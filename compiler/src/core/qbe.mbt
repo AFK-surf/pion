@@ -79,6 +79,7 @@ pub struct QbeGen {
   tc : TypeChecker
   release : Bool
   unit_mode : Bool
+  pkg_prefix : String
   struct_order : Array[String]
   enum_order : Array[String]
   const_order : Array[String]
@@ -321,13 +322,91 @@ fn qbe_load_heap_slot(g : QbeGen, slot : String, ty : Ty) -> String {
 }
 
 ///|
+fn qbe_sanitize_sym(s : String) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < s.length() {
+    let c = str_code_at(s, i)
+    if (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      (c >= 48 && c <= 57) ||
+      c == 95 {
+      sb.write_char(c.unsafe_to_char())
+    } else {
+      sb.write_char('_')
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn qbe_pkg_prefix_for(pkg_name : String, multi_pkg : Bool) -> String {
+  if multi_pkg {
+    "pkg_" + qbe_sanitize_sym(pkg_name) + "_"
+  } else {
+    ""
+  }
+}
+
+///|
+fn qbe_local_fn_sym(g : QbeGen, name : String) -> String {
+  "$m2_" + g.pkg_prefix + "fn_" + name
+}
+
+///|
+fn qbe_local_method_sym(g : QbeGen, recv : String, name : String) -> String {
+  "$m2_" + g.pkg_prefix + "m_" + recv + "__" + name
+}
+
+///|
+fn qbe_local_const_sym(g : QbeGen, name : String) -> String {
+  "$m2_" + g.pkg_prefix + "const_" + name
+}
+
+///|
+fn qbe_ext_fn_sym(canon_pkg : String, name : String) -> String {
+  "$m2_pkg_" + qbe_sanitize_sym(canon_pkg) + "_fn_" + name
+}
+
+///|
+fn qbe_ext_method_sym(
+  canon_pkg : String,
+  recv : String,
+  name : String,
+) -> String {
+  "$m2_pkg_" + qbe_sanitize_sym(canon_pkg) + "_m_" + recv + "__" + name
+}
+
+///|
+fn qbe_ext_const_sym(canon_pkg : String, name : String) -> String {
+  "$m2_pkg_" + qbe_sanitize_sym(canon_pkg) + "_const_" + name
+}
+
+///|
+fn qbe_method_call_sym(
+  g : QbeGen,
+  sname : String,
+  method_name : String,
+) -> String {
+  let qp = split_qual_name(sname)
+  let canon_pkg = qp.prefix
+  let st_name = qp.name
+  if canon_pkg.length() > 0 {
+    qbe_ext_method_sym(canon_pkg, st_name, method_name)
+  } else {
+    qbe_local_method_sym(g, sname, method_name)
+  }
+}
+
+///|
 fn qbe_register_enum_const(
   g : QbeGen,
   enum_name : String,
   vname : String,
   tag : Int,
 ) -> String {
-  let sym = "$m2_enum_" + enum_name + "__" + vname + "_hdr"
+  let sym = "$m2_enum_" + qbe_sanitize_sym(enum_name) + "__" + vname + "_hdr"
   if !g.enum_const_seen.contains(sym) {
     g.enum_const_seen.set(sym, true)
     g.enum_consts.push(QbeEnumConst::{ sym: sym, tag: tag })
@@ -2987,6 +3066,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     tc: tc,
     release: release,
     unit_mode: unit_mode,
+    pkg_prefix: qbe_pkg_prefix_for(tc.pkg_name, tc.multi_pkg),
     struct_order: [],
     enum_order: [],
     const_order: [],
@@ -3909,7 +3989,10 @@ fn qbe_emit_variant_ctor(
       }
       let payload_sz = (1 + arg_vals.length()) * 8
       let drop_sym = if einfo.decl.type_params.length() == 0 {
-        "$m2_drop_enum_" + resolved_enum
+        if has_qual_sep(resolved_enum) && !str_arr_contains(g.enum_order, resolved_enum) {
+          g.enum_order.push(resolved_enum)
+        }
+        "$m2_drop_enum_" + qbe_sanitize_sym(resolved_enum)
       } else {
         let mut mask = 0
         let mut fi = 0
@@ -4777,10 +4860,8 @@ fn qbe_emit_method_call(
           sb.write_string(res)
           sb.write_string(" =")
           sb.write_string(ret_abi)
-          sb.write_string(" call $m2_m_")
-          sb.write_string(sname)
-          sb.write_string("__")
-          sb.write_string(method_name)
+          sb.write_string(" call ")
+          sb.write_string(qbe_method_call_sym(g, sname, method_name))
           sb.write_string("(")
           j = 0
           while j < call_args.length() {
@@ -5513,7 +5594,7 @@ fn qbe_emit_expr(
       }
       match g.tc.consts.get(name) {
         Some(cty) => {
-          let t = qbe_load_heap_slot(g, "$m2_const_" + name, cty)
+          let t = qbe_load_heap_slot(g, qbe_local_const_sym(g, name), cty)
           qbe_rc_inc(g, t, cty)
           return qval(t, cty)
         }
@@ -5543,6 +5624,49 @@ fn qbe_emit_expr(
       }
       if g.tc.enums.contains(qual) {
         return qbe_emit_variant_ctor(g, qual, mem, [], expected)
+      }
+      let qp = split_qual_name(qual)
+      let q_alias = qp.prefix
+      let q_sub = qp.name
+      if q_alias.length() > 0 {
+        match resolve_alias_pkg(g.tc, q_alias) {
+          Some(ipkg) =>
+            if ipkg.tc.enums.contains(q_sub) {
+              return qbe_emit_variant_ctor(
+                g,
+                ipkg.name + "::" + q_sub,
+                mem,
+                [],
+                expected,
+              )
+            }
+          None => ()
+        }
+      }
+      match resolve_alias_pkg(g.tc, qual) {
+        Some(ipkg) => {
+          match ipkg.tc.consts.get(mem) {
+            Some(cty) => {
+              let qcty = qualify_imported_ty(ipkg.name, cty)
+              let t = qbe_load_heap_slot(g, qbe_ext_const_sym(ipkg.name, mem), qcty)
+              qbe_rc_inc(g, t, qcty)
+              return qval(t, qcty)
+            }
+            None => ()
+          }
+          match ipkg.tc.variant_to_enum.get(mem) {
+            Some(en) =>
+              return qbe_emit_variant_ctor(
+                g,
+                ipkg.name + "::" + en,
+                mem,
+                [],
+                expected,
+              )
+            None => ()
+          }
+        }
+        None => ()
       }
       qval("0", TError)
     }
@@ -6116,8 +6240,8 @@ fn qbe_emit_expr(
               sb.write_string(res)
               sb.write_string(" =")
               sb.write_string(ret_abi)
-              sb.write_string(" call $m2_fn_")
-              sb.write_string(name)
+              sb.write_string(" call ")
+              sb.write_string(qbe_local_fn_sym(g, name))
               sb.write_string("(")
               j = 0
               while j < call_args.length() {
@@ -6270,8 +6394,79 @@ fn qbe_emit_expr(
           if qual == "Option" || qual == "Result" || g.tc.enums.contains(qual) {
             return qbe_emit_variant_ctor(g, qual, mem, args, expected)
           }
-          let key = qual + "::" + mem
-          match g.tc.methods.get(key) {
+          let mut target_finfo : Option[FnInfo] = None
+          let mut target_sym = ""
+          let qp = split_qual_name(qual)
+          let q_alias = qp.prefix
+          let q_sub = qp.name
+          if q_alias.length() > 0 {
+            match resolve_alias_pkg(g.tc, q_alias) {
+              Some(ipkg) => {
+                if ipkg.tc.enums.contains(q_sub) {
+                  return qbe_emit_variant_ctor(
+                    g,
+                    ipkg.name + "::" + q_sub,
+                    mem,
+                    args,
+                    expected,
+                  )
+                }
+                match ipkg.tc.methods.get(q_sub + "::" + mem) {
+                  Some(mi) => {
+                    target_finfo = Some(qualify_fn_info(ipkg.name, mi))
+                    target_sym = qbe_ext_method_sym(ipkg.name, q_sub, mem)
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
+          }
+          match target_finfo {
+            None =>
+              match resolve_alias_pkg(g.tc, qual) {
+                Some(ipkg) => {
+                  match ipkg.tc.fns.get(mem) {
+                    Some(fi) => {
+                      target_finfo = Some(qualify_fn_info(ipkg.name, fi))
+                      target_sym = qbe_ext_fn_sym(ipkg.name, mem)
+                    }
+                    None => ()
+                  }
+                  match target_finfo {
+                    None =>
+                      match ipkg.tc.variant_to_enum.get(mem) {
+                        Some(en) =>
+                          return qbe_emit_variant_ctor(
+                            g,
+                            ipkg.name + "::" + en,
+                            mem,
+                            args,
+                            expected,
+                          )
+                        None => ()
+                      }
+                    Some(_) => ()
+                  }
+                }
+                None => ()
+              }
+            Some(_) => ()
+          }
+          match target_finfo {
+            None => {
+              let key = qual + "::" + mem
+              match g.tc.methods.get(key) {
+                Some(minfo) => {
+                  target_finfo = Some(minfo)
+                  target_sym = qbe_local_method_sym(g, qual, mem)
+                }
+                None => ()
+              }
+            }
+            Some(_) => ()
+          }
+          match target_finfo {
             Some(minfo) => {
               let subst : Map[String, Ty] = Map([])
               match expected {
@@ -6322,10 +6517,8 @@ fn qbe_emit_expr(
               sb.write_string(res)
               sb.write_string(" =")
               sb.write_string(ret_abi)
-              sb.write_string(" call $m2_m_")
-              sb.write_string(qual)
-              sb.write_string("__")
-              sb.write_string(mem)
+              sb.write_string(" call ")
+              sb.write_string(target_sym)
               sb.write_string("(")
               j = 0
               while j < call_args.length() {
@@ -6660,12 +6853,26 @@ fn qbe_emit_expr(
       qval(arr, TArray(elem_ty))
     }
     EStructLit(sname, fields, _) => {
-      let resolved_name = if sname != "" {
+      let mut resolved_name = if sname != "" {
         sname
       } else {
         match expected {
           Some(TStruct(en, _)) => en
           _ => ""
+        }
+      }
+      if resolved_name != "" && !g.tc.structs.contains(resolved_name) {
+        let qp = split_qual_name(resolved_name)
+        let q_alias = qp.prefix
+        let q_st = qp.name
+        if q_alias.length() > 0 {
+          match resolve_alias_pkg(g.tc, q_alias) {
+            Some(ipkg) =>
+              if ipkg.tc.structs.contains(q_st) {
+                resolved_name = ipkg.name + "::" + q_st
+              }
+            None => ()
+          }
         }
       }
       match g.tc.structs.get(resolved_name) {
@@ -6721,7 +6928,10 @@ fn qbe_emit_expr(
               k = k + 1
             }
             if has_obj {
-              "$m2_drop_struct_" + resolved_name
+              if has_qual_sep(resolved_name) && !str_arr_contains(g.struct_order, resolved_name) {
+                g.struct_order.push(resolved_name)
+              }
+              "$m2_drop_struct_" + qbe_sanitize_sym(resolved_name)
             } else {
               "0"
             }
@@ -8793,9 +9003,9 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
 
       let out = StringBuilder()
       let sym = if fd.receiver_type != "" {
-        "$m2_m_" + fd.receiver_type + "__" + fd.name
+        qbe_local_method_sym(g, fd.receiver_type, fd.name)
       } else {
-        "$m2_fn_" + fd.name
+        qbe_local_fn_sym(g, fd.name)
       }
       if fd.is_pub || g.unit_mode {
         out.write_string("export ")
@@ -8855,11 +9065,11 @@ fn qbe_emit_struct_drops(g : QbeGen, out : StringBuilder) -> Unit {
             fi = fi + 1
           }
           if obj_slots.length() > 0 {
-            if g.unit_mode {
+            if g.unit_mode && !has_qual_sep(sname) {
               out.write_string("export ")
             }
             out.write_string("function $m2_drop_struct_")
-            out.write_string(sname)
+            out.write_string(qbe_sanitize_sym(sname))
             out.write_string("(l %p) {\n@start\n")
             let mut j = 0
             while j < obj_slots.length() {
@@ -8894,11 +9104,11 @@ fn qbe_emit_enum_drops(g : QbeGen, out : StringBuilder) -> Unit {
     match g.tc.enums.get(ename) {
       Some(einfo) =>
         if einfo.decl.type_params.length() == 0 {
-          if g.unit_mode {
+          if g.unit_mode && !has_qual_sep(ename) {
             out.write_string("export ")
           }
           out.write_string("function $m2_drop_enum_")
-          out.write_string(ename)
+          out.write_string(qbe_sanitize_sym(ename))
           out.write_string("(l %p) {\n@start\n")
           out.write_string("    %tag =l loadl %p\n")
           let mut vi = 0
@@ -9051,14 +9261,15 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
         }
         let ret_d = qbe_is_double_ty(finfo.ret_ty)
         let ret_w = qbe_is_int32_ty(finfo.ret_ty)
+        let fn_sym = qbe_local_fn_sym(g, fname)
         if ret_d {
-          out.write_string("    %rd =d call $m2_fn_")
+          out.write_string("    %rd =d call ")
         } else if ret_w {
-          out.write_string("    %rw =w call $m2_fn_")
+          out.write_string("    %rw =w call ")
         } else {
-          out.write_string("    %r =l call $m2_fn_")
+          out.write_string("    %r =l call ")
         }
-        out.write_string(fname)
+        out.write_string(fn_sym)
         out.write_string("(")
         pi = 0
         while pi < finfo.param_tys.length() {
@@ -9092,12 +9303,20 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
 ///|
 fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
   let tc = TypeChecker::{
+    pkg_name: pkg.name,
+    multi_pkg: false,
     structs: Map([]),
+    struct_names: [],
     enums: Map([]),
+    enum_names: [],
     variant_to_enum: Map([]),
     fns: Map([]),
     methods: Map([]),
+    method_names: [],
     consts: Map([]),
+    const_pub: Map([]),
+    import_aliases: Map([]),
+    imported_pkgs: Map([]),
     diagnostics: [],
   }
   let mut fi = 0
@@ -9192,7 +9411,9 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
         DConst(cd) => {
           let cty = resolve_type_expr(tc, cd.ty, [])
           tc.consts.set(cd.name, cty)
+          tc.const_pub.set(cd.name, cd.is_pub)
         }
+        DTest(_) => ()
       }
       di = di + 1
     }
@@ -9202,10 +9423,12 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
 }
 
 ///|
-pub fn emit_qbe_package_with_tc(
+pub fn emit_qbe_package_multi(
   pkg : Package,
   tc : TypeChecker,
   release : Bool,
+  is_entry : Bool,
+  dep_pkg_names : Array[String],
 ) -> QbeEmitResult {
   let g = qbe_new(tc, release, false)
   let const_decls : Array[ConstDecl] = []
@@ -9222,15 +9445,16 @@ pub fn emit_qbe_package_with_tc(
           g.const_order.push(cd.name)
           const_decls.push(cd)
         }
-        DFn(_) => ()
+        DFn(_) | DTest(_) => ()
       }
       di = di + 1
     }
     fi = fi + 1
   }
 
+  let init_sym = "$m2_" + g.pkg_prefix + "init_consts"
   let mut init_consts_code = ""
-  if const_decls.length() > 0 {
+  if const_decls.length() > 0 || tc.multi_pkg {
     g.fn_allocs = StringBuilder()
     g.fn_body = StringBuilder()
     g.scopes = []
@@ -9250,13 +9474,23 @@ pub fn emit_qbe_package_with_tc(
         None => TError
       }
       let cv = qbe_emit_expr(g, cd.value, Some(cty))
-      qbe_store_heap_slot(g, qbe_coerce_val(g, cv, cty), "$m2_const_" + cd.name, cty)
+      qbe_store_heap_slot(
+        g,
+        qbe_coerce_val(g, cv, cty),
+        qbe_local_const_sym(g, cd.name),
+        cty,
+      )
       ci = ci + 1
     }
     qbe_scope_pop(g)
     qbe_emit_term(g, "ret")
     let csb = StringBuilder()
-    csb.write_string("function $m2_init_consts() {\n@start\n")
+    if tc.multi_pkg {
+      csb.write_string("export ")
+    }
+    csb.write_string("function ")
+    csb.write_string(init_sym)
+    csb.write_string("() {\n@start\n")
     csb.write_string(g.fn_allocs.to_string())
     csb.write_string(g.fn_body.to_string())
     csb.write_string("}\n\n")
@@ -9328,8 +9562,16 @@ pub fn emit_qbe_package_with_tc(
 
   let mut kci = 0
   while kci < g.const_order.length() {
-    out.write_string("data $m2_const_")
-    out.write_string(g.const_order[kci])
+    let cname = g.const_order[kci]
+    let is_pub_c = match tc.const_pub.get(cname) {
+      Some(b) => b
+      None => false
+    }
+    if tc.multi_pkg && is_pub_c {
+      out.write_string("export ")
+    }
+    out.write_string("data ")
+    out.write_string(qbe_local_const_sym(g, cname))
     out.write_string(" = align 8 { l 0 }\n")
     kci = kci + 1
   }
@@ -9350,39 +9592,64 @@ pub fn emit_qbe_package_with_tc(
   out.write_string(fns_buf.to_string())
 
   let mut has_main = false
-  match tc.fns.get("main") {
-    Some(minfo) => {
-      has_main = true
-      out.write_string("export function w $main(w %argc, l %argv) {\n@start\n")
-      out.write_string("    %w =l call $m2_world_init(w %argc, l %argv)\n")
-      if const_decls.length() > 0 {
-        out.write_string("    call $m2_init_consts()\n")
-      }
-      let ret_abi = qbe_abi_ty(minfo.ret_ty)
-      if minfo.param_tys.length() >= 1 {
-        out.write_string("    %r =")
-        out.write_string(ret_abi)
-        out.write_string(" call $m2_fn_main(l %w)\n")
-      } else {
-        out.write_string("    %r =")
-        out.write_string(ret_abi)
-        out.write_string(" call $m2_fn_main()\n")
-      }
-      out.write_string("    call $m2_rc_dec(l %w)\n")
-      match minfo.ret_ty {
-        TInt => out.write_string("    ret %r\n")
-        TInt64 => {
-          out.write_string("    %rw =w copy %r\n")
-          out.write_string("    ret %rw\n")
+  if is_entry {
+    match tc.fns.get("main") {
+      Some(minfo) => {
+        has_main = true
+        out.write_string("export function w $main(w %argc, l %argv) {\n@start\n")
+        out.write_string("    %w =l call $m2_world_init(w %argc, l %argv)\n")
+        let mut dpi = 0
+        while dpi < dep_pkg_names.length() {
+          out.write_string("    call $m2_pkg_")
+          out.write_string(qbe_sanitize_sym(dep_pkg_names[dpi]))
+          out.write_string("_init_consts()\n")
+          dpi = dpi + 1
         }
-        _ => out.write_string("    ret 0\n")
+        if const_decls.length() > 0 || tc.multi_pkg {
+          out.write_string("    call ")
+          out.write_string(init_sym)
+          out.write_string("()\n")
+        }
+        let ret_abi = qbe_abi_ty(minfo.ret_ty)
+        let main_fn_sym = qbe_local_fn_sym(g, "main")
+        if minfo.param_tys.length() >= 1 {
+          out.write_string("    %r =")
+          out.write_string(ret_abi)
+          out.write_string(" call ")
+          out.write_string(main_fn_sym)
+          out.write_string("(l %w)\n")
+        } else {
+          out.write_string("    %r =")
+          out.write_string(ret_abi)
+          out.write_string(" call ")
+          out.write_string(main_fn_sym)
+          out.write_string("()\n")
+        }
+        out.write_string("    call $m2_rc_dec(l %w)\n")
+        match minfo.ret_ty {
+          TInt => out.write_string("    ret %r\n")
+          TInt64 => {
+            out.write_string("    %rw =w copy %r\n")
+            out.write_string("    ret %rw\n")
+          }
+          _ => out.write_string("    ret 0\n")
+        }
+        out.write_string("}\n")
       }
-      out.write_string("}\n")
+      None => ()
     }
-    None => ()
   }
 
   QbeEmitResult::{ ssa: out.to_string(), has_main: has_main }
+}
+
+///|
+pub fn emit_qbe_package_with_tc(
+  pkg : Package,
+  tc : TypeChecker,
+  release : Bool,
+) -> QbeEmitResult {
+  emit_qbe_package_multi(pkg, tc, release, true, [])
 }
 
 ///|
@@ -9513,6 +9780,7 @@ pub fn emit_qbe_unit(
         if fd.receiver_type == "" && fd.name == "main" {
           unit_has_main = true
         }
+      DTest(_) => ()
     }
     di = di + 1
   }
@@ -9688,4 +9956,314 @@ pub fn cli_compile_qbe(
   let sig_text = emit_m2sig(checked.pkg)
   let res = emit_qbe_package_with_tc(checked.pkg, checked.tc, release)
   Ok(CompileQbeOut::{ sig: sig_text, ssa: res.ssa, has_main: res.has_main })
+}
+
+///|
+pub struct QbeTestEmitResult {
+  ssa : String
+  test_names : Array[String]
+}
+
+///|
+pub fn qbe_test_emit_empty() -> QbeTestEmitResult {
+  QbeTestEmitResult::{ ssa: "", test_names: [] }
+}
+
+///|
+pub fn emit_qbe_test_package(
+  pkg : Package,
+  tc : TypeChecker,
+  dep_pkg_names : Array[String],
+) -> QbeTestEmitResult {
+  let g = qbe_new(tc, false, false)
+  let const_decls : Array[ConstDecl] = []
+  let test_decls : Array[TestDecl] = []
+  let test_names : Array[String] = []
+
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DStruct(sd) => g.struct_order.push(sd.name)
+        DEnum(ed) => g.enum_order.push(ed.name)
+        DConst(cd) => {
+          g.const_order.push(cd.name)
+          const_decls.push(cd)
+        }
+        DTest(td) => {
+          test_decls.push(td)
+          test_names.push(td.name)
+        }
+        DFn(_) => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+
+  let init_sym = "$m2_" + g.pkg_prefix + "init_consts"
+  let mut init_consts_code = ""
+  if const_decls.length() > 0 || tc.multi_pkg {
+    g.fn_allocs = StringBuilder()
+    g.fn_body = StringBuilder()
+    g.scopes = []
+    g.loop_breaks = []
+    g.loop_conts = []
+    g.loop_depths = []
+    g.cur_tparams = []
+    g.cur_ret_ty = TUnit
+    g.cur_ret_abi_ty = TUnit
+    g.block_term = false
+    qbe_scope_push(g)
+    let mut ci = 0
+    while ci < const_decls.length() {
+      let cd = const_decls[ci]
+      let cty = match tc.consts.get(cd.name) {
+        Some(t) => t
+        None => TError
+      }
+      let cv = qbe_emit_expr(g, cd.value, Some(cty))
+      qbe_store_heap_slot(
+        g,
+        qbe_coerce_val(g, cv, cty),
+        qbe_local_const_sym(g, cd.name),
+        cty,
+      )
+      ci = ci + 1
+    }
+    qbe_scope_pop(g)
+    qbe_emit_term(g, "ret")
+    let csb = StringBuilder()
+    csb.write_string("function ")
+    csb.write_string(init_sym)
+    csb.write_string("() {\n@start\n")
+    csb.write_string(g.fn_allocs.to_string())
+    csb.write_string(g.fn_body.to_string())
+    csb.write_string("}\n\n")
+    init_consts_code = csb.to_string()
+  }
+
+  let fns_buf = StringBuilder()
+  fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    g.inline_fns = qbe_collect_file_inline_fns(f)
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) => fns_buf.write_string(qbe_emit_fn_decl(g, fd))
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+
+  let tests_buf = StringBuilder()
+  let mut ti = 0
+  while ti < test_decls.length() {
+    let td = test_decls[ti]
+    g.fn_allocs = StringBuilder()
+    g.fn_body = StringBuilder()
+    g.scopes = []
+    g.loop_breaks = []
+    g.loop_conts = []
+    g.loop_depths = []
+    g.cur_tparams = []
+    g.cur_ret_ty = TUnit
+    g.cur_ret_abi_ty = TUnit
+    g.block_term = false
+    g.hoisted_arr_len = Map([])
+    g.hoisted_arr_dp = Map([])
+    g.hoisted_fields = Map([])
+    g.block_immut_fields = Map([])
+    g.len_aliases = Map([])
+    g.len_alias_keys = []
+    g.nonneg_vars = Map([])
+    g.bce_safe_indices = Map([])
+    g.bce_safe_exprs = Map([])
+    g.sq_reuse_slot = Map([])
+    g.sq_reuse_state = Map([])
+    g.promoted_fields = Map([])
+    g.promoted_field_tys = Map([])
+    g.w_to_l_ext = Map([])
+    g.local_w_to_l_ext = Map([])
+    qbe_scope_push(g)
+    let bres = qbe_emit_stmts(g, td.body, None)
+    if !g.block_term {
+      qbe_rc_dec(g, bres.reg, bres.ty)
+      qbe_scope_pop(g)
+      qbe_emit_term(g, "ret")
+    } else {
+      let _ = g.scopes.pop()
+    }
+    tests_buf.write_string("function $m2_test_fn_")
+    tests_buf.write_string(ti.to_string())
+    tests_buf.write_string("() {\n@start\n")
+    tests_buf.write_string(g.fn_allocs.to_string())
+    tests_buf.write_string(g.fn_body.to_string())
+    tests_buf.write_string("}\n\n")
+    ti = ti + 1
+  }
+
+  let out = StringBuilder()
+  out.write_string("# Generated by m2c QBE test runner backend (deterministic)\n\n")
+
+  if g.need_none_const {
+    out.write_string(
+      "data $m2_none_hdr = align 8 { l 0, w 0, w 1, h 5, h 3, w 8, l 0, l 0 }\n",
+    )
+  }
+
+  let mut eci = 0
+  while eci < g.enum_consts.length() {
+    let ec = g.enum_consts[eci]
+    out.write_string("data ")
+    out.write_string(ec.sym)
+    out.write_string(" = align 8 { l 0, w 0, w 1, h 5, h 3, w 8, l 0, l ")
+    out.write_string(ec.tag.to_string())
+    out.write_string(" }\n")
+    eci = eci + 1
+  }
+
+  let mut si = 0
+  while si < g.strings.length() {
+    let s = g.strings[si]
+    let bytes = str_to_utf8_ints(s)
+    let payload_sz = 8 + bytes.length() + 1
+    out.write_string("data $m2_str_")
+    out.write_string(si.to_string())
+    out.write_string("_hdr = align 8 { l 0, w 0, w 1, h 1, h 3, w ")
+    out.write_string(payload_sz.to_string())
+    out.write_string(", l 0, l ")
+    out.write_string(bytes.length().to_string())
+    out.write_string(", ")
+    let _ = qbe_emit_bytes_data(out, s)
+    out.write_string(" }\n")
+    si = si + 1
+  }
+
+  let mut csi = 0
+  while csi < g.cstrings.length() {
+    out.write_string("data $m2_cstr_")
+    out.write_string(csi.to_string())
+    out.write_string(" = { ")
+    let _ = qbe_emit_bytes_data(out, g.cstrings[csi])
+    out.write_string(" }\n")
+    csi = csi + 1
+  }
+
+  let mut kci = 0
+  while kci < g.const_order.length() {
+    out.write_string("data ")
+    out.write_string(qbe_local_const_sym(g, g.const_order[kci]))
+    out.write_string(" = align 8 { l 0 }\n")
+    kci = kci + 1
+  }
+  out.write_string("\n")
+
+  qbe_emit_struct_drops(g, out)
+  qbe_emit_enum_drops(g, out)
+  qbe_emit_helper_drops(g, out)
+  qbe_emit_fn_wrappers(g, out)
+
+  let mut ei = 0
+  while ei < g.extra_fns.length() {
+    out.write_string(g.extra_fns[ei])
+    ei = ei + 1
+  }
+
+  out.write_string(init_consts_code)
+  out.write_string(fns_buf.to_string())
+  out.write_string(tests_buf.to_string())
+
+  out.write_string("export function w $main(w %argc, l %argv) {\n@start\n")
+  out.write_string("    %ok_slot =l alloc4 4\n")
+  out.write_string("    %w =l call $m2_world_init(w %argc, l %argv)\n")
+  let mut dpi = 0
+  while dpi < dep_pkg_names.length() {
+    out.write_string("    call $m2_pkg_")
+    out.write_string(qbe_sanitize_sym(dep_pkg_names[dpi]))
+    out.write_string("_init_consts()\n")
+    dpi = dpi + 1
+  }
+  if const_decls.length() > 0 || tc.multi_pkg {
+    out.write_string("    call ")
+    out.write_string(init_sym)
+    out.write_string("()\n")
+  }
+  if test_decls.length() > 0 {
+    out.write_string("    %arg1 =l call $m2_world_argv(l %w, l 1)\n")
+    out.write_string("    %idx =l call $m2_str_to_int(l %arg1, l %ok_slot)\n")
+    out.write_string("    call $m2_rc_dec(l %arg1)\n")
+    ti = 0
+    while ti < test_decls.length() {
+      let s_i = ti.to_string()
+      out.write_string("    %c")
+      out.write_string(s_i)
+      out.write_string(" =w ceql %idx, ")
+      out.write_string(s_i)
+      out.write_string("\n    jnz %c")
+      out.write_string(s_i)
+      out.write_string(", @test_")
+      out.write_string(s_i)
+      out.write_string(", @next_")
+      out.write_string(s_i)
+      out.write_string("\n@test_")
+      out.write_string(s_i)
+      out.write_string("\n    call $m2_test_fn_")
+      out.write_string(s_i)
+      out.write_string("()\n    jmp @done\n@next_")
+      out.write_string(s_i)
+      out.write_string("\n")
+      ti = ti + 1
+    }
+    out.write_string("@done\n")
+  }
+  out.write_string("    call $m2_rc_dec(l %w)\n")
+  out.write_string("    ret 0\n}\n")
+
+  QbeTestEmitResult::{ ssa: out.to_string(), test_names: test_names }
+}
+
+///|
+pub fn format_test_report_json(
+  names : Array[String],
+  passed_flags : Array[Bool],
+) -> String {
+  let mut passed = 0
+  let mut failed = 0
+  let mut i = 0
+  while i < names.length() && i < passed_flags.length() {
+    if passed_flags[i] {
+      passed = passed + 1
+    } else {
+      failed = failed + 1
+    }
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  sb.write_string("{\"ok\":")
+  sb.write_string(if failed == 0 { "true" } else { "false" })
+  sb.write_string(",\"passed\":")
+  sb.write_string(passed.to_string())
+  sb.write_string(",\"failed\":")
+  sb.write_string(failed.to_string())
+  sb.write_string(",\"tests\":[")
+  i = 0
+  while i < names.length() && i < passed_flags.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("{\"name\":")
+    sb.write_string(json_quote(names[i]))
+    sb.write_string(",\"ok\":")
+    sb.write_string(if passed_flags[i] { "true" } else { "false" })
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
 }

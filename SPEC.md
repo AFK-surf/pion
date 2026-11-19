@@ -79,10 +79,12 @@ Every construct below is valid in BOTH MoonBit (with thin helper aliases where n
   - `Byte`: `b'a'`, `b'\n'`, `b'\x00'`
   - `Char`: `'a'`, `'\n'`
   - `String`: `"..."` with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`
-- Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`.
+- Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`, `import` (and contextual top-level `test`).
 
 ### 3.2 Top-Level Declarations
 ```
+import "pkg_name" [as alias]
+
 [pub] [val] struct Name[T1, T2] {
   [mut] field1 : Type1
   field2 : Type2
@@ -102,10 +104,15 @@ Every construct below is valid in BOTH MoonBit (with thin helper aliases where n
 }
 
 [pub] let CONST_NAME : Type = expr
+
+test "test name" {
+  ...
+}
 ```
 - Optional trailing commas and optional semicolons (newline-terminated statements, matching MoonBit).
-- `pub` marks items exported in `.m2sig`.
+- `pub` marks items exported in `.m2sig` and accessible from downstream packages via `alias::symbol`. Referencing a non-`pub` symbol from an imported package is a compile-time error (`E_PRIVATE_SYMBOL`).
 - `val struct` asserts at compile time that the struct has zero `mut` fields and every field is `Send`.
+- `test "name" { ... }` blocks are type-checked by `m2c check`, omitted (0 bytes) by `m2c build`, and compiled with active `debug_assert` by `m2c test [--json] [--filter <substr>] <path>`.
 
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
@@ -275,10 +282,29 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `callers`: `{"callers":[{"fn":"...","calls":["..."]}]}`
 - `deps`: `{"packages":[{"name":"...","deps":["..."],"sig_hash":"..."}]}`
 
+### 5.3 `m2c test [--json] [--filter <substr>] <path>`
+- Runs all `test "name" { ... }` blocks in isolated child processes (active `debug_assert`, binary stored in `$M2_CACHE_DIR/bin/`).
+- JSON output: `{"ok":bool,"passed":N,"failed":M,"tests":[{"name":"...","ok":bool}]}`
+- Additional diagnostic codes:
+  - `E_PRIVATE_SYMBOL`: accessing a non-`pub` function, struct, enum, method, or constant from an imported package.
+  - `E_IMPORT_CYCLE`: cyclic package dependency detected across `m2.toml` manifests.
+  - `E_UNKNOWN_PACKAGE`: importing or depending on an undeclared package.
+
 ---
 
-## 6. Global Content-Addressed Cache (CAS) Contract
+## 6. Global Content-Addressed Cache (CAS) & `m2.toml` Contract
 
+- **Package Manifest (`m2.toml`)**:
+  ```toml
+  [package]
+  name = "app"
+  version = "0.1.0"
+
+  [dependencies]
+  math = { path = "../math" }
+  ```
+- **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.m2sig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.m2sig` yields 100% CAS hit on downstream `.o` files.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(M2_COMPILER_ABI_REV | qbe_size | libm2rt_size | M2_CACHE_SALT)`, ensuring compiler/backend upgrades automatically invalidate stale cache entries.
 - Default directory: `$M2_CACHE_DIR` or `$HOME/.cache/m2/cas`
 - Layout:
   - `sig/<sha256>.m2sig`

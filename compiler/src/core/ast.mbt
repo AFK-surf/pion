@@ -15,8 +15,16 @@ pub struct Package {
 }
 
 ///|
+pub struct ImportDecl {
+  path : String
+  alias_name : String
+  span : Span
+}
+
+///|
 pub struct SourceFile {
   path : String
+  imports : Array[ImportDecl]
   decls : Array[Decl]
 }
 
@@ -91,11 +99,19 @@ pub struct ConstDecl {
 }
 
 ///|
+pub struct TestDecl {
+  name : String
+  body : Array[Stmt]
+  span : Span
+}
+
+///|
 pub enum Decl {
   DStruct(StructDecl)
   DEnum(EnumDecl)
   DFn(FnDecl)
   DConst(ConstDecl)
+  DTest(TestDecl)
 }
 
 ///|

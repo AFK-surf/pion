@@ -80,7 +80,8 @@ fn p_skip_semis(p : Parser) -> Unit {
 fn p_sync_top(p : Parser) -> Unit {
   while !p_is_eof(p) {
     match p_peek(p).kind {
-      KwPub | KwFn | KwStruct | KwEnum | KwVal | KwLet | KwType => break
+      KwPub | KwFn | KwStruct | KwEnum | KwVal | KwLet | KwType | KwImport =>
+        break
       _ => {
         let _ = p_advance(p)
       }
@@ -387,6 +388,11 @@ fn p_parse_type_expr(p : Parser) -> TypeExpr {
     }
     Ident(name) => {
       let _ = p_advance(p)
+      let mut full_name = name
+      if p_match_kind_coloncolon(p) {
+        let mem = p_expect_ident(p, "type name after `::`")
+        full_name = name + "::" + mem
+      }
       let args : Array[TypeExpr] = []
       if p_match_kind_lbracket(p) {
         while !p_is_eof(p) {
@@ -415,7 +421,7 @@ fn p_parse_type_expr(p : Parser) -> TypeExpr {
           }
         }
       }
-      TyName(name, args, tok.span)
+      TyName(full_name, args, tok.span)
     }
     _ => {
       p_err(
@@ -1086,8 +1092,14 @@ fn p_parse_pattern(p : Parser) -> Pattern {
       }
       if p_match_kind_coloncolon(p) {
         let vname = p_expect_ident(p, "variant name")
-        let sub = p_parse_pattern_args(p)
-        PVariant(name, vname, sub, tok.span)
+        if p_match_kind_coloncolon(p) {
+          let vname2 = p_expect_ident(p, "variant name")
+          let sub = p_parse_pattern_args(p)
+          PVariant(name + "::" + vname, vname2, sub, tok.span)
+        } else {
+          let sub = p_parse_pattern_args(p)
+          PVariant(name, vname, sub, tok.span)
+        }
       } else {
         match p_peek(p).kind {
           LParen => {
@@ -1350,7 +1362,20 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
           }
           _ => {
             let mem = p_expect_ident(p, "member name after `::`")
-            EPath(name, mem, tok.span)
+            if p_match_kind_coloncolon(p) {
+              match p_peek(p).kind {
+                LBrace => {
+                  let fields = p_parse_struct_lit_fields(p)
+                  EStructLit(name + "::" + mem, fields, tok.span)
+                }
+                _ => {
+                  let mem2 = p_expect_ident(p, "member name after `::`")
+                  EPath(name + "::" + mem, mem2, tok.span)
+                }
+              }
+            } else {
+              EPath(name, mem, tok.span)
+            }
           }
         }
       } else {
@@ -1375,9 +1400,84 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
 }
 
 ///|
+pub fn default_import_alias(pkg_path : String) -> String {
+  let len = pkg_path.length()
+  let mut last_slash = -1
+  let mut i = 0
+  while i < len {
+    if str_code_at(pkg_path, i) == 47 {
+      last_slash = i
+    }
+    i = i + 1
+  }
+  if last_slash >= 0 && last_slash + 1 < len {
+    slice_str(pkg_path, last_slash + 1, len)
+  } else {
+    pkg_path
+  }
+}
+
+///|
+fn p_parse_import_decl(p : Parser, start_span : Span) -> ImportDecl {
+  let _ = p_advance(p) // consume 'import'
+  let path_tok = p_peek(p)
+  let pkg_path = match path_tok.kind {
+    StringLit(s) => {
+      let _ = p_advance(p)
+      s
+    }
+    _ => {
+      p_err(
+        p,
+        path_tok.span,
+        "expected package path string after `import`, found `" + path_tok.raw + "`",
+        "string literal",
+        path_tok.raw,
+        "write `import \"pkg_name\"`",
+      )
+      ""
+    }
+  }
+  let alias_name = match p_peek(p).kind {
+    KwAs => {
+      let _ = p_advance(p)
+      p_expect_ident(p, "import alias")
+    }
+    _ => default_import_alias(pkg_path)
+  }
+  ImportDecl::{ path: pkg_path, alias_name: alias_name, span: start_span }
+}
+
+///|
+fn p_parse_test_decl(p : Parser, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume contextual 'test'
+  let name_tok = p_peek(p)
+  let tname = match name_tok.kind {
+    StringLit(s) => {
+      let _ = p_advance(p)
+      s
+    }
+    _ => {
+      p_err(
+        p,
+        name_tok.span,
+        "expected test name string after `test`, found `" + name_tok.raw + "`",
+        "string literal",
+        name_tok.raw,
+        "write `test \"name\" { ... }`",
+      )
+      "<unnamed>"
+    }
+  }
+  let body = p_parse_block_stmts(p)
+  DTest(TestDecl::{ name: tname, body: body, span: start_span })
+}
+
+///|
 pub fn parse_source(path : String, source : String) -> ParseResult {
   let lex_res = lex(path, source)
   let p = parser_new(lex_res.tokens, lex_res.diagnostics)
+  let imports : Array[ImportDecl] = []
   let decls : Array[Decl] = []
 
   while !p_is_eof(p) {
@@ -1386,6 +1486,13 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
       break
     }
     let start_span = p_peek(p).span
+    match p_peek(p).kind {
+      KwImport => {
+        imports.push(p_parse_import_decl(p, start_span))
+        continue
+      }
+      _ => ()
+    }
     let mut is_pub = false
     match p_peek(p).kind {
       KwPub => {
@@ -1420,16 +1527,38 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
       }
       KwFn => decls.push(p_parse_fn_decl(p, is_pub, start_span))
       KwLet => decls.push(p_parse_const_decl(p, is_pub, start_span))
+      Ident(kw) => {
+        let next_is_str = match p_peek_at(p, 1).kind {
+          StringLit(_) => true
+          _ => false
+        }
+        if !is_pub && !is_val && kw == "test" && next_is_str {
+          decls.push(p_parse_test_decl(p, start_span))
+        } else {
+          p_err(
+            p,
+            tok.span,
+            "expected top-level declaration (`import`, `fn`, `struct`, `enum`, `let`, `test`), found `" +
+            tok.raw +
+            "`",
+            "top-level declaration",
+            tok.raw,
+            "start a declaration with `import`, `fn`, `struct`, `enum`, `let`, or `test`",
+          )
+          let _ = p_advance(p)
+          p_sync_top(p)
+        }
+      }
       _ => {
         p_err(
           p,
           tok.span,
-          "expected top-level declaration (`fn`, `struct`, `enum`, `let`), found `" +
+          "expected top-level declaration (`import`, `fn`, `struct`, `enum`, `let`, `test`), found `" +
           tok.raw +
           "`",
           "top-level declaration",
           tok.raw,
-          "start a declaration with `fn`, `struct`, `enum`, or `let`",
+          "start a declaration with `import`, `fn`, `struct`, `enum`, `let`, or `test`",
         )
         let _ = p_advance(p)
         p_sync_top(p)
@@ -1438,7 +1567,7 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
   }
 
   ParseResult::{
-    file: SourceFile::{ path: path, decls: decls },
+    file: SourceFile::{ path: path, imports: imports, decls: decls },
     diagnostics: p.diagnostics,
   }
 }

@@ -152,13 +152,32 @@ pub struct Env {
 }
 
 ///|
+pub struct ImportedPkg {
+  name : String
+  tc : TypeChecker
+}
+
+///|
+pub fn imported_pkg_new(name : String, tc : TypeChecker) -> ImportedPkg {
+  ImportedPkg::{ name: name, tc: tc }
+}
+
+///|
 pub struct TypeChecker {
+  pkg_name : String
+  multi_pkg : Bool
   structs : Map[String, StructInfo]
+  struct_names : Array[String]
   enums : Map[String, EnumInfo]
+  enum_names : Array[String]
   variant_to_enum : Map[String, String]
   fns : Map[String, FnInfo]
   methods : Map[String, FnInfo]
+  method_names : Array[String]
   consts : Map[String, Ty]
+  const_pub : Map[String, Bool]
+  import_aliases : Map[String, String]
+  imported_pkgs : Map[String, ImportedPkg]
   diagnostics : Array[Diagnostic]
 }
 
@@ -228,6 +247,243 @@ fn env_lookup(env : Env, name : String) -> Option[VarBinding] {
     i = i - 1
   }
   None
+}
+
+///|
+pub struct QualParts {
+  prefix : String
+  name : String
+}
+
+///|
+pub fn split_qual_name(s : String) -> QualParts {
+  let len = s.length()
+  let mut i = 0
+  while i + 1 < len {
+    if str_code_at(s, i) == 58 && str_code_at(s, i + 1) == 58 {
+      return QualParts::{
+        prefix: slice_str(s, 0, i),
+        name: slice_str(s, i + 2, len),
+      }
+    }
+    i = i + 1
+  }
+  QualParts::{ prefix: "", name: s }
+}
+
+///|
+fn has_qual_sep(s : String) -> Bool {
+  split_qual_name(s).prefix.length() > 0
+}
+
+///|
+pub fn qualify_imported_ty(pkg_name : String, t : Ty) -> Ty {
+  match t {
+    TArray(e) => TArray(qualify_imported_ty(pkg_name, e))
+    TOption(e) => TOption(qualify_imported_ty(pkg_name, e))
+    TResult(ok, err) =>
+      TResult(
+        qualify_imported_ty(pkg_name, ok),
+        qualify_imported_ty(pkg_name, err),
+      )
+    TMap(k, v) =>
+      TMap(qualify_imported_ty(pkg_name, k), qualify_imported_ty(pkg_name, v))
+    TChannel(e) => TChannel(qualify_imported_ty(pkg_name, e))
+    TMutex(e) => TMutex(qualify_imported_ty(pkg_name, e))
+    TStruct(name, args) => {
+      let qname = if has_qual_sep(name) {
+        name
+      } else {
+        pkg_name + "::" + name
+      }
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(qualify_imported_ty(pkg_name, args[i]))
+        i = i + 1
+      }
+      TStruct(qname, out)
+    }
+    TEnum(name, args) => {
+      let qname = if has_qual_sep(name) {
+        name
+      } else {
+        pkg_name + "::" + name
+      }
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(qualify_imported_ty(pkg_name, args[i]))
+        i = i + 1
+      }
+      TEnum(qname, out)
+    }
+    TFn(params, ret) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < params.length() {
+        out.push(qualify_imported_ty(pkg_name, params[i]))
+        i = i + 1
+      }
+      TFn(out, qualify_imported_ty(pkg_name, ret))
+    }
+    TTuple(elems) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < elems.length() {
+        out.push(qualify_imported_ty(pkg_name, elems[i]))
+        i = i + 1
+      }
+      TTuple(out)
+    }
+    _ => t
+  }
+}
+
+///|
+fn qualify_fn_info(pkg_name : String, fi : FnInfo) -> FnInfo {
+  let ptys : Array[Ty] = []
+  let mut i = 0
+  while i < fi.param_tys.length() {
+    ptys.push(qualify_imported_ty(pkg_name, fi.param_tys[i]))
+    i = i + 1
+  }
+  FnInfo::{
+    decl: fi.decl,
+    param_tys: ptys,
+    ret_ty: qualify_imported_ty(pkg_name, fi.ret_ty),
+  }
+}
+
+///|
+fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
+  tc.imported_pkgs.set(ipkg.name, ipkg)
+  let skeys = ipkg.tc.struct_names
+  let mut i = 0
+  while i < skeys.length() {
+    let k = skeys[i]
+    match ipkg.tc.structs.get(k) {
+      Some(si) =>
+        if has_qual_sep(k) {
+          if !tc.structs.contains(k) {
+            tc.structs.set(k, si)
+            tc.struct_names.push(k)
+          }
+        } else if si.decl.is_pub {
+          let qftys : Array[Ty] = []
+          let mut j = 0
+          while j < si.field_tys.length() {
+            qftys.push(qualify_imported_ty(ipkg.name, si.field_tys[j]))
+            j = j + 1
+          }
+          let qk = ipkg.name + "::" + k
+          if !tc.structs.contains(qk) {
+            tc.struct_names.push(qk)
+          }
+          tc.structs.set(
+            qk,
+            StructInfo::{
+              decl: si.decl,
+              field_names: si.field_names,
+              field_muts: si.field_muts,
+              field_tys: qftys,
+            },
+          )
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  let ekeys = ipkg.tc.enum_names
+  i = 0
+  while i < ekeys.length() {
+    let k = ekeys[i]
+    match ipkg.tc.enums.get(k) {
+      Some(ei) =>
+        if has_qual_sep(k) {
+          if !tc.enums.contains(k) {
+            tc.enums.set(k, ei)
+            tc.enum_names.push(k)
+          }
+        } else if ei.decl.is_pub {
+          let qvars : Array[VariantInfo] = []
+          let mut vi = 0
+          while vi < ei.variants.length() {
+            let v = ei.variants[vi]
+            let qvftys : Array[Ty] = []
+            let mut j = 0
+            while j < v.field_tys.length() {
+              qvftys.push(qualify_imported_ty(ipkg.name, v.field_tys[j]))
+              j = j + 1
+            }
+            qvars.push(VariantInfo::{ name: v.name, field_tys: qvftys })
+            vi = vi + 1
+          }
+          let qk = ipkg.name + "::" + k
+          if !tc.enums.contains(qk) {
+            tc.enum_names.push(qk)
+          }
+          tc.enums.set(qk, EnumInfo::{ decl: ei.decl, variants: qvars })
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  let mkeys = ipkg.tc.method_names
+  i = 0
+  while i < mkeys.length() {
+    let k = mkeys[i]
+    match ipkg.tc.methods.get(k) {
+      Some(mi) => {
+        let pre = split_qual_name(k).prefix
+        let is_already_pkg_qual = ipkg.tc.imported_pkgs.contains(pre)
+        if is_already_pkg_qual {
+          if !tc.methods.contains(k) {
+            tc.methods.set(k, mi)
+            tc.method_names.push(k)
+          }
+        } else if mi.decl.is_pub {
+          let qk = ipkg.name + "::" + k
+          if !tc.methods.contains(qk) {
+            tc.method_names.push(qk)
+          }
+          tc.methods.set(qk, qualify_fn_info(ipkg.name, mi))
+        }
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+pub fn resolve_alias_pkg(
+  tc : TypeChecker,
+  alias_name : String,
+) -> Option[ImportedPkg] {
+  match tc.import_aliases.get(alias_name) {
+    Some(canon) => tc.imported_pkgs.get(canon)
+    None => None
+  }
+}
+
+///|
+fn emit_private_err(
+  tc : TypeChecker,
+  sp : Span,
+  kind : String,
+  pkg_name : String,
+  sym : String,
+) -> Unit {
+  tc_err(
+    tc,
+    sp,
+    "E_PRIVATE_SYMBOL",
+    kind + " `" + sym + "` in package `" + pkg_name + "` is private",
+    "pub " + kind,
+    "private " + kind + " `" + pkg_name + "::" + sym + "`",
+    "mark `" + kind + " " + sym + "` as `pub` in package `" + pkg_name + "`",
+  )
 }
 
 ///|
@@ -349,6 +605,34 @@ fn resolve_type_expr(
       }
       if tc.enums.contains(name) {
         return TEnum(name, rargs)
+      }
+      let qp = split_qual_name(name)
+      let q_alias = qp.prefix
+      let q_type = qp.name
+      if q_alias.length() > 0 {
+        match resolve_alias_pkg(tc, q_alias) {
+          Some(ipkg) => {
+            match ipkg.tc.structs.get(q_type) {
+              Some(si) => {
+                if !si.decl.is_pub {
+                  emit_private_err(tc, sp, "struct", ipkg.name, q_type)
+                }
+                return TStruct(ipkg.name + "::" + q_type, rargs)
+              }
+              None => ()
+            }
+            match ipkg.tc.enums.get(q_type) {
+              Some(ei) => {
+                if !ei.decl.is_pub {
+                  emit_private_err(tc, sp, "enum", ipkg.name, q_type)
+                }
+                return TEnum(ipkg.name + "::" + q_type, rargs)
+              }
+              None => ()
+            }
+          }
+          None => ()
+        }
       }
       tc_err(
         tc,
@@ -2067,7 +2351,31 @@ fn check_method_call(
           }
           return subst_ty(minfo.ret_ty, subst)
         }
-        None => ()
+        None => {
+          let qp = split_qual_name(sname)
+          let canon_pkg = qp.prefix
+          let st_name = qp.name
+          if canon_pkg.length() > 0 {
+            match tc.imported_pkgs.get(canon_pkg) {
+              Some(ipkg) =>
+                match ipkg.tc.methods.get(st_name + "::" + method_name) {
+                  Some(mi) =>
+                    if !mi.decl.is_pub {
+                      emit_private_err(
+                        tc,
+                        sp,
+                        "fn",
+                        canon_pkg,
+                        st_name + "::" + method_name,
+                      )
+                      return qualify_imported_ty(canon_pkg, mi.ret_ty)
+                    }
+                  None => ()
+                }
+              None => ()
+            }
+          }
+        }
       }
     }
     _ => ()
@@ -2147,6 +2455,92 @@ fn check_expr(
       }
       if tc.enums.contains(qual) {
         return check_variant_ctor(tc, env, qual, mem, [], expected, sp)
+      }
+      let qp = split_qual_name(qual)
+      let q_alias = qp.prefix
+      let q_sub = qp.name
+      if q_alias.length() > 0 {
+        match resolve_alias_pkg(tc, q_alias) {
+          Some(ipkg) => {
+            match ipkg.tc.enums.get(q_sub) {
+              Some(ei) => {
+                if !ei.decl.is_pub {
+                  emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                }
+                return check_variant_ctor(
+                  tc,
+                  env,
+                  ipkg.name + "::" + q_sub,
+                  mem,
+                  [],
+                  expected,
+                  sp,
+                )
+              }
+              None => ()
+            }
+            match ipkg.tc.methods.get(q_sub + "::" + mem) {
+              Some(mi) => {
+                if !mi.decl.is_pub {
+                  emit_private_err(tc, sp, "fn", ipkg.name, q_sub + "::" + mem)
+                }
+                let qmi = qualify_fn_info(ipkg.name, mi)
+                return TFn(qmi.param_tys, qmi.ret_ty)
+              }
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
+      match resolve_alias_pkg(tc, qual) {
+        Some(ipkg) => {
+          match ipkg.tc.consts.get(mem) {
+            Some(cty) => {
+              let is_p = match ipkg.tc.const_pub.get(mem) {
+                Some(b) => b
+                None => false
+              }
+              if !is_p {
+                emit_private_err(tc, sp, "let", ipkg.name, mem)
+              }
+              return qualify_imported_ty(ipkg.name, cty)
+            }
+            None => ()
+          }
+          match ipkg.tc.fns.get(mem) {
+            Some(fi) => {
+              if !fi.decl.is_pub {
+                emit_private_err(tc, sp, "fn", ipkg.name, mem)
+              }
+              let qfi = qualify_fn_info(ipkg.name, fi)
+              return TFn(qfi.param_tys, qfi.ret_ty)
+            }
+            None => ()
+          }
+          match ipkg.tc.variant_to_enum.get(mem) {
+            Some(en) => {
+              match ipkg.tc.enums.get(en) {
+                Some(ei) =>
+                  if !ei.decl.is_pub {
+                    emit_private_err(tc, sp, "enum", ipkg.name, en)
+                  }
+                None => ()
+              }
+              return check_variant_ctor(
+                tc,
+                env,
+                ipkg.name + "::" + en,
+                mem,
+                [],
+                expected,
+                sp,
+              )
+            }
+            None => ()
+          }
+        }
+        None => ()
       }
       let key = qual + "::" + mem
       match tc.methods.get(key) {
@@ -2438,6 +2832,97 @@ fn check_expr(
           if qual == "Option" || qual == "Result" || tc.enums.contains(qual) {
             return check_variant_ctor(tc, env, qual, mem, args, expected, sp)
           }
+          let qp = split_qual_name(qual)
+          let q_alias = qp.prefix
+          let q_sub = qp.name
+          if q_alias.length() > 0 {
+            match resolve_alias_pkg(tc, q_alias) {
+              Some(ipkg) => {
+                match ipkg.tc.enums.get(q_sub) {
+                  Some(ei) => {
+                    if !ei.decl.is_pub {
+                      emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                    }
+                    return check_variant_ctor(
+                      tc,
+                      env,
+                      ipkg.name + "::" + q_sub,
+                      mem,
+                      args,
+                      expected,
+                      sp,
+                    )
+                  }
+                  None => ()
+                }
+                match ipkg.tc.methods.get(q_sub + "::" + mem) {
+                  Some(mi) => {
+                    if !mi.decl.is_pub {
+                      emit_private_err(
+                        tc,
+                        sp,
+                        "fn",
+                        ipkg.name,
+                        q_sub + "::" + mem,
+                      )
+                    }
+                    return check_fn_call(
+                      tc,
+                      env,
+                      qualify_fn_info(ipkg.name, mi),
+                      args,
+                      expected,
+                      sp,
+                    )
+                  }
+                  None => ()
+                }
+              }
+              None => ()
+            }
+          }
+          match resolve_alias_pkg(tc, qual) {
+            Some(ipkg) => {
+              match ipkg.tc.fns.get(mem) {
+                Some(fi) => {
+                  if !fi.decl.is_pub {
+                    emit_private_err(tc, sp, "fn", ipkg.name, mem)
+                  }
+                  return check_fn_call(
+                    tc,
+                    env,
+                    qualify_fn_info(ipkg.name, fi),
+                    args,
+                    expected,
+                    sp,
+                  )
+                }
+                None => ()
+              }
+              match ipkg.tc.variant_to_enum.get(mem) {
+                Some(en) => {
+                  match ipkg.tc.enums.get(en) {
+                    Some(ei) =>
+                      if !ei.decl.is_pub {
+                        emit_private_err(tc, sp, "enum", ipkg.name, en)
+                      }
+                    None => ()
+                  }
+                  return check_variant_ctor(
+                    tc,
+                    env,
+                    ipkg.name + "::" + en,
+                    mem,
+                    args,
+                    expected,
+                    sp,
+                  )
+                }
+                None => ()
+              }
+            }
+            None => ()
+          }
           let key = qual + "::" + mem
           match tc.methods.get(key) {
             Some(minfo) => return check_fn_call(tc, env, minfo, args, expected, sp)
@@ -2611,12 +3096,32 @@ fn check_expr(
       TArray(first_ty)
     }
     EStructLit(sname, fields, sp) => {
-      let resolved_name = if sname != "" {
+      let mut resolved_name = if sname != "" {
         sname
       } else {
         match expected {
           Some(TStruct(en, _)) => en
           _ => ""
+        }
+      }
+      if resolved_name != "" && !tc.structs.contains(resolved_name) {
+        let qp = split_qual_name(resolved_name)
+        let q_alias = qp.prefix
+        let q_st = qp.name
+        if q_alias.length() > 0 {
+          match resolve_alias_pkg(tc, q_alias) {
+            Some(ipkg) =>
+              match ipkg.tc.structs.get(q_st) {
+                Some(si) => {
+                  if !si.decl.is_pub {
+                    emit_private_err(tc, sp, "struct", ipkg.name, q_st)
+                  }
+                  resolved_name = ipkg.name + "::" + q_st
+                }
+                None => ()
+              }
+            None => ()
+          }
         }
       }
       if resolved_name == "" {
@@ -2929,18 +3434,59 @@ pub struct CheckedPackage {
 }
 
 ///|
-pub fn check_package_selective(
+pub fn check_package_with_imports(
   pkg : Package,
   check_file : Array[Bool],
+  imported : Array[ImportedPkg],
+  multi_pkg : Bool,
 ) -> CheckedPackage {
   let tc = TypeChecker::{
+    pkg_name: pkg.name,
+    multi_pkg: multi_pkg,
     structs: Map([]),
+    struct_names: [],
     enums: Map([]),
+    enum_names: [],
     variant_to_enum: Map([]),
     fns: Map([]),
     methods: Map([]),
+    method_names: [],
     consts: Map([]),
+    const_pub: Map([]),
+    import_aliases: Map([]),
+    imported_pkgs: Map([]),
     diagnostics: [],
+  }
+
+  let mut ipi = 0
+  while ipi < imported.length() {
+    import_pkg_into_tc(tc, imported[ipi])
+    ipi = ipi + 1
+  }
+
+  // Register file-level imports and validate package existence
+  let mut fi_imp = 0
+  while fi_imp < pkg.files.length() {
+    let f = pkg.files[fi_imp]
+    let mut ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      if tc.imported_pkgs.contains(imp.path) {
+        tc.import_aliases.set(imp.alias_name, imp.path)
+      } else {
+        tc_err(
+          tc,
+          imp.span,
+          "E_UNKNOWN_PACKAGE",
+          "unknown imported package `" + imp.path + "`",
+          "declared dependency in m2.toml",
+          imp.path,
+          "add `" + imp.path + " = { path = \"...\" }` to `[dependencies]` in `m2.toml`",
+        )
+      }
+      ii = ii + 1
+    }
+    fi_imp = fi_imp + 1
   }
 
   // Pass 1: register type names (structs & enums)
@@ -2950,7 +3496,10 @@ pub fn check_package_selective(
     let mut di = 0
     while di < f.decls.length() {
       match f.decls[di] {
-        DStruct(sd) =>
+        DStruct(sd) => {
+          if !tc.structs.contains(sd.name) {
+            tc.struct_names.push(sd.name)
+          }
           tc.structs.set(
             sd.name,
             StructInfo::{
@@ -2960,7 +3509,11 @@ pub fn check_package_selective(
               field_tys: [],
             },
           )
+        }
         DEnum(ed) => {
+          if !tc.enums.contains(ed.name) {
+            tc.enum_names.push(ed.name)
+          }
           tc.enums.set(ed.name, EnumInfo::{ decl: ed, variants: [] })
           let mut vi = 0
           while vi < ed.variants.length() {
@@ -3059,7 +3612,11 @@ pub fn check_package_selective(
           }
           let finfo = FnInfo::{ decl: fd, param_tys: ptys, ret_ty: rty }
           if fd.receiver_type != "" {
-            tc.methods.set(fd.receiver_type + "::" + fd.name, finfo)
+            let mk = fd.receiver_type + "::" + fd.name
+            if !tc.methods.contains(mk) {
+              tc.method_names.push(mk)
+            }
+            tc.methods.set(mk, finfo)
           } else {
             tc.fns.set(fd.name, finfo)
           }
@@ -3081,7 +3638,9 @@ pub fn check_package_selective(
             _ => resolve_type_expr(tc, cd.ty, [])
           }
           tc.consts.set(cd.name, cty)
+          tc.const_pub.set(cd.name, cd.is_pub)
         }
+        DTest(_) => ()
       }
       di = di + 1
     }
@@ -3196,6 +3755,10 @@ pub fn check_package_selective(
             )
           }
         }
+        DTest(td) => {
+          let env = env_new(TUnit, [])
+          let _ = check_stmts(tc, env, td.body, None)
+        }
         _ => ()
       }
       di = di + 1
@@ -3204,6 +3767,14 @@ pub fn check_package_selective(
   }
 
   CheckedPackage::{ pkg: pkg, tc: tc, diagnostics: tc.diagnostics }
+}
+
+///|
+pub fn check_package_selective(
+  pkg : Package,
+  check_file : Array[Bool],
+) -> CheckedPackage {
+  check_package_with_imports(pkg, check_file, [], false)
 }
 
 ///|
@@ -3218,10 +3789,12 @@ pub fn check_package(pkg : Package) -> CheckResult {
 }
 
 ///|
-pub fn check_source_files_full(
+pub fn check_source_files_with_imports(
   pkg_name : String,
   paths : Array[String],
   sources : Array[String],
+  imported : Array[ImportedPkg],
+  multi_pkg : Bool,
 ) -> CheckedPackage {
   let all_diags : Array[Diagnostic] = []
   let files : Array[SourceFile] = []
@@ -3237,13 +3810,22 @@ pub fn check_source_files_full(
     i = i + 1
   }
   let pkg = Package::{ name: pkg_name, files: files }
-  let cr = check_package_full(pkg)
+  let cr = check_package_with_imports(pkg, [], imported, multi_pkg)
   let mut k = 0
   while k < cr.diagnostics.length() {
     all_diags.push(cr.diagnostics[k])
     k = k + 1
   }
   CheckedPackage::{ pkg: pkg, tc: cr.tc, diagnostics: all_diags }
+}
+
+///|
+pub fn check_source_files_full(
+  pkg_name : String,
+  paths : Array[String],
+  sources : Array[String],
+) -> CheckedPackage {
+  check_source_files_with_imports(pkg_name, paths, sources, [], false)
 }
 
 ///|

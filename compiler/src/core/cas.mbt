@@ -223,6 +223,30 @@ pub struct CasEntry {
 }
 
 ///|
+pub fn m2_compiler_abi_rev() -> String {
+  "m2c-v0.6"
+}
+
+///|
+pub fn cas_compiler_fp(
+  qbe_size : Int64,
+  rt_size : Int64,
+  salt : String,
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string(m2_compiler_abi_rev())
+  sb.write_string("|qbe:")
+  sb.write_string(qbe_size.to_string())
+  sb.write_string("|rt:")
+  sb.write_string(rt_size.to_string())
+  if salt.length() > 0 {
+    sb.write_string("|salt:")
+    sb.write_string(salt)
+  }
+  cas_sha256_hex(sb.to_string())
+}
+
+///|
 pub fn cas_compute_key(
   pkg_name : String,
   paths : Array[String],
@@ -230,10 +254,18 @@ pub fn cas_compute_key(
   upstream_sigs : Array[String],
   target : String,
   release : Bool,
+  compiler_fp : String,
 ) -> String {
+  let fp = if compiler_fp.length() > 0 {
+    compiler_fp
+  } else {
+    m2_compiler_abi_rev()
+  }
   let sb = StringBuilder()
-  sb.write_string("m2-cas-v1\n")
-  sb.write_string("pkg:")
+  sb.write_string("m2-cas-v2\n")
+  sb.write_string("fp:")
+  sb.write_string(fp)
+  sb.write_string("\npkg:")
   sb.write_string(pkg_name)
   sb.write_string("\ntarget:")
   sb.write_string(target)
@@ -272,10 +304,18 @@ pub fn cas_compute_unit_key(
   sigs_hash : String,
   target : String,
   release : Bool,
+  compiler_fp : String,
 ) -> String {
+  let fp = if compiler_fp.length() > 0 {
+    compiler_fp
+  } else {
+    m2_compiler_abi_rev()
+  }
   let sb = StringBuilder()
-  sb.write_string("m2-unit-cas-v1\n")
-  sb.write_string("pkg:")
+  sb.write_string("m2-unit-cas-v2\n")
+  sb.write_string("fp:")
+  sb.write_string(fp)
+  sb.write_string("\npkg:")
   sb.write_string(pkg_name)
   sb.write_string("\nidx:")
   sb.write_string(unit_idx.to_string())
