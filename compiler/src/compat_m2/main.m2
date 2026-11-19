@@ -374,8 +374,10 @@ fn drv_resolve_qbe_target(world : World) -> String {
   let env_t = drv_env_str(world, "M2_TARGET")
   if env_t.length() > 0 {
     env_t
-  } else {
+  } else if fs_exists(world, "/System/Library") {
     "arm64_apple"
+  } else {
+    "amd64_sysv"
   }
 }
 
@@ -891,7 +893,7 @@ fn drv_link_objects(
       if e.length() > 0 {
         e
       } else {
-        "clang"
+        "cc"
       }
     }
     let ld_argv : Array[String] = [cc]
@@ -1108,6 +1110,9 @@ fn drv_build_targets(
           "_" +
           drv_prefix16(built.link_key)
         let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+        if out_bin_arg == "" && fs_exists(world, final_bin) {
+          return Ok(final_bin)
+        }
         if out_bin_arg != "" {
           drv_ensure_parent_dir(world, out_bin_arg)
         }
@@ -1652,7 +1657,7 @@ fn drv_build_targets(
         if e.length() > 0 {
           e
         } else {
-          "clang"
+          "cc"
         }
       }
       let ld_argv : Array[String] = [cc]
@@ -1847,7 +1852,7 @@ fn drv_build_targets(
       if e.length() > 0 {
         e
       } else {
-        "clang"
+        "cc"
       }
     }
     proc_exec(
@@ -2044,6 +2049,106 @@ fn drv_run_tests_cmd(
 }
 
 ///|
+fn drv_is_fmt_file(name : String) -> Bool {
+  if name.length() == 0 {
+    return false
+  }
+  if str_code_at(name, 0) == 46 {
+    return false
+  }
+  drv_ends_with(name, ".m2") || drv_ends_with(name, ".mbt")
+}
+
+///|
+fn drv_collect_fmt_files_dir(
+  world : World,
+  dir : String,
+  out : Array[String],
+) -> Unit {
+  let entries = fs_list_dir(world, dir)
+  let mut i = 0
+  while i < entries.length() {
+    let name = entries[i]
+    if name.length() > 0 && str_code_at(name, 0) != 46 {
+      let full = drv_join_path(dir, name)
+      if fs_is_dir(world, full) {
+        if name != "_build" && name != "target" && name != "out" && name != "vendor" {
+          drv_collect_fmt_files_dir(world, full, out)
+        }
+      } else if drv_is_fmt_file(name) {
+        out.push(full)
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn drv_run_fmt_cmd(
+  world : World,
+  targets : Array[String],
+  check_only : Bool,
+  as_json : Bool,
+) -> Int {
+  let files : Array[String] = []
+  let mut t = 0
+  while t < targets.length() {
+    let target = targets[t]
+    if !fs_exists(world, target) {
+      io_eprintln(world, "error: path does not exist: " + target)
+      return 1
+    }
+    if fs_is_dir(world, target) {
+      drv_collect_fmt_files_dir(world, target, files)
+    } else {
+      files.push(target)
+    }
+    t = t + 1
+  }
+  let unformatted : Array[String] = []
+  let mut i = 0
+  while i < files.length() {
+    let path = files[i]
+    let src = match fs_read(world, path) {
+      Err(msg) => {
+        io_eprintln(world, "error: failed to read " + path + ": " + msg)
+        return 1
+      }
+      Ok(s) => s
+    }
+    let formatted = format_source(src)
+    if formatted != src {
+      if check_only {
+        unformatted.push(path)
+      } else {
+        if !drv_write_text_atomic(world, path, formatted) {
+          io_eprintln(world, "error: failed to write " + path)
+          return 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if check_only {
+    if as_json {
+      io_println(world, fmt_check_result_to_json(unformatted))
+    } else {
+      let mut j = 0
+      while j < unformatted.length() {
+        io_println(world, unformatted[j])
+        j = j + 1
+      }
+    }
+    if unformatted.length() == 0 { 0 } else { 1 }
+  } else {
+    if as_json {
+      io_println(world, fmt_check_result_to_json([]))
+    }
+    0
+  }
+}
+
+///|
 fn drv_usage(world : World) -> Unit {
   io_eprintln(
     world,
@@ -2053,6 +2158,7 @@ fn drv_usage(world : World) -> Unit {
     "  m2c emit-sig <input1> [input2 ...]\n" +
     "  m2c build [--release] [--emit-ssa <path>] [--emit-asm <path>] [--jobs <n>] [-o <out>] <input1> [input2 ...]\n" +
     "  m2c run [--release] <input> [-- args...]\n" +
+    "  m2c fmt [--check] [--json] <input1> [input2 ...]\n" +
     "  m2c test [--json] [--filter <name>] <input>",
   )
 }
@@ -2331,6 +2437,27 @@ pub fn main(world : World) -> Int {
         return proc_exec(world, run_argv)
       }
     }
+  } else if cmd == "fmt" {
+    let mut check_only = false
+    let mut as_json = false
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      if a == "--check" {
+        check_only = true
+      } else if a == "--json" {
+        as_json = true
+      } else {
+        targets.push(a)
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    return drv_run_fmt_cmd(world, targets, check_only, as_json)
   } else if cmd == "test" {
     let mut as_json = false
     let mut filter = ""
