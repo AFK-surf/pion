@@ -8,6 +8,7 @@
 #include <limits.h>
 #include <math.h>
 #include <pthread.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,6 +18,8 @@
 #include <time.h>
 #include <unistd.h>
 
+extern char **environ;
+
 /* ============================================================================
  * 1. Memory & Biased RC
  * ============================================================================ */
@@ -24,13 +27,22 @@
 static _Atomic uint64_t g_next_tid = 1;
 static _Thread_local uint64_t tls_tid = 0;
 
-uint64_t m2_cur_tid(void) {
+static uint64_t m2_cur_tid_slow(void) {
+    uint64_t t = atomic_fetch_add_explicit(&g_next_tid, 1, memory_order_relaxed);
+    tls_tid = t;
+    return t;
+}
+
+static inline uint64_t m2_cur_tid_fast(void) {
     uint64_t t = tls_tid;
     if (__builtin_expect(t == 0, 0)) {
-        t = atomic_fetch_add_explicit(&g_next_tid, 1, memory_order_relaxed);
-        tls_tid = t;
+        return m2_cur_tid_slow();
     }
     return t;
+}
+
+uint64_t m2_cur_tid(void) {
+    return m2_cur_tid_fast();
 }
 
 static inline M2Header *m2_hdr(void *obj) {
@@ -202,7 +214,7 @@ static inline void *m2_alloc_raw(uint32_t payload_size, uint16_t type_tag, M2Dro
             m2_panic("out of memory", __FILE__, __LINE__);
         }
     }
-    hdr->owner_tid = m2_cur_tid();
+    hdr->owner_tid = m2_cur_tid_fast();
     hdr->local_rc = 1;
     atomic_init(&hdr->shared_rc, 0);
     hdr->type_tag = type_tag;
@@ -218,6 +230,10 @@ void *m2_alloc(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn) {
         memset(payload, 0, payload_size);
     }
     return payload;
+}
+
+void *m2_alloc_uninit(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn) {
+    return m2_alloc_raw(payload_size, type_tag, drop_fn);
 }
 
 static void m2_destroy(M2Header *hdr, void *obj) {
@@ -247,7 +263,7 @@ void m2_rc_inc(void *obj) {
     if (!obj) return;
     M2Header *hdr = m2_hdr(obj);
     if (hdr->flags & M2_FLAG_IMMORTAL) return;
-    if (__builtin_expect(hdr->owner_tid == m2_cur_tid(), 1)) {
+    if (__builtin_expect(hdr->owner_tid == m2_cur_tid_fast(), 1)) {
         hdr->local_rc++;
     } else {
         atomic_fetch_add_explicit(&hdr->shared_rc, 1, memory_order_relaxed);
@@ -258,7 +274,7 @@ void m2_rc_dec(void *obj) {
     if (!obj) return;
     M2Header *hdr = m2_hdr(obj);
     if (hdr->flags & M2_FLAG_IMMORTAL) return;
-    if (__builtin_expect(hdr->owner_tid == m2_cur_tid(), 1)) {
+    if (__builtin_expect(hdr->owner_tid == m2_cur_tid_fast(), 1)) {
         if (--hdr->local_rc == 0) {
             if (atomic_load_explicit(&hdr->shared_rc, memory_order_acquire) == 0) {
                 m2_destroy(hdr, obj);
@@ -275,7 +291,7 @@ void m2_rc_freeze(void *obj) {
     if (!obj) return;
     M2Header *hdr = m2_hdr(obj);
     if ((hdr->flags & M2_FLAG_IMMORTAL) || hdr->owner_tid == 0) return;
-    if (hdr->owner_tid != m2_cur_tid()) {
+    if (hdr->owner_tid != m2_cur_tid_fast()) {
         m2_panic("m2_rc_freeze called from non-owning thread", __FILE__, __LINE__);
     }
     uint32_t rc = hdr->local_rc;
@@ -636,18 +652,75 @@ void *m2_arr_copy(void *a_ptr) {
 }
 
 /* ============================================================================
- * 5. String-Keyed Hash Map (Open Addressing, FNV-1a)
+ * 5. String-Keyed Hash Map (Open Addressing, 64-bit Block Hash)
  * ============================================================================ */
 
-static inline uint64_t m2_fnv1a(const M2String *s) {
-    uint64_t h = 14695981039346656037ULL;
+static inline uint64_t m2_str_hash(const M2String *s) {
     const unsigned char *p = (const unsigned char *)s->data;
-    const unsigned char *end = p + s->len;
-    while (p < end) {
-        h ^= (uint64_t)(*p++);
-        h *= 1099511628211ULL;
+    size_t len = (size_t)s->len;
+    uint64_t h = 0x517cc1b727220a95ULL ^ ((uint64_t)len * 0x9e3779b97f4a7c15ULL);
+    while (len >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h ^= w;
+        h *= 0x9e3779b97f4a7c15ULL;
+        h ^= h >> 32;
+        p += 8;
+        len -= 8;
     }
+    uint64_t tail = 0;
+    if (len >= 4) {
+        uint32_t w4;
+        memcpy(&w4, p, 4);
+        tail = (uint64_t)w4;
+        p += 4;
+        len -= 4;
+        if (len >= 2) {
+            uint16_t w2;
+            memcpy(&w2, p, 2);
+            tail |= ((uint64_t)w2) << 32;
+            p += 2;
+            len -= 2;
+        }
+        if (len == 1) {
+            tail |= ((uint64_t)p[0]) << 48;
+        }
+    } else {
+        if (len >= 2) {
+            uint16_t w2;
+            memcpy(&w2, p, 2);
+            tail = (uint64_t)w2;
+            p += 2;
+            len -= 2;
+        }
+        if (len == 1) {
+            tail |= ((uint64_t)p[0]) << 16;
+        }
+    }
+    h ^= tail;
+    h *= 0xbf58476d1ce4e5b9ULL;
+    h ^= h >> 27;
+    h *= 0x94d049bb133111ebULL;
+    h ^= h >> 31;
     return h;
+}
+
+/* Shared inline linear-probe hot path: returns matching occupied slot or first empty slot.
+ * Caller must ensure m->cap > 0, m->entries != NULL, and k != NULL. */
+static inline M2MapEntry *m2_map_probe(const M2Map *m, const M2String *k, uint64_t h) {
+    uint64_t mask = (uint64_t)(m->cap - 1);
+    uint64_t idx = h & mask;
+    M2MapEntry *entries = m->entries;
+    for (;;) {
+        M2MapEntry *e = &entries[idx];
+        if (e->state == 0) {
+            return e;
+        }
+        if (e->hash == h && m2_str_eq_fast(e->key, k)) {
+            return e;
+        }
+        idx = (idx + 1) & mask;
+    }
 }
 
 static void m2_map_drop(void *payload) {
@@ -707,47 +780,47 @@ void m2_map_set(void *m_ptr, void *key_str, int64_t val) {
     } else if (__builtin_expect((m->len + 1) * 10 >= m->cap * 7, 0)) {
         m2_map_grow(m, m->cap * 2);
     }
-    uint64_t h = m2_fnv1a(k);
-    uint64_t mask = (uint64_t)(m->cap - 1);
-    uint64_t idx = h & mask;
-    M2MapEntry *entries = m->entries;
-    while (entries[idx].state == 1) {
-        if (entries[idx].hash == h && m2_str_eq_fast(entries[idx].key, k)) {
-            if (m->val_is_obj) {
-                m2_rc_inc((void *)(uintptr_t)val);
-                m2_rc_dec((void *)(uintptr_t)entries[idx].val);
-            }
-            entries[idx].val = val;
-            return;
+    uint64_t h = m2_str_hash(k);
+    M2MapEntry *e = m2_map_probe(m, k, h);
+    if (e->state == 1) {
+        if (m->val_is_obj) {
+            m2_rc_inc((void *)(uintptr_t)val);
+            m2_rc_dec((void *)(uintptr_t)e->val);
         }
-        idx = (idx + 1) & mask;
+        e->val = val;
+        return;
     }
     m2_rc_inc(k);
     if (m->val_is_obj) {
         m2_rc_inc((void *)(uintptr_t)val);
     }
-    entries[idx].key = k;
-    entries[idx].hash = h;
-    entries[idx].val = val;
-    entries[idx].state = 1;
+    e->key = k;
+    e->hash = h;
+    e->val = val;
+    e->state = 1;
     m->len++;
+}
+
+int32_t m2_map_try_get(void *m_ptr, void *key_str, int64_t *out_val) {
+    M2Map *m = (M2Map *)m_ptr;
+    M2String *k = (M2String *)key_str;
+    if (__builtin_expect(!m || !k || m->len == 0, 0)) return 0;
+    uint64_t h = m2_str_hash(k);
+    M2MapEntry *e = m2_map_probe(m, k, h);
+    if (e->state == 1) {
+        if (out_val) *out_val = e->val;
+        return 1;
+    }
+    return 0;
 }
 
 int32_t m2_map_has(void *m_ptr, void *key_str) {
     M2Map *m = (M2Map *)m_ptr;
     M2String *k = (M2String *)key_str;
     if (__builtin_expect(!m || !k || m->len == 0, 0)) return 0;
-    uint64_t h = m2_fnv1a(k);
-    uint64_t mask = (uint64_t)(m->cap - 1);
-    uint64_t idx = h & mask;
-    M2MapEntry *entries = m->entries;
-    while (entries[idx].state == 1) {
-        if (entries[idx].hash == h && m2_str_eq_fast(entries[idx].key, k)) {
-            return 1;
-        }
-        idx = (idx + 1) & mask;
-    }
-    return 0;
+    uint64_t h = m2_str_hash(k);
+    M2MapEntry *e = m2_map_probe(m, k, h);
+    return e->state == 1 ? 1 : 0;
 }
 
 int64_t m2_map_get(void *m_ptr, void *key_str) {
@@ -756,15 +829,10 @@ int64_t m2_map_get(void *m_ptr, void *key_str) {
     if (__builtin_expect(!m || !k || m->len == 0, 0)) {
         m2_panic("map key not found", __FILE__, __LINE__);
     }
-    uint64_t h = m2_fnv1a(k);
-    uint64_t mask = (uint64_t)(m->cap - 1);
-    uint64_t idx = h & mask;
-    M2MapEntry *entries = m->entries;
-    while (entries[idx].state == 1) {
-        if (entries[idx].hash == h && m2_str_eq_fast(entries[idx].key, k)) {
-            return entries[idx].val;
-        }
-        idx = (idx + 1) & mask;
+    uint64_t h = m2_str_hash(k);
+    M2MapEntry *e = m2_map_probe(m, k, h);
+    if (__builtin_expect(e->state == 1, 1)) {
+        return e->val;
     }
     m2_panic("map key not found", __FILE__, __LINE__);
 }
@@ -773,35 +841,31 @@ void m2_map_remove(void *m_ptr, void *key_str) {
     M2Map *m = (M2Map *)m_ptr;
     M2String *k = (M2String *)key_str;
     if (!m || !k || m->len == 0 || m->cap == 0) return;
-    uint64_t h = m2_fnv1a(k);
+    uint64_t h = m2_str_hash(k);
+    M2MapEntry *e = m2_map_probe(m, k, h);
+    if (e->state == 0) return;
     uint64_t mask = (uint64_t)(m->cap - 1);
-    uint64_t idx = h & mask;
-    while (m->entries[idx].state == 1) {
-        if (m->entries[idx].hash == h && m2_str_eq(m->entries[idx].key, k)) {
-            m2_rc_dec(m->entries[idx].key);
-            if (m->val_is_obj) {
-                m2_rc_dec((void *)(uintptr_t)m->entries[idx].val);
-            }
-            m->len--;
-            /* Backward-shift deletion to keep probe chains intact without tombstones */
-            uint64_t hole = idx;
-            uint64_t cur = (idx + 1) & mask;
-            while (m->entries[cur].state == 1) {
-                uint64_t home = m->entries[cur].hash & mask;
-                if (((hole - home) & mask) < ((cur - home) & mask)) {
-                    m->entries[hole] = m->entries[cur];
-                    hole = cur;
-                }
-                cur = (cur + 1) & mask;
-            }
-            m->entries[hole].state = 0;
-            m->entries[hole].key = NULL;
-            m->entries[hole].val = 0;
-            m->entries[hole].hash = 0;
-            return;
-        }
-        idx = (idx + 1) & mask;
+    uint64_t idx = (uint64_t)(e - m->entries);
+    m2_rc_dec(e->key);
+    if (m->val_is_obj) {
+        m2_rc_dec((void *)(uintptr_t)e->val);
     }
+    m->len--;
+    /* Backward-shift deletion to keep probe chains intact without tombstones */
+    uint64_t hole = idx;
+    uint64_t cur = (idx + 1) & mask;
+    while (m->entries[cur].state == 1) {
+        uint64_t home = m->entries[cur].hash & mask;
+        if (((hole - home) & mask) < ((cur - home) & mask)) {
+            m->entries[hole] = m->entries[cur];
+            hole = cur;
+        }
+        cur = (cur + 1) & mask;
+    }
+    m->entries[hole].state = 0;
+    m->entries[hole].key = NULL;
+    m->entries[hole].val = 0;
+    m->entries[hole].hash = 0;
 }
 
 void *m2_map_copy(void *m_ptr) {
@@ -1252,8 +1316,8 @@ void *m2_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_out) {
         if (ok_out) *ok_out = 0;
         return m2_str_from_cstr("", 0);
     }
-    M2String *out = (M2String *)m2_alloc((uint32_t)(sizeof(M2String) + (size_t)sz + 1),
-                                         M2_TAG_STRING, NULL);
+    M2String *out = (M2String *)m2_alloc_raw((uint32_t)(sizeof(M2String) + (size_t)sz + 1),
+                                             M2_TAG_STRING, NULL);
     out->len = (int64_t)sz;
     if (sz > 0) {
         size_t got = fread(out->data, 1, (size_t)sz, f);
@@ -1422,16 +1486,12 @@ int32_t m2_world_exec(void *w_ptr, void *argv_arr) {
     }
     argv[arr->len] = NULL;
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        free(argv);
-        return -1;
-    }
-    if (pid == 0) {
-        execvp(argv[0], argv);
-        _exit(127);
-    }
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, argv[0], NULL, NULL, argv, environ);
     free(argv);
+    if (rc != 0) {
+        return 127;
+    }
     int status = 0;
     while (waitpid(pid, &status, 0) < 0) {
         if (errno != EINTR) return -1;

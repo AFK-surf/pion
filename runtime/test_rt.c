@@ -43,6 +43,12 @@ static void *test_node_new(int64_t id, void *child) {
 M2_STATIC_STRING_DEF(kImmortalHello, "hello immortal");
 M2_STATIC_STRING_DEF(kImmortalEmpty, "");
 
+static double monotonic_sec(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 /* ============================================================================
  * 1. Unit Tests
  * ============================================================================ */
@@ -79,6 +85,48 @@ static void test_biased_rc_and_immortal(void) {
     /* debug_assert true path */
     m2_debug_assert(1, kImmortalHello, __FILE__, __LINE__);
     printf("[PASS] biased_rc_and_immortal\n");
+}
+
+static void test_alloc_uninit(void) {
+    atomic_store(&g_drop_count, 0);
+
+    /* Slab-sized object with destructor + nested child */
+    TestNode *leaf = (TestNode *)m2_alloc_uninit((uint32_t)sizeof(TestNode), M2_TAG_STRUCT, test_node_drop);
+    leaf->id = 101;
+    leaf->child = NULL;
+
+    TestNode *parent = (TestNode *)m2_alloc_uninit((uint32_t)sizeof(TestNode), M2_TAG_STRUCT, test_node_drop);
+    parent->id = 202;
+    m2_rc_inc(leaf);
+    parent->child = leaf;
+
+    assert(parent->id == 202);
+    assert(((TestNode *)parent->child)->id == 101);
+
+    m2_rc_dec(leaf);
+    assert(atomic_load(&g_drop_count) == 0);
+    m2_rc_inc(parent);
+    m2_rc_dec(parent);
+    assert(atomic_load(&g_drop_count) == 0);
+    m2_rc_dec(parent);
+    assert(atomic_load(&g_drop_count) == 2);
+
+    /* Large (> slab max) uninitialized allocation + full write/read + release */
+    uint64_t *big = (uint64_t *)m2_alloc_uninit(512u, M2_TAG_STRUCT, NULL);
+    for (int i = 0; i < 64; i++) {
+        big[i] = (uint64_t)(i * 131 + 7);
+    }
+    for (int i = 0; i < 64; i++) {
+        assert(big[i] == (uint64_t)(i * 131 + 7));
+    }
+    m2_rc_dec(big);
+
+    /* Zero-byte uninitialized allocation */
+    void *empty = m2_alloc_uninit(0u, M2_TAG_ENUM, NULL);
+    assert(empty != NULL);
+    m2_rc_dec(empty);
+
+    printf("[PASS] alloc_uninit\n");
 }
 
 static void test_string_and_strbuf(void) {
@@ -272,6 +320,120 @@ static void test_array_and_map(void) {
     assert(atomic_load(&g_drop_count) == 129);
 
     printf("[PASS] array_and_map\n");
+}
+
+static void test_map_try_get_and_100k(void) {
+    /* Edge cases: NULL map, NULL key, empty map, NULL out_val */
+    int64_t out = -999;
+    void *k0 = m2_str_from_cstr("a", 1);
+    assert(m2_map_try_get(NULL, k0, &out) == 0 && out == -999);
+    void *empty_map = m2_map_new(0);
+    assert(m2_map_try_get(empty_map, NULL, &out) == 0 && out == -999);
+    assert(m2_map_try_get(empty_map, k0, &out) == 0 && out == -999);
+    assert(m2_map_try_get(empty_map, k0, NULL) == 0);
+    m2_rc_dec(k0);
+    m2_rc_dec(empty_map);
+
+    /* Hash length coverage (0..32 bytes: all tail branches + multi-block) + overwrite + remove */
+    atomic_store(&g_drop_count, 0);
+    void *omap = m2_map_new(1);
+    const char *sample_keys[] = {
+        "", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg",
+        "abcdefgh", "abcdefghi", "0123456789abcde", "0123456789abcdef",
+        "0123456789abcdefX", "0123456789abcdef0123456789abcdef"
+    };
+    const size_t n_samples = sizeof(sample_keys) / sizeof(sample_keys[0]);
+    for (size_t i = 0; i < n_samples; i++) {
+        void *k = m2_str_from_cstr(sample_keys[i], -1);
+        void *v = test_node_new((int64_t)(i + 1), NULL);
+        m2_map_set(omap, k, (int64_t)(uintptr_t)v);
+        m2_rc_dec(k);
+        m2_rc_dec(v);
+    }
+    for (size_t i = 0; i < n_samples; i++) {
+        void *k = m2_str_from_cstr(sample_keys[i], -1);
+        int64_t val = 0;
+        assert(m2_map_try_get(omap, k, &val) == 1);
+        assert(((TestNode *)(uintptr_t)val)->id == (int64_t)(i + 1));
+        assert(m2_map_try_get(omap, k, NULL) == 1);
+        m2_rc_dec(k);
+    }
+    /* Overwrite & remove */
+    void *k_ov = m2_str_from_cstr("abcde", 5);
+    void *v_ov = test_node_new(9999, NULL);
+    m2_map_set(omap, k_ov, (int64_t)(uintptr_t)v_ov);
+    m2_rc_dec(v_ov);
+    assert(atomic_load(&g_drop_count) == 1);
+    int64_t ov_out = 0;
+    assert(m2_map_try_get(omap, k_ov, &ov_out) == 1);
+    assert(((TestNode *)(uintptr_t)ov_out)->id == 9999);
+
+    m2_map_remove(omap, k_ov);
+    ov_out = -777;
+    assert(m2_map_try_get(omap, k_ov, &ov_out) == 0 && ov_out == -777);
+    m2_rc_dec(k_ov);
+    m2_rc_dec(omap);
+    assert(atomic_load(&g_drop_count) == (int64_t)(n_samples + 1));
+
+    /* 100k keys insert + growth + try_get verification + remove + throughput timing */
+    const int64_t N = 100000;
+    void **keys = (void **)malloc((size_t)N * sizeof(void *));
+    assert(keys != NULL);
+    void *big_map = m2_map_new(0);
+    char kbuf[32];
+    for (int64_t i = 0; i < N; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "m2_key_%06" PRId64, i);
+        keys[i] = m2_str_from_cstr(kbuf, n);
+        m2_map_set(big_map, keys[i], i * 7 + 3);
+    }
+    assert(m2_map_len(big_map) == N);
+
+    /* Timed 100k m2_map_try_get lookups */
+    double t0 = monotonic_sec();
+    int64_t checksum = 0;
+    for (int64_t i = 0; i < N; i++) {
+        int64_t v = 0;
+        int32_t hit = m2_map_try_get(big_map, keys[i], &v);
+        assert(hit == 1);
+        assert(v == i * 7 + 3);
+        checksum += v;
+    }
+    double t1 = monotonic_sec();
+    double ms = (t1 - t0) * 1000.0;
+    assert(checksum == (N * (N - 1) / 2) * 7 + N * 3);
+
+    /* Verify misses */
+    for (int64_t i = 0; i < 1000; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "miss_key_%06" PRId64, i);
+        void *mk = m2_str_from_cstr(kbuf, n);
+        int64_t v = -1;
+        assert(m2_map_try_get(big_map, mk, &v) == 0 && v == -1);
+        m2_rc_dec(mk);
+    }
+
+    /* Remove every 4th key and re-verify hit/miss */
+    for (int64_t i = 0; i < N; i += 4) {
+        m2_map_remove(big_map, keys[i]);
+    }
+    assert(m2_map_len(big_map) == (N * 3) / 4);
+    for (int64_t i = 0; i < N; i++) {
+        int64_t v = 0;
+        int32_t hit = m2_map_try_get(big_map, keys[i], &v);
+        if ((i & 3) == 0) {
+            assert(hit == 0);
+        } else {
+            assert(hit == 1 && v == i * 7 + 3);
+        }
+    }
+
+    for (int64_t i = 0; i < N; i++) {
+        m2_rc_dec(keys[i]);
+    }
+    free(keys);
+    m2_rc_dec(big_map);
+
+    printf("[PASS] map_try_get_100k (100k lookups: %.2f ms, %.1f ns/op)\n",
+           ms, (ms * 1e6) / (double)N);
 }
 
 static void test_sha256(void) {
@@ -776,10 +938,62 @@ static void test_mt_slab_stress(void) {
     printf("[PASS] mt_slab_stress (8 threads, %" PRId64 " slab/large alloc+free, 0 leaks)\n", expected_drops);
 }
 
-static double monotonic_sec(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+typedef struct ExecStressEnv {
+    void *world;
+    void *done_cnt;
+    int iters;
+} ExecStressEnv;
+
+static void exec_stress_env_drop(void *p) {
+    ExecStressEnv *e = (ExecStressEnv *)p;
+    m2_rc_dec(e->world);
+    m2_rc_dec(e->done_cnt);
+}
+
+static void exec_stress_worker(void *arg) {
+    ExecStressEnv *e = (ExecStressEnv *)arg;
+    void *cmd_true = m2_arr_new(1, 1);
+    void *s_true = m2_str_from_cstr("/usr/bin/true", -1);
+    m2_arr_push(cmd_true, (int64_t)(uintptr_t)s_true);
+
+    void *cmd_missing = m2_arr_new(1, 1);
+    void *s_missing = m2_str_from_cstr("/nonexistent_m2_exec_cmd_xyz_999", -1);
+    m2_arr_push(cmd_missing, (int64_t)(uintptr_t)s_missing);
+
+    for (int i = 0; i < e->iters; i++) {
+        assert(m2_world_exec(e->world, cmd_true) == 0);
+        assert(m2_world_exec(e->world, cmd_missing) == 127);
+    }
+
+    m2_rc_dec(s_true);
+    m2_rc_dec(cmd_true);
+    m2_rc_dec(s_missing);
+    m2_rc_dec(cmd_missing);
+    m2_atomic_fetch_add(e->done_cnt, 1);
+}
+
+static void test_mt_world_exec(int argc, char **argv) {
+    void *w = m2_world_init(argc, argv);
+    void *done_cnt = m2_atomic_new(0);
+
+    void *sc = m2_scope_begin();
+    for (int i = 0; i < 8; i++) {
+        ExecStressEnv *e = (ExecStressEnv *)m2_alloc_uninit(
+            (uint32_t)sizeof(ExecStressEnv), M2_TAG_STRUCT, exec_stress_env_drop);
+        m2_rc_inc(w);
+        m2_rc_inc(done_cnt);
+        e->world = w;
+        e->done_cnt = done_cnt;
+        e->iters = 4;
+        m2_scope_spawn(sc, exec_stress_worker, e);
+        m2_rc_dec(e);
+    }
+    m2_scope_end(sc);
+
+    assert(m2_atomic_load(done_cnt) == 8);
+    m2_rc_dec(done_cnt);
+    m2_rc_dec(w);
+    printf("[PASS] mt_world_exec (8 threads concurrent posix_spawnp)\n");
 }
 
 static void run_slab_bench(void) {
@@ -811,8 +1025,29 @@ static void run_slab_bench(void) {
     }
     double t1 = monotonic_sec();
     double ms = (t1 - t0) * 1000.0;
-    printf("[BENCH] slab 1M alloc+free (24B payload / 64B class): %.2f ms (%.1f ns/op)\n",
+    printf("[BENCH] slab 1M m2_alloc+free (24B payload / 64B class): %.2f ms (%.1f ns/op)\n",
            ms, (ms * 1e6) / (double)N);
+
+    double t2 = monotonic_sec();
+    for (int64_t i = 0; i < N; i++) {
+        int slot = (int)(i & 63);
+        if (ring[slot]) {
+            m2_rc_dec(ring[slot]);
+        }
+        int64_t *node = (int64_t *)m2_alloc_uninit(24u, M2_TAG_STRUCT, NULL);
+        node[0] = i;
+        ring[slot] = node;
+    }
+    for (int i = 0; i < 64; i++) {
+        if (ring[i]) {
+            m2_rc_dec(ring[i]);
+            ring[i] = NULL;
+        }
+    }
+    double t3 = monotonic_sec();
+    double ms_uninit = (t3 - t2) * 1000.0;
+    printf("[BENCH] slab 1M m2_alloc_uninit+free (24B payload / 64B class): %.2f ms (%.1f ns/op)\n",
+           ms_uninit, (ms_uninit * 1e6) / (double)N);
 }
 
 /* ============================================================================
@@ -900,8 +1135,10 @@ int main(int argc, char **argv) {
     }
 
     test_biased_rc_and_immortal();
+    test_alloc_uninit();
     test_string_and_strbuf();
     test_array_and_map();
+    test_map_try_get_and_100k();
     test_sha256();
     test_world(argc, argv);
 
@@ -910,6 +1147,7 @@ int main(int argc, char **argv) {
     test_mt_mutex_and_atomic();
     test_mt_nested_scope();
     test_mt_slab_stress();
+    test_mt_world_exec(argc, argv);
 
     if (run_bench) {
         run_slab_bench();
