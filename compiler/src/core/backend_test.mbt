@@ -149,3 +149,42 @@ test "sig_file_stub_and_sigs_hash_parity" {
   let spr = @core.parse_source("a.m2", stub0)
   assert_eq(spr.diagnostics.length(), 0)
 }
+
+///|
+test "qbe_map_try_get_match_fusion_and_alloc_uninit" {
+  let src =
+    #|pub enum Tree {
+    #|  Leaf
+    #|  Node(Tree, Tree)
+    #|}
+    #|pub fn make_node(l : Tree, r : Tree) -> Tree {
+    #|  Node(l, r)
+    #|}
+    #|pub fn lookup_int(m : Map[String, Int], k : String) -> Int {
+    #|  match m.get(k) {
+    #|    Some(v) => v + 1
+    #|    None => 0
+    #|  }
+    #|}
+    #|pub fn lookup_rev(m : Map[String, Int], k : String) -> Int {
+    #|  match m.get(k) {
+    #|    None => -1
+    #|    Some(v) => v
+    #|  }
+    #|}
+  let pkg = @core.parse_package("test", ["p3c.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  // Node(l, r) must use $m2_alloc_uninit (not $m2_alloc)
+  assert_eq(res.ssa.contains("$m2_alloc_uninit("), true)
+  assert_eq(res.ssa.contains("$m2_alloc("), false)
+  // Fused match m.get(k) must emit $m2_map_try_get, never $m2_map_has, and zero Some allocation / RC in lookup_*
+  assert_eq(res.ssa.contains("$m2_map_try_get("), true)
+  assert_eq(res.ssa.contains("$m2_map_has("), false)
+  let lookup_part = match res.ssa.find("$m2_fn_lookup_int") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => res.ssa
+  }
+  assert_eq(lookup_part.contains("$m2_alloc"), false)
+  assert_eq(lookup_part.contains("m2_rc_inc"), false)
+  assert_eq(lookup_part.contains("m2_rc_dec"), false)
+}
