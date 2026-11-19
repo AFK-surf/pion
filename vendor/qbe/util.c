@@ -38,6 +38,25 @@ static void **pool = ptr;
 static int nptr = 1;
 
 static Bucket itbl[IMask+1]; /* string interning table */
+static int newtmp_n;
+
+void
+util_reset(void)
+{
+	uint i, j;
+
+	freeall();
+	newtmp_n = 0;
+	for (i = 0; i <= IMask; i++) {
+		if (itbl[i].nstr > 0) {
+			for (j = 0; j < itbl[i].nstr; j++)
+				free(itbl[i].str[j]);
+			vfree(itbl[i].str);
+			itbl[i].str = 0;
+			itbl[i].nstr = 0;
+		}
+	}
+}
 
 uint32_t
 hash(char *s)
@@ -443,14 +462,13 @@ phiarg(Phi *p, Blk *b)
 Ref
 newtmp(char *prfx, int k,  Fn *fn)
 {
-	static int n;
 	int t;
 
 	t = fn->ntmp++;
 	vgrow(&fn->tmp, fn->ntmp);
 	memset(&fn->tmp[t], 0, sizeof(Tmp));
 	if (prfx)
-		fn->tmp[t].name = strf(PFn, "%s.%d", prfx, ++n);
+		fn->tmp[t].name = strf(PFn, "%s.%d", prfx, ++newtmp_n);
 	fn->tmp[t].cls = k;
 	fn->tmp[t].slot = -1;
 	fn->tmp[t].nuse = +1;

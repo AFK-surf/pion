@@ -1254,6 +1254,11 @@ parse(FILE *f, char *path, void dbgfile(char *), void data(Dat *), void func(Fn 
 					vfree(typ[n].fields);
 			}
 			vfree(typ);
+			typ = 0;
+			if (tokval.str) {
+				vfree(tokval.str);
+				tokval.str = 0;
+			}
 			return;
 		}
 	}

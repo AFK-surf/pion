@@ -38,6 +38,7 @@ static Target *tlist[] = {
 static FILE *outf;
 static int dbg;
 static int objmode;
+static int objbatch;
 
 static uint32_t
 parse_macos_ver(const char *s)
@@ -134,6 +135,11 @@ func(Fn *fn)
 	filluse(fn);
 	T.isel(fn);
 	fillcfg(fn);
+	if (strncmp(T.name, "arm64", 5) == 0) {
+		filldom(fn);
+		fillloop(fn);
+		arm64_hoist_consts(fn);
+	}
 	filllive(fn);
 	fillloop(fn);
 	fillcost(fn);
@@ -179,6 +185,7 @@ usage(FILE *hf, char *prog)
 	fprintf(hf, "\t%-18s prints this help\n", "-h");
 	fprintf(hf, "\t%-18s output to file\n", "-o file");
 	fprintf(hf, "\t%-18s emit Mach-O .o directly (arm64_apple)\n", "--obj");
+	fprintf(hf, "\t%-18s batch emit Mach-O .o pairs <in.ssa> <out.o>...\n", "--obj-batch");
 	fprintf(hf, "\t%-18s macOS platform version (e.g. 15.0)\n", "--macos-ver <ver>");
 	fprintf(hf, "\t%-18s generate for a target among:\n", "-t <target>");
 	fprintf(hf, "\t%-18s ", "");
@@ -217,6 +224,9 @@ main(int ac, char *av[])
 		}
 		if (strcmp(arg, "--obj") == 0 || strcmp(arg, "-O") == 0) {
 			objmode = 1;
+		} else if (strcmp(arg, "--obj-batch") == 0) {
+			objmode = 1;
+			objbatch = 1;
 		} else if (strcmp(arg, "--macos-ver") == 0) {
 			if (i + 1 >= ac) {
 				usage(stderr, av[0]);
@@ -282,6 +292,44 @@ main(int ac, char *av[])
 	if (objmode && (!T.apple || strcmp(T.name, "arm64_apple") != 0)) {
 		fprintf(stderr, "--obj is only supported for target arm64_apple\n");
 		exit(1);
+	}
+
+	if (objbatch) {
+		if (nfiles == 0 || (nfiles & 1) != 0) {
+			fprintf(stderr, "--obj-batch requires pairs of <in.ssa> <out.o>\n");
+			exit(1);
+		}
+		if (outpath) {
+			fprintf(stderr, "--obj-batch cannot be combined with -o\n");
+			exit(1);
+		}
+		for (i = 0; i < nfiles; i += 2) {
+			char *in_p = files[i];
+			char *out_p = files[i + 1];
+			inf = fopen(in_p, "r");
+			if (!inf) {
+				fprintf(stderr, "cannot open '%s'\n", in_p);
+				exit(1);
+			}
+			outf = fopen(out_p, "wb");
+			if (!outf) {
+				fclose(inf);
+				fprintf(stderr, "cannot open '%s'\n", out_p);
+				exit(1);
+			}
+			emit_reset();
+			util_reset();
+			if (!dbg)
+				arm64_macho_begin(macos_ver);
+			parse(inf, in_p, dbgfile, data, func);
+			fclose(inf);
+			if (!dbg)
+				arm64_macho_finish(outf);
+			fclose(outf);
+			outf = stdout;
+		}
+		free(files);
+		exit(0);
 	}
 
 	if (outpath && strcmp(outpath, "-") != 0) {
