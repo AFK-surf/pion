@@ -14,8 +14,8 @@ rm -f "$OUT_DIR/libm2rt.a"
 ar rcs "$OUT_DIR/libm2rt.a" "$OUT_DIR/m2_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libm2rt.a" | tr -d ' ')"
 echo "libm2rt.a size: $LIB_SIZE bytes"
-if [ "$LIB_SIZE" -ge 46080 ]; then
-    echo "FAIL: libm2rt.a ($LIB_SIZE bytes) exceeds 45 KB budget (46080 bytes)" >&2
+if [ "$LIB_SIZE" -ge 53248 ]; then
+    echo "FAIL: libm2rt.a ($LIB_SIZE bytes) exceeds 52 KB budget (53248 bytes)" >&2
     exit 1
 fi
 
@@ -66,6 +66,12 @@ export function w $main(w %argc, l %argv) {
     %num =l call $m2_int_to_str(l %val)
     call $m2_world_println(l %w, l %num)
 
+    %sq =d sqrt d_1764.0
+    %sqi =l dtosi %sq
+    %sqstr =l call $m2_int_to_str(l %sqi)
+    call $m2_world_println(l %w, l %sqstr)
+
+    call $m2_rc_dec(l %sqstr)
     call $m2_rc_dec(l %num)
     call $m2_rc_dec(l %atom)
     call $m2_rc_dec(l %s)
@@ -86,10 +92,32 @@ echo "QBE smoke compile time: $((T1 - T0)) ms, binary size: $SMOKE_SIZE bytes"
 echo "QBE smoke output:"
 echo "$SMOKE_OUT"
 
-EXPECTED_OUT="$(printf 'hello from qbe+m2rt\n42')"
+EXPECTED_OUT="$(printf 'hello from qbe+m2rt\n42\n42')"
 if [ "$SMOKE_OUT" != "$EXPECTED_OUT" ]; then
     echo "FAIL: QBE smoke output mismatch! Expected:" >&2
     echo "$EXPECTED_OUT" >&2
     exit 1
 fi
-echo "[PASS] QBE arm64_apple end-to-end ABI smoke test"
+
+echo "Checking QBE hardware sqrt emission:"
+grep -n 'fsqrt' "$OUT_DIR/smoke_qbe.s" || {
+    echo "FAIL: expected hardware fsqrt in arm64_apple assembly" >&2
+    exit 1
+}
+if command -v otool >/dev/null 2>&1; then
+    otool -tV "$OUT_DIR/smoke_qbe" | grep 'fsqrt' || {
+        echo "FAIL: expected hardware fsqrt in otool disassembly" >&2
+        exit 1
+    }
+fi
+"$OUT_DIR/qbe" -t amd64_sysv -o "$OUT_DIR/smoke_qbe_x64.s" "$OUT_DIR/smoke_qbe.ssa"
+grep -n 'sqrtsd' "$OUT_DIR/smoke_qbe_x64.s" || {
+    echo "FAIL: expected hardware sqrtsd in amd64_sysv assembly" >&2
+    exit 1
+}
+"$OUT_DIR/qbe" -t rv64 -o "$OUT_DIR/smoke_qbe_rv64.s" "$OUT_DIR/smoke_qbe.ssa"
+grep -n 'fsqrt\.d' "$OUT_DIR/smoke_qbe_rv64.s" || {
+    echo "FAIL: expected hardware fsqrt.d in rv64 assembly" >&2
+    exit 1
+}
+echo "[PASS] QBE arm64_apple/amd64_sysv/rv64 end-to-end ABI & hardware sqrt smoke test"

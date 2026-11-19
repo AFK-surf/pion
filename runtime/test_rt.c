@@ -102,6 +102,33 @@ static void test_string_and_strbuf(void) {
     int32_t ok = 0;
     assert(m2_str_to_int(num_s, &ok) == -9876543210LL && ok == 1);
 
+    /* Fast int-to-str edge cases (0, small, 2-digit, 3-digit, INT64_MAX, INT64_MIN) */
+    const int64_t edge_vals[] = {
+        0LL, 1LL, -1LL, 9LL, -9LL, 10LL, -10LL, 99LL, -99LL, 100LL, -100LL,
+        9223372036854775807LL, (-9223372036854775807LL - 1LL)
+    };
+    const char *edge_strs[] = {
+        "0", "1", "-1", "9", "-9", "10", "-10", "99", "-99", "100", "-100",
+        "9223372036854775807", "-9223372036854775808"
+    };
+    for (size_t i = 0; i < sizeof(edge_vals) / sizeof(edge_vals[0]); i++) {
+        void *es = m2_int_to_str(edge_vals[i]);
+        void *ex = m2_str_from_cstr(edge_strs[i], -1);
+        assert(m2_str_eq(es, ex) == 1);
+        void *esb = m2_strbuf_new(8);
+        m2_strbuf_push_int(esb, edge_vals[i]);
+        void *esb_s = m2_strbuf_to_str(esb);
+        assert(m2_str_eq(esb_s, ex) == 1);
+        m2_rc_dec(es);
+        m2_rc_dec(ex);
+        m2_rc_dec(esb);
+        m2_rc_dec(esb_s);
+    }
+
+    /* C ABI math sqrt fallback */
+    assert(m2_math_sqrt(1764.0) == 42.0);
+    assert(m2_math_sqrt(0.0) == 0.0);
+
     void *bad = m2_str_from_cstr("123abc", 6);
     assert(m2_str_to_int(bad, &ok) == 0 && ok == 0);
     void *ws = m2_str_from_cstr(" 42", 3);
@@ -653,15 +680,144 @@ static void test_mt_nested_scope(void) {
     printf("[PASS] mt_nested_scope (4x2 nested + 4x3 parent-scope spawn)\n");
 }
 
-/* ============================================================================
- * 3. Multi-Core Speedup Benchmark (4 cores vs 1 core)
- * ============================================================================ */
+typedef struct SlabStressEnv {
+    void *ch;
+    int64_t count;
+    int64_t tid_idx;
+} SlabStressEnv;
+
+static void slab_stress_env_drop(void *p) {
+    SlabStressEnv *e = (SlabStressEnv *)p;
+    m2_rc_dec(e->ch);
+}
+
+static void slab_obj_drop(void *payload) {
+    (void)payload;
+    atomic_fetch_add_explicit(&g_drop_count, 1, memory_order_relaxed);
+}
+
+static void slab_producer_worker(void *arg) {
+    SlabStressEnv *e = (SlabStressEnv *)arg;
+    /* Mix all 7 slab size classes (payload 0..224) + large (>224) */
+    const uint32_t sizes[8] = { 8u, 16u, 32u, 64u, 96u, 160u, 224u, 512u };
+    for (int64_t i = 0; i < e->count; i++) {
+        /* Local alloc/free burst */
+        uint32_t lsz = sizes[(size_t)(i + e->tid_idx) & 7u];
+        int64_t *loc = (int64_t *)m2_alloc(lsz, M2_TAG_STRUCT, slab_obj_drop);
+        assert(loc[0] == 0); /* Verify zero-initialization */
+        loc[0] = i + 1;
+        m2_rc_dec(loc);
+
+        /* Cross-thread alloc -> freeze -> send -> remote free */
+        uint32_t rsz = sizes[(size_t)i & 7u];
+        int64_t *rem = (int64_t *)m2_alloc(rsz, M2_TAG_STRUCT, slab_obj_drop);
+        assert(rem[0] == 0);
+        rem[0] = (e->tid_idx << 32) | i;
+        assert(m2_chan_send(e->ch, (int64_t)(uintptr_t)rem) == 1);
+        m2_rc_dec(rem);
+    }
+}
+
+static void slab_consumer_worker(void *arg) {
+    SlabStressEnv *e = (SlabStressEnv *)arg;
+    int64_t val = 0;
+    while (m2_chan_recv(e->ch, &val)) {
+        int64_t *obj = (int64_t *)(uintptr_t)val;
+        assert(obj[0] >= 0);
+        /* Also allocate locally to trigger draining g_slab_remote */
+        int64_t *tmp = (int64_t *)m2_alloc(32u, M2_TAG_STRUCT, slab_obj_drop);
+        assert(tmp[0] == 0);
+        tmp[0] = obj[0];
+        m2_rc_dec(tmp);
+        m2_rc_dec(obj);
+    }
+}
+
+static void test_mt_slab_stress(void) {
+    atomic_store(&g_drop_count, 0);
+    const int n_prod = 4;
+    const int n_cons = 4;
+    const int64_t per_prod = 5000;
+
+    void *ch = m2_chan_new(128, 1);
+
+    void *cons_scope = m2_scope_begin();
+    for (int i = 0; i < n_cons; i++) {
+        SlabStressEnv *e = (SlabStressEnv *)m2_alloc((uint32_t)sizeof(SlabStressEnv),
+                                                     M2_TAG_STRUCT, slab_stress_env_drop);
+        m2_rc_inc(ch);
+        e->ch = ch;
+        e->count = per_prod;
+        e->tid_idx = i;
+        m2_scope_spawn(cons_scope, slab_consumer_worker, e);
+        m2_rc_dec(e);
+    }
+
+    void *prod_scope = m2_scope_begin();
+    for (int i = 0; i < n_prod; i++) {
+        SlabStressEnv *e = (SlabStressEnv *)m2_alloc((uint32_t)sizeof(SlabStressEnv),
+                                                     M2_TAG_STRUCT, slab_stress_env_drop);
+        m2_rc_inc(ch);
+        e->ch = ch;
+        e->count = per_prod;
+        e->tid_idx = i;
+        m2_scope_spawn(prod_scope, slab_producer_worker, e);
+        m2_rc_dec(e);
+    }
+
+    m2_scope_end(prod_scope);
+    m2_chan_close(ch);
+    m2_scope_end(cons_scope);
+    m2_rc_dec(ch);
+
+    /* Expected drops: per producer: 1 local + 1 remote; per remote: 1 consumer local = 3 * n_prod * per_prod */
+    int64_t expected_drops = 3LL * n_prod * per_prod;
+    assert(atomic_load(&g_drop_count) == expected_drops);
+    printf("[PASS] mt_slab_stress (8 threads, %" PRId64 " slab/large alloc+free, 0 leaks)\n", expected_drops);
+}
 
 static double monotonic_sec(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
+
+static void run_slab_bench(void) {
+    const int64_t N = 1000000;
+    void *ring[64];
+    memset(ring, 0, sizeof(ring));
+
+    /* Warmup */
+    for (int i = 0; i < 10000; i++) {
+        void *p = m2_alloc(24u, M2_TAG_STRUCT, NULL);
+        m2_rc_dec(p);
+    }
+
+    double t0 = monotonic_sec();
+    for (int64_t i = 0; i < N; i++) {
+        int slot = (int)(i & 63);
+        if (ring[slot]) {
+            m2_rc_dec(ring[slot]);
+        }
+        int64_t *node = (int64_t *)m2_alloc(24u, M2_TAG_STRUCT, NULL);
+        node[0] = i;
+        ring[slot] = node;
+    }
+    for (int i = 0; i < 64; i++) {
+        if (ring[i]) {
+            m2_rc_dec(ring[i]);
+            ring[i] = NULL;
+        }
+    }
+    double t1 = monotonic_sec();
+    double ms = (t1 - t0) * 1000.0;
+    printf("[BENCH] slab 1M alloc+free (24B payload / 64B class): %.2f ms (%.1f ns/op)\n",
+           ms, (ms * 1e6) / (double)N);
+}
+
+/* ============================================================================
+ * 3. Multi-Core Speedup Benchmark (4 cores vs 1 core)
+ * ============================================================================ */
 
 typedef struct BenchChunk {
     uint64_t seed;
@@ -753,8 +909,10 @@ int main(int argc, char **argv) {
     test_mt_channel_10k();
     test_mt_mutex_and_atomic();
     test_mt_nested_scope();
+    test_mt_slab_stress();
 
     if (run_bench) {
+        run_slab_bench();
         run_multicore_bench();
     }
 

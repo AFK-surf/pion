@@ -29,6 +29,9 @@ typedef enum M2Tag {
 
 #define M2_FLAG_FROZEN   ((uint16_t)1u)
 #define M2_FLAG_IMMORTAL ((uint16_t)2u)
+#define M2_FLAG_SLAB     ((uint16_t)4u)
+#define M2_FLAG_SLAB_CLS_SHIFT 4u
+#define M2_FLAG_SLAB_CLS_MASK  ((uint16_t)0x7u)
 
 typedef struct M2Header {
     uint64_t owner_tid;         /* Thread ID of creator; 0 = FROZEN/SHARED (atomic mode) */
@@ -97,7 +100,11 @@ void     m2_rc_inc(void *obj);
 void     m2_rc_dec(void *obj);
 void     m2_rc_freeze(void *obj);
 void     m2_panic(const char *msg, const char *file, int32_t line) __attribute__((noreturn));
+void     m2_panic_oob(int64_t idx, int64_t len) __attribute__((noreturn));
 void     m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line);
+
+/* Math */
+double   m2_math_sqrt(double x);
 
 /* String */
 void*    m2_str_from_cstr(const char *s, int64_t len);
