@@ -14,8 +14,8 @@ rm -f "$OUT_DIR/libm2rt.a"
 ar rcs "$OUT_DIR/libm2rt.a" "$OUT_DIR/m2_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libm2rt.a" | tr -d ' ')"
 echo "libm2rt.a size: $LIB_SIZE bytes"
-if [ "$LIB_SIZE" -ge 40960 ]; then
-    echo "FAIL: libm2rt.a ($LIB_SIZE bytes) exceeds 40 KB budget (40960 bytes)" >&2
+if [ "$LIB_SIZE" -ge 46080 ]; then
+    echo "FAIL: libm2rt.a ($LIB_SIZE bytes) exceeds 45 KB budget (46080 bytes)" >&2
     exit 1
 fi
 

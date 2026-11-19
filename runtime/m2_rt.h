@@ -96,7 +96,7 @@ void*    m2_alloc(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn);
 void     m2_rc_inc(void *obj);
 void     m2_rc_dec(void *obj);
 void     m2_rc_freeze(void *obj);
-void     m2_panic(const char *msg, const char *file, int32_t line);
+void     m2_panic(const char *msg, const char *file, int32_t line) __attribute__((noreturn));
 void     m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line);
 
 /* String */
@@ -114,7 +114,9 @@ int64_t  m2_str_to_int(void *s, int32_t *ok_out);
 void*    m2_strbuf_new(int64_t cap);
 void     m2_strbuf_push_str(void *sb, void *s);
 void     m2_strbuf_push_byte(void *sb, int32_t b);
+void     m2_strbuf_push_char(void *sb, int32_t cp);
 void     m2_strbuf_push_int(void *sb, int64_t v);
+void     m2_strbuf_reset(void *sb);
 void*    m2_strbuf_to_str(void *sb);
 
 /* Array */
@@ -124,6 +126,7 @@ void     m2_arr_push(void *a, int64_t val);
 int64_t  m2_arr_get(void *a, int64_t idx);
 void     m2_arr_set(void *a, int64_t idx, int64_t val);
 int64_t  m2_arr_pop(void *a);
+void*    m2_arr_copy(void *a);
 
 /* String-Keyed Hash Map */
 void*    m2_map_new(int32_t val_is_obj);
@@ -131,6 +134,8 @@ int64_t  m2_map_len(void *m);
 void     m2_map_set(void *m, void *key_str, int64_t val);
 int32_t  m2_map_has(void *m, void *key_str);
 int64_t  m2_map_get(void *m, void *key_str);
+void     m2_map_remove(void *m, void *key_str);
+void*    m2_map_copy(void *m);
 void*    m2_map_keys(void *m);
 
 /* Concurrency */
@@ -143,6 +148,7 @@ int32_t  m2_chan_recv(void *ch, int64_t *out_val);
 void     m2_chan_close(void *ch);
 void*    m2_mutex_new(int64_t init_val, int32_t val_is_obj);
 int64_t  m2_mutex_lock(void *m);
+void     m2_mutex_set(void *m, int64_t new_val);
 void     m2_mutex_set_and_unlock(void *m, int64_t new_val);
 void     m2_mutex_unlock(void *m);
 void*    m2_atomic_new(int64_t init_val);
@@ -154,6 +160,7 @@ int64_t  m2_atomic_fetch_add(void *a, int64_t delta);
 void*    m2_world_init(int argc, char **argv);
 int64_t  m2_world_argc(void *w);
 void*    m2_world_argv(void *w, int64_t idx);
+void*    m2_world_args(void *w);
 void     m2_world_println(void *w, void *s);
 void     m2_world_eprintln(void *w, void *s);
 void*    m2_world_fs_read(void *w, void *path_str, int32_t *ok_out);

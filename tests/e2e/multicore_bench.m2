@@ -1,0 +1,132 @@
+///| Pure m2 multicore benchmark: scope + 4x spawn + Channel + Mutex + AtomicInt + val struct
+
+pub val struct WorkChunk {
+  seed : Int64
+  iters : Int64
+}
+
+pub fn cpu_work(seed : Int64, iters : Int64) -> Int64 {
+  let mut x = seed ^ 0x9e3779b97f4a7c15L
+  let mut i = 0L
+  while i < iters {
+    x = x ^ (x << 13)
+    x = x ^ ((x >> 7) & 0x01ffffffffffffffL)
+    x = x ^ (x << 17)
+    x = x + 0x2545F4914F6CDD1DL
+    i = i + 1L
+  }
+  x & 0xFFFFFFFFL
+}
+
+pub fn main(world : World) -> Int {
+  let iters = 60000000L
+  let c0 = WorkChunk::{ seed: 12345L, iters: iters }
+  let c1 = WorkChunk::{ seed: 24690L, iters: iters }
+  let c2 = WorkChunk::{ seed: 37035L, iters: iters }
+  let c3 = WorkChunk::{ seed: 49380L, iters: iters }
+
+  // Warm up
+  let _ = cpu_work(1L, 2000000L)
+
+  // 1-core sequential
+  let t0 = clock_now_ms(world)
+  let seq_sum = cpu_work(c0.seed, c0.iters) +
+    cpu_work(c1.seed, c1.iters) +
+    cpu_work(c2.seed, c2.iters) +
+    cpu_work(c3.seed, c3.iters)
+  let t1 = clock_now_ms(world)
+  let seq_ms = if t1 > t0 { t1 - t0 } else { 1L }
+
+  // 4-core parallel via scope + spawn + Channel + Mutex + AtomicInt
+  let ch : Channel[Int64] = Channel::new(8)
+  let mu : Mutex[Int] = Mutex::new(0)
+  let done_cnt = AtomicInt::new(0)
+
+  let t2 = clock_now_ms(world)
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      let r = cpu_work(c0.seed, c0.iters)
+      let _ = ch.send(r)
+      let cur = mu.lock()
+      mu.set(cur + 1)
+      mu.unlock()
+      let _ = done_cnt.fetch_add(1)
+    })
+    spawn(s, fn() -> Unit {
+      let r = cpu_work(c1.seed, c1.iters)
+      let _ = ch.send(r)
+      let cur = mu.lock()
+      mu.set(cur + 1)
+      mu.unlock()
+      let _ = done_cnt.fetch_add(1)
+    })
+    spawn(s, fn() -> Unit {
+      let r = cpu_work(c2.seed, c2.iters)
+      let _ = ch.send(r)
+      let cur = mu.lock()
+      mu.set(cur + 1)
+      mu.unlock()
+      let _ = done_cnt.fetch_add(1)
+    })
+    spawn(s, fn() -> Unit {
+      let r = cpu_work(c3.seed, c3.iters)
+      let _ = ch.send(r)
+      let cur = mu.lock()
+      mu.set(cur + 1)
+      mu.unlock()
+      let _ = done_cnt.fetch_add(1)
+    })
+  })
+  ch.close()
+  let t3 = clock_now_ms(world)
+  let par_ms = if t3 > t2 { t3 - t2 } else { 1L }
+
+  let mut par_sum = 0L
+  let mut recv_cnt = 0
+  while true {
+    match ch.recv() {
+      Some(v) => {
+        par_sum = par_sum + v
+        recv_cnt = recv_cnt + 1
+      }
+      None => break
+    }
+  }
+
+  let mu_val = mu.lock()
+  mu.unlock()
+  let atom_val = done_cnt.load()
+
+  let speedup_x100 = (seq_ms * 100L) / par_ms
+  let sp_whole = speedup_x100 / 100L
+  let sp_frac = speedup_x100 % 100L
+  let frac_str = if sp_frac < 10L {
+    "0" + sp_frac.to_string()
+  } else {
+    sp_frac.to_string()
+  }
+
+  io_println(
+    world,
+    "1-core=" +
+    seq_ms.to_string() +
+    "ms 4-core=" +
+    par_ms.to_string() +
+    "ms speedup=" +
+    sp_whole.to_string() +
+    "." +
+    frac_str +
+    "x checksum=" +
+    par_sum.to_string(),
+  )
+
+  if par_sum != seq_sum || recv_cnt != 4 || mu_val != 4 || atom_val != 4 {
+    io_eprintln(world, "FAIL: checksum or sync mismatch")
+    return 1
+  }
+  if speedup_x100 <= 300L {
+    io_eprintln(world, "FAIL: 4-core speedup <= 3.0x")
+    return 2
+  }
+  0
+}
