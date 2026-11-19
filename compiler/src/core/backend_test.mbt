@@ -544,3 +544,132 @@ test "qbe_p5b_alias_guarded_struct_promotion_and_bailout" {
   assert_eq(fn_s.contains("@wh_pslow_"), true)
   assert_eq(fn_s.contains("@wh_pwb_"), true)
 }
+
+///|
+test "qbe_p5p_sq_reuse_dead_var_reorder" {
+  let src =
+    #|pub fn mandel_reorder(cr : Double, ci : Double) -> Bool {
+    #|  let mut zr = 0.0
+    #|  let mut zi = 0.0
+    #|  let mut escaped = false
+    #|  let mut iter = 0
+    #|  while iter < 50 {
+    #|    let tr = zr * zr - zi * zi + cr
+    #|    let ti = 2.0 * zr * zi + ci
+    #|    zr = tr
+    #|    zi = ti
+    #|    if zr * zr + zi * zi > 4.0 {
+    #|      escaped = true
+    #|      break
+    #|    }
+    #|    iter = iter + 1
+    #|  }
+    #|  escaped
+    #|}
+  let pkg = @core.parse_package("test", ["sq_reorder.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_s = match res.ssa.find("$m2_fn_mandel_reorder") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  let body_part = match fn_s.find("\n@wh_b_") {
+    Some(idx) => fn_s.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  // `ti = 2.0 * zr * zi + ci` (`=d mul`) must be emitted before `tr = sq_zr - sq_zi + cr` (`=d sub`)
+  let mul_idx = match body_part.find("=d mul ") {
+    Some(i) => i
+    None => -1
+  }
+  let sub_idx = match body_part.find("=d sub ") {
+    Some(i) => i
+    None => -1
+  }
+  assert_eq(mul_idx >= 0, true)
+  assert_eq(sub_idx >= 0, true)
+  assert_eq(mul_idx < sub_idx, true)
+}
+
+///|
+test "qbe_p5p_even_int_div2_sar" {
+  let src =
+    #|pub fn eval_even(ij : Int) -> Int {
+    #|  let a = (ij * (ij + 1)) / 2
+    #|  let b = ((ij - 1) * ij) / 2
+    #|  let c = (-2 * -1) / 2
+    #|  let d = (-10 * -9) / 2
+    #|  let e = (ij << 1) / 2
+    #|  let f = (2 * ij + 4) / 2
+    #|  a + b + c + d + e + f
+    #|}
+    #|pub fn eval_general(x : Int) -> Int {
+    #|  x / 2
+    #|}
+  let pkg = @core.parse_package("test", ["even_div2.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let even_start = match res.ssa.find("$m2_fn_eval_even") {
+    Some(idx) => idx
+    None => 0
+  }
+  let gen_start = match res.ssa.find("$m2_fn_eval_general") {
+    Some(idx) => idx
+    None => res.ssa.length()
+  }
+  let even_fn = res.ssa.clamped_view(start=even_start, end=gen_start).to_owned()
+  let gen_fn = res.ssa.clamped_view(start=gen_start).to_owned()
+  // All 6 even divisions emit direct `=w sar ..., 1` with zero `=w shr ..., 31` sign fixup
+  assert_eq(even_fn.contains("=w sar "), true)
+  assert_eq(even_fn.contains("=w shr "), false)
+  // General unknown-parity x / 2 retains `=w shr ..., 31` sign fixup
+  assert_eq(gen_fn.contains("=w shr "), true)
+  assert_eq(gen_fn.contains("=w sar "), true)
+}
+
+///|
+test "qbe_p5p_local_immut_w_to_l_ext_prop" {
+  let src =
+    #|pub fn rev_swap(perm : Array[Int], k : Int) -> Unit {
+    #|  let n = perm.length()
+    #|  if k >= n {
+    #|    return
+    #|  }
+    #|  let mut fi = 0
+    #|  while fi < k {
+    #|    let tmp = perm[fi]
+    #|    perm[fi] = perm[k - fi]
+    #|    perm[k - fi] = tmp
+    #|    fi = fi + 1
+    #|  }
+    #|}
+  let pkg = @core.parse_package("test", ["w2l_local.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_s = match res.ssa.find("$m2_fn_rev_swap") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  let fast_start = match fn_s.find("\n@wh_fast_") {
+    Some(idx) => idx
+    None => 0
+  }
+  let after_fast = fn_s.clamped_view(start=fast_start + 1).to_owned()
+  let slow_off = match after_fast.find("\n@wh_slow_") {
+    Some(idx) => idx
+    None => after_fast.length()
+  }
+  let fast_region = after_fast.clamped_view(end=slow_off).to_owned()
+  assert_eq(fast_region.contains("m2_panic_oob"), false)
+  let mut ext_cnt = 0
+  let mut ep = 0
+  while ep < fast_region.length() {
+    let et = fast_region.clamped_view(start=ep).to_owned()
+    match et.find("=l extsw ") {
+      Some(eo) => {
+        ext_cnt = ext_cnt + 1
+        ep = ep + eo + 9
+      }
+      None => break
+    }
+  }
+  // Only 4 index extsw (perm[fi], perm[fi], perm[k-fi], perm[k-fi]); 0 value extsw for `tmp` or `perm[k-fi]`
+  assert_eq(ext_cnt, 4)
+}

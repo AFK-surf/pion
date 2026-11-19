@@ -110,6 +110,7 @@ pub struct QbeGen {
   mut promoted_fields : Map[String, String]
   mut promoted_field_tys : Map[String, Ty]
   mut w_to_l_ext : Map[String, String]
+  mut local_w_to_l_ext : Map[String, String]
   mut next_tmp : Int
   mut next_lbl : Int
   mut next_clo : Int
@@ -3017,6 +3018,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     promoted_fields: Map([]),
     promoted_field_tys: Map([]),
     w_to_l_ext: Map([]),
+    local_w_to_l_ext: Map([]),
     next_tmp: 0,
     next_lbl: 0,
     next_clo: 0,
@@ -3078,6 +3080,7 @@ fn qbe_emit_lbl(g : QbeGen, lbl : String) -> Unit {
   g.block_term = false
   g.block_immut_fields = Map([])
   g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
 }
 
 ///|
@@ -3177,6 +3180,7 @@ fn qbe_scope_push(g : QbeGen) -> Unit {
   g.scopes.push(QbeScope::{ locals: [] })
   g.block_immut_fields = Map([])
   g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
 }
 
 ///|
@@ -3214,6 +3218,7 @@ fn qbe_scope_pop(g : QbeGen) -> Unit {
   }
   g.block_immut_fields = Map([])
   g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
 }
 
 ///|
@@ -3238,6 +3243,7 @@ fn qbe_define_local(
   top.locals.push(loc)
   g.block_immut_fields = Map([])
   g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext.remove(name)
   loc
 }
 
@@ -4066,6 +4072,7 @@ fn qbe_emit_closure_obj(
   let saved_prom = g.promoted_fields
   let saved_prom_tys = g.promoted_field_tys
   let saved_w2l = g.w_to_l_ext
+  let saved_local_w2l = g.local_w_to_l_ext
 
   g.fn_allocs = StringBuilder()
   g.fn_body = StringBuilder()
@@ -4090,6 +4097,7 @@ fn qbe_emit_closure_obj(
   g.promoted_fields = Map([])
   g.promoted_field_tys = Map([])
   g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
 
   qbe_scope_push(g)
   ki = 0
@@ -4175,6 +4183,7 @@ fn qbe_emit_closure_obj(
   g.promoted_fields = saved_prom
   g.promoted_field_tys = saved_prom_tys
   g.w_to_l_ext = saved_w2l
+  g.local_w_to_l_ext = saved_local_w2l
 
   QbeCloRes::{ env: env_obj, fn_sym: fn_sym, ty: TFn(ptys, actual_ret) }
 }
@@ -5491,6 +5500,12 @@ fn qbe_emit_expr(
       match qbe_lookup_local(g, name) {
         Some(loc) => {
           let t = qbe_load_local_slot(g, loc.slot, loc.ty)
+          if qbe_is_int32_ty(loc.ty) {
+            match g.local_w_to_l_ext.get(name) {
+              Some(rl) => g.w_to_l_ext.set(t, rl)
+              None => ()
+            }
+          }
           qbe_rc_inc(g, t, loc.ty)
           return qval(t, loc.ty)
         }
@@ -5812,11 +5827,15 @@ fn qbe_emit_expr(
                     }
                     let aw = qbe_tmp(g)
                     if k == 1 {
-                      let s = qbe_tmp(g)
-                      let a = qbe_tmp(g)
-                      qbe_emit(g, s + " =w shr " + lw + ", 31")
-                      qbe_emit(g, a + " =w add " + lw + ", " + s)
-                      qbe_emit(g, aw + " =w sar " + a + ", 1")
+                      if qbe_expr_is_even_int(lhs) {
+                        qbe_emit(g, aw + " =w sar " + lw + ", 1")
+                      } else {
+                        let s = qbe_tmp(g)
+                        let a = qbe_tmp(g)
+                        qbe_emit(g, s + " =w shr " + lw + ", 31")
+                        qbe_emit(g, a + " =w add " + lw + ", " + s)
+                        qbe_emit(g, aw + " =w sar " + a + ", 1")
+                      }
                     } else {
                       let s = qbe_tmp(g)
                       let b = qbe_tmp(g)
@@ -7693,6 +7712,93 @@ fn qbe_try_emit_while_field_promoted(
 }
 
 ///|
+fn qbe_is_ident_plus_minus_one(base : String, other : Expr) -> Bool {
+  match other {
+    EBinary("+", EIdent(x, _), EInt(raw, _), _) =>
+      x == base && qbe_parse_int64_lit(raw) == 1L
+    EBinary("+", EInt(raw, _), EIdent(x, _), _) =>
+      x == base && qbe_parse_int64_lit(raw) == 1L
+    EBinary("-", EIdent(x, _), EInt(raw, _), _) =>
+      x == base && qbe_parse_int64_lit(raw) == 1L
+    _ => false
+  }
+}
+
+///|
+fn qbe_are_consecutive_int_exprs(l : Expr, r : Expr) -> Bool {
+  match l {
+    EIdent(x, _) =>
+      if qbe_is_ident_plus_minus_one(x, r) {
+        return true
+      }
+    _ => ()
+  }
+  match r {
+    EIdent(x, _) => qbe_is_ident_plus_minus_one(x, l)
+    _ => false
+  }
+}
+
+///|
+fn qbe_expr_is_even_int(e : Expr) -> Bool {
+  match e {
+    EInt(raw, _) => (qbe_parse_int64_lit(raw) & 1L) == 0L
+    EUnary("-", inner, _) | EMove(inner, _) => qbe_expr_is_even_int(inner)
+    EBinary("*", l, r, _) =>
+      qbe_expr_is_even_int(l) ||
+      qbe_expr_is_even_int(r) ||
+      qbe_are_consecutive_int_exprs(l, r)
+    EBinary("<<", _, EInt(raw, _), _) => {
+      let sh = qbe_parse_int64_lit(raw)
+      sh >= 1L && sh <= 31L
+    }
+    EBinary("+", l, r, _) | EBinary("-", l, r, _) =>
+      qbe_expr_is_even_int(l) && qbe_expr_is_even_int(r)
+    _ => false
+  }
+}
+
+///|
+fn qbe_expr_is_pure_arith(e : Expr) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EDouble(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EIdent(_, _) => true
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+      qbe_expr_is_pure_arith(inner)
+    EBinary(op, l, r, _) =>
+      if op == "/" || op == "%" {
+        false
+      } else {
+        qbe_expr_is_pure_arith(l) && qbe_expr_is_pure_arith(r)
+      }
+    _ => false
+  }
+}
+
+///|
+fn qbe_expr_bare_reads_ident(e : Expr, name : String) -> Bool {
+  match e {
+    EIdent(n, _) => n == name
+    EBinary("*", EIdent(a, _), EIdent(b, _), _) =>
+      if a == name && b == name {
+        false
+      } else {
+        a == name || b == name
+      }
+    EBinary(_, l, r, _) =>
+      qbe_expr_bare_reads_ident(l, name) || qbe_expr_bare_reads_ident(r, name)
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+      qbe_expr_bare_reads_ident(inner, name)
+    _ => false
+  }
+}
+
+///|
 fn qbe_try_emit_while_sq_reuse(
   g : QbeGen,
   cond : Expr,
@@ -7804,6 +7910,66 @@ fn qbe_try_emit_while_sq_reuse(
     qbe_emit_cond_branch(g, cond, l_body, l_end)
   }
 
+  // Reorder adjacent pure immutable `let` statements before the first candidate
+  // assignment so statements that bare-read an old candidate variable run before
+  // statements that only use its precomputed square, shortening live ranges.
+  let eff_body : Array[Stmt] = []
+  let mut bi = 0
+  while bi < body.length() {
+    eff_body.push(body[bi])
+    bi = bi + 1
+  }
+  let mut min_assign = body.length()
+  ci = 0
+  while ci < cands.length() {
+    if cands[ci].assign_idx < min_assign {
+      min_assign = cands[ci].assign_idx
+    }
+    ci = ci + 1
+  }
+  let mut ri = 0
+  while ri + 1 < min_assign {
+    let mut do_swap = false
+    match eff_body[ri] {
+      SLet(n0, false, _, e0, _) =>
+        match eff_body[ri + 1] {
+          SLet(n1, false, _, e1, _) =>
+            if n0 != n1 &&
+              qbe_expr_is_pure_arith(e0) &&
+              qbe_expr_is_pure_arith(e1) &&
+              !qbe_expr_mentions_ident(e1, n0) &&
+              !qbe_expr_mentions_ident(e0, n1) {
+              let mut e0_bare = false
+              let mut e1_bare = false
+              let mut k = 0
+              while k < cands.length() {
+                let cn = cands[k].name
+                if qbe_expr_bare_reads_ident(e0, cn) {
+                  e0_bare = true
+                }
+                if qbe_expr_bare_reads_ident(e1, cn) {
+                  e1_bare = true
+                }
+                k = k + 1
+              }
+              if !e0_bare && e1_bare {
+                do_swap = true
+              }
+            }
+          _ => ()
+        }
+      _ => ()
+    }
+    if do_swap {
+      let tmp = eff_body[ri]
+      eff_body[ri] = eff_body[ri + 1]
+      eff_body[ri + 1] = tmp
+      ri = ri + 2
+    } else {
+      ri = ri + 1
+    }
+  }
+
   qbe_emit_lbl(g, l_body)
   let loop_depth = g.scopes.length()
   g.loop_breaks.push(l_end)
@@ -7811,16 +7977,16 @@ fn qbe_try_emit_while_sq_reuse(
   g.loop_depths.push(loop_depth)
   qbe_scope_push(g)
   si = 0
-  while si < body.length() {
+  while si < eff_body.length() {
     if g.block_term {
       break
     }
-    let is_last = si == body.length() - 1
-    if !is_last && qbe_try_emit_borrowed_arr_elem_let(g, body, si) {
+    let is_last = si == eff_body.length() - 1
+    if !is_last && qbe_try_emit_borrowed_arr_elem_let(g, eff_body, si) {
       si = si + 1
       continue
     }
-    let sv = qbe_emit_stmt(g, body[si], None, is_last)
+    let sv = qbe_emit_stmt(g, eff_body[si], None, is_last)
     if !g.block_term {
       qbe_rc_dec(g, sv.reg, sv.ty)
     }
@@ -7903,8 +8069,19 @@ fn qbe_emit_stmt(
       if name == "_" {
         qbe_rc_dec(g, iv.reg, final_ty)
       } else {
+        let iv_ext : Option[String] = if !is_mut &&
+          qbe_is_int32_ty(final_ty) &&
+          qbe_is_int32_ty(iv.ty) {
+          g.w_to_l_ext.get(iv.reg)
+        } else {
+          None
+        }
         let loc = qbe_define_local(g, name, final_ty, true)
         qbe_store_local_slot(g, qbe_coerce_val(g, iv, final_ty), loc.slot, final_ty)
+        match iv_ext {
+          Some(rl) => g.local_w_to_l_ext.set(name, rl)
+          None => ()
+        }
         // Track immutable `let n = arr.length()` aliases for BCE
         g.len_aliases.remove(name)
         if !is_mut {
@@ -7964,6 +8141,7 @@ fn qbe_emit_stmt(
         EIdent(name, _) => {
           g.len_aliases.remove(name)
           qbe_invalidate_len_aliases_for(g, name)
+          g.local_w_to_l_ext.remove(name)
           match rhs {
             EInt(raw, _) =>
               if qbe_parse_int64_lit(raw).to_int() >= 0 {
@@ -8595,6 +8773,7 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       g.promoted_fields = Map([])
       g.promoted_field_tys = Map([])
       g.w_to_l_ext = Map([])
+      g.local_w_to_l_ext = Map([])
 
       qbe_scope_push(g)
       let mut pi = 0
