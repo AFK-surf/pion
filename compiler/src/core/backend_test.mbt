@@ -295,3 +295,66 @@ test "qbe_p4b_loop_invariant_readonly_struct_field_hoist" {
   }
   assert_eq(loads, 12)
 }
+
+///|
+test "qbe_p4d_array_int_loadl_and_block_immut_field_cse" {
+  let src =
+    #|pub struct Particle {
+    #|  mut vx : Double
+    #|  mut vy : Double
+    #|  mut vz : Double
+    #|  mass : Double
+    #|}
+    #|pub fn read_int_elem(arr : Array[Int], i : Int) -> Int {
+    #|  arr[i]
+    #|}
+    #|pub fn triple_mass(a : Particle, b : Particle) -> Unit {
+    #|  a.vx = b.mass
+    #|  a.vy = b.mass
+    #|  a.vz = b.mass
+    #|}
+  let pkg = @core.parse_package("test", ["p4d.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_arr = match res.ssa.find("$m2_fn_read_int_elem") {
+    Some(idx) => {
+      let rest = res.ssa.clamped_view(start=idx).to_owned()
+      match rest.find("\n}\n") {
+        Some(e) => rest.clamped_view(end=e).to_owned()
+        None => rest
+      }
+    }
+    None => ""
+  }
+  // Array[Int] element load uses 64-bit `=l loadl` + `=w copy` for ARM64 [xBase, xIdx, lsl #3]
+  let after_shl = match fn_arr.find("=l shl ") {
+    Some(idx) => fn_arr.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  assert_eq(after_shl.contains("=l loadl "), true)
+  assert_eq(after_shl.contains("=w copy "), true)
+  assert_eq(after_shl.contains("=w loadsw "), false)
+  // Immutable primitive struct field `b.mass` loaded once across 3 reads in same basic block
+  let fn_mass = match res.ssa.find("$m2_fn_triple_mass") {
+    Some(idx) => {
+      let rest = res.ssa.clamped_view(start=idx).to_owned()
+      match rest.find("\n}\n") {
+        Some(e) => rest.clamped_view(end=e).to_owned()
+        None => rest
+      }
+    }
+    None => ""
+  }
+  let mut dloads = 0
+  let mut pos = 0
+  while pos < fn_mass.length() {
+    let tail = fn_mass.clamped_view(start=pos).to_owned()
+    match tail.find("=d loadd ") {
+      Some(off) => {
+        dloads = dloads + 1
+        pos = pos + off + 9
+      }
+      None => break
+    }
+  }
+  assert_eq(dloads, 1)
+}
