@@ -32,6 +32,7 @@ void apple_extsb(Fn *);
 
 /* isel.c */
 int arm64_logimm(uint64_t, int);
+int arm64_fpimm(Con *, int);
 void arm64_isel(Fn *);
 
 /* emit.c */

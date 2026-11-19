@@ -66,6 +66,35 @@ Check:
 	return (n & (n + (n & -n))) == 0;
 }
 
+int
+arm64_fpimm(Con *c, int k)
+{
+	uint64_t b;
+	uint exp;
+
+	if (c->type != CBits)
+		return 0;
+	if (k == Kd) {
+		b = (uint64_t)c->bits.i;
+		if (b == 0)
+			return 1;
+		if ((b & 0xffffffffffffULL) != 0)
+			return 0;
+		exp = (uint)((b >> 52) & 0x7ff);
+		return 1020 <= exp && exp <= 1027;
+	}
+	if (k == Ks) {
+		b = (uint32_t)c->bits.i;
+		if (b == 0)
+			return 1;
+		if ((b & 0x7ffffU) != 0)
+			return 0;
+		exp = (uint)((b >> 23) & 0xff);
+		return 124 <= exp && exp <= 131;
+	}
+	return 0;
+}
+
 static void
 fixarg(Ref *pr, int k, int phi, Fn *fn)
 {
@@ -106,7 +135,7 @@ fixarg(Ref *pr, int k, int phi, Fn *fn)
 		if (KBASE(k) == 0 && phi)
 			return;
 		r1 = newtmp("isel", k, fn);
-		if (KBASE(k) == 0) {
+		if (KBASE(k) == 0 || arm64_fpimm(c, k)) {
 			emit(Ocopy, k, r1, r0, R);
 		} else {
 			n = stashbits(c->bits.i, KWIDE(k) ? 8 : 4);
@@ -141,10 +170,19 @@ selcmp(Ref arg[2], int k, Fn *fn)
 	int64_t n;
 
 	if (KBASE(k) == 1) {
+		fix = 1;
+		if (rtype(arg[1]) == RCon) {
+			c = &fn->con[arg[1].val];
+			if (c->type == CBits
+			&& ((k == Kd && c->bits.i == 0)
+			 || (k == Ks && (uint32_t)c->bits.i == 0)))
+				fix = 0;
+		}
 		emit(Oafcmp, k, R, arg[0], arg[1]);
 		iarg = curi->arg;
 		fixarg(&iarg[0], k, 0, fn);
-		fixarg(&iarg[1], k, 0, fn);
+		if (fix)
+			fixarg(&iarg[1], k, 0, fn);
 		return 0;
 	}
 	swap = rtype(arg[0]) == RCon;
@@ -163,6 +201,7 @@ selcmp(Ref arg[2], int k, Fn *fn)
 			break;
 		case Iplo12:
 		case Iphi12:
+			r = getcon(n, fn);
 			fix = 0;
 			break;
 		case Inlo12:
@@ -197,13 +236,164 @@ callable(Ref r, Fn *fn)
 	return 0;
 }
 
-static void
-sel(Ins i, Fn *fn)
+static Ins *
+blkdef(Blk *b, Ins *cur, Ref r, Fn *fn)
 {
-	Ref *iarg;
-	Ins *i0;
-	int ck, cc;
+	Ins *d;
 
+	if (rtype(r) != RTmp || isreg(r))
+		return 0;
+	if (fn->tmp[r.val].slot != -1)
+		return 0;
+	if (fn->tmp[r.val].bid != b->id || fn->tmp[r.val].ndef != 1)
+		return 0;
+	d = fn->tmp[r.val].def;
+	if (!d || d < b->ins || d >= cur)
+		return 0;
+	return d;
+}
+
+static int
+iskltmp(Ref r, Fn *fn)
+{
+	return rtype(r) == RTmp
+		&& !isreg(r)
+		&& fn->tmp[r.val].slot == -1
+		&& fn->tmp[r.val].cls == Kl;
+}
+
+static int
+seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
+{
+	Ref addr, a0, a1, base, rhs, idx;
+	Ins *def, *shl;
+	Con *c;
+	Mem *m;
+	int64_t off, s;
+	int side;
+
+	addr = *pr;
+	def = blkdef(b, cur, addr, fn);
+	if (!def || def->op != Oadd || def->cls != Kl)
+		return 0;
+	a0 = def->arg[0];
+	a1 = def->arg[1];
+
+	/* Mode A: [base, #off] with ARM64 unsigned scaled offset */
+	base = R;
+	c = 0;
+	if (iskltmp(a0, fn) && rtype(a1) == RCon) {
+		base = a0;
+		c = &fn->con[a1.val];
+	} else if (iskltmp(a1, fn) && rtype(a0) == RCon) {
+		base = a1;
+		c = &fn->con[a0.val];
+	}
+	if (c && c->type == CBits) {
+		off = c->bits.i;
+		if (off >= 0 && off <= (int64_t)4095 * sz && (off % sz) == 0) {
+			vgrow(&fn->mem, ++fn->nmem);
+			m = &fn->mem[fn->nmem - 1];
+			memset(m, 0, sizeof *m);
+			m->offset.type = CBits;
+			m->offset.bits.i = off;
+			m->base = base;
+			m->index = R;
+			m->scale = 0;
+			fixarg(&m->base, Kl, 0, fn);
+			chuse(addr, -1, fn);
+			chuse(m->base, +1, fn);
+			if (fn->tmp[addr.val].nuse == 0) {
+				chuse(def->arg[0], -1, fn);
+				chuse(def->arg[1], -1, fn);
+				*def = (Ins){.op = Onop};
+			}
+			*pr = MEM(fn->nmem - 1);
+			return 1;
+		}
+		return 0;
+	}
+
+	/* Mode B: [base, idx, lsl #shift] or [base, idx] */
+	if (!iskltmp(a0, fn) || !iskltmp(a1, fn))
+		return 0;
+
+	for (side = 0; side < 2; side++) {
+		base = side == 0 ? a0 : a1;
+		rhs  = side == 0 ? a1 : a0;
+		shl = blkdef(b, def, rhs, fn);
+		if (!shl || shl->op != Oshl || shl->cls != Kl)
+			continue;
+		idx = shl->arg[0];
+		if (!iskltmp(idx, fn) || rtype(shl->arg[1]) != RCon)
+			continue;
+		c = &fn->con[shl->arg[1].val];
+		if (c->type != CBits)
+			continue;
+		s = c->bits.i;
+		if (s < 0 || s > 3 || (1 << s) != sz)
+			continue;
+		vgrow(&fn->mem, ++fn->nmem);
+		m = &fn->mem[fn->nmem - 1];
+		memset(m, 0, sizeof *m);
+		m->offset.type = CBits;
+		m->offset.bits.i = 0;
+		m->base = base;
+		m->index = idx;
+		m->scale = sz;
+		fixarg(&m->base, Kl, 0, fn);
+		fixarg(&m->index, Kl, 0, fn);
+		chuse(addr, -1, fn);
+		chuse(m->base, +1, fn);
+		chuse(m->index, +1, fn);
+		if (fn->tmp[addr.val].nuse == 0) {
+			chuse(def->arg[0], -1, fn);
+			chuse(def->arg[1], -1, fn);
+			*def = (Ins){.op = Onop};
+			if (fn->tmp[rhs.val].nuse == 0) {
+				chuse(shl->arg[0], -1, fn);
+				chuse(shl->arg[1], -1, fn);
+				*shl = (Ins){.op = Onop};
+			}
+		}
+		*pr = MEM(fn->nmem - 1);
+		return 1;
+	}
+
+	if (fn->tmp[addr.val].nuse == 1) {
+		vgrow(&fn->mem, ++fn->nmem);
+		m = &fn->mem[fn->nmem - 1];
+		memset(m, 0, sizeof *m);
+		m->offset.type = CBits;
+		m->offset.bits.i = 0;
+		m->base = a0;
+		m->index = a1;
+		m->scale = 1;
+		fixarg(&m->base, Kl, 0, fn);
+		fixarg(&m->index, Kl, 0, fn);
+		chuse(addr, -1, fn);
+		chuse(m->base, +1, fn);
+		chuse(m->index, +1, fn);
+		chuse(def->arg[0], -1, fn);
+		chuse(def->arg[1], -1, fn);
+		*def = (Ins){.op = Onop};
+		*pr = MEM(fn->nmem - 1);
+		return 1;
+	}
+	return 0;
+}
+
+static void
+sel(Ins i, Blk *b, Ins *cur, Fn *fn)
+{
+	Ref *iarg, r;
+	Ins *i0;
+	Con *c;
+	int ck, cc, fix1;
+	int64_t n;
+
+	if (i.op == Onop)
+		return;
 	if (INRANGE(i.op, Oalloc, Oalloc1)) {
 		i0 = curi - 1;
 		salloc(i.to, i.arg[0], fn);
@@ -224,12 +414,86 @@ sel(Ins i, Fn *fn)
 		emiti(i);
 		return;
 	}
-	if (i.op != Onop) {
+	if (isload(i.op)) {
 		emiti(i);
-		iarg = curi->arg; /* fixarg() can change curi */
-		fixarg(&iarg[0], argcls(&i, 0), 0, fn);
-		fixarg(&iarg[1], argcls(&i, 1), 0, fn);
+		iarg = curi->arg;
+		if (!seladdr(&iarg[0], loadsz(&i), b, cur, fn))
+			fixarg(&iarg[0], argcls(&i, 0), 0, fn);
+		return;
 	}
+	if (isstore(i.op)) {
+		emiti(i);
+		iarg = curi->arg;
+		fixarg(&iarg[0], argcls(&i, 0), 0, fn);
+		if (!seladdr(&iarg[1], storesz(&i), b, cur, fn))
+			fixarg(&iarg[1], argcls(&i, 1), 0, fn);
+		return;
+	}
+	fix1 = 1;
+	if (KBASE(i.cls) == 0) {
+		switch (i.op) {
+		case Oadd:
+			if (rtype(i.arg[0]) == RCon && rtype(i.arg[1]) != RCon) {
+				r = i.arg[0];
+				i.arg[0] = i.arg[1];
+				i.arg[1] = r;
+			}
+			/* fall through */
+		case Osub:
+			if (rtype(i.arg[1]) == RCon) {
+				c = &fn->con[i.arg[1].val];
+				switch (imm(c, i.cls, &n)) {
+				case Iplo12:
+				case Iphi12:
+					i.arg[1] = getcon(n, fn);
+					fix1 = 0;
+					break;
+				case Inlo12:
+				case Inhi12:
+					i.op = i.op == Oadd ? Osub : Oadd;
+					i.arg[1] = getcon(n, fn);
+					fix1 = 0;
+					break;
+				default:
+					break;
+				}
+			}
+			break;
+		case Oshl:
+		case Oshr:
+		case Osar:
+			if (rtype(i.arg[1]) == RCon) {
+				c = &fn->con[i.arg[1].val];
+				if (c->type == CBits) {
+					n = c->bits.i;
+					if (n >= 0 && n < (KWIDE(i.cls) ? 64 : 32)) {
+						i.arg[1] = getcon(n, fn);
+						fix1 = 0;
+					}
+				}
+			}
+			break;
+		case Oand:
+		case Oor:
+		case Oxor:
+			if (rtype(i.arg[0]) == RCon && rtype(i.arg[1]) != RCon) {
+				r = i.arg[0];
+				i.arg[0] = i.arg[1];
+				i.arg[1] = r;
+			}
+			if (rtype(i.arg[1]) == RCon) {
+				c = &fn->con[i.arg[1].val];
+				if (c->type == CBits && arm64_logimm(c->bits.i, i.cls))
+					fix1 = 0;
+			}
+			break;
+		}
+	}
+	emiti(i);
+	iarg = curi->arg; /* fixarg() can change curi */
+	fixarg(&iarg[0], argcls(&i, 0), 0, fn);
+	if (fix1)
+		fixarg(&iarg[1], argcls(&i, 1), 0, fn);
 }
 
 static void
@@ -304,8 +568,10 @@ arm64_isel(Fn *fn)
 				fixarg(&p->arg[n], p->cls, 1, fn);
 			}
 		seljmp(b, fn);
-		for (i=&b->ins[b->nins]; i!=b->ins;)
-			sel(*--i, fn);
+		for (i=&b->ins[b->nins]; i!=b->ins;) {
+			--i;
+			sel(*i, b, i, fn);
+		}
 		idup(b, curi, &insb[NIns]-curi);
 	}
 

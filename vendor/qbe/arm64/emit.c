@@ -229,9 +229,14 @@ emitf(char *s, Ins *i, E *e)
 				pc = &e->fn->con[r.val];
 				n = pc->bits.i;
 				assert(pc->type == CBits);
-				if (n >> 24) {
+				if (i->op == Oafcmp) {
+					assert(k == Kd ? n == 0 : (uint32_t)n == 0);
+					fputs("#0.0", e->f);
+				} else if (i->op == Oand || i->op == Oor || i->op == Oxor) {
+					if (k == Kw)
+						n = (uint32_t)n;
 					assert(arm64_logimm(n, k));
-					fprintf(e->f, "#%"PRIu64, n);
+					fprintf(e->f, "#0x%"PRIx64, n);
 				} else if (n & 0xfff000) {
 					assert(!(n & ~0xfff000ull));
 					fprintf(e->f, "#%"PRIu64", lsl #12",
@@ -257,6 +262,40 @@ emitf(char *s, Ins *i, E *e)
 			case RSlot:
 				fprintf(e->f, "[x29, %"PRIu64"]", slot(r, e));
 				break;
+			case RMem: {
+				Mem *m = &e->fn->mem[r.val];
+				assert(isreg(m->base));
+				if (req(m->index, R)) {
+					if (m->offset.bits.i == 0)
+						fprintf(e->f, "[%s]",
+							rname(m->base.val, Kl));
+					else
+						fprintf(e->f, "[%s, #%"PRIi64"]",
+							rname(m->base.val, Kl),
+							m->offset.bits.i);
+				} else {
+					int sh = 0;
+					assert(isreg(m->index));
+					if (m->scale == 2)
+						sh = 1;
+					else if (m->scale == 4)
+						sh = 2;
+					else if (m->scale == 8)
+						sh = 3;
+					else
+						assert(m->scale <= 1);
+					fprintf(e->f, "[%s, ",
+						rname(m->base.val, Kl));
+					if (sh)
+						fprintf(e->f, "%s, lsl #%d]",
+							rname(m->index.val, Kl),
+							sh);
+					else
+						fprintf(e->f, "%s]",
+							rname(m->index.val, Kl));
+				}
+				break;
+			}
 			}
 			break;
 		}
@@ -327,7 +366,7 @@ loadaddr(Con *c, char *rn, E *e)
 static void
 loadcon(Con *c, int r, int k, E *e)
 {
-	char *rn;
+	char *rn, buf[64];
 	int64_t n;
 	int w, sh;
 
@@ -340,6 +379,26 @@ loadcon(Con *c, int r, int k, E *e)
 		return;
 	}
 	assert(c->type == CBits);
+	if (KBASE(k) == 1) {
+		assert(arm64_fpimm(c, k));
+		if (k == Kd) {
+			if (n == 0) {
+				fprintf(e->f, "\tfmov\t%s, xzr\n", rn);
+				return;
+			}
+			snprintf(buf, sizeof buf, "%.17g", c->bits.d);
+		} else {
+			if ((uint32_t)n == 0) {
+				fprintf(e->f, "\tfmov\t%s, wzr\n", rn);
+				return;
+			}
+			snprintf(buf, sizeof buf, "%.17g", (double)c->bits.s);
+		}
+		if (!strchr(buf, '.'))
+			strcat(buf, ".0");
+		fprintf(e->f, "\tfmov\t%s, #%s\n", rn, buf);
+		return;
+	}
 	if (!w)
 		n = (int32_t)n;
 	if ((n | 0xffff) == -1 || arm64_logimm(n, k)) {
@@ -431,7 +490,7 @@ emitins(Ins *i, E *e)
 		if (rtype(i->to) == RSlot) {
 			r = i->to;
 			if (!isreg(i->arg[0])) {
-				i->to = TMP(IP1);
+				i->to = TMP(KBASE(i->cls) == 0 ? IP1 : V31);
 				emitins(i, e);
 				i->arg[0] = i->to;
 			}
@@ -441,7 +500,7 @@ emitins(Ins *i, E *e)
 			emitins(i, e);
 			break;
 		}
-		assert(isreg(i->to));
+		assert(isreg(i->to) || req(i->to, TMP(V31)));
 		switch (rtype(i->arg[0])) {
 		case RCon:
 			c = &e->fn->con[i->arg[0].val];
