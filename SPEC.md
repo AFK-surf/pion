@@ -228,7 +228,10 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `int32_t m2_world_fs_write(void *w, void *path_str, void *content_str);`
 - `int32_t m2_world_fs_exists(void *w, void *path_str);`
 - `int32_t m2_world_fs_mkdir_p(void *w, void *path_str);`
-- `void*   m2_world_fs_list_dir(void *w, void *path_str);`
+- `void*   m2_world_fs_list_dir(void *w, void *path_str);` (MUST return entries sorted lexicographically for deterministic builds!)
+- `int32_t m2_world_fs_remove(void *w, void *path_str);` (for CAS LRU eviction; returns 1 on success)
+- `int32_t m2_world_fs_rename(void *w, void *old_path, void *new_path);` (for atomic concurrent CAS writes; returns 1 on success)
+- `int64_t m2_world_fs_size(void *w, void *path_str);` (file size in bytes, or -1 if missing)
 - `void*   m2_world_env_get(void *w, void *name_str, int32_t *ok_out);`
 - `int64_t m2_world_clock_ms(void *w);`
 - `int32_t m2_world_exec(void *w, void *argv_arr);` (fork/execvp waitpid, returns exit code)
