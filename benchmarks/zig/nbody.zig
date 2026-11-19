@@ -1,0 +1,131 @@
+const std = @import("std");
+
+extern "c" fn printf(fmt: [*:0]const u8, ...) c_int;
+
+const PI: f64 = 3.141592653589793;
+const SOLAR_MASS: f64 = 4.0 * PI * PI;
+const DAYS_PER_YEAR: f64 = 365.24;
+
+const Body = struct {
+    x: f64,
+    y: f64,
+    z: f64,
+    vx: f64,
+    vy: f64,
+    vz: f64,
+    mass: f64,
+};
+
+fn offsetMomentum(bodies: []Body) void {
+    var px: f64 = 0.0;
+    var py: f64 = 0.0;
+    var pz: f64 = 0.0;
+    for (bodies) |b| {
+        px += b.vx * b.mass;
+        py += b.vy * b.mass;
+        pz += b.vz * b.mass;
+    }
+    bodies[0].vx = -px / SOLAR_MASS;
+    bodies[0].vy = -py / SOLAR_MASS;
+    bodies[0].vz = -pz / SOLAR_MASS;
+}
+
+fn energy(bodies: []const Body) f64 {
+    var e: f64 = 0.0;
+    for (bodies, 0..) |b, i| {
+        e += 0.5 * b.mass * (b.vx * b.vx + b.vy * b.vy + b.vz * b.vz);
+        var j: usize = i + 1;
+        while (j < bodies.len) : (j += 1) {
+            const b2 = bodies[j];
+            const dx = b.x - b2.x;
+            const dy = b.y - b2.y;
+            const dz = b.z - b2.z;
+            const distance = @sqrt(dx * dx + dy * dy + dz * dz);
+            e -= (b.mass * b2.mass) / distance;
+        }
+    }
+    return e;
+}
+
+fn advance(bodies: []Body, dt: f64) void {
+    var i: usize = 0;
+    while (i < bodies.len) : (i += 1) {
+        var j: usize = i + 1;
+        while (j < bodies.len) : (j += 1) {
+            const dx = bodies[i].x - bodies[j].x;
+            const dy = bodies[i].y - bodies[j].y;
+            const dz = bodies[i].z - bodies[j].z;
+            const d2 = dx * dx + dy * dy + dz * dz;
+            const distance = @sqrt(d2);
+            const mag = dt / (d2 * distance);
+
+            const mi = bodies[i].mass;
+            const mj = bodies[j].mass;
+
+            bodies[i].vx -= dx * mj * mag;
+            bodies[i].vy -= dy * mj * mag;
+            bodies[i].vz -= dz * mj * mag;
+
+            bodies[j].vx += dx * mi * mag;
+            bodies[j].vy += dy * mi * mag;
+            bodies[j].vz += dz * mi * mag;
+        }
+    }
+    for (bodies) |*b| {
+        b.x += dt * b.vx;
+        b.y += dt * b.vy;
+        b.z += dt * b.vz;
+    }
+}
+
+pub fn main() void {
+    const n: usize = 5_000_000;
+    var bodies = [_]Body{
+        .{ .x = 0.0, .y = 0.0, .z = 0.0, .vx = 0.0, .vy = 0.0, .vz = 0.0, .mass = SOLAR_MASS },
+        .{
+            .x = 4.84143144246472090e+00,
+            .y = -1.16032004402742839e+00,
+            .z = -1.03622044471123109e-01,
+            .vx = 1.66007664274403694e-03 * DAYS_PER_YEAR,
+            .vy = 7.69901118419740425e-03 * DAYS_PER_YEAR,
+            .vz = -6.90460016972063023e-05 * DAYS_PER_YEAR,
+            .mass = 9.54791938424326609e-04 * SOLAR_MASS,
+        },
+        .{
+            .x = 8.34336671824457987e+00,
+            .y = 4.12479856412430479e+00,
+            .z = -4.03523417114321381e-01,
+            .vx = -2.76742510726862411e-03 * DAYS_PER_YEAR,
+            .vy = 4.99852801234917238e-03 * DAYS_PER_YEAR,
+            .vz = 2.30417297573763929e-05 * DAYS_PER_YEAR,
+            .mass = 2.85885980666130812e-04 * SOLAR_MASS,
+        },
+        .{
+            .x = 1.28943695621391310e+01,
+            .y = -1.51111514016986312e+01,
+            .z = -2.23307578892655734e-01,
+            .vx = 2.96460137564761618e-03 * DAYS_PER_YEAR,
+            .vy = 2.37847173959480950e-03 * DAYS_PER_YEAR,
+            .vz = -2.96589568540237556e-05 * DAYS_PER_YEAR,
+            .mass = 4.36624404335156298e-05 * SOLAR_MASS,
+        },
+        .{
+            .x = 1.53796971148509165e+01,
+            .y = -2.59193146099879641e+01,
+            .z = 1.79258772950371181e-01,
+            .vx = 2.68067772490389322e-03 * DAYS_PER_YEAR,
+            .vy = 1.62824170038242295e-03 * DAYS_PER_YEAR,
+            .vz = -9.51592254519715870e-05 * DAYS_PER_YEAR,
+            .mass = 5.15138902046611451e-05 * SOLAR_MASS,
+        },
+    };
+
+    offsetMomentum(&bodies);
+    const e0 = energy(&bodies);
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        advance(&bodies, 0.01);
+    }
+    const e1 = energy(&bodies);
+    _ = printf("%.9f %.9f\n", e0, e1);
+}
