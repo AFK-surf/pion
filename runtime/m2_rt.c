@@ -121,6 +121,7 @@ static void m2_slab_push_remote_list(uint32_t cls, void *head, void *tail) {
 }
 
 static void m2_slab_thread_cleanup(void *arg) {
+    tls_slab = NULL;
     M2SlabTLS *s = (M2SlabTLS *)arg;
     if (!s) return;
     for (uint32_t cls = 0; cls < M2_SLAB_CLASSES; cls++) {

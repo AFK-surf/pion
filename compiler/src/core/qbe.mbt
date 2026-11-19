@@ -2751,7 +2751,7 @@ fn qbe_emit_expr(
             let xv = qbe_emit_expr(g, args[0], Some(TDouble))
             let xd = qbe_coerce_val(g, xv, TDouble)
             let r = qbe_tmp(g)
-            qbe_emit(g, r + " =d call $sqrt(d " + xd + ")")
+            qbe_emit(g, r + " =d sqrt " + xd)
             return qval(r, TDouble)
           }
           if is_world_builtin(name) {
@@ -3176,7 +3176,7 @@ fn qbe_emit_expr(
     }
     EMethodCall(obj, method_name, args, _) =>
       qbe_emit_method_call(g, obj, method_name, args, expected)
-    EIndex(obj, idx, sp) => {
+    EIndex(obj, idx, _) => {
       let mut borrowed = false
       let mut ov = qval("0", TError)
       if !qbe_expr_has_assign(idx) {
@@ -3212,18 +3212,7 @@ fn qbe_emit_expr(
           qbe_emit(g, oob + " =w cugel " + iv.reg + ", " + alen)
           qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
           qbe_emit_lbl(g, l_oob)
-          let msg_id = qbe_intern_cstring(g, "array index out of bounds")
-          let file_id = qbe_intern_cstring(g, sp.file)
-          qbe_emit(
-            g,
-            "call $m2_panic(l $m2_cstr_" +
-            msg_id.to_string() +
-            ", l $m2_cstr_" +
-            file_id.to_string() +
-            ", w " +
-            sp.line.to_string() +
-            ")",
-          )
+          qbe_emit(g, "call $m2_panic_oob(l " + iv.reg + ", l " + alen + ")")
           qbe_emit_term(g, "hlt")
           qbe_emit_lbl(g, l_ok)
           let dp_p = qbe_tmp(g)
@@ -3688,7 +3677,7 @@ fn qbe_emit_stmt(
       }
       qval("0", TUnit)
     }
-    SAssign(lhs, rhs, sp) => {
+    SAssign(lhs, rhs, _) => {
       match lhs {
         EIdent(name, _) =>
           match qbe_lookup_local(g, name) {
@@ -3819,18 +3808,7 @@ fn qbe_emit_stmt(
                 qbe_emit(g, oob + " =w cugel " + iv.reg + ", " + alen)
                 qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
                 qbe_emit_lbl(g, l_oob)
-                let msg_id = qbe_intern_cstring(g, "array index out of bounds")
-                let file_id = qbe_intern_cstring(g, sp.file)
-                qbe_emit(
-                  g,
-                  "call $m2_panic(l $m2_cstr_" +
-                  msg_id.to_string() +
-                  ", l $m2_cstr_" +
-                  file_id.to_string() +
-                  ", w " +
-                  sp.line.to_string() +
-                  ")",
-                )
+                qbe_emit(g, "call $m2_panic_oob(l " + iv.reg + ", l " + alen + ")")
                 qbe_emit_term(g, "hlt")
                 qbe_emit_lbl(g, l_ok)
                 let dp_p = qbe_tmp(g)
