@@ -583,8 +583,16 @@ fn drv_build_targets(
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
-  let cc1as_triple = "arm64-apple-macosx" + apple_tools.macos_ver + ".0"
-  let ld_ver = apple_tools.macos_ver + ".0"
+  let direct_obj = qbe_target == "arm64_apple" &&
+    emit_asm_path == "" &&
+    drv_env_str(world, "M2_NO_DIRECT_OBJ") != "1"
+  let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
+    apple_tools.macos_ver
+  } else {
+    "15.0"
+  }
+  let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
+  let ld_ver = qbe_macos_ver + ".0"
 
   // Multi-file unit-level parallel compilation + unit-level global CAS + incremental .sig/.stub skip
   if paths.length() > 1 && emit_ssa_path == "" && emit_asm_path == "" {
@@ -812,7 +820,7 @@ fn drv_build_targets(
       }
     }
 
-    // Compile missed units (qbe + cc1as/as) in parallel across up to `jobs` OS threads
+    // Compile missed units (qbe --obj or qbe + cc1as/as) in parallel across up to `jobs` OS threads
     let n_miss = miss_indices.length()
     if n_miss == 1 || (n_miss > 1 && jobs <= 1) {
       let stamp = clock_now_ms(world).to_string()
@@ -822,27 +830,39 @@ fn drv_build_targets(
         let ukey = unit_keys[idx]
         let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
         let u_obj = obj_paths[idx]
-        let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp + "_" + idx.to_string()
         let u_tmp = u_obj + ".tmp." + stamp + "_" + idx.to_string()
-        let rc_qbe = proc_exec(world, [qbe_bin, "-t", qbe_target, "-o", u_asm, u_ssa])
-        if rc_qbe != 0 {
-          let _ = fs_remove(world, u_asm)
-          return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
-        }
-        let rc_as = if apple_tools.ok {
-          proc_exec(
+        if direct_obj {
+          let rc_qbe = proc_exec(
             world,
-            [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", u_tmp, u_asm],
+            [qbe_bin, "-t", qbe_target, "--obj", "--macos-ver", qbe_macos_ver, "-o", u_tmp, u_ssa],
           )
+          if rc_qbe != 0 {
+            let _ = fs_remove(world, u_tmp)
+            return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+          }
+          let _ = fs_rename(world, u_tmp, u_obj)
         } else {
-          proc_exec(world, ["as", "-o", u_tmp, u_asm])
+          let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp + "_" + idx.to_string()
+          let rc_qbe = proc_exec(world, [qbe_bin, "-t", qbe_target, "-o", u_asm, u_ssa])
+          if rc_qbe != 0 {
+            let _ = fs_remove(world, u_asm)
+            return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+          }
+          let rc_as = if apple_tools.ok {
+            proc_exec(
+              world,
+              [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", u_tmp, u_asm],
+            )
+          } else {
+            proc_exec(world, ["as", "-o", u_tmp, u_asm])
+          }
+          let _ = fs_remove(world, u_asm)
+          if rc_as != 0 {
+            let _ = fs_remove(world, u_tmp)
+            return Err("as failed with exit code " + rc_as.to_string())
+          }
+          let _ = fs_rename(world, u_tmp, u_obj)
         }
-        let _ = fs_remove(world, u_asm)
-        if rc_as != 0 {
-          let _ = fs_remove(world, u_tmp)
-          return Err("as failed with exit code " + rc_as.to_string())
-        }
-        let _ = fs_rename(world, u_tmp, u_obj)
         mi = mi + 1
       }
     } else if n_miss > 1 {
@@ -854,6 +874,8 @@ fn drv_build_targets(
         }
         let err_ch : Channel[String] = Channel::new(batch + 1)
         let stamp_base = clock_now_ms(world).to_string()
+        let use_direct = direct_obj
+        let qmv = qbe_macos_ver
         let use_cc1as = apple_tools.ok
         let cc1as_bin = apple_tools.clang_bin
         let cc1as_tr = cc1as_triple
@@ -869,22 +891,32 @@ fn drv_build_targets(
             let qb = qbe_bin
             let qt = qbe_target
             spawn(s, fn() -> Unit {
-              let rc_qbe = proc_exec([qb, "-t", qt, "-o", u_asm, u_ssa])
-              if rc_qbe != 0 {
-                let _ = fs_remove(u_asm)
-                let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
-              } else {
-                let rc_as = if use_cc1as {
-                  proc_exec([cc1as_bin, "-cc1as", "-triple", cc1as_tr, "-filetype", "obj", "-o", u_tmp, u_asm])
-                } else {
-                  proc_exec(["as", "-o", u_tmp, u_asm])
-                }
-                let _ = fs_remove(u_asm)
-                if rc_as != 0 {
+              if use_direct {
+                let rc_qbe = proc_exec([qb, "-t", qt, "--obj", "--macos-ver", qmv, "-o", u_tmp, u_ssa])
+                if rc_qbe != 0 {
                   let _ = fs_remove(u_tmp)
-                  let _ = err_ch.send("as failed with exit code " + rc_as.to_string() + " on " + u_asm)
+                  let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
                 } else {
                   let _ = fs_rename(u_tmp, u_obj)
+                }
+              } else {
+                let rc_qbe = proc_exec([qb, "-t", qt, "-o", u_asm, u_ssa])
+                if rc_qbe != 0 {
+                  let _ = fs_remove(u_asm)
+                  let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+                } else {
+                  let rc_as = if use_cc1as {
+                    proc_exec([cc1as_bin, "-cc1as", "-triple", cc1as_tr, "-filetype", "obj", "-o", u_tmp, u_asm])
+                  } else {
+                    proc_exec(["as", "-o", u_tmp, u_asm])
+                  }
+                  let _ = fs_remove(u_asm)
+                  if rc_as != 0 {
+                    let _ = fs_remove(u_tmp)
+                    let _ = err_ch.send("as failed with exit code " + rc_as.to_string() + " on " + u_asm)
+                  } else {
+                    let _ = fs_rename(u_tmp, u_obj)
+                  }
                 }
               }
             })
@@ -1024,46 +1056,60 @@ fn drv_build_targets(
     }
 
     let stamp = clock_now_ms(world).to_string()
-    let asm_path = cache_dir + "/obj/" + key + ".s." + stamp
     let obj_tmp = obj_path + ".tmp." + stamp
-    let rc_qbe = proc_exec(
-      world,
-      [qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path],
-    )
-    if rc_qbe != 0 {
-      let _ = fs_remove(world, asm_path)
-      return Err(
-        "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
-      )
-    }
-    if emit_asm_path != "" {
-      drv_ensure_parent_dir(world, emit_asm_path)
-      match fs_read(world, asm_path) {
-        Err(msg) => {
-          let _ = fs_remove(world, asm_path)
-          return Err("failed to read asm: " + msg)
-        }
-        Ok(asm_text) =>
-          if !drv_write_text_atomic(world, emit_asm_path, asm_text) {
-            let _ = fs_remove(world, asm_path)
-            return Err("failed to write --emit-asm file: " + emit_asm_path)
-          }
-      }
-    }
-    let rc_as = if apple_tools.ok {
-      proc_exec(
+    if direct_obj {
+      let rc_qbe = proc_exec(
         world,
-        [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", obj_tmp, asm_path],
+        [qbe_bin, "-t", qbe_target, "--obj", "--macos-ver", qbe_macos_ver, "-o", obj_tmp, ssa_path],
       )
+      if rc_qbe != 0 {
+        let _ = fs_remove(world, obj_tmp)
+        return Err(
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+        )
+      }
+      let _ = fs_rename(world, obj_tmp, obj_path)
     } else {
-      proc_exec(world, ["as", "-o", obj_tmp, asm_path])
+      let asm_path = cache_dir + "/obj/" + key + ".s." + stamp
+      let rc_qbe = proc_exec(
+        world,
+        [qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path],
+      )
+      if rc_qbe != 0 {
+        let _ = fs_remove(world, asm_path)
+        return Err(
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+        )
+      }
+      if emit_asm_path != "" {
+        drv_ensure_parent_dir(world, emit_asm_path)
+        match fs_read(world, asm_path) {
+          Err(msg) => {
+            let _ = fs_remove(world, asm_path)
+            return Err("failed to read asm: " + msg)
+          }
+          Ok(asm_text) =>
+            if !drv_write_text_atomic(world, emit_asm_path, asm_text) {
+              let _ = fs_remove(world, asm_path)
+              return Err("failed to write --emit-asm file: " + emit_asm_path)
+            }
+        }
+      }
+      let rc_as = if apple_tools.ok {
+        proc_exec(
+          world,
+          [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", obj_tmp, asm_path],
+        )
+      } else {
+        proc_exec(world, ["as", "-o", obj_tmp, asm_path])
+      }
+      let _ = fs_remove(world, asm_path)
+      if rc_as != 0 {
+        let _ = fs_remove(world, obj_tmp)
+        return Err("as failed with exit code " + rc_as.to_string())
+      }
+      let _ = fs_rename(world, obj_tmp, obj_path)
     }
-    let _ = fs_remove(world, asm_path)
-    if rc_as != 0 {
-      let _ = fs_remove(world, obj_tmp)
-      return Err("as failed with exit code " + rc_as.to_string())
-    }
-    let _ = fs_rename(world, obj_tmp, obj_path)
 
     let sz_sig = fs_size(world, sig_path)
     let sz_ssa = fs_size(world, ssa_path)

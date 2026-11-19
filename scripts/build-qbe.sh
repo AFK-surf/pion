@@ -33,7 +33,7 @@ T0="$(python3 -c 'import time; print(int(time.time()*1000))')"
 
 SRCS="main util parse abi cfg mem ssa alias load copy fold gvn gcm simpl ifopt live spill rega emit \
 amd64/targ amd64/sysv amd64/isel amd64/emit amd64/winabi \
-arm64/targ arm64/abi arm64/isel arm64/emit \
+arm64/targ arm64/abi arm64/isel arm64/emit arm64/macho \
 rv64/targ rv64/abi rv64/isel rv64/emit"
 
 mkdir -p "$BUILD_DIR/amd64" "$BUILD_DIR/arm64" "$BUILD_DIR/rv64"
