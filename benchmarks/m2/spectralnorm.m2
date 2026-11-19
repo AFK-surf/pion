@@ -1,17 +1,4 @@
 ///| Benchmarks Game: Spectral Norm (N = 2000) in m2
-fn sqrt_d(x : Double) -> Double {
-  if x <= 0.0 {
-    return 0.0
-  }
-  let mut g = if x > 1.0 { x * 0.5 } else { 1.0 }
-  let mut i = 0
-  while i < 16 {
-    g = 0.5 * (g + x / g)
-    i = i + 1
-  }
-  g
-}
-
 fn fmt_fixed9(v : Double) -> String {
   let neg = v < 0.0
   let av = if neg { -v } else { v }
@@ -103,6 +90,6 @@ pub fn main(world : World) -> Int {
     vv = vv + v[i] * v[i]
     i = i + 1
   }
-  io_println(world, fmt_fixed9(sqrt_d(vbv / vv)))
+  io_println(world, fmt_fixed9(math_sqrt(vbv / vv)))
   0
 }

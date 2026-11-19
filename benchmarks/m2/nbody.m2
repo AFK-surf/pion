@@ -13,19 +13,6 @@ pub struct Body {
   mass : Double
 }
 
-fn sqrt_d(x : Double) -> Double {
-  if x <= 0.0 {
-    return 0.0
-  }
-  let mut g = if x > 1.0 { x * 0.5 } else { 1.0 }
-  let mut i = 0
-  while i < 16 {
-    g = 0.5 * (g + x / g)
-    i = i + 1
-  }
-  g
-}
-
 fn fmt_fixed9(v : Double) -> String {
   let neg = v < 0.0
   let av = if neg { -v } else { v }
@@ -78,7 +65,7 @@ fn energy(bodies : Array[Body]) -> Double {
       let dx = b.x - b2.x
       let dy = b.y - b2.y
       let dz = b.z - b2.z
-      let distance = sqrt_d(dx * dx + dy * dy + dz * dz)
+      let distance = math_sqrt(dx * dx + dy * dy + dz * dz)
       e = e - b.mass * b2.mass / distance
       j = j + 1
     }
@@ -99,7 +86,7 @@ fn advance(bodies : Array[Body], dt : Double) -> Unit {
       let dy = b.y - b2.y
       let dz = b.z - b2.z
       let d2 = dx * dx + dy * dy + dz * dz
-      let distance = sqrt_d(d2)
+      let distance = math_sqrt(d2)
       let mag = dt / (d2 * distance)
       b.vx = b.vx - dx * b2.mass * mag
       b.vy = b.vy - dy * b2.mass * mag

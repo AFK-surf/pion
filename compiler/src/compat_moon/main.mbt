@@ -431,6 +431,100 @@ fn build_targets(
 
   let qbe_target = resolve_qbe_target()
   let qbe_bin = resolve_qbe_bin()
+
+  if paths.length() > 1 && emit_ssa_path == "" && emit_asm_path == "" {
+    let prep = match @core.cli_prepare_qbe_units(pkg_name, paths, sources) {
+      Err(diag_json) => return Err(diag_json)
+      Ok(p) => p
+    }
+    let n_units = paths.length()
+    let unit_keys : Array[String] = []
+    let obj_paths : Array[String] = []
+    let miss_indices : Array[Int] = []
+    let pkg_key_sb = StringBuilder()
+    pkg_key_sb.write_string(prep.sigs_hash)
+    let mut ui = 0
+    while ui < n_units {
+      let src_h = @core.cas_sha256_hex(sources[ui])
+      let ukey = @core.cas_compute_unit_key(
+        pkg_name,
+        ui,
+        paths[ui],
+        src_h,
+        prep.sigs_hash,
+        qbe_target,
+        release,
+      )
+      unit_keys.push(ukey)
+      pkg_key_sb.write_string(":")
+      pkg_key_sb.write_string(ukey)
+      let uobj = cache_dir + "/obj/" + ukey + ".o"
+      obj_paths.push(uobj)
+      if !file_exists(uobj) {
+        miss_indices.push(ui)
+      }
+      ui = ui + 1
+    }
+    let pkg_key = @core.cas_sha256_hex(pkg_key_sb.to_string())
+    let default_bin = cache_dir + "/bin/" + pkg_name + "_" + prefix16(pkg_key)
+    let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+    if miss_indices.length() == 0 && out_bin_arg == "" && file_exists(final_bin) {
+      return Ok(final_bin)
+    }
+    let pid_s = m2_host_getpid().to_string()
+    let mut mi = 0
+    while mi < miss_indices.length() {
+      let idx = miss_indices[mi]
+      let ukey = unit_keys[idx]
+      let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+      let u_obj = obj_paths[idx]
+      let u_asm = cache_dir + "/obj/" + ukey + ".s." + pid_s + "_" + idx.to_string()
+      let u_tmp = u_obj + ".tmp." + pid_s + "_" + idx.to_string()
+      let ssa_text = @core.emit_qbe_unit(prep, idx, release)
+      if !write_text_atomic(u_ssa, ssa_text) {
+        return Err("failed to write CAS unit ssa: " + u_ssa)
+      }
+      let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", u_asm, u_ssa])
+      if rc_qbe != 0 {
+        let _ = m2_host_remove(str_to_utf8(u_asm))
+        return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+      }
+      let rc_as = exec_argv(["as", "-o", u_tmp, u_asm])
+      let _ = m2_host_remove(str_to_utf8(u_asm))
+      if rc_as != 0 {
+        let _ = m2_host_remove(str_to_utf8(u_tmp))
+        return Err("as failed with exit code " + rc_as.to_string())
+      }
+      let _ = m2_host_rename(str_to_utf8(u_tmp), str_to_utf8(u_obj))
+      mi = mi + 1
+    }
+    if !prep.has_main && out_bin_arg == "" {
+      return Ok(obj_paths[0])
+    }
+    if out_bin_arg != "" {
+      ensure_parent_dir(out_bin_arg)
+    }
+    let rt_lib = resolve_rt_lib()
+    let cc = {
+      let e = env_str("CC")
+      if e.length() > 0 { e } else { "clang" }
+    }
+    let ld_argv : Array[String] = [cc]
+    let mut oi = 0
+    while oi < obj_paths.length() {
+      ld_argv.push(obj_paths[oi])
+      oi = oi + 1
+    }
+    ld_argv.push(rt_lib)
+    ld_argv.push("-lpthread")
+    ld_argv.push("-o")
+    ld_argv.push(final_bin)
+    let rc_ld = exec_argv(ld_argv)
+    if rc_ld != 0 {
+      return Err("linker failed with exit code " + rc_ld.to_string())
+    }
+    return Ok(final_bin)
+  }
   let key = @core.cas_compute_key(pkg_name, paths, sources, [], qbe_target, release)
   let sig_path = cache_dir + "/sig/" + key + ".m2sig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"

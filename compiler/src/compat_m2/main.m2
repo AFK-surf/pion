@@ -296,7 +296,7 @@ fn drv_parallel_prehash(
   if n <= 1 || jobs <= 1 {
     let mut i = 0
     while i < n {
-      out[i] = cas_sha256_hex(sources[i])
+      out[i] = sha256_hex(sources[i])
       i = i + 1
     }
     return out
@@ -315,7 +315,7 @@ fn drv_parallel_prehash(
         let idx = base + off
         let src = sources[idx]
         spawn(s, fn() -> Unit {
-          let h = cas_sha256_hex(src)
+          let h = sha256_hex(src)
           let _ = ch.send(idx.to_string() + ":" + h)
           let _ = done.fetch_add(1)
         })
@@ -412,7 +412,7 @@ fn drv_build_targets(
   let sources = loaded.sources
 
   // Dogfood m2 native multithreading on multi-file builds (deterministic order)
-  let _ = drv_parallel_prehash(world, sources, jobs)
+  let src_hashes = drv_parallel_prehash(world, sources, jobs)
 
   let cache_dir = drv_resolve_cache_dir(world)
   let _ = fs_mkdir_p(world, cache_dir + "/sig")
@@ -422,6 +422,167 @@ fn drv_build_targets(
 
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
+
+  // Multi-file unit-level parallel compilation + unit-level global CAS
+  if paths.length() > 1 && emit_ssa_path == "" && emit_asm_path == "" {
+    let prep = match cli_prepare_qbe_units(pkg_name, paths, sources) {
+      Err(diag_json) => return Err(diag_json)
+      Ok(p) => p
+    }
+    let n_units = paths.length()
+    let unit_keys : Array[String] = []
+    let obj_paths : Array[String] = []
+    let miss_indices : Array[Int] = []
+    let pkg_key_sb = StringBuilder()
+    pkg_key_sb.write_string(prep.sigs_hash)
+    let mut ui = 0
+    while ui < n_units {
+      let ukey = cas_compute_unit_key(
+        pkg_name,
+        ui,
+        paths[ui],
+        src_hashes[ui],
+        prep.sigs_hash,
+        qbe_target,
+        release,
+      )
+      unit_keys.push(ukey)
+      pkg_key_sb.write_string(":")
+      pkg_key_sb.write_string(ukey)
+      let uobj = cache_dir + "/obj/" + ukey + ".o"
+      obj_paths.push(uobj)
+      if !fs_exists(world, uobj) {
+        miss_indices.push(ui)
+      }
+      ui = ui + 1
+    }
+    let pkg_key = sha256_hex(pkg_key_sb.to_string())
+    let default_bin = cache_dir + "/bin/" + pkg_name + "_" + drv_prefix16(pkg_key)
+    let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+
+    if miss_indices.length() == 0 && out_bin_arg == "" && fs_exists(world, final_bin) {
+      return Ok(final_bin)
+    }
+
+    // Emit QBE SSA only for cache-missed units
+    let mut mi = 0
+    while mi < miss_indices.length() {
+      let idx = miss_indices[mi]
+      let ukey = unit_keys[idx]
+      let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+      let ssa_text = emit_qbe_unit(prep, idx, release)
+      if !drv_write_text_atomic(world, u_ssa, ssa_text) {
+        return Err("failed to write CAS unit ssa: " + u_ssa)
+      }
+      mi = mi + 1
+    }
+
+    // Compile missed units (qbe + as) in parallel across up to `jobs` OS threads
+    let n_miss = miss_indices.length()
+    if n_miss == 1 || jobs <= 1 {
+      let stamp = clock_now_ms(world).to_string()
+      mi = 0
+      while mi < n_miss {
+        let idx = miss_indices[mi]
+        let ukey = unit_keys[idx]
+        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+        let u_obj = obj_paths[idx]
+        let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp + "_" + idx.to_string()
+        let u_tmp = u_obj + ".tmp." + stamp + "_" + idx.to_string()
+        let rc_qbe = proc_exec(world, [qbe_bin, "-t", qbe_target, "-o", u_asm, u_ssa])
+        if rc_qbe != 0 {
+          let _ = fs_remove(world, u_asm)
+          return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+        }
+        let rc_as = proc_exec(world, ["as", "-o", u_tmp, u_asm])
+        let _ = fs_remove(world, u_asm)
+        if rc_as != 0 {
+          let _ = fs_remove(world, u_tmp)
+          return Err("as failed with exit code " + rc_as.to_string())
+        }
+        let _ = fs_rename(world, u_tmp, u_obj)
+        mi = mi + 1
+      }
+    } else if n_miss > 1 {
+      let mut base = 0
+      while base < n_miss {
+        let mut batch = n_miss - base
+        if batch > jobs {
+          batch = jobs
+        }
+        let err_ch : Channel[String] = Channel::new(batch + 1)
+        let stamp_base = clock_now_ms(world).to_string()
+        scope(world, fn(s : Scope) -> Unit {
+          let mut off = 0
+          while off < batch {
+            let idx = miss_indices[base + off]
+            let ukey = unit_keys[idx]
+            let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+            let u_obj = obj_paths[idx]
+            let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp_base + "_" + idx.to_string()
+            let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+            let qb = qbe_bin
+            let qt = qbe_target
+            spawn(s, fn() -> Unit {
+              let rc_qbe = proc_exec([qb, "-t", qt, "-o", u_asm, u_ssa])
+              if rc_qbe != 0 {
+                let _ = fs_remove(u_asm)
+                let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+              } else {
+                let rc_as = proc_exec(["as", "-o", u_tmp, u_asm])
+                let _ = fs_remove(u_asm)
+                if rc_as != 0 {
+                  let _ = fs_remove(u_tmp)
+                  let _ = err_ch.send("as failed with exit code " + rc_as.to_string() + " on " + u_asm)
+                } else {
+                  let _ = fs_rename(u_tmp, u_obj)
+                }
+              }
+            })
+            off = off + 1
+          }
+        })
+        err_ch.close()
+        match err_ch.recv() {
+          Some(err_msg) => return Err(err_msg)
+          None => ()
+        }
+        base = base + batch
+      }
+    }
+
+    if !prep.has_main && out_bin_arg == "" {
+      return Ok(obj_paths[0])
+    }
+
+    if out_bin_arg != "" {
+      drv_ensure_parent_dir(world, out_bin_arg)
+    }
+    let rt_lib = drv_resolve_rt_lib(world)
+    let cc = {
+      let e = drv_env_str(world, "CC")
+      if e.length() > 0 {
+        e
+      } else {
+        "clang"
+      }
+    }
+    let ld_argv : Array[String] = [cc]
+    let mut oi = 0
+    while oi < obj_paths.length() {
+      ld_argv.push(obj_paths[oi])
+      oi = oi + 1
+    }
+    ld_argv.push(rt_lib)
+    ld_argv.push("-lpthread")
+    ld_argv.push("-o")
+    ld_argv.push(final_bin)
+    let rc_ld = proc_exec(world, ld_argv)
+    if rc_ld != 0 {
+      return Err("linker failed with exit code " + rc_ld.to_string())
+    }
+    return Ok(final_bin)
+  }
   let key = cas_compute_key(pkg_name, paths, sources, [], qbe_target, release)
   let sig_path = cache_dir + "/sig/" + key + ".m2sig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
@@ -675,7 +836,7 @@ pub fn main(world : World) -> Int {
     let mut emit_ssa = ""
     let mut emit_asm = ""
     let mut out_bin = ""
-    let mut jobs = 4
+    let mut jobs = 8
     let targets : Array[String] = []
     let mut i = 2
     while i < args.length() {
@@ -689,7 +850,7 @@ pub fn main(world : World) -> Int {
         emit_asm = args[i + 1]
         i = i + 1
       } else if a == "--jobs" && i + 1 < args.length() {
-        jobs = drv_parse_pos_int(args[i + 1], 4)
+        jobs = drv_parse_pos_int(args[i + 1], 8)
         i = i + 1
       } else if a == "-o" && i + 1 < args.length() {
         out_bin = args[i + 1]

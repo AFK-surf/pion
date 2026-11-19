@@ -2295,6 +2295,23 @@ fn check_expr(
             }
             return TString
           }
+          if name == "math_sqrt" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TDouble))
+              if !ty_compat(TDouble, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "argument 1 of `math_sqrt` expects `Double`",
+                  "Double",
+                  ty_to_string(aty),
+                  "pass a `Double` to `math_sqrt`",
+                )
+              }
+            }
+            return TDouble
+          }
           if name == "abort" || name == "panic" {
             let mut i = 0
             while i < args.length() {
