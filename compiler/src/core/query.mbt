@@ -148,6 +148,15 @@ fn collect_stmt_calls(stmts : Array[Stmt], out : Array[String]) -> Unit {
         collect_stmt_calls([step_s], out)
         collect_stmt_calls(body, out)
       }
+      SForRange(_, start_e, end_e, body, _) => {
+        collect_expr_calls(start_e, out)
+        collect_expr_calls(end_e, out)
+        collect_stmt_calls(body, out)
+      }
+      SForIn(_, iter_e, body, _) => {
+        collect_expr_calls(iter_e, out)
+        collect_stmt_calls(body, out)
+      }
       SReturn(opt, _) =>
         match opt {
           Some(e) => collect_expr_calls(e, out)
@@ -171,8 +180,15 @@ fn collect_expr_calls(e : Expr, out : Array[String]) -> Unit {
     EInt(_, _) | EInt64(_, _) | EDouble(_, _) | EBool(_, _) => ()
     EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) => ()
     EIdent(_, _) | EPath(_, _, _) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
       collect_expr_calls(inner, out)
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        collect_expr_calls(parts[i], out)
+        i = i + 1
+      }
+    }
     EBinary(_, l, r, _) => {
       collect_expr_calls(l, out)
       collect_expr_calls(r, out)

@@ -458,7 +458,7 @@ fn qbe_expr_has_assign(e : Expr) -> Bool {
       }
       false
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if qbe_expr_has_assign(elems[i]) {
@@ -478,7 +478,7 @@ fn qbe_expr_has_assign(e : Expr) -> Bool {
       }
       false
     }
-    EBlock(_, _) | EIf(_, _, _, _) | EMatch(_, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) =>
+    EBlock(_, _) | EIf(_, _, _, _) | EMatch(_, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) =>
       true
   }
 }
@@ -549,7 +549,7 @@ fn qbe_expr_assigns_ident(e : Expr, name : String) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_expr_assigns_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_assigns_ident(l, name) || qbe_expr_assigns_ident(r, name)
@@ -579,7 +579,7 @@ fn qbe_expr_assigns_ident(e : Expr, name : String) -> Bool {
       }
       false
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if qbe_expr_assigns_ident(elems[i], name) {
@@ -647,6 +647,13 @@ fn qbe_stmt_assigns_ident(s : Stmt, name : String) -> Bool {
       qbe_expr_assigns_ident(cond, name) ||
       qbe_stmt_assigns_ident(step_s, name) ||
       qbe_stmts_assigns_ident(body, name)
+    SForRange(_, start_e, end_e, body, _) =>
+      qbe_expr_assigns_ident(start_e, name) ||
+      qbe_expr_assigns_ident(end_e, name) ||
+      qbe_stmts_assigns_ident(body, name)
+    SForIn(_, iter_e, body, _) =>
+      qbe_expr_assigns_ident(iter_e, name) ||
+      qbe_stmts_assigns_ident(body, name)
     SReturn(opt, _) =>
       match opt {
         None => false
@@ -684,7 +691,7 @@ fn qbe_expr_mentions_ident(e : Expr, name : String) -> Bool {
     | EPath(_, _, _)
     | EUnit(_) => false
     EIdent(n, _) => n == name
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_expr_mentions_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_mentions_ident(l, name) || qbe_expr_mentions_ident(r, name)
@@ -714,7 +721,7 @@ fn qbe_expr_mentions_ident(e : Expr, name : String) -> Bool {
       }
       false
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if qbe_expr_mentions_ident(elems[i], name) {
@@ -773,6 +780,13 @@ fn qbe_stmt_mentions_ident(s : Stmt, name : String) -> Bool {
       qbe_stmt_mentions_ident(init_s, name) ||
       qbe_expr_mentions_ident(cond, name) ||
       qbe_stmt_mentions_ident(step_s, name) ||
+      qbe_stmts_mentions_ident(body, name)
+    SForRange(_, start_e, end_e, body, _) =>
+      qbe_expr_mentions_ident(start_e, name) ||
+      qbe_expr_mentions_ident(end_e, name) ||
+      qbe_stmts_mentions_ident(body, name)
+    SForIn(_, iter_e, body, _) =>
+      qbe_expr_mentions_ident(iter_e, name) ||
       qbe_stmts_mentions_ident(body, name)
     SReturn(opt, _) =>
       match opt {
@@ -983,7 +997,7 @@ fn qbe_ident_is_borrow_safe_expr(g : QbeGen, e : Expr, name : String) -> Bool {
       }
       true
     }
-    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) =>
+    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) | EInterp(_, _) =>
       !qbe_expr_mentions_ident(e, name)
   }
 }
@@ -1033,6 +1047,13 @@ fn qbe_ident_is_borrow_safe_stmt(g : QbeGen, s : Stmt, name : String) -> Bool {
       qbe_ident_is_borrow_safe_expr(g, cond, name) &&
       qbe_ident_is_borrow_safe_stmt(g, step_s, name) &&
       qbe_ident_is_borrow_safe_stmts(g, body, 0, name)
+    SForRange(vname, start_e, end_e, body, _) =>
+      qbe_ident_is_borrow_safe_expr(g, start_e, name) &&
+      qbe_ident_is_borrow_safe_expr(g, end_e, name) &&
+      (vname == name || qbe_ident_is_borrow_safe_stmts(g, body, 0, name))
+    SForIn(vname, iter_e, body, _) =>
+      qbe_ident_is_borrow_safe_expr(g, iter_e, name) &&
+      (vname == name || qbe_ident_is_borrow_safe_stmts(g, body, 0, name))
     SReturn(opt, _) =>
       match opt {
         None => true
@@ -1139,7 +1160,7 @@ fn qbe_arr_is_stable_expr(
       }
       true
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if !qbe_arr_is_stable_expr(elems[i], aname, allow_elem_assign) {
@@ -1185,7 +1206,7 @@ fn qbe_arr_is_stable_expr(
       }
       true
     }
-    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) =>
+    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) =>
       !qbe_expr_mentions_ident(e, aname)
   }
 }
@@ -1223,6 +1244,13 @@ fn qbe_arr_is_stable_stmt(
       qbe_arr_is_stable_expr(cond, aname, allow_elem_assign) &&
       qbe_arr_is_stable_stmt(step_s, aname, allow_elem_assign) &&
       qbe_arr_is_stable_stmts(body, 0, aname, allow_elem_assign)
+    SForRange(vname, start_e, end_e, body, _) =>
+      qbe_arr_is_stable_expr(start_e, aname, allow_elem_assign) &&
+      qbe_arr_is_stable_expr(end_e, aname, allow_elem_assign) &&
+      (vname == aname || qbe_arr_is_stable_stmts(body, 0, aname, allow_elem_assign))
+    SForIn(vname, iter_e, body, _) =>
+      qbe_arr_is_stable_expr(iter_e, aname, allow_elem_assign) &&
+      (vname == aname || qbe_arr_is_stable_stmts(body, 0, aname, allow_elem_assign))
     SReturn(opt, _) =>
       match opt {
         None => true
@@ -1277,7 +1305,7 @@ fn qbe_collect_indexed_arrs_expr(e : Expr, out : Array[String]) -> Unit {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_collect_indexed_arrs_expr(inner, out)
     EBinary(_, l, r, _) => {
       qbe_collect_indexed_arrs_expr(l, out)
@@ -1309,7 +1337,7 @@ fn qbe_collect_indexed_arrs_expr(e : Expr, out : Array[String]) -> Unit {
         i = i + 1
       }
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         qbe_collect_indexed_arrs_expr(elems[i], out)
@@ -1360,6 +1388,15 @@ fn qbe_collect_indexed_arrs_stmt(s : Stmt, out : Array[String]) -> Unit {
       qbe_collect_indexed_arrs_stmt(init_s, out)
       qbe_collect_indexed_arrs_expr(cond, out)
       qbe_collect_indexed_arrs_stmt(step_s, out)
+      qbe_collect_indexed_arrs_stmts(body, out)
+    }
+    SForRange(_, start_e, end_e, body, _) => {
+      qbe_collect_indexed_arrs_expr(start_e, out)
+      qbe_collect_indexed_arrs_expr(end_e, out)
+      qbe_collect_indexed_arrs_stmts(body, out)
+    }
+    SForIn(_, iter_e, body, _) => {
+      qbe_collect_indexed_arrs_expr(iter_e, out)
       qbe_collect_indexed_arrs_stmts(body, out)
     }
     SReturn(opt, _) =>
@@ -1435,7 +1472,7 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
           }
         _ => false
       }
-    EMethodCall(_, _, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) =>
+    EMethodCall(_, _, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) | EInterp(_, _) =>
       false
     EArrayLit(elems, _) | ETuple(elems, _) => {
       let mut i = 0
@@ -1496,6 +1533,13 @@ fn qbe_loop_has_no_calls_stmt(s : Stmt) -> Bool {
       qbe_loop_has_no_calls_expr(cond) &&
       qbe_loop_has_no_calls_stmt(step_s) &&
       qbe_loop_has_no_calls_stmts(body)
+    SForRange(_, start_e, end_e, body, _) =>
+      qbe_loop_has_no_calls_expr(start_e) &&
+      qbe_loop_has_no_calls_expr(end_e) &&
+      qbe_loop_has_no_calls_stmts(body)
+    SForIn(_, iter_e, body, _) =>
+      qbe_loop_has_no_calls_expr(iter_e) &&
+      qbe_loop_has_no_calls_stmts(body)
     SReturn(opt, _) =>
       match opt {
         None => true
@@ -1533,7 +1577,7 @@ fn qbe_collect_written_fields_expr(e : Expr, out : Map[String, Bool]) -> Unit {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_collect_written_fields_expr(inner, out)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
       qbe_collect_written_fields_expr(l, out)
@@ -1555,7 +1599,7 @@ fn qbe_collect_written_fields_expr(e : Expr, out : Map[String, Bool]) -> Unit {
         i = i + 1
       }
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         qbe_collect_written_fields_expr(elems[i], out)
@@ -1612,6 +1656,15 @@ fn qbe_collect_written_fields_stmt(s : Stmt, out : Map[String, Bool]) -> Unit {
       qbe_collect_written_fields_stmt(step_s, out)
       qbe_collect_written_fields_stmts(body, out)
     }
+    SForRange(_, start_e, end_e, body, _) => {
+      qbe_collect_written_fields_expr(start_e, out)
+      qbe_collect_written_fields_expr(end_e, out)
+      qbe_collect_written_fields_stmts(body, out)
+    }
+    SForIn(_, iter_e, body, _) => {
+      qbe_collect_written_fields_expr(iter_e, out)
+      qbe_collect_written_fields_stmts(body, out)
+    }
     SReturn(opt, _) =>
       match opt {
         Some(e) => qbe_collect_written_fields_expr(e, out)
@@ -1665,7 +1718,7 @@ fn qbe_collect_read_fields_expr(
         }
         _ => qbe_collect_read_fields_expr(obj, out_vars, out_fields, seen)
       }
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
       qbe_collect_read_fields_expr(inner, out_vars, out_fields, seen)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
       qbe_collect_read_fields_expr(l, out_vars, out_fields, seen)
@@ -1687,7 +1740,7 @@ fn qbe_collect_read_fields_expr(
         i = i + 1
       }
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         qbe_collect_read_fields_expr(elems[i], out_vars, out_fields, seen)
@@ -1752,6 +1805,15 @@ fn qbe_collect_read_fields_stmt(
       qbe_collect_read_fields_stmt(step_s, out_vars, out_fields, seen)
       qbe_collect_read_fields_stmts(body, out_vars, out_fields, seen)
     }
+    SForRange(_, start_e, end_e, body, _) => {
+      qbe_collect_read_fields_expr(start_e, out_vars, out_fields, seen)
+      qbe_collect_read_fields_expr(end_e, out_vars, out_fields, seen)
+      qbe_collect_read_fields_stmts(body, out_vars, out_fields, seen)
+    }
+    SForIn(_, iter_e, body, _) => {
+      qbe_collect_read_fields_expr(iter_e, out_vars, out_fields, seen)
+      qbe_collect_read_fields_stmts(body, out_vars, out_fields, seen)
+    }
     SReturn(opt, _) =>
       match opt {
         Some(e) => qbe_collect_read_fields_expr(e, out_vars, out_fields, seen)
@@ -1793,7 +1855,7 @@ fn qbe_expr_rebinds_ident(e : Expr, name : String) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_expr_rebinds_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_rebinds_ident(l, name) || qbe_expr_rebinds_ident(r, name)
@@ -1823,7 +1885,7 @@ fn qbe_expr_rebinds_ident(e : Expr, name : String) -> Bool {
       }
       false
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if qbe_expr_rebinds_ident(elems[i], name) {
@@ -1883,6 +1945,15 @@ fn qbe_stmt_rebinds_ident(s : Stmt, name : String) -> Bool {
       qbe_stmt_rebinds_ident(init_s, name) ||
       qbe_expr_rebinds_ident(cond, name) ||
       qbe_stmt_rebinds_ident(step_s, name) ||
+      qbe_stmts_rebinds_ident(body, name)
+    SForRange(vname, start_e, end_e, body, _) =>
+      vname == name ||
+      qbe_expr_rebinds_ident(start_e, name) ||
+      qbe_expr_rebinds_ident(end_e, name) ||
+      qbe_stmts_rebinds_ident(body, name)
+    SForIn(vname, iter_e, body, _) =>
+      vname == name ||
+      qbe_expr_rebinds_ident(iter_e, name) ||
       qbe_stmts_rebinds_ident(body, name)
     SReturn(opt, _) =>
       match opt {
@@ -1962,7 +2033,7 @@ fn qbe_expr_has_nested_loop(e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_expr_has_nested_loop(inner)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_has_nested_loop(l) || qbe_expr_has_nested_loop(r)
@@ -1992,7 +2063,7 @@ fn qbe_expr_has_nested_loop(e : Expr) -> Bool {
       }
       false
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if qbe_expr_has_nested_loop(elems[i]) {
@@ -2042,7 +2113,7 @@ fn qbe_expr_has_nested_loop(e : Expr) -> Bool {
 ///|
 fn qbe_stmt_has_nested_loop(s : Stmt) -> Bool {
   match s {
-    SWhile(_, _, _) | SFor(_, _, _, _, _) => true
+    SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) => true
     SLet(_, _, _, init, _) => qbe_expr_has_nested_loop(init)
     SAssign(lhs, rhs, _) =>
       qbe_expr_has_nested_loop(lhs) || qbe_expr_has_nested_loop(rhs)
@@ -2119,7 +2190,7 @@ fn qbe_expr_has_cf(
       }
       false
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         if qbe_expr_has_cf(elems[i], check_break, check_cont, check_ret) {
@@ -2163,6 +2234,8 @@ fn qbe_expr_has_cf(
       }
       false
     }
+    ETry(inner, _) =>
+      check_ret || qbe_expr_has_cf(inner, check_break, check_cont, check_ret)
     EClosure(_, _, _, _) => false
   }
 }
@@ -2198,6 +2271,13 @@ fn qbe_stmt_has_cf(
       qbe_stmt_has_cf(init_s, check_break, check_cont, check_ret) ||
       qbe_expr_has_cf(cond, check_break, check_cont, check_ret) ||
       qbe_stmt_has_cf(step_s, false, false, check_ret) ||
+      qbe_stmts_has_cf(body, false, false, check_ret)
+    SForRange(_, start_e, end_e, body, _) =>
+      qbe_expr_has_cf(start_e, check_break, check_cont, check_ret) ||
+      qbe_expr_has_cf(end_e, check_break, check_cont, check_ret) ||
+      qbe_stmts_has_cf(body, false, false, check_ret)
+    SForIn(_, iter_e, body, _) =>
+      qbe_expr_has_cf(iter_e, check_break, check_cont, check_ret) ||
       qbe_stmts_has_cf(body, false, false, check_ret)
     SDebugAssert(c, m, _) =>
       qbe_expr_has_cf(c, check_break, check_cont, check_ret) ||
@@ -2328,7 +2408,7 @@ fn qbe_collect_bce_guards_expr(
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_collect_bce_guards_expr(g, body, iv, inner, out, seen)
     EBinary(_, l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
       qbe_collect_bce_guards_expr(g, body, iv, l, out, seen)
@@ -2357,7 +2437,7 @@ fn qbe_collect_bce_guards_expr(
         i = i + 1
       }
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
         qbe_collect_bce_guards_expr(g, body, iv, elems[i], out, seen)
@@ -2418,7 +2498,7 @@ fn qbe_collect_bce_guards_stmt(
       qbe_collect_bce_guards_expr(g, body, iv, m, out, seen)
     }
     SExpr(e, _) => qbe_collect_bce_guards_expr(g, body, iv, e, out, seen)
-    SWhile(_, _, _) | SFor(_, _, _, _, _) | SBreak(_) | SContinue(_) => ()
+    SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) | SBreak(_) | SContinue(_) => ()
   }
 }
 
@@ -2451,7 +2531,7 @@ fn qbe_expr_count_assigns_ident(e : Expr, name : String) -> Int {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => 0
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
       qbe_expr_count_assigns_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_count_assigns_ident(l, name) + qbe_expr_count_assigns_ident(r, name)
@@ -2473,7 +2553,7 @@ fn qbe_expr_count_assigns_ident(e : Expr, name : String) -> Int {
       }
       n
     }
-    EArrayLit(elems, _) | ETuple(elems, _) => {
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut n = 0
       let mut i = 0
       while i < elems.length() {
@@ -2534,6 +2614,13 @@ fn qbe_stmt_count_assigns_ident(s : Stmt, name : String) -> Int {
       qbe_stmt_count_assigns_ident(init_s, name) +
       qbe_expr_count_assigns_ident(cond, name) +
       qbe_stmt_count_assigns_ident(step_s, name) +
+      qbe_stmts_count_assigns_ident(body, name)
+    SForRange(_, start_e, end_e, body, _) =>
+      qbe_expr_count_assigns_ident(start_e, name) +
+      qbe_expr_count_assigns_ident(end_e, name) +
+      qbe_stmts_count_assigns_ident(body, name)
+    SForIn(_, iter_e, body, _) =>
+      qbe_expr_count_assigns_ident(iter_e, name) +
       qbe_stmts_count_assigns_ident(body, name)
     SReturn(opt, _) =>
       match opt {
@@ -2803,7 +2890,7 @@ fn qbe_collect_field_access_expr(
       }
       true
     }
-    EClosure(_, _, _, _) => false
+    EClosure(_, _, _, _) | ETry(_, _) | EInterp(_, _) => false
   }
 }
 
@@ -2849,7 +2936,7 @@ fn qbe_collect_field_access_stmt(
       qbe_collect_field_access_expr(m, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all)
     SExpr(e, _) =>
       qbe_collect_field_access_expr(e, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all)
-    SWhile(_, _, _) | SFor(_, _, _, _, _) | SBreak(_) | SContinue(_) => true
+    SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) | SBreak(_) | SContinue(_) => true
   }
 }
 
@@ -2995,7 +3082,7 @@ fn qbe_expr_inline_cost(e : Expr, self_name : String) -> Int {
       }
       if ce < 0 { -1 } else { cc + ct + ce + 2 }
     }
-    EMatch(_, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) =>
+    EMatch(_, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) | EInterp(_, _) =>
       -1
   }
 }
@@ -3031,7 +3118,7 @@ fn qbe_stmts_inline_cost(stmts : Array[Stmt], self_name : String) -> Int {
         }
         tot = tot + c
       }
-      SWhile(_, _, _) | SFor(_, _, _, _, _) | SReturn(_, _) | SBreak(_) | SContinue(_) | SDebugAssert(_, _, _) =>
+      SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) | SReturn(_, _) | SBreak(_) | SContinue(_) | SDebugAssert(_, _, _) =>
         return -1
     }
     if tot > 40 {
@@ -4510,6 +4597,11 @@ fn qbe_emit_method_call(
       }
     }
     TDouble => {
+      if method_name == "to_string" {
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_double_to_str(d " + obj_val + ")")
+        return qval(r, TString)
+      }
       if method_name == "to_int" {
         let w = qbe_tmp(g)
         qbe_emit(g, w + " =w dtosi " + obj_val)
@@ -4859,6 +4951,43 @@ fn qbe_emit_method_call(
           qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
         }
         return qval(r, TArray(elem))
+      }
+      if method_name == "clear" {
+        qbe_emit(g, "call $m2_arr_clear(l " + obj_val + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval("0", TUnit)
+      }
+      if method_name == "reverse" {
+        qbe_emit(g, "call $m2_arr_reverse(l " + obj_val + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval("0", TUnit)
+      }
+      if method_name == "join" {
+        let sa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let sv = sa.qv
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_arr_join(l " + obj_val + ", l " + sv.reg + ")")
+        if !sa.borrowed {
+          qbe_rc_dec(g, sv.reg, sv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TString)
+      }
+      if method_name == "sort" {
+        match elem {
+          TString => qbe_emit(g, "call $m2_arr_sort_str(l " + obj_val + ")")
+          _ => qbe_emit(g, "call $m2_arr_sort_int(l " + obj_val + ")")
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval("0", TUnit)
       }
     }
     TMap(kty, vty) => {
@@ -5983,6 +6112,116 @@ fn qbe_emit_expr(
       qval("0", TError)
     }
     EMove(inner, _) => qbe_emit_expr(g, inner, expected)
+    ETry(inner, _) => {
+      let iv = qbe_emit_expr(g, inner, None)
+      match iv.ty {
+        TResult(ok_ty, _) => {
+          let tag = qbe_tmp(g)
+          let is_ok = qbe_tmp(g)
+          let l_ok = qbe_lbl(g, "try_ok")
+          let l_err = qbe_lbl(g, "try_err")
+          qbe_emit(g, tag + " =l loadl " + iv.reg)
+          qbe_emit(g, is_ok + " =w ceql " + tag + ", 0")
+          qbe_emit_term(g, "jnz " + is_ok + ", " + l_ok + ", " + l_err)
+          qbe_emit_lbl(g, l_err)
+          qbe_release_scopes_down_to(g, 0)
+          qbe_emit_term(g, "ret " + iv.reg)
+          qbe_emit_lbl(g, l_ok)
+          let p1 = qbe_tmp(g)
+          qbe_emit(g, p1 + " =l add " + iv.reg + ", 8")
+          let payload = qbe_load_heap_slot(g, p1, ok_ty)
+          qbe_rc_inc(g, payload, ok_ty)
+          qbe_emit(g, "call $m2_rc_dec(l " + iv.reg + ")")
+          qval(payload, ok_ty)
+        }
+        TOption(inner_ty) => {
+          let tag = qbe_tmp(g)
+          let is_some = qbe_tmp(g)
+          let l_some = qbe_lbl(g, "try_some")
+          let l_none = qbe_lbl(g, "try_none")
+          qbe_emit(g, tag + " =l loadl " + iv.reg)
+          qbe_emit(g, is_some + " =w ceql " + tag + ", 1")
+          qbe_emit_term(g, "jnz " + is_some + ", " + l_some + ", " + l_none)
+          qbe_emit_lbl(g, l_none)
+          qbe_emit(g, "call $m2_rc_dec(l " + iv.reg + ")")
+          qbe_release_scopes_down_to(g, 0)
+          let none_obj = qbe_emit_none(g)
+          qbe_emit_term(g, "ret " + none_obj)
+          qbe_emit_lbl(g, l_some)
+          let p1 = qbe_tmp(g)
+          qbe_emit(g, p1 + " =l add " + iv.reg + ", 8")
+          let payload = qbe_load_heap_slot(g, p1, inner_ty)
+          qbe_rc_inc(g, payload, inner_ty)
+          qbe_emit(g, "call $m2_rc_dec(l " + iv.reg + ")")
+          qval(payload, inner_ty)
+        }
+        _ => iv
+      }
+    }
+    EInterp(parts, _) => {
+      if parts.length() == 0 {
+        return qval(qbe_emit_string_lit(g, ""), TString)
+      }
+      let sb = qbe_tmp(g)
+      qbe_emit(g, sb + " =l call $m2_strbuf_new(l 32)")
+      let mut i = 0
+      while i < parts.length() {
+        let part = parts[i]
+        match part {
+          EString(s, _) => {
+            let lit = qbe_emit_string_lit(g, s)
+            qbe_emit(g, "call $m2_strbuf_push_str(l " + sb + ", l " + lit + ")")
+          }
+          _ => {
+            let pv = qbe_emit_expr(g, part, None)
+            match pv.ty {
+              TString => {
+                qbe_emit(g, "call $m2_strbuf_push_str(l " + sb + ", l " + pv.reg + ")")
+                qbe_rc_dec(g, pv.reg, TString)
+              }
+              TInt => {
+                let v64 = qbe_as_l(g, pv)
+                qbe_emit(g, "call $m2_strbuf_push_int(l " + sb + ", l " + v64 + ")")
+              }
+              TInt64 =>
+                qbe_emit(g, "call $m2_strbuf_push_int(l " + sb + ", l " + pv.reg + ")")
+              TDouble => {
+                let ds = qbe_tmp(g)
+                qbe_emit(g, ds + " =l call $m2_double_to_str(d " + pv.reg + ")")
+                qbe_emit(g, "call $m2_strbuf_push_str(l " + sb + ", l " + ds + ")")
+                qbe_emit(g, "call $m2_rc_dec(l " + ds + ")")
+              }
+              TBool => {
+                let l_t = qbe_lbl(g, "ib_t")
+                let l_f = qbe_lbl(g, "ib_f")
+                let l_e = qbe_lbl(g, "ib_e")
+                qbe_emit_term(g, "jnz " + pv.reg + ", " + l_t + ", " + l_f)
+                qbe_emit_lbl(g, l_t)
+                let st = qbe_emit_string_lit(g, "true")
+                qbe_emit(g, "call $m2_strbuf_push_str(l " + sb + ", l " + st + ")")
+                qbe_emit_term(g, "jmp " + l_e)
+                qbe_emit_lbl(g, l_f)
+                let sf = qbe_emit_string_lit(g, "false")
+                qbe_emit(g, "call $m2_strbuf_push_str(l " + sb + ", l " + sf + ")")
+                qbe_emit_term(g, "jmp " + l_e)
+                qbe_emit_lbl(g, l_e)
+              }
+              TChar => {
+                let cw = qbe_tmp(g)
+                qbe_emit(g, cw + " =w copy " + pv.reg)
+                qbe_emit(g, "call $m2_strbuf_push_char(l " + sb + ", w " + cw + ")")
+              }
+              _ => ()
+            }
+          }
+        }
+        i = i + 1
+      }
+      let res = qbe_tmp(g)
+      qbe_emit(g, res + " =l call $m2_strbuf_to_str(l " + sb + ")")
+      qbe_emit(g, "call $m2_rc_dec(l " + sb + ")")
+      qval(res, TString)
+    }
     EAs(inner, target, _) => {
       let v = qbe_emit_expr(g, inner, None)
       let rty = resolve_type_expr(g.tc, target, g.cur_tparams)
@@ -9324,6 +9563,163 @@ fn qbe_emit_stmt(
       let _ = qbe_emit_stmt(g, step_s, None, false)
       qbe_emit_term(g, "jmp " + l_cond)
       qbe_emit_lbl(g, l_end)
+      qbe_scope_pop(g)
+      qval("0", TUnit)
+    }
+    SForRange(var_name, start_e, end_e, body, sp) => {
+      qbe_scope_push(g)
+      let sv = qbe_emit_expr(g, start_e, Some(TInt))
+      let ev = qbe_emit_expr(g, end_e, Some(sv.ty))
+      let idx_ty = sv.ty
+      let end_name = "__m2_fe_" + g.next_tmp.to_string()
+      g.next_tmp = g.next_tmp + 1
+      let end_loc = qbe_define_local(g, end_name, idx_ty, false)
+      qbe_store_local_slot(g, ev.reg, end_loc.slot, idx_ty)
+      let idx_name = if var_name == "_" {
+        let nm = "__m2_fi_" + g.next_tmp.to_string()
+        g.next_tmp = g.next_tmp + 1
+        nm
+      } else {
+        var_name
+      }
+      let idx_loc = qbe_define_local(g, idx_name, idx_ty, false)
+      qbe_store_local_slot(g, sv.reg, idx_loc.slot, idx_ty)
+      match start_e {
+        EInt(raw, _) =>
+          if qbe_parse_int64_lit(raw) >= 0L {
+            g.nonneg_vars.set(idx_name, true)
+          }
+        _ => ()
+      }
+      let one_expr = match idx_ty {
+        TInt64 => EInt64("1L", sp)
+        _ => EInt("1", sp)
+      }
+      let cond_e = EBinary("<", EIdent(idx_name, sp), EIdent(end_name, sp), sp)
+      let step_s = SAssign(
+        EIdent(idx_name, sp),
+        EBinary("+", EIdent(idx_name, sp), one_expr, sp),
+        sp,
+      )
+      if qbe_stmts_has_cf(body, false, true, false) {
+        let l_cond = qbe_lbl(g, "forr_c")
+        let l_body = qbe_lbl(g, "forr_b")
+        let l_step = qbe_lbl(g, "forr_s")
+        let l_end = qbe_lbl(g, "forr_e")
+        qbe_emit_term(g, "jmp " + l_cond)
+        qbe_emit_lbl(g, l_cond)
+        qbe_emit_cond_branch(g, cond_e, l_body, l_end)
+        qbe_emit_lbl(g, l_body)
+        let loop_depth = g.scopes.length()
+        g.loop_breaks.push(l_end)
+        g.loop_conts.push(l_step)
+        g.loop_depths.push(loop_depth)
+        qbe_scope_push(g)
+        let bv = qbe_emit_stmts(g, body, None)
+        if !g.block_term {
+          qbe_rc_dec(g, bv.reg, bv.ty)
+        }
+        qbe_scope_pop(g)
+        let _ = g.loop_breaks.pop()
+        let _ = g.loop_conts.pop()
+        let _ = g.loop_depths.pop()
+        qbe_emit_term(g, "jmp " + l_step)
+        qbe_emit_lbl(g, l_step)
+        let _ = qbe_emit_stmt(g, step_s, None, false)
+        qbe_emit_term(g, "jmp " + l_cond)
+        qbe_emit_lbl(g, l_end)
+      } else {
+        let wbody : Array[Stmt] = []
+        let mut bi = 0
+        while bi < body.length() {
+          wbody.push(body[bi])
+          bi = bi + 1
+        }
+        wbody.push(step_s)
+        let _ = qbe_emit_stmt(g, SWhile(cond_e, wbody, sp), None, false)
+      }
+      qbe_scope_pop(g)
+      qval("0", TUnit)
+    }
+    SForIn(var_name, iter_e, body, sp) => {
+      qbe_scope_push(g)
+      let av = qbe_emit_expr(g, iter_e, None)
+      let arr_name = "__m2_fa_" + g.next_tmp.to_string()
+      g.next_tmp = g.next_tmp + 1
+      let arr_loc = qbe_define_local(g, arr_name, av.ty, qbe_is_obj_ty(av.ty))
+      qbe_store_local_slot(g, av.reg, arr_loc.slot, av.ty)
+      let len_name = "__m2_fl_" + g.next_tmp.to_string()
+      g.next_tmp = g.next_tmp + 1
+      let len_r64 = qbe_tmp(g)
+      let len_rw = qbe_tmp(g)
+      qbe_emit(g, len_r64 + " =l loadl " + av.reg)
+      qbe_emit(g, len_rw + " =w copy " + len_r64)
+      let len_loc = qbe_define_local(g, len_name, TInt, false)
+      qbe_store_local_slot(g, len_rw, len_loc.slot, TInt)
+      let idx_name = "__m2_fi_" + g.next_tmp.to_string()
+      g.next_tmp = g.next_tmp + 1
+      let idx_loc = qbe_define_local(g, idx_name, TInt, false)
+      qbe_store_local_slot(g, "0", idx_loc.slot, TInt)
+      g.nonneg_vars.set(idx_name, true)
+      g.len_aliases.set(len_name, arr_name)
+      g.len_alias_keys.push(len_name)
+      let cond_e = EBinary("<", EIdent(idx_name, sp), EIdent(len_name, sp), sp)
+      let step_s = SAssign(
+        EIdent(idx_name, sp),
+        EBinary("+", EIdent(idx_name, sp), EInt("1", sp), sp),
+        sp,
+      )
+      let elem_bind = SLet(
+        var_name,
+        false,
+        TyMissing(sp),
+        EIndex(EIdent(arr_name, sp), EIdent(idx_name, sp), sp),
+        sp,
+      )
+      if qbe_stmts_has_cf(body, false, true, false) {
+        let l_cond = qbe_lbl(g, "fori_c")
+        let l_body = qbe_lbl(g, "fori_b")
+        let l_step = qbe_lbl(g, "fori_s")
+        let l_end = qbe_lbl(g, "fori_e")
+        qbe_emit_term(g, "jmp " + l_cond)
+        qbe_emit_lbl(g, l_cond)
+        qbe_emit_cond_branch(g, cond_e, l_body, l_end)
+        qbe_emit_lbl(g, l_body)
+        let loop_depth = g.scopes.length()
+        g.loop_breaks.push(l_end)
+        g.loop_conts.push(l_step)
+        g.loop_depths.push(loop_depth)
+        qbe_scope_push(g)
+        let fbody : Array[Stmt] = [elem_bind]
+        let mut bi = 0
+        while bi < body.length() {
+          fbody.push(body[bi])
+          bi = bi + 1
+        }
+        let bv = qbe_emit_stmts(g, fbody, None)
+        if !g.block_term {
+          qbe_rc_dec(g, bv.reg, bv.ty)
+        }
+        qbe_scope_pop(g)
+        let _ = g.loop_breaks.pop()
+        let _ = g.loop_conts.pop()
+        let _ = g.loop_depths.pop()
+        qbe_emit_term(g, "jmp " + l_step)
+        qbe_emit_lbl(g, l_step)
+        let _ = qbe_emit_stmt(g, step_s, None, false)
+        qbe_emit_term(g, "jmp " + l_cond)
+        qbe_emit_lbl(g, l_end)
+      } else {
+        let wbody : Array[Stmt] = [elem_bind]
+        let mut bi = 0
+        while bi < body.length() {
+          wbody.push(body[bi])
+          bi = bi + 1
+        }
+        wbody.push(step_s)
+        let _ = qbe_emit_stmt(g, SWhile(cond_e, wbody, sp), None, false)
+      }
+      g.len_aliases.remove(len_name)
       qbe_scope_pop(g)
       qval("0", TUnit)
     }

@@ -4,6 +4,9 @@ pub enum TokenKind {
   Int64Lit(String)
   DoubleLit(String)
   StringLit(String)
+  InterpStart(String)
+  InterpMid(String)
+  InterpEnd(String)
   CharLit(String)
   ByteLit(String)
   BoolLit(Bool)
@@ -42,6 +45,8 @@ pub enum TokenKind {
   Colon
   ColonColon
   Dot
+  DotDot
+  Question
   Arrow
   FatArrow
   Plus
@@ -179,6 +184,7 @@ pub fn lex(file : String, source : String) -> LexResult {
   let mut line = 1
   let mut col = 1
   let mut saw_newline = true
+  let interp_depths : Array[Int] = []
 
   while pos < len {
     let ch = str_code_at(source, pos)
@@ -320,12 +326,13 @@ pub fn lex(file : String, source : String) -> LexResult {
       continue
     }
 
-    // String literal: "..."
+    // String literal: "..." or interpolated "...\{expr}..."
     if ch == 34 {
       pos = pos + 1
       col = col + 1
       let sb = StringBuilder()
       let mut closed = false
+      let mut hit_interp = false
       while pos < len {
         let c = str_code_at(source, pos)
         if c == 10 {
@@ -339,6 +346,12 @@ pub fn lex(file : String, source : String) -> LexResult {
         }
         if c == 92 && pos + 1 < len {
           let next_c = str_code_at(source, pos + 1)
+          if next_c == 123 {
+            pos = pos + 2
+            col = col + 2
+            hit_interp = true
+            break
+          }
           if next_c == 110 {
             sb.write_char('\n')
           } else if next_c == 114 {
@@ -365,7 +378,15 @@ pub fn lex(file : String, source : String) -> LexResult {
       }
       let sp = span_new(file, start_line, start_col)
       let raw = slice_str(source, start_pos, pos)
-      if closed {
+      if hit_interp {
+        interp_depths.push(0)
+        tokens.push(Token::{
+          kind: InterpStart(sb.to_string()),
+          span: sp,
+          raw: raw,
+          newline_before: nl,
+        })
+      } else if closed {
         tokens.push(Token::{
           kind: StringLit(sb.to_string()),
           span: sp,
@@ -385,6 +406,92 @@ pub fn lex(file : String, source : String) -> LexResult {
         )
       }
       continue
+    }
+
+    // Closing `}` of a string interpolation segment resumes scanning the string
+    if ch == 125 && interp_depths.length() > 0 {
+      let top_idx = interp_depths.length() - 1
+      if interp_depths[top_idx] == 0 {
+        pos = pos + 1
+        col = col + 1
+        let sb = StringBuilder()
+        let mut closed = false
+        let mut hit_interp = false
+        while pos < len {
+          let c = str_code_at(source, pos)
+          if c == 10 {
+            break
+          }
+          if c == 34 {
+            pos = pos + 1
+            col = col + 1
+            closed = true
+            break
+          }
+          if c == 92 && pos + 1 < len {
+            let next_c = str_code_at(source, pos + 1)
+            if next_c == 123 {
+              pos = pos + 2
+              col = col + 2
+              hit_interp = true
+              break
+            }
+            if next_c == 110 {
+              sb.write_char('\n')
+            } else if next_c == 114 {
+              sb.write_char('\r')
+            } else if next_c == 116 {
+              sb.write_char('\t')
+            } else if next_c == 92 {
+              sb.write_char('\\')
+            } else if next_c == 34 {
+              sb.write_char('"')
+            } else if next_c == 48 {
+              let nul = 0
+              sb.write_char(nul.unsafe_to_char())
+            } else {
+              sb.write_char(next_c.unsafe_to_char())
+            }
+            pos = pos + 2
+            col = col + 2
+          } else {
+            sb.write_char(c.unsafe_to_char())
+            pos = pos + 1
+            col = col + 1
+          }
+        }
+        let sp = span_new(file, start_line, start_col)
+        let raw = slice_str(source, start_pos, pos)
+        if hit_interp {
+          tokens.push(Token::{
+            kind: InterpMid(sb.to_string()),
+            span: sp,
+            raw: raw,
+            newline_before: nl,
+          })
+        } else if closed {
+          let _ = interp_depths.pop()
+          tokens.push(Token::{
+            kind: InterpEnd(sb.to_string()),
+            span: sp,
+            raw: raw,
+            newline_before: nl,
+          })
+        } else {
+          let _ = interp_depths.pop()
+          diags.push(
+            diag_new(
+              sp,
+              "E_PARSE",
+              "unterminated interpolated string literal",
+              "closing `\"`",
+              "end of line",
+              "close the string literal with `\"`",
+            ),
+          )
+        }
+        continue
+      }
     }
 
     // Identifiers and keywords
@@ -473,6 +580,12 @@ pub fn lex(file : String, source : String) -> LexResult {
     let sp = span_new(file, start_line, start_col)
     if pos + 1 < len {
       let c2 = str_code_at(source, pos + 1)
+      if ch == 46 && c2 == 46 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: DotDot, span: sp, raw: "..", newline_before: nl })
+        continue
+      }
       if ch == 58 && c2 == 58 {
         pos = pos + 2
         col = col + 2
@@ -550,8 +663,18 @@ pub fn lex(file : String, source : String) -> LexResult {
     } else if ch == 41 {
       RParen
     } else if ch == 123 {
+      if interp_depths.length() > 0 {
+        let top_idx = interp_depths.length() - 1
+        interp_depths[top_idx] = interp_depths[top_idx] + 1
+      }
       LBrace
     } else if ch == 125 {
+      if interp_depths.length() > 0 {
+        let top_idx = interp_depths.length() - 1
+        if interp_depths[top_idx] > 0 {
+          interp_depths[top_idx] = interp_depths[top_idx] - 1
+        }
+      }
       RBrace
     } else if ch == 91 {
       LBracket
@@ -565,6 +688,8 @@ pub fn lex(file : String, source : String) -> LexResult {
       Colon
     } else if ch == 46 {
       Dot
+    } else if ch == 63 {
+      Question
     } else if ch == 43 {
       Plus
     } else if ch == 45 {

@@ -829,3 +829,81 @@ test "p6c_perceus_lite_early_drop_before_subsequent_alloc" {
   assert_eq(between.contains("call $m2_rc_dec("), true)
   assert_eq(between.contains("storel 0, "), true)
 }
+
+///|
+test "p7a_ergonomics_qbe_codegen_and_bce" {
+  let src =
+    "fn get_s(ok : Bool) -> Result[String, String] {\n" +
+    "  if ok { Ok(\" hello \") } else { Err(\"bad\") }\n" +
+    "}\n" +
+    "fn try_res(ok : Bool) -> Result[Int, String] {\n" +
+    "  let t = get_s(ok)?.trim()\n" +
+    "  Ok(t.length())\n" +
+    "}\n" +
+    "fn try_opt(o : Option[Int]) -> Option[Int] {\n" +
+    "  let v = o?\n" +
+    "  Some(v * 2)\n" +
+    "}\n" +
+    "fn sum_arr(a : Array[Int]) -> Int {\n" +
+    "  let mut acc = 0\n" +
+    "  for x in a {\n" +
+    "    acc = acc + x\n" +
+    "  }\n" +
+    "  acc\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let mut s = 0\n" +
+    "  for i in 0..10 {\n" +
+    "    if i == 2 { continue }\n" +
+    "    s = s + i\n" +
+    "  }\n" +
+    "  let a : Array[Int] = [3, 1, 2]\n" +
+    "  a.sort()\n" +
+    "  a.reverse()\n" +
+    "  let total = sum_arr(a)\n" +
+    "  a.clear()\n" +
+    "  let ws : Array[String] = [\"b\", \"a\"]\n" +
+    "  ws.sort()\n" +
+    "  let j = ws.join(\"-\")\n" +
+    "  let d = 2.5\n" +
+    "  let msg = \"j=\\{j}, t=\\{total}, d=\\{d}, ds=\\{d.to_string()}\"\n" +
+    "  let m : Map[String, Int] = Map::new()\n" +
+    "  m.set(\"x\", 1)\n" +
+    "  let _h = m.contains(\"x\")\n" +
+    "  let _ks = m.keys()\n" +
+    "  m.remove(\"x\")\n" +
+    "  let _r = try_res(true)\n" +
+    "  let _o = try_opt(Some(3))\n" +
+    "  s + msg.length()\n" +
+    "}\n"
+  let cr = @core.check_source_files_with_imports("p7a_cg", ["cg.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  assert_eq(ssa.contains("@try_ok"), true)
+  assert_eq(ssa.contains("@try_err"), true)
+  assert_eq(ssa.contains("@try_some"), true)
+  assert_eq(ssa.contains("@try_none"), true)
+  assert_eq(ssa.contains("call $m2_double_to_str("), true)
+  assert_eq(ssa.contains("call $m2_arr_sort_int("), true)
+  assert_eq(ssa.contains("call $m2_arr_sort_str("), true)
+  assert_eq(ssa.contains("call $m2_arr_reverse("), true)
+  assert_eq(ssa.contains("call $m2_arr_clear("), true)
+  assert_eq(ssa.contains("call $m2_arr_join("), true)
+  assert_eq(ssa.contains("call $m2_map_has("), true)
+  assert_eq(ssa.contains("call $m2_map_keys("), true)
+  assert_eq(ssa.contains("call $m2_map_remove("), true)
+  assert_eq(ssa.contains("@forr_s"), true)
+  // Verify sum_arr (`for x in a` without continue) triggers BCE (zero m2_panic_oob in sum_arr)
+  let sa_start = match ssa.find("fn_sum_arr(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(sa_start >= 0, true)
+  let sa_rest = ssa.clamped_view(start=sa_start).to_owned()
+  let sa_end = match sa_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => sa_rest.length()
+  }
+  let sa_body = sa_rest.clamped_view(end=sa_end).to_owned()
+  assert_eq(sa_body.contains("m2_panic_oob"), false)
+}

@@ -717,13 +717,40 @@ fn p_parse_stmt(p : Parser) -> Stmt {
     }
     KwFor => {
       let _ = p_advance(p)
-      let init_stmt = p_parse_for_clause_stmt(p)
-      p_skip_semis(p)
-      let cond = p_parse_expr(p)
-      p_skip_semis(p)
-      let step_stmt = p_parse_for_clause_stmt(p)
-      let body = p_parse_block_stmts(p)
-      SFor(init_stmt, cond, step_stmt, body, tok.span)
+      let is_for_in = match p_peek(p).kind {
+        Ident(_) =>
+          match p_peek_at(p, 1).kind {
+            KwIn => true
+            _ => false
+          }
+        _ => false
+      }
+      if is_for_in {
+        let var_name = p_expect_ident(p, "loop variable")
+        let _ = p_advance(p) // consume 'in'
+        let first_expr = p_parse_expr(p)
+        let is_range = match p_peek(p).kind {
+          DotDot => true
+          _ => false
+        }
+        if is_range {
+          let _ = p_advance(p) // consume '..'
+          let end_expr = p_parse_expr(p)
+          let body = p_parse_block_stmts(p)
+          SForRange(var_name, first_expr, end_expr, body, tok.span)
+        } else {
+          let body = p_parse_block_stmts(p)
+          SForIn(var_name, first_expr, body, tok.span)
+        }
+      } else {
+        let init_stmt = p_parse_for_clause_stmt(p)
+        p_skip_semis(p)
+        let cond = p_parse_expr(p)
+        p_skip_semis(p)
+        let step_stmt = p_parse_for_clause_stmt(p)
+        let body = p_parse_block_stmts(p)
+        SFor(init_stmt, cond, step_stmt, body, tok.span)
+      }
     }
     KwReturn => {
       let _ = p_advance(p)
@@ -944,6 +971,13 @@ fn p_parse_postfix_expr(p : Parser) -> Expr {
           )
         }
         expr = EIndex(expr, idx, tok.span)
+      }
+      Question => {
+        if tok.newline_before {
+          break
+        }
+        let _ = p_advance(p)
+        expr = ETry(expr, tok.span)
       }
       _ => break
     }
@@ -1253,6 +1287,44 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
     StringLit(s) => {
       let _ = p_advance(p)
       EString(s, tok.span)
+    }
+    InterpStart(prefix) => {
+      let _ = p_advance(p)
+      let parts : Array[Expr] = []
+      if prefix.length() > 0 {
+        parts.push(EString(prefix, tok.span))
+      }
+      while !p_is_eof(p) {
+        parts.push(p_parse_expr(p))
+        let nt = p_peek(p)
+        match nt.kind {
+          InterpMid(mid) => {
+            let _ = p_advance(p)
+            if mid.length() > 0 {
+              parts.push(EString(mid, nt.span))
+            }
+          }
+          InterpEnd(suffix) => {
+            let _ = p_advance(p)
+            if suffix.length() > 0 {
+              parts.push(EString(suffix, nt.span))
+            }
+            break
+          }
+          _ => {
+            p_err(
+              p,
+              nt.span,
+              "expected `}` to close string interpolation",
+              "`}`",
+              nt.raw,
+              "close the interpolation expression with `}`",
+            )
+            break
+          }
+        }
+      }
+      EInterp(parts, tok.span)
     }
     KwIf => p_parse_if_expr(p)
     KwMatch => p_parse_match_expr(p)

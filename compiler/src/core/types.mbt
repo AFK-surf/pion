@@ -1254,6 +1254,19 @@ fn collect_stmts_captures(
         collect_stmts_captures([step_s], locals, out)
         collect_stmts_captures(body, locals, out)
       }
+      SForRange(vname, start_e, end_e, body, _) => {
+        collect_expr_captures(start_e, locals, out)
+        collect_expr_captures(end_e, locals, out)
+        let inner_locals = locals.copy()
+        inner_locals.set(vname, true)
+        collect_stmts_captures(body, inner_locals, out)
+      }
+      SForIn(vname, iter_e, body, _) => {
+        collect_expr_captures(iter_e, locals, out)
+        let inner_locals = locals.copy()
+        inner_locals.set(vname, true)
+        collect_stmts_captures(body, inner_locals, out)
+      }
       SReturn(opt, _) =>
         match opt {
           Some(e) => collect_expr_captures(e, locals, out)
@@ -1365,7 +1378,14 @@ fn collect_expr_captures(
       collect_expr_captures(s, locals, out)
       collect_expr_captures(f, locals, out)
     }
-    EAs(inner, _, _) => collect_expr_captures(inner, locals, out)
+    EAs(inner, _, _) | ETry(inner, _) => collect_expr_captures(inner, locals, out)
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        collect_expr_captures(parts[i], locals, out)
+        i = i + 1
+      }
+    }
   }
 }
 
@@ -1766,6 +1786,70 @@ fn check_stmt(
         )
       }
       let _ = check_stmt(tc, env, step_s, None)
+      let _ = check_stmts(tc, env, body, None)
+      env_pop(env)
+      TUnit
+    }
+    SForRange(vname, start_e, end_e, body, sp) => {
+      let sty = check_expr(tc, env, start_e, Some(TInt))
+      let expected_end = match sty {
+        TInt64 => TInt64
+        _ => TInt
+      }
+      let ety = check_expr(tc, env, end_e, Some(expected_end))
+      let valid_start = match sty {
+        TInt | TInt64 | TError => true
+        _ => false
+      }
+      if !valid_start {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "`for ... in start..end` range start must be `Int` or `Int64`",
+          "Int or Int64",
+          ty_to_string(sty),
+          "use an `Int` or `Int64` range bound",
+        )
+      }
+      if valid_start && !ty_compat(sty, ety) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "`for ... in start..end` range bounds must have the same type",
+          ty_to_string(sty),
+          ty_to_string(ety),
+          "make both range bounds `" + ty_to_string(sty) + "`",
+        )
+      }
+      let loop_var_ty = if valid_start { sty } else { TInt }
+      env_push(env)
+      env_define(env, vname, loop_var_ty, false)
+      let _ = check_stmts(tc, env, body, None)
+      env_pop(env)
+      TUnit
+    }
+    SForIn(vname, iter_e, body, sp) => {
+      let ity = check_expr(tc, env, iter_e, None)
+      let elem_ty = match ity {
+        TArray(et) => et
+        TError => TError
+        _ => {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "`for ... in` requires an `Array[T]`",
+            "Array[T]",
+            ty_to_string(ity),
+            "iterate over an `Array` or use `start..end` range",
+          )
+          TError
+        }
+      }
+      env_push(env)
+      env_define(env, vname, elem_ty, false)
       let _ = check_stmts(tc, env, body, None)
       env_pop(env)
       TUnit
@@ -2316,6 +2400,55 @@ fn check_method_call(
           let _ = check_expr(tc, env, args[0], Some(elem))
         }
         return TBool
+      }
+      if method_name == "clear" || method_name == "reverse" {
+        return TUnit
+      }
+      if method_name == "join" {
+        if !ty_compat(TString, elem) {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "`Array::join` is only supported on `Array[String]`",
+            "Array[String]",
+            ty_to_string(TArray(elem)),
+            "convert elements to `String` before calling `.join(...)`",
+          )
+        }
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TString))
+          if !ty_compat(TString, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`Array::join` separator expects `String`",
+              "String",
+              ty_to_string(aty),
+              "pass a `String` separator",
+            )
+          }
+        }
+        return TString
+      }
+      if method_name == "sort" {
+        let sortable = match elem {
+          TInt | TInt64 | TString | TError => true
+          _ => false
+        }
+        if !sortable {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "`Array::sort` is only supported on `Array[Int]`, `Array[Int64]`, or `Array[String]`",
+            "Array[Int], Array[Int64], or Array[String]",
+            ty_to_string(TArray(elem)),
+            "sort an array of `Int`, `Int64`, or `String`",
+          )
+        }
+        return TUnit
       }
     }
     TMap(kty, vty) => {
@@ -3630,6 +3763,103 @@ fn check_expr(
       let _ = check_expr(tc, env, inner, None)
       resolve_type_expr(tc, target, env.type_params)
     }
+    ETry(inner, sp) => {
+      let ity = check_expr(tc, env, inner, None)
+      match ity {
+        TError => TError
+        TResult(ok_ty, err_ty) =>
+          match env.ret_ty {
+            TResult(_, fn_err_ty) => {
+              if !ty_compat(fn_err_ty, err_ty) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "`?` error type `" +
+                  ty_to_string(err_ty) +
+                  "` does not match enclosing function error type `" +
+                  ty_to_string(fn_err_ty) +
+                  "`",
+                  ty_to_string(fn_err_ty),
+                  ty_to_string(err_ty),
+                  "return a matching error type `" + ty_to_string(fn_err_ty) + "`",
+                )
+              }
+              ok_ty
+            }
+            _ => {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "`?` on `Result` requires enclosing function to return `Result[_, " +
+                ty_to_string(err_ty) +
+                "]`",
+                "Result[_, " + ty_to_string(err_ty) + "]",
+                ty_to_string(env.ret_ty),
+                "change the function return type to `Result[_, " +
+                ty_to_string(err_ty) +
+                "]` or handle with `match`",
+              )
+              ok_ty
+            }
+          }
+        TOption(inner_ty) =>
+          match env.ret_ty {
+            TOption(_) => inner_ty
+            _ => {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "`?` on `Option` requires enclosing function to return `Option[_]`",
+                "Option[_]",
+                ty_to_string(env.ret_ty),
+                "change the function return type to `Option[_]` or handle with `match`",
+              )
+              inner_ty
+            }
+          }
+        _ => {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "`?` operator requires `Result[T, E]` or `Option[T]`",
+            "Result[T, E] or Option[T]",
+            ty_to_string(ity),
+            "apply `?` only to `Result` or `Option` expressions",
+          )
+          TError
+        }
+      }
+    }
+    EInterp(parts, sp) => {
+      let mut i = 0
+      while i < parts.length() {
+        let pty = check_expr(tc, env, parts[i], None)
+        let ok = match pty {
+          TString | TInt | TInt64 | TDouble | TBool | TChar | TError => true
+          _ => false
+        }
+        if !ok {
+          tc_err(
+            tc,
+            expr_span(parts[i]),
+            "E_TYPE_MISMATCH",
+            "string interpolation does not support type `" +
+            ty_to_string(pty) +
+            "`",
+            "String, Int, Int64, Double, Bool, or Char",
+            ty_to_string(pty),
+            "convert the value to `String` before interpolating",
+          )
+        }
+        i = i + 1
+      }
+      let _ = sp
+      TString
+    }
   }
 }
 
@@ -3949,7 +4179,7 @@ pub fn check_package_with_imports(
             Some(t) => t
             None => TError
           }
-          let env = env_new(cty, [])
+          let env = env_new(TUnit, [])
           let vty = check_expr(tc, env, cd.value, Some(cty))
           if !ty_compat(cty, vty) {
             tc_err(
