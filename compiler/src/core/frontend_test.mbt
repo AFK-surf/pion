@@ -650,3 +650,82 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
   let cr6 = @core.check_source_files("p7a_bad6", ["b6.m2"], [bad_sort])
   assert_true(str_contains(@core.check_result_to_json(cr6.diagnostics), "E_TYPE_MISMATCH"), "Array[Bool]::sort rejected")
 }
+
+///|
+test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_swap" {
+  let ok_src =
+    "fn pair_swap[A, B](p : (A, B)) -> (B, A) {\n" +
+    "  let (a, b) = p\n" +
+    "  (b, a)\n" +
+    "}\n" +
+    "fn mk_triple(tag : String, n : Int) -> (String, Int, Double) {\n" +
+    "  (tag, n, 3.5)\n" +
+    "}\n" +
+    "fn classify(opt : Option[Int]) -> String {\n" +
+    "  match opt {\n" +
+    "    Some(x) if x > 10 => \"big\"\n" +
+    "    Some(x) if x > 0 => \"pos\"\n" +
+    "    Some(_) => \"nonpos\"\n" +
+    "    None => \"none\"\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let (s, _, d) : (String, Int, Double) = mk_triple(\"hi\", 7)\n" +
+    "  let swapped = pair_swap((s, 42))\n" +
+    "  let n = swapped.0\n" +
+    "  let s2 = swapped.1\n" +
+    "  let c = classify(Some(5))\n" +
+    "  if n == 42 && s2 == \"hi\" && c == \"pos\" && d > 3.0 { 0 } else { 1 }\n" +
+    "}\n"
+  let cr = @core.check_source_files("p8_ok", ["p8_ok.m2"], [ok_src])
+  assert_true(cr.diagnostics.length() == 0, "p8 ok_src should have 0 diagnostics")
+
+  // Arity mismatch in tuple destructuring
+  let bad_arity =
+    "fn f() -> Int {\n" +
+    "  let (a, b) = (1, 2, 3)\n" +
+    "  a + b\n" +
+    "}\n"
+  let cr1 = @core.check_source_files("p8_bad1", ["b1.m2"], [bad_arity])
+  assert_true(str_contains(@core.check_result_to_json(cr1.diagnostics), "E_TYPE_MISMATCH"), "tuple arity mismatch")
+
+  // Destructuring non-tuple
+  let bad_nontup =
+    "fn f() -> Int {\n" +
+    "  let (a, b) = 42\n" +
+    "  a + b\n" +
+    "}\n"
+  let cr2 = @core.check_source_files("p8_bad2", ["b2.m2"], [bad_nontup])
+  assert_true(str_contains(@core.check_result_to_json(cr2.diagnostics), "E_TYPE_MISMATCH"), "destructure non-tuple")
+
+  // Out-of-range tuple index
+  let bad_idx =
+    "fn f() -> Int {\n" +
+    "  let t = (1, 2)\n" +
+    "  t.2\n" +
+    "}\n"
+  let cr3 = @core.check_source_files("p8_bad3", ["b3.m2"], [bad_idx])
+  assert_true(str_contains(@core.check_result_to_json(cr3.diagnostics), "E_TYPE_MISMATCH"), "tuple index out of bounds")
+
+  // Guarded arm does NOT satisfy exhaustiveness
+  let bad_exh =
+    "fn f(opt : Option[Int]) -> Int {\n" +
+    "  match opt {\n" +
+    "    Some(x) if x > 0 => x\n" +
+    "    None => 0\n" +
+    "  }\n" +
+    "}\n"
+  let cr4 = @core.check_source_files("p8_bad4", ["b4.m2"], [bad_exh])
+  assert_true(str_contains(@core.check_result_to_json(cr4.diagnostics), "E_NON_EXHAUSTIVE"), "guarded arm is non-exhaustive")
+
+  // Non-Bool guard condition
+  let bad_guard =
+    "fn f(x : Int) -> Int {\n" +
+    "  match x {\n" +
+    "    n if n + 1 => n\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n"
+  let cr5 = @core.check_source_files("p8_bad5", ["b5.m2"], [bad_guard])
+  assert_true(str_contains(@core.check_result_to_json(cr5.diagnostics), "E_TYPE_MISMATCH"), "non-Bool match guard")
+}

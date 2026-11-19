@@ -907,3 +907,33 @@ test "p7a_ergonomics_qbe_codegen_and_bce" {
   let sa_body = sa_rest.clamped_view(end=sa_end).to_owned()
   assert_eq(sa_body.contains("m2_panic_oob"), false)
 }
+
+///|
+test "p8: tuple destructuring, match guards, and generic pair_swap codegen" {
+  let src =
+    "fn pair_swap[A, B](p : (A, B)) -> (B, A) {\n" +
+    "  let (a, b) = p\n" +
+    "  (b, a)\n" +
+    "}\n" +
+    "fn pick(opt : Option[String]) -> Int {\n" +
+    "  match opt {\n" +
+    "    Some(s) if s.length() > 3 => s.length()\n" +
+    "    Some(s) => s.length() + 100\n" +
+    "    None => 0\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let (k, _, v) : (String, String, Int) = (\"alpha\", \"dropme\", 9)\n" +
+    "  let sw = pair_swap((k, v))\n" +
+    "  let first = sw.0\n" +
+    "  let second = sw.1\n" +
+    "  first + pick(Some(second))\n" +
+    "}\n"
+  let cr = @core.check_source_files_with_imports("p8_cg", ["p8_cg.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  assert_eq(ssa.contains("@match_guard_ok"), true)
+  assert_eq(ssa.contains("@match_guard_fail"), true)
+  assert_eq(ssa.contains("call $m2_rc_inc("), true)
+  assert_eq(ssa.contains("call $m2_rc_dec("), true)
+}

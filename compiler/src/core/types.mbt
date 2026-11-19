@@ -1240,6 +1240,16 @@ fn collect_stmts_captures(
         collect_expr_captures(init, locals, out)
         locals.set(name, true)
       }
+      SLetTuple(names, _, init, _) => {
+        collect_expr_captures(init, locals, out)
+        let mut ni = 0
+        while ni < names.length() {
+          if names[ni] != "_" {
+            locals.set(names[ni], true)
+          }
+          ni = ni + 1
+        }
+      }
       SAssign(lhs, rhs, _) => {
         collect_expr_captures(lhs, locals, out)
         collect_expr_captures(rhs, locals, out)
@@ -1358,6 +1368,10 @@ fn collect_expr_captures(
       let mut i = 0
       while i < arms.length() {
         collect_pat_bindings(arms[i].pat, locals)
+        match arms[i].guard_expr {
+          Some(ge) => collect_expr_captures(ge, locals, out)
+          None => ()
+        }
         collect_expr_captures(arms[i].body, locals, out)
         i = i + 1
       }
@@ -1400,11 +1414,17 @@ fn check_match_exhaustiveness(
   let covered : Array[String] = []
   let mut i = 0
   while i < arms.length() {
-    match arms[i].pat {
-      PWild(_) | PIdent(_, _) => has_wild = true
-      PBool(b, _) => covered.push(if b { "true" } else { "false" })
-      PVariant(_, vname, _, _) => covered.push(vname)
-      _ => ()
+    let has_guard = match arms[i].guard_expr {
+      Some(_) => true
+      None => false
+    }
+    if !has_guard {
+      match arms[i].pat {
+        PWild(_) | PIdent(_, _) => has_wild = true
+        PBool(b, _) => covered.push(if b { "true" } else { "false" })
+        PVariant(_, vname, _, _) => covered.push(vname)
+        _ => ()
+      }
     }
     i = i + 1
   }
@@ -1514,6 +1534,25 @@ fn check_match_exhaustiveness(
         "add a wildcard arm `_ => ...`",
       )
   }
+}
+
+///|
+pub fn parse_tuple_index(s : String) -> Int {
+  let n = s.length()
+  if n == 0 {
+    return -1
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c < 48 || c > 57 {
+      return -1
+    }
+    acc = acc * 10 + (c - 48)
+    i = i + 1
+  }
+  acc
 }
 
 ///|
@@ -1693,6 +1732,77 @@ fn check_stmt(
       }
       if name != "_" {
         env_define(env, name, final_ty, is_mut)
+      }
+      TUnit
+    }
+    SLetTuple(names, ty_expr, init, sp) => {
+      let ann_opt : Option[Ty] = match ty_expr {
+        TyMissing(_) => None
+        _ => Some(resolve_type_expr(tc, ty_expr, env.type_params))
+      }
+      let init_ty = check_expr(tc, env, init, ann_opt)
+      let final_ty = match ann_opt {
+        Some(ann) => {
+          if !ty_compat(ann, init_ty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "type mismatch in tuple destructuring `let (...)`",
+              ty_to_string(ann),
+              ty_to_string(init_ty),
+              "change the initializer or the type annotation to `" +
+              ty_to_string(ann) +
+              "`",
+            )
+          }
+          ann
+        }
+        None => init_ty
+      }
+      match final_ty {
+        TTuple(elem_tys) =>
+          if elem_tys.length() != names.length() {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "tuple destructuring arity mismatch: expected " +
+              names.length().to_string() +
+              " element(s), found " +
+              elem_tys.length().to_string(),
+              names.length().to_string() + "-tuple",
+              ty_to_string(final_ty),
+              "match the number of bindings to the tuple's length",
+            )
+          } else {
+            let mut ni = 0
+            while ni < names.length() {
+              if names[ni] != "_" {
+                env_define(env, names[ni], elem_tys[ni], false)
+              }
+              ni = ni + 1
+            }
+          }
+        TError => {
+          let mut ni = 0
+          while ni < names.length() {
+            if names[ni] != "_" {
+              env_define(env, names[ni], TError, false)
+            }
+            ni = ni + 1
+          }
+        }
+        _ =>
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "cannot destructure non-tuple type `" + ty_to_string(final_ty) + "`",
+            "tuple of " + names.length().to_string() + " element(s)",
+            ty_to_string(final_ty),
+            "destructure a tuple value or use a plain `let x = ...` binding",
+          )
       }
       TUnit
     }
@@ -3304,6 +3414,23 @@ fn check_expr(
       let oty = check_expr(tc, env, obj, None)
       match oty {
         TError => TError
+        TTuple(elems) => {
+          let idx = parse_tuple_index(field_name)
+          if idx >= 0 && idx < elems.length() {
+            elems[idx]
+          } else {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "tuple `" + ty_to_string(oty) + "` has no element `." + field_name + "`",
+              "index in 0.." + elems.length().to_string(),
+              field_name,
+              "use a valid tuple element index",
+            )
+            TError
+          }
+        }
         TStruct(sname, sargs) =>
           match tc.structs.get(sname) {
             None => TError
@@ -3615,6 +3742,23 @@ fn check_expr(
       while i < arms.length() {
         env_push(env)
         bind_pattern(tc, env, arms[i].pat, scrut_ty)
+        match arms[i].guard_expr {
+          Some(ge) => {
+            let gty = check_expr(tc, env, ge, Some(TBool))
+            if !ty_compat(TBool, gty) {
+              tc_err(
+                tc,
+                expr_span(ge),
+                "E_TYPE_MISMATCH",
+                "`match` guard condition must be `Bool`",
+                "Bool",
+                ty_to_string(gty),
+                "use a boolean expression after `if` in match arm",
+              )
+            }
+          }
+          None => ()
+        }
         let bty = check_expr(tc, env, arms[i].body, res_ty)
         env_pop(env)
         match res_ty {
