@@ -30,6 +30,7 @@ pub enum TokenKind {
   KwSpawn
   KwDebugAssert
   KwType
+  KwImport
   LParen
   RParen
   LBrace
@@ -151,6 +152,8 @@ fn keyword_or_ident(word : String) -> TokenKind {
     KwDebugAssert
   } else if word == "type" {
     KwType
+  } else if word == "import" {
+    KwImport
   } else {
     Ident(word)
   }

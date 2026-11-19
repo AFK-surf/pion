@@ -208,6 +208,7 @@ pub fn extract_package_sig(pkg : Package) -> PackageSig {
               signature: format_const_sig(cd),
             })
           }
+        DTest(_) => ()
       }
       di = di + 1
     }
@@ -279,6 +280,7 @@ pub fn emit_all_sigs(pkg : Package) -> String {
             name: cd.name,
             signature: format_const_sig(cd),
           })
+        DTest(_) => ()
       }
       di = di + 1
     }
@@ -312,6 +314,7 @@ pub fn emit_file_sig_entries(f : SourceFile) -> String {
         sb.write_string(format_const_sig(cd))
         sb.write_string("\n")
       }
+      DTest(_) => ()
     }
     di = di + 1
   }
@@ -419,6 +422,7 @@ pub fn emit_file_stub(f : SourceFile) -> String {
         sb.write_string(type_expr_to_string(cd.ty))
         sb.write_string(" = panic()\n")
       }
+      DTest(_) => ()
     }
     di = di + 1
   }

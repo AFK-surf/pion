@@ -357,3 +357,133 @@ test "query: defs, sig, callers, deps JSON outputs" {
     Err(e) => abort(e)
   }
 }
+
+///|
+test "p6b: import, cross-package types/methods/enums/consts and E_PRIVATE_SYMBOL" {
+  let math_src =
+    "pub let PI : Int = 3\n" +
+    "let SECRET : Int = 99\n" +
+    "pub struct Point { x : Int, y : Int }\n" +
+    "struct Hidden { v : Int }\n" +
+    "pub fn Point::sum(self : Point) -> Int { self.x + self.y }\n" +
+    "pub enum Color { Red, Blue(Int) }\n" +
+    "pub fn add(a : Int, b : Int) -> Int { a + b }\n" +
+    "fn priv_helper(x : Int) -> Int { x * 2 }\n"
+  let math_cr = @core.check_source_files_with_imports(
+    "math",
+    ["math.m2"],
+    [math_src],
+    [],
+    true,
+  )
+  assert_true(math_cr.diagnostics.length() == 0, "math should check cleanly")
+  let imported = [@core.imported_pkg_new("math", math_cr.tc)]
+
+  let ok_app =
+    "import \"math\" as m\n" +
+    "pub fn run() -> Int {\n" +
+    "  let p : m::Point = m::Point::{ x: 10, y: 20 }\n" +
+    "  let c : m::Color = m::Color::Blue(m::PI)\n" +
+    "  let cv = match c {\n" +
+    "    m::Color::Red => 0\n" +
+    "    m::Color::Blue(v) => v\n" +
+    "  }\n" +
+    "  m::add(p.sum(), cv)\n" +
+    "}\n"
+  let app_cr = @core.check_source_files_with_imports(
+    "app",
+    ["app.m2"],
+    [ok_app],
+    imported,
+    true,
+  )
+  assert_true(app_cr.diagnostics.length() == 0, "app using pub symbols should pass")
+
+  let priv_app =
+    "import \"math\"\n" +
+    "pub fn bad() -> Int {\n" +
+    "  let h = math::Hidden::{ v: 1 }\n" +
+    "  let s = math::SECRET\n" +
+    "  math::priv_helper(s + h.v)\n" +
+    "}\n"
+  let priv_cr = @core.check_source_files_with_imports(
+    "app",
+    ["bad.m2"],
+    [priv_app],
+    imported,
+    true,
+  )
+  let priv_json = @core.check_result_to_json(priv_cr.diagnostics)
+  assert_true(str_contains(priv_json, "E_PRIVATE_SYMBOL"), "expected E_PRIVATE_SYMBOL")
+  assert_true(priv_cr.diagnostics.length() >= 3, "expected 3 private symbol errors")
+
+  let unk_app =
+    "import \"missing_pkg\"\n" +
+    "pub fn f() -> Int { 0 }\n"
+  let unk_cr = @core.check_source_files_with_imports(
+    "app",
+    ["unk.m2"],
+    [unk_app],
+    imported,
+    true,
+  )
+  let unk_json = @core.check_result_to_json(unk_cr.diagnostics)
+  assert_true(str_contains(unk_json, "E_UNKNOWN_PACKAGE"), "expected E_UNKNOWN_PACKAGE")
+}
+
+///|
+test "p6b: m2.toml parser, topo_sort, E_IMPORT_CYCLE, and workspace deps json" {
+  let toml =
+    "# sample manifest\n" +
+    "[package]\n" +
+    "name = \"app\"\n" +
+    "version = \"0.1.0\"\n" +
+    "\n" +
+    "[dependencies]\n" +
+    "math = { path = \"../math\" }\n" +
+    "util = { path = \"./deps/util\" }\n"
+  match @core.parse_m2_toml(toml) {
+    Ok(m) => {
+      assert_true(m.name == "app", "pkg name")
+      assert_true(m.version == "0.1.0", "pkg version")
+      assert_true(m.deps.length() == 2, "2 deps")
+      assert_true(m.deps[0].name == "math" && m.deps[0].path == "../math", "dep 0")
+      assert_true(m.deps[1].name == "util" && m.deps[1].path == "./deps/util", "dep 1")
+    }
+    Err(e) => abort("parse_m2_toml failed: " + e)
+  }
+
+  let ok_topo = @core.topo_sort_packages(
+    ["app", "math", "core_util"],
+    [["math"], ["core_util"], []],
+  )
+  assert_true(ok_topo.diagnostics.length() == 0, "acyclic topo ok")
+  assert_true(ok_topo.order.length() == 3, "3 nodes")
+  assert_true(ok_topo.order[0] == 2 && ok_topo.order[1] == 1 && ok_topo.order[2] == 0, "deps first")
+
+  let cyc_topo = @core.topo_sort_packages(["a", "b"], [["b"], ["a"]])
+  let cyc_json = @core.check_result_to_json(cyc_topo.diagnostics)
+  assert_true(str_contains(cyc_json, "E_IMPORT_CYCLE"), "expected E_IMPORT_CYCLE")
+
+  let ws_json = @core.query_workspace_deps_json(
+    ["math", "app"],
+    [[], ["math"]],
+    ["aaaa", "bbbb"],
+  )
+  assert_true(str_contains(ws_json, "\"name\":\"math\""), "math in ws json")
+  assert_true(str_contains(ws_json, "\"deps\":[\"math\"]"), "app dep in ws json")
+}
+
+///|
+test "p6b: first-class test block and contextual test identifier" {
+  let src =
+    "pub fn double(x : Int) -> Int {\n" +
+    "  let test = x * 2\n" +
+    "  test\n" +
+    "}\n" +
+    "test \"double works\" {\n" +
+    "  debug_assert(double(21) == 42, \"expected 42\")\n" +
+    "}\n"
+  let cr = @core.check_source_files("tpkg", ["t.m2"], [src])
+  assert_true(cr.diagnostics.length() == 0, "contextual test var + test block should pass")
+}

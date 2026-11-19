@@ -410,6 +410,369 @@ fn cas_record_and_evict(
 }
 
 ///|
+fn compute_compiler_fp(qbe_bin : String, rt_lib : String) -> String {
+  let qsz = m2_host_file_size(str_to_utf8(qbe_bin))
+  let rsz = m2_host_file_size(str_to_utf8(rt_lib))
+  let salt = env_str("M2_CACHE_SALT")
+  @core.cas_compiler_fp(qsz, rsz, salt)
+}
+
+///|
+fn ends_with_str(s : String, suf : String) -> Bool {
+  let sl = s.length()
+  let sufl = suf.length()
+  if sl < sufl {
+    return false
+  }
+  let off = sl - sufl
+  let mut i = 0
+  while i < sufl {
+    if s[off + i].to_int() != suf[i].to_int() {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn find_substr_str(s : String, needle : String) -> Int {
+  let sl = s.length()
+  let nl = needle.length()
+  if nl == 0 || nl > sl {
+    return -1
+  }
+  let mut i = 0
+  while i + nl <= sl {
+    let mut j = 0
+    let mut ok = true
+    while j < nl {
+      if s[i + j].to_int() != needle[j].to_int() {
+        ok = false
+        break
+      }
+      j = j + 1
+    }
+    if ok {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn join_path_str(dir : String, name : String) -> String {
+  if dir.length() == 0 {
+    return name
+  }
+  if dir[dir.length() - 1].to_int() == 47 {
+    dir + name
+  } else {
+    dir + "/" + name
+  }
+}
+
+///|
+fn normalize_path_str(path : String) -> String {
+  let is_abs = path.length() > 0 && path[0].to_int() == 47
+  let parts : Array[String] = []
+  let sb = StringBuilder()
+  let mut i = 0
+  while i <= path.length() {
+    let is_sep = i == path.length() || path[i].to_int() == 47
+    if is_sep {
+      let seg = sb.to_string()
+      sb.reset()
+      if seg.length() == 0 || seg == "." {
+        ()
+      } else if seg == ".." {
+        if parts.length() > 0 && parts[parts.length() - 1] != ".." {
+          let _ = parts.pop()
+        } else if !is_abs {
+          parts.push("..")
+        }
+      } else {
+        parts.push(seg)
+      }
+    } else {
+      sb.write_char(path[i].to_int().unsafe_to_char())
+    }
+    i = i + 1
+  }
+  let out = StringBuilder()
+  if is_abs {
+    out.write_char('/')
+  }
+  let mut j = 0
+  while j < parts.length() {
+    if j > 0 {
+      out.write_char('/')
+    }
+    out.write_string(parts[j])
+    j = j + 1
+  }
+  let res = out.to_string()
+  if res.length() == 0 {
+    "."
+  } else {
+    res
+  }
+}
+
+///|
+fn resolve_rel_path_str(base_dir : String, rel : String) -> String {
+  if rel.length() > 0 && rel[0].to_int() == 47 {
+    normalize_path_str(rel)
+  } else {
+    normalize_path_str(join_path_str(base_dir, rel))
+  }
+}
+
+///|
+fn detect_manifest_dir(target : String) -> Option[String] {
+  if target == "m2.toml" || ends_with_str(target, "/m2.toml") {
+    let pd = parent_dir(target)
+    return Some(if pd.length() == 0 { "." } else { pd })
+  }
+  let tb = str_to_utf8(target)
+  if m2_host_is_dir(tb) != 0 {
+    let mf = join_path_str(target, "m2.toml")
+    if file_exists(mf) {
+      return Some(normalize_path_str(target))
+    }
+  }
+  None
+}
+
+///|
+fn load_pkg_dir_sources(
+  pkg_dir : String,
+) -> (Array[String], Array[String]) {
+  let paths : Array[String] = []
+  let sources : Array[String] = []
+  let listing = utf8_to_str(m2_host_list_sources(str_to_utf8(pkg_dir)))
+  let files = split_nonempty_lines(listing)
+  let mut i = 0
+  while i < files.length() {
+    let fpath = files[i]
+    paths.push(fpath)
+    sources.push(read_text(fpath))
+    i = i + 1
+  }
+  let src_dir = join_path_str(pkg_dir, "src")
+  if m2_host_is_dir(str_to_utf8(src_dir)) != 0 {
+    let slisting = utf8_to_str(m2_host_list_sources(str_to_utf8(src_dir)))
+    let sfiles = split_nonempty_lines(slisting)
+    let mut j = 0
+    while j < sfiles.length() {
+      let fpath = sfiles[j]
+      paths.push(fpath)
+      sources.push(read_text(fpath))
+      j = j + 1
+    }
+  }
+  (paths, sources)
+}
+
+///|
+fn load_workspace_dfs(
+  pkg_dir : String,
+  visited : Map[String, Bool],
+  out : Array[@core.PkgNodeInput],
+) -> Result[Unit, String] {
+  let norm_dir = normalize_path_str(pkg_dir)
+  if visited.contains(norm_dir) {
+    return Ok(())
+  }
+  visited.set(norm_dir, true)
+  let mf_path = join_path_str(norm_dir, "m2.toml")
+  if !file_exists(mf_path) {
+    return Err("missing m2.toml in " + norm_dir)
+  }
+  let mf = match @core.parse_m2_toml(read_text(mf_path)) {
+    Err(e) => return Err(e)
+    Ok(m) => m
+  }
+  let dep_names : Array[String] = []
+  let mut i = 0
+  while i < mf.deps.length() {
+    dep_names.push(mf.deps[i].name)
+    let dep_dir = resolve_rel_path_str(norm_dir, mf.deps[i].path)
+    match load_workspace_dfs(dep_dir, visited, out) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    i = i + 1
+  }
+  let (paths, sources) = load_pkg_dir_sources(norm_dir)
+  out.push(
+    @core.pkg_node_input_new(mf.name, norm_dir, dep_names, paths, sources),
+  )
+  Ok(())
+}
+
+///|
+fn load_workspace_nodes(
+  root_dir : String,
+) -> Result[Array[@core.PkgNodeInput], String] {
+  let visited : Map[String, Bool] = Map([])
+  let out : Array[@core.PkgNodeInput] = []
+  match load_workspace_dfs(root_dir, visited, out) {
+    Err(e) => Err(e)
+    Ok(_) => Ok(out)
+  }
+}
+
+///|
+fn build_workspace_objects(
+  root_dir : String,
+  release : Bool,
+  include_entry : Bool,
+) -> Result[
+  (Array[@core.CheckedPackage], Array[String], Array[String], String),
+  String,
+] {
+  let nodes = match load_workspace_nodes(root_dir) {
+    Err(e) => return Err(e)
+    Ok(v) => v
+  }
+  let names : Array[String] = []
+  let dep_lists : Array[Array[String]] = []
+  let mut i = 0
+  while i < nodes.length() {
+    names.push(nodes[i].name)
+    dep_lists.push(nodes[i].deps)
+    i = i + 1
+  }
+  let topo = @core.topo_sort_packages(names, dep_lists)
+  if topo.diagnostics.length() > 0 {
+    return Err(@core.check_result_to_json(topo.diagnostics))
+  }
+  let cache_dir = resolve_cache_dir()
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/sig"))
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
+  let qbe_target = resolve_qbe_target()
+  let qbe_bin = resolve_qbe_bin()
+  let rt_lib = resolve_rt_lib()
+  let compiler_fp = compute_compiler_fp(qbe_bin, rt_lib)
+  let trace_cas = env_str("M2_CAS_TRACE") == "1"
+
+  let checked_pkgs : Array[@core.CheckedPackage] = []
+  let imported : Array[@core.ImportedPkg] = []
+  let sig_hashes : Map[String, String] = Map([])
+  let all_diags : Array[@core.Diagnostic] = []
+
+  let n = topo.order.length()
+  let mut k = 0
+  while k < n {
+    let node = nodes[topo.order[k]]
+    let cr = @core.check_source_files_with_imports(
+      node.name,
+      node.paths,
+      node.sources,
+      imported,
+      true,
+    )
+    let mut di = 0
+    while di < cr.diagnostics.length() {
+      all_diags.push(cr.diagnostics[di])
+      di = di + 1
+    }
+    checked_pkgs.push(cr)
+    imported.push(@core.imported_pkg_new(node.name, cr.tc))
+    let m2sig = @core.emit_m2sig(cr.pkg)
+    sig_hashes.set(node.name, @core.cas_sha256_hex(m2sig))
+    k = k + 1
+  }
+  if all_diags.length() > 0 {
+    return Err(@core.check_result_to_json(all_diags))
+  }
+
+  let obj_paths : Array[String] = []
+  let dep_pkg_names : Array[String] = []
+  let link_key_sb = StringBuilder()
+  link_key_sb.write_string(compiler_fp)
+  let limit = if include_entry { n } else { n - 1 }
+  let pid_s = m2_host_getpid().to_string()
+  k = 0
+  while k < limit {
+    let node = nodes[topo.order[k]]
+    let cr = checked_pkgs[k]
+    let is_entry = k == n - 1
+    let upstream_sigs : Array[String] = []
+    let mut u = 0
+    while u < k {
+      let un = nodes[topo.order[u]].name
+      let sh = match sig_hashes.get(un) {
+        Some(h) => h
+        None => ""
+      }
+      upstream_sigs.push(un + ":" + sh)
+      u = u + 1
+    }
+    let key = @core.cas_compute_key(
+      node.name,
+      node.paths,
+      node.sources,
+      upstream_sigs,
+      qbe_target,
+      release,
+      compiler_fp,
+    )
+    let obj_path = cache_dir + "/obj/" + key + ".o"
+    let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+    let sig_path = cache_dir + "/sig/" + key + ".m2sig"
+    if file_exists(obj_path) {
+      if trace_cas {
+        write_err("[cas] pkg=" + node.name + " HIT key=" + prefix16(key) + "\n")
+      }
+    } else {
+      if trace_cas {
+        write_err("[cas] pkg=" + node.name + " MISS key=" + prefix16(key) + "\n")
+      }
+      let res = @core.emit_qbe_package_multi(
+        cr.pkg,
+        cr.tc,
+        release,
+        is_entry,
+        dep_pkg_names,
+      )
+      let _ = write_text_atomic(sig_path, @core.emit_m2sig(cr.pkg))
+      if !write_text_atomic(ssa_path, res.ssa) {
+        return Err("failed to write CAS ssa: " + ssa_path)
+      }
+      let asm_path = cache_dir + "/obj/" + key + ".s." + pid_s
+      let obj_tmp = obj_path + ".tmp." + pid_s
+      let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
+      if rc_qbe != 0 {
+        let _ = m2_host_remove(str_to_utf8(asm_path))
+        return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path)
+      }
+      let rc_as = exec_argv(["as", "-o", obj_tmp, asm_path])
+      let _ = m2_host_remove(str_to_utf8(asm_path))
+      if rc_as != 0 {
+        let _ = m2_host_remove(str_to_utf8(obj_tmp))
+        return Err("as failed with exit code " + rc_as.to_string())
+      }
+      let _ = m2_host_rename(str_to_utf8(obj_tmp), str_to_utf8(obj_path))
+      let sz = m2_host_file_size(str_to_utf8(obj_path))
+      cas_record_and_evict(cache_dir, key, if sz > 0L { sz } else { 0L })
+    }
+    obj_paths.push(obj_path)
+    if !is_entry {
+      dep_pkg_names.push(node.name)
+    }
+    link_key_sb.write_string(":")
+    link_key_sb.write_string(key)
+    k = k + 1
+  }
+  Ok((checked_pkgs, obj_paths, dep_pkg_names, @core.cas_sha256_hex(link_key_sb.to_string())))
+}
+
+///|
 fn build_targets(
   targets : Array[String],
   release : Bool,
@@ -417,6 +780,45 @@ fn build_targets(
   emit_asm_path : String,
   out_bin_arg : String,
 ) -> Result[String, String] {
+  if targets.length() == 1 {
+    match detect_manifest_dir(targets[0]) {
+      Some(root_dir) => {
+        let built = match build_workspace_objects(root_dir, release, true) {
+          Err(e) => return Err(e)
+          Ok(v) => v
+        }
+        let (checked_pkgs, obj_paths, _, link_key) = built
+        let root_pkg = checked_pkgs[checked_pkgs.length() - 1].pkg.name
+        let cache_dir = resolve_cache_dir()
+        let default_bin = cache_dir + "/bin/" + root_pkg + "_" + prefix16(link_key)
+        let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+        if out_bin_arg != "" {
+          ensure_parent_dir(out_bin_arg)
+        }
+        let rt_lib = resolve_rt_lib()
+        let cc = {
+          let e = env_str("CC")
+          if e.length() > 0 { e } else { "clang" }
+        }
+        let ld_argv : Array[String] = [cc]
+        let mut oi = 0
+        while oi < obj_paths.length() {
+          ld_argv.push(obj_paths[oi])
+          oi = oi + 1
+        }
+        ld_argv.push(rt_lib)
+        ld_argv.push("-lpthread")
+        ld_argv.push("-o")
+        ld_argv.push(final_bin)
+        let rc_ld = exec_argv(ld_argv)
+        if rc_ld != 0 {
+          return Err("linker failed with exit code " + rc_ld.to_string())
+        }
+        return Ok(final_bin)
+      }
+      None => ()
+    }
+  }
   let loaded = match load_targets(targets) {
     Err(msg) => return Err(msg)
     Ok(v) => v
@@ -431,6 +833,8 @@ fn build_targets(
 
   let qbe_target = resolve_qbe_target()
   let qbe_bin = resolve_qbe_bin()
+  let rt_lib = resolve_rt_lib()
+  let compiler_fp = compute_compiler_fp(qbe_bin, rt_lib)
 
   if paths.length() > 1 && emit_ssa_path == "" && emit_asm_path == "" {
     let prep = match @core.cli_prepare_qbe_units(pkg_name, paths, sources) {
@@ -442,6 +846,8 @@ fn build_targets(
     let obj_paths : Array[String] = []
     let miss_indices : Array[Int] = []
     let pkg_key_sb = StringBuilder()
+    pkg_key_sb.write_string(compiler_fp)
+    pkg_key_sb.write_string(":")
     pkg_key_sb.write_string(prep.sigs_hash)
     let mut ui = 0
     while ui < n_units {
@@ -454,6 +860,7 @@ fn build_targets(
         prep.sigs_hash,
         qbe_target,
         release,
+        compiler_fp,
       )
       unit_keys.push(ukey)
       pkg_key_sb.write_string(":")
@@ -525,7 +932,15 @@ fn build_targets(
     }
     return Ok(final_bin)
   }
-  let key = @core.cas_compute_key(pkg_name, paths, sources, [], qbe_target, release)
+  let key = @core.cas_compute_key(
+    pkg_name,
+    paths,
+    sources,
+    [],
+    qbe_target,
+    release,
+    compiler_fp,
+  )
   let sig_path = cache_dir + "/sig/" + key + ".m2sig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
   let obj_path = cache_dir + "/obj/" + key + ".o"
@@ -635,6 +1050,174 @@ fn build_targets(
 }
 
 ///|
+fn run_tests_cmd(
+  targets : Array[String],
+  as_json : Bool,
+  filter : String,
+) -> Int {
+  let cache_dir = resolve_cache_dir()
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
+  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
+  let qbe_target = resolve_qbe_target()
+  let qbe_bin = resolve_qbe_bin()
+  let rt_lib = resolve_rt_lib()
+  let compiler_fp = compute_compiler_fp(qbe_bin, rt_lib)
+
+  let mut test_res = @core.qbe_test_emit_empty()
+  let dep_objs : Array[String] = []
+
+  if targets.length() == 1 {
+    match detect_manifest_dir(targets[0]) {
+      Some(root_dir) =>
+        match build_workspace_objects(root_dir, false, false) {
+          Err(msg) => {
+            write_err(msg + "\n")
+            return 1
+          }
+          Ok((checked_pkgs, obj_paths, dep_pkg_names, _)) => {
+            let root_cr = checked_pkgs[checked_pkgs.length() - 1]
+            test_res = @core.emit_qbe_test_package(
+              root_cr.pkg,
+              root_cr.tc,
+              dep_pkg_names,
+            )
+            let mut oi = 0
+            while oi < obj_paths.length() {
+              dep_objs.push(obj_paths[oi])
+              oi = oi + 1
+            }
+          }
+        }
+      None =>
+        match load_targets(targets) {
+          Err(msg) => {
+            write_err("error: " + msg + "\n")
+            return 1
+          }
+          Ok((pkg_name, paths, sources)) => {
+            let cr = @core.check_source_files_full(pkg_name, paths, sources)
+            if cr.diagnostics.length() > 0 {
+              write_out(@core.check_result_to_json(cr.diagnostics) + "\n")
+              return 1
+            }
+            test_res = @core.emit_qbe_test_package(cr.pkg, cr.tc, [])
+          }
+        }
+    }
+  } else {
+    match load_targets(targets) {
+      Err(msg) => {
+        write_err("error: " + msg + "\n")
+        return 1
+      }
+      Ok((pkg_name, paths, sources)) => {
+        let cr = @core.check_source_files_full(pkg_name, paths, sources)
+        if cr.diagnostics.length() > 0 {
+          write_out(@core.check_result_to_json(cr.diagnostics) + "\n")
+          return 1
+        }
+        test_res = @core.emit_qbe_test_package(cr.pkg, cr.tc, [])
+      }
+    }
+  }
+
+  let names = test_res.test_names
+  if names.length() == 0 {
+    if as_json {
+      write_out(@core.format_test_report_json([], []) + "\n")
+    } else {
+      write_out("test result: ok. 0 passed; 0 failed\n")
+    }
+    return 0
+  }
+
+  let tkey = @core.cas_sha256_hex(compiler_fp + ":test:" + test_res.ssa)
+  let ssa_path = cache_dir + "/ssa/test_" + tkey + ".ssa"
+  let asm_path = cache_dir + "/obj/test_" + tkey + ".s." + m2_host_getpid().to_string()
+  let obj_path = cache_dir + "/obj/test_" + tkey + ".o"
+  let test_bin = cache_dir + "/bin/test_" + prefix16(tkey)
+  if !file_exists(test_bin) {
+    if !write_text_atomic(ssa_path, test_res.ssa) {
+      write_err("error: failed to write test ssa\n")
+      return 1
+    }
+    let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
+    if rc_qbe != 0 {
+      let _ = m2_host_remove(str_to_utf8(asm_path))
+      write_err("error: qbe failed on test harness\n")
+      return 1
+    }
+    let rc_as = exec_argv(["as", "-o", obj_path, asm_path])
+    let _ = m2_host_remove(str_to_utf8(asm_path))
+    if rc_as != 0 {
+      write_err("error: as failed on test harness\n")
+      return 1
+    }
+    let cc = {
+      let e = env_str("CC")
+      if e.length() > 0 { e } else { "clang" }
+    }
+    let ld_argv : Array[String] = [cc]
+    let mut oi = 0
+    while oi < dep_objs.length() {
+      ld_argv.push(dep_objs[oi])
+      oi = oi + 1
+    }
+    ld_argv.push(obj_path)
+    ld_argv.push(rt_lib)
+    ld_argv.push("-lpthread")
+    ld_argv.push("-o")
+    ld_argv.push(test_bin)
+    let rc_ld = exec_argv(ld_argv)
+    if rc_ld != 0 {
+      write_err("error: linker failed on test harness\n")
+      return 1
+    }
+  }
+
+  let ran_names : Array[String] = []
+  let ran_ok : Array[Bool] = []
+  let mut failed = 0
+  let mut passed = 0
+  let mut i = 0
+  while i < names.length() {
+    let tname = names[i]
+    if filter.length() == 0 || find_substr_str(tname, filter) >= 0 {
+      let rc = exec_argv([test_bin, i.to_string()])
+      let ok = rc == 0
+      ran_names.push(tname)
+      ran_ok.push(ok)
+      if ok {
+        passed = passed + 1
+      } else {
+        failed = failed + 1
+      }
+      if !as_json {
+        write_out(
+          "test " + tname + " ... " + (if ok { "ok\n" } else { "FAILED\n" }),
+        )
+      }
+    }
+    i = i + 1
+  }
+  if as_json {
+    write_out(@core.format_test_report_json(ran_names, ran_ok) + "\n")
+  } else {
+    write_out(
+      "test result: " +
+      (if failed == 0 { "ok" } else { "FAILED" }) +
+      ". " +
+      passed.to_string() +
+      " passed; " +
+      failed.to_string() +
+      " failed\n",
+    )
+  }
+  if failed == 0 { 0 } else { 1 }
+}
+
+///|
 fn usage() -> Unit {
   write_err(
     "usage:\n" +
@@ -642,7 +1225,8 @@ fn usage() -> Unit {
     "  m2c query defs|sig|callers|deps [--json] <input1> [input2 ...]\n" +
     "  m2c emit-sig <input1> [input2 ...]\n" +
     "  m2c build [--release] [--emit-ssa <path>] [--emit-asm <path>] [--jobs <n>] [-o <out>] <input1> [input2 ...]\n" +
-    "  m2c run [--release] <input> [-- args...]\n",
+    "  m2c run [--release] <input> [-- args...]\n" +
+    "  m2c test [--json] [--filter <name>] <input>\n",
   )
 }
 
@@ -668,6 +1252,60 @@ fn main {
       usage()
       m2_host_exit(1)
       return
+    }
+    if targets.length() == 1 {
+      match detect_manifest_dir(targets[0]) {
+        Some(root_dir) => {
+          match load_workspace_nodes(root_dir) {
+            Err(msg) => {
+              write_err("error: " + msg + "\n")
+              m2_host_exit(1)
+            }
+            Ok(nodes) => {
+              let names : Array[String] = []
+              let dep_lists : Array[Array[String]] = []
+              let mut ni = 0
+              while ni < nodes.length() {
+                names.push(nodes[ni].name)
+                dep_lists.push(nodes[ni].deps)
+                ni = ni + 1
+              }
+              let topo = @core.topo_sort_packages(names, dep_lists)
+              if topo.diagnostics.length() > 0 {
+                write_out(@core.check_result_to_json(topo.diagnostics) + "\n")
+                m2_host_exit(1)
+                return
+              }
+              let imported : Array[@core.ImportedPkg] = []
+              let all_diags : Array[@core.Diagnostic] = []
+              let mut k = 0
+              while k < topo.order.length() {
+                let node = nodes[topo.order[k]]
+                let cr = @core.check_source_files_with_imports(
+                  node.name,
+                  node.paths,
+                  node.sources,
+                  imported,
+                  true,
+                )
+                let mut di = 0
+                while di < cr.diagnostics.length() {
+                  all_diags.push(cr.diagnostics[di])
+                  di = di + 1
+                }
+                imported.push(@core.imported_pkg_new(node.name, cr.tc))
+                k = k + 1
+              }
+              write_out(@core.check_result_to_json(all_diags) + "\n")
+              if all_diags.length() > 0 {
+                m2_host_exit(1)
+              }
+            }
+          }
+          return
+        }
+        None => ()
+      }
     }
     match load_targets(targets) {
       Err(msg) => {
@@ -701,6 +1339,52 @@ fn main {
       usage()
       m2_host_exit(1)
       return
+    }
+    if kind == "deps" && targets.length() == 1 {
+      match detect_manifest_dir(targets[0]) {
+        Some(root_dir) => {
+          match load_workspace_nodes(root_dir) {
+            Err(msg) => {
+              write_err("error: " + msg + "\n")
+              m2_host_exit(1)
+            }
+            Ok(nodes) => {
+              let names : Array[String] = []
+              let dep_lists : Array[Array[String]] = []
+              let mut ni = 0
+              while ni < nodes.length() {
+                names.push(nodes[ni].name)
+                dep_lists.push(nodes[ni].deps)
+                ni = ni + 1
+              }
+              let topo = @core.topo_sort_packages(names, dep_lists)
+              if topo.diagnostics.length() > 0 {
+                write_out(@core.check_result_to_json(topo.diagnostics) + "\n")
+                m2_host_exit(1)
+                return
+              }
+              let ord_names : Array[String] = []
+              let ord_deps : Array[Array[String]] = []
+              let ord_hashes : Array[String] = []
+              let mut k = 0
+              while k < topo.order.length() {
+                let node = nodes[topo.order[k]]
+                let pkg = @core.parse_package(node.name, node.paths, node.sources)
+                ord_names.push(node.name)
+                ord_deps.push(node.deps)
+                ord_hashes.push(@core.sig_hash_hex(@core.emit_m2sig(pkg)))
+                k = k + 1
+              }
+              write_out(
+                @core.query_workspace_deps_json(ord_names, ord_deps, ord_hashes) +
+                "\n",
+              )
+            }
+          }
+          return
+        }
+        None => ()
+      }
     }
     match load_targets(targets) {
       Err(msg) => {
@@ -815,6 +1499,32 @@ fn main {
           m2_host_exit(rc)
         }
       }
+    }
+  } else if cmd == "test" {
+    let mut as_json = false
+    let mut filter = ""
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      if a == "--json" {
+        as_json = true
+      } else if a == "--filter" && i + 1 < args.length() {
+        filter = args[i + 1]
+        i = i + 1
+      } else {
+        targets.push(a)
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      usage()
+      m2_host_exit(1)
+      return
+    }
+    let rc = run_tests_cmd(targets, as_json, filter)
+    if rc != 0 {
+      m2_host_exit(rc)
     }
   } else {
     usage()

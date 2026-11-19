@@ -94,6 +94,19 @@ pub fn query_defs_json(pkg : Package) -> String {
           sb.write_string(json_quote(format_const_sig(cd)))
           sb.write_string("}")
         }
+        DTest(td) => {
+          sb.write_string("{\"pkg\":")
+          sb.write_string(json_quote(pkg.name))
+          sb.write_string(",\"name\":")
+          sb.write_string(json_quote(td.name))
+          sb.write_string(",\"kind\":\"test\",\"pub\":false,\"file\":")
+          sb.write_string(json_quote(td.span.file))
+          sb.write_string(",\"line\":")
+          sb.write_string(td.span.line.to_string())
+          sb.write_string(",\"sig\":")
+          sb.write_string(json_quote("test \"" + td.name + "\""))
+          sb.write_string("}")
+        }
       }
       di = di + 1
     }

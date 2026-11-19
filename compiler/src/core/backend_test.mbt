@@ -673,3 +673,52 @@ test "qbe_p5p_local_immut_w_to_l_ext_prop" {
   // Only 4 index extsw (perm[fi], perm[fi], perm[k-fi], perm[k-fi]); 0 value extsw for `tmp` or `perm[k-fi]`
   assert_eq(ext_cnt, 4)
 }
+
+///|
+test "p6b_cas_compiler_fingerprint_invalidates_keys" {
+  let fp1 = @core.cas_compiler_fp(1000L, 2000L, "")
+  let fp2 = @core.cas_compiler_fp(1001L, 2000L, "")
+  let fp3 = @core.cas_compiler_fp(1000L, 2000L, "salt-a")
+  assert_not_eq(fp1, fp2)
+  assert_not_eq(fp1, fp3)
+  let k1 = @core.cas_compute_key("p", ["a.m2"], ["pub fn f() -> Int { 1 }"], [], "arm64_apple", false, fp1)
+  let k2 = @core.cas_compute_key("p", ["a.m2"], ["pub fn f() -> Int { 1 }"], [], "arm64_apple", false, fp2)
+  assert_not_eq(k1, k2)
+  let u1 = @core.cas_compute_unit_key("p", 0, "a.m2", "h1", "s1", "arm64_apple", false, fp1)
+  let u2 = @core.cas_compute_unit_key("p", 0, "a.m2", "h1", "s1", "arm64_apple", false, fp3)
+  assert_not_eq(u1, u2)
+}
+
+///|
+test "p6b_multi_pkg_qbe_mangling_and_test_runner_emit" {
+  let math_src =
+    #|pub let BASE : Int = 10
+    #|pub fn add(a : Int, b : Int) -> Int { a + b + BASE }
+  let math_cr = @core.check_source_files_with_imports("math", ["math.m2"], [math_src], [], true)
+  assert_eq(math_cr.diagnostics.length(), 0)
+  let math_qbe = @core.emit_qbe_package_multi(math_cr.pkg, math_cr.tc, false, false, [])
+  assert_eq(math_qbe.ssa.contains("export function w $m2_pkg_math_fn_add("), true)
+  assert_eq(math_qbe.ssa.contains("export function $m2_pkg_math_init_consts()"), true)
+  assert_eq(math_qbe.ssa.contains("export data $m2_pkg_math_const_BASE"), true)
+  assert_eq(math_qbe.has_main, false)
+
+  let app_src =
+    #|import "math"
+    #|pub fn main() -> Int { math::add(1, 2) }
+    #|test "adds" { debug_assert(math::add(1, 2) == 13, "sum") }
+  let imported = [@core.imported_pkg_new("math", math_cr.tc)]
+  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_src], imported, true)
+  assert_eq(app_cr.diagnostics.length(), 0)
+  let build_qbe = @core.emit_qbe_package_multi(app_cr.pkg, app_cr.tc, true, true, ["math"])
+  assert_eq(build_qbe.ssa.contains("call $m2_pkg_math_init_consts()"), true)
+  assert_eq(build_qbe.ssa.contains("call $m2_pkg_math_fn_add("), true)
+  assert_eq(build_qbe.ssa.contains("m2_test_fn_0"), false)
+
+  let test_qbe = @core.emit_qbe_test_package(app_cr.pkg, app_cr.tc, ["math"])
+  assert_eq(test_qbe.test_names.length(), 1)
+  assert_eq(test_qbe.test_names[0], "adds")
+  assert_eq(test_qbe.ssa.contains("function $m2_test_fn_0()"), true)
+  assert_eq(test_qbe.ssa.contains("m2_debug_assert"), true)
+  let rep = @core.format_test_report_json(["a", "b"], [true, false])
+  assert_eq(rep, "{\"ok\":false,\"passed\":1,\"failed\":1,\"tests\":[{\"name\":\"a\",\"ok\":true},{\"name\":\"b\",\"ok\":false}]}")
+}
