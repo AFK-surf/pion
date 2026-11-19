@@ -287,3 +287,20 @@ emitdbgloc(uint line, uint col, FILE *f)
 	else
 		fprintf(f, "\t.loc %u %u\n", curfile, line);
 }
+
+void
+emit_reset(void)
+{
+	Asmbits *b;
+
+	while ((b = stash)) {
+		stash = b->link;
+		free(b);
+	}
+	if (file) {
+		vfree(file);
+		file = 0;
+	}
+	nfile = 0;
+	curfile = 0;
+}

@@ -484,6 +484,7 @@ void die_(char *, char *, ...) __attribute__((noreturn));
 void *emalloc(size_t);
 void *alloc(size_t);
 void freeall(void);
+void util_reset(void);
 void *vnew(ulong, size_t, Pool);
 void vfree(void *);
 void vgrow(void *, ulong);
@@ -626,10 +627,14 @@ void emitdbgfile(char *, FILE *);
 void emitdbgloc(uint, uint, FILE *);
 int stashbits(bits, int);
 void iterstash(void (*)(int, bits, int, void *), void *);
+void emit_reset(void);
 void elf_emitfnfin(char *, FILE *);
 void elf_emitfin(FILE *);
 void macho_emitfin(FILE *);
 void pe_emitfin(FILE *);
+
+/* arm64/isel.c */
+void arm64_hoist_consts(Fn *);
 
 /* arm64/macho.c */
 void arm64_macho_begin(uint32_t macos_ver);

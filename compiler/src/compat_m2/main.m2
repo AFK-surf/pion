@@ -553,6 +553,30 @@ fn drv_cas_record_and_evict(
 }
 
 ///|
+fn drv_split_lines(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut cur = StringBuilder()
+  let mut has_any = false
+  let mut i = 0
+  while i < s.length() {
+    let c = str_code_at(s, i)
+    if c == 10 {
+      out.push(cur.to_string())
+      cur = StringBuilder()
+      has_any = false
+    } else {
+      cur.write_char(c.unsafe_to_char())
+      has_any = true
+    }
+    i = i + 1
+  }
+  if has_any {
+    out.push(cur.to_string())
+  }
+  out
+}
+
+///|
 fn drv_build_targets(
   world : World,
   targets : Array[String],
@@ -820,9 +844,9 @@ fn drv_build_targets(
       }
     }
 
-    // Compile missed units (qbe --obj or qbe + cc1as/as) in parallel across up to `jobs` OS threads
+    // Compile missed units (qbe --obj / --obj-batch or qbe + cc1as/as) in parallel across up to `jobs` OS threads
     let n_miss = miss_indices.length()
-    if n_miss == 1 || (n_miss > 1 && jobs <= 1) {
+    if n_miss == 1 || (n_miss > 1 && !direct_obj && jobs <= 1) {
       let stamp = clock_now_ms(world).to_string()
       let mut mi = 0
       while mi < n_miss {
@@ -864,6 +888,111 @@ fn drv_build_targets(
           let _ = fs_rename(world, u_tmp, u_obj)
         }
         mi = mi + 1
+      }
+    } else if n_miss > 1 && direct_obj {
+      let nw = if jobs <= 1 {
+        1
+      } else if n_miss < jobs {
+        n_miss
+      } else {
+        jobs
+      }
+      let stamp_base = clock_now_ms(world).to_string()
+      if nw == 1 {
+        let argv : Array[String] = [qbe_bin, "-t", qbe_target, "--obj-batch", "--macos-ver", qbe_macos_ver]
+        let tmps : Array[String] = []
+        let objs : Array[String] = []
+        let mut mi = 0
+        while mi < n_miss {
+          let idx = miss_indices[mi]
+          let ukey = unit_keys[idx]
+          let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+          let u_obj = obj_paths[idx]
+          let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+          argv.push(u_ssa)
+          argv.push(u_tmp)
+          tmps.push(u_tmp)
+          objs.push(u_obj)
+          mi = mi + 1
+        }
+        let rc_qbe = proc_exec(world, argv)
+        if rc_qbe != 0 {
+          let mut j = 0
+          while j < tmps.length() {
+            let _ = fs_remove(world, tmps[j])
+            j = j + 1
+          }
+          return Err("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+        }
+        let mut j = 0
+        while j < tmps.length() {
+          let _ = fs_rename(world, tmps[j], objs[j])
+          j = j + 1
+        }
+      } else {
+        let err_ch : Channel[String] = Channel::new(nw + 1)
+        let qmv = qbe_macos_ver
+        let qb = qbe_bin
+        let qt = qbe_target
+        scope(world, fn(s : Scope) -> Unit {
+          let mut wi = 0
+          while wi < nw {
+            let start = wi * n_miss / nw
+            let end = (wi + 1) * n_miss / nw
+            let spec_sb = StringBuilder()
+            let mut k = start
+            while k < end {
+              let idx = miss_indices[k]
+              let ukey = unit_keys[idx]
+              let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+              let u_obj = obj_paths[idx]
+              let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+              spec_sb.write_string(u_ssa)
+              spec_sb.write_char('\n')
+              spec_sb.write_string(u_tmp)
+              spec_sb.write_char('\n')
+              spec_sb.write_string(u_obj)
+              spec_sb.write_char('\n')
+              k = k + 1
+            }
+            let spec = spec_sb.to_string()
+            spawn(s, fn() -> Unit {
+              let lines = drv_split_lines(spec)
+              let argv : Array[String] = [qb, "-t", qt, "--obj-batch", "--macos-ver", qmv]
+              let tmps : Array[String] = []
+              let objs : Array[String] = []
+              let mut li = 0
+              while li + 2 < lines.length() {
+                argv.push(lines[li])
+                argv.push(lines[li + 1])
+                tmps.push(lines[li + 1])
+                objs.push(lines[li + 2])
+                li = li + 3
+              }
+              let rc_qbe = proc_exec(argv)
+              if rc_qbe != 0 {
+                let mut j = 0
+                while j < tmps.length() {
+                  let _ = fs_remove(tmps[j])
+                  j = j + 1
+                }
+                let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+              } else {
+                let mut j = 0
+                while j < tmps.length() {
+                  let _ = fs_rename(tmps[j], objs[j])
+                  j = j + 1
+                }
+              }
+            })
+            wi = wi + 1
+          }
+        })
+        err_ch.close()
+        match err_ch.recv() {
+          Some(err_msg) => return Err(err_msg)
+          None => ()
+        }
       }
     } else if n_miss > 1 {
       let mut base = 0

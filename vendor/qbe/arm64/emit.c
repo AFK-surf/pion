@@ -274,19 +274,29 @@ emitf(char *s, Ins *i, E *e)
 							rname(m->base.val, Kl),
 							m->offset.bits.i);
 				} else {
+					int sxtw = m->scale < 0;
+					int sc = sxtw ? -m->scale : m->scale;
 					int sh = 0;
 					assert(isreg(m->index));
-					if (m->scale == 2)
+					if (sc == 2)
 						sh = 1;
-					else if (m->scale == 4)
+					else if (sc == 4)
 						sh = 2;
-					else if (m->scale == 8)
+					else if (sc == 8)
 						sh = 3;
 					else
-						assert(m->scale <= 1);
+						assert(sc <= 1);
 					fprintf(e->f, "[%s, ",
 						rname(m->base.val, Kl));
-					if (sh)
+					if (sxtw) {
+						if (sh)
+							fprintf(e->f, "%s, sxtw #%d]",
+								rname(m->index.val, Kw),
+								sh);
+						else
+							fprintf(e->f, "%s, sxtw]",
+								rname(m->index.val, Kw));
+					} else if (sh)
 						fprintf(e->f, "%s, lsl #%d]",
 							rname(m->index.val, Kl),
 							sh);

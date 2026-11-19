@@ -958,9 +958,14 @@ me_emit_mem(uint32_t imm_base_op, uint32_t reg_base_op, uint32_t rt, int sz, Ref
 			uint32_t imm12 = (uint32_t)(off / sz);
 			emit_u32(imm_base_op | (imm12 << 10) | (rn << 5) | rt);
 		} else {
+			int sxtw = m->scale < 0;
+			int sc = sxtw ? -m->scale : m->scale;
 			uint32_t rm = greg(m->index.val);
-			uint32_t S = (m->scale > 1) ? 1u : 0u;
-			emit_u32(reg_base_op | (rm << 16) | (S << 12) | (rn << 5) | rt);
+			uint32_t S = (sc > 1) ? 1u : 0u;
+			uint32_t op = reg_base_op;
+			if (sxtw)
+				op = (op & ~(7u << 13)) | (6u << 13);
+			emit_u32(op | (rm << 16) | (S << 12) | (rn << 5) | rt);
 		}
 		break;
 	}
@@ -2017,5 +2022,8 @@ arm64_macho_finish(FILE *outf)
 		free(M.syms[i].name);
 	free(M.syms);
 	free(M.sym_ht);
+	free(M.dat_name);
+	free(M.dat_sec_str);
+	free(M.dat_secf_str);
 	memset(&M, 0, sizeof M);
 }

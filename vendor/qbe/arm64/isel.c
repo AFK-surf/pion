@@ -263,10 +263,19 @@ iskltmp(Ref r, Fn *fn)
 }
 
 static int
+iskwtmp(Ref r, Fn *fn)
+{
+	return rtype(r) == RTmp
+		&& !isreg(r)
+		&& fn->tmp[r.val].slot == -1
+		&& fn->tmp[r.val].cls == Kw;
+}
+
+static int
 seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 {
 	Ref addr, a0, a1, base, rhs, idx;
-	Ins *def, *shl;
+	Ins *def, *shl, *ext;
 	Con *c;
 	Mem *m;
 	int64_t off, s;
@@ -333,6 +342,38 @@ seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 		s = c->bits.i;
 		if (s < 0 || s > 3 || (1 << s) != sz)
 			continue;
+		ext = blkdef(b, shl, idx, fn);
+		if (ext && ext->op == Oextsw && iskwtmp(ext->arg[0], fn)) {
+			vgrow(&fn->mem, ++fn->nmem);
+			m = &fn->mem[fn->nmem - 1];
+			memset(m, 0, sizeof *m);
+			m->offset.type = CBits;
+			m->offset.bits.i = 0;
+			m->base = base;
+			m->index = ext->arg[0];
+			m->scale = -sz;
+			fixarg(&m->base, Kl, 0, fn);
+			fixarg(&m->index, Kw, 0, fn);
+			chuse(addr, -1, fn);
+			chuse(m->base, +1, fn);
+			chuse(m->index, +1, fn);
+			if (fn->tmp[addr.val].nuse == 0) {
+				chuse(def->arg[0], -1, fn);
+				chuse(def->arg[1], -1, fn);
+				*def = (Ins){.op = Onop};
+				if (fn->tmp[rhs.val].nuse == 0) {
+					chuse(shl->arg[0], -1, fn);
+					chuse(shl->arg[1], -1, fn);
+					*shl = (Ins){.op = Onop};
+					if (fn->tmp[idx.val].nuse == 0) {
+						chuse(ext->arg[0], -1, fn);
+						*ext = (Ins){.op = Onop};
+					}
+				}
+			}
+			*pr = MEM(fn->nmem - 1);
+			return 1;
+		}
 		vgrow(&fn->mem, ++fn->nmem);
 		m = &fn->mem[fn->nmem - 1];
 		memset(m, 0, sizeof *m);
@@ -369,14 +410,33 @@ seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 		m->base = a0;
 		m->index = a1;
 		m->scale = 1;
+		ext = 0;
+		idx = R;
+		if ((ext = blkdef(b, def, a1, fn)) && ext->op == Oextsw && iskwtmp(ext->arg[0], fn)) {
+			m->base = a0;
+			m->index = ext->arg[0];
+			m->scale = -1;
+			idx = a1;
+		} else if ((ext = blkdef(b, def, a0, fn)) && ext->op == Oextsw && iskwtmp(ext->arg[0], fn)) {
+			m->base = a1;
+			m->index = ext->arg[0];
+			m->scale = -1;
+			idx = a0;
+		} else {
+			ext = 0;
+		}
 		fixarg(&m->base, Kl, 0, fn);
-		fixarg(&m->index, Kl, 0, fn);
+		fixarg(&m->index, m->scale < 0 ? Kw : Kl, 0, fn);
 		chuse(addr, -1, fn);
 		chuse(m->base, +1, fn);
 		chuse(m->index, +1, fn);
 		chuse(def->arg[0], -1, fn);
 		chuse(def->arg[1], -1, fn);
 		*def = (Ins){.op = Onop};
+		if (ext && fn->tmp[idx.val].nuse == 0) {
+			chuse(ext->arg[0], -1, fn);
+			*ext = (Ins){.op = Onop};
+		}
 		*pr = MEM(fn->nmem - 1);
 		return 1;
 	}
@@ -578,5 +638,80 @@ arm64_isel(Fn *fn)
 	if (debug['I']) {
 		fprintf(stderr, "\n> After instruction selection:\n");
 		printfn(fn, stderr);
+	}
+}
+
+void
+arm64_hoist_consts(Fn *fn)
+{
+	Blk *b, *d, *p;
+	Ins *i, ins;
+	Con *c;
+	uint *nhoist;
+	uint k, pos, bestloop;
+
+	if (fn->nblk == 0)
+		return;
+	nhoist = alloc(fn->nblk * sizeof *nhoist);
+	for (b = fn->start; b; b = b->link) {
+		if (b->loop <= 1)
+			continue;
+		for (k = 0; k < b->nins; k++) {
+			i = &b->ins[k];
+			if (i->op != Ocopy || KBASE(i->cls) != 1)
+				continue;
+			if (rtype(i->arg[0]) != RCon)
+				continue;
+			if (rtype(i->to) != RTmp || isreg(i->to))
+				continue;
+			if (fn->tmp[i->to.val].slot != -1 || fn->tmp[i->to.val].ndef != 1)
+				continue;
+			c = &fn->con[i->arg[0].val];
+			if (c->type != CBits)
+				continue;
+
+			d = 0;
+			bestloop = (uint)b->loop;
+			for (p = b->idom; p; p = p->idom) {
+				if ((uint)p->loop < bestloop) {
+					bestloop = (uint)p->loop;
+					d = p;
+					if (bestloop == 1)
+						break;
+				}
+			}
+			if (!d || nhoist[d->id] >= 6)
+				continue;
+
+			ins = *i;
+			pos = d->nins;
+			while (pos > 0) {
+				int op = d->ins[pos - 1].op;
+				if (op == Oacmp || op == Oacmn || op == Oafcmp
+				 || INRANGE(op, Oflag, Oflag1))
+					pos--;
+				else
+					break;
+			}
+			vgrow(&d->ins, d->nins + 1);
+			if (pos < d->nins)
+				memmove(&d->ins[pos + 1], &d->ins[pos],
+					(d->nins - pos) * sizeof(Ins));
+			d->ins[pos] = ins;
+			d->nins++;
+			nhoist[d->id]++;
+			fn->tmp[ins.to.val].bid = d->id;
+			fn->tmp[ins.to.val].def = &d->ins[pos];
+			b->ins[k] = (Ins){.op = Onop};
+		}
+	}
+	for (b = fn->start; b; b = b->link) {
+		if (!nhoist[b->id])
+			continue;
+		for (k = 0; k < b->nins; k++) {
+			Ref to = b->ins[k].to;
+			if (rtype(to) == RTmp && !isreg(to) && fn->tmp[to.val].ndef == 1)
+				fn->tmp[to.val].def = &b->ins[k];
+		}
 	}
 }
