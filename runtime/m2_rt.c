@@ -984,6 +984,15 @@ void *m2_world_args(void *w_ptr) {
     return arr;
 }
 
+void m2_world_print(void *w_ptr, void *s_ptr) {
+    (void)w_ptr;
+    M2String *s = (M2String *)s_ptr;
+    if (s && s->len > 0) {
+        fwrite(s->data, 1, (size_t)s->len, stdout);
+    }
+    fflush(stdout);
+}
+
 void m2_world_println(void *w_ptr, void *s_ptr) {
     (void)w_ptr;
     M2String *s = (M2String *)s_ptr;
@@ -1065,6 +1074,15 @@ int32_t m2_world_fs_exists(void *w_ptr, void *path_str) {
     M2String *path = (M2String *)path_str;
     if (!path) return 0;
     return access(path->data, F_OK) == 0 ? 1 : 0;
+}
+
+int32_t m2_world_fs_is_dir(void *w_ptr, void *path_str) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    if (!path || path->len == 0) return 0;
+    struct stat st;
+    if (stat(path->data, &st) != 0) return 0;
+    return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 
 int32_t m2_world_fs_mkdir_p(void *w_ptr, void *path_str) {

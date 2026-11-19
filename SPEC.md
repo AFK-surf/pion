@@ -229,11 +229,13 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `int64_t m2_world_argc(void *w);`
 - `void*   m2_world_argv(void *w, int64_t idx);`
 - `void*   m2_world_args(void *w);`
+- `void    m2_world_print(void *w, void *s);`
 - `void    m2_world_println(void *w, void *s);`
 - `void    m2_world_eprintln(void *w, void *s);`
 - `void*   m2_world_fs_read(void *w, void *path_str, int32_t *ok_out);`
 - `int32_t m2_world_fs_write(void *w, void *path_str, void *content_str);`
 - `int32_t m2_world_fs_exists(void *w, void *path_str);`
+- `int32_t m2_world_fs_is_dir(void *w, void *path_str);`
 - `int32_t m2_world_fs_mkdir_p(void *w, void *path_str);`
 - `void*   m2_world_fs_list_dir(void *w, void *path_str);` (MUST return entries sorted lexicographically for deterministic builds!)
 - `int32_t m2_world_fs_remove(void *w, void *path_str);` (for CAS LRU eviction; returns 1 on success)

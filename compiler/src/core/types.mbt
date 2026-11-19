@@ -789,11 +789,13 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
 
 ///|
 fn is_world_builtin(name : String) -> Bool {
+  name == "io_print" ||
   name == "io_println" ||
   name == "io_eprintln" ||
   name == "fs_read" ||
   name == "fs_write" ||
   name == "fs_exists" ||
+  name == "fs_is_dir" ||
   name == "fs_mkdir_p" ||
   name == "fs_list_dir" ||
   name == "fs_remove" ||
@@ -803,6 +805,7 @@ fn is_world_builtin(name : String) -> Bool {
   name == "proc_exec" ||
   name == "env_get" ||
   name == "args_get" ||
+  name == "world_args" ||
   name == "world_argc" ||
   name == "world_argv"
 }
@@ -840,7 +843,7 @@ fn check_world_builtin_call(
     )
   }
   let offset = if has_world_arg { 1 } else { 0 }
-  if name == "io_println" || name == "io_eprintln" {
+  if name == "io_print" || name == "io_println" || name == "io_eprintln" {
     if arg_tys.length() > offset && !ty_compat(TString, arg_tys[offset]) {
       tc_err(
         tc,
@@ -857,11 +860,11 @@ fn check_world_builtin_call(
     TResult(TString, TString)
   } else if name == "fs_write" {
     TResult(TUnit, TString)
-  } else if name == "fs_exists" || name == "fs_mkdir_p" || name == "fs_remove" || name == "fs_rename" {
+  } else if name == "fs_exists" || name == "fs_is_dir" || name == "fs_mkdir_p" || name == "fs_remove" || name == "fs_rename" {
     TBool
   } else if name == "fs_size" {
     TInt64
-  } else if name == "fs_list_dir" || name == "args_get" {
+  } else if name == "fs_list_dir" || name == "args_get" || name == "world_args" {
     TArray(TString)
   } else if name == "clock_now_ms" {
     TInt64
