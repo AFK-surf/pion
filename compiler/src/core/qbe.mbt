@@ -1943,7 +1943,86 @@ fn qbe_emit_expr(
     EAs(inner, target, _) => {
       let v = qbe_emit_expr(g, inner, None)
       let rty = resolve_type_expr(g.tc, target, g.cur_tparams)
-      qval(v.reg, rty)
+      match rty {
+        TDouble =>
+          match v.ty {
+            TInt => {
+              let w = qbe_tmp(g)
+              let d = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, w + " =w copy " + v.reg)
+              qbe_emit(g, d + " =d swtof " + w)
+              qbe_emit(g, r + " =l cast " + d)
+              qval(r, TDouble)
+            }
+            TInt64 | TByte | TChar => {
+              let d = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, d + " =d sltof " + v.reg)
+              qbe_emit(g, r + " =l cast " + d)
+              qval(r, TDouble)
+            }
+            _ => qval(v.reg, TDouble)
+          }
+        TInt =>
+          match v.ty {
+            TDouble => {
+              let d = qbe_tmp(g)
+              let w = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, d + " =d cast " + v.reg)
+              qbe_emit(g, w + " =w dtosi " + d)
+              qbe_emit(g, r + " =l extsw " + w)
+              qval(r, TInt)
+            }
+            TInt64 => {
+              let w = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, w + " =w copy " + v.reg)
+              qbe_emit(g, r + " =l extsw " + w)
+              qval(r, TInt)
+            }
+            _ => qval(v.reg, TInt)
+          }
+        TInt64 =>
+          match v.ty {
+            TDouble => {
+              let d = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, d + " =d cast " + v.reg)
+              qbe_emit(g, r + " =l dtosi " + d)
+              qval(r, TInt64)
+            }
+            TInt => {
+              let w = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, w + " =w copy " + v.reg)
+              qbe_emit(g, r + " =l extsw " + w)
+              qval(r, TInt64)
+            }
+            _ => qval(v.reg, TInt64)
+          }
+        TByte =>
+          match v.ty {
+            TDouble => {
+              let d = qbe_tmp(g)
+              let w = qbe_tmp(g)
+              let u = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, d + " =d cast " + v.reg)
+              qbe_emit(g, w + " =w dtosi " + d)
+              qbe_emit(g, u + " =l extuw " + w)
+              qbe_emit(g, r + " =l and " + u + ", 255")
+              qval(r, TByte)
+            }
+            _ => {
+              let r = qbe_tmp(g)
+              qbe_emit(g, r + " =l and " + v.reg + ", 255")
+              qval(r, TByte)
+            }
+          }
+        _ => qval(v.reg, rty)
+      }
     }
     EUnary(op, inner, _) => {
       let iv = qbe_emit_expr(g, inner, expected)

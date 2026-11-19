@@ -575,6 +575,11 @@ fn drv_usage(world : World) -> Unit {
 ///|
 pub fn main(world : World) -> Int {
   let args = world_args(world)
+  if args.length() >= 2 &&
+    (args[1] == "--version" || args[1] == "-V" || args[1] == "version") {
+    io_println(world, "m2c2 0.1.0 (self-hosted m2 native compiler)")
+    return 0
+  }
   if args.length() < 3 {
     drv_usage(world)
     return 1
