@@ -264,6 +264,36 @@ pub fn cas_compute_key(
 }
 
 ///|
+pub fn cas_compute_unit_key(
+  pkg_name : String,
+  unit_idx : Int,
+  unit_path : String,
+  unit_src_hash : String,
+  sigs_hash : String,
+  target : String,
+  release : Bool,
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string("m2-unit-cas-v1\n")
+  sb.write_string("pkg:")
+  sb.write_string(pkg_name)
+  sb.write_string("\nidx:")
+  sb.write_string(unit_idx.to_string())
+  sb.write_string("\npath:")
+  sb.write_string(unit_path)
+  sb.write_string("\nsigs:")
+  sb.write_string(sigs_hash)
+  sb.write_string("\ntarget:")
+  sb.write_string(target)
+  sb.write_string("\nrelease:")
+  sb.write_string(if release { "1" } else { "0" })
+  sb.write_string("\nsrc:")
+  sb.write_string(unit_src_hash)
+  sb.write_string("\n")
+  cas_sha256_hex(sb.to_string())
+}
+
+///|
 fn parse_int64_dec(s : String) -> Int64 {
   let len = s.length()
   if len == 0 {

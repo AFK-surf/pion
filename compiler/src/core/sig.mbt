@@ -239,6 +239,56 @@ pub fn emit_m2sig(pkg : Package) -> String {
 }
 
 ///|
+/// Extract all declarations (pub and package-private signatures, no function bodies)
+/// for sound unit-level incremental CAS invalidation across files in a package.
+pub fn emit_all_sigs(pkg : Package) -> String {
+  let entries : Array[SigEntry] = []
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DStruct(sd) =>
+          entries.push(SigEntry::{
+            kind: "struct",
+            name: sd.name,
+            signature: format_struct_sig(sd),
+          })
+        DEnum(ed) =>
+          entries.push(SigEntry::{
+            kind: "enum",
+            name: ed.name,
+            signature: format_enum_sig(ed),
+          })
+        DFn(fd) => {
+          let full_name = if fd.receiver_type != "" {
+            fd.receiver_type + "::" + fd.name
+          } else {
+            fd.name
+          }
+          entries.push(SigEntry::{
+            kind: "fn",
+            name: full_name,
+            signature: format_fn_sig(fd),
+          })
+        }
+        DConst(cd) =>
+          entries.push(SigEntry::{
+            kind: "const",
+            name: cd.name,
+            signature: format_const_sig(cd),
+          })
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  sort_sig_entries(entries)
+  serialize_m2sig(PackageSig::{ pkg: pkg.name, entries: entries })
+}
+
+///|
 fn split_lines(s : String) -> Array[String] {
   let out : Array[String] = []
   let len = s.length()
