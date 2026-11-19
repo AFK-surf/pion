@@ -40,7 +40,7 @@ To achieve **zero-rewrite Stage 0 → Stage 1 → Stage 2 fixed-point self-hosti
 
 ```
 compiler/
-  moon.mod.json            # Stage 0 MoonBit module definition
+  moon.mod                 # Stage 0 MoonBit module definition (moon 0.1.20261117+)
   src/
     core/                  # PURE m2 ∩ MoonBit compiler core (shared by Stage 0 & Stage 1!)
       lexer.mbt
@@ -183,6 +183,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void  m2_strbuf_push_str(void *sb, void *s);`
 - `void  m2_strbuf_push_byte(void *sb, int32_t b);`
 - `void  m2_strbuf_push_int(void *sb, int64_t v);`
+- `void  m2_strbuf_reset(void *sb);`
 - `void* m2_strbuf_to_str(void *sb);`
 
 **Array (`M2Array`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int64_t *data; }` — uniform 64-bit slots!):**
@@ -192,6 +193,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `int64_t m2_arr_get(void *a, int64_t idx);` (bounds-checked!)
 - `void    m2_arr_set(void *a, int64_t idx, int64_t val);` (bounds-checked; retains new, releases old if `elem_is_obj`)
 - `int64_t m2_arr_pop(void *a);`
+- `void*   m2_arr_copy(void *a);`
 
 **String-Keyed Hash Map (`M2Map` — open addressing FNV-1a, 64-bit value slots):**
 - `void*   m2_map_new(int32_t val_is_obj);`
@@ -199,6 +201,8 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void    m2_map_set(void *m, void *key_str, int64_t val);`
 - `int32_t m2_map_has(void *m, void *key_str);`
 - `int64_t m2_map_get(void *m, void *key_str);` (panics if missing; compiler pairs with `has` or returns Option)
+- `void    m2_map_remove(void *m, void *key_str);`
+- `void*   m2_map_copy(void *m);`
 - `void*   m2_map_keys(void *m);` (returns `M2Array` of `M2String*`)
 
 **Concurrency (`pthread` backed, race-free):**
