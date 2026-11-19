@@ -188,3 +188,110 @@ test "qbe_map_try_get_match_fusion_and_alloc_uninit" {
   assert_eq(lookup_part.contains("m2_rc_inc"), false)
   assert_eq(lookup_part.contains("m2_rc_dec"), false)
 }
+
+///|
+test "qbe_p4b_int32_w_regs_and_double_mul2_add" {
+  let src =
+    #|pub fn sum_int(n : Int) -> Int {
+    #|  let mut acc = 0
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    acc = acc + (i * 3 - 1)
+    #|    i = i + 1
+    #|  }
+    #|  acc
+    #|}
+    #|pub fn double_two(x : Double, y : Double) -> Double {
+    #|  2.0 * x + y * 2.0
+    #|}
+  let pkg = @core.parse_package("test", ["p4b.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  // Native 32-bit w ABI & local slots, zero extsw in pure Int arithmetic/loops
+  assert_eq(res.ssa.contains("function w $m2_fn_sum_int(w %p0)"), true)
+  assert_eq(res.ssa.contains("alloc4 4"), true)
+  assert_eq(res.ssa.contains("storew "), true)
+  assert_eq(res.ssa.contains("=w loadsw "), true)
+  assert_eq(res.ssa.contains("extsw"), false)
+  // IEEE-754 exact `2.0 * x -> x + x` and `y * 2.0 -> y + y`
+  let fn_dbl = match res.ssa.find("$m2_fn_double_two") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => res.ssa
+  }
+  assert_eq(fn_dbl.contains("=d mul "), false)
+  assert_eq(fn_dbl.contains("=d add "), true)
+}
+
+///|
+test "qbe_p4b_loop_invariant_readonly_struct_field_hoist" {
+  let src =
+    #|pub struct Body {
+    #|  mut x : Double
+    #|  mut vx : Double
+    #|  mass : Double
+    #|}
+    #|pub fn advance_like(bodies : Array[Body], dt : Double) -> Unit {
+    #|  let n = bodies.length()
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    let b = bodies[i]
+    #|    let mut j = i + 1
+    #|    while j < n {
+    #|      let b2 = bodies[j]
+    #|      let dx = b.x - b2.x
+    #|      let d = math_sqrt(dx * dx)
+    #|      let mag = dt / d
+    #|      b.vx = b.vx - dx * b2.mass * mag
+    #|      b2.vx = b2.vx + dx * b.mass * mag
+    #|      j = j + 1
+    #|    }
+    #|    i = i + 1
+    #|  }
+    #|}
+  let pkg = @core.parse_package("test", ["hoist.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  // Locate the inner loop (@wh_c_...) and verify b.x / b.mass are loaded before it,
+  // while inside the inner loop body we still load b2.x, b2.mass, b.vx, b2.vx (4 loadd total, not 6)
+  let fn_adv = match res.ssa.find("$m2_fn_advance_like") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => res.ssa
+  }
+  let first_wh = match fn_adv.find("\n@wh_c_") {
+    Some(idx) => idx
+    None => 0
+  }
+  let after_first = fn_adv.clamped_view(start=first_wh + 7).to_owned()
+  let second_wh = match after_first.find("\n@wh_c_") {
+    Some(idx) => idx
+    None => 0
+  }
+  let pre_inner = after_first.clamped_view(end=second_wh).to_owned()
+  let inner_body = after_first.clamped_view(start=second_wh).to_owned()
+  // Both b.x and b.mass must be hoisted into pre_inner (exactly 2 `=d loadd ` before inner @wh_c)
+  let mut pre_loads = 0
+  let mut ppos = 0
+  while ppos < pre_inner.length() {
+    let tail = pre_inner.clamped_view(start=ppos).to_owned()
+    match tail.find("=d loadd ") {
+      Some(off) => {
+        pre_loads = pre_loads + 1
+        ppos = ppos + off + 9
+      }
+      None => break
+    }
+  }
+  assert_eq(pre_loads, 2)
+  // Inside inner_body: 4 struct field loads (b2.x, b.vx, b2.mass, b2.vx) + 8 local double loads (dx x4, dt, d, mag x2) = 12 (not 14)
+  let mut loads = 0
+  let mut pos = 0
+  while pos < inner_body.length() {
+    let tail = inner_body.clamped_view(start=pos).to_owned()
+    match tail.find("=d loadd ") {
+      Some(off) => {
+        loads = loads + 1
+        pos = pos + off + 9
+      }
+      None => break
+    }
+  }
+  assert_eq(loads, 12)
+}
