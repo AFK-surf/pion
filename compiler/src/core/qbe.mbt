@@ -622,7 +622,11 @@ fn qbe_emit_world_builtin(
   let off = if has_w { 1 } else { 0 }
   let mut res = "0"
   let mut rty = TUnit
-  if name == "io_println" {
+  if name == "io_print" {
+    let s = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    qbe_emit(g, "call $m2_world_print(l " + w_val + ", l " + s + ")")
+    rty = TUnit
+  } else if name == "io_println" {
     let s = if arg_vals.length() > off { arg_vals[off] } else { "0" }
     qbe_emit(g, "call $m2_world_println(l " + w_val + ", l " + s + ")")
     rty = TUnit
@@ -699,6 +703,13 @@ fn qbe_emit_world_builtin(
     res = qbe_tmp(g)
     qbe_emit(g, res + " =l extuw " + rw)
     rty = TBool
+  } else if name == "fs_is_dir" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let rw = qbe_tmp(g)
+    qbe_emit(g, rw + " =w call $m2_world_fs_is_dir(l " + w_val + ", l " + p + ")")
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l extuw " + rw)
+    rty = TBool
   } else if name == "fs_mkdir_p" {
     let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
     let rw = qbe_tmp(g)
@@ -741,7 +752,7 @@ fn qbe_emit_world_builtin(
     res = qbe_tmp(g)
     qbe_emit(g, res + " =l call $m2_world_fs_list_dir(l " + w_val + ", l " + p + ")")
     rty = TArray(TString)
-  } else if name == "args_get" {
+  } else if name == "args_get" || name == "world_args" {
     res = qbe_tmp(g)
     qbe_emit(g, res + " =l call $m2_world_args(l " + w_val + ")")
     rty = TArray(TString)

@@ -320,29 +320,65 @@ fn resolve_qbe_target() -> String {
 }
 
 ///|
-fn load_target(target : String) -> Result[(String, Array[String], Array[String]), String] {
-  let target_b = str_to_utf8(target)
-  if m2_host_file_exists(target_b) == 0 {
-    return Err("path does not exist: " + target)
+fn parent_dir(path : String) -> String {
+  let mut idx = path.length() - 1
+  while idx >= 0 && path[idx].to_int() != 47 {
+    idx = idx - 1
   }
-  let pkg_name = basename_pkg(target)
+  if idx <= 0 {
+    return ""
+  }
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < idx {
+    sb.write_char(path[i].to_int().unsafe_to_char())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ensure_parent_dir(path : String) -> Unit {
+  let dir = parent_dir(path)
+  if dir.length() > 0 {
+    let _ = m2_host_mkdir_p(str_to_utf8(dir))
+  }
+}
+
+///|
+fn load_targets(
+  targets : Array[String],
+) -> Result[(String, Array[String], Array[String]), String] {
+  if targets.length() == 0 {
+    return Err("no input files specified")
+  }
+  let pkg_name = basename_pkg(targets[0])
   let paths : Array[String] = []
   let sources : Array[String] = []
-  if m2_host_is_dir(target_b) != 0 {
-    let listing = utf8_to_str(m2_host_list_sources(target_b))
-    let files = split_nonempty_lines(listing)
-    let mut i = 0
-    while i < files.length() {
-      let fpath = files[i]
-      let content = utf8_to_str(m2_host_read_file(str_to_utf8(fpath)))
-      paths.push(fpath)
-      sources.push(content)
-      i = i + 1
+  let mut t = 0
+  while t < targets.length() {
+    let target = targets[t]
+    let target_b = str_to_utf8(target)
+    if m2_host_file_exists(target_b) == 0 {
+      return Err("path does not exist: " + target)
     }
-  } else {
-    let content = utf8_to_str(m2_host_read_file(target_b))
-    paths.push(target)
-    sources.push(content)
+    if m2_host_is_dir(target_b) != 0 {
+      let listing = utf8_to_str(m2_host_list_sources(target_b))
+      let files = split_nonempty_lines(listing)
+      let mut i = 0
+      while i < files.length() {
+        let fpath = files[i]
+        let content = utf8_to_str(m2_host_read_file(str_to_utf8(fpath)))
+        paths.push(fpath)
+        sources.push(content)
+        i = i + 1
+      }
+    } else {
+      let content = utf8_to_str(m2_host_read_file(target_b))
+      paths.push(target)
+      sources.push(content)
+    }
+    t = t + 1
   }
   Ok((pkg_name, paths, sources))
 }
@@ -374,13 +410,14 @@ fn cas_record_and_evict(
 }
 
 ///|
-fn build_target(
-  target : String,
+fn build_targets(
+  targets : Array[String],
   release : Bool,
   emit_ssa_path : String,
+  emit_asm_path : String,
   out_bin_arg : String,
 ) -> Result[String, String] {
-  let loaded = match load_target(target) {
+  let loaded = match load_targets(targets) {
     Err(msg) => return Err(msg)
     Ok(v) => v
   }
@@ -393,6 +430,7 @@ fn build_target(
   let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
 
   let qbe_target = resolve_qbe_target()
+  let qbe_bin = resolve_qbe_bin()
   let key = @core.cas_compute_key(pkg_name, paths, sources, [], qbe_target, release)
   let sig_path = cache_dir + "/sig/" + key + ".m2sig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
@@ -405,9 +443,17 @@ fn build_target(
 
   if cache_hit {
     if emit_ssa_path != "" {
+      ensure_parent_dir(emit_ssa_path)
       let ssa_cached = read_text(ssa_path)
       if !write_text_atomic(emit_ssa_path, ssa_cached) {
         return Err("failed to write --emit-ssa file: " + emit_ssa_path)
+      }
+    }
+    if emit_asm_path != "" {
+      ensure_parent_dir(emit_asm_path)
+      let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", emit_asm_path, ssa_path])
+      if rc_qbe != 0 {
+        return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path)
       }
     }
     let sz_sig = m2_host_file_size(str_to_utf8(sig_path))
@@ -421,8 +467,7 @@ fn build_target(
     if out_bin_arg == "" && file_exists(final_bin) {
       return Ok(final_bin)
     }
-    // Check if cached ssa had C main
-    if emit_ssa_path != "" && out_bin_arg == "" {
+    if (emit_ssa_path != "" || emit_asm_path != "") && out_bin_arg == "" {
       return Ok(obj_path)
     }
   } else {
@@ -438,18 +483,26 @@ fn build_target(
       return Err("failed to write CAS ssa: " + ssa_path)
     }
     if emit_ssa_path != "" {
+      ensure_parent_dir(emit_ssa_path)
       if !write_text_atomic(emit_ssa_path, compiled.ssa) {
         return Err("failed to write --emit-ssa file: " + emit_ssa_path)
       }
     }
 
-    let qbe_bin = resolve_qbe_bin()
     let asm_path = cache_dir + "/obj/" + key + ".s." + m2_host_getpid().to_string()
     let obj_tmp = obj_path + ".tmp." + m2_host_getpid().to_string()
     let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
     if rc_qbe != 0 {
       let _ = m2_host_remove(str_to_utf8(asm_path))
       return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path)
+    }
+    if emit_asm_path != "" {
+      ensure_parent_dir(emit_asm_path)
+      let asm_text = read_text(asm_path)
+      if !write_text_atomic(emit_asm_path, asm_text) {
+        let _ = m2_host_remove(str_to_utf8(asm_path))
+        return Err("failed to write --emit-asm file: " + emit_asm_path)
+      }
     }
     let rc_as = exec_argv(["as", "-o", obj_tmp, asm_path])
     let _ = m2_host_remove(str_to_utf8(asm_path))
@@ -472,6 +525,9 @@ fn build_target(
     return Ok(obj_path)
   }
 
+  if out_bin_arg != "" {
+    ensure_parent_dir(out_bin_arg)
+  }
   let rt_lib = resolve_rt_lib()
   let cc = {
     let e = env_str("CC")
@@ -488,11 +544,11 @@ fn build_target(
 fn usage() -> Unit {
   write_err(
     "usage:\n" +
-    "  m2c check [--json] <file_or_dir>\n" +
-    "  m2c query defs|sig|callers|deps [--json] <file_or_dir>\n" +
-    "  m2c emit-sig <file_or_dir>\n" +
-    "  m2c build [--release] [--emit-ssa <path>] [-o <out>] <file_or_dir>\n" +
-    "  m2c run [--release] <file_or_dir> [-- args...]\n",
+    "  m2c check [--json] <input1> [input2 ...]\n" +
+    "  m2c query defs|sig|callers|deps [--json] <input1> [input2 ...]\n" +
+    "  m2c emit-sig <input1> [input2 ...]\n" +
+    "  m2c build [--release] [--emit-ssa <path>] [--emit-asm <path>] [--jobs <n>] [-o <out>] <input1> [input2 ...]\n" +
+    "  m2c run [--release] <input> [-- args...]\n",
   )
 }
 
@@ -506,20 +562,20 @@ fn main {
   }
   let cmd = args[1]
   if cmd == "check" {
-    let mut target = ""
+    let targets : Array[String] = []
     let mut i = 2
     while i < args.length() {
       if args[i] != "--json" {
-        target = args[i]
+        targets.push(args[i])
       }
       i = i + 1
     }
-    if target == "" {
+    if targets.length() == 0 {
       usage()
       m2_host_exit(1)
       return
     }
-    match load_target(target) {
+    match load_targets(targets) {
       Err(msg) => {
         write_err("error: " + msg + "\n")
         m2_host_exit(1)
@@ -539,20 +595,20 @@ fn main {
       return
     }
     let kind = args[2]
-    let mut target = ""
+    let targets : Array[String] = []
     let mut i = 3
     while i < args.length() {
       if args[i] != "--json" {
-        target = args[i]
+        targets.push(args[i])
       }
       i = i + 1
     }
-    if target == "" {
+    if targets.length() == 0 {
       usage()
       m2_host_exit(1)
       return
     }
-    match load_target(target) {
+    match load_targets(targets) {
       Err(msg) => {
         write_err("error: " + msg + "\n")
         m2_host_exit(1)
@@ -567,8 +623,13 @@ fn main {
         }
     }
   } else if cmd == "emit-sig" {
-    let target = args[2]
-    match load_target(target) {
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      targets.push(args[i])
+      i = i + 1
+    }
+    match load_targets(targets) {
       Err(msg) => {
         write_err("error: " + msg + "\n")
         m2_host_exit(1)
@@ -581,8 +642,9 @@ fn main {
   } else if cmd == "build" {
     let mut release = false
     let mut emit_ssa = ""
+    let mut emit_asm = ""
     let mut out_bin = ""
-    let mut target = ""
+    let targets : Array[String] = []
     let mut i = 2
     while i < args.length() {
       let a = args[i]
@@ -591,20 +653,25 @@ fn main {
       } else if a == "--emit-ssa" && i + 1 < args.length() {
         emit_ssa = args[i + 1]
         i = i + 1
+      } else if a == "--emit-asm" && i + 1 < args.length() {
+        emit_asm = args[i + 1]
+        i = i + 1
+      } else if a == "--jobs" && i + 1 < args.length() {
+        i = i + 1
       } else if a == "-o" && i + 1 < args.length() {
         out_bin = args[i + 1]
         i = i + 1
       } else {
-        target = a
+        targets.push(a)
       }
       i = i + 1
     }
-    if target == "" {
+    if targets.length() == 0 {
       usage()
       m2_host_exit(1)
       return
     }
-    match build_target(target, release, emit_ssa, out_bin) {
+    match build_targets(targets, release, emit_ssa, emit_asm, out_bin) {
       Ok(_) => ()
       Err(msg) => {
         write_err(msg + "\n")
@@ -637,7 +704,7 @@ fn main {
       m2_host_exit(1)
       return
     }
-    match build_target(target, release, "", "") {
+    match build_targets([target], release, "", "", "") {
       Err(msg) => {
         write_err(msg + "\n")
         m2_host_exit(1)

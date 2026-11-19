@@ -336,6 +336,8 @@ static void test_world(int argc, char **argv) {
     }
 
     void *entries = m2_world_fs_list_dir(w, dir_s);
+    assert(m2_world_fs_is_dir(w, dir_s) == 1);
+    assert(m2_world_fs_is_dir(w, zeta_s) == 0);
     assert(m2_arr_len(entries) == 4);
     const char *sorted_expected[] = {"alpha.txt", "beta.txt", "mid.txt", "zeta.txt"};
     for (int i = 0; i < 4; i++) {
