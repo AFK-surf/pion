@@ -105,6 +105,8 @@ static struct {
 
 	{ Oexts,    Kd, "cvtss2sd %0, %=" },
 	{ Otruncd,  Ks, "cvtsd2ss %0, %=" },
+	{ Osqrt,    Ks, "sqrtss %0, %=" },
+	{ Osqrt,    Kd, "sqrtsd %0, %=" },
 	{ Ostosi,   Ki, "cvttss2si%k %0, %=" },
 	{ Odtosi,   Ki, "cvttsd2si%k %0, %=" },
 	{ Oswtof,   Ka, "cvtsi2%k %W0, %=" },

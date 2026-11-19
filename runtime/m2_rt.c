@@ -6,6 +6,7 @@
 #include <errno.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <math.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -43,6 +44,12 @@ void m2_panic(const char *msg, const char *file, int32_t line) {
     abort();
 }
 
+void m2_panic_oob(int64_t idx, int64_t len) {
+    fprintf(stderr, "m2 panic: index %" PRId64 " out of bounds (len %" PRId64 ")\n", idx, len);
+    fflush(stderr);
+    abort();
+}
+
 void m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line) {
     if (__builtin_expect(!cond, 0)) {
         const char *msg = msg_str ? ((M2String *)msg_str)->data : "assertion failed";
@@ -50,20 +57,162 @@ void m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line
     }
 }
 
-void *m2_alloc(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn) {
-    size_t total = sizeof(M2Header) + (size_t)payload_size;
-    M2Header *hdr = (M2Header *)malloc(total);
-    if (__builtin_expect(!hdr, 0)) {
-        m2_panic("out of memory", __FILE__, __LINE__);
+double m2_math_sqrt(double x) {
+    return sqrt(x);
+}
+
+#if defined(__SANITIZE_ADDRESS__)
+#define M2_USE_SLAB 0
+#elif defined(__has_feature)
+#if __has_feature(address_sanitizer)
+#define M2_USE_SLAB 0
+#else
+#define M2_USE_SLAB 1
+#endif
+#else
+#define M2_USE_SLAB 1
+#endif
+
+#if M2_USE_SLAB
+
+#define M2_SLAB_CLASSES     7u
+#define M2_SLAB_MAX_TOTAL   256u
+#define M2_SLAB_MAX_PAYLOAD (M2_SLAB_MAX_TOTAL - (uint32_t)sizeof(M2Header))
+#define M2_SLAB_CHUNK_BYTES 65536u
+
+typedef struct M2SlabTLS {
+    void *local_free[M2_SLAB_CLASSES];
+    char *chunk_cur;
+    char *chunk_end;
+} M2SlabTLS;
+
+static const uint16_t m2_slab_sizes[M2_SLAB_CLASSES] = {
+    32u, 48u, 64u, 96u, 128u, 192u, 256u
+};
+
+/* Maps ((total + 15) >> 4) in [2..16] to slab class [0..6] */
+static const uint8_t m2_slab_cls_lut[17] = {
+    0, 0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6
+};
+
+static _Thread_local M2SlabTLS *tls_slab = NULL;
+static _Atomic(void *) g_slab_remote[M2_SLAB_CLASSES];
+static pthread_once_t g_slab_key_once = PTHREAD_ONCE_INIT;
+static pthread_key_t g_slab_key;
+
+/* Strict-aliasing-safe intrusive freelist link (lives at offset 0 of free slot) */
+static inline void *m2_slab_get_next(void *slot) {
+    void *next;
+    memcpy(&next, slot, sizeof(next));
+    return next;
+}
+
+static inline void m2_slab_set_next(void *slot, void *next) {
+    memcpy(slot, &next, sizeof(next));
+}
+
+static void m2_slab_push_remote_list(uint32_t cls, void *head, void *tail) {
+    void *cur = atomic_load_explicit(&g_slab_remote[cls], memory_order_relaxed);
+    do {
+        m2_slab_set_next(tail, cur);
+    } while (!atomic_compare_exchange_weak_explicit(
+        &g_slab_remote[cls], &cur, head,
+        memory_order_release, memory_order_relaxed));
+}
+
+static void m2_slab_thread_cleanup(void *arg) {
+    M2SlabTLS *s = (M2SlabTLS *)arg;
+    if (!s) return;
+    for (uint32_t cls = 0; cls < M2_SLAB_CLASSES; cls++) {
+        void *head = s->local_free[cls];
+        if (!head) continue;
+        s->local_free[cls] = NULL;
+        void *tail = head;
+        void *nxt;
+        while ((nxt = m2_slab_get_next(tail)) != NULL) {
+            tail = nxt;
+        }
+        m2_slab_push_remote_list(cls, head, tail);
+    }
+    free(s);
+}
+
+static void m2_slab_key_init(void) {
+    (void)pthread_key_create(&g_slab_key, m2_slab_thread_cleanup);
+}
+
+static M2Header *m2_slab_alloc_slow(M2SlabTLS *s, uint32_t cls) {
+    if (__builtin_expect(!s, 0)) {
+        s = (M2SlabTLS *)calloc(1, sizeof(M2SlabTLS));
+        if (__builtin_expect(!s, 0)) {
+            m2_panic("out of memory", __FILE__, __LINE__);
+        }
+        pthread_once(&g_slab_key_once, m2_slab_key_init);
+        (void)pthread_setspecific(g_slab_key, s);
+        tls_slab = s;
+    }
+    void *remote = atomic_exchange_explicit(&g_slab_remote[cls], NULL, memory_order_acquire);
+    if (remote) {
+        s->local_free[cls] = m2_slab_get_next(remote);
+        return (M2Header *)remote;
+    }
+    uint32_t slot_sz = m2_slab_sizes[cls];
+    if (__builtin_expect(!s->chunk_cur || (size_t)(s->chunk_end - s->chunk_cur) < slot_sz, 0)) {
+        char *chunk = (char *)malloc(M2_SLAB_CHUNK_BYTES);
+        if (__builtin_expect(!chunk, 0)) {
+            m2_panic("out of memory", __FILE__, __LINE__);
+        }
+        s->chunk_cur = chunk;
+        s->chunk_end = chunk + M2_SLAB_CHUNK_BYTES;
+    }
+    M2Header *hdr = (M2Header *)s->chunk_cur;
+    s->chunk_cur += slot_sz;
+    return hdr;
+}
+
+#endif /* M2_USE_SLAB */
+
+static inline void *m2_alloc_raw(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn) {
+    M2Header *hdr;
+    uint16_t flags = 0;
+#if M2_USE_SLAB
+    if (__builtin_expect(payload_size <= M2_SLAB_MAX_PAYLOAD, 1)) {
+        uint32_t total = (uint32_t)sizeof(M2Header) + payload_size;
+        uint32_t cls = m2_slab_cls_lut[(total + 15u) >> 4];
+        M2SlabTLS *s = tls_slab;
+        if (__builtin_expect(s != NULL, 1)) {
+            void *node = s->local_free[cls];
+            if (__builtin_expect(node != NULL, 1)) {
+                s->local_free[cls] = m2_slab_get_next(node);
+                hdr = (M2Header *)node;
+            } else {
+                hdr = m2_slab_alloc_slow(s, cls);
+            }
+        } else {
+            hdr = m2_slab_alloc_slow(NULL, cls);
+        }
+        flags = (uint16_t)(M2_FLAG_SLAB | (cls << M2_FLAG_SLAB_CLS_SHIFT));
+    } else
+#endif
+    {
+        size_t total = sizeof(M2Header) + (size_t)payload_size;
+        hdr = (M2Header *)malloc(total);
+        if (__builtin_expect(!hdr, 0)) {
+            m2_panic("out of memory", __FILE__, __LINE__);
+        }
     }
     hdr->owner_tid = m2_cur_tid();
     hdr->local_rc = 1;
     atomic_init(&hdr->shared_rc, 0);
     hdr->type_tag = type_tag;
-    hdr->flags = 0;
+    hdr->flags = flags;
     hdr->payload_size = payload_size;
     hdr->drop_fn = drop_fn;
-    void *payload = (void *)(hdr + 1);
+    return (void *)(hdr + 1);
+}
+
+void *m2_alloc(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn) {
+    void *payload = m2_alloc_raw(payload_size, type_tag, drop_fn);
     if (payload_size > 0) {
         memset(payload, 0, payload_size);
     }
@@ -74,6 +223,22 @@ static void m2_destroy(M2Header *hdr, void *obj) {
     if (hdr->drop_fn) {
         hdr->drop_fn(obj);
     }
+#if M2_USE_SLAB
+    uint16_t flags = hdr->flags;
+    if (__builtin_expect((flags & M2_FLAG_SLAB) != 0, 1)) {
+        uint32_t cls = (uint32_t)((flags >> M2_FLAG_SLAB_CLS_SHIFT) & M2_FLAG_SLAB_CLS_MASK);
+        if (__builtin_expect((flags & M2_FLAG_FROZEN) == 0, 1)) {
+            M2SlabTLS *s = tls_slab;
+            if (__builtin_expect(s != NULL, 1)) {
+                m2_slab_set_next(hdr, s->local_free[cls]);
+                s->local_free[cls] = hdr;
+                return;
+            }
+        }
+        m2_slab_push_remote_list(cls, hdr, hdr);
+        return;
+    }
+#endif
     free(hdr);
 }
 
@@ -123,6 +288,39 @@ void m2_rc_freeze(void *obj) {
  * 2. String
  * ============================================================================ */
 
+static const char m2_digits200[201] =
+    "0001020304050607080910111213141516171819"
+    "2021222324252627282930313233343536373839"
+    "4041424344454647484950515253545556575859"
+    "6061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+
+static inline char *m2_fmt_i64_end(int64_t v, char *end) {
+    char *p = end;
+    int neg = v < 0;
+    uint64_t u = neg ? ((uint64_t)(-(v + 1)) + 1ULL) : (uint64_t)v;
+    while (u >= 100ULL) {
+        uint64_t q = u / 100ULL;
+        uint32_t r = (uint32_t)(u - q * 100ULL) * 2u;
+        u = q;
+        p -= 2;
+        p[0] = m2_digits200[r];
+        p[1] = m2_digits200[r + 1];
+    }
+    if (u >= 10ULL) {
+        uint32_t r = (uint32_t)u * 2u;
+        p -= 2;
+        p[0] = m2_digits200[r];
+        p[1] = m2_digits200[r + 1];
+    } else {
+        *--p = (char)('0' + u);
+    }
+    if (neg) {
+        *--p = '-';
+    }
+    return p;
+}
+
 void *m2_str_from_cstr(const char *s, int64_t len) {
     if (!s) {
         len = 0;
@@ -130,7 +328,7 @@ void *m2_str_from_cstr(const char *s, int64_t len) {
         len = (int64_t)strlen(s);
     }
     uint32_t payload_size = (uint32_t)(sizeof(M2String) + (size_t)len + 1);
-    M2String *str = (M2String *)m2_alloc(payload_size, M2_TAG_STRING, NULL);
+    M2String *str = (M2String *)m2_alloc_raw(payload_size, M2_TAG_STRING, NULL);
     str->len = len;
     if (len > 0 && s) {
         memcpy(str->data, s, (size_t)len);
@@ -158,8 +356,8 @@ void *m2_str_concat(void *a, void *b) {
     int64_t la = sa ? sa->len : 0;
     int64_t lb = sb ? sb->len : 0;
     int64_t total = la + lb;
-    M2String *out = (M2String *)m2_alloc((uint32_t)(sizeof(M2String) + (size_t)total + 1),
-                                         M2_TAG_STRING, NULL);
+    M2String *out = (M2String *)m2_alloc_raw((uint32_t)(sizeof(M2String) + (size_t)total + 1),
+                                             M2_TAG_STRING, NULL);
     out->len = total;
     if (la > 0) memcpy(out->data, sa->data, (size_t)la);
     if (lb > 0) memcpy(out->data + la, sb->data, (size_t)lb);
@@ -167,14 +365,17 @@ void *m2_str_concat(void *a, void *b) {
     return out;
 }
 
+static inline int32_t m2_str_eq_fast(const M2String *sa, const M2String *sb) {
+    if (sa == sb) return 1;
+    if (!sa || !sb) return 0;
+    int64_t len = sa->len;
+    if (len != sb->len) return 0;
+    if (len == 0) return 1;
+    return memcmp(sa->data, sb->data, (size_t)len) == 0 ? 1 : 0;
+}
+
 int32_t m2_str_eq(void *a, void *b) {
-    if (a == b) return 1;
-    if (!a || !b) return 0;
-    M2String *sa = (M2String *)a;
-    M2String *sb = (M2String *)b;
-    if (sa->len != sb->len) return 0;
-    if (sa->len == 0) return 1;
-    return memcmp(sa->data, sb->data, (size_t)sa->len) == 0 ? 1 : 0;
+    return m2_str_eq_fast((const M2String *)a, (const M2String *)b);
 }
 
 int32_t m2_str_cmp(void *a, void *b) {
@@ -202,9 +403,16 @@ void *m2_str_slice(void *s, int64_t start, int64_t end) {
 }
 
 void *m2_int_to_str(int64_t v) {
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%" PRId64, v);
-    return m2_str_from_cstr(buf, (int64_t)n);
+    char tmp[24];
+    char *end = tmp + sizeof(tmp);
+    char *p = m2_fmt_i64_end(v, end);
+    size_t n = (size_t)(end - p);
+    M2String *str = (M2String *)m2_alloc_raw((uint32_t)(sizeof(M2String) + n + 1),
+                                             M2_TAG_STRING, NULL);
+    str->len = (int64_t)n;
+    memcpy(str->data, p, n);
+    str->data[n] = '\0';
+    return str;
 }
 
 int64_t m2_str_to_int(void *s, int32_t *ok_out) {
@@ -308,11 +516,13 @@ void m2_strbuf_push_char(void *sb_ptr, int32_t cp) {
 void m2_strbuf_push_int(void *sb_ptr, int64_t v) {
     M2StrBuf *sb = (M2StrBuf *)sb_ptr;
     if (!sb) return;
-    char buf[32];
-    int n = snprintf(buf, sizeof(buf), "%" PRId64, v);
+    char tmp[24];
+    char *end = tmp + sizeof(tmp);
+    char *p = m2_fmt_i64_end(v, end);
+    size_t n = (size_t)(end - p);
     m2_strbuf_reserve(sb, (int64_t)n);
-    memcpy(sb->data + sb->len, buf, (size_t)n);
-    sb->len += n;
+    memcpy(sb->data + sb->len, p, n);
+    sb->len += (int64_t)n;
     sb->data[sb->len] = '\0';
 }
 
@@ -428,10 +638,12 @@ void *m2_arr_copy(void *a_ptr) {
  * 5. String-Keyed Hash Map (Open Addressing, FNV-1a)
  * ============================================================================ */
 
-static uint64_t m2_fnv1a(const M2String *s) {
+static inline uint64_t m2_fnv1a(const M2String *s) {
     uint64_t h = 14695981039346656037ULL;
-    for (int64_t i = 0; i < s->len; i++) {
-        h ^= (uint64_t)(unsigned char)s->data[i];
+    const unsigned char *p = (const unsigned char *)s->data;
+    const unsigned char *end = p + s->len;
+    while (p < end) {
+        h ^= (uint64_t)(*p++);
         h *= 1099511628211ULL;
     }
     return h;
@@ -488,22 +700,23 @@ int64_t m2_map_len(void *m_ptr) {
 void m2_map_set(void *m_ptr, void *key_str, int64_t val) {
     M2Map *m = (M2Map *)m_ptr;
     M2String *k = (M2String *)key_str;
-    if (!m || !k) m2_panic("null map or key", __FILE__, __LINE__);
-    if (m->cap == 0) {
+    if (__builtin_expect(!m || !k, 0)) m2_panic("null map or key", __FILE__, __LINE__);
+    if (__builtin_expect(m->cap == 0, 0)) {
         m2_map_grow(m, 16);
-    } else if ((m->len + 1) * 10 >= m->cap * 7) {
+    } else if (__builtin_expect((m->len + 1) * 10 >= m->cap * 7, 0)) {
         m2_map_grow(m, m->cap * 2);
     }
     uint64_t h = m2_fnv1a(k);
     uint64_t mask = (uint64_t)(m->cap - 1);
     uint64_t idx = h & mask;
-    while (m->entries[idx].state == 1) {
-        if (m->entries[idx].hash == h && m2_str_eq(m->entries[idx].key, k)) {
+    M2MapEntry *entries = m->entries;
+    while (entries[idx].state == 1) {
+        if (entries[idx].hash == h && m2_str_eq_fast(entries[idx].key, k)) {
             if (m->val_is_obj) {
                 m2_rc_inc((void *)(uintptr_t)val);
-                m2_rc_dec((void *)(uintptr_t)m->entries[idx].val);
+                m2_rc_dec((void *)(uintptr_t)entries[idx].val);
             }
-            m->entries[idx].val = val;
+            entries[idx].val = val;
             return;
         }
         idx = (idx + 1) & mask;
@@ -512,22 +725,23 @@ void m2_map_set(void *m_ptr, void *key_str, int64_t val) {
     if (m->val_is_obj) {
         m2_rc_inc((void *)(uintptr_t)val);
     }
-    m->entries[idx].key = k;
-    m->entries[idx].hash = h;
-    m->entries[idx].val = val;
-    m->entries[idx].state = 1;
+    entries[idx].key = k;
+    entries[idx].hash = h;
+    entries[idx].val = val;
+    entries[idx].state = 1;
     m->len++;
 }
 
 int32_t m2_map_has(void *m_ptr, void *key_str) {
     M2Map *m = (M2Map *)m_ptr;
     M2String *k = (M2String *)key_str;
-    if (!m || !k || m->len == 0) return 0;
+    if (__builtin_expect(!m || !k || m->len == 0, 0)) return 0;
     uint64_t h = m2_fnv1a(k);
     uint64_t mask = (uint64_t)(m->cap - 1);
     uint64_t idx = h & mask;
-    while (m->entries[idx].state == 1) {
-        if (m->entries[idx].hash == h && m2_str_eq(m->entries[idx].key, k)) {
+    M2MapEntry *entries = m->entries;
+    while (entries[idx].state == 1) {
+        if (entries[idx].hash == h && m2_str_eq_fast(entries[idx].key, k)) {
             return 1;
         }
         idx = (idx + 1) & mask;
@@ -538,15 +752,16 @@ int32_t m2_map_has(void *m_ptr, void *key_str) {
 int64_t m2_map_get(void *m_ptr, void *key_str) {
     M2Map *m = (M2Map *)m_ptr;
     M2String *k = (M2String *)key_str;
-    if (!m || !k || m->len == 0) {
+    if (__builtin_expect(!m || !k || m->len == 0, 0)) {
         m2_panic("map key not found", __FILE__, __LINE__);
     }
     uint64_t h = m2_fnv1a(k);
     uint64_t mask = (uint64_t)(m->cap - 1);
     uint64_t idx = h & mask;
-    while (m->entries[idx].state == 1) {
-        if (m->entries[idx].hash == h && m2_str_eq(m->entries[idx].key, k)) {
-            return m->entries[idx].val;
+    M2MapEntry *entries = m->entries;
+    while (entries[idx].state == 1) {
+        if (entries[idx].hash == h && m2_str_eq_fast(entries[idx].key, k)) {
+            return entries[idx].val;
         }
         idx = (idx + 1) & mask;
     }

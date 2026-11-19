@@ -16,6 +16,7 @@ static struct {
 	{ Osub,    Ka, "fsub.%k %=, %0, %1" },
 	{ Oneg,    Ki, "neg%k %=, %0" },
 	{ Oneg,    Ka, "fneg.%k %=, %0" },
+	{ Osqrt,   Ka, "fsqrt.%k %=, %0" },
 	{ Odiv,    Ki, "div%k %=, %0, %1" },
 	{ Odiv,    Ka, "fdiv.%k %=, %0, %1" },
 	{ Orem,    Ki, "rem%k %=, %0, %1" },

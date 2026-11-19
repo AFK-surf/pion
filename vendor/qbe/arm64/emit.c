@@ -45,6 +45,7 @@ static struct {
 	{ Osub,    Ka, "fsub %=, %0, %1" },
 	{ Oneg,    Ki, "neg %=, %0" },
 	{ Oneg,    Ka, "fneg %=, %0" },
+	{ Osqrt,   Ka, "fsqrt %=, %0" },
 	{ Oand,    Ki, "and %=, %0, %1" },
 	{ Oor,     Ki, "orr %=, %0, %1" },
 	{ Oxor,    Ki, "eor %=, %0, %1" },

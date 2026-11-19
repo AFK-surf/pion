@@ -438,6 +438,7 @@ sel(Ins i, Num *tn, Fn *fn)
 	case Osltof:
 	case Oexts:
 	case Otruncd:
+	case Osqrt:
 	case Ocast:
 	case_Oxsel:
 	case_Oext:
