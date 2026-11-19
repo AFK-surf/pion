@@ -249,24 +249,24 @@ test "qbe_p4b_loop_invariant_readonly_struct_field_hoist" {
     #|}
   let pkg = @core.parse_package("test", ["hoist.m2"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  // Locate the inner loop (@wh_c_...) and verify b.x / b.mass are loaded before it,
-  // while inside the inner loop body we still load b2.x, b2.mass, b.vx, b2.vx (4 loadd total, not 6)
+  // Locate the inner loop (@wh_pinit_...) and verify b.x / b.mass are hoisted before it,
+  // and b.vx is scalar-promoted into a local slot with alias guard (@wh_pb_, @wh_pbail_, @wh_pwb_)
   let fn_adv = match res.ssa.find("$m2_fn_advance_like") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => res.ssa
   }
-  let first_wh = match fn_adv.find("\n@wh_c_") {
+  let outer_body = match fn_adv.find("\n@wh_b_") {
+    Some(idx) => fn_adv.clamped_view(start=idx + 7).to_owned()
+    None => ""
+  }
+  let inner_pinit = match outer_body.find("\n@wh_pinit_") {
     Some(idx) => idx
     None => 0
   }
-  let after_first = fn_adv.clamped_view(start=first_wh + 7).to_owned()
-  let second_wh = match after_first.find("\n@wh_c_") {
-    Some(idx) => idx
-    None => 0
-  }
-  let pre_inner = after_first.clamped_view(end=second_wh).to_owned()
-  let inner_body = after_first.clamped_view(start=second_wh).to_owned()
-  // Both b.x and b.mass must be hoisted into pre_inner (exactly 2 `=d loadd ` before inner @wh_c)
+  assert_eq(inner_pinit > 0, true)
+  let pre_inner = outer_body.clamped_view(end=inner_pinit).to_owned()
+  let inner_all = outer_body.clamped_view(start=inner_pinit).to_owned()
+  // Both b.x and b.mass must be hoisted into pre_inner (exactly 2 `=d loadd ` before inner @wh_pinit_)
   let mut pre_loads = 0
   let mut ppos = 0
   while ppos < pre_inner.length() {
@@ -280,20 +280,10 @@ test "qbe_p4b_loop_invariant_readonly_struct_field_hoist" {
     }
   }
   assert_eq(pre_loads, 2)
-  // Inside inner_body: 4 struct field loads (b2.x, b.vx, b2.mass, b2.vx) + 8 local double loads (dx x4, dt, d, mag x2) = 12 (not 14)
-  let mut loads = 0
-  let mut pos = 0
-  while pos < inner_body.length() {
-    let tail = inner_body.clamped_view(start=pos).to_owned()
-    match tail.find("=d loadd ") {
-      Some(off) => {
-        loads = loads + 1
-        pos = pos + off + 9
-      }
-      None => break
-    }
-  }
-  assert_eq(loads, 12)
+  assert_eq(inner_all.contains("@wh_pb_"), true)
+  assert_eq(inner_all.contains("@wh_pbail_"), true)
+  assert_eq(inner_all.contains("@wh_pwb_"), true)
+  assert_eq(inner_all.contains("=w ceql "), true)
 }
 
 ///|
@@ -357,4 +347,200 @@ test "qbe_p4d_array_int_loadl_and_block_immut_field_cse" {
     }
   }
   assert_eq(dloads, 1)
+}
+
+///|
+test "qbe_p5b_guarded_bottom_tested_loop_rotation" {
+  let src =
+    #|pub fn count_even(n : Int) -> Int {
+    #|  let mut i = 0
+    #|  let mut s = 0
+    #|  while i < n {
+    #|    i = i + 1
+    #|    if (i & 1) == 1 {
+    #|      continue
+    #|    }
+    #|    s = s + i
+    #|  }
+    #|  s
+    #|}
+  let pkg = @core.parse_package("test", ["rot.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_s = match res.ssa.find("$m2_fn_count_even") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  let b_pos = match fn_s.find("\n@wh_b_") {
+    Some(idx) => idx
+    None => -1
+  }
+  let c_pos = match fn_s.find("\n@wh_c_") {
+    Some(idx) => idx
+    None => -1
+  }
+  // Bottom-tested: @wh_b_ appears before @wh_c_
+  assert_eq(b_pos > 0, true)
+  assert_eq(c_pos > b_pos, true)
+}
+
+///|
+test "qbe_p5b_preloop_bce_versioning_and_extsw_reuse" {
+  let src =
+    #|pub fn copy_rev_shift(
+    #|  n : Int,
+    #|  k : Int,
+    #|  k2 : Int,
+    #|  r : Int,
+    #|  perm : Array[Int],
+    #|  perm1 : Array[Int],
+    #|) -> Unit {
+    #|  let mut ci = 0
+    #|  while ci < n {
+    #|    perm[ci] = perm1[ci]
+    #|    ci = ci + 1
+    #|  }
+    #|  let mut fi = 0
+    #|  while fi < k2 {
+    #|    let tmp = perm[fi]
+    #|    perm[fi] = perm[k - fi]
+    #|    perm[k - fi] = tmp
+    #|    fi = fi + 1
+    #|  }
+    #|  let mut si = 0
+    #|  while si < r {
+    #|    perm1[si] = perm1[si + 1]
+    #|    si = si + 1
+    #|  }
+    #|}
+  let pkg = @core.parse_package("test", ["bce_v.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_s = match res.ssa.find("$m2_fn_copy_rev_shift") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  // All 3 loops must be versioned with @wh_vchk_ / @wh_fast_ / @wh_slow_
+  let mut fast_count = 0
+  let mut pos = 0
+  while pos < fn_s.length() {
+    let tail = fn_s.clamped_view(start=pos).to_owned()
+    match tail.find("\n@wh_fast_") {
+      Some(f_off) => {
+        let after_fast = tail.clamped_view(start=f_off + 1).to_owned()
+        let slow_off = match after_fast.find("\n@wh_slow_") {
+          Some(s_off) => s_off
+          None => after_fast.length()
+        }
+        let fast_region = after_fast.clamped_view(end=slow_off).to_owned()
+        // Fast region must have zero m2_panic_oob
+        assert_eq(fast_region.contains("m2_panic_oob"), false)
+        // First loop (`perm[ci] = perm1[ci]`): zero redundant extsw for copied value
+        if fast_count == 0 {
+          assert_eq(fast_region.contains("=l loadl "), true)
+          assert_eq(fast_region.contains("storel "), true)
+          // Only index ci needs 1 extsw (for perm1[ci] / perm[ci] index); value copy reuses rl
+          let mut ext_cnt = 0
+          let mut ep = 0
+          while ep < fast_region.length() {
+            let et = fast_region.clamped_view(start=ep).to_owned()
+            match et.find("=l extsw ") {
+              Some(eo) => {
+                ext_cnt = ext_cnt + 1
+                ep = ep + eo + 9
+              }
+              None => break
+            }
+          }
+          // 2 index extsw (ci for perm[ci], ci for perm1[ci]), 0 value extsw (would be 3 without Opt 5)
+          assert_eq(ext_cnt, 2)
+        }
+        fast_count = fast_count + 1
+        pos = pos + f_off + 10
+      }
+      None => break
+    }
+  }
+  assert_eq(fast_count, 3)
+  // Slow path still retains m2_panic_oob for safety
+  assert_eq(fn_s.contains("m2_panic_oob"), true)
+}
+
+///|
+test "qbe_p5b_loop_carried_square_reuse" {
+  let src =
+    #|pub fn mandel_iter(cr : Double, ci : Double) -> Bool {
+    #|  let mut zr = 0.0
+    #|  let mut zi = 0.0
+    #|  let mut escaped = false
+    #|  let mut iter = 0
+    #|  while iter < 50 {
+    #|    let tr = zr * zr - zi * zi + cr
+    #|    let ti = 2.0 * zr * zi + ci
+    #|    zr = tr
+    #|    zi = ti
+    #|    if zr * zr + zi * zi > 4.0 {
+    #|      escaped = true
+    #|      break
+    #|    }
+    #|    iter = iter + 1
+    #|  }
+    #|  escaped
+    #|}
+  let pkg = @core.parse_package("test", ["sq.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_s = match res.ssa.find("$m2_fn_mandel_iter") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  assert_eq(fn_s.contains("@wh_sqi_"), true)
+  let body_part = match fn_s.find("\n@wh_b_") {
+    Some(idx) => fn_s.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  let mut mul_cnt = 0
+  let mut pos = 0
+  while pos < body_part.length() {
+    let tail = body_part.clamped_view(start=pos).to_owned()
+    match tail.find("=d mul ") {
+      Some(off) => {
+        mul_cnt = mul_cnt + 1
+        pos = pos + off + 7
+      }
+      None => break
+    }
+  }
+  // Only 3 fmul inside loop body (ti = (zr+zr)*zi, new zr*zr, new zi*zi), down from 5
+  assert_eq(mul_cnt, 3)
+}
+
+///|
+test "qbe_p5b_alias_guarded_struct_promotion_and_bailout" {
+  let src =
+    #|pub struct Acc {
+    #|  mut v : Double
+    #|  w : Double
+    #|}
+    #|pub fn pair_update(arr : Array[Acc]) -> Double {
+    #|  let n = arr.length()
+    #|  let b = arr[0]
+    #|  let mut j = 0
+    #|  while j < n {
+    #|    let b2 = arr[j]
+    #|    b.v = b.v + b2.w
+    #|    b2.v = b2.v + b.w
+    #|    j = j + 1
+    #|  }
+    #|  b.v
+    #|}
+  let pkg = @core.parse_package("test", ["alias_prom.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  let fn_s = match res.ssa.find("$m2_fn_pair_update") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => ""
+  }
+  assert_eq(fn_s.contains("@wh_pinit_"), true)
+  assert_eq(fn_s.contains("@wh_pb_"), true)
+  assert_eq(fn_s.contains("=w ceql "), true)
+  assert_eq(fn_s.contains("@wh_pbail_"), true)
+  assert_eq(fn_s.contains("@wh_pslow_"), true)
+  assert_eq(fn_s.contains("@wh_pwb_"), true)
 }
