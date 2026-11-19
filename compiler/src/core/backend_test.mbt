@@ -43,3 +43,109 @@ test "qbe_codegen_deterministic_and_release_strips_assert" {
   let rel = @core.emit_qbe_package(pkg, true)
   assert_eq(rel.ssa.contains("m2_debug_assert"), false)
 }
+
+///|
+test "qbe_double_slot_and_cond_branch_fusion" {
+  let src =
+    #|pub fn loop_fp(n : Int) -> Double {
+    #|  let mut s = 0.0
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    s = s + 1.5
+    #|    if s > 10.0 {
+    #|      break
+    #|    }
+    #|    i = i + 1
+    #|  }
+    #|  s
+    #|}
+  let pkg = @core.parse_package("test", ["fp.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  // Double slot must initialize with stored d_0.0 (not storel 0) for QBE mem2reg
+  assert_eq(res.ssa.contains("stored d_0.0"), true)
+  // Compare+branch fusion: no extuw in loop_fp
+  assert_eq(res.ssa.contains("extuw"), false)
+}
+
+///|
+test "qbe_borrow_elision_tree_and_arr_elem_and_bce" {
+  let src =
+    #|pub enum Tree {
+    #|  Leaf
+    #|  Node(Tree, Tree)
+    #|}
+    #|pub fn check_tree(t : Tree) -> Int {
+    #|  match t {
+    #|    Leaf => 1
+    #|    Node(l, r) => 1 + check_tree(l) + check_tree(r)
+    #|  }
+    #|}
+    #|pub struct Body {
+    #|  mut x : Double
+    #|}
+    #|pub fn step(bodies : Array[Body]) -> Unit {
+    #|  let n = bodies.length()
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    let b = bodies[i]
+    #|    b.x = b.x + 1.0
+    #|    i = i + 1
+    #|  }
+    #|}
+  let pkg = @core.parse_package("test", ["opt.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  // Zero RC inc anywhere; zero RC dec inside check_tree / step (drop_enum_Tree is emitted before fns)
+  assert_eq(res.ssa.contains("m2_rc_inc"), false)
+  let fn_part = match res.ssa.find("$m2_fn_check_tree") {
+    Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
+    None => res.ssa
+  }
+  assert_eq(fn_part.contains("m2_rc_dec"), false)
+  // Conservative BCE removes m2_panic_oob inside `while i < n` where `n = bodies.length()`
+  assert_eq(res.ssa.contains("m2_panic_oob"), false)
+}
+
+///|
+test "qbe_pow2_signed_div_shift" {
+  let src =
+    #|pub fn half(x : Int) -> Int {
+    #|  x / 2
+    #|}
+    #|pub fn quarter(x : Int) -> Int {
+    #|  x / 4
+    #|}
+  let pkg = @core.parse_package("test", ["div.m2"], [src])
+  let res = @core.emit_qbe_package(pkg, true)
+  assert_eq(res.ssa.contains("=w div "), false)
+  assert_eq(res.ssa.contains("=w sar "), true)
+}
+
+///|
+test "sig_file_stub_and_sigs_hash_parity" {
+  let s1 =
+    #|pub struct Pt { x : Int; mut y : Double }
+    #|pub let SCALE : Int = 42
+    #|pub fn add_pt(p : Pt, k : Int) -> Int { p.x + k }
+  let s2 =
+    #|pub fn main(world : World) -> Int {
+    #|  let p = Pt::{ x: 1, y: 2.0 }
+    #|  io_println(world, add_pt(p, SCALE).to_string())
+    #|  0
+    #|}
+  let prep = match @core.cli_prepare_qbe_units("demo", ["a.m2", "b.m2"], [s1, s2]) {
+    Ok(p) => p
+    Err(e) => fail(e)
+  }
+  let f0 = prep.pkg.files[0]
+  let f1 = prep.pkg.files[1]
+  let sig0 = @core.emit_file_sig_entries(f0)
+  let sig1 = @core.emit_file_sig_entries(f1)
+  let summary = @core.summarize_file_sigs("demo", [sig0, sig1])
+  assert_eq(summary.sigs_hash, prep.sigs_hash)
+  assert_eq(summary.has_main, true)
+  assert_eq(summary.const_units.length(), 1)
+  assert_eq(summary.const_units[0], 0)
+  let stub0 = @core.emit_file_stub(f0)
+  let spr = @core.parse_source("a.m2", stub0)
+  assert_eq(spr.diagnostics.length(), 0)
+}

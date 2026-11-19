@@ -2921,7 +2921,18 @@ fn check_expr(
 }
 
 ///|
-pub fn check_package(pkg : Package) -> CheckResult {
+///|
+pub struct CheckedPackage {
+  pkg : Package
+  tc : TypeChecker
+  diagnostics : Array[Diagnostic]
+}
+
+///|
+pub fn check_package_selective(
+  pkg : Package,
+  check_file : Array[Bool],
+) -> CheckedPackage {
   let tc = TypeChecker::{
     structs: Map([]),
     enums: Map([]),
@@ -3128,6 +3139,10 @@ pub fn check_package(pkg : Package) -> CheckResult {
   // Pass 3: type-check function bodies and constant initializers
   fi = 0
   while fi < pkg.files.length() {
+    if fi < check_file.length() && !check_file[fi] {
+      fi = fi + 1
+      continue
+    }
     let f = pkg.files[fi]
     let mut di = 0
     while di < f.decls.length() {
@@ -3188,15 +3203,26 @@ pub fn check_package(pkg : Package) -> CheckResult {
     fi = fi + 1
   }
 
-  CheckResult::{ diagnostics: tc.diagnostics }
+  CheckedPackage::{ pkg: pkg, tc: tc, diagnostics: tc.diagnostics }
 }
 
 ///|
-pub fn check_source_files(
+pub fn check_package_full(pkg : Package) -> CheckedPackage {
+  check_package_selective(pkg, [])
+}
+
+///|
+pub fn check_package(pkg : Package) -> CheckResult {
+  let r = check_package_full(pkg)
+  CheckResult::{ diagnostics: r.diagnostics }
+}
+
+///|
+pub fn check_source_files_full(
   pkg_name : String,
   paths : Array[String],
   sources : Array[String],
-) -> CheckResult {
+) -> CheckedPackage {
   let all_diags : Array[Diagnostic] = []
   let files : Array[SourceFile] = []
   let mut i = 0
@@ -3211,11 +3237,21 @@ pub fn check_source_files(
     i = i + 1
   }
   let pkg = Package::{ name: pkg_name, files: files }
-  let cr = check_package(pkg)
+  let cr = check_package_full(pkg)
   let mut k = 0
   while k < cr.diagnostics.length() {
     all_diags.push(cr.diagnostics[k])
     k = k + 1
   }
-  CheckResult::{ diagnostics: all_diags }
+  CheckedPackage::{ pkg: pkg, tc: cr.tc, diagnostics: all_diags }
+}
+
+///|
+pub fn check_source_files(
+  pkg_name : String,
+  paths : Array[String],
+  sources : Array[String],
+) -> CheckResult {
+  let cr = check_source_files_full(pkg_name, paths, sources)
+  CheckResult::{ diagnostics: cr.diagnostics }
 }
