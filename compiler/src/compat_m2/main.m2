@@ -8,6 +8,165 @@ struct DrvLoaded {
 }
 
 ///|
+struct AppleTools {
+  ok : Bool
+  clang_bin : String
+  ld_bin : String
+  sdk_path : String
+  macos_ver : String
+}
+
+///|
+fn drv_starts_with(s : String, pre : String) -> Bool {
+  let sl = s.length()
+  let pl = pre.length()
+  if sl < pl {
+    return false
+  }
+  let mut i = 0
+  while i < pl {
+    if str_code_at(s, i) != str_code_at(pre, i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn drv_find_substr(s : String, needle : String, start : Int) -> Int {
+  let sl = s.length()
+  let nl = needle.length()
+  if nl == 0 || start + nl > sl {
+    return -1
+  }
+  let mut i = start
+  while i + nl <= sl {
+    let mut j = 0
+    let mut ok = true
+    while j < nl {
+      if str_code_at(s, i + j) != str_code_at(needle, j) {
+        ok = false
+        break
+      }
+      j = j + 1
+    }
+    if ok {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn drv_parse_macos_ver_from_plist(plist : String) -> String {
+  let kpos = drv_find_substr(plist, "<key>ProductVersion</key>", 0)
+  if kpos < 0 {
+    return "15.0"
+  }
+  let spos = drv_find_substr(plist, "<string>", kpos + 25)
+  if spos < 0 {
+    return "15.0"
+  }
+  let vstart = spos + 8
+  let vend = drv_find_substr(plist, "</string>", vstart)
+  if vend <= vstart {
+    return "15.0"
+  }
+  let sb = StringBuilder()
+  let mut dots = 0
+  let mut i = vstart
+  while i < vend {
+    let c = str_code_at(plist, i)
+    if c == 46 {
+      dots = dots + 1
+      if dots >= 2 {
+        break
+      }
+      sb.write_char('.')
+    } else if c >= 48 && c <= 57 {
+      sb.write_char(c.unsafe_to_char())
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  let v = sb.to_string()
+  if v.length() == 0 {
+    "15.0"
+  } else if dots == 0 {
+    v + ".0"
+  } else {
+    v
+  }
+}
+
+///|
+/// Pure filesystem probe (0 subprocesses, <0.2ms) for real clang (-cc1as), ld, and MacOSX.sdk
+/// on macOS arm64_apple when CC is not overridden.
+fn drv_probe_apple_tools(world : World, qbe_target : String) -> AppleTools {
+  let empty = AppleTools::{
+    ok: false,
+    clang_bin: "",
+    ld_bin: "",
+    sdk_path: "",
+    macos_ver: "",
+  }
+  if qbe_target != "arm64_apple" {
+    return empty
+  }
+  if drv_env_str(world, "CC").length() > 0 {
+    return empty
+  }
+  let mut clang_bin = ""
+  let mut ld_bin = ""
+  let mut sdk_path = ""
+
+  let clt_c = "/Library/Developer/CommandLineTools/usr/bin/clang"
+  let clt_l = "/Library/Developer/CommandLineTools/usr/bin/ld"
+  let clt_s = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+  if fs_exists(world, clt_c) && fs_exists(world, clt_l) && fs_exists(world, clt_s) {
+    clang_bin = clt_c
+    ld_bin = clt_l
+    sdk_path = clt_s
+  } else if fs_is_dir(world, "/Applications") {
+    let apps = fs_list_dir(world, "/Applications")
+    let mut i = 0
+    while i < apps.length() {
+      let name = apps[i]
+      if drv_starts_with(name, "Xcode") && drv_ends_with(name, ".app") {
+        let dev = "/Applications/" + name + "/Contents/Developer"
+        let xc_c = dev + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+        let xc_l = dev + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
+        let xc_s = dev + "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        if fs_exists(world, xc_c) && fs_exists(world, xc_l) && fs_exists(world, xc_s) {
+          clang_bin = xc_c
+          ld_bin = xc_l
+          sdk_path = xc_s
+          break
+        }
+      }
+      i = i + 1
+    }
+  }
+  if clang_bin == "" {
+    return empty
+  }
+  let macos_ver = match fs_read(world, "/System/Library/CoreServices/SystemVersion.plist") {
+    Ok(txt) => drv_parse_macos_ver_from_plist(txt)
+    Err(_) => "15.0"
+  }
+  AppleTools::{
+    ok: true,
+    clang_bin: clang_bin,
+    ld_bin: ld_bin,
+    sdk_path: sdk_path,
+    macos_ver: macos_ver,
+  }
+}
+
+///|
 fn drv_ends_with(s : String, suf : String) -> Bool {
   let sl = s.length()
   let sufl = suf.length()
@@ -419,30 +578,112 @@ fn drv_build_targets(
   let _ = fs_mkdir_p(world, cache_dir + "/ssa")
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let _ = fs_mkdir_p(world, cache_dir + "/bin")
+  let _ = fs_mkdir_p(world, cache_dir + "/usig")
 
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
+  let apple_tools = drv_probe_apple_tools(world, qbe_target)
+  let cc1as_triple = "arm64-apple-macosx" + apple_tools.macos_ver + ".0"
+  let ld_ver = apple_tools.macos_ver + ".0"
 
-  // Multi-file unit-level parallel compilation + unit-level global CAS
+  // Multi-file unit-level parallel compilation + unit-level global CAS + incremental .sig/.stub skip
   if paths.length() > 1 && emit_ssa_path == "" && emit_asm_path == "" {
-    let prep = match cli_prepare_qbe_units(pkg_name, paths, sources) {
-      Err(diag_json) => return Err(diag_json)
-      Ok(p) => p
-    }
     let n_units = paths.length()
+    let has_usig : Array[Bool] = []
+    let file_sigs : Array[String] = []
+    let mut n_usig_hits = 0
+    let mut ui = 0
+    while ui < n_units {
+      let usig_p = cache_dir + "/usig/" + src_hashes[ui] + ".sig"
+      let ustub_p = cache_dir + "/usig/" + src_hashes[ui] + ".stub"
+      if fs_exists(world, usig_p) && fs_exists(world, ustub_p) {
+        match fs_read(world, usig_p) {
+          Ok(sig_txt) => {
+            has_usig.push(true)
+            file_sigs.push(sig_txt)
+            n_usig_hits = n_usig_hits + 1
+          }
+          Err(_) => {
+            has_usig.push(false)
+            file_sigs.push("")
+          }
+        }
+      } else {
+        has_usig.push(false)
+        file_sigs.push("")
+      }
+      ui = ui + 1
+    }
+
+    let mut sigs_hash = ""
+    let mut const_units : Array[Int] = []
+    let mut has_main = false
+    let mut prep_opt : Option[PreparedPackage] = None
+    let parsed_dirty : Array[Option[SourceFile]] = []
+
+    if n_usig_hits > 0 {
+      let parse_diags : Array[Diagnostic] = []
+      ui = 0
+      while ui < n_units {
+        if has_usig[ui] {
+          parsed_dirty.push(None)
+        } else {
+          let pr = parse_source(paths[ui], sources[ui])
+          let mut di = 0
+          while di < pr.diagnostics.length() {
+            parse_diags.push(pr.diagnostics[di])
+            di = di + 1
+          }
+          file_sigs[ui] = emit_file_sig_entries(pr.file)
+          parsed_dirty.push(Some(pr.file))
+        }
+        ui = ui + 1
+      }
+      if parse_diags.length() > 0 {
+        return Err(check_result_to_json(parse_diags))
+      }
+      let summary = summarize_file_sigs(pkg_name, file_sigs)
+      sigs_hash = summary.sigs_hash
+      const_units = summary.const_units
+      has_main = summary.has_main
+    } else {
+      let prep = match cli_prepare_qbe_units(pkg_name, paths, sources) {
+        Err(diag_json) => return Err(diag_json)
+        Ok(p) => p
+      }
+      sigs_hash = prep.sigs_hash
+      const_units = prep.const_units
+      has_main = prep.has_main
+      prep_opt = Some(prep)
+      // Populate global CAS per-file .sig and .stub for subsequent incremental builds
+      ui = 0
+      while ui < n_units {
+        let usig_p = cache_dir + "/usig/" + src_hashes[ui] + ".sig"
+        let ustub_p = cache_dir + "/usig/" + src_hashes[ui] + ".stub"
+        if !fs_exists(world, usig_p) {
+          let _ = drv_write_text_atomic(world, usig_p, emit_file_sig_entries(prep.pkg.files[ui]))
+        }
+        if !fs_exists(world, ustub_p) {
+          let _ = drv_write_text_atomic(world, ustub_p, emit_file_stub(prep.pkg.files[ui]))
+        }
+        ui = ui + 1
+      }
+    }
+
     let unit_keys : Array[String] = []
     let obj_paths : Array[String] = []
     let miss_indices : Array[Int] = []
+    let is_miss : Array[Bool] = []
     let pkg_key_sb = StringBuilder()
-    pkg_key_sb.write_string(prep.sigs_hash)
-    let mut ui = 0
+    pkg_key_sb.write_string(sigs_hash)
+    ui = 0
     while ui < n_units {
       let ukey = cas_compute_unit_key(
         pkg_name,
         ui,
         paths[ui],
         src_hashes[ui],
-        prep.sigs_hash,
+        sigs_hash,
         qbe_target,
         release,
       )
@@ -453,6 +694,9 @@ fn drv_build_targets(
       obj_paths.push(uobj)
       if !fs_exists(world, uobj) {
         miss_indices.push(ui)
+        is_miss.push(true)
+      } else {
+        is_miss.push(false)
       }
       ui = ui + 1
     }
@@ -464,24 +708,115 @@ fn drv_build_targets(
       return Ok(final_bin)
     }
 
-    // Emit QBE SSA only for cache-missed units
-    let mut mi = 0
-    while mi < miss_indices.length() {
-      let idx = miss_indices[mi]
-      let ukey = unit_keys[idx]
-      let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
-      let ssa_text = emit_qbe_unit(prep, idx, release)
-      if !drv_write_text_atomic(world, u_ssa, ssa_text) {
-        return Err("failed to write CAS unit ssa: " + u_ssa)
+    if miss_indices.length() > 0 {
+      let prep = match prep_opt {
+        Some(p) => p
+        None => {
+          // Incremental selective frontend: parse full source only for missed/uncached units,
+          // and lightweight `.stub` for cached unchanged units!
+          let files : Array[SourceFile] = []
+          let check_file : Array[Bool] = []
+          let parse_diags : Array[Diagnostic] = []
+          ui = 0
+          while ui < n_units {
+            if is_miss[ui] || !has_usig[ui] {
+              match parsed_dirty[ui] {
+                Some(sf) => files.push(sf)
+                None => {
+                  let pr = parse_source(paths[ui], sources[ui])
+                  let mut di = 0
+                  while di < pr.diagnostics.length() {
+                    parse_diags.push(pr.diagnostics[di])
+                    di = di + 1
+                  }
+                  files.push(pr.file)
+                }
+              }
+              check_file.push(true)
+            } else {
+              let ustub_p = cache_dir + "/usig/" + src_hashes[ui] + ".stub"
+              let stub_loaded = match fs_read(world, ustub_p) {
+                Ok(stxt) => {
+                  let spr = parse_source(paths[ui], stxt)
+                  if spr.diagnostics.length() == 0 {
+                    Some(spr.file)
+                  } else {
+                    None
+                  }
+                }
+                Err(_) => None
+              }
+              match stub_loaded {
+                Some(sf) => {
+                  files.push(sf)
+                  check_file.push(false)
+                }
+                None => {
+                  let pr = parse_source(paths[ui], sources[ui])
+                  let mut di = 0
+                  while di < pr.diagnostics.length() {
+                    parse_diags.push(pr.diagnostics[di])
+                    di = di + 1
+                  }
+                  files.push(pr.file)
+                  check_file.push(true)
+                }
+              }
+            }
+            ui = ui + 1
+          }
+          if parse_diags.length() > 0 {
+            return Err(check_result_to_json(parse_diags))
+          }
+          let sel = match cli_prepare_qbe_units_selective(
+            pkg_name,
+            files,
+            check_file,
+            sigs_hash,
+            const_units,
+          ) {
+            Err(diag_json) => return Err(diag_json)
+            Ok(p) => p
+          }
+          has_main = sel.has_main
+          // Save newly validated dirty units' .sig and .stub to CAS
+          ui = 0
+          while ui < n_units {
+            if !has_usig[ui] {
+              let usig_p = cache_dir + "/usig/" + src_hashes[ui] + ".sig"
+              let ustub_p = cache_dir + "/usig/" + src_hashes[ui] + ".stub"
+              if !fs_exists(world, usig_p) {
+                let _ = drv_write_text_atomic(world, usig_p, file_sigs[ui])
+              }
+              if !fs_exists(world, ustub_p) {
+                let _ = drv_write_text_atomic(world, ustub_p, emit_file_stub(sel.pkg.files[ui]))
+              }
+            }
+            ui = ui + 1
+          }
+          sel
+        }
       }
-      mi = mi + 1
+
+      // Emit QBE SSA only for cache-missed units
+      let mut mi = 0
+      while mi < miss_indices.length() {
+        let idx = miss_indices[mi]
+        let ukey = unit_keys[idx]
+        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+        let ssa_text = emit_qbe_unit(prep, idx, release)
+        if !drv_write_text_atomic(world, u_ssa, ssa_text) {
+          return Err("failed to write CAS unit ssa: " + u_ssa)
+        }
+        mi = mi + 1
+      }
     }
 
-    // Compile missed units (qbe + as) in parallel across up to `jobs` OS threads
+    // Compile missed units (qbe + cc1as/as) in parallel across up to `jobs` OS threads
     let n_miss = miss_indices.length()
-    if n_miss == 1 || jobs <= 1 {
+    if n_miss == 1 || (n_miss > 1 && jobs <= 1) {
       let stamp = clock_now_ms(world).to_string()
-      mi = 0
+      let mut mi = 0
       while mi < n_miss {
         let idx = miss_indices[mi]
         let ukey = unit_keys[idx]
@@ -494,7 +829,14 @@ fn drv_build_targets(
           let _ = fs_remove(world, u_asm)
           return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
         }
-        let rc_as = proc_exec(world, ["as", "-o", u_tmp, u_asm])
+        let rc_as = if apple_tools.ok {
+          proc_exec(
+            world,
+            [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", u_tmp, u_asm],
+          )
+        } else {
+          proc_exec(world, ["as", "-o", u_tmp, u_asm])
+        }
         let _ = fs_remove(world, u_asm)
         if rc_as != 0 {
           let _ = fs_remove(world, u_tmp)
@@ -512,6 +854,9 @@ fn drv_build_targets(
         }
         let err_ch : Channel[String] = Channel::new(batch + 1)
         let stamp_base = clock_now_ms(world).to_string()
+        let use_cc1as = apple_tools.ok
+        let cc1as_bin = apple_tools.clang_bin
+        let cc1as_tr = cc1as_triple
         scope(world, fn(s : Scope) -> Unit {
           let mut off = 0
           while off < batch {
@@ -529,7 +874,11 @@ fn drv_build_targets(
                 let _ = fs_remove(u_asm)
                 let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
               } else {
-                let rc_as = proc_exec(["as", "-o", u_tmp, u_asm])
+                let rc_as = if use_cc1as {
+                  proc_exec([cc1as_bin, "-cc1as", "-triple", cc1as_tr, "-filetype", "obj", "-o", u_tmp, u_asm])
+                } else {
+                  proc_exec(["as", "-o", u_tmp, u_asm])
+                }
                 let _ = fs_remove(u_asm)
                 if rc_as != 0 {
                   let _ = fs_remove(u_tmp)
@@ -551,7 +900,7 @@ fn drv_build_targets(
       }
     }
 
-    if !prep.has_main && out_bin_arg == "" {
+    if !has_main && out_bin_arg == "" {
       return Ok(obj_paths[0])
     }
 
@@ -559,25 +908,49 @@ fn drv_build_targets(
       drv_ensure_parent_dir(world, out_bin_arg)
     }
     let rt_lib = drv_resolve_rt_lib(world)
-    let cc = {
-      let e = drv_env_str(world, "CC")
-      if e.length() > 0 {
-        e
-      } else {
-        "clang"
+    let rc_ld = if apple_tools.ok {
+      let ld_argv : Array[String] = [
+        apple_tools.ld_bin,
+        "-arch",
+        "arm64",
+        "-platform_version",
+        "macos",
+        ld_ver,
+        ld_ver,
+        "-syslibroot",
+        apple_tools.sdk_path,
+        "-o",
+        final_bin,
+      ]
+      let mut oi = 0
+      while oi < obj_paths.length() {
+        ld_argv.push(obj_paths[oi])
+        oi = oi + 1
       }
+      ld_argv.push(rt_lib)
+      ld_argv.push("-lSystem")
+      proc_exec(world, ld_argv)
+    } else {
+      let cc = {
+        let e = drv_env_str(world, "CC")
+        if e.length() > 0 {
+          e
+        } else {
+          "clang"
+        }
+      }
+      let ld_argv : Array[String] = [cc]
+      let mut oi = 0
+      while oi < obj_paths.length() {
+        ld_argv.push(obj_paths[oi])
+        oi = oi + 1
+      }
+      ld_argv.push(rt_lib)
+      ld_argv.push("-lpthread")
+      ld_argv.push("-o")
+      ld_argv.push(final_bin)
+      proc_exec(world, ld_argv)
     }
-    let ld_argv : Array[String] = [cc]
-    let mut oi = 0
-    while oi < obj_paths.length() {
-      ld_argv.push(obj_paths[oi])
-      oi = oi + 1
-    }
-    ld_argv.push(rt_lib)
-    ld_argv.push("-lpthread")
-    ld_argv.push("-o")
-    ld_argv.push(final_bin)
-    let rc_ld = proc_exec(world, ld_argv)
     if rc_ld != 0 {
       return Err("linker failed with exit code " + rc_ld.to_string())
     }
@@ -677,7 +1050,14 @@ fn drv_build_targets(
           }
       }
     }
-    let rc_as = proc_exec(world, ["as", "-o", obj_tmp, asm_path])
+    let rc_as = if apple_tools.ok {
+      proc_exec(
+        world,
+        [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", obj_tmp, asm_path],
+      )
+    } else {
+      proc_exec(world, ["as", "-o", obj_tmp, asm_path])
+    }
     let _ = fs_remove(world, asm_path)
     if rc_as != 0 {
       let _ = fs_remove(world, obj_tmp)
@@ -702,18 +1082,40 @@ fn drv_build_targets(
     drv_ensure_parent_dir(world, out_bin_arg)
   }
   let rt_lib = drv_resolve_rt_lib(world)
-  let cc = {
-    let e = drv_env_str(world, "CC")
-    if e.length() > 0 {
-      e
-    } else {
-      "clang"
+  let rc_ld = if apple_tools.ok {
+    proc_exec(
+      world,
+      [
+        apple_tools.ld_bin,
+        "-arch",
+        "arm64",
+        "-platform_version",
+        "macos",
+        ld_ver,
+        ld_ver,
+        "-syslibroot",
+        apple_tools.sdk_path,
+        "-o",
+        final_bin,
+        obj_path,
+        rt_lib,
+        "-lSystem",
+      ],
+    )
+  } else {
+    let cc = {
+      let e = drv_env_str(world, "CC")
+      if e.length() > 0 {
+        e
+      } else {
+        "clang"
+      }
     }
+    proc_exec(
+      world,
+      [cc, obj_path, rt_lib, "-lpthread", "-o", final_bin],
+    )
   }
-  let rc_ld = proc_exec(
-    world,
-    [cc, obj_path, rt_lib, "-lpthread", "-o", final_bin],
-  )
   if rc_ld != 0 {
     return Err("linker failed with exit code " + rc_ld.to_string())
   }
@@ -836,7 +1238,7 @@ pub fn main(world : World) -> Int {
     let mut emit_ssa = ""
     let mut emit_asm = ""
     let mut out_bin = ""
-    let mut jobs = 8
+    let mut jobs = 16
     let targets : Array[String] = []
     let mut i = 2
     while i < args.length() {
@@ -850,7 +1252,7 @@ pub fn main(world : World) -> Int {
         emit_asm = args[i + 1]
         i = i + 1
       } else if a == "--jobs" && i + 1 < args.length() {
-        jobs = drv_parse_pos_int(args[i + 1], 8)
+        jobs = drv_parse_pos_int(args[i + 1], 16)
         i = i + 1
       } else if a == "-o" && i + 1 < args.length() {
         out_bin = args[i + 1]

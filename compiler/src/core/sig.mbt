@@ -289,6 +289,235 @@ pub fn emit_all_sigs(pkg : Package) -> String {
 }
 
 ///|
+/// Emit canonical per-file declaration signatures (one per line, no header)
+/// for incremental unit-level CAS hashing without re-parsing unchanged files.
+pub fn emit_file_sig_entries(f : SourceFile) -> String {
+  let sb = StringBuilder()
+  let mut di = 0
+  while di < f.decls.length() {
+    match f.decls[di] {
+      DStruct(sd) => {
+        sb.write_string(format_struct_sig(sd))
+        sb.write_string("\n")
+      }
+      DEnum(ed) => {
+        sb.write_string(format_enum_sig(ed))
+        sb.write_string("\n")
+      }
+      DFn(fd) => {
+        sb.write_string(format_fn_sig(fd))
+        sb.write_string("\n")
+      }
+      DConst(cd) => {
+        sb.write_string(format_const_sig(cd))
+        sb.write_string("\n")
+      }
+    }
+    di = di + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Emit a minimal parseable `.m2` stub containing only top-level declarations
+/// (structs, enums, const types, and fn signatures with `{ panic() }` bodies).
+pub fn emit_file_stub(f : SourceFile) -> String {
+  let sb = StringBuilder()
+  let mut di = 0
+  while di < f.decls.length() {
+    match f.decls[di] {
+      DStruct(sd) => {
+        if sd.is_pub {
+          sb.write_string("pub ")
+        }
+        if sd.is_val {
+          sb.write_string("val ")
+        }
+        sb.write_string("struct ")
+        sb.write_string(sd.name)
+        sb.write_string(format_type_params(sd.type_params))
+        sb.write_string(" {\n")
+        let mut i = 0
+        while i < sd.fields.length() {
+          let fld = sd.fields[i]
+          sb.write_string("  ")
+          if fld.is_mut {
+            sb.write_string("mut ")
+          }
+          sb.write_string(fld.name)
+          sb.write_string(" : ")
+          sb.write_string(type_expr_to_string(fld.ty))
+          sb.write_string("\n")
+          i = i + 1
+        }
+        sb.write_string("}\n")
+      }
+      DEnum(ed) => {
+        if ed.is_pub {
+          sb.write_string("pub ")
+        }
+        sb.write_string("enum ")
+        sb.write_string(ed.name)
+        sb.write_string(format_type_params(ed.type_params))
+        sb.write_string(" {\n")
+        let mut i = 0
+        while i < ed.variants.length() {
+          let v = ed.variants[i]
+          sb.write_string("  ")
+          sb.write_string(v.name)
+          if v.fields.length() > 0 {
+            sb.write_string("(")
+            let mut j = 0
+            while j < v.fields.length() {
+              if j > 0 {
+                sb.write_string(", ")
+              }
+              sb.write_string(type_expr_to_string(v.fields[j]))
+              j = j + 1
+            }
+            sb.write_string(")")
+          }
+          sb.write_string("\n")
+          i = i + 1
+        }
+        sb.write_string("}\n")
+      }
+      DFn(fd) => {
+        if fd.is_pub {
+          sb.write_string("pub ")
+        }
+        sb.write_string("fn ")
+        if fd.receiver_type != "" {
+          sb.write_string(fd.receiver_type)
+          sb.write_string("::")
+        }
+        sb.write_string(fd.name)
+        sb.write_string(format_type_params(fd.type_params))
+        sb.write_string("(")
+        let mut i = 0
+        while i < fd.params.length() {
+          if i > 0 {
+            sb.write_string(", ")
+          }
+          let param = fd.params[i]
+          sb.write_string(param.name)
+          sb.write_string(" : ")
+          sb.write_string(type_expr_to_string(param.ty))
+          i = i + 1
+        }
+        sb.write_string(") -> ")
+        sb.write_string(type_expr_to_string(fd.ret_ty))
+        sb.write_string(" { panic() }\n")
+      }
+      DConst(cd) => {
+        if cd.is_pub {
+          sb.write_string("pub ")
+        }
+        sb.write_string("let ")
+        sb.write_string(cd.name)
+        sb.write_string(" : ")
+        sb.write_string(type_expr_to_string(cd.ty))
+        sb.write_string(" = panic()\n")
+      }
+    }
+    di = di + 1
+  }
+  sb.to_string()
+}
+
+///|
+pub struct FileSigsSummary {
+  sigs_hash : String
+  const_units : Array[Int]
+  has_main : Bool
+}
+
+///|
+/// Reconstruct the exact same `sigs_hash` and `const_units` as `cli_prepare_qbe_units`
+/// from per-file signature texts (`emit_file_sig_entries`).
+pub fn summarize_file_sigs(
+  pkg_name : String,
+  file_sigs : Array[String],
+) -> FileSigsSummary {
+  let entries : Array[SigEntry] = []
+  let const_units : Array[Int] = []
+  let mut has_main = false
+  let mut fi = 0
+  while fi < file_sigs.length() {
+    let lines = split_lines(file_sigs[fi])
+    let mut has_const = false
+    let mut i = 0
+    while i < lines.length() {
+      let line = lines[i]
+      if line.length() == 0 {
+        i = i + 1
+        continue
+      }
+      if starts_with_str(line, "val struct ") {
+        entries.push(SigEntry::{
+          kind: "struct",
+          name: extract_sig_name(line, 11),
+          signature: line,
+        })
+      } else if starts_with_str(line, "struct ") {
+        entries.push(SigEntry::{
+          kind: "struct",
+          name: extract_sig_name(line, 7),
+          signature: line,
+        })
+      } else if starts_with_str(line, "enum ") {
+        entries.push(SigEntry::{
+          kind: "enum",
+          name: extract_sig_name(line, 5),
+          signature: line,
+        })
+      } else if starts_with_str(line, "fn ") {
+        let fname = extract_sig_name(line, 3)
+        if fname == "main" {
+          has_main = true
+        }
+        entries.push(SigEntry::{
+          kind: "fn",
+          name: fname,
+          signature: line,
+        })
+      } else if starts_with_str(line, "const ") {
+        has_const = true
+        entries.push(SigEntry::{
+          kind: "const",
+          name: extract_sig_name(line, 6),
+          signature: line,
+        })
+      }
+      i = i + 1
+    }
+    if has_const {
+      const_units.push(fi)
+    }
+    fi = fi + 1
+  }
+  sort_sig_entries(entries)
+  let all_sigs = serialize_m2sig(PackageSig::{ pkg: pkg_name, entries: entries })
+  let sig_sb = StringBuilder()
+  sig_sb.write_string(all_sigs)
+  sig_sb.write_string("const_units:")
+  let mut ci = 0
+  while ci < const_units.length() {
+    if ci > 0 {
+      sig_sb.write_string(",")
+    }
+    sig_sb.write_string(const_units[ci].to_string())
+    ci = ci + 1
+  }
+  sig_sb.write_string("\n")
+  FileSigsSummary::{
+    sigs_hash: cas_sha256_hex(sig_sb.to_string()),
+    const_units: const_units,
+    has_main: has_main,
+  }
+}
+
+///|
 fn split_lines(s : String) -> Array[String] {
   let out : Array[String] = []
   let len = s.length()
