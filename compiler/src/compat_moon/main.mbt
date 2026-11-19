@@ -807,6 +807,7 @@ fn build_targets(
           oi = oi + 1
         }
         ld_argv.push(rt_lib)
+        ld_argv.push("-lm")
         ld_argv.push("-lpthread")
         ld_argv.push("-o")
         ld_argv.push(final_bin)
@@ -923,6 +924,7 @@ fn build_targets(
       oi = oi + 1
     }
     ld_argv.push(rt_lib)
+    ld_argv.push("-lm")
     ld_argv.push("-lpthread")
     ld_argv.push("-o")
     ld_argv.push(final_bin)
@@ -1042,7 +1044,7 @@ fn build_targets(
     let e = env_str("CC")
     if e.length() > 0 { e } else { "clang" }
   }
-  let rc_ld = exec_argv([cc, obj_path, rt_lib, "-lpthread", "-o", final_bin])
+  let rc_ld = exec_argv([cc, obj_path, rt_lib, "-lm", "-lpthread", "-o", final_bin])
   if rc_ld != 0 {
     return Err("linker failed with exit code " + rc_ld.to_string())
   }
@@ -1166,6 +1168,7 @@ fn run_tests_cmd(
     }
     ld_argv.push(obj_path)
     ld_argv.push(rt_lib)
+    ld_argv.push("-lm")
     ld_argv.push("-lpthread")
     ld_argv.push("-o")
     ld_argv.push(test_bin)

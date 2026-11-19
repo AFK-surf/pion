@@ -13,6 +13,7 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
    - No Rust-style `<'a>` lifetime annotations.
    - Heap objects (strings, bytes, arrays, maps, structs, enums, closures) use **Biased Reference Counting**: non-atomic `local_rc` on the owning thread (zero atomic overhead in single-threaded code), transparently promoted to atomic `shared_rc` when frozen/shared across threads.
    - Borrowed function parameters do not bump RC on entry/exit (Perceus-lite borrow elision).
+   - **Perceus-lite last-use early drop**: top-level immutable owned heap locals in a straight-line statement block are released immediately after their last syntactic mention (`m2_rc_dec` + slot zeroing) when not pinned by a borrowed array-element view, reclaiming large temporaries before subsequent allocations.
 3. **Compile-Time Data-Race-Free Multithreading**:
    - Native OS threads via structured concurrency (`scope` + `spawn`), `Channel[T]`, `Mutex[T]`, `AtomicInt`.
    - Every type is statically classified as `Send` or `!Send`:
@@ -174,6 +175,15 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void  m2_panic(const char *msg, const char *file, int32_t line);` (prints concise diagnostic to stderr and `abort()`/`_exit(1)`)
 - `void  m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line);`
 
+**Math (`Double`):**
+- `double  m2_math_sqrt(double x);` (compiler builtin `math_sqrt`)
+- `double  m2_math_abs(double x);` (compiler builtin `math_abs`)
+- `double  m2_math_floor(double x);` (compiler builtin `math_floor`)
+- `double  m2_math_ceil(double x);` (compiler builtin `math_ceil`)
+- `double  m2_math_sin(double x);` (compiler builtin `math_sin`)
+- `double  m2_math_cos(double x);` (compiler builtin `math_cos`)
+- `double  m2_math_pow(double x, double y);` (compiler builtin `math_pow`)
+
 **String (`M2String`: `{ int64_t len; char data[]; }` UTF-8, NUL-terminated):**
 - `void*   m2_str_from_cstr(const char *s, int64_t len);`
 - `int64_t m2_str_len(void *s);`
@@ -184,6 +194,23 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void*   m2_str_slice(void *s, int64_t start, int64_t end);`
 - `void*   m2_int_to_str(int64_t v);`
 - `int64_t m2_str_to_int(void *s, int32_t *ok_out);`
+- `int32_t m2_str_starts_with(void *s, void *prefix);` (`s.starts_with(prefix) -> Bool`)
+- `int32_t m2_str_ends_with(void *s, void *suffix);` (`s.ends_with(suffix) -> Bool`)
+- `int32_t m2_str_contains(void *s, void *needle);` (`s.contains(needle) -> Bool`)
+- `int64_t m2_str_index_of(void *s, void *needle);` (`s.index_of(needle) -> Int`)
+- `void*   m2_str_trim(void *s);` (`s.trim() -> String`)
+- `void*   m2_str_split(void *s, void *sep);` (`s.split(sep) -> Array[String]`)
+- `void*   m2_str_replace(void *s, void *from, void *to);` (`s.replace(from, to) -> String`)
+- `void*   m2_str_to_bytes(void *s);` (`s.to_bytes() -> Bytes`)
+
+**Bytes (`M2Bytes`: `{ int64_t len; int64_t cap; uint8_t *data; }` — mutable `!Send` heap byte buffer):**
+- `void*   m2_bytes_new(int64_t len);` (`Bytes::new(len) -> Bytes`)
+- `int64_t m2_bytes_len(void *b);` (`b.length() -> Int`)
+- `int32_t m2_bytes_get(void *b, int64_t idx);` (`b[i] -> Byte`, bounds-checked)
+- `void    m2_bytes_set(void *b, int64_t idx, int32_t val);` (`b[i] = val` where `val : Byte`, bounds-checked)
+- `void*   m2_bytes_slice(void *b, int64_t start, int64_t end);` (`b.slice(start, end) -> Bytes`)
+- `void*   m2_bytes_concat(void *a, void *b);` (`b.concat(other) -> Bytes`)
+- `void*   m2_bytes_to_str(void *b);` (`b.to_string() -> String`)
 
 **StringBuilder (`M2StrBuf`):**
 - `void* m2_strbuf_new(int64_t cap);`
@@ -239,8 +266,12 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void    m2_world_print(void *w, void *s);`
 - `void    m2_world_println(void *w, void *s);`
 - `void    m2_world_eprintln(void *w, void *s);`
-- `void*   m2_world_fs_read(void *w, void *path_str, int32_t *ok_out);`
-- `int32_t m2_world_fs_write(void *w, void *path_str, void *content_str);`
+- `void*   m2_world_fs_read(void *w, void *path_str, int32_t *ok_out);` (`fs_read -> Result[String, String]`)
+- `int32_t m2_world_fs_write(void *w, void *path_str, void *content_str);` (`fs_write -> Result[Unit, String]`)
+- `void*   m2_world_fs_read_bytes(void *w, void *path_str, int32_t *ok_out);` (`fs_read_bytes -> Result[Bytes, String]`)
+- `int32_t m2_world_fs_write_bytes(void *w, void *path_str, void *bytes_obj);` (`fs_write_bytes -> Result[Unit, String]`)
+- `int32_t m2_world_fs_append(void *w, void *path_str, void *content_str);` (`fs_append -> Result[Unit, String]`)
+- `int64_t m2_world_fs_mtime_ms(void *w, void *path_str);` (`fs_mtime_ms -> Int64`, `-1` if missing)
 - `int32_t m2_world_fs_exists(void *w, void *path_str);`
 - `int32_t m2_world_fs_is_dir(void *w, void *path_str);`
 - `int32_t m2_world_fs_mkdir_p(void *w, void *path_str);`
@@ -251,6 +282,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void*   m2_world_env_get(void *w, void *name_str, int32_t *ok_out);`
 - `int64_t m2_world_clock_ms(void *w);`
 - `int32_t m2_world_exec(void *w, void *argv_arr);` (fork/execvp waitpid, returns exit code)
+- `void*   m2_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out);` (`proc_exec_capture -> Result[String, String]`; `Ok(stdout)` if exit code == 0, else `Err("exit <code>: <stdout>")`)
 - `void*   m2_sha256_hex(void *s);` (pure SHA-256 hex digest for CAS cache keys!)
 
 ---
