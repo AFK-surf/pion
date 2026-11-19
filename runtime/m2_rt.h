@@ -50,6 +50,12 @@ typedef struct M2String {
     char data[];
 } M2String;
 
+typedef struct M2Bytes {
+    int64_t len;
+    int64_t cap;
+    uint8_t *data;
+} M2Bytes;
+
 typedef struct M2StrBuf {
     int64_t len;
     int64_t cap;
@@ -106,6 +112,12 @@ void     m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t 
 
 /* Math */
 double   m2_math_sqrt(double x);
+double   m2_math_abs(double x);
+double   m2_math_floor(double x);
+double   m2_math_ceil(double x);
+double   m2_math_sin(double x);
+double   m2_math_cos(double x);
+double   m2_math_pow(double x, double y);
 
 /* String */
 void*    m2_str_from_cstr(const char *s, int64_t len);
@@ -117,6 +129,23 @@ int32_t  m2_str_cmp(void *a, void *b);
 void*    m2_str_slice(void *s, int64_t start, int64_t end);
 void*    m2_int_to_str(int64_t v);
 int64_t  m2_str_to_int(void *s, int32_t *ok_out);
+int32_t  m2_str_starts_with(void *s, void *prefix);
+int32_t  m2_str_ends_with(void *s, void *suffix);
+int32_t  m2_str_contains(void *s, void *needle);
+int64_t  m2_str_index_of(void *s, void *needle);
+void*    m2_str_trim(void *s);
+void*    m2_str_split(void *s, void *sep);
+void*    m2_str_replace(void *s, void *from, void *to);
+void*    m2_str_to_bytes(void *s);
+void*    m2_bytes_to_str(void *b);
+
+/* Bytes */
+void*    m2_bytes_new(int64_t len);
+int64_t  m2_bytes_len(void *b);
+int32_t  m2_bytes_get(void *b, int64_t idx);
+void     m2_bytes_set(void *b, int64_t idx, int32_t val);
+void*    m2_bytes_slice(void *b, int64_t start, int64_t end);
+void*    m2_bytes_concat(void *a, void *b);
 
 /* StringBuilder */
 void*    m2_strbuf_new(int64_t cap);
@@ -175,6 +204,10 @@ void     m2_world_println(void *w, void *s);
 void     m2_world_eprintln(void *w, void *s);
 void*    m2_world_fs_read(void *w, void *path_str, int32_t *ok_out);
 int32_t  m2_world_fs_write(void *w, void *path_str, void *content_str);
+void*    m2_world_fs_read_bytes(void *w, void *path_str, int32_t *ok_out);
+int32_t  m2_world_fs_write_bytes(void *w, void *path_str, void *bytes_obj);
+int32_t  m2_world_fs_append(void *w, void *path_str, void *content_str);
+int64_t  m2_world_fs_mtime_ms(void *w, void *path_str);
 int32_t  m2_world_fs_exists(void *w, void *path_str);
 int32_t  m2_world_fs_is_dir(void *w, void *path_str);
 int32_t  m2_world_fs_mkdir_p(void *w, void *path_str);
@@ -185,6 +218,7 @@ int64_t  m2_world_fs_size(void *w, void *path_str);
 void*    m2_world_env_get(void *w, void *name_str, int32_t *ok_out);
 int64_t  m2_world_clock_ms(void *w);
 int32_t  m2_world_exec(void *w, void *argv_arr);
+void*    m2_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out);
 void*    m2_sha256_hex(void *s);
 
 #ifdef __cplusplus
