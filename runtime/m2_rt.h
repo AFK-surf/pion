@@ -96,6 +96,7 @@ typedef struct M2Map {
 /* Memory & Biased RC */
 uint64_t m2_cur_tid(void);
 void*    m2_alloc(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn);
+void*    m2_alloc_uninit(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn);
 void     m2_rc_inc(void *obj);
 void     m2_rc_dec(void *obj);
 void     m2_rc_freeze(void *obj);
@@ -141,6 +142,7 @@ int64_t  m2_map_len(void *m);
 void     m2_map_set(void *m, void *key_str, int64_t val);
 int32_t  m2_map_has(void *m, void *key_str);
 int64_t  m2_map_get(void *m, void *key_str);
+int32_t  m2_map_try_get(void *m_ptr, void *key_str, int64_t *out_val);
 void     m2_map_remove(void *m, void *key_str);
 void*    m2_map_copy(void *m);
 void*    m2_map_keys(void *m);
