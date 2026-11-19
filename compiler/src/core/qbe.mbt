@@ -77,6 +77,7 @@ pub struct QbeGen {
   mut hoisted_arr_len : Map[String, String]
   mut hoisted_arr_dp : Map[String, String]
   mut hoisted_fields : Map[String, QbeVal]
+  mut block_immut_fields : Map[String, QbeVal]
   mut len_aliases : Map[String, String]
   mut len_alias_keys : Array[String]
   mut nonneg_vars : Map[String, Bool]
@@ -2008,6 +2009,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     hoisted_arr_len: Map([]),
     hoisted_arr_dp: Map([]),
     hoisted_fields: Map([]),
+    block_immut_fields: Map([]),
     len_aliases: Map([]),
     len_alias_keys: [],
     nonneg_vars: Map([]),
@@ -2071,6 +2073,7 @@ fn qbe_emit_lbl(g : QbeGen, lbl : String) -> Unit {
   g.fn_body.write_string(lbl)
   g.fn_body.write_string("\n")
   g.block_term = false
+  g.block_immut_fields = Map([])
 }
 
 ///|
@@ -2168,6 +2171,7 @@ fn qbe_register_fn_wrapper(g : QbeGen, fname : String) -> String {
 ///|
 fn qbe_scope_push(g : QbeGen) -> Unit {
   g.scopes.push(QbeScope::{ locals: [] })
+  g.block_immut_fields = Map([])
 }
 
 ///|
@@ -2203,6 +2207,7 @@ fn qbe_scope_pop(g : QbeGen) -> Unit {
     }
     let _ = g.scopes.pop()
   }
+  g.block_immut_fields = Map([])
 }
 
 ///|
@@ -2225,6 +2230,7 @@ fn qbe_define_local(
   let loc = QbeLocal::{ name: name, slot: slot, ty: ty, owned: owned }
   let top = g.scopes[g.scopes.length() - 1]
   top.locals.push(loc)
+  g.block_immut_fields = Map([])
   loc
 }
 
@@ -3042,6 +3048,7 @@ fn qbe_emit_closure_obj(
   let saved_hlen = g.hoisted_arr_len
   let saved_hdp = g.hoisted_arr_dp
   let saved_hfields = g.hoisted_fields
+  let saved_bfields = g.block_immut_fields
   let saved_lalias = g.len_aliases
   let saved_lkeys = g.len_alias_keys
   let saved_nonneg = g.nonneg_vars
@@ -3059,6 +3066,7 @@ fn qbe_emit_closure_obj(
   g.hoisted_arr_len = Map([])
   g.hoisted_arr_dp = Map([])
   g.hoisted_fields = Map([])
+  g.block_immut_fields = Map([])
   g.len_aliases = Map([])
   g.len_alias_keys = []
   g.nonneg_vars = Map([])
@@ -3137,6 +3145,7 @@ fn qbe_emit_closure_obj(
   g.hoisted_arr_len = saved_hlen
   g.hoisted_arr_dp = saved_hdp
   g.hoisted_fields = saved_hfields
+  g.block_immut_fields = saved_bfields
   g.len_aliases = saved_lalias
   g.len_alias_keys = saved_lkeys
   g.nonneg_vars = saved_nonneg
@@ -4881,7 +4890,8 @@ fn qbe_emit_expr(
         }
       }
     }
-    ECall(callee, args, sp) =>
+    ECall(callee, args, sp) => {
+      g.block_immut_fields = Map([])
       match callee {
         EIdent(name, _) => {
           if name == "StringBuilder" {
@@ -5056,6 +5066,7 @@ fn qbe_emit_expr(
               }
               sb.write_string(")")
               qbe_emit(g, sb.to_string())
+              g.block_immut_fields = Map([])
               j = 0
               while j < arg_vals.length() {
                 if !arg_borrowed[j] {
@@ -5263,6 +5274,7 @@ fn qbe_emit_expr(
               }
               sb.write_string(")")
               qbe_emit(g, sb.to_string())
+              g.block_immut_fields = Map([])
               j = 0
               while j < arg_vals.length() {
                 if !arg_borrowed[j] {
@@ -5303,16 +5315,25 @@ fn qbe_emit_expr(
             i = i + 1
           }
           let res = qbe_emit_closure_call(g, cv.reg, arg_vals, arg_tys)
+          g.block_immut_fields = Map([])
           qval(qbe_from_l(g, res, rty), rty)
         }
       }
+    }
     EField(obj, field_name, _) => {
+      let mut cache_key = ""
       match obj {
-        EIdent(lname, _) =>
-          match g.hoisted_fields.get(lname + "." + field_name) {
+        EIdent(lname, _) => {
+          cache_key = lname + "." + field_name
+          match g.hoisted_fields.get(cache_key) {
             Some(hv) => return hv
             None => ()
           }
+          match g.block_immut_fields.get(cache_key) {
+            Some(bv) => return bv
+            None => ()
+          }
+        }
         _ => ()
       }
       let mut borrowed = false
@@ -5353,7 +5374,17 @@ fn qbe_emit_expr(
                   if !borrowed {
                     qbe_rc_dec(g, ov.reg, ov.ty)
                   }
-                  return qval(r, fty)
+                  let res_val = qval(r, fty)
+                  if borrowed && cache_key != "" && !sinfo.field_muts[i] {
+                    let is_prim = match fty {
+                      TInt | TInt64 | TDouble | TBool | TByte | TChar => true
+                      _ => false
+                    }
+                    if is_prim {
+                      g.block_immut_fields.set(cache_key, res_val)
+                    }
+                  }
+                  return res_val
                 }
                 i = i + 1
               }
@@ -5377,8 +5408,12 @@ fn qbe_emit_expr(
         }
       }
     }
-    EMethodCall(obj, method_name, args, _) =>
-      qbe_emit_method_call(g, obj, method_name, args, expected)
+    EMethodCall(obj, method_name, args, _) => {
+      g.block_immut_fields = Map([])
+      let r = qbe_emit_method_call(g, obj, method_name, args, expected)
+      g.block_immut_fields = Map([])
+      r
+    }
     EIndex(obj, idx, _) => {
       let mut borrowed = false
       let mut ov = qval("0", TError)
@@ -5457,7 +5492,15 @@ fn qbe_emit_expr(
           let ep = qbe_tmp(g)
           qbe_emit(g, off + " =l shl " + il + ", 3")
           qbe_emit(g, ep + " =l add " + dp + ", " + off)
-          let r = qbe_load_heap_slot(g, ep, elem)
+          let r = if qbe_is_int32_ty(elem) {
+            let rl = qbe_tmp(g)
+            let rw = qbe_tmp(g)
+            qbe_emit(g, rl + " =l loadl " + ep)
+            qbe_emit(g, rw + " =w copy " + rl)
+            rw
+          } else {
+            qbe_load_heap_slot(g, ep, elem)
+          }
           qbe_rc_inc(g, r, elem)
           if !borrowed {
             qbe_rc_dec(g, ov.reg, ov.ty)
@@ -6154,11 +6197,13 @@ fn qbe_emit_stmt(
               } else {
                 qbe_store_local_slot(g, rval_reg, loc.slot, loc.ty)
               }
+              g.block_immut_fields = Map([])
             }
             None => {
               let rv = qbe_emit_expr(g, rhs, None)
               let loc = qbe_define_local(g, name, rv.ty, true)
               qbe_store_local_slot(g, rv.reg, loc.slot, rv.ty)
+              g.block_immut_fields = Map([])
             }
           }
         }
@@ -6683,6 +6728,7 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       g.hoisted_arr_len = Map([])
       g.hoisted_arr_dp = Map([])
       g.hoisted_fields = Map([])
+      g.block_immut_fields = Map([])
       g.len_aliases = Map([])
       g.len_alias_keys = []
       g.nonneg_vars = Map([])
