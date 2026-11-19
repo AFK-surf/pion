@@ -625,7 +625,14 @@ void emitdat(Dat *, FILE *);
 void emitdbgfile(char *, FILE *);
 void emitdbgloc(uint, uint, FILE *);
 int stashbits(bits, int);
+void iterstash(void (*)(int, bits, int, void *), void *);
 void elf_emitfnfin(char *, FILE *);
 void elf_emitfin(FILE *);
 void macho_emitfin(FILE *);
 void pe_emitfin(FILE *);
+
+/* arm64/macho.c */
+void arm64_macho_begin(uint32_t macos_ver);
+void arm64_macho_dat(Dat *);
+void arm64_macho_fn(Fn *);
+void arm64_macho_finish(FILE *);

@@ -200,6 +200,24 @@ emitfin(FILE *f, char *sec[3])
 }
 
 void
+iterstash(void (*cb)(int, bits, int, void *), void *ctx)
+{
+	Asmbits *b;
+	int lg, i;
+
+	if (!stash)
+		return;
+	for (lg=4; lg>=2; lg--)
+		for (b=stash, i=0; b; b=b->link, i++)
+			if (b->size == (1<<lg))
+				cb(i, b->n, b->size, ctx);
+	while ((b=stash)) {
+		stash = b->link;
+		free(b);
+	}
+}
+
+void
 elf_emitfin(FILE *f)
 {
 	static char *sec[3] = { ".rodata", ".rodata", ".rodata" };
