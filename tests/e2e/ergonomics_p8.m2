@@ -1,0 +1,98 @@
+// Phase 8 comprehensive E2E:
+// tuple destructuring (including `_` and heap String elements),
+// tuple element indexing (`t.0`, `t.1`),
+// match guards with fallthrough and heap-binding cleanup,
+// generic user functions (`pair_swap[A, B]`),
+// postfix `?` on Result/Option, `for in`, and string interpolation `\{expr}`.
+
+fn pair_swap[A, B](p : (A, B)) -> (B, A) {
+  let (a, b) = p
+  (b, a)
+}
+
+fn make_record(prefix : String, score : Int) -> (String, String, Int) {
+  (prefix + "-ok", prefix + "-discard", score)
+}
+
+fn classify_opt(opt : Option[String]) -> String {
+  match opt {
+    Some(s) if s.length() > 6 => "long:\{s}"
+    Some(s) if s.starts_with("hi") => "greet:\{s}"
+    Some(s) => "other:\{s}"
+    None => "none"
+  }
+}
+
+fn classify_num(n : Int) -> String {
+  match n {
+    x if x < 0 => "neg"
+    x if x == 0 => "zero"
+    x if x > 100 => "huge"
+    _ => "normal"
+  }
+}
+
+fn parse_and_double(flag : Bool, v : Int) -> Result[Int, String] {
+  let base : Result[Int, String] = if flag { Ok(v) } else { Err("bad-flag") }
+  let x = base?
+  Ok(x * 2)
+}
+
+fn opt_chain(v : Option[Int]) -> Option[Int] {
+  let x = v?
+  Some(x + 10)
+}
+
+pub fn main(world : World) -> Int {
+  let (tag, _, score) : (String, String, Int) = make_record("m2", 21)
+  let swapped = pair_swap((tag, score))
+  let s_num = swapped.0
+  let s_str = swapped.1
+
+  let mut sum = 0
+  let nums : Array[Int] = [1, 2, 3, 4]
+  for x in nums {
+    sum = sum + x
+  }
+  for i in 0..5 {
+    sum = sum + i
+  }
+
+  let c1 = classify_opt(Some("hello-world"))
+  let c2 = classify_opt(Some("hi!"))
+  let c3 = classify_opt(Some("abc"))
+  let c4 = classify_opt(None)
+
+  let n1 = classify_num(-5)
+  let n2 = classify_num(0)
+  let n3 = classify_num(250)
+  let n4 = classify_num(42)
+
+  let r_ok = match parse_and_double(true, s_num) {
+    Ok(v) => v
+    Err(_) => -1
+  }
+  let r_err = match parse_and_double(false, 9) {
+    Ok(_) => "unexpected"
+    Err(e) => e
+  }
+  let o_val = match opt_chain(Some(5)) {
+    Some(v) => v
+    None => -1
+  }
+
+  debug_assert(s_num == 21, "swapped.0 mismatch")
+  debug_assert(s_str == "m2-ok", "swapped.1 mismatch")
+  debug_assert(sum == 20, "for-in/range sum mismatch")
+  debug_assert(c1 == "long:hello-world", "c1 mismatch")
+  debug_assert(c2 == "greet:hi!", "c2 mismatch")
+  debug_assert(c3 == "other:abc", "c3 mismatch")
+  debug_assert(c4 == "none", "c4 mismatch")
+  debug_assert(n1 == "neg" && n2 == "zero" && n3 == "huge" && n4 == "normal", "num guard mismatch")
+  debug_assert(r_ok == 42, "try ok mismatch")
+  debug_assert(r_err == "bad-flag", "try err mismatch")
+  debug_assert(o_val == 15, "opt try mismatch")
+
+  io_println(world, "p8-e2e: s=\{s_str} n=\{s_num} sum=\{sum} c=\{c1}|\{c2}|\{c3}|\{c4} try=\{r_ok}/\{r_err}/\{o_val}")
+  0
+}

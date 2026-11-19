@@ -117,13 +117,14 @@ test "test name" {
 
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
+- Tuple destructuring & element indexing: `let (a, b) = expr` / `let (a, _, c) : (T1, T2, T3) = expr` (`_` ignores an element), and `t.0` / `t.1` tuple element access
 - Assignment: `x = expr`, `obj.field = expr`, `arr[i] = expr`
 - Control flow:
   - `if cond { ... } else if cond2 { ... } else { ... }` (expression when all branches yield same type)
   - `while cond { ... }`
   - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` (half-open `[start, end)`), `for x in arr { ... }` (`Array[T]`)
   - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E]`) and `Option[T]` (enclosing function returns `Option[_]`)
-  - `match scrutinee { Pat => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed)
+  - `match scrutinee { Pat [if guard_cond] => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed; guarded arms do not satisfy exhaustiveness on their own, and failed guards release arm pattern bindings and fall through to subsequent arms)
   - `return [expr]`, `break`, `continue`
 - Closures: `fn(x : T) -> R { ... }` (captures by value / biased RC; inside `spawn(...)`, only `Send` or `move` captures allowed)
 - Concurrency (m2 native):

@@ -615,6 +615,13 @@ fn qbe_expr_assigns_ident(e : Expr, name : String) -> Bool {
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_assigns_ident(ge, name) {
+              return true
+            }
+          None => ()
+        }
         if qbe_expr_assigns_ident(arms[i].body, name) {
           return true
         }
@@ -630,6 +637,7 @@ fn qbe_expr_assigns_ident(e : Expr, name : String) -> Bool {
 fn qbe_stmt_assigns_ident(s : Stmt, name : String) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_expr_assigns_ident(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_assigns_ident(init, name)
     SAssign(lhs, rhs, _) => {
       match lhs {
         EIdent(n, _) =>
@@ -757,6 +765,13 @@ fn qbe_expr_mentions_ident(e : Expr, name : String) -> Bool {
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_mentions_ident(ge, name) {
+              return true
+            }
+          None => ()
+        }
         if qbe_expr_mentions_ident(arms[i].body, name) {
           return true
         }
@@ -772,6 +787,7 @@ fn qbe_expr_mentions_ident(e : Expr, name : String) -> Bool {
 fn qbe_stmt_mentions_ident(s : Stmt, name : String) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_expr_mentions_ident(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_mentions_ident(init, name)
     SAssign(lhs, rhs, _) =>
       qbe_expr_mentions_ident(lhs, name) || qbe_expr_mentions_ident(rhs, name)
     SWhile(cond, body, _) =>
@@ -971,6 +987,14 @@ fn qbe_ident_is_borrow_safe_expr(g : QbeGen, e : Expr, name : String) -> Bool {
             let mut ai = 0
             let mut ok = true
             while ai < arms.length() {
+              match arms[ai].guard_expr {
+                Some(ge) =>
+                  if qbe_expr_assigns_ident(ge, name) {
+                    ok = false
+                    break
+                  }
+                None => ()
+              }
               if qbe_expr_assigns_ident(arms[ai].body, name) {
                 ok = false
                 break
@@ -989,6 +1013,13 @@ fn qbe_ident_is_borrow_safe_expr(g : QbeGen, e : Expr, name : String) -> Bool {
       let mut i = 0
       while i < arms.length() {
         if !qbe_pat_binds_name(arms[i].pat, name) {
+          match arms[i].guard_expr {
+            Some(ge) =>
+              if !qbe_ident_is_borrow_safe_expr(g, ge, name) {
+                return false
+              }
+            None => ()
+          }
           if !qbe_ident_is_borrow_safe_expr(g, arms[i].body, name) {
             return false
           }
@@ -1006,6 +1037,7 @@ fn qbe_ident_is_borrow_safe_expr(g : QbeGen, e : Expr, name : String) -> Bool {
 fn qbe_ident_is_borrow_safe_stmt(g : QbeGen, s : Stmt, name : String) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_ident_is_borrow_safe_expr(g, init, name)
+    SLetTuple(_, _, init, _) => qbe_ident_is_borrow_safe_expr(g, init, name)
     SAssign(lhs, rhs, _) => {
       if !qbe_ident_is_borrow_safe_expr(g, rhs, name) {
         return false
@@ -1082,6 +1114,14 @@ fn qbe_ident_is_borrow_safe_stmts(
           return false
         }
         if lname == name {
+          return true
+        }
+      }
+      SLetTuple(lnames, _, init, _) => {
+        if !qbe_ident_is_borrow_safe_expr(g, init, name) {
+          return false
+        }
+        if str_arr_contains(lnames, name) {
           return true
         }
       }
@@ -1198,6 +1238,13 @@ fn qbe_arr_is_stable_expr(
       let mut i = 0
       while i < arms.length() {
         if !qbe_pat_binds_name(arms[i].pat, aname) {
+          match arms[i].guard_expr {
+            Some(ge) =>
+              if !qbe_arr_is_stable_expr(ge, aname, allow_elem_assign) {
+                return false
+              }
+            None => ()
+          }
           if !qbe_arr_is_stable_expr(arms[i].body, aname, allow_elem_assign) {
             return false
           }
@@ -1219,6 +1266,8 @@ fn qbe_arr_is_stable_stmt(
 ) -> Bool {
   match s {
     SLet(_, _, _, init, _) =>
+      qbe_arr_is_stable_expr(init, aname, allow_elem_assign)
+    SLetTuple(_, _, init, _) =>
       qbe_arr_is_stable_expr(init, aname, allow_elem_assign)
     SAssign(lhs, rhs, _) => {
       if !qbe_arr_is_stable_expr(rhs, aname, allow_elem_assign) {
@@ -1279,6 +1328,14 @@ fn qbe_arr_is_stable_stmts(
           return false
         }
         if lname == aname {
+          return true
+        }
+      }
+      SLetTuple(lnames, _, init, _) => {
+        if !qbe_arr_is_stable_expr(init, aname, allow_elem_assign) {
+          return false
+        }
+        if str_arr_contains(lnames, aname) {
           return true
         }
       }
@@ -1364,6 +1421,10 @@ fn qbe_collect_indexed_arrs_expr(e : Expr, out : Array[String]) -> Unit {
       qbe_collect_indexed_arrs_expr(scrut, out)
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => qbe_collect_indexed_arrs_expr(ge, out)
+          None => ()
+        }
         qbe_collect_indexed_arrs_expr(arms[i].body, out)
         i = i + 1
       }
@@ -1376,6 +1437,7 @@ fn qbe_collect_indexed_arrs_expr(e : Expr, out : Array[String]) -> Unit {
 fn qbe_collect_indexed_arrs_stmt(s : Stmt, out : Array[String]) -> Unit {
   match s {
     SLet(_, _, _, init, _) => qbe_collect_indexed_arrs_expr(init, out)
+    SLetTuple(_, _, init, _) => qbe_collect_indexed_arrs_expr(init, out)
     SAssign(lhs, rhs, _) => {
       qbe_collect_indexed_arrs_expr(lhs, out)
       qbe_collect_indexed_arrs_expr(rhs, out)
@@ -1510,6 +1572,13 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if !qbe_loop_has_no_calls_expr(ge) {
+              return false
+            }
+          None => ()
+        }
         if !qbe_loop_has_no_calls_expr(arms[i].body) {
           return false
         }
@@ -1524,6 +1593,7 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
 fn qbe_loop_has_no_calls_stmt(s : Stmt) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_loop_has_no_calls_expr(init)
+    SLetTuple(_, _, init, _) => qbe_loop_has_no_calls_expr(init)
     SAssign(lhs, rhs, _) =>
       qbe_loop_has_no_calls_expr(lhs) && qbe_loop_has_no_calls_expr(rhs)
     SWhile(cond, body, _) =>
@@ -1626,6 +1696,10 @@ fn qbe_collect_written_fields_expr(e : Expr, out : Map[String, Bool]) -> Unit {
       qbe_collect_written_fields_expr(scrut, out)
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => qbe_collect_written_fields_expr(ge, out)
+          None => ()
+        }
         qbe_collect_written_fields_expr(arms[i].body, out)
         i = i + 1
       }
@@ -1638,6 +1712,7 @@ fn qbe_collect_written_fields_expr(e : Expr, out : Map[String, Bool]) -> Unit {
 fn qbe_collect_written_fields_stmt(s : Stmt, out : Map[String, Bool]) -> Unit {
   match s {
     SLet(_, _, _, init, _) => qbe_collect_written_fields_expr(init, out)
+    SLetTuple(_, _, init, _) => qbe_collect_written_fields_expr(init, out)
     SAssign(lhs, rhs, _) => {
       match lhs {
         EField(_, fname, _) => out.set(fname, true)
@@ -1768,6 +1843,10 @@ fn qbe_collect_read_fields_expr(
       qbe_collect_read_fields_expr(scrut, out_vars, out_fields, seen)
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => qbe_collect_read_fields_expr(ge, out_vars, out_fields, seen)
+          None => ()
+        }
         qbe_collect_read_fields_expr(arms[i].body, out_vars, out_fields, seen)
         i = i + 1
       }
@@ -1786,6 +1865,8 @@ fn qbe_collect_read_fields_stmt(
 ) -> Unit {
   match s {
     SLet(_, _, _, init, _) =>
+      qbe_collect_read_fields_expr(init, out_vars, out_fields, seen)
+    SLetTuple(_, _, init, _) =>
       qbe_collect_read_fields_expr(init, out_vars, out_fields, seen)
     SAssign(lhs, rhs, _) => {
       match lhs {
@@ -1921,6 +2002,13 @@ fn qbe_expr_rebinds_ident(e : Expr, name : String) -> Bool {
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_rebinds_ident(ge, name) {
+              return true
+            }
+          None => ()
+        }
         if qbe_pat_binds_name(arms[i].pat, name) ||
           qbe_expr_rebinds_ident(arms[i].body, name) {
           return true
@@ -1937,6 +2025,8 @@ fn qbe_expr_rebinds_ident(e : Expr, name : String) -> Bool {
 fn qbe_stmt_rebinds_ident(s : Stmt, name : String) -> Bool {
   match s {
     SLet(n, _, _, init, _) => n == name || qbe_expr_rebinds_ident(init, name)
+    SLetTuple(ns, _, init, _) =>
+      str_arr_contains(ns, name) || qbe_expr_rebinds_ident(init, name)
     SAssign(lhs, rhs, _) =>
       qbe_expr_rebinds_ident(lhs, name) || qbe_expr_rebinds_ident(rhs, name)
     SWhile(cond, body, _) =>
@@ -2099,6 +2189,13 @@ fn qbe_expr_has_nested_loop(e : Expr) -> Bool {
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_nested_loop(ge) {
+              return true
+            }
+          None => ()
+        }
         if qbe_expr_has_nested_loop(arms[i].body) {
           return true
         }
@@ -2115,6 +2212,7 @@ fn qbe_stmt_has_nested_loop(s : Stmt) -> Bool {
   match s {
     SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) => true
     SLet(_, _, _, init, _) => qbe_expr_has_nested_loop(init)
+    SLetTuple(_, _, init, _) => qbe_expr_has_nested_loop(init)
     SAssign(lhs, rhs, _) =>
       qbe_expr_has_nested_loop(lhs) || qbe_expr_has_nested_loop(rhs)
     SReturn(opt, _) =>
@@ -2227,6 +2325,13 @@ fn qbe_expr_has_cf(
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_cf(ge, check_break, check_cont, check_ret) {
+              return true
+            }
+          None => ()
+        }
         if qbe_expr_has_cf(arms[i].body, check_break, check_cont, check_ret) {
           return true
         }
@@ -2260,6 +2365,8 @@ fn qbe_stmt_has_cf(
         }
       }
     SLet(_, _, _, init, _) =>
+      qbe_expr_has_cf(init, check_break, check_cont, check_ret)
+    SLetTuple(_, _, init, _) =>
       qbe_expr_has_cf(init, check_break, check_cont, check_ret)
     SAssign(lhs, rhs, _) =>
       qbe_expr_has_cf(lhs, check_break, check_cont, check_ret) ||
@@ -2464,6 +2571,10 @@ fn qbe_collect_bce_guards_expr(
       qbe_collect_bce_guards_expr(g, body, iv, scrut, out, seen)
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => qbe_collect_bce_guards_expr(g, body, iv, ge, out, seen)
+          None => ()
+        }
         qbe_collect_bce_guards_expr(g, body, iv, arms[i].body, out, seen)
         i = i + 1
       }
@@ -2483,6 +2594,8 @@ fn qbe_collect_bce_guards_stmt(
 ) -> Unit {
   match s {
     SLet(_, _, _, init, _) =>
+      qbe_collect_bce_guards_expr(g, body, iv, init, out, seen)
+    SLetTuple(_, _, init, _) =>
       qbe_collect_bce_guards_expr(g, body, iv, init, out, seen)
     SAssign(lhs, rhs, _) => {
       qbe_collect_bce_guards_expr(g, body, iv, lhs, out, seen)
@@ -2585,6 +2698,10 @@ fn qbe_expr_count_assigns_ident(e : Expr, name : String) -> Int {
       let mut n = qbe_expr_count_assigns_ident(scrut, name)
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => n = n + qbe_expr_count_assigns_ident(ge, name)
+          None => ()
+        }
         n = n + qbe_expr_count_assigns_ident(arms[i].body, name)
         i = i + 1
       }
@@ -2598,6 +2715,7 @@ fn qbe_expr_count_assigns_ident(e : Expr, name : String) -> Int {
 fn qbe_stmt_count_assigns_ident(s : Stmt, name : String) -> Int {
   match s {
     SLet(_, _, _, init, _) => qbe_expr_count_assigns_ident(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_count_assigns_ident(init, name)
     SAssign(lhs, rhs, _) => {
       let self_hit = match lhs {
         EIdent(n, _) => if n == name { 1 } else { 0 }
@@ -2688,6 +2806,7 @@ fn qbe_expr_has_sq(e : Expr, name : String) -> Bool {
 fn qbe_stmt_has_sq(s : Stmt, name : String) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_expr_has_sq(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_has_sq(init, name)
     SAssign(lhs, rhs, _) =>
       qbe_expr_has_sq(lhs, name) || qbe_expr_has_sq(rhs, name)
     SExpr(e, _) => qbe_expr_has_sq(e, name)
@@ -2721,6 +2840,7 @@ fn qbe_expr_uncond_has_sq(e : Expr, name : String) -> Bool {
 fn qbe_stmt_uncond_has_sq(s : Stmt, name : String) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_expr_uncond_has_sq(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_uncond_has_sq(init, name)
     SAssign(_, rhs, _) => qbe_expr_uncond_has_sq(rhs, name)
     SExpr(e, _) => qbe_expr_uncond_has_sq(e, name)
     _ => false
@@ -2757,6 +2877,13 @@ fn qbe_expr_has_branch_sq(e : Expr, name : String) -> Bool {
     EMatch(_, arms, _) => {
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_sq(ge, name) {
+              return true
+            }
+          None => ()
+        }
         if qbe_expr_has_sq(arms[i].body, name) {
           return true
         }
@@ -2772,6 +2899,7 @@ fn qbe_expr_has_branch_sq(e : Expr, name : String) -> Bool {
 fn qbe_stmt_has_branch_sq(s : Stmt, name : String) -> Bool {
   match s {
     SLet(_, _, _, init, _) => qbe_expr_has_branch_sq(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_has_branch_sq(init, name)
     SAssign(lhs, rhs, _) =>
       qbe_expr_has_branch_sq(lhs, name) || qbe_expr_has_branch_sq(rhs, name)
     SExpr(e, _) => qbe_expr_has_branch_sq(e, name)
@@ -2883,6 +3011,13 @@ fn qbe_collect_field_access_expr(
       }
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if !qbe_collect_field_access_expr(ge, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all) {
+              return false
+            }
+          None => ()
+        }
         if !qbe_collect_field_access_expr(arms[i].body, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all) {
           return false
         }
@@ -2906,6 +3041,8 @@ fn qbe_collect_field_access_stmt(
 ) -> Bool {
   match s {
     SLet(_, _, _, init, _) =>
+      qbe_collect_field_access_expr(init, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all)
+    SLetTuple(_, _, init, _) =>
       qbe_collect_field_access_expr(init, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all)
     SAssign(lhs, rhs, _) => {
       let lhs_ok = match lhs {
@@ -3118,7 +3255,7 @@ fn qbe_stmts_inline_cost(stmts : Array[Stmt], self_name : String) -> Int {
         }
         tot = tot + c
       }
-      SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) | SReturn(_, _) | SBreak(_) | SContinue(_) | SDebugAssert(_, _, _) =>
+      SLetTuple(_, _, _, _) | SWhile(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _) | SForIn(_, _, _, _) | SReturn(_, _) | SBreak(_) | SContinue(_) | SDebugAssert(_, _, _) =>
         return -1
     }
     if tot > 40 {
@@ -5787,6 +5924,14 @@ fn qbe_try_emit_map_get_match(
       if mname != "get" || margs.length() != 1 || arms.length() != 2 {
         return None
       }
+      match arms[0].guard_expr {
+        Some(_) => return None
+        None => ()
+      }
+      match arms[1].guard_expr {
+        Some(_) => return None
+        None => ()
+      }
       let mut kty = TError
       let mut vty = TError
       match qbe_peek_expr_ty(g, map_expr) {
@@ -7207,7 +7352,7 @@ fn qbe_emit_expr(
           match qbe_lookup_local(g, lname) {
             Some(loc) =>
               match loc.ty {
-                TStruct(_, _) => {
+                TStruct(_, _) | TTuple(_) => {
                   let r = qbe_tmp(g)
                   qbe_emit(g, r + " =l loadl " + loc.slot)
                   ov = qval(r, loc.ty)
@@ -7223,6 +7368,25 @@ fn qbe_emit_expr(
         ov = qbe_emit_expr(g, obj, None)
       }
       match ov.ty {
+        TTuple(elems) => {
+          let idx = parse_tuple_index(field_name)
+          if idx >= 0 && idx < elems.length() {
+            let fty = elems[idx]
+            let p = qbe_tmp(g)
+            qbe_emit(g, p + " =l add " + ov.reg + ", " + (idx * 8).to_string())
+            let r = qbe_load_heap_slot(g, p, fty)
+            qbe_rc_inc(g, r, fty)
+            if !borrowed {
+              qbe_rc_dec(g, ov.reg, ov.ty)
+            }
+            qval(r, fty)
+          } else {
+            if !borrowed {
+              qbe_rc_dec(g, ov.reg, ov.ty)
+            }
+            qval("0", TError)
+          }
+        }
         TStruct(sname, sargs) =>
           match g.tc.structs.get(sname) {
             Some(sinfo) => {
@@ -7706,6 +7870,14 @@ fn qbe_emit_expr(
               let mut reassigned = false
               let mut ai = 0
               while ai < arms.length() {
+                match arms[ai].guard_expr {
+                  Some(ge) =>
+                    if qbe_expr_assigns_ident(ge, xname) {
+                      reassigned = true
+                      break
+                    }
+                  None => ()
+                }
                 if qbe_expr_assigns_ident(arms[ai].body, xname) {
                   reassigned = true
                   break
@@ -7738,7 +7910,24 @@ fn qbe_emit_expr(
         qbe_emit_pat_test(g, arm.pat, cur_sv, sv.ty, l_next)
         qbe_scope_push(g)
         let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
-        qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, scrut_borrowed, arm.body)
+        let arm_allow_borrow = match arm.guard_expr {
+          Some(_) => false
+          None => scrut_borrowed
+        }
+        qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, arm_allow_borrow, arm.body)
+        match arm.guard_expr {
+          Some(ge) => {
+            let l_body = qbe_lbl(g, "match_guard_ok")
+            let l_gfail = qbe_lbl(g, "match_guard_fail")
+            qbe_emit_cond_branch(g, ge, l_body, l_gfail)
+            qbe_emit_lbl(g, l_gfail)
+            let cur_sc = g.scopes[g.scopes.length() - 1]
+            qbe_release_scope_locals(g, cur_sc)
+            qbe_emit_term(g, "jmp " + l_next)
+            qbe_emit_lbl(g, l_body)
+          }
+          None => ()
+        }
         let bv = qbe_emit_expr(g, arm.body, res_ty)
         match res_ty {
           None =>
@@ -8869,6 +9058,13 @@ fn qbe_emit_stmts(
                     }
                     break
                   }
+                SLetTuple(ns2, _, init2, _) =>
+                  if str_arr_contains(ns2, name) {
+                    if qbe_expr_mentions_ident(init2, name) {
+                      shadowed_use = true
+                    }
+                    break
+                  }
                 _ => ()
               }
               if qbe_stmt_mentions_ident(stmts[j], name) {
@@ -9030,6 +9226,40 @@ fn qbe_emit_stmt(
           _ => g.nonneg_vars.remove(name)
         }
       }
+      qval("0", TUnit)
+    }
+    SLetTuple(names, ty_expr, init, _) => {
+      let ann_opt : Option[Ty] = match ty_expr {
+        TyMissing(_) => None
+        _ => Some(resolve_type_expr(g.tc, ty_expr, g.cur_tparams))
+      }
+      let iv = qbe_emit_expr(g, init, ann_opt)
+      let tup_ty = match ann_opt {
+        Some(a) => a
+        None => iv.ty
+      }
+      match tup_ty {
+        TTuple(elem_tys) => {
+          let mut i = 0
+          while i < names.length() && i < elem_tys.length() {
+            let bname = names[i]
+            if bname != "_" {
+              let ety = elem_tys[i]
+              let p = qbe_tmp(g)
+              qbe_emit(g, p + " =l add " + iv.reg + ", " + (i * 8).to_string())
+              let ev = qbe_load_heap_slot(g, p, ety)
+              qbe_rc_inc(g, ev, ety)
+              let loc = qbe_define_local(g, bname, ety, true)
+              qbe_store_local_slot(g, ev, loc.slot, ety)
+              g.len_aliases.remove(bname)
+              g.nonneg_vars.remove(bname)
+            }
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+      qbe_rc_dec(g, iv.reg, tup_ty)
       qval("0", TUnit)
     }
     SAssign(lhs, rhs, _) => {

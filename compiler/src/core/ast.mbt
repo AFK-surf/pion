@@ -129,6 +129,7 @@ pub enum Pattern {
 ///|
 pub struct MatchArm {
   pat : Pattern
+  guard_expr : Option[Expr]
   body : Expr
   span : Span
 }
@@ -143,6 +144,7 @@ pub struct FieldInit {
 ///|
 pub enum Stmt {
   SLet(String, Bool, TypeExpr, Expr, Span)
+  SLetTuple(Array[String], TypeExpr, Expr, Span)
   SAssign(Expr, Expr, Span)
   SWhile(Expr, Array[Stmt], Span)
   SFor(Stmt, Expr, Stmt, Array[Stmt], Span)

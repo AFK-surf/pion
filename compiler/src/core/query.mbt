@@ -134,6 +134,7 @@ fn collect_stmt_calls(stmts : Array[Stmt], out : Array[String]) -> Unit {
   while i < stmts.length() {
     match stmts[i] {
       SLet(_, _, _, init, _) => collect_expr_calls(init, out)
+      SLetTuple(_, _, init, _) => collect_expr_calls(init, out)
       SAssign(lhs, rhs, _) => {
         collect_expr_calls(lhs, out)
         collect_expr_calls(rhs, out)
@@ -246,6 +247,10 @@ fn collect_expr_calls(e : Expr, out : Array[String]) -> Unit {
       collect_expr_calls(scrut, out)
       let mut i = 0
       while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => collect_expr_calls(ge, out)
+          None => ()
+        }
         collect_expr_calls(arms[i].body, out)
         i = i + 1
       }

@@ -679,6 +679,49 @@ fn p_parse_stmt(p : Parser) -> Stmt {
   match tok.kind {
     KwLet => {
       let _ = p_advance(p)
+      match p_peek(p).kind {
+        LParen => {
+          let _ = p_advance(p)
+          let names : Array[String] = []
+          while !p_is_eof(p) {
+            match p_peek(p).kind {
+              RParen => {
+                let _ = p_advance(p)
+                break
+              }
+              _ => {
+                let bname = p_expect_ident(p, "tuple binding name")
+                names.push(bname)
+                if !p_match_kind_comma(p) {
+                  p_expect_rparen(p)
+                  break
+                }
+              }
+            }
+          }
+          let vty = if p_match_kind_colon(p) {
+            p_parse_type_expr(p)
+          } else {
+            TyMissing(tok.span)
+          }
+          if !p_match_kind_eq(p) {
+            let t2 = p_peek(p)
+            p_err(
+              p,
+              t2.span,
+              "expected `=` in tuple `let` destructuring",
+              "`=`",
+              t2.raw,
+              "initialize tuple bindings with `= <expr>`",
+            )
+            p_sync_stmt(p)
+            return SLetTuple(names, vty, EUnit(tok.span), tok.span)
+          }
+          let init = p_parse_expr(p)
+          return SLetTuple(names, vty, init, tok.span)
+        }
+        _ => ()
+      }
       let mut is_mut = false
       match p_peek(p).kind {
         KwMut => {
@@ -932,18 +975,26 @@ fn p_parse_postfix_expr(p : Parser) -> Expr {
     match tok.kind {
       Dot => {
         let _ = p_advance(p)
-        let mem = p_expect_ident(p, "field or method name")
-        let next = p_peek(p)
-        let next_lparen = match next.kind {
-          LParen => true
-          _ => false
-        }
-        let is_call = !next.newline_before && next_lparen
-        if is_call {
-          let args = p_parse_arg_list(p)
-          expr = EMethodCall(expr, mem, args, tok.span)
-        } else {
-          expr = EField(expr, mem, tok.span)
+        match p_peek(p).kind {
+          IntLit(idx_str) => {
+            let _ = p_advance(p)
+            expr = EField(expr, idx_str, tok.span)
+          }
+          _ => {
+            let mem = p_expect_ident(p, "field or method name")
+            let next = p_peek(p)
+            let next_lparen = match next.kind {
+              LParen => true
+              _ => false
+            }
+            let is_call = !next.newline_before && next_lparen
+            if is_call {
+              let args = p_parse_arg_list(p)
+              expr = EMethodCall(expr, mem, args, tok.span)
+            } else {
+              expr = EField(expr, mem, tok.span)
+            }
+          }
         }
       }
       LParen => {
@@ -1215,6 +1266,13 @@ fn p_parse_match_expr(p : Parser) -> Expr {
             _ => break
           }
         }
+        let guard_expr : Option[Expr] = match p_peek(p).kind {
+          KwIf => {
+            let _ = p_advance(p)
+            Some(p_parse_expr(p))
+          }
+          _ => None
+        }
         if !p_match_kind_fatarrow(p) {
           let t2 = p_peek(p)
           p_err(
@@ -1245,7 +1303,7 @@ fn p_parse_match_expr(p : Parser) -> Expr {
         }
         let mut i = 0
         while i < pats.length() {
-          arms.push(MatchArm::{ pat: pats[i], body: body, span: arm_span })
+          arms.push(MatchArm::{ pat: pats[i], guard_expr: guard_expr, body: body, span: arm_span })
           i = i + 1
         }
         let _ = p_match_kind_comma(p)
