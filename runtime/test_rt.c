@@ -121,6 +121,20 @@ static void test_string_and_strbuf(void) {
     assert(m2_str_byte_at(built, 6) == '4');
     assert(m2_str_byte_at(built, 7) == '2');
 
+    /* StringBuilder reset + UTF-8 push_char */
+    m2_strbuf_reset(sb);
+    m2_strbuf_push_char(sb, 'A');       /* 1 byte */
+    m2_strbuf_push_char(sb, 0x00E9);    /* é: 2 bytes */
+    m2_strbuf_push_char(sb, 0x4E2D);    /* 中: 3 bytes */
+    m2_strbuf_push_char(sb, 0x1F600);   /* 😀: 4 bytes */
+    void *utf8_s = m2_strbuf_to_str(sb);
+    assert(m2_str_len(utf8_s) == 10);
+    assert(m2_str_byte_at(utf8_s, 0) == 'A');
+    assert(m2_str_byte_at(utf8_s, 1) == 0xC3);
+    assert(m2_str_byte_at(utf8_s, 2) == 0xA9);
+    assert(m2_str_byte_at(utf8_s, 3) == 0xE4);
+    assert(m2_str_byte_at(utf8_s, 6) == 0xF0);
+
     m2_rc_dec(a);
     m2_rc_dec(b);
     m2_rc_dec(c);
@@ -132,6 +146,7 @@ static void test_string_and_strbuf(void) {
     m2_rc_dec(ws);
     m2_rc_dec(sb);
     m2_rc_dec(built);
+    m2_rc_dec(utf8_s);
     printf("[PASS] string_and_strbuf\n");
 }
 
@@ -165,10 +180,17 @@ static void test_array_and_map(void) {
     assert(((TestNode *)popped)->id == 19);
     m2_rc_dec(popped);
     assert(atomic_load(&g_drop_count) == 2);
+
+    /* m2_arr_copy retains object elements independently */
+    void *oarr_cp = m2_arr_copy(oarr);
+    assert(m2_arr_len(oarr_cp) == 19);
+    assert(((TestNode *)(uintptr_t)m2_arr_get(oarr_cp, 5))->id == 999);
     m2_rc_dec(oarr);
+    assert(atomic_load(&g_drop_count) == 2); /* elements still alive in copy */
+    m2_rc_dec(oarr_cp);
     assert(atomic_load(&g_drop_count) == 21);
 
-    /* Map (primitive + object values + growth) */
+    /* Map (primitive + object values + growth + remove + copy) */
     atomic_store(&g_drop_count, 0);
     void *map = m2_map_new(1);
     for (int64_t i = 0; i < 128; i++) {
@@ -193,12 +215,33 @@ static void test_array_and_map(void) {
     assert(atomic_load(&g_drop_count) == 1);
     assert(m2_map_len(map) == 128);
 
-    void *keys = m2_map_keys(map);
+    /* Map copy + remove half the keys + re-verify remaining + re-insert */
+    void *map_cp = m2_map_copy(map);
+    assert(m2_map_len(map_cp) == 128);
+    for (int64_t i = 0; i < 64; i++) {
+        void *k = m2_int_to_str(i * 2);
+        m2_map_remove(map, k);
+        assert(m2_map_has(map, k) == 0);
+        assert(m2_map_has(map_cp, k) == 1);
+        m2_rc_dec(k);
+    }
+    assert(m2_map_len(map) == 64);
+    for (int64_t i = 0; i < 64; i++) {
+        void *k = m2_int_to_str(i * 2 + 1);
+        assert(m2_map_has(map, k) == 1);
+        assert(((TestNode *)(uintptr_t)m2_map_get(map, k))->id == (i * 2 + 1) * 10);
+        m2_rc_dec(k);
+    }
+    m2_map_remove(map, kmiss); /* removing non-existent key is a no-op */
+    assert(m2_map_len(map) == 64);
+
+    void *keys = m2_map_keys(map_cp);
     assert(m2_arr_len(keys) == 128);
     m2_rc_dec(keys);
     m2_rc_dec(k42);
     m2_rc_dec(kmiss);
     m2_rc_dec(map);
+    m2_rc_dec(map_cp);
     assert(atomic_load(&g_drop_count) == 129);
 
     printf("[PASS] array_and_map\n");

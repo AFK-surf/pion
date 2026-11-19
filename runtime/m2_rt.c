@@ -279,6 +279,32 @@ void m2_strbuf_push_byte(void *sb_ptr, int32_t b) {
     sb->data[sb->len] = '\0';
 }
 
+void m2_strbuf_push_char(void *sb_ptr, int32_t cp) {
+    M2StrBuf *sb = (M2StrBuf *)sb_ptr;
+    if (!sb || cp < 0 || cp > 0x10FFFF) return;
+    char buf[4];
+    int n = 0;
+    if (cp < 0x80) {
+        buf[n++] = (char)cp;
+    } else if (cp < 0x800) {
+        buf[n++] = (char)(0xC0 | (cp >> 6));
+        buf[n++] = (char)(0x80 | (cp & 0x3F));
+    } else if (cp < 0x10000) {
+        buf[n++] = (char)(0xE0 | (cp >> 12));
+        buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[n++] = (char)(0x80 | (cp & 0x3F));
+    } else {
+        buf[n++] = (char)(0xF0 | (cp >> 18));
+        buf[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
+        buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+        buf[n++] = (char)(0x80 | (cp & 0x3F));
+    }
+    m2_strbuf_reserve(sb, n);
+    memcpy(sb->data + sb->len, buf, (size_t)n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
 void m2_strbuf_push_int(void *sb_ptr, int64_t v) {
     M2StrBuf *sb = (M2StrBuf *)sb_ptr;
     if (!sb) return;
@@ -288,6 +314,13 @@ void m2_strbuf_push_int(void *sb_ptr, int64_t v) {
     memcpy(sb->data + sb->len, buf, (size_t)n);
     sb->len += n;
     sb->data[sb->len] = '\0';
+}
+
+void m2_strbuf_reset(void *sb_ptr) {
+    M2StrBuf *sb = (M2StrBuf *)sb_ptr;
+    if (!sb) return;
+    sb->len = 0;
+    if (sb->data) sb->data[0] = '\0';
 }
 
 void *m2_strbuf_to_str(void *sb_ptr) {
@@ -373,6 +406,22 @@ int64_t m2_arr_pop(void *a_ptr) {
     }
     /* Transfers slot ownership to caller (no RC dec) */
     return a->data[--a->len];
+}
+
+void *m2_arr_copy(void *a_ptr) {
+    M2Array *a = (M2Array *)a_ptr;
+    if (!a) return m2_arr_new(0, 0);
+    M2Array *cp = (M2Array *)m2_arr_new(a->len, a->elem_is_obj);
+    if (a->len > 0) {
+        memcpy(cp->data, a->data, (size_t)a->len * sizeof(int64_t));
+        cp->len = a->len;
+        if (a->elem_is_obj) {
+            for (int64_t i = 0; i < a->len; i++) {
+                m2_rc_inc((void *)(uintptr_t)cp->data[i]);
+            }
+        }
+    }
+    return cp;
 }
 
 /* ============================================================================
@@ -502,7 +551,63 @@ int64_t m2_map_get(void *m_ptr, void *key_str) {
         idx = (idx + 1) & mask;
     }
     m2_panic("map key not found", __FILE__, __LINE__);
-    return 0;
+}
+
+void m2_map_remove(void *m_ptr, void *key_str) {
+    M2Map *m = (M2Map *)m_ptr;
+    M2String *k = (M2String *)key_str;
+    if (!m || !k || m->len == 0 || m->cap == 0) return;
+    uint64_t h = m2_fnv1a(k);
+    uint64_t mask = (uint64_t)(m->cap - 1);
+    uint64_t idx = h & mask;
+    while (m->entries[idx].state == 1) {
+        if (m->entries[idx].hash == h && m2_str_eq(m->entries[idx].key, k)) {
+            m2_rc_dec(m->entries[idx].key);
+            if (m->val_is_obj) {
+                m2_rc_dec((void *)(uintptr_t)m->entries[idx].val);
+            }
+            m->len--;
+            /* Backward-shift deletion to keep probe chains intact without tombstones */
+            uint64_t hole = idx;
+            uint64_t cur = (idx + 1) & mask;
+            while (m->entries[cur].state == 1) {
+                uint64_t home = m->entries[cur].hash & mask;
+                if (((hole - home) & mask) < ((cur - home) & mask)) {
+                    m->entries[hole] = m->entries[cur];
+                    hole = cur;
+                }
+                cur = (cur + 1) & mask;
+            }
+            m->entries[hole].state = 0;
+            m->entries[hole].key = NULL;
+            m->entries[hole].val = 0;
+            m->entries[hole].hash = 0;
+            return;
+        }
+        idx = (idx + 1) & mask;
+    }
+}
+
+void *m2_map_copy(void *m_ptr) {
+    M2Map *m = (M2Map *)m_ptr;
+    if (!m) return m2_map_new(0);
+    M2Map *cp = (M2Map *)m2_map_new(m->val_is_obj);
+    if (m->cap > 0 && m->entries) {
+        cp->entries = (M2MapEntry *)malloc((size_t)m->cap * sizeof(M2MapEntry));
+        if (!cp->entries) m2_panic("out of memory in map_copy", __FILE__, __LINE__);
+        memcpy(cp->entries, m->entries, (size_t)m->cap * sizeof(M2MapEntry));
+        cp->cap = m->cap;
+        cp->len = m->len;
+        for (int64_t i = 0; i < cp->cap; i++) {
+            if (cp->entries[i].state == 1) {
+                m2_rc_inc(cp->entries[i].key);
+                if (cp->val_is_obj) {
+                    m2_rc_inc((void *)(uintptr_t)cp->entries[i].val);
+                }
+            }
+        }
+    }
+    return cp;
 }
 
 void *m2_map_keys(void *m_ptr) {
@@ -774,6 +879,22 @@ int64_t m2_mutex_lock(void *m_ptr) {
     return m->val;
 }
 
+void m2_mutex_set(void *m_ptr, int64_t new_val) {
+    M2Mutex *m = (M2Mutex *)m_ptr;
+    int64_t old_val = 0;
+    if (m->val_is_obj) {
+        if (new_val != 0) {
+            m2_rc_freeze((void *)(uintptr_t)new_val);
+            m2_rc_inc((void *)(uintptr_t)new_val);
+        }
+        old_val = m->val;
+    }
+    m->val = new_val;
+    if (m->val_is_obj && old_val != 0) {
+        m2_rc_dec((void *)(uintptr_t)old_val);
+    }
+}
+
 void m2_mutex_set_and_unlock(void *m_ptr, int64_t new_val) {
     M2Mutex *m = (M2Mutex *)m_ptr;
     int64_t old_val = 0;
@@ -849,6 +970,18 @@ void *m2_world_argv(void *w_ptr, int64_t idx) {
     }
     const char *arg = w->argv[idx] ? w->argv[idx] : "";
     return m2_str_from_cstr(arg, (int64_t)strlen(arg));
+}
+
+void *m2_world_args(void *w_ptr) {
+    M2World *w = (M2World *)w_ptr;
+    int64_t n = w ? (int64_t)w->argc : 0;
+    void *arr = m2_arr_new(n, 1);
+    for (int64_t i = 0; i < n; i++) {
+        void *s = m2_world_argv(w_ptr, i);
+        m2_arr_push(arr, (int64_t)(uintptr_t)s);
+        m2_rc_dec(s);
+    }
+    return arr;
 }
 
 void m2_world_println(void *w_ptr, void *s_ptr) {

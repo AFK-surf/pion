@@ -182,6 +182,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void* m2_strbuf_new(int64_t cap);`
 - `void  m2_strbuf_push_str(void *sb, void *s);`
 - `void  m2_strbuf_push_byte(void *sb, int32_t b);`
+- `void  m2_strbuf_push_char(void *sb, int32_t cp);`
 - `void  m2_strbuf_push_int(void *sb, int64_t v);`
 - `void  m2_strbuf_reset(void *sb);`
 - `void* m2_strbuf_to_str(void *sb);`
@@ -215,6 +216,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void    m2_chan_close(void *ch);`
 - `void*   m2_mutex_new(int64_t init_val, int32_t val_is_obj);`
 - `int64_t m2_mutex_lock(void *m);`
+- `void    m2_mutex_set(void *m, int64_t new_val);`
 - `void    m2_mutex_set_and_unlock(void *m, int64_t new_val);`
 - `void    m2_mutex_unlock(void *m);`
 - `void*   m2_atomic_new(int64_t init_val);`
@@ -226,6 +228,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void*   m2_world_init(int argc, char **argv);`
 - `int64_t m2_world_argc(void *w);`
 - `void*   m2_world_argv(void *w, int64_t idx);`
+- `void*   m2_world_args(void *w);`
 - `void    m2_world_println(void *w, void *s);`
 - `void    m2_world_eprintln(void *w, void *s);`
 - `void*   m2_world_fs_read(void *w, void *path_str, int32_t *ok_out);`

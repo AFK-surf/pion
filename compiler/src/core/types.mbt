@@ -796,10 +796,15 @@ fn is_world_builtin(name : String) -> Bool {
   name == "fs_exists" ||
   name == "fs_mkdir_p" ||
   name == "fs_list_dir" ||
+  name == "fs_remove" ||
+  name == "fs_rename" ||
+  name == "fs_size" ||
   name == "clock_now_ms" ||
   name == "proc_exec" ||
   name == "env_get" ||
-  name == "args_get"
+  name == "args_get" ||
+  name == "world_argc" ||
+  name == "world_argv"
 }
 
 ///|
@@ -852,14 +857,18 @@ fn check_world_builtin_call(
     TResult(TString, TString)
   } else if name == "fs_write" {
     TResult(TUnit, TString)
-  } else if name == "fs_exists" || name == "fs_mkdir_p" {
+  } else if name == "fs_exists" || name == "fs_mkdir_p" || name == "fs_remove" || name == "fs_rename" {
     TBool
+  } else if name == "fs_size" {
+    TInt64
   } else if name == "fs_list_dir" || name == "args_get" {
     TArray(TString)
   } else if name == "clock_now_ms" {
     TInt64
-  } else if name == "proc_exec" {
+  } else if name == "proc_exec" || name == "world_argc" {
     TInt
+  } else if name == "world_argv" {
+    TString
   } else if name == "env_get" {
     TOption(TString)
   } else {
@@ -1725,6 +1734,9 @@ fn check_method_call(
       if method_name == "unsafe_to_char" {
         return TChar
       }
+      if method_name == "to_byte" {
+        return TByte
+      }
     }
     TInt64 => {
       if method_name == "to_string" {
@@ -1732,6 +1744,9 @@ fn check_method_call(
       }
       if method_name == "to_int" {
         return TInt
+      }
+      if method_name == "to_int64" {
+        return TInt64
       }
     }
     TDouble => {
@@ -1771,6 +1786,15 @@ fn check_method_call(
         }
         return TInt
       }
+      if method_name == "slice" {
+        if args.length() >= 1 {
+          let _ = check_expr(tc, env, args[0], Some(TInt))
+        }
+        if args.length() >= 2 {
+          let _ = check_expr(tc, env, args[1], Some(TInt))
+        }
+        return TString
+      }
     }
     TStringBuilder => {
       if method_name == "write_string" {
@@ -1809,6 +1833,9 @@ fn check_method_call(
       }
       if method_name == "to_string" {
         return TString
+      }
+      if method_name == "reset" {
+        return TUnit
       }
     }
     TBytes =>
@@ -1896,6 +1923,9 @@ fn check_method_call(
       }
       if method_name == "keys" {
         return TArray(kty)
+      }
+      if method_name == "copy" {
+        return TMap(kty, vty)
       }
     }
     TChannel(elem) => {
@@ -2255,6 +2285,12 @@ fn check_expr(
           }
           if is_world_builtin(name) {
             return check_world_builtin_call(tc, env, name, args, sp)
+          }
+          if name == "sha256_hex" {
+            if args.length() >= 1 {
+              let _ = check_expr(tc, env, args[0], Some(TString))
+            }
+            return TString
           }
           if name == "abort" || name == "panic" {
             let mut i = 0
