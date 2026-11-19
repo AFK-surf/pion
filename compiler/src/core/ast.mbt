@@ -146,6 +146,8 @@ pub enum Stmt {
   SAssign(Expr, Expr, Span)
   SWhile(Expr, Array[Stmt], Span)
   SFor(Stmt, Expr, Stmt, Array[Stmt], Span)
+  SForRange(String, Expr, Expr, Array[Stmt], Span)
+  SForIn(String, Expr, Array[Stmt], Span)
   SReturn(Option[Expr], Span)
   SBreak(Span)
   SContinue(Span)
@@ -181,6 +183,8 @@ pub enum Expr {
   ESpawn(Expr, Expr, Span)
   EMove(Expr, Span)
   EAs(Expr, TypeExpr, Span)
+  ETry(Expr, Span)
+  EInterp(Array[Expr], Span)
   EUnit(Span)
 }
 
@@ -213,6 +217,8 @@ pub fn expr_span(e : Expr) -> Span {
     ESpawn(_, _, sp) => sp
     EMove(_, sp) => sp
     EAs(_, _, sp) => sp
+    ETry(_, sp) => sp
+    EInterp(_, sp) => sp
     EUnit(sp) => sp
   }
 }

@@ -128,6 +128,7 @@ int32_t  m2_str_eq(void *a, void *b);
 int32_t  m2_str_cmp(void *a, void *b);
 void*    m2_str_slice(void *s, int64_t start, int64_t end);
 void*    m2_int_to_str(int64_t v);
+void*    m2_double_to_str(double v);
 int64_t  m2_str_to_int(void *s, int32_t *ok_out);
 int32_t  m2_str_starts_with(void *s, void *prefix);
 int32_t  m2_str_ends_with(void *s, void *suffix);
@@ -164,6 +165,11 @@ int64_t  m2_arr_get(void *a, int64_t idx);
 void     m2_arr_set(void *a, int64_t idx, int64_t val);
 int64_t  m2_arr_pop(void *a);
 void*    m2_arr_copy(void *a);
+void     m2_arr_clear(void *a);
+void     m2_arr_reverse(void *a);
+void*    m2_arr_join(void *a, void *sep);
+void     m2_arr_sort_int(void *a);
+void     m2_arr_sort_str(void *a);
 
 /* String-Keyed Hash Map */
 void*    m2_map_new(int32_t val_is_obj);

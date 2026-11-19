@@ -1392,6 +1392,84 @@ static void run_multicore_bench(void) {
     assert(speedup > 3.0);
 }
 
+static void test_arr_ergonomics_and_double_to_str(void) {
+    /* m2_double_to_str */
+    void *d1 = m2_double_to_str(3.14);
+    void *d2 = m2_double_to_str(0.0);
+    void *d3 = m2_double_to_str(-42.5);
+    void *e1 = m2_str_from_cstr("3.14", -1);
+    void *e2 = m2_str_from_cstr("0", -1);
+    void *e3 = m2_str_from_cstr("-42.5", -1);
+    assert(m2_str_eq(d1, e1) == 1);
+    assert(m2_str_eq(d2, e2) == 1);
+    assert(m2_str_eq(d3, e3) == 1);
+    m2_rc_dec(d1); m2_rc_dec(d2); m2_rc_dec(d3);
+    m2_rc_dec(e1); m2_rc_dec(e2); m2_rc_dec(e3);
+
+    /* m2_arr_sort_int + m2_arr_reverse + m2_arr_clear (non-obj) */
+    void *ai = m2_arr_new(8, 0);
+    m2_arr_push(ai, 30);
+    m2_arr_push(ai, -5);
+    m2_arr_push(ai, 100);
+    m2_arr_push(ai, 0);
+    m2_arr_push(ai, 42);
+    m2_arr_sort_int(ai);
+    assert(m2_arr_get(ai, 0) == -5);
+    assert(m2_arr_get(ai, 1) == 0);
+    assert(m2_arr_get(ai, 2) == 30);
+    assert(m2_arr_get(ai, 3) == 42);
+    assert(m2_arr_get(ai, 4) == 100);
+    m2_arr_reverse(ai);
+    assert(m2_arr_get(ai, 0) == 100);
+    assert(m2_arr_get(ai, 1) == 42);
+    assert(m2_arr_get(ai, 2) == 30);
+    assert(m2_arr_get(ai, 3) == 0);
+    assert(m2_arr_get(ai, 4) == -5);
+    m2_arr_clear(ai);
+    assert(m2_arr_len(ai) == 0);
+    m2_arr_reverse(ai);
+    m2_arr_sort_int(ai);
+    m2_rc_dec(ai);
+
+    /* m2_arr_sort_str + m2_arr_join + m2_arr_reverse + m2_arr_clear (obj RC safety) */
+    void *as = m2_arr_new(4, 1);
+    void *s_c = m2_str_from_cstr("cherry", -1);
+    void *s_a = m2_str_from_cstr("apple", -1);
+    void *s_b = m2_str_from_cstr("banana", -1);
+    m2_arr_push(as, (int64_t)(uintptr_t)s_c);
+    m2_arr_push(as, (int64_t)(uintptr_t)s_a);
+    m2_arr_push(as, (int64_t)(uintptr_t)s_b);
+    m2_rc_dec(s_c); m2_rc_dec(s_a); m2_rc_dec(s_b);
+
+    m2_arr_sort_str(as);
+    void *sep = m2_str_from_cstr(", ", -1);
+    void *joined = m2_arr_join(as, sep);
+    void *exp_j = m2_str_from_cstr("apple, banana, cherry", -1);
+    assert(m2_str_eq(joined, exp_j) == 1);
+    m2_rc_dec(joined);
+    m2_rc_dec(exp_j);
+
+    m2_arr_reverse(as);
+    void *joined_rev = m2_arr_join(as, sep);
+    void *exp_rev = m2_str_from_cstr("cherry, banana, apple", -1);
+    assert(m2_str_eq(joined_rev, exp_rev) == 1);
+    m2_rc_dec(joined_rev);
+    m2_rc_dec(exp_rev);
+
+    /* clear releases all object elements cleanly (verified by ASan) */
+    m2_arr_clear(as);
+    assert(m2_arr_len(as) == 0);
+    void *empty_j = m2_arr_join(as, sep);
+    void *exp_empty = m2_str_from_cstr("", -1);
+    assert(m2_str_eq(empty_j, exp_empty) == 1);
+    m2_rc_dec(empty_j);
+    m2_rc_dec(exp_empty);
+    m2_rc_dec(sep);
+    m2_rc_dec(as);
+
+    printf("[PASS] arr_ergonomics_and_double_to_str\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -1405,6 +1483,7 @@ int main(int argc, char **argv) {
     test_string_and_strbuf();
     test_stdlib_string_bytes_math();
     test_array_and_map();
+    test_arr_ergonomics_and_double_to_str();
     test_map_try_get_and_100k();
     test_sha256();
     test_world(argc, argv);

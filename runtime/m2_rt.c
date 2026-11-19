@@ -21,6 +21,12 @@
 
 extern char **environ;
 
+#if defined(__clang__)
+#define M2_MINSIZE __attribute__((minsize))
+#else
+#define M2_MINSIZE __attribute__((optimize("Os")))
+#endif
+
 /* ============================================================================
  * 1. Memory & Biased RC
  * ============================================================================ */
@@ -462,6 +468,18 @@ void *m2_int_to_str(int64_t v) {
     memcpy(str->data, p, n);
     str->data[n] = '\0';
     return str;
+}
+
+M2_MINSIZE void *m2_double_to_str(double v) {
+    char buf[64];
+    int n = snprintf(buf, sizeof(buf), "%.15g", v);
+    if (n < 0) {
+        return m2_str_from_cstr("", 0);
+    }
+    if (n >= (int)sizeof(buf)) {
+        n = (int)sizeof(buf) - 1;
+    }
+    return m2_str_from_cstr(buf, (int64_t)n);
 }
 
 int64_t m2_str_to_int(void *s, int32_t *ok_out) {
@@ -935,6 +953,86 @@ void *m2_arr_copy(void *a_ptr) {
         }
     }
     return cp;
+}
+
+M2_MINSIZE void m2_arr_clear(void *a_ptr) {
+    M2Array *a = (M2Array *)a_ptr;
+    if (!a || a->len <= 0) return;
+    if (a->elem_is_obj) {
+        for (int64_t i = 0; i < a->len; i++) {
+            m2_rc_dec((void *)(uintptr_t)a->data[i]);
+        }
+    }
+    a->len = 0;
+}
+
+M2_MINSIZE void m2_arr_reverse(void *a_ptr) {
+    M2Array *a = (M2Array *)a_ptr;
+    if (!a || a->len <= 1) return;
+    int64_t i = 0;
+    int64_t j = a->len - 1;
+    while (i < j) {
+        int64_t t = a->data[i];
+        a->data[i] = a->data[j];
+        a->data[j] = t;
+        i++;
+        j--;
+    }
+}
+
+M2_MINSIZE void *m2_arr_join(void *a_ptr, void *sep_ptr) {
+    M2Array *a = (M2Array *)a_ptr;
+    M2String *sep = (M2String *)sep_ptr;
+    if (!a || a->len <= 0) {
+        return m2_str_from_cstr("", 0);
+    }
+    int64_t sep_len = sep ? sep->len : 0;
+    int64_t total = (a->len - 1) * sep_len;
+    for (int64_t i = 0; i < a->len; i++) {
+        M2String *s = (M2String *)(uintptr_t)a->data[i];
+        if (s) total += s->len;
+    }
+    M2String *out = (M2String *)m2_alloc_raw((uint32_t)(sizeof(M2String) + (size_t)total + 1),
+                                             M2_TAG_STRING, NULL);
+    out->len = total;
+    char *dst = out->data;
+    for (int64_t i = 0; i < a->len; i++) {
+        if (i > 0 && sep_len > 0) {
+            memcpy(dst, sep->data, (size_t)sep_len);
+            dst += sep_len;
+        }
+        M2String *s = (M2String *)(uintptr_t)a->data[i];
+        if (s && s->len > 0) {
+            memcpy(dst, s->data, (size_t)s->len);
+            dst += s->len;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
+static int m2_cmp_i64_qsort(const void *pa, const void *pb) {
+    int64_t a = *(const int64_t *)pa;
+    int64_t b = *(const int64_t *)pb;
+    return (a > b) - (a < b);
+}
+
+M2_MINSIZE void m2_arr_sort_int(void *a_ptr) {
+    M2Array *a = (M2Array *)a_ptr;
+    if (!a || a->len <= 1) return;
+    qsort(a->data, (size_t)a->len, sizeof(int64_t), m2_cmp_i64_qsort);
+}
+
+static int m2_cmp_str_qsort(const void *pa, const void *pb) {
+    void *sa = (void *)(uintptr_t)(*(const int64_t *)pa);
+    void *sb = (void *)(uintptr_t)(*(const int64_t *)pb);
+    return (int)m2_str_cmp(sa, sb);
+}
+
+M2_MINSIZE void m2_arr_sort_str(void *a_ptr) {
+    M2Array *a = (M2Array *)a_ptr;
+    if (!a || a->len <= 1) return;
+    qsort(a->data, (size_t)a->len, sizeof(int64_t), m2_cmp_str_qsort);
 }
 
 /* ============================================================================
@@ -1984,7 +2082,7 @@ static inline uint32_t rotr32(uint32_t x, uint32_t n) {
     return (x >> n) | (x << (32u - n));
 }
 
-static void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
+M2_MINSIZE static void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
     uint32_t w[64];
     for (int i = 0; i < 16; i++) {
         w[i] = ((uint32_t)blk[i * 4] << 24) | ((uint32_t)blk[i * 4 + 1] << 16) |

@@ -79,7 +79,7 @@ Every construct below is valid in BOTH MoonBit (with thin helper aliases where n
   - `Bool`: `true`, `false`
   - `Byte`: `b'a'`, `b'\n'`, `b'\x00'`
   - `Char`: `'a'`, `'\n'`
-  - `String`: `"..."` with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`
+  - `String`: `"..."` with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`; MoonBit-compatible interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `Double`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings)
 - Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`, `import` (and contextual top-level `test`).
 
 ### 3.2 Top-Level Declarations
@@ -121,7 +121,8 @@ test "test name" {
 - Control flow:
   - `if cond { ... } else if cond2 { ... } else { ... }` (expression when all branches yield same type)
   - `while cond { ... }`
-  - `for i = 0; i < n; i = i + 1 { ... }`
+  - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` (half-open `[start, end)`), `for x in arr { ... }` (`Array[T]`)
+  - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E]`) and `Option[T]` (enclosing function returns `Option[_]`)
   - `match scrutinee { Pat => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed)
   - `return [expr]`, `break`, `continue`
 - Closures: `fn(x : T) -> R { ... }` (captures by value / biased RC; inside `spawn(...)`, only `Send` or `move` captures allowed)
@@ -131,7 +132,7 @@ test "test name" {
   - `Mutex::new(v)`, `m.with_lock(fn(v : T) -> R { ... })` / `m.lock()` + `m.set(v)` + `m.unlock()`
   - `AtomicInt::new(v)`, `a.load()`, `a.store(v)`, `a.fetch_add(d)`
 - Contracts: `debug_assert(cond, "msg")`
-- Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`.
+- Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..`, postfix `?`.
 
 ---
 
@@ -193,6 +194,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `int32_t m2_str_cmp(void *a, void *b);`
 - `void*   m2_str_slice(void *s, int64_t start, int64_t end);`
 - `void*   m2_int_to_str(int64_t v);`
+- `void*   m2_double_to_str(double v);` (`d.to_string() -> String`)
 - `int64_t m2_str_to_int(void *s, int32_t *ok_out);`
 - `int32_t m2_str_starts_with(void *s, void *prefix);` (`s.starts_with(prefix) -> Bool`)
 - `int32_t m2_str_ends_with(void *s, void *suffix);` (`s.ends_with(suffix) -> Bool`)
@@ -229,6 +231,11 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void    m2_arr_set(void *a, int64_t idx, int64_t val);` (bounds-checked; retains new, releases old if `elem_is_obj`)
 - `int64_t m2_arr_pop(void *a);`
 - `void*   m2_arr_copy(void *a);`
+- `void    m2_arr_clear(void *a);` (`arr.clear() -> Unit`; releases elements if `elem_is_obj`)
+- `void    m2_arr_reverse(void *a);` (`arr.reverse() -> Unit`; in-place)
+- `void*   m2_arr_join(void *a, void *sep);` (`arr.join(sep) -> String` for `Array[String]`)
+- `void    m2_arr_sort_int(void *a);` (`arr.sort() -> Unit` for `Array[Int]` / `Array[Int64]`)
+- `void    m2_arr_sort_str(void *a);` (`arr.sort() -> Unit` for `Array[String]`)
 
 **String-Keyed Hash Map (`M2Map` — open addressing FNV-1a, 64-bit value slots):**
 - `void*   m2_map_new(int32_t val_is_obj);`

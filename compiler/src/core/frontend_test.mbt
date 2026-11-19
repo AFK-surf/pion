@@ -543,3 +543,110 @@ test "p6c: stdlib String/Bytes/Math/World IO typechecking and capability/Send gu
   let ns_json = @core.check_result_to_json(cr_ns.diagnostics)
   assert_true(str_contains(ns_json, "E_NOT_SEND"), "Bytes must be !Send")
 }
+
+///|
+test "p7a_ergonomics_try_for_interp_and_methods" {
+  let ok_src =
+    "fn get_res(ok : Bool) -> Result[String, String] {\n" +
+    "  if ok { Ok(\"  hi  \") } else { Err(\"boom\") }\n" +
+    "}\n" +
+    "fn use_res(ok : Bool) -> Result[Int, String] {\n" +
+    "  let s : String = get_res(ok)?.trim()\n" +
+    "  Ok(s.length())\n" +
+    "}\n" +
+    "fn use_opt(x : Option[Int]) -> Option[Int] {\n" +
+    "  let v : Int = x?\n" +
+    "  Some(v + 1)\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let mut sum = 0\n" +
+    "  for i in 0..10 {\n" +
+    "    if i == 3 { continue }\n" +
+    "    if i == 8 { break }\n" +
+    "    sum = sum + i\n" +
+    "  }\n" +
+    "  let mut sum64 : Int64 = 0L\n" +
+    "  for j in 0L..5L {\n" +
+    "    sum64 = sum64 + j\n" +
+    "  }\n" +
+    "  let nums : Array[Int] = [3, 1, 2]\n" +
+    "  nums.sort()\n" +
+    "  nums.reverse()\n" +
+    "  for x in nums {\n" +
+    "    sum = sum + x\n" +
+    "  }\n" +
+    "  nums.clear()\n" +
+    "  let words : Array[String] = [\"b\", \"a\"]\n" +
+    "  words.sort()\n" +
+    "  let joined : String = words.join(\",\")\n" +
+    "  let d : Double = 3.5\n" +
+    "  let ds : String = d.to_string()\n" +
+    "  let b : Bool = true\n" +
+    "  let c : Char = 'Z'\n" +
+    "  let msg : String = \"j=\\{joined}, n=\\{sum + 1}, n64=\\{sum64}, d=\\{d}, b=\\{b}, c=\\{c}, ds=\\{ds}\"\n" +
+    "  let esc : String = \"\\\\{literal}\"\n" +
+    "  let m : Map[String, Int] = Map::new()\n" +
+    "  m.set(\"k\", 1)\n" +
+    "  let has_k : Bool = m.contains(\"k\")\n" +
+    "  let ks : Array[String] = m.keys()\n" +
+    "  m.remove(\"k\")\n" +
+    "  let _r = use_res(true)\n" +
+    "  let _o = use_opt(Some(1))\n" +
+    "  if has_k && ks.length() == 1 && msg.length() > 0 && esc.length() > 0 { 0 } else { 1 }\n" +
+    "}\n"
+  let cr = @core.check_source_files("p7a_ok", ["ok.m2"], [ok_src])
+  assert_true(cr.diagnostics.length() == 0, "p7a ok_src should have 0 diagnostics")
+
+  // `?` in non-Result function
+  let bad_try1 =
+    "fn f() -> Int {\n" +
+    "  let r : Result[Int, String] = Ok(1)\n" +
+    "  r?\n" +
+    "}\n"
+  let cr1 = @core.check_source_files("p7a_bad1", ["b1.m2"], [bad_try1])
+  assert_true(str_contains(@core.check_result_to_json(cr1.diagnostics), "E_TYPE_MISMATCH"), "try in non-Result fn")
+
+  // `?` with incompatible error type
+  let bad_try2 =
+    "fn f() -> Result[Int, Int] {\n" +
+    "  let r : Result[Int, String] = Ok(1)\n" +
+    "  Ok(r?)\n" +
+    "}\n"
+  let cr2 = @core.check_source_files("p7a_bad2", ["b2.m2"], [bad_try2])
+  assert_true(str_contains(@core.check_result_to_json(cr2.diagnostics), "E_TYPE_MISMATCH"), "try err type mismatch")
+
+  // `?` in top-level const
+  let bad_try3 =
+    "fn mk() -> Result[Int, String] { Ok(1) }\n" +
+    "let BAD : Result[Int, String] = Ok(mk()?)\n"
+  let cr3 = @core.check_source_files("p7a_bad3", ["b3.m2"], [bad_try3])
+  assert_true(str_contains(@core.check_result_to_json(cr3.diagnostics), "E_TYPE_MISMATCH"), "try in top-level const")
+
+  // `for x in non_array`
+  let bad_for =
+    "fn f() -> Unit {\n" +
+    "  for x in 42 {\n" +
+    "    let _ = x\n" +
+    "  }\n" +
+    "}\n"
+  let cr4 = @core.check_source_files("p7a_bad4", ["b4.m2"], [bad_for])
+  assert_true(str_contains(@core.check_result_to_json(cr4.diagnostics), "E_TYPE_MISMATCH"), "for-in requires Array")
+
+  // `Array[Int]::join` rejected
+  let bad_join =
+    "fn f() -> String {\n" +
+    "  let a : Array[Int] = [1, 2]\n" +
+    "  a.join(\",\")\n" +
+    "}\n"
+  let cr5 = @core.check_source_files("p7a_bad5", ["b5.m2"], [bad_join])
+  assert_true(str_contains(@core.check_result_to_json(cr5.diagnostics), "E_TYPE_MISMATCH"), "Array[Int]::join rejected")
+
+  // `Array[Bool]::sort` rejected
+  let bad_sort =
+    "fn f() -> Unit {\n" +
+    "  let a : Array[Bool] = [true, false]\n" +
+    "  a.sort()\n" +
+    "}\n"
+  let cr6 = @core.check_source_files("p7a_bad6", ["b6.m2"], [bad_sort])
+  assert_true(str_contains(@core.check_result_to_json(cr6.diagnostics), "E_TYPE_MISMATCH"), "Array[Bool]::sort rejected")
+}
