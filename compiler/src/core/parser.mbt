@@ -1,0 +1,1444 @@
+///|
+pub struct ParseResult {
+  file : SourceFile
+  diagnostics : Array[Diagnostic]
+}
+
+///|
+pub struct Parser {
+  tokens : Array[Token]
+  mut pos : Int
+  diagnostics : Array[Diagnostic]
+}
+
+///|
+fn parser_new(tokens : Array[Token], diags : Array[Diagnostic]) -> Parser {
+  Parser::{ tokens: tokens, pos: 0, diagnostics: diags }
+}
+
+///|
+fn p_peek(p : Parser) -> Token {
+  if p.pos < p.tokens.length() {
+    p.tokens[p.pos]
+  } else {
+    p.tokens[p.tokens.length() - 1]
+  }
+}
+
+///|
+fn p_peek_at(p : Parser, offset : Int) -> Token {
+  let idx = p.pos + offset
+  if idx >= 0 && idx < p.tokens.length() {
+    p.tokens[idx]
+  } else {
+    p.tokens[p.tokens.length() - 1]
+  }
+}
+
+///|
+fn p_advance(p : Parser) -> Token {
+  let tok = p_peek(p)
+  if p.pos < p.tokens.length() - 1 {
+    p.pos = p.pos + 1
+  }
+  tok
+}
+
+///|
+fn p_is_eof(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    Eof => true
+    _ => false
+  }
+}
+
+///|
+fn p_err(
+  p : Parser,
+  span : Span,
+  msg : String,
+  expected : String,
+  found : String,
+  fixit : String,
+) -> Unit {
+  p.diagnostics.push(diag_new(span, "E_PARSE", msg, expected, found, fixit))
+}
+
+///|
+fn p_skip_semis(p : Parser) -> Unit {
+  while true {
+    match p_peek(p).kind {
+      Semi => {
+        let _ = p_advance(p)
+      }
+      _ => break
+    }
+  }
+}
+
+///|
+fn p_sync_top(p : Parser) -> Unit {
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      KwPub | KwFn | KwStruct | KwEnum | KwVal | KwLet | KwType => break
+      _ => {
+        let _ = p_advance(p)
+      }
+    }
+  }
+}
+
+///|
+fn p_sync_stmt(p : Parser) -> Unit {
+  while !p_is_eof(p) {
+    let tok = p_peek(p)
+    if tok.newline_before {
+      break
+    }
+    match tok.kind {
+      RBrace | Semi => break
+      _ => {
+        let _ = p_advance(p)
+      }
+    }
+  }
+}
+
+///|
+fn p_expect_ident(p : Parser, what : String) -> String {
+  let tok = p_peek(p)
+  match tok.kind {
+    Ident(name) => {
+      let _ = p_advance(p)
+      name
+    }
+    _ => {
+      p_err(
+        p,
+        tok.span,
+        "expected " + what + ", found `" + tok.raw + "`",
+        what,
+        tok.raw,
+        "provide a valid " + what,
+      )
+      "<error>"
+    }
+  }
+}
+
+///|
+fn p_match_kind_lbrace(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    LBrace => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_rbrace(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    RBrace => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_lparen(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    LParen => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_rparen(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    RParen => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_lbracket(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    LBracket => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_rbracket(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    RBracket => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_comma(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    Comma => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_colon(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    Colon => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_coloncolon(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    ColonColon => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_arrow(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    Arrow => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_fatarrow(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    FatArrow => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_match_kind_eq(p : Parser) -> Bool {
+  match p_peek(p).kind {
+    Eq => {
+      let _ = p_advance(p)
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn p_expect_lbrace(p : Parser) -> Unit {
+  if !p_match_kind_lbrace(p) {
+    let tok = p_peek(p)
+    p_err(
+      p,
+      tok.span,
+      "expected `{`, found `" + tok.raw + "`",
+      "`{`",
+      tok.raw,
+      "insert `{`",
+    )
+  }
+}
+
+///|
+fn p_expect_rbrace(p : Parser) -> Unit {
+  if !p_match_kind_rbrace(p) {
+    let tok = p_peek(p)
+    p_err(
+      p,
+      tok.span,
+      "expected `}`, found `" + tok.raw + "`",
+      "`}`",
+      tok.raw,
+      "insert matching `}`",
+    )
+  }
+}
+
+///|
+fn p_expect_lparen(p : Parser) -> Unit {
+  if !p_match_kind_lparen(p) {
+    let tok = p_peek(p)
+    p_err(
+      p,
+      tok.span,
+      "expected `(`, found `" + tok.raw + "`",
+      "`(`",
+      tok.raw,
+      "insert `(`",
+    )
+  }
+}
+
+///|
+fn p_expect_rparen(p : Parser) -> Unit {
+  if !p_match_kind_rparen(p) {
+    let tok = p_peek(p)
+    p_err(
+      p,
+      tok.span,
+      "expected `)`, found `" + tok.raw + "`",
+      "`)`",
+      tok.raw,
+      "insert matching `)`",
+    )
+  }
+}
+
+///|
+fn p_parse_type_params(p : Parser) -> Array[String] {
+  let params : Array[String] = []
+  if !p_match_kind_lbracket(p) {
+    return params
+  }
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      RBracket => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let name = p_expect_ident(p, "type parameter")
+        params.push(name)
+        if !p_match_kind_comma(p) {
+          if !p_match_kind_rbracket(p) {
+            let tok = p_peek(p)
+            p_err(
+              p,
+              tok.span,
+              "expected `,` or `]` in type parameter list",
+              "`,` or `]`",
+              tok.raw,
+              "close type parameter list with `]`",
+            )
+          }
+          break
+        }
+      }
+    }
+  }
+  params
+}
+
+///|
+fn p_parse_type_expr(p : Parser) -> TypeExpr {
+  let tok = p_peek(p)
+  match tok.kind {
+    LParen => {
+      let _ = p_advance(p)
+      let elems : Array[TypeExpr] = []
+      if !p_match_kind_rparen(p) {
+        while !p_is_eof(p) {
+          elems.push(p_parse_type_expr(p))
+          if !p_match_kind_comma(p) {
+            p_expect_rparen(p)
+            break
+          }
+          match p_peek(p).kind {
+            RParen => {
+              let _ = p_advance(p)
+              break
+            }
+            _ => ()
+          }
+        }
+      }
+      if p_match_kind_arrow(p) {
+        let ret = p_parse_type_expr(p)
+        TyFn(elems, ret, tok.span)
+      } else if elems.length() == 1 {
+        elems[0]
+      } else {
+        TyTuple(elems, tok.span)
+      }
+    }
+    Ident(name) => {
+      let _ = p_advance(p)
+      let args : Array[TypeExpr] = []
+      if p_match_kind_lbracket(p) {
+        while !p_is_eof(p) {
+          match p_peek(p).kind {
+            RBracket => {
+              let _ = p_advance(p)
+              break
+            }
+            _ => {
+              args.push(p_parse_type_expr(p))
+              if !p_match_kind_comma(p) {
+                if !p_match_kind_rbracket(p) {
+                  let t2 = p_peek(p)
+                  p_err(
+                    p,
+                    t2.span,
+                    "expected `,` or `]` in type arguments",
+                    "`,` or `]`",
+                    t2.raw,
+                    "close type arguments with `]`",
+                  )
+                }
+                break
+              }
+            }
+          }
+        }
+      }
+      TyName(name, args, tok.span)
+    }
+    _ => {
+      p_err(
+        p,
+        tok.span,
+        "expected type, found `" + tok.raw + "`",
+        "type expression",
+        tok.raw,
+        "write a valid type name",
+      )
+      TyMissing(tok.span)
+    }
+  }
+}
+
+///|
+fn p_parse_struct_decl(
+  p : Parser,
+  is_pub : Bool,
+  is_val : Bool,
+  start_span : Span,
+) -> Decl {
+  let _ = p_advance(p) // consume 'struct'
+  let name = p_expect_ident(p, "struct name")
+  let tparams = p_parse_type_params(p)
+  p_expect_lbrace(p)
+  let fields : Array[FieldDecl] = []
+  while !p_is_eof(p) {
+    p_skip_semis(p)
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let fspan = p_peek(p).span
+        let mut is_mut = false
+        match p_peek(p).kind {
+          KwMut => {
+            is_mut = true
+            let _ = p_advance(p)
+          }
+          _ => ()
+        }
+        let fname = p_expect_ident(p, "field name")
+        let fty = if p_match_kind_colon(p) {
+          p_parse_type_expr(p)
+        } else {
+          let t = p_peek(p)
+          p_err(
+            p,
+            t.span,
+            "expected `:` and field type for `" + fname + "`",
+            "`: Type`",
+            t.raw,
+            "add `: Type` to field `" + fname + "`",
+          )
+          TyMissing(t.span)
+        }
+        fields.push(FieldDecl::{
+          name: fname,
+          is_mut: is_mut,
+          ty: fty,
+          span: fspan,
+        })
+        let _ = p_match_kind_comma(p)
+        p_skip_semis(p)
+      }
+    }
+  }
+  DStruct(StructDecl::{
+    is_pub: is_pub,
+    is_val: is_val,
+    name: name,
+    type_params: tparams,
+    fields: fields,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume 'enum'
+  let name = p_expect_ident(p, "enum name")
+  let tparams = p_parse_type_params(p)
+  p_expect_lbrace(p)
+  let variants : Array[VariantDecl] = []
+  while !p_is_eof(p) {
+    p_skip_semis(p)
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let vspan = p_peek(p).span
+        let vname = p_expect_ident(p, "variant name")
+        let vfields : Array[TypeExpr] = []
+        if p_match_kind_lparen(p) {
+          while !p_is_eof(p) {
+            match p_peek(p).kind {
+              RParen => {
+                let _ = p_advance(p)
+                break
+              }
+              _ => {
+                vfields.push(p_parse_type_expr(p))
+                if !p_match_kind_comma(p) {
+                  p_expect_rparen(p)
+                  break
+                }
+              }
+            }
+          }
+        }
+        variants.push(VariantDecl::{
+          name: vname,
+          fields: vfields,
+          span: vspan,
+        })
+        let _ = p_match_kind_comma(p)
+        p_skip_semis(p)
+      }
+    }
+  }
+  DEnum(EnumDecl::{
+    is_pub: is_pub,
+    name: name,
+    type_params: tparams,
+    variants: variants,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_params(p : Parser) -> Array[Param] {
+  let params : Array[Param] = []
+  p_expect_lparen(p)
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      RParen => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let pspan = p_peek(p).span
+        let pname = p_expect_ident(p, "parameter name")
+        let pty = if p_match_kind_colon(p) {
+          p_parse_type_expr(p)
+        } else {
+          TyMissing(pspan)
+        }
+        params.push(Param::{ name: pname, ty: pty, span: pspan })
+        if !p_match_kind_comma(p) {
+          p_expect_rparen(p)
+          break
+        }
+      }
+    }
+  }
+  params
+}
+
+///|
+fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume 'fn'
+  let mut tparams = p_parse_type_params(p)
+  let first = p_expect_ident(p, "function name")
+  let mut recv_ty = ""
+  let mut fname = first
+  if p_match_kind_coloncolon(p) {
+    recv_ty = first
+    fname = p_expect_ident(p, "method name")
+  }
+  if tparams.length() == 0 {
+    tparams = p_parse_type_params(p)
+  }
+  let params = p_parse_params(p)
+  let ret_ty = if p_match_kind_arrow(p) {
+    p_parse_type_expr(p)
+  } else {
+    TyMissing(p_peek(p).span)
+  }
+  let body = p_parse_block_stmts(p)
+  DFn(FnDecl::{
+    is_pub: is_pub,
+    receiver_type: recv_ty,
+    name: fname,
+    type_params: tparams,
+    params: params,
+    ret_ty: ret_ty,
+    body: body,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_const_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume 'let'
+  let name = p_expect_ident(p, "constant name")
+  let cty = if p_match_kind_colon(p) {
+    p_parse_type_expr(p)
+  } else {
+    TyMissing(start_span)
+  }
+  if !p_match_kind_eq(p) {
+    let tok = p_peek(p)
+    p_err(
+      p,
+      tok.span,
+      "expected `=` in constant declaration `" + name + "`",
+      "`=`",
+      tok.raw,
+      "add `= <expr>`",
+    )
+  }
+  let val_expr = p_parse_expr(p)
+  DConst(ConstDecl::{
+    is_pub: is_pub,
+    name: name,
+    ty: cty,
+    value: val_expr,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_block_stmts(p : Parser) -> Array[Stmt] {
+  p_expect_lbrace(p)
+  let stmts : Array[Stmt] = []
+  while !p_is_eof(p) {
+    p_skip_semis(p)
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let prev_pos = p.pos
+        let st = p_parse_stmt(p)
+        stmts.push(st)
+        p_skip_semis(p)
+        if p.pos == prev_pos {
+          let _ = p_advance(p)
+        }
+      }
+    }
+  }
+  stmts
+}
+
+///|
+fn p_parse_stmt(p : Parser) -> Stmt {
+  let tok = p_peek(p)
+  match tok.kind {
+    KwLet => {
+      let _ = p_advance(p)
+      let mut is_mut = false
+      match p_peek(p).kind {
+        KwMut => {
+          is_mut = true
+          let _ = p_advance(p)
+        }
+        _ => ()
+      }
+      let name = p_expect_ident(p, "variable name")
+      let vty = if p_match_kind_colon(p) {
+        p_parse_type_expr(p)
+      } else {
+        TyMissing(tok.span)
+      }
+      if !p_match_kind_eq(p) {
+        let t2 = p_peek(p)
+        p_err(
+          p,
+          t2.span,
+          "expected `=` in `let` binding `" + name + "`",
+          "`=`",
+          t2.raw,
+          "initialize `" + name + "` with `= <expr>`",
+        )
+        p_sync_stmt(p)
+        return SLet(name, is_mut, vty, EUnit(tok.span), tok.span)
+      }
+      let init = p_parse_expr(p)
+      SLet(name, is_mut, vty, init, tok.span)
+    }
+    KwWhile => {
+      let _ = p_advance(p)
+      let cond = p_parse_expr(p)
+      let body = p_parse_block_stmts(p)
+      SWhile(cond, body, tok.span)
+    }
+    KwFor => {
+      let _ = p_advance(p)
+      let init_stmt = p_parse_for_clause_stmt(p)
+      p_skip_semis(p)
+      let cond = p_parse_expr(p)
+      p_skip_semis(p)
+      let step_stmt = p_parse_for_clause_stmt(p)
+      let body = p_parse_block_stmts(p)
+      SFor(init_stmt, cond, step_stmt, body, tok.span)
+    }
+    KwReturn => {
+      let _ = p_advance(p)
+      let next = p_peek(p)
+      let is_term = match next.kind {
+        RBrace | Semi | Eof => true
+        _ => false
+      }
+      let no_expr = next.newline_before || is_term
+      if no_expr {
+        SReturn(None, tok.span)
+      } else {
+        let e = p_parse_expr(p)
+        SReturn(Some(e), tok.span)
+      }
+    }
+    KwBreak => {
+      let _ = p_advance(p)
+      SBreak(tok.span)
+    }
+    KwContinue => {
+      let _ = p_advance(p)
+      SContinue(tok.span)
+    }
+    KwDebugAssert => {
+      let _ = p_advance(p)
+      p_expect_lparen(p)
+      let cond = p_parse_expr(p)
+      let msg = if p_match_kind_comma(p) {
+        p_parse_expr(p)
+      } else {
+        EString("assertion failed", tok.span)
+      }
+      p_expect_rparen(p)
+      SDebugAssert(cond, msg, tok.span)
+    }
+    _ => {
+      let lhs = p_parse_expr(p)
+      if p_match_kind_eq(p) {
+        let rhs = p_parse_expr(p)
+        SAssign(lhs, rhs, tok.span)
+      } else {
+        SExpr(lhs, tok.span)
+      }
+    }
+  }
+}
+
+///|
+fn p_parse_for_clause_stmt(p : Parser) -> Stmt {
+  let tok = p_peek(p)
+  match tok.kind {
+    KwLet => p_parse_stmt(p)
+    _ => {
+      let lhs = p_parse_expr(p)
+      if p_match_kind_eq(p) {
+        let rhs = p_parse_expr(p)
+        SAssign(lhs, rhs, tok.span)
+      } else {
+        SExpr(lhs, tok.span)
+      }
+    }
+  }
+}
+
+///|
+fn bin_prec(kind : TokenKind) -> Int {
+  match kind {
+    PipePipe => 1
+    AmpAmp => 2
+    Pipe => 3
+    Caret => 4
+    Amp => 5
+    EqEq | BangEq => 6
+    Lt | LtEq | Gt | GtEq => 7
+    LtLt | GtGt => 8
+    Plus | Minus => 9
+    Star | Slash | Percent => 10
+    _ => 0
+  }
+}
+
+///|
+fn p_parse_expr(p : Parser) -> Expr {
+  p_parse_bin_expr(p, 1)
+}
+
+///|
+fn p_parse_bin_expr(p : Parser, min_prec : Int) -> Expr {
+  let mut lhs = p_parse_unary_expr(p)
+  while true {
+    let tok = p_peek(p)
+    // Handle `expr as Type` at high precedence
+    match tok.kind {
+      KwAs => {
+        if min_prec <= 11 {
+          let _ = p_advance(p)
+          let target = p_parse_type_expr(p)
+          lhs = EAs(lhs, target, tok.span)
+          continue
+        }
+      }
+      _ => ()
+    }
+    let prec = bin_prec(tok.kind)
+    if prec == 0 || prec < min_prec {
+      break
+    }
+    // Avoid treating a leading unary `-` on a new line as binary subtraction
+    if tok.newline_before {
+      match tok.kind {
+        Minus => break
+        _ => ()
+      }
+    }
+    let op_tok = p_advance(p)
+    let rhs = p_parse_bin_expr(p, prec + 1)
+    lhs = EBinary(op_tok.raw, lhs, rhs, op_tok.span)
+  }
+  lhs
+}
+
+///|
+fn p_parse_unary_expr(p : Parser) -> Expr {
+  let tok = p_peek(p)
+  match tok.kind {
+    Minus => {
+      let _ = p_advance(p)
+      let inner = p_parse_unary_expr(p)
+      EUnary("-", inner, tok.span)
+    }
+    Bang => {
+      let _ = p_advance(p)
+      let inner = p_parse_unary_expr(p)
+      EUnary("!", inner, tok.span)
+    }
+    KwMove => {
+      let _ = p_advance(p)
+      if p_match_kind_lparen(p) {
+        let inner = p_parse_expr(p)
+        p_expect_rparen(p)
+        EMove(inner, tok.span)
+      } else {
+        let inner = p_parse_unary_expr(p)
+        EMove(inner, tok.span)
+      }
+    }
+    _ => p_parse_postfix_expr(p)
+  }
+}
+
+///|
+fn p_parse_arg_list(p : Parser) -> Array[Expr] {
+  let args : Array[Expr] = []
+  p_expect_lparen(p)
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      RParen => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        args.push(p_parse_expr(p))
+        if !p_match_kind_comma(p) {
+          p_expect_rparen(p)
+          break
+        }
+      }
+    }
+  }
+  args
+}
+
+///|
+fn p_parse_postfix_expr(p : Parser) -> Expr {
+  let mut expr = p_parse_primary_expr(p)
+  while !p_is_eof(p) {
+    let tok = p_peek(p)
+    match tok.kind {
+      Dot => {
+        let _ = p_advance(p)
+        let mem = p_expect_ident(p, "field or method name")
+        let next = p_peek(p)
+        let next_lparen = match next.kind {
+          LParen => true
+          _ => false
+        }
+        let is_call = !next.newline_before && next_lparen
+        if is_call {
+          let args = p_parse_arg_list(p)
+          expr = EMethodCall(expr, mem, args, tok.span)
+        } else {
+          expr = EField(expr, mem, tok.span)
+        }
+      }
+      LParen => {
+        if tok.newline_before {
+          break
+        }
+        let args = p_parse_arg_list(p)
+        expr = ECall(expr, args, tok.span)
+      }
+      LBracket => {
+        if tok.newline_before {
+          break
+        }
+        let _ = p_advance(p)
+        let idx = p_parse_expr(p)
+        if !p_match_kind_rbracket(p) {
+          let t2 = p_peek(p)
+          p_err(
+            p,
+            t2.span,
+            "expected `]` after index expression",
+            "`]`",
+            t2.raw,
+            "close index with `]`",
+          )
+        }
+        expr = EIndex(expr, idx, tok.span)
+      }
+      _ => break
+    }
+  }
+  expr
+}
+
+///|
+fn p_parse_struct_lit_fields(p : Parser) -> Array[FieldInit] {
+  p_expect_lbrace(p)
+  let fields : Array[FieldInit] = []
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let fspan = p_peek(p).span
+        let fname = p_expect_ident(p, "field name")
+        let fval = if p_match_kind_colon(p) {
+          p_parse_expr(p)
+        } else {
+          EIdent(fname, fspan)
+        }
+        fields.push(FieldInit::{ name: fname, value: fval, span: fspan })
+        if !p_match_kind_comma(p) {
+          p_expect_rbrace(p)
+          break
+        }
+      }
+    }
+  }
+  fields
+}
+
+///|
+fn p_looks_like_struct_lit(p : Parser) -> Bool {
+  match p_peek_at(p, 1).kind {
+    Ident(_) =>
+      match p_peek_at(p, 2).kind {
+        Colon => true
+        _ => false
+      }
+    _ => false
+  }
+}
+
+///|
+fn p_parse_if_expr(p : Parser) -> Expr {
+  let tok = p_advance(p) // consume 'if'
+  let cond = p_parse_expr(p)
+  let then_stmts = p_parse_block_stmts(p)
+  let else_opt : Option[Expr] = match p_peek(p).kind {
+    KwElse => {
+      let _ = p_advance(p)
+      match p_peek(p).kind {
+        KwIf => Some(p_parse_if_expr(p))
+        _ => {
+          let else_span = p_peek(p).span
+          let else_stmts = p_parse_block_stmts(p)
+          Some(EBlock(else_stmts, else_span))
+        }
+      }
+    }
+    _ => None
+  }
+  EIf(cond, then_stmts, else_opt, tok.span)
+}
+
+///|
+fn is_upper_start(s : String) -> Bool {
+  if s.length() == 0 {
+    false
+  } else {
+    let ch = str_code_at(s, 0)
+    ch >= 65 && ch <= 90
+  }
+}
+
+///|
+fn p_parse_pattern(p : Parser) -> Pattern {
+  let tok = p_peek(p)
+  match tok.kind {
+    BoolLit(b) => {
+      let _ = p_advance(p)
+      PBool(b, tok.span)
+    }
+    IntLit(s) => {
+      let _ = p_advance(p)
+      PInt(s, tok.span)
+    }
+    Minus => {
+      let _ = p_advance(p)
+      let t2 = p_peek(p)
+      match t2.kind {
+        IntLit(s) => {
+          let _ = p_advance(p)
+          PInt("-" + s, tok.span)
+        }
+        _ => {
+          p_err(
+            p,
+            t2.span,
+            "expected integer literal after `-` in pattern",
+            "integer literal",
+            t2.raw,
+            "write an integer literal",
+          )
+          PWild(tok.span)
+        }
+      }
+    }
+    StringLit(s) => {
+      let _ = p_advance(p)
+      PString(s, tok.span)
+    }
+    CharLit(s) => {
+      let _ = p_advance(p)
+      PChar(s, tok.span)
+    }
+    LParen => {
+      let _ = p_advance(p)
+      let pats : Array[Pattern] = []
+      while !p_is_eof(p) {
+        match p_peek(p).kind {
+          RParen => {
+            let _ = p_advance(p)
+            break
+          }
+          _ => {
+            pats.push(p_parse_pattern(p))
+            if !p_match_kind_comma(p) {
+              p_expect_rparen(p)
+              break
+            }
+          }
+        }
+      }
+      PTuple(pats, tok.span)
+    }
+    Ident(name) => {
+      let _ = p_advance(p)
+      if name == "_" {
+        return PWild(tok.span)
+      }
+      if p_match_kind_coloncolon(p) {
+        let vname = p_expect_ident(p, "variant name")
+        let sub = p_parse_pattern_args(p)
+        PVariant(name, vname, sub, tok.span)
+      } else {
+        match p_peek(p).kind {
+          LParen => {
+            let sub = p_parse_pattern_args(p)
+            PVariant("", name, sub, tok.span)
+          }
+          _ =>
+            if is_upper_start(name) {
+              PVariant("", name, [], tok.span)
+            } else {
+              PIdent(name, tok.span)
+            }
+        }
+      }
+    }
+    _ => {
+      p_err(
+        p,
+        tok.span,
+        "expected pattern, found `" + tok.raw + "`",
+        "pattern",
+        tok.raw,
+        "write a valid pattern or `_`",
+      )
+      let _ = p_advance(p)
+      PWild(tok.span)
+    }
+  }
+}
+
+///|
+fn p_parse_pattern_args(p : Parser) -> Array[Pattern] {
+  let sub : Array[Pattern] = []
+  if !p_match_kind_lparen(p) {
+    return sub
+  }
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      RParen => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        sub.push(p_parse_pattern(p))
+        if !p_match_kind_comma(p) {
+          p_expect_rparen(p)
+          break
+        }
+      }
+    }
+  }
+  sub
+}
+
+///|
+fn p_parse_match_expr(p : Parser) -> Expr {
+  let tok = p_advance(p) // consume 'match'
+  let scrut = p_parse_expr(p)
+  p_expect_lbrace(p)
+  let arms : Array[MatchArm] = []
+  while !p_is_eof(p) {
+    p_skip_semis(p)
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let arm_span = p_peek(p).span
+        // Support `Pat1 | Pat2 => body` by expanding into separate arms
+        let pats : Array[Pattern] = []
+        pats.push(p_parse_pattern(p))
+        while true {
+          match p_peek(p).kind {
+            Pipe => {
+              let _ = p_advance(p)
+              pats.push(p_parse_pattern(p))
+            }
+            _ => break
+          }
+        }
+        if !p_match_kind_fatarrow(p) {
+          let t2 = p_peek(p)
+          p_err(
+            p,
+            t2.span,
+            "expected `=>` in match arm",
+            "`=>`",
+            t2.raw,
+            "add `=> <expr>` after match pattern",
+          )
+          p_sync_stmt(p)
+          continue
+        }
+        let body = match p_peek(p).kind {
+          KwReturn | KwBreak | KwContinue => {
+            let st = p_parse_stmt(p)
+            EBlock([st], arm_span)
+          }
+          _ => {
+            let lhs = p_parse_expr(p)
+            if p_match_kind_eq(p) {
+              let rhs = p_parse_expr(p)
+              EBlock([SAssign(lhs, rhs, arm_span)], arm_span)
+            } else {
+              lhs
+            }
+          }
+        }
+        let mut i = 0
+        while i < pats.length() {
+          arms.push(MatchArm::{ pat: pats[i], body: body, span: arm_span })
+          i = i + 1
+        }
+        let _ = p_match_kind_comma(p)
+        p_skip_semis(p)
+      }
+    }
+  }
+  EMatch(scrut, arms, tok.span)
+}
+
+///|
+fn p_parse_primary_expr(p : Parser) -> Expr {
+  let tok = p_peek(p)
+  match tok.kind {
+    IntLit(s) => {
+      let _ = p_advance(p)
+      EInt(s, tok.span)
+    }
+    Int64Lit(s) => {
+      let _ = p_advance(p)
+      EInt64(s, tok.span)
+    }
+    DoubleLit(s) => {
+      let _ = p_advance(p)
+      EDouble(s, tok.span)
+    }
+    BoolLit(b) => {
+      let _ = p_advance(p)
+      EBool(b, tok.span)
+    }
+    ByteLit(s) => {
+      let _ = p_advance(p)
+      EByte(s, tok.span)
+    }
+    CharLit(s) => {
+      let _ = p_advance(p)
+      EChar(s, tok.span)
+    }
+    StringLit(s) => {
+      let _ = p_advance(p)
+      EString(s, tok.span)
+    }
+    KwIf => p_parse_if_expr(p)
+    KwMatch => p_parse_match_expr(p)
+    KwFn => {
+      let _ = p_advance(p)
+      let params = p_parse_params(p)
+      let ret_ty = if p_match_kind_arrow(p) {
+        p_parse_type_expr(p)
+      } else {
+        TyMissing(p_peek(p).span)
+      }
+      let body = p_parse_block_stmts(p)
+      EClosure(params, ret_ty, body, tok.span)
+    }
+    KwScope => {
+      let _ = p_advance(p)
+      p_expect_lparen(p)
+      let w = p_parse_expr(p)
+      let _ = p_match_kind_comma(p)
+      let f = p_parse_expr(p)
+      p_expect_rparen(p)
+      EScope(w, f, tok.span)
+    }
+    KwSpawn => {
+      let _ = p_advance(p)
+      p_expect_lparen(p)
+      let s = p_parse_expr(p)
+      let _ = p_match_kind_comma(p)
+      let f = p_parse_expr(p)
+      p_expect_rparen(p)
+      ESpawn(s, f, tok.span)
+    }
+    LParen => {
+      let _ = p_advance(p)
+      if p_match_kind_rparen(p) {
+        return EUnit(tok.span)
+      }
+      let first = p_parse_expr(p)
+      if p_match_kind_comma(p) {
+        let elems : Array[Expr] = [first]
+        while !p_is_eof(p) {
+          match p_peek(p).kind {
+            RParen => {
+              let _ = p_advance(p)
+              break
+            }
+            _ => {
+              elems.push(p_parse_expr(p))
+              if !p_match_kind_comma(p) {
+                p_expect_rparen(p)
+                break
+              }
+            }
+          }
+        }
+        ETuple(elems, tok.span)
+      } else {
+        p_expect_rparen(p)
+        first
+      }
+    }
+    LBracket => {
+      let _ = p_advance(p)
+      let elems : Array[Expr] = []
+      while !p_is_eof(p) {
+        match p_peek(p).kind {
+          RBracket => {
+            let _ = p_advance(p)
+            break
+          }
+          _ => {
+            elems.push(p_parse_expr(p))
+            if !p_match_kind_comma(p) {
+              if !p_match_kind_rbracket(p) {
+                let t2 = p_peek(p)
+                p_err(
+                  p,
+                  t2.span,
+                  "expected `,` or `]` in array literal",
+                  "`,` or `]`",
+                  t2.raw,
+                  "close array literal with `]`",
+                )
+              }
+              break
+            }
+          }
+        }
+      }
+      EArrayLit(elems, tok.span)
+    }
+    LBrace =>
+      if p_looks_like_struct_lit(p) {
+        let fields = p_parse_struct_lit_fields(p)
+        EStructLit("", fields, tok.span)
+      } else {
+        let stmts = p_parse_block_stmts(p)
+        EBlock(stmts, tok.span)
+      }
+    Ident(name) => {
+      let _ = p_advance(p)
+      if p_match_kind_coloncolon(p) {
+        match p_peek(p).kind {
+          LBrace => {
+            let fields = p_parse_struct_lit_fields(p)
+            EStructLit(name, fields, tok.span)
+          }
+          _ => {
+            let mem = p_expect_ident(p, "member name after `::`")
+            EPath(name, mem, tok.span)
+          }
+        }
+      } else {
+        EIdent(name, tok.span)
+      }
+    }
+    _ => {
+      p_err(
+        p,
+        tok.span,
+        "expected expression, found `" + tok.raw + "`",
+        "expression",
+        tok.raw,
+        "provide a valid expression",
+      )
+      if !p_is_eof(p) {
+        let _ = p_advance(p)
+      }
+      EUnit(tok.span)
+    }
+  }
+}
+
+///|
+pub fn parse_source(path : String, source : String) -> ParseResult {
+  let lex_res = lex(path, source)
+  let p = parser_new(lex_res.tokens, lex_res.diagnostics)
+  let decls : Array[Decl] = []
+
+  while !p_is_eof(p) {
+    p_skip_semis(p)
+    if p_is_eof(p) {
+      break
+    }
+    let start_span = p_peek(p).span
+    let mut is_pub = false
+    match p_peek(p).kind {
+      KwPub => {
+        is_pub = true
+        let _ = p_advance(p)
+      }
+      _ => ()
+    }
+    let mut is_val = false
+    match p_peek(p).kind {
+      KwVal => {
+        is_val = true
+        let _ = p_advance(p)
+      }
+      _ => ()
+    }
+    let tok = p_peek(p)
+    match tok.kind {
+      KwStruct => decls.push(p_parse_struct_decl(p, is_pub, is_val, start_span))
+      KwEnum => {
+        if is_val {
+          p_err(
+            p,
+            start_span,
+            "`val` modifier is only allowed on `struct` declarations",
+            "`struct`",
+            "`enum`",
+            "remove `val` before `enum`",
+          )
+        }
+        decls.push(p_parse_enum_decl(p, is_pub, start_span))
+      }
+      KwFn => decls.push(p_parse_fn_decl(p, is_pub, start_span))
+      KwLet => decls.push(p_parse_const_decl(p, is_pub, start_span))
+      _ => {
+        p_err(
+          p,
+          tok.span,
+          "expected top-level declaration (`fn`, `struct`, `enum`, `let`), found `" +
+          tok.raw +
+          "`",
+          "top-level declaration",
+          tok.raw,
+          "start a declaration with `fn`, `struct`, `enum`, or `let`",
+        )
+        let _ = p_advance(p)
+        p_sync_top(p)
+      }
+    }
+  }
+
+  ParseResult::{
+    file: SourceFile::{ path: path, decls: decls },
+    diagnostics: p.diagnostics,
+  }
+}
