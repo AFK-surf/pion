@@ -901,6 +901,7 @@ fn drv_link_objects(
       oi = oi + 1
     }
     ld_argv.push(rt_lib)
+    ld_argv.push("-lm")
     ld_argv.push("-lpthread")
     ld_argv.push("-o")
     ld_argv.push(final_bin)
@@ -1661,6 +1662,7 @@ fn drv_build_targets(
         oi = oi + 1
       }
       ld_argv.push(rt_lib)
+      ld_argv.push("-lm")
       ld_argv.push("-lpthread")
       ld_argv.push("-o")
       ld_argv.push(final_bin)
@@ -1850,7 +1852,7 @@ fn drv_build_targets(
     }
     proc_exec(
       world,
-      [cc, obj_path, rt_lib, "-lpthread", "-o", final_bin],
+      [cc, obj_path, rt_lib, "-lm", "-lpthread", "-o", final_bin],
     )
   }
   if rc_ld != 0 {

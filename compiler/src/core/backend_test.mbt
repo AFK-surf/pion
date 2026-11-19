@@ -722,3 +722,110 @@ test "p6b_multi_pkg_qbe_mangling_and_test_runner_emit" {
   let rep = @core.format_test_report_json(["a", "b"], [true, false])
   assert_eq(rep, "{\"ok\":false,\"passed\":1,\"failed\":1,\"tests\":[{\"name\":\"a\",\"ok\":true},{\"name\":\"b\",\"ok\":false}]}")
 }
+
+///|
+test "p6c_stdlib_qbe_codegen_symbols" {
+  let src =
+    #|pub fn main(world : World) -> Int {
+    #|  let s = "  a,b  ".trim()
+    #|  let _b1 = s.starts_with("a")
+    #|  let _b2 = s.ends_with("b")
+    #|  let _b3 = s.contains(",")
+    #|  let _i = s.index_of(",")
+    #|  let _sp = s.split(",")
+    #|  let r = s.replace(",", "-")
+    #|  let bs = r.to_bytes()
+    #|  let buf = Bytes::new(2)
+    #|  buf[0] = b'x'
+    #|  let _c = buf[0]
+    #|  let _n = buf.length()
+    #|  let j = buf.slice(0, 1).concat(bs)
+    #|  let _t = j.to_string()
+    #|  let _m = math_abs(-1.0) + math_floor(1.5) + math_ceil(1.2) + math_sin(0.0) + math_cos(0.0) + math_pow(2.0, 3.0)
+    #|  let _w = fs_write_bytes(world, "/tmp/p6c", j)
+    #|  let _rb = fs_read_bytes(world, "/tmp/p6c")
+    #|  let _ap = fs_append(world, "/tmp/p6c", "!")
+    #|  let _mt = fs_mtime_ms(world, "/tmp/p6c")
+    #|  let _ec = proc_exec_capture(world, ["echo", "ok"])
+    #|  0
+    #|}
+  let cr = @core.check_source_files_with_imports("p6c_std", ["std.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  assert_eq(ssa.contains("call $m2_str_trim("), true)
+  assert_eq(ssa.contains("call $m2_str_starts_with("), true)
+  assert_eq(ssa.contains("call $m2_str_ends_with("), true)
+  assert_eq(ssa.contains("call $m2_str_contains("), true)
+  assert_eq(ssa.contains("call $m2_str_index_of("), true)
+  assert_eq(ssa.contains("call $m2_str_split("), true)
+  assert_eq(ssa.contains("call $m2_str_replace("), true)
+  assert_eq(ssa.contains("call $m2_str_to_bytes("), true)
+  assert_eq(ssa.contains("call $m2_bytes_new("), true)
+  assert_eq(ssa.contains("call $m2_bytes_set("), true)
+  assert_eq(ssa.contains("call $m2_bytes_get("), true)
+  assert_eq(ssa.contains("call $m2_bytes_len("), true)
+  assert_eq(ssa.contains("call $m2_bytes_slice("), true)
+  assert_eq(ssa.contains("call $m2_bytes_concat("), true)
+  assert_eq(ssa.contains("call $m2_bytes_to_str("), true)
+  assert_eq(ssa.contains("call $m2_math_abs("), true)
+  assert_eq(ssa.contains("call $m2_math_floor("), true)
+  assert_eq(ssa.contains("call $m2_math_ceil("), true)
+  assert_eq(ssa.contains("call $m2_math_sin("), true)
+  assert_eq(ssa.contains("call $m2_math_cos("), true)
+  assert_eq(ssa.contains("call $m2_math_pow("), true)
+  assert_eq(ssa.contains("call $m2_world_fs_write_bytes("), true)
+  assert_eq(ssa.contains("call $m2_world_fs_read_bytes("), true)
+  assert_eq(ssa.contains("call $m2_world_fs_append("), true)
+  assert_eq(ssa.contains("call $m2_world_fs_mtime_ms("), true)
+  assert_eq(ssa.contains("call $m2_world_exec_capture("), true)
+}
+
+///|
+test "p6c_perceus_lite_early_drop_before_subsequent_alloc" {
+  let src =
+    #|enum Tree {
+    #|  Leaf
+    #|  Node(Tree, Tree)
+    #|}
+    #|fn make_tree(d : Int) -> Tree {
+    #|  if d <= 0 { Leaf } else { Node(make_tree(d - 1), make_tree(d - 1)) }
+    #|}
+    #|fn check_tree(t : Tree) -> Int {
+    #|  match t {
+    #|    Leaf => 1
+    #|    Node(l, r) => 1 + check_tree(l) + check_tree(r)
+    #|  }
+    #|}
+    #|pub fn run() -> Int {
+    #|  let stretch = make_tree(4)
+    #|  let c1 = check_tree(stretch)
+    #|  let long_lived = make_tree(3)
+    #|  let c2 = check_tree(long_lived)
+    #|  c1 + c2
+    #|}
+  let cr = @core.check_source_files_with_imports("p6c_ed", ["ed.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  let fn_start = match ssa.find("fn_run(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(fn_start >= 0, true)
+  let fn_body = ssa.clamped_view(start=fn_start).to_owned()
+  // After first check_tree(stretch) and before second make_tree(3), stretch must be
+  // early-dropped via m2_rc_dec + slot zeroing (`storel 0,`).
+  let first_check = match fn_body.find("fn_check_tree(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(first_check >= 0, true)
+  let after_first_check = fn_body.clamped_view(start=first_check).to_owned()
+  let second_make = match after_first_check.find("fn_make_tree(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(second_make >= 0, true)
+  let between = after_first_check.clamped_view(end=second_make).to_owned()
+  assert_eq(between.contains("call $m2_rc_dec("), true)
+  assert_eq(between.contains("storel 0, "), true)
+}

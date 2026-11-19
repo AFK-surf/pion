@@ -1078,6 +1078,10 @@ fn is_world_builtin(name : String) -> Bool {
   name == "io_eprintln" ||
   name == "fs_read" ||
   name == "fs_write" ||
+  name == "fs_read_bytes" ||
+  name == "fs_write_bytes" ||
+  name == "fs_append" ||
+  name == "fs_mtime_ms" ||
   name == "fs_exists" ||
   name == "fs_is_dir" ||
   name == "fs_mkdir_p" ||
@@ -1087,6 +1091,7 @@ fn is_world_builtin(name : String) -> Bool {
   name == "fs_size" ||
   name == "clock_now_ms" ||
   name == "proc_exec" ||
+  name == "proc_exec_capture" ||
   name == "env_get" ||
   name == "args_get" ||
   name == "world_args" ||
@@ -1142,8 +1147,25 @@ fn check_world_builtin_call(
     TUnit
   } else if name == "fs_read" {
     TResult(TString, TString)
-  } else if name == "fs_write" {
+  } else if name == "fs_write" || name == "fs_append" {
     TResult(TUnit, TString)
+  } else if name == "fs_read_bytes" {
+    TResult(TBytes, TString)
+  } else if name == "fs_write_bytes" {
+    if arg_tys.length() > offset + 1 && !ty_compat(TBytes, arg_tys[offset + 1]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`fs_write_bytes` expects `Bytes` data argument",
+        "Bytes",
+        ty_to_string(arg_tys[offset + 1]),
+        "pass a `Bytes` value",
+      )
+    }
+    TResult(TUnit, TString)
+  } else if name == "fs_mtime_ms" {
+    TInt64
   } else if name == "fs_exists" || name == "fs_is_dir" || name == "fs_mkdir_p" || name == "fs_remove" || name == "fs_rename" {
     TBool
   } else if name == "fs_size" {
@@ -1154,6 +1176,19 @@ fn check_world_builtin_call(
     TInt64
   } else if name == "proc_exec" || name == "world_argc" {
     TInt
+  } else if name == "proc_exec_capture" {
+    if arg_tys.length() > offset && !ty_compat(TArray(TString), arg_tys[offset]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`proc_exec_capture` expects `Array[String]` argv argument",
+        "Array[String]",
+        ty_to_string(arg_tys[offset]),
+        "pass an `Array[String]`",
+      )
+    }
+    TResult(TString, TString)
   } else if name == "world_argv" {
     TString
   } else if name == "env_get" {
@@ -2082,6 +2117,96 @@ fn check_method_call(
         }
         return TString
       }
+      if method_name == "starts_with" ||
+        method_name == "ends_with" ||
+        method_name == "contains" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TString))
+          if !ty_compat(TString, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`String::" + method_name + "` expects `String`",
+              "String",
+              ty_to_string(aty),
+              "pass a `String`",
+            )
+          }
+        }
+        return TBool
+      }
+      if method_name == "index_of" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TString))
+          if !ty_compat(TString, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`String::index_of` expects `String`",
+              "String",
+              ty_to_string(aty),
+              "pass a `String`",
+            )
+          }
+        }
+        return TInt
+      }
+      if method_name == "trim" {
+        return TString
+      }
+      if method_name == "split" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TString))
+          if !ty_compat(TString, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`String::split` expects `String`",
+              "String",
+              ty_to_string(aty),
+              "pass a `String`",
+            )
+          }
+        }
+        return TArray(TString)
+      }
+      if method_name == "replace" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TString))
+          if !ty_compat(TString, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`String::replace` argument 1 expects `String`",
+              "String",
+              ty_to_string(aty),
+              "pass a `String`",
+            )
+          }
+        }
+        if args.length() >= 2 {
+          let bty = check_expr(tc, env, args[1], Some(TString))
+          if !ty_compat(TString, bty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`String::replace` argument 2 expects `String`",
+              "String",
+              ty_to_string(bty),
+              "pass a `String`",
+            )
+          }
+        }
+        return TString
+      }
+      if method_name == "to_bytes" {
+        return TBytes
+      }
     }
     TStringBuilder => {
       if method_name == "write_string" {
@@ -2125,10 +2250,40 @@ fn check_method_call(
         return TUnit
       }
     }
-    TBytes =>
+    TBytes => {
       if method_name == "length" {
         return TInt
       }
+      if method_name == "slice" {
+        if args.length() >= 1 {
+          let _ = check_expr(tc, env, args[0], Some(TInt))
+        }
+        if args.length() >= 2 {
+          let _ = check_expr(tc, env, args[1], Some(TInt))
+        }
+        return TBytes
+      }
+      if method_name == "concat" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TBytes))
+          if !ty_compat(TBytes, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`Bytes::concat` expects `Bytes`",
+              "Bytes",
+              ty_to_string(aty),
+              "pass a `Bytes` value",
+            )
+          }
+        }
+        return TBytes
+      }
+      if method_name == "to_string" {
+        return TString
+      }
+    }
     TArray(elem) => {
       if method_name == "length" {
         return TInt
@@ -2689,7 +2844,12 @@ fn check_expr(
             }
             return TString
           }
-          if name == "math_sqrt" {
+          if name == "math_sqrt" ||
+            name == "math_abs" ||
+            name == "math_floor" ||
+            name == "math_ceil" ||
+            name == "math_sin" ||
+            name == "math_cos" {
             if args.length() >= 1 {
               let aty = check_expr(tc, env, args[0], Some(TDouble))
               if !ty_compat(TDouble, aty) {
@@ -2697,10 +2857,41 @@ fn check_expr(
                   tc,
                   expr_span(args[0]),
                   "E_TYPE_MISMATCH",
-                  "argument 1 of `math_sqrt` expects `Double`",
+                  "argument 1 of `" + name + "` expects `Double`",
                   "Double",
                   ty_to_string(aty),
-                  "pass a `Double` to `math_sqrt`",
+                  "pass a `Double` to `" + name + "`",
+                )
+              }
+            }
+            return TDouble
+          }
+          if name == "math_pow" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TDouble))
+              if !ty_compat(TDouble, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "argument 1 of `math_pow` expects `Double`",
+                  "Double",
+                  ty_to_string(aty),
+                  "pass a `Double` to `math_pow`",
+                )
+              }
+            }
+            if args.length() >= 2 {
+              let bty = check_expr(tc, env, args[1], Some(TDouble))
+              if !ty_compat(TDouble, bty) {
+                tc_err(
+                  tc,
+                  expr_span(args[1]),
+                  "E_TYPE_MISMATCH",
+                  "argument 2 of `math_pow` expects `Double`",
+                  "Double",
+                  ty_to_string(bty),
+                  "pass a `Double` to `math_pow`",
                 )
               }
             }
@@ -2778,6 +2969,23 @@ fn check_expr(
         EPath(qual, mem, _) => {
           if qual == "StringBuilder" && mem == "new" {
             return TStringBuilder
+          }
+          if qual == "Bytes" && mem == "new" {
+            if args.length() >= 1 {
+              let lty = check_expr(tc, env, args[0], Some(TInt))
+              if !ty_compat(TInt, lty) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "`Bytes::new` length must be `Int`",
+                  "Int",
+                  ty_to_string(lty),
+                  "pass an `Int` length",
+                )
+              }
+            }
+            return TBytes
           }
           if qual == "Map" && mem == "new" {
             return match expected {

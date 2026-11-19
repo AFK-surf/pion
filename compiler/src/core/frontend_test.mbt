@@ -487,3 +487,59 @@ test "p6b: first-class test block and contextual test identifier" {
   let cr = @core.check_source_files("tpkg", ["t.m2"], [src])
   assert_true(cr.diagnostics.length() == 0, "contextual test var + test block should pass")
 }
+
+///|
+test "p6c: stdlib String/Bytes/Math/World IO typechecking and capability/Send guards" {
+  let ok_src =
+    "pub fn demo(world : World) -> Int {\n" +
+    "  let s = \"  hello,world  \".trim()\n" +
+    "  let a = s.starts_with(\"he\") && s.ends_with(\"ld\") && s.contains(\",\")\n" +
+    "  let idx : Int = s.index_of(\",\")\n" +
+    "  let parts : Array[String] = s.split(\",\")\n" +
+    "  let r : String = s.replace(\"world\", \"m2\")\n" +
+    "  let bs : Bytes = r.to_bytes()\n" +
+    "  let buf = Bytes::new(4)\n" +
+    "  buf[0] = b'A'\n" +
+    "  let b0 : Byte = buf[0]\n" +
+    "  let joined : Bytes = buf.slice(0, 1).concat(bs)\n" +
+    "  let back : String = joined.to_string()\n" +
+    "  let m : Double = math_abs(-1.5) + math_floor(2.7) + math_ceil(2.1) + math_sin(0.0) + math_cos(0.0) + math_pow(2.0, 3.0)\n" +
+    "  let _w : Result[Unit, String] = fs_write_bytes(world, \"/tmp/x\", joined)\n" +
+    "  let _rb : Result[Bytes, String] = fs_read_bytes(world, \"/tmp/x\")\n" +
+    "  let _ap : Result[Unit, String] = fs_append(world, \"/tmp/x\", back)\n" +
+    "  let _mt : Int64 = fs_mtime_ms(world, \"/tmp/x\")\n" +
+    "  let _ec : Result[String, String] = proc_exec_capture(world, [\"echo\", \"hi\"])\n" +
+    "  if a && idx >= 0 && parts.length() > 0 && b0.to_int() == 65 && m > 0.0 { 0 } else { 1 }\n" +
+    "}\n"
+  let cr = @core.check_source_files("stdlib_ok", ["ok.m2"], [ok_src])
+  assert_true(cr.diagnostics.length() == 0, "stdlib ok_src should have 0 diagnostics")
+
+  let no_world =
+    "pub fn bad_io() -> Int64 {\n" +
+    "  fs_mtime_ms(\"/tmp/x\")\n" +
+    "}\n"
+  let cr_nw = @core.check_source_files("stdlib_nw", ["nw.m2"], [no_world])
+  let nw_json = @core.check_result_to_json(cr_nw.diagnostics)
+  assert_true(str_contains(nw_json, "E_CAPABILITY_MISSING"), "fs_mtime_ms requires World")
+
+  let no_world_cap =
+    "pub fn bad_exec() -> Result[String, String] {\n" +
+    "  proc_exec_capture([\"echo\", \"hi\"])\n" +
+    "}\n"
+  let cr_ec = @core.check_source_files("stdlib_ec", ["ec.m2"], [no_world_cap])
+  let ec_json = @core.check_result_to_json(cr_ec.diagnostics)
+  assert_true(str_contains(ec_json, "E_CAPABILITY_MISSING"), "proc_exec_capture requires World")
+
+  let bytes_not_send =
+    "pub fn bad_spawn(world : World) -> Unit {\n" +
+    "  let b = Bytes::new(4)\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      let _ = b.length()\n" +
+    "    })\n" +
+    "  })\n" +
+    "}\n"
+  let cr_ns = @core.check_source_files("stdlib_ns", ["ns.m2"], [bytes_not_send])
+  let ns_json = @core.check_result_to_json(cr_ns.diagnostics)
+  assert_true(str_contains(ns_json, "E_NOT_SEND"), "Bytes must be !Send")
+}

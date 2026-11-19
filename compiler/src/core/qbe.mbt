@@ -1415,7 +1415,13 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
     ECall(callee, args, _) =>
       match callee {
         EIdent(fname, _) =>
-          if fname == "math_sqrt" {
+          if fname == "math_sqrt" ||
+            fname == "math_abs" ||
+            fname == "math_floor" ||
+            fname == "math_ceil" ||
+            fname == "math_sin" ||
+            fname == "math_cos" ||
+            fname == "math_pow" {
             let mut i = 0
             while i < args.length() {
               if !qbe_loop_has_no_calls_expr(args[i]) {
@@ -3731,6 +3737,99 @@ fn qbe_emit_world_builtin(
     res = qbe_tmp(g)
     qbe_emit(g, res + " =l loadl " + res_slot)
     rty = TResult(TUnit, TString)
+  } else if name == "fs_read_bytes" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let ok_slot = qbe_alloc_slot4(g)
+    let raw_b = qbe_tmp(g)
+    qbe_emit(
+      g,
+      raw_b +
+      " =l call $m2_world_fs_read_bytes(l " +
+      w_val +
+      ", l " +
+      p +
+      ", l " +
+      ok_slot +
+      ")",
+    )
+    let ok_w = qbe_tmp(g)
+    qbe_emit(g, ok_w + " =w loadw " + ok_slot)
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "fsrb_ok")
+    let l_err = qbe_lbl(g, "fsrb_err")
+    let l_end = qbe_lbl(g, "fsrb_end")
+    qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, raw_b, TBytes, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    qbe_emit(g, "call $m2_rc_dec(l " + raw_b + ")")
+    let err_s = qbe_emit_string_lit(g, "fs_read_bytes failed")
+    let err_obj = qbe_emit_result(g, 1, err_s, TBytes, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TBytes, TString)
+  } else if name == "fs_write_bytes" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let b = if arg_vals.length() > off + 1 { arg_vals[off + 1] } else { "0" }
+    let ok_w = qbe_tmp(g)
+    qbe_emit(
+      g,
+      ok_w + " =w call $m2_world_fs_write_bytes(l " + w_val + ", l " + p + ", l " + b + ")",
+    )
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "fswb_ok")
+    let l_err = qbe_lbl(g, "fswb_err")
+    let l_end = qbe_lbl(g, "fswb_end")
+    qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, "0", TUnit, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    let err_s = qbe_emit_string_lit(g, "fs_write_bytes failed")
+    let err_obj = qbe_emit_result(g, 1, err_s, TUnit, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TUnit, TString)
+  } else if name == "fs_append" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let c = if arg_vals.length() > off + 1 { arg_vals[off + 1] } else { "0" }
+    let ok_w = qbe_tmp(g)
+    qbe_emit(
+      g,
+      ok_w + " =w call $m2_world_fs_append(l " + w_val + ", l " + p + ", l " + c + ")",
+    )
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "fsap_ok")
+    let l_err = qbe_lbl(g, "fsap_err")
+    let l_end = qbe_lbl(g, "fsap_end")
+    qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, "0", TUnit, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    let err_s = qbe_emit_string_lit(g, "fs_append failed")
+    let err_obj = qbe_emit_result(g, 1, err_s, TUnit, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TUnit, TString)
+  } else if name == "fs_mtime_ms" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l call $m2_world_fs_mtime_ms(l " + w_val + ", l " + p + ")")
+    rty = TInt64
   } else if name == "fs_exists" {
     let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
     let rw = qbe_tmp(g)
@@ -3850,6 +3949,56 @@ fn qbe_emit_world_builtin(
     res = qbe_tmp(g)
     qbe_emit(g, res + " =w call $m2_world_exec(l " + w_val + ", l " + arr + ")")
     rty = TInt
+  } else if name == "proc_exec_capture" {
+    let arr = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let rc_slot = qbe_alloc_slot4(g)
+    let raw_s = qbe_tmp(g)
+    qbe_emit(
+      g,
+      raw_s +
+      " =l call $m2_world_exec_capture(l " +
+      w_val +
+      ", l " +
+      arr +
+      ", l " +
+      rc_slot +
+      ")",
+    )
+    let rc_w = qbe_tmp(g)
+    qbe_emit(g, rc_w + " =w loadw " + rc_slot)
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "pexc_ok")
+    let l_err = qbe_lbl(g, "pexc_err")
+    let l_end = qbe_lbl(g, "pexc_end")
+    qbe_emit_term(g, "jnz " + rc_w + ", " + l_err + ", " + l_ok)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, raw_s, TString, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    let rc_l = qbe_tmp(g)
+    qbe_emit(g, rc_l + " =l extsw " + rc_w)
+    let rc_str = qbe_tmp(g)
+    qbe_emit(g, rc_str + " =l call $m2_int_to_str(l " + rc_l + ")")
+    let pre_s = qbe_emit_string_lit(g, "exit ")
+    let sep_s = qbe_emit_string_lit(g, ": ")
+    let p1 = qbe_tmp(g)
+    qbe_emit(g, p1 + " =l call $m2_str_concat(l " + pre_s + ", l " + rc_str + ")")
+    qbe_emit(g, "call $m2_rc_dec(l " + rc_str + ")")
+    let p2 = qbe_tmp(g)
+    qbe_emit(g, p2 + " =l call $m2_str_concat(l " + p1 + ", l " + sep_s + ")")
+    qbe_emit(g, "call $m2_rc_dec(l " + p1 + ")")
+    let err_s = qbe_tmp(g)
+    qbe_emit(g, err_s + " =l call $m2_str_concat(l " + p2 + ", l " + raw_s + ")")
+    qbe_emit(g, "call $m2_rc_dec(l " + p2 + ")")
+    qbe_emit(g, "call $m2_rc_dec(l " + raw_s + ")")
+    let err_obj = qbe_emit_result(g, 1, err_s, TString, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TString, TString)
   }
   let mut j = 0
   while j < arg_vals.length() {
@@ -4445,6 +4594,169 @@ fn qbe_emit_method_call(
           g,
           r + " =l call $m2_str_slice(l " + obj_val + ", l " + al + ", l " + bl + ")",
         )
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TString)
+      }
+      if method_name == "starts_with" {
+        let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let pv = pa.qv
+        let rw = qbe_tmp(g)
+        qbe_emit(g, rw + " =w call $m2_str_starts_with(l " + obj_val + ", l " + pv.reg + ")")
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l extuw " + rw)
+        if !pa.borrowed {
+          qbe_rc_dec(g, pv.reg, pv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBool)
+      }
+      if method_name == "ends_with" {
+        let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let pv = pa.qv
+        let rw = qbe_tmp(g)
+        qbe_emit(g, rw + " =w call $m2_str_ends_with(l " + obj_val + ", l " + pv.reg + ")")
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l extuw " + rw)
+        if !pa.borrowed {
+          qbe_rc_dec(g, pv.reg, pv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBool)
+      }
+      if method_name == "contains" {
+        let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let pv = pa.qv
+        let rw = qbe_tmp(g)
+        qbe_emit(g, rw + " =w call $m2_str_contains(l " + obj_val + ", l " + pv.reg + ")")
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l extuw " + rw)
+        if !pa.borrowed {
+          qbe_rc_dec(g, pv.reg, pv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBool)
+      }
+      if method_name == "index_of" {
+        let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let pv = pa.qv
+        let r64 = qbe_tmp(g)
+        qbe_emit(g, r64 + " =l call $m2_str_index_of(l " + obj_val + ", l " + pv.reg + ")")
+        let rw = qbe_tmp(g)
+        qbe_emit(g, rw + " =w copy " + r64)
+        if !pa.borrowed {
+          qbe_rc_dec(g, pv.reg, pv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(rw, TInt)
+      }
+      if method_name == "trim" {
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_str_trim(l " + obj_val + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TString)
+      }
+      if method_name == "split" {
+        let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let pv = pa.qv
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_str_split(l " + obj_val + ", l " + pv.reg + ")")
+        if !pa.borrowed {
+          qbe_rc_dec(g, pv.reg, pv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TArray(TString))
+      }
+      if method_name == "replace" {
+        let a0 = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let a1 = qbe_emit_arg_maybe_borrow(g, args[1], Some(TString), args_pure)
+        let r = qbe_tmp(g)
+        qbe_emit(
+          g,
+          r +
+          " =l call $m2_str_replace(l " +
+          obj_val +
+          ", l " +
+          a0.qv.reg +
+          ", l " +
+          a1.qv.reg +
+          ")",
+        )
+        if !a1.borrowed {
+          qbe_rc_dec(g, a1.qv.reg, a1.qv.ty)
+        }
+        if !a0.borrowed {
+          qbe_rc_dec(g, a0.qv.reg, a0.qv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TString)
+      }
+      if method_name == "to_bytes" {
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_str_to_bytes(l " + obj_val + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBytes)
+      }
+    }
+    TBytes => {
+      if method_name == "length" {
+        let r64 = qbe_tmp(g)
+        let rw = qbe_tmp(g)
+        qbe_emit(g, r64 + " =l call $m2_bytes_len(l " + obj_val + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        qbe_emit(g, rw + " =w copy " + r64)
+        return qval(rw, TInt)
+      }
+      if method_name == "slice" {
+        let a = qbe_emit_expr(g, args[0], Some(TInt))
+        let b = qbe_emit_expr(g, args[1], Some(TInt))
+        let al = qbe_as_l(g, a)
+        let bl = qbe_as_l(g, b)
+        let r = qbe_tmp(g)
+        qbe_emit(
+          g,
+          r + " =l call $m2_bytes_slice(l " + obj_val + ", l " + al + ", l " + bl + ")",
+        )
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBytes)
+      }
+      if method_name == "concat" {
+        let oa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TBytes), args_pure)
+        let ov = oa.qv
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_bytes_concat(l " + obj_val + ", l " + ov.reg + ")")
+        if !oa.borrowed {
+          qbe_rc_dec(g, ov.reg, ov.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBytes)
+      }
+      if method_name == "to_string" {
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l call $m2_bytes_to_str(l " + obj_val + ")")
         if !obj_borrowed {
           qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
         }
@@ -6134,6 +6446,26 @@ fn qbe_emit_expr(
             qbe_emit(g, r + " =d sqrt " + xd)
             return qval(r, TDouble)
           }
+          if name == "math_abs" ||
+            name == "math_floor" ||
+            name == "math_ceil" ||
+            name == "math_sin" ||
+            name == "math_cos" {
+            let xv = qbe_emit_expr(g, args[0], Some(TDouble))
+            let xd = qbe_coerce_val(g, xv, TDouble)
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =d call $m2_" + name + "(d " + xd + ")")
+            return qval(r, TDouble)
+          }
+          if name == "math_pow" {
+            let xv = qbe_emit_expr(g, args[0], Some(TDouble))
+            let yv = qbe_emit_expr(g, args[1], Some(TDouble))
+            let xd = qbe_coerce_val(g, xv, TDouble)
+            let yd = qbe_coerce_val(g, yv, TDouble)
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =d call $m2_math_pow(d " + xd + ", d " + yd + ")")
+            return qval(r, TDouble)
+          }
           if is_world_builtin(name) {
             return qbe_emit_world_builtin(g, name, args)
           }
@@ -6321,6 +6653,17 @@ fn qbe_emit_expr(
             let r = qbe_tmp(g)
             qbe_emit(g, r + " =l call $m2_strbuf_new(l 32)")
             return qval(r, TStringBuilder)
+          }
+          if qual == "Bytes" && mem == "new" {
+            let lv = if args.length() >= 1 {
+              qbe_emit_expr(g, args[0], Some(TInt))
+            } else {
+              qval("0", TInt)
+            }
+            let ll = qbe_as_l(g, lv)
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =l call $m2_bytes_new(l " + ll + ")")
+            return qval(r, TBytes)
           }
           if qual == "Map" && mem == "new" {
             let mut kty = TString
@@ -6802,6 +7145,18 @@ fn qbe_emit_expr(
           qbe_emit(g, bw + " =w call $m2_str_byte_at(l " + ov.reg + ", l " + il + ")")
           qbe_rc_dec(g, ov.reg, ov.ty)
           qval(bw, TInt)
+        }
+        TBytes => {
+          let iv = qbe_emit_expr(g, idx, Some(TInt))
+          let il = qbe_as_l(g, iv)
+          let bw = qbe_tmp(g)
+          let bl = qbe_tmp(g)
+          qbe_emit(g, bw + " =w call $m2_bytes_get(l " + ov.reg + ", l " + il + ")")
+          qbe_emit(g, bl + " =l extuw " + bw)
+          if !borrowed {
+            qbe_rc_dec(g, ov.reg, ov.ty)
+          }
+          qval(bl, TByte)
         }
         _ => {
           let _ = qbe_emit_expr(g, idx, None)
@@ -8231,28 +8586,120 @@ fn qbe_try_emit_while_sq_reuse(
 }
 
 ///|
+fn qbe_is_early_drop_ty(t : Ty) -> Bool {
+  match t {
+    TWorld | TScope | TParam(_) => false
+    _ => qbe_is_obj_ty(t)
+  }
+}
+
+///|
 fn qbe_emit_stmts(
   g : QbeGen,
   stmts : Array[Stmt],
   expected : Option[Ty],
 ) -> QbeVal {
-  if stmts.length() == 0 {
+  let n = stmts.length()
+  if n == 0 {
     return qval("0", TUnit)
   }
+  // Perceus-lite last-use early drop: for each top-level immutable `SLet` in this
+  // straight-line statement block, compute its last syntactic mention index `last_use`.
+  // When `last_use < n - 1` and the binding is an owned heap object not shadowed or
+  // pinned by a borrowed array-element view, drop it immediately after `stmts[last_use]`
+  // and zero its stack slot so scope-exit / early-return release is a 1-branch NULL no-op.
+  let def_last_use : Array[Int] = []
+  let def_names : Array[String] = []
+  let mut di = 0
+  while di < n {
+    let mut lu = -1
+    let mut dname = ""
+    if di < n - 1 {
+      match stmts[di] {
+        SLet(name, is_mut, _, _, _) =>
+          if !is_mut && name != "_" {
+            let mut cur_lu = di
+            let mut shadowed_use = false
+            let mut j = di + 1
+            while j < n {
+              match stmts[j] {
+                SLet(n2, _, _, init2, _) =>
+                  if n2 == name {
+                    if qbe_expr_mentions_ident(init2, name) {
+                      shadowed_use = true
+                    }
+                    break
+                  }
+                _ => ()
+              }
+              if qbe_stmt_mentions_ident(stmts[j], name) {
+                cur_lu = j
+              }
+              j = j + 1
+            }
+            if !shadowed_use && cur_lu < n - 1 {
+              lu = cur_lu
+              dname = name
+            }
+          }
+        _ => ()
+      }
+    }
+    def_last_use.push(lu)
+    def_names.push(dname)
+    di = di + 1
+  }
+  let ed_names : Array[String] = []
+  let ed_slots : Array[String] = []
+  let ed_last : Array[Int] = []
+  let pinned : Map[String, Bool] = Map([])
   let mut i = 0
   let mut last = qval("0", TUnit)
-  while i < stmts.length() {
+  while i < n {
     if g.block_term {
       break
     }
-    let is_last = i == stmts.length() - 1
+    let is_last = i == n - 1
     if !is_last && qbe_try_emit_borrowed_arr_elem_let(g, stmts, i) {
+      match stmts[i] {
+        SLet(_, _, _, EIndex(EIdent(aname, _), _, _), _) =>
+          pinned.set(aname, true)
+        _ => ()
+      }
       last = qval("0", TUnit)
-      i = i + 1
-      continue
+    } else {
+      let exp = if is_last { expected } else { None }
+      last = qbe_emit_stmt(g, stmts[i], exp, is_last)
+      if def_last_use[i] >= 0 {
+        let dname = def_names[i]
+        match qbe_lookup_local(g, dname) {
+          Some(loc) =>
+            if loc.owned && qbe_is_early_drop_ty(loc.ty) {
+              ed_names.push(dname)
+              ed_slots.push(loc.slot)
+              ed_last.push(def_last_use[i])
+            }
+          None => ()
+        }
+      }
     }
-    let exp = if is_last { expected } else { None }
-    last = qbe_emit_stmt(g, stmts[i], exp, is_last)
+    if !g.block_term && ed_names.length() > 0 {
+      let mut k = ed_names.length() - 1
+      let mut dropped_any = false
+      while k >= 0 {
+        if ed_last[k] == i && !pinned.contains(ed_names[k]) {
+          let dead = qbe_tmp(g)
+          qbe_emit(g, dead + " =l loadl " + ed_slots[k])
+          qbe_emit(g, "call $m2_rc_dec(l " + dead + ")")
+          qbe_emit(g, "storel 0, " + ed_slots[k])
+          dropped_any = true
+        }
+        k = k - 1
+      }
+      if dropped_any {
+        g.block_immut_fields = Map([])
+      }
+    }
     i = i + 1
   }
   last
@@ -8578,6 +9025,17 @@ fn qbe_emit_stmt(
               )
               qbe_rc_dec(g, kv.reg, kv.ty)
               qbe_rc_dec(g, rv.reg, rv.ty)
+            }
+            TBytes => {
+              let iv = qbe_emit_expr(g, idx, Some(TInt))
+              let il = qbe_as_l(g, iv)
+              let rv = qbe_emit_expr(g, rhs, Some(TByte))
+              let vw = qbe_tmp(g)
+              qbe_emit(g, vw + " =w copy " + rv.reg)
+              qbe_emit(
+                g,
+                "call $m2_bytes_set(l " + ov.reg + ", l " + il + ", w " + vw + ")",
+              )
             }
             _ => ()
           }
