@@ -254,7 +254,7 @@ static void test_world(int argc, char **argv) {
     m2_rc_dec(missing_key);
     m2_rc_dec(missing_val);
 
-    /* fs_mkdir_p / fs_write / fs_exists / fs_read / fs_list_dir */
+    /* fs_mkdir_p / fs_write / fs_exists / fs_size / fs_read / fs_rename / fs_list_dir / fs_remove */
     char dir_buf[128];
     snprintf(dir_buf, sizeof(dir_buf), "/tmp/m2_rt_test_%d/sub", (int)getpid());
     void *dir_s = m2_str_from_cstr(dir_buf, -1);
@@ -262,19 +262,49 @@ static void test_world(int argc, char **argv) {
     assert(m2_world_fs_exists(w, dir_s) == 1);
 
     char file_buf[160];
-    snprintf(file_buf, sizeof(file_buf), "%s/hello.txt", dir_buf);
-    void *file_s = m2_str_from_cstr(file_buf, -1);
+    snprintf(file_buf, sizeof(file_buf), "%s/zeta.tmp", dir_buf);
+    void *file_tmp = m2_str_from_cstr(file_buf, -1);
     void *content = m2_str_from_cstr("m2 world fs payload\n", -1);
-    assert(m2_world_fs_write(w, file_s, content) == 1);
-    assert(m2_world_fs_exists(w, file_s) == 1);
+    assert(m2_world_fs_write(w, file_tmp, content) == 1);
+    assert(m2_world_fs_exists(w, file_tmp) == 1);
+    assert(m2_world_fs_size(w, file_tmp) == 20);
 
-    void *read_back = m2_world_fs_read(w, file_s, &ok);
+    /* Atomic rename */
+    char file_zeta[160];
+    snprintf(file_zeta, sizeof(file_zeta), "%s/zeta.txt", dir_buf);
+    void *zeta_s = m2_str_from_cstr(file_zeta, -1);
+    assert(m2_world_fs_rename(w, file_tmp, zeta_s) == 1);
+    assert(m2_world_fs_exists(w, file_tmp) == 0);
+    assert(m2_world_fs_size(w, file_tmp) == -1);
+    assert(m2_world_fs_exists(w, zeta_s) == 1);
+    assert(m2_world_fs_size(w, zeta_s) == 20);
+
+    void *read_back = m2_world_fs_read(w, zeta_s, &ok);
     assert(ok == 1 && m2_str_eq(read_back, content) == 1);
 
+    /* Write unsorted filenames and verify deterministic lexicographical order */
+    const char *extra_names[] = {"mid.txt", "alpha.txt", "beta.txt"};
+    char extra_paths[3][160];
+    for (int i = 0; i < 3; i++) {
+        snprintf(extra_paths[i], sizeof(extra_paths[i]), "%s/%s", dir_buf, extra_names[i]);
+        void *ps = m2_str_from_cstr(extra_paths[i], -1);
+        assert(m2_world_fs_write(w, ps, content) == 1);
+        m2_rc_dec(ps);
+    }
+
     void *entries = m2_world_fs_list_dir(w, dir_s);
-    assert(m2_arr_len(entries) == 1);
-    void *hello_name = m2_str_from_cstr("hello.txt", -1);
-    assert(m2_str_eq((void *)(uintptr_t)m2_arr_get(entries, 0), hello_name) == 1);
+    assert(m2_arr_len(entries) == 4);
+    const char *sorted_expected[] = {"alpha.txt", "beta.txt", "mid.txt", "zeta.txt"};
+    for (int i = 0; i < 4; i++) {
+        void *exp = m2_str_from_cstr(sorted_expected[i], -1);
+        assert(m2_str_eq((void *)(uintptr_t)m2_arr_get(entries, i), exp) == 1);
+        m2_rc_dec(exp);
+    }
+
+    /* fs_remove */
+    assert(m2_world_fs_remove(w, zeta_s) == 1);
+    assert(m2_world_fs_exists(w, zeta_s) == 0);
+    assert(m2_world_fs_remove(w, zeta_s) == 0);
 
     /* exec */
     void *cmd = m2_arr_new(3, 1);
@@ -287,7 +317,9 @@ static void test_world(int argc, char **argv) {
     assert(m2_world_exec(w, cmd) == 42);
 
     /* cleanup temp files */
-    unlink(file_buf);
+    for (int i = 0; i < 3; i++) {
+        unlink(extra_paths[i]);
+    }
     rmdir(dir_buf);
     snprintf(dir_buf, sizeof(dir_buf), "/tmp/m2_rt_test_%d", (int)getpid());
     rmdir(dir_buf);
@@ -296,11 +328,11 @@ static void test_world(int argc, char **argv) {
     m2_rc_dec(flag);
     m2_rc_dec(script);
     m2_rc_dec(cmd);
-    m2_rc_dec(hello_name);
     m2_rc_dec(entries);
     m2_rc_dec(read_back);
     m2_rc_dec(content);
-    m2_rc_dec(file_s);
+    m2_rc_dec(zeta_s);
+    m2_rc_dec(file_tmp);
     m2_rc_dec(dir_s);
     m2_rc_dec(w);
     printf("[PASS] world_capabilities\n");
@@ -530,6 +562,24 @@ static void nested_mid(void *arg) {
     m2_scope_end(inner);
 }
 
+typedef struct ParentScopeEnv {
+    void *parent_scope;
+    void *atom;
+} ParentScopeEnv;
+
+static void parent_scope_env_drop(void *p) {
+    ParentScopeEnv *e = (ParentScopeEnv *)p;
+    m2_rc_dec(e->parent_scope);
+    m2_rc_dec(e->atom);
+}
+
+static void child_spawning_into_parent(void *arg) {
+    ParentScopeEnv *e = (ParentScopeEnv *)arg;
+    for (int i = 0; i < 3; i++) {
+        m2_scope_spawn(e->parent_scope, nested_leaf, e->atom);
+    }
+}
+
 static void test_mt_nested_scope(void) {
     void *atom = m2_atomic_new(0);
     void *outer = m2_scope_begin();
@@ -538,8 +588,24 @@ static void test_mt_nested_scope(void) {
     }
     m2_scope_end(outer);
     assert(m2_atomic_load(atom) == 8);
+
+    /* Child threads capturing parent scope & spawning into it concurrently */
+    void *shared_scope = m2_scope_begin();
+    ParentScopeEnv *penv = (ParentScopeEnv *)m2_alloc(
+        (uint32_t)sizeof(ParentScopeEnv), M2_TAG_STRUCT, parent_scope_env_drop);
+    m2_rc_inc(shared_scope);
+    m2_rc_inc(atom);
+    penv->parent_scope = shared_scope;
+    penv->atom = atom;
+    for (int i = 0; i < 4; i++) {
+        m2_scope_spawn(shared_scope, child_spawning_into_parent, penv);
+    }
+    m2_rc_dec(penv);
+    m2_scope_end(shared_scope);
+    assert(m2_atomic_load(atom) == 8 + 4 * 3);
+
     m2_rc_dec(atom);
-    printf("[PASS] mt_nested_scope (4x2 threads)\n");
+    printf("[PASS] mt_nested_scope (4x2 nested + 4x3 parent-scope spawn)\n");
 }
 
 /* ============================================================================

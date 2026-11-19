@@ -559,6 +559,7 @@ void *m2_scope_begin(void) {
     s->threads = NULL;
     s->len = 0;
     s->cap = 0;
+    m2_rc_freeze(s);
     return s;
 }
 
@@ -965,6 +966,12 @@ int32_t m2_world_fs_mkdir_p(void *w_ptr, void *path_str) {
     return ok;
 }
 
+static int m2_str_slot_cmp(const void *a, const void *b) {
+    void *sa = (void *)(uintptr_t)(*(const int64_t *)a);
+    void *sb = (void *)(uintptr_t)(*(const int64_t *)b);
+    return (int)m2_str_cmp(sa, sb);
+}
+
 void *m2_world_fs_list_dir(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
@@ -982,7 +989,35 @@ void *m2_world_fs_list_dir(void *w_ptr, void *path_str) {
         m2_rc_dec(name);
     }
     closedir(d);
+    M2Array *a = (M2Array *)arr;
+    if (a->len > 1) {
+        qsort(a->data, (size_t)a->len, sizeof(int64_t), m2_str_slot_cmp);
+    }
     return arr;
+}
+
+int32_t m2_world_fs_remove(void *w_ptr, void *path_str) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    if (!path || path->len == 0) return 0;
+    return unlink(path->data) == 0 ? 1 : 0;
+}
+
+int32_t m2_world_fs_rename(void *w_ptr, void *old_path, void *new_path) {
+    (void)w_ptr;
+    M2String *op = (M2String *)old_path;
+    M2String *np = (M2String *)new_path;
+    if (!op || !np || op->len == 0 || np->len == 0) return 0;
+    return rename(op->data, np->data) == 0 ? 1 : 0;
+}
+
+int64_t m2_world_fs_size(void *w_ptr, void *path_str) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    if (!path || path->len == 0) return -1;
+    struct stat st;
+    if (stat(path->data, &st) != 0) return -1;
+    return (int64_t)st.st_size;
 }
 
 void *m2_world_env_get(void *w_ptr, void *name_str, int32_t *ok_out) {
