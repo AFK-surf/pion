@@ -644,18 +644,32 @@ arm64_isel(Fn *fn)
 void
 arm64_hoist_consts(Fn *fn)
 {
-	Blk *b, *d, *p;
+	Blk *b, *d, *p, **order;
 	Ins *i, ins;
 	Con *c;
 	uint *nhoist;
-	uint k, pos, bestloop;
+	uint k, n, j, pos, bestloop;
 
 	if (fn->nblk == 0)
 		return;
 	nhoist = alloc(fn->nblk * sizeof *nhoist);
+	order = alloc(fn->nblk * sizeof *order);
+	n = 0;
 	for (b = fn->start; b; b = b->link) {
-		if (b->loop <= 1)
-			continue;
+		if (b->loop > 1)
+			order[n++] = b;
+	}
+	for (k = 1; k < n; k++) {
+		Blk *key = order[k];
+		j = k;
+		while (j > 0 && order[j - 1]->loop < key->loop) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = key;
+	}
+	for (j = 0; j < n; j++) {
+		b = order[j];
 		for (k = 0; k < b->nins; k++) {
 			i = &b->ins[k];
 			if (i->op != Ocopy || KBASE(i->cls) != 1)
@@ -667,7 +681,7 @@ arm64_hoist_consts(Fn *fn)
 			if (fn->tmp[i->to.val].slot != -1 || fn->tmp[i->to.val].ndef != 1)
 				continue;
 			c = &fn->con[i->arg[0].val];
-			if (c->type != CBits)
+			if (c->type != CBits || c->bits.i == 0)
 				continue;
 
 			d = 0;
@@ -680,7 +694,7 @@ arm64_hoist_consts(Fn *fn)
 						break;
 				}
 			}
-			if (!d || nhoist[d->id] >= 6)
+			if (!d || nhoist[d->id] >= 8)
 				continue;
 
 			ins = *i;
