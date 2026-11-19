@@ -4,6 +4,7 @@
 
 #include <assert.h>
 #include <inttypes.h>
+#include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -223,6 +224,182 @@ static void test_string_and_strbuf(void) {
     m2_rc_dec(built);
     m2_rc_dec(utf8_s);
     printf("[PASS] string_and_strbuf\n");
+}
+
+static void test_stdlib_string_bytes_math(void) {
+    /* Math */
+    assert(m2_math_abs(-3.5) == 3.5);
+    assert(m2_math_abs(0.0) == 0.0);
+    assert(m2_math_abs(7.25) == 7.25);
+    assert(m2_math_floor(2.9) == 2.0);
+    assert(m2_math_floor(-2.1) == -3.0);
+    assert(m2_math_ceil(2.1) == 3.0);
+    assert(m2_math_ceil(-2.9) == -2.0);
+    assert(fabs(m2_math_sin(0.0)) < 1e-12);
+    assert(fabs(m2_math_cos(0.0) - 1.0) < 1e-12);
+    assert(fabs(m2_math_pow(2.0, 10.0) - 1024.0) < 1e-12);
+    assert(fabs(m2_math_pow(9.0, 0.5) - 3.0) < 1e-12);
+
+    /* starts_with / ends_with / contains / index_of */
+    void *s = m2_str_from_cstr("hello, 世界! hello", -1);
+    void *empty = m2_str_from_cstr("", 0);
+    void *p_hello = m2_str_from_cstr("hello", -1);
+    void *p_world = m2_str_from_cstr("世界", -1);
+    void *p_bang = m2_str_from_cstr("!", 1);
+    void *p_long = m2_str_from_cstr("hello, 世界! hello world", -1);
+    void *p_miss = m2_str_from_cstr("xyz", 3);
+
+    assert(m2_str_starts_with(s, p_hello) == 1);
+    assert(m2_str_starts_with(s, empty) == 1);
+    assert(m2_str_starts_with(s, p_long) == 0);
+    assert(m2_str_starts_with(empty, empty) == 1);
+    assert(m2_str_starts_with(empty, p_bang) == 0);
+    assert(m2_str_starts_with(NULL, NULL) == 1);
+
+    assert(m2_str_ends_with(s, p_hello) == 1);
+    assert(m2_str_ends_with(s, empty) == 1);
+    assert(m2_str_ends_with(s, p_long) == 0);
+    assert(m2_str_ends_with(empty, p_bang) == 0);
+
+    assert(m2_str_index_of(s, empty) == 0);
+    assert(m2_str_index_of(empty, empty) == 0);
+    assert(m2_str_index_of(s, p_hello) == 0);
+    assert(m2_str_index_of(s, p_world) == 7);
+    assert(m2_str_index_of(s, p_bang) == 13);
+    assert(m2_str_index_of(s, p_miss) == -1);
+    assert(m2_str_index_of(s, p_long) == -1);
+    assert(m2_str_contains(s, p_world) == 1);
+    assert(m2_str_contains(s, p_miss) == 0);
+    assert(m2_str_contains(empty, empty) == 1);
+
+    /* trim */
+    void *ws1 = m2_str_from_cstr(" \t\r\n  hi \t there \r\n ", -1);
+    void *tr1 = m2_str_trim(ws1);
+    void *exp_tr1 = m2_str_from_cstr("hi \t there", -1);
+    assert(m2_str_eq(tr1, exp_tr1) == 1);
+
+    void *ws_all = m2_str_from_cstr(" \t\r\n ", -1);
+    void *tr_all = m2_str_trim(ws_all);
+    assert(m2_str_len(tr_all) == 0);
+
+    void *tr_empty = m2_str_trim(empty);
+    assert(m2_str_len(tr_empty) == 0);
+    void *tr_null = m2_str_trim(NULL);
+    assert(m2_str_len(tr_null) == 0);
+
+    /* split */
+    void *csv = m2_str_from_cstr(",a,,b,", -1);
+    void *comma = m2_str_from_cstr(",", 1);
+    void *parts = m2_str_split(csv, comma);
+    assert(m2_arr_len(parts) == 5);
+    const char *exp_parts[] = {"", "a", "", "b", ""};
+    for (int i = 0; i < 5; i++) {
+        void *ep = m2_str_from_cstr(exp_parts[i], -1);
+        assert(m2_str_eq((void *)(uintptr_t)m2_arr_get(parts, i), ep) == 1);
+        m2_rc_dec(ep);
+    }
+
+    /* split empty string with non-empty sep -> [""] */
+    void *parts_empty = m2_str_split(empty, comma);
+    assert(m2_arr_len(parts_empty) == 1);
+    assert(m2_str_len((void *)(uintptr_t)m2_arr_get(parts_empty, 0)) == 0);
+
+    /* split with empty sep -> per-byte (empty -> []) */
+    void *abc = m2_str_from_cstr("abc", 3);
+    void *parts_bytes = m2_str_split(abc, empty);
+    assert(m2_arr_len(parts_bytes) == 3);
+    assert(m2_str_byte_at((void *)(uintptr_t)m2_arr_get(parts_bytes, 0), 0) == 'a');
+    assert(m2_str_byte_at((void *)(uintptr_t)m2_arr_get(parts_bytes, 2), 0) == 'c');
+    void *parts_ee = m2_str_split(empty, empty);
+    assert(m2_arr_len(parts_ee) == 0);
+
+    /* split overlapping pattern */
+    void *aaa = m2_str_from_cstr("aaa", 3);
+    void *aa = m2_str_from_cstr("aa", 2);
+    void *parts_ov = m2_str_split(aaa, aa);
+    assert(m2_arr_len(parts_ov) == 2);
+    assert(m2_str_len((void *)(uintptr_t)m2_arr_get(parts_ov, 0)) == 0);
+    assert(m2_str_byte_at((void *)(uintptr_t)m2_arr_get(parts_ov, 1), 0) == 'a');
+
+    /* replace */
+    void *rep_grow = m2_str_replace(s, p_hello, p_world);
+    void *exp_grow = m2_str_from_cstr("世界, 世界! 世界", -1);
+    assert(m2_str_eq(rep_grow, exp_grow) == 1);
+
+    void *rep_del = m2_str_replace(s, p_hello, empty);
+    void *exp_del = m2_str_from_cstr(", 世界! ", -1);
+    assert(m2_str_eq(rep_del, exp_del) == 1);
+
+    /* replace empty from -> retain original without infinite loop */
+    void *rep_empty_from = m2_str_replace(s, empty, p_bang);
+    assert(rep_empty_from == s);
+    assert(m2_str_eq(rep_empty_from, s) == 1);
+
+    /* replace miss -> retain original */
+    void *rep_miss = m2_str_replace(s, p_miss, p_bang);
+    assert(rep_miss == s);
+
+    /* Bytes: new / len / get / set / slice (clamped) / concat / str<->bytes */
+    void *b0 = m2_bytes_new(0);
+    assert(m2_bytes_len(b0) == 0);
+    assert(m2_bytes_len(NULL) == 0);
+
+    void *b = m2_bytes_new(6);
+    assert(m2_bytes_len(b) == 6);
+    for (int64_t i = 0; i < 6; i++) {
+        assert(m2_bytes_get(b, i) == 0);
+        m2_bytes_set(b, i, (int32_t)(i * 40 + 5));
+    }
+    m2_bytes_set(b, 5, 0x1AB); /* wraps to 0xAB */
+    assert(m2_bytes_get(b, 0) == 5);
+    assert(m2_bytes_get(b, 5) == 0xAB);
+
+    void *bsl1 = m2_bytes_slice(b, -10, 3);
+    assert(m2_bytes_len(bsl1) == 3);
+    assert(m2_bytes_get(bsl1, 0) == 5 && m2_bytes_get(bsl1, 2) == 85);
+
+    void *bsl2 = m2_bytes_slice(b, 4, 999);
+    assert(m2_bytes_len(bsl2) == 2);
+    assert(m2_bytes_get(bsl2, 0) == 165 && m2_bytes_get(bsl2, 1) == 0xAB);
+
+    void *bsl3 = m2_bytes_slice(b, 5, 2); /* start > end -> empty */
+    assert(m2_bytes_len(bsl3) == 0);
+    void *bsl4 = m2_bytes_slice(b, 99, 100); /* start > len -> empty */
+    assert(m2_bytes_len(bsl4) == 0);
+
+    void *bcat = m2_bytes_concat(bsl1, bsl2);
+    assert(m2_bytes_len(bcat) == 5);
+    assert(m2_bytes_get(bcat, 0) == 5);
+    assert(m2_bytes_get(bcat, 3) == 165);
+    assert(m2_bytes_get(bcat, 4) == 0xAB);
+
+    /* str <-> bytes roundtrip (including embedded NUL) */
+    const char raw_nul[5] = {'a', '\0', 'b', (char)0xE4, 'z'};
+    void *s_nul = m2_str_from_cstr(raw_nul, 5);
+    void *b_nul = m2_str_to_bytes(s_nul);
+    assert(m2_bytes_len(b_nul) == 5);
+    assert(m2_bytes_get(b_nul, 1) == 0);
+    assert(m2_bytes_get(b_nul, 3) == 0xE4);
+    void *s_rt = m2_bytes_to_str(b_nul);
+    assert(m2_str_eq(s_rt, s_nul) == 1);
+    assert(((M2String *)s_rt)->data[5] == '\0');
+
+    void *s_from_b0 = m2_bytes_to_str(b0);
+    assert(m2_str_len(s_from_b0) == 0);
+
+    m2_rc_dec(s); m2_rc_dec(empty); m2_rc_dec(p_hello); m2_rc_dec(p_world);
+    m2_rc_dec(p_bang); m2_rc_dec(p_long); m2_rc_dec(p_miss);
+    m2_rc_dec(ws1); m2_rc_dec(tr1); m2_rc_dec(exp_tr1);
+    m2_rc_dec(ws_all); m2_rc_dec(tr_all); m2_rc_dec(tr_empty); m2_rc_dec(tr_null);
+    m2_rc_dec(csv); m2_rc_dec(comma); m2_rc_dec(parts); m2_rc_dec(parts_empty);
+    m2_rc_dec(abc); m2_rc_dec(parts_bytes); m2_rc_dec(parts_ee);
+    m2_rc_dec(aaa); m2_rc_dec(aa); m2_rc_dec(parts_ov);
+    m2_rc_dec(rep_grow); m2_rc_dec(exp_grow); m2_rc_dec(rep_del); m2_rc_dec(exp_del);
+    m2_rc_dec(rep_empty_from); m2_rc_dec(rep_miss);
+    m2_rc_dec(b0); m2_rc_dec(b); m2_rc_dec(bsl1); m2_rc_dec(bsl2);
+    m2_rc_dec(bsl3); m2_rc_dec(bsl4); m2_rc_dec(bcat);
+    m2_rc_dec(s_nul); m2_rc_dec(b_nul); m2_rc_dec(s_rt); m2_rc_dec(s_from_b0);
+    printf("[PASS] stdlib_string_bytes_math\n");
 }
 
 static void test_array_and_map(void) {
@@ -549,6 +726,77 @@ static void test_world(int argc, char **argv) {
     m2_arr_push(cmd, (int64_t)(uintptr_t)flag);
     m2_arr_push(cmd, (int64_t)(uintptr_t)script);
     assert(m2_world_exec(w, cmd) == 42);
+
+    /* fs_read_bytes / fs_write_bytes / fs_append / fs_mtime_ms */
+    char bin_path_buf[160];
+    snprintf(bin_path_buf, sizeof(bin_path_buf), "%s/bin.dat", dir_buf);
+    void *bin_path = m2_str_from_cstr(bin_path_buf, -1);
+    assert(m2_world_fs_mtime_ms(w, bin_path) == -1);
+    void *raw_b = m2_bytes_new(256);
+    for (int i = 0; i < 256; i++) {
+        m2_bytes_set(raw_b, i, i);
+    }
+    assert(m2_world_fs_write_bytes(w, bin_path, raw_b) == 1);
+    int64_t mtime = m2_world_fs_mtime_ms(w, bin_path);
+    assert(mtime > 1700000000000LL);
+    void *read_b = m2_world_fs_read_bytes(w, bin_path, &ok);
+    assert(ok == 1 && m2_bytes_len(read_b) == 256);
+    for (int i = 0; i < 256; i++) {
+        assert(m2_bytes_get(read_b, i) == i);
+    }
+    void *missing_b_path = m2_str_from_cstr("/nonexistent_m2_bytes_file_xyz", -1);
+    void *missing_b = m2_world_fs_read_bytes(w, missing_b_path, &ok);
+    assert(ok == 0 && m2_bytes_len(missing_b) == 0);
+    unlink(bin_path_buf);
+
+    /* fs_append */
+    char app_path_buf[160];
+    snprintf(app_path_buf, sizeof(app_path_buf), "%s/app.log", dir_buf);
+    void *app_path = m2_str_from_cstr(app_path_buf, -1);
+    void *line1 = m2_str_from_cstr("first\n", -1);
+    void *line2 = m2_str_from_cstr("second\n", -1);
+    assert(m2_world_fs_append(w, app_path, line1) == 1);
+    assert(m2_world_fs_append(w, app_path, line2) == 1);
+    void *app_read = m2_world_fs_read(w, app_path, &ok);
+    void *app_exp = m2_str_from_cstr("first\nsecond\n", -1);
+    assert(ok == 1 && m2_str_eq(app_read, app_exp) == 1);
+    unlink(app_path_buf);
+
+    /* exec_capture: normal, non-zero exit, missing binary, and >64KB stdout (no pipe deadlock) */
+    int32_t cap_code = -1;
+    void *cap_cmd1 = m2_arr_new(3, 1);
+    void *cap_s1 = m2_str_from_cstr("printf 'hello-capture'; exit 7", -1);
+    m2_arr_push(cap_cmd1, (int64_t)(uintptr_t)sh);
+    m2_arr_push(cap_cmd1, (int64_t)(uintptr_t)flag);
+    m2_arr_push(cap_cmd1, (int64_t)(uintptr_t)cap_s1);
+    void *cap_out1 = m2_world_exec_capture(w, cap_cmd1, &cap_code);
+    void *cap_exp1 = m2_str_from_cstr("hello-capture", -1);
+    assert(cap_code == 7 && m2_str_eq(cap_out1, cap_exp1) == 1);
+
+    /* Large stdout (>128 KB, well over OS 64KB pipe buffer) */
+    void *cap_cmd_big = m2_arr_new(3, 1);
+    void *cap_s_big = m2_str_from_cstr("head -c 131072 /dev/zero | tr '\\0' 'A'", -1);
+    m2_arr_push(cap_cmd_big, (int64_t)(uintptr_t)sh);
+    m2_arr_push(cap_cmd_big, (int64_t)(uintptr_t)flag);
+    m2_arr_push(cap_cmd_big, (int64_t)(uintptr_t)cap_s_big);
+    void *cap_out_big = m2_world_exec_capture(w, cap_cmd_big, &cap_code);
+    assert(cap_code == 0 && m2_str_len(cap_out_big) == 131072);
+    assert(m2_str_byte_at(cap_out_big, 0) == 'A' && m2_str_byte_at(cap_out_big, 131071) == 'A');
+
+    /* Missing binary -> exit 127 */
+    void *cap_cmd_miss = m2_arr_new(1, 1);
+    void *cap_s_miss = m2_str_from_cstr("/nonexistent_m2_cap_cmd_xyz", -1);
+    m2_arr_push(cap_cmd_miss, (int64_t)(uintptr_t)cap_s_miss);
+    void *cap_out_miss = m2_world_exec_capture(w, cap_cmd_miss, &cap_code);
+    assert(cap_code == 127 && m2_str_len(cap_out_miss) == 0);
+
+    m2_rc_dec(bin_path); m2_rc_dec(raw_b); m2_rc_dec(read_b);
+    m2_rc_dec(missing_b_path); m2_rc_dec(missing_b);
+    m2_rc_dec(app_path); m2_rc_dec(line1); m2_rc_dec(line2);
+    m2_rc_dec(app_read); m2_rc_dec(app_exp);
+    m2_rc_dec(cap_cmd1); m2_rc_dec(cap_s1); m2_rc_dec(cap_out1); m2_rc_dec(cap_exp1);
+    m2_rc_dec(cap_cmd_big); m2_rc_dec(cap_s_big); m2_rc_dec(cap_out_big);
+    m2_rc_dec(cap_cmd_miss); m2_rc_dec(cap_s_miss); m2_rc_dec(cap_out_miss);
 
     /* cleanup temp files */
     for (int i = 0; i < 3; i++) {
@@ -960,11 +1208,29 @@ static void exec_stress_worker(void *arg) {
     void *s_missing = m2_str_from_cstr("/nonexistent_m2_exec_cmd_xyz_999", -1);
     m2_arr_push(cmd_missing, (int64_t)(uintptr_t)s_missing);
 
+    void *cmd_cap = m2_arr_new(3, 1);
+    void *s_sh = m2_str_from_cstr("/bin/sh", -1);
+    void *s_c = m2_str_from_cstr("-c", -1);
+    void *s_echo = m2_str_from_cstr("printf 'mt-ok'", -1);
+    m2_arr_push(cmd_cap, (int64_t)(uintptr_t)s_sh);
+    m2_arr_push(cmd_cap, (int64_t)(uintptr_t)s_c);
+    m2_arr_push(cmd_cap, (int64_t)(uintptr_t)s_echo);
+    void *exp_ok = m2_str_from_cstr("mt-ok", -1);
+
     for (int i = 0; i < e->iters; i++) {
         assert(m2_world_exec(e->world, cmd_true) == 0);
         assert(m2_world_exec(e->world, cmd_missing) == 127);
+        int32_t code = -1;
+        void *out = m2_world_exec_capture(e->world, cmd_cap, &code);
+        assert(code == 0 && m2_str_eq(out, exp_ok) == 1);
+        m2_rc_dec(out);
     }
 
+    m2_rc_dec(s_sh);
+    m2_rc_dec(s_c);
+    m2_rc_dec(s_echo);
+    m2_rc_dec(cmd_cap);
+    m2_rc_dec(exp_ok);
     m2_rc_dec(s_true);
     m2_rc_dec(cmd_true);
     m2_rc_dec(s_missing);
@@ -1137,6 +1403,7 @@ int main(int argc, char **argv) {
     test_biased_rc_and_immortal();
     test_alloc_uninit();
     test_string_and_strbuf();
+    test_stdlib_string_bytes_math();
     test_array_and_map();
     test_map_try_get_and_100k();
     test_sha256();

@@ -14,24 +14,24 @@ rm -f "$OUT_DIR/libm2rt.a"
 ar rcs "$OUT_DIR/libm2rt.a" "$OUT_DIR/m2_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libm2rt.a" | tr -d ' ')"
 echo "libm2rt.a size: $LIB_SIZE bytes"
-if [ "$LIB_SIZE" -ge 53248 ]; then
-    echo "FAIL: libm2rt.a ($LIB_SIZE bytes) exceeds 52 KB budget (53248 bytes)" >&2
+if [ "$LIB_SIZE" -ge 65536 ]; then
+    echo "FAIL: libm2rt.a ($LIB_SIZE bytes) exceeds 64 KB budget (65536 bytes)" >&2
     exit 1
 fi
 
 echo "=== 2. Run unit + MT + 4-core speedup benchmark (-O2) ==="
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
-    "$RT_DIR/test_rt.c" "$OUT_DIR/libm2rt.a" -lpthread -o "$OUT_DIR/test_rt_o2"
+    "$RT_DIR/test_rt.c" "$OUT_DIR/libm2rt.a" -lm -lpthread -o "$OUT_DIR/test_rt_o2"
 "$OUT_DIR/test_rt_o2" --bench
 
 echo "=== 3. Run ThreadSanitizer (-fsanitize=thread) ==="
 "$CC" -std=c11 -O1 -g -fsanitize=thread -Wall -Wextra -Werror -I"$RT_DIR" \
-    "$RT_DIR/m2_rt.c" "$RT_DIR/test_rt.c" -lpthread -o "$OUT_DIR/test_rt_tsan"
+    "$RT_DIR/m2_rt.c" "$RT_DIR/test_rt.c" -lm -lpthread -o "$OUT_DIR/test_rt_tsan"
 "$OUT_DIR/test_rt_tsan"
 
 echo "=== 4. Run AddressSanitizer (-fsanitize=address) ==="
 "$CC" -std=c11 -O1 -g -fsanitize=address -Wall -Wextra -Werror -I"$RT_DIR" \
-    "$RT_DIR/m2_rt.c" "$RT_DIR/test_rt.c" -lpthread -o "$OUT_DIR/test_rt_asan"
+    "$RT_DIR/m2_rt.c" "$RT_DIR/test_rt.c" -lm -lpthread -o "$OUT_DIR/test_rt_asan"
 "$OUT_DIR/test_rt_asan"
 
 echo "=== 5. QBE arm64_apple End-to-End ABI Smoke Test ==="

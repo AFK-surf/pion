@@ -4,6 +4,7 @@
 
 #include <dirent.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
@@ -73,6 +74,30 @@ double m2_math_sqrt(double x) {
     return sqrt(x);
 }
 
+double m2_math_abs(double x) {
+    return fabs(x);
+}
+
+double m2_math_floor(double x) {
+    return floor(x);
+}
+
+double m2_math_ceil(double x) {
+    return ceil(x);
+}
+
+double m2_math_sin(double x) {
+    return sin(x);
+}
+
+double m2_math_cos(double x) {
+    return cos(x);
+}
+
+double m2_math_pow(double x, double y) {
+    return pow(x, y);
+}
+
 #if defined(__SANITIZE_ADDRESS__)
 #define M2_USE_SLAB 0
 #elif defined(__has_feature)
@@ -87,7 +112,7 @@ double m2_math_sqrt(double x) {
 
 #if M2_USE_SLAB
 
-#define M2_SLAB_CLASSES     7u
+#define M2_SLAB_CLASSES     8u
 #define M2_SLAB_MAX_TOTAL   256u
 #define M2_SLAB_MAX_PAYLOAD (M2_SLAB_MAX_TOTAL - (uint32_t)sizeof(M2Header))
 #define M2_SLAB_CHUNK_BYTES 65536u
@@ -99,12 +124,19 @@ typedef struct M2SlabTLS {
 } M2SlabTLS;
 
 static const uint16_t m2_slab_sizes[M2_SLAB_CLASSES] = {
-    32u, 48u, 64u, 96u, 128u, 192u, 256u
+    32u, 48u, 56u, 64u, 96u, 128u, 192u, 256u
 };
 
-/* Maps ((total + 15) >> 4) in [2..16] to slab class [0..6] */
-static const uint8_t m2_slab_cls_lut[17] = {
-    0, 0, 0, 1, 2, 3, 3, 4, 4, 5, 5, 5, 5, 6, 6, 6, 6
+/* Maps ((total + 7) >> 3) in [4..32] to slab class [0..7] */
+static const uint8_t m2_slab_cls_lut[33] = {
+    0, 0, 0, 0, 0,
+    1, 1,
+    2,
+    3,
+    4, 4, 4, 4,
+    5, 5, 5, 5,
+    6, 6, 6, 6, 6, 6, 6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7
 };
 
 static _Thread_local M2SlabTLS *tls_slab = NULL;
@@ -191,7 +223,7 @@ static inline void *m2_alloc_raw(uint32_t payload_size, uint16_t type_tag, M2Dro
 #if M2_USE_SLAB
     if (__builtin_expect(payload_size <= M2_SLAB_MAX_PAYLOAD, 1)) {
         uint32_t total = (uint32_t)sizeof(M2Header) + payload_size;
-        uint32_t cls = m2_slab_cls_lut[(total + 15u) >> 4];
+        uint32_t cls = m2_slab_cls_lut[(total + 7u) >> 3];
         M2SlabTLS *s = tls_slab;
         if (__builtin_expect(s != NULL, 1)) {
             void *node = s->local_free[cls];
@@ -452,6 +484,260 @@ int64_t m2_str_to_int(void *s, int32_t *ok_out) {
     }
     if (ok_out) *ok_out = 1;
     return (int64_t)v;
+}
+
+static const char *m2_memmem(const char *hay, int64_t hlen, const char *ndl, int64_t nlen) {
+    if (nlen == 0) return hay;
+    if (nlen > hlen) return NULL;
+    if (nlen == 1) return (const char *)memchr(hay, (unsigned char)ndl[0], (size_t)hlen);
+    const char *cur = hay;
+    const char *last = hay + (hlen - nlen);
+    unsigned char first = (unsigned char)ndl[0];
+    while (cur <= last) {
+        const char *hit = (const char *)memchr(cur, first, (size_t)(last - cur + 1));
+        if (!hit) return NULL;
+        if (memcmp(hit + 1, ndl + 1, (size_t)(nlen - 1)) == 0) return hit;
+        cur = hit + 1;
+    }
+    return NULL;
+}
+
+int32_t m2_str_starts_with(void *s, void *prefix) {
+    M2String *ss = (M2String *)s;
+    M2String *sp = (M2String *)prefix;
+    int64_t sl = ss ? ss->len : 0;
+    int64_t pl = sp ? sp->len : 0;
+    if (pl == 0) return 1;
+    if (pl > sl) return 0;
+    return memcmp(ss->data, sp->data, (size_t)pl) == 0 ? 1 : 0;
+}
+
+int32_t m2_str_ends_with(void *s, void *suffix) {
+    M2String *ss = (M2String *)s;
+    M2String *sx = (M2String *)suffix;
+    int64_t sl = ss ? ss->len : 0;
+    int64_t xl = sx ? sx->len : 0;
+    if (xl == 0) return 1;
+    if (xl > sl) return 0;
+    return memcmp(ss->data + (sl - xl), sx->data, (size_t)xl) == 0 ? 1 : 0;
+}
+
+int64_t m2_str_index_of(void *s, void *needle) {
+    M2String *ss = (M2String *)s;
+    M2String *sn = (M2String *)needle;
+    int64_t sl = ss ? ss->len : 0;
+    int64_t nl = sn ? sn->len : 0;
+    if (nl == 0) return 0;
+    if (nl > sl) return -1;
+    const char *hit = m2_memmem(ss->data, sl, sn->data, nl);
+    return hit ? (int64_t)(hit - ss->data) : -1;
+}
+
+int32_t m2_str_contains(void *s, void *needle) {
+    return m2_str_index_of(s, needle) >= 0 ? 1 : 0;
+}
+
+static inline int m2_is_ascii_ws(char c) {
+    return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+}
+
+void *m2_str_trim(void *s) {
+    M2String *str = (M2String *)s;
+    if (!str || str->len == 0) return m2_str_from_cstr("", 0);
+    int64_t lo = 0;
+    int64_t hi = str->len;
+    while (lo < hi && m2_is_ascii_ws(str->data[lo])) lo++;
+    while (hi > lo && m2_is_ascii_ws(str->data[hi - 1])) hi--;
+    return m2_str_from_cstr(str->data + lo, hi - lo);
+}
+
+/* Splits s by sep into M2Array of M2String*.
+ * Empty sep splits into individual bytes (empty string -> empty array). */
+void *m2_str_split(void *s, void *sep) {
+    M2String *ss = (M2String *)s;
+    M2String *sp = (M2String *)sep;
+    int64_t sl = ss ? ss->len : 0;
+    int64_t pl = sp ? sp->len : 0;
+    void *arr = m2_arr_new(8, 1);
+    if (pl == 0) {
+        for (int64_t i = 0; i < sl; i++) {
+            void *ch = m2_str_from_cstr(ss->data + i, 1);
+            m2_arr_push(arr, (int64_t)(uintptr_t)ch);
+            m2_rc_dec(ch);
+        }
+        return arr;
+    }
+    if (!ss || sl == 0) {
+        void *empty = m2_str_from_cstr("", 0);
+        m2_arr_push(arr, (int64_t)(uintptr_t)empty);
+        m2_rc_dec(empty);
+        return arr;
+    }
+    int64_t pos = 0;
+    while (pos <= sl) {
+        const char *hit = m2_memmem(ss->data + pos, sl - pos, sp->data, pl);
+        if (!hit) {
+            void *part = m2_str_from_cstr(ss->data + pos, sl - pos);
+            m2_arr_push(arr, (int64_t)(uintptr_t)part);
+            m2_rc_dec(part);
+            break;
+        }
+        int64_t off = (int64_t)(hit - ss->data);
+        void *part = m2_str_from_cstr(ss->data + pos, off - pos);
+        m2_arr_push(arr, (int64_t)(uintptr_t)part);
+        m2_rc_dec(part);
+        pos = off + pl;
+    }
+    return arr;
+}
+
+void *m2_str_replace(void *s, void *from, void *to) {
+    M2String *ss = (M2String *)s;
+    if (!ss) return m2_str_from_cstr("", 0);
+    M2String *sf = (M2String *)from;
+    M2String *st = (M2String *)to;
+    int64_t sl = ss->len;
+    int64_t fl = sf ? sf->len : 0;
+    int64_t tl = st ? st->len : 0;
+    if (fl == 0 || fl > sl) {
+        m2_rc_inc(ss);
+        return ss;
+    }
+    /* First pass: count matches */
+    int64_t count = 0;
+    int64_t pos = 0;
+    while (pos <= sl - fl) {
+        const char *hit = m2_memmem(ss->data + pos, sl - pos, sf->data, fl);
+        if (!hit) break;
+        count++;
+        pos = (int64_t)(hit - ss->data) + fl;
+    }
+    if (count == 0) {
+        m2_rc_inc(ss);
+        return ss;
+    }
+    int64_t out_len = sl + count * (tl - fl);
+    M2String *out = (M2String *)m2_alloc_raw((uint32_t)(sizeof(M2String) + (size_t)out_len + 1),
+                                             M2_TAG_STRING, NULL);
+    out->len = out_len;
+    char *dst = out->data;
+    pos = 0;
+    while (pos <= sl - fl) {
+        const char *hit = m2_memmem(ss->data + pos, sl - pos, sf->data, fl);
+        if (!hit) break;
+        int64_t off = (int64_t)(hit - ss->data);
+        if (off > pos) {
+            memcpy(dst, ss->data + pos, (size_t)(off - pos));
+            dst += (off - pos);
+        }
+        if (tl > 0) {
+            memcpy(dst, st->data, (size_t)tl);
+            dst += tl;
+        }
+        pos = off + fl;
+    }
+    if (pos < sl) {
+        memcpy(dst, ss->data + pos, (size_t)(sl - pos));
+        dst += (sl - pos);
+    }
+    *dst = '\0';
+    return out;
+}
+
+/* ============================================================================
+ * 2b. Bytes
+ * ============================================================================ */
+
+static void m2_bytes_drop(void *payload) {
+    M2Bytes *b = (M2Bytes *)payload;
+    free(b->data);
+    b->data = NULL;
+}
+
+static M2Bytes *m2_bytes_alloc_uninit(int64_t len) {
+    M2Bytes *b = (M2Bytes *)m2_alloc_raw((uint32_t)sizeof(M2Bytes), M2_TAG_BYTES, m2_bytes_drop);
+    b->len = len;
+    b->cap = len;
+    if (len > 0) {
+        b->data = (uint8_t *)malloc((size_t)len);
+        if (!b->data) m2_panic("out of memory in bytes", __FILE__, __LINE__);
+    } else {
+        b->data = NULL;
+    }
+    return b;
+}
+
+void *m2_bytes_new(int64_t len) {
+    if (__builtin_expect(len < 0, 0)) {
+        m2_panic("negative bytes length", __FILE__, __LINE__);
+    }
+    M2Bytes *b = m2_bytes_alloc_uninit(len);
+    if (len > 0) {
+        memset(b->data, 0, (size_t)len);
+    }
+    return b;
+}
+
+int64_t m2_bytes_len(void *b) {
+    return b ? ((M2Bytes *)b)->len : 0;
+}
+
+int32_t m2_bytes_get(void *b_ptr, int64_t idx) {
+    M2Bytes *b = (M2Bytes *)b_ptr;
+    if (__builtin_expect(!b || idx < 0 || idx >= b->len, 0)) {
+        m2_panic_oob(idx, b ? b->len : 0);
+    }
+    return (int32_t)b->data[idx];
+}
+
+void m2_bytes_set(void *b_ptr, int64_t idx, int32_t val) {
+    M2Bytes *b = (M2Bytes *)b_ptr;
+    if (__builtin_expect(!b || idx < 0 || idx >= b->len, 0)) {
+        m2_panic_oob(idx, b ? b->len : 0);
+    }
+    b->data[idx] = (uint8_t)(val & 0xFF);
+}
+
+void *m2_bytes_slice(void *b_ptr, int64_t start, int64_t end) {
+    M2Bytes *b = (M2Bytes *)b_ptr;
+    int64_t len = b ? b->len : 0;
+    if (start < 0) start = 0;
+    if (start > len) start = len;
+    if (end < start) end = start;
+    if (end > len) end = len;
+    int64_t n = end - start;
+    M2Bytes *out = m2_bytes_alloc_uninit(n);
+    if (n > 0) {
+        memcpy(out->data, b->data + start, (size_t)n);
+    }
+    return out;
+}
+
+void *m2_bytes_concat(void *a_ptr, void *b_ptr) {
+    M2Bytes *a = (M2Bytes *)a_ptr;
+    M2Bytes *b = (M2Bytes *)b_ptr;
+    int64_t la = a ? a->len : 0;
+    int64_t lb = b ? b->len : 0;
+    M2Bytes *out = m2_bytes_alloc_uninit(la + lb);
+    if (la > 0) memcpy(out->data, a->data, (size_t)la);
+    if (lb > 0) memcpy(out->data + la, b->data, (size_t)lb);
+    return out;
+}
+
+void *m2_str_to_bytes(void *s) {
+    M2String *str = (M2String *)s;
+    int64_t len = str ? str->len : 0;
+    M2Bytes *out = m2_bytes_alloc_uninit(len);
+    if (len > 0) {
+        memcpy(out->data, str->data, (size_t)len);
+    }
+    return out;
+}
+
+void *m2_bytes_to_str(void *b_ptr) {
+    M2Bytes *b = (M2Bytes *)b_ptr;
+    if (!b || b->len == 0) return m2_str_from_cstr("", 0);
+    return m2_str_from_cstr((const char *)b->data, b->len);
 }
 
 /* ============================================================================
@@ -1349,6 +1635,89 @@ int32_t m2_world_fs_write(void *w_ptr, void *path_str, void *content_str) {
     return (written == (size_t)content->len && close_ok) ? 1 : 0;
 }
 
+void *m2_world_fs_read_bytes(void *w_ptr, void *path_str, int32_t *ok_out) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    if (!path) {
+        if (ok_out) *ok_out = 0;
+        return m2_bytes_new(0);
+    }
+    FILE *f = fopen(path->data, "rb");
+    if (!f) {
+        if (ok_out) *ok_out = 0;
+        return m2_bytes_new(0);
+    }
+    if (fseek(f, 0, SEEK_END) != 0) {
+        fclose(f);
+        if (ok_out) *ok_out = 0;
+        return m2_bytes_new(0);
+    }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) {
+        fclose(f);
+        if (ok_out) *ok_out = 0;
+        return m2_bytes_new(0);
+    }
+    M2Bytes *out = m2_bytes_alloc_uninit((int64_t)sz);
+    if (sz > 0) {
+        size_t got = fread(out->data, 1, (size_t)sz, f);
+        if (got != (size_t)sz) {
+            fclose(f);
+            m2_rc_dec(out);
+            if (ok_out) *ok_out = 0;
+            return m2_bytes_new(0);
+        }
+    }
+    fclose(f);
+    if (ok_out) *ok_out = 1;
+    return out;
+}
+
+int32_t m2_world_fs_write_bytes(void *w_ptr, void *path_str, void *bytes_obj) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    M2Bytes *b = (M2Bytes *)bytes_obj;
+    if (!path || !b) return 0;
+    FILE *f = fopen(path->data, "wb");
+    if (!f) return 0;
+    size_t written = 0;
+    if (b->len > 0) {
+        written = fwrite(b->data, 1, (size_t)b->len, f);
+    }
+    int close_ok = (fclose(f) == 0);
+    return (written == (size_t)b->len && close_ok) ? 1 : 0;
+}
+
+int32_t m2_world_fs_append(void *w_ptr, void *path_str, void *content_str) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    M2String *content = (M2String *)content_str;
+    if (!path || !content) return 0;
+    FILE *f = fopen(path->data, "ab");
+    if (!f) return 0;
+    size_t written = 0;
+    if (content->len > 0) {
+        written = fwrite(content->data, 1, (size_t)content->len, f);
+    }
+    int close_ok = (fclose(f) == 0);
+    return (written == (size_t)content->len && close_ok) ? 1 : 0;
+}
+
+int64_t m2_world_fs_mtime_ms(void *w_ptr, void *path_str) {
+    (void)w_ptr;
+    M2String *path = (M2String *)path_str;
+    if (!path || path->len == 0) return -1;
+    struct stat st;
+    if (stat(path->data, &st) != 0) return -1;
+#if defined(__APPLE__) && defined(_POSIX_C_SOURCE) && !defined(_DARWIN_C_SOURCE)
+    return (int64_t)st.st_mtime * 1000 + (int64_t)(st.st_mtimensec / 1000000);
+#elif defined(__APPLE__)
+    return (int64_t)st.st_mtimespec.tv_sec * 1000 + (int64_t)(st.st_mtimespec.tv_nsec / 1000000);
+#else
+    return (int64_t)st.st_mtim.tv_sec * 1000 + (int64_t)(st.st_mtim.tv_nsec / 1000000);
+#endif
+}
+
 int32_t m2_world_fs_exists(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
@@ -1499,6 +1868,104 @@ int32_t m2_world_exec(void *w_ptr, void *argv_arr) {
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;
+}
+
+void *m2_world_exec_capture(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
+    (void)w_ptr;
+    if (exit_code_out) *exit_code_out = -1;
+    M2Array *arr = (M2Array *)argv_arr;
+    if (!arr || arr->len <= 0) return m2_str_from_cstr("", 0);
+
+    int pfd[2];
+    if (pipe(pfd) != 0) return m2_str_from_cstr("", 0);
+    (void)fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
+    (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
+
+    char **argv = (char **)malloc(((size_t)arr->len + 1) * sizeof(char *));
+    if (!argv) {
+        close(pfd[0]);
+        close(pfd[1]);
+        return m2_str_from_cstr("", 0);
+    }
+    for (int64_t i = 0; i < arr->len; i++) {
+        M2String *s = (M2String *)(uintptr_t)arr->data[i];
+        argv[i] = s ? s->data : (char *)"";
+    }
+    argv[arr->len] = NULL;
+
+    posix_spawn_file_actions_t actions;
+    if (posix_spawn_file_actions_init(&actions) != 0) {
+        free(argv);
+        close(pfd[0]);
+        close(pfd[1]);
+        return m2_str_from_cstr("", 0);
+    }
+    (void)posix_spawn_file_actions_addclose(&actions, pfd[0]);
+    (void)posix_spawn_file_actions_adddup2(&actions, pfd[1], STDOUT_FILENO);
+    (void)posix_spawn_file_actions_addclose(&actions, pfd[1]);
+
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    free(argv);
+    close(pfd[1]);
+
+    if (rc != 0) {
+        close(pfd[0]);
+        if (exit_code_out) *exit_code_out = 127;
+        return m2_str_from_cstr("", 0);
+    }
+
+    size_t cap = 4096;
+    size_t len = 0;
+    char *buf = (char *)malloc(cap);
+    if (!buf) {
+        close(pfd[0]);
+        int st_ign = 0;
+        while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
+        return m2_str_from_cstr("", 0);
+    }
+    for (;;) {
+        if (len + 4096 > cap) {
+            cap *= 2;
+            char *nb = (char *)realloc(buf, cap);
+            if (!nb) {
+                free(buf);
+                close(pfd[0]);
+                int st_ign = 0;
+                while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
+                return m2_str_from_cstr("", 0);
+            }
+            buf = nb;
+        }
+        ssize_t n = read(pfd[0], buf + len, cap - len);
+        if (n > 0) {
+            len += (size_t)n;
+        } else if (n == 0) {
+            break;
+        } else if (errno != EINTR) {
+            break;
+        }
+    }
+    close(pfd[0]);
+
+    int status = 0;
+    int code = -1;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR) {
+            status = -1;
+            break;
+        }
+    }
+    if (status != -1) {
+        if (WIFEXITED(status)) code = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
+    }
+    if (exit_code_out) *exit_code_out = code;
+
+    void *out = m2_str_from_cstr(buf, (int64_t)len);
+    free(buf);
+    return out;
 }
 
 /* Pure C SHA-256 (FIPS 180-4) */
