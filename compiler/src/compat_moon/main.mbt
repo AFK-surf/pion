@@ -314,8 +314,10 @@ fn resolve_qbe_target() -> String {
   let env_t = env_str("M2_TARGET")
   if env_t.length() > 0 {
     env_t
-  } else {
+  } else if file_exists("/System/Library") {
     "arm64_apple"
+  } else {
+    "amd64_sysv"
   }
 }
 
@@ -792,13 +794,16 @@ fn build_targets(
         let cache_dir = resolve_cache_dir()
         let default_bin = cache_dir + "/bin/" + root_pkg + "_" + prefix16(link_key)
         let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+        if out_bin_arg == "" && file_exists(final_bin) {
+          return Ok(final_bin)
+        }
         if out_bin_arg != "" {
           ensure_parent_dir(out_bin_arg)
         }
         let rt_lib = resolve_rt_lib()
         let cc = {
           let e = env_str("CC")
-          if e.length() > 0 { e } else { "clang" }
+          if e.length() > 0 { e } else { "cc" }
         }
         let ld_argv : Array[String] = [cc]
         let mut oi = 0
@@ -915,7 +920,7 @@ fn build_targets(
     let rt_lib = resolve_rt_lib()
     let cc = {
       let e = env_str("CC")
-      if e.length() > 0 { e } else { "clang" }
+      if e.length() > 0 { e } else { "cc" }
     }
     let ld_argv : Array[String] = [cc]
     let mut oi = 0
@@ -1042,7 +1047,7 @@ fn build_targets(
   let rt_lib = resolve_rt_lib()
   let cc = {
     let e = env_str("CC")
-    if e.length() > 0 { e } else { "clang" }
+    if e.length() > 0 { e } else { "cc" }
   }
   let rc_ld = exec_argv([cc, obj_path, rt_lib, "-lm", "-lpthread", "-o", final_bin])
   if rc_ld != 0 {
@@ -1158,7 +1163,7 @@ fn run_tests_cmd(
     }
     let cc = {
       let e = env_str("CC")
-      if e.length() > 0 { e } else { "clang" }
+      if e.length() > 0 { e } else { "cc" }
     }
     let ld_argv : Array[String] = [cc]
     let mut oi = 0
@@ -1221,6 +1226,92 @@ fn run_tests_cmd(
 }
 
 ///|
+fn run_fmt_cmd(
+  targets : Array[String],
+  check_only : Bool,
+  as_json : Bool,
+) -> Int {
+  let files : Array[String] = []
+  let mut t = 0
+  while t < targets.length() {
+    let target = targets[t]
+    let tb = str_to_utf8(target)
+    if m2_host_file_exists(tb) == 0 {
+      write_err("error: path does not exist: " + target + "\n")
+      return 1
+    }
+    if m2_host_is_dir(tb) != 0 {
+      match detect_manifest_dir(target) {
+        Some(root_dir) =>
+          match load_workspace_nodes(root_dir) {
+            Err(msg) => {
+              write_err("error: " + msg + "\n")
+              return 1
+            }
+            Ok(nodes) => {
+              let mut ni = 0
+              while ni < nodes.length() {
+                let mut pi = 0
+                while pi < nodes[ni].paths.length() {
+                  files.push(nodes[ni].paths[pi])
+                  pi = pi + 1
+                }
+                ni = ni + 1
+              }
+            }
+          }
+        None => {
+          let (paths, _) = load_pkg_dir_sources(target)
+          let mut pi = 0
+          while pi < paths.length() {
+            files.push(paths[pi])
+            pi = pi + 1
+          }
+        }
+      }
+    } else {
+      files.push(target)
+    }
+    t = t + 1
+  }
+  let unformatted : Array[String] = []
+  let mut i = 0
+  while i < files.length() {
+    let path = files[i]
+    let src = read_text(path)
+    let formatted = @core.format_source(src)
+    if formatted != src {
+      if check_only {
+        unformatted.push(path)
+      } else {
+        if !write_text_atomic(path, formatted) {
+          write_err("error: failed to write " + path + "\n")
+          return 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if check_only {
+    if as_json {
+      write_out(@core.fmt_check_result_to_json(unformatted) + "\n")
+    } else {
+      let mut j = 0
+      while j < unformatted.length() {
+        write_out(unformatted[j] + "\n")
+        j = j + 1
+      }
+    }
+    if unformatted.length() == 0 { 0 } else { 1 }
+  } else {
+    if as_json {
+      write_out(@core.fmt_check_result_to_json([]) + "\n")
+    }
+    0
+  }
+}
+
+///|
 fn usage() -> Unit {
   write_err(
     "usage:\n" +
@@ -1229,6 +1320,7 @@ fn usage() -> Unit {
     "  m2c emit-sig <input1> [input2 ...]\n" +
     "  m2c build [--release] [--emit-ssa <path>] [--emit-asm <path>] [--jobs <n>] [-o <out>] <input1> [input2 ...]\n" +
     "  m2c run [--release] <input> [-- args...]\n" +
+    "  m2c fmt [--check] [--json] <input1> [input2 ...]\n" +
     "  m2c test [--json] [--filter <name>] <input>\n",
   )
 }
@@ -1502,6 +1594,31 @@ fn main {
           m2_host_exit(rc)
         }
       }
+    }
+  } else if cmd == "fmt" {
+    let mut check_only = false
+    let mut as_json = false
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      if a == "--check" {
+        check_only = true
+      } else if a == "--json" {
+        as_json = true
+      } else {
+        targets.push(a)
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      usage()
+      m2_host_exit(1)
+      return
+    }
+    let rc = run_fmt_cmd(targets, check_only, as_json)
+    if rc != 0 {
+      m2_host_exit(rc)
     }
   } else if cmd == "test" {
     let mut as_json = false
