@@ -183,7 +183,7 @@ pub struct Env {
   scopes : Array[Map[String, VarBinding]]
   moved : Map[String, Span]
   mut has_world : Bool
-  ret_ty : Ty
+  mut ret_ty : Ty
   type_params : Array[String]
   type_bounds : Map[String, Array[String]]
   /// Decl key (`span_key`) of the generic fn whose body is being checked.
@@ -3547,6 +3547,9 @@ fn check_method_call(
       if method_name == "to_string" {
         return TString
       }
+      if method_name == "length" {
+        return TInt
+      }
       if method_name == "reset" {
         return TUnit
       }
@@ -5082,8 +5085,17 @@ fn check_expr(
         i = i + 1
       }
       let ret_opt : Option[Ty] = match ret_te {
-        TyMissing(_) => None
+        TyMissing(_) =>
+          match expected {
+            Some(TFn(_, er)) => Some(er)
+            _ => None
+          }
         _ => Some(resolve_type_expr(tc, ret_te, env.type_params))
+      }
+      let saved_ret_ty = env.ret_ty
+      env.ret_ty = match ret_opt {
+        Some(r) => r
+        None => TError
       }
       env_push(env)
       let mut j = 0
@@ -5093,6 +5105,7 @@ fn check_expr(
       }
       let body_ty = check_stmts(tc, env, body, ret_opt)
       env_pop(env)
+      env.ret_ty = saved_ret_ty
       let final_ret = match ret_opt {
         Some(r) => r
         None => body_ty

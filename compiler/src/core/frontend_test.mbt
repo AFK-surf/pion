@@ -1780,3 +1780,42 @@ test "p18: non-blocking IO and poll primitives typecheck behind an explicit Worl
   assert_true(str_contains(bad_json, "argument 3 of `tcp_set_nonblock` expects `Bool`"), "nonblock arg: " + bad_json)
   assert_true(str_contains(bad_json, "argument 3 of `poll_wait` expects `Array[Int]`"), "poll_wait arg: " + bad_json)
 }
+
+///|
+test "p19b: StringBuilder::length and closure return type checking" {
+  let ok_src =
+    #|pub fn f() -> Int {
+    #|  let sb = StringBuilder()
+    #|  sb.write_string("hello")
+    #|  let n : Int = sb.length()
+    #|  let g = fn(x : Int) -> String {
+    #|    if x > 0 {
+    #|      return "pos"
+    #|    }
+    #|    "nonpos"
+    #|  }
+    #|  let s : String = g(n)
+    #|  s.length() + n
+    #|}
+  let ok_cr = @core.check_source_files("p19b_ok", ["p19b_ok.pion"], [ok_src])
+  assert_true(
+    ok_cr.diagnostics.length() == 0,
+    "p19b closure return & sb.length ok: " + @core.check_result_to_json(ok_cr.diagnostics),
+  )
+
+  let bad_src =
+    #|pub fn f() -> Int {
+    #|  let g = fn(x : Int) -> String {
+    #|    return x
+    #|  }
+    #|  let _ = g(1)
+    #|  0
+    #|}
+  let bad_json = @core.check_result_to_json(
+    @core.check_source_files("p19b_bad", ["p19b_bad.pion"], [bad_src]).diagnostics,
+  )
+  assert_true(
+    str_contains(bad_json, "E_TYPE_MISMATCH") && str_contains(bad_json, "String"),
+    "closure bad return should check against closure return type: " + bad_json,
+  )
+}

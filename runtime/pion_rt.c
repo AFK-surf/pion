@@ -53,17 +53,17 @@ extern char **environ;
  * 1. Memory & Biased RC
  * ============================================================================ */
 
-static _Atomic uint64_t g_next_tid = 1;
-static _Thread_local uint64_t tls_tid = 0;
+static _Atomic uint32_t g_next_tid = 1;
+static _Thread_local uint32_t tls_tid = 0;
 
-static uint64_t pion_cur_tid_slow(void) {
-    uint64_t t = atomic_fetch_add_explicit(&g_next_tid, 1, memory_order_relaxed);
+static uint32_t pion_cur_tid_slow(void) {
+    uint32_t t = atomic_fetch_add_explicit(&g_next_tid, 1, memory_order_relaxed);
     tls_tid = t;
     return t;
 }
 
-static inline uint64_t pion_cur_tid_fast(void) {
-    uint64_t t = tls_tid;
+static inline uint32_t pion_cur_tid_fast(void) {
+    uint32_t t = tls_tid;
     if (__builtin_expect(t == 0, 0)) {
         return pion_cur_tid_slow();
     }
@@ -71,7 +71,7 @@ static inline uint64_t pion_cur_tid_fast(void) {
 }
 
 uint64_t pion_cur_tid(void) {
-    return pion_cur_tid_fast();
+    return (uint64_t)pion_cur_tid_fast();
 }
 
 static inline PionHeader *pion_hdr(void *obj) {
@@ -140,7 +140,7 @@ PION_MINSIZE double pion_math_pow(double x, double y) {
 
 #if PION_USE_SLAB
 
-#define PION_SLAB_CLASSES      8u
+#define PION_SLAB_CLASSES      12u
 #define PION_SLAB_MAX_TOTAL    256u
 #define PION_SLAB_MAX_PAYLOAD  (PION_SLAB_MAX_TOTAL - (uint32_t)sizeof(PionHeader))
 #define PION_SLAB_CHUNK_BYTES  65536u
@@ -156,19 +156,23 @@ typedef struct PionSlabTLS {
 } PionSlabTLS;
 
 static const uint16_t pion_slab_sizes[PION_SLAB_CLASSES] = {
-    48u, 56u, 64u, 80u, 96u, 112u, 128u, 256u
+    32u, 40u, 48u, 56u, 64u, 80u, 96u, 112u, 128u, 160u, 192u, 256u
 };
 
-/* Maps ((total + 7) >> 3) in [4..32] to slab class [0..7] */
+/* Maps ((total + 7) >> 3) in [3..32] to slab class [0..11] */
 static const uint8_t pion_slab_cls_lut[33] = {
-    0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0,
     1,
     2,
-    3, 3,
-    4, 4,
+    3,
+    4,
     5, 5,
     6, 6,
-    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
+    7, 7,
+    8, 8,
+    9, 9, 9, 9,
+    10, 10, 10, 10,
+    11, 11, 11, 11, 11, 11, 11, 11
 };
 
 static _Thread_local PionSlabTLS *tls_slab = NULL;
@@ -292,7 +296,6 @@ static inline void *pion_alloc_raw(uint32_t payload_size, uint16_t type_tag, Pio
     atomic_init(&hdr->shared_rc, 0);
     hdr->type_tag = type_tag;
     hdr->flags = flags;
-    hdr->payload_size = payload_size;
     hdr->drop_fn = drop_fn;
     return (void *)(hdr + 1);
 }
@@ -505,6 +508,28 @@ void *pion_str_concat(void *a, void *b) {
     return out;
 }
 
+void *pion_str_concat_n(int64_t n, void **parts) {
+    int64_t total = 0;
+    for (int64_t i = 0; i < n; i++) {
+        PionString *s = (PionString *)parts[i];
+        if (s) total += s->len;
+    }
+    PionString *out = (PionString *)pion_alloc_raw(
+        (uint32_t)(sizeof(PionString) + (size_t)total + 1),
+        PION_TAG_STRING, NULL);
+    out->len = total;
+    char *dst = out->data;
+    for (int64_t i = 0; i < n; i++) {
+        PionString *s = (PionString *)parts[i];
+        if (s && s->len > 0) {
+            memcpy(dst, s->data, (size_t)s->len);
+            dst += s->len;
+        }
+    }
+    *dst = '\0';
+    return out;
+}
+
 static inline int32_t pion_str_eq_fast(const PionString *sa, const PionString *sb) {
     if (sa == sb) return 1;
     if (!sa || !sb) return 0;
@@ -540,8 +565,8 @@ void *pion_str_slice(void *s, int64_t start, int64_t end) {
         pion_panic("string slice out of bounds", __FILE__, __LINE__);
     }
     int64_t n = end - start;
-    PionString *out = (PionString *)pion_alloc_uninit((uint32_t)(sizeof(PionString) + (size_t)n + 1),
-                                                PION_TAG_STRING, NULL);
+    PionString *out = (PionString *)pion_alloc_raw((uint32_t)(sizeof(PionString) + (size_t)n + 1),
+                                             PION_TAG_STRING, NULL);
     out->len = n;
     if (n > 0) {
         memcpy(out->data, str->data + start, (size_t)n);
@@ -1558,6 +1583,8 @@ typedef struct PionChannel {
     int32_t bounded;
     int32_t closed;
     int32_t elem_is_obj;
+    int32_t recv_waiters;
+    int32_t send_waiters;
 } PionChannel;
 
 PION_MINSIZE static void pion_chan_drop(void *payload) {
@@ -1587,26 +1614,30 @@ PION_MINSIZE void *pion_chan_new(int64_t cap, int32_t elem_is_obj) {
     c->count = 0;
     c->closed = 0;
     c->elem_is_obj = elem_is_obj ? 1 : 0;
+    c->recv_waiters = 0;
+    c->send_waiters = 0;
     pion_rc_freeze(c);
     return c;
 }
 
-PION_MINSIZE int32_t pion_chan_send(void *ch_ptr, int64_t val) {
+int32_t pion_chan_send(void *ch_ptr, int64_t val) {
     PionChannel *c = (PionChannel *)ch_ptr;
     if (c->elem_is_obj && val != 0) {
         pion_rc_freeze((void *)(uintptr_t)val);
     }
     pthread_mutex_lock(&c->mu);
-    if (c->bounded) {
+    if (c->bounded && c->count == c->cap && !c->closed) {
+        c->send_waiters++;
         while (c->count == c->cap && !c->closed) {
             pthread_cond_wait(&c->not_full, &c->mu);
         }
+        c->send_waiters--;
     }
-    if (c->closed) {
+    if (__builtin_expect(c->closed, 0)) {
         pthread_mutex_unlock(&c->mu);
         return 0;
     }
-    if (!c->bounded && c->count == c->cap) {
+    if (__builtin_expect(!c->bounded && c->count == c->cap, 0)) {
         int64_t ncap = c->cap * 2;
         int64_t *nb = (int64_t *)malloc((size_t)ncap * sizeof(int64_t));
         if (!nb) {
@@ -1614,7 +1645,9 @@ PION_MINSIZE int32_t pion_chan_send(void *ch_ptr, int64_t val) {
             pion_panic("out of memory growing unbounded channel", __FILE__, __LINE__);
         }
         for (int64_t i = 0; i < c->count; i++) {
-            nb[i] = c->buf[(c->head + i) % c->cap];
+            int64_t idx = c->head + i;
+            if (idx >= c->cap) idx -= c->cap;
+            nb[i] = c->buf[idx];
         }
         free(c->buf);
         c->buf = nb;
@@ -1624,28 +1657,35 @@ PION_MINSIZE int32_t pion_chan_send(void *ch_ptr, int64_t val) {
     if (c->elem_is_obj && val != 0) {
         pion_rc_inc((void *)(uintptr_t)val);
     }
-    int64_t tail = (c->head + c->count) % c->cap;
+    int64_t tail = c->head + c->count;
+    if (tail >= c->cap) tail -= c->cap;
     c->buf[tail] = val;
     c->count++;
-    pthread_cond_signal(&c->not_empty);
+    if (c->recv_waiters > 0) {
+        pthread_cond_signal(&c->not_empty);
+    }
     pthread_mutex_unlock(&c->mu);
     return 1;
 }
 
-PION_MINSIZE int32_t pion_chan_recv(void *ch_ptr, int64_t *out_val) {
+int32_t pion_chan_recv(void *ch_ptr, int64_t *out_val) {
     PionChannel *c = (PionChannel *)ch_ptr;
     pthread_mutex_lock(&c->mu);
-    while (c->count == 0 && !c->closed) {
-        pthread_cond_wait(&c->not_empty, &c->mu);
+    if (c->count == 0 && !c->closed) {
+        c->recv_waiters++;
+        while (c->count == 0 && !c->closed) {
+            pthread_cond_wait(&c->not_empty, &c->mu);
+        }
+        c->recv_waiters--;
     }
-    if (c->count == 0 && c->closed) {
+    if (__builtin_expect(c->count == 0 && c->closed, 0)) {
         pthread_mutex_unlock(&c->mu);
         return 0;
     }
     int64_t v = c->buf[c->head];
-    c->head = (c->head + 1) % c->cap;
+    if (++c->head == c->cap) c->head = 0;
     c->count--;
-    if (c->bounded) {
+    if (c->send_waiters > 0) {
         pthread_cond_signal(&c->not_full);
     }
     pthread_mutex_unlock(&c->mu);
