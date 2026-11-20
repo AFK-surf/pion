@@ -170,7 +170,8 @@ def markdown(r):
                 extra.append("`-race`: %s" % ("detected at run time" if rd.get("detected") else "not detected"))
             cells.append("%s %s ms, %s B%s%s" % (
                 mark, _fmt(e.get("latency", {}).get("median_ms")), e.get("output_bytes"),
-                ", fix-it" if e.get("has_fixit") and e.get("caught_compile_time") else "",
+                (", machine edit" if e.get("machine_applicable_fix") else ", fix-it")
+                if e.get("has_fixit") and e.get("caught_compile_time") else "",
                 ("<br>" + "; ".join(extra)) if extra else ""))
         L.append(_row(cells))
     L.append("")
@@ -242,9 +243,11 @@ NOTES = """## 4. Notes, caveats and observed weaknesses
 - Diagnostic sizes are the raw bytes of the JSON/text each command prints. `cargo --message-format=json`
   embeds a pre-rendered human message and artefact records in every line, which is why it is several KB;
   Go and MoonBit print JSON envelopes around plain text messages without fix-its.
-- Pion's `fixit` is a natural-language hint attached to every diagnostic, not a span edit; only rustc emits
-  machine-applicable replacements (`suggestion_applicability: MachineApplicable`). Both are counted as
-  "any fix suggestion"; only rustc's are counted as machine-applicable.
+- Pion attaches a natural-language `fixit` hint to every diagnostic and, where an exact patch is known, a
+  machine-applicable `edits` array (span + replacement; six diagnostic classes so far, see `SPEC.md` §5.1).
+  rustc's counterpart is `suggestion_applicability: MachineApplicable`. Hints and edits both count as "any
+  fix suggestion"; only Pion `edits` and rustc `MachineApplicable` replacements count as machine-applicable
+  ("machine edit" in the per-probe table). Whether an edit is applied and re-checked is not measured.
 - Go caches test results by test-binary content: when an edit recompiles to an identical binary
   (the body edit folds `n+1 - n` back to `1`), `go test` reports `(cached)` without re-running tests.
   The edits are unique per run, so no content-addressed cache replays an earlier state.
@@ -261,11 +264,20 @@ NOTES = """## 4. Notes, caveats and observed weaknesses
   `Option`, `Result`, structs, arrays, maps, `Bytes`, tuples and payload-carrying enums is now an
   `E_TYPE_MISMATCH` with a `use match` fix-it. A `Result` in statement position (probe `e09`) used to be
   silently discarded; it is now `E_UNHANDLED_RESULT` (`let _ = ...` discards explicitly).
-- `pionc2 test <workspace>` runs only the root package's tests; the suite tests each package directory in turn.
-- `pionc2 query defs|callers` on a workspace directory returns an empty table; it needs the source files.
+- Fixed in P17: `pionc2 test --json <workspace>` now runs every local package's tests in one report (the
+  suite used to loop over the three package directories); `pionc2 query defs|callers --json <workspace>`
+  covers every package (it used to return an empty table and needed the source files); `debug_assert` is an
+  expression (no braces needed in a match arm); `String::to_int/to_int64/to_double -> Option` exist (the
+  `t01` reference code still hand-parses digits, kept as first written so sizes stay comparable).
+- The edit -> tests-green times of Pion rose after P17 (about 240 ms -> 630 ms here) and that is the correct
+  cost, not a slowdown: before P17-B a package's cached test binary was keyed without its dependencies'
+  objects, so after a body edit in `shapes` the `inventory` / `app` test binaries were reused unrelinked and
+  reported stale passes (reproduced: an edit that breaks `app`'s test still printed `"ok":true` until the
+  cache was cleared). Now every dependent test binary is recompiled and relinked, and each new binary is
+  started for the first time; that relink + first launch per package is what dominates the loop.
+- Workspace-wide `pionc2 test` also runs the tests of path dependencies outside the task (`std/json`,
+  `std/http` for `t05` / `t12`); the dimension-1 test counts include only the task's own packages.
 - `pionc2 doc --json` is larger than the sources of the small `t06` project (plain-text `pionc2 doc` is compact).
-- `debug_assert(...)` is not an expression, so a match arm needs braces around it; there is no
-  `String -> Int` parser in the language or its std (`t01` hand-parses digits).
 
 **MoonBit pitfalls met while writing the reference code**
 - `String::compare` (and `Bytes::compare`) order by length first, so sorting names needs a byte-order

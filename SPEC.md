@@ -17,25 +17,26 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 3. **Compile-Time Data-Race-Free Multithreading**:
    - Native OS threads via structured concurrency (`scope` + `spawn`), `Channel[T]`, `Mutex[T]`, `AtomicInt`.
    - Every type is statically classified as `Send` or `!Send`:
-     - Primitives (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Unit`), `String`, the `World` capability (a frozen handle; spawned workers capture it explicitly to do IO/TCP), `Channel[T]` (where `T: Send`), `Mutex[T]` (where `T: Send`, or `T = Map[String, V]` with `V` a primitive or `String`), `AtomicInt`, and immutable `struct`/`enum` (no `mut` fields, all fields `Send`) are `Send`.
-     - Any `struct` with `mut` fields, `Array[T]`, `Bytes`, `Map[K, V]` are `!Send` by default (must be wrapped in `Mutex[T]` or explicitly transferred via `move` with single-function linear check). A `Map` placed in a `Mutex` is frozen together with its entries, and `pion_map_set` freezes every key/value later stored into a frozen map, so entries released on any thread keep an atomic RC.
+     - Primitives (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Unit`), `String`, the `World` capability (a frozen handle; spawned workers capture it explicitly to do IO/TCP), `Channel[T]` (where `T: Send`), `Mutex[T]` (where `T: Send`, or `T` is a *shareable container*: `Array[E]` or `Map[String, E]` whose `E` is `Send` or itself a shareable container, e.g. `Mutex[Array[Rec]]`, `Mutex[Map[String, Array[String]]]`), `AtomicInt`, and immutable `struct`/`enum` (no `mut` fields, all fields `Send`) are `Send`.
+     - Any `struct` with `mut` fields, `Array[T]`, `Bytes`, `Map[K, V]` are `!Send` by default (must be wrapped in `Mutex[T]` or explicitly transferred via `move` with single-function linear check). A container placed in a `Mutex` (`Mutex::new` / `set`) is frozen recursively together with its elements, and every object later stored into a frozen container (`pion_map_set`, array push/store, including the inline push fast path) is frozen on insertion, so elements released on any thread keep an atomic RC. Bare `Array` / `Map` outside a `Mutex`, `Ptr` and closures stay `!Send`.
      - Capturing a non-`Send` variable in `spawn` or sending a non-`Send` value over `Channel[T]` is a compile-time error (`E_NOT_SEND`).
 4. **Explicit Capability (`World`, Vercel Zero rule)**:
    - Pure functions cannot perform IO, read wall clock, spawn OS processes, or touch the filesystem unless a `World` (or sub-capability) parameter is explicitly in scope.
    - Entry point: `pub fn main(world : World) -> Int` (or `fn main() -> Unit` in pure test mode). Calling IO builtins (`io_println`, `fs_read`, `fs_write`, `clock_now_ms`, `proc_exec`, `env_get`, `args_get`) without a `World` value in scope is a compile-time error (`E_CAPABILITY_MISSING`).
    - Network and time primitives (`tcp_listen`, `tcp_local_port`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close`, `sleep_ms`) take the `World` value as their **explicit first argument**; a `World` merely in scope is not enough (`E_CAPABILITY_MISSING`).
 5. **Agent-First Compiler Interface**:
-   - `pionc check --json <path>` — compact JSON diagnostics (`file`, `line`, `col`, `code`, `message`, `expected`, `found`, `fixit`), one object per diagnostic inside `{"ok":bool,"diagnostics":[...]}`.
-   - `pionc query defs|sig|callers|deps --json <path>` — structured symbol table, exported signatures, call graph, and package dependency graph.
+   - `pionc check --json <path>` — compact JSON diagnostics (`file`, `line`, `col`, `code`, `message`, `expected`, `found`, `fixit`, plus machine-applicable `edits` when an exact patch is known), one object per diagnostic inside `{"ok":bool,"diagnostics":[...]}` (§5.1).
+   - `pionc query defs|sig|callers|deps --json <path>` — structured symbol table, exported signatures, call graph, and package dependency graph; `<path>` may be a file, a package directory, or a whole `pion.toml` workspace (§5.2).
+   - `pionc test --json <workspace>` runs every local package's tests in one report (§5.3); `pionc init <dir>` scaffolds a package that is check/test/run/fmt-clean; `pionc fetch [dir]` resolves git dependencies and writes `pion.lock` (§6).
    - `pionc doc [--json] <path>` — the public API (every `pub` struct/enum/trait/extern fn/fn/const and every `impl`) of a file, directory or whole `pion.toml` workspace in one call (§5.4).
-   - Contracts: `debug_assert(cond, msg)` — active in dev/test builds, stripped to 0 bytes in `--release`.
+   - Contracts: `debug_assert(cond, msg)` — active in dev/test builds, stripped to 0 bytes in `--release`; it is an expression of type `Unit` and may stand in expression position (e.g. a `match` arm body).
 6. **Sub-150ms Incremental Compile, Tiny Binaries, Zero `target/`**:
    - Package-level separate compilation via `.pionsig` compact interface files: editing a function body without changing its `pub` signature yields 100% cache hit on downstream packages.
    - **Global Content-Addressed Cache** (`$PION_CACHE_DIR`, default `~/.cache/pion/cas`), LRU-evicted (`$PION_CACHE_MAX_MB`, default 2048). **NEVER writes a `target/` or `_build/` directory inside the source tree.**
    - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly (Mach-O arm64 for `arm64_apple`, ELF64 x86-64 for `amd64_sysv`; no `as`) → `ld`/`cc` + prebuilt `<64 KB` `libpionrt.a`. `--emit-asm` or `PION_NO_DIRECT_OBJ=1` falls back to `qbe` text + `as`.
    - **Cross objects**: `pionc build --target arm64_apple|amd64_sysv --emit-obj <out.o> <input>` writes the single-package object for that target and skips linking (e.g. an ELF64 x86-64 `.o` from macOS with no extra toolchain).
    - **Native libraries**: `-l <lib>` / `-l<lib>` / `--link <lib>` on `build`/`run`/`test`, plus `[link] libs = [...]` in `pion.toml` (dependencies first, de-duplicated) add `-l<lib>` to the link; the list is part of the binary's cache key.
-   - **Release backend** (`--release`): emits clean per-package C or LLVM IR compiled with `-O2`, stripping `debug_assert`.
+   - **Release backend** (`--release`): the same embedded QBE pipeline (no LLVM, no separate optimizing toolchain) with release-mode IL, stripping `debug_assert`.
 
 ---
 
@@ -138,9 +139,13 @@ test "test name" {
   - `Channel::new(cap)`, `ch.send(v)`, `ch.recv() -> Option[T]`, `ch.close()`
   - `Mutex::new(v)`, `m.with_lock(fn(v : T) -> R { ... })` / `m.lock()` + `m.set(v)` + `m.unlock()`
   - `AtomicInt::new(v)`, `a.load()`, `a.store(v)`, `a.fetch_add(d)`
-- Contracts: `debug_assert(cond, "msg")`
+- Contracts: `debug_assert(cond, "msg")` (statement or expression position, type `Unit`)
+- Built-in conversions and helpers:
+  - `s.to_int() -> Option[Int]`, `s.to_int64() -> Option[Int64]`, `s.to_double() -> Option[Double]` on `String` (`None` on any malformed or out-of-range input; no exceptions, no partial parses)
+  - `o.is_some()`, `o.is_none()`, `o.unwrap_or(default)` on `Option[T]`
+  - `r.is_ok()`, `r.is_err()`, `r.unwrap_or(default)` on `Result[T, E]`
 - Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..`, postfix `?`.
-- Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `Double`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T`, and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, `struct`, `Array`, `Map`, `Bytes`, tuples and payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
+- Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `Double`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T` (checked at every instantiation: a type parameter compared with `==`/`!=` in a generic body, directly or through generic callers, must be instantiated with one of these types, else `E_TYPE_MISMATCH` at the call site; such generics are monomorphized so `String` compares bytes and payload-less enums compare tags), and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, `struct`, `Array`, `Map`, `Bytes`, tuples and payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
 - Must-use `Result`: an expression statement whose type is `Result[T, E]` and whose value is discarded — any non-tail statement of a block, or the tail statement of a loop or `test` body — is a compile-time error (`E_UNHANDLED_RESULT`, fix-it "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`"). `let _ = expr` discards explicitly; a block's tail value returned to its function or branch is not discarded.
 
 ---
@@ -342,16 +347,25 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   ]
 }
 ```
+- `edits` (optional, emitted only when non-empty): machine-applicable patches `[{"file","line","col","end_line","end_col","replacement"}]` replacing the 1-based range `[line:col, end_line:end_col)` (end exclusive; an empty range is an insertion). Applying every edit of a diagnostic verbatim fixes it; each distinct edit is attached once. Covered today:
+  - `E_MISSING_TYPE` — inserts the inferred return type (`-> T`).
+  - `E_TYPE_MISMATCH` "cannot assign to immutable variable" — `let x` → `let mut x` at the declaration.
+  - `E_UNHANDLED_RESULT` — prefixes the discarded statement with `let _ = `.
+  - `E_NON_EXHAUSTIVE` — inserts the missing `match` arms (`panic`-bodied) before the first arm.
+  - `E_TRAIT_METHOD_SIGNATURE` — rewrites the impl method's return type to the trait's.
+  - `E_PRIVATE_SYMBOL` — inserts `pub ` at the target declaration.
 
 ### 5.2 `pionc query <kind> --json <path>`
 - `defs`: `{"defs":[{"pkg":"...","name":"...","kind":"fn|struct|enum","pub":true,"file":"...","line":10,"sig":"..."}]}`
 - `sig`: compact `.pionsig` export table in JSON
-- `callers`: `{"callers":[{"fn":"...","calls":["..."]}]}`
+- `callers`: `{"callers":[{"fn":"...","calls":["..."]}]}` (workspace targets add `"pkg"` to every entry)
 - `deps`: `{"packages":[{"name":"...","deps":["..."],"sig_hash":"..."}]}`
+- `<path>` may be a file, a package directory (its `src/` included) or a `pion.toml` workspace root: `defs`/`sig`/`callers` then cover every package in one call.
 
 ### 5.3 `pionc test [--json] [--filter <substr>] <path>`
 - Runs all `test "name" { ... }` blocks in isolated child processes (active `debug_assert`, binary stored in `$PION_CACHE_DIR/bin/`).
 - JSON output: `{"ok":bool,"passed":N,"failed":M,"tests":[{"name":"...","ok":bool}]}`
+- Workspace target (a directory with `pion.toml`): one invocation runs the tests of every local package (dependencies first; packages from the git cache are excluded) and reports `{"ok":bool,"total":N,"passed":N,"failed":M,"packages":["..."],"tests":[{"pkg":"...","name":"...","ok":bool}]}`; `--package <name>` restricts it to one package.
 - Additional diagnostic codes:
   - `E_PRIVATE_SYMBOL`: accessing a non-`pub` function, struct, enum, method, or constant from an imported package.
   - `E_IMPORT_CYCLE`: cyclic package dependency detected across `pion.toml` manifests.
@@ -373,13 +387,18 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 
   [dependencies]
   math = { path = "../math" }
+  regex = { git = "https://example.com/pion-std.git", tag = "v0.3.0", subdir = "std/regex" }
+  # exactly one of tag = / rev = / branch = (none: the remote HEAD); subdir is optional
 
   [link]
   libs = ["sqlite3"]   # or: lib = "sqlite3"
   ```
+- **Git dependencies & `pion.lock`**: git dependencies resolve into the global shared cache `$PION_CACHE_DIR/git/` (default `~/.cache/pion/git/`): bare mirrors `repos/<sha256(url)>.git` and read-only checkouts `checkouts/<rev>` (no `.git`), created atomically and shared zero-copy by every worktree. `<root>/pion.lock` pins each git dependency to a full commit (`version = 1`, then `[[package]]` tables with `name`, `git`, `ref`, `rev`, `subdir`, sorted, every key written); an entry is reused only while `pion.toml` requests the same name, URL, subdir and ref. A locked dependency whose checkout exists runs no `git` at all; tags and full revs resolve from the mirror, branches and HEAD always fetch. Only `<root>/pion.lock` is ever written, and only when it changes.
+- **`pionc fetch [--json] [dir]`**: resolves every git dependency, writes/verifies `pion.lock`, and prints `{"ok":true,"lock":"...","git_cache":"...","packages":[{"name","dir","source":"path|git"}],"git":[{"name","git","ref","rev","subdir"}]}`.
+- **`pionc init [--json] <dir>`**: writes `pion.toml`, `src/main.pion` and `main_test.pion` for a package named after the directory (`[a-z0-9_]`); the result passes `check`, `test`, `run` and `fmt --check` as is. Refuses to overwrite existing files.
 - **Cross-package traits**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. A package exporting a `pub` generic fn with trait bounds has no `.pionstub` (importers monomorphize from its source).
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.pionsig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.pionsig` yields 100% CAS hit on downstream `.o` files.
-- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | PION_CACHE_SALT)`, ensuring compiler/backend upgrades automatically invalidate stale cache entries.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.8`, ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
 - Default directory: `$PION_CACHE_DIR` or `$HOME/.cache/pion/cas`
 - Layout:
   - `sig/<sha256>.pionsig`
@@ -388,3 +407,14 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   - `index.tsv` (`<key>\t<bytes>\t<last_access_ms>`)
 - Eviction: when total bytes exceed `$PION_CACHE_MAX_MB` (default 2048 MB), evict least-recently-used entries until under 80% watermark.
 - **Invariant**: Running `pionc check`, `pionc build`, or `pionc test` MUST leave `git status --ignored` completely clean inside the source worktree (except an explicitly requested `-o <out>` output binary path).
+
+---
+
+## 7. Standard Library (`std/`)
+
+Plain Pion packages imported through `pion.toml` (`path` or `git` dependencies); each has `*_test.pion` tests and is `pionc fmt --check` clean.
+
+- **`std/json`**: JSON values, parser and serializer.
+- **`std/http`**: HTTP/1.1 over `World` TCP — `parse_request`/`parse_response` (with `Transfer-Encoding: chunked` bodies via `decode_chunked`), `parse_query` (`a=1&b=x%20y` → `Map[String, String]`, percent and `+` decoding), framing helpers `request_len`/`response_len`, `read_http_response`, keep-alive (`should_keep_alive`, where HTTP/1.0 defaults to close; `format_response_ka`/`format_request_ka`/`write_http_response_ka`) and `HttpConn` (`new_conn`, `conn_read_request`, `conn_read_response`), which keeps pipelined bytes between requests on one connection. Existing `Connection: close` APIs are unchanged.
+- **`std/regex`**: pure-Pion Thompson NFA executed by a Pike VM — linear time in the input for every pattern (no backtracking, no ReDoS). Syntax: literals, `.`, `\d \D \w \W \s \S`, classes `[...]`/`[^...]` with ranges, groups, `|`, greedy and lazy `* + ? {n} {n,} {n,m}`, anchors `^ $`; matching is UTF-8 aware. API: `compile(pattern) -> Result[Regex, String]` (errors carry the byte offset), `is_match`, `find`, `find_at`, `find_all -> Array[Match]` (byte offsets), `replace_all`, `escape`, `program_size`.
+- **`std/tls`**: TLS 1.2/1.3 client binding the system OpenSSL (`libssl`/`libcrypto`, 1.1.x or 3.x C ABI) through `extern "C"` declarations only — zero C glue; `[link] libs = ["ssl", "crypto"]`. SNI, certificate verification against OpenSSL's default CA store (`SSL_CERT_FILE`/`SSL_CERT_DIR` honoured) with host-name or IP checking, TLS 1.2 minimum. API: `tls_connect(w, host, port, verify_cert) -> Result[TlsConn, String]`, `tls_write`, `tls_read`, `tls_close`, `tls_protocol`, `tls_cipher`, `tls_version`, and `https_request` on top of `std/http`. Linux needs the `libssl.so`/`libcrypto.so` link names (Debian/Ubuntu `libssl-dev`); macOS needs Homebrew `openssl@3` and `CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`. `std/tls/e2e/run_e2e.sh <pionc>` performs real loopback TLS 1.3 and 1.2 handshakes against a Python `ssl` server and checks that a wrong host name is refused.

@@ -24,7 +24,8 @@ echo "=== [4/6] Standalone pionc2 Formatter Check ==="
 FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" \
   "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" "$ROOT_DIR/examples/http_loopback" "$ROOT_DIR/tests/e2e/net_ffi.pion" \
   "$ROOT_DIR/tests/e2e/link_z" "$ROOT_DIR/examples/http_kv_service" "$ROOT_DIR/examples/sqlite_indexer" \
-  "$ROOT_DIR/tests/e2e/utf8_text.pion")
+  "$ROOT_DIR/tests/e2e/utf8_text.pion" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" \
+  "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
 if ! printf '%s' "$FMT_OUT" | grep -q '"ok":true'; then
   echo "FAIL: pionc2 fmt --check --json reported unformatted files" >&2
@@ -44,8 +45,8 @@ fi
 rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
-echo "=== [5/6] Standalone pionc2 Test Runner (examples/text_stats, std/json, std/http, dogfood apps) ==="
-for TPKG in examples/text_stats std/json std/http examples/http_kv_service examples/sqlite_indexer; do
+echo "=== [5/6] Standalone pionc2 Test Runner (examples/text_stats, std/json, std/http, std/regex, dogfood apps) ==="
+for TPKG in examples/text_stats std/json std/http std/regex examples/http_kv_service examples/sqlite_indexer; do
   TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
   printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
   if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
@@ -53,7 +54,29 @@ for TPKG in examples/text_stats std/json std/http examples/http_kv_service examp
     exit 1
   fi
 done
-for DPKG in std/json std/http; do
+# std/regex: 9 tests, two of them linear-time ReDoS guards ((a?){n}a{n}, nested quantifiers).
+REGEX_OUT=$("$PIONC2" test --json "$ROOT_DIR/std/regex")
+REGEX_PASSED=$(printf '%s' "$REGEX_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("%d/%d" % (d["passed"], len(d["tests"])))')
+if [ "$REGEX_PASSED" != "9/9" ] || ! printf '%s' "$REGEX_OUT" | grep -q '"name":"ReDoS: (a?){n}a{n} is linear","ok":true'; then
+  echo "FAIL: std/regex expected 9/9 incl. ReDoS guards, got $REGEX_PASSED" >&2
+  exit 1
+fi
+echo "std/regex: $REGEX_PASSED passed (ReDoS guards included)"
+
+# `pionc init` scaffolds a package that is check/test/run/fmt-clean as is.
+INIT_TMP=$(mktemp -d)
+"$PIONC2" init --json "$INIT_TMP/demo"
+"$PIONC2" check --json "$INIT_TMP/demo" | grep -q '"ok":true'
+INIT_TEST=$("$PIONC2" test --json "$INIT_TMP/demo")
+printf 'pionc2 test --json <init demo> -> %s\n' "$INIT_TEST"
+printf '%s' "$INIT_TEST" | grep -q '"ok":true'
+printf '%s' "$INIT_TEST" | grep -q '"failed":0'
+"$PIONC2" run "$INIT_TMP/demo"
+"$PIONC2" fmt --check --json "$INIT_TMP/demo" | grep -q '"ok":true'
+rm -rf "$INIT_TMP"
+echo "pionc2 init -> check/test/run/fmt --check: OK"
+
+for DPKG in std/json std/http std/regex; do
   "$PIONC2" doc --json "$ROOT_DIR/$DPKG" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("pionc2 doc --json %s -> valid JSON, %d package(s), %d public item(s)" % (sys.argv[1], len(d["packages"]), sum(len(p["items"]) for p in d["packages"])))' "$DPKG"
 done
 
@@ -61,6 +84,12 @@ echo "=== [6/6] Standalone pionc2 Run (examples/text_stats, net_ffi) + Cross ELF
 "$PIONC2" run "$ROOT_DIR/examples/text_stats"
 "$PIONC2" run "$ROOT_DIR/tests/e2e/net_ffi.pion"
 "$PIONC2" run "$ROOT_DIR/tests/e2e/utf8_text.pion"
+P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
+echo "p17a_ergonomics_mt -> $P17A_OUT"
+if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
+  echo "FAIL: p17a_ergonomics_mt output mismatch" >&2
+  exit 1
+fi
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent
 # stress) and the pure-pion libsqlite3 indexer cross-checked by the sqlite3 CLI.
 "$PIONC2" build --release -o "$OUT_DIR/http_kv_service" "$ROOT_DIR/examples/http_kv_service"

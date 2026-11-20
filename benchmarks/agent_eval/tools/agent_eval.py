@@ -136,13 +136,16 @@ def list_tasks(only):
     return names
 
 
-def pion_test_dirs(d):
-    dirs = []
+def pion_task_packages(d):
+    """Package names declared by the pion.toml files inside `d`."""
+    names = set()
     for dirpath, dirnames, filenames in os.walk(d):
-        dirnames.sort()
         if "pion.toml" in filenames:
-            dirs.append(dirpath)
-    return dirs
+            with open(os.path.join(dirpath, "pion.toml"), encoding="utf-8") as fh:
+                m = re.search(r'^\s*name\s*=\s*"([^"]+)"', fh.read(), re.M)
+            if m:
+                names.add(m.group(1))
+    return names
 
 
 def lang_run_test(lang, src, workdir):
@@ -151,23 +154,26 @@ def lang_run_test(lang, src, workdir):
         d = src
         rc, so, se, ms = run([PIONC2, "run", d], d)
         runr = {"rc": rc, "stdout": so, "stderr": se, "ms": ms}
+        # One workspace-wide `pionc2 test` covers every local package (P17-B).
+        trc, tso, tse, tms = run([PIONC2, "test", "--json", d], d)
         passed = failed = 0
-        ok = True
-        details = []
-        tms = 0.0
-        for td in pion_test_dirs(d):
-            trc, tso, tse, tm = run([PIONC2, "test", "--json", td], td)
-            tms += tm
-            try:
-                j = json.loads(tso.strip().splitlines()[-1])
-                passed += int(j.get("passed", 0))
-                failed += int(j.get("failed", 0))
-                ok = ok and bool(j.get("ok")) and trc == 0
-            except (ValueError, IndexError):
-                ok = False
-            details.append((tso + tse)[-2000:])
+        ok = trc == 0
+        try:
+            j = json.loads(tso.strip().splitlines()[-1])
+            # The report also covers path dependencies outside the task (std/json, std/http):
+            # count only the task's own packages, as the other languages' commands do.
+            own = pion_task_packages(d)
+            for t in j.get("tests", []):
+                if t.get("pkg") in own:
+                    if t.get("ok"):
+                        passed += 1
+                    else:
+                        failed += 1
+            ok = ok and bool(j.get("ok"))
+        except (ValueError, IndexError):
+            ok = False
         return runr, {"ok": ok and failed == 0 and passed > 0, "passed": passed, "failed": failed,
-                      "ms": tms, "log": "\n".join(details)[-4000:]}
+                      "ms": tms, "log": (tso + tse)[-4000:]}
     if lang == "moonbit":
         d = fresh_copy(src, workdir)
         rc, so, se, ms = run(["moon", "run", "src/main", "--target", "native"], d)
@@ -305,6 +311,16 @@ def parse_diags(lang, so, se):
                     has_fixit = True
                     if not FIXIT_TEXT[0]:
                         FIXIT_TEXT[0] = "hint: " + dg.get("fixit")
+                # P17-A: exact `edits` patches are machine-applicable (as rustc's
+                # MachineApplicable suggestions); they win over a prose hint.
+                edits = dg.get("edits") or []
+                if edits:
+                    has_fixit = True
+                    if "MachineApplicable" not in FIXIT_TEXT[0]:
+                        ed = edits[0]
+                        FIXIT_TEXT[0] = "edit (MachineApplicable): %s:%d:%d -> %r" % (
+                            os.path.basename(ed.get("file", "")), int(ed.get("line", 0)),
+                            int(ed.get("col", 0)), (ed.get("replacement") or "")[:80])
                 if not first:
                     first = "%s: %s" % (dg.get("code"), dg.get("message"))
         except (ValueError, IndexError):
@@ -490,9 +506,9 @@ def cmd_dim2(args):
 T06 = os.path.join(AE, "tasks", "t06_multi_pkg_refactor")
 
 TEST_CMDS = {
-    # `pionc2 test <workspace>` runs only the root package's tests, so every package
-    # directory is tested in turn (cargo --workspace / go ./... / moon test cover all three).
-    "pion": lambda d: ["/bin/sh", "-c", " && ".join("%s test --json %s" % (_q(PIONC2), _q(t)) for t in pion_test_dirs(d))],
+    # `pionc2 test <workspace>` runs every local package's tests in one report, like
+    # cargo --workspace / go ./... / moon test.
+    "pion": lambda d: [PIONC2, "test", "--json", d],
     "moonbit": lambda d: ["moon", "test", "--target", "native"],
     "rust": lambda d: ["cargo", "test", "-q", "--offline", "--workspace"],
     "go": lambda d: ["go", "test", "./..."],
@@ -504,7 +520,7 @@ CHECK3_CMDS = {
     "go": lambda d: ["go", "vet", "./..."],
 }
 TEST_CMD_TEXT = {
-    "pion": "pionc2 test --json <pkg> for each of the 3 package dirs",
+    "pion": "pionc2 test --json <dir>",
     "moonbit": "moon test --target native",
     "rust": "cargo test -q --offline --workspace",
     "go": "go test ./...",
@@ -599,9 +615,9 @@ def cmd_dim3(args):
         if lang == "pion":
             parts = {}
             for name, cmd in [("doc_json", [PIONC2, "doc", "--json", src]),
-                              # `query` takes source files (a workspace directory yields an empty table)
-                              ("query_defs_json", [PIONC2, "query", "defs", "--json"] + metrics.source_files(src)),
-                              ("query_callers_json", [PIONC2, "query", "callers", "--json"] + metrics.source_files(src)),
+                              # `query` takes the workspace directory itself (every package, P17-B)
+                              ("query_defs_json", [PIONC2, "query", "defs", "--json", src]),
+                              ("query_callers_json", [PIONC2, "query", "callers", "--json", src]),
                               ("doc_text", [PIONC2, "doc", src])]:
                 rc, so, se, ms = run(cmd, src)
                 parts[name] = {"rc": rc, "bytes": len(so.encode()), "ms": round(ms, 1)}
