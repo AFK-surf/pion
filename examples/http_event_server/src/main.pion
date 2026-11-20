@@ -1,0 +1,643 @@
+///| pion-event-kv: an HTTP/1.1 + JSON key-value service on non-blocking sockets,
+///| one kqueue/epoll event loop per worker thread.
+///|
+///|   http_event_server --self-test
+///|   http_event_server --port <p> --workers <w> [--max-reqs <n>] [--port-file <path>]
+///|
+///| Every worker binds 127.0.0.1:<p> with SO_REUSEPORT (the kernel spreads new
+///| connections over the listeners) and multiplexes its connections: HTTP/1.1
+///| keep-alive, pipelining, and large responses drained on EV_WRITE. With
+///| `--port 0`, worker 0 binds first and hands the real port to the other workers
+///| over a `Channel[Int]`; once every worker listens, the port is printed (and
+///| written to --port-file, which may be a FIFO). With `--max-reqs <n>` the
+///| workers stop after the n-th request has been answered and flushed, and the
+///| final `/stats` JSON is printed.
+
+import "json"
+import "http"
+import "net"
+
+pub struct Options {
+  self_test : Bool
+  port : Int
+  workers : Int
+  max_reqs : Int
+  port_file : String
+}
+
+fn parse_int(s : String) -> Option[Int] {
+  if s.length() == 0 || s.length() > 9 {
+    return None
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  Some(v)
+}
+
+pub fn parse_options(args : Array[String]) -> Result[Options, String] {
+  let mut self_test = false
+  let mut port = 0
+  let mut workers = 4
+  let mut max_reqs = 0
+  let mut port_file = ""
+  let mut i = 1
+  while i < args.length() {
+    let a = args[i]
+    if a == "--self-test" {
+      self_test = true
+      i = i + 1
+      continue
+    }
+    if i + 1 >= args.length() {
+      return Err("missing value for " + a)
+    }
+    let v = args[i + 1]
+    if a == "--port-file" {
+      port_file = v
+    } else {
+      let n = match parse_int(v) {
+        Some(n) => n
+        None => return Err("invalid number for " + a + ": " + v)
+      }
+      if a == "--port" {
+        port = n
+      } else if a == "--workers" {
+        workers = n
+      } else if a == "--max-reqs" {
+        max_reqs = n
+      } else {
+        return Err("unknown option " + a)
+      }
+    }
+    i = i + 2
+  }
+  if workers < 1 || workers > 64 || port > 65535 {
+    return Err("need --workers 1..64 and --port 0..65535")
+  }
+  Ok(Options::{
+    self_test: self_test,
+    port: port,
+    workers: workers,
+    max_reqs: max_reqs,
+    port_file: port_file,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// One worker's event loop.
+
+/// A client connection owned by one worker: unparsed request bytes and the
+/// responses not yet accepted by the socket.
+struct Conn {
+  fd : Int
+  inbuf : StringBuilder
+  mut inlen : Int
+  out : net::WriteQueue
+  mut writing : Bool
+  mut close_after : Bool
+}
+
+/// Connections of one worker, indexed by fd.
+struct Loop {
+  poller : net::Poller
+  lfd : Int
+  conns : Array[Option[Conn]]
+  mut open : Int
+  mut peak : Int
+  mut pending : Int
+  mut answered : Int
+}
+
+fn conn_at(lp : Loop, fd : Int) -> Option[Conn] {
+  if fd < 0 || fd >= lp.conns.length() {
+    return None
+  }
+  lp.conns[fd]
+}
+
+fn close_conn(world : World, lp : Loop, c : Conn) -> Unit {
+  if c.writing {
+    lp.pending = lp.pending - 1
+  }
+  let _ = net::poller_del(world, lp.poller, c.fd)
+  tcp_close(world, c.fd)
+  let cs = lp.conns
+  cs[c.fd] = None
+  lp.open = lp.open - 1
+}
+
+/// Sends what the socket takes; switches EV_WRITE interest on while bytes
+/// remain and off once drained. Returns false when the connection was closed.
+fn flush(world : World, lp : Loop, c : Conn) -> Bool {
+  let r = net::wq_flush(world, c.fd, c.out)
+  if r < 0 {
+    close_conn(world, lp, c)
+    return false
+  }
+  let want = r == 0
+  if want && !c.writing {
+    c.writing = true
+    lp.pending = lp.pending + 1
+    let _ = net::poller_mod(world, lp.poller, c.fd, net::EV_READ | net::EV_WRITE)
+  } else if !want && c.writing {
+    c.writing = false
+    lp.pending = lp.pending - 1
+    let _ = net::poller_mod(world, lp.poller, c.fd, net::EV_READ)
+  }
+  if !want && c.close_after {
+    close_conn(world, lp, c)
+    return false
+  }
+  true
+}
+
+fn accept_all(world : World, svc : Service, lp : Loop) -> Unit {
+  while true {
+    let fd = tcp_accept_nb(world, lp.lfd)
+    if fd < 0 {
+      break
+    }
+    let cs = lp.conns
+    while cs.length() <= fd {
+      cs.push(None)
+    }
+    let c = Conn::{
+      fd: fd,
+      inbuf: StringBuilder(),
+      inlen: 0,
+      out: net::write_queue_new(),
+      writing: false,
+      close_after: false,
+    }
+    if !net::poller_add(world, lp.poller, fd, net::EV_READ) {
+      tcp_close(world, fd)
+      continue
+    }
+    cs[fd] = Some(c)
+    lp.open = lp.open + 1
+    if lp.open > lp.peak {
+      lp.peak = lp.open
+    }
+    let _ = svc.accepted.fetch_add(1)
+  }
+}
+
+/// Reads until the socket would block, answers every complete request and
+/// queues the responses. Returns false when the connection was closed.
+fn on_readable(world : World, svc : Service, lp : Loop, c : Conn) -> Bool {
+  let mut eof = false
+  while true {
+    let n = tcp_read_nb(world, c.fd, c.inbuf, 16384)
+    if n > 0 {
+      c.inlen = c.inlen + n
+      continue
+    }
+    if n == 0 || n == -1 {
+      eof = true
+    }
+    break
+  }
+  if c.inlen > 0 && !c.close_after {
+    let buf = c.inbuf.to_string()
+    let out = StringBuilder()
+    let (used, count, close) = answer_buffered(svc, buf, out)
+    c.inbuf.reset()
+    c.inlen = buf.length() - used
+    if used < buf.length() {
+      c.inbuf.write_string(buf.slice(used, buf.length()))
+    }
+    let text = out.to_string()
+    if text.length() > 0 {
+      net::wq_push(c.out, text)
+    }
+    lp.answered = lp.answered + count
+    if close {
+      c.close_after = true
+    }
+  }
+  if eof {
+    // The peer is gone (or half-closed): finish what can be sent, then close.
+    c.close_after = true
+  }
+  if net::wq_pending(c.out) > 0 || c.close_after {
+    return flush(world, lp, c)
+  }
+  true
+}
+
+/// A worker stops once nothing it owes is unsent and either `--max-reqs`
+/// requests were answered (by any worker) or `svc.stop` was raised.
+fn done(svc : Service, lp : Loop, max_reqs : Int) -> Bool {
+  lp.pending == 0 && (svc.stop.load() != 0 || (max_reqs > 0 && svc.total_reqs.load() >= max_reqs))
+}
+
+/// Runs one worker's event loop on listening socket `lfd` until `--max-reqs`
+/// requests were answered (forever with 0). Returns requests answered here.
+fn run_loop(world : World, svc : Service, lfd : Int, max_reqs : Int, peak_out : AtomicInt) -> Int {
+  let poller = match net::poller_new(world) {
+    Ok(p) => p
+    Err(e) => {
+      io_eprintln(world, "event loop: " + e)
+      return -1
+    }
+  }
+  let lp = Loop::{
+    poller: poller,
+    lfd: lfd,
+    conns: [],
+    open: 0,
+    peak: 0,
+    pending: 0,
+    answered: 0,
+  }
+  if !tcp_set_nonblock(world, lfd, true) || !net::poller_add(world, poller, lfd, net::EV_READ) {
+    io_eprintln(world, "event loop: cannot watch the listener")
+    net::poller_close(world, poller)
+    return -1
+  }
+  // A finite timeout lets idle workers notice that another worker answered the
+  // last request; readiness, not the timeout, drives all IO.
+  let timeout = if max_reqs > 0 { 20 } else { -1 }
+  while !done(svc, lp, max_reqs) {
+    let n = net::poller_wait(world, poller, timeout)
+    if n < 0 {
+      io_eprintln(world, "event loop: poll_wait failed")
+      break
+    }
+    let mut i = 0
+    while i < n {
+      let fd = poller.fds[i]
+      let ev = poller.events[i]
+      i = i + 1
+      if fd == lfd {
+        accept_all(world, svc, lp)
+        continue
+      }
+      match conn_at(lp, fd) {
+        Some(c) => {
+          let mut alive = true
+          if net::has_event(ev, net::EV_READ) || net::has_event(ev, net::EV_ERR) {
+            alive = on_readable(world, svc, lp, c)
+          }
+          if alive && net::has_event(ev, net::EV_WRITE) && c.writing {
+            let _ = flush(world, lp, c)
+          }
+        }
+        None => ()
+      }
+    }
+  }
+  let mut fd = 0
+  while fd < lp.conns.length() {
+    match lp.conns[fd] {
+      Some(c) => close_conn(world, lp, c)
+      None => ()
+    }
+    fd = fd + 1
+  }
+  net::poller_close(world, poller)
+  let _ = peak_out.fetch_add(lp.peak)
+  lp.answered
+}
+
+// ---------------------------------------------------------------------------
+// Server mode.
+
+/// Starts `workers` event loops on 127.0.0.1:`port` (0 = ephemeral), sends the
+/// bound port on `ready` once every worker listens (-1 when binding failed), and
+/// returns after all loops stopped. `answered` collects per-worker totals.
+fn run_workers(
+  world : World,
+  svc : Service,
+  port : Int,
+  workers : Int,
+  max_reqs : Int,
+  ready : Channel[Int],
+  peak : AtomicInt,
+  answered : Mutex[Array[Int]],
+) -> Unit {
+  let port_ch : Channel[Int] = Channel::new(64)
+  let bound : Channel[Int] = Channel::new(64)
+  scope(world, fn(s : Scope) -> Unit {
+    let mut wi = 0
+    while wi < workers {
+      let id = wi
+      spawn(s, fn() -> Unit {
+        let mut want = port
+        if id > 0 {
+          want = match port_ch.recv() {
+            Some(p) => p
+            None => -1
+          }
+        }
+        let lfd = if want < 0 { -1 } else { tcp_listen_reuse(world, "127.0.0.1", want) }
+        let got = if lfd < 0 { -1 } else { tcp_local_port(world, lfd) }
+        if id == 0 {
+          let mut k = 1
+          while k < workers {
+            let _ = port_ch.send(got)
+            k = k + 1
+          }
+        }
+        let _ = bound.send(got)
+        if lfd >= 0 {
+          let n = run_loop(world, svc, lfd, max_reqs, peak)
+          tcp_close(world, lfd)
+          let a = answered.lock()
+          a.push(n)
+          answered.unlock()
+        }
+      })
+      wi = wi + 1
+    }
+    let mut ok = true
+    let mut actual = -1
+    let mut k = 0
+    while k < workers {
+      match bound.recv() {
+        Some(p) => {
+          if p < 0 {
+            ok = false
+          } else {
+            actual = p
+          }
+        }
+        None => ok = false
+      }
+      k = k + 1
+    }
+    let _ = ready.send(if ok { actual } else { -1 })
+  })
+}
+
+fn announce(world : World, port : Int, workers : Int, port_file : String) -> Unit {
+  io_eprintln(world, "pion-event-kv listening on 127.0.0.1:" + port.to_string() + " workers=" + workers.to_string())
+  if port_file.length() > 0 {
+    match fs_write(world, port_file, port.to_string() + "\n") {
+      Ok(_) => ()
+      Err(e) => io_eprintln(world, "write port file: " + e)
+    }
+  }
+}
+
+fn serve(world : World, opts : Options) -> Int {
+  let svc = new_service()
+  let ready : Channel[Int] = Channel::new(1)
+  let peak = AtomicInt::new(0)
+  let answered : Mutex[Array[Int]] = Mutex::new([])
+  let failed = AtomicInt::new(0)
+  let want_port = opts.port
+  let workers = opts.workers
+  let max_reqs = opts.max_reqs
+  let port_file = opts.port_file
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      run_workers(world, svc, want_port, workers, max_reqs, ready, peak, answered)
+    })
+    let port = match ready.recv() {
+      Some(p) => p
+      None => -1
+    }
+    if port < 0 {
+      io_eprintln(world, "listen on 127.0.0.1:" + want_port.to_string() + " failed")
+      failed.store(1)
+    } else {
+      announce(world, port, workers, port_file)
+    }
+  })
+  if failed.load() != 0 {
+    return 1
+  }
+  let per = answered.lock()
+  let mut parts = ""
+  let mut i = 0
+  while i < per.length() {
+    if i > 0 {
+      parts = parts + ","
+    }
+    parts = parts + per[i].to_string()
+    i = i + 1
+  }
+  answered.unlock()
+  io_eprintln(world, "per-worker requests: [" + parts + "] peak open conns (sum of worker peaks): " + peak.load().to_string())
+  io_println(world, json::encode(stats(svc)))
+  0
+}
+
+// ---------------------------------------------------------------------------
+// --self-test: routes, pipelining parser, and real event loops over loopback TCP.
+
+fn expect(world : World, failures : AtomicInt, cond : Bool, what : String) -> Unit {
+  if !cond {
+    let _ = failures.fetch_add(1)
+    io_eprintln(world, "FAIL: " + what)
+  }
+}
+
+fn body_of(r : Result[http::HttpResponse, String]) -> String {
+  match r {
+    Ok(resp) => resp.status.to_string() + " " + resp.body
+    Err(e) => "error: " + e
+  }
+}
+
+fn put_body(v : String) -> String {
+  json::stringify(json::JObj([json::field("value", json::JStr(v))]))
+}
+
+/// The client half of `loopback`: drives the workers on `port` from this thread.
+fn drive_client(world : World, failures : AtomicInt, port : Int, conns : Int, rounds : Int, total : Int) -> Unit {
+  let cfd = tcp_connect(world, "127.0.0.1", port)
+  expect(world, failures, cfd >= 0, "connect")
+  let a = http::format_request_ka("PUT", "127.0.0.1", port, "/kv/a", put_body("1"), true)
+  let b = http::format_request_ka("GET", "127.0.0.1", port, "/kv/a", "", true)
+  let c = http::format_request_ka("GET", "127.0.0.1", port, "/kv/zz", "", true)
+  let batch = a + "\r\n" + b + c
+  expect(world, failures, tcp_write(world, cfd, batch) == batch.length(), "pipelined write")
+  let conn = http::new_conn(cfd)
+  let r1 = body_of(http::conn_read_response(world, conn))
+  let r2 = body_of(http::conn_read_response(world, conn))
+  let r3 = body_of(http::conn_read_response(world, conn))
+  expect(world, failures, r1 == "200 {\"ok\":true,\"key\":\"a\"}", "pipelined r1: " + r1)
+  expect(world, failures, r2 == "200 {\"key\":\"a\",\"value\":\"1\"}", "pipelined r2: " + r2)
+  expect(world, failures, r3 == "404 {\"error\":\"not found\"}", "pipelined r3: " + r3)
+  // 1 MiB value: the response outgrows the socket buffer and drains on EV_WRITE.
+  let chunk = StringBuilder()
+  let mut i = 0
+  while i < 16384 {
+    chunk.write_string("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+    i = i + 1
+  }
+  let big = chunk.to_string()
+  let put_big = http::format_request_ka("PUT", "127.0.0.1", port, "/kv/big", put_body(big), true)
+  expect(world, failures, tcp_write(world, cfd, put_big) == put_big.length(), "big put write")
+  let rb = body_of(http::conn_read_response(world, conn))
+  expect(world, failures, rb == "200 {\"ok\":true,\"key\":\"big\"}", "big put: " + rb)
+  let get_big = http::format_request_ka("GET", "127.0.0.1", port, "/kv/big", "", false)
+  expect(world, failures, tcp_write(world, cfd, get_big) == get_big.length(), "big get write")
+  let gb = http::conn_read_response(world, conn)
+  let big_ok = match gb {
+    Ok(resp) => resp.status == 200 && resp.body == "{\"key\":\"big\",\"value\":\"" + big + "\"}"
+    Err(_) => false
+  }
+  expect(world, failures, big_ok, "1 MiB response intact")
+  let after = body_of(http::conn_read_response(world, conn))
+  expect(world, failures, after == "error: connection closed before response", "closed after close: " + after)
+  tcp_close(world, cfd)
+  // 64 connections open at once, requests round-robin over them.
+  let fds : Array[Int] = []
+  let hc : Array[http::HttpConn] = []
+  let mut k = 0
+  while k < conns {
+    let fd = tcp_connect(world, "127.0.0.1", port)
+    expect(world, failures, fd >= 0, "connect " + k.to_string())
+    fds.push(fd)
+    hc.push(http::new_conn(fd))
+    k = k + 1
+  }
+  let mut bad = 0
+  let mut r = 0
+  while r < rounds {
+    k = 0
+    while k < conns {
+      let key = "/kv/c" + k.to_string()
+      let req = if r == 0 {
+        http::format_request_ka("PUT", "127.0.0.1", port, key, put_body("v" + k.to_string()), true)
+      } else {
+        http::format_request_ka("GET", "127.0.0.1", port, key, "", true)
+      }
+      if tcp_write(world, fds[k], req) != req.length() {
+        bad = bad + 1
+      }
+      k = k + 1
+    }
+    k = 0
+    while k < conns {
+      let got = body_of(http::conn_read_response(world, hc[k]))
+      let want = if r == 0 {
+        "200 {\"ok\":true,\"key\":\"c" + k.to_string() + "\"}"
+      } else {
+        "200 {\"key\":\"c" + k.to_string() + "\",\"value\":\"v" + k.to_string() + "\"}"
+      }
+      if got != want {
+        bad = bad + 1
+      }
+      k = k + 1
+    }
+    r = r + 1
+  }
+  expect(world, failures, bad == 0, "concurrent keep-alive mismatches: " + bad.to_string())
+  k = 0
+  while k < conns {
+    tcp_close(world, fds[k])
+    k = k + 1
+  }
+  let sfd = tcp_connect(world, "127.0.0.1", port)
+  let sreq = http::format_request("GET", "127.0.0.1", port, "/stats", "")
+  expect(world, failures, tcp_write(world, sfd, sreq) == sreq.length(), "stats write")
+  let st = body_of(http::conn_read_response(world, http::new_conn(sfd)))
+  let want_hits = 2 + conns * (rounds - 1)
+  let want_st = "200 {\"total_reqs\":" + total.to_string() + ",\"keys\":" + (2 + conns).to_string() +
+  ",\"hits\":" + want_hits.to_string() + ",\"misses\":1,\"puts\":" + (2 + conns).to_string() +
+  ",\"bad_requests\":0,\"accepted\":" + (conns + 2).to_string() + "}"
+  expect(world, failures, st == want_st, "stats: " + st + " want " + want_st)
+  tcp_close(world, sfd)
+}
+
+/// Two event-loop workers on an ephemeral port; a client on this thread drives
+/// pipelining, a 1 MiB response drained through EV_WRITE, 64 concurrently open
+/// keep-alive connections, `Connection: close`, and the exact `/stats`.
+fn loopback(world : World, failures : AtomicInt) -> Unit {
+  let svc = new_service()
+  let ready : Channel[Int] = Channel::new(1)
+  let peak = AtomicInt::new(0)
+  let answered : Mutex[Array[Int]] = Mutex::new([])
+  let conns = 64
+  let rounds = 5
+  // 3 pipelined + PUT big + GET big + conns * rounds + final /stats
+  let total = 3 + 2 + conns * rounds + 1
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      run_workers(world, svc, 0, 2, total, ready, peak, answered)
+    })
+    let port = match ready.recv() {
+      Some(p) => p
+      None => -1
+    }
+    if port > 0 {
+      drive_client(world, failures, port, conns, rounds, total)
+    } else {
+      expect(world, failures, false, "workers did not bind")
+    }
+    // Releases the workers even when a check failed before `total` was reached.
+    svc.stop.store(1)
+  })
+  let per = answered.lock()
+  let mut sum = 0
+  let mut i = 0
+  while i < per.length() {
+    sum = sum + per[i]
+    i = i + 1
+  }
+  let nworkers = per.length()
+  answered.unlock()
+  expect(world, failures, nworkers == 2 && sum == total, "workers answered " + sum.to_string() + " of " + total.to_string())
+  expect(world, failures, peak.load() >= conns, "peak open conns " + peak.load().to_string())
+  io_println(
+    world,
+    "event loop: " + total.to_string() + " requests, 3 pipelined, 1 MiB EV_WRITE drain, " + conns.to_string() +
+    " concurrent keep-alive conns on 2 workers",
+  )
+}
+
+fn functional(world : World, failures : AtomicInt) -> Unit {
+  let svc = new_service()
+  let out = StringBuilder()
+  let req = "PUT /kv/k HTTP/1.1\r\nContent-Length: 13\r\n\r\n{\"value\":\"v\"}\r\nGET /kv/k HTTP/1.1\r\n\r\nGET /kv/k HT"
+  let (used, n, close) = answer_buffered(svc, req, out)
+  expect(world, failures, !close && n == 2 && used == req.length() - 12, "pipelined parse used " + used.to_string())
+  let text = out.to_string()
+  expect(world, failures, text.starts_with("HTTP/1.1 200 OK\r\n"), "first response: " + text)
+  expect(world, failures, text.contains("{\"key\":\"k\",\"value\":\"v\"}"), "second response: " + text)
+  let out2 = StringBuilder()
+  let first = "GET /health HTTP/1.1\r\nConnection: close\r\n\r\n"
+  let (u2, n2, c2) = answer_buffered(svc, first + "GET /stats HTTP/1.1\r\n\r\n", out2)
+  expect(world, failures, c2 && n2 == 1 && u2 == first.length(), "close stops the batch at " + u2.to_string())
+  let out3 = StringBuilder()
+  let (u3, n3, c3) = answer_buffered(svc, "garbage\r\n\r\n", out3)
+  expect(world, failures, c3 && n3 == 0 && u3 == 11 && out3.to_string().starts_with("HTTP/1.1 400"), "malformed: " + out3.to_string())
+}
+
+fn self_test(world : World) -> Int {
+  let failures = AtomicInt::new(0)
+  functional(world, failures)
+  loopback(world, failures)
+  if failures.load() != 0 {
+    io_eprintln(world, "self-test FAILED: " + failures.load().to_string() + " check(s)")
+    return 1
+  }
+  io_println(world, "self-test ok")
+  0
+}
+
+pub fn main(world : World) -> Int {
+  match parse_options(world_args(world)) {
+    Ok(opts) => if opts.self_test { self_test(world) } else { serve(world, opts) }
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      io_eprintln(
+        world,
+        "usage: http_event_server --self-test | --port <p> --workers <w> [--max-reqs <n>] [--port-file <path>]",
+      )
+      2
+    }
+  }
+}

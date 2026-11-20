@@ -243,6 +243,7 @@ void*    pion_cstr_to_str(void *cstr);
 
 /* POSIX TCP Socket & Time */
 int32_t  pion_tcp_listen(void *w_ptr, void *host_str, int32_t port);
+int32_t  pion_tcp_listen_reuse(void *w_ptr, void *host_str, int32_t port);
 int32_t  pion_tcp_local_port(void *w_ptr, int32_t fd);
 int32_t  pion_tcp_accept(void *w_ptr, int32_t listen_fd);
 int32_t  pion_tcp_connect(void *w_ptr, void *host_str, int32_t port);
@@ -250,6 +251,19 @@ void*    pion_tcp_read(void *w_ptr, int32_t fd, int32_t max_bytes);
 int32_t  pion_tcp_write(void *w_ptr, int32_t fd, void *data_str);
 void     pion_tcp_close(void *w_ptr, int32_t fd);
 void     pion_sleep_ms(void *w_ptr, int32_t ms);
+
+/* Non-blocking sockets & readiness polling (kqueue on macOS, epoll on Linux).
+ * IO returns >= 0 bytes/fd, -2 (would block) or -1 (error); poll masks are
+ * 1 READ | 2 WRITE | 4 ERR/HUP/EOF; poll_ctl op is 1 ADD, 2 MOD, 3 DEL. */
+int32_t  pion_tcp_set_nonblock(void *w_ptr, int32_t fd, int32_t enable);
+int32_t  pion_tcp_accept_nb(void *w_ptr, int32_t listen_fd);
+int32_t  pion_tcp_read_nb(void *w_ptr, int32_t fd, void *sb_ptr, int32_t max_bytes);
+int32_t  pion_tcp_write_nb(void *w_ptr, int32_t fd, void *data_str, int32_t offset);
+int32_t  pion_poll_create(void *w_ptr);
+int32_t  pion_poll_ctl(void *w_ptr, int32_t pfd, int32_t op, int32_t fd, int32_t events);
+int32_t  pion_poll_wait(void *w_ptr, int32_t pfd, void *out_fds, void *out_events,
+                        int32_t max_events, int32_t timeout_ms);
+void     pion_poll_close(void *w_ptr, int32_t pfd);
 
 #ifdef __cplusplus
 }

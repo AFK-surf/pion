@@ -1,0 +1,202 @@
+///| The shared KV store, its counters and the REST router of the event-loop server.
+///| `handle` is pure (no `World`): the event loops and `--self-test` share it.
+
+import "json"
+import "http"
+
+/// State shared by every event-loop worker thread (all fields are `Send`).
+pub struct Service {
+  store : Mutex[Map[String, String]]
+  total_reqs : AtomicInt
+  hits : AtomicInt
+  misses : AtomicInt
+  puts : AtomicInt
+  bad_requests : AtomicInt
+  accepted : AtomicInt
+  stop : AtomicInt
+}
+
+pub fn new_service() -> Service {
+  let store : Mutex[Map[String, String]] = Mutex::new(Map::new())
+  Service::{
+    store: store,
+    total_reqs: AtomicInt::new(0),
+    hits: AtomicInt::new(0),
+    misses: AtomicInt::new(0),
+    puts: AtomicInt::new(0),
+    bad_requests: AtomicInt::new(0),
+    accepted: AtomicInt::new(0),
+    stop: AtomicInt::new(0),
+  }
+}
+
+pub struct StatsResp {
+  total_reqs : Int
+  keys : Int
+  hits : Int
+  misses : Int
+  puts : Int
+  bad_requests : Int
+  accepted : Int
+}
+
+impl json::ToJson for StatsResp {
+  fn to_json(self : StatsResp) -> json::JsonValue {
+    json::JObj([
+      json::field("total_reqs", self.total_reqs.to_json()),
+      json::field("keys", self.keys.to_json()),
+      json::field("hits", self.hits.to_json()),
+      json::field("misses", self.misses.to_json()),
+      json::field("puts", self.puts.to_json()),
+      json::field("bad_requests", self.bad_requests.to_json()),
+      json::field("accepted", self.accepted.to_json()),
+    ])
+  }
+}
+
+pub fn key_count(svc : Service) -> Int {
+  let m = svc.store.lock()
+  let n = m.length()
+  svc.store.unlock()
+  n
+}
+
+pub fn stats(svc : Service) -> StatsResp {
+  StatsResp::{
+    total_reqs: svc.total_reqs.load(),
+    keys: key_count(svc),
+    hits: svc.hits.load(),
+    misses: svc.misses.load(),
+    puts: svc.puts.load(),
+    bad_requests: svc.bad_requests.load(),
+    accepted: svc.accepted.load(),
+  }
+}
+
+fn bad_request(svc : Service, msg : String) -> http::HttpResponse {
+  let _ = svc.bad_requests.fetch_add(1)
+  http::err_json(400, msg)
+}
+
+fn item_json(key : String, value : String) -> String {
+  json::stringify(json::JObj([json::field("key", json::JStr(key)), json::field("value", json::JStr(value))]))
+}
+
+fn put_item(svc : Service, key : String, body : String) -> http::HttpResponse {
+  let value = match json::parse(body) {
+    Ok(v) =>
+    match json::obj_get(v, "value") {
+      Some(jv) =>
+      match json::as_str(jv) {
+        Some(s) => s
+        None => return bad_request(svc, "field `value` must be a string")
+      }
+      None => return bad_request(svc, "missing field `value`")
+    }
+    Err(e) => return bad_request(svc, "invalid json: " + e)
+  }
+  let m = svc.store.lock()
+  m.set(key, value)
+  svc.store.unlock()
+  let _ = svc.puts.fetch_add(1)
+  http::ok_json("{\"ok\":true,\"key\":" + json::stringify(json::JStr(key)) + "}")
+}
+
+fn get_item(svc : Service, key : String) -> http::HttpResponse {
+  let m = svc.store.lock()
+  let found = m.get(key)
+  svc.store.unlock()
+  match found {
+    Some(v) => {
+      let _ = svc.hits.fetch_add(1)
+      http::ok_json(item_json(key, v))
+    }
+    None => {
+      let _ = svc.misses.fetch_add(1)
+      http::err_json(404, "not found")
+    }
+  }
+}
+
+/// Routes one request; every call counts towards `total_reqs`.
+pub fn handle(svc : Service, method : String, path : String, body : String) -> http::HttpResponse {
+  let _ = svc.total_reqs.fetch_add(1)
+  if path == "/health" {
+    if method != "GET" {
+      return http::err_json(405, "method not allowed")
+    }
+    return http::ok_json("{\"ok\":true,\"service\":\"pion-event-kv\"}")
+  }
+  if path == "/stats" {
+    if method != "GET" {
+      return http::err_json(405, "method not allowed")
+    }
+    return http::ok_json(json::encode(stats(svc)))
+  }
+  if path.starts_with("/kv/") {
+    let key = http::url_decode(path.slice(4, path.length()))
+    if key.length() == 0 || key.contains("/") {
+      return bad_request(svc, "invalid key")
+    }
+    if method == "PUT" {
+      return put_item(svc, key, body)
+    } else if method == "GET" {
+      return get_item(svc, key)
+    }
+    return http::err_json(405, "method not allowed")
+  }
+  http::err_json(404, "no route for " + path)
+}
+
+/// Bytes a client may send between pipelined requests (`\r` / `\n`).
+pub fn leading_blank(buf : String) -> Int {
+  let mut i = 0
+  while i < buf.length() {
+    let c = buf.code_unit_at(i)
+    if c != 13 && c != 10 {
+      break
+    }
+    i = i + 1
+  }
+  i
+}
+
+/// Answers every complete request at the front of `buf` and appends the
+/// responses to `out`. Returns `(consumed bytes, requests answered, close after
+/// these responses)`; a malformed request gets a 400 and closes the connection.
+pub fn answer_buffered(svc : Service, buf : String, out : StringBuilder) -> (Int, Int, Bool) {
+  let mut pos = 0
+  let mut count = 0
+  while pos < buf.length() {
+    let rest = buf.slice(pos, buf.length())
+    let n = http::request_len(rest)
+    if n < 0 {
+      if rest.length() > http::MAX_MESSAGE_BYTES {
+        out.write_string(http::format_response(bad_request(svc, "request too large")))
+        return (buf.length(), count, true)
+      }
+      return (pos, count, false)
+    }
+    let skip = leading_blank(rest)
+    if skip == n {
+      return (pos + n, count, false)
+    }
+    match http::parse_request(rest.slice(skip, n)) {
+      Ok(req) => {
+        let keep = http::should_keep_alive(req)
+        let resp = handle(svc, req.method, req.path, req.body)
+        out.write_string(http::format_response_ka(resp, keep))
+        pos = pos + n
+        count = count + 1
+        if !keep {
+          return (pos, count, true)
+        }
+      }
+      Err(e) => {
+        out.write_string(http::format_response(bad_request(svc, e)))
+        return (buf.length(), count, true)
+      }
+    }
+  }
+  (pos, count, false)
+}

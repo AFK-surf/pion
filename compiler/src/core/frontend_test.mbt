@@ -1727,3 +1727,56 @@ test "p17a: Mutex[Array[T]] and Mutex[Map[String, Array[T]]] are Send, bare cont
   assert_eq(d2.length(), 3)
   assert_true(d2[0].code == "E_NOT_SEND" && d2[1].code == "E_NOT_SEND" && d2[2].code == "E_NOT_SEND", json2)
 }
+
+///|
+test "p18: non-blocking IO and poll primitives typecheck behind an explicit World" {
+  let ok_src =
+    #|pub fn main(world : World) -> Int {
+    #|  let lfd = tcp_listen_reuse(world, "127.0.0.1", 0)
+    #|  let nb : Bool = tcp_set_nonblock(world, lfd, true)
+    #|  let pfd = poll_create(world)
+    #|  let added : Bool = poll_ctl(world, pfd, 1, lfd, 1)
+    #|  let fds : Array[Int] = []
+    #|  let evs : Array[Int] = []
+    #|  let n : Int = poll_wait(world, pfd, fds, evs, 64, 0)
+    #|  let c = tcp_accept_nb(world, lfd)
+    #|  let buf = StringBuilder()
+    #|  let r : Int = tcp_read_nb(world, c, buf, 16384)
+    #|  let wr : Int = tcp_write_nb(world, c, "ok", 0)
+    #|  poll_close(world, pfd)
+    #|  if nb && added { n + r + wr } else { 0 }
+    #|}
+  let ok_cr = @core.check_source_files("p18_ok", ["p18_ok.pion"], [ok_src])
+  assert_true(ok_cr.diagnostics.length() == 0, "p18 prims ok: " + @core.check_result_to_json(ok_cr.diagnostics))
+
+  // A pure helper cannot reach the event loop: World must be the first argument.
+  let no_w =
+    #|pub fn f(pfd : Int) -> Int {
+    #|  let fds : Array[Int] = []
+    #|  let evs : Array[Int] = []
+    #|  poll_wait(pfd, fds, evs, 64, 0)
+    #|}
+  let no_w_json = @core.check_result_to_json(
+    @core.check_source_files("p18_now", ["p18_now.pion"], [no_w]).diagnostics,
+  )
+  assert_true(str_contains(no_w_json, "E_CAPABILITY_MISSING"), "poll_wait without World: " + no_w_json)
+  assert_true(str_contains(no_w_json, "`poll_wait` requires an explicit `World`"), "poll_wait msg: " + no_w_json)
+
+  let bad_ty =
+    #|pub fn main(world : World) -> Int {
+    #|  let fds : Array[String] = []
+    #|  let evs : Array[Int] = []
+    #|  let a = tcp_read_nb(world, 3, "not a builder", 16)
+    #|  let b = tcp_set_nonblock(world, 3, 1)
+    #|  poll_wait(world, 4, fds, evs, 8, 0) + a
+    #|}
+  let bad_json = @core.check_result_to_json(
+    @core.check_source_files("p18_bad", ["p18_bad.pion"], [bad_ty]).diagnostics,
+  )
+  assert_true(
+    str_contains(bad_json, "argument 3 of `tcp_read_nb` expects `StringBuilder`"),
+    "tcp_read_nb arg type: " + bad_json,
+  )
+  assert_true(str_contains(bad_json, "argument 3 of `tcp_set_nonblock` expects `Bool`"), "nonblock arg: " + bad_json)
+  assert_true(str_contains(bad_json, "argument 3 of `poll_wait` expects `Array[Int]`"), "poll_wait arg: " + bad_json)
+}

@@ -1549,3 +1549,64 @@ test "p17a: storing into a possibly-frozen container deep-freezes the element" {
   assert_true(ssa.contains("adopt_fz"), ssa)
   assert_true(ssa.contains("$pion_freeze_st_Msg"), ssa)
 }
+
+///|
+test "p18: event-loop primitives lower to direct C calls with the World first" {
+  let src =
+    #|pub fn watch(world : World, pfd : Int, fd : Int) -> Bool {
+    #|  poll_ctl(world, pfd, 1, fd, 1)
+    #|}
+    #|pub fn main(world : World) -> Int {
+    #|  let lfd = tcp_listen_reuse(world, "127.0.0.1", 0)
+    #|  let pfd = poll_create(world)
+    #|  if !tcp_set_nonblock(world, lfd, true) || !poll_ctl(world, pfd, 1, lfd, 3) {
+    #|    return 1
+    #|  }
+    #|  let fds : Array[Int] = []
+    #|  let evs : Array[Int] = []
+    #|  let buf = StringBuilder()
+    #|  let n = poll_wait(world, pfd, fds, evs, 256, 10)
+    #|  let c = tcp_accept_nb(world, lfd)
+    #|  let r = tcp_read_nb(world, c, buf, 16384)
+    #|  let w = tcp_write_nb(world, c, buf.to_string(), r)
+    #|  poll_close(world, pfd)
+    #|  n + w
+    #|}
+  let cr = @core.check_source_files_full("p18_cg", ["p18_cg.pion"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  assert_true(ssa.contains("=w call $pion_tcp_listen_reuse(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_poll_create(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_tcp_set_nonblock(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_poll_ctl(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_poll_wait(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_tcp_accept_nb(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_tcp_read_nb(l "), ssa)
+  assert_true(ssa.contains("=w call $pion_tcp_write_nb(l "), ssa)
+  assert_true(ssa.contains("call $pion_poll_close(l "), ssa)
+  // A C `int32_t` Bool result is widened into Pion's 64-bit Bool slot before `ret`.
+  let fn_at = p18_find_from(ssa, "$pion_fn_watch(", 0)
+  assert_true(fn_at >= 0, ssa)
+  let fn_end = p18_find_from(ssa, "\n}", fn_at)
+  let call_at = p18_find_from(ssa, "=w call $pion_poll_ctl(", fn_at)
+  let ext_at = p18_find_from(ssa, " =l extuw ", call_at)
+  assert_true(call_at > fn_at && ext_at > call_at && ext_at < fn_end, ssa)
+}
+
+///|
+/// Index of `needle` in `hay` at or after `from`, or -1.
+fn p18_find_from(hay : String, needle : String, from : Int) -> Int {
+  let n = needle.length()
+  let mut i = if from < 0 { 0 } else { from }
+  while i + n <= hay.length() {
+    let mut j = 0
+    while j < n && @core.str_code_at(hay, i + j) == @core.str_code_at(needle, j) {
+      j = j + 1
+    }
+    if j == n {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
