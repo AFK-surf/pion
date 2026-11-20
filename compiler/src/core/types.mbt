@@ -1593,6 +1593,31 @@ fn rt_prim_info(name : String) -> Option[RtPrim] {
     Some(RtPrim::{ c_sym: "pion_tcp_close", world: true, param_tys: [TInt], ret_ty: TUnit })
   } else if name == "sleep_ms" {
     Some(RtPrim::{ c_sym: "pion_sleep_ms", world: true, param_tys: [TInt], ret_ty: TUnit })
+  } else if name == "tcp_listen_reuse" {
+    Some(RtPrim::{ c_sym: "pion_tcp_listen_reuse", world: true, param_tys: [TString, TInt], ret_ty: TInt })
+  } else if name == "tcp_set_nonblock" {
+    Some(RtPrim::{ c_sym: "pion_tcp_set_nonblock", world: true, param_tys: [TInt, TBool], ret_ty: TBool })
+  } else if name == "tcp_accept_nb" {
+    Some(RtPrim::{ c_sym: "pion_tcp_accept_nb", world: true, param_tys: [TInt], ret_ty: TInt })
+  } else if name == "tcp_read_nb" {
+    Some(RtPrim::{ c_sym: "pion_tcp_read_nb", world: true, param_tys: [TInt, TStringBuilder, TInt], ret_ty: TInt })
+  } else if name == "tcp_write_nb" {
+    Some(RtPrim::{ c_sym: "pion_tcp_write_nb", world: true, param_tys: [TInt, TString, TInt], ret_ty: TInt })
+  } else if name == "poll_create" {
+    Some(RtPrim::{ c_sym: "pion_poll_create", world: true, param_tys: [], ret_ty: TInt })
+  } else if name == "poll_ctl" {
+    Some(RtPrim::{ c_sym: "pion_poll_ctl", world: true, param_tys: [TInt, TInt, TInt, TInt], ret_ty: TBool })
+  } else if name == "poll_wait" {
+    Some(
+      RtPrim::{
+        c_sym: "pion_poll_wait",
+        world: true,
+        param_tys: [TInt, TArray(TInt), TArray(TInt), TInt, TInt],
+        ret_ty: TInt,
+      },
+    )
+  } else if name == "poll_close" {
+    Some(RtPrim::{ c_sym: "pion_poll_close", world: true, param_tys: [TInt], ret_ty: TUnit })
   } else {
     None
   }

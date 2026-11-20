@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE /* kqueue's <sys/event.h> and SO_REUSEPORT need the BSD types */
+#endif
 
 #include "pion_rt.h"
 
@@ -10,6 +13,7 @@
 #include <limits.h>
 #include <math.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
@@ -22,11 +26,25 @@
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <sys/event.h>
+#elif defined(__linux__)
+#include <sys/epoll.h>
+/* glibc hides SO_REUSEPORT under _POSIX_C_SOURCE; 15 is the asm-generic value. */
+#if !defined(SO_REUSEPORT) && (defined(__x86_64__) || defined(__aarch64__) || defined(__riscv) || \
+                               defined(__i386__) || defined(__arm__) || defined(__powerpc__))
+#define SO_REUSEPORT 15
+#endif
+#endif
 
 extern char **environ;
 
 #if defined(__clang__)
 #define PION_MINSIZE __attribute__((minsize))
+/* C never unwinds: drop per-function unwind entries (Darwin arm64 emits 32 B of
+ * __compact_unwind per function even with -fno-asynchronous-unwind-tables, ~8 KB
+ * here). Backtraces (lldb, ASan/TSan) walk frame pointers, which arm64 always keeps. */
+#pragma clang attribute push (__attribute__((nouwtable)), apply_to = hasType(functionType))
 #else
 #define PION_MINSIZE __attribute__((optimize("Os")))
 #endif
@@ -80,31 +98,31 @@ PION_MINSIZE void pion_debug_assert(int32_t cond, void *msg_str, const char *fil
     }
 }
 
-double pion_math_sqrt(double x) {
+PION_MINSIZE double pion_math_sqrt(double x) {
     return sqrt(x);
 }
 
-double pion_math_abs(double x) {
+PION_MINSIZE double pion_math_abs(double x) {
     return fabs(x);
 }
 
-double pion_math_floor(double x) {
+PION_MINSIZE double pion_math_floor(double x) {
     return floor(x);
 }
 
-double pion_math_ceil(double x) {
+PION_MINSIZE double pion_math_ceil(double x) {
     return ceil(x);
 }
 
-double pion_math_sin(double x) {
+PION_MINSIZE double pion_math_sin(double x) {
     return sin(x);
 }
 
-double pion_math_cos(double x) {
+PION_MINSIZE double pion_math_cos(double x) {
     return cos(x);
 }
 
-double pion_math_pow(double x, double y) {
+PION_MINSIZE double pion_math_pow(double x, double y) {
     return pow(x, y);
 }
 
@@ -832,7 +850,7 @@ PION_MINSIZE void *pion_bytes_concat(void *a_ptr, void *b_ptr) {
     return out;
 }
 
-void *pion_str_to_bytes(void *s) {
+PION_MINSIZE void *pion_str_to_bytes(void *s) {
     PionString *str = (PionString *)s;
     int64_t len = str ? str->len : 0;
     PionBytes *out = pion_bytes_alloc_uninit(len);
@@ -1069,7 +1087,7 @@ int64_t pion_arr_pop(void *a_ptr) {
     return a->data[--a->len];
 }
 
-void *pion_arr_copy(void *a_ptr) {
+PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a) return pion_arr_new(0, 0);
     PionArray *cp = (PionArray *)pion_arr_new(a->len, a->elem_is_obj);
@@ -1409,7 +1427,7 @@ PION_MINSIZE void *pion_map_copy(void *m_ptr) {
     return cp;
 }
 
-void *pion_map_keys(void *m_ptr) {
+PION_MINSIZE void *pion_map_keys(void *m_ptr) {
     PionMap *m = (PionMap *)m_ptr;
     int64_t n = m ? m->len : 0;
     void *arr = pion_arr_new(n, 1);
@@ -2371,8 +2389,7 @@ PION_MINSIZE static int pion_parse_ipv4_addr(void *host_str, int32_t port, int a
     return inet_pton(AF_INET, hs, &addr->sin_addr) == 1;
 }
 
-PION_MINSIZE int32_t pion_tcp_listen(void *w_ptr, void *host_str, int32_t port) {
-    (void)w_ptr;
+PION_MINSIZE static int32_t pion_tcp_listen_impl(void *host_str, int32_t port, int reuse_port) {
     pthread_once(&g_sigpipe_once, pion_ignore_sigpipe_init);
     if (port < 0 || port > 65535) return -1;
     struct sockaddr_in addr;
@@ -2381,14 +2398,29 @@ PION_MINSIZE int32_t pion_tcp_listen(void *w_ptr, void *host_str, int32_t port) 
     if (fd < 0) return -1;
     int yes = 1;
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, (socklen_t)sizeof(yes));
+#ifdef SO_REUSEPORT
+    if (reuse_port) (void)setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, (socklen_t)sizeof(yes));
+#else
+    (void)reuse_port;
+#endif
     if (bind(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0 ||
-        listen(fd, 128) != 0) {
+        listen(fd, 1024) != 0) {
         int saved = errno;
         close(fd);
         errno = saved;
         return -1;
     }
     return (int32_t)fd;
+}
+
+PION_MINSIZE int32_t pion_tcp_listen(void *w_ptr, void *host_str, int32_t port) {
+    (void)w_ptr;
+    return pion_tcp_listen_impl(host_str, port, 0);
+}
+
+PION_MINSIZE int32_t pion_tcp_listen_reuse(void *w_ptr, void *host_str, int32_t port) {
+    (void)w_ptr;
+    return pion_tcp_listen_impl(host_str, port, 1);
 }
 
 PION_MINSIZE int32_t pion_tcp_local_port(void *w_ptr, int32_t fd) {
@@ -2474,6 +2506,218 @@ PION_MINSIZE void pion_tcp_close(void *w_ptr, int32_t fd) {
     if (fd >= 0) close(fd);
 }
 
+/* ============================================================================
+ * 10. Non-blocking sockets & kqueue/epoll readiness polling (level-triggered)
+ * ============================================================================ */
+
+#define PION_IO_AGAIN (-2)
+#define PION_EV_READ 1
+#define PION_EV_WRITE 2
+#define PION_EV_ERR 4
+#define PION_POLL_MAX 256
+
+static int pion_io_would_block(void) {
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+
+PION_MINSIZE static int pion_fd_set_nonblock(int fd, int enable) {
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl < 0) return 0;
+    int nfl = enable ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
+    return nfl == fl || fcntl(fd, F_SETFL, nfl) == 0;
+}
+
+PION_MINSIZE int32_t pion_tcp_set_nonblock(void *w_ptr, int32_t fd, int32_t enable) {
+    (void)w_ptr;
+    return fd >= 0 && pion_fd_set_nonblock(fd, enable != 0);
+}
+
+PION_MINSIZE int32_t pion_tcp_accept_nb(void *w_ptr, int32_t listen_fd) {
+    (void)w_ptr;
+    if (listen_fd < 0) return -1;
+    int cfd;
+    do {
+        cfd = accept(listen_fd, NULL, NULL);
+    } while (cfd < 0 && errno == EINTR);
+    if (cfd < 0) return pion_io_would_block() || errno == ECONNABORTED ? PION_IO_AGAIN : -1;
+    int yes = 1;
+    (void)setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &yes, (socklen_t)sizeof(yes));
+#ifdef SO_NOSIGPIPE
+    (void)setsockopt(cfd, SOL_SOCKET, SO_NOSIGPIPE, &yes, (socklen_t)sizeof(yes));
+#endif
+    (void)fcntl(cfd, F_SETFD, FD_CLOEXEC);
+    if (!pion_fd_set_nonblock(cfd, 1)) {
+        close(cfd);
+        return -1;
+    }
+    return (int32_t)cfd;
+}
+
+/* One recv into a 16 KB stack buffer, then appends exactly the bytes read (an
+ * idle connection's StringBuilder never grows to the read window). */
+PION_MINSIZE int32_t pion_tcp_read_nb(void *w_ptr, int32_t fd, void *sb_ptr, int32_t max_bytes) {
+    (void)w_ptr;
+    PionStrBuf *sb = (PionStrBuf *)sb_ptr;
+    if (fd < 0 || !sb) return -1;
+    char buf[16384];
+    size_t cap = max_bytes <= 0 || max_bytes > (int32_t)sizeof(buf) ? sizeof(buf) : (size_t)max_bytes;
+    ssize_t n;
+    do {
+        n = recv(fd, buf, cap, 0);
+    } while (n < 0 && errno == EINTR);
+    if (n > 0) {
+        pion_strbuf_reserve(sb, (int64_t)n);
+        memcpy(sb->data + sb->len, buf, (size_t)n);
+        sb->len += (int64_t)n;
+        sb->data[sb->len] = '\0';
+        return (int32_t)n;
+    }
+    if (n == 0) return 0;
+    return pion_io_would_block() ? PION_IO_AGAIN : -1;
+}
+
+/* One send of data[offset..]: partial writes resume from a new offset, no slicing. */
+PION_MINSIZE int32_t pion_tcp_write_nb(void *w_ptr, int32_t fd, void *data_str, int32_t offset) {
+    (void)w_ptr;
+    PionString *s = (PionString *)data_str;
+    if (fd < 0 || !s || offset < 0) return -1;
+    if ((int64_t)offset >= s->len) return 0;
+    size_t len = (size_t)(s->len - offset);
+    if (len > (size_t)INT32_MAX) len = (size_t)INT32_MAX;
+    int flags = 0;
+#ifdef MSG_NOSIGNAL
+    flags = MSG_NOSIGNAL;
+#endif
+    ssize_t n;
+    do {
+        n = send(fd, s->data + offset, len, flags);
+    } while (n < 0 && errno == EINTR);
+    if (n >= 0) return (int32_t)n;
+    return pion_io_would_block() ? PION_IO_AGAIN : -1;
+}
+
+PION_MINSIZE int32_t pion_poll_create(void *w_ptr) {
+    (void)w_ptr;
+#if defined(__APPLE__)
+    int pfd = kqueue();
+    if (pfd >= 0) (void)fcntl(pfd, F_SETFD, FD_CLOEXEC);
+    return pfd >= 0 ? (int32_t)pfd : -1;
+#elif defined(__linux__)
+    int pfd = epoll_create1(EPOLL_CLOEXEC);
+    return pfd >= 0 ? (int32_t)pfd : -1;
+#else
+    errno = ENOSYS;
+    return -1;
+#endif
+}
+
+/* op: 1 ADD, 2 MOD, 3 DEL; events: 1 READ | 2 WRITE. Level-triggered on both
+ * backends. kqueue registers both filters on ADD/MOD (enabled or disabled), so a
+ * MOD never deletes a filter that was not registered. */
+PION_MINSIZE int32_t pion_poll_ctl(void *w_ptr, int32_t pfd, int32_t op, int32_t fd, int32_t events) {
+    (void)w_ptr;
+    if (pfd < 0 || fd < 0 || op < 1 || op > 3) return 0;
+#if defined(__APPLE__)
+    struct kevent ch[2];
+    struct kevent res[2];
+    for (int i = 0; i < 2; i++) {
+        int16_t filt = i == 0 ? EVFILT_READ : EVFILT_WRITE;
+        int on = (events & (i == 0 ? PION_EV_READ : PION_EV_WRITE)) != 0;
+        uint16_t fl = op == 3 ? EV_DELETE : (uint16_t)(EV_ADD | (on ? EV_ENABLE : EV_DISABLE));
+        EV_SET(&ch[i], (uintptr_t)fd, filt, (uint16_t)(fl | EV_RECEIPT), 0, 0, NULL);
+    }
+    int n;
+    do {
+        n = kevent(pfd, ch, 2, res, 2, NULL);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) return 0;
+    for (int i = 0; i < n; i++) {
+        if ((res[i].flags & EV_ERROR) && res[i].data != 0 &&
+            !(op == 3 && res[i].data == ENOENT)) {
+            errno = (int)res[i].data;
+            return 0;
+        }
+    }
+    return 1;
+#elif defined(__linux__)
+    struct epoll_event ev;
+    memset(&ev, 0, sizeof(ev));
+    ev.events = ((events & PION_EV_READ) ? EPOLLIN : 0u) | ((events & PION_EV_WRITE) ? EPOLLOUT : 0u);
+    ev.data.fd = fd;
+    int eop = op == 1 ? EPOLL_CTL_ADD : (op == 2 ? EPOLL_CTL_MOD : EPOLL_CTL_DEL);
+    return epoll_ctl(pfd, eop, fd, &ev) == 0;
+#else
+    (void)events;
+    errno = ENOSYS;
+    return 0;
+#endif
+}
+
+/* Fills out_fds/out_events (cleared first) with one entry per ready fd, its mask
+ * 1 READ | 2 WRITE | 4 ERR/HUP/EOF; kqueue's per-filter events are merged by fd. */
+PION_MINSIZE int32_t pion_poll_wait(void *w_ptr, int32_t pfd, void *out_fds, void *out_events,
+                                    int32_t max_events, int32_t timeout_ms) {
+    (void)w_ptr;
+    pion_arr_clear(out_fds);
+    pion_arr_clear(out_events);
+    if (pfd < 0 || !out_fds || !out_events) return -1;
+    int cap = max_events <= 0 || max_events > PION_POLL_MAX ? PION_POLL_MAX : (int)max_events;
+    int fds[PION_POLL_MAX];
+    int masks[PION_POLL_MAX];
+    int m = 0;
+#if defined(__APPLE__)
+    struct kevent evs[PION_POLL_MAX];
+    struct timespec ts;
+    ts.tv_sec = (time_t)(timeout_ms / 1000);
+    ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
+    int n;
+    do {
+        n = kevent(pfd, NULL, 0, evs, cap, timeout_ms < 0 ? NULL : &ts);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        int fd = (int)evs[i].ident;
+        int mask = evs[i].filter == EVFILT_READ ? PION_EV_READ : PION_EV_WRITE;
+        if (evs[i].flags & (EV_EOF | EV_ERROR)) mask |= PION_EV_ERR;
+        int j = 0;
+        while (j < m && fds[j] != fd) j++;
+        if (j == m) {
+            fds[m] = fd;
+            masks[m++] = 0;
+        }
+        masks[j] |= mask;
+    }
+#elif defined(__linux__)
+    struct epoll_event evs[PION_POLL_MAX];
+    int n;
+    do {
+        n = epoll_wait(pfd, evs, cap, timeout_ms < 0 ? -1 : (int)timeout_ms);
+    } while (n < 0 && errno == EINTR);
+    if (n < 0) return -1;
+    for (int i = 0; i < n; i++) {
+        uint32_t e = evs[i].events;
+        fds[m] = evs[i].data.fd;
+        masks[m++] = ((e & EPOLLIN) ? PION_EV_READ : 0) | ((e & EPOLLOUT) ? PION_EV_WRITE : 0) |
+                     ((e & (EPOLLERR | EPOLLHUP)) ? PION_EV_ERR : 0);
+    }
+#else
+    (void)cap;
+    (void)timeout_ms;
+    errno = ENOSYS;
+    return -1;
+#endif
+    for (int i = 0; i < m; i++) {
+        pion_arr_push(out_fds, (int64_t)fds[i]);
+        pion_arr_push(out_events, (int64_t)masks[i]);
+    }
+    return (int32_t)m;
+}
+
+PION_MINSIZE void pion_poll_close(void *w_ptr, int32_t pfd) {
+    (void)w_ptr;
+    if (pfd >= 0) close(pfd);
+}
+
 PION_MINSIZE void pion_sleep_ms(void *w_ptr, int32_t ms) {
     (void)w_ptr;
     if (ms <= 0) return;
@@ -2485,3 +2729,7 @@ PION_MINSIZE void pion_sleep_ms(void *w_ptr, int32_t ms) {
         req = rem;
     }
 }
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#endif

@@ -1,0 +1,158 @@
+///| std/net: level-triggered readiness polling (kqueue on macOS, epoll on Linux)
+///| and non-blocking socket write queues for event-loop servers (pure Pion).
+///|
+///| Every IO call takes the `World` capability first, so pure code cannot reach
+///| the event loop. Non-blocking IO returns `>= 0` bytes (or an fd), `IO_AGAIN`
+///| when it would block, and `-1` on a real error.
+
+/// `poll_ctl` operations.
+pub let POLL_ADD : Int = 1
+
+pub let POLL_MOD : Int = 2
+
+pub let POLL_DEL : Int = 3
+
+/// Readiness bits: interest masks use `EV_READ | EV_WRITE`; ready masks may add `EV_ERR`
+/// (error, hang-up or peer EOF; read until `0` to tell which).
+pub let EV_READ : Int = 1
+
+pub let EV_WRITE : Int = 2
+
+pub let EV_ERR : Int = 4
+
+/// Returned by non-blocking IO that would block.
+pub let IO_AGAIN : Int = -2
+
+/// Most ready fds one `poller_wait` reports (the runtime's stack batch).
+pub let MAX_EVENTS : Int = 256
+
+/// One kqueue/epoll instance and its reusable ready lists: after `poller_wait`
+/// returns `n`, `fds[i]` is ready with mask `events[i]` for `i < n` (one entry per fd).
+pub struct Poller {
+  pub pfd : Int
+  pub fds : Array[Int]
+  pub events : Array[Int]
+}
+
+/// Opens a poller.
+pub fn poller_new(w : World) -> Result[Poller, String] {
+  let pfd = poll_create(w)
+  if pfd < 0 {
+    return Err("poll_create failed")
+  }
+  Ok(Poller::{ pfd: pfd, fds: [], events: [] })
+}
+
+/// Starts watching `fd` for `interest` (`EV_READ`, `EV_WRITE` or both).
+pub fn poller_add(w : World, p : Poller, fd : Int, interest : Int) -> Bool {
+  poll_ctl(w, p.pfd, POLL_ADD, fd, interest)
+}
+
+/// Replaces the interest of a watched `fd`.
+pub fn poller_mod(w : World, p : Poller, fd : Int, interest : Int) -> Bool {
+  poll_ctl(w, p.pfd, POLL_MOD, fd, interest)
+}
+
+/// Stops watching `fd` (do it before closing `fd`).
+pub fn poller_del(w : World, p : Poller, fd : Int) -> Bool {
+  poll_ctl(w, p.pfd, POLL_DEL, fd, 0)
+}
+
+/// Waits up to `timeout_ms` (`-1` forever, `0` poll) and returns how many fds
+/// are ready (listed in `p.fds` / `p.events`), or -1 on error.
+pub fn poller_wait(w : World, p : Poller, timeout_ms : Int) -> Int {
+  poll_wait(w, p.pfd, p.fds, p.events, MAX_EVENTS, timeout_ms)
+}
+
+/// Closes the poller (watched sockets stay open).
+pub fn poller_close(w : World, p : Poller) -> Unit {
+  poll_close(w, p.pfd)
+}
+
+/// True when `mask` has every bit of `bit`.
+pub fn has_event(mask : Int, bit : Int) -> Bool {
+  (mask & bit) == bit
+}
+
+/// True for the would-block result of non-blocking IO.
+pub fn is_again(n : Int) -> Bool {
+  n == IO_AGAIN
+}
+
+/// Interest mask for a connection: always readable, writable only while output is queued.
+pub fn interest(want_read : Bool, want_write : Bool) -> Int {
+  let r = if want_read { EV_READ } else { 0 }
+  let wr = if want_write { EV_WRITE } else { 0 }
+  r | wr
+}
+
+/// `READ|WRITE|ERR`-style text for a ready mask (`-` when empty).
+pub fn describe_events(mask : Int) -> String {
+  let parts : Array[String] = []
+  if has_event(mask, EV_READ) {
+    parts.push("READ")
+  }
+  if has_event(mask, EV_WRITE) {
+    parts.push("WRITE")
+  }
+  if has_event(mask, EV_ERR) {
+    parts.push("ERR")
+  }
+  if parts.length() == 0 {
+    return "-"
+  }
+  parts.join("|")
+}
+
+/// Bytes queued for a non-blocking socket: `data[off..]` is still unsent.
+pub struct WriteQueue {
+  mut data : String
+  mut off : Int
+}
+
+pub fn write_queue_new() -> WriteQueue {
+  WriteQueue::{ data: "", off: 0 }
+}
+
+/// Unsent bytes.
+pub fn wq_pending(q : WriteQueue) -> Int {
+  q.data.length() - q.off
+}
+
+/// Appends `s`, dropping the bytes already sent so the queue never grows past
+/// what is unsent plus `s`.
+pub fn wq_push(q : WriteQueue, s : String) -> Unit {
+  if q.off >= q.data.length() {
+    q.data = s
+  } else if q.off == 0 {
+    q.data = q.data + s
+  } else {
+    q.data = q.data.slice(q.off, q.data.length()) + s
+  }
+  q.off = 0
+}
+
+/// Marks `n` more bytes as sent.
+pub fn wq_advance(q : WriteQueue, n : Int) -> Unit {
+  q.off = q.off + n
+  if q.off >= q.data.length() {
+    q.data = ""
+    q.off = 0
+  }
+}
+
+/// Sends queued bytes until the socket would block: `1` when everything was
+/// sent, `0` when bytes remain (wait for `EV_WRITE`), `-1` on a socket error.
+pub fn wq_flush(w : World, fd : Int, q : WriteQueue) -> Int {
+  while wq_pending(q) > 0 {
+    let n = tcp_write_nb(w, fd, q.data, q.off)
+    if n > 0 {
+      wq_advance(q, n)
+    } else if n == IO_AGAIN {
+      return 0
+    } else {
+      return -1
+    }
+  }
+  1
+}

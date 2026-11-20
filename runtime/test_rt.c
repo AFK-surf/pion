@@ -1,4 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
+#ifdef __APPLE__
+#define _DARWIN_C_SOURCE
+#endif
 
 #include "pion_rt.h"
 
@@ -8,6 +11,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <math.h>
@@ -2052,6 +2056,189 @@ static void test_tcp_loopback_mt(int argc, char **argv) {
     }
 }
 
+/* ============================================================================
+ * Non-blocking IO + kqueue/epoll event loop (deterministic: socketpair always,
+ * real 127.0.0.1 TCP when the host lets this binary reach loopback)
+ * ============================================================================ */
+
+static int32_t poll_one(void *w, int32_t pfd, void *fds, void *evs, int32_t timeout_ms,
+                        int32_t want_fd, int32_t *mask_out) {
+    int32_t n = pion_poll_wait(w, pfd, fds, evs, 64, timeout_ms);
+    assert(n >= 0 && pion_arr_len(fds) == n && pion_arr_len(evs) == n);
+    *mask_out = 0;
+    for (int32_t i = 0; i < n; i++) {
+        if ((int32_t)pion_arr_get(fds, i) == want_fd) {
+            /* kqueue's READ and WRITE filters must come back merged into one entry */
+            assert(*mask_out == 0);
+            *mask_out = (int32_t)pion_arr_get(evs, i);
+        }
+    }
+    return n;
+}
+
+static void test_event_loop_nb(int argc, char **argv) {
+    void *w = pion_world_init(argc, argv);
+    void *fds = pion_arr_new(0, 0);
+    void *evs = pion_arr_new(0, 0);
+    void *sb = pion_strbuf_new(16);
+    int32_t mask = 0;
+
+    /* Error paths */
+    assert(pion_poll_ctl(w, -1, 1, 0, 1) == 0);
+    assert(pion_poll_wait(w, -1, fds, evs, 8, 0) == -1);
+    assert(pion_tcp_set_nonblock(w, -1, 1) == 0);
+    assert(pion_tcp_accept_nb(w, -1) == -1);
+    assert(pion_tcp_read_nb(w, -1, sb, 16) == -1);
+    void *hello = pion_str_from_cstr("hello", 5);
+    assert(pion_tcp_write_nb(w, -1, hello, 0) == -1);
+    pion_poll_close(w, -1);
+
+    int32_t pfd = pion_poll_create(w);
+    assert(pfd >= 0);
+    assert(pion_poll_ctl(w, pfd, 9, 0, 1) == 0);
+
+    /* 1. socketpair: EAGAIN, readiness, read into StringBuilder */
+    int sv[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
+    int32_t a = sv[0], b = sv[1];
+    assert(pion_tcp_set_nonblock(w, a, 1) == 1 && pion_tcp_set_nonblock(w, b, 1) == 1);
+    assert((fcntl(a, F_GETFL, 0) & O_NONBLOCK) != 0);
+    assert(pion_tcp_set_nonblock(w, a, 0) == 1 && (fcntl(a, F_GETFL, 0) & O_NONBLOCK) == 0);
+    assert(pion_tcp_set_nonblock(w, a, 1) == 1);
+    assert(pion_tcp_write_nb(w, b, hello, 5) == 0);
+    assert(pion_tcp_write_nb(w, b, hello, -1) == -1);
+    assert(pion_poll_ctl(w, pfd, 1, a, 1) == 1);
+    assert(poll_one(w, pfd, fds, evs, 0, a, &mask) == 0);
+    assert(pion_tcp_read_nb(w, a, sb, 16) == -2);
+    assert(pion_tcp_write_nb(w, b, hello, 0) == 5);
+    assert(poll_one(w, pfd, fds, evs, -1, a, &mask) == 1 && (mask & 1));
+    assert(pion_tcp_read_nb(w, a, sb, 0) == 5);
+    assert(pion_tcp_read_nb(w, a, sb, 0) == -2);
+    assert(((PionStrBuf *)sb)->len == 5 && memcmp(((PionStrBuf *)sb)->data, "hello", 5) == 0);
+    assert(pion_tcp_write_nb(w, b, hello, 3) == 2); /* resume mid-string */
+    assert(pion_tcp_read_nb(w, a, sb, 1) == 1 && pion_tcp_read_nb(w, a, sb, 16) == 1);
+    assert(((PionStrBuf *)sb)->len == 7 && memcmp(((PionStrBuf *)sb)->data, "hellolo", 7) == 0);
+
+    /* 2. MOD to READ|WRITE: writable, not readable */
+    assert(pion_poll_ctl(w, pfd, 2, a, 3) == 1);
+    assert(poll_one(w, pfd, fds, evs, -1, a, &mask) == 1 && mask == 2);
+
+    /* 3. Partial writes of 4 MiB drained through EV_WRITE, interleaved with reads */
+    const int64_t big_len = 4 * 1024 * 1024;
+    char *raw = (char *)malloc((size_t)big_len);
+    assert(raw);
+    for (int64_t i = 0; i < big_len; i++) raw[i] = (char)('a' + (i * 7) % 26);
+    void *big = pion_str_from_cstr(raw, big_len);
+    void *rsb = pion_strbuf_new(64);
+    int32_t off = 0;
+    int partial = 0, again = 0;
+    assert(pion_poll_ctl(w, pfd, 1, b, 1) == 1);
+    while (off < big_len || ((PionStrBuf *)rsb)->len < big_len) {
+        int32_t n = pion_poll_wait(w, pfd, fds, evs, 64, -1);
+        assert(n > 0);
+        for (int32_t i = 0; i < n; i++) {
+            int32_t fd = (int32_t)pion_arr_get(fds, i);
+            int32_t m = (int32_t)pion_arr_get(evs, i);
+            if (fd == a && (m & 2) && off < big_len) {
+                int32_t wr = pion_tcp_write_nb(w, a, big, off);
+                assert(wr > 0 || wr == -2);
+                if (wr > 0) {
+                    off += wr;
+                    if (off < big_len) partial++;
+                } else {
+                    again++;
+                }
+                if (off == big_len) assert(pion_poll_ctl(w, pfd, 2, a, 1) == 1);
+            }
+            if (fd == b && (m & 1)) {
+                int32_t rd;
+                while ((rd = pion_tcp_read_nb(w, b, rsb, 16384)) > 0) {
+                }
+                assert(rd == -2);
+            }
+        }
+    }
+    assert(partial > 0);
+    assert(pion_tcp_write_nb(w, a, big, off) == 0);
+    assert(((PionStrBuf *)rsb)->len == big_len && memcmp(((PionStrBuf *)rsb)->data, raw, (size_t)big_len) == 0);
+
+    /* 4. DEL, then peer close: EOF reads 0, writes fail with -1 (no SIGPIPE) */
+    assert(pion_poll_ctl(w, pfd, 3, b, 0) == 1);
+    assert(pion_poll_ctl(w, pfd, 2, a, 1) == 1);
+    close(b);
+    assert(poll_one(w, pfd, fds, evs, -1, a, &mask) == 1 && (mask & 1));
+    assert(pion_tcp_read_nb(w, a, sb, 16) == 0);
+    assert(pion_tcp_write_nb(w, a, hello, 0) == -1);
+    assert(pion_poll_ctl(w, pfd, 3, a, 0) == 1);
+    assert(poll_one(w, pfd, fds, evs, 0, a, &mask) == 0);
+    close(a);
+
+    /* 5. TCP: SO_REUSEPORT listeners, non-blocking accept, TCP_NODELAY */
+    void *lo = pion_str_from_cstr("127.0.0.1", 9);
+    int32_t lfd = pion_tcp_listen_reuse(w, lo, 0);
+    assert(lfd >= 0);
+    int32_t port = pion_tcp_local_port(w, lfd);
+    assert(port > 0);
+    int32_t lfd2 = pion_tcp_listen_reuse(w, lo, port);
+    assert(lfd2 >= 0 && pion_tcp_local_port(w, lfd2) == port);
+    pion_tcp_close(w, lfd2);
+    errno = 0;
+    assert(pion_tcp_listen(w, lo, port) == -1 && errno == EADDRINUSE);
+    int use_tcp = tcp_loopback_probe(w, lfd, port) == 0;
+    assert(pion_tcp_set_nonblock(w, lfd, 1) == 1);
+    assert(pion_tcp_accept_nb(w, lfd) == -2);
+    if (use_tcp) {
+        assert(pion_poll_ctl(w, pfd, 1, lfd, 1) == 1);
+        int32_t cfd = pion_tcp_connect(w, lo, port);
+        assert(cfd >= 0);
+        assert(poll_one(w, pfd, fds, evs, -1, lfd, &mask) == 1 && (mask & 1));
+        int32_t afd = pion_tcp_accept_nb(w, lfd);
+        assert(afd >= 0);
+        assert(pion_tcp_accept_nb(w, lfd) == -2);
+        assert((fcntl(afd, F_GETFL, 0) & O_NONBLOCK) != 0);
+        int nd = 0;
+        socklen_t ndl = (socklen_t)sizeof(nd);
+        assert(getsockopt(afd, IPPROTO_TCP, TCP_NODELAY, &nd, &ndl) == 0 && nd != 0);
+        assert(pion_poll_ctl(w, pfd, 1, afd, 1) == 1);
+        void *ping = pion_str_from_cstr("ping", 4);
+        assert(pion_tcp_write(w, cfd, ping) == 4);
+        assert(poll_one(w, pfd, fds, evs, -1, afd, &mask) == 1 && (mask & 1));
+        pion_strbuf_reset(sb);
+        assert(pion_tcp_read_nb(w, afd, sb, 0) == 4);
+        assert(memcmp(((PionStrBuf *)sb)->data, "ping", 4) == 0);
+        assert(pion_tcp_write_nb(w, afd, hello, 0) == 5);
+        void *got = pion_tcp_read(w, cfd, 64);
+        assert(pion_str_eq(got, hello) == 1);
+        pion_tcp_close(w, cfd);
+        assert(poll_one(w, pfd, fds, evs, -1, afd, &mask) == 1 && (mask & 1));
+        assert(pion_tcp_read_nb(w, afd, sb, 0) == 0);
+        assert(pion_poll_ctl(w, pfd, 3, afd, 0) == 1);
+        pion_tcp_close(w, afd);
+        pion_rc_dec(got);
+        pion_rc_dec(ping);
+    }
+    pion_tcp_close(w, lfd);
+    pion_poll_close(w, pfd);
+
+    free(raw);
+    pion_rc_dec(big);
+    pion_rc_dec(rsb);
+    pion_rc_dec(lo);
+    pion_rc_dec(hello);
+    pion_rc_dec(sb);
+    pion_rc_dec(evs);
+    pion_rc_dec(fds);
+    pion_rc_dec(w);
+    printf("[PASS] event_loop_nb (%s; socketpair EAGAIN/merge/%d partial writes/EOF%s)\n",
+#if defined(__APPLE__)
+           "kqueue",
+#else
+           "epoll",
+#endif
+           partial, use_tcp ? "; 127.0.0.1 TCP accept_nb/TCP_NODELAY" : "; TCP blocked by host firewall");
+    (void)again;
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -2081,6 +2268,7 @@ int main(int argc, char **argv) {
     test_mt_slab_stress();
     test_mt_world_exec(argc, argv);
     test_tcp_loopback_mt(argc, argv);
+    test_event_loop_nb(argc, argv);
 
     if (run_bench) {
         run_slab_bench();

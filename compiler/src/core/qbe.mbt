@@ -8548,10 +8548,15 @@ fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal 
     qbe_rc_dec(g, owned_vals[i], owned_tys[i])
     i = i + 1
   }
-  if is_unit {
-    qval("0", TUnit)
-  } else {
-    qval(res, pr.ret_ty)
+  match pr.ret_ty {
+    TUnit => qval("0", TUnit)
+    // C returns `int32_t` 0/1; a Pion `Bool` lives in a 64-bit slot.
+    TBool => {
+      let rl = qbe_tmp(g)
+      qbe_emit(g, rl + " =l extuw " + res)
+      qval(rl, TBool)
+    }
+    _ => qval(res, pr.ret_ty)
   }
 }
 
