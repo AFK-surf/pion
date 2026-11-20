@@ -694,11 +694,38 @@ pub fn emit_file_stub(f : SourceFile) -> String {
 }
 
 ///|
+pub fn pkg_has_pub_bounded_fn(pkg : Package) -> Bool {
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) =>
+          if fd.is_pub && fd.type_bounds.length() > 0 {
+            return true
+          }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+///|
 /// Emit a minimal parseable `.m2` package stub preserving imports and all
 /// top-level declaration signatures (with `{ panic() }` / `= panic()` bodies)
 /// so downstream packages can typecheck against CAS-hit dependencies without
 /// re-parsing or typechecking upstream function bodies.
 pub fn emit_m2_stub(pkg : Package) -> String {
+  // A `pub` generic fn with trait bounds is monomorphized in the importing package
+  // from its body; a `{ panic() }` stub would be instantiated instead. Return "" so
+  // the driver loads this package from source.
+  if pkg_has_pub_bounded_fn(pkg) {
+    return ""
+  }
   let sb = StringBuilder()
   let seen_imports : Map[String, Bool] = Map([])
   let mut fi = 0

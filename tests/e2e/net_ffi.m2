@@ -1,0 +1,106 @@
+///| P13-A runtime primitives: FFI raw pointers / CStr, POSIX TCP and sleep_ms.
+///| `net_ffi --loopback` also runs a single-threaded 127.0.0.1 TCP exchange.
+
+fn loopback(world : World, lfd : Int, port : Int) -> Int {
+  let cfd = tcp_connect(world, "127.0.0.1", port)
+  if cfd < 0 {
+    return 20
+  }
+  if tcp_write(world, cfd, "ping-m2") != 7 {
+    return 21
+  }
+  let sfd = tcp_accept(world, lfd)
+  if sfd < 0 {
+    return 22
+  }
+  let got = tcp_read(world, sfd, 64)
+  if got != "ping-m2" {
+    return 23
+  }
+  if tcp_write(world, sfd, "pong:" + got) != 12 {
+    return 24
+  }
+  tcp_close(world, sfd)
+  let sb = StringBuilder()
+  while true {
+    let chunk = tcp_read(world, cfd, 4)
+    if chunk.length() == 0 {
+      break
+    }
+    sb.write_string(chunk)
+  }
+  tcp_close(world, cfd)
+  if sb.to_string() != "pong:ping-m2" {
+    return 25
+  }
+  io_println(world, "loopback ok")
+  0
+}
+
+pub fn main(world : World) -> Int {
+  // FFI raw pointers
+  let p = ptr_alloc(32L)
+  if ptr_is_null(p) {
+    return 1
+  }
+  ptr_write_i32(p, 0L, -7)
+  ptr_write_i64(p, 8L, 1234567890123L)
+  ptr_write_ptr(p, 16L, p)
+  if ptr_read_i32(p, 0L) != -7 {
+    return 2
+  }
+  if ptr_read_i64(p, 8L) != 1234567890123L {
+    return 3
+  }
+  if ptr_addr(ptr_read_ptr(p, 16L)) != ptr_addr(p) {
+    return 4
+  }
+  let q = ptr_offset(p, 24L)
+  if ptr_addr(q) != ptr_addr(p) + 24L {
+    return 5
+  }
+  // "m2!" + NUL, little-endian
+  ptr_write_i32(q, 0L, 0x0021326d)
+  let s = cstr_to_str(q)
+  if s != "m2!" || s.length() != 3 {
+    return 6
+  }
+  if cstr_to_str(ptr_null()) != "" {
+    return 7
+  }
+  ptr_free(p)
+  sleep_ms(world, 1)
+
+  // POSIX TCP error paths + ephemeral listen
+  if tcp_connect(world, "999.1.1.1", 80) != -1 {
+    return 10
+  }
+  if tcp_listen(world, "127.0.0.1", 70000) != -1 {
+    return 11
+  }
+  if tcp_local_port(world, -1) != -1 || tcp_accept(world, -1) != -1 {
+    return 12
+  }
+  if tcp_read(world, -1, 16) != "" || tcp_write(world, -1, "x") != -1 {
+    return 13
+  }
+  tcp_close(world, -1)
+  let lfd = tcp_listen(world, "127.0.0.1", 0)
+  if lfd < 0 {
+    return 14
+  }
+  let port = tcp_local_port(world, lfd)
+  if port <= 0 || port > 65535 {
+    return 15
+  }
+  let args = world_args(world)
+  if args.length() > 1 && args[1] == "--loopback" {
+    let rc = loopback(world, lfd, port)
+    if rc != 0 {
+      return rc
+    }
+  }
+  tcp_close(world, lfd)
+  io_println(world, "net_ffi ok")
+  0
+}

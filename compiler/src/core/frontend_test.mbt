@@ -964,3 +964,152 @@ test "p12a: trait errors E_UNKNOWN_TRAIT E_TRAIT_METHOD_MISSING E_TRAIT_METHOD_S
   assert_eq(cr4.diagnostics[0].code, "E_TRAIT_NOT_IMPLEMENTED")
   assert_eq(cr4.diagnostics[0].expected, "impl Show for Bare")
 }
+
+///|
+test "p13a: runtime primitives typecheck, World is explicit for TCP/sleep" {
+  let ok_src =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let p = ptr_alloc(16L)\n" +
+    "  ptr_write_i64(p, 0L, 7L)\n" +
+    "  ptr_write_i32(p, 8L, 3)\n" +
+    "  ptr_write_ptr(p, 8L, ptr_offset(p, 4L))\n" +
+    "  let s : String = cstr_to_str(ptr_read_ptr(p, 8L))\n" +
+    "  let a : Int64 = ptr_read_i64(p, 0L)\n" +
+    "  let b : Int = ptr_read_i32(p, 8L)\n" +
+    "  ptr_free(p)\n" +
+    "  let fd = tcp_listen(world, \"127.0.0.1\", 0)\n" +
+    "  let port : Int = tcp_local_port(world, fd)\n" +
+    "  let c = tcp_connect(world, \"127.0.0.1\", port)\n" +
+    "  let n : Int = tcp_write(world, c, s)\n" +
+    "  let r : String = tcp_read(world, tcp_accept(world, fd), 64)\n" +
+    "  tcp_close(world, c)\n" +
+    "  sleep_ms(world, 1)\n" +
+    "  a.to_int() + b + n + r.length()\n" +
+    "}\n"
+  let ok_cr = @core.check_source_files("p13a_prims", ["p13a_prims.m2"], [ok_src])
+  assert_true(ok_cr.diagnostics.length() == 0, "prims ok: " + @core.check_result_to_json(ok_cr.diagnostics))
+
+  // World in scope is not enough: TCP primitives take it as their first argument.
+  let no_w =
+    "pub fn main(world : World) -> Int {\n" +
+    "  tcp_listen(\"127.0.0.1\", 0)\n" +
+    "}\n"
+  let no_w_json = @core.check_result_to_json(
+    @core.check_source_files("p13a_now", ["p13a_now.m2"], [no_w]).diagnostics,
+  )
+  assert_true(str_contains(no_w_json, "E_CAPABILITY_MISSING"), "missing explicit World: " + no_w_json)
+
+  let pure_fn =
+    "pub fn f() -> Unit {\n" +
+    "  sleep_ms(5)\n" +
+    "}\n"
+  let pure_json = @core.check_result_to_json(
+    @core.check_source_files("p13a_pure", ["p13a_pure.m2"], [pure_fn]).diagnostics,
+  )
+  assert_true(str_contains(pure_json, "E_CAPABILITY_MISSING"), "sleep_ms without World: " + pure_json)
+
+  let bad_ty =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let p = ptr_alloc(8)\n" +
+    "  tcp_write(world, 1, 2)\n" +
+    "}\n"
+  let bad_json = @core.check_result_to_json(
+    @core.check_source_files("p13a_bad", ["p13a_bad.m2"], [bad_ty]).diagnostics,
+  )
+  assert_true(str_contains(bad_json, "argument 3 of `tcp_write` expects `String`"), "tcp_write arg type: " + bad_json)
+}
+
+///|
+test "p13a: cross-package trait impls are qualified on import" {
+  let lib_src =
+    "pub trait ToJson {\n" +
+    "  to_json(self : Self) -> String\n" +
+    "}\n" +
+    "pub struct Point {\n" +
+    "  x : Int\n" +
+    "}\n" +
+    "impl ToJson for Int {\n" +
+    "  fn to_json(self : Int) -> String { self.to_string() }\n" +
+    "}\n" +
+    "impl ToJson for Point {\n" +
+    "  fn to_json(self : Point) -> String { \"P\" + self.x.to_string() }\n" +
+    "}\n" +
+    "pub fn encode[T : ToJson](v : T) -> String {\n" +
+    "  \"<\" + v.to_json() + \">\"\n" +
+    "}\n"
+  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.m2"], [lib_src], [], true)
+  assert_true(lib_cr.diagnostics.length() == 0, "lib check")
+  // A package exporting a bounded generic fn has no body-less stub.
+  assert_true(@core.emit_m2_stub(lib_cr.pkg) == "", "bounded pub fn disables the stub")
+  let lib_imp = @core.imported_pkg_new("lib", lib_cr.tc)
+  let app_src =
+    "import \"lib\" as l\n" +
+    "pub fn main() -> Int {\n" +
+    "  let p = l::Point::{ x: 3 }\n" +
+    "  let a = p.to_json()\n" +
+    "  let b = (4).to_json()\n" +
+    "  let c = l::encode(p) + l::encode(5)\n" +
+    "  a.length() + b.length() + c.length()\n" +
+    "}\n"
+  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_src], [lib_imp], true)
+  assert_true(
+    app_cr.diagnostics.length() == 0,
+    "app check: " + @core.check_result_to_json(app_cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_multi(app_cr.pkg, app_cr.tc, false, true, ["lib"]).ssa
+  let lib_ssa = @core.emit_qbe_package_multi(lib_cr.pkg, lib_cr.tc, false, false, []).ssa
+  // Definition and cross-package call sites agree on the impl symbol names.
+  assert_true(lib_ssa.contains("impl_ToJson_Point_to_json("), "lib defines Point impl")
+  assert_true(lib_ssa.contains("impl_ToJson_Int_to_json("), "lib defines Int impl")
+  assert_true(ssa.contains("impl_ToJson_Point_to_json("), "app calls Point impl")
+  assert_true(ssa.contains("impl_ToJson_Int_to_json("), "app calls Int impl")
+  assert_true(!ssa.contains("impl_lib__ToJson"), "no package-qualified impl symbol")
+
+  let bad_src =
+    "import \"lib\" as l\n" +
+    "pub fn main() -> Int {\n" +
+    "  l::encode(true).length()\n" +
+    "}\n"
+  let bad_json = @core.check_result_to_json(
+    @core.check_source_files_with_imports("app", ["app.m2"], [bad_src], [lib_imp], true).diagnostics,
+  )
+  assert_true(str_contains(bad_json, "E_TRAIT_NOT_IMPLEMENTED"), "Bool has no ToJson impl: " + bad_json)
+}
+
+///|
+test "p13a: m2.toml [link] libs and doc json" {
+  let toml =
+    "[package]\n" +
+    "name = \"db\"\n" +
+    "[link]\n" +
+    "libs = [\"sqlite3\", \"z\", \"sqlite3\"]\n" +
+    "lib = \"m\"\n"
+  match @core.parse_m2_toml(toml) {
+    Ok(m) => {
+      assert_true(m.link_libs.length() == 3, "3 unique libs")
+      assert_true(m.link_libs[0] == "sqlite3" && m.link_libs[1] == "z" && m.link_libs[2] == "m", "lib order")
+    }
+    Err(e) => abort("parse_m2_toml failed: " + e)
+  }
+  match @core.parse_m2_toml("[package]\nname = \"x\"\n[link]\nlibs = [sqlite3]\n") {
+    Ok(_) => abort("unquoted lib must fail")
+    Err(e) => assert_true(str_contains(e, "m2.toml line 4"), "error line: " + e)
+  }
+  let src =
+    "pub struct P {\n  pub x : Int\n}\n" +
+    "pub trait T {\n  t(self : Self) -> Int\n}\n" +
+    "impl T for P {\n  fn t(self : P) -> Int { self.x }\n}\n" +
+    "pub let K : Int = 1\n" +
+    "fn hidden() -> Int { 0 }\n" +
+    "pub fn get(p : P) -> Int { p.x }\n"
+  let pkg = @core.parse_package("docpkg", ["d.m2"], [src])
+  let j = @core.doc_packages_json([pkg])
+  assert_true(str_contains(j, "{\"packages\":[{\"name\":\"docpkg\",\"items\":["), "doc json head: " + j)
+  assert_true(str_contains(j, "\"kind\":\"struct\",\"name\":\"P\""), "struct item")
+  assert_true(str_contains(j, "\"kind\":\"impl\",\"name\":\"T for P\""), "impl item")
+  assert_true(str_contains(j, "\"kind\":\"const\",\"name\":\"K\""), "const item")
+  assert_true(str_contains(j, "\"sig\":\"fn get(p: P) -> Int\""), "fn sig")
+  assert_true(!str_contains(j, "hidden"), "private fn omitted")
+  let t = @core.doc_package_text(pkg)
+  assert_true(str_contains(t, "package docpkg\n  struct P { x: Int }\n"), "doc text: " + t)
+}

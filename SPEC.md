@@ -23,14 +23,18 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 4. **Explicit Capability (`World`, Vercel Zero rule)**:
    - Pure functions cannot perform IO, read wall clock, spawn OS processes, or touch the filesystem unless a `World` (or sub-capability) parameter is explicitly in scope.
    - Entry point: `pub fn main(world : World) -> Int` (or `fn main() -> Unit` in pure test mode). Calling IO builtins (`io_println`, `fs_read`, `fs_write`, `clock_now_ms`, `proc_exec`, `env_get`, `args_get`) without a `World` value in scope is a compile-time error (`E_CAPABILITY_MISSING`).
+   - Network and time primitives (`tcp_listen`, `tcp_local_port`, `tcp_accept`, `tcp_connect`, `tcp_read`, `tcp_write`, `tcp_close`, `sleep_ms`) take the `World` value as their **explicit first argument**; a `World` merely in scope is not enough (`E_CAPABILITY_MISSING`).
 5. **Agent-First Compiler Interface**:
    - `m2c check --json <path>` — compact JSON diagnostics (`file`, `line`, `col`, `code`, `message`, `expected`, `found`, `fixit`), one object per diagnostic inside `{"ok":bool,"diagnostics":[...]}`.
    - `m2c query defs|sig|callers|deps --json <path>` — structured symbol table, exported signatures, call graph, and package dependency graph.
+   - `m2c doc [--json] <path>` — the public API (every `pub` struct/enum/trait/extern fn/fn/const and every `impl`) of a file, directory or whole `m2.toml` workspace in one call (§5.4).
    - Contracts: `debug_assert(cond, msg)` — active in dev/test builds, stripped to 0 bytes in `--release`.
 6. **Sub-150ms Incremental Compile, Tiny Binaries, Zero `target/`**:
    - Package-level separate compilation via `.m2sig` compact interface files: editing a function body without changing its `pub` signature yields 100% cache hit on downstream packages.
    - **Global Content-Addressed Cache** (`$M2_CACHE_DIR`, default `~/.cache/m2/cas`), LRU-evicted (`$M2_CACHE_MAX_MB`, default 2048). **NEVER writes a `target/` or `_build/` directory inside the source tree.**
-   - **Dev backend**: emits per-package **QBE IL** → vendored `qbe` → system `as` + `ld` + prebuilt `<40 KB` `libm2rt.a`. Zero `clang` C-parsing overhead!
+   - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly (Mach-O arm64 for `arm64_apple`, ELF64 x86-64 for `amd64_sysv`; no `as`) → `ld`/`cc` + prebuilt `<64 KB` `libm2rt.a`. `--emit-asm` or `M2_NO_DIRECT_OBJ=1` falls back to `qbe` text + `as`.
+   - **Cross objects**: `m2c build --target arm64_apple|amd64_sysv --emit-obj <out.o> <input>` writes the single-package object for that target and skips linking (e.g. an ELF64 x86-64 `.o` from macOS with no extra toolchain).
+   - **Native libraries**: `-l <lib>` / `-l<lib>` / `--link <lib>` on `build`/`run`/`test`, plus `[link] libs = [...]` in `m2.toml` (dependencies first, de-duplicated) add `-l<lib>` to the link; the list is part of the binary's cache key.
    - **Release backend** (`--release`): emits clean per-package C or LLVM IR compiled with `-O2`, stripping `debug_assert`.
 
 ---
@@ -114,6 +118,8 @@ test "test name" {
 - `pub` marks items exported in `.m2sig` and accessible from downstream packages via `alias::symbol`. Referencing a non-`pub` symbol from an imported package is a compile-time error (`E_PRIVATE_SYMBOL`).
 - `val struct` asserts at compile time that the struct has zero `mut` fields and every field is `Send`.
 - `test "name" { ... }` blocks are type-checked by `m2c check`, omitted (0 bytes) by `m2c build`, and compiled with active `debug_assert` by `m2c test [--json] [--filter <substr>] <path>`.
+- Files named `*_test.m2` belong to their package only under `m2c test` (the root package of a workspace, or a directory target); `check`, `build` and `run` skip them.
+- A struct field may be written `pub name : Type` (MoonBit compatibility); the fields of a `pub struct` are always visible to importers.
 
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
@@ -293,6 +299,25 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void*   m2_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out);` (`proc_exec_capture -> Result[String, String]`; `Ok(stdout)` if exit code == 0, else `Err("exit <code>: <stdout>")`)
 - `void*   m2_sha256_hex(void *s);` (pure SHA-256 hex digest for CAS cache keys!)
 
+**FFI raw pointers & C strings (no `World`; compiler builtins → direct calls):**
+- `void*   m2_ptr_alloc(int64_t bytes);` (`ptr_alloc(bytes : Int64) -> Ptr`, zeroed)
+- `void    m2_ptr_free(void *p);` (`ptr_free(p : Ptr) -> Unit`)
+- `void*   m2_ptr_offset(void *p, int64_t off);` (`ptr_offset(p : Ptr, off : Int64) -> Ptr`)
+- `void*   m2_ptr_read_ptr(void *p, int64_t off);` / `void m2_ptr_write_ptr(void *p, int64_t off, void *v);` (`ptr_read_ptr` / `ptr_write_ptr`)
+- `int32_t m2_ptr_read_i32(void *p, int64_t off);` / `void m2_ptr_write_i32(void *p, int64_t off, int32_t v);` (`ptr_read_i32 -> Int` / `ptr_write_i32`)
+- `int64_t m2_ptr_read_i64(void *p, int64_t off);` / `void m2_ptr_write_i64(void *p, int64_t off, int64_t v);` (`ptr_read_i64 -> Int64` / `ptr_write_i64`)
+- `void*   m2_cstr_to_str(void *cstr);` (`cstr_to_str(p : Ptr) -> String`, owned copy; `""` for NULL)
+
+**POSIX TCP & time (explicit `World` first argument; IPv4, `"localhost"` = `127.0.0.1`; `-1` on error with `errno` preserved):**
+- `int32_t m2_tcp_listen(void *w, void *host, int32_t port);` (`tcp_listen(w, host : String, port : Int) -> Int`; `""`/`"0.0.0.0"` = any, port 0 = ephemeral)
+- `int32_t m2_tcp_local_port(void *w, int32_t fd);` (`tcp_local_port(w, fd : Int) -> Int`)
+- `int32_t m2_tcp_accept(void *w, int32_t listen_fd);` (`tcp_accept(w, listen_fd : Int) -> Int`)
+- `int32_t m2_tcp_connect(void *w, void *host, int32_t port);` (`tcp_connect(w, host : String, port : Int) -> Int`)
+- `void*   m2_tcp_read(void *w, int32_t fd, int32_t max_bytes);` (`tcp_read(w, fd : Int, max_bytes : Int) -> String`; `""` at EOF or error)
+- `int32_t m2_tcp_write(void *w, int32_t fd, void *data);` (`tcp_write(w, fd : Int, data : String) -> Int`, bytes written; writes all or returns `-1`)
+- `void    m2_tcp_close(void *w, int32_t fd);` (`tcp_close(w, fd : Int) -> Unit`)
+- `void    m2_sleep_ms(void *w, int32_t ms);` (`sleep_ms(w, ms : Int) -> Unit`)
+
 ---
 
 ## 5. Agent JSON Protocols
@@ -330,6 +355,10 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
   - `E_IMPORT_CYCLE`: cyclic package dependency detected across `m2.toml` manifests.
   - `E_UNKNOWN_PACKAGE`: importing or depending on an undeclared package.
 
+### 5.4 `m2c doc [--json] <path>`
+- `{"packages":[{"name":"json","items":[{"kind":"struct|enum|trait|impl|extern_fn|fn|const","name":"...","sig":"...","file":"...","line":3}]}]}` — one entry per package (workspace: dependencies first); `impl` items are always listed, everything else only when `pub`.
+- Without `--json`: `package <name>` followed by one indented signature per item.
+
 ---
 
 ## 6. Global Content-Addressed Cache (CAS) & `m2.toml` Contract
@@ -342,7 +371,11 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 
   [dependencies]
   math = { path = "../math" }
+
+  [link]
+  libs = ["sqlite3"]   # or: lib = "sqlite3"
   ```
+- **Cross-package traits**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. A package exporting a `pub` generic fn with trait bounds has no `.m2stub` (importers monomorphize from its source).
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.m2sig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.m2sig` yields 100% CAS hit on downstream `.o` files.
 - **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(M2_COMPILER_ABI_REV | qbe_size | libm2rt_size | M2_CACHE_SALT)`, ensuring compiler/backend upgrades automatically invalidate stale cache entries.
 - Default directory: `$M2_CACHE_DIR` or `$HOME/.cache/m2/cas`

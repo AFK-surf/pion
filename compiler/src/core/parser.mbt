@@ -459,6 +459,14 @@ fn p_parse_struct_decl(
       }
       _ => {
         let fspan = p_peek(p).span
+        // `pub` on a field is accepted for MoonBit compatibility: the fields of a
+        // `pub struct` are always visible to importers.
+        match p_peek(p).kind {
+          KwPub => {
+            let _ = p_advance(p)
+          }
+          _ => ()
+        }
         let mut is_mut = false
         match p_peek(p).kind {
           KwMut => {

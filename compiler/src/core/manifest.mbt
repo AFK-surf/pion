@@ -11,6 +11,7 @@ pub struct PackageManifest {
   name : String
   version : String
   deps : Array[ManifestDep]
+  link_libs : Array[String]
 }
 
 ///|
@@ -20,6 +21,7 @@ pub struct PkgNodeInput {
   deps : Array[String]
   paths : Array[String]
   sources : Array[String]
+  link_libs : Array[String]
 }
 
 ///|
@@ -30,7 +32,14 @@ pub fn pkg_node_input_new(
   paths : Array[String],
   sources : Array[String],
 ) -> PkgNodeInput {
-  PkgNodeInput::{ name: name, dir: dir, deps: deps, paths: paths, sources: sources }
+  PkgNodeInput::{
+    name: name,
+    dir: dir,
+    deps: deps,
+    paths: paths,
+    sources: sources,
+    link_libs: [],
+  }
 }
 
 ///|
@@ -187,12 +196,67 @@ fn toml_parse_dep_path(rhs : String) -> Result[String, String] {
 }
 
 ///|
+/// Parses a TOML string array `["a", "b"]` (or a single quoted string).
+fn toml_parse_str_array(rhs : String) -> Result[Array[String], String] {
+  let s = toml_trim(rhs)
+  let out : Array[String] = []
+  if s.length() >= 2 && str_code_at(s, 0) == 34 {
+    match toml_unquote(s) {
+      Ok(v) => out.push(v)
+      Err(e) => return Err(e)
+    }
+    return Ok(out)
+  }
+  if s.length() < 2 ||
+    str_code_at(s, 0) != 91 ||
+    str_code_at(s, s.length() - 1) != 93 {
+    return Err("expected `[\"...\", ...]`, found `" + s + "`")
+  }
+  let inner = slice_str(s, 1, s.length() - 1)
+  let ilen = inner.length()
+  let mut pos = 0
+  while pos < ilen {
+    let comma = toml_find_char(inner, 44, pos)
+    let end_p = if comma < 0 { ilen } else { comma }
+    let entry = toml_trim(slice_str(inner, pos, end_p))
+    if entry.length() > 0 {
+      match toml_unquote(entry) {
+        Ok(v) => out.push(v)
+        Err(e) => return Err(e)
+      }
+    }
+    if comma < 0 {
+      break
+    }
+    pos = comma + 1
+  }
+  Ok(out)
+}
+
+///|
+/// Appends `lib` to `libs` unless already present (keeps first-seen order).
+pub fn push_unique_lib(libs : Array[String], lib : String) -> Unit {
+  if lib.length() == 0 {
+    return
+  }
+  let mut i = 0
+  while i < libs.length() {
+    if libs[i] == lib {
+      return
+    }
+    i = i + 1
+  }
+  libs.push(lib)
+}
+
+///|
 pub fn parse_m2_toml(text : String) -> Result[PackageManifest, String] {
   let lines = split_lines(text)
   let mut section = ""
   let mut pkg_name = ""
   let mut version = "0.1.0"
   let deps : Array[ManifestDep] = []
+  let link_libs : Array[String] = []
   let mut i = 0
   while i < lines.length() {
     let clean = toml_trim(toml_strip_comment(lines[i]))
@@ -231,13 +295,31 @@ pub fn parse_m2_toml(text : String) -> Result[PackageManifest, String] {
         Ok(p) => deps.push(ManifestDep::{ name: key, path: p })
         Err(e) => return Err("m2.toml line " + (i + 1).to_string() + ": " + e)
       }
+    } else if section == "link" {
+      if key == "libs" || key == "lib" {
+        match toml_parse_str_array(raw_val) {
+          Ok(vs) => {
+            let mut vi = 0
+            while vi < vs.length() {
+              push_unique_lib(link_libs, vs[vi])
+              vi = vi + 1
+            }
+          }
+          Err(e) => return Err("m2.toml line " + (i + 1).to_string() + ": " + e)
+        }
+      }
     }
     i = i + 1
   }
   if pkg_name.length() == 0 {
     return Err("m2.toml: missing `[package]` `name = \"...\"`")
   }
-  Ok(PackageManifest::{ name: pkg_name, version: version, deps: deps })
+  Ok(PackageManifest::{
+    name: pkg_name,
+    version: version,
+    deps: deps,
+    link_libs: link_libs,
+  })
 }
 
 ///|

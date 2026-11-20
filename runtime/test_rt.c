@@ -2,8 +2,14 @@
 
 #include "m2_rt.h"
 
+#include <arpa/inet.h>
 #include <assert.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <inttypes.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <sys/socket.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1648,55 +1654,75 @@ static void test_ffi_ptr_and_cstr(void) {
 
 typedef struct TcpServerEnv {
     void *w;
-    int32_t listen_fd;
+    int32_t listen_fd; /* >= 0: accept n_clients connections; < 0: serve fixed_fd */
+    int32_t fixed_fd;
     int32_t n_clients;
     void *handled_cnt;
 } TcpServerEnv;
 
 typedef struct TcpClientEnv {
     void *w;
-    int32_t port;
+    int32_t port;      /* > 0: m2_tcp_connect to 127.0.0.1/localhost; 0: use fixed_fd */
+    int32_t fixed_fd;
     int32_t client_id;
     void *ok_cnt;
 } TcpClientEnv;
 
+/* Reads a 15-byte request, replies "echo:<req>" and closes (EOF for the peer). */
+static void tcp_echo_serve(void *w, int32_t cfd) {
+    void *sb = m2_strbuf_new(32);
+    int64_t got = 0;
+    while (got < 15) {
+        void *chunk = m2_tcp_read(w, cfd, 64);
+        int64_t clen = m2_str_len(chunk);
+        if (clen == 0) {
+            m2_rc_dec(chunk);
+            break;
+        }
+        m2_strbuf_push_str(sb, chunk);
+        got += clen;
+        m2_rc_dec(chunk);
+    }
+    void *req = m2_strbuf_to_str(sb);
+    m2_rc_dec(sb);
+    void *prefix = m2_str_from_cstr("echo:", 5);
+    void *resp = m2_str_concat(prefix, req);
+    int32_t nw = m2_tcp_write(w, cfd, resp);
+    assert(nw == (int32_t)m2_str_len(resp));
+    m2_tcp_close(w, cfd);
+    m2_rc_dec(req);
+    m2_rc_dec(prefix);
+    m2_rc_dec(resp);
+}
+
 static void tcp_server_worker(void *env_ptr) {
     TcpServerEnv *env = (TcpServerEnv *)env_ptr;
+    if (env->listen_fd < 0) {
+        tcp_echo_serve(env->w, env->fixed_fd);
+        m2_atomic_fetch_add(env->handled_cnt, 1);
+        return;
+    }
     for (int32_t i = 0; i < env->n_clients; i++) {
         int32_t cfd = m2_tcp_accept(env->w, env->listen_fd);
         assert(cfd >= 0);
-        void *sb = m2_strbuf_new(32);
-        int64_t got = 0;
-        while (got < 15) {
-            void *chunk = m2_tcp_read(env->w, cfd, 64);
-            int64_t clen = m2_str_len(chunk);
-            if (clen == 0) {
-                m2_rc_dec(chunk);
-                break;
-            }
-            m2_strbuf_push_str(sb, chunk);
-            got += clen;
-            m2_rc_dec(chunk);
-        }
-        void *req = m2_strbuf_to_str(sb);
-        m2_rc_dec(sb);
-        void *prefix = m2_str_from_cstr("echo:", 5);
-        void *resp = m2_str_concat(prefix, req);
-        int32_t nw = m2_tcp_write(env->w, cfd, resp);
-        assert(nw == (int32_t)m2_str_len(resp));
-        m2_tcp_close(env->w, cfd);
-        m2_rc_dec(req);
-        m2_rc_dec(prefix);
-        m2_rc_dec(resp);
+        tcp_echo_serve(env->w, cfd);
         m2_atomic_fetch_add(env->handled_cnt, 1);
     }
 }
 
 static void tcp_client_worker(void *env_ptr) {
     TcpClientEnv *env = (TcpClientEnv *)env_ptr;
-    void *host = m2_str_from_cstr((env->client_id & 1) ? "localhost" : "127.0.0.1", -1);
-    int32_t fd = m2_tcp_connect(env->w, host, env->port);
-    m2_rc_dec(host);
+    int32_t fd = env->fixed_fd;
+    if (env->port > 0) {
+        void *host = m2_str_from_cstr((env->client_id & 1) ? "localhost" : "127.0.0.1", -1);
+        fd = m2_tcp_connect(env->w, host, env->port);
+        int err = errno;
+        m2_rc_dec(host);
+        if (fd < 0) {
+            fprintf(stderr, "tcp_client_worker %d: connect failed errno=%d (%s)\n",
+                    (int)env->client_id, err, strerror(err));
+        }
+    }
     assert(fd >= 0);
 
     char msg_buf[32];
@@ -1729,6 +1755,51 @@ static void tcp_client_worker(void *env_ptr) {
     m2_atomic_fetch_add(env->ok_cnt, 1);
 }
 
+/* Probes a 127.0.0.1 TCP connection to `port` with a 200 ms non-blocking connect.
+ * Returns 0 when connected (the probe is accepted and closed on lfd), or the errno
+ * that stopped it (ETIMEDOUT when nothing answered within 200 ms). */
+static int tcp_loopback_probe(void *w, int32_t lfd, int32_t port) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    int fl = fcntl(fd, F_GETFL, 0);
+    assert(fl >= 0 && fcntl(fd, F_SETFL, fl | O_NONBLOCK) == 0);
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+#ifdef __APPLE__
+    addr.sin_len = (uint8_t)sizeof(addr);
+#endif
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons((uint16_t)port);
+    assert(inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) == 1);
+    int err = 0;
+    if (connect(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0) {
+        err = errno;
+        if (err == EINPROGRESS) {
+            struct pollfd pfd;
+            pfd.fd = fd;
+            pfd.events = POLLOUT;
+            pfd.revents = 0;
+            int pr;
+            do {
+                pr = poll(&pfd, 1, 200);
+            } while (pr < 0 && errno == EINTR);
+            if (pr == 0) {
+                err = ETIMEDOUT;
+            } else {
+                socklen_t len = (socklen_t)sizeof(err);
+                assert(pr > 0 && getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) == 0);
+            }
+        }
+    }
+    close(fd);
+    if (err == 0) {
+        int32_t pfd = m2_tcp_accept(w, lfd);
+        assert(pfd >= 0);
+        m2_tcp_close(w, pfd);
+    }
+    return err;
+}
+
 static void test_tcp_loopback_mt(int argc, char **argv) {
     void *w = m2_world_init(argc, argv);
 
@@ -1737,37 +1808,69 @@ static void test_tcp_loopback_mt(int argc, char **argv) {
     assert(m2_tcp_accept(w, -1) == -1);
     void *bad_host = m2_str_from_cstr("999.999.999.999", -1);
     assert(m2_tcp_connect(w, bad_host, 80) == -1);
+    assert(m2_tcp_listen(w, bad_host, 0) == -1);
     m2_rc_dec(bad_host);
+    void *lo_host = m2_str_from_cstr("127.0.0.1", 9);
+    assert(m2_tcp_listen(w, lo_host, 70000) == -1);
+    assert(m2_tcp_connect(w, lo_host, 0) == -1);
     m2_tcp_close(w, -1);
     m2_sleep_ms(w, 0);
     m2_sleep_ms(w, 1);
 
     /* Bind ephemeral port on 127.0.0.1 */
-    void *bind_host = m2_str_from_cstr("127.0.0.1", 9);
-    int32_t lfd = m2_tcp_listen(w, bind_host, 0);
-    m2_rc_dec(bind_host);
+    int32_t lfd = m2_tcp_listen(w, lo_host, 0);
     assert(lfd >= 0);
     int32_t port = m2_tcp_local_port(w, lfd);
     assert(port > 0 && port <= 65535);
 
+    /* Binding the same port again without SO_REUSEPORT must fail with errno preserved. */
+    errno = 0;
+    assert(m2_tcp_listen(w, lo_host, port) == -1);
+    assert(errno == EADDRINUSE);
+    m2_rc_dec(lo_host);
+
     const int32_t N_CLIENTS = 4;
+    int probe_err = tcp_loopback_probe(w, lfd, port);
+    int use_tcp = probe_err == 0;
+    if (!use_tcp) {
+        if (probe_err != ETIMEDOUT && probe_err != EPERM && probe_err != EACCES) {
+            fprintf(stderr, "FAIL: 127.0.0.1:%d loopback probe errno=%d (%s)\n", (int)port,
+                    probe_err, strerror(probe_err));
+            assert(0 && "unexpected loopback TCP error");
+        }
+        printf("NOTE: host firewall blocks 127.0.0.1 TCP for this unsigned binary "
+               "(probe errno=%d %s); running the 4-way concurrent read/write/close "
+               "test over socketpair(AF_UNIX) instead\n",
+               probe_err, strerror(probe_err));
+    }
+
+    int sv[4][2];
     void *handled_cnt = m2_atomic_new(0);
     void *ok_cnt = m2_atomic_new(0);
-
-    TcpServerEnv *senv = (TcpServerEnv *)m2_alloc((uint32_t)sizeof(TcpServerEnv), M2_TAG_STRUCT, NULL);
-    senv->w = w;
-    senv->listen_fd = lfd;
-    senv->n_clients = N_CLIENTS;
-    senv->handled_cnt = handled_cnt;
+    TcpServerEnv *senvs[4];
+    TcpClientEnv *cenvs[4];
+    int32_t n_servers = use_tcp ? 1 : N_CLIENTS;
+    for (int32_t i = 0; i < n_servers; i++) {
+        if (!use_tcp) {
+            assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i]) == 0);
+        }
+        senvs[i] = (TcpServerEnv *)m2_alloc((uint32_t)sizeof(TcpServerEnv), M2_TAG_STRUCT, NULL);
+        senvs[i]->w = w;
+        senvs[i]->listen_fd = use_tcp ? lfd : -1;
+        senvs[i]->fixed_fd = use_tcp ? -1 : (int32_t)sv[i][0];
+        senvs[i]->n_clients = N_CLIENTS;
+        senvs[i]->handled_cnt = handled_cnt;
+    }
 
     void *scope = m2_scope_begin();
-    m2_scope_spawn(scope, tcp_server_worker, senv);
-
-    TcpClientEnv *cenvs[4];
+    for (int32_t i = 0; i < n_servers; i++) {
+        m2_scope_spawn(scope, tcp_server_worker, senvs[i]);
+    }
     for (int32_t i = 0; i < N_CLIENTS; i++) {
         cenvs[i] = (TcpClientEnv *)m2_alloc((uint32_t)sizeof(TcpClientEnv), M2_TAG_STRUCT, NULL);
         cenvs[i]->w = w;
-        cenvs[i]->port = port;
+        cenvs[i]->port = use_tcp ? port : 0;
+        cenvs[i]->fixed_fd = use_tcp ? -1 : (int32_t)sv[i][1];
         cenvs[i]->client_id = i;
         cenvs[i]->ok_cnt = ok_cnt;
         m2_scope_spawn(scope, tcp_client_worker, cenvs[i]);
@@ -1778,14 +1881,22 @@ static void test_tcp_loopback_mt(int argc, char **argv) {
     assert(m2_atomic_load(ok_cnt) == N_CLIENTS);
 
     m2_tcp_close(w, lfd);
-    m2_rc_dec(senv);
+    for (int32_t i = 0; i < n_servers; i++) {
+        m2_rc_dec(senvs[i]);
+    }
     for (int32_t i = 0; i < N_CLIENTS; i++) {
         m2_rc_dec(cenvs[i]);
     }
     m2_rc_dec(handled_cnt);
     m2_rc_dec(ok_cnt);
     m2_rc_dec(w);
-    printf("[PASS] tcp_loopback_mt (%d concurrent clients on port %d)\n", (int)N_CLIENTS, (int)port);
+    if (use_tcp) {
+        printf("[PASS] tcp_loopback_mt (%d concurrent TCP clients on 127.0.0.1:%d)\n",
+               (int)N_CLIENTS, (int)port);
+    } else {
+        printf("[PASS] tcp_loopback_mt (socketpair fallback: %d concurrent read/write/close pairs)\n",
+               (int)N_CLIENTS);
+    }
 }
 
 int main(int argc, char **argv) {

@@ -286,14 +286,27 @@ fn qbe_impl_method_sym(
   } else {
     ""
   }
+  // Package-local (unqualified) names, so the defining package and every importer
+  // (which sees `pkg::Trait` / `pkg::Type`) agree on the symbol.
   "$m2_" +
   prefix +
   "impl_" +
-  qbe_sanitize_sym(trait_name) +
+  qbe_sanitize_sym(qbe_last_qual_seg(trait_name)) +
   "_" +
-  qbe_sanitize_sym(target_type) +
+  qbe_sanitize_sym(qbe_last_qual_seg(target_type)) +
   "_" +
   method_name
+}
+
+///|
+fn qbe_last_qual_seg(s : String) -> String {
+  let mut rest = s
+  let mut qp = split_qual_name(rest)
+  while qp.prefix.length() > 0 {
+    rest = qp.name
+    qp = split_qual_name(rest)
+  }
+  rest
 }
 
 ///|
@@ -8005,6 +8018,87 @@ fn qbe_emit_extern_fn_call(
 }
 
 ///|
+fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal {
+  let can_borrow = !qbe_args_have_assign(args)
+  let off = if pr.world { 1 } else { 0 }
+  let call_args : Array[String] = []
+  let call_abis : Array[String] = []
+  let owned_vals : Array[String] = []
+  let owned_tys : Array[Ty] = []
+  let mut i = 0
+  while i < args.length() {
+    let pty = if i < off {
+      TWorld
+    } else if i - off < pr.param_tys.length() {
+      pr.param_tys[i - off]
+    } else {
+      TInt64
+    }
+    let av = qbe_emit_arg_maybe_borrow(g, args[i], Some(pty), can_borrow)
+    if !av.borrowed && qbe_is_obj_ty(av.qv.ty) {
+      owned_vals.push(av.qv.reg)
+      owned_tys.push(av.qv.ty)
+    }
+    let cabi = qbe_c_abi_ty(pty)
+    let src_abi = qbe_abi_ty(av.qv.ty)
+    let carg = if src_abi == cabi {
+      av.qv.reg
+    } else if cabi == "w" && src_abi == "l" {
+      let w = qbe_tmp(g)
+      qbe_emit(g, w + " =w copy " + av.qv.reg)
+      w
+    } else if cabi == "l" && src_abi == "w" {
+      let l = qbe_tmp(g)
+      qbe_emit(g, l + " =l extsw " + av.qv.reg)
+      l
+    } else {
+      qbe_coerce_val(g, av.qv, pty)
+    }
+    call_args.push(carg)
+    call_abis.push(cabi)
+    i = i + 1
+  }
+  let is_unit = match pr.ret_ty {
+    TUnit => true
+    _ => false
+  }
+  let sb = StringBuilder()
+  let res = if is_unit { "" } else { qbe_tmp(g) }
+  if !is_unit {
+    sb.write_string(res)
+    sb.write_string(" =")
+    sb.write_string(qbe_c_abi_ty(pr.ret_ty))
+    sb.write_string(" ")
+  }
+  sb.write_string("call $")
+  sb.write_string(pr.c_sym)
+  sb.write_string("(")
+  i = 0
+  while i < call_args.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(call_abis[i])
+    sb.write_string(" ")
+    sb.write_string(call_args[i])
+    i = i + 1
+  }
+  sb.write_string(")")
+  qbe_emit(g, sb.to_string())
+  g.block_immut_fields = Map([])
+  i = 0
+  while i < owned_vals.length() {
+    qbe_rc_dec(g, owned_vals[i], owned_tys[i])
+    i = i + 1
+  }
+  if is_unit {
+    qval("0", TUnit)
+  } else {
+    qval(res, pr.ret_ty)
+  }
+}
+
+///|
 fn qbe_emit_mono_call(
   g : QbeGen,
   base_sym : String,
@@ -8804,6 +8898,10 @@ fn qbe_emit_expr(
               qbe_rc_dec(g, sv.reg, sv.ty)
             }
             return qval(r, TString)
+          }
+          match rt_prim_info(name) {
+            Some(pr) => return qbe_emit_rt_prim_call(g, pr, args)
+            None => ()
           }
           if name == "ptr_null" {
             return qval("0", TPtr)

@@ -393,7 +393,7 @@ pub fn query_deps_json(pkg : Package) -> String {
             let c = calls[ci]
             if c == "scope" || c == "spawn" || starts_with_str(c, "Channel::") || starts_with_str(c, "Mutex::") || starts_with_str(c, "AtomicInt::") {
               push_unique(deps, "m2/runtime/concurrency")
-            } else if is_world_builtin(c) {
+            } else if is_world_builtin(c) || is_world_rt_prim(c) {
               push_unique(deps, "m2/runtime/world")
             }
             ci = ci + 1
@@ -463,4 +463,203 @@ pub fn cli_emit_sig(
 ) -> String {
   let pkg = parse_package(pkg_name, paths, sources)
   emit_m2sig(pkg)
+}
+
+///|
+pub struct DocItem {
+  kind : String
+  name : String
+  sig : String
+  file : String
+  line : Int
+}
+
+///|
+/// Public API surface of a package: every `pub` struct/enum/trait/extern fn/fn/const
+/// and every `impl`, in declaration order.
+pub fn doc_package_items(pkg : Package) -> Array[DocItem] {
+  let out : Array[DocItem] = []
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DStruct(sd) =>
+          if sd.is_pub {
+            out.push(DocItem::{
+              kind: "struct",
+              name: sd.name,
+              sig: format_struct_sig(sd),
+              file: sd.span.file,
+              line: sd.span.line,
+            })
+          }
+        DEnum(ed) =>
+          if ed.is_pub {
+            out.push(DocItem::{
+              kind: "enum",
+              name: ed.name,
+              sig: format_enum_sig(ed),
+              file: ed.span.file,
+              line: ed.span.line,
+            })
+          }
+        DTrait(td) =>
+          if td.is_pub {
+            out.push(DocItem::{
+              kind: "trait",
+              name: td.name,
+              sig: format_trait_sig(td),
+              file: td.span.file,
+              line: td.span.line,
+            })
+          }
+        DImpl(id) =>
+          out.push(DocItem::{
+            kind: "impl",
+            name: id.trait_name + " for " + id.target_type,
+            sig: format_impl_sig(id),
+            file: id.span.file,
+            line: id.span.line,
+          })
+        DExternFn(ed) =>
+          if ed.is_pub {
+            out.push(DocItem::{
+              kind: "extern_fn",
+              name: ed.name,
+              sig: format_extern_fn_sig(ed),
+              file: ed.span.file,
+              line: ed.span.line,
+            })
+          }
+        DFn(fd) =>
+          if fd.is_pub {
+            let full_name = if fd.receiver_type != "" {
+              fd.receiver_type + "::" + fd.name
+            } else {
+              fd.name
+            }
+            out.push(DocItem::{
+              kind: "fn",
+              name: full_name,
+              sig: format_fn_sig(fd),
+              file: fd.span.file,
+              line: fd.span.line,
+            })
+          }
+        DConst(cd) =>
+          if cd.is_pub {
+            out.push(DocItem::{
+              kind: "const",
+              name: cd.name,
+              sig: format_const_sig(cd),
+              file: cd.span.file,
+              line: cd.span.line,
+            })
+          }
+        DTest(_) => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  out
+}
+
+///|
+/// `{"name":"pkg","items":[{"kind":..,"name":..,"sig":..,"file":..,"line":..}]}`
+pub fn doc_package_json(pkg : Package) -> String {
+  let items = doc_package_items(pkg)
+  let sb = StringBuilder()
+  sb.write_string("{\"name\":")
+  sb.write_string(json_quote(pkg.name))
+  sb.write_string(",\"items\":[")
+  let mut i = 0
+  while i < items.length() {
+    let it = items[i]
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("{\"kind\":")
+    sb.write_string(json_quote(it.kind))
+    sb.write_string(",\"name\":")
+    sb.write_string(json_quote(it.name))
+    sb.write_string(",\"sig\":")
+    sb.write_string(json_quote(it.sig))
+    sb.write_string(",\"file\":")
+    sb.write_string(json_quote(it.file))
+    sb.write_string(",\"line\":")
+    sb.write_string(it.line.to_string())
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+/// One line per public item under a `package <name>` header.
+pub fn doc_package_text(pkg : Package) -> String {
+  let items = doc_package_items(pkg)
+  let sb = StringBuilder()
+  sb.write_string("package ")
+  sb.write_string(pkg.name)
+  sb.write_string("\n")
+  let mut i = 0
+  while i < items.length() {
+    sb.write_string("  ")
+    sb.write_string(items[i].sig)
+    sb.write_string("\n")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Workspace summary: `{"packages":[<doc_package_json>...]}`.
+pub fn doc_packages_json(pkgs : Array[Package]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("{\"packages\":[")
+  let mut i = 0
+  while i < pkgs.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(doc_package_json(pkgs[i]))
+    i = i + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+pub fn doc_packages_text(pkgs : Array[Package]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < pkgs.length() {
+    sb.write_string(doc_package_text(pkgs[i]))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Parse diagnostics of a package, empty when every file parsed cleanly.
+pub fn parse_package_diagnostics(
+  paths : Array[String],
+  sources : Array[String],
+) -> Array[Diagnostic] {
+  let out : Array[Diagnostic] = []
+  let mut i = 0
+  while i < paths.length() && i < sources.length() {
+    let pr = parse_source(paths[i], sources[i])
+    let mut di = 0
+    while di < pr.diagnostics.length() {
+      out.push(pr.diagnostics[di])
+      di = di + 1
+    }
+    i = i + 1
+  }
+  out
 }

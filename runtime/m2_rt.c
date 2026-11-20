@@ -2296,6 +2296,9 @@ M2_MINSIZE static void m2_ignore_sigpipe_init(void) {
 M2_MINSIZE static int m2_parse_ipv4_addr(void *host_str, int32_t port, int allow_any,
                                          struct sockaddr_in *addr) {
     memset(addr, 0, sizeof(*addr));
+#ifdef __APPLE__
+    addr->sin_len = (uint8_t)sizeof(*addr);
+#endif
     addr->sin_family = AF_INET;
     addr->sin_port = htons((uint16_t)port);
     M2String *h = (M2String *)host_str;
@@ -2321,7 +2324,9 @@ M2_MINSIZE int32_t m2_tcp_listen(void *w_ptr, void *host_str, int32_t port) {
     (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, (socklen_t)sizeof(yes));
     if (bind(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0 ||
         listen(fd, 128) != 0) {
+        int saved = errno;
         close(fd);
+        errno = saved;
         return -1;
     }
     return (int32_t)fd;
@@ -2360,7 +2365,9 @@ M2_MINSIZE int32_t m2_tcp_connect(void *w_ptr, void *host_str, int32_t port) {
         rc = connect(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr));
     } while (rc < 0 && errno == EINTR);
     if (rc != 0) {
+        int saved = errno;
         close(fd);
+        errno = saved;
         return -1;
     }
     return (int32_t)fd;

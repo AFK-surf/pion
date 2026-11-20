@@ -1,0 +1,615 @@
+///| std/json: JSON values, parser, serializer and the `ToJson` trait (pure m2)
+
+pub enum JsonValue {
+  JNull
+  JBool(Bool)
+  JInt(Int64)
+  JFloat(Double)
+  JStr(String)
+  JArr(Array[JsonValue])
+  JObj(Array[JsonField])
+}
+
+pub struct JsonField {
+  pub key : String
+  pub value : JsonValue
+}
+
+pub trait ToJson {
+  to_json(self : Self) -> JsonValue
+}
+
+impl ToJson for Int {
+  fn to_json(self : Int) -> JsonValue {
+    JInt(self.to_int64())
+  }
+}
+
+impl ToJson for Int64 {
+  fn to_json(self : Int64) -> JsonValue {
+    JInt(self)
+  }
+}
+
+impl ToJson for Bool {
+  fn to_json(self : Bool) -> JsonValue {
+    JBool(self)
+  }
+}
+
+impl ToJson for String {
+  fn to_json(self : String) -> JsonValue {
+    JStr(self)
+  }
+}
+
+impl ToJson for JsonValue {
+  fn to_json(self : JsonValue) -> JsonValue {
+    self
+  }
+}
+
+/// Serializes any `ToJson` value.
+pub fn encode[T : ToJson](v : T) -> String {
+  stringify(v.to_json())
+}
+
+/// Builds a field for `JObj`.
+pub fn field(key : String, value : JsonValue) -> JsonField {
+  JsonField::{ key: key, value: value }
+}
+
+struct JsonParser {
+  src : String
+  mut pos : Int
+}
+
+fn jp_err(p : JsonParser, msg : String) -> String {
+  msg + " at offset " + p.pos.to_string()
+}
+
+fn jp_skip_ws(p : JsonParser) -> Unit {
+  while p.pos < p.src.length() {
+    let c = p.src.code_unit_at(p.pos)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      p.pos = p.pos + 1
+    } else {
+      break
+    }
+  }
+}
+
+fn jp_peek(p : JsonParser) -> Int {
+  if p.pos < p.src.length() {
+    p.src.code_unit_at(p.pos)
+  } else {
+    -1
+  }
+}
+
+fn jp_expect_word(p : JsonParser, word : String) -> Bool {
+  let n = word.length()
+  if p.pos + n > p.src.length() {
+    return false
+  }
+  if p.src.slice(p.pos, p.pos + n) != word {
+    return false
+  }
+  p.pos = p.pos + n
+  true
+}
+
+fn jp_hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    -1
+  }
+}
+
+fn jp_read_hex4(p : JsonParser) -> Result[Int, String] {
+  if p.pos + 4 > p.src.length() {
+    return Err(jp_err(p, "truncated \\u escape"))
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < 4 {
+    let h = jp_hex_val(p.src.code_unit_at(p.pos + i))
+    if h < 0 {
+      return Err(jp_err(p, "invalid \\u escape"))
+    }
+    v = v * 16 + h
+    i = i + 1
+  }
+  p.pos = p.pos + 4
+  Ok(v)
+}
+
+fn jp_parse_string(p : JsonParser) -> Result[String, String] {
+  // p.pos is at the opening quote
+  p.pos = p.pos + 1
+  let sb = StringBuilder()
+  let mut run_start = p.pos
+  while p.pos < p.src.length() {
+    let c = p.src.code_unit_at(p.pos)
+    if c == 34 {
+      sb.write_string(p.src.slice(run_start, p.pos))
+      p.pos = p.pos + 1
+      return Ok(sb.to_string())
+    }
+    if c < 32 {
+      return Err(jp_err(p, "unescaped control character in string"))
+    }
+    if c == 92 {
+      sb.write_string(p.src.slice(run_start, p.pos))
+      p.pos = p.pos + 1
+      if p.pos >= p.src.length() {
+        return Err(jp_err(p, "unterminated escape"))
+      }
+      let e = p.src.code_unit_at(p.pos)
+      p.pos = p.pos + 1
+      if e == 34 {
+        sb.write_char('"')
+      } else if e == 92 {
+        sb.write_char('\\')
+      } else if e == 47 {
+        sb.write_char('/')
+      } else if e == 98 {
+        sb.write_char((8).unsafe_to_char())
+      } else if e == 102 {
+        sb.write_char((12).unsafe_to_char())
+      } else if e == 110 {
+        sb.write_char('\n')
+      } else if e == 114 {
+        sb.write_char('\r')
+      } else if e == 116 {
+        sb.write_char('\t')
+      } else if e == 117 {
+        let mut cp = jp_read_hex4(p)?
+        if cp >= 55296 && cp <= 56319 {
+          // high surrogate: must be followed by `\uDC00..\uDFFF`
+          if !jp_expect_word(p, "\\u") {
+            return Err(jp_err(p, "unpaired surrogate in \\u escape"))
+          }
+          let lo = jp_read_hex4(p)?
+          if lo < 56320 || lo > 57343 {
+            return Err(jp_err(p, "invalid low surrogate in \\u escape"))
+          }
+          cp = 65536 + (cp - 55296) * 1024 + (lo - 56320)
+        } else if cp >= 56320 && cp <= 57343 {
+          return Err(jp_err(p, "unpaired surrogate in \\u escape"))
+        }
+        sb.write_char(cp.unsafe_to_char())
+      } else {
+        p.pos = p.pos - 1
+        return Err(jp_err(p, "invalid escape character"))
+      }
+      run_start = p.pos
+    } else {
+      p.pos = p.pos + 1
+    }
+  }
+  Err(jp_err(p, "unterminated string"))
+}
+
+fn jp_is_digit(c : Int) -> Bool {
+  c >= 48 && c <= 57
+}
+
+fn pow10(n : Int) -> Double {
+  let mut r = 1.0
+  let mut i = 0
+  while i < n {
+    r = r * 10.0
+    i = i + 1
+  }
+  r
+}
+
+fn jp_parse_number(p : JsonParser) -> Result[JsonValue, String] {
+  let mut neg = false
+  if jp_peek(p) == 45 {
+    neg = true
+    p.pos = p.pos + 1
+  }
+  if !jp_is_digit(jp_peek(p)) {
+    return Err(jp_err(p, "expected digit"))
+  }
+  // All digits go into one mantissa; the decimal point and exponent become a
+  // single power-of-ten scale applied at the end (one rounding step).
+  let mut ival = 0L
+  let mut mant = 0.0
+  let mut int_digits = 0
+  if jp_peek(p) == 48 {
+    p.pos = p.pos + 1
+    int_digits = 1
+    if jp_is_digit(jp_peek(p)) {
+      return Err(jp_err(p, "leading zero in number"))
+    }
+  } else {
+    while jp_is_digit(jp_peek(p)) {
+      let d = jp_peek(p) - 48
+      ival = ival * 10L + d.to_int64()
+      mant = mant * 10.0 + (d as Double)
+      int_digits = int_digits + 1
+      p.pos = p.pos + 1
+    }
+  }
+  let mut is_float = false
+  let mut scale = 0
+  if jp_peek(p) == 46 {
+    is_float = true
+    p.pos = p.pos + 1
+    if !jp_is_digit(jp_peek(p)) {
+      return Err(jp_err(p, "expected digit after decimal point"))
+    }
+    while jp_is_digit(jp_peek(p)) {
+      mant = mant * 10.0 + ((jp_peek(p) - 48) as Double)
+      scale = scale - 1
+      p.pos = p.pos + 1
+    }
+  }
+  let c = jp_peek(p)
+  if c == 101 || c == 69 {
+    is_float = true
+    p.pos = p.pos + 1
+    let mut eneg = false
+    if jp_peek(p) == 43 {
+      p.pos = p.pos + 1
+    } else if jp_peek(p) == 45 {
+      eneg = true
+      p.pos = p.pos + 1
+    }
+    if !jp_is_digit(jp_peek(p)) {
+      return Err(jp_err(p, "expected digit in exponent"))
+    }
+    let mut ex = 0
+    while jp_is_digit(jp_peek(p)) {
+      if ex < 10000 {
+        ex = ex * 10 + (jp_peek(p) - 48)
+      }
+      p.pos = p.pos + 1
+    }
+    scale = if eneg { scale - ex } else { scale + ex }
+  }
+  if !is_float && int_digits > 18 {
+    // Too large for Int64 without overflow: keep it as a float.
+    is_float = true
+  }
+  if is_float {
+    let dval = if scale < 0 {
+      mant / pow10(0 - scale)
+    } else {
+      mant * pow10(scale)
+    }
+    Ok(JFloat(if neg { 0.0 - dval } else { dval }))
+  } else {
+    Ok(JInt(if neg { 0L - ival } else { ival }))
+  }
+}
+
+fn jp_parse_value(p : JsonParser, depth : Int) -> Result[JsonValue, String] {
+  if depth > 512 {
+    return Err(jp_err(p, "nesting too deep"))
+  }
+  jp_skip_ws(p)
+  let c = jp_peek(p)
+  if c < 0 {
+    Err(jp_err(p, "unexpected end of input"))
+  } else if c == 110 {
+    if jp_expect_word(p, "null") {
+      Ok(JNull)
+    } else {
+      Err(jp_err(p, "invalid literal"))
+    }
+  } else if c == 116 {
+    if jp_expect_word(p, "true") {
+      Ok(JBool(true))
+    } else {
+      Err(jp_err(p, "invalid literal"))
+    }
+  } else if c == 102 {
+    if jp_expect_word(p, "false") {
+      Ok(JBool(false))
+    } else {
+      Err(jp_err(p, "invalid literal"))
+    }
+  } else if c == 34 {
+    let s = jp_parse_string(p)?
+    Ok(JStr(s))
+  } else if c == 91 {
+    jp_parse_array(p, depth)
+  } else if c == 123 {
+    jp_parse_object(p, depth)
+  } else if c == 45 || jp_is_digit(c) {
+    jp_parse_number(p)
+  } else {
+    Err(jp_err(p, "unexpected character '" + p.src.slice(p.pos, p.pos + 1) + "'"))
+  }
+}
+
+fn jp_parse_array(p : JsonParser, depth : Int) -> Result[JsonValue, String] {
+  p.pos = p.pos + 1
+  let items : Array[JsonValue] = []
+  jp_skip_ws(p)
+  if jp_peek(p) == 93 {
+    p.pos = p.pos + 1
+    return Ok(JArr(items))
+  }
+  while true {
+    let v = jp_parse_value(p, depth + 1)?
+    items.push(v)
+    jp_skip_ws(p)
+    let c = jp_peek(p)
+    if c == 44 {
+      p.pos = p.pos + 1
+    } else if c == 93 {
+      p.pos = p.pos + 1
+      return Ok(JArr(items))
+    } else {
+      return Err(jp_err(p, "expected ',' or ']' in array"))
+    }
+  }
+  Err(jp_err(p, "unterminated array"))
+}
+
+fn jp_parse_object(p : JsonParser, depth : Int) -> Result[JsonValue, String] {
+  p.pos = p.pos + 1
+  let fields : Array[JsonField] = []
+  jp_skip_ws(p)
+  if jp_peek(p) == 125 {
+    p.pos = p.pos + 1
+    return Ok(JObj(fields))
+  }
+  while true {
+    jp_skip_ws(p)
+    if jp_peek(p) != 34 {
+      return Err(jp_err(p, "expected string key in object"))
+    }
+    let key = jp_parse_string(p)?
+    jp_skip_ws(p)
+    if jp_peek(p) != 58 {
+      return Err(jp_err(p, "expected ':' after object key"))
+    }
+    p.pos = p.pos + 1
+    let v = jp_parse_value(p, depth + 1)?
+    fields.push(JsonField::{ key: key, value: v })
+    jp_skip_ws(p)
+    let c = jp_peek(p)
+    if c == 44 {
+      p.pos = p.pos + 1
+    } else if c == 125 {
+      p.pos = p.pos + 1
+      return Ok(JObj(fields))
+    } else {
+      return Err(jp_err(p, "expected ',' or '}' in object"))
+    }
+  }
+  Err(jp_err(p, "unterminated object"))
+}
+
+/// Parses one JSON document; errors carry the byte offset where parsing stopped.
+pub fn parse(input : String) -> Result[JsonValue, String] {
+  let p = JsonParser::{ src: input, pos: 0 }
+  let v = jp_parse_value(p, 0)?
+  jp_skip_ws(p)
+  if p.pos != input.length() {
+    return Err(jp_err(p, "trailing characters after JSON value"))
+  }
+  Ok(v)
+}
+
+fn hex_digit(n : Int) -> Char {
+  if n < 10 {
+    (48 + n).unsafe_to_char()
+  } else {
+    (87 + n).unsafe_to_char()
+  }
+}
+
+/// Writes `s` as a quoted JSON string with full escaping.
+pub fn write_json_string(sb : StringBuilder, s : String) -> Unit {
+  sb.write_char('"')
+  let n = s.length()
+  let mut run_start = 0
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 34 || c == 92 || c < 32 {
+      sb.write_string(s.slice(run_start, i))
+      if c == 34 {
+        sb.write_string("\\\"")
+      } else if c == 92 {
+        sb.write_string("\\\\")
+      } else if c == 10 {
+        sb.write_string("\\n")
+      } else if c == 13 {
+        sb.write_string("\\r")
+      } else if c == 9 {
+        sb.write_string("\\t")
+      } else if c == 8 {
+        sb.write_string("\\b")
+      } else if c == 12 {
+        sb.write_string("\\f")
+      } else {
+        sb.write_string("\\u00")
+        sb.write_char(hex_digit(c / 16))
+        sb.write_char(hex_digit(c % 16))
+      }
+      run_start = i + 1
+    }
+    i = i + 1
+  }
+  sb.write_string(s.slice(run_start, n))
+  sb.write_char('"')
+}
+
+fn write_json_float(sb : StringBuilder, d : Double) -> Unit {
+  if d != d || d - d != 0.0 {
+    // NaN or +/-Infinity have no JSON form.
+    sb.write_string("null")
+    return
+  }
+  let s = d.to_string()
+  sb.write_string(s)
+  if !s.contains(".") && !s.contains("e") && !s.contains("E") {
+    sb.write_string(".0")
+  }
+}
+
+fn write_json(sb : StringBuilder, v : JsonValue) -> Unit {
+  match v {
+    JNull => sb.write_string("null")
+    JBool(b) => sb.write_string(if b { "true" } else { "false" })
+    JInt(n) => sb.write_string(n.to_string())
+    JFloat(d) => write_json_float(sb, d)
+    JStr(s) => write_json_string(sb, s)
+    JArr(items) => {
+      sb.write_char('[')
+      let mut i = 0
+      while i < items.length() {
+        if i > 0 {
+          sb.write_char(',')
+        }
+        write_json(sb, items[i])
+        i = i + 1
+      }
+      sb.write_char(']')
+    }
+    JObj(fields) => {
+      sb.write_char('{')
+      let mut i = 0
+      while i < fields.length() {
+        if i > 0 {
+          sb.write_char(',')
+        }
+        write_json_string(sb, fields[i].key)
+        sb.write_char(':')
+        write_json(sb, fields[i].value)
+        i = i + 1
+      }
+      sb.write_char('}')
+    }
+  }
+}
+
+/// Compact JSON text of `v`.
+pub fn stringify(v : JsonValue) -> String {
+  let sb = StringBuilder()
+  write_json(sb, v)
+  sb.to_string()
+}
+
+/// Value of the first field named `key` when `v` is an object.
+pub fn obj_get(v : JsonValue, key : String) -> Option[JsonValue] {
+  match v {
+    JObj(fields) => {
+      let mut i = 0
+      while i < fields.length() {
+        if fields[i].key == key {
+          return Some(fields[i].value)
+        }
+        i = i + 1
+      }
+      None
+    }
+    _ => None
+  }
+}
+
+pub fn as_str(v : JsonValue) -> Option[String] {
+  match v {
+    JStr(s) => Some(s)
+    _ => None
+  }
+}
+
+pub fn as_int(v : JsonValue) -> Option[Int64] {
+  match v {
+    JInt(n) => Some(n)
+    _ => None
+  }
+}
+
+pub fn as_bool(v : JsonValue) -> Option[Bool] {
+  match v {
+    JBool(b) => Some(b)
+    _ => None
+  }
+}
+
+pub fn as_arr(v : JsonValue) -> Option[Array[JsonValue]] {
+  match v {
+    JArr(items) => Some(items)
+    _ => None
+  }
+}
+
+/// Structural equality (object fields compared in order).
+pub fn json_equal(a : JsonValue, b : JsonValue) -> Bool {
+  match a {
+    JNull =>
+    match b {
+      JNull => true
+      _ => false
+    }
+    JBool(x) =>
+    match b {
+      JBool(y) => x == y
+      _ => false
+    }
+    JInt(x) =>
+    match b {
+      JInt(y) => x == y
+      _ => false
+    }
+    JFloat(x) =>
+    match b {
+      JFloat(y) => x == y
+      _ => false
+    }
+    JStr(x) =>
+    match b {
+      JStr(y) => x == y
+      _ => false
+    }
+    JArr(xs) =>
+    match b {
+      JArr(ys) => {
+        if xs.length() != ys.length() {
+          return false
+        }
+        let mut i = 0
+        while i < xs.length() {
+          if !json_equal(xs[i], ys[i]) {
+            return false
+          }
+          i = i + 1
+        }
+        true
+      }
+      _ => false
+    }
+    JObj(xs) =>
+    match b {
+      JObj(ys) => {
+        if xs.length() != ys.length() {
+          return false
+        }
+        let mut i = 0
+        while i < xs.length() {
+          if xs[i].key != ys[i].key || !json_equal(xs[i].value, ys[i].value) {
+            return false
+          }
+          i = i + 1
+        }
+        true
+      }
+      _ => false
+    }
+  }
+}

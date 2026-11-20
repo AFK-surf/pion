@@ -541,13 +541,100 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
     let k = ikeys[i]
     match ipkg.tc.impls.get(k) {
       Some(ii) =>
-        if !tc.impls.contains(k) {
-          tc.impls.set(k, ii)
-          tc.impl_keys.push(k)
+        if ii.pkg_name != ipkg.name {
+          // Already normalized when `ipkg` imported it from its own dependency.
+          if !tc.impls.contains(k) {
+            tc.impls.set(k, ii)
+            tc.impl_keys.push(k)
+          }
+        } else {
+          let q_trait = if !has_qual_sep(ii.trait_name) &&
+            ipkg.tc.traits.contains(ii.trait_name) {
+            ipkg.name + "::" + ii.trait_name
+          } else {
+            ii.trait_name
+          }
+          let q_target = if !has_qual_sep(ii.target_type) &&
+            (
+              ipkg.tc.structs.contains(ii.target_type) ||
+              ipkg.tc.enums.contains(ii.target_type)
+            ) {
+            ipkg.name + "::" + ii.target_type
+          } else {
+            ii.target_type
+          }
+          let qk = q_trait + "::" + q_target
+          if !tc.impls.contains(qk) {
+            let qms : Map[String, FnInfo] = Map([])
+            let mut mi = 0
+            while mi < ii.method_names.length() {
+              let mn = ii.method_names[mi]
+              match ii.methods.get(mn) {
+                Some(mf) => qms.set(mn, qualify_fn_info(ipkg.name, mf))
+                None => ()
+              }
+              mi = mi + 1
+            }
+            tc.impls.set(
+              qk,
+              ImplInfo::{
+                decl: ii.decl,
+                pkg_name: ii.pkg_name,
+                trait_name: q_trait,
+                target_type: q_target,
+                methods: qms,
+                method_names: ii.method_names,
+              },
+            )
+            tc.impl_keys.push(qk)
+          }
         }
       None => ()
     }
     i = i + 1
+  }
+}
+
+///|
+/// Resolves the trait names of an imported function's bounds in the package that
+/// declared it, so bound checks in the importer look up `pkg::Trait::Type` impls.
+fn qualify_fn_bounds(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
+  if fi.decl.type_bounds.length() == 0 {
+    return fi
+  }
+  let qbounds : Array[TypeBound] = []
+  let mut bi = 0
+  while bi < fi.decl.type_bounds.length() {
+    let tb = fi.decl.type_bounds[bi]
+    let qtrs : Array[String] = []
+    let mut ti = 0
+    while ti < tb.traits.length() {
+      let tn = tb.traits[ti]
+      if !has_qual_sep(tn) && ipkg.tc.traits.contains(tn) {
+        qtrs.push(ipkg.name + "::" + tn)
+      } else {
+        qtrs.push(canon_trait_name(ipkg.tc, tn))
+      }
+      ti = ti + 1
+    }
+    qbounds.push(TypeBound::{ param: tb.param, traits: qtrs })
+    bi = bi + 1
+  }
+  let d = fi.decl
+  FnInfo::{
+    decl: FnDecl::{
+      is_pub: d.is_pub,
+      receiver_type: d.receiver_type,
+      name: d.name,
+      type_params: d.type_params,
+      type_bounds: qbounds,
+      params: d.params,
+      ret_ty: d.ret_ty,
+      body: d.body,
+      span: d.span,
+    },
+    param_tys: fi.param_tys,
+    ret_ty: fi.ret_ty,
   }
 }
 
@@ -1200,6 +1287,134 @@ fn is_world_builtin(name : String) -> Bool {
   name == "world_args" ||
   name == "world_argc" ||
   name == "world_argv"
+}
+
+///|
+pub struct RtPrim {
+  c_sym : String
+  world : Bool
+  param_tys : Array[Ty]
+  ret_ty : Ty
+}
+
+///|
+/// Runtime primitives that lower to one direct `$m2_*` C call. `world` ones take an
+/// explicit leading `World` argument (not part of `param_tys`).
+fn rt_prim_info(name : String) -> Option[RtPrim] {
+  if name == "ptr_alloc" {
+    Some(RtPrim::{ c_sym: "m2_ptr_alloc", world: false, param_tys: [TInt64], ret_ty: TPtr })
+  } else if name == "ptr_free" {
+    Some(RtPrim::{ c_sym: "m2_ptr_free", world: false, param_tys: [TPtr], ret_ty: TUnit })
+  } else if name == "ptr_offset" {
+    Some(RtPrim::{ c_sym: "m2_ptr_offset", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
+  } else if name == "ptr_read_ptr" {
+    Some(RtPrim::{ c_sym: "m2_ptr_read_ptr", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
+  } else if name == "ptr_write_ptr" {
+    Some(RtPrim::{ c_sym: "m2_ptr_write_ptr", world: false, param_tys: [TPtr, TInt64, TPtr], ret_ty: TUnit })
+  } else if name == "ptr_read_i32" {
+    Some(RtPrim::{ c_sym: "m2_ptr_read_i32", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt })
+  } else if name == "ptr_write_i32" {
+    Some(RtPrim::{ c_sym: "m2_ptr_write_i32", world: false, param_tys: [TPtr, TInt64, TInt], ret_ty: TUnit })
+  } else if name == "ptr_read_i64" {
+    Some(RtPrim::{ c_sym: "m2_ptr_read_i64", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt64 })
+  } else if name == "ptr_write_i64" {
+    Some(RtPrim::{ c_sym: "m2_ptr_write_i64", world: false, param_tys: [TPtr, TInt64, TInt64], ret_ty: TUnit })
+  } else if name == "cstr_to_str" {
+    Some(RtPrim::{ c_sym: "m2_cstr_to_str", world: false, param_tys: [TPtr], ret_ty: TString })
+  } else if name == "tcp_listen" {
+    Some(RtPrim::{ c_sym: "m2_tcp_listen", world: true, param_tys: [TString, TInt], ret_ty: TInt })
+  } else if name == "tcp_local_port" {
+    Some(RtPrim::{ c_sym: "m2_tcp_local_port", world: true, param_tys: [TInt], ret_ty: TInt })
+  } else if name == "tcp_accept" {
+    Some(RtPrim::{ c_sym: "m2_tcp_accept", world: true, param_tys: [TInt], ret_ty: TInt })
+  } else if name == "tcp_connect" {
+    Some(RtPrim::{ c_sym: "m2_tcp_connect", world: true, param_tys: [TString, TInt], ret_ty: TInt })
+  } else if name == "tcp_read" {
+    Some(RtPrim::{ c_sym: "m2_tcp_read", world: true, param_tys: [TInt, TInt], ret_ty: TString })
+  } else if name == "tcp_write" {
+    Some(RtPrim::{ c_sym: "m2_tcp_write", world: true, param_tys: [TInt, TString], ret_ty: TInt })
+  } else if name == "tcp_close" {
+    Some(RtPrim::{ c_sym: "m2_tcp_close", world: true, param_tys: [TInt], ret_ty: TUnit })
+  } else if name == "sleep_ms" {
+    Some(RtPrim::{ c_sym: "m2_sleep_ms", world: true, param_tys: [TInt], ret_ty: TUnit })
+  } else {
+    None
+  }
+}
+
+///|
+fn is_world_rt_prim(name : String) -> Bool {
+  match rt_prim_info(name) {
+    Some(pr) => pr.world
+    None => false
+  }
+}
+
+///|
+fn check_rt_prim_call(
+  tc : TypeChecker,
+  env : Env,
+  name : String,
+  pr : RtPrim,
+  args : Array[Expr],
+  sp : Span,
+) -> Ty {
+  let off = if pr.world { 1 } else { 0 }
+  let want = pr.param_tys.length() + off
+  if pr.world {
+    let mut has_world = false
+    if args.length() > 0 {
+      match check_expr(tc, env, args[0], Some(TWorld)) {
+        TWorld => has_world = true
+        _ => ()
+      }
+    }
+    if !has_world {
+      tc_err(
+        tc,
+        sp,
+        "E_CAPABILITY_MISSING",
+        "calling `" + name + "` requires an explicit `World` capability as its first argument",
+        "World",
+        "none",
+        "pass the `World` value as the first argument of `" + name + "`",
+      )
+    }
+  }
+  if args.length() != want {
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "`" + name + "` expects " + want.to_string() + " argument(s), found " + args.length().to_string(),
+      want.to_string() + " args",
+      args.length().to_string() + " args",
+      "pass " + want.to_string() + " argument(s) to `" + name + "`",
+    )
+  }
+  let mut i = off
+  while i < args.length() {
+    let pi = i - off
+    if pi < pr.param_tys.length() {
+      let pty = pr.param_tys[pi]
+      let aty = check_expr(tc, env, args[i], Some(pty))
+      if !ty_compat(pty, aty) {
+        tc_err(
+          tc,
+          expr_span(args[i]),
+          "E_TYPE_MISMATCH",
+          "argument " + (i + 1).to_string() + " of `" + name + "` expects `" + ty_to_string(pty) + "`",
+          ty_to_string(pty),
+          ty_to_string(aty),
+          "pass a `" + ty_to_string(pty) + "` value",
+        )
+      }
+    } else {
+      let _ = check_expr(tc, env, args[i], None)
+    }
+    i = i + 1
+  }
+  pr.ret_ty
 }
 
 ///|
@@ -3533,6 +3748,10 @@ fn check_expr(
             }
             return TString
           }
+          match rt_prim_info(name) {
+            Some(pr) => return check_rt_prim_call(tc, env, name, pr, args, sp)
+            None => ()
+          }
           if name == "ptr_null" {
             if args.length() != 0 {
               tc_err(
@@ -3840,7 +4059,7 @@ fn check_expr(
                   return check_fn_call(
                     tc,
                     env,
-                    qualify_fn_info(ipkg.name, fi),
+                    qualify_fn_bounds(ipkg, qualify_fn_info(ipkg.name, fi)),
                     args,
                     expected,
                     sp,

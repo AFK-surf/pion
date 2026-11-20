@@ -1,0 +1,454 @@
+///| std/http: HTTP/1.1 request/response parsing, formatting and a blocking client/server over POSIX TCP (pure m2)
+
+import "json"
+
+pub struct HttpRequest {
+  pub method : String
+  pub path : String
+  pub query : String
+  pub headers : Map[String, String]
+  pub body : String
+}
+
+pub struct HttpResponse {
+  pub status : Int
+  pub status_text : String
+  pub content_type : String
+  pub body : String
+}
+
+/// Largest request or response accepted by the TCP helpers (8 MiB).
+pub let MAX_MESSAGE_BYTES : Int = 8388608
+
+/// ASCII-lowercases `s` (header names are case-insensitive).
+pub fn ascii_lower(s : String) -> String {
+  let sb = StringBuilder()
+  let n = s.length()
+  let mut run_start = 0
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c >= 65 && c <= 90 {
+      sb.write_string(s.slice(run_start, i))
+      sb.write_char((c + 32).unsafe_to_char())
+      run_start = i + 1
+    }
+    i = i + 1
+  }
+  sb.write_string(s.slice(run_start, n))
+  sb.to_string()
+}
+
+/// Reason phrase of the common status codes.
+pub fn status_text_for(status : Int) -> String {
+  if status == 200 {
+    "OK"
+  } else if status == 201 {
+    "Created"
+  } else if status == 204 {
+    "No Content"
+  } else if status == 400 {
+    "Bad Request"
+  } else if status == 404 {
+    "Not Found"
+  } else if status == 405 {
+    "Method Not Allowed"
+  } else if status == 413 {
+    "Payload Too Large"
+  } else if status == 500 {
+    "Internal Server Error"
+  } else if status == 503 {
+    "Service Unavailable"
+  } else {
+    "Unknown"
+  }
+}
+
+/// Offset of the blank line ending the head (`\r\n\r\n` or `\n\n`) and its length.
+fn head_end(raw : String) -> (Int, Int) {
+  let crlf = raw.index_of("\r\n\r\n")
+  let lf = raw.index_of("\n\n")
+  if crlf >= 0 && (lf < 0 || crlf <= lf) {
+    (crlf, 4)
+  } else if lf >= 0 {
+    (lf, 2)
+  } else {
+    (-1, 0)
+  }
+}
+
+fn split_head_lines(head : String) -> Array[String] {
+  let lines = head.split("\n")
+  let out : Array[String] = []
+  let mut i = 0
+  while i < lines.length() {
+    let ln = lines[i]
+    if ln.length() > 0 && ln.code_unit_at(ln.length() - 1) == 13 {
+      out.push(ln.slice(0, ln.length() - 1))
+    } else {
+      out.push(ln)
+    }
+    i = i + 1
+  }
+  out
+}
+
+/// Parses `Name: value` lines (from index 1) into lowercase-keyed headers.
+fn parse_header_lines(lines : Array[String]) -> Result[Map[String, String], String] {
+  let headers : Map[String, String] = Map::new()
+  let mut i = 1
+  while i < lines.length() {
+    let ln = lines[i]
+    if ln.length() > 0 {
+      let colon = ln.index_of(":")
+      if colon <= 0 {
+        return Err("malformed header line " + i.to_string() + ": `" + ln + "`")
+      }
+      let name = ascii_lower(ln.slice(0, colon).trim())
+      let value = ln.slice(colon + 1, ln.length()).trim()
+      headers.set(name, value)
+    }
+    i = i + 1
+  }
+  Ok(headers)
+}
+
+fn parse_decimal(s : String) -> Option[Int] {
+  let t = s.trim()
+  if t.length() == 0 || t.length() > 9 {
+    return None
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < t.length() {
+    let c = t.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  Some(v)
+}
+
+/// Body bytes after the head, cut to `content-length` when present.
+fn take_body(rest : String, headers : Map[String, String]) -> Result[String, String] {
+  match headers.get("content-length") {
+    Some(cl) =>
+    match parse_decimal(cl) {
+      Some(n) =>
+      if rest.length() < n {
+        Err(
+          "incomplete body: expected " +
+          n.to_string() +
+          " bytes, got " +
+          rest.length().to_string(),
+        )
+      } else {
+        Ok(rest.slice(0, n))
+      }
+      None => Err("invalid content-length `" + cl + "`")
+    }
+    None => Ok(rest)
+  }
+}
+
+/// Parses a complete HTTP/1.x request (head and body).
+pub fn parse_request(raw : String) -> Result[HttpRequest, String] {
+  let (he, sep) = head_end(raw)
+  if he < 0 {
+    return Err("incomplete request head")
+  }
+  let lines = split_head_lines(raw.slice(0, he))
+  let parts = lines[0].split(" ")
+  if parts.length() != 3 || parts[0].length() == 0 || parts[1].length() == 0 {
+    return Err("malformed request line `" + lines[0] + "`")
+  }
+  if !parts[2].starts_with("HTTP/1.") {
+    return Err("unsupported protocol `" + parts[2] + "`")
+  }
+  let target = parts[1]
+  let q = target.index_of("?")
+  let path = if q >= 0 { target.slice(0, q) } else { target }
+  let query = if q >= 0 { target.slice(q + 1, target.length()) } else { "" }
+  let headers = parse_header_lines(lines)?
+  let body = take_body(raw.slice(he + sep, raw.length()), headers)?
+  Ok(HttpRequest::{
+    method: parts[0],
+    path: path,
+    query: query,
+    headers: headers,
+    body: body,
+  })
+}
+
+/// Parses a complete HTTP/1.x response (head and body).
+pub fn parse_response(raw : String) -> Result[HttpResponse, String] {
+  let (he, sep) = head_end(raw)
+  if he < 0 {
+    return Err("incomplete response head")
+  }
+  let lines = split_head_lines(raw.slice(0, he))
+  let status_line = lines[0]
+  if !status_line.starts_with("HTTP/1.") {
+    return Err("malformed status line `" + status_line + "`")
+  }
+  let sp1 = status_line.index_of(" ")
+  if sp1 < 0 {
+    return Err("malformed status line `" + status_line + "`")
+  }
+  let after = status_line.slice(sp1 + 1, status_line.length())
+  let sp2 = after.index_of(" ")
+  let code_s = if sp2 >= 0 { after.slice(0, sp2) } else { after }
+  let text = if sp2 >= 0 { after.slice(sp2 + 1, after.length()) } else { "" }
+  let status = match parse_decimal(code_s) {
+    Some(n) =>
+    if code_s.length() == 3 {
+      n
+    } else {
+      return Err("invalid status code `" + code_s + "`")
+    }
+    None => return Err("invalid status code `" + code_s + "`")
+  }
+  let headers = parse_header_lines(lines)?
+  let body = take_body(raw.slice(he + sep, raw.length()), headers)?
+  let ctype = match headers.get("content-type") {
+    Some(ct) => ct
+    None => ""
+  }
+  Ok(HttpResponse::{
+    status: status,
+    status_text: text,
+    content_type: ctype,
+    body: body,
+  })
+}
+
+/// Serializes a response with `Content-Length` and `Connection: close`.
+pub fn format_response(resp : HttpResponse) -> String {
+  let sb = StringBuilder()
+  sb.write_string("HTTP/1.1 ")
+  sb.write_string(resp.status.to_string())
+  sb.write_string(" ")
+  sb.write_string(resp.status_text)
+  sb.write_string("\r\n")
+  if resp.content_type.length() > 0 {
+    sb.write_string("Content-Type: ")
+    sb.write_string(resp.content_type)
+    sb.write_string("\r\n")
+  }
+  sb.write_string("Content-Length: ")
+  sb.write_string(resp.body.length().to_string())
+  sb.write_string("\r\nConnection: close\r\n\r\n")
+  sb.write_string(resp.body)
+  sb.to_string()
+}
+
+/// Serializes a request with `Host`, `Content-Length` and `Connection: close`.
+pub fn format_request(
+  method : String,
+  host : String,
+  port : Int,
+  path : String,
+  body : String,
+) -> String {
+  method +
+  " " +
+  path +
+  " HTTP/1.1\r\nHost: " +
+  host +
+  ":" +
+  port.to_string() +
+  "\r\nContent-Length: " +
+  body.length().to_string() +
+  "\r\nConnection: close\r\n\r\n" +
+  body
+}
+
+/// `200 OK` with an `application/json` body.
+pub fn ok_json(body : String) -> HttpResponse {
+  HttpResponse::{
+    status: 200,
+    status_text: "OK",
+    content_type: "application/json",
+    body: body,
+  }
+}
+
+/// Error status with body `{"error":"<msg>"}`.
+pub fn err_json(status : Int, msg : String) -> HttpResponse {
+  let body = json::stringify(json::JObj([json::field("error", json::JStr(msg))]))
+  HttpResponse::{
+    status: status,
+    status_text: status_text_for(status),
+    content_type: "application/json",
+    body: body,
+  }
+}
+
+fn hex_nibble(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    -1
+  }
+}
+
+/// Percent-decodes `s` (`+` becomes a space); malformed escapes are kept as is.
+pub fn url_decode(s : String) -> String {
+  let bytes = s.to_bytes()
+  let n = s.length()
+  let out = Bytes::new(n)
+  let mut o = 0
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 43 {
+      out[o] = b' '
+      i = i + 1
+    } else if c == 37 && i + 2 < n && hex_nibble(s.code_unit_at(i + 1)) >= 0 &&
+    hex_nibble(s.code_unit_at(i + 2)) >= 0 {
+      let v = hex_nibble(s.code_unit_at(i + 1)) * 16 + hex_nibble(s.code_unit_at(i + 2))
+      out[o] = v.to_byte()
+      i = i + 3
+    } else {
+      out[o] = bytes[i]
+      i = i + 1
+    }
+    o = o + 1
+  }
+  out.slice(0, o).to_string()
+}
+
+/// Splits `a=1&b=x%20y` into decoded pairs; later duplicates win.
+pub fn query_params(query : String) -> Map[String, String] {
+  let out : Map[String, String] = Map::new()
+  if query.length() == 0 {
+    return out
+  }
+  let pairs = query.split("&")
+  let mut i = 0
+  while i < pairs.length() {
+    let pr = pairs[i]
+    if pr.length() > 0 {
+      let eq = pr.index_of("=")
+      if eq >= 0 {
+        out.set(url_decode(pr.slice(0, eq)), url_decode(pr.slice(eq + 1, pr.length())))
+      } else {
+        out.set(url_decode(pr), "")
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+/// Header value by case-insensitive name.
+pub fn header(req : HttpRequest, name : String) -> Option[String] {
+  req.headers.get(ascii_lower(name))
+}
+
+/// Bytes still needed for a complete message in `buf`: -1 while the head is
+/// incomplete, else the missing body bytes (0 when complete or unbounded).
+fn missing_bytes(buf : String) -> Int {
+  let (he, sep) = head_end(buf)
+  if he < 0 {
+    return -1
+  }
+  let head = buf.slice(0, he)
+  let lower = ascii_lower(head)
+  let k = lower.index_of("content-length:")
+  if k < 0 {
+    return 0
+  }
+  let line_end = {
+    let rest = lower.slice(k, lower.length())
+    let nl = rest.index_of("\n")
+    if nl >= 0 {
+      k + nl
+    } else {
+      lower.length()
+    }
+  }
+  match parse_decimal(lower.slice(k + 15, line_end)) {
+    Some(n) => {
+      let have = buf.length() - (he + sep)
+      if have >= n {
+        0
+      } else {
+        n - have
+      }
+    }
+    None => 0
+  }
+}
+
+/// Reads one request from `fd` (head plus `content-length` body) and parses it.
+pub fn read_http_request(w : World, fd : Int) -> Result[HttpRequest, String] {
+  let sb = StringBuilder()
+  let mut buf = ""
+  while true {
+    let chunk = tcp_read(w, fd, 65536)
+    if chunk.length() == 0 {
+      break
+    }
+    sb.write_string(chunk)
+    buf = sb.to_string()
+    if buf.length() > MAX_MESSAGE_BYTES {
+      return Err("request too large")
+    }
+    if missing_bytes(buf) == 0 {
+      break
+    }
+  }
+  if buf.length() == 0 {
+    return Err("connection closed before request")
+  }
+  parse_request(buf)
+}
+
+/// Writes `resp` to `fd`; true when every byte was sent.
+pub fn write_http_response(w : World, fd : Int, resp : HttpResponse) -> Bool {
+  let text = format_response(resp)
+  tcp_write(w, fd, text) == text.length()
+}
+
+/// Blocking HTTP/1.1 client call: connect, send, read until the server closes.
+pub fn http_request(
+  w : World,
+  host : String,
+  port : Int,
+  method : String,
+  path : String,
+  body : String,
+) -> Result[HttpResponse, String] {
+  let fd = tcp_connect(w, host, port)
+  if fd < 0 {
+    return Err("connect to " + host + ":" + port.to_string() + " failed")
+  }
+  let req = format_request(method, host, port, path, body)
+  if tcp_write(w, fd, req) != req.length() {
+    tcp_close(w, fd)
+    return Err("failed to send request")
+  }
+  let sb = StringBuilder()
+  let mut total = 0
+  while true {
+    let chunk = tcp_read(w, fd, 65536)
+    if chunk.length() == 0 {
+      break
+    }
+    total = total + chunk.length()
+    if total > MAX_MESSAGE_BYTES {
+      tcp_close(w, fd)
+      return Err("response too large")
+    }
+    sb.write_string(chunk)
+  }
+  tcp_close(w, fd)
+  parse_response(sb.to_string())
+}
