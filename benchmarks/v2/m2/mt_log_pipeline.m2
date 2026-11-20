@@ -1,0 +1,289 @@
+///| V2 Benchmark 3: mt_log_pipeline (m2, scope/spawn + Channel[String] + AtomicInt)
+///| Usage: mt_log_pipeline <logs.txt> [1|4]
+
+pub val struct WorkerStats {
+  lines : Int
+  errs : Int
+  slow : Int
+  sum_lat : Int64
+  svc_sum : Int64
+  msg_xor : Int
+}
+
+struct AggState {
+  mut alert_cnt : Int
+  mut alert_len_sum : Int64
+  mut alert_xor : Int
+}
+
+fn poly_hash(s : String) -> Int {
+  let n = s.length()
+  let mut h = 0
+  let mut i = 0
+  while i < n {
+    h = (h * 31 + s.code_unit_at(i)) & 0x3fffffff
+    i = i + 1
+  }
+  h
+}
+
+fn poly_hash_slice(s : String, start : Int, end : Int) -> Int {
+  let mut h = 0
+  let mut i = start
+  while i < end {
+    h = (h * 31 + s.code_unit_at(i)) & 0x3fffffff
+    i = i + 1
+  }
+  h
+}
+
+fn spawn_producer(s : Scope, src : String, work_ch : Channel[String]) -> Unit {
+  spawn(s, fn() -> Unit {
+    let n = src.length()
+    let mut pos = 0
+    while pos < n {
+      let start = pos
+      let mut nl_count = 0
+      while pos < n && nl_count < 10 {
+        if src.code_unit_at(pos) == 10 {
+          nl_count = nl_count + 1
+        }
+        pos = pos + 1
+      }
+      let chunk = src.slice(start, pos)
+      let _ = work_ch.send(chunk)
+    }
+    work_ch.close()
+  })
+}
+
+fn spawn_worker(
+  s : Scope,
+  work_ch : Channel[String],
+  alert_ch : Channel[String],
+  stats_ch : Channel[WorkerStats],
+  active_workers : AtomicInt,
+) -> Unit {
+  spawn(s, fn() -> Unit {
+    let svc_lat : Map[String, Int64] = Map::new()
+    let mut lines = 0
+    let mut errs = 0
+    let mut slow = 0
+    let mut sum_lat : Int64 = 0L
+    let mut msg_xor = 0
+
+    let mut running = true
+    while running {
+      match work_ch.recv() {
+        None => running = false
+        Some(chunk) => {
+          let n = chunk.length()
+          let mut i = 0
+          while i < n {
+            let line_start = i
+            while i < n && chunk.code_unit_at(i) != 10 {
+              i = i + 1
+            }
+            let line_end = i
+            if i < n && chunk.code_unit_at(i) == 10 {
+              i = i + 1
+            }
+            if line_end <= line_start {
+              continue
+            }
+            lines = lines + 1
+            let mut p = line_start
+            while p < line_end && chunk.code_unit_at(p) != 32 {
+              p = p + 1
+            }
+            if p < line_end {
+              p = p + 1
+            }
+            // level=
+            p = p + 6
+            let lvl_s = p
+            while p < line_end && chunk.code_unit_at(p) != 32 {
+              p = p + 1
+            }
+            let lvl_e = p
+            if p < line_end {
+              p = p + 1
+            }
+            // svc=
+            p = p + 4
+            let svc_s = p
+            while p < line_end && chunk.code_unit_at(p) != 32 {
+              p = p + 1
+            }
+            let svc_e = p
+            if p < line_end {
+              p = p + 1
+            }
+            // lat=
+            p = p + 4
+            let mut lat = 0
+            while p < line_end && chunk.code_unit_at(p) != 32 {
+              lat = lat * 10 + (chunk.code_unit_at(p) - 48)
+              p = p + 1
+            }
+            if p < line_end {
+              p = p + 1
+            }
+            // msg=
+            p = p + 4
+            let msg_s = p
+
+            let lat64 = lat.to_int64()
+            sum_lat = sum_lat + lat64
+            let svc = chunk.slice(svc_s, svc_e)
+            match svc_lat.get(svc) {
+              Some(prev) => svc_lat.set(svc, prev + lat64)
+              None => svc_lat.set(svc, lat64)
+            }
+            msg_xor = msg_xor ^ poly_hash_slice(chunk, msg_s, line_end)
+
+            let is_err = (lvl_e - lvl_s == 3) &&
+              chunk.code_unit_at(lvl_s) == 69 &&
+              chunk.code_unit_at(lvl_s + 1) == 82 &&
+              chunk.code_unit_at(lvl_s + 2) == 82
+            let is_slow = lat >= 500
+            if is_err {
+              errs = errs + 1
+            }
+            if is_slow {
+              slow = slow + 1
+            }
+            if is_err || is_slow {
+              let lvl = chunk.slice(lvl_s, lvl_e)
+              let msg = chunk.slice(msg_s, line_end)
+              let alert = "ALERT|" + svc + "|" + lvl + "|" + lat.to_string() + "|" + msg
+              let _ = alert_ch.send(alert)
+            }
+          }
+        }
+      }
+    }
+
+    let mut svc_sum : Int64 = 0L
+    let keys = svc_lat.keys()
+    let mut ki = 0
+    while ki < keys.length() {
+      match svc_lat.get(keys[ki]) {
+        Some(v) => svc_sum = svc_sum + v
+        None => ()
+      }
+      ki = ki + 1
+    }
+
+    if active_workers.fetch_add(-1) == 1 {
+      alert_ch.close()
+    }
+    let _ = stats_ch.send(WorkerStats::{
+      lines: lines,
+      errs: errs,
+      slow: slow,
+      sum_lat: sum_lat,
+      svc_sum: svc_sum,
+      msg_xor: msg_xor,
+    })
+  })
+}
+
+pub fn main(world : World) -> Int {
+  let args = args_get(world)
+  if args.length() < 2 {
+    io_eprintln(world, "usage: mt_log_pipeline <logs.txt> [1|4]")
+    return 2
+  }
+  let mut nworkers = 1
+  if args.length() >= 3 {
+    if args[2] == "4" {
+      nworkers = 4
+    } else if args[2] == "2" {
+      nworkers = 2
+    } else if args[2] == "8" {
+      nworkers = 8
+    }
+  }
+  let src = match fs_read(world, args[1]) {
+    Ok(s) => s
+    Err(e) => {
+      io_eprintln(world, "read error: " + e)
+      return 1
+    }
+  }
+
+  let work_ch : Channel[String] = Channel::new(64)
+  let alert_ch : Channel[String] = Channel::new(256)
+  let stats_ch : Channel[WorkerStats] = Channel::new(16)
+  let active_workers = AtomicInt::new(nworkers)
+  let agg = AggState::{ alert_cnt: 0, alert_len_sum: 0L, alert_xor: 0 }
+
+  scope(world, fn(s : Scope) -> Unit {
+    spawn_producer(s, src, work_ch)
+    let mut t = 0
+    while t < nworkers {
+      spawn_worker(s, work_ch, alert_ch, stats_ch, active_workers)
+      t = t + 1
+    }
+    let mut consuming = true
+    while consuming {
+      match alert_ch.recv() {
+        None => consuming = false
+        Some(alert) => {
+          agg.alert_cnt = agg.alert_cnt + 1
+          agg.alert_len_sum = agg.alert_len_sum + alert.length().to_int64()
+          agg.alert_xor = agg.alert_xor ^ poly_hash(alert)
+        }
+      }
+    }
+  })
+
+  stats_ch.close()
+  let mut lines = 0
+  let mut errs = 0
+  let mut slow = 0
+  let mut sum_lat : Int64 = 0L
+  let mut svc_sum : Int64 = 0L
+  let mut msg_xor = 0
+  let mut got = 0
+  while got < nworkers {
+    match stats_ch.recv() {
+      None => break
+      Some(st) => {
+        lines = lines + st.lines
+        errs = errs + st.errs
+        slow = slow + st.slow
+        sum_lat = sum_lat + st.sum_lat
+        svc_sum = svc_sum + st.svc_sum
+        msg_xor = msg_xor ^ st.msg_xor
+      }
+    }
+    got = got + 1
+  }
+
+  if svc_sum != sum_lat {
+    io_eprintln(world, "svc_sum mismatch")
+    return 1
+  }
+
+  io_println(
+    world,
+    lines.to_string() +
+    " " +
+    errs.to_string() +
+    " " +
+    slow.to_string() +
+    " " +
+    sum_lat.to_string() +
+    " " +
+    msg_xor.to_string() +
+    " " +
+    agg.alert_cnt.to_string() +
+    " " +
+    agg.alert_len_sum.to_string() +
+    " " +
+    agg.alert_xor.to_string(),
+  )
+  0
+}
