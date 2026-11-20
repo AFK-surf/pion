@@ -645,3 +645,9 @@ void arm64_macho_begin(uint32_t macos_ver);
 void arm64_macho_dat(Dat *);
 void arm64_macho_fn(Fn *);
 void arm64_macho_finish(FILE *);
+
+/* amd64/elf.c */
+void amd64_elf_begin(void);
+void amd64_elf_dat(Dat *);
+void amd64_elf_fn(Fn *);
+void amd64_elf_finish(FILE *);

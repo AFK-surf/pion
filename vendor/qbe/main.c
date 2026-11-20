@@ -75,7 +75,10 @@ data(Dat *d)
 	if (dbg)
 		return;
 	if (objmode) {
-		arm64_macho_dat(d);
+		if (strcmp(T.name, "arm64_apple") == 0)
+			arm64_macho_dat(d);
+		else
+			amd64_elf_dat(d);
 		if (d->type == DEnd)
 			freeall();
 		return;
@@ -157,7 +160,10 @@ func(Fn *fn)
 			fn->rpo[n]->link = fn->rpo[n+1];
 	if (!dbg) {
 		if (objmode) {
-			arm64_macho_fn(fn);
+			if (strcmp(T.name, "arm64_apple") == 0)
+				arm64_macho_fn(fn);
+			else
+				amd64_elf_fn(fn);
 		} else {
 			T.emitfn(fn, outf);
 			fprintf(outf, "/* end function %s */\n\n", fn->name);
@@ -184,8 +190,8 @@ usage(FILE *hf, char *prog)
 	fprintf(hf, "%s [OPTIONS] {file.ssa, -}\n", prog);
 	fprintf(hf, "\t%-18s prints this help\n", "-h");
 	fprintf(hf, "\t%-18s output to file\n", "-o file");
-	fprintf(hf, "\t%-18s emit Mach-O .o directly (arm64_apple)\n", "--obj");
-	fprintf(hf, "\t%-18s batch emit Mach-O .o pairs <in.ssa> <out.o>...\n", "--obj-batch");
+	fprintf(hf, "\t%-18s emit .o directly (arm64_apple Mach-O / amd64_sysv ELF64)\n", "--obj");
+	fprintf(hf, "\t%-18s batch emit .o pairs <in.ssa> <out.o>...\n", "--obj-batch");
 	fprintf(hf, "\t%-18s macOS platform version (e.g. 15.0)\n", "--macos-ver <ver>");
 	fprintf(hf, "\t%-18s generate for a target among:\n", "-t <target>");
 	fprintf(hf, "\t%-18s ", "");
@@ -289,8 +295,11 @@ main(int ac, char *av[])
 		}
 	}
 
-	if (objmode && (!T.apple || strcmp(T.name, "arm64_apple") != 0)) {
-		fprintf(stderr, "--obj is only supported for target arm64_apple\n");
+	int is_arm64_macho = (strcmp(T.name, "arm64_apple") == 0);
+	int is_amd64_elf = (strcmp(T.name, "amd64_sysv") == 0);
+
+	if (objmode && !is_arm64_macho && !is_amd64_elf) {
+		fprintf(stderr, "--obj is only supported for targets arm64_apple and amd64_sysv\n");
 		exit(1);
 	}
 
@@ -319,12 +328,20 @@ main(int ac, char *av[])
 			}
 			emit_reset();
 			util_reset();
-			if (!dbg)
-				arm64_macho_begin(macos_ver);
+			if (!dbg) {
+				if (is_arm64_macho)
+					arm64_macho_begin(macos_ver);
+				else
+					amd64_elf_begin();
+			}
 			parse(inf, in_p, dbgfile, data, func);
 			fclose(inf);
-			if (!dbg)
-				arm64_macho_finish(outf);
+			if (!dbg) {
+				if (is_arm64_macho)
+					arm64_macho_finish(outf);
+				else
+					amd64_elf_finish(outf);
+			}
 			fclose(outf);
 			outf = stdout;
 		}
@@ -340,8 +357,12 @@ main(int ac, char *av[])
 		}
 	}
 
-	if (objmode && !dbg)
-		arm64_macho_begin(macos_ver);
+	if (objmode && !dbg) {
+		if (is_arm64_macho)
+			arm64_macho_begin(macos_ver);
+		else
+			amd64_elf_begin();
+	}
 
 	if (nfiles == 0)
 		files[nfiles++] = "-";
@@ -364,9 +385,12 @@ main(int ac, char *av[])
 	}
 
 	if (!dbg) {
-		if (objmode)
-			arm64_macho_finish(outf);
-		else
+		if (objmode) {
+			if (is_arm64_macho)
+				arm64_macho_finish(outf);
+			else
+				amd64_elf_finish(outf);
+		} else
 			T.emitfin(outf);
 	}
 
