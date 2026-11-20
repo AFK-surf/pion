@@ -1,8 +1,35 @@
 # Working on `Pion` (for agents)
 
-- `SPEC.md` is the authoritative architecture, grammar, runtime ABI, and JSON protocol spec. Keep code and `SPEC.md` strictly synchronized.
-- **Never run heavy builds or tests on `Office-Host-2`**: run all `moon`, `clang`, `qbe`, `zig`, and test binaries via `station_task` on `tokyo-mac-studio-0` (`PATH="$HOME/.moon/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"`).
-- **Zero `target/` or `_build/` inside source tree** for `pionc` outputs (only Stage 0 MoonBit build uses `moon`'s target dir inside the remote mirror, never committed to git).
-- **Stage 0 ↔ Stage 1 intersection discipline**: Everything under `compiler/src/core/` MUST stay strictly within the `Pion ∩ MoonBit` subset defined in `SPEC.md` §2–3 so that `pionc0` compiles `compiler/src/core/` directly with zero rewrite.
-- **No flaky tests, no sleeps**: Concurrency tests synchronize via `scope`/`Channel`/`AtomicInt`, never wall-clock sleeps.
-- **Fast fail**: If a remote build/test command fails unexpectedly or a single step exceeds 10 minutes, stop immediately and return the raw log rather than blindly retrying.
+Pion is a systems language built for AI agents to write and iterate on at high frequency. Read this before touching anything; `SPEC.md` holds the details.
+
+## 1. Product constitution (non-negotiable)
+
+- **Agent-first, no human developer tools.** Do not build an LSP, IDE/editor plugins, or an interactive DWARF debugger for humans, and never list their absence as a gap or TODO. All tooling effort goes to: fast deterministic CLI, compact structured JSON diagnostics with stable `code`s and fix-its (moving toward machine-applicable `edits`), symbol/call-graph/API queries, and explicit unambiguous contracts — `pionc check|query|doc|fmt|test --json`.
+- **Zero LLVM; release build speed is build speed.** LLVM is banned. There is no "fast dev / slow release" split: daily builds and releases use the same pipeline (embedded QBE → native ARM64 Mach-O / Linux x86_64 ELF64 `.o`, linear low-overhead optimizations, parallel global CAS). Release builds must beat mainstream compiled languages on build time.
+- **C-speed execution, native multithreading.** Single-core target is C `-O2` speed. Concurrency is native OS threads (`scope`/`spawn`/`Channel`/`Mutex`/`AtomicInt`) with biased RC, compile-time race freedom (`Send`), and explicit `World` capability boundaries for IO.
+- **Tiny binaries, zero worktree cache pollution.** Keep artefacts small (`libpionrt.a` < 64 KB, `hello` ~50 KB, a service ~110 KB). Source trees get **0 bytes** of `target/`/`_build/`: outputs live in the global LRU CAS shared zero-copy across agent worktrees (only the Stage 0 MoonBit build uses `moon`'s target dir, in the remote mirror, never committed). The compiler is the self-hosted `pionc`: never rewrite it in Rust or pull in giant dependencies.
+- **Objective benchmarks and real dogfooding — no self-congratulation.** Never claim performance or agent-friendliness by feel. Every such change is measured on the same machine against other languages with bit-for-bit identical checksums (`scripts/bench-v2-exec.sh`, `scripts/bench-v2-compile.sh`, `scripts/bench.sh`, `benchmarks/agent_eval/run.sh`) and on real programs in `examples/`. Record weaknesses as honestly as strengths.
+
+## 2. Compiler and repository invariants
+
+- **`SPEC.md` is the single source of truth** for grammar, type system, runtime ABI and JSON protocol. Any change to these updates `SPEC.md` in the same commit.
+- **Stage 0 ↔ Stage 1 intersection.** Everything under `compiler/src/core/` stays strictly inside the `Pion ∩ MoonBit` subset (`SPEC.md` §2–3) so `pionc0` compiles it with zero rewrite. Bootstrap must stay bit-for-bit fixed-point: `pionc0 → pionc1 → pionc2` on macOS ARM64, and Stage 3 == Stage 4 on Linux x86_64 (no `as`).
+- **Runtime size budget.** `libpionrt.a` must be `< 65,536 B` on both macOS ARM64 and Linux x86_64 (including Ubuntu GCC's default hardening); aim for `< 56 KB` on Linux to keep headroom. Hot paths (`pion_rc_*`, `pion_alloc*`, `pion_map_*`, `pion_arr_push*`, `pion_str_eq`, `pion_str_from_cstr`) must not carry `PION_MINSIZE`; cold paths should. Build with `-fno-asynchronous-unwind-tables`.
+- **Deterministic tests.** Concurrency tests synchronize via `scope`/`Channel`/`AtomicInt`/FIFO ordering — **never `sleep`**. Both gates must pass 6/6 before merging: `sh scripts/verify-all.sh` and `PION_LINUX_SSA=... sh scripts/test-linux.sh`.
+- **Don't stop without cause.** When you hit a real weakness or an independently fixable compiler/performance/stdlib issue, keep going in priority order and verify each fix; do not pause after every small step waiting to be prompted.
+
+## 3. Build and verification
+
+```sh
+sh scripts/verify-all.sh                          # macOS ARM64 gate, 6/6: moon check/test, runtime, bootstrap fixed point, fmt, e2e
+PION_LINUX_SSA=out/stage2.ssa sh scripts/test-linux.sh   # Linux x86_64 gate, 6/6: runtime size, native ELF, Stage 3 == Stage 4
+sh scripts/bench-v2-exec.sh [--quick]             # cross-language execution speed (checksums must match)
+sh scripts/bench-v2-compile.sh                    # cross-language cold/incremental/multi-worktree build speed
+sh scripts/bench.sh                               # archived P8 suite
+sh benchmarks/agent_eval/run.sh                   # agent-in-the-loop eval vs MoonBit / Rust / Go
+```
+
+## 4. Station notes (internal cluster)
+
+- **Never run heavy builds or tests on `Office-Host-2`.** Run all `moon`, `clang`, `qbe`, `zig` and test binaries via `station_task` on `tokyo-mac-studio-0` (macOS ARM64) and `gt2` (Linux x86_64), with `PATH="$HOME/.moon/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"`.
+- **Fail fast.** If a remote command fails unexpectedly or a single step exceeds 10 minutes, stop immediately and return the raw log; never blindly retry or patch around it.
