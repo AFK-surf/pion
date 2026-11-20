@@ -1470,6 +1470,114 @@ static void test_arr_ergonomics_and_double_to_str(void) {
     printf("[PASS] arr_ergonomics_and_double_to_str\n");
 }
 
+static void test_slab_48b_and_arr_growth(void) {
+    /* 1. Empty array zero-overhead creation + 0 -> 4 -> 8 -> 16 -> 32 growth */
+    M2Array *a = (M2Array *)m2_arr_new(0, 0);
+    assert(a->len == 0 && a->cap == 0 && a->data == NULL);
+
+    for (int64_t i = 0; i < 4; i++) {
+        m2_arr_push(a, i * 11 + 1);
+        assert(a->len == i + 1);
+        assert(a->cap == 4);
+    }
+    for (int64_t i = 4; i < 8; i++) {
+        m2_arr_push(a, i * 11 + 1);
+        assert(a->len == i + 1);
+        assert(a->cap == 8);
+    }
+    for (int64_t i = 8; i < 16; i++) {
+        m2_arr_push(a, i * 11 + 1);
+        assert(a->len == i + 1);
+        assert(a->cap == 16);
+    }
+    m2_arr_push(a, 16 * 11 + 1);
+    assert(a->len == 17 && a->cap == 32);
+    for (int64_t i = 0; i < 17; i++) {
+        assert(m2_arr_get(a, i) == i * 11 + 1);
+    }
+    m2_rc_dec(a);
+
+    /* Empty object array dropped without pushing */
+    M2Array *empty_obj_arr = (M2Array *)m2_arr_new(0, 1);
+    assert(empty_obj_arr->len == 0 && empty_obj_arr->cap == 0 && empty_obj_arr->data == NULL);
+    m2_rc_dec(empty_obj_arr);
+
+    /* 2. 48B Slab class (16B payload + 32B M2Header = 48B) & all slab class boundaries */
+    const uint32_t payloads[] = {
+        0u, 8u, 16u, 17u, 24u, 25u, 32u, 33u, 48u, 49u, 64u, 65u, 80u, 81u, 96u, 97u, 224u, 225u
+    };
+    const size_t n_payloads = sizeof(payloads) / sizeof(payloads[0]);
+    void *ptrs[sizeof(payloads) / sizeof(payloads[0])];
+    for (size_t i = 0; i < n_payloads; i++) {
+        uint32_t sz = payloads[i];
+        uint8_t *p = (uint8_t *)m2_alloc(sz, M2_TAG_STRUCT, NULL);
+        assert(p != NULL);
+        if (sz > 0) {
+            assert(p[0] == 0 && p[sz - 1] == 0);
+            p[0] = (uint8_t)(i + 1);
+            p[sz - 1] = (uint8_t)(0xA0u + i);
+        }
+        M2Header *hdr = ((M2Header *)p) - 1;
+        assert(hdr->payload_size == sz);
+        if (hdr->flags & M2_FLAG_SLAB) {
+            uint32_t cls = (uint32_t)((hdr->flags >> M2_FLAG_SLAB_CLS_SHIFT) & M2_FLAG_SLAB_CLS_MASK);
+            if (sz <= 16u) {
+                assert(cls == 0u); /* 48B class */
+            } else if (sz <= 24u) {
+                assert(cls == 1u); /* 56B class */
+            } else if (sz <= 32u) {
+                assert(cls == 2u); /* 64B class */
+            } else if (sz <= 48u) {
+                assert(cls == 3u); /* 80B class */
+            } else if (sz <= 64u) {
+                assert(cls == 4u); /* 96B class */
+            } else if (sz <= 80u) {
+                assert(cls == 5u); /* 112B class */
+            } else if (sz <= 96u) {
+                assert(cls == 6u); /* 128B class */
+            } else {
+                assert(cls == 7u); /* 256B class */
+            }
+        }
+        ptrs[i] = p;
+    }
+    for (size_t i = 0; i < n_payloads; i++) {
+        uint32_t sz = payloads[i];
+        uint8_t *p = (uint8_t *)ptrs[i];
+        if (sz > 0) {
+            assert(p[0] == (uint8_t)(i + 1));
+            assert(p[sz - 1] == (uint8_t)(0xA0u + i));
+        }
+        m2_rc_dec(p);
+    }
+
+    /* Short strings (0..7 bytes -> 48B slab) + medium/long strings via slice/concat/strbuf */
+    const char *keys[] = { "", "id", "role", "tags", "note", "metrics", "latency_ms", "user_00001_ap-northeast-1" };
+    for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+        size_t klen = strlen(keys[i]);
+        void *s = m2_str_from_cstr(keys[i], (int64_t)klen);
+        M2Header *shdr = ((M2Header *)s) - 1;
+        if ((shdr->flags & M2_FLAG_SLAB) && klen <= 7) {
+            uint32_t cls = (uint32_t)((shdr->flags >> M2_FLAG_SLAB_CLS_SHIFT) & M2_FLAG_SLAB_CLS_MASK);
+            assert(cls == 0u); /* 32B header + 8B len + <=8B data+NUL <= 48B */
+        }
+        void *sl = m2_str_slice(s, 0, (int64_t)klen);
+        assert(m2_str_eq(s, sl) == 1);
+        void *sb = m2_strbuf_new(0);
+        for (size_t j = 0; j < klen; j++) {
+            m2_strbuf_push_char(sb, (unsigned char)keys[i][j]);
+        }
+        void *from_sb = m2_strbuf_to_str(sb);
+        assert(m2_str_eq(s, from_sb) == 1);
+        m2_rc_dec(s);
+        m2_rc_dec(sl);
+        m2_rc_dec(sb);
+        m2_rc_dec(from_sb);
+    }
+
+    printf("[PASS] slab_48b_and_arr_growth\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -1484,6 +1592,7 @@ int main(int argc, char **argv) {
     test_stdlib_string_bytes_math();
     test_array_and_map();
     test_arr_ergonomics_and_double_to_str();
+    test_slab_48b_and_arr_growth();
     test_map_try_get_and_100k();
     test_sha256();
     test_world(argc, argv);
