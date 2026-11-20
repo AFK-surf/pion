@@ -18,7 +18,16 @@ pub fn parse_package(
 pub fn query_defs_json(pkg : Package) -> String {
   let sb = StringBuilder()
   sb.write_string("{\"defs\":[")
-  let mut count = 0
+  let _ = query_defs_write(pkg, sb, 0)
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+/// Writes `pkg`'s definition objects (comma-separated, after `count` earlier
+/// items) and returns the new item count.
+fn query_defs_write(pkg : Package, sb : StringBuilder, count0 : Int) -> Int {
+  let mut count = count0
   let mut fi = 0
   while fi < pkg.files.length() {
     let f = pkg.files[fi]
@@ -155,8 +164,7 @@ pub fn query_defs_json(pkg : Package) -> String {
     }
     fi = fi + 1
   }
-  sb.write_string("]}")
-  sb.to_string()
+  count
 }
 
 ///|
@@ -316,7 +324,21 @@ fn collect_expr_calls(e : Expr, out : Array[String]) -> Unit {
 pub fn query_callers_json(pkg : Package) -> String {
   let sb = StringBuilder()
   sb.write_string("{\"callers\":[")
-  let mut count = 0
+  let _ = query_callers_write(pkg, false, sb, 0)
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+/// Writes `pkg`'s caller objects (with a leading `"pkg"` key when `with_pkg`)
+/// and returns the new item count.
+fn query_callers_write(
+  pkg : Package,
+  with_pkg : Bool,
+  sb : StringBuilder,
+  count0 : Int,
+) -> Int {
+  let mut count = count0
   let mut fi = 0
   while fi < pkg.files.length() {
     let f = pkg.files[fi]
@@ -335,7 +357,13 @@ pub fn query_callers_json(pkg : Package) -> String {
           }
           let calls : Array[String] = []
           collect_stmt_calls(fd.body, calls)
-          sb.write_string("{\"fn\":")
+          if with_pkg {
+            sb.write_string("{\"pkg\":")
+            sb.write_string(json_quote(pkg.name))
+            sb.write_string(",\"fn\":")
+          } else {
+            sb.write_string("{\"fn\":")
+          }
           sb.write_string(json_quote(full_name))
           sb.write_string(",\"calls\":[")
           let mut ci = 0
@@ -354,8 +382,57 @@ pub fn query_callers_json(pkg : Package) -> String {
     }
     fi = fi + 1
   }
-  sb.write_string("]}")
-  sb.to_string()
+  count
+}
+
+///|
+/// `pionc query defs|sig|callers` over every package of a workspace
+/// (dependencies first): one `defs`/`callers` table whose items carry their
+/// `pkg`, or one exported-signature table per package for `sig`.
+pub fn query_workspace_json(
+  kind : String,
+  pkgs : Array[Package],
+) -> Result[String, String] {
+  let sb = StringBuilder()
+  if kind == "defs" {
+    sb.write_string("{\"defs\":[")
+    let mut count = 0
+    let mut i = 0
+    while i < pkgs.length() {
+      count = query_defs_write(pkgs[i], sb, count)
+      i = i + 1
+    }
+    sb.write_string("]}")
+  } else if kind == "callers" {
+    sb.write_string("{\"callers\":[")
+    let mut count = 0
+    let mut i = 0
+    while i < pkgs.length() {
+      count = query_callers_write(pkgs[i], true, sb, count)
+      i = i + 1
+    }
+    sb.write_string("]}")
+  } else if kind == "sig" {
+    sb.write_string("{\"packages\":[")
+    let mut i = 0
+    while i < pkgs.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string("{\"name\":")
+      sb.write_string(json_quote(pkgs[i].name))
+      sb.write_string(",\"sig\":")
+      sb.write_string(query_sig_json(pkgs[i]))
+      sb.write_string("}")
+      i = i + 1
+    }
+    sb.write_string("]}")
+  } else {
+    return Err(
+      "unknown workspace query kind `" + kind + "` (expected defs|sig|callers|deps)",
+    )
+  }
+  Ok(sb.to_string())
 }
 
 ///|
