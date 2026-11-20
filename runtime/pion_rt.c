@@ -358,6 +358,7 @@ void pion_rc_dec(void *obj) {
 }
 
 static void pion_freeze_map_entries(PionMap *m);
+static void pion_freeze_arr_elems(PionArray *a);
 
 void pion_rc_freeze(void *obj) {
     if (!obj) return;
@@ -373,6 +374,8 @@ void pion_rc_freeze(void *obj) {
     hdr->owner_tid = 0;
     if (hdr->type_tag == PION_TAG_MAP) {
         pion_freeze_map_entries((PionMap *)obj);
+    } else if (hdr->type_tag == PION_TAG_ARRAY) {
+        pion_freeze_arr_elems((PionArray *)obj);
     }
 }
 
@@ -385,6 +388,15 @@ PION_MINSIZE static void pion_freeze_map_entries(PionMap *m) {
             pion_rc_freeze(m->entries[i].key);
             if (m->val_is_obj) pion_rc_freeze((void *)(uintptr_t)m->entries[i].val);
         }
+    }
+}
+
+/* Likewise a frozen `Array` (`Mutex[Array[T]]`, or a value of a frozen map):
+ * every element now and every object stored later is frozen. */
+PION_MINSIZE static void pion_freeze_arr_elems(PionArray *a) {
+    if (!a->elem_is_obj) return;
+    for (int64_t i = 0; i < a->len; i++) {
+        pion_rc_freeze((void *)(uintptr_t)a->data[i]);
     }
 }
 
@@ -565,6 +577,21 @@ PION_MINSIZE int64_t pion_str_to_int(void *s, int32_t *ok_out) {
     }
     if (ok_out) *ok_out = 1;
     return (int64_t)v;
+}
+
+PION_MINSIZE double pion_str_to_double(void *s, int32_t *ok_out) {
+    PionString *str = (PionString *)s;
+    *ok_out = 0;
+    if (!str || str->len <= 0) return 0.0;
+    const char *p = str->data;
+    char c = p[(p[0] == '-' || p[0] == '+') ? 1 : 0];
+    /* Plain decimal text only: no leading whitespace, no `inf`/`nan` words. */
+    if (!((c >= '0' && c <= '9') || c == '.')) return 0.0;
+    char *end = NULL;
+    double v = strtod(p, &end);
+    if (end != p + str->len) return 0.0;
+    *ok_out = 1;
+    return v;
 }
 
 static const char *pion_memmem(const char *hay, int64_t hlen, const char *ndl, int64_t nlen) {
@@ -995,6 +1022,7 @@ void pion_arr_push(void *a_ptr, int64_t val) {
         pion_arr_grow(a);
     }
     if (a->elem_is_obj) {
+        pion_adopt(a, val);
         pion_rc_inc((void *)(uintptr_t)val);
     }
     a->data[a->len++] = val;
@@ -1004,6 +1032,9 @@ void pion_arr_push_owned(void *a_ptr, int64_t val) {
     PionArray *a = (PionArray *)a_ptr;
     if (__builtin_expect(a->len == a->cap, 0)) {
         pion_arr_grow(a);
+    }
+    if (a->elem_is_obj) {
+        pion_adopt(a, val);
     }
     a->data[a->len++] = val;
 }
@@ -1022,6 +1053,7 @@ void pion_arr_set(void *a_ptr, int64_t idx, int64_t val) {
         pion_panic("array set index out of bounds", __FILE__, __LINE__);
     }
     if (a->elem_is_obj) {
+        pion_adopt(a, val);
         pion_rc_inc((void *)(uintptr_t)val);
         pion_rc_dec((void *)(uintptr_t)a->data[idx]);
     }

@@ -1609,7 +1609,7 @@ fn p_parse_match_expr(p : Parser) -> Expr {
           continue
         }
         let body = match p_peek(p).kind {
-          KwReturn | KwBreak | KwContinue => {
+          KwReturn | KwBreak | KwContinue | KwDebugAssert => {
             let st = p_parse_stmt(p)
             EBlock([st], arm_span)
           }
@@ -1708,6 +1708,11 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
     }
     KwIf => p_parse_if_expr(p)
     KwMatch => p_parse_match_expr(p)
+    // `debug_assert(cond, msg)` in expression position is a `Unit` block.
+    KwDebugAssert => {
+      let st = p_parse_stmt(p)
+      EBlock([st], tok.span)
+    }
     KwFn => {
       let _ = p_advance(p)
       let params = p_parse_params(p)

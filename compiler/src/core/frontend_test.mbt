@@ -1150,7 +1150,7 @@ test "p13b: UTF-8 scalar helpers decode the host string encoding" {
 }
 
 ///|
-test "p13b: Mutex[Map[String, V]] with flat values is Send, nested values are not" {
+test "p13b: Mutex[Map[String, V]] with Send values is Send, Ptr values are not" {
   let ok_src =
     "pub fn main(world : World) -> Int {\n" +
     "  let kv : Mutex[Map[String, String]] = Mutex::new(Map::new())\n" +
@@ -1167,7 +1167,7 @@ test "p13b: Mutex[Map[String, V]] with flat values is Send, nested values are no
   assert_true(ok1, "Mutex[Map[String, String]] spawn capture: " + json1)
   let bad_src =
     "pub fn main(world : World) -> Int {\n" +
-    "  let kv : Mutex[Map[String, Array[Int]]] = Mutex::new(Map::new())\n" +
+    "  let kv : Mutex[Map[String, Ptr]] = Mutex::new(Map::new())\n" +
     "  scope(world, fn(s : Scope) -> Unit {\n" +
     "    spawn(s, fn() -> Unit {\n" +
     "      let _ = kv.lock()\n" +
@@ -1177,7 +1177,7 @@ test "p13b: Mutex[Map[String, V]] with flat values is Send, nested values are no
     "  0\n" +
     "}\n"
   let (ok2, json2, _) = check_one(bad_src)
-  assert_true(!ok2 && str_contains(json2, "E_NOT_SEND"), "nested map values stay !Send: " + json2)
+  assert_true(!ok2 && str_contains(json2, "E_NOT_SEND"), "Ptr map values stay !Send: " + json2)
 }
 
 ///|
@@ -1336,4 +1336,394 @@ test "p15: == on Option/Result/payload enums is rejected, payload-less enums all
   assert_true(ds[1].message.contains("`!=`"), json)
   assert_true(ds[1].message.contains("Result[Int, String]"), json)
   assert_true(ds[2].message.contains("Shape"), json)
+}
+
+///|
+/// Applies `edits` that target `file` to `src` (1-based line/col, end
+/// exclusive), latest position first so earlier offsets stay valid.
+fn apply_edits(src : String, file : String, edits : Array[@core.TextEdit]) -> String {
+  let starts : Array[Int] = [0]
+  let mut i = 0
+  while i < src.length() {
+    if @core.str_code_at(src, i) == 10 {
+      starts.push(i + 1)
+    }
+    i = i + 1
+  }
+  let offs : Array[Int] = []
+  let ends : Array[Int] = []
+  let reps : Array[String] = []
+  let mut k = 0
+  while k < edits.length() {
+    let e = edits[k]
+    if e.file == file {
+      offs.push(starts[e.line - 1] + e.col - 1)
+      ends.push(starts[e.end_line - 1] + e.end_col - 1)
+      reps.push(e.replacement)
+    }
+    k = k + 1
+  }
+  let mut cur = src
+  let used : Array[Bool] = []
+  let mut u = 0
+  while u < offs.length() {
+    used.push(false)
+    u = u + 1
+  }
+  let mut done = 0
+  while done < offs.length() {
+    let mut best = -1
+    let mut j = 0
+    while j < offs.length() {
+      if !used[j] && (best < 0 || offs[j] > offs[best]) {
+        best = j
+      }
+      j = j + 1
+    }
+    used[best] = true
+    let sb = StringBuilder()
+    @core.sb_write_range(sb, cur, 0, offs[best])
+    sb.write_string(reps[best])
+    @core.sb_write_range(sb, cur, ends[best], cur.length())
+    cur = sb.to_string()
+    done = done + 1
+  }
+  cur
+}
+
+///|
+fn all_edits(diags : Array[@core.Diagnostic]) -> Array[@core.TextEdit] {
+  let out : Array[@core.TextEdit] = []
+  let mut i = 0
+  while i < diags.length() {
+    let mut j = 0
+    while j < diags[i].edits.length() {
+      out.push(diags[i].edits[j])
+      j = j + 1
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Checks `src`, expects `code` with a machine-applicable edit, applies every
+/// edit and expects the patched program to check clean.
+fn expect_edit_fixes(src : String, code : String, want_patched : String) -> Unit {
+  let (ok, json, diags) = check_one(src)
+  assert_true(!ok, "expected " + code + ": " + json)
+  let mut found = false
+  let mut i = 0
+  while i < diags.length() {
+    if diags[i].code == code && diags[i].edits.length() > 0 {
+      found = true
+    }
+    i = i + 1
+  }
+  assert_true(found, code + " carries edits: " + json)
+  assert_true(str_contains(json, "\"edits\":[{\"file\":\"test.pion\""), json)
+  let patched = apply_edits(src, "test.pion", all_edits(diags))
+  assert_true(str_contains(patched, want_patched), "patched:\n" + patched)
+  let (ok2, json2, _) = check_one(patched)
+  assert_true(ok2, "patched program must check clean: " + json2 + "\n" + patched)
+}
+
+///|
+test "p17a: diagnostics without a patch keep the compact JSON shape" {
+  let (_, json, _) = check_one("pub fn f() -> Int {\n  \"s\"\n}\n")
+  assert_true(!str_contains(json, "edits"), json)
+}
+
+///|
+test "p17a: E_MISSING_TYPE edit inserts the inferred return type" {
+  let src =
+    "fn add(a : Int, b : Int) {\n" +
+    "  a + b\n" +
+    "}\n" +
+    "fn names() {\n" +
+    "  [\"a\"]\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  add(1, 2) + names().length()\n" +
+    "}\n"
+  expect_edit_fixes(src, "E_MISSING_TYPE", "fn add(a : Int, b : Int) -> Int {")
+  let (_, _, diags) = check_one(src)
+  assert_eq(diags[0].edits[0].line, 1)
+  assert_eq(diags[0].edits[0].col, 26)
+  assert_eq(diags[0].edits[0].replacement, "-> Int ")
+  assert_eq(diags[1].edits[0].replacement, "-> Array[String] ")
+}
+
+///|
+test "p17a: reassigning an immutable let gets `mut ` at the declaration" {
+  let src =
+    "pub fn main() -> Int {\n" +
+    "  let total = 0\n" +
+    "  for i in 0..3 {\n" +
+    "    total = total + i\n" +
+    "  }\n" +
+    "  total = total + 1\n" +
+    "  total\n" +
+    "}\n"
+  expect_edit_fixes(src, "E_TYPE_MISMATCH", "  let mut total = 0\n")
+  let (_, _, diags) = check_one(src)
+  // Two bad assignments, one patch.
+  assert_eq(diags.length(), 2)
+  assert_eq(all_edits(diags).length(), 1)
+  assert_eq(diags[0].edits[0].line, 2)
+  assert_eq(diags[0].edits[0].col, 7)
+}
+
+///|
+test "p17a: E_UNHANDLED_RESULT edit prefixes `let _ = `" {
+  let src =
+    "fn parse(s : String) -> Result[Int, String] {\n" +
+    "  if s.length() > 0 { Ok(1) } else { Err(\"empty\") }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  parse(\"x\")\n" +
+    "  0\n" +
+    "}\n"
+  expect_edit_fixes(src, "E_UNHANDLED_RESULT", "  let _ = parse(\"x\")\n")
+}
+
+///|
+test "p17a: E_NON_EXHAUSTIVE edit inserts the missing arms" {
+  let src =
+    "enum Color {\n" +
+    "  Red\n" +
+    "  Green\n" +
+    "  Blue(Int, String)\n" +
+    "}\n" +
+    "pub fn code(c : Color) -> Int {\n" +
+    "  match c {\n" +
+    "    Red => 1\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn pick(o : Option[Int]) -> Int {\n" +
+    "  match o {\n" +
+    "    Some(v) => v\n" +
+    "  }\n" +
+    "}\n"
+  expect_edit_fixes(
+    src,
+    "E_NON_EXHAUSTIVE",
+    "    Green => panic(\"unhandled Green\")\n    Blue(_, _) => panic(\"unhandled Blue(_, _)\")\n    Red => 1\n",
+  )
+  let (_, _, diags) = check_one(src)
+  assert_eq(diags[1].edits[0].replacement, "None => panic(\"unhandled None\")\n    ")
+}
+
+///|
+test "p17a: E_TRAIT_METHOD_SIGNATURE edit replaces the return type" {
+  let src =
+    "trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "  tags(self : Self) -> Array[String]\n" +
+    "}\n" +
+    "struct P {\n" +
+    "  x : Int\n" +
+    "}\n" +
+    "impl Show for P {\n" +
+    "  fn show(self : P) -> Int {\n" +
+    "    self.x.to_string()\n" +
+    "  }\n" +
+    "  fn tags(self : P) -> Array[Int] {\n" +
+    "    [self.x.to_string()]\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let p = P::{ x: 1 }\n" +
+    "  p.show().length()\n" +
+    "}\n"
+  expect_edit_fixes(src, "E_TRAIT_METHOD_SIGNATURE", "  fn tags(self : P) -> Array[String] {\n")
+  let (_, _, diags) = check_one(src)
+  let e = diags[0].edits[0]
+  assert_eq(e.line, 9)
+  assert_eq(e.col, 24)
+  assert_eq(e.end_col, 27)
+  assert_eq(e.replacement, "String")
+}
+
+///|
+test "p17a: E_PRIVATE_SYMBOL edit marks the target declaration `pub `" {
+  let lib_src =
+    "pub fn api() -> Int {\n" +
+    "  1\n" +
+    "}\n" +
+    "fn helper(x : Int) -> Int {\n" +
+    "  x + 1\n" +
+    "}\n"
+  let app_src =
+    "import \"lib\" as l\n" +
+    "pub fn main() -> Int {\n" +
+    "  l::api() + l::helper(2)\n" +
+    "}\n"
+  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.pion"], [lib_src], [], true)
+  assert_true(lib_cr.diagnostics.length() == 0, "lib check")
+  let app_cr = @core.check_source_files_with_imports(
+    "app",
+    ["app.pion"],
+    [app_src],
+    [@core.imported_pkg_new("lib", lib_cr.tc)],
+    true,
+  )
+  let json = @core.check_result_to_json(app_cr.diagnostics)
+  assert_eq(app_cr.diagnostics.length(), 1)
+  assert_eq(app_cr.diagnostics[0].code, "E_PRIVATE_SYMBOL")
+  assert_true(
+    str_contains(
+      json,
+      "\"edits\":[{\"file\":\"lib.pion\",\"line\":4,\"col\":1,\"end_line\":4,\"end_col\":1,\"replacement\":\"pub \"}]",
+    ),
+    json,
+  )
+  let fixed_lib = apply_edits(lib_src, "lib.pion", all_edits(app_cr.diagnostics))
+  assert_true(str_contains(fixed_lib, "pub fn helper(x : Int) -> Int {"), fixed_lib)
+  let lib2 = @core.check_source_files_with_imports("lib", ["lib.pion"], [fixed_lib], [], true)
+  assert_true(lib2.diagnostics.length() == 0, "fixed lib check")
+  let app2 = @core.check_source_files_with_imports(
+    "app",
+    ["app.pion"],
+    [app_src],
+    [@core.imported_pkg_new("lib", lib2.tc)],
+    true,
+  )
+  assert_true(
+    app2.diagnostics.length() == 0,
+    "patched app: " + @core.check_result_to_json(app2.diagnostics),
+  )
+}
+
+///|
+test "p17a: String parsing, Option/Result helpers and expression debug_assert type-check" {
+  let src =
+    "fn half(n : Int) -> Result[Int, String] {\n" +
+    "  if n % 2 == 0 { Ok(n / 2) } else { Err(\"odd\") }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let a : Option[Int] = \"42\".to_int()\n" +
+    "  let b : Option[Int64] = \"-9000000000\".to_int64()\n" +
+    "  let c : Option[Double] = \"2.5\".to_double()\n" +
+    "  let n = a.unwrap_or(0) + half(4).unwrap_or(-1)\n" +
+    "  let flags = a.is_some() && !b.is_none() && c.is_some() && half(3).is_err() && half(2).is_ok()\n" +
+    "  let names : Option[String] = None\n" +
+    "  let s : String = names.unwrap_or(\"anon\")\n" +
+    "  match a {\n" +
+    "    Some(x) => debug_assert(x > 0, \"pos\")\n" +
+    "    None => ()\n" +
+    "  }\n" +
+    "  let u : Unit = debug_assert(n > 0, \"n\")\n" +
+    "  if flags { n + s.length() } else { 0 }\n" +
+    "}\n"
+  let (ok, json, _) = check_one(src)
+  assert_true(ok, json)
+  let bad =
+    "pub fn main() -> Int {\n" +
+    "  let a = \"1\".to_int()\n" +
+    "  let x : Int = a\n" +
+    "  a.unwrap_or(\"zero\") + \"2\".to_int(10).unwrap_or(0)\n" +
+    "}\n"
+  let (ok2, json2, d2) = check_one(bad)
+  assert_true(!ok2, json2)
+  assert_eq(d2.length(), 3)
+  assert_true(str_contains(json2, "Option[Int]"), json2)
+  assert_true(str_contains(json2, "`unwrap_or` default type mismatch"), json2)
+  assert_true(str_contains(json2, "`to_int` takes no arguments"), json2)
+}
+
+///|
+test "p17a: generic == is checked at each instantiation" {
+  let prelude =
+    "enum Color {\n" +
+    "  Red\n" +
+    "  Green\n" +
+    "}\n" +
+    "fn same[T](a : T, b : T) -> Bool {\n" +
+    "  a == b\n" +
+    "}\n" +
+    "fn count_eq[U](xs : Array[U], x : U) -> Int {\n" +
+    "  let mut n = 0\n" +
+    "  for y in xs {\n" +
+    "    if same(x, y) {\n" +
+    "      n = n + 1\n" +
+    "    }\n" +
+    "  }\n" +
+    "  n\n" +
+    "}\n" +
+    "fn first[T](xs : Array[T]) -> T {\n" +
+    "  xs[0]\n" +
+    "}\n"
+  let good = prelude +
+    "pub fn main() -> Int {\n" +
+    "  let ok = same(1, 2) || same(\"a\", \"b\") || same(Red, Green)\n" +
+    "  let opts : Array[Option[Int]] = [Some(1)]\n" +
+    "  let _ = first(opts)\n" +
+    "  let k = if ok { 1 } else { 0 }\n" +
+    "  count_eq([\"a\", \"b\"], \"a\") + k\n" +
+    "}\n"
+  let (ok1, json1, _) = check_one(good)
+  assert_true(ok1, "comparable instantiations: " + json1)
+  let bad = prelude +
+    "pub fn main() -> Int {\n" +
+    "  let a = same(Some(1), None)\n" +
+    "  let r : Result[Int, String] = Ok(1)\n" +
+    "  let b = same(r, r)\n" +
+    "  let opts : Array[Option[Int]] = [Some(1)]\n" +
+    "  let k = if a || b { 1 } else { 0 }\n" +
+    "  count_eq(opts, None) + k\n" +
+    "}\n"
+  let (ok2, json2, d2) = check_one(bad)
+  assert_true(!ok2, json2)
+  assert_eq(d2.length(), 3)
+  assert_eq(d2[0].code, "E_TYPE_MISMATCH")
+  assert_true(str_contains(d2[0].message, "`T` = `Option[Int]`"), json2)
+  assert_true(str_contains(d2[1].message, "Result[Int, String]"), json2)
+  // Propagated through the generic caller `count_eq`.
+  assert_true(str_contains(d2[2].message, "generic `count_eq` compares `U`"), json2)
+}
+
+///|
+test "p17a: Mutex[Array[T]] and Mutex[Map[String, Array[T]]] are Send, bare containers are not" {
+  let ok_src =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let log : Mutex[Array[String]] = Mutex::new([])\n" +
+    "  let idx : Mutex[Map[String, Array[String]]] = Mutex::new(Map::new())\n" +
+    "  let grid : Mutex[Array[Array[Int]]] = Mutex::new([])\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      let l = log.lock()\n" +
+    "      l.push(\"x\")\n" +
+    "      log.unlock()\n" +
+    "      let m = idx.lock()\n" +
+    "      m.set(\"k\", [\"v\"])\n" +
+    "      idx.unlock()\n" +
+    "      let _ = grid.lock()\n" +
+    "      grid.unlock()\n" +
+    "    })\n" +
+    "  })\n" +
+    "  0\n" +
+    "}\n"
+  let (ok1, json1, _) = check_one(ok_src)
+  assert_true(ok1, json1)
+  let bad_src =
+    "pub fn run(world : World, p : Ptr) -> Int {\n" +
+    "  let bare : Array[String] = []\n" +
+    "  let ptrs : Mutex[Array[Ptr]] = Mutex::new([p])\n" +
+    "  let fns : Mutex[Map[String, Array[(Int) -> Int]]] = Mutex::new(Map::new())\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      let _ = bare.length()\n" +
+    "      let _ = ptrs.lock()\n" +
+    "      ptrs.unlock()\n" +
+    "      let _ = fns.lock()\n" +
+    "      fns.unlock()\n" +
+    "    })\n" +
+    "  })\n" +
+    "  0\n" +
+    "}\n"
+  let (ok2, json2, d2) = check_one(bad_src)
+  assert_true(!ok2, json2)
+  assert_eq(d2.length(), 3)
+  assert_true(d2[0].code == "E_NOT_SEND" && d2[1].code == "E_NOT_SEND" && d2[2].code == "E_NOT_SEND", json2)
 }

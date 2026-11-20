@@ -173,6 +173,9 @@ pub struct VarBinding {
   name : String
   ty : Ty
   is_mut : Bool
+  /// Span of the `let` keyword that introduced the binding (line 0 for
+  /// parameters, loop variables and pattern bindings).
+  decl_span : Span
 }
 
 ///|
@@ -183,6 +186,20 @@ pub struct Env {
   ret_ty : Ty
   type_params : Array[String]
   type_bounds : Map[String, Array[String]]
+  /// Decl key (`span_key`) of the generic fn whose body is being checked.
+  mut fn_key : String
+}
+
+///|
+/// A call `callee[tparam := concrete]` whose validity depends on whether the
+/// callee compares `tparam` values with `==` / `!=`.
+pub struct EqUse {
+  callee_key : String
+  callee_name : String
+  tparam : String
+  concrete : Ty
+  caller_key : String
+  span : Span
 }
 
 ///|
@@ -219,6 +236,12 @@ pub struct TypeChecker {
   import_aliases : Map[String, String]
   imported_pkgs : Map[String, ImportedPkg]
   diagnostics : Array[Diagnostic]
+  /// Generic fn decl key -> type params its body compares with `==` / `!=`.
+  eq_tparams : Map[String, Array[String]]
+  eq_keys : Array[String]
+  eq_uses : Array[EqUse]
+  /// Dedup keys of machine-applicable edits already attached.
+  edit_keys : Map[String, Bool]
 }
 
 ///|
@@ -249,6 +272,7 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     ret_ty: ret_ty,
     type_params: type_params,
     type_bounds: Map([]),
+    fn_key: "",
   }
 }
 
@@ -266,8 +290,24 @@ fn env_pop(env : Env) -> Unit {
 
 ///|
 fn env_define(env : Env, name : String, ty : Ty, is_mut : Bool) -> Unit {
+  env_define_at(env, name, ty, is_mut, span_empty())
+}
+
+///|
+fn env_define_at(
+  env : Env,
+  name : String,
+  ty : Ty,
+  is_mut : Bool,
+  decl_span : Span,
+) -> Unit {
   let top = env.scopes[env.scopes.length() - 1]
-  top.set(name, VarBinding::{ name: name, ty: ty, is_mut: is_mut })
+  top.set(name, VarBinding::{
+    name: name,
+    ty: ty,
+    is_mut: is_mut,
+    decl_span: decl_span,
+  })
   match ty {
     TWorld => env.has_world = true
     _ => ()
@@ -399,6 +439,15 @@ fn qualify_fn_info(pkg_name : String, fi : FnInfo) -> FnInfo {
 ///|
 fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
   tc.imported_pkgs.set(ipkg.name, ipkg)
+  let mut ei = 0
+  while ei < ipkg.tc.eq_keys.length() {
+    let ek = ipkg.tc.eq_keys[ei]
+    match ipkg.tc.eq_tparams.get(ek) {
+      Some(tps) => eq_tparams_add_all(tc, ek, tps)
+      None => ()
+    }
+    ei = ei + 1
+  }
   let skeys = ipkg.tc.struct_names
   let mut i = 0
   while i < skeys.length() {
@@ -650,6 +699,22 @@ pub fn resolve_alias_pkg(
 }
 
 ///|
+/// Private symbol with a known declaration: also patch `pub ` onto it.
+fn emit_private_err_at(
+  tc : TypeChecker,
+  sp : Span,
+  kind : String,
+  pkg_name : String,
+  sym : String,
+  decl_span : Span,
+) -> Unit {
+  emit_private_err(tc, sp, kind, pkg_name, sym)
+  if decl_span.file != "" {
+    tc_add_edit(tc, text_edit_insert(decl_span, 0, "pub "))
+  }
+}
+
+///|
 fn emit_private_err(
   tc : TypeChecker,
   sp : Span,
@@ -666,6 +731,173 @@ fn emit_private_err(
     "private " + kind + " `" + pkg_name + "::" + sym + "`",
     "mark `" + kind + " " + sym + "` as `pub` in package `" + pkg_name + "`",
   )
+}
+
+///|
+/// Attaches a machine-applicable edit to the diagnostic just reported (once
+/// per distinct edit, so repeated errors never yield conflicting patches).
+fn tc_add_edit(tc : TypeChecker, edit : TextEdit) -> Unit {
+  tc_add_edit_at(tc, tc.diagnostics.length() - 1, edit)
+}
+
+///|
+fn tc_add_edit_at(tc : TypeChecker, idx : Int, edit : TextEdit) -> Unit {
+  if idx < 0 || idx >= tc.diagnostics.length() || edit.line <= 0 || edit.col <= 0 {
+    return
+  }
+  let key = edit.file +
+    ":" +
+    edit.line.to_string() +
+    ":" +
+    edit.col.to_string() +
+    ":" +
+    edit.end_line.to_string() +
+    ":" +
+    edit.end_col.to_string() +
+    ":" +
+    edit.replacement
+  if tc.edit_keys.contains(key) {
+    return
+  }
+  tc.edit_keys.set(key, true)
+  tc.diagnostics[idx].edits.push(edit)
+}
+
+///|
+/// Index of the latest diagnostic `code` reported at `sp`, or -1.
+fn tc_find_diag(tc : TypeChecker, code : String, sp : Span) -> Int {
+  let mut i = tc.diagnostics.length() - 1
+  while i >= 0 {
+    let d = tc.diagnostics[i]
+    if d.code == code && d.line == sp.line && d.col == sp.col && d.file == sp.file {
+      return i
+    }
+    i = i - 1
+  }
+  -1
+}
+
+///|
+pub fn span_key(sp : Span) -> String {
+  sp.file + ":" + sp.line.to_string() + ":" + sp.col.to_string()
+}
+
+///|
+/// Column just past a single-line type expression written in canonical
+/// (`pionc fmt`) spacing, or -1 when it cannot be located exactly.
+fn type_expr_end_col(te : TypeExpr) -> Int {
+  match te {
+    TyName(name, args, sp) => {
+      if args.length() == 0 {
+        return sp.col + name.length()
+      }
+      let mut i = 0
+      while i < args.length() {
+        if type_expr_span(args[i]).line != sp.line {
+          return -1
+        }
+        i = i + 1
+      }
+      let last_end = type_expr_end_col(args[args.length() - 1])
+      if last_end < 0 {
+        -1
+      } else {
+        last_end + 1
+      }
+    }
+    _ => -1
+  }
+}
+
+///|
+fn eq_tparams_has(tc : TypeChecker, key : String, tparam : String) -> Bool {
+  match tc.eq_tparams.get(key) {
+    Some(tps) => str_arr_contains(tps, tparam)
+    None => false
+  }
+}
+
+///|
+fn eq_tparams_add(tc : TypeChecker, key : String, tparam : String) -> Bool {
+  match tc.eq_tparams.get(key) {
+    Some(tps) =>
+      if str_arr_contains(tps, tparam) {
+        false
+      } else {
+        tps.push(tparam)
+        true
+      }
+    None => {
+      tc.eq_tparams.set(key, [tparam])
+      tc.eq_keys.push(key)
+      true
+    }
+  }
+}
+
+///|
+fn eq_tparams_add_all(tc : TypeChecker, key : String, tps : Array[String]) -> Unit {
+  let mut i = 0
+  while i < tps.length() {
+    let _ = eq_tparams_add(tc, key, tps[i])
+    i = i + 1
+  }
+}
+
+///|
+/// Closes the generic `==` / `!=` check: a type parameter compared in a
+/// generic body must be instantiated with a value-comparable type.
+/// Requirements propagate through generic callers before reporting.
+fn resolve_eq_uses(tc : TypeChecker) -> Unit {
+  let mut changed = true
+  let mut rounds = 0
+  while changed && rounds < 16 {
+    changed = false
+    let mut i = 0
+    while i < tc.eq_uses.length() {
+      let u = tc.eq_uses[i]
+      if u.caller_key != "" && eq_tparams_has(tc, u.callee_key, u.tparam) {
+        match u.concrete {
+          TParam(outer) =>
+            if eq_tparams_add(tc, u.caller_key, outer) {
+              changed = true
+            }
+          _ => ()
+        }
+      }
+      i = i + 1
+    }
+    rounds = rounds + 1
+  }
+  let mut i = 0
+  while i < tc.eq_uses.length() {
+    let u = tc.eq_uses[i]
+    if eq_tparams_has(tc, u.callee_key, u.tparam) && !eq_comparable(tc, u.concrete) {
+      let cname = ty_to_string(u.concrete)
+      tc_err(
+        tc,
+        u.span,
+        "E_TYPE_MISMATCH",
+        "generic `" +
+        u.callee_name +
+        "` compares `" +
+        u.tparam +
+        "` values with `==`/`!=`, but `" +
+        u.tparam +
+        "` = `" +
+        cname +
+        "` is not value-comparable (no implicit pointer-identity comparison)",
+        "value-comparable type for `" + u.tparam + "`",
+        cname,
+        "instantiate `" +
+        u.callee_name +
+        "` with a scalar, `String` or payload-less enum, or compare `" +
+        cname +
+        "` values with `match`",
+      )
+    }
+    i = i + 1
+  }
 }
 
 ///|
@@ -800,7 +1032,7 @@ fn resolve_type_expr(
             match ipkg.tc.structs.get(q_type) {
               Some(si) => {
                 if !si.decl.is_pub {
-                  emit_private_err(tc, sp, "struct", ipkg.name, q_type)
+                  emit_private_err_at(tc, sp, "struct", ipkg.name, q_type, si.decl.span)
                 }
                 return TStruct(ipkg.name + "::" + q_type, rargs)
               }
@@ -809,7 +1041,7 @@ fn resolve_type_expr(
             match ipkg.tc.enums.get(q_type) {
               Some(ei) => {
                 if !ei.decl.is_pub {
-                  emit_private_err(tc, sp, "enum", ipkg.name, q_type)
+                  emit_private_err_at(tc, sp, "enum", ipkg.name, q_type, ei.decl.span)
                 }
                 return TEnum(ipkg.name + "::" + q_type, rargs)
               }
@@ -1184,18 +1416,19 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
 }
 
 ///|
-/// `Map[String, V]` with a primitive or `String` value may live in a `Mutex`:
-/// the runtime freezes a frozen map's entries and everything later stored in
-/// it, so entries inserted or released on any thread keep a correct atomic RC.
-fn is_mutex_shareable_map(t : Ty) -> Bool {
+/// Containers a `Mutex` may share across threads: `Array[T]` and
+/// `Map[String, V]` whose elements are `Send` or themselves such containers
+/// (`Mutex[Map[String, Array[String]]]`). The runtime freezes them
+/// recursively on `Mutex::new` / `set`, and every object later stored into a
+/// frozen container is frozen on insertion, so element RC stays atomic.
+/// Bare `Array` / `Map` (no `Mutex`), `Ptr` and closures stay `!Send`.
+fn is_mutex_inner_send(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
   match t {
+    TArray(e) => is_send_ty(tc, e, visiting) || is_mutex_inner_send(tc, e, visiting)
     TMap(k, v) =>
       match k {
         TString =>
-          match v {
-            TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TUnit => true
-            _ => false
-          }
+          is_send_ty(tc, v, visiting) || is_mutex_inner_send(tc, v, visiting)
         _ => false
       }
     _ => false
@@ -1216,7 +1449,8 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
     TResult(ok, err) =>
       is_send_ty(tc, ok, visiting) && is_send_ty(tc, err, visiting)
     TChannel(e) => is_send_ty(tc, e, visiting)
-    TMutex(e) => is_send_ty(tc, e, visiting) || is_mutex_shareable_map(e)
+    TMutex(e) =>
+      is_send_ty(tc, e, visiting) || is_mutex_inner_send(tc, e, visiting)
     TFn(_, _) => false
     TTuple(elems) => {
       let mut i = 0
@@ -1744,6 +1978,38 @@ fn collect_expr_captures(
 }
 
 ///|
+/// Inserts the missing arms (one per line, `panic`-bodied) before the first
+/// existing arm, keeping its indentation.
+fn add_missing_arms_edit(
+  tc : TypeChecker,
+  arms : Array[MatchArm],
+  pats : Array[String],
+) -> Unit {
+  if arms.length() == 0 || pats.length() == 0 {
+    return
+  }
+  let first = arms[0].span
+  let indent = StringBuilder()
+  let mut k = 1
+  while k < first.col {
+    indent.write_string(" ")
+    k = k + 1
+  }
+  let ind = indent.to_string()
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < pats.length() {
+    sb.write_string(pats[i])
+    sb.write_string(" => panic(\"unhandled ")
+    sb.write_string(pats[i])
+    sb.write_string("\")\n")
+    sb.write_string(ind)
+    i = i + 1
+  }
+  tc_add_edit(tc, text_edit_insert(first, 0, sb.to_string()))
+}
+
+///|
 fn check_match_exhaustiveness(
   tc : TypeChecker,
   scrut_ty : Ty,
@@ -1792,6 +2058,7 @@ fn check_match_exhaustiveness(
           "missing " + miss_str,
           "add missing match arm(s): " + miss_str + " => ...",
         )
+        add_missing_arms_edit(tc, arms, missing)
       }
     }
     TOption(_) => {
@@ -1813,6 +2080,7 @@ fn check_match_exhaustiveness(
           "missing " + miss_str,
           "add missing match arm(s): " + miss_str + " => ...",
         )
+        add_missing_arms_edit(tc, arms, missing)
       }
     }
     TResult(_, _) => {
@@ -1834,6 +2102,7 @@ fn check_match_exhaustiveness(
           "missing " + miss_str,
           "add missing match arm(s): " + miss_str + " => ...",
         )
+        add_missing_arms_edit(tc, arms, missing)
       }
     }
     TEnum(ename, _) =>
@@ -1841,11 +2110,30 @@ fn check_match_exhaustiveness(
         None => ()
         Some(einfo) => {
           let missing : Array[String] = []
+          let missing_pats : Array[String] = []
           let mut vi = 0
           while vi < einfo.variants.length() {
             let v = einfo.variants[vi]
             if !str_arr_contains(covered, v.name) {
               missing.push(v.name)
+              let nf = v.field_tys.length()
+              if nf == 0 {
+                missing_pats.push(v.name)
+              } else {
+                let psb = StringBuilder()
+                psb.write_string(v.name)
+                psb.write_string("(")
+                let mut fj = 0
+                while fj < nf {
+                  if fj > 0 {
+                    psb.write_string(", ")
+                  }
+                  psb.write_string("_")
+                  fj = fj + 1
+                }
+                psb.write_string(")")
+                missing_pats.push(psb.to_string())
+              }
             }
             vi = vi + 1
           }
@@ -1860,6 +2148,7 @@ fn check_match_exhaustiveness(
               "missing " + miss_str,
               "add missing match arm(s): " + miss_str + " => ...",
             )
+            add_missing_arms_edit(tc, arms, missing_pats)
           }
         }
       }
@@ -2059,7 +2348,7 @@ fn check_unhandled_result(tc : TypeChecker, stmt : Stmt, ty : Ty) -> Unit {
   match stmt {
     SExpr(_, sp) =>
       match ty {
-        TResult(_, _) =>
+        TResult(_, _) => {
           tc_err(
             tc,
             sp,
@@ -2071,6 +2360,8 @@ fn check_unhandled_result(tc : TypeChecker, stmt : Stmt, ty : Ty) -> Unit {
             ty_to_string(ty),
             "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`",
           )
+          tc_add_edit(tc, text_edit_insert(sp, 0, "let _ = "))
+        }
         _ => ()
       }
     _ => ()
@@ -2147,7 +2438,7 @@ fn check_stmt(
         None => init_ty
       }
       if name != "_" {
-        env_define(env, name, final_ty, is_mut)
+        env_define_at(env, name, final_ty, is_mut, sp)
       }
       TUnit
     }
@@ -2237,6 +2528,10 @@ fn check_stmt(
                   "immutable `" + name + "`",
                   "declare `" + name + "` with `let mut " + name + "`",
                 )
+                // `let x` -> `let mut x` at the declaration.
+                if b.decl_span.line > 0 {
+                  tc_add_edit(tc, text_edit_insert(b.decl_span, 4, "mut "))
+                }
               }
               let rty = check_expr(tc, env, rhs, Some(b.ty))
               if !ty_compat(b.ty, rty) {
@@ -2883,7 +3178,89 @@ fn check_fn_call(
     }
     bi = bi + 1
   }
+  // Record instantiations; `resolve_eq_uses` rejects non-comparable ones once
+  // every generic body (and its `==` uses) has been checked.
+  let mut ti = 0
+  while ti < finfo.decl.type_params.length() {
+    let tp = finfo.decl.type_params[ti]
+    match subst.get(tp) {
+      Some(concrete) =>
+        tc.eq_uses.push(EqUse::{
+          callee_key: span_key(finfo.decl.span),
+          callee_name: finfo.decl.name,
+          tparam: tp,
+          concrete: concrete,
+          caller_key: env.fn_key,
+          span: sp,
+        })
+      None => ()
+    }
+    ti = ti + 1
+  }
   subst_ty(finfo.ret_ty, subst)
+}
+
+///|
+fn check_no_args(
+  tc : TypeChecker,
+  env : Env,
+  method_name : String,
+  args : Array[Expr],
+  sp : Span,
+) -> Unit {
+  if args.length() != 0 {
+    let mut i = 0
+    while i < args.length() {
+      let _ = check_expr(tc, env, args[i], None)
+      i = i + 1
+    }
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "`" + method_name + "` takes no arguments, found " + args.length().to_string(),
+      "0 args",
+      args.length().to_string() + " args",
+      "call `." + method_name + "()`",
+    )
+  }
+}
+
+///|
+fn check_unwrap_or_arg(
+  tc : TypeChecker,
+  env : Env,
+  inner : Ty,
+  args : Array[Expr],
+  sp : Span,
+) -> Unit {
+  if args.length() != 1 {
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "`unwrap_or` expects 1 argument (the default), found " + args.length().to_string(),
+      "1 arg",
+      args.length().to_string() + " args",
+      "call `.unwrap_or(<default : " + ty_to_string(inner) + ">)`",
+    )
+  }
+  let mut i = 0
+  while i < args.length() {
+    let aty = check_expr(tc, env, args[i], Some(inner))
+    if i == 0 && !ty_compat(inner, aty) {
+      tc_err(
+        tc,
+        expr_span(args[i]),
+        "E_TYPE_MISMATCH",
+        "`unwrap_or` default type mismatch",
+        ty_to_string(inner),
+        ty_to_string(aty),
+        "pass a default of type `" + ty_to_string(inner) + "`",
+      )
+    }
+    i = i + 1
+  }
 }
 
 ///|
@@ -2958,12 +3335,45 @@ fn check_method_call(
       if method_name == "to_int" {
         return TInt
       }
+    TOption(inner) => {
+      if method_name == "is_some" || method_name == "is_none" {
+        check_no_args(tc, env, method_name, args, sp)
+        return TBool
+      }
+      if method_name == "unwrap_or" {
+        check_unwrap_or_arg(tc, env, inner, args, sp)
+        return inner
+      }
+    }
+    TResult(ok, _) => {
+      if method_name == "is_ok" || method_name == "is_err" {
+        check_no_args(tc, env, method_name, args, sp)
+        return TBool
+      }
+      if method_name == "unwrap_or" {
+        check_unwrap_or_arg(tc, env, ok, args, sp)
+        return ok
+      }
+    }
     TString => {
       if method_name == "length" {
         return TInt
       }
       if method_name == "to_string" {
         return TString
+      }
+      // Parsing never panics: malformed or out-of-range text is `None`.
+      if method_name == "to_int" {
+        check_no_args(tc, env, method_name, args, sp)
+        return TOption(TInt)
+      }
+      if method_name == "to_int64" {
+        check_no_args(tc, env, method_name, args, sp)
+        return TOption(TInt64)
+      }
+      if method_name == "to_double" {
+        check_no_args(tc, env, method_name, args, sp)
+        return TOption(TDouble)
       }
       if method_name == "code_unit_at" {
         if args.length() >= 1 {
@@ -3668,7 +4078,7 @@ fn check_expr(
           match ipkg.tc.fns.get(mem) {
             Some(fi) => {
               if !fi.decl.is_pub {
-                emit_private_err(tc, sp, "fn", ipkg.name, mem)
+                emit_private_err_at(tc, sp, "fn", ipkg.name, mem, fi.decl.span)
               }
               let qfi = qualify_fn_info(ipkg.name, fi)
               return TFn(qfi.param_tys, qfi.ret_ty)
@@ -3785,6 +4195,15 @@ fn check_expr(
         }
         TBool
       } else if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+        if op == "==" || op == "!=" {
+          match lty {
+            TParam(tp) =>
+              if env.fn_key != "" && str_arr_contains(env.type_params, tp) {
+                let _ = eq_tparams_add(tc, env.fn_key, tp)
+              }
+            _ => ()
+          }
+        }
         if (op == "==" || op == "!=") && !eq_comparable(tc, lty) {
           let lname = ty_to_string(lty)
           tc_err(
@@ -4167,7 +4586,7 @@ fn check_expr(
               match ipkg.tc.fns.get(mem) {
                 Some(fi) => {
                   if !fi.decl.is_pub {
-                    emit_private_err(tc, sp, "fn", ipkg.name, mem)
+                    emit_private_err_at(tc, sp, "fn", ipkg.name, mem, fi.decl.span)
                   }
                   return check_fn_call(
                     tc,
@@ -4883,6 +5302,10 @@ pub fn check_package_with_imports(
     import_aliases: Map([]),
     imported_pkgs: Map([]),
     diagnostics: [],
+    eq_tparams: Map([]),
+    eq_keys: [],
+    eq_uses: [],
+    edit_keys: Map([]),
   }
 
   let mut ipi = 0
@@ -5333,6 +5756,32 @@ pub fn check_package_with_imports(
                         act_sig,
                         "change signature to `" + exp_sig + "`",
                       )
+                      // Return type alone differs: replace it in place.
+                      let mut params_ok = impl_fi.param_tys.length() ==
+                        exp_ptys.length()
+                      let mut k2 = 0
+                      while params_ok && k2 < exp_ptys.length() {
+                        if !ty_compat(exp_ptys[k2], impl_fi.param_tys[k2]) {
+                          params_ok = false
+                        }
+                        k2 = k2 + 1
+                      }
+                      let exp_rs = ty_to_string(exp_rty)
+                      if params_ok && !has_qual_sep(exp_rs) {
+                        let rte = impl_fi.decl.ret_ty
+                        let rsp = type_expr_span(rte)
+                        let end_col = type_expr_end_col(rte)
+                        if end_col > 0 {
+                          tc_add_edit(tc, TextEdit::{
+                            file: rsp.file,
+                            line: rsp.line,
+                            col: rsp.col,
+                            end_line: rsp.line,
+                            end_col: end_col,
+                            replacement: exp_rs,
+                          })
+                        }
+                      }
                     }
                   }
                 }
@@ -5416,6 +5865,9 @@ pub fn check_package_with_imports(
           match finfo_opt {
             Some(finfo) => {
               let env = env_new(finfo.ret_ty, fd.type_params)
+              if fd.type_params.length() > 0 {
+                env.fn_key = span_key(fd.span)
+              }
               let mut bi = 0
               while bi < fd.type_bounds.length() {
                 let tb = fd.type_bounds[bi]
@@ -5434,6 +5886,24 @@ pub fn check_package_with_imports(
                 pi = pi + 1
               }
               let body_ty = check_stmts(tc, env, fd.body, Some(finfo.ret_ty))
+              match fd.ret_ty {
+                // Missing `-> T`: patch in the type the body actually produces.
+                TyMissing(rsp) =>
+                  match body_ty {
+                    TError | TNever => ()
+                    _ => {
+                      let rs = ty_to_string(body_ty)
+                      if !has_qual_sep(rs) {
+                        tc_add_edit_at(
+                          tc,
+                          tc_find_diag(tc, "E_MISSING_TYPE", rsp),
+                          text_edit_insert(rsp, 0, "-> " + rs + " "),
+                        )
+                      }
+                    }
+                  }
+                _ => ()
+              }
               if !ty_compat(finfo.ret_ty, body_ty) {
                 tc_err(
                   tc,
@@ -5521,6 +5991,7 @@ pub fn check_package_with_imports(
     fi = fi + 1
   }
 
+  resolve_eq_uses(tc)
   CheckedPackage::{ pkg: pkg, tc: tc, diagnostics: tc.diagnostics }
 }
 

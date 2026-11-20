@@ -16,6 +16,31 @@ pub fn span_empty() -> Span {
 }
 
 ///|
+/// A machine-applicable source patch: replace `[line:col, end_line:end_col)`
+/// (1-based, end exclusive; an empty range is an insertion) in `file` with
+/// `replacement`.
+pub struct TextEdit {
+  file : String
+  line : Int
+  col : Int
+  end_line : Int
+  end_col : Int
+  replacement : String
+}
+
+///|
+pub fn text_edit_insert(sp : Span, col_delta : Int, text : String) -> TextEdit {
+  TextEdit::{
+    file: sp.file,
+    line: sp.line,
+    col: sp.col + col_delta,
+    end_line: sp.line,
+    end_col: sp.col + col_delta,
+    replacement: text,
+  }
+}
+
+///|
 pub struct Diagnostic {
   file : String
   line : Int
@@ -25,6 +50,7 @@ pub struct Diagnostic {
   expected : String
   found : String
   fixit : String
+  edits : Array[TextEdit]
 }
 
 ///|
@@ -45,6 +71,7 @@ pub fn diag_new(
     expected: expected,
     found: found,
     fixit: fixit,
+    edits: [],
   }
 }
 
@@ -252,6 +279,32 @@ pub fn diagnostic_to_json(d : Diagnostic) -> String {
   sb.write_string(json_quote(d.found))
   sb.write_string(",\"fixit\":")
   sb.write_string(json_quote(d.fixit))
+  // Only diagnostics with a machine-applicable patch pay for the field.
+  if d.edits.length() > 0 {
+    sb.write_string(",\"edits\":[")
+    let mut i = 0
+    while i < d.edits.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      let e = d.edits[i]
+      sb.write_string("{\"file\":")
+      sb.write_string(json_quote(e.file))
+      sb.write_string(",\"line\":")
+      sb.write_string(e.line.to_string())
+      sb.write_string(",\"col\":")
+      sb.write_string(e.col.to_string())
+      sb.write_string(",\"end_line\":")
+      sb.write_string(e.end_line.to_string())
+      sb.write_string(",\"end_col\":")
+      sb.write_string(e.end_col.to_string())
+      sb.write_string(",\"replacement\":")
+      sb.write_string(json_quote(e.replacement))
+      sb.write_string("}")
+      i = i + 1
+    }
+    sb.write_string("]")
+  }
   sb.write_string("}")
   sb.to_string()
 }

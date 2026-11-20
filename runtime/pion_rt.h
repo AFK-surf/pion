@@ -130,6 +130,7 @@ void*    pion_str_slice(void *s, int64_t start, int64_t end);
 void*    pion_int_to_str(int64_t v);
 void*    pion_double_to_str(double v);
 int64_t  pion_str_to_int(void *s, int32_t *ok_out);
+double   pion_str_to_double(void *s, int32_t *ok_out);
 int32_t  pion_str_starts_with(void *s, void *prefix);
 int32_t  pion_str_ends_with(void *s, void *suffix);
 int32_t  pion_str_contains(void *s, void *needle);
