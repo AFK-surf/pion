@@ -228,6 +228,28 @@ int32_t  m2_world_exec(void *w, void *argv_arr);
 void*    m2_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out);
 void*    m2_sha256_hex(void *s);
 
+/* FFI Raw Pointers & CStr */
+void*    m2_ptr_alloc(int64_t bytes);
+void     m2_ptr_free(void *p);
+void*    m2_ptr_offset(void *p, int64_t byte_off);
+void*    m2_ptr_read_ptr(void *p, int64_t byte_off);
+void     m2_ptr_write_ptr(void *p, int64_t byte_off, void *v);
+int32_t  m2_ptr_read_i32(void *p, int64_t byte_off);
+void     m2_ptr_write_i32(void *p, int64_t byte_off, int32_t v);
+int64_t  m2_ptr_read_i64(void *p, int64_t byte_off);
+void     m2_ptr_write_i64(void *p, int64_t byte_off, int64_t v);
+void*    m2_cstr_to_str(void *cstr);
+
+/* POSIX TCP Socket & Time */
+int32_t  m2_tcp_listen(void *w_ptr, void *host_str, int32_t port);
+int32_t  m2_tcp_local_port(void *w_ptr, int32_t fd);
+int32_t  m2_tcp_accept(void *w_ptr, int32_t listen_fd);
+int32_t  m2_tcp_connect(void *w_ptr, void *host_str, int32_t port);
+void*    m2_tcp_read(void *w_ptr, int32_t fd, int32_t max_bytes);
+int32_t  m2_tcp_write(void *w_ptr, int32_t fd, void *data_str);
+void     m2_tcp_close(void *w_ptr, int32_t fd);
+void     m2_sleep_ms(void *w_ptr, int32_t ms);
+
 #ifdef __cplusplus
 }
 #endif

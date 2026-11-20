@@ -2,17 +2,21 @@
 
 #include "m2_rt.h"
 
+#include <arpa/inet.h>
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <limits.h>
 #include <math.h>
+#include <netinet/in.h>
 #include <pthread.h>
+#include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <sys/wait.h>
@@ -56,20 +60,20 @@ static inline M2Header *m2_hdr(void *obj) {
     return ((M2Header *)obj) - 1;
 }
 
-void m2_panic(const char *msg, const char *file, int32_t line) {
+M2_MINSIZE void m2_panic(const char *msg, const char *file, int32_t line) {
     fprintf(stderr, "m2 panic at %s:%d: %s\n",
             file ? file : "<unknown>", (int)line, msg ? msg : "");
     fflush(stderr);
     abort();
 }
 
-void m2_panic_oob(int64_t idx, int64_t len) {
+M2_MINSIZE void m2_panic_oob(int64_t idx, int64_t len) {
     fprintf(stderr, "m2 panic: index %" PRId64 " out of bounds (len %" PRId64 ")\n", idx, len);
     fflush(stderr);
     abort();
 }
 
-void m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line) {
+M2_MINSIZE void m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line) {
     if (__builtin_expect(!cond, 0)) {
         const char *msg = msg_str ? ((M2String *)msg_str)->data : "assertion failed";
         m2_panic(msg, file, line);
@@ -1387,14 +1391,14 @@ static void *m2_spawn_trampoline(void *arg) {
     return NULL;
 }
 
-static void m2_scope_drop(void *payload) {
+M2_MINSIZE static void m2_scope_drop(void *payload) {
     M2Scope *s = (M2Scope *)payload;
     pthread_mutex_destroy(&s->mu);
     free(s->threads);
     s->threads = NULL;
 }
 
-void *m2_scope_begin(void) {
+M2_MINSIZE void *m2_scope_begin(void) {
     M2Scope *s = (M2Scope *)m2_alloc((uint32_t)sizeof(M2Scope), M2_TAG_SCOPE, m2_scope_drop);
     pthread_mutex_init(&s->mu, NULL);
     s->threads = NULL;
@@ -1404,7 +1408,7 @@ void *m2_scope_begin(void) {
     return s;
 }
 
-void m2_scope_spawn(void *scope_ptr, void (*fn)(void *env), void *env) {
+M2_MINSIZE void m2_scope_spawn(void *scope_ptr, void (*fn)(void *env), void *env) {
     M2Scope *s = (M2Scope *)scope_ptr;
     if (!s || !fn) m2_panic("invalid scope_spawn", __FILE__, __LINE__);
     if (env) {
@@ -1442,7 +1446,7 @@ void m2_scope_spawn(void *scope_ptr, void (*fn)(void *env), void *env) {
     pthread_mutex_unlock(&s->mu);
 }
 
-void m2_scope_end(void *scope_ptr) {
+M2_MINSIZE void m2_scope_end(void *scope_ptr) {
     M2Scope *s = (M2Scope *)scope_ptr;
     if (!s) return;
     for (;;) {
@@ -1686,7 +1690,7 @@ typedef struct M2World {
     char **argv;
 } M2World;
 
-void *m2_world_init(int argc, char **argv) {
+M2_MINSIZE void *m2_world_init(int argc, char **argv) {
     M2World *w = (M2World *)m2_alloc((uint32_t)sizeof(M2World), M2_TAG_WORLD, NULL);
     w->argc = argc;
     w->argv = argv;
@@ -1694,12 +1698,12 @@ void *m2_world_init(int argc, char **argv) {
     return w;
 }
 
-int64_t m2_world_argc(void *w_ptr) {
+M2_MINSIZE int64_t m2_world_argc(void *w_ptr) {
     M2World *w = (M2World *)w_ptr;
     return w ? (int64_t)w->argc : 0;
 }
 
-void *m2_world_argv(void *w_ptr, int64_t idx) {
+M2_MINSIZE void *m2_world_argv(void *w_ptr, int64_t idx) {
     M2World *w = (M2World *)w_ptr;
     if (!w || idx < 0 || idx >= w->argc) {
         m2_panic("argv index out of bounds", __FILE__, __LINE__);
@@ -1708,7 +1712,7 @@ void *m2_world_argv(void *w_ptr, int64_t idx) {
     return m2_str_from_cstr(arg, (int64_t)strlen(arg));
 }
 
-void *m2_world_args(void *w_ptr) {
+M2_MINSIZE void *m2_world_args(void *w_ptr) {
     M2World *w = (M2World *)w_ptr;
     int64_t n = w ? (int64_t)w->argc : 0;
     void *arr = m2_arr_new(n, 1);
@@ -1720,7 +1724,7 @@ void *m2_world_args(void *w_ptr) {
     return arr;
 }
 
-void m2_world_print(void *w_ptr, void *s_ptr) {
+M2_MINSIZE void m2_world_print(void *w_ptr, void *s_ptr) {
     (void)w_ptr;
     M2String *s = (M2String *)s_ptr;
     if (s && s->len > 0) {
@@ -1729,7 +1733,7 @@ void m2_world_print(void *w_ptr, void *s_ptr) {
     fflush(stdout);
 }
 
-void m2_world_println(void *w_ptr, void *s_ptr) {
+M2_MINSIZE void m2_world_println(void *w_ptr, void *s_ptr) {
     (void)w_ptr;
     M2String *s = (M2String *)s_ptr;
     if (s && s->len > 0) {
@@ -1739,7 +1743,7 @@ void m2_world_println(void *w_ptr, void *s_ptr) {
     fflush(stdout);
 }
 
-void m2_world_eprintln(void *w_ptr, void *s_ptr) {
+M2_MINSIZE void m2_world_eprintln(void *w_ptr, void *s_ptr) {
     (void)w_ptr;
     M2String *s = (M2String *)s_ptr;
     if (s && s->len > 0) {
@@ -1790,7 +1794,7 @@ M2_MINSIZE void *m2_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_out) 
     return out;
 }
 
-int32_t m2_world_fs_write(void *w_ptr, void *path_str, void *content_str) {
+M2_MINSIZE int32_t m2_world_fs_write(void *w_ptr, void *path_str, void *content_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     M2String *content = (M2String *)content_str;
@@ -1843,7 +1847,7 @@ M2_MINSIZE void *m2_world_fs_read_bytes(void *w_ptr, void *path_str, int32_t *ok
     return out;
 }
 
-int32_t m2_world_fs_write_bytes(void *w_ptr, void *path_str, void *bytes_obj) {
+M2_MINSIZE int32_t m2_world_fs_write_bytes(void *w_ptr, void *path_str, void *bytes_obj) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     M2Bytes *b = (M2Bytes *)bytes_obj;
@@ -1858,7 +1862,7 @@ int32_t m2_world_fs_write_bytes(void *w_ptr, void *path_str, void *bytes_obj) {
     return (written == (size_t)b->len && close_ok) ? 1 : 0;
 }
 
-int32_t m2_world_fs_append(void *w_ptr, void *path_str, void *content_str) {
+M2_MINSIZE int32_t m2_world_fs_append(void *w_ptr, void *path_str, void *content_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     M2String *content = (M2String *)content_str;
@@ -1873,7 +1877,7 @@ int32_t m2_world_fs_append(void *w_ptr, void *path_str, void *content_str) {
     return (written == (size_t)content->len && close_ok) ? 1 : 0;
 }
 
-int64_t m2_world_fs_mtime_ms(void *w_ptr, void *path_str) {
+M2_MINSIZE int64_t m2_world_fs_mtime_ms(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path || path->len == 0) return -1;
@@ -1888,14 +1892,14 @@ int64_t m2_world_fs_mtime_ms(void *w_ptr, void *path_str) {
 #endif
 }
 
-int32_t m2_world_fs_exists(void *w_ptr, void *path_str) {
+M2_MINSIZE int32_t m2_world_fs_exists(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path) return 0;
     return access(path->data, F_OK) == 0 ? 1 : 0;
 }
 
-int32_t m2_world_fs_is_dir(void *w_ptr, void *path_str) {
+M2_MINSIZE int32_t m2_world_fs_is_dir(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path || path->len == 0) return 0;
@@ -1966,14 +1970,14 @@ M2_MINSIZE void *m2_world_fs_list_dir(void *w_ptr, void *path_str) {
     return arr;
 }
 
-int32_t m2_world_fs_remove(void *w_ptr, void *path_str) {
+M2_MINSIZE int32_t m2_world_fs_remove(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path || path->len == 0) return 0;
     return unlink(path->data) == 0 ? 1 : 0;
 }
 
-int32_t m2_world_fs_rename(void *w_ptr, void *old_path, void *new_path) {
+M2_MINSIZE int32_t m2_world_fs_rename(void *w_ptr, void *old_path, void *new_path) {
     (void)w_ptr;
     M2String *op = (M2String *)old_path;
     M2String *np = (M2String *)new_path;
@@ -1981,7 +1985,7 @@ int32_t m2_world_fs_rename(void *w_ptr, void *old_path, void *new_path) {
     return rename(op->data, np->data) == 0 ? 1 : 0;
 }
 
-int64_t m2_world_fs_size(void *w_ptr, void *path_str) {
+M2_MINSIZE int64_t m2_world_fs_size(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path || path->len == 0) return -1;
@@ -1990,7 +1994,7 @@ int64_t m2_world_fs_size(void *w_ptr, void *path_str) {
     return (int64_t)st.st_size;
 }
 
-void *m2_world_env_get(void *w_ptr, void *name_str, int32_t *ok_out) {
+M2_MINSIZE void *m2_world_env_get(void *w_ptr, void *name_str, int32_t *ok_out) {
     (void)w_ptr;
     M2String *name = (M2String *)name_str;
     if (!name) {
@@ -2006,7 +2010,7 @@ void *m2_world_env_get(void *w_ptr, void *name_str, int32_t *ok_out) {
     return m2_str_from_cstr(v, (int64_t)strlen(v));
 }
 
-int64_t m2_world_clock_ms(void *w_ptr) {
+M2_MINSIZE int64_t m2_world_clock_ms(void *w_ptr) {
     (void)w_ptr;
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
@@ -2221,4 +2225,197 @@ M2_MINSIZE void *m2_sha256_hex(void *s_ptr) {
         }
     }
     return m2_str_from_cstr(out, 64);
+}
+
+/* ============================================================================
+ * 8. FFI Raw Pointers & CStr Helpers
+ * ============================================================================ */
+
+M2_MINSIZE void *m2_ptr_alloc(int64_t bytes) {
+    size_t sz = bytes > 0 ? (size_t)bytes : 1u;
+    void *p = calloc(1u, sz);
+    if (!p) m2_panic("out of memory in ptr_alloc", __FILE__, __LINE__);
+    return p;
+}
+
+M2_MINSIZE void m2_ptr_free(void *p) {
+    free(p);
+}
+
+M2_MINSIZE void *m2_ptr_offset(void *p, int64_t byte_off) {
+    if (!p) return NULL;
+    return (void *)((char *)p + byte_off);
+}
+
+M2_MINSIZE void *m2_ptr_read_ptr(void *p, int64_t byte_off) {
+    void *v = NULL;
+    memcpy(&v, (const char *)p + byte_off, sizeof(v));
+    return v;
+}
+
+M2_MINSIZE void m2_ptr_write_ptr(void *p, int64_t byte_off, void *v) {
+    memcpy((char *)p + byte_off, &v, sizeof(v));
+}
+
+M2_MINSIZE int32_t m2_ptr_read_i32(void *p, int64_t byte_off) {
+    int32_t v = 0;
+    memcpy(&v, (const char *)p + byte_off, sizeof(v));
+    return v;
+}
+
+M2_MINSIZE void m2_ptr_write_i32(void *p, int64_t byte_off, int32_t v) {
+    memcpy((char *)p + byte_off, &v, sizeof(v));
+}
+
+M2_MINSIZE int64_t m2_ptr_read_i64(void *p, int64_t byte_off) {
+    int64_t v = 0;
+    memcpy(&v, (const char *)p + byte_off, sizeof(v));
+    return v;
+}
+
+M2_MINSIZE void m2_ptr_write_i64(void *p, int64_t byte_off, int64_t v) {
+    memcpy((char *)p + byte_off, &v, sizeof(v));
+}
+
+M2_MINSIZE void *m2_cstr_to_str(void *cstr) {
+    if (!cstr) return m2_str_from_cstr("", 0);
+    const char *s = (const char *)cstr;
+    return m2_str_from_cstr(s, (int64_t)strlen(s));
+}
+
+/* ============================================================================
+ * 9. POSIX TCP Socket & Time Helpers
+ * ============================================================================ */
+
+static pthread_once_t g_sigpipe_once = PTHREAD_ONCE_INIT;
+
+M2_MINSIZE static void m2_ignore_sigpipe_init(void) {
+    (void)signal(SIGPIPE, SIG_IGN);
+}
+
+M2_MINSIZE static int m2_parse_ipv4_addr(void *host_str, int32_t port, int allow_any,
+                                         struct sockaddr_in *addr) {
+    memset(addr, 0, sizeof(*addr));
+    addr->sin_family = AF_INET;
+    addr->sin_port = htons((uint16_t)port);
+    M2String *h = (M2String *)host_str;
+    const char *hs = (h && h->len > 0) ? h->data : "";
+    if (allow_any && (hs[0] == '\0' || strcmp(hs, "0.0.0.0") == 0)) {
+        addr->sin_addr.s_addr = htonl(INADDR_ANY);
+        return 1;
+    }
+    if (hs[0] == '\0') return 0;
+    if (strcmp(hs, "localhost") == 0) hs = "127.0.0.1";
+    return inet_pton(AF_INET, hs, &addr->sin_addr) == 1;
+}
+
+M2_MINSIZE int32_t m2_tcp_listen(void *w_ptr, void *host_str, int32_t port) {
+    (void)w_ptr;
+    pthread_once(&g_sigpipe_once, m2_ignore_sigpipe_init);
+    if (port < 0 || port > 65535) return -1;
+    struct sockaddr_in addr;
+    if (!m2_parse_ipv4_addr(host_str, port, 1, &addr)) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int yes = 1;
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, (socklen_t)sizeof(yes));
+    if (bind(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr)) != 0 ||
+        listen(fd, 128) != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int32_t)fd;
+}
+
+M2_MINSIZE int32_t m2_tcp_local_port(void *w_ptr, int32_t fd) {
+    (void)w_ptr;
+    if (fd < 0) return -1;
+    struct sockaddr_in addr;
+    socklen_t len = (socklen_t)sizeof(addr);
+    memset(&addr, 0, sizeof(addr));
+    if (getsockname(fd, (struct sockaddr *)&addr, &len) != 0) return -1;
+    return (int32_t)ntohs(addr.sin_port);
+}
+
+M2_MINSIZE int32_t m2_tcp_accept(void *w_ptr, int32_t listen_fd) {
+    (void)w_ptr;
+    if (listen_fd < 0) return -1;
+    int cfd;
+    do {
+        cfd = accept(listen_fd, NULL, NULL);
+    } while (cfd < 0 && errno == EINTR);
+    return cfd >= 0 ? (int32_t)cfd : -1;
+}
+
+M2_MINSIZE int32_t m2_tcp_connect(void *w_ptr, void *host_str, int32_t port) {
+    (void)w_ptr;
+    pthread_once(&g_sigpipe_once, m2_ignore_sigpipe_init);
+    if (port <= 0 || port > 65535) return -1;
+    struct sockaddr_in addr;
+    if (!m2_parse_ipv4_addr(host_str, port, 0, &addr)) return -1;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    int rc;
+    do {
+        rc = connect(fd, (struct sockaddr *)&addr, (socklen_t)sizeof(addr));
+    } while (rc < 0 && errno == EINTR);
+    if (rc != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int32_t)fd;
+}
+
+M2_MINSIZE void *m2_tcp_read(void *w_ptr, int32_t fd, int32_t max_bytes) {
+    (void)w_ptr;
+    if (fd < 0) return m2_str_from_cstr("", 0);
+    size_t cap = max_bytes <= 0 ? 4096u : (size_t)max_bytes;
+    if (cap > (size_t)(4 * 1024 * 1024)) cap = (size_t)(4 * 1024 * 1024);
+    char stack_buf[4096];
+    char *buf = cap <= sizeof(stack_buf) ? stack_buf : (char *)malloc(cap);
+    if (!buf) return m2_str_from_cstr("", 0);
+    ssize_t n;
+    do {
+        n = recv(fd, buf, cap, 0);
+    } while (n < 0 && errno == EINTR);
+    void *out = (n > 0) ? m2_str_from_cstr(buf, (int64_t)n) : m2_str_from_cstr("", 0);
+    if (buf != stack_buf) free(buf);
+    return out;
+}
+
+M2_MINSIZE int32_t m2_tcp_write(void *w_ptr, int32_t fd, void *data_str) {
+    (void)w_ptr;
+    if (fd < 0) return -1;
+    M2String *s = (M2String *)data_str;
+    if (!s || s->len <= 0) return 0;
+    size_t total = (size_t)s->len;
+    size_t sent = 0;
+    while (sent < total) {
+        ssize_t n = send(fd, s->data + sent, total - sent, 0);
+        if (n > 0) {
+            sent += (size_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            return -1;
+        }
+    }
+    return (int32_t)sent;
+}
+
+M2_MINSIZE void m2_tcp_close(void *w_ptr, int32_t fd) {
+    (void)w_ptr;
+    if (fd >= 0) close(fd);
+}
+
+M2_MINSIZE void m2_sleep_ms(void *w_ptr, int32_t ms) {
+    (void)w_ptr;
+    if (ms <= 0) return;
+    struct timespec req;
+    req.tv_sec = (time_t)(ms / 1000);
+    req.tv_nsec = (long)(ms % 1000) * 1000000L;
+    struct timespec rem;
+    while (nanosleep(&req, &rem) < 0 && errno == EINTR) {
+        req = rem;
+    }
 }

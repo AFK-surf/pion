@@ -1596,6 +1596,198 @@ static void test_slab_48b_and_arr_growth(void) {
     printf("[PASS] slab_48b_and_arr_growth\n");
 }
 
+static void test_ffi_ptr_and_cstr(void) {
+    /* Zero-initialized allocation + typed read/write + offset + unaligned safety */
+    void *p = m2_ptr_alloc(48);
+    assert(p != NULL);
+    assert(m2_ptr_read_i64(p, 0) == 0);
+    assert(m2_ptr_read_i64(p, 40) == 0);
+
+    m2_ptr_write_i32(p, 0, -123456789);
+    m2_ptr_write_i32(p, 4, 0x7fffffff);
+    assert(m2_ptr_read_i32(p, 0) == -123456789);
+    assert(m2_ptr_read_i32(p, 4) == 0x7fffffff);
+
+    /* Offset + i64 */
+    void *p16 = m2_ptr_offset(p, 16);
+    assert(p16 == (void *)((char *)p + 16));
+    m2_ptr_write_i64(p16, 0, -987654321012345LL);
+    assert(m2_ptr_read_i64(p, 16) == -987654321012345LL);
+
+    /* Unaligned offset i32/i64 (memcpy alignment-safe) */
+    m2_ptr_write_i32(p, 9, 0x12345678);
+    assert(m2_ptr_read_i32(p, 9) == 0x12345678);
+    m2_ptr_write_i64(p, 25, 0x1122334455667788LL);
+    assert(m2_ptr_read_i64(p, 25) == 0x1122334455667788LL);
+
+    /* Pointer roundtrip */
+    m2_ptr_write_ptr(p, 32, p16);
+    assert(m2_ptr_read_ptr(p, 32) == p16);
+    assert(m2_ptr_offset(NULL, 8) == NULL);
+
+    /* Zero-size alloc + NULL free safety */
+    void *p0 = m2_ptr_alloc(0);
+    assert(p0 != NULL);
+    m2_ptr_free(p0);
+    m2_ptr_free(NULL);
+    m2_ptr_free(p);
+
+    /* m2_cstr_to_str: NULL and non-NULL */
+    void *s_null = m2_cstr_to_str(NULL);
+    assert(m2_str_len(s_null) == 0);
+    const char *raw = "hello ffi \xE4\xB8\x96\xE7\x95\x8C";
+    void *s_raw = m2_cstr_to_str((void *)raw);
+    void *s_exp = m2_str_from_cstr(raw, -1);
+    assert(m2_str_eq(s_raw, s_exp) == 1);
+
+    m2_rc_dec(s_null);
+    m2_rc_dec(s_raw);
+    m2_rc_dec(s_exp);
+    printf("[PASS] ffi_ptr_and_cstr\n");
+}
+
+typedef struct TcpServerEnv {
+    void *w;
+    int32_t listen_fd;
+    int32_t n_clients;
+    void *handled_cnt;
+} TcpServerEnv;
+
+typedef struct TcpClientEnv {
+    void *w;
+    int32_t port;
+    int32_t client_id;
+    void *ok_cnt;
+} TcpClientEnv;
+
+static void tcp_server_worker(void *env_ptr) {
+    TcpServerEnv *env = (TcpServerEnv *)env_ptr;
+    for (int32_t i = 0; i < env->n_clients; i++) {
+        int32_t cfd = m2_tcp_accept(env->w, env->listen_fd);
+        assert(cfd >= 0);
+        void *sb = m2_strbuf_new(32);
+        int64_t got = 0;
+        while (got < 15) {
+            void *chunk = m2_tcp_read(env->w, cfd, 64);
+            int64_t clen = m2_str_len(chunk);
+            if (clen == 0) {
+                m2_rc_dec(chunk);
+                break;
+            }
+            m2_strbuf_push_str(sb, chunk);
+            got += clen;
+            m2_rc_dec(chunk);
+        }
+        void *req = m2_strbuf_to_str(sb);
+        m2_rc_dec(sb);
+        void *prefix = m2_str_from_cstr("echo:", 5);
+        void *resp = m2_str_concat(prefix, req);
+        int32_t nw = m2_tcp_write(env->w, cfd, resp);
+        assert(nw == (int32_t)m2_str_len(resp));
+        m2_tcp_close(env->w, cfd);
+        m2_rc_dec(req);
+        m2_rc_dec(prefix);
+        m2_rc_dec(resp);
+        m2_atomic_fetch_add(env->handled_cnt, 1);
+    }
+}
+
+static void tcp_client_worker(void *env_ptr) {
+    TcpClientEnv *env = (TcpClientEnv *)env_ptr;
+    void *host = m2_str_from_cstr((env->client_id & 1) ? "localhost" : "127.0.0.1", -1);
+    int32_t fd = m2_tcp_connect(env->w, host, env->port);
+    m2_rc_dec(host);
+    assert(fd >= 0);
+
+    char msg_buf[32];
+    snprintf(msg_buf, sizeof(msg_buf), "ping-%d-hello-m2", (int)env->client_id);
+    void *req = m2_str_from_cstr(msg_buf, 15);
+    int32_t nw = m2_tcp_write(env->w, fd, req);
+    assert(nw == 15);
+
+    void *sb = m2_strbuf_new(32);
+    for (;;) {
+        void *chunk = m2_tcp_read(env->w, fd, 64);
+        if (m2_str_len(chunk) == 0) {
+            m2_rc_dec(chunk);
+            break;
+        }
+        m2_strbuf_push_str(sb, chunk);
+        m2_rc_dec(chunk);
+    }
+    void *resp = m2_strbuf_to_str(sb);
+    void *prefix = m2_str_from_cstr("echo:", 5);
+    void *exp = m2_str_concat(prefix, req);
+    assert(m2_str_eq(resp, exp) == 1);
+
+    m2_tcp_close(env->w, fd);
+    m2_rc_dec(req);
+    m2_rc_dec(sb);
+    m2_rc_dec(resp);
+    m2_rc_dec(prefix);
+    m2_rc_dec(exp);
+    m2_atomic_fetch_add(env->ok_cnt, 1);
+}
+
+static void test_tcp_loopback_mt(int argc, char **argv) {
+    void *w = m2_world_init(argc, argv);
+
+    /* Error path checks */
+    assert(m2_tcp_local_port(w, -1) == -1);
+    assert(m2_tcp_accept(w, -1) == -1);
+    void *bad_host = m2_str_from_cstr("999.999.999.999", -1);
+    assert(m2_tcp_connect(w, bad_host, 80) == -1);
+    m2_rc_dec(bad_host);
+    m2_tcp_close(w, -1);
+    m2_sleep_ms(w, 0);
+    m2_sleep_ms(w, 1);
+
+    /* Bind ephemeral port on 127.0.0.1 */
+    void *bind_host = m2_str_from_cstr("127.0.0.1", 9);
+    int32_t lfd = m2_tcp_listen(w, bind_host, 0);
+    m2_rc_dec(bind_host);
+    assert(lfd >= 0);
+    int32_t port = m2_tcp_local_port(w, lfd);
+    assert(port > 0 && port <= 65535);
+
+    const int32_t N_CLIENTS = 4;
+    void *handled_cnt = m2_atomic_new(0);
+    void *ok_cnt = m2_atomic_new(0);
+
+    TcpServerEnv *senv = (TcpServerEnv *)m2_alloc((uint32_t)sizeof(TcpServerEnv), M2_TAG_STRUCT, NULL);
+    senv->w = w;
+    senv->listen_fd = lfd;
+    senv->n_clients = N_CLIENTS;
+    senv->handled_cnt = handled_cnt;
+
+    void *scope = m2_scope_begin();
+    m2_scope_spawn(scope, tcp_server_worker, senv);
+
+    TcpClientEnv *cenvs[4];
+    for (int32_t i = 0; i < N_CLIENTS; i++) {
+        cenvs[i] = (TcpClientEnv *)m2_alloc((uint32_t)sizeof(TcpClientEnv), M2_TAG_STRUCT, NULL);
+        cenvs[i]->w = w;
+        cenvs[i]->port = port;
+        cenvs[i]->client_id = i;
+        cenvs[i]->ok_cnt = ok_cnt;
+        m2_scope_spawn(scope, tcp_client_worker, cenvs[i]);
+    }
+    m2_scope_end(scope);
+
+    assert(m2_atomic_load(handled_cnt) == N_CLIENTS);
+    assert(m2_atomic_load(ok_cnt) == N_CLIENTS);
+
+    m2_tcp_close(w, lfd);
+    m2_rc_dec(senv);
+    for (int32_t i = 0; i < N_CLIENTS; i++) {
+        m2_rc_dec(cenvs[i]);
+    }
+    m2_rc_dec(handled_cnt);
+    m2_rc_dec(ok_cnt);
+    m2_rc_dec(w);
+    printf("[PASS] tcp_loopback_mt (%d concurrent clients on port %d)\n", (int)N_CLIENTS, (int)port);
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -1614,6 +1806,7 @@ int main(int argc, char **argv) {
     test_map_try_get_and_100k();
     test_sha256();
     test_world(argc, argv);
+    test_ffi_ptr_and_cstr();
 
     test_mt_shared_rc();
     test_mt_channel_10k();
@@ -1621,6 +1814,7 @@ int main(int argc, char **argv) {
     test_mt_nested_scope();
     test_mt_slab_stress();
     test_mt_world_exec(argc, argv);
+    test_tcp_loopback_mt(argc, argv);
 
     if (run_bench) {
         run_slab_bench();
