@@ -2342,6 +2342,178 @@ static void test_short_str_and_hash_edges(void) {
     printf("[PASS] short_str_and_hash_edges\n");
 }
 
+static void test_p22a_systems_io(int argc, char **argv) {
+    void *w = pion_world_init(argc, argv);
+
+    /* 1. ptr_read_u8 / ptr_write_u8 / bytes_from_ptr / bytes_copy_to_ptr */
+    void *p = pion_ptr_alloc(16);
+    pion_ptr_write_u8(p, 0, 0);
+    pion_ptr_write_u8(p, 1, 127);
+    pion_ptr_write_u8(p, 2, 128);
+    pion_ptr_write_u8(p, 3, 255);
+    assert(pion_ptr_read_u8(p, 0) == 0);
+    assert(pion_ptr_read_u8(p, 1) == 127);
+    assert(pion_ptr_read_u8(p, 2) == 128);
+    assert(pion_ptr_read_u8(p, 3) == 255);
+
+    void *b = pion_bytes_from_ptr(p, 4);
+    assert(pion_bytes_len(b) == 4);
+    assert(pion_bytes_get(b, 0) == 0);
+    assert(pion_bytes_get(b, 1) == 127);
+    assert(pion_bytes_get(b, 2) == 128);
+    assert(pion_bytes_get(b, 3) == 255);
+
+    void *b0 = pion_bytes_from_ptr(p, 0);
+    assert(pion_bytes_len(b0) == 0);
+    pion_rc_dec(b0);
+
+    void *dst = pion_ptr_alloc(16);
+    pion_bytes_copy_to_ptr(b, 1, dst, 2);
+    assert(pion_ptr_read_u8(dst, 0) == 127);
+    assert(pion_ptr_read_u8(dst, 1) == 128);
+    pion_ptr_free(dst);
+    pion_ptr_free(p);
+    pion_rc_dec(b);
+
+    /* 2. fs_symlink / fs_lstat / fs_readlink / fs_chmod / fs_read_range_nofollow */
+    char dirbuf[128];
+    snprintf(dirbuf, sizeof(dirbuf), "/tmp/pion_rt_p22a_%lld_%lld",
+             (long long)getpid(), (long long)pion_world_clock_ms(w));
+    void *dir_s = pion_str_from_cstr(dirbuf, (int64_t)strlen(dirbuf));
+    assert(pion_world_fs_mkdir_p(w, dir_s) == 1);
+
+    char fbuf[160], lbuf[160], sbuf[160];
+    snprintf(fbuf, sizeof(fbuf), "%s/data.bin", dirbuf);
+    snprintf(lbuf, sizeof(lbuf), "%s/sym.bin", dirbuf);
+    snprintf(sbuf, sizeof(sbuf), "%s/sub", dirbuf);
+    void *f_s = pion_str_from_cstr(fbuf, (int64_t)strlen(fbuf));
+    void *l_s = pion_str_from_cstr(lbuf, (int64_t)strlen(lbuf));
+    void *sub_s = pion_str_from_cstr(sbuf, (int64_t)strlen(sbuf));
+    void *content = pion_str_from_cstr("0123456789abcdefghij", 20);
+    assert(pion_world_fs_write(w, f_s, content) == 1);
+    assert(pion_world_fs_mkdir_p(w, sub_s) == 1);
+    assert(pion_world_fs_chmod(w, f_s, 0644) == 1);
+
+    int32_t ok = 0;
+    void *ls_file = pion_world_fs_lstat(w, f_s, &ok);
+    assert(ok == 1);
+    assert(strncmp(((PionString *)ls_file)->data, "file|20|0|", 10) == 0);
+    pion_rc_dec(ls_file);
+
+    assert(pion_world_fs_chmod(w, f_s, 0755) == 1);
+    void *ls_exec = pion_world_fs_lstat(w, f_s, &ok);
+    assert(ok == 1);
+    assert(strncmp(((PionString *)ls_exec)->data, "file|20|1|", 10) == 0);
+    pion_rc_dec(ls_exec);
+
+    void *ls_dir = pion_world_fs_lstat(w, sub_s, &ok);
+    assert(ok == 1);
+    assert(strncmp(((PionString *)ls_dir)->data, "dir|", 4) == 0);
+    pion_rc_dec(ls_dir);
+
+    void *tgt_s = pion_str_from_cstr("data.bin", 8);
+    assert(pion_world_fs_symlink(w, tgt_s, l_s) == 1);
+    void *ls_lnk = pion_world_fs_lstat(w, l_s, &ok);
+    assert(ok == 1);
+    assert(strncmp(((PionString *)ls_lnk)->data, "link|", 5) == 0);
+    pion_rc_dec(ls_lnk);
+
+    void *rl = pion_world_fs_readlink(w, l_s, &ok);
+    assert(ok == 1 && pion_str_eq(rl, tgt_s) == 1);
+    pion_rc_dec(rl);
+
+    void *rl_err = pion_world_fs_readlink(w, f_s, &ok);
+    assert(ok == 0 && pion_str_len(rl_err) > 0);
+    pion_rc_dec(rl_err);
+
+    /* fs_read_range_nofollow: normal, symlink reject, wrong size reject */
+    void *rng = pion_world_fs_read_range_nofollow(w, f_s, 5, 10, 20, &ok);
+    assert(ok == 1 && pion_bytes_len(rng) == 10);
+    void *rng_s = pion_bytes_to_str(rng);
+    void *want_s = pion_str_from_cstr("56789abcde", 10);
+    assert(pion_str_eq(rng_s, want_s) == 1);
+    pion_rc_dec(want_s);
+    pion_rc_dec(rng_s);
+    pion_rc_dec(rng);
+
+    void *rng_sym = pion_world_fs_read_range_nofollow(w, l_s, 0, 4, 20, &ok);
+    assert(ok == 0 && strcmp(((PionString *)rng_sym)->data, "changed") == 0);
+    pion_rc_dec(rng_sym);
+
+    void *rng_sz = pion_world_fs_read_range_nofollow(w, f_s, 0, 4, 19, &ok);
+    assert(ok == 0 && strcmp(((PionString *)rng_sz)->data, "changed") == 0);
+    pion_rc_dec(rng_sz);
+
+    /* 3. pion_world_exec_capture_bytes with NUL bytes and silenced stderr */
+    void *argv_arr = pion_arr_new(4, 1);
+    void *a0 = pion_str_from_cstr("/bin/sh", 7);
+    void *a1 = pion_str_from_cstr("-c", 2);
+    void *a2 = pion_str_from_cstr("printf 'a\\000b\\377'; echo err >&2", 33);
+    pion_arr_push(argv_arr, (int64_t)(uintptr_t)a0);
+    pion_arr_push(argv_arr, (int64_t)(uintptr_t)a1);
+    pion_arr_push(argv_arr, (int64_t)(uintptr_t)a2);
+    int32_t ec = -1;
+    void *cap_b = pion_world_exec_capture_bytes(w, argv_arr, &ec);
+    assert(ec == 0 && pion_bytes_len(cap_b) == 4);
+    assert(pion_bytes_get(cap_b, 0) == 'a');
+    assert(pion_bytes_get(cap_b, 1) == 0);
+    assert(pion_bytes_get(cap_b, 2) == 'b');
+    assert(pion_bytes_get(cap_b, 3) == 255);
+    pion_rc_dec(cap_b);
+    pion_rc_dec(a0);
+    pion_rc_dec(a1);
+    pion_rc_dec(a2);
+    pion_rc_dec(argv_arr);
+
+    /* 4. pion_world_read_line via redirected stdin pipe (CRLF, empty line, long line, EOF) */
+    int saved_stdin = dup(STDIN_FILENO);
+    assert(saved_stdin >= 0);
+    int rpipe[2];
+    assert(pipe(rpipe) == 0);
+    const char *p1 = "hello\r\n\n";
+    assert(write(rpipe[1], p1, strlen(p1)) == (ssize_t)strlen(p1));
+    char longbuf[5000];
+    memset(longbuf, 'x', sizeof(longbuf));
+    assert(write(rpipe[1], longbuf, sizeof(longbuf)) == (ssize_t)sizeof(longbuf));
+    close(rpipe[1]);
+    assert(dup2(rpipe[0], STDIN_FILENO) >= 0);
+    close(rpipe[0]);
+    clearerr(stdin);
+
+    void *ln1 = pion_world_read_line(w, &ok);
+    assert(ok == 1 && pion_str_len(ln1) == 5 && strcmp(((PionString *)ln1)->data, "hello") == 0);
+    pion_rc_dec(ln1);
+
+    void *ln2 = pion_world_read_line(w, &ok);
+    assert(ok == 1 && pion_str_len(ln2) == 0);
+    pion_rc_dec(ln2);
+
+    void *ln3 = pion_world_read_line(w, &ok);
+    assert(ok == 1 && pion_str_len(ln3) == 5000);
+    pion_rc_dec(ln3);
+
+    void *ln4 = pion_world_read_line(w, &ok);
+    assert(ok == 0 && pion_str_len(ln4) == 0);
+    pion_rc_dec(ln4);
+
+    assert(dup2(saved_stdin, STDIN_FILENO) >= 0);
+    close(saved_stdin);
+    clearerr(stdin);
+
+    assert(pion_world_fs_remove(w, l_s) == 1);
+    assert(pion_world_fs_remove(w, f_s) == 1);
+    assert(rmdir(sbuf) == 0);
+    assert(rmdir(dirbuf) == 0);
+    pion_rc_dec(tgt_s);
+    pion_rc_dec(content);
+    pion_rc_dec(sub_s);
+    pion_rc_dec(l_s);
+    pion_rc_dec(f_s);
+    pion_rc_dec(dir_s);
+    pion_rc_dec(w);
+    printf("[PASS] p22a_systems_io\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -2361,6 +2533,7 @@ int main(int argc, char **argv) {
     test_map_try_get_and_100k();
     test_sha256();
     test_world(argc, argv);
+    test_p22a_systems_io(argc, argv);
     test_ffi_ptr_and_cstr();
     test_str_to_double();
 

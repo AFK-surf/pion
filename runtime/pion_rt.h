@@ -148,6 +148,8 @@ int32_t  pion_bytes_get(void *b, int64_t idx);
 void     pion_bytes_set(void *b, int64_t idx, int32_t val);
 void*    pion_bytes_slice(void *b, int64_t start, int64_t end);
 void*    pion_bytes_concat(void *a, void *b);
+void*    pion_bytes_from_ptr(void *p, int64_t len);
+void     pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst, int64_t len);
 
 /* StringBuilder */
 void*    pion_strbuf_new(int64_t cap);
@@ -210,6 +212,7 @@ void*    pion_world_args(void *w);
 void     pion_world_print(void *w, void *s);
 void     pion_world_println(void *w, void *s);
 void     pion_world_eprintln(void *w, void *s);
+void*    pion_world_read_line(void *w, int32_t *ok_out);
 void*    pion_world_fs_read(void *w, void *path_str, int32_t *ok_out);
 int32_t  pion_world_fs_write(void *w, void *path_str, void *content_str);
 void*    pion_world_fs_read_bytes(void *w, void *path_str, int32_t *ok_out);
@@ -223,10 +226,16 @@ void*    pion_world_fs_list_dir(void *w, void *path_str);
 int32_t  pion_world_fs_remove(void *w, void *path_str);
 int32_t  pion_world_fs_rename(void *w, void *old_path, void *new_path);
 int64_t  pion_world_fs_size(void *w, void *path_str);
+void*    pion_world_fs_lstat(void *w, void *path_str, int32_t *ok_out);
+void*    pion_world_fs_readlink(void *w, void *path_str, int32_t *ok_out);
+int32_t  pion_world_fs_symlink(void *w, void *target_str, void *linkpath_str);
+int32_t  pion_world_fs_chmod(void *w, void *path_str, int32_t mode);
+void*    pion_world_fs_read_range_nofollow(void *w, void *path_str, int64_t offset, int64_t length, int64_t expected_size, int32_t *ok_out);
 void*    pion_world_env_get(void *w, void *name_str, int32_t *ok_out);
 int64_t  pion_world_clock_ms(void *w);
 int32_t  pion_world_exec(void *w, void *argv_arr);
 void*    pion_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out);
+void*    pion_world_exec_capture_bytes(void *w, void *argv_arr, int32_t *exit_code_out);
 void*    pion_sha256_hex(void *s);
 
 /* FFI Raw Pointers & CStr */
@@ -235,6 +244,8 @@ void     pion_ptr_free(void *p);
 void*    pion_ptr_offset(void *p, int64_t byte_off);
 void*    pion_ptr_read_ptr(void *p, int64_t byte_off);
 void     pion_ptr_write_ptr(void *p, int64_t byte_off, void *v);
+int32_t  pion_ptr_read_u8(void *p, int64_t byte_off);
+void     pion_ptr_write_u8(void *p, int64_t byte_off, int32_t v);
 int32_t  pion_ptr_read_i32(void *p, int64_t byte_off);
 void     pion_ptr_write_i32(void *p, int64_t byte_off, int32_t v);
 int64_t  pion_ptr_read_i64(void *p, int64_t byte_off);

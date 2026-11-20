@@ -699,7 +699,7 @@ PION_MINSIZE double pion_str_to_double(void *s, int32_t *ok_out) {
     return v;
 }
 
-static const char *pion_memmem(const char *hay, int64_t hlen, const char *ndl, int64_t nlen) {
+PION_MINSIZE static const char *pion_memmem(const char *hay, int64_t hlen, const char *ndl, int64_t nlen) {
     if (nlen == 0) return hay;
     if (nlen > hlen) return NULL;
     if (nlen == 1) return (const char *)memchr(hay, (unsigned char)ndl[0], (size_t)hlen);
@@ -867,7 +867,7 @@ PION_MINSIZE static void pion_bytes_drop(void *payload) {
     b->data = NULL;
 }
 
-static PionBytes *pion_bytes_alloc_uninit(int64_t len) {
+static __attribute__((noinline)) PION_MINSIZE PionBytes *pion_bytes_alloc_uninit(int64_t len) {
     PionBytes *b = (PionBytes *)pion_alloc_raw((uint32_t)sizeof(PionBytes), PION_TAG_BYTES, pion_bytes_drop);
     b->len = len;
     b->cap = len;
@@ -951,6 +951,25 @@ PION_MINSIZE void *pion_bytes_to_str(void *b_ptr) {
     PionBytes *b = (PionBytes *)b_ptr;
     if (!b || b->len == 0) return pion_str_from_cstr("", 0);
     return pion_str_from_cstr((const char *)b->data, b->len);
+}
+
+PION_MINSIZE void *pion_bytes_from_ptr(void *p, int64_t len) {
+    if (len <= 0 || !p) return pion_bytes_alloc_uninit(0);
+    PionBytes *out = pion_bytes_alloc_uninit(len);
+    memcpy(out->data, p, (size_t)len);
+    return out;
+}
+
+PION_MINSIZE void pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst, int64_t len) {
+    PionBytes *b = (PionBytes *)b_ptr;
+    int64_t blen = b ? b->len : 0;
+    if (src_off < 0 || len < 0 || src_off > blen || len > blen - src_off) {
+        pion_panic_oob(src_off + len, blen);
+    }
+    if (len > 0) {
+        if (!dst) pion_panic("null dst in bytes_copy_to_ptr", __FILE__, __LINE__);
+        memcpy(dst, b->data + src_off, (size_t)len);
+    }
 }
 
 /* ============================================================================
@@ -1932,128 +1951,98 @@ PION_MINSIZE void pion_world_eprintln(void *w_ptr, void *s_ptr) {
     fflush(stderr);
 }
 
-PION_MINSIZE void *pion_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_out) {
+PION_MINSIZE void *pion_world_read_line(void *w_ptr, int32_t *ok_out) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    if (!path) {
+    char *line = NULL;
+    size_t cap = 0;
+    ssize_t n = getline(&line, &cap, stdin);
+    if (n < 0) {
+        free(line);
         if (ok_out) *ok_out = 0;
         return pion_str_from_cstr("", 0);
     }
-    FILE *f = fopen(path->data, "rb");
-    if (!f) {
-        if (ok_out) *ok_out = 0;
-        return pion_str_from_cstr("", 0);
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        if (ok_out) *ok_out = 0;
-        return pion_str_from_cstr("", 0);
-    }
-    long sz = ftell(f);
-    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        if (ok_out) *ok_out = 0;
-        return pion_str_from_cstr("", 0);
-    }
-    PionString *out = (PionString *)pion_alloc_raw((uint32_t)(sizeof(PionString) + (size_t)sz + 1),
-                                             PION_TAG_STRING, NULL);
-    out->len = (int64_t)sz;
-    if (sz > 0) {
-        size_t got = fread(out->data, 1, (size_t)sz, f);
-        if (got != (size_t)sz) {
-            fclose(f);
-            pion_rc_dec(out);
-            if (ok_out) *ok_out = 0;
-            return pion_str_from_cstr("", 0);
-        }
-    }
-    out->data[sz] = '\0';
-    fclose(f);
+    if (n > 0 && line[n - 1] == '\n') n--;
+    if (n > 0 && line[n - 1] == '\r') n--;
+    void *out = pion_str_from_cstr(line, (int64_t)n);
+    free(line);
     if (ok_out) *ok_out = 1;
     return out;
 }
 
+PION_MINSIZE static char *pion_read_file_raw(void *path_str, int64_t *len_out) {
+    PionString *path = (PionString *)path_str;
+    if (!path) return NULL;
+    FILE *f = fopen(path->data, "rb");
+    if (!f) return NULL;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
+    long sz = ftell(f);
+    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) { fclose(f); return NULL; }
+    char *buf = (char *)malloc((size_t)sz + 1);
+    if (!buf) { fclose(f); return NULL; }
+    if (sz > 0 && fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
+        free(buf);
+        fclose(f);
+        return NULL;
+    }
+    fclose(f);
+    *len_out = (int64_t)sz;
+    return buf;
+}
+
+PION_MINSIZE void *pion_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_out) {
+    (void)w_ptr;
+    int64_t sz = 0;
+    char *buf = pion_read_file_raw(path_str, &sz);
+    if (!buf) {
+        if (ok_out) *ok_out = 0;
+        return pion_str_from_cstr("", 0);
+    }
+    void *out = pion_str_from_cstr(buf, sz);
+    free(buf);
+    if (ok_out) *ok_out = 1;
+    return out;
+}
+
+PION_MINSIZE static int32_t pion_write_file_raw(void *path_str, const char *mode,
+                                                const void *data, int64_t len) {
+    PionString *path = (PionString *)path_str;
+    if (!path) return 0;
+    FILE *f = fopen(path->data, mode);
+    if (!f) return 0;
+    size_t written = len > 0 ? fwrite(data, 1, (size_t)len, f) : 0;
+    return (fclose(f) == 0 && written == (size_t)len) ? 1 : 0;
+}
+
 PION_MINSIZE int32_t pion_world_fs_write(void *w_ptr, void *path_str, void *content_str) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    PionString *content = (PionString *)content_str;
-    if (!path || !content) return 0;
-    FILE *f = fopen(path->data, "wb");
-    if (!f) return 0;
-    size_t written = 0;
-    if (content->len > 0) {
-        written = fwrite(content->data, 1, (size_t)content->len, f);
-    }
-    int close_ok = (fclose(f) == 0);
-    return (written == (size_t)content->len && close_ok) ? 1 : 0;
+    PionString *c = (PionString *)content_str;
+    return c ? pion_write_file_raw(path_str, "wb", c->data, c->len) : 0;
 }
 
 PION_MINSIZE void *pion_world_fs_read_bytes(void *w_ptr, void *path_str, int32_t *ok_out) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    if (!path) {
+    int64_t sz = 0;
+    char *buf = pion_read_file_raw(path_str, &sz);
+    if (!buf) {
         if (ok_out) *ok_out = 0;
-        return pion_bytes_new(0);
+        return pion_bytes_alloc_uninit(0);
     }
-    FILE *f = fopen(path->data, "rb");
-    if (!f) {
-        if (ok_out) *ok_out = 0;
-        return pion_bytes_new(0);
-    }
-    if (fseek(f, 0, SEEK_END) != 0) {
-        fclose(f);
-        if (ok_out) *ok_out = 0;
-        return pion_bytes_new(0);
-    }
-    long sz = ftell(f);
-    if (sz < 0 || fseek(f, 0, SEEK_SET) != 0) {
-        fclose(f);
-        if (ok_out) *ok_out = 0;
-        return pion_bytes_new(0);
-    }
-    PionBytes *out = pion_bytes_alloc_uninit((int64_t)sz);
-    if (sz > 0) {
-        size_t got = fread(out->data, 1, (size_t)sz, f);
-        if (got != (size_t)sz) {
-            fclose(f);
-            pion_rc_dec(out);
-            if (ok_out) *ok_out = 0;
-            return pion_bytes_new(0);
-        }
-    }
-    fclose(f);
+    void *out = pion_bytes_from_ptr(buf, sz);
+    free(buf);
     if (ok_out) *ok_out = 1;
     return out;
 }
 
 PION_MINSIZE int32_t pion_world_fs_write_bytes(void *w_ptr, void *path_str, void *bytes_obj) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
     PionBytes *b = (PionBytes *)bytes_obj;
-    if (!path || !b) return 0;
-    FILE *f = fopen(path->data, "wb");
-    if (!f) return 0;
-    size_t written = 0;
-    if (b->len > 0) {
-        written = fwrite(b->data, 1, (size_t)b->len, f);
-    }
-    int close_ok = (fclose(f) == 0);
-    return (written == (size_t)b->len && close_ok) ? 1 : 0;
+    return b ? pion_write_file_raw(path_str, "wb", b->data, b->len) : 0;
 }
 
 PION_MINSIZE int32_t pion_world_fs_append(void *w_ptr, void *path_str, void *content_str) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    PionString *content = (PionString *)content_str;
-    if (!path || !content) return 0;
-    FILE *f = fopen(path->data, "ab");
-    if (!f) return 0;
-    size_t written = 0;
-    if (content->len > 0) {
-        written = fwrite(content->data, 1, (size_t)content->len, f);
-    }
-    int close_ok = (fclose(f) == 0);
-    return (written == (size_t)content->len && close_ok) ? 1 : 0;
+    PionString *c = (PionString *)content_str;
+    return c ? pion_write_file_raw(path_str, "ab", c->data, c->len) : 0;
 }
 
 PION_MINSIZE int64_t pion_world_fs_mtime_ms(void *w_ptr, void *path_str) {
@@ -2119,7 +2108,7 @@ PION_MINSIZE int32_t pion_world_fs_mkdir_p(void *w_ptr, void *path_str) {
     return ok;
 }
 
-static int pion_str_slot_cmp(const void *a, const void *b) {
+PION_MINSIZE static int pion_str_slot_cmp(const void *a, const void *b) {
     void *sa = (void *)(uintptr_t)(*(const int64_t *)a);
     void *sb = (void *)(uintptr_t)(*(const int64_t *)b);
     return (int)pion_str_cmp(sa, sb);
@@ -2173,6 +2162,141 @@ PION_MINSIZE int64_t pion_world_fs_size(void *w_ptr, void *path_str) {
     return (int64_t)st.st_size;
 }
 
+PION_MINSIZE static void *pion_errno_str(int err) {
+    char errbuf[96];
+    if (strerror_r(err, errbuf, sizeof(errbuf)) != 0) {
+        snprintf(errbuf, sizeof(errbuf), "errno %d", err);
+    }
+    return pion_str_from_cstr(errbuf, (int64_t)strlen(errbuf));
+}
+
+PION_MINSIZE void *pion_world_fs_lstat(void *w_ptr, void *path_str, int32_t *ok_out) {
+    (void)w_ptr;
+    PionString *path = (PionString *)path_str;
+    if (!path || path->len == 0) {
+        if (ok_out) *ok_out = 0;
+        return pion_errno_str(EINVAL);
+    }
+    struct stat st;
+    if (lstat(path->data, &st) != 0) {
+        int err = errno;
+        if (ok_out) *ok_out = 0;
+        return pion_errno_str(err);
+    }
+    const char *kind = S_ISREG(st.st_mode) ? "file"
+                     : S_ISDIR(st.st_mode) ? "dir"
+                     : S_ISLNK(st.st_mode) ? "link"
+                     : "other";
+    int exec01 = (st.st_mode & 0111) != 0 ? 1 : 0;
+#if defined(__APPLE__) && defined(_POSIX_C_SOURCE) && !defined(_DARWIN_C_SOURCE)
+    int64_t mtime_ms = (int64_t)st.st_mtime * 1000 + (int64_t)(st.st_mtimensec / 1000000);
+#elif defined(__APPLE__)
+    int64_t mtime_ms = (int64_t)st.st_mtimespec.tv_sec * 1000 + (int64_t)(st.st_mtimespec.tv_nsec / 1000000);
+#else
+    int64_t mtime_ms = (int64_t)st.st_mtim.tv_sec * 1000 + (int64_t)(st.st_mtim.tv_nsec / 1000000);
+#endif
+    char buf[128];
+    int n = snprintf(buf, sizeof(buf), "%s|%lld|%d|%lld|%lld",
+                     kind, (long long)st.st_size, exec01, (long long)mtime_ms, (long long)st.st_dev);
+    if (n < 0) n = 0;
+    if ((size_t)n >= sizeof(buf)) n = (int)(sizeof(buf) - 1);
+    if (ok_out) *ok_out = 1;
+    return pion_str_from_cstr(buf, (int64_t)n);
+}
+
+PION_MINSIZE void *pion_world_fs_readlink(void *w_ptr, void *path_str, int32_t *ok_out) {
+    (void)w_ptr;
+    if (ok_out) *ok_out = 0;
+    PionString *path = (PionString *)path_str;
+    int err = EINVAL;
+    if (!path || path->len == 0) return pion_errno_str(err);
+    size_t cap = 256;
+    char *buf = NULL;
+    for (;;) {
+        char *nb = (char *)realloc(buf, cap);
+        if (!nb) {
+            err = ENOMEM;
+            break;
+        }
+        buf = nb;
+        ssize_t n = readlink(path->data, buf, cap);
+        if (n < 0) {
+            err = errno;
+            break;
+        }
+        if ((size_t)n < cap) {
+            void *out = pion_str_from_cstr(buf, (int64_t)n);
+            free(buf);
+            if (ok_out) *ok_out = 1;
+            return out;
+        }
+        if (cap >= (1u << 20)) {
+            err = ENAMETOOLONG;
+            break;
+        }
+        cap *= 2;
+    }
+    free(buf);
+    return pion_errno_str(err);
+}
+
+PION_MINSIZE int32_t pion_world_fs_symlink(void *w_ptr, void *target_str, void *linkpath_str) {
+    (void)w_ptr;
+    PionString *target = (PionString *)target_str;
+    PionString *linkpath = (PionString *)linkpath_str;
+    if (!target || !linkpath || target->len == 0 || linkpath->len == 0) return 0;
+    return symlink(target->data, linkpath->data) == 0 ? 1 : 0;
+}
+
+PION_MINSIZE int32_t pion_world_fs_chmod(void *w_ptr, void *path_str, int32_t mode) {
+    (void)w_ptr;
+    PionString *path = (PionString *)path_str;
+    if (!path || path->len == 0) return 0;
+    return chmod(path->data, (mode_t)mode) == 0 ? 1 : 0;
+}
+
+PION_MINSIZE void *pion_world_fs_read_range_nofollow(void *w_ptr, void *path_str,
+                                                     int64_t offset, int64_t length,
+                                                     int64_t expected_size, int32_t *ok_out) {
+    (void)w_ptr;
+    if (ok_out) *ok_out = 0;
+    PionString *path = (PionString *)path_str;
+    int fd = -1;
+    PionBytes *out = NULL;
+    struct stat st;
+    if (!path || path->len == 0 || offset < 0 || length < 0 || expected_size < 0 ||
+        offset > expected_size || length > expected_size - offset) {
+        goto changed;
+    }
+    if (lstat(path->data, &st) != 0 || !S_ISREG(st.st_mode) ||
+        (int64_t)st.st_size != expected_size) {
+        goto changed;
+    }
+    fd = open(path->data, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    if (fd < 0 || fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        (int64_t)st.st_size != expected_size) {
+        goto changed;
+    }
+    out = pion_bytes_alloc_uninit(length);
+    for (int64_t got = 0; got < length; ) {
+        ssize_t n = pread(fd, out->data + got, (size_t)(length - got), (off_t)(offset + got));
+        if (n > 0) {
+            got += (int64_t)n;
+        } else if (n < 0 && errno == EINTR) {
+            continue;
+        } else {
+            goto changed;
+        }
+    }
+    close(fd);
+    if (ok_out) *ok_out = 1;
+    return out;
+changed:
+    if (fd >= 0) close(fd);
+    if (out) pion_rc_dec(out);
+    return pion_str_from_cstr("changed", 7);
+}
+
 PION_MINSIZE void *pion_world_env_get(void *w_ptr, void *name_str, int32_t *ok_out) {
     (void)w_ptr;
     PionString *name = (PionString *)name_str;
@@ -2223,14 +2347,15 @@ PION_MINSIZE int32_t pion_world_exec(void *w_ptr, void *argv_arr) {
     return -1;
 }
 
-PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
-    (void)w_ptr;
+static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stderr,
+                                                size_t *out_len, int32_t *exit_code_out) {
+    if (out_len) *out_len = 0;
     if (exit_code_out) *exit_code_out = -1;
     PionArray *arr = (PionArray *)argv_arr;
-    if (!arr || arr->len <= 0) return pion_str_from_cstr("", 0);
+    if (!arr || arr->len <= 0) return NULL;
 
     int pfd[2];
-    if (pipe(pfd) != 0) return pion_str_from_cstr("", 0);
+    if (pipe(pfd) != 0) return NULL;
     (void)fcntl(pfd[0], F_SETFD, FD_CLOEXEC);
     (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
 
@@ -2238,7 +2363,7 @@ PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t 
     if (!argv) {
         close(pfd[0]);
         close(pfd[1]);
-        return pion_str_from_cstr("", 0);
+        return NULL;
     }
     for (int64_t i = 0; i < arr->len; i++) {
         PionString *s = (PionString *)(uintptr_t)arr->data[i];
@@ -2251,11 +2376,14 @@ PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t 
         free(argv);
         close(pfd[0]);
         close(pfd[1]);
-        return pion_str_from_cstr("", 0);
+        return NULL;
     }
     (void)posix_spawn_file_actions_addclose(&actions, pfd[0]);
     (void)posix_spawn_file_actions_adddup2(&actions, pfd[1], STDOUT_FILENO);
     (void)posix_spawn_file_actions_addclose(&actions, pfd[1]);
+    if (silence_stderr) {
+        (void)posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_WRONLY, 0);
+    }
 
     pid_t pid = 0;
     int rc = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
@@ -2266,7 +2394,7 @@ PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t 
     if (rc != 0) {
         close(pfd[0]);
         if (exit_code_out) *exit_code_out = 127;
-        return pion_str_from_cstr("", 0);
+        return NULL;
     }
 
     size_t cap = 4096;
@@ -2276,7 +2404,7 @@ PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t 
         close(pfd[0]);
         int st_ign = 0;
         while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
-        return pion_str_from_cstr("", 0);
+        return NULL;
     }
     for (;;) {
         if (len + 4096 > cap) {
@@ -2287,7 +2415,7 @@ PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t 
                 close(pfd[0]);
                 int st_ign = 0;
                 while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
-                return pion_str_from_cstr("", 0);
+                return NULL;
             }
             buf = nb;
         }
@@ -2315,8 +2443,24 @@ PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t 
         else if (WIFSIGNALED(status)) code = 128 + WTERMSIG(status);
     }
     if (exit_code_out) *exit_code_out = code;
+    if (out_len) *out_len = len;
+    return buf;
+}
 
-    void *out = pion_str_from_cstr(buf, (int64_t)len);
+PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
+    (void)w_ptr;
+    size_t len = 0;
+    char *buf = pion_exec_capture_raw(argv_arr, 0, &len, exit_code_out);
+    void *out = pion_str_from_cstr(buf ? buf : "", (int64_t)len);
+    free(buf);
+    return out;
+}
+
+PION_MINSIZE void *pion_world_exec_capture_bytes(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
+    (void)w_ptr;
+    size_t len = 0;
+    char *buf = pion_exec_capture_raw(argv_arr, 1, &len, exit_code_out);
+    void *out = pion_bytes_from_ptr(buf, (int64_t)len);
     free(buf);
     return out;
 }
@@ -2434,6 +2578,14 @@ PION_MINSIZE void *pion_ptr_read_ptr(void *p, int64_t byte_off) {
 
 PION_MINSIZE void pion_ptr_write_ptr(void *p, int64_t byte_off, void *v) {
     memcpy((char *)p + byte_off, &v, sizeof(v));
+}
+
+PION_MINSIZE int32_t pion_ptr_read_u8(void *p, int64_t byte_off) {
+    return (int32_t)((const uint8_t *)p)[byte_off];
+}
+
+PION_MINSIZE void pion_ptr_write_u8(void *p, int64_t byte_off, int32_t v) {
+    ((uint8_t *)p)[byte_off] = (uint8_t)v;
 }
 
 PION_MINSIZE int32_t pion_ptr_read_i32(void *p, int64_t byte_off) {
@@ -2618,7 +2770,7 @@ PION_MINSIZE void pion_tcp_close(void *w_ptr, int32_t fd) {
 #define PION_EV_ERR 4
 #define PION_POLL_MAX 256
 
-static int pion_io_would_block(void) {
+PION_MINSIZE static int pion_io_would_block(void) {
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 

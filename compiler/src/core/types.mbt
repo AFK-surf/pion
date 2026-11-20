@@ -2041,6 +2041,7 @@ fn is_world_builtin(name : String) -> Bool {
   name == "io_print" ||
   name == "io_println" ||
   name == "io_eprintln" ||
+  name == "io_read_line" ||
   name == "fs_read" ||
   name == "fs_write" ||
   name == "fs_read_bytes" ||
@@ -2054,9 +2055,15 @@ fn is_world_builtin(name : String) -> Bool {
   name == "fs_remove" ||
   name == "fs_rename" ||
   name == "fs_size" ||
+  name == "fs_lstat" ||
+  name == "fs_readlink" ||
+  name == "fs_symlink" ||
+  name == "fs_chmod" ||
+  name == "fs_read_range_nofollow" ||
   name == "clock_now_ms" ||
   name == "proc_exec" ||
   name == "proc_exec_capture" ||
+  name == "proc_exec_capture_bytes" ||
   name == "env_get" ||
   name == "args_get" ||
   name == "world_args" ||
@@ -2086,6 +2093,10 @@ fn rt_prim_info(name : String) -> Option[RtPrim] {
     Some(RtPrim::{ c_sym: "pion_ptr_read_ptr", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
   } else if name == "ptr_write_ptr" {
     Some(RtPrim::{ c_sym: "pion_ptr_write_ptr", world: false, param_tys: [TPtr, TInt64, TPtr], ret_ty: TUnit })
+  } else if name == "ptr_read_u8" {
+    Some(RtPrim::{ c_sym: "pion_ptr_read_u8", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt })
+  } else if name == "ptr_write_u8" {
+    Some(RtPrim::{ c_sym: "pion_ptr_write_u8", world: false, param_tys: [TPtr, TInt64, TInt], ret_ty: TUnit })
   } else if name == "ptr_read_i32" {
     Some(RtPrim::{ c_sym: "pion_ptr_read_i32", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt })
   } else if name == "ptr_write_i32" {
@@ -2094,6 +2105,10 @@ fn rt_prim_info(name : String) -> Option[RtPrim] {
     Some(RtPrim::{ c_sym: "pion_ptr_read_i64", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt64 })
   } else if name == "ptr_write_i64" {
     Some(RtPrim::{ c_sym: "pion_ptr_write_i64", world: false, param_tys: [TPtr, TInt64, TInt64], ret_ty: TUnit })
+  } else if name == "bytes_from_ptr" {
+    Some(RtPrim::{ c_sym: "pion_bytes_from_ptr", world: false, param_tys: [TPtr, TInt], ret_ty: TBytes })
+  } else if name == "bytes_copy_to_ptr" {
+    Some(RtPrim::{ c_sym: "pion_bytes_copy_to_ptr", world: false, param_tys: [TBytes, TInt, TPtr, TInt], ret_ty: TUnit })
   } else if name == "cstr_to_str" {
     Some(RtPrim::{ c_sym: "pion_cstr_to_str", world: false, param_tys: [TPtr], ret_ty: TString })
   } else if name == "tcp_listen" {
@@ -2271,11 +2286,59 @@ fn check_world_builtin_call(
       )
     }
     TUnit
-  } else if name == "fs_read" {
+  } else if name == "io_read_line" {
+    TOption(TString)
+  } else if name == "fs_read" || name == "fs_lstat" || name == "fs_readlink" {
     TResult(TString, TString)
   } else if name == "fs_write" || name == "fs_append" {
     TResult(TUnit, TString)
   } else if name == "fs_read_bytes" {
+    TResult(TBytes, TString)
+  } else if name == "fs_read_range_nofollow" {
+    if arg_tys.length() > offset && !ty_compat(TString, arg_tys[offset]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`fs_read_range_nofollow` expects `String` path argument",
+        "String",
+        ty_to_string(arg_tys[offset]),
+        "pass a `String` path",
+      )
+    }
+    if arg_tys.length() > offset + 1 && !ty_compat(TInt64, arg_tys[offset + 1]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`fs_read_range_nofollow` expects `Int64` offset argument",
+        "Int64",
+        ty_to_string(arg_tys[offset + 1]),
+        "pass an `Int64` offset",
+      )
+    }
+    if arg_tys.length() > offset + 2 && !ty_compat(TInt, arg_tys[offset + 2]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`fs_read_range_nofollow` expects `Int` length argument",
+        "Int",
+        ty_to_string(arg_tys[offset + 2]),
+        "pass an `Int` length",
+      )
+    }
+    if arg_tys.length() > offset + 3 && !ty_compat(TInt64, arg_tys[offset + 3]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`fs_read_range_nofollow` expects `Int64` expected_size argument",
+        "Int64",
+        ty_to_string(arg_tys[offset + 3]),
+        "pass an `Int64` expected_size",
+      )
+    }
     TResult(TBytes, TString)
   } else if name == "fs_write_bytes" {
     if arg_tys.length() > offset + 1 && !ty_compat(TBytes, arg_tys[offset + 1]) {
@@ -2292,7 +2355,20 @@ fn check_world_builtin_call(
     TResult(TUnit, TString)
   } else if name == "fs_mtime_ms" {
     TInt64
-  } else if name == "fs_exists" || name == "fs_is_dir" || name == "fs_mkdir_p" || name == "fs_remove" || name == "fs_rename" {
+  } else if name == "fs_exists" || name == "fs_is_dir" || name == "fs_mkdir_p" || name == "fs_remove" || name == "fs_rename" || name == "fs_symlink" {
+    TBool
+  } else if name == "fs_chmod" {
+    if arg_tys.length() > offset + 1 && !ty_compat(TInt, arg_tys[offset + 1]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`fs_chmod` expects `Int` mode argument",
+        "Int",
+        ty_to_string(arg_tys[offset + 1]),
+        "pass an `Int` mode",
+      )
+    }
     TBool
   } else if name == "fs_size" {
     TInt64
@@ -2315,6 +2391,19 @@ fn check_world_builtin_call(
       )
     }
     TResult(TString, TString)
+  } else if name == "proc_exec_capture_bytes" {
+    if arg_tys.length() > offset && !ty_compat(TArray(TString), arg_tys[offset]) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`proc_exec_capture_bytes` expects `Array[String]` argv argument",
+        "Array[String]",
+        ty_to_string(arg_tys[offset]),
+        "pass an `Array[String]`",
+      )
+    }
+    TResult(TBytes, TString)
   } else if name == "world_argv" {
     TString
   } else if name == "env_get" {
