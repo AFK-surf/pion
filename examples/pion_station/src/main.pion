@@ -1,0 +1,661 @@
+///| pion_station: multi-package pure-Pion HTTPS/1.1 + SSE + SQLite multi-agent
+///| session & job scheduling station.
+///|
+///|   pion_station --cert <pem> --key <pem> [--db <path>] [--port <p>] [--port-file <fifo>] [--workers <n>]
+///|   pion_station --self-test --cert <pem> --key <pem> [--db <path>] [--expect-proto TLSv1.3]
+
+import "store"
+import "router"
+import "tls"
+import "http"
+import "json"
+import "regex"
+
+pub struct Options {
+  pub mode : String
+  pub cert : String
+  pub key : String
+  pub db : String
+  pub port : Int
+  pub port_file : String
+  pub workers : Int
+  pub expect_proto : String
+}
+
+fn parse_int(s : String) -> Option[Int] {
+  if s.length() == 0 || s.length() > 9 {
+    return None
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  Some(v)
+}
+
+pub fn parse_options(args : Array[String]) -> Result[Options, String] {
+  let mut mode = "serve"
+  let mut cert = ""
+  let mut key = ""
+  let mut db = ""
+  let mut port = 0
+  let mut port_file = ""
+  let mut workers = 4
+  let mut expect_proto = "TLSv1.3"
+  let mut i = 1
+  while i < args.length() {
+    let a = args[i]
+    if a == "--self-test" {
+      mode = "self-test"
+      i = i + 1
+      continue
+    }
+    if i + 1 >= args.length() {
+      return Err("missing value for " + a)
+    }
+    let v = args[i + 1]
+    if a == "--cert" {
+      cert = v
+    } else if a == "--key" {
+      key = v
+    } else if a == "--db" {
+      db = v
+    } else if a == "--port-file" {
+      port_file = v
+    } else if a == "--expect-proto" {
+      expect_proto = v
+    } else if a == "--port" || a == "--workers" {
+      let n = match parse_int(v) {
+        Some(n) => n
+        None => return Err("invalid number for " + a + ": " + v)
+      }
+      if a == "--port" {
+        port = n
+      } else {
+        workers = n
+      }
+    } else {
+      return Err("unknown option " + a)
+    }
+    i = i + 2
+  }
+  if cert.length() == 0 || key.length() == 0 {
+    return Err("need --cert <pem> and --key <pem>")
+  }
+  if port > 65535 {
+    return Err("need --port 0..65535")
+  }
+  if workers < 1 || workers > 32 {
+    return Err("need --workers 1..32")
+  }
+  if db.length() == 0 {
+    db = ":memory:"
+  }
+  Ok(Options::{
+    mode: mode,
+    cert: cert,
+    key: key,
+    db: db,
+    port: port,
+    port_file: port_file,
+    workers: workers,
+    expect_proto: expect_proto,
+  })
+}
+
+/// Streams SSE `event: job_done` frames over an established TLS connection.
+fn serve_sse(world : World, hub : SseHub, conn : tls::TlsConn, query : String) -> Unit {
+  let qp = http::parse_query(query)
+  let limit = match qp.get("limit") {
+    Some(s) =>
+    match parse_int(s) {
+      Some(n) => n
+      None => 0
+    }
+    None => 0
+  }
+  let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\n\r\n"
+  match tls::tls_write(world, conn, head) {
+    Ok(_) => ()
+    Err(_) => {
+      tls::tls_close(world, conn)
+      return
+    }
+  }
+  let (past, ch) = sse_subscribe(hub)
+  let mut sent = 0
+  let mut i = 0
+  while i < past.length() {
+    if limit > 0 && sent >= limit {
+      break
+    }
+    match tls::tls_write(world, conn, past[i]) {
+      Ok(_) => sent = sent + 1
+      Err(_) => {
+        tls::tls_close(world, conn)
+        return
+      }
+    }
+    i = i + 1
+  }
+  while limit == 0 || sent < limit {
+    match ch.recv() {
+      Some(frame) =>
+      match tls::tls_write(world, conn, frame) {
+        Ok(_) => sent = sent + 1
+        Err(_) => break
+      }
+      None => break
+    }
+  }
+  tls::tls_close(world, conn)
+}
+
+/// Runs the HTTPS accept loop + background worker pool inside a single `scope`.
+fn run_server(
+  world : World,
+  st : router::StationState,
+  hub : SseHub,
+  listener : tls::TlsListener,
+  workers : Int,
+) -> Int {
+  let rt = match router::build_station_router(st) {
+    Ok(r) => r
+    Err(e) => {
+      io_eprintln(world, "router init failed: " + e)
+      return 1
+    }
+  }
+  match router::router_add(rt, "GET", "^/info$", "", "", StationInfoHandler::{ version: "1.0", workers: workers }) {
+    Ok(_) => ()
+    Err(e) => {
+      io_eprintln(world, "info route init failed: " + e)
+      return 1
+    }
+  }
+  let accept_rc = AtomicInt::new(0)
+  scope(world, fn(s : Scope) -> Unit {
+    let mut w = 0
+    while w < workers {
+      spawn(s, fn() -> Unit {
+        worker_loop(world, st, hub)
+      })
+      w = w + 1
+    }
+    while true {
+      match tls::tls_accept(world, listener) {
+        Ok(conn) =>
+        match tls::tls_read_http_request(world, conn) {
+          Err(e) => {
+            let _ = st.counters.total_reqs.fetch_add(1)
+            let r = router::err_resp(st.counters, 400, e)
+            let _ = tls::tls_write_http_response(world, conn, r.status, r.content_type, r.body)
+            tls::tls_close(world, conn)
+          }
+          Ok(req) =>
+          if req.path != "/events" {
+            let resp = router::router_dispatch(
+              rt,
+              req.method,
+              req.path,
+              req.query,
+              req.body,
+              tls::tls_protocol(conn),
+              conn.host,
+              clock_now_ms(world),
+            )
+            match tls::tls_write_http_response(world, conn, resp.status, resp.content_type, resp.body) {
+              Ok(_) => ()
+              Err(e) => io_eprintln(world, "server: write failed: " + e)
+            }
+            tls::tls_close(world, conn)
+            if resp.quit {
+              break
+            }
+          } else if req.method != "GET" {
+            let _ = st.counters.total_reqs.fetch_add(1)
+            let r = router::err_resp(st.counters, 405, "use GET for /events")
+            let _ = tls::tls_write_http_response(world, conn, r.status, r.content_type, r.body)
+            tls::tls_close(world, conn)
+          } else {
+            let _ = st.counters.total_reqs.fetch_add(1)
+            let _ = st.counters.sse_reqs.fetch_add(1)
+            let q = req.query
+            spawn(s, fn() -> Unit {
+              serve_sse(world, hub, move conn, q)
+            })
+          }
+        }
+        Err(e) => {
+          if e.starts_with("accept") {
+            io_eprintln(world, "server: " + e)
+            accept_rc.store(1)
+            break
+          }
+          let _ = st.counters.handshake_failures.fetch_add(1)
+          io_eprintln(world, "server: handshake refused: " + e)
+        }
+      }
+    }
+    // Gracefully drain all queued jobs before releasing SSE streams and exiting scope.
+    st.job_tx.close()
+    sse_close_all(hub)
+  })
+  accept_rc.load()
+}
+
+fn serve(world : World, opts : Options) -> Int {
+  let db = match store::open(opts.db) {
+    Ok(d) => d
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      return 1
+    }
+  }
+  let listener = match tls::tls_listen(world, "127.0.0.1", opts.port, opts.cert, opts.key) {
+    Ok(l) => l
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      let _ = store::close(db)
+      return 1
+    }
+  }
+  if opts.port_file.length() > 0 {
+    match fs_write(world, opts.port_file, listener.port.to_string() + "\n") {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write port file: " + e)
+        tls::tls_listener_close(world, listener)
+        let _ = store::close(db)
+        return 1
+      }
+    }
+  }
+  io_eprintln(
+    world,
+    "pion_station listening on https://127.0.0.1:" +
+    listener.port.to_string() +
+    " (db=" +
+    opts.db +
+    ", workers=" +
+    opts.workers.to_string() +
+    ", " +
+    tls::tls_version() +
+    ", sqlite=" +
+    store::sqlite_version() +
+    ")",
+  )
+  let job_ch : Channel[router::JobTask] = Channel::new(512)
+  let st = router::new_station_state(db, job_ch)
+  let hub = new_sse_hub()
+  let rc = run_server(world, st, hub, listener, opts.workers)
+  tls::tls_listener_close(world, listener)
+  match router::stats_json(st) {
+    Ok(s) => io_println(world, s)
+    Err(e) => io_eprintln(world, "stats error: " + e)
+  }
+  let _ = store::close(db)
+  rc
+}
+
+// ---------------------------------------------------------------------------
+// --self-test: 4 concurrent pure-Pion std/tls clients + 40 jobs + SSE + checks
+
+let ST_CLIENTS : Int = 4
+let ST_JOBS_PER_CLIENT : Int = 10
+
+fn expect(world : World, failures : AtomicInt, cond : Bool, what : String) -> Unit {
+  if !cond {
+    let _ = failures.fetch_add(1)
+    io_eprintln(world, "FAIL: " + what)
+  }
+}
+
+fn json_str(body : String, key : String) -> String {
+  match json::parse(body) {
+    Ok(v) =>
+    match json::obj_get(v, key) {
+      Some(x) =>
+      match json::as_str(x) {
+        Some(s) => s
+        None => ""
+      }
+      None => ""
+    }
+    Err(_) => ""
+  }
+}
+
+fn json_int(body : String, key : String) -> Int {
+  match json::parse(body) {
+    Ok(v) =>
+    match json::obj_get(v, key) {
+      Some(x) =>
+      match json::as_int(x) {
+        Some(n) => n.to_int()
+        None => -1
+      }
+      None => -1
+    }
+    Err(_) => -1
+  }
+}
+
+fn count_occurrences(text : String, needle : String) -> Int {
+  let mut count = 0
+  let mut pos = 0
+  let nlen = needle.length()
+  while pos + nlen <= text.length() {
+    let idx = text.slice(pos, text.length()).index_of(needle)
+    if idx < 0 {
+      break
+    }
+    count = count + 1
+    pos = pos + idx + nlen
+  }
+  count
+}
+
+fn self_test_client(world : World, failures : AtomicInt, port : Int, cid : Int, want_proto : String) -> Unit {
+  // 1. Verify /health
+  match tls::https_request(world, "localhost", port, "GET", "/health", "", true) {
+    Ok(resp) =>
+    expect(
+      world,
+      failures,
+      resp.status == 200 && json_str(resp.body, "protocol") == want_proto && json_str(resp.body, "sni") == "localhost",
+      "client " + cid.to_string() + " /health: " + resp.body,
+    )
+    Err(e) => expect(world, failures, false, "client " + cid.to_string() + " /health err: " + e)
+  }
+
+  // 2. Create 2 sessions + 2 messages each
+  let mut si = 0
+  while si < 2 {
+    let sid = "s-" + cid.to_string() + "-" + si.to_string()
+    let sbody = json::stringify(json::JObj([
+      json::field("id", json::JStr(sid)),
+      json::field("title", json::JStr("Agent Session " + sid)),
+    ]))
+    match tls::https_request(world, "localhost", port, "POST", "/sessions", sbody, true) {
+      Ok(resp) => expect(world, failures, resp.status == 201 && json_str(resp.body, "id") == sid, "create " + sid)
+      Err(e) => expect(world, failures, false, "create " + sid + " err: " + e)
+    }
+    let mut mi = 0
+    while mi < 2 {
+      let mbody = json::stringify(json::JObj([
+        json::field("role", json::JStr(if mi == 0 { "user" } else { "agent" })),
+        json::field("body", json::JStr("msg-" + sid + "-" + mi.to_string())),
+      ]))
+      match tls::https_request(world, "localhost", port, "POST", "/sessions/" + sid + "/messages", mbody, true) {
+        Ok(resp) => expect(world, failures, resp.status == 201, "post msg " + sid)
+        Err(e) => expect(world, failures, false, "post msg err: " + e)
+      }
+      mi = mi + 1
+    }
+    match tls::https_request(world, "localhost", port, "GET", "/sessions/" + sid + "/messages", "", true) {
+      Ok(resp) => expect(world, failures, resp.status == 200 && json_int(resp.body, "count") == 2, "list msgs " + sid)
+      Err(e) => expect(world, failures, false, "list msgs err: " + e)
+    }
+    si = si + 1
+  }
+
+  // 3. Submit 10 background jobs (hash, regex_extract, compute)
+  let sid0 = "s-" + cid.to_string() + "-0"
+  let mut ji = 0
+  while ji < ST_JOBS_PER_CLIENT {
+    let jid = "job-" + cid.to_string() + "-" + ji.to_string()
+    let kind = if ji % 3 == 0 {
+      "hash"
+    } else if ji % 3 == 1 {
+      "regex_extract"
+    } else {
+      "compute"
+    }
+    let payload = if kind == "regex_extract" {
+      "[0-9]+|req=" + cid.to_string() + ",idx=" + ji.to_string()
+    } else {
+      "payload-" + jid
+    }
+    let jbody = json::stringify(json::JObj([
+      json::field("id", json::JStr(jid)),
+      json::field("session_id", json::JStr(sid0)),
+      json::field("kind", json::JStr(kind)),
+      json::field("payload", json::JStr(payload)),
+    ]))
+    match tls::https_request(world, "localhost", port, "POST", "/jobs", jbody, true) {
+      Ok(resp) => expect(world, failures, resp.status == 202 && json_str(resp.body, "id") == jid, "submit " + jid)
+      Err(e) => expect(world, failures, false, "submit " + jid + " err: " + e)
+    }
+    ji = ji + 1
+  }
+}
+
+fn self_test_sse_reader(
+  world : World,
+  failures : AtomicInt,
+  port : Int,
+  want_events : Int,
+  sse_ready : Channel[Int],
+  sse_count : AtomicInt,
+) -> Unit {
+  let conn = match tls::tls_connect(world, "localhost", port, true) {
+    Ok(c) => c
+    Err(e) => {
+      expect(world, failures, false, "sse tls_connect: " + e)
+      let _ = sse_ready.send(-1)
+      return
+    }
+  }
+  let req = http::format_request("GET", "localhost", port, "/events?limit=" + want_events.to_string(), "")
+  match tls::tls_write(world, conn, req) {
+    Ok(_) => ()
+    Err(e) => {
+      expect(world, failures, false, "sse write: " + e)
+      tls::tls_close(world, conn)
+      let _ = sse_ready.send(-1)
+      return
+    }
+  }
+  let sb = StringBuilder()
+  let mut signaled = false
+  while true {
+    let chunk = tls::tls_read(world, conn, 4096)
+    if chunk.length() == 0 {
+      break
+    }
+    sb.write_string(chunk)
+    if !signaled {
+      let cur = sb.to_string()
+      if cur.contains("\r\n\r\n") {
+        expect(world, failures, cur.contains("text/event-stream"), "sse content-type: " + cur)
+        let _ = sse_ready.send(1)
+        signaled = true
+      }
+    }
+  }
+  if !signaled {
+    let _ = sse_ready.send(-1)
+  }
+  tls::tls_close(world, conn)
+  let full = sb.to_string()
+  let n = count_occurrences(full, "event: job_done")
+  sse_count.store(n)
+  expect(world, failures, n == want_events, "sse received " + n.to_string() + " events (want " + want_events.to_string() + ")")
+}
+
+fn self_test(world : World, opts : Options) -> Int {
+  let db = match store::open(opts.db) {
+    Ok(d) => d
+    Err(e) => {
+      io_eprintln(world, "self-test db open failed: " + e)
+      return 1
+    }
+  }
+  let job_ch : Channel[router::JobTask] = Channel::new(512)
+  let st = router::new_station_state(db, job_ch)
+  let hub = new_sse_hub()
+  let failures = AtomicInt::new(0)
+  let server_rc = AtomicInt::new(-1)
+  let ready : Channel[Int] = Channel::new(1)
+  let cert = opts.cert
+  let key = opts.key
+  let workers = opts.workers
+  let want_proto = opts.expect_proto
+  let total_jobs = ST_CLIENTS * ST_JOBS_PER_CLIENT
+
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      match tls::tls_listen(world, "127.0.0.1", 0, cert, key) {
+        Ok(l) => {
+          let _ = ready.send(l.port)
+          server_rc.store(run_server(world, st, hub, l, workers))
+          tls::tls_listener_close(world, l)
+        }
+        Err(e) => {
+          io_eprintln(world, "server listen failed: " + e)
+          server_rc.store(1)
+          let _ = ready.send(-1)
+        }
+      }
+    })
+    let port = match ready.recv() {
+      Some(p) => p
+      None => -1
+    }
+    if port < 0 {
+      let _ = failures.fetch_add(1)
+      return
+    }
+    io_println(world, "pion_station self-test on https://localhost:" + port.to_string())
+
+    // Start SSE subscriber thread before submitting jobs (zero sleeps)
+    let sse_ready : Channel[Int] = Channel::new(1)
+    let sse_count = AtomicInt::new(0)
+    scope(world, fn(cs : Scope) -> Unit {
+      spawn(cs, fn() -> Unit {
+        self_test_sse_reader(world, failures, port, total_jobs, sse_ready, sse_count)
+      })
+      let sr = match sse_ready.recv() {
+        Some(v) => v
+        None => -1
+      }
+      expect(world, failures, sr == 1, "sse subscriber ready")
+
+      // 4 concurrent verified TLS clients
+      let mut cid = 0
+      while cid < ST_CLIENTS {
+        let id = cid
+        spawn(cs, fn() -> Unit {
+          self_test_client(world, failures, port, id, want_proto)
+        })
+        cid = cid + 1
+      }
+    })
+
+    io_println(world, "SSE stream received " + sse_count.load().to_string() + "/" + total_jobs.to_string() + " job_done events")
+
+    // Verify a hash job result directly via GET /jobs/job-0-0
+    match tls::https_request(world, "localhost", port, "GET", "/jobs/job-0-0", "", true) {
+      Ok(resp) => {
+        let want_hash = sha256_hex("payload-job-0-0")
+        expect(
+          world,
+          failures,
+          resp.status == 200 && json_str(resp.body, "status") == "done" && json_str(resp.body, "result") == want_hash,
+          "job-0-0 check: " + resp.body,
+        )
+      }
+      Err(e) => expect(world, failures, false, "get job-0-0 err: " + e)
+    }
+
+    // Verify regex_extract job result via GET /jobs/job-0-1
+    match tls::https_request(world, "localhost", port, "GET", "/jobs/job-0-1", "", true) {
+      Ok(resp) =>
+      expect(
+        world,
+        failures,
+        resp.status == 200 && json_str(resp.body, "status") == "done" && json_str(resp.body, "result") == "0,1",
+        "job-0-1 regex_extract check: " + resp.body,
+      )
+      Err(e) => expect(world, failures, false, "get job-0-1 err: " + e)
+    }
+
+    // Verify /stats matches exact SQLite + AtomicInt counts
+    match tls::https_request(world, "localhost", port, "GET", "/stats", "", true) {
+      Ok(resp) => {
+        expect(world, failures, resp.status == 200, "stats status")
+        expect(world, failures, json_int(resp.body, "sessions") == ST_CLIENTS * 2, "stats sessions: " + resp.body)
+        expect(world, failures, json_int(resp.body, "messages") == ST_CLIENTS * 4, "stats messages: " + resp.body)
+        expect(world, failures, json_int(resp.body, "jobs_total") == total_jobs, "stats jobs_total: " + resp.body)
+        expect(world, failures, json_int(resp.body, "jobs_done") == total_jobs, "stats jobs_done: " + resp.body)
+        expect(world, failures, json_int(resp.body, "jobs_completed") == total_jobs, "stats jobs_completed: " + resp.body)
+        expect(world, failures, json_int(resp.body, "sse_reqs") == 1, "stats sse_reqs: " + resp.body)
+        io_println(world, "stats: " + resp.body)
+      }
+      Err(e) => expect(world, failures, false, "stats err: " + e)
+    }
+
+    // Wrong hostname (127.0.0.1 vs DNS:localhost cert) must be refused
+    match tls::tls_connect(world, "127.0.0.1", port, true) {
+      Ok(c) => {
+        tls::tls_close(world, c)
+        expect(world, failures, false, "wrong hostname 127.0.0.1 accepted")
+      }
+      Err(e) => {
+        expect(world, failures, e.contains("certificate verify error"), "wrong host error: " + e)
+        io_println(world, "wrong host rejected: " + e)
+      }
+    }
+
+    // 404 / 405 error routes over TLS
+    match tls::https_request(world, "localhost", port, "GET", "/no-such-route", "", true) {
+      Ok(resp) => expect(world, failures, resp.status == 404, "404 check: " + resp.body)
+      Err(e) => expect(world, failures, false, "404 err: " + e)
+    }
+    match tls::https_request(world, "localhost", port, "DELETE", "/health", "", true) {
+      Ok(resp) => expect(world, failures, resp.status == 405, "405 check: " + resp.body)
+      Err(e) => expect(world, failures, false, "405 err: " + e)
+    }
+
+    // Graceful shutdown via POST /quit
+    match tls::https_request(world, "localhost", port, "POST", "/quit", "", true) {
+      Ok(resp) => expect(world, failures, resp.status == 200 && resp.body.contains("\"quit\":true"), "quit: " + resp.body)
+      Err(e) => expect(world, failures, false, "quit err: " + e)
+    }
+  })
+
+  let _ = store::close(db)
+  expect(world, failures, server_rc.load() == 0, "server rc " + server_rc.load().to_string())
+  if failures.load() != 0 {
+    io_eprintln(world, "pion_station self-test FAILED: " + failures.load().to_string() + " check(s)")
+    return 1
+  }
+  io_println(world, "pion_station self-test PASSED")
+  0
+}
+
+pub fn main(world : World) -> Int {
+  match parse_options(world_args(world)) {
+    Ok(opts) =>
+    if opts.mode == "self-test" {
+      self_test(world, opts)
+    } else {
+      serve(world, opts)
+    }
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      io_eprintln(
+        world,
+        "usage: pion_station [--self-test] --cert <pem> --key <pem> [--db <path>] [--port <p>] [--port-file <fifo>] [--workers <n>] [--expect-proto TLSv1.3]",
+      )
+      2
+    }
+  }
+}

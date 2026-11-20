@@ -1,0 +1,510 @@
+///| router: pluggable `dyn Trait` HTTP router with `std/regex` path matching.
+///|
+///| Defines the object-safe `Handler` trait and a dynamic-dispatch `Router`
+///| storing `Array[Route]` (each holding a compiled `regex::Regex` + `dyn Handler`).
+
+import "store"
+import "regex"
+import "json"
+import "http"
+
+/// Request passed to a matched `dyn Handler`.
+pub struct RouteReq {
+  pub method : String
+  pub path : String
+  pub query : String
+  pub body : String
+  pub param : String
+  pub protocol : String
+  pub sni : String
+  pub now_ms : Int64
+}
+
+/// Response returned by a `dyn Handler`.
+pub struct RouteResp {
+  pub status : Int
+  pub content_type : String
+  pub body : String
+  pub quit : Bool
+}
+
+/// One background job pushed to the worker thread pool over `Channel[JobTask]`.
+pub struct JobTask {
+  pub id : String
+  pub session_id : String
+  pub kind : String
+  pub payload : String
+}
+
+/// Lock-free atomic counters shared across server and worker threads (`Send`).
+pub struct StationCounters {
+  pub total_reqs : AtomicInt
+  pub health_reqs : AtomicInt
+  pub session_reqs : AtomicInt
+  pub message_reqs : AtomicInt
+  pub job_reqs : AtomicInt
+  pub jobs_completed : AtomicInt
+  pub sse_reqs : AtomicInt
+  pub bad_reqs : AtomicInt
+  pub handshake_failures : AtomicInt
+}
+
+pub fn new_counters() -> StationCounters {
+  StationCounters::{
+    total_reqs: AtomicInt::new(0),
+    health_reqs: AtomicInt::new(0),
+    session_reqs: AtomicInt::new(0),
+    message_reqs: AtomicInt::new(0),
+    job_reqs: AtomicInt::new(0),
+    jobs_completed: AtomicInt::new(0),
+    sse_reqs: AtomicInt::new(0),
+    bad_reqs: AtomicInt::new(0),
+    handshake_failures: AtomicInt::new(0),
+  }
+}
+
+/// Shared station state held by handlers and workers (`Send`).
+pub struct StationState {
+  pub db : store::Store
+  pub job_tx : Channel[JobTask]
+  pub counters : StationCounters
+  pub next_id : AtomicInt
+}
+
+pub fn new_station_state(db : store::Store, job_tx : Channel[JobTask]) -> StationState {
+  StationState::{
+    db: db,
+    job_tx: job_tx,
+    counters: new_counters(),
+    next_id: AtomicInt::new(1),
+  }
+}
+
+/// Object-safe handler trait for polymorphic `dyn Handler` dispatch.
+pub trait Handler {
+  name(self : Self) -> String
+  handle(self : Self, req : RouteReq) -> RouteResp
+}
+
+/// One registered route: HTTP method, compiled regex pattern, parameter slice
+/// boundaries, and boxed `dyn Handler`.
+pub struct Route {
+  pub method : String
+  pub pattern : regex::Regex
+  pub param_prefix : String
+  pub param_suffix : String
+  pub handler : dyn Handler
+}
+
+/// Dynamic-dispatch router over `Array[Route]`.
+pub struct Router {
+  routes : Array[Route]
+  counters : StationCounters
+}
+
+pub fn new_router(counters : StationCounters) -> Router {
+  Router::{ routes: [], counters: counters }
+}
+
+pub fn router_add(
+  r : Router,
+  method : String,
+  pattern_str : String,
+  param_prefix : String,
+  param_suffix : String,
+  handler : dyn Handler,
+) -> Result[Unit, String] {
+  let re = regex::compile(pattern_str)?
+  r.routes.push(Route::{
+    method: method,
+    pattern: re,
+    param_prefix: param_prefix,
+    param_suffix: param_suffix,
+    handler: handler,
+  })
+  Ok(())
+}
+
+pub fn router_route_count(r : Router) -> Int {
+  r.routes.length()
+}
+
+pub fn json_resp(status : Int, body : String) -> RouteResp {
+  RouteResp::{
+    status: status,
+    content_type: "application/json",
+    body: body,
+    quit: false,
+  }
+}
+
+pub fn err_resp(counters : StationCounters, status : Int, msg : String) -> RouteResp {
+  let _ = counters.bad_reqs.fetch_add(1)
+  let body = json::stringify(json::JObj([json::field("error", json::JStr(msg))]))
+  json_resp(status, body)
+}
+
+fn extract_param(path : String, prefix : String, suffix : String) -> String {
+  if prefix.length() == 0 {
+    return ""
+  }
+  let start = prefix.length()
+  let end = path.length() - suffix.length()
+  if end < start || start > path.length() {
+    return ""
+  }
+  http::url_decode(path.slice(start, end))
+}
+
+/// Matches `(method, path)` against `Router.routes` using `regex::is_match` and
+/// invokes `route.handler.handle(req)` via `dyn Handler` dispatch.
+pub fn router_dispatch(
+  r : Router,
+  method : String,
+  path : String,
+  query : String,
+  body : String,
+  protocol : String,
+  sni : String,
+  now_ms : Int64,
+) -> RouteResp {
+  let _ = r.counters.total_reqs.fetch_add(1)
+  let mut path_matched = false
+  let mut i = 0
+  while i < r.routes.length() {
+    let rt = r.routes[i]
+    if regex::is_match(rt.pattern, path) {
+      if rt.method == method {
+        let param = extract_param(path, rt.param_prefix, rt.param_suffix)
+        let req = RouteReq::{
+          method: method,
+          path: path,
+          query: query,
+          body: body,
+          param: param,
+          protocol: protocol,
+          sni: sni,
+          now_ms: now_ms,
+        }
+        return rt.handler.handle(req)
+      }
+      path_matched = true
+    }
+    i = i + 1
+  }
+  if path_matched {
+    err_resp(r.counters, 405, "method not allowed: " + method + " " + path)
+  } else {
+    err_resp(r.counters, 404, "no route: " + method + " " + path)
+  }
+}
+
+fn json_str_field(v : json::JsonValue, key : String) -> Option[String] {
+  match json::obj_get(v, key) {
+    Some(x) => json::as_str(x)
+    None => None
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Built-in pluggable `Handler` implementations.
+
+pub struct HealthHandler {
+  pub st : StationState
+}
+
+impl Handler for HealthHandler {
+  fn name(self : HealthHandler) -> String {
+    "health"
+  }
+  fn handle(self : HealthHandler, req : RouteReq) -> RouteResp {
+    let _ = self.st.counters.health_reqs.fetch_add(1)
+    let body = json::stringify(json::JObj([
+      json::field("ok", json::JBool(true)),
+      json::field("service", json::JStr("pion-station")),
+      json::field("protocol", json::JStr(req.protocol)),
+      json::field("sni", json::JStr(req.sni)),
+      json::field("sqlite", json::JStr(store::sqlite_version())),
+    ]))
+    json_resp(200, body)
+  }
+}
+
+pub struct SessionCreateHandler {
+  pub st : StationState
+}
+
+impl Handler for SessionCreateHandler {
+  fn name(self : SessionCreateHandler) -> String {
+    "session_create"
+  }
+  fn handle(self : SessionCreateHandler, req : RouteReq) -> RouteResp {
+    let parsed = match json::parse(req.body) {
+      Ok(v) => v
+      Err(e) => return err_resp(self.st.counters, 400, "invalid json: " + e)
+    }
+    let title = match json_str_field(parsed, "title") {
+      Some(t) => t
+      None => return err_resp(self.st.counters, 400, "missing string field `title`")
+    }
+    let id = match json_str_field(parsed, "id") {
+      Some(s) =>
+      if s.length() > 0 {
+        s
+      } else {
+        "sess-" + self.st.next_id.fetch_add(1).to_string()
+      }
+      None => "sess-" + self.st.next_id.fetch_add(1).to_string()
+    }
+    match store::create_session(self.st.db, id, title, req.now_ms) {
+      Ok(rec) => {
+        let _ = self.st.counters.session_reqs.fetch_add(1)
+        json_resp(201, json::encode(rec))
+      }
+      Err(e) => err_resp(self.st.counters, 400, e)
+    }
+  }
+}
+
+pub struct SessionListHandler {
+  pub st : StationState
+}
+
+impl Handler for SessionListHandler {
+  fn name(self : SessionListHandler) -> String {
+    "session_list"
+  }
+  fn handle(self : SessionListHandler, req : RouteReq) -> RouteResp {
+    let _ = req
+    match store::list_sessions(self.st.db) {
+      Ok(rows) => {
+        let _ = self.st.counters.session_reqs.fetch_add(1)
+        let items : Array[json::JsonValue] = []
+        let mut i = 0
+        while i < rows.length() {
+          items.push(rows[i].to_json())
+          i = i + 1
+        }
+        let body = json::stringify(json::JObj([
+          json::field("sessions", json::JArr(items)),
+          json::field("count", json::JInt(rows.length().to_int64())),
+        ]))
+        json_resp(200, body)
+      }
+      Err(e) => err_resp(self.st.counters, 500, e)
+    }
+  }
+}
+
+pub struct MessagePostHandler {
+  pub st : StationState
+}
+
+impl Handler for MessagePostHandler {
+  fn name(self : MessagePostHandler) -> String {
+    "message_post"
+  }
+  fn handle(self : MessagePostHandler, req : RouteReq) -> RouteResp {
+    let session_id = req.param
+    if session_id.length() == 0 {
+      return err_resp(self.st.counters, 400, "missing session id")
+    }
+    let parsed = match json::parse(req.body) {
+      Ok(v) => v
+      Err(e) => return err_resp(self.st.counters, 400, "invalid json: " + e)
+    }
+    let role = match json_str_field(parsed, "role") {
+      Some(r) => r
+      None => "user"
+    }
+    let msg_body = match json_str_field(parsed, "body") {
+      Some(b) => b
+      None => return err_resp(self.st.counters, 400, "missing string field `body`")
+    }
+    match store::append_message(self.st.db, session_id, role, msg_body, req.now_ms) {
+      Ok(rec) => {
+        let _ = self.st.counters.message_reqs.fetch_add(1)
+        json_resp(201, json::encode(rec))
+      }
+      Err(e) => err_resp(self.st.counters, 500, e)
+    }
+  }
+}
+
+pub struct MessageListHandler {
+  pub st : StationState
+}
+
+impl Handler for MessageListHandler {
+  fn name(self : MessageListHandler) -> String {
+    "message_list"
+  }
+  fn handle(self : MessageListHandler, req : RouteReq) -> RouteResp {
+    let session_id = req.param
+    match store::list_messages(self.st.db, session_id) {
+      Ok(rows) => {
+        let _ = self.st.counters.message_reqs.fetch_add(1)
+        let items : Array[json::JsonValue] = []
+        let mut i = 0
+        while i < rows.length() {
+          items.push(rows[i].to_json())
+          i = i + 1
+        }
+        let body = json::stringify(json::JObj([
+          json::field("session_id", json::JStr(session_id)),
+          json::field("messages", json::JArr(items)),
+          json::field("count", json::JInt(rows.length().to_int64())),
+        ]))
+        json_resp(200, body)
+      }
+      Err(e) => err_resp(self.st.counters, 500, e)
+    }
+  }
+}
+
+pub struct JobSubmitHandler {
+  pub st : StationState
+}
+
+impl Handler for JobSubmitHandler {
+  fn name(self : JobSubmitHandler) -> String {
+    "job_submit"
+  }
+  fn handle(self : JobSubmitHandler, req : RouteReq) -> RouteResp {
+    let parsed = match json::parse(req.body) {
+      Ok(v) => v
+      Err(e) => return err_resp(self.st.counters, 400, "invalid json: " + e)
+    }
+    let session_id = match json_str_field(parsed, "session_id") {
+      Some(s) => s
+      None => "default"
+    }
+    let kind = match json_str_field(parsed, "kind") {
+      Some(k) => k
+      None => "hash"
+    }
+    let payload = match json_str_field(parsed, "payload") {
+      Some(p) => p
+      None => return err_resp(self.st.counters, 400, "missing string field `payload`")
+    }
+    let id = match json_str_field(parsed, "id") {
+      Some(s) =>
+      if s.length() > 0 {
+        s
+      } else {
+        "job-" + self.st.next_id.fetch_add(1).to_string()
+      }
+      None => "job-" + self.st.next_id.fetch_add(1).to_string()
+    }
+    match store::create_job(self.st.db, id, session_id, kind, payload, req.now_ms) {
+      Ok(rec) => {
+        let _ = self.st.counters.job_reqs.fetch_add(1)
+        let ok = self.st.job_tx.send(JobTask::{
+          id: id,
+          session_id: session_id,
+          kind: kind,
+          payload: payload,
+        })
+        if !ok {
+          return err_resp(self.st.counters, 503, "job queue closed")
+        }
+        json_resp(202, json::encode(rec))
+      }
+      Err(e) => err_resp(self.st.counters, 400, e)
+    }
+  }
+}
+
+pub struct JobGetHandler {
+  pub st : StationState
+}
+
+impl Handler for JobGetHandler {
+  fn name(self : JobGetHandler) -> String {
+    "job_get"
+  }
+  fn handle(self : JobGetHandler, req : RouteReq) -> RouteResp {
+    let job_id = req.param
+    match store::get_job(self.st.db, job_id) {
+      Ok(Some(rec)) => {
+        let _ = self.st.counters.job_reqs.fetch_add(1)
+        json_resp(200, json::encode(rec))
+      }
+      Ok(None) => err_resp(self.st.counters, 404, "job not found: " + job_id)
+      Err(e) => err_resp(self.st.counters, 500, e)
+    }
+  }
+}
+
+pub fn stats_json(st : StationState) -> Result[String, String] {
+  let db_st = store::stats(st.db)?
+  Ok(
+    json::stringify(json::JObj([
+      json::field("total_reqs", json::JInt(st.counters.total_reqs.load().to_int64())),
+      json::field("health_reqs", json::JInt(st.counters.health_reqs.load().to_int64())),
+      json::field("session_reqs", json::JInt(st.counters.session_reqs.load().to_int64())),
+      json::field("message_reqs", json::JInt(st.counters.message_reqs.load().to_int64())),
+      json::field("job_reqs", json::JInt(st.counters.job_reqs.load().to_int64())),
+      json::field("jobs_completed", json::JInt(st.counters.jobs_completed.load().to_int64())),
+      json::field("sse_reqs", json::JInt(st.counters.sse_reqs.load().to_int64())),
+      json::field("bad_reqs", json::JInt(st.counters.bad_reqs.load().to_int64())),
+      json::field("handshake_failures", json::JInt(st.counters.handshake_failures.load().to_int64())),
+      json::field("sessions", json::JInt(db_st.sessions)),
+      json::field("messages", json::JInt(db_st.messages)),
+      json::field("jobs_done", json::JInt(db_st.jobs_done)),
+      json::field("jobs_total", json::JInt(db_st.jobs_total)),
+    ])),
+  )
+}
+
+pub struct StatsHandler {
+  pub st : StationState
+}
+
+impl Handler for StatsHandler {
+  fn name(self : StatsHandler) -> String {
+    "stats"
+  }
+  fn handle(self : StatsHandler, req : RouteReq) -> RouteResp {
+    let _ = req
+    match stats_json(self.st) {
+      Ok(body) => json_resp(200, body)
+      Err(e) => err_resp(self.st.counters, 500, e)
+    }
+  }
+}
+
+pub struct QuitHandler {
+  pub st : StationState
+}
+
+impl Handler for QuitHandler {
+  fn name(self : QuitHandler) -> String {
+    "quit"
+  }
+  fn handle(self : QuitHandler, req : RouteReq) -> RouteResp {
+    let _ = req
+    let _ = self.st
+    RouteResp::{
+      status: 200,
+      content_type: "application/json",
+      body: "{\"ok\":true,\"quit\":true}",
+      quit: true,
+    }
+  }
+}
+
+/// Builds the full station router with all 9 handlers registered as `dyn Handler`.
+pub fn build_station_router(st : StationState) -> Result[Router, String] {
+  let r = new_router(st.counters)
+  router_add(r, "GET", "^/health$", "", "", HealthHandler::{ st: st })?
+  router_add(r, "POST", "^/sessions$", "", "", SessionCreateHandler::{ st: st })?
+  router_add(r, "GET", "^/sessions$", "", "", SessionListHandler::{ st: st })?
+  router_add(r, "POST", "^/sessions/[^/]+/messages$", "/sessions/", "/messages", MessagePostHandler::{ st: st })?
+  router_add(r, "GET", "^/sessions/[^/]+/messages$", "/sessions/", "/messages", MessageListHandler::{ st: st })?
+  router_add(r, "POST", "^/jobs$", "", "", JobSubmitHandler::{ st: st })?
+  router_add(r, "GET", "^/jobs/[^/]+$", "/jobs/", "", JobGetHandler::{ st: st })?
+  router_add(r, "GET", "^/stats$", "", "", StatsHandler::{ st: st })?
+  router_add(r, "POST", "^/quit$", "", "", QuitHandler::{ st: st })?
+  Ok(r)
+}

@@ -1,0 +1,108 @@
+///| router unit tests: regex route matching, `dyn Handler` polymorphic dispatch, 404/405.
+
+struct CustomPingHandler {
+  tag : String
+}
+
+impl Handler for CustomPingHandler {
+  fn name(self : CustomPingHandler) -> String {
+    "custom_ping"
+  }
+  fn handle(self : CustomPingHandler, req : RouteReq) -> RouteResp {
+    let body = json::stringify(json::JObj([
+      json::field("tag", json::JStr(self.tag)),
+      json::field("param", json::JStr(req.param)),
+    ]))
+    json_resp(200, body)
+  }
+}
+
+fn test_state() -> StationState {
+  let db = match store::open(":memory:") {
+    Ok(s) => s
+    Err(e) => {
+      debug_assert(false, e)
+      store::Store::{ db_addr: Mutex::new(0L), path: "" }
+    }
+  }
+  let ch : Channel[JobTask] = Channel::new(16)
+  new_station_state(db, ch)
+}
+
+test "dyn Handler dispatch and regex path params" {
+  let st = test_state()
+  let r = match build_station_router(st) {
+    Ok(rt) => rt
+    Err(e) => {
+      debug_assert(false, e)
+      new_router(st.counters)
+    }
+  }
+  debug_assert(router_route_count(r) == 9, "9 built-in routes")
+  match router_add(r, "GET", "^/ping/[a-z0-9_-]+$", "/ping/", "", CustomPingHandler::{ tag: "v1" }) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, e)
+  }
+
+  // Health
+  let h = router_dispatch(r, "GET", "/health", "", "", "TLSv1.3", "localhost", 100L)
+  debug_assert(h.status == 200 && h.body.contains("\"service\":\"pion-station\""), "health: " + h.body)
+
+  // Custom dyn Handler plugin with regex path param
+  let p = router_dispatch(r, "GET", "/ping/agent-42", "", "", "TLSv1.3", "localhost", 101L)
+  debug_assert(p.status == 200 && p.body == "{\"tag\":\"v1\",\"param\":\"agent-42\"}", "ping: " + p.body)
+
+  // Session + message + job through dyn Handlers
+  let s1 = router_dispatch(r, "POST", "/sessions", "", "{\"id\":\"s1\",\"title\":\"Demo\"}", "TLSv1.3", "", 102L)
+  debug_assert(s1.status == 201 && s1.body.contains("\"id\":\"s1\""), "create session: " + s1.body)
+
+  let m1 = router_dispatch(
+    r,
+    "POST",
+    "/sessions/s1/messages",
+    "",
+    "{\"role\":\"user\",\"body\":\"hi\"}",
+    "TLSv1.3",
+    "",
+    103L,
+  )
+  debug_assert(m1.status == 201 && m1.body.contains("\"session_id\":\"s1\""), "post msg: " + m1.body)
+
+  let ml = router_dispatch(r, "GET", "/sessions/s1/messages", "", "", "TLSv1.3", "", 104L)
+  debug_assert(ml.status == 200 && ml.body.contains("\"count\":1"), "list msgs: " + ml.body)
+
+  let j1 = router_dispatch(
+    r,
+    "POST",
+    "/jobs",
+    "",
+    "{\"id\":\"j1\",\"session_id\":\"s1\",\"kind\":\"hash\",\"payload\":\"pion\"}",
+    "TLSv1.3",
+    "",
+    105L,
+  )
+  debug_assert(j1.status == 202 && j1.body.contains("\"status\":\"queued\""), "submit job: " + j1.body)
+
+  // Verify job arrived on channel
+  match st.job_tx.recv() {
+    Some(t) => debug_assert(t.id == "j1" && t.payload == "pion", "job task")
+    None => debug_assert(false, "job channel empty")
+  }
+
+  let jg = router_dispatch(r, "GET", "/jobs/j1", "", "", "TLSv1.3", "", 106L)
+  debug_assert(jg.status == 200 && jg.body.contains("\"id\":\"j1\""), "get job: " + jg.body)
+
+  // 404 and 405
+  let r404 = router_dispatch(r, "GET", "/does/not/exist", "", "", "TLSv1.3", "", 107L)
+  debug_assert(r404.status == 404, "expected 404, got " + r404.status.to_string())
+
+  let r405 = router_dispatch(r, "DELETE", "/health", "", "", "TLSv1.3", "", 108L)
+  debug_assert(r405.status == 405, "expected 405, got " + r405.status.to_string())
+
+  // Quit
+  let q = router_dispatch(r, "POST", "/quit", "", "", "TLSv1.3", "", 109L)
+  debug_assert(q.status == 200 && q.quit, "quit flag")
+
+  st.job_tx.close()
+  let _ = store::close(st.db)
+}
