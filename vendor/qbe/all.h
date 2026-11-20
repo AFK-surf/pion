@@ -63,6 +63,8 @@ struct Target {
 	char asloc[4];
 	char assym[4];
 	uint cansel:1;
+	bits jtblclob; /* scratch regs clobbered by jtbl */
+	int njtblclob;
 };
 
 #define BIT(n) ((bits)1 << (n))
@@ -164,7 +166,7 @@ enum J {
 	X(jfisle) X(jfislt) X(jfiuge) X(jfiugt) \
 	X(jfiule) X(jfiult) X(jffeq)  X(jffge)  \
 	X(jffgt)  X(jffle)  X(jfflt)  X(jffne)  \
-	X(jffo)   X(jffuo)  X(hlt)
+	X(jffo)   X(jffuo)  X(hlt)    X(jtbl)
 #define X(j) J##j,
 	JMPS(X)
 #undef X
@@ -257,6 +259,8 @@ struct Blk {
 	} jmp;
 	Blk *s1;
 	Blk *s2;
+	Blk **jtbl;
+	uint32_t njtbl;
 	Blk *link;
 
 	uint id;

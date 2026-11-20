@@ -641,6 +641,45 @@ emitins(Ins i, E *e)
 }
 
 static void
+emitjtbl(Blk *b, int id0, E *e)
+{
+	static int jt0;
+	int jtid = jt0++;
+	FILE *f = e->f;
+	char *idx_reg;
+	uint32_t jk;
+
+	if (rtype(b->jmp.arg) == RSlot) {
+		Ins li = { .op = Oload, .cls = Kw, .to = TMP(R10), .arg = { b->jmp.arg, R } };
+		emitf("movl %M0, %W=", &li, e);
+		idx_reg = rname[R10][SWord];
+	} else {
+		assert(isreg(b->jmp.arg));
+		idx_reg = rname[b->jmp.arg.val][SWord];
+	}
+	fprintf(f, "\tcmpl $%"PRIu32", %%%s\n", b->njtbl, idx_reg);
+	fprintf(f, "\tjae %sbb%d\n", T.asloc, id0 + b->s1->id);
+	fprintf(f, "\tleaq %sjt%d(%%rip), %%r11\n", T.asloc, jtid);
+	if (strcmp(idx_reg, "r10d") != 0)
+		fprintf(f, "\tmovl %%%s, %%r10d\n", idx_reg);
+	fprintf(f, "\tmovslq (%%r11,%%r10,4), %%r10\n");
+	fprintf(f, "\taddq %%r10, %%r11\n");
+	fprintf(f, "\tjmpq *%%r11\n");
+	if (T.apple)
+		fprintf(f, ".section __TEXT,__const\n");
+	else if (T.windows)
+		fprintf(f, ".section .rdata,\"dr\"\n");
+	else
+		fprintf(f, ".section .rodata\n");
+	fprintf(f, ".p2align 2\n");
+	fprintf(f, "%sjt%d:\n", T.asloc, jtid);
+	for (jk = 0; jk < b->njtbl; jk++)
+		fprintf(f, "\t.long %sbb%d - %sjt%d\n",
+			T.asloc, id0 + b->jtbl[jk]->id, T.asloc, jtid);
+	fprintf(f, ".text\n");
+}
+
+static void
 sysv_framesz(E *e)
 {
 	uint64_t i, o, f;
@@ -743,6 +782,9 @@ amd64_sysv_emitfn(Fn *fn, FILE *f)
 					T.asloc, id0+b->s1->id);
 			else
 				lbl = 0;
+			break;
+		case Jjtbl:
+			emitjtbl(b, id0, e);
 			break;
 		default:
 			c = b->jmp.type - Jjf;
@@ -861,6 +903,9 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 					T.asloc, id0+b->s1->id);
 			else
 				lbl = 0;
+			break;
+		case Jjtbl:
+			emitjtbl(b, id0, e);
 			break;
 		default:
 			c = b->jmp.type - Jjf;

@@ -53,6 +53,7 @@ enum Token {
 	Tphi,
 	Tjmp,
 	Tjnz,
+	Tjtbl,
 	Tret,
 	Thlt,
 	Texport,
@@ -113,6 +114,7 @@ static char *kwmap[Ntok] = {
 	[Tphi] = "phi",
 	[Tjmp] = "jmp",
 	[Tjnz] = "jnz",
+	[Tjtbl] = "jtbl",
 	[Tret] = "ret",
 	[Thlt] = "hlt",
 	[Texport] = "export",
@@ -685,6 +687,38 @@ parseline(PState ps)
 		if (curb->s1 == curf->start || curb->s2 == curf->start)
 			err("invalid jump to the start block");
 		goto Close;
+	case Tjtbl:
+		curb->jmp.type = Jjtbl;
+		r = parseref();
+		if (req(r, R))
+			err("invalid argument for jtbl jump");
+		curb->jmp.arg = r;
+		expect(Tcomma);
+		expect(Tlbl);
+		curb->s1 = findblk();
+		if (curb->s1 == curf->start)
+			err("invalid jump to the start block");
+		{
+			Blk **jt;
+			uint32_t njt;
+
+			jt = vnew(0, sizeof jt[0], PFn);
+			njt = 0;
+			while (peek() == Tcomma) {
+				next();
+				expect(Tlbl);
+				b = findblk();
+				if (b == curf->start)
+					err("invalid jump to the start block");
+				vgrow(&jt, ++njt);
+				jt[njt - 1] = b;
+			}
+			if (njt == 0)
+				err("jtbl requires at least one table target");
+			curb->jtbl = jt;
+			curb->njtbl = njt;
+		}
+		goto Close;
 	case Thlt:
 		curb->jmp.type = Jhlt;
 	Close:
@@ -892,7 +926,7 @@ typecheck(Fn *fn)
 			if (!usecheck(r, k, fn))
 				goto JErr;
 		}
-		if (b->jmp.type == Jjnz && !usecheck(r, Kw, fn))
+		if ((b->jmp.type == Jjnz || b->jmp.type == Jjtbl) && !usecheck(r, Kw, fn))
 		JErr:
 			err("invalid type for jump argument %%%s in block @%s",
 				fn->tmp[r.val].name, b->name);
@@ -900,6 +934,12 @@ typecheck(Fn *fn)
 			err("block @%s is used undefined", b->s1->name);
 		if (b->s2 && b->s2->jmp.type == Jxxx)
 			err("block @%s is used undefined", b->s2->name);
+		if (b->jmp.type == Jjtbl) {
+			uint32_t jk;
+			for (jk = 0; jk < b->njtbl; jk++)
+				if (b->jtbl[jk]->jmp.type == Jxxx)
+					err("block @%s is used undefined", b->jtbl[jk]->name);
+		}
 	}
 }
 
@@ -1439,6 +1479,16 @@ printfn(Fn *fn, FILE *f)
 			if (b->s1 != b->link)
 				fprintf(f, "\tjmp @%s\n", b->s1->name);
 			break;
+		case Jjtbl: {
+			uint32_t jk;
+			fprintf(f, "\tjtbl ");
+			printref(b->jmp.arg, fn, f);
+			fprintf(f, ", @%s", b->s1->name);
+			for (jk = 0; jk < b->njtbl; jk++)
+				fprintf(f, ", @%s", b->jtbl[jk]->name);
+			fprintf(f, "\n");
+			break;
+		}
 		default:
 			fprintf(f, "\t%s ", jtoa[b->jmp.type]);
 			if (b->jmp.type == Jjnz) {

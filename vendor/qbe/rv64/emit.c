@@ -575,6 +575,41 @@ rv64_emitfn(Fn *fn, FILE *f)
 				id0+b->s2->id
 			);
 			goto Jmp;
+		case Jjtbl: {
+			static int jt0;
+			int jtid = jt0++;
+			char *idx_reg;
+			uint32_t jk;
+			if (rtype(b->jmp.arg) == RSlot) {
+				ii.arg[0] = b->jmp.arg;
+				emitf("lw t5, %M0", &ii, fn, f);
+				idx_reg = rname[T5];
+			} else {
+				assert(isreg(b->jmp.arg));
+				idx_reg = rname[b->jmp.arg.val];
+			}
+			fprintf(f,
+				"\tslli t5, %s, 32\n"
+				"\tsrli t5, t5, 32\n"
+				"\tli t6, %"PRIu32"\n"
+				"\tbgeu t5, t6, .L%d\n"
+				"\tlla t6, .Ljt%d\n"
+				"\tslli t5, t5, 2\n"
+				"\tadd t5, t6, t5\n"
+				"\tlw t5, 0(t5)\n"
+				"\tadd t6, t6, t5\n"
+				"\tjr t6\n"
+				".section .rodata\n"
+				".p2align 2\n"
+				".Ljt%d:\n",
+				idx_reg, b->njtbl, id0 + b->s1->id, jtid, jtid
+			);
+			for (jk = 0; jk < b->njtbl; jk++)
+				fprintf(f, "\t.word .L%d - .Ljt%d\n",
+					id0 + b->jtbl[jk]->id, jtid);
+			fprintf(f, ".text\n");
+			break;
+		}
 		}
 	}
 	id0 += fn->nblk;

@@ -22,7 +22,9 @@ amd64_memargs(int op)
 	.memargs = amd64_memargs, \
 	.abi0 = elimsb, \
 	.isel = amd64_isel, \
-	.cansel = 1,
+	.cansel = 1, \
+	.jtblclob = BIT(R10) | BIT(R11), \
+	.njtblclob = 2,
 
 Target T_amd64_sysv = {
 	.name = "amd64_sysv",

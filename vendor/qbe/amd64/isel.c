@@ -605,6 +605,14 @@ seljmp(Blk *b, Fn *fn)
 	|| b->jmp.type == Jjmp
 	|| b->jmp.type == Jhlt)
 		return;
+	if (b->jmp.type == Jjtbl) {
+		if (rtype(b->jmp.arg) != RTmp) {
+			r = newtmp("isel", Kw, fn);
+			emit(Ocopy, Kw, r, b->jmp.arg, R);
+			b->jmp.arg = r;
+		}
+		return;
+	}
 	assert(b->jmp.type == Jjnz);
 	r = b->jmp.arg;
 	t = &fn->tmp[r.val];
@@ -923,6 +931,24 @@ amd64_isel(Fn *fn)
 					assert(a+1 < p->narg);
 				fixarg(&p->arg[a], p->cls, 0, fn);
 			}
+		if (b->jmp.type == Jjtbl) {
+			uint32_t jk, jp;
+			for (jk = 0; jk < b->njtbl; jk++) {
+				Blk *jt = b->jtbl[jk];
+				if (jt == b->s1)
+					continue;
+				for (jp = 0; jp < jk; jp++)
+					if (b->jtbl[jp] == jt)
+						break;
+				if (jp < jk)
+					continue;
+				for (p=jt->phi; p; p=p->link) {
+					for (a=0; p->blk[a] != b; a++)
+						assert(a+1 < p->narg);
+					fixarg(&p->arg[a], p->cls, 0, fn);
+				}
+			}
+		}
 		memset(num, 0, n * sizeof num[0]);
 		anumber(num, b, fn->con);
 		seljmp(b, fn);

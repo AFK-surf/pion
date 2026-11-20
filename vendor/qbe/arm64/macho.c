@@ -199,6 +199,12 @@ typedef struct {
 	uint8_t is_cond;
 } BrFixup;
 
+typedef struct {
+	uint32_t entry_off;
+	uint32_t tbl_base_off;
+	uint32_t target_bid;
+} JtblFixup;
+
 enum {
 	SEC_TEXT = 0,
 	SEC_CONST,
@@ -755,7 +761,25 @@ typedef struct {
 	BrFixup *fixups;
 	size_t nfixups;
 	size_t cap_fixups;
+	JtblFixup *jtfixups;
+	size_t njtfixups;
+	size_t cap_jtfixups;
 } ME;
+
+static void
+me_add_jtfixup(ME *e, uint32_t entry_off, uint32_t tbl_base_off, uint32_t target_bid)
+{
+	if (e->njtfixups == e->cap_jtfixups) {
+		e->cap_jtfixups = e->cap_jtfixups ? e->cap_jtfixups * 2 : 64;
+		e->jtfixups = realloc(e->jtfixups, e->cap_jtfixups * sizeof *e->jtfixups);
+		if (!e->jtfixups)
+			die("out of memory");
+	}
+	JtblFixup *f = &e->jtfixups[e->njtfixups++];
+	f->entry_off = entry_off;
+	f->tbl_base_off = tbl_base_off;
+	f->target_bid = target_bid;
+}
 
 static void
 me_add_fixup(ME *e, uint32_t pc_off, uint32_t target_bid, uint8_t cond, uint8_t is_cond)
@@ -1461,6 +1485,46 @@ arm64_macho_fn(Fn *fn)
 				emit_u32(0x14000000u); /* b placeholder */
 			}
 			break;
+		case Jjtbl: {
+			uint32_t idx;
+			if (rtype(b->jmp.arg) == RSlot) {
+				Ins li = { .op = Oload, .cls = Kw, .to = TMP(IP0), .arg = { b->jmp.arg, R } };
+				me_emitins(&li, &e);
+				idx = greg(IP0);
+			} else {
+				assert(isreg(b->jmp.arg));
+				idx = greg(b->jmp.arg.val);
+			}
+			if (b->njtbl <= 4095) {
+				/* cmp w<idx>, #njtbl (subs wzr, w<idx>, #njtbl) */
+				emit_u32(0x7100001fu | (b->njtbl << 10) | (idx << 5));
+			} else if (b->njtbl <= 65535) {
+				enc_movz(0, 17, (uint16_t)b->njtbl, 0);
+				/* cmp w<idx>, w17 (subs wzr, w<idx>, w17) */
+				emit_u32(0x6b11001fu | (idx << 5));
+			} else {
+				enc_movz(0, 17, (uint16_t)(b->njtbl & 0xffffu), 0);
+				enc_movk(0, 17, (uint16_t)(b->njtbl >> 16), 1);
+				emit_u32(0x6b11001fu | (idx << 5));
+			}
+			/* b.hs <s1> (cond 0x2 = CS/HS) */
+			me_add_fixup(&e, text_pos(), b->s1->id, 0x2, 1);
+			emit_u32(0x54000002u);
+			/* adr x17, .+16 */
+			emit_u32(0x10000091u);
+			/* ldrsw x16, [x17, w<idx>, uxtw #2] */
+			emit_u32(0xb8a05a30u | (idx << 16));
+			/* add x17, x17, x16 */
+			emit_u32(0x8b100231u);
+			/* br x17 */
+			emit_u32(0xd61f0220u);
+			uint32_t tbl_base = text_pos();
+			for (uint32_t jk = 0; jk < b->njtbl; jk++) {
+				me_add_jtfixup(&e, text_pos(), tbl_base, b->jtbl[jk]->id);
+				emit_u32(0);
+			}
+			break;
+		}
 		default: {
 			int c = b->jmp.type - Jjf;
 			if (c < 0 || c >= NCmp)
@@ -1502,8 +1566,20 @@ arm64_macho_fn(Fn *fn)
 		code[f->pc_off + 3] = (uint8_t)((insn >> 24) & 0xffu);
 	}
 
+	/* Patch jump table entries */
+	for (size_t k = 0; k < e.njtfixups; k++) {
+		JtblFixup *jf = &e.jtfixups[k];
+		int32_t rel = (int32_t)blk_off[jf->target_bid] - (int32_t)jf->tbl_base_off;
+		uint32_t u = (uint32_t)rel;
+		code[jf->entry_off + 0] = (uint8_t)(u & 0xffu);
+		code[jf->entry_off + 1] = (uint8_t)((u >> 8) & 0xffu);
+		code[jf->entry_off + 2] = (uint8_t)((u >> 16) & 0xffu);
+		code[jf->entry_off + 3] = (uint8_t)((u >> 24) & 0xffu);
+	}
+
 	free(blk_off);
 	free(e.fixups);
+	free(e.jtfixups);
 }
 
 /* ---- Data section emission ---- */

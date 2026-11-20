@@ -481,7 +481,7 @@ void
 rega(Fn *fn)
 {
 	int j, t, r, x, rl[Tmp0];
-	Blk *b, *b1, *s, ***ps, *blist, **blk, **bp;
+	Blk *b, *b1, *s, *blist, **blk, **bp;
 	RMap *end, *beg, cur, old, *m;
 	Ins *i;
 	Phi *p;
@@ -539,10 +539,18 @@ rega(Fn *fn)
 		}
 		for (r=0; bsiter(b->out, &r) && r<Tmp0; r++)
 			radd(&cur, r, r);
+		if (b->jmp.type == Jjtbl && T.jtblclob)
+			for (r = T.gpr0; r < T.gpr0 + T.ngpr; r++)
+				if ((T.jtblclob & BIT(r)) && !bshas(cur.b, r))
+					radd(&cur, r, r);
 		for (j=0; j<x; j++)
 			ralloctry(&cur, rl[j], 1);
 		for (j=0; j<x; j++)
 			ralloc(&cur, rl[j]);
+		if (b->jmp.type == Jjtbl && T.jtblclob)
+			for (r = T.gpr0; r < T.gpr0 + T.ngpr; r++)
+				if (T.jtblclob & BIT(r))
+					rfree(&cur, r);
 		rcopy(&end[n], &cur);
 		doblk(b, &cur);
 		bscopy(b->in, cur.b);
@@ -640,8 +648,38 @@ rega(Fn *fn)
 	/* 4. emit remaining copies in new blocks */
 	blist = 0;
 	for (b=fn->start;; b=b->link) {
-		ps = (Blk**[3]){&b->s1, &b->s2, (Blk*[1]){0}};
-		for (; (s=**ps); ps++) {
+		Blk **e2[2] = {&b->s1, &b->s2};
+		uint32_t ne = 2 + (b->jmp.type == Jjtbl ? b->njtbl : 0);
+		Blk ***edges = e2;
+		Blk **origs = 0;
+		Blk **tramps = 0;
+		uint32_t ei;
+		if (b->jmp.type == Jjtbl) {
+			edges = alloc(ne * sizeof edges[0]);
+			origs = alloc(ne * sizeof origs[0]);
+			tramps = alloc(ne * sizeof tramps[0]);
+			edges[0] = &b->s1;
+			edges[1] = &b->s2;
+			for (ei = 0; ei < b->njtbl; ei++)
+				edges[2 + ei] = &b->jtbl[ei];
+		}
+		for (ei = 0; ei < ne; ei++) {
+			s = *edges[ei];
+			if (!s)
+				continue;
+			if (origs) {
+				uint32_t ek;
+				for (ek = 0; ek < ei; ek++)
+					if (origs[ek] == s)
+						break;
+				if (ek < ei) {
+					if (tramps[ek])
+						*edges[ei] = tramps[ek];
+					continue;
+				}
+				origs[ei] = s;
+				tramps[ei] = 0;
+			}
 			npm = 0;
 			for (p=s->phi; p; p=p->link) {
 				dst = p->to;
@@ -679,7 +717,9 @@ rega(Fn *fn)
 			idup(b1, curi, &insb[NIns]-curi);
 			b1->jmp.type = Jjmp;
 			b1->s1 = s;
-			**ps = b1;
+			*edges[ei] = b1;
+			if (tramps)
+				tramps[ei] = b1;
 		}
 		if (!b->link) {
 			b->link = blist;

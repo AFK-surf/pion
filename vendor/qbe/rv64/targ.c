@@ -51,6 +51,8 @@ Target T_rv64 = {
 	.emitfin = elf_emitfin,
 	.asloc = ".L",
 	.cansel = 0,
+	.jtblclob = BIT(T5),
+	.njtblclob = 1,
 };
 
 MAKESURE(rsave_size_ok, sizeof rv64_rsave == (NGPS+NFPS+1) * sizeof(int));

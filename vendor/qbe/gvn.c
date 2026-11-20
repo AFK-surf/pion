@@ -399,6 +399,18 @@ dedupjmp(Fn *fn, Blk *b)
 	Ref arg;
 	int cls, eqval, z;
 
+	if (b->jmp.type == Jjtbl) {
+		if (isconbits(fn, b->jmp.arg, &v)) {
+			uint32_t idx = (uint32_t)v;
+			if (idx < b->njtbl)
+				b->s1 = b->jtbl[idx];
+			b->jtbl = 0;
+			b->njtbl = 0;
+			b->jmp.type = Jjmp;
+			b->jmp.arg = R;
+		}
+		return;
+	}
 	if (b->jmp.type != Jjnz)
 		return;
 

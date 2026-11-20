@@ -738,6 +738,52 @@ arm64_emitfn(Fn *fn, FILE *out)
 			else
 				lbl = 0;
 			break;
+		case Jjtbl: {
+			static int jt0;
+			int jtid = jt0++;
+			int idx_r;
+			uint32_t jk;
+			if (rtype(b->jmp.arg) == RSlot) {
+				Ins li = {Oload, Kw, TMP(IP0), {b->jmp.arg, R}};
+				emitins(&li, e);
+				idx_r = IP0;
+			} else {
+				assert(isreg(b->jmp.arg));
+				idx_r = b->jmp.arg.val;
+			}
+			if (b->njtbl <= 4095) {
+				fprintf(e->f, "\tcmp\t%s, #%"PRIu32"\n",
+					rname(idx_r, Kw), b->njtbl);
+			} else if (b->njtbl <= 65535) {
+				fprintf(e->f,
+					"\tmov\tw17, #%"PRIu32"\n"
+					"\tcmp\t%s, w17\n",
+					b->njtbl, rname(idx_r, Kw));
+			} else {
+				fprintf(e->f,
+					"\tmov\tw17, #%"PRIu32"\n"
+					"\tmovk\tw17, #%"PRIu32", lsl #16\n"
+					"\tcmp\t%s, w17\n",
+					b->njtbl & 0xffffu, b->njtbl >> 16,
+					rname(idx_r, Kw));
+			}
+			fprintf(e->f,
+				"\tbhs\t%s%d\n"
+				"\tadr\tx17, %sjt%d\n"
+				"\tldrsw\tx16, [x17, %s, uxtw #2]\n"
+				"\tadd\tx17, x17, x16\n"
+				"\tbr\tx17\n"
+				"%sjt%d:\n",
+				T.asloc, id0 + b->s1->id,
+				T.asloc, jtid,
+				rname(idx_r, Kw),
+				T.asloc, jtid);
+			for (jk = 0; jk < b->njtbl; jk++)
+				fprintf(e->f, "\t.long\t%s%d - %sjt%d\n",
+					T.asloc, id0 + b->jtbl[jk]->id,
+					T.asloc, jtid);
+			break;
+		}
 		default:
 			c = b->jmp.type - Jjf;
 			if (c < 0 || c > NCmp)

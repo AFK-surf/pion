@@ -13,6 +13,20 @@ newblk()
 	return b;
 }
 
+static int
+issucc(Blk *bp, Blk *b)
+{
+	uint32_t k;
+
+	if (bp->s1 == b || bp->s2 == b)
+		return 1;
+	if (bp->jmp.type == Jjtbl)
+		for (k = 0; k < bp->njtbl; k++)
+			if (bp->jtbl[k] == b)
+				return 1;
+	return 0;
+}
+
 static void
 fixphis(Fn *f)
 {
@@ -26,7 +40,7 @@ fixphis(Fn *f)
 			for (n=n0=0; n<p->narg; n++) {
 				bp = p->blk[n];
 				if (bp->id != -1u)
-				if (bp->s1 == b || bp->s2 == b) {
+				if (issucc(bp, b)) {
 					p->blk[n0] = bp;
 					p->arg[n0] = p->arg[n];
 					n0++;
@@ -41,6 +55,8 @@ fixphis(Fn *f)
 static void
 addpred(Blk *bp, Blk *b)
 {
+	if (b->npred > 0 && b->pred[b->npred-1] == bp)
+		return;
 	vgrow(&b->pred, ++b->npred);
 	b->pred[b->npred-1] = bp;
 }
@@ -49,6 +65,7 @@ void
 fillpreds(Fn *f)
 {
 	Blk *b;
+	uint32_t k;
 
 	for (b=f->start; b; b=b->link)
 		b->npred = 0;
@@ -57,6 +74,9 @@ fillpreds(Fn *f)
 			addpred(b, b->s1);
 		if (b->s2 && b->s2 != b->s1)
 			addpred(b, b->s2);
+		if (b->jmp.type == Jjtbl)
+			for (k = 0; k < b->njtbl; k++)
+				addpred(b, b->jtbl[k]);
 	}
 }
 
@@ -64,6 +84,7 @@ static void
 porec(Blk *b, uint *npo)
 {
 	Blk *s1, *s2;
+	uint32_t k;
 
 	if (!b || b->id != -1u)
 		return;
@@ -76,6 +97,9 @@ porec(Blk *b, uint *npo)
 	}
 	porec(s1, npo);
 	porec(s2, npo);
+	if (b->jmp.type == Jjtbl)
+		for (k = 0; k < b->njtbl; k++)
+			porec(b->jtbl[k], npo);
 	b->id = (*npo)++;
 }
 
@@ -217,6 +241,12 @@ fillfron(Fn *fn)
 		if (b->s2)
 			for (a=b; !sdom(a, b->s2); a=a->idom)
 				addfron(a, b->s2);
+		if (b->jmp.type == Jjtbl) {
+			uint32_t k;
+			for (k = 0; k < b->njtbl; k++)
+				for (a=b; !sdom(a, b->jtbl[k]); a=a->idom)
+					addfron(a, b->jtbl[k]);
+		}
 	}
 }
 
@@ -356,6 +386,21 @@ simpljmp(Fn *fn)
 			b->jmp.type = Jjmp;
 			b->s2 = 0;
 		}
+		if (b->jmp.type == Jjtbl) {
+			uint32_t k;
+			int allsame = 1;
+			for (k = 0; k < b->njtbl; k++) {
+				uffind(&b->jtbl[k], uf);
+				if (b->jtbl[k] != b->s1)
+					allsame = 0;
+			}
+			if (allsame) {
+				b->jmp.type = Jjmp;
+				b->jmp.arg = R;
+				b->jtbl = 0;
+				b->njtbl = 0;
+			}
+		}
 	}
 	*p = ret;
 	free(uf);
@@ -374,6 +419,12 @@ reachrec(Blk *b, Blk *to)
 		return 1;
 	if (reachrec(b->s2, to))
 		return 1;
+	if (b->jmp.type == Jjtbl) {
+		uint32_t k;
+		for (k = 0; k < b->njtbl; k++)
+			if (reachrec(b->jtbl[k], to))
+				return 1;
+	}
 
 	return 0;
 }
@@ -451,11 +502,15 @@ struct Jmp {
 	int type;
 	Ref arg;
 	Blk *s1, *s2;
+	Blk **jtbl;
+	uint32_t njtbl;
 };
 
 static int
 jmpeq(Jmp *a, Jmp *b)
 {
+	if (a->type == Jjtbl || b->type == Jjtbl)
+		return 0;
 	return a->type == b->type && req(a->arg, b->arg)
 		&& a->s1 == b->s1 && a->s2 == b->s2;
 }
@@ -463,10 +518,16 @@ jmpeq(Jmp *a, Jmp *b)
 static int
 jmpnophi(Jmp *j)
 {
+	uint32_t k;
+
 	if (j->s1 && j->s1->phi)
 		return 0;
 	if (j->s2 && j->s2->phi)
 		return 0;
+	if (j->type == Jjtbl)
+		for (k = 0; k < j->njtbl; k++)
+			if (j->jtbl[k]->phi)
+				return 0;
 	return 1;
 }
 
@@ -506,6 +567,8 @@ simplcfg(Fn *fn)
 		jmp[b->id].arg = b->jmp.arg;
 		jmp[b->id].s1 = b->s1;
 		jmp[b->id].s2 = b->s2;
+		jmp[b->id].jtbl = b->jtbl;
+		jmp[b->id].njtbl = b->njtbl;
 		empty[b->id] = !b->phi;
 		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			if (i->op != Onop && i->op != Odbgloc) {
@@ -531,6 +594,23 @@ simplcfg(Fn *fn)
 						n = phiargn(p, j->s1);
 						p->blk[n] = b;
 					}
+				if (jj->type == Jjtbl) {
+					uint32_t jk, jp;
+					for (jk = 0; jk < jj->njtbl; jk++) {
+						bb = jj->jtbl[jk];
+						if (bb == jj->s1)
+							continue;
+						for (jp = 0; jp < jk; jp++)
+							if (jj->jtbl[jp] == bb)
+								break;
+						if (jp < jk)
+							continue;
+						for (p=bb->phi; p; p=p->link) {
+							n = phiargn(p, j->s1);
+							p->blk[n] = b;
+						}
+					}
+				}
 				j->s1->id = -1u;
 				*j = *jj;
 				done = 0;
@@ -552,8 +632,15 @@ simplcfg(Fn *fn)
 			b->jmp.arg = j->arg;
 			b->s1 = j->s1;
 			b->s2 = j->s2;
+			b->jtbl = j->jtbl;
+			b->njtbl = j->njtbl;
 			assert(!j->s1 || j->s1->id != -1u);
 			assert(!j->s2 || j->s2->id != -1u);
+			if (j->type == Jjtbl) {
+				uint32_t jk;
+				for (jk = 0; jk < j->njtbl; jk++)
+					assert(j->jtbl[jk]->id != -1u);
+			}
 		}
 
 	fillcfg(fn);

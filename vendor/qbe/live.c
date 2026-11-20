@@ -65,6 +65,13 @@ Again:
 			liveon(v, b, b->s2);
 			bsunion(b->out, v);
 		}
+		if (b->jmp.type == Jjtbl) {
+			uint32_t jk;
+			for (jk = 0; jk < b->njtbl; jk++) {
+				liveon(v, b, b->jtbl[jk]);
+				bsunion(b->out, v);
+			}
+		}
 		chg |= !bsequal(b->out, u);
 
 		memset(nlv, 0, sizeof nlv);

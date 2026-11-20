@@ -307,6 +307,26 @@ renblk(Blk *b, Name **stk, Fn *fn)
 				p->blk[m] = b;
 			}
 		}
+	if (b->jmp.type == Jjtbl) {
+		uint32_t jk;
+		for (jk = 0; jk < b->njtbl; jk++) {
+			s = b->jtbl[jk];
+			if (s == b->s1)
+				continue;
+			for (p=s->phi; p; p=p->link) {
+				if (p->narg > 0 && p->blk[p->narg-1] == b)
+					continue;
+				t = p->to.val;
+				if ((t=fn->tmp[t].visit)) {
+					m = p->narg++;
+					vgrow(&p->arg, p->narg);
+					vgrow(&p->blk, p->narg);
+					p->arg[m] = getstk(t, b, stk);
+					p->blk[m] = b;
+				}
+			}
+		}
+	}
 	for (s=b->dom; s; s=s->dlink)
 		renblk(s, stk, fn);
 }
