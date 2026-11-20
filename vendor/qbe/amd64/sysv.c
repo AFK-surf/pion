@@ -572,10 +572,27 @@ selvaarg(Fn *fn, Blk *b, Ins *i)
 	b0->jmp = b->jmp;
 	b0->s1 = b->s1;
 	b0->s2 = b->s2;
+	b0->jtbl = b->jtbl;
+	b0->njtbl = b->njtbl;
+	b->jtbl = 0;
+	b->njtbl = 0;
 	if (b->s1)
 		chpred(b->s1, b, b0);
 	if (b->s2 && b->s2 != b->s1)
 		chpred(b->s2, b, b0);
+	if (b0->jmp.type == Jjtbl) {
+		uint32_t jk, jp;
+		for (jk = 0; jk < b0->njtbl; jk++) {
+			Blk *jt = b0->jtbl[jk];
+			if (jt == b0->s1)
+				continue;
+			for (jp = 0; jp < jk; jp++)
+				if (b0->jtbl[jp] == jt)
+					break;
+			if (jp == jk)
+				chpred(jt, b, b0);
+		}
+	}
 
 	lreg = newtmp("abi", Kl, fn);
 	nr = newtmp("abi", Kl, fn);

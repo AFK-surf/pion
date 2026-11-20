@@ -264,6 +264,16 @@ coalesce(Fn *fn)
 					radd(&s->r, ip);
 				}
 			}
+			if (b->jmp.type == Jjtbl) {
+				uint32_t jk;
+				for (jk = 0; jk < b->njtbl; jk++) {
+					m = b->jtbl[jk]->id;
+					if (m > n && rin(s->r, br[m].a)) {
+						s->l = s->m;
+						radd(&s->r, ip);
+					}
+				}
+			}
 		}
 		if (b->jmp.type == Jretc)
 			load(b->jmp.arg, -1, --ip, fn, sl);

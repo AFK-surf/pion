@@ -567,6 +567,10 @@ seljmp(Blk *b, Fn *fn)
 	|| b->jmp.type == Jjmp
 	|| b->jmp.type == Jhlt)
 		return;
+	if (b->jmp.type == Jjtbl) {
+		fixarg(&b->jmp.arg, Kw, 0, fn);
+		return;
+	}
 	assert(b->jmp.type == Jjnz);
 	r = b->jmp.arg;
 	use = -1;
@@ -627,6 +631,24 @@ arm64_isel(Fn *fn)
 					assert(n+1 < p->narg);
 				fixarg(&p->arg[n], p->cls, 1, fn);
 			}
+		if (b->jmp.type == Jjtbl) {
+			uint32_t jk, jp;
+			for (jk = 0; jk < b->njtbl; jk++) {
+				Blk *jt = b->jtbl[jk];
+				if (jt == b->s1)
+					continue;
+				for (jp = 0; jp < jk; jp++)
+					if (b->jtbl[jp] == jt)
+						break;
+				if (jp < jk)
+					continue;
+				for (p=jt->phi; p; p=p->link) {
+					for (n=0; p->blk[n] != b; n++)
+						assert(n+1 < p->narg);
+					fixarg(&p->arg[n], p->cls, 1, fn);
+				}
+			}
+		}
 		seljmp(b, fn);
 		for (i=&b->ins[b->nins]; i!=b->ins;) {
 			--i;

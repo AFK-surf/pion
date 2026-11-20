@@ -369,12 +369,20 @@ spill(Fn *fn)
 		if (s2 && s2->id <= b->id)
 		if (!hd || s2->id >= hd->id)
 			hd = s2;
+		if (b->jmp.type == Jjtbl) {
+			uint32_t jk;
+			for (jk = 0; jk < b->njtbl; jk++)
+				if (b->jtbl[jk]->id <= b->id)
+				if (!hd || b->jtbl[jk]->id >= hd->id)
+					hd = b->jtbl[jk];
+		}
+		int clob = (b->jmp.type == Jjtbl) ? T.njtblclob : 0;
 		if (hd) {
 			/* back-edge */
 			bszero(v);
 			hd->gen->t[0] |= T.rglob; /* don't spill registers */
 			for (k=0; k<2; k++) {
-				n = k == 0 ? T.ngpr : T.nfpr;
+				n = k == 0 ? (uint)(T.ngpr - clob) : (uint)T.nfpr;
 				bscopy(u, b->out);
 				bsinter(u, mask[k]);
 				bscopy(w, u);
@@ -400,7 +408,15 @@ spill(Fn *fn)
 				merge(v, b, u, s2);
 				bsinter(w, u);
 			}
-			limit2(v, 0, 0, w);
+			if (b->jmp.type == Jjtbl) {
+				uint32_t jk;
+				for (jk = 0; jk < b->njtbl; jk++) {
+					liveon(u, b, b->jtbl[jk]);
+					merge(v, b, u, b->jtbl[jk]);
+					bsinter(w, u);
+				}
+			}
+			limit2(v, clob, 0, w);
 		} else {
 			bscopy(v, b->out);
 			if (rtype(b->jmp.arg) == RCall)
@@ -410,10 +426,12 @@ spill(Fn *fn)
 			t = b->jmp.arg.val;
 			assert(KBASE(tmp[t].cls) == 0);
 			bsset(v, t);
-			limit2(v, 0, 0, NULL);
+			limit2(v, clob, 0, NULL);
 			if (!bshas(v, t))
 				b->jmp.arg = slot(t);
 		}
+		if (b->jmp.type == Jjtbl && T.jtblclob)
+			sethint(v, T.jtblclob);
 		for (t=Tmp0; bsiter(b->out, &t); t++)
 			if (!bshas(v, t))
 				slot(t);

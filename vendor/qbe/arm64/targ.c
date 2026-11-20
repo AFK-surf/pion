@@ -41,6 +41,8 @@ arm64_memargs(int op)
 	.abi1 = arm64_abi, \
 	.emitfn = arm64_emitfn, \
 	.cansel = 0, \
+	.jtblclob = BIT(IP0), \
+	.njtblclob = 1, \
 
 Target T_arm64 = {
 	.name = "arm64",
