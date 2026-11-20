@@ -1,0 +1,599 @@
+///| store: thread-safe SQLite3 persistence layer for pion_station (pure Pion,
+///| zero C glue, `extern "C"` directly into system libsqlite3).
+///|
+///| Uses WAL mode, busy_timeout, and a `Mutex[Int64]` guarding the `sqlite3*`
+///| handle so `Store` is statically `Send` and safe across worker OS threads.
+
+import "json"
+
+extern "C" fn sq3_libversion() -> Ptr = "sqlite3_libversion"
+extern "C" fn sq3_open(filename : Ptr, pp_db : Ptr) -> Int = "sqlite3_open"
+extern "C" fn sq3_close(db : Ptr) -> Int = "sqlite3_close"
+extern "C" fn sq3_busy_timeout(db : Ptr, ms : Int) -> Int = "sqlite3_busy_timeout"
+extern "C" fn sq3_exec(db : Ptr, sql : Ptr, callback : Ptr, arg : Ptr, errmsg : Ptr) -> Int = "sqlite3_exec"
+extern "C" fn sq3_prepare_v2(db : Ptr, sql : Ptr, n_byte : Int, pp_stmt : Ptr, pz_tail : Ptr) -> Int = "sqlite3_prepare_v2"
+extern "C" fn sq3_bind_text(stmt : Ptr, idx : Int, text : Ptr, n : Int, destructor : Ptr) -> Int = "sqlite3_bind_text"
+extern "C" fn sq3_bind_int64(stmt : Ptr, idx : Int, v : Int64) -> Int = "sqlite3_bind_int64"
+extern "C" fn sq3_step(stmt : Ptr) -> Int = "sqlite3_step"
+extern "C" fn sq3_column_text(stmt : Ptr, col : Int) -> Ptr = "sqlite3_column_text"
+extern "C" fn sq3_column_int64(stmt : Ptr, col : Int) -> Int64 = "sqlite3_column_int64"
+extern "C" fn sq3_finalize(stmt : Ptr) -> Int = "sqlite3_finalize"
+extern "C" fn sq3_errmsg(db : Ptr) -> Ptr = "sqlite3_errmsg"
+extern "C" fn sq3_free(p : Ptr) -> Unit = "sqlite3_free"
+extern "C" fn sq3_last_insert_rowid(db : Ptr) -> Int64 = "sqlite3_last_insert_rowid"
+
+let SQLITE_OK : Int = 0
+let SQLITE_ROW : Int = 100
+let SQLITE_DONE : Int = 101
+
+fn ptr_to_i64(p : Ptr) -> Int64 {
+  let b = ptr_alloc(8L)
+  ptr_write_ptr(b, 0L, p)
+  let v = ptr_read_i64(b, 0L)
+  ptr_free(b)
+  v
+}
+
+fn i64_to_ptr(v : Int64) -> Ptr {
+  let b = ptr_alloc(8L)
+  ptr_write_i64(b, 0L, v)
+  let p = ptr_read_ptr(b, 0L)
+  ptr_free(b)
+  p
+}
+
+fn transient() -> Ptr {
+  ptr_offset(ptr_null(), -1L)
+}
+
+fn db_error(db : Ptr, what : String, rc : Int) -> String {
+  what + " (rc=" + rc.to_string() + "): " + cstr_to_str(sq3_errmsg(db))
+}
+
+fn raw_exec(db : Ptr, sql : String) -> Result[Unit, String] {
+  let errp = ptr_alloc(8L)
+  let rc = sq3_exec(db, sql.as_cstr(), ptr_null(), ptr_null(), errp)
+  let em = ptr_read_ptr(errp, 0L)
+  ptr_free(errp)
+  if rc != SQLITE_OK {
+    let msg = cstr_to_str(em)
+    sq3_free(em)
+    return Err("sqlite3_exec (rc=" + rc.to_string() + "): " + msg)
+  }
+  Ok(())
+}
+
+fn raw_prepare(db : Ptr, sql : String) -> Result[Ptr, String] {
+  let pp = ptr_alloc(8L)
+  let rc = sq3_prepare_v2(db, sql.as_cstr(), -1, pp, ptr_null())
+  let h = ptr_read_ptr(pp, 0L)
+  ptr_free(pp)
+  if rc != SQLITE_OK {
+    return Err(db_error(db, "prepare", rc))
+  }
+  Ok(h)
+}
+
+fn raw_bind_text(db : Ptr, st : Ptr, idx : Int, v : String) -> Result[Unit, String] {
+  let rc = sq3_bind_text(st, idx, v.as_cstr(), v.length(), transient())
+  if rc != SQLITE_OK {
+    return Err(db_error(db, "bind_text", rc))
+  }
+  Ok(())
+}
+
+fn raw_bind_i64(db : Ptr, st : Ptr, idx : Int, v : Int64) -> Result[Unit, String] {
+  let rc = sq3_bind_int64(st, idx, v)
+  if rc != SQLITE_OK {
+    return Err(db_error(db, "bind_i64", rc))
+  }
+  Ok(())
+}
+
+fn raw_step(db : Ptr, st : Ptr) -> Result[Bool, String] {
+  let rc = sq3_step(st)
+  if rc == SQLITE_ROW {
+    Ok(true)
+  } else if rc == SQLITE_DONE {
+    Ok(false)
+  } else {
+    Err(db_error(db, "step", rc))
+  }
+}
+
+/// Executes a write statement inside `BEGIN IMMEDIATE ... COMMIT` (rolling back on error),
+/// binding text params in order followed by a trailing `Int64` param if `i64_idx > 0`.
+fn exec_tx(
+  db : Ptr,
+  sql : String,
+  texts : Array[String],
+  text_idxs : Array[Int],
+  i64_idx : Int,
+  i64_val : Int64,
+) -> Result[Int64, String] {
+  raw_exec(db, "BEGIN IMMEDIATE")?
+  let st = match raw_prepare(db, sql) {
+    Ok(h) => h
+    Err(e) => {
+      let _ = raw_exec(db, "ROLLBACK")
+      return Err(e)
+    }
+  }
+  let mut err = ""
+  let mut i = 0
+  while i < texts.length() {
+    match raw_bind_text(db, st, text_idxs[i], texts[i]) {
+      Ok(_) => ()
+      Err(e) => {
+        err = e
+        break
+      }
+    }
+    i = i + 1
+  }
+  if err.length() == 0 && i64_idx > 0 {
+    match raw_bind_i64(db, st, i64_idx, i64_val) {
+      Ok(_) => ()
+      Err(e) => err = e
+    }
+  }
+  if err.length() == 0 {
+    match raw_step(db, st) {
+      Ok(_) => ()
+      Err(e) => err = e
+    }
+  }
+  let _ = sq3_finalize(st)
+  if err.length() > 0 {
+    let _ = raw_exec(db, "ROLLBACK")
+    return Err(err)
+  }
+  let row_id = sq3_last_insert_rowid(db)
+  raw_exec(db, "COMMIT")?
+  Ok(row_id)
+}
+
+/// Linked libsqlite3 version string, e.g. `3.45.1`.
+pub fn sqlite_version() -> String {
+  cstr_to_str(sq3_libversion())
+}
+
+/// Thread-safe handle to the station's SQLite database (`Send`).
+pub struct Store {
+  db_addr : Mutex[Int64]
+  pub path : String
+}
+
+pub struct SessionRec {
+  pub id : String
+  pub title : String
+  pub created_ms : Int64
+}
+
+pub struct MessageRec {
+  pub id : Int64
+  pub session_id : String
+  pub role : String
+  pub body : String
+  pub ts_ms : Int64
+}
+
+pub struct JobRec {
+  pub id : String
+  pub session_id : String
+  pub kind : String
+  pub payload : String
+  pub status : String
+  pub result : String
+  pub updated_ms : Int64
+}
+
+pub struct StoreStats {
+  pub sessions : Int64
+  pub messages : Int64
+  pub jobs_done : Int64
+  pub jobs_total : Int64
+}
+
+impl json::ToJson for SessionRec {
+  fn to_json(self : SessionRec) -> json::JsonValue {
+    json::JObj([
+      json::field("id", json::JStr(self.id)),
+      json::field("title", json::JStr(self.title)),
+      json::field("created_ms", json::JInt(self.created_ms)),
+    ])
+  }
+}
+
+impl json::ToJson for MessageRec {
+  fn to_json(self : MessageRec) -> json::JsonValue {
+    json::JObj([
+      json::field("id", json::JInt(self.id)),
+      json::field("session_id", json::JStr(self.session_id)),
+      json::field("role", json::JStr(self.role)),
+      json::field("body", json::JStr(self.body)),
+      json::field("ts_ms", json::JInt(self.ts_ms)),
+    ])
+  }
+}
+
+impl json::ToJson for JobRec {
+  fn to_json(self : JobRec) -> json::JsonValue {
+    json::JObj([
+      json::field("id", json::JStr(self.id)),
+      json::field("session_id", json::JStr(self.session_id)),
+      json::field("kind", json::JStr(self.kind)),
+      json::field("payload", json::JStr(self.payload)),
+      json::field("status", json::JStr(self.status)),
+      json::field("result", json::JStr(self.result)),
+      json::field("updated_ms", json::JInt(self.updated_ms)),
+    ])
+  }
+}
+
+impl json::ToJson for StoreStats {
+  fn to_json(self : StoreStats) -> json::JsonValue {
+    json::JObj([
+      json::field("sessions", json::JInt(self.sessions)),
+      json::field("messages", json::JInt(self.messages)),
+      json::field("jobs_done", json::JInt(self.jobs_done)),
+      json::field("jobs_total", json::JInt(self.jobs_total)),
+    ])
+  }
+}
+
+let SCHEMA_SQL : String = "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; CREATE TABLE IF NOT EXISTS sessions (id TEXT PRIMARY KEY, title TEXT NOT NULL, created_ms INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS messages (id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT NOT NULL, role TEXT NOT NULL, body TEXT NOT NULL, ts_ms INTEGER NOT NULL); CREATE TABLE IF NOT EXISTS jobs (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, kind TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL, result TEXT NOT NULL, updated_ms INTEGER NOT NULL);"
+
+/// Opens or creates the SQLite database at `path`, enables WAL + busy_timeout,
+/// and initializes the schema idempotently (preserving existing data across restarts).
+pub fn open(path : String) -> Result[Store, String] {
+  let pp = ptr_alloc(8L)
+  let rc = sq3_open(path.as_cstr(), pp)
+  let h = ptr_read_ptr(pp, 0L)
+  ptr_free(pp)
+  if rc != SQLITE_OK {
+    let msg = if ptr_is_null(h) { "out of memory" } else { cstr_to_str(sq3_errmsg(h)) }
+    let _ = sq3_close(h)
+    return Err("sqlite3_open(" + path + ") failed (rc=" + rc.to_string() + "): " + msg)
+  }
+  let _ = sq3_busy_timeout(h, 5000)
+  match raw_exec(h, SCHEMA_SQL) {
+    Ok(_) => Ok(Store::{ db_addr: Mutex::new(ptr_to_i64(h)), path: path })
+    Err(e) => {
+      let _ = sq3_close(h)
+      Err(e)
+    }
+  }
+}
+
+/// Closes the underlying SQLite connection safely.
+pub fn close(s : Store) -> Result[Unit, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Ok(())
+  }
+  let rc = sq3_close(i64_to_ptr(addr))
+  s.db_addr.set(0L)
+  s.db_addr.unlock()
+  if rc != SQLITE_OK {
+    return Err("sqlite3_close failed (rc=" + rc.to_string() + ")")
+  }
+  Ok(())
+}
+
+/// Clears all rows in the three tables (useful for deterministic tests).
+pub fn clear_all(s : Store) -> Result[Unit, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = raw_exec(i64_to_ptr(addr), "BEGIN IMMEDIATE; DELETE FROM messages; DELETE FROM jobs; DELETE FROM sessions; COMMIT;")
+  s.db_addr.unlock()
+  res
+}
+
+pub fn create_session(s : Store, id : String, title : String, created_ms : Int64) -> Result[SessionRec, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = match exec_tx(
+    i64_to_ptr(addr),
+    "INSERT INTO sessions (id, title, created_ms) VALUES (?, ?, ?)",
+    [id, title],
+    [1, 2],
+    3,
+    created_ms,
+  ) {
+    Ok(_) => Ok(SessionRec::{ id: id, title: title, created_ms: created_ms })
+    Err(e) => Err(e)
+  }
+  s.db_addr.unlock()
+  res
+}
+
+fn list_sessions_locked(db : Ptr) -> Result[Array[SessionRec], String] {
+  let st = raw_prepare(db, "SELECT id, title, created_ms FROM sessions ORDER BY created_ms ASC, id ASC")?
+  let out : Array[SessionRec] = []
+  while true {
+    match raw_step(db, st) {
+      Ok(true) =>
+      out.push(SessionRec::{
+        id: cstr_to_str(sq3_column_text(st, 0)),
+        title: cstr_to_str(sq3_column_text(st, 1)),
+        created_ms: sq3_column_int64(st, 2),
+      })
+      Ok(false) => break
+      Err(e) => {
+        let _ = sq3_finalize(st)
+        return Err(e)
+      }
+    }
+  }
+  let _ = sq3_finalize(st)
+  Ok(out)
+}
+
+pub fn list_sessions(s : Store) -> Result[Array[SessionRec], String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = list_sessions_locked(i64_to_ptr(addr))
+  s.db_addr.unlock()
+  res
+}
+
+fn get_session_locked(db : Ptr, id : String) -> Result[Option[SessionRec], String] {
+  let st = raw_prepare(db, "SELECT id, title, created_ms FROM sessions WHERE id = ?")?
+  match raw_bind_text(db, st, 1, id) {
+    Err(e) => {
+      let _ = sq3_finalize(st)
+      return Err(e)
+    }
+    Ok(_) => ()
+  }
+  let res = match raw_step(db, st) {
+    Ok(true) =>
+    Ok(Some(SessionRec::{
+      id: cstr_to_str(sq3_column_text(st, 0)),
+      title: cstr_to_str(sq3_column_text(st, 1)),
+      created_ms: sq3_column_int64(st, 2),
+    }))
+    Ok(false) => Ok(None)
+    Err(e) => Err(e)
+  }
+  let _ = sq3_finalize(st)
+  res
+}
+
+pub fn get_session(s : Store, id : String) -> Result[Option[SessionRec], String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = get_session_locked(i64_to_ptr(addr), id)
+  s.db_addr.unlock()
+  res
+}
+
+pub fn append_message(
+  s : Store,
+  session_id : String,
+  role : String,
+  body : String,
+  ts_ms : Int64,
+) -> Result[MessageRec, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = match exec_tx(
+    i64_to_ptr(addr),
+    "INSERT INTO messages (session_id, role, body, ts_ms) VALUES (?, ?, ?, ?)",
+    [session_id, role, body],
+    [1, 2, 3],
+    4,
+    ts_ms,
+  ) {
+    Ok(row_id) =>
+    Ok(MessageRec::{
+      id: row_id,
+      session_id: session_id,
+      role: role,
+      body: body,
+      ts_ms: ts_ms,
+    })
+    Err(e) => Err(e)
+  }
+  s.db_addr.unlock()
+  res
+}
+
+fn list_messages_locked(db : Ptr, session_id : String) -> Result[Array[MessageRec], String] {
+  let st = raw_prepare(db, "SELECT id, session_id, role, body, ts_ms FROM messages WHERE session_id = ? ORDER BY id ASC")?
+  match raw_bind_text(db, st, 1, session_id) {
+    Err(e) => {
+      let _ = sq3_finalize(st)
+      return Err(e)
+    }
+    Ok(_) => ()
+  }
+  let out : Array[MessageRec] = []
+  while true {
+    match raw_step(db, st) {
+      Ok(true) =>
+      out.push(MessageRec::{
+        id: sq3_column_int64(st, 0),
+        session_id: cstr_to_str(sq3_column_text(st, 1)),
+        role: cstr_to_str(sq3_column_text(st, 2)),
+        body: cstr_to_str(sq3_column_text(st, 3)),
+        ts_ms: sq3_column_int64(st, 4),
+      })
+      Ok(false) => break
+      Err(e) => {
+        let _ = sq3_finalize(st)
+        return Err(e)
+      }
+    }
+  }
+  let _ = sq3_finalize(st)
+  Ok(out)
+}
+
+pub fn list_messages(s : Store, session_id : String) -> Result[Array[MessageRec], String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = list_messages_locked(i64_to_ptr(addr), session_id)
+  s.db_addr.unlock()
+  res
+}
+
+pub fn create_job(
+  s : Store,
+  id : String,
+  session_id : String,
+  kind : String,
+  payload : String,
+  updated_ms : Int64,
+) -> Result[JobRec, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = match exec_tx(
+    i64_to_ptr(addr),
+    "INSERT INTO jobs (id, session_id, kind, payload, status, result, updated_ms) VALUES (?, ?, ?, ?, ?, ?, ?)",
+    [id, session_id, kind, payload, "queued", ""],
+    [1, 2, 3, 4, 5, 6],
+    7,
+    updated_ms,
+  ) {
+    Ok(_) =>
+    Ok(JobRec::{
+      id: id,
+      session_id: session_id,
+      kind: kind,
+      payload: payload,
+      status: "queued",
+      result: "",
+      updated_ms: updated_ms,
+    })
+    Err(e) => Err(e)
+  }
+  s.db_addr.unlock()
+  res
+}
+
+pub fn update_job(
+  s : Store,
+  id : String,
+  status : String,
+  result : String,
+  updated_ms : Int64,
+) -> Result[Unit, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = match exec_tx(
+    i64_to_ptr(addr),
+    "UPDATE jobs SET status = ?, result = ?, updated_ms = ? WHERE id = ?",
+    [status, result, id],
+    [1, 2, 4],
+    3,
+    updated_ms,
+  ) {
+    Ok(_) => Ok(())
+    Err(e) => Err(e)
+  }
+  s.db_addr.unlock()
+  res
+}
+
+fn get_job_locked(db : Ptr, id : String) -> Result[Option[JobRec], String] {
+  let st = raw_prepare(
+    db,
+    "SELECT id, session_id, kind, payload, status, result, updated_ms FROM jobs WHERE id = ?",
+  )?
+  match raw_bind_text(db, st, 1, id) {
+    Err(e) => {
+      let _ = sq3_finalize(st)
+      return Err(e)
+    }
+    Ok(_) => ()
+  }
+  let res = match raw_step(db, st) {
+    Ok(true) =>
+    Ok(Some(JobRec::{
+      id: cstr_to_str(sq3_column_text(st, 0)),
+      session_id: cstr_to_str(sq3_column_text(st, 1)),
+      kind: cstr_to_str(sq3_column_text(st, 2)),
+      payload: cstr_to_str(sq3_column_text(st, 3)),
+      status: cstr_to_str(sq3_column_text(st, 4)),
+      result: cstr_to_str(sq3_column_text(st, 5)),
+      updated_ms: sq3_column_int64(st, 6),
+    }))
+    Ok(false) => Ok(None)
+    Err(e) => Err(e)
+  }
+  let _ = sq3_finalize(st)
+  res
+}
+
+pub fn get_job(s : Store, id : String) -> Result[Option[JobRec], String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = get_job_locked(i64_to_ptr(addr), id)
+  s.db_addr.unlock()
+  res
+}
+
+fn query_count(db : Ptr, sql : String) -> Result[Int64, String] {
+  let st = raw_prepare(db, sql)?
+  let res = match raw_step(db, st) {
+    Ok(true) => Ok(sq3_column_int64(st, 0))
+    Ok(false) => Ok(0L)
+    Err(e) => Err(e)
+  }
+  let _ = sq3_finalize(st)
+  res
+}
+
+fn stats_locked(db : Ptr) -> Result[StoreStats, String] {
+  let sessions = query_count(db, "SELECT COUNT(*) FROM sessions")?
+  let messages = query_count(db, "SELECT COUNT(*) FROM messages")?
+  let jobs_done = query_count(db, "SELECT COUNT(*) FROM jobs WHERE status = 'done'")?
+  let jobs_total = query_count(db, "SELECT COUNT(*) FROM jobs")?
+  Ok(StoreStats::{
+    sessions: sessions,
+    messages: messages,
+    jobs_done: jobs_done,
+    jobs_total: jobs_total,
+  })
+}
+
+pub fn stats(s : Store) -> Result[StoreStats, String] {
+  let addr = s.db_addr.lock()
+  if addr == 0L {
+    s.db_addr.unlock()
+    return Err("database is closed")
+  }
+  let res = stats_locked(i64_to_ptr(addr))
+  s.db_addr.unlock()
+  res
+}

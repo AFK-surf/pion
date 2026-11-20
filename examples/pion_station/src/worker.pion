@@ -1,0 +1,175 @@
+///| Background worker pool and SSE event broadcast hub for pion_station.
+
+import "store"
+import "router"
+import "json"
+import "regex"
+
+/// Thread-safe SSE broadcast hub (`Send`).
+/// Keeps a history of emitted SSE frames so clients subscribing during a burst
+/// receive every job_done event deterministically without sleeps or races.
+pub struct SseHub {
+  subs : Mutex[Array[Channel[String]]]
+  history : Mutex[Array[String]]
+  closed : AtomicInt
+}
+
+pub fn new_sse_hub() -> SseHub {
+  let subs : Mutex[Array[Channel[String]]] = Mutex::new([])
+  let history : Mutex[Array[String]] = Mutex::new([])
+  SseHub::{
+    subs: subs,
+    history: history,
+    closed: AtomicInt::new(0),
+  }
+}
+
+/// Registers a new SSE subscriber channel and returns a snapshot of past frames.
+pub fn sse_subscribe(hub : SseHub) -> (Array[String], Channel[String]) {
+  let ch : Channel[String] = Channel::new(512)
+  let h = hub.history.lock()
+  let past : Array[String] = []
+  let mut i = 0
+  while i < h.length() {
+    past.push(h[i])
+    i = i + 1
+  }
+  let s = hub.subs.lock()
+  if hub.closed.load() != 0 {
+    ch.close()
+  } else {
+    s.push(ch)
+  }
+  hub.subs.unlock()
+  hub.history.unlock()
+  (past, ch)
+}
+
+/// Records an SSE frame in history and broadcasts it to all active subscribers.
+pub fn sse_broadcast(hub : SseHub, frame : String) -> Unit {
+  let h = hub.history.lock()
+  h.push(frame)
+  let s = hub.subs.lock()
+  let mut i = 0
+  while i < s.length() {
+    let _ = s[i].send(frame)
+    i = i + 1
+  }
+  hub.subs.unlock()
+  hub.history.unlock()
+}
+
+/// Closes all active subscriber channels on graceful shutdown.
+pub fn sse_close_all(hub : SseHub) -> Unit {
+  hub.closed.store(1)
+  let s = hub.subs.lock()
+  let mut i = 0
+  while i < s.length() {
+    s[i].close()
+    i = i + 1
+  }
+  s.clear()
+  hub.subs.unlock()
+}
+
+/// Deterministic FNV-1a-like 64-bit checksum for `compute` jobs.
+pub fn compute_checksum(payload : String) -> String {
+  let mut acc : Int64 = 1469598103934665603L
+  let mut i = 0
+  while i < payload.length() {
+    let b = payload.code_unit_at(i).to_int64()
+    acc = (acc ^ b) * 1099511628211L
+    i = i + 1
+  }
+  if acc < 0L {
+    acc = 0L - acc
+  }
+  "fnv:" + acc.to_string()
+}
+
+/// Executes one background job:
+/// - `hash`: SHA-256 hex digest of `payload`
+/// - `regex_extract`: `pattern|text` (or `[0-9]+` if no `|`), comma-joined matches
+/// - `compute`: deterministic 64-bit checksum
+pub fn execute_job(task : router::JobTask) -> String {
+  if task.kind == "hash" {
+    return sha256_hex(task.payload)
+  }
+  if task.kind == "regex_extract" {
+    let sep = task.payload.index_of("|")
+    let pat = if sep > 0 { task.payload.slice(0, sep) } else { "[0-9]+" }
+    let text = if sep > 0 {
+      task.payload.slice(sep + 1, task.payload.length())
+    } else {
+      task.payload
+    }
+    return match regex::compile(pat) {
+      Ok(re) => {
+        let ms = regex::find_all(re, text)
+        let parts : Array[String] = []
+        let mut i = 0
+        while i < ms.length() {
+          parts.push(ms[i].text)
+          i = i + 1
+        }
+        parts.join(",")
+      }
+      Err(e) => "regex_err:" + e
+    }
+  }
+  if task.kind == "compute" {
+    return compute_checksum(task.payload)
+  }
+  "echo:" + task.payload
+}
+
+pub fn format_sse_job_done(id : String, session_id : String, kind : String, result : String) -> String {
+  let data = json::stringify(json::JObj([
+    json::field("id", json::JStr(id)),
+    json::field("session_id", json::JStr(session_id)),
+    json::field("kind", json::JStr(kind)),
+    json::field("status", json::JStr("done")),
+    json::field("result", json::JStr(result)),
+  ]))
+  "event: job_done\ndata: " + data + "\n\n"
+}
+
+/// Cross-package `dyn router::Handler` plugin registered by the root app on `GET /info`.
+pub struct StationInfoHandler {
+  pub version : String
+  pub workers : Int
+}
+
+impl router::Handler for StationInfoHandler {
+  fn name(self : StationInfoHandler) -> String {
+    "station_info"
+  }
+  fn handle(self : StationInfoHandler, req : router::RouteReq) -> router::RouteResp {
+    let body = json::stringify(json::JObj([
+      json::field("service", json::JStr("pion-station")),
+      json::field("version", json::JStr(self.version)),
+      json::field("workers", json::JInt(self.workers.to_int64())),
+      json::field("protocol", json::JStr(req.protocol)),
+    ]))
+    router::json_resp(200, body)
+  }
+}
+
+/// Worker OS thread loop: drains `st.job_tx` until closed, updates SQLite, and broadcasts SSE.
+pub fn worker_loop(world : World, st : router::StationState, hub : SseHub) -> Unit {
+  while true {
+    match st.job_tx.recv() {
+      Some(task) => {
+        let result = execute_job(task)
+        let ts = clock_now_ms(world)
+        match store::update_job(st.db, task.id, "done", result, ts) {
+          Ok(_) => ()
+          Err(e) => io_eprintln(world, "worker: update_job(" + task.id + ") failed: " + e)
+        }
+        let _ = st.counters.jobs_completed.fetch_add(1)
+        sse_broadcast(hub, format_sse_job_done(task.id, task.session_id, task.kind, result))
+      }
+      None => break
+    }
+  }
+}
