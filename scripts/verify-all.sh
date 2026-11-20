@@ -27,7 +27,7 @@ FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DI
   "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/examples/sqlite_indexer" \
   "$ROOT_DIR/tests/e2e/utf8_text.pion" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" \
   "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" "$ROOT_DIR/examples/https_server" \
-  "$ROOT_DIR/tests/e2e/dyn_trait.pion")
+  "$ROOT_DIR/tests/e2e/dyn_trait.pion" "$ROOT_DIR/examples/pion_station")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
 if ! printf '%s' "$FMT_OUT" | grep -q '"ok":true'; then
   echo "FAIL: pionc2 fmt --check --json reported unformatted files" >&2
@@ -147,7 +147,7 @@ if [ "$DYN_OUT" != "dyn_trait ok" ]; then
 fi
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
-# examples/https_server links the system OpenSSL; GitHub's macos-15 runner has no
+# examples/https_server and examples/pion_station link the system OpenSSL; GitHub's macos-15 runner has no
 # Homebrew openssl@3, so this runs only where it is installed.
 if [ -d /opt/homebrew/opt/openssl@3/lib ]; then
   HTTPS_OUT=$(CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib "$PIONC2" test --json "$ROOT_DIR/examples/https_server")
@@ -156,8 +156,15 @@ if [ -d /opt/homebrew/opt/openssl@3/lib ]; then
     echo "FAIL: pionc2 test --json examples/https_server failed" >&2
     exit 1
   fi
+  # Flagship: HTTPS + SSE + SQLite WAL + dyn Handler + std/regex + worker pool.
+  STATION_OUT=$(CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib "$PIONC2" test --json "$ROOT_DIR/examples/pion_station")
+  printf 'pionc2 test --json examples/pion_station -> %s\n' "$STATION_OUT"
+  if ! printf '%s' "$STATION_OUT" | grep -q '"ok":true' || ! printf '%s' "$STATION_OUT" | grep -q '"failed":0'; then
+    echo "FAIL: pionc2 test --json examples/pion_station failed" >&2
+    exit 1
+  fi
 else
-  echo "NOTE: /opt/homebrew/opt/openssl@3/lib not found; skipping examples/https_server tests"
+  echo "NOTE: /opt/homebrew/opt/openssl@3/lib not found; skipping examples/https_server + examples/pion_station tests"
 fi
 
 echo "=== ALL 6 VERIFY-ALL GATES PASSED ==="
