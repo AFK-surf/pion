@@ -91,6 +91,45 @@ pub fn format_enum_sig(ed : EnumDecl) -> String {
 }
 
 ///|
+fn format_type_params_with_bounds(
+  tparams : Array[String],
+  bounds : Array[TypeBound],
+) -> String {
+  if tparams.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder()
+  sb.write_string("[")
+  let mut i = 0
+  while i < tparams.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    let tp = tparams[i]
+    sb.write_string(tp)
+    let mut bi = 0
+    while bi < bounds.length() {
+      if bounds[bi].param == tp && bounds[bi].traits.length() > 0 {
+        sb.write_string(" : ")
+        let mut ti = 0
+        while ti < bounds[bi].traits.length() {
+          if ti > 0 {
+            sb.write_string(" + ")
+          }
+          sb.write_string(bounds[bi].traits[ti])
+          ti = ti + 1
+        }
+        break
+      }
+      bi = bi + 1
+    }
+    i = i + 1
+  }
+  sb.write_string("]")
+  sb.to_string()
+}
+
+///|
 pub fn format_fn_sig(fd : FnDecl) -> String {
   let sb = StringBuilder()
   sb.write_string("fn ")
@@ -99,7 +138,7 @@ pub fn format_fn_sig(fd : FnDecl) -> String {
     sb.write_string("::")
   }
   sb.write_string(fd.name)
-  sb.write_string(format_type_params(fd.type_params))
+  sb.write_string(format_type_params_with_bounds(fd.type_params, fd.type_bounds))
   sb.write_string("(")
   let mut i = 0
   while i < fd.params.length() {
@@ -118,6 +157,86 @@ pub fn format_fn_sig(fd : FnDecl) -> String {
 }
 
 ///|
+pub fn format_extern_fn_sig(ed : ExternFnDecl) -> String {
+  let sb = StringBuilder()
+  sb.write_string("extern \"")
+  sb.write_string(ed.abi)
+  sb.write_string("\" fn ")
+  sb.write_string(ed.name)
+  sb.write_string("(")
+  let mut i = 0
+  while i < ed.params.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    let param = ed.params[i]
+    sb.write_string(param.name)
+    sb.write_string(": ")
+    sb.write_string(type_expr_to_string(param.ty))
+    i = i + 1
+  }
+  sb.write_string(") -> ")
+  sb.write_string(type_expr_to_string(ed.ret_ty))
+  if ed.c_symbol != ed.name {
+    sb.write_string(" = ")
+    sb.write_string(json_quote(ed.c_symbol))
+  }
+  sb.to_string()
+}
+
+///|
+pub fn format_trait_sig(td : TraitDecl) -> String {
+  let sb = StringBuilder()
+  sb.write_string("trait ")
+  sb.write_string(td.name)
+  sb.write_string(" { ")
+  let mut i = 0
+  while i < td.methods.length() {
+    if i > 0 {
+      sb.write_string("; ")
+    }
+    let m = td.methods[i]
+    sb.write_string(m.name)
+    sb.write_string("(")
+    let mut j = 0
+    while j < m.params.length() {
+      if j > 0 {
+        sb.write_string(", ")
+      }
+      sb.write_string(m.params[j].name)
+      sb.write_string(": ")
+      sb.write_string(type_expr_to_string(m.params[j].ty))
+      j = j + 1
+    }
+    sb.write_string(") -> ")
+    sb.write_string(type_expr_to_string(m.ret_ty))
+    i = i + 1
+  }
+  sb.write_string(" }")
+  sb.to_string()
+}
+
+///|
+pub fn format_impl_sig(id : ImplDecl) -> String {
+  let sb = StringBuilder()
+  sb.write_string("impl ")
+  sb.write_string(id.trait_name)
+  sb.write_string(" for ")
+  sb.write_string(id.target_type)
+  sb.write_string(" { ")
+  let mut i = 0
+  while i < id.methods.length() {
+    if i > 0 {
+      sb.write_string("; ")
+    }
+    sb.write_string(format_fn_sig(id.methods[i]))
+    i = i + 1
+  }
+  sb.write_string(" }")
+  sb.to_string()
+}
+
+///|
 pub fn format_const_sig(cd : ConstDecl) -> String {
   "const " + cd.name + ": " + type_expr_to_string(cd.ty)
 }
@@ -128,10 +247,16 @@ fn sig_kind_rank(kind : String) -> Int {
     0
   } else if kind == "enum" {
     1
-  } else if kind == "const" {
+  } else if kind == "trait" {
     2
-  } else {
+  } else if kind == "impl" {
     3
+  } else if kind == "const" {
+    4
+  } else if kind == "extern_fn" {
+    5
+  } else {
+    6
   }
 }
 
@@ -200,6 +325,28 @@ pub fn extract_package_sig(pkg : Package) -> PackageSig {
               signature: format_fn_sig(fd),
             })
           }
+        DExternFn(ed) =>
+          if ed.is_pub {
+            entries.push(SigEntry::{
+              kind: "extern_fn",
+              name: ed.name,
+              signature: format_extern_fn_sig(ed),
+            })
+          }
+        DTrait(td) =>
+          if td.is_pub {
+            entries.push(SigEntry::{
+              kind: "trait",
+              name: td.name,
+              signature: format_trait_sig(td),
+            })
+          }
+        DImpl(id) =>
+          entries.push(SigEntry::{
+            kind: "impl",
+            name: id.trait_name + "::" + id.target_type,
+            signature: format_impl_sig(id),
+          })
         DConst(cd) =>
           if cd.is_pub {
             entries.push(SigEntry::{
@@ -274,6 +421,24 @@ pub fn emit_all_sigs(pkg : Package) -> String {
             signature: format_fn_sig(fd),
           })
         }
+        DExternFn(ed) =>
+          entries.push(SigEntry::{
+            kind: "extern_fn",
+            name: ed.name,
+            signature: format_extern_fn_sig(ed),
+          })
+        DTrait(td) =>
+          entries.push(SigEntry::{
+            kind: "trait",
+            name: td.name,
+            signature: format_trait_sig(td),
+          })
+        DImpl(id) =>
+          entries.push(SigEntry::{
+            kind: "impl",
+            name: id.trait_name + "::" + id.target_type,
+            signature: format_impl_sig(id),
+          })
         DConst(cd) =>
           entries.push(SigEntry::{
             kind: "const",
@@ -308,6 +473,18 @@ pub fn emit_file_sig_entries(f : SourceFile) -> String {
       }
       DFn(fd) => {
         sb.write_string(format_fn_sig(fd))
+        sb.write_string("\n")
+      }
+      DExternFn(ed) => {
+        sb.write_string(format_extern_fn_sig(ed))
+        sb.write_string("\n")
+      }
+      DTrait(td) => {
+        sb.write_string(format_trait_sig(td))
+        sb.write_string("\n")
+      }
+      DImpl(id) => {
+        sb.write_string(format_impl_sig(id))
         sb.write_string("\n")
       }
       DConst(cd) => {
@@ -395,7 +572,7 @@ pub fn emit_file_stub(f : SourceFile) -> String {
           sb.write_string("::")
         }
         sb.write_string(fd.name)
-        sb.write_string(format_type_params(fd.type_params))
+        sb.write_string(format_type_params_with_bounds(fd.type_params, fd.type_bounds))
         sb.write_string("(")
         let mut i = 0
         while i < fd.params.length() {
@@ -411,6 +588,93 @@ pub fn emit_file_stub(f : SourceFile) -> String {
         sb.write_string(") -> ")
         sb.write_string(type_expr_to_string(fd.ret_ty))
         sb.write_string(" { panic() }\n")
+      }
+      DExternFn(ed) => {
+        if ed.is_pub {
+          sb.write_string("pub ")
+        }
+        sb.write_string("extern \"")
+        sb.write_string(ed.abi)
+        sb.write_string("\" fn ")
+        sb.write_string(ed.name)
+        sb.write_string("(")
+        let mut i = 0
+        while i < ed.params.length() {
+          if i > 0 {
+            sb.write_string(", ")
+          }
+          let param = ed.params[i]
+          sb.write_string(param.name)
+          sb.write_string(" : ")
+          sb.write_string(type_expr_to_string(param.ty))
+          i = i + 1
+        }
+        sb.write_string(") -> ")
+        sb.write_string(type_expr_to_string(ed.ret_ty))
+        if ed.c_symbol != ed.name {
+          sb.write_string(" = ")
+          sb.write_string(json_quote(ed.c_symbol))
+        }
+        sb.write_string("\n")
+      }
+      DTrait(td) => {
+        if td.is_pub {
+          sb.write_string("pub ")
+        }
+        sb.write_string("trait ")
+        sb.write_string(td.name)
+        sb.write_string(" {\n")
+        let mut i = 0
+        while i < td.methods.length() {
+          let m = td.methods[i]
+          sb.write_string("  fn ")
+          sb.write_string(m.name)
+          sb.write_string("(")
+          let mut j = 0
+          while j < m.params.length() {
+            if j > 0 {
+              sb.write_string(", ")
+            }
+            sb.write_string(m.params[j].name)
+            sb.write_string(" : ")
+            sb.write_string(type_expr_to_string(m.params[j].ty))
+            j = j + 1
+          }
+          sb.write_string(") -> ")
+          sb.write_string(type_expr_to_string(m.ret_ty))
+          sb.write_string("\n")
+          i = i + 1
+        }
+        sb.write_string("}\n")
+      }
+      DImpl(id) => {
+        sb.write_string("impl ")
+        sb.write_string(id.trait_name)
+        sb.write_string(" for ")
+        sb.write_string(id.target_type)
+        sb.write_string(" {\n")
+        let mut i = 0
+        while i < id.methods.length() {
+          let m = id.methods[i]
+          sb.write_string("  fn ")
+          sb.write_string(m.name)
+          sb.write_string("(")
+          let mut j = 0
+          while j < m.params.length() {
+            if j > 0 {
+              sb.write_string(", ")
+            }
+            sb.write_string(m.params[j].name)
+            sb.write_string(" : ")
+            sb.write_string(type_expr_to_string(m.params[j].ty))
+            j = j + 1
+          }
+          sb.write_string(") -> ")
+          sb.write_string(type_expr_to_string(m.ret_ty))
+          sb.write_string(" { panic() }\n")
+          i = i + 1
+        }
+        sb.write_string("}\n")
       }
       DConst(cd) => {
         if cd.is_pub {
@@ -525,6 +789,24 @@ pub fn summarize_file_sigs(
         entries.push(SigEntry::{
           kind: "const",
           name: extract_sig_name(line, 6),
+          signature: line,
+        })
+      } else if starts_with_str(line, "extern \"C\" fn ") {
+        entries.push(SigEntry::{
+          kind: "extern_fn",
+          name: extract_sig_name(line, 14),
+          signature: line,
+        })
+      } else if starts_with_str(line, "trait ") {
+        entries.push(SigEntry::{
+          kind: "trait",
+          name: extract_sig_name(line, 6),
+          signature: line,
+        })
+      } else if starts_with_str(line, "impl ") {
+        entries.push(SigEntry::{
+          kind: "impl",
+          name: extract_sig_name(line, 5),
           signature: line,
         })
       }
@@ -657,6 +939,24 @@ pub fn parse_m2sig(text : String) -> Result[PackageSig, String] {
       entries.push(SigEntry::{
         kind: "const",
         name: extract_sig_name(line, 6),
+        signature: line,
+      })
+    } else if starts_with_str(line, "extern \"C\" fn ") {
+      entries.push(SigEntry::{
+        kind: "extern_fn",
+        name: extract_sig_name(line, 14),
+        signature: line,
+      })
+    } else if starts_with_str(line, "trait ") {
+      entries.push(SigEntry::{
+        kind: "trait",
+        name: extract_sig_name(line, 6),
+        signature: line,
+      })
+    } else if starts_with_str(line, "impl ") {
+      entries.push(SigEntry::{
+        kind: "impl",
+        name: extract_sig_name(line, 5),
         signature: line,
       })
     } else {

@@ -818,3 +818,149 @@ test "p10a: parser never hangs on reserved keyword as struct field or param name
   let cr3 = @core.check_source_files("p10a_bad_enum", ["be.m2"], [bad_enum])
   assert_true(cr3.diagnostics.length() > 0, "reserved keyword enum variant must return parse error")
 }
+
+///|
+test "p12a: extern C FFI valid and Ptr helpers" {
+  let src =
+    "pub extern \"C\" fn c_strlen(s : Ptr) -> Int64 = \"strlen\"\n" +
+    "extern \"C\" fn abs(x : Int) -> Int\n" +
+    "extern \"C\" fn c_free(p : Ptr) -> Unit = \"free\"\n" +
+    "pub fn main() -> Int {\n" +
+    "  let p : Ptr = ptr_null()\n" +
+    "  let is_n : Bool = ptr_is_null(p)\n" +
+    "  let a : Int64 = ptr_addr(p)\n" +
+    "  let s : String = \"hello\"\n" +
+    "  let n : Int64 = c_strlen(s.as_cstr())\n" +
+    "  let v : Int = abs(-7)\n" +
+    "  c_free(p)\n" +
+    "  if is_n && a == 0L { n.to_int() + v } else { 0 }\n" +
+    "}\n"
+  let cr = @core.check_source_files("p12a_ffi_ok", ["p12a_ffi_ok.m2"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let sig = @core.cli_emit_sig("p12a_ffi_ok", ["p12a_ffi_ok.m2"], [src])
+  assert_eq(sig.contains("extern \"C\" fn c_strlen(s: Ptr) -> Int64 = \"strlen\""), true)
+}
+
+///|
+test "p12a: extern C rejects non-C-ABI types with fixit" {
+  let src =
+    "extern \"C\" fn bad_str(s : String) -> Int\n" +
+    "extern \"C\" fn bad_arr(a : Array[Int]) -> Map[String, Int]\n" +
+    "pub fn main() -> Int { 0 }\n"
+  let cr = @core.check_source_files("p12a_ffi_bad", ["p12a_ffi_bad.m2"], [src])
+  assert_eq(cr.diagnostics.length(), 3)
+  assert_eq(cr.diagnostics[0].code, "E_TYPE_MISMATCH")
+  assert_eq(cr.diagnostics[0].fixit.contains("as_cstr"), true)
+  assert_eq(cr.diagnostics[1].code, "E_TYPE_MISMATCH")
+  assert_eq(cr.diagnostics[2].code, "E_TYPE_MISMATCH")
+}
+
+///|
+test "p12a: Ptr is !Send across spawn" {
+  let src =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let p : Ptr = ptr_null()\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      let _ = ptr_is_null(p)\n" +
+    "    })\n" +
+    "  })\n" +
+    "  0\n" +
+    "}\n"
+  let cr = @core.check_source_files("p12a_ptr_send", ["p12a_ptr_send.m2"], [src])
+  assert_eq(cr.diagnostics.length() > 0, true)
+  assert_eq(cr.diagnostics[0].code, "E_NOT_SEND")
+}
+
+///|
+test "p12a: trait impl and generic trait bounds ok" {
+  let src =
+    "pub trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "}\n" +
+    "pub trait Hash {\n" +
+    "  fn hash(self : Self) -> Int\n" +
+    "}\n" +
+    "pub struct Point {\n" +
+    "  x : Int\n" +
+    "  y : Int\n" +
+    "}\n" +
+    "impl Show for Int {\n" +
+    "  fn show(self : Int) -> String { self.to_string() }\n" +
+    "}\n" +
+    "impl Hash for Int {\n" +
+    "  fn hash(self : Int) -> Int { self * 31 }\n" +
+    "}\n" +
+    "impl Show for Point {\n" +
+    "  fn show(self : Point) -> String { \"Point(\" + self.x.to_string() + \",\" + self.y.to_string() + \")\" }\n" +
+    "}\n" +
+    "fn format_pair[A : Show, B : Show](a : A, b : B) -> String {\n" +
+    "  a.show() + \":\" + b.show()\n" +
+    "}\n" +
+    "fn hash_and_show[T : Show + Hash](x : T) -> String {\n" +
+    "  x.show() + \"#\" + x.hash().to_string()\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let pt = Point::{ x: 1, y: 2 }\n" +
+    "  let s1 = format_pair(42, pt)\n" +
+    "  let s2 = hash_and_show(7)\n" +
+    "  let s3 = pt.show()\n" +
+    "  s1.length() + s2.length() + s3.length()\n" +
+    "}\n"
+  let cr = @core.check_source_files("p12a_trait_ok", ["p12a_trait_ok.m2"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let sig = @core.cli_emit_sig("p12a_trait_ok", ["p12a_trait_ok.m2"], [src])
+  assert_eq(sig.contains("trait Show"), true)
+  assert_eq(sig.contains("impl Show for Point"), true)
+}
+
+///|
+test "p12a: trait errors E_UNKNOWN_TRAIT E_TRAIT_METHOD_MISSING E_TRAIT_METHOD_SIGNATURE E_TRAIT_NOT_IMPLEMENTED" {
+  let src_unknown =
+    "impl Ghost for Int {\n" +
+    "  fn boo(self : Int) -> Int { self }\n" +
+    "}\n" +
+    "pub fn main() -> Int { 0 }\n"
+  let cr1 = @core.check_source_files("t1", ["t1.m2"], [src_unknown])
+  assert_eq(cr1.diagnostics.length() > 0, true)
+  assert_eq(cr1.diagnostics[0].code, "E_UNKNOWN_TRAIT")
+
+  let src_missing =
+    "trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "}\n" +
+    "impl Show for Int {\n" +
+    "}\n" +
+    "pub fn main() -> Int { 0 }\n"
+  let cr2 = @core.check_source_files("t2", ["t2.m2"], [src_missing])
+  assert_eq(cr2.diagnostics.length() > 0, true)
+  assert_eq(cr2.diagnostics[0].code, "E_TRAIT_METHOD_MISSING")
+
+  let src_sig =
+    "trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "}\n" +
+    "impl Show for Int {\n" +
+    "  fn show(self : Int) -> Int { self }\n" +
+    "}\n" +
+    "pub fn main() -> Int { 0 }\n"
+  let cr3 = @core.check_source_files("t3", ["t3.m2"], [src_sig])
+  assert_eq(cr3.diagnostics.length() > 0, true)
+  assert_eq(cr3.diagnostics[0].code, "E_TRAIT_METHOD_SIGNATURE")
+
+  let src_not_impl =
+    "trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "}\n" +
+    "struct Bare { v : Int }\n" +
+    "fn render[T : Show](x : T) -> String { x.show() }\n" +
+    "pub fn main() -> Int {\n" +
+    "  let b = Bare::{ v: 1 }\n" +
+    "  let _ = render(b)\n" +
+    "  0\n" +
+    "}\n"
+  let cr4 = @core.check_source_files("t4", ["t4.m2"], [src_not_impl])
+  assert_eq(cr4.diagnostics.length() > 0, true)
+  assert_eq(cr4.diagnostics[0].code, "E_TRAIT_NOT_IMPLEMENTED")
+  assert_eq(cr4.diagnostics[0].expected, "impl Show for Bare")
+}

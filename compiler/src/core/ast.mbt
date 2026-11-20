@@ -78,14 +78,56 @@ pub struct EnumDecl {
 }
 
 ///|
+pub struct TypeBound {
+  param : String
+  traits : Array[String]
+}
+
+///|
 pub struct FnDecl {
   is_pub : Bool
   receiver_type : String
   name : String
   type_params : Array[String]
+  type_bounds : Array[TypeBound]
   params : Array[Param]
   ret_ty : TypeExpr
   body : Array[Stmt]
+  span : Span
+}
+
+///|
+pub struct ExternFnDecl {
+  is_pub : Bool
+  abi : String
+  name : String
+  c_symbol : String
+  params : Array[Param]
+  ret_ty : TypeExpr
+  span : Span
+}
+
+///|
+pub struct TraitMethodDecl {
+  name : String
+  params : Array[Param]
+  ret_ty : TypeExpr
+  span : Span
+}
+
+///|
+pub struct TraitDecl {
+  is_pub : Bool
+  name : String
+  methods : Array[TraitMethodDecl]
+  span : Span
+}
+
+///|
+pub struct ImplDecl {
+  trait_name : String
+  target_type : String
+  methods : Array[FnDecl]
   span : Span
 }
 
@@ -110,6 +152,9 @@ pub enum Decl {
   DStruct(StructDecl)
   DEnum(EnumDecl)
   DFn(FnDecl)
+  DExternFn(ExternFnDecl)
+  DTrait(TraitDecl)
+  DImpl(ImplDecl)
   DConst(ConstDecl)
   DTest(TestDecl)
 }

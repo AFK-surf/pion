@@ -1378,3 +1378,48 @@ test "p11c: same-index overwrite OOB dedup and pure EIf rhs array borrow" {
   }
   assert_eq(oob_cnt, 2)
 }
+
+///|
+test "p12a: extern C FFI and trait monomorphization QBE codegen" {
+  let src =
+    "extern \"C\" fn c_strlen(s : Ptr) -> Int64 = \"strlen\"\n" +
+    "extern \"C\" fn c_free(p : Ptr) -> Unit = \"free\"\n" +
+    "pub trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "}\n" +
+    "pub struct User {\n" +
+    "  id : Int\n" +
+    "  name : String\n" +
+    "}\n" +
+    "impl Show for Int {\n" +
+    "  fn show(self : Int) -> String { self.to_string() }\n" +
+    "}\n" +
+    "impl Show for User {\n" +
+    "  fn show(self : User) -> String { self.name }\n" +
+    "}\n" +
+    "fn format_pair[A : Show, B : Show](a : A, b : B) -> String {\n" +
+    "  a.show() + \":\" + b.show()\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let u = User::{ id: 1, name: \"ada\" }\n" +
+    "  let s = format_pair(42, u)\n" +
+    "  let n = c_strlen(s.as_cstr())\n" +
+    "  let p = ptr_null()\n" +
+    "  if ptr_is_null(p) { c_free(p) }\n" +
+    "  n.to_int()\n" +
+    "}\n"
+  let cr = @core.check_source_files_full("p12a_cg", ["p12a_cg.m2"], [src])
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  // Native C symbol call without $m2_fn_ prefix
+  assert_eq(ssa.contains("call $strlen("), true)
+  assert_eq(ssa.contains("call $free("), true)
+  assert_eq(ssa.contains("$m2_fn_c_strlen"), false)
+  // Static impl functions (zero vtable)
+  assert_eq(ssa.contains("$m2_impl_Show_Int_show"), true)
+  assert_eq(ssa.contains("$m2_impl_Show_User_show"), true)
+  // Monomorphized generic function calling concrete $m2_impl_ directly
+  assert_eq(ssa.contains("$m2_fn_format_pair__mono_Int_User"), true)
+  assert_eq(ssa.contains("call $m2_impl_Show_Int_show("), true)
+  assert_eq(ssa.contains("call $m2_impl_Show_User_show("), true)
+}

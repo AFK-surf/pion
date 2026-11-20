@@ -80,7 +80,7 @@ fn p_skip_semis(p : Parser) -> Unit {
 fn p_sync_top(p : Parser) -> Unit {
   while !p_is_eof(p) {
     match p_peek(p).kind {
-      KwPub | KwFn | KwStruct | KwEnum | KwVal | KwLet | KwType | KwImport =>
+      KwPub | KwFn | KwStruct | KwEnum | KwVal | KwLet | KwType | KwImport | KwExtern | KwTrait | KwImpl =>
         break
       _ => {
         let _ = p_advance(p)
@@ -602,9 +602,71 @@ fn p_parse_params(p : Parser) -> Array[Param] {
 }
 
 ///|
+pub struct ParsedTypeParams {
+  names : Array[String]
+  bounds : Array[TypeBound]
+}
+
+///|
+fn p_parse_fn_type_params(p : Parser) -> ParsedTypeParams {
+  let names : Array[String] = []
+  let bounds : Array[TypeBound] = []
+  if !p_match_kind_lbracket(p) {
+    return ParsedTypeParams::{ names: names, bounds: bounds }
+  }
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      RBracket => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let name = p_expect_ident(p, "type parameter")
+        names.push(name)
+        if p_match_kind_colon(p) {
+          let trs : Array[String] = []
+          while !p_is_eof(p) {
+            let mut tname = p_expect_ident(p, "trait bound")
+            if p_match_kind_coloncolon(p) {
+              let mem = p_expect_ident(p, "trait name after `::`")
+              tname = tname + "::" + mem
+            }
+            trs.push(tname)
+            match p_peek(p).kind {
+              Plus => {
+                let _ = p_advance(p)
+              }
+              _ => break
+            }
+          }
+          if trs.length() > 0 {
+            bounds.push(TypeBound::{ param: name, traits: trs })
+          }
+        }
+        if !p_match_kind_comma(p) {
+          if !p_match_kind_rbracket(p) {
+            let tok = p_peek(p)
+            p_err(
+              p,
+              tok.span,
+              "expected `,` or `]` in type parameter list",
+              "`,` or `]`",
+              tok.raw,
+              "close type parameter list with `]`",
+            )
+          }
+          break
+        }
+      }
+    }
+  }
+  ParsedTypeParams::{ names: names, bounds: bounds }
+}
+
+///|
 fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
   let _ = p_advance(p) // consume 'fn'
-  let mut tparams = p_parse_type_params(p)
+  let mut tp = p_parse_fn_type_params(p)
   let first = p_expect_ident(p, "function name")
   let mut recv_ty = ""
   let mut fname = first
@@ -612,8 +674,8 @@ fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
     recv_ty = first
     fname = p_expect_ident(p, "method name")
   }
-  if tparams.length() == 0 {
-    tparams = p_parse_type_params(p)
+  if tp.names.length() == 0 {
+    tp = p_parse_fn_type_params(p)
   }
   let params = p_parse_params(p)
   let ret_ty = if p_match_kind_arrow(p) {
@@ -626,10 +688,242 @@ fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
     is_pub: is_pub,
     receiver_type: recv_ty,
     name: fname,
-    type_params: tparams,
+    type_params: tp.names,
+    type_bounds: tp.bounds,
     params: params,
     ret_ty: ret_ty,
     body: body,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_extern_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume 'extern'
+  let abi_tok = p_peek(p)
+  let abi = match abi_tok.kind {
+    StringLit(s) => {
+      let _ = p_advance(p)
+      if s != "C" {
+        p_err(
+          p,
+          abi_tok.span,
+          "unsupported extern ABI `" + s + "` (only `\"C\"` is supported)",
+          "`\"C\"`",
+          abi_tok.raw,
+          "use `extern \"C\" fn ...`",
+        )
+      }
+      s
+    }
+    _ => {
+      p_err(
+        p,
+        abi_tok.span,
+        "expected ABI string `\"C\"` after `extern`, found `" + abi_tok.raw + "`",
+        "`\"C\"`",
+        abi_tok.raw,
+        "write `extern \"C\" fn ...`",
+      )
+      "C"
+    }
+  }
+  match p_peek(p).kind {
+    KwFn => {
+      let _ = p_advance(p)
+    }
+    _ => {
+      let t = p_peek(p)
+      p_err(
+        p,
+        t.span,
+        "expected `fn` after `extern \"C\"`, found `" + t.raw + "`",
+        "`fn`",
+        t.raw,
+        "write `extern \"C\" fn <name>(...) -> <Ret>`",
+      )
+    }
+  }
+  let name = p_expect_ident(p, "extern function name")
+  let params = p_parse_params(p)
+  let ret_ty = if p_match_kind_arrow(p) {
+    p_parse_type_expr(p)
+  } else {
+    TyMissing(p_peek(p).span)
+  }
+  let mut c_symbol = name
+  if p_match_kind_eq(p) {
+    let sym_tok = p_peek(p)
+    match sym_tok.kind {
+      StringLit(s) => {
+        let _ = p_advance(p)
+        c_symbol = s
+      }
+      _ =>
+        p_err(
+          p,
+          sym_tok.span,
+          "expected C symbol name string after `=`, found `" + sym_tok.raw + "`",
+          "string literal",
+          sym_tok.raw,
+          "write `= \"c_symbol\"`",
+        )
+    }
+  }
+  DExternFn(ExternFnDecl::{
+    is_pub: is_pub,
+    abi: abi,
+    name: name,
+    c_symbol: c_symbol,
+    params: params,
+    ret_ty: ret_ty,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_trait_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume 'trait'
+  let name = p_expect_ident(p, "trait name")
+  p_expect_lbrace(p)
+  let methods : Array[TraitMethodDecl] = []
+  while !p_is_eof(p) {
+    let before_pos = p.pos
+    p_skip_semis(p)
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let mspan = p_peek(p).span
+        match p_peek(p).kind {
+          KwFn => {
+            let _ = p_advance(p)
+          }
+          _ => ()
+        }
+        let mname = p_expect_ident(p, "trait method name")
+        let mparams = p_parse_params(p)
+        let mret = if p_match_kind_arrow(p) {
+          p_parse_type_expr(p)
+        } else {
+          TyMissing(p_peek(p).span)
+        }
+        methods.push(TraitMethodDecl::{
+          name: mname,
+          params: mparams,
+          ret_ty: mret,
+          span: mspan,
+        })
+        p_skip_semis(p)
+      }
+    }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
+    }
+  }
+  DTrait(TraitDecl::{
+    is_pub: is_pub,
+    name: name,
+    methods: methods,
+    span: start_span,
+  })
+}
+
+///|
+fn p_parse_impl_decl(p : Parser, start_span : Span) -> Decl {
+  let _ = p_advance(p) // consume 'impl'
+  let mut trait_name = p_expect_ident(p, "trait name")
+  if p_match_kind_coloncolon(p) {
+    let mem = p_expect_ident(p, "trait name after `::`")
+    trait_name = trait_name + "::" + mem
+  }
+  match p_peek(p).kind {
+    KwFor => {
+      let _ = p_advance(p)
+    }
+    _ => {
+      let t = p_peek(p)
+      p_err(
+        p,
+        t.span,
+        "expected `for` in `impl` declaration, found `" + t.raw + "`",
+        "`for`",
+        t.raw,
+        "write `impl " + trait_name + " for <Type> { ... }`",
+      )
+    }
+  }
+  let mut target_type = p_expect_ident(p, "target type name")
+  if p_match_kind_coloncolon(p) {
+    let mem = p_expect_ident(p, "type name after `::`")
+    target_type = target_type + "::" + mem
+  }
+  p_expect_lbrace(p)
+  let methods : Array[FnDecl] = []
+  while !p_is_eof(p) {
+    let before_pos = p.pos
+    p_skip_semis(p)
+    match p_peek(p).kind {
+      RBrace => {
+        let _ = p_advance(p)
+        break
+      }
+      _ => {
+        let mspan = p_peek(p).span
+        match p_peek(p).kind {
+          KwPub => {
+            let _ = p_advance(p)
+          }
+          _ => ()
+        }
+        match p_peek(p).kind {
+          KwFn => {
+            let _ = p_advance(p)
+          }
+          _ => {
+            let t = p_peek(p)
+            p_err(
+              p,
+              t.span,
+              "expected `fn` in `impl` block, found `" + t.raw + "`",
+              "`fn`",
+              t.raw,
+              "start each `impl` method with `fn`",
+            )
+          }
+        }
+        let mname = p_expect_ident(p, "impl method name")
+        let mparams = p_parse_params(p)
+        let mret = if p_match_kind_arrow(p) {
+          p_parse_type_expr(p)
+        } else {
+          TyMissing(p_peek(p).span)
+        }
+        let mbody = p_parse_block_stmts(p)
+        methods.push(FnDecl::{
+          is_pub: true,
+          receiver_type: target_type,
+          name: mname,
+          type_params: [],
+          type_bounds: [],
+          params: mparams,
+          ret_ty: mret,
+          body: mbody,
+          span: mspan,
+        })
+        p_skip_semis(p)
+      }
+    }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
+    }
+  }
+  DImpl(ImplDecl::{
+    trait_name: trait_name,
+    target_type: target_type,
+    methods: methods,
     span: start_span,
   })
 }
@@ -1676,6 +1970,9 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
         decls.push(p_parse_enum_decl(p, is_pub, start_span))
       }
       KwFn => decls.push(p_parse_fn_decl(p, is_pub, start_span))
+      KwExtern => decls.push(p_parse_extern_fn_decl(p, is_pub, start_span))
+      KwTrait => decls.push(p_parse_trait_decl(p, is_pub, start_span))
+      KwImpl => decls.push(p_parse_impl_decl(p, start_span))
       KwLet => decls.push(p_parse_const_decl(p, is_pub, start_span))
       Ident(kw) => {
         let next_is_str = match p_peek_at(p, 1).kind {
