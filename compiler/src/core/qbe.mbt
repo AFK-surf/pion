@@ -95,6 +95,19 @@ pub struct QbeSwitchPlan {
 }
 
 ///|
+pub struct QbeMonoReq {
+  sym : String
+  finfo : FnInfo
+  subst : Map[String, Ty]
+}
+
+///|
+pub struct QbeImplMethodMatch {
+  sym : String
+  finfo : FnInfo
+}
+
+///|
 pub struct QbeGen {
   tc : TypeChecker
   release : Bool
@@ -118,6 +131,9 @@ pub struct QbeGen {
   fn_wrappers : Array[String]
   fn_wrapper_seen : Map[String, Bool]
   extra_fns : Array[String]
+  mono_seen : Map[String, Bool]
+  mono_queue : Array[QbeMonoReq]
+  mut mono_emitted : Int
   mut inline_fns : Map[String, FnDecl]
   mut inline_depth : Int
   inline_stack : Array[String]
@@ -154,6 +170,7 @@ pub struct QbeGen {
   mut loop_conts : Array[String]
   mut loop_depths : Array[Int]
   mut cur_tparams : Array[String]
+  mut cur_type_subst : Map[String, Ty]
   mut cur_ret_ty : Ty
   mut cur_ret_abi_ty : Ty
   mut block_term : Bool
@@ -172,7 +189,7 @@ fn qval(reg : String, ty : Ty) -> QbeVal {
 ///|
 fn qbe_is_obj_ty(t : Ty) -> Bool {
   match t {
-    TInt | TInt64 | TDouble | TBool | TByte | TChar | TUnit | TNever | TError =>
+    TInt | TInt64 | TDouble | TBool | TByte | TChar | TUnit | TPtr | TNever | TError =>
       false
     TParam(_) => false
     _ => true
@@ -198,9 +215,126 @@ fn qbe_is_int32_ty(t : Ty) -> Bool {
 ///|
 fn qbe_is_prim_array_elem(t : Ty) -> Bool {
   match t {
-    TInt | TInt64 | TDouble | TBool | TByte | TChar => true
+    TInt | TInt64 | TDouble | TBool | TByte | TChar | TPtr => true
     _ => false
   }
+}
+
+///|
+fn qbe_c_abi_ty(t : Ty) -> String {
+  match t {
+    TDouble => "d"
+    TInt | TBool | TByte => "w"
+    _ => "l"
+  }
+}
+
+///|
+fn qbe_mangle_ty(t : Ty) -> String {
+  match t {
+    TInt => "Int"
+    TInt64 => "Int64"
+    TDouble => "Double"
+    TBool => "Bool"
+    TByte => "Byte"
+    TChar => "Char"
+    TString => "String"
+    TUnit => "Unit"
+    TPtr => "Ptr"
+    TArray(e) => "Array_" + qbe_mangle_ty(e)
+    TOption(e) => "Option_" + qbe_mangle_ty(e)
+    TResult(ok, err) => "Result_" + qbe_mangle_ty(ok) + "_" + qbe_mangle_ty(err)
+    TMap(k, v) => "Map_" + qbe_mangle_ty(k) + "_" + qbe_mangle_ty(v)
+    TStruct(n, _) => qbe_sanitize_sym(n)
+    TEnum(n, _) => qbe_sanitize_sym(n)
+    _ => qbe_sanitize_sym(ty_to_string(t))
+  }
+}
+
+///|
+fn qbe_mono_fn_sym(
+  base_sym : String,
+  tparams : Array[String],
+  subst : Map[String, Ty],
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string(base_sym)
+  sb.write_string("__mono")
+  let mut i = 0
+  while i < tparams.length() {
+    sb.write_string("_")
+    let t = match subst.get(tparams[i]) {
+      Some(ty) => ty
+      None => TError
+    }
+    sb.write_string(qbe_mangle_ty(t))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn qbe_impl_method_sym(
+  g : QbeGen,
+  impl_pkg : String,
+  trait_name : String,
+  target_type : String,
+  method_name : String,
+) -> String {
+  let prefix = if g.tc.multi_pkg {
+    qbe_pkg_prefix_for(impl_pkg, true)
+  } else {
+    ""
+  }
+  "$m2_" +
+  prefix +
+  "impl_" +
+  qbe_sanitize_sym(trait_name) +
+  "_" +
+  qbe_sanitize_sym(target_type) +
+  "_" +
+  method_name
+}
+
+///|
+fn qbe_find_impl_method(
+  g : QbeGen,
+  recv_ty : Ty,
+  method_name : String,
+) -> Option[QbeImplMethodMatch] {
+  let tname = ty_base_name(recv_ty)
+  let mut i = 0
+  while i < g.tc.impl_keys.length() {
+    let k = g.tc.impl_keys[i]
+    match g.tc.impls.get(k) {
+      Some(ii) =>
+        if ii.target_type == tname {
+          match ii.methods.get(method_name) {
+            Some(fi) =>
+              return Some(QbeImplMethodMatch::{
+                sym: qbe_impl_method_sym(
+                  g,
+                  ii.pkg_name,
+                  ii.trait_name,
+                  ii.target_type,
+                  method_name,
+                ),
+                finfo: fi,
+              })
+            None => ()
+          }
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+fn qbe_resolve_type(g : QbeGen, te : TypeExpr) -> Ty {
+  let raw = resolve_type_expr(g.tc, te, g.cur_tparams)
+  subst_ty(raw, g.cur_type_subst)
 }
 
 ///|
@@ -3966,6 +4100,9 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     fn_wrappers: [],
     fn_wrapper_seen: Map([]),
     extra_fns: [],
+    mono_seen: Map([]),
+    mono_queue: [],
+    mono_emitted: 0,
     inline_fns: Map([]),
     inline_depth: 0,
     inline_stack: [],
@@ -4002,6 +4139,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     loop_conts: [],
     loop_depths: [],
     cur_tparams: [],
+    cur_type_subst: Map([]),
     cur_ret_ty: TUnit,
     cur_ret_abi_ty: TUnit,
     block_term: false,
@@ -5889,14 +6027,14 @@ fn qbe_emit_closure_obj(
   while pi < params.length() {
     let pty = match params[pi].ty {
       TyMissing(_) => TError
-      _ => resolve_type_expr(g.tc, params[pi].ty, g.cur_tparams)
+      _ => qbe_resolve_type(g, params[pi].ty)
     }
     ptys.push(pty)
     pi = pi + 1
   }
   let ret_ty = match ret_te {
     TyMissing(_) => TUnit
-    _ => resolve_type_expr(g.tc, ret_te, g.cur_tparams)
+    _ => qbe_resolve_type(g, ret_te)
   }
 
   let n_slots = 1 + cap_locals.length()
@@ -6450,6 +6588,14 @@ fn qbe_emit_method_call(
           qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
         }
         return qval(r, TBytes)
+      }
+      if method_name == "as_cstr" {
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l add " + obj_val + ", 8")
+        if !obj_borrowed {
+          qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TPtr)
       }
     }
     TBytes => {
@@ -7074,6 +7220,71 @@ fn qbe_emit_method_call(
       }
     }
     _ => ()
+  }
+  match qbe_find_impl_method(g, recv_ty, method_name) {
+    Some(imatch) => {
+      let minfo = imatch.finfo
+      let arg_vals : Array[String] = [obj_val]
+      let arg_tys : Array[Ty] = [recv_ty]
+      let arg_borrowed : Array[Bool] = [obj_borrowed]
+      let mut i = 0
+      while i < args.length() {
+        let p_idx = i + 1
+        let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
+          Some(minfo.param_tys[p_idx])
+        } else {
+          None
+        }
+        let aa = qbe_emit_arg_maybe_borrow(g, args[i], exp_p, args_pure)
+        arg_vals.push(aa.qv.reg)
+        arg_tys.push(aa.qv.ty)
+        arg_borrowed.push(aa.borrowed)
+        i = i + 1
+      }
+      let call_args : Array[String] = []
+      let call_abis : Array[String] = []
+      let mut j = 0
+      while j < arg_vals.length() {
+        let decl_pty = if j < minfo.param_tys.length() {
+          minfo.param_tys[j]
+        } else {
+          arg_tys[j]
+        }
+        call_args.push(qbe_coerce_val(g, qval(arg_vals[j], arg_tys[j]), decl_pty))
+        call_abis.push(qbe_abi_ty(decl_pty))
+        j = j + 1
+      }
+      let ret_abi = qbe_abi_ty(minfo.ret_ty)
+      let res = qbe_tmp(g)
+      let sb = StringBuilder()
+      sb.write_string(res)
+      sb.write_string(" =")
+      sb.write_string(ret_abi)
+      sb.write_string(" call ")
+      sb.write_string(imatch.sym)
+      sb.write_string("(")
+      j = 0
+      while j < call_args.length() {
+        if j > 0 {
+          sb.write_string(", ")
+        }
+        sb.write_string(call_abis[j])
+        sb.write_string(" ")
+        sb.write_string(call_args[j])
+        j = j + 1
+      }
+      sb.write_string(")")
+      qbe_emit(g, sb.to_string())
+      j = 0
+      while j < arg_vals.length() {
+        if !arg_borrowed[j] {
+          qbe_rc_dec(g, arg_vals[j], arg_tys[j])
+        }
+        j = j + 1
+      }
+      return qval(res, minfo.ret_ty)
+    }
+    None => ()
   }
   if !obj_borrowed {
     qbe_rc_dec(g, obj_val, recv_ty)
@@ -7713,6 +7924,152 @@ fn qbe_try_emit_map_get_match(
 }
 
 ///|
+fn qbe_emit_extern_fn_call(
+  g : QbeGen,
+  einfo : ExternFnInfo,
+  args : Array[Expr],
+) -> QbeVal {
+  let call_args : Array[String] = []
+  let call_abis : Array[String] = []
+  let mut i = 0
+  while i < args.length() {
+    let decl_pty = if i < einfo.param_tys.length() {
+      einfo.param_tys[i]
+    } else {
+      TInt64
+    }
+    let av = qbe_emit_expr(g, args[i], Some(decl_pty))
+    let cabi = qbe_c_abi_ty(decl_pty)
+    let src_abi = qbe_abi_ty(av.ty)
+    let carg = if src_abi == cabi {
+      av.reg
+    } else if cabi == "w" && src_abi == "l" {
+      let w = qbe_tmp(g)
+      qbe_emit(g, w + " =w copy " + av.reg)
+      w
+    } else if cabi == "l" && src_abi == "w" {
+      let l = qbe_tmp(g)
+      qbe_emit(g, l + " =l extsw " + av.reg)
+      l
+    } else {
+      qbe_coerce_val(g, av, decl_pty)
+    }
+    call_args.push(carg)
+    call_abis.push(cabi)
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  let is_unit = match einfo.ret_ty {
+    TUnit => true
+    _ => false
+  }
+  let raw_res = if is_unit { "" } else { qbe_tmp(g) }
+  if !is_unit {
+    sb.write_string(raw_res)
+    sb.write_string(" =")
+    sb.write_string(qbe_c_abi_ty(einfo.ret_ty))
+    sb.write_string(" ")
+  }
+  sb.write_string("call $")
+  sb.write_string(einfo.decl.c_symbol)
+  sb.write_string("(")
+  i = 0
+  while i < call_args.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(call_abis[i])
+    sb.write_string(" ")
+    sb.write_string(call_args[i])
+    i = i + 1
+  }
+  sb.write_string(")")
+  qbe_emit(g, sb.to_string())
+  g.block_immut_fields = Map([])
+  if is_unit {
+    return qval("0", TUnit)
+  }
+  match einfo.ret_ty {
+    TBool => {
+      let rl = qbe_tmp(g)
+      qbe_emit(g, rl + " =l extuw " + raw_res)
+      qval(rl, TBool)
+    }
+    TByte => {
+      let rl = qbe_tmp(g)
+      qbe_emit(g, rl + " =l extub " + raw_res)
+      qval(rl, TByte)
+    }
+    _ => qval(raw_res, einfo.ret_ty)
+  }
+}
+
+///|
+fn qbe_emit_mono_call(
+  g : QbeGen,
+  base_sym : String,
+  finfo : FnInfo,
+  subst : Map[String, Ty],
+  arg_vals : Array[String],
+  arg_tys : Array[Ty],
+  arg_borrowed : Array[Bool],
+) -> QbeVal {
+  let mono_sym = qbe_mono_fn_sym(base_sym, finfo.decl.type_params, subst)
+  if !g.mono_seen.contains(mono_sym) {
+    g.mono_seen.set(mono_sym, true)
+    g.mono_queue.push(QbeMonoReq::{
+      sym: mono_sym,
+      finfo: finfo,
+      subst: subst,
+    })
+  }
+  let call_args : Array[String] = []
+  let call_abis : Array[String] = []
+  let mut j = 0
+  while j < arg_vals.length() {
+    let decl_pty = if j < finfo.param_tys.length() {
+      subst_ty(finfo.param_tys[j], subst)
+    } else {
+      arg_tys[j]
+    }
+    call_args.push(qbe_coerce_val(g, qval(arg_vals[j], arg_tys[j]), decl_pty))
+    call_abis.push(qbe_abi_ty(decl_pty))
+    j = j + 1
+  }
+  let concrete_ret = subst_ty(finfo.ret_ty, subst)
+  let ret_abi = qbe_abi_ty(concrete_ret)
+  let res = qbe_tmp(g)
+  let sb = StringBuilder()
+  sb.write_string(res)
+  sb.write_string(" =")
+  sb.write_string(ret_abi)
+  sb.write_string(" call ")
+  sb.write_string(mono_sym)
+  sb.write_string("(")
+  j = 0
+  while j < call_args.length() {
+    if j > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(call_abis[j])
+    sb.write_string(" ")
+    sb.write_string(call_args[j])
+    j = j + 1
+  }
+  sb.write_string(")")
+  qbe_emit(g, sb.to_string())
+  g.block_immut_fields = Map([])
+  j = 0
+  while j < arg_vals.length() {
+    if !arg_borrowed[j] {
+      qbe_rc_dec(g, arg_vals[j], arg_tys[j])
+    }
+    j = j + 1
+  }
+  qval(res, concrete_ret)
+}
+
+///|
 fn qbe_emit_expr(
   g : QbeGen,
   expr : Expr,
@@ -7994,7 +8351,7 @@ fn qbe_emit_expr(
     }
     EAs(inner, target, _) => {
       let v = qbe_emit_expr(g, inner, None)
-      let rty = resolve_type_expr(g.tc, target, g.cur_tparams)
+      let rty = qbe_resolve_type(g, target)
       match rty {
         TDouble =>
           match v.ty {
@@ -8448,6 +8805,19 @@ fn qbe_emit_expr(
             }
             return qval(r, TString)
           }
+          if name == "ptr_null" {
+            return qval("0", TPtr)
+          }
+          if name == "ptr_is_null" {
+            let pv = qbe_emit_expr(g, args[0], Some(TPtr))
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =l ceql " + pv.reg + ", 0")
+            return qval(r, TBool)
+          }
+          if name == "ptr_addr" {
+            let pv = qbe_emit_expr(g, args[0], Some(TPtr))
+            return qval(pv.reg, TInt64)
+          }
           if name == "math_sqrt" {
             let xv = qbe_emit_expr(g, args[0], Some(TDouble))
             let xd = qbe_coerce_val(g, xv, TDouble)
@@ -8527,6 +8897,17 @@ fn qbe_emit_expr(
                 arg_tys.push(av.ty)
                 arg_borrowed.push(aa.borrowed)
                 i = i + 1
+              }
+              if finfo.decl.type_bounds.length() > 0 {
+                return qbe_emit_mono_call(
+                  g,
+                  qbe_local_fn_sym(g, name),
+                  finfo,
+                  subst,
+                  arg_vals,
+                  arg_tys,
+                  arg_borrowed,
+                )
               }
               // Small-function / leaf-function single-pass inlining (same-file only)
               if g.inline_depth < 2 &&
@@ -8673,6 +9054,10 @@ fn qbe_emit_expr(
               let final_res = qbe_coerce_val(g, qval(res, finfo.ret_ty), concrete_ret)
               return qval(final_res, concrete_ret)
             }
+            None => ()
+          }
+          match g.tc.extern_fns.get(name) {
+            Some(einfo) => return qbe_emit_extern_fn_call(g, einfo, args)
             None => ()
           }
           match qbe_lookup_local(g, name) {
@@ -8836,7 +9221,11 @@ fn qbe_emit_expr(
                       target_finfo = Some(qualify_fn_info(ipkg.name, fi))
                       target_sym = qbe_ext_fn_sym(ipkg.name, mem)
                     }
-                    None => ()
+                    None =>
+                      match ipkg.tc.extern_fns.get(mem) {
+                        Some(ei) => return qbe_emit_extern_fn_call(g, ei, args)
+                        None => ()
+                      }
                   }
                   match target_finfo {
                     None =>
@@ -8902,6 +9291,17 @@ fn qbe_emit_expr(
                 arg_tys.push(av.ty)
                 arg_borrowed.push(aa.borrowed)
                 i = i + 1
+              }
+              if minfo.decl.type_bounds.length() > 0 {
+                return qbe_emit_mono_call(
+                  g,
+                  target_sym,
+                  minfo,
+                  subst,
+                  arg_vals,
+                  arg_tys,
+                  arg_borrowed,
+                )
               }
               let call_args : Array[String] = []
               let call_abis : Array[String] = []
@@ -10219,7 +10619,7 @@ fn qbe_try_emit_borrowed_arr_elem_let(
               }
               let final_ty = match ty_expr {
                 TyMissing(_) => elem
-                _ => resolve_type_expr(g.tc, ty_expr, g.cur_tparams)
+                _ => qbe_resolve_type(g, ty_expr)
               }
               let arr_reg = if g.hoisted_arr_len.contains(aname) &&
                 g.hoisted_arr_dp.contains(aname) {
@@ -11402,7 +11802,7 @@ fn qbe_emit_stmt(
     SLet(name, is_mut, ty_expr, init, _) => {
       let ann_opt : Option[Ty] = match ty_expr {
         TyMissing(_) => None
-        _ => Some(resolve_type_expr(g.tc, ty_expr, g.cur_tparams))
+        _ => Some(qbe_resolve_type(g, ty_expr))
       }
       let iv = qbe_emit_expr(g, init, ann_opt)
       let final_ty = match ann_opt {
@@ -11487,7 +11887,7 @@ fn qbe_emit_stmt(
     SLetTuple(names, ty_expr, init, _) => {
       let ann_opt : Option[Ty] = match ty_expr {
         TyMissing(_) => None
-        _ => Some(resolve_type_expr(g.tc, ty_expr, g.cur_tparams))
+        _ => Some(qbe_resolve_type(g, ty_expr))
       }
       let iv = qbe_emit_expr(g, init, ann_opt)
       let tup_ty = match ann_opt {
@@ -12622,6 +13022,9 @@ fn qbe_emit_bytes_data(sb : StringBuilder, s : String) -> Int {
 
 ///|
 fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
+  if fd.type_bounds.length() > 0 {
+    return ""
+  }
   let finfo_opt = if fd.receiver_type != "" {
     g.tc.methods.get(fd.receiver_type + "::" + fd.name)
   } else {
@@ -12637,6 +13040,7 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       g.loop_conts = []
       g.loop_depths = []
       g.cur_tparams = fd.type_params
+      g.cur_type_subst = Map([])
       g.cur_ret_ty = finfo.ret_ty
       g.cur_ret_abi_ty = finfo.ret_ty
       g.block_term = false
@@ -12721,6 +13125,204 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       out.write_string("}\n\n")
       out.to_string()
     }
+  }
+}
+
+///|
+fn qbe_emit_impl_method(g : QbeGen, id : ImplDecl, md : FnDecl) -> String {
+  let c_trait = canon_trait_name(g.tc, id.trait_name)
+  let c_target = canon_target_type_name(g.tc, id.target_type)
+  let impl_key = c_trait + "::" + c_target
+  match g.tc.impls.get(impl_key) {
+    None => ""
+    Some(iinfo) =>
+      match iinfo.methods.get(md.name) {
+        None => ""
+        Some(finfo) => {
+          g.fn_allocs = StringBuilder()
+          g.fn_body = StringBuilder()
+          g.scopes = []
+          g.loop_breaks = []
+          g.loop_conts = []
+          g.loop_depths = []
+          g.cur_tparams = []
+          g.cur_type_subst = Map([])
+          g.cur_ret_ty = finfo.ret_ty
+          g.cur_ret_abi_ty = finfo.ret_ty
+          g.block_term = false
+          g.hoisted_arr_len = Map([])
+          g.hoisted_arr_dp = Map([])
+          g.hoisted_str_len = Map([])
+          g.hoisted_str_dp = Map([])
+          g.hoisted_fields = Map([])
+          g.block_immut_fields = Map([])
+          g.len_aliases = Map([])
+          g.len_alias_keys = []
+          g.nonneg_vars = Map([])
+          g.bce_safe_indices = Map([])
+          g.bce_safe_exprs = Map([])
+          g.movable_locals = Map([])
+          g.moved_slots = Map([])
+          g.zeroed_slots = Map([])
+          g.sq_reuse_slot = Map([])
+          g.sq_reuse_state = Map([])
+          g.promoted_fields = Map([])
+          g.promoted_field_tys = Map([])
+          g.w_to_l_ext = Map([])
+          g.local_w_to_l_ext = Map([])
+
+          qbe_scope_push(g)
+          let mut pi = 0
+          while pi < md.params.length() && pi < finfo.param_tys.length() {
+            let loc = qbe_define_local(g, md.params[pi].name, finfo.param_tys[pi], false)
+            qbe_store_local_slot(g, "%p" + pi.to_string(), loc.slot, finfo.param_tys[pi])
+            pi = pi + 1
+          }
+          let bres = qbe_emit_stmts(g, md.body, Some(finfo.ret_ty))
+          if !g.block_term {
+            let ret_reg = qbe_coerce_val(g, bres, finfo.ret_ty)
+            qbe_scope_pop(g)
+            qbe_emit_term(g, "ret " + ret_reg)
+          } else {
+            let _ = g.scopes.pop()
+          }
+
+          let out = StringBuilder()
+          let sym = qbe_impl_method_sym(
+            g,
+            iinfo.pkg_name,
+            iinfo.trait_name,
+            iinfo.target_type,
+            md.name,
+          )
+          if g.tc.multi_pkg || g.unit_mode {
+            out.write_string("export ")
+          }
+          out.write_string("function ")
+          out.write_string(qbe_abi_ty(finfo.ret_ty))
+          out.write_string(" ")
+          out.write_string(sym)
+          out.write_string("(")
+          pi = 0
+          while pi < md.params.length() {
+            if pi > 0 {
+              out.write_string(", ")
+            }
+            let p_abi = if pi < finfo.param_tys.length() {
+              qbe_abi_ty(finfo.param_tys[pi])
+            } else {
+              "l"
+            }
+            out.write_string(p_abi)
+            out.write_string(" %p")
+            out.write_string(pi.to_string())
+            pi = pi + 1
+          }
+          out.write_string(") {\n@start\n")
+          out.write_string(g.fn_allocs.to_string())
+          out.write_string(g.fn_body.to_string())
+          out.write_string("}\n\n")
+          out.to_string()
+        }
+      }
+  }
+}
+
+///|
+fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
+  let fd = req.finfo.decl
+  let concrete_ptys : Array[Ty] = []
+  let mut pi = 0
+  while pi < req.finfo.param_tys.length() {
+    concrete_ptys.push(subst_ty(req.finfo.param_tys[pi], req.subst))
+    pi = pi + 1
+  }
+  let concrete_ret = subst_ty(req.finfo.ret_ty, req.subst)
+
+  g.fn_allocs = StringBuilder()
+  g.fn_body = StringBuilder()
+  g.scopes = []
+  g.loop_breaks = []
+  g.loop_conts = []
+  g.loop_depths = []
+  g.cur_tparams = fd.type_params
+  g.cur_type_subst = req.subst
+  g.cur_ret_ty = concrete_ret
+  g.cur_ret_abi_ty = concrete_ret
+  g.block_term = false
+  g.hoisted_arr_len = Map([])
+  g.hoisted_arr_dp = Map([])
+  g.hoisted_str_len = Map([])
+  g.hoisted_str_dp = Map([])
+  g.hoisted_fields = Map([])
+  g.block_immut_fields = Map([])
+  g.len_aliases = Map([])
+  g.len_alias_keys = []
+  g.nonneg_vars = Map([])
+  g.bce_safe_indices = Map([])
+  g.bce_safe_exprs = Map([])
+  g.movable_locals = Map([])
+  g.moved_slots = Map([])
+  g.zeroed_slots = Map([])
+  g.sq_reuse_slot = Map([])
+  g.sq_reuse_state = Map([])
+  g.promoted_fields = Map([])
+  g.promoted_field_tys = Map([])
+  g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
+
+  qbe_scope_push(g)
+  pi = 0
+  while pi < fd.params.length() && pi < concrete_ptys.length() {
+    let loc = qbe_define_local(g, fd.params[pi].name, concrete_ptys[pi], false)
+    qbe_store_local_slot(g, "%p" + pi.to_string(), loc.slot, concrete_ptys[pi])
+    pi = pi + 1
+  }
+  let bres = qbe_emit_stmts(g, fd.body, Some(concrete_ret))
+  if !g.block_term {
+    let ret_reg = qbe_coerce_val(g, bres, concrete_ret)
+    qbe_scope_pop(g)
+    qbe_emit_term(g, "ret " + ret_reg)
+  } else {
+    let _ = g.scopes.pop()
+  }
+  g.cur_type_subst = Map([])
+  g.cur_tparams = []
+
+  let out = StringBuilder()
+  out.write_string("function ")
+  out.write_string(qbe_abi_ty(concrete_ret))
+  out.write_string(" ")
+  out.write_string(req.sym)
+  out.write_string("(")
+  pi = 0
+  while pi < fd.params.length() {
+    if pi > 0 {
+      out.write_string(", ")
+    }
+    let p_abi = if pi < concrete_ptys.length() {
+      qbe_abi_ty(concrete_ptys[pi])
+    } else {
+      "l"
+    }
+    out.write_string(p_abi)
+    out.write_string(" %p")
+    out.write_string(pi.to_string())
+    pi = pi + 1
+  }
+  out.write_string(") {\n@start\n")
+  out.write_string(g.fn_allocs.to_string())
+  out.write_string(g.fn_body.to_string())
+  out.write_string("}\n\n")
+  out.to_string()
+}
+
+///|
+fn qbe_drain_mono_queue(g : QbeGen, out : StringBuilder) -> Unit {
+  while g.mono_emitted < g.mono_queue.length() {
+    let req = g.mono_queue[g.mono_emitted]
+    g.mono_emitted = g.mono_emitted + 1
+    out.write_string(qbe_emit_mono_fn(g, req))
   }
 }
 
@@ -12987,8 +13589,14 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
     enum_names: [],
     variant_to_enum: Map([]),
     fns: Map([]),
+    extern_fns: Map([]),
+    extern_fn_names: [],
     methods: Map([]),
     method_names: [],
+    traits: Map([]),
+    trait_names: [],
+    impls: Map([]),
+    impl_keys: [],
     consts: Map([]),
     const_pub: Map([]),
     import_aliases: Map([]),
@@ -13084,6 +13692,91 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
             tc.fns.set(fd.name, finfo)
           }
         }
+        DExternFn(ed) => {
+          let ptys : Array[Ty] = []
+          let mut pi = 0
+          while pi < ed.params.length() {
+            ptys.push(resolve_type_expr(tc, ed.params[pi].ty, []))
+            pi = pi + 1
+          }
+          let rty = resolve_type_expr(tc, ed.ret_ty, [])
+          tc.extern_fns.set(
+            ed.name,
+            ExternFnInfo::{ decl: ed, param_tys: ptys, ret_ty: rty },
+          )
+        }
+        DTrait(td) => {
+          let tmethods : Array[TraitMethodInfo] = []
+          let self_tp : Array[String] = ["Self"]
+          let mut mi = 0
+          while mi < td.methods.length() {
+            let tm = td.methods[mi]
+            let ptys : Array[Ty] = []
+            let mut pi = 0
+            while pi < tm.params.length() {
+              ptys.push(resolve_type_expr(tc, tm.params[pi].ty, self_tp))
+              pi = pi + 1
+            }
+            let rty = resolve_type_expr(tc, tm.ret_ty, self_tp)
+            tmethods.push(TraitMethodInfo::{
+              name: tm.name,
+              param_tys: ptys,
+              ret_ty: rty,
+              span: tm.span,
+            })
+            mi = mi + 1
+          }
+          if !tc.traits.contains(td.name) {
+            tc.trait_names.push(td.name)
+          }
+          tc.traits.set(td.name, TraitInfo::{ decl: td, methods: tmethods })
+        }
+        DImpl(id) => {
+          let target_ty = resolve_type_expr(
+            tc,
+            TyName(id.target_type, [], id.span),
+            [],
+          )
+          let self_subst : Map[String, Ty] = Map([])
+          self_subst.set("Self", target_ty)
+          let self_tp : Array[String] = ["Self"]
+          let impl_methods : Map[String, FnInfo] = Map([])
+          let impl_mnames : Array[String] = []
+          let mut mi = 0
+          while mi < id.methods.length() {
+            let md = id.methods[mi]
+            let ptys : Array[Ty] = []
+            let mut pi = 0
+            while pi < md.params.length() {
+              let raw_p = resolve_type_expr(tc, md.params[pi].ty, self_tp)
+              ptys.push(subst_ty(raw_p, self_subst))
+              pi = pi + 1
+            }
+            let raw_r = resolve_type_expr(tc, md.ret_ty, self_tp)
+            let rty = subst_ty(raw_r, self_subst)
+            impl_methods.set(
+              md.name,
+              FnInfo::{ decl: md, param_tys: ptys, ret_ty: rty },
+            )
+            impl_mnames.push(md.name)
+            mi = mi + 1
+          }
+          let impl_key = id.trait_name + "::" + id.target_type
+          if !tc.impls.contains(impl_key) {
+            tc.impl_keys.push(impl_key)
+          }
+          tc.impls.set(
+            impl_key,
+            ImplInfo::{
+              decl: id,
+              pkg_name: pkg.name,
+              trait_name: id.trait_name,
+              target_type: id.target_type,
+              methods: impl_methods,
+              method_names: impl_mnames,
+            },
+          )
+        }
         DConst(cd) => {
           let cty = resolve_type_expr(tc, cd.ty, [])
           tc.consts.set(cd.name, cty)
@@ -13125,7 +13818,7 @@ pub fn emit_qbe_package_multi(
             None => ()
           }
         }
-        DFn(_) | DTest(_) => ()
+        DFn(_) | DExternFn(_) | DTrait(_) | DImpl(_) | DTest(_) => ()
       }
       di = di + 1
     }
@@ -13186,12 +13879,20 @@ pub fn emit_qbe_package_multi(
     while di < f.decls.length() {
       match f.decls[di] {
         DFn(fd) => fns_buf.write_string(qbe_emit_fn_decl(g, fd))
+        DImpl(id) => {
+          let mut mi = 0
+          while mi < id.methods.length() {
+            fns_buf.write_string(qbe_emit_impl_method(g, id, id.methods[mi]))
+            mi = mi + 1
+          }
+        }
         _ => ()
       }
       di = di + 1
     }
     fi = fi + 1
   }
+  qbe_drain_mono_queue(g, fns_buf)
 
   let out = StringBuilder()
   out.write_string("# Generated by m2c QBE backend (deterministic)\n\n")
@@ -13478,7 +14179,7 @@ pub fn emit_qbe_unit(
         if fd.receiver_type == "" && fd.name == "main" {
           unit_has_main = true
         }
-      DTest(_) => ()
+      DExternFn(_) | DTrait(_) | DImpl(_) | DTest(_) => ()
     }
     di = di + 1
   }
@@ -13525,10 +14226,18 @@ pub fn emit_qbe_unit(
   while di < f.decls.length() {
     match f.decls[di] {
       DFn(fd) => fns_buf.write_string(qbe_emit_fn_decl(g, fd))
+      DImpl(id) => {
+        let mut mi = 0
+        while mi < id.methods.length() {
+          fns_buf.write_string(qbe_emit_impl_method(g, id, id.methods[mi]))
+          mi = mi + 1
+        }
+      }
       _ => ()
     }
     di = di + 1
   }
+  qbe_drain_mono_queue(g, fns_buf)
 
   let out = StringBuilder()
   out.write_string("# Generated by m2c QBE unit backend (deterministic)\n\n")
@@ -13698,7 +14407,7 @@ pub fn emit_qbe_test_package(
           test_decls.push(td)
           test_names.push(td.name)
         }
-        DFn(_) => ()
+        DFn(_) | DExternFn(_) | DTrait(_) | DImpl(_) => ()
       }
       di = di + 1
     }
@@ -13756,12 +14465,20 @@ pub fn emit_qbe_test_package(
     while di < f.decls.length() {
       match f.decls[di] {
         DFn(fd) => fns_buf.write_string(qbe_emit_fn_decl(g, fd))
+        DImpl(id) => {
+          let mut mi = 0
+          while mi < id.methods.length() {
+            fns_buf.write_string(qbe_emit_impl_method(g, id, id.methods[mi]))
+            mi = mi + 1
+          }
+        }
         _ => ()
       }
       di = di + 1
     }
     fi = fi + 1
   }
+  qbe_drain_mono_queue(g, fns_buf)
 
   let tests_buf = StringBuilder()
   let mut ti = 0
@@ -13809,6 +14526,7 @@ pub fn emit_qbe_test_package(
     tests_buf.write_string("}\n\n")
     ti = ti + 1
   }
+  qbe_drain_mono_queue(g, fns_buf)
 
   let out = StringBuilder()
   out.write_string("# Generated by m2c QBE test runner backend (deterministic)\n\n")

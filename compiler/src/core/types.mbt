@@ -8,6 +8,7 @@ pub enum Ty {
   TChar
   TString
   TUnit
+  TPtr
   TStringBuilder
   TBytes
   TWorld
@@ -39,6 +40,7 @@ pub fn ty_to_string(t : Ty) -> String {
     TChar => "Char"
     TString => "String"
     TUnit => "Unit"
+    TPtr => "Ptr"
     TStringBuilder => "StringBuilder"
     TBytes => "Bytes"
     TWorld => "World"
@@ -136,6 +138,37 @@ pub struct FnInfo {
 }
 
 ///|
+pub struct ExternFnInfo {
+  decl : ExternFnDecl
+  param_tys : Array[Ty]
+  ret_ty : Ty
+}
+
+///|
+pub struct TraitMethodInfo {
+  name : String
+  param_tys : Array[Ty]
+  ret_ty : Ty
+  span : Span
+}
+
+///|
+pub struct TraitInfo {
+  decl : TraitDecl
+  methods : Array[TraitMethodInfo]
+}
+
+///|
+pub struct ImplInfo {
+  decl : ImplDecl
+  pkg_name : String
+  trait_name : String
+  target_type : String
+  methods : Map[String, FnInfo]
+  method_names : Array[String]
+}
+
+///|
 pub struct VarBinding {
   name : String
   ty : Ty
@@ -149,6 +182,7 @@ pub struct Env {
   mut has_world : Bool
   ret_ty : Ty
   type_params : Array[String]
+  type_bounds : Map[String, Array[String]]
 }
 
 ///|
@@ -172,8 +206,14 @@ pub struct TypeChecker {
   enum_names : Array[String]
   variant_to_enum : Map[String, String]
   fns : Map[String, FnInfo]
+  extern_fns : Map[String, ExternFnInfo]
+  extern_fn_names : Array[String]
   methods : Map[String, FnInfo]
   method_names : Array[String]
+  traits : Map[String, TraitInfo]
+  trait_names : Array[String]
+  impls : Map[String, ImplInfo]
+  impl_keys : Array[String]
   consts : Map[String, Ty]
   const_pub : Map[String, Bool]
   import_aliases : Map[String, String]
@@ -208,6 +248,7 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     has_world: false,
     ret_ty: ret_ty,
     type_params: type_params,
+    type_bounds: Map([]),
   }
 }
 
@@ -454,6 +495,60 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
     }
     i = i + 1
   }
+  let tkeys = ipkg.tc.trait_names
+  i = 0
+  while i < tkeys.length() {
+    let k = tkeys[i]
+    match ipkg.tc.traits.get(k) {
+      Some(ti) =>
+        if has_qual_sep(k) {
+          if !tc.traits.contains(k) {
+            tc.traits.set(k, ti)
+            tc.trait_names.push(k)
+          }
+        } else if ti.decl.is_pub {
+          let qms : Array[TraitMethodInfo] = []
+          let mut mi = 0
+          while mi < ti.methods.length() {
+            let m = ti.methods[mi]
+            let qptys : Array[Ty] = []
+            let mut j = 0
+            while j < m.param_tys.length() {
+              qptys.push(qualify_imported_ty(ipkg.name, m.param_tys[j]))
+              j = j + 1
+            }
+            qms.push(TraitMethodInfo::{
+              name: m.name,
+              param_tys: qptys,
+              ret_ty: qualify_imported_ty(ipkg.name, m.ret_ty),
+              span: m.span,
+            })
+            mi = mi + 1
+          }
+          let qk = ipkg.name + "::" + k
+          if !tc.traits.contains(qk) {
+            tc.trait_names.push(qk)
+          }
+          tc.traits.set(qk, TraitInfo::{ decl: ti.decl, methods: qms })
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  let ikeys = ipkg.tc.impl_keys
+  i = 0
+  while i < ikeys.length() {
+    let k = ikeys[i]
+    match ipkg.tc.impls.get(k) {
+      Some(ii) =>
+        if !tc.impls.contains(k) {
+          tc.impls.set(k, ii)
+          tc.impl_keys.push(k)
+        }
+      None => ()
+    }
+    i = i + 1
+  }
 }
 
 ///|
@@ -552,6 +647,9 @@ fn resolve_type_expr(
       }
       if name == "Unit" {
         return TUnit
+      }
+      if name == "Ptr" {
+        return TPtr
       }
       if name == "StringBuilder" {
         return TStringBuilder
@@ -861,6 +959,11 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
         TUnit => true
         _ => false
       }
+    TPtr =>
+      match found {
+        TPtr => true
+        _ => false
+      }
     TStringBuilder =>
       match found {
         TStringBuilder => true
@@ -998,7 +1101,7 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
   match t {
     TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TUnit => true
     TAtomicInt | TScope | TNever | TError => true
-    TArray(_) | TBytes | TMap(_, _) | TStringBuilder | TWorld => false
+    TPtr | TArray(_) | TBytes | TMap(_, _) | TStringBuilder | TWorld => false
     TParam(_) => false
     TOption(e) => is_send_ty(tc, e, visiting)
     TResult(ok, err) =>
@@ -2160,6 +2263,192 @@ fn check_variant_ctor(
 }
 
 ///|
+pub fn ty_base_name(t : Ty) -> String {
+  match t {
+    TInt => "Int"
+    TInt64 => "Int64"
+    TDouble => "Double"
+    TBool => "Bool"
+    TByte => "Byte"
+    TChar => "Char"
+    TString => "String"
+    TUnit => "Unit"
+    TPtr => "Ptr"
+    TStringBuilder => "StringBuilder"
+    TBytes => "Bytes"
+    TWorld => "World"
+    TScope => "Scope"
+    TAtomicInt => "AtomicInt"
+    TArray(_) => "Array"
+    TOption(_) => "Option"
+    TResult(_, _) => "Result"
+    TMap(_, _) => "Map"
+    TChannel(_) => "Channel"
+    TMutex(_) => "Mutex"
+    TStruct(name, _) => name
+    TEnum(name, _) => name
+    _ => ty_to_string(t)
+  }
+}
+
+///|
+fn is_c_abi_param_ty(t : Ty) -> Bool {
+  match t {
+    TInt | TInt64 | TDouble | TBool | TByte | TPtr | TError => true
+    _ => false
+  }
+}
+
+///|
+fn is_c_abi_ret_ty(t : Ty) -> Bool {
+  match t {
+    TInt | TInt64 | TDouble | TBool | TByte | TPtr | TUnit | TError => true
+    _ => false
+  }
+}
+
+///|
+fn canon_trait_name(tc : TypeChecker, name : String) -> String {
+  if tc.traits.contains(name) {
+    return name
+  }
+  let qp = split_qual_name(name)
+  if qp.prefix.length() > 0 {
+    match resolve_alias_pkg(tc, qp.prefix) {
+      Some(ipkg) => return ipkg.name + "::" + qp.name
+      None => ()
+    }
+  }
+  name
+}
+
+///|
+fn lookup_trait(tc : TypeChecker, name : String) -> Option[TraitInfo] {
+  let cname = canon_trait_name(tc, name)
+  tc.traits.get(cname)
+}
+
+///|
+fn canon_target_type_name(tc : TypeChecker, name : String) -> String {
+  let qp = split_qual_name(name)
+  if qp.prefix.length() > 0 {
+    match resolve_alias_pkg(tc, qp.prefix) {
+      Some(ipkg) => return ipkg.name + "::" + qp.name
+      None => ()
+    }
+  }
+  name
+}
+
+///|
+fn format_method_sig_types(
+  name : String,
+  ptys : Array[Ty],
+  rty : Ty,
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string("fn ")
+  sb.write_string(name)
+  sb.write_string("(")
+  let mut i = 0
+  while i < ptys.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(ty_to_string(ptys[i]))
+    i = i + 1
+  }
+  sb.write_string(") -> ")
+  sb.write_string(ty_to_string(rty))
+  sb.to_string()
+}
+
+///|
+fn find_impl_method(
+  tc : TypeChecker,
+  recv_ty : Ty,
+  method_name : String,
+) -> Option[FnInfo] {
+  let tname = ty_base_name(recv_ty)
+  let mut i = 0
+  while i < tc.impl_keys.length() {
+    let k = tc.impl_keys[i]
+    match tc.impls.get(k) {
+      Some(ii) =>
+        if ii.target_type == tname {
+          match ii.methods.get(method_name) {
+            Some(fi) => return Some(fi)
+            None => ()
+          }
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+fn check_extern_fn_call(
+  tc : TypeChecker,
+  env : Env,
+  einfo : ExternFnInfo,
+  args : Array[Expr],
+  sp : Span,
+) -> Ty {
+  if args.length() != einfo.param_tys.length() {
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "extern function `" +
+      einfo.decl.name +
+      "` expects " +
+      einfo.param_tys.length().to_string() +
+      " argument(s), found " +
+      args.length().to_string(),
+      einfo.param_tys.length().to_string() + " args",
+      args.length().to_string() + " args",
+      "pass " + einfo.param_tys.length().to_string() + " argument(s)",
+    )
+  }
+  let mut i = 0
+  while i < args.length() {
+    let exp_p : Option[Ty] = if i < einfo.param_tys.length() {
+      Some(einfo.param_tys[i])
+    } else {
+      None
+    }
+    let aty = check_expr(tc, env, args[i], exp_p)
+    if i < einfo.param_tys.length() && !ty_compat(einfo.param_tys[i], aty) {
+      let fix = match einfo.param_tys[i] {
+        TPtr =>
+          match aty {
+            TString => "pass `s.as_cstr()` to convert `String` to `Ptr`"
+            _ => "pass a value of type `Ptr`"
+          }
+        _ => "pass a value of type `" + ty_to_string(einfo.param_tys[i]) + "`"
+      }
+      tc_err(
+        tc,
+        expr_span(args[i]),
+        "E_TYPE_MISMATCH",
+        "argument " +
+        (i + 1).to_string() +
+        " type mismatch in call to extern function `" +
+        einfo.decl.name +
+        "`",
+        ty_to_string(einfo.param_tys[i]),
+        ty_to_string(aty),
+        fix,
+      )
+    }
+    i = i + 1
+  }
+  einfo.ret_ty
+}
+
+///|
 fn check_fn_call(
   tc : TypeChecker,
   env : Env,
@@ -2213,6 +2502,73 @@ fn check_fn_call(
       }
     }
     i = i + 1
+  }
+  // Validate trait bounds on generic type parameters
+  let mut bi = 0
+  while bi < finfo.decl.type_bounds.length() {
+    let tb = finfo.decl.type_bounds[bi]
+    match subst.get(tb.param) {
+      Some(concrete_ty) =>
+        match concrete_ty {
+          TError | TNever => ()
+          TParam(other_tp) => {
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let has_bound = match env.type_bounds.get(other_tp) {
+                Some(btrs) => str_arr_contains(btrs, req_tr)
+                None => false
+              }
+              if !has_bound {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TRAIT_NOT_IMPLEMENTED",
+                  "type parameter `" +
+                  other_tp +
+                  "` does not satisfy trait bound `" +
+                  req_tr +
+                  "` required by `" +
+                  finfo.decl.name +
+                  "`",
+                  other_tp + " : " + req_tr,
+                  other_tp,
+                  "add `: " + req_tr + "` bound to type parameter `" + other_tp + "`",
+                )
+              }
+              ti = ti + 1
+            }
+          }
+          _ => {
+            let tname = ty_base_name(concrete_ty)
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let impl_key = req_tr + "::" + tname
+              if !tc.impls.contains(impl_key) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TRAIT_NOT_IMPLEMENTED",
+                  "type `" +
+                  ty_to_string(concrete_ty) +
+                  "` does not implement trait `" +
+                  req_tr +
+                  "` required by `" +
+                  finfo.decl.name +
+                  "`",
+                  "impl " + req_tr + " for " + ty_to_string(concrete_ty),
+                  ty_to_string(concrete_ty),
+                  "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
+                )
+              }
+              ti = ti + 1
+            }
+          }
+        }
+      None => ()
+    }
+    bi = bi + 1
   }
   subst_ty(finfo.ret_ty, subst)
 }
@@ -2400,6 +2756,9 @@ fn check_method_call(
       }
       if method_name == "to_bytes" {
         return TBytes
+      }
+      if method_name == "as_cstr" {
+        return TPtr
       }
     }
     TStringBuilder => {
@@ -2776,7 +3135,90 @@ fn check_method_call(
         }
       }
     }
+    TParam(tp_name) => {
+      match env.type_bounds.get(tp_name) {
+        Some(bound_traits) => {
+          let self_subst : Map[String, Ty] = Map([])
+          self_subst.set("Self", TParam(tp_name))
+          let mut bi = 0
+          while bi < bound_traits.length() {
+            match lookup_trait(tc, bound_traits[bi]) {
+              Some(tinfo) => {
+                let mut mi = 0
+                while mi < tinfo.methods.length() {
+                  let tm = tinfo.methods[mi]
+                  if tm.name == method_name {
+                    let mut ai = 0
+                    while ai < args.length() {
+                      let p_idx = ai + 1
+                      let exp_p : Option[Ty] = if p_idx < tm.param_tys.length() {
+                        Some(subst_ty(tm.param_tys[p_idx], self_subst))
+                      } else {
+                        None
+                      }
+                      let aty = check_expr(tc, env, args[ai], exp_p)
+                      if p_idx < tm.param_tys.length() {
+                        let pty = subst_ty(tm.param_tys[p_idx], self_subst)
+                        if !ty_compat(pty, aty) {
+                          tc_err(
+                            tc,
+                            expr_span(args[ai]),
+                            "E_TYPE_MISMATCH",
+                            "argument type mismatch in trait method `" +
+                            bound_traits[bi] +
+                            "::" +
+                            method_name +
+                            "`",
+                            ty_to_string(pty),
+                            ty_to_string(aty),
+                            "pass a value of type `" + ty_to_string(pty) + "`",
+                          )
+                        }
+                      }
+                      ai = ai + 1
+                    }
+                    return subst_ty(tm.ret_ty, self_subst)
+                  }
+                  mi = mi + 1
+                }
+              }
+              None => ()
+            }
+            bi = bi + 1
+          }
+        }
+        None => ()
+      }
+    }
     _ => ()
+  }
+  match find_impl_method(tc, recv_ty, method_name) {
+    Some(minfo) => {
+      let mut i = 0
+      while i < args.length() {
+        let p_idx = i + 1
+        let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
+          Some(minfo.param_tys[p_idx])
+        } else {
+          None
+        }
+        let aty = check_expr(tc, env, args[i], exp_p)
+        if p_idx < minfo.param_tys.length() && !ty_compat(minfo.param_tys[p_idx], aty) {
+          tc_err(
+            tc,
+            expr_span(args[i]),
+            "E_TYPE_MISMATCH",
+            "argument type mismatch in trait method `" + method_name + "`",
+            ty_to_string(minfo.param_tys[p_idx]),
+            ty_to_string(aty),
+            "pass a value of type `" + ty_to_string(minfo.param_tys[p_idx]) + "`",
+          )
+        }
+        i = i + 1
+      }
+      return minfo.ret_ty
+    }
+    None => ()
   }
   tc_err(
     tc,
@@ -2828,6 +3270,10 @@ fn check_expr(
       }
       match tc.fns.get(name) {
         Some(finfo) => return TFn(finfo.param_tys, finfo.ret_ty)
+        None => ()
+      }
+      match tc.extern_fns.get(name) {
+        Some(einfo) => return TFn(einfo.param_tys, einfo.ret_ty)
         None => ()
       }
       if name == "None" {
@@ -3087,6 +3533,54 @@ fn check_expr(
             }
             return TString
           }
+          if name == "ptr_null" {
+            if args.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "`ptr_null` takes 0 arguments",
+                "0 args",
+                args.length().to_string() + " args",
+                "call `ptr_null()` with no arguments",
+              )
+            }
+            return TPtr
+          }
+          if name == "ptr_is_null" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TPtr))
+              if !ty_compat(TPtr, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`ptr_is_null` expects `Ptr`",
+                  "Ptr",
+                  ty_to_string(aty),
+                  "pass a `Ptr` value",
+                )
+              }
+            }
+            return TBool
+          }
+          if name == "ptr_addr" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TPtr))
+              if !ty_compat(TPtr, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`ptr_addr` expects `Ptr`",
+                  "Ptr",
+                  ty_to_string(aty),
+                  "pass a `Ptr` value",
+                )
+              }
+            }
+            return TInt64
+          }
           if name == "math_sqrt" ||
             name == "math_abs" ||
             name == "math_floor" ||
@@ -3153,6 +3647,10 @@ fn check_expr(
           }
           match tc.fns.get(name) {
             Some(finfo) => return check_fn_call(tc, env, finfo, args, expected, sp)
+            None => ()
+          }
+          match tc.extern_fns.get(name) {
+            Some(einfo) => return check_extern_fn_call(tc, env, einfo, args, sp)
             None => ()
           }
           match env_lookup(env, name) {
@@ -3347,6 +3845,15 @@ fn check_expr(
                     expected,
                     sp,
                   )
+                }
+                None => ()
+              }
+              match ipkg.tc.extern_fns.get(mem) {
+                Some(ei) => {
+                  if !ei.decl.is_pub {
+                    emit_private_err(tc, sp, "extern fn", ipkg.name, mem)
+                  }
+                  return check_extern_fn_call(tc, env, ei, args, sp)
                 }
                 None => ()
               }
@@ -4031,8 +4538,14 @@ pub fn check_package_with_imports(
     enum_names: [],
     variant_to_enum: Map([]),
     fns: Map([]),
+    extern_fns: Map([]),
+    extern_fn_names: [],
     methods: Map([]),
     method_names: [],
+    traits: Map([]),
+    trait_names: [],
+    impls: Map([]),
+    impl_keys: [],
     consts: Map([]),
     const_pub: Map([]),
     import_aliases: Map([]),
@@ -4102,6 +4615,12 @@ pub fn check_package_with_imports(
             tc.variant_to_enum.set(ed.variants[vi].name, ed.name)
             vi = vi + 1
           }
+        }
+        DTrait(td) => {
+          if !tc.traits.contains(td.name) {
+            tc.trait_names.push(td.name)
+          }
+          tc.traits.set(td.name, TraitInfo::{ decl: td, methods: [] })
         }
         _ => ()
       }
@@ -4193,6 +4712,29 @@ pub fn check_package_with_imports(
             _ => resolve_type_expr(tc, fd.ret_ty, fd.type_params)
           }
           let finfo = FnInfo::{ decl: fd, param_tys: ptys, ret_ty: rty }
+          let mut bi = 0
+          while bi < fd.type_bounds.length() {
+            let tb = fd.type_bounds[bi]
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let tr_name = tb.traits[ti]
+              match lookup_trait(tc, tr_name) {
+                Some(_) => ()
+                None =>
+                  tc_err(
+                    tc,
+                    fd.span,
+                    "E_UNKNOWN_TRAIT",
+                    "unknown trait `" + tr_name + "` in generic bound of `" + fd.name + "`",
+                    "defined trait",
+                    tr_name,
+                    "declare `trait " + tr_name + " { ... }` before using it as a bound",
+                  )
+              }
+              ti = ti + 1
+            }
+            bi = bi + 1
+          }
           if fd.receiver_type != "" {
             let mk = fd.receiver_type + "::" + fd.name
             if !tc.methods.contains(mk) {
@@ -4203,6 +4745,108 @@ pub fn check_package_with_imports(
             tc.fns.set(fd.name, finfo)
           }
         }
+        DExternFn(ed) => {
+          let ptys : Array[Ty] = []
+          let mut pi = 0
+          while pi < ed.params.length() {
+            let param = ed.params[pi]
+            let pty = match param.ty {
+              TyMissing(psp) => {
+                tc_err(
+                  tc,
+                  psp,
+                  "E_MISSING_TYPE",
+                  "missing explicit type annotation on extern parameter `" + param.name + "` of `" + ed.name + "`",
+                  "explicit C-ABI parameter type",
+                  "missing",
+                  "add `: Type` to parameter `" + param.name + "`",
+                )
+                TError
+              }
+              _ => resolve_type_expr(tc, param.ty, [])
+            }
+            if !is_c_abi_param_ty(pty) {
+              let fix = match pty {
+                TString =>
+                  "change parameter `" + param.name + "` to `Ptr` and pass `s.as_cstr()` at call sites"
+                _ =>
+                  "use a C-ABI safe type (`Int`, `Int64`, `Double`, `Bool`, `Byte`, or `Ptr`)"
+              }
+              tc_err(
+                tc,
+                param.span,
+                "E_TYPE_MISMATCH",
+                "extern \"C\" parameter `" + param.name + "` has non-C-ABI type `" + ty_to_string(pty) + "`",
+                "Int, Int64, Double, Bool, Byte, or Ptr",
+                ty_to_string(pty),
+                fix,
+              )
+            }
+            ptys.push(pty)
+            pi = pi + 1
+          }
+          let rty = match ed.ret_ty {
+            TyMissing(rsp) => {
+              tc_err(
+                tc,
+                rsp,
+                "E_MISSING_TYPE",
+                "missing explicit return type on extern function `" + ed.name + "`",
+                "explicit C-ABI return type `-> Type`",
+                "missing",
+                "add `-> ReturnType` to `" + ed.name + "`",
+              )
+              TError
+            }
+            _ => resolve_type_expr(tc, ed.ret_ty, [])
+          }
+          if !is_c_abi_ret_ty(rty) {
+            let fix = match rty {
+              TString => "return `Ptr` from `extern \"C\" fn` instead of managed `String`"
+              _ => "use a C-ABI safe return type (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Ptr`, or `Unit`)"
+            }
+            tc_err(
+              tc,
+              ed.span,
+              "E_TYPE_MISMATCH",
+              "extern \"C\" function `" + ed.name + "` has non-C-ABI return type `" + ty_to_string(rty) + "`",
+              "Int, Int64, Double, Bool, Byte, Ptr, or Unit",
+              ty_to_string(rty),
+              fix,
+            )
+          }
+          if !tc.extern_fns.contains(ed.name) {
+            tc.extern_fn_names.push(ed.name)
+          }
+          tc.extern_fns.set(
+            ed.name,
+            ExternFnInfo::{ decl: ed, param_tys: ptys, ret_ty: rty },
+          )
+        }
+        DTrait(td) => {
+          let tmethods : Array[TraitMethodInfo] = []
+          let self_tp : Array[String] = ["Self"]
+          let mut mi = 0
+          while mi < td.methods.length() {
+            let tm = td.methods[mi]
+            let ptys : Array[Ty] = []
+            let mut pi = 0
+            while pi < tm.params.length() {
+              ptys.push(resolve_type_expr(tc, tm.params[pi].ty, self_tp))
+              pi = pi + 1
+            }
+            let rty = resolve_type_expr(tc, tm.ret_ty, self_tp)
+            tmethods.push(TraitMethodInfo::{
+              name: tm.name,
+              param_tys: ptys,
+              ret_ty: rty,
+              span: tm.span,
+            })
+            mi = mi + 1
+          }
+          tc.traits.set(td.name, TraitInfo::{ decl: td, methods: tmethods })
+        }
+        DImpl(_) => ()
         DConst(cd) => {
           let cty = match cd.ty {
             TyMissing(csp) => {
@@ -4223,6 +4867,149 @@ pub fn check_package_with_imports(
           tc.const_pub.set(cd.name, cd.is_pub)
         }
         DTest(_) => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+
+  // Pass 2.2: resolve and validate `impl Trait for Type` declarations
+  fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DImpl(id) => {
+          let c_trait = canon_trait_name(tc, id.trait_name)
+          let c_target = canon_target_type_name(tc, id.target_type)
+          let target_ty = resolve_type_expr(
+            tc,
+            TyName(id.target_type, [], id.span),
+            [],
+          )
+          let self_subst : Map[String, Ty] = Map([])
+          self_subst.set("Self", target_ty)
+          let self_tp : Array[String] = ["Self"]
+          let impl_methods : Map[String, FnInfo] = Map([])
+          let impl_mnames : Array[String] = []
+          let mut mi = 0
+          while mi < id.methods.length() {
+            let md = id.methods[mi]
+            let ptys : Array[Ty] = []
+            let mut pi = 0
+            while pi < md.params.length() {
+              let raw_p = resolve_type_expr(tc, md.params[pi].ty, self_tp)
+              ptys.push(subst_ty(raw_p, self_subst))
+              pi = pi + 1
+            }
+            let raw_r = resolve_type_expr(tc, md.ret_ty, self_tp)
+            let rty = subst_ty(raw_r, self_subst)
+            let finfo = FnInfo::{ decl: md, param_tys: ptys, ret_ty: rty }
+            if !impl_methods.contains(md.name) {
+              impl_mnames.push(md.name)
+            }
+            impl_methods.set(md.name, finfo)
+            mi = mi + 1
+          }
+          let impl_key = c_trait + "::" + c_target
+          if !tc.impls.contains(impl_key) {
+            tc.impl_keys.push(impl_key)
+          }
+          tc.impls.set(
+            impl_key,
+            ImplInfo::{
+              decl: id,
+              pkg_name: pkg.name,
+              trait_name: c_trait,
+              target_type: c_target,
+              methods: impl_methods,
+              method_names: impl_mnames,
+            },
+          )
+          match lookup_trait(tc, id.trait_name) {
+            None =>
+              tc_err(
+                tc,
+                id.span,
+                "E_UNKNOWN_TRAIT",
+                "unknown trait `" + id.trait_name + "` in `impl`",
+                "defined trait",
+                id.trait_name,
+                "declare `trait " + id.trait_name + " { ... }` or check its spelling",
+              )
+            Some(tinfo) => {
+              let mut tmi = 0
+              while tmi < tinfo.methods.length() {
+                let tm = tinfo.methods[tmi]
+                let exp_ptys : Array[Ty] = []
+                let mut j = 0
+                while j < tm.param_tys.length() {
+                  exp_ptys.push(subst_ty(tm.param_tys[j], self_subst))
+                  j = j + 1
+                }
+                let exp_rty = subst_ty(tm.ret_ty, self_subst)
+                let exp_sig = format_method_sig_types(tm.name, exp_ptys, exp_rty)
+                match impl_methods.get(tm.name) {
+                  None =>
+                    tc_err(
+                      tc,
+                      id.span,
+                      "E_TRAIT_METHOD_MISSING",
+                      "`impl " +
+                      id.trait_name +
+                      " for " +
+                      id.target_type +
+                      "` is missing required method `" +
+                      tm.name +
+                      "`",
+                      exp_sig,
+                      "missing `" + tm.name + "`",
+                      "add `" + exp_sig + " { ... }` to `impl " + id.trait_name + " for " + id.target_type + "`",
+                    )
+                  Some(impl_fi) => {
+                    let mut sig_ok = impl_fi.param_tys.length() == exp_ptys.length() &&
+                      ty_compat(exp_rty, impl_fi.ret_ty)
+                    if sig_ok {
+                      let mut k = 0
+                      while k < exp_ptys.length() {
+                        if !ty_compat(exp_ptys[k], impl_fi.param_tys[k]) {
+                          sig_ok = false
+                          break
+                        }
+                        k = k + 1
+                      }
+                    }
+                    if !sig_ok {
+                      let act_sig = format_method_sig_types(
+                        tm.name,
+                        impl_fi.param_tys,
+                        impl_fi.ret_ty,
+                      )
+                      tc_err(
+                        tc,
+                        impl_fi.decl.span,
+                        "E_TRAIT_METHOD_SIGNATURE",
+                        "method `" +
+                        tm.name +
+                        "` in `impl " +
+                        id.trait_name +
+                        " for " +
+                        id.target_type +
+                        "` does not match trait signature",
+                        exp_sig,
+                        act_sig,
+                        "change signature to `" + exp_sig + "`",
+                      )
+                    }
+                  }
+                }
+                tmi = tmi + 1
+              }
+            }
+          }
+        }
+        _ => ()
       }
       di = di + 1
     }
@@ -4297,6 +5084,18 @@ pub fn check_package_with_imports(
           match finfo_opt {
             Some(finfo) => {
               let env = env_new(finfo.ret_ty, fd.type_params)
+              let mut bi = 0
+              while bi < fd.type_bounds.length() {
+                let tb = fd.type_bounds[bi]
+                let ctrs : Array[String] = []
+                let mut ti = 0
+                while ti < tb.traits.length() {
+                  ctrs.push(canon_trait_name(tc, tb.traits[ti]))
+                  ti = ti + 1
+                }
+                env.type_bounds.set(tb.param, ctrs)
+                bi = bi + 1
+              }
               let mut pi = 0
               while pi < fd.params.length() && pi < finfo.param_tys.length() {
                 env_define(env, fd.params[pi].name, finfo.param_tys[pi], false)
@@ -4313,6 +5112,48 @@ pub fn check_package_with_imports(
                   ty_to_string(body_ty),
                   "return a value of type `" + ty_to_string(finfo.ret_ty) + "`",
                 )
+              }
+            }
+            None => ()
+          }
+        }
+        DImpl(id) => {
+          let impl_key = canon_trait_name(tc, id.trait_name) +
+            "::" +
+            canon_target_type_name(tc, id.target_type)
+          match tc.impls.get(impl_key) {
+            Some(iinfo) => {
+              let mut mi = 0
+              while mi < id.methods.length() {
+                let md = id.methods[mi]
+                match iinfo.methods.get(md.name) {
+                  Some(finfo) => {
+                    let env = env_new(finfo.ret_ty, [])
+                    let mut pi = 0
+                    while pi < md.params.length() && pi < finfo.param_tys.length() {
+                      env_define(env, md.params[pi].name, finfo.param_tys[pi], false)
+                      pi = pi + 1
+                    }
+                    let body_ty = check_stmts(tc, env, md.body, Some(finfo.ret_ty))
+                    if !ty_compat(finfo.ret_ty, body_ty) {
+                      tc_err(
+                        tc,
+                        md.span,
+                        "E_TYPE_MISMATCH",
+                        "impl method `" +
+                        id.trait_name +
+                        "::" +
+                        md.name +
+                        "` body type does not match declared return type",
+                        ty_to_string(finfo.ret_ty),
+                        ty_to_string(body_ty),
+                        "return a value of type `" + ty_to_string(finfo.ret_ty) + "`",
+                      )
+                    }
+                  }
+                  None => ()
+                }
+                mi = mi + 1
               }
             }
             None => ()
