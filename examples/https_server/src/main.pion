@@ -1,0 +1,534 @@
+///| pion-https: an HTTPS/1.1 + JSON service on `std/tls` (system OpenSSL through
+///| `extern "C"`, zero C glue), and its own end-to-end check.
+///|
+///|   https_server --cert <chain.pem> --key <key.pem> [--port <p>] [--port-file <path>] [--max-conns <n>]
+///|   https_server --self-test --cert <chain.pem> --key <key.pem> [--expect-proto TLSv1.3]
+///|   https_server --check-config --cert <chain.pem> --key <key.pem>
+///|
+///| Routes: `GET /health`, `POST /echo` (the JSON body parsed and serialized
+///| back), `GET /stats` (`AtomicInt` counters), `POST /quit` (answers, then the
+///| server stops accepting and exits). Every connection carries one request
+///| (`Connection: close`).
+///|
+///| Server mode listens on 127.0.0.1:<p> (0 = ephemeral; the real port goes to
+///| --port-file, which may be a FIFO the caller reads), serves until `/quit` or
+///| <n> connections, and prints the final `/stats` JSON.
+///|
+///| `--self-test` runs the server on a background thread (its port comes back
+///| over a `Channel`, no sleeps) and drives it with four concurrent client
+///| threads through `tls::https_request(..., verify_cert = true)`; the client
+///| trusts the certificate through `SSL_CERT_FILE`, which must name a `localhost`
+///| certificate. `--check-config` only loads the certificate and key.
+
+import "tls"
+import "http"
+import "json"
+
+pub struct Options {
+  mode : String
+  cert : String
+  key : String
+  port : Int
+  port_file : String
+  max_conns : Int
+  expect_proto : String
+}
+
+fn parse_int(s : String) -> Option[Int] {
+  if s.length() == 0 || s.length() > 9 {
+    return None
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  Some(v)
+}
+
+fn parse_options(args : Array[String]) -> Result[Options, String] {
+  let mut mode = "serve"
+  let mut cert = ""
+  let mut key = ""
+  let mut port = 0
+  let mut port_file = ""
+  let mut max_conns = 0
+  let mut expect_proto = "TLSv1.3"
+  let mut i = 1
+  while i < args.length() {
+    let a = args[i]
+    if a == "--self-test" {
+      mode = "self-test"
+      i = i + 1
+      continue
+    }
+    if a == "--check-config" {
+      mode = "check-config"
+      i = i + 1
+      continue
+    }
+    if i + 1 >= args.length() {
+      return Err("missing value for " + a)
+    }
+    let v = args[i + 1]
+    if a == "--cert" {
+      cert = v
+    } else if a == "--key" {
+      key = v
+    } else if a == "--port-file" {
+      port_file = v
+    } else if a == "--expect-proto" {
+      expect_proto = v
+    } else if a == "--port" || a == "--max-conns" {
+      let n = match parse_int(v) {
+        Some(n) => n
+        None => return Err("invalid number for " + a + ": " + v)
+      }
+      if a == "--port" {
+        port = n
+      } else {
+        max_conns = n
+      }
+    } else {
+      return Err("unknown option " + a)
+    }
+    i = i + 2
+  }
+  if cert.length() == 0 || key.length() == 0 {
+    return Err("need --cert <chain.pem> and --key <key.pem>")
+  }
+  if port > 65535 {
+    return Err("need --port 0..65535")
+  }
+  Ok(Options::{
+    mode: mode,
+    cert: cert,
+    key: key,
+    port: port,
+    port_file: port_file,
+    max_conns: max_conns,
+    expect_proto: expect_proto,
+  })
+}
+
+// ---------------------------------------------------------------------------
+// Service: counters and the pure router.
+
+/// Counters shared by the accept thread and whoever reads them (all `Send`).
+pub struct Service {
+  total : AtomicInt
+  health : AtomicInt
+  echo : AtomicInt
+  stats : AtomicInt
+  bad : AtomicInt
+  handshake_failures : AtomicInt
+}
+
+pub fn new_service() -> Service {
+  Service::{
+    total: AtomicInt::new(0),
+    health: AtomicInt::new(0),
+    echo: AtomicInt::new(0),
+    stats: AtomicInt::new(0),
+    bad: AtomicInt::new(0),
+    handshake_failures: AtomicInt::new(0),
+  }
+}
+
+pub fn stats_json(svc : Service) -> String {
+  json::stringify(json::JObj([
+    json::field("total", json::JInt(svc.total.load().to_int64())),
+    json::field("health", json::JInt(svc.health.load().to_int64())),
+    json::field("echo", json::JInt(svc.echo.load().to_int64())),
+    json::field("stats", json::JInt(svc.stats.load().to_int64())),
+    json::field("bad", json::JInt(svc.bad.load().to_int64())),
+    json::field("handshake_failures", json::JInt(svc.handshake_failures.load().to_int64())),
+  ]))
+}
+
+/// One answer: status, JSON body, and whether the server stops after it.
+pub struct Reply {
+  status : Int
+  body : String
+  quit : Bool
+}
+
+fn reply(status : Int, body : String) -> Reply {
+  Reply::{ status: status, body: body, quit: false }
+}
+
+fn error_reply(svc : Service, status : Int, msg : String) -> Reply {
+  let _ = svc.bad.fetch_add(1)
+  reply(status, json::stringify(json::JObj([json::field("error", json::JStr(msg))])))
+}
+
+/// Routes one request. `protocol` and `sni` describe the TLS session it came on.
+pub fn handle(
+  svc : Service,
+  method : String,
+  path : String,
+  body : String,
+  protocol : String,
+  sni : String,
+) -> Reply {
+  let _ = svc.total.fetch_add(1)
+  if path == "/health" {
+    if method != "GET" {
+      return error_reply(svc, 405, "use GET")
+    }
+    let _ = svc.health.fetch_add(1)
+    return reply(
+      200,
+      json::stringify(json::JObj([
+        json::field("ok", json::JBool(true)),
+        json::field("service", json::JStr("pion-https")),
+        json::field("protocol", json::JStr(protocol)),
+        json::field("sni", json::JStr(sni)),
+      ])),
+    )
+  }
+  if path == "/echo" {
+    if method != "POST" {
+      return error_reply(svc, 405, "use POST")
+    }
+    match json::parse(body) {
+      Ok(v) => {
+        let _ = svc.echo.fetch_add(1)
+        return reply(200, json::stringify(v))
+      }
+      Err(e) => return error_reply(svc, 400, "invalid json: " + e)
+    }
+  }
+  if path == "/stats" {
+    if method != "GET" {
+      return error_reply(svc, 405, "use GET")
+    }
+    let _ = svc.stats.fetch_add(1)
+    return reply(200, stats_json(svc))
+  }
+  if path == "/quit" {
+    if method != "POST" {
+      return error_reply(svc, 405, "use POST")
+    }
+    return Reply::{ status: 200, body: "{\"ok\":true,\"quit\":true}", quit: true }
+  }
+  error_reply(svc, 404, "no route " + method + " " + path)
+}
+
+/// Serves the single request of one accepted connection, then closes it;
+/// true when it asked the server to stop.
+fn serve_conn(world : World, svc : Service, conn : tls::TlsConn) -> Bool {
+  let r = match tls::tls_read_http_request(world, conn) {
+    Ok(req) => handle(svc, req.method, req.path, req.body, tls::tls_protocol(conn), conn.host)
+    Err(e) => {
+      let _ = svc.total.fetch_add(1)
+      error_reply(svc, 400, e)
+    }
+  }
+  match tls::tls_write_http_response(world, conn, r.status, "application/json", r.body) {
+    Ok(_) => ()
+    Err(e) => io_eprintln(world, "server: write failed: " + e)
+  }
+  tls::tls_close(world, conn)
+  r.quit
+}
+
+/// Accept loop: one connection at a time until `/quit`, `max_conns` served
+/// connections (0 = no limit) or a failing `accept`. Failed handshakes are
+/// counted and the loop goes on.
+fn serve_loop(world : World, svc : Service, listener : tls::TlsListener, max_conns : Int) -> Int {
+  let mut served = 0
+  while true {
+    match tls::tls_accept(world, listener) {
+      Ok(conn) => {
+        served = served + 1
+        if serve_conn(world, svc, conn) {
+          break
+        }
+        if max_conns > 0 && served >= max_conns {
+          break
+        }
+      }
+      Err(e) => {
+        if e.starts_with("accept") {
+          io_eprintln(world, "server: " + e)
+          return 1
+        }
+        let _ = svc.handshake_failures.fetch_add(1)
+        io_eprintln(world, "server: handshake refused: " + e)
+      }
+    }
+  }
+  0
+}
+
+fn serve(world : World, opts : Options) -> Int {
+  let listener = match tls::tls_listen(world, "127.0.0.1", opts.port, opts.cert, opts.key) {
+    Ok(l) => l
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      return 1
+    }
+  }
+  if opts.port_file.length() > 0 {
+    match fs_write(world, opts.port_file, listener.port.to_string() + "\n") {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write port file: " + e)
+        tls::tls_listener_close(world, listener)
+        return 1
+      }
+    }
+  }
+  io_eprintln(world, "pion-https listening on https://127.0.0.1:" + listener.port.to_string() + " (" + tls::tls_version() + ")")
+  let svc = new_service()
+  let rc = serve_loop(world, svc, listener, opts.max_conns)
+  tls::tls_listener_close(world, listener)
+  io_println(world, stats_json(svc))
+  rc
+}
+
+fn check_config(world : World, opts : Options) -> Int {
+  match tls::tls_listen(world, "127.0.0.1", 0, opts.cert, opts.key) {
+    Ok(l) => {
+      tls::tls_listener_close(world, l)
+      io_println(world, "config ok")
+      0
+    }
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      1
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// --self-test: in-process server thread + four concurrent verified clients.
+
+let CLIENTS : Int = 4
+let ROUNDS : Int = 8
+
+fn expect(world : World, failures : AtomicInt, cond : Bool, what : String) -> Unit {
+  if !cond {
+    let _ = failures.fetch_add(1)
+    io_eprintln(world, "FAIL: " + what)
+  }
+}
+
+fn str_field(body : String, key : String) -> String {
+  match json::parse(body) {
+    Ok(v) =>
+    match json::obj_get(v, key) {
+      Some(x) =>
+      match json::as_str(x) {
+        Some(s) => s
+        None => ""
+      }
+      None => ""
+    }
+    Err(_) => ""
+  }
+}
+
+fn int_field(body : String, key : String) -> Int {
+  match json::parse(body) {
+    Ok(v) =>
+    match json::obj_get(v, key) {
+      Some(x) =>
+      match json::as_int(x) {
+        Some(n) => n.to_int()
+        None => -1
+      }
+      None => -1
+    }
+    Err(_) => -1
+  }
+}
+
+fn show(r : Result[http::HttpResponse, String]) -> String {
+  match r {
+    Ok(resp) => resp.status.to_string() + " " + resp.body
+    Err(e) => "error: " + e
+  }
+}
+
+fn echo_payload(client : Int, round : Int) -> String {
+  json::stringify(json::JObj([
+    json::field("client", json::JInt(client.to_int64())),
+    json::field("round", json::JInt(round.to_int64())),
+    json::field("text", json::JStr("值 🚀 over \"TLS\"")),
+  ]))
+}
+
+/// One client thread: `ROUNDS` × (GET /health + POST /echo), all verified.
+fn client_rounds(world : World, failures : AtomicInt, port : Int, id : Int, want_proto : String) -> Unit {
+  let mut r = 0
+  while r < ROUNDS {
+    let h = tls::https_request(world, "localhost", port, "GET", "/health", "", true)
+    let hs = show(h)
+    let hb = match h {
+      Ok(resp) => if resp.status == 200 { resp.body } else { "" }
+      Err(_) => ""
+    }
+    expect(
+      world,
+      failures,
+      str_field(hb, "protocol") == want_proto && str_field(hb, "sni") == "localhost",
+      "client " + id.to_string() + " /health: " + hs,
+    )
+    let payload = echo_payload(id, r)
+    let e = show(tls::https_request(world, "localhost", port, "POST", "/echo", payload, true))
+    expect(world, failures, e == "200 " + payload, "client " + id.to_string() + " /echo: " + e)
+    r = r + 1
+  }
+}
+
+fn drive(world : World, svc : Service, failures : AtomicInt, port : Int, want_proto : String) -> Unit {
+  // Client-side view of one session.
+  match tls::tls_connect(world, "localhost", port, true) {
+    Ok(c) => {
+      let proto = tls::tls_protocol(c)
+      let cipher = tls::tls_cipher(c)
+      let req = http::format_request("GET", "localhost", port, "/health", "")
+      let _ = tls::tls_write(world, c, req)
+      let sb = StringBuilder()
+      while true {
+        let part = tls::tls_read(world, c, 4096)
+        if part.length() == 0 {
+          break
+        }
+        sb.write_string(part)
+      }
+      tls::tls_close(world, c)
+      let resp = show(http::parse_response(sb.to_string()))
+      expect(world, failures, proto == want_proto, "client protocol " + proto + " (want " + want_proto + ")")
+      expect(world, failures, resp.contains("\"protocol\":\"" + want_proto + "\""), "server protocol: " + resp)
+      io_println(world, "handshake: client " + proto + " " + cipher + ", server " + str_field(resp.slice(4, resp.length()), "protocol"))
+    }
+    Err(e) => expect(world, failures, false, "verified tls_connect to localhost: " + e)
+  }
+
+  // Four concurrent verified clients.
+  scope(world, fn(s : Scope) -> Unit {
+    let mut i = 0
+    while i < CLIENTS {
+      let id = i
+      spawn(s, fn() -> Unit {
+        client_rounds(world, failures, port, id, want_proto)
+      })
+      i = i + 1
+    }
+  })
+  let per = 2 * ROUNDS
+  io_println(world, CLIENTS.to_string() + " concurrent clients x " + per.to_string() + " verified requests done")
+
+  let st = show(tls::https_request(world, "localhost", port, "GET", "/stats", "", true))
+  let n = CLIENTS * ROUNDS
+  let want = "200 {\"total\":" + (2 * n + 2).to_string() + ",\"health\":" + (n + 1).to_string() +
+  ",\"echo\":" + n.to_string() + ",\"stats\":1,\"bad\":0,\"handshake_failures\":0}"
+  expect(world, failures, st == want, "stats after clients: " + st + " (want " + want + ")")
+  io_println(world, "stats: " + st)
+
+  // The certificate names only `localhost`: a verified client must refuse 127.0.0.1.
+  match tls::tls_connect(world, "127.0.0.1", port, true) {
+    Ok(c) => {
+      tls::tls_close(world, c)
+      expect(world, failures, false, "verification accepted 127.0.0.1 for a localhost-only certificate")
+    }
+    Err(e) => {
+      expect(world, failures, e.contains("certificate verify error"), "wrong host error: " + e)
+      io_println(world, "verify rejects 127.0.0.1: " + e)
+    }
+  }
+  let rejected = tls::https_request(world, "127.0.0.1", port, "GET", "/health", "", true)
+  expect(world, failures, show(rejected).starts_with("error: TLS handshake"), "https_request to 127.0.0.1: " + show(rejected))
+
+  // Without verification the address works (no SNI is sent for an IP literal).
+  let plain = show(tls::https_request(world, "127.0.0.1", port, "GET", "/health", "", false))
+  expect(world, failures, plain.starts_with("200 ") && plain.contains("\"sni\":\"\""), "unverified 127.0.0.1: " + plain)
+
+  // Error paths of the router over TLS.
+  let bad = show(tls::https_request(world, "localhost", port, "POST", "/echo", "{\"x\":", true))
+  expect(world, failures, bad.starts_with("400 ") && bad.contains("invalid json"), "bad json: " + bad)
+  let miss = show(tls::https_request(world, "localhost", port, "GET", "/nope", "", true))
+  expect(world, failures, miss.starts_with("404 "), "no route: " + miss)
+
+  let st2 = show(tls::https_request(world, "localhost", port, "GET", "/stats", "", true))
+  expect(world, failures, int_field(st2.slice(4, st2.length()), "handshake_failures") == 2, "handshake failures: " + st2)
+  expect(world, failures, int_field(st2.slice(4, st2.length()), "bad") == 2, "bad requests: " + st2)
+  expect(world, failures, int_field(st2.slice(4, st2.length()), "total") == 2 * n + 6, "total: " + st2)
+  io_println(world, "stats: " + st2)
+  let _ = svc
+}
+
+fn self_test(world : World, opts : Options) -> Int {
+  let svc = new_service()
+  let failures = AtomicInt::new(0)
+  let server_rc = AtomicInt::new(-1)
+  let ready : Channel[Int] = Channel::new(1)
+  let cert = opts.cert
+  let key = opts.key
+  let want_proto = opts.expect_proto
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      match tls::tls_listen(world, "127.0.0.1", 0, cert, key) {
+        Ok(l) => {
+          let _ = ready.send(l.port)
+          server_rc.store(serve_loop(world, svc, l, 0))
+          tls::tls_listener_close(world, l)
+        }
+        Err(e) => {
+          io_eprintln(world, "server: " + e)
+          server_rc.store(1)
+          let _ = ready.send(-1)
+        }
+      }
+    })
+    let port = match ready.recv() {
+      Some(p) => p
+      None => -1
+    }
+    if port < 0 {
+      let _ = failures.fetch_add(1)
+      return
+    }
+    io_println(world, "server: " + tls::tls_version() + " on https://localhost:" + port.to_string())
+    drive(world, svc, failures, port, want_proto)
+    // Always stop the server thread, whatever failed above.
+    let q = show(tls::https_request(world, "localhost", port, "POST", "/quit", "", false))
+    expect(world, failures, q == "200 {\"ok\":true,\"quit\":true}", "quit: " + q)
+  })
+  expect(world, failures, server_rc.load() == 0, "server thread rc " + server_rc.load().to_string())
+  if failures.load() != 0 {
+    io_eprintln(world, "self-test FAILED: " + failures.load().to_string() + " check(s)")
+    return 1
+  }
+  io_println(world, "https self-test ok: " + stats_json(svc))
+  0
+}
+
+pub fn main(world : World) -> Int {
+  match parse_options(world_args(world)) {
+    Ok(opts) =>
+    if opts.mode == "self-test" {
+      self_test(world, opts)
+    } else if opts.mode == "check-config" {
+      check_config(world, opts)
+    } else {
+      serve(world, opts)
+    }
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      io_eprintln(
+        world,
+        "usage: https_server [--self-test | --check-config] --cert <chain.pem> --key <key.pem> [--port <p>] [--port-file <path>] [--max-conns <n>] [--expect-proto <TLSv1.3|TLSv1.2>]",
+      )
+      2
+    }
+  }
+}
