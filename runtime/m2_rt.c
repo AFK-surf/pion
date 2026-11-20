@@ -973,6 +973,14 @@ void m2_arr_push(void *a_ptr, int64_t val) {
     a->data[a->len++] = val;
 }
 
+void m2_arr_push_owned(void *a_ptr, int64_t val) {
+    M2Array *a = (M2Array *)a_ptr;
+    if (__builtin_expect(a->len == a->cap, 0)) {
+        m2_arr_grow(a);
+    }
+    a->data[a->len++] = val;
+}
+
 int64_t m2_arr_get(void *a_ptr, int64_t idx) {
     M2Array *a = (M2Array *)a_ptr;
     if (!a || idx < 0 || idx >= a->len) {
