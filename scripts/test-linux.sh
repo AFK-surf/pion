@@ -191,7 +191,7 @@ TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/examples/text_stats")"
 echo "pionc_linux test --json examples/text_stats -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'
 
-for TPKG in std/json std/http; do
+for TPKG in std/json std/http std/regex; do
   STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_linux test --json $TPKG -> $STD_JSON"
   printf '%s' "$STD_JSON" | grep -q '"ok":true'
@@ -237,7 +237,8 @@ if [ "$HTTP_OUT" != "$(printf 'http in-process ok\nhttp_request ok: 200 text/pla
   exit 1
 fi
 
-FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http")"
+FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
+  "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: fmt --check failed on Linux: $FMT_JSON" >&2
@@ -261,6 +262,26 @@ FIXED_CHK="$("$PIONC" fmt --check --json "$MESSY")"
 if [ "$FIXED_CHK" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: file still unformatted after pionc fmt: $FIXED_CHK" >&2
   exit 1
+fi
+
+# P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
+P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
+echo "pionc_linux run p17a_ergonomics_mt -> $P17A_OUT"
+if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
+  echo "FAIL: p17a_ergonomics_mt output mismatch" >&2
+  exit 1
+fi
+
+# std/tls: zero-C-glue OpenSSL FFI. Unit tests plus real TLS 1.3/1.2 loopback
+# handshakes (and a refused wrong host) whenever libssl/libcrypto can be linked.
+if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null; then
+  TLS_JSON="$("$PIONC" test --json "$ROOT_DIR/std/tls")"
+  echo "pionc_linux test --json std/tls -> $TLS_JSON"
+  printf '%s' "$TLS_JSON" | grep -q '"ok":true'
+  printf '%s' "$TLS_JSON" | grep -q '"failed":0'
+  sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
+else
+  echo "NOTE: OpenSSL development files not found; skipping std/tls test + e2e handshakes"
 fi
 
 # Multi-package run (cold + hot + 0-pollution)
@@ -306,5 +327,7 @@ KV_TEST="$("$PIONC" test --json "$ROOT_DIR/examples/http_kv_service")"
 echo "pionc_linux test --json examples/http_kv_service -> $KV_TEST"
 printf '%s' "$KV_TEST" | grep -q '"failed":0'
 BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$PIONC" 8 500 8
+# Same load over HTTP/1.1 keep-alive (one connection per client thread).
+KEEP_ALIVE=1 BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$PIONC" 8 500 8
 
 echo "ALL LINUX X86_64 (amd64_sysv) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"
