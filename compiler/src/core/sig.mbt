@@ -430,6 +430,41 @@ pub fn emit_file_stub(f : SourceFile) -> String {
 }
 
 ///|
+/// Emit a minimal parseable `.m2` package stub preserving imports and all
+/// top-level declaration signatures (with `{ panic() }` / `= panic()` bodies)
+/// so downstream packages can typecheck against CAS-hit dependencies without
+/// re-parsing or typechecking upstream function bodies.
+pub fn emit_m2_stub(pkg : Package) -> String {
+  let sb = StringBuilder()
+  let seen_imports : Map[String, Bool] = Map([])
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut ii = 0
+    while ii < f.imports.length() {
+      let imp = f.imports[ii]
+      let key = imp.path + "\n" + imp.alias_name
+      if !seen_imports.contains(key) {
+        seen_imports.set(key, true)
+        sb.write_string("import ")
+        sb.write_string(json_quote(imp.path))
+        sb.write_string(" as ")
+        sb.write_string(imp.alias_name)
+        sb.write_string("\n")
+      }
+      ii = ii + 1
+    }
+    fi = fi + 1
+  }
+  fi = 0
+  while fi < pkg.files.length() {
+    sb.write_string(emit_file_stub(pkg.files[fi]))
+    fi = fi + 1
+  }
+  sb.to_string()
+}
+
+///|
 pub struct FileSigsSummary {
   sigs_hash : String
   const_units : Array[Int]
