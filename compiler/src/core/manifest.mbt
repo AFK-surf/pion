@@ -1,9 +1,37 @@
 ///| Pure Pion ∩ MoonBit `pion.toml` manifest parser & package dependency graph
 
 ///|
+/// A `[dependencies]` entry: either a local `path` dependency or a `git`
+/// dependency pinned by at most one of `tag` / `rev` / `branch` (default: the
+/// remote `HEAD`), optionally rooted at a monorepo `subdir`.
 pub struct ManifestDep {
   name : String
   path : String
+  git : String
+  tag : String
+  rev : String
+  branch : String
+  subdir : String
+}
+
+///|
+pub fn manifest_dep_is_git(dep : ManifestDep) -> Bool {
+  dep.git.length() > 0
+}
+
+///|
+/// The requested git reference of a dependency, as recorded in `pion.lock`:
+/// `tag:<t>`, `rev:<sha>`, `branch:<b>` or `HEAD`.
+pub fn manifest_dep_ref(dep : ManifestDep) -> String {
+  if dep.tag.length() > 0 {
+    "tag:" + dep.tag
+  } else if dep.rev.length() > 0 {
+    "rev:" + dep.rev
+  } else if dep.branch.length() > 0 {
+    "branch:" + dep.branch
+  } else {
+    "HEAD"
+  }
 }
 
 ///|
@@ -160,16 +188,38 @@ fn toml_unquote(raw : String) -> Result[String, String] {
 }
 
 ///|
-fn toml_parse_dep_path(rhs : String) -> Result[String, String] {
+fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
   let s = toml_trim(rhs)
   if s.length() >= 2 && str_code_at(s, 0) == 34 {
-    return toml_unquote(s)
+    match toml_unquote(s) {
+      Ok(p) =>
+        return Ok(ManifestDep::{
+          name: name,
+          path: p,
+          git: "",
+          tag: "",
+          rev: "",
+          branch: "",
+          subdir: "",
+        })
+      Err(e) => return Err(e)
+    }
   }
   if s.length() < 2 ||
     str_code_at(s, 0) != 123 ||
     str_code_at(s, s.length() - 1) != 125 {
-    return Err("expected `{ path = \"...\" }` in [dependencies], found `" + s + "`")
+    return Err(
+      "expected `{ path = \"...\" }` or `{ git = \"...\", tag = \"...\" }` in [dependencies], found `" +
+      s +
+      "`",
+    )
   }
+  let mut path = ""
+  let mut git = ""
+  let mut tag = ""
+  let mut rev = ""
+  let mut branch = ""
+  let mut subdir = ""
   let inner = toml_trim(slice_str(s, 1, s.length() - 1))
   let mut pos = 0
   let ilen = inner.length()
@@ -182,8 +232,24 @@ fn toml_parse_dep_path(rhs : String) -> Result[String, String] {
       if eq > 0 {
         let k = toml_trim(slice_str(entry, 0, eq))
         let v = toml_trim(slice_str(entry, eq + 1, entry.length()))
-        if k == "path" {
-          return toml_unquote(v)
+        if k == "path" || k == "git" || k == "tag" || k == "rev" || k == "branch" || k == "subdir" {
+          let uv = match toml_unquote(v) {
+            Ok(x) => x
+            Err(e) => return Err("dependency `" + name + "` key `" + k + "`: " + e)
+          }
+          if k == "path" {
+            path = uv
+          } else if k == "git" {
+            git = uv
+          } else if k == "tag" {
+            tag = uv
+          } else if k == "rev" {
+            rev = uv
+          } else if k == "branch" {
+            branch = uv
+          } else {
+            subdir = uv
+          }
         }
       }
     }
@@ -192,7 +258,51 @@ fn toml_parse_dep_path(rhs : String) -> Result[String, String] {
     }
     pos = comma + 1
   }
-  Err("missing `path = \"...\"` in dependency table `" + s + "`")
+  if git.length() > 0 {
+    if path.length() > 0 {
+      return Err("dependency `" + name + "` sets both `path` and `git`")
+    }
+    let mut nrefs = 0
+    if tag.length() > 0 {
+      nrefs = nrefs + 1
+    }
+    if rev.length() > 0 {
+      nrefs = nrefs + 1
+    }
+    if branch.length() > 0 {
+      nrefs = nrefs + 1
+    }
+    if nrefs > 1 {
+      return Err(
+        "dependency `" + name + "` sets more than one of `tag`, `rev`, `branch`",
+      )
+    }
+  } else {
+    if path.length() == 0 {
+      return Err(
+        "missing `path = \"...\"` or `git = \"...\"` in dependency table `" +
+        s +
+        "`",
+      )
+    }
+    if tag.length() > 0 ||
+      rev.length() > 0 ||
+      branch.length() > 0 ||
+      subdir.length() > 0 {
+      return Err(
+        "dependency `" + name + "`: `tag`/`rev`/`branch`/`subdir` require `git = \"...\"`",
+      )
+    }
+  }
+  Ok(ManifestDep::{
+    name: name,
+    path: path,
+    git: git,
+    tag: tag,
+    rev: rev,
+    branch: branch,
+    subdir: subdir,
+  })
 }
 
 ///|
@@ -291,8 +401,8 @@ pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
         }
       }
     } else if section == "dependencies" {
-      match toml_parse_dep_path(raw_val) {
-        Ok(p) => deps.push(ManifestDep::{ name: key, path: p })
+      match toml_parse_dep(key, raw_val) {
+        Ok(d) => deps.push(d)
         Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
       }
     } else if section == "link" {
@@ -449,4 +559,344 @@ pub fn query_workspace_deps_json(
   }
   sb.write_string("]}")
   sb.to_string()
+}
+
+///|
+/// One `[[package]]` entry of `pion.lock`: a git dependency pinned to a full
+/// commit `rev`. `reference` is the requested ref (`manifest_dep_ref`), so a
+/// lock entry is reused only while `pion.toml` still asks for the same thing.
+pub struct LockEntry {
+  name : String
+  git : String
+  reference : String
+  rev : String
+  subdir : String
+}
+
+///|
+pub fn lock_entry_new(
+  name : String,
+  git : String,
+  reference : String,
+  rev : String,
+  subdir : String,
+) -> LockEntry {
+  LockEntry::{
+    name: name,
+    git: git,
+    reference: reference,
+    rev: rev,
+    subdir: subdir,
+  }
+}
+
+///|
+fn lock_entry_sort_key(e : LockEntry) -> String {
+  e.name + "\n" + e.git + "\n" + e.subdir + "\n" + e.reference + "\n" + e.rev
+}
+
+///|
+/// Plain code-unit lexicographic order (independent of the host `String` compare).
+fn lock_str_less(a : String, b : String) -> Bool {
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  let mut i = 0
+  while i < n {
+    let ca = str_code_at(a, i)
+    let cb = str_code_at(b, i)
+    if ca != cb {
+      return ca < cb
+    }
+    i = i + 1
+  }
+  a.length() < b.length()
+}
+
+///|
+/// Parses `pion.lock` (`[[package]]` tables of `name`/`git`/`ref`/`rev`/`subdir`).
+pub fn parse_pion_lock(text : String) -> Result[Array[LockEntry], String] {
+  let lines = split_lines(text)
+  let out : Array[LockEntry] = []
+  let mut in_pkg = false
+  let mut name = ""
+  let mut git = ""
+  let mut reference = ""
+  let mut rev = ""
+  let mut subdir = ""
+  let mut start_line = 0
+  let mut i = 0
+  while i <= lines.length() {
+    let at_end = i == lines.length()
+    let clean = if at_end { "" } else { toml_trim(toml_strip_comment(lines[i])) }
+    let is_header = !at_end && clean == "[[package]]"
+    if at_end || is_header {
+      if in_pkg {
+        if name.length() == 0 || git.length() == 0 || rev.length() == 0 {
+          return Err(
+            "pion.lock line " +
+            start_line.to_string() +
+            ": [[package]] needs `name`, `git` and `rev`",
+          )
+        }
+        out.push(lock_entry_new(name, git, reference, rev, subdir))
+      }
+      if is_header {
+        in_pkg = true
+        name = ""
+        git = ""
+        reference = ""
+        rev = ""
+        subdir = ""
+        start_line = i + 1
+      }
+      i = i + 1
+      continue
+    }
+    if clean.length() == 0 {
+      i = i + 1
+      continue
+    }
+    if str_code_at(clean, 0) == 91 {
+      return Err(
+        "pion.lock line " + (i + 1).to_string() + ": unexpected table `" + clean + "`",
+      )
+    }
+    let eq = toml_find_char(clean, 61, 0)
+    if eq <= 0 {
+      return Err("pion.lock line " + (i + 1).to_string() + ": expected `key = value`")
+    }
+    let key = toml_trim(slice_str(clean, 0, eq))
+    let raw_val = toml_trim(slice_str(clean, eq + 1, clean.length()))
+    if in_pkg {
+      let v = match toml_unquote(raw_val) {
+        Ok(x) => x
+        Err(e) => return Err("pion.lock line " + (i + 1).to_string() + ": " + e)
+      }
+      if key == "name" {
+        name = v
+      } else if key == "git" {
+        git = v
+      } else if key == "ref" {
+        reference = v
+      } else if key == "rev" {
+        rev = v
+      } else if key == "subdir" {
+        subdir = v
+      }
+    }
+    i = i + 1
+  }
+  Ok(out)
+}
+
+///|
+/// Deterministic `pion.lock` text: entries sorted by name/git/subdir, one
+/// `[[package]]` table each, with every key always written.
+pub fn format_pion_lock(entries : Array[LockEntry]) -> String {
+  let sorted : Array[LockEntry] = []
+  let mut i = 0
+  while i < entries.length() {
+    sorted.push(entries[i])
+    i = i + 1
+  }
+  i = 1
+  while i < sorted.length() {
+    let cur = sorted[i]
+    let ck = lock_entry_sort_key(cur)
+    let mut j = i - 1
+    while j >= 0 && lock_str_less(ck, lock_entry_sort_key(sorted[j])) {
+      sorted[j + 1] = sorted[j]
+      j = j - 1
+    }
+    sorted[j + 1] = cur
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  sb.write_string("# pion.lock: generated by pionc; do not edit by hand.\n")
+  sb.write_string("version = 1\n")
+  i = 0
+  while i < sorted.length() {
+    let e = sorted[i]
+    sb.write_string("\n[[package]]\nname = ")
+    sb.write_string(json_quote(e.name))
+    sb.write_string("\ngit = ")
+    sb.write_string(json_quote(e.git))
+    sb.write_string("\nref = ")
+    sb.write_string(json_quote(e.reference))
+    sb.write_string("\nrev = ")
+    sb.write_string(json_quote(e.rev))
+    sb.write_string("\nsubdir = ")
+    sb.write_string(json_quote(e.subdir))
+    sb.write_string("\n")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// The locked entry for `dep`, if `pion.lock` pins the same name, URL, subdir
+/// and requested ref.
+pub fn lock_find(entries : Array[LockEntry], dep : ManifestDep) -> Option[LockEntry] {
+  let want_ref = manifest_dep_ref(dep)
+  let mut i = 0
+  while i < entries.length() {
+    let e = entries[i]
+    if e.name == dep.name &&
+      e.git == dep.git &&
+      e.subdir == dep.subdir &&
+      e.reference == want_ref {
+      return Some(e)
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+/// Adds `e` to `entries` (keyed by name/git/subdir). Fails when the same
+/// dependency was already resolved to a different revision.
+pub fn lock_add(entries : Array[LockEntry], e : LockEntry) -> Result[Unit, String] {
+  let mut i = 0
+  while i < entries.length() {
+    let o = entries[i]
+    if o.name == e.name && o.git == e.git && o.subdir == e.subdir {
+      if o.rev != e.rev || o.reference != e.reference {
+        return Err(
+          "git dependency `" +
+          e.name +
+          "` is required as both " +
+          o.reference +
+          " (" +
+          o.rev +
+          ") and " +
+          e.reference +
+          " (" +
+          e.rev +
+          ")",
+        )
+      }
+      return Ok(())
+    }
+    i = i + 1
+  }
+  entries.push(e)
+  Ok(())
+}
+
+///|
+/// Merged `pionc test --json` report over several packages. Keeps the
+/// single-package keys (`ok`, `passed`, `failed`, `tests`) and adds `total`,
+/// `packages` and a `pkg` on every test.
+pub fn format_workspace_test_report_json(
+  packages : Array[String],
+  test_pkgs : Array[String],
+  names : Array[String],
+  passed_flags : Array[Bool],
+) -> String {
+  let mut passed = 0
+  let mut failed = 0
+  let mut i = 0
+  while i < names.length() && i < passed_flags.length() {
+    if passed_flags[i] {
+      passed = passed + 1
+    } else {
+      failed = failed + 1
+    }
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  sb.write_string("{\"ok\":")
+  sb.write_string(if failed == 0 { "true" } else { "false" })
+  sb.write_string(",\"total\":")
+  sb.write_string((passed + failed).to_string())
+  sb.write_string(",\"passed\":")
+  sb.write_string(passed.to_string())
+  sb.write_string(",\"failed\":")
+  sb.write_string(failed.to_string())
+  sb.write_string(",\"packages\":[")
+  i = 0
+  while i < packages.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(json_quote(packages[i]))
+    i = i + 1
+  }
+  sb.write_string("],\"tests\":[")
+  i = 0
+  while i < names.length() && i < passed_flags.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("{\"pkg\":")
+    sb.write_string(json_quote(if i < test_pkgs.length() { test_pkgs[i] } else { "" }))
+    sb.write_string(",\"name\":")
+    sb.write_string(json_quote(names[i]))
+    sb.write_string(",\"ok\":")
+    sb.write_string(if passed_flags[i] { "true" } else { "false" })
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+/// Package name for `pionc init <dir>`: the last path component, lowercased,
+/// with every character outside `[a-z0-9_]` turned into `_`.
+pub fn init_package_name(dir : String) -> String {
+  let mut end = dir.length()
+  while end > 1 && str_code_at(dir, end - 1) == 47 {
+    end = end - 1
+  }
+  let mut start = end - 1
+  while start >= 0 && str_code_at(dir, start) != 47 {
+    start = start - 1
+  }
+  let sb = StringBuilder()
+  let mut i = start + 1
+  while i < end {
+    let c = str_code_at(dir, i)
+    if c >= 65 && c <= 90 {
+      sb.write_char((c + 32).unsafe_to_char())
+    } else if (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 {
+      sb.write_char(c.unsafe_to_char())
+    } else {
+      sb.write_char('_')
+    }
+    i = i + 1
+  }
+  let raw = sb.to_string()
+  if raw.length() == 0 || raw == "_" || raw == "__" {
+    "app"
+  } else if str_code_at(raw, 0) >= 48 && str_code_at(raw, 0) <= 57 {
+    "pkg_" + raw
+  } else {
+    raw
+  }
+}
+
+///|
+pub fn init_pion_toml(name : String) -> String {
+  "[package]\nname = " +
+  json_quote(name) +
+  "\nversion = \"0.1.0\"\n\n[dependencies]\n"
+}
+
+///|
+pub fn init_main_source(name : String) -> String {
+  "///| " +
+  name +
+  ": generated by `pionc init`.\n\n" +
+  "///|\npub fn greet(who : String) -> String {\n  \"Hello, \" + who + \"!\"\n}\n\n" +
+  "///|\npub fn main(world : World) -> Int {\n  io_println(world, greet(" +
+  json_quote(name) +
+  "))\n  0\n}\n"
+}
+
+///|
+pub fn init_test_source(name : String) -> String {
+  "///| " +
+  name +
+  " tests.\n\n" +
+  "///|\ntest \"greet\" {\n  debug_assert(greet(\"pion\") == \"Hello, pion!\", \"greet\")\n}\n"
 }
