@@ -3,7 +3,9 @@
 ///|
 /// A `[dependencies]` entry: either a local `path` dependency or a `git`
 /// dependency pinned by at most one of `tag` / `rev` / `branch` (default: the
-/// remote `HEAD`), optionally rooted at a monorepo `subdir`.
+/// remote `HEAD`), optionally rooted at a monorepo `subdir`. A dependency
+/// added from a git-index registry (`pionc add <name>`) also records that
+/// `registry` and the index entry's `version`, so `pionc update` can re-read it.
 pub struct ManifestDep {
   name : String
   path : String
@@ -12,6 +14,31 @@ pub struct ManifestDep {
   rev : String
   branch : String
   subdir : String
+  registry : String
+  version : String
+}
+
+///|
+pub fn manifest_dep_new(
+  name : String,
+  path : String,
+  git : String,
+  tag : String,
+  rev : String,
+  branch : String,
+  subdir : String,
+) -> ManifestDep {
+  ManifestDep::{
+    name: name,
+    path: path,
+    git: git,
+    tag: tag,
+    rev: rev,
+    branch: branch,
+    subdir: subdir,
+    registry: "",
+    version: "",
+  }
 }
 
 ///|
@@ -40,6 +67,7 @@ pub struct PackageManifest {
   version : String
   deps : Array[ManifestDep]
   link_libs : Array[String]
+  registry : String
 }
 
 ///|
@@ -192,16 +220,7 @@ fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
   let s = toml_trim(rhs)
   if s.length() >= 2 && str_code_at(s, 0) == 34 {
     match toml_unquote(s) {
-      Ok(p) =>
-        return Ok(ManifestDep::{
-          name: name,
-          path: p,
-          git: "",
-          tag: "",
-          rev: "",
-          branch: "",
-          subdir: "",
-        })
+      Ok(p) => return Ok(manifest_dep_new(name, p, "", "", "", "", ""))
       Err(e) => return Err(e)
     }
   }
@@ -220,6 +239,8 @@ fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
   let mut rev = ""
   let mut branch = ""
   let mut subdir = ""
+  let mut registry = ""
+  let mut version = ""
   let inner = toml_trim(slice_str(s, 1, s.length() - 1))
   let mut pos = 0
   let ilen = inner.length()
@@ -232,7 +253,14 @@ fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
       if eq > 0 {
         let k = toml_trim(slice_str(entry, 0, eq))
         let v = toml_trim(slice_str(entry, eq + 1, entry.length()))
-        if k == "path" || k == "git" || k == "tag" || k == "rev" || k == "branch" || k == "subdir" {
+        if k == "path" ||
+          k == "git" ||
+          k == "tag" ||
+          k == "rev" ||
+          k == "branch" ||
+          k == "subdir" ||
+          k == "registry" ||
+          k == "version" {
           let uv = match toml_unquote(v) {
             Ok(x) => x
             Err(e) => return Err("dependency `" + name + "` key `" + k + "`: " + e)
@@ -247,6 +275,10 @@ fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
             rev = uv
           } else if k == "branch" {
             branch = uv
+          } else if k == "registry" {
+            registry = uv
+          } else if k == "version" {
+            version = uv
           } else {
             subdir = uv
           }
@@ -288,9 +320,10 @@ fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
     if tag.length() > 0 ||
       rev.length() > 0 ||
       branch.length() > 0 ||
-      subdir.length() > 0 {
+      subdir.length() > 0 ||
+      registry.length() > 0 {
       return Err(
-        "dependency `" + name + "`: `tag`/`rev`/`branch`/`subdir` require `git = \"...\"`",
+        "dependency `" + name + "`: `tag`/`rev`/`branch`/`subdir`/`registry` require `git = \"...\"`",
       )
     }
   }
@@ -302,6 +335,8 @@ fn toml_parse_dep(name : String, rhs : String) -> Result[ManifestDep, String] {
     rev: rev,
     branch: branch,
     subdir: subdir,
+    registry: registry,
+    version: version,
   })
 }
 
@@ -367,6 +402,7 @@ pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
   let mut version = "0.1.0"
   let deps : Array[ManifestDep] = []
   let link_libs : Array[String] = []
+  let mut registry = ""
   let mut i = 0
   while i < lines.length() {
     let clean = toml_trim(toml_strip_comment(lines[i]))
@@ -405,6 +441,13 @@ pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
         Ok(d) => deps.push(d)
         Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
       }
+    } else if section == "registry" {
+      if key == "url" {
+        match toml_unquote(raw_val) {
+          Ok(v) => registry = v
+          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
+        }
+      }
     } else if section == "link" {
       if key == "libs" || key == "lib" {
         match toml_parse_str_array(raw_val) {
@@ -429,6 +472,7 @@ pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
     version: version,
     deps: deps,
     link_libs: link_libs,
+    registry: registry,
   })
 }
 
@@ -899,4 +943,295 @@ pub fn init_test_source(name : String) -> String {
   name +
   " tests.\n\n" +
   "///|\ntest \"greet\" {\n  debug_assert(greet(\"pion\") == \"Hello, pion!\", \"greet\")\n}\n"
+}
+
+///|
+/// One `index/<name>.toml` entry of a git-index package registry: where the
+/// package's source lives (`git` + at most one of `tag` / `rev` / `branch`,
+/// optional monorepo `subdir`) and its published `version`.
+pub struct RegistryEntry {
+  name : String
+  version : String
+  git : String
+  tag : String
+  rev : String
+  branch : String
+  subdir : String
+}
+
+///|
+/// Path of a package's entry inside a registry index repository.
+pub fn registry_index_path(name : String) -> String {
+  "index/" + name + ".toml"
+}
+
+///|
+/// A dependency / registry package name usable as a bare `pion.toml` key:
+/// `[A-Za-z_][A-Za-z0-9_-]*`.
+pub fn manifest_valid_dep_name(name : String) -> Bool {
+  if name.length() == 0 {
+    return false
+  }
+  let mut i = 0
+  while i < name.length() {
+    let c = str_code_at(name, i)
+    let alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+    let digit = c >= 48 && c <= 57
+    if i == 0 && !alpha {
+      return false
+    }
+    if !alpha && !digit && c != 45 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Parses a registry index entry (`git = "..."`, `tag`/`rev`/`branch`,
+/// `subdir`, `version`, optional `name` that must match).
+pub fn parse_registry_entry(
+  name : String,
+  text : String,
+) -> Result[RegistryEntry, String] {
+  let lines = split_lines(text)
+  let mut git = ""
+  let mut tag = ""
+  let mut rev = ""
+  let mut branch = ""
+  let mut subdir = ""
+  let mut version = ""
+  let mut i = 0
+  while i < lines.length() {
+    let clean = toml_trim(toml_strip_comment(lines[i]))
+    if clean.length() == 0 || str_code_at(clean, 0) == 91 {
+      i = i + 1
+      continue
+    }
+    let eq = toml_find_char(clean, 61, 0)
+    if eq <= 0 {
+      return Err(
+        registry_index_path(name) +
+        " line " +
+        (i + 1).to_string() +
+        ": expected `key = value`",
+      )
+    }
+    let key = toml_trim(slice_str(clean, 0, eq))
+    let v = match toml_unquote(slice_str(clean, eq + 1, clean.length())) {
+      Ok(x) => x
+      Err(e) =>
+        return Err(
+          registry_index_path(name) + " line " + (i + 1).to_string() + ": " + e,
+        )
+    }
+    if key == "git" {
+      git = v
+    } else if key == "tag" {
+      tag = v
+    } else if key == "rev" {
+      rev = v
+    } else if key == "branch" {
+      branch = v
+    } else if key == "subdir" {
+      subdir = v
+    } else if key == "version" {
+      version = v
+    } else if key == "name" && v != name {
+      return Err(
+        registry_index_path(name) + ": entry is for package `" + v + "`",
+      )
+    }
+    i = i + 1
+  }
+  if git.length() == 0 {
+    return Err(registry_index_path(name) + ": missing `git = \"...\"`")
+  }
+  let mut nrefs = 0
+  if tag.length() > 0 {
+    nrefs = nrefs + 1
+  }
+  if rev.length() > 0 {
+    nrefs = nrefs + 1
+  }
+  if branch.length() > 0 {
+    nrefs = nrefs + 1
+  }
+  if nrefs > 1 {
+    return Err(
+      registry_index_path(name) + ": more than one of `tag`, `rev`, `branch`",
+    )
+  }
+  Ok(RegistryEntry::{
+    name: name,
+    version: version,
+    git: git,
+    tag: tag,
+    rev: rev,
+    branch: branch,
+    subdir: subdir,
+  })
+}
+
+///|
+/// The `pion.toml` dependency for a registry entry, remembering `registry`.
+pub fn registry_entry_dep(e : RegistryEntry, registry : String) -> ManifestDep {
+  ManifestDep::{
+    name: e.name,
+    path: "",
+    git: e.git,
+    tag: e.tag,
+    rev: e.rev,
+    branch: e.branch,
+    subdir: e.subdir,
+    registry: registry,
+    version: e.version,
+  }
+}
+
+///|
+/// Inline-table form of a dependency, with keys in a fixed order:
+/// `{ path = "..." }` or `{ git = "...", tag = "...", subdir = "...",
+/// version = "...", registry = "..." }` (empty keys left out).
+pub fn format_dep_inline(dep : ManifestDep) -> String {
+  if dep.git.length() == 0 {
+    return "{ path = " + json_quote(dep.path) + " }"
+  }
+  let sb = StringBuilder()
+  sb.write_string("{ git = ")
+  sb.write_string(json_quote(dep.git))
+  if dep.tag.length() > 0 {
+    sb.write_string(", tag = ")
+    sb.write_string(json_quote(dep.tag))
+  }
+  if dep.rev.length() > 0 {
+    sb.write_string(", rev = ")
+    sb.write_string(json_quote(dep.rev))
+  }
+  if dep.branch.length() > 0 {
+    sb.write_string(", branch = ")
+    sb.write_string(json_quote(dep.branch))
+  }
+  if dep.subdir.length() > 0 {
+    sb.write_string(", subdir = ")
+    sb.write_string(json_quote(dep.subdir))
+  }
+  if dep.version.length() > 0 {
+    sb.write_string(", version = ")
+    sb.write_string(json_quote(dep.version))
+  }
+  if dep.registry.length() > 0 {
+    sb.write_string(", registry = ")
+    sb.write_string(json_quote(dep.registry))
+  }
+  sb.write_string(" }")
+  sb.to_string()
+}
+
+///|
+/// Splits at every newline, keeping a trailing empty segment ("a\n" -> ["a", ""]).
+fn toml_split_keep(text : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < text.length() {
+    if str_code_at(text, i) == 10 {
+      out.push(slice_str(text, start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(slice_str(text, start, text.length()))
+  out
+}
+
+///|
+/// Sets `dep` in the `[dependencies]` table of a `pion.toml` text: replaces
+/// the line of an existing entry with the same name in place, else appends it
+/// after the table's last entry (creating the table at the end when missing).
+/// Every other line is kept byte for byte, and setting the same dependency
+/// again returns the text unchanged.
+pub fn manifest_set_dependency(text : String, dep : ManifestDep) -> String {
+  let line = dep.name + " = " + format_dep_inline(dep)
+  let lines = toml_split_keep(text)
+  let mut section = ""
+  let mut dep_header = -1
+  let mut last_entry = -1
+  let mut i = 0
+  while i < lines.length() {
+    let clean = toml_trim(toml_strip_comment(lines[i]))
+    if clean.length() > 0 {
+      if str_code_at(clean, 0) == 91 &&
+        str_code_at(clean, clean.length() - 1) == 93 {
+        section = toml_trim(slice_str(clean, 1, clean.length() - 1))
+        if section == "dependencies" && dep_header < 0 {
+          dep_header = i
+        }
+      } else if section == "dependencies" {
+        let eq = toml_find_char(clean, 61, 0)
+        if eq > 0 && toml_trim(slice_str(clean, 0, eq)) == dep.name {
+          lines[i] = line
+          return join_lines_nl(lines)
+        }
+        last_entry = i
+      }
+    }
+    i = i + 1
+  }
+  if dep_header >= 0 {
+    let at = if last_entry > dep_header { last_entry + 1 } else { dep_header + 1 }
+    let out : Array[String] = []
+    let mut j = 0
+    while j < lines.length() {
+      if j == at {
+        out.push(line)
+      }
+      out.push(lines[j])
+      j = j + 1
+    }
+    if at >= lines.length() {
+      out.push(line)
+    }
+    return join_lines_nl(out)
+  }
+  let sb = StringBuilder()
+  sb.write_string(text)
+  if text.length() > 0 && str_code_at(text, text.length() - 1) != 10 {
+    sb.write_string("\n")
+  }
+  if text.length() > 0 {
+    sb.write_string("\n")
+  }
+  sb.write_string("[dependencies]\n")
+  sb.write_string(line)
+  sb.write_string("\n")
+  sb.to_string()
+}
+
+///|
+fn join_lines_nl(lines : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < lines.length() {
+    if i > 0 {
+      sb.write_string("\n")
+    }
+    sb.write_string(lines[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// The locked commit of the git dependency `name` ("" when not locked).
+pub fn lock_rev_of(entries : Array[LockEntry], name : String) -> String {
+  let mut i = 0
+  while i < entries.length() {
+    if entries[i].name == name {
+      return entries[i].rev
+    }
+    i = i + 1
+  }
+  ""
 }
