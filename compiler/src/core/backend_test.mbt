@@ -1819,3 +1819,56 @@ fn p18_find_from(hay : String, needle : String, from : Int) -> Int {
   }
   -1
 }
+
+///|
+test "p20a: dyn Trait emits fat-pointer vtable, thunks, drop_dyn, and niche Option" {
+  let src =
+    #|pub trait Describe {
+    #|  describe(self : Self) -> String
+    #|  score(self : Self, bonus : Int) -> Int
+    #|}
+    #|pub struct Dog {
+    #|  name : String
+    #|}
+    #|impl Describe for Dog {
+    #|  fn describe(self : Dog) -> String {
+    #|    "dog:" + self.name
+    #|  }
+    #|  fn score(self : Dog, bonus : Int) -> Int {
+    #|    self.name.length() + bonus
+    #|  }
+    #|}
+    #|impl Describe for Int {
+    #|  fn describe(self : Int) -> String {
+    #|    "int:" + self.to_string()
+    #|  }
+    #|  fn score(self : Int, bonus : Int) -> Int {
+    #|    self + bonus
+    #|  }
+    #|}
+    #|pub fn render(x : dyn Describe) -> String {
+    #|  x.describe() + ":" + x.score(2).to_string()
+    #|}
+    #|pub fn main() -> Int {
+    #|  let xs : Array[dyn Describe] = [Dog::{ name: "rex" }, 40]
+    #|  let opt : Option[dyn Describe] = Some(Dog::{ name: "max" })
+    #|  let _ = match opt {
+    #|    Some(v) => render(v)
+    #|    None => ""
+    #|  }
+    #|  render(xs[0]).length() + render(xs[1]).length()
+    #|}
+  let cr = @core.check_source_files_full("p20a_dyn", ["p20a_dyn.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  assert_true(ssa.contains("function $pion_drop_dyn("), ssa)
+  assert_true(ssa.contains("data $pion_vtable_Describe__Dog = align 8 { l 1,"), ssa)
+  assert_true(ssa.contains("data $pion_vtable_Describe__Int = align 8 { l 0, l 0,"), ssa)
+  assert_true(ssa.contains("$pion_dyn_wrap_Describe__Dog__describe("), ssa)
+  assert_true(ssa.contains("$pion_dyn_wrap_Describe__Int__score("), ssa)
+  // Niche Option[dyn Describe] must NOT box Option with $pion_drop_opt_obj
+  assert_true(!ssa.contains("$pion_drop_opt_obj"), ssa)
+}
