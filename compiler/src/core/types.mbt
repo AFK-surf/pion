@@ -24,6 +24,7 @@ pub enum Ty {
   TEnum(String, Array[Ty])
   TFn(Array[Ty], Ty)
   TTuple(Array[Ty])
+  TDynTrait(String)
   TParam(String)
   TNever
   TError
@@ -84,6 +85,7 @@ pub fn ty_to_string(t : Ty) -> String {
       sb.write_string(")")
       sb.to_string()
     }
+    TDynTrait(n) => "dyn " + n
     TParam(n) => n
     TNever => "Never"
     TError => "<error>"
@@ -176,6 +178,10 @@ pub struct VarBinding {
   /// Span of the `let` keyword that introduced the binding (line 0 for
   /// parameters, loop variables and pattern bindings).
   decl_span : Span
+  ty_span : Span
+  ty_end_col : Int
+  init_span : Span
+  init_end_col : Int
 }
 
 ///|
@@ -188,6 +194,8 @@ pub struct Env {
   type_bounds : Map[String, Array[String]]
   /// Decl key (`span_key`) of the generic fn whose body is being checked.
   mut fn_key : String
+  mut fn_lparen_span : Span
+  mut fn_has_params : Bool
 }
 
 ///|
@@ -273,6 +281,8 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     type_params: type_params,
     type_bounds: Map([]),
     fn_key: "",
+    fn_lparen_span: span_empty(),
+    fn_has_params: false,
   }
 }
 
@@ -301,12 +311,41 @@ fn env_define_at(
   is_mut : Bool,
   decl_span : Span,
 ) -> Unit {
+  env_define_let(
+    env,
+    name,
+    ty,
+    is_mut,
+    decl_span,
+    span_empty(),
+    -1,
+    span_empty(),
+    -1,
+  )
+}
+
+///|
+fn env_define_let(
+  env : Env,
+  name : String,
+  ty : Ty,
+  is_mut : Bool,
+  decl_span : Span,
+  ty_span : Span,
+  ty_end_col : Int,
+  init_span : Span,
+  init_end_col : Int,
+) -> Unit {
   let top = env.scopes[env.scopes.length() - 1]
   top.set(name, VarBinding::{
     name: name,
     ty: ty,
     is_mut: is_mut,
     decl_span: decl_span,
+    ty_span: ty_span,
+    ty_end_col: ty_end_col,
+    init_span: init_span,
+    init_end_col: init_end_col,
   })
   match ty {
     TWorld => env.has_world = true
@@ -416,6 +455,14 @@ pub fn qualify_imported_ty(pkg_name : String, t : Ty) -> Ty {
         i = i + 1
       }
       TTuple(out)
+    }
+    TDynTrait(name) => {
+      let qname = if has_qual_sep(name) {
+        name
+      } else {
+        pkg_name + "::" + name
+      }
+      TDynTrait(qname)
     }
     _ => t
   }
@@ -681,6 +728,7 @@ fn qualify_fn_bounds(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
       ret_ty: d.ret_ty,
       body: d.body,
       span: d.span,
+      lparen_span: d.lparen_span,
     },
     param_tys: fi.param_tys,
     ret_ty: fi.ret_ty,
@@ -805,8 +853,429 @@ fn type_expr_end_col(te : TypeExpr) -> Int {
         last_end + 1
       }
     }
+    TyDynTrait(name, sp) => sp.col + 4 + name.length()
     _ => -1
   }
+}
+
+///|
+/// Column just past a single-line expression, or -1 when it cannot be located
+/// exactly.
+fn expr_end_col(e : Expr) -> Int {
+  match e {
+    EInt(raw, sp) | EInt64(raw, sp) | EDouble(raw, sp) | EIdent(raw, sp) =>
+      sp.col + raw.length()
+    EBool(b, sp) => sp.col + (if b { 4 } else { 5 })
+    EString(s, sp) => {
+      let mut i = 0
+      while i < s.length() {
+        let ch = str_code_at(s, i)
+        if ch == 34 || ch == 92 || ch == 10 || ch == 13 || ch == 9 || ch < 32 {
+          return -1
+        }
+        i = i + 1
+      }
+      sp.col + s.length() + 2
+    }
+    EChar(s, sp) => sp.col + s.length() + 2
+    EByte(s, sp) => sp.col + s.length() + 3
+    EUnit(sp) => sp.col + 2
+    EPath(q, m, sp) => sp.col + q.length() + 2 + m.length()
+    EField(obj, fname, sp) =>
+      if expr_span(obj).line == sp.line {
+        sp.col + 1 + fname.length()
+      } else {
+        -1
+      }
+    EUnary(_, inner, sp) | EMove(inner, sp) =>
+      if expr_span(inner).line == sp.line {
+        expr_end_col(inner)
+      } else {
+        -1
+      }
+    EBinary(_, _, rhs, sp) =>
+      if expr_span(rhs).line == sp.line {
+        expr_end_col(rhs)
+      } else {
+        -1
+      }
+    ETry(inner, sp) =>
+      if expr_span(inner).line == sp.line {
+        sp.col + 1
+      } else {
+        -1
+      }
+    EArrayLit(elems, sp) =>
+      if elems.length() == 0 {
+        sp.col + 2
+      } else {
+        let last = elems[elems.length() - 1]
+        if expr_span(last).line == sp.line {
+          let ec = expr_end_col(last)
+          if ec > 0 { ec + 1 } else { -1 }
+        } else {
+          -1
+        }
+      }
+    ECall(_, args, sp) =>
+      if args.length() == 0 {
+        sp.col + 2
+      } else {
+        let last = args[args.length() - 1]
+        if expr_span(last).line == sp.line {
+          let ec = expr_end_col(last)
+          if ec > 0 { ec + 1 } else { -1 }
+        } else {
+          -1
+        }
+      }
+    EMethodCall(_, mname, args, sp) =>
+      if args.length() == 0 {
+        sp.col + 1 + mname.length() + 2
+      } else {
+        let last = args[args.length() - 1]
+        if expr_span(last).line == sp.line {
+          let ec = expr_end_col(last)
+          if ec > 0 { ec + 1 } else { -1 }
+        } else {
+          -1
+        }
+      }
+    _ => -1
+  }
+}
+
+///|
+fn levenshtein_dist(a : String, b : String) -> Int {
+  let m = a.length()
+  let n = b.length()
+  if m == 0 {
+    return n
+  }
+  if n == 0 {
+    return m
+  }
+  let prev : Array[Int] = []
+  let curr : Array[Int] = []
+  let mut j = 0
+  while j <= n {
+    prev.push(j)
+    curr.push(0)
+    j = j + 1
+  }
+  let mut i = 1
+  while i <= m {
+    curr[0] = i
+    let ca = str_code_at(a, i - 1)
+    j = 1
+    while j <= n {
+      let cb = str_code_at(b, j - 1)
+      let cost = if ca == cb { 0 } else { 1 }
+      let del = prev[j] + 1
+      let ins = curr[j - 1] + 1
+      let sub = prev[j - 1] + cost
+      let mut best = del
+      if ins < best {
+        best = ins
+      }
+      if sub < best {
+        best = sub
+      }
+      curr[j] = best
+      j = j + 1
+    }
+    j = 0
+    while j <= n {
+      prev[j] = curr[j]
+      j = j + 1
+    }
+    i = i + 1
+  }
+  prev[n]
+}
+
+///|
+fn find_closest_name(
+  target : String,
+  candidates : Array[String],
+  max_dist : Int,
+) -> Option[String] {
+  let mut best_name = ""
+  let mut best_dist = max_dist + 1
+  let mut tie = false
+  let mut i = 0
+  while i < candidates.length() {
+    let cand = candidates[i]
+    let d = levenshtein_dist(target, cand)
+    if d < best_dist {
+      best_dist = d
+      best_name = cand
+      tie = false
+    } else if d == best_dist {
+      tie = true
+    }
+    i = i + 1
+  }
+  if best_dist <= max_dist && !tie && best_name.length() > 0 {
+    Some(best_name)
+  } else {
+    None
+  }
+}
+
+///|
+fn default_val_for_ty(t : Ty) -> String {
+  match t {
+    TInt => "0"
+    TInt64 => "0L"
+    TDouble => "0.0"
+    TBool => "false"
+    TString => "\"\""
+    TUnit => "()"
+    TByte => "b'\\0'"
+    TChar => "'a'"
+    TWorld => "world"
+    TArray(_) => "[]"
+    TOption(_) => "None"
+    _ => "panic(\"todo\")"
+  }
+}
+
+///|
+fn add_arity_edit(
+  tc : TypeChecker,
+  sp : Span,
+  args : Array[Expr],
+  param_tys : Array[Ty],
+) -> Unit {
+  let want = param_tys.length()
+  if args.length() > want {
+    let last = args[args.length() - 1]
+    let last_sp = expr_span(last)
+    let last_end = expr_end_col(last)
+    if last_end <= 0 {
+      return
+    }
+    if want == 0 {
+      let first_sp = expr_span(args[0])
+      if first_sp.line == last_sp.line {
+        tc_add_edit(tc, TextEdit::{
+          file: sp.file,
+          line: first_sp.line,
+          col: first_sp.col,
+          end_line: last_sp.line,
+          end_col: last_end,
+          replacement: "",
+        })
+      }
+    } else {
+      let prev = args[want - 1]
+      let prev_sp = expr_span(prev)
+      let prev_end = expr_end_col(prev)
+      if prev_sp.line == last_sp.line && prev_end > 0 {
+        tc_add_edit(tc, TextEdit::{
+          file: sp.file,
+          line: prev_sp.line,
+          col: prev_end,
+          end_line: last_sp.line,
+          end_col: last_end,
+          replacement: "",
+        })
+      }
+    }
+  } else if args.length() < want {
+    let sb = StringBuilder()
+    let mut k = args.length()
+    while k < want {
+      if k > args.length() {
+        sb.write_string(", ")
+      }
+      sb.write_string(default_val_for_ty(param_tys[k]))
+      k = k + 1
+    }
+    if args.length() == 0 {
+      if sp.line > 0 && sp.col > 0 {
+        tc_add_edit(tc, text_edit_insert(sp, 1, sb.to_string()))
+      }
+    } else {
+      let last = args[args.length() - 1]
+      let last_sp = expr_span(last)
+      let last_end = expr_end_col(last)
+      if last_end > 0 {
+        tc_add_edit(tc, TextEdit::{
+          file: sp.file,
+          line: last_sp.line,
+          col: last_end,
+          end_line: last_sp.line,
+          end_col: last_end,
+          replacement: ", " + sb.to_string(),
+        })
+      }
+    }
+  }
+}
+
+///|
+fn add_missing_impl_edit(
+  tc : TypeChecker,
+  trait_name : String,
+  concrete_ty : Ty,
+) -> Unit {
+  let tinfo = match lookup_trait(tc, trait_name) {
+    Some(ti) => ti
+    None => return
+  }
+  let target_name = ty_base_name(concrete_ty)
+  let mut insert_span = span_empty()
+  match tc.structs.get(target_name) {
+    Some(si) =>
+      if !has_qual_sep(target_name) && si.decl.end_span.line > 0 {
+        insert_span = si.decl.end_span
+      }
+    None => ()
+  }
+  if insert_span.line == 0 {
+    match tc.enums.get(target_name) {
+      Some(ei) =>
+        if !has_qual_sep(target_name) && ei.decl.end_span.line > 0 {
+          insert_span = ei.decl.end_span
+        }
+      None => ()
+    }
+  }
+  if insert_span.line == 0 {
+    return
+  }
+  let self_subst : Map[String, Ty] = Map([])
+  self_subst.set("Self", concrete_ty)
+  let sb = StringBuilder()
+  sb.write_string("\n\nimpl ")
+  sb.write_string(trait_name)
+  sb.write_string(" for ")
+  sb.write_string(ty_to_string(concrete_ty))
+  sb.write_string(" {\n")
+  let mut mi = 0
+  while mi < tinfo.methods.length() {
+    let tm = tinfo.methods[mi]
+    let decl_m = tinfo.decl.methods[mi]
+    sb.write_string("  fn ")
+    sb.write_string(tm.name)
+    sb.write_string("(")
+    let mut pi = 0
+    while pi < tm.param_tys.length() {
+      if pi > 0 {
+        sb.write_string(", ")
+      }
+      let pname = if pi < decl_m.params.length() {
+        decl_m.params[pi].name
+      } else {
+        "arg" + pi.to_string()
+      }
+      sb.write_string(pname)
+      sb.write_string(" : ")
+      sb.write_string(ty_to_string(subst_ty(tm.param_tys[pi], self_subst)))
+      pi = pi + 1
+    }
+    sb.write_string(") -> ")
+    sb.write_string(ty_to_string(subst_ty(tm.ret_ty, self_subst)))
+    sb.write_string(" {\n    panic(\"todo\")\n  }\n")
+    mi = mi + 1
+  }
+  sb.write_string("}")
+  tc_add_edit(tc, text_edit_insert(insert_span, 1, sb.to_string()))
+}
+
+///|
+fn ty_mentions_self(t : Ty) -> Bool {
+  match t {
+    TParam(n) => n == "Self"
+    TArray(e) | TOption(e) | TChannel(e) | TMutex(e) => ty_mentions_self(e)
+    TResult(o, e) | TMap(o, e) => ty_mentions_self(o) || ty_mentions_self(e)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if ty_mentions_self(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, r) => {
+      let mut i = 0
+      while i < ps.length() {
+        if ty_mentions_self(ps[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      ty_mentions_self(r)
+    }
+    _ => false
+  }
+}
+
+///|
+fn check_trait_object_safe(
+  tc : TypeChecker,
+  tname : String,
+  tinfo : TraitInfo,
+  sp : Span,
+) -> Bool {
+  let mut mi = 0
+  while mi < tinfo.methods.length() {
+    let tm = tinfo.methods[mi]
+    let has_self_recv = if tm.param_tys.length() > 0 {
+      match tm.param_tys[0] {
+        TParam(p) => p == "Self"
+        _ => false
+      }
+    } else {
+      false
+    }
+    if !has_self_recv {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "trait `" + tname + "` is not object-safe for `dyn " + tname + "`: method `" + tm.name + "` must take `self : Self` as its first parameter",
+        "object-safe trait",
+        "dyn " + tname,
+        "make `self : Self` the first parameter of `" + tm.name + "`",
+      )
+      return false
+    }
+    let mut pi = 1
+    while pi < tm.param_tys.length() {
+      if ty_mentions_self(tm.param_tys[pi]) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "trait `" + tname + "` is not object-safe for `dyn " + tname + "`: method `" + tm.name + "` references `Self` in parameter " + (pi + 1).to_string(),
+          "object-safe trait",
+          "dyn " + tname,
+          "avoid `Self` in non-receiver parameters of `" + tm.name + "`",
+        )
+        return false
+      }
+      pi = pi + 1
+    }
+    if ty_mentions_self(tm.ret_ty) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "trait `" + tname + "` is not object-safe for `dyn " + tname + "`: method `" + tm.name + "` returns `Self`",
+        "object-safe trait",
+        "dyn " + tname,
+        "return a concrete type or `dyn " + tname + "` instead of `Self` in `" + tm.name + "`",
+      )
+      return false
+    }
+    mi = mi + 1
+  }
+  true
 }
 
 ///|
@@ -938,6 +1407,50 @@ fn resolve_type_expr(
         i = i + 1
       }
       TFn(ptys, resolve_type_expr(tc, ret, tparams))
+    }
+    TyDynTrait(tname, sp) => {
+      let qp = split_qual_name(tname)
+      if qp.prefix.length() > 0 {
+        match resolve_alias_pkg(tc, qp.prefix) {
+          Some(ipkg) =>
+            match ipkg.tc.traits.get(qp.name) {
+              Some(ti) =>
+                if !ti.decl.is_pub {
+                  emit_private_err_at(
+                    tc,
+                    sp,
+                    "trait",
+                    ipkg.name,
+                    qp.name,
+                    ti.decl.span,
+                  )
+                }
+              None => ()
+            }
+          None => ()
+        }
+      }
+      let cname = canon_trait_name(tc, tname)
+      match tc.traits.get(cname) {
+        None => {
+          tc_err(
+            tc,
+            sp,
+            "E_UNKNOWN_TRAIT",
+            "unknown trait `" + tname + "` in `dyn` type",
+            "defined trait",
+            tname,
+            "declare `trait " + tname + " { ... }` or check its spelling",
+          )
+          TError
+        }
+        Some(tinfo) =>
+          if check_trait_object_safe(tc, tname, tinfo, sp) {
+            TDynTrait(cname)
+          } else {
+            TError
+          }
+      }
     }
     TyName(name, args, sp) => {
       if str_arr_contains(tparams, name) {
@@ -1411,6 +1924,11 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
         }
         _ => false
       }
+    TDynTrait(t1) =>
+      match found {
+        TDynTrait(t2) => t1 == t2
+        _ => false
+      }
     TNever | TError => true
   }
 }
@@ -1444,6 +1962,7 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
     // primitives are thread-safe syscalls: spawned workers may capture it.
     TWorld => true
     TPtr | TArray(_) | TBytes | TMap(_, _) | TStringBuilder => false
+    TDynTrait(_) => false
     TParam(_) => false
     TOption(e) => is_send_ty(tc, e, visiting)
     TResult(ok, err) =>
@@ -1660,6 +2179,10 @@ fn check_rt_prim_call(
         "none",
         "pass the `World` value as the first argument of `" + name + "`",
       )
+      if !env.has_world && env.fn_lparen_span.line > 0 {
+        let ins = if env.fn_has_params { "world : World, " } else { "world : World" }
+        tc_add_edit(tc, text_edit_insert(env.fn_lparen_span, 1, ins))
+      }
     }
   }
   if args.length() != want {
@@ -1729,6 +2252,10 @@ fn check_world_builtin_call(
       "none",
       "add `world : World` parameter to the enclosing function",
     )
+    if env.fn_lparen_span.line > 0 {
+      let ins = if env.fn_has_params { "world : World, " } else { "world : World" }
+      tc_add_edit(tc, text_edit_insert(env.fn_lparen_span, 1, ins))
+    }
   }
   let offset = if has_world_arg { 1 } else { 0 }
   if name == "io_print" || name == "io_println" || name == "io_eprintln" {
@@ -2463,7 +2990,25 @@ fn check_stmt(
         None => init_ty
       }
       if name != "_" {
-        env_define_at(env, name, final_ty, is_mut, sp)
+        let ty_sp = match ty_expr {
+          TyMissing(_) => span_empty()
+          _ => type_expr_span(ty_expr)
+        }
+        let ty_ec = match ty_expr {
+          TyMissing(_) => -1
+          _ => type_expr_end_col(ty_expr)
+        }
+        env_define_let(
+          env,
+          name,
+          final_ty,
+          is_mut,
+          sp,
+          ty_sp,
+          ty_ec,
+          expr_span(init),
+          expr_end_col(init),
+        )
       }
       TUnit
     }
@@ -3044,6 +3589,7 @@ fn check_extern_fn_call(
       args.length().to_string() + " args",
       "pass " + einfo.param_tys.length().to_string() + " argument(s)",
     )
+    add_arity_edit(tc, sp, args, einfo.param_tys)
   }
   let mut i = 0
   while i < args.length() {
@@ -3110,6 +3656,7 @@ fn check_fn_call(
       args.length().to_string() + " args",
       "pass " + finfo.param_tys.length().to_string() + " argument(s)",
     )
+    add_arity_edit(tc, sp, args, finfo.param_tys)
   }
   let mut i = 0
   while i < args.length() {
@@ -3194,6 +3741,7 @@ fn check_fn_call(
                   ty_to_string(concrete_ty),
                   "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
                 )
+                add_missing_impl_edit(tc, req_tr, concrete_ty)
               }
               ti = ti + 1
             }
@@ -3886,6 +4434,69 @@ fn check_method_call(
         }
       }
     }
+    TDynTrait(tname) =>
+      match lookup_trait(tc, tname) {
+        Some(tinfo) => {
+          let mut mi = 0
+          while mi < tinfo.methods.length() {
+            let tm = tinfo.methods[mi]
+            if tm.name == method_name {
+              let want_args = if tm.param_tys.length() > 0 {
+                tm.param_tys.length() - 1
+              } else {
+                0
+              }
+              if args.length() != want_args {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "trait method `dyn " +
+                  tname +
+                  "::" +
+                  method_name +
+                  "` expects " +
+                  want_args.to_string() +
+                  " argument(s), found " +
+                  args.length().to_string(),
+                  want_args.to_string() + " args",
+                  args.length().to_string() + " args",
+                  "pass " + want_args.to_string() + " argument(s)",
+                )
+              }
+              let mut ai = 0
+              while ai < args.length() {
+                let p_idx = ai + 1
+                let exp_p : Option[Ty] = if p_idx < tm.param_tys.length() {
+                  Some(tm.param_tys[p_idx])
+                } else {
+                  None
+                }
+                let aty = check_expr(tc, env, args[ai], exp_p)
+                if p_idx < tm.param_tys.length() && !ty_compat(tm.param_tys[p_idx], aty) {
+                  tc_err(
+                    tc,
+                    expr_span(args[ai]),
+                    "E_TYPE_MISMATCH",
+                    "argument type mismatch in `dyn " +
+                    tname +
+                    "::" +
+                    method_name +
+                    "`",
+                    ty_to_string(tm.param_tys[p_idx]),
+                    ty_to_string(aty),
+                    "pass a value of type `" + ty_to_string(tm.param_tys[p_idx]) + "`",
+                  )
+                }
+                ai = ai + 1
+              }
+              return tm.ret_ty
+            }
+            mi = mi + 1
+          }
+        }
+        None => ()
+      }
     TParam(tp_name) => {
       match env.type_bounds.get(tp_name) {
         Some(bound_traits) => {
@@ -3985,6 +4596,47 @@ fn check_method_call(
 
 ///|
 fn check_expr(
+  tc : TypeChecker,
+  env : Env,
+  expr : Expr,
+  expected : Option[Ty],
+) -> Ty {
+  let ty = check_expr_inner(tc, env, expr, expected)
+  match expected {
+    Some(TDynTrait(tname)) =>
+      match ty {
+        TDynTrait(_) | TError | TNever => ty
+        _ => {
+          let impl_key = tname + "::" + ty_base_name(ty)
+          if tc.impls.contains(impl_key) {
+            TDynTrait(tname)
+          } else {
+            tc_err(
+              tc,
+              expr_span(expr),
+              "E_TRAIT_NOT_IMPLEMENTED",
+              "type `" +
+              ty_to_string(ty) +
+              "` does not implement trait `" +
+              tname +
+              "` required for `dyn " +
+              tname +
+              "`",
+              "impl " + tname + " for " + ty_to_string(ty),
+              ty_to_string(ty),
+              "add `impl " + tname + " for " + ty_to_string(ty) + " { ... }`",
+            )
+            add_missing_impl_edit(tc, tname, ty)
+            TError
+          }
+        }
+      }
+    _ => ty
+  }
+}
+
+///|
+fn check_expr_inner(
   tc : TypeChecker,
   env : Env,
   expr : Expr,
@@ -4729,6 +5381,10 @@ fn check_expr(
                 }
                 i = i + 1
               }
+              let fix_hint = match find_closest_name(field_name, sinfo.field_names, 2) {
+                Some(best) => "did you mean `" + best + "`?"
+                None => "check field name on `" + sname + "`"
+              }
               tc_err(
                 tc,
                 sp,
@@ -4736,8 +5392,20 @@ fn check_expr(
                 "struct `" + sname + "` has no field `" + field_name + "`",
                 "valid field of `" + sname + "`",
                 field_name,
-                "check field name on `" + sname + "`",
+                fix_hint,
               )
+              match find_closest_name(field_name, sinfo.field_names, 2) {
+                Some(best) =>
+                  tc_add_edit(tc, TextEdit::{
+                    file: sp.file,
+                    line: sp.line,
+                    col: sp.col + 1,
+                    end_line: sp.line,
+                    end_col: sp.col + 1 + field_name.length(),
+                    replacement: best,
+                  })
+                None => ()
+              }
               TError
             }
           }
@@ -4831,23 +5499,27 @@ fn check_expr(
         }
       }
       let first_ty = check_expr(tc, env, elems[0], exp_elem)
+      let target_elem = match exp_elem {
+        Some(TDynTrait(tn)) => TDynTrait(tn)
+        _ => first_ty
+      }
       let mut i = 1
       while i < elems.length() {
-        let ety = check_expr(tc, env, elems[i], Some(first_ty))
-        if !ty_compat(first_ty, ety) {
+        let ety = check_expr(tc, env, elems[i], Some(target_elem))
+        if !ty_compat(target_elem, ety) {
           tc_err(
             tc,
             sp,
             "E_TYPE_MISMATCH",
             "array literal element type mismatch",
-            ty_to_string(first_ty),
+            ty_to_string(target_elem),
             ty_to_string(ety),
-            "ensure all array elements have type `" + ty_to_string(first_ty) + "`",
+            "ensure all array elements have type `" + ty_to_string(target_elem) + "`",
           )
         }
         i = i + 1
       }
-      TArray(first_ty)
+      TArray(target_elem)
     }
     EStructLit(sname, fields, sp) => {
       let mut resolved_name = if sname != "" {
@@ -4925,6 +5597,10 @@ fn check_expr(
               j = j + 1
             }
             if found_idx < 0 {
+              let fix_hint = match find_closest_name(f.name, sinfo.field_names, 2) {
+                Some(best) => "did you mean `" + best + "`?"
+                None => "remove or rename field `" + f.name + "`"
+              }
               tc_err(
                 tc,
                 f.span,
@@ -4932,8 +5608,20 @@ fn check_expr(
                 "unknown field `" + f.name + "` on struct `" + resolved_name + "`",
                 "valid field",
                 f.name,
-                "remove or rename field `" + f.name + "`",
+                fix_hint,
               )
+              match find_closest_name(f.name, sinfo.field_names, 2) {
+                Some(best) =>
+                  tc_add_edit(tc, TextEdit::{
+                    file: f.span.file,
+                    line: f.span.line,
+                    col: f.span.col,
+                    end_line: f.span.line,
+                    end_col: f.span.col + f.name.length(),
+                    replacement: best,
+                  })
+                None => ()
+              }
               let _ = check_expr(tc, env, f.value, None)
             } else {
               let exp_f = subst_ty(sinfo.field_tys[found_idx], subst)
@@ -5177,6 +5865,28 @@ fn check_expr(
                     "mut " + ty_to_string(b.ty),
                     "wrap `" + cap.name + "` in `Mutex::new(...)` or `AtomicInt::new(...)`",
                   )
+                  if b.init_span.line > 0 && b.init_end_col > 0 && is_send_ty(tc, TMutex(b.ty), []) {
+                    if b.ty_span.line > 0 && b.ty_end_col > 0 {
+                      tc_add_edit(tc, text_edit_insert(b.ty_span, 0, "Mutex["))
+                      tc_add_edit(tc, TextEdit::{
+                        file: b.ty_span.file,
+                        line: b.ty_span.line,
+                        col: b.ty_end_col,
+                        end_line: b.ty_span.line,
+                        end_col: b.ty_end_col,
+                        replacement: "]",
+                      })
+                    }
+                    tc_add_edit(tc, text_edit_insert(b.init_span, 0, "Mutex::new("))
+                    tc_add_edit(tc, TextEdit::{
+                      file: b.init_span.file,
+                      line: b.init_span.line,
+                      col: b.init_end_col,
+                      end_line: b.init_span.line,
+                      end_col: b.init_end_col,
+                      replacement: ")",
+                    })
+                  }
                 } else if !is_send_ty(tc, b.ty, []) {
                   tc_err(
                     tc,
@@ -5187,6 +5897,32 @@ fn check_expr(
                     ty_to_string(b.ty),
                     "wrap `" + cap.name + "` in `Mutex::new(...)` or transfer ownership with `move " + cap.name + "`",
                   )
+                  if b.init_span.line > 0 &&
+                    b.init_end_col > 0 &&
+                    is_send_ty(tc, TMutex(b.ty), []) {
+                    if b.ty_span.line > 0 && b.ty_end_col > 0 {
+                      tc_add_edit(tc, text_edit_insert(b.ty_span, 0, "Mutex["))
+                      tc_add_edit(tc, TextEdit::{
+                        file: b.ty_span.file,
+                        line: b.ty_span.line,
+                        col: b.ty_end_col,
+                        end_line: b.ty_span.line,
+                        end_col: b.ty_end_col,
+                        replacement: "]",
+                      })
+                    }
+                    tc_add_edit(tc, text_edit_insert(b.init_span, 0, "Mutex::new("))
+                    tc_add_edit(tc, TextEdit::{
+                      file: b.init_span.file,
+                      line: b.init_span.line,
+                      col: b.init_end_col,
+                      end_line: b.init_span.line,
+                      end_col: b.init_end_col,
+                      replacement: ")",
+                    })
+                  } else if cap.span.line > 0 {
+                    tc_add_edit(tc, text_edit_insert(cap.span, 0, "move "))
+                  }
                 }
               }
               None => ()
@@ -5200,8 +5936,14 @@ fn check_expr(
       TUnit
     }
     EAs(inner, target, _) => {
-      let _ = check_expr(tc, env, inner, None)
-      resolve_type_expr(tc, target, env.type_params)
+      let rty = resolve_type_expr(tc, target, env.type_params)
+      match rty {
+        TDynTrait(_) => check_expr(tc, env, inner, Some(rty))
+        _ => {
+          let _ = check_expr(tc, env, inner, None)
+          rty
+        }
+      }
     }
     ETry(inner, sp) => {
       let ity = check_expr(tc, env, inner, None)
@@ -5903,6 +6645,8 @@ pub fn check_package_with_imports(
           match finfo_opt {
             Some(finfo) => {
               let env = env_new(finfo.ret_ty, fd.type_params)
+              env.fn_lparen_span = fd.lparen_span
+              env.fn_has_params = fd.params.length() > 0
               if fd.type_params.length() > 0 {
                 env.fn_key = span_key(fd.span)
               }
@@ -5952,6 +6696,30 @@ pub fn check_package_with_imports(
                   ty_to_string(body_ty),
                   "return a value of type `" + ty_to_string(finfo.ret_ty) + "`",
                 )
+                match fd.ret_ty {
+                  TyMissing(_) => ()
+                  _ =>
+                    match body_ty {
+                      TError | TNever => ()
+                      _ => {
+                        let body_rs = ty_to_string(body_ty)
+                        if !has_qual_sep(body_rs) {
+                          let rsp = type_expr_span(fd.ret_ty)
+                          let end_col = type_expr_end_col(fd.ret_ty)
+                          if end_col > 0 {
+                            tc_add_edit(tc, TextEdit::{
+                              file: rsp.file,
+                              line: rsp.line,
+                              col: rsp.col,
+                              end_line: rsp.line,
+                              end_col: end_col,
+                              replacement: body_rs,
+                            })
+                          }
+                        }
+                      }
+                    }
+                }
               }
             }
             None => ()

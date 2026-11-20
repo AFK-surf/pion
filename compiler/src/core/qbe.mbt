@@ -135,6 +135,8 @@ pub struct QbeGen {
   slot_drop_seen : Map[String, Bool]
   fn_wrappers : Array[String]
   fn_wrapper_seen : Map[String, Bool]
+  dyn_vtable_seen : Map[String, Bool]
+  dyn_vtables : Array[String]
   extra_fns : Array[String]
   mono_seen : Map[String, Bool]
   mono_queue : Array[QbeMonoReq]
@@ -186,6 +188,7 @@ pub struct QbeGen {
   mut need_drop_res_ok : Bool
   mut need_drop_res_err : Bool
   mut need_drop_res_both : Bool
+  mut need_drop_dyn : Bool
 }
 
 ///|
@@ -220,7 +223,8 @@ fn qbe_is_niche_opt_inner(t : Ty) -> Bool {
     | TChannel(_)
     | TMutex(_)
     | TAtomicInt
-    | TTuple(_) => true
+    | TTuple(_)
+    | TDynTrait(_) => true
     _ => false
   }
 }
@@ -276,6 +280,7 @@ fn qbe_mangle_ty(t : Ty) -> String {
     TMap(k, v) => "Map_" + qbe_mangle_ty(k) + "_" + qbe_mangle_ty(v)
     TStruct(n, _) => qbe_sanitize_sym(n)
     TEnum(n, _) => qbe_sanitize_sym(n)
+    TDynTrait(n) => "dyn_" + qbe_sanitize_sym(n)
     _ => qbe_sanitize_sym(ty_to_string(t))
   }
 }
@@ -1431,20 +1436,37 @@ fn qbe_emit_arg_maybe_borrow_ext(
   can_borrow : Bool,
   can_borrow_arr_field : Bool,
 ) -> QbeArgVal {
+  let expect_dyn = match expected {
+    Some(TDynTrait(_)) => true
+    _ => false
+  }
   if can_borrow {
     match arg {
       EString(s, _) =>
-        return QbeArgVal::{ qv: qval(qbe_emit_string_lit(g, s), TString), borrowed: true }
+        if !expect_dyn {
+          return QbeArgVal::{ qv: qval(qbe_emit_string_lit(g, s), TString), borrowed: true }
+        }
       EIdent(lname, _) =>
         match qbe_lookup_local(g, lname) {
           Some(loc) => {
-            g.unfrozen_local_arrs.remove(lname)
-            let t = qbe_load_local_slot(g, loc.slot, loc.ty)
-            return QbeArgVal::{ qv: qval(t, loc.ty), borrowed: true }
+            let loc_ok = if !expect_dyn {
+              true
+            } else {
+              match loc.ty {
+                TDynTrait(_) => true
+                _ => false
+              }
+            }
+            if loc_ok {
+              g.unfrozen_local_arrs.remove(lname)
+              let t = qbe_load_local_slot(g, loc.slot, loc.ty)
+              return QbeArgVal::{ qv: qval(t, loc.ty), borrowed: true }
+            }
           }
           None => ()
         }
       EField(EIdent(lname, _), fname, _) =>
+        if !expect_dyn {
         match qbe_lookup_local(g, lname) {
           Some(loc) =>
             match loc.ty {
@@ -1486,8 +1508,9 @@ fn qbe_emit_arg_maybe_borrow_ext(
             }
           None => ()
         }
+        }
       EField(EIndex(EIdent(aname, _), idx_expr, _), fname, _) =>
-        if can_borrow_arr_field {
+        if can_borrow_arr_field && !expect_dyn {
           match qbe_lookup_local(g, aname) {
             Some(aloc) =>
               match aloc.ty {
@@ -5028,6 +5051,8 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     slot_drop_seen: Map([]),
     fn_wrappers: [],
     fn_wrapper_seen: Map([]),
+    dyn_vtable_seen: Map([]),
+    dyn_vtables: [],
     extra_fns: [],
     mono_seen: Map([]),
     mono_queue: [],
@@ -5079,6 +5104,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     need_drop_res_ok: false,
     need_drop_res_err: false,
     need_drop_res_both: false,
+    need_drop_dyn: false,
   }
 }
 
@@ -5815,8 +5841,140 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
+    TDynTrait(_) => {
+      let fn_sym = "$pion_freeze_dyn"
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      g.extra_fns.push(
+        "function $pion_freeze_dyn(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n    %vp =l add %obj, 8\n    %vt =l loadl %vp\n    %fa =l add %vt, 8\n    %fz =l loadl %fa\n    jnz %fz, @call_fz, @done\n@call_fz\n    %data =l loadl %obj\n    call %fz(l %data)\n@done\n    ret\n}\n\n",
+      )
+      fn_sym
+    }
     _ => "$pion_rc_freeze"
   }
+}
+
+///|
+fn qbe_ensure_dyn_vtable(
+  g : QbeGen,
+  trait_name : String,
+  concrete_ty : Ty,
+) -> String {
+  let c_trait = canon_trait_name(g.tc, trait_name)
+  let tname = ty_base_name(concrete_ty)
+  let vt_sym = "$pion_vtable_" +
+    qbe_sanitize_sym(c_trait) +
+    "__" +
+    qbe_sanitize_sym(tname)
+  if g.dyn_vtable_seen.contains(vt_sym) {
+    return vt_sym
+  }
+  g.dyn_vtable_seen.set(vt_sym, true)
+  let is_obj_s = if qbe_is_obj_ty(concrete_ty) { "1" } else { "0" }
+  let fz_sym = if qbe_is_obj_ty(concrete_ty) {
+    let f = qbe_ensure_freeze_fn(g, concrete_ty)
+    if f.length() > 0 { f } else { "0" }
+  } else {
+    "0"
+  }
+  let impl_key = c_trait + "::" + tname
+  let vt_sb = StringBuilder()
+  vt_sb.write_string("data ")
+  vt_sb.write_string(vt_sym)
+  vt_sb.write_string(" = align 8 { l ")
+  vt_sb.write_string(is_obj_s)
+  vt_sb.write_string(", l ")
+  vt_sb.write_string(fz_sym)
+  match lookup_trait(g.tc, c_trait) {
+    Some(tinfo) =>
+      match g.tc.impls.get(impl_key) {
+        Some(iinfo) => {
+          let mut mi = 0
+          while mi < tinfo.methods.length() {
+            let tm = tinfo.methods[mi]
+            let wrap_sym = "$pion_dyn_wrap_" +
+              qbe_sanitize_sym(c_trait) +
+              "__" +
+              qbe_sanitize_sym(tname) +
+              "__" +
+              tm.name
+            vt_sb.write_string(", l ")
+            vt_sb.write_string(wrap_sym)
+            let impl_sym = qbe_impl_method_sym(
+              g,
+              iinfo.pkg_name,
+              iinfo.trait_name,
+              iinfo.target_type,
+              tm.name,
+            )
+            let ret_abi = qbe_abi_ty(tm.ret_ty)
+            let wsb = StringBuilder()
+            wsb.write_string("function ")
+            wsb.write_string(ret_abi)
+            wsb.write_string(" ")
+            wsb.write_string(wrap_sym)
+            wsb.write_string("(l %self_raw")
+            let mut pi = 1
+            while pi < tm.param_tys.length() {
+              wsb.write_string(", ")
+              wsb.write_string(qbe_abi_ty(tm.param_tys[pi]))
+              wsb.write_string(" %a")
+              wsb.write_string(pi.to_string())
+              pi = pi + 1
+            }
+            wsb.write_string(") {\n@start\n")
+            let self_arg = if qbe_is_int32_ty(concrete_ty) {
+              wsb.write_string("    %self =w copy %self_raw\n")
+              "w %self"
+            } else if qbe_is_double_ty(concrete_ty) {
+              wsb.write_string("    %self =d cast %self_raw\n")
+              "d %self"
+            } else {
+              "l %self_raw"
+            }
+            wsb.write_string("    %r =")
+            wsb.write_string(ret_abi)
+            wsb.write_string(" call ")
+            wsb.write_string(impl_sym)
+            wsb.write_string("(")
+            wsb.write_string(self_arg)
+            pi = 1
+            while pi < tm.param_tys.length() {
+              wsb.write_string(", ")
+              wsb.write_string(qbe_abi_ty(tm.param_tys[pi]))
+              wsb.write_string(" %a")
+              wsb.write_string(pi.to_string())
+              pi = pi + 1
+            }
+            wsb.write_string(")\n    ret %r\n}\n\n")
+            g.extra_fns.push(wsb.to_string())
+            mi = mi + 1
+          }
+        }
+        None => ()
+      }
+    None => ()
+  }
+  vt_sb.write_string(" }\n")
+  g.dyn_vtables.push(vt_sb.to_string())
+  vt_sym
+}
+
+///|
+fn qbe_box_dyn(g : QbeGen, v : QbeVal, trait_name : String) -> QbeVal {
+  let c_trait = canon_trait_name(g.tc, trait_name)
+  let vt_sym = qbe_ensure_dyn_vtable(g, c_trait, v.ty)
+  g.need_drop_dyn = true
+  let data_l = qbe_as_l(g, v)
+  let box_r = qbe_tmp(g)
+  let vp = qbe_tmp(g)
+  qbe_emit(g, box_r + " =l call $pion_alloc_uninit(w 16, w 4, l $pion_drop_dyn)")
+  qbe_emit(g, "storel " + data_l + ", " + box_r)
+  qbe_emit(g, vp + " =l add " + box_r + ", 8")
+  qbe_emit(g, "storel " + vt_sym + ", " + vp)
+  qval(box_r, TDynTrait(c_trait))
 }
 
 ///|
@@ -8525,6 +8683,89 @@ fn qbe_emit_method_call(
         None => ()
       }
     }
+    TDynTrait(tname) =>
+      match lookup_trait(g.tc, tname) {
+        Some(tinfo) => {
+          let mut mi = 0
+          while mi < tinfo.methods.length() {
+            let tm = tinfo.methods[mi]
+            if tm.name == method_name {
+              let arg_vals : Array[String] = []
+              let arg_tys : Array[Ty] = []
+              let arg_borrowed : Array[Bool] = []
+              let mut i = 0
+              while i < args.length() {
+                let p_idx = i + 1
+                let exp_p : Option[Ty] = if p_idx < tm.param_tys.length() {
+                  Some(tm.param_tys[p_idx])
+                } else {
+                  None
+                }
+                let aa = qbe_emit_arg_maybe_borrow(g, args[i], exp_p, args_pure)
+                arg_vals.push(aa.qv.reg)
+                arg_tys.push(aa.qv.ty)
+                arg_borrowed.push(aa.borrowed)
+                i = i + 1
+              }
+              let data_r = qbe_tmp(g)
+              let vp_r = qbe_tmp(g)
+              let vt_r = qbe_tmp(g)
+              let fpa_r = qbe_tmp(g)
+              let fp_r = qbe_tmp(g)
+              let slot_off = (2 + mi) * 8
+              qbe_emit(g, data_r + " =l loadl " + obj_val)
+              qbe_emit(g, vp_r + " =l add " + obj_val + ", 8")
+              qbe_emit(g, vt_r + " =l loadl " + vp_r)
+              qbe_emit(g, fpa_r + " =l add " + vt_r + ", " + slot_off.to_string())
+              qbe_emit(g, fp_r + " =l loadl " + fpa_r)
+              let ret_abi = qbe_abi_ty(tm.ret_ty)
+              let res = qbe_tmp(g)
+              let sb = StringBuilder()
+              sb.write_string(res)
+              sb.write_string(" =")
+              sb.write_string(ret_abi)
+              sb.write_string(" call ")
+              sb.write_string(fp_r)
+              sb.write_string("(l ")
+              sb.write_string(data_r)
+              let mut j = 0
+              while j < arg_vals.length() {
+                let p_idx = j + 1
+                let decl_pty = if p_idx < tm.param_tys.length() {
+                  tm.param_tys[p_idx]
+                } else {
+                  arg_tys[j]
+                }
+                let coerced = qbe_coerce_val(
+                  g,
+                  qval(arg_vals[j], arg_tys[j]),
+                  decl_pty,
+                )
+                sb.write_string(", ")
+                sb.write_string(qbe_abi_ty(decl_pty))
+                sb.write_string(" ")
+                sb.write_string(coerced)
+                j = j + 1
+              }
+              sb.write_string(")")
+              qbe_emit(g, sb.to_string())
+              j = 0
+              while j < arg_vals.length() {
+                if !arg_borrowed[j] {
+                  qbe_rc_dec(g, arg_vals[j], arg_tys[j])
+                }
+                j = j + 1
+              }
+              if !obj_borrowed {
+                qbe_rc_dec(g, obj_val, recv_ty)
+              }
+              return qval(res, tm.ret_ty)
+            }
+            mi = mi + 1
+          }
+        }
+        None => ()
+      }
     _ => ()
   }
   match qbe_find_impl_method(g, recv_ty, method_name) {
@@ -9551,6 +9792,23 @@ fn qbe_emit_expr(
   expr : Expr,
   expected : Option[Ty],
 ) -> QbeVal {
+  let res = qbe_emit_expr_inner(g, expr, expected)
+  match expected {
+    Some(TDynTrait(tname)) =>
+      match res.ty {
+        TDynTrait(_) | TNever | TError => res
+        _ => qbe_box_dyn(g, res, tname)
+      }
+    _ => res
+  }
+}
+
+///|
+fn qbe_emit_expr_inner(
+  g : QbeGen,
+  expr : Expr,
+  expected : Option[Ty],
+) -> QbeVal {
   match expr {
     EInt(raw, _) => {
       let v64 = qbe_parse_int64_lit(raw)
@@ -9845,8 +10103,12 @@ fn qbe_emit_expr(
       qval(res, TString)
     }
     EAs(inner, target, _) => {
-      let v = qbe_emit_expr(g, inner, None)
       let rty = qbe_resolve_type(g, target)
+      match rty {
+        TDynTrait(_) => return qbe_emit_expr(g, inner, Some(rty))
+        _ => ()
+      }
+      let v = qbe_emit_expr(g, inner, None)
       match rty {
         TDouble =>
           match v.ty {
@@ -15304,6 +15566,19 @@ fn qbe_emit_helper_drops(g : QbeGen, out : StringBuilder) -> Unit {
       "function $pion_drop_res_both(l %p) {\n@start\n    %a =l add %p, 8\n    %v =l loadl %a\n    call $pion_rc_dec(l %v)\n    ret\n}\n\n",
     )
   }
+  if g.need_drop_dyn {
+    out.write_string(
+      "function $pion_drop_dyn(l %p) {\n@start\n    %vp =l add %p, 8\n    %vt =l loadl %vp\n    %is_obj =l loadl %vt\n    jnz %is_obj, @dec, @done\n@dec\n    %data =l loadl %p\n    call $pion_rc_dec(l %data)\n@done\n    ret\n}\n\n",
+    )
+  }
+  let mut dvi = 0
+  while dvi < g.dyn_vtables.length() {
+    out.write_string(g.dyn_vtables[dvi])
+    dvi = dvi + 1
+  }
+  if g.dyn_vtables.length() > 0 {
+    out.write_string("\n")
+  }
   let mut i = 0
   while i < g.slot_drop_masks.length() {
     let mask = g.slot_drop_masks[i]
@@ -15460,6 +15735,12 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
             tc.variant_to_enum.set(ed.variants[vi].name, ed.name)
             vi = vi + 1
           }
+        }
+        DTrait(td) => {
+          if !tc.traits.contains(td.name) {
+            tc.trait_names.push(td.name)
+          }
+          tc.traits.set(td.name, TraitInfo::{ decl: td, methods: [] })
         }
         _ => ()
       }

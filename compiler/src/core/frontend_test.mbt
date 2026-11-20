@@ -1430,7 +1430,7 @@ fn expect_edit_fixes(src : String, code : String, want_patched : String) -> Unit
 
 ///|
 test "p17a: diagnostics without a patch keep the compact JSON shape" {
-  let (_, json, _) = check_one("pub fn f() -> Int {\n  \"s\"\n}\n")
+  let (_, json, _) = check_one("pub fn f() -> Int {\n  unknown_var\n}\n")
   assert_true(!str_contains(json, "edits"), json)
 }
 
@@ -1817,5 +1817,290 @@ test "p19b: StringBuilder::length and closure return type checking" {
   assert_true(
     str_contains(bad_json, "E_TYPE_MISMATCH") && str_contains(bad_json, "String"),
     "closure bad return should check against closure return type: " + bad_json,
+  )
+}
+
+///|
+test "p20a: dyn Trait implicit/explicit boxing, collections, Option, cross-pkg, and error checks" {
+  let ok_src =
+    #|pub trait Describe {
+    #|  describe(self : Self) -> String
+    #|  score(self : Self, bonus : Int) -> Int
+    #|}
+    #|pub struct Dog {
+    #|  name : String
+    #|}
+    #|impl Describe for Dog {
+    #|  fn describe(self : Dog) -> String {
+    #|    "dog:" + self.name
+    #|  }
+    #|  fn score(self : Dog, bonus : Int) -> Int {
+    #|    self.name.length() + bonus
+    #|  }
+    #|}
+    #|impl Describe for Int {
+    #|  fn describe(self : Int) -> String {
+    #|    "int:" + self.to_string()
+    #|  }
+    #|  fn score(self : Int, bonus : Int) -> Int {
+    #|    self + bonus
+    #|  }
+    #|}
+    #|pub struct Boxed {
+    #|  item : dyn Describe
+    #|}
+    #|fn render(x : dyn Describe) -> String {
+    #|  x.describe() + ":" + x.score(1).to_string()
+    #|}
+    #|fn make_dyn(flag : Bool) -> dyn Describe {
+    #|  if flag {
+    #|    Dog::{ name: "rex" }
+    #|  } else {
+    #|    42
+    #|  }
+    #|}
+    #|pub fn main() -> Int {
+    #|  let a : dyn Describe = Dog::{ name: "fido" }
+    #|  let b = 7 as dyn Describe
+    #|  let items : Array[dyn Describe] = [Dog::{ name: "a" }, 10]
+    #|  items.push(Dog::{ name: "b" })
+    #|  items.push(99)
+    #|  let opt : Option[dyn Describe] = Some(Dog::{ name: "c" })
+    #|  let opt2 : Option[dyn Describe] = None
+    #|  let w = Boxed::{ item: 5 }
+    #|  let _ = render(Dog::{ name: "d" })
+    #|  let _ = render(a)
+    #|  let _ = render(b)
+    #|  let _ = render(w.item)
+    #|  let _ = render(make_dyn(true))
+    #|  let _ = match opt {
+    #|    Some(v) => v.describe()
+    #|    None => ""
+    #|  }
+    #|  let _ = match opt2 {
+    #|    Some(v) => v.describe()
+    #|    None => ""
+    #|  }
+    #|  items.length()
+    #|}
+  let (ok, json, _) = check_one(ok_src)
+  assert_true(ok, "dyn Trait ok: " + json)
+  let pkg = @core.parse_package("demo", ["demo.pion"], [ok_src])
+  let sig = @core.emit_pionsig(pkg)
+  assert_true(str_contains(sig, "dyn Describe"), "pionsig dyn: " + sig)
+
+  // Cross-package `dyn pkg::Trait`
+  let lib_src =
+    #|pub trait Greet {
+    #|  greet(self : Self) -> String
+    #|}
+    #|pub struct Bot {
+    #|  id : Int
+    #|}
+    #|impl Greet for Bot {
+    #|  fn greet(self : Bot) -> String {
+    #|    "bot" + self.id.to_string()
+    #|  }
+    #|}
+  let app_src =
+    #|import "lib" as l
+    #|pub fn say(x : dyn l::Greet) -> String {
+    #|  x.greet()
+    #|}
+    #|pub fn main() -> Int {
+    #|  let b = l::Bot::{ id: 1 }
+    #|  let xs : Array[dyn l::Greet] = [b]
+    #|  say(xs[0]).length()
+    #|}
+  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.pion"], [lib_src], [], true)
+  assert_true(lib_cr.diagnostics.length() == 0, "lib check")
+  let app_cr = @core.check_source_files_with_imports(
+    "app",
+    ["app.pion"],
+    [app_src],
+    [@core.imported_pkg_new("lib", lib_cr.tc)],
+    true,
+  )
+  assert_true(
+    app_cr.diagnostics.length() == 0,
+    "cross-pkg dyn: " + @core.check_result_to_json(app_cr.diagnostics),
+  )
+
+  // Reject == on dyn Trait
+  let eq_src =
+    #|trait T {
+    #|  f(self : Self) -> Int
+    #|}
+    #|impl T for Int {
+    #|  fn f(self : Int) -> Int { self }
+    #|}
+    #|pub fn bad(a : dyn T, b : dyn T) -> Bool {
+    #|  a == b
+    #|}
+  let (eq_ok, eq_json, _) = check_one(eq_src)
+  assert_true(!eq_ok && str_contains(eq_json, "no implicit pointer-identity comparison"), eq_json)
+
+  // Reject non-object-safe trait (returning Self)
+  let nos_src =
+    #|trait Clone {
+    #|  clone(self : Self) -> Self
+    #|}
+    #|pub fn bad(x : dyn Clone) -> Int {
+    #|  0
+    #|}
+  let (nos_ok, nos_json, _) = check_one(nos_src)
+  assert_true(!nos_ok && str_contains(nos_json, "not object-safe"), nos_json)
+
+  // Reject non-Send dyn Trait in spawn
+  let send_src =
+    #|trait T {
+    #|  f(self : Self) -> Int
+    #|}
+    #|impl T for Int {
+    #|  fn f(self : Int) -> Int { self }
+    #|}
+    #|pub fn main(world : World) -> Int {
+    #|  let x : dyn T = 1
+    #|  scope(world, fn(s : Scope) -> Unit {
+    #|    spawn(s, fn() -> Unit {
+    #|      let _ = x.f()
+    #|    })
+    #|  })
+    #|  0
+    #|}
+  let (send_ok, send_json, _) = check_one(send_src)
+  assert_true(!send_ok && str_contains(send_json, "E_NOT_SEND"), send_json)
+
+  // Unimplemented type for dyn Trait emits E_TRAIT_NOT_IMPLEMENTED with impl edit
+  let unimpl_src =
+    "trait Describe {\n" +
+    "  describe(self : Self) -> String\n" +
+    "}\n" +
+    "struct Cat {\n" +
+    "  name : String\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let x : dyn Describe = Cat::{ name: \"m\" }\n" +
+    "  x.describe().length()\n" +
+    "}\n"
+  expect_edit_fixes(unimpl_src, "E_TRAIT_NOT_IMPLEMENTED", "impl Describe for Cat {")
+}
+
+///|
+test "p20a: 6 new machine-applicable edits complete 12/12 coverage" {
+  // e01_type_mismatch: fn declared return type vs body type
+  let e01 =
+    "fn label(n : Int) -> Int {\n" +
+    "  \"n=\" + n.to_string()\n" +
+    "}\n" +
+    "pub fn main(world : World) -> Int {\n" +
+    "  io_println(world, label(3).to_string())\n" +
+    "  0\n" +
+    "}\n"
+  expect_edit_fixes(e01, "E_TYPE_MISMATCH", "fn label(n : Int) -> String {")
+
+  // e02_wrong_arity (extra argument)
+  let e02_extra =
+    "fn add(a : Int, b : Int) -> Int {\n" +
+    "  a + b\n" +
+    "}\n" +
+    "pub fn main(world : World) -> Int {\n" +
+    "  io_println(world, add(1, 2, 3).to_string())\n" +
+    "  0\n" +
+    "}\n"
+  expect_edit_fixes(e02_extra, "E_TYPE_MISMATCH", "add(1, 2).to_string()")
+
+  // e02_wrong_arity (missing argument)
+  let e02_missing =
+    "fn add(a : Int, b : Int) -> Int {\n" +
+    "  a + b\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  add(1)\n" +
+    "}\n"
+  expect_edit_fixes(e02_missing, "E_TYPE_MISMATCH", "add(1, 0)")
+
+  // e03_unknown_field (Levenshtein <= 2 typo)
+  let e03 =
+    "pub struct User {\n" +
+    "  name : String\n" +
+    "  age : Int\n" +
+    "}\n" +
+    "pub fn main(world : World) -> Int {\n" +
+    "  let u = User::{ name: \"ada\", age: 36 }\n" +
+    "  io_println(world, u.agee.to_string())\n" +
+    "  0\n" +
+    "}\n"
+  expect_edit_fixes(e03, "E_TYPE_MISMATCH", "u.age.to_string()")
+
+  // e06_missing_trait_impl (generic bound)
+  let e06 =
+    "pub trait Describe {\n" +
+    "  describe(self : Self) -> String\n" +
+    "}\n" +
+    "pub struct Point {\n" +
+    "  x : Int\n" +
+    "  y : Int\n" +
+    "}\n" +
+    "impl Describe for Int {\n" +
+    "  fn describe(self : Int) -> String {\n" +
+    "    \"int \" + self.to_string()\n" +
+    "  }\n" +
+    "}\n" +
+    "fn show_all[T : Describe](x : T) -> String {\n" +
+    "  x.describe()\n" +
+    "}\n" +
+    "pub fn main(world : World) -> Int {\n" +
+    "  io_println(world, show_all(1))\n" +
+    "  io_println(world, show_all(Point::{ x: 1, y: 2 }))\n" +
+    "  0\n" +
+    "}\n"
+  expect_edit_fixes(e06, "E_TRAIT_NOT_IMPLEMENTED", "impl Describe for Point {")
+
+  // e10_missing_capability (adds `world : World, ` to enclosing function)
+  let e10 =
+    "fn load_config(path : String) -> String {\n" +
+    "  match fs_read(path) {\n" +
+    "    Ok(s) => s\n" +
+    "    Err(_) => \"\"\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn main(world : World) -> Int {\n" +
+    "  io_println(world, load_config(\"/etc/hosts\"))\n" +
+    "  0\n" +
+    "}\n"
+  let (ok10, json10, diags10) = check_one(e10)
+  assert_true(!ok10 && str_contains(json10, "E_CAPABILITY_MISSING"), json10)
+  assert_true(all_edits(diags10).length() > 0, "e10 edits: " + json10)
+  let patched10 = apply_edits(e10, "test.pion", all_edits(diags10))
+  assert_true(
+    str_contains(patched10, "fn load_config(world : World, path : String) -> String {"),
+    patched10,
+  )
+  // Applying the edit removes E_CAPABILITY_MISSING; only caller arity remains.
+  let (_, json10_2, _) = check_one(patched10)
+  assert_true(!str_contains(json10_2, "E_CAPABILITY_MISSING"), json10_2)
+
+  // e08_data_race_send (wraps non-Send Array in Mutex::new(...))
+  let e08 =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let hits : Array[Int] = []\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    for w in 0..4 {\n" +
+    "      spawn(s, fn() -> Unit {\n" +
+    "        hits.push(w)\n" +
+    "      })\n" +
+    "    }\n" +
+    "  })\n" +
+    "  io_println(world, hits.length().to_string())\n" +
+    "  0\n" +
+    "}\n"
+  let (ok08, json08, diags08) = check_one(e08)
+  assert_true(!ok08 && str_contains(json08, "E_NOT_SEND"), json08)
+  assert_true(all_edits(diags08).length() > 0, "e08 edits: " + json08)
+  let patched08 = apply_edits(e08, "test.pion", all_edits(diags08))
+  assert_true(
+    str_contains(patched08, "let hits : Mutex[Array[Int]] = Mutex::new([])"),
+    patched08,
   )
 }

@@ -387,6 +387,20 @@ fn p_parse_type_expr(p : Parser) -> TypeExpr {
       }
     }
     Ident(name) => {
+      if name == "dyn" {
+        match p_peek_at(p, 1).kind {
+          Ident(_) => {
+            let _ = p_advance(p)
+            let mut tname = p_expect_ident(p, "trait name after `dyn`")
+            if p_match_kind_coloncolon(p) {
+              let mem = p_expect_ident(p, "trait name after `::`")
+              tname = tname + "::" + mem
+            }
+            return TyDynTrait(tname, tok.span)
+          }
+          _ => ()
+        }
+      }
       let _ = p_advance(p)
       let mut full_name = name
       if p_match_kind_coloncolon(p) {
@@ -449,12 +463,13 @@ fn p_parse_struct_decl(
   let tparams = p_parse_type_params(p)
   p_expect_lbrace(p)
   let fields : Array[FieldDecl] = []
+  let mut end_span = start_span
   while !p_is_eof(p) {
     let before_pos = p.pos
     p_skip_semis(p)
     match p_peek(p).kind {
       RBrace => {
-        let _ = p_advance(p)
+        end_span = p_advance(p).span
         break
       }
       _ => {
@@ -511,6 +526,7 @@ fn p_parse_struct_decl(
     type_params: tparams,
     fields: fields,
     span: start_span,
+    end_span: end_span,
   })
 }
 
@@ -521,12 +537,13 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
   let tparams = p_parse_type_params(p)
   p_expect_lbrace(p)
   let variants : Array[VariantDecl] = []
+  let mut end_span = start_span
   while !p_is_eof(p) {
     let before_pos = p.pos
     p_skip_semis(p)
     match p_peek(p).kind {
       RBrace => {
-        let _ = p_advance(p)
+        end_span = p_advance(p).span
         break
       }
       _ => {
@@ -573,6 +590,7 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
     type_params: tparams,
     variants: variants,
     span: start_span,
+    end_span: end_span,
   })
 }
 
@@ -685,6 +703,7 @@ fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
   if tp.names.length() == 0 {
     tp = p_parse_fn_type_params(p)
   }
+  let lparen_span = p_peek(p).span
   let params = p_parse_params(p)
   let ret_ty = if p_match_kind_arrow(p) {
     p_parse_type_expr(p)
@@ -702,6 +721,7 @@ fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
     ret_ty: ret_ty,
     body: body,
     span: start_span,
+    lparen_span: lparen_span,
   })
 }
 
@@ -903,6 +923,7 @@ fn p_parse_impl_decl(p : Parser, start_span : Span) -> Decl {
           }
         }
         let mname = p_expect_ident(p, "impl method name")
+        let mlp_span = p_peek(p).span
         let mparams = p_parse_params(p)
         let mret = if p_match_kind_arrow(p) {
           p_parse_type_expr(p)
@@ -920,6 +941,7 @@ fn p_parse_impl_decl(p : Parser, start_span : Span) -> Decl {
           ret_ty: mret,
           body: mbody,
           span: mspan,
+          lparen_span: mlp_span,
         })
         p_skip_semis(p)
       }

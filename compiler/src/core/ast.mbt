@@ -33,6 +33,7 @@ pub enum TypeExpr {
   TyName(String, Array[TypeExpr], Span)
   TyFn(Array[TypeExpr], TypeExpr, Span)
   TyTuple(Array[TypeExpr], Span)
+  TyDynTrait(String, Span)
   TyMissing(Span)
 }
 
@@ -66,6 +67,7 @@ pub struct StructDecl {
   type_params : Array[String]
   fields : Array[FieldDecl]
   span : Span
+  end_span : Span
 }
 
 ///|
@@ -75,6 +77,7 @@ pub struct EnumDecl {
   type_params : Array[String]
   variants : Array[VariantDecl]
   span : Span
+  end_span : Span
 }
 
 ///|
@@ -94,6 +97,7 @@ pub struct FnDecl {
   ret_ty : TypeExpr
   body : Array[Stmt]
   span : Span
+  lparen_span : Span
 }
 
 ///|
@@ -276,6 +280,7 @@ pub fn type_expr_span(t : TypeExpr) -> Span {
     TyName(_, _, sp) => sp
     TyFn(_, _, sp) => sp
     TyTuple(_, sp) => sp
+    TyDynTrait(_, sp) => sp
     TyMissing(sp) => sp
   }
 }
@@ -331,6 +336,7 @@ pub fn type_expr_to_string(t : TypeExpr) -> String {
       sb.write_string(")")
       sb.to_string()
     }
+    TyDynTrait(name, _) => "dyn " + name
     TyMissing(_) => "<missing>"
   }
 }
