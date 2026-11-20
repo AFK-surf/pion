@@ -164,6 +164,20 @@ This run was on a loaded host: the cold builds of Rust, Go, Zig and Pion took 1.
 
 The `http_event_server` C1000 numbers are from the archived P19 run (not rerun here). Reproduce: `sh examples/http_event_server/run_bench.sh <pionc> 1000 40 4`, `sh std/tls/e2e/run_server_e2e.sh <pionc>` (run by `scripts/test-linux.sh`), `sh examples/http_kv_service/run_bench.sh <pionc> 8 500 8` (with and without `KEEP_ALIVE=1`, both run by `scripts/test-linux.sh`) and `scripts/verify-all.sh` gate 6. On C1000 the latency percentiles are those of 1,000 connections queued on 4 workers; the 8-connection KV numbers measure per-request latency.
 
+**Flagship: `examples/pion_station`.** Three packages (`store`, `router`, the app) in pure `Pion`, zero C glue: HTTPS/1.1 on `std/tls`, Server-Sent Events, a SQLite WAL store through `extern "C"` to the system `libsqlite3`, `dyn Handler` routing with `std/regex` path patterns, and a 4-thread `Channel` job pool. SSE subscribers are closed on disconnect or `limit` and pruned from the broadcast list, so long runs keep no per-connection backlog.
+
+| `examples/pion_station` | Linux x86_64 (`gt2`) | macOS ARM64 (`tokyo-mac-studio-0`) |
+|---|---|---|
+| Tests | 39/39 (`pionc test --json`) | 39/39 |
+| Functional e2e | 4 concurrent pure-Pion TLS clients, 40 jobs, SSE stream, wrong host refused; restart recovery cross-checked 100% by the `sqlite3` CLI | same self-test |
+| Load (4 threads, HTTPS + SQLite + jobs, 0 errors) | **993–1,017 QPS**, P50 3.53–3.57 ms, P99 10.34–10.66 ms, peak RSS 14.4–14.8 MB | 620–937 QPS, peak RSS 7.6 MB |
+| Binary (stripped) | 216,992 B | 245,112 B |
+| Release cold build | 185–214 ms | 124–155 ms |
+| Incremental: one Handler body edit → `pionc test --json --package router` | 77–101 ms | — |
+| Memory / thread safety | ASan + LSan 0 errors, 0 leaks; TSan 0 warnings | — |
+
+Linux numbers span the P21 runs and the v1.0.0 gate run (`scripts/test-linux.sh` on `gt2`); macOS numbers are from the P21 runs (`verify-all.sh` runs the 39 tests, not `run_e2e.sh`). Reproduce: `sh examples/pion_station/run_e2e.sh <pionc>` (cold build, incremental test, self-test, restart + `sqlite3` cross-check, load and peak RSS; run by `scripts/test-linux.sh` where `libsqlite3` and the `sqlite3` CLI exist). QPS here is a full TLS handshake per request plus SQLite writes, not comparable to the plain-TCP services above.
+
 ### 4. Agent-in-the-loop evaluation, 4 languages (`sh benchmarks/agent_eval/run.sh`)
 
 Full report: [`benchmarks/agent_eval/SUMMARY.md`](benchmarks/agent_eval/SUMMARY.md) (run of 2026-11-20 on the same Apple M5 Max; load average 76 / 48 / 34 when the report was written, medians of 1 warmup + 5 runs). 12 engineering tasks and 12 error-class probes per language; check commands `pionc2 check --json`, `moon check --output-json`, `cargo check --message-format=json`, `go build -json`. Gates: 48/48 reference implementations pass, 48/48 probes measured with 0 expectation mismatches.
@@ -243,19 +257,22 @@ Pion's `hello` fell from 71,976 B to 50,792 B stripped and the six V1 binaries f
 # Stage 0 unit tests, <64 KB runtime (O2 + TSan + ASan), 9/9 fixed-point
 # bootstrap, fmt (UTF-8), std/json/http/net/regex + dogfood app tests,
 # pionc init smoke, event-server self-test, cross ELF64 .o, dyn_trait,
-# pionc add/update registry e2e, examples/https_server tests (with Homebrew openssl@3)
+# pionc add/update registry e2e, examples/https_server + examples/pion_station tests
+# (with Homebrew openssl@3)
 sh scripts/verify-all.sh
 out/pionc2 run examples/text_stats
 
 # Linux x86_64 with the macOS Stage 2 SSA: zero-`as` ELF64 objects, <56 KB runtime,
 # epoll event loop, Stage 3 == Stage 4, dyn_trait, pionc add/update e2e, std/tls client +
 # server TLS 1.3/1.2 e2e (examples/https_server vs Python ssl and curl), KV service
-# 8x500 (with/without Keep-Alive), event-server self-test, V1 checksums
+# 8x500 (with/without Keep-Alive), event-server self-test, examples/pion_station
+# tests + run_e2e.sh (with libsqlite3 and the sqlite3 CLI), V1 checksums
 PION_LINUX_SSA="$PWD/out/stage2.ssa" sh scripts/test-linux.sh
 
 # Benchmarks
 sh scripts/bench-v2-exec.sh            # V2 real workloads, 6 languages
 sh examples/http_event_server/run_bench.sh "$PWD/out/pionc2" 1000 40 4   # C1000 keep-alive
+sh examples/pion_station/run_e2e.sh "$PWD/out/pionc2"   # flagship: build, e2e, restart, load
 sh scripts/bench-v2-compile.sh         # V2 50k LOC / 50 packages compile
 PIONC="$PWD/out/pionc2" sh scripts/bench.sh   # V1 classic kernels, 5 languages
 sh benchmarks/agent_eval/run.sh        # agent-in-the-loop, 4 languages
@@ -271,6 +288,6 @@ CI (`.github/workflows/ci.yml`) runs `verify-all.sh` on `macos-15` and then `tes
 - `runtime/` — `<64 KB` C11 runtime (`pion_rt.h`, `pion_rt.c`, `test_rt.c`; BRC, slab allocator, threads, `kqueue`/`epoll` event loop)
 - `vendor/qbe/` — vendored QBE with direct Mach-O / ELF64 object emission and hardware `sqrt` lowering
 - `std/json`, `std/http`, `std/net`, `std/regex`, `std/tls` — standard packages in pure `Pion`
-- `examples/` — `text_stats` (multi-package), `http_loopback`, `http_kv_service`, `http_event_server` (C1000 keep-alive event-loop server), `sqlite_indexer`, `https_server` (pure-Pion HTTPS service on `std/tls`)
+- `examples/` — `text_stats` (multi-package), `http_loopback`, `http_kv_service`, `http_event_server` (C1000 keep-alive event-loop server), `sqlite_indexer`, `https_server` (pure-Pion HTTPS service on `std/tls`), `pion_station` (flagship: HTTPS + SSE + SQLite WAL + `dyn Handler` + worker pool, 3 packages)
 - `benchmarks/` — V1 (`c`, `moonbit`, `zig`, `rust`, `pion`), V2 (`v2/`, + Go) and `agent_eval/`
 - `scripts/` — bootstrap, verification, Linux and benchmark scripts

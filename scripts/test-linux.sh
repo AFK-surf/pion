@@ -239,7 +239,7 @@ fi
 
 FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
   "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" \
-  "$ROOT_DIR/examples/https_server" "$ROOT_DIR/tests/e2e/dyn_trait.pion")"
+  "$ROOT_DIR/examples/https_server" "$ROOT_DIR/tests/e2e/dyn_trait.pion" "$ROOT_DIR/examples/pion_station")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: fmt --check failed on Linux: $FMT_JSON" >&2
@@ -287,6 +287,24 @@ if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null;
   printf '%s' "$HTTPS_JSON" | grep -q '"failed":0'
   # Server side: pure-Pion HTTPS service vs Python ssl / curl, TLS 1.3 and 1.2.
   sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
+  # Flagship examples/pion_station also links the system libsqlite3 and checks
+  # restart recovery with the sqlite3 CLI.
+  if { [ -f /usr/include/sqlite3.h ] || pkg-config --exists sqlite3 2>/dev/null || [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ]; } \
+    && command -v sqlite3 >/dev/null 2>&1; then
+    STATION_LIB_PATH="${LIBRARY_PATH:-}"
+    if [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ] && [ ! -e /usr/lib/x86_64-linux-gnu/libsqlite3.so ]; then
+      # Runtime package only (no -dev): give the linker a libsqlite3.so outside the source tree.
+      ln -sf /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 "$OUT_DIR/libsqlite3.so"
+      STATION_LIB_PATH="$OUT_DIR${STATION_LIB_PATH:+:$STATION_LIB_PATH}"
+    fi
+    STATION_JSON="$(LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --json "$ROOT_DIR/examples/pion_station")"
+    echo "pionc_linux test --json examples/pion_station -> $STATION_JSON"
+    printf '%s' "$STATION_JSON" | grep -q '"ok":true'
+    printf '%s' "$STATION_JSON" | grep -q '"failed":0'
+    LIBRARY_PATH="$STATION_LIB_PATH" sh "$ROOT_DIR/examples/pion_station/run_e2e.sh" "$PIONC"
+  else
+    echo "NOTE: libsqlite3 or the sqlite3 CLI not found; skipping examples/pion_station tests and e2e"
+  fi
 else
   echo "NOTE: OpenSSL development files not found; skipping std/tls + examples/https_server tests and client/server e2e handshakes"
 fi
