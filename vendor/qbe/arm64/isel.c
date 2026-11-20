@@ -161,8 +161,10 @@ fixarg(Ref *pr, int k, int phi, Fn *fn)
 	}
 }
 
+static Ins *blkdef(Blk *, Ins *, Ref, Fn *);
+
 static int
-selcmp(Ref arg[2], int k, Fn *fn)
+selcmp_ex(Ref arg[2], int k, int eqne, Blk *b, Ins *cur, Fn *fn)
 {
 	Ref r, *iarg;
 	Con *c;
@@ -190,6 +192,35 @@ selcmp(Ref arg[2], int k, Fn *fn)
 		r = arg[1];
 		arg[1] = arg[0];
 		arg[0] = r;
+	}
+	/* Fuse `and t, a, b; cmp t, #0` (eq/ne, single-use t in same block) -> `tst a, b` */
+	if (eqne && b && rtype(arg[1]) == RCon) {
+		c = &fn->con[arg[1].val];
+		if (c->type == CBits && (k == Kw ? (int32_t)c->bits.i == 0 : c->bits.i == 0)) {
+			Ins *d = blkdef(b, cur, arg[0], fn);
+			if (d && d->op == Oand && d->cls == k && fn->tmp[arg[0].val].nuse == 1) {
+				Ref a0 = d->arg[0], a1 = d->arg[1];
+				int fix1 = 1;
+				if (rtype(a0) == RCon && rtype(a1) != RCon) {
+					r = a0;
+					a0 = a1;
+					a1 = r;
+				}
+				if (rtype(a1) == RCon) {
+					Con *mc = &fn->con[a1.val];
+					if (mc->type == CBits && arm64_logimm(mc->bits.i, k))
+						fix1 = 0;
+				}
+				emit(Oatst, k, R, a0, a1);
+				iarg = curi->arg;
+				fixarg(&iarg[0], k, 0, fn);
+				if (fix1)
+					fixarg(&iarg[1], k, 0, fn);
+				chuse(arg[0], -1, fn);
+				*d = (Ins){.op = Onop};
+				return 0;
+			}
+		}
 	}
 	fix = 1;
 	cmp = Oacmp;
@@ -475,7 +506,7 @@ sel(Ins i, Blk *b, Ins *cur, Fn *fn)
 	if (iscmp(i.op, &ck, &cc)) {
 		emit(Oflag, i.cls, i.to, R, R);
 		i0 = curi;
-		if (selcmp(i.arg, ck, fn))
+		if (selcmp_ex(i.arg, ck, cc == Cieq || cc == Cine, b, cur, fn))
 			i0->op += cmpop(cc);
 		else
 			i0->op += cc;
@@ -559,6 +590,58 @@ sel(Ins i, Blk *b, Ins *cur, Fn *fn)
 					fix1 = 0;
 			}
 			break;
+		case Omul:
+			if (rtype(i.arg[0]) == RCon && rtype(i.arg[1]) != RCon) {
+				r = i.arg[0];
+				i.arg[0] = i.arg[1];
+				i.arg[1] = r;
+			}
+			if (rtype(i.arg[1]) == RCon) {
+				c = &fn->con[i.arg[1].val];
+				if (c->type == CBits) {
+					uint64_t u = KWIDE(i.cls) ? (uint64_t)c->bits.i : (uint64_t)(uint32_t)c->bits.i;
+					int maxsh = KWIDE(i.cls) ? 64 : 32;
+					if (u >= 2 && (u & (u - 1)) == 0) {
+						int sh = 0;
+						while ((1ULL << sh) != u)
+							sh++;
+						if (sh < maxsh) {
+							i.op = Oshl;
+							i.arg[1] = getcon(sh, fn);
+							fix1 = 0;
+						}
+					} else if (u >= 3 && ((u - 1) & (u - 2)) == 0) {
+						uint64_t p2 = u - 1;
+						int sh = 0;
+						while ((1ULL << sh) != p2)
+							sh++;
+						if (sh < maxsh) {
+							Ref r1 = newtmp("mul", i.cls, fn);
+							Ref x = i.arg[0];
+							emit(Oadd, i.cls, i.to, r1, x);
+							iarg = curi->arg;
+							fixarg(&iarg[1], i.cls, 0, fn);
+							emit(Oshl, i.cls, r1, iarg[1], getcon(sh, fn));
+							return;
+						}
+					} else if (u >= 3 && ((u + 1) & u) == 0) {
+						uint64_t p2 = u + 1;
+						int sh = 0;
+						while (sh < maxsh && (1ULL << sh) != p2)
+							sh++;
+						if (sh < maxsh && (1ULL << sh) == p2) {
+							Ref r1 = newtmp("mul", i.cls, fn);
+							Ref x = i.arg[0];
+							emit(Osub, i.cls, i.to, r1, x);
+							iarg = curi->arg;
+							fixarg(&iarg[1], i.cls, 0, fn);
+							emit(Oshl, i.cls, r1, iarg[1], getcon(sh, fn));
+							return;
+						}
+					}
+				}
+			}
+			break;
 		}
 	}
 	emiti(i);
@@ -566,6 +649,61 @@ sel(Ins i, Blk *b, Ins *cur, Fn *fn)
 	fixarg(&iarg[0], argcls(&i, 0), 0, fn);
 	if (fix1)
 		fixarg(&iarg[1], argcls(&i, 1), 0, fn);
+}
+
+static Ins *
+selsel(Fn *fn, Blk *b, Ins *i)
+{
+	Ref r, cr[2];
+	Ins *isel0, *isel1, *ir, *first_sel;
+	int ck, cc, nsels, k, swap;
+
+	assert(i->op == Osel1);
+	for (isel0 = i; isel0 > b->ins; isel0--) {
+		if (isel0->op == Osel0)
+			break;
+		assert(isel0->op == Osel1);
+	}
+	assert(isel0->op == Osel0);
+	r = isel0->arg[0];
+	ir = 0;
+	for (Ins *p = isel0; p > b->ins;) {
+		--p;
+		if (req(p->to, r)) {
+			ir = p;
+			break;
+		}
+	}
+	if (ir && rtype(r) == RTmp && fn->tmp[r.val].nuse == 1
+	&& iscmp(ir->op, &ck, &cc)
+	&& !isreg(ir->arg[0]) && !isreg(ir->arg[1])) {
+		cr[0] = ir->arg[0];
+		cr[1] = ir->arg[1];
+		*ir = (Ins){.op = Onop};
+	} else {
+		cr[0] = r;
+		cr[1] = CON_Z;
+		ck = Kw;
+		cc = Cine;
+	}
+	nsels = 0;
+	for (isel1 = i; isel1 > isel0; --isel1) {
+		emit(Oxsel + cc, isel1->cls, isel1->to, isel1->arg[0], isel1->arg[1]);
+		nsels++;
+	}
+	first_sel = curi;
+	swap = selcmp_ex(cr, ck, cc == Cieq || cc == Cine, b, isel0, fn);
+	if (swap) {
+		int swcc = cmpop(cc);
+		for (k = 0; k < nsels; k++)
+			first_sel[k].op = Oxsel + swcc;
+	}
+	for (k = 0; k < nsels; k++) {
+		fixarg(&first_sel[k].arg[0], first_sel[k].cls, 0, fn);
+		fixarg(&first_sel[k].arg[1], first_sel[k].cls, 0, fn);
+	}
+	*isel0 = (Ins){.op = Onop};
+	return isel0;
 }
 
 static void
@@ -597,13 +735,13 @@ seljmp(Blk *b, Fn *fn)
 		}
 	if (ir && use == 1
 	&& iscmp(ir->op, &ck, &cc)) {
-		if (selcmp(ir->arg, ck, fn))
+		if (selcmp_ex(ir->arg, ck, cc == Cieq || cc == Cine, b, ir, fn))
 			cc = cmpop(cc);
 		b->jmp.type = Jjf + cc;
 		*ir = (Ins){.op = Onop};
 	}
 	else {
-		selcmp((Ref[]){r, CON_Z}, Kw, fn);
+		selcmp_ex((Ref[]){r, CON_Z}, Kw, 1, b, &b->ins[b->nins], fn);
 		b->jmp.type = Jjfine;
 	}
 }
@@ -664,7 +802,11 @@ arm64_isel(Fn *fn)
 		seljmp(b, fn);
 		for (i=&b->ins[b->nins]; i!=b->ins;) {
 			--i;
-			sel(*i, b, i, fn);
+			assert(i->op != Osel0);
+			if (i->op == Osel1)
+				i = selsel(fn, b, i);
+			else
+				sel(*i, b, i, fn);
 		}
 		idup(b, curi, &insb[NIns]-curi);
 		for (n=0; n<b->nins; n++) {
@@ -740,8 +882,9 @@ arm64_hoist_consts(Fn *fn)
 			pos = d->nins;
 			while (pos > 0) {
 				int op = d->ins[pos - 1].op;
-				if (op == Oacmp || op == Oacmn || op == Oafcmp
-				 || INRANGE(op, Oflag, Oflag1))
+				if (op == Oacmp || op == Oacmn || op == Oatst || op == Oafcmp
+				 || INRANGE(op, Oflag, Oflag1)
+				 || isxsel(op))
 					pos--;
 				else
 					break;

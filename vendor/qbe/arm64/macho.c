@@ -195,8 +195,8 @@ typedef struct {
 typedef struct {
 	uint32_t pc_off;
 	uint32_t target_bid;
-	uint8_t cond;
-	uint8_t is_cond;
+	uint32_t base;
+	uint8_t is_imm19;
 } BrFixup;
 
 typedef struct {
@@ -782,7 +782,7 @@ me_add_jtfixup(ME *e, uint32_t entry_off, uint32_t tbl_base_off, uint32_t target
 }
 
 static void
-me_add_fixup(ME *e, uint32_t pc_off, uint32_t target_bid, uint8_t cond, uint8_t is_cond)
+me_add_fixup(ME *e, uint32_t pc_off, uint32_t target_bid, uint32_t base, uint8_t is_imm19)
 {
 	if (e->nfixups == e->cap_fixups) {
 		e->cap_fixups = e->cap_fixups ? e->cap_fixups * 2 : 64;
@@ -793,8 +793,8 @@ me_add_fixup(ME *e, uint32_t pc_off, uint32_t target_bid, uint8_t cond, uint8_t 
 	BrFixup *f = &e->fixups[e->nfixups++];
 	f->pc_off = pc_off;
 	f->target_bid = target_bid;
-	f->cond = cond;
-	f->is_cond = is_cond;
+	f->base = base;
+	f->is_imm19 = is_imm19;
 }
 
 static uint64_t
@@ -915,7 +915,9 @@ me_loadcon(Con *c, int r, int k)
 	uint32_t rd = greg(r);
 	if (!w)
 		n = (int32_t)n;
-	if ((n | 0xffff) == -1) {
+	if (n >= 0 && n <= 0xffff) {
+		enc_movz(w, rd, (uint16_t)n, 0);
+	} else if ((n | 0xffff) == -1) {
 		enc_movn(w, rd, (uint16_t)(~n & 0xffff), 0);
 	} else if (arm64_logimm((uint64_t)n, k)) {
 		uint32_t N, immr, imms;
@@ -1030,6 +1032,16 @@ me_emitins(Ins *i, ME *e)
 			uint32_t cc = cmp_cc[c][0];
 			/* cset rd, cc == csinc rd, xzr, xzr, inv(cc) */
 			emit_u32(0x1a9f07e0u | (sf << 31) | (((cc ^ 1u) & 0xfu) << 12) | rd);
+			break;
+		}
+		if (i->op >= Oxsel && i->op <= Oxsel1) {
+			int c = (int)i->op - Oxsel;
+			uint32_t rd = greg(i->to.val);
+			uint32_t rn = greg(i->arg[0].val);
+			uint32_t rm = greg(i->arg[1].val);
+			uint32_t cc = cmp_cc[c][0];
+			/* csel rd, rn, rm, cc */
+			emit_u32(0x1a800000u | (sf << 31) | (rm << 16) | (cc << 12) | (rn << 5) | rd);
 			break;
 		}
 		die("macho: unhandled op %s(%c)", optab[i->op].name, "wlsd"[k]);
@@ -1347,6 +1359,25 @@ me_emitins(Ins *i, ME *e)
 		break;
 	}
 
+	case Oatst: {
+		uint32_t rn = greg(i->arg[0].val);
+		if (rtype(i->arg[1]) == RCon) {
+			uint64_t n = (uint64_t)e->fn->con[i->arg[1].val].bits.i;
+			if (!is64)
+				n = (uint32_t)n;
+			uint32_t N, immr, imms;
+			int ok = encode_logimm(n, is64, &N, &immr, &imms);
+			assert(ok);
+			/* tst rn, #imm == ands wzr/xzr, rn, #imm */
+			emit_u32(0x7200001fu | (sf << 31) | (N << 22) | (immr << 16) | (imms << 10) | (rn << 5));
+		} else {
+			uint32_t rm = greg(i->arg[1].val);
+			/* tst rn, rm == ands wzr/xzr, rn, rm */
+			emit_u32(0x6a00001fu | (sf << 31) | (rm << 16) | (rn << 5));
+		}
+		break;
+	}
+
 	case Oafcmp: {
 		uint32_t rn = freg(i->arg[0].val);
 		if (rtype(i->arg[1]) == RCon) {
@@ -1397,6 +1428,77 @@ me_emitins(Ins *i, ME *e)
 	}
 }
 
+static Ins *
+me_can_fuse_cbz(Blk *b, Fn *fn)
+{
+	Ins *p;
+	Con *c;
+
+	if (b->jmp.type != Jjfieq && b->jmp.type != Jjfine)
+		return 0;
+	for (p = &b->ins[b->nins]; p > b->ins;) {
+		--p;
+		if (p->op == Onop || p->op == Odbgloc)
+			continue;
+		if (p->op == Oacmp && KBASE(p->cls) == 0
+		&& isreg(p->arg[0]) && p->arg[0].val != SP
+		&& rtype(p->arg[1]) == RCon) {
+			c = &fn->con[p->arg[1].val];
+			if (c->type == CBits && c->bits.i == 0)
+				return p;
+		}
+		return 0;
+	}
+	return 0;
+}
+
+static int
+me_w32_def_reg(const Ins *i, int cur_reg)
+{
+	if (i->op == Onop || i->op == Odbgloc)
+		return cur_reg;
+	if (i->op == Ocopy && req(i->to, i->arg[0]))
+		return cur_reg;
+	if (!isreg(i->to) || i->to.val == SP || i->to.val < R0 || i->to.val > LR)
+		return -1;
+	switch (i->op) {
+	case Oloadub:
+	case Oloaduh:
+	case Oloaduw:
+	case Oextub:
+	case Oextuh:
+	case Oextuw:
+		return i->to.val;
+	case Oadd:
+	case Osub:
+	case Oneg:
+	case Oand:
+	case Oor:
+	case Oxor:
+	case Oshl:
+	case Oshr:
+	case Osar:
+	case Omul:
+	case Odiv:
+	case Oudiv:
+	case Orem:
+	case Ourem:
+	case Oload:
+	case Oloadsw:
+	case Ocast:
+	case Ostosi:
+	case Ostoui:
+	case Odtosi:
+	case Odtoui:
+	case Ocopy:
+		return i->cls == Kw ? i->to.val : -1;
+	default:
+		if (i->cls == Kw && (INRANGE(i->op, Oflag, Oflag1) || isxsel(i->op)))
+			return i->to.val;
+		return -1;
+	}
+}
+
 void
 arm64_macho_fn(Fn *fn)
 {
@@ -1440,9 +1542,21 @@ arm64_macho_fn(Fn *fn)
 	uint32_t *blk_off = emalloc((size_t)(fn->nblk + 1) * sizeof *blk_off);
 
 	for (Blk *b = fn->start; b; b = b->link) {
+		Ins *cbz_ins = me_can_fuse_cbz(b, fn);
+		int last_w32 = -1;
 		blk_off[b->id] = text_pos();
-		for (Ins *i = b->ins; i != &b->ins[b->nins]; i++)
+		for (Ins *i = b->ins; i != &b->ins[b->nins]; i++) {
+			if (i == cbz_ins) {
+				last_w32 = -1;
+				continue;
+			}
+			if (i->op == Oextuw && req(i->to, i->arg[0])
+			&& isreg(i->to) && i->to.val == last_w32)
+				continue;
+			int next_w32 = me_w32_def_reg(i, last_w32);
 			me_emitins(i, &e);
+			last_w32 = next_w32;
+		}
 
 		switch (b->jmp.type) {
 		case Jhlt:
@@ -1481,7 +1595,7 @@ arm64_macho_fn(Fn *fn)
 		case Jjmp:
 		Jmp:
 			if (b->s1 != b->link) {
-				me_add_fixup(&e, text_pos(), b->s1->id, 0, 0);
+				me_add_fixup(&e, text_pos(), b->s1->id, 0x14000000u, 0);
 				emit_u32(0x14000000u); /* b placeholder */
 			}
 			break;
@@ -1508,7 +1622,7 @@ arm64_macho_fn(Fn *fn)
 				emit_u32(0x6b11001fu | (idx << 5));
 			}
 			/* b.hs <s1> (cond 0x2 = CS/HS) */
-			me_add_fixup(&e, text_pos(), b->s1->id, 0x2, 1);
+			me_add_fixup(&e, text_pos(), b->s1->id, 0x54000002u, 1);
 			emit_u32(0x54000002u);
 			/* adr x17, .+16 */
 			emit_u32(0x10000091u);
@@ -1538,8 +1652,18 @@ arm64_macho_fn(Fn *fn)
 			} else {
 				inv = 1;
 			}
-			me_add_fixup(&e, text_pos(), b->s2->id, cmp_cc[c][inv], 1);
-			emit_u32(0x54000000u | cmp_cc[c][inv]); /* b.cc placeholder */
+			if (cbz_ins) {
+				int is_nz = (c == Cine) ^ inv;
+				uint32_t sf = KWIDE(cbz_ins->cls) ? 1u : 0u;
+				uint32_t rt = greg(cbz_ins->arg[0].val);
+				uint32_t base = 0x34000000u | (sf << 31) | ((uint32_t)is_nz << 24) | rt;
+				me_add_fixup(&e, text_pos(), b->s2->id, base, 1);
+				emit_u32(base);
+			} else {
+				uint32_t base = 0x54000000u | cmp_cc[c][inv];
+				me_add_fixup(&e, text_pos(), b->s2->id, base, 1);
+				emit_u32(base); /* b.cc placeholder */
+			}
 			goto Jmp;
 		}
 		}
@@ -1551,14 +1675,14 @@ arm64_macho_fn(Fn *fn)
 		BrFixup *f = &e.fixups[k];
 		int64_t diff = ((int64_t)blk_off[f->target_bid] - (int64_t)f->pc_off) / 4;
 		uint32_t insn;
-		if (f->is_cond) {
+		if (f->is_imm19) {
 			if (diff < -262144 || diff > 262143)
 				die("macho: conditional branch out of 1MB range in %s", fn->name);
-			insn = 0x54000000u | (((uint32_t)diff & 0x7ffffu) << 5) | f->cond;
+			insn = f->base | (((uint32_t)diff & 0x7ffffu) << 5);
 		} else {
 			if (diff < -33554432 || diff > 33554431)
 				die("macho: unconditional branch out of 128MB range in %s", fn->name);
-			insn = 0x14000000u | ((uint32_t)diff & 0x03ffffffu);
+			insn = f->base | ((uint32_t)diff & 0x03ffffffu);
 		}
 		code[f->pc_off + 0] = (uint8_t)(insn & 0xffu);
 		code[f->pc_off + 1] = (uint8_t)((insn >> 8) & 0xffu);
