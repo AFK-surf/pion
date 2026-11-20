@@ -729,3 +729,75 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
   let cr5 = @core.check_source_files("p8_bad5", ["b5.m2"], [bad_guard])
   assert_true(str_contains(@core.check_result_to_json(cr5.diagnostics), "E_TYPE_MISMATCH"), "non-Bool match guard")
 }
+
+///|
+test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pkg types" {
+  let az_src =
+    "pub val struct Stats {\n" +
+    "  lines : Int\n" +
+    "  words : Int\n" +
+    "}\n" +
+    "pub enum Mode {\n" +
+    "  Fast\n" +
+    "  Full(Int)\n" +
+    "}\n" +
+    "pub let MAX_N : Int = 100\n" +
+    "fn secret_helper(x : Int) -> Int {\n" +
+    "  x * 2 + 1\n" +
+    "}\n" +
+    "pub fn make_stats(n : Int) -> Stats {\n" +
+    "  let h = secret_helper(n)\n" +
+    "  Stats::{ lines: n, words: h }\n" +
+    "}\n"
+  let az_cr = @core.check_source_files_with_imports("analyzer", ["analyzer.m2"], [az_src], [], true)
+  assert_true(az_cr.diagnostics.length() == 0, "analyzer full check should pass")
+  let az_stub = @core.emit_m2_stub(az_cr.pkg)
+  assert_true(str_contains(az_stub, "pub val struct Stats"), "stub preserves pub val struct")
+  assert_true(str_contains(az_stub, "pub enum Mode"), "stub preserves pub enum")
+  assert_true(str_contains(az_stub, "pub let MAX_N : Int = panic()"), "stub preserves pub const")
+  assert_true(str_contains(az_stub, "fn secret_helper(x : Int) -> Int { panic() }"), "stub preserves private fn for E_PRIVATE_SYMBOL")
+
+  let az_stub_cr = @core.check_source_files_with_imports("analyzer", ["analyzer.m2stub"], [az_stub], [], true)
+  assert_true(az_stub_cr.diagnostics.length() == 0, "analyzer stub should typecheck cleanly")
+  let az_imp = @core.imported_pkg_new("analyzer", az_stub_cr.tc)
+
+  let mid_src =
+    "import \"analyzer\" as az\n" +
+    "pub fn wrap(s : az::Stats) -> az::Stats {\n" +
+    "  az::Stats::{ lines: s.lines + 1, words: s.words + az::MAX_N }\n" +
+    "}\n"
+  let mid_cr = @core.check_source_files_with_imports("mid", ["mid.m2"], [mid_src], [az_imp], true)
+  assert_true(mid_cr.diagnostics.length() == 0, "mid full check against az stub should pass")
+  let mid_stub = @core.emit_m2_stub(mid_cr.pkg)
+  assert_true(str_contains(mid_stub, "import \"analyzer\" as az"), "mid stub preserves import declaration")
+  let mid_stub_cr = @core.check_source_files_with_imports("mid", ["mid.m2stub"], [mid_stub], [az_imp], true)
+  assert_true(mid_stub_cr.diagnostics.length() == 0, "mid stub should typecheck cleanly against az stub")
+  let mid_imp = @core.imported_pkg_new("mid", mid_stub_cr.tc)
+
+  let app_ok =
+    "import \"analyzer\" as az\n" +
+    "import \"mid\" as m\n" +
+    "pub fn main() -> Int {\n" +
+    "  let s = m::wrap(az::make_stats(3))\n" +
+    "  s.lines + s.words\n" +
+    "}\n"
+  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_ok], [az_imp, mid_imp], true)
+  assert_true(app_cr.diagnostics.length() == 0, "app should typecheck cleanly against transitive stubs")
+
+  let app_priv =
+    "import \"analyzer\" as az\n" +
+    "pub fn main() -> Int {\n" +
+    "  az::secret_helper(1)\n" +
+    "}\n"
+  let priv_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_priv], [az_imp], true)
+  assert_true(str_contains(@core.check_result_to_json(priv_cr.diagnostics), "E_PRIVATE_SYMBOL"), "stub must still reject private symbol with E_PRIVATE_SYMBOL")
+
+  let app_bad_ty =
+    "import \"mid\" as m\n" +
+    "pub fn main() -> Int {\n" +
+    "  let _ = m::wrap(42)\n" +
+    "  0\n" +
+    "}\n"
+  let bad_ty_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_bad_ty], [az_imp, mid_imp], true)
+  assert_true(str_contains(@core.check_result_to_json(bad_ty_cr.diagnostics), "E_TYPE_MISMATCH"), "stub must still reject type mismatch with E_TYPE_MISMATCH")
+}
