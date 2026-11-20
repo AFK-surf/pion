@@ -10,10 +10,10 @@
 
 ## Architecture
 
-- **Agent-friendly by construction**: no cross-function type inference (every top-level parameter and return type is written), one-line JSON diagnostics with a stable `code` and a `fixit` hint (`pionc check --json`), symbol/signature/call-graph/dependency queries (`pionc query ... --json`), API docs as JSON (`pionc doc --json`) and a deterministic formatter (`pionc fmt --check --json`). Agent foot-guns are compile errors: a discarded `Result` (`E_UNHANDLED_RESULT`), `==` on boxed values that would silently compare pointers (`E_TYPE_MISMATCH`), non-exhaustive `match`, IO without a `World`, data races (`E_NOT_SEND`).
-- **Zero LLVM**: per-package QBE SSA IL → embedded/vendored QBE 1.3 → **native objects written directly** (ARM64 Mach-O and x86_64 Linux ELF64 `.o`, no system assembler) → system linker + a `<64 KB` C11 runtime (`libpionrt.a`).
-- **Runtime**: Biased Reference Counting (non-atomic on the owning thread, frozen to atomic when a value crosses threads), size-class slab allocator with batched remote frees, immortal `.rodata` literals and payload-less enum constants, native OS threads.
-- **Global CAS, zero worktree pollution**: `.pionsig`, `.ssa` and `.o` artifacts live in an LRU-evicted content-addressed cache (`$PION_CACHE_DIR`, default `~/.cache/pion/cas`) keyed by compiler fingerprint and upstream `.pionsig` hashes; `git status --ignored` stays clean and parallel worktrees share work.
+- **Agent-friendly by construction**: no cross-function type inference (every top-level parameter and return type is written), one-line JSON diagnostics with a stable `code`, a `fixit` hint and, where the exact patch is known, machine-applicable span `edits` (`pionc check --json`; 6 of the 12 agent error classes in `benchmarks/agent_eval` carry an `edits` patch, rustc 4 of 12), symbol/signature/call-graph/dependency queries over a file, package or whole workspace (`pionc query ... --json`), workspace-wide test reports (`pionc test --json <dir>`), API docs as JSON (`pionc doc --json`) and a deterministic formatter (`pionc fmt --check --json`). Agent foot-guns are compile errors: a discarded `Result` (`E_UNHANDLED_RESULT`), `==` on boxed values that would silently compare pointers (`E_TYPE_MISMATCH`), non-exhaustive `match`, IO without a `World`, data races (`E_NOT_SEND`).
+- **Zero LLVM**: per-package QBE SSA IL → embedded/vendored QBE 1.3 (native `jtbl` jump tables; ARM64 callee-saved/loop-spill/register-hint fixes and cross-block shift folding) → **native objects written directly** (ARM64 Mach-O and x86_64 Linux ELF64 `.o`, no system assembler) → system linker + a C11 runtime (`libpionrt.a`: 58,352 B on macOS ARM64, 55,910 B on Linux x86_64).
+- **Runtime**: Biased Reference Counting (non-atomic on the owning thread, frozen to atomic when a value crosses threads) on a compact 24-byte `PionHeader`, 12-class slab allocator (32–256 B) with batched remote frees, null-niche `Option[Ref]` (`None` = null, `Some(p)` = `p`, no box), immortal `.rodata` literals and payload-less enum constants, native OS threads, and a non-blocking `kqueue`/`epoll` event loop with `SO_REUSEPORT` multi-worker accept.
+- **Global CAS, zero worktree pollution**: `.pionsig`, `.ssa` and `.o` artifacts live in an LRU-evicted content-addressed cache (`$PION_CACHE_DIR`, default `~/.cache/pion/cas`) keyed by the compiler's self-fingerprint (`pionc-v0.9` ABI revision + the running `pionc` binary + `qbe` + runtime) and upstream `.pionsig` hashes; git dependencies are pinned in `pion.lock` and checked out once into the shared `$PION_CACHE_DIR/git/` cache; `git status --ignored` stays clean and parallel worktrees share work.
 - **Self-hosting**: `pionc0` (MoonBit host) → `pionc1` → `pionc2` reaches a bit-for-bit fixed point (identical SSA & assembly SHA-256) on ARM64 macOS; on x86_64 Linux the cross-emitted compiler rebuilds itself with Stage 3 == Stage 4 bit-for-bit, without ever invoking `as`.
 
 ## Language at a Glance
@@ -25,8 +25,10 @@
 - Capabilities: IO, clocks, processes, TCP and sleeping require the explicit `World` value.
 - FFI: `extern "C" fn`, `Ptr` plus pointer/C-string helpers, `-l <lib>` / `pion.toml` `[link]`.
 - Traits: `trait` / `impl` with bounded generics, monomorphized (zero-cost static dispatch).
-- Full UTF-8 strings (scalar iteration, byte-exact formatting); `std/json` and `std/http` written in pure `Pion`.
-- Equality is by value only: `==` on scalars, `String`, `Ptr` and payload-less enums; boxed values are inspected with `match`.
+- Full UTF-8 strings (scalar iteration, byte-exact formatting); `String::to_int/to_int64/to_double -> Option`.
+- Standard packages in pure `Pion`: `std/json`; `std/http` (HTTP/1.1 Keep-Alive, chunked bodies, pipelining, query decoding); `std/net` (non-blocking `kqueue`/`epoll` poller, `SO_REUSEPORT`); `std/regex` (Thompson NFA run by a Pike VM: linear time for every pattern, no ReDoS); `std/tls` (TLS 1.2/1.3 client over the system OpenSSL 1.1.x/3.x through `extern "C"` only, zero C glue, SNI + certificate/host verification).
+- Packages: `pion.toml` `path` and `git` (`tag`/`rev`/`branch`, optional `subdir`) dependencies, pinned by `pion.lock`.
+- Equality is by value only: `==` on scalars, `String`, `Ptr` and payload-less enums; boxed values are inspected with `match` (also enforced when a generic `==` is instantiated with a boxed type).
 
 ## Language Tour
 
@@ -100,142 +102,154 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 
 | Command | Purpose |
 |---|---|
-| `pionc check [--json] <path...>` | Type, exhaustiveness, must-use `Result`, `Send`, `World` and visibility checks; JSON diagnostics with fix-its |
-| `pionc query defs\|sig\|callers\|deps [--json] <path...>` | Symbol definitions, exported `.pionsig` interface, call graph, package dependency graph |
+| `pionc check [--json] <path...>` | Type, exhaustiveness, must-use `Result`, `Send`, `World` and visibility checks; JSON diagnostics with fix-its and machine-applicable `edits` (`[{file,line,col,end_line,end_col,replacement}]`) |
+| `pionc query defs\|sig\|callers\|deps [--json] <path...>` | Symbol definitions, exported `.pionsig` interface, call graph, package dependency graph; a path may be a file, a package directory or a whole workspace |
 | `pionc doc [--json] <path...>` | Public API of each package (dependencies first) |
 | `pionc emit-sig <path...>` | Print the `.pionsig` export table |
 | `pionc build [--release] [--target arm64_apple\|amd64_sysv] [--emit-obj <f>] [--emit-ssa <f>] [--emit-asm <f>] [--jobs <n>] [-l <lib>] [-o <bin>] <path...>` | Native binary via the global CAS (`--release` strips `debug_assert`; `--target amd64_sysv --emit-obj` cross-emits an ELF64 `.o`) |
 | `pionc run [--release] [-l <lib>] <path> [-- args...]` | Build and execute a package or `.pion` file |
-| `pionc test [--json] [--filter <name>] [-l <lib>] <path>` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert` |
+| `pionc test [--json] [--package <name>] [--filter <name>] [-l <lib>] <path>` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert`; a workspace directory runs every local package's tests in one report |
 | `pionc fmt [--check] [--json] <path...>` | Deterministic, idempotent, comment- and UTF-8-preserving formatter |
+| `pionc init [--json] <dir>` | Scaffold `pion.toml`, `src/main.pion` and `main_test.pion`; the result passes `check`, `test`, `run` and `fmt --check` as is |
+| `pionc fetch [--json] [dir]` | Resolve `git` dependencies into the global git cache and write/verify `pion.lock` |
 
 ---
 
 ## Measured Results
 
-Every number below is copied from an archived run of the scripts named in each section; rerun them to reproduce (absolute milliseconds vary with machine load, checksums do not).
+Every number below is copied from the combined P19 run of the scripts named in each section (main `3365132`: P17-A/B/C + P18 + P19-A + P19-B), on **Apple M5 Max (18 cores), Darwin 27.0.0 arm64** (`tokyo` station) and an x86_64 Linux station (`gt2`, kernel 6.18). Rerun the scripts to reproduce: checksums are fixed, absolute milliseconds vary with machine load. The macOS station is shared; the 1-minute load average was 40–53 during §1, 18–40 during §2 and 18–30 during §5. Peak RSS and instructions retired (`/usr/bin/time -l`) do not depend on load and are listed next to the wall times.
+
+Toolchains: C Apple clang 21.0.0 `-O2`, MoonBit `0.1.20261117` `--target native --release`, Zig `0.17.1` `-OReleaseFast`, Rust `1.100.0` `-O` / `--release`, Go `1.27.3` `go build`, Pion `pionc2 0.1.0 build --release` (self-hosted, embedded QBE).
 
 ### 1. V2 real workloads, 6 languages (`sh scripts/bench-v2-exec.sh`)
 
-Apple M5 Max (18 cores), Darwin 27.0.0 arm64; 1 warmup + 5 runs, median; checksums identical across all six languages. C `clang -O2`, MoonBit `--target native --release`, Zig `-OReleaseFast`, Rust `-O`, Go `go build`, Pion `pionc2 build --release`.
+Full mode (1 warmup + 5 runs, median); checksums bit-for-bit identical across all six languages and `1T == 4T`.
 
-| Median ms (peak RSS MB) | C | MoonBit | Zig | Rust | Go | **Pion (`pionc2`)** |
+| Median ms / peak RSS MB / instructions retired (M) | C | MoonBit | Zig | Rust | Go | **Pion (`pionc2`)** |
 |---|---:|---:|---:|---:|---:|---:|
-| `json_query` (11.6 MB JSON) | 49.96 (76.7) | 66.48 (92.8) | 48.51 (81.5) | 41.55 (67.4) | 47.91 (107.3) | **61.02** (123.4) |
-| `bytecode_vm` | 50.17 (2.4) | 54.12 (2.7) | 43.89 (2.5) | 47.52 (2.7) | 39.65 (10.2) | **64.38** (3.0) |
-| `mt_log_pipeline_1t` (17.5 MB log) | 44.12 (18.6) | 69.97 (18.9) | 41.08 (18.6) | 44.80 (18.8) | 32.57 (39.5) | **58.42** (18.6) |
-| `mt_log_pipeline_4t` | 34.45 (18.6) | N/A (1T) | 34.05 (18.7) | 32.68 (18.9) | 24.52 (41.9) | **38.87** (18.8) |
-| 3 binaries, stripped bytes | 103,576 | 757,240 | 505,064 | 1,167,864 | 7,159,144 | **282,360** |
+| `json_query` (11.6 MB JSON) | 62.11 / 76.7 / 1,044 | 81.58 / 92.8 / 1,375 | 57.94 / 81.5 / 1,006 | 54.89 / 67.4 / 841 | 75.91 / 106.2 / 1,256 | **67.45** / 105.6 / 1,141 |
+| `bytecode_vm` | 62.95 / 2.4 / 887 | 60.16 / 2.7 / 1,578 | 49.04 / 2.5 / 795 | 55.81 / 2.7 / 1,203 | 45.20 / 9.8 / 1,154 | **50.80** / 2.9 / 1,508 |
+| `mt_log_pipeline_1t` (17.5 MB log) | 53.58 / 18.6 / 636 | 81.89 / 18.9 / 1,426 | 60.88 / 18.6 / 698 | 60.96 / 18.8 / 716 | 48.08 / 39.1 / 612 | **63.80** / 18.6 / 820 |
+| `mt_log_pipeline_4t` | 56.91 / 18.7 / 777 | N/A (1T) | 50.12 / 18.7 / 783 | 50.67 / 19.0 / 821 | 36.66 / 41.0 / 690 | **51.86** / 18.8 / 924 |
+| 3 binaries, stripped bytes | 103,576 | 757,240 | 505,064 | 1,167,864 | 7,159,144 | **221,848** |
+
+Pion's three stripped binaries shrank from 282,360 B to 221,848 B with the 24-byte header and 12-class slab (P19-B). Pion retires more instructions than C, Zig and Rust on all three workloads (1.1–1.9×); its median wall time is 1.12–1.41× that of the fastest language per workload (Rust or Go), ahead of C and Rust on `bytecode_vm` and ahead of MoonBit everywhere.
 
 ### 2. V2 compile: 50k LOC, 50 packages, 4-layer diamond DAG (`sh scripts/bench-v2-compile.sh`)
 
-Same host; checksums identical across languages for the cold build and all three edits. "5-WT" = five worktrees built one after another with a shared global cache.
+Checksums identical across all six languages for the cold build, all three edits and all five worktrees. "5-WT" = five worktrees built one after another with a shared global cache.
 
 | Lang | Cold (ms) | Leaf body edit (ms) | Core body edit (ms) | Core signature edit (ms) | 5-WT total (ms) | 5-WT in-tree cache | 5-WT global cache |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| C (`make -j12`) | 1182.54 | 229.93 | 257.31 | 282.80 | 5971.52 | 1.55 MB | 0 |
-| MoonBit | 12385.33 | 14426.37 | 12487.42 | 12950.61 | 114580.56 | 101.31 MB | 0 |
-| Zig | 15623.89 | 18844.81 | 15068.23 | 15303.62 | 124411.48 | 44.97 MB | 43.36 MB |
-| Rust (`cargo`) | 855.29 | 763.43 | 1339.28 | 934.21 | 5816.21 | 18.33 MB | 0 |
-| Go | 1356.58 | 436.75 | 447.80 | 460.28 | 3610.74 | 0 | 80.57 MB |
-| **Pion (`pionc2`)** | **241.13** | **198.75** | **162.77** | **271.03** | **830.99** | **0** | 12.97 MB |
+| C (`make -j12`) | 1537.27 | 394.36 | 568.85 | 380.15 | 22118.76 | 1.55 MB | 0 |
+| MoonBit | 19363.86 | 19962.97 | 20376.79 | 20892.04 | 123713.57 | 101.40 MB | 0 |
+| Zig | 24506.32 | 26439.96 | 64656.97 | 19355.26 | 100664.79 | 44.97 MB | 43.36 MB |
+| Rust (`cargo`) | 1736.74 | 826.63 | 791.17 | 998.46 | 6391.69 | 18.34 MB | 0 |
+| Go | 2190.21 | 350.75 | 472.16 | 370.33 | 3400.20 | 0 | 80.57 MB |
+| **Pion (`pionc2`)** | **448.81** | **177.99** | **177.74** | **246.45** | **934.85** | **0** | 13.05 MB |
 
 ### 3. Dogfood applications
 
-| | `examples/http_kv_service` | `examples/sqlite_indexer` |
-|---|---|---|
-| What | multithreaded HTTP + JSON key-value service on `std/http` / `std/json` | pure-`Pion` indexer calling the system `libsqlite3` through `extern "C"` (zero C glue) |
-| Load / work | Linux x86_64, 8 concurrent clients × 500 = 4,000 real TCP requests, 0 errors | indexes `compiler/src/core` (14 files / 29,468 lines), cross-checked 100% by the `sqlite3` CLI |
-| Speed | 34,110–37,764 QPS, P50 0.20 ms, P99 0.51–0.62 ms, peak RSS 14.5 MB | compiles in 41–76 ms |
-| Binary | 112 KB stripped | 123 KB |
-| Memory safety | ASan + LSan: 0 errors, 0 leaks | ASan + LSan: 0 errors, 0 leaks |
+| | `examples/http_event_server` | `examples/http_kv_service` | `examples/sqlite_indexer` |
+|---|---|---|---|
+| What | `std/net` event-loop HTTP/1.1 key-value server: 4 `kqueue`/`epoll` workers sharing the port through `SO_REUSEPORT` | multithreaded HTTP + JSON key-value service on `std/http` / `std/json` | pure-`Pion` indexer calling the system `libsqlite3` through `extern "C"` (zero C glue) |
+| Load / work | Linux x86_64 (`gt2`): **C1000** — 1,000 concurrently open keep-alive connections × 40 = 40,000 requests from 4 client threads, 0 errors, exact `/stats` check; per-worker requests 10,361 / 10,400 / 8,800 / 10,440 | Linux x86_64 (`gt2`): 8 clients × 500 = 4,000 requests, 0 errors, exact `/stats`, with and without Keep-Alive | indexes `compiler/src/core` (15 files / 33,541 lines), cross-checked 100% by the `sqlite3` CLI |
+| Speed | **121,028 QPS**, P50 6.82 ms, P99 18.28 ms (max 26.5 ms), peak RSS 14.83 MB | Keep-Alive **83,274 QPS**, P50 0.066 ms, P99 0.243 ms; connection per request 33,428 QPS, P50 0.219 ms, P99 0.494 ms; peak RSS 14.4 MB | — |
+| Binary | 118,144 B stripped (build 108 ms) | 109,488 B stripped (build 75–81 ms) | 123 KB |
+| Memory safety | `ASAN=1` mode of `run_bench.sh` (not part of this run) | ASan + LSan: 0 errors, 0 leaks (archived P13 run) | ASan + LSan: 0 errors, 0 leaks (archived P13 run) |
 
-Reproduce: `sh examples/http_kv_service/run_bench.sh <pionc> 8 500 8` (run by `scripts/test-linux.sh`) and `scripts/verify-all.sh` gate 6.
+Reproduce: `sh examples/http_event_server/run_bench.sh <pionc> 1000 40 4`, `sh examples/http_kv_service/run_bench.sh <pionc> 8 500 8` (with and without `KEEP_ALIVE=1`, both run by `scripts/test-linux.sh`) and `scripts/verify-all.sh` gate 6. On C1000 the latency percentiles are those of 1,000 connections queued on 4 workers; the 8-connection KV numbers measure per-request latency.
 
 ### 4. Agent-in-the-loop evaluation, 4 languages (`sh benchmarks/agent_eval/run.sh`)
 
-Full report: [`benchmarks/agent_eval/SUMMARY.md`](benchmarks/agent_eval/SUMMARY.md). 12 engineering tasks and 12 error-class probes per language; check commands `pionc2 check --json`, `moon check --output-json`, `cargo check --message-format=json`, `go build -json`.
-
-Run of 2026-11-20 on Apple M5 Max (shared station; medians of 1 warmup + 5 runs). Gates: 48/48 reference implementations pass, 48/48 probes measured with 0 expectation mismatches.
+Full report: [`benchmarks/agent_eval/SUMMARY.md`](benchmarks/agent_eval/SUMMARY.md) (run of 2026-11-20 on the same Apple M5 Max; load average 89 / 83 / 67 while it ran, medians of 1 warmup + 5 runs). 12 engineering tasks and 12 error-class probes per language; check commands `pionc2 check --json`, `moon check --output-json`, `cargo check --message-format=json`, `go build -json`. Gates: 48/48 reference implementations pass, 48/48 probes measured with 0 expectation mismatches.
 
 |  | **Pion (`pionc2`)** | MoonBit | Rust | Go |
 |---|---:|---:|---:|---:|
 | error classes caught before running (of 12) | **12** | 10 | 10 | 8 |
 | caught with JSON diagnostics / any fix suggestion | **12/12 / 12** | 10/10 / 0 | 10/10 / 7 | 8/8 / 0 |
-| median check latency (ms) | **3.5** | 49.0 | 61.5 | 57.9 |
-| median diagnostic size when caught (bytes) | 436.5 | 538.5 | 4798.0 | 343.0 |
+| caught with a machine-applicable edit | **6** | 0 | 4 | 0 |
+| median check latency (ms) | **5.2** | 54.1 | 90.0 | 88.5 |
+| median diagnostic size when caught (bytes) | 594.0 | 543.5 | 4833.0 | 343.0 |
 | effective LOC, 12 tasks | 1526 | 1393 | 1446 | 1539 |
-| private body edit → tests green (ms) | 220.7 | 458.8 | 898.4 | 155.9 |
-| 5 worktrees check+test concurrently, cold (wall ms) | **170.1** | 1611.9 | 1384.7 | 6145.5 |
+| first (cold) test run, `t06` (ms) | **718.1** | 1029.3 | 1408.8 | 7952.0 |
+| private body edit → tests green (ms) | 643.9 | 494.8 | 1044.8 | 424.5 |
+| exported-signature edit → tests green (ms) | 649.3 | 360.6 | 1099.5 | 570.5 |
+| 5 worktrees check+test concurrently, cold (wall ms) | **315.8** | 2412.0 | 1844.4 | 8058.8 |
 | build artefacts inside the 5 worktrees (MB) | **0.0** | 42.1 | 63.8 | 0.0 |
 
-Pion's two former blind spots found by this suite — a silently discarded `Result` (probe `e09`) and `opt == Some(x)` comparing pointers — are compile errors since P15 (`E_UNHANDLED_RESULT`, `E_TYPE_MISMATCH`). rustc is the only checker emitting machine-applicable edits (4 of 12); Pion's fix-its are hints.
+Pion's `edits` (span + replacement) are emitted for non-exhaustive `match`, private symbols, trait signature mismatches, discarded `Result`, missing return types and assignment to immutable bindings; rustc's `MachineApplicable` suggestions cover 4 of the 12 probes. Pion's edit → tests-green loop is slower than MoonBit's and Go's here, and that is the exact cost: since P17-B every dependent package's test binary is recompiled and relinked against its dependencies' new `.o` files and launched fresh (before, a cached test binary could report a stale pass after a dependency's body edit).
 
-### 5. V1 classic kernels (5 languages)
+### 5. V1 classic kernels, 5 languages (`PIONC=$PWD/out/pionc2 sh scripts/bench.sh`)
 
-Archived P8 run (`p8-bench-summary.md`) on **Apple M5 Max (18 cores), Darwin 27.0.0 arm64** via `PIONC=$PWD/out/pionc2 sh scripts/bench.sh` (1 warmup + 5 timed runs, median wall time in ms, strict bit-for-bit checksum verification across all 5 languages):
+1 warmup + 5 timed runs, median; strict bit-for-bit checksums across all five languages, including the `scale10k` cold → incremental pair.
 
-- **Toolchains**: Apple clang 21.0.0 (`-O2`), MoonBit `0.1.20261117` (`--target native --release`), Zig `0.17.1` (`-OReleaseFast`), Rust `1.100.0` (`-O` / `--release`), `pionc2 0.1.0` (self-hosted QBE backend).
-
-#### Execution Speed (Median Wall Time, ms)
+#### Execution (median ms / instructions retired, M)
 
 | Benchmark | C (`-O2`) | MoonBit | Zig (`-OReleaseFast`) | Rust (`-O`) | **Pion (`pionc2`)** |
 |---|---:|---:|---:|---:|---:|
-| `nbody` | 146.01 | 271.93 | 142.61 | 142.41 | **155.68** |
-| `binarytrees` | 258.32 | 66.74 | 257.00 | 422.60 | **67.75** |
-| `spectralnorm` | 101.08 | 105.94 | 100.72 | 102.74 | **104.46** |
-| `fannkuchredux` | 172.21 | 136.61 | 128.04 | 129.10 | **130.66** |
-| `mandelbrot_1t` | 532.88 | 531.39 | 509.55 | 533.82 | **467.33** |
-| `mandelbrot_4t` | 203.90 | N/A (1T) | 192.76 | 205.03 | **178.95** |
-| `hashmap_str` | 39.65 | 43.12 | 18.73 | 39.75 | **31.45** |
+| `nbody` | 160.57 / 2,318 | 290.98 / 3,525 | 147.16 / 2,011 | 146.87 / 2,015 | **165.97** / 3,408 |
+| `binarytrees` | 277.59 / 6,051 | 75.75 / 1,288 | 1199.62\* / 6,202 | 1603.55\* / 7,634 | **82.94** / 1,680 |
+| `spectralnorm` | 110.88 / 1,896 | 108.39 / 2,019 | 103.07 / 1,780 | 108.91 / 1,779 | **99.16** / 2,256 |
+| `fannkuchredux` | 287.24\* / 1,432 | 164.23 / 1,817 | 131.55 / 759 | 157.01 / 1,307 | **146.95** / 1,588 |
+| `mandelbrot_1t` | 1148.96\* / 6,227 | 1250.89\* / 6,215 | 1250.61\* / 6,106 | 1567.49\* / 5,767 | **586.22** / 5,486 |
+| `mandelbrot_4t` | 243.56 / 6,209 | N/A (1T) | 232.00 / 6,094 | 288.79 / 5,761 | **254.69** / 5,486 |
+| `hashmap_str` | 92.60 / 653 | 88.45 / 583 | 28.09 / 273 | 58.13 / 922 | **48.37** / 456 |
 
-#### Compile Speed (10,000 LOC / 20 Packages) & Worktree Cache Pollution
+\* Load-distorted: min–max spreads of 376–1305 ms (Zig `binarytrees`), 1006–1704 ms (Rust `binarytrees`), 249–334 ms (C `fannkuchredux`) and 931–2115 ms (`mandelbrot_1t` for C, MoonBit, Zig, Rust) in this run; the archived quiet-host P8 run measured `mandelbrot_1t` at 532.88 (C) vs 467.33 ms (Pion) and `binarytrees` at 258.32 (C) / 257.00 (Zig) / 422.60 (Rust) vs 67.75 ms (Pion). Compare the instruction counts, which load does not change.
 
-| Language | Cold Compile (ms) | 1-Line Body Edit Incr (ms) | Worktree Cache | Global CAS |
+#### Compile speed (10,000 LOC / 20 packages) & worktree cache pollution
+
+| Language | Cold compile (ms) | 1-line body edit incr (ms) | Worktree cache | Global CAS |
 |---|---:|---:|---:|---:|
-| C (`make -j8`) | 207.60 | 84.81 | 0.28 MB | 0 |
-| MoonBit | 717.36 | 542.79 | 3.79 MB | 0 |
-| Zig | 1565.69 | 224.15 | 1.20 MB | 0 |
-| Rust (`cargo`) | 919.45 | 668.85 | 2.47 MB | 0 |
-| **Pion (`pionc2`)** | **64.63** *(5-run median: 66.2 ms)* | **31.19** *(5-run median: 30.7 ms)* | **0.00 MB** | 1.43 MB |
+| C (`make -j8`) | 383.54 | 120.83 | 0.28 MB | 0 |
+| MoonBit | 1018.70 | 812.08 | 3.79 MB | 0 |
+| Zig | 2790.35 | 473.69 | 1.20 MB | 0 |
+| Rust (`cargo`) | 1672.40 | 1174.26 | 2.47 MB | 0 |
+| **Pion (`pionc2`)** | **184.37** | 124.93 | **0.00 MB** | 1.44 MB |
 
-#### Binary Artifact Sizes (Default / Stripped)
+#### Binary artifact sizes (default / stripped, bytes)
 
-| Language | `hello` (bytes) | 6-Benchmark Total (bytes) |
+| Language | `hello` | 6-benchmark total |
 |---|---:|---:|
 | C | 33,432 / 33,432 | 218,648 / 218,528 |
-| Zig | 52,104 / 50,184 | 1,963,576 / 1,750,048 |
-| **Pion (`pionc2`)** | **78,744 / 71,976** | **572,712 / 531,024** |
-| MoonBit | 283,256 / 241,176 | 1,706,616 / 1,447,216 |
+| **Pion (`pionc2`)** | **52,120 / 50,792** | **322,472 / 308,064** |
+| Zig | 52,120 / 50,184 | 1,963,592 / 1,750,048 |
+| MoonBit | 283,272 / 241,176 | 1,706,680 / 1,447,216 |
 | Rust | 471,736 / 342,920 | 3,023,928 / 2,213,584 |
+
+Pion's `hello` fell from 71,976 B to 50,792 B stripped and the six V1 binaries from 531,024 B to 308,064 B since the P8 run.
 
 ---
 
 ## Known Limitations & Next Steps
 
 - No dynamic dispatch: traits are monomorphized only, there are no trait objects (heterogeneous collections use a closed `enum`).
-- `fixit` is a natural-language hint, not a span-based machine-applicable patch.
-- No package registry: dependencies are `path = ...` entries in `pion.toml`.
-- `Send` is structural and conservative: `Mutex[Map[K, V]]` with flat values is `Send`, but nested containers such as `Mutex[Map[K, Array[V]]]` are not yet.
-- `==` inside a generic function is admitted for any `T`; instantiating it with a boxed type still compares identity (the non-generic case is a compile error).
-- `pionc test <workspace>` runs only the root package's tests; `pionc query defs|callers` needs source files rather than a workspace directory.
+- Machine-applicable `edits` cover 6 of the 12 measured error classes; the other 6 (type mismatch, arity, unknown field, missing trait impl, `Send`, missing `World`) carry a natural-language `fixit` only. Whether an applied edit re-checks clean is not yet measured by `agent_eval`.
+- No central package registry: dependencies are `path` or `git` entries in `pion.toml`, pinned by `pion.lock`.
+- `std/tls` is a client only and depends on the system OpenSSL (1.1.x or 3.x) being installed.
 - Targets: ARM64 macOS (Mach-O) and x86_64 Linux (ELF64) are verified; other QBE targets are not.
+- No automatic SIMD vectorization (QBE has no vector IR and LLVM is excluded by design); on `nbody` Pion is 3% behind C `-O2` and ~13% behind Zig/Rust, retiring ~1.7× their instructions (§5).
+- On the edit → tests-green loop Pion relinks and relaunches every dependent package's test binary after a body edit (exact, no stale passes), which costs more than MoonBit's and Go's incremental test runs on the small `t06` project (§4).
 
 ## Quick Start & Full Reproduction
 
 ```sh
 # Build the toolchain and run all 6 gates on macOS ARM64:
 # Stage 0 unit tests, <64 KB runtime (O2 + TSan + ASan), 9/9 fixed-point
-# bootstrap, fmt (UTF-8), std/json + std/http + dogfood app tests, cross ELF64 .o
+# bootstrap, fmt (UTF-8), std/json/http/net/regex + dogfood app tests,
+# pionc init smoke, event-server self-test, cross ELF64 .o
 sh scripts/verify-all.sh
 out/pionc2 run examples/text_stats
 
-# Linux x86_64 with the macOS Stage 2 SSA: zero-`as` ELF64 objects, runtime,
-# 4-client TCP loopback, Stage 3 == Stage 4, KV service 8x500 stress, V1 checksums
+# Linux x86_64 with the macOS Stage 2 SSA: zero-`as` ELF64 objects, <56 KB runtime,
+# epoll event loop, Stage 3 == Stage 4, std/tls TLS 1.3/1.2 handshakes, KV service
+# 8x500 (with/without Keep-Alive), event-server self-test, V1 checksums
 PION_LINUX_SSA="$PWD/out/stage2.ssa" sh scripts/test-linux.sh
 
 # Benchmarks
 sh scripts/bench-v2-exec.sh            # V2 real workloads, 6 languages
+sh examples/http_event_server/run_bench.sh "$PWD/out/pionc2" 1000 40 4   # C1000 keep-alive
 sh scripts/bench-v2-compile.sh         # V2 50k LOC / 50 packages compile
 PIONC="$PWD/out/pionc2" sh scripts/bench.sh   # V1 classic kernels, 5 languages
 sh benchmarks/agent_eval/run.sh        # agent-in-the-loop, 4 languages
@@ -248,9 +262,9 @@ CI (`.github/workflows/ci.yml`) runs `verify-all.sh` on `macos-15` and then `tes
 - `compiler/src/core/` — compiler core in the strict `Pion ∩ MoonBit` subset (`lexer`, `ast`, `parser`, `sig`, `types`, `qbe`, `cas`, `diag`, `query`, `fmt`, `manifest`)
 - `compiler/src/compat_moon/` — Stage 0 MoonBit host adapter
 - `compiler/src/compat_pion/` — Stage 1/2 native `Pion` CLI driver (parallel package compilation)
-- `runtime/` — `<64 KB` C11 runtime (`pion_rt.h`, `pion_rt.c`, `test_rt.c`)
+- `runtime/` — `<64 KB` C11 runtime (`pion_rt.h`, `pion_rt.c`, `test_rt.c`; BRC, slab allocator, threads, `kqueue`/`epoll` event loop)
 - `vendor/qbe/` — vendored QBE with direct Mach-O / ELF64 object emission and hardware `sqrt` lowering
-- `std/json`, `std/http` — standard packages in pure `Pion`
-- `examples/` — `text_stats` (multi-package), `http_loopback`, `http_kv_service`, `sqlite_indexer`
+- `std/json`, `std/http`, `std/net`, `std/regex`, `std/tls` — standard packages in pure `Pion`
+- `examples/` — `text_stats` (multi-package), `http_loopback`, `http_kv_service`, `http_event_server` (C1000 keep-alive event-loop server), `sqlite_indexer`
 - `benchmarks/` — V1 (`c`, `moonbit`, `zig`, `rust`, `pion`), V2 (`v2/`, + Go) and `agent_eval/`
 - `scripts/` — bootstrap, verification, Linux and benchmark scripts
