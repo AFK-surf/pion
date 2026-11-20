@@ -1027,7 +1027,7 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
   assert_eq(sw_body.contains("m2_rc_inc"), false)
   assert_eq(sw_body.contains("m2_rc_dec"), false)
   assert_eq(sw_body.contains("loadub"), true)
-  // 2. dispatch_if: const folded (no loadsw $m2_const_) and binary dispatch tree (@sw_lt, csltw)
+  // 2. dispatch_if: const folded (no loadsw $m2_const_) and native jtbl jump table
   let di_start = match ssa.find("fn_dispatch_if(") {
     Some(idx) => idx
     None => -1
@@ -1040,9 +1040,9 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
   }
   let di_body = di_rest.clamped_view(end=di_end).to_owned()
   assert_eq(di_body.contains("$m2_const_"), false)
-  assert_eq(di_body.contains("csltw"), true)
+  assert_eq(di_body.contains("jtbl "), true)
   assert_eq(di_body.contains("@sw_arm"), true)
-  // 3. dispatch_match: binary dispatch tree
+  // 3. dispatch_match: native jtbl jump table
   let dm_start = match ssa.find("fn_dispatch_match(") {
     Some(idx) => idx
     None => -1
@@ -1054,7 +1054,7 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
     None => dm_rest.length()
   }
   let dm_body = dm_rest.clamped_view(end=dm_end).to_owned()
-  assert_eq(dm_body.contains("csltw"), true)
+  assert_eq(dm_body.contains("jtbl "), true)
   assert_eq(dm_body.contains("@sw_arm"), true)
   // 4. fast_ops: inline bytes length/get/set, sb ASCII fast path, prim array push fast path
   let fo_start = match ssa.find("fn_fast_ops(") {
@@ -1226,4 +1226,155 @@ test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
   assert_eq(us_body.contains("loadub"), true)
   // 5. budget_loop: emits cleanly with 5 arrays + call
   assert_eq(ssa.contains("fn_budget_loop("), true)
+}
+
+///|
+test "p11c: native jtbl for dense int dispatch, sparse fallback, and dense TEnum match" {
+  let src =
+    "enum Expr {\n" +
+    "  ENum(Int)\n" +
+    "  EAdd(Int, Int)\n" +
+    "  ESub(Int, Int)\n" +
+    "  EMul(Int, Int)\n" +
+    "  EDiv(Int, Int)\n" +
+    "  ENeg(Int)\n" +
+    "}\n" +
+    "fn dense_int(x : Int) -> Int {\n" +
+    "  match x {\n" +
+    "    10 => 1\n" +
+    "    11 => 2\n" +
+    "    12 => 3\n" +
+    "    14 => 5\n" +
+    "    15 => 6\n" +
+    "    16 => 7\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n" +
+    "fn sparse_int(x : Int) -> Int {\n" +
+    "  match x {\n" +
+    "    1 => 1\n" +
+    "    100 => 2\n" +
+    "    1000 => 3\n" +
+    "    10000 => 4\n" +
+    "    100000 => 5\n" +
+    "    1000000 => 6\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n" +
+    "fn eval_enum(e : Expr) -> Int {\n" +
+    "  match e {\n" +
+    "    ENum(v) => v\n" +
+    "    EAdd(a, b) => a + b\n" +
+    "    ESub(a, b) => a - b\n" +
+    "    EMul(a, b) => a * b\n" +
+    "    EDiv(a, b) => a / b\n" +
+    "    ENeg(v) => 0 - v\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  dense_int(12) + sparse_int(100) + eval_enum(EAdd(3, 4))\n" +
+    "}\n"
+  let cr = @core.check_source_files_with_imports("p11c_cg", ["p11c.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  // 1. dense_int: shifted jtbl
+  let di_start = match ssa.find("fn_dense_int(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(di_start >= 0, true)
+  let di_rest = ssa.clamped_view(start=di_start).to_owned()
+  let di_end = match di_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => di_rest.length()
+  }
+  let di_body = di_rest.clamped_view(end=di_end).to_owned()
+  assert_eq(di_body.contains("jtbl "), true)
+  assert_eq(di_body.contains("=w sub "), true)
+  // 2. sparse_int: falls back to balanced binary tree (no jtbl)
+  let si_start = match ssa.find("fn_sparse_int(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(si_start >= 0, true)
+  let si_rest = ssa.clamped_view(start=si_start).to_owned()
+  let si_end = match si_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => si_rest.length()
+  }
+  let si_body = si_rest.clamped_view(end=si_end).to_owned()
+  assert_eq(si_body.contains("jtbl "), false)
+  assert_eq(si_body.contains("csltw"), true)
+  // 3. eval_enum: dense TEnum match emits jtbl
+  let ee_start = match ssa.find("fn_eval_enum(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(ee_start >= 0, true)
+  let ee_rest = ssa.clamped_view(start=ee_start).to_owned()
+  let ee_end = match ee_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => ee_rest.length()
+  }
+  let ee_body = ee_rest.clamped_view(end=ee_end).to_owned()
+  assert_eq(ee_body.contains("jtbl "), true)
+  assert_eq(ee_body.contains("@em_arm"), true)
+}
+
+///|
+test "p11c: same-index overwrite OOB dedup and pure EIf rhs array borrow" {
+  let src =
+    "fn cmp_overwrite(st : Array[Int], sp : Int) -> Unit {\n" +
+    "  st[sp - 1] = if st[sp - 1] < st[sp] { 1 } else { 0 }\n" +
+    "}\n" +
+    "fn add_overwrite(st : Array[Int], sp : Int) -> Unit {\n" +
+    "  st[sp - 1] = st[sp - 1] + st[sp]\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let st = [3, 5]\n" +
+    "  add_overwrite(st, 1)\n" +
+    "  cmp_overwrite(st, 1)\n" +
+    "  st[0]\n" +
+    "}\n"
+  let cr = @core.check_source_files_with_imports("p11c_ow", ["p11c_ow.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  // cmp_overwrite: zero rc_inc/rc_dec (pure EIf borrows st) and only 2 OOB checks (not 3)
+  let co_start = match ssa.find("fn_cmp_overwrite(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(co_start >= 0, true)
+  let co_rest = ssa.clamped_view(start=co_start).to_owned()
+  let co_end = match co_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => co_rest.length()
+  }
+  let co_body = co_rest.clamped_view(end=co_end).to_owned()
+  assert_eq(co_body.contains("m2_rc_inc"), false)
+  assert_eq(co_body.contains("m2_rc_dec"), false)
+  // add_overwrite: only 2 OOB checks (st[sp-1] reused once, st[sp] checked once)
+  let ao_start = match ssa.find("fn_add_overwrite(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(ao_start >= 0, true)
+  let ao_rest = ssa.clamped_view(start=ao_start).to_owned()
+  let ao_end = match ao_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => ao_rest.length()
+  }
+  let ao_body = ao_rest.clamped_view(end=ao_end).to_owned()
+  let mut oob_cnt = 0
+  let mut pos = 0
+  while pos < ao_body.length() {
+    match ao_body.clamped_view(start=pos).to_owned().find("m2_panic_oob") {
+      Some(off) => {
+        oob_cnt = oob_cnt + 1
+        pos = pos + off + 12
+      }
+      None => break
+    }
+  }
+  assert_eq(oob_cnt, 2)
 }

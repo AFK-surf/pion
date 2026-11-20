@@ -141,6 +141,9 @@ pub struct QbeGen {
   mut promoted_field_tys : Map[String, Ty]
   mut w_to_l_ext : Map[String, String]
   mut local_w_to_l_ext : Map[String, String]
+  mut assign_idx_arr : String
+  mut assign_idx_key : String
+  mut assign_idx_ep : String
   mut next_tmp : Int
   mut next_lbl : Int
   mut next_clo : Int
@@ -520,8 +523,139 @@ fn qbe_expr_has_assign(e : Expr) -> Bool {
       }
       false
     }
-    EBlock(_, _) | EIf(_, _, _, _) | EMatch(_, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) =>
+    EBlock(stmts, _) => qbe_stmts_have_assign(stmts)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if qbe_expr_has_assign(cond) || qbe_stmts_have_assign(then_stmts) {
+        return true
+      }
+      match else_opt {
+        None => false
+        Some(el) => qbe_expr_has_assign(el)
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      if qbe_expr_has_assign(scrut) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_assign(ge) {
+              return true
+            }
+          None => ()
+        }
+        if qbe_expr_has_assign(arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) =>
       true
+  }
+}
+
+///|
+fn qbe_stmts_have_assign(stmts : Array[Stmt]) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SExpr(e, _) =>
+        if qbe_expr_has_assign(e) {
+          return true
+        }
+      _ => return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn qbe_pure_idx_key(e : Expr) -> String {
+  match e {
+    EIdent(v, _) => "v:" + v
+    EBinary(op, EIdent(v, _), EInt(raw, _), _) =>
+      if op == "+" || op == "-" {
+        op + ":" + v + ":" + qbe_parse_int64_lit(raw).to_string()
+      } else {
+        ""
+      }
+    EBinary(op, EIdent(v1, _), EIdent(v2, _), _) =>
+      if op == "+" || op == "-" {
+        op + ":" + v1 + ":v:" + v2
+      } else {
+        ""
+      }
+    _ => ""
+  }
+}
+
+///|
+fn qbe_expr_has_same_index(e : Expr, arr : String, key : String) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EDouble(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => false
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+      qbe_expr_has_same_index(inner, arr, key)
+    EBinary(_, l, r, _) =>
+      qbe_expr_has_same_index(l, arr, key) || qbe_expr_has_same_index(r, arr, key)
+    EIndex(obj, idx, _) => {
+      match obj {
+        EIdent(aname, _) =>
+          if aname == arr && qbe_pure_idx_key(idx) == key {
+            return true
+          }
+        _ => ()
+      }
+      qbe_expr_has_same_index(obj, arr, key) || qbe_expr_has_same_index(idx, arr, key)
+    }
+    EIf(cond, then_stmts, else_opt, _) => {
+      if qbe_expr_has_same_index(cond, arr, key) {
+        return true
+      }
+      let mut i = 0
+      while i < then_stmts.length() {
+        match then_stmts[i] {
+          SExpr(se, _) =>
+            if qbe_expr_has_same_index(se, arr, key) {
+              return true
+            }
+          _ => ()
+        }
+        i = i + 1
+      }
+      match else_opt {
+        None => false
+        Some(el) => qbe_expr_has_same_index(el, arr, key)
+      }
+    }
+    EBlock(stmts, _) => {
+      let mut i = 0
+      while i < stmts.length() {
+        match stmts[i] {
+          SExpr(se, _) =>
+            if qbe_expr_has_same_index(se, arr, key) {
+              return true
+            }
+          _ => ()
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
   }
 }
 
@@ -1569,10 +1703,10 @@ fn qbe_collect_indexed_arrs_stmts(stmts : Array[Stmt], out : Array[String]) -> U
 }
 
 ///|
-fn qbe_inc_count(counts : Map[String, Int], name : String) -> Unit {
+fn qbe_inc_count_by(counts : Map[String, Int], name : String, weight : Int) -> Unit {
   match counts.get(name) {
-    Some(c) => counts.set(name, c + 1)
-    None => counts.set(name, 1)
+    Some(c) => counts.set(name, c + weight)
+    None => counts.set(name, weight)
   }
 }
 
@@ -1582,6 +1716,7 @@ fn qbe_collect_loop_idx_expr(
   arrs : Array[String],
   counts : Map[String, Int],
   strs : Array[String],
+  weight : Int,
 ) -> Unit {
   match e {
     EInt(_, _)
@@ -1595,10 +1730,10 @@ fn qbe_collect_loop_idx_expr(
     | EPath(_, _, _)
     | EUnit(_) => ()
     EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
-      qbe_collect_loop_idx_expr(inner, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(inner, arrs, counts, strs, weight)
     EBinary(_, l, r, _) => {
-      qbe_collect_loop_idx_expr(l, arrs, counts, strs)
-      qbe_collect_loop_idx_expr(r, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(l, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_expr(r, arrs, counts, strs, weight)
     }
     EIndex(obj, idx, _) => {
       match obj {
@@ -1606,17 +1741,17 @@ fn qbe_collect_loop_idx_expr(
           if !str_arr_contains(arrs, aname) {
             arrs.push(aname)
           }
-          qbe_inc_count(counts, aname)
+          qbe_inc_count_by(counts, aname, weight)
         }
-        _ => qbe_collect_loop_idx_expr(obj, arrs, counts, strs)
+        _ => qbe_collect_loop_idx_expr(obj, arrs, counts, strs, weight)
       }
-      qbe_collect_loop_idx_expr(idx, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(idx, arrs, counts, strs, weight)
     }
     ECall(callee, args, _) => {
-      qbe_collect_loop_idx_expr(callee, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(callee, arrs, counts, strs, weight)
       let mut i = 0
       while i < args.length() {
-        qbe_collect_loop_idx_expr(args[i], arrs, counts, strs)
+        qbe_collect_loop_idx_expr(args[i], arrs, counts, strs, weight)
         i = i + 1
       }
     }
@@ -1627,49 +1762,49 @@ fn qbe_collect_loop_idx_expr(
             if !str_arr_contains(strs, sname) {
               strs.push(sname)
             }
-          _ => qbe_collect_loop_idx_expr(obj, arrs, counts, strs)
+          _ => qbe_collect_loop_idx_expr(obj, arrs, counts, strs, weight)
         }
       } else {
-        qbe_collect_loop_idx_expr(obj, arrs, counts, strs)
+        qbe_collect_loop_idx_expr(obj, arrs, counts, strs, weight)
       }
       let mut i = 0
       while i < args.length() {
-        qbe_collect_loop_idx_expr(args[i], arrs, counts, strs)
+        qbe_collect_loop_idx_expr(args[i], arrs, counts, strs, weight)
         i = i + 1
       }
     }
     EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        qbe_collect_loop_idx_expr(elems[i], arrs, counts, strs)
+        qbe_collect_loop_idx_expr(elems[i], arrs, counts, strs, weight)
         i = i + 1
       }
     }
     EStructLit(_, fields, _) => {
       let mut i = 0
       while i < fields.length() {
-        qbe_collect_loop_idx_expr(fields[i].value, arrs, counts, strs)
+        qbe_collect_loop_idx_expr(fields[i].value, arrs, counts, strs, weight)
         i = i + 1
       }
     }
-    EBlock(stmts, _) => qbe_collect_loop_idx_stmts(stmts, arrs, counts, strs)
+    EBlock(stmts, _) => qbe_collect_loop_idx_stmts(stmts, arrs, counts, strs, weight)
     EIf(cond, then_stmts, else_opt, _) => {
-      qbe_collect_loop_idx_expr(cond, arrs, counts, strs)
-      qbe_collect_loop_idx_stmts(then_stmts, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(cond, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_stmts(then_stmts, arrs, counts, strs, 1)
       match else_opt {
         None => ()
-        Some(el) => qbe_collect_loop_idx_expr(el, arrs, counts, strs)
+        Some(el) => qbe_collect_loop_idx_expr(el, arrs, counts, strs, 1)
       }
     }
     EMatch(scrut, arms, _) => {
-      qbe_collect_loop_idx_expr(scrut, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(scrut, arrs, counts, strs, weight)
       let mut i = 0
       while i < arms.length() {
         match arms[i].guard_expr {
-          Some(ge) => qbe_collect_loop_idx_expr(ge, arrs, counts, strs)
+          Some(ge) => qbe_collect_loop_idx_expr(ge, arrs, counts, strs, 1)
           None => ()
         }
-        qbe_collect_loop_idx_expr(arms[i].body, arrs, counts, strs)
+        qbe_collect_loop_idx_expr(arms[i].body, arrs, counts, strs, 1)
         i = i + 1
       }
     }
@@ -1683,44 +1818,45 @@ fn qbe_collect_loop_idx_stmt(
   arrs : Array[String],
   counts : Map[String, Int],
   strs : Array[String],
+  weight : Int,
 ) -> Unit {
   match s {
-    SLet(_, _, _, init, _) => qbe_collect_loop_idx_expr(init, arrs, counts, strs)
-    SLetTuple(_, _, init, _) => qbe_collect_loop_idx_expr(init, arrs, counts, strs)
+    SLet(_, _, _, init, _) => qbe_collect_loop_idx_expr(init, arrs, counts, strs, weight)
+    SLetTuple(_, _, init, _) => qbe_collect_loop_idx_expr(init, arrs, counts, strs, weight)
     SAssign(lhs, rhs, _) => {
-      qbe_collect_loop_idx_expr(lhs, arrs, counts, strs)
-      qbe_collect_loop_idx_expr(rhs, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(lhs, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_expr(rhs, arrs, counts, strs, weight)
     }
     SWhile(cond, body, _) => {
-      qbe_collect_loop_idx_expr(cond, arrs, counts, strs)
-      qbe_collect_loop_idx_stmts(body, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(cond, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_stmts(body, arrs, counts, strs, weight)
     }
     SFor(init_s, cond, step_s, body, _) => {
-      qbe_collect_loop_idx_stmt(init_s, arrs, counts, strs)
-      qbe_collect_loop_idx_expr(cond, arrs, counts, strs)
-      qbe_collect_loop_idx_stmt(step_s, arrs, counts, strs)
-      qbe_collect_loop_idx_stmts(body, arrs, counts, strs)
+      qbe_collect_loop_idx_stmt(init_s, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_expr(cond, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_stmt(step_s, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_stmts(body, arrs, counts, strs, weight)
     }
     SForRange(_, start_e, end_e, body, _) => {
-      qbe_collect_loop_idx_expr(start_e, arrs, counts, strs)
-      qbe_collect_loop_idx_expr(end_e, arrs, counts, strs)
-      qbe_collect_loop_idx_stmts(body, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(start_e, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_expr(end_e, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_stmts(body, arrs, counts, strs, weight)
     }
     SForIn(_, iter_e, body, _) => {
-      qbe_collect_loop_idx_expr(iter_e, arrs, counts, strs)
-      qbe_collect_loop_idx_stmts(body, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(iter_e, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_stmts(body, arrs, counts, strs, weight)
     }
     SReturn(opt, _) =>
       match opt {
         None => ()
-        Some(e) => qbe_collect_loop_idx_expr(e, arrs, counts, strs)
+        Some(e) => qbe_collect_loop_idx_expr(e, arrs, counts, strs, weight)
       }
     SBreak(_) | SContinue(_) => ()
     SDebugAssert(c, m, _) => {
-      qbe_collect_loop_idx_expr(c, arrs, counts, strs)
-      qbe_collect_loop_idx_expr(m, arrs, counts, strs)
+      qbe_collect_loop_idx_expr(c, arrs, counts, strs, weight)
+      qbe_collect_loop_idx_expr(m, arrs, counts, strs, weight)
     }
-    SExpr(e, _) => qbe_collect_loop_idx_expr(e, arrs, counts, strs)
+    SExpr(e, _) => qbe_collect_loop_idx_expr(e, arrs, counts, strs, weight)
   }
 }
 
@@ -1730,10 +1866,11 @@ fn qbe_collect_loop_idx_stmts(
   arrs : Array[String],
   counts : Map[String, Int],
   strs : Array[String],
+  weight : Int,
 ) -> Unit {
   let mut i = 0
   while i < stmts.length() {
-    qbe_collect_loop_idx_stmt(stmts[i], arrs, counts, strs)
+    qbe_collect_loop_idx_stmt(stmts[i], arrs, counts, strs, weight)
     i = i + 1
   }
 }
@@ -3852,6 +3989,9 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     promoted_field_tys: Map([]),
     w_to_l_ext: Map([]),
     local_w_to_l_ext: Map([]),
+    assign_idx_arr: "",
+    assign_idx_key: "",
+    assign_idx_ep: "",
     next_tmp: 0,
     next_lbl: 0,
     next_clo: 0,
@@ -4780,7 +4920,48 @@ fn qbe_emit_int_dispatch(
   }
   let l_def = qbe_lbl(g, "sw_def")
   let l_end = qbe_lbl(g, "sw_end")
-  qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, 0, arms.length() - 1, l_def)
+  let min_v = arms[0].cval.to_int64()
+  let max_v = arms[arms.length() - 1].cval.to_int64()
+  let span = max_v - min_v + 1L
+  if arms.length() >= 6 &&
+    span >= 6L &&
+    span <= 256L &&
+    span <= (arms.length() * 2).to_int64() {
+    let idx_w = if min_v == 0L {
+      val_reg
+    } else {
+      let t = qbe_tmp(g)
+      qbe_emit(g, t + " =w sub " + val_reg + ", " + arms[0].cval.to_string())
+      t
+    }
+    let span_n = span.to_int()
+    let tbl : Array[String] = []
+    let mut k = 0
+    while k < span_n {
+      tbl.push(l_def)
+      k = k + 1
+    }
+    k = 0
+    while k < arms.length() {
+      let slot_idx = (arms[k].cval.to_int64() - min_v).to_int()
+      tbl[slot_idx] = arm_lbls[k]
+      k = k + 1
+    }
+    let sb = StringBuilder()
+    sb.write_string("jtbl ")
+    sb.write_string(idx_w)
+    sb.write_string(", ")
+    sb.write_string(l_def)
+    k = 0
+    while k < span_n {
+      sb.write_string(", ")
+      sb.write_string(tbl[k])
+      k = k + 1
+    }
+    qbe_emit_term(g, sb.to_string())
+  } else {
+    qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, 0, arms.length() - 1, l_def)
+  }
 
   let mut res_slot = ""
   let mut res_ty : Option[Ty] = expected
@@ -8943,6 +9124,35 @@ fn qbe_emit_expr(
       r
     }
     EIndex(obj, idx, _) => {
+      // Reuse already bounds-checked element pointer when inside `arr[idx] = ... arr[idx] ...`
+      if g.assign_idx_arr != "" {
+        match obj {
+          EIdent(lname, _) =>
+            if lname == g.assign_idx_arr && qbe_pure_idx_key(idx) == g.assign_idx_key {
+              match qbe_lookup_local(g, lname) {
+                Some(loc) =>
+                  match loc.ty {
+                    TArray(elem) => {
+                      let r = if qbe_is_int32_ty(elem) {
+                        let rl = qbe_tmp(g)
+                        let rw = qbe_tmp(g)
+                        qbe_emit(g, rl + " =l loadl " + g.assign_idx_ep)
+                        qbe_emit(g, rw + " =w copy " + rl)
+                        g.w_to_l_ext.set(rw, rl)
+                        rw
+                      } else {
+                        qbe_load_heap_slot(g, g.assign_idx_ep, elem)
+                      }
+                      return qval(r, elem)
+                    }
+                    _ => ()
+                  }
+                None => ()
+              }
+            }
+          _ => ()
+        }
+      }
       let mut borrowed = false
       let mut ov = qval("0", TError)
       let mut arr_local_name = ""
@@ -9604,6 +9814,241 @@ fn qbe_emit_expr(
       }
       let scrut_loc = qbe_define_local(g, "__match_scrut", sv.ty, !scrut_borrowed)
       qbe_store_local_slot(g, sv.reg, scrut_loc.slot, sv.ty)
+      // Dense guardless single-layer TEnum match -> native QBE jtbl jump table
+      if arms.length() >= 6 {
+        match sv.ty {
+          TEnum(ename, _) =>
+            match g.tc.enums.get(ename) {
+              Some(einfo) => {
+                let var_tags : Array[Int] = []
+                let var_arm_idxs : Array[Int] = []
+                let seen_tags : Map[String, Bool] = Map([])
+                let mut def_arm_idx = -1
+                let mut min_tag = 2147483647
+                let mut max_tag = -1
+                let mut ok_enum_jtbl = true
+                let mut ai = 0
+                while ai < arms.length() {
+                  let arm = arms[ai]
+                  match arm.guard_expr {
+                    Some(_) => {
+                      ok_enum_jtbl = false
+                      break
+                    }
+                    None => ()
+                  }
+                  match arm.pat {
+                    PVariant(_, vname, subs, _) => {
+                      let mut simple_subs = true
+                      let mut si = 0
+                      while si < subs.length() {
+                        match subs[si] {
+                          PWild(_) | PIdent(_, _) => ()
+                          _ => {
+                            simple_subs = false
+                            break
+                          }
+                        }
+                        si = si + 1
+                      }
+                      if !simple_subs {
+                        ok_enum_jtbl = false
+                        break
+                      }
+                      let mut found_tag = -1
+                      let mut vi = 0
+                      while vi < einfo.variants.length() {
+                        if einfo.variants[vi].name == vname {
+                          found_tag = vi
+                          break
+                        }
+                        vi = vi + 1
+                      }
+                      if found_tag < 0 {
+                        ok_enum_jtbl = false
+                        break
+                      }
+                      let tk = found_tag.to_string()
+                      if seen_tags.contains(tk) {
+                        ok_enum_jtbl = false
+                        break
+                      }
+                      seen_tags.set(tk, true)
+                      var_tags.push(found_tag)
+                      var_arm_idxs.push(ai)
+                      if found_tag < min_tag {
+                        min_tag = found_tag
+                      }
+                      if found_tag > max_tag {
+                        max_tag = found_tag
+                      }
+                    }
+                    PWild(_) | PIdent(_, _) =>
+                      if ai == arms.length() - 1 {
+                        def_arm_idx = ai
+                      } else {
+                        ok_enum_jtbl = false
+                        break
+                      }
+                    _ => {
+                      ok_enum_jtbl = false
+                      break
+                    }
+                  }
+                  ai = ai + 1
+                }
+                let span = max_tag - min_tag + 1
+                if ok_enum_jtbl &&
+                  var_tags.length() >= 6 &&
+                  span >= 6 &&
+                  span <= 256 &&
+                  span <= var_tags.length() * 2 {
+                  let arm_lbls : Array[String] = []
+                  let mut k = 0
+                  while k < var_tags.length() {
+                    arm_lbls.push(qbe_lbl(g, "em_arm"))
+                    k = k + 1
+                  }
+                  let l_def = qbe_lbl(g, "em_def")
+                  let l_end = qbe_lbl(g, "match_end")
+                  let cur_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
+                  let tag_l = qbe_tmp(g)
+                  let tag_w = qbe_tmp(g)
+                  qbe_emit(g, tag_l + " =l loadl " + cur_sv)
+                  qbe_emit(g, tag_w + " =w copy " + tag_l)
+                  let idx_w = if min_tag == 0 {
+                    tag_w
+                  } else {
+                    let t = qbe_tmp(g)
+                    qbe_emit(g, t + " =w sub " + tag_w + ", " + min_tag.to_string())
+                    t
+                  }
+                  let tbl : Array[String] = []
+                  k = 0
+                  while k < span {
+                    tbl.push(l_def)
+                    k = k + 1
+                  }
+                  k = 0
+                  while k < var_tags.length() {
+                    tbl[var_tags[k] - min_tag] = arm_lbls[k]
+                    k = k + 1
+                  }
+                  let sb = StringBuilder()
+                  sb.write_string("jtbl ")
+                  sb.write_string(idx_w)
+                  sb.write_string(", ")
+                  sb.write_string(l_def)
+                  k = 0
+                  while k < span {
+                    sb.write_string(", ")
+                    sb.write_string(tbl[k])
+                    k = k + 1
+                  }
+                  qbe_emit_term(g, sb.to_string())
+                  let mut res_slot = ""
+                  let mut res_ty : Option[Ty] = expected
+                  k = 0
+                  while k < var_tags.length() {
+                    let arm = arms[var_arm_idxs[k]]
+                    qbe_emit_lbl(g, arm_lbls[k])
+                    qbe_scope_push(g)
+                    let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
+                    qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, scrut_borrowed, arm.body)
+                    let bv = qbe_emit_expr(g, arm.body, res_ty)
+                    match res_ty {
+                      None =>
+                        match bv.ty {
+                          TNever => ()
+                          _ => res_ty = Some(bv.ty)
+                        }
+                      Some(_) => ()
+                    }
+                    if !g.block_term {
+                      let store_ty = match res_ty {
+                        Some(t) => t
+                        None => bv.ty
+                      }
+                      if res_slot == "" {
+                        res_slot = qbe_alloc_slot_for(g, store_ty)
+                      }
+                      qbe_store_local_slot(
+                        g,
+                        qbe_coerce_val(g, bv, store_ty),
+                        res_slot,
+                        store_ty,
+                      )
+                    }
+                    qbe_scope_pop(g)
+                    qbe_emit_term(g, "jmp " + l_end)
+                    k = k + 1
+                  }
+                  qbe_emit_lbl(g, l_def)
+                  if def_arm_idx >= 0 {
+                    let arm = arms[def_arm_idx]
+                    qbe_scope_push(g)
+                    let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
+                    qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, scrut_borrowed, arm.body)
+                    let bv = qbe_emit_expr(g, arm.body, res_ty)
+                    match res_ty {
+                      None =>
+                        match bv.ty {
+                          TNever => ()
+                          _ => res_ty = Some(bv.ty)
+                        }
+                      Some(_) => ()
+                    }
+                    if !g.block_term {
+                      let store_ty = match res_ty {
+                        Some(t) => t
+                        None => bv.ty
+                      }
+                      if res_slot == "" {
+                        res_slot = qbe_alloc_slot_for(g, store_ty)
+                      }
+                      qbe_store_local_slot(
+                        g,
+                        qbe_coerce_val(g, bv, store_ty),
+                        res_slot,
+                        store_ty,
+                      )
+                    }
+                    qbe_scope_pop(g)
+                    qbe_emit_term(g, "jmp " + l_end)
+                  } else {
+                    let file_id = qbe_intern_cstring(g, sp.file)
+                    let msg_id = qbe_intern_cstring(g, "non-exhaustive match")
+                    qbe_emit(
+                      g,
+                      "call $m2_panic(l $m2_cstr_" +
+                      msg_id.to_string() +
+                      ", l $m2_cstr_" +
+                      file_id.to_string() +
+                      ", w " +
+                      sp.line.to_string() +
+                      ")",
+                    )
+                    qbe_emit_term(g, "jmp " + l_end)
+                  }
+                  qbe_emit_lbl(g, l_end)
+                  qbe_scope_pop(g)
+                  let final_ty = match res_ty {
+                    Some(t) => t
+                    None => TUnit
+                  }
+                  if res_slot == "" {
+                    return qval(qbe_zero_reg(final_ty), final_ty)
+                  } else {
+                    let r = qbe_load_local_slot(g, res_slot, final_ty)
+                    return qval(r, final_ty)
+                  }
+                }
+              }
+              None => ()
+            }
+          _ => ()
+        }
+      }
       let mut res_slot = ""
       let l_end = qbe_lbl(g, "match_end")
       let mut res_ty : Option[Ty] = expected
@@ -11315,48 +11760,107 @@ fn qbe_emit_stmt(
             TArray(elem) => {
               let iv = qbe_emit_expr(g, idx, Some(TInt))
               let il = qbe_as_l(g, iv)
-              let rv = qbe_emit_expr(g, rhs, Some(elem))
               if qbe_is_prim_array_elem(elem) {
-                let bce_safe = if arr_local_name != "" {
-                  qbe_bce_expr_is_safe(g, arr_local_name, idx)
+                let idx_key = if borrowed &&
+                  arr_local_name != "" &&
+                  qbe_loop_has_no_calls_expr(rhs) &&
+                  !qbe_expr_assigns_ident(rhs, arr_local_name) {
+                  qbe_pure_idx_key(idx)
                 } else {
-                  false
+                  ""
                 }
-                if !bce_safe {
-                  let alen = match g.hoisted_arr_len.get(arr_local_name) {
-                    Some(hlen) => hlen
+                let reuse_ep = idx_key != "" &&
+                  qbe_expr_has_same_index(rhs, arr_local_name, idx_key)
+                if reuse_ep {
+                  let bce_safe = qbe_bce_expr_is_safe(g, arr_local_name, idx)
+                  if !bce_safe {
+                    let alen = match g.hoisted_arr_len.get(arr_local_name) {
+                      Some(hlen) => hlen
+                      None => {
+                        let t = qbe_tmp(g)
+                        qbe_emit(g, t + " =l loadl " + ov.reg)
+                        t
+                      }
+                    }
+                    let oob = qbe_tmp(g)
+                    let l_oob = qbe_lbl(g, "arr_oob")
+                    let l_ok = qbe_lbl(g, "arr_ok")
+                    qbe_emit(g, oob + " =w cugel " + il + ", " + alen)
+                    qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+                    qbe_emit_lbl(g, l_oob)
+                    qbe_emit(g, "call $m2_panic_oob(l " + il + ", l " + alen + ")")
+                    qbe_emit_term(g, "hlt")
+                    qbe_emit_lbl(g, l_ok)
+                  }
+                  let dp = match g.hoisted_arr_dp.get(arr_local_name) {
+                    Some(hdp) => hdp
                     None => {
+                      let dp_p = qbe_tmp(g)
                       let t = qbe_tmp(g)
-                      qbe_emit(g, t + " =l loadl " + ov.reg)
+                      qbe_emit(g, dp_p + " =l add " + ov.reg + ", 24")
+                      qbe_emit(g, t + " =l loadl " + dp_p)
                       t
                     }
                   }
-                  let oob = qbe_tmp(g)
-                  let l_oob = qbe_lbl(g, "arr_oob")
-                  let l_ok = qbe_lbl(g, "arr_ok")
-                  qbe_emit(g, oob + " =w cugel " + il + ", " + alen)
-                  qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
-                  qbe_emit_lbl(g, l_oob)
-                  qbe_emit(g, "call $m2_panic_oob(l " + il + ", l " + alen + ")")
-                  qbe_emit_term(g, "hlt")
-                  qbe_emit_lbl(g, l_ok)
-                }
-                let dp = match g.hoisted_arr_dp.get(arr_local_name) {
-                  Some(hdp) => hdp
-                  None => {
-                    let dp_p = qbe_tmp(g)
-                    let t = qbe_tmp(g)
-                    qbe_emit(g, dp_p + " =l add " + ov.reg + ", 24")
-                    qbe_emit(g, t + " =l loadl " + dp_p)
-                    t
+                  let off = qbe_tmp(g)
+                  let ep = qbe_tmp(g)
+                  qbe_emit(g, off + " =l shl " + il + ", 3")
+                  qbe_emit(g, ep + " =l add " + dp + ", " + off)
+                  let prev_arr = g.assign_idx_arr
+                  let prev_key = g.assign_idx_key
+                  let prev_ep = g.assign_idx_ep
+                  g.assign_idx_arr = arr_local_name
+                  g.assign_idx_key = idx_key
+                  g.assign_idx_ep = ep
+                  let rv = qbe_emit_expr(g, rhs, Some(elem))
+                  g.assign_idx_arr = prev_arr
+                  g.assign_idx_key = prev_key
+                  g.assign_idx_ep = prev_ep
+                  qbe_store_heap_slot(g, qbe_coerce_val(g, rv, elem), ep, elem)
+                } else {
+                  let rv = qbe_emit_expr(g, rhs, Some(elem))
+                  let bce_safe = if arr_local_name != "" {
+                    qbe_bce_expr_is_safe(g, arr_local_name, idx)
+                  } else {
+                    false
                   }
+                  if !bce_safe {
+                    let alen = match g.hoisted_arr_len.get(arr_local_name) {
+                      Some(hlen) => hlen
+                      None => {
+                        let t = qbe_tmp(g)
+                        qbe_emit(g, t + " =l loadl " + ov.reg)
+                        t
+                      }
+                    }
+                    let oob = qbe_tmp(g)
+                    let l_oob = qbe_lbl(g, "arr_oob")
+                    let l_ok = qbe_lbl(g, "arr_ok")
+                    qbe_emit(g, oob + " =w cugel " + il + ", " + alen)
+                    qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+                    qbe_emit_lbl(g, l_oob)
+                    qbe_emit(g, "call $m2_panic_oob(l " + il + ", l " + alen + ")")
+                    qbe_emit_term(g, "hlt")
+                    qbe_emit_lbl(g, l_ok)
+                  }
+                  let dp = match g.hoisted_arr_dp.get(arr_local_name) {
+                    Some(hdp) => hdp
+                    None => {
+                      let dp_p = qbe_tmp(g)
+                      let t = qbe_tmp(g)
+                      qbe_emit(g, dp_p + " =l add " + ov.reg + ", 24")
+                      qbe_emit(g, t + " =l loadl " + dp_p)
+                      t
+                    }
+                  }
+                  let off = qbe_tmp(g)
+                  let ep = qbe_tmp(g)
+                  qbe_emit(g, off + " =l shl " + il + ", 3")
+                  qbe_emit(g, ep + " =l add " + dp + ", " + off)
+                  qbe_store_heap_slot(g, qbe_coerce_val(g, rv, elem), ep, elem)
                 }
-                let off = qbe_tmp(g)
-                let ep = qbe_tmp(g)
-                qbe_emit(g, off + " =l shl " + il + ", 3")
-                qbe_emit(g, ep + " =l add " + dp + ", " + off)
-                qbe_store_heap_slot(g, qbe_coerce_val(g, rv, elem), ep, elem)
               } else {
+                let rv = qbe_emit_expr(g, rhs, Some(elem))
                 let vl = qbe_as_l(g, rv)
                 qbe_emit(
                   g,
@@ -11420,8 +11924,8 @@ fn qbe_emit_stmt(
       let cand_arrs : Array[String] = []
       let cand_counts : Map[String, Int] = Map([])
       let cand_strs : Array[String] = []
-      qbe_collect_loop_idx_expr(cond, cand_arrs, cand_counts, cand_strs)
-      qbe_collect_loop_idx_stmts(body, cand_arrs, cand_counts, cand_strs)
+      qbe_collect_loop_idx_expr(cond, cand_arrs, cand_counts, cand_strs, 8)
+      qbe_collect_loop_idx_stmts(body, cand_arrs, cand_counts, cand_strs, 8)
       let stable_arrs : Array[String] = []
       let mut ai = 0
       while ai < cand_arrs.length() {

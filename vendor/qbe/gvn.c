@@ -266,6 +266,13 @@ dedupins(Fn *fn, Blk *b, Ins *i)
 	}
 	i1 = gvndup(i, 1);
 	if (i1) {
+		Blk *b1 = fn->rpo[fn->tmp[i1->to.val].bid];
+		if (!dom(b1, b) && !dom(b, b1)) {
+			Blk *d;
+			for (d = b->idom; d; d = d->idom)
+				if (d->jmp.type == Jjtbl && dom(d, b1))
+					return;
+		}
 		killins(fn, i, i1->to);
 		return;
 	}
