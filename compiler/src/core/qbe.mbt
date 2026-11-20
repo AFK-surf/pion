@@ -626,6 +626,236 @@ fn qbe_register_enum_const(
 }
 
 ///|
+fn qbe_exprs_have_eq(g : QbeGen, d : Int, es : Array[Expr]) -> Bool {
+  let mut i = 0
+  while i < es.length() {
+    if qbe_expr_has_eq(g, d, es[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// Whether `e` contains a `==` / `!=` anywhere (closures included), or calls
+/// a generic fn whose body does (up to 4 levels deep).
+fn qbe_expr_has_eq(g : QbeGen, d : Int, e : Expr) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EDouble(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => false
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
+      qbe_expr_has_eq(g, d, inner)
+    EBinary(op, l, r, _) =>
+      op == "==" || op == "!=" || qbe_expr_has_eq(g, d, l) || qbe_expr_has_eq(g, d, r)
+    EField(o, _, _) => qbe_expr_has_eq(g, d, o)
+    EIndex(o, i, _) => qbe_expr_has_eq(g, d, o) || qbe_expr_has_eq(g, d, i)
+    ECall(callee, args, _) =>
+      qbe_expr_has_eq(g, d, callee) ||
+      qbe_exprs_have_eq(g, d, args) ||
+      qbe_callee_generic_has_eq(g, d, callee)
+    EMethodCall(obj, _, args, _) => qbe_expr_has_eq(g, d, obj) || qbe_exprs_have_eq(g, d, args)
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) =>
+      qbe_exprs_have_eq(g, d, elems)
+    EStructLit(_, fields, _) => {
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_expr_has_eq(g, d, fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) => qbe_stmts_have_eq(g, d, stmts)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if qbe_expr_has_eq(g, d, cond) || qbe_stmts_have_eq(g, d, then_stmts) {
+        return true
+      }
+      match else_opt {
+        None => false
+        Some(el) => qbe_expr_has_eq(g, d, el)
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      if qbe_expr_has_eq(g, d, scrut) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_eq(g, d, ge) {
+              return true
+            }
+          None => ()
+        }
+        if qbe_expr_has_eq(g, d, arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EClosure(_, _, body, _) => qbe_stmts_have_eq(g, d, body)
+    EScope(a, b, _) | ESpawn(a, b, _) => qbe_expr_has_eq(g, d, a) || qbe_expr_has_eq(g, d, b)
+  }
+}
+
+///|
+fn qbe_stmt_has_eq(g : QbeGen, d : Int, st : Stmt) -> Bool {
+  match st {
+    SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) => qbe_expr_has_eq(g, d, init)
+    SAssign(l, r, _) => qbe_expr_has_eq(g, d, l) || qbe_expr_has_eq(g, d, r)
+    SWhile(c, body, _) => qbe_expr_has_eq(g, d, c) || qbe_stmts_have_eq(g, d, body)
+    SFor(init, c, step, body, _) =>
+      qbe_stmt_has_eq(g, d, init) ||
+      qbe_expr_has_eq(g, d, c) ||
+      qbe_stmt_has_eq(g, d, step) ||
+      qbe_stmts_have_eq(g, d, body)
+    SForRange(_, a, b, body, _) =>
+      qbe_expr_has_eq(g, d, a) || qbe_expr_has_eq(g, d, b) || qbe_stmts_have_eq(g, d, body)
+    SForIn(_, it, body, _) => qbe_expr_has_eq(g, d, it) || qbe_stmts_have_eq(g, d, body)
+    SReturn(ro, _) =>
+      match ro {
+        Some(re) => qbe_expr_has_eq(g, d, re)
+        None => false
+      }
+    SBreak(_) | SContinue(_) => false
+    SDebugAssert(c, m, _) => qbe_expr_has_eq(g, d, c) || qbe_expr_has_eq(g, d, m)
+    SExpr(e, _) => qbe_expr_has_eq(g, d, e)
+  }
+}
+
+///|
+fn qbe_stmts_have_eq(g : QbeGen, d : Int, stmts : Array[Stmt]) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if qbe_stmt_has_eq(g, d, stmts[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// A generic callee comparing its type params: a caller forwarding its own
+/// type params must be monomorphized too, so the inner call sees concrete types.
+fn qbe_callee_generic_has_eq(g : QbeGen, d : Int, callee : Expr) -> Bool {
+  if d >= 4 {
+    return false
+  }
+  let fo : Option[FnInfo] = match callee {
+    EIdent(name, _) => g.tc.fns.get(name)
+    EPath(qual, mem, _) =>
+      match resolve_alias_pkg(g.tc, qual) {
+        Some(ipkg) => ipkg.tc.fns.get(mem)
+        None => None
+      }
+    _ => None
+  }
+  match fo {
+    Some(fi) =>
+      fi.decl.type_params.length() > 0 &&
+      fi.decl.type_bounds.length() == 0 &&
+      qbe_stmts_have_eq(g, d + 1, fi.decl.body)
+    None => false
+  }
+}
+
+///|
+/// Generic fns are monomorphized when bounded, or when their body uses
+/// `==` / `!=` and every type argument is concrete: the erased body would
+/// compare `T` values by pointer, while `String` must compare bytes and
+/// payload-less enums their tags.
+fn qbe_call_needs_mono(g : QbeGen, fd : FnDecl, subst : Map[String, Ty]) -> Bool {
+  if fd.type_bounds.length() > 0 {
+    return true
+  }
+  if fd.type_params.length() == 0 {
+    return false
+  }
+  let mut i = 0
+  while i < fd.type_params.length() {
+    match subst.get(fd.type_params[i]) {
+      Some(t) =>
+        if qbe_ty_has_param(t) {
+          return false
+        }
+      None => return false
+    }
+    i = i + 1
+  }
+  qbe_stmts_have_eq(g, 0, fd.body)
+}
+
+///|
+/// Expected type for an argument of a call to `fd`. For an unbounded generic
+/// that compares its type params (monomorphized per call), a parameter type
+/// still naming an unbound type param is no hint: the argument infers its own
+/// concrete type (`count_same(["a"], "a")` binds `U = String`, not `U`).
+fn qbe_generic_arg_expect(g : QbeGen, fd : FnDecl, pty : Ty, arg : Expr) -> Option[Ty] {
+  if fd.type_params.length() == 0 ||
+    fd.type_bounds.length() > 0 ||
+    !qbe_ty_has_param(pty) {
+    return Some(pty)
+  }
+  let self_inferring = match arg {
+    EArrayLit(elems, _) => elems.length() > 0
+    EIdent(n, _) => n != "None"
+    EUnit(_) => false
+    _ => true
+  }
+  if self_inferring && qbe_stmts_have_eq(g, 0, fd.body) {
+    None
+  } else {
+    Some(pty)
+  }
+}
+
+///|
+fn qbe_ty_has_param(t : Ty) -> Bool {
+  match t {
+    TParam(_) | TError => true
+    TArray(e) | TOption(e) | TChannel(e) | TMutex(e) => qbe_ty_has_param(e)
+    TResult(a, b) | TMap(a, b) => qbe_ty_has_param(a) || qbe_ty_has_param(b)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if qbe_ty_has_param(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, r) => {
+      if qbe_ty_has_param(r) {
+        return true
+      }
+      let mut i = 0
+      while i < ps.length() {
+        if qbe_ty_has_param(ps[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
 fn qbe_expr_has_assign(e : Expr) -> Bool {
   match e {
     EInt(_, _)
@@ -4918,6 +5148,41 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
 }
 
 ///|
+/// Storing object `val_l` into container `container` (an `Array` / `Map`
+/// shared through a `Mutex` is frozen, `owner_tid == 0`): deep-freeze the
+/// value first so its RC (and that of everything it owns) stays atomic on
+/// whichever thread later releases it. `deep_only` skips types the runtime's
+/// own adopt-on-store already freezes completely.
+fn qbe_emit_adopt_if_frozen(
+  g : QbeGen,
+  container : String,
+  val_l : String,
+  elem : Ty,
+  deep_only : Bool,
+) -> Unit {
+  if !qbe_is_obj_ty(elem) {
+    return
+  }
+  let sym = qbe_ensure_freeze_fn(g, elem)
+  if sym == "" || (deep_only && sym == "$pion_rc_freeze") {
+    return
+  }
+  let hp = qbe_tmp(g)
+  let tid = qbe_tmp(g)
+  let fz = qbe_tmp(g)
+  let l_fz = qbe_lbl(g, "adopt_fz")
+  let l_go = qbe_lbl(g, "adopt_go")
+  qbe_emit(g, hp + " =l sub " + container + ", 32")
+  qbe_emit(g, tid + " =l loadl " + hp)
+  qbe_emit(g, fz + " =w ceql " + tid + ", 0")
+  qbe_emit_term(g, "jnz " + fz + ", " + l_fz + ", " + l_go)
+  qbe_emit_lbl(g, l_fz)
+  qbe_emit(g, "call " + sym + "(l " + val_l + ")")
+  qbe_emit_term(g, "jmp " + l_go)
+  qbe_emit_lbl(g, l_go)
+}
+
+///|
 fn qbe_emit_deep_freeze(g : QbeGen, reg_l : String, ty : Ty) -> Unit {
   if !qbe_is_obj_ty(ty) {
     return
@@ -6266,6 +6531,138 @@ fn qbe_emit_closure_obj(
 }
 
 ///|
+/// `opt.is_some()` / `res.is_ok()` and friends: compare the tag word (Option:
+/// `Some` = 1; Result: `Ok` = 0) against zero.
+fn qbe_emit_tag_test(
+  g : QbeGen,
+  obj_val : String,
+  obj_borrowed : Bool,
+  obj_ty : Ty,
+  cmp : String,
+) -> QbeVal {
+  let tag = qbe_tmp(g)
+  let cw = qbe_tmp(g)
+  let r = qbe_tmp(g)
+  qbe_emit(g, tag + " =l loadl " + obj_val)
+  qbe_emit(g, cw + " =w " + cmp + " " + tag + ", 0")
+  qbe_emit(g, r + " =l extuw " + cw)
+  if !obj_borrowed {
+    qbe_rc_dec(g, obj_val, obj_ty)
+  }
+  qval(r, TBool)
+}
+
+///|
+/// `opt.unwrap_or(d)` / `res.unwrap_or(d)`: the default is evaluated first
+/// (owned); the payload is taken (+1) when the tag is `hit_tag`, otherwise the
+/// default is moved into the result.
+fn qbe_emit_unwrap_or(
+  g : QbeGen,
+  obj_val : String,
+  obj_borrowed : Bool,
+  obj_ty : Ty,
+  hit_tag : Int,
+  inner : Ty,
+  dflt : Expr,
+) -> QbeVal {
+  let dv = qbe_emit_expr(g, dflt, Some(inner))
+  let dl = qbe_as_l(g, qval(qbe_coerce_val(g, dv, inner), inner))
+  let res_slot = qbe_alloc_slot(g)
+  let tag = qbe_tmp(g)
+  let hit = qbe_tmp(g)
+  let l_hit = qbe_lbl(g, "uwo_hit")
+  let l_miss = qbe_lbl(g, "uwo_miss")
+  let l_end = qbe_lbl(g, "uwo_end")
+  qbe_emit(g, tag + " =l loadl " + obj_val)
+  qbe_emit(g, hit + " =w ceql " + tag + ", " + hit_tag.to_string())
+  qbe_emit_term(g, "jnz " + hit + ", " + l_hit + ", " + l_miss)
+  qbe_emit_lbl(g, l_hit)
+  let pp = qbe_tmp(g)
+  let pv = qbe_tmp(g)
+  qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+  qbe_emit(g, pv + " =l loadl " + pp)
+  qbe_emit(g, "storel " + pv + ", " + res_slot)
+  qbe_rc_inc(g, pv, inner)
+  qbe_rc_dec(g, dl, inner)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_miss)
+  qbe_emit(g, "storel " + dl + ", " + res_slot)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_end)
+  if !obj_borrowed {
+    qbe_rc_dec(g, obj_val, obj_ty)
+  }
+  let rl = qbe_tmp(g)
+  qbe_emit(g, rl + " =l loadl " + res_slot)
+  qval(qbe_from_l(g, rl, inner), inner)
+}
+
+///|
+/// `s.to_int()` / `s.to_int64()` / `s.to_double()` -> `Option[...]`: `None`
+/// for empty, malformed or out-of-range text (never panics).
+fn qbe_emit_str_parse(
+  g : QbeGen,
+  obj_val : String,
+  obj_borrowed : Bool,
+  method_name : String,
+) -> QbeVal {
+  let ok_slot = qbe_alloc_slot4(g)
+  let okw = qbe_tmp(g)
+  let payload = qbe_tmp(g)
+  let inner = if method_name == "to_int" {
+    TInt
+  } else if method_name == "to_int64" {
+    TInt64
+  } else {
+    TDouble
+  }
+  let mut ok_final = okw
+  if method_name == "to_double" {
+    let d = qbe_tmp(g)
+    qbe_emit(g, d + " =d call $pion_str_to_double(l " + obj_val + ", l " + ok_slot + ")")
+    qbe_emit(g, okw + " =w loadw " + ok_slot)
+    qbe_emit(g, payload + " =l cast " + d)
+  } else {
+    let v = qbe_tmp(g)
+    qbe_emit(g, v + " =l call $pion_str_to_int(l " + obj_val + ", l " + ok_slot + ")")
+    qbe_emit(g, okw + " =w loadw " + ok_slot)
+    if method_name == "to_int" {
+      // `Int` is 32-bit: values that do not survive the round trip are `None`.
+      let vw = qbe_tmp(g)
+      let in_range = qbe_tmp(g)
+      let both = qbe_tmp(g)
+      qbe_emit(g, vw + " =w copy " + v)
+      qbe_emit(g, payload + " =l extsw " + vw)
+      qbe_emit(g, in_range + " =w ceql " + payload + ", " + v)
+      qbe_emit(g, both + " =w and " + okw + ", " + in_range)
+      ok_final = both
+    } else {
+      qbe_emit(g, payload + " =l copy " + v)
+    }
+  }
+  if !obj_borrowed {
+    qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+  }
+  let res_slot = qbe_alloc_slot(g)
+  let l_some = qbe_lbl(g, "sp_some")
+  let l_none = qbe_lbl(g, "sp_none")
+  let l_end = qbe_lbl(g, "sp_end")
+  qbe_emit_term(g, "jnz " + ok_final + ", " + l_some + ", " + l_none)
+  qbe_emit_lbl(g, l_some)
+  let some_obj = qbe_emit_some(g, payload, inner)
+  qbe_emit(g, "storel " + some_obj + ", " + res_slot)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_none)
+  let none_obj = qbe_emit_none(g)
+  qbe_emit(g, "storel " + none_obj + ", " + res_slot)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_end)
+  let r = qbe_tmp(g)
+  qbe_emit(g, r + " =l loadl " + res_slot)
+  qval(r, TOption(inner))
+}
+
+///|
 fn qbe_emit_method_call(
   g : QbeGen,
   obj_expr : Expr,
@@ -6469,7 +6866,40 @@ fn qbe_emit_method_call(
         qbe_emit(g, w + " =w copy " + obj_val)
         return qval(w, TInt)
       }
+    TOption(inner) => {
+      if method_name == "is_some" || method_name == "is_none" {
+        return qbe_emit_tag_test(
+          g,
+          obj_val,
+          obj_borrowed,
+          TOption(inner),
+          if method_name == "is_some" { "cnel" } else { "ceql" },
+        )
+      }
+      if method_name == "unwrap_or" {
+        return qbe_emit_unwrap_or(g, obj_val, obj_borrowed, recv_ty, 1, inner, args[0])
+      }
+    }
+    TResult(ok_ty, _) => {
+      if method_name == "is_ok" || method_name == "is_err" {
+        return qbe_emit_tag_test(
+          g,
+          obj_val,
+          obj_borrowed,
+          recv_ty,
+          if method_name == "is_ok" { "ceql" } else { "cnel" },
+        )
+      }
+      if method_name == "unwrap_or" {
+        return qbe_emit_unwrap_or(g, obj_val, obj_borrowed, recv_ty, 0, ok_ty, args[0])
+      }
+    }
     TString => {
+      if method_name == "to_int" ||
+        method_name == "to_int64" ||
+        method_name == "to_double" {
+        return qbe_emit_str_parse(g, obj_val, obj_borrowed, method_name)
+      }
       if method_name == "length" {
         let r64 = qbe_tmp(g)
         let rw = qbe_tmp(g)
@@ -6781,6 +7211,8 @@ fn qbe_emit_method_call(
         let vl = qbe_as_l(g, vv)
         let is_prim = qbe_is_prim_array_elem(elem)
         let is_owned_obj = !is_prim && qbe_is_obj_ty(elem) && !va.borrowed
+        // The inline fast path below bypasses the runtime's adopt-on-push.
+        qbe_emit_adopt_if_frozen(g, obj_val, vl, elem, !is_owned_obj)
         if is_prim || is_owned_obj {
           let alen = qbe_tmp(g)
           let cap_p = qbe_tmp(g)
@@ -6916,6 +7348,7 @@ fn qbe_emit_method_call(
         let kv = ka.qv
         let vv = va.qv
         let vl = qbe_as_l(g, vv)
+        qbe_emit_adopt_if_frozen(g, obj_val, vl, vty, true)
         qbe_emit(
           g,
           "call $pion_map_set(l " + obj_val + ", l " + kv.reg + ", l " + vl + ")",
@@ -9043,7 +9476,7 @@ fn qbe_emit_expr(
                   _ => ()
                 }
                 let exp_p : Option[Ty] = if i < finfo.param_tys.length() {
-                  Some(subst_ty(finfo.param_tys[i], subst))
+                  qbe_generic_arg_expect(g, finfo.decl, subst_ty(finfo.param_tys[i], subst), args[i])
                 } else {
                   None
                 }
@@ -9057,7 +9490,7 @@ fn qbe_emit_expr(
                 arg_borrowed.push(aa.borrowed)
                 i = i + 1
               }
-              if finfo.decl.type_bounds.length() > 0 {
+              if qbe_call_needs_mono(g, finfo.decl, subst) {
                 return qbe_emit_mono_call(
                   g,
                   qbe_local_fn_sym(g, name),
@@ -9441,7 +9874,7 @@ fn qbe_emit_expr(
                   _ => ()
                 }
                 let exp_p : Option[Ty] = if i < minfo.param_tys.length() {
-                  Some(subst_ty(minfo.param_tys[i], subst))
+                  qbe_generic_arg_expect(g, minfo.decl, subst_ty(minfo.param_tys[i], subst), args[i])
                 } else {
                   None
                 }
@@ -9455,7 +9888,7 @@ fn qbe_emit_expr(
                 arg_borrowed.push(aa.borrowed)
                 i = i + 1
               }
-              if minfo.decl.type_bounds.length() > 0 {
+              if qbe_call_needs_mono(g, minfo.decl, subst) {
                 return qbe_emit_mono_call(
                   g,
                   target_sym,
@@ -12426,6 +12859,7 @@ fn qbe_emit_stmt(
               } else {
                 let rv = qbe_emit_expr(g, rhs, Some(elem))
                 let vl = qbe_as_l(g, rv)
+                qbe_emit_adopt_if_frozen(g, ov.reg, vl, elem, true)
                 qbe_emit(
                   g,
                   "call $pion_arr_set(l " + ov.reg + ", l " + il + ", l " + vl + ")",
@@ -12437,6 +12871,7 @@ fn qbe_emit_stmt(
               let kv = qbe_emit_expr(g, idx, Some(kty))
               let rv = qbe_emit_expr(g, rhs, Some(vty))
               let vl = qbe_as_l(g, rv)
+              qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
               qbe_emit(
                 g,
                 "call $pion_map_set(l " + ov.reg + ", l " + kv.reg + ", l " + vl + ")",
@@ -13769,6 +14204,10 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
     import_aliases: Map([]),
     imported_pkgs: Map([]),
     diagnostics: [],
+    eq_tparams: Map([]),
+    eq_keys: [],
+    eq_uses: [],
+    edit_keys: Map([]),
   }
   let mut fi = 0
   while fi < pkg.files.length() {

@@ -1454,3 +1454,98 @@ test "p15: == on a payload-less enum compares variant tags, not pointers" {
   )
   assert_true(res2.ssa.contains("=l loadl %"), res2.ssa)
 }
+
+///|
+test "p17a: generic == is monomorphized per instantiation (String bytes, enum tags)" {
+  let src =
+    #|enum Color {
+    #|  Red
+    #|  Green
+    #|}
+    #|fn same[T](a : T, b : T) -> Bool {
+    #|  a == b
+    #|}
+    #|fn ident[T](a : T) -> T {
+    #|  a
+    #|}
+    #|fn count_same[U](xs : Array[U], x : U) -> Int {
+    #|  let mut n = 0
+    #|  for y in xs {
+    #|    if same(x, y) {
+    #|      n = n + 1
+    #|    }
+    #|  }
+    #|  n
+    #|}
+    #|pub fn main(world : World) -> Int {
+    #|  let x = "a" + "b"
+    #|  let c = count_same([x], "ab")
+    #|  let n = if same(x, "ab") && same(Red, Red) && same(3, 3) { c } else { 0 }
+    #|  io_println(world, ident("k"))
+    #|  n
+    #|}
+  let res = @core.emit_qbe_package(
+    @core.parse_package("test", ["generic_eq.pion"], [src]),
+    false,
+  )
+  let ssa = res.ssa
+  assert_true(ssa.contains("same__mono_String"), ssa)
+  assert_true(ssa.contains("same__mono_Color"), ssa)
+  assert_true(ssa.contains("same__mono_Int"), ssa)
+  // A generic forwarding its type param to a comparing generic is
+  // monomorphized too, so the inner call compares concrete `String`s.
+  assert_true(ssa.contains("count_same__mono_String"), ssa)
+  // String instantiation compares bytes, never pointers.
+  assert_true(ssa.contains("call $pion_str_eq("), ssa)
+  // Generic fns without `==` keep the single erased body.
+  assert_true(!ssa.contains("ident__mono"), ssa)
+}
+
+///|
+test "p17a: String parse helpers, Option/Result helpers, expression debug_assert lower to QBE" {
+  let src =
+    #|pub fn main(world : World) -> Int {
+    #|  let a = "42".to_int()
+    #|  let b = "7".to_int64()
+    #|  let c = "2.5".to_double()
+    #|  match a {
+    #|    Some(x) => debug_assert(x > 0, "pos")
+    #|    None => ()
+    #|  }
+    #|  let r : Result[Int, String] = Ok(1)
+    #|  if a.is_some() && b.is_some() && !c.is_none() && r.is_ok() && !r.is_err() {
+    #|    io_println(world, "ok")
+    #|  }
+    #|  a.unwrap_or(0) + r.unwrap_or(0) + c.unwrap_or(0.0).to_int() + b.unwrap_or(0L).to_int()
+    #|}
+  let ssa = @core.emit_qbe_package(@core.parse_package("test", ["parse.pion"], [src]), false).ssa
+  assert_true(ssa.contains("call $pion_str_to_int("), ssa)
+  assert_true(ssa.contains("call $pion_str_to_double("), ssa)
+  assert_true(ssa.contains("uwo_hit"), ssa)
+  assert_true(ssa.contains("pion_debug_assert"), ssa)
+}
+
+///|
+test "p17a: storing into a possibly-frozen container deep-freezes the element" {
+  let src =
+    #|pub val struct Msg {
+    #|  id : Int
+    #|  body : String
+    #|}
+    #|pub fn main(world : World) -> Int {
+    #|  let q : Mutex[Array[Msg]] = Mutex::new([])
+    #|  let nums : Array[Int] = []
+    #|  scope(world, fn(s : Scope) -> Unit {
+    #|    spawn(s, fn() -> Unit {
+    #|      let a = q.lock()
+    #|      a.push(Msg::{ id: 1, body: "x" })
+    #|      q.unlock()
+    #|    })
+    #|  })
+    #|  nums.push(1)
+    #|  0
+    #|}
+  let ssa = @core.emit_qbe_package(@core.parse_package("test", ["adopt.pion"], [src]), false).ssa
+  assert_true(ssa.contains("adopt_fz"), ssa)
+  assert_true(ssa.contains("$pion_freeze_st_Msg"), ssa)
+}

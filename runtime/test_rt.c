@@ -1038,6 +1038,159 @@ static void test_mt_mutex_and_atomic(void) {
     printf("[PASS] mt_mutex_and_atomic (8 threads)\n");
 }
 
+/* P17-A: `Mutex[Array[String]]` and `Mutex[Map[String, Array[String]]]`.
+ * Freezing a container freezes its elements recursively; every object stored
+ * into a frozen container later (push / push_owned / set / map_set) is frozen
+ * too, so strings created on one worker and released on another keep a
+ * correct atomic RC (ASan/LSan: no leak, no double free; TSan: no race). */
+typedef struct DeepEnv {
+    void *mu_arr;
+    void *mu_map;
+} DeepEnv;
+
+static void deep_env_drop(void *p) {
+    DeepEnv *e = (DeepEnv *)p;
+    pion_rc_dec(e->mu_arr);
+    pion_rc_dec(e->mu_map);
+}
+
+static int is_frozen_obj(void *obj) {
+    return ((PionHeader *)obj - 1)->owner_tid == 0;
+}
+
+static _Atomic int64_t g_deep_seq = 0;
+
+static void deep_worker(void *arg) {
+    DeepEnv *e = (DeepEnv *)arg;
+    PION_STATIC_STRING_DEF(kKeyPrefix, "k");
+    for (int i = 0; i < 2000; i++) {
+        int64_t seq = atomic_fetch_add_explicit(&g_deep_seq, 1, memory_order_relaxed);
+        void *s = pion_int_to_str(seq);
+        void *arr = (void *)(uintptr_t)pion_mutex_lock(e->mu_arr);
+        assert(is_frozen_obj(arr));
+        if ((i & 3) == 3 && pion_arr_len(arr) > 0) {
+            /* Release (on this thread) a string another worker created. */
+            void *popped = (void *)(uintptr_t)pion_arr_pop(arr);
+            assert(is_frozen_obj(popped));
+            pion_rc_dec(popped);
+        } else {
+            if ((i & 7) == 5 && pion_arr_len(arr) > 0) {
+                pion_arr_set(arr, 0, (int64_t)(uintptr_t)s);
+            } else if ((i & 1) == 0) {
+                pion_rc_inc(s);
+                pion_arr_push_owned(arr, (int64_t)(uintptr_t)s);
+            } else {
+                pion_arr_push(arr, (int64_t)(uintptr_t)s);
+            }
+            assert(is_frozen_obj(s));
+        }
+        pion_mutex_unlock(e->mu_arr);
+        pion_rc_dec(s);
+
+        void *num = pion_int_to_str(i & 15);
+        void *key = pion_str_concat(kKeyPrefix, num);
+        pion_rc_dec(num);
+        void *m = (void *)(uintptr_t)pion_mutex_lock(e->mu_map);
+        int64_t got = 0;
+        void *bucket;
+        if (pion_map_try_get(m, key, &got)) {
+            bucket = (void *)(uintptr_t)got;
+        } else {
+            void *fresh = pion_arr_new(0, 1);
+            pion_map_set(m, key, (int64_t)(uintptr_t)fresh);
+            assert(is_frozen_obj(fresh));
+            pion_rc_dec(fresh);
+            bucket = fresh;
+        }
+        void *v = pion_int_to_str(seq);
+        pion_arr_push(bucket, (int64_t)(uintptr_t)v);
+        assert(is_frozen_obj(v));
+        pion_mutex_unlock(e->mu_map);
+        pion_rc_dec(v);
+        pion_rc_dec(key);
+    }
+}
+
+static void test_mt_mutex_deep_containers(void) {
+    void *arr0 = pion_arr_new(0, 1);
+    void *a = pion_int_to_str(-1);
+    void *b = pion_int_to_str(-2);
+    pion_arr_push(arr0, (int64_t)(uintptr_t)a);
+    pion_arr_push(arr0, (int64_t)(uintptr_t)b);
+    void *map0 = pion_map_new(1);
+    void *inner = pion_arr_new(0, 1);
+    pion_arr_push(inner, (int64_t)(uintptr_t)a);
+    PION_STATIC_STRING_DEF(kSeed, "seed");
+    pion_map_set(map0, kSeed, (int64_t)(uintptr_t)inner);
+    void *mu_arr = pion_mutex_new((int64_t)(uintptr_t)arr0, 1);
+    void *mu_map = pion_mutex_new((int64_t)(uintptr_t)map0, 1);
+    /* Recursive freeze reaches array elements and map -> array -> string. */
+    assert(is_frozen_obj(arr0) && is_frozen_obj(a) && is_frozen_obj(b));
+    assert(is_frozen_obj(map0) && is_frozen_obj(inner));
+    pion_rc_dec(a);
+    pion_rc_dec(b);
+    pion_rc_dec(inner);
+    pion_rc_dec(arr0);
+    pion_rc_dec(map0);
+
+    DeepEnv *env = (DeepEnv *)pion_alloc((uint32_t)sizeof(DeepEnv), PION_TAG_STRUCT, deep_env_drop);
+    pion_rc_inc(mu_arr);
+    pion_rc_inc(mu_map);
+    env->mu_arr = mu_arr;
+    env->mu_map = mu_map;
+    void *sc = pion_scope_begin();
+    for (int t = 0; t < 8; t++) {
+        pion_scope_spawn(sc, deep_worker, env);
+    }
+    pion_scope_end(sc);
+
+    void *arr = (void *)(uintptr_t)pion_mutex_lock(mu_arr);
+    int64_t n = pion_arr_len(arr);
+    for (int64_t i = 0; i < n; i++) {
+        assert(is_frozen_obj((void *)(uintptr_t)pion_arr_get(arr, i)));
+    }
+    pion_mutex_unlock(mu_arr);
+    /* Per worker: 2000 ops, 1/4 pops (when non-empty), 1/8 sets, rest pushes. */
+    assert(n > 0 && n <= 2 + 8 * 2000);
+    void *m = (void *)(uintptr_t)pion_mutex_lock(mu_map);
+    int64_t total = 0;
+    void *keys = pion_map_keys(m);
+    for (int64_t i = 0; i < pion_arr_len(keys); i++) {
+        void *bucket = (void *)(uintptr_t)pion_map_get(m, (void *)(uintptr_t)pion_arr_get(keys, i));
+        assert(is_frozen_obj(bucket));
+        total += pion_arr_len(bucket);
+    }
+    pion_rc_dec(keys);
+    pion_mutex_unlock(mu_map);
+    assert(total == 1 + 8 * 2000);
+    pion_rc_dec(env);
+    pion_rc_dec(mu_arr);
+    pion_rc_dec(mu_map);
+    printf("[PASS] mt_mutex_deep_containers (8 threads, Mutex[Array[String]] n=%" PRId64
+           ", Mutex[Map[String, Array[String]]] total=%" PRId64 ")\n", n, total);
+}
+
+static void test_str_to_double(void) {
+    int32_t ok = 7;
+    PION_STATIC_STRING_DEF(kD1, "3.25");
+    PION_STATIC_STRING_DEF(kD2, "-1e3");
+    PION_STATIC_STRING_DEF(kD3, "+.5");
+    PION_STATIC_STRING_DEF(kBad1, "");
+    PION_STATIC_STRING_DEF(kBad2, " 1.0");
+    PION_STATIC_STRING_DEF(kBad3, "1.5x");
+    PION_STATIC_STRING_DEF(kBad4, "-inf");
+    PION_STATIC_STRING_DEF(kBad5, "nan");
+    assert(pion_str_to_double(kD1, &ok) == 3.25 && ok == 1);
+    assert(pion_str_to_double(kD2, &ok) == -1000.0 && ok == 1);
+    assert(pion_str_to_double(kD3, &ok) == 0.5 && ok == 1);
+    void *bads[] = { kBad1, kBad2, kBad3, kBad4, kBad5 };
+    for (int i = 0; i < 5; i++) {
+        ok = 7;
+        assert(pion_str_to_double(bads[i], &ok) == 0.0 && ok == 0);
+    }
+    printf("[PASS] str_to_double\n");
+}
+
 static void nested_leaf(void *arg) {
     pion_atomic_fetch_add(arg, 1);
 }
@@ -1918,10 +2071,12 @@ int main(int argc, char **argv) {
     test_sha256();
     test_world(argc, argv);
     test_ffi_ptr_and_cstr();
+    test_str_to_double();
 
     test_mt_shared_rc();
     test_mt_channel_10k();
     test_mt_mutex_and_atomic();
+    test_mt_mutex_deep_containers();
     test_mt_nested_scope();
     test_mt_slab_stress();
     test_mt_world_exec(argc, argv);
