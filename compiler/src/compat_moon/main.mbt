@@ -1,63 +1,63 @@
 ///|
 #borrow(path)
-extern "C" fn m2_host_file_exists(path : Bytes) -> Int = "m2_host_file_exists"
+extern "C" fn pion_host_file_exists(path : Bytes) -> Int = "pion_host_file_exists"
 
 ///|
 #borrow(path)
-extern "C" fn m2_host_is_dir(path : Bytes) -> Int = "m2_host_is_dir"
+extern "C" fn pion_host_is_dir(path : Bytes) -> Int = "pion_host_is_dir"
 
 ///|
 #borrow(path)
-extern "C" fn m2_host_read_file(path : Bytes) -> Bytes = "m2_host_read_file"
+extern "C" fn pion_host_read_file(path : Bytes) -> Bytes = "pion_host_read_file"
 
 ///|
 #borrow(path, data)
-extern "C" fn m2_host_write_file(path : Bytes, data : Bytes) -> Int = "m2_host_write_file"
+extern "C" fn pion_host_write_file(path : Bytes, data : Bytes) -> Int = "pion_host_write_file"
 
 ///|
 #borrow(path)
-extern "C" fn m2_host_mkdir_p(path : Bytes) -> Int = "m2_host_mkdir_p"
+extern "C" fn pion_host_mkdir_p(path : Bytes) -> Int = "pion_host_mkdir_p"
 
 ///|
 #borrow(path)
-extern "C" fn m2_host_remove(path : Bytes) -> Int = "m2_host_remove"
+extern "C" fn pion_host_remove(path : Bytes) -> Int = "pion_host_remove"
 
 ///|
 #borrow(old_p, new_p)
-extern "C" fn m2_host_rename(old_p : Bytes, new_p : Bytes) -> Int = "m2_host_rename"
+extern "C" fn pion_host_rename(old_p : Bytes, new_p : Bytes) -> Int = "pion_host_rename"
 
 ///|
 #borrow(path)
-extern "C" fn m2_host_file_size(path : Bytes) -> Int64 = "m2_host_file_size"
+extern "C" fn pion_host_file_size(path : Bytes) -> Int64 = "pion_host_file_size"
 
 ///|
 #borrow(name)
-extern "C" fn m2_host_env_get(name : Bytes) -> Bytes = "m2_host_env_get"
+extern "C" fn pion_host_env_get(name : Bytes) -> Bytes = "pion_host_env_get"
 
 ///|
-extern "C" fn m2_host_clock_ms() -> Int64 = "m2_host_clock_ms"
+extern "C" fn pion_host_clock_ms() -> Int64 = "pion_host_clock_ms"
 
 ///|
-extern "C" fn m2_host_getpid() -> Int = "m2_host_getpid"
+extern "C" fn pion_host_getpid() -> Int = "pion_host_getpid"
 
 ///|
 #borrow(argv)
-extern "C" fn m2_host_exec(argv : Bytes) -> Int = "m2_host_exec"
+extern "C" fn pion_host_exec(argv : Bytes) -> Int = "pion_host_exec"
 
 ///|
 #borrow(dir)
-extern "C" fn m2_host_list_sources(dir : Bytes) -> Bytes = "m2_host_list_sources"
+extern "C" fn pion_host_list_sources(dir : Bytes) -> Bytes = "pion_host_list_sources"
 
 ///|
 #borrow(data)
-extern "C" fn m2_host_write_stdout(data : Bytes) -> Unit = "m2_host_write_stdout"
+extern "C" fn pion_host_write_stdout(data : Bytes) -> Unit = "pion_host_write_stdout"
 
 ///|
 #borrow(data)
-extern "C" fn m2_host_write_stderr(data : Bytes) -> Unit = "m2_host_write_stderr"
+extern "C" fn pion_host_write_stderr(data : Bytes) -> Unit = "pion_host_write_stderr"
 
 ///|
-extern "C" fn m2_host_exit(code : Int) -> Unit = "m2_host_exit"
+extern "C" fn pion_host_exit(code : Int) -> Unit = "pion_host_exit"
 
 ///|
 fn str_to_utf8(s : String) -> Bytes {
@@ -122,36 +122,36 @@ fn utf8_to_str(b : Bytes) -> String {
 
 ///|
 fn write_out(s : String) -> Unit {
-  m2_host_write_stdout(str_to_utf8(s))
+  pion_host_write_stdout(str_to_utf8(s))
 }
 
 ///|
 fn write_err(s : String) -> Unit {
-  m2_host_write_stderr(str_to_utf8(s))
+  pion_host_write_stderr(str_to_utf8(s))
 }
 
 ///|
 fn env_str(name : String) -> String {
-  utf8_to_str(m2_host_env_get(str_to_utf8(name)))
+  utf8_to_str(pion_host_env_get(str_to_utf8(name)))
 }
 
 ///|
 fn file_exists(path : String) -> Bool {
-  m2_host_file_exists(str_to_utf8(path)) != 0
+  pion_host_file_exists(str_to_utf8(path)) != 0
 }
 
 ///|
 fn read_text(path : String) -> String {
-  utf8_to_str(m2_host_read_file(str_to_utf8(path)))
+  utf8_to_str(pion_host_read_file(str_to_utf8(path)))
 }
 
 ///|
 fn write_text_atomic(path : String, content : String) -> Bool {
-  let tmp = path + ".tmp." + m2_host_getpid().to_string()
-  if m2_host_write_file(str_to_utf8(tmp), str_to_utf8(content)) == 0 {
+  let tmp = path + ".tmp." + pion_host_getpid().to_string()
+  if pion_host_write_file(str_to_utf8(tmp), str_to_utf8(content)) == 0 {
     return false
   }
-  m2_host_rename(str_to_utf8(tmp), str_to_utf8(path)) != 0
+  pion_host_rename(str_to_utf8(tmp), str_to_utf8(path)) != 0
 }
 
 ///|
@@ -165,7 +165,7 @@ fn exec_argv(argv : Array[String]) -> Int {
     sb.write_string(argv[i])
     i = i + 1
   }
-  m2_host_exec(str_to_utf8(sb.to_string()))
+  pion_host_exec(str_to_utf8(sb.to_string()))
 }
 
 ///|
@@ -257,31 +257,31 @@ fn prefix16(s : String) -> String {
 
 ///|
 fn resolve_cache_dir() -> String {
-  let custom = env_str("M2_CACHE_DIR")
+  let custom = env_str("PION_CACHE_DIR")
   if custom.length() > 0 {
     return custom
   }
   let home = env_str("HOME")
   if home.length() > 0 {
-    home + "/.cache/m2/cas"
+    home + "/.cache/pion/cas"
   } else {
-    "/tmp/m2-cas"
+    "/tmp/pion-cas"
   }
 }
 
 ///|
 fn resolve_cache_max_bytes() -> Int64 {
-  let kb_s = env_str("M2_CACHE_MAX_KB")
+  let kb_s = env_str("PION_CACHE_MAX_KB")
   if kb_s.length() > 0 {
     return parse_pos_int64(kb_s, 1024L) * 1024L
   }
-  let mb_s = env_str("M2_CACHE_MAX_MB")
+  let mb_s = env_str("PION_CACHE_MAX_MB")
   parse_pos_int64(mb_s, 2048L) * 1024L * 1024L
 }
 
 ///|
 fn resolve_qbe_bin() -> String {
-  let env_qbe = env_str("M2_QBE")
+  let env_qbe = env_str("PION_QBE")
   if env_qbe.length() > 0 {
     return env_qbe
   }
@@ -296,22 +296,22 @@ fn resolve_qbe_bin() -> String {
 
 ///|
 fn resolve_rt_lib() -> String {
-  let env_rt = env_str("M2_RT_LIB")
+  let env_rt = env_str("PION_RT_LIB")
   if env_rt.length() > 0 {
     return env_rt
   }
-  if file_exists("out/libm2rt.a") {
-    return "out/libm2rt.a"
+  if file_exists("out/libpionrt.a") {
+    return "out/libpionrt.a"
   }
-  if file_exists("../out/libm2rt.a") {
-    return "../out/libm2rt.a"
+  if file_exists("../out/libpionrt.a") {
+    return "../out/libpionrt.a"
   }
-  "out/libm2rt.a"
+  "out/libpionrt.a"
 }
 
 ///|
 fn resolve_qbe_target() -> String {
-  let env_t = env_str("M2_TARGET")
+  let env_t = env_str("PION_TARGET")
   if env_t.length() > 0 {
     env_t
   } else if file_exists("/System/Library") {
@@ -343,7 +343,7 @@ fn parent_dir(path : String) -> String {
 fn ensure_parent_dir(path : String) -> Unit {
   let dir = parent_dir(path)
   if dir.length() > 0 {
-    let _ = m2_host_mkdir_p(str_to_utf8(dir))
+    let _ = pion_host_mkdir_p(str_to_utf8(dir))
   }
 }
 
@@ -361,22 +361,22 @@ fn load_targets(
   while t < targets.length() {
     let target = targets[t]
     let target_b = str_to_utf8(target)
-    if m2_host_file_exists(target_b) == 0 {
+    if pion_host_file_exists(target_b) == 0 {
       return Err("path does not exist: " + target)
     }
-    if m2_host_is_dir(target_b) != 0 {
-      let listing = utf8_to_str(m2_host_list_sources(target_b))
+    if pion_host_is_dir(target_b) != 0 {
+      let listing = utf8_to_str(pion_host_list_sources(target_b))
       let files = split_nonempty_lines(listing)
       let mut i = 0
       while i < files.length() {
         let fpath = files[i]
-        let content = utf8_to_str(m2_host_read_file(str_to_utf8(fpath)))
+        let content = utf8_to_str(pion_host_read_file(str_to_utf8(fpath)))
         paths.push(fpath)
         sources.push(content)
         i = i + 1
       }
     } else {
-      let content = utf8_to_str(m2_host_read_file(target_b))
+      let content = utf8_to_str(pion_host_read_file(target_b))
       paths.push(target)
       sources.push(content)
     }
@@ -397,15 +397,15 @@ fn cas_record_and_evict(
   } else {
     []
   }
-  let now = m2_host_clock_ms()
+  let now = pion_host_clock_ms()
   let max_bytes = resolve_cache_max_bytes()
   let ev = @core.cas_touch_and_evict(entries, key, entry_bytes, now, max_bytes)
   let mut i = 0
   while i < ev.evicted.length() {
     let ek = ev.evicted[i]
-    let _ = m2_host_remove(str_to_utf8(cache_dir + "/sig/" + ek + ".m2sig"))
-    let _ = m2_host_remove(str_to_utf8(cache_dir + "/ssa/" + ek + ".ssa"))
-    let _ = m2_host_remove(str_to_utf8(cache_dir + "/obj/" + ek + ".o"))
+    let _ = pion_host_remove(str_to_utf8(cache_dir + "/sig/" + ek + ".pionsig"))
+    let _ = pion_host_remove(str_to_utf8(cache_dir + "/ssa/" + ek + ".ssa"))
+    let _ = pion_host_remove(str_to_utf8(cache_dir + "/obj/" + ek + ".o"))
     i = i + 1
   }
   let _ = write_text_atomic(index_path, @core.cas_format_index(ev.kept))
@@ -413,9 +413,9 @@ fn cas_record_and_evict(
 
 ///|
 fn compute_compiler_fp(qbe_bin : String, rt_lib : String) -> String {
-  let qsz = m2_host_file_size(str_to_utf8(qbe_bin))
-  let rsz = m2_host_file_size(str_to_utf8(rt_lib))
-  let salt = env_str("M2_CACHE_SALT")
+  let qsz = pion_host_file_size(str_to_utf8(qbe_bin))
+  let rsz = pion_host_file_size(str_to_utf8(rt_lib))
+  let salt = env_str("PION_CACHE_SALT")
   @core.cas_compiler_fp(qsz, rsz, salt)
 }
 
@@ -533,13 +533,13 @@ fn resolve_rel_path_str(base_dir : String, rel : String) -> String {
 
 ///|
 fn detect_manifest_dir(target : String) -> Option[String] {
-  if target == "m2.toml" || ends_with_str(target, "/m2.toml") {
+  if target == "pion.toml" || ends_with_str(target, "/pion.toml") {
     let pd = parent_dir(target)
     return Some(if pd.length() == 0 { "." } else { pd })
   }
   let tb = str_to_utf8(target)
-  if m2_host_is_dir(tb) != 0 {
-    let mf = join_path_str(target, "m2.toml")
+  if pion_host_is_dir(tb) != 0 {
+    let mf = join_path_str(target, "pion.toml")
     if file_exists(mf) {
       return Some(normalize_path_str(target))
     }
@@ -553,7 +553,7 @@ fn load_pkg_dir_sources(
 ) -> (Array[String], Array[String]) {
   let paths : Array[String] = []
   let sources : Array[String] = []
-  let listing = utf8_to_str(m2_host_list_sources(str_to_utf8(pkg_dir)))
+  let listing = utf8_to_str(pion_host_list_sources(str_to_utf8(pkg_dir)))
   let files = split_nonempty_lines(listing)
   let mut i = 0
   while i < files.length() {
@@ -563,8 +563,8 @@ fn load_pkg_dir_sources(
     i = i + 1
   }
   let src_dir = join_path_str(pkg_dir, "src")
-  if m2_host_is_dir(str_to_utf8(src_dir)) != 0 {
-    let slisting = utf8_to_str(m2_host_list_sources(str_to_utf8(src_dir)))
+  if pion_host_is_dir(str_to_utf8(src_dir)) != 0 {
+    let slisting = utf8_to_str(pion_host_list_sources(str_to_utf8(src_dir)))
     let sfiles = split_nonempty_lines(slisting)
     let mut j = 0
     while j < sfiles.length() {
@@ -588,11 +588,11 @@ fn load_workspace_dfs(
     return Ok(())
   }
   visited.set(norm_dir, true)
-  let mf_path = join_path_str(norm_dir, "m2.toml")
+  let mf_path = join_path_str(norm_dir, "pion.toml")
   if !file_exists(mf_path) {
-    return Err("missing m2.toml in " + norm_dir)
+    return Err("missing pion.toml in " + norm_dir)
   }
-  let mf = match @core.parse_m2_toml(read_text(mf_path)) {
+  let mf = match @core.parse_pion_toml(read_text(mf_path)) {
     Err(e) => return Err(e)
     Ok(m) => m
   }
@@ -652,15 +652,15 @@ fn build_workspace_objects(
     return Err(@core.check_result_to_json(topo.diagnostics))
   }
   let cache_dir = resolve_cache_dir()
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/sig"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/sig"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
   let qbe_target = resolve_qbe_target()
   let qbe_bin = resolve_qbe_bin()
   let rt_lib = resolve_rt_lib()
   let compiler_fp = compute_compiler_fp(qbe_bin, rt_lib)
-  let trace_cas = env_str("M2_CAS_TRACE") == "1"
+  let trace_cas = env_str("PION_CAS_TRACE") == "1"
 
   let checked_pkgs : Array[@core.CheckedPackage] = []
   let imported : Array[@core.ImportedPkg] = []
@@ -685,8 +685,8 @@ fn build_workspace_objects(
     }
     checked_pkgs.push(cr)
     imported.push(@core.imported_pkg_new(node.name, cr.tc))
-    let m2sig = @core.emit_m2sig(cr.pkg)
-    sig_hashes.set(node.name, @core.cas_sha256_hex(m2sig))
+    let pionsig = @core.emit_pionsig(cr.pkg)
+    sig_hashes.set(node.name, @core.cas_sha256_hex(pionsig))
     k = k + 1
   }
   if all_diags.length() > 0 {
@@ -698,7 +698,7 @@ fn build_workspace_objects(
   let link_key_sb = StringBuilder()
   link_key_sb.write_string(compiler_fp)
   let limit = if include_entry { n } else { n - 1 }
-  let pid_s = m2_host_getpid().to_string()
+  let pid_s = pion_host_getpid().to_string()
   k = 0
   while k < limit {
     let node = nodes[topo.order[k]]
@@ -726,7 +726,7 @@ fn build_workspace_objects(
     )
     let obj_path = cache_dir + "/obj/" + key + ".o"
     let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
-    let sig_path = cache_dir + "/sig/" + key + ".m2sig"
+    let sig_path = cache_dir + "/sig/" + key + ".pionsig"
     if file_exists(obj_path) {
       if trace_cas {
         write_err("[cas] pkg=" + node.name + " HIT key=" + prefix16(key) + "\n")
@@ -742,7 +742,7 @@ fn build_workspace_objects(
         is_entry,
         dep_pkg_names,
       )
-      let _ = write_text_atomic(sig_path, @core.emit_m2sig(cr.pkg))
+      let _ = write_text_atomic(sig_path, @core.emit_pionsig(cr.pkg))
       if !write_text_atomic(ssa_path, res.ssa) {
         return Err("failed to write CAS ssa: " + ssa_path)
       }
@@ -750,17 +750,17 @@ fn build_workspace_objects(
       let obj_tmp = obj_path + ".tmp." + pid_s
       let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
       if rc_qbe != 0 {
-        let _ = m2_host_remove(str_to_utf8(asm_path))
+        let _ = pion_host_remove(str_to_utf8(asm_path))
         return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path)
       }
       let rc_as = exec_argv(["as", "-o", obj_tmp, asm_path])
-      let _ = m2_host_remove(str_to_utf8(asm_path))
+      let _ = pion_host_remove(str_to_utf8(asm_path))
       if rc_as != 0 {
-        let _ = m2_host_remove(str_to_utf8(obj_tmp))
+        let _ = pion_host_remove(str_to_utf8(obj_tmp))
         return Err("as failed with exit code " + rc_as.to_string())
       }
-      let _ = m2_host_rename(str_to_utf8(obj_tmp), str_to_utf8(obj_path))
-      let sz = m2_host_file_size(str_to_utf8(obj_path))
+      let _ = pion_host_rename(str_to_utf8(obj_tmp), str_to_utf8(obj_path))
+      let sz = pion_host_file_size(str_to_utf8(obj_path))
       cas_record_and_evict(cache_dir, key, if sz > 0L { sz } else { 0L })
     }
     obj_paths.push(obj_path)
@@ -832,10 +832,10 @@ fn build_targets(
   let (pkg_name, paths, sources) = loaded
 
   let cache_dir = resolve_cache_dir()
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/sig"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/sig"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
 
   let qbe_target = resolve_qbe_target()
   let qbe_bin = resolve_qbe_bin()
@@ -884,7 +884,7 @@ fn build_targets(
     if miss_indices.length() == 0 && out_bin_arg == "" && file_exists(final_bin) {
       return Ok(final_bin)
     }
-    let pid_s = m2_host_getpid().to_string()
+    let pid_s = pion_host_getpid().to_string()
     let mut mi = 0
     while mi < miss_indices.length() {
       let idx = miss_indices[mi]
@@ -899,16 +899,16 @@ fn build_targets(
       }
       let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", u_asm, u_ssa])
       if rc_qbe != 0 {
-        let _ = m2_host_remove(str_to_utf8(u_asm))
+        let _ = pion_host_remove(str_to_utf8(u_asm))
         return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
       }
       let rc_as = exec_argv(["as", "-o", u_tmp, u_asm])
-      let _ = m2_host_remove(str_to_utf8(u_asm))
+      let _ = pion_host_remove(str_to_utf8(u_asm))
       if rc_as != 0 {
-        let _ = m2_host_remove(str_to_utf8(u_tmp))
+        let _ = pion_host_remove(str_to_utf8(u_tmp))
         return Err("as failed with exit code " + rc_as.to_string())
       }
-      let _ = m2_host_rename(str_to_utf8(u_tmp), str_to_utf8(u_obj))
+      let _ = pion_host_rename(str_to_utf8(u_tmp), str_to_utf8(u_obj))
       mi = mi + 1
     }
     if !prep.has_main && out_bin_arg == "" {
@@ -948,7 +948,7 @@ fn build_targets(
     release,
     compiler_fp,
   )
-  let sig_path = cache_dir + "/sig/" + key + ".m2sig"
+  let sig_path = cache_dir + "/sig/" + key + ".pionsig"
   let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
   let obj_path = cache_dir + "/obj/" + key + ".o"
   let default_bin = cache_dir + "/bin/" + pkg_name + "_" + prefix16(key)
@@ -972,9 +972,9 @@ fn build_targets(
         return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path)
       }
     }
-    let sz_sig = m2_host_file_size(str_to_utf8(sig_path))
-    let sz_ssa = m2_host_file_size(str_to_utf8(ssa_path))
-    let sz_obj = m2_host_file_size(str_to_utf8(obj_path))
+    let sz_sig = pion_host_file_size(str_to_utf8(sig_path))
+    let sz_ssa = pion_host_file_size(str_to_utf8(ssa_path))
+    let sz_obj = pion_host_file_size(str_to_utf8(obj_path))
     let total_sz = (if sz_sig > 0L { sz_sig } else { 0L }) +
       (if sz_ssa > 0L { sz_ssa } else { 0L }) +
       (if sz_obj > 0L { sz_obj } else { 0L })
@@ -1005,32 +1005,32 @@ fn build_targets(
       }
     }
 
-    let asm_path = cache_dir + "/obj/" + key + ".s." + m2_host_getpid().to_string()
-    let obj_tmp = obj_path + ".tmp." + m2_host_getpid().to_string()
+    let asm_path = cache_dir + "/obj/" + key + ".s." + pion_host_getpid().to_string()
+    let obj_tmp = obj_path + ".tmp." + pion_host_getpid().to_string()
     let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
     if rc_qbe != 0 {
-      let _ = m2_host_remove(str_to_utf8(asm_path))
+      let _ = pion_host_remove(str_to_utf8(asm_path))
       return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path)
     }
     if emit_asm_path != "" {
       ensure_parent_dir(emit_asm_path)
       let asm_text = read_text(asm_path)
       if !write_text_atomic(emit_asm_path, asm_text) {
-        let _ = m2_host_remove(str_to_utf8(asm_path))
+        let _ = pion_host_remove(str_to_utf8(asm_path))
         return Err("failed to write --emit-asm file: " + emit_asm_path)
       }
     }
     let rc_as = exec_argv(["as", "-o", obj_tmp, asm_path])
-    let _ = m2_host_remove(str_to_utf8(asm_path))
+    let _ = pion_host_remove(str_to_utf8(asm_path))
     if rc_as != 0 {
-      let _ = m2_host_remove(str_to_utf8(obj_tmp))
+      let _ = pion_host_remove(str_to_utf8(obj_tmp))
       return Err("as failed with exit code " + rc_as.to_string())
     }
-    let _ = m2_host_rename(str_to_utf8(obj_tmp), str_to_utf8(obj_path))
+    let _ = pion_host_rename(str_to_utf8(obj_tmp), str_to_utf8(obj_path))
 
-    let sz_sig = m2_host_file_size(str_to_utf8(sig_path))
-    let sz_ssa = m2_host_file_size(str_to_utf8(ssa_path))
-    let sz_obj = m2_host_file_size(str_to_utf8(obj_path))
+    let sz_sig = pion_host_file_size(str_to_utf8(sig_path))
+    let sz_ssa = pion_host_file_size(str_to_utf8(ssa_path))
+    let sz_obj = pion_host_file_size(str_to_utf8(obj_path))
     let total_sz = (if sz_sig > 0L { sz_sig } else { 0L }) +
       (if sz_ssa > 0L { sz_ssa } else { 0L }) +
       (if sz_obj > 0L { sz_obj } else { 0L })
@@ -1063,9 +1063,9 @@ fn run_tests_cmd(
   filter : String,
 ) -> Int {
   let cache_dir = resolve_cache_dir()
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
-  let _ = m2_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/ssa"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/obj"))
+  let _ = pion_host_mkdir_p(str_to_utf8(cache_dir + "/bin"))
   let qbe_target = resolve_qbe_target()
   let qbe_bin = resolve_qbe_bin()
   let rt_lib = resolve_rt_lib()
@@ -1141,7 +1141,7 @@ fn run_tests_cmd(
 
   let tkey = @core.cas_sha256_hex(compiler_fp + ":test:" + test_res.ssa)
   let ssa_path = cache_dir + "/ssa/test_" + tkey + ".ssa"
-  let asm_path = cache_dir + "/obj/test_" + tkey + ".s." + m2_host_getpid().to_string()
+  let asm_path = cache_dir + "/obj/test_" + tkey + ".s." + pion_host_getpid().to_string()
   let obj_path = cache_dir + "/obj/test_" + tkey + ".o"
   let test_bin = cache_dir + "/bin/test_" + prefix16(tkey)
   if !file_exists(test_bin) {
@@ -1151,12 +1151,12 @@ fn run_tests_cmd(
     }
     let rc_qbe = exec_argv([qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
     if rc_qbe != 0 {
-      let _ = m2_host_remove(str_to_utf8(asm_path))
+      let _ = pion_host_remove(str_to_utf8(asm_path))
       write_err("error: qbe failed on test harness\n")
       return 1
     }
     let rc_as = exec_argv(["as", "-o", obj_path, asm_path])
-    let _ = m2_host_remove(str_to_utf8(asm_path))
+    let _ = pion_host_remove(str_to_utf8(asm_path))
     if rc_as != 0 {
       write_err("error: as failed on test harness\n")
       return 1
@@ -1236,11 +1236,11 @@ fn run_fmt_cmd(
   while t < targets.length() {
     let target = targets[t]
     let tb = str_to_utf8(target)
-    if m2_host_file_exists(tb) == 0 {
+    if pion_host_file_exists(tb) == 0 {
       write_err("error: path does not exist: " + target + "\n")
       return 1
     }
-    if m2_host_is_dir(tb) != 0 {
+    if pion_host_is_dir(tb) != 0 {
       match detect_manifest_dir(target) {
         Some(root_dir) =>
           match load_workspace_nodes(root_dir) {
@@ -1315,13 +1315,13 @@ fn run_fmt_cmd(
 fn usage() -> Unit {
   write_err(
     "usage:\n" +
-    "  m2c check [--json] <input1> [input2 ...]\n" +
-    "  m2c query defs|sig|callers|deps [--json] <input1> [input2 ...]\n" +
-    "  m2c emit-sig <input1> [input2 ...]\n" +
-    "  m2c build [--release] [--emit-ssa <path>] [--emit-asm <path>] [--jobs <n>] [-o <out>] <input1> [input2 ...]\n" +
-    "  m2c run [--release] <input> [-- args...]\n" +
-    "  m2c fmt [--check] [--json] <input1> [input2 ...]\n" +
-    "  m2c test [--json] [--filter <name>] <input>\n",
+    "  pionc check [--json] <input1> [input2 ...]\n" +
+    "  pionc query defs|sig|callers|deps [--json] <input1> [input2 ...]\n" +
+    "  pionc emit-sig <input1> [input2 ...]\n" +
+    "  pionc build [--release] [--emit-ssa <path>] [--emit-asm <path>] [--jobs <n>] [-o <out>] <input1> [input2 ...]\n" +
+    "  pionc run [--release] <input> [-- args...]\n" +
+    "  pionc fmt [--check] [--json] <input1> [input2 ...]\n" +
+    "  pionc test [--json] [--filter <name>] <input>\n",
   )
 }
 
@@ -1330,7 +1330,7 @@ fn main {
   let args = @env.args()
   if args.length() < 3 {
     usage()
-    m2_host_exit(1)
+    pion_host_exit(1)
     return
   }
   let cmd = args[1]
@@ -1345,7 +1345,7 @@ fn main {
     }
     if targets.length() == 0 {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     if targets.length() == 1 {
@@ -1354,7 +1354,7 @@ fn main {
           match load_workspace_nodes(root_dir) {
             Err(msg) => {
               write_err("error: " + msg + "\n")
-              m2_host_exit(1)
+              pion_host_exit(1)
             }
             Ok(nodes) => {
               let names : Array[String] = []
@@ -1368,7 +1368,7 @@ fn main {
               let topo = @core.topo_sort_packages(names, dep_lists)
               if topo.diagnostics.length() > 0 {
                 write_out(@core.check_result_to_json(topo.diagnostics) + "\n")
-                m2_host_exit(1)
+                pion_host_exit(1)
                 return
               }
               let imported : Array[@core.ImportedPkg] = []
@@ -1393,7 +1393,7 @@ fn main {
               }
               write_out(@core.check_result_to_json(all_diags) + "\n")
               if all_diags.length() > 0 {
-                m2_host_exit(1)
+                pion_host_exit(1)
               }
             }
           }
@@ -1405,20 +1405,20 @@ fn main {
     match load_targets(targets) {
       Err(msg) => {
         write_err("error: " + msg + "\n")
-        m2_host_exit(1)
+        pion_host_exit(1)
       }
       Ok((pkg_name, paths, sources)) => {
         let (ok, json) = @core.cli_check_json(pkg_name, paths, sources)
         write_out(json + "\n")
         if !ok {
-          m2_host_exit(1)
+          pion_host_exit(1)
         }
       }
     }
   } else if cmd == "query" {
     if args.length() < 4 {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     let kind = args[2]
@@ -1432,7 +1432,7 @@ fn main {
     }
     if targets.length() == 0 {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     if kind == "deps" && targets.length() == 1 {
@@ -1441,7 +1441,7 @@ fn main {
           match load_workspace_nodes(root_dir) {
             Err(msg) => {
               write_err("error: " + msg + "\n")
-              m2_host_exit(1)
+              pion_host_exit(1)
             }
             Ok(nodes) => {
               let names : Array[String] = []
@@ -1455,7 +1455,7 @@ fn main {
               let topo = @core.topo_sort_packages(names, dep_lists)
               if topo.diagnostics.length() > 0 {
                 write_out(@core.check_result_to_json(topo.diagnostics) + "\n")
-                m2_host_exit(1)
+                pion_host_exit(1)
                 return
               }
               let ord_names : Array[String] = []
@@ -1467,7 +1467,7 @@ fn main {
                 let pkg = @core.parse_package(node.name, node.paths, node.sources)
                 ord_names.push(node.name)
                 ord_deps.push(node.deps)
-                ord_hashes.push(@core.sig_hash_hex(@core.emit_m2sig(pkg)))
+                ord_hashes.push(@core.sig_hash_hex(@core.emit_pionsig(pkg)))
                 k = k + 1
               }
               write_out(
@@ -1484,14 +1484,14 @@ fn main {
     match load_targets(targets) {
       Err(msg) => {
         write_err("error: " + msg + "\n")
-        m2_host_exit(1)
+        pion_host_exit(1)
       }
       Ok((pkg_name, paths, sources)) =>
         match @core.cli_query_json(kind, pkg_name, paths, sources) {
           Ok(json) => write_out(json + "\n")
           Err(msg) => {
             write_err("error: " + msg + "\n")
-            m2_host_exit(1)
+            pion_host_exit(1)
           }
         }
     }
@@ -1505,7 +1505,7 @@ fn main {
     match load_targets(targets) {
       Err(msg) => {
         write_err("error: " + msg + "\n")
-        m2_host_exit(1)
+        pion_host_exit(1)
       }
       Ok((pkg_name, paths, sources)) => {
         let sig = @core.cli_emit_sig(pkg_name, paths, sources)
@@ -1541,14 +1541,14 @@ fn main {
     }
     if targets.length() == 0 {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     match build_targets(targets, release, emit_ssa, emit_asm, out_bin) {
       Ok(_) => ()
       Err(msg) => {
         write_err(msg + "\n")
-        m2_host_exit(1)
+        pion_host_exit(1)
       }
     }
   } else if cmd == "run" {
@@ -1574,13 +1574,13 @@ fn main {
     }
     if target == "" {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     match build_targets([target], release, "", "", "") {
       Err(msg) => {
         write_err(msg + "\n")
-        m2_host_exit(1)
+        pion_host_exit(1)
       }
       Ok(bin_path) => {
         let run_argv : Array[String] = [bin_path]
@@ -1591,7 +1591,7 @@ fn main {
         }
         let rc = exec_argv(run_argv)
         if rc != 0 {
-          m2_host_exit(rc)
+          pion_host_exit(rc)
         }
       }
     }
@@ -1613,12 +1613,12 @@ fn main {
     }
     if targets.length() == 0 {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     let rc = run_fmt_cmd(targets, check_only, as_json)
     if rc != 0 {
-      m2_host_exit(rc)
+      pion_host_exit(rc)
     }
   } else if cmd == "test" {
     let mut as_json = false
@@ -1639,15 +1639,15 @@ fn main {
     }
     if targets.length() == 0 {
       usage()
-      m2_host_exit(1)
+      pion_host_exit(1)
       return
     }
     let rc = run_tests_cmd(targets, as_json, filter)
     if rc != 0 {
-      m2_host_exit(rc)
+      pion_host_exit(rc)
     }
   } else {
     usage()
-    m2_host_exit(1)
+    pion_host_exit(1)
   }
 }

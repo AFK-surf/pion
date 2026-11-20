@@ -4,9 +4,9 @@
 # through a FIFO, no sleeps), runs <conns> x <reqs> requests, then reports the
 # client JSON plus the server's peak RSS and stripped binary size.
 #
-#   [BENCH_LOAD=<prebuilt client>] sh examples/http_kv_service/run_bench.sh <m2c> [conns=8] [reqs=500] [workers=8]
+#   [BENCH_LOAD=<prebuilt client>] sh examples/http_kv_service/run_bench.sh <pionc> [conns=8] [reqs=500] [workers=8]
 set -eu
-M2C="$1"
+PIONC="$1"
 CONNS="${2:-8}"
 REQS="${3:-500}"
 WORKERS="${4:-8}"
@@ -16,7 +16,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 T0="$(python3 -c 'import time; print(int(time.time()*1000))')"
-"$M2C" build --release -o "$TMP/http_kv_service" "$HERE"
+"$PIONC" build --release -o "$TMP/http_kv_service" "$HERE"
 T1="$(python3 -c 'import time; print(int(time.time()*1000))')"
 strip -o "$TMP/http_kv_service.stripped" "$TMP/http_kv_service" 2>/dev/null || cp "$TMP/http_kv_service" "$TMP/http_kv_service.stripped"
 # BENCH_LOAD: a prebuilt client (e.g. built before `as` is masked off PATH).

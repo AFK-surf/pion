@@ -8,10 +8,10 @@ BENCH_DIR="$ROOT_DIR/benchmarks"
 OUT_DIR="$ROOT_DIR/out"
 mkdir -p "$OUT_DIR"
 
-export M2_QBE="${M2_QBE:-$OUT_DIR/qbe}"
-export M2_RT_LIB="${M2_RT_LIB:-$OUT_DIR/libm2rt.a}"
+export PION_QBE="${PION_QBE:-$OUT_DIR/qbe}"
+export PION_RT_LIB="${PION_RT_LIB:-$OUT_DIR/libpionrt.a}"
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/m2-v2-compile.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/pion-v2-compile.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/bin" "$WORK/base" "$WORK/wt5"
@@ -45,12 +45,12 @@ HAS_MOON=0; command -v moon >/dev/null 2>&1 && HAS_MOON=1
 HAS_ZIG=0; command -v zig >/dev/null 2>&1 && HAS_ZIG=1
 HAS_RUST=0; command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1 && HAS_RUST=1
 HAS_GO=0; command -v go >/dev/null 2>&1 && HAS_GO=1
-HAS_M2=0
-if [ -n "${M2C:-}" ] && [ -x "${M2C:-}" ]; then
-  HAS_M2=1
-elif [ -x "$OUT_DIR/m2c2" ]; then
-  M2C="$OUT_DIR/m2c2"
-  HAS_M2=1
+HAS_PION=0
+if [ -n "${PIONC:-}" ] && [ -x "${PIONC:-}" ]; then
+  HAS_PION=1
+elif [ -x "$OUT_DIR/pionc2" ]; then
+  PIONC="$OUT_DIR/pionc2"
+  HAS_PION=1
 fi
 
 CPU_BRAND=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
@@ -62,7 +62,7 @@ ZIG_VER=$( [ "$HAS_ZIG" -eq 1 ] && zig version 2>&1 | head -n 1 || echo "N/A" )
 RUST_VER=$( [ "$HAS_RUST" -eq 1 ] && rustc --version 2>&1 | head -n 1 || echo "N/A" )
 CARGO_VER=$( [ "$HAS_RUST" -eq 1 ] && cargo --version 2>&1 | head -n 1 || echo "N/A" )
 GO_VER=$( [ "$HAS_GO" -eq 1 ] && go version 2>&1 | head -n 1 || echo "N/A" )
-M2_VER=$( [ "$HAS_M2" -eq 1 ] && ("$M2C" --version 2>&1 | head -n 1 || echo "$M2C") || echo "not provided" )
+PION_VER=$( [ "$HAS_PION" -eq 1 ] && ("$PIONC" --version 2>&1 | head -n 1 || echo "$PIONC") || echo "not provided" )
 
 LANGS=""
 [ "$HAS_C" -eq 1 ] && LANGS="$LANGS c"
@@ -70,10 +70,10 @@ LANGS=""
 [ "$HAS_ZIG" -eq 1 ] && LANGS="$LANGS zig"
 [ "$HAS_RUST" -eq 1 ] && LANGS="$LANGS rust"
 [ "$HAS_GO" -eq 1 ] && LANGS="$LANGS go"
-[ "$HAS_M2" -eq 1 ] && LANGS="$LANGS m2"
+[ "$HAS_PION" -eq 1 ] && LANGS="$LANGS pion"
 
 echo "========================================================================="
-echo " m2 V2 Real-Engineering 6-Language Compile Benchmark (50k LOC / 50 Pkgs)"
+echo " pion V2 Real-Engineering 6-Language Compile Benchmark (50k LOC / 50 Pkgs)"
 echo "========================================================================="
 echo "Host   : $CPU_BRAND ($CPU_CORES cores) | $OS_VER"
 echo "C      : $CLANG_VER"
@@ -81,7 +81,7 @@ echo "MoonBit: $MOON_VER"
 echo "Zig    : $ZIG_VER"
 echo "Rust   : $RUST_VER / $CARGO_VER"
 echo "Go     : $GO_VER"
-echo "m2     : $M2_VER"
+echo "pion     : $PION_VER"
 echo "========================================================================="
 
 # ---------------------------------------------------------------------------
@@ -95,7 +95,7 @@ LOC_MOON=$(find "$WORK/base/moonbit/src" -name '*.mbt' -exec cat {} + | wc -l | 
 LOC_ZIG=$(find "$WORK/base/zig" -name '*.zig' -exec cat {} + | wc -l | tr -d ' ')
 LOC_RUST=$(find "$WORK/base/rust" -name '*.rs' -exec cat {} + | wc -l | tr -d ' ')
 LOC_GO=$(find "$WORK/base/go" -name '*.go' -exec cat {} + | wc -l | tr -d ' ')
-LOC_M2=$(find "$WORK/base/m2" -name '*.m2' -exec cat {} + | wc -l | tr -d ' ')
+LOC_PION=$(find "$WORK/base/pion" -name '*.pion' -exec cat {} + | wc -l | tr -d ' ')
 
 echo ">>> Source LOC verification (50 lib pkgs + app):"
 printf '  %-8s : %s LOC\n' "c" "$LOC_C"
@@ -103,14 +103,14 @@ printf '  %-8s : %s LOC\n' "moonbit" "$LOC_MOON"
 printf '  %-8s : %s LOC\n' "zig" "$LOC_ZIG"
 printf '  %-8s : %s LOC\n' "rust" "$LOC_RUST"
 printf '  %-8s : %s LOC\n' "go" "$LOC_GO"
-printf '  %-8s : %s LOC\n' "m2" "$LOC_M2"
+printf '  %-8s : %s LOC\n' "pion" "$LOC_PION"
 
 # Helper: build one project root for a given language, printing elapsed ms to stdout
 build_lang() {
   lang="$1"
   proj="$2"
   gocache="$3"
-  m2cas="$4"
+  pioncas="$4"
   zig_gcache="$5"
   case "$lang" in
     c)
@@ -128,8 +128,8 @@ build_lang() {
     go)
       "$MEASURE" once -- sh -c "cd '$proj/go' && GOCACHE='$gocache' go build -o '$proj/go/app' ./cmd/app"
       ;;
-    m2)
-      "$MEASURE" once -- sh -c "cd '$proj/m2' && M2_CACHE_DIR='$m2cas' '$M2C' build --release app -o '$proj/m2_app'"
+    pion)
+      "$MEASURE" once -- sh -c "cd '$proj/pion' && PION_CACHE_DIR='$pioncas' '$PIONC' build --release app -o '$proj/pion_app'"
       ;;
   esac
 }
@@ -143,11 +143,11 @@ run_lang_ck() {
     zig)     "$proj/zig/app" ;;
     rust)    "$proj/rust/target/release/app" ;;
     go)      "$proj/go/app" ;;
-    m2)      "$proj/m2_app" ;;
+    pion)      "$proj/pion_app" ;;
   esac
 }
 
-mkdir -p "$WORK/base-go-cache" "$WORK/base-m2-cas" "$WORK/base-zig-gcache"
+mkdir -p "$WORK/base-go-cache" "$WORK/base-pion-cas" "$WORK/base-zig-gcache"
 
 PHASE_TSV="$WORK/phases.tsv"
 : > "$PHASE_TSV"
@@ -157,7 +157,7 @@ run_phase() {
   expected_ck=""
   echo ">>> Phase [$phase]..."
   for lang in $LANGS; do
-    ms=$(build_lang "$lang" "$WORK/base" "$WORK/base-go-cache" "$WORK/base-m2-cas" "$WORK/base-zig-gcache")
+    ms=$(build_lang "$lang" "$WORK/base" "$WORK/base-go-cache" "$WORK/base-pion-cas" "$WORK/base-zig-gcache")
     ck=$(run_lang_ck "$lang" "$WORK/base")
     if [ -z "$expected_ck" ]; then
       expected_ck="$ck"
@@ -211,7 +211,7 @@ for k in 0 1 2 3 4; do
   "$GEN" "$WORK/wt5" --branch "$k"
 done
 
-mkdir -p "$WORK/wt5-go-cache" "$WORK/wt5-m2-cas" "$WORK/wt5-zig-gcache"
+mkdir -p "$WORK/wt5-go-cache" "$WORK/wt5-pion-cas" "$WORK/wt5-zig-gcache"
 
 WT5_TSV="$WORK/wt5.tsv"
 : > "$WT5_TSV"
@@ -224,7 +224,7 @@ for lang in $LANGS; do
   wt_ck_summary=""
   for k in 0 1 2 3 4; do
     proj="$WORK/wt5/wt$k"
-    ms=$(build_lang "$lang" "$proj" "$WORK/wt5-go-cache" "$WORK/wt5-m2-cas" "$WORK/wt5-zig-gcache")
+    ms=$(build_lang "$lang" "$proj" "$WORK/wt5-go-cache" "$WORK/wt5-pion-cas" "$WORK/wt5-zig-gcache")
     ck=$(run_lang_ck "$lang" "$proj")
     tot_ms=$(sum_floats "$tot_ms" "$ms")
     printf '%s\t%s\t%s\n' "$k" "$lang" "$ck" >> "$WT5_CK_FILE"
@@ -270,9 +270,9 @@ for lang in $LANGS; do
       wt_bytes=0
       glob_bytes=$(dir_bytes "$WORK/wt5-go-cache")
       ;;
-    m2)
+    pion)
       wt_bytes=0
-      glob_bytes=$(dir_bytes "$WORK/wt5-m2-cas")
+      glob_bytes=$(dir_bytes "$WORK/wt5-pion-cas")
       ;;
   esac
 
@@ -313,7 +313,7 @@ get_loc() {
     zig)     echo "$LOC_ZIG" ;;
     rust)    echo "$LOC_RUST" ;;
     go)      echo "$LOC_GO" ;;
-    m2)      echo "$LOC_M2" ;;
+    pion)      echo "$LOC_PION" ;;
   esac
 }
 
@@ -349,7 +349,7 @@ JSON_OUT="$OUT_DIR/v2-compile-results.json"
   printf '    "rust": "%s",\n' "$(json_escape "$RUST_VER")"
   printf '    "cargo": "%s",\n' "$(json_escape "$CARGO_VER")"
   printf '    "go": "%s",\n' "$(json_escape "$GO_VER")"
-  printf '    "m2": "%s"\n' "$(json_escape "$M2_VER")"
+  printf '    "pion": "%s"\n' "$(json_escape "$PION_VER")"
   printf '  },\n'
   printf '  "checksums": {\n'
   printf '    "cold": "%s",\n' "$CK_COLD"
@@ -375,7 +375,7 @@ JSON_OUT="$OUT_DIR/v2-compile-results.json"
 # ---------------------------------------------------------------------------
 MD_OUT="$OUT_DIR/v2-compile-summary.md"
 {
-  echo "# m2 V2 Real-Engineering 6-Language Compile Benchmark (50k LOC / 50 Packages)"
+  echo "# pion V2 Real-Engineering 6-Language Compile Benchmark (50k LOC / 50 Packages)"
   echo ""
   echo "- **Host**: \`$CPU_BRAND\` ($CPU_CORES cores), \`$OS_VER\`"
   echo "- **Project Graph**: 50 library packages + 1 \`app\` entry package, 4-layer diamond DAG (\`core00..04\` -> \`mid00..14\` -> \`svc00..19\` -> \`leaf00..09\` -> \`app\`), structs + tagged ADTs + generics instantiated per package."
@@ -385,7 +385,7 @@ MD_OUT="$OUT_DIR/v2-compile-summary.md"
   echo "  - Zig: \`$ZIG_VER\` (\`zig build-exe -OReleaseFast -lc\`)"
   echo "  - Rust: \`$RUST_VER\` / \`$CARGO_VER\` (\`cargo build --release\`)"
   echo "  - Go: \`$GO_VER\` (\`go build\`, isolated \`GOCACHE\`)"
-  echo "  - m2: \`$M2_VER\` (\`m2c2 build --release app\`, isolated \`M2_CACHE_DIR\`)"
+  echo "  - pion: \`$PION_VER\` (\`pionc2 build --release app\`, isolated \`PION_CACHE_DIR\`)"
   echo "- **Checksums (bit-for-bit identical across all 6 languages)**:"
   echo "  - \`cold\`: \`$CK_COLD\` | \`incr_leaf_body\`: \`$CK_LEAF\` | \`incr_core_body\`: \`$CK_CORE\` | \`incr_core_sig\`: \`$CK_SIG\`"
   echo ""

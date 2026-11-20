@@ -1,4 +1,4 @@
-name = "m2/compiler"
+name = "pion/compiler"
 
 version = "0.1.0"
 

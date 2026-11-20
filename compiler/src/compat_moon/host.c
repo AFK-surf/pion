@@ -24,7 +24,7 @@ static moonbit_bytes_t cbuf_to_bytes(const char *buf, size_t len) {
   return out;
 }
 
-int32_t m2_host_file_exists(moonbit_bytes_t path_b) {
+int32_t pion_host_file_exists(moonbit_bytes_t path_b) {
   char *path = bytes_to_cstr(path_b);
   if (!path) return 0;
   struct stat st;
@@ -33,7 +33,7 @@ int32_t m2_host_file_exists(moonbit_bytes_t path_b) {
   return ok ? 1 : 0;
 }
 
-int32_t m2_host_is_dir(moonbit_bytes_t path_b) {
+int32_t pion_host_is_dir(moonbit_bytes_t path_b) {
   char *path = bytes_to_cstr(path_b);
   if (!path) return 0;
   struct stat st;
@@ -42,7 +42,7 @@ int32_t m2_host_is_dir(moonbit_bytes_t path_b) {
   return ok ? 1 : 0;
 }
 
-moonbit_bytes_t m2_host_read_file(moonbit_bytes_t path_b) {
+moonbit_bytes_t pion_host_read_file(moonbit_bytes_t path_b) {
   char *path = bytes_to_cstr(path_b);
   if (!path) return moonbit_make_bytes(0, 0);
   FILE *f = fopen(path, "rb");
@@ -80,7 +80,7 @@ static int cmp_cstr_ptr(const void *a, const void *b) {
   return strcmp(sa, sb);
 }
 
-moonbit_bytes_t m2_host_list_sources(moonbit_bytes_t dir_b) {
+moonbit_bytes_t pion_host_list_sources(moonbit_bytes_t dir_b) {
   char *dir = bytes_to_cstr(dir_b);
   if (!dir) return moonbit_make_bytes(0, 0);
   DIR *d = opendir(dir);
@@ -95,8 +95,8 @@ moonbit_bytes_t m2_host_list_sources(moonbit_bytes_t dir_b) {
   while ((ent = readdir(d)) != NULL) {
     const char *name = ent->d_name;
     if (name[0] == '.') continue;
-    int is_src = ends_with(name, ".m2") || ends_with(name, ".mbt");
-    int is_test = ends_with(name, "_test.m2") || ends_with(name, "_test.mbt");
+    int is_src = ends_with(name, ".pion") || ends_with(name, ".mbt");
+    int is_test = ends_with(name, "_test.pion") || ends_with(name, "_test.mbt");
     if (!is_src || is_test) continue;
     size_t dlen = strlen(dir);
     size_t nlen = strlen(name);
@@ -136,23 +136,23 @@ moonbit_bytes_t m2_host_list_sources(moonbit_bytes_t dir_b) {
   return out;
 }
 
-void m2_host_write_stdout(moonbit_bytes_t data) {
+void pion_host_write_stdout(moonbit_bytes_t data) {
   int32_t len = Moonbit_array_length(data);
   if (len > 0) fwrite(data, 1, (size_t)len, stdout);
   fflush(stdout);
 }
 
-void m2_host_write_stderr(moonbit_bytes_t data) {
+void pion_host_write_stderr(moonbit_bytes_t data) {
   int32_t len = Moonbit_array_length(data);
   if (len > 0) fwrite(data, 1, (size_t)len, stderr);
   fflush(stderr);
 }
 
-void m2_host_exit(int32_t code) {
+void pion_host_exit(int32_t code) {
   exit(code);
 }
 
-int32_t m2_host_write_file(moonbit_bytes_t path_b, moonbit_bytes_t data_b) {
+int32_t pion_host_write_file(moonbit_bytes_t path_b, moonbit_bytes_t data_b) {
   char *path = bytes_to_cstr(path_b);
   if (!path) return 0;
   FILE *f = fopen(path, "wb");
@@ -165,7 +165,7 @@ int32_t m2_host_write_file(moonbit_bytes_t path_b, moonbit_bytes_t data_b) {
   return ok ? 1 : 0;
 }
 
-int32_t m2_host_mkdir_p(moonbit_bytes_t path_b) {
+int32_t pion_host_mkdir_p(moonbit_bytes_t path_b) {
   char *tmp = bytes_to_cstr(path_b);
   if (!tmp) return 0;
   size_t len = strlen(tmp);
@@ -197,7 +197,7 @@ int32_t m2_host_mkdir_p(moonbit_bytes_t path_b) {
   return ok;
 }
 
-int32_t m2_host_remove(moonbit_bytes_t path_b) {
+int32_t pion_host_remove(moonbit_bytes_t path_b) {
   char *path = bytes_to_cstr(path_b);
   if (!path) return 0;
   int ok = (unlink(path) == 0);
@@ -205,7 +205,7 @@ int32_t m2_host_remove(moonbit_bytes_t path_b) {
   return ok ? 1 : 0;
 }
 
-int32_t m2_host_rename(moonbit_bytes_t old_b, moonbit_bytes_t new_b) {
+int32_t pion_host_rename(moonbit_bytes_t old_b, moonbit_bytes_t new_b) {
   char *op = bytes_to_cstr(old_b);
   char *np = bytes_to_cstr(new_b);
   if (!op || !np) {
@@ -219,7 +219,7 @@ int32_t m2_host_rename(moonbit_bytes_t old_b, moonbit_bytes_t new_b) {
   return ok ? 1 : 0;
 }
 
-int64_t m2_host_file_size(moonbit_bytes_t path_b) {
+int64_t pion_host_file_size(moonbit_bytes_t path_b) {
   char *path = bytes_to_cstr(path_b);
   if (!path) return -1;
   struct stat st;
@@ -228,7 +228,7 @@ int64_t m2_host_file_size(moonbit_bytes_t path_b) {
   return sz;
 }
 
-moonbit_bytes_t m2_host_env_get(moonbit_bytes_t name_b) {
+moonbit_bytes_t pion_host_env_get(moonbit_bytes_t name_b) {
   char *name = bytes_to_cstr(name_b);
   if (!name) return moonbit_make_bytes(0, 0);
   const char *v = getenv(name);
@@ -237,18 +237,18 @@ moonbit_bytes_t m2_host_env_get(moonbit_bytes_t name_b) {
   return cbuf_to_bytes(v, strlen(v));
 }
 
-int64_t m2_host_clock_ms(void) {
+int64_t pion_host_clock_ms(void) {
   struct timespec ts;
   clock_gettime(CLOCK_REALTIME, &ts);
   return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
 }
 
-int32_t m2_host_getpid(void) {
+int32_t pion_host_getpid(void) {
   return (int32_t)getpid();
 }
 
 /* Executes a command where arguments are separated by '\n' in argv_b */
-int32_t m2_host_exec(moonbit_bytes_t argv_b) {
+int32_t pion_host_exec(moonbit_bytes_t argv_b) {
   char *raw = bytes_to_cstr(argv_b);
   if (!raw) return -1;
   size_t cap = 16;

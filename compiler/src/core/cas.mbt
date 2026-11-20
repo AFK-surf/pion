@@ -1,4 +1,4 @@
-///| Pure m2 ∩ MoonBit SHA-256 + Global Content-Addressed Cache (CAS) & LRU manager
+///| Pure Pion ∩ MoonBit SHA-256 + Global Content-Addressed Cache (CAS) & LRU manager
 
 ///|
 fn ushr32(x : Int, n : Int) -> Int {
@@ -101,7 +101,7 @@ fn str_to_utf8_ints(s : String) -> Array[Int] {
       mode = if host_str_is_utf8() { 1 } else { 2 }
     }
     let utf8 = mode == 1
-    // Decode one scalar from the host encoding (UTF-8 bytes in m2, UTF-16
+    // Decode one scalar from the host encoding (UTF-8 bytes in Pion, UTF-16
     // units in MoonBit) and re-encode it, so both hosts emit identical bytes.
     let cp = str_scalar_at(s, i, utf8)
     i = i + str_scalar_len(s, i, utf8)
@@ -239,8 +239,8 @@ pub struct CasEntry {
 }
 
 ///|
-pub fn m2_compiler_abi_rev() -> String {
-  "m2c-v0.7"
+pub fn pion_compiler_abi_rev() -> String {
+  "pionc-v0.7"
 }
 
 ///|
@@ -250,7 +250,7 @@ pub fn cas_compiler_fp(
   salt : String,
 ) -> String {
   let sb = StringBuilder()
-  sb.write_string(m2_compiler_abi_rev())
+  sb.write_string(pion_compiler_abi_rev())
   sb.write_string("|qbe:")
   sb.write_string(qbe_size.to_string())
   sb.write_string("|rt:")
@@ -275,10 +275,10 @@ pub fn cas_compute_key(
   let fp = if compiler_fp.length() > 0 {
     compiler_fp
   } else {
-    m2_compiler_abi_rev()
+    pion_compiler_abi_rev()
   }
   let sb = StringBuilder()
-  sb.write_string("m2-cas-v2\n")
+  sb.write_string("pion-cas-v2\n")
   sb.write_string("fp:")
   sb.write_string(fp)
   sb.write_string("\npkg:")
@@ -325,10 +325,10 @@ pub fn cas_compute_unit_key(
   let fp = if compiler_fp.length() > 0 {
     compiler_fp
   } else {
-    m2_compiler_abi_rev()
+    pion_compiler_abi_rev()
   }
   let sb = StringBuilder()
-  sb.write_string("m2-unit-cas-v2\n")
+  sb.write_string("pion-unit-cas-v2\n")
   sb.write_string("fp:")
   sb.write_string(fp)
   sb.write_string("\npkg:")

@@ -13,5 +13,5 @@ Route table (first match wins): `GET /health` (health), `GET /users` (user_list)
 
 Output per request: `<METHOD> <target> -> <status>` followed by the non-empty parts among
 `route=<name>`, `params=<k=v,...>`, `query=<k=v,...>`, `error=<msg>`, `allow=<methods>`.
-Each language uses its standard library where it has one: m2 `std/http` (`query_params`), Go `net/url`
+Each language uses its standard library where it has one: Pion `std/http` (`query_params`), Go `net/url`
 (`ParseQuery`); Rust and MoonBit decode by hand.

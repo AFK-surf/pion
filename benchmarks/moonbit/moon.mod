@@ -1,4 +1,4 @@
-name = "m2/benchmarks"
+name = "pion/benchmarks"
 
 version = "0.1.0"
 

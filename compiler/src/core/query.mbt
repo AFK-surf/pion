@@ -360,7 +360,7 @@ pub fn query_callers_json(pkg : Package) -> String {
 
 ///|
 pub fn query_deps_json(pkg : Package) -> String {
-  let sig_text = emit_m2sig(pkg)
+  let sig_text = emit_pionsig(pkg)
   let hash = sig_hash_hex(sig_text)
   let deps : Array[String] = []
   let local_types : Map[String, Bool] = Map([])
@@ -392,9 +392,9 @@ pub fn query_deps_json(pkg : Package) -> String {
           while ci < calls.length() {
             let c = calls[ci]
             if c == "scope" || c == "spawn" || starts_with_str(c, "Channel::") || starts_with_str(c, "Mutex::") || starts_with_str(c, "AtomicInt::") {
-              push_unique(deps, "m2/runtime/concurrency")
+              push_unique(deps, "pion/runtime/concurrency")
             } else if is_world_builtin(c) || is_world_rt_prim(c) {
-              push_unique(deps, "m2/runtime/world")
+              push_unique(deps, "pion/runtime/world")
             }
             ci = ci + 1
           }
@@ -462,7 +462,7 @@ pub fn cli_emit_sig(
   sources : Array[String],
 ) -> String {
   let pkg = parse_package(pkg_name, paths, sources)
-  emit_m2sig(pkg)
+  emit_pionsig(pkg)
 }
 
 ///|

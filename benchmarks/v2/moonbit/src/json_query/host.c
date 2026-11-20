@@ -3,7 +3,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-moonbit_bytes_t m2_v2_read_file(moonbit_bytes_t path_b) {
+moonbit_bytes_t pion_v2_read_file(moonbit_bytes_t path_b) {
   int32_t plen = Moonbit_array_length(path_b);
   char *path = (char *)malloc((size_t)plen + 1);
   if (!path) return moonbit_make_bytes(0, 0);

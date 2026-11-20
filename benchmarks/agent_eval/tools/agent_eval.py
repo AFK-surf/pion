@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""agent_eval harness: m2 vs MoonBit vs Rust vs Go, three dimensions.
+"""agent_eval harness: Pion vs MoonBit vs Rust vs Go, three dimensions.
 
-  python3 agent_eval.py dim1 [--only t01,...] [--lang m2,...]
+  python3 agent_eval.py dim1 [--only t01,...] [--lang pion,...]
   python3 agent_eval.py dim2 [--only e01,...] [--lang ...] [--runs N]
   python3 agent_eval.py dim3 [--runs N]
   python3 agent_eval.py report
@@ -10,7 +10,7 @@ Every partial result is written to <repo>/out/agent_eval/<dim>.json; `report`
 merges them into benchmarks/agent_eval/results.json and SUMMARY.md.
 Nothing is written inside the source tree except those two files: MoonBit and
 Rust projects are copied to <repo>/out/agent_eval/work before building (their
-tools create `_build/` / `target/` in-tree), m2 and Go build in place (their
+tools create `_build/` / `target/` in-tree), Pion and Go build in place (their
 caches are global).
 """
 import argparse
@@ -29,8 +29,8 @@ AE = os.path.dirname(HERE)
 ROOT = os.path.dirname(os.path.dirname(AE))
 OUT = os.path.join(ROOT, "out", "agent_eval")
 WORK = os.path.join(OUT, "work")
-M2C2 = os.path.join(ROOT, "out", "m2c2")
-LANGS = ["m2", "moonbit", "rust", "go"]
+PIONC2 = os.path.join(ROOT, "out", "pionc2")
+LANGS = ["pion", "moonbit", "rust", "go"]
 
 sys.path.insert(0, HERE)
 import metrics  # noqa: E402
@@ -41,9 +41,9 @@ def base_env():
     home = env.get("HOME", "")
     env["PATH"] = ":".join([home + "/.moon/bin", home + "/.cargo/bin", "/opt/homebrew/bin",
                             "/usr/local/go/bin", "/usr/bin", "/bin", env.get("PATH", "")])
-    env["M2_QBE"] = os.path.join(ROOT, "out", "qbe")
-    env["M2_RT_LIB"] = os.path.join(ROOT, "out", "libm2rt.a")
-    env.setdefault("M2_CACHE_DIR", os.path.join(OUT, "m2cas"))
+    env["PION_QBE"] = os.path.join(ROOT, "out", "qbe")
+    env["PION_RT_LIB"] = os.path.join(ROOT, "out", "libpionrt.a")
+    env.setdefault("PION_CACHE_DIR", os.path.join(OUT, "pioncas"))
     env["CARGO_TERM_COLOR"] = "never"
     env["NO_COLOR"] = "1"
     return env
@@ -104,7 +104,7 @@ def tool_versions():
                       ("clang", ["clang", "--version"])]:
         rc, so, se, _ = run(cmd, ROOT)
         out[name] = (so or se).strip().splitlines()[0] if rc == 0 else "unavailable"
-    out["m2c2_bytes"] = os.path.getsize(M2C2) if os.path.exists(M2C2) else None
+    out["pionc2_bytes"] = os.path.getsize(PIONC2) if os.path.exists(PIONC2) else None
     rc, so, _, _ = run(["git", "rev-parse", "--short", "HEAD"], ROOT)
     out["repo_commit"] = so.strip() or os.environ.get("AE_REPO_COMMIT", "unknown (run directory has no .git)")
     out["host"] = platform.node()
@@ -136,27 +136,27 @@ def list_tasks(only):
     return names
 
 
-def m2_test_dirs(d):
+def pion_test_dirs(d):
     dirs = []
     for dirpath, dirnames, filenames in os.walk(d):
         dirnames.sort()
-        if "m2.toml" in filenames:
+        if "pion.toml" in filenames:
             dirs.append(dirpath)
     return dirs
 
 
 def lang_run_test(lang, src, workdir):
     """Returns (run_result, test_result) dicts for one implementation."""
-    if lang == "m2":
+    if lang == "pion":
         d = src
-        rc, so, se, ms = run([M2C2, "run", d], d)
+        rc, so, se, ms = run([PIONC2, "run", d], d)
         runr = {"rc": rc, "stdout": so, "stderr": se, "ms": ms}
         passed = failed = 0
         ok = True
         details = []
         tms = 0.0
-        for td in m2_test_dirs(d):
-            trc, tso, tse, tm = run([M2C2, "test", "--json", td], td)
+        for td in pion_test_dirs(d):
+            trc, tso, tse, tm = run([PIONC2, "test", "--json", td], td)
             tms += tm
             try:
                 j = json.loads(tso.strip().splitlines()[-1])
@@ -254,13 +254,13 @@ def cmd_dim1(args):
 # ---------------------------------------------------------------------------
 
 CHECK_CMDS = {
-    "m2": lambda d: [M2C2, "check", "--json", d],
+    "pion": lambda d: [PIONC2, "check", "--json", d],
     "moonbit": lambda d: ["moon", "check", "--target", "native", "--output-json"],
     "rust": lambda d: ["cargo", "check", "--offline", "--message-format=json"],
     "go": lambda d: ["go", "build", "-json", "-o", os.devnull, "./..."],
 }
 CHECK_CMD_TEXT = {
-    "m2": "m2c2 check --json <dir>",
+    "pion": "pionc2 check --json <dir>",
     "moonbit": "moon check --target native --output-json",
     "rust": "cargo check --offline --message-format=json",
     "go": "go build -json -o /dev/null ./...",
@@ -295,7 +295,7 @@ def parse_diags(lang, so, se):
     has_fixit = False
     structured = False
     first = ""
-    if lang == "m2":
+    if lang == "pion":
         try:
             j = json.loads(so.strip().splitlines()[-1])
             structured = True
@@ -490,21 +490,21 @@ def cmd_dim2(args):
 T06 = os.path.join(AE, "tasks", "t06_multi_pkg_refactor")
 
 TEST_CMDS = {
-    # `m2c2 test <workspace>` runs only the root package's tests, so every package
+    # `pionc2 test <workspace>` runs only the root package's tests, so every package
     # directory is tested in turn (cargo --workspace / go ./... / moon test cover all three).
-    "m2": lambda d: ["/bin/sh", "-c", " && ".join("%s test --json %s" % (_q(M2C2), _q(t)) for t in m2_test_dirs(d))],
+    "pion": lambda d: ["/bin/sh", "-c", " && ".join("%s test --json %s" % (_q(PIONC2), _q(t)) for t in pion_test_dirs(d))],
     "moonbit": lambda d: ["moon", "test", "--target", "native"],
     "rust": lambda d: ["cargo", "test", "-q", "--offline", "--workspace"],
     "go": lambda d: ["go", "test", "./..."],
 }
 CHECK3_CMDS = {
-    "m2": lambda d: [M2C2, "check", "--json", d],
+    "pion": lambda d: [PIONC2, "check", "--json", d],
     "moonbit": lambda d: ["moon", "check", "--target", "native"],
     "rust": lambda d: ["cargo", "check", "-q", "--offline", "--workspace"],
     "go": lambda d: ["go", "vet", "./..."],
 }
 TEST_CMD_TEXT = {
-    "m2": "m2c2 test --json <pkg> for each of the 3 package dirs",
+    "pion": "pionc2 test --json <pkg> for each of the 3 package dirs",
     "moonbit": "moon test --target native",
     "rust": "cargo test -q --offline --workspace",
     "go": "go test ./...",
@@ -515,7 +515,7 @@ EDIT_MARK = {"body": "AE_EDIT_BODY", "iface": "AE_EDIT_IFACE"}
 
 def apply_edit(d, mark, n):
     """Rewrites the single line tagged `mark` into a never-seen-before but equivalent form, so no
-    content-addressed cache (m2 CAS, Go build/test cache) can short-circuit the edit:
+    content-addressed cache (Pion CAS, Go build/test cache) can short-circuit the edit:
     a body edit sets the private constant to `<n+1> - <n>`; an interface edit renames the exported
     (unused) probe function to a fresh name `ae_probe_k<n>` / `AeProbeK<n>`."""
     hits = 0
@@ -562,10 +562,10 @@ def cmd_dim3(args):
     for lang in LANGS:
         d = fresh_copy(os.path.join(T06, lang), os.path.join(WORK, "dim3", "loop", lang))
         env = dict(ENV)
-        # cold = fresh copy *and* fresh global caches (m2 CAS, Go build/test cache)
-        for c in ("m2cas", "gocache"):
+        # cold = fresh copy *and* fresh global caches (Pion CAS, Go build/test cache)
+        for c in ("pioncas", "gocache"):
             shutil.rmtree(os.path.join(WORK, "dim3", "loop", c), ignore_errors=True)
-        env["M2_CACHE_DIR"] = os.path.join(WORK, "dim3", "loop", "m2cas")
+        env["PION_CACHE_DIR"] = os.path.join(WORK, "dim3", "loop", "pioncas")
         env["GOCACHE"] = os.path.join(WORK, "dim3", "loop", "gocache")
         rc, so, se, cold_ms = run(TEST_CMDS[lang](d), d, env=env)
         entry = {"cold_test_ms": round(cold_ms, 1), "cold_ok": rc == 0}
@@ -596,26 +596,26 @@ def cmd_dim3(args):
         src = os.path.join(T06, lang)
         full = metrics.measure_dir(src)
         e = {"full_source_bytes": full["bytes"], "full_source_est_tokens": full["est_tokens_bytes_div4"]}
-        if lang == "m2":
+        if lang == "pion":
             parts = {}
-            for name, cmd in [("doc_json", [M2C2, "doc", "--json", src]),
+            for name, cmd in [("doc_json", [PIONC2, "doc", "--json", src]),
                               # `query` takes source files (a workspace directory yields an empty table)
-                              ("query_defs_json", [M2C2, "query", "defs", "--json"] + metrics.source_files(src)),
-                              ("query_callers_json", [M2C2, "query", "callers", "--json"] + metrics.source_files(src)),
-                              ("doc_text", [M2C2, "doc", src])]:
+                              ("query_defs_json", [PIONC2, "query", "defs", "--json"] + metrics.source_files(src)),
+                              ("query_callers_json", [PIONC2, "query", "callers", "--json"] + metrics.source_files(src)),
+                              ("doc_text", [PIONC2, "doc", src])]:
                 rc, so, se, ms = run(cmd, src)
                 parts[name] = {"rc": rc, "bytes": len(so.encode()), "ms": round(ms, 1)}
-            e["api_tool"] = "m2c2 doc --json"
+            e["api_tool"] = "pionc2 doc --json"
             e["api_bytes"] = parts["doc_json"]["bytes"]
             e["api_ok"] = parts["doc_json"]["rc"] == 0
             e["extra"] = parts
             stdp = {}
             for pkg in ("std/json", "std/http"):
                 pdir = os.path.join(ROOT, pkg)
-                rc, so, se, ms = run([M2C2, "doc", "--json", pdir], pdir)
+                rc, so, se, ms = run([PIONC2, "doc", "--json", pdir], pdir)
                 stdp[pkg] = {"doc_json_bytes": len(so.encode()), "rc": rc,
                              "source_bytes": metrics.measure_dir(pdir)["bytes"]}
-            e["m2_std_packages"] = stdp
+            e["pion_std_packages"] = stdp
         elif lang == "go":
             d = src
             rc, so, se, ms = run(["go", "list", "./..."], d)
@@ -662,7 +662,7 @@ def cmd_dim3(args):
                 shutil.rmtree(base)
             os.makedirs(base)
             env = dict(ENV)
-            env["M2_CACHE_DIR"] = os.path.join(base, "_global_m2cas")
+            env["PION_CACHE_DIR"] = os.path.join(base, "_global_pioncas")
             env["GOCACHE"] = os.path.join(base, "_global_gocache")
             wts = [fresh_copy(os.path.join(T06, lang), os.path.join(base, "wt%d" % k)) for k in range(5)]
             src_bytes = du_bytes(wts[0])
@@ -677,7 +677,7 @@ def cmd_dim3(args):
             wall = (time.perf_counter() - t0) * 1000.0
             rcs = [p.returncode for p in procs]
             in_tree = [du_bytes(w) - src_bytes for w in wts]
-            glob = du_bytes(env["M2_CACHE_DIR"]) + du_bytes(env["GOCACHE"])
+            glob = du_bytes(env["PION_CACHE_DIR"]) + du_bytes(env["GOCACHE"])
             last = {"rcs": rcs, "in_tree_bytes": in_tree, "global_cache_bytes": glob, "sample": outs[0][-600:],
                     "fail_tail": [o[-1500:] for o, r in zip(outs, rcs) if r != 0][:1]}
             if i > 0:

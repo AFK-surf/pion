@@ -73,7 +73,7 @@ func main() {
 				}
 				pos++
 			}
-			// Heap-allocate a standalone copy of the chunk (matching C/Rust/Zig/m2)
+			// Heap-allocate a standalone copy of the chunk (matching C/Rust/Zig/pion)
 			chunk := strings.Clone(src[start:pos])
 			workCh <- chunk
 		}

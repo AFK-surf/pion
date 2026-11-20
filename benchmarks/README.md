@@ -1,6 +1,6 @@
-# `m2` Multi-Language Objective Benchmark Suite (D5)
+# `Pion` Multi-Language Objective Benchmark Suite (D5)
 
-Objective, checksum-verified, one-command reproducible benchmark suite comparing **`m2`** against **C (`clang -O2`)**, **MoonBit (`moon build --target native --release`)**, **Zig (`zig build-exe -OReleaseFast`)**, and **Rust (`rustc -O` / `cargo build --release`)**.
+Objective, checksum-verified, one-command reproducible benchmark suite comparing **`Pion`** against **C (`clang -O2`)**, **MoonBit (`moon build --target native --release`)**, **Zig (`zig build-exe -OReleaseFast`)**, and **Rust (`rustc -O` / `cargo build --release`)**.
 
 ## Dimensions Covered
 
@@ -14,19 +14,19 @@ All programs print a strict deterministic checksum to prevent dead-code eliminat
 | `spectralnorm` | Benchmarks Game eigenvalue power iteration (`N = 2000`, 10 iters) | `1.274224152` |
 | `fannkuchredux` | Benchmarks Game pancake-flip permutations (`N = 10`, `10! = 3,628,800`) | `73196 38` |
 | `mandelbrot_1t` | Benchmarks Game Mandelbrot (`4000×4000`, 50 iters, 1 thread) | `6351041 721219984` |
-| `mandelbrot_4t` | Same Mandelbrot (`4000×4000`, 4 threads: `m2` `scope`/`spawn`/`Channel`, C `pthread`, Zig `std.Thread`, Rust `std::thread`; MoonBit is single-threaded baseline) | `6351041 721219984` |
+| `mandelbrot_4t` | Same Mandelbrot (`4000×4000`, 4 threads: `Pion` `scope`/`spawn`/`Channel`, C `pthread`, Zig `std.Thread`, Rust `std::thread`; MoonBit is single-threaded baseline) | `6351041 721219984` |
 | `hashmap_str` | 100,000 string-keyed inserts + 400,000 lookups (200k hit / 200k miss) + `StringBuilder` concat & hash | `200000 208681440 205599 815496841` |
 
-*Note on floating-point determinism*: Apple `clang -O2` enables `-ffp-contract=fast` by default, whereas Rust, Zig, MoonBit, and `m2` use strict IEEE-754 rounding. `scripts/bench.sh` passes `-ffp-contract=off` to `clang -O2` so all languages execute identical IEEE-754 arithmetic.
+*Note on floating-point determinism*: Apple `clang -O2` enables `-ffp-contract=fast` by default, whereas Rust, Zig, MoonBit, and `Pion` use strict IEEE-754 rounding. `scripts/bench.sh` passes `-ffp-contract=off` to `clang -O2` so all languages execute identical IEEE-754 arithmetic.
 
 ### 2. Compile Speed (10,000 LOC / 20 Packages)
-`benchmarks/tools/gen_compile_bench.c` deterministically generates an equivalent 20-package (~10,000 LOC) layered DAG project for C, MoonBit, Zig, Rust, and `m2`:
+`benchmarks/tools/gen_compile_bench.c` deterministically generates an equivalent 20-package (~10,000 LOC) layered DAG project for C, MoonBit, Zig, Rust, and `Pion`:
 - **Cold compile**: end-to-end build from clean state (checksum `796114417`).
 - **Incremental compile**: 1-line edit inside a function body in `pkg05` (no `pub` signature change, all other 19 packages untouched) + relink (checksum `688976608`).
 
 ### 3. Artifact Size & Worktree Cache Pollution
 - Default and `strip`ped binary sizes (bytes) for `hello` and all 6 execution benchmarks.
-- In-tree build cache size (`*.o`, `_build/`, `.zig-cache/`, `target/`) vs `m2`'s `0 B` worktree pollution + global CAS (`$M2_CACHE_DIR`).
+- In-tree build cache size (`*.o`, `_build/`, `.zig-cache/`, `target/`) vs `Pion`'s `0 B` worktree pollution + global CAS (`$PION_CACHE_DIR`).
 
 ### 4. Measurement Protocol
 - Pure C timing harness (`benchmarks/tools/bench_measure.c`, zero Python).
@@ -36,12 +36,12 @@ All programs print a strict deterministic checksum to prevent dead-code eliminat
 ## Usage
 
 ```sh
-# 1. Verify all benchmarks/m2/*.m2 + generated 10,000-LOC/20-pkg m2 project pass Stage 0 m2c0 check --json
-sh scripts/bench.sh --check-m2
+# 1. Verify all benchmarks/pion/*.pion + generated 10,000-LOC/20-pkg Pion project pass Stage 0 pionc0 check --json
+sh scripts/bench.sh --check-pion
 
 # 2. Run full baseline (C / MoonBit / Zig / Rust)
 sh scripts/bench.sh
 
-# 3. Include m2 once Stage 1/2 m2c binary is built
-M2C=/path/to/m2c sh scripts/bench.sh
+# 3. Include Pion once Stage 1/2 pionc binary is built
+PIONC=/path/to/pionc sh scripts/bench.sh
 ```

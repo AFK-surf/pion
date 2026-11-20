@@ -2,7 +2,7 @@
 import os
 import re
 
-CODE_EXT = {".m2": "m2", ".mbt": "moonbit", ".rs": "rust", ".go": "go", ".c": "c"}
+CODE_EXT = {".pion": "pion", ".mbt": "moonbit", ".rs": "rust", ".go": "go", ".c": "c"}
 
 # One alternation, scanned left to right, so `//` inside a string literal is
 # never mistaken for a comment.

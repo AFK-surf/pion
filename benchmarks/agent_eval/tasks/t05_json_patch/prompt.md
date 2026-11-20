@@ -3,7 +3,7 @@
 Parse a JSON base config and six JSON merge patches, apply each patch to the base independently
 (RFC 7386: an object patch merges recursively, a `null` member deletes the key, anything else replaces),
 then validate the merged config. Each language uses what its **standard library** offers:
-m2 `std/json` (in this repo), Go `encoding/json`, MoonBit `moonbitlang/core/json`; Rust's standard library
+Pion `std/json` (in this repo), Go `encoding/json`, MoonBit `moonbitlang/core/json`; Rust's standard library
 has no JSON, so the Rust version carries its own small recursive-descent parser (no crates).
 
 Validation (first failure wins, in this order), messages exactly:

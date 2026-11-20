@@ -366,9 +366,9 @@ pub fn extract_package_sig(pkg : Package) -> PackageSig {
 }
 
 ///|
-pub fn serialize_m2sig(sig : PackageSig) -> String {
+pub fn serialize_pionsig(sig : PackageSig) -> String {
   let sb = StringBuilder()
-  sb.write_string("m2sig v1\n")
+  sb.write_string("pionsig v1\n")
   sb.write_string("pkg ")
   sb.write_string(sig.pkg)
   sb.write_string("\n")
@@ -382,8 +382,8 @@ pub fn serialize_m2sig(sig : PackageSig) -> String {
 }
 
 ///|
-pub fn emit_m2sig(pkg : Package) -> String {
-  serialize_m2sig(extract_package_sig(pkg))
+pub fn emit_pionsig(pkg : Package) -> String {
+  serialize_pionsig(extract_package_sig(pkg))
 }
 
 ///|
@@ -452,7 +452,7 @@ pub fn emit_all_sigs(pkg : Package) -> String {
     fi = fi + 1
   }
   sort_sig_entries(entries)
-  serialize_m2sig(PackageSig::{ pkg: pkg.name, entries: entries })
+  serialize_pionsig(PackageSig::{ pkg: pkg.name, entries: entries })
 }
 
 ///|
@@ -499,7 +499,7 @@ pub fn emit_file_sig_entries(f : SourceFile) -> String {
 }
 
 ///|
-/// Emit a minimal parseable `.m2` stub containing only top-level declarations
+/// Emit a minimal parseable `.pion` stub containing only top-level declarations
 /// (structs, enums, const types, and fn signatures with `{ panic() }` bodies).
 pub fn emit_file_stub(f : SourceFile) -> String {
   let sb = StringBuilder()
@@ -715,11 +715,11 @@ pub fn pkg_has_pub_bounded_fn(pkg : Package) -> Bool {
 }
 
 ///|
-/// Emit a minimal parseable `.m2` package stub preserving imports and all
+/// Emit a minimal parseable `.pion` package stub preserving imports and all
 /// top-level declaration signatures (with `{ panic() }` / `= panic()` bodies)
 /// so downstream packages can typecheck against CAS-hit dependencies without
 /// re-parsing or typechecking upstream function bodies.
-pub fn emit_m2_stub(pkg : Package) -> String {
+pub fn emit_pion_stub(pkg : Package) -> String {
   // A `pub` generic fn with trait bounds is monomorphized in the importing package
   // from its body; a `{ panic() }` stub would be instantiated instead. Return "" so
   // the driver loads this package from source.
@@ -845,7 +845,7 @@ pub fn summarize_file_sigs(
     fi = fi + 1
   }
   sort_sig_entries(entries)
-  let all_sigs = serialize_m2sig(PackageSig::{ pkg: pkg_name, entries: entries })
+  let all_sigs = serialize_pionsig(PackageSig::{ pkg: pkg_name, entries: entries })
   let sig_sb = StringBuilder()
   sig_sb.write_string(all_sigs)
   sig_sb.write_string("const_units:")
@@ -918,16 +918,16 @@ fn extract_sig_name(line : String, start_idx : Int) -> String {
 }
 
 ///|
-pub fn parse_m2sig(text : String) -> Result[PackageSig, String] {
+pub fn parse_pionsig(text : String) -> Result[PackageSig, String] {
   let lines = split_lines(text)
   if lines.length() < 2 {
-    return Err("m2sig too short: missing header")
+    return Err("pionsig too short: missing header")
   }
-  if lines[0] != "m2sig v1" {
-    return Err("unsupported m2sig header: " + lines[0])
+  if lines[0] != "pionsig v1" {
+    return Err("unsupported pionsig header: " + lines[0])
   }
   if !starts_with_str(lines[1], "pkg ") {
-    return Err("missing pkg line in m2sig")
+    return Err("missing pkg line in pionsig")
   }
   let pkg_name = slice_str(lines[1], 4, lines[1].length())
   let entries : Array[SigEntry] = []
@@ -987,7 +987,7 @@ pub fn parse_m2sig(text : String) -> Result[PackageSig, String] {
         signature: line,
       })
     } else {
-      return Err("unrecognized m2sig entry: " + line)
+      return Err("unrecognized pionsig entry: " + line)
     }
     i = i + 1
   }
@@ -1018,14 +1018,14 @@ pub fn sig_hash_hex(text : String) -> String {
 
 ///|
 pub fn package_sig_to_json(sig : PackageSig) -> String {
-  let raw = serialize_m2sig(sig)
+  let raw = serialize_pionsig(sig)
   let hash = sig_hash_hex(raw)
   let sb = StringBuilder()
   sb.write_string("{\"pkg\":")
   sb.write_string(json_quote(sig.pkg))
   sb.write_string(",\"sig_hash\":")
   sb.write_string(json_quote(hash))
-  sb.write_string(",\"m2sig\":")
+  sb.write_string(",\"pionsig\":")
   sb.write_string(json_quote(raw))
   sb.write_string(",\"exports\":[")
   let mut i = 0

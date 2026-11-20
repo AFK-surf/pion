@@ -18,14 +18,14 @@ if [ "${1:-}" = "--quick" ]; then
   MODE_LABEL="quick (1 warmup + 1 run)"
 fi
 
-if [ -z "${M2C:-}" ] && [ -x "$OUT_DIR/m2c2" ]; then
-  M2C="$OUT_DIR/m2c2"
+if [ -z "${PIONC:-}" ] && [ -x "$OUT_DIR/pionc2" ]; then
+  PIONC="$OUT_DIR/pionc2"
 fi
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/m2-bench-v2.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/pion-bench-v2.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
-mkdir -p "$WORK/bin" "$WORK/data" "$WORK/exec/c" "$WORK/exec/zig" "$WORK/exec/rust" "$WORK/exec/go" "$WORK/exec/m2"
+mkdir -p "$WORK/bin" "$WORK/data" "$WORK/exec/c" "$WORK/exec/zig" "$WORK/exec/rust" "$WORK/exec/go" "$WORK/exec/pion"
 
 # Build pure-C benchmark tools (zero Python)
 clang -O2 -Wall -Wextra -o "$WORK/bin/bench_measure" "$TOOLS_DIR/bench_measure.c"
@@ -58,9 +58,9 @@ HAS_MOON=0; command -v moon >/dev/null 2>&1 && HAS_MOON=1
 HAS_ZIG=0; command -v zig >/dev/null 2>&1 && HAS_ZIG=1
 HAS_RUST=0; command -v rustc >/dev/null 2>&1 && HAS_RUST=1
 HAS_GO=0; command -v go >/dev/null 2>&1 && HAS_GO=1
-HAS_M2=0
-if [ -n "${M2C:-}" ] && [ -x "${M2C:-}" ]; then
-  HAS_M2=1
+HAS_PION=0
+if [ -n "${PIONC:-}" ] && [ -x "${PIONC:-}" ]; then
+  HAS_PION=1
 fi
 
 CPU_BRAND=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
@@ -71,10 +71,10 @@ MOON_VER=$( [ "$HAS_MOON" -eq 1 ] && moon --version 2>&1 | head -n 1 || echo "N/
 ZIG_VER=$( [ "$HAS_ZIG" -eq 1 ] && zig version 2>&1 | head -n 1 || echo "N/A" )
 RUST_VER=$( [ "$HAS_RUST" -eq 1 ] && rustc --version 2>&1 | head -n 1 || echo "N/A" )
 GO_VER=$( [ "$HAS_GO" -eq 1 ] && go version 2>&1 | head -n 1 || echo "N/A" )
-M2_VER=$( [ "$HAS_M2" -eq 1 ] && ("$M2C" --version 2>&1 | head -n 1 || echo "$M2C") || echo "not provided (pass M2C=/path/to/m2c2)" )
+PION_VER=$( [ "$HAS_PION" -eq 1 ] && ("$PIONC" --version 2>&1 | head -n 1 || echo "$PIONC") || echo "not provided (pass PIONC=/path/to/pionc2)" )
 
 echo "================================================================="
-echo " m2 V2 Real-Workload 6-Language Execution Benchmark Suite"
+echo " pion V2 Real-Workload 6-Language Execution Benchmark Suite"
 echo "================================================================="
 echo "Mode   : $MODE_LABEL"
 echo "Host   : $CPU_BRAND ($CPU_CORES cores) | $OS_VER"
@@ -83,7 +83,7 @@ echo "MoonBit: $MOON_VER"
 echo "Zig    : $ZIG_VER"
 echo "Rust   : $RUST_VER"
 echo "Go     : $GO_VER"
-echo "m2     : $M2_VER"
+echo "pion     : $PION_VER"
 echo "================================================================="
 
 # 1. Generate deterministic datasets
@@ -138,12 +138,12 @@ if [ "$HAS_GO" -eq 1 ]; then
   done
 fi
 
-if [ "$HAS_M2" -eq 1 ]; then
-  echo ">>> Building m2 ($M2C build --release)..."
-  export M2_CACHE_DIR="$WORK/m2-cas"
-  mkdir -p "$M2_CACHE_DIR"
+if [ "$HAS_PION" -eq 1 ]; then
+  echo ">>> Building pion ($PIONC build --release)..."
+  export PION_CACHE_DIR="$WORK/pion-cas"
+  mkdir -p "$PION_CACHE_DIR"
   for b in $BENCHES; do
-    "$M2C" build --release "$BENCH_DIR/m2/$b.m2" -o "$WORK/exec/m2/$b"
+    "$PIONC" build --release "$BENCH_DIR/pion/$b.pion" -o "$WORK/exec/pion/$b"
   done
 fi
 
@@ -156,7 +156,7 @@ bin_path() {
     zig)     echo "$WORK/exec/zig/$bench" ;;
     rust)    echo "$WORK/exec/rust/$bench" ;;
     go)      echo "$WORK/exec/go/$bench" ;;
-    m2)      echo "$WORK/exec/m2/$bench" ;;
+    pion)      echo "$WORK/exec/pion/$bench" ;;
   esac
 }
 
@@ -166,7 +166,7 @@ LANGS=""
 [ "$HAS_ZIG" -eq 1 ] && LANGS="$LANGS zig"
 [ "$HAS_RUST" -eq 1 ] && LANGS="$LANGS rust"
 [ "$HAS_GO" -eq 1 ] && LANGS="$LANGS go"
-[ "$HAS_M2" -eq 1 ] && LANGS="$LANGS m2"
+[ "$HAS_PION" -eq 1 ] && LANGS="$LANGS pion"
 
 EXEC_TSV="$WORK/exec_results.tsv"
 : > "$EXEC_TSV"
@@ -258,7 +258,7 @@ JSON_OUT="$OUT_DIR/v2-exec-results.json"
   printf '    "zig": "%s",\n' "$(json_escape "$ZIG_VER")"
   printf '    "rust": "%s",\n' "$(json_escape "$RUST_VER")"
   printf '    "go": "%s",\n' "$(json_escape "$GO_VER")"
-  printf '    "m2": "%s"\n' "$(json_escape "$M2_VER")"
+  printf '    "pion": "%s"\n' "$(json_escape "$PION_VER")"
   printf '  },\n'
   printf '  "execution": [\n'
   awk -F'\t' '
@@ -288,7 +288,7 @@ JSON_OUT="$OUT_DIR/v2-exec-results.json"
 # 5. Emit Markdown summary (out/v2-exec-summary.md)
 MD_OUT="$OUT_DIR/v2-exec-summary.md"
 {
-  echo "# m2 V2 Real-Workload 6-Language Execution Benchmark Report"
+  echo "# pion V2 Real-Workload 6-Language Execution Benchmark Report"
   echo ""
   echo "- **Mode**: $MODE_LABEL"
   echo "- **Machine**: \`$CPU_BRAND\` ($CPU_CORES cores), \`$OS_VER\`"
@@ -299,7 +299,7 @@ MD_OUT="$OUT_DIR/v2-exec-summary.md"
   echo "  - Zig: \`$ZIG_VER\` (\`-OReleaseFast\`)"
   echo "  - Rust: \`$RUST_VER\` (\`rustc -O\`)"
   echo "  - Go: \`$GO_VER\` (\`go build\`)"
-  echo "  - m2: \`$M2_VER\` (\`m2c2 build --release\`)"
+  echo "  - pion: \`$PION_VER\` (\`pionc2 build --release\`)"
   echo ""
   echo "## 1. Execution Speed, Peak RSS & Instructions Retired"
   echo ""

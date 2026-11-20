@@ -1,6 +1,6 @@
 /*
  * Deterministic 10,000-LOC / 20-package multi-file project generator
- * for C, MoonBit, Zig, Rust, and m2 compile-speed & cache-pollution benchmarks.
+ * for C, MoonBit, Zig, Rust, and Pion compile-speed & cache-pollution benchmarks.
  *
  * Usage:
  *   gen_compile_bench <out_dir> [--mutate]
@@ -279,13 +279,13 @@ static void gen_rust(const char *root, int delta) {
     fclose(am);
 }
 
-static void gen_m2(const char *root, int delta) {
+static void gen_pion(const char *root, int delta) {
     char dir[1024], path[1024];
-    snprintf(dir, sizeof(dir), "%s/m2", root);
+    snprintf(dir, sizeof(dir), "%s/pion", root);
     mkdir_p(dir);
 
     for (int p = 0; p < NUM_PKGS; p++) {
-        snprintf(path, sizeof(path), "%s/pkg%02d.m2", dir, p);
+        snprintf(path, sizeof(path), "%s/pkg%02d.pion", dir, p);
         FILE *f = must_open(path);
         fprintf(f, "///| Generated package pkg%02d (500 LOC)\n", p);
         for (int i = 0; i < FNS_PER_PKG; i++) {
@@ -314,9 +314,9 @@ static void gen_m2(const char *root, int delta) {
         fclose(f);
     }
 
-    snprintf(path, sizeof(path), "%s/main.m2", dir);
+    snprintf(path, sizeof(path), "%s/main.pion", dir);
     FILE *m = must_open(path);
-    fprintf(m, "///| Generated entry point for 10,000-LOC / 20-package m2 benchmark\n");
+    fprintf(m, "///| Generated entry point for 10,000-LOC / 20-package pion benchmark\n");
     fprintf(m, "pub fn main(world : World) -> Int {\n");
     fprintf(m, "  let r = pkg%02d_entry(42)\n", NUM_PKGS - 1);
     fprintf(m, "  io_println(world, r.to_string())\n");
@@ -421,28 +421,28 @@ static void mutate_pkg05_only(const char *root) {
     fprintf(r, "pub fn entry(x: i32) -> i32 {\n    fn%02d(x)\n}\n", FNS_PER_PKG - 1);
     fclose(r);
 
-    /* m2: rewrite pkg05.m2 only */
-    snprintf(path, sizeof(path), "%s/m2/pkg%02d.m2", root, p);
-    FILE *m2 = must_open(path);
-    fprintf(m2, "///| Generated package pkg%02d (500 LOC, mutated 1 line)\n", p);
+    /* Pion: rewrite pkg05.pion only */
+    snprintf(path, sizeof(path), "%s/pion/pkg%02d.pion", root, p);
+    FILE *pion = must_open(path);
+    fprintf(pion, "///| Generated package pkg%02d (500 LOC, mutated 1 line)\n", p);
     for (int i = 0; i < FNS_PER_PKG; i++) {
         int d = (i == 0) ? delta : 1;
-        fprintf(m2, "pub fn pkg%02d_fn%02d(x : Int) -> Int {\n", p, i);
-        fprintf(m2, "  let a = (x + %d) & 0x3fffffff\n", p * 31 + i + 3);
-        fprintf(m2, "  let b = ((a * %d) ^ %d) & 0x3fffffff\n", (i % 7) + 3, p * 17 + i);
-        fprintf(m2, "  let d = %d\n", d);
-        fprintf(m2, "  let mut c = (b + d) & 0x3fffffff\n");
+        fprintf(pion, "pub fn pkg%02d_fn%02d(x : Int) -> Int {\n", p, i);
+        fprintf(pion, "  let a = (x + %d) & 0x3fffffff\n", p * 31 + i + 3);
+        fprintf(pion, "  let b = ((a * %d) ^ %d) & 0x3fffffff\n", (i % 7) + 3, p * 17 + i);
+        fprintf(pion, "  let d = %d\n", d);
+        fprintf(pion, "  let mut c = (b + d) & 0x3fffffff\n");
         if (i > 0) {
-            fprintf(m2, "  let prev = pkg%02d_fn%02d(c & 0xffff)\n", p, i - 1);
+            fprintf(pion, "  let prev = pkg%02d_fn%02d(c & 0xffff)\n", p, i - 1);
         } else {
-            fprintf(m2, "  let prev = pkg%02d_entry(c & 0xffff)\n", p - 1);
+            fprintf(pion, "  let prev = pkg%02d_entry(c & 0xffff)\n", p - 1);
         }
-        fprintf(m2, "  c = (c + prev) & 0x3fffffff\n");
-        fprintf(m2, "  let e = ((c * 5) + %d) & 0x3fffffff\n", i + 1);
-        fprintf(m2, "  e\n}\n\n");
+        fprintf(pion, "  c = (c + prev) & 0x3fffffff\n");
+        fprintf(pion, "  let e = ((c * 5) + %d) & 0x3fffffff\n", i + 1);
+        fprintf(pion, "  e\n}\n\n");
     }
-    fprintf(m2, "pub fn pkg%02d_entry(x : Int) -> Int {\n  pkg%02d_fn%02d(x)\n}\n", p, p, FNS_PER_PKG - 1);
-    fclose(m2);
+    fprintf(pion, "pub fn pkg%02d_entry(x : Int) -> Int {\n  pkg%02d_fn%02d(x)\n}\n", p, p, FNS_PER_PKG - 1);
+    fclose(pion);
 }
 
 int main(int argc, char **argv) {
@@ -461,6 +461,6 @@ int main(int argc, char **argv) {
     gen_moonbit(root, 1);
     gen_zig(root, 1);
     gen_rust(root, 1);
-    gen_m2(root, 1);
+    gen_pion(root, 1);
     return 0;
 }

@@ -54,7 +54,7 @@ pub fn str_code_at(s : String, idx : Int) -> Int {
 }
 
 ///|
-/// True when `String` code units are UTF-8 bytes (m2 Stage 1/2), false when
+/// True when `String` code units are UTF-8 bytes (Pion Stage 1/2), false when
 /// they are UTF-16 units (MoonBit Stage 0). Text handling that goes beyond
 /// ASCII must decode scalars with `str_scalar_at` / `str_scalar_len` instead
 /// of turning one code unit into one `Char`.

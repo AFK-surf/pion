@@ -1,3 +1,3 @@
 fn main {
-  println("hello m2")
+  println("hello pion")
 }

@@ -36,7 +36,7 @@ fn str_contains(haystack : String, needle : String) -> Bool {
 
 ///|
 fn check_one(src : String) -> (Bool, String, Array[@core.Diagnostic]) {
-  let cr = @core.check_source_files("testpkg", ["test.m2"], [src])
+  let cr = @core.check_source_files("testpkg", ["test.pion"], [src])
   let json = @core.check_result_to_json(cr.diagnostics)
   (cr.diagnostics.length() == 0, json, cr.diagnostics)
 }
@@ -55,7 +55,7 @@ test "lexer: literals, comments, line and col tracking" {
     "let d : Byte = b'a'\n" +
     "let e : Char = '\\n'\n" +
     "let f : String = \"hello\\nworld\"\n"
-  let lr = @core.lex("sample.m2", src)
+  let lr = @core.lex("sample.pion", src)
   assert_true(lr.diagnostics.length() == 0, "expected 0 lex diagnostics")
   assert_true(lr.tokens[0].span.line == 3, "first token on line 3")
   assert_true(lr.tokens[0].span.col == 1, "first token on col 1")
@@ -288,7 +288,7 @@ test "negative: E_CAPABILITY_MISSING on IO without World" {
 }
 
 ///|
-test "m2sig: stability across body edits and round-trip parse" {
+test "pionsig: stability across body edits and round-trip parse" {
   let v1 =
     "pub struct User { id : Int }\n" +
     "fn private_helper(x : Int) -> Int { x + 1 }\n" +
@@ -303,16 +303,16 @@ test "m2sig: stability across body edits and round-trip parse" {
     "  let tmp = another_private(u.id, 10)\n" +
     "  tmp + 42\n" +
     "}\n"
-  let sig1 = @core.cli_emit_sig("app", ["a.m2"], [v1])
-  let sig2 = @core.cli_emit_sig("app", ["a.m2"], [v2])
-  assert_true(sig1 == sig2, "m2sig must be byte-for-byte identical when only bodies change")
-  match @core.parse_m2sig(sig1) {
+  let sig1 = @core.cli_emit_sig("app", ["a.pion"], [v1])
+  let sig2 = @core.cli_emit_sig("app", ["a.pion"], [v2])
+  assert_true(sig1 == sig2, "pionsig must be byte-for-byte identical when only bodies change")
+  match @core.parse_pionsig(sig1) {
     Ok(parsed) => {
       assert_true(parsed.pkg == "app", "parsed pkg name")
       assert_true(parsed.entries.length() == 2, "2 pub entries")
-      assert_true(@core.serialize_m2sig(parsed) == sig1, "round-trip serialize matches")
+      assert_true(@core.serialize_pionsig(parsed) == sig1, "round-trip serialize matches")
     }
-    Err(e) => abort("parse_m2sig failed: " + e)
+    Err(e) => abort("parse_pionsig failed: " + e)
   }
 }
 
@@ -325,7 +325,7 @@ test "query: defs, sig, callers, deps JSON outputs" {
     "  io_println(world, \"hi\")\n" +
     "  helper(41)\n" +
     "}\n"
-  match @core.cli_query_json("defs", "demo", ["demo.m2"], [src]) {
+  match @core.cli_query_json("defs", "demo", ["demo.pion"], [src]) {
     Ok(j) => {
       assert_true(str_contains(j, "\"defs\":["), "defs root")
       assert_true(str_contains(j, "\"name\":\"Item\""), "Item def")
@@ -333,14 +333,14 @@ test "query: defs, sig, callers, deps JSON outputs" {
     }
     Err(e) => abort(e)
   }
-  match @core.cli_query_json("sig", "demo", ["demo.m2"], [src]) {
+  match @core.cli_query_json("sig", "demo", ["demo.pion"], [src]) {
     Ok(j) => {
       assert_true(str_contains(j, "\"sig_hash\":"), "sig_hash")
       assert_true(str_contains(j, "\"exports\":["), "exports")
     }
     Err(e) => abort(e)
   }
-  match @core.cli_query_json("callers", "demo", ["demo.m2"], [src]) {
+  match @core.cli_query_json("callers", "demo", ["demo.pion"], [src]) {
     Ok(j) => {
       assert_true(str_contains(j, "\"callers\":["), "callers root")
       assert_true(str_contains(j, "\"helper\""), "calls helper")
@@ -348,10 +348,10 @@ test "query: defs, sig, callers, deps JSON outputs" {
     }
     Err(e) => abort(e)
   }
-  match @core.cli_query_json("deps", "demo", ["demo.m2"], [src]) {
+  match @core.cli_query_json("deps", "demo", ["demo.pion"], [src]) {
     Ok(j) => {
       assert_true(str_contains(j, "\"packages\":["), "packages root")
-      assert_true(str_contains(j, "m2/runtime/world"), "world dep")
+      assert_true(str_contains(j, "pion/runtime/world"), "world dep")
       assert_true(str_contains(j, "\"sig_hash\":"), "deps sig_hash")
     }
     Err(e) => abort(e)
@@ -371,7 +371,7 @@ test "p6b: import, cross-package types/methods/enums/consts and E_PRIVATE_SYMBOL
     "fn priv_helper(x : Int) -> Int { x * 2 }\n"
   let math_cr = @core.check_source_files_with_imports(
     "math",
-    ["math.m2"],
+    ["math.pion"],
     [math_src],
     [],
     true,
@@ -392,7 +392,7 @@ test "p6b: import, cross-package types/methods/enums/consts and E_PRIVATE_SYMBOL
     "}\n"
   let app_cr = @core.check_source_files_with_imports(
     "app",
-    ["app.m2"],
+    ["app.pion"],
     [ok_app],
     imported,
     true,
@@ -408,7 +408,7 @@ test "p6b: import, cross-package types/methods/enums/consts and E_PRIVATE_SYMBOL
     "}\n"
   let priv_cr = @core.check_source_files_with_imports(
     "app",
-    ["bad.m2"],
+    ["bad.pion"],
     [priv_app],
     imported,
     true,
@@ -422,7 +422,7 @@ test "p6b: import, cross-package types/methods/enums/consts and E_PRIVATE_SYMBOL
     "pub fn f() -> Int { 0 }\n"
   let unk_cr = @core.check_source_files_with_imports(
     "app",
-    ["unk.m2"],
+    ["unk.pion"],
     [unk_app],
     imported,
     true,
@@ -432,7 +432,7 @@ test "p6b: import, cross-package types/methods/enums/consts and E_PRIVATE_SYMBOL
 }
 
 ///|
-test "p6b: m2.toml parser, topo_sort, E_IMPORT_CYCLE, and workspace deps json" {
+test "p6b: pion.toml parser, topo_sort, E_IMPORT_CYCLE, and workspace deps json" {
   let toml =
     "# sample manifest\n" +
     "[package]\n" +
@@ -442,7 +442,7 @@ test "p6b: m2.toml parser, topo_sort, E_IMPORT_CYCLE, and workspace deps json" {
     "[dependencies]\n" +
     "math = { path = \"../math\" }\n" +
     "util = { path = \"./deps/util\" }\n"
-  match @core.parse_m2_toml(toml) {
+  match @core.parse_pion_toml(toml) {
     Ok(m) => {
       assert_true(m.name == "app", "pkg name")
       assert_true(m.version == "0.1.0", "pkg version")
@@ -450,7 +450,7 @@ test "p6b: m2.toml parser, topo_sort, E_IMPORT_CYCLE, and workspace deps json" {
       assert_true(m.deps[0].name == "math" && m.deps[0].path == "../math", "dep 0")
       assert_true(m.deps[1].name == "util" && m.deps[1].path == "./deps/util", "dep 1")
     }
-    Err(e) => abort("parse_m2_toml failed: " + e)
+    Err(e) => abort("parse_pion_toml failed: " + e)
   }
 
   let ok_topo = @core.topo_sort_packages(
@@ -484,7 +484,7 @@ test "p6b: first-class test block and contextual test identifier" {
     "test \"double works\" {\n" +
     "  debug_assert(double(21) == 42, \"expected 42\")\n" +
     "}\n"
-  let cr = @core.check_source_files("tpkg", ["t.m2"], [src])
+  let cr = @core.check_source_files("tpkg", ["t.pion"], [src])
   assert_true(cr.diagnostics.length() == 0, "contextual test var + test block should pass")
 }
 
@@ -496,7 +496,7 @@ test "p6c: stdlib String/Bytes/Math/World IO typechecking and capability/Send gu
     "  let a = s.starts_with(\"he\") && s.ends_with(\"ld\") && s.contains(\",\")\n" +
     "  let idx : Int = s.index_of(\",\")\n" +
     "  let parts : Array[String] = s.split(\",\")\n" +
-    "  let r : String = s.replace(\"world\", \"m2\")\n" +
+    "  let r : String = s.replace(\"world\", \"pion\")\n" +
     "  let bs : Bytes = r.to_bytes()\n" +
     "  let buf = Bytes::new(4)\n" +
     "  buf[0] = b'A'\n" +
@@ -511,14 +511,14 @@ test "p6c: stdlib String/Bytes/Math/World IO typechecking and capability/Send gu
     "  let _ec : Result[String, String] = proc_exec_capture(world, [\"echo\", \"hi\"])\n" +
     "  if a && idx >= 0 && parts.length() > 0 && b0.to_int() == 65 && m > 0.0 { 0 } else { 1 }\n" +
     "}\n"
-  let cr = @core.check_source_files("stdlib_ok", ["ok.m2"], [ok_src])
+  let cr = @core.check_source_files("stdlib_ok", ["ok.pion"], [ok_src])
   assert_true(cr.diagnostics.length() == 0, "stdlib ok_src should have 0 diagnostics")
 
   let no_world =
     "pub fn bad_io() -> Int64 {\n" +
     "  fs_mtime_ms(\"/tmp/x\")\n" +
     "}\n"
-  let cr_nw = @core.check_source_files("stdlib_nw", ["nw.m2"], [no_world])
+  let cr_nw = @core.check_source_files("stdlib_nw", ["nw.pion"], [no_world])
   let nw_json = @core.check_result_to_json(cr_nw.diagnostics)
   assert_true(str_contains(nw_json, "E_CAPABILITY_MISSING"), "fs_mtime_ms requires World")
 
@@ -526,7 +526,7 @@ test "p6c: stdlib String/Bytes/Math/World IO typechecking and capability/Send gu
     "pub fn bad_exec() -> Result[String, String] {\n" +
     "  proc_exec_capture([\"echo\", \"hi\"])\n" +
     "}\n"
-  let cr_ec = @core.check_source_files("stdlib_ec", ["ec.m2"], [no_world_cap])
+  let cr_ec = @core.check_source_files("stdlib_ec", ["ec.pion"], [no_world_cap])
   let ec_json = @core.check_result_to_json(cr_ec.diagnostics)
   assert_true(str_contains(ec_json, "E_CAPABILITY_MISSING"), "proc_exec_capture requires World")
 
@@ -539,7 +539,7 @@ test "p6c: stdlib String/Bytes/Math/World IO typechecking and capability/Send gu
     "    })\n" +
     "  })\n" +
     "}\n"
-  let cr_ns = @core.check_source_files("stdlib_ns", ["ns.m2"], [bytes_not_send])
+  let cr_ns = @core.check_source_files("stdlib_ns", ["ns.pion"], [bytes_not_send])
   let ns_json = @core.check_result_to_json(cr_ns.diagnostics)
   assert_true(str_contains(ns_json, "E_NOT_SEND"), "Bytes must be !Send")
 }
@@ -594,7 +594,7 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
     "  let _o = use_opt(Some(1))\n" +
     "  if has_k && ks.length() == 1 && msg.length() > 0 && esc.length() > 0 { 0 } else { 1 }\n" +
     "}\n"
-  let cr = @core.check_source_files("p7a_ok", ["ok.m2"], [ok_src])
+  let cr = @core.check_source_files("p7a_ok", ["ok.pion"], [ok_src])
   assert_true(cr.diagnostics.length() == 0, "p7a ok_src should have 0 diagnostics")
 
   // `?` in non-Result function
@@ -603,7 +603,7 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
     "  let r : Result[Int, String] = Ok(1)\n" +
     "  r?\n" +
     "}\n"
-  let cr1 = @core.check_source_files("p7a_bad1", ["b1.m2"], [bad_try1])
+  let cr1 = @core.check_source_files("p7a_bad1", ["b1.pion"], [bad_try1])
   assert_true(str_contains(@core.check_result_to_json(cr1.diagnostics), "E_TYPE_MISMATCH"), "try in non-Result fn")
 
   // `?` with incompatible error type
@@ -612,14 +612,14 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
     "  let r : Result[Int, String] = Ok(1)\n" +
     "  Ok(r?)\n" +
     "}\n"
-  let cr2 = @core.check_source_files("p7a_bad2", ["b2.m2"], [bad_try2])
+  let cr2 = @core.check_source_files("p7a_bad2", ["b2.pion"], [bad_try2])
   assert_true(str_contains(@core.check_result_to_json(cr2.diagnostics), "E_TYPE_MISMATCH"), "try err type mismatch")
 
   // `?` in top-level const
   let bad_try3 =
     "fn mk() -> Result[Int, String] { Ok(1) }\n" +
     "let BAD : Result[Int, String] = Ok(mk()?)\n"
-  let cr3 = @core.check_source_files("p7a_bad3", ["b3.m2"], [bad_try3])
+  let cr3 = @core.check_source_files("p7a_bad3", ["b3.pion"], [bad_try3])
   assert_true(str_contains(@core.check_result_to_json(cr3.diagnostics), "E_TYPE_MISMATCH"), "try in top-level const")
 
   // `for x in non_array`
@@ -629,7 +629,7 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
     "    let _ = x\n" +
     "  }\n" +
     "}\n"
-  let cr4 = @core.check_source_files("p7a_bad4", ["b4.m2"], [bad_for])
+  let cr4 = @core.check_source_files("p7a_bad4", ["b4.pion"], [bad_for])
   assert_true(str_contains(@core.check_result_to_json(cr4.diagnostics), "E_TYPE_MISMATCH"), "for-in requires Array")
 
   // `Array[Int]::join` rejected
@@ -638,7 +638,7 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
     "  let a : Array[Int] = [1, 2]\n" +
     "  a.join(\",\")\n" +
     "}\n"
-  let cr5 = @core.check_source_files("p7a_bad5", ["b5.m2"], [bad_join])
+  let cr5 = @core.check_source_files("p7a_bad5", ["b5.pion"], [bad_join])
   assert_true(str_contains(@core.check_result_to_json(cr5.diagnostics), "E_TYPE_MISMATCH"), "Array[Int]::join rejected")
 
   // `Array[Bool]::sort` rejected
@@ -647,7 +647,7 @@ test "p7a_ergonomics_try_for_interp_and_methods" {
     "  let a : Array[Bool] = [true, false]\n" +
     "  a.sort()\n" +
     "}\n"
-  let cr6 = @core.check_source_files("p7a_bad6", ["b6.m2"], [bad_sort])
+  let cr6 = @core.check_source_files("p7a_bad6", ["b6.pion"], [bad_sort])
   assert_true(str_contains(@core.check_result_to_json(cr6.diagnostics), "E_TYPE_MISMATCH"), "Array[Bool]::sort rejected")
 }
 
@@ -677,7 +677,7 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
     "  let c = classify(Some(5))\n" +
     "  if n == 42 && s2 == \"hi\" && c == \"pos\" && d > 3.0 { 0 } else { 1 }\n" +
     "}\n"
-  let cr = @core.check_source_files("p8_ok", ["p8_ok.m2"], [ok_src])
+  let cr = @core.check_source_files("p8_ok", ["p8_ok.pion"], [ok_src])
   assert_true(cr.diagnostics.length() == 0, "p8 ok_src should have 0 diagnostics")
 
   // Arity mismatch in tuple destructuring
@@ -686,7 +686,7 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
     "  let (a, b) = (1, 2, 3)\n" +
     "  a + b\n" +
     "}\n"
-  let cr1 = @core.check_source_files("p8_bad1", ["b1.m2"], [bad_arity])
+  let cr1 = @core.check_source_files("p8_bad1", ["b1.pion"], [bad_arity])
   assert_true(str_contains(@core.check_result_to_json(cr1.diagnostics), "E_TYPE_MISMATCH"), "tuple arity mismatch")
 
   // Destructuring non-tuple
@@ -695,7 +695,7 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
     "  let (a, b) = 42\n" +
     "  a + b\n" +
     "}\n"
-  let cr2 = @core.check_source_files("p8_bad2", ["b2.m2"], [bad_nontup])
+  let cr2 = @core.check_source_files("p8_bad2", ["b2.pion"], [bad_nontup])
   assert_true(str_contains(@core.check_result_to_json(cr2.diagnostics), "E_TYPE_MISMATCH"), "destructure non-tuple")
 
   // Out-of-range tuple index
@@ -704,7 +704,7 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
     "  let t = (1, 2)\n" +
     "  t.2\n" +
     "}\n"
-  let cr3 = @core.check_source_files("p8_bad3", ["b3.m2"], [bad_idx])
+  let cr3 = @core.check_source_files("p8_bad3", ["b3.pion"], [bad_idx])
   assert_true(str_contains(@core.check_result_to_json(cr3.diagnostics), "E_TYPE_MISMATCH"), "tuple index out of bounds")
 
   // Guarded arm does NOT satisfy exhaustiveness
@@ -715,7 +715,7 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
     "    None => 0\n" +
     "  }\n" +
     "}\n"
-  let cr4 = @core.check_source_files("p8_bad4", ["b4.m2"], [bad_exh])
+  let cr4 = @core.check_source_files("p8_bad4", ["b4.pion"], [bad_exh])
   assert_true(str_contains(@core.check_result_to_json(cr4.diagnostics), "E_NON_EXHAUSTIVE"), "guarded arm is non-exhaustive")
 
   // Non-Bool guard condition
@@ -726,12 +726,12 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
     "    _ => 0\n" +
     "  }\n" +
     "}\n"
-  let cr5 = @core.check_source_files("p8_bad5", ["b5.m2"], [bad_guard])
+  let cr5 = @core.check_source_files("p8_bad5", ["b5.pion"], [bad_guard])
   assert_true(str_contains(@core.check_result_to_json(cr5.diagnostics), "E_TYPE_MISMATCH"), "non-Bool match guard")
 }
 
 ///|
-test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pkg types" {
+test "p10c: emit_pion_stub preserves imports, pub/private visibility, and cross-pkg types" {
   let az_src =
     "pub val struct Stats {\n" +
     "  lines : Int\n" +
@@ -749,15 +749,15 @@ test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pk
     "  let h = secret_helper(n)\n" +
     "  Stats::{ lines: n, words: h }\n" +
     "}\n"
-  let az_cr = @core.check_source_files_with_imports("analyzer", ["analyzer.m2"], [az_src], [], true)
+  let az_cr = @core.check_source_files_with_imports("analyzer", ["analyzer.pion"], [az_src], [], true)
   assert_true(az_cr.diagnostics.length() == 0, "analyzer full check should pass")
-  let az_stub = @core.emit_m2_stub(az_cr.pkg)
+  let az_stub = @core.emit_pion_stub(az_cr.pkg)
   assert_true(str_contains(az_stub, "pub val struct Stats"), "stub preserves pub val struct")
   assert_true(str_contains(az_stub, "pub enum Mode"), "stub preserves pub enum")
   assert_true(str_contains(az_stub, "pub let MAX_N : Int = panic()"), "stub preserves pub const")
   assert_true(str_contains(az_stub, "fn secret_helper(x : Int) -> Int { panic() }"), "stub preserves private fn for E_PRIVATE_SYMBOL")
 
-  let az_stub_cr = @core.check_source_files_with_imports("analyzer", ["analyzer.m2stub"], [az_stub], [], true)
+  let az_stub_cr = @core.check_source_files_with_imports("analyzer", ["analyzer.pionstub"], [az_stub], [], true)
   assert_true(az_stub_cr.diagnostics.length() == 0, "analyzer stub should typecheck cleanly")
   let az_imp = @core.imported_pkg_new("analyzer", az_stub_cr.tc)
 
@@ -766,11 +766,11 @@ test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pk
     "pub fn wrap(s : az::Stats) -> az::Stats {\n" +
     "  az::Stats::{ lines: s.lines + 1, words: s.words + az::MAX_N }\n" +
     "}\n"
-  let mid_cr = @core.check_source_files_with_imports("mid", ["mid.m2"], [mid_src], [az_imp], true)
+  let mid_cr = @core.check_source_files_with_imports("mid", ["mid.pion"], [mid_src], [az_imp], true)
   assert_true(mid_cr.diagnostics.length() == 0, "mid full check against az stub should pass")
-  let mid_stub = @core.emit_m2_stub(mid_cr.pkg)
+  let mid_stub = @core.emit_pion_stub(mid_cr.pkg)
   assert_true(str_contains(mid_stub, "import \"analyzer\" as az"), "mid stub preserves import declaration")
-  let mid_stub_cr = @core.check_source_files_with_imports("mid", ["mid.m2stub"], [mid_stub], [az_imp], true)
+  let mid_stub_cr = @core.check_source_files_with_imports("mid", ["mid.pionstub"], [mid_stub], [az_imp], true)
   assert_true(mid_stub_cr.diagnostics.length() == 0, "mid stub should typecheck cleanly against az stub")
   let mid_imp = @core.imported_pkg_new("mid", mid_stub_cr.tc)
 
@@ -781,7 +781,7 @@ test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pk
     "  let s = m::wrap(az::make_stats(3))\n" +
     "  s.lines + s.words\n" +
     "}\n"
-  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_ok], [az_imp, mid_imp], true)
+  let app_cr = @core.check_source_files_with_imports("app", ["app.pion"], [app_ok], [az_imp, mid_imp], true)
   assert_true(app_cr.diagnostics.length() == 0, "app should typecheck cleanly against transitive stubs")
 
   let app_priv =
@@ -789,7 +789,7 @@ test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pk
     "pub fn main() -> Int {\n" +
     "  az::secret_helper(1)\n" +
     "}\n"
-  let priv_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_priv], [az_imp], true)
+  let priv_cr = @core.check_source_files_with_imports("app", ["app.pion"], [app_priv], [az_imp], true)
   assert_true(str_contains(@core.check_result_to_json(priv_cr.diagnostics), "E_PRIVATE_SYMBOL"), "stub must still reject private symbol with E_PRIVATE_SYMBOL")
 
   let app_bad_ty =
@@ -798,24 +798,24 @@ test "p10c: emit_m2_stub preserves imports, pub/private visibility, and cross-pk
     "  let _ = m::wrap(42)\n" +
     "  0\n" +
     "}\n"
-  let bad_ty_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_bad_ty], [az_imp, mid_imp], true)
+  let bad_ty_cr = @core.check_source_files_with_imports("app", ["app.pion"], [app_bad_ty], [az_imp, mid_imp], true)
   assert_true(str_contains(@core.check_result_to_json(bad_ty_cr.diagnostics), "E_TYPE_MISMATCH"), "stub must still reject type mismatch with E_TYPE_MISMATCH")
 }
 
 ///|
 test "p10a: parser never hangs on reserved keyword as struct field or param name" {
   let bad_struct = "struct Bad { val : Int }\n"
-  let cr1 = @core.check_source_files("p10a_bad_struct", ["bs.m2"], [bad_struct])
+  let cr1 = @core.check_source_files("p10a_bad_struct", ["bs.pion"], [bad_struct])
   assert_true(cr1.diagnostics.length() > 0, "reserved keyword field must return parse error")
   assert_true(str_contains(@core.check_result_to_json(cr1.diagnostics), "E_PARSE"), "E_PARSE expected for struct field keyword")
 
   let bad_param = "fn f(val : Int) -> Int { 0 }\n"
-  let cr2 = @core.check_source_files("p10a_bad_param", ["bp.m2"], [bad_param])
+  let cr2 = @core.check_source_files("p10a_bad_param", ["bp.pion"], [bad_param])
   assert_true(cr2.diagnostics.length() > 0, "reserved keyword param must return parse error")
   assert_true(str_contains(@core.check_result_to_json(cr2.diagnostics), "E_PARSE"), "E_PARSE expected for param keyword")
 
   let bad_enum = "enum BadE { val(Int) }\n"
-  let cr3 = @core.check_source_files("p10a_bad_enum", ["be.m2"], [bad_enum])
+  let cr3 = @core.check_source_files("p10a_bad_enum", ["be.pion"], [bad_enum])
   assert_true(cr3.diagnostics.length() > 0, "reserved keyword enum variant must return parse error")
 }
 
@@ -835,9 +835,9 @@ test "p12a: extern C FFI valid and Ptr helpers" {
     "  c_free(p)\n" +
     "  if is_n && a == 0L { n.to_int() + v } else { 0 }\n" +
     "}\n"
-  let cr = @core.check_source_files("p12a_ffi_ok", ["p12a_ffi_ok.m2"], [src])
+  let cr = @core.check_source_files("p12a_ffi_ok", ["p12a_ffi_ok.pion"], [src])
   assert_eq(cr.diagnostics.length(), 0)
-  let sig = @core.cli_emit_sig("p12a_ffi_ok", ["p12a_ffi_ok.m2"], [src])
+  let sig = @core.cli_emit_sig("p12a_ffi_ok", ["p12a_ffi_ok.pion"], [src])
   assert_eq(sig.contains("extern \"C\" fn c_strlen(s: Ptr) -> Int64 = \"strlen\""), true)
 }
 
@@ -847,7 +847,7 @@ test "p12a: extern C rejects non-C-ABI types with fixit" {
     "extern \"C\" fn bad_str(s : String) -> Int\n" +
     "extern \"C\" fn bad_arr(a : Array[Int]) -> Map[String, Int]\n" +
     "pub fn main() -> Int { 0 }\n"
-  let cr = @core.check_source_files("p12a_ffi_bad", ["p12a_ffi_bad.m2"], [src])
+  let cr = @core.check_source_files("p12a_ffi_bad", ["p12a_ffi_bad.pion"], [src])
   assert_eq(cr.diagnostics.length(), 3)
   assert_eq(cr.diagnostics[0].code, "E_TYPE_MISMATCH")
   assert_eq(cr.diagnostics[0].fixit.contains("as_cstr"), true)
@@ -867,7 +867,7 @@ test "p12a: Ptr is !Send across spawn" {
     "  })\n" +
     "  0\n" +
     "}\n"
-  let cr = @core.check_source_files("p12a_ptr_send", ["p12a_ptr_send.m2"], [src])
+  let cr = @core.check_source_files("p12a_ptr_send", ["p12a_ptr_send.pion"], [src])
   assert_eq(cr.diagnostics.length() > 0, true)
   assert_eq(cr.diagnostics[0].code, "E_NOT_SEND")
 }
@@ -907,9 +907,9 @@ test "p12a: trait impl and generic trait bounds ok" {
     "  let s3 = pt.show()\n" +
     "  s1.length() + s2.length() + s3.length()\n" +
     "}\n"
-  let cr = @core.check_source_files("p12a_trait_ok", ["p12a_trait_ok.m2"], [src])
+  let cr = @core.check_source_files("p12a_trait_ok", ["p12a_trait_ok.pion"], [src])
   assert_eq(cr.diagnostics.length(), 0)
-  let sig = @core.cli_emit_sig("p12a_trait_ok", ["p12a_trait_ok.m2"], [src])
+  let sig = @core.cli_emit_sig("p12a_trait_ok", ["p12a_trait_ok.pion"], [src])
   assert_eq(sig.contains("trait Show"), true)
   assert_eq(sig.contains("impl Show for Point"), true)
 }
@@ -921,7 +921,7 @@ test "p12a: trait errors E_UNKNOWN_TRAIT E_TRAIT_METHOD_MISSING E_TRAIT_METHOD_S
     "  fn boo(self : Int) -> Int { self }\n" +
     "}\n" +
     "pub fn main() -> Int { 0 }\n"
-  let cr1 = @core.check_source_files("t1", ["t1.m2"], [src_unknown])
+  let cr1 = @core.check_source_files("t1", ["t1.pion"], [src_unknown])
   assert_eq(cr1.diagnostics.length() > 0, true)
   assert_eq(cr1.diagnostics[0].code, "E_UNKNOWN_TRAIT")
 
@@ -932,7 +932,7 @@ test "p12a: trait errors E_UNKNOWN_TRAIT E_TRAIT_METHOD_MISSING E_TRAIT_METHOD_S
     "impl Show for Int {\n" +
     "}\n" +
     "pub fn main() -> Int { 0 }\n"
-  let cr2 = @core.check_source_files("t2", ["t2.m2"], [src_missing])
+  let cr2 = @core.check_source_files("t2", ["t2.pion"], [src_missing])
   assert_eq(cr2.diagnostics.length() > 0, true)
   assert_eq(cr2.diagnostics[0].code, "E_TRAIT_METHOD_MISSING")
 
@@ -944,7 +944,7 @@ test "p12a: trait errors E_UNKNOWN_TRAIT E_TRAIT_METHOD_MISSING E_TRAIT_METHOD_S
     "  fn show(self : Int) -> Int { self }\n" +
     "}\n" +
     "pub fn main() -> Int { 0 }\n"
-  let cr3 = @core.check_source_files("t3", ["t3.m2"], [src_sig])
+  let cr3 = @core.check_source_files("t3", ["t3.pion"], [src_sig])
   assert_eq(cr3.diagnostics.length() > 0, true)
   assert_eq(cr3.diagnostics[0].code, "E_TRAIT_METHOD_SIGNATURE")
 
@@ -959,7 +959,7 @@ test "p12a: trait errors E_UNKNOWN_TRAIT E_TRAIT_METHOD_MISSING E_TRAIT_METHOD_S
     "  let _ = render(b)\n" +
     "  0\n" +
     "}\n"
-  let cr4 = @core.check_source_files("t4", ["t4.m2"], [src_not_impl])
+  let cr4 = @core.check_source_files("t4", ["t4.pion"], [src_not_impl])
   assert_eq(cr4.diagnostics.length() > 0, true)
   assert_eq(cr4.diagnostics[0].code, "E_TRAIT_NOT_IMPLEMENTED")
   assert_eq(cr4.diagnostics[0].expected, "impl Show for Bare")
@@ -986,7 +986,7 @@ test "p13a: runtime primitives typecheck, World is explicit for TCP/sleep" {
     "  sleep_ms(world, 1)\n" +
     "  a.to_int() + b + n + r.length()\n" +
     "}\n"
-  let ok_cr = @core.check_source_files("p13a_prims", ["p13a_prims.m2"], [ok_src])
+  let ok_cr = @core.check_source_files("p13a_prims", ["p13a_prims.pion"], [ok_src])
   assert_true(ok_cr.diagnostics.length() == 0, "prims ok: " + @core.check_result_to_json(ok_cr.diagnostics))
 
   // World in scope is not enough: TCP primitives take it as their first argument.
@@ -995,7 +995,7 @@ test "p13a: runtime primitives typecheck, World is explicit for TCP/sleep" {
     "  tcp_listen(\"127.0.0.1\", 0)\n" +
     "}\n"
   let no_w_json = @core.check_result_to_json(
-    @core.check_source_files("p13a_now", ["p13a_now.m2"], [no_w]).diagnostics,
+    @core.check_source_files("p13a_now", ["p13a_now.pion"], [no_w]).diagnostics,
   )
   assert_true(str_contains(no_w_json, "E_CAPABILITY_MISSING"), "missing explicit World: " + no_w_json)
 
@@ -1004,7 +1004,7 @@ test "p13a: runtime primitives typecheck, World is explicit for TCP/sleep" {
     "  sleep_ms(5)\n" +
     "}\n"
   let pure_json = @core.check_result_to_json(
-    @core.check_source_files("p13a_pure", ["p13a_pure.m2"], [pure_fn]).diagnostics,
+    @core.check_source_files("p13a_pure", ["p13a_pure.pion"], [pure_fn]).diagnostics,
   )
   assert_true(str_contains(pure_json, "E_CAPABILITY_MISSING"), "sleep_ms without World: " + pure_json)
 
@@ -1014,7 +1014,7 @@ test "p13a: runtime primitives typecheck, World is explicit for TCP/sleep" {
     "  tcp_write(world, 1, 2)\n" +
     "}\n"
   let bad_json = @core.check_result_to_json(
-    @core.check_source_files("p13a_bad", ["p13a_bad.m2"], [bad_ty]).diagnostics,
+    @core.check_source_files("p13a_bad", ["p13a_bad.pion"], [bad_ty]).diagnostics,
   )
   assert_true(str_contains(bad_json, "argument 3 of `tcp_write` expects `String`"), "tcp_write arg type: " + bad_json)
 }
@@ -1037,10 +1037,10 @@ test "p13a: cross-package trait impls are qualified on import" {
     "pub fn encode[T : ToJson](v : T) -> String {\n" +
     "  \"<\" + v.to_json() + \">\"\n" +
     "}\n"
-  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.m2"], [lib_src], [], true)
+  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.pion"], [lib_src], [], true)
   assert_true(lib_cr.diagnostics.length() == 0, "lib check")
   // A package exporting a bounded generic fn has no body-less stub.
-  assert_true(@core.emit_m2_stub(lib_cr.pkg) == "", "bounded pub fn disables the stub")
+  assert_true(@core.emit_pion_stub(lib_cr.pkg) == "", "bounded pub fn disables the stub")
   let lib_imp = @core.imported_pkg_new("lib", lib_cr.tc)
   let app_src =
     "import \"lib\" as l\n" +
@@ -1051,7 +1051,7 @@ test "p13a: cross-package trait impls are qualified on import" {
     "  let c = l::encode(p) + l::encode(5)\n" +
     "  a.length() + b.length() + c.length()\n" +
     "}\n"
-  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_src], [lib_imp], true)
+  let app_cr = @core.check_source_files_with_imports("app", ["app.pion"], [app_src], [lib_imp], true)
   assert_true(
     app_cr.diagnostics.length() == 0,
     "app check: " + @core.check_result_to_json(app_cr.diagnostics),
@@ -1071,29 +1071,29 @@ test "p13a: cross-package trait impls are qualified on import" {
     "  l::encode(true).length()\n" +
     "}\n"
   let bad_json = @core.check_result_to_json(
-    @core.check_source_files_with_imports("app", ["app.m2"], [bad_src], [lib_imp], true).diagnostics,
+    @core.check_source_files_with_imports("app", ["app.pion"], [bad_src], [lib_imp], true).diagnostics,
   )
   assert_true(str_contains(bad_json, "E_TRAIT_NOT_IMPLEMENTED"), "Bool has no ToJson impl: " + bad_json)
 }
 
 ///|
-test "p13a: m2.toml [link] libs and doc json" {
+test "p13a: pion.toml [link] libs and doc json" {
   let toml =
     "[package]\n" +
     "name = \"db\"\n" +
     "[link]\n" +
     "libs = [\"sqlite3\", \"z\", \"sqlite3\"]\n" +
     "lib = \"m\"\n"
-  match @core.parse_m2_toml(toml) {
+  match @core.parse_pion_toml(toml) {
     Ok(m) => {
       assert_true(m.link_libs.length() == 3, "3 unique libs")
       assert_true(m.link_libs[0] == "sqlite3" && m.link_libs[1] == "z" && m.link_libs[2] == "m", "lib order")
     }
-    Err(e) => abort("parse_m2_toml failed: " + e)
+    Err(e) => abort("parse_pion_toml failed: " + e)
   }
-  match @core.parse_m2_toml("[package]\nname = \"x\"\n[link]\nlibs = [sqlite3]\n") {
+  match @core.parse_pion_toml("[package]\nname = \"x\"\n[link]\nlibs = [sqlite3]\n") {
     Ok(_) => abort("unquoted lib must fail")
-    Err(e) => assert_true(str_contains(e, "m2.toml line 4"), "error line: " + e)
+    Err(e) => assert_true(str_contains(e, "pion.toml line 4"), "error line: " + e)
   }
   let src =
     "pub struct P {\n  pub x : Int\n}\n" +
@@ -1102,7 +1102,7 @@ test "p13a: m2.toml [link] libs and doc json" {
     "pub let K : Int = 1\n" +
     "fn hidden() -> Int { 0 }\n" +
     "pub fn get(p : P) -> Int { p.x }\n"
-  let pkg = @core.parse_package("docpkg", ["d.m2"], [src])
+  let pkg = @core.parse_package("docpkg", ["d.pion"], [src])
   let j = @core.doc_packages_json([pkg])
   assert_true(str_contains(j, "{\"packages\":[{\"name\":\"docpkg\",\"items\":["), "doc json head: " + j)
   assert_true(str_contains(j, "\"kind\":\"struct\",\"name\":\"P\""), "struct item")
@@ -1225,7 +1225,7 @@ test "p13b: imported bounded generic fn resolves its own package's names" {
     "pub fn render[T : Show](v : T) -> String {\n" +
     "  unwrap(W(wrap(v.show())))\n" +
     "}\n"
-  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.m2"], [lib_src], [], true)
+  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.pion"], [lib_src], [], true)
   assert_true(lib_cr.diagnostics.length() == 0, "lib check")
   let lib_imp = @core.imported_pkg_new("lib", lib_cr.tc)
   let app_src =
@@ -1242,7 +1242,7 @@ test "p13b: imported bounded generic fn resolves its own package's names" {
     "pub fn main() -> Int {\n" +
     "  (l::render(P::{ x: 1 }) + l::render(2) + wrap(\"\")).length()\n" +
     "}\n"
-  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_src], [lib_imp], true)
+  let app_cr = @core.check_source_files_with_imports("app", ["app.pion"], [app_src], [lib_imp], true)
   assert_true(
     app_cr.diagnostics.length() == 0,
     "app check: " + @core.check_result_to_json(app_cr.diagnostics),
@@ -1250,8 +1250,8 @@ test "p13b: imported bounded generic fn resolves its own package's names" {
   let ssa = @core.emit_qbe_package_multi(app_cr.pkg, app_cr.tc, false, true, ["lib"]).ssa
   // The monomorphized `render` bodies call lib's `wrap` / `unwrap`, never app's `wrap`.
   assert_true(ssa.contains("render__mono"), "render instantiated in app")
-  assert_true(ssa.contains("$m2_pkg_lib_fn_wrap("), "lib::wrap called from the mono body:\n" + ssa)
-  assert_true(ssa.contains("$m2_pkg_lib_fn_unwrap("), "lib::unwrap called from the mono body")
+  assert_true(ssa.contains("$pion_pkg_lib_fn_wrap("), "lib::wrap called from the mono body:\n" + ssa)
+  assert_true(ssa.contains("$pion_pkg_lib_fn_unwrap("), "lib::unwrap called from the mono body")
 }
 
 ///|

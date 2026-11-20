@@ -5,7 +5,7 @@ export PATH="$HOME/.moon/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPILER_DIR="$ROOT_DIR/compiler"
-M2C0="$COMPILER_DIR/_build/native/debug/build/compat_moon/compat_moon.exe"
+PIONC0="$COMPILER_DIR/_build/native/debug/build/compat_moon/compat_moon.exe"
 
 now_ms() {
   python3 -c 'import time; print(int(time.time()*1000))'
@@ -14,26 +14,26 @@ now_ms() {
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-export M2_QBE="$ROOT_DIR/out/qbe"
-export M2_RT_LIB="$ROOT_DIR/out/libm2rt.a"
-export M2_CACHE_DIR="$TMP_DIR/cas"
+export PION_QBE="$ROOT_DIR/out/qbe"
+export PION_RT_LIB="$ROOT_DIR/out/libpionrt.a"
+export PION_CACHE_DIR="$TMP_DIR/cas"
 
 echo "=== [1/8] Build QBE + Runtime (TSan/ASan/bench) ==="
-sh "$ROOT_DIR/scripts/build-qbe.sh" "$M2_QBE"
+sh "$ROOT_DIR/scripts/build-qbe.sh" "$PION_QBE"
 sh "$ROOT_DIR/scripts/test-runtime.sh"
 
-echo "=== [2/8] Frontend + Self-eat Check (moon check / moon test / m2c0 check compiler/src/core) ==="
+echo "=== [2/8] Frontend + Self-eat Check (moon check / moon test / pionc0 check compiler/src/core) ==="
 sh "$ROOT_DIR/scripts/test-frontend.sh"
 
-echo "=== [3/8] E2E hello.m2 (output + binary size < 80 KB) ==="
+echo "=== [3/8] E2E hello.pion (output + binary size < 80 KB) ==="
 T0=$(now_ms)
-"$M2C0" build -o "$TMP_DIR/hello" "$ROOT_DIR/tests/e2e/hello.m2"
+"$PIONC0" build -o "$TMP_DIR/hello" "$ROOT_DIR/tests/e2e/hello.pion"
 T1=$(now_ms)
 HELLO_SIZE=$(wc -c < "$TMP_DIR/hello" | tr -d ' ')
 HELLO_OUT=$("$TMP_DIR/hello")
-echo "hello.m2: cold build=$((T1 - T0)) ms, binary=${HELLO_SIZE} bytes, output='${HELLO_OUT}'"
-if [ "$HELLO_OUT" != "hello m2" ]; then
-  echo "FAIL: hello.m2 output mismatch: '$HELLO_OUT'" >&2
+echo "hello.pion: cold build=$((T1 - T0)) ms, binary=${HELLO_SIZE} bytes, output='${HELLO_OUT}'"
+if [ "$HELLO_OUT" != "hello pion" ]; then
+  echo "FAIL: hello.pion output mismatch: '$HELLO_OUT'" >&2
   exit 1
 fi
 if [ "$HELLO_SIZE" -ge 81920 ]; then
@@ -41,25 +41,25 @@ if [ "$HELLO_SIZE" -ge 81920 ]; then
   exit 1
 fi
 
-echo "=== [4/8] E2E adt_generics.m2 (ADT, mut struct, generics, containers, closures, i32 wrap) ==="
-"$M2C0" build -o "$TMP_DIR/adt_generics" "$ROOT_DIR/tests/e2e/adt_generics.m2"
+echo "=== [4/8] E2E adt_generics.pion (ADT, mut struct, generics, containers, closures, i32 wrap) ==="
+"$PIONC0" build -o "$TMP_DIR/adt_generics" "$ROOT_DIR/tests/e2e/adt_generics.pion"
 ADT_OUT=$("$TMP_DIR/adt_generics")
 echo "$ADT_OUT"
-ADT_EXP=$(printf 'ast=49\nbox=boxed:42\narr=28,len=3,cplen=5\nmap=100,has_beta=false,cp_beta=200,len=2\nsb=m2-ok\nclo=43\ni32wrap=true')
+ADT_EXP=$(printf 'ast=49\nbox=boxed:42\narr=28,len=3,cplen=5\nmap=100,has_beta=false,cp_beta=200,len=2\nsb=pion-ok\nclo=43\ni32wrap=true')
 if [ "$ADT_OUT" != "$ADT_EXP" ]; then
-  echo "FAIL: adt_generics.m2 output mismatch! Expected:" >&2
+  echo "FAIL: adt_generics.pion output mismatch! Expected:" >&2
   echo "$ADT_EXP" >&2
   exit 1
 fi
 
-echo "=== [5/8] E2E multicore_bench.m2 (scope + 4x spawn + Channel + Mutex + AtomicInt > 3.0x) ==="
-"$M2C0" build -o "$TMP_DIR/multicore_bench" "$ROOT_DIR/tests/e2e/multicore_bench.m2"
+echo "=== [5/8] E2E multicore_bench.pion (scope + 4x spawn + Channel + Mutex + AtomicInt > 3.0x) ==="
+"$PIONC0" build -o "$TMP_DIR/multicore_bench" "$ROOT_DIR/tests/e2e/multicore_bench.pion"
 "$TMP_DIR/multicore_bench"
 
-echo "=== [6/8] E2E contracts.m2 (dev debug_assert aborts, --release strips to 0 bytes) ==="
-"$M2C0" build --emit-ssa "$TMP_DIR/contracts_dev.ssa" -o "$TMP_DIR/contracts_dev" "$ROOT_DIR/tests/e2e/contracts.m2"
-if ! grep -q "m2_debug_assert" "$TMP_DIR/contracts_dev.ssa"; then
-  echo "FAIL: dev build missing m2_debug_assert" >&2
+echo "=== [6/8] E2E contracts.pion (dev debug_assert aborts, --release strips to 0 bytes) ==="
+"$PIONC0" build --emit-ssa "$TMP_DIR/contracts_dev.ssa" -o "$TMP_DIR/contracts_dev" "$ROOT_DIR/tests/e2e/contracts.pion"
+if ! grep -q "pion_debug_assert" "$TMP_DIR/contracts_dev.ssa"; then
+  echo "FAIL: dev build missing pion_debug_assert" >&2
   exit 1
 fi
 set +e
@@ -72,9 +72,9 @@ if [ "$DEV_RC" -eq 0 ]; then
   exit 1
 fi
 
-"$M2C0" build --release --emit-ssa "$TMP_DIR/contracts_rel.ssa" -o "$TMP_DIR/contracts_rel" "$ROOT_DIR/tests/e2e/contracts.m2"
-if grep -q "m2_debug_assert" "$TMP_DIR/contracts_rel.ssa"; then
-  echo "FAIL: --release SSA still contains m2_debug_assert!" >&2
+"$PIONC0" build --release --emit-ssa "$TMP_DIR/contracts_rel.ssa" -o "$TMP_DIR/contracts_rel" "$ROOT_DIR/tests/e2e/contracts.pion"
+if grep -q "pion_debug_assert" "$TMP_DIR/contracts_rel.ssa"; then
+  echo "FAIL: --release SSA still contains pion_debug_assert!" >&2
   exit 1
 fi
 REL_OUT=$("$TMP_DIR/contracts_rel")
@@ -87,7 +87,7 @@ fi
 echo "=== [7/8] CAS Cache + Zero target/ + Incremental Speed + LRU Eviction ==="
 SRC_DIR="$TMP_DIR/pkg_cas"
 mkdir -p "$SRC_DIR"
-cat > "$SRC_DIR/main.m2" <<'EOF'
+cat > "$SRC_DIR/main.pion" <<'EOF'
 pub fn compute(x : Int) -> Int {
   x * 2 + 1
 }
@@ -99,19 +99,19 @@ EOF
 
 BEFORE_FILES=$(ls -A "$SRC_DIR" | tr '\n' ' ')
 TC0=$(now_ms)
-"$M2C0" build "$SRC_DIR"
+"$PIONC0" build "$SRC_DIR"
 TC1=$(now_ms)
 COLD_MS=$((TC1 - TC0))
 
 TH0=$(now_ms)
-"$M2C0" build "$SRC_DIR"
+"$PIONC0" build "$SRC_DIR"
 TH1=$(now_ms)
 HOT_MS=$((TH1 - TH0))
 
-SIG1=$("$M2C0" emit-sig "$SRC_DIR")
+SIG1=$("$PIONC0" emit-sig "$SRC_DIR")
 
 # Edit function body without changing pub signature
-cat > "$SRC_DIR/main.m2" <<'EOF'
+cat > "$SRC_DIR/main.pion" <<'EOF'
 pub fn compute(x : Int) -> Int {
   x * 3 - 19
 }
@@ -121,14 +121,14 @@ pub fn main(world : World) -> Int {
 }
 EOF
 
-SIG2=$("$M2C0" emit-sig "$SRC_DIR")
+SIG2=$("$PIONC0" emit-sig "$SRC_DIR")
 if [ "$SIG1" != "$SIG2" ]; then
-  echo "FAIL: .m2sig changed on body-only edit!" >&2
+  echo "FAIL: .pionsig changed on body-only edit!" >&2
   exit 1
 fi
 
 TI0=$(now_ms)
-"$M2C0" build "$SRC_DIR"
+"$PIONC0" build "$SRC_DIR"
 TI1=$(now_ms)
 INCR_MS=$((TI1 - TI0))
 
@@ -140,20 +140,20 @@ if [ "$BEFORE_FILES" != "$AFTER_FILES" ]; then
   exit 1
 fi
 
-# Verify m2c0 run works cleanly too
-RUN_OUT=$("$M2C0" run "$SRC_DIR")
+# Verify pionc0 run works cleanly too
+RUN_OUT=$("$PIONC0" run "$SRC_DIR")
 if [ "$RUN_OUT" != "41" ]; then
-  echo "FAIL: m2c0 run output mismatch: '$RUN_OUT'" >&2
+  echo "FAIL: pionc0 run output mismatch: '$RUN_OUT'" >&2
   exit 1
 fi
 
-# Test LRU eviction under tiny M2_CACHE_MAX_KB quota (4 KB)
+# Test LRU eviction under tiny PION_CACHE_MAX_KB quota (4 KB)
 LRU_CAS="$TMP_DIR/cas_lru"
 mkdir -p "$LRU_CAS"
 for k in 1 2 3 4 5; do
-  F="$TMP_DIR/lru_${k}.m2"
+  F="$TMP_DIR/lru_${k}.pion"
   printf 'pub fn main(world : World) -> Int {\n  io_println(world, "item-%s")\n  0\n}\n' "$k" > "$F"
-  M2_CACHE_DIR="$LRU_CAS" M2_CACHE_MAX_KB=4 "$M2C0" build "$F"
+  PION_CACHE_DIR="$LRU_CAS" PION_CACHE_MAX_KB=4 "$PIONC0" build "$F"
 done
 INDEX_LINES=$(wc -l < "$LRU_CAS/index.tsv" | tr -d ' ')
 OBJ_FILES=$(ls "$LRU_CAS/obj" | wc -l | tr -d ' ')
@@ -164,15 +164,15 @@ if [ "$INDEX_LINES" -ge 5 ] || [ "$OBJ_FILES" -ge 5 ]; then
 fi
 
 echo "=== [8/8] D4 Pre-check: Lower entire compiler/src/core -> QBE IL -> arm64_apple asm ==="
-CORE_SSA="/tmp/m2_core_preview.ssa"
+CORE_SSA="/tmp/pion_core_preview.ssa"
 T_CORE0=$(now_ms)
-"$M2C0" build --emit-ssa "$CORE_SSA" "$COMPILER_DIR/src/core"
+"$PIONC0" build --emit-ssa "$CORE_SSA" "$COMPILER_DIR/src/core"
 T_CORE1=$(now_ms)
 CORE_LINES=$(wc -l < "$CORE_SSA" | tr -d ' ')
 CORE_BYTES=$(wc -c < "$CORE_SSA" | tr -d ' ')
-"$M2_QBE" -t arm64_apple -o "$TMP_DIR/m2_core_preview.s" "$CORE_SSA"
-as -o "$TMP_DIR/m2_core_preview.o" "$TMP_DIR/m2_core_preview.s"
-CORE_OBJ_BYTES=$(wc -c < "$TMP_DIR/m2_core_preview.o" | tr -d ' ')
+"$PION_QBE" -t arm64_apple -o "$TMP_DIR/pion_core_preview.s" "$CORE_SSA"
+as -o "$TMP_DIR/pion_core_preview.o" "$TMP_DIR/pion_core_preview.s"
+CORE_OBJ_BYTES=$(wc -c < "$TMP_DIR/pion_core_preview.o" | tr -d ' ')
 echo "D4 pre-check PASS: compiler/src/core -> ${CORE_LINES} lines (${CORE_BYTES} bytes) QBE IL -> ${CORE_OBJ_BYTES} bytes arm64 .o in $((T_CORE1 - T_CORE0)) ms"
 
 echo "ALL 8 BACKEND GATES PASSED!"

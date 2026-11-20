@@ -1,6 +1,6 @@
 /*
  * Deterministic 50,000-LOC / 50-package 4-layer diamond-dependency project generator
- * for C, MoonBit, Zig, Rust, Go, and m2 V2 compile-speed & multi-worktree benchmarks.
+ * for C, MoonBit, Zig, Rust, Go, and Pion V2 compile-speed & multi-worktree benchmarks.
  *
  * Architecture (50 library packages + 1 app entry package ≈ 50,000 LOC):
  *   Layer 0: core00..core04 (5 pkgs)  - no deps; defines Packet, Op, generic wrap_tag
@@ -158,7 +158,7 @@ static void emit_c_header(const char *dir, int id, const MutConfig *cfg) {
     char path[1024];
     snprintf(path, sizeof(path), "%s/%s.h", dir, p->name);
     FILE *h = must_open(path);
-    fprintf(h, "#ifndef M2BENCH_%s_H\n#define M2BENCH_%s_H\n\n", p->name, p->name);
+    fprintf(h, "#ifndef PION_BENCH_%s_H\n#define PION_BENCH_%s_H\n\n", p->name, p->name);
     fprintf(h, "typedef struct { int a; int b; int tag; } %s_%s;\n", p->name, p->struct_name);
     fprintf(h, "typedef struct { int kind; int x; int y; } %s_%s;\n\n", p->name, p->enum_name);
     if (p->layer == LAYER_CORE) {
@@ -920,9 +920,9 @@ static void gen_go_all(const char *root, const MutConfig *cfg) {
 }
 
 /* =========================================================================
- * 6. m2 Generator (51 real m2.toml packages + import "pkg" as alias)
+ * 6. Pion Generator (51 real pion.toml packages + import "pkg" as alias)
  * ========================================================================= */
-static void emit_m2_pkg(const char *dir, int id, const MutConfig *cfg, int write_manifest) {
+static void emit_pion_pkg(const char *dir, int id, const MutConfig *cfg, int write_manifest) {
     const PkgInfo *p = &g_pkgs[id];
     char pdir[1024], sdir[1024], path[1024];
     snprintf(pdir, sizeof(pdir), "%s/%s", dir, p->name);
@@ -930,7 +930,7 @@ static void emit_m2_pkg(const char *dir, int id, const MutConfig *cfg, int write
     mkdir_p(sdir);
 
     if (write_manifest) {
-        snprintf(path, sizeof(path), "%s/m2.toml", pdir);
+        snprintf(path, sizeof(path), "%s/pion.toml", pdir);
         FILE *mf = must_open(path);
         fprintf(mf, "[package]\nname = \"%s\"\nversion = \"0.1.0\"\n", p->name);
         if (p->num_deps > 0) {
@@ -943,7 +943,7 @@ static void emit_m2_pkg(const char *dir, int id, const MutConfig *cfg, int write
         fclose(mf);
     }
 
-    snprintf(path, sizeof(path), "%s/%s.m2", sdir, p->name);
+    snprintf(path, sizeof(path), "%s/%s.pion", sdir, p->name);
     FILE *f = must_open(path);
     for (int d = 0; d < p->num_deps; d++) {
         const PkgInfo *dp = &g_pkgs[p->deps[d]];
@@ -1041,20 +1041,20 @@ static void emit_m2_pkg(const char *dir, int id, const MutConfig *cfg, int write
     fclose(f);
 }
 
-static void gen_m2_all(const char *root, const MutConfig *cfg) {
+static void gen_pion_all(const char *root, const MutConfig *cfg) {
     char dir[1024], adir[1024], sdir[1024], path[1024];
-    snprintf(dir, sizeof(dir), "%s/m2", root);
+    snprintf(dir, sizeof(dir), "%s/pion", root);
     mkdir_p(dir);
 
     for (int id = 0; id < NUM_PKGS; id++) {
-        emit_m2_pkg(dir, id, cfg, 1);
+        emit_pion_pkg(dir, id, cfg, 1);
     }
 
     snprintf(adir, sizeof(adir), "%s/app", dir);
     snprintf(sdir, sizeof(sdir), "%s/src", adir);
     mkdir_p(sdir);
 
-    snprintf(path, sizeof(path), "%s/m2.toml", adir);
+    snprintf(path, sizeof(path), "%s/pion.toml", adir);
     FILE *mf = must_open(path);
     fprintf(mf, "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n[dependencies]\n");
     for (int i = 0; i < NUM_LEAF; i++) {
@@ -1062,7 +1062,7 @@ static void gen_m2_all(const char *root, const MutConfig *cfg) {
     }
     fclose(mf);
 
-    snprintf(path, sizeof(path), "%s/main.m2", sdir);
+    snprintf(path, sizeof(path), "%s/main.pion", sdir);
     FILE *am = must_open(path);
     for (int i = 0; i < NUM_LEAF; i++) {
         fprintf(am, "import \"leaf%02d\" as leaf%02d\n", i, i);
@@ -1086,7 +1086,7 @@ static void gen_all_langs(const char *root, const MutConfig *cfg) {
     gen_zig_all(root, cfg);
     gen_rust_all(root, cfg);
     gen_go_all(root, cfg);
-    gen_m2_all(root, cfg);
+    gen_pion_all(root, cfg);
 }
 
 static void rewrite_pkg_source_all_langs(const char *root, int id, const MutConfig *cfg, int rewrite_c_header) {
@@ -1107,8 +1107,8 @@ static void rewrite_pkg_source_all_langs(const char *root, int id, const MutConf
     snprintf(dir, sizeof(dir), "%s/go", root);
     emit_go_pkg(dir, id, cfg);
 
-    snprintf(dir, sizeof(dir), "%s/m2", root);
-    emit_m2_pkg(dir, id, cfg, 0);
+    snprintf(dir, sizeof(dir), "%s/pion", root);
+    emit_pion_pkg(dir, id, cfg, 0);
 }
 
 int main(int argc, char **argv) {

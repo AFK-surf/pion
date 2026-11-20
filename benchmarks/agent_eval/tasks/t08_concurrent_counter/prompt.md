@@ -7,7 +7,7 @@ and latency `(1000p + j) % 97`.
 - Shared aggregate: per-level counters + latency sum behind **one mutex** (each event: lock, update, unlock);
   plus a lock-free **atomic** event counter incremented per event.
 - Join all producers (structured concurrency), then compare against a sequential computation.
-- m2: `Mutex[Stats]` over an immutable `val struct` (`lock` / `set` / `unlock`) + `AtomicInt`, threads via `scope`/`spawn`;
+- Pion: `Mutex[Stats]` over an immutable `val struct` (`lock` / `set` / `unlock`) + `AtomicInt`, threads via `scope`/`spawn`;
   Rust: `Mutex<Stats>` + `AtomicU64` in `thread::scope`; Go: `sync.Mutex` + `atomic.Int64` + `WaitGroup`.
   **MoonBit has no shared-memory threads**: its version runs the four producers one after another (no locks
   needed) and is recorded as a single-threaded baseline.

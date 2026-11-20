@@ -1,4 +1,4 @@
-///| Pure m2 ∩ MoonBit `m2.toml` manifest parser & package dependency graph
+///| Pure Pion ∩ MoonBit `pion.toml` manifest parser & package dependency graph
 
 ///|
 pub struct ManifestDep {
@@ -250,7 +250,7 @@ pub fn push_unique_lib(libs : Array[String], lib : String) -> Unit {
 }
 
 ///|
-pub fn parse_m2_toml(text : String) -> Result[PackageManifest, String] {
+pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
   let lines = split_lines(text)
   let mut section = ""
   let mut pkg_name = ""
@@ -273,7 +273,7 @@ pub fn parse_m2_toml(text : String) -> Result[PackageManifest, String] {
     let eq = toml_find_char(clean, 61, 0)
     if eq <= 0 {
       return Err(
-        "m2.toml line " + (i + 1).to_string() + ": expected `key = value`",
+        "pion.toml line " + (i + 1).to_string() + ": expected `key = value`",
       )
     }
     let key = toml_trim(slice_str(clean, 0, eq))
@@ -282,18 +282,18 @@ pub fn parse_m2_toml(text : String) -> Result[PackageManifest, String] {
       if key == "name" {
         match toml_unquote(raw_val) {
           Ok(v) => pkg_name = v
-          Err(e) => return Err("m2.toml line " + (i + 1).to_string() + ": " + e)
+          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
         }
       } else if key == "version" {
         match toml_unquote(raw_val) {
           Ok(v) => version = v
-          Err(e) => return Err("m2.toml line " + (i + 1).to_string() + ": " + e)
+          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
         }
       }
     } else if section == "dependencies" {
       match toml_parse_dep_path(raw_val) {
         Ok(p) => deps.push(ManifestDep::{ name: key, path: p })
-        Err(e) => return Err("m2.toml line " + (i + 1).to_string() + ": " + e)
+        Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
       }
     } else if section == "link" {
       if key == "libs" || key == "lib" {
@@ -305,14 +305,14 @@ pub fn parse_m2_toml(text : String) -> Result[PackageManifest, String] {
               vi = vi + 1
             }
           }
-          Err(e) => return Err("m2.toml line " + (i + 1).to_string() + ": " + e)
+          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
         }
       }
     }
     i = i + 1
   }
   if pkg_name.length() == 0 {
-    return Err("m2.toml: missing `[package]` `name = \"...\"`")
+    return Err("pion.toml: missing `[package]` `name = \"...\"`")
   }
   Ok(PackageManifest::{
     name: pkg_name,
@@ -343,12 +343,12 @@ fn topo_dfs(
       None =>
         diags.push(
           diag_new(
-            span_new(names[idx] + "/m2.toml", 1, 1),
+            span_new(names[idx] + "/pion.toml", 1, 1),
             "E_UNKNOWN_PACKAGE",
             "unknown dependency package `" + dep_name + "` required by `" + names[idx] + "`",
             "defined package in [dependencies]",
             dep_name,
-            "add `" + dep_name + " = { path = \"...\" }` to `m2.toml`",
+            "add `" + dep_name + " = { path = \"...\" }` to `pion.toml`",
           ),
         )
       Some(didx) =>
@@ -370,7 +370,7 @@ fn topo_dfs(
           let cycle_str = sb.to_string()
           diags.push(
             diag_new(
-              span_new(names[idx] + "/m2.toml", 1, 1),
+              span_new(names[idx] + "/pion.toml", 1, 1),
               "E_IMPORT_CYCLE",
               "cyclic package dependency detected: " + cycle_str,
               "acyclic package dependency graph",

@@ -1,0 +1,3244 @@
+///| Pure Pion native compiler driver (zero MoonBit runtime dependency)
+
+///|
+struct DrvLoaded {
+  pkg_name : String
+  paths : Array[String]
+  sources : Array[String]
+}
+
+///|
+struct AppleTools {
+  ok : Bool
+  clang_bin : String
+  ld_bin : String
+  sdk_path : String
+  macos_ver : String
+}
+
+///|
+fn drv_starts_with(s : String, pre : String) -> Bool {
+  let sl = s.length()
+  let pl = pre.length()
+  if sl < pl {
+    return false
+  }
+  let mut i = 0
+  while i < pl {
+    if str_code_at(s, i) != str_code_at(pre, i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn drv_find_substr(s : String, needle : String, start : Int) -> Int {
+  let sl = s.length()
+  let nl = needle.length()
+  if nl == 0 || start + nl > sl {
+    return -1
+  }
+  let mut i = start
+  while i + nl <= sl {
+    let mut j = 0
+    let mut ok = true
+    while j < nl {
+      if str_code_at(s, i + j) != str_code_at(needle, j) {
+        ok = false
+        break
+      }
+      j = j + 1
+    }
+    if ok {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn drv_parse_macos_ver_from_plist(plist : String) -> String {
+  let kpos = drv_find_substr(plist, "<key>ProductVersion</key>", 0)
+  if kpos < 0 {
+    return "15.0"
+  }
+  let spos = drv_find_substr(plist, "<string>", kpos + 25)
+  if spos < 0 {
+    return "15.0"
+  }
+  let vstart = spos + 8
+  let vend = drv_find_substr(plist, "</string>", vstart)
+  if vend <= vstart {
+    return "15.0"
+  }
+  let sb = StringBuilder()
+  let mut dots = 0
+  let mut i = vstart
+  while i < vend {
+    let c = str_code_at(plist, i)
+    if c == 46 {
+      dots = dots + 1
+      if dots >= 2 {
+        break
+      }
+      sb.write_char('.')
+    } else if c >= 48 && c <= 57 {
+      sb.write_char(c.unsafe_to_char())
+    } else {
+      break
+    }
+    i = i + 1
+  }
+  let v = sb.to_string()
+  if v.length() == 0 {
+    "15.0"
+  } else if dots == 0 {
+    v + ".0"
+  } else {
+    v
+  }
+}
+
+///|
+/// Pure filesystem probe (0 subprocesses, <0.2ms) for real clang (-cc1as), ld, and MacOSX.sdk
+/// on macOS arm64_apple when CC is not overridden.
+fn drv_probe_apple_tools(world : World, qbe_target : String) -> AppleTools {
+  let empty = AppleTools::{
+    ok: false,
+    clang_bin: "",
+    ld_bin: "",
+    sdk_path: "",
+    macos_ver: "",
+  }
+  if qbe_target != "arm64_apple" {
+    return empty
+  }
+  if drv_env_str(world, "CC").length() > 0 {
+    return empty
+  }
+  let mut clang_bin = ""
+  let mut ld_bin = ""
+  let mut sdk_path = ""
+
+  let clt_c = "/Library/Developer/CommandLineTools/usr/bin/clang"
+  let clt_l = "/Library/Developer/CommandLineTools/usr/bin/ld"
+  let clt_s = "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk"
+  if fs_exists(world, clt_c) && fs_exists(world, clt_l) && fs_exists(world, clt_s) {
+    clang_bin = clt_c
+    ld_bin = clt_l
+    sdk_path = clt_s
+  } else if fs_is_dir(world, "/Applications") {
+    let apps = fs_list_dir(world, "/Applications")
+    let mut i = 0
+    while i < apps.length() {
+      let name = apps[i]
+      if drv_starts_with(name, "Xcode") && drv_ends_with(name, ".app") {
+        let dev = "/Applications/" + name + "/Contents/Developer"
+        let xc_c = dev + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/clang"
+        let xc_l = dev + "/Toolchains/XcodeDefault.xctoolchain/usr/bin/ld"
+        let xc_s = dev + "/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+        if fs_exists(world, xc_c) && fs_exists(world, xc_l) && fs_exists(world, xc_s) {
+          clang_bin = xc_c
+          ld_bin = xc_l
+          sdk_path = xc_s
+          break
+        }
+      }
+      i = i + 1
+    }
+  }
+  if clang_bin == "" {
+    return empty
+  }
+  let macos_ver = match fs_read(world, "/System/Library/CoreServices/SystemVersion.plist") {
+    Ok(txt) => drv_parse_macos_ver_from_plist(txt)
+    Err(_) => "15.0"
+  }
+  AppleTools::{
+    ok: true,
+    clang_bin: clang_bin,
+    ld_bin: ld_bin,
+    sdk_path: sdk_path,
+    macos_ver: macos_ver,
+  }
+}
+
+///|
+fn drv_ends_with(s : String, suf : String) -> Bool {
+  let sl = s.length()
+  let sufl = suf.length()
+  if sl < sufl {
+    return false
+  }
+  let off = sl - sufl
+  let mut i = 0
+  while i < sufl {
+    if str_code_at(s, off + i) != str_code_at(suf, i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn drv_is_source_file(name : String) -> Bool {
+  if name.length() == 0 {
+    return false
+  }
+  if str_code_at(name, 0) == 46 {
+    return false
+  }
+  let is_src = drv_ends_with(name, ".pion") || drv_ends_with(name, ".mbt")
+  let is_test = drv_ends_with(name, "_test.pion") || drv_ends_with(name, "_test.mbt")
+  is_src && !is_test
+}
+
+///|
+fn drv_is_test_source_file(name : String) -> Bool {
+  name.length() > 0 &&
+  str_code_at(name, 0) != 46 &&
+  (drv_ends_with(name, "_test.pion") || drv_ends_with(name, "_test.mbt"))
+}
+
+///|
+/// Appends the package's `*_test.pion` files (in `dir` and `dir/src`), which only
+/// `pionc test` compiles.
+fn drv_append_test_sources(
+  world : World,
+  dir : String,
+  paths : Array[String],
+  sources : Array[String],
+) -> Result[Unit, String] {
+  let dirs : Array[String] = [dir]
+  let src_dir = drv_join_path(dir, "src")
+  if fs_is_dir(world, src_dir) {
+    dirs.push(src_dir)
+  }
+  let mut di = 0
+  while di < dirs.length() {
+    let entries = fs_list_dir(world, dirs[di])
+    let mut i = 0
+    while i < entries.length() {
+      if drv_is_test_source_file(entries[i]) {
+        let fpath = drv_join_path(dirs[di], entries[i])
+        match fs_read(world, fpath) {
+          Err(msg) => return Err("failed to read " + fpath + ": " + msg)
+          Ok(content) => {
+            paths.push(fpath)
+            sources.push(content)
+          }
+        }
+      }
+      i = i + 1
+    }
+    di = di + 1
+  }
+  Ok(())
+}
+
+///|
+fn drv_join_path(dir : String, name : String) -> String {
+  if dir.length() == 0 {
+    return name
+  }
+  if str_code_at(dir, dir.length() - 1) == 47 {
+    dir + name
+  } else {
+    dir + "/" + name
+  }
+}
+
+///|
+fn drv_parent_dir(path : String) -> String {
+  let mut idx = path.length() - 1
+  while idx >= 0 && str_code_at(path, idx) != 47 {
+    idx = idx - 1
+  }
+  if idx <= 0 {
+    return ""
+  }
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < idx {
+    sb.write_char(str_code_at(path, i).unsafe_to_char())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn drv_ensure_parent_dir(world : World, path : String) -> Unit {
+  let dir = drv_parent_dir(path)
+  if dir.length() > 0 {
+    let _ = fs_mkdir_p(world, dir)
+  }
+}
+
+///|
+fn drv_basename_pkg(path : String) -> String {
+  let mut end = path.length()
+  while end > 1 && str_code_at(path, end - 1) == 47 {
+    end = end - 1
+  }
+  let mut start = end - 1
+  while start >= 0 && str_code_at(path, start) != 47 {
+    start = start - 1
+  }
+  let sb = StringBuilder()
+  let mut i = start + 1
+  while i < end {
+    let ch = str_code_at(path, i)
+    if ch == 46 {
+      break
+    }
+    sb.write_char(ch.unsafe_to_char())
+    i = i + 1
+  }
+  let name = sb.to_string()
+  if name.length() == 0 {
+    "main"
+  } else {
+    name
+  }
+}
+
+///|
+fn drv_prefix16(s : String) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < 16 && i < s.length() {
+    sb.write_char(str_code_at(s, i).unsafe_to_char())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn drv_parse_pos_int64(s : String, fallback : Int64) -> Int64 {
+  if s.length() == 0 {
+    return fallback
+  }
+  let mut acc = 0L
+  let mut i = 0
+  while i < s.length() {
+    let c = str_code_at(s, i)
+    if c >= 48 && c <= 57 {
+      acc = acc * 10L + (c - 48).to_int64()
+    } else {
+      return fallback
+    }
+    i = i + 1
+  }
+  if acc > 0L {
+    acc
+  } else {
+    fallback
+  }
+}
+
+///|
+fn drv_parse_pos_int(s : String, fallback : Int) -> Int {
+  let v = drv_parse_pos_int64(s, fallback.to_int64()).to_int()
+  if v > 0 {
+    v
+  } else {
+    fallback
+  }
+}
+
+///|
+fn drv_env_str(world : World, name : String) -> String {
+  match env_get(world, name) {
+    Some(v) => v
+    None => ""
+  }
+}
+
+///|
+fn drv_resolve_cache_dir(world : World) -> String {
+  let custom = drv_env_str(world, "PION_CACHE_DIR")
+  if custom.length() > 0 {
+    return custom
+  }
+  let home = drv_env_str(world, "HOME")
+  if home.length() > 0 {
+    home + "/.cache/pion/cas"
+  } else {
+    "/tmp/pion-cas"
+  }
+}
+
+///|
+fn drv_resolve_cache_max_bytes(world : World) -> Int64 {
+  let kb_s = drv_env_str(world, "PION_CACHE_MAX_KB")
+  if kb_s.length() > 0 {
+    return drv_parse_pos_int64(kb_s, 1024L) * 1024L
+  }
+  let mb_s = drv_env_str(world, "PION_CACHE_MAX_MB")
+  drv_parse_pos_int64(mb_s, 2048L) * 1024L * 1024L
+}
+
+///|
+fn drv_resolve_qbe_bin(world : World) -> String {
+  let env_qbe = drv_env_str(world, "PION_QBE")
+  if env_qbe.length() > 0 {
+    return env_qbe
+  }
+  if fs_exists(world, "out/qbe") {
+    return "out/qbe"
+  }
+  if fs_exists(world, "../out/qbe") {
+    return "../out/qbe"
+  }
+  "qbe"
+}
+
+///|
+fn drv_resolve_rt_lib(world : World) -> String {
+  let env_rt = drv_env_str(world, "PION_RT_LIB")
+  if env_rt.length() > 0 {
+    return env_rt
+  }
+  if fs_exists(world, "out/libpionrt.a") {
+    return "out/libpionrt.a"
+  }
+  if fs_exists(world, "../out/libpionrt.a") {
+    return "../out/libpionrt.a"
+  }
+  "out/libpionrt.a"
+}
+
+///|
+fn drv_resolve_qbe_target(world : World) -> String {
+  let env_t = drv_env_str(world, "PION_TARGET")
+  if env_t.length() > 0 {
+    env_t
+  } else if fs_exists(world, "/System/Library") {
+    "arm64_apple"
+  } else {
+    "amd64_sysv"
+  }
+}
+
+///|
+fn drv_write_text_atomic(world : World, path : String, content : String) -> Bool {
+  let tmp = path + ".tmp." + clock_now_ms(world).to_string()
+  match fs_write(world, tmp, content) {
+    Err(_) => return false
+    Ok(_) => ()
+  }
+  fs_rename(world, tmp, path)
+}
+
+///|
+fn drv_load_targets(
+  world : World,
+  targets : Array[String],
+) -> Result[DrvLoaded, String] {
+  if targets.length() == 0 {
+    return Err("no input files specified")
+  }
+  let pkg_name = drv_basename_pkg(targets[0])
+  let paths : Array[String] = []
+  let sources : Array[String] = []
+  let mut t = 0
+  while t < targets.length() {
+    let target = targets[t]
+    if !fs_exists(world, target) {
+      return Err("path does not exist: " + target)
+    }
+    if fs_is_dir(world, target) {
+      let entries = fs_list_dir(world, target)
+      let mut i = 0
+      while i < entries.length() {
+        let name = entries[i]
+        if drv_is_source_file(name) {
+          let fpath = drv_join_path(target, name)
+          match fs_read(world, fpath) {
+            Err(msg) => return Err("failed to read " + fpath + ": " + msg)
+            Ok(content) => {
+              paths.push(fpath)
+              sources.push(content)
+            }
+          }
+        }
+        i = i + 1
+      }
+    } else {
+      match fs_read(world, target) {
+        Err(msg) => return Err("failed to read " + target + ": " + msg)
+        Ok(content) => {
+          paths.push(target)
+          sources.push(content)
+        }
+      }
+    }
+    t = t + 1
+  }
+  Ok(DrvLoaded::{ pkg_name: pkg_name, paths: paths, sources: sources })
+}
+
+///|
+/// Parallel per-file SHA-256 pre-hash using Pion native OS threads (scope + spawn + Channel + AtomicInt).
+/// Results are always reassembled in deterministic input index order.
+fn drv_parallel_prehash(
+  world : World,
+  sources : Array[String],
+  jobs : Int,
+) -> Array[String] {
+  let n = sources.length()
+  let out : Array[String] = []
+  let mut k = 0
+  while k < n {
+    out.push("")
+    k = k + 1
+  }
+  if n <= 1 || jobs <= 1 {
+    let mut i = 0
+    while i < n {
+      out[i] = sha256_hex(sources[i])
+      i = i + 1
+    }
+    return out
+  }
+  let mut base = 0
+  while base < n {
+    let mut batch = n - base
+    if batch > jobs {
+      batch = jobs
+    }
+    let ch : Channel[String] = Channel::new(batch + 1)
+    let done = AtomicInt::new(0)
+    scope(world, fn(s : Scope) -> Unit {
+      let mut off = 0
+      while off < batch {
+        let idx = base + off
+        let src = sources[idx]
+        spawn(s, fn() -> Unit {
+          let h = sha256_hex(src)
+          let _ = ch.send(idx.to_string() + ":" + h)
+          let _ = done.fetch_add(1)
+        })
+        off = off + 1
+      }
+    })
+    ch.close()
+    while true {
+      match ch.recv() {
+        Some(msg) => {
+          let mut colon = -1
+          let mut j = 0
+          while j < msg.length() {
+            if str_code_at(msg, j) == 58 {
+              colon = j
+              break
+            }
+            j = j + 1
+          }
+          if colon > 0 {
+            let idx_sb = StringBuilder()
+            let mut a = 0
+            while a < colon {
+              idx_sb.write_char(str_code_at(msg, a).unsafe_to_char())
+              a = a + 1
+            }
+            let h_sb = StringBuilder()
+            let mut b = colon + 1
+            while b < msg.length() {
+              h_sb.write_char(str_code_at(msg, b).unsafe_to_char())
+              b = b + 1
+            }
+            let idx = drv_parse_pos_int64(idx_sb.to_string(), 0L).to_int()
+            if idx >= 0 && idx < n {
+              out[idx] = h_sb.to_string()
+            }
+          }
+        }
+        None => break
+      }
+    }
+    let _ = done.load()
+    base = base + batch
+  }
+  out
+}
+
+///|
+fn drv_default_jobs(world : World) -> Int {
+  let env_j = drv_env_str(world, "PION_JOBS")
+  if env_j.length() > 0 {
+    drv_parse_pos_int(env_j, 16)
+  } else {
+    16
+  }
+}
+
+///|
+fn drv_sort_strings(arr : Array[String]) -> Unit {
+  let n = arr.length()
+  let mut i = 1
+  while i < n {
+    let key = arr[i]
+    let mut j = i - 1
+    while j >= 0 && key < arr[j] {
+      arr[j + 1] = arr[j]
+      j = j - 1
+    }
+    arr[j + 1] = key
+    i = i + 1
+  }
+}
+
+///|
+fn drv_cas_record_and_evict(
+  world : World,
+  cache_dir : String,
+  key : String,
+  entry_bytes : Int64,
+) -> Unit {
+  let index_path = cache_dir + "/index.tsv"
+  let entries : Array[CasEntry] = if fs_exists(world, index_path) {
+    match fs_read(world, index_path) {
+      Ok(txt) => cas_parse_index(txt)
+      Err(_) => []
+    }
+  } else {
+    []
+  }
+  let now = clock_now_ms(world)
+  let max_bytes = drv_resolve_cache_max_bytes(world)
+  let ev = cas_touch_and_evict(entries, key, entry_bytes, now, max_bytes)
+  let mut i = 0
+  while i < ev.evicted.length() {
+    let ek = ev.evicted[i]
+    let _ = fs_remove(world, cache_dir + "/sig/" + ek + ".pionsig")
+    let _ = fs_remove(world, cache_dir + "/sig/" + ek + ".pionstub")
+    let _ = fs_remove(world, cache_dir + "/ssa/" + ek + ".ssa")
+    let _ = fs_remove(world, cache_dir + "/obj/" + ek + ".o")
+    i = i + 1
+  }
+  let _ = drv_write_text_atomic(world, index_path, cas_format_index(ev.kept))
+}
+
+///|
+fn drv_cas_record_batch_and_evict(
+  world : World,
+  cache_dir : String,
+  keys : Array[String],
+  sizes : Array[Int64],
+) -> Unit {
+  if keys.length() == 0 {
+    return
+  }
+  let index_path = cache_dir + "/index.tsv"
+  let mut entries : Array[CasEntry] = if fs_exists(world, index_path) {
+    match fs_read(world, index_path) {
+      Ok(txt) => cas_parse_index(txt)
+      Err(_) => []
+    }
+  } else {
+    []
+  }
+  let now = clock_now_ms(world)
+  let max_bytes = drv_resolve_cache_max_bytes(world)
+  let all_evicted : Array[String] = []
+  let mut ki = 0
+  while ki < keys.length() && ki < sizes.length() {
+    let ev = cas_touch_and_evict(entries, keys[ki], sizes[ki], now, max_bytes)
+    entries = ev.kept
+    let mut ei = 0
+    while ei < ev.evicted.length() {
+      all_evicted.push(ev.evicted[ei])
+      ei = ei + 1
+    }
+    ki = ki + 1
+  }
+  let mut i = 0
+  while i < all_evicted.length() {
+    let ek = all_evicted[i]
+    let _ = fs_remove(world, cache_dir + "/sig/" + ek + ".pionsig")
+    let _ = fs_remove(world, cache_dir + "/sig/" + ek + ".pionstub")
+    let _ = fs_remove(world, cache_dir + "/ssa/" + ek + ".ssa")
+    let _ = fs_remove(world, cache_dir + "/obj/" + ek + ".o")
+    i = i + 1
+  }
+  let _ = drv_write_text_atomic(world, index_path, cas_format_index(entries))
+}
+
+///|
+fn drv_split_lines(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut cur = StringBuilder()
+  let mut has_any = false
+  let mut i = 0
+  while i < s.length() {
+    let c = str_code_at(s, i)
+    if c == 10 {
+      out.push(cur.to_string())
+      cur = StringBuilder()
+      has_any = false
+    } else {
+      cur.write_char(c.unsafe_to_char())
+      has_any = true
+    }
+    i = i + 1
+  }
+  if has_any {
+    out.push(cur.to_string())
+  }
+  out
+}
+
+///|
+fn drv_compute_compiler_fp(
+  world : World,
+  qbe_bin : String,
+  rt_lib : String,
+) -> String {
+  let qsz = fs_size(world, qbe_bin)
+  let rsz = fs_size(world, rt_lib)
+  let salt = drv_env_str(world, "PION_CACHE_SALT")
+  cas_compiler_fp(qsz, rsz, salt)
+}
+
+///|
+fn drv_normalize_path(path : String) -> String {
+  let is_abs = path.length() > 0 && str_code_at(path, 0) == 47
+  let parts : Array[String] = []
+  let mut sb = StringBuilder()
+  let mut i = 0
+  while i <= path.length() {
+    let is_sep = i == path.length() || str_code_at(path, i) == 47
+    if is_sep {
+      let seg = sb.to_string()
+      sb = StringBuilder()
+      if seg.length() == 0 || seg == "." {
+        ()
+      } else if seg == ".." {
+        if parts.length() > 0 && parts[parts.length() - 1] != ".." {
+          let _ = parts.pop()
+        } else if !is_abs {
+          parts.push("..")
+        }
+      } else {
+        parts.push(seg)
+      }
+    } else {
+      sb.write_char(str_code_at(path, i).unsafe_to_char())
+    }
+    i = i + 1
+  }
+  let out = StringBuilder()
+  if is_abs {
+    out.write_char('/')
+  }
+  let mut j = 0
+  while j < parts.length() {
+    if j > 0 {
+      out.write_char('/')
+    }
+    out.write_string(parts[j])
+    j = j + 1
+  }
+  let res = out.to_string()
+  if res.length() == 0 {
+    "."
+  } else {
+    res
+  }
+}
+
+///|
+fn drv_resolve_rel_path(base_dir : String, rel : String) -> String {
+  if rel.length() > 0 && str_code_at(rel, 0) == 47 {
+    drv_normalize_path(rel)
+  } else {
+    drv_normalize_path(drv_join_path(base_dir, rel))
+  }
+}
+
+///|
+fn drv_detect_manifest_dir(world : World, target : String) -> Option[String] {
+  if target == "pion.toml" || drv_ends_with(target, "/pion.toml") {
+    let pd = drv_parent_dir(target)
+    return Some(if pd.length() == 0 { "." } else { pd })
+  }
+  if fs_is_dir(world, target) {
+    let mf = drv_join_path(target, "pion.toml")
+    if fs_exists(world, mf) {
+      return Some(drv_normalize_path(target))
+    }
+  }
+  None
+}
+
+///|
+struct DrvSrcPair {
+  paths : Array[String]
+  sources : Array[String]
+}
+
+///|
+fn drv_load_pkg_dir_sources(
+  world : World,
+  pkg_dir : String,
+) -> Result[DrvSrcPair, String] {
+  let paths : Array[String] = []
+  let sources : Array[String] = []
+  let entries = fs_list_dir(world, pkg_dir)
+  let mut i = 0
+  while i < entries.length() {
+    let name = entries[i]
+    if drv_is_source_file(name) {
+      let fpath = drv_join_path(pkg_dir, name)
+      match fs_read(world, fpath) {
+        Err(msg) => return Err("failed to read " + fpath + ": " + msg)
+        Ok(content) => {
+          paths.push(fpath)
+          sources.push(content)
+        }
+      }
+    }
+    i = i + 1
+  }
+  let src_dir = drv_join_path(pkg_dir, "src")
+  if fs_is_dir(world, src_dir) {
+    let sentries = fs_list_dir(world, src_dir)
+    let mut j = 0
+    while j < sentries.length() {
+      let name = sentries[j]
+      if drv_is_source_file(name) {
+        let fpath = drv_join_path(src_dir, name)
+        match fs_read(world, fpath) {
+          Err(msg) => return Err("failed to read " + fpath + ": " + msg)
+          Ok(content) => {
+            paths.push(fpath)
+            sources.push(content)
+          }
+        }
+      }
+      j = j + 1
+    }
+  }
+  Ok(DrvSrcPair::{ paths: paths, sources: sources })
+}
+
+///|
+fn drv_load_workspace_dfs(
+  world : World,
+  pkg_dir : String,
+  visited : Map[String, Bool],
+  out : Array[PkgNodeInput],
+) -> Result[Unit, String] {
+  let norm_dir = drv_normalize_path(pkg_dir)
+  if visited.contains(norm_dir) {
+    return Ok(())
+  }
+  visited.set(norm_dir, true)
+  let mf_path = drv_join_path(norm_dir, "pion.toml")
+  if !fs_exists(world, mf_path) {
+    return Err("missing pion.toml in " + norm_dir)
+  }
+  let mf_txt = match fs_read(world, mf_path) {
+    Err(e) => return Err("failed to read " + mf_path + ": " + e)
+    Ok(t) => t
+  }
+  let mf = match parse_pion_toml(mf_txt) {
+    Err(e) => return Err(e)
+    Ok(m) => m
+  }
+  let dep_names : Array[String] = []
+  let mut i = 0
+  while i < mf.deps.length() {
+    dep_names.push(mf.deps[i].name)
+    let dep_dir = drv_resolve_rel_path(norm_dir, mf.deps[i].path)
+    match drv_load_workspace_dfs(world, dep_dir, visited, out) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    i = i + 1
+  }
+  let loaded_src = match drv_load_pkg_dir_sources(world, norm_dir) {
+    Err(e) => return Err(e)
+    Ok(v) => v
+  }
+  out.push(PkgNodeInput::{
+    name: mf.name,
+    dir: norm_dir,
+    deps: dep_names,
+    paths: loaded_src.paths,
+    sources: loaded_src.sources,
+    link_libs: mf.link_libs,
+  })
+  Ok(())
+}
+
+///|
+fn drv_load_workspace_nodes(
+  world : World,
+  root_dir : String,
+) -> Result[Array[PkgNodeInput], String] {
+  let visited : Map[String, Bool] = Map([])
+  let out : Array[PkgNodeInput] = []
+  match drv_load_workspace_dfs(world, root_dir, visited, out) {
+    Err(e) => Err(e)
+    Ok(_) => Ok(out)
+  }
+}
+
+///|
+struct DrvWsBuilt {
+  root_pkg_name : String
+  root_checked : Option[CheckedPackage]
+  obj_paths : Array[String]
+  dep_pkg_names : Array[String]
+  link_key : String
+  link_libs : Array[String]
+}
+
+///|
+/// `qbe -t <target> --obj|--obj-batch`, plus `--macos-ver` only for Mach-O.
+fn drv_qbe_obj_argv(
+  qbe_bin : String,
+  qbe_target : String,
+  qbe_macos_ver : String,
+  batch : Bool,
+) -> Array[String] {
+  let mode = if batch { "--obj-batch" } else { "--obj" }
+  let argv : Array[String] = [qbe_bin, "-t", qbe_target, mode]
+  if qbe_target == "arm64_apple" {
+    argv.push("--macos-ver")
+    argv.push(qbe_macos_ver)
+  }
+  argv
+}
+
+///|
+/// QBE writes `.o` itself (Mach-O arm64 or ELF64 x86_64), skipping `as`.
+fn drv_direct_obj_target(world : World, qbe_target : String) -> Bool {
+  (qbe_target == "arm64_apple" || qbe_target == "amd64_sysv") &&
+  drv_env_str(world, "PION_NO_DIRECT_OBJ") != "1"
+}
+
+///|
+fn drv_pick_target(world : World, target_override : String) -> String {
+  if target_override.length() > 0 {
+    target_override
+  } else {
+    drv_resolve_qbe_target(world)
+  }
+}
+
+///|
+/// Cache-key suffix for extra link libraries ("" when none, so keys stay stable).
+fn drv_libs_key(link_libs : Array[String]) -> String {
+  if link_libs.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder()
+  sb.write_string("|link:")
+  let mut i = 0
+  while i < link_libs.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(link_libs[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn drv_bin_key(key : String, link_libs : Array[String]) -> String {
+  if link_libs.length() == 0 {
+    key
+  } else {
+    sha256_hex(key + drv_libs_key(link_libs))
+  }
+}
+
+///|
+fn drv_copy_file(world : World, src : String, dst : String) -> Result[String, String] {
+  drv_ensure_parent_dir(world, dst)
+  match fs_read_bytes(world, src) {
+    Err(e) => Err("failed to read " + src + ": " + e)
+    Ok(b) =>
+      match fs_write_bytes(world, dst, b) {
+        Err(e) => Err("failed to write " + dst + ": " + e)
+        Ok(_) => Ok(dst)
+      }
+  }
+}
+
+///|
+/// Parses `-l <lib>`, `-l<lib>` and `--link <lib>` at `args[i]`; returns how many
+/// arguments were consumed (0 when `args[i]` is not a link flag).
+fn drv_parse_link_flag(args : Array[String], i : Int, libs : Array[String]) -> Int {
+  let a = args[i]
+  if (a == "-l" || a == "--link") && i + 1 < args.length() {
+    push_unique_lib(libs, args[i + 1])
+    2
+  } else if a.length() > 2 && drv_starts_with(a, "-l") {
+    push_unique_lib(libs, slice_str(a, 2, a.length()))
+    1
+  } else {
+    0
+  }
+}
+
+///|
+fn drv_compile_ssa_to_obj(
+  world : World,
+  qbe_bin : String,
+  qbe_target : String,
+  apple_tools : AppleTools,
+  direct_obj : Bool,
+  qbe_macos_ver : String,
+  cc1as_triple : String,
+  ssa_path : String,
+  obj_path : String,
+  stamp : String,
+) -> Result[Unit, String] {
+  let obj_tmp = obj_path + ".tmp." + stamp
+  if direct_obj {
+    let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, false)
+    argv.push("-o")
+    argv.push(obj_tmp)
+    argv.push(ssa_path)
+    let rc_qbe = proc_exec(world, argv)
+    if rc_qbe != 0 {
+      let _ = fs_remove(world, obj_tmp)
+      return Err(
+        "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+      )
+    }
+    let _ = fs_rename(world, obj_tmp, obj_path)
+    Ok(())
+  } else {
+    let asm_path = obj_path + ".s." + stamp
+    let rc_qbe = proc_exec(world, [qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path])
+    if rc_qbe != 0 {
+      let _ = fs_remove(world, asm_path)
+      return Err(
+        "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+      )
+    }
+    let rc_as = if apple_tools.ok {
+      proc_exec(
+        world,
+        [
+          apple_tools.clang_bin,
+          "-cc1as",
+          "-triple",
+          cc1as_triple,
+          "-filetype",
+          "obj",
+          "-o",
+          obj_tmp,
+          asm_path,
+        ],
+      )
+    } else {
+      proc_exec(world, ["as", "-o", obj_tmp, asm_path])
+    }
+    let _ = fs_remove(world, asm_path)
+    if rc_as != 0 {
+      let _ = fs_remove(world, obj_tmp)
+      return Err("as failed with exit code " + rc_as.to_string())
+    }
+    let _ = fs_rename(world, obj_tmp, obj_path)
+    Ok(())
+  }
+}
+
+///|
+fn drv_link_objects(
+  world : World,
+  apple_tools : AppleTools,
+  ld_ver : String,
+  obj_paths : Array[String],
+  rt_lib : String,
+  link_libs : Array[String],
+  final_bin : String,
+) -> Result[Unit, String] {
+  let rc_ld = if apple_tools.ok {
+    let ld_argv : Array[String] = [
+      apple_tools.ld_bin,
+      "-arch",
+      "arm64",
+      "-platform_version",
+      "macos",
+      ld_ver,
+      ld_ver,
+      "-syslibroot",
+      apple_tools.sdk_path,
+      "-dead_strip",
+      "-o",
+      final_bin,
+    ]
+    let mut oi = 0
+    while oi < obj_paths.length() {
+      ld_argv.push(obj_paths[oi])
+      oi = oi + 1
+    }
+    ld_argv.push(rt_lib)
+    let mut li = 0
+    while li < link_libs.length() {
+      ld_argv.push("-l" + link_libs[li])
+      li = li + 1
+    }
+    ld_argv.push("-lSystem")
+    proc_exec(world, ld_argv)
+  } else {
+    let cc = {
+      let e = drv_env_str(world, "CC")
+      if e.length() > 0 {
+        e
+      } else {
+        "cc"
+      }
+    }
+    let ld_argv : Array[String] = [cc]
+    let mut oi = 0
+    while oi < obj_paths.length() {
+      ld_argv.push(obj_paths[oi])
+      oi = oi + 1
+    }
+    ld_argv.push(rt_lib)
+    let mut li = 0
+    while li < link_libs.length() {
+      ld_argv.push("-l" + link_libs[li])
+      li = li + 1
+    }
+    ld_argv.push("-lm")
+    ld_argv.push("-lpthread")
+    ld_argv.push("-o")
+    ld_argv.push(final_bin)
+    proc_exec(world, ld_argv)
+  }
+  if rc_ld != 0 {
+    Err("linker failed with exit code " + rc_ld.to_string())
+  } else {
+    Ok(())
+  }
+}
+
+///|
+fn drv_ensure_ws_imports(
+  world : World,
+  nodes : Array[PkgNodeInput],
+  topo_order : Array[Int],
+  trans_dep_topo : Array[Array[Int]],
+  stub_paths : Array[String],
+  loaded_imported : Array[Option[ImportedPkg]],
+  pkg_topo_idx : Int,
+) -> Array[ImportedPkg] {
+  let deps_topo = trans_dep_topo[pkg_topo_idx]
+  let out : Array[ImportedPkg] = []
+  let mut i = 0
+  while i < deps_topo.length() {
+    let u = deps_topo[i]
+    match loaded_imported[u] {
+      Some(ipkg) => out.push(ipkg)
+      None => {
+        let unode = nodes[topo_order[u]]
+        let u_deps = trans_dep_topo[u]
+        let u_imports : Array[ImportedPkg] = []
+        let mut ui = 0
+        while ui < u_deps.length() {
+          match loaded_imported[u_deps[ui]] {
+            Some(dep_imp) => u_imports.push(dep_imp)
+            None => ()
+          }
+          ui = ui + 1
+        }
+        let mut loaded_opt : Option[ImportedPkg] = None
+        let sp = stub_paths[u]
+        if sp.length() > 0 {
+          match fs_read(world, sp) {
+            Ok(stub_txt) =>
+              if stub_txt.length() > 0 {
+                let scr = check_source_files_with_imports(
+                  unode.name,
+                  [unode.name + ".pionstub"],
+                  [stub_txt],
+                  u_imports,
+                  true,
+                )
+                if scr.diagnostics.length() == 0 {
+                  loaded_opt = Some(ImportedPkg::{ name: unode.name, tc: scr.tc })
+                }
+              }
+            Err(_) => ()
+          }
+        }
+        let ipkg = match loaded_opt {
+          Some(v) => v
+          None => {
+            let fcr = check_source_files_with_imports(
+              unode.name,
+              unode.paths,
+              unode.sources,
+              u_imports,
+              true,
+            )
+            ImportedPkg::{ name: unode.name, tc: fcr.tc }
+          }
+        }
+        loaded_imported[u] = Some(ipkg)
+        out.push(ipkg)
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn drv_build_workspace_objects(
+  world : World,
+  root_dir : String,
+  release : Bool,
+  include_entry : Bool,
+  jobs : Int,
+  target_override : String,
+  root_tests : Bool,
+) -> Result[DrvWsBuilt, String] {
+  let nodes = match drv_load_workspace_nodes(world, root_dir) {
+    Err(e) => return Err(e)
+    Ok(v) => v
+  }
+  if root_tests && nodes.length() > 0 {
+    // The root package is pushed last by the DFS; it is never CAS-cached here.
+    let rn = nodes[nodes.length() - 1]
+    match drv_append_test_sources(world, rn.dir, rn.paths, rn.sources) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+  }
+  let names : Array[String] = []
+  let dep_lists : Array[Array[String]] = []
+  let mut i = 0
+  while i < nodes.length() {
+    names.push(nodes[i].name)
+    dep_lists.push(nodes[i].deps)
+    i = i + 1
+  }
+  let topo = topo_sort_packages(names, dep_lists)
+  if topo.diagnostics.length() > 0 {
+    return Err(check_result_to_json(topo.diagnostics))
+  }
+
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/sig")
+  let _ = fs_mkdir_p(world, cache_dir + "/ssa")
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let _ = fs_mkdir_p(world, cache_dir + "/bin")
+
+  let qbe_target = drv_pick_target(world, target_override)
+  let qbe_bin = drv_resolve_qbe_bin(world)
+  let rt_lib = drv_resolve_rt_lib(world)
+  let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib)
+  let apple_tools = drv_probe_apple_tools(world, qbe_target)
+  let direct_obj = drv_direct_obj_target(world, qbe_target)
+  let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
+    apple_tools.macos_ver
+  } else {
+    "15.0"
+  }
+  let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
+  let trace_cas = drv_env_str(world, "PION_CAS_TRACE") == "1"
+
+  let n = topo.order.length()
+  let name_to_topo : Map[String, Int] = Map([])
+  let mut k = 0
+  while k < n {
+    name_to_topo.set(nodes[topo.order[k]].name, k)
+    k = k + 1
+  }
+
+  // Exact transitive dependency closure for each package in topo order
+  let trans_dep_topo : Array[Array[Int]] = []
+  let trans_dep_names : Array[Array[String]] = []
+  k = 0
+  while k < n {
+    let seen : Array[Bool] = []
+    let mut si = 0
+    while si < n {
+      seen.push(false)
+      si = si + 1
+    }
+    let node = nodes[topo.order[k]]
+    let mut di = 0
+    while di < node.deps.length() {
+      match name_to_topo.get(node.deps[di]) {
+        Some(didx) => {
+          seen[didx] = true
+          let dtrans = trans_dep_topo[didx]
+          let mut ti = 0
+          while ti < dtrans.length() {
+            seen[dtrans[ti]] = true
+            ti = ti + 1
+          }
+        }
+        None => ()
+      }
+      di = di + 1
+    }
+    let t_topo : Array[Int] = []
+    let t_names : Array[String] = []
+    let mut u = 0
+    while u < k {
+      if seen[u] {
+        t_topo.push(u)
+        t_names.push(nodes[topo.order[u]].name)
+      }
+      u = u + 1
+    }
+    drv_sort_strings(t_names)
+    trans_dep_topo.push(t_topo)
+    trans_dep_names.push(t_names)
+    k = k + 1
+  }
+
+  let sig_hashes : Map[String, String] = Map([])
+  let stub_paths : Array[String] = []
+  let loaded_imported : Array[Option[ImportedPkg]] = []
+  k = 0
+  while k < n {
+    stub_paths.push("")
+    loaded_imported.push(None)
+    k = k + 1
+  }
+
+  let obj_paths : Array[String] = []
+  let dep_pkg_names : Array[String] = []
+  let miss_ssa_paths : Array[String] = []
+  let miss_obj_paths : Array[String] = []
+  let miss_keys : Array[String] = []
+  let mut root_checked : Option[CheckedPackage] = None
+  let link_key_sb = StringBuilder()
+  link_key_sb.write_string(compiler_fp)
+
+  k = 0
+  while k < n {
+    let node = nodes[topo.order[k]]
+    let is_entry = k == n - 1
+    if is_entry && !include_entry {
+      let k_imports = drv_ensure_ws_imports(
+        world,
+        nodes,
+        topo.order,
+        trans_dep_topo,
+        stub_paths,
+        loaded_imported,
+        k,
+      )
+      let cr = check_source_files_with_imports(
+        node.name,
+        node.paths,
+        node.sources,
+        k_imports,
+        true,
+      )
+      if cr.diagnostics.length() > 0 {
+        return Err(check_result_to_json(cr.diagnostics))
+      }
+      root_checked = Some(cr)
+      k = k + 1
+      continue
+    }
+
+    let upstream_sigs : Array[String] = []
+    let t_names = trans_dep_names[k]
+    let mut u = 0
+    while u < t_names.length() {
+      let un = t_names[u]
+      let sh = match sig_hashes.get(un) {
+        Some(h) => h
+        None => ""
+      }
+      upstream_sigs.push(un + ":" + sh)
+      u = u + 1
+    }
+    let key = cas_compute_key(
+      node.name,
+      node.paths,
+      node.sources,
+      upstream_sigs,
+      qbe_target,
+      release,
+      compiler_fp,
+    )
+    let obj_path = cache_dir + "/obj/" + key + ".o"
+    let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+    let sig_path = cache_dir + "/sig/" + key + ".pionsig"
+    let stub_path = cache_dir + "/sig/" + key + ".pionstub"
+
+    let mut cas_hit = false
+    if fs_exists(world, obj_path) && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
+      match fs_read(world, sig_path) {
+        Ok(sig_text) => {
+          sig_hashes.set(node.name, sha256_hex(sig_text))
+          stub_paths[k] = stub_path
+          cas_hit = true
+          if trace_cas {
+            io_eprintln(
+              world,
+              "[cas] pkg=" + node.name + " HIT key=" + drv_prefix16(key),
+            )
+          }
+        }
+        Err(_) => ()
+      }
+    }
+
+    if !cas_hit {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas] pkg=" + node.name + " MISS key=" + drv_prefix16(key),
+        )
+      }
+      let k_imports = drv_ensure_ws_imports(
+        world,
+        nodes,
+        topo.order,
+        trans_dep_topo,
+        stub_paths,
+        loaded_imported,
+        k,
+      )
+      let cr = check_source_files_with_imports(
+        node.name,
+        node.paths,
+        node.sources,
+        k_imports,
+        true,
+      )
+      if cr.diagnostics.length() > 0 {
+        return Err(check_result_to_json(cr.diagnostics))
+      }
+      loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
+      let pionsig = emit_pionsig(cr.pkg)
+      sig_hashes.set(node.name, sha256_hex(pionsig))
+      let pionstub = emit_pion_stub(cr.pkg)
+      let res = emit_qbe_package_multi(
+        cr.pkg,
+        cr.tc,
+        release,
+        is_entry,
+        dep_pkg_names,
+      )
+      let _ = drv_write_text_atomic(world, sig_path, pionsig)
+      let _ = drv_write_text_atomic(world, stub_path, pionstub)
+      stub_paths[k] = stub_path
+      if !drv_write_text_atomic(world, ssa_path, res.ssa) {
+        return Err("failed to write CAS ssa: " + ssa_path)
+      }
+      miss_ssa_paths.push(ssa_path)
+      miss_obj_paths.push(obj_path)
+      miss_keys.push(key)
+    }
+
+    obj_paths.push(obj_path)
+    if !is_entry {
+      dep_pkg_names.push(node.name)
+    }
+    link_key_sb.write_string(":")
+    link_key_sb.write_string(key)
+    k = k + 1
+  }
+
+  // Compile all CAS-missed packages (parallel --obj-batch on direct_obj, parallel qbe+as otherwise)
+  let n_miss = miss_keys.length()
+  let eff_jobs = if jobs > 0 { jobs } else { drv_default_jobs(world) }
+  if n_miss == 1 || (n_miss > 1 && !direct_obj && eff_jobs <= 1) {
+    let stamp = clock_now_ms(world).to_string()
+    let mut mi = 0
+    while mi < n_miss {
+      match drv_compile_ssa_to_obj(
+        world,
+        qbe_bin,
+        qbe_target,
+        apple_tools,
+        direct_obj,
+        qbe_macos_ver,
+        cc1as_triple,
+        miss_ssa_paths[mi],
+        miss_obj_paths[mi],
+        stamp + "_" + mi.to_string(),
+      ) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      mi = mi + 1
+    }
+  } else if n_miss > 1 && direct_obj {
+    let nw = if eff_jobs <= 1 {
+      1
+    } else if n_miss < eff_jobs {
+      n_miss
+    } else {
+      eff_jobs
+    }
+    let stamp_base = clock_now_ms(world).to_string()
+    if nw == 1 {
+      let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, true)
+      let tmps : Array[String] = []
+      let objs : Array[String] = []
+      let mut mi = 0
+      while mi < n_miss {
+        let u_ssa = miss_ssa_paths[mi]
+        let u_obj = miss_obj_paths[mi]
+        let u_tmp = u_obj + ".tmp." + stamp_base + "_" + mi.to_string()
+        argv.push(u_ssa)
+        argv.push(u_tmp)
+        tmps.push(u_tmp)
+        objs.push(u_obj)
+        mi = mi + 1
+      }
+      let rc_qbe = proc_exec(world, argv)
+      if rc_qbe != 0 {
+        let mut j = 0
+        while j < tmps.length() {
+          let _ = fs_remove(world, tmps[j])
+          j = j + 1
+        }
+        return Err("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+      }
+      let mut j = 0
+      while j < tmps.length() {
+        let _ = fs_rename(world, tmps[j], objs[j])
+        j = j + 1
+      }
+    } else {
+      let err_ch : Channel[String] = Channel::new(nw + 1)
+      let qmv = qbe_macos_ver
+      let qb = qbe_bin
+      let qt = qbe_target
+      scope(world, fn(s : Scope) -> Unit {
+        let mut wi = 0
+        while wi < nw {
+          let start = wi * n_miss / nw
+          let end = (wi + 1) * n_miss / nw
+          let spec_sb = StringBuilder()
+          let mut mi = start
+          while mi < end {
+            let u_ssa = miss_ssa_paths[mi]
+            let u_obj = miss_obj_paths[mi]
+            let u_tmp = u_obj + ".tmp." + stamp_base + "_" + mi.to_string()
+            spec_sb.write_string(u_ssa)
+            spec_sb.write_char('\n')
+            spec_sb.write_string(u_tmp)
+            spec_sb.write_char('\n')
+            spec_sb.write_string(u_obj)
+            spec_sb.write_char('\n')
+            mi = mi + 1
+          }
+          let spec = spec_sb.to_string()
+          spawn(s, fn() -> Unit {
+            let lines = drv_split_lines(spec)
+            let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
+            let tmps : Array[String] = []
+            let objs : Array[String] = []
+            let mut li = 0
+            while li + 2 < lines.length() {
+              argv.push(lines[li])
+              argv.push(lines[li + 1])
+              tmps.push(lines[li + 1])
+              objs.push(lines[li + 2])
+              li = li + 3
+            }
+            let rc_qbe = proc_exec(argv)
+            if rc_qbe != 0 {
+              let mut j = 0
+              while j < tmps.length() {
+                let _ = fs_remove(tmps[j])
+                j = j + 1
+              }
+              let _ = err_ch.send(
+                "qbe --obj-batch failed with exit code " + rc_qbe.to_string(),
+              )
+            } else {
+              let mut j = 0
+              while j < tmps.length() {
+                let _ = fs_rename(tmps[j], objs[j])
+                j = j + 1
+              }
+            }
+          })
+          wi = wi + 1
+        }
+      })
+      err_ch.close()
+      match err_ch.recv() {
+        Some(err_msg) => return Err(err_msg)
+        None => ()
+      }
+    }
+  } else if n_miss > 1 {
+    let mut base = 0
+    while base < n_miss {
+      let mut batch = n_miss - base
+      if batch > eff_jobs {
+        batch = eff_jobs
+      }
+      let err_ch : Channel[String] = Channel::new(batch + 1)
+      let stamp_base = clock_now_ms(world).to_string()
+      let use_cc1as = apple_tools.ok
+      let cc1as_bin = apple_tools.clang_bin
+      let cc1as_tr = cc1as_triple
+      scope(world, fn(s : Scope) -> Unit {
+        let mut off = 0
+        while off < batch {
+          let mi = base + off
+          let u_ssa = miss_ssa_paths[mi]
+          let u_obj = miss_obj_paths[mi]
+          let u_asm = u_obj + ".s." + stamp_base + "_" + mi.to_string()
+          let u_tmp = u_obj + ".tmp." + stamp_base + "_" + mi.to_string()
+          let qb = qbe_bin
+          let qt = qbe_target
+          spawn(s, fn() -> Unit {
+            let rc_qbe = proc_exec([qb, "-t", qt, "-o", u_asm, u_ssa])
+            if rc_qbe != 0 {
+              let _ = fs_remove(u_asm)
+              let _ = err_ch.send(
+                "qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa,
+              )
+            } else {
+              let rc_as = if use_cc1as {
+                proc_exec([
+                  cc1as_bin,
+                  "-cc1as",
+                  "-triple",
+                  cc1as_tr,
+                  "-filetype",
+                  "obj",
+                  "-o",
+                  u_tmp,
+                  u_asm,
+                ])
+              } else {
+                proc_exec(["as", "-o", u_tmp, u_asm])
+              }
+              let _ = fs_remove(u_asm)
+              if rc_as != 0 {
+                let _ = fs_remove(u_tmp)
+                let _ = err_ch.send(
+                  "as failed with exit code " + rc_as.to_string() + " on " + u_asm,
+                )
+              } else {
+                let _ = fs_rename(u_tmp, u_obj)
+              }
+            }
+          })
+          off = off + 1
+        }
+      })
+      err_ch.close()
+      match err_ch.recv() {
+        Some(err_msg) => return Err(err_msg)
+        None => ()
+      }
+      base = base + batch
+    }
+  }
+
+  if n_miss > 0 {
+    let miss_sizes : Array[Int64] = []
+    let mut mi = 0
+    while mi < n_miss {
+      let sz = fs_size(world, miss_obj_paths[mi])
+      miss_sizes.push(if sz > 0L { sz } else { 0L })
+      mi = mi + 1
+    }
+    drv_cas_record_batch_and_evict(world, cache_dir, miss_keys, miss_sizes)
+  }
+
+  let root_pkg_name = nodes[topo.order[n - 1]].name
+  // `[link]` libraries of every package in topo order (deps first), de-duplicated.
+  let ws_libs : Array[String] = []
+  k = 0
+  while k < n {
+    let ln = nodes[topo.order[k]].link_libs
+    let mut li = 0
+    while li < ln.length() {
+      push_unique_lib(ws_libs, ln[li])
+      li = li + 1
+    }
+    k = k + 1
+  }
+  Ok(DrvWsBuilt::{
+    root_pkg_name: root_pkg_name,
+    root_checked: root_checked,
+    obj_paths: obj_paths,
+    dep_pkg_names: dep_pkg_names,
+    link_key: sha256_hex(link_key_sb.to_string()),
+    link_libs: ws_libs,
+  })
+}
+
+///|
+fn drv_build_targets(
+  world : World,
+  targets : Array[String],
+  release : Bool,
+  emit_ssa_path : String,
+  emit_asm_path : String,
+  out_bin_arg : String,
+  jobs : Int,
+  target_override : String,
+  emit_obj_path : String,
+  cli_libs : Array[String],
+) -> Result[String, String] {
+  if targets.length() == 1 {
+    match drv_detect_manifest_dir(world, targets[0]) {
+      Some(root_dir) => {
+        let built = match drv_build_workspace_objects(
+          world,
+          root_dir,
+          release,
+          true,
+          jobs,
+          target_override,
+          false,
+        ) {
+          Err(e) => return Err(e)
+          Ok(v) => v
+        }
+        if emit_obj_path != "" {
+          if built.obj_paths.length() != 1 {
+            return Err(
+              "--emit-obj needs a single package; workspace has " +
+              built.obj_paths.length().to_string() +
+              " packages",
+            )
+          }
+          return drv_copy_file(world, built.obj_paths[0], emit_obj_path)
+        }
+        let link_libs : Array[String] = []
+        let mut li = 0
+        while li < built.link_libs.length() {
+          push_unique_lib(link_libs, built.link_libs[li])
+          li = li + 1
+        }
+        li = 0
+        while li < cli_libs.length() {
+          push_unique_lib(link_libs, cli_libs[li])
+          li = li + 1
+        }
+        let root_pkg = built.root_pkg_name
+        let cache_dir = drv_resolve_cache_dir(world)
+        let default_bin = cache_dir +
+          "/bin/" +
+          root_pkg +
+          "_" +
+          drv_prefix16(drv_bin_key(built.link_key, link_libs))
+        let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+        if out_bin_arg == "" && fs_exists(world, final_bin) {
+          return Ok(final_bin)
+        }
+        if out_bin_arg != "" {
+          drv_ensure_parent_dir(world, out_bin_arg)
+        }
+        let qbe_target = drv_pick_target(world, target_override)
+        let apple_tools = drv_probe_apple_tools(world, qbe_target)
+        let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
+          apple_tools.macos_ver
+        } else {
+          "15.0"
+        }
+        let ld_ver = qbe_macos_ver + ".0"
+        let rt_lib = drv_resolve_rt_lib(world)
+        match drv_link_objects(
+          world,
+          apple_tools,
+          ld_ver,
+          built.obj_paths,
+          rt_lib,
+          link_libs,
+          final_bin,
+        ) {
+          Err(e) => return Err(e)
+          Ok(_) => return Ok(final_bin)
+        }
+      }
+      None => ()
+    }
+  }
+  let loaded = match drv_load_targets(world, targets) {
+    Err(msg) => return Err(msg)
+    Ok(v) => v
+  }
+  let pkg_name = loaded.pkg_name
+  let paths = loaded.paths
+  let sources = loaded.sources
+
+  // Dogfood Pion native multithreading on multi-file builds (deterministic order)
+  let src_hashes = drv_parallel_prehash(world, sources, jobs)
+
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/sig")
+  let _ = fs_mkdir_p(world, cache_dir + "/ssa")
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let _ = fs_mkdir_p(world, cache_dir + "/bin")
+  let _ = fs_mkdir_p(world, cache_dir + "/usig")
+
+  let qbe_target = drv_pick_target(world, target_override)
+  let qbe_bin = drv_resolve_qbe_bin(world)
+  let rt_lib_fp = drv_resolve_rt_lib(world)
+  let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib_fp)
+  let fp_pre = drv_prefix16(compiler_fp)
+  let apple_tools = drv_probe_apple_tools(world, qbe_target)
+  let direct_obj = drv_direct_obj_target(world, qbe_target) && emit_asm_path == ""
+  let link_libs = cli_libs
+  let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
+    apple_tools.macos_ver
+  } else {
+    "15.0"
+  }
+  let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
+  let ld_ver = qbe_macos_ver + ".0"
+
+  // Multi-file unit-level parallel compilation + unit-level global CAS + incremental .sig/.stub skip
+  if paths.length() > 1 &&
+    emit_ssa_path == "" &&
+    emit_asm_path == "" &&
+    emit_obj_path == "" {
+    let n_units = paths.length()
+    let has_usig : Array[Bool] = []
+    let file_sigs : Array[String] = []
+    let mut n_usig_hits = 0
+    let mut ui = 0
+    while ui < n_units {
+      let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
+      let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
+      if fs_exists(world, usig_p) && fs_exists(world, ustub_p) {
+        match fs_read(world, usig_p) {
+          Ok(sig_txt) => {
+            has_usig.push(true)
+            file_sigs.push(sig_txt)
+            n_usig_hits = n_usig_hits + 1
+          }
+          Err(_) => {
+            has_usig.push(false)
+            file_sigs.push("")
+          }
+        }
+      } else {
+        has_usig.push(false)
+        file_sigs.push("")
+      }
+      ui = ui + 1
+    }
+
+    let mut sigs_hash = ""
+    let mut const_units : Array[Int] = []
+    let mut has_main = false
+    let mut prep_opt : Option[PreparedPackage] = None
+    let parsed_dirty : Array[Option[SourceFile]] = []
+
+    if n_usig_hits > 0 {
+      let parse_diags : Array[Diagnostic] = []
+      ui = 0
+      while ui < n_units {
+        if has_usig[ui] {
+          parsed_dirty.push(None)
+        } else {
+          let pr = parse_source(paths[ui], sources[ui])
+          let mut di = 0
+          while di < pr.diagnostics.length() {
+            parse_diags.push(pr.diagnostics[di])
+            di = di + 1
+          }
+          file_sigs[ui] = emit_file_sig_entries(pr.file)
+          parsed_dirty.push(Some(pr.file))
+        }
+        ui = ui + 1
+      }
+      if parse_diags.length() > 0 {
+        return Err(check_result_to_json(parse_diags))
+      }
+      let summary = summarize_file_sigs(pkg_name, file_sigs)
+      sigs_hash = summary.sigs_hash
+      const_units = summary.const_units
+      has_main = summary.has_main
+    } else {
+      let prep = match cli_prepare_qbe_units(pkg_name, paths, sources) {
+        Err(diag_json) => return Err(diag_json)
+        Ok(p) => p
+      }
+      sigs_hash = prep.sigs_hash
+      const_units = prep.const_units
+      has_main = prep.has_main
+      prep_opt = Some(prep)
+      // Populate global CAS per-file .sig and .stub for subsequent incremental builds
+      ui = 0
+      while ui < n_units {
+        let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
+        let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
+        if !fs_exists(world, usig_p) {
+          let _ = drv_write_text_atomic(world, usig_p, emit_file_sig_entries(prep.pkg.files[ui]))
+        }
+        if !fs_exists(world, ustub_p) {
+          let _ = drv_write_text_atomic(world, ustub_p, emit_file_stub(prep.pkg.files[ui]))
+        }
+        ui = ui + 1
+      }
+    }
+
+    let unit_keys : Array[String] = []
+    let obj_paths : Array[String] = []
+    let miss_indices : Array[Int] = []
+    let is_miss : Array[Bool] = []
+    let pkg_key_sb = StringBuilder()
+    pkg_key_sb.write_string(compiler_fp)
+    pkg_key_sb.write_string(":")
+    pkg_key_sb.write_string(sigs_hash)
+    ui = 0
+    while ui < n_units {
+      let ukey = cas_compute_unit_key(
+        pkg_name,
+        ui,
+        paths[ui],
+        src_hashes[ui],
+        sigs_hash,
+        qbe_target,
+        release,
+        compiler_fp,
+      )
+      unit_keys.push(ukey)
+      pkg_key_sb.write_string(":")
+      pkg_key_sb.write_string(ukey)
+      let uobj = cache_dir + "/obj/" + ukey + ".o"
+      obj_paths.push(uobj)
+      if !fs_exists(world, uobj) {
+        miss_indices.push(ui)
+        is_miss.push(true)
+      } else {
+        is_miss.push(false)
+      }
+      ui = ui + 1
+    }
+    let pkg_key = sha256_hex(pkg_key_sb.to_string())
+    let default_bin = cache_dir +
+      "/bin/" +
+      pkg_name +
+      "_" +
+      drv_prefix16(drv_bin_key(pkg_key, link_libs))
+    let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+
+    if miss_indices.length() == 0 && out_bin_arg == "" && fs_exists(world, final_bin) {
+      return Ok(final_bin)
+    }
+
+    if miss_indices.length() > 0 {
+      let prep = match prep_opt {
+        Some(p) => p
+        None => {
+          // Incremental selective frontend: parse full source only for missed/uncached units,
+          // and lightweight `.stub` for cached unchanged units!
+          let files : Array[SourceFile] = []
+          let check_file : Array[Bool] = []
+          let parse_diags : Array[Diagnostic] = []
+          ui = 0
+          while ui < n_units {
+            if is_miss[ui] || !has_usig[ui] {
+              match parsed_dirty[ui] {
+                Some(sf) => files.push(sf)
+                None => {
+                  let pr = parse_source(paths[ui], sources[ui])
+                  let mut di = 0
+                  while di < pr.diagnostics.length() {
+                    parse_diags.push(pr.diagnostics[di])
+                    di = di + 1
+                  }
+                  files.push(pr.file)
+                }
+              }
+              check_file.push(true)
+            } else {
+              let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
+              let stub_loaded = match fs_read(world, ustub_p) {
+                Ok(stxt) => {
+                  let spr = parse_source(paths[ui], stxt)
+                  if spr.diagnostics.length() == 0 {
+                    Some(spr.file)
+                  } else {
+                    None
+                  }
+                }
+                Err(_) => None
+              }
+              match stub_loaded {
+                Some(sf) => {
+                  files.push(sf)
+                  check_file.push(false)
+                }
+                None => {
+                  let pr = parse_source(paths[ui], sources[ui])
+                  let mut di = 0
+                  while di < pr.diagnostics.length() {
+                    parse_diags.push(pr.diagnostics[di])
+                    di = di + 1
+                  }
+                  files.push(pr.file)
+                  check_file.push(true)
+                }
+              }
+            }
+            ui = ui + 1
+          }
+          if parse_diags.length() > 0 {
+            return Err(check_result_to_json(parse_diags))
+          }
+          let sel = match cli_prepare_qbe_units_selective(
+            pkg_name,
+            files,
+            check_file,
+            sigs_hash,
+            const_units,
+          ) {
+            Err(diag_json) => return Err(diag_json)
+            Ok(p) => p
+          }
+          has_main = sel.has_main
+          // Save newly validated dirty units' .sig and .stub to CAS
+          ui = 0
+          while ui < n_units {
+            if !has_usig[ui] {
+              let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
+              let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
+              if !fs_exists(world, usig_p) {
+                let _ = drv_write_text_atomic(world, usig_p, file_sigs[ui])
+              }
+              if !fs_exists(world, ustub_p) {
+                let _ = drv_write_text_atomic(world, ustub_p, emit_file_stub(sel.pkg.files[ui]))
+              }
+            }
+            ui = ui + 1
+          }
+          sel
+        }
+      }
+
+      // Emit QBE SSA only for cache-missed units
+      let mut mi = 0
+      while mi < miss_indices.length() {
+        let idx = miss_indices[mi]
+        let ukey = unit_keys[idx]
+        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+        let ssa_text = emit_qbe_unit(prep, idx, release)
+        if !drv_write_text_atomic(world, u_ssa, ssa_text) {
+          return Err("failed to write CAS unit ssa: " + u_ssa)
+        }
+        mi = mi + 1
+      }
+    }
+
+    // Compile missed units (qbe --obj / --obj-batch or qbe + cc1as/as) in parallel across up to `jobs` OS threads
+    let n_miss = miss_indices.length()
+    if n_miss == 1 || (n_miss > 1 && !direct_obj && jobs <= 1) {
+      let stamp = clock_now_ms(world).to_string()
+      let mut mi = 0
+      while mi < n_miss {
+        let idx = miss_indices[mi]
+        let ukey = unit_keys[idx]
+        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+        let u_obj = obj_paths[idx]
+        let u_tmp = u_obj + ".tmp." + stamp + "_" + idx.to_string()
+        if direct_obj {
+          let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, false)
+          argv.push("-o")
+          argv.push(u_tmp)
+          argv.push(u_ssa)
+          let rc_qbe = proc_exec(world, argv)
+          if rc_qbe != 0 {
+            let _ = fs_remove(world, u_tmp)
+            return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+          }
+          let _ = fs_rename(world, u_tmp, u_obj)
+        } else {
+          let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp + "_" + idx.to_string()
+          let rc_qbe = proc_exec(world, [qbe_bin, "-t", qbe_target, "-o", u_asm, u_ssa])
+          if rc_qbe != 0 {
+            let _ = fs_remove(world, u_asm)
+            return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+          }
+          let rc_as = if apple_tools.ok {
+            proc_exec(
+              world,
+              [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", u_tmp, u_asm],
+            )
+          } else {
+            proc_exec(world, ["as", "-o", u_tmp, u_asm])
+          }
+          let _ = fs_remove(world, u_asm)
+          if rc_as != 0 {
+            let _ = fs_remove(world, u_tmp)
+            return Err("as failed with exit code " + rc_as.to_string())
+          }
+          let _ = fs_rename(world, u_tmp, u_obj)
+        }
+        mi = mi + 1
+      }
+    } else if n_miss > 1 && direct_obj {
+      let nw = if jobs <= 1 {
+        1
+      } else if n_miss < jobs {
+        n_miss
+      } else {
+        jobs
+      }
+      let stamp_base = clock_now_ms(world).to_string()
+      if nw == 1 {
+        let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, true)
+        let tmps : Array[String] = []
+        let objs : Array[String] = []
+        let mut mi = 0
+        while mi < n_miss {
+          let idx = miss_indices[mi]
+          let ukey = unit_keys[idx]
+          let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+          let u_obj = obj_paths[idx]
+          let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+          argv.push(u_ssa)
+          argv.push(u_tmp)
+          tmps.push(u_tmp)
+          objs.push(u_obj)
+          mi = mi + 1
+        }
+        let rc_qbe = proc_exec(world, argv)
+        if rc_qbe != 0 {
+          let mut j = 0
+          while j < tmps.length() {
+            let _ = fs_remove(world, tmps[j])
+            j = j + 1
+          }
+          return Err("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+        }
+        let mut j = 0
+        while j < tmps.length() {
+          let _ = fs_rename(world, tmps[j], objs[j])
+          j = j + 1
+        }
+      } else {
+        let err_ch : Channel[String] = Channel::new(nw + 1)
+        let qmv = qbe_macos_ver
+        let qb = qbe_bin
+        let qt = qbe_target
+        scope(world, fn(s : Scope) -> Unit {
+          let mut wi = 0
+          while wi < nw {
+            let start = wi * n_miss / nw
+            let end = (wi + 1) * n_miss / nw
+            let spec_sb = StringBuilder()
+            let mut k = start
+            while k < end {
+              let idx = miss_indices[k]
+              let ukey = unit_keys[idx]
+              let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+              let u_obj = obj_paths[idx]
+              let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+              spec_sb.write_string(u_ssa)
+              spec_sb.write_char('\n')
+              spec_sb.write_string(u_tmp)
+              spec_sb.write_char('\n')
+              spec_sb.write_string(u_obj)
+              spec_sb.write_char('\n')
+              k = k + 1
+            }
+            let spec = spec_sb.to_string()
+            spawn(s, fn() -> Unit {
+              let lines = drv_split_lines(spec)
+              let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
+              let tmps : Array[String] = []
+              let objs : Array[String] = []
+              let mut li = 0
+              while li + 2 < lines.length() {
+                argv.push(lines[li])
+                argv.push(lines[li + 1])
+                tmps.push(lines[li + 1])
+                objs.push(lines[li + 2])
+                li = li + 3
+              }
+              let rc_qbe = proc_exec(argv)
+              if rc_qbe != 0 {
+                let mut j = 0
+                while j < tmps.length() {
+                  let _ = fs_remove(tmps[j])
+                  j = j + 1
+                }
+                let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+              } else {
+                let mut j = 0
+                while j < tmps.length() {
+                  let _ = fs_rename(tmps[j], objs[j])
+                  j = j + 1
+                }
+              }
+            })
+            wi = wi + 1
+          }
+        })
+        err_ch.close()
+        match err_ch.recv() {
+          Some(err_msg) => return Err(err_msg)
+          None => ()
+        }
+      }
+    } else if n_miss > 1 {
+      let mut base = 0
+      while base < n_miss {
+        let mut batch = n_miss - base
+        if batch > jobs {
+          batch = jobs
+        }
+        let err_ch : Channel[String] = Channel::new(batch + 1)
+        let stamp_base = clock_now_ms(world).to_string()
+        let use_direct = direct_obj
+        let qmv = qbe_macos_ver
+        let use_cc1as = apple_tools.ok
+        let cc1as_bin = apple_tools.clang_bin
+        let cc1as_tr = cc1as_triple
+        scope(world, fn(s : Scope) -> Unit {
+          let mut off = 0
+          while off < batch {
+            let idx = miss_indices[base + off]
+            let ukey = unit_keys[idx]
+            let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+            let u_obj = obj_paths[idx]
+            let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp_base + "_" + idx.to_string()
+            let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+            let qb = qbe_bin
+            let qt = qbe_target
+            spawn(s, fn() -> Unit {
+              if use_direct {
+                let argv = drv_qbe_obj_argv(qb, qt, qmv, false)
+                argv.push("-o")
+                argv.push(u_tmp)
+                argv.push(u_ssa)
+                let rc_qbe = proc_exec(argv)
+                if rc_qbe != 0 {
+                  let _ = fs_remove(u_tmp)
+                  let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+                } else {
+                  let _ = fs_rename(u_tmp, u_obj)
+                }
+              } else {
+                let rc_qbe = proc_exec([qb, "-t", qt, "-o", u_asm, u_ssa])
+                if rc_qbe != 0 {
+                  let _ = fs_remove(u_asm)
+                  let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
+                } else {
+                  let rc_as = if use_cc1as {
+                    proc_exec([cc1as_bin, "-cc1as", "-triple", cc1as_tr, "-filetype", "obj", "-o", u_tmp, u_asm])
+                  } else {
+                    proc_exec(["as", "-o", u_tmp, u_asm])
+                  }
+                  let _ = fs_remove(u_asm)
+                  if rc_as != 0 {
+                    let _ = fs_remove(u_tmp)
+                    let _ = err_ch.send("as failed with exit code " + rc_as.to_string() + " on " + u_asm)
+                  } else {
+                    let _ = fs_rename(u_tmp, u_obj)
+                  }
+                }
+              }
+            })
+            off = off + 1
+          }
+        })
+        err_ch.close()
+        match err_ch.recv() {
+          Some(err_msg) => return Err(err_msg)
+          None => ()
+        }
+        base = base + batch
+      }
+    }
+
+    if !has_main && out_bin_arg == "" {
+      return Ok(obj_paths[0])
+    }
+
+    if out_bin_arg != "" {
+      drv_ensure_parent_dir(world, out_bin_arg)
+    }
+    let rt_lib = drv_resolve_rt_lib(world)
+    match drv_link_objects(world, apple_tools, ld_ver, obj_paths, rt_lib, link_libs, final_bin) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    return Ok(final_bin)
+  }
+  let key = cas_compute_key(
+    pkg_name,
+    paths,
+    sources,
+    [],
+    qbe_target,
+    release,
+    compiler_fp,
+  )
+  let sig_path = cache_dir + "/sig/" + key + ".pionsig"
+  let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+  let obj_path = cache_dir + "/obj/" + key + ".o"
+  let default_bin = cache_dir +
+    "/bin/" +
+    pkg_name +
+    "_" +
+    drv_prefix16(drv_bin_key(key, link_libs))
+  let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
+
+  let mut has_main = true
+  let cache_hit = fs_exists(world, obj_path) &&
+    fs_exists(world, ssa_path) &&
+    fs_exists(world, sig_path)
+
+  if cache_hit {
+    if emit_ssa_path != "" {
+      drv_ensure_parent_dir(world, emit_ssa_path)
+      match fs_read(world, ssa_path) {
+        Err(msg) => return Err("failed to read cached ssa: " + msg)
+        Ok(ssa_cached) =>
+          if !drv_write_text_atomic(world, emit_ssa_path, ssa_cached) {
+            return Err("failed to write --emit-ssa file: " + emit_ssa_path)
+          }
+      }
+    }
+    if emit_asm_path != "" {
+      drv_ensure_parent_dir(world, emit_asm_path)
+      let rc_qbe = proc_exec(
+        world,
+        [qbe_bin, "-t", qbe_target, "-o", emit_asm_path, ssa_path],
+      )
+      if rc_qbe != 0 {
+        return Err(
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+        )
+      }
+    }
+    let sz_sig = fs_size(world, sig_path)
+    let sz_ssa = fs_size(world, ssa_path)
+    let sz_obj = fs_size(world, obj_path)
+    let total_sz = (if sz_sig > 0L { sz_sig } else { 0L }) +
+      (if sz_ssa > 0L { sz_ssa } else { 0L }) +
+      (if sz_obj > 0L { sz_obj } else { 0L })
+    drv_cas_record_and_evict(world, cache_dir, key, total_sz)
+    if emit_obj_path == "" && out_bin_arg == "" && fs_exists(world, final_bin) {
+      return Ok(final_bin)
+    }
+    if emit_obj_path == "" &&
+      (emit_ssa_path != "" || emit_asm_path != "") &&
+      out_bin_arg == "" {
+      return Ok(obj_path)
+    }
+  } else {
+    let compiled = match cli_compile_qbe(pkg_name, paths, sources, release) {
+      Err(diag_json) => return Err(diag_json)
+      Ok(c) => c
+    }
+    has_main = compiled.has_main
+    if !drv_write_text_atomic(world, sig_path, compiled.sig) {
+      return Err("failed to write CAS sig: " + sig_path)
+    }
+    if !drv_write_text_atomic(world, ssa_path, compiled.ssa) {
+      return Err("failed to write CAS ssa: " + ssa_path)
+    }
+    if emit_ssa_path != "" {
+      drv_ensure_parent_dir(world, emit_ssa_path)
+      if !drv_write_text_atomic(world, emit_ssa_path, compiled.ssa) {
+        return Err("failed to write --emit-ssa file: " + emit_ssa_path)
+      }
+    }
+
+    let stamp = clock_now_ms(world).to_string()
+    let obj_tmp = obj_path + ".tmp." + stamp
+    if direct_obj {
+      let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, false)
+      argv.push("-o")
+      argv.push(obj_tmp)
+      argv.push(ssa_path)
+      let rc_qbe = proc_exec(world, argv)
+      if rc_qbe != 0 {
+        let _ = fs_remove(world, obj_tmp)
+        return Err(
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+        )
+      }
+      let _ = fs_rename(world, obj_tmp, obj_path)
+    } else {
+      let asm_path = cache_dir + "/obj/" + key + ".s." + stamp
+      let rc_qbe = proc_exec(
+        world,
+        [qbe_bin, "-t", qbe_target, "-o", asm_path, ssa_path],
+      )
+      if rc_qbe != 0 {
+        let _ = fs_remove(world, asm_path)
+        return Err(
+          "qbe failed with exit code " + rc_qbe.to_string() + " on " + ssa_path,
+        )
+      }
+      if emit_asm_path != "" {
+        drv_ensure_parent_dir(world, emit_asm_path)
+        match fs_read(world, asm_path) {
+          Err(msg) => {
+            let _ = fs_remove(world, asm_path)
+            return Err("failed to read asm: " + msg)
+          }
+          Ok(asm_text) =>
+            if !drv_write_text_atomic(world, emit_asm_path, asm_text) {
+              let _ = fs_remove(world, asm_path)
+              return Err("failed to write --emit-asm file: " + emit_asm_path)
+            }
+        }
+      }
+      let rc_as = if apple_tools.ok {
+        proc_exec(
+          world,
+          [apple_tools.clang_bin, "-cc1as", "-triple", cc1as_triple, "-filetype", "obj", "-o", obj_tmp, asm_path],
+        )
+      } else {
+        proc_exec(world, ["as", "-o", obj_tmp, asm_path])
+      }
+      let _ = fs_remove(world, asm_path)
+      if rc_as != 0 {
+        let _ = fs_remove(world, obj_tmp)
+        return Err("as failed with exit code " + rc_as.to_string())
+      }
+      let _ = fs_rename(world, obj_tmp, obj_path)
+    }
+
+    let sz_sig = fs_size(world, sig_path)
+    let sz_ssa = fs_size(world, ssa_path)
+    let sz_obj = fs_size(world, obj_path)
+    let total_sz = (if sz_sig > 0L { sz_sig } else { 0L }) +
+      (if sz_ssa > 0L { sz_ssa } else { 0L }) +
+      (if sz_obj > 0L { sz_obj } else { 0L })
+    drv_cas_record_and_evict(world, cache_dir, key, total_sz)
+  }
+
+  if emit_obj_path != "" {
+    return drv_copy_file(world, obj_path, emit_obj_path)
+  }
+
+  if !has_main && out_bin_arg == "" {
+    return Ok(obj_path)
+  }
+
+  if out_bin_arg != "" {
+    drv_ensure_parent_dir(world, out_bin_arg)
+  }
+  let rt_lib = drv_resolve_rt_lib(world)
+  match drv_link_objects(world, apple_tools, ld_ver, [obj_path], rt_lib, link_libs, final_bin) {
+    Err(e) => Err(e)
+    Ok(_) => Ok(final_bin)
+  }
+}
+
+///|
+fn drv_run_tests_cmd(
+  world : World,
+  targets : Array[String],
+  as_json : Bool,
+  filter : String,
+  cli_libs : Array[String],
+) -> Int {
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/ssa")
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let _ = fs_mkdir_p(world, cache_dir + "/bin")
+  let qbe_target = drv_resolve_qbe_target(world)
+  let qbe_bin = drv_resolve_qbe_bin(world)
+  let rt_lib = drv_resolve_rt_lib(world)
+  let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib)
+  let apple_tools = drv_probe_apple_tools(world, qbe_target)
+  let direct_obj = drv_direct_obj_target(world, qbe_target)
+  let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
+    apple_tools.macos_ver
+  } else {
+    "15.0"
+  }
+  let cc1as_triple = "arm64-apple-macosx" + qbe_macos_ver + ".0"
+  let ld_ver = qbe_macos_ver + ".0"
+
+  let mut test_res = QbeTestEmitResult::{ ssa: "", test_names: [] }
+  let dep_objs : Array[String] = []
+  let link_libs : Array[String] = []
+
+  let mut handled_ws = false
+  if targets.length() == 1 {
+    match drv_detect_manifest_dir(world, targets[0]) {
+      Some(root_dir) => {
+        handled_ws = true
+        match drv_build_workspace_objects(
+          world,
+          root_dir,
+          false,
+          false,
+          drv_default_jobs(world),
+          "",
+          true,
+        ) {
+          Err(msg) => {
+            io_eprintln(world, msg)
+            return 1
+          }
+          Ok(built) => {
+            let root_cr = match built.root_checked {
+              Some(cr) => cr
+              None => {
+                io_eprintln(world, "error: missing root package check result")
+                return 1
+              }
+            }
+            test_res = emit_qbe_test_package(
+              root_cr.pkg,
+              root_cr.tc,
+              built.dep_pkg_names,
+            )
+            let mut oi = 0
+            while oi < built.obj_paths.length() {
+              dep_objs.push(built.obj_paths[oi])
+              oi = oi + 1
+            }
+            let mut li = 0
+            while li < built.link_libs.length() {
+              push_unique_lib(link_libs, built.link_libs[li])
+              li = li + 1
+            }
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  if !handled_ws {
+    match drv_load_targets(world, targets) {
+      Err(msg) => {
+        io_eprintln(world, "error: " + msg)
+        return 1
+      }
+      Ok(loaded) => {
+        let mut ti = 0
+        while ti < targets.length() {
+          if fs_is_dir(world, targets[ti]) {
+            match drv_append_test_sources(world, targets[ti], loaded.paths, loaded.sources) {
+              Err(msg) => {
+                io_eprintln(world, "error: " + msg)
+                return 1
+              }
+              Ok(_) => ()
+            }
+          }
+          ti = ti + 1
+        }
+        let cr = check_source_files_full(
+          loaded.pkg_name,
+          loaded.paths,
+          loaded.sources,
+        )
+        if cr.diagnostics.length() > 0 {
+          io_println(world, check_result_to_json(cr.diagnostics))
+          return 1
+        }
+        test_res = emit_qbe_test_package(cr.pkg, cr.tc, [])
+      }
+    }
+  }
+
+  let names = test_res.test_names
+  if names.length() == 0 {
+    if as_json {
+      io_println(world, format_test_report_json([], []))
+    } else {
+      io_println(world, "test result: ok. 0 passed; 0 failed")
+    }
+    return 0
+  }
+
+  let mut li = 0
+  while li < cli_libs.length() {
+    push_unique_lib(link_libs, cli_libs[li])
+    li = li + 1
+  }
+  let tkey = sha256_hex(compiler_fp + ":test:" + drv_libs_key(link_libs) + test_res.ssa)
+  let ssa_path = cache_dir + "/ssa/test_" + tkey + ".ssa"
+  let obj_path = cache_dir + "/obj/test_" + tkey + ".o"
+  let test_bin = cache_dir + "/bin/test_" + drv_prefix16(tkey)
+  if !fs_exists(world, test_bin) {
+    if !drv_write_text_atomic(world, ssa_path, test_res.ssa) {
+      io_eprintln(world, "error: failed to write test ssa")
+      return 1
+    }
+    let stamp = clock_now_ms(world).to_string()
+    match drv_compile_ssa_to_obj(
+      world,
+      qbe_bin,
+      qbe_target,
+      apple_tools,
+      direct_obj,
+      qbe_macos_ver,
+      cc1as_triple,
+      ssa_path,
+      obj_path,
+      stamp,
+    ) {
+      Err(e) => {
+        io_eprintln(world, "error: " + e)
+        return 1
+      }
+      Ok(_) => ()
+    }
+    let link_objs : Array[String] = []
+    let mut oi = 0
+    while oi < dep_objs.length() {
+      link_objs.push(dep_objs[oi])
+      oi = oi + 1
+    }
+    link_objs.push(obj_path)
+    match drv_link_objects(
+      world,
+      apple_tools,
+      ld_ver,
+      link_objs,
+      rt_lib,
+      link_libs,
+      test_bin,
+    ) {
+      Err(e) => {
+        io_eprintln(world, "error: " + e)
+        return 1
+      }
+      Ok(_) => ()
+    }
+  }
+
+  let ran_names : Array[String] = []
+  let ran_ok : Array[Bool] = []
+  let mut passed = 0
+  let mut failed = 0
+  let mut i = 0
+  while i < names.length() {
+    let tname = names[i]
+    if filter.length() == 0 || drv_find_substr(tname, filter, 0) >= 0 {
+      let rc = proc_exec(world, [test_bin, i.to_string()])
+      let ok = rc == 0
+      ran_names.push(tname)
+      ran_ok.push(ok)
+      if ok {
+        passed = passed + 1
+      } else {
+        failed = failed + 1
+      }
+      if !as_json {
+        io_println(
+          world,
+          "test " + tname + " ... " + (if ok { "ok" } else { "FAILED" }),
+        )
+      }
+    }
+    i = i + 1
+  }
+  if as_json {
+    io_println(world, format_test_report_json(ran_names, ran_ok))
+  } else {
+    io_println(
+      world,
+      "test result: " +
+      (if failed == 0 { "ok" } else { "FAILED" }) +
+      ". " +
+      passed.to_string() +
+      " passed; " +
+      failed.to_string() +
+      " failed",
+    )
+  }
+  if failed == 0 { 0 } else { 1 }
+}
+
+///|
+fn drv_is_fmt_file(name : String) -> Bool {
+  if name.length() == 0 {
+    return false
+  }
+  if str_code_at(name, 0) == 46 {
+    return false
+  }
+  drv_ends_with(name, ".pion") || drv_ends_with(name, ".mbt")
+}
+
+///|
+fn drv_collect_fmt_files_dir(
+  world : World,
+  dir : String,
+  out : Array[String],
+) -> Unit {
+  let entries = fs_list_dir(world, dir)
+  let mut i = 0
+  while i < entries.length() {
+    let name = entries[i]
+    if name.length() > 0 && str_code_at(name, 0) != 46 {
+      let full = drv_join_path(dir, name)
+      if fs_is_dir(world, full) {
+        if name != "_build" && name != "target" && name != "out" && name != "vendor" {
+          drv_collect_fmt_files_dir(world, full, out)
+        }
+      } else if drv_is_fmt_file(name) {
+        out.push(full)
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn drv_run_fmt_cmd(
+  world : World,
+  targets : Array[String],
+  check_only : Bool,
+  as_json : Bool,
+) -> Int {
+  let files : Array[String] = []
+  let mut t = 0
+  while t < targets.length() {
+    let target = targets[t]
+    if !fs_exists(world, target) {
+      io_eprintln(world, "error: path does not exist: " + target)
+      return 1
+    }
+    if fs_is_dir(world, target) {
+      drv_collect_fmt_files_dir(world, target, files)
+    } else {
+      files.push(target)
+    }
+    t = t + 1
+  }
+  let unformatted : Array[String] = []
+  let mut i = 0
+  while i < files.length() {
+    let path = files[i]
+    let src = match fs_read(world, path) {
+      Err(msg) => {
+        io_eprintln(world, "error: failed to read " + path + ": " + msg)
+        return 1
+      }
+      Ok(s) => s
+    }
+    let formatted = format_source(src)
+    if formatted != src {
+      if check_only {
+        unformatted.push(path)
+      } else {
+        if !drv_write_text_atomic(world, path, formatted) {
+          io_eprintln(world, "error: failed to write " + path)
+          return 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  if check_only {
+    if as_json {
+      io_println(world, fmt_check_result_to_json(unformatted))
+    } else {
+      let mut j = 0
+      while j < unformatted.length() {
+        io_println(world, unformatted[j])
+        j = j + 1
+      }
+    }
+    if unformatted.length() == 0 { 0 } else { 1 }
+  } else {
+    if as_json {
+      io_println(world, fmt_check_result_to_json([]))
+    }
+    0
+  }
+}
+
+///|
+/// `pionc doc [--json]`: public API of a file, directory or `pion.toml` workspace
+/// (every package, dependencies first).
+fn drv_run_doc_cmd(world : World, targets : Array[String], as_json : Bool) -> Int {
+  let pkgs : Array[Package] = []
+  let diags : Array[Diagnostic] = []
+  let mut handled_ws = false
+  if targets.length() == 1 {
+    match drv_detect_manifest_dir(world, targets[0]) {
+      Some(root_dir) => {
+        handled_ws = true
+        let nodes = match drv_load_workspace_nodes(world, root_dir) {
+          Err(msg) => {
+            io_eprintln(world, "error: " + msg)
+            return 1
+          }
+          Ok(v) => v
+        }
+        let mut ni = 0
+        while ni < nodes.length() {
+          let node = nodes[ni]
+          let pd = parse_package_diagnostics(node.paths, node.sources)
+          let mut di = 0
+          while di < pd.length() {
+            diags.push(pd[di])
+            di = di + 1
+          }
+          pkgs.push(parse_package(node.name, node.paths, node.sources))
+          ni = ni + 1
+        }
+      }
+      None => ()
+    }
+  }
+  if !handled_ws {
+    match drv_load_targets(world, targets) {
+      Err(msg) => {
+        io_eprintln(world, "error: " + msg)
+        return 1
+      }
+      Ok(loaded) => {
+        let pd = parse_package_diagnostics(loaded.paths, loaded.sources)
+        let mut di = 0
+        while di < pd.length() {
+          diags.push(pd[di])
+          di = di + 1
+        }
+        pkgs.push(parse_package(loaded.pkg_name, loaded.paths, loaded.sources))
+      }
+    }
+  }
+  if diags.length() > 0 {
+    io_println(world, check_result_to_json(diags))
+    return 1
+  }
+  if as_json {
+    io_println(world, doc_packages_json(pkgs))
+  } else {
+    io_print(world, doc_packages_text(pkgs))
+  }
+  0
+}
+
+///|
+fn drv_usage(world : World) -> Unit {
+  io_eprintln(
+    world,
+    "usage:\n" +
+    "  pionc check [--json] <input1> [input2 ...]\n" +
+    "  pionc query defs|sig|callers|deps [--json] <input1> [input2 ...]\n" +
+    "  pionc emit-sig <input1> [input2 ...]\n" +
+    "  pionc build [--release] [--target arm64_apple|amd64_sysv] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] <input1> [input2 ...]\n" +
+    "  pionc run [--release] [-l <lib>|--link <lib>] <input> [-- args...]\n" +
+    "  pionc fmt [--check] [--json] <input1> [input2 ...]\n" +
+    "  pionc test [--json] [--filter <name>] [-l <lib>|--link <lib>] <input>\n" +
+    "  pionc doc [--json] <input1> [input2 ...]",
+  )
+}
+
+///|
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  if args.length() >= 2 &&
+    (args[1] == "--version" || args[1] == "-V" || args[1] == "version") {
+    io_println(world, "pionc2 0.1.0 (self-hosted Pion native compiler)")
+    return 0
+  }
+  if args.length() < 3 {
+    drv_usage(world)
+    return 1
+  }
+  let cmd = args[1]
+  if cmd == "check" {
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      if args[i] != "--json" {
+        targets.push(args[i])
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    if targets.length() == 1 {
+      match drv_detect_manifest_dir(world, targets[0]) {
+        Some(root_dir) =>
+          match drv_load_workspace_nodes(world, root_dir) {
+            Err(msg) => {
+              io_eprintln(world, "error: " + msg)
+              return 1
+            }
+            Ok(nodes) => {
+              let names : Array[String] = []
+              let dep_lists : Array[Array[String]] = []
+              let mut ni = 0
+              while ni < nodes.length() {
+                names.push(nodes[ni].name)
+                dep_lists.push(nodes[ni].deps)
+                ni = ni + 1
+              }
+              let topo = topo_sort_packages(names, dep_lists)
+              if topo.diagnostics.length() > 0 {
+                io_println(world, check_result_to_json(topo.diagnostics))
+                return 1
+              }
+              let imported : Array[ImportedPkg] = []
+              let all_diags : Array[Diagnostic] = []
+              let mut k = 0
+              while k < topo.order.length() {
+                let node = nodes[topo.order[k]]
+                let cr = check_source_files_with_imports(
+                  node.name,
+                  node.paths,
+                  node.sources,
+                  imported,
+                  true,
+                )
+                let mut di = 0
+                while di < cr.diagnostics.length() {
+                  all_diags.push(cr.diagnostics[di])
+                  di = di + 1
+                }
+                imported.push(ImportedPkg::{ name: node.name, tc: cr.tc })
+                k = k + 1
+              }
+              io_println(world, check_result_to_json(all_diags))
+              if all_diags.length() > 0 {
+                return 1
+              }
+              return 0
+            }
+          }
+        None => ()
+      }
+    }
+    match drv_load_targets(world, targets) {
+      Err(msg) => {
+        io_eprintln(world, "error: " + msg)
+        return 1
+      }
+      Ok(loaded) => {
+        let _ = drv_parallel_prehash(world, loaded.sources, 4)
+        match cli_check_json(loaded.pkg_name, loaded.paths, loaded.sources) {
+          (ok, json) => {
+            io_println(world, json)
+            if !ok {
+              return 1
+            }
+            return 0
+          }
+          _ => return 1
+        }
+      }
+    }
+  } else if cmd == "query" {
+    if args.length() < 4 {
+      drv_usage(world)
+      return 1
+    }
+    let kind = args[2]
+    let targets : Array[String] = []
+    let mut i = 3
+    while i < args.length() {
+      if args[i] != "--json" {
+        targets.push(args[i])
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    if kind == "deps" && targets.length() == 1 {
+      match drv_detect_manifest_dir(world, targets[0]) {
+        Some(root_dir) =>
+          match drv_load_workspace_nodes(world, root_dir) {
+            Err(msg) => {
+              io_eprintln(world, "error: " + msg)
+              return 1
+            }
+            Ok(nodes) => {
+              let names : Array[String] = []
+              let dep_lists : Array[Array[String]] = []
+              let mut ni = 0
+              while ni < nodes.length() {
+                names.push(nodes[ni].name)
+                dep_lists.push(nodes[ni].deps)
+                ni = ni + 1
+              }
+              let topo = topo_sort_packages(names, dep_lists)
+              if topo.diagnostics.length() > 0 {
+                io_println(world, check_result_to_json(topo.diagnostics))
+                return 1
+              }
+              let ord_names : Array[String] = []
+              let ord_deps : Array[Array[String]] = []
+              let ord_hashes : Array[String] = []
+              let mut k = 0
+              while k < topo.order.length() {
+                let node = nodes[topo.order[k]]
+                let pkg = parse_package(node.name, node.paths, node.sources)
+                ord_names.push(node.name)
+                ord_deps.push(node.deps)
+                ord_hashes.push(sig_hash_hex(emit_pionsig(pkg)))
+                k = k + 1
+              }
+              io_println(
+                world,
+                query_workspace_deps_json(ord_names, ord_deps, ord_hashes),
+              )
+              return 0
+            }
+          }
+        None => ()
+      }
+    }
+    match drv_load_targets(world, targets) {
+      Err(msg) => {
+        io_eprintln(world, "error: " + msg)
+        return 1
+      }
+      Ok(loaded) =>
+        match cli_query_json(kind, loaded.pkg_name, loaded.paths, loaded.sources) {
+          Ok(json) => {
+            io_println(world, json)
+            return 0
+          }
+          Err(msg) => {
+            io_eprintln(world, "error: " + msg)
+            return 1
+          }
+        }
+    }
+  } else if cmd == "emit-sig" {
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      targets.push(args[i])
+      i = i + 1
+    }
+    match drv_load_targets(world, targets) {
+      Err(msg) => {
+        io_eprintln(world, "error: " + msg)
+        return 1
+      }
+      Ok(loaded) => {
+        let sig = cli_emit_sig(loaded.pkg_name, loaded.paths, loaded.sources)
+        io_print(world, sig)
+        return 0
+      }
+    }
+  } else if cmd == "build" {
+    let mut release = false
+    let mut emit_ssa = ""
+    let mut emit_asm = ""
+    let mut out_bin = ""
+    let mut jobs = 16
+    let mut target_override = ""
+    let mut emit_obj = ""
+    let libs : Array[String] = []
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      let nl = drv_parse_link_flag(args, i, libs)
+      if nl > 0 {
+        i = i + nl
+        continue
+      }
+      if a == "--release" {
+        release = true
+      } else if a == "--target" && i + 1 < args.length() {
+        target_override = args[i + 1]
+        i = i + 1
+      } else if a == "--emit-obj" && i + 1 < args.length() {
+        emit_obj = args[i + 1]
+        i = i + 1
+      } else if a == "--emit-ssa" && i + 1 < args.length() {
+        emit_ssa = args[i + 1]
+        i = i + 1
+      } else if a == "--emit-asm" && i + 1 < args.length() {
+        emit_asm = args[i + 1]
+        i = i + 1
+      } else if a == "--jobs" && i + 1 < args.length() {
+        jobs = drv_parse_pos_int(args[i + 1], 16)
+        i = i + 1
+      } else if a == "-o" && i + 1 < args.length() {
+        out_bin = args[i + 1]
+        i = i + 1
+      } else {
+        targets.push(a)
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    if target_override != "" &&
+      target_override != "arm64_apple" &&
+      target_override != "amd64_sysv" {
+      io_eprintln(
+        world,
+        "error: unsupported --target `" +
+        target_override +
+        "` (expected arm64_apple or amd64_sysv)",
+      )
+      return 1
+    }
+    match drv_build_targets(
+      world,
+      targets,
+      release,
+      emit_ssa,
+      emit_asm,
+      out_bin,
+      jobs,
+      target_override,
+      emit_obj,
+      libs,
+    ) {
+      Ok(_) => return 0
+      Err(msg) => {
+        io_eprintln(world, msg)
+        return 1
+      }
+    }
+  } else if cmd == "run" {
+    let mut release = false
+    let mut target = ""
+    let libs : Array[String] = []
+    let prog_args : Array[String] = []
+    let mut after_sep = false
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      if !after_sep && target == "" {
+        let nl = drv_parse_link_flag(args, i, libs)
+        if nl > 0 {
+          i = i + nl
+          continue
+        }
+      }
+      if after_sep {
+        prog_args.push(a)
+      } else if a == "--" {
+        after_sep = true
+      } else if a == "--release" && target == "" {
+        release = true
+      } else if target == "" {
+        target = a
+      } else {
+        prog_args.push(a)
+      }
+      i = i + 1
+    }
+    if target == "" {
+      drv_usage(world)
+      return 1
+    }
+    match drv_build_targets(
+      world,
+      [target],
+      release,
+      "",
+      "",
+      "",
+      drv_default_jobs(world),
+      "",
+      "",
+      libs,
+    ) {
+      Err(msg) => {
+        io_eprintln(world, msg)
+        return 1
+      }
+      Ok(bin_path) => {
+        let run_argv : Array[String] = [bin_path]
+        let mut j = 0
+        while j < prog_args.length() {
+          run_argv.push(prog_args[j])
+          j = j + 1
+        }
+        return proc_exec(world, run_argv)
+      }
+    }
+  } else if cmd == "fmt" {
+    let mut check_only = false
+    let mut as_json = false
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      if a == "--check" {
+        check_only = true
+      } else if a == "--json" {
+        as_json = true
+      } else {
+        targets.push(a)
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    return drv_run_fmt_cmd(world, targets, check_only, as_json)
+  } else if cmd == "test" {
+    let mut as_json = false
+    let mut filter = ""
+    let libs : Array[String] = []
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      let a = args[i]
+      let nl = drv_parse_link_flag(args, i, libs)
+      if nl > 0 {
+        i = i + nl
+        continue
+      }
+      if a == "--json" {
+        as_json = true
+      } else if a == "--filter" && i + 1 < args.length() {
+        filter = args[i + 1]
+        i = i + 1
+      } else {
+        targets.push(a)
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    return drv_run_tests_cmd(world, targets, as_json, filter, libs)
+  } else if cmd == "doc" {
+    let mut as_json = false
+    let targets : Array[String] = []
+    let mut i = 2
+    while i < args.length() {
+      if args[i] == "--json" {
+        as_json = true
+      } else {
+        targets.push(args[i])
+      }
+      i = i + 1
+    }
+    if targets.length() == 0 {
+      drv_usage(world)
+      return 1
+    }
+    return drv_run_doc_cmd(world, targets, as_json)
+  } else {
+    drv_usage(world)
+    return 1
+  }
+}

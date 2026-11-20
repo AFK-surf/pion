@@ -1,4 +1,4 @@
-///| Canonical, comment-preserving deterministic formatter for m2 / MoonBit (pure m2 ∩ MoonBit)
+///| Canonical, comment-preserving deterministic formatter for Pion / MoonBit (pure Pion ∩ MoonBit)
 
 ///|
 fn fmt_is_hspace(c : Int) -> Bool {
@@ -86,7 +86,7 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
 }
 
 ///|
-/// Format m2 / MoonBit source code deterministically:
+/// Format Pion / MoonBit source code deterministically:
 /// - 2-space indentation aligned by `{`/`}`, `(`/`)`, `[`/`]` nesting
 /// - strips trailing horizontal whitespace and normalizes CRLF to LF
 /// - collapses consecutive blank lines to at most 1 (and strips leading/trailing blanks)
@@ -220,7 +220,7 @@ pub fn format_source(source : String) -> String {
 }
 
 ///|
-/// Format `m2c fmt --check --json` output: `{"ok":bool,"unformatted":[...]}`
+/// Format `pionc fmt --check --json` output: `{"ok":bool,"unformatted":[...]}`
 pub fn fmt_check_result_to_json(unformatted : Array[String]) -> String {
   let sb = StringBuilder()
   sb.write_string("{\"ok\":")

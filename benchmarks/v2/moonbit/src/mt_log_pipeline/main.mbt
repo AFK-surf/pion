@@ -2,7 +2,7 @@
 ///| Usage: mt_log_pipeline <logs.txt> [1]
 
 #borrow(path)
-extern "C" fn m2_v2_read_file(path : Bytes) -> Bytes = "m2_v2_read_file"
+extern "C" fn pion_v2_read_file(path : Bytes) -> Bytes = "pion_v2_read_file"
 
 fn str_to_utf8(s : String) -> Bytes {
   let out : Array[Byte] = []
@@ -44,7 +44,7 @@ fn main {
     println("usage: mt_log_pipeline <logs.txt> [1]")
     return
   }
-  let raw = m2_v2_read_file(str_to_utf8(args[1]))
+  let raw = pion_v2_read_file(str_to_utf8(args[1]))
   let total_len = raw.length()
 
   let svc_lat : Map[String, Int64] = Map([])

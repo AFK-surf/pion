@@ -113,8 +113,8 @@ test "fmt: check result JSON format" {
     "empty unformatted list",
   )
   fmt_assert_eq(
-    @core.fmt_check_result_to_json(["a.m2", "dir/b.mbt"]),
-    "{\"ok\":false,\"unformatted\":[\"a.m2\",\"dir/b.mbt\"]}",
+    @core.fmt_check_result_to_json(["a.pion", "dir/b.mbt"]),
+    "{\"ok\":false,\"unformatted\":[\"a.pion\",\"dir/b.mbt\"]}",
     "two unformatted files",
   )
 }

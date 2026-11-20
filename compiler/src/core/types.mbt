@@ -1320,45 +1320,45 @@ pub struct RtPrim {
 }
 
 ///|
-/// Runtime primitives that lower to one direct `$m2_*` C call. `world` ones take an
+/// Runtime primitives that lower to one direct `$pion_*` C call. `world` ones take an
 /// explicit leading `World` argument (not part of `param_tys`).
 fn rt_prim_info(name : String) -> Option[RtPrim] {
   if name == "ptr_alloc" {
-    Some(RtPrim::{ c_sym: "m2_ptr_alloc", world: false, param_tys: [TInt64], ret_ty: TPtr })
+    Some(RtPrim::{ c_sym: "pion_ptr_alloc", world: false, param_tys: [TInt64], ret_ty: TPtr })
   } else if name == "ptr_free" {
-    Some(RtPrim::{ c_sym: "m2_ptr_free", world: false, param_tys: [TPtr], ret_ty: TUnit })
+    Some(RtPrim::{ c_sym: "pion_ptr_free", world: false, param_tys: [TPtr], ret_ty: TUnit })
   } else if name == "ptr_offset" {
-    Some(RtPrim::{ c_sym: "m2_ptr_offset", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
+    Some(RtPrim::{ c_sym: "pion_ptr_offset", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
   } else if name == "ptr_read_ptr" {
-    Some(RtPrim::{ c_sym: "m2_ptr_read_ptr", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
+    Some(RtPrim::{ c_sym: "pion_ptr_read_ptr", world: false, param_tys: [TPtr, TInt64], ret_ty: TPtr })
   } else if name == "ptr_write_ptr" {
-    Some(RtPrim::{ c_sym: "m2_ptr_write_ptr", world: false, param_tys: [TPtr, TInt64, TPtr], ret_ty: TUnit })
+    Some(RtPrim::{ c_sym: "pion_ptr_write_ptr", world: false, param_tys: [TPtr, TInt64, TPtr], ret_ty: TUnit })
   } else if name == "ptr_read_i32" {
-    Some(RtPrim::{ c_sym: "m2_ptr_read_i32", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt })
+    Some(RtPrim::{ c_sym: "pion_ptr_read_i32", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt })
   } else if name == "ptr_write_i32" {
-    Some(RtPrim::{ c_sym: "m2_ptr_write_i32", world: false, param_tys: [TPtr, TInt64, TInt], ret_ty: TUnit })
+    Some(RtPrim::{ c_sym: "pion_ptr_write_i32", world: false, param_tys: [TPtr, TInt64, TInt], ret_ty: TUnit })
   } else if name == "ptr_read_i64" {
-    Some(RtPrim::{ c_sym: "m2_ptr_read_i64", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt64 })
+    Some(RtPrim::{ c_sym: "pion_ptr_read_i64", world: false, param_tys: [TPtr, TInt64], ret_ty: TInt64 })
   } else if name == "ptr_write_i64" {
-    Some(RtPrim::{ c_sym: "m2_ptr_write_i64", world: false, param_tys: [TPtr, TInt64, TInt64], ret_ty: TUnit })
+    Some(RtPrim::{ c_sym: "pion_ptr_write_i64", world: false, param_tys: [TPtr, TInt64, TInt64], ret_ty: TUnit })
   } else if name == "cstr_to_str" {
-    Some(RtPrim::{ c_sym: "m2_cstr_to_str", world: false, param_tys: [TPtr], ret_ty: TString })
+    Some(RtPrim::{ c_sym: "pion_cstr_to_str", world: false, param_tys: [TPtr], ret_ty: TString })
   } else if name == "tcp_listen" {
-    Some(RtPrim::{ c_sym: "m2_tcp_listen", world: true, param_tys: [TString, TInt], ret_ty: TInt })
+    Some(RtPrim::{ c_sym: "pion_tcp_listen", world: true, param_tys: [TString, TInt], ret_ty: TInt })
   } else if name == "tcp_local_port" {
-    Some(RtPrim::{ c_sym: "m2_tcp_local_port", world: true, param_tys: [TInt], ret_ty: TInt })
+    Some(RtPrim::{ c_sym: "pion_tcp_local_port", world: true, param_tys: [TInt], ret_ty: TInt })
   } else if name == "tcp_accept" {
-    Some(RtPrim::{ c_sym: "m2_tcp_accept", world: true, param_tys: [TInt], ret_ty: TInt })
+    Some(RtPrim::{ c_sym: "pion_tcp_accept", world: true, param_tys: [TInt], ret_ty: TInt })
   } else if name == "tcp_connect" {
-    Some(RtPrim::{ c_sym: "m2_tcp_connect", world: true, param_tys: [TString, TInt], ret_ty: TInt })
+    Some(RtPrim::{ c_sym: "pion_tcp_connect", world: true, param_tys: [TString, TInt], ret_ty: TInt })
   } else if name == "tcp_read" {
-    Some(RtPrim::{ c_sym: "m2_tcp_read", world: true, param_tys: [TInt, TInt], ret_ty: TString })
+    Some(RtPrim::{ c_sym: "pion_tcp_read", world: true, param_tys: [TInt, TInt], ret_ty: TString })
   } else if name == "tcp_write" {
-    Some(RtPrim::{ c_sym: "m2_tcp_write", world: true, param_tys: [TInt, TString], ret_ty: TInt })
+    Some(RtPrim::{ c_sym: "pion_tcp_write", world: true, param_tys: [TInt, TString], ret_ty: TInt })
   } else if name == "tcp_close" {
-    Some(RtPrim::{ c_sym: "m2_tcp_close", world: true, param_tys: [TInt], ret_ty: TUnit })
+    Some(RtPrim::{ c_sym: "pion_tcp_close", world: true, param_tys: [TInt], ret_ty: TUnit })
   } else if name == "sleep_ms" {
-    Some(RtPrim::{ c_sym: "m2_sleep_ms", world: true, param_tys: [TInt], ret_ty: TUnit })
+    Some(RtPrim::{ c_sym: "pion_sleep_ms", world: true, param_tys: [TInt], ret_ty: TUnit })
   } else {
     None
   }
@@ -4906,9 +4906,9 @@ pub fn check_package_with_imports(
           imp.span,
           "E_UNKNOWN_PACKAGE",
           "unknown imported package `" + imp.path + "`",
-          "declared dependency in m2.toml",
+          "declared dependency in pion.toml",
           imp.path,
-          "add `" + imp.path + " = { path = \"...\" }` to `[dependencies]` in `m2.toml`",
+          "add `" + imp.path + " = { path = \"...\" }` to `[dependencies]` in `pion.toml`",
         )
       }
       ii = ii + 1

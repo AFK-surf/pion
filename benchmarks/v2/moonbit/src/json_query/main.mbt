@@ -1,7 +1,7 @@
 ///| V2 Benchmark 1: json_query (MoonBit, hand-written lexer + recursive-descent JSON AST)
 
 #borrow(path)
-extern "C" fn m2_v2_read_file(path : Bytes) -> Bytes = "m2_v2_read_file"
+extern "C" fn pion_v2_read_file(path : Bytes) -> Bytes = "pion_v2_read_file"
 
 fn str_to_utf8(s : String) -> Bytes {
   let out : Array[Byte] = []
@@ -262,7 +262,7 @@ fn main {
     println("usage: json_query <dataset.json>")
     return
   }
-  let raw = m2_v2_read_file(str_to_utf8(args[1]))
+  let raw = pion_v2_read_file(str_to_utf8(args[1]))
   let p : Parser = { src: raw, len: raw.length(), pos: 0 }
   let root = parse_value(p)
   let records = match obj_get(root, "records") {

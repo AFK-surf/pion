@@ -13,6 +13,6 @@ implemented by three record types:
 - `describe[T: Summary + Serializable](x)` — `"<summary> | <to_kv>"`.
 - A **heterogeneous** collection (article, two tweets, metric) rendered through the same functions, using each
   language's idiom: trait objects (`Box<dyn Item>` in Rust, `&Item` in MoonBit), an interface slice in Go;
-  m2 has no trait objects (monomorphization only), so it uses a closed enum wrapper that implements both traits.
+  Pion has no trait objects (monomorphization only), so it uses a closed enum wrapper that implements both traits.
 
 `main` prints the heterogeneous `render_all`, one `describe` per item, then `render_all` over `Array[Metric]`.

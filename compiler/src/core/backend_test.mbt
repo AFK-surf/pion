@@ -34,14 +34,14 @@ test "qbe_codegen_deterministic_and_release_strips_assert" {
     #|  io_println(world, "hello")
     #|  0
     #|}
-  let pkg = @core.parse_package("test", ["main.m2"], [src])
+  let pkg = @core.parse_package("test", ["main.pion"], [src])
   let dev1 = @core.emit_qbe_package(pkg, false)
   let dev2 = @core.emit_qbe_package(pkg, false)
   assert_eq(dev1.ssa, dev2.ssa)
   assert_eq(dev1.has_main, true)
-  assert_eq(dev1.ssa.contains("m2_debug_assert"), true)
+  assert_eq(dev1.ssa.contains("pion_debug_assert"), true)
   let rel = @core.emit_qbe_package(pkg, true)
-  assert_eq(rel.ssa.contains("m2_debug_assert"), false)
+  assert_eq(rel.ssa.contains("pion_debug_assert"), false)
 }
 
 ///|
@@ -59,7 +59,7 @@ test "qbe_double_slot_and_cond_branch_fusion" {
     #|  }
     #|  s
     #|}
-  let pkg = @core.parse_package("test", ["fp.m2"], [src])
+  let pkg = @core.parse_package("test", ["fp.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
   // Double slot must initialize with stored d_0.0 (not storel 0) for QBE mem2reg
   assert_eq(res.ssa.contains("stored d_0.0"), true)
@@ -92,17 +92,17 @@ test "qbe_borrow_elision_tree_and_arr_elem_and_bce" {
     #|    i = i + 1
     #|  }
     #|}
-  let pkg = @core.parse_package("test", ["opt.m2"], [src])
+  let pkg = @core.parse_package("test", ["opt.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
   // Zero RC inc anywhere; zero RC dec inside check_tree / step (drop_enum_Tree is emitted before fns)
-  assert_eq(res.ssa.contains("m2_rc_inc"), false)
-  let fn_part = match res.ssa.find("$m2_fn_check_tree") {
+  assert_eq(res.ssa.contains("pion_rc_inc"), false)
+  let fn_part = match res.ssa.find("$pion_fn_check_tree") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => res.ssa
   }
-  assert_eq(fn_part.contains("m2_rc_dec"), false)
-  // Conservative BCE removes m2_panic_oob inside `while i < n` where `n = bodies.length()`
-  assert_eq(res.ssa.contains("m2_panic_oob"), false)
+  assert_eq(fn_part.contains("pion_rc_dec"), false)
+  // Conservative BCE removes pion_panic_oob inside `while i < n` where `n = bodies.length()`
+  assert_eq(res.ssa.contains("pion_panic_oob"), false)
 }
 
 ///|
@@ -114,7 +114,7 @@ test "qbe_pow2_signed_div_shift" {
     #|pub fn quarter(x : Int) -> Int {
     #|  x / 4
     #|}
-  let pkg = @core.parse_package("test", ["div.m2"], [src])
+  let pkg = @core.parse_package("test", ["div.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
   assert_eq(res.ssa.contains("=w div "), false)
   assert_eq(res.ssa.contains("=w sar "), true)
@@ -132,7 +132,7 @@ test "sig_file_stub_and_sigs_hash_parity" {
     #|  io_println(world, add_pt(p, SCALE).to_string())
     #|  0
     #|}
-  let prep = match @core.cli_prepare_qbe_units("demo", ["a.m2", "b.m2"], [s1, s2]) {
+  let prep = match @core.cli_prepare_qbe_units("demo", ["a.pion", "b.pion"], [s1, s2]) {
     Ok(p) => p
     Err(e) => fail(e)
   }
@@ -146,7 +146,7 @@ test "sig_file_stub_and_sigs_hash_parity" {
   assert_eq(summary.const_units.length(), 1)
   assert_eq(summary.const_units[0], 0)
   let stub0 = @core.emit_file_stub(f0)
-  let spr = @core.parse_source("a.m2", stub0)
+  let spr = @core.parse_source("a.pion", stub0)
   assert_eq(spr.diagnostics.length(), 0)
 }
 
@@ -172,21 +172,21 @@ test "qbe_map_try_get_match_fusion_and_alloc_uninit" {
     #|    Some(v) => v
     #|  }
     #|}
-  let pkg = @core.parse_package("test", ["p3c.m2"], [src])
+  let pkg = @core.parse_package("test", ["p3c.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  // Node(l, r) must use $m2_alloc_uninit (not $m2_alloc)
-  assert_eq(res.ssa.contains("$m2_alloc_uninit("), true)
-  assert_eq(res.ssa.contains("$m2_alloc("), false)
-  // Fused match m.get(k) must emit $m2_map_try_get, never $m2_map_has, and zero Some allocation / RC in lookup_*
-  assert_eq(res.ssa.contains("$m2_map_try_get("), true)
-  assert_eq(res.ssa.contains("$m2_map_has("), false)
-  let lookup_part = match res.ssa.find("$m2_fn_lookup_int") {
+  // Node(l, r) must use $pion_alloc_uninit (not $pion_alloc)
+  assert_eq(res.ssa.contains("$pion_alloc_uninit("), true)
+  assert_eq(res.ssa.contains("$pion_alloc("), false)
+  // Fused match m.get(k) must emit $pion_map_try_get, never $pion_map_has, and zero Some allocation / RC in lookup_*
+  assert_eq(res.ssa.contains("$pion_map_try_get("), true)
+  assert_eq(res.ssa.contains("$pion_map_has("), false)
+  let lookup_part = match res.ssa.find("$pion_fn_lookup_int") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => res.ssa
   }
-  assert_eq(lookup_part.contains("$m2_alloc"), false)
-  assert_eq(lookup_part.contains("m2_rc_inc"), false)
-  assert_eq(lookup_part.contains("m2_rc_dec"), false)
+  assert_eq(lookup_part.contains("$pion_alloc"), false)
+  assert_eq(lookup_part.contains("pion_rc_inc"), false)
+  assert_eq(lookup_part.contains("pion_rc_dec"), false)
 }
 
 ///|
@@ -204,16 +204,16 @@ test "qbe_p4b_int32_w_regs_and_double_mul2_add" {
     #|pub fn double_two(x : Double, y : Double) -> Double {
     #|  2.0 * x + y * 2.0
     #|}
-  let pkg = @core.parse_package("test", ["p4b.m2"], [src])
+  let pkg = @core.parse_package("test", ["p4b.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
   // Native 32-bit w ABI & local slots, zero extsw in pure Int arithmetic/loops
-  assert_eq(res.ssa.contains("function w $m2_fn_sum_int(w %p0)"), true)
+  assert_eq(res.ssa.contains("function w $pion_fn_sum_int(w %p0)"), true)
   assert_eq(res.ssa.contains("alloc4 4"), true)
   assert_eq(res.ssa.contains("storew "), true)
   assert_eq(res.ssa.contains("=w loadsw "), true)
   assert_eq(res.ssa.contains("extsw"), false)
   // IEEE-754 exact `2.0 * x -> x + x` and `y * 2.0 -> y + y`
-  let fn_dbl = match res.ssa.find("$m2_fn_double_two") {
+  let fn_dbl = match res.ssa.find("$pion_fn_double_two") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => res.ssa
   }
@@ -247,11 +247,11 @@ test "qbe_p4b_loop_invariant_readonly_struct_field_hoist" {
     #|    i = i + 1
     #|  }
     #|}
-  let pkg = @core.parse_package("test", ["hoist.m2"], [src])
+  let pkg = @core.parse_package("test", ["hoist.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
   // Locate the inner loop (@wh_pinit_...) and verify b.x / b.mass are hoisted before it,
   // and b.vx is scalar-promoted into a local slot with alias guard (@wh_pb_, @wh_pbail_, @wh_pwb_)
-  let fn_adv = match res.ssa.find("$m2_fn_advance_like") {
+  let fn_adv = match res.ssa.find("$pion_fn_advance_like") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => res.ssa
   }
@@ -303,9 +303,9 @@ test "qbe_p4d_array_int_loadl_and_block_immut_field_cse" {
     #|  a.vy = b.mass
     #|  a.vz = b.mass
     #|}
-  let pkg = @core.parse_package("test", ["p4d.m2"], [src])
+  let pkg = @core.parse_package("test", ["p4d.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_arr = match res.ssa.find("$m2_fn_read_int_elem") {
+  let fn_arr = match res.ssa.find("$pion_fn_read_int_elem") {
     Some(idx) => {
       let rest = res.ssa.clamped_view(start=idx).to_owned()
       match rest.find("\n}\n") {
@@ -324,7 +324,7 @@ test "qbe_p4d_array_int_loadl_and_block_immut_field_cse" {
   assert_eq(after_shl.contains("=w copy "), true)
   assert_eq(after_shl.contains("=w loadsw "), false)
   // Immutable primitive struct field `b.mass` loaded once across 3 reads in same basic block
-  let fn_mass = match res.ssa.find("$m2_fn_triple_mass") {
+  let fn_mass = match res.ssa.find("$pion_fn_triple_mass") {
     Some(idx) => {
       let rest = res.ssa.clamped_view(start=idx).to_owned()
       match rest.find("\n}\n") {
@@ -364,9 +364,9 @@ test "qbe_p5b_guarded_bottom_tested_loop_rotation" {
     #|  }
     #|  s
     #|}
-  let pkg = @core.parse_package("test", ["rot.m2"], [src])
+  let pkg = @core.parse_package("test", ["rot.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_s = match res.ssa.find("$m2_fn_count_even") {
+  let fn_s = match res.ssa.find("$pion_fn_count_even") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => ""
   }
@@ -412,9 +412,9 @@ test "qbe_p5b_preloop_bce_versioning_and_extsw_reuse" {
     #|    si = si + 1
     #|  }
     #|}
-  let pkg = @core.parse_package("test", ["bce_v.m2"], [src])
+  let pkg = @core.parse_package("test", ["bce_v.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_s = match res.ssa.find("$m2_fn_copy_rev_shift") {
+  let fn_s = match res.ssa.find("$pion_fn_copy_rev_shift") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => ""
   }
@@ -431,8 +431,8 @@ test "qbe_p5b_preloop_bce_versioning_and_extsw_reuse" {
           None => after_fast.length()
         }
         let fast_region = after_fast.clamped_view(end=slow_off).to_owned()
-        // Fast region must have zero m2_panic_oob
-        assert_eq(fast_region.contains("m2_panic_oob"), false)
+        // Fast region must have zero pion_panic_oob
+        assert_eq(fast_region.contains("pion_panic_oob"), false)
         // First loop (`perm[ci] = perm1[ci]`): zero redundant extsw for copied value
         if fast_count == 0 {
           assert_eq(fast_region.contains("=l loadl "), true)
@@ -460,8 +460,8 @@ test "qbe_p5b_preloop_bce_versioning_and_extsw_reuse" {
     }
   }
   assert_eq(fast_count, 3)
-  // Slow path still retains m2_panic_oob for safety
-  assert_eq(fn_s.contains("m2_panic_oob"), true)
+  // Slow path still retains pion_panic_oob for safety
+  assert_eq(fn_s.contains("pion_panic_oob"), true)
 }
 
 ///|
@@ -485,9 +485,9 @@ test "qbe_p5b_loop_carried_square_reuse" {
     #|  }
     #|  escaped
     #|}
-  let pkg = @core.parse_package("test", ["sq.m2"], [src])
+  let pkg = @core.parse_package("test", ["sq.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_s = match res.ssa.find("$m2_fn_mandel_iter") {
+  let fn_s = match res.ssa.find("$pion_fn_mandel_iter") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => ""
   }
@@ -531,9 +531,9 @@ test "qbe_p5b_alias_guarded_struct_promotion_and_bailout" {
     #|  }
     #|  b.v
     #|}
-  let pkg = @core.parse_package("test", ["alias_prom.m2"], [src])
+  let pkg = @core.parse_package("test", ["alias_prom.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_s = match res.ssa.find("$m2_fn_pair_update") {
+  let fn_s = match res.ssa.find("$pion_fn_pair_update") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => ""
   }
@@ -566,9 +566,9 @@ test "qbe_p5p_sq_reuse_dead_var_reorder" {
     #|  }
     #|  escaped
     #|}
-  let pkg = @core.parse_package("test", ["sq_reorder.m2"], [src])
+  let pkg = @core.parse_package("test", ["sq_reorder.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_s = match res.ssa.find("$m2_fn_mandel_reorder") {
+  let fn_s = match res.ssa.find("$pion_fn_mandel_reorder") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => ""
   }
@@ -605,13 +605,13 @@ test "qbe_p5p_even_int_div2_sar" {
     #|pub fn eval_general(x : Int) -> Int {
     #|  x / 2
     #|}
-  let pkg = @core.parse_package("test", ["even_div2.m2"], [src])
+  let pkg = @core.parse_package("test", ["even_div2.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let even_start = match res.ssa.find("$m2_fn_eval_even") {
+  let even_start = match res.ssa.find("$pion_fn_eval_even") {
     Some(idx) => idx
     None => 0
   }
-  let gen_start = match res.ssa.find("$m2_fn_eval_general") {
+  let gen_start = match res.ssa.find("$pion_fn_eval_general") {
     Some(idx) => idx
     None => res.ssa.length()
   }
@@ -641,9 +641,9 @@ test "qbe_p5p_local_immut_w_to_l_ext_prop" {
     #|    fi = fi + 1
     #|  }
     #|}
-  let pkg = @core.parse_package("test", ["w2l_local.m2"], [src])
+  let pkg = @core.parse_package("test", ["w2l_local.pion"], [src])
   let res = @core.emit_qbe_package(pkg, true)
-  let fn_s = match res.ssa.find("$m2_fn_rev_swap") {
+  let fn_s = match res.ssa.find("$pion_fn_rev_swap") {
     Some(idx) => res.ssa.clamped_view(start=idx).to_owned()
     None => ""
   }
@@ -657,7 +657,7 @@ test "qbe_p5p_local_immut_w_to_l_ext_prop" {
     None => after_fast.length()
   }
   let fast_region = after_fast.clamped_view(end=slow_off).to_owned()
-  assert_eq(fast_region.contains("m2_panic_oob"), false)
+  assert_eq(fast_region.contains("pion_panic_oob"), false)
   let mut ext_cnt = 0
   let mut ep = 0
   while ep < fast_region.length() {
@@ -681,11 +681,11 @@ test "p6b_cas_compiler_fingerprint_invalidates_keys" {
   let fp3 = @core.cas_compiler_fp(1000L, 2000L, "salt-a")
   assert_not_eq(fp1, fp2)
   assert_not_eq(fp1, fp3)
-  let k1 = @core.cas_compute_key("p", ["a.m2"], ["pub fn f() -> Int { 1 }"], [], "arm64_apple", false, fp1)
-  let k2 = @core.cas_compute_key("p", ["a.m2"], ["pub fn f() -> Int { 1 }"], [], "arm64_apple", false, fp2)
+  let k1 = @core.cas_compute_key("p", ["a.pion"], ["pub fn f() -> Int { 1 }"], [], "arm64_apple", false, fp1)
+  let k2 = @core.cas_compute_key("p", ["a.pion"], ["pub fn f() -> Int { 1 }"], [], "arm64_apple", false, fp2)
   assert_not_eq(k1, k2)
-  let u1 = @core.cas_compute_unit_key("p", 0, "a.m2", "h1", "s1", "arm64_apple", false, fp1)
-  let u2 = @core.cas_compute_unit_key("p", 0, "a.m2", "h1", "s1", "arm64_apple", false, fp3)
+  let u1 = @core.cas_compute_unit_key("p", 0, "a.pion", "h1", "s1", "arm64_apple", false, fp1)
+  let u2 = @core.cas_compute_unit_key("p", 0, "a.pion", "h1", "s1", "arm64_apple", false, fp3)
   assert_not_eq(u1, u2)
 }
 
@@ -694,12 +694,12 @@ test "p6b_multi_pkg_qbe_mangling_and_test_runner_emit" {
   let math_src =
     #|pub let BASE : Int = 10
     #|pub fn add(a : Int, b : Int) -> Int { a + b + BASE }
-  let math_cr = @core.check_source_files_with_imports("math", ["math.m2"], [math_src], [], true)
+  let math_cr = @core.check_source_files_with_imports("math", ["math.pion"], [math_src], [], true)
   assert_eq(math_cr.diagnostics.length(), 0)
   let math_qbe = @core.emit_qbe_package_multi(math_cr.pkg, math_cr.tc, false, false, [])
-  assert_eq(math_qbe.ssa.contains("export function w $m2_pkg_math_fn_add("), true)
-  assert_eq(math_qbe.ssa.contains("export function $m2_pkg_math_init_consts()"), true)
-  assert_eq(math_qbe.ssa.contains("export data $m2_pkg_math_const_BASE"), true)
+  assert_eq(math_qbe.ssa.contains("export function w $pion_pkg_math_fn_add("), true)
+  assert_eq(math_qbe.ssa.contains("export function $pion_pkg_math_init_consts()"), true)
+  assert_eq(math_qbe.ssa.contains("export data $pion_pkg_math_const_BASE"), true)
   assert_eq(math_qbe.has_main, false)
 
   let app_src =
@@ -707,18 +707,18 @@ test "p6b_multi_pkg_qbe_mangling_and_test_runner_emit" {
     #|pub fn main() -> Int { math::add(1, 2) }
     #|test "adds" { debug_assert(math::add(1, 2) == 13, "sum") }
   let imported = [@core.imported_pkg_new("math", math_cr.tc)]
-  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_src], imported, true)
+  let app_cr = @core.check_source_files_with_imports("app", ["app.pion"], [app_src], imported, true)
   assert_eq(app_cr.diagnostics.length(), 0)
   let build_qbe = @core.emit_qbe_package_multi(app_cr.pkg, app_cr.tc, true, true, ["math"])
-  assert_eq(build_qbe.ssa.contains("call $m2_pkg_math_init_consts()"), true)
-  assert_eq(build_qbe.ssa.contains("call $m2_pkg_math_fn_add("), true)
-  assert_eq(build_qbe.ssa.contains("m2_test_fn_0"), false)
+  assert_eq(build_qbe.ssa.contains("call $pion_pkg_math_init_consts()"), true)
+  assert_eq(build_qbe.ssa.contains("call $pion_pkg_math_fn_add("), true)
+  assert_eq(build_qbe.ssa.contains("pion_test_fn_0"), false)
 
   let test_qbe = @core.emit_qbe_test_package(app_cr.pkg, app_cr.tc, ["math"])
   assert_eq(test_qbe.test_names.length(), 1)
   assert_eq(test_qbe.test_names[0], "adds")
-  assert_eq(test_qbe.ssa.contains("function $m2_test_fn_0()"), true)
-  assert_eq(test_qbe.ssa.contains("m2_debug_assert"), true)
+  assert_eq(test_qbe.ssa.contains("function $pion_test_fn_0()"), true)
+  assert_eq(test_qbe.ssa.contains("pion_debug_assert"), true)
   let rep = @core.format_test_report_json(["a", "b"], [true, false])
   assert_eq(rep, "{\"ok\":false,\"passed\":1,\"failed\":1,\"tests\":[{\"name\":\"a\",\"ok\":true},{\"name\":\"b\",\"ok\":false}]}")
 }
@@ -749,36 +749,36 @@ test "p6c_stdlib_qbe_codegen_symbols" {
     #|  let _ec = proc_exec_capture(world, ["echo", "ok"])
     #|  0
     #|}
-  let cr = @core.check_source_files_with_imports("p6c_std", ["std.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p6c_std", ["std.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
-  assert_eq(ssa.contains("call $m2_str_trim("), true)
-  assert_eq(ssa.contains("call $m2_str_starts_with("), true)
-  assert_eq(ssa.contains("call $m2_str_ends_with("), true)
-  assert_eq(ssa.contains("call $m2_str_contains("), true)
-  assert_eq(ssa.contains("call $m2_str_index_of("), true)
-  assert_eq(ssa.contains("call $m2_str_split("), true)
-  assert_eq(ssa.contains("call $m2_str_replace("), true)
-  assert_eq(ssa.contains("call $m2_str_to_bytes("), true)
-  assert_eq(ssa.contains("call $m2_bytes_new("), true)
+  assert_eq(ssa.contains("call $pion_str_trim("), true)
+  assert_eq(ssa.contains("call $pion_str_starts_with("), true)
+  assert_eq(ssa.contains("call $pion_str_ends_with("), true)
+  assert_eq(ssa.contains("call $pion_str_contains("), true)
+  assert_eq(ssa.contains("call $pion_str_index_of("), true)
+  assert_eq(ssa.contains("call $pion_str_split("), true)
+  assert_eq(ssa.contains("call $pion_str_replace("), true)
+  assert_eq(ssa.contains("call $pion_str_to_bytes("), true)
+  assert_eq(ssa.contains("call $pion_bytes_new("), true)
   // Bytes set/get/length are inlined in QBE IR (storeb / loadub / @bytes_oob)
   assert_eq(ssa.contains("storeb "), true)
   assert_eq(ssa.contains("loadub "), true)
   assert_eq(ssa.contains("@bytes_oob"), true)
-  assert_eq(ssa.contains("call $m2_bytes_slice("), true)
-  assert_eq(ssa.contains("call $m2_bytes_concat("), true)
-  assert_eq(ssa.contains("call $m2_bytes_to_str("), true)
-  assert_eq(ssa.contains("call $m2_math_abs("), true)
-  assert_eq(ssa.contains("call $m2_math_floor("), true)
-  assert_eq(ssa.contains("call $m2_math_ceil("), true)
-  assert_eq(ssa.contains("call $m2_math_sin("), true)
-  assert_eq(ssa.contains("call $m2_math_cos("), true)
-  assert_eq(ssa.contains("call $m2_math_pow("), true)
-  assert_eq(ssa.contains("call $m2_world_fs_write_bytes("), true)
-  assert_eq(ssa.contains("call $m2_world_fs_read_bytes("), true)
-  assert_eq(ssa.contains("call $m2_world_fs_append("), true)
-  assert_eq(ssa.contains("call $m2_world_fs_mtime_ms("), true)
-  assert_eq(ssa.contains("call $m2_world_exec_capture("), true)
+  assert_eq(ssa.contains("call $pion_bytes_slice("), true)
+  assert_eq(ssa.contains("call $pion_bytes_concat("), true)
+  assert_eq(ssa.contains("call $pion_bytes_to_str("), true)
+  assert_eq(ssa.contains("call $pion_math_abs("), true)
+  assert_eq(ssa.contains("call $pion_math_floor("), true)
+  assert_eq(ssa.contains("call $pion_math_ceil("), true)
+  assert_eq(ssa.contains("call $pion_math_sin("), true)
+  assert_eq(ssa.contains("call $pion_math_cos("), true)
+  assert_eq(ssa.contains("call $pion_math_pow("), true)
+  assert_eq(ssa.contains("call $pion_world_fs_write_bytes("), true)
+  assert_eq(ssa.contains("call $pion_world_fs_read_bytes("), true)
+  assert_eq(ssa.contains("call $pion_world_fs_append("), true)
+  assert_eq(ssa.contains("call $pion_world_fs_mtime_ms("), true)
+  assert_eq(ssa.contains("call $pion_world_exec_capture("), true)
 }
 
 ///|
@@ -804,7 +804,7 @@ test "p6c_perceus_lite_early_drop_before_subsequent_alloc" {
     #|  let c2 = check_tree(long_lived)
     #|  c1 + c2
     #|}
-  let cr = @core.check_source_files_with_imports("p6c_ed", ["ed.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p6c_ed", ["ed.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
   let fn_start = match ssa.find("fn_run(") {
@@ -814,7 +814,7 @@ test "p6c_perceus_lite_early_drop_before_subsequent_alloc" {
   assert_eq(fn_start >= 0, true)
   let fn_body = ssa.clamped_view(start=fn_start).to_owned()
   // After first check_tree(stretch) and before second make_tree(3), stretch must be
-  // early-dropped via m2_rc_dec + slot zeroing (`storel 0,`).
+  // early-dropped via pion_rc_dec + slot zeroing (`storel 0,`).
   let first_check = match fn_body.find("fn_check_tree(") {
     Some(idx) => idx
     None => -1
@@ -827,7 +827,7 @@ test "p6c_perceus_lite_early_drop_before_subsequent_alloc" {
   }
   assert_eq(second_make >= 0, true)
   let between = after_first_check.clamped_view(end=second_make).to_owned()
-  assert_eq(between.contains("call $m2_rc_dec("), true)
+  assert_eq(between.contains("call $pion_rc_dec("), true)
   assert_eq(between.contains("storel 0, "), true)
 }
 
@@ -877,24 +877,24 @@ test "p7a_ergonomics_qbe_codegen_and_bce" {
     "  let _o = try_opt(Some(3))\n" +
     "  s + msg.length()\n" +
     "}\n"
-  let cr = @core.check_source_files_with_imports("p7a_cg", ["cg.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p7a_cg", ["cg.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
   assert_eq(ssa.contains("@try_ok"), true)
   assert_eq(ssa.contains("@try_err"), true)
   assert_eq(ssa.contains("@try_some"), true)
   assert_eq(ssa.contains("@try_none"), true)
-  assert_eq(ssa.contains("call $m2_double_to_str("), true)
-  assert_eq(ssa.contains("call $m2_arr_sort_int("), true)
-  assert_eq(ssa.contains("call $m2_arr_sort_str("), true)
-  assert_eq(ssa.contains("call $m2_arr_reverse("), true)
-  assert_eq(ssa.contains("call $m2_arr_clear("), true)
-  assert_eq(ssa.contains("call $m2_arr_join("), true)
-  assert_eq(ssa.contains("call $m2_map_has("), true)
-  assert_eq(ssa.contains("call $m2_map_keys("), true)
-  assert_eq(ssa.contains("call $m2_map_remove("), true)
+  assert_eq(ssa.contains("call $pion_double_to_str("), true)
+  assert_eq(ssa.contains("call $pion_arr_sort_int("), true)
+  assert_eq(ssa.contains("call $pion_arr_sort_str("), true)
+  assert_eq(ssa.contains("call $pion_arr_reverse("), true)
+  assert_eq(ssa.contains("call $pion_arr_clear("), true)
+  assert_eq(ssa.contains("call $pion_arr_join("), true)
+  assert_eq(ssa.contains("call $pion_map_has("), true)
+  assert_eq(ssa.contains("call $pion_map_keys("), true)
+  assert_eq(ssa.contains("call $pion_map_remove("), true)
   assert_eq(ssa.contains("@forr_s"), true)
-  // Verify sum_arr (`for x in a` without continue) triggers BCE (zero m2_panic_oob in sum_arr)
+  // Verify sum_arr (`for x in a` without continue) triggers BCE (zero pion_panic_oob in sum_arr)
   let sa_start = match ssa.find("fn_sum_arr(") {
     Some(idx) => idx
     None => -1
@@ -906,7 +906,7 @@ test "p7a_ergonomics_qbe_codegen_and_bce" {
     None => sa_rest.length()
   }
   let sa_body = sa_rest.clamped_view(end=sa_end).to_owned()
-  assert_eq(sa_body.contains("m2_panic_oob"), false)
+  assert_eq(sa_body.contains("pion_panic_oob"), false)
 }
 
 ///|
@@ -930,13 +930,13 @@ test "p8: tuple destructuring, match guards, and generic pair_swap codegen" {
     "  let second = sw.1\n" +
     "  first + pick(Some(second))\n" +
     "}\n"
-  let cr = @core.check_source_files_with_imports("p8_cg", ["p8_cg.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p8_cg", ["p8_cg.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
   assert_eq(ssa.contains("@match_guard_ok"), true)
   assert_eq(ssa.contains("@match_guard_fail"), true)
-  assert_eq(ssa.contains("call $m2_rc_inc("), true)
-  assert_eq(ssa.contains("call $m2_rc_dec("), true)
+  assert_eq(ssa.contains("call $pion_rc_inc("), true)
+  assert_eq(ssa.contains("call $pion_rc_dec("), true)
 }
 
 ///|
@@ -1008,10 +1008,10 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
     "  let a : Array[Int] = []\n" +
     "  dispatch_if(OP_3) + dispatch_match(2) + fast_ops(b, sb, a)\n" +
     "}\n"
-  let cr = @core.check_source_files_with_imports("p10a_cg", ["p10a.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p10a_cg", ["p10a.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
-  // 1. skip_ws: no m2_str_byte_at, no m2_rc_inc/m2_rc_dec inside skip_ws
+  // 1. skip_ws: no pion_str_byte_at, no pion_rc_inc/pion_rc_dec inside skip_ws
   let sw_start = match ssa.find("fn_skip_ws(") {
     Some(idx) => idx
     None => -1
@@ -1023,11 +1023,11 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
     None => sw_rest.length()
   }
   let sw_body = sw_rest.clamped_view(end=sw_end).to_owned()
-  assert_eq(sw_body.contains("m2_str_byte_at"), false)
-  assert_eq(sw_body.contains("m2_rc_inc"), false)
-  assert_eq(sw_body.contains("m2_rc_dec"), false)
+  assert_eq(sw_body.contains("pion_str_byte_at"), false)
+  assert_eq(sw_body.contains("pion_rc_inc"), false)
+  assert_eq(sw_body.contains("pion_rc_dec"), false)
   assert_eq(sw_body.contains("loadub"), true)
-  // 2. dispatch_if: const folded (no loadsw $m2_const_) and native jtbl jump table
+  // 2. dispatch_if: const folded (no loadsw $pion_const_) and native jtbl jump table
   let di_start = match ssa.find("fn_dispatch_if(") {
     Some(idx) => idx
     None => -1
@@ -1039,7 +1039,7 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
     None => di_rest.length()
   }
   let di_body = di_rest.clamped_view(end=di_end).to_owned()
-  assert_eq(di_body.contains("$m2_const_"), false)
+  assert_eq(di_body.contains("$pion_const_"), false)
   assert_eq(di_body.contains("jtbl "), true)
   assert_eq(di_body.contains("@sw_arm"), true)
   // 3. dispatch_match: native jtbl jump table
@@ -1068,14 +1068,14 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
     None => fo_rest.length()
   }
   let fo_body = fo_rest.clamped_view(end=fo_end).to_owned()
-  assert_eq(fo_body.contains("m2_bytes_len"), false)
-  assert_eq(fo_body.contains("m2_bytes_get"), false)
-  assert_eq(fo_body.contains("m2_bytes_set"), false)
+  assert_eq(fo_body.contains("pion_bytes_len"), false)
+  assert_eq(fo_body.contains("pion_bytes_get"), false)
+  assert_eq(fo_body.contains("pion_bytes_set"), false)
   assert_eq(fo_body.contains("@sb_fast"), true)
   assert_eq(fo_body.contains("@ap_fast"), true)
   // 5. deep freeze for Msg (nested String)
-  assert_eq(ssa.contains("function $m2_freeze_st_Msg("), true)
-  assert_eq(ssa.contains("call $m2_freeze_st_Msg("), true)
+  assert_eq(ssa.contains("function $pion_freeze_st_Msg("), true)
+  assert_eq(ssa.contains("call $pion_freeze_st_Msg("), true)
 }
 
 ///|
@@ -1163,10 +1163,10 @@ test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
     "  let a = [1, 2]\n" +
     "  scan_str(\"abc\\n\") + scan_slice(\"abc \", 0, 4) + use_skip(sc) + budget_loop(a, a, a, a, a, 2)\n" +
     "}\n"
-  let cr = @core.check_source_files_with_imports("p11b_cg", ["p11b.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p11b_cg", ["p11b.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
-  // 1. build_obj: owned push fast path + m2_arr_push_owned + zero rc_inc/rc_dec
+  // 1. build_obj: owned push fast path + pion_arr_push_owned + zero rc_inc/rc_dec
   let bo_start = match ssa.find("fn_build_obj(") {
     Some(idx) => idx
     None => -1
@@ -1179,10 +1179,10 @@ test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
   }
   let bo_body = bo_rest.clamped_view(end=bo_end).to_owned()
   assert_eq(bo_body.contains("@ap_fast"), true)
-  assert_eq(bo_body.contains("m2_arr_push_owned"), true)
-  assert_eq(bo_body.contains("m2_rc_inc"), false)
-  assert_eq(bo_body.contains("m2_rc_dec"), false)
-  // 2. scan_str: direct String BCE under `&&` -> zero m2_panic_oob
+  assert_eq(bo_body.contains("pion_arr_push_owned"), true)
+  assert_eq(bo_body.contains("pion_rc_inc"), false)
+  assert_eq(bo_body.contains("pion_rc_dec"), false)
+  // 2. scan_str: direct String BCE under `&&` -> zero pion_panic_oob
   let ss_start = match ssa.find("fn_scan_str(") {
     Some(idx) => idx
     None => -1
@@ -1194,7 +1194,7 @@ test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
     None => ss_rest.length()
   }
   let ss_body = ss_rest.clamped_view(end=ss_end).to_owned()
-  assert_eq(ss_body.contains("m2_panic_oob"), false)
+  assert_eq(ss_body.contains("pion_panic_oob"), false)
   assert_eq(ss_body.contains("loadub"), true)
   // 3. scan_slice: BCE versioning for String under `&&` -> @wh_vchk + @wh_fast
   let sl_start = match ssa.find("fn_scan_slice(") {
@@ -1210,7 +1210,7 @@ test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
   let sl_body = sl_rest.clamped_view(end=sl_end).to_owned()
   assert_eq(sl_body.contains("@wh_vchk"), true)
   assert_eq(sl_body.contains("@wh_fast"), true)
-  // 4. use_skip: leaf-loop skip_sp inlined (no call $m2_fn_skip_sp)
+  // 4. use_skip: leaf-loop skip_sp inlined (no call $pion_fn_skip_sp)
   let us_start = match ssa.find("fn_use_skip(") {
     Some(idx) => idx
     None => -1
@@ -1222,7 +1222,7 @@ test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
     None => us_rest.length()
   }
   let us_body = us_rest.clamped_view(end=us_end).to_owned()
-  assert_eq(us_body.contains("call $m2_fn_skip_sp"), false)
+  assert_eq(us_body.contains("call $pion_fn_skip_sp"), false)
   assert_eq(us_body.contains("loadub"), true)
   // 5. budget_loop: emits cleanly with 5 arrays + call
   assert_eq(ssa.contains("fn_budget_loop("), true)
@@ -1274,7 +1274,7 @@ test "p11c: native jtbl for dense int dispatch, sparse fallback, and dense TEnum
     "pub fn main() -> Int {\n" +
     "  dense_int(12) + sparse_int(100) + eval_enum(EAdd(3, 4))\n" +
     "}\n"
-  let cr = @core.check_source_files_with_imports("p11c_cg", ["p11c.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p11c_cg", ["p11c.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
   // 1. dense_int: shifted jtbl
@@ -1336,7 +1336,7 @@ test "p11c: same-index overwrite OOB dedup and pure EIf rhs array borrow" {
     "  cmp_overwrite(st, 1)\n" +
     "  st[0]\n" +
     "}\n"
-  let cr = @core.check_source_files_with_imports("p11c_ow", ["p11c_ow.m2"], [src], [], true)
+  let cr = @core.check_source_files_with_imports("p11c_ow", ["p11c_ow.pion"], [src], [], true)
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
   // cmp_overwrite: zero rc_inc/rc_dec (pure EIf borrows st) and only 2 OOB checks (not 3)
@@ -1351,8 +1351,8 @@ test "p11c: same-index overwrite OOB dedup and pure EIf rhs array borrow" {
     None => co_rest.length()
   }
   let co_body = co_rest.clamped_view(end=co_end).to_owned()
-  assert_eq(co_body.contains("m2_rc_inc"), false)
-  assert_eq(co_body.contains("m2_rc_dec"), false)
+  assert_eq(co_body.contains("pion_rc_inc"), false)
+  assert_eq(co_body.contains("pion_rc_dec"), false)
   // add_overwrite: only 2 OOB checks (st[sp-1] reused once, st[sp] checked once)
   let ao_start = match ssa.find("fn_add_overwrite(") {
     Some(idx) => idx
@@ -1368,7 +1368,7 @@ test "p11c: same-index overwrite OOB dedup and pure EIf rhs array borrow" {
   let mut oob_cnt = 0
   let mut pos = 0
   while pos < ao_body.length() {
-    match ao_body.clamped_view(start=pos).to_owned().find("m2_panic_oob") {
+    match ao_body.clamped_view(start=pos).to_owned().find("pion_panic_oob") {
       Some(off) => {
         oob_cnt = oob_cnt + 1
         pos = pos + off + 12
@@ -1408,20 +1408,20 @@ test "p12a: extern C FFI and trait monomorphization QBE codegen" {
     "  if ptr_is_null(p) { c_free(p) }\n" +
     "  n.to_int()\n" +
     "}\n"
-  let cr = @core.check_source_files_full("p12a_cg", ["p12a_cg.m2"], [src])
+  let cr = @core.check_source_files_full("p12a_cg", ["p12a_cg.pion"], [src])
   assert_eq(cr.diagnostics.length(), 0)
   let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
-  // Native C symbol call without $m2_fn_ prefix
+  // Native C symbol call without $pion_fn_ prefix
   assert_eq(ssa.contains("call $strlen("), true)
   assert_eq(ssa.contains("call $free("), true)
-  assert_eq(ssa.contains("$m2_fn_c_strlen"), false)
+  assert_eq(ssa.contains("$pion_fn_c_strlen"), false)
   // Static impl functions (zero vtable)
-  assert_eq(ssa.contains("$m2_impl_Show_Int_show"), true)
-  assert_eq(ssa.contains("$m2_impl_Show_User_show"), true)
-  // Monomorphized generic function calling concrete $m2_impl_ directly
-  assert_eq(ssa.contains("$m2_fn_format_pair__mono_Int_User"), true)
-  assert_eq(ssa.contains("call $m2_impl_Show_Int_show("), true)
-  assert_eq(ssa.contains("call $m2_impl_Show_User_show("), true)
+  assert_eq(ssa.contains("$pion_impl_Show_Int_show"), true)
+  assert_eq(ssa.contains("$pion_impl_Show_User_show"), true)
+  // Monomorphized generic function calling concrete $pion_impl_ directly
+  assert_eq(ssa.contains("$pion_fn_format_pair__mono_Int_User"), true)
+  assert_eq(ssa.contains("call $pion_impl_Show_Int_show("), true)
+  assert_eq(ssa.contains("call $pion_impl_Show_User_show("), true)
 }
 
 ///|
@@ -1435,7 +1435,7 @@ test "p15: == on a payload-less enum compares variant tags, not pointers" {
     #|  a == b
     #|}
   let res = @core.emit_qbe_package(
-    @core.parse_package("test", ["enum_eq.m2"], [src]),
+    @core.parse_package("test", ["enum_eq.pion"], [src]),
     true,
   )
   // The only loads in `same` are the tag words of its two operands.
@@ -1449,7 +1449,7 @@ test "p15: == on a payload-less enum compares variant tags, not pointers" {
     #|  if a == Red { 1 } else { 0 }
     #|}
   let res2 = @core.emit_qbe_package(
-    @core.parse_package("test", ["enum_eq2.m2"], [src2]),
+    @core.parse_package("test", ["enum_eq2.pion"], [src2]),
     true,
   )
   assert_true(res2.ssa.contains("=l loadl %"), res2.ssa)

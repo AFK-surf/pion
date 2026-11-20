@@ -9,11 +9,11 @@ OUT_DIR="$ROOT_DIR/out"
 mkdir -p "$OUT_DIR"
 
 MODE="all"
-if [ "${1:-}" = "--check-m2" ]; then
-  MODE="check-m2"
+if [ "${1:-}" = "--check-pion" ]; then
+  MODE="check-pion"
 fi
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/m2-bench.XXXXXX")
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/pion-bench.XXXXXX")
 trap 'rm -rf "$WORK"' EXIT
 
 mkdir -p "$WORK/bin" "$WORK/exec" "$WORK/scale10k"
@@ -26,49 +26,49 @@ MEASURE="$WORK/bin/bench_measure"
 GEN="$WORK/bin/gen_compile_bench"
 
 # ---------------------------------------------------------------------------
-# Mode: --check-m2 (verify all benchmarks/m2/*.m2 + 10k-LOC generated m2)
+# Mode: --check-pion (verify all benchmarks/pion/*.pion + 10k-LOC generated Pion)
 # ---------------------------------------------------------------------------
-check_m2_sources() {
+check_pion_sources() {
   COMPILER_DIR="$ROOT_DIR/compiler"
-  M2C0="$COMPILER_DIR/_build/native/debug/build/compat_moon/compat_moon.exe"
-  if [ ! -x "$M2C0" ]; then
-    echo "=== Building Stage 0 m2c0 (moon build --target native) ==="
+  PIONC0="$COMPILER_DIR/_build/native/debug/build/compat_moon/compat_moon.exe"
+  if [ ! -x "$PIONC0" ]; then
+    echo "=== Building Stage 0 pionc0 (moon build --target native) ==="
     (cd "$COMPILER_DIR" && moon build --target native)
   fi
 
-  echo "=== Checking benchmarks/m2/*.m2 with m2c0 check --json ==="
-  m2_fail=0
-  for f in "$BENCH_DIR"/m2/*.m2; do
+  echo "=== Checking benchmarks/pion/*.pion with pionc0 check --json ==="
+  pion_fail=0
+  for f in "$BENCH_DIR"/pion/*.pion; do
     base=$(basename "$f")
     set +e
-    out=$("$M2C0" check --json "$f" 2>&1)
+    out=$("$PIONC0" check --json "$f" 2>&1)
     rc=$?
     set -e
     printf '  %-20s -> %s\n' "$base" "$out"
     if [ "$rc" -ne 0 ] || [ "$out" != '{"ok":true,"diagnostics":[]}' ]; then
-      m2_fail=1
+      pion_fail=1
     fi
   done
 
-  echo "=== Checking generated 10,000-LOC / 20-package m2 project ==="
+  echo "=== Checking generated 10,000-LOC / 20-package pion project ==="
   "$GEN" "$WORK/scale10k"
   set +e
-  out=$("$M2C0" check --json "$WORK/scale10k/m2" 2>&1)
+  out=$("$PIONC0" check --json "$WORK/scale10k/pion" 2>&1)
   rc=$?
   set -e
-  printf '  %-20s -> %s\n' "scale10k/m2 (20 pkg)" "$out"
+  printf '  %-20s -> %s\n' "scale10k/pion (20 pkg)" "$out"
   if [ "$rc" -ne 0 ] || [ "$out" != '{"ok":true,"diagnostics":[]}' ]; then
-    m2_fail=1
+    pion_fail=1
   fi
-  if [ "$m2_fail" -ne 0 ]; then
-    echo "FAIL: one or more m2 benchmark sources failed m2c0 check" >&2
+  if [ "$pion_fail" -ne 0 ]; then
+    echo "FAIL: one or more pion benchmark sources failed pionc0 check" >&2
     exit 1
   fi
-  echo "ALL M2 BENCHMARK SOURCES PASSED m2c0 check --json (ok:true)!"
+  echo "ALL PION BENCHMARK SOURCES PASSED pionc0 check --json (ok:true)!"
 }
 
-if [ "$MODE" = "check-m2" ]; then
-  check_m2_sources
+if [ "$MODE" = "check-pion" ]; then
+  check_pion_sources
   exit 0
 fi
 
@@ -107,9 +107,9 @@ HAS_C=0; command -v clang >/dev/null 2>&1 && HAS_C=1
 HAS_MOON=0; command -v moon >/dev/null 2>&1 && HAS_MOON=1
 HAS_ZIG=0; command -v zig >/dev/null 2>&1 && HAS_ZIG=1
 HAS_RUST=0; command -v rustc >/dev/null 2>&1 && command -v cargo >/dev/null 2>&1 && HAS_RUST=1
-HAS_M2=0
-if [ -n "${M2C:-}" ] && [ -x "${M2C:-}" ]; then
-  HAS_M2=1
+HAS_PION=0
+if [ -n "${PIONC:-}" ] && [ -x "${PIONC:-}" ]; then
+  HAS_PION=1
 fi
 
 CPU_BRAND=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
@@ -120,17 +120,17 @@ MOON_VER=$( [ "$HAS_MOON" -eq 1 ] && moon --version 2>&1 | head -n 1 || echo "N/
 ZIG_VER=$( [ "$HAS_ZIG" -eq 1 ] && zig version 2>&1 | head -n 1 || echo "N/A" )
 RUST_VER=$( [ "$HAS_RUST" -eq 1 ] && rustc --version 2>&1 | head -n 1 || echo "N/A" )
 CARGO_VER=$( [ "$HAS_RUST" -eq 1 ] && cargo --version 2>&1 | head -n 1 || echo "N/A" )
-M2_VER=$( [ "$HAS_M2" -eq 1 ] && ("$M2C" --version 2>&1 | head -n 1 || echo "$M2C") || echo "not provided (pass M2C=/path/to/m2c)" )
+PION_VER=$( [ "$HAS_PION" -eq 1 ] && ("$PIONC" --version 2>&1 | head -n 1 || echo "$PIONC") || echo "not provided (pass PIONC=/path/to/pionc)" )
 
 echo "================================================================="
-echo " m2 Multi-Language Objective Benchmark Suite (D5)"
+echo " pion Multi-Language Objective Benchmark Suite (D5)"
 echo "================================================================="
 echo "Host   : $CPU_BRAND ($CPU_CORES cores) | $OS_VER"
 echo "C      : $CLANG_VER"
 echo "MoonBit: $MOON_VER"
 echo "Zig    : $ZIG_VER"
 echo "Rust   : $RUST_VER / $CARGO_VER"
-echo "m2     : $M2_VER"
+echo "pion     : $PION_VER"
 echo "================================================================="
 
 # ---------------------------------------------------------------------------
@@ -138,7 +138,7 @@ echo "================================================================="
 # ---------------------------------------------------------------------------
 BENCHES="hello nbody binarytrees spectralnorm fannkuchredux mandelbrot_mt hashmap_str"
 
-mkdir -p "$WORK/exec/c" "$WORK/exec/zig" "$WORK/exec/rust" "$WORK/exec/m2"
+mkdir -p "$WORK/exec/c" "$WORK/exec/zig" "$WORK/exec/rust" "$WORK/exec/pion"
 
 if [ "$HAS_C" -eq 1 ]; then
   echo ">>> Building C (-O2 -ffp-contract=off)..."
@@ -172,12 +172,12 @@ if [ "$HAS_RUST" -eq 1 ]; then
   done
 fi
 
-if [ "$HAS_M2" -eq 1 ]; then
-  echo ">>> Building m2 ($M2C build --release)..."
-  export M2_CACHE_DIR="$WORK/m2-cas"
-  mkdir -p "$M2_CACHE_DIR"
+if [ "$HAS_PION" -eq 1 ]; then
+  echo ">>> Building pion ($PIONC build --release)..."
+  export PION_CACHE_DIR="$WORK/pion-cas"
+  mkdir -p "$PION_CACHE_DIR"
   for b in $BENCHES; do
-    "$M2C" build --release "$BENCH_DIR/m2/$b.m2" -o "$WORK/exec/m2/$b"
+    "$PIONC" build --release "$BENCH_DIR/pion/$b.pion" -o "$WORK/exec/pion/$b"
   done
 fi
 
@@ -189,7 +189,7 @@ bin_path() {
     moonbit) echo "$WORK/exec/moonbit/_build/native/release/build/$bench/$bench.exe" ;;
     zig)     echo "$WORK/exec/zig/$bench" ;;
     rust)    echo "$WORK/exec/rust/$bench" ;;
-    m2)      echo "$WORK/exec/m2/$bench" ;;
+    pion)      echo "$WORK/exec/pion/$bench" ;;
   esac
 }
 
@@ -206,7 +206,7 @@ LANGS=""
 [ "$HAS_MOON" -eq 1 ] && LANGS="$LANGS moonbit"
 [ "$HAS_ZIG" -eq 1 ] && LANGS="$LANGS zig"
 [ "$HAS_RUST" -eq 1 ] && LANGS="$LANGS rust"
-[ "$HAS_M2" -eq 1 ] && LANGS="$LANGS m2"
+[ "$HAS_PION" -eq 1 ] && LANGS="$LANGS pion"
 
 run_case() {
   case_name="$1"
@@ -343,15 +343,15 @@ if [ "$HAS_RUST" -eq 1 ]; then
   RUST_CACHE=$(dir_bytes "$WORK/scale10k/rust/target")
 fi
 
-if [ "$HAS_M2" -eq 1 ]; then
-  echo ">>> Cold compile (10k LOC / 20 pkgs): m2 ($M2C build)..."
-  export M2_CACHE_DIR="$WORK/scale10k/m2-cas"
-  mkdir -p "$M2_CACHE_DIR"
-  M2_COLD=$("$MEASURE" once -- "$M2C" build "$WORK/scale10k/m2" -o "$WORK/scale10k/m2_app")
-  M2_CK1=$("$WORK/scale10k/m2_app")
-  check_scale_ck cold m2 "$M2_CK1"
-  M2_INTREE_CACHE=0
-  M2_CAS_CACHE=$(dir_bytes "$M2_CACHE_DIR")
+if [ "$HAS_PION" -eq 1 ]; then
+  echo ">>> Cold compile (10k LOC / 20 pkgs): pion ($PIONC build)..."
+  export PION_CACHE_DIR="$WORK/scale10k/pion-cas"
+  mkdir -p "$PION_CACHE_DIR"
+  PION_COLD=$("$MEASURE" once -- "$PIONC" build "$WORK/scale10k/pion" -o "$WORK/scale10k/pion_app")
+  PION_CK1=$("$WORK/scale10k/pion_app")
+  check_scale_ck cold pion "$PION_CK1"
+  PION_INTREE_CACHE=0
+  PION_CAS_CACHE=$(dir_bytes "$PION_CACHE_DIR")
 fi
 
 # Sleep 1 second so filesystem mtime (1s granularity in make) reliably sees pkg05 edit
@@ -388,11 +388,11 @@ if [ "$HAS_RUST" -eq 1 ]; then
   printf 'rust\t%s\t%s\t%s\t0\t%s\t%s\n' "$RUST_COLD" "$RUST_INCR" "$RUST_CACHE" "$RUST_CK1" "$RUST_CK2" >> "$COMPILE_TSV"
 fi
 
-if [ "$HAS_M2" -eq 1 ]; then
-  M2_INCR=$("$MEASURE" once -- "$M2C" build "$WORK/scale10k/m2" -o "$WORK/scale10k/m2_app")
-  M2_CK2=$("$WORK/scale10k/m2_app")
-  check_scale_ck incr m2 "$M2_CK2"
-  printf 'm2\t%s\t%s\t%s\t%s\t%s\t%s\n' "$M2_COLD" "$M2_INCR" "$M2_INTREE_CACHE" "$M2_CAS_CACHE" "$M2_CK1" "$M2_CK2" >> "$COMPILE_TSV"
+if [ "$HAS_PION" -eq 1 ]; then
+  PION_INCR=$("$MEASURE" once -- "$PIONC" build "$WORK/scale10k/pion" -o "$WORK/scale10k/pion_app")
+  PION_CK2=$("$WORK/scale10k/pion_app")
+  check_scale_ck incr pion "$PION_CK2"
+  printf 'pion\t%s\t%s\t%s\t%s\t%s\t%s\n' "$PION_COLD" "$PION_INCR" "$PION_INTREE_CACHE" "$PION_CAS_CACHE" "$PION_CK1" "$PION_CK2" >> "$COMPILE_TSV"
 fi
 
 if [ "$COLD_CK" = "$INCR_CK" ]; then
@@ -433,7 +433,7 @@ JSON_OUT="$OUT_DIR/bench-results.json"
   printf '    "zig": "%s",\n' "$(json_escape "$ZIG_VER")"
   printf '    "rust": "%s",\n' "$(json_escape "$RUST_VER")"
   printf '    "cargo": "%s",\n' "$(json_escape "$CARGO_VER")"
-  printf '    "m2": "%s"\n' "$(json_escape "$M2_VER")"
+  printf '    "pion": "%s"\n' "$(json_escape "$PION_VER")"
   printf '  },\n'
 
   printf '  "execution": [\n'
@@ -477,7 +477,7 @@ JSON_OUT="$OUT_DIR/bench-results.json"
 # ---------------------------------------------------------------------------
 MD_OUT="$OUT_DIR/bench-summary.md"
 {
-  echo "# m2 Multi-Language Objective Benchmark Report"
+  echo "# pion Multi-Language Objective Benchmark Report"
   echo ""
   echo "- **Machine**: \`$CPU_BRAND\` ($CPU_CORES cores), \`$OS_VER\`"
   echo "- **Methodology**: 1 warmup + 5 timed runs (median wall ms), Peak RSS (MB) & \`instructions retired\` via \`/usr/bin/time -l\`, strict bit-for-bit checksum assertion across all languages."
@@ -486,7 +486,7 @@ MD_OUT="$OUT_DIR/bench-summary.md"
   echo "  - MoonBit: \`$MOON_VER\` (\`moon build --target native --release\`)"
   echo "  - Zig: \`$ZIG_VER\` (\`-OReleaseFast\`)"
   echo "  - Rust: \`$RUST_VER\` / \`$CARGO_VER\` (\`rustc -O\` / \`cargo build --release\`)"
-  echo "  - m2: \`$M2_VER\`"
+  echo "  - pion: \`$PION_VER\`"
   echo ""
   echo "## 1. Execution Speed, Peak RSS & Instructions Retired"
   echo ""
