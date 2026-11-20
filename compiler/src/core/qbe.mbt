@@ -596,6 +596,21 @@ fn qbe_method_call_sym(
 }
 
 ///|
+/// `==` on an enum (the checker only admits payload-less ones) compares the
+/// variant tags: each package emits its own static constant per variant, so
+/// pointer identity would differ across packages.
+fn qbe_cmp_operand(g : QbeGen, reg : String, ty : Ty) -> String {
+  match ty {
+    TEnum(_, _) => {
+      let t = qbe_tmp(g)
+      qbe_emit(g, t + " =l loadl " + reg)
+      t
+    }
+    _ => reg
+  }
+}
+
+///|
 fn qbe_register_enum_const(
   g : QbeGen,
   enum_name : String,
@@ -7685,7 +7700,9 @@ fn qbe_emit_cond_branch(
               "csgel"
             }
             let cw = qbe_tmp(g)
-            qbe_emit(g, cw + " =w " + cop + " " + lv.reg + ", " + rv.reg)
+            let lc = qbe_cmp_operand(g, lv.reg, lv.ty)
+            let rc = qbe_cmp_operand(g, rv.reg, lv.ty)
+            qbe_emit(g, cw + " =w " + cop + " " + lc + ", " + rc)
             if !la.borrowed {
               qbe_rc_dec(g, lv.reg, lv.ty)
             }
@@ -8849,7 +8866,9 @@ fn qbe_emit_expr(
             }
             let cw = qbe_tmp(g)
             let r = qbe_tmp(g)
-            qbe_emit(g, cw + " =w " + cop + " " + lv.reg + ", " + rv.reg)
+            let lc = qbe_cmp_operand(g, lv.reg, lv.ty)
+            let rc = qbe_cmp_operand(g, rv.reg, lv.ty)
+            qbe_emit(g, cw + " =w " + cop + " " + lc + ", " + rc)
             qbe_rc_dec(g, lv.reg, lv.ty)
             qbe_rc_dec(g, rv.reg, rv.ty)
             qbe_emit(g, r + " =l extuw " + cw)

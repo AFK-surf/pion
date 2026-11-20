@@ -1423,3 +1423,34 @@ test "p12a: extern C FFI and trait monomorphization QBE codegen" {
   assert_eq(ssa.contains("call $m2_impl_Show_Int_show("), true)
   assert_eq(ssa.contains("call $m2_impl_Show_User_show("), true)
 }
+
+///|
+test "p15: == on a payload-less enum compares variant tags, not pointers" {
+  let src =
+    #|enum Color {
+    #|  Red
+    #|  Green
+    #|}
+    #|pub fn same(a : Color, b : Color) -> Bool {
+    #|  a == b
+    #|}
+  let res = @core.emit_qbe_package(
+    @core.parse_package("test", ["enum_eq.m2"], [src]),
+    true,
+  )
+  // The only loads in `same` are the tag words of its two operands.
+  assert_true(res.ssa.contains("=l loadl %"), res.ssa)
+  let src2 =
+    #|enum Color {
+    #|  Red
+    #|  Green
+    #|}
+    #|pub fn is_red(a : Color) -> Int {
+    #|  if a == Red { 1 } else { 0 }
+    #|}
+  let res2 = @core.emit_qbe_package(
+    @core.parse_package("test", ["enum_eq2.m2"], [src2]),
+    true,
+  )
+  assert_true(res2.ssa.contains("=l loadl %"), res2.ssa)
+}

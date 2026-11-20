@@ -154,8 +154,7 @@ pub fn main(world : World) -> Int {
   0
 }
 
-// NOTE: `Option == Some(..)` type-checks in m2 today but compares object
-// identity, so tests match explicitly.
+// `==` is not defined on `Option` (no implicit pointer identity), so tests match.
 fn some_str(o : Option[String], want : String) -> Bool {
   match o {
     Some(v) => v == want

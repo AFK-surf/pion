@@ -1253,3 +1253,87 @@ test "p13b: imported bounded generic fn resolves its own package's names" {
   assert_true(ssa.contains("$m2_pkg_lib_fn_wrap("), "lib::wrap called from the mono body:\n" + ssa)
   assert_true(ssa.contains("$m2_pkg_lib_fn_unwrap("), "lib::unwrap called from the mono body")
 }
+
+///|
+test "p15: statement-position Result is E_UNHANDLED_RESULT, let _ / tail / ? are fine" {
+  let prelude =
+    "fn parse(s : String) -> Result[Int, String] {\n" +
+    "  if s.length() > 0 { Ok(1) } else { Err(\"empty\") }\n" +
+    "}\n"
+  let bad = prelude +
+    "pub fn main() -> Int {\n" +
+    "  parse(\"x\")\n" +
+    "  0\n" +
+    "}\n"
+  let (ok1, json1, d1) = check_one(bad)
+  assert_true(!ok1, "discarded Result must error")
+  assert_eq(d1.length(), 1)
+  assert_eq(d1[0].code, "E_UNHANDLED_RESULT")
+  assert_true(d1[0].fixit.contains("let _ ="), json1)
+  let in_loop = prelude +
+    "pub fn main() -> Int {\n" +
+    "  for i in 0..3 {\n" +
+    "    parse(i.to_string())\n" +
+    "  }\n" +
+    "  0\n" +
+    "}\n"
+  let (ok2, _, d2) = check_one(in_loop)
+  assert_true(!ok2, "Result discarded as a loop body tail must error")
+  assert_eq(d2[0].code, "E_UNHANDLED_RESULT")
+  let good = prelude +
+    "fn twice(s : String) -> Result[Int, String] {\n" +
+    "  parse(s)?\n" +
+    "  parse(s)\n" +
+    "}\n" +
+    "fn pick(b : Bool) -> Result[Int, String] {\n" +
+    "  if b { parse(\"a\") } else { parse(\"\") }\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let _ = parse(\"x\")\n" +
+    "  let _ = twice(\"y\")\n" +
+    "  let _ = pick(true)\n" +
+    "  match parse(\"z\") {\n" +
+    "    Ok(n) => n\n" +
+    "    Err(_) => 0\n" +
+    "  }\n" +
+    "}\n"
+  let (ok3, json3, _) = check_one(good)
+  assert_true(ok3, "explicit discard, tail and ? are allowed: " + json3)
+}
+
+///|
+test "p15: == on Option/Result/payload enums is rejected, payload-less enums allowed" {
+  let src =
+    "enum Color {\n" +
+    "  Red\n" +
+    "  Green\n" +
+    "}\n" +
+    "enum Shape {\n" +
+    "  Dot\n" +
+    "  Circle(Int)\n" +
+    "}\n" +
+    "fn find(x : Int) -> Option[Int] {\n" +
+    "  if x > 0 { Some(x) } else { None }\n" +
+    "}\n" +
+    "fn r(x : Int) -> Result[Int, String] {\n" +
+    "  Ok(x)\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let a = find(1) == Some(1)\n" +
+    "  let b = r(1) != Ok(1)\n" +
+    "  let c = Circle(1) == Dot\n" +
+    "  let d = Red == Green\n" +
+    "  let e = \"s\" == \"s\"\n" +
+    "  if a || b || c || d || e { 1 } else { 0 }\n" +
+    "}\n"
+  let (ok, json, ds) = check_one(src)
+  assert_true(!ok, "must reject pointer-identity ==")
+  assert_true(ds.length() == 3, json)
+  assert_eq(ds[0].code, "E_TYPE_MISMATCH")
+  assert_true(ds[0].message.contains("Option[Int]"), json)
+  assert_true(ds[0].message.contains("no implicit pointer-identity comparison"), json)
+  assert_true(ds[0].fixit.contains("use `match`"), json)
+  assert_true(ds[1].message.contains("`!=`"), json)
+  assert_true(ds[1].message.contains("Result[Int, String]"), json)
+  assert_true(ds[2].message.contains("Shape"), json)
+}

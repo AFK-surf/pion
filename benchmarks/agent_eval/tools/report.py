@@ -255,11 +255,12 @@ NOTES = """## 4. Notes, caveats and observed weaknesses
 - The station is shared with other workloads (see the load average above); medians of 5 runs after a warmup
   dampen but do not remove that noise.
 
-**m2 weaknesses found by this suite** (none fixed here; `compiler/` is out of scope for this benchmark)
-- `opt == Some(x)` type-checks but compares object identity and is always false for fresh boxes — a silent
-  wrong answer (hit by the first drafts of `t01` / `t03` tests, rewritten as explicit `match`).
-- A `Result` returned by a call in statement position is silently discarded (probe `e09`), where MoonBit
-  rejects the unhandled `raise` and rustc at least warns (`must_use`).
+**m2 weaknesses found by this suite**
+- Fixed after this suite was first run (P15): `opt == Some(x)` used to type-check and compare object
+  identity (always false for fresh boxes, hit by the first drafts of `t01` / `t03` tests); `==` / `!=` on
+  `Option`, `Result`, structs, arrays, maps, `Bytes`, tuples and payload-carrying enums is now an
+  `E_TYPE_MISMATCH` with a `use match` fix-it. A `Result` in statement position (probe `e09`) used to be
+  silently discarded; it is now `E_UNHANDLED_RESULT` (`let _ = ...` discards explicitly).
 - `m2c2 test <workspace>` runs only the root package's tests; the suite tests each package directory in turn.
 - `m2c2 query defs|callers` on a workspace directory returns an empty table; it needs the source files.
 - `m2c2 doc --json` is larger than the sources of the small `t06` project (plain-text `m2c2 doc` is compact).

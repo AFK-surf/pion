@@ -100,8 +100,7 @@ pub fn main(world : World) -> Int {
   0
 }
 
-// NOTE: `Option == Some(..)` type-checks in m2 today but compares object
-// identity (always false for fresh boxes), so tests match explicitly.
+// `==` is not defined on `Option` (no implicit pointer identity), so tests match.
 fn uint_is(s : String, want : Int) -> Bool {
   match parse_uint(s) {
     Some(v) => v == want

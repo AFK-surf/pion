@@ -140,6 +140,8 @@ test "test name" {
   - `AtomicInt::new(v)`, `a.load()`, `a.store(v)`, `a.fetch_add(d)`
 - Contracts: `debug_assert(cond, "msg")`
 - Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..`, postfix `?`.
+- Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `Double`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T`, and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, `struct`, `Array`, `Map`, `Bytes`, tuples and payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
+- Must-use `Result`: an expression statement whose type is `Result[T, E]` and whose value is discarded — any non-tail statement of a block, or the tail statement of a loop or `test` body — is a compile-time error (`E_UNHANDLED_RESULT`, fix-it "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`"). `let _ = expr` discards explicitly; a block's tail value returned to its function or branch is not discarded.
 
 ---
 

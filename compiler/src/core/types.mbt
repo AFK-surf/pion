@@ -2023,6 +2023,20 @@ fn check_stmts(
   stmts : Array[Stmt],
   expected : Option[Ty],
 ) -> Ty {
+  check_stmts_ex(tc, env, stmts, expected, true)
+}
+
+///|
+/// `tail_used` is false for bodies whose tail value is discarded (loop and
+/// test bodies): there the tail statement is also checked for an unhandled
+/// `Result`.
+fn check_stmts_ex(
+  tc : TypeChecker,
+  env : Env,
+  stmts : Array[Stmt],
+  expected : Option[Ty],
+  tail_used : Bool,
+) -> Ty {
   if stmts.length() == 0 {
     return TUnit
   }
@@ -2032,9 +2046,71 @@ fn check_stmts(
     let is_last = i == stmts.length() - 1
     let exp = if is_last { expected } else { None }
     last_ty = check_stmt(tc, env, stmts[i], exp)
+    if !is_last || !tail_used {
+      check_unhandled_result(tc, stmts[i], last_ty)
+    }
     i = i + 1
   }
   last_ty
+}
+
+///|
+fn check_unhandled_result(tc : TypeChecker, stmt : Stmt, ty : Ty) -> Unit {
+  match stmt {
+    SExpr(_, sp) =>
+      match ty {
+        TResult(_, _) =>
+          tc_err(
+            tc,
+            sp,
+            "E_UNHANDLED_RESULT",
+            "value of type `" +
+            ty_to_string(ty) +
+            "` is silently discarded",
+            "handled Result",
+            ty_to_string(ty),
+            "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`",
+          )
+        _ => ()
+      }
+    _ => ()
+  }
+}
+
+///|
+/// Types `==`/`!=` compare by value: scalars, `String`, `Ptr`, and enums whose
+/// variants carry no payload (immortal constants, so identity is the tag).
+fn eq_comparable(tc : TypeChecker, t : Ty) -> Bool {
+  match t {
+    TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TPtr => true
+    TUnit | TParam(_) | TNever | TError => true
+    TEnum(name, _) => {
+      let found : Option[EnumInfo] = match tc.enums.get(name) {
+        Some(ei) => Some(ei)
+        None => {
+          let qp = split_qual_name(name)
+          match tc.imported_pkgs.get(qp.prefix) {
+            Some(ipkg) => ipkg.tc.enums.get(qp.name)
+            None => None
+          }
+        }
+      }
+      match found {
+        None => true
+        Some(einfo) => {
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            if einfo.variants[vi].field_tys.length() != 0 {
+              return false
+            }
+            vi = vi + 1
+          }
+          true
+        }
+      }
+    }
+    _ => false
+  }
 }
 
 ///|
@@ -2216,7 +2292,7 @@ fn check_stmt(
         )
       }
       env_push(env)
-      let _ = check_stmts(tc, env, body, None)
+      let _ = check_stmts_ex(tc, env, body, None, false)
       env_pop(env)
       TUnit
     }
@@ -2236,7 +2312,7 @@ fn check_stmt(
         )
       }
       let _ = check_stmt(tc, env, step_s, None)
-      let _ = check_stmts(tc, env, body, None)
+      let _ = check_stmts_ex(tc, env, body, None, false)
       env_pop(env)
       TUnit
     }
@@ -2276,7 +2352,7 @@ fn check_stmt(
       let loop_var_ty = if valid_start { sty } else { TInt }
       env_push(env)
       env_define(env, vname, loop_var_ty, false)
-      let _ = check_stmts(tc, env, body, None)
+      let _ = check_stmts_ex(tc, env, body, None, false)
       env_pop(env)
       TUnit
     }
@@ -2300,7 +2376,7 @@ fn check_stmt(
       }
       env_push(env)
       env_define(env, vname, elem_ty, false)
-      let _ = check_stmts(tc, env, body, None)
+      let _ = check_stmts_ex(tc, env, body, None, false)
       env_pop(env)
       TUnit
     }
@@ -3709,7 +3785,22 @@ fn check_expr(
         }
         TBool
       } else if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
-        if !ty_compat(lty, rty) {
+        if (op == "==" || op == "!=") && !eq_comparable(tc, lty) {
+          let lname = ty_to_string(lty)
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "operator `" +
+            op +
+            "` is not supported on `" +
+            lname +
+            "` (no implicit pointer-identity comparison)",
+            "value-comparable type",
+            lname,
+            "use `match` to inspect `" + lname + "` values",
+          )
+        } else if !ty_compat(lty, rty) {
           tc_err(
             tc,
             sp,
@@ -5421,7 +5512,7 @@ pub fn check_package_with_imports(
         }
         DTest(td) => {
           let env = env_new(TUnit, [])
-          let _ = check_stmts(tc, env, td.body, None)
+          let _ = check_stmts_ex(tc, env, td.body, None, false)
         }
         _ => ()
       }
