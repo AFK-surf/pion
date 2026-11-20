@@ -42,6 +42,8 @@ def summarize(r):
             "structured_json_when_caught": "%d/%d" % (sum(1 for e in caught if e.get("structured_json")), len(caught)),
             "with_fixit_when_caught": sum(1 for e in caught if e.get("has_fixit")),
             "machine_applicable_fix_when_caught": sum(1 for e in caught if e.get("machine_applicable_fix")),
+            "machine_edit_applied": sum(1 for e in caught if e.get("edit_recheck_errors") is not None),
+            "edit_recheck_clean": sum(1 for e in caught if e.get("edit_recheck_clean")),
             "expectation_mismatches": sum(1 for e in ents if not e.get("matches_expectation", False)),
         }
     out["dim2"] = s2
@@ -146,10 +148,14 @@ def markdown(r):
                        ("median_output_bytes_when_caught", "median diagnostic bytes (caught)"),
                        ("structured_json_when_caught", "caught with JSON diagnostics"),
                        ("with_fixit_when_caught", "caught with any fix suggestion"),
-                       ("machine_applicable_fix_when_caught", "caught with a machine-applicable edit")]:
+                       ("machine_applicable_fix_when_caught", "caught with a machine-applicable edit"),
+                       ("machine_edit_applied", "machine edit applied verbatim to a copy"),
+                       ("edit_recheck_clean", "machine edit applied -> re-check clean (0 errors)")]:
         L.append(_row([label] + [_fmt(s["dim2"][l][key]) for l in LANGS]))
     L.append("")
-    L.append("Per probe: `✓` caught at check time / `✗` not caught (`—` not expressible), check latency, diagnostic size, fix suggestion.")
+    L.append("Per probe: `✓` caught at check time / `✗` not caught (`—` not expressible), check latency, diagnostic size, fix suggestion. "
+             "`edit ✓clean`: the first error's machine-applicable patch (Pion `edits`, rustc `MachineApplicable` spans), applied "
+             "verbatim to a scratch copy, makes the same check pass; `edit (recheck: N err)`: N errors remain and a second step is needed.")
     L.append("")
     L.append(_row(["probe", "Pion", "MoonBit", "Rust", "Go"]))
     L.append(_row(["---"] * 5))
@@ -170,7 +176,10 @@ def markdown(r):
                 extra.append("`-race`: %s" % ("detected at run time" if rd.get("detected") else "not detected"))
             cells.append("%s %s ms, %s B%s%s" % (
                 mark, _fmt(e.get("latency", {}).get("median_ms")), e.get("output_bytes"),
-                (", machine edit" if e.get("machine_applicable_fix") else ", fix-it")
+                ((", edit ✓clean" if e.get("edit_recheck_clean") else
+                  ", edit (recheck: %d err)" % e["edit_recheck_errors"])
+                 if e.get("edit_recheck_errors") is not None else
+                 (", machine edit" if e.get("machine_applicable_fix") else ", fix-it"))
                 if e.get("has_fixit") and e.get("caught_compile_time") else "",
                 ("<br>" + "; ".join(extra)) if extra else ""))
         L.append(_row(cells))
@@ -238,16 +247,22 @@ NOTES = """## 4. Notes, caveats and observed weaknesses
 - Every implementation uses only its language's standard library. Pion uses `std/json` / `std/http` from this
   repository, Go uses `encoding/json` / `net/url`, MoonBit uses `moonbitlang/core/json`; Rust's standard
   library has no JSON, so `t05` carries a hand-written parser (it dominates Rust's `t05` size).
-- `t04`: Pion has no trait objects, so its heterogeneous collection is a closed enum wrapper; Rust uses
-  `Box<dyn Item>`, MoonBit `&Item`, Go an interface slice.
+- `t04`: Pion's reference code predates `dyn Trait` (P20) and keeps its heterogeneous collection as a closed
+  enum wrapper, as first written, so sizes stay comparable; Rust uses `Box<dyn Item>`, MoonBit `&Item`, Go an
+  interface slice.
 - Diagnostic sizes are the raw bytes of the JSON/text each command prints. `cargo --message-format=json`
   embeds a pre-rendered human message and artefact records in every line, which is why it is several KB;
   Go and MoonBit print JSON envelopes around plain text messages without fix-its.
 - Pion attaches a natural-language `fixit` hint to every diagnostic and, where an exact patch is known, a
-  machine-applicable `edits` array (span + replacement; six diagnostic classes so far, see `SPEC.md` §5.1).
+  machine-applicable `edits` array (span + replacement; all 12 probed classes since P20, see `SPEC.md` §5.1).
   rustc's counterpart is `suggestion_applicability: MachineApplicable`. Hints and edits both count as "any
   fix suggestion"; only Pion `edits` and rustc `MachineApplicable` replacements count as machine-applicable
-  ("machine edit" in the per-probe table). Whether an edit is applied and re-checked is not measured.
+  ("machine edit" in the per-probe table). Apply-and-recheck: the first error diagnostic's machine-applicable
+  patch (all of its Pion `edits`, or all `MachineApplicable` spans of its first rustc suggestion) is applied
+  verbatim, last offset first, to a scratch copy and the same check command is run again; nothing else is
+  changed. `edit (recheck: N err)` is reported as is: e.g. `e10` gains `world : World` but its caller must then
+  pass `world`, `e08` becomes `Mutex[Array[Int]]` but the `push` inside the closure must become a locked
+  access, `e07` takes the trait's return type but the body still returns the old one.
 - Go caches test results by test-binary content: when an edit recompiles to an identical binary
   (the body edit folds `n+1 - n` back to `1`), `go test` reports `(cached)` without re-running tests.
   The edits are unique per run, so no content-addressed cache replays an earlier state.
@@ -269,12 +284,12 @@ NOTES = """## 4. Notes, caveats and observed weaknesses
   covers every package (it used to return an empty table and needed the source files); `debug_assert` is an
   expression (no braces needed in a match arm); `String::to_int/to_int64/to_double -> Option` exist (the
   `t01` reference code still hand-parses digits, kept as first written so sizes stay comparable).
-- The edit -> tests-green times of Pion rose after P17 (about 240 ms -> 630 ms here) and that is the correct
-  cost, not a slowdown: before P17-B a package's cached test binary was keyed without its dependencies'
-  objects, so after a body edit in `shapes` the `inventory` / `app` test binaries were reused unrelinked and
-  reported stale passes (reproduced: an edit that breaks `app`'s test still printed `"ok":true` until the
-  cache was cleared). Now every dependent test binary is recompiled and relinked, and each new binary is
-  started for the first time; that relink + first launch per package is what dominates the loop.
+- Edit -> tests-green: since P17-B every dependent package's test binary is relinked against its
+  dependencies' new objects (before, a cached binary could report a stale pass after a dependency edit), which
+  had raised the loop to about 630 ms. P20-B keeps that exactness and brings it back to about 250 ms: the
+  workspace is loaded and CAS-built once, test binaries are cached in the CAS keyed by every linked object,
+  and missing binaries link and run in parallel. Most of what remains on macOS is the first launch of each
+  newly written (ad-hoc signed) Mach-O; Go's body edit is still faster here.
 - Workspace-wide `pionc2 test` also runs the tests of path dependencies outside the task (`std/json`,
   `std/http` for `t05` / `t12`); the dimension-1 test counts include only the task's own packages.
 - `pionc2 doc --json` is larger than the sources of the small `t06` project (plain-text `pionc2 doc` is compact).

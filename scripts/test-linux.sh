@@ -238,7 +238,8 @@ if [ "$HTTP_OUT" != "$(printf 'http in-process ok\nhttp_request ok: 200 text/pla
 fi
 
 FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
-  "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
+  "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" \
+  "$ROOT_DIR/examples/https_server" "$ROOT_DIR/tests/e2e/dyn_trait.pion")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: fmt --check failed on Linux: $FMT_JSON" >&2
@@ -280,9 +281,26 @@ if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null;
   printf '%s' "$TLS_JSON" | grep -q '"ok":true'
   printf '%s' "$TLS_JSON" | grep -q '"failed":0'
   sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
+  HTTPS_JSON="$("$PIONC" test --json "$ROOT_DIR/examples/https_server")"
+  echo "pionc_linux test --json examples/https_server -> $HTTPS_JSON"
+  printf '%s' "$HTTPS_JSON" | grep -q '"ok":true'
+  printf '%s' "$HTTPS_JSON" | grep -q '"failed":0'
+  # Server side: pure-Pion HTTPS service vs Python ssl / curl, TLS 1.3 and 1.2.
+  sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
 else
-  echo "NOTE: OpenSSL development files not found; skipping std/tls test + e2e handshakes"
+  echo "NOTE: OpenSSL development files not found; skipping std/tls + examples/https_server tests and client/server e2e handshakes"
 fi
+
+# dyn Trait: fat-pointer dispatch, vtables, Option[dyn Trait] niche, freeze/drop.
+DYN_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/dyn_trait.pion")"
+echo "pionc_linux run dyn_trait -> $DYN_OUT"
+if [ "$DYN_OUT" != "dyn_trait ok" ]; then
+  echo "FAIL: dyn_trait output mismatch" >&2
+  exit 1
+fi
+
+# pionc add / update against an offline git-index registry.
+sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"
