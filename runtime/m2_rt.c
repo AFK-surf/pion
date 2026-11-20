@@ -118,31 +118,35 @@ double m2_math_pow(double x, double y) {
 
 #if M2_USE_SLAB
 
-#define M2_SLAB_CLASSES     8u
-#define M2_SLAB_MAX_TOTAL   256u
-#define M2_SLAB_MAX_PAYLOAD (M2_SLAB_MAX_TOTAL - (uint32_t)sizeof(M2Header))
-#define M2_SLAB_CHUNK_BYTES 65536u
+#define M2_SLAB_CLASSES      8u
+#define M2_SLAB_MAX_TOTAL    256u
+#define M2_SLAB_MAX_PAYLOAD  (M2_SLAB_MAX_TOTAL - (uint32_t)sizeof(M2Header))
+#define M2_SLAB_CHUNK_BYTES  65536u
+#define M2_SLAB_REMOTE_BATCH 32u
 
 typedef struct M2SlabTLS {
     void *local_free[M2_SLAB_CLASSES];
+    void *remote_head[M2_SLAB_CLASSES];
+    void *remote_tail[M2_SLAB_CLASSES];
+    uint32_t remote_count[M2_SLAB_CLASSES];
     char *chunk_cur;
     char *chunk_end;
 } M2SlabTLS;
 
 static const uint16_t m2_slab_sizes[M2_SLAB_CLASSES] = {
-    32u, 48u, 56u, 64u, 96u, 128u, 192u, 256u
+    48u, 56u, 64u, 80u, 96u, 112u, 128u, 256u
 };
 
 /* Maps ((total + 7) >> 3) in [4..32] to slab class [0..7] */
 static const uint8_t m2_slab_cls_lut[33] = {
-    0, 0, 0, 0, 0,
-    1, 1,
+    0, 0, 0, 0, 0, 0, 0,
+    1,
     2,
-    3,
-    4, 4, 4, 4,
-    5, 5, 5, 5,
-    6, 6, 6, 6, 6, 6, 6, 6,
-    7, 7, 7, 7, 7, 7, 7, 7
+    3, 3,
+    4, 4,
+    5, 5,
+    6, 6,
+    7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7
 };
 
 static _Thread_local M2SlabTLS *tls_slab = NULL;
@@ -170,20 +174,29 @@ static void m2_slab_push_remote_list(uint32_t cls, void *head, void *tail) {
         memory_order_release, memory_order_relaxed));
 }
 
-static void m2_slab_thread_cleanup(void *arg) {
+M2_MINSIZE static void m2_slab_thread_cleanup(void *arg) {
     tls_slab = NULL;
     M2SlabTLS *s = (M2SlabTLS *)arg;
     if (!s) return;
     for (uint32_t cls = 0; cls < M2_SLAB_CLASSES; cls++) {
         void *head = s->local_free[cls];
-        if (!head) continue;
-        s->local_free[cls] = NULL;
-        void *tail = head;
-        void *nxt;
-        while ((nxt = m2_slab_get_next(tail)) != NULL) {
-            tail = nxt;
+        if (head) {
+            s->local_free[cls] = NULL;
+            void *tail = head;
+            void *nxt;
+            while ((nxt = m2_slab_get_next(tail)) != NULL) {
+                tail = nxt;
+            }
+            m2_slab_push_remote_list(cls, head, tail);
         }
-        m2_slab_push_remote_list(cls, head, tail);
+        void *rhead = s->remote_head[cls];
+        if (rhead) {
+            void *rtail = s->remote_tail[cls];
+            s->remote_head[cls] = NULL;
+            s->remote_tail[cls] = NULL;
+            s->remote_count[cls] = 0;
+            m2_slab_push_remote_list(cls, rhead, rtail);
+        }
     }
     free(s);
 }
@@ -282,13 +295,28 @@ static void m2_destroy(M2Header *hdr, void *obj) {
     uint16_t flags = hdr->flags;
     if (__builtin_expect((flags & M2_FLAG_SLAB) != 0, 1)) {
         uint32_t cls = (uint32_t)((flags >> M2_FLAG_SLAB_CLS_SHIFT) & M2_FLAG_SLAB_CLS_MASK);
+        M2SlabTLS *s = tls_slab;
         if (__builtin_expect((flags & M2_FLAG_FROZEN) == 0, 1)) {
-            M2SlabTLS *s = tls_slab;
             if (__builtin_expect(s != NULL, 1)) {
                 m2_slab_set_next(hdr, s->local_free[cls]);
                 s->local_free[cls] = hdr;
                 return;
             }
+        } else if (__builtin_expect(s != NULL, 1)) {
+            void *head = s->remote_head[cls];
+            m2_slab_set_next(hdr, head);
+            s->remote_head[cls] = hdr;
+            if (!head) {
+                s->remote_tail[cls] = hdr;
+            }
+            if (++s->remote_count[cls] >= M2_SLAB_REMOTE_BATCH) {
+                void *tail = s->remote_tail[cls];
+                s->remote_head[cls] = NULL;
+                s->remote_tail[cls] = NULL;
+                s->remote_count[cls] = 0;
+                m2_slab_push_remote_list(cls, hdr, tail);
+            }
+            return;
         }
         m2_slab_push_remote_list(cls, hdr, hdr);
         return;
@@ -399,7 +427,7 @@ int64_t m2_str_len(void *s) {
 
 int32_t m2_str_byte_at(void *s, int64_t idx) {
     M2String *str = (M2String *)s;
-    if (!str || idx < 0 || idx >= str->len) {
+    if (__builtin_expect(!str || idx < 0 || idx >= str->len, 0)) {
         m2_panic("string index out of bounds", __FILE__, __LINE__);
     }
     return (int32_t)(unsigned char)str->data[idx];
@@ -451,10 +479,18 @@ int32_t m2_str_cmp(void *a, void *b) {
 
 void *m2_str_slice(void *s, int64_t start, int64_t end) {
     M2String *str = (M2String *)s;
-    if (!str || start < 0 || end < start || end > str->len) {
+    if (__builtin_expect(!str || start < 0 || end < start || end > str->len, 0)) {
         m2_panic("string slice out of bounds", __FILE__, __LINE__);
     }
-    return m2_str_from_cstr(str->data + start, end - start);
+    int64_t n = end - start;
+    M2String *out = (M2String *)m2_alloc_uninit((uint32_t)(sizeof(M2String) + (size_t)n + 1),
+                                                M2_TAG_STRING, NULL);
+    out->len = n;
+    if (n > 0) {
+        memcpy(out->data, str->data + start, (size_t)n);
+    }
+    out->data[n] = '\0';
+    return out;
 }
 
 void *m2_int_to_str(int64_t v) {
@@ -571,7 +607,7 @@ void *m2_str_trim(void *s) {
 
 /* Splits s by sep into M2Array of M2String*.
  * Empty sep splits into individual bytes (empty string -> empty array). */
-void *m2_str_split(void *s, void *sep) {
+M2_MINSIZE void *m2_str_split(void *s, void *sep) {
     M2String *ss = (M2String *)s;
     M2String *sp = (M2String *)sep;
     int64_t sl = ss ? ss->len : 0;
@@ -609,7 +645,7 @@ void *m2_str_split(void *s, void *sep) {
     return arr;
 }
 
-void *m2_str_replace(void *s, void *from, void *to) {
+M2_MINSIZE void *m2_str_replace(void *s, void *from, void *to) {
     M2String *ss = (M2String *)s;
     if (!ss) return m2_str_from_cstr("", 0);
     M2String *sf = (M2String *)from;
@@ -768,9 +804,7 @@ static void m2_strbuf_drop(void *payload) {
     sb->data = NULL;
 }
 
-static void m2_strbuf_reserve(M2StrBuf *sb, int64_t add) {
-    int64_t need = sb->len + add + 1;
-    if (need <= sb->cap) return;
+static __attribute__((noinline)) M2_MINSIZE void m2_strbuf_grow(M2StrBuf *sb, int64_t need) {
     int64_t ncap = sb->cap > 0 ? sb->cap * 2 : 32;
     while (ncap < need) ncap *= 2;
     char *nd = (char *)realloc(sb->data, (size_t)ncap);
@@ -779,9 +813,16 @@ static void m2_strbuf_reserve(M2StrBuf *sb, int64_t add) {
     sb->cap = ncap;
 }
 
+static inline void m2_strbuf_reserve(M2StrBuf *sb, int64_t add) {
+    int64_t need = sb->len + add + 1;
+    if (__builtin_expect(need > sb->cap, 0)) {
+        m2_strbuf_grow(sb, need);
+    }
+}
+
 void *m2_strbuf_new(int64_t cap) {
-    M2StrBuf *sb = (M2StrBuf *)m2_alloc((uint32_t)sizeof(M2StrBuf), M2_TAG_STRBUF, m2_strbuf_drop);
-    int64_t init_cap = cap > 16 ? cap : 16;
+    M2StrBuf *sb = (M2StrBuf *)m2_alloc_uninit((uint32_t)sizeof(M2StrBuf), M2_TAG_STRBUF, m2_strbuf_drop);
+    int64_t init_cap = cap > 32 ? cap : 32;
     sb->data = (char *)malloc((size_t)init_cap);
     if (!sb->data) m2_panic("out of memory in strbuf_new", __FILE__, __LINE__);
     sb->data[0] = '\0';
@@ -793,16 +834,17 @@ void *m2_strbuf_new(int64_t cap) {
 void m2_strbuf_push_str(void *sb_ptr, void *s_ptr) {
     M2StrBuf *sb = (M2StrBuf *)sb_ptr;
     M2String *s = (M2String *)s_ptr;
-    if (!sb || !s || s->len == 0) return;
-    m2_strbuf_reserve(sb, s->len);
-    memcpy(sb->data + sb->len, s->data, (size_t)s->len);
-    sb->len += s->len;
+    if (__builtin_expect(!sb || !s || s->len == 0, 0)) return;
+    int64_t slen = s->len;
+    m2_strbuf_reserve(sb, slen);
+    memcpy(sb->data + sb->len, s->data, (size_t)slen);
+    sb->len += slen;
     sb->data[sb->len] = '\0';
 }
 
 void m2_strbuf_push_byte(void *sb_ptr, int32_t b) {
     M2StrBuf *sb = (M2StrBuf *)sb_ptr;
-    if (!sb) return;
+    if (__builtin_expect(!sb, 0)) return;
     m2_strbuf_reserve(sb, 1);
     sb->data[sb->len++] = (char)(b & 0xFF);
     sb->data[sb->len] = '\0';
@@ -810,12 +852,21 @@ void m2_strbuf_push_byte(void *sb_ptr, int32_t b) {
 
 void m2_strbuf_push_char(void *sb_ptr, int32_t cp) {
     M2StrBuf *sb = (M2StrBuf *)sb_ptr;
-    if (!sb || cp < 0 || cp > 0x10FFFF) return;
+    if (__builtin_expect(!sb, 0)) return;
+    if (__builtin_expect((uint32_t)cp < 0x80u, 1)) {
+        int64_t len = sb->len;
+        if (__builtin_expect(len + 2 > sb->cap, 0)) {
+            m2_strbuf_grow(sb, len + 2);
+        }
+        sb->data[len] = (char)cp;
+        sb->data[len + 1] = '\0';
+        sb->len = len + 1;
+        return;
+    }
+    if (cp < 0 || cp > 0x10FFFF) return;
     char buf[4];
     int n = 0;
-    if (cp < 0x80) {
-        buf[n++] = (char)cp;
-    } else if (cp < 0x800) {
+    if (cp < 0x800) {
         buf[n++] = (char)(0xC0 | (cp >> 6));
         buf[n++] = (char)(0x80 | (cp & 0x3F));
     } else if (cp < 0x10000) {
@@ -856,8 +907,15 @@ void m2_strbuf_reset(void *sb_ptr) {
 
 void *m2_strbuf_to_str(void *sb_ptr) {
     M2StrBuf *sb = (M2StrBuf *)sb_ptr;
-    if (!sb) return m2_str_from_cstr("", 0);
-    return m2_str_from_cstr(sb->data, sb->len);
+    int64_t len = sb ? sb->len : 0;
+    M2String *out = (M2String *)m2_alloc_uninit((uint32_t)(sizeof(M2String) + (size_t)len + 1),
+                                                M2_TAG_STRING, NULL);
+    out->len = len;
+    if (len > 0) {
+        memcpy(out->data, sb->data, (size_t)len);
+    }
+    out->data[len] = '\0';
+    return out;
 }
 
 /* ============================================================================
@@ -875,10 +933,19 @@ static void m2_arr_drop(void *payload) {
     a->data = NULL;
 }
 
+static __attribute__((noinline)) M2_MINSIZE void m2_arr_grow(M2Array *a) {
+    int64_t ncap = a->cap > 0 ? a->cap * 2 : 4;
+    int64_t *nd = (int64_t *)realloc(a->data, (size_t)ncap * sizeof(int64_t));
+    if (!nd) m2_panic("out of memory in arr_push", __FILE__, __LINE__);
+    a->data = nd;
+    a->cap = ncap;
+}
+
 void *m2_arr_new(int64_t cap, int32_t elem_is_obj) {
-    M2Array *a = (M2Array *)m2_alloc((uint32_t)sizeof(M2Array), M2_TAG_ARRAY, m2_arr_drop);
+    M2Array *a = (M2Array *)m2_alloc_uninit((uint32_t)sizeof(M2Array), M2_TAG_ARRAY, m2_arr_drop);
     a->len = 0;
     a->elem_is_obj = elem_is_obj ? 1 : 0;
+    a->_pad = 0;
     if (cap > 0) {
         a->data = (int64_t *)malloc((size_t)cap * sizeof(int64_t));
         if (!a->data) m2_panic("out of memory in arr_new", __FILE__, __LINE__);
@@ -897,12 +964,8 @@ int64_t m2_arr_len(void *a_ptr) {
 
 void m2_arr_push(void *a_ptr, int64_t val) {
     M2Array *a = (M2Array *)a_ptr;
-    if (a->len == a->cap) {
-        int64_t ncap = a->cap > 0 ? a->cap * 2 : 8;
-        int64_t *nd = (int64_t *)realloc(a->data, (size_t)ncap * sizeof(int64_t));
-        if (!nd) m2_panic("out of memory in arr_push", __FILE__, __LINE__);
-        a->data = nd;
-        a->cap = ncap;
+    if (__builtin_expect(a->len == a->cap, 0)) {
+        m2_arr_grow(a);
     }
     if (a->elem_is_obj) {
         m2_rc_inc((void *)(uintptr_t)val);
@@ -1142,8 +1205,9 @@ static void m2_map_grow(M2Map *m, int64_t new_cap) {
 }
 
 void *m2_map_new(int32_t val_is_obj) {
-    M2Map *m = (M2Map *)m2_alloc((uint32_t)sizeof(M2Map), M2_TAG_MAP, m2_map_drop);
+    M2Map *m = (M2Map *)m2_alloc_uninit((uint32_t)sizeof(M2Map), M2_TAG_MAP, m2_map_drop);
     m->val_is_obj = val_is_obj ? 1 : 0;
+    m->_pad = 0;
     m->len = 0;
     m->cap = 0;
     m->entries = NULL;
@@ -1221,7 +1285,7 @@ int64_t m2_map_get(void *m_ptr, void *key_str) {
     m2_panic("map key not found", __FILE__, __LINE__);
 }
 
-void m2_map_remove(void *m_ptr, void *key_str) {
+M2_MINSIZE void m2_map_remove(void *m_ptr, void *key_str) {
     M2Map *m = (M2Map *)m_ptr;
     M2String *k = (M2String *)key_str;
     if (!m || !k || m->len == 0 || m->cap == 0) return;
@@ -1252,7 +1316,7 @@ void m2_map_remove(void *m_ptr, void *key_str) {
     m->entries[hole].hash = 0;
 }
 
-void *m2_map_copy(void *m_ptr) {
+M2_MINSIZE void *m2_map_copy(void *m_ptr) {
     M2Map *m = (M2Map *)m_ptr;
     if (!m) return m2_map_new(0);
     M2Map *cp = (M2Map *)m2_map_new(m->val_is_obj);
@@ -1677,7 +1741,7 @@ void m2_world_eprintln(void *w_ptr, void *s_ptr) {
     fflush(stderr);
 }
 
-void *m2_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_out) {
+M2_MINSIZE void *m2_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_out) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path) {
@@ -1733,7 +1797,7 @@ int32_t m2_world_fs_write(void *w_ptr, void *path_str, void *content_str) {
     return (written == (size_t)content->len && close_ok) ? 1 : 0;
 }
 
-void *m2_world_fs_read_bytes(void *w_ptr, void *path_str, int32_t *ok_out) {
+M2_MINSIZE void *m2_world_fs_read_bytes(void *w_ptr, void *path_str, int32_t *ok_out) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path) {
@@ -1832,7 +1896,7 @@ int32_t m2_world_fs_is_dir(void *w_ptr, void *path_str) {
     return S_ISDIR(st.st_mode) ? 1 : 0;
 }
 
-int32_t m2_world_fs_mkdir_p(void *w_ptr, void *path_str) {
+M2_MINSIZE int32_t m2_world_fs_mkdir_p(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     if (!path || path->len == 0) return 0;
@@ -1870,7 +1934,7 @@ static int m2_str_slot_cmp(const void *a, const void *b) {
     return (int)m2_str_cmp(sa, sb);
 }
 
-void *m2_world_fs_list_dir(void *w_ptr, void *path_str) {
+M2_MINSIZE void *m2_world_fs_list_dir(void *w_ptr, void *path_str) {
     (void)w_ptr;
     M2String *path = (M2String *)path_str;
     void *arr = m2_arr_new(8, 1);
@@ -1941,7 +2005,7 @@ int64_t m2_world_clock_ms(void *w_ptr) {
     return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
 }
 
-int32_t m2_world_exec(void *w_ptr, void *argv_arr) {
+M2_MINSIZE int32_t m2_world_exec(void *w_ptr, void *argv_arr) {
     (void)w_ptr;
     M2Array *arr = (M2Array *)argv_arr;
     if (!arr || arr->len <= 0) return -1;
@@ -1968,7 +2032,7 @@ int32_t m2_world_exec(void *w_ptr, void *argv_arr) {
     return -1;
 }
 
-void *m2_world_exec_capture(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
+M2_MINSIZE void *m2_world_exec_capture(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
     (void)w_ptr;
     if (exit_code_out) *exit_code_out = -1;
     M2Array *arr = (M2Array *)argv_arr;
@@ -2109,7 +2173,7 @@ M2_MINSIZE static void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
     st[4] += e; st[5] += f; st[6] += g; st[7] += h;
 }
 
-void *m2_sha256_hex(void *s_ptr) {
+M2_MINSIZE void *m2_sha256_hex(void *s_ptr) {
     M2String *s = (M2String *)s_ptr;
     const uint8_t *data = s ? (const uint8_t *)s->data : (const uint8_t *)"";
     uint64_t len = s ? (uint64_t)s->len : 0;
