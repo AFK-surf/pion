@@ -761,9 +761,10 @@ test "p6c_stdlib_qbe_codegen_symbols" {
   assert_eq(ssa.contains("call $m2_str_replace("), true)
   assert_eq(ssa.contains("call $m2_str_to_bytes("), true)
   assert_eq(ssa.contains("call $m2_bytes_new("), true)
-  assert_eq(ssa.contains("call $m2_bytes_set("), true)
-  assert_eq(ssa.contains("call $m2_bytes_get("), true)
-  assert_eq(ssa.contains("call $m2_bytes_len("), true)
+  // Bytes set/get/length are inlined in QBE IR (storeb / loadub / @bytes_oob)
+  assert_eq(ssa.contains("storeb "), true)
+  assert_eq(ssa.contains("loadub "), true)
+  assert_eq(ssa.contains("@bytes_oob"), true)
   assert_eq(ssa.contains("call $m2_bytes_slice("), true)
   assert_eq(ssa.contains("call $m2_bytes_concat("), true)
   assert_eq(ssa.contains("call $m2_bytes_to_str("), true)
@@ -936,4 +937,143 @@ test "p8: tuple destructuring, match guards, and generic pair_swap codegen" {
   assert_eq(ssa.contains("@match_guard_fail"), true)
   assert_eq(ssa.contains("call $m2_rc_inc("), true)
   assert_eq(ssa.contains("call $m2_rc_dec("), true)
+}
+
+///|
+test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/bytes/sb/arr, deep freeze" {
+  let src =
+    "let OP_0 : Int = 0\n" +
+    "let OP_1 : Int = 1\n" +
+    "let OP_2 : Int = 2\n" +
+    "let OP_3 : Int = 3\n" +
+    "let OP_4 : Int = 4\n" +
+    "let OP_5 : Int = 5\n" +
+    "let OP_NEG : Int = -1\n" +
+    "pub val struct Msg {\n" +
+    "  id : Int\n" +
+    "  body : String\n" +
+    "}\n" +
+    "struct Lexer {\n" +
+    "  src : String\n" +
+    "  len : Int\n" +
+    "  mut pos : Int\n" +
+    "}\n" +
+    "fn skip_ws(p : Lexer) -> Unit {\n" +
+    "  while p.pos < p.len {\n" +
+    "    let ch = p.src.code_unit_at(p.pos)\n" +
+    "    if ch == 32 || ch == 10 {\n" +
+    "      p.pos = p.pos + 1\n" +
+    "    } else {\n" +
+    "      break\n" +
+    "    }\n" +
+    "  }\n" +
+    "}\n" +
+    "fn dispatch_if(op : Int) -> Int {\n" +
+    "  if op == OP_0 { 10 }\n" +
+    "  else if op == OP_1 { 20 }\n" +
+    "  else if op == OP_2 { 30 }\n" +
+    "  else if op == OP_3 { 40 }\n" +
+    "  else if op == OP_4 { 50 }\n" +
+    "  else if op == OP_5 { 60 }\n" +
+    "  else if op == OP_NEG { -1 }\n" +
+    "  else { 0 }\n" +
+    "}\n" +
+    "fn dispatch_match(op : Int) -> Int {\n" +
+    "  match op {\n" +
+    "    0 => 10\n" +
+    "    1 => 20\n" +
+    "    2 => 30\n" +
+    "    3 => 40\n" +
+    "    4 => 50\n" +
+    "    5 => 60\n" +
+    "    _ => 0\n" +
+    "  }\n" +
+    "}\n" +
+    "fn fast_ops(b : Bytes, sb : StringBuilder, a : Array[Int]) -> Int {\n" +
+    "  sb.write_char('A')\n" +
+    "  a.push(42)\n" +
+    "  b[0] = b[0]\n" +
+    "  b.length()\n" +
+    "}\n" +
+    "fn send_msg(ch : Channel[Msg], m : Msg) -> Bool {\n" +
+    "  ch.send(m)\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let lx = Lexer::{ src: \"  hi\", len: 4, pos: 0 }\n" +
+    "  skip_ws(lx)\n" +
+    "  let ch : Channel[Msg] = Channel::new(4)\n" +
+    "  let _ = send_msg(ch, Msg::{ id: 1, body: \"hello\" })\n" +
+    "  let b = Bytes::new(4)\n" +
+    "  let sb = StringBuilder::new()\n" +
+    "  let a : Array[Int] = []\n" +
+    "  dispatch_if(OP_3) + dispatch_match(2) + fast_ops(b, sb, a)\n" +
+    "}\n"
+  let cr = @core.check_source_files_with_imports("p10a_cg", ["p10a.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  // 1. skip_ws: no m2_str_byte_at, no m2_rc_inc/m2_rc_dec inside skip_ws
+  let sw_start = match ssa.find("fn_skip_ws(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(sw_start >= 0, true)
+  let sw_rest = ssa.clamped_view(start=sw_start).to_owned()
+  let sw_end = match sw_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => sw_rest.length()
+  }
+  let sw_body = sw_rest.clamped_view(end=sw_end).to_owned()
+  assert_eq(sw_body.contains("m2_str_byte_at"), false)
+  assert_eq(sw_body.contains("m2_rc_inc"), false)
+  assert_eq(sw_body.contains("m2_rc_dec"), false)
+  assert_eq(sw_body.contains("loadub"), true)
+  // 2. dispatch_if: const folded (no loadsw $m2_const_) and binary dispatch tree (@sw_lt, csltw)
+  let di_start = match ssa.find("fn_dispatch_if(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(di_start >= 0, true)
+  let di_rest = ssa.clamped_view(start=di_start).to_owned()
+  let di_end = match di_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => di_rest.length()
+  }
+  let di_body = di_rest.clamped_view(end=di_end).to_owned()
+  assert_eq(di_body.contains("$m2_const_"), false)
+  assert_eq(di_body.contains("csltw"), true)
+  assert_eq(di_body.contains("@sw_arm"), true)
+  // 3. dispatch_match: binary dispatch tree
+  let dm_start = match ssa.find("fn_dispatch_match(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(dm_start >= 0, true)
+  let dm_rest = ssa.clamped_view(start=dm_start).to_owned()
+  let dm_end = match dm_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => dm_rest.length()
+  }
+  let dm_body = dm_rest.clamped_view(end=dm_end).to_owned()
+  assert_eq(dm_body.contains("csltw"), true)
+  assert_eq(dm_body.contains("@sw_arm"), true)
+  // 4. fast_ops: inline bytes length/get/set, sb ASCII fast path, prim array push fast path
+  let fo_start = match ssa.find("fn_fast_ops(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(fo_start >= 0, true)
+  let fo_rest = ssa.clamped_view(start=fo_start).to_owned()
+  let fo_end = match fo_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => fo_rest.length()
+  }
+  let fo_body = fo_rest.clamped_view(end=fo_end).to_owned()
+  assert_eq(fo_body.contains("m2_bytes_len"), false)
+  assert_eq(fo_body.contains("m2_bytes_get"), false)
+  assert_eq(fo_body.contains("m2_bytes_set"), false)
+  assert_eq(fo_body.contains("@sb_fast"), true)
+  assert_eq(fo_body.contains("@ap_fast"), true)
+  // 5. deep freeze for Msg (nested String)
+  assert_eq(ssa.contains("function $m2_freeze_st_Msg("), true)
+  assert_eq(ssa.contains("call $m2_freeze_st_Msg("), true)
 }

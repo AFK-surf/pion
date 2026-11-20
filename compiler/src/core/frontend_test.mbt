@@ -729,3 +729,20 @@ test "p8: tuple destructuring, tuple indexing, match guards, and generic pair_sw
   let cr5 = @core.check_source_files("p8_bad5", ["b5.m2"], [bad_guard])
   assert_true(str_contains(@core.check_result_to_json(cr5.diagnostics), "E_TYPE_MISMATCH"), "non-Bool match guard")
 }
+
+///|
+test "p10a: parser never hangs on reserved keyword as struct field or param name" {
+  let bad_struct = "struct Bad { val : Int }\n"
+  let cr1 = @core.check_source_files("p10a_bad_struct", ["bs.m2"], [bad_struct])
+  assert_true(cr1.diagnostics.length() > 0, "reserved keyword field must return parse error")
+  assert_true(str_contains(@core.check_result_to_json(cr1.diagnostics), "E_PARSE"), "E_PARSE expected for struct field keyword")
+
+  let bad_param = "fn f(val : Int) -> Int { 0 }\n"
+  let cr2 = @core.check_source_files("p10a_bad_param", ["bp.m2"], [bad_param])
+  assert_true(cr2.diagnostics.length() > 0, "reserved keyword param must return parse error")
+  assert_true(str_contains(@core.check_result_to_json(cr2.diagnostics), "E_PARSE"), "E_PARSE expected for param keyword")
+
+  let bad_enum = "enum BadE { val(Int) }\n"
+  let cr3 = @core.check_source_files("p10a_bad_enum", ["be.m2"], [bad_enum])
+  assert_true(cr3.diagnostics.length() > 0, "reserved keyword enum variant must return parse error")
+}

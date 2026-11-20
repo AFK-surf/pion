@@ -75,6 +75,26 @@ pub struct QbePromField {
 }
 
 ///|
+pub struct QbeSwitchArm {
+  cval : Int
+  stmts : Array[Stmt]
+  expr_opt : Option[Expr]
+}
+
+///|
+pub struct QbeEqVarConst {
+  vname : String
+  cval : Int
+}
+
+///|
+pub struct QbeSwitchPlan {
+  vname : String
+  arms : Array[QbeSwitchArm]
+  default_opt : Option[Expr]
+}
+
+///|
 pub struct QbeGen {
   tc : TypeChecker
   release : Bool
@@ -83,6 +103,10 @@ pub struct QbeGen {
   struct_order : Array[String]
   enum_order : Array[String]
   const_order : Array[String]
+  const_int_vals : Map[String, Int]
+  const_i64_vals : Map[String, Int64]
+  const_bool_vals : Map[String, Bool]
+  freeze_fn_seen : Map[String, Bool]
   strings : Array[String]
   string_ids : Map[String, Int]
   cstrings : Array[String]
@@ -192,19 +216,28 @@ fn qbe_zero_reg(t : Ty) -> String {
 }
 
 ///|
+fn qbe_is_temp_reg(reg : String) -> Bool {
+  reg.length() > 0 && str_code_at(reg, 0) == 37
+}
+
+///|
 fn qbe_as_l(g : QbeGen, v : QbeVal) -> String {
   if qbe_is_double_ty(v.ty) {
     let t = qbe_tmp(g)
     qbe_emit(g, t + " =l cast " + v.reg)
     t
   } else if qbe_is_int32_ty(v.ty) {
-    match g.w_to_l_ext.get(v.reg) {
-      Some(rl) => rl
-      None => {
-        let t = qbe_tmp(g)
-        qbe_emit(g, t + " =l extsw " + v.reg)
-        g.w_to_l_ext.set(v.reg, t)
-        t
+    if !qbe_is_temp_reg(v.reg) {
+      v.reg
+    } else {
+      match g.w_to_l_ext.get(v.reg) {
+        Some(rl) => rl
+        None => {
+          let t = qbe_tmp(g)
+          qbe_emit(g, t + " =l extsw " + v.reg)
+          g.w_to_l_ext.set(v.reg, t)
+          t
+        }
       }
     }
   } else {
@@ -293,16 +326,20 @@ fn qbe_store_heap_slot(g : QbeGen, reg : String, slot : String, ty : Ty) -> Unit
   if qbe_is_double_ty(ty) {
     qbe_emit(g, "stored " + reg + ", " + slot)
   } else if qbe_is_int32_ty(ty) {
-    let rl = match g.w_to_l_ext.get(reg) {
-      Some(existing) => existing
-      None => {
-        let t = qbe_tmp(g)
-        qbe_emit(g, t + " =l extsw " + reg)
-        g.w_to_l_ext.set(reg, t)
-        t
+    if !qbe_is_temp_reg(reg) {
+      qbe_emit(g, "storel " + reg + ", " + slot)
+    } else {
+      let rl = match g.w_to_l_ext.get(reg) {
+        Some(existing) => existing
+        None => {
+          let t = qbe_tmp(g)
+          qbe_emit(g, t + " =l extsw " + reg)
+          g.w_to_l_ext.set(reg, t)
+          t
+        }
       }
+      qbe_emit(g, "storel " + rl + ", " + slot)
     }
-    qbe_emit(g, "storel " + rl + ", " + slot)
   } else {
     qbe_emit(g, "storel " + reg + ", " + slot)
   }
@@ -510,6 +547,48 @@ fn qbe_emit_arg_maybe_borrow(
             let t = qbe_load_local_slot(g, loc.slot, loc.ty)
             return QbeArgVal::{ qv: qval(t, loc.ty), borrowed: true }
           }
+          None => ()
+        }
+      EField(EIdent(lname, _), fname, _) =>
+        match qbe_lookup_local(g, lname) {
+          Some(loc) =>
+            match loc.ty {
+              TStruct(sname, sargs) =>
+                match g.tc.structs.get(sname) {
+                  Some(sinfo) => {
+                    let subst = make_subst(sinfo.decl.type_params, sargs)
+                    let mut fi = 0
+                    while fi < sinfo.field_names.length() {
+                      if sinfo.field_names[fi] == fname {
+                        if !sinfo.field_muts[fi] {
+                          let fkey = lname + "." + fname
+                          match g.hoisted_fields.get(fkey) {
+                            Some(hv) =>
+                              return QbeArgVal::{ qv: hv, borrowed: true }
+                            None => ()
+                          }
+                          match g.block_immut_fields.get(fkey) {
+                            Some(bv) =>
+                              return QbeArgVal::{ qv: bv, borrowed: true }
+                            None => ()
+                          }
+                          let fty = subst_ty(sinfo.field_tys[fi], subst)
+                          let obj_p = qbe_tmp(g)
+                          let fp = qbe_tmp(g)
+                          qbe_emit(g, obj_p + " =l loadl " + loc.slot)
+                          qbe_emit(g, fp + " =l add " + obj_p + ", " + (fi * 8).to_string())
+                          let fv = qbe_load_heap_slot(g, fp, fty)
+                          return QbeArgVal::{ qv: qval(fv, fty), borrowed: true }
+                        }
+                        break
+                      }
+                      fi = fi + 1
+                    }
+                  }
+                  None => ()
+                }
+              _ => ()
+            }
           None => ()
         }
       _ => ()
@@ -3300,6 +3379,10 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     struct_order: [],
     enum_order: [],
     const_order: [],
+    const_int_vals: Map([]),
+    const_i64_vals: Map([]),
+    const_bool_vals: Map([]),
+    freeze_fn_seen: Map([]),
     strings: [],
     string_ids: Map([]),
     cstrings: [],
@@ -3642,6 +3725,718 @@ fn qbe_rc_dec(g : QbeGen, vreg : String, ty : Ty) -> Unit {
       if qbe_is_obj_ty(ty) {
         qbe_emit(g, "call $m2_rc_dec(l " + vreg + ")")
       }
+  }
+}
+
+///|
+fn qbe_record_scalar_const(g : QbeGen, cd : ConstDecl, cty : Ty) -> Unit {
+  match cty {
+    TInt =>
+      match cd.value {
+        EInt(raw, _) =>
+          g.const_int_vals.set(cd.name, qbe_parse_int64_lit(raw).to_int())
+        EUnary("-", EInt(raw, _), _) =>
+          g.const_int_vals.set(cd.name, 0 - qbe_parse_int64_lit(raw).to_int())
+        _ => ()
+      }
+    TInt64 =>
+      match cd.value {
+        EInt64(raw, _) | EInt(raw, _) =>
+          g.const_i64_vals.set(cd.name, qbe_parse_int64_lit(raw))
+        EUnary("-", EInt64(raw, _), _) | EUnary("-", EInt(raw, _), _) =>
+          g.const_i64_vals.set(cd.name, 0L - qbe_parse_int64_lit(raw))
+        _ => ()
+      }
+    TBool =>
+      match cd.value {
+        EBool(b, _) => g.const_bool_vals.set(cd.name, b)
+        _ => ()
+      }
+    _ => ()
+  }
+}
+
+///|
+fn qbe_try_const_int(g : QbeGen, e : Expr) -> Option[Int] {
+  match e {
+    EInt(raw, _) => Some(qbe_parse_int64_lit(raw).to_int())
+    EUnary("-", EInt(raw, _), _) => Some(0 - qbe_parse_int64_lit(raw).to_int())
+    EIdent(name, _) =>
+      match qbe_lookup_local(g, name) {
+        Some(_) => None
+        None => g.const_int_vals.get(name)
+      }
+    _ => None
+  }
+}
+
+///|
+fn qbe_emit_str_code_unit_at(
+  g : QbeGen,
+  str_reg : String,
+  idx_expr : Expr,
+  str_local_name : String,
+) -> String {
+  let iv = qbe_emit_expr(g, idx_expr, Some(TInt))
+  let il = qbe_as_l(g, iv)
+  let bce_safe = if str_local_name != "" {
+    qbe_bce_expr_is_safe(g, str_local_name, idx_expr)
+  } else {
+    false
+  }
+  if !bce_safe {
+    let slen = qbe_tmp(g)
+    let oob = qbe_tmp(g)
+    let l_oob = qbe_lbl(g, "str_oob")
+    let l_ok = qbe_lbl(g, "str_ok")
+    qbe_emit(g, slen + " =l loadl " + str_reg)
+    qbe_emit(g, oob + " =w cugel " + il + ", " + slen)
+    qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+    qbe_emit_lbl(g, l_oob)
+    qbe_emit(g, "call $m2_panic_oob(l " + il + ", l " + slen + ")")
+    qbe_emit_term(g, "hlt")
+    qbe_emit_lbl(g, l_ok)
+  }
+  let base = qbe_tmp(g)
+  let ep = qbe_tmp(g)
+  let bw = qbe_tmp(g)
+  qbe_emit(g, base + " =l add " + str_reg + ", 8")
+  qbe_emit(g, ep + " =l add " + base + ", " + il)
+  qbe_emit(g, bw + " =w loadub " + ep)
+  bw
+}
+
+///|
+fn qbe_freeze_ty_key(ty : Ty) -> String {
+  match ty {
+    TInt => "i"
+    TInt64 => "i64"
+    TDouble => "d"
+    TBool => "b"
+    TByte => "u8"
+    TChar => "ch"
+    TString => "str"
+    TBytes => "bytes"
+    TStringBuilder => "sb"
+    TUnit => "u"
+    TStruct(sname, sargs) => {
+      let sb = StringBuilder()
+      sb.write_string("st_")
+      sb.write_string(qbe_sanitize_sym(sname))
+      let mut i = 0
+      while i < sargs.length() {
+        sb.write_string("_")
+        sb.write_string(qbe_freeze_ty_key(sargs[i]))
+        i = i + 1
+      }
+      sb.to_string()
+    }
+    TEnum(ename, eargs) => {
+      let sb = StringBuilder()
+      sb.write_string("en_")
+      sb.write_string(qbe_sanitize_sym(ename))
+      let mut i = 0
+      while i < eargs.length() {
+        sb.write_string("_")
+        sb.write_string(qbe_freeze_ty_key(eargs[i]))
+        i = i + 1
+      }
+      sb.to_string()
+    }
+    TTuple(elems) => {
+      let sb = StringBuilder()
+      sb.write_string("tup")
+      let mut i = 0
+      while i < elems.length() {
+        sb.write_string("_")
+        sb.write_string(qbe_freeze_ty_key(elems[i]))
+        i = i + 1
+      }
+      sb.to_string()
+    }
+    TOption(inner) => "opt_" + qbe_freeze_ty_key(inner)
+    TResult(ok_ty, err_ty) =>
+      "res_" + qbe_freeze_ty_key(ok_ty) + "_" + qbe_freeze_ty_key(err_ty)
+    TArray(elem) => "arr_" + qbe_freeze_ty_key(elem)
+    _ => "obj"
+  }
+}
+
+///|
+fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
+  if !qbe_is_obj_ty(ty) {
+    return ""
+  }
+  match ty {
+    TStruct(sname, sargs) =>
+      match g.tc.structs.get(sname) {
+        Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let obj_slots : Array[Int] = []
+          let obj_tys : Array[Ty] = []
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            let fty = subst_ty(sinfo.field_tys[fi], subst)
+            if qbe_is_obj_ty(fty) {
+              obj_slots.push(fi)
+              obj_tys.push(fty)
+            }
+            fi = fi + 1
+          }
+          if obj_slots.length() == 0 {
+            return "$m2_rc_freeze"
+          }
+          let fn_sym = "$m2_freeze_" + qbe_freeze_ty_key(ty)
+          if g.freeze_fn_seen.contains(fn_sym) {
+            return fn_sym
+          }
+          g.freeze_fn_seen.set(fn_sym, true)
+          let child_syms : Array[String] = []
+          let mut ci = 0
+          while ci < obj_tys.length() {
+            child_syms.push(qbe_ensure_freeze_fn(g, obj_tys[ci]))
+            ci = ci + 1
+          }
+          let sb = StringBuilder()
+          sb.write_string("function ")
+          sb.write_string(fn_sym)
+          sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $m2_rc_freeze(l %obj)\n")
+          let mut j = 0
+          while j < obj_slots.length() {
+            let off = obj_slots[j] * 8
+            sb.write_string("    %a")
+            sb.write_string(j.to_string())
+            sb.write_string(" =l add %obj, ")
+            sb.write_string(off.to_string())
+            sb.write_string("\n    %v")
+            sb.write_string(j.to_string())
+            sb.write_string(" =l loadl %a")
+            sb.write_string(j.to_string())
+            sb.write_string("\n    call ")
+            sb.write_string(child_syms[j])
+            sb.write_string("(l %v")
+            sb.write_string(j.to_string())
+            sb.write_string(")\n")
+            j = j + 1
+          }
+          sb.write_string("@done\n    ret\n}\n\n")
+          g.extra_fns.push(sb.to_string())
+          fn_sym
+        }
+        None => "$m2_rc_freeze"
+      }
+    TTuple(elems) => {
+      let obj_slots : Array[Int] = []
+      let obj_tys : Array[Ty] = []
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_is_obj_ty(elems[i]) {
+          obj_slots.push(i)
+          obj_tys.push(elems[i])
+        }
+        i = i + 1
+      }
+      if obj_slots.length() == 0 {
+        return "$m2_rc_freeze"
+      }
+      let fn_sym = "$m2_freeze_" + qbe_freeze_ty_key(ty)
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      let child_syms : Array[String] = []
+      let mut ci = 0
+      while ci < obj_tys.length() {
+        child_syms.push(qbe_ensure_freeze_fn(g, obj_tys[ci]))
+        ci = ci + 1
+      }
+      let sb = StringBuilder()
+      sb.write_string("function ")
+      sb.write_string(fn_sym)
+      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $m2_rc_freeze(l %obj)\n")
+      let mut j = 0
+      while j < obj_slots.length() {
+        let off = obj_slots[j] * 8
+        sb.write_string("    %a")
+        sb.write_string(j.to_string())
+        sb.write_string(" =l add %obj, ")
+        sb.write_string(off.to_string())
+        sb.write_string("\n    %v")
+        sb.write_string(j.to_string())
+        sb.write_string(" =l loadl %a")
+        sb.write_string(j.to_string())
+        sb.write_string("\n    call ")
+        sb.write_string(child_syms[j])
+        sb.write_string("(l %v")
+        sb.write_string(j.to_string())
+        sb.write_string(")\n")
+        j = j + 1
+      }
+      sb.write_string("@done\n    ret\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    TOption(inner) => {
+      if !qbe_is_obj_ty(inner) {
+        return "$m2_rc_freeze"
+      }
+      let fn_sym = "$m2_freeze_" + qbe_freeze_ty_key(ty)
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      let child_sym = qbe_ensure_freeze_fn(g, inner)
+      let sb = StringBuilder()
+      sb.write_string("function ")
+      sb.write_string(fn_sym)
+      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $m2_rc_freeze(l %obj)\n    %tag =l loadl %obj\n    %is1 =w ceql %tag, 1\n    jnz %is1, @some, @done\n@some\n    %a =l add %obj, 8\n    %v =l loadl %a\n    call ")
+      sb.write_string(child_sym)
+      sb.write_string("(l %v)\n@done\n    ret\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    TResult(ok_ty, err_ty) => {
+      let ok_obj = qbe_is_obj_ty(ok_ty)
+      let err_obj = qbe_is_obj_ty(err_ty)
+      if !ok_obj && !err_obj {
+        return "$m2_rc_freeze"
+      }
+      let fn_sym = "$m2_freeze_" + qbe_freeze_ty_key(ty)
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      let ok_sym = if ok_obj { qbe_ensure_freeze_fn(g, ok_ty) } else { "" }
+      let err_sym = if err_obj { qbe_ensure_freeze_fn(g, err_ty) } else { "" }
+      let sb = StringBuilder()
+      sb.write_string("function ")
+      sb.write_string(fn_sym)
+      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $m2_rc_freeze(l %obj)\n    %tag =l loadl %obj\n    %is0 =w ceql %tag, 0\n    jnz %is0, @ok_b, @err_b\n@ok_b\n")
+      if ok_obj {
+        sb.write_string("    %ao =l add %obj, 8\n    %vo =l loadl %ao\n    call ")
+        sb.write_string(ok_sym)
+        sb.write_string("(l %vo)\n")
+      }
+      sb.write_string("    jmp @done\n@err_b\n")
+      if err_obj {
+        sb.write_string("    %ae =l add %obj, 8\n    %ve =l loadl %ae\n    call ")
+        sb.write_string(err_sym)
+        sb.write_string("(l %ve)\n")
+      }
+      sb.write_string("@done\n    ret\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    TEnum(ename, eargs) =>
+      match g.tc.enums.get(ename) {
+        Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let mut any_obj = false
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              if qbe_is_obj_ty(subst_ty(v.field_tys[fi], subst)) {
+                any_obj = true
+                break
+              }
+              fi = fi + 1
+            }
+            if any_obj {
+              break
+            }
+            vi = vi + 1
+          }
+          if !any_obj {
+            return "$m2_rc_freeze"
+          }
+          let fn_sym = "$m2_freeze_" + qbe_freeze_ty_key(ty)
+          if g.freeze_fn_seen.contains(fn_sym) {
+            return fn_sym
+          }
+          g.freeze_fn_seen.set(fn_sym, true)
+          let sb = StringBuilder()
+          sb.write_string("function ")
+          sb.write_string(fn_sym)
+          sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $m2_rc_freeze(l %obj)\n    %tag =l loadl %obj\n")
+          vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let obj_slots : Array[Int] = []
+            let child_syms : Array[String] = []
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              let fty = subst_ty(v.field_tys[fi], subst)
+              if qbe_is_obj_ty(fty) {
+                obj_slots.push(fi)
+                child_syms.push(qbe_ensure_freeze_fn(g, fty))
+              }
+              fi = fi + 1
+            }
+            if obj_slots.length() > 0 {
+              sb.write_string("    %c")
+              sb.write_string(vi.to_string())
+              sb.write_string(" =w ceql %tag, ")
+              sb.write_string(vi.to_string())
+              sb.write_string("\n    jnz %c")
+              sb.write_string(vi.to_string())
+              sb.write_string(", @v")
+              sb.write_string(vi.to_string())
+              sb.write_string(", @n")
+              sb.write_string(vi.to_string())
+              sb.write_string("\n@v")
+              sb.write_string(vi.to_string())
+              sb.write_string("\n")
+              let mut j = 0
+              while j < obj_slots.length() {
+                let off = (obj_slots[j] + 1) * 8
+                sb.write_string("    %a")
+                sb.write_string(vi.to_string())
+                sb.write_string("_")
+                sb.write_string(j.to_string())
+                sb.write_string(" =l add %obj, ")
+                sb.write_string(off.to_string())
+                sb.write_string("\n    %v")
+                sb.write_string(vi.to_string())
+                sb.write_string("_")
+                sb.write_string(j.to_string())
+                sb.write_string(" =l loadl %a")
+                sb.write_string(vi.to_string())
+                sb.write_string("_")
+                sb.write_string(j.to_string())
+                sb.write_string("\n    call ")
+                sb.write_string(child_syms[j])
+                sb.write_string("(l %v")
+                sb.write_string(vi.to_string())
+                sb.write_string("_")
+                sb.write_string(j.to_string())
+                sb.write_string(")\n")
+                j = j + 1
+              }
+              sb.write_string("    ret\n@n")
+              sb.write_string(vi.to_string())
+              sb.write_string("\n")
+            }
+            vi = vi + 1
+          }
+          sb.write_string("@done\n    ret\n}\n\n")
+          g.extra_fns.push(sb.to_string())
+          fn_sym
+        }
+        None => "$m2_rc_freeze"
+      }
+    TArray(elem) => {
+      if !qbe_is_obj_ty(elem) {
+        return "$m2_rc_freeze"
+      }
+      let fn_sym = "$m2_freeze_" + qbe_freeze_ty_key(ty)
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      let child_sym = qbe_ensure_freeze_fn(g, elem)
+      let sb = StringBuilder()
+      sb.write_string("function ")
+      sb.write_string(fn_sym)
+      sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    call $m2_rc_freeze(l %obj)\n    %len =l loadl %obj\n    %dp_p =l add %obj, 24\n    %dp =l loadl %dp_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %len\n    jnz %c, @step, @done\n@step\n    %off =l shl %i, 3\n    %ep =l add %dp, %off\n    %ev =l loadl %ep\n    call ")
+      sb.write_string(child_sym)
+      sb.write_string("(l %ev)\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    _ => "$m2_rc_freeze"
+  }
+}
+
+///|
+fn qbe_emit_deep_freeze(g : QbeGen, reg_l : String, ty : Ty) -> Unit {
+  if !qbe_is_obj_ty(ty) {
+    return
+  }
+  let sym = qbe_ensure_freeze_fn(g, ty)
+  if sym != "" {
+    qbe_emit(g, "call " + sym + "(l " + reg_l + ")")
+  }
+}
+
+///|
+fn qbe_match_eq_var_const(g : QbeGen, cond : Expr) -> Option[QbeEqVarConst] {
+  match cond {
+    EBinary("==", l, r, _) => {
+      match l {
+        EIdent(vname, _) =>
+          match qbe_try_const_int(g, r) {
+            Some(cv) =>
+              match qbe_lookup_local(g, vname) {
+                Some(loc) =>
+                  match loc.ty {
+                    TInt => return Some(QbeEqVarConst::{ vname: vname, cval: cv })
+                    _ => ()
+                  }
+                None => ()
+              }
+            None => ()
+          }
+        _ => ()
+      }
+      match r {
+        EIdent(vname, _) =>
+          match qbe_try_const_int(g, l) {
+            Some(cv) =>
+              match qbe_lookup_local(g, vname) {
+                Some(loc) =>
+                  match loc.ty {
+                    TInt => return Some(QbeEqVarConst::{ vname: vname, cval: cv })
+                    _ => ()
+                  }
+                None => ()
+              }
+            None => ()
+          }
+        _ => ()
+      }
+      None
+    }
+    _ => None
+  }
+}
+
+///|
+fn qbe_sort_switch_arms(arms : Array[QbeSwitchArm]) -> Unit {
+  let mut i = 1
+  while i < arms.length() {
+    let key = arms[i]
+    let mut j = i - 1
+    while j >= 0 && arms[j].cval > key.cval {
+      arms[j + 1] = arms[j]
+      j = j - 1
+    }
+    arms[j + 1] = key
+    i = i + 1
+  }
+}
+
+///|
+fn qbe_try_collect_if_switch(
+  g : QbeGen,
+  cond : Expr,
+  then_stmts : Array[Stmt],
+  else_opt : Option[Expr],
+) -> Option[QbeSwitchPlan] {
+  let first = match qbe_match_eq_var_const(g, cond) {
+    Some(f) => f
+    None => return None
+  }
+  let vname = first.vname
+  let arms : Array[QbeSwitchArm] = [
+    QbeSwitchArm::{ cval: first.cval, stmts: then_stmts, expr_opt: None },
+  ]
+  let seen : Map[String, Bool] = Map([])
+  seen.set(first.cval.to_string(), true)
+  let mut cur_else = else_opt
+  while true {
+    match cur_else {
+      Some(EIf(c2, t2, e2, _)) =>
+        match qbe_match_eq_var_const(g, c2) {
+          Some(m2) =>
+            if m2.vname == vname && !seen.contains(m2.cval.to_string()) {
+              seen.set(m2.cval.to_string(), true)
+              arms.push(QbeSwitchArm::{ cval: m2.cval, stmts: t2, expr_opt: None })
+              cur_else = e2
+            } else {
+              break
+            }
+          None => break
+        }
+      _ => break
+    }
+  }
+  if arms.length() < 6 {
+    return None
+  }
+  qbe_sort_switch_arms(arms)
+  Some(QbeSwitchPlan::{ vname: vname, arms: arms, default_opt: cur_else })
+}
+
+///|
+fn qbe_emit_dispatch_subtree(
+  g : QbeGen,
+  val_reg : String,
+  arms : Array[QbeSwitchArm],
+  arm_lbls : Array[String],
+  lo : Int,
+  hi : Int,
+  default_lbl : String,
+) -> Unit {
+  if lo > hi {
+    qbe_emit_term(g, "jmp " + default_lbl)
+    return
+  }
+  if lo == hi {
+    let cmp = qbe_tmp(g)
+    qbe_emit(g, cmp + " =w ceqw " + val_reg + ", " + arms[lo].cval.to_string())
+    qbe_emit_term(g, "jnz " + cmp + ", " + arm_lbls[lo] + ", " + default_lbl)
+    return
+  }
+  let mid = lo + (hi - lo) / 2
+  let pivot = arms[mid].cval.to_string()
+  let eq_r = qbe_tmp(g)
+  let l_neq = qbe_lbl(g, "sw_neq")
+  qbe_emit(g, eq_r + " =w ceqw " + val_reg + ", " + pivot)
+  qbe_emit_term(g, "jnz " + eq_r + ", " + arm_lbls[mid] + ", " + l_neq)
+  qbe_emit_lbl(g, l_neq)
+  if lo == mid {
+    qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, mid + 1, hi, default_lbl)
+  } else if mid == hi {
+    qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, lo, mid - 1, default_lbl)
+  } else {
+    let lt_r = qbe_tmp(g)
+    let l_left = qbe_lbl(g, "sw_lt")
+    let l_right = qbe_lbl(g, "sw_gt")
+    qbe_emit(g, lt_r + " =w csltw " + val_reg + ", " + pivot)
+    qbe_emit_term(g, "jnz " + lt_r + ", " + l_left + ", " + l_right)
+    qbe_emit_lbl(g, l_left)
+    qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, lo, mid - 1, default_lbl)
+    qbe_emit_lbl(g, l_right)
+    qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, mid + 1, hi, default_lbl)
+  }
+}
+
+///|
+fn qbe_emit_int_dispatch(
+  g : QbeGen,
+  val_reg : String,
+  arms : Array[QbeSwitchArm],
+  default_expr_opt : Option[Expr],
+  default_bind_name : String,
+  is_match_no_default : Bool,
+  sp : Span,
+  expected : Option[Ty],
+  is_void : Bool,
+) -> QbeVal {
+  let arm_lbls : Array[String] = []
+  let mut i = 0
+  while i < arms.length() {
+    arm_lbls.push(qbe_lbl(g, "sw_arm"))
+    i = i + 1
+  }
+  let l_def = qbe_lbl(g, "sw_def")
+  let l_end = qbe_lbl(g, "sw_end")
+  qbe_emit_dispatch_subtree(g, val_reg, arms, arm_lbls, 0, arms.length() - 1, l_def)
+
+  let mut res_slot = ""
+  let mut res_ty : Option[Ty] = expected
+  let mut all_term = true
+
+  i = 0
+  while i < arms.length() {
+    qbe_emit_lbl(g, arm_lbls[i])
+    qbe_scope_push(g)
+    let av = match arms[i].expr_opt {
+      Some(e) => qbe_emit_expr(g, e, if is_void { None } else { res_ty })
+      None => qbe_emit_stmts(g, arms[i].stmts, if is_void { None } else { res_ty })
+    }
+    if !g.block_term {
+      all_term = false
+      if is_void {
+        qbe_rc_dec(g, av.reg, av.ty)
+      } else {
+        match res_ty {
+          None =>
+            match av.ty {
+              TNever => ()
+              _ => res_ty = Some(av.ty)
+            }
+          Some(_) => ()
+        }
+        let store_ty = match res_ty {
+          Some(t) => t
+          None => av.ty
+        }
+        if res_slot == "" {
+          res_slot = qbe_alloc_slot_for(g, store_ty)
+        }
+        qbe_store_local_slot(g, qbe_coerce_val(g, av, store_ty), res_slot, store_ty)
+      }
+    }
+    qbe_scope_pop(g)
+    qbe_emit_term(g, "jmp " + l_end)
+    i = i + 1
+  }
+
+  qbe_emit_lbl(g, l_def)
+  match default_expr_opt {
+    Some(de) => {
+      qbe_scope_push(g)
+      if default_bind_name != "" {
+        let bloc = qbe_define_local(g, default_bind_name, TInt, false)
+        qbe_store_local_slot(g, val_reg, bloc.slot, TInt)
+      }
+      let dv = qbe_emit_expr(g, de, if is_void { None } else { res_ty })
+      if !g.block_term {
+        all_term = false
+        if is_void {
+          qbe_rc_dec(g, dv.reg, dv.ty)
+        } else {
+          match res_ty {
+            None =>
+              match dv.ty {
+                TNever => ()
+                _ => res_ty = Some(dv.ty)
+              }
+            Some(_) => ()
+          }
+          let store_ty = match res_ty {
+            Some(t) => t
+            None => dv.ty
+          }
+          if res_slot == "" {
+            res_slot = qbe_alloc_slot_for(g, store_ty)
+          }
+          qbe_store_local_slot(g, qbe_coerce_val(g, dv, store_ty), res_slot, store_ty)
+        }
+      }
+      qbe_scope_pop(g)
+      qbe_emit_term(g, "jmp " + l_end)
+    }
+    None =>
+      if is_match_no_default {
+        let file_id = qbe_intern_cstring(g, sp.file)
+        let msg_id = qbe_intern_cstring(g, "non-exhaustive match")
+        qbe_emit(
+          g,
+          "call $m2_panic(l $m2_cstr_" +
+          msg_id.to_string() +
+          ", l $m2_cstr_" +
+          file_id.to_string() +
+          ", w " +
+          sp.line.to_string() +
+          ")",
+        )
+        qbe_emit_term(g, "jmp " + l_end)
+      } else {
+        all_term = false
+        qbe_emit_term(g, "jmp " + l_end)
+      }
+  }
+
+  qbe_emit_lbl(g, l_end)
+  if is_void {
+    qval("0", TUnit)
+  } else if all_term {
+    qval("0", TNever)
+  } else {
+    let final_ty = match res_ty {
+      Some(t) => t
+      None => TUnit
+    }
+    if res_slot == "" {
+      qval(qbe_zero_reg(final_ty), final_ty)
+    } else {
+      let r = qbe_load_local_slot(g, res_slot, final_ty)
+      qval(r, final_ty)
+    }
   }
 }
 
@@ -4494,7 +5289,7 @@ fn qbe_emit_closure_obj(
     let v = qbe_as_l(g, qval(dv, loc.ty))
     if qbe_is_obj_ty(loc.ty) {
       if is_spawn {
-        qbe_emit(g, "call $m2_rc_freeze(l " + v + ")")
+        qbe_emit_deep_freeze(g, v, loc.ty)
       }
       qbe_emit(g, "call $m2_rc_inc(l " + v + ")")
     }
@@ -4652,14 +5447,14 @@ fn qbe_emit_method_call(
   args : Array[Expr],
   expected : Option[Ty],
 ) -> QbeVal {
-  // Fast zero-RC borrow path for `local.length()` on String / Array
+  // Fast zero-RC borrow path for `local.length()` and `local.immut_field.length()` on String / Array / Bytes
   if method_name == "length" && args.length() == 0 {
     match obj_expr {
       EIdent(lname, _) =>
         match qbe_lookup_local(g, lname) {
           Some(loc) =>
             match loc.ty {
-              TString | TArray(_) => {
+              TString | TArray(_) | TBytes => {
                 let r64 = match g.hoisted_arr_len.get(lname) {
                   Some(hlen) => hlen
                   None => {
@@ -4674,6 +5469,61 @@ fn qbe_emit_method_call(
                 qbe_emit(g, rw + " =w copy " + r64)
                 return qval(rw, TInt)
               }
+              _ => ()
+            }
+          None => ()
+        }
+      EField(EIdent(lname, _), fname, _) =>
+        match qbe_lookup_local(g, lname) {
+          Some(loc) =>
+            match loc.ty {
+              TStruct(sname, sargs) =>
+                match g.tc.structs.get(sname) {
+                  Some(sinfo) => {
+                    let subst = make_subst(sinfo.decl.type_params, sargs)
+                    let mut fi = 0
+                    while fi < sinfo.field_names.length() {
+                      if sinfo.field_names[fi] == fname {
+                        if !sinfo.field_muts[fi] {
+                          let fty = subst_ty(sinfo.field_tys[fi], subst)
+                          match fty {
+                            TString | TArray(_) | TBytes => {
+                              let fkey = lname + "." + fname
+                              let fld_p = match g.hoisted_fields.get(fkey) {
+                                Some(hv) => hv.reg
+                                None =>
+                                  match g.block_immut_fields.get(fkey) {
+                                    Some(bv) => bv.reg
+                                    None => {
+                                      let sp = qbe_tmp(g)
+                                      let fp = qbe_tmp(g)
+                                      let fv = qbe_tmp(g)
+                                      qbe_emit(g, sp + " =l loadl " + loc.slot)
+                                      qbe_emit(
+                                        g,
+                                        fp + " =l add " + sp + ", " + (fi * 8).to_string(),
+                                      )
+                                      qbe_emit(g, fv + " =l loadl " + fp)
+                                      fv
+                                    }
+                                  }
+                              }
+                              let t64 = qbe_tmp(g)
+                              let rw = qbe_tmp(g)
+                              qbe_emit(g, t64 + " =l loadl " + fld_p)
+                              qbe_emit(g, rw + " =w copy " + t64)
+                              return qval(rw, TInt)
+                            }
+                            _ => ()
+                          }
+                        }
+                        break
+                      }
+                      fi = fi + 1
+                    }
+                  }
+                  None => ()
+                }
               _ => ()
             }
           None => ()
@@ -4804,10 +5654,11 @@ fn qbe_emit_method_call(
         return qval(obj_val, TString)
       }
       if method_name == "code_unit_at" {
-        let iv = qbe_emit_expr(g, args[0], Some(TInt))
-        let il = qbe_as_l(g, iv)
-        let bw = qbe_tmp(g)
-        qbe_emit(g, bw + " =w call $m2_str_byte_at(l " + obj_val + ", l " + il + ")")
+        let str_lname = match obj_expr {
+          EIdent(n, _) => n
+          _ => ""
+        }
+        let bw = qbe_emit_str_code_unit_at(g, obj_val, args[0], str_lname)
         if !obj_borrowed {
           qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
         }
@@ -4948,7 +5799,7 @@ fn qbe_emit_method_call(
       if method_name == "length" {
         let r64 = qbe_tmp(g)
         let rw = qbe_tmp(g)
-        qbe_emit(g, r64 + " =l call $m2_bytes_len(l " + obj_val + ")")
+        qbe_emit(g, r64 + " =l loadl " + obj_val)
         if !obj_borrowed {
           qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
         }
@@ -5008,8 +5859,43 @@ fn qbe_emit_method_call(
       if method_name == "write_char" {
         let cv = qbe_emit_expr(g, args[0], Some(TChar))
         let cw = qbe_tmp(g)
+        let is_ascii = qbe_tmp(g)
+        let l_chk = qbe_lbl(g, "sb_chk")
+        let l_fast = qbe_lbl(g, "sb_fast")
+        let l_slow = qbe_lbl(g, "sb_slow")
+        let l_end = qbe_lbl(g, "sb_end")
         qbe_emit(g, cw + " =w copy " + cv.reg)
+        qbe_emit(g, is_ascii + " =w cultw " + cw + ", 128")
+        qbe_emit_term(g, "jnz " + is_ascii + ", " + l_chk + ", " + l_slow)
+        qbe_emit_lbl(g, l_chk)
+        let slen = qbe_tmp(g)
+        let nlen = qbe_tmp(g)
+        let cap_p = qbe_tmp(g)
+        let scap = qbe_tmp(g)
+        let has_cap = qbe_tmp(g)
+        qbe_emit(g, slen + " =l loadl " + obj_val)
+        qbe_emit(g, nlen + " =l add " + slen + ", 1")
+        qbe_emit(g, cap_p + " =l add " + obj_val + ", 8")
+        qbe_emit(g, scap + " =l loadl " + cap_p)
+        qbe_emit(g, has_cap + " =w csltl " + nlen + ", " + scap)
+        qbe_emit_term(g, "jnz " + has_cap + ", " + l_fast + ", " + l_slow)
+        qbe_emit_lbl(g, l_fast)
+        let dp_p = qbe_tmp(g)
+        let dp = qbe_tmp(g)
+        let ep = qbe_tmp(g)
+        let zp = qbe_tmp(g)
+        qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
+        qbe_emit(g, dp + " =l loadl " + dp_p)
+        qbe_emit(g, ep + " =l add " + dp + ", " + slen)
+        qbe_emit(g, "storeb " + cw + ", " + ep)
+        qbe_emit(g, zp + " =l add " + dp + ", " + nlen)
+        qbe_emit(g, "storeb 0, " + zp)
+        qbe_emit(g, "storel " + nlen + ", " + obj_val)
+        qbe_emit_term(g, "jmp " + l_end)
+        qbe_emit_lbl(g, l_slow)
         qbe_emit(g, "call $m2_strbuf_push_char(l " + obj_val + ", w " + cw + ")")
+        qbe_emit_term(g, "jmp " + l_end)
+        qbe_emit_lbl(g, l_end)
         if !obj_borrowed {
           qbe_emit(g, "call $m2_rc_dec(l " + obj_val + ")")
         }
@@ -5046,7 +5932,40 @@ fn qbe_emit_method_call(
         let va = qbe_emit_arg_maybe_borrow(g, args[0], Some(elem), args_pure)
         let vv = va.qv
         let vl = qbe_as_l(g, vv)
-        qbe_emit(g, "call $m2_arr_push(l " + obj_val + ", l " + vl + ")")
+        if qbe_is_prim_array_elem(elem) {
+          let alen = qbe_tmp(g)
+          let cap_p = qbe_tmp(g)
+          let acap = qbe_tmp(g)
+          let has_cap = qbe_tmp(g)
+          let l_fast = qbe_lbl(g, "ap_fast")
+          let l_slow = qbe_lbl(g, "ap_slow")
+          let l_end = qbe_lbl(g, "ap_end")
+          qbe_emit(g, alen + " =l loadl " + obj_val)
+          qbe_emit(g, cap_p + " =l add " + obj_val + ", 8")
+          qbe_emit(g, acap + " =l loadl " + cap_p)
+          qbe_emit(g, has_cap + " =w csltl " + alen + ", " + acap)
+          qbe_emit_term(g, "jnz " + has_cap + ", " + l_fast + ", " + l_slow)
+          qbe_emit_lbl(g, l_fast)
+          let dp_p = qbe_tmp(g)
+          let dp = qbe_tmp(g)
+          let off = qbe_tmp(g)
+          let ep = qbe_tmp(g)
+          let nlen = qbe_tmp(g)
+          qbe_emit(g, dp_p + " =l add " + obj_val + ", 24")
+          qbe_emit(g, dp + " =l loadl " + dp_p)
+          qbe_emit(g, off + " =l shl " + alen + ", 3")
+          qbe_emit(g, ep + " =l add " + dp + ", " + off)
+          qbe_emit(g, "storel " + vl + ", " + ep)
+          qbe_emit(g, nlen + " =l add " + alen + ", 1")
+          qbe_emit(g, "storel " + nlen + ", " + obj_val)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_slow)
+          qbe_emit(g, "call $m2_arr_push(l " + obj_val + ", l " + vl + ")")
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_end)
+        } else {
+          qbe_emit(g, "call $m2_arr_push(l " + obj_val + ", l " + vl + ")")
+        }
         if !va.borrowed {
           qbe_rc_dec(g, vv.reg, vv.ty)
         }
@@ -5251,6 +6170,7 @@ fn qbe_emit_method_call(
         let va = qbe_emit_arg_maybe_borrow(g, args[0], Some(elem), args_pure)
         let vv = va.qv
         let vl = qbe_as_l(g, vv)
+        qbe_emit_deep_freeze(g, vl, elem)
         let rw = qbe_tmp(g)
         let r = qbe_tmp(g)
         qbe_emit(g, rw + " =w call $m2_chan_send(l " + obj_val + ", l " + vl + ")")
@@ -5315,6 +6235,7 @@ fn qbe_emit_method_call(
         let va = qbe_emit_arg_maybe_borrow(g, args[0], Some(elem), args_pure)
         let vv = va.qv
         let vl = qbe_as_l(g, vv)
+        qbe_emit_deep_freeze(g, vl, elem)
         qbe_emit(g, "call $m2_mutex_set(l " + obj_val + ", l " + vl + ")")
         if !va.borrowed {
           qbe_rc_dec(g, vv.reg, vv.ty)
@@ -6180,6 +7101,24 @@ fn qbe_emit_expr(
       }
       match g.tc.consts.get(name) {
         Some(cty) => {
+          match cty {
+            TInt =>
+              match g.const_int_vals.get(name) {
+                Some(v) => return qval(v.to_string(), TInt)
+                None => ()
+              }
+            TInt64 =>
+              match g.const_i64_vals.get(name) {
+                Some(v) => return qval(v.to_string(), TInt64)
+                None => ()
+              }
+            TBool =>
+              match g.const_bool_vals.get(name) {
+                Some(b) => return qval(if b { "1" } else { "0" }, TBool)
+                None => ()
+              }
+            _ => ()
+          }
           let t = qbe_load_heap_slot(g, qbe_local_const_sym(g, name), cty)
           qbe_rc_inc(g, t, cty)
           return qval(t, cty)
@@ -7102,6 +8041,7 @@ fn qbe_emit_expr(
             }
             let vo = if qbe_is_obj_ty(iv.ty) { "1" } else { "0" }
             let il = qbe_as_l(g, iv)
+            qbe_emit_deep_freeze(g, il, iv.ty)
             let r = qbe_tmp(g)
             qbe_emit(g, r + " =l call $m2_mutex_new(l " + il + ", w " + vo + ")")
             qbe_rc_dec(g, iv.reg, iv.ty)
@@ -7335,7 +8275,10 @@ fn qbe_emit_expr(
             None => ()
           }
           match g.hoisted_fields.get(cache_key) {
-            Some(hv) => return hv
+            Some(hv) => {
+              qbe_rc_inc(g, hv.reg, hv.ty)
+              return hv
+            }
             None => ()
           }
           match g.block_immut_fields.get(cache_key) {
@@ -7464,9 +8407,77 @@ fn qbe_emit_expr(
                       ov = qval(r, loc.ty)
                     }
                   }
+                  TString | TBytes => {
+                    arr_local_name = lname
+                    borrowed = true
+                    let r = qbe_tmp(g)
+                    qbe_emit(g, r + " =l loadl " + loc.slot)
+                    ov = qval(r, loc.ty)
+                  }
                   _ => ()
                 }
               None => ()
+            }
+          EIndex(EIdent(outer, _), idx1, _) =>
+            if !qbe_expr_has_assign(idx1) &&
+              qbe_loop_has_no_calls_expr(idx) &&
+              !qbe_expr_assigns_ident(idx, outer) {
+              match qbe_lookup_local(g, outer) {
+                Some(oloc) =>
+                  match oloc.ty {
+                    TArray(TArray(inner_elem)) => {
+                      let outer_p = if g.hoisted_arr_len.contains(outer) &&
+                        g.hoisted_arr_dp.contains(outer) {
+                        "0"
+                      } else {
+                        let r = qbe_tmp(g)
+                        qbe_emit(g, r + " =l loadl " + oloc.slot)
+                        r
+                      }
+                      let iv1 = qbe_emit_expr(g, idx1, Some(TInt))
+                      let il1 = qbe_as_l(g, iv1)
+                      if !qbe_bce_expr_is_safe(g, outer, idx1) {
+                        let olen = match g.hoisted_arr_len.get(outer) {
+                          Some(hlen) => hlen
+                          None => {
+                            let t = qbe_tmp(g)
+                            qbe_emit(g, t + " =l loadl " + outer_p)
+                            t
+                          }
+                        }
+                        let oob1 = qbe_tmp(g)
+                        let l_oob1 = qbe_lbl(g, "arr_oob")
+                        let l_ok1 = qbe_lbl(g, "arr_ok")
+                        qbe_emit(g, oob1 + " =w cugel " + il1 + ", " + olen)
+                        qbe_emit_term(g, "jnz " + oob1 + ", " + l_oob1 + ", " + l_ok1)
+                        qbe_emit_lbl(g, l_oob1)
+                        qbe_emit(g, "call $m2_panic_oob(l " + il1 + ", l " + olen + ")")
+                        qbe_emit_term(g, "hlt")
+                        qbe_emit_lbl(g, l_ok1)
+                      }
+                      let odp = match g.hoisted_arr_dp.get(outer) {
+                        Some(hdp) => hdp
+                        None => {
+                          let dp_p = qbe_tmp(g)
+                          let t = qbe_tmp(g)
+                          qbe_emit(g, dp_p + " =l add " + outer_p + ", 24")
+                          qbe_emit(g, t + " =l loadl " + dp_p)
+                          t
+                        }
+                      }
+                      let off1 = qbe_tmp(g)
+                      let ep1 = qbe_tmp(g)
+                      let inner_p = qbe_tmp(g)
+                      qbe_emit(g, off1 + " =l shl " + il1 + ", 3")
+                      qbe_emit(g, ep1 + " =l add " + odp + ", " + off1)
+                      qbe_emit(g, inner_p + " =l loadl " + ep1)
+                      ov = qval(inner_p, TArray(inner_elem))
+                      borrowed = true
+                    }
+                    _ => ()
+                  }
+                None => ()
+              }
             }
           _ => ()
         }
@@ -7542,19 +8553,35 @@ fn qbe_emit_expr(
           qval(qbe_from_l(g, r, vty), vty)
         }
         TString => {
-          let iv = qbe_emit_expr(g, idx, Some(TInt))
-          let il = qbe_as_l(g, iv)
-          let bw = qbe_tmp(g)
-          qbe_emit(g, bw + " =w call $m2_str_byte_at(l " + ov.reg + ", l " + il + ")")
-          qbe_rc_dec(g, ov.reg, ov.ty)
+          let bw = qbe_emit_str_code_unit_at(g, ov.reg, idx, arr_local_name)
+          if !borrowed {
+            qbe_rc_dec(g, ov.reg, ov.ty)
+          }
           qval(bw, TInt)
         }
         TBytes => {
           let iv = qbe_emit_expr(g, idx, Some(TInt))
           let il = qbe_as_l(g, iv)
+          let blen = qbe_tmp(g)
+          let oob = qbe_tmp(g)
+          let l_oob = qbe_lbl(g, "bytes_oob")
+          let l_ok = qbe_lbl(g, "bytes_ok")
+          qbe_emit(g, blen + " =l loadl " + ov.reg)
+          qbe_emit(g, oob + " =w cugel " + il + ", " + blen)
+          qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+          qbe_emit_lbl(g, l_oob)
+          qbe_emit(g, "call $m2_panic_oob(l " + il + ", l " + blen + ")")
+          qbe_emit_term(g, "hlt")
+          qbe_emit_lbl(g, l_ok)
+          let dp_p = qbe_tmp(g)
+          let dp = qbe_tmp(g)
+          let ep = qbe_tmp(g)
           let bw = qbe_tmp(g)
           let bl = qbe_tmp(g)
-          qbe_emit(g, bw + " =w call $m2_bytes_get(l " + ov.reg + ", l " + il + ")")
+          qbe_emit(g, dp_p + " =l add " + ov.reg + ", 16")
+          qbe_emit(g, dp + " =l loadl " + dp_p)
+          qbe_emit(g, ep + " =l add " + dp + ", " + il)
+          qbe_emit(g, bw + " =w loadub " + ep)
           qbe_emit(g, bl + " =l extuw " + bw)
           if !borrowed {
             qbe_rc_dec(g, ov.reg, ov.ty)
@@ -7786,7 +8813,28 @@ fn qbe_emit_expr(
       qbe_scope_pop(g)
       r
     }
-    EIf(cond, then_stmts, else_opt, _) => {
+    EIf(cond, then_stmts, else_opt, sp) => {
+      match qbe_try_collect_if_switch(g, cond, then_stmts, else_opt) {
+        Some(plan) =>
+          match qbe_lookup_local(g, plan.vname) {
+            Some(vloc) => {
+              let vreg = qbe_load_local_slot(g, vloc.slot, TInt)
+              return qbe_emit_int_dispatch(
+                g,
+                vreg,
+                plan.arms,
+                plan.default_opt,
+                "",
+                false,
+                sp,
+                expected,
+                false,
+              )
+            }
+            None => ()
+          }
+        None => ()
+      }
       let l_then = qbe_lbl(g, "if_t")
       let l_else = qbe_lbl(g, "if_f")
       let l_end = qbe_lbl(g, "if_e")
@@ -7859,6 +8907,102 @@ fn qbe_emit_expr(
       match qbe_try_emit_map_get_match(g, scrut, arms, expected) {
         Some(qv) => return qv
         None => ()
+      }
+      // Dense guardless Int match -> balanced binary dispatch tree
+      if arms.length() >= 6 {
+        let mut is_int_scrut = false
+        let mut scrut_slot_opt : Option[String] = None
+        match scrut {
+          EIdent(xname, _) =>
+            match qbe_lookup_local(g, xname) {
+              Some(loc) =>
+                match loc.ty {
+                  TInt => {
+                    is_int_scrut = true
+                    scrut_slot_opt = Some(loc.slot)
+                  }
+                  _ => ()
+                }
+              None => ()
+            }
+          _ => ()
+        }
+        if is_int_scrut {
+          let sw_arms : Array[QbeSwitchArm] = []
+          let seen_vals : Map[String, Bool] = Map([])
+          let mut def_expr : Option[Expr] = None
+          let mut def_bind = ""
+          let mut ok_dispatch = true
+          let mut ai = 0
+          while ai < arms.length() {
+            let arm = arms[ai]
+            match arm.guard_expr {
+              Some(_) => {
+                ok_dispatch = false
+                break
+              }
+              None => ()
+            }
+            match arm.pat {
+              PInt(raw, _) => {
+                let cv = qbe_parse_int64_lit(raw).to_int()
+                let ck = cv.to_string()
+                if seen_vals.contains(ck) {
+                  ok_dispatch = false
+                  break
+                }
+                seen_vals.set(ck, true)
+                sw_arms.push(
+                  QbeSwitchArm::{ cval: cv, stmts: [], expr_opt: Some(arm.body) },
+                )
+              }
+              PWild(_) =>
+                if ai == arms.length() - 1 {
+                  def_expr = Some(arm.body)
+                } else {
+                  ok_dispatch = false
+                  break
+                }
+              PIdent(bname, _) =>
+                if ai == arms.length() - 1 {
+                  def_expr = Some(arm.body)
+                  def_bind = bname
+                } else {
+                  ok_dispatch = false
+                  break
+                }
+              _ => {
+                ok_dispatch = false
+                break
+              }
+            }
+            ai = ai + 1
+          }
+          if ok_dispatch && sw_arms.length() >= 6 {
+            match scrut_slot_opt {
+              Some(sslot) => {
+                qbe_sort_switch_arms(sw_arms)
+                let vreg = qbe_load_local_slot(g, sslot, TInt)
+                let is_no_def = match def_expr {
+                  None => true
+                  Some(_) => false
+                }
+                return qbe_emit_int_dispatch(
+                  g,
+                  vreg,
+                  sw_arms,
+                  def_expr,
+                  def_bind,
+                  is_no_def,
+                  sp,
+                  expected,
+                  false,
+                )
+              }
+              None => ()
+            }
+          }
+        }
       }
       qbe_scope_push(g)
       let mut scrut_borrowed = false
@@ -9420,9 +10564,79 @@ fn qbe_emit_stmt(
                           ov = qval(r, loc.ty)
                         }
                       }
+                      TBytes => {
+                        arr_local_name = lname
+                        borrowed = true
+                        let r = qbe_tmp(g)
+                        qbe_emit(g, r + " =l loadl " + loc.slot)
+                        ov = qval(r, loc.ty)
+                      }
                       _ => ()
                     }
                   None => ()
+                }
+              EIndex(EIdent(outer, _), idx1, _) =>
+                if !qbe_expr_has_assign(idx1) &&
+                  qbe_loop_has_no_calls_expr(idx) &&
+                  qbe_loop_has_no_calls_expr(rhs) &&
+                  !qbe_expr_assigns_ident(idx, outer) &&
+                  !qbe_expr_assigns_ident(rhs, outer) {
+                  match qbe_lookup_local(g, outer) {
+                    Some(oloc) =>
+                      match oloc.ty {
+                        TArray(TArray(inner_elem)) => {
+                          let outer_p = if g.hoisted_arr_len.contains(outer) &&
+                            g.hoisted_arr_dp.contains(outer) {
+                            "0"
+                          } else {
+                            let r = qbe_tmp(g)
+                            qbe_emit(g, r + " =l loadl " + oloc.slot)
+                            r
+                          }
+                          let iv1 = qbe_emit_expr(g, idx1, Some(TInt))
+                          let il1 = qbe_as_l(g, iv1)
+                          if !qbe_bce_expr_is_safe(g, outer, idx1) {
+                            let olen = match g.hoisted_arr_len.get(outer) {
+                              Some(hlen) => hlen
+                              None => {
+                                let t = qbe_tmp(g)
+                                qbe_emit(g, t + " =l loadl " + outer_p)
+                                t
+                              }
+                            }
+                            let oob1 = qbe_tmp(g)
+                            let l_oob1 = qbe_lbl(g, "arr_oob")
+                            let l_ok1 = qbe_lbl(g, "arr_ok")
+                            qbe_emit(g, oob1 + " =w cugel " + il1 + ", " + olen)
+                            qbe_emit_term(g, "jnz " + oob1 + ", " + l_oob1 + ", " + l_ok1)
+                            qbe_emit_lbl(g, l_oob1)
+                            qbe_emit(g, "call $m2_panic_oob(l " + il1 + ", l " + olen + ")")
+                            qbe_emit_term(g, "hlt")
+                            qbe_emit_lbl(g, l_ok1)
+                          }
+                          let odp = match g.hoisted_arr_dp.get(outer) {
+                            Some(hdp) => hdp
+                            None => {
+                              let dp_p = qbe_tmp(g)
+                              let t = qbe_tmp(g)
+                              qbe_emit(g, dp_p + " =l add " + outer_p + ", 24")
+                              qbe_emit(g, t + " =l loadl " + dp_p)
+                              t
+                            }
+                          }
+                          let off1 = qbe_tmp(g)
+                          let ep1 = qbe_tmp(g)
+                          let inner_p = qbe_tmp(g)
+                          qbe_emit(g, off1 + " =l shl " + il1 + ", 3")
+                          qbe_emit(g, ep1 + " =l add " + odp + ", " + off1)
+                          qbe_emit(g, inner_p + " =l loadl " + ep1)
+                          ov = qval(inner_p, TArray(inner_elem))
+                          borrowed = true
+                        }
+                        _ => ()
+                      }
+                    None => ()
+                  }
                 }
               _ => ()
             }
@@ -9499,12 +10713,26 @@ fn qbe_emit_stmt(
               let iv = qbe_emit_expr(g, idx, Some(TInt))
               let il = qbe_as_l(g, iv)
               let rv = qbe_emit_expr(g, rhs, Some(TByte))
+              let blen = qbe_tmp(g)
+              let oob = qbe_tmp(g)
+              let l_oob = qbe_lbl(g, "bytes_oob")
+              let l_ok = qbe_lbl(g, "bytes_ok")
+              qbe_emit(g, blen + " =l loadl " + ov.reg)
+              qbe_emit(g, oob + " =w cugel " + il + ", " + blen)
+              qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+              qbe_emit_lbl(g, l_oob)
+              qbe_emit(g, "call $m2_panic_oob(l " + il + ", l " + blen + ")")
+              qbe_emit_term(g, "hlt")
+              qbe_emit_lbl(g, l_ok)
+              let dp_p = qbe_tmp(g)
+              let dp = qbe_tmp(g)
+              let ep = qbe_tmp(g)
               let vw = qbe_tmp(g)
+              qbe_emit(g, dp_p + " =l add " + ov.reg + ", 16")
+              qbe_emit(g, dp + " =l loadl " + dp_p)
+              qbe_emit(g, ep + " =l add " + dp + ", " + il)
               qbe_emit(g, vw + " =w copy " + rv.reg)
-              qbe_emit(
-                g,
-                "call $m2_bytes_set(l " + ov.reg + ", l " + il + ", w " + vw + ")",
-              )
+              qbe_emit(g, "storeb " + vw + ", " + ep)
             }
             _ => ()
           }
@@ -9616,77 +10844,93 @@ fn qbe_emit_stmt(
         }
         _ => ()
       }
-      // Loop-invariant read-only primitive struct field hoisting
+      // Loop-invariant struct field hoisting:
+      // - Immutable struct fields (`!field_muts[fi]`) can ALWAYS be hoisted (including String/Bytes/Array)
+      //   as long as the struct local itself is not reassigned or rebound in the loop, even if other
+      //   mutable fields of the same struct are mutated or calls occur in the loop.
+      // - Mutable primitive fields are hoisted only when the loop has no calls and the field is never written.
       let newly_hoisted_fields : Array[String] = []
-      if qbe_loop_has_no_calls_expr(cond) && qbe_loop_has_no_calls_stmts(body) {
-        let written_fields : Map[String, Bool] = Map([])
+      let loop_no_calls = qbe_loop_has_no_calls_expr(cond) && qbe_loop_has_no_calls_stmts(body)
+      let written_fields : Map[String, Bool] = Map([])
+      if loop_no_calls {
         qbe_collect_written_fields_expr(cond, written_fields)
         qbe_collect_written_fields_stmts(body, written_fields)
-        let read_vars : Array[String] = []
-        let read_fnames : Array[String] = []
-        let read_seen : Map[String, Bool] = Map([])
-        qbe_collect_read_fields_expr(cond, read_vars, read_fnames, read_seen)
-        qbe_collect_read_fields_stmts(body, read_vars, read_fnames, read_seen)
-        let loaded_ptrs : Map[String, String] = Map([])
-        let mut rfi = 0
-        while rfi < read_vars.length() {
-          let vname = read_vars[rfi]
-          let fname = read_fnames[rfi]
-          let fkey = vname + "." + fname
-          if !g.hoisted_fields.contains(fkey) && !written_fields.contains(fname) {
-            match qbe_lookup_local(g, vname) {
-              Some(loc) =>
-                match loc.ty {
-                  TStruct(sname, sargs) =>
-                    if !qbe_expr_assigns_ident(cond, vname) &&
-                      !qbe_stmts_assigns_ident(body, vname) &&
-                      !qbe_expr_rebinds_ident(cond, vname) &&
-                      !qbe_stmts_rebinds_ident(body, vname) {
-                      match g.tc.structs.get(sname) {
-                        Some(sinfo) => {
-                          let subst = make_subst(sinfo.decl.type_params, sargs)
-                          let mut fi = 0
-                          while fi < sinfo.field_names.length() {
-                            if sinfo.field_names[fi] == fname {
-                              let fty = subst_ty(sinfo.field_tys[fi], subst)
-                              let is_prim = match fty {
-                                TInt | TInt64 | TDouble | TBool | TByte | TChar => true
-                                _ => false
-                              }
-                              if is_prim {
-                                let ptr_reg = match loaded_ptrs.get(vname) {
-                                  Some(pr) => pr
-                                  None => {
-                                    let pr = qbe_tmp(g)
-                                    qbe_emit(g, pr + " =l loadl " + loc.slot)
-                                    loaded_ptrs.set(vname, pr)
-                                    pr
-                                  }
-                                }
-                                let fp = qbe_tmp(g)
-                                qbe_emit(
-                                  g,
-                                  fp + " =l add " + ptr_reg + ", " + (fi * 8).to_string(),
-                                )
-                                let fv = qbe_load_heap_slot(g, fp, fty)
-                                g.hoisted_fields.set(fkey, qval(fv, fty))
-                                newly_hoisted_fields.push(fkey)
-                              }
-                              break
+      }
+      let read_vars : Array[String] = []
+      let read_fnames : Array[String] = []
+      let read_seen : Map[String, Bool] = Map([])
+      qbe_collect_read_fields_expr(cond, read_vars, read_fnames, read_seen)
+      qbe_collect_read_fields_stmts(body, read_vars, read_fnames, read_seen)
+      let loaded_ptrs : Map[String, String] = Map([])
+      let mut rfi = 0
+      while rfi < read_vars.length() {
+        let vname = read_vars[rfi]
+        let fname = read_fnames[rfi]
+        let fkey = vname + "." + fname
+        if !g.hoisted_fields.contains(fkey) {
+          match qbe_lookup_local(g, vname) {
+            Some(loc) =>
+              match loc.ty {
+                TStruct(sname, sargs) =>
+                  if !qbe_expr_assigns_ident(cond, vname) &&
+                    !qbe_stmts_assigns_ident(body, vname) &&
+                    !qbe_expr_rebinds_ident(cond, vname) &&
+                    !qbe_stmts_rebinds_ident(body, vname) {
+                    match g.tc.structs.get(sname) {
+                      Some(sinfo) => {
+                        let subst = make_subst(sinfo.decl.type_params, sargs)
+                        let mut fi = 0
+                        while fi < sinfo.field_names.length() {
+                          if sinfo.field_names[fi] == fname {
+                            let fty = subst_ty(sinfo.field_tys[fi], subst)
+                            let is_immut = !sinfo.field_muts[fi]
+                            let is_prim = match fty {
+                              TInt | TInt64 | TDouble | TBool | TByte | TChar => true
+                              _ => false
                             }
-                            fi = fi + 1
+                            let is_hoistable_immut = match fty {
+                              TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TBytes | TArray(_) =>
+                                true
+                              _ => false
+                            }
+                            let can_hoist = if is_immut {
+                              is_hoistable_immut
+                            } else {
+                              loop_no_calls && !written_fields.contains(fname) && is_prim
+                            }
+                            if can_hoist {
+                              let ptr_reg = match loaded_ptrs.get(vname) {
+                                Some(pr) => pr
+                                None => {
+                                  let pr = qbe_tmp(g)
+                                  qbe_emit(g, pr + " =l loadl " + loc.slot)
+                                  loaded_ptrs.set(vname, pr)
+                                  pr
+                                }
+                              }
+                              let fp = qbe_tmp(g)
+                              qbe_emit(
+                                g,
+                                fp + " =l add " + ptr_reg + ", " + (fi * 8).to_string(),
+                              )
+                              let fv = qbe_load_heap_slot(g, fp, fty)
+                              g.hoisted_fields.set(fkey, qval(fv, fty))
+                              newly_hoisted_fields.push(fkey)
+                            }
+                            break
                           }
+                          fi = fi + 1
                         }
-                        None => ()
                       }
+                      None => ()
                     }
-                  _ => ()
-                }
-              None => ()
-            }
+                  }
+                _ => ()
+              }
+            None => ()
           }
-          rfi = rfi + 1
         }
+        rfi = rfi + 1
       }
       let mut emitted_loop = false
       if !emitted_loop {
@@ -10008,6 +11252,33 @@ fn qbe_emit_stmt(
       qval("0", TUnit)
     }
     SExpr(e, _) => {
+      if !is_tail {
+        match e {
+          EIf(cond, then_stmts, else_opt, sp) =>
+            match qbe_try_collect_if_switch(g, cond, then_stmts, else_opt) {
+              Some(plan) =>
+                match qbe_lookup_local(g, plan.vname) {
+                  Some(vloc) => {
+                    let vreg = qbe_load_local_slot(g, vloc.slot, TInt)
+                    return qbe_emit_int_dispatch(
+                      g,
+                      vreg,
+                      plan.arms,
+                      plan.default_opt,
+                      "",
+                      false,
+                      sp,
+                      None,
+                      true,
+                    )
+                  }
+                  None => ()
+                }
+              None => ()
+            }
+          _ => ()
+        }
+      }
       let v = qbe_emit_expr(g, e, if is_tail { expected } else { None })
       if !is_tail {
         qbe_rc_dec(g, v.reg, v.ty)
@@ -10528,6 +11799,10 @@ pub fn emit_qbe_package_multi(
         DConst(cd) => {
           g.const_order.push(cd.name)
           const_decls.push(cd)
+          match tc.consts.get(cd.name) {
+            Some(cty) => qbe_record_scalar_const(g, cd, cty)
+            None => ()
+          }
         }
         DFn(_) | DTest(_) => ()
       }
@@ -10851,6 +12126,24 @@ pub fn emit_qbe_unit(
   let const_decls : Array[ConstDecl] = []
   let mut unit_has_main = false
 
+  let mut cfi = 0
+  while cfi < prep.pkg.files.length() {
+    let cf = prep.pkg.files[cfi]
+    let mut cdi = 0
+    while cdi < cf.decls.length() {
+      match cf.decls[cdi] {
+        DConst(cd) =>
+          match tc.consts.get(cd.name) {
+            Some(cty) => qbe_record_scalar_const(g, cd, cty)
+            None => ()
+          }
+        _ => ()
+      }
+      cdi = cdi + 1
+    }
+    cfi = cfi + 1
+  }
+
   let mut di = 0
   while di < f.decls.length() {
     match f.decls[di] {
@@ -11075,6 +12368,10 @@ pub fn emit_qbe_test_package(
         DConst(cd) => {
           g.const_order.push(cd.name)
           const_decls.push(cd)
+          match tc.consts.get(cd.name) {
+            Some(cty) => qbe_record_scalar_const(g, cd, cty)
+            None => ()
+          }
         }
         DTest(td) => {
           test_decls.push(td)

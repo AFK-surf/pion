@@ -450,6 +450,7 @@ fn p_parse_struct_decl(
   p_expect_lbrace(p)
   let fields : Array[FieldDecl] = []
   while !p_is_eof(p) {
+    let before_pos = p.pos
     p_skip_semis(p)
     match p_peek(p).kind {
       RBrace => {
@@ -491,6 +492,9 @@ fn p_parse_struct_decl(
         p_skip_semis(p)
       }
     }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
+    }
   }
   DStruct(StructDecl::{
     is_pub: is_pub,
@@ -510,6 +514,7 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
   p_expect_lbrace(p)
   let variants : Array[VariantDecl] = []
   while !p_is_eof(p) {
+    let before_pos = p.pos
     p_skip_semis(p)
     match p_peek(p).kind {
       RBrace => {
@@ -522,6 +527,7 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
         let vfields : Array[TypeExpr] = []
         if p_match_kind_lparen(p) {
           while !p_is_eof(p) {
+            let inner_before = p.pos
             match p_peek(p).kind {
               RParen => {
                 let _ = p_advance(p)
@@ -535,6 +541,9 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
                 }
               }
             }
+            if p.pos == inner_before {
+              let _ = p_advance(p)
+            }
           }
         }
         variants.push(VariantDecl::{
@@ -545,6 +554,9 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
         let _ = p_match_kind_comma(p)
         p_skip_semis(p)
       }
+    }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
     }
   }
   DEnum(EnumDecl::{
@@ -561,6 +573,7 @@ fn p_parse_params(p : Parser) -> Array[Param] {
   let params : Array[Param] = []
   p_expect_lparen(p)
   while !p_is_eof(p) {
+    let before_pos = p.pos
     match p_peek(p).kind {
       RParen => {
         let _ = p_advance(p)
@@ -580,6 +593,9 @@ fn p_parse_params(p : Parser) -> Array[Param] {
           break
         }
       }
+    }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
     }
   }
   params
@@ -1041,6 +1057,7 @@ fn p_parse_struct_lit_fields(p : Parser) -> Array[FieldInit] {
   p_expect_lbrace(p)
   let fields : Array[FieldInit] = []
   while !p_is_eof(p) {
+    let before_pos = p.pos
     match p_peek(p).kind {
       RBrace => {
         let _ = p_advance(p)
@@ -1060,6 +1077,9 @@ fn p_parse_struct_lit_fields(p : Parser) -> Array[FieldInit] {
           break
         }
       }
+    }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
     }
   }
   fields
