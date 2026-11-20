@@ -234,3 +234,109 @@ test "p17b: workspace query covers every package" {
     "single-package callers",
   )
 }
+
+///|
+test "p20b: pion.toml [registry] url and registry/version dependency keys" {
+  let toml =
+    "[package]\nname = \"app\"\n\n[registry]\nurl = \"file:///srv/pion-index.git\"\n\n" +
+    "[dependencies]\n" +
+    "mylib = { git = \"file:///srv/mylib.git\", tag = \"v1\", version = \"1.0.0\", registry = \"file:///srv/pion-index.git\" }\n"
+  match @core.parse_pion_toml(toml) {
+    Ok(m) => {
+      mf_check(m.registry == "file:///srv/pion-index.git", "[registry] url")
+      mf_check(m.deps.length() == 1, "one dep")
+      let d = m.deps[0]
+      mf_check(d.tag == "v1" && d.version == "1.0.0", "tag + version")
+      mf_check(d.registry == "file:///srv/pion-index.git", "dep registry")
+      mf_check(@core.manifest_dep_ref(d) == "tag:v1", "registry dep ref is its tag")
+    }
+    Err(e) => abort("parse_pion_toml failed: " + e)
+  }
+  match @core.parse_pion_toml("[package]\nname = \"a\"\n[dependencies]\nx = { path = \"../x\", registry = \"r\" }\n") {
+    Ok(_) => abort("path dep with registry must be rejected")
+    Err(e) => mf_check(mf_has(e, "require `git"), "registry needs git: " + e)
+  }
+  match @core.parse_pion_toml("[package]\nname = \"a\"\n") {
+    Ok(m) => mf_check(m.registry == "", "no registry by default")
+    Err(e) => abort(e)
+  }
+}
+
+///|
+test "p20b: registry index entry parsing" {
+  let txt = "# mylib\nname = \"mylib\"\nversion = \"2.0.0\"\ngit = \"file:///srv/mylib.git\"\ntag = \"v2\"\nsubdir = \"pkg\"\n"
+  match @core.parse_registry_entry("mylib", txt) {
+    Ok(e) => {
+      mf_check(e.name == "mylib" && e.version == "2.0.0", "name + version")
+      mf_check(e.git == "file:///srv/mylib.git" && e.tag == "v2", "git + tag")
+      mf_check(e.subdir == "pkg" && e.rev == "" && e.branch == "", "subdir")
+      let d = @core.registry_entry_dep(e, "file:///srv/idx.git")
+      mf_check(d.name == "mylib" && d.registry == "file:///srv/idx.git", "dep from entry")
+      mf_check(@core.manifest_dep_is_git(d) && d.path == "", "registry dep is a git dep")
+      mf_check(
+        @core.format_dep_inline(d) ==
+        "{ git = \"file:///srv/mylib.git\", tag = \"v2\", subdir = \"pkg\", version = \"2.0.0\", registry = \"file:///srv/idx.git\" }",
+        "inline form: " + @core.format_dep_inline(d),
+      )
+    }
+    Err(e) => abort("parse_registry_entry failed: " + e)
+  }
+  mf_check(@core.registry_index_path("mylib") == "index/mylib.toml", "index path")
+  let bad : Array[String] = [
+    "version = \"1\"\n", "git = \"u\"\ntag = \"a\"\nrev = \"b\"\n", "name = \"other\"\ngit = \"u\"\n",
+    "git u\n",
+  ]
+  let mut i = 0
+  while i < bad.length() {
+    match @core.parse_registry_entry("mylib", bad[i]) {
+      Ok(_) => abort("bad registry entry accepted: " + bad[i])
+      Err(e) => mf_check(mf_has(e, "index/mylib.toml"), "error names the entry: " + e)
+    }
+    i = i + 1
+  }
+  mf_check(@core.manifest_valid_dep_name("my_lib-2"), "valid name")
+  mf_check(!@core.manifest_valid_dep_name("2lib"), "leading digit")
+  mf_check(!@core.manifest_valid_dep_name("a b"), "space")
+  mf_check(!@core.manifest_valid_dep_name(""), "empty")
+}
+
+///|
+test "p20b: manifest_set_dependency appends, replaces in place and is idempotent" {
+  let init = @core.init_pion_toml("app")
+  let d1 = @core.manifest_dep_new("util", "../util", "", "", "", "", "")
+  let t1 = @core.manifest_set_dependency(init, d1)
+  mf_check(t1 == init + "util = { path = \"../util\" }\n", "append to empty table: " + t1)
+  mf_check(@core.manifest_set_dependency(t1, d1) == t1, "idempotent")
+  let d2 = @core.manifest_dep_new("net", "", "file:///r.git", "v1", "", "", "")
+  let t2 = @core.manifest_set_dependency(t1, d2)
+  mf_check(
+    t2 == init + "util = { path = \"../util\" }\nnet = { git = \"file:///r.git\", tag = \"v1\" }\n",
+    "second entry after the first: " + t2,
+  )
+  let d2b = @core.manifest_dep_new("net", "", "file:///r.git", "v2", "", "", "")
+  let t3 = @core.manifest_set_dependency(t2, d2b)
+  mf_check(
+    t3 == init + "util = { path = \"../util\" }\nnet = { git = \"file:///r.git\", tag = \"v2\" }\n",
+    "replace in place: " + t3,
+  )
+  match @core.parse_pion_toml(t3) {
+    Ok(m) => mf_check(m.deps.length() == 2 && m.deps[1].tag == "v2", "rewritten toml parses")
+    Err(e) => abort(e)
+  }
+  // Other sections and comments are kept; the entry goes into [dependencies], not after [link].
+  let mixed = "[package]\nname = \"a\" # app\n\n[dependencies]\nold = { path = \"../old\" } # keep\n\n[link]\nlibs = [\"z\"]\n"
+  let t4 = @core.manifest_set_dependency(mixed, d1)
+  mf_check(
+    t4 == "[package]\nname = \"a\" # app\n\n[dependencies]\nold = { path = \"../old\" } # keep\nutil = { path = \"../util\" }\n\n[link]\nlibs = [\"z\"]\n",
+    "insert inside the table: " + t4,
+  )
+  // No [dependencies] table yet (and no trailing newline).
+  let t5 = @core.manifest_set_dependency("[package]\nname = \"a\"", d1)
+  mf_check(
+    t5 == "[package]\nname = \"a\"\n\n[dependencies]\nutil = { path = \"../util\" }\n",
+    "create the table: " + t5,
+  )
+  let entries = [@core.lock_entry_new("net", "file:///r.git", "tag:v2", "abc123", "")]
+  mf_check(@core.lock_rev_of(entries, "net") == "abc123", "lock_rev_of")
+  mf_check(@core.lock_rev_of(entries, "nope") == "", "lock_rev_of missing")
+}
