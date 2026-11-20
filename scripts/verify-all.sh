@@ -27,7 +27,8 @@ FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DI
   "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/examples/sqlite_indexer" \
   "$ROOT_DIR/tests/e2e/utf8_text.pion" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" \
   "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" "$ROOT_DIR/examples/https_server" \
-  "$ROOT_DIR/tests/e2e/dyn_trait.pion" "$ROOT_DIR/examples/pion_station")
+  "$ROOT_DIR/tests/e2e/dyn_trait.pion" "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" \
+  "$ROOT_DIR/examples/pion_station")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
 if ! printf '%s' "$FMT_OUT" | grep -q '"ok":true'; then
   echo "FAIL: pionc2 fmt --check --json reported unformatted files" >&2
@@ -86,6 +87,12 @@ echo "=== [6/6] Standalone pionc2 Run (examples/text_stats, net_ffi) + Cross ELF
 "$PIONC2" run "$ROOT_DIR/examples/text_stats"
 "$PIONC2" run "$ROOT_DIR/tests/e2e/net_ffi.pion"
 "$PIONC2" run "$ROOT_DIR/tests/e2e/utf8_text.pion"
+P22A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p22a_systems_io.pion")
+echo "p22a_systems_io -> $P22A_OUT"
+if [ "$P22A_OUT" != "p22a_systems_io ok" ]; then
+  echo "FAIL: p22a_systems_io output mismatch" >&2
+  exit 1
+fi
 P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
 echo "p17a_ergonomics_mt -> $P17A_OUT"
 if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then

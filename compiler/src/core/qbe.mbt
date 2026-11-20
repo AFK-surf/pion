@@ -6642,6 +6642,33 @@ fn qbe_emit_world_builtin(
     let s = if arg_vals.length() > off { arg_vals[off] } else { "0" }
     qbe_emit(g, "call $pion_world_eprintln(l " + w_val + ", l " + s + ")")
     rty = TUnit
+  } else if name == "io_read_line" {
+    let ok_slot = qbe_alloc_slot4(g)
+    let raw_s = qbe_tmp(g)
+    qbe_emit(
+      g,
+      raw_s + " =l call $pion_world_read_line(l " + w_val + ", l " + ok_slot + ")",
+    )
+    let ok_w = qbe_tmp(g)
+    qbe_emit(g, ok_w + " =w loadw " + ok_slot)
+    let res_slot = qbe_alloc_slot(g)
+    let l_some = qbe_lbl(g, "rl_some")
+    let l_none = qbe_lbl(g, "rl_none")
+    let l_end = qbe_lbl(g, "rl_end")
+    qbe_emit_term(g, "jnz " + ok_w + ", " + l_some + ", " + l_none)
+    qbe_emit_lbl(g, l_some)
+    let some_obj = qbe_emit_some(g, raw_s, TString)
+    qbe_emit(g, "storel " + some_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_none)
+    qbe_emit(g, "call $pion_rc_dec(l " + raw_s + ")")
+    let none_obj = qbe_emit_none(g, TString)
+    qbe_emit(g, "storel " + none_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TOption(TString)
   } else if name == "fs_read" {
     let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
     let ok_slot = qbe_alloc_slot4(g)
@@ -6848,6 +6875,125 @@ fn qbe_emit_world_builtin(
     res = qbe_tmp(g)
     qbe_emit(g, res + " =l call $pion_world_fs_size(l " + w_val + ", l " + p + ")")
     rty = TInt64
+  } else if name == "fs_lstat" || name == "fs_readlink" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let ok_slot = qbe_alloc_slot4(g)
+    let raw_s = qbe_tmp(g)
+    let csym = if name == "fs_lstat" {
+      "$pion_world_fs_lstat"
+    } else {
+      "$pion_world_fs_readlink"
+    }
+    qbe_emit(
+      g,
+      raw_s + " =l call " + csym + "(l " + w_val + ", l " + p + ", l " + ok_slot + ")",
+    )
+    let ok_w = qbe_tmp(g)
+    qbe_emit(g, ok_w + " =w loadw " + ok_slot)
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "fsl_ok")
+    let l_err = qbe_lbl(g, "fsl_err")
+    let l_end = qbe_lbl(g, "fsl_end")
+    qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, raw_s, TString, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    let err_obj = qbe_emit_result(g, 1, raw_s, TString, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TString, TString)
+  } else if name == "fs_symlink" {
+    let t = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let lp = if arg_vals.length() > off + 1 { arg_vals[off + 1] } else { "0" }
+    let rw = qbe_tmp(g)
+    qbe_emit(
+      g,
+      rw + " =w call $pion_world_fs_symlink(l " + w_val + ", l " + t + ", l " + lp + ")",
+    )
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l extuw " + rw)
+    rty = TBool
+  } else if name == "fs_chmod" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let m_w = if arg_vals.length() > off + 1 {
+      if qbe_abi_ty(arg_tys[off + 1]) == "w" {
+        arg_vals[off + 1]
+      } else {
+        let tw = qbe_tmp(g)
+        qbe_emit(g, tw + " =w copy " + arg_vals[off + 1])
+        tw
+      }
+    } else {
+      "0"
+    }
+    let rw = qbe_tmp(g)
+    qbe_emit(
+      g,
+      rw + " =w call $pion_world_fs_chmod(l " + w_val + ", l " + p + ", w " + m_w + ")",
+    )
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l extuw " + rw)
+    rty = TBool
+  } else if name == "fs_read_range_nofollow" {
+    let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let off_l = if arg_vals.length() > off + 1 {
+      qbe_as_l(g, qval(arg_vals[off + 1], arg_tys[off + 1]))
+    } else {
+      "0"
+    }
+    let len_l = if arg_vals.length() > off + 2 {
+      qbe_as_l(g, qval(arg_vals[off + 2], arg_tys[off + 2]))
+    } else {
+      "0"
+    }
+    let exp_l = if arg_vals.length() > off + 3 {
+      qbe_as_l(g, qval(arg_vals[off + 3], arg_tys[off + 3]))
+    } else {
+      "0"
+    }
+    let ok_slot = qbe_alloc_slot4(g)
+    let raw = qbe_tmp(g)
+    qbe_emit(
+      g,
+      raw +
+      " =l call $pion_world_fs_read_range_nofollow(l " +
+      w_val +
+      ", l " +
+      p +
+      ", l " +
+      off_l +
+      ", l " +
+      len_l +
+      ", l " +
+      exp_l +
+      ", l " +
+      ok_slot +
+      ")",
+    )
+    let ok_w = qbe_tmp(g)
+    qbe_emit(g, ok_w + " =w loadw " + ok_slot)
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "fsrn_ok")
+    let l_err = qbe_lbl(g, "fsrn_err")
+    let l_end = qbe_lbl(g, "fsrn_end")
+    qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, raw, TBytes, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    let err_obj = qbe_emit_result(g, 1, raw, TBytes, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TBytes, TString)
   } else if name == "fs_list_dir" {
     let p = if arg_vals.length() > off { arg_vals[off] } else { "0" }
     res = qbe_tmp(g)
@@ -6966,6 +7112,49 @@ fn qbe_emit_world_builtin(
     res = qbe_tmp(g)
     qbe_emit(g, res + " =l loadl " + res_slot)
     rty = TResult(TString, TString)
+  } else if name == "proc_exec_capture_bytes" {
+    let arr = if arg_vals.length() > off { arg_vals[off] } else { "0" }
+    let rc_slot = qbe_alloc_slot4(g)
+    let raw_b = qbe_tmp(g)
+    qbe_emit(
+      g,
+      raw_b +
+      " =l call $pion_world_exec_capture_bytes(l " +
+      w_val +
+      ", l " +
+      arr +
+      ", l " +
+      rc_slot +
+      ")",
+    )
+    let rc_w = qbe_tmp(g)
+    qbe_emit(g, rc_w + " =w loadw " + rc_slot)
+    let res_slot = qbe_alloc_slot(g)
+    let l_ok = qbe_lbl(g, "pexb_ok")
+    let l_err = qbe_lbl(g, "pexb_err")
+    let l_end = qbe_lbl(g, "pexb_end")
+    qbe_emit_term(g, "jnz " + rc_w + ", " + l_err + ", " + l_ok)
+    qbe_emit_lbl(g, l_ok)
+    let ok_obj = qbe_emit_result(g, 0, raw_b, TBytes, TString)
+    qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_err)
+    qbe_emit(g, "call $pion_rc_dec(l " + raw_b + ")")
+    let rc_l = qbe_tmp(g)
+    qbe_emit(g, rc_l + " =l extsw " + rc_w)
+    let rc_str = qbe_tmp(g)
+    qbe_emit(g, rc_str + " =l call $pion_int_to_str(l " + rc_l + ")")
+    let pre_s = qbe_emit_string_lit(g, "exit ")
+    let err_s = qbe_tmp(g)
+    qbe_emit(g, err_s + " =l call $pion_str_concat(l " + pre_s + ", l " + rc_str + ")")
+    qbe_emit(g, "call $pion_rc_dec(l " + rc_str + ")")
+    let err_obj = qbe_emit_result(g, 1, err_s, TBytes, TString)
+    qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+    qbe_emit_term(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    res = qbe_tmp(g)
+    qbe_emit(g, res + " =l loadl " + res_slot)
+    rty = TResult(TBytes, TString)
   }
   let mut j = 0
   while j < arg_vals.length() {
@@ -9643,7 +9832,14 @@ fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal 
       owned_vals.push(av.qv.reg)
       owned_tys.push(av.qv.ty)
     }
-    let cabi = qbe_c_abi_ty(pty)
+    let cabi = if (
+      pr.c_sym == "pion_bytes_from_ptr" || pr.c_sym == "pion_bytes_copy_to_ptr"
+    ) &&
+      qbe_c_abi_ty(pty) == "w" {
+      "l"
+    } else {
+      qbe_c_abi_ty(pty)
+    }
     let src_abi = qbe_abi_ty(av.qv.ty)
     let carg = if src_abi == cabi {
       av.qv.reg

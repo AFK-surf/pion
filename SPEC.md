@@ -244,6 +244,8 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void    pion_bytes_set(void *b, int64_t idx, int32_t val);` (`b[i] = val` where `val : Byte`, bounds-checked)
 - `void*   pion_bytes_slice(void *b, int64_t start, int64_t end);` (`b.slice(start, end) -> Bytes`)
 - `void*   pion_bytes_concat(void *a, void *b);` (`b.concat(other) -> Bytes`)
+- `void*   pion_bytes_from_ptr(void *p, int64_t len);` (`bytes_from_ptr(p : Ptr, len : Int) -> Bytes`, allocates `len` bytes and copies from `p`; `len <= 0` returns empty `Bytes`)
+- `void    pion_bytes_copy_to_ptr(void *b, int64_t src_off, void *dst, int64_t len);` (`bytes_copy_to_ptr(b : Bytes, src_off : Int, dst : Ptr, len : Int) -> Unit`, bounds-checked `memcpy` from `b[src_off .. src_off + len)` to `dst`)
 - `void*   pion_bytes_to_str(void *b);` (`b.to_string() -> String`)
 
 **StringBuilder (`PionStrBuf`):**
@@ -306,6 +308,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void    pion_world_print(void *w, void *s);`
 - `void    pion_world_println(void *w, void *s);`
 - `void    pion_world_eprintln(void *w, void *s);`
+- `void*   pion_world_read_line(void *w, int32_t *ok_out);` (`io_read_line(world) -> Option[String]`, strips trailing `\n` / `\r\n`, `None` on immediate EOF)
 - `void*   pion_world_fs_read(void *w, void *path_str, int32_t *ok_out);` (`fs_read -> Result[String, String]`)
 - `int32_t pion_world_fs_write(void *w, void *path_str, void *content_str);` (`fs_write -> Result[Unit, String]`)
 - `void*   pion_world_fs_read_bytes(void *w, void *path_str, int32_t *ok_out);` (`fs_read_bytes -> Result[Bytes, String]`)
@@ -319,10 +322,16 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `int32_t pion_world_fs_remove(void *w, void *path_str);` (for CAS LRU eviction; returns 1 on success)
 - `int32_t pion_world_fs_rename(void *w, void *old_path, void *new_path);` (for atomic concurrent CAS writes; returns 1 on success)
 - `int64_t pion_world_fs_size(void *w, void *path_str);` (file size in bytes, or -1 if missing)
+- `void*   pion_world_fs_lstat(void *w, void *path_str, int32_t *ok_out);` (`fs_lstat(world, path) -> Result[String, String]`, POSIX `lstat` formatted as `"<kind>|<size>|<exec01>|<mtime_ms>|<dev>"` where `<kind>` is `file`/`dir`/`link`/`other`, or `Err(strerror(errno))`)
+- `void*   pion_world_fs_readlink(void *w, void *path_str, int32_t *ok_out);` (`fs_readlink(world, path) -> Result[String, String]`, dynamically grown POSIX `readlink`)
+- `int32_t pion_world_fs_symlink(void *w, void *target_str, void *linkpath_str);` (`fs_symlink(world, target, linkpath) -> Bool`)
+- `int32_t pion_world_fs_chmod(void *w, void *path_str, int32_t mode);` (`fs_chmod(world, path, mode : Int) -> Bool`)
+- `void*   pion_world_fs_read_range_nofollow(void *w, void *path_str, int64_t offset, int64_t length, int64_t expected_size, int32_t *ok_out);` (`fs_read_range_nofollow(world, path, offset : Int64, length : Int, expected_size : Int64) -> Result[Bytes, String]`; TOCTOU-safe `lstat` + `open(O_RDONLY|O_NOFOLLOW|O_NONBLOCK|O_CLOEXEC)` + `fstat` + `pread` loop, returns `Err("changed")` on any mismatch/symlink/size change)
 - `void*   pion_world_env_get(void *w, void *name_str, int32_t *ok_out);`
 - `int64_t pion_world_clock_ms(void *w);`
 - `int32_t pion_world_exec(void *w, void *argv_arr);` (fork/execvp waitpid, returns exit code)
 - `void*   pion_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out);` (`proc_exec_capture -> Result[String, String]`; `Ok(stdout)` if exit code == 0, else `Err("exit <code>: <stdout>")`)
+- `void*   pion_world_exec_capture_bytes(void *w, void *argv_arr, int32_t *exit_code_out);` (`proc_exec_capture_bytes(world, argv : Array[String]) -> Result[Bytes, String]`; silences child stderr to `/dev/null`, preserves raw stdout bytes including `\0`, `Ok(bytes)` if exit code == 0 else `Err("exit <code>")`)
 - `void*   pion_sha256_hex(void *s);` (pure SHA-256 hex digest for CAS cache keys!)
 
 **FFI raw pointers & C strings (no `World`; compiler builtins → direct calls):**
@@ -330,6 +339,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void    pion_ptr_free(void *p);` (`ptr_free(p : Ptr) -> Unit`)
 - `void*   pion_ptr_offset(void *p, int64_t off);` (`ptr_offset(p : Ptr, off : Int64) -> Ptr`)
 - `void*   pion_ptr_read_ptr(void *p, int64_t off);` / `void pion_ptr_write_ptr(void *p, int64_t off, void *v);` (`ptr_read_ptr` / `ptr_write_ptr`)
+- `int32_t pion_ptr_read_u8(void *p, int64_t off);` / `void pion_ptr_write_u8(void *p, int64_t off, int32_t v);` (`ptr_read_u8 -> Int` `0..255` / `ptr_write_u8`)
 - `int32_t pion_ptr_read_i32(void *p, int64_t off);` / `void pion_ptr_write_i32(void *p, int64_t off, int32_t v);` (`ptr_read_i32 -> Int` / `ptr_write_i32`)
 - `int64_t pion_ptr_read_i64(void *p, int64_t off);` / `void pion_ptr_write_i64(void *p, int64_t off, int64_t v);` (`ptr_read_i64 -> Int64` / `ptr_write_i64`)
 - `void*   pion_cstr_to_str(void *cstr);` (`cstr_to_str(p : Ptr) -> String`, owned copy; `""` for NULL)
@@ -445,7 +455,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - **`pionc init [--json] <dir>`**: writes `pion.toml`, `src/main.pion` and `main_test.pion` for a package named after the directory (`[a-z0-9_]`); the result passes `check`, `test`, `run` and `fmt --check` as is. Refuses to overwrite existing files.
 - **Cross-package traits**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. A package exporting a `pub` generic fn with trait bounds has no `.pionstub` (importers monomorphize from its source).
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.pionsig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.pionsig` yields 100% CAS hit on downstream `.o` files.
-- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.10` (since `dyn Trait`, §4.1.1), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.11` (since Phase 22-A systems IO & byte FFI primitives, §4.2), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
 - Default directory: `$PION_CACHE_DIR` or `$HOME/.cache/pion/cas`
 - Layout:
   - `sig/<sha256>.pionsig`
