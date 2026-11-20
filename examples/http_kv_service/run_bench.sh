@@ -3,8 +3,10 @@
 # bench_load.c, starts the server on an ephemeral 127.0.0.1 port (handed over
 # through a FIFO, no sleeps), runs <conns> x <reqs> requests, then reports the
 # client JSON plus the server's peak RSS and stripped binary size.
+# KEEP_ALIVE=1 sends every request of a client thread on one HTTP/1.1
+# keep-alive connection (bench_load --keep-alive) instead of one per request.
 #
-#   [BENCH_LOAD=<prebuilt client>] sh examples/http_kv_service/run_bench.sh <pionc> [conns=8] [reqs=500] [workers=8]
+#   [KEEP_ALIVE=1] [BENCH_LOAD=<prebuilt client>] sh examples/http_kv_service/run_bench.sh <pionc> [conns=8] [reqs=500] [workers=8]
 set -eu
 PIONC="$1"
 CONNS="${2:-8}"
@@ -26,10 +28,18 @@ else
   "$CC" -O2 -pthread -o "$TMP/bench_load" "$HERE/bench_load.c"
 fi
 
-TOTAL=$((CONNS * REQS + 1))
+# Connections the server accepts: every request (or every client thread with
+# keep-alive), plus the final /stats call.
+if [ "${KEEP_ALIVE:-0}" = "1" ]; then
+  KA_FLAG="--keep-alive"
+  TOTAL=$((CONNS + 1))
+else
+  KA_FLAG=""
+  TOTAL=$((CONNS * REQS + 1))
+fi
 mkfifo "$TMP/port.fifo"
 # Peak RSS of the server process (ru_maxrss: KiB on Linux, bytes on macOS).
-python3 - "$TMP/rss" "$TMP/http_kv_service" --port 0 --workers "$WORKERS" --max-reqs "$TOTAL" \
+python3 - "$TMP/rss" "$TMP/http_kv_service" --port 0 --workers "$WORKERS" --max-conns "$TOTAL" \
   --port-file "$TMP/port.fifo" > "$TMP/server.out" <<'PYEOF' &
 import resource, subprocess, sys
 rc = subprocess.call(sys.argv[2:])
@@ -41,7 +51,7 @@ PYEOF
 SRV=$!
 read PORT < "$TMP/port.fifo"
 set +e
-"$TMP/bench_load" "$PORT" "$CONNS" "$REQS" > "$TMP/client.json"
+"$TMP/bench_load" $KA_FLAG "$PORT" "$CONNS" "$REQS" > "$TMP/client.json"
 CLIENT_RC=$?
 set -e
 wait "$SRV"

@@ -131,8 +131,106 @@ fn parse_decimal(s : String) -> Option[Int] {
   Some(v)
 }
 
-/// Body bytes after the head, cut to `content-length` when present.
+fn hex_value(s : String) -> Option[Int] {
+  let t = s.trim()
+  if t.length() == 0 || t.length() > 7 {
+    return None
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < t.length() {
+    let h = hex_nibble(t.code_unit_at(i))
+    if h < 0 {
+      return None
+    }
+    v = v * 16 + h
+    i = i + 1
+  }
+  Some(v)
+}
+
+/// The line of `s` starting at `from` (without `\r\n`/`\n`) and the offset
+/// after it, or `None` while the line is incomplete.
+fn line_at(s : String, from : Int) -> Option[(String, Int)] {
+  let nl = s.slice(from, s.length()).index_of("\n")
+  if nl < 0 {
+    return None
+  }
+  let end = from + nl
+  let cut = if nl > 0 && s.code_unit_at(end - 1) == 13 { end - 1 } else { end }
+  Some((s.slice(from, cut), end + 1))
+}
+
+/// Decodes a `Transfer-Encoding: chunked` body at the start of `rest`: the body
+/// and the bytes consumed (through the trailer section). Incomplete input is
+/// `Err("incomplete chunked body")`.
+pub fn decode_chunked(rest : String) -> Result[(String, Int), String] {
+  let sb = StringBuilder()
+  let mut pos = 0
+  let mut total = 0
+  while true {
+    let (line, next) = match line_at(rest, pos) {
+      Some(l) => l
+      None => return Err("incomplete chunked body")
+    }
+    let semi = line.index_of(";")
+    let size_s = if semi >= 0 { line.slice(0, semi) } else { line }
+    let size = match hex_value(size_s) {
+      Some(n) => n
+      None => return Err("invalid chunk size `" + line + "`")
+    }
+    pos = next
+    if size == 0 {
+      while true {
+        match line_at(rest, pos) {
+          Some(tl) => {
+            pos = tl.1
+            if tl.0.length() == 0 {
+              break
+            }
+          }
+          None => return Err("incomplete chunked body")
+        }
+      }
+      return Ok((sb.to_string(), pos))
+    }
+    total = total + size
+    if total > MAX_MESSAGE_BYTES {
+      return Err("chunked body too large")
+    }
+    if pos + size > rest.length() {
+      return Err("incomplete chunked body")
+    }
+    sb.write_string(rest.slice(pos, pos + size))
+    pos = pos + size
+    if pos < rest.length() && rest.code_unit_at(pos) == 13 {
+      pos = pos + 1
+    }
+    if pos >= rest.length() {
+      return Err("incomplete chunked body")
+    }
+    if rest.code_unit_at(pos) != 10 {
+      return Err("missing CRLF after chunk data")
+    }
+    pos = pos + 1
+  }
+  Err("incomplete chunked body")
+}
+
+fn is_chunked(headers : Map[String, String]) -> Bool {
+  match headers.get("transfer-encoding") {
+    Some(te) => ascii_lower(te).contains("chunked")
+    None => false
+  }
+}
+
+/// Body bytes after the head: de-chunked for `transfer-encoding: chunked`, cut
+/// to `content-length` when present, else the rest.
 fn take_body(rest : String, headers : Map[String, String]) -> Result[String, String] {
+  if is_chunked(headers) {
+    let (body, _) = decode_chunked(rest)?
+    return Ok(body)
+  }
   match headers.get("content-length") {
     Some(cl) =>
     match parse_decimal(cl) {
@@ -172,6 +270,10 @@ pub fn parse_request(raw : String) -> Result[HttpRequest, String] {
   let path = if q >= 0 { target.slice(0, q) } else { target }
   let query = if q >= 0 { target.slice(q + 1, target.length()) } else { "" }
   let headers = parse_header_lines(lines)?
+  if parts[2] == "HTTP/1.0" && !headers.contains("connection") {
+    // HTTP/1.0 closes after each response unless the client asks otherwise.
+    headers.set("connection", "close")
+  }
   let body = take_body(raw.slice(he + sep, raw.length()), headers)?
   Ok(HttpRequest::{
     method: parts[0],
@@ -226,6 +328,12 @@ pub fn parse_response(raw : String) -> Result[HttpResponse, String] {
 
 /// Serializes a response with `Content-Length` and `Connection: close`.
 pub fn format_response(resp : HttpResponse) -> String {
+  format_response_ka(resp, false)
+}
+
+/// Serializes a response with `Content-Length` and `Connection: keep-alive`
+/// (the connection stays open for the next request) or `Connection: close`.
+pub fn format_response_ka(resp : HttpResponse, keep_alive : Bool) -> String {
   let sb = StringBuilder()
   sb.write_string("HTTP/1.1 ")
   sb.write_string(resp.status.to_string())
@@ -239,7 +347,11 @@ pub fn format_response(resp : HttpResponse) -> String {
   }
   sb.write_string("Content-Length: ")
   sb.write_string(resp.body.length().to_string())
-  sb.write_string("\r\nConnection: close\r\n\r\n")
+  if keep_alive {
+    sb.write_string("\r\nConnection: keep-alive\r\n\r\n")
+  } else {
+    sb.write_string("\r\nConnection: close\r\n\r\n")
+  }
   sb.write_string(resp.body)
   sb.to_string()
 }
@@ -347,47 +459,97 @@ pub fn query_params(query : String) -> Map[String, String] {
   out
 }
 
+/// Parses a URL query string (`a=1&b=x+y%2Fz`): `+` and `%XX` are decoded
+/// (`url_decode`), a bare key maps to `""`, later duplicates win.
+pub fn parse_query(query : String) -> Map[String, String] {
+  query_params(query)
+}
+
 /// Header value by case-insensitive name.
 pub fn header(req : HttpRequest, name : String) -> Option[String] {
   req.headers.get(ascii_lower(name))
 }
 
-/// Bytes still needed for a complete message in `buf`: -1 while the head is
-/// incomplete, else the missing body bytes (0 when complete or unbounded).
-fn missing_bytes(buf : String) -> Int {
+/// True when the connection may carry another request after answering `req`:
+/// HTTP/1.1 keeps it unless `Connection: close`; HTTP/1.0 closes unless the
+/// client sent `Connection: keep-alive`.
+pub fn should_keep_alive(req : HttpRequest) -> Bool {
+  match req.headers.get("connection") {
+    Some(v) => !ascii_lower(v).contains("close")
+    None => true
+  }
+}
+
+/// Leading empty lines a client may send between pipelined messages.
+fn skip_blank_lines(buf : String) -> Int {
+  let mut i = 0
+  while i < buf.length() {
+    let c = buf.code_unit_at(i)
+    if c != 13 && c != 10 {
+      break
+    }
+    i = i + 1
+  }
+  i
+}
+
+/// Byte length of the first complete message in `buf` (head, then a chunked,
+/// `content-length` or — for requests — empty body), or -1 while incomplete.
+/// Responses without either framing run to the end of the connection (-1). A
+/// malformed head counts as the whole buffer so parsing reports the error.
+fn message_len(buf : String, is_request : Bool) -> Int {
   let (he, sep) = head_end(buf)
   if he < 0 {
     return -1
   }
-  let head = buf.slice(0, he)
-  let lower = ascii_lower(head)
-  let k = lower.index_of("content-length:")
-  if k < 0 {
-    return 0
+  let body_at = he + sep
+  let lines = split_head_lines(buf.slice(0, he))
+  let headers = match parse_header_lines(lines) {
+    Ok(h) => h
+    Err(_) => return buf.length()
   }
-  let line_end = {
-    let rest = lower.slice(k, lower.length())
-    let nl = rest.index_of("\n")
-    if nl >= 0 {
-      k + nl
-    } else {
-      lower.length()
+  if !is_request {
+    let st = lines[0]
+    if st.starts_with("HTTP/1.1 1") || st.starts_with("HTTP/1.0 1") ||
+    st.starts_with("HTTP/1.1 204") || st.starts_with("HTTP/1.1 304") {
+      return body_at
     }
   }
-  match parse_decimal(lower.slice(k + 15, line_end)) {
-    Some(n) => {
-      let have = buf.length() - (he + sep)
-      if have >= n {
-        0
-      } else {
-        n - have
-      }
+  if is_chunked(headers) {
+    return match decode_chunked(buf.slice(body_at, buf.length())) {
+      Ok(r) => body_at + r.1
+      Err(e) => if e == "incomplete chunked body" { -1 } else { buf.length() }
     }
-    None => 0
+  }
+  match headers.get("content-length") {
+    Some(cl) =>
+    match parse_decimal(cl) {
+      Some(n) => if buf.length() - body_at >= n { body_at + n } else { -1 }
+      None => buf.length()
+    }
+    None => if is_request { body_at } else { -1 }
   }
 }
 
-/// Reads one request from `fd` (head plus `content-length` body) and parses it.
+/// Length of the first complete request in `buf` (after leading blank lines),
+/// or -1 while more bytes are needed; bytes past it belong to the next request.
+pub fn request_len(buf : String) -> Int {
+  let skip = skip_blank_lines(buf)
+  let n = message_len(buf.slice(skip, buf.length()), true)
+  if n < 0 {
+    -1
+  } else {
+    skip + n
+  }
+}
+
+/// Length of the first complete response in `buf`, or -1 while more bytes are
+/// needed (or, without `content-length`/chunking, until the peer closes).
+pub fn response_len(buf : String) -> Int {
+  message_len(buf, false)
+}
+
+/// Reads one request from `fd` (head plus `content-length` or chunked body) and parses it.
 pub fn read_http_request(w : World, fd : Int) -> Result[HttpRequest, String] {
   let sb = StringBuilder()
   let mut buf = ""
@@ -401,7 +563,7 @@ pub fn read_http_request(w : World, fd : Int) -> Result[HttpRequest, String] {
     if buf.length() > MAX_MESSAGE_BYTES {
       return Err("request too large")
     }
-    if missing_bytes(buf) == 0 {
+    if request_len(buf) >= 0 {
       break
     }
   }
@@ -411,13 +573,143 @@ pub fn read_http_request(w : World, fd : Int) -> Result[HttpRequest, String] {
   parse_request(buf)
 }
 
-/// Writes `resp` to `fd`; true when every byte was sent.
+/// Reads one response from `fd`: up to its `content-length` or last chunk, or
+/// until the server closes when neither is given.
+pub fn read_http_response(w : World, fd : Int) -> Result[HttpResponse, String] {
+  let sb = StringBuilder()
+  let mut buf = ""
+  while true {
+    let chunk = tcp_read(w, fd, 65536)
+    if chunk.length() == 0 {
+      break
+    }
+    sb.write_string(chunk)
+    buf = sb.to_string()
+    if buf.length() > MAX_MESSAGE_BYTES {
+      return Err("response too large")
+    }
+    if response_len(buf) >= 0 {
+      break
+    }
+  }
+  if buf.length() == 0 {
+    return Err("connection closed before response")
+  }
+  let n = response_len(buf)
+  parse_response(if n >= 0 { buf.slice(0, n) } else { buf })
+}
+
+/// Writes `resp` to `fd` with `Connection: close`; true when every byte was sent.
 pub fn write_http_response(w : World, fd : Int, resp : HttpResponse) -> Bool {
-  let text = format_response(resp)
+  write_http_response_ka(w, fd, resp, false)
+}
+
+/// Writes `resp` to `fd` announcing `Connection: keep-alive` or `close`; true
+/// when every byte was sent.
+pub fn write_http_response_ka(w : World, fd : Int, resp : HttpResponse, keep_alive : Bool) -> Bool {
+  let text = format_response_ka(resp, keep_alive)
   tcp_write(w, fd, text) == text.length()
 }
 
-/// Blocking HTTP/1.1 client call: connect, send, read until the server closes.
+/// A buffered HTTP/1.1 connection: reads message after message from one socket,
+/// keeping bytes past the current message (pipelined requests, coalesced TCP
+/// segments) for the next read.
+pub struct HttpConn {
+  pub fd : Int
+  mut buf : String
+}
+
+/// Wraps an accepted or connected socket.
+pub fn new_conn(fd : Int) -> HttpConn {
+  HttpConn::{ fd: fd, buf: "" }
+}
+
+/// Bytes received but not yet consumed by a read.
+pub fn conn_buffered(conn : HttpConn) -> Int {
+  conn.buf.length()
+}
+
+/// Next request on the connection: `Ok(None)` when the peer closed cleanly
+/// between requests, `Err` for a malformed, oversized or truncated request.
+pub fn conn_read_request(w : World, conn : HttpConn) -> Result[Option[HttpRequest], String] {
+  while true {
+    let n = request_len(conn.buf)
+    if n >= 0 {
+      let raw = conn.buf.slice(skip_blank_lines(conn.buf), n)
+      conn.buf = conn.buf.slice(n, conn.buf.length())
+      let req = parse_request(raw)?
+      return Ok(Some(req))
+    }
+    if conn.buf.length() > MAX_MESSAGE_BYTES {
+      return Err("request too large")
+    }
+    let chunk = tcp_read(w, conn.fd, 65536)
+    if chunk.length() == 0 {
+      if skip_blank_lines(conn.buf) == conn.buf.length() {
+        conn.buf = ""
+        return Ok(None)
+      }
+      return Err("connection closed mid-request")
+    }
+    conn.buf = conn.buf + chunk
+  }
+  Ok(None)
+}
+
+/// Next response on the connection (a response without `content-length` or
+/// chunking runs until the server closes).
+pub fn conn_read_response(w : World, conn : HttpConn) -> Result[HttpResponse, String] {
+  while true {
+    let n = response_len(conn.buf)
+    if n >= 0 {
+      let raw = conn.buf.slice(0, n)
+      conn.buf = conn.buf.slice(n, conn.buf.length())
+      return parse_response(raw)
+    }
+    if conn.buf.length() > MAX_MESSAGE_BYTES {
+      return Err("response too large")
+    }
+    let chunk = tcp_read(w, conn.fd, 65536)
+    if chunk.length() == 0 {
+      if conn.buf.length() == 0 {
+        return Err("connection closed before response")
+      }
+      let raw = conn.buf
+      conn.buf = ""
+      return parse_response(raw)
+    }
+    conn.buf = conn.buf + chunk
+  }
+  Err("unreachable")
+}
+
+/// Serializes a request with `Host`, `Content-Length` and `Connection: keep-alive`
+/// (or `close`), for clients that reuse one connection.
+pub fn format_request_ka(
+  method : String,
+  host : String,
+  port : Int,
+  path : String,
+  body : String,
+  keep_alive : Bool,
+) -> String {
+  let conn = if keep_alive { "keep-alive" } else { "close" }
+  method +
+  " " +
+  path +
+  " HTTP/1.1\r\nHost: " +
+  host +
+  ":" +
+  port.to_string() +
+  "\r\nContent-Length: " +
+  body.length().to_string() +
+  "\r\nConnection: " +
+  conn +
+  "\r\n\r\n" +
+  body
+}
+
+/// Blocking HTTP/1.1 client call: connect, send, read one response, close.
 pub fn http_request(
   w : World,
   host : String,
@@ -435,20 +727,7 @@ pub fn http_request(
     tcp_close(w, fd)
     return Err("failed to send request")
   }
-  let sb = StringBuilder()
-  let mut total = 0
-  while true {
-    let chunk = tcp_read(w, fd, 65536)
-    if chunk.length() == 0 {
-      break
-    }
-    total = total + chunk.length()
-    if total > MAX_MESSAGE_BYTES {
-      tcp_close(w, fd)
-      return Err("response too large")
-    }
-    sb.write_string(chunk)
-  }
+  let resp = read_http_response(w, fd)
   tcp_close(w, fd)
-  parse_response(sb.to_string())
+  resp
 }

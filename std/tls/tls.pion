@@ -1,0 +1,297 @@
+///| std/tls: TLS 1.2 / 1.3 client in pure Pion, `extern "C"` straight into the
+///| system OpenSSL (libssl + libcrypto, stable 1.1.x / 3.x C ABI), zero C glue.
+///|
+///| System libraries (linked with `-lssl -lcrypto` from `pion.toml`):
+///|   - Linux: OpenSSL 3 runtime `libssl.so.3` / `libcrypto.so.3` plus the
+///|     `libssl.so` / `libcrypto.so` link names (Debian/Ubuntu `libssl-dev`;
+///|     headers are not needed). Verified on Debian x86_64 with OpenSSL 3.5.
+///|   - macOS: the SDK ships no linkable libssl (the system LibreSSL is
+///|     private); install Homebrew `openssl@3` and build with
+///|     `CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib` (`CC` makes pionc
+///|     link through `cc`, which honours `LIBRARY_PATH`; its default direct
+///|     `ld` call does not).
+///| Certificate verification uses OpenSSL's default CA store
+///| (`SSL_CTX_set_default_verify_paths`, which honours `SSL_CERT_FILE` /
+///| `SSL_CERT_DIR`) and checks the host name (or IP address) against the
+///| certificate. TLS 1.2 is the minimum protocol version.
+
+import "http"
+
+extern "C" fn ossl_version_text(t : Int) -> Ptr = "OpenSSL_version"
+extern "C" fn ossl_tls_client_method() -> Ptr = "TLS_client_method"
+extern "C" fn ossl_ctx_new(method : Ptr) -> Ptr = "SSL_CTX_new"
+extern "C" fn ossl_ctx_free(ctx : Ptr) -> Unit = "SSL_CTX_free"
+extern "C" fn ossl_ctx_set_default_verify_paths(ctx : Ptr) -> Int = "SSL_CTX_set_default_verify_paths"
+extern "C" fn ossl_ctx_set_verify(ctx : Ptr, mode : Int, callback : Ptr) -> Unit = "SSL_CTX_set_verify"
+extern "C" fn ossl_ctx_ctrl(ctx : Ptr, cmd : Int, larg : Int64, parg : Ptr) -> Int64 = "SSL_CTX_ctrl"
+extern "C" fn ossl_new(ctx : Ptr) -> Ptr = "SSL_new"
+extern "C" fn ossl_free(ssl : Ptr) -> Unit = "SSL_free"
+extern "C" fn ossl_set_fd(ssl : Ptr, fd : Int) -> Int = "SSL_set_fd"
+extern "C" fn ossl_ctrl(ssl : Ptr, cmd : Int, larg : Int64, parg : Ptr) -> Int64 = "SSL_ctrl"
+extern "C" fn ossl_set1_host(ssl : Ptr, host : Ptr) -> Int = "SSL_set1_host"
+extern "C" fn ossl_get0_param(ssl : Ptr) -> Ptr = "SSL_get0_param"
+extern "C" fn ossl_param_set1_ip_asc(param : Ptr, ip : Ptr) -> Int = "X509_VERIFY_PARAM_set1_ip_asc"
+extern "C" fn ossl_connect(ssl : Ptr) -> Int = "SSL_connect"
+extern "C" fn ossl_read(ssl : Ptr, buf : Ptr, num : Int) -> Int = "SSL_read"
+extern "C" fn ossl_write(ssl : Ptr, buf : Ptr, num : Int) -> Int = "SSL_write"
+extern "C" fn ossl_shutdown(ssl : Ptr) -> Int = "SSL_shutdown"
+extern "C" fn ossl_get_error(ssl : Ptr, ret : Int) -> Int = "SSL_get_error"
+extern "C" fn ossl_get_version(ssl : Ptr) -> Ptr = "SSL_get_version"
+extern "C" fn ossl_get_current_cipher(ssl : Ptr) -> Ptr = "SSL_get_current_cipher"
+extern "C" fn ossl_cipher_get_name(cipher : Ptr) -> Ptr = "SSL_CIPHER_get_name"
+extern "C" fn ossl_get_verify_result(ssl : Ptr) -> Int64 = "SSL_get_verify_result"
+extern "C" fn ossl_verify_error_text(n : Int64) -> Ptr = "X509_verify_cert_error_string"
+extern "C" fn ossl_err_get_error() -> Int64 = "ERR_get_error"
+extern "C" fn ossl_err_error_string_n(e : Int64, buf : Ptr, len : Int64) -> Unit = "ERR_error_string_n"
+
+let SSL_VERIFY_NONE : Int = 0
+let SSL_VERIFY_PEER : Int = 1
+let SSL_CTRL_SET_TLSEXT_HOSTNAME : Int = 55
+let TLSEXT_NAMETYPE_HOST_NAME : Int64 = 0L
+let SSL_CTRL_SET_MIN_PROTO_VERSION : Int = 123
+let TLS1_2_VERSION : Int64 = 771L
+
+/// An established TLS session over a TCP socket.
+pub struct TlsConn {
+  ssl : Ptr
+  ctx : Ptr
+  pub fd : Int
+  pub host : String
+}
+
+/// Version text of the linked library, e.g. `OpenSSL 3.5.7 9 Jun 2026`.
+pub fn tls_version() -> String {
+  cstr_to_str(ossl_version_text(0))
+}
+
+/// True for a dotted IPv4 literal such as `127.0.0.1` (no SNI is sent for it,
+/// and it is verified as an IP address rather than a DNS name).
+pub fn is_ipv4_literal(host : String) -> Bool {
+  if host.length() == 0 {
+    return false
+  }
+  let parts = host.split(".")
+  if parts.length() != 4 {
+    return false
+  }
+  let mut i = 0
+  while i < 4 {
+    let p = parts[i]
+    if p.length() == 0 || p.length() > 3 {
+      return false
+    }
+    let mut v = 0
+    let mut j = 0
+    while j < p.length() {
+      let c = p.code_unit_at(j)
+      if c < 48 || c > 57 {
+        return false
+      }
+      v = v * 10 + (c - 48)
+      j = j + 1
+    }
+    if v > 255 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+/// Drains OpenSSL's thread-local error queue into one `; `-separated line.
+fn openssl_errors() -> String {
+  let buf = ptr_alloc(256L)
+  let parts : Array[String] = []
+  while true {
+    let e = ossl_err_get_error()
+    if e == 0L {
+      break
+    }
+    ossl_err_error_string_n(e, buf, 256L)
+    parts.push(cstr_to_str(buf))
+  }
+  ptr_free(buf)
+  parts.join("; ")
+}
+
+fn fail_text(what : String, ssl : Ptr, rc : Int) -> String {
+  let code = ossl_get_error(ssl, rc)
+  let errs = openssl_errors()
+  let mut msg = what + " failed (rc=" + rc.to_string() + ", ssl_error=" + code.to_string() + ")"
+  if errs.length() > 0 {
+    msg = msg + ": " + errs
+  }
+  msg
+}
+
+/// Connects to `host:port` over TCP (`tcp_connect`) and completes a TLS 1.2+
+/// handshake with SNI. With `verify_cert` the peer chain must verify against the
+/// default CA store and match `host`; without it any certificate is accepted.
+pub fn tls_connect(w : World, host : String, port : Int, verify_cert : Bool) -> Result[TlsConn, String] {
+  let fd = tcp_connect(w, host, port)
+  if fd < 0 {
+    return Err("connect to " + host + ":" + port.to_string() + " failed")
+  }
+  let ctx = ossl_ctx_new(ossl_tls_client_method())
+  if ptr_is_null(ctx) {
+    tcp_close(w, fd)
+    return Err("SSL_CTX_new failed: " + openssl_errors())
+  }
+  let _ = ossl_ctx_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, ptr_null())
+  if verify_cert {
+    if ossl_ctx_set_default_verify_paths(ctx) != 1 {
+      ossl_ctx_free(ctx)
+      tcp_close(w, fd)
+      return Err("loading the default CA store failed: " + openssl_errors())
+    }
+    ossl_ctx_set_verify(ctx, SSL_VERIFY_PEER, ptr_null())
+  } else {
+    ossl_ctx_set_verify(ctx, SSL_VERIFY_NONE, ptr_null())
+  }
+  let ssl = ossl_new(ctx)
+  if ptr_is_null(ssl) {
+    ossl_ctx_free(ctx)
+    tcp_close(w, fd)
+    return Err("SSL_new failed: " + openssl_errors())
+  }
+  let ip = is_ipv4_literal(host)
+  let mut setup = ossl_set_fd(ssl, fd) == 1
+  if setup && !ip {
+    setup = ossl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, host.as_cstr()) == 1L
+  }
+  if setup && verify_cert {
+    setup = if ip {
+      ossl_param_set1_ip_asc(ossl_get0_param(ssl), host.as_cstr()) == 1
+    } else {
+      ossl_set1_host(ssl, host.as_cstr()) == 1
+    }
+  }
+  if !setup {
+    let msg = "TLS session setup for " + host + " failed: " + openssl_errors()
+    ossl_free(ssl)
+    ossl_ctx_free(ctx)
+    tcp_close(w, fd)
+    return Err(msg)
+  }
+  let rc = ossl_connect(ssl)
+  if rc != 1 {
+    let mut msg = fail_text("TLS handshake with " + host + ":" + port.to_string(), ssl, rc)
+    let vr = ossl_get_verify_result(ssl)
+    if verify_cert && vr != 0L {
+      msg = msg + " (certificate verify error " + vr.to_string() + ": " +
+      cstr_to_str(ossl_verify_error_text(vr)) + ")"
+    }
+    ossl_free(ssl)
+    ossl_ctx_free(ctx)
+    tcp_close(w, fd)
+    return Err(msg)
+  }
+  Ok(TlsConn::{ ssl: ssl, ctx: ctx, fd: fd, host: host })
+}
+
+/// Negotiated protocol, e.g. `TLSv1.3` or `TLSv1.2`.
+pub fn tls_protocol(conn : TlsConn) -> String {
+  cstr_to_str(ossl_get_version(conn.ssl))
+}
+
+/// Negotiated cipher suite, e.g. `TLS_AES_256_GCM_SHA384`.
+pub fn tls_cipher(conn : TlsConn) -> String {
+  let c = ossl_get_current_cipher(conn.ssl)
+  if ptr_is_null(c) {
+    ""
+  } else {
+    cstr_to_str(ossl_cipher_get_name(c))
+  }
+}
+
+/// Sends every byte of `data`; the number of bytes written.
+pub fn tls_write(w : World, conn : TlsConn, data : String) -> Result[Int, String] {
+  let _ = w
+  let n = data.length()
+  if n == 0 {
+    return Ok(0)
+  }
+  let rc = ossl_write(conn.ssl, data.as_cstr(), n)
+  if rc != n {
+    return Err(fail_text("SSL_write", conn.ssl, rc))
+  }
+  Ok(n)
+}
+
+/// Reads up to `max_bytes` decrypted bytes; `""` at end of stream or on error.
+pub fn tls_read(w : World, conn : TlsConn, max_bytes : Int) -> String {
+  let _ = w
+  if max_bytes <= 0 {
+    return ""
+  }
+  let buf = ptr_alloc((max_bytes + 8).to_int64())
+  let n = ossl_read(conn.ssl, buf, max_bytes)
+  if n <= 0 {
+    ptr_free(buf)
+    let _ = openssl_errors()
+    return ""
+  }
+  let out = Bytes::new(n)
+  let mut i = 0
+  while i < n {
+    out[i] = (ptr_read_i32(buf, i.to_int64()) & 255).to_byte()
+    i = i + 1
+  }
+  ptr_free(buf)
+  out.to_string()
+}
+
+/// Sends `close_notify`, frees the session and closes the socket.
+pub fn tls_close(w : World, conn : TlsConn) -> Unit {
+  let _ = ossl_shutdown(conn.ssl)
+  ossl_free(conn.ssl)
+  ossl_ctx_free(conn.ctx)
+  let _ = openssl_errors()
+  tcp_close(w, conn.fd)
+}
+
+/// Blocking HTTPS/1.1 call (`std/http` framing over `tls_connect`): send one
+/// request with `Connection: close`, read one response (content-length,
+/// chunked, or until the server closes), close.
+pub fn https_request(
+  w : World,
+  host : String,
+  port : Int,
+  method : String,
+  path : String,
+  body : String,
+  verify_cert : Bool,
+) -> Result[http::HttpResponse, String] {
+  let conn = tls_connect(w, host, port, verify_cert)?
+  let req = http::format_request(method, host, port, path, body)
+  match tls_write(w, conn, req) {
+    Ok(_) => ()
+    Err(e) => {
+      tls_close(w, conn)
+      return Err(e)
+    }
+  }
+  let sb = StringBuilder()
+  let mut buf = ""
+  while true {
+    let chunk = tls_read(w, conn, 65536)
+    if chunk.length() == 0 {
+      break
+    }
+    sb.write_string(chunk)
+    buf = sb.to_string()
+    if buf.length() > http::MAX_MESSAGE_BYTES {
+      tls_close(w, conn)
+      return Err("response too large")
+    }
+    if http::response_len(buf) >= 0 {
+      break
+    }
+  }
+  tls_close(w, conn)
+  if buf.length() == 0 {
+    return Err("connection closed before response")
+  }
+  let n = http::response_len(buf)
+  http::parse_response(if n >= 0 { buf.slice(0, n) } else { buf })
+}

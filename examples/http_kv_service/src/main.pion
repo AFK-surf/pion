@@ -1,12 +1,16 @@
 ///| pion-kv: a multithreaded HTTP/1.1 + JSON key-value service.
 ///|
 ///|   http_kv_service --self-test
-///|   http_kv_service --port <p> --workers <n> --max-reqs <m> [--port-file <path>]
+///|   http_kv_service --port <p> --workers <n> --max-conns <m> [--port-file <path>]
 ///|
 ///| Server mode listens on 127.0.0.1:<p> (0 = ephemeral; the real port is written
 ///| to --port-file, which may be a FIFO the client reads), hands accepted
 ///| connections to <n> worker OS threads over a `Channel[Int]`, and after <m>
-///| connections drains the workers and prints the final `/stats` JSON.
+///| connections drains the workers and prints the final `/stats` JSON
+///| (`--max-reqs` is the older name of `--max-conns`). Each connection is
+///| HTTP/1.1 keep-alive: a worker answers request after request on it
+///| (pipelined bytes included) until the client sends `Connection: close`, speaks
+///| HTTP/1.0 without keep-alive, or closes; short-lived clients get one exchange.
 
 import "json"
 import "http"
@@ -65,7 +69,7 @@ fn parse_options(args : Array[String]) -> Result[Options, String] {
         port = n
       } else if a == "--workers" {
         workers = n
-      } else if a == "--max-reqs" {
+      } else if a == "--max-reqs" || a == "--max-conns" {
         max_reqs = n
       } else {
         return Err("unknown option " + a)
@@ -74,7 +78,7 @@ fn parse_options(args : Array[String]) -> Result[Options, String] {
     i = i + 2
   }
   if !self_test && (workers < 1 || workers > 256 || max_reqs < 1 || port > 65535) {
-    return Err("need --workers 1..256, --max-reqs >= 1 and --port 0..65535")
+    return Err("need --workers 1..256, --max-conns >= 1 and --port 0..65535")
   }
   Ok(Options::{
     self_test: self_test,
@@ -85,14 +89,32 @@ fn parse_options(args : Array[String]) -> Result[Options, String] {
   })
 }
 
-/// Serves one connection: read the request, route it, reply, close.
-fn serve_conn(world : World, svc : Service, fd : Int) -> Unit {
-  let resp = match http::read_http_request(world, fd) {
-    Ok(req) => handle(svc, req.method, req.path, req.body)
-    Err(e) => http::err_json(400, e)
+/// Serves one connection: request after request (HTTP/1.1 keep-alive and
+/// pipelining) until the client asks to close or hangs up; returns how many
+/// requests were answered.
+fn serve_conn(world : World, svc : Service, fd : Int) -> Int {
+  let conn = http::new_conn(fd)
+  let mut answered = 0
+  while true {
+    match http::conn_read_request(world, conn) {
+      Ok(Some(req)) => {
+        let keep = http::should_keep_alive(req)
+        let resp = handle(svc, req.method, req.path, req.body)
+        answered = answered + 1
+        if !http::write_http_response_ka(world, fd, resp, keep) || !keep {
+          break
+        }
+      }
+      Ok(None) => break
+      Err(e) => {
+        let _ = http::write_http_response(world, fd, http::err_json(400, e))
+        answered = answered + 1
+        break
+      }
+    }
   }
-  let _ = http::write_http_response(world, fd, resp)
   tcp_close(world, fd)
+  answered
 }
 
 fn serve(world : World, opts : Options) -> Int {
@@ -113,7 +135,7 @@ fn serve(world : World, opts : Options) -> Int {
   }
   io_eprintln(
     world,
-    "pion-kv listening on 127.0.0.1:" + port.to_string() + " workers=" + opts.workers.to_string(),
+    "pion-kv (keep-alive) listening on 127.0.0.1:" + port.to_string() + " workers=" + opts.workers.to_string(),
   )
   let svc = new_service()
   let conns : Channel[Int] = Channel::new(256)
@@ -128,7 +150,7 @@ fn serve(world : World, opts : Options) -> Int {
         while true {
           match conns.recv() {
             Some(fd) => {
-              serve_conn(world, svc, fd)
+              let _ = serve_conn(world, svc, fd)
               let _ = served.fetch_add(1)
             }
             None => break
@@ -153,7 +175,7 @@ fn serve(world : World, opts : Options) -> Int {
   let st = stats(svc)
   io_println(world, json::encode(st))
   if accept_errors.load() > 0 || served.load() != max_reqs {
-    io_eprintln(world, "served " + served.load().to_string() + " of " + max_reqs.to_string())
+    io_eprintln(world, "served " + served.load().to_string() + " of " + max_reqs.to_string() + " connections")
     return 1
   }
   0
@@ -272,9 +294,72 @@ fn stress(world : World, failures : AtomicInt, workers : Int, ops : Int) -> Int6
   elapsed
 }
 
+fn body_of(r : Result[http::HttpResponse, String]) -> String {
+  match r {
+    Ok(resp) => resp.status.to_string() + " " + resp.body
+    Err(e) => "error: " + e
+  }
+}
+
+/// Keep-alive over real 127.0.0.1 TCP: one worker serves a connection that
+/// carries three pipelined requests sent in a single write (one chunked), then a
+/// fourth with `Connection: close`, after which the server must hang up.
+fn keepalive_loopback(world : World, failures : AtomicInt) -> Unit {
+  let svc = new_service()
+  let lfd = tcp_listen(world, "127.0.0.1", 0)
+  if lfd < 0 {
+    expect(world, failures, false, "keep-alive: listen failed")
+    return
+  }
+  let port = tcp_local_port(world, lfd)
+  let answered = AtomicInt::new(-1)
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit {
+      let fd = tcp_accept(world, lfd)
+      if fd >= 0 {
+        answered.store(serve_conn(world, svc, fd))
+      }
+    })
+    let cfd = tcp_connect(world, "127.0.0.1", port)
+    if cfd < 0 {
+      expect(world, failures, false, "keep-alive: connect failed")
+      return
+    }
+    let put = http::format_request_ka("PUT", "127.0.0.1", port, "/items/ka", "{\"value\":\"v1\"}", true)
+    let chunked = "PUT /items/kb HTTP/1.1\r\nHost: x\r\nTransfer-Encoding: chunked\r\n\r\n" +
+    "6\r\n{\"valu\r\n8\r\ne\":\"v2\"}\r\n0\r\n\r\n"
+    let get = http::format_request_ka("GET", "127.0.0.1", port, "/items/ka", "", true)
+    let batch = put + chunked + get
+    expect(world, failures, tcp_write(world, cfd, batch) == batch.length(), "keep-alive: pipelined write")
+    let conn = http::new_conn(cfd)
+    let r1 = body_of(http::conn_read_response(world, conn))
+    let r2 = body_of(http::conn_read_response(world, conn))
+    let r3 = body_of(http::conn_read_response(world, conn))
+    expect(world, failures, r1 == "200 {\"ok\":true,\"key\":\"ka\",\"value\":\"v1\"}", "keep-alive r1: " + r1)
+    expect(world, failures, r2 == "200 {\"ok\":true,\"key\":\"kb\",\"value\":\"v2\"}", "keep-alive r2 (chunked): " + r2)
+    expect(world, failures, r3 == "200 {\"key\":\"ka\",\"value\":\"v1\"}", "keep-alive r3: " + r3)
+    let last = http::format_request("GET", "127.0.0.1", port, "/stats", "")
+    expect(world, failures, tcp_write(world, cfd, last) == last.length(), "keep-alive: final write")
+    let r4 = body_of(http::conn_read_response(world, conn))
+    expect(
+      world,
+      failures,
+      r4 == "200 {\"total_reqs\":4,\"keys\":2,\"hits\":1,\"misses\":0,\"puts\":2,\"deletes\":0}",
+      "keep-alive r4: " + r4,
+    )
+    let after = body_of(http::conn_read_response(world, conn))
+    expect(world, failures, after == "error: connection closed before response", "server closed after close: " + after)
+    tcp_close(world, cfd)
+  })
+  tcp_close(world, lfd)
+  expect(world, failures, answered.load() == 4, "keep-alive: answered " + answered.load().to_string())
+  io_println(world, "keep-alive loopback: 4 requests on 1 connection (3 pipelined, 1 chunked)")
+}
+
 fn self_test(world : World) -> Int {
   let failures = AtomicInt::new(0)
   functional(world, failures)
+  keepalive_loopback(world, failures)
   let ms = stress(world, failures, 8, 500)
   if failures.load() != 0 {
     io_eprintln(world, "self-test FAILED: " + failures.load().to_string() + " check(s)")
@@ -291,7 +376,7 @@ pub fn main(world : World) -> Int {
       io_eprintln(world, "error: " + e)
       io_eprintln(
         world,
-        "usage: http_kv_service --self-test | --port <p> --workers <n> --max-reqs <m> [--port-file <path>]",
+        "usage: http_kv_service --self-test | --port <p> --workers <n> --max-conns <m> [--port-file <path>]",
       )
       2
     }
