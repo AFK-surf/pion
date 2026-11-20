@@ -101,10 +101,15 @@ static struct {
 
 	{ Oacmp,   Ki, "cmp %0, %1" },
 	{ Oacmn,   Ki, "cmn %0, %1" },
+	{ Oatst,   Ki, "tst %0, %1" },
 	{ Oafcmp,  Ka, "fcmpe %0, %1" },
 
 #define X(c, str, _) \
 	{ Oflag+c, Ki, "cset %=, " str },
+	CMP(X)
+#undef X
+#define X(c, str, _) \
+	{ Oxsel+c, Ki, "csel %=, %0, %1, " str },
 	CMP(X)
 #undef X
 	{ NOp, 0, 0 }
@@ -232,7 +237,7 @@ emitf(char *s, Ins *i, E *e)
 				if (i->op == Oafcmp) {
 					assert(k == Kd ? n == 0 : (uint32_t)n == 0);
 					fputs("#0.0", e->f);
-				} else if (i->op == Oand || i->op == Oor || i->op == Oxor) {
+				} else if (i->op == Oand || i->op == Oor || i->op == Oxor || i->op == Oatst) {
 					if (k == Kw)
 						n = (uint32_t)n;
 					assert(arm64_logimm(n, k));
@@ -611,6 +616,77 @@ framelayout(E *e)
 
 */
 
+static Ins *
+can_fuse_cbz(Blk *b, Fn *fn)
+{
+	Ins *p;
+	Con *c;
+
+	if (b->jmp.type != Jjfieq && b->jmp.type != Jjfine)
+		return 0;
+	for (p = &b->ins[b->nins]; p > b->ins;) {
+		--p;
+		if (p->op == Onop || p->op == Odbgloc)
+			continue;
+		if (p->op == Oacmp && KBASE(p->cls) == 0
+		&& isreg(p->arg[0]) && p->arg[0].val != SP
+		&& rtype(p->arg[1]) == RCon) {
+			c = &fn->con[p->arg[1].val];
+			if (c->type == CBits && c->bits.i == 0)
+				return p;
+		}
+		return 0;
+	}
+	return 0;
+}
+
+static int
+w32_def_reg(const Ins *i, int cur_reg)
+{
+	if (i->op == Onop || i->op == Odbgloc)
+		return cur_reg;
+	if (i->op == Ocopy && req(i->to, i->arg[0]))
+		return cur_reg;
+	if (!isreg(i->to) || i->to.val == SP || i->to.val < R0 || i->to.val > LR)
+		return -1;
+	switch (i->op) {
+	case Oloadub:
+	case Oloaduh:
+	case Oloaduw:
+	case Oextub:
+	case Oextuh:
+	case Oextuw:
+		return i->to.val;
+	case Oadd:
+	case Osub:
+	case Oneg:
+	case Oand:
+	case Oor:
+	case Oxor:
+	case Oshl:
+	case Oshr:
+	case Osar:
+	case Omul:
+	case Odiv:
+	case Oudiv:
+	case Orem:
+	case Ourem:
+	case Oload:
+	case Oloadsw:
+	case Ocast:
+	case Ostosi:
+	case Ostoui:
+	case Odtosi:
+	case Odtoui:
+	case Ocopy:
+		return i->cls == Kw ? i->to.val : -1;
+	default:
+		if (i->cls == Kw && (INRANGE(i->op, Oflag, Oflag1) || isxsel(i->op)))
+			return i->to.val;
+		return -1;
+	}
+}
+
 void
 arm64_emitfn(Fn *fn, FILE *out)
 {
@@ -677,10 +753,22 @@ arm64_emitfn(Fn *fn, FILE *out)
 		}
 
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
+		Ins *cbz_ins = can_fuse_cbz(b, e->fn);
+		int last_w32 = -1;
 		if (lbl || b->npred > 1)
 			fprintf(e->f, "%s%d:\n", T.asloc, id0+b->id);
-		for (i=b->ins; i!=&b->ins[b->nins]; i++)
+		for (i=b->ins; i!=&b->ins[b->nins]; i++) {
+			if (i == cbz_ins) {
+				last_w32 = -1;
+				continue;
+			}
+			if (i->op == Oextuw && req(i->to, i->arg[0])
+			&& isreg(i->to) && i->to.val == last_w32)
+				continue;
+			int next_w32 = w32_def_reg(i, last_w32);
 			emitins(i, e);
+			last_w32 = next_w32;
+		}
 		lbl = 1;
 		switch (b->jmp.type) {
 		case Jhlt:
@@ -795,10 +883,20 @@ arm64_emitfn(Fn *fn, FILE *out)
 				n = 0;
 			} else
 				n = 1;
-			fprintf(e->f,
-				"\tb%s\t%s%d\n",
-				ctoa[c][n], T.asloc, id0+b->s2->id
-			);
+			if (cbz_ins) {
+				int is_nz = (c == Cine) ^ n;
+				fprintf(e->f,
+					"\t%s\t%s, %s%d\n",
+					is_nz ? "cbnz" : "cbz",
+					rname(cbz_ins->arg[0].val, cbz_ins->cls),
+					T.asloc, id0+b->s2->id
+				);
+			} else {
+				fprintf(e->f,
+					"\tb%s\t%s%d\n",
+					ctoa[c][n], T.asloc, id0+b->s2->id
+				);
+			}
 			goto Jmp;
 		}
 	}

@@ -464,6 +464,34 @@ static inline char *pion_fmt_i64_end(int64_t v, char *end) {
     return p;
 }
 
+static inline void pion_copy_short(char *dst, const char *src, size_t n) {
+    if (__builtin_expect(n <= 16, 1)) {
+        if (n >= 8) {
+            uint64_t a, b;
+            memcpy(&a, src, 8);
+            memcpy(&b, src + n - 8, 8);
+            memcpy(dst, &a, 8);
+            memcpy(dst + n - 8, &b, 8);
+        } else if (n >= 4) {
+            uint32_t a, b;
+            memcpy(&a, src, 4);
+            memcpy(&b, src + n - 4, 4);
+            memcpy(dst, &a, 4);
+            memcpy(dst + n - 4, &b, 4);
+        } else if (n >= 2) {
+            uint16_t a, b;
+            memcpy(&a, src, 2);
+            memcpy(&b, src + n - 2, 2);
+            memcpy(dst, &a, 2);
+            memcpy(dst + n - 2, &b, 2);
+        } else if (n == 1) {
+            dst[0] = src[0];
+        }
+        return;
+    }
+    memcpy(dst, src, n);
+}
+
 void *pion_str_from_cstr(const char *s, int64_t len) {
     if (!s) {
         len = 0;
@@ -474,7 +502,7 @@ void *pion_str_from_cstr(const char *s, int64_t len) {
     PionString *str = (PionString *)pion_alloc_raw(payload_size, PION_TAG_STRING, NULL);
     str->len = len;
     if (len > 0 && s) {
-        memcpy(str->data, s, (size_t)len);
+        pion_copy_short(str->data, s, (size_t)len);
     }
     str->data[len] = '\0';
     return str;
@@ -522,7 +550,7 @@ void *pion_str_concat_n(int64_t n, void **parts) {
     for (int64_t i = 0; i < n; i++) {
         PionString *s = (PionString *)parts[i];
         if (s && s->len > 0) {
-            memcpy(dst, s->data, (size_t)s->len);
+            pion_copy_short(dst, s->data, (size_t)s->len);
             dst += s->len;
         }
     }
@@ -536,7 +564,41 @@ static inline int32_t pion_str_eq_fast(const PionString *sa, const PionString *s
     int64_t len = sa->len;
     if (len != sb->len) return 0;
     if (len == 0) return 1;
-    return memcmp(sa->data, sb->data, (size_t)len) == 0 ? 1 : 0;
+    size_t n = (size_t)len;
+    const char *a = sa->data;
+    const char *b = sb->data;
+    if (__builtin_expect(n <= 16, 1)) {
+        if (n >= 8) {
+            uint64_t a0, b0, a1, b1;
+            memcpy(&a0, a, 8);
+            memcpy(&b0, b, 8);
+            memcpy(&a1, a + n - 8, 8);
+            memcpy(&b1, b + n - 8, 8);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0 ? 1 : 0;
+        }
+        if (n >= 4) {
+            uint32_t a0, b0, a1, b1;
+            memcpy(&a0, a, 4);
+            memcpy(&b0, b, 4);
+            memcpy(&a1, a + n - 4, 4);
+            memcpy(&b1, b + n - 4, 4);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0 ? 1 : 0;
+        }
+        if (n >= 2) {
+            uint16_t a0, b0, a1, b1;
+            memcpy(&a0, a, 2);
+            memcpy(&b0, b, 2);
+            memcpy(&a1, a + n - 2, 2);
+            memcpy(&b1, b + n - 2, 2);
+            return ((a0 ^ b0) | (a1 ^ b1)) == 0 ? 1 : 0;
+        }
+        return a[0] == b[0] ? 1 : 0;
+    }
+    uint64_t a0, b0;
+    memcpy(&a0, a, 8);
+    memcpy(&b0, b, 8);
+    if (a0 != b0) return 0;
+    return memcmp(a + 8, b + 8, n - 8) == 0 ? 1 : 0;
 }
 
 int32_t pion_str_eq(void *a, void *b) {
@@ -569,7 +631,7 @@ void *pion_str_slice(void *s, int64_t start, int64_t end) {
                                              PION_TAG_STRING, NULL);
     out->len = n;
     if (n > 0) {
-        memcpy(out->data, str->data + start, (size_t)n);
+        pion_copy_short(out->data, str->data + start, (size_t)n);
     }
     out->data[n] = '\0';
     return out;

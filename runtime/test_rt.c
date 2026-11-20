@@ -2275,6 +2275,73 @@ static void test_event_loop_nb(int argc, char **argv) {
     (void)again;
 }
 
+static void test_short_str_and_hash_edges(void) {
+    /* Exhaustively test boundary lengths 0..32 (incl. 0,1,7,8,9,15,16,17,32) across
+     * slice (unaligned offsets), from_cstr, concat_n, str_eq (first/mid/last diff),
+     * and map set/try_get under heavy key overlap. */
+    const char *base = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ-_";
+    void *base_s = pion_str_from_cstr(base, 64);
+    const int64_t lens[] = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 12, 15, 16, 17, 24, 31, 32};
+    const int64_t offs[] = {0, 1, 3, 7, 8, 15};
+    void *m = pion_map_new(0);
+    int64_t seq = 1;
+
+    for (size_t oi = 0; oi < sizeof(offs) / sizeof(offs[0]); oi++) {
+        int64_t off = offs[oi];
+        for (size_t li = 0; li < sizeof(lens) / sizeof(lens[0]); li++) {
+            int64_t len = lens[li];
+            void *sl = pion_str_slice(base_s, off, off + len);
+            void *fc = pion_str_from_cstr(base + off, len);
+            assert(pion_str_len(sl) == len);
+            assert(pion_str_eq(sl, fc) == 1);
+            assert(((PionString *)sl)->data[len] == '\0');
+            assert(((PionString *)fc)->data[len] == '\0');
+            if (len > 0) {
+                char buf[40];
+                memcpy(buf, base + off, (size_t)len);
+                /* Differ at first byte */
+                buf[0] ^= 1;
+                void *d0 = pion_str_from_cstr(buf, len);
+                assert(pion_str_eq(sl, d0) == 0);
+                pion_rc_dec(d0);
+                buf[0] ^= 1;
+                /* Differ at last byte */
+                buf[len - 1] ^= 1;
+                void *d1 = pion_str_from_cstr(buf, len);
+                assert(pion_str_eq(sl, d1) == 0);
+                pion_rc_dec(d1);
+                buf[len - 1] ^= 1;
+                /* Differ at middle byte */
+                buf[len / 2] ^= 1;
+                void *d2 = pion_str_from_cstr(buf, len);
+                assert(pion_str_eq(sl, d2) == 0);
+                pion_rc_dec(d2);
+            }
+            /* Test concat_n with 3 short parts */
+            void *parts[3] = {sl, fc, sl};
+            void *cat = pion_str_concat_n(3, parts);
+            assert(pion_str_len(cat) == len * 3);
+            if (len > 0) {
+                void *mid = pion_str_slice(cat, len, len * 2);
+                assert(pion_str_eq(mid, fc) == 1);
+                pion_rc_dec(mid);
+            }
+            pion_rc_dec(cat);
+
+            /* Map insert & lookup */
+            pion_map_set(m, sl, seq);
+            int64_t got = -1;
+            assert(pion_map_try_get(m, fc, &got) == 1 && got == seq);
+            seq++;
+            pion_rc_dec(sl);
+            pion_rc_dec(fc);
+        }
+    }
+    pion_rc_dec(m);
+    pion_rc_dec(base_s);
+    printf("[PASS] short_str_and_hash_edges\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -2286,6 +2353,7 @@ int main(int argc, char **argv) {
     test_biased_rc_and_immortal();
     test_alloc_uninit();
     test_string_and_strbuf();
+    test_short_str_and_hash_edges();
     test_stdlib_string_bytes_math();
     test_array_and_map();
     test_arr_ergonomics_and_double_to_str();
