@@ -146,3 +146,92 @@ test "error handling" {
   debug_assert(resp_err("HTTP/1.1 20x OK\r\n\r\n") == "invalid status code `20x`", "status code")
   debug_assert(resp_err("HTTP/1.1 2000 OK\r\n\r\n") == "invalid status code `2000`", "status width")
 }
+
+test "parse_query decodes percent escapes and plus" {
+  let q = parse_query("name=Ada+Lovelace&city=S%C3%A3o%20Paulo&empty=&flag&a%26b=c%3Dd&x=1&x=2")
+  debug_assert(opt_is(q.get("name"), "Ada Lovelace"), "plus is a space")
+  debug_assert(opt_is(q.get("city"), "São Paulo"), "UTF-8 percent escapes")
+  debug_assert(opt_is(q.get("empty"), "") && opt_is(q.get("flag"), ""), "empty and bare keys")
+  debug_assert(opt_is(q.get("a&b"), "c=d"), "escaped separators")
+  debug_assert(opt_is(q.get("x"), "2"), "later duplicate wins")
+  debug_assert(q.length() == 6, "pair count")
+  debug_assert(parse_query("").length() == 0, "empty query")
+  debug_assert(url_decode("100%25+sure%") == "100% sure%", "url_decode: " + url_decode("100%25+sure%"))
+  let r = req_ok("GET /search?q=pion+lang&page=2 HTTP/1.1\r\n\r\n")
+  debug_assert(opt_is(parse_query(r.query).get("q"), "pion lang"), "query of a parsed request")
+}
+
+test "chunked transfer-encoding responses" {
+  let raw = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n" +
+  "5\r\nHello\r\n7;ext=1\r\n, world\r\n1A\r\n -- abcdefghijklmnopqrstu!\r\n0\r\nX-Trailer: t\r\n\r\n"
+  let resp = resp_ok(raw)
+  debug_assert(resp.status == 200 && resp.content_type == "text/plain", "head")
+  debug_assert(resp.body == "Hello, world -- abcdefghijklmnopqrstu!", "dechunked body: " + resp.body)
+  debug_assert(response_len(raw) == raw.length(), "complete length")
+  debug_assert(response_len(raw + "HTTP/1.1 204") == raw.length(), "trailing bytes are the next message")
+  debug_assert(response_len(raw.slice(0, raw.length() - 2)) == -1, "trailer incomplete")
+  debug_assert(response_len(raw.slice(0, 80)) == -1, "chunk incomplete")
+  let lf = resp_ok("HTTP/1.1 200 OK\ntransfer-encoding: CHUNKED\n\n3\nabc\n0\n\n")
+  debug_assert(lf.body == "abc", "bare LF and upper-case coding")
+  debug_assert(resp_err("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\nabc\r\n0\r\n\r\n") ==
+    "invalid chunk size `zz`", "bad chunk size")
+  debug_assert(resp_err("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc") ==
+    "incomplete chunked body", "truncated chunk")
+  debug_assert(resp_err("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX\r\n0\r\n\r\n") ==
+    "missing CRLF after chunk data", "chunk overrun")
+  match decode_chunked("4\r\nWiki\r\n0\r\n\r\nREST") {
+    Ok(r) => { debug_assert(r.0 == "Wiki" && r.1 == 14, "decode_chunked consumed " + r.1.to_string()) }
+    Err(e) => { debug_assert(false, e) }
+  }
+  let req = req_ok("POST /up HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n")
+  debug_assert(req.body == "hi", "chunked request body")
+}
+
+test "keep-alive decisions and formatting" {
+  debug_assert(should_keep_alive(req_ok("GET / HTTP/1.1\r\nHost: x\r\n\r\n")), "HTTP/1.1 default")
+  debug_assert(!should_keep_alive(req_ok("GET / HTTP/1.1\r\nConnection: close\r\n\r\n")), "close")
+  debug_assert(!should_keep_alive(req_ok("GET / HTTP/1.1\r\nconnection: Close\r\n\r\n")), "case-insensitive close")
+  debug_assert(should_keep_alive(req_ok("GET / HTTP/1.1\r\nConnection: keep-alive\r\n\r\n")), "explicit keep-alive")
+  debug_assert(!should_keep_alive(req_ok("GET / HTTP/1.0\r\n\r\n")), "HTTP/1.0 default closes")
+  debug_assert(should_keep_alive(req_ok("GET / HTTP/1.0\r\nConnection: Keep-Alive\r\n\r\n")), "HTTP/1.0 keep-alive")
+  let text = format_response_ka(ok_json("{}"), true)
+  debug_assert(
+    text == "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n{}",
+    "format_response_ka: " + text
+  )
+  debug_assert(format_response_ka(ok_json("{}"), false) == format_response(ok_json("{}")), "close variant")
+  let kreq = format_request_ka("PUT", "h", 1, "/k", "v", true)
+  debug_assert(should_keep_alive(req_ok(kreq)) && req_ok(kreq).body == "v", "format_request_ka keep-alive")
+  debug_assert(!should_keep_alive(req_ok(format_request_ka("GET", "h", 1, "/", "", false))), "format_request_ka close")
+}
+
+test "pipelined requests split without losing bytes" {
+  let r1 = "PUT /items/a HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello"
+  let r2 = "GET /items/a?x=1 HTTP/1.1\r\nHost: h\r\n\r\n"
+  let r3 = "POST /c HTTP/1.1\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\r\n0\r\n\r\n"
+  let partial = "DELETE /items/a HTTP/1.1\r\nContent-Le"
+  let mut buf = r1 + r2 + "\r\n" + r3 + partial
+  let got : Array[HttpRequest] = []
+  while true {
+    let n = request_len(buf)
+    if n < 0 {
+      break
+    }
+    got.push(req_ok(buf.slice(skip_blank_lines(buf), n)))
+    buf = buf.slice(n, buf.length())
+  }
+  debug_assert(got.length() == 3, "three complete requests: " + got.length().to_string())
+  debug_assert(got[0].method == "PUT" && got[0].body == "hello", "first body")
+  debug_assert(got[1].method == "GET" && got[1].query == "x=1" && got[1].body == "", "second, no body")
+  debug_assert(got[2].method == "POST" && got[2].body == "abc", "third, chunked")
+  debug_assert(buf == partial, "partial fourth request kept: " + buf)
+  debug_assert(request_len(buf + "ngth: 0\r\n\r\n") == partial.length() + 11, "completed fourth")
+  debug_assert(request_len("") == -1 && request_len("\r\n") == -1, "nothing yet")
+  debug_assert(request_len("POST / HTTP/1.1\r\nContent-Length: 4\r\n\r\nab") == -1, "body incomplete")
+  let two = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nokHTTP/1.1 204 No Content\r\n\r\n"
+  let first = response_len(two)
+  debug_assert(first == 40, "response length " + first.to_string())
+  debug_assert(resp_ok(two.slice(0, first)).body == "ok", "first response body")
+  debug_assert(response_len(two.slice(first, two.length())) == two.length() - first, "204 has no body")
+  debug_assert(response_len("HTTP/1.1 200 OK\r\n\r\nstreaming") == -1, "unframed response runs to close")
+}

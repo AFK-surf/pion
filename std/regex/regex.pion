@@ -1,0 +1,930 @@
+///| std/regex: linear-time regular expressions (pure Pion).
+///|
+///| Patterns compile to a Thompson NFA program run by a Pike VM: every input
+///| byte is visited once per NFA state, so matching is O(len(text) x len(program))
+///| whatever the pattern. There is no backtracking, hence no ReDoS: `(a?){25}a{25}`,
+///| `(a*)*b` or `(x+x+)+y` stay linear.
+///|
+///| Syntax (UTF-8 text, byte-oriented engine that keeps multi-byte characters whole):
+///|   literals, `.` (any character except `\n`), `\d \D \w \W \s \S` (ASCII classes),
+///|   `\n \t \r \f \v`, `\` + any ASCII punctuation (e.g. `\. \\ \( \[ \*`),
+///|   classes `[a-z0-9_]`, `[^...]` (members ASCII; positive classes may also list
+///|   non-ASCII characters), groups `(...)` and `(?:...)`, alternation `a|b`,
+///|   greedy `* + ? {n} {n,} {n,m}` and lazy `*? +? ?? {n,m}?` quantifiers (counts
+///|   up to 1000), anchors `^` (start of text) and `$` (end of text).
+///| Matches are leftmost-first (Perl/RE2 order). Groups do not capture.
+
+pub struct Regex {
+  pub pattern : String
+  ops : Array[Int]
+  xs : Array[Int]
+  ys : Array[Int]
+  bits : Array[Int]
+  anchored : Bool
+}
+
+pub struct Match {
+  pub start : Int
+  pub end : Int
+  pub text : String
+}
+
+let OP_BYTE : Int = 0
+let OP_CLASS : Int = 1
+let OP_SPLIT : Int = 2
+let OP_JMP : Int = 3
+let OP_ASSERT : Int = 4
+let OP_MATCH : Int = 5
+
+/// Largest repetition count in `{n,m}`.
+pub let MAX_REPEAT : Int = 1000
+
+/// Largest compiled program (instructions).
+pub let MAX_PROGRAM : Int = 100000
+
+enum Node {
+  NEmpty
+  NByte(Int)
+  NClass(Int)
+  NCat(Array[Node])
+  NAlt(Array[Node])
+  NRep(Node, Int, Int, Bool)
+  NBol
+  NEol
+}
+
+struct Parser {
+  src : String
+  mut pos : Int
+  bits : Array[Int]
+  mut mb_ready : Bool
+  mut c_cont : Int
+  mut c_lead2 : Int
+  mut c_lead3 : Int
+  mut c_lead4 : Int
+}
+
+// ---------------------------------------------------------------------------
+// Character classes: 256 flags per class in `bits`.
+
+fn new_class(p : Parser) -> Int {
+  let k = p.bits.length() / 256
+  let mut i = 0
+  while i < 256 {
+    p.bits.push(0)
+    i = i + 1
+  }
+  k
+}
+
+fn class_add_range(p : Parser, k : Int, lo : Int, hi : Int) -> Unit {
+  let mut c = lo
+  while c <= hi {
+    p.bits[k * 256 + c] = 1
+    c = c + 1
+  }
+}
+
+fn is_digit(c : Int) -> Bool {
+  c >= 48 && c <= 57
+}
+
+fn is_word(c : Int) -> Bool {
+  is_digit(c) || (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+fn is_space(c : Int) -> Bool {
+  c == 32 || (c >= 9 && c <= 13)
+}
+
+/// Adds the ASCII members of `\d`/`\w`/`\s` (kind `d`/`w`/`s`), or of their
+/// complement when `negate`.
+fn class_add_perl(p : Parser, k : Int, kind : Int, negate : Bool) -> Unit {
+  let mut c = 0
+  while c < 128 {
+    let inside = if kind == 100 {
+      is_digit(c)
+    } else if kind == 119 {
+      is_word(c)
+    } else {
+      is_space(c)
+    }
+    if inside != negate {
+      p.bits[k * 256 + c] = 1
+    }
+    c = c + 1
+  }
+}
+
+/// Any well-formed multi-byte UTF-8 character.
+fn multibyte_any(p : Parser) -> Node {
+  if !p.mb_ready {
+    p.c_cont = new_class(p)
+    class_add_range(p, p.c_cont, 128, 191)
+    p.c_lead2 = new_class(p)
+    class_add_range(p, p.c_lead2, 194, 223)
+    p.c_lead3 = new_class(p)
+    class_add_range(p, p.c_lead3, 224, 239)
+    p.c_lead4 = new_class(p)
+    class_add_range(p, p.c_lead4, 240, 244)
+    p.mb_ready = true
+  }
+  let cont = NClass(p.c_cont)
+  NAlt([
+    NCat([NClass(p.c_lead2), cont]),
+    NCat([NClass(p.c_lead3), cont, cont]),
+    NCat([NClass(p.c_lead4), cont, cont, cont]),
+  ])
+}
+
+/// An ASCII class `k` plus every multi-byte character.
+fn with_multibyte(p : Parser, k : Int) -> Node {
+  NAlt([NClass(k), multibyte_any(p)])
+}
+
+// ---------------------------------------------------------------------------
+// Parser: pattern text -> Node.
+
+fn perr(p : Parser, msg : String) -> String {
+  msg + " at offset " + p.pos.to_string() + " in `" + p.src + "`"
+}
+
+fn peek(p : Parser) -> Int {
+  if p.pos < p.src.length() {
+    p.src.code_unit_at(p.pos)
+  } else {
+    -1
+  }
+}
+
+/// Byte length of the UTF-8 sequence led by `c` (1 for ASCII or stray bytes).
+fn utf8_len(c : Int) -> Int {
+  if c >= 240 && c <= 247 {
+    4
+  } else if c >= 224 {
+    if c <= 239 {
+      3
+    } else {
+      1
+    }
+  } else if c >= 192 {
+    2
+  } else {
+    1
+  }
+}
+
+/// The literal character at `p.pos` (whole UTF-8 sequence) as byte nodes.
+fn literal_char(p : Parser) -> Node {
+  let c = p.src.code_unit_at(p.pos)
+  let mut len = utf8_len(c)
+  if p.pos + len > p.src.length() {
+    len = 1
+  }
+  if len == 1 {
+    p.pos = p.pos + 1
+    return NByte(c)
+  }
+  let parts : Array[Node] = []
+  let mut i = 0
+  while i < len {
+    parts.push(NByte(p.src.code_unit_at(p.pos + i)))
+    i = i + 1
+  }
+  p.pos = p.pos + len
+  NCat(parts)
+}
+
+/// Value of a single-character escape (`\n`, `\.`, ...), or -1 if unknown.
+fn escape_literal(c : Int) -> Int {
+  if c == 110 {
+    10
+  } else if c == 116 {
+    9
+  } else if c == 114 {
+    13
+  } else if c == 102 {
+    12
+  } else if c == 118 {
+    11
+  } else if c >= 33 && c <= 126 && !is_word(c) {
+    c
+  } else if c == 32 {
+    32
+  } else {
+    -1
+  }
+}
+
+fn is_perl_class(c : Int) -> Bool {
+  c == 100 || c == 68 || c == 119 || c == 87 || c == 115 || c == 83
+}
+
+fn lower_kind(c : Int) -> Int {
+  if c < 97 {
+    c + 32
+  } else {
+    c
+  }
+}
+
+fn parse_escape(p : Parser) -> Result[Node, String] {
+  // p.pos is at the backslash
+  if p.pos + 1 >= p.src.length() {
+    return Err(perr(p, "trailing backslash"))
+  }
+  let c = p.src.code_unit_at(p.pos + 1)
+  if is_perl_class(c) {
+    p.pos = p.pos + 2
+    let negate = c < 97
+    let k = new_class(p)
+    class_add_perl(p, k, lower_kind(c), negate)
+    if negate {
+      return Ok(with_multibyte(p, k))
+    }
+    return Ok(NClass(k))
+  }
+  let v = escape_literal(c)
+  if v < 0 {
+    return Err(perr(p, "unknown escape `\\" + p.src.slice(p.pos + 1, p.pos + 2) + "`"))
+  }
+  p.pos = p.pos + 2
+  Ok(NByte(v))
+}
+
+/// One class member byte (literal or escaped) for a range end; -2 when the
+/// member is a Perl class, -3 when non-ASCII.
+fn class_atom(p : Parser) -> Result[Int, String] {
+  let c = p.src.code_unit_at(p.pos)
+  if c == 92 {
+    if p.pos + 1 >= p.src.length() {
+      return Err(perr(p, "trailing backslash"))
+    }
+    let e = p.src.code_unit_at(p.pos + 1)
+    if is_perl_class(e) {
+      return Ok(-2)
+    }
+    let v = escape_literal(e)
+    if v < 0 {
+      return Err(perr(p, "unknown escape `\\" + p.src.slice(p.pos + 1, p.pos + 2) + "`"))
+    }
+    p.pos = p.pos + 2
+    return Ok(v)
+  }
+  if c >= 128 {
+    return Ok(-3)
+  }
+  p.pos = p.pos + 1
+  Ok(c)
+}
+
+fn parse_class(p : Parser) -> Result[Node, String] {
+  let open = p.pos
+  p.pos = p.pos + 1
+  let mut negate = false
+  if peek(p) == 94 {
+    negate = true
+    p.pos = p.pos + 1
+  }
+  let k = new_class(p)
+  let extras : Array[Node] = []
+  let mut any_multibyte = false
+  let mut first = true
+  while true {
+    let c = peek(p)
+    if c < 0 {
+      p.pos = open
+      return Err(perr(p, "missing closing `]` for character class"))
+    }
+    if c == 93 && !first {
+      p.pos = p.pos + 1
+      break
+    }
+    first = false
+    let lo = class_atom(p)?
+    if lo == -2 {
+      let e = p.src.code_unit_at(p.pos + 1)
+      p.pos = p.pos + 2
+      class_add_perl(p, k, lower_kind(e), e < 97)
+      if e < 97 {
+        any_multibyte = true
+      }
+      continue
+    }
+    if lo == -3 {
+      if negate {
+        return Err(perr(p, "non-ASCII character in negated class"))
+      }
+      let start = p.pos
+      let ch = literal_char(p)
+      if peek(p) == 45 && p.pos + 1 < p.src.length() && p.src.code_unit_at(p.pos + 1) != 93 {
+        p.pos = start
+        return Err(perr(p, "non-ASCII range in character class"))
+      }
+      extras.push(ch)
+      continue
+    }
+    if peek(p) == 45 && p.pos + 1 < p.src.length() && p.src.code_unit_at(p.pos + 1) != 93 {
+      p.pos = p.pos + 1
+      let hi = class_atom(p)?
+      if hi == -2 || hi == -3 {
+        return Err(perr(p, "invalid character class range end"))
+      }
+      if hi < lo {
+        return Err(perr(p, "invalid character class range"))
+      }
+      class_add_range(p, k, lo, hi)
+    } else {
+      class_add_range(p, k, lo, lo)
+    }
+  }
+  if negate {
+    let mut c = 0
+    while c < 128 {
+      p.bits[k * 256 + c] = 1 - p.bits[k * 256 + c]
+      c = c + 1
+    }
+    return Ok(with_multibyte(p, k))
+  }
+  if any_multibyte {
+    extras.push(multibyte_any(p))
+  }
+  if extras.length() == 0 {
+    return Ok(NClass(k))
+  }
+  let alts : Array[Node] = [NClass(k)]
+  let mut i = 0
+  while i < extras.length() {
+    alts.push(extras[i])
+    i = i + 1
+  }
+  Ok(NAlt(alts))
+}
+
+fn parse_atom(p : Parser) -> Result[Node, String] {
+  let c = peek(p)
+  if c == 40 {
+    let open = p.pos
+    p.pos = p.pos + 1
+    if peek(p) == 63 {
+      if p.pos + 1 < p.src.length() && p.src.code_unit_at(p.pos + 1) == 58 {
+        p.pos = p.pos + 2
+      } else {
+        return Err(perr(p, "unsupported group flag"))
+      }
+    }
+    let inner = parse_alt(p)?
+    if peek(p) != 41 {
+      p.pos = open
+      return Err(perr(p, "missing closing `)`"))
+    }
+    p.pos = p.pos + 1
+    return Ok(inner)
+  }
+  if c == 91 {
+    return parse_class(p)
+  }
+  if c == 46 {
+    p.pos = p.pos + 1
+    let k = new_class(p)
+    class_add_range(p, k, 0, 9)
+    class_add_range(p, k, 11, 127)
+    return Ok(with_multibyte(p, k))
+  }
+  if c == 92 {
+    return parse_escape(p)
+  }
+  if c == 94 {
+    p.pos = p.pos + 1
+    return Ok(NBol)
+  }
+  if c == 36 {
+    p.pos = p.pos + 1
+    return Ok(NEol)
+  }
+  if c == 42 || c == 43 || c == 63 {
+    return Err(perr(p, "missing argument to repetition operator"))
+  }
+  Ok(literal_char(p))
+}
+
+/// Digits at `p.pos` as a number (-1 when there are none, -2 when > MAX_REPEAT).
+fn parse_count(p : Parser) -> Int {
+  let start = p.pos
+  let mut v = 0
+  while p.pos < p.src.length() && is_digit(p.src.code_unit_at(p.pos)) {
+    if v <= MAX_REPEAT {
+      v = v * 10 + (p.src.code_unit_at(p.pos) - 48)
+    }
+    p.pos = p.pos + 1
+  }
+  if p.pos == start {
+    -1
+  } else if v > MAX_REPEAT {
+    -2
+  } else {
+    v
+  }
+}
+
+/// `{n}`, `{n,}` or `{n,m}` at `p.pos`: `Ok(Some((n, m)))` (m = -1 unbounded),
+/// `Ok(None)` (position unchanged) when the brace is not a quantifier.
+fn parse_braces(p : Parser) -> Result[Option[(Int, Int)], String] {
+  let open = p.pos
+  p.pos = p.pos + 1
+  let lo = parse_count(p)
+  if lo == -1 {
+    p.pos = open
+    return Ok(None)
+  }
+  let mut hi = lo
+  if peek(p) == 44 {
+    p.pos = p.pos + 1
+    if peek(p) == 125 {
+      hi = -1
+    } else {
+      hi = parse_count(p)
+      if hi == -1 {
+        p.pos = open
+        return Ok(None)
+      }
+    }
+  }
+  if peek(p) != 125 {
+    p.pos = open
+    return Ok(None)
+  }
+  p.pos = p.pos + 1
+  if lo == -2 || hi == -2 {
+    p.pos = open
+    return Err(perr(p, "repetition count above " + MAX_REPEAT.to_string()))
+  }
+  if hi != -1 && hi < lo {
+    p.pos = open
+    return Err(perr(p, "invalid repetition range"))
+  }
+  Ok(Some((lo, hi)))
+}
+
+fn parse_repeat(p : Parser) -> Result[Node, String] {
+  let mut node = parse_atom(p)?
+  while true {
+    let c = peek(p)
+    let mut lo = 0
+    let mut hi = -1
+    if c == 42 {
+      p.pos = p.pos + 1
+    } else if c == 43 {
+      lo = 1
+      p.pos = p.pos + 1
+    } else if c == 63 {
+      hi = 1
+      p.pos = p.pos + 1
+    } else if c == 123 {
+      match parse_braces(p)? {
+        Some(r) => {
+          lo = r.0
+          hi = r.1
+        }
+        None => break
+      }
+    } else {
+      break
+    }
+    let mut greedy = true
+    if peek(p) == 63 {
+      greedy = false
+      p.pos = p.pos + 1
+    }
+    node = NRep(node, lo, hi, greedy)
+  }
+  Ok(node)
+}
+
+fn parse_cat(p : Parser) -> Result[Node, String] {
+  let items : Array[Node] = []
+  while true {
+    let c = peek(p)
+    if c < 0 || c == 124 || c == 41 {
+      break
+    }
+    items.push(parse_repeat(p)?)
+  }
+  if items.length() == 0 {
+    return Ok(NEmpty)
+  }
+  if items.length() == 1 {
+    return Ok(items[0])
+  }
+  Ok(NCat(items))
+}
+
+fn parse_alt(p : Parser) -> Result[Node, String] {
+  let first = parse_cat(p)?
+  if peek(p) != 124 {
+    return Ok(first)
+  }
+  let branches : Array[Node] = [first]
+  while peek(p) == 124 {
+    p.pos = p.pos + 1
+    branches.push(parse_cat(p)?)
+  }
+  Ok(NAlt(branches))
+}
+
+// ---------------------------------------------------------------------------
+// Compiler: Node -> program (ops / xs / ys).
+
+struct Prog {
+  ops : Array[Int]
+  xs : Array[Int]
+  ys : Array[Int]
+}
+
+fn inst(g : Prog, op : Int, x : Int, y : Int) -> Int {
+  g.ops.push(op)
+  g.xs.push(x)
+  g.ys.push(y)
+  g.ops.length() - 1
+}
+
+/// `SPLIT` at `at` choosing `body` (= at + 1) or `out`, body first when greedy.
+fn patch_split(g : Prog, at : Int, out : Int, greedy : Bool) -> Unit {
+  if greedy {
+    g.xs[at] = at + 1
+    g.ys[at] = out
+  } else {
+    g.xs[at] = out
+    g.ys[at] = at + 1
+  }
+}
+
+fn emit(g : Prog, n : Node) -> Result[Unit, String] {
+  if g.ops.length() > MAX_PROGRAM {
+    return Err("regex program too large (over " + MAX_PROGRAM.to_string() + " instructions)")
+  }
+  match n {
+    NEmpty => Ok(())
+    NByte(b) => {
+      let _ = inst(g, OP_BYTE, b, 0)
+      Ok(())
+    }
+    NClass(k) => {
+      let _ = inst(g, OP_CLASS, k, 0)
+      Ok(())
+    }
+    NBol => {
+      let _ = inst(g, OP_ASSERT, 0, 0)
+      Ok(())
+    }
+    NEol => {
+      let _ = inst(g, OP_ASSERT, 1, 0)
+      Ok(())
+    }
+    NCat(items) => {
+      let mut i = 0
+      while i < items.length() {
+        emit(g, items[i])?
+        i = i + 1
+      }
+      Ok(())
+    }
+    NAlt(branches) => {
+      let jumps : Array[Int] = []
+      let last = branches.length() - 1
+      let mut i = 0
+      while i < last {
+        let sp = inst(g, OP_SPLIT, 0, 0)
+        emit(g, branches[i])?
+        jumps.push(inst(g, OP_JMP, 0, 0))
+        patch_split(g, sp, g.ops.length(), true)
+        i = i + 1
+      }
+      emit(g, branches[last])?
+      let end = g.ops.length()
+      let mut j = 0
+      while j < jumps.length() {
+        g.xs[jumps[j]] = end
+        j = j + 1
+      }
+      Ok(())
+    }
+    NRep(body, lo, hi, greedy) => {
+      if hi == -1 {
+        let mut i = 0
+        while i + 1 < lo {
+          emit(g, body)?
+          i = i + 1
+        }
+        if lo >= 1 {
+          // x+ : L: x; SPLIT L, out
+          let top = g.ops.length()
+          emit(g, body)?
+          let sp = inst(g, OP_SPLIT, 0, 0)
+          if greedy {
+            g.xs[sp] = top
+            g.ys[sp] = sp + 1
+          } else {
+            g.xs[sp] = sp + 1
+            g.ys[sp] = top
+          }
+        } else {
+          // x* : L: SPLIT body, out; body: x; JMP L
+          let sp = inst(g, OP_SPLIT, 0, 0)
+          emit(g, body)?
+          let _ = inst(g, OP_JMP, sp, 0)
+          patch_split(g, sp, g.ops.length(), greedy)
+        }
+      } else {
+        let mut i = 0
+        while i < lo {
+          emit(g, body)?
+          i = i + 1
+        }
+        while i < hi {
+          let sp = inst(g, OP_SPLIT, 0, 0)
+          emit(g, body)?
+          patch_split(g, sp, g.ops.length(), greedy)
+          i = i + 1
+        }
+      }
+      Ok(())
+    }
+  }
+}
+
+fn starts_anchored(n : Node) -> Bool {
+  match n {
+    NBol => true
+    NCat(items) => items.length() > 0 && starts_anchored(items[0])
+    _ => false
+  }
+}
+
+/// Compiles `pattern`; errors name the problem and its byte offset.
+pub fn compile(pattern : String) -> Result[Regex, String] {
+  let p = Parser::{
+    src: pattern,
+    pos: 0,
+    bits: [],
+    mb_ready: false,
+    c_cont: 0,
+    c_lead2: 0,
+    c_lead3: 0,
+    c_lead4: 0,
+  }
+  let node = parse_alt(p)?
+  if p.pos < pattern.length() {
+    return Err(perr(p, "unmatched `)`"))
+  }
+  let g = Prog::{ ops: [], xs: [], ys: [] }
+  emit(g, node)?
+  let _ = inst(g, OP_MATCH, 0, 0)
+  if g.ops.length() > MAX_PROGRAM {
+    return Err("regex program too large (over " + MAX_PROGRAM.to_string() + " instructions)")
+  }
+  Ok(Regex::{
+    pattern: pattern,
+    ops: g.ops,
+    xs: g.xs,
+    ys: g.ys,
+    bits: p.bits,
+    anchored: starts_anchored(node),
+  })
+}
+
+/// Number of NFA instructions (the per-byte cost bound).
+pub fn program_size(re : Regex) -> Int {
+  re.ops.length()
+}
+
+// ---------------------------------------------------------------------------
+// Pike VM.
+
+struct Vm {
+  mark : Array[Int]
+  stack : Array[Int]
+  cpc : Array[Int]
+  cst : Array[Int]
+  npc : Array[Int]
+  nst : Array[Int]
+}
+
+fn new_vm(re : Regex) -> Vm {
+  let m = re.ops.length()
+  let mark : Array[Int] = []
+  let stack : Array[Int] = []
+  let mut i = 0
+  while i < m {
+    mark.push(-1)
+    stack.push(0)
+    stack.push(0)
+    i = i + 1
+  }
+  stack.push(0)
+  stack.push(0)
+  Vm::{ mark: mark, stack: stack, cpc: [], cst: [], npc: [], nst: [] }
+}
+
+/// Follows the epsilon closure of `pc0` at `pos`, appending the consuming and
+/// MATCH states to (`lpc`, `lst`) in priority order; `gen` marks visited states.
+fn add_thread(
+  re : Regex,
+  vm : Vm,
+  pc0 : Int,
+  st : Int,
+  pos : Int,
+  n : Int,
+  gen : Int,
+  lpc : Array[Int],
+  lst : Array[Int],
+) -> Unit {
+  let stack = vm.stack
+  let mark = vm.mark
+  stack[0] = pc0
+  let mut sp = 1
+  while sp > 0 {
+    sp = sp - 1
+    let pc = stack[sp]
+    if mark[pc] == gen {
+      continue
+    }
+    mark[pc] = gen
+    let op = re.ops[pc]
+    if op == OP_JMP {
+      stack[sp] = re.xs[pc]
+      sp = sp + 1
+    } else if op == OP_SPLIT {
+      stack[sp] = re.ys[pc]
+      stack[sp + 1] = re.xs[pc]
+      sp = sp + 2
+    } else if op == OP_ASSERT {
+      let ok = if re.xs[pc] == 0 { pos == 0 } else { pos == n }
+      if ok {
+        stack[sp] = pc + 1
+        sp = sp + 1
+      }
+    } else {
+      lpc.push(pc)
+      lst.push(st)
+    }
+  }
+}
+
+/// Leftmost-first match starting at or after `from`: (start, end) or (-1, -1).
+/// With `any_match` the scan stops at the first accepting state.
+fn pike(re : Regex, text : String, from : Int, any_match : Bool) -> (Int, Int) {
+  let n = text.length()
+  let vm = new_vm(re)
+  let mut cpc = vm.cpc
+  let mut cst = vm.cst
+  let mut npc = vm.npc
+  let mut nst = vm.nst
+  let mut gen = 0
+  let mut best_s = -1
+  let mut best_e = -1
+  let mut pos = from
+  while true {
+    if best_s < 0 && (!re.anchored || pos == 0) {
+      add_thread(re, vm, 0, pos, pos, n, gen, cpc, cst)
+    }
+    if cpc.length() == 0 {
+      break
+    }
+    let c = if pos < n { text.code_unit_at(pos) } else { -1 }
+    let ngen = gen + 1
+    npc.clear()
+    nst.clear()
+    let mut i = 0
+    while i < cpc.length() {
+      let pc = cpc[i]
+      let op = re.ops[pc]
+      if op == OP_MATCH {
+        best_s = cst[i]
+        best_e = pos
+        if any_match {
+          return (best_s, best_e)
+        }
+        break
+      } else if op == OP_BYTE {
+        if c == re.xs[pc] {
+          add_thread(re, vm, pc + 1, cst[i], pos + 1, n, ngen, npc, nst)
+        }
+      } else if c >= 0 && re.bits[re.xs[pc] * 256 + c] != 0 {
+        add_thread(re, vm, pc + 1, cst[i], pos + 1, n, ngen, npc, nst)
+      }
+      i = i + 1
+    }
+    if pos >= n {
+      break
+    }
+    let tpc = cpc
+    let tst = cst
+    cpc = npc
+    cst = nst
+    npc = tpc
+    nst = tst
+    gen = ngen
+    pos = pos + 1
+  }
+  (best_s, best_e)
+}
+
+fn char_len_at(text : String, i : Int) -> Int {
+  let len = utf8_len(text.code_unit_at(i))
+  if i + len > text.length() {
+    1
+  } else {
+    len
+  }
+}
+
+/// True when `re` matches anywhere in `text`.
+pub fn is_match(re : Regex, text : String) -> Bool {
+  let (s, _) = pike(re, text, 0, true)
+  s >= 0
+}
+
+/// Leftmost-first match starting at byte offset `from` or later.
+pub fn find_at(re : Regex, text : String, from : Int) -> Option[Match] {
+  if from < 0 || from > text.length() {
+    return None
+  }
+  let (s, e) = pike(re, text, from, false)
+  if s < 0 {
+    None
+  } else {
+    Some(Match::{ start: s, end: e, text: text.slice(s, e) })
+  }
+}
+
+/// Leftmost-first match in `text`.
+pub fn find(re : Regex, text : String) -> Option[Match] {
+  find_at(re, text, 0)
+}
+
+/// Every non-overlapping match, left to right; an empty match right after the
+/// previous match is skipped (Go/RE2 semantics).
+pub fn find_all(re : Regex, text : String) -> Array[Match] {
+  let out : Array[Match] = []
+  let n = text.length()
+  let mut pos = 0
+  let mut prev_end = -1
+  while pos <= n {
+    match find_at(re, text, pos) {
+      None => break
+      Some(m) => {
+        if m.end == m.start {
+          if m.start != prev_end {
+            out.push(m)
+          }
+          if m.start >= n {
+            break
+          }
+          pos = m.start + char_len_at(text, m.start)
+        } else {
+          out.push(m)
+          pos = m.end
+        }
+        prev_end = m.end
+      }
+    }
+  }
+  out
+}
+
+/// Replaces every match of `re` (as `find_all`) with the literal `repl`.
+pub fn replace_all(re : Regex, text : String, repl : String) -> String {
+  let ms = find_all(re, text)
+  if ms.length() == 0 {
+    return text
+  }
+  let sb = StringBuilder()
+  let mut last = 0
+  let mut i = 0
+  while i < ms.length() {
+    let m = ms[i]
+    sb.write_string(text.slice(last, m.start))
+    sb.write_string(repl)
+    last = m.end
+    i = i + 1
+  }
+  sb.write_string(text.slice(last, text.length()))
+  sb.to_string()
+}
+
+/// Escapes every regex metacharacter of `s`, so `compile(escape(s))` matches `s` literally.
+pub fn escape(s : String) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c == 92 || c == 46 || c == 43 || c == 42 || c == 63 || c == 40 || c == 41 || c == 124 ||
+    c == 91 || c == 93 || c == 123 || c == 125 || c == 94 || c == 36 {
+      sb.write_char('\\')
+    }
+    sb.write_string(s.slice(i, i + 1))
+    i = i + 1
+  }
+  sb.to_string()
+}
