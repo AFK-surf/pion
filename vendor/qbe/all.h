@@ -277,6 +277,8 @@ struct Blk {
 	BSet in[1], out[1], gen[1];
 	int nlive[2];
 	int loop;
+	char hascall;
+	char loopcall;
 	char *name;
 };
 

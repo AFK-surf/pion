@@ -8,6 +8,8 @@ aggreg(Blk *hd, Blk *b)
 	/* aggregate looping information at
 	 * loop headers */
 	bsunion(hd->gen, b->gen);
+	if (b->hascall)
+		hd->loopcall = 1;
 	for (k=0; k<2; k++)
 		if (b->nlive[k] > hd->nlive[k])
 			hd->nlive[k] = b->nlive[k];
@@ -46,6 +48,15 @@ fillcost(Fn *fn)
 	Tmp *t;
 	Phi *p;
 
+	for (b=fn->start; b; b=b->link) {
+		b->hascall = 0;
+		b->loopcall = 0;
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
+			if (i->op == Ocall) {
+				b->hascall = 1;
+				break;
+			}
+	}
 	loopiter(fn, aggreg);
 	if (debug['S']) {
 		fprintf(stderr, "\n> Loop information:\n");
@@ -391,7 +402,20 @@ spill(Fn *fn)
 				if (bscount(u) < n) {
 					j = bscount(w); /* live through */
 					l = hd->nlive[k];
-					limit(w, n - (l - j), 0);
+					/* Do not pull already-spilled live-through
+					 * temps (unused in loop hd) back into regs. */
+					for (t=Tmp0; bsiter(w, &t); t++)
+						if (tmp[t].slot != -1)
+							bsclr(w, t);
+					if (k == 0 && hd->loopcall) {
+						int ncallee = T.ngpr - T.nrsave[0] - clob;
+						int nlim = (int)n - (l - j);
+						int budget = ncallee - (int)bscount(u);
+						if (budget < nlim)
+							nlim = budget;
+						limit(w, nlim, 0);
+					} else
+						limit(w, (int)n - (l - j), 0);
 					bsunion(u, w);
 				} else
 					limit(u, n, 0);

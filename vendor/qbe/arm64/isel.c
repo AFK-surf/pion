@@ -253,6 +253,18 @@ blkdef(Blk *b, Ins *cur, Ref r, Fn *fn)
 	return d;
 }
 
+static Ins *
+ssadef(Ref r, Fn *fn)
+{
+	if (rtype(r) != RTmp || isreg(r))
+		return 0;
+	if (fn->tmp[r.val].slot != -1)
+		return 0;
+	if (fn->tmp[r.val].ndef != 1)
+		return 0;
+	return fn->tmp[r.val].def;
+}
+
 static int
 iskltmp(Ref r, Fn *fn)
 {
@@ -330,7 +342,7 @@ seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 	for (side = 0; side < 2; side++) {
 		base = side == 0 ? a0 : a1;
 		rhs  = side == 0 ? a1 : a0;
-		shl = blkdef(b, def, rhs, fn);
+		shl = ssadef(rhs, fn);
 		if (!shl || shl->op != Oshl || shl->cls != Kl)
 			continue;
 		idx = shl->arg[0];
@@ -342,7 +354,7 @@ seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 		s = c->bits.i;
 		if (s < 0 || s > 3 || (1 << s) != sz)
 			continue;
-		ext = blkdef(b, shl, idx, fn);
+		ext = (fn->tmp[rhs.val].bid == b->id) ? blkdef(b, shl, idx, fn) : 0;
 		if (ext && ext->op == Oextsw && iskwtmp(ext->arg[0], fn)) {
 			vgrow(&fn->mem, ++fn->nmem);
 			m = &fn->mem[fn->nmem - 1];
@@ -655,6 +667,11 @@ arm64_isel(Fn *fn)
 			sel(*i, b, i, fn);
 		}
 		idup(b, curi, &insb[NIns]-curi);
+		for (n=0; n<b->nins; n++) {
+			Ref to = b->ins[n].to;
+			if (rtype(to) == RTmp && !isreg(to) && fn->tmp[to.val].ndef == 1)
+				fn->tmp[to.val].def = &b->ins[n];
+		}
 	}
 
 	if (debug['I']) {

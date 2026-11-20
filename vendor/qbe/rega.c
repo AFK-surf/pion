@@ -44,7 +44,7 @@ sethint(int t, int r)
 	Tmp *p;
 
 	p = &tmp[phicls(t, tmp)];
-	if (p->hint.r == -1 || p->hint.w > loop) {
+	if (p->hint.r == -1 || p->hint.w < loop) {
 		p->hint.r = r;
 		p->hint.w = loop;
 		tmp[t].visit = -1;
@@ -457,9 +457,11 @@ carve(const void *a, const void *b)
 	 * better than the simple postorder */
 	ba = *(Blk**)a;
 	bb = *(Blk**)b;
-	if (ba->loop == bb->loop)
-		return ba->id > bb->id ? -1 : ba->id < bb->id;
-	return ba->loop > bb->loop ? -1 : +1;
+	if (ba->loop != bb->loop)
+		return ba->loop > bb->loop ? -1 : +1;
+	if ((ba->jmp.type == Jjtbl) != (bb->jmp.type == Jjtbl))
+		return ba->jmp.type == Jjtbl ? -1 : +1;
+	return ba->id > bb->id ? -1 : ba->id < bb->id;
 }
 
 /* comparison function to order temporaries
@@ -471,7 +473,7 @@ prio2(int t1, int t2)
 		return tmp[t1].visit != -1 ? +1 : -1;
 	if ((*hint(t1) ^ *hint(t2)) < 0)
 		return *hint(t1) != -1 ? +1 : -1;
-	return tmp[t1].cost - tmp[t2].cost;
+	return (tmp[t1].cost > tmp[t2].cost) - (tmp[t1].cost < tmp[t2].cost);
 }
 
 /* register allocation
@@ -483,6 +485,7 @@ rega(Fn *fn)
 	int j, t, r, x, rl[Tmp0];
 	Blk *b, *b1, *s, *blist, **blk, **bp;
 	RMap *end, *beg, cur, old, *m;
+	uchar *allocd;
 	Ins *i;
 	Phi *p;
 	uint u, n;
@@ -497,6 +500,7 @@ rega(Fn *fn)
 	blk = alloc(fn->nblk * sizeof blk[0]);
 	end = alloc(fn->nblk * sizeof end[0]);
 	beg = alloc(fn->nblk * sizeof beg[0]);
+	allocd = alloc(fn->nblk * sizeof allocd[0]);
 	for (n=0; n<fn->nblk; n++) {
 		bsinit(end[n].b, fn->ntmp);
 		bsinit(beg[n].b, fn->ntmp);
@@ -504,7 +508,7 @@ rega(Fn *fn)
 	bsinit(cur.b, fn->ntmp);
 	bsinit(old.b, fn->ntmp);
 
-	loop = INT_MAX;
+	loop = 0;
 	for (t=0; t<fn->ntmp; t++) {
 		tmp[t].hint.r = t < Tmp0 ? t : -1;
 		tmp[t].hint.w = loop;
@@ -526,6 +530,33 @@ rega(Fn *fn)
 		b = *bp;
 		n = b->id;
 		loop = b->loop;
+		/* Seed visit registers from the hottest already-allocated
+		 * successor so end[b] aligns directly with beg[s]. */
+		s = 0;
+		if (b->s1 && allocd[b->s1->id])
+			s = b->s1;
+		if (b->s2 && allocd[b->s2->id] && (!s || b->s2->loop > s->loop))
+			s = b->s2;
+		if (s) {
+			for (t=Tmp0; bsiter(b->out, &t); t++) {
+				r = rfind(&beg[s->id], t);
+				if (r != -1)
+					tmp[t].visit = r;
+			}
+			for (p=s->phi; p; p=p->link) {
+				if (rtype(p->to) != RTmp)
+					continue;
+				r = rfind(&beg[s->id], p->to.val);
+				if (r == -1)
+					continue;
+				for (u=0; u<p->narg; u++)
+					if (p->blk[u] == b) {
+						if (rtype(p->arg[u]) == RTmp && p->arg[u].val >= Tmp0)
+							tmp[p->arg[u].val].visit = r;
+						break;
+					}
+			}
+		}
 		cur.n = 0;
 		bszero(cur.b);
 		memset(cur.w, 0, sizeof cur.w);
@@ -558,6 +589,7 @@ rega(Fn *fn)
 			if (rtype(p->to) == RTmp)
 				bsclr(b->in, p->to.val);
 		rcopy(&beg[n], &cur);
+		allocd[n] = 1;
 	}
 
 	/* 3. emit copies shared by multiple edges
