@@ -99,6 +99,9 @@ pub struct QbeMonoReq {
   sym : String
   finfo : FnInfo
   subst : Map[String, Ty]
+  /// Canonical package whose source declares the fn ("" = this package): its
+  /// body's unqualified top-level names resolve in that package.
+  pkg : String
 }
 
 ///|
@@ -134,6 +137,7 @@ pub struct QbeGen {
   mono_seen : Map[String, Bool]
   mono_queue : Array[QbeMonoReq]
   mut mono_emitted : Int
+  mut mono_pkg : String
   mut inline_fns : Map[String, FnDecl]
   mut inline_depth : Int
   inline_stack : Array[String]
@@ -4116,6 +4120,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     mono_seen: Map([]),
     mono_queue: [],
     mono_emitted: 0,
+    mono_pkg: "",
     inline_fns: Map([]),
     inline_depth: 0,
     inline_stack: [],
@@ -5316,6 +5321,8 @@ fn qbe_parse_char_lit(raw : String) -> Int {
     } else {
       c1
     }
+  } else if c0 >= 0x80 {
+    str_scalar_at(raw, 0, host_str_is_utf8())
   } else {
     c0
   }
@@ -8099,6 +8106,18 @@ fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal 
 }
 
 ///|
+/// An import alias naming `g.mono_pkg` (registered under the canonical name
+/// when the importer only knows it by another alias).
+fn qbe_mono_pkg_alias(g : QbeGen) -> String {
+  let canon = g.mono_pkg
+  match g.tc.import_aliases.get(canon) {
+    Some(_) => ()
+    None => g.tc.import_aliases.set(canon, canon)
+  }
+  canon
+}
+
+///|
 fn qbe_emit_mono_call(
   g : QbeGen,
   base_sym : String,
@@ -8107,6 +8126,7 @@ fn qbe_emit_mono_call(
   arg_vals : Array[String],
   arg_tys : Array[Ty],
   arg_borrowed : Array[Bool],
+  decl_pkg : String,
 ) -> QbeVal {
   let mono_sym = qbe_mono_fn_sym(base_sym, finfo.decl.type_params, subst)
   if !g.mono_seen.contains(mono_sym) {
@@ -8115,6 +8135,7 @@ fn qbe_emit_mono_call(
       sym: mono_sym,
       finfo: finfo,
       subst: subst,
+      pkg: decl_pkg,
     })
   }
   let call_args : Array[String] = []
@@ -8961,6 +8982,27 @@ fn qbe_emit_expr(
             )
             return qval("0", TNever)
           }
+          // Inside a fn monomorphized from an imported package's source, its own
+          // unqualified top-level fns and enum variants mean `pkg::name`.
+          if g.mono_pkg != "" {
+            match qbe_lookup_local(g, name) {
+              Some(_) => ()
+              None =>
+                match g.tc.imported_pkgs.get(g.mono_pkg) {
+                  Some(ipkg) =>
+                    if ipkg.tc.fns.contains(name) ||
+                      ipkg.tc.extern_fns.contains(name) ||
+                      ipkg.tc.variant_to_enum.contains(name) {
+                      return qbe_emit_expr(
+                        g,
+                        ECall(EPath(qbe_mono_pkg_alias(g), name, sp), args, sp),
+                        expected,
+                      )
+                    }
+                  None => ()
+                }
+            }
+          }
           if name == "Some" || name == "Ok" || name == "Err" || g.tc.variant_to_enum.contains(name) {
             return qbe_emit_variant_ctor(g, "", name, args, expected)
           }
@@ -9005,6 +9047,7 @@ fn qbe_emit_expr(
                   arg_vals,
                   arg_tys,
                   arg_borrowed,
+                  "",
                 )
               }
               // Small-function / leaf-function single-pass inlining (same-file only)
@@ -9284,6 +9327,7 @@ fn qbe_emit_expr(
           }
           let mut target_finfo : Option[FnInfo] = None
           let mut target_sym = ""
+          let mut target_pkg = ""
           let qp = split_qual_name(qual)
           let q_alias = qp.prefix
           let q_sub = qp.name
@@ -9303,6 +9347,7 @@ fn qbe_emit_expr(
                   Some(mi) => {
                     target_finfo = Some(qualify_fn_info(ipkg.name, mi))
                     target_sym = qbe_ext_method_sym(ipkg.name, q_sub, mem)
+                    target_pkg = ipkg.name
                   }
                   None => ()
                 }
@@ -9318,6 +9363,7 @@ fn qbe_emit_expr(
                     Some(fi) => {
                       target_finfo = Some(qualify_fn_info(ipkg.name, fi))
                       target_sym = qbe_ext_fn_sym(ipkg.name, mem)
+                      target_pkg = ipkg.name
                     }
                     None =>
                       match ipkg.tc.extern_fns.get(mem) {
@@ -9399,6 +9445,7 @@ fn qbe_emit_expr(
                   arg_vals,
                   arg_tys,
                   arg_borrowed,
+                  target_pkg,
                 )
               }
               let call_args : Array[String] = []
@@ -13329,6 +13376,8 @@ fn qbe_emit_impl_method(g : QbeGen, id : ImplDecl, md : FnDecl) -> String {
 ///|
 fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
   let fd = req.finfo.decl
+  let saved_mono_pkg = g.mono_pkg
+  g.mono_pkg = req.pkg
   let concrete_ptys : Array[Ty] = []
   let mut pi = 0
   while pi < req.finfo.param_tys.length() {
@@ -13386,6 +13435,7 @@ fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
   }
   g.cur_type_subst = Map([])
   g.cur_tparams = []
+  g.mono_pkg = saved_mono_pkg
 
   let out = StringBuilder()
   out.write_string("function ")

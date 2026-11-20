@@ -357,6 +357,8 @@ void m2_rc_dec(void *obj) {
     }
 }
 
+static void m2_freeze_map_entries(M2Map *m);
+
 void m2_rc_freeze(void *obj) {
     if (!obj) return;
     M2Header *hdr = m2_hdr(obj);
@@ -369,6 +371,27 @@ void m2_rc_freeze(void *obj) {
     atomic_fetch_add_explicit(&hdr->shared_rc, rc, memory_order_relaxed);
     hdr->flags |= M2_FLAG_FROZEN;
     hdr->owner_tid = 0;
+    if (hdr->type_tag == M2_TAG_MAP) {
+        m2_freeze_map_entries((M2Map *)obj);
+    }
+}
+
+/* A frozen `Map` (one held by a `Mutex`) is reachable from several threads,
+ * so its entries and every key/value later stored in it are frozen too: their
+ * RC then stays atomic on whichever thread releases them. */
+M2_MINSIZE static void m2_freeze_map_entries(M2Map *m) {
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (m->entries[i].state == 1) {
+            m2_rc_freeze(m->entries[i].key);
+            if (m->val_is_obj) m2_rc_freeze((void *)(uintptr_t)m->entries[i].val);
+        }
+    }
+}
+
+static inline void m2_adopt(void *container, int64_t val) {
+    if (__builtin_expect(m2_hdr(container)->owner_tid == 0, 0)) {
+        m2_rc_freeze((void *)(uintptr_t)val);
+    }
 }
 
 /* ============================================================================
@@ -1242,6 +1265,9 @@ void m2_map_set(void *m_ptr, void *key_str, int64_t val) {
     }
     uint64_t h = m2_str_hash(k);
     M2MapEntry *e = m2_map_probe(m, k, h);
+    if (m->val_is_obj) {
+        m2_adopt(m, val);
+    }
     if (e->state == 1) {
         if (m->val_is_obj) {
             m2_rc_inc((void *)(uintptr_t)val);
@@ -1250,6 +1276,7 @@ void m2_map_set(void *m_ptr, void *key_str, int64_t val) {
         e->val = val;
         return;
     }
+    m2_adopt(m, (int64_t)(uintptr_t)k);
     m2_rc_inc(k);
     if (m->val_is_obj) {
         m2_rc_inc((void *)(uintptr_t)val);

@@ -176,16 +176,13 @@ fn keyword_or_ident(word : String) -> TokenKind {
 ///|
 fn slice_str(s : String, start : Int, end_pos : Int) -> String {
   let sb = StringBuilder()
-  let mut i = start
-  while i < end_pos {
-    sb.write_char(str_code_at(s, i).unsafe_to_char())
-    i = i + 1
-  }
+  sb_write_range(sb, s, start, end_pos)
   sb.to_string()
 }
 
 ///|
 pub fn lex(file : String, source : String) -> LexResult {
+  let utf8 = host_str_is_utf8()
   let tokens : Array[Token] = []
   let diags : Array[Diagnostic] = []
   let len = source.length()
@@ -253,8 +250,9 @@ pub fn lex(file : String, source : String) -> LexResult {
           pos = pos + 2
           col = col + 2
         } else {
-          sb.write_char(c.unsafe_to_char())
-          pos = pos + 1
+          let un = str_scalar_len(source, pos, utf8)
+          sb.write_char(str_scalar_at(source, pos, utf8).unsafe_to_char())
+          pos = pos + un
           col = col + 1
         }
       }
@@ -306,8 +304,9 @@ pub fn lex(file : String, source : String) -> LexResult {
           pos = pos + 2
           col = col + 2
         } else {
-          sb.write_char(c.unsafe_to_char())
-          pos = pos + 1
+          let un = str_scalar_len(source, pos, utf8)
+          sb.write_char(str_scalar_at(source, pos, utf8).unsafe_to_char())
+          pos = pos + un
           col = col + 1
         }
       }
@@ -380,8 +379,9 @@ pub fn lex(file : String, source : String) -> LexResult {
           pos = pos + 2
           col = col + 2
         } else {
-          sb.write_char(c.unsafe_to_char())
-          pos = pos + 1
+          let un = str_scalar_len(source, pos, utf8)
+          sb.write_char(str_scalar_at(source, pos, utf8).unsafe_to_char())
+          pos = pos + un
           col = col + 1
         }
       }
@@ -464,8 +464,9 @@ pub fn lex(file : String, source : String) -> LexResult {
             pos = pos + 2
             col = col + 2
           } else {
-            sb.write_char(c.unsafe_to_char())
-            pos = pos + 1
+            let un = str_scalar_len(source, pos, utf8)
+            sb.write_char(str_scalar_at(source, pos, utf8).unsafe_to_char())
+            pos = pos + un
             col = col + 1
           }
         }

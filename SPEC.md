@@ -17,8 +17,8 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 3. **Compile-Time Data-Race-Free Multithreading**:
    - Native OS threads via structured concurrency (`scope` + `spawn`), `Channel[T]`, `Mutex[T]`, `AtomicInt`.
    - Every type is statically classified as `Send` or `!Send`:
-     - Primitives (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Unit`), `String`, `Channel[T]` (where `T: Send`), `Mutex[T]` (where `T: Send`), `AtomicInt`, and immutable `struct`/`enum` (no `mut` fields, all fields `Send`) are `Send`.
-     - Any `struct` with `mut` fields, `Array[T]`, `Bytes`, `Map[K, V]` are `!Send` by default (must be wrapped in `Mutex[T]` or explicitly transferred via `move` with single-function linear check).
+     - Primitives (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Unit`), `String`, the `World` capability (a frozen handle; spawned workers capture it explicitly to do IO/TCP), `Channel[T]` (where `T: Send`), `Mutex[T]` (where `T: Send`, or `T = Map[String, V]` with `V` a primitive or `String`), `AtomicInt`, and immutable `struct`/`enum` (no `mut` fields, all fields `Send`) are `Send`.
+     - Any `struct` with `mut` fields, `Array[T]`, `Bytes`, `Map[K, V]` are `!Send` by default (must be wrapped in `Mutex[T]` or explicitly transferred via `move` with single-function linear check). A `Map` placed in a `Mutex` is frozen together with its entries, and `m2_map_set` freezes every key/value later stored into a frozen map, so entries released on any thread keep an atomic RC.
      - Capturing a non-`Send` variable in `spawn` or sending a non-`Send` value over `Channel[T]` is a compile-time error (`E_NOT_SEND`).
 4. **Explicit Capability (`World`, Vercel Zero rule)**:
    - Pure functions cannot perform IO, read wall clock, spawn OS processes, or touch the filesystem unless a `World` (or sub-capability) parameter is explicitly in scope.
@@ -83,7 +83,7 @@ Every construct below is valid in BOTH MoonBit (with thin helper aliases where n
   - `Bool`: `true`, `false`
   - `Byte`: `b'a'`, `b'\n'`, `b'\x00'`
   - `Char`: `'a'`, `'\n'`
-  - `String`: `"..."` with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`; MoonBit-compatible interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `Double`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings)
+  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text, kept byte-for-byte by every compiler stage (Stage 0 decodes UTF-16, Stage 1/2 UTF-8 via `str_scalar_at`), with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`; MoonBit-compatible interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `Double`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings)
 - Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`, `import` (and contextual top-level `test`).
 
 ### 3.2 Top-Level Declarations
@@ -179,7 +179,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 - `void* m2_alloc(uint32_t payload_size, uint16_t type_tag, M2DropFn drop_fn);`
 - `void  m2_rc_inc(void *obj);` (no-op if NULL or `M2_FLAG_IMMORTAL`; fast non-atomic if `owner_tid == m2_cur_tid()`, else atomic)
 - `void  m2_rc_dec(void *obj);` (no-op if NULL or `M2_FLAG_IMMORTAL`; frees + calls `drop_fn` when total RC hits 0)
-- `void  m2_rc_freeze(void *obj);` (promotes `owner_tid` to 0 and moves `local_rc` into `shared_rc` before crossing thread boundary)
+- `void  m2_rc_freeze(void *obj);` (promotes `owner_tid` to 0 and moves `local_rc` into `shared_rc` before crossing thread boundary; freezing a `Map` also freezes its keys and object values)
 - `void  m2_panic(const char *msg, const char *file, int32_t line);` (prints concise diagnostic to stderr and `abort()`/`_exit(1)`)
 - `void  m2_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line);`
 
@@ -247,7 +247,7 @@ All symbols use `m2_` prefix and C calling convention (`arm64_apple` / `amd64_sy
 **String-Keyed Hash Map (`M2Map` — open addressing FNV-1a, 64-bit value slots):**
 - `void*   m2_map_new(int32_t val_is_obj);`
 - `int64_t m2_map_len(void *m);`
-- `void    m2_map_set(void *m, void *key_str, int64_t val);`
+- `void    m2_map_set(void *m, void *key_str, int64_t val);` (freezes the key and object value first when the map itself is frozen)
 - `int32_t m2_map_has(void *m, void *key_str);`
 - `int64_t m2_map_get(void *m, void *key_str);` (panics if missing; compiler pairs with `has` or returns Option)
 - `void    m2_map_remove(void *m, void *key_str);`

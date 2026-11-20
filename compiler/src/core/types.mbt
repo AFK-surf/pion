@@ -1184,17 +1184,39 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
 }
 
 ///|
+/// `Map[String, V]` with a primitive or `String` value may live in a `Mutex`:
+/// the runtime freezes a frozen map's entries and everything later stored in
+/// it, so entries inserted or released on any thread keep a correct atomic RC.
+fn is_mutex_shareable_map(t : Ty) -> Bool {
+  match t {
+    TMap(k, v) =>
+      match k {
+        TString =>
+          match v {
+            TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TUnit => true
+            _ => false
+          }
+        _ => false
+      }
+    _ => false
+  }
+}
+
+///|
 fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
   match t {
     TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TUnit => true
     TAtomicInt | TScope | TNever | TError => true
-    TPtr | TArray(_) | TBytes | TMap(_, _) | TStringBuilder | TWorld => false
+    // The `World` capability is a frozen, immutable handle whose IO/TCP
+    // primitives are thread-safe syscalls: spawned workers may capture it.
+    TWorld => true
+    TPtr | TArray(_) | TBytes | TMap(_, _) | TStringBuilder => false
     TParam(_) => false
     TOption(e) => is_send_ty(tc, e, visiting)
     TResult(ok, err) =>
       is_send_ty(tc, ok, visiting) && is_send_ty(tc, err, visiting)
     TChannel(e) => is_send_ty(tc, e, visiting)
-    TMutex(e) => is_send_ty(tc, e, visiting)
+    TMutex(e) => is_send_ty(tc, e, visiting) || is_mutex_shareable_map(e)
     TFn(_, _) => false
     TTuple(elems) => {
       let mut i = 0

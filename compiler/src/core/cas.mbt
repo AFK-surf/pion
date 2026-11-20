@@ -88,20 +88,36 @@ fn sha256_k_table() -> Array[Int] {
 fn str_to_utf8_ints(s : String) -> Array[Int] {
   let out : Array[Int] = []
   let len = s.length()
+  let mut mode = 0
   let mut i = 0
   while i < len {
-    let cp = str_code_at(s, i)
-    if cp < 0x80 {
-      out.push(cp)
-    } else if cp < 0x800 {
+    let c = str_code_at(s, i)
+    if c < 0x80 {
+      out.push(c)
+      i = i + 1
+      continue
+    }
+    if mode == 0 {
+      mode = if host_str_is_utf8() { 1 } else { 2 }
+    }
+    let utf8 = mode == 1
+    // Decode one scalar from the host encoding (UTF-8 bytes in m2, UTF-16
+    // units in MoonBit) and re-encode it, so both hosts emit identical bytes.
+    let cp = str_scalar_at(s, i, utf8)
+    i = i + str_scalar_len(s, i, utf8)
+    if cp < 0x800 {
       out.push(0xC0 | (cp >> 6))
       out.push(0x80 | (cp & 0x3F))
-    } else {
+    } else if cp < 0x10000 {
       out.push(0xE0 | (cp >> 12))
       out.push(0x80 | ((cp >> 6) & 0x3F))
       out.push(0x80 | (cp & 0x3F))
+    } else {
+      out.push(0xF0 | (cp >> 18))
+      out.push(0x80 | ((cp >> 12) & 0x3F))
+      out.push(0x80 | ((cp >> 6) & 0x3F))
+      out.push(0x80 | (cp & 0x3F))
     }
-    i = i + 1
   }
   out
 }
@@ -224,7 +240,7 @@ pub struct CasEntry {
 
 ///|
 pub fn m2_compiler_abi_rev() -> String {
-  "m2c-v0.6"
+  "m2c-v0.7"
 }
 
 ///|

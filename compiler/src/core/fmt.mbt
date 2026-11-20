@@ -30,6 +30,7 @@ fn fmt_write_indent(sb : StringBuilder, level : Int) -> Unit {
 /// while preserving comments and literals verbatim.
 fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
   let sb = StringBuilder()
+  let utf8 = host_str_is_utf8()
   let mut i = start
   let mut in_space = false
   while i < end {
@@ -40,52 +41,28 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
         sb.write_char(' ')
         in_space = false
       }
-      while i < end {
-        sb.write_char(str_code_at(line, i).unsafe_to_char())
-        i = i + 1
-      }
+      sb_write_range(sb, line, i, end)
       break
     }
-    // String literal "..."
-    if c == 34 {
+    // String literal "..." or char / byte literal '...' (also covers the
+    // '...' part of b'...'): copied verbatim up to the matching quote.
+    if c == 34 || c == 39 {
       if in_space {
         sb.write_char(' ')
         in_space = false
       }
-      sb.write_char('"')
+      let lit_start = i
       i = i + 1
       while i < end {
         let sc = str_code_at(line, i)
-        sb.write_char(sc.unsafe_to_char())
         i = i + 1
         if sc == 92 && i < end {
-          sb.write_char(str_code_at(line, i).unsafe_to_char())
           i = i + 1
-        } else if sc == 34 {
+        } else if sc == c {
           break
         }
       }
-      continue
-    }
-    // Char / byte literal '...' (also covers the '...' part of b'...')
-    if c == 39 {
-      if in_space {
-        sb.write_char(' ')
-        in_space = false
-      }
-      sb.write_char('\'')
-      i = i + 1
-      while i < end {
-        let cc = str_code_at(line, i)
-        sb.write_char(cc.unsafe_to_char())
-        i = i + 1
-        if cc == 92 && i < end {
-          sb.write_char(str_code_at(line, i).unsafe_to_char())
-          i = i + 1
-        } else if cc == 39 {
-          break
-        }
-      }
+      sb_write_range(sb, line, lit_start, i)
       continue
     }
     if fmt_is_hspace(c) {
@@ -97,8 +74,13 @@ fn fmt_normalize_line_body(line : String, start : Int, end : Int) -> String {
       sb.write_char(' ')
       in_space = false
     }
-    sb.write_char(c.unsafe_to_char())
-    i = i + 1
+    if c < 0x80 {
+      sb.write_char(c.unsafe_to_char())
+      i = i + 1
+    } else {
+      sb.write_char(str_scalar_at(line, i, utf8).unsafe_to_char())
+      i = i + str_scalar_len(line, i, utf8)
+    }
   }
   sb.to_string()
 }

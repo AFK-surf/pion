@@ -51,6 +51,9 @@ if [ "$BENCH_RC" -ne 0 ]; then
   echo "NOTE: test_rt --bench returned $BENCH_RC (paravirtualized vCPU jitter); continuing functional & MT checks"
 fi
 
+# The KV load client is plain C: build it while `as` is still reachable.
+"$CC" -O2 -pthread -o "$OUT_DIR/bench_load" "$ROOT_DIR/examples/http_kv_service/bench_load.c"
+
 # From here on every object file comes straight from `qbe --obj` (ELF64): a
 # failing `as` first on PATH proves no step assembles text.
 mkdir -p "$TMP_DIR/noas"
@@ -297,5 +300,11 @@ verify_bench binarytrees "stretch=262143 long=131071 total=14592688"
 verify_bench fannkuchredux "73196 38"
 verify_bench mandelbrot_mt "6351041 721219984" -- 4
 verify_bench hashmap_str "200000 208681440 205599 815496841"
+
+# Dogfood: multithreaded HTTP+JSON KV service under real 8 x 500 TCP load (0 errors, exact /stats).
+KV_TEST="$("$M2C" test --json "$ROOT_DIR/examples/http_kv_service")"
+echo "m2c_linux test --json examples/http_kv_service -> $KV_TEST"
+printf '%s' "$KV_TEST" | grep -q '"failed":0'
+BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$M2C" 8 500 8
 
 echo "ALL LINUX X86_64 (amd64_sysv) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"

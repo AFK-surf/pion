@@ -1113,3 +1113,143 @@ test "p13a: m2.toml [link] libs and doc json" {
   let t = @core.doc_package_text(pkg)
   assert_true(str_contains(t, "package docpkg\n  struct P { x: Int }\n"), "doc text: " + t)
 }
+
+///|
+test "p13b: fmt keeps non-ASCII UTF-8 text in strings, comments, chars and code" {
+  let src =
+    "// 中文注释：键值服务   保持原样\n" +
+    "pub fn greet(名 : String) -> String {\n" +
+    "      let   s = \"你好，\" +   名 + \"！🚀\"   // 行尾注释  ✓\n" +
+    "  let c = '中'\n" +
+    "        s\n" +
+    "}\n"
+  let expected =
+    "// 中文注释：键值服务   保持原样\n" +
+    "pub fn greet(名 : String) -> String {\n" +
+    "  let s = \"你好，\" + 名 + \"！🚀\" // 行尾注释  ✓\n" +
+    "  let c = '中'\n" +
+    "  s\n" +
+    "}\n"
+  let out1 = @core.format_source(src)
+  assert_true(out1 == expected, "first pass:\n" + out1)
+  assert_true(@core.format_source(out1) == out1, "idempotent")
+}
+
+///|
+test "p13b: UTF-8 scalar helpers decode the host string encoding" {
+  let s = "a中🚀"
+  let utf8 = @core.host_str_is_utf8()
+  assert_true(!utf8, "Stage 0 MoonBit strings are UTF-16")
+  assert_true(@core.str_scalar_at(s, 0, utf8) == 97, "ascii")
+  assert_true(@core.str_scalar_at(s, 1, utf8) == 0x4E2D, "BMP scalar")
+  assert_true(@core.str_scalar_len(s, 2, utf8) == 2, "surrogate pair is 2 UTF-16 units")
+  assert_true(@core.str_scalar_at(s, 2, utf8) == 0x1F680, "astral scalar")
+  let sb = StringBuilder()
+  @core.sb_write_range(sb, s, 1, s.length())
+  assert_true(sb.to_string() == "中🚀", "verbatim range copy")
+}
+
+///|
+test "p13b: Mutex[Map[String, V]] with flat values is Send, nested values are not" {
+  let ok_src =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let kv : Mutex[Map[String, String]] = Mutex::new(Map::new())\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      let m = kv.lock()\n" +
+    "      m.set(\"k\", \"v\")\n" +
+    "      kv.unlock()\n" +
+    "    })\n" +
+    "  })\n" +
+    "  0\n" +
+    "}\n"
+  let (ok1, json1, _) = check_one(ok_src)
+  assert_true(ok1, "Mutex[Map[String, String]] spawn capture: " + json1)
+  let bad_src =
+    "pub fn main(world : World) -> Int {\n" +
+    "  let kv : Mutex[Map[String, Array[Int]]] = Mutex::new(Map::new())\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      let _ = kv.lock()\n" +
+    "      kv.unlock()\n" +
+    "    })\n" +
+    "  })\n" +
+    "  0\n" +
+    "}\n"
+  let (ok2, json2, _) = check_one(bad_src)
+  assert_true(!ok2 && str_contains(json2, "E_NOT_SEND"), "nested map values stay !Send: " + json2)
+}
+
+///|
+test "p13b: spawned workers may capture the World capability" {
+  let src =
+    "pub fn serve(world : World, fds : Channel[Int]) -> Unit {\n" +
+    "  scope(world, fn(s : Scope) -> Unit {\n" +
+    "    spawn(s, fn() -> Unit {\n" +
+    "      while true {\n" +
+    "        match fds.recv() {\n" +
+    "          Some(fd) => {\n" +
+    "            let _ = tcp_write(world, fd, \"ok\")\n" +
+    "            tcp_close(world, fd)\n" +
+    "          }\n" +
+    "          None => break\n" +
+    "        }\n" +
+    "      }\n" +
+    "    })\n" +
+    "  })\n" +
+    "}\n"
+  let (ok, json, _) = check_one(src)
+  assert_true(ok, "World capture in spawn: " + json)
+}
+
+///|
+test "p13b: imported bounded generic fn resolves its own package's names" {
+  let lib_src =
+    "pub trait Show {\n" +
+    "  show(self : Self) -> String\n" +
+    "}\n" +
+    "pub enum Wrapped {\n" +
+    "  W(String)\n" +
+    "}\n" +
+    "impl Show for Int {\n" +
+    "  fn show(self : Int) -> String { self.to_string() }\n" +
+    "}\n" +
+    "pub fn wrap(s : String) -> String {\n" +
+    "  \"<\" + s + \">\"\n" +
+    "}\n" +
+    "pub fn unwrap(w : Wrapped) -> String {\n" +
+    "  match w {\n" +
+    "    W(s) => s\n" +
+    "  }\n" +
+    "}\n" +
+    "pub fn render[T : Show](v : T) -> String {\n" +
+    "  unwrap(W(wrap(v.show())))\n" +
+    "}\n"
+  let lib_cr = @core.check_source_files_with_imports("lib", ["lib.m2"], [lib_src], [], true)
+  assert_true(lib_cr.diagnostics.length() == 0, "lib check")
+  let lib_imp = @core.imported_pkg_new("lib", lib_cr.tc)
+  let app_src =
+    "import \"lib\" as l\n" +
+    "pub struct P {\n" +
+    "  x : Int\n" +
+    "}\n" +
+    "impl l::Show for P {\n" +
+    "  fn show(self : P) -> String { \"P\" + self.x.to_string() }\n" +
+    "}\n" +
+    "fn wrap(s : String) -> String {\n" +
+    "  s\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  (l::render(P::{ x: 1 }) + l::render(2) + wrap(\"\")).length()\n" +
+    "}\n"
+  let app_cr = @core.check_source_files_with_imports("app", ["app.m2"], [app_src], [lib_imp], true)
+  assert_true(
+    app_cr.diagnostics.length() == 0,
+    "app check: " + @core.check_result_to_json(app_cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_multi(app_cr.pkg, app_cr.tc, false, true, ["lib"]).ssa
+  // The monomorphized `render` bodies call lib's `wrap` / `unwrap`, never app's `wrap`.
+  assert_true(ssa.contains("render__mono"), "render instantiated in app")
+  assert_true(ssa.contains("$m2_pkg_lib_fn_wrap("), "lib::wrap called from the mono body:\n" + ssa)
+  assert_true(ssa.contains("$m2_pkg_lib_fn_unwrap("), "lib::unwrap called from the mono body")
+}

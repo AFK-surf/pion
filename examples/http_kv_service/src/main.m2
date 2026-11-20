@@ -1,0 +1,299 @@
+///| m2-kv: a multithreaded HTTP/1.1 + JSON key-value service.
+///|
+///|   http_kv_service --self-test
+///|   http_kv_service --port <p> --workers <n> --max-reqs <m> [--port-file <path>]
+///|
+///| Server mode listens on 127.0.0.1:<p> (0 = ephemeral; the real port is written
+///| to --port-file, which may be a FIFO the client reads), hands accepted
+///| connections to <n> worker OS threads over a `Channel[Int]`, and after <m>
+///| connections drains the workers and prints the final `/stats` JSON.
+
+import "json"
+import "http"
+
+pub struct Options {
+  self_test : Bool
+  port : Int
+  workers : Int
+  max_reqs : Int
+  port_file : String
+}
+
+fn parse_int(s : String) -> Option[Int] {
+  if s.length() == 0 || s.length() > 9 {
+    return None
+  }
+  let mut v = 0
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    v = v * 10 + (c - 48)
+    i = i + 1
+  }
+  Some(v)
+}
+
+fn parse_options(args : Array[String]) -> Result[Options, String] {
+  let mut self_test = false
+  let mut port = 0
+  let mut workers = 4
+  let mut max_reqs = 0
+  let mut port_file = ""
+  let mut i = 1
+  while i < args.length() {
+    let a = args[i]
+    if a == "--self-test" {
+      self_test = true
+      i = i + 1
+      continue
+    }
+    if i + 1 >= args.length() {
+      return Err("missing value for " + a)
+    }
+    let v = args[i + 1]
+    if a == "--port-file" {
+      port_file = v
+    } else {
+      let n = match parse_int(v) {
+        Some(n) => n
+        None => return Err("invalid number for " + a + ": " + v)
+      }
+      if a == "--port" {
+        port = n
+      } else if a == "--workers" {
+        workers = n
+      } else if a == "--max-reqs" {
+        max_reqs = n
+      } else {
+        return Err("unknown option " + a)
+      }
+    }
+    i = i + 2
+  }
+  if !self_test && (workers < 1 || workers > 256 || max_reqs < 1 || port > 65535) {
+    return Err("need --workers 1..256, --max-reqs >= 1 and --port 0..65535")
+  }
+  Ok(Options::{
+    self_test: self_test,
+    port: port,
+    workers: workers,
+    max_reqs: max_reqs,
+    port_file: port_file,
+  })
+}
+
+/// Serves one connection: read the request, route it, reply, close.
+fn serve_conn(world : World, svc : Service, fd : Int) -> Unit {
+  let resp = match http::read_http_request(world, fd) {
+    Ok(req) => handle(svc, req.method, req.path, req.body)
+    Err(e) => http::err_json(400, e)
+  }
+  let _ = http::write_http_response(world, fd, resp)
+  tcp_close(world, fd)
+}
+
+fn serve(world : World, opts : Options) -> Int {
+  let lfd = tcp_listen(world, "127.0.0.1", opts.port)
+  if lfd < 0 {
+    io_eprintln(world, "listen on 127.0.0.1:" + opts.port.to_string() + " failed")
+    return 1
+  }
+  let port = tcp_local_port(world, lfd)
+  if opts.port_file.length() > 0 {
+    match fs_write(world, opts.port_file, port.to_string() + "\n") {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "write port file: " + e)
+        return 1
+      }
+    }
+  }
+  io_eprintln(
+    world,
+    "m2-kv listening on 127.0.0.1:" + port.to_string() + " workers=" + opts.workers.to_string(),
+  )
+  let svc = new_service()
+  let conns : Channel[Int] = Channel::new(256)
+  let accept_errors = AtomicInt::new(0)
+  let served = AtomicInt::new(0)
+  let max_reqs = opts.max_reqs
+  let workers = opts.workers
+  scope(world, fn(s : Scope) -> Unit {
+    let mut wi = 0
+    while wi < workers {
+      spawn(s, fn() -> Unit {
+        while true {
+          match conns.recv() {
+            Some(fd) => {
+              serve_conn(world, svc, fd)
+              let _ = served.fetch_add(1)
+            }
+            None => break
+          }
+        }
+      })
+      wi = wi + 1
+    }
+    let mut n = 0
+    while n < max_reqs {
+      let fd = tcp_accept(world, lfd)
+      if fd < 0 {
+        let _ = accept_errors.fetch_add(1)
+        break
+      }
+      let _ = conns.send(fd)
+      n = n + 1
+    }
+    conns.close()
+  })
+  tcp_close(world, lfd)
+  let st = stats(svc)
+  io_println(world, json::encode(st))
+  if accept_errors.load() > 0 || served.load() != max_reqs {
+    io_eprintln(world, "served " + served.load().to_string() + " of " + max_reqs.to_string())
+    return 1
+  }
+  0
+}
+
+// ---------------------------------------------------------------------------
+// --self-test: routes, JSON and multithreaded KV stress without the network.
+
+fn expect(world : World, failures : AtomicInt, cond : Bool, what : String) -> Unit {
+  if !cond {
+    let _ = failures.fetch_add(1)
+    io_eprintln(world, "FAIL: " + what)
+  }
+}
+
+/// One request through the full text path: format, parse, route, format, parse.
+fn roundtrip(svc : Service, method : String, path : String, body : String) -> http::HttpResponse {
+  let raw = http::format_request(method, "127.0.0.1", 0, path, body)
+  match http::parse_response(handle_raw(svc, raw)) {
+    Ok(r) => r
+    Err(e) => http::err_json(500, "unparsable response: " + e)
+  }
+}
+
+fn functional(world : World, failures : AtomicInt) -> Unit {
+  let svc = new_service()
+  let h = roundtrip(svc, "GET", "/health", "")
+  expect(world, failures, h.status == 200 && h.body == "{\"ok\":true,\"service\":\"m2-kv\"}", "health: " + h.body)
+  let v = "键值服务 🚀 \"quoted\""
+  let put_body = json::stringify(json::JObj([json::field("value", json::JStr(v))]))
+  let p = roundtrip(svc, "PUT", "/items/greeting%20one", put_body)
+  expect(
+    world,
+    failures,
+    p.status == 200 && p.body == "{\"ok\":true,\"key\":\"greeting one\",\"value\":\"键值服务 🚀 \\\"quoted\\\"\"}",
+    "put: " + p.body,
+  )
+  let g = roundtrip(svc, "GET", "/items/greeting%20one", "")
+  let back = match json::parse(g.body) {
+    Ok(j) =>
+    match json::obj_get(j, "value") {
+      Some(x) =>
+      match json::as_str(x) {
+        Some(s) => s
+        None => ""
+      }
+      None => ""
+    }
+    Err(_) => ""
+  }
+  expect(world, failures, g.status == 200 && back == v, "get utf-8 value: " + g.body)
+  let bad = roundtrip(svc, "PUT", "/items/x", "{\"value\":")
+  expect(world, failures, bad.status == 400 && bad.body.contains("invalid json"), "bad json: " + bad.body)
+  let wrong = roundtrip(svc, "PUT", "/items/x", "{\"value\":42}")
+  expect(world, failures, wrong.status == 400, "non-string value: " + wrong.body)
+  let miss = roundtrip(svc, "GET", "/items/nope", "")
+  expect(world, failures, miss.status == 404 && miss.body == "{\"error\":\"not found\"}", "miss: " + miss.body)
+  let d = roundtrip(svc, "DELETE", "/items/greeting%20one", "")
+  expect(world, failures, d.status == 200 && d.body == "{\"deleted\":true}", "delete: " + d.body)
+  let d2 = roundtrip(svc, "DELETE", "/items/greeting%20one", "")
+  expect(world, failures, d2.status == 404, "delete twice: " + d2.body)
+  let nr = roundtrip(svc, "GET", "/nope", "")
+  expect(world, failures, nr.status == 404, "no route: " + nr.body)
+  let st = roundtrip(svc, "GET", "/stats", "")
+  expect(
+    world,
+    failures,
+    st.status == 200 &&
+    st.body == "{\"total_reqs\":10,\"keys\":0,\"hits\":1,\"misses\":1,\"puts\":1,\"deletes\":1}",
+    "stats: " + st.body,
+  )
+}
+
+fn stress(world : World, failures : AtomicInt, workers : Int, ops : Int) -> Int64 {
+  let svc = new_service()
+  let mismatches = AtomicInt::new(0)
+  let t0 = clock_now_ms(world)
+  scope(world, fn(s : Scope) -> Unit {
+    let mut w = 0
+    while w < workers {
+      let wid = w
+      spawn(s, fn() -> Unit {
+        let mut i = 0
+        while i < ops {
+          let key = "w" + wid.to_string() + "-k" + i.to_string()
+          let value = "值-" + wid.to_string() + "-" + i.to_string()
+          let body = json::stringify(json::JObj([json::field("value", json::JStr(value))]))
+          let p = roundtrip(svc, "PUT", "/items/" + key, body)
+          let g = roundtrip(svc, "GET", "/items/" + key, "")
+          let want = json::encode(ItemResp::{ key: key, value: value })
+          if p.status != 200 || g.status != 200 || g.body != want {
+            let _ = mismatches.fetch_add(1)
+          }
+          if i % 2 == 1 {
+            let d = roundtrip(svc, "DELETE", "/items/" + key, "")
+            let m = roundtrip(svc, "GET", "/items/" + key, "")
+            if d.status != 200 || m.status != 404 {
+              let _ = mismatches.fetch_add(1)
+            }
+          }
+          i = i + 1
+        }
+      })
+      w = w + 1
+    }
+  })
+  let elapsed = clock_now_ms(world) - t0
+  let st = stats(svc)
+  let n = workers * ops
+  let half = workers * (ops / 2)
+  expect(world, failures, mismatches.load() == 0, "stress mismatches: " + mismatches.load().to_string())
+  expect(world, failures, st.puts == n && st.keys == n - half, "stress puts/keys: " + json::encode(st))
+  expect(world, failures, st.hits == n && st.misses == half && st.deletes == half, "stress hits/misses: " + json::encode(st))
+  expect(world, failures, st.total_reqs == 2 * n + 2 * half, "stress total: " + json::encode(st))
+  io_println(world, "stress " + workers.to_string() + "x" + ops.to_string() + ": " + json::encode(st))
+  elapsed
+}
+
+fn self_test(world : World) -> Int {
+  let failures = AtomicInt::new(0)
+  functional(world, failures)
+  let ms = stress(world, failures, 8, 500)
+  if failures.load() != 0 {
+    io_eprintln(world, "self-test FAILED: " + failures.load().to_string() + " check(s)")
+    return 1
+  }
+  io_println(world, "self-test ok (stress " + ms.to_string() + " ms)")
+  0
+}
+
+pub fn main(world : World) -> Int {
+  match parse_options(world_args(world)) {
+    Ok(opts) => if opts.self_test { self_test(world) } else { serve(world, opts) }
+    Err(e) => {
+      io_eprintln(world, "error: " + e)
+      io_eprintln(
+        world,
+        "usage: http_kv_service --self-test | --port <p> --workers <n> --max-reqs <m> [--port-file <path>]",
+      )
+      2
+    }
+  }
+}

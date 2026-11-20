@@ -54,6 +54,115 @@ pub fn str_code_at(s : String, idx : Int) -> Int {
 }
 
 ///|
+/// True when `String` code units are UTF-8 bytes (m2 Stage 1/2), false when
+/// they are UTF-16 units (MoonBit Stage 0). Text handling that goes beyond
+/// ASCII must decode scalars with `str_scalar_at` / `str_scalar_len` instead
+/// of turning one code unit into one `Char`.
+pub fn host_str_is_utf8() -> Bool {
+  let sb = StringBuilder()
+  sb.write_char((0x4E2D).unsafe_to_char())
+  sb.to_string().length() != 1
+}
+
+///|
+fn utf8_is_cont(s : String, idx : Int) -> Bool {
+  idx < s.length() && (str_code_at(s, idx) & 0xC0) == 0x80
+}
+
+///|
+/// Number of code units of the Unicode scalar starting at `idx` (1 for ASCII,
+/// stray or malformed units).
+pub fn str_scalar_len(s : String, idx : Int, utf8 : Bool) -> Int {
+  let c = str_code_at(s, idx)
+  if c < 0x80 {
+    return 1
+  }
+  if utf8 {
+    let n = if c >= 0xC2 && c <= 0xDF {
+      2
+    } else if c >= 0xE0 && c <= 0xEF {
+      3
+    } else if c >= 0xF0 && c <= 0xF4 {
+      4
+    } else {
+      1
+    }
+    let mut k = 1
+    while k < n {
+      if !utf8_is_cont(s, idx + k) {
+        return 1
+      }
+      k = k + 1
+    }
+    n
+  } else if c >= 0xD800 && c <= 0xDBFF && idx + 1 < s.length() {
+    let lo = str_code_at(s, idx + 1)
+    if lo >= 0xDC00 && lo <= 0xDFFF {
+      2
+    } else {
+      1
+    }
+  } else {
+    1
+  }
+}
+
+///|
+/// Unicode scalar starting at `idx` (U+FFFD for malformed UTF-8 or lone surrogates).
+pub fn str_scalar_at(s : String, idx : Int, utf8 : Bool) -> Int {
+  let c = str_code_at(s, idx)
+  if c < 0x80 {
+    return c
+  }
+  let n = str_scalar_len(s, idx, utf8)
+  if utf8 {
+    if n == 2 {
+      ((c & 0x1F) << 6) | (str_code_at(s, idx + 1) & 0x3F)
+    } else if n == 3 {
+      ((c & 0x0F) << 12) |
+      ((str_code_at(s, idx + 1) & 0x3F) << 6) |
+      (str_code_at(s, idx + 2) & 0x3F)
+    } else if n == 4 {
+      ((c & 0x07) << 18) |
+      ((str_code_at(s, idx + 1) & 0x3F) << 12) |
+      ((str_code_at(s, idx + 2) & 0x3F) << 6) |
+      (str_code_at(s, idx + 3) & 0x3F)
+    } else {
+      0xFFFD
+    }
+  } else if n == 2 {
+    0x10000 + ((c - 0xD800) << 10) + (str_code_at(s, idx + 1) - 0xDC00)
+  } else if c >= 0xD800 && c <= 0xDFFF {
+    0xFFFD
+  } else {
+    c
+  }
+}
+
+///|
+/// Appends `s[start, end)` to `sb` unchanged on both hosts (never one `Char`
+/// per UTF-8 byte).
+pub fn sb_write_range(sb : StringBuilder, s : String, start : Int, end : Int) -> Unit {
+  let mut mode = 0
+  let mut i = start
+  while i < end {
+    let c = str_code_at(s, i)
+    if c < 0x80 {
+      sb.write_char(c.unsafe_to_char())
+      i = i + 1
+    } else {
+      // Host encoding is probed lazily: ASCII-only ranges (identifiers) stay cheap.
+      if mode == 0 {
+        mode = if host_str_is_utf8() { 1 } else { 2 }
+      }
+      let utf8 = mode == 1
+      sb.write_char(str_scalar_at(s, i, utf8).unsafe_to_char())
+      i = i + str_scalar_len(s, i, utf8)
+    }
+  }
+}
+
+///|
 pub fn hex_digit(n : Int) -> Char {
   if n == 0 {
     '0'
