@@ -1077,3 +1077,153 @@ test "p10a: const folding, binary dispatch tree, immut field borrow, inline str/
   assert_eq(ssa.contains("function $m2_freeze_st_Msg("), true)
   assert_eq(ssa.contains("call $m2_freeze_st_Msg("), true)
 }
+
+///|
+test "p11b: perceus move, string bce, leaf-loop inline, array hoist budget" {
+  let src =
+    "struct Entry {\n" +
+    "  k : String\n" +
+    "  v : String\n" +
+    "}\n" +
+    "enum Val {\n" +
+    "  VArr(Array[Entry])\n" +
+    "}\n" +
+    "struct Scan {\n" +
+    "  src : String\n" +
+    "  len : Int\n" +
+    "  mut pos : Int\n" +
+    "}\n" +
+    "fn skip_sp(p : Scan) -> Unit {\n" +
+    "  while p.pos < p.len {\n" +
+    "    let c = p.src.code_unit_at(p.pos)\n" +
+    "    if c == 32 || c == 9 {\n" +
+    "      p.pos = p.pos + 1\n" +
+    "    } else {\n" +
+    "      break\n" +
+    "    }\n" +
+    "  }\n" +
+    "}\n" +
+    "fn build_obj(s : String) -> Val {\n" +
+    "  let entries : Array[Entry] = []\n" +
+    "  let k = s.slice(0, 1)\n" +
+    "  let v = s.slice(1, 2)\n" +
+    "  entries.push(Entry::{ k: k, v: v })\n" +
+    "  return VArr(entries)\n" +
+    "}\n" +
+    "fn scan_str(s : String) -> Int {\n" +
+    "  let n = s.length()\n" +
+    "  let mut i = 0\n" +
+    "  while i < n && s.code_unit_at(i) != 10 {\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "  i\n" +
+    "}\n" +
+    "fn scan_slice(s : String, start : Int, end : Int) -> Int {\n" +
+    "  let mut p = start\n" +
+    "  let mut acc = 0\n" +
+    "  while p < end && s.code_unit_at(p) != 32 {\n" +
+    "    acc = acc + s.code_unit_at(p)\n" +
+    "    p = p + 1\n" +
+    "  }\n" +
+    "  acc\n" +
+    "}\n" +
+    "fn use_skip(p : Scan) -> Int {\n" +
+    "  skip_sp(p)\n" +
+    "  p.pos\n" +
+    "}\n" +
+    "fn helper_call(x : Int) -> Int {\n" +
+    "  let mut r = x\n" +
+    "  let mut k = 0\n" +
+    "  while k < 3 {\n" +
+    "    r = r + k\n" +
+    "    k = k + 1\n" +
+    "  }\n" +
+    "  let mut j = 0\n" +
+    "  while j < 3 {\n" +
+    "    r = r + j\n" +
+    "    j = j + 1\n" +
+    "  }\n" +
+    "  r\n" +
+    "}\n" +
+    "fn budget_loop(a : Array[Int], b : Array[Int], c : Array[Int], d : Array[Int], e : Array[Int], n : Int) -> Int {\n" +
+    "  let mut i = 0\n" +
+    "  let mut s = 0\n" +
+    "  while i < n {\n" +
+    "    s = s + a[i] + a[i] + b[i] + b[i] + c[i] + c[i]\n" +
+    "    if i == 0 {\n" +
+    "      s = s + d[i] + e[i] + helper_call(i)\n" +
+    "    }\n" +
+    "    i = i + 1\n" +
+    "  }\n" +
+    "  s\n" +
+    "}\n" +
+    "pub fn main() -> Int {\n" +
+    "  let _ = build_obj(\"ab\")\n" +
+    "  let sc = Scan::{ src: \"  x\", len: 3, pos: 0 }\n" +
+    "  let a = [1, 2]\n" +
+    "  scan_str(\"abc\\n\") + scan_slice(\"abc \", 0, 4) + use_skip(sc) + budget_loop(a, a, a, a, a, 2)\n" +
+    "}\n"
+  let cr = @core.check_source_files_with_imports("p11b_cg", ["p11b.m2"], [src], [], true)
+  assert_eq(cr.diagnostics.length(), 0)
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  // 1. build_obj: owned push fast path + m2_arr_push_owned + zero rc_inc/rc_dec
+  let bo_start = match ssa.find("fn_build_obj(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(bo_start >= 0, true)
+  let bo_rest = ssa.clamped_view(start=bo_start).to_owned()
+  let bo_end = match bo_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => bo_rest.length()
+  }
+  let bo_body = bo_rest.clamped_view(end=bo_end).to_owned()
+  assert_eq(bo_body.contains("@ap_fast"), true)
+  assert_eq(bo_body.contains("m2_arr_push_owned"), true)
+  assert_eq(bo_body.contains("m2_rc_inc"), false)
+  assert_eq(bo_body.contains("m2_rc_dec"), false)
+  // 2. scan_str: direct String BCE under `&&` -> zero m2_panic_oob
+  let ss_start = match ssa.find("fn_scan_str(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(ss_start >= 0, true)
+  let ss_rest = ssa.clamped_view(start=ss_start).to_owned()
+  let ss_end = match ss_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => ss_rest.length()
+  }
+  let ss_body = ss_rest.clamped_view(end=ss_end).to_owned()
+  assert_eq(ss_body.contains("m2_panic_oob"), false)
+  assert_eq(ss_body.contains("loadub"), true)
+  // 3. scan_slice: BCE versioning for String under `&&` -> @wh_vchk + @wh_fast
+  let sl_start = match ssa.find("fn_scan_slice(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(sl_start >= 0, true)
+  let sl_rest = ssa.clamped_view(start=sl_start).to_owned()
+  let sl_end = match sl_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => sl_rest.length()
+  }
+  let sl_body = sl_rest.clamped_view(end=sl_end).to_owned()
+  assert_eq(sl_body.contains("@wh_vchk"), true)
+  assert_eq(sl_body.contains("@wh_fast"), true)
+  // 4. use_skip: leaf-loop skip_sp inlined (no call $m2_fn_skip_sp)
+  let us_start = match ssa.find("fn_use_skip(") {
+    Some(idx) => idx
+    None => -1
+  }
+  assert_eq(us_start >= 0, true)
+  let us_rest = ssa.clamped_view(start=us_start).to_owned()
+  let us_end = match us_rest.find("\n}\n") {
+    Some(idx) => idx
+    None => us_rest.length()
+  }
+  let us_body = us_rest.clamped_view(end=us_end).to_owned()
+  assert_eq(us_body.contains("call $m2_fn_skip_sp"), false)
+  assert_eq(us_body.contains("loadub"), true)
+  // 5. budget_loop: emits cleanly with 5 arrays + call
+  assert_eq(ssa.contains("fn_budget_loop("), true)
+}

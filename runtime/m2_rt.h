@@ -161,6 +161,7 @@ void*    m2_strbuf_to_str(void *sb);
 void*    m2_arr_new(int64_t cap, int32_t elem_is_obj);
 int64_t  m2_arr_len(void *a);
 void     m2_arr_push(void *a, int64_t val);
+void     m2_arr_push_owned(void *a, int64_t val);
 int64_t  m2_arr_get(void *a, int64_t idx);
 void     m2_arr_set(void *a, int64_t idx, int64_t val);
 int64_t  m2_arr_pop(void *a);

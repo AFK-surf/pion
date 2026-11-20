@@ -1575,6 +1575,24 @@ static void test_slab_48b_and_arr_growth(void) {
         m2_rc_dec(from_sb);
     }
 
+    /* Verify m2_arr_push_owned transfers ownership without incrementing RC */
+    void *owned_arr = m2_arr_new(0, 1);
+    for (int i = 0; i < 16; i++) {
+        void *s = m2_int_to_str((int64_t)i);
+        M2Header *sh = ((M2Header *)s) - 1;
+        assert(sh->local_rc == 1);
+        m2_arr_push_owned(owned_arr, (int64_t)(uintptr_t)s);
+        assert(sh->local_rc == 1);
+    }
+    assert(m2_arr_len(owned_arr) == 16);
+    for (int i = 0; i < 16; i++) {
+        void *s = (void *)(uintptr_t)m2_arr_get(owned_arr, (int64_t)i);
+        void *exp = m2_int_to_str((int64_t)i);
+        assert(m2_str_eq(s, exp) == 1);
+        m2_rc_dec(exp);
+    }
+    m2_rc_dec(owned_arr);
+
     printf("[PASS] slab_48b_and_arr_growth\n");
 }
 
