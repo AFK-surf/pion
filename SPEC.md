@@ -165,14 +165,13 @@ test "test name" {
 typedef void (*PionDropFn)(void *payload);
 
 typedef struct PionHeader {
-    uint64_t owner_tid;        // Thread ID of creator; 0 = FROZEN/SHARED (atomic mode)
+    uint32_t owner_tid;        // Thread ID of creator; 0 = FROZEN/SHARED (atomic mode)
     uint32_t local_rc;         // Non-atomic RC used while owner_tid == current_tid
     _Atomic uint32_t shared_rc;// Atomic RC used once owner_tid == 0 (or cross-thread dec)
     uint16_t type_tag;         // PionTag (String=1, Bytes=2, Array=3, Struct=4, Enum=5, Closure=6, Map=7, Channel=8, Mutex=9, Atomic=10)
-    uint16_t flags;            // bit 0: PION_FLAG_FROZEN, bit 1: PION_FLAG_IMMORTAL (static .rodata literals!)
-    uint32_t payload_size;     // Byte size of payload
-    PionDropFn drop_fn;          // Nullable destructor for releasing child pointers
-} PionHeader;                    // Total: 32 bytes (clean 8-byte alignment on arm64/x64)
+    uint16_t flags;            // bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bits 4..7: 12-class slab id
+    PionDropFn drop_fn;        // Nullable destructor for releasing child pointers
+} PionHeader;                  // Total: 24 bytes (clean 8-byte alignment on arm64/x64)
 ```
 Payload immediately follows `PionHeader`: `void* obj = (char*)hdr + sizeof(PionHeader)`.
 Header recovery: `PionHeader* hdr = ((PionHeader*)obj) - 1`.
@@ -204,6 +203,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `int64_t pion_str_len(void *s);`
 - `int32_t pion_str_byte_at(void *s, int64_t idx);`
 - `void*   pion_str_concat(void *a, void *b);`
+- `void*   pion_str_concat_n(int64_t n, void **parts);` (single-allocation N-way string concatenation)
 - `int32_t pion_str_eq(void *a, void *b);`
 - `int32_t pion_str_cmp(void *a, void *b);`
 - `void*   pion_str_slice(void *s, int64_t start, int64_t end);`
@@ -236,6 +236,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void  pion_strbuf_push_int(void *sb, int64_t v);`
 - `void  pion_strbuf_reset(void *sb);`
 - `void* pion_strbuf_to_str(void *sb);`
+- `StringBuilder::length() -> Int` (reads `PionStrBuf.len` at offset 0)
 
 **Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int64_t *data; }` — uniform 64-bit slots!):**
 - `void*   pion_arr_new(int64_t cap, int32_t elem_is_obj);`
@@ -325,6 +326,17 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void    pion_tcp_close(void *w, int32_t fd);` (`tcp_close(w, fd : Int) -> Unit`)
 - `void    pion_sleep_ms(void *w, int32_t ms);` (`sleep_ms(w, ms : Int) -> Unit`)
 
+**Non-blocking sockets & readiness polling (explicit `World` first argument; kqueue on macOS, epoll on Linux; IO returns `>= 0` bytes/fd, `-2` for `EAGAIN`/`EWOULDBLOCK`, or `-1` on error; `Bool` returns are zero-extended from C `int32_t` 0/1 to 64-bit slots; poll event masks: `1` READ | `2` WRITE | `4` ERR/HUP/EOF; `poll_ctl` ops: `1` ADD, `2` MOD, `3` DEL):**
+- `int32_t pion_tcp_listen_reuse(void *w, void *host, int32_t port);` (`tcp_listen_reuse(w, host : String, port : Int) -> Int`; enables `SO_REUSEPORT` for multi-worker accept)
+- `int32_t pion_tcp_set_nonblock(void *w, int32_t fd, int32_t enable);` (`tcp_set_nonblock(w, fd : Int, enable : Bool) -> Bool`)
+- `int32_t pion_tcp_accept_nb(void *w, int32_t listen_fd);` (`tcp_accept_nb(w, listen_fd : Int) -> Int`; sets `O_NONBLOCK` + `TCP_NODELAY`)
+- `int32_t pion_tcp_read_nb(void *w, int32_t fd, void *sb, int32_t max_bytes);` (`tcp_read_nb(w, fd : Int, sb : StringBuilder, max_bytes : Int) -> Int`; appends into `sb`)
+- `int32_t pion_tcp_write_nb(void *w, int32_t fd, void *data, int32_t offset);` (`tcp_write_nb(w, fd : Int, data : String, offset : Int) -> Int`)
+- `int32_t pion_poll_create(void *w);` (`poll_create(w) -> Int`)
+- `int32_t pion_poll_ctl(void *w, int32_t pfd, int32_t op, int32_t fd, int32_t events);` (`poll_ctl(w, pfd : Int, op : Int, fd : Int, events : Int) -> Bool`)
+- `int32_t pion_poll_wait(void *w, int32_t pfd, void *out_fds, void *out_events, int32_t max_events, int32_t timeout_ms);` (`poll_wait(w, pfd : Int, out_fds : Array[Int], out_events : Array[Int], max_events : Int, timeout_ms : Int) -> Int`)
+- `void    pion_poll_close(void *w, int32_t pfd);` (`poll_close(w, pfd : Int) -> Unit`)
+
 ---
 
 ## 5. Agent JSON Protocols
@@ -398,7 +410,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - **`pionc init [--json] <dir>`**: writes `pion.toml`, `src/main.pion` and `main_test.pion` for a package named after the directory (`[a-z0-9_]`); the result passes `check`, `test`, `run` and `fmt --check` as is. Refuses to overwrite existing files.
 - **Cross-package traits**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. A package exporting a `pub` generic fn with trait bounds has no `.pionstub` (importers monomorphize from its source).
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.pionsig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.pionsig` yields 100% CAS hit on downstream `.o` files.
-- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.8`, ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.9`, ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
 - Default directory: `$PION_CACHE_DIR` or `$HOME/.cache/pion/cas`
 - Layout:
   - `sig/<sha256>.pionsig`
@@ -416,5 +428,6 @@ Plain Pion packages imported through `pion.toml` (`path` or `git` dependencies);
 
 - **`std/json`**: JSON values, parser and serializer.
 - **`std/http`**: HTTP/1.1 over `World` TCP — `parse_request`/`parse_response` (with `Transfer-Encoding: chunked` bodies via `decode_chunked`), `parse_query` (`a=1&b=x%20y` → `Map[String, String]`, percent and `+` decoding), framing helpers `request_len`/`response_len`, `read_http_response`, keep-alive (`should_keep_alive`, where HTTP/1.0 defaults to close; `format_response_ka`/`format_request_ka`/`write_http_response_ka`) and `HttpConn` (`new_conn`, `conn_read_request`, `conn_read_response`), which keeps pipelined bytes between requests on one connection. Existing `Connection: close` APIs are unchanged.
+- **`std/net`**: non-blocking event-loop poller (`Poller`, `Event`, `EV_READ`/`EV_WRITE`/`EV_ERR`) over `kqueue` (macOS) / `epoll` (Linux) with `SO_REUSEPORT` multi-worker accept helpers.
 - **`std/regex`**: pure-Pion Thompson NFA executed by a Pike VM — linear time in the input for every pattern (no backtracking, no ReDoS). Syntax: literals, `.`, `\d \D \w \W \s \S`, classes `[...]`/`[^...]` with ranges, groups, `|`, greedy and lazy `* + ? {n} {n,} {n,m}`, anchors `^ $`; matching is UTF-8 aware. API: `compile(pattern) -> Result[Regex, String]` (errors carry the byte offset), `is_match`, `find`, `find_at`, `find_all -> Array[Match]` (byte offsets), `replace_all`, `escape`, `program_size`.
 - **`std/tls`**: TLS 1.2/1.3 client binding the system OpenSSL (`libssl`/`libcrypto`, 1.1.x or 3.x C ABI) through `extern "C"` declarations only — zero C glue; `[link] libs = ["ssl", "crypto"]`. SNI, certificate verification against OpenSSL's default CA store (`SSL_CERT_FILE`/`SSL_CERT_DIR` honoured) with host-name or IP checking, TLS 1.2 minimum. API: `tls_connect(w, host, port, verify_cert) -> Result[TlsConn, String]`, `tls_write`, `tls_read`, `tls_close`, `tls_protocol`, `tls_cipher`, `tls_version`, and `https_request` on top of `std/http`. Linux needs the `libssl.so`/`libcrypto.so` link names (Debian/Ubuntu `libssl-dev`); macOS needs Homebrew `openssl@3` and `CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`. `std/tls/e2e/run_e2e.sh <pionc>` performs real loopback TLS 1.3 and 1.2 handshakes against a Python `ssl` server and checks that a wrong host name is refused.

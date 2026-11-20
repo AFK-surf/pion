@@ -1665,9 +1665,11 @@ static void test_slab_48b_and_arr_growth(void) {
     assert(empty_obj_arr->len == 0 && empty_obj_arr->cap == 0 && empty_obj_arr->data == NULL);
     pion_rc_dec(empty_obj_arr);
 
-    /* 2. 48B Slab class (16B payload + 32B PionHeader = 48B) & all slab class boundaries */
+    /* 2. 24B PionHeader + 12-class Slab (32B..256B, 16B payload -> 40B class 1) */
+    assert(sizeof(PionHeader) == 24);
     const uint32_t payloads[] = {
-        0u, 8u, 16u, 17u, 24u, 25u, 32u, 33u, 48u, 49u, 64u, 65u, 80u, 81u, 96u, 97u, 224u, 225u
+        0u, 8u, 9u, 16u, 17u, 24u, 25u, 32u, 33u, 40u, 41u, 56u, 57u, 72u, 73u,
+        88u, 89u, 104u, 105u, 136u, 137u, 168u, 169u, 232u, 233u
     };
     const size_t n_payloads = sizeof(payloads) / sizeof(payloads[0]);
     void *ptrs[sizeof(payloads) / sizeof(payloads[0])];
@@ -1681,25 +1683,32 @@ static void test_slab_48b_and_arr_growth(void) {
             p[sz - 1] = (uint8_t)(0xA0u + i);
         }
         PionHeader *hdr = ((PionHeader *)p) - 1;
-        assert(hdr->payload_size == sz);
         if (hdr->flags & PION_FLAG_SLAB) {
             uint32_t cls = (uint32_t)((hdr->flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
-            if (sz <= 16u) {
-                assert(cls == 0u); /* 48B class */
+            if (sz <= 8u) {
+                assert(cls == 0u);  /* 32B class */
+            } else if (sz <= 16u) {
+                assert(cls == 1u);  /* 40B class */
             } else if (sz <= 24u) {
-                assert(cls == 1u); /* 56B class */
+                assert(cls == 2u);  /* 48B class */
             } else if (sz <= 32u) {
-                assert(cls == 2u); /* 64B class */
-            } else if (sz <= 48u) {
-                assert(cls == 3u); /* 80B class */
-            } else if (sz <= 64u) {
-                assert(cls == 4u); /* 96B class */
-            } else if (sz <= 80u) {
-                assert(cls == 5u); /* 112B class */
-            } else if (sz <= 96u) {
-                assert(cls == 6u); /* 128B class */
+                assert(cls == 3u);  /* 56B class */
+            } else if (sz <= 40u) {
+                assert(cls == 4u);  /* 64B class */
+            } else if (sz <= 56u) {
+                assert(cls == 5u);  /* 80B class */
+            } else if (sz <= 72u) {
+                assert(cls == 6u);  /* 96B class */
+            } else if (sz <= 88u) {
+                assert(cls == 7u);  /* 112B class */
+            } else if (sz <= 104u) {
+                assert(cls == 8u);  /* 128B class */
+            } else if (sz <= 136u) {
+                assert(cls == 9u);  /* 160B class */
+            } else if (sz <= 168u) {
+                assert(cls == 10u); /* 192B class */
             } else {
-                assert(cls == 7u); /* 256B class */
+                assert(cls == 11u); /* 256B class */
             }
         }
         ptrs[i] = p;
@@ -1714,7 +1723,7 @@ static void test_slab_48b_and_arr_growth(void) {
         pion_rc_dec(p);
     }
 
-    /* Short strings (0..7 bytes -> 48B slab) + medium/long strings via slice/concat/strbuf */
+    /* Short strings (0..7 bytes -> 24B hdr + 8B len + <=8B = <=40B -> class 1) + concat_n */
     const char *keys[] = { "", "id", "role", "tags", "note", "metrics", "latency_ms", "user_00001_ap-northeast-1" };
     for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
         size_t klen = strlen(keys[i]);
@@ -1722,7 +1731,7 @@ static void test_slab_48b_and_arr_growth(void) {
         PionHeader *shdr = ((PionHeader *)s) - 1;
         if ((shdr->flags & PION_FLAG_SLAB) && klen <= 7) {
             uint32_t cls = (uint32_t)((shdr->flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
-            assert(cls == 0u); /* 32B header + 8B len + <=8B data+NUL <= 48B */
+            assert(cls == 1u); /* 24B header + 8B len + (1..8B) data+NUL -> 40B class */
         }
         void *sl = pion_str_slice(s, 0, (int64_t)klen);
         assert(pion_str_eq(s, sl) == 1);
@@ -1736,6 +1745,33 @@ static void test_slab_48b_and_arr_growth(void) {
         pion_rc_dec(sl);
         pion_rc_dec(sb);
         pion_rc_dec(from_sb);
+    }
+
+    /* pion_str_concat_n: 0 parts, NULL/empty parts, multi-part */
+    {
+        void *c0 = pion_str_concat_n(0, NULL);
+        assert(pion_str_len(c0) == 0);
+        pion_rc_dec(c0);
+
+        void *p0 = pion_str_from_cstr("ALERT|", 6);
+        void *p1 = pion_str_from_cstr("auth", 4);
+        void *p2 = pion_str_from_cstr("|", 1);
+        void *p3 = pion_str_from_cstr("", 0);
+        void *p4 = pion_str_from_cstr("ERR", 3);
+        void *p5 = pion_str_from_cstr("|523|timeout", 12);
+        void *parts[7] = { p0, p1, p2, NULL, p3, p4, p5 };
+        void *joined = pion_str_concat_n(7, parts);
+        void *want = pion_str_from_cstr("ALERT|auth|ERR|523|timeout", 26);
+        assert(pion_str_len(joined) == 26);
+        assert(pion_str_eq(joined, want) == 1);
+        pion_rc_dec(joined);
+        pion_rc_dec(want);
+        pion_rc_dec(p0);
+        pion_rc_dec(p1);
+        pion_rc_dec(p2);
+        pion_rc_dec(p3);
+        pion_rc_dec(p4);
+        pion_rc_dec(p5);
     }
 
     /* Verify pion_arr_push_owned transfers ownership without incrementing RC */

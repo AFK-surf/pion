@@ -31,19 +31,18 @@ typedef enum PionTag {
 #define PION_FLAG_IMMORTAL ((uint16_t)2u)
 #define PION_FLAG_SLAB     ((uint16_t)4u)
 #define PION_FLAG_SLAB_CLS_SHIFT 4u
-#define PION_FLAG_SLAB_CLS_MASK  ((uint16_t)0x7u)
+#define PION_FLAG_SLAB_CLS_MASK  ((uint16_t)0xFu)
 
 typedef struct PionHeader {
-    uint64_t owner_tid;         /* Thread ID of creator; 0 = FROZEN/SHARED (atomic mode) */
+    uint32_t owner_tid;         /* Thread ID of creator; 0 = FROZEN/SHARED (atomic mode) */
     uint32_t local_rc;          /* Non-atomic RC used while owner_tid == current_tid */
     _Atomic uint32_t shared_rc; /* Atomic RC used once owner_tid == 0 (or cross-thread dec) */
     uint16_t type_tag;          /* PionTag */
-    uint16_t flags;             /* bit 0: PION_FLAG_FROZEN, bit 1: PION_FLAG_IMMORTAL */
-    uint32_t payload_size;      /* Byte size of payload */
-    PionDropFn drop_fn;           /* Nullable destructor for releasing child pointers */
-} PionHeader;                     /* Total: 32 bytes (clean 8-byte alignment on arm64/x64) */
+    uint16_t flags;             /* bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bits 4..7: slab cls */
+    PionDropFn drop_fn;         /* Nullable destructor for releasing child pointers */
+} PionHeader;                   /* Total: 24 bytes (clean 8-byte alignment on arm64/x64) */
 
-_Static_assert(sizeof(PionHeader) == 32, "PionHeader must be exactly 32 bytes");
+_Static_assert(sizeof(PionHeader) == 24, "PionHeader must be exactly 24 bytes");
 
 typedef struct PionString {
     int64_t len;
@@ -92,8 +91,8 @@ typedef struct PionMap {
         int64_t len;                                                           \
         char data[sizeof(str_lit)];                                            \
     } sym##_storage = {                                                        \
-        { 0, 0, 1, PION_TAG_STRING, (PION_FLAG_FROZEN | PION_FLAG_IMMORTAL),         \
-          (uint32_t)(sizeof(int64_t) + sizeof(str_lit)), NULL },               \
+        { 0, 0, 1, PION_TAG_STRING, (PION_FLAG_FROZEN | PION_FLAG_IMMORTAL),   \
+          NULL },                                                              \
         (int64_t)(sizeof(str_lit) - 1),                                        \
         str_lit                                                                \
     };                                                                         \
@@ -124,6 +123,7 @@ void*    pion_str_from_cstr(const char *s, int64_t len);
 int64_t  pion_str_len(void *s);
 int32_t  pion_str_byte_at(void *s, int64_t idx);
 void*    pion_str_concat(void *a, void *b);
+void*    pion_str_concat_n(int64_t n, void **parts);
 int32_t  pion_str_eq(void *a, void *b);
 int32_t  pion_str_cmp(void *a, void *b);
 void*    pion_str_slice(void *s, int64_t start, int64_t end);

@@ -22,8 +22,9 @@ export PION_RT_LIB="$OUT_DIR/libpionrt.a"
 
 echo "=== [4/6] Standalone pionc2 Formatter Check ==="
 FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" \
-  "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" "$ROOT_DIR/examples/http_loopback" "$ROOT_DIR/tests/e2e/net_ffi.pion" \
-  "$ROOT_DIR/tests/e2e/link_z" "$ROOT_DIR/examples/http_kv_service" "$ROOT_DIR/examples/sqlite_indexer" \
+  "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_loopback" \
+  "$ROOT_DIR/tests/e2e/net_ffi.pion" "$ROOT_DIR/tests/e2e/link_z" "$ROOT_DIR/examples/http_kv_service" \
+  "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/examples/sqlite_indexer" \
   "$ROOT_DIR/tests/e2e/utf8_text.pion" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" \
   "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
@@ -45,8 +46,8 @@ fi
 rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
-echo "=== [5/6] Standalone pionc2 Test Runner (examples/text_stats, std/json, std/http, std/regex, dogfood apps) ==="
-for TPKG in examples/text_stats std/json std/http std/regex examples/http_kv_service examples/sqlite_indexer; do
+echo "=== [5/6] Standalone pionc2 Test Runner (examples/text_stats, std/json, std/http, std/net, std/regex, dogfood apps) ==="
+for TPKG in examples/text_stats std/json std/http std/net std/regex examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
   TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
   printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
   if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
@@ -94,6 +95,8 @@ fi
 # stress) and the pure-pion libsqlite3 indexer cross-checked by the sqlite3 CLI.
 "$PIONC2" build --release -o "$OUT_DIR/http_kv_service" "$ROOT_DIR/examples/http_kv_service"
 "$OUT_DIR/http_kv_service" --self-test
+"$PIONC2" build --release -o "$OUT_DIR/http_event_server" "$ROOT_DIR/examples/http_event_server"
+"$OUT_DIR/http_event_server" --self-test
 "$PIONC2" build --release -o "$OUT_DIR/sqlite_indexer" "$ROOT_DIR/examples/sqlite_indexer"
 IDX_DB="$OUT_DIR/sqlite_indexer_check.db"
 rm -f "$IDX_DB"
@@ -108,7 +111,7 @@ if command -v sqlite3 >/dev/null 2>&1; then
   fi
   echo "sqlite3 CLI cross-check: $IDX_GOT (files|lines) == indexer JSON"
 fi
-rm -f "$IDX_DB" "$OUT_DIR/http_kv_service" "$OUT_DIR/sqlite_indexer"
+rm -f "$IDX_DB" "$OUT_DIR/http_kv_service" "$OUT_DIR/http_event_server" "$OUT_DIR/sqlite_indexer"
 # std/http over a workspace dependency graph (http -> json) must build and link;
 # its real-TCP run is part of scripts/test-linux.sh.
 "$PIONC2" build -o "$OUT_DIR/http_loopback" "$ROOT_DIR/examples/http_loopback"

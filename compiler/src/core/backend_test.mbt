@@ -1594,6 +1594,110 @@ test "p18: event-loop primitives lower to direct C calls with the World first" {
 }
 
 ///|
+test "p19b: 24B header, null-niche Option[Ref], Bool enum singleton, N-way concat, chained borrow, struct String BCE, sb.length" {
+  let src =
+    #|pub struct Pair {
+    #|  key : String
+    #|  value : String
+    #|}
+    #|pub enum Val {
+    #|  VNull
+    #|  VBool(Bool)
+    #|  VStr(String)
+    #|}
+    #|pub struct Scanner {
+    #|  src : String
+    #|  len : Int
+    #|  mut pos : Int
+    #|}
+    #|pub fn lookup(entries : Array[Pair], k : String) -> Option[String] {
+    #|  let n = entries.length()
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    if entries[i].key == k {
+    #|      return Some(entries[i].value)
+    #|    }
+    #|    i = i + 1
+    #|  }
+    #|  None
+    #|}
+    #|pub fn nested_opt(flag : Int) -> Option[Option[String]] {
+    #|  if flag == 0 {
+    #|    None
+    #|  } else if flag == 1 {
+    #|    Some(None)
+    #|  } else {
+    #|    Some(Some("ok"))
+    #|  }
+    #|}
+    #|pub fn scan_quote(p : Scanner) -> Int {
+    #|  let mut i = p.pos
+    #|  while i < p.len {
+    #|    if p.src.code_unit_at(i) == 34 {
+    #|      break
+    #|    }
+    #|    i = i + 1
+    #|  }
+    #|  i
+    #|}
+    #|pub fn build_alert(svc : String, lvl : String, msg : String) -> String {
+    #|  "ALERT|" + svc + "|" + lvl + "|" + msg
+    #|}
+    #|pub fn mk_bools(b : Bool) -> Array[Val] {
+    #|  let out : Array[Val] = []
+    #|  out.push(VBool(true))
+    #|  out.push(VBool(false))
+    #|  out.push(VBool(b))
+    #|  out
+    #|}
+    #|pub fn sb_len_and_closure() -> Int {
+    #|  let sb = StringBuilder()
+    #|  sb.write_string("abc")
+    #|  let f = fn(x : Int) -> String {
+    #|    if x > 0 {
+    #|      return "yes"
+    #|    }
+    #|    "no"
+    #|  }
+    #|  sb.length() + f(1).length()
+    #|}
+  let cr = @core.check_source_files_full("p19b_cg", ["p19b_cg.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  // 24B header layout
+  assert_true(ssa.contains("_hdr, 24"), ssa)
+  assert_true(!ssa.contains("_hdr, 32"), ssa)
+  // Null-niche Option[String] in lookup: no pion_alloc_uninit, returns 0 on None
+  let lk_s = p18_find_from(ssa, "$pion_fn_lookup(", 0)
+  let lk_e = p18_find_from(ssa, "\n}", lk_s)
+  assert_true(lk_s >= 0 && lk_e > lk_s, ssa)
+  let lk_alloc = p18_find_from(ssa, "$pion_alloc_uninit", lk_s)
+  assert_true(lk_alloc < 0 || lk_alloc > lk_e, ssa)
+  let lk_ret0 = p18_find_from(ssa, "ret 0", lk_s)
+  assert_true(lk_ret0 > lk_s && lk_ret0 < lk_e, ssa)
+  // Nested Option[Option[String]] uses boxed outer Option
+  assert_true(ssa.contains("$pion_drop_opt_obj"), ssa)
+  // Bool enum static immortal singletons
+  assert_true(ssa.contains("_VBool_1_hdr"), ssa)
+  assert_true(ssa.contains("_VBool_0_hdr"), ssa)
+  // N-way string concat flattened to pion_str_concat_n
+  assert_true(ssa.contains("$pion_str_concat_n("), ssa)
+  // Struct String field BCE versioning in scan_quote
+  let sq_s = p18_find_from(ssa, "$pion_fn_scan_quote(", 0)
+  let sq_e = p18_find_from(ssa, "\n}", sq_s)
+  let sq_fast = p18_find_from(ssa, "@wh_fast", sq_s)
+  assert_true(sq_fast > sq_s && sq_fast < sq_e, ssa)
+  // Local-only array push skips adopt_fz
+  let mb_s = p18_find_from(ssa, "$pion_fn_mk_bools(", 0)
+  let mb_e = p18_find_from(ssa, "\n}", mb_s)
+  let mb_adopt = p18_find_from(ssa, "adopt_fz", mb_s)
+  assert_true(mb_adopt < 0 || mb_adopt > mb_e, ssa)
+}
+
+///|
 /// Index of `needle` in `hay` at or after `from`, or -1.
 fn p18_find_from(hay : String, needle : String, from : Int) -> Int {
   let n = needle.length()

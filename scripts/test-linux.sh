@@ -191,7 +191,7 @@ TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/examples/text_stats")"
 echo "pionc_linux test --json examples/text_stats -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'
 
-for TPKG in std/json std/http std/regex; do
+for TPKG in std/json std/http std/net std/regex examples/http_event_server; do
   STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_linux test --json $TPKG -> $STD_JSON"
   printf '%s' "$STD_JSON" | grep -q '"ok":true'
@@ -238,7 +238,7 @@ if [ "$HTTP_OUT" != "$(printf 'http in-process ok\nhttp_request ok: 200 text/pla
 fi
 
 FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
-  "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
+  "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: fmt --check failed on Linux: $FMT_JSON" >&2
@@ -321,6 +321,11 @@ verify_bench binarytrees "stretch=262143 long=131071 total=14592688"
 verify_bench fannkuchredux "73196 38"
 verify_bench mandelbrot_mt "6351041 721219984" -- 4
 verify_bench hashmap_str "200000 208681440 205599 815496841"
+
+# Dogfood: event-loop HTTP server (--self-test: routes, pipelining, real epoll TCP).
+"$PIONC" build --release -o "$OUT_DIR/http_event_server" "$ROOT_DIR/examples/http_event_server"
+"$OUT_DIR/http_event_server" --self-test
+rm -f "$OUT_DIR/http_event_server"
 
 # Dogfood: multithreaded HTTP+JSON KV service under real 8 x 500 TCP load (0 errors, exact /stats).
 KV_TEST="$("$PIONC" test --json "$ROOT_DIR/examples/http_kv_service")"
