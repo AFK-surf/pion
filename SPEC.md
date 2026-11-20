@@ -27,7 +27,7 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 5. **Agent-First Compiler Interface**:
    - `pionc check --json <path>` — compact JSON diagnostics (`file`, `line`, `col`, `code`, `message`, `expected`, `found`, `fixit`, plus machine-applicable `edits` when an exact patch is known), one object per diagnostic inside `{"ok":bool,"diagnostics":[...]}` (§5.1).
    - `pionc query defs|sig|callers|deps --json <path>` — structured symbol table, exported signatures, call graph, and package dependency graph; `<path>` may be a file, a package directory, or a whole `pion.toml` workspace (§5.2).
-   - `pionc test --json <workspace>` runs every local package's tests in one report (§5.3); `pionc init <dir>` scaffolds a package that is check/test/run/fmt-clean; `pionc fetch [dir]` resolves git dependencies and writes `pion.lock` (§6).
+   - `pionc test --json <workspace>` runs every local package's tests in one report (§5.3); `pionc init <dir>` scaffolds a package that is check/test/run/fmt-clean; `pionc fetch [dir]` resolves git dependencies and writes `pion.lock`; `pionc add` / `pionc update` edit `pion.toml` and re-resolve from paths, git URLs or a git-index registry (§6).
    - `pionc doc [--json] <path>` — the public API (every `pub` struct/enum/trait/extern fn/fn/const and every `impl`) of a file, directory or whole `pion.toml` workspace in one call (§5.4).
    - Contracts: `debug_assert(cond, msg)` — active in dev/test builds, stripped to 0 bytes in `--release`; it is an expression of type `Unit` and may stand in expression position (e.g. a `match` arm body).
 6. **Sub-150ms Incremental Compile, Tiny Binaries, Zero `target/`**:
@@ -109,6 +109,14 @@ import "pkg_name" [as alias]
   ...
 }
 
+[pub] trait Name {
+  method(self : Self, p1 : Type1) -> RetType
+}
+
+impl Name for TypeName {
+  fn method(self : TypeName, p1 : Type1) -> RetType { ... }
+}
+
 [pub] let CONST_NAME : Type = expr
 
 test "test name" {
@@ -121,6 +129,9 @@ test "test name" {
 - `test "name" { ... }` blocks are type-checked by `pionc check`, omitted (0 bytes) by `pionc build`, and compiled with active `debug_assert` by `pionc test [--json] [--filter <substr>] <path>`.
 - Files named `*_test.pion` belong to their package only under `pionc test` (the root package of a workspace, or a directory target); `check`, `build` and `run` skip them.
 - A struct field may be written `pub name : Type` (MoonBit compatibility); the fields of a `pub struct` are always visible to importers.
+- **Trait objects (`dyn Trait`)**: `dyn Trait` / `dyn pkg::Trait` is a type usable anywhere a type is (parameters, returns, locals, struct fields, `Array[dyn T]`, `Option[dyn T]`). A value of any type with an `impl Trait for Type` (structs, enums, `Int`, `String`, ...) converts to `dyn Trait` implicitly where that type is expected (`let d : dyn Describe = Dog::{ ... }`, arguments, returns, array literal elements, `push`, `Some(...)`) or explicitly with `expr as dyn Trait`; a type without the impl is `E_TRAIT_NOT_IMPLEMENTED` (with an `impl` skeleton edit). Method calls on a `dyn Trait` value dispatch dynamically and are type-checked against the trait's signatures.
+  - **Object safety**: every method of the trait must take `self : Self` as its first parameter, must not mention `Self` in any other parameter and must not return `Self`; otherwise `dyn Trait` is `E_TYPE_MISMATCH` ("trait `T` is not object-safe ..."). An unknown trait name is `E_UNKNOWN_TRAIT`; a private trait of an imported package is `E_PRIVATE_SYMBOL`.
+  - `dyn Trait` is `!Send` (it may hide a non-`Send` value): capturing one in `spawn` or sending it over a `Channel` is `E_NOT_SEND`. `==`/`!=` are not defined on it.
 
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
@@ -177,6 +188,13 @@ Payload immediately follows `PionHeader`: `void* obj = (char*)hdr + sizeof(PionH
 Header recovery: `PionHeader* hdr = ((PionHeader*)obj) - 1`.
 
 **Immortal static strings** (`.rodata` string literals): `flags = PION_FLAG_IMMORTAL | PION_FLAG_FROZEN`, `owner_tid = 0`. `pion_rc_inc` / `pion_rc_dec` return immediately in 1 branch — **ZERO heap allocation and ZERO `init` code for string literals!**
+
+### 4.1.1 `dyn Trait` Layout (compiler-emitted, no runtime symbols)
+- A `dyn Trait` value is one 64-bit pointer (`l`) to a **16-byte fat-pointer box**, an ordinary RC object (`pion_alloc_uninit(16, 4, $pion_drop_dyn)`) whose payload is `{ l data, l vtable }`: `data` is the concrete value in its uniform 64-bit slot (an object pointer, or an `Int`/`Bool`/`Double` bit pattern), `vtable` points to static read-only data.
+- One vtable per (trait, concrete type) pair, emitted once per package: `data $pion_vtable_<Trait>__<Type> = align 8 { l is_obj, l freeze_fn, l m0, l m1, ... }` — `is_obj` is `1` when `data` is a heap object, `freeze_fn` the concrete type's recursive freeze routine (or `0`), then one entry per trait method in declaration order. Each entry is a thunk `$pion_dyn_wrap_<Trait>__<Type>__<method>(l %self_raw, ...)` that narrows `self` to the concrete ABI type (`w` / `d` / `l`) and calls the impl method.
+- `$pion_drop_dyn(l box)` (box destructor) `pion_rc_dec`s `data` when `is_obj`; `$pion_freeze_dyn(l box)` freezes the box and, through `freeze_fn`, the concrete value, so a `dyn` value stored into a frozen container keeps an atomic RC end to end.
+- `Option[dyn Trait]` uses the **null niche**: `None` is the null pointer and `Some(d)` is the box pointer itself (no second allocation, no `$pion_drop_opt_obj` wrapper).
+- The dyn ABI is part of `PION_COMPILER_ABI_REV` `pionc-v0.10` (§6), so objects cached by older compilers are never linked against it.
 
 ### 4.2 Required Runtime C ABI Functions (`pion_rt.h`)
 All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_sysv`):
@@ -359,13 +377,19 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   ]
 }
 ```
-- `edits` (optional, emitted only when non-empty): machine-applicable patches `[{"file","line","col","end_line","end_col","replacement"}]` replacing the 1-based range `[line:col, end_line:end_col)` (end exclusive; an empty range is an insertion). Applying every edit of a diagnostic verbatim fixes it; each distinct edit is attached once. Covered today:
+- `edits` (optional, emitted only when non-empty): machine-applicable patches `[{"file","line","col","end_line","end_col","replacement"}]` replacing the 1-based range `[line:col, end_line:end_col)` (end exclusive, columns in bytes; an empty range is an insertion). Edits of one diagnostic never overlap: apply them from the last offset to the first. Each distinct edit is attached once. All 12 agent error classes of `benchmarks/agent_eval` carry one:
+  - `E_TYPE_MISMATCH` (return type) — a function body whose type contradicts the declared return type: rewrites the declared return type to the body's type.
+  - `E_TYPE_MISMATCH` (arity) — too many arguments: deletes the extra ones; too few: appends a type-default placeholder for each missing parameter (`0`, `""`, `false`, ...).
+  - `E_TYPE_MISMATCH` (unknown field) — replaces a misspelt field with the closest declared field when it is unique and within Levenshtein distance 2.
+  - `E_NON_EXHAUSTIVE` — inserts the missing `match` arms (`panic`-bodied) before the first arm.
+  - `E_PRIVATE_SYMBOL` — inserts `pub ` at the target declaration.
+  - `E_TRAIT_NOT_IMPLEMENTED` — appends an `impl Trait for Type { ... }` skeleton (every trait method with its signature, `panic("todo")` bodies) after the type's declaration (generic bounds and `dyn Trait` conversions).
+  - `E_TRAIT_METHOD_SIGNATURE` — rewrites the impl method's return type to the trait's.
+  - `E_NOT_SEND` — a captured non-`Send` local: wraps its declaration in `Mutex::new(...)` (and its type annotation in `Mutex[...]`), or prefixes the capture with `move` where ownership transfer fits. Uses of the binding inside the closure are left as they are and may need a second step (e.g. `with_lock`).
+  - `E_UNHANDLED_RESULT` — prefixes the discarded statement with `let _ = `.
+  - `E_CAPABILITY_MISSING` — inserts `world : World` as the first parameter of the enclosing function; its call sites then report the arity and need a second step passing `world`.
   - `E_MISSING_TYPE` — inserts the inferred return type (`-> T`).
   - `E_TYPE_MISMATCH` "cannot assign to immutable variable" — `let x` → `let mut x` at the declaration.
-  - `E_UNHANDLED_RESULT` — prefixes the discarded statement with `let _ = `.
-  - `E_NON_EXHAUSTIVE` — inserts the missing `match` arms (`panic`-bodied) before the first arm.
-  - `E_TRAIT_METHOD_SIGNATURE` — rewrites the impl method's return type to the trait's.
-  - `E_PRIVATE_SYMBOL` — inserts `pub ` at the target declaration.
 
 ### 5.2 `pionc query <kind> --json <path>`
 - `defs`: `{"defs":[{"pkg":"...","name":"...","kind":"fn|struct|enum","pub":true,"file":"...","line":10,"sig":"..."}]}`
@@ -374,8 +398,10 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `deps`: `{"packages":[{"name":"...","deps":["..."],"sig_hash":"..."}]}`
 - `<path>` may be a file, a package directory (its `src/` included) or a `pion.toml` workspace root: `defs`/`sig`/`callers` then cover every package in one call.
 
-### 5.3 `pionc test [--json] [--filter <substr>] <path>`
-- Runs all `test "name" { ... }` blocks in isolated child processes (active `debug_assert`, binary stored in `$PION_CACHE_DIR/bin/`).
+### 5.3 `pionc test [--json] [--package <name>] [--filter <substr>] [--jobs <n>] <path>`
+- Runs all `test "name" { ... }` blocks in isolated child processes (active `debug_assert`).
+- One pass over the workspace: the package graph is loaded, CAS-built and interface-checked once; packages without (matching) tests stop after type checking. Each tested package's test object is cached under `$PION_CACHE_DIR/testbin/` keyed by `sha256(compiler_fp | testobj | target | sha256(test SSA))`, and its linked test binary by that object key plus every linked dependency object (CAS path, size, mtime) and the link libraries — a dependency whose body or upstream interface changed has a new CAS path, so a stale binary is never reused. `testbin/` entries are LRU-tracked in `index.tsv` and evicted with the rest of the CAS.
+- Missing test binaries compile and link in parallel and every selected test runs in its own process in parallel, on up to `--jobs <n>` OS threads (default `$PION_JOBS`, else 16); results are reported in package order, then test order, so the JSON is identical for any `--jobs`. `PION_CAS_TRACE=1` prints per-phase `[test]` timings on stderr.
 - JSON output: `{"ok":bool,"passed":N,"failed":M,"tests":[{"name":"...","ok":bool}]}`
 - Workspace target (a directory with `pion.toml`): one invocation runs the tests of every local package (dependencies first; packages from the git cache are excluded) and reports `{"ok":bool,"total":N,"passed":N,"failed":M,"packages":["..."],"tests":[{"pkg":"...","name":"...","ok":bool}]}`; `--package <name>` restricts it to one package.
 - Additional diagnostic codes:
@@ -402,20 +428,30 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   regex = { git = "https://example.com/pion-std.git", tag = "v0.3.0", subdir = "std/regex" }
   # exactly one of tag = / rev = / branch = (none: the remote HEAD); subdir is optional
 
+  mylib = { git = "https://example.com/mylib.git", tag = "v1", version = "1.0.0", registry = "https://example.com/index.git" }
+  # written by `pionc add` from a registry: `registry` and the index `version` let `pionc update` re-read it
+
   [link]
   libs = ["sqlite3"]   # or: lib = "sqlite3"
+
+  [registry]
+  url = "https://example.com/pion-index.git"   # default registry for `pionc add <name>`
   ```
 - **Git dependencies & `pion.lock`**: git dependencies resolve into the global shared cache `$PION_CACHE_DIR/git/` (default `~/.cache/pion/git/`): bare mirrors `repos/<sha256(url)>.git` and read-only checkouts `checkouts/<rev>` (no `.git`), created atomically and shared zero-copy by every worktree. `<root>/pion.lock` pins each git dependency to a full commit (`version = 1`, then `[[package]]` tables with `name`, `git`, `ref`, `rev`, `subdir`, sorted, every key written); an entry is reused only while `pion.toml` requests the same name, URL, subdir and ref. A locked dependency whose checkout exists runs no `git` at all; tags and full revs resolve from the mirror, branches and HEAD always fetch. Only `<root>/pion.lock` is ever written, and only when it changes.
 - **`pionc fetch [--json] [dir]`**: resolves every git dependency, writes/verifies `pion.lock`, and prints `{"ok":true,"lock":"...","git_cache":"...","packages":[{"name","dir","source":"path|git"}],"git":[{"name","git","ref","rev","subdir"}]}`.
+- **Git-index registry**: a registry is any git repository (URL or local path) holding one `index/<name>.toml` per package: `name = "..."` (optional, must match), `version = "..."`, `git = "..."`, at most one of `tag` / `rev` / `branch`, optional `subdir`. Its index is mirrored in `$PION_CACHE_DIR/registry/<sha256(url)>.git` (default `~/.cache/pion/registry`), refreshed on every `add`/`update` that reads it; the package itself resolves like any git dependency.
+- **`pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]`**: sets `[dependencies] <name>` in `pion.toml` in place (only that line changes; idempotent), resolves it into the shared cache and `pion.lock`, and prints `{"ok":true,"action":"add","package":"...","source":"path|git|registry","location":"...","version":"...","rev":"...","changed":bool}`. Without `--path`/`--git` the registry is `--registry`, else `[registry] url`, else `$PION_REGISTRY` (none: `no source for ...`). A git source whose `pion.toml` declares another package name, an unknown registry package or a failed fetch print `{"ok":false,"error":"..."}` and restore `pion.toml` and `pion.lock` byte for byte.
+- **`pionc update [--json] [pkg] [dir]`**: re-reads the registry entry of every registry dependency (or only `pkg`), drops its lock pin, re-resolves every git dependency to its newest target ref, rewrites `pion.lock` and type-checks the workspace; prints `{"ok":true,"action":"update","packages":[{"name","ref","from","to","updated":bool}]}`. Updating a path dependency is an error; a failed resolution or a workspace that no longer checks restores `pion.toml` and `pion.lock` (`"check"` carries the diagnostics).
 - **`pionc init [--json] <dir>`**: writes `pion.toml`, `src/main.pion` and `main_test.pion` for a package named after the directory (`[a-z0-9_]`); the result passes `check`, `test`, `run` and `fmt --check` as is. Refuses to overwrite existing files.
 - **Cross-package traits**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. A package exporting a `pub` generic fn with trait bounds has no `.pionstub` (importers monomorphize from its source).
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.pionsig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.pionsig` yields 100% CAS hit on downstream `.o` files.
-- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.9`, ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.10` (since `dyn Trait`, §4.1.1), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
 - Default directory: `$PION_CACHE_DIR` or `$HOME/.cache/pion/cas`
 - Layout:
   - `sig/<sha256>.pionsig`
   - `ssa/<sha256>.ssa`
   - `obj/<sha256>.o`
+  - `testbin/<sha256>` (`pionc test` objects and binaries, §5.3)
   - `index.tsv` (`<key>\t<bytes>\t<last_access_ms>`)
 - Eviction: when total bytes exceed `$PION_CACHE_MAX_MB` (default 2048 MB), evict least-recently-used entries until under 80% watermark.
 - **Invariant**: Running `pionc check`, `pionc build`, or `pionc test` MUST leave `git status --ignored` completely clean inside the source worktree (except an explicitly requested `-o <out>` output binary path).
@@ -430,4 +466,4 @@ Plain Pion packages imported through `pion.toml` (`path` or `git` dependencies);
 - **`std/http`**: HTTP/1.1 over `World` TCP — `parse_request`/`parse_response` (with `Transfer-Encoding: chunked` bodies via `decode_chunked`), `parse_query` (`a=1&b=x%20y` → `Map[String, String]`, percent and `+` decoding), framing helpers `request_len`/`response_len`, `read_http_response`, keep-alive (`should_keep_alive`, where HTTP/1.0 defaults to close; `format_response_ka`/`format_request_ka`/`write_http_response_ka`) and `HttpConn` (`new_conn`, `conn_read_request`, `conn_read_response`), which keeps pipelined bytes between requests on one connection. Existing `Connection: close` APIs are unchanged.
 - **`std/net`**: non-blocking event-loop poller (`Poller`, `Event`, `EV_READ`/`EV_WRITE`/`EV_ERR`) over `kqueue` (macOS) / `epoll` (Linux) with `SO_REUSEPORT` multi-worker accept helpers.
 - **`std/regex`**: pure-Pion Thompson NFA executed by a Pike VM — linear time in the input for every pattern (no backtracking, no ReDoS). Syntax: literals, `.`, `\d \D \w \W \s \S`, classes `[...]`/`[^...]` with ranges, groups, `|`, greedy and lazy `* + ? {n} {n,} {n,m}`, anchors `^ $`; matching is UTF-8 aware. API: `compile(pattern) -> Result[Regex, String]` (errors carry the byte offset), `is_match`, `find`, `find_at`, `find_all -> Array[Match]` (byte offsets), `replace_all`, `escape`, `program_size`.
-- **`std/tls`**: TLS 1.2/1.3 client binding the system OpenSSL (`libssl`/`libcrypto`, 1.1.x or 3.x C ABI) through `extern "C"` declarations only — zero C glue; `[link] libs = ["ssl", "crypto"]`. SNI, certificate verification against OpenSSL's default CA store (`SSL_CERT_FILE`/`SSL_CERT_DIR` honoured) with host-name or IP checking, TLS 1.2 minimum. API: `tls_connect(w, host, port, verify_cert) -> Result[TlsConn, String]`, `tls_write`, `tls_read`, `tls_close`, `tls_protocol`, `tls_cipher`, `tls_version`, and `https_request` on top of `std/http`. Linux needs the `libssl.so`/`libcrypto.so` link names (Debian/Ubuntu `libssl-dev`); macOS needs Homebrew `openssl@3` and `CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`. `std/tls/e2e/run_e2e.sh <pionc>` performs real loopback TLS 1.3 and 1.2 handshakes against a Python `ssl` server and checks that a wrong host name is refused.
+- **`std/tls`**: TLS 1.2/1.3 client and server binding the system OpenSSL (`libssl`/`libcrypto`, 1.1.x or 3.x C ABI) through `extern "C"` declarations only — zero C glue; `[link] libs = ["ssl", "crypto"]`. SNI, certificate verification against OpenSSL's default CA store (`SSL_CERT_FILE`/`SSL_CERT_DIR` honoured) with host-name or IP checking, TLS 1.2 minimum. API: `tls_connect(w, host, port, verify_cert) -> Result[TlsConn, String]`, `tls_write`, `tls_read`, `tls_close`, `tls_protocol`, `tls_cipher`, `tls_version`, and `https_request` on top of `std/http`. Server: `tls_listen(w, host, port, cert_pem, key_pem) -> Result[TlsListener, String]` (one `TLS_server_method` `SSL_CTX` with the PEM certificate chain and private key, checked to match; TLS 1.2 minimum; port 0 = ephemeral, bound port in `listener.port`), `tls_accept(w, listener) -> Result[TlsConn, String]` (accept + handshake; a failed handshake closes only that connection; the client's SNI becomes `conn.host`), `tls_listener_close` and the HTTP helpers `tls_read_http_request(w, conn) -> Result[http::HttpRequest, String]` / `tls_write_http_response(w, conn, status, content_type, body)`. `TlsConn` has a private `owns_ctx`: client connections free their own `SSL_CTX` in `tls_close`, accepted connections borrow the listener's, which `tls_listener_close` frees exactly once. Linux needs the `libssl.so`/`libcrypto.so` link names (Debian/Ubuntu `libssl-dev`); macOS needs Homebrew `openssl@3` and `CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib`. `std/tls/e2e/run_e2e.sh <pionc>` performs real loopback TLS 1.3 and 1.2 handshakes against a Python `ssl` server and checks that a wrong host name is refused; `std/tls/e2e/run_server_e2e.sh <pionc>` drives the pure-Pion `examples/https_server` (self-test with 4 concurrent verified clients, key/certificate error paths, Python `ssl` and curl clients at TLS 1.3 and 1.2, a refused wrong host, exact `/stats`).

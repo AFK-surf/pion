@@ -414,6 +414,91 @@ def parse_diags(lang, so, se):
     return errors, warnings, has_fixit, structured, first.strip()
 
 
+# ---------------------------------------------------------------------------
+# Dimension 2 apply-edit-and-recheck: take the one diagnostic's machine-applicable
+# patch exactly as emitted, apply it to a scratch copy, run the same check again.
+# ---------------------------------------------------------------------------
+
+def machine_edits(lang, so):
+    """Byte-range patches of the first error diagnostic carrying a machine-applicable fix:
+    [(file, start_byte | (line, col), end_byte | (line, col), replacement)], or [].
+    Pion: every entry of that diagnostic's `edits` (1-based [line:col, end_line:end_col),
+    columns in bytes). Rust: every `MachineApplicable` span of the first child suggestion
+    (multipart suggestions stay together), using rustc's byte_start/byte_end."""
+    if lang == "pion":
+        try:
+            j = json.loads(so.strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            return []
+        for dg in j.get("diagnostics", []):
+            eds = dg.get("edits") or []
+            if eds:
+                return [(e.get("file", ""), (int(e["line"]), int(e["col"])),
+                         (int(e["end_line"]), int(e["end_col"])), e.get("replacement") or "") for e in eds]
+        return []
+    if lang == "rust":
+        for line in so.splitlines():
+            try:
+                j = json.loads(line)
+            except ValueError:
+                continue
+            if j.get("reason") != "compiler-message":
+                continue
+            msg = j.get("message", {})
+            if msg.get("level") != "error":
+                continue
+            for ch in [msg] + msg.get("children", []):
+                sps = [sp for sp in ch.get("spans", []) if sp.get("suggested_replacement") is not None
+                       and sp.get("suggestion_applicability") == "MachineApplicable"]
+                if sps:
+                    return [(sp["file_name"], int(sp["byte_start"]), int(sp["byte_end"]),
+                             sp["suggested_replacement"]) for sp in sps]
+        return []
+    return []
+
+
+def _byte_offset(data, pos):
+    if isinstance(pos, int):
+        return pos
+    line, col = pos
+    off = 0
+    for _ in range(line - 1):
+        nl = data.find(b"\n", off)
+        if nl < 0:
+            return len(data)
+        off = nl + 1
+    return off + col - 1
+
+
+def apply_machine_edits(src, dst, edits):
+    """Copies `src` to `dst` and applies `edits` verbatim: per file, from the last offset to the
+    first, so earlier patches never shift later ones. Returns the number applied."""
+    fresh_copy(src, dst)
+    by_file = {}
+    for f, a, b, rep in edits:
+        if os.path.isabs(f):
+            rel = os.path.relpath(f, src)
+        else:
+            rel = f
+        by_file.setdefault(os.path.normpath(os.path.join(dst, rel)), []).append((a, b, rep))
+    n = 0
+    for path, eds in by_file.items():
+        with open(path, "rb") as fh:
+            data = fh.read()
+        spans = sorted(((_byte_offset(data, a), _byte_offset(data, b), rep) for a, b, rep in eds),
+                       key=lambda t: (t[0], t[1]), reverse=True)
+        seen = set()
+        for a, b, rep in spans:
+            if (a, b, rep) in seen:
+                continue
+            seen.add((a, b, rep))
+            data = data[:a] + rep.encode("utf-8") + data[b:]
+            n += 1
+        with open(path, "wb") as fh:
+            fh.write(data)
+    return n
+
+
 def cmd_dim2(args):
     path = os.path.join(OUT, "dim2.json")
     res = load_json(path, {}) if (args.only or args.lang) else {}
@@ -478,6 +563,22 @@ def cmd_dim2(args):
                 "note": exp.get("note", ""),
                 "applicable": exp.get("applicable", True),
             }
+            edits = machine_edits(lang, so) if caught else []
+            e["edit_count"] = len(edits)
+            e["edit_recheck_clean"] = None
+            e["edit_recheck_errors"] = None
+            if edits:
+                fd = os.path.join(WORK, "dim2_edit", err, lang)
+                e["edit_count"] = apply_machine_edits(d, fd, edits)
+                frc, fso, fse, _ = run(CHECK_CMDS[lang](fd), fd)
+                ferrs = parse_diags(lang, fso, fse)[0]
+                if frc != 0 and ferrs == 0:
+                    ferrs = 1  # a failing check that printed no parsable diagnostic still is not clean
+                e["edit_recheck_errors"] = ferrs
+                e["edit_recheck_clean"] = frc == 0 and ferrs == 0
+                if not e["edit_recheck_clean"]:
+                    e["edit_recheck_first"] = parse_diags(lang, fso, fse)[4][:300]
+                shutil.rmtree(fd, ignore_errors=True)
             if lang == "go" and exp.get("race_probe"):
                 rrc, rso, rse, rms = run(["go", "run", "-race", "."], d, timeout=300)
                 e["runtime_race_detector"] = {
@@ -489,9 +590,11 @@ def cmd_dim2(args):
             if not consistent:
                 e["raw_tail"] = (so + se)[-3000:]
             entry[lang] = e
-            print("[dim2] %s %-7s caught=%s errs=%d warns=%d %.0fms %dB json=%s fixit=%s ok=%s | %s" % (
+            print("[dim2] %s %-7s caught=%s errs=%d warns=%d %.0fms %dB json=%s fixit=%s edit=%s ok=%s | %s" % (
                 err, lang, caught, errors, warnings, e["latency"]["median_ms"], out_bytes, structured,
-                has_fixit, consistent, first[:110]), flush=True)
+                has_fixit, "-" if e["edit_recheck_errors"] is None else
+                ("clean" if e["edit_recheck_clean"] else "recheck:%d" % e["edit_recheck_errors"]),
+                consistent, first[:110]), flush=True)
             if not consistent:
                 print((so + se)[-2000:], flush=True)
     write_json(path, res)

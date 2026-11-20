@@ -26,7 +26,8 @@ FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DI
   "$ROOT_DIR/tests/e2e/net_ffi.pion" "$ROOT_DIR/tests/e2e/link_z" "$ROOT_DIR/examples/http_kv_service" \
   "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/examples/sqlite_indexer" \
   "$ROOT_DIR/tests/e2e/utf8_text.pion" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" \
-  "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
+  "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" "$ROOT_DIR/examples/https_server" \
+  "$ROOT_DIR/tests/e2e/dyn_trait.pion")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
 if ! printf '%s' "$FMT_OUT" | grep -q '"ok":true'; then
   echo "FAIL: pionc2 fmt --check --json reported unformatted files" >&2
@@ -135,5 +136,28 @@ if ! printf '%s' "$CROSS_FILE" | grep -q 'ELF 64-bit LSB relocatable, x86-64'; t
   exit 1
 fi
 rm -f "$CROSS_O"
+# dyn Trait: fat-pointer dispatch, vtables, Option[dyn Trait] niche, freeze/drop.
+"$PIONC2" build -o "$OUT_DIR/dyn_trait" "$ROOT_DIR/tests/e2e/dyn_trait.pion"
+DYN_OUT=$("$OUT_DIR/dyn_trait")
+rm -f "$OUT_DIR/dyn_trait"
+echo "dyn_trait -> $DYN_OUT"
+if [ "$DYN_OUT" != "dyn_trait ok" ]; then
+  echo "FAIL: dyn_trait output mismatch" >&2
+  exit 1
+fi
+# pionc add / update against an offline git-index registry.
+sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
+# examples/https_server links the system OpenSSL; GitHub's macos-15 runner has no
+# Homebrew openssl@3, so this runs only where it is installed.
+if [ -d /opt/homebrew/opt/openssl@3/lib ]; then
+  HTTPS_OUT=$(CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib "$PIONC2" test --json "$ROOT_DIR/examples/https_server")
+  printf 'pionc2 test --json examples/https_server -> %s\n' "$HTTPS_OUT"
+  if ! printf '%s' "$HTTPS_OUT" | grep -q '"ok":true' || ! printf '%s' "$HTTPS_OUT" | grep -q '"failed":0'; then
+    echo "FAIL: pionc2 test --json examples/https_server failed" >&2
+    exit 1
+  fi
+else
+  echo "NOTE: /opt/homebrew/opt/openssl@3/lib not found; skipping examples/https_server tests"
+fi
 
 echo "=== ALL 6 VERIFY-ALL GATES PASSED ==="
