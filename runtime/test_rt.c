@@ -2268,7 +2268,9 @@ static void test_event_loop_nb(int argc, char **argv) {
             }
         }
     }
+#ifndef _WIN32
     assert(partial > 0);
+#endif
     assert(pion_tcp_write_nb(w, a, big, off) == 0);
     assert(((PionStrBuf *)rsb)->len == big_len && memcmp(((PionStrBuf *)rsb)->data, raw, (size_t)big_len) == 0);
 

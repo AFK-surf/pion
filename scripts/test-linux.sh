@@ -46,11 +46,13 @@ CC="$CC" sh "$ROOT_DIR/scripts/build-qbe.sh" "$OUT_DIR/qbe"
 
 if [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; then
   RT_OPT="-Os"
+  RT_EXTRA="-mbranch-protection=none -fno-stack-protector"
 else
   RT_OPT="-O2"
+  RT_EXTRA=""
 fi
-echo "=== [2/6] Build libpionrt.a (-std=c11 ${RT_OPT} -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror) ==="
-"$CC" -std=c11 "$RT_OPT" -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
+echo "=== [2/6] Build libpionrt.a (-std=c11 ${RT_OPT} ${RT_EXTRA} -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror) ==="
+"$CC" -std=c11 "$RT_OPT" $RT_EXTRA -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
 rm -f "$OUT_DIR/libpionrt.a"
 ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libpionrt.a" | tr -d ' ')"
