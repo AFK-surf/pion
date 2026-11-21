@@ -858,7 +858,29 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 	} else
 		e->fp = RSP;
 	winabi_framesz(e);
-	if (e->fsz)
+	/* Windows commits the stack on demand behind a single 4 KB
+	 * guard page: a frame of 4 KB or more must touch every page
+	 * in order (inline __chkstk; %r11 is volatile and dead here). */
+	if (e->fsz >= 4096) {
+		static int chkstk_id;
+		int cid = chkstk_id++;
+		fprintf(f,
+			"\tmovq $%"PRIu64", %%r11\n"
+			"%schkstk%d:\n"
+			"\tsubq $4096, %%rsp\n"
+			"\torq $0, (%%rsp)\n"
+			"\tsubq $4096, %%r11\n"
+			"\tcmpq $4096, %%r11\n"
+			"\tjae %schkstk%d\n"
+			"\tsubq %%r11, %%rsp\n"
+			"\torq $0, (%%rsp)\n",
+			e->fsz, T.asloc, cid, T.asloc, cid);
+	} else if (e->fsz >= 4000) {
+		fprintf(f,
+			"\tsubq $%"PRIu64", %%rsp\n"
+			"\torq $0, (%%rsp)\n",
+			e->fsz);
+	} else if (e->fsz)
 		fprintf(f, "\tsubq $%"PRIu64", %%rsp\n", e->fsz);
 	for (r=amd64_winabi_rclob; r<&amd64_winabi_rclob[NCLR_WIN]; r++)
 		if (fn->reg & BIT(*r)) {

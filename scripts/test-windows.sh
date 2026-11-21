@@ -62,11 +62,11 @@ export PION_RT_LIB="$OUT_DIR/libpionrt.a"
 export PION_CACHE_DIR="$TMP_DIR/cas_win"
 mkdir -p "$PION_CACHE_DIR"
 
-echo "=== [3.5/5] Windows single-file smoke (check + run) before Stage 3 ==="
+echo "=== [3.5/5] Windows single-file smoke (check) before Stage 3 ==="
+# Only `check` here: the seed's driver links without `-lws2_32`, so its `run`
+# cannot link on Windows; `run` is exercised with the Stage 3 binary below.
 "$OUT_DIR/pionc_win.exe" check --json "$ROOT_DIR/tests/frontend/ok_full.pion"
 echo
-HELLO_OUT="$("$OUT_DIR/pionc_win.exe" run "$ROOT_DIR/tests/e2e/hello.pion" | tr -d '\r')"
-echo "pionc_win run hello -> $HELLO_OUT"
 
 echo "=== [4/5] Windows Native Self-Hosting Fixed-Point (Stage 3 == Stage 4) ==="
 # The seed's driver predates amd64_win linking (it links `-lm -lpthread`, no
@@ -83,6 +83,14 @@ T_S3_0="$(now_ms)"
 T_S3_1="$(now_ms)"
 S3_SIZE="$(wc -c < "$TMP_DIR/pionc_win_s3.exe" | tr -d ' ')"
 echo "Windows x86_64 native self-host Stage 3: build=$((T_S3_1 - T_S3_0))ms, binary=${S3_SIZE} bytes"
+
+# This tree's driver links amd64_win with `-lws2_32 -Wl,--stack,16777216`: prove `run` end to end.
+HELLO_OUT="$("$TMP_DIR/pionc_win_s3.exe" run "$ROOT_DIR/tests/e2e/hello.pion" | tr -d '\r')"
+echo "pionc_win_s3 run hello -> $HELLO_OUT"
+case "$HELLO_OUT" in
+  *hello*) ;;
+  *) echo "FAIL: pionc_win_s3 run hello.pion output mismatch: '$HELLO_OUT'" >&2; exit 1 ;;
+esac
 
 # Stage 4 runs with PION_TARGET unset to prove pionc_win_s3 auto-detects Windows -> amd64_win!
 unset PION_TARGET || true

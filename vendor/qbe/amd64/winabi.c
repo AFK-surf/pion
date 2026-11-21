@@ -424,8 +424,12 @@ static Ins* lower_call(Fn* func,
           emit(Ostorel, 0, R, smalltmp, slot);
           emit(Oload, arg->cls, smalltmp, instr->arg[1], R);
         } else {
-          // Stash the value into the stack slot.
-          emit(Ostorel, 0, R, instr->arg[0], slot);
+          // Stash the value into the stack slot with a store of its class.
+          int store_op = instr->cls == Kd   ? Ostored
+                         : instr->cls == Ks ? Ostores
+                         : instr->cls == Kw ? Ostorew
+                                            : Ostorel;
+          emit(store_op, 0, R, instr->arg[0], slot);
         }
         emit(Oadd, Kl, slot, arg_stack_slots, getcon(slot_offset, func));
         slot_offset += arg->size;
@@ -676,7 +680,7 @@ static RegisterUsage lower_func_parameters(Fn* func) {
           emit(Ocopy, instr->cls, arg->ref, SLOT(-slot_offset), R);
           emit(Oalloc8, Kl, instr->to, getcon(arg->size, func), R);
         } else {
-          emit(Ocopy, Kl, instr->to, SLOT(-slot_offset), R);
+          emit(Oload, instr->cls, instr->to, SLOT(-slot_offset), R);
         }
         slot_offset += 2;
         break;
