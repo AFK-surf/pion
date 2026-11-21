@@ -1176,6 +1176,9 @@ fn drv_load_workspace_dfs(
     paths: loaded_src.paths,
     sources: loaded_src.sources,
     link_libs: mf.link_libs,
+    link_common: mf.link_common,
+    link_macos: mf.link_macos,
+    link_linux: mf.link_linux,
   })
   Ok(())
 }
@@ -1280,13 +1283,358 @@ fn drv_is_external_pkg(git_root : String, dir : String) -> Bool {
 }
 
 ///|
+struct DrvLinkOpts {
+  libs : Array[String]
+  frameworks : Array[String]
+  search_paths : Array[String]
+  rpaths : Array[String]
+  objects : Array[String]
+  flags : Array[String]
+  mut has_cxx : Bool
+}
+
+///|
+fn drv_link_opts_empty() -> DrvLinkOpts {
+  DrvLinkOpts::{
+    libs: [],
+    frameworks: [],
+    search_paths: [],
+    rpaths: [],
+    objects: [],
+    flags: [],
+    has_cxx: false,
+  }
+}
+
+///|
+fn drv_is_cxx_lib(lib : String) -> Bool {
+  lib == "c++" || lib == "stdc++"
+}
+
+///|
+fn drv_is_cxx_source(path : String) -> Bool {
+  drv_ends_with(path, ".cc") ||
+  drv_ends_with(path, ".cpp") ||
+  drv_ends_with(path, ".mm")
+}
+
+///|
+fn drv_link_opts_from_libs(libs : Array[String]) -> DrvLinkOpts {
+  let opts = drv_link_opts_empty()
+  let mut i = 0
+  while i < libs.length() {
+    let lib = libs[i]
+    push_unique_lib(opts.libs, lib)
+    if drv_is_cxx_lib(lib) {
+      opts.has_cxx = true
+    }
+    i = i + 1
+  }
+  opts
+}
+
+///|
+fn drv_resolve_pkg_path(pkg_dir : String, p : String) -> String {
+  if p.length() > 0 && str_code_at(p, 0) == 47 {
+    p
+  } else {
+    drv_resolve_rel_path(pkg_dir, p)
+  }
+}
+
+///|
+fn drv_resolve_rpath(pkg_dir : String, p : String) -> String {
+  if p.length() > 0 {
+    let c0 = str_code_at(p, 0)
+    if c0 == 47 || c0 == 64 || c0 == 36 {
+      return p
+    }
+  }
+  drv_resolve_rel_path(pkg_dir, p)
+}
+
+///|
+fn drv_resolve_cc_flag(pkg_dir : String, flag : String) -> String {
+  if flag.length() > 2 && drv_starts_with(flag, "-I") {
+    let inc = slice_str(flag, 2, flag.length())
+    if str_code_at(inc, 0) != 47 {
+      return "-I" + drv_resolve_rel_path(pkg_dir, inc)
+    }
+  }
+  flag
+}
+
+///|
+fn drv_collect_link_spec(
+  pkg_dir : String,
+  spec : LinkSpec,
+  is_macos : Bool,
+  opts : DrvLinkOpts,
+) -> Unit {
+  let mut i = 0
+  while i < spec.libs.length() {
+    let lib = spec.libs[i]
+    push_unique_lib(opts.libs, lib)
+    if drv_is_cxx_lib(lib) {
+      opts.has_cxx = true
+    }
+    i = i + 1
+  }
+  if is_macos {
+    i = 0
+    while i < spec.frameworks.length() {
+      push_unique_lib(opts.frameworks, spec.frameworks[i])
+      i = i + 1
+    }
+  }
+  i = 0
+  while i < spec.search_paths.length() {
+    push_unique_lib(
+      opts.search_paths,
+      drv_resolve_pkg_path(pkg_dir, spec.search_paths[i]),
+    )
+    i = i + 1
+  }
+  i = 0
+  while i < spec.rpaths.length() {
+    push_unique_lib(opts.rpaths, drv_resolve_rpath(pkg_dir, spec.rpaths[i]))
+    i = i + 1
+  }
+  i = 0
+  while i < spec.objects.length() {
+    push_unique_lib(
+      opts.objects,
+      drv_resolve_pkg_path(pkg_dir, spec.objects[i]),
+    )
+    i = i + 1
+  }
+  i = 0
+  while i < spec.flags.length() {
+    if spec.flags[i].length() > 0 {
+      opts.flags.push(spec.flags[i])
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn drv_collect_node_link_opts(
+  node : PkgNodeInput,
+  qbe_target : String,
+  opts : DrvLinkOpts,
+) -> Unit {
+  let is_macos = qbe_target == "arm64_apple"
+  drv_collect_link_spec(node.dir, node.link_common, is_macos, opts)
+  if is_macos {
+    drv_collect_link_spec(node.dir, node.link_macos, is_macos, opts)
+  } else {
+    drv_collect_link_spec(node.dir, node.link_linux, is_macos, opts)
+  }
+}
+
+///|
+fn drv_collect_dir_headers(
+  world : World,
+  dir : String,
+  out : Array[String],
+) -> Unit {
+  if dir.length() == 0 || !fs_is_dir(world, dir) {
+    return
+  }
+  let entries = fs_list_dir(world, dir)
+  let mut i = 0
+  while i < entries.length() {
+    let name = entries[i]
+    if drv_ends_with(name, ".h") || drv_ends_with(name, ".hpp") {
+      let full = drv_join_path(dir, name)
+      out.push(
+        full +
+        ":" +
+        fs_size(world, full).to_string() +
+        ":" +
+        fs_mtime_ms(world, full).to_string(),
+      )
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn drv_local_headers_fp(
+  world : World,
+  pkg_dir : String,
+  src_dir : String,
+) -> String {
+  let entries : Array[String] = []
+  drv_collect_dir_headers(world, pkg_dir, entries)
+  if src_dir.length() > 0 && src_dir != pkg_dir {
+    drv_collect_dir_headers(world, src_dir, entries)
+  }
+  drv_sort_strings(entries)
+  sha256_hex(drv_join_char(entries, "\n"))
+}
+
+///|
+/// Compiles a package's active `c_sources` (`[link]` + platform section) into
+/// `$PION_CACHE_DIR/obj/cstub_<key>.o` (atomic temp + rename, LRU-tracked).
+/// Returns `Ok(true)` if any compiled source is C++/ObjC++ (`.cc`/`.cpp`/`.mm`).
+fn drv_compile_pkg_c_sources(
+  world : World,
+  node : PkgNodeInput,
+  qbe_target : String,
+  rt_lib : String,
+  cache_dir : String,
+  trace_cas : Bool,
+  out_objs : Array[String],
+  out_keys : Array[String],
+  out_new_keys : Array[String],
+  out_new_sizes : Array[Int64],
+) -> Result[Bool, String] {
+  let is_macos = qbe_target == "arm64_apple"
+  let plat = if is_macos { node.link_macos } else { node.link_linux }
+  let c_sources : Array[String] = []
+  let mut i = 0
+  while i < node.link_common.c_sources.length() {
+    push_unique_lib(
+      c_sources,
+      drv_resolve_pkg_path(node.dir, node.link_common.c_sources[i]),
+    )
+    i = i + 1
+  }
+  i = 0
+  while i < plat.c_sources.length() {
+    push_unique_lib(c_sources, drv_resolve_pkg_path(node.dir, plat.c_sources[i]))
+    i = i + 1
+  }
+  if c_sources.length() == 0 {
+    return Ok(false)
+  }
+  let cc_flags : Array[String] = []
+  i = 0
+  while i < node.link_common.cc_flags.length() {
+    cc_flags.push(drv_resolve_cc_flag(node.dir, node.link_common.cc_flags[i]))
+    i = i + 1
+  }
+  i = 0
+  while i < plat.cc_flags.length() {
+    cc_flags.push(drv_resolve_cc_flag(node.dir, plat.cc_flags[i]))
+    i = i + 1
+  }
+  let rt_dir_raw = drv_parent_dir(rt_lib)
+  let rt_dir = if rt_dir_raw.length() > 0 { rt_dir_raw } else { "." }
+  let rt_inc_dirs : Array[String] = [rt_dir]
+  let alt_rt_dir = drv_resolve_rel_path(rt_dir, "../runtime")
+  if alt_rt_dir != rt_dir &&
+    fs_exists(world, drv_join_path(alt_rt_dir, "pion_rt.h")) {
+    rt_inc_dirs.push(alt_rt_dir)
+  }
+  let cc_flags_joined = drv_join_char(cc_flags, "\n")
+  let cc_env = drv_env_str(world, "CC")
+  let cxx_env = drv_env_str(world, "CXX")
+  let cc_bin = if cc_env.length() > 0 { cc_env } else { "cc" }
+  let cxx_bin = if cxx_env.length() > 0 { cxx_env } else { "c++" }
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let mut any_cxx = false
+  let mut si = 0
+  while si < c_sources.length() {
+    let src_path = c_sources[si]
+    if !fs_exists(world, src_path) {
+      return Err("c_source does not exist: " + src_path)
+    }
+    let is_cxx = drv_is_cxx_source(src_path)
+    if is_cxx {
+      any_cxx = true
+    }
+    let compiler = if is_cxx { cxx_bin } else { cc_bin }
+    let src_txt = match fs_read(world, src_path) {
+      Ok(t) => t
+      Err(e) => return Err("failed to read c_source " + src_path + ": " + e)
+    }
+    let src_hash = sha256_hex(src_txt)
+    let headers_fp = drv_local_headers_fp(
+      world,
+      node.dir,
+      drv_parent_dir(src_path),
+    )
+    let key = sha256_hex(
+      "cstub-v1|" +
+      qbe_target +
+      "|" +
+      compiler +
+      "|" +
+      cc_flags_joined +
+      "|" +
+      src_path +
+      "|" +
+      src_hash +
+      "|" +
+      headers_fp,
+    )
+    let obj_path = cache_dir + "/obj/cstub_" + key + ".o"
+    if fs_exists(world, obj_path) {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas] cstub=" + src_path + " HIT key=" + drv_prefix16(key),
+        )
+      }
+    } else {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas] cstub=" + src_path + " MISS key=" + drv_prefix16(key),
+        )
+      }
+      let stamp = clock_now_ms(world).to_string()
+      let obj_tmp = obj_path + ".tmp." + stamp + "_" + si.to_string()
+      let argv : Array[String] = [compiler]
+      let mut fi = 0
+      while fi < cc_flags.length() {
+        argv.push(cc_flags[fi])
+        fi = fi + 1
+      }
+      let mut ri = 0
+      while ri < rt_inc_dirs.length() {
+        argv.push("-I" + rt_inc_dirs[ri])
+        ri = ri + 1
+      }
+      argv.push("-c")
+      argv.push(src_path)
+      argv.push("-o")
+      argv.push(obj_tmp)
+      let rc = proc_exec(world, argv)
+      if rc != 0 {
+        let _ = fs_remove(world, obj_tmp)
+        return Err(
+          "failed to compile c_source " +
+          src_path +
+          " with " +
+          compiler +
+          " (exit code " +
+          rc.to_string() +
+          ")",
+        )
+      }
+      let _ = fs_rename(world, obj_tmp, obj_path)
+      let sz = fs_size(world, obj_path)
+      out_new_keys.push("cstub_" + key)
+      out_new_sizes.push(if sz > 0L { sz } else { 0L })
+    }
+    out_objs.push(obj_path)
+    out_keys.push(key)
+    si = si + 1
+  }
+  Ok(any_cxx)
+}
+
+///|
 struct DrvWsBuilt {
   root_pkg_name : String
   root_checked : Option[CheckedPackage]
   obj_paths : Array[String]
   dep_pkg_names : Array[String]
   link_key : String
-  link_libs : Array[String]
+  link_opts : DrvLinkOpts
 }
 
 ///|
@@ -1323,30 +1671,69 @@ fn drv_pick_target(world : World, target_override : String) -> String {
 }
 
 ///|
-/// Cache-key suffix for extra link libraries ("" when none, so keys stay stable).
-fn drv_libs_key(link_libs : Array[String]) -> String {
-  if link_libs.length() == 0 {
+/// Cache-key suffix for extra link options ("" when empty, so keys stay stable).
+/// Includes every `objects` file's `(path, size, mtime_ms)` so rebuilt `.a`/`.o`/`.dylib`
+/// invalidate the linked binary automatically.
+fn drv_link_opts_key(world : World, opts : DrvLinkOpts) -> String {
+  if opts.libs.length() == 0 &&
+    opts.frameworks.length() == 0 &&
+    opts.search_paths.length() == 0 &&
+    opts.rpaths.length() == 0 &&
+    opts.objects.length() == 0 &&
+    opts.flags.length() == 0 &&
+    !opts.has_cxx {
     return ""
   }
   let sb = StringBuilder()
-  sb.write_string("|link:")
-  let mut i = 0
-  while i < link_libs.length() {
-    if i > 0 {
-      sb.write_string(",")
+  if opts.libs.length() > 0 {
+    sb.write_string("|link:")
+    sb.write_string(drv_join_char(opts.libs, ","))
+  }
+  if opts.frameworks.length() > 0 {
+    sb.write_string("|fw:")
+    sb.write_string(drv_join_char(opts.frameworks, ","))
+  }
+  if opts.search_paths.length() > 0 {
+    sb.write_string("|L:")
+    sb.write_string(drv_join_char(opts.search_paths, ","))
+  }
+  if opts.rpaths.length() > 0 {
+    sb.write_string("|rpath:")
+    sb.write_string(drv_join_char(opts.rpaths, ","))
+  }
+  if opts.objects.length() > 0 {
+    sb.write_string("|obj:")
+    let mut i = 0
+    while i < opts.objects.length() {
+      if i > 0 {
+        sb.write_string(",")
+      }
+      let op = opts.objects[i]
+      sb.write_string(op)
+      sb.write_string(":")
+      sb.write_string(fs_size(world, op).to_string())
+      sb.write_string(":")
+      sb.write_string(fs_mtime_ms(world, op).to_string())
+      i = i + 1
     }
-    sb.write_string(link_libs[i])
-    i = i + 1
+  }
+  if opts.flags.length() > 0 {
+    sb.write_string("|flags:")
+    sb.write_string(drv_join_char(opts.flags, "\n"))
+  }
+  if opts.has_cxx {
+    sb.write_string("|cxx:1")
   }
   sb.to_string()
 }
 
 ///|
-fn drv_bin_key(key : String, link_libs : Array[String]) -> String {
-  if link_libs.length() == 0 {
+fn drv_bin_key(world : World, key : String, opts : DrvLinkOpts) -> String {
+  let suffix = drv_link_opts_key(world, opts)
+  if suffix.length() == 0 {
     key
   } else {
-    sha256_hex(key + drv_libs_key(link_libs))
+    sha256_hex(key + suffix)
   }
 }
 
@@ -1447,14 +1834,21 @@ fn drv_compile_ssa_to_obj(
 ///|
 fn drv_link_objects(
   world : World,
+  qbe_target : String,
   apple_tools : AppleTools,
   ld_ver : String,
   obj_paths : Array[String],
   rt_lib : String,
-  link_libs : Array[String],
+  opts : DrvLinkOpts,
   final_bin : String,
 ) -> Result[Unit, String] {
-  let rc_ld = if apple_tools.ok {
+  let is_simple = opts.frameworks.length() == 0 &&
+    opts.search_paths.length() == 0 &&
+    opts.rpaths.length() == 0 &&
+    opts.objects.length() == 0 &&
+    opts.flags.length() == 0 &&
+    !opts.has_cxx
+  let rc_ld = if apple_tools.ok && is_simple {
     let ld_argv : Array[String] = [
       apple_tools.ld_bin,
       "-arch",
@@ -1476,14 +1870,21 @@ fn drv_link_objects(
     }
     ld_argv.push(rt_lib)
     let mut li = 0
-    while li < link_libs.length() {
-      ld_argv.push("-l" + link_libs[li])
+    while li < opts.libs.length() {
+      ld_argv.push("-l" + opts.libs[li])
       li = li + 1
     }
     ld_argv.push("-lSystem")
     proc_exec(world, ld_argv)
   } else {
-    let cc = {
+    let driver = if opts.has_cxx {
+      let e = drv_env_str(world, "CXX")
+      if e.length() > 0 {
+        e
+      } else {
+        "c++"
+      }
+    } else {
       let e = drv_env_str(world, "CC")
       if e.length() > 0 {
         e
@@ -1491,20 +1892,50 @@ fn drv_link_objects(
         "cc"
       }
     }
-    let ld_argv : Array[String] = [cc]
+    let ld_argv : Array[String] = [driver]
     let mut oi = 0
     while oi < obj_paths.length() {
       ld_argv.push(obj_paths[oi])
       oi = oi + 1
     }
     ld_argv.push(rt_lib)
+    let mut exi = 0
+    while exi < opts.objects.length() {
+      ld_argv.push(opts.objects[exi])
+      exi = exi + 1
+    }
+    let mut spi = 0
+    while spi < opts.search_paths.length() {
+      ld_argv.push("-L" + opts.search_paths[spi])
+      spi = spi + 1
+    }
+    let mut rpi = 0
+    while rpi < opts.rpaths.length() {
+      ld_argv.push("-Wl,-rpath," + opts.rpaths[rpi])
+      rpi = rpi + 1
+    }
+    if qbe_target == "arm64_apple" {
+      let mut fwi = 0
+      while fwi < opts.frameworks.length() {
+        ld_argv.push("-framework")
+        ld_argv.push(opts.frameworks[fwi])
+        fwi = fwi + 1
+      }
+    }
     let mut li = 0
-    while li < link_libs.length() {
-      ld_argv.push("-l" + link_libs[li])
+    while li < opts.libs.length() {
+      ld_argv.push("-l" + opts.libs[li])
       li = li + 1
     }
-    ld_argv.push("-lm")
-    ld_argv.push("-lpthread")
+    let mut fli = 0
+    while fli < opts.flags.length() {
+      ld_argv.push(opts.flags[fli])
+      fli = fli + 1
+    }
+    if qbe_target != "arm64_apple" {
+      ld_argv.push("-lm")
+      ld_argv.push("-lpthread")
+    }
     ld_argv.push("-o")
     ld_argv.push(final_bin)
     proc_exec(world, ld_argv)
@@ -2061,17 +2492,45 @@ fn drv_build_nodes_objects(
   }
 
   let root_pkg_name = nodes[topo.order[n - 1]].name
-  // `[link]` libraries of every package in topo order (deps first), de-duplicated.
-  let ws_libs : Array[String] = []
+  // Collect `[link]` / `[link.<os>]` options and compile `c_sources` in topo order (deps first).
+  let ws_link_opts = drv_link_opts_empty()
+  let cstub_new_keys : Array[String] = []
+  let cstub_new_sizes : Array[Int64] = []
   k = 0
   while k < n {
-    let ln = nodes[topo.order[k]].link_libs
-    let mut li = 0
-    while li < ln.length() {
-      push_unique_lib(ws_libs, ln[li])
-      li = li + 1
+    let node = nodes[topo.order[k]]
+    drv_collect_node_link_opts(node, qbe_target, ws_link_opts)
+    let cstub_objs : Array[String] = []
+    let cstub_keys : Array[String] = []
+    match drv_compile_pkg_c_sources(
+      world,
+      node,
+      qbe_target,
+      rt_lib,
+      cache_dir,
+      trace_cas,
+      cstub_objs,
+      cstub_keys,
+      cstub_new_keys,
+      cstub_new_sizes,
+    ) {
+      Err(e) => return Err(e)
+      Ok(has_cxx) =>
+        if has_cxx {
+          ws_link_opts.has_cxx = true
+        }
+    }
+    let mut ci = 0
+    while ci < cstub_objs.length() {
+      obj_paths.push(cstub_objs[ci])
+      link_key_sb.write_string(":cstub:")
+      link_key_sb.write_string(cstub_keys[ci])
+      ci = ci + 1
     }
     k = k + 1
+  }
+  if cstub_new_keys.length() > 0 {
+    drv_cas_record_batch_and_evict(world, cache_dir, cstub_new_keys, cstub_new_sizes)
   }
   Ok(DrvWsBuilt::{
     root_pkg_name: root_pkg_name,
@@ -2079,7 +2538,7 @@ fn drv_build_nodes_objects(
     obj_paths: obj_paths,
     dep_pkg_names: dep_pkg_names,
     link_key: sha256_hex(link_key_sb.to_string()),
-    link_libs: ws_libs,
+    link_opts: ws_link_opts,
   })
 }
 
@@ -2121,15 +2580,13 @@ fn drv_build_targets(
           }
           return drv_copy_file(world, built.obj_paths[0], emit_obj_path)
         }
-        let link_libs : Array[String] = []
+        let link_opts = built.link_opts
         let mut li = 0
-        while li < built.link_libs.length() {
-          push_unique_lib(link_libs, built.link_libs[li])
-          li = li + 1
-        }
-        li = 0
         while li < cli_libs.length() {
-          push_unique_lib(link_libs, cli_libs[li])
+          push_unique_lib(link_opts.libs, cli_libs[li])
+          if drv_is_cxx_lib(cli_libs[li]) {
+            link_opts.has_cxx = true
+          }
           li = li + 1
         }
         let root_pkg = built.root_pkg_name
@@ -2138,7 +2595,7 @@ fn drv_build_targets(
           "/bin/" +
           root_pkg +
           "_" +
-          drv_prefix16(drv_bin_key(built.link_key, link_libs))
+          drv_prefix16(drv_bin_key(world, built.link_key, link_opts))
         let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
         if out_bin_arg == "" && fs_exists(world, final_bin) {
           return Ok(final_bin)
@@ -2157,11 +2614,12 @@ fn drv_build_targets(
         let rt_lib = drv_resolve_rt_lib(world)
         match drv_link_objects(
           world,
+          qbe_target,
           apple_tools,
           ld_ver,
           built.obj_paths,
           rt_lib,
-          link_libs,
+          link_opts,
           final_bin,
         ) {
           Err(e) => return Err(e)
@@ -2196,7 +2654,7 @@ fn drv_build_targets(
   let fp_pre = drv_prefix16(compiler_fp)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target) && emit_asm_path == ""
-  let link_libs = cli_libs
+  let link_opts = drv_link_opts_from_libs(cli_libs)
   let qbe_macos_ver = if apple_tools.macos_ver.length() > 0 {
     apple_tools.macos_ver
   } else {
@@ -2330,7 +2788,7 @@ fn drv_build_targets(
       "/bin/" +
       pkg_name +
       "_" +
-      drv_prefix16(drv_bin_key(pkg_key, link_libs))
+      drv_prefix16(drv_bin_key(world, pkg_key, link_opts))
     let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
 
     if miss_indices.length() == 0 && out_bin_arg == "" && fs_exists(world, final_bin) {
@@ -2671,7 +3129,7 @@ fn drv_build_targets(
       drv_ensure_parent_dir(world, out_bin_arg)
     }
     let rt_lib = drv_resolve_rt_lib(world)
-    match drv_link_objects(world, apple_tools, ld_ver, obj_paths, rt_lib, link_libs, final_bin) {
+    match drv_link_objects(world, qbe_target, apple_tools, ld_ver, obj_paths, rt_lib, link_opts, final_bin) {
       Err(e) => return Err(e)
       Ok(_) => ()
     }
@@ -2693,7 +3151,7 @@ fn drv_build_targets(
     "/bin/" +
     pkg_name +
     "_" +
-    drv_prefix16(drv_bin_key(key, link_libs))
+    drv_prefix16(drv_bin_key(world, key, link_opts))
   let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
 
   let mut has_main = true
@@ -2836,7 +3294,7 @@ fn drv_build_targets(
     drv_ensure_parent_dir(world, out_bin_arg)
   }
   let rt_lib = drv_resolve_rt_lib(world)
-  match drv_link_objects(world, apple_tools, ld_ver, [obj_path], rt_lib, link_libs, final_bin) {
+  match drv_link_objects(world, qbe_target, apple_tools, ld_ver, [obj_path], rt_lib, link_opts, final_bin) {
     Err(e) => Err(e)
     Ok(_) => Ok(final_bin)
   }
@@ -2851,7 +3309,7 @@ struct DrvTestJob {
   names : Array[String]
   run_idx : Array[Int]
   dep_objs : Array[String]
-  link_libs : Array[String]
+  link_opts : DrvLinkOpts
 }
 
 ///|
@@ -2937,7 +3395,7 @@ fn drv_build_test_bin(
   obj_path : String,
   bin_path : String,
   need_qbe : Bool,
-  libs : Array[String],
+  link_opts : DrvLinkOpts,
   deps : Array[String],
   stamp : String,
 ) -> Result[Unit, String] {
@@ -2966,7 +3424,7 @@ fn drv_build_test_bin(
   }
   objs.push(obj_path)
   let tmp = bin_path + ".tmp." + stamp
-  match drv_link_objects(world, apple_tools, qbe_macos_ver + ".0", objs, rt_lib, libs, tmp) {
+  match drv_link_objects(world, qbe_target, apple_tools, qbe_macos_ver + ".0", objs, rt_lib, link_opts, tmp) {
     Err(e) => {
       let _ = fs_remove(world, tmp)
       return Err(e)
@@ -3112,7 +3570,7 @@ fn drv_exec_test_jobs(
       dsb.write_string(fs_mtime_ms(world, dp).to_string())
       di = di + 1
     }
-    dsb.write_string(drv_libs_key(job.link_libs))
+    dsb.write_string(drv_link_opts_key(world, job.link_opts))
     let bkey = sha256_hex(dsb.to_string())
     let obj_path = tb_dir + "/" + okey + ".o"
     let bin_path = tb_dir + "/" + bkey
@@ -3151,13 +3609,25 @@ fn drv_exec_test_jobs(
         "\t" +
         (if need_qbe { "1" } else { "0" }) +
         "\t" +
-        drv_join_char(job.link_libs, usep) +
+        drv_join_char(job.link_opts.libs, usep) +
         "\t" +
         drv_join_char(job.dep_objs, usep) +
         "\t" +
         (if job.run_idx.length() > 0 { job.run_idx[0].to_string() } else { "-" }) +
         "\t" +
-        job_gi.to_string(),
+        job_gi.to_string() +
+        "\t" +
+        drv_join_char(job.link_opts.frameworks, usep) +
+        "\t" +
+        drv_join_char(job.link_opts.search_paths, usep) +
+        "\t" +
+        drv_join_char(job.link_opts.rpaths, usep) +
+        "\t" +
+        drv_join_char(job.link_opts.objects, usep) +
+        "\t" +
+        drv_join_char(job.link_opts.flags, usep) +
+        "\t" +
+        (if job.link_opts.has_cxx { "1" } else { "0" }),
       )
     }
     j = j + 1
@@ -3192,9 +3662,18 @@ fn drv_exec_test_jobs(
               break
             }
             let f = drv_split_char(items[bi], 9)
-            if f.length() < 8 {
+            if f.length() < 14 {
               let _ = err_ch.send(bi.to_string() + "\tmalformed test build spec")
               continue
+            }
+            let job_opts = DrvLinkOpts::{
+              libs: drv_split_char(f[4], 31),
+              frameworks: drv_split_char(f[8], 31),
+              search_paths: drv_split_char(f[9], 31),
+              rpaths: drv_split_char(f[10], 31),
+              objects: drv_split_char(f[11], 31),
+              flags: drv_split_char(f[12], 31),
+              has_cxx: f[13] == "1",
             }
             match drv_build_test_bin(
               world,
@@ -3209,7 +3688,7 @@ fn drv_exec_test_jobs(
               f[1],
               f[2],
               f[3] == "1",
-              drv_split_char(f[4], 31),
+              job_opts,
               drv_split_char(f[5], 31),
               stamp + "_" + bi.to_string(),
             ) {
@@ -3745,6 +4224,58 @@ fn drv_run_ws_tests(
     Ok(v) => v
   }
   let t_built = clock_now_ms(world)
+  let qbe_target = drv_resolve_qbe_target(world)
+  let rt_lib = drv_resolve_rt_lib(world)
+  let cache_dir = drv_resolve_cache_dir(world)
+  let need_cstub : Array[Bool] = []
+  let pkg_cstub_objs : Array[Array[String]] = []
+  let pkg_cstub_cxx : Array[Bool] = []
+  k = 0
+  while k < n {
+    need_cstub.push(need[k])
+    pkg_cstub_objs.push([])
+    pkg_cstub_cxx.push(false)
+    k = k + 1
+  }
+  si = 0
+  while si < selected.length() {
+    need_cstub[node_to_topo[selected[si]]] = true
+    si = si + 1
+  }
+  let cstub_new_keys : Array[String] = []
+  let cstub_new_sizes : Array[Int64] = []
+  k = 0
+  while k < n {
+    if need_cstub[k] {
+      let cstub_objs : Array[String] = []
+      let cstub_keys : Array[String] = []
+      match drv_compile_pkg_c_sources(
+        world,
+        nodes[topo.order[k]],
+        qbe_target,
+        rt_lib,
+        cache_dir,
+        trace,
+        cstub_objs,
+        cstub_keys,
+        cstub_new_keys,
+        cstub_new_sizes,
+      ) {
+        Err(msg) => {
+          io_eprintln(world, "error: " + msg)
+          return 1
+        }
+        Ok(has_cxx) => {
+          pkg_cstub_objs[k] = cstub_objs
+          pkg_cstub_cxx[k] = has_cxx
+        }
+      }
+    }
+    k = k + 1
+  }
+  if cstub_new_keys.length() > 0 {
+    drv_cas_record_batch_and_evict(world, cache_dir, cstub_new_keys, cstub_new_sizes)
+  }
   let tested : Array[String] = []
   let test_jobs : Array[DrvTestJob] = []
   si = 0
@@ -3787,27 +4318,41 @@ fn drv_run_ws_tests(
       let td = trans.topo[tk]
       let dep_names : Array[String] = []
       let dep_objs : Array[String] = []
-      let libs : Array[String] = []
+      let job_opts = drv_link_opts_empty()
       let mut u = 0
       while u < td.length() {
-        let dn = nodes[topo.order[td[u]]]
+        let tu = td[u]
+        let dn = nodes[topo.order[tu]]
         dep_names.push(dn.name)
-        dep_objs.push(built.obj_paths[td[u]])
-        let mut li = 0
-        while li < dn.link_libs.length() {
-          push_unique_lib(libs, dn.link_libs[li])
-          li = li + 1
+        dep_objs.push(built.obj_paths[tu])
+        let dcstubs = pkg_cstub_objs[tu]
+        let mut ci = 0
+        while ci < dcstubs.length() {
+          dep_objs.push(dcstubs[ci])
+          ci = ci + 1
         }
+        if pkg_cstub_cxx[tu] {
+          job_opts.has_cxx = true
+        }
+        drv_collect_node_link_opts(dn, qbe_target, job_opts)
         u = u + 1
       }
-      let mut li = 0
-      while li < node.link_libs.length() {
-        push_unique_lib(libs, node.link_libs[li])
-        li = li + 1
+      let self_cstubs = pkg_cstub_objs[tk]
+      let mut ci = 0
+      while ci < self_cstubs.length() {
+        dep_objs.push(self_cstubs[ci])
+        ci = ci + 1
       }
-      li = 0
+      if pkg_cstub_cxx[tk] {
+        job_opts.has_cxx = true
+      }
+      drv_collect_node_link_opts(node, qbe_target, job_opts)
+      let mut li = 0
       while li < cli_libs.length() {
-        push_unique_lib(libs, cli_libs[li])
+        push_unique_lib(job_opts.libs, cli_libs[li])
+        if drv_is_cxx_lib(cli_libs[li]) {
+          job_opts.has_cxx = true
+        }
         li = li + 1
       }
       let test_res = emit_qbe_test_package(cr.pkg, cr.tc, dep_names)
@@ -3817,7 +4362,7 @@ fn drv_run_ws_tests(
         names: tnames,
         run_idx: run_idx,
         dep_objs: dep_objs,
-        link_libs: libs,
+        link_opts: job_opts,
       })
     }
     si = si + 1
@@ -3920,19 +4465,14 @@ fn drv_run_tests_cmd(
   let test_jobs : Array[DrvTestJob] = []
   if run_idx.length() > 0 {
     let test_res = emit_qbe_test_package(cr.pkg, cr.tc, [])
-    let libs : Array[String] = []
-    let mut li = 0
-    while li < cli_libs.length() {
-      push_unique_lib(libs, cli_libs[li])
-      li = li + 1
-    }
+    let job_opts = drv_link_opts_from_libs(cli_libs)
     test_jobs.push(DrvTestJob::{
       label: "",
       ssa: test_res.ssa,
       names: tnames,
       run_idx: run_idx,
       dep_objs: [],
-      link_libs: libs,
+      link_opts: job_opts,
     })
   }
   match drv_exec_test_jobs(

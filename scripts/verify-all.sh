@@ -160,6 +160,8 @@ if [ "$DYN_OUT" != "dyn_trait ok" ]; then
 fi
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
+# P26-A: native link ([link]/[link.macos]/[link.linux], c_sources .c/.cc, objects .a, search_paths, rpaths, frameworks, pionc test).
+sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC2"
 # examples/https_server and examples/pion_station link the system OpenSSL; GitHub's macos-15 runner has no
 # Homebrew openssl@3, so this runs only where it is installed.
 if [ -d /opt/homebrew/opt/openssl@3/lib ]; then

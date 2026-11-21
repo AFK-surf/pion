@@ -56,6 +56,7 @@ fi
 
 # From here on every object file comes straight from `qbe --obj` (ELF64): a
 # failing `as` first on PATH proves no step assembles text.
+ORIG_PATH="$PATH"
 mkdir -p "$TMP_DIR/noas"
 printf '#!/bin/sh\necho "FAIL: as invoked: $*" >&2\nexit 97\n' > "$TMP_DIR/noas/as"
 chmod +x "$TMP_DIR/noas/as"
@@ -336,6 +337,9 @@ fi
 
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC"
+
+# P26-A: native link (c_sources .c/.cc invoke system cc/c++ which need real `as`).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

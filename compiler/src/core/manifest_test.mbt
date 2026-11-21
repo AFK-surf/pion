@@ -340,3 +340,75 @@ test "p20b: manifest_set_dependency appends, replaces in place and is idempotent
   mf_check(@core.lock_rev_of(entries, "net") == "abc123", "lock_rev_of")
   mf_check(@core.lock_rev_of(entries, "nope") == "", "lock_rev_of missing")
 }
+
+///|
+test "p26a: pion.toml multiline arrays and [link] / [link.macos] / [link.linux]" {
+  let toml =
+    "[package]\nname = \"farview_shim\"\nversion = \"0.1.0\"\n\n" +
+    "[link]\n" +
+    "libs = [\n" +
+    "  \"z\",\n" +
+    "  # comment inside multiline array\n" +
+    "  \"sqlite3\",\n" +
+    "  \"z\",\n" +
+    "]\n" +
+    "search_paths = [\"./lib\", \"/opt/local/lib\", \"./lib\"]\n" +
+    "rpaths = [\"@executable_path/../lib\", \"$ORIGIN/../lib\", \"./lib\"]\n" +
+    "objects = [\"vendor/libcurl.a\", \"vendor/libcurl.a\"]\n" +
+    "flags = [\"-Wl,-u\", \"_sym1\", \"-Wl,-u\", \"_sym2\"]\n" +
+    "c_sources = [\n" +
+    "  \"csrc/v8_shim.cc\",\n" +
+    "  \"csrc/helper.c\",\n" +
+    "  \"csrc/v8_shim.cc\",\n" +
+    "]\n" +
+    "cc_flags = [\"-O2\", \"-DFLAG=1\", \"-DFLAG=1\", \"-Iinclude\"]\n\n" +
+    "[link.macos]\n" +
+    "frameworks = [\n" +
+    "  \"Cocoa\",\n" +
+    "  \"Metal\",\n" +
+    "  \"QuartzCore\",\n" +
+    "  \"Cocoa\",\n" +
+    "]\n" +
+    "lib = \"c++\"\n\n" +
+    "[link.linux]\n" +
+    "libs = [\"freetype\", \"fontconfig\"]\n" +
+    "flags = [\"-Wl,--as-needed\"]\n"
+  match @core.parse_pion_toml(toml) {
+    Ok(m) => {
+      mf_check(m.link_libs.length() == 2 && m.link_libs[0] == "z" && m.link_libs[1] == "sqlite3", "link_libs compat")
+      let lc = m.link_common
+      mf_check(lc.libs.length() == 2 && lc.libs[0] == "z" && lc.libs[1] == "sqlite3", "common libs dedup")
+      mf_check(lc.search_paths.length() == 2 && lc.search_paths[0] == "./lib" && lc.search_paths[1] == "/opt/local/lib", "search_paths dedup")
+      mf_check(lc.rpaths.length() == 3 && lc.rpaths[0] == "@executable_path/../lib" && lc.rpaths[1] == "$ORIGIN/../lib" && lc.rpaths[2] == "./lib", "rpaths")
+      mf_check(lc.objects.length() == 1 && lc.objects[0] == "vendor/libcurl.a", "objects dedup")
+      mf_check(lc.flags.length() == 4 && lc.flags[0] == "-Wl,-u" && lc.flags[2] == "-Wl,-u", "flags keep duplicates and order")
+      mf_check(lc.c_sources.length() == 2 && lc.c_sources[0] == "csrc/v8_shim.cc" && lc.c_sources[1] == "csrc/helper.c", "c_sources dedup")
+      mf_check(lc.cc_flags.length() == 4 && lc.cc_flags[1] == "-DFLAG=1" && lc.cc_flags[2] == "-DFLAG=1", "cc_flags keep duplicates and order")
+      let lm = m.link_macos
+      mf_check(lm.frameworks.length() == 3 && lm.frameworks[0] == "Cocoa" && lm.frameworks[1] == "Metal" && lm.frameworks[2] == "QuartzCore", "macos frameworks")
+      mf_check(lm.libs.length() == 1 && lm.libs[0] == "c++", "macos lib")
+      let ll = m.link_linux
+      mf_check(ll.libs.length() == 2 && ll.libs[0] == "freetype" && ll.libs[1] == "fontconfig", "linux libs")
+      mf_check(ll.flags.length() == 1 && ll.flags[0] == "-Wl,--as-needed", "linux flags")
+    }
+    Err(e) => abort("parse_pion_toml failed: " + e)
+  }
+  // Unknown key in [link], [link.macos], [link.linux] must fail cleanly with line number.
+  match @core.parse_pion_toml("[package]\nname = \"a\"\n[link]\nbogus = [\"x\"]\n") {
+    Ok(_) => abort("unknown key in [link] must fail")
+    Err(e) => mf_check(mf_has(e, "pion.toml line 4") && mf_has(e, "unknown key `bogus`"), "unknown [link] key: " + e)
+  }
+  match @core.parse_pion_toml("[package]\nname = \"a\"\n[link.macos]\nfoo = \"bar\"\n") {
+    Ok(_) => abort("unknown key in [link.macos] must fail")
+    Err(e) => mf_check(mf_has(e, "pion.toml line 4") && mf_has(e, "unknown key `foo`"), "unknown [link.macos] key: " + e)
+  }
+  match @core.parse_pion_toml("[package]\nname = \"a\"\n[link.linux]\nbar = [\"x\"]\n") {
+    Ok(_) => abort("unknown key in [link.linux] must fail")
+    Err(e) => mf_check(mf_has(e, "pion.toml line 4") && mf_has(e, "unknown key `bar`"), "unknown [link.linux] key: " + e)
+  }
+  // Unclosed multiline array must fail cleanly.
+  match @core.parse_pion_toml("[package]\nname = \"a\"\n[link]\nlibs = [\n  \"z\",\n") {
+    Ok(_) => abort("unclosed array must fail")
+    Err(e) => mf_check(mf_has(e, "pion.toml line 4") && mf_has(e, "unclosed array"), "unclosed array: " + e)
+  }
+}

@@ -62,11 +62,42 @@ pub fn manifest_dep_ref(dep : ManifestDep) -> String {
 }
 
 ///|
+/// Native link & C/C++/ObjC stub compilation settings from `[link]`,
+/// `[link.macos]` or `[link.linux]` in `pion.toml`.
+pub struct LinkSpec {
+  libs : Array[String]
+  frameworks : Array[String]
+  search_paths : Array[String]
+  rpaths : Array[String]
+  objects : Array[String]
+  flags : Array[String]
+  c_sources : Array[String]
+  cc_flags : Array[String]
+}
+
+///|
+pub fn link_spec_empty() -> LinkSpec {
+  LinkSpec::{
+    libs: [],
+    frameworks: [],
+    search_paths: [],
+    rpaths: [],
+    objects: [],
+    flags: [],
+    c_sources: [],
+    cc_flags: [],
+  }
+}
+
+///|
 pub struct PackageManifest {
   name : String
   version : String
   deps : Array[ManifestDep]
   link_libs : Array[String]
+  link_common : LinkSpec
+  link_macos : LinkSpec
+  link_linux : LinkSpec
   registry : String
 }
 
@@ -78,6 +109,9 @@ pub struct PkgNodeInput {
   paths : Array[String]
   sources : Array[String]
   link_libs : Array[String]
+  link_common : LinkSpec
+  link_macos : LinkSpec
+  link_linux : LinkSpec
 }
 
 ///|
@@ -95,6 +129,9 @@ pub fn pkg_node_input_new(
     paths: paths,
     sources: sources,
     link_libs: [],
+    link_common: link_spec_empty(),
+    link_macos: link_spec_empty(),
+    link_linux: link_spec_empty(),
   }
 }
 
@@ -395,13 +432,78 @@ pub fn push_unique_lib(libs : Array[String], lib : String) -> Unit {
 }
 
 ///|
+fn push_nonempty_str(arr : Array[String], s : String) -> Unit {
+  if s.length() > 0 {
+    arr.push(s)
+  }
+}
+
+///|
+fn toml_apply_link_key(
+  spec : LinkSpec,
+  section : String,
+  key : String,
+  raw_val : String,
+) -> Result[Unit, String] {
+  let mut kind = 0
+  if key == "libs" || key == "lib" {
+    kind = 1
+  } else if key == "frameworks" || key == "framework" {
+    kind = 2
+  } else if key == "search_paths" || key == "search_path" {
+    kind = 3
+  } else if key == "rpaths" || key == "rpath" {
+    kind = 4
+  } else if key == "objects" || key == "object" {
+    kind = 5
+  } else if key == "flags" {
+    kind = 6
+  } else if key == "c_sources" || key == "c_source" {
+    kind = 7
+  } else if key == "cc_flags" {
+    kind = 8
+  } else {
+    return Err("unknown key `" + key + "` in [" + section + "]")
+  }
+  let vs = match toml_parse_str_array(raw_val) {
+    Ok(x) => x
+    Err(e) => return Err(e)
+  }
+  let mut vi = 0
+  while vi < vs.length() {
+    let v = vs[vi]
+    if kind == 1 {
+      push_unique_lib(spec.libs, v)
+    } else if kind == 2 {
+      push_unique_lib(spec.frameworks, v)
+    } else if kind == 3 {
+      push_unique_lib(spec.search_paths, v)
+    } else if kind == 4 {
+      push_unique_lib(spec.rpaths, v)
+    } else if kind == 5 {
+      push_unique_lib(spec.objects, v)
+    } else if kind == 6 {
+      push_nonempty_str(spec.flags, v)
+    } else if kind == 7 {
+      push_unique_lib(spec.c_sources, v)
+    } else {
+      push_nonempty_str(spec.cc_flags, v)
+    }
+    vi = vi + 1
+  }
+  Ok(())
+}
+
+///|
 pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
   let lines = split_lines(text)
   let mut section = ""
   let mut pkg_name = ""
   let mut version = "0.1.0"
   let deps : Array[ManifestDep] = []
-  let link_libs : Array[String] = []
+  let link_common = link_spec_empty()
+  let link_macos = link_spec_empty()
+  let link_linux = link_spec_empty()
   let mut registry = ""
   let mut i = 0
   while i < lines.length() {
@@ -416,50 +518,79 @@ pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
       i = i + 1
       continue
     }
+    let start_line = i + 1
     let eq = toml_find_char(clean, 61, 0)
     if eq <= 0 {
       return Err(
-        "pion.toml line " + (i + 1).to_string() + ": expected `key = value`",
+        "pion.toml line " + start_line.to_string() + ": expected `key = value`",
       )
     }
     let key = toml_trim(slice_str(clean, 0, eq))
-    let raw_val = toml_trim(slice_str(clean, eq + 1, clean.length()))
+    let mut raw_val = toml_trim(slice_str(clean, eq + 1, clean.length()))
+    if raw_val.length() > 0 &&
+      str_code_at(raw_val, 0) == 91 &&
+      toml_find_char(raw_val, 93, 0) < 0 {
+      let sb = StringBuilder()
+      sb.write_string(raw_val)
+      let mut closed = false
+      while i + 1 < lines.length() {
+        i = i + 1
+        let cont = toml_trim(toml_strip_comment(lines[i]))
+        if cont.length() == 0 {
+          continue
+        }
+        sb.write_char(' ')
+        sb.write_string(cont)
+        if toml_find_char(cont, 93, 0) >= 0 {
+          closed = true
+          break
+        }
+      }
+      if !closed {
+        return Err(
+          "pion.toml line " + start_line.to_string() + ": unclosed array `[`",
+        )
+      }
+      raw_val = sb.to_string()
+    }
     if section == "package" {
       if key == "name" {
         match toml_unquote(raw_val) {
           Ok(v) => pkg_name = v
-          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
+          Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
         }
       } else if key == "version" {
         match toml_unquote(raw_val) {
           Ok(v) => version = v
-          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
+          Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
         }
       }
     } else if section == "dependencies" {
       match toml_parse_dep(key, raw_val) {
         Ok(d) => deps.push(d)
-        Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
+        Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
       }
     } else if section == "registry" {
       if key == "url" {
         match toml_unquote(raw_val) {
           Ok(v) => registry = v
-          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
+          Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
         }
       }
     } else if section == "link" {
-      if key == "libs" || key == "lib" {
-        match toml_parse_str_array(raw_val) {
-          Ok(vs) => {
-            let mut vi = 0
-            while vi < vs.length() {
-              push_unique_lib(link_libs, vs[vi])
-              vi = vi + 1
-            }
-          }
-          Err(e) => return Err("pion.toml line " + (i + 1).to_string() + ": " + e)
-        }
+      match toml_apply_link_key(link_common, section, key, raw_val) {
+        Ok(_) => ()
+        Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
+      }
+    } else if section == "link.macos" {
+      match toml_apply_link_key(link_macos, section, key, raw_val) {
+        Ok(_) => ()
+        Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
+      }
+    } else if section == "link.linux" {
+      match toml_apply_link_key(link_linux, section, key, raw_val) {
+        Ok(_) => ()
+        Err(e) => return Err("pion.toml line " + start_line.to_string() + ": " + e)
       }
     }
     i = i + 1
@@ -471,7 +602,10 @@ pub fn parse_pion_toml(text : String) -> Result[PackageManifest, String] {
     name: pkg_name,
     version: version,
     deps: deps,
-    link_libs: link_libs,
+    link_libs: link_common.libs,
+    link_common: link_common,
+    link_macos: link_macos,
+    link_linux: link_linux,
     registry: registry,
   })
 }
