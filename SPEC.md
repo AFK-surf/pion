@@ -78,12 +78,15 @@ compiler/
 - Identifiers: `[a-zA-Z_][a-zA-Z0-9_]*`
 - Literals:
   - `Int`: decimal `42`, hex `0xFF`, negative `-1`
-  - `Int64`: `42L`
+  - `Int64`: `42L`, `0xFFL`
+  - `UInt`: unsigned 32-bit `42U`, `0xFFFF_FFFFU` (and unsuffixed integer literals when expected type is `UInt`)
+  - `UInt64`: unsigned 64-bit `42UL`, `0xFFFF_FFFF_FFFF_FFFFUL` (and unsuffixed integer literals when expected type is `UInt64`)
   - `Double`: `3.14`, scientific notation `1e-9`, `1.5E+3`
+  - `Float`: IEEE-754 32-bit single-precision `1.5f`, `0.0f` (and unsuffixed floating literals when expected type is `Float`; QBE `s`, C ABI `float`)
   - `Bool`: `true`, `false`
   - `Byte`: `b'a'`, `b'\n'`, `b'\x00'`
   - `Char`: `'a'`, `'\n'`
-  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text kept byte-for-byte, with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`, `\xHH`; string interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `Double`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings).
+  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text kept byte-for-byte, with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`, `\xHH`; string interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `UInt`, `UInt64`, `Double`, `Float`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings).
   - Multi-line raw string literals: `#|...` — consecutive lines prefixed with `#|` (separated by `\n` and optional leading spaces/tabs, stripping `\r` in `\r\n`) are joined with `\n` verbatim without escape or interpolation processing (UTF-8 preserved byte-for-byte; `#derive(...)` attributes remain unaffected).
 - Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`, `import` (and contextual top-level `test`).
 
@@ -143,13 +146,13 @@ test "test name" {
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
 - Tuple destructuring & element indexing: `let (a, b) = expr` / `let (a, _, c) : (T1, T2, T3) = expr` (`_` ignores an element), and `t.0` / `t.1` tuple element access; tuple literals propagate element expected types (`(n, None)` as `(Node, Option[Node])` uses null-niche `0`)
-- Assignment & compound assignment: `x = expr`, `obj.field = expr`, `arr[i] = expr`, and `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=` (receiver/index evaluated once; `+=` also supports `String` concatenation)
+- Assignment & compound assignment: `x = expr`, `obj.field = expr`, `arr[i] = expr`, and `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` (receiver/index evaluated once; `+=` also supports `String` concatenation)
 - Struct literals: field shorthand `Foo::{ x, y }` and functional update `Foo::{ ..base, x: 1 }` (copies non-overridden fields with RC retention)
 - Control flow:
   - `if cond { ... } else if cond2 { ... } else { ... }` (expression when all branches yield same type; `expr is Pattern` in `if`/`while`/`guard` binds pattern variables into the matching branch, `&&` right-hand side, or enclosing block)
   - `guard cond else { diverge_block }` and `guard expr is Pattern else { diverge_block }` (early exit on mismatch; binds pattern variables into the enclosing block for subsequent statements)
   - `while cond { ... }` (including `while expr is Pattern { ... }`)
-  - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` / `for i in start..<end { ... }` (half-open `[start, end)`), `for i in start..=end { ... }` (closed `[start, end]`, overflow-safe), `for x in arr { ... }` and `for i, x in arr { ... }` (`Array[T]`)
+  - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` / `for i in start..<end { ... }` (half-open `[start, end)`), `for i in start..=end { ... }` (closed `[start, end]`, overflow-safe), `for x in arr { ... }` and `for i, x in arr { ... }` (`Array[T]` and `FixedArray[T]`)
   - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E]`) and `Option[T]` (enclosing function returns `Option[_]`)
   - `match scrutinee { Pat [if guard_cond] => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed; guarded arms do not satisfy exhaustiveness on their own, and failed guards release arm pattern bindings and fall through to subsequent arms)
   - `return [expr]`, `break`, `continue`
@@ -162,14 +165,17 @@ test "test name" {
 - Contracts: `debug_assert(cond, "msg"[,])` (statement or expression position, type `Unit`; optional trailing comma)
 - Built-in conversions and helpers:
   - Scientific notation `Double` literals (`1e-9`, `1E9`, `1.797e308`, `1.0e+5`) and `\xHH` raw byte escapes in string literals
-  - `Int::to_double() -> Double`, `Int::abs() -> Int`, `Int64::to_double() -> Double`, `Int64::abs() -> Int64`, `Double::to_int() -> Int`, `Double::to_int64() -> Int64`, `Double::to_bits() -> Int64`, `Double::from_bits(bits : Int64) -> Double`, and `Double` methods `abs()`, `floor()`, `ceil()`, `round()`, `trunc()`, `sqrt()` (all 0-byte runtime)
+  - `Int::to_double() -> Double`, `Int::to_float() -> Float`, `Int::to_uint() -> UInt`, `Int::reinterpret_as_uint() -> UInt`, `Int::abs() -> Int`, `Int64::to_double() -> Double`, `Int64::to_uint64() -> UInt64`, `Int64::reinterpret_as_uint64() -> UInt64`, `Int64::abs() -> Int64`, `Double::to_int() -> Int`, `Double::to_int64() -> Int64`, `Double::to_float() -> Float`, `Double::to_bits() -> Int64`, `Double::reinterpret_as_uint64() -> UInt64`, `Double::from_bits(bits : Int64) -> Double`, and `Double` methods `abs()`, `floor()`, `ceil()`, `round()`, `trunc()`, `sqrt()` (all 0-byte runtime)
+  - `Float` (IEEE-754 f32, QBE `s`, C ABI `float`, 0-byte runtime): `Float::from_double(Double)`, `Float::from_int(Int)`, `Float::from_bits(Int)`, and methods `to_double()`, `to_int()`, `to_int64()`, `to_bits()`, `reinterpret_as_int()`, `reinterpret_as_uint()`, `abs()`, `sqrt()`, `floor()`, `ceil()`, `round()`, `trunc()`, `to_string()`
+  - `UInt` / `UInt64` (unsigned 32/64-bit, QBE `w`/`l` with `udiv`/`urem`/`shr`/`cult*`/`cule*`/`cugt*`/`cuge*`, 0-byte runtime): `UInt` methods `to_int()`, `reinterpret_as_int()`, `to_int64()`, `to_uint64()`, `to_double()`, `to_float()`, `reinterpret_as_float()`, `to_string()`; `UInt64` methods `to_int()`, `to_uint()`, `to_int64()`, `reinterpret_as_int64()`, `to_double()`, `reinterpret_as_double()`, `to_string()`
+  - `FixedArray[T]` (fixed-length heap array backed by `PionArray`, distinct from `Array[T]`, 0-byte runtime) & `Array::make(len, init)`: `FixedArray::make(len, init)`, `FixedArray::makei(len, f)`, `FixedArray::from_array(a)`, `[...]` when expected type is `FixedArray[T]`, indexing `a[i]` / `a[i] = v` / compound assign, `length()`, `fill(v)`, `copy()`, `blit_to(dst, len~, src_offset~=0, dst_offset~=0)`, `for [i,] x in a`, and `array_data_ptr(a)`
   - `Map::clear() -> Unit` (`pion_map_clear`)
   - `ignore(x : T) -> Unit` (releases non-borrowed heap value, 0-byte runtime)
   - `s.to_int() -> Option[Int]`, `s.to_int64() -> Option[Int64]`, `s.to_double() -> Option[Double]` on `String` (`None` on any malformed or out-of-range input; no exceptions, no partial parses)
   - `o.is_some()`, `o.is_none()`, `o.unwrap_or(default)` on `Option[T]`
   - `r.is_ok()`, `r.is_err()`, `r.unwrap_or(default)` on `Result[T, E]`
-- Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..` / `..<` / `..=`, pipe `|>`, pattern test `is`, compound assign `+=`/`-=`/`*=`/`/=`/`%=`/`&=`/`|=`/`^=`, postfix `?`.
-- Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `Double`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T` (checked at every instantiation: a type parameter compared with `==`/`!=` in a generic body, directly or through generic callers, must be instantiated with one of these types, else `E_TYPE_MISMATCH` at the call site; such generics are monomorphized so `String` compares bytes and payload-less enums compare tags), and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, `struct`, `Array`, `Map`, `Bytes`, tuples and payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
+- Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..` / `..<` / `..=`, pipe `|>`, pattern test `is`, compound assign `+=`/`-=`/`*=`/`/=`/`%=`/`&=`/`|=`/`^=`/`<<=`/`>>=`, postfix `?`.
+- Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `UInt`, `UInt64`, `Double`, `Float`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T` (checked at every instantiation: a type parameter compared with `==`/`!=` in a generic body, directly or through generic callers, must be instantiated with one of these types, else `E_TYPE_MISMATCH` at the call site; such generics are monomorphized so `String` compares bytes and payload-less enums compare tags), `#derive(Eq)` structs/enums, and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, non-`#derive(Eq)` `struct`, `Array`, `FixedArray`, `Map`, `Bytes`, tuples and non-`#derive(Eq)` payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
 - Must-use `Result`: an expression statement whose type is `Result[T, E]` and whose value is discarded — any non-tail statement of a block, or the tail statement of a loop or `test` body — is a compile-time error (`E_UNHANDLED_RESULT`, fix-it "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`"). `let _ = expr` discards explicitly; a block's tail value returned to its function or branch is not discarded.
 
 ---

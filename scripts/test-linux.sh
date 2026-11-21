@@ -315,6 +315,8 @@ fi
 sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC"
 # P27-C1: Bug #6 cross-pkg mono private lookups + Bug #7 generic closure %tp_T capture + native Map[Int/Int64, V] + #derive(Eq) + ASan/LSan.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC"
+# P27-C2: Float (IEEE-754 f32), UInt/UInt64 (unsigned 32/64-bit), FixedArray[T] + Array::make + C FFI + ASan/LSan (0 runtime bytes).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
 
 # P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
 P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
