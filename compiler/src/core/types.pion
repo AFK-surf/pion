@@ -206,6 +206,8 @@ pub struct Env {
   mut fn_has_params : Bool
   /// Scope index floor of the innermost enclosing closure (0 at function level).
   mut closure_scope_floor : Int
+  /// Return type inferred from `return expr` statements inside an unannotated closure.
+  mut inferred_ret : Option[Ty]
 }
 
 ///|
@@ -304,6 +306,7 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     fn_lparen_span: span_empty(),
     fn_has_params: false,
     closure_scope_floor: 0,
+    inferred_ret: None,
   }
 }
 
@@ -1703,6 +1706,78 @@ fn subst_ty(t : Ty, subst : Map[String, Ty]) -> Ty {
 }
 
 ///|
+fn subst_ty_mask_unbound(
+  t : Ty,
+  decl_tparams : Array[String],
+  subst : Map[String, Ty],
+) -> Ty {
+  match t {
+    TParam(n) =>
+      match subst.get(n) {
+        Some(rep) => rep
+        None =>
+          if str_arr_contains(decl_tparams, n) {
+            TError
+          } else {
+            t
+          }
+      }
+    TArray(e) => TArray(subst_ty_mask_unbound(e, decl_tparams, subst))
+    TFixedArray(e) => TFixedArray(subst_ty_mask_unbound(e, decl_tparams, subst))
+    TOption(e) => TOption(subst_ty_mask_unbound(e, decl_tparams, subst))
+    TResult(ok, err) =>
+      TResult(
+        subst_ty_mask_unbound(ok, decl_tparams, subst),
+        subst_ty_mask_unbound(err, decl_tparams, subst),
+      )
+    TMap(k, v) =>
+      TMap(
+        subst_ty_mask_unbound(k, decl_tparams, subst),
+        subst_ty_mask_unbound(v, decl_tparams, subst),
+      )
+    TChannel(e) => TChannel(subst_ty_mask_unbound(e, decl_tparams, subst))
+    TMutex(e) => TMutex(subst_ty_mask_unbound(e, decl_tparams, subst))
+    TStruct(name, args) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(subst_ty_mask_unbound(args[i], decl_tparams, subst))
+        i = i + 1
+      }
+      TStruct(name, out)
+    }
+    TEnum(name, args) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(subst_ty_mask_unbound(args[i], decl_tparams, subst))
+        i = i + 1
+      }
+      TEnum(name, out)
+    }
+    TFn(params, ret) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < params.length() {
+        out.push(subst_ty_mask_unbound(params[i], decl_tparams, subst))
+        i = i + 1
+      }
+      TFn(out, subst_ty_mask_unbound(ret, decl_tparams, subst))
+    }
+    TTuple(elems) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < elems.length() {
+        out.push(subst_ty_mask_unbound(elems[i], decl_tparams, subst))
+        i = i + 1
+      }
+      TTuple(out)
+    }
+    _ => t
+  }
+}
+
+///|
 fn make_subst(tparams : Array[String], targs : Array[Ty]) -> Map[String, Ty] {
   let m : Map[String, Ty] = Map([])
   let mut i = 0
@@ -1727,7 +1802,13 @@ fn unify_tparams(pattern : Ty, actual : Ty, subst : Map[String, Ty]) -> Unit {
                 TParam(_) => ()
                 _ => subst.set(n, actual)
               }
-            Some(_) => ()
+            Some(prev) =>
+              if ty_has_unresolved(prev) && !ty_has_unresolved(actual) {
+                match actual {
+                  TNever => ()
+                  _ => subst.set(n, actual)
+                }
+              }
           }
       }
     TArray(pe) =>
@@ -1833,6 +1914,29 @@ fn ty_has_unresolved(t : Ty) -> Bool {
     TResult(ok, err) => ty_has_unresolved(ok) || ty_has_unresolved(err)
     TChannel(e) => ty_has_unresolved(e)
     TMutex(e) => ty_has_unresolved(e)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if ty_has_unresolved(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, r) => {
+      if ty_has_unresolved(r) {
+        return true
+      }
+      let mut i = 0
+      while i < ps.length() {
+        if ty_has_unresolved(ps[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
     _ => false
   }
 }
@@ -4070,8 +4174,12 @@ fn check_stmt(
       TUnit
     }
     SReturn(opt, sp) => {
+      let exp_r : Option[Ty] = match env.ret_ty {
+        TError => None
+        _ => Some(env.ret_ty)
+      }
       let rty = match opt {
-        Some(e) => check_expr(tc, env, e, Some(env.ret_ty))
+        Some(e) => check_expr(tc, env, e, exp_r)
         None => TUnit
       }
       if !ty_compat(env.ret_ty, rty) {
@@ -4084,6 +4192,20 @@ fn check_stmt(
           ty_to_string(rty),
           "return a value of type `" + ty_to_string(env.ret_ty) + "`",
         )
+      }
+      match env.inferred_ret {
+        None =>
+          match rty {
+            TNever => ()
+            _ => env.inferred_ret = Some(rty)
+          }
+        Some(prev) =>
+          if ty_has_unresolved(prev) && !ty_has_unresolved(rty) {
+            match rty {
+              TNever => ()
+              _ => env.inferred_ret = Some(rty)
+            }
+          }
       }
       TNever
     }
@@ -4765,7 +4887,7 @@ fn check_fn_call(
       continue
     }
     let exp_p : Option[Ty] = if i < finfo.param_tys.length() {
-      Some(subst_ty(finfo.param_tys[i], subst))
+      Some(subst_ty_mask_unbound(finfo.param_tys[i], finfo.decl.type_params, subst))
     } else {
       None
     }
@@ -5772,7 +5894,10 @@ fn check_method_call(
       let key = sname + "::" + method_name
       match tc.methods.get(key) {
         Some(minfo) => {
-          let subst = make_subst(minfo.decl.type_params, sargs)
+          let subst : Map[String, Ty] = Map([])
+          if minfo.param_tys.length() > 0 {
+            unify_tparams(minfo.param_tys[0], recv_ty, subst)
+          }
           match expected {
             Some(exp_ty) => unify_tparams(minfo.ret_ty, exp_ty, subst)
             None => ()
@@ -5801,7 +5926,7 @@ fn check_method_call(
             }
             let p_idx = i + 1
             let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
-              Some(subst_ty(minfo.param_tys[p_idx], subst))
+              Some(subst_ty_mask_unbound(minfo.param_tys[p_idx], minfo.decl.type_params, subst))
             } else {
               None
             }
@@ -7464,7 +7589,10 @@ fn check_expr_inner(
               if en == resolved_name {
                 let mut k = 0
                 while k < sinfo.decl.type_params.length() && k < eargs.length() {
-                  subst.set(sinfo.decl.type_params[k], eargs[k])
+                  match eargs[k] {
+                    TError => ()
+                    _ => subst.set(sinfo.decl.type_params[k], eargs[k])
+                  }
                   k = k + 1
                 }
               }
@@ -7549,7 +7677,11 @@ fn check_expr_inner(
               }
               let _ = check_expr(tc, env, f.value, None)
             } else {
-              let exp_f = subst_ty(sinfo.field_tys[found_idx], subst)
+              let exp_f = subst_ty_mask_unbound(
+                sinfo.field_tys[found_idx],
+                sinfo.decl.type_params,
+                subst,
+              )
               let vty = check_expr(tc, env, f.value, Some(exp_f))
               unify_tparams(sinfo.field_tys[found_idx], vty, subst)
               let exp_f2 = subst_ty(sinfo.field_tys[found_idx], subst)
@@ -7721,20 +7853,30 @@ fn check_expr_inner(
         ptys.push(pty)
         i = i + 1
       }
+      let has_explicit_ret = match ret_te {
+        TyMissing(_) => false
+        _ => true
+      }
       let ret_opt : Option[Ty] = match ret_te {
         TyMissing(_) =>
           match expected {
-            Some(TFn(_, er)) => Some(er)
+            Some(TFn(_, er)) =>
+              match er {
+                TError => None
+                _ => Some(er)
+              }
             _ => None
           }
         _ => Some(resolve_type_expr(tc, ret_te, env.type_params))
       }
       let saved_ret_ty = env.ret_ty
+      let saved_inferred_ret = env.inferred_ret
       let saved_closure_floor = env.closure_scope_floor
       env.ret_ty = match ret_opt {
         Some(r) => r
         None => TError
       }
+      env.inferred_ret = None
       env.closure_scope_floor = env.scopes.length()
       env_push(env)
       let mut j = 0
@@ -7743,12 +7885,30 @@ fn check_expr_inner(
         j = j + 1
       }
       let body_ty = check_stmts(tc, env, body, ret_opt)
+      let clo_inferred_ret = env.inferred_ret
       env_pop(env)
       env.closure_scope_floor = saved_closure_floor
       env.ret_ty = saved_ret_ty
+      env.inferred_ret = saved_inferred_ret
+      let eff_body_ty = match body_ty {
+        TNever =>
+          match clo_inferred_ret {
+            Some(ir) => ir
+            None => body_ty
+          }
+        _ => body_ty
+      }
       let final_ret = match ret_opt {
-        Some(r) => r
-        None => body_ty
+        Some(r) =>
+          if !has_explicit_ret && ty_has_unresolved(r) && !ty_has_unresolved(eff_body_ty) {
+            match eff_body_ty {
+              TNever => r
+              _ => eff_body_ty
+            }
+          } else {
+            r
+          }
+        None => eff_body_ty
       }
       let clo_ty = TFn(ptys, final_ret)
       tc.closure_infer.set(span_key(sp), clo_ty)
