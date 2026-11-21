@@ -197,6 +197,9 @@ cmp "$TMP_DIR/linux_stage3.s" "$TMP_DIR/linux_stage4.s"
 sha256sum "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
 cmp "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
 echo "[PASS] Linux x86_64 Native Self-Hosting Fixed-Point (Stage 3 == Stage 4 SSA, x86_64 ASM & ELF64 .o BIT-FOR-BIT IDENTICAL, zero as)!"
+# [6/6] must test the compiler built from this tree, not the (possibly older) seed.
+cp "$TMP_DIR/pionc_linux_s4" "$OUT_DIR/pionc_linux"
+PIONC="$OUT_DIR/pionc_linux"
 
 echo "=== [6/6] Native Linux x86_64 pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
 CORE_TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/compiler/src/core")"

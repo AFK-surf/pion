@@ -418,4 +418,64 @@ if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
   fi
 fi
 
-echo "[PASS] p27c1_crosspkg_clo_intmap_eq (Bug #6 + Bug #7 + Map[Int/Int64, V] + #derive(Eq) + ASan/LSan)"
+# Bug #7b: struct literal `Boxed::{ val_opt: None, getter }` inside a monomorphized
+# generic fn whose closure calls `step(st)` must not emit an undefined %tp_T
+# (Bool / Unit non-object and String heap-object type arguments).
+cat > "$TMP_DIR/bug7b.pion" <<'EOF'
+struct Boxed[T] {
+  mut val_opt : Option[T]
+  getter : (Option[T]) -> T
+}
+
+fn step[T](b : Boxed[T]) -> Bool {
+  b.val_opt = Some((b.getter)(b.val_opt))
+  true
+}
+
+fn make_updater[T](getter : (Option[T]) -> T) -> () -> Bool {
+  let st = Boxed::{ val_opt: None, getter }
+  fn() -> Bool {
+    step(st)
+  }
+}
+
+fn main(world : World) -> Unit {
+  let mut i = 0
+  let mut ok = 0
+  while i < 64 {
+    let tag = "s_" + i.to_string()
+    let fb = make_updater(fn(p : Option[Bool]) -> Bool { p.is_none() })
+    let fu = make_updater(fn(_p : Option[Unit]) -> Unit { () })
+    let fs = make_updater(fn(p : Option[String]) -> String {
+      match p {
+        Some(s) => s + "!"
+        None => tag
+      }
+    })
+    if fb() && fb() && fu() && fu() && fs() && fs() {
+      ok = ok + 1
+    }
+    i = i + 1
+  }
+  io_println(world, "p27c1b_bug7b ok " + ok.to_string())
+}
+EOF
+
+B7_OUT=$(PION_CACHE_DIR="$CAS_DIR/bug7b" "$PIONC" run "$TMP_DIR/bug7b.pion")
+echo "p27c1b_bug7b -> $B7_OUT"
+if [ "$B7_OUT" != "p27c1b_bug7b ok 64" ]; then
+  echo "FAIL: p27c1b_bug7b output mismatch: $B7_OUT" >&2
+  exit 1
+fi
+if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
+  PION_CACHE_DIR="$CAS_DIR/bug7b_asan" "$PIONC" build --emit-obj "$TMP_DIR/bug7b.o" "$TMP_DIR/bug7b.pion"
+  "$CC_BIN" -fsanitize=address "$TMP_DIR/bug7b.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/bug7b_asan"
+  B7_ASAN_OUT=$("$TMP_DIR/bug7b_asan")
+  echo "p27c1b_bug7b_asan -> $B7_ASAN_OUT"
+  if [ "$B7_ASAN_OUT" != "p27c1b_bug7b ok 64" ]; then
+    echo "FAIL: p27c1b_bug7b_asan output mismatch: $B7_ASAN_OUT" >&2
+    exit 1
+  fi
+fi
+
+echo "[PASS] p27c1_crosspkg_clo_intmap_eq (Bug #6 + Bug #7 + Map[Int/Int64, V] + #derive(Eq) + Bug #7b + ASan/LSan)"
