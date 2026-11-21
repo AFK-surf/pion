@@ -2667,7 +2667,8 @@ fn collect_expr_captures(
       collect_expr_captures(s, locals, out)
       collect_expr_captures(f, locals, out)
     }
-    EAs(inner, _, _) | ETry(inner, _) => collect_expr_captures(inner, locals, out)
+    EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
+      collect_expr_captures(inner, locals, out)
     EInterp(parts, _) => {
       let mut i = 0
       while i < parts.length() {
@@ -3915,6 +3916,264 @@ fn check_extern_fn_call(
 }
 
 ///|
+pub struct ResolvedCallArgs {
+  args : Array[Expr]
+  missing : Array[Bool]
+}
+
+///|
+fn params_need_named_resolution(
+  params : Array[Param],
+  param_offset : Int,
+  raw_args : Array[Expr],
+) -> Bool {
+  let mut i = 0
+  while i < raw_args.length() {
+    match raw_args[i] {
+      ENamedArg(_, _, _, _) => return true
+      _ => ()
+    }
+    i = i + 1
+  }
+  let mut pi = param_offset
+  while pi < params.length() {
+    let p = params[pi]
+    if p.label_kind != 0 {
+      return true
+    }
+    match p.default_expr {
+      Some(_) => return true
+      None => ()
+    }
+    pi = pi + 1
+  }
+  false
+}
+
+///|
+fn resolve_call_args_impl(
+  tc_opt : Option[TypeChecker],
+  params : Array[Param],
+  param_offset : Int,
+  raw_args : Array[Expr],
+  fn_name : String,
+  sp : Span,
+) -> ResolvedCallArgs {
+  let n = if params.length() > param_offset {
+    params.length() - param_offset
+  } else {
+    0
+  }
+  let slots : Array[Option[Expr]] = []
+  let pos_slots : Array[Int] = []
+  let named_candidates : Array[String] = []
+  let mut k = 0
+  while k < n {
+    slots.push(None)
+    let p = params[param_offset + k]
+    if p.label_kind == 0 {
+      pos_slots.push(k)
+    }
+    let has_def = match p.default_expr {
+      Some(_) => true
+      None => false
+    }
+    if p.label_kind != 0 || has_def {
+      named_candidates.push(p.name)
+    }
+    k = k + 1
+  }
+  let mut pos_cursor = 0
+  let mut ai = 0
+  while ai < raw_args.length() {
+    let arg = raw_args[ai]
+    match arg {
+      ENamedArg(label, opt_fwd, expr, asp) => {
+        let mut found = -1
+        let mut j = 0
+        while j < n {
+          let pj = params[param_offset + j]
+          let pj_has_def = match pj.default_expr {
+            Some(_) => true
+            None => false
+          }
+          if pj.name == label && (pj.label_kind != 0 || pj_has_def) {
+            found = j
+            break
+          }
+          j = j + 1
+        }
+        if found < 0 {
+          match tc_opt {
+            Some(tc) => {
+              let fix = match find_closest_name(label, named_candidates, 2) {
+                Some(best) => "did you mean `" + best + "`?"
+                None => "check parameter name in call to `" + fn_name + "`"
+              }
+              tc_err(
+                tc,
+                asp,
+                "E_TYPE_MISMATCH",
+                "unknown named argument `" + label + "` in call to `" + fn_name + "`",
+                "valid named parameter",
+                label,
+                fix,
+              )
+            }
+            None => ()
+          }
+        } else {
+          match slots[found] {
+            Some(_) =>
+              match tc_opt {
+                Some(tc) =>
+                  tc_err(
+                    tc,
+                    asp,
+                    "E_TYPE_MISMATCH",
+                    "duplicate argument `" + label + "` in call to `" + fn_name + "`",
+                    "single argument for `" + label + "`",
+                    "duplicate `" + label + "`",
+                    "remove the duplicate `" + label + "` argument",
+                  )
+                None => ()
+              }
+            None => {
+              let pf = params[param_offset + found]
+              if opt_fwd {
+                if pf.label_kind != 2 {
+                  match tc_opt {
+                    Some(tc) =>
+                      tc_err(
+                        tc,
+                        asp,
+                        "E_TYPE_MISMATCH",
+                        "`" + label + "?=` can only be used for optional `" + label + "?` parameters",
+                        "optional parameter `" + label + "?`",
+                        "non-optional parameter `" + label + "`",
+                        "use `" + label + "=...` instead",
+                      )
+                    None => ()
+                  }
+                }
+                slots[found] = Some(expr)
+              } else if pf.label_kind == 2 {
+                slots[found] = Some(ECall(EIdent("Some", asp), [expr], asp))
+              } else {
+                slots[found] = Some(expr)
+              }
+            }
+          }
+        }
+      }
+      _ =>
+        if pos_cursor < pos_slots.length() {
+          let slot_idx = pos_slots[pos_cursor]
+          pos_cursor = pos_cursor + 1
+          match slots[slot_idx] {
+            Some(_) =>
+              match tc_opt {
+                Some(tc) =>
+                  tc_err(
+                    tc,
+                    expr_span(arg),
+                    "E_TYPE_MISMATCH",
+                    "duplicate argument `" +
+                    params[param_offset + slot_idx].name +
+                    "` in call to `" +
+                    fn_name +
+                    "`",
+                    "single argument",
+                    "duplicate argument",
+                    "pass this argument once",
+                  )
+                None => ()
+              }
+            None => slots[slot_idx] = Some(arg)
+          }
+        } else {
+          match tc_opt {
+            Some(tc) =>
+              tc_err(
+                tc,
+                expr_span(arg),
+                "E_TYPE_MISMATCH",
+                "too many positional arguments in call to `" + fn_name + "`",
+                pos_slots.length().to_string() + " positional arg(s)",
+                "extra positional arg",
+                "pass labeled parameters by name (`name=value`) or remove extra argument",
+              )
+            None => ()
+          }
+        }
+    }
+    ai = ai + 1
+  }
+  let out : Array[Expr] = []
+  let missing : Array[Bool] = []
+  k = 0
+  while k < n {
+    match slots[k] {
+      Some(e) => {
+        out.push(e)
+        missing.push(false)
+      }
+      None => {
+        let pk = params[param_offset + k]
+        match pk.default_expr {
+          Some(def) => {
+            out.push(def)
+            missing.push(false)
+          }
+          None =>
+            if pk.label_kind == 2 {
+              out.push(EIdent("None", sp))
+              missing.push(false)
+            } else {
+              match tc_opt {
+                Some(tc) => {
+                  let hint = if pk.label_kind == 1 {
+                    "pass `" + pk.name + "=...`"
+                  } else {
+                    "provide required argument `" + pk.name + "`"
+                  }
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_TYPE_MISMATCH",
+                    "missing required argument `" + pk.name + "` in call to `" + fn_name + "`",
+                    "argument `" + pk.name + "`",
+                    "missing",
+                    hint,
+                  )
+                }
+                None => ()
+              }
+              out.push(EUnit(sp))
+              missing.push(true)
+            }
+        }
+      }
+    }
+    k = k + 1
+  }
+  ResolvedCallArgs::{ args: out, missing: missing }
+}
+
+///|
+pub fn resolve_call_args_qbe(
+  params : Array[Param],
+  param_offset : Int,
+  raw_args : Array[Expr],
+  sp : Span,
+) -> Array[Expr] {
+  if !params_need_named_resolution(params, param_offset, raw_args) {
+    return raw_args
+  }
+  resolve_call_args_impl(None, params, param_offset, raw_args, "", sp).args
+}
+
+///|
 fn check_fn_call(
   tc : TypeChecker,
   env : Env,
@@ -3928,7 +4187,21 @@ fn check_fn_call(
     Some(exp_ty) => unify_tparams(finfo.ret_ty, exp_ty, subst)
     None => ()
   }
-  if args.length() != finfo.param_tys.length() {
+  let use_named = params_need_named_resolution(finfo.decl.params, 0, args)
+  let mut resolved_args = args
+  let mut missing_flags : Array[Bool] = []
+  if use_named {
+    let res = resolve_call_args_impl(
+      Some(tc),
+      finfo.decl.params,
+      0,
+      args,
+      finfo.decl.name,
+      sp,
+    )
+    resolved_args = res.args
+    missing_flags = res.missing
+  } else if args.length() != finfo.param_tys.length() {
     tc_err(
       tc,
       sp,
@@ -3946,20 +4219,24 @@ fn check_fn_call(
     add_arity_edit(tc, sp, args, finfo.param_tys)
   }
   let mut i = 0
-  while i < args.length() {
+  while i < resolved_args.length() {
+    if i < missing_flags.length() && missing_flags[i] {
+      i = i + 1
+      continue
+    }
     let exp_p : Option[Ty] = if i < finfo.param_tys.length() {
       Some(subst_ty(finfo.param_tys[i], subst))
     } else {
       None
     }
-    let aty = check_expr(tc, env, args[i], exp_p)
+    let aty = check_expr(tc, env, resolved_args[i], exp_p)
     if i < finfo.param_tys.length() {
       unify_tparams(finfo.param_tys[i], aty, subst)
       let pty = subst_ty(finfo.param_tys[i], subst)
       if !ty_compat(pty, aty) {
         tc_err(
           tc,
-          expr_span(args[i]),
+          expr_span(resolved_args[i]),
           "E_TYPE_MISMATCH",
           "argument " + (i + 1).to_string() + " type mismatch in call to `" + finfo.decl.name + "`",
           ty_to_string(pty),
@@ -4730,22 +5007,41 @@ fn check_method_call(
             None => ()
           }
           // Skip `self` parameter (index 0)
+          let use_named = params_need_named_resolution(minfo.decl.params, 1, args)
+          let mut resolved_args = args
+          let mut missing_flags : Array[Bool] = []
+          if use_named {
+            let res = resolve_call_args_impl(
+              Some(tc),
+              minfo.decl.params,
+              1,
+              args,
+              key,
+              sp,
+            )
+            resolved_args = res.args
+            missing_flags = res.missing
+          }
           let mut i = 0
-          while i < args.length() {
+          while i < resolved_args.length() {
+            if i < missing_flags.length() && missing_flags[i] {
+              i = i + 1
+              continue
+            }
             let p_idx = i + 1
             let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
               Some(subst_ty(minfo.param_tys[p_idx], subst))
             } else {
               None
             }
-            let aty = check_expr(tc, env, args[i], exp_p)
+            let aty = check_expr(tc, env, resolved_args[i], exp_p)
             if p_idx < minfo.param_tys.length() {
               unify_tparams(minfo.param_tys[p_idx], aty, subst)
               let pty = subst_ty(minfo.param_tys[p_idx], subst)
               if !ty_compat(pty, aty) {
                 tc_err(
                   tc,
-                  expr_span(args[i]),
+                  expr_span(resolved_args[i]),
                   "E_TYPE_MISMATCH",
                   "argument type mismatch in method `" + key + "`",
                   ty_to_string(pty),
@@ -5002,6 +5298,18 @@ fn check_expr_inner(
     EChar(_, _) => TChar
     EString(_, _) => TString
     EUnit(_) => TUnit
+    ENamedArg(label, _, inner, sp) => {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "named argument `" + label + "` is only allowed in function or method calls",
+        "expression",
+        "named argument `" + label + "`",
+        "pass `" + label + "=...` directly to a function or method call",
+      )
+      check_expr(tc, env, inner, expected)
+    }
     EIdent(name, sp) => {
       if env.moved.contains(name) {
         tc_err(
@@ -6877,7 +7185,14 @@ pub fn check_package_with_imports(
                 )
                 ptys.push(TError)
               }
-              _ => ptys.push(resolve_type_expr(tc, param.ty, fd.type_params))
+              _ => {
+                let raw_pty = resolve_type_expr(tc, param.ty, fd.type_params)
+                if param.label_kind == 2 {
+                  ptys.push(TOption(raw_pty))
+                } else {
+                  ptys.push(raw_pty)
+                }
+              }
             }
             pi = pi + 1
           }
@@ -7314,6 +7629,29 @@ pub fn check_package_with_imports(
               }
               let mut pi = 0
               while pi < fd.params.length() && pi < finfo.param_tys.length() {
+                match fd.params[pi].default_expr {
+                  Some(def) => {
+                    let dty = check_expr(tc, env, def, Some(finfo.param_tys[pi]))
+                    if !ty_compat(finfo.param_tys[pi], dty) {
+                      tc_err(
+                        tc,
+                        expr_span(def),
+                        "E_TYPE_MISMATCH",
+                        "default value type mismatch for parameter `" +
+                        fd.params[pi].name +
+                        "` of `" +
+                        fd.name +
+                        "`",
+                        ty_to_string(finfo.param_tys[pi]),
+                        ty_to_string(dty),
+                        "provide a default value of type `" +
+                        ty_to_string(finfo.param_tys[pi]) +
+                        "`",
+                      )
+                    }
+                  }
+                  None => ()
+                }
                 env_define(env, fd.params[pi].name, finfo.param_tys[pi], false)
                 pi = pi + 1
               }

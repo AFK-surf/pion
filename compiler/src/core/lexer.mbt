@@ -55,6 +55,7 @@ pub enum TokenKind {
   DotDotEq
   Ellipsis
   Question
+  Tilde
   Arrow
   FatArrow
   PipeGt
@@ -918,6 +919,8 @@ pub fn lex(file : String, source : String) -> LexResult {
       Dot
     } else if ch == 63 {
       Question
+    } else if ch == 126 {
+      Tilde
     } else if ch == 43 {
       Plus
     } else if ch == 45 {

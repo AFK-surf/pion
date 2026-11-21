@@ -291,6 +291,9 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
   exit 1
 fi
 
+# P27-B: Bug #5 cyclic graph deep freeze (PION_FLAG_DEEP_FROZEN) + named & optional default parameters (same-pkg & cross-pkg).
+sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC"
+
 # P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
 P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
 echo "pionc_linux run p17a_ergonomics_mt -> $P17A_OUT"

@@ -130,6 +130,58 @@ fn format_type_params_with_bounds(
 }
 
 ///|
+fn format_simple_default_expr(e : Expr) -> Option[String] {
+  match e {
+    EInt(s, _) => Some(s)
+    EInt64(s, _) => Some(s + "L")
+    EDouble(s, _) => Some(s)
+    EBool(b, _) => Some(if b { "true" } else { "false" })
+    EByte(s, _) => Some("b'" + s + "'")
+    EChar(s, _) => Some("'" + s + "'")
+    EString(s, _) => Some(json_quote(s))
+    EIdent(name, _) => if name == "None" { Some("None") } else { None }
+    EUnit(_) => Some("()")
+    EUnary(op, inner, _) =>
+      if op == "-" || op == "!" {
+        match format_simple_default_expr(inner) {
+          Some(s) => Some(op + s)
+          None => None
+        }
+      } else {
+        None
+      }
+    EArrayLit(elems, _) => if elems.length() == 0 { Some("[]") } else { None }
+    _ => None
+  }
+}
+
+///|
+fn write_param_sig(sb : StringBuilder, param : Param, spaced_colon : Bool) -> Unit {
+  sb.write_string(param.name)
+  if param.label_kind == 1 {
+    sb.write_string("~")
+  } else if param.label_kind == 2 {
+    sb.write_string("?")
+  }
+  if spaced_colon {
+    sb.write_string(" : ")
+  } else {
+    sb.write_string(": ")
+  }
+  sb.write_string(type_expr_to_string(param.ty))
+  match param.default_expr {
+    Some(def) => {
+      sb.write_string(" = ")
+      match format_simple_default_expr(def) {
+        Some(s) => sb.write_string(s)
+        None => sb.write_string("<expr>")
+      }
+    }
+    None => ()
+  }
+}
+
+///|
 pub fn format_fn_sig(fd : FnDecl) -> String {
   let sb = StringBuilder()
   sb.write_string("fn ")
@@ -145,10 +197,7 @@ pub fn format_fn_sig(fd : FnDecl) -> String {
     if i > 0 {
       sb.write_string(", ")
     }
-    let param = fd.params[i]
-    sb.write_string(param.name)
-    sb.write_string(": ")
-    sb.write_string(type_expr_to_string(param.ty))
+    write_param_sig(sb, fd.params[i], false)
     i = i + 1
   }
   sb.write_string(") -> ")
@@ -588,10 +637,7 @@ pub fn emit_file_stub(f : SourceFile) -> String {
           if i > 0 {
             sb.write_string(", ")
           }
-          let param = fd.params[i]
-          sb.write_string(param.name)
-          sb.write_string(" : ")
-          sb.write_string(type_expr_to_string(param.ty))
+          write_param_sig(sb, fd.params[i], true)
           i = i + 1
         }
         sb.write_string(") -> ")
@@ -741,12 +787,51 @@ pub fn pkg_has_pub_generic_fn(pkg : Package) -> Bool {
 /// top-level declaration signatures (with `{ panic() }` / `= panic()` bodies)
 /// so downstream packages can typecheck against CAS-hit dependencies without
 /// re-parsing or typechecking upstream function bodies.
+fn params_have_complex_default(params : Array[Param]) -> Bool {
+  let mut i = 0
+  while i < params.length() {
+    match params[i].default_expr {
+      Some(def) =>
+        match format_simple_default_expr(def) {
+          Some(_) => ()
+          None => return true
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn pkg_has_complex_pub_default(pkg : Package) -> Bool {
+  let mut fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) =>
+          if fd.is_pub && params_have_complex_default(fd.params) {
+            return true
+          }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  false
+}
+
+///|
 pub fn emit_pion_stub(pkg : Package) -> String {
   // A `pub` generic fn or method may be monomorphized in the importing package
   // from its body (trait bounds, `==`/`!=`, or `Option[T]` null-niche); a
   // `{ panic() }` stub would be instantiated instead. Return "" so the driver
-  // loads this package from source.
-  if pkg_has_pub_generic_fn(pkg) {
+  // loads this package from source. Also skip stubbing if a `pub fn` has a
+  // non-literal default argument expression.
+  if pkg_has_pub_generic_fn(pkg) || pkg_has_complex_pub_default(pkg) {
     return ""
   }
   let sb = StringBuilder()

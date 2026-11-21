@@ -33,9 +33,10 @@ typedef enum PionTag {
     PION_TAG_WORLD   = 13
 } PionTag;
 
-#define PION_FLAG_FROZEN   ((uint16_t)1u)
-#define PION_FLAG_IMMORTAL ((uint16_t)2u)
-#define PION_FLAG_SLAB     ((uint16_t)4u)
+#define PION_FLAG_FROZEN      ((uint16_t)1u)
+#define PION_FLAG_IMMORTAL    ((uint16_t)2u)
+#define PION_FLAG_SLAB        ((uint16_t)4u)
+#define PION_FLAG_DEEP_FROZEN ((uint16_t)8u)
 #define PION_FLAG_SLAB_CLS_SHIFT 4u
 #define PION_FLAG_SLAB_CLS_MASK  ((uint16_t)0xFu)
 
@@ -44,7 +45,7 @@ typedef struct PionHeader {
     uint32_t local_rc;          /* Non-atomic RC used while owner_tid == current_tid */
     pion_atomic_u32 shared_rc;  /* Atomic RC used once owner_tid == 0 (or cross-thread dec) */
     uint16_t type_tag;          /* PionTag */
-    uint16_t flags;             /* bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bits 4..7: slab cls */
+    uint16_t flags;             /* bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bit 3: DEEP_FROZEN, bits 4..7: slab cls */
     PionDropFn drop_fn;         /* Nullable destructor for releasing child pointers */
 } PionHeader;                   /* Total: 24 bytes (clean 8-byte alignment on arm64/x64) */
 

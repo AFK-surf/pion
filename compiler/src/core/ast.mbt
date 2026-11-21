@@ -56,6 +56,8 @@ pub struct VariantDecl {
 pub struct Param {
   name : String
   ty : TypeExpr
+  label_kind : Int
+  default_expr : Option[Expr]
   span : Span
 }
 
@@ -242,6 +244,7 @@ pub enum Expr {
   EAs(Expr, TypeExpr, Span)
   ETry(Expr, Span)
   EInterp(Array[Expr], Span)
+  ENamedArg(String, Bool, Expr, Span)
   EUnit(Span)
 }
 
@@ -277,6 +280,7 @@ pub fn expr_span(e : Expr) -> Span {
     EAs(_, _, sp) => sp
     ETry(_, sp) => sp
     EInterp(_, sp) => sp
+    ENamedArg(_, _, _, sp) => sp
     EUnit(sp) => sp
   }
 }

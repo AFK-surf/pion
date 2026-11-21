@@ -772,7 +772,7 @@ fn qbe_expr_has_eq(g : QbeGen, d : Int, e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_has_eq(g, d, inner)
     EBinary(op, l, r, _) =>
       op == "==" || op == "!=" || qbe_expr_has_eq(g, d, l) || qbe_expr_has_eq(g, d, r)
@@ -1222,7 +1222,7 @@ fn qbe_expr_has_option(g : QbeGen, depth : Int, e : Expr) -> Bool {
     | EString(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | ETry(inner, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | ETry(inner, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_has_option(g, depth + 1, inner)
     EAs(inner, ty, _) =>
       qbe_type_expr_has_option(g, ty, 0) ||
@@ -1499,7 +1499,7 @@ fn qbe_expr_has_assign(e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_has_assign(inner)
     EBinary(_, l, r, _) => qbe_expr_has_assign(l) || qbe_expr_has_assign(r)
     EField(o, _, _) => qbe_expr_has_assign(o)
@@ -1639,7 +1639,7 @@ fn qbe_expr_has_same_index(e : Expr, arr : String, key : String) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_has_same_index(inner, arr, key)
     EBinary(_, l, r, _) =>
       qbe_expr_has_same_index(l, arr, key) || qbe_expr_has_same_index(r, arr, key)
@@ -1935,7 +1935,7 @@ fn qbe_expr_assigns_ident(e : Expr, name : String) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_assigns_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_assigns_ident(l, name) || qbe_expr_assigns_ident(r, name)
@@ -2090,7 +2090,7 @@ fn qbe_expr_mentions_ident(e : Expr, name : String) -> Bool {
     | EPath(_, _, _)
     | EUnit(_) => false
     EIdent(n, _) => n == name
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_mentions_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_mentions_ident(l, name) || qbe_expr_mentions_ident(r, name)
@@ -2240,7 +2240,7 @@ fn qbe_ident_is_borrow_safe_expr(g : QbeGen, e : Expr, name : String) -> Bool {
     | EPath(_, _, _)
     | EUnit(_) => true
     EIdent(n, _) => n != name
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_ident_is_borrow_safe_expr(g, inner, name)
     EBinary(_, l, r, _) =>
       qbe_ident_is_borrow_safe_expr(g, l, name) &&
@@ -2553,7 +2553,7 @@ fn qbe_arr_escapes_in_expr(e : Expr, aname : String) -> Bool {
     | EPath(_, _, _)
     | EUnit(_) => false
     EIdent(n, _) => n == aname
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_arr_escapes_in_expr(inner, aname)
     EBinary(_, l, r, _) =>
       qbe_arr_escapes_in_expr(l, aname) || qbe_arr_escapes_in_expr(r, aname)
@@ -2820,7 +2820,7 @@ fn qbe_arr_is_stable_expr(
     | EPath(_, _, _)
     | EUnit(_) => true
     EIdent(n, _) => n != aname
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_arr_is_stable_expr(inner, aname, allow_elem_assign)
     EBinary(_, l, r, _) =>
       qbe_arr_is_stable_expr(l, aname, allow_elem_assign) &&
@@ -3032,7 +3032,7 @@ fn qbe_collect_indexed_arrs_expr(e : Expr, out : Array[String]) -> Unit {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_collect_indexed_arrs_expr(inner, out)
     EBinary(_, l, r, _) => {
       qbe_collect_indexed_arrs_expr(l, out)
@@ -3182,7 +3182,7 @@ fn qbe_collect_loop_idx_expr(
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_collect_loop_idx_expr(inner, arrs, counts, strs, weight)
     EBinary(_, l, r, _) => {
       qbe_collect_loop_idx_expr(l, arrs, counts, strs, weight)
@@ -3342,7 +3342,7 @@ fn qbe_expr_count_mentions(e : Expr, name : String) -> Int {
     | EPath(_, _, _)
     | EUnit(_) => 0
     EIdent(n, _) => if n == name { 1 } else { 0 }
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_count_mentions(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_count_mentions(l, name) + qbe_expr_count_mentions(r, name)
@@ -3399,7 +3399,7 @@ fn qbe_expr_is_straight_line_movable(e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => true
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_is_straight_line_movable(inner)
     EBinary(op, l, r, _) =>
       if op == "&&" || op == "||" {
@@ -3483,7 +3483,7 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => true
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_loop_has_no_calls_expr(inner)
     EBinary(_, l, r, _) | EIndex(l, r, _) =>
       qbe_loop_has_no_calls_expr(l) && qbe_loop_has_no_calls_expr(r)
@@ -3643,7 +3643,7 @@ fn qbe_collect_written_fields_expr(e : Expr, out : Map[String, Bool]) -> Unit {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_collect_written_fields_expr(inner, out)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
       qbe_collect_written_fields_expr(l, out)
@@ -3790,7 +3790,7 @@ fn qbe_collect_read_fields_expr(
         }
         _ => qbe_collect_read_fields_expr(obj, out_vars, out_fields, seen)
       }
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_collect_read_fields_expr(inner, out_vars, out_fields, seen)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
       qbe_collect_read_fields_expr(l, out_vars, out_fields, seen)
@@ -3934,7 +3934,7 @@ fn qbe_expr_rebinds_ident(e : Expr, name : String) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_rebinds_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_rebinds_ident(l, name) || qbe_expr_rebinds_ident(r, name)
@@ -4124,7 +4124,7 @@ fn qbe_expr_has_nested_loop(e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_has_nested_loop(inner)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_has_nested_loop(l) || qbe_expr_has_nested_loop(r)
@@ -4260,7 +4260,7 @@ fn qbe_expr_has_cf(
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => false
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_has_cf(inner, check_break, check_cont, check_ret)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_has_cf(l, check_break, check_cont, check_ret) ||
@@ -4527,7 +4527,7 @@ fn qbe_collect_bce_guards_expr(
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => ()
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_collect_bce_guards_expr(g, body, iv, inner, out, seen)
     EBinary(_, l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
       qbe_collect_bce_guards_expr(g, body, iv, l, out, seen)
@@ -4666,7 +4666,7 @@ fn qbe_expr_count_assigns_ident(e : Expr, name : String) -> Int {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => 0
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_count_assigns_ident(inner, name)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_expr_count_assigns_ident(l, name) + qbe_expr_count_assigns_ident(r, name)
@@ -4964,7 +4964,7 @@ fn qbe_collect_field_access_expr(
         }
         _ => false
       }
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_collect_field_access_expr(inner, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
       qbe_collect_field_access_expr(l, write_vars, write_fields, read_vars, read_fields, all_vars, seen_all) &&
@@ -5153,7 +5153,7 @@ fn qbe_expr_is_leaf_loop_pure(e : Expr) -> Bool {
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => true
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) =>
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
       qbe_expr_is_leaf_loop_pure(inner)
     EBinary(_, l, r, _) | EIndex(l, r, _) =>
       qbe_expr_is_leaf_loop_pure(l) && qbe_expr_is_leaf_loop_pure(r)
@@ -5227,7 +5227,7 @@ fn qbe_expr_inline_cost_in(e : Expr, self_name : String, in_loop : Bool) -> Int 
     | EIdent(_, _)
     | EPath(_, _, _)
     | EUnit(_) => 1
-    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) => {
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) => {
       let c = qbe_expr_inline_cost_in(inner, self_name, in_loop)
       if c < 0 { -1 } else { c + 1 }
     }
@@ -5992,6 +5992,8 @@ fn qbe_freeze_ty_key(ty : Ty) -> String {
     TResult(ok_ty, err_ty) =>
       "res_" + qbe_freeze_ty_key(ok_ty) + "_" + qbe_freeze_ty_key(err_ty)
     TArray(elem) => "arr_" + qbe_freeze_ty_key(elem)
+    TMap(kty, vty) =>
+      "map_" + qbe_freeze_ty_key(kty) + "_" + qbe_freeze_ty_key(vty)
     _ => "obj"
   }
 }
@@ -6034,7 +6036,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
           let sb = StringBuilder()
           sb.write_string("function ")
           sb.write_string(fn_sym)
-          sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n")
+          sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n")
           let mut j = 0
           while j < obj_slots.length() {
             let off = obj_slots[j] * 8
@@ -6087,7 +6089,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       let sb = StringBuilder()
       sb.write_string("function ")
       sb.write_string(fn_sym)
-      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n")
+      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n")
       let mut j = 0
       while j < obj_slots.length() {
         let off = obj_slots[j] * 8
@@ -6126,7 +6128,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       let sb = StringBuilder()
       sb.write_string("function ")
       sb.write_string(fn_sym)
-      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n    %tag =l loadl %obj\n    %is1 =w ceql %tag, 1\n    jnz %is1, @some, @done\n@some\n    %a =l add %obj, 8\n    %v =l loadl %a\n    call ")
+      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %tag =l loadl %obj\n    %is1 =w ceql %tag, 1\n    jnz %is1, @some, @done\n@some\n    %a =l add %obj, 8\n    %v =l loadl %a\n    call ")
       sb.write_string(child_sym)
       sb.write_string("(l %v)\n@done\n    ret\n}\n\n")
       g.extra_fns.push(sb.to_string())
@@ -6148,7 +6150,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       let sb = StringBuilder()
       sb.write_string("function ")
       sb.write_string(fn_sym)
-      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n    %tag =l loadl %obj\n    %is0 =w ceql %tag, 0\n    jnz %is0, @ok_b, @err_b\n@ok_b\n")
+      sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %tag =l loadl %obj\n    %is0 =w ceql %tag, 0\n    jnz %is0, @ok_b, @err_b\n@ok_b\n")
       if ok_obj {
         sb.write_string("    %ao =l add %obj, 8\n    %vo =l loadl %ao\n    call ")
         sb.write_string(ok_sym)
@@ -6196,7 +6198,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
           let sb = StringBuilder()
           sb.write_string("function ")
           sb.write_string(fn_sym)
-          sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n    %tag =l loadl %obj\n")
+          sb.write_string("(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %tag =l loadl %obj\n")
           vi = 0
           while vi < einfo.variants.length() {
             let v = einfo.variants[vi]
@@ -6276,9 +6278,28 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       let sb = StringBuilder()
       sb.write_string("function ")
       sb.write_string(fn_sym)
-      sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n    %len =l loadl %obj\n    %dp_p =l add %obj, 24\n    %dp =l loadl %dp_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %len\n    jnz %c, @step, @done\n@step\n    %off =l shl %i, 3\n    %ep =l add %dp, %off\n    %ev =l loadl %ep\n    call ")
+      sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %len =l loadl %obj\n    %dp_p =l add %obj, 24\n    %dp =l loadl %dp_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %len\n    jnz %c, @step, @done\n@step\n    %off =l shl %i, 3\n    %ep =l add %dp, %off\n    %ev =l loadl %ep\n    call ")
       sb.write_string(child_sym)
       sb.write_string("(l %ev)\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    TMap(_, vty) => {
+      if !qbe_is_obj_ty(vty) {
+        return "$pion_rc_freeze"
+      }
+      let fn_sym = "$pion_freeze_" + qbe_freeze_ty_key(ty)
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      let child_sym = qbe_ensure_freeze_fn(g, vty)
+      let sb = StringBuilder()
+      sb.write_string("function ")
+      sb.write_string(fn_sym)
+      sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %cap_p =l add %obj, 8\n    %cap =l loadl %cap_p\n    %ep_p =l add %obj, 24\n    %ep =l loadl %ep_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %cap\n    jnz %c, @step, @done\n@step\n    %off =l shl %i, 5\n    %ent =l add %ep, %off\n    %st_p =l add %ent, 24\n    %st =w loadub %st_p\n    %occ =w ceqw %st, 1\n    jnz %occ, @fval, @next\n@fval\n    %vp =l add %ent, 16\n    %ev =l loadl %vp\n    call ")
+      sb.write_string(child_sym)
+      sb.write_string("(l %ev)\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
@@ -6289,7 +6310,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       }
       g.freeze_fn_seen.set(fn_sym, true)
       g.extra_fns.push(
-        "function $pion_freeze_dyn(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    call $pion_rc_freeze(l %obj)\n    %vp =l add %obj, 8\n    %vt =l loadl %vp\n    %fa =l add %vt, 8\n    %fz =l loadl %fa\n    jnz %fz, @call_fz, @done\n@call_fz\n    %data =l loadl %obj\n    call %fz(l %data)\n@done\n    ret\n}\n\n",
+        "function $pion_freeze_dyn(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %vp =l add %obj, 8\n    %vt =l loadl %vp\n    %fa =l add %vt, 8\n    %fz =l loadl %fa\n    jnz %fz, @call_fz, @done\n@call_fz\n    %data =l loadl %obj\n    call %fz(l %data)\n@done\n    ret\n}\n\n",
       )
       fn_sym
     }
@@ -9496,6 +9517,13 @@ fn qbe_emit_method_call(
       let key = sname + "::" + method_name
       match g.tc.methods.get(key) {
         Some(minfo) => {
+          let norm_args = resolve_call_args_qbe(
+            minfo.decl.params,
+            1,
+            args,
+            span_new("", 0, 0),
+          )
+          let norm_pure = !qbe_args_have_assign(norm_args)
           let subst = make_subst(minfo.decl.type_params, sargs)
           match expected {
             Some(et) => unify_tparams(minfo.ret_ty, et, subst)
@@ -9505,19 +9533,19 @@ fn qbe_emit_method_call(
           let arg_tys : Array[Ty] = [recv_ty]
           let arg_borrowed : Array[Bool] = [obj_borrowed]
           let mut i = 0
-          while i < args.length() {
+          while i < norm_args.length() {
             let p_idx = i + 1
             let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
               qbe_generic_arg_expect(
                 g,
                 minfo.decl,
                 subst_ty(minfo.param_tys[p_idx], subst),
-                args[i],
+                norm_args[i],
               )
             } else {
               None
             }
-            let aa = qbe_emit_arg_maybe_borrow(g, args[i], exp_p, args_pure)
+            let aa = qbe_emit_arg_maybe_borrow(g, norm_args[i], exp_p, norm_pure)
             let av = aa.qv
             if p_idx < minfo.param_tys.length() {
               unify_tparams(minfo.param_tys[p_idx], av.ty, subst)
@@ -9689,18 +9717,25 @@ fn qbe_emit_method_call(
   match qbe_find_impl_method(g, recv_ty, method_name) {
     Some(imatch) => {
       let minfo = imatch.finfo
+      let norm_args = resolve_call_args_qbe(
+        minfo.decl.params,
+        1,
+        args,
+        span_new("", 0, 0),
+      )
+      let norm_pure = !qbe_args_have_assign(norm_args)
       let arg_vals : Array[String] = [obj_val]
       let arg_tys : Array[Ty] = [recv_ty]
       let arg_borrowed : Array[Bool] = [obj_borrowed]
       let mut i = 0
-      while i < args.length() {
+      while i < norm_args.length() {
         let p_idx = i + 1
         let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
           Some(minfo.param_tys[p_idx])
         } else {
           None
         }
-        let aa = qbe_emit_arg_maybe_borrow(g, args[i], exp_p, args_pure)
+        let aa = qbe_emit_arg_maybe_borrow(g, norm_args[i], exp_p, norm_pure)
         arg_vals.push(aa.qv.reg)
         arg_tys.push(aa.qv.ty)
         arg_borrowed.push(aa.borrowed)
@@ -11389,6 +11424,7 @@ fn qbe_emit_expr_inner(
     }
     EString(s, _) => qval(qbe_emit_string_lit(g, s), TString)
     EUnit(_) => qval("0", TUnit)
+    ENamedArg(_, _, inner, _) => qbe_emit_expr(g, inner, expected)
     EIdent(name, _) => {
       match qbe_lookup_local(g, name) {
         Some(loc) => {
@@ -12596,27 +12632,28 @@ fn qbe_emit_expr_inner(
           }
           match g.tc.fns.get(name) {
             Some(finfo) => {
+              let norm_args = resolve_call_args_qbe(finfo.decl.params, 0, args, sp)
               let subst : Map[String, Ty] = Map([])
               match expected {
                 Some(et) => unify_tparams(finfo.ret_ty, et, subst)
                 None => ()
               }
-              let can_borrow = !qbe_args_have_assign(args)
+              let can_borrow = !qbe_args_have_assign(norm_args)
               let arg_vals : Array[String] = []
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
               let mut i = 0
-              while i < args.length() {
-                match args[i] {
+              while i < norm_args.length() {
+                match norm_args[i] {
                   EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                   _ => ()
                 }
                 let exp_p : Option[Ty] = if i < finfo.param_tys.length() {
-                  qbe_generic_arg_expect(g, finfo.decl, subst_ty(finfo.param_tys[i], subst), args[i])
+                  qbe_generic_arg_expect(g, finfo.decl, subst_ty(finfo.param_tys[i], subst), norm_args[i])
                 } else {
                   None
                 }
-                let aa = qbe_emit_arg_maybe_borrow(g, args[i], exp_p, can_borrow)
+                let aa = qbe_emit_arg_maybe_borrow(g, norm_args[i], exp_p, can_borrow)
                 let av = aa.qv
                 if i < finfo.param_tys.length() {
                   unify_tparams(finfo.param_tys[i], av.ty, subst)
@@ -13032,27 +13069,28 @@ fn qbe_emit_expr_inner(
           }
           match target_finfo {
             Some(minfo) => {
+              let norm_args = resolve_call_args_qbe(minfo.decl.params, 0, args, sp)
               let subst : Map[String, Ty] = Map([])
               match expected {
                 Some(et) => unify_tparams(minfo.ret_ty, et, subst)
                 None => ()
               }
-              let can_borrow = !qbe_args_have_assign(args)
+              let can_borrow = !qbe_args_have_assign(norm_args)
               let arg_vals : Array[String] = []
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
               let mut i = 0
-              while i < args.length() {
-                match args[i] {
+              while i < norm_args.length() {
+                match norm_args[i] {
                   EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                   _ => ()
                 }
                 let exp_p : Option[Ty] = if i < minfo.param_tys.length() {
-                  qbe_generic_arg_expect(g, minfo.decl, subst_ty(minfo.param_tys[i], subst), args[i])
+                  qbe_generic_arg_expect(g, minfo.decl, subst_ty(minfo.param_tys[i], subst), norm_args[i])
                 } else {
                   None
                 }
-                let aa = qbe_emit_arg_maybe_borrow(g, args[i], exp_p, can_borrow)
+                let aa = qbe_emit_arg_maybe_borrow(g, norm_args[i], exp_p, can_borrow)
                 let av = aa.qv
                 if i < minfo.param_tys.length() {
                   unify_tparams(minfo.param_tys[i], av.ty, subst)

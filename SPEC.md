@@ -101,9 +101,14 @@ import "pkg_name" [as alias]
   Variant1(Type1, Type2)
 }
 
-[pub] fn name[T1](p1 : Type1, p2 : Type2) -> RetType {
+[pub] fn name[T1](p1 : Type1, w~ : Type2 = default_expr, opt? : Type3) -> RetType {
   ...
 }
+// Named & optional default parameters (zero-ABI-overhead, resolved at call sites):
+// - `w~ : T` or `w~ : T = def` (labeled parameter, optional default)
+// - `opt? : T` (optional parameter, bound as `Option[T]` inside body, defaults to `None`)
+// - `p : T = def` (positional parameter with default, also passable by name)
+// - Call sites: `f(w=10.0)` / `f(w~)` (punned) / `f(opt=val)` (auto-wrapped in `Some`) / `f(opt?=opt_val)` (Option forwarding) / `x |> f(w=10.0)`
 
 [pub] fn TypeName::method(self : TypeName, p1 : Type1) -> RetType {
   ...
@@ -188,7 +193,7 @@ typedef struct PionHeader {
     uint32_t local_rc;         // Non-atomic RC used while owner_tid == current_tid
     _Atomic uint32_t shared_rc;// Atomic RC used once owner_tid == 0 (or cross-thread dec)
     uint16_t type_tag;         // PionTag (String=1, Bytes=2, Array=3, Struct=4, Enum=5, Closure=6, Map=7, Channel=8, Mutex=9, Atomic=10)
-    uint16_t flags;            // bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bits 4..7: 12-class slab id
+    uint16_t flags;            // bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bit 3: DEEP_FROZEN, bits 4..7: 12-class slab id
     PionDropFn drop_fn;        // Nullable destructor for releasing child pointers
 } PionHeader;                  // Total: 24 bytes (clean 8-byte alignment on arm64/x64)
 ```
@@ -489,7 +494,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - **`pionc init [--json] <dir>`**: writes `pion.toml`, `src/main.pion` and `main_test.pion` for a package named after the directory (`[a-z0-9_]`); the result passes `check`, `test`, `run` and `fmt --check` as is. Refuses to overwrite existing files.
 - **Cross-package traits & generics**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. Any package exporting a `pub` generic fn or method (`type_params.length() > 0`) skips `.pionstub` (importers monomorphize from its source) and exports its package-prefixed internal functions and constants at the QBE level so cross-package monomorphized bodies link cleanly while `types.mbt` still enforces `E_PRIVATE_SYMBOL`.
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.pionsig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.pionsig` yields 100% CAS hit on downstream `.o` files.
-- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.12` (since Phase 26-B C callbacks, zero-copy FFI/math builtins & cross-package generic monomorphization), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.14` (since Phase 27-B cyclic-graph `PION_FLAG_DEEP_FROZEN` freeze & named/optional default parameters), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
 - Default directory: `$PION_CACHE_DIR` or `$HOME/.cache/pion/cas`
 - Layout:
   - `sig/<sha256>.pionsig`

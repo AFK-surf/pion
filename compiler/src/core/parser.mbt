@@ -608,12 +608,36 @@ fn p_parse_params(p : Parser) -> Array[Param] {
       _ => {
         let pspan = p_peek(p).span
         let pname = p_expect_ident(p, "parameter name")
+        let label_kind = match p_peek(p).kind {
+          Tilde => {
+            let _ = p_advance(p)
+            1
+          }
+          Question => {
+            let _ = p_advance(p)
+            2
+          }
+          _ => 0
+        }
         let pty = if p_match_kind_colon(p) {
           p_parse_type_expr(p)
         } else {
           TyMissing(pspan)
         }
-        params.push(Param::{ name: pname, ty: pty, span: pspan })
+        let default_expr : Option[Expr] = match p_peek(p).kind {
+          Eq => {
+            let _ = p_advance(p)
+            Some(p_parse_expr(p))
+          }
+          _ => None
+        }
+        params.push(Param::{
+          name: pname,
+          ty: pty,
+          label_kind: label_kind,
+          default_expr: default_expr,
+          span: pspan,
+        })
         if !p_match_kind_comma(p) {
           p_expect_rparen(p)
           break
@@ -780,7 +804,13 @@ fn p_parse_extern_params(p : Parser) -> ParsedExternParams {
         } else {
           TyMissing(pspan)
         }
-        params.push(Param::{ name: pname, ty: pty, span: pspan })
+        params.push(Param::{
+          name: pname,
+          ty: pty,
+          label_kind: 0,
+          default_expr: None,
+          span: pspan,
+        })
         if !p_match_kind_comma(p) {
           p_expect_rparen(p)
           break
@@ -1496,7 +1526,46 @@ fn p_parse_arg_list(p : Parser) -> Array[Expr] {
         break
       }
       _ => {
-        args.push(p_parse_expr(p))
+        let cur = p_peek(p)
+        let parsed_named = match cur.kind {
+          Ident(arg_name) => {
+            let next1 = p_peek_at(p, 1)
+            match next1.kind {
+              Eq => {
+                let _ = p_advance(p)
+                let _ = p_advance(p)
+                let arg_val = p_parse_expr(p)
+                args.push(ENamedArg(arg_name, false, arg_val, cur.span))
+                true
+              }
+              Tilde => {
+                let _ = p_advance(p)
+                let _ = p_advance(p)
+                args.push(
+                  ENamedArg(arg_name, false, EIdent(arg_name, cur.span), cur.span),
+                )
+                true
+              }
+              Question =>
+                match p_peek_at(p, 2).kind {
+                  Eq => {
+                    let _ = p_advance(p)
+                    let _ = p_advance(p)
+                    let _ = p_advance(p)
+                    let arg_val = p_parse_expr(p)
+                    args.push(ENamedArg(arg_name, true, arg_val, cur.span))
+                    true
+                  }
+                  _ => false
+                }
+              _ => false
+            }
+          }
+          _ => false
+        }
+        if !parsed_named {
+          args.push(p_parse_expr(p))
+        }
         if !p_match_kind_comma(p) {
           p_expect_rparen(p)
           break

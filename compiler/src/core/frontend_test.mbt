@@ -2355,3 +2355,84 @@ test "p27a_ergonomics_and_bug4_frontend" {
   let (ok_bm, json_bm, _) = check_one(bad_mut)
   assert_true(!ok_bm && str_contains(json_bm, "immutable"), json_bm)
 }
+
+///|
+test "p27b_named_and_optional_params" {
+  let src =
+    #|struct View {
+    #|  w : Double
+    #|  h : Double
+    #|  bg : Int64
+    #|}
+    #|fn View::pad(self : View, x~ : Double = 0.0, y~ : Double = 0.0) -> View {
+    #|  View::{ w: self.w + x, h: self.h + y, bg: self.bg }
+    #|}
+    #|fn View::ground(self : View, color? : Int64) -> View {
+    #|  let c = match color { Some(v) => v; None => self.bg }
+    #|  View::{ w: self.w, h: self.h, bg: c }
+    #|}
+    #|fn box(w~ : Double = 0.0, h~ : Double = 0.0, bg? : Int64, label? : String) -> String {
+    #|  let b = match bg { Some(v) => v.to_string(); None => "none" }
+    #|  let l = match label { Some(s) => s; None => "-" }
+    #|  "\{w}:\{h}:\{b}:\{l}"
+    #|}
+    #|fn req_labeled(w~ : Double, scale~ : Double = 1.0) -> Double {
+    #|  w * scale
+    #|}
+    #|fn scale_val(x : Double, factor~ : Double = 2.0) -> Double {
+    #|  x * factor
+    #|}
+    #|fn pick[T](base : T, alt? : T) -> T {
+    #|  match alt { Some(v) => v; None => base }
+    #|}
+    #|fn main() -> Int {
+    #|  let _s0 = box()
+    #|  let _s1 = box(bg=255L, w=120.0)
+    #|  let w = 64.0
+    #|  let _s2 = box(w~, label="hi")
+    #|  let opt_bg : Option[Int64] = Some(16L)
+    #|  let _s3 = box(bg?=opt_bg)
+    #|  let _r1 = req_labeled(w=5.0)
+    #|  let _r2 = 10.0 |> scale_val(factor=2.5)
+    #|  let _p1 = pick(1)
+    #|  let _p2 = pick(1, alt=2)
+    #|  let v = View::{ w: 10.0, h: 20.0, bg: 0L }
+    #|  let v2 = v.pad(x=12.0, y=8.0).ground(color=0xFFFFFFL)
+    #|  v2.w.to_int()
+    #|}
+  let (ok, json, _) = check_one(src)
+  assert_true(ok, json)
+
+  // Negative: unknown named argument with typo suggestion
+  let bad_unknown =
+    #|fn f(width~ : Double = 0.0) -> Double { width }
+    #|fn main() -> Double { f(widht=1.0) }
+  let (ok_u, json_u, _) = check_one(bad_unknown)
+  assert_true(
+    !ok_u && str_contains(json_u, "unknown named argument") && str_contains(json_u, "width"),
+    json_u,
+  )
+
+  // Negative: duplicate named argument
+  let bad_dup =
+    #|fn f(w~ : Double = 0.0) -> Double { w }
+    #|fn main() -> Double { f(w=1.0, w=2.0) }
+  let (ok_d, json_d, _) = check_one(bad_dup)
+  assert_true(!ok_d && str_contains(json_d, "duplicate argument"), json_d)
+
+  // Negative: missing required labeled argument
+  let bad_missing =
+    #|fn f(w~ : Double, h~ : Double = 1.0) -> Double { w + h }
+    #|fn main() -> Double { f(h=2.0) }
+  let (ok_m, json_m, _) = check_one(bad_missing)
+  assert_true(
+    !ok_m && str_contains(json_m, "missing required argument") && str_contains(json_m, "w"),
+    json_m,
+  )
+
+  // Negative: default value type mismatch
+  let bad_def =
+    #|fn f(w~ : Double = "oops") -> Double { w }
+  let (ok_def, json_def, _) = check_one(bad_def)
+  assert_true(!ok_def && str_contains(json_def, "default value type mismatch"), json_def)
+}
