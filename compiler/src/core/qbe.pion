@@ -652,14 +652,13 @@ fn qbe_coerce_val(g : QbeGen, v : QbeVal, target_ty : Ty) -> String {
     qbe_emit(g, dreg + " =d cast " + lreg)
     dreg
   } else if src_abi == "s" && dst_abi == "d" {
-    let lreg = qbe_as_l(g, v)
     let dreg = qbe_tmp(g)
-    qbe_emit(g, dreg + " =d cast " + lreg)
+    qbe_emit(g, dreg + " =d exts " + v.reg)
     dreg
   } else if src_abi == "d" && dst_abi == "s" {
-    let lreg = qbe_tmp(g)
-    qbe_emit(g, lreg + " =l cast " + v.reg)
-    qbe_from_l(g, lreg, TFloat)
+    let freg = qbe_tmp(g)
+    qbe_emit(g, freg + " =s truncd " + v.reg)
+    freg
   } else {
     let lreg = qbe_tmp(g)
     let wreg = qbe_tmp(g)
@@ -942,7 +941,8 @@ fn qbe_expr_has_eq(g : QbeGen, d : Int, e : Expr) -> Bool {
       qbe_expr_has_eq(g, d, callee) ||
       qbe_exprs_have_eq(g, d, args) ||
       qbe_callee_generic_has_eq(g, d, callee)
-    EMethodCall(obj, _, args, _) => qbe_expr_has_eq(g, d, obj) || qbe_exprs_have_eq(g, d, args)
+    EMethodCall(obj, mname, args, _) =>
+      mname == "contains" || qbe_expr_has_eq(g, d, obj) || qbe_exprs_have_eq(g, d, args)
     EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) =>
       qbe_exprs_have_eq(g, d, elems)
     EStructLit(_, _spread, fields, _) => {
@@ -7481,6 +7481,88 @@ fn qbe_hex_val(c : Int) -> Int {
 }
 
 ///|
+fn qbe_emit_arr_contains(
+  g : QbeGen,
+  obj_val : String,
+  obj_borrowed : Bool,
+  raw_elem : Ty,
+  arg : Expr,
+  args_pure : Bool,
+) -> QbeVal {
+  let elem = subst_ty(raw_elem, g.cur_type_subst)
+  let va = qbe_emit_arg_maybe_borrow(g, arg, Some(elem), args_pure)
+  let tv = va.qv
+  let target_reg = qbe_coerce_val(g, tv, elem)
+  let alen = qbe_tmp(g)
+  let dp_p = qbe_tmp(g)
+  let dp = qbe_tmp(g)
+  let idx_slot = qbe_alloc_slot(g)
+  let res_slot = qbe_alloc_slot(g)
+  let l_cond = qbe_lbl(g, "ac_cond")
+  let l_body = qbe_lbl(g, "ac_body")
+  let l_found = qbe_lbl(g, "ac_found")
+  let l_next = qbe_lbl(g, "ac_next")
+  let l_end = qbe_lbl(g, "ac_end")
+  qbe_emit(g, alen + " =l loadl " + obj_val)
+  qbe_emit(g, dp_p + " =l add " + obj_val + ", 24")
+  qbe_emit(g, dp + " =l loadl " + dp_p)
+  qbe_emit(g, "storel 0, " + idx_slot)
+  qbe_emit(g, "storel 0, " + res_slot)
+  qbe_emit_term(g, "jmp " + l_cond)
+  qbe_emit_lbl(g, l_cond)
+  let cur_i = qbe_tmp(g)
+  let cmp_i = qbe_tmp(g)
+  qbe_emit(g, cur_i + " =l loadl " + idx_slot)
+  qbe_emit(g, cmp_i + " =w csltl " + cur_i + ", " + alen)
+  qbe_emit_term(g, "jnz " + cmp_i + ", " + l_body + ", " + l_end)
+  qbe_emit_lbl(g, l_body)
+  let off = qbe_tmp(g)
+  let ep = qbe_tmp(g)
+  qbe_emit(g, off + " =l shl " + cur_i + ", 3")
+  qbe_emit(g, ep + " =l add " + dp + ", " + off)
+  let ev = qbe_load_heap_slot(g, ep, elem)
+  let eq_w = qbe_tmp(g)
+  match elem {
+    TString =>
+      qbe_emit(g, eq_w + " =w call $pion_str_eq(l " + ev + ", l " + target_reg + ")")
+    TInt | TUInt =>
+      qbe_emit(g, eq_w + " =w ceqw " + ev + ", " + target_reg)
+    TDouble =>
+      qbe_emit(g, eq_w + " =w ceqd " + ev + ", " + target_reg)
+    TFloat =>
+      qbe_emit(g, eq_w + " =w ceqs " + ev + ", " + target_reg)
+    _ =>
+      if qbe_type_needs_eq_fn(g, elem) {
+        let eq_sym = qbe_ensure_eq_fn(g, elem)
+        qbe_emit(g, eq_w + " =w call " + eq_sym + "(l " + ev + ", l " + target_reg + ")")
+      } else {
+        let lc = qbe_cmp_operand(g, ev, elem)
+        let rc = qbe_cmp_operand(g, target_reg, elem)
+        qbe_emit(g, eq_w + " =w ceql " + lc + ", " + rc)
+      }
+  }
+  qbe_emit_term(g, "jnz " + eq_w + ", " + l_found + ", " + l_next)
+  qbe_emit_lbl(g, l_found)
+  qbe_emit(g, "storel 1, " + res_slot)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_next)
+  let next_i = qbe_tmp(g)
+  qbe_emit(g, next_i + " =l add " + cur_i + ", 1")
+  qbe_emit(g, "storel " + next_i + ", " + idx_slot)
+  qbe_emit_term(g, "jmp " + l_cond)
+  qbe_emit_lbl(g, l_end)
+  if !va.borrowed {
+    qbe_rc_dec(g, tv.reg, tv.ty)
+  }
+  if !obj_borrowed {
+    qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+  }
+  let r = qbe_tmp(g)
+  qbe_emit(g, r + " =l loadl " + res_slot)
+  qval(r, TBool)
+}
+
+///|
 fn qbe_parse_char_lit(raw : String) -> Int {
   let len = raw.length()
   if len == 0 {
@@ -7507,6 +7589,21 @@ fn qbe_parse_char_lit(raw : String) -> Int {
       let h1 = qbe_hex_val(str_code_at(raw, 2))
       let h2 = qbe_hex_val(str_code_at(raw, 3))
       (h1 << 4) | h2
+    } else if c1 == 117 && len >= 5 && str_code_at(raw, 2) == 123 {
+      let mut p = 3
+      let mut cp = 0
+      while p < len {
+        let ch = str_code_at(raw, p)
+        if ch == 125 {
+          break
+        }
+        let hv = qbe_hex_val(ch)
+        if hv >= 0 {
+          cp = (cp << 4) | hv
+        }
+        p = p + 1
+      }
+      cp
     } else {
       c1
     }
@@ -9945,6 +10042,9 @@ fn qbe_emit_method_call(
         }
         return qval(r, TFixedArray(elem))
       }
+      if method_name == "contains" {
+        return qbe_emit_arr_contains(g, obj_val, obj_borrowed, elem, args[0], args_pure)
+      }
       if method_name == "fill" {
         let va = qbe_emit_arg_maybe_borrow(g, args[0], Some(elem), args_pure)
         let vv = va.qv
@@ -10260,6 +10360,9 @@ fn qbe_emit_method_call(
           qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
         }
         return qval(r, TArray(elem))
+      }
+      if method_name == "contains" {
+        return qbe_emit_arr_contains(g, obj_val, obj_borrowed, elem, args[0], args_pure)
       }
       if method_name == "clear" {
         qbe_emit(g, "call $pion_arr_clear(l " + obj_val + ")")
@@ -13395,11 +13498,20 @@ fn qbe_emit_expr_inner(
       }
       // IEEE-754 exact `2.0 * x -> x + x` strength reduction
       if op == "*" && qbe_is_double_two(lhs) {
-        let rv = qbe_emit_expr(g, rhs, Some(TDouble))
-        let rd = qbe_coerce_val(g, rv, TDouble)
-        let ad = qbe_tmp(g)
-        qbe_emit(g, ad + " =d add " + rd + ", " + rd)
-        return qval(ad, TDouble)
+        let rv = qbe_emit_expr(g, rhs, expected)
+        match rv.ty {
+          TFloat => {
+            let af = qbe_tmp(g)
+            qbe_emit(g, af + " =s add " + rv.reg + ", " + rv.reg)
+            return qval(af, TFloat)
+          }
+          _ => {
+            let rd = qbe_coerce_val(g, rv, TDouble)
+            let ad = qbe_tmp(g)
+            qbe_emit(g, ad + " =d add " + rd + ", " + rd)
+            return qval(ad, TDouble)
+          }
+        }
       }
       let cmp_borrow = (op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "+") &&
         !qbe_expr_has_assign(lhs) &&
