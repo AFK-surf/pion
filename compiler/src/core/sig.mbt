@@ -33,6 +33,9 @@ fn format_type_params(tparams : Array[String]) -> String {
 ///|
 pub fn format_struct_sig(sd : StructDecl) -> String {
   let sb = StringBuilder()
+  if sd.derive_eq {
+    sb.write_string("#derive(Eq) ")
+  }
   if sd.is_val {
     sb.write_string("val ")
   }
@@ -61,6 +64,9 @@ pub fn format_struct_sig(sd : StructDecl) -> String {
 ///|
 pub fn format_enum_sig(ed : EnumDecl) -> String {
   let sb = StringBuilder()
+  if ed.derive_eq {
+    sb.write_string("#derive(Eq) ")
+  }
   sb.write_string("enum ")
   sb.write_string(ed.name)
   sb.write_string(format_type_params(ed.type_params))
@@ -565,6 +571,9 @@ pub fn emit_file_stub(f : SourceFile) -> String {
   while di < f.decls.length() {
     match f.decls[di] {
       DStruct(sd) => {
+        if sd.derive_eq {
+          sb.write_string("#derive(Eq)\n")
+        }
         if sd.is_pub {
           sb.write_string("pub ")
         }
@@ -591,6 +600,9 @@ pub fn emit_file_stub(f : SourceFile) -> String {
         sb.write_string("}\n")
       }
       DEnum(ed) => {
+        if ed.derive_eq {
+          sb.write_string("#derive(Eq)\n")
+        }
         if ed.is_pub {
           sb.write_string("pub ")
         }

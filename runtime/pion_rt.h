@@ -91,7 +91,7 @@ typedef struct PionMap {
     int64_t len;
     int64_t cap;
     int32_t val_is_obj;
-    int32_t _pad;
+    int32_t key_is_int;
     PionMapEntry *entries;
 } PionMap;
 
@@ -187,8 +187,9 @@ void*    pion_arr_join(void *a, void *sep);
 void     pion_arr_sort_int(void *a);
 void     pion_arr_sort_str(void *a);
 
-/* String-Keyed Hash Map */
+/* Hash Map (String or Int/Int64 keys) */
 void*    pion_map_new(int32_t val_is_obj);
+void*    pion_map_new_int(int32_t val_is_obj);
 int64_t  pion_map_len(void *m);
 void     pion_map_set(void *m, void *key_str, int64_t val);
 int32_t  pion_map_has(void *m, void *key_str);

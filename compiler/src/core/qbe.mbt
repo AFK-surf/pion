@@ -140,6 +140,7 @@ pub struct QbeGen {
   const_i64_vals : Map[String, Int64]
   const_bool_vals : Map[String, Bool]
   freeze_fn_seen : Map[String, Bool]
+  eq_fn_seen : Map[String, Bool]
   strings : Array[String]
   string_ids : Map[String, Int]
   cstrings : Array[String]
@@ -395,7 +396,18 @@ fn qbe_find_impl_method(
 
 ///|
 fn qbe_resolve_type(g : QbeGen, te : TypeExpr) -> Ty {
-  let raw = resolve_type_expr(g.tc, te, g.cur_tparams)
+  let raw = if g.mono_pkg != "" {
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        qualify_imported_ty(
+          ipkg.name,
+          resolve_type_expr(ipkg.tc, te, g.cur_tparams),
+        )
+      None => resolve_type_expr(g.tc, te, g.cur_tparams)
+    }
+  } else {
+    resolve_type_expr(g.tc, te, g.cur_tparams)
+  }
   subst_ty(raw, g.cur_type_subst)
 }
 
@@ -678,6 +690,16 @@ fn qbe_method_call_sym(
   let st_name = qp.name
   if canon_pkg.length() > 0 {
     qbe_ext_method_sym(canon_pkg, st_name, method_name)
+  } else if g.mono_pkg != "" {
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        if ipkg.tc.methods.contains(sname + "::" + method_name) {
+          qbe_ext_method_sym(ipkg.name, sname, method_name)
+        } else {
+          qbe_local_method_sym(g, sname, method_name)
+        }
+      None => qbe_local_method_sym(g, sname, method_name)
+    }
   } else {
     qbe_local_method_sym(g, sname, method_name)
   }
@@ -894,6 +916,40 @@ fn qbe_callee_generic_has_eq(g : QbeGen, d : Int, callee : Expr) -> Bool {
 }
 
 ///|
+fn qbe_qualify_struct_info(pkg_name : String, si : StructInfo) -> StructInfo {
+  let ftys : Array[Ty] = []
+  let mut i = 0
+  while i < si.field_tys.length() {
+    ftys.push(qualify_imported_ty(pkg_name, si.field_tys[i]))
+    i = i + 1
+  }
+  StructInfo::{
+    decl: si.decl,
+    field_names: si.field_names,
+    field_muts: si.field_muts,
+    field_tys: ftys,
+  }
+}
+
+///|
+fn qbe_qualify_enum_info(pkg_name : String, ei : EnumInfo) -> EnumInfo {
+  let vars : Array[VariantInfo] = []
+  let mut vi = 0
+  while vi < ei.variants.length() {
+    let v = ei.variants[vi]
+    let ftys : Array[Ty] = []
+    let mut fi = 0
+    while fi < v.field_tys.length() {
+      ftys.push(qualify_imported_ty(pkg_name, v.field_tys[fi]))
+      fi = fi + 1
+    }
+    vars.push(VariantInfo::{ name: v.name, field_tys: ftys })
+    vi = vi + 1
+  }
+  EnumInfo::{ decl: ei.decl, variants: vars }
+}
+
+///|
 fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
   match g.tc.structs.get(name) {
     Some(si) => return Some(si)
@@ -907,7 +963,7 @@ fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
     match g.tc.imported_pkgs.get(g.mono_pkg) {
       Some(ipkg) =>
         match ipkg.tc.structs.get(name) {
-          Some(si) => return Some(si)
+          Some(si) => return Some(qbe_qualify_struct_info(ipkg.name, si))
           None => ()
         }
       None => ()
@@ -918,7 +974,7 @@ fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
     match resolve_alias_pkg(g.tc, qp.prefix) {
       Some(ipkg) =>
         match ipkg.tc.structs.get(qp.name) {
-          Some(si) => return Some(si)
+          Some(si) => return Some(qbe_qualify_struct_info(ipkg.name, si))
           None => ()
         }
       None => ()
@@ -926,7 +982,7 @@ fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
     match g.tc.imported_pkgs.get(qp.prefix) {
       Some(ipkg) =>
         match ipkg.tc.structs.get(qp.name) {
-          Some(si) => return Some(si)
+          Some(si) => return Some(qbe_qualify_struct_info(ipkg.name, si))
           None => ()
         }
       None => ()
@@ -937,7 +993,7 @@ fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
           match resolve_alias_pkg(mpkg.tc, qp.prefix) {
             Some(ipkg) =>
               match ipkg.tc.structs.get(qp.name) {
-                Some(si) => return Some(si)
+                Some(si) => return Some(qbe_qualify_struct_info(ipkg.name, si))
                 None => ()
               }
             None => ()
@@ -963,7 +1019,7 @@ fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
     match g.tc.imported_pkgs.get(g.mono_pkg) {
       Some(ipkg) =>
         match ipkg.tc.enums.get(name) {
-          Some(ei) => return Some(ei)
+          Some(ei) => return Some(qbe_qualify_enum_info(ipkg.name, ei))
           None => ()
         }
       None => ()
@@ -974,7 +1030,7 @@ fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
     match resolve_alias_pkg(g.tc, qp.prefix) {
       Some(ipkg) =>
         match ipkg.tc.enums.get(qp.name) {
-          Some(ei) => return Some(ei)
+          Some(ei) => return Some(qbe_qualify_enum_info(ipkg.name, ei))
           None => ()
         }
       None => ()
@@ -982,7 +1038,7 @@ fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
     match g.tc.imported_pkgs.get(qp.prefix) {
       Some(ipkg) =>
         match ipkg.tc.enums.get(qp.name) {
-          Some(ei) => return Some(ei)
+          Some(ei) => return Some(qbe_qualify_enum_info(ipkg.name, ei))
           None => ()
         }
       None => ()
@@ -993,7 +1049,7 @@ fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
           match resolve_alias_pkg(mpkg.tc, qp.prefix) {
             Some(ipkg) =>
               match ipkg.tc.enums.get(qp.name) {
-                Some(ei) => return Some(ei)
+                Some(ei) => return Some(qbe_qualify_enum_info(ipkg.name, ei))
                 None => ()
               }
             None => ()
@@ -1003,6 +1059,110 @@ fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
     }
   }
   None
+}
+
+///|
+fn qbe_lookup_method_info(
+  g : QbeGen,
+  sname : String,
+  method_name : String,
+) -> Option[FnInfo] {
+  let key = sname + "::" + method_name
+  match g.tc.methods.get(key) {
+    Some(mi) => return Some(mi)
+    None => ()
+  }
+  if g.mono_pkg != "" {
+    match g.tc.methods.get(g.mono_pkg + "::" + key) {
+      Some(mi) => return Some(mi)
+      None => ()
+    }
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        match ipkg.tc.methods.get(key) {
+          Some(mi) => return Some(qualify_fn_info(ipkg.name, mi))
+          None => ()
+        }
+      None => ()
+    }
+  }
+  let qp = split_qual_name(sname)
+  if qp.prefix != "" {
+    let sub_key = qp.name + "::" + method_name
+    match resolve_alias_pkg(g.tc, qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.methods.get(sub_key) {
+          Some(mi) => return Some(qualify_fn_info(ipkg.name, mi))
+          None => ()
+        }
+      None => ()
+    }
+    match g.tc.imported_pkgs.get(qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.methods.get(sub_key) {
+          Some(mi) => return Some(qualify_fn_info(ipkg.name, mi))
+          None => ()
+        }
+      None => ()
+    }
+    if g.mono_pkg != "" {
+      match g.tc.imported_pkgs.get(g.mono_pkg) {
+        Some(mpkg) =>
+          match resolve_alias_pkg(mpkg.tc, qp.prefix) {
+            Some(ipkg) =>
+              match ipkg.tc.methods.get(sub_key) {
+                Some(mi) => return Some(qualify_fn_info(ipkg.name, mi))
+                None => ()
+              }
+            None => ()
+          }
+        None => ()
+      }
+    }
+  }
+  None
+}
+
+///|
+fn qbe_lookup_variant_enum(g : QbeGen, vname : String) -> Option[String] {
+  match g.tc.variant_to_enum.get(vname) {
+    Some(en) => return Some(en)
+    None => ()
+  }
+  if g.mono_pkg != "" {
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        match ipkg.tc.variant_to_enum.get(vname) {
+          Some(en) => return Some(ipkg.name + "::" + en)
+          None => ()
+        }
+      None => ()
+    }
+  }
+  None
+}
+
+///|
+fn qbe_lookup_const_ty(g : QbeGen, name : String) -> Option[Ty] {
+  if g.mono_pkg != "" {
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        match ipkg.tc.consts.get(name) {
+          Some(cty) => return Some(qualify_imported_ty(ipkg.name, cty))
+          None => ()
+        }
+      None => ()
+    }
+  }
+  g.tc.consts.get(name)
+}
+
+///|
+fn qbe_map_key_is_int(kty : Ty) -> Bool {
+  match kty {
+    TInt | TInt64 => true
+    _ => false
+  }
 }
 
 ///|
@@ -1814,7 +1974,7 @@ fn qbe_emit_arg_maybe_borrow_ext(
           Some(loc) =>
             match loc.ty {
               TStruct(sname, sargs) =>
-                match g.tc.structs.get(sname) {
+                match qbe_lookup_struct_info(g, sname) {
                   Some(sinfo) => {
                     let subst = make_subst(sinfo.decl.type_params, sargs)
                     let mut fi = 0
@@ -1858,7 +2018,7 @@ fn qbe_emit_arg_maybe_borrow_ext(
             Some(aloc) =>
               match aloc.ty {
                 TArray(TStruct(sname, sargs)) =>
-                  match g.tc.structs.get(sname) {
+                  match qbe_lookup_struct_info(g, sname) {
                     Some(sinfo) => {
                       let subst = make_subst(sinfo.decl.type_params, sargs)
                       let mut fi = 0
@@ -5456,6 +5616,7 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     const_i64_vals: Map([]),
     const_bool_vals: Map([]),
     freeze_fn_seen: Map([]),
+    eq_fn_seen: Map([]),
     strings: [],
     string_ids: Map([]),
     cstrings: [],
@@ -6005,7 +6166,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
   }
   match ty {
     TStruct(sname, sargs) =>
-      match g.tc.structs.get(sname) {
+      match qbe_lookup_struct_info(g, sname) {
         Some(sinfo) => {
           let subst = make_subst(sinfo.decl.type_params, sargs)
           let obj_slots : Array[Int] = []
@@ -6167,7 +6328,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       fn_sym
     }
     TEnum(ename, eargs) =>
-      match g.tc.enums.get(ename) {
+      match qbe_lookup_enum_info(g, ename) {
         Some(einfo) => {
           let subst = make_subst(einfo.decl.type_params, eargs)
           let mut any_obj = false
@@ -6315,6 +6476,179 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       fn_sym
     }
     _ => "$pion_rc_freeze"
+  }
+}
+
+///|
+fn qbe_type_needs_eq_fn(g : QbeGen, ty : Ty) -> Bool {
+  match ty {
+    TStruct(sname, _) =>
+      match qbe_lookup_struct_info(g, sname) {
+        Some(si) => si.decl.derive_eq
+        None => false
+      }
+    TEnum(ename, _) =>
+      match qbe_lookup_enum_info(g, ename) {
+        Some(ei) => {
+          if !ei.decl.derive_eq {
+            return false
+          }
+          let mut vi = 0
+          while vi < ei.variants.length() {
+            if ei.variants[vi].field_tys.length() > 0 {
+              return true
+            }
+            vi = vi + 1
+          }
+          false
+        }
+        None => false
+      }
+    _ => false
+  }
+}
+
+///|
+fn qbe_emit_eq_field_cmp(
+  g : QbeGen,
+  sb : StringBuilder,
+  fty : Ty,
+  off : Int,
+  pfx : String,
+  next_lbl : String,
+) -> Unit {
+  sb.write_string("    %ap_" + pfx + " =l add %a, " + off.to_string() + "\n")
+  sb.write_string("    %bp_" + pfx + " =l add %b, " + off.to_string() + "\n")
+  match fty {
+    TInt => {
+      sb.write_string("    %al_" + pfx + " =l loadl %ap_" + pfx + "\n")
+      sb.write_string("    %bl_" + pfx + " =l loadl %bp_" + pfx + "\n")
+      sb.write_string("    %aw_" + pfx + " =w copy %al_" + pfx + "\n")
+      sb.write_string("    %bw_" + pfx + " =w copy %bl_" + pfx + "\n")
+      sb.write_string("    %ok_" + pfx + " =w ceqw %aw_" + pfx + ", %bw_" + pfx + "\n")
+    }
+    TDouble => {
+      sb.write_string("    %ad_" + pfx + " =d loadd %ap_" + pfx + "\n")
+      sb.write_string("    %bd_" + pfx + " =d loadd %bp_" + pfx + "\n")
+      sb.write_string("    %ok_" + pfx + " =w ceqd %ad_" + pfx + ", %bd_" + pfx + "\n")
+    }
+    TString => {
+      sb.write_string("    %av_" + pfx + " =l loadl %ap_" + pfx + "\n")
+      sb.write_string("    %bv_" + pfx + " =l loadl %bp_" + pfx + "\n")
+      sb.write_string("    %ok_" + pfx + " =w call $pion_str_eq(l %av_" + pfx + ", l %bv_" + pfx + ")\n")
+    }
+    _ => {
+      sb.write_string("    %av_" + pfx + " =l loadl %ap_" + pfx + "\n")
+      sb.write_string("    %bv_" + pfx + " =l loadl %bp_" + pfx + "\n")
+      if qbe_type_needs_eq_fn(g, fty) {
+        let child_sym = qbe_ensure_eq_fn(g, fty)
+        sb.write_string("    %ok_" + pfx + " =w call " + child_sym + "(l %av_" + pfx + ", l %bv_" + pfx + ")\n")
+      } else {
+        match fty {
+          TEnum(_, _) => {
+            sb.write_string("    %at_" + pfx + " =l loadl %av_" + pfx + "\n")
+            sb.write_string("    %bt_" + pfx + " =l loadl %bv_" + pfx + "\n")
+            sb.write_string("    %ok_" + pfx + " =w ceql %at_" + pfx + ", %bt_" + pfx + "\n")
+          }
+          _ =>
+            sb.write_string("    %ok_" + pfx + " =w ceql %av_" + pfx + ", %bv_" + pfx + "\n")
+        }
+      }
+    }
+  }
+  sb.write_string("    jnz %ok_" + pfx + ", " + next_lbl + ", @ret_false\n")
+}
+
+///|
+fn qbe_ensure_eq_fn(g : QbeGen, ty : Ty) -> String {
+  let fn_sym = "$pion_eq_" + qbe_freeze_ty_key(ty)
+  if g.eq_fn_seen.contains(fn_sym) {
+    return fn_sym
+  }
+  g.eq_fn_seen.set(fn_sym, true)
+  match ty {
+    TStruct(sname, sargs) =>
+      match qbe_lookup_struct_info(g, sname) {
+        Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let sb = StringBuilder()
+          sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
+          sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @f_0\n")
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            let fty = subst_ty(sinfo.field_tys[fi], subst)
+            let next_lbl = if fi + 1 < sinfo.field_tys.length() {
+              "@f_" + (fi + 1).to_string()
+            } else {
+              "@ret_true"
+            }
+            sb.write_string("@f_" + fi.to_string() + "\n")
+            qbe_emit_eq_field_cmp(g, sb, fty, fi * 8, "s" + fi.to_string(), next_lbl)
+            fi = fi + 1
+          }
+          if sinfo.field_tys.length() == 0 {
+            sb.write_string("@f_0\n    jmp @ret_true\n")
+          }
+          sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+          g.extra_fns.push(sb.to_string())
+          fn_sym
+        }
+        None => fn_sym
+      }
+    TEnum(ename, eargs) =>
+      match qbe_lookup_enum_info(g, ename) {
+        Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let sb = StringBuilder()
+          sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
+          sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_tag\n@cmp_tag\n")
+          sb.write_string("    %ta =l loadl %a\n    %tb =l loadl %b\n    %teq =w ceql %ta, %tb\n    jnz %teq, @vchk_0, @ret_false\n")
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let next_v = if vi + 1 < einfo.variants.length() {
+              "@vchk_" + (vi + 1).to_string()
+            } else {
+              "@ret_true"
+            }
+            sb.write_string("@vchk_" + vi.to_string() + "\n")
+            if v.field_tys.length() == 0 {
+              sb.write_string("    jmp " + next_v + "\n")
+            } else {
+              sb.write_string("    %isv_" + vi.to_string() + " =w ceql %ta, " + vi.to_string() + "\n")
+              sb.write_string("    jnz %isv_" + vi.to_string() + ", @v_" + vi.to_string() + "_0, " + next_v + "\n")
+              let mut fi = 0
+              while fi < v.field_tys.length() {
+                let fty = subst_ty(v.field_tys[fi], subst)
+                let next_f = if fi + 1 < v.field_tys.length() {
+                  "@v_" + vi.to_string() + "_" + (fi + 1).to_string()
+                } else {
+                  "@ret_true"
+                }
+                sb.write_string("@v_" + vi.to_string() + "_" + fi.to_string() + "\n")
+                qbe_emit_eq_field_cmp(
+                  g,
+                  sb,
+                  fty,
+                  (fi + 1) * 8,
+                  "v" + vi.to_string() + "_" + fi.to_string(),
+                  next_f,
+                )
+                fi = fi + 1
+              }
+            }
+            vi = vi + 1
+          }
+          if einfo.variants.length() == 0 {
+            sb.write_string("@vchk_0\n    jmp @ret_true\n")
+          }
+          sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+          g.extra_fns.push(sb.to_string())
+          fn_sym
+        }
+        None => fn_sym
+      }
+    _ => fn_sym
   }
 }
 
@@ -7839,18 +8173,20 @@ fn qbe_emit_variant_ctor(
   let resolved_enum = if enum_name != "" {
     enum_name
   } else {
-    match g.tc.variant_to_enum.get(vname) {
+    match qbe_lookup_variant_enum(g, vname) {
       Some(en) => en
       None => ""
     }
   }
-  match g.tc.enums.get(resolved_enum) {
+  match qbe_lookup_enum_info(g, resolved_enum) {
     None => qval("0", TError)
     Some(einfo) => {
       let subst : Map[String, Ty] = Map([])
       match expected {
         Some(TEnum(en, eargs)) =>
-          if en == resolved_enum {
+          if en == resolved_enum ||
+            (g.mono_pkg != "" && g.mono_pkg + "::" + en == resolved_enum) ||
+            (g.mono_pkg != "" && en == g.mono_pkg + "::" + resolved_enum) {
             let mut k = 0
             while k < einfo.decl.type_params.length() && k < eargs.length() {
               subst.set(einfo.decl.type_params[k], eargs[k])
@@ -8071,16 +8407,82 @@ fn qbe_emit_closure_obj(
     _ => qbe_resolve_type(g, ret_te)
   }
 
-  let n_slots = 1 + cap_locals.length()
+  let cap_tparams : Array[String] = []
+  let mut tpi = 0
+  while tpi < g.cur_tparams.length() {
+    let tn = g.cur_tparams[tpi]
+    if !g.cur_type_subst.contains(tn) {
+      cap_tparams.push(tn)
+    }
+    tpi = tpi + 1
+  }
+
+  let n_slots = 1 + cap_locals.length() + cap_tparams.length()
   let mut drop_mask = 0
+  let mut has_tparam_cap = false
   let mut mi = 0
   while mi < cap_locals.length() {
     if qbe_is_obj_ty(cap_locals[mi].ty) {
       drop_mask = drop_mask | (1 << (mi + 1))
+    } else {
+      match cap_locals[mi].ty {
+        TParam(tn) =>
+          if str_arr_contains(cap_tparams, tn) {
+            has_tparam_cap = true
+          }
+        _ => ()
+      }
     }
     mi = mi + 1
   }
-  let drop_sym = qbe_register_slot_drop(g, drop_mask)
+  let drop_sym = if has_tparam_cap {
+    let dsym = "$pion_drop_clo_" + clo_id.to_string()
+    let dsb = StringBuilder()
+    dsb.write_string("function " + dsym + "(l %p) {\n@start\n")
+    let mut di = 0
+    while di < cap_locals.length() {
+      let cty = cap_locals[di].ty
+      let off = (di + 1) * 8
+      if qbe_is_obj_ty(cty) {
+        dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
+        dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
+        dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
+      } else {
+        match cty {
+          TParam(tn) => {
+            let mut found_ti = -1
+            let mut tj = 0
+            while tj < cap_tparams.length() {
+              if cap_tparams[tj] == tn {
+                found_ti = tj
+                break
+              }
+              tj = tj + 1
+            }
+            if found_ti >= 0 {
+              let tp_off = (1 + cap_locals.length() + found_ti) * 8
+              dsb.write_string("    %tp_a" + di.to_string() + " =l add %p, " + tp_off.to_string() + "\n")
+              dsb.write_string("    %tp_f" + di.to_string() + " =l loadl %tp_a" + di.to_string() + "\n")
+              dsb.write_string("    jnz %tp_f" + di.to_string() + ", @do_" + di.to_string() + ", @sk_" + di.to_string() + "\n")
+              dsb.write_string("@do_" + di.to_string() + "\n")
+              dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
+              dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
+              dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
+              dsb.write_string("    jmp @sk_" + di.to_string() + "\n")
+              dsb.write_string("@sk_" + di.to_string() + "\n")
+            }
+          }
+          _ => ()
+        }
+      }
+      di = di + 1
+    }
+    dsb.write_string("    ret\n}\n\n")
+    g.extra_fns.push(dsb.to_string())
+    dsym
+  } else {
+    qbe_register_slot_drop(g, drop_mask)
+  }
   let env_obj = qbe_tmp(g)
   qbe_emit(
     g,
@@ -8097,17 +8499,23 @@ fn qbe_emit_closure_obj(
     let loc = cap_locals[ki]
     let dv = qbe_load_local_slot(g, loc.slot, loc.ty)
     let v = qbe_as_l(g, qval(dv, loc.ty))
-    if qbe_is_obj_ty(loc.ty) {
-      if is_spawn {
-        qbe_emit_deep_freeze(g, v, loc.ty)
-      }
-      qbe_emit(g, "call $pion_rc_inc(l " + v + ")")
+    if is_spawn {
+      qbe_emit_deep_freeze(g, v, loc.ty)
     }
+    qbe_rc_inc(g, v, loc.ty)
     let off = (ki + 1) * 8
     let p = qbe_tmp(g)
     qbe_emit(g, p + " =l add " + env_obj + ", " + off.to_string())
     qbe_emit(g, "storel " + v + ", " + p)
     ki = ki + 1
+  }
+  tpi = 0
+  while tpi < cap_tparams.length() {
+    let off = (1 + cap_locals.length() + tpi) * 8
+    let p = qbe_tmp(g)
+    qbe_emit(g, p + " =l add " + env_obj + ", " + off.to_string())
+    qbe_emit(g, "storel %tp_" + cap_tparams[tpi] + ", " + p)
+    tpi = tpi + 1
   }
 
   let saved_allocs = g.fn_allocs
@@ -8175,6 +8583,14 @@ fn qbe_emit_closure_obj(
   g.unfrozen_local_arrs = Map([])
 
   qbe_scope_push(g)
+  tpi = 0
+  while tpi < cap_tparams.length() {
+    let off = (1 + cap_locals.length() + tpi) * 8
+    let p = qbe_tmp(g)
+    qbe_emit(g, p + " =l add %env, " + off.to_string())
+    qbe_emit(g, "%tp_" + cap_tparams[tpi] + " =l loadl " + p)
+    tpi = tpi + 1
+  }
   ki = 0
   while ki < cap_locals.length() {
     let cap = cap_locals[ki]
@@ -8479,7 +8895,7 @@ fn qbe_emit_method_call(
           Some(loc) =>
             match loc.ty {
               TStruct(sname, sargs) =>
-                match g.tc.structs.get(sname) {
+                match qbe_lookup_struct_info(g, sname) {
                   Some(sinfo) => {
                     let subst = make_subst(sinfo.decl.type_params, sargs)
                     let mut fi = 0
@@ -9257,11 +9673,12 @@ fn qbe_emit_method_call(
         let va = qbe_emit_arg_maybe_borrow(g, args[1], Some(vty), args_pure)
         let kv = ka.qv
         let vv = va.qv
+        let kl = qbe_as_l(g, kv)
         let vl = qbe_as_l(g, vv)
         qbe_emit_adopt_if_frozen(g, obj_val, vl, vty, true)
         qbe_emit(
           g,
-          "call $pion_map_set(l " + obj_val + ", l " + kv.reg + ", l " + vl + ")",
+          "call $pion_map_set(l " + obj_val + ", l " + kl + ", l " + vl + ")",
         )
         if !ka.borrowed {
           qbe_rc_dec(g, kv.reg, kv.ty)
@@ -9277,9 +9694,10 @@ fn qbe_emit_method_call(
       if method_name == "contains" {
         let ka = qbe_emit_arg_maybe_borrow(g, args[0], Some(kty), args_pure)
         let kv = ka.qv
+        let kl = qbe_as_l(g, kv)
         let hw = qbe_tmp(g)
         let r = qbe_tmp(g)
-        qbe_emit(g, hw + " =w call $pion_map_has(l " + obj_val + ", l " + kv.reg + ")")
+        qbe_emit(g, hw + " =w call $pion_map_has(l " + obj_val + ", l " + kl + ")")
         if !ka.borrowed {
           qbe_rc_dec(g, kv.reg, kv.ty)
         }
@@ -9292,7 +9710,8 @@ fn qbe_emit_method_call(
       if method_name == "remove" {
         let ka = qbe_emit_arg_maybe_borrow(g, args[0], Some(kty), args_pure)
         let kv = ka.qv
-        qbe_emit(g, "call $pion_map_remove(l " + obj_val + ", l " + kv.reg + ")")
+        let kl = qbe_as_l(g, kv)
+        qbe_emit(g, "call $pion_map_remove(l " + obj_val + ", l " + kl + ")")
         if !ka.borrowed {
           qbe_rc_dec(g, kv.reg, kv.ty)
         }
@@ -9304,6 +9723,7 @@ fn qbe_emit_method_call(
       if method_name == "get" {
         let ka = qbe_emit_arg_maybe_borrow(g, args[0], Some(kty), args_pure)
         let kv = ka.qv
+        let kl = qbe_as_l(g, kv)
         let out_slot = qbe_alloc_slot(g)
         let hw = qbe_tmp(g)
         qbe_emit(
@@ -9312,7 +9732,7 @@ fn qbe_emit_method_call(
           " =w call $pion_map_try_get(l " +
           obj_val +
           ", l " +
-          kv.reg +
+          kl +
           ", l " +
           out_slot +
           ")",
@@ -9514,8 +9934,7 @@ fn qbe_emit_method_call(
       }
     }
     TStruct(sname, sargs) => {
-      let key = sname + "::" + method_name
-      match g.tc.methods.get(key) {
+      match qbe_lookup_method_info(g, sname, method_name) {
         Some(minfo) => {
           let norm_args = resolve_call_args_qbe(
             minfo.decl.params,
@@ -9557,6 +9976,7 @@ fn qbe_emit_method_call(
           }
           if qbe_call_needs_mono(g, minfo.decl, subst) {
             let qp = split_qual_name(sname)
+            let mpkg = if qp.prefix != "" { qp.prefix } else { g.mono_pkg }
             return qbe_emit_mono_call(
               g,
               qbe_method_call_sym(g, sname, method_name),
@@ -9565,7 +9985,7 @@ fn qbe_emit_method_call(
               arg_vals,
               arg_tys,
               arg_borrowed,
-              qp.prefix,
+              mpkg,
             )
           }
           let call_args : Array[String] = []
@@ -9892,7 +10312,7 @@ fn qbe_emit_pat_test(
             field_tys.push(err)
           }
         TEnum(ename, eargs) =>
-          match g.tc.enums.get(ename) {
+          match qbe_lookup_enum_info(g, ename) {
             Some(einfo) => {
               let subst = make_subst(einfo.decl.type_params, eargs)
               let mut vi = 0
@@ -9992,7 +10412,7 @@ fn qbe_emit_pat_bind(
             field_tys.push(err)
           }
         TEnum(ename, eargs) =>
-          match g.tc.enums.get(ename) {
+          match qbe_lookup_enum_info(g, ename) {
             Some(einfo) => {
               let subst = make_subst(einfo.decl.type_params, eargs)
               let mut vi = 0
@@ -10260,6 +10680,23 @@ fn qbe_emit_cond_branch(
             }
           }
           _ => {
+            if (op == "==" || op == "!=") && qbe_type_needs_eq_fn(g, lv.ty) {
+              let eq_sym = qbe_ensure_eq_fn(g, lv.ty)
+              let eq = qbe_tmp(g)
+              qbe_emit(g, eq + " =w call " + eq_sym + "(l " + lv.reg + ", l " + rv.reg + ")")
+              if !la.borrowed {
+                qbe_rc_dec(g, lv.reg, lv.ty)
+              }
+              if !ra.borrowed {
+                qbe_rc_dec(g, rv.reg, rv.ty)
+              }
+              if op == "==" {
+                qbe_emit_term(g, "jnz " + eq + ", " + l_true + ", " + l_false)
+              } else {
+                qbe_emit_term(g, "jnz " + eq + ", " + l_false + ", " + l_true)
+              }
+              return
+            }
             let cop = if op == "==" {
               "ceql"
             } else if op == "!=" {
@@ -10301,12 +10738,12 @@ fn qbe_peek_expr_ty(g : QbeGen, e : Expr) -> Option[Ty] {
     EIdent(name, _) =>
       match qbe_lookup_local(g, name) {
         Some(loc) => Some(loc.ty)
-        None => g.tc.consts.get(name)
+        None => qbe_lookup_const_ty(g, name)
       }
     EField(base, fname, _) =>
       match qbe_peek_expr_ty(g, base) {
         Some(TStruct(sname, sargs)) =>
-          match g.tc.structs.get(sname) {
+          match qbe_lookup_struct_info(g, sname) {
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, sargs)
               let mut i = 0
@@ -10423,7 +10860,7 @@ fn qbe_bind_pat_probe_hints(
             field_tys.push(err)
           }
         Some(TEnum(ename, eargs)) =>
-          match g.tc.enums.get(ename) {
+          match qbe_lookup_enum_info(g, ename) {
             Some(einfo) => {
               let subst = make_subst(einfo.decl.type_params, eargs)
               let mut vi = 0
@@ -10561,7 +10998,7 @@ fn qbe_probe_expr_ty_with(
         None =>
           match qbe_lookup_local(g, name) {
             Some(loc) => Some(loc.ty)
-            None => g.tc.consts.get(name)
+            None => qbe_lookup_const_ty(g, name)
           }
       }
     EPath(qual, mem, _) =>
@@ -10576,7 +11013,7 @@ fn qbe_probe_expr_ty_with(
     EField(base, fname, _) =>
       match qbe_probe_expr_ty_with(g, base, hints) {
         Some(TStruct(sname, sargs)) =>
-          match g.tc.structs.get(sname) {
+          match qbe_lookup_struct_info(g, sname) {
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, sargs)
               let mut i = 0
@@ -10620,7 +11057,7 @@ fn qbe_probe_expr_ty_with(
     }
     EStructLit(sname, _, _, _) =>
       if sname != "" {
-        match g.tc.structs.get(sname) {
+        match qbe_lookup_struct_info(g, sname) {
           Some(sinfo) =>
             if sinfo.decl.type_params.length() == 0 {
               Some(TStruct(sname, []))
@@ -10713,13 +11150,13 @@ fn qbe_probe_expr_ty_with(
           if mname == "copy" && !ty_has_unresolved(v) {
             Some(TMap(k, v))
           } else if mname == "keys" {
-            Some(TArray(TString))
+            Some(TArray(k))
           } else {
             None
           }
         Some(TStruct(sn, sargs)) =>
           if sargs.length() == 0 {
-            match g.tc.methods.get(sn + "::" + mname) {
+            match qbe_lookup_method_info(g, sn, mname) {
               Some(mi) =>
                 if mi.decl.type_params.length() == 0 && !ty_has_unresolved(mi.ret_ty) {
                   Some(mi.ret_ty)
@@ -10932,6 +11369,7 @@ fn qbe_try_emit_map_get_match(
       let args_pure = !qbe_expr_has_assign(key_expr)
       let obj_av = qbe_emit_arg_maybe_borrow(g, map_expr, None, args_pure)
       let ka = qbe_emit_arg_maybe_borrow(g, key_expr, Some(kty), args_pure)
+      let kl = qbe_as_l(g, ka.qv)
       let out_slot = qbe_alloc_slot(g)
       let hw = qbe_tmp(g)
       qbe_emit(
@@ -10940,7 +11378,7 @@ fn qbe_try_emit_map_get_match(
         " =w call $pion_map_try_get(l " +
         obj_av.qv.reg +
         ", l " +
-        ka.qv.reg +
+        kl +
         ", l " +
         out_slot +
         ")",
@@ -12265,6 +12703,28 @@ fn qbe_emit_expr_inner(
           }
         }
         _ => {
+          if (op == "==" || op == "!=") && qbe_type_needs_eq_fn(g, lv.ty) {
+            let eq_sym = qbe_ensure_eq_fn(g, lv.ty)
+            let eq = qbe_tmp(g)
+            qbe_emit(g, eq + " =w call " + eq_sym + "(l " + lv.reg + ", l " + rv.reg + ")")
+            if !la.borrowed {
+              qbe_rc_dec(g, lv.reg, lv.ty)
+            }
+            if !ra.borrowed {
+              qbe_rc_dec(g, rv.reg, rv.ty)
+            }
+            if op == "==" {
+              let r = qbe_tmp(g)
+              qbe_emit(g, r + " =l extuw " + eq)
+              return qval(r, TBool)
+            } else {
+              let ne = qbe_tmp(g)
+              let r = qbe_tmp(g)
+              qbe_emit(g, ne + " =w ceqw " + eq + ", 0")
+              qbe_emit(g, r + " =l extuw " + ne)
+              return qval(r, TBool)
+            }
+          }
           if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
             let cop = if op == "==" {
               "ceql"
@@ -12343,8 +12803,13 @@ fn qbe_emit_expr_inner(
               _ => ()
             }
             let vo = qbe_is_obj_flag_w(g, vty)
+            let new_fn = if qbe_map_key_is_int(kty) {
+              "$pion_map_new_int"
+            } else {
+              "$pion_map_new"
+            }
             let r = qbe_tmp(g)
-            qbe_emit(g, r + " =l call $pion_map_new(w " + vo + ")")
+            qbe_emit(g, r + " =l call " + new_fn + "(w " + vo + ")")
             return qval(r, TMap(kty, vty))
           }
           if name == "sha256_hex" {
@@ -12898,8 +13363,13 @@ fn qbe_emit_expr_inner(
               _ => ()
             }
             let vo = qbe_is_obj_flag_w(g, vty)
+            let new_fn = if qbe_map_key_is_int(kty) {
+              "$pion_map_new_int"
+            } else {
+              "$pion_map_new"
+            }
             let r = qbe_tmp(g)
-            qbe_emit(g, r + " =l call $pion_map_new(w " + vo + ")")
+            qbe_emit(g, r + " =l call " + new_fn + "(w " + vo + ")")
             return qval(r, TMap(kty, vty))
           }
           if qual == "Array" && mem == "new" {
@@ -13055,16 +13525,20 @@ fn qbe_emit_expr_inner(
             Some(_) => ()
           }
           match target_finfo {
-            None => {
-              let key = qual + "::" + mem
-              match g.tc.methods.get(key) {
+            None =>
+              match qbe_lookup_method_info(g, qual, mem) {
                 Some(minfo) => {
                   target_finfo = Some(minfo)
-                  target_sym = qbe_local_method_sym(g, qual, mem)
+                  target_sym = qbe_method_call_sym(g, qual, mem)
+                  let qpm = split_qual_name(qual)
+                  if qpm.prefix != "" {
+                    target_pkg = qpm.prefix
+                  } else if g.mono_pkg != "" {
+                    target_pkg = g.mono_pkg
+                  }
                 }
                 None => ()
               }
-            }
             Some(_) => ()
           }
           match target_finfo {
@@ -13290,7 +13764,7 @@ fn qbe_emit_expr_inner(
           }
         }
         TStruct(sname, sargs) =>
-          match g.tc.structs.get(sname) {
+          match qbe_lookup_struct_info(g, sname) {
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, sargs)
               let mut i = 0
@@ -13533,8 +14007,9 @@ fn qbe_emit_expr_inner(
         }
         TMap(kty, vty) => {
           let kv = qbe_emit_expr(g, idx, Some(kty))
+          let kl = qbe_as_l(g, kv)
           let r = qbe_tmp(g)
-          qbe_emit(g, r + " =l call $pion_map_get(l " + ov.reg + ", l " + kv.reg + ")")
+          qbe_emit(g, r + " =l call $pion_map_get(l " + ov.reg + ", l " + kl + ")")
           qbe_rc_inc(g, r, vty)
           qbe_rc_dec(g, kv.reg, kv.ty)
           qbe_rc_dec(g, ov.reg, ov.ty)
@@ -13660,8 +14135,18 @@ fn qbe_emit_expr_inner(
         }
       }
       if resolved_name != "" && !g.tc.structs.contains(resolved_name) {
-        if g.mono_pkg != "" && g.tc.structs.contains(g.mono_pkg + "::" + resolved_name) {
-          resolved_name = g.mono_pkg + "::" + resolved_name
+        if g.mono_pkg != "" {
+          if g.tc.structs.contains(g.mono_pkg + "::" + resolved_name) {
+            resolved_name = g.mono_pkg + "::" + resolved_name
+          } else {
+            match g.tc.imported_pkgs.get(g.mono_pkg) {
+              Some(ipkg) =>
+                if ipkg.tc.structs.contains(resolved_name) {
+                  resolved_name = ipkg.name + "::" + resolved_name
+                }
+              None => ()
+            }
+          }
         }
       }
       if resolved_name != "" && !g.tc.structs.contains(resolved_name) {
@@ -13678,7 +14163,7 @@ fn qbe_emit_expr_inner(
           }
         }
       }
-      match g.tc.structs.get(resolved_name) {
+      match qbe_lookup_struct_info(g, resolved_name) {
         None => qval("0", TError)
         Some(sinfo) => {
           let subst : Map[String, Ty] = Map([])
@@ -14256,7 +14741,7 @@ fn qbe_emit_expr_inner(
       if arms.length() >= 6 {
         match sv.ty {
           TEnum(ename, _) =>
-            match g.tc.enums.get(ename) {
+            match qbe_lookup_enum_info(g, ename) {
               Some(einfo) => {
                 let var_tags : Array[Int] = []
                 let var_arm_idxs : Array[Int] = []
@@ -15209,7 +15694,7 @@ fn qbe_try_emit_while_field_promoted(
     }
   }
   // Collect promotable primitive fields of `b_name` (both read and written)
-  let sinfo = match g.tc.structs.get(b_sname) {
+  let sinfo = match qbe_lookup_struct_info(g, b_sname) {
     Some(si) => si
     None => return false
   }
@@ -16219,7 +16704,7 @@ fn qbe_emit_stmt(
           }
           match ov.ty {
             TStruct(sname, sargs) =>
-              match g.tc.structs.get(sname) {
+              match qbe_lookup_struct_info(g, sname) {
                 Some(sinfo) => {
                   let subst = make_subst(sinfo.decl.type_params, sargs)
                   let mut i = 0
@@ -16483,12 +16968,13 @@ fn qbe_emit_stmt(
             }
             TMap(kty, vty) => {
               let kv = qbe_emit_expr(g, idx, Some(kty))
+              let kl = qbe_as_l(g, kv)
               let rv = qbe_emit_expr(g, rhs, Some(vty))
               let vl = qbe_as_l(g, rv)
               qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
               qbe_emit(
                 g,
-                "call $pion_map_set(l " + ov.reg + ", l " + kv.reg + ", l " + vl + ")",
+                "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
               )
               qbe_rc_dec(g, kv.reg, kv.ty)
               qbe_rc_dec(g, rv.reg, rv.ty)
@@ -16544,7 +17030,7 @@ fn qbe_emit_stmt(
           let ov = qbe_emit_expr(g, obj, None)
           match ov.ty {
             TStruct(sname, sargs) =>
-              match g.tc.structs.get(sname) {
+              match qbe_lookup_struct_info(g, sname) {
                 Some(sinfo) => {
                   let subst = make_subst(sinfo.decl.type_params, sargs)
                   let mut fi = 0
@@ -16615,10 +17101,11 @@ fn qbe_emit_stmt(
             }
             TMap(kty, vty) => {
               let kv = qbe_emit_expr(g, idx, Some(kty))
+              let kl = qbe_as_l(g, kv)
               let old_l = qbe_tmp(g)
               qbe_emit(
                 g,
-                old_l + " =l call $pion_map_get(l " + ov.reg + ", l " + kv.reg + ")",
+                old_l + " =l call $pion_map_get(l " + ov.reg + ", l " + kl + ")",
               )
               let old_v = match vty {
                 TInt => {
@@ -16639,7 +17126,7 @@ fn qbe_emit_stmt(
               qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
               qbe_emit(
                 g,
-                "call $pion_map_set(l " + ov.reg + ", l " + kv.reg + ", l " + vl + ")",
+                "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
               )
               qbe_rc_dec(g, kv.reg, kv.ty)
               if qbe_is_obj_ty(vty) {
@@ -16966,7 +17453,7 @@ fn qbe_emit_stmt(
                     !qbe_stmts_assigns_ident(body, vname) &&
                     !qbe_expr_rebinds_ident(cond, vname) &&
                     !qbe_stmts_rebinds_ident(body, vname) {
-                    match g.tc.structs.get(sname) {
+                    match qbe_lookup_struct_info(g, sname) {
                       Some(sinfo) => {
                         let subst = make_subst(sinfo.decl.type_params, sargs)
                         let mut fi = 0
@@ -17945,7 +18432,7 @@ fn qbe_emit_struct_drops(g : QbeGen, out : StringBuilder) -> Unit {
   let mut i = 0
   while i < g.struct_order.length() {
     let sname = g.struct_order[i]
-    match g.tc.structs.get(sname) {
+    match qbe_lookup_struct_info(g, sname) {
       Some(sinfo) =>
         if sinfo.decl.type_params.length() == 0 {
           let obj_slots : Array[Int] = []
@@ -17993,7 +18480,7 @@ fn qbe_emit_enum_drops(g : QbeGen, out : StringBuilder) -> Unit {
   let mut i = 0
   while i < g.enum_order.length() {
     let ename = g.enum_order[i]
-    match g.tc.enums.get(ename) {
+    match qbe_lookup_enum_info(g, ename) {
       Some(einfo) =>
         if einfo.decl.type_params.length() == 0 {
           if g.unit_mode && !has_qual_sep(ename) {

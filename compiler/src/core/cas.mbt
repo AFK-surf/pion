@@ -244,7 +244,7 @@ pub struct CasEntry {
 
 ///|
 pub fn pion_compiler_abi_rev() -> String {
-  "pionc-v0.14"
+  "pionc-v0.15"
 }
 
 ///|

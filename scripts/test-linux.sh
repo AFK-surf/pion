@@ -293,6 +293,8 @@ fi
 
 # P27-B: Bug #5 cyclic graph deep freeze (PION_FLAG_DEEP_FROZEN) + named & optional default parameters (same-pkg & cross-pkg).
 sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC"
+# P27-C1: Bug #6 cross-pkg mono private lookups + Bug #7 generic closure %tp_T capture + native Map[Int/Int64, V] + #derive(Eq) + ASan/LSan.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC"
 
 # P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
 P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"

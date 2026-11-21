@@ -107,6 +107,7 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
   exit 1
 fi
 sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC2"
 P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
 echo "p17a_ergonomics_mt -> $P17A_OUT"
 if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then

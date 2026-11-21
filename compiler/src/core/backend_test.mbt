@@ -2240,3 +2240,37 @@ test "p27a_bug4_tuple_niche_and_numeric_qbe_ir" {
   assert_true(ssa.contains("call $trunc("), ssa)
   assert_true(ssa.contains("call $pion_map_clear("), ssa)
 }
+
+///|
+test "p27c1_generic_closure_intmap_derive_eq_ssa" {
+  let src =
+    #|#derive(Eq)
+    #|pub struct Pair {
+    #|  a : Int
+    #|  b : String
+    #|}
+    #|fn make_fn[T](x : T) -> () -> Int {
+    #|  fn() -> Int {
+    #|    let y = x
+    #|    let _ = y
+    #|    42
+    #|  }
+    #|}
+    #|fn main(w : World) -> Unit {
+    #|  let f1 = make_fn(7)
+    #|  let f2 = make_fn("hello")
+    #|  let m : Map[Int, String] = Map::new()
+    #|  m.set(0, "zero")
+    #|  let p1 = Pair::{ a: 1, b: "k" }
+    #|  let p2 = Pair::{ a: 1, b: "k" }
+    #|  if p1 == p2 && f1() + f2() == 84 {
+    #|    io_println(w, "ok")
+    #|  }
+    #|}
+  let cr = @core.check_source_files_with_imports("p27c1", ["main.pion"], [src], [], false)
+  assert_true(cr.diagnostics.length() == 0, @core.check_result_to_json(cr.diagnostics))
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, false, false, []).ssa
+  assert_true(ssa.contains("$pion_drop_clo_"), ssa)
+  assert_true(ssa.contains("call $pion_map_new_int("), ssa)
+  assert_true(ssa.contains("function w $pion_eq_"), ssa)
+}

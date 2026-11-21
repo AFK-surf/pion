@@ -2107,20 +2107,26 @@ test "p20a: 6 new machine-applicable edits complete 12/12 coverage" {
 
 ///|
 test "p24a_map_key_and_empty_branch" {
-  // Bug 5: Map[K, V] rejects non-String keys with E_MAP_KEY_TYPE
+  // Bug 5 / P27-C1: Map[K, V] rejects unsupported keys with E_MAP_KEY_TYPE
   let bad_map =
-    #|pub fn f(m : Map[Int, String]) -> Int {
+    #|pub fn f(m : Map[Double, String]) -> Int {
     #|  m.length()
     #|}
   let (ok_m, json_m, _) = check_one(bad_map)
   assert_true(!ok_m && str_contains(json_m, "E_MAP_KEY_TYPE"), json_m)
 
-  // Map[String, Int] and generic Map[K, V] remain accepted
+  // Map[String, Int], Map[Int, String], Map[Int64, String] and generic Map[K, V] are accepted
   let ok_map =
     #|pub fn g[K, V](m : Map[K, V]) -> Int {
     #|  m.length()
     #|}
     #|pub fn h(m : Map[String, Int]) -> Int {
+    #|  m.length()
+    #|}
+    #|pub fn hi(m : Map[Int, String]) -> Int {
+    #|  m.length()
+    #|}
+    #|pub fn hi64(m : Map[Int64, String]) -> Int {
     #|  m.length()
     #|}
   let (ok_g, json_g, _) = check_one(ok_map)
@@ -2435,4 +2441,45 @@ test "p27b_named_and_optional_params" {
     #|fn f(w~ : Double = "oops") -> Double { w }
   let (ok_def, json_def, _) = check_one(bad_def)
   assert_true(!ok_def && str_contains(json_def, "default value type mismatch"), json_def)
+}
+
+///|
+test "p27c1_intmap_and_derive_eq" {
+  let ok_src =
+    #|#derive(Eq)
+    #|pub struct NodeId {
+    #|  id : Int
+    #|  tag : String
+    #|}
+    #|#[derive(Eq, Hash, Debug)]
+    #|pub enum Token {
+    #|  Empty
+    #|  Num(Int, Double)
+    #|  Ref(NodeId)
+    #|}
+    #|pub fn test_all() -> Bool {
+    #|  let m : Map[Int, String] = Map::new()
+    #|  m.set(0, "zero")
+    #|  m.set(-5, "neg")
+    #|  let ks : Array[Int] = m.keys()
+    #|  let m64 : Map[Int64, Int] = Map([])
+    #|  m64.set(100L, 1)
+    #|  let mx : Mutex[Map[Int, String]] = Mutex::new(m)
+    #|  let _ = mx
+    #|  let a = NodeId::{ id: 1, tag: "x" }
+    #|  let b = NodeId::{ id: 1, tag: "x" }
+    #|  let t1 = Ref(a)
+    #|  let t2 = Ref(b)
+    #|  a == b && t1 == t2 && t1 != Empty && ks.length() == 2
+    #|}
+  let (ok, json, _) = check_one(ok_src)
+  assert_true(ok, json)
+
+  // Negative: #derive(Eq) with non-Eq field must fail with E_TYPE_MISMATCH
+  let bad_eq =
+    #|struct Plain { x : Int }
+    #|#derive(Eq)
+    #|struct BadWrap { p : Plain }
+  let (ok_bad, json_bad, _) = check_one(bad_eq)
+  assert_true(!ok_bad && str_contains(json_bad, "E_TYPE_MISMATCH"), json_bad)
 }

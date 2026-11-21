@@ -456,6 +456,7 @@ fn p_parse_struct_decl(
   p : Parser,
   is_pub : Bool,
   is_val : Bool,
+  derive_eq : Bool,
   start_span : Span,
 ) -> Decl {
   let _ = p_advance(p) // consume 'struct'
@@ -522,6 +523,7 @@ fn p_parse_struct_decl(
   DStruct(StructDecl::{
     is_pub: is_pub,
     is_val: is_val,
+    derive_eq: derive_eq,
     name: name,
     type_params: tparams,
     fields: fields,
@@ -531,7 +533,12 @@ fn p_parse_struct_decl(
 }
 
 ///|
-fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
+fn p_parse_enum_decl(
+  p : Parser,
+  is_pub : Bool,
+  derive_eq : Bool,
+  start_span : Span,
+) -> Decl {
   let _ = p_advance(p) // consume 'enum'
   let name = p_expect_ident(p, "enum name")
   let tparams = p_parse_type_params(p)
@@ -586,6 +593,7 @@ fn p_parse_enum_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
   }
   DEnum(EnumDecl::{
     is_pub: is_pub,
+    derive_eq: derive_eq,
     name: name,
     type_params: tparams,
     variants: variants,
@@ -2245,6 +2253,57 @@ fn p_parse_test_decl(p : Parser, start_span : Span) -> Decl {
 }
 
 ///|
+///|
+fn p_parse_derive_attrs(p : Parser) -> Bool {
+  let mut derive_eq = false
+  while !p_is_eof(p) {
+    match p_peek(p).kind {
+      Hash => {
+        let _ = p_advance(p)
+        let has_bracket = p_match_kind_lbracket(p)
+        let attr_name = match p_peek(p).kind {
+          Ident(s) => {
+            let _ = p_advance(p)
+            s
+          }
+          _ => ""
+        }
+        if p_match_kind_lparen(p) {
+          while !p_is_eof(p) {
+            let before = p.pos
+            match p_peek(p).kind {
+              RParen => {
+                let _ = p_advance(p)
+                break
+              }
+              Ident(tr) => {
+                let _ = p_advance(p)
+                if attr_name == "derive" && tr == "Eq" {
+                  derive_eq = true
+                }
+                let _ = p_match_kind_comma(p)
+              }
+              _ => {
+                let _ = p_advance(p)
+              }
+            }
+            if p.pos == before {
+              let _ = p_advance(p)
+            }
+          }
+        }
+        if has_bracket {
+          let _ = p_match_kind_rbracket(p)
+        }
+        p_skip_semis(p)
+      }
+      _ => break
+    }
+  }
+  derive_eq
+}
+
+///|
 pub fn parse_source(path : String, source : String) -> ParseResult {
   let lex_res = lex(path, source)
   let p = parser_new(lex_res.tokens, lex_res.diagnostics)
@@ -2253,6 +2312,10 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
 
   while !p_is_eof(p) {
     p_skip_semis(p)
+    if p_is_eof(p) {
+      break
+    }
+    let derive_eq = p_parse_derive_attrs(p)
     if p_is_eof(p) {
       break
     }
@@ -2282,7 +2345,8 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
     }
     let tok = p_peek(p)
     match tok.kind {
-      KwStruct => decls.push(p_parse_struct_decl(p, is_pub, is_val, start_span))
+      KwStruct =>
+        decls.push(p_parse_struct_decl(p, is_pub, is_val, derive_eq, start_span))
       KwEnum => {
         if is_val {
           p_err(
@@ -2294,7 +2358,7 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
             "remove `val` before `enum`",
           )
         }
-        decls.push(p_parse_enum_decl(p, is_pub, start_span))
+        decls.push(p_parse_enum_decl(p, is_pub, derive_eq, start_span))
       }
       KwFn => decls.push(p_parse_fn_decl(p, is_pub, start_span))
       KwExtern => decls.push(p_parse_extern_fn_decl(p, is_pub, start_span))

@@ -65,6 +65,7 @@ pub struct Param {
 pub struct StructDecl {
   is_pub : Bool
   is_val : Bool
+  derive_eq : Bool
   name : String
   type_params : Array[String]
   fields : Array[FieldDecl]
@@ -75,6 +76,7 @@ pub struct StructDecl {
 ///|
 pub struct EnumDecl {
   is_pub : Bool
+  derive_eq : Bool
   name : String
   type_params : Array[String]
   variants : Array[VariantDecl]

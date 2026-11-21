@@ -1521,16 +1521,16 @@ fn resolve_type_expr(
         let k = if rargs.length() >= 1 { rargs[0] } else { TError }
         let v = if rargs.length() >= 2 { rargs[1] } else { TError }
         match k {
-          TString | TParam(_) | TError => ()
+          TString | TInt | TInt64 | TParam(_) | TError => ()
           _ =>
             tc_err(
               tc,
               sp,
               "E_MAP_KEY_TYPE",
-              "`Map` keys must be `String`, got `" + ty_to_string(k) + "`",
-              "String",
+              "`Map` keys must be `String`, `Int`, or `Int64`, got `" + ty_to_string(k) + "`",
+              "String, Int, or Int64",
               ty_to_string(k),
-              "use `Map[String, " + ty_to_string(v) + "]`",
+              "use `Map[String, " + ty_to_string(v) + "]`, `Map[Int, " + ty_to_string(v) + "]`, or `Map[Int64, " + ty_to_string(v) + "]`",
             )
         }
         return TMap(k, v)
@@ -1989,7 +1989,7 @@ fn is_mutex_inner_send(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bo
     TArray(e) => is_send_ty(tc, e, visiting) || is_mutex_inner_send(tc, e, visiting)
     TMap(k, v) =>
       match k {
-        TString =>
+        TString | TInt | TInt64 =>
           is_send_ty(tc, v, visiting) || is_mutex_inner_send(tc, v, visiting)
         _ => false
       }
@@ -3071,13 +3071,47 @@ fn check_unhandled_result(tc : TypeChecker, stmt : Stmt, ty : Ty) -> Unit {
 }
 
 ///|
-/// Types `==`/`!=` compare by value: scalars, `String`, `Ptr`, and enums whose
-/// variants carry no payload (immortal constants, so identity is the tag).
-fn eq_comparable(tc : TypeChecker, t : Ty) -> Bool {
+/// Types `==`/`!=` compare by value: scalars, `String`, `Ptr`, enums whose
+/// variants carry no payload, and structs/enums marked `#derive(Eq)` whose
+/// fields are themselves value-comparable.
+fn eq_comparable_depth(tc : TypeChecker, t : Ty, depth : Int) -> Bool {
+  if depth > 16 {
+    return true
+  }
   match t {
     TInt | TInt64 | TDouble | TBool | TByte | TChar | TString | TPtr => true
     TUnit | TParam(_) | TNever | TError => true
-    TEnum(name, _) => {
+    TStruct(name, sargs) => {
+      let found : Option[StructInfo] = match tc.structs.get(name) {
+        Some(si) => Some(si)
+        None => {
+          let qp = split_qual_name(name)
+          match tc.imported_pkgs.get(qp.prefix) {
+            Some(ipkg) => ipkg.tc.structs.get(qp.name)
+            None => None
+          }
+        }
+      }
+      match found {
+        None => false
+        Some(sinfo) => {
+          if !sinfo.decl.derive_eq {
+            return false
+          }
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            let fty = subst_ty(sinfo.field_tys[fi], subst)
+            if !eq_comparable_depth(tc, fty, depth + 1) {
+              return false
+            }
+            fi = fi + 1
+          }
+          true
+        }
+      }
+    }
+    TEnum(name, eargs) => {
       let found : Option[EnumInfo] = match tc.enums.get(name) {
         Some(ei) => Some(ei)
         None => {
@@ -3091,6 +3125,23 @@ fn eq_comparable(tc : TypeChecker, t : Ty) -> Bool {
       match found {
         None => true
         Some(einfo) => {
+          if einfo.decl.derive_eq {
+            let subst = make_subst(einfo.decl.type_params, eargs)
+            let mut vi = 0
+            while vi < einfo.variants.length() {
+              let v = einfo.variants[vi]
+              let mut fi = 0
+              while fi < v.field_tys.length() {
+                let fty = subst_ty(v.field_tys[fi], subst)
+                if !eq_comparable_depth(tc, fty, depth + 1) {
+                  return false
+                }
+                fi = fi + 1
+              }
+              vi = vi + 1
+            }
+            return true
+          }
           let mut vi = 0
           while vi < einfo.variants.length() {
             if einfo.variants[vi].field_tys.length() != 0 {
@@ -3104,6 +3155,11 @@ fn eq_comparable(tc : TypeChecker, t : Ty) -> Bool {
     }
     _ => false
   }
+}
+
+///|
+fn eq_comparable(tc : TypeChecker, t : Ty) -> Bool {
+  eq_comparable_depth(tc, t, 0)
 }
 
 ///|
@@ -7549,7 +7605,7 @@ pub fn check_package_with_imports(
     let mut di = 0
     while di < f.decls.length() {
       match f.decls[di] {
-        DStruct(sd) =>
+        DStruct(sd) => {
           if sd.is_val {
             match tc.structs.get(sd.name) {
               Some(sinfo) => {
@@ -7578,6 +7634,60 @@ pub fn check_package_with_imports(
                     )
                   }
                   j = j + 1
+                }
+              }
+              None => ()
+            }
+          }
+          if sd.derive_eq {
+            match tc.structs.get(sd.name) {
+              Some(sinfo) => {
+                let mut j = 0
+                while j < sinfo.field_tys.length() {
+                  let fty = sinfo.field_tys[j]
+                  if !eq_comparable(tc, fty) {
+                    let fld = sd.fields[j]
+                    tc_err(
+                      tc,
+                      fld.span,
+                      "E_TYPE_MISMATCH",
+                      "`#derive(Eq)` struct `" + sd.name + "` field `" + fld.name + "` has non-Eq type `" + ty_to_string(fty) + "`",
+                      "Eq-comparable field type",
+                      ty_to_string(fty),
+                      "add `#derive(Eq)` to `" + ty_to_string(fty) + "` or remove `#derive(Eq)` from `" + sd.name + "`",
+                    )
+                  }
+                  j = j + 1
+                }
+              }
+              None => ()
+            }
+          }
+        }
+        DEnum(ed) =>
+          if ed.derive_eq {
+            match tc.enums.get(ed.name) {
+              Some(einfo) => {
+                let mut vi = 0
+                while vi < einfo.variants.length() {
+                  let v = einfo.variants[vi]
+                  let mut j = 0
+                  while j < v.field_tys.length() {
+                    let fty = v.field_tys[j]
+                    if !eq_comparable(tc, fty) {
+                      tc_err(
+                        tc,
+                        ed.variants[vi].span,
+                        "E_TYPE_MISMATCH",
+                        "`#derive(Eq)` enum `" + ed.name + "` variant `" + v.name + "` has non-Eq field type `" + ty_to_string(fty) + "`",
+                        "Eq-comparable field type",
+                        ty_to_string(fty),
+                        "add `#derive(Eq)` to `" + ty_to_string(fty) + "` or remove `#derive(Eq)` from `" + ed.name + "`",
+                      )
+                    }
+                    j = j + 1
+                  }
+                  vi = vi + 1
                 }
               }
               None => ()
