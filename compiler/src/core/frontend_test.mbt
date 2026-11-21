@@ -2151,3 +2151,72 @@ test "p24a_map_key_and_empty_branch" {
   let (ok_bad, json_bad, _) = check_one(bad_if)
   assert_true(!ok_bad && str_contains(json_bad, "E_TYPE_MISMATCH"), json_bad)
 }
+
+///|
+test "p25a_extern_c_varargs_parse_and_sig" {
+  let good =
+    #|pub extern "C" fn sq3_config_i(op : Int, ..., v : Int) -> Int = "sqlite3_config"
+    #|pub extern "C" fn c_snprintf_0(buf : Ptr, cap : Int64, fmt : Ptr, ...) -> Int = "snprintf"
+    #|pub fn call_em(buf : Ptr, fmt : Ptr) -> Int {
+    #|  let a = sq3_config_i(9, 0)
+    #|  let b = c_snprintf_0(buf, 64L, fmt)
+    #|  a + b
+    #|}
+  let (ok_g, json_g, _) = check_one(good)
+  assert_true(ok_g, json_g)
+  let cr = @core.check_source_files_full("p25a_va", ["p25a_va.pion"], [good])
+  let sig = @core.emit_pionsig(cr.pkg)
+  assert_true(
+    str_contains(
+      sig,
+      "extern \"C\" fn sq3_config_i(op: Int, ..., v: Int) -> Int = \"sqlite3_config\"",
+    ),
+    sig,
+  )
+  assert_true(
+    str_contains(
+      sig,
+      "extern \"C\" fn c_snprintf_0(buf: Ptr, cap: Int64, fmt: Ptr, ...) -> Int = \"snprintf\"",
+    ),
+    sig,
+  )
+  let stub = @core.emit_file_stub(cr.pkg.files[0])
+  assert_true(
+    str_contains(
+      stub,
+      "pub extern \"C\" fn sq3_config_i(op : Int, ..., v : Int) -> Int = \"sqlite3_config\"",
+    ),
+    stub,
+  )
+  assert_true(
+    str_contains(
+      stub,
+      "pub extern \"C\" fn c_snprintf_0(buf : Ptr, cap : Int64, fmt : Ptr, ...) -> Int = \"snprintf\"",
+    ),
+    stub,
+  )
+
+  // Leading `...` with no fixed parameter must be a syntax error
+  let bad_leading =
+    #|extern "C" fn bad(..., x : Int) -> Int = "bad"
+  let (ok_l, json_l, _) = check_one(bad_leading)
+  assert_true(!ok_l && str_contains(json_l, "at least one fixed parameter"), json_l)
+
+  // Duplicate `...` must be a syntax error
+  let bad_dup =
+    #|extern "C" fn bad2(a : Int, ..., x : Int, ..., y : Int) -> Int = "bad2"
+  let (ok_d, json_d, _) = check_one(bad_dup)
+  assert_true(!ok_d && str_contains(json_d, "duplicate `...`"), json_d)
+
+  // Range `0..n` still lexes as DotDot
+  let ok_range =
+    #|pub fn sum_n(n : Int) -> Int {
+    #|  let mut acc = 0
+    #|  for i in 0..n {
+    #|    acc = acc + i
+    #|  }
+    #|  acc
+    #|}
+  let (ok_r, json_r, _) = check_one(ok_range)
+  assert_true(ok_r, json_r)
+}

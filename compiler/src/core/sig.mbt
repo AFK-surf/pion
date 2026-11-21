@@ -169,11 +169,20 @@ pub fn format_extern_fn_sig(ed : ExternFnDecl) -> String {
     if i > 0 {
       sb.write_string(", ")
     }
+    if ed.vararg_from >= 0 && i == ed.vararg_from {
+      sb.write_string("..., ")
+    }
     let param = ed.params[i]
     sb.write_string(param.name)
     sb.write_string(": ")
     sb.write_string(type_expr_to_string(param.ty))
     i = i + 1
+  }
+  if ed.vararg_from >= 0 && ed.vararg_from == ed.params.length() {
+    if ed.params.length() > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string("...")
   }
   sb.write_string(") -> ")
   sb.write_string(type_expr_to_string(ed.ret_ty))
@@ -603,11 +612,20 @@ pub fn emit_file_stub(f : SourceFile) -> String {
           if i > 0 {
             sb.write_string(", ")
           }
+          if ed.vararg_from >= 0 && i == ed.vararg_from {
+            sb.write_string("..., ")
+          }
           let param = ed.params[i]
           sb.write_string(param.name)
           sb.write_string(" : ")
           sb.write_string(type_expr_to_string(param.ty))
           i = i + 1
+        }
+        if ed.vararg_from >= 0 && ed.vararg_from == ed.params.length() {
+          if ed.params.length() > 0 {
+            sb.write_string(", ")
+          }
+          sb.write_string("...")
         }
         sb.write_string(") -> ")
         sb.write_string(type_expr_to_string(ed.ret_ty))

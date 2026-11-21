@@ -118,3 +118,16 @@ test "fmt: check result JSON format" {
     "two unformatted files",
   )
 }
+
+///|
+test "fmt: extern C variadic declaration round-trip is idempotent" {
+  let src =
+    "  extern  \"C\"  fn  sq3_config_i(op : Int,   ...,   v : Int)  ->  Int  =  \"sqlite3_config\"  \n" +
+    "extern \"C\" fn c_snprintf_0(buf : Ptr, cap : Int64, fmt : Ptr, ...) -> Int = \"snprintf\"\n"
+  let expected =
+    "extern \"C\" fn sq3_config_i(op : Int, ..., v : Int) -> Int = \"sqlite3_config\"\n" +
+    "extern \"C\" fn c_snprintf_0(buf : Ptr, cap : Int64, fmt : Ptr, ...) -> Int = \"snprintf\"\n"
+  let out1 = @core.format_source(src)
+  fmt_assert_eq(out1, expected, "extern C varargs format")
+  fmt_assert_eq(@core.format_source(out1), out1, "extern C varargs idempotent")
+}

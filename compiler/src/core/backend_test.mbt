@@ -2064,3 +2064,41 @@ test "p24a_probe_shadowing" {
   let sb_new1 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 1)", sb_s)
   assert_true(sb_new1 > sb_s && sb_new1 < sb_e, ssa)
 }
+
+///|
+test "p25a_extern_c_varargs_qbe_ir" {
+  let src =
+    #|extern "C" fn sq3_config_i(op : Int, ..., v : Int) -> Int = "sqlite3_config"
+    #|extern "C" fn c_snprintf_iid(buf : Ptr, cap : Int64, fmt : Ptr, ..., a : Int, b : Int, c : Double) -> Int = "snprintf"
+    #|extern "C" fn c_snprintf_0(buf : Ptr, cap : Int64, fmt : Ptr, ...) -> Int = "snprintf"
+    #|pub fn test_va(buf : Ptr, fmt : Ptr) -> Int {
+    #|  let r1 = sq3_config_i(9, 0)
+    #|  let r2 = c_snprintf_iid(buf, 128L, fmt, 42, -7, 3.25)
+    #|  let r3 = c_snprintf_0(buf, 128L, fmt)
+    #|  r1 + r2 + r3
+    #|}
+  let cr = @core.check_source_files_full("p25a_va_qbe", ["p25a_va_qbe.pion"], [
+    src,
+  ])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  assert_true(p18_find_from(ssa, "call $sqlite3_config(w ", 0) >= 0, ssa)
+  let sq_pos = p18_find_from(ssa, "call $sqlite3_config(", 0)
+  let sq_end = p18_find_from(ssa, "\n", sq_pos)
+  let va_sq = p18_find_from(ssa, ", ..., w ", sq_pos)
+  assert_true(va_sq > sq_pos && va_sq < sq_end, ssa)
+
+  let sn_pos = p18_find_from(ssa, "call $snprintf(l ", 0)
+  let sn_end = p18_find_from(ssa, "\n", sn_pos)
+  let va_sn = p18_find_from(ssa, ", ..., w ", sn_pos)
+  let d_sn = p18_find_from(ssa, ", d ", va_sn)
+  assert_true(va_sn > sn_pos && va_sn < sn_end && d_sn > va_sn && d_sn < sn_end, ssa)
+
+  let sn0_pos = p18_find_from(ssa, "call $snprintf(l ", sn_end)
+  let sn0_end = p18_find_from(ssa, "\n", sn0_pos)
+  let va_sn0 = p18_find_from(ssa, ", ...)", sn0_pos)
+  assert_true(va_sn0 > sn0_pos && va_sn0 < sn0_end, ssa)
+}

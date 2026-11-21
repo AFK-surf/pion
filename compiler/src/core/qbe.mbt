@@ -10475,10 +10475,19 @@ fn qbe_emit_extern_fn_call(
     if i > 0 {
       sb.write_string(", ")
     }
+    if einfo.decl.vararg_from >= 0 && i == einfo.decl.vararg_from {
+      sb.write_string("..., ")
+    }
     sb.write_string(call_abis[i])
     sb.write_string(" ")
     sb.write_string(call_args[i])
     i = i + 1
+  }
+  if einfo.decl.vararg_from >= 0 && einfo.decl.vararg_from == call_args.length() {
+    if call_args.length() > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string("...")
   }
   sb.write_string(")")
   qbe_emit(g, sb.to_string())

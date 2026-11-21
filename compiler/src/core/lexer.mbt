@@ -49,6 +49,7 @@ pub enum TokenKind {
   ColonColon
   Dot
   DotDot
+  Ellipsis
   Question
   Arrow
   FatArrow
@@ -586,8 +587,17 @@ pub fn lex(file : String, source : String) -> LexResult {
       continue
     }
 
-    // Two-char operators
+    // Three-char and two-char operators
     let sp = span_new(file, start_line, start_col)
+    if pos + 2 < len &&
+      ch == 46 &&
+      str_code_at(source, pos + 1) == 46 &&
+      str_code_at(source, pos + 2) == 46 {
+      pos = pos + 3
+      col = col + 3
+      tokens.push(Token::{ kind: Ellipsis, span: sp, raw: "...", newline_before: nl })
+      continue
+    }
     if pos + 1 < len {
       let c2 = str_code_at(source, pos + 1)
       if ch == 46 && c2 == 46 {

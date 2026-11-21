@@ -107,6 +107,7 @@ pub struct ExternFnDecl {
   name : String
   c_symbol : String
   params : Array[Param]
+  vararg_from : Int
   ret_ty : TypeExpr
   span : Span
 }

@@ -109,6 +109,8 @@ import "pkg_name" [as alias]
   ...
 }
 
+[pub] extern "C" fn name(p1 : Type1, [..., v1 : VarType1, ...]) -> RetType [= "c_symbol"]
+
 [pub] trait Name {
   method(self : Self, p1 : Type1) -> RetType
 }
@@ -335,7 +337,8 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void*   pion_world_exec_capture_bytes(void *w, void *argv_arr, int32_t *exit_code_out);` (`proc_exec_capture_bytes(world, argv : Array[String]) -> Result[Bytes, String]`; silences child stderr to `/dev/null`, preserves raw stdout bytes including `\0`, `Ok(bytes)` if exit code == 0 else `Err("exit <code>")`)
 - `void*   pion_sha256_hex(void *s);` (pure SHA-256 hex digest for CAS cache keys!)
 
-**FFI raw pointers & C strings (no `World`; compiler builtins → direct calls):**
+**FFI raw pointers, C variadic calls & C strings (no `World`; compiler builtins → direct calls):**
+- `extern "C" fn name(fixed_params..., ..., vararg_params...) -> Ret [= "c_sym"]`: native C variadic ABI support. At least one fixed parameter is required before `...` (duplicate or leading `...` is a syntax error); trailing typed vararg parameters stay statically type-checked at call sites (or 0 trailing parameters, e.g. `fn foo(a : Int, ...) -> Int`). Emits QBE variadic calls `call $c_sym(fixed..., ..., varargs...)` with C default argument promotions (`Int`/`Bool`/`Byte` as `w`, `Int64`/`Ptr` as `l`, `Double` as `d`), satisfying Apple Silicon ARM64 Darwin PCS (all variadic args passed on the stack) and Linux x86_64 SysV ABI (register allocation + `%al` XMM count).
 - `void*   pion_ptr_alloc(int64_t bytes);` (`ptr_alloc(bytes : Int64) -> Ptr`, zeroed)
 - `void    pion_ptr_free(void *p);` (`ptr_free(p : Ptr) -> Unit`)
 - `void*   pion_ptr_offset(void *p, int64_t off);` (`ptr_offset(p : Ptr, off : Int64) -> Ptr`)

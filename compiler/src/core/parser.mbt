@@ -726,6 +726,75 @@ fn p_parse_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
 }
 
 ///|
+pub struct ParsedExternParams {
+  params : Array[Param]
+  vararg_from : Int
+}
+
+///|
+fn p_parse_extern_params(p : Parser) -> ParsedExternParams {
+  let params : Array[Param] = []
+  let mut vararg_from = -1
+  p_expect_lparen(p)
+  while !p_is_eof(p) {
+    let before_pos = p.pos
+    match p_peek(p).kind {
+      RParen => {
+        let _ = p_advance(p)
+        break
+      }
+      Ellipsis => {
+        let esp = p_peek(p).span
+        let _ = p_advance(p)
+        if vararg_from >= 0 {
+          p_err(
+            p,
+            esp,
+            "duplicate `...` in extern \"C\" parameter list",
+            "parameter or `)`",
+            "...",
+            "only one `...` separator is allowed in an extern \"C\" declaration",
+          )
+        } else if params.length() == 0 {
+          p_err(
+            p,
+            esp,
+            "extern \"C\" variadic function requires at least one fixed parameter before `...`",
+            "fixed parameter",
+            "...",
+            "declare at least one fixed parameter before `...` (C ABI requirement)",
+          )
+        } else {
+          vararg_from = params.length()
+        }
+        if !p_match_kind_comma(p) {
+          p_expect_rparen(p)
+          break
+        }
+      }
+      _ => {
+        let pspan = p_peek(p).span
+        let pname = p_expect_ident(p, "parameter name")
+        let pty = if p_match_kind_colon(p) {
+          p_parse_type_expr(p)
+        } else {
+          TyMissing(pspan)
+        }
+        params.push(Param::{ name: pname, ty: pty, span: pspan })
+        if !p_match_kind_comma(p) {
+          p_expect_rparen(p)
+          break
+        }
+      }
+    }
+    if p.pos == before_pos {
+      let _ = p_advance(p)
+    }
+  }
+  ParsedExternParams::{ params: params, vararg_from: vararg_from }
+}
+
+///|
 fn p_parse_extern_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl {
   let _ = p_advance(p) // consume 'extern'
   let abi_tok = p_peek(p)
@@ -773,7 +842,7 @@ fn p_parse_extern_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl 
     }
   }
   let name = p_expect_ident(p, "extern function name")
-  let params = p_parse_params(p)
+  let eparams = p_parse_extern_params(p)
   let ret_ty = if p_match_kind_arrow(p) {
     p_parse_type_expr(p)
   } else {
@@ -803,7 +872,8 @@ fn p_parse_extern_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl 
     abi: abi,
     name: name,
     c_symbol: c_symbol,
-    params: params,
+    params: eparams.params,
+    vararg_from: eparams.vararg_from,
     ret_ty: ret_ty,
     span: start_span,
   })

@@ -240,7 +240,7 @@ fi
 FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
   "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" \
   "$ROOT_DIR/examples/https_server" "$ROOT_DIR/tests/e2e/dyn_trait.pion" \
-  "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" "$ROOT_DIR/examples/pion_station")"
+  "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/examples/pion_station")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: fmt --check failed on Linux: $FMT_JSON" >&2
@@ -271,6 +271,14 @@ P22A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p22a_systems_io.pion")"
 echo "pionc_linux run p22a_systems_io -> $P22A_OUT"
 if [ "$P22A_OUT" != "p22a_systems_io ok" ]; then
   echo "FAIL: p22a_systems_io output mismatch" >&2
+  exit 1
+fi
+
+# P25-A: native C variadic ABI (extern "C" fn with `...`).
+P25A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion")"
+echo "pionc_linux run p25a_c_varargs -> $P25A_OUT"
+if [ "$P25A_OUT" != "a=42 b=-7 c=3.25" ]; then
+  echo "FAIL: p25a_c_varargs output mismatch" >&2
   exit 1
 fi
 
