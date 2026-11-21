@@ -20,6 +20,8 @@ pub enum TokenKind {
   KwIf
   KwElse
   KwMatch
+  KwGuard
+  KwIs
   KwWhile
   KwFor
   KwIn
@@ -49,15 +51,26 @@ pub enum TokenKind {
   ColonColon
   Dot
   DotDot
+  DotDotLt
+  DotDotEq
   Ellipsis
   Question
   Arrow
   FatArrow
+  PipeGt
   Plus
   Minus
   Star
   Slash
   Percent
+  PlusEq
+  MinusEq
+  StarEq
+  SlashEq
+  PercentEq
+  AmpEq
+  PipeEq
+  CaretEq
   Eq
   EqEq
   BangEq
@@ -112,6 +125,19 @@ fn is_hex_digit(ch : Int) -> Bool {
 }
 
 ///|
+fn hex_digit_val(ch : Int) -> Int {
+  if ch >= 48 && ch <= 57 {
+    ch - 48
+  } else if ch >= 65 && ch <= 70 {
+    ch - 65 + 10
+  } else if ch >= 97 && ch <= 102 {
+    ch - 97 + 10
+  } else {
+    -1
+  }
+}
+
+///|
 fn keyword_or_ident(word : String) -> TokenKind {
   if word == "fn" {
     KwFn
@@ -131,6 +157,10 @@ fn keyword_or_ident(word : String) -> TokenKind {
     KwElse
   } else if word == "match" {
     KwMatch
+  } else if word == "guard" {
+    KwGuard
+  } else if word == "is" {
+    KwIs
   } else if word == "while" {
     KwWhile
   } else if word == "for" {
@@ -363,22 +393,68 @@ pub fn lex(file : String, source : String) -> LexResult {
           }
           if next_c == 110 {
             sb.write_char('\n')
+            pos = pos + 2
+            col = col + 2
           } else if next_c == 114 {
             sb.write_char('\r')
+            pos = pos + 2
+            col = col + 2
           } else if next_c == 116 {
             sb.write_char('\t')
+            pos = pos + 2
+            col = col + 2
           } else if next_c == 92 {
             sb.write_char('\\')
+            pos = pos + 2
+            col = col + 2
           } else if next_c == 34 {
             sb.write_char('"')
+            pos = pos + 2
+            col = col + 2
           } else if next_c == 48 {
             let nul = 0
             sb.write_char(nul.unsafe_to_char())
+            pos = pos + 2
+            col = col + 2
+          } else if next_c == 120 {
+            let hi = if pos + 2 < len {
+              hex_digit_val(str_code_at(source, pos + 2))
+            } else {
+              -1
+            }
+            let lo = if pos + 3 < len {
+              hex_digit_val(str_code_at(source, pos + 3))
+            } else {
+              -1
+            }
+            if hi >= 0 && lo >= 0 {
+              let bv = hi * 16 + lo
+              if bv < 0x80 {
+                sb.write_char(bv.unsafe_to_char())
+              } else {
+                sb.write_char((0xE000 + bv).unsafe_to_char())
+              }
+              pos = pos + 4
+              col = col + 4
+            } else {
+              diags.push(
+                diag_new(
+                  span_new(file, line, col),
+                  "E_PARSE",
+                  "invalid hex escape in string literal",
+                  "two hex digits after `\\x`",
+                  "\\x",
+                  "write two hexadecimal digits after `\\x`, e.g. `\\x41`",
+                ),
+              )
+              pos = pos + 2
+              col = col + 2
+            }
           } else {
             sb.write_char(next_c.unsafe_to_char())
+            pos = pos + 2
+            col = col + 2
           }
-          pos = pos + 2
-          col = col + 2
         } else {
           let un = str_scalar_len(source, pos, utf8)
           sb.write_char(str_scalar_at(source, pos, utf8).unsafe_to_char())
@@ -448,22 +524,68 @@ pub fn lex(file : String, source : String) -> LexResult {
             }
             if next_c == 110 {
               sb.write_char('\n')
+              pos = pos + 2
+              col = col + 2
             } else if next_c == 114 {
               sb.write_char('\r')
+              pos = pos + 2
+              col = col + 2
             } else if next_c == 116 {
               sb.write_char('\t')
+              pos = pos + 2
+              col = col + 2
             } else if next_c == 92 {
               sb.write_char('\\')
+              pos = pos + 2
+              col = col + 2
             } else if next_c == 34 {
               sb.write_char('"')
+              pos = pos + 2
+              col = col + 2
             } else if next_c == 48 {
               let nul = 0
               sb.write_char(nul.unsafe_to_char())
+              pos = pos + 2
+              col = col + 2
+            } else if next_c == 120 {
+              let hi = if pos + 2 < len {
+                hex_digit_val(str_code_at(source, pos + 2))
+              } else {
+                -1
+              }
+              let lo = if pos + 3 < len {
+                hex_digit_val(str_code_at(source, pos + 3))
+              } else {
+                -1
+              }
+              if hi >= 0 && lo >= 0 {
+                let bv = hi * 16 + lo
+                if bv < 0x80 {
+                  sb.write_char(bv.unsafe_to_char())
+                } else {
+                  sb.write_char((0xE000 + bv).unsafe_to_char())
+                }
+                pos = pos + 4
+                col = col + 4
+              } else {
+                diags.push(
+                  diag_new(
+                    span_new(file, line, col),
+                    "E_PARSE",
+                    "invalid hex escape in string literal",
+                    "two hex digits after `\\x`",
+                    "\\x",
+                    "write two hexadecimal digits after `\\x`, e.g. `\\x41`",
+                  ),
+                )
+                pos = pos + 2
+                col = col + 2
+              }
             } else {
               sb.write_char(next_c.unsafe_to_char())
+              pos = pos + 2
+              col = col + 2
             }
-            pos = pos + 2
-            col = col + 2
           } else {
             let un = str_scalar_len(source, pos, utf8)
             sb.write_char(str_scalar_at(source, pos, utf8).unsafe_to_char())
@@ -568,6 +690,24 @@ pub fn lex(file : String, source : String) -> LexResult {
           col = col + 1
         }
       }
+      if pos < len &&
+        (str_code_at(source, pos) == 101 || str_code_at(source, pos) == 69) {
+        let mut ep = pos + 1
+        if ep < len &&
+          (str_code_at(source, ep) == 43 || str_code_at(source, ep) == 45) {
+          ep = ep + 1
+        }
+        if ep < len && is_digit(str_code_at(source, ep)) {
+          is_double = true
+          col = col + (ep - pos)
+          pos = ep
+          while pos < len &&
+            (is_digit(str_code_at(source, pos)) || str_code_at(source, pos) == 95) {
+            pos = pos + 1
+            col = col + 1
+          }
+        }
+      }
       let mut is_i64 = false
       if !is_double && pos < len && str_code_at(source, pos) == 76 {
         is_i64 = true
@@ -591,15 +731,83 @@ pub fn lex(file : String, source : String) -> LexResult {
     let sp = span_new(file, start_line, start_col)
     if pos + 2 < len &&
       ch == 46 &&
-      str_code_at(source, pos + 1) == 46 &&
-      str_code_at(source, pos + 2) == 46 {
-      pos = pos + 3
-      col = col + 3
-      tokens.push(Token::{ kind: Ellipsis, span: sp, raw: "...", newline_before: nl })
-      continue
+      str_code_at(source, pos + 1) == 46 {
+      let c3 = str_code_at(source, pos + 2)
+      if c3 == 46 {
+        pos = pos + 3
+        col = col + 3
+        tokens.push(Token::{ kind: Ellipsis, span: sp, raw: "...", newline_before: nl })
+        continue
+      }
+      if c3 == 60 {
+        pos = pos + 3
+        col = col + 3
+        tokens.push(Token::{ kind: DotDotLt, span: sp, raw: "..<", newline_before: nl })
+        continue
+      }
+      if c3 == 61 {
+        pos = pos + 3
+        col = col + 3
+        tokens.push(Token::{ kind: DotDotEq, span: sp, raw: "..=", newline_before: nl })
+        continue
+      }
     }
     if pos + 1 < len {
       let c2 = str_code_at(source, pos + 1)
+      if ch == 124 && c2 == 62 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: PipeGt, span: sp, raw: "|>", newline_before: nl })
+        continue
+      }
+      if ch == 43 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: PlusEq, span: sp, raw: "+=", newline_before: nl })
+        continue
+      }
+      if ch == 45 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: MinusEq, span: sp, raw: "-=", newline_before: nl })
+        continue
+      }
+      if ch == 42 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: StarEq, span: sp, raw: "*=", newline_before: nl })
+        continue
+      }
+      if ch == 47 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: SlashEq, span: sp, raw: "/=", newline_before: nl })
+        continue
+      }
+      if ch == 37 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: PercentEq, span: sp, raw: "%=", newline_before: nl })
+        continue
+      }
+      if ch == 38 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: AmpEq, span: sp, raw: "&=", newline_before: nl })
+        continue
+      }
+      if ch == 124 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: PipeEq, span: sp, raw: "|=", newline_before: nl })
+        continue
+      }
+      if ch == 94 && c2 == 61 {
+        pos = pos + 2
+        col = col + 2
+        tokens.push(Token::{ kind: CaretEq, span: sp, raw: "^=", newline_before: nl })
+        continue
+      }
       if ch == 46 && c2 == 46 {
         pos = pos + 2
         col = col + 2

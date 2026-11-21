@@ -283,6 +283,14 @@ if [ "$P25A_OUT" != "a=42 b=-7 c=3.25" ]; then
   exit 1
 fi
 
+# P27-A: Bug #4 tuple expected-type propagation, scientific notation, \xNN, numeric/Double methods, Map::clear, |>, ignore, compound assign, guard/is, ..</..=, indexed for, struct update.
+P27A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion")"
+echo "pionc_linux run p27a_ergonomics_bug4 -> $P27A_OUT"
+if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
+  echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2
+  exit 1
+fi
+
 # P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
 P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
 echo "pionc_linux run p17a_ergonomics_mt -> $P17A_OUT"

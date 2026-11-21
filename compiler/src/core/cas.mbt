@@ -105,7 +105,11 @@ fn str_to_utf8_ints(s : String) -> Array[Int] {
     // units in MoonBit) and re-encode it, so both hosts emit identical bytes.
     let cp = str_scalar_at(s, i, utf8)
     i = i + str_scalar_len(s, i, utf8)
-    if cp < 0x800 {
+    if cp >= 0xE080 && cp <= 0xE0FF {
+      // Raw byte escape (\x80..\xFF) encoded by lexer as PUA sentinel so
+      // Stage 0 (UTF-16 MoonBit) and Stage 1 (UTF-8 Pion) emit identical bytes.
+      out.push(cp - 0xE000)
+    } else if cp < 0x800 {
       out.push(0xC0 | (cp >> 6))
       out.push(0x80 | (cp & 0x3F))
     } else if cp < 0x10000 {
@@ -240,7 +244,7 @@ pub struct CasEntry {
 
 ///|
 pub fn pion_compiler_abi_rev() -> String {
-  "pionc-v0.12"
+  "pionc-v0.13"
 }
 
 ///|

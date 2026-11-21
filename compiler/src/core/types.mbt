@@ -2509,13 +2509,20 @@ fn collect_stmts_captures(
           ni = ni + 1
         }
       }
-      SAssign(lhs, rhs, _) => {
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
         collect_expr_captures(lhs, locals, out)
         collect_expr_captures(rhs, locals, out)
       }
-      SWhile(cond, body, _) => {
+      SGuard(cond, else_body, _) => {
         collect_expr_captures(cond, locals, out)
-        collect_stmts_captures(body, locals, out)
+        let else_locals = locals.copy()
+        collect_stmts_captures(else_body, else_locals, out)
+        collect_cond_is_locals(cond, locals)
+      }
+      SWhile(cond, body, _) => {
+        let body_locals = locals.copy()
+        collect_cond_captures_with_is(cond, body_locals, out)
+        collect_stmts_captures(body, body_locals, out)
       }
       SFor(init_s, cond, step_s, body, _) => {
         collect_stmts_captures([init_s], locals, out)
@@ -2523,16 +2530,19 @@ fn collect_stmts_captures(
         collect_stmts_captures([step_s], locals, out)
         collect_stmts_captures(body, locals, out)
       }
-      SForRange(vname, start_e, end_e, body, _) => {
+      SForRange(vname, start_e, end_e, _, body, _) => {
         collect_expr_captures(start_e, locals, out)
         collect_expr_captures(end_e, locals, out)
         let inner_locals = locals.copy()
         inner_locals.set(vname, true)
         collect_stmts_captures(body, inner_locals, out)
       }
-      SForIn(vname, iter_e, body, _) => {
+      SForIn(idx_name, vname, iter_e, body, _) => {
         collect_expr_captures(iter_e, locals, out)
         let inner_locals = locals.copy()
+        if idx_name != "" && idx_name != "_" {
+          inner_locals.set(idx_name, true)
+        }
         inner_locals.set(vname, true)
         collect_stmts_captures(body, inner_locals, out)
       }
@@ -2606,7 +2616,11 @@ fn collect_expr_captures(
         i = i + 1
       }
     }
-    EStructLit(_, fields, _) => {
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => collect_expr_captures(base, locals, out)
+        None => ()
+      }
       let mut i = 0
       while i < fields.length() {
         collect_expr_captures(fields[i].value, locals, out)
@@ -2615,8 +2629,9 @@ fn collect_expr_captures(
     }
     EBlock(stmts, _) => collect_stmts_captures(stmts, locals, out)
     EIf(cond, then_s, else_opt, _) => {
-      collect_expr_captures(cond, locals, out)
-      collect_stmts_captures(then_s, locals, out)
+      let then_locals = locals.copy()
+      collect_cond_captures_with_is(cond, then_locals, out)
+      collect_stmts_captures(then_s, then_locals, out)
       match else_opt {
         Some(el) => collect_expr_captures(el, locals, out)
         None => ()
@@ -2635,6 +2650,7 @@ fn collect_expr_captures(
         i = i + 1
       }
     }
+    EIs(scrut, _, _) => collect_expr_captures(scrut, locals, out)
     EClosure(params, _, body, _) => {
       let mut i = 0
       while i < params.length() {
@@ -3090,6 +3106,69 @@ fn eq_comparable(tc : TypeChecker, t : Ty) -> Bool {
 }
 
 ///|
+fn collect_cond_is_locals(cond : Expr, locals : Map[String, Bool]) -> Unit {
+  match cond {
+    EIs(_, pat, _) => collect_pat_bindings(pat, locals)
+    EBinary("&&", lhs, rhs, _) => {
+      collect_cond_is_locals(lhs, locals)
+      collect_cond_is_locals(rhs, locals)
+    }
+    _ => ()
+  }
+}
+
+///|
+fn collect_cond_captures_with_is(
+  cond : Expr,
+  locals : Map[String, Bool],
+  out : Array[CaptureInfo],
+) -> Unit {
+  match cond {
+    EIs(scrut, pat, _) => {
+      collect_expr_captures(scrut, locals, out)
+      collect_pat_bindings(pat, locals)
+    }
+    EBinary("&&", lhs, rhs, _) => {
+      collect_cond_captures_with_is(lhs, locals, out)
+      collect_cond_captures_with_is(rhs, locals, out)
+    }
+    _ => collect_expr_captures(cond, locals, out)
+  }
+}
+
+///|
+fn check_cond_with_bindings(
+  tc : TypeChecker,
+  env : Env,
+  cond : Expr,
+) -> Ty {
+  match cond {
+    EIs(scrut, pat, _) => {
+      let sty = check_expr(tc, env, scrut, None)
+      bind_pattern(tc, env, pat, sty)
+      TBool
+    }
+    EBinary("&&", lhs, rhs, sp) => {
+      let lty = check_cond_with_bindings(tc, env, lhs)
+      let rty = check_cond_with_bindings(tc, env, rhs)
+      if !ty_compat(TBool, lty) || !ty_compat(TBool, rty) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "logical `&&` expects `Bool` operands",
+          "Bool",
+          ty_to_string(lty) + " && " + ty_to_string(rty),
+          "use boolean operands with `&&`",
+        )
+      }
+      TBool
+    }
+    _ => check_expr(tc, env, cond, Some(TBool))
+  }
+}
+
+///|
 fn check_stmt(
   tc : TypeChecker,
   env : Env,
@@ -3276,8 +3355,81 @@ fn check_stmt(
       }
       TUnit
     }
+    SCompoundAssign(op, lhs, rhs, sp) => {
+      let lty = match lhs {
+        EIdent(name, lsp) =>
+          match env_lookup(env, name) {
+            Some(b) => {
+              if !b.is_mut {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_TYPE_MISMATCH",
+                  "cannot assign to immutable variable `" + name + "`",
+                  "mutable binding",
+                  "immutable `" + name + "`",
+                  "declare `" + name + "` with `let mut " + name + "`",
+                )
+              }
+              b.ty
+            }
+            None => check_expr(tc, env, lhs, None)
+          }
+        _ => check_expr(tc, env, lhs, None)
+      }
+      let rty = check_expr(tc, env, rhs, Some(lty))
+      if !ty_compat(lty, rty) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "type mismatch in compound assignment `" + op + "=`",
+          ty_to_string(lty),
+          ty_to_string(rty),
+          "use a right-hand side of type `" + ty_to_string(lty) + "`",
+        )
+      } else {
+        let valid_op = match lty {
+          TInt | TInt64 | TError => true
+          TDouble => op == "+" || op == "-" || op == "*" || op == "/"
+          TString => op == "+"
+          _ => false
+        }
+        if !valid_op {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "operator `" + op + "=` is not supported for type `" + ty_to_string(lty) + "`",
+            "numeric or String type",
+            ty_to_string(lty),
+            "use a supported operand type for `" + op + "=`",
+          )
+        }
+      }
+      TUnit
+    }
+    SGuard(cond, else_body, sp) => {
+      env_push(env)
+      let _ = check_stmts_ex(tc, env, else_body, None, false)
+      env_pop(env)
+      let cty = check_cond_with_bindings(tc, env, cond)
+      if !ty_compat(TBool, cty) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "`guard` condition must be `Bool`",
+          "Bool",
+          ty_to_string(cty),
+          "use a boolean condition or `expr is Pattern`",
+        )
+      }
+      TUnit
+    }
     SWhile(cond, body, sp) => {
-      let cty = check_expr(tc, env, cond, Some(TBool))
+      env_push(env)
+      let cty = check_cond_with_bindings(tc, env, cond)
       if !ty_compat(TBool, cty) {
         tc_err(
           tc,
@@ -3289,7 +3441,6 @@ fn check_stmt(
           "use a boolean condition",
         )
       }
-      env_push(env)
       let _ = check_stmts_ex(tc, env, body, None, false)
       env_pop(env)
       TUnit
@@ -3314,7 +3465,7 @@ fn check_stmt(
       env_pop(env)
       TUnit
     }
-    SForRange(vname, start_e, end_e, body, sp) => {
+    SForRange(vname, start_e, end_e, _, body, sp) => {
       let sty = check_expr(tc, env, start_e, Some(TInt))
       let expected_end = match sty {
         TInt64 => TInt64
@@ -3354,7 +3505,7 @@ fn check_stmt(
       env_pop(env)
       TUnit
     }
-    SForIn(vname, iter_e, body, sp) => {
+    SForIn(idx_name, vname, iter_e, body, sp) => {
       let ity = check_expr(tc, env, iter_e, None)
       let elem_ty = match ity {
         TArray(et) => et
@@ -3373,6 +3524,9 @@ fn check_stmt(
         }
       }
       env_push(env)
+      if idx_name != "" && idx_name != "_" {
+        env_define(env, idx_name, TInt, false)
+      }
       env_define(env, vname, elem_ty, false)
       let _ = check_stmts_ex(tc, env, body, None, false)
       env_pop(env)
@@ -3999,6 +4153,12 @@ fn check_method_call(
       if method_name == "to_int" {
         return TInt
       }
+      if method_name == "to_double" {
+        return TDouble
+      }
+      if method_name == "abs" {
+        return TInt
+      }
       if method_name == "unsafe_to_char" {
         return TChar
       }
@@ -4016,6 +4176,12 @@ fn check_method_call(
       if method_name == "to_int64" {
         return TInt64
       }
+      if method_name == "to_double" {
+        return TDouble
+      }
+      if method_name == "abs" {
+        return TInt64
+      }
     }
     TDouble => {
       if method_name == "to_string" {
@@ -4023,6 +4189,20 @@ fn check_method_call(
       }
       if method_name == "to_int" {
         return TInt
+      }
+      if method_name == "to_int64" {
+        return TInt64
+      }
+      if method_name == "to_bits" {
+        return TInt64
+      }
+      if method_name == "abs" ||
+        method_name == "floor" ||
+        method_name == "ceil" ||
+        method_name == "round" ||
+        method_name == "trunc" ||
+        method_name == "sqrt" {
+        return TDouble
       }
     }
     TBool =>
@@ -4436,6 +4616,10 @@ fn check_method_call(
       }
       if method_name == "copy" {
         return TMap(kty, vty)
+      }
+      if method_name == "clear" {
+        check_no_args(tc, env, method_name, args, sp)
+        return TUnit
       }
     }
     TChannel(elem) => {
@@ -5385,6 +5569,12 @@ fn check_expr_inner(
             }
             return TUnit
           }
+          if name == "ignore" {
+            if args.length() >= 1 {
+              let _ = check_expr(tc, env, args[0], None)
+            }
+            return TUnit
+          }
           if name == "math_sqrt" ||
             name == "math_abs" ||
             name == "math_floor" ||
@@ -5520,6 +5710,23 @@ fn check_expr_inner(
           TError
         }
         EPath(qual, mem, _) => {
+          if qual == "Double" && mem == "from_bits" {
+            if args.length() >= 1 {
+              let bty = check_expr(tc, env, args[0], Some(TInt64))
+              if !ty_compat(TInt64, bty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`Double::from_bits` expects `Int64`",
+                  "Int64",
+                  ty_to_string(bty),
+                  "pass an `Int64` bit pattern",
+                )
+              }
+            }
+            return TDouble
+          }
           if qual == "StringBuilder" && mem == "new" {
             return TStringBuilder
           }
@@ -5902,13 +6109,21 @@ fn check_expr_inner(
       }
       TArray(target_elem)
     }
-    EStructLit(sname, fields, sp) => {
+    EStructLit(sname, spread_opt, fields, sp) => {
+      let base_ty_opt : Option[Ty] = match spread_opt {
+        Some(base_e) => Some(check_expr(tc, env, base_e, expected))
+        None => None
+      }
       let mut resolved_name = if sname != "" {
         sname
       } else {
-        match expected {
-          Some(TStruct(en, _)) => en
-          _ => ""
+        match base_ty_opt {
+          Some(TStruct(bn, _)) => bn
+          _ =>
+            match expected {
+              Some(TStruct(en, _)) => en
+              _ => ""
+            }
         }
       }
       if resolved_name != "" && !tc.structs.contains(resolved_name) {
@@ -5964,6 +6179,45 @@ fn check_expr_inner(
                 }
               }
             _ => ()
+          }
+          match base_ty_opt {
+            Some(bty) =>
+              match bty {
+                TStruct(bn, bargs) =>
+                  if bn != resolved_name {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_TYPE_MISMATCH",
+                      "struct update base type mismatch: expected `" +
+                      resolved_name +
+                      "`, found `" +
+                      bn +
+                      "`",
+                      resolved_name,
+                      bn,
+                      "use a base value of struct `" + resolved_name + "`",
+                    )
+                  } else {
+                    let mut k = 0
+                    while k < sinfo.decl.type_params.length() && k < bargs.length() {
+                      subst.set(sinfo.decl.type_params[k], bargs[k])
+                      k = k + 1
+                    }
+                  }
+                TError => ()
+                _ =>
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_TYPE_MISMATCH",
+                    "struct update base must be a struct of type `" + resolved_name + "`",
+                    resolved_name,
+                    ty_to_string(bty),
+                    "provide a `" + resolved_name + "` value after `..`",
+                  )
+              }
+            None => ()
           }
           let mut fi = 0
           while fi < fields.length() {
@@ -6037,10 +6291,19 @@ fn check_expr_inner(
       }
     }
     ETuple(elems, _) => {
+      let exp_elems : Array[Ty] = match expected {
+        Some(TTuple(etys)) => etys
+        _ => []
+      }
       let out : Array[Ty] = []
       let mut i = 0
       while i < elems.length() {
-        out.push(check_expr(tc, env, elems[i], None))
+        let e_exp : Option[Ty] = if i < exp_elems.length() {
+          Some(exp_elems[i])
+        } else {
+          None
+        }
+        out.push(check_expr(tc, env, elems[i], e_exp))
         i = i + 1
       }
       TTuple(out)
@@ -6052,7 +6315,8 @@ fn check_expr_inner(
       t
     }
     EIf(cond, then_stmts, else_opt, sp) => {
-      let cty = check_expr(tc, env, cond, Some(TBool))
+      env_push(env)
+      let cty = check_cond_with_bindings(tc, env, cond)
       if !ty_compat(TBool, cty) {
         tc_err(
           tc,
@@ -6064,7 +6328,6 @@ fn check_expr_inner(
           "use a `Bool` condition",
         )
       }
-      env_push(env)
       let then_ty = check_stmts(tc, env, then_stmts, expected)
       env_pop(env)
       match else_opt {
@@ -6085,6 +6348,13 @@ fn check_expr_inner(
           ty_prefer_concrete(then_ty, else_ty)
         }
       }
+    }
+    EIs(scrut, pat, _) => {
+      let sty = check_expr(tc, env, scrut, None)
+      env_push(env)
+      bind_pattern(tc, env, pat, sty)
+      env_pop(env)
+      TBool
     }
     EMatch(scrut, arms, sp) => {
       let scrut_ty = check_expr(tc, env, scrut, None)

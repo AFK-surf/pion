@@ -1183,6 +1183,28 @@ fn p_parse_stmt(p : Parser) -> Stmt {
       let init = p_parse_expr(p)
       SLet(name, is_mut, vty, init, tok.span)
     }
+    KwGuard => {
+      let _ = p_advance(p)
+      let cond = p_parse_expr(p)
+      match p_peek(p).kind {
+        KwElse => {
+          let _ = p_advance(p)
+        }
+        _ => {
+          let t2 = p_peek(p)
+          p_err(
+            p,
+            t2.span,
+            "expected `else` after `guard` condition",
+            "`else`",
+            t2.raw,
+            "write `guard <cond> else { ... }`",
+          )
+        }
+      }
+      let else_body = p_parse_block_stmts(p)
+      SGuard(cond, else_body, tok.span)
+    }
     KwWhile => {
       let _ = p_advance(p)
       let cond = p_parse_expr(p)
@@ -1191,6 +1213,22 @@ fn p_parse_stmt(p : Parser) -> Stmt {
     }
     KwFor => {
       let _ = p_advance(p)
+      let is_for_idx_in = match p_peek(p).kind {
+        Ident(_) =>
+          match p_peek_at(p, 1).kind {
+            Comma =>
+              match p_peek_at(p, 2).kind {
+                Ident(_) =>
+                  match p_peek_at(p, 3).kind {
+                    KwIn => true
+                    _ => false
+                  }
+                _ => false
+              }
+            _ => false
+          }
+        _ => false
+      }
       let is_for_in = match p_peek(p).kind {
         Ident(_) =>
           match p_peek_at(p, 1).kind {
@@ -1199,22 +1237,31 @@ fn p_parse_stmt(p : Parser) -> Stmt {
           }
         _ => false
       }
-      if is_for_in {
+      if is_for_idx_in {
+        let idx_name = p_expect_ident(p, "index variable")
+        let _ = p_advance(p) // consume ','
+        let var_name = p_expect_ident(p, "loop variable")
+        let _ = p_advance(p) // consume 'in'
+        let iter_expr = p_parse_expr(p)
+        let body = p_parse_block_stmts(p)
+        SForIn(idx_name, var_name, iter_expr, body, tok.span)
+      } else if is_for_in {
         let var_name = p_expect_ident(p, "loop variable")
         let _ = p_advance(p) // consume 'in'
         let first_expr = p_parse_expr(p)
-        let is_range = match p_peek(p).kind {
-          DotDot => true
-          _ => false
+        let range_mode = match p_peek(p).kind {
+          DotDot | DotDotLt => 1
+          DotDotEq => 2
+          _ => 0
         }
-        if is_range {
-          let _ = p_advance(p) // consume '..'
+        if range_mode > 0 {
+          let _ = p_advance(p) // consume '..', '..<', or '..='
           let end_expr = p_parse_expr(p)
           let body = p_parse_block_stmts(p)
-          SForRange(var_name, first_expr, end_expr, body, tok.span)
+          SForRange(var_name, first_expr, end_expr, range_mode == 2, body, tok.span)
         } else {
           let body = p_parse_block_stmts(p)
-          SForIn(var_name, first_expr, body, tok.span)
+          SForIn("", var_name, first_expr, body, tok.span)
         }
       } else {
         let init_stmt = p_parse_for_clause_stmt(p)
@@ -1274,10 +1321,35 @@ fn p_parse_stmt(p : Parser) -> Stmt {
         let rhs = p_parse_expr(p)
         SAssign(lhs, rhs, tok.span)
       } else {
-        SExpr(lhs, tok.span)
+        let cop = p_match_compound_assign_op(p)
+        if cop != "" {
+          let rhs = p_parse_expr(p)
+          SCompoundAssign(cop, lhs, rhs, tok.span)
+        } else {
+          SExpr(lhs, tok.span)
+        }
       }
     }
   }
+}
+
+///|
+fn p_match_compound_assign_op(p : Parser) -> String {
+  let op = match p_peek(p).kind {
+    PlusEq => "+"
+    MinusEq => "-"
+    StarEq => "*"
+    SlashEq => "/"
+    PercentEq => "%"
+    AmpEq => "&"
+    PipeEq => "|"
+    CaretEq => "^"
+    _ => ""
+  }
+  if op != "" {
+    let _ = p_advance(p)
+  }
+  op
 }
 
 ///|
@@ -1291,7 +1363,13 @@ fn p_parse_for_clause_stmt(p : Parser) -> Stmt {
         let rhs = p_parse_expr(p)
         SAssign(lhs, rhs, tok.span)
       } else {
-        SExpr(lhs, tok.span)
+        let cop = p_match_compound_assign_op(p)
+        if cop != "" {
+          let rhs = p_parse_expr(p)
+          SCompoundAssign(cop, lhs, rhs, tok.span)
+        } else {
+          SExpr(lhs, tok.span)
+        }
       }
     }
   }
@@ -1300,16 +1378,17 @@ fn p_parse_for_clause_stmt(p : Parser) -> Stmt {
 ///|
 fn bin_prec(kind : TokenKind) -> Int {
   match kind {
-    PipePipe => 1
-    AmpAmp => 2
-    Pipe => 3
-    Caret => 4
-    Amp => 5
-    EqEq | BangEq => 6
-    Lt | LtEq | Gt | GtEq => 7
-    LtLt | GtGt => 8
-    Plus | Minus => 9
-    Star | Slash | Percent => 10
+    PipeGt => 1
+    PipePipe => 2
+    AmpAmp => 3
+    Pipe => 4
+    Caret => 5
+    Amp => 6
+    EqEq | BangEq => 7
+    Lt | LtEq | Gt | GtEq => 8
+    LtLt | GtGt => 9
+    Plus | Minus => 10
+    Star | Slash | Percent => 11
     _ => 0
   }
 }
@@ -1324,13 +1403,21 @@ fn p_parse_bin_expr(p : Parser, min_prec : Int) -> Expr {
   let mut lhs = p_parse_unary_expr(p)
   while true {
     let tok = p_peek(p)
-    // Handle `expr as Type` at high precedence
+    // Handle `expr as Type` at high precedence and `expr is Pattern` at comparison precedence
     match tok.kind {
       KwAs => {
-        if min_prec <= 11 {
+        if min_prec <= 12 {
           let _ = p_advance(p)
           let target = p_parse_type_expr(p)
           lhs = EAs(lhs, target, tok.span)
+          continue
+        }
+      }
+      KwIs => {
+        if min_prec <= 7 {
+          let _ = p_advance(p)
+          let pat = p_parse_pattern(p)
+          lhs = EIs(lhs, pat, tok.span)
           continue
         }
       }
@@ -1349,7 +1436,22 @@ fn p_parse_bin_expr(p : Parser, min_prec : Int) -> Expr {
     }
     let op_tok = p_advance(p)
     let rhs = p_parse_bin_expr(p, prec + 1)
-    lhs = EBinary(op_tok.raw, lhs, rhs, op_tok.span)
+    match op_tok.kind {
+      PipeGt =>
+        match rhs {
+          ECall(callee, args, sp) => {
+            let new_args : Array[Expr] = [lhs]
+            let mut ai = 0
+            while ai < args.length() {
+              new_args.push(args[ai])
+              ai = ai + 1
+            }
+            lhs = ECall(callee, new_args, sp)
+          }
+          _ => lhs = ECall(rhs, [lhs], op_tok.span)
+        }
+      _ => lhs = EBinary(op_tok.raw, lhs, rhs, op_tok.span)
+    }
   }
   lhs
 }
@@ -1475,8 +1577,24 @@ fn p_parse_postfix_expr(p : Parser) -> Expr {
 }
 
 ///|
-fn p_parse_struct_lit_fields(p : Parser) -> Array[FieldInit] {
+pub struct StructLitParsed {
+  spread : Option[Expr]
+  fields : Array[FieldInit]
+}
+
+///|
+fn p_parse_struct_lit_fields(p : Parser) -> StructLitParsed {
   p_expect_lbrace(p)
+  let mut spread : Option[Expr] = None
+  match p_peek(p).kind {
+    DotDot => {
+      let _ = p_advance(p)
+      let base = p_parse_expr(p)
+      spread = Some(base)
+      let _ = p_match_kind_comma(p)
+    }
+    _ => ()
+  }
   let fields : Array[FieldInit] = []
   while !p_is_eof(p) {
     let before_pos = p.pos
@@ -1504,12 +1622,13 @@ fn p_parse_struct_lit_fields(p : Parser) -> Array[FieldInit] {
       let _ = p_advance(p)
     }
   }
-  fields
+  StructLitParsed::{ spread: spread, fields: fields }
 }
 
 ///|
 fn p_looks_like_struct_lit(p : Parser) -> Bool {
   match p_peek_at(p, 1).kind {
+    DotDot => true
     Ident(_) =>
       match p_peek_at(p, 2).kind {
         Colon => true
@@ -1739,7 +1858,13 @@ fn p_parse_match_expr(p : Parser) -> Expr {
               let rhs = p_parse_expr(p)
               EBlock([SAssign(lhs, rhs, arm_span)], arm_span)
             } else {
-              lhs
+              let cop = p_match_compound_assign_op(p)
+              if cop != "" {
+                let rhs = p_parse_expr(p)
+                EBlock([SCompoundAssign(cop, lhs, rhs, arm_span)], arm_span)
+              } else {
+                lhs
+              }
             }
           }
         }
@@ -1923,8 +2048,8 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
     }
     LBrace =>
       if p_looks_like_struct_lit(p) {
-        let fields = p_parse_struct_lit_fields(p)
-        EStructLit("", fields, tok.span)
+        let sp_f = p_parse_struct_lit_fields(p)
+        EStructLit("", sp_f.spread, sp_f.fields, tok.span)
       } else {
         let stmts = p_parse_block_stmts(p)
         EBlock(stmts, tok.span)
@@ -1934,16 +2059,16 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
       if p_match_kind_coloncolon(p) {
         match p_peek(p).kind {
           LBrace => {
-            let fields = p_parse_struct_lit_fields(p)
-            EStructLit(name, fields, tok.span)
+            let sp_f = p_parse_struct_lit_fields(p)
+            EStructLit(name, sp_f.spread, sp_f.fields, tok.span)
           }
           _ => {
             let mem = p_expect_ident(p, "member name after `::`")
             if p_match_kind_coloncolon(p) {
               match p_peek(p).kind {
                 LBrace => {
-                  let fields = p_parse_struct_lit_fields(p)
-                  EStructLit(name + "::" + mem, fields, tok.span)
+                  let sp_f = p_parse_struct_lit_fields(p)
+                  EStructLit(name + "::" + mem, sp_f.spread, sp_f.fields, tok.span)
                 }
                 _ => {
                   let mem2 = p_expect_ident(p, "member name after `::`")

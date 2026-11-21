@@ -186,9 +186,13 @@ fn collect_stmt_calls(stmts : Array[Stmt], out : Array[String]) -> Unit {
     match stmts[i] {
       SLet(_, _, _, init, _) => collect_expr_calls(init, out)
       SLetTuple(_, _, init, _) => collect_expr_calls(init, out)
-      SAssign(lhs, rhs, _) => {
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
         collect_expr_calls(lhs, out)
         collect_expr_calls(rhs, out)
+      }
+      SGuard(cond, else_body, _) => {
+        collect_expr_calls(cond, out)
+        collect_stmt_calls(else_body, out)
       }
       SWhile(cond, body, _) => {
         collect_expr_calls(cond, out)
@@ -200,12 +204,12 @@ fn collect_stmt_calls(stmts : Array[Stmt], out : Array[String]) -> Unit {
         collect_stmt_calls([step_s], out)
         collect_stmt_calls(body, out)
       }
-      SForRange(_, start_e, end_e, body, _) => {
+      SForRange(_, start_e, end_e, _, body, _) => {
         collect_expr_calls(start_e, out)
         collect_expr_calls(end_e, out)
         collect_stmt_calls(body, out)
       }
-      SForIn(_, iter_e, body, _) => {
+      SForIn(_, _, iter_e, body, _) => {
         collect_expr_calls(iter_e, out)
         collect_stmt_calls(body, out)
       }
@@ -278,7 +282,11 @@ fn collect_expr_calls(e : Expr, out : Array[String]) -> Unit {
         i = i + 1
       }
     }
-    EStructLit(_, fields, _) => {
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => collect_expr_calls(base, out)
+        None => ()
+      }
       let mut i = 0
       while i < fields.length() {
         collect_expr_calls(fields[i].value, out)
@@ -306,6 +314,7 @@ fn collect_expr_calls(e : Expr, out : Array[String]) -> Unit {
         i = i + 1
       }
     }
+    EIs(scrut, _, _) => collect_expr_calls(scrut, out)
     EClosure(_, _, body, _) => collect_stmt_calls(body, out)
     EScope(w, f, _) => {
       push_unique(out, "scope")

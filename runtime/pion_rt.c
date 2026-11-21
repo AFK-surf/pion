@@ -1538,6 +1538,21 @@ PION_MINSIZE void pion_map_remove(void *m_ptr, void *key_str) {
     m->entries[hole].hash = 0;
 }
 
+PION_MINSIZE void pion_map_clear(void *m_ptr) {
+    PionMap *m = (PionMap *)m_ptr;
+    if (!m || m->len == 0 || !m->entries) return;
+    for (int64_t i = 0; i < m->cap; i++) {
+        if (m->entries[i].state == 1) {
+            pion_rc_dec(m->entries[i].key);
+            if (m->val_is_obj) {
+                pion_rc_dec((void *)(uintptr_t)m->entries[i].val);
+            }
+        }
+    }
+    memset(m->entries, 0, (size_t)m->cap * sizeof(PionMapEntry));
+    m->len = 0;
+}
+
 PION_MINSIZE void *pion_map_copy(void *m_ptr) {
     PionMap *m = (PionMap *)m_ptr;
     if (!m) return pion_map_new(0);

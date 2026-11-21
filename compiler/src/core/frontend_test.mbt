@@ -2269,3 +2269,89 @@ test "p26b_extern_c_body_c_fn_ptr_zero_copy_math_sb_debug_assert" {
   let (ok_va, json_va, _) = check_one(bad_va_body)
   assert_true(!ok_va && str_contains(json_va, "cannot be variadic"), json_va)
 }
+
+///|
+test "p27a_ergonomics_and_bug4_frontend" {
+  let src =
+    #|struct Node {
+    #|  id : Int
+    #|  label : String
+    #|}
+    #|struct Pt {
+    #|  mut x : Int
+    #|  y : Int
+    #|  tag : String
+    #|}
+    #|fn mk_pair(n : Node, flag : Bool) -> (Node, Option[Node]) {
+    #|  if flag { (n, None) } else { (n, Some(n)) }
+    #|}
+    #|fn add2(a : Int, b : Int) -> Int { a + b }
+    #|fn test_all(opt : Option[Int], arr : Array[Int], p : Pt) -> Int {
+    #|  let a = 1e-9 + 1E9 + 1.797e308 + 1.0e+5 + 0.5e-3
+    #|  let s = "\x41\x00\x42\xff"
+    #|  let b = 42.to_double() + 10L.to_double() + a.abs().floor().ceil().round().trunc().sqrt()
+    #|  let bits = b.to_bits()
+    #|  let _b2 = Double::from_bits(bits)
+    #|  let _i1 = b.to_int() + b.to_int64().to_int() + (-7).abs() + (-9L).abs().to_int()
+    #|  let m : Map[String, Int] = Map::new()
+    #|  m.set("k", 1)
+    #|  m.clear()
+    #|  42 |> add2(8) |> ignore
+    #|  let mut acc = 0
+    #|  acc += 10
+    #|  acc -= 2
+    #|  acc *= 3
+    #|  acc /= 4
+    #|  acc %= 5
+    #|  acc |= 8
+    #|  acc &= 15
+    #|  acc ^= 1
+    #|  let mut msg = "hi"
+    #|  msg += s
+    #|  arr[0] += 1
+    #|  p.x += 2
+    #|  guard acc >= 0 else { return -1 }
+    #|  guard opt is Some(v) else { return 0 }
+    #|  let mut sum = v
+    #|  if opt is Some(w) && w > 0 {
+    #|    sum += w
+    #|  }
+    #|  let _ok : Bool = opt is Some(_)
+    #|  let mut cur : Option[Int] = Some(3)
+    #|  while cur is Some(n) {
+    #|    sum += n
+    #|    cur = if n > 1 { Some(n - 1) } else { None }
+    #|  }
+    #|  for i in 0..<5 {
+    #|    sum += i
+    #|  }
+    #|  for i in 0..=5 {
+    #|    sum += i
+    #|  }
+    #|  for idx, elem in arr {
+    #|    sum += idx + elem
+    #|  }
+    #|  let x = 1
+    #|  let y = 2
+    #|  let tag = "t"
+    #|  let _p1 = Pt::{ x, y, tag }
+    #|  let _p2 = Pt::{ ..p, x: 99 }
+    #|  let n = Node::{ id: 1, label: "a" }
+    #|  let (_, before) = mk_pair(n, true)
+    #|  if before.is_none() { sum } else { 0 }
+    #|}
+  let (ok, json, _) = check_one(src)
+  assert_true(ok, json)
+
+  // Invalid \x escape in string literal must fail lexing
+  let bad_hex =
+    #|fn f() -> String { "\x4G" }
+  let (ok_hx, json_hx, _) = check_one(bad_hex)
+  assert_true(!ok_hx && str_contains(json_hx, "invalid hex escape"), json_hx)
+
+  // Compound assignment on immutable variable must fail
+  let bad_mut =
+    #|fn f() -> Int { let x = 1; x += 2; x }
+  let (ok_bm, json_bm, _) = check_one(bad_mut)
+  assert_true(!ok_bm && str_contains(json_bm, "immutable"), json_bm)
+}

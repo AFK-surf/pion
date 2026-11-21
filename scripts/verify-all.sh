@@ -28,7 +28,8 @@ FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DI
   "$ROOT_DIR/tests/e2e/utf8_text.pion" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" \
   "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" "$ROOT_DIR/examples/https_server" \
   "$ROOT_DIR/tests/e2e/dyn_trait.pion" "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" \
-  "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/examples/pion_station")
+  "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion" \
+  "$ROOT_DIR/examples/pion_station")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
 if ! printf '%s' "$FMT_OUT" | grep -q '"ok":true'; then
   echo "FAIL: pionc2 fmt --check --json reported unformatted files" >&2
@@ -97,6 +98,12 @@ P25A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion")
 echo "p25a_c_varargs -> $P25A_OUT"
 if [ "$P25A_OUT" != "a=42 b=-7 c=3.25" ]; then
   echo "FAIL: p25a_c_varargs output mismatch" >&2
+  exit 1
+fi
+P27A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion")
+echo "p27a_ergonomics_bug4 -> $P27A_OUT"
+if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
+  echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2
   exit 1
 fi
 P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")

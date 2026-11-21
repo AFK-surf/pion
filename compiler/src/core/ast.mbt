@@ -198,10 +198,12 @@ pub enum Stmt {
   SLet(String, Bool, TypeExpr, Expr, Span)
   SLetTuple(Array[String], TypeExpr, Expr, Span)
   SAssign(Expr, Expr, Span)
+  SCompoundAssign(String, Expr, Expr, Span)
+  SGuard(Expr, Array[Stmt], Span)
   SWhile(Expr, Array[Stmt], Span)
   SFor(Stmt, Expr, Stmt, Array[Stmt], Span)
-  SForRange(String, Expr, Expr, Array[Stmt], Span)
-  SForIn(String, Expr, Array[Stmt], Span)
+  SForRange(String, Expr, Expr, Bool, Array[Stmt], Span)
+  SForIn(String, String, Expr, Array[Stmt], Span)
   SReturn(Option[Expr], Span)
   SBreak(Span)
   SContinue(Span)
@@ -227,11 +229,12 @@ pub enum Expr {
   EMethodCall(Expr, String, Array[Expr], Span)
   EIndex(Expr, Expr, Span)
   EArrayLit(Array[Expr], Span)
-  EStructLit(String, Array[FieldInit], Span)
+  EStructLit(String, Option[Expr], Array[FieldInit], Span)
   ETuple(Array[Expr], Span)
   EBlock(Array[Stmt], Span)
   EIf(Expr, Array[Stmt], Option[Expr], Span)
   EMatch(Expr, Array[MatchArm], Span)
+  EIs(Expr, Pattern, Span)
   EClosure(Array[Param], TypeExpr, Array[Stmt], Span)
   EScope(Expr, Expr, Span)
   ESpawn(Expr, Expr, Span)
@@ -261,11 +264,12 @@ pub fn expr_span(e : Expr) -> Span {
     EMethodCall(_, _, _, sp) => sp
     EIndex(_, _, sp) => sp
     EArrayLit(_, sp) => sp
-    EStructLit(_, _, sp) => sp
+    EStructLit(_, _, _, sp) => sp
     ETuple(_, sp) => sp
     EBlock(_, sp) => sp
     EIf(_, _, _, sp) => sp
     EMatch(_, _, sp) => sp
+    EIs(_, _, sp) => sp
     EClosure(_, _, _, sp) => sp
     EScope(_, _, sp) => sp
     ESpawn(_, _, sp) => sp

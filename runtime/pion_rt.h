@@ -3,7 +3,13 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#ifdef __cplusplus
+#include <atomic>
+typedef std::atomic<uint32_t> pion_atomic_u32;
+#else
 #include <stdatomic.h>
+typedef _Atomic uint32_t pion_atomic_u32;
+#endif
 
 #ifdef __cplusplus
 extern "C" {
@@ -36,13 +42,17 @@ typedef enum PionTag {
 typedef struct PionHeader {
     uint32_t owner_tid;         /* Thread ID of creator; 0 = FROZEN/SHARED (atomic mode) */
     uint32_t local_rc;          /* Non-atomic RC used while owner_tid == current_tid */
-    _Atomic uint32_t shared_rc; /* Atomic RC used once owner_tid == 0 (or cross-thread dec) */
+    pion_atomic_u32 shared_rc;  /* Atomic RC used once owner_tid == 0 (or cross-thread dec) */
     uint16_t type_tag;          /* PionTag */
     uint16_t flags;             /* bit 0: FROZEN, bit 1: IMMORTAL, bit 2: SLAB, bits 4..7: slab cls */
     PionDropFn drop_fn;         /* Nullable destructor for releasing child pointers */
 } PionHeader;                   /* Total: 24 bytes (clean 8-byte alignment on arm64/x64) */
 
+#ifdef __cplusplus
+static_assert(sizeof(PionHeader) == 24, "PionHeader must be exactly 24 bytes");
+#else
 _Static_assert(sizeof(PionHeader) == 24, "PionHeader must be exactly 24 bytes");
+#endif
 
 typedef struct PionString {
     int64_t len;
@@ -184,6 +194,7 @@ int32_t  pion_map_has(void *m, void *key_str);
 int64_t  pion_map_get(void *m, void *key_str);
 int32_t  pion_map_try_get(void *m_ptr, void *key_str, int64_t *out_val);
 void     pion_map_remove(void *m, void *key_str);
+void     pion_map_clear(void *m);
 void*    pion_map_copy(void *m);
 void*    pion_map_keys(void *m);
 

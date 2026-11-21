@@ -137,12 +137,14 @@ test "test name" {
 
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
-- Tuple destructuring & element indexing: `let (a, b) = expr` / `let (a, _, c) : (T1, T2, T3) = expr` (`_` ignores an element), and `t.0` / `t.1` tuple element access
-- Assignment: `x = expr`, `obj.field = expr`, `arr[i] = expr`
+- Tuple destructuring & element indexing: `let (a, b) = expr` / `let (a, _, c) : (T1, T2, T3) = expr` (`_` ignores an element), and `t.0` / `t.1` tuple element access; tuple literals propagate element expected types (`(n, None)` as `(Node, Option[Node])` uses null-niche `0`)
+- Assignment & compound assignment: `x = expr`, `obj.field = expr`, `arr[i] = expr`, and `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=` (receiver/index evaluated once; `+=` also supports `String` concatenation)
+- Struct literals: field shorthand `Foo::{ x, y }` and functional update `Foo::{ ..base, x: 1 }` (copies non-overridden fields with RC retention)
 - Control flow:
-  - `if cond { ... } else if cond2 { ... } else { ... }` (expression when all branches yield same type)
-  - `while cond { ... }`
-  - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` (half-open `[start, end)`), `for x in arr { ... }` (`Array[T]`)
+  - `if cond { ... } else if cond2 { ... } else { ... }` (expression when all branches yield same type; `expr is Pattern` in `if`/`while`/`guard` binds pattern variables into the matching branch, `&&` right-hand side, or enclosing block)
+  - `guard cond else { diverge_block }` and `guard expr is Pattern else { diverge_block }` (early exit on mismatch; binds pattern variables into the enclosing block for subsequent statements)
+  - `while cond { ... }` (including `while expr is Pattern { ... }`)
+  - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` / `for i in start..<end { ... }` (half-open `[start, end)`), `for i in start..=end { ... }` (closed `[start, end]`, overflow-safe), `for x in arr { ... }` and `for i, x in arr { ... }` (`Array[T]`)
   - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E]`) and `Option[T]` (enclosing function returns `Option[_]`)
   - `match scrutinee { Pat [if guard_cond] => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed; guarded arms do not satisfy exhaustiveness on their own, and failed guards release arm pattern bindings and fall through to subsequent arms)
   - `return [expr]`, `break`, `continue`
@@ -154,10 +156,14 @@ test "test name" {
   - `AtomicInt::new(v)`, `a.load()`, `a.store(v)`, `a.fetch_add(d)`
 - Contracts: `debug_assert(cond, "msg"[,])` (statement or expression position, type `Unit`; optional trailing comma)
 - Built-in conversions and helpers:
+  - Scientific notation `Double` literals (`1e-9`, `1E9`, `1.797e308`, `1.0e+5`) and `\xHH` raw byte escapes in string literals
+  - `Int::to_double() -> Double`, `Int::abs() -> Int`, `Int64::to_double() -> Double`, `Int64::abs() -> Int64`, `Double::to_int() -> Int`, `Double::to_int64() -> Int64`, `Double::to_bits() -> Int64`, `Double::from_bits(bits : Int64) -> Double`, and `Double` methods `abs()`, `floor()`, `ceil()`, `round()`, `trunc()`, `sqrt()` (all 0-byte runtime)
+  - `Map::clear() -> Unit` (`pion_map_clear`)
+  - `ignore(x : T) -> Unit` (releases non-borrowed heap value, 0-byte runtime)
   - `s.to_int() -> Option[Int]`, `s.to_int64() -> Option[Int64]`, `s.to_double() -> Option[Double]` on `String` (`None` on any malformed or out-of-range input; no exceptions, no partial parses)
   - `o.is_some()`, `o.is_none()`, `o.unwrap_or(default)` on `Option[T]`
   - `r.is_ok()`, `r.is_err()`, `r.unwrap_or(default)` on `Result[T, E]`
-- Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..`, postfix `?`.
+- Operators: `+`, `-`, `*`, `/`, `%`, `==`, `!=`, `<`, `<=`, `>`, `>=`, `&&`, `||`, `!`, `&`, `|`, `^`, `<<`, `>>`, unary `-`, range `..` / `..<` / `..=`, pipe `|>`, pattern test `is`, compound assign `+=`/`-=`/`*=`/`/=`/`%=`/`&=`/`|=`/`^=`, postfix `?`.
 - Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `Double`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T` (checked at every instantiation: a type parameter compared with `==`/`!=` in a generic body, directly or through generic callers, must be instantiated with one of these types, else `E_TYPE_MISMATCH` at the call site; such generics are monomorphized so `String` compares bytes and payload-less enums compare tags), and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, `struct`, `Array`, `Map`, `Bytes`, tuples and payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
 - Must-use `Result`: an expression statement whose type is `Result[T, E]` and whose value is discarded — any non-tail statement of a block, or the tail statement of a loop or `test` body — is a compile-time error (`E_UNHANDLED_RESULT`, fix-it "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`"). `let _ = expr` discards explicitly; a block's tail value returned to its function or branch is not discarded.
 

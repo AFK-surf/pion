@@ -49,14 +49,18 @@ int64_t c_helper_val(void) {
 }
 EOF
 
-# 4. C++ stub in sub-package using std::string + extern "C"
+# 4. C++ stub in sub-package using std::string + extern "C" + #include "pion_rt.h"
 cat > "$LIB_DIR/csrc/cxx_shim.cc" <<'EOF'
 #include <cstdint>
 #include <string>
+#include "pion_rt.h"
 
 extern "C" int64_t cxx_str_len(int64_t extra) {
     std::string s = "hello_cxx";
-    return static_cast<int64_t>(s.size()) + extra;
+    void *ps = pion_str_from_cstr(s.c_str(), static_cast<int64_t>(s.size()));
+    int64_t n = pion_str_len(ps);
+    pion_rc_dec(ps);
+    return n + extra;
 }
 EOF
 

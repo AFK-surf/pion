@@ -2206,3 +2206,37 @@ test "p26b_generic_method_option_mono_and_cross_pkg_export_internals" {
   assert_true(app_ssa.contains("__mono_String("), app_ssa)
   assert_true(app_ssa.contains("__mono_Int("), app_ssa)
 }
+
+///|
+test "p27a_bug4_tuple_niche_and_numeric_qbe_ir" {
+  let src =
+    #|struct Node { id : Int }
+    #|pub fn mk_none(n : Node) -> (Node, Option[Node]) {
+    #|  (n, None)
+    #|}
+    #|pub fn num_ops(a : Int, b : Int64, d : Double) -> Double {
+    #|  let x = a.to_double() + b.to_double()
+    #|  let bits = d.to_bits()
+    #|  let d2 = Double::from_bits(bits)
+    #|  let _k = d2.to_int64() + a.abs().to_int64() + b.abs()
+    #|  x + d2.sqrt() + d2.round() + d2.trunc()
+    #|}
+    #|pub fn map_clr(m : Map[String, Int]) -> Unit {
+    #|  m.clear()
+    #|}
+  let cr = @core.check_source_files_with_imports("p27a", ["main.pion"], [src], [], false)
+  assert_true(cr.diagnostics.length() == 0, @core.check_result_to_json(cr.diagnostics))
+  let ssa = @core.emit_qbe_package_multi(cr.pkg, cr.tc, false, false, []).ssa
+  // Bug #4: `(n, None)` for `(Node, Option[Node])` must store null-niche 0, never $pion_none_hdr
+  assert_true(!ssa.contains("$pion_none_hdr"), "expected null-niche 0 for (Node, Option[Node]), got $pion_none_hdr:\n" + ssa)
+  // Zero-byte numeric IR instructions
+  assert_true(ssa.contains("=d swtof "), ssa)
+  assert_true(ssa.contains("=d sltof "), ssa)
+  assert_true(ssa.contains("=l cast "), ssa)
+  assert_true(ssa.contains("=d cast "), ssa)
+  assert_true(ssa.contains("=l dtosi "), ssa)
+  assert_true(ssa.contains("=d sqrt "), ssa)
+  assert_true(ssa.contains("call $round("), ssa)
+  assert_true(ssa.contains("call $trunc("), ssa)
+  assert_true(ssa.contains("call $pion_map_clear("), ssa)
+}
