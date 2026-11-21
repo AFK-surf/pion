@@ -1786,7 +1786,7 @@ PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void 
 
     pion_thread_t th;
 #ifdef _WIN32
-    uintptr_t h = _beginthreadex(NULL, 0, pion_spawn_trampoline, task, 0, NULL);
+    uintptr_t h = _beginthreadex(NULL, 8u * 1024u * 1024u, pion_spawn_trampoline, task, 0, NULL);
     if (h == 0) {
         free(task);
         if (env) pion_rc_dec(env);

@@ -478,4 +478,85 @@ if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
   fi
 fi
 
-echo "[PASS] p27c1_crosspkg_clo_intmap_eq (Bug #6 + Bug #7 + Map[Int/Int64, V] + #derive(Eq) + Bug #7b + ASan/LSan)"
+# Bug #8: unannotated `let out = []` / `Map([])` must take their element type from the
+# first push/set (or the return type) so the array/map owns (rc) heap elements;
+# before the fix it was `pion_arr_new(0, 0)` -> dangling strings / double free.
+cat > "$TMP_DIR/bug8.pion" <<'EOF'
+fn collect(n : Int) -> Array[String] {
+  let out = []
+  let mut i = 0
+  while i < n {
+    let s = "item-" + i.to_string()
+    out.push(s)
+    i += 1
+  }
+  out
+}
+
+fn nested(n : Int) -> Array[Array[String]] {
+  let rows = []
+  let mut i = 0
+  while i < n {
+    rows.push(collect(i % 4 + 1))
+    i += 1
+  }
+  rows
+}
+
+fn index(n : Int) -> Map[String, Array[String]] {
+  let m = Map([])
+  let mut i = 0
+  while i < n {
+    m.set("k" + i.to_string(), collect(2))
+    i += 1
+  }
+  m
+}
+
+fn main(world : World) -> Unit {
+  let mut total = 0
+  let mut round = 0
+  while round < 8 {
+    let xs = collect(64)
+    let mut i = 0
+    while i < xs.length() {
+      total += xs[i].length()
+      i += 1
+    }
+    let rows = nested(16)
+    total += rows[15][3].length()
+    let m = index(16)
+    total += m["k15"][1].length()
+    // No return witness: element type comes from the first push only.
+    let tags = []
+    let mut j = 0
+    while j < 8 {
+      tags.push("t" + j.to_string())
+      j += 1
+    }
+    total += tags[7].length()
+    round += 1
+  }
+  io_println(world, "p29b2_bug8 ok " + total.to_string() + " " + collect(64)[63])
+}
+EOF
+
+B8_EXPECT="p29b2_bug8 ok 3616 item-63"
+B8_OUT=$(PION_CACHE_DIR="$CAS_DIR/bug8" "$PIONC" run "$TMP_DIR/bug8.pion")
+echo "p29b2_bug8 -> $B8_OUT"
+if [ "$B8_OUT" != "$B8_EXPECT" ]; then
+  echo "FAIL: p29b2_bug8 output mismatch: $B8_OUT" >&2
+  exit 1
+fi
+if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
+  PION_CACHE_DIR="$CAS_DIR/bug8_asan" "$PIONC" build --emit-obj "$TMP_DIR/bug8.o" "$TMP_DIR/bug8.pion"
+  "$CC_BIN" -fsanitize=address "$TMP_DIR/bug8.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/bug8_asan"
+  B8_ASAN_OUT=$("$TMP_DIR/bug8_asan")
+  echo "p29b2_bug8_asan -> $B8_ASAN_OUT"
+  if [ "$B8_ASAN_OUT" != "$B8_EXPECT" ]; then
+    echo "FAIL: p29b2_bug8_asan output mismatch: $B8_ASAN_OUT" >&2
+    exit 1
+  fi
+fi
+
+echo "[PASS] p27c1_crosspkg_clo_intmap_eq (Bug #6 + Bug #7 + Map[Int/Int64, V] + #derive(Eq) + Bug #7b + Bug #8 + ASan/LSan)"

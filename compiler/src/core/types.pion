@@ -258,6 +258,14 @@ pub struct TypeChecker {
   eq_uses : Array[EqUse]
   /// Dedup keys of machine-applicable edits already attached.
   edit_keys : Map[String, Bool]
+  /// `span_key` of an unannotated `let x = []` / `Map([])` -> the collection
+  /// type inferred for it (read by codegen, which shares this checker).
+  let_infer : Map[String, Ty]
+  /// `span_key`s of such `let`s whose element type is still unknown.
+  infer_pending : Map[String, Bool]
+  /// Argument types of the `push` / `set` just checked on a collection with an
+  /// unknown element type (consumed by the enclosing method call).
+  infer_hit : Array[Ty]
 }
 
 ///|
@@ -3102,16 +3110,336 @@ fn check_stmts_ex(
   }
   let mut i = 0
   let mut last_ty = TUnit
+  let pending_keys : Array[String] = []
+  let pending_lets : Array[Stmt] = []
   while i < stmts.length() {
     let is_last = i == stmts.length() - 1
     let exp = if is_last { expected } else { None }
-    last_ty = check_stmt(tc, env, stmts[i], exp)
+    match stmts[i] {
+      SLet(name, is_mut, TyMissing(tsp), init, sp) =>
+        if name != "_" && infer_empty_kind(init) != 0 {
+          let hint = infer_let_hint(env, stmts, i, name, expected, tail_used)
+          last_ty = check_let(tc, env, name, is_mut, TyMissing(tsp), init, sp, hint)
+          if tc.infer_pending.contains(span_key(sp)) {
+            pending_keys.push(span_key(sp))
+            pending_lets.push(stmts[i])
+          }
+        } else {
+          last_ty = check_stmt(tc, env, stmts[i], exp)
+        }
+      _ => last_ty = check_stmt(tc, env, stmts[i], exp)
+    }
     if !is_last || !tail_used {
       check_unhandled_result(tc, stmts[i], last_ty)
     }
     i = i + 1
   }
+  let mut pi = 0
+  while pi < pending_keys.length() {
+    if tc.infer_pending.contains(pending_keys[pi]) {
+      tc.infer_pending.remove(pending_keys[pi])
+      match pending_lets[pi] {
+        SLet(name, _, _, init, sp) => infer_missing_type_err(tc, name, init, sp)
+        _ => ()
+      }
+    }
+    pi = pi + 1
+  }
   last_ty
+}
+
+///|
+/// 1 for an empty array initializer (`[]`, `Array::new()`), 2 for an empty map
+/// (`Map([])`, `Map()`, `Map::new()`), 0 otherwise.
+fn infer_empty_kind(init : Expr) -> Int {
+  match init {
+    EArrayLit(elems, _) => if elems.length() == 0 { 1 } else { 0 }
+    ECall(EIdent("Map", _), args, _) =>
+      if args.length() == 0 {
+        2
+      } else if args.length() == 1 {
+        match args[0] {
+          EArrayLit(elems, _) => if elems.length() == 0 { 2 } else { 0 }
+          _ => 0
+        }
+      } else {
+        0
+      }
+    ECall(EPath("Map", "new", _), args, _) => if args.length() == 0 { 2 } else { 0 }
+    ECall(EPath("Array", "new", _), args, _) => if args.length() == 0 { 1 } else { 0 }
+    _ => 0
+  }
+}
+
+///|
+fn infer_kind_fits(kind : Int, t : Ty) -> Bool {
+  if ty_has_unresolved(t) {
+    return false
+  }
+  match t {
+    TArray(_) | TFixedArray(_) => kind == 1
+    TMap(_, _) => kind == 2
+    _ => false
+  }
+}
+
+///|
+/// Type an unannotated empty collection `let` takes from how it leaves its
+/// block: the block's tail expression is `name` (block type `expected`), or a
+/// later `return name` (the enclosing fn's return type). Pushes are handled
+/// later by refinement on the first `push` / `set`.
+fn infer_let_hint(
+  env : Env,
+  stmts : Array[Stmt],
+  idx : Int,
+  name : String,
+  expected : Option[Ty],
+  tail_used : Bool,
+) -> Option[Ty] {
+  let kind = infer_empty_kind(
+    match stmts[idx] {
+      SLet(_, _, _, init, _) => init
+      _ => EUnit(span_empty())
+    },
+  )
+  let last = stmts.length() - 1
+  if tail_used && last > idx && !infer_stmts_shadow(stmts, idx + 1, last, name) {
+    match stmts[last] {
+      SExpr(EIdent(n, _), _) =>
+        if n == name {
+          match expected {
+            Some(t) => if infer_kind_fits(kind, t) { return Some(t) }
+            None => ()
+          }
+        }
+      _ => ()
+    }
+  }
+  if infer_kind_fits(kind, env.ret_ty) &&
+    infer_stmts_return(stmts, idx + 1, name) {
+    return Some(env.ret_ty)
+  }
+  None
+}
+
+///|
+/// Whether `stmts[from..to)` rebinds `name` (so later uses refer elsewhere).
+fn infer_stmts_shadow(
+  stmts : Array[Stmt],
+  from : Int,
+  to : Int,
+  name : String,
+) -> Bool {
+  let mut i = from
+  while i < to {
+    if infer_stmt_binds(stmts[i], name) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn infer_stmt_binds(st : Stmt, name : String) -> Bool {
+  match st {
+    SLet(n, _, _, _, _) => n == name
+    SLetTuple(ns, _, _, _) => str_arr_contains(ns, name)
+    _ => false
+  }
+}
+
+///|
+/// Whether `stmts[from..]` contains `return name` for this binding (descending
+/// into nested blocks, branches and loops, not closures; stops at a rebinding).
+fn infer_stmts_return(stmts : Array[Stmt], from : Int, name : String) -> Bool {
+  let mut i = from
+  while i < stmts.length() {
+    let st = stmts[i]
+    match st {
+      SReturn(Some(EIdent(n, _)), _) => if n == name { return true }
+      SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) =>
+        if infer_expr_return(init, name) {
+          return true
+        }
+      SAssign(_, rhs, _) | SCompoundAssign(_, _, rhs, _) =>
+        if infer_expr_return(rhs, name) {
+          return true
+        }
+      SGuard(c, body, _) | SWhile(c, body, _) =>
+        if infer_expr_return(c, name) || infer_stmts_return(body, 0, name) {
+          return true
+        }
+      SFor(_, c, _, body, _) =>
+        if infer_expr_return(c, name) || infer_stmts_return(body, 0, name) {
+          return true
+        }
+      SForRange(v, _, _, _, body, _) =>
+        if v != name && infer_stmts_return(body, 0, name) {
+          return true
+        }
+      SForIn(k, v, _, body, _) =>
+        if k != name && v != name && infer_stmts_return(body, 0, name) {
+          return true
+        }
+      SExpr(e, _) => if infer_expr_return(e, name) { return true }
+      _ => ()
+    }
+    if infer_stmt_binds(st, name) {
+      return false
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn infer_expr_return(e : Expr, name : String) -> Bool {
+  match e {
+    EBlock(stmts, _) => infer_stmts_return(stmts, 0, name)
+    EIf(c, then_s, else_e, _) =>
+      infer_expr_return(c, name) ||
+      infer_stmts_return(then_s, 0, name) ||
+      (match else_e {
+        Some(el) => infer_expr_return(el, name)
+        None => false
+      })
+    EMatch(scrut, arms, _) => {
+      if infer_expr_return(scrut, name) {
+        return true
+      }
+      let mut ai = 0
+      while ai < arms.length() {
+        if infer_expr_return(arms[ai].body, name) {
+          return true
+        }
+        ai = ai + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn infer_missing_type_err(
+  tc : TypeChecker,
+  name : String,
+  init : Expr,
+  sp : Span,
+) -> Unit {
+  if infer_empty_kind(init) == 2 {
+    tc_err(
+      tc,
+      sp,
+      "E_MISSING_TYPE",
+      "cannot infer the key/value types of empty map `" + name + "`",
+      "Map[K, V]",
+      "Map[?, ?]",
+      "annotate it (`let " + name + " : Map[K, V] = Map([])`), or `set` an entry / return it as `Map[K, V]` in the same block",
+    )
+  } else {
+    tc_err(
+      tc,
+      sp,
+      "E_MISSING_TYPE",
+      "cannot infer the element type of empty array `" + name + "`",
+      "Array[T]",
+      "Array[?]",
+      "annotate it (`let " + name + " : Array[T] = []`), or `push` a value / return it as `Array[T]` in the same block",
+    )
+  }
+}
+
+///|
+/// After a method call on `obj`: an unannotated empty collection binding whose
+/// element type was unknown takes it from the first `push` / `set`.
+fn infer_refine_call(
+  tc : TypeChecker,
+  env : Env,
+  obj : Expr,
+  recv_ty : Ty,
+  method_name : String,
+) -> Unit {
+  if tc.infer_hit.length() == 0 {
+    return
+  }
+  let hit : Array[Ty] = []
+  let mut hi = 0
+  while hi < tc.infer_hit.length() {
+    hit.push(tc.infer_hit[hi])
+    hi = hi + 1
+  }
+  tc.infer_hit.clear()
+  let new_ty = match recv_ty {
+    TArray(_) => if method_name == "push" && hit.length() == 1 { TArray(hit[0]) } else { TError }
+    TMap(_, _) =>
+      if method_name == "set" && hit.length() == 2 {
+        TMap(hit[0], hit[1])
+      } else {
+        TError
+      }
+    _ => TError
+  }
+  match obj {
+    EIdent(n, _) => infer_refine_binding(tc, env, n, new_ty)
+    _ => ()
+  }
+}
+
+///|
+fn infer_refine_binding(tc : TypeChecker, env : Env, name : String, new_ty : Ty) -> Unit {
+  if ty_has_unresolved(new_ty) || ty_contains_never(new_ty) {
+    return
+  }
+  let mut i = env.scopes.length() - 1
+  while i >= 0 {
+    match env.scopes[i].get(name) {
+      Some(b) => {
+        let key = span_key(b.decl_span)
+        if b.decl_span.line > 0 && tc.infer_pending.contains(key) {
+          tc.infer_pending.remove(key)
+          tc.let_infer.set(key, new_ty)
+          env.scopes[i].set(name, VarBinding::{
+            name: b.name,
+            ty: new_ty,
+            is_mut: b.is_mut,
+            decl_span: b.decl_span,
+            ty_span: b.ty_span,
+            ty_end_col: b.ty_end_col,
+            init_span: b.init_span,
+            init_end_col: b.init_end_col,
+          })
+        }
+        return
+      }
+      None => ()
+    }
+    i = i - 1
+  }
+}
+
+///|
+fn infer_map_pending(tc : TypeChecker, env : Env, name : String) -> Bool {
+  match env_lookup(env, name) {
+    Some(b) =>
+      match b.ty {
+        TMap(_, _) =>
+          b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span))
+        _ => false
+      }
+    None => false
+  }
+}
+
+///|
+fn ty_contains_never(t : Ty) -> Bool {
+  match t {
+    TNever => true
+    TArray(e) | TFixedArray(e) => ty_contains_never(e)
+    TMap(k, v) => ty_contains_never(k) || ty_contains_never(v)
+    _ => false
+  }
 }
 
 ///|
@@ -3295,6 +3623,87 @@ fn check_cond_with_bindings(
 }
 
 ///|
+/// `hint` types an unannotated empty collection initializer (from how the
+/// binding leaves its block); without one such a binding stays pending until
+/// its first `push` / `set` (`infer_refine_call`).
+fn check_let(
+  tc : TypeChecker,
+  env : Env,
+  name : String,
+  is_mut : Bool,
+  ty_expr : TypeExpr,
+  init : Expr,
+  sp : Span,
+  hint : Option[Ty],
+) -> Ty {
+  let ann_opt : Option[Ty] = match ty_expr {
+    TyMissing(_) => None
+    _ => Some(resolve_type_expr(tc, ty_expr, env.type_params))
+  }
+  let exp = match ann_opt {
+    Some(_) => ann_opt
+    None => hint
+  }
+  let init_ty = check_expr(tc, env, init, exp)
+  let mut final_ty = match ann_opt {
+    Some(ann) => {
+      if !ty_compat(ann, init_ty) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "type mismatch in `let " + name + "`",
+          ty_to_string(ann),
+          ty_to_string(init_ty),
+          "change the initializer or the type annotation to `" +
+          ty_to_string(ann) +
+          "`",
+        )
+      }
+      ann
+    }
+    None => init_ty
+  }
+  match ann_opt {
+    None =>
+      if name != "_" {
+        let kind = infer_empty_kind(init)
+        if kind != 0 {
+          if !ty_has_unresolved(final_ty) {
+            tc.let_infer.set(span_key(sp), final_ty)
+          } else {
+            tc.infer_pending.set(span_key(sp), true)
+            final_ty = if kind == 2 { TMap(TError, TError) } else { TArray(TError) }
+          }
+        }
+      }
+    Some(_) => ()
+  }
+  if name != "_" {
+    let ty_sp = match ty_expr {
+      TyMissing(_) => span_empty()
+      _ => type_expr_span(ty_expr)
+    }
+    let ty_ec = match ty_expr {
+      TyMissing(_) => -1
+      _ => type_expr_end_col(ty_expr)
+    }
+    env_define_let(
+      env,
+      name,
+      final_ty,
+      is_mut,
+      sp,
+      ty_sp,
+      ty_ec,
+      expr_span(init),
+      expr_end_col(init),
+    )
+  }
+  TUnit
+}
+
+///|
 fn check_stmt(
   tc : TypeChecker,
   env : Env,
@@ -3302,54 +3711,8 @@ fn check_stmt(
   expected : Option[Ty],
 ) -> Ty {
   match stmt {
-    SLet(name, is_mut, ty_expr, init, sp) => {
-      let ann_opt : Option[Ty] = match ty_expr {
-        TyMissing(_) => None
-        _ => Some(resolve_type_expr(tc, ty_expr, env.type_params))
-      }
-      let init_ty = check_expr(tc, env, init, ann_opt)
-      let final_ty = match ann_opt {
-        Some(ann) => {
-          if !ty_compat(ann, init_ty) {
-            tc_err(
-              tc,
-              sp,
-              "E_TYPE_MISMATCH",
-              "type mismatch in `let " + name + "`",
-              ty_to_string(ann),
-              ty_to_string(init_ty),
-              "change the initializer or the type annotation to `" +
-              ty_to_string(ann) +
-              "`",
-            )
-          }
-          ann
-        }
-        None => init_ty
-      }
-      if name != "_" {
-        let ty_sp = match ty_expr {
-          TyMissing(_) => span_empty()
-          _ => type_expr_span(ty_expr)
-        }
-        let ty_ec = match ty_expr {
-          TyMissing(_) => -1
-          _ => type_expr_end_col(ty_expr)
-        }
-        env_define_let(
-          env,
-          name,
-          final_ty,
-          is_mut,
-          sp,
-          ty_sp,
-          ty_ec,
-          expr_span(init),
-          expr_end_col(init),
-        )
-      }
-      TUnit
-    }
+    SLet(name, is_mut, ty_expr, init, sp) =>
+      check_let(tc, env, name, is_mut, ty_expr, init, sp, None)
     SLetTuple(names, ty_expr, init, sp) => {
       let ann_opt : Option[Ty] = match ty_expr {
         TyMissing(_) => None
@@ -3463,6 +3826,11 @@ fn check_stmt(
               env_define(env, name, rty, true)
             }
           }
+        EIndex(EIdent(mname, _), kexpr, _) if infer_map_pending(tc, env, mname) => {
+          let kty = check_expr(tc, env, kexpr, None)
+          let rty = check_expr(tc, env, rhs, None)
+          infer_refine_binding(tc, env, mname, TMap(kty, rty))
+        }
         _ => {
           let lty = check_expr(tc, env, lhs, None)
           let rty = check_expr(tc, env, rhs, Some(lty))
@@ -4992,6 +5360,10 @@ fn check_method_call(
               "push a value of type `" + ty_to_string(elem) + "`",
             )
           }
+          if ty_has_unresolved(elem) {
+            tc.infer_hit.clear()
+            tc.infer_hit.push(aty)
+          }
         }
         return TUnit
       }
@@ -5181,6 +5553,11 @@ fn check_method_call(
               ty_to_string(av),
               "use a value of type `" + ty_to_string(vty) + "`",
             )
+          }
+          if ty_has_unresolved(kty) || ty_has_unresolved(vty) {
+            tc.infer_hit.clear()
+            tc.infer_hit.push(ak)
+            tc.infer_hit.push(av)
           }
         }
         return TUnit
@@ -6833,7 +7210,10 @@ fn check_expr_inner(
     }
     EMethodCall(obj, method_name, args, sp) => {
       let oty = check_expr(tc, env, obj, None)
-      check_method_call(tc, env, oty, method_name, args, expected, sp)
+      tc.infer_hit.clear()
+      let rty = check_method_call(tc, env, oty, method_name, args, expected, sp)
+      infer_refine_call(tc, env, obj, oty, method_name)
+      rty
     }
     EIndex(obj, idx, sp) => {
       let oty = check_expr(tc, env, obj, None)
@@ -7561,6 +7941,9 @@ pub fn check_package_with_imports(
     eq_keys: [],
     eq_uses: [],
     edit_keys: Map([]),
+    let_infer: Map([]),
+    infer_pending: Map([]),
+    infer_hit: [],
   }
 
   let mut ipi = 0

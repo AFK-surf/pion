@@ -51,7 +51,7 @@ gzip -dc "$ROOT_DIR/bootstrap/pionc-seed.ssa.gz" > "$SEED_SSA"
 T_B0="$(now_ms)"
 "$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/pionc_win.s" "$SEED_SSA"
 "$CC" -c "$TMP_DIR/pionc_win.s" -o "$OUT_DIR/pionc_win.o"
-"$CC" "$OUT_DIR/pionc_win.o" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -o "$OUT_DIR/pionc_win.exe"
+"$CC" "$OUT_DIR/pionc_win.o" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$OUT_DIR/pionc_win.exe"
 T_B1="$(now_ms)"
 PIONC_SIZE="$(wc -c < "$OUT_DIR/pionc_win.exe" | tr -d ' ')"
 echo "Native Windows x86_64 pionc_win.exe: assemble+link=$((T_B1 - T_B0))ms, size=${PIONC_SIZE} bytes"
@@ -62,13 +62,24 @@ export PION_RT_LIB="$OUT_DIR/libpionrt.a"
 export PION_CACHE_DIR="$TMP_DIR/cas_win"
 mkdir -p "$PION_CACHE_DIR"
 
+echo "=== [3.5/5] Windows single-file smoke (check + run) before Stage 3 ==="
+"$OUT_DIR/pionc_win.exe" check --json "$ROOT_DIR/tests/frontend/ok_full.pion"
+echo
+HELLO_OUT="$("$OUT_DIR/pionc_win.exe" run "$ROOT_DIR/tests/e2e/hello.pion" | tr -d '\r')"
+echo "pionc_win run hello -> $HELLO_OUT"
+
 echo "=== [4/5] Windows Native Self-Hosting Fixed-Point (Stage 3 == Stage 4) ==="
+# The seed's driver predates amd64_win linking (it links `-lm -lpthread`, no
+# `-lws2_32`, no `--stack`), so Stage 3 stops at the object and links it here with
+# the same flags this tree's driver uses for amd64_win; Stage 4 links itself.
 T_S3_0="$(now_ms)"
 (cd "$ROOT_DIR" && PION_TARGET="amd64_win" "$OUT_DIR/pionc_win.exe" build \
   --emit-ssa "$TMP_DIR/win_stage3.ssa" \
-  -o "$TMP_DIR/pionc_win_s3.exe" \
+  --emit-obj "$TMP_DIR/pionc_win_s3.o" \
   compiler/src/core \
   compiler/src/cli/main.pion)
+"$CC" "$TMP_DIR/pionc_win_s3.o" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -Wl,--stack,16777216 \
+  -o "$TMP_DIR/pionc_win_s3.exe"
 T_S3_1="$(now_ms)"
 S3_SIZE="$(wc -c < "$TMP_DIR/pionc_win_s3.exe" | tr -d ' ')"
 echo "Windows x86_64 native self-host Stage 3: build=$((T_S3_1 - T_S3_0))ms, binary=${S3_SIZE} bytes"

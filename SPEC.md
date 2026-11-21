@@ -36,7 +36,7 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
    - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly for `arm64_apple` (Mach-O arm64) and `amd64_sysv` (ELF64 x86-64) with no `as`; all other targets (`amd64_apple`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`) lower via `qbe -t <arch>` → target `cc -c` → `ld`/`cc` + prebuilt `<64 KB` `libpionrt.a`. `--emit-asm` or `PION_NO_DIRECT_OBJ=1` falls back to `qbe` text + assembler.
    - **Multi-target & library outputs**:
      - Host auto-detection (`$PION_TARGET`, else `$OS == Windows_NT`, else `uname -sm`): macOS ARM64 (`arm64_apple`), macOS x86_64 (`amd64_apple`), Linux x86_64 (`amd64_sysv`), Linux ARM64 (`arm64`), Linux RISC-V 64 (`rv64`), Windows x86_64 (`amd64_win`).
-     - Cross targets: `--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64`, with optional `--sysroot <dir>` (`-isysroot` on Apple, `--sysroot=` on ELF; iOS auto-probes `xcrun --sdk iphoneos|iphonesimulator --show-sdk-path`; Android honors `$PION_ANDROID_CC` / `$ANDROID_NDK_HOME`; Windows auto-links `-lws2_32` and omits `-fPIC`/`-rpath`).
+     - Cross targets: `--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64`, with optional `--sysroot <dir>` (`-isysroot` on Apple, `--sysroot=` on ELF; iOS auto-probes `xcrun --sdk iphoneos|iphonesimulator --show-sdk-path`; Android honors `$PION_ANDROID_CC` / `$ANDROID_NDK_HOME`; Windows auto-links `-lws2_32`, links executables with a 16 MB main-thread stack (`-Wl,--stack,16777216`; MinGW defaults to 1 MB), spawns `scope` threads with 8 MB stacks, and omits `-fPIC`/`-rpath`).
      - Artifact modes: `--emit-obj <out.o>`, `--emit-staticlib <out.a>` (`ar rcs` of package + `c_sources` `.o`), `--emit-cdylib <out.so|.dylib>` (`-dynamiclib` on Apple, `-shared` + `-fPIC` on Linux/Android), `--emit-asm <out.s>` (skips assembly when no link/object artifact is requested).
    - **Native libraries**: `-l <lib>` / `-l<lib>` / `--link <lib>` on `build`/`run`/`test`, plus `[link] libs = [...]` in `pion.toml` (dependencies first, de-duplicated) add `-l<lib>` to the link; the list is part of the binary's cache key.
    - **Release backend** (`--release`): the same embedded QBE pipeline (no LLVM, no separate optimizing toolchain) with release-mode IL, stripping `debug_assert`.
@@ -148,6 +148,7 @@ test "test name" {
 
 ### 3.3 Statements & Expressions
 - `let x = expr` / `let x : Type = expr` / `let mut x = expr`
+  - An unannotated empty collection (`let xs = []`, `Array::new()`, `let m = Map([])`, `Map()`, `Map::new()`) takes its type, within its own block, from (1) the block's tail expression `xs` (the block's expected type) or a later `return xs` (the enclosing function's return type) when that is `Array[T]` / `FixedArray[T]` / `Map[K, V]`, else (2) the first `xs.push(v)` → `Array[typeof v]`, `m.set(k, v)` / `m[k] = v` → `Map[typeof k, typeof v]` (later uses are checked against it). A rebinding of the same name ends the search. If none applies, it is `E_MISSING_TYPE` ("cannot infer the element type of empty array `xs`" / "... key/value types of empty map `m`") — never a silently untyped collection. Codegen reuses the checker's inferred type, so heap elements are always owned (`pion_arr_new(n, 1)`).
 - Tuple destructuring & element indexing: `let (a, b) = expr` / `let (a, _, c) : (T1, T2, T3) = expr` (`_` ignores an element), and `t.0` / `t.1` tuple element access; tuple literals propagate element expected types (`(n, None)` as `(Node, Option[Node])` uses null-niche `0`)
 - Assignment & compound assignment: `x = expr`, `obj.field = expr`, `arr[i] = expr`, and `+=`, `-=`, `*=`, `/=`, `%=`, `&=`, `|=`, `^=`, `<<=`, `>>=` (receiver/index evaluated once; `+=` also supports `String` concatenation)
 - Struct literals: field shorthand `Foo::{ x, y }` and functional update `Foo::{ ..base, x: 1 }` (copies non-overridden fields with RC retention)
@@ -427,7 +428,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   - `E_NOT_SEND` — a captured non-`Send` local: wraps its declaration in `Mutex::new(...)` (and its type annotation in `Mutex[...]`), or prefixes the capture with `move` where ownership transfer fits. Uses of the binding inside the closure are left as they are and may need a second step (e.g. `with_lock`).
   - `E_UNHANDLED_RESULT` — prefixes the discarded statement with `let _ = `.
   - `E_CAPABILITY_MISSING` — inserts `world : World` as the first parameter of the enclosing function; its call sites then report the arity and need a second step passing `world`.
-  - `E_MISSING_TYPE` — inserts the inferred return type (`-> T`).
+  - `E_MISSING_TYPE` — inserts the inferred return type (`-> T`) (no edit for an uninferable empty `let` collection: the fix-it names the annotation to add).
   - `E_TYPE_MISMATCH` "cannot assign to immutable variable" — `let x` → `let mut x` at the declaration.
 
 ### 5.2 `pionc query <kind> --json <path>`
