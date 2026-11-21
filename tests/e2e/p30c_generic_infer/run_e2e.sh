@@ -429,4 +429,133 @@ if command -v node >/dev/null 2>&1; then
   fi
 fi
 
+# Bug #19: 3-package chain (pkg_c -> pkg_b -> pkg_a) with alias import and all 5 default arg forms
+B19_DIR="$TMP_DIR/b19_ws"
+mkdir -p "$B19_DIR/pkg_a/src" "$B19_DIR/pkg_b/src" "$B19_DIR/pkg_c/src"
+
+cat > "$B19_DIR/pkg_a/pion.toml" <<'EOF'
+[package]
+name = "pkg_a"
+version = "0.1.0"
+EOF
+
+cat > "$B19_DIR/pkg_a/src/lib.pion" <<'EOF'
+pub fn base_val() -> Double {
+  12.5
+}
+EOF
+
+cat > "$B19_DIR/pkg_b/pion.toml" <<'EOF'
+[package]
+name = "pkg_b"
+version = "0.1.0"
+
+[dependencies]
+pkg_a = { path = "../pkg_a" }
+EOF
+
+cat > "$B19_DIR/pkg_b/src/lib.pion" <<'EOF'
+import "pkg_a"
+
+pub enum Side {
+  Top
+  Bottom
+}
+
+pub enum Pivot {
+  Center
+  At(Double, Double)
+}
+
+pub enum Along {
+  Start
+  Middle
+  End
+}
+
+let flag_a : Int = 1
+let flag_b : Int = 4
+
+pub struct Widget {
+  pub id : Int
+}
+
+pub fn make_val(
+  side~ : Side = Bottom,
+  about~ : Pivot = At(0.5, 0.5),
+  along~ : Along = Along::Middle,
+  mask~ : Int = flag_a | flag_b,
+  bound~ : () -> Double = fn() { pkg_a::base_val() },
+) -> Double {
+  let s = match side {
+    Top => 1.0
+    Bottom => 2.0
+  }
+  let p = match about {
+    Center => 0.0
+    At(x, y) => x + y
+  }
+  let a = match along {
+    Start => 10.0
+    Middle => 20.0
+    End => 30.0
+  }
+  s + p + a + mask.to_double() + bound()
+}
+
+pub fn Widget::score(
+  self : Widget,
+  side~ : Side = Bottom,
+  about~ : Pivot = At(0.5, 0.5),
+  along~ : Along = Along::Middle,
+  mask~ : Int = flag_a | flag_b,
+  bound~ : () -> Double = fn() { pkg_a::base_val() },
+) -> Double {
+  self.id.to_double() +
+  make_val(side=side, about=about, along=along, mask=mask, bound=bound)
+}
+EOF
+
+cat > "$B19_DIR/pkg_c/pion.toml" <<'EOF'
+[package]
+name = "pkg_c"
+version = "0.1.0"
+
+[dependencies]
+pkg_b = { path = "../pkg_b" }
+EOF
+
+cat > "$B19_DIR/pkg_c/src/main.pion" <<'EOF'
+import "pkg_b" as b
+
+pub fn main(world : World) -> Int {
+  // Expected: make_val() = 2.0 + 1.0 + 20.0 + 5.0 + 12.5 = 40.5
+  let v1 = b::make_val()
+  debug_assert(v1 == 40.5, "bug19 make_val default args")
+  let w = b::Widget::{ id: 3 }
+  let v2 = w.score()
+  debug_assert(v2 == 43.5, "bug19 Widget::score default args")
+  io_println(world, "p30c_bug19_defaults ok")
+  0
+}
+EOF
+
+B19_OUT=$("$PIONC" run "$B19_DIR/pkg_c")
+echo "p30c_bug19_defaults native -> $B19_OUT"
+if [ "$B19_OUT" != "p30c_bug19_defaults ok" ]; then
+  echo "FAIL: p30c_bug19_defaults native output mismatch" >&2
+  exit 1
+fi
+
+if command -v node >/dev/null 2>&1; then
+  B19_WASM="$TMP_DIR/b19_defaults.wasm"
+  "$PIONC" build --target wasm32 -o "$B19_WASM" "$B19_DIR/pkg_c"
+  B19_WASM_OUT=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$B19_WASM")
+  echo "p30c_bug19_defaults wasm32 -> $B19_WASM_OUT"
+  if [ "$B19_WASM_OUT" != "p30c_bug19_defaults ok" ]; then
+    echo "FAIL: p30c_bug19_defaults wasm32 output mismatch" >&2
+    exit 1
+  fi
+fi
+
 echo "p30c_generic_infer: ALL PASSED"

@@ -208,6 +208,8 @@ pub struct Env {
   mut closure_scope_floor : Int
   /// Return type inferred from `return expr` statements inside an unannotated closure.
   mut inferred_ret : Option[Ty]
+  /// True while checking a callee's default parameter expression (allows transitive/package-private symbols).
+  mut in_default_arg : Bool
 }
 
 ///|
@@ -255,6 +257,7 @@ pub struct TypeChecker {
   const_pub : Map[String, Bool]
   import_aliases : Map[String, String]
   imported_pkgs : Map[String, ImportedPkg]
+  imported_pkg_names : Array[String]
   diagnostics : Array[Diagnostic]
   /// Generic fn decl key -> type params its body compares with `==` / `!=`.
   eq_tparams : Map[String, Array[String]]
@@ -307,6 +310,7 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     fn_has_params: false,
     closure_scope_floor: 0,
     inferred_ret: None,
+    in_default_arg: false,
   }
 }
 
@@ -506,15 +510,393 @@ pub fn qualify_imported_ty(pkg_name : String, t : Ty) -> Ty {
 }
 
 ///|
-fn qualify_fn_info(pkg_name : String, fi : FnInfo) -> FnInfo {
+fn str_arr_clone(arr : Array[String]) -> Array[String] {
+  let out : Array[String] = []
+  let mut i = 0
+  while i < arr.length() {
+    out.push(arr[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qualify_pat_bindings(pat : Pattern, bound : Array[String]) -> Unit {
+  match pat {
+    PIdent(n, _) => bound.push(n)
+    PVariant(_, _, subs, _) | PTuple(subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        qualify_pat_bindings(subs[i], bound)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn qualify_struct_lit_name(ipkg : ImportedPkg, sname : String) -> String {
+  if sname == "" {
+    return ""
+  }
+  if has_qual_sep(sname) {
+    let qp = split_qual_name(sname)
+    match resolve_alias_pkg(ipkg.tc, qp.prefix) {
+      Some(dep) => dep.name + "::" + qp.name
+      None => sname
+    }
+  } else if ipkg.tc.structs.contains(sname) {
+    ipkg.name + "::" + sname
+  } else {
+    sname
+  }
+}
+
+///|
+fn qualify_imported_expr(ipkg : ImportedPkg, e : Expr, bound : Array[String]) -> Expr {
+  match e {
+    EIdent(name, sp) =>
+      if !str_arr_contains(bound, name) &&
+        name != "Some" &&
+        name != "None" &&
+        name != "Ok" &&
+        name != "Err" &&
+        (
+          ipkg.tc.consts.contains(name) ||
+          ipkg.tc.fns.contains(name) ||
+          ipkg.tc.extern_fns.contains(name) ||
+          ipkg.tc.variant_to_enum.contains(name)
+        ) {
+        EPath(ipkg.name, name, sp)
+      } else {
+        e
+      }
+    EPath(qual, mem, sp) =>
+      match resolve_alias_pkg(ipkg.tc, qual) {
+        Some(dep) => EPath(dep.name, mem, sp)
+        None =>
+          if has_qual_sep(qual) {
+            let qp = split_qual_name(qual)
+            match resolve_alias_pkg(ipkg.tc, qp.prefix) {
+              Some(dep) => EPath(dep.name + "::" + qp.name, mem, sp)
+              None => e
+            }
+          } else if ipkg.tc.enums.contains(qual) || ipkg.tc.structs.contains(qual) {
+            EPath(ipkg.name + "::" + qual, mem, sp)
+          } else {
+            e
+          }
+      }
+    EStructLit(sname, spread_opt, fields, sp) => {
+      let qname = qualify_struct_lit_name(ipkg, sname)
+      let qspread = match spread_opt {
+        Some(se) => Some(qualify_imported_expr(ipkg, se, bound))
+        None => None
+      }
+      let qfields : Array[FieldInit] = []
+      let mut i = 0
+      while i < fields.length() {
+        let f = fields[i]
+        qfields.push(FieldInit::{
+          name: f.name,
+          value: qualify_imported_expr(ipkg, f.value, bound),
+          span: f.span,
+        })
+        i = i + 1
+      }
+      EStructLit(qname, qspread, qfields, sp)
+    }
+    EUnary(op, inner, sp) => EUnary(op, qualify_imported_expr(ipkg, inner, bound), sp)
+    EBinary(op, l, r, sp) =>
+      EBinary(
+        op,
+        qualify_imported_expr(ipkg, l, bound),
+        qualify_imported_expr(ipkg, r, bound),
+        sp,
+      )
+    ECall(callee, args, sp) => {
+      let qc = qualify_imported_expr(ipkg, callee, bound)
+      let qargs : Array[Expr] = []
+      let mut i = 0
+      while i < args.length() {
+        qargs.push(qualify_imported_expr(ipkg, args[i], bound))
+        i = i + 1
+      }
+      ECall(qc, qargs, sp)
+    }
+    EField(obj, fname, sp) => EField(qualify_imported_expr(ipkg, obj, bound), fname, sp)
+    EMethodCall(obj, mname, args, sp) => {
+      let qo = qualify_imported_expr(ipkg, obj, bound)
+      let qargs : Array[Expr] = []
+      let mut i = 0
+      while i < args.length() {
+        qargs.push(qualify_imported_expr(ipkg, args[i], bound))
+        i = i + 1
+      }
+      EMethodCall(qo, mname, qargs, sp)
+    }
+    EIndex(obj, idx, sp) =>
+      EIndex(
+        qualify_imported_expr(ipkg, obj, bound),
+        qualify_imported_expr(ipkg, idx, bound),
+        sp,
+      )
+    EArrayLit(elems, sp) => {
+      let qelems : Array[Expr] = []
+      let mut i = 0
+      while i < elems.length() {
+        qelems.push(qualify_imported_expr(ipkg, elems[i], bound))
+        i = i + 1
+      }
+      EArrayLit(qelems, sp)
+    }
+    ETuple(elems, sp) => {
+      let qelems : Array[Expr] = []
+      let mut i = 0
+      while i < elems.length() {
+        qelems.push(qualify_imported_expr(ipkg, elems[i], bound))
+        i = i + 1
+      }
+      ETuple(qelems, sp)
+    }
+    EInterp(elems, sp) => {
+      let qelems : Array[Expr] = []
+      let mut i = 0
+      while i < elems.length() {
+        qelems.push(qualify_imported_expr(ipkg, elems[i], bound))
+        i = i + 1
+      }
+      EInterp(qelems, sp)
+    }
+    EBlock(stmts, sp) => EBlock(qualify_imported_stmts(ipkg, stmts, bound), sp)
+    EIf(cond, then_s, else_opt, sp) => {
+      let qc = qualify_imported_expr(ipkg, cond, bound)
+      let qt = qualify_imported_stmts(ipkg, then_s, bound)
+      let qe = match else_opt {
+        Some(ee) => Some(qualify_imported_expr(ipkg, ee, bound))
+        None => None
+      }
+      EIf(qc, qt, qe, sp)
+    }
+    EMatch(scrut, arms, sp) => {
+      let qs = qualify_imported_expr(ipkg, scrut, bound)
+      let qarms : Array[MatchArm] = []
+      let mut i = 0
+      while i < arms.length() {
+        let a = arms[i]
+        let ab = str_arr_clone(bound)
+        qualify_pat_bindings(a.pat, ab)
+        let qg = match a.guard_expr {
+          Some(ge) => Some(qualify_imported_expr(ipkg, ge, ab))
+          None => None
+        }
+        qarms.push(MatchArm::{
+          pat: a.pat,
+          guard_expr: qg,
+          body: qualify_imported_expr(ipkg, a.body, ab),
+          span: a.span,
+        })
+        i = i + 1
+      }
+      EMatch(qs, qarms, sp)
+    }
+    EIs(scrut, pat, sp) => EIs(qualify_imported_expr(ipkg, scrut, bound), pat, sp)
+    EClosure(ps, rty, body, sp) => {
+      let cb = str_arr_clone(bound)
+      let mut i = 0
+      while i < ps.length() {
+        cb.push(ps[i].name)
+        i = i + 1
+      }
+      EClosure(ps, rty, qualify_imported_stmts(ipkg, body, cb), sp)
+    }
+    EScope(w, f, sp) =>
+      EScope(
+        qualify_imported_expr(ipkg, w, bound),
+        qualify_imported_expr(ipkg, f, bound),
+        sp,
+      )
+    ESpawn(s, f, sp) =>
+      ESpawn(
+        qualify_imported_expr(ipkg, s, bound),
+        qualify_imported_expr(ipkg, f, bound),
+        sp,
+      )
+    EMove(inner, sp) => EMove(qualify_imported_expr(ipkg, inner, bound), sp)
+    EAs(inner, ty, sp) => EAs(qualify_imported_expr(ipkg, inner, bound), ty, sp)
+    ETry(inner, sp) => ETry(qualify_imported_expr(ipkg, inner, bound), sp)
+    ENamedArg(n, pun, inner, sp) =>
+      ENamedArg(n, pun, qualify_imported_expr(ipkg, inner, bound), sp)
+    _ => e
+  }
+}
+
+///|
+fn qualify_imported_stmts(
+  ipkg : ImportedPkg,
+  stmts : Array[Stmt],
+  bound : Array[String],
+) -> Array[Stmt] {
+  let lb = str_arr_clone(bound)
+  let out : Array[Stmt] = []
+  let mut i = 0
+  while i < stmts.length() {
+    let st = stmts[i]
+    match st {
+      SLet(n, is_mut, ty, init, sp) => {
+        let qi = qualify_imported_expr(ipkg, init, lb)
+        lb.push(n)
+        out.push(SLet(n, is_mut, ty, qi, sp))
+      }
+      SLetTuple(ns, ty, init, sp) => {
+        let qi = qualify_imported_expr(ipkg, init, lb)
+        let mut j = 0
+        while j < ns.length() {
+          lb.push(ns[j])
+          j = j + 1
+        }
+        out.push(SLetTuple(ns, ty, qi, sp))
+      }
+      SAssign(l, r, sp) =>
+        out.push(
+          SAssign(
+            qualify_imported_expr(ipkg, l, lb),
+            qualify_imported_expr(ipkg, r, lb),
+            sp,
+          ),
+        )
+      SCompoundAssign(op, l, r, sp) =>
+        out.push(
+          SCompoundAssign(
+            op,
+            qualify_imported_expr(ipkg, l, lb),
+            qualify_imported_expr(ipkg, r, lb),
+            sp,
+          ),
+        )
+      SGuard(c, body, sp) =>
+        out.push(
+          SGuard(
+            qualify_imported_expr(ipkg, c, lb),
+            qualify_imported_stmts(ipkg, body, lb),
+            sp,
+          ),
+        )
+      SWhile(c, body, sp) =>
+        out.push(
+          SWhile(
+            qualify_imported_expr(ipkg, c, lb),
+            qualify_imported_stmts(ipkg, body, lb),
+            sp,
+          ),
+        )
+      SFor(init, c, step, body, sp) => {
+        let fb = str_arr_clone(lb)
+        let qi_arr = qualify_imported_stmts(ipkg, [init], fb)
+        match init {
+          SLet(n, _, _, _, _) => fb.push(n)
+          _ => ()
+        }
+        let qc = qualify_imported_expr(ipkg, c, fb)
+        let qs_arr = qualify_imported_stmts(ipkg, [step], fb)
+        let qbody = qualify_imported_stmts(ipkg, body, fb)
+        out.push(SFor(qi_arr[0], qc, qs_arr[0], qbody, sp))
+      }
+      SForRange(n, a, b, incl, body, sp) => {
+        let qa = qualify_imported_expr(ipkg, a, lb)
+        let qb = qualify_imported_expr(ipkg, b, lb)
+        let fb = str_arr_clone(lb)
+        fb.push(n)
+        out.push(SForRange(n, qa, qb, incl, qualify_imported_stmts(ipkg, body, fb), sp))
+      }
+      SForIn(idx, v, it, body, sp) => {
+        let qit = qualify_imported_expr(ipkg, it, lb)
+        let fb = str_arr_clone(lb)
+        if idx != "" {
+          fb.push(idx)
+        }
+        fb.push(v)
+        out.push(SForIn(idx, v, qit, qualify_imported_stmts(ipkg, body, fb), sp))
+      }
+      SReturn(ro, sp) =>
+        match ro {
+          Some(re) => out.push(SReturn(Some(qualify_imported_expr(ipkg, re, lb)), sp))
+          None => out.push(st)
+        }
+      SDebugAssert(c, m, sp) =>
+        out.push(
+          SDebugAssert(
+            qualify_imported_expr(ipkg, c, lb),
+            qualify_imported_expr(ipkg, m, lb),
+            sp,
+          ),
+        )
+      SExpr(e, sp) => out.push(SExpr(qualify_imported_expr(ipkg, e, lb), sp))
+      SBreak(_) | SContinue(_) => out.push(st)
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
+  let pkg_name = ipkg.name
   let ptys : Array[Ty] = []
   let mut i = 0
   while i < fi.param_tys.length() {
     ptys.push(qualify_imported_ty(pkg_name, fi.param_tys[i]))
     i = i + 1
   }
+  let d = fi.decl
+  let mut has_def = false
+  i = 0
+  while i < d.params.length() {
+    match d.params[i].default_expr {
+      Some(_) => {
+        has_def = true
+        break
+      }
+      None => ()
+    }
+    i = i + 1
+  }
+  let qdecl = if has_def {
+    let qparams : Array[Param] = []
+    i = 0
+    while i < d.params.length() {
+      let p = d.params[i]
+      let qdef = match p.default_expr {
+        Some(def) => Some(qualify_imported_expr(ipkg, def, []))
+        None => None
+      }
+      qparams.push(Param::{
+        name: p.name,
+        ty: p.ty,
+        label_kind: p.label_kind,
+        default_expr: qdef,
+        span: p.span,
+      })
+      i = i + 1
+    }
+    FnDecl::{
+      is_pub: d.is_pub,
+      receiver_type: d.receiver_type,
+      name: d.name,
+      type_params: d.type_params,
+      type_bounds: d.type_bounds,
+      params: qparams,
+      ret_ty: d.ret_ty,
+      body: d.body,
+      span: d.span,
+      lparen_span: d.lparen_span,
+    }
+  } else {
+    d
+  }
   FnInfo::{
-    decl: fi.decl,
+    decl: qdecl,
     param_tys: ptys,
     ret_ty: qualify_imported_ty(pkg_name, fi.ret_ty),
   }
@@ -522,6 +904,9 @@ fn qualify_fn_info(pkg_name : String, fi : FnInfo) -> FnInfo {
 
 ///|
 fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
+  if !tc.imported_pkgs.contains(ipkg.name) {
+    tc.imported_pkg_names.push(ipkg.name)
+  }
   tc.imported_pkgs.set(ipkg.name, ipkg)
   let mut ei = 0
   while ei < ipkg.tc.eq_keys.length() {
@@ -621,7 +1006,7 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
           if !tc.methods.contains(qk) {
             tc.method_names.push(qk)
           }
-          tc.methods.set(qk, qualify_fn_info(ipkg.name, mi))
+          tc.methods.set(qk, qualify_fn_info(ipkg, mi))
         }
       }
       None => ()
@@ -703,7 +1088,7 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
             while mi < ii.method_names.length() {
               let mn = ii.method_names[mi]
               match ii.methods.get(mn) {
-                Some(mf) => qms.set(mn, qualify_fn_info(ipkg.name, mf))
+                Some(mf) => qms.set(mn, qualify_fn_info(ipkg, mf))
                 None => ()
               }
               mi = mi + 1
@@ -780,6 +1165,59 @@ pub fn resolve_alias_pkg(
   match tc.import_aliases.get(alias_name) {
     Some(canon) => tc.imported_pkgs.get(canon)
     None => None
+  }
+}
+
+///|
+fn lookup_imported_pkg_transitive_depth(
+  tc : TypeChecker,
+  canon_name : String,
+  depth : Int,
+) -> Option[ImportedPkg] {
+  if depth > 8 {
+    return None
+  }
+  match tc.imported_pkgs.get(canon_name) {
+    Some(p) => return Some(p)
+    None => ()
+  }
+  let mut i = 0
+  while i < tc.imported_pkg_names.length() {
+    match tc.imported_pkgs.get(tc.imported_pkg_names[i]) {
+      Some(dep) =>
+        match lookup_imported_pkg_transitive_depth(dep.tc, canon_name, depth + 1) {
+          Some(found) => return Some(found)
+          None => ()
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+pub fn lookup_imported_pkg_transitive(
+  tc : TypeChecker,
+  canon_name : String,
+) -> Option[ImportedPkg] {
+  lookup_imported_pkg_transitive_depth(tc, canon_name, 0)
+}
+
+///|
+fn resolve_pkg_for_lookup(
+  tc : TypeChecker,
+  qual : String,
+  allow_transitive : Bool,
+) -> Option[ImportedPkg] {
+  match resolve_alias_pkg(tc, qual) {
+    Some(p) => Some(p)
+    None =>
+      if allow_transitive {
+        lookup_imported_pkg_transitive(tc, qual)
+      } else {
+        None
+      }
   }
 }
 
@@ -4339,7 +4777,20 @@ fn check_variant_ctor(
   if resolved_enum == "" {
     return TError
   }
-  match tc.enums.get(resolved_enum) {
+  let einfo_opt : Option[EnumInfo] = match tc.enums.get(resolved_enum) {
+    Some(ei) => Some(ei)
+    None =>
+      if env.in_default_arg && has_qual_sep(resolved_enum) {
+        let qpe = split_qual_name(resolved_enum)
+        match lookup_imported_pkg_transitive(tc, qpe.prefix) {
+          Some(ipkg) => ipkg.tc.enums.get(qpe.name)
+          None => None
+        }
+      } else {
+        None
+      }
+  }
+  match einfo_opt {
     None => TError
     Some(einfo) => {
       let subst : Map[String, Ty] = Map([])
@@ -4606,6 +5057,7 @@ fn check_extern_fn_call(
 pub struct ResolvedCallArgs {
   args : Array[Expr]
   missing : Array[Bool]
+  from_default : Array[Bool]
 }
 
 ///|
@@ -4798,12 +5250,14 @@ fn resolve_call_args_impl(
   }
   let out : Array[Expr] = []
   let missing : Array[Bool] = []
+  let from_default : Array[Bool] = []
   k = 0
   while k < n {
     match slots[k] {
       Some(e) => {
         out.push(e)
         missing.push(false)
+        from_default.push(false)
       }
       None => {
         let pk = params[param_offset + k]
@@ -4811,11 +5265,13 @@ fn resolve_call_args_impl(
           Some(def) => {
             out.push(def)
             missing.push(false)
+            from_default.push(true)
           }
           None =>
             if pk.label_kind == 2 {
               out.push(EIdent("None", sp))
               missing.push(false)
+              from_default.push(false)
             } else {
               match tc_opt {
                 Some(tc) => {
@@ -4838,13 +5294,14 @@ fn resolve_call_args_impl(
               }
               out.push(EUnit(sp))
               missing.push(true)
+              from_default.push(false)
             }
         }
       }
     }
     k = k + 1
   }
-  ResolvedCallArgs::{ args: out, missing: missing }
+  ResolvedCallArgs::{ args: out, missing: missing, from_default: from_default }
 }
 
 ///|
@@ -4877,6 +5334,7 @@ fn check_fn_call(
   let use_named = params_need_named_resolution(finfo.decl.params, 0, args)
   let mut resolved_args = args
   let mut missing_flags : Array[Bool] = []
+  let mut default_flags : Array[Bool] = []
   if use_named {
     let res = resolve_call_args_impl(
       Some(tc),
@@ -4888,6 +5346,7 @@ fn check_fn_call(
     )
     resolved_args = res.args
     missing_flags = res.missing
+    default_flags = res.from_default
   } else if args.length() != finfo.param_tys.length() {
     tc_err(
       tc,
@@ -4916,7 +5375,12 @@ fn check_fn_call(
     } else {
       None
     }
+    let saved_in_def = env.in_default_arg
+    if i < default_flags.length() && default_flags[i] {
+      env.in_default_arg = true
+    }
     let aty = check_expr(tc, env, resolved_args[i], exp_p)
+    env.in_default_arg = saved_in_def
     if i < finfo.param_tys.length() {
       unify_tparams(finfo.param_tys[i], aty, subst)
       let pty = subst_ty(finfo.param_tys[i], subst)
@@ -5931,6 +6395,7 @@ fn check_method_call(
           let use_named = params_need_named_resolution(minfo.decl.params, 1, args)
           let mut resolved_args = args
           let mut missing_flags : Array[Bool] = []
+          let mut default_flags : Array[Bool] = []
           if use_named {
             let res = resolve_call_args_impl(
               Some(tc),
@@ -5942,6 +6407,7 @@ fn check_method_call(
             )
             resolved_args = res.args
             missing_flags = res.missing
+            default_flags = res.from_default
           }
           let mut i = 0
           while i < resolved_args.length() {
@@ -5955,7 +6421,12 @@ fn check_method_call(
             } else {
               None
             }
+            let saved_in_def = env.in_default_arg
+            if i < default_flags.length() && default_flags[i] {
+              env.in_default_arg = true
+            }
             let aty = check_expr(tc, env, resolved_args[i], exp_p)
+            env.in_default_arg = saved_in_def
             if p_idx < minfo.param_tys.length() {
               unify_tparams(minfo.param_tys[p_idx], aty, subst)
               let pty = subst_ty(minfo.param_tys[p_idx], subst)
@@ -6313,11 +6784,11 @@ fn check_expr_inner(
       let q_alias = qp.prefix
       let q_sub = qp.name
       if q_alias.length() > 0 {
-        match resolve_alias_pkg(tc, q_alias) {
+        match resolve_pkg_for_lookup(tc, q_alias, env.in_default_arg) {
           Some(ipkg) => {
             match ipkg.tc.enums.get(q_sub) {
               Some(ei) => {
-                if !ei.decl.is_pub {
+                if !ei.decl.is_pub && !env.in_default_arg {
                   emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
                 }
                 return check_variant_ctor(
@@ -6334,10 +6805,10 @@ fn check_expr_inner(
             }
             match ipkg.tc.methods.get(q_sub + "::" + mem) {
               Some(mi) => {
-                if !mi.decl.is_pub {
+                if !mi.decl.is_pub && !env.in_default_arg {
                   emit_private_err(tc, sp, "fn", ipkg.name, q_sub + "::" + mem)
                 }
-                let qmi = qualify_fn_info(ipkg.name, mi)
+                let qmi = qualify_fn_info(ipkg, mi)
                 return TFn(qmi.param_tys, qmi.ret_ty)
               }
               None => ()
@@ -6346,7 +6817,7 @@ fn check_expr_inner(
           None => ()
         }
       }
-      match resolve_alias_pkg(tc, qual) {
+      match resolve_pkg_for_lookup(tc, qual, env.in_default_arg) {
         Some(ipkg) => {
           match ipkg.tc.consts.get(mem) {
             Some(cty) => {
@@ -6354,7 +6825,7 @@ fn check_expr_inner(
                 Some(b) => b
                 None => false
               }
-              if !is_p {
+              if !is_p && !env.in_default_arg {
                 emit_private_err(tc, sp, "let", ipkg.name, mem)
               }
               return qualify_imported_ty(ipkg.name, cty)
@@ -6363,10 +6834,10 @@ fn check_expr_inner(
           }
           match ipkg.tc.fns.get(mem) {
             Some(fi) => {
-              if !fi.decl.is_pub {
+              if !fi.decl.is_pub && !env.in_default_arg {
                 emit_private_err_at(tc, sp, "fn", ipkg.name, mem, fi.decl.span)
               }
-              let qfi = qualify_fn_info(ipkg.name, fi)
+              let qfi = qualify_fn_info(ipkg, fi)
               return TFn(qfi.param_tys, qfi.ret_ty)
             }
             None => ()
@@ -6375,7 +6846,7 @@ fn check_expr_inner(
             Some(en) => {
               match ipkg.tc.enums.get(en) {
                 Some(ei) =>
-                  if !ei.decl.is_pub {
+                  if !ei.decl.is_pub && !env.in_default_arg {
                     emit_private_err(tc, sp, "enum", ipkg.name, en)
                   }
                 None => ()
@@ -6540,7 +7011,67 @@ fn check_expr_inner(
         }
         lty
       } else {
-        if !ty_compat(lty, rty) {
+        let op_ok = if op == "+" {
+          match lty {
+            TInt
+            | TInt64
+            | TUInt
+            | TUInt64
+            | TDouble
+            | TFloat
+            | TByte
+            | TString
+            | TParam(_)
+            | TError
+            | TNever => true
+            _ => false
+          }
+        } else if op == "-" || op == "*" || op == "/" || op == "%" {
+          match lty {
+            TInt
+            | TInt64
+            | TUInt
+            | TUInt64
+            | TDouble
+            | TFloat
+            | TByte
+            | TParam(_)
+            | TError
+            | TNever => true
+            _ => false
+          }
+        } else if op == "&" || op == "|" || op == "^" {
+          match lty {
+            TInt
+            | TInt64
+            | TUInt
+            | TUInt64
+            | TByte
+            | TParam(_)
+            | TError
+            | TNever => true
+            _ => false
+          }
+        } else {
+          true
+        }
+        if !op_ok {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "operator `" + op + "` is not supported on `" + ty_to_string(lty) + "`",
+            if op == "+" {
+              "numeric type or String"
+            } else if op == "&" || op == "|" || op == "^" {
+              "integer type"
+            } else {
+              "numeric type"
+            },
+            ty_to_string(lty),
+            "use a supported operand type for `" + op + "`",
+          )
+        } else if !ty_compat(lty, rty) {
           tc_err(
             tc,
             sp,
@@ -7250,11 +7781,11 @@ fn check_expr_inner(
           let q_alias = qp.prefix
           let q_sub = qp.name
           if q_alias.length() > 0 {
-            match resolve_alias_pkg(tc, q_alias) {
+            match resolve_pkg_for_lookup(tc, q_alias, env.in_default_arg) {
               Some(ipkg) => {
                 match ipkg.tc.enums.get(q_sub) {
                   Some(ei) => {
-                    if !ei.decl.is_pub {
+                    if !ei.decl.is_pub && !env.in_default_arg {
                       emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
                     }
                     return check_variant_ctor(
@@ -7271,7 +7802,7 @@ fn check_expr_inner(
                 }
                 match ipkg.tc.methods.get(q_sub + "::" + mem) {
                   Some(mi) => {
-                    if !mi.decl.is_pub {
+                    if !mi.decl.is_pub && !env.in_default_arg {
                       emit_private_err(
                         tc,
                         sp,
@@ -7283,7 +7814,7 @@ fn check_expr_inner(
                     return check_fn_call(
                       tc,
                       env,
-                      qualify_fn_info(ipkg.name, mi),
+                      qualify_fn_info(ipkg, mi),
                       args,
                       expected,
                       sp,
@@ -7295,17 +7826,17 @@ fn check_expr_inner(
               None => ()
             }
           }
-          match resolve_alias_pkg(tc, qual) {
+          match resolve_pkg_for_lookup(tc, qual, env.in_default_arg) {
             Some(ipkg) => {
               match ipkg.tc.fns.get(mem) {
                 Some(fi) => {
-                  if !fi.decl.is_pub {
+                  if !fi.decl.is_pub && !env.in_default_arg {
                     emit_private_err_at(tc, sp, "fn", ipkg.name, mem, fi.decl.span)
                   }
                   return check_fn_call(
                     tc,
                     env,
-                    qualify_fn_bounds(ipkg, qualify_fn_info(ipkg.name, fi)),
+                    qualify_fn_bounds(ipkg, qualify_fn_info(ipkg, fi)),
                     args,
                     expected,
                     sp,
@@ -7315,7 +7846,7 @@ fn check_expr_inner(
               }
               match ipkg.tc.extern_fns.get(mem) {
                 Some(ei) => {
-                  if !ei.decl.is_pub {
+                  if !ei.decl.is_pub && !env.in_default_arg {
                     emit_private_err(tc, sp, "extern fn", ipkg.name, mem)
                   }
                   return check_extern_fn_call(tc, env, ei, args, sp)
@@ -7326,7 +7857,7 @@ fn check_expr_inner(
                 Some(en) => {
                   match ipkg.tc.enums.get(en) {
                     Some(ei) =>
-                      if !ei.decl.is_pub {
+                      if !ei.decl.is_pub && !env.in_default_arg {
                         emit_private_err(tc, sp, "enum", ipkg.name, en)
                       }
                     None => ()
@@ -7585,11 +8116,11 @@ fn check_expr_inner(
         let q_alias = qp.prefix
         let q_st = qp.name
         if q_alias.length() > 0 {
-          match resolve_alias_pkg(tc, q_alias) {
+          match resolve_pkg_for_lookup(tc, q_alias, env.in_default_arg) {
             Some(ipkg) =>
               match ipkg.tc.structs.get(q_st) {
                 Some(si) => {
-                  if !si.decl.is_pub {
+                  if !si.decl.is_pub && !env.in_default_arg {
                     emit_private_err(tc, sp, "struct", ipkg.name, q_st)
                   }
                   resolved_name = ipkg.name + "::" + q_st
@@ -8234,6 +8765,7 @@ pub fn check_package_with_imports(
     const_pub: Map([]),
     import_aliases: Map([]),
     imported_pkgs: Map([]),
+    imported_pkg_names: [],
     diagnostics: [],
     eq_tparams: Map([]),
     eq_keys: [],
