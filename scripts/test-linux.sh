@@ -15,16 +15,41 @@ now_ms() {
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-echo "=== [1/6] Linux x86_64 Environment & QBE (amd64_sysv) Build ==="
+UNAME_M="$(uname -m)"
+if [ "$UNAME_M" = "x86_64" ]; then
+  LINUX_TARGET="amd64_sysv"
+  LINUX_ARCH_LABEL="x86_64"
+  USE_DIRECT_OBJ=1
+  EXPECTED_OBJ_FILE="ELF 64-bit LSB relocatable, x86-64"
+  EXPECTED_SQRT_INSN="sqrtsd"
+elif [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; then
+  LINUX_TARGET="arm64"
+  LINUX_ARCH_LABEL="aarch64"
+  USE_DIRECT_OBJ=0
+  EXPECTED_OBJ_FILE="ELF 64-bit LSB relocatable, ARM aarch64"
+  EXPECTED_SQRT_INSN="fsqrt"
+elif [ "$UNAME_M" = "riscv64" ]; then
+  LINUX_TARGET="rv64"
+  LINUX_ARCH_LABEL="riscv64"
+  USE_DIRECT_OBJ=0
+  EXPECTED_OBJ_FILE="ELF 64-bit LSB relocatable, UCB RISC-V"
+  EXPECTED_SQRT_INSN="fsqrt.d"
+else
+  echo "FAIL: unsupported Linux arch $UNAME_M" >&2
+  exit 1
+fi
+MULTIARCH_LIB_DIR="/usr/lib/${UNAME_M}-linux-gnu"
+
+echo "=== [1/6] Linux ${LINUX_ARCH_LABEL} Environment & QBE (${LINUX_TARGET}) Build ==="
 uname -a
 CC="$CC" sh "$ROOT_DIR/scripts/build-qbe.sh" "$OUT_DIR/qbe"
 
-echo "=== [2/6] Build libpionrt.a (-std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror) ==="
-"$CC" -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
+echo "=== [2/6] Build libpionrt.a (-std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror) ==="
+"$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
 rm -f "$OUT_DIR/libpionrt.a"
 ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libpionrt.a" | tr -d ' ')"
-echo "Linux x86_64 libpionrt.a size: ${LIB_SIZE} bytes"
+echo "Linux ${LINUX_ARCH_LABEL} libpionrt.a size: ${LIB_SIZE} bytes"
 if [ "$LIB_SIZE" -ge 65536 ]; then
   echo "FAIL: libpionrt.a (${LIB_SIZE} bytes) exceeds 64 KB budget" >&2
   exit 1
@@ -54,15 +79,18 @@ fi
 # The KV load client is plain C: build it while `as` is still reachable.
 "$CC" -O2 -pthread -o "$OUT_DIR/bench_load" "$ROOT_DIR/examples/http_kv_service/bench_load.c"
 
-# From here on every object file comes straight from `qbe --obj` (ELF64): a
-# failing `as` first on PATH proves no step assembles text.
+# On x86_64 (`amd64_sysv`), every object file comes straight from `qbe --obj` (ELF64):
+# a failing `as` first on PATH proves no step assembles text. On aarch64/riscv64,
+# QBE emits text assembly and `cc -c` assembles it.
 ORIG_PATH="$PATH"
-mkdir -p "$TMP_DIR/noas"
-printf '#!/bin/sh\necho "FAIL: as invoked: $*" >&2\nexit 97\n' > "$TMP_DIR/noas/as"
-chmod +x "$TMP_DIR/noas/as"
-export PATH="$TMP_DIR/noas:$PATH"
+if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+  mkdir -p "$TMP_DIR/noas"
+  printf '#!/bin/sh\necho "FAIL: as invoked: $*" >&2\nexit 97\n' > "$TMP_DIR/noas/as"
+  chmod +x "$TMP_DIR/noas/as"
+  export PATH="$TMP_DIR/noas:$PATH"
+fi
 
-echo "=== [4/6] QBE amd64_sysv End-to-End ABI & Hardware sqrtsd Smoke Test (direct ELF64 .o) ==="
+echo "=== [4/6] QBE ${LINUX_TARGET} End-to-End ABI & Hardware ${EXPECTED_SQRT_INSN} Smoke Test ==="
 cat > "$TMP_DIR/smoke_qbe.ssa" <<'EOF'
 data $hello = { b "hello from qbe+pionrt", b 0 }
 
@@ -105,22 +133,26 @@ export function w $main(w %argc, l %argv) {
 EOF
 
 T_SM0="$(now_ms)"
-"$OUT_DIR/qbe" -t amd64_sysv -o "$TMP_DIR/smoke_qbe.s" "$TMP_DIR/smoke_qbe.ssa"
-"$OUT_DIR/qbe" -t amd64_sysv --obj -o "$TMP_DIR/smoke_qbe.o" "$TMP_DIR/smoke_qbe.ssa"
+"$OUT_DIR/qbe" -t "$LINUX_TARGET" -o "$TMP_DIR/smoke_qbe.s" "$TMP_DIR/smoke_qbe.ssa"
+if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+  "$OUT_DIR/qbe" -t "$LINUX_TARGET" --obj -o "$TMP_DIR/smoke_qbe.o" "$TMP_DIR/smoke_qbe.ssa"
+else
+  "$CC" -c "$TMP_DIR/smoke_qbe.s" -o "$TMP_DIR/smoke_qbe.o"
+fi
 "$CC" "$TMP_DIR/smoke_qbe.o" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$TMP_DIR/smoke_qbe"
 T_SM1="$(now_ms)"
 SMOKE_SIZE="$(wc -c < "$TMP_DIR/smoke_qbe" | tr -d ' ')"
 SMOKE_OUT="$("$TMP_DIR/smoke_qbe")"
-echo "QBE amd64_sysv smoke: compile=$((T_SM1 - T_SM0))ms, binary=${SMOKE_SIZE} bytes"
+echo "QBE ${LINUX_TARGET} smoke: compile=$((T_SM1 - T_SM0))ms, binary=${SMOKE_SIZE} bytes"
 EXPECTED_SMOKE="$(printf 'hello from qbe+pionrt\n42\n42')"
 if [ "$SMOKE_OUT" != "$EXPECTED_SMOKE" ]; then
-  echo "FAIL: QBE amd64_sysv smoke output mismatch: $SMOKE_OUT" >&2
+  echo "FAIL: QBE ${LINUX_TARGET} smoke output mismatch: $SMOKE_OUT" >&2
   exit 1
 fi
-grep -n 'sqrtsd' "$TMP_DIR/smoke_qbe.s"
-echo "[PASS] QBE amd64_sysv ABI & hardware sqrtsd smoke"
+grep -n "$EXPECTED_SQRT_INSN" "$TMP_DIR/smoke_qbe.s"
+echo "[PASS] QBE ${LINUX_TARGET} ABI & hardware ${EXPECTED_SQRT_INSN} smoke"
 
-echo "=== [5/6] Native Linux x86_64 pionc ELF Bootstrap & Self-Hosting Proof (direct ELF64 .o, zero as) ==="
+echo "=== [5/6] Native Linux ${LINUX_ARCH_LABEL} pionc ELF Bootstrap & Self-Hosting Proof ==="
 if [ -z "${PION_LINUX_SSA:-}" ]; then
   if [ -f "$OUT_DIR/stage2.ssa" ]; then
     PION_LINUX_SSA="$OUT_DIR/stage2.ssa"
@@ -139,17 +171,22 @@ if [ ! -f "$PION_LINUX_SSA" ]; then
 fi
 
 T_B0="$(now_ms)"
-"$OUT_DIR/qbe" -t amd64_sysv --obj -o "$OUT_DIR/pionc_linux.o" "$PION_LINUX_SSA"
+if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+  "$OUT_DIR/qbe" -t "$LINUX_TARGET" --obj -o "$OUT_DIR/pionc_linux.o" "$PION_LINUX_SSA"
+else
+  "$OUT_DIR/qbe" -t "$LINUX_TARGET" -o "$TMP_DIR/pionc_linux.s" "$PION_LINUX_SSA"
+  "$CC" -c "$TMP_DIR/pionc_linux.s" -o "$OUT_DIR/pionc_linux.o"
+fi
 "$CC" "$OUT_DIR/pionc_linux.o" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$OUT_DIR/pionc_linux"
 T_B1="$(now_ms)"
 PIONC_O_FILE="$(file "$OUT_DIR/pionc_linux.o")"
 echo "$PIONC_O_FILE"
-printf '%s' "$PIONC_O_FILE" | grep -q 'ELF 64-bit LSB relocatable, x86-64' || {
-  echo "FAIL: qbe --obj did not produce an x86-64 ELF64 relocatable" >&2
+printf '%s' "$PIONC_O_FILE" | grep -q "$EXPECTED_OBJ_FILE" || {
+  echo "FAIL: pionc_linux.o did not match expected ELF64 relocatable ($EXPECTED_OBJ_FILE)" >&2
   exit 1
 }
 PIONC_SIZE="$(wc -c < "$OUT_DIR/pionc_linux" | tr -d ' ')"
-echo "Native Linux x86_64 pionc ELF: assemble+link=$((T_B1 - T_B0))ms, size=${PIONC_SIZE} bytes"
+echo "Native Linux ${LINUX_ARCH_LABEL} pionc ELF: assemble+link=$((T_B1 - T_B0))ms, size=${PIONC_SIZE} bytes"
 if command -v file >/dev/null 2>&1; then
   file "$OUT_DIR/pionc_linux"
 fi
@@ -163,17 +200,28 @@ export PION_CACHE_DIR="$TMP_DIR/cas_linux"
 mkdir -p "$PION_CACHE_DIR"
 unset PION_TARGET || true
 
-# Self-hosting Stage 3 & Stage 4 on Linux x86_64 -> verify bit-for-bit fixed-point!
-# No --emit-asm: pionc takes its default direct `qbe --obj` ELF64 path (zero `as`).
+# Self-hosting Stage 3 & Stage 4 on Linux -> verify bit-for-bit fixed-point!
+# Note: on x86_64, no --emit-asm so pionc takes its direct `qbe --obj` ELF64 path (zero `as`).
+# When booting from an older seed on aarch64, pass PION_TARGET="$LINUX_TARGET" for Stage 3
+# so Stage 3 emits the right target even if the seed predates uname auto-detection; Stage 4
+# runs with PION_TARGET unset to prove pionc_linux_s3 auto-detects its own host arch!
 T_S3_0="$(now_ms)"
-(cd "$ROOT_DIR" && "$PIONC" build \
-  --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
-  -o "$TMP_DIR/pionc_linux_s3" \
-  compiler/src/core \
-  compiler/src/cli/main.pion)
+if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+  (cd "$ROOT_DIR" && "$PIONC" build \
+    --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
+    -o "$TMP_DIR/pionc_linux_s3" \
+    compiler/src/core \
+    compiler/src/cli/main.pion)
+else
+  (cd "$ROOT_DIR" && PION_TARGET="$LINUX_TARGET" "$PIONC" build \
+    --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
+    -o "$TMP_DIR/pionc_linux_s3" \
+    compiler/src/core \
+    compiler/src/cli/main.pion)
+fi
 T_S3_1="$(now_ms)"
 S3_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s3" | tr -d ' ')"
-echo "Linux x86_64 native self-host Stage 3: build=$((T_S3_1 - T_S3_0))ms, binary=${S3_SIZE} bytes"
+echo "Linux ${LINUX_ARCH_LABEL} native self-host Stage 3: build=$((T_S3_1 - T_S3_0))ms, binary=${S3_SIZE} bytes"
 
 T_S4_0="$(now_ms)"
 (cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_linux_s4" "$TMP_DIR/pionc_linux_s3" build \
@@ -183,25 +231,29 @@ T_S4_0="$(now_ms)"
   compiler/src/cli/main.pion)
 T_S4_1="$(now_ms)"
 S4_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s4" | tr -d ' ')"
-echo "Linux x86_64 native self-host Stage 4: build=$((T_S4_1 - T_S4_0))ms, binary=${S4_SIZE} bytes"
+echo "Linux ${LINUX_ARCH_LABEL} native self-host Stage 4: build=$((T_S4_1 - T_S4_0))ms, binary=${S4_SIZE} bytes"
 
 "$TMP_DIR/pionc_linux_s4" --version
 sha256sum "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"
 cmp "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"
 for S in 3 4; do
-  "$OUT_DIR/qbe" -t amd64_sysv -o "$TMP_DIR/linux_stage$S.s" "$TMP_DIR/linux_stage$S.ssa"
-  "$OUT_DIR/qbe" -t amd64_sysv --obj -o "$TMP_DIR/linux_stage$S.o" "$TMP_DIR/linux_stage$S.ssa"
+  "$OUT_DIR/qbe" -t "$LINUX_TARGET" -o "$TMP_DIR/linux_stage$S.s" "$TMP_DIR/linux_stage$S.ssa"
+  if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
+    "$OUT_DIR/qbe" -t "$LINUX_TARGET" --obj -o "$TMP_DIR/linux_stage$S.o" "$TMP_DIR/linux_stage$S.ssa"
+  else
+    "$CC" -c "$TMP_DIR/linux_stage$S.s" -o "$TMP_DIR/linux_stage$S.o"
+  fi
 done
 sha256sum "$TMP_DIR/linux_stage3.s" "$TMP_DIR/linux_stage4.s"
 cmp "$TMP_DIR/linux_stage3.s" "$TMP_DIR/linux_stage4.s"
 sha256sum "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
 cmp "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
-echo "[PASS] Linux x86_64 Native Self-Hosting Fixed-Point (Stage 3 == Stage 4 SSA, x86_64 ASM & ELF64 .o BIT-FOR-BIT IDENTICAL, zero as)!"
+echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Native Self-Hosting Fixed-Point (Stage 3 == Stage 4 SSA, ASM & ELF64 .o BIT-FOR-BIT IDENTICAL)!"
 # [6/6] must test the compiler built from this tree, not the (possibly older) seed.
 cp "$TMP_DIR/pionc_linux_s4" "$OUT_DIR/pionc_linux"
 PIONC="$OUT_DIR/pionc_linux"
 
-echo "=== [6/6] Native Linux x86_64 pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
+echo "=== [6/6] Native Linux ${LINUX_ARCH_LABEL} pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
 CORE_TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/compiler/src/core")"
 CORE_TEST_SUMMARY="$(printf '%s' "$CORE_TEST_JSON" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')"
 echo "pionc_linux test --json compiler/src/core -> $CORE_TEST_SUMMARY"
@@ -342,12 +394,12 @@ if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null;
   sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
   # Flagship examples/pion_station also links the system libsqlite3 and checks
   # restart recovery with the sqlite3 CLI.
-  if { [ -f /usr/include/sqlite3.h ] || pkg-config --exists sqlite3 2>/dev/null || [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ]; } \
+  if { [ -f /usr/include/sqlite3.h ] || pkg-config --exists sqlite3 2>/dev/null || [ -f "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" ]; } \
     && command -v sqlite3 >/dev/null 2>&1; then
     STATION_LIB_PATH="${LIBRARY_PATH:-}"
-    if [ -f /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 ] && [ ! -e /usr/lib/x86_64-linux-gnu/libsqlite3.so ]; then
+    if [ -f "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" ] && [ ! -e "${MULTIARCH_LIB_DIR}/libsqlite3.so" ]; then
       # Runtime package only (no -dev): give the linker a libsqlite3.so outside the source tree.
-      ln -sf /usr/lib/x86_64-linux-gnu/libsqlite3.so.0 "$OUT_DIR/libsqlite3.so"
+      ln -sf "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" "$OUT_DIR/libsqlite3.so"
       STATION_LIB_PATH="$OUT_DIR${STATION_LIB_PATH:+:$STATION_LIB_PATH}"
     fi
     STATION_JSON="$(LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --json "$ROOT_DIR/examples/pion_station")"
@@ -377,6 +429,8 @@ sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC"
 # P26-B: C callbacks, zero-copy FFI/math/StringBuilder, cross-pkg generic Option mono & private exports.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p26b_ffi_generics/run_e2e.sh" "$PIONC"
+# P29-A: multi-target (--target all 9 POSIX/mobile targets, --emit-asm, --emit-staticlib, --emit-cdylib C host calls).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p29a_multi_target/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"
@@ -429,4 +483,4 @@ BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_benc
 # Same load over HTTP/1.1 keep-alive (one connection per client thread).
 KEEP_ALIVE=1 BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$PIONC" 8 500 8
 
-echo "ALL LINUX X86_64 (amd64_sysv) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"
+echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"

@@ -46,7 +46,10 @@ else
   UNAME_S=$(uname -s)
   UNAME_M=$(uname -m)
   CC_BIN="${CC:-cc}"
-  if [ "$UNAME_S" = "Darwin" ]; then
+  if [ "$UNAME_S" = "Darwin" ] && [ "$UNAME_M" = "x86_64" ]; then
+    "$PION_QBE" -t amd64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
+    "$CC_BIN" -arch x86_64 "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+  elif [ "$UNAME_S" = "Darwin" ]; then
     "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
     "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "x86_64" ]; then
@@ -54,6 +57,9 @@ else
     "$CC_BIN" "$TMP_DIR/pionc0.o" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Linux" ] && { [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; }; then
     "$PION_QBE" -t arm64 -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
+    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+  elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "riscv64" ]; then
+    "$PION_QBE" -t rv64 -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
     "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   else
     echo "FAIL: unsupported host platform $UNAME_S/$UNAME_M for Stage 0 bootstrap" >&2

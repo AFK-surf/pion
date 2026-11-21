@@ -33,8 +33,11 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 6. **Sub-150ms Incremental Compile, Tiny Binaries, Zero `target/`**:
    - Package-level separate compilation via `.pionsig` compact interface files: editing a function body without changing its `pub` signature yields 100% cache hit on downstream packages.
    - **Global Content-Addressed Cache** (`$PION_CACHE_DIR`, default `~/.cache/pion/cas`), LRU-evicted (`$PION_CACHE_MAX_MB`, default 2048). **NEVER writes a `target/` or `_build/` directory inside the source tree.**
-   - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly (Mach-O arm64 for `arm64_apple`, ELF64 x86-64 for `amd64_sysv`; no `as`) → `ld`/`cc` + prebuilt `<64 KB` `libpionrt.a`. `--emit-asm` or `PION_NO_DIRECT_OBJ=1` falls back to `qbe` text + `as`.
-   - **Cross objects**: `pionc build --target arm64_apple|amd64_sysv --emit-obj <out.o> <input>` writes the single-package object for that target and skips linking (e.g. an ELF64 x86-64 `.o` from macOS with no extra toolchain).
+   - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly for `arm64_apple` (Mach-O arm64) and `amd64_sysv` (ELF64 x86-64) with no `as`; all other targets (`amd64_apple`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`) lower via `qbe -t <arch>` → target `cc -c` → `ld`/`cc` + prebuilt `<64 KB` `libpionrt.a`. `--emit-asm` or `PION_NO_DIRECT_OBJ=1` falls back to `qbe` text + assembler.
+   - **Multi-target & library outputs**:
+     - Host auto-detection (`$PION_TARGET`, else `uname -sm`): macOS ARM64 (`arm64_apple`), macOS x86_64 (`amd64_apple`), Linux x86_64 (`amd64_sysv`), Linux ARM64 (`arm64`), Linux RISC-V 64 (`rv64`).
+     - Cross targets: `--target arm64_apple|amd64_apple|amd64_sysv|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64`, with optional `--sysroot <dir>` (`-isysroot` on Apple, `--sysroot=` on ELF; iOS auto-probes `xcrun --sdk iphoneos|iphonesimulator --show-sdk-path`; Android honors `$PION_ANDROID_CC` / `$ANDROID_NDK_HOME`).
+     - Artifact modes: `--emit-obj <out.o>`, `--emit-staticlib <out.a>` (`ar rcs` of package + `c_sources` `.o`), `--emit-cdylib <out.so|.dylib>` (`-dynamiclib` on Apple, `-shared` + `-fPIC` on Linux/Android), `--emit-asm <out.s>` (skips assembly when no link/object artifact is requested).
    - **Native libraries**: `-l <lib>` / `-l<lib>` / `--link <lib>` on `build`/`run`/`test`, plus `[link] libs = [...]` in `pion.toml` (dependencies first, de-duplicated) add `-l<lib>` to the link; the list is part of the binary's cache key.
    - **Release backend** (`--release`): the same embedded QBE pipeline (no LLVM, no separate optimizing toolchain) with release-mode IL, stripping `debug_assert`.
 
@@ -477,19 +480,25 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   c_sources = ["csrc/shim.cc"]  # or: c_source = "..." (compiled to CAS obj/cstub_<key>.o)
   cc_flags = ["-O2", "-Iinc"]   # C/C++/ObjC compiler flags (order-preserving; relative `-I<path>` resolved to package dir)
 
-  [link.macos]                  # merged after [link] when target is `arm64_apple`
+  [link.macos]                  # merged after [link] when target OS is macOS (`arm64_apple`, `amd64_apple`)
   frameworks = [
     "Cocoa",
     "Metal",
   ]
 
-  [link.linux]                  # merged after [link] on non-macOS targets
+  [link.linux]                  # merged after [link] when target OS is Linux (`amd64_sysv`, `arm64`, `rv64`)
   libs = ["freetype", "fontconfig"]
+
+  [link.ios]                    # optional; merged after [link] for `ios_arm64`, `ios_sim_arm64`
+  frameworks = ["UIKit", "Metal"]
+
+  [link.android]                # optional; merged after [link] for `android_arm64`, `android_x64`
+  libs = ["log", "android"]
 
   [registry]
   url = "https://example.com/pion-index.git"   # default registry for `pionc add <name>`
   ```
-  - **Multiline arrays**: any `key = [ ... ]` value in `pion.toml` may span multiple lines (with `#` comments and optional trailing commas). Unknown keys in `[link]` / `[link.macos]` / `[link.linux]` are rejected with the line number.
+  - **Multiline arrays**: any `key = [ ... ]` value in `pion.toml` may span multiple lines (with `#` comments and optional trailing commas). Unknown keys in `[link]` / `[link.macos]` / `[link.linux]` / `[link.ios]` / `[link.android]` are rejected with the line number.
   - **C/C++/ObjC stub compilation (`c_sources`)**: each package's active `c_sources` are compiled in topological order (`.cc`/`.cpp`/`.mm` with `$CXX` or `c++`, `.c`/`.m` with `$CC` or `cc`), automatically passing `-I<runtime_dir>` (and `<runtime_dir>/../runtime` when `pion_rt.h` resides there) so stubs can `#include "pion_rt.h"`. Objects are written atomically to `$PION_CACHE_DIR/obj/cstub_<key>.o` (LRU-tracked, zero source-tree pollution) keyed by `sha256("cstub-v1|" + target + "|" + compiler + "|" + cc_flags + "|" + src_path + "|" + sha256(src) + "|" + local_headers_fp)`, where `local_headers_fp` hashes sorted `(path, size, mtime_ms)` of all `.h`/`.hpp` files in the package dir and `src_path`'s dir.
   - **Linker & binary cache key**: when all packages have no `frameworks`, `search_paths`, `rpaths`, `objects`, `flags`, or C++ sources/libs (`has_cxx`), macOS keeps its direct `ld` fast path. Otherwise both macOS and Linux link through `$CXX`/`c++` (when `has_cxx`) or `$CC`/`cc` with argument order `obj_paths` (including `cstub_*.o`) → `libpionrt.a` → `objects` → `-L<search_paths>` → `-Wl,-rpath,<rpaths>` → (macOS: `-framework <fw>`) → `-l<libs>` → `flags` → (Linux: `-lm -lpthread`). Both `pionc build`/`run` and `pionc test` include all resolved link options plus each `objects` file's `(path, size, mtime_ms)` in the binary cache key.
 - **Git dependencies & `pion.lock`**: git dependencies resolve into the global shared cache `$PION_CACHE_DIR/git/` (default `~/.cache/pion/git/`): bare mirrors `repos/<sha256(url)>.git` and read-only checkouts `checkouts/<rev>` (no `.git`), created atomically and shared zero-copy by every worktree. `<root>/pion.lock` pins each git dependency to a full commit (`version = 1`, then `[[package]]` tables with `name`, `git`, `ref`, `rev`, `subdir`, sorted, every key written); an entry is reused only while `pion.toml` requests the same name, URL, subdir and ref. A locked dependency whose checkout exists runs no `git` at all; tags and full revs resolve from the mirror, branches and HEAD always fetch. Only `<root>/pion.lock` is ever written, and only when it changes.

@@ -16,7 +16,16 @@
 #include <netinet/tcp.h>
 #include <pthread.h>
 #include <signal.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#if (defined(__APPLE__) && defined(TARGET_OS_IPHONE) && TARGET_OS_IPHONE) || \
+    (defined(__ANDROID__) && defined(__ANDROID_API__) && (__ANDROID_API__ < 28))
+#define PION_NO_SPAWN 1
+#else
+#define PION_NO_SPAWN 0
 #include <spawn.h>
+#endif
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -37,7 +46,9 @@
 #endif
 #endif
 
+#if !PION_NO_SPAWN
 extern char **environ;
+#endif
 
 #if defined(__clang__)
 #define PION_MINSIZE __attribute__((minsize))
@@ -2393,6 +2404,11 @@ PION_MINSIZE int64_t pion_world_clock_ms(void *w_ptr) {
 
 PION_MINSIZE int32_t pion_world_exec(void *w_ptr, void *argv_arr) {
     (void)w_ptr;
+#if PION_NO_SPAWN
+    (void)argv_arr;
+    errno = ENOSYS;
+    return -1;
+#else
     PionArray *arr = (PionArray *)argv_arr;
     if (!arr || arr->len <= 0) return -1;
     char **argv = (char **)malloc(((size_t)arr->len + 1) * sizeof(char *));
@@ -2416,12 +2432,19 @@ PION_MINSIZE int32_t pion_world_exec(void *w_ptr, void *argv_arr) {
     if (WIFEXITED(status)) return WEXITSTATUS(status);
     if (WIFSIGNALED(status)) return 128 + WTERMSIG(status);
     return -1;
+#endif
 }
 
 static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stderr,
                                                 size_t *out_len, int32_t *exit_code_out) {
     if (out_len) *out_len = 0;
     if (exit_code_out) *exit_code_out = -1;
+#if PION_NO_SPAWN
+    (void)argv_arr;
+    (void)silence_stderr;
+    errno = ENOSYS;
+    return NULL;
+#else
     PionArray *arr = (PionArray *)argv_arr;
     if (!arr || arr->len <= 0) return NULL;
 
@@ -2516,6 +2539,7 @@ static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stde
     if (exit_code_out) *exit_code_out = code;
     if (out_len) *out_len = len;
     return buf;
+#endif
 }
 
 PION_MINSIZE void *pion_world_exec_capture(void *w_ptr, void *argv_arr, int32_t *exit_code_out) {
