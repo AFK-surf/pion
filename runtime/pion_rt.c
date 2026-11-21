@@ -194,11 +194,34 @@ PION_MINSIZE double pion_math_pow(double x, double y) {
 #define PION_SLAB_CHUNK_BYTES  65536u
 #define PION_SLAB_REMOTE_BATCH 32u
 
+/* 4-tier per-thread medium-block cache (2K / 4K / 8K / 16K, max 8 blocks per tier).
+ * Uses unused high bits of PionHeader.flags (bit 8 = flag, bits 9..10 = tier 0..3). */
+#define PION_FLAG_MED_CACHE     ((uint16_t)256u)
+#define PION_FLAG_MED_CLS_SHIFT 9u
+#define PION_FLAG_MED_CLS_MASK  ((uint16_t)3u)
+#define PION_MED_CLASSES        4u
+#define PION_MED_MAX_BYTES      16384u
+#define PION_MED_MAX_PAYLOAD    (PION_MED_MAX_BYTES - (uint32_t)sizeof(PionHeader))
+#define PION_MED_MAX_CACHE      8u
+
+static const uint16_t pion_med_sizes[PION_MED_CLASSES] = {
+    2048u, 4096u, 8192u, 16384u
+};
+
+static inline uint32_t pion_med_cls_for(size_t total) {
+    if (total <= 2048u) return 0u;
+    if (total <= 4096u) return 1u;
+    if (total <= 8192u) return 2u;
+    return 3u;
+}
+
 typedef struct PionSlabTLS {
     void *local_free[PION_SLAB_CLASSES];
     void *remote_head[PION_SLAB_CLASSES];
     void *remote_tail[PION_SLAB_CLASSES];
     uint32_t remote_count[PION_SLAB_CLASSES];
+    void *med_free[PION_MED_CLASSES];
+    uint8_t med_count[PION_MED_CLASSES];
     char *chunk_cur;
     char *chunk_end;
 } PionSlabTLS;
@@ -296,6 +319,16 @@ PION_MINSIZE static void pion_slab_thread_cleanup(void *arg) {
             pion_slab_push_remote_list(cls, rhead, rtail);
         }
     }
+    for (uint32_t mcls = 0; mcls < PION_MED_CLASSES; mcls++) {
+        void *mcur = s->med_free[mcls];
+        s->med_free[mcls] = NULL;
+        s->med_count[mcls] = 0;
+        while (mcur) {
+            void *mnxt = pion_slab_get_next(mcur);
+            free(mcur);
+            mcur = mnxt;
+        }
+    }
     if (s != &g_main_slab) {
         free(s);
     }
@@ -355,6 +388,34 @@ static PionHeader *pion_slab_alloc_slow(PionSlabTLS *s, uint32_t cls) {
     return hdr;
 }
 
+static void *pion_med_alloc(uint32_t mcls) {
+    PionSlabTLS *s = pion_slab_cur();
+    if (__builtin_expect(s != NULL && s->med_free[mcls] != NULL, 1)) {
+        void *node = s->med_free[mcls];
+        s->med_free[mcls] = pion_slab_get_next(node);
+        s->med_count[mcls]--;
+        return node;
+    }
+    void *mp = malloc(pion_med_sizes[mcls]);
+    if (__builtin_expect(!mp, 0)) {
+        pion_panic("out of memory", __FILE__, __LINE__);
+    }
+    return mp;
+}
+
+static void pion_med_free(void *ptr, uint32_t mcls, int is_frozen) {
+    if (__builtin_expect(!is_frozen, 1)) {
+        PionSlabTLS *s = pion_slab_cur();
+        if (__builtin_expect(s != NULL && s->med_count[mcls] < PION_MED_MAX_CACHE, 1)) {
+            pion_slab_set_next(ptr, s->med_free[mcls]);
+            s->med_free[mcls] = ptr;
+            s->med_count[mcls]++;
+            return;
+        }
+    }
+    free(ptr);
+}
+
 #endif /* PION_USE_SLAB */
 
 static PION_HOT void *pion_slab_raw_alloc(size_t bytes) {
@@ -371,6 +432,9 @@ static PION_HOT void *pion_slab_raw_alloc(size_t bytes) {
             return (void *)pion_slab_alloc_slow(s, cls);
         }
         return (void *)pion_slab_alloc_slow(NULL, cls);
+    }
+    if (__builtin_expect(bytes <= PION_MED_MAX_BYTES, 1)) {
+        return pion_med_alloc(pion_med_cls_for(bytes));
     }
 #endif
     void *p = malloc(bytes);
@@ -411,6 +475,10 @@ static PION_HOT void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) 
         pion_slab_push_remote_list(cls, ptr, ptr);
         return;
     }
+    if (__builtin_expect(bytes <= PION_MED_MAX_BYTES, 1)) {
+        pion_med_free(ptr, pion_med_cls_for(bytes), is_frozen);
+        return;
+    }
 #else
     (void)bytes;
     (void)is_frozen;
@@ -439,6 +507,11 @@ static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag
             hdr = pion_slab_alloc_slow(NULL, cls);
         }
         flags = (uint16_t)(PION_FLAG_SLAB | (cls << PION_FLAG_SLAB_CLS_SHIFT));
+    } else if (__builtin_expect(payload_size <= PION_MED_MAX_PAYLOAD, 1)) {
+        uint32_t total = (uint32_t)sizeof(PionHeader) + payload_size;
+        uint32_t mcls = pion_med_cls_for(total);
+        hdr = (PionHeader *)pion_med_alloc(mcls);
+        flags = (uint16_t)(PION_FLAG_MED_CACHE | (mcls << PION_FLAG_MED_CLS_SHIFT));
     } else
 #endif
     {
@@ -508,6 +581,11 @@ static void pion_destroy(PionHeader *hdr, void *obj) {
             return;
         }
         pion_slab_push_remote_list(cls, hdr, hdr);
+        return;
+    }
+    if (__builtin_expect((flags & PION_FLAG_MED_CACHE) != 0, 0)) {
+        uint32_t mcls = (uint32_t)((flags >> PION_FLAG_MED_CLS_SHIFT) & PION_FLAG_MED_CLS_MASK);
+        pion_med_free(hdr, mcls, (flags & PION_FLAG_FROZEN) != 0);
         return;
     }
 #endif
@@ -1339,7 +1417,7 @@ static __attribute__((noinline)) PION_HOT void pion_arr_grow(PionArray *a) {
     int64_t *nd;
 #if PION_USE_SLAB
     size_t old_bytes = (size_t)ocap * sizeof(int64_t);
-    if (old_bytes > PION_SLAB_MAX_TOTAL && new_bytes > PION_SLAB_MAX_TOTAL) {
+    if (old_bytes > PION_MED_MAX_BYTES && new_bytes > PION_MED_MAX_BYTES) {
         nd = (int64_t *)realloc(a->data, new_bytes);
         if (!nd) pion_panic("out of memory in arr_push", __FILE__, __LINE__);
     } else {

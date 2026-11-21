@@ -1396,6 +1396,94 @@ static void test_mt_slab_stress(void) {
     printf("[PASS] mt_slab_stress (8 threads, %" PRId64 " slab/large alloc+free, 0 leaks)\n", expected_drops);
 }
 
+static void med_frozen_env_drop(void *p) {
+    void **env = (void **)p;
+    pion_rc_dec(*env);
+}
+
+static void med_frozen_worker(void *env) {
+    void *ch = *(void **)env;
+    int64_t v = 0;
+    while (pion_chan_recv(ch, &v)) {
+        void *obj = (void *)(uintptr_t)v;
+        /* Verify payload integrity across threads before freeing */
+        uint8_t *bytes = (uint8_t *)obj;
+        assert(bytes[0] == 0x5A);
+        pion_rc_dec(obj);
+    }
+}
+
+static void test_med_cache_and_mt_frozen(void) {
+    /* 1. Single-thread 4-tier medium-block object cache (2K / 4K / 8K / 16K) */
+    const uint32_t tiers[4] = { 1500u, 3000u, 7000u, 15000u };
+    for (int t = 0; t < 4; t++) {
+        uint32_t psz = tiers[t];
+        /* Allocate > 8 blocks to exercise both cache hit and >8 overflow free() */
+        void *ptrs[12];
+        for (int i = 0; i < 12; i++) {
+            ptrs[i] = pion_alloc_uninit(psz, PION_TAG_STRUCT, NULL);
+            memset(ptrs[i], (int)(0xA0 + i), psz);
+        }
+        for (int i = 0; i < 12; i++) {
+            assert(((uint8_t *)ptrs[i])[0] == (uint8_t)(0xA0 + i));
+            assert(((uint8_t *)ptrs[i])[psz - 1] == (uint8_t)(0xA0 + i));
+            pion_rc_dec(ptrs[i]);
+        }
+        /* Repeated alloc/free should hit TLS cache without corruption */
+        for (int r = 0; r < 64; r++) {
+            void *p = pion_alloc_uninit(psz, PION_TAG_STRUCT, NULL);
+            ((uint8_t *)p)[0] = (uint8_t)r;
+            ((uint8_t *)p)[psz - 1] = (uint8_t)(r ^ 0xFF);
+            assert(((uint8_t *)p)[0] == (uint8_t)r);
+            assert(((uint8_t *)p)[psz - 1] == (uint8_t)(r ^ 0xFF));
+            pion_rc_dec(p);
+        }
+    }
+
+    /* 2. Array and Map growth across 1K -> 2K -> 4K -> 8K -> 16K -> 32K boundaries */
+    for (int rep = 0; rep < 16; rep++) {
+        void *arr = pion_arr_new(0, 0);
+        for (int64_t i = 0; i < 4200; i++) {
+            pion_arr_push(arr, i * 3 + rep);
+        }
+        assert(pion_arr_len(arr) == 4200);
+        assert(pion_arr_get(arr, 0) == rep);
+        assert(pion_arr_get(arr, 4199) == 4199 * 3 + rep);
+        pion_rc_dec(arr);
+
+        void *mp = pion_map_new_int(0);
+        for (int64_t i = 0; i < 520; i++) {
+            pion_map_set(mp, (void *)(uintptr_t)(i + 1), i * 7 + rep);
+        }
+        assert(pion_map_len(mp) == 520);
+        assert(pion_map_get(mp, (void *)(uintptr_t)520) == 519 * 7 + rep);
+        pion_rc_dec(mp);
+    }
+
+    /* 3. Cross-thread frozen medium-block release (TSan/ASan stress) */
+    void *ch = pion_chan_new(32, 1);
+    void *sc = pion_scope_begin();
+    for (int w = 0; w < 4; w++) {
+        void **env = (void **)pion_alloc((uint32_t)sizeof(void *), PION_TAG_STRUCT, med_frozen_env_drop);
+        pion_rc_inc(ch);
+        *env = ch;
+        pion_scope_spawn(sc, med_frozen_worker, env);
+        pion_rc_dec(env);
+    }
+    for (int i = 0; i < 128; i++) {
+        uint32_t psz = tiers[i & 3];
+        void *obj = pion_alloc_uninit(psz, PION_TAG_STRUCT, NULL);
+        ((uint8_t *)obj)[0] = 0x5A;
+        ((uint8_t *)obj)[psz - 1] = (uint8_t)i;
+        pion_chan_send(ch, (int64_t)(uintptr_t)obj);
+        pion_rc_dec(obj);
+    }
+    pion_chan_close(ch);
+    pion_scope_end(sc);
+    pion_rc_dec(ch);
+    printf("[PASS] med_cache_and_mt_frozen (2K/4K/8K/16K TLS cache + Array/Map + MT frozen)\n");
+}
+
 typedef struct ExecStressEnv {
     void *world;
     void *done_cnt;
@@ -2664,6 +2752,7 @@ int main(int argc, char **argv) {
     test_mt_mutex_deep_containers();
     test_mt_nested_scope();
     test_mt_slab_stress();
+    test_med_cache_and_mt_frozen();
     test_mt_world_exec(argc, argv);
     test_tcp_loopback_mt(argc, argv);
     test_event_loop_nb(argc, argv);

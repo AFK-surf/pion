@@ -234,5 +234,27 @@ if [ "$MP_OUT" != "pkg_a_ok:pkg_b_ok:42" ]; then
   echo "FAIL: mp_clo wasm32 output mismatch: '$MP_OUT'" >&2
   exit 1
 fi
+# Verify zero leaked internal exports (no pion_pkg_* / pion_drop_* / pion_clo_* in export section)
+# and verify auto wasm-opt -Oz shrinks --release output when wasm-opt is on PATH
+MP_RAW="$TMP_DIR/mp_clo_noopt.wasm"
+PION_NO_WASM_OPT=1 "$PIONC" build --release --target wasm32 -o "$MP_RAW" "$MP_DIR/app"
+node -e '
+const fs = require("node:fs");
+const optBytes = fs.readFileSync(process.argv[1]);
+const rawBytes = fs.readFileSync(process.argv[2]);
+const hasWopt = process.argv[3] === "1";
+const mod = new WebAssembly.Module(optBytes);
+const exps = WebAssembly.Module.exports(mod).filter(e => e.kind === "function").map(e => e.name);
+const leaked = exps.filter(n => n.startsWith("pion_pkg_") || n.startsWith("pion_drop_") || n.startsWith("pion_clo_") || n.startsWith("pion_init_"));
+if (leaked.length > 0) {
+  console.error("FAIL: leaked internal exports:", leaked);
+  process.exit(1);
+}
+if (hasWopt && optBytes.length >= rawBytes.length) {
+  console.error("FAIL: expected auto wasm-opt -Oz to shrink mp_clo:", optBytes.length, ">=", rawBytes.length);
+  process.exit(1);
+}
+console.log("  mp_clo export check OK:", exps, "raw=" + rawBytes.length + "B opt=" + optBytes.length + "B");
+' "$MP_WASM" "$MP_RAW" "$(command -v wasm-opt >/dev/null 2>&1 && echo 1 || echo 0)"
 
 echo "p29c_wasm32 E2E: OK"

@@ -2598,9 +2598,313 @@ fn wasm_extract_sym_name(raw : String) -> String {
 fn wasm_is_internal_mangled_export(name : String) -> Bool {
   name.starts_with("pion_pkg_") ||
   name.starts_with("pion_init_consts_") ||
+  name.starts_with("__pion_init_") ||
   name.starts_with("pion_fn_") ||
   name.starts_with("pion_m_") ||
-  name.starts_with("pion_drop_")
+  name.starts_with("pion_drop_") ||
+  name.starts_with("pion_clo_") ||
+  name.starts_with("pion_wrap_") ||
+  name.starts_with("pion_impl_") ||
+  name.starts_with("pion_trait_") ||
+  name.starts_with("pion_vtable_")
+}
+
+///|
+fn wasm_is_ro_dedup_data(name : String) -> Bool {
+  name.contains("pion_str_") ||
+  name.contains("pion_cstr_") ||
+  name.contains("pion_none_hdr")
+}
+
+///|
+fn wasm_data_content_key(dd : WasmDataDef) -> String {
+  let sb = StringBuilder()
+  sb.write_string(dd.align.to_string())
+  sb.write_char('|')
+  let mut i = 0
+  while i < dd.items.length() {
+    let it = dd.items[i]
+    // Never dedup data containing symbol relocations
+    if it.raw.length() > 0 && str_code_at(it.raw, 0) == 36 {
+      return ""
+    }
+    sb.write_string(it.kind)
+    sb.write_char(':')
+    sb.write_string(it.raw)
+    sb.write_char(';')
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn wasm_rewrite_sym_ref(raw : String, aliases : Map[String, String]) -> String {
+  if raw.length() <= 1 || str_code_at(raw, 0) != 36 {
+    return raw
+  }
+  let s = wasm_trim(raw)
+  let plus = wasm_find_char(s, 43, 1)
+  let minus = wasm_find_char(s, 45, 1)
+  if plus > 0 {
+    let sym = wasm_trim(slice_str(s, 1, plus))
+    match aliases.get(sym) {
+      Some(canon) => "$" + canon + slice_str(s, plus, s.length())
+      None => raw
+    }
+  } else if minus > 0 {
+    let sym = wasm_trim(slice_str(s, 1, minus))
+    match aliases.get(sym) {
+      Some(canon) => "$" + canon + slice_str(s, minus, s.length())
+      None => raw
+    }
+  } else {
+    let sym = slice_str(s, 1, s.length())
+    match aliases.get(sym) {
+      Some(canon) => "$" + canon
+      None => raw
+    }
+  }
+}
+
+///|
+fn wasm_func_fingerprint(f : WasmFunc) -> String {
+  let sb = StringBuilder()
+  sb.write_string(f.ret_ty.to_string())
+  sb.write_char('(')
+  let reg_map : Map[String, String] = Map([])
+  let mut next_reg = 0
+  let mut pi = 0
+  while pi < f.param_tys.length() {
+    sb.write_string(f.param_tys[pi].to_string())
+    sb.write_char(',')
+    if pi < f.param_names.length() {
+      reg_map.set(f.param_names[pi], "%r" + next_reg.to_string())
+      next_reg = next_reg + 1
+    }
+    pi = pi + 1
+  }
+  sb.write_char(')')
+  let lbl_map : Map[String, String] = Map([])
+  let mut bi = 0
+  while bi < f.blocks.length() {
+    lbl_map.set(f.blocks[bi].label, "@b" + bi.to_string())
+    bi = bi + 1
+  }
+  bi = 0
+  while bi < f.blocks.length() {
+    sb.write_string("@b")
+    sb.write_string(bi.to_string())
+    sb.write_char(':')
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      if inst.dst.length() > 0 {
+        let ndst = match reg_map.get(inst.dst) {
+          Some(r) => r
+          None => {
+            let r = "%r" + next_reg.to_string()
+            next_reg = next_reg + 1
+            reg_map.set(inst.dst, r)
+            r
+          }
+        }
+        sb.write_string(ndst)
+        sb.write_char('=')
+        sb.write_string(inst.dst_ty.to_string())
+        sb.write_char(' ')
+      }
+      sb.write_string(inst.op)
+      let mut ai = 0
+      while ai < inst.args.length() {
+        sb.write_char(' ')
+        let a = inst.args[ai]
+        if a.length() > 0 && str_code_at(a, 0) == 37 {
+          let nr = match reg_map.get(a) {
+            Some(r) => r
+            None => {
+              let r = "%r" + next_reg.to_string()
+              next_reg = next_reg + 1
+              reg_map.set(a, r)
+              r
+            }
+          }
+          sb.write_string(nr)
+        } else if a.length() > 0 && str_code_at(a, 0) == 64 {
+          match lbl_map.get(a) {
+            Some(nl) => sb.write_string(nl)
+            None => sb.write_string(a)
+          }
+        } else {
+          sb.write_string(a)
+        }
+        ai = ai + 1
+      }
+      if inst.arg_tys.length() > 0 {
+        sb.write_char('[')
+        let mut ti = 0
+        while ti < inst.arg_tys.length() {
+          sb.write_string(inst.arg_tys[ti].to_string())
+          sb.write_char(',')
+          ti = ti + 1
+        }
+        sb.write_char(']')
+      }
+      sb.write_char(';')
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Deduplicate identical immutable static data (`pion_str_*`, `pion_cstr_*`, `pion_none_hdr`)
+/// and identical non-root internal functions across multi-package units (2 rounds).
+fn wasm_dedup_module(parsed : WasmModuleParsed) -> WasmModuleParsed {
+  let aliases : Map[String, String] = Map([])
+  // 1. Deduplicate immutable read-only static data
+  let seen_data_key : Map[String, String] = Map([])
+  let dedup_datas : Array[WasmDataDef] = []
+  let mut di = 0
+  while di < parsed.datas.length() {
+    let dd = parsed.datas[di]
+    let mut dropped = false
+    if wasm_is_ro_dedup_data(dd.name) {
+      let key = wasm_data_content_key(dd)
+      if key.length() > 0 {
+        match seen_data_key.get(key) {
+          Some(canon) => {
+            aliases.set(dd.name, canon)
+            dropped = true
+          }
+          None => seen_data_key.set(key, dd.name)
+        }
+      }
+    }
+    if !dropped {
+      dedup_datas.push(dd)
+    }
+    di = di + 1
+  }
+
+  let mut cur_funcs = parsed.funcs
+  let mut has_main = false
+  let mut fi = 0
+  while fi < cur_funcs.length() {
+    if cur_funcs[fi].name == "main" {
+      has_main = true
+    }
+    fi = fi + 1
+  }
+
+  // Rewrite data aliases into funcs first, then run 2 rounds of identical-function dedup
+  let mut round = 0
+  while round < 3 {
+    if round == 0 && aliases.length() > 0 {
+      fi = 0
+      while fi < cur_funcs.length() {
+        let f = cur_funcs[fi]
+        let mut bi = 0
+        while bi < f.blocks.length() {
+          let insts = f.blocks[bi].insts
+          let mut ii = 0
+          while ii < insts.length() {
+            let args = insts[ii].args
+            let mut ai = 0
+            while ai < args.length() {
+              args[ai] = wasm_rewrite_sym_ref(args[ai], aliases)
+              ai = ai + 1
+            }
+            ii = ii + 1
+          }
+          bi = bi + 1
+        }
+        fi = fi + 1
+      }
+      di = 0
+      while di < dedup_datas.length() {
+        let items = dedup_datas[di].items
+        let mut ii = 0
+        while ii < items.length() {
+          let nr = wasm_rewrite_sym_ref(items[ii].raw, aliases)
+          if nr != items[ii].raw {
+            items[ii] = WasmDataItem::{ kind: items[ii].kind, raw: nr }
+          }
+          ii = ii + 1
+        }
+        di = di + 1
+      }
+    }
+    if round >= 2 {
+      break
+    }
+    let fn_aliases : Map[String, String] = Map([])
+    let seen_fp : Map[String, String] = Map([])
+    let next_funcs : Array[WasmFunc] = []
+    let mut merged = 0
+    fi = 0
+    while fi < cur_funcs.length() {
+      let f = cur_funcs[fi]
+      let is_root = f.name == "main" || f.name == "_start" ||
+        (f.exported && (!has_main || !wasm_is_internal_mangled_export(f.name)))
+      if is_root {
+        next_funcs.push(f)
+      } else {
+        let fp = wasm_func_fingerprint(f)
+        match seen_fp.get(fp) {
+          Some(canon) => {
+            fn_aliases.set(f.name, canon)
+            merged = merged + 1
+          }
+          None => {
+            seen_fp.set(fp, f.name)
+            next_funcs.push(f)
+          }
+        }
+      }
+      fi = fi + 1
+    }
+    if merged == 0 {
+      break
+    }
+    cur_funcs = next_funcs
+    fi = 0
+    while fi < cur_funcs.length() {
+      let f = cur_funcs[fi]
+      let mut bi = 0
+      while bi < f.blocks.length() {
+        let insts = f.blocks[bi].insts
+        let mut ii = 0
+        while ii < insts.length() {
+          let args = insts[ii].args
+          let mut ai = 0
+          while ai < args.length() {
+            args[ai] = wasm_rewrite_sym_ref(args[ai], fn_aliases)
+            ai = ai + 1
+          }
+          ii = ii + 1
+        }
+        bi = bi + 1
+      }
+      fi = fi + 1
+    }
+    di = 0
+    while di < dedup_datas.length() {
+      let items = dedup_datas[di].items
+      let mut ii = 0
+      while ii < items.length() {
+        let nr = wasm_rewrite_sym_ref(items[ii].raw, fn_aliases)
+        if nr != items[ii].raw {
+          items[ii] = WasmDataItem::{ kind: items[ii].kind, raw: nr }
+        }
+        ii = ii + 1
+      }
+      di = di + 1
+    }
+    round = round + 1
+  }
+  WasmModuleParsed::{ datas: dedup_datas, funcs: cur_funcs }
 }
 
 ///|
@@ -2966,7 +3270,7 @@ fn wasm_build_rc_dec_body(slow_imp_idx : Int) -> Array[Int] {
 ///|
 /// Compile QBE SSA text directly into a valid WebAssembly 32-bit (.wasm) binary.
 pub fn emit_wasm_from_ssa(ssa : String) -> Bytes {
-  let parsed = wasm_dce_module(wasm_parse_ssa(ssa))
+  let parsed = wasm_dedup_module(wasm_dce_module(wasm_parse_ssa(ssa)))
 
   let ctx = WasmModCtx::{
     sigs: [],
@@ -3335,11 +3639,10 @@ pub fn emit_wasm_from_ssa(ssa : String) -> Bytes {
   let exp_names : Array[String] = [
     "memory",
     "__indirect_function_table",
-    "__pion_stack_ptr",
     "__heap_base",
   ]
-  let exp_kinds : Array[Int] = [0x02, 0x01, 0x03, 0x03]
-  let exp_idxs : Array[Int] = [0, 0, 0, 1]
+  let exp_kinds : Array[Int] = [0x02, 0x01, 0x03]
+  let exp_idxs : Array[Int] = [0, 0, 1]
   let mut mod_has_main = false
   fi = 0
   while fi < parsed.funcs.length() {
@@ -3351,7 +3654,8 @@ pub fn emit_wasm_from_ssa(ssa : String) -> Bytes {
   fi = 0
   while fi < parsed.funcs.length() {
     let f = parsed.funcs[fi]
-    if f.name == "main" || (f.exported && (!mod_has_main || !wasm_is_internal_mangled_export(f.name))) {
+    if f.name == "main" || f.name == "_start" ||
+      (f.exported && (!mod_has_main || !wasm_is_internal_mangled_export(f.name))) {
       exp_names.push(f.name)
       exp_kinds.push(0x00)
       exp_idxs.push(num_imports + fi)
