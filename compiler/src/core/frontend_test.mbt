@@ -2104,3 +2104,50 @@ test "p20a: 6 new machine-applicable edits complete 12/12 coverage" {
     patched08,
   )
 }
+
+///|
+test "p24a_map_key_and_empty_branch" {
+  // Bug 5: Map[K, V] rejects non-String keys with E_MAP_KEY_TYPE
+  let bad_map =
+    #|pub fn f(m : Map[Int, String]) -> Int {
+    #|  m.length()
+    #|}
+  let (ok_m, json_m, _) = check_one(bad_map)
+  assert_true(!ok_m && str_contains(json_m, "E_MAP_KEY_TYPE"), json_m)
+
+  // Map[String, Int] and generic Map[K, V] remain accepted
+  let ok_map =
+    #|pub fn g[K, V](m : Map[K, V]) -> Int {
+    #|  m.length()
+    #|}
+    #|pub fn h(m : Map[String, Int]) -> Int {
+    #|  m.length()
+    #|}
+  let (ok_g, json_g, _) = check_one(ok_map)
+  assert_true(ok_g, json_g)
+
+  // Bug 2: if/match with empty [] first branch infers concrete element type from other branch
+  let ok_if =
+    #|pub fn pick(cond : Bool, k : Int) -> Int {
+    #|  let xs = if cond { [] } else { ["a", "b"] }
+    #|  xs.push("c")
+    #|  let ys = match k {
+    #|    0 => []
+    #|    _ => ["x", "y"]
+    #|  }
+    #|  ys.push("z")
+    #|  xs.length() + ys.length()
+    #|}
+  let (ok_b2, json_b2, _) = check_one(ok_if)
+  assert_true(ok_b2, json_b2)
+
+  // Pushing wrong type into inferred Array[String] must fail type check
+  let bad_if =
+    #|pub fn bad_pick(cond : Bool) -> Int {
+    #|  let xs = if cond { [] } else { ["a", "b"] }
+    #|  xs.push(123)
+    #|  xs.length()
+    #|}
+  let (ok_bad, json_bad, _) = check_one(bad_if)
+  assert_true(!ok_bad && str_contains(json_bad, "E_TYPE_MISMATCH"), json_bad)
+}

@@ -1520,6 +1520,19 @@ fn resolve_type_expr(
       if name == "Map" {
         let k = if rargs.length() >= 1 { rargs[0] } else { TError }
         let v = if rargs.length() >= 2 { rargs[1] } else { TError }
+        match k {
+          TString | TParam(_) | TError => ()
+          _ =>
+            tc_err(
+              tc,
+              sp,
+              "E_MAP_KEY_TYPE",
+              "`Map` keys must be `String`, got `" + ty_to_string(k) + "`",
+              "String",
+              ty_to_string(k),
+              "use `Map[String, " + ty_to_string(v) + "]`",
+            )
+        }
         return TMap(k, v)
       }
       if name == "Channel" {
@@ -1737,6 +1750,37 @@ fn unify_tparams(pattern : Ty, actual : Ty, subst : Map[String, Ty]) -> Unit {
         _ => ()
       }
     _ => ()
+  }
+}
+
+///|
+fn ty_has_unresolved(t : Ty) -> Bool {
+  match t {
+    TError => true
+    TArray(e) => ty_has_unresolved(e)
+    TMap(k, v) => ty_has_unresolved(k) || ty_has_unresolved(v)
+    TOption(e) => ty_has_unresolved(e)
+    TResult(ok, err) => ty_has_unresolved(ok) || ty_has_unresolved(err)
+    TChannel(e) => ty_has_unresolved(e)
+    TMutex(e) => ty_has_unresolved(e)
+    _ => false
+  }
+}
+
+///|
+fn ty_prefer_concrete(a : Ty, b : Ty) -> Ty {
+  match a {
+    TNever => b
+    _ =>
+      match b {
+        TNever => a
+        _ =>
+          if ty_has_unresolved(a) && !ty_has_unresolved(b) {
+            b
+          } else {
+            a
+          }
+      }
   }
 }
 
@@ -5790,10 +5834,7 @@ fn check_expr_inner(
               "make both branches return `" + ty_to_string(then_ty) + "`",
             )
           }
-          match then_ty {
-            TNever => else_ty
-            _ => then_ty
-          }
+          ty_prefer_concrete(then_ty, else_ty)
         }
       }
     }
@@ -5830,7 +5871,7 @@ fn check_expr_inner(
               TNever => ()
               _ => res_ty = Some(bty)
             }
-          Some(rt) =>
+          Some(rt) => {
             if !ty_compat(rt, bty) {
               tc_err(
                 tc,
@@ -5842,6 +5883,8 @@ fn check_expr_inner(
                 "return `" + ty_to_string(rt) + "` from every arm",
               )
             }
+            res_ty = Some(ty_prefer_concrete(rt, bty))
+          }
         }
         i = i + 1
       }

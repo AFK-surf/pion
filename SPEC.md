@@ -204,6 +204,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void  pion_rc_inc(void *obj);` (no-op if NULL or `PION_FLAG_IMMORTAL`; fast non-atomic if `owner_tid == pion_cur_tid()`, else atomic)
 - `void  pion_rc_dec(void *obj);` (no-op if NULL or `PION_FLAG_IMMORTAL`; frees + calls `drop_fn` when total RC hits 0)
 - `void  pion_rc_freeze(void *obj);` (promotes `owner_tid` to 0 and moves `local_rc` into `shared_rc` before crossing thread boundary; freezing a `Map` also freezes its keys and object values)
+- `void  pion_rc_immortalize(void *obj);` (marks a module-level heap constant and its reachable `Array`/`Map` children `PION_FLAG_FROZEN | PION_FLAG_IMMORTAL` during `init_consts`, making cross-thread reads zero-atomic-overhead and race-free)
 - `void  pion_panic(const char *msg, const char *file, int32_t line);` (prints concise diagnostic to stderr and `abort()`/`_exit(1)`)
 - `void  pion_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line);`
 

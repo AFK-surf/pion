@@ -421,6 +421,33 @@ PION_MINSIZE static void pion_freeze_arr_elems(PionArray *a) {
     }
 }
 
+PION_MINSIZE void pion_rc_immortalize(void *obj) {
+    if (!obj) return;
+    PionHeader *hdr = pion_hdr(obj);
+    if (hdr->flags & PION_FLAG_IMMORTAL) return;
+    hdr->owner_tid = 0;
+    hdr->local_rc = 0;
+    hdr->flags |= (PION_FLAG_FROZEN | PION_FLAG_IMMORTAL);
+    if (hdr->type_tag == PION_TAG_ARRAY) {
+        PionArray *a = (PionArray *)obj;
+        if (a->elem_is_obj) {
+            for (int64_t i = 0; i < a->len; i++) {
+                pion_rc_immortalize((void *)(uintptr_t)a->data[i]);
+            }
+        }
+    } else if (hdr->type_tag == PION_TAG_MAP) {
+        PionMap *m = (PionMap *)obj;
+        for (int64_t i = 0; i < m->cap; i++) {
+            if (m->entries[i].state == 1) {
+                pion_rc_immortalize(m->entries[i].key);
+                if (m->val_is_obj) {
+                    pion_rc_immortalize((void *)(uintptr_t)m->entries[i].val);
+                }
+            }
+        }
+    }
+}
+
 static inline void pion_adopt(void *container, int64_t val) {
     if (__builtin_expect(pion_hdr(container)->owner_tid == 0, 0)) {
         pion_rc_freeze((void *)(uintptr_t)val);

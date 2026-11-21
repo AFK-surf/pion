@@ -1872,3 +1872,140 @@ test "p20a: dyn Trait emits fat-pointer vtable, thunks, drop_dyn, and niche Opti
   // Niche Option[dyn Describe] must NOT box Option with $pion_drop_opt_obj
   assert_true(!ssa.contains("$pion_drop_opt_obj"), ssa)
 }
+
+///|
+test "p24a_five_bug_fixes" {
+  // Bug 1, 2, 3, 4 (local), 5 (test block return)
+  let src =
+    #|let CONST_ARR : Array[String] = ["a", "b"]
+    #|fn inc(x : Int) -> Int {
+    #|  x + 1
+    #|}
+    #|fn apply(f : (Int) -> Int, v : Int) -> Int {
+    #|  f(v)
+    #|}
+    #|pub fn clone_arr[T](xs : Array[T]) -> Array[T] {
+    #|  let out : Array[T] = []
+    #|  let mut i = 0
+    #|  while i < xs.length() {
+    #|    out.push(xs[i])
+    #|    i = i + 1
+    #|  }
+    #|  out
+    #|}
+    #|pub fn empty_branch(cond : Bool, k : Int) -> Int {
+    #|  let xs = if cond { [] } else { ["a", "b"] }
+    #|  xs.push("c")
+    #|  let ys = match k {
+    #|    0 => []
+    #|    _ => ["x", "y"]
+    #|  }
+    #|  ys.push("z")
+    #|  xs.length() + ys.length() + apply(inc, CONST_ARR.length())
+    #|}
+    #|test "early return in match" {
+    #|  let res : Result[Int, String] = Err("boom")
+    #|  let x = match res {
+    #|    Ok(v) => v
+    #|    Err(_) => {
+    #|      return
+    #|    }
+    #|  }
+    #|  debug_assert(x == 0, "unreachable")
+    #|}
+  let cr = @core.check_source_files_full("p24a_cg", ["p24a_cg.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  // Bug 1: init_consts immortalizes module-level heap constants
+  assert_true(ssa.contains("call $pion_rc_immortalize("), ssa)
+  // Bug 2: empty_branch emits pion_arr_new(l 0, w 1) for empty [] branch (never w 0)
+  let eb_s = p18_find_from(ssa, "$pion_fn_empty_branch(", 0)
+  let eb_e = p18_find_from(ssa, "\n}", eb_s)
+  assert_true(eb_s >= 0 && eb_e > eb_s, ssa)
+  let eb_new0 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 0)", eb_s)
+  assert_true(eb_new0 < 0 || eb_new0 > eb_e, ssa)
+  let eb_new1 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 1)", eb_s)
+  assert_true(eb_new1 > eb_s && eb_new1 < eb_e, ssa)
+  // Bug 3: generic clone_arr[T] passes runtime %tp_T flag (truncated to w) to pion_arr_new
+  let ca_s = p18_find_from(ssa, "$pion_fn_clone_arr(", 0)
+  let ca_e = p18_find_from(ssa, "\n}", ca_s)
+  assert_true(ca_s >= 0 && ca_e > ca_s, ssa)
+  let ca_tpw = p18_find_from(ssa, "=w copy %tp_T", ca_s)
+  assert_true(ca_tpw > ca_s && ca_tpw < ca_e, ssa)
+  // Bug 5: test runner emits bare `ret` (not `ret 0`) inside void $pion_test_fn_0
+  let tssa = @core.emit_qbe_test_package(cr.pkg, cr.tc, []).ssa
+  let tf_s = p18_find_from(tssa, "function $pion_test_fn_0()", 0)
+  let tf_e = p18_find_from(tssa, "\n}", tf_s)
+  assert_true(tf_s >= 0 && tf_e > tf_s, tssa)
+  let tf_ret0 = p18_find_from(tssa, "ret 0", tf_s)
+  assert_true(tf_ret0 < 0 || tf_ret0 > tf_e, tssa)
+}
+
+///|
+test "p24a_bug6_generic_drop_fn" {
+  let src =
+    #|pub struct Box[T] {
+    #|  item : T
+    #|}
+    #|pub enum Wrap[T] {
+    #|  WVal(T)
+    #|  WEmpty
+    #|}
+    #|pub fn wrap_ok[T](v : T) -> Result[T, String] {
+    #|  Ok(v)
+    #|}
+    #|pub fn wrap_err[E](e : E) -> Result[Int, E] {
+    #|  Err(e)
+    #|}
+    #|pub fn wrap_some[T](v : T) -> Option[T] {
+    #|  Some(v)
+    #|}
+    #|pub fn wrap_box[T](v : T) -> Box[T] {
+    #|  Box::{ item: v }
+    #|}
+    #|pub fn wrap_enum[T](v : T) -> Wrap[T] {
+    #|  WVal(v)
+    #|}
+    #|pub fn wrap_pair[T](v : T) -> (T, Int) {
+    #|  (v, 1)
+    #|}
+  let cr = @core.check_source_files_full("p24a_b6", ["p24a_b6.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  // wrap_ok[T]: selects $pion_drop_res_ok dynamically on %tp_T
+  let wok_s = p18_find_from(ssa, "$pion_fn_wrap_ok(", 0)
+  let wok_e = p18_find_from(ssa, "\n}", wok_s)
+  assert_true(wok_s >= 0 && wok_e > wok_s, ssa)
+  let wok_jnz = p18_find_from(ssa, "jnz %tp_T,", wok_s)
+  assert_true(wok_jnz > wok_s && wok_jnz < wok_e, ssa)
+  let wok_dp = p18_find_from(ssa, "$pion_drop_res_ok", wok_s)
+  assert_true(wok_dp > wok_s && wok_dp < wok_e, ssa)
+  // wrap_err[E]: selects $pion_drop_res_err dynamically on %tp_E
+  let werr_s = p18_find_from(ssa, "$pion_fn_wrap_err(", 0)
+  let werr_e = p18_find_from(ssa, "\n}", werr_s)
+  assert_true(werr_s >= 0 && werr_e > werr_s, ssa)
+  let werr_dp = p18_find_from(ssa, "$pion_drop_res_err", werr_s)
+  assert_true(werr_dp > werr_s && werr_dp < werr_e, ssa)
+  // wrap_some[T]: selects $pion_drop_opt_obj dynamically on %tp_T
+  let ws_s = p18_find_from(ssa, "$pion_fn_wrap_some(", 0)
+  let ws_e = p18_find_from(ssa, "\n}", ws_s)
+  assert_true(ws_s >= 0 && ws_e > ws_s, ssa)
+  let ws_dp = p18_find_from(ssa, "$pion_drop_opt_obj", ws_s)
+  assert_true(ws_dp > ws_s && ws_dp < ws_e, ssa)
+  // wrap_box[T], wrap_enum[T], wrap_pair[T]: select slot drop dynamically on %tp_T
+  let wb_s = p18_find_from(ssa, "$pion_fn_wrap_box(", 0)
+  let wb_e = p18_find_from(ssa, "\n}", wb_s)
+  assert_true(p18_find_from(ssa, "$pion_drop_slots_1", wb_s) < wb_e, ssa)
+  let we_s = p18_find_from(ssa, "$pion_fn_wrap_enum(", 0)
+  let we_e = p18_find_from(ssa, "\n}", we_s)
+  assert_true(p18_find_from(ssa, "$pion_drop_slots_2", we_s) < we_e, ssa)
+  let wp_s = p18_find_from(ssa, "$pion_fn_wrap_pair(", 0)
+  let wp_e = p18_find_from(ssa, "\n}", wp_s)
+  assert_true(p18_find_from(ssa, "$pion_drop_slots_1", wp_s) < wp_e, ssa)
+}

@@ -105,6 +105,7 @@ void*    pion_alloc_uninit(uint32_t payload_size, uint16_t type_tag, PionDropFn 
 void     pion_rc_inc(void *obj);
 void     pion_rc_dec(void *obj);
 void     pion_rc_freeze(void *obj);
+void     pion_rc_immortalize(void *obj);
 void     pion_panic(const char *msg, const char *file, int32_t line) __attribute__((noreturn));
 void     pion_panic_oob(int64_t idx, int64_t len) __attribute__((noreturn));
 void     pion_debug_assert(int32_t cond, void *msg_str, const char *file, int32_t line);
