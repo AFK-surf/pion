@@ -135,6 +135,43 @@ fn take_opt_str(x : Option[String]) -> Int {
   }
 }
 
+// Bug #18b single-pkg check (also covered under ASan/LSan + Wasm32):
+// struct literal with `value: None` before `getter: g` inferring T = Payload
+struct LocalState[T] {
+  mut value : Option[T]
+  getter : () -> T
+}
+
+struct LocalBoxed[T] {
+  state : LocalState[T]
+}
+
+fn make_local_boxed[T](g : () -> T) -> LocalBoxed[T] {
+  let st = LocalState::{ value: None, getter: g }
+  LocalBoxed::{ state: st }
+}
+
+fn LocalBoxed::get[T](self : LocalBoxed[T]) -> T {
+  match self.state.value {
+    Some(v) => v
+    None => {
+      let f = self.state.getter
+      let v = f()
+      self.state.value = Some(v)
+      v
+    }
+  }
+}
+
+fn LocalBoxed::untracked[T](self : LocalBoxed[T]) -> T {
+  self.get()
+}
+
+struct LocalPayload {
+  id : Int
+  tag : String
+}
+
 struct CellI {
   mut v : Int
 }
@@ -239,6 +276,19 @@ pub fn main(world : World) -> Int {
   let pass_none = None
   debug_assert(take_opt_str(pass_none) == 7, "bug17 let x = None; take_opt(x)")
 
+  // Bug #18a + #18b single-pkg (native + ASan/LSan + Wasm32)
+  let lb1 = make_local_boxed(fn() { LocalPayload::{ id: 42, tag: "o" + "k" } })
+  let lp1 = lb1.untracked()
+  debug_assert(lp1.id == 42 && lp1.tag == "ok", "bug18 local untracked first")
+  let lb2 = make_local_boxed(fn() { LocalPayload::{ id: 42, tag: "o" + "k" } })
+  let lp2a = lb2.get()
+  let lp2b = lb2.untracked()
+  debug_assert(lp2a.id == 42 && lp2b.id == 42 && lp2b.tag == "ok", "bug18 local get then untracked")
+  let lb3 = make_local_boxed(fn() { LocalPayload::{ id: 42, tag: "o" + "k" } })
+  let lp3a = lb3.untracked()
+  let lp3b = lb3.get()
+  debug_assert(lp3a.id == 42 && lp3b.id == 42 && lp3b.tag == "ok", "bug18 local untracked then get")
+
   io_println(world, "p30c_generic_infer ok")
   0
 }
@@ -276,6 +326,105 @@ if command -v node >/dev/null 2>&1; then
   echo "p30c_generic_infer wasm32 -> $WASM_OUT"
   if [ "$WASM_OUT" != "p30c_generic_infer ok" ]; then
     echo "FAIL: p30c_generic_infer wasm32 output mismatch" >&2
+    exit 1
+  fi
+fi
+
+# Bug #18a + #18b cross-package workspace E2E (native + Wasm32)
+WS_DIR="$TMP_DIR/b18_ws"
+mkdir -p "$WS_DIR/pkg_a/src" "$WS_DIR/pkg_b/src"
+
+cat > "$WS_DIR/pkg_a/pion.toml" <<'EOF'
+[package]
+name = "pkg_a"
+version = "0.1.0"
+EOF
+
+cat > "$WS_DIR/pkg_a/src/lib.pion" <<'EOF'
+pub struct BoxState[T] {
+  pub mut value : Option[T]
+  pub getter : () -> T
+}
+
+pub struct Boxed[T] {
+  state : BoxState[T]
+}
+
+pub fn make_boxed[T](g : () -> T) -> Boxed[T] {
+  let st = BoxState::{ value: None, getter: g }
+  Boxed::{ state: st }
+}
+
+pub fn Boxed::get[T](self : Boxed[T]) -> T {
+  match self.state.value {
+    Some(v) => v
+    None => {
+      let f = self.state.getter
+      let v = f()
+      self.state.value = Some(v)
+      v
+    }
+  }
+}
+
+pub fn Boxed::untracked[T](self : Boxed[T]) -> T {
+  self.get()
+}
+EOF
+
+cat > "$WS_DIR/pkg_b/pion.toml" <<'EOF'
+[package]
+name = "pkg_b"
+version = "0.1.0"
+
+[dependencies]
+pkg_a = { path = "../pkg_a" }
+EOF
+
+cat > "$WS_DIR/pkg_b/src/main.pion" <<'EOF'
+import "pkg_a"
+
+struct Payload {
+  id : Int
+  tag : String
+}
+
+pub fn main(world : World) -> Int {
+  let b1 = pkg_a::make_boxed(fn() { Payload::{ id: 42, tag: "o" + "k" } })
+  let p1 = b1.untracked()
+  debug_assert(p1.id == 42 && p1.tag == "ok", "bug18 cross-pkg untracked first")
+
+  let b2 = pkg_a::make_boxed(fn() { Payload::{ id: 42, tag: "o" + "k" } })
+  let p2a = b2.get()
+  let p2b = b2.untracked()
+  debug_assert(p2a.id == 42 && p2a.tag == "ok", "bug18 cross-pkg get first")
+  debug_assert(p2b.id == 42 && p2b.tag == "ok", "bug18 cross-pkg untracked after get")
+
+  let b3 = pkg_a::make_boxed(fn() { Payload::{ id: 42, tag: "o" + "k" } })
+  let p3a = b3.untracked()
+  let p3b = b3.get()
+  debug_assert(p3a.id == 42 && p3a.tag == "ok", "bug18 cross-pkg untracked before get")
+  debug_assert(p3b.id == 42 && p3b.tag == "ok", "bug18 cross-pkg get after untracked")
+
+  io_println(world, "p30c_bug18_cross_pkg ok")
+  0
+}
+EOF
+
+B18_OUT=$("$PIONC" run "$WS_DIR/pkg_b")
+echo "p30c_bug18_cross_pkg native -> $B18_OUT"
+if [ "$B18_OUT" != "p30c_bug18_cross_pkg ok" ]; then
+  echo "FAIL: p30c_bug18_cross_pkg native output mismatch" >&2
+  exit 1
+fi
+
+if command -v node >/dev/null 2>&1; then
+  B18_WASM="$TMP_DIR/b18_cross.wasm"
+  "$PIONC" build --target wasm32 -o "$B18_WASM" "$WS_DIR/pkg_b"
+  B18_WASM_OUT=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$B18_WASM")
+  echo "p30c_bug18_cross_pkg wasm32 -> $B18_WASM_OUT"
+  if [ "$B18_WASM_OUT" != "p30c_bug18_cross_pkg ok" ]; then
+    echo "FAIL: p30c_bug18_cross_pkg wasm32 output mismatch" >&2
     exit 1
   fi
 fi
