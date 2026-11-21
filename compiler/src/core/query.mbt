@@ -476,6 +476,21 @@ pub fn query_deps_json(pkg : Package) -> String {
             ci = ci + 1
           }
         }
+        DExternFn(ed) =>
+          if ed.has_body {
+            let calls : Array[String] = []
+            collect_stmt_calls(ed.body, calls)
+            let mut ci = 0
+            while ci < calls.length() {
+              let c = calls[ci]
+              if c == "scope" || c == "spawn" || starts_with_str(c, "Channel::") || starts_with_str(c, "Mutex::") || starts_with_str(c, "AtomicInt::") {
+                push_unique(deps, "pion/runtime/concurrency")
+              } else if is_world_builtin(c) || is_world_rt_prim(c) {
+                push_unique(deps, "pion/runtime/world")
+              }
+              ci = ci + 1
+            }
+          }
         _ => ()
       }
       di = di + 1

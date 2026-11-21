@@ -867,6 +867,25 @@ fn p_parse_extern_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl 
         )
     }
   }
+  let mut has_body = false
+  let mut body : Array[Stmt] = []
+  match p_peek(p).kind {
+    LBrace => {
+      has_body = true
+      if eparams.vararg_from >= 0 {
+        p_err(
+          p,
+          p_peek(p).span,
+          "exported `extern \"C\" fn` with body cannot be variadic (`...`)",
+          "fixed parameters",
+          "...",
+          "remove `...` from exported `extern \"C\" fn` definition",
+        )
+      }
+      body = p_parse_block_stmts(p)
+    }
+    _ => ()
+  }
   DExternFn(ExternFnDecl::{
     is_pub: is_pub,
     abi: abi,
@@ -875,6 +894,8 @@ fn p_parse_extern_fn_decl(p : Parser, is_pub : Bool, start_span : Span) -> Decl 
     params: eparams.params,
     vararg_from: eparams.vararg_from,
     ret_ty: ret_ty,
+    has_body: has_body,
+    body: body,
     span: start_span,
   })
 }
@@ -1233,7 +1254,14 @@ fn p_parse_stmt(p : Parser) -> Stmt {
       p_expect_lparen(p)
       let cond = p_parse_expr(p)
       let msg = if p_match_kind_comma(p) {
-        p_parse_expr(p)
+        match p_peek(p).kind {
+          RParen => EString("assertion failed", tok.span)
+          _ => {
+            let m = p_parse_expr(p)
+            let _ = p_match_kind_comma(p)
+            m
+          }
+        }
       } else {
         EString("assertion failed", tok.span)
       }

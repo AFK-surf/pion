@@ -633,7 +633,11 @@ pub fn emit_file_stub(f : SourceFile) -> String {
           sb.write_string(" = ")
           sb.write_string(json_quote(ed.c_symbol))
         }
-        sb.write_string("\n")
+        if ed.has_body {
+          sb.write_string(" { panic() }\n")
+        } else {
+          sb.write_string("\n")
+        }
       }
       DTrait(td) => {
         if td.is_pub {
@@ -712,7 +716,7 @@ pub fn emit_file_stub(f : SourceFile) -> String {
 }
 
 ///|
-pub fn pkg_has_pub_bounded_fn(pkg : Package) -> Bool {
+pub fn pkg_has_pub_generic_fn(pkg : Package) -> Bool {
   let mut fi = 0
   while fi < pkg.files.length() {
     let f = pkg.files[fi]
@@ -720,7 +724,7 @@ pub fn pkg_has_pub_bounded_fn(pkg : Package) -> Bool {
     while di < f.decls.length() {
       match f.decls[di] {
         DFn(fd) =>
-          if fd.is_pub && fd.type_bounds.length() > 0 {
+          if fd.is_pub && fd.type_params.length() > 0 {
             return true
           }
         _ => ()
@@ -738,10 +742,11 @@ pub fn pkg_has_pub_bounded_fn(pkg : Package) -> Bool {
 /// so downstream packages can typecheck against CAS-hit dependencies without
 /// re-parsing or typechecking upstream function bodies.
 pub fn emit_pion_stub(pkg : Package) -> String {
-  // A `pub` generic fn with trait bounds is monomorphized in the importing package
-  // from its body; a `{ panic() }` stub would be instantiated instead. Return "" so
-  // the driver loads this package from source.
-  if pkg_has_pub_bounded_fn(pkg) {
+  // A `pub` generic fn or method may be monomorphized in the importing package
+  // from its body (trait bounds, `==`/`!=`, or `Option[T]` null-niche); a
+  // `{ panic() }` stub would be instantiated instead. Return "" so the driver
+  // loads this package from source.
+  if pkg_has_pub_generic_fn(pkg) {
     return ""
   }
   let sb = StringBuilder()

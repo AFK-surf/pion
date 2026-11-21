@@ -2102,3 +2102,107 @@ test "p25a_extern_c_varargs_qbe_ir" {
   let va_sn0 = p18_find_from(ssa, ", ...)", sn0_pos)
   assert_true(va_sn0 > sn0_pos && va_sn0 < sn0_end, ssa)
 }
+
+///|
+test "p26b_extern_c_body_c_fn_ptr_zero_copy_math_sb_qbe_ir" {
+  let src =
+    #|pub extern "C" fn cb_add(a : Int, b : Int) -> Int = "my_cb_add" {
+    #|  a + b
+    #|}
+    #|extern "C" fn cb_void(p : Ptr, x : Int) -> Unit {
+    #|  ptr_write_i32(p, 0L, x)
+    #|}
+    #|pub fn test_p26b(s : String, bs : Bytes, arr : Array[Double], p : Ptr) -> Double {
+    #|  let _f1 = c_fn_ptr(cb_add)
+    #|  let _f2 = c_fn_ptr(cb_void)
+    #|  let _sp = str_data_ptr(s)
+    #|  let _bp = bytes_data_ptr(bs)
+    #|  let _ap = array_data_ptr(arr)
+    #|  ptr_write_f64(p, 0L, 1.5)
+    #|  ptr_write_f32(p, 8L, 2.25)
+    #|  let v = ptr_read_f64(p, 0L) + ptr_read_f32(p, 8L)
+    #|  let sb = StringBuilder()
+    #|  sb.write_byte(b'A')
+    #|  sb.write_bytes(bs)
+    #|  v + math_tan(0.5) + math_asin(0.5) + math_acos(0.5) + math_atan(0.5) +
+    #|    math_atan2(1.0, 2.0) + math_exp(1.0) + math_log(2.0) + math_round(1.6) + math_trunc(1.6)
+    #|}
+  let cr = @core.check_source_files_full("p26b_qbe", ["p26b_qbe.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  assert_true(ssa.contains("export function w $my_cb_add(w %p0, w %p1)"), ssa)
+  assert_true(ssa.contains("export function $cb_void(l %p0, w %p1)"), ssa)
+  assert_true(ssa.contains("=l copy $my_cb_add"), ssa)
+  assert_true(ssa.contains("=l copy $cb_void"), ssa)
+  assert_true(ssa.contains("=s loads "), ssa)
+  assert_true(ssa.contains("=d exts "), ssa)
+  assert_true(ssa.contains("=s truncd "), ssa)
+  assert_true(ssa.contains("stores "), ssa)
+  assert_true(ssa.contains("call $tan("), ssa)
+  assert_true(ssa.contains("call $asin("), ssa)
+  assert_true(ssa.contains("call $acos("), ssa)
+  assert_true(ssa.contains("call $atan("), ssa)
+  assert_true(ssa.contains("call $atan2("), ssa)
+  assert_true(ssa.contains("call $exp("), ssa)
+  assert_true(ssa.contains("call $log("), ssa)
+  assert_true(ssa.contains("call $round("), ssa)
+  assert_true(ssa.contains("call $trunc("), ssa)
+  assert_true(ssa.contains("call $pion_strbuf_push_byte("), ssa)
+}
+
+///|
+test "p26b_generic_method_option_mono_and_cross_pkg_export_internals" {
+  let lib_src =
+    #|let MASK : Int = 15
+    #|fn hash_int(k : Int) -> Int {
+    #|  (k * 31) & MASK
+    #|}
+    #|pub struct Wrap[V] {
+    #|  mut inner : Option[V]
+    #|}
+    #|pub fn Wrap::new[V]() -> Wrap[V] {
+    #|  Wrap::{ inner: None }
+    #|}
+    #|pub fn Wrap::set[V](self : Wrap[V], v : V) -> Unit {
+    #|  let _h = hash_int(1)
+    #|  self.inner = Some(v)
+    #|}
+    #|pub fn Wrap::get[V](self : Wrap[V]) -> Option[V] {
+    #|  self.inner
+    #|}
+  let lib_cr = @core.check_source_files_with_imports("wlib", ["wlib.pion"], [lib_src], [], true)
+  assert_true(
+    lib_cr.diagnostics.length() == 0,
+    @core.check_result_to_json(lib_cr.diagnostics),
+  )
+  // Upstream package with pub generic fn skips .pionstub and exports private helpers/consts
+  assert_eq(@core.emit_pion_stub(lib_cr.pkg), "")
+  let lib_ssa = @core.emit_qbe_package_multi(lib_cr.pkg, lib_cr.tc, false, false, []).ssa
+  assert_true(lib_ssa.contains("export function w $pion_pkg_wlib_fn_hash_int("), lib_ssa)
+  assert_true(lib_ssa.contains("export data $pion_pkg_wlib_const_MASK"), lib_ssa)
+
+  let app_src =
+    #|import "wlib"
+    #|pub fn run_wrap() -> Int {
+    #|  let ws : wlib::Wrap[String] = wlib::Wrap::new()
+    #|  ws.set("hi")
+    #|  let wi : wlib::Wrap[Int] = wlib::Wrap::new()
+    #|  wi.set(42)
+    #|  match (ws.get(), wi.get()) {
+    #|    (Some(s), Some(n)) => s.length() + n
+    #|    _ => 0
+    #|  }
+    #|}
+  let imported = [@core.imported_pkg_new("wlib", lib_cr.tc)]
+  let app_cr = @core.check_source_files_with_imports("app", ["main.pion"], [app_src], imported, true)
+  assert_true(
+    app_cr.diagnostics.length() == 0,
+    @core.check_result_to_json(app_cr.diagnostics),
+  )
+  let app_ssa = @core.emit_qbe_package_multi(app_cr.pkg, app_cr.tc, false, false, ["wlib"]).ssa
+  assert_true(app_ssa.contains("__mono_String("), app_ssa)
+  assert_true(app_ssa.contains("__mono_Int("), app_ssa)
+}

@@ -340,6 +340,8 @@ sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC"
 
 # P26-A: native link (c_sources .c/.cc invoke system cc/c++ which need real `as`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC"
+# P26-B: C callbacks, zero-copy FFI/math/StringBuilder, cross-pkg generic Option mono & private exports.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p26b_ffi_generics/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

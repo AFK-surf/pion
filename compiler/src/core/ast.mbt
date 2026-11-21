@@ -109,6 +109,8 @@ pub struct ExternFnDecl {
   params : Array[Param]
   vararg_from : Int
   ret_ty : TypeExpr
+  has_body : Bool
+  body : Array[Stmt]
   span : Span
 }
 

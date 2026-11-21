@@ -109,7 +109,7 @@ import "pkg_name" [as alias]
   ...
 }
 
-[pub] extern "C" fn name(p1 : Type1, [..., v1 : VarType1, ...]) -> RetType [= "c_symbol"]
+[pub] extern "C" fn name(p1 : Type1, [..., v1 : VarType1, ...]) -> RetType [= "c_symbol"] [{ ... }]
 
 [pub] trait Name {
   method(self : Self, p1 : Type1) -> RetType
@@ -152,7 +152,7 @@ test "test name" {
   - `Channel::new(cap)`, `ch.send(v)`, `ch.recv() -> Option[T]`, `ch.close()`
   - `Mutex::new(v)`, `m.with_lock(fn(v : T) -> R { ... })` / `m.lock()` + `m.set(v)` + `m.unlock()`
   - `AtomicInt::new(v)`, `a.load()`, `a.store(v)`, `a.fetch_add(d)`
-- Contracts: `debug_assert(cond, "msg")` (statement or expression position, type `Unit`)
+- Contracts: `debug_assert(cond, "msg"[,])` (statement or expression position, type `Unit`; optional trailing comma)
 - Built-in conversions and helpers:
   - `s.to_int() -> Option[Int]`, `s.to_int64() -> Option[Int64]`, `s.to_double() -> Option[Double]` on `String` (`None` on any malformed or out-of-range input; no exceptions, no partial parses)
   - `o.is_some()`, `o.is_none()`, `o.unwrap_or(default)` on `Option[T]`
@@ -337,8 +337,13 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void*   pion_world_exec_capture_bytes(void *w, void *argv_arr, int32_t *exit_code_out);` (`proc_exec_capture_bytes(world, argv : Array[String]) -> Result[Bytes, String]`; silences child stderr to `/dev/null`, preserves raw stdout bytes including `\0`, `Ok(bytes)` if exit code == 0 else `Err("exit <code>")`)
 - `void*   pion_sha256_hex(void *s);` (pure SHA-256 hex digest for CAS cache keys!)
 
-**FFI raw pointers, C variadic calls & C strings (no `World`; compiler builtins → direct calls):**
+**FFI raw pointers, C callbacks, C variadic calls & zero-copy helpers (no `World`; compiler builtins → direct/inline QBE IR):**
 - `extern "C" fn name(fixed_params..., ..., vararg_params...) -> Ret [= "c_sym"]`: native C variadic ABI support. At least one fixed parameter is required before `...` (duplicate or leading `...` is a syntax error); trailing typed vararg parameters stay statically type-checked at call sites (or 0 trailing parameters, e.g. `fn foo(a : Int, ...) -> Int`). Emits QBE variadic calls `call $c_sym(fixed..., ..., varargs...)` with C default argument promotions (`Int`/`Bool`/`Byte` as `w`, `Int64`/`Ptr` as `l`, `Double` as `d`), satisfying Apple Silicon ARM64 Darwin PCS (all variadic args passed on the stack) and Linux x86_64 SysV ABI (register allocation + `%al` XMM count).
+- `[pub] extern "C" fn name(p1 : T1, ...) -> Ret [= "c_sym"] { ... }`: exports a Pion function with C ABI under `$c_sym` (non-variadic; `Int`/`Bool`/`Byte`/`Char` as `w`, `Double` as `d`, `Int64`/`Ptr`/`String`/`Bytes`/heap objects as `l`, `Unit` as void). Incoming parameters use borrowed semantics (`is_owned = false`, no RC change on entry/exit); returned heap objects transfer ownership (`RC=1`) to the C caller. `c_fn_ptr(target) -> Ptr` returns the C function pointer (`%t =l copy $<c_sym>`) for any in-scope `extern "C" fn` (or imported `pub extern "C" fn`).
+- Zero-copy data pointers (inline QBE IR, 0 runtime bytes): `str_data_ptr(s : String) -> Ptr` (`s + 8`, NUL-terminated UTF-8), `bytes_data_ptr(b : Bytes) -> Ptr` (`*(b + 16)`), `array_data_ptr(a : Array[T]) -> Ptr` (`*(a + 24)`, contiguous 64-bit slots).
+- Inline float pointer access (inline QBE IR, 0 runtime bytes): `ptr_read_f64(p : Ptr, off : Int64) -> Double`, `ptr_write_f64(p : Ptr, off : Int64, v : Double) -> Unit`, `ptr_read_f32(p : Ptr, off : Int64) -> Double`, `ptr_write_f32(p : Ptr, off : Int64, v : Double) -> Unit`.
+- Direct libm math builtins (inline QBE calls to `$tan`, `$asin`, `$acos`, `$atan`, `$atan2`, `$exp`, `$log`, `$round`, `$trunc`, 0 runtime bytes): `math_tan`, `math_asin`, `math_acos`, `math_atan`, `math_atan2(y, x)`, `math_exp`, `math_log`, `math_round`, `math_trunc`.
+- `StringBuilder::write_byte(b : Byte) -> Unit` (calls `$pion_strbuf_push_byte`) and `StringBuilder::write_bytes(bs : Bytes) -> Unit` (inline loop over `bs.data`, 0 runtime bytes).
 - `void*   pion_ptr_alloc(int64_t bytes);` (`ptr_alloc(bytes : Int64) -> Ptr`, zeroed)
 - `void    pion_ptr_free(void *p);` (`ptr_free(p : Ptr) -> Unit`)
 - `void*   pion_ptr_offset(void *p, int64_t off);` (`ptr_offset(p : Ptr, off : Int64) -> Ptr`)
@@ -476,9 +481,9 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - **`pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]`**: sets `[dependencies] <name>` in `pion.toml` in place (only that line changes; idempotent), resolves it into the shared cache and `pion.lock`, and prints `{"ok":true,"action":"add","package":"...","source":"path|git|registry","location":"...","version":"...","rev":"...","changed":bool}`. Without `--path`/`--git` the registry is `--registry`, else `[registry] url`, else `$PION_REGISTRY` (none: `no source for ...`). A git source whose `pion.toml` declares another package name, an unknown registry package or a failed fetch print `{"ok":false,"error":"..."}` and restore `pion.toml` and `pion.lock` byte for byte.
 - **`pionc update [--json] [pkg] [dir]`**: re-reads the registry entry of every registry dependency (or only `pkg`), drops its lock pin, re-resolves every git dependency to its newest target ref, rewrites `pion.lock` and type-checks the workspace; prints `{"ok":true,"action":"update","packages":[{"name","ref","from","to","updated":bool}]}`. Updating a path dependency is an error; a failed resolution or a workspace that no longer checks restores `pion.toml` and `pion.lock` (`"check"` carries the diagnostics).
 - **`pionc init [--json] <dir>`**: writes `pion.toml`, `src/main.pion` and `main_test.pion` for a package named after the directory (`[a-z0-9_]`); the result passes `check`, `test`, `run` and `fmt --check` as is. Refuses to overwrite existing files.
-- **Cross-package traits**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. A package exporting a `pub` generic fn with trait bounds has no `.pionstub` (importers monomorphize from its source).
+- **Cross-package traits & generics**: an imported package's `impl Trait for Type` is registered under `pkg::Trait::pkg::Type` (built-in targets such as `Int` stay unqualified), and impl symbols use the package-local trait/type names, so definitions and cross-package calls link. Any package exporting a `pub` generic fn or method (`type_params.length() > 0`) skips `.pionstub` (importers monomorphize from its source) and exports its package-prefixed internal functions and constants at the QBE level so cross-package monomorphized bodies link cleanly while `types.mbt` still enforces `E_PRIVATE_SYMBOL`.
 - **Cross-Package Incremental Isolation**: Downstream package CAS keys depend ONLY on upstream packages' `pub` `.pionsig` SHA-256 hashes (never upstream function bodies). Editing an upstream function body without changing its `pub` `.pionsig` yields 100% CAS hit on downstream `.o` files.
-- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.11` (since Phase 22-A systems IO & byte FFI primitives, §4.2), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
+- **Compiler Fingerprint**: Every CAS key (`cas_compute_key`, `cas_compute_unit_key`) and `.usig` cache prefix includes `compiler_fp = sha256(PION_COMPILER_ABI_REV | qbe_size | libpionrt_size | salt)`, where `salt` = `self:<pionc_size>:<pionc_mtime_ms>|$PION_CACHE_SALT` (the running `pionc` binary from `argv[0]`, when it resolves to a file) and `PION_COMPILER_ABI_REV` is currently `pionc-v0.12` (since Phase 26-B C callbacks, zero-copy FFI/math builtins & cross-package generic monomorphization), ensuring compiler/backend upgrades — including a rebuilt `pionc` whose `qbe` and `libpionrt.a` are unchanged — automatically invalidate stale cache entries. The fingerprint only names cache files: it never changes emitted SSA or objects, so the bootstrap fixed point is unaffected.
 - Default directory: `$PION_CACHE_DIR` or `$HOME/.cache/pion/cas`
 - Layout:
   - `sig/<sha256>.pionsig`

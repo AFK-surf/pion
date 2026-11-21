@@ -4225,6 +4225,40 @@ fn check_method_call(
         }
         return TUnit
       }
+      if method_name == "write_byte" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TByte))
+          if !ty_compat(TByte, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`StringBuilder::write_byte` expects `Byte`",
+              "Byte",
+              ty_to_string(aty),
+              "pass a `Byte`",
+            )
+          }
+        }
+        return TUnit
+      }
+      if method_name == "write_bytes" {
+        if args.length() >= 1 {
+          let aty = check_expr(tc, env, args[0], Some(TBytes))
+          if !ty_compat(TBytes, aty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`StringBuilder::write_bytes` expects `Bytes`",
+              "Bytes",
+              ty_to_string(aty),
+              "pass a `Bytes`",
+            )
+          }
+        }
+        return TUnit
+      }
       if method_name == "to_string" {
         return TString
       }
@@ -5145,12 +5179,226 @@ fn check_expr_inner(
             }
             return TInt64
           }
+          if name == "c_fn_ptr" {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "`c_fn_ptr` expects 1 argument (an `extern \"C\" fn`)",
+                "1 argument",
+                args.length().to_string() + " arguments",
+                "c_fn_ptr requires an extern \"C\" fn",
+              )
+              return TPtr
+            }
+            match args[0] {
+              EIdent(tname, tsp) =>
+                if !tc.extern_fns.contains(tname) {
+                  tc_err(
+                    tc,
+                    tsp,
+                    "E_TYPE_MISMATCH",
+                    "`c_fn_ptr` target `" + tname + "` is not an `extern \"C\" fn`",
+                    "extern \"C\" fn",
+                    tname,
+                    "c_fn_ptr requires an extern \"C\" fn",
+                  )
+                }
+              EPath(alias_name, mem, psp) =>
+                match resolve_alias_pkg(tc, alias_name) {
+                  Some(ipkg) =>
+                    match ipkg.tc.extern_fns.get(mem) {
+                      Some(ei) =>
+                        if !ei.decl.is_pub {
+                          tc_err(
+                            tc,
+                            psp,
+                            "E_PRIVATE_SYMBOL",
+                            "extern function `" + alias_name + "::" + mem + "` is private",
+                            "pub extern \"C\" fn",
+                            "private extern \"C\" fn",
+                            "mark `" + mem + "` as `pub extern \"C\" fn`",
+                          )
+                        }
+                      None =>
+                        tc_err(
+                          tc,
+                          psp,
+                          "E_TYPE_MISMATCH",
+                          "`c_fn_ptr` target `" + alias_name + "::" + mem + "` is not an `extern \"C\" fn`",
+                          "extern \"C\" fn",
+                          alias_name + "::" + mem,
+                          "c_fn_ptr requires an extern \"C\" fn",
+                        )
+                    }
+                  None =>
+                    tc_err(
+                      tc,
+                      psp,
+                      "E_TYPE_MISMATCH",
+                      "`c_fn_ptr` target `" + alias_name + "::" + mem + "` is not an `extern \"C\" fn`",
+                      "extern \"C\" fn",
+                      alias_name + "::" + mem,
+                      "c_fn_ptr requires an extern \"C\" fn",
+                    )
+                }
+              _ =>
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`c_fn_ptr` target must be an `extern \"C\" fn` name",
+                  "extern \"C\" fn",
+                  "expression",
+                  "c_fn_ptr requires an extern \"C\" fn",
+                )
+            }
+            return TPtr
+          }
+          if name == "str_data_ptr" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TString))
+              if !ty_compat(TString, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`str_data_ptr` expects `String`",
+                  "String",
+                  ty_to_string(aty),
+                  "pass a `String` value",
+                )
+              }
+            }
+            return TPtr
+          }
+          if name == "bytes_data_ptr" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TBytes))
+              if !ty_compat(TBytes, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`bytes_data_ptr` expects `Bytes`",
+                  "Bytes",
+                  ty_to_string(aty),
+                  "pass a `Bytes` value",
+                )
+              }
+            }
+            return TPtr
+          }
+          if name == "array_data_ptr" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], None)
+              match aty {
+                TArray(_) | TError => ()
+                _ =>
+                  tc_err(
+                    tc,
+                    expr_span(args[0]),
+                    "E_TYPE_MISMATCH",
+                    "`array_data_ptr` expects `Array[T]`",
+                    "Array[T]",
+                    ty_to_string(aty),
+                    "pass an `Array[T]` value",
+                  )
+              }
+            }
+            return TPtr
+          }
+          if name == "ptr_read_f64" || name == "ptr_read_f32" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TPtr))
+              if !ty_compat(TPtr, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "argument 1 of `" + name + "` expects `Ptr`",
+                  "Ptr",
+                  ty_to_string(aty),
+                  "pass a `Ptr` value",
+                )
+              }
+            }
+            if args.length() >= 2 {
+              let bty = check_expr(tc, env, args[1], Some(TInt64))
+              if !ty_compat(TInt64, bty) {
+                tc_err(
+                  tc,
+                  expr_span(args[1]),
+                  "E_TYPE_MISMATCH",
+                  "argument 2 of `" + name + "` expects `Int64`",
+                  "Int64",
+                  ty_to_string(bty),
+                  "pass an `Int64` byte offset",
+                )
+              }
+            }
+            return TDouble
+          }
+          if name == "ptr_write_f64" || name == "ptr_write_f32" {
+            if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], Some(TPtr))
+              if !ty_compat(TPtr, aty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "argument 1 of `" + name + "` expects `Ptr`",
+                  "Ptr",
+                  ty_to_string(aty),
+                  "pass a `Ptr` value",
+                )
+              }
+            }
+            if args.length() >= 2 {
+              let bty = check_expr(tc, env, args[1], Some(TInt64))
+              if !ty_compat(TInt64, bty) {
+                tc_err(
+                  tc,
+                  expr_span(args[1]),
+                  "E_TYPE_MISMATCH",
+                  "argument 2 of `" + name + "` expects `Int64`",
+                  "Int64",
+                  ty_to_string(bty),
+                  "pass an `Int64` byte offset",
+                )
+              }
+            }
+            if args.length() >= 3 {
+              let cty = check_expr(tc, env, args[2], Some(TDouble))
+              if !ty_compat(TDouble, cty) {
+                tc_err(
+                  tc,
+                  expr_span(args[2]),
+                  "E_TYPE_MISMATCH",
+                  "argument 3 of `" + name + "` expects `Double`",
+                  "Double",
+                  ty_to_string(cty),
+                  "pass a `Double` value",
+                )
+              }
+            }
+            return TUnit
+          }
           if name == "math_sqrt" ||
             name == "math_abs" ||
             name == "math_floor" ||
             name == "math_ceil" ||
             name == "math_sin" ||
-            name == "math_cos" {
+            name == "math_cos" ||
+            name == "math_tan" ||
+            name == "math_asin" ||
+            name == "math_acos" ||
+            name == "math_atan" ||
+            name == "math_exp" ||
+            name == "math_log" ||
+            name == "math_round" ||
+            name == "math_trunc" {
             if args.length() >= 1 {
               let aty = check_expr(tc, env, args[0], Some(TDouble))
               if !ty_compat(TDouble, aty) {
@@ -5167,7 +5415,7 @@ fn check_expr_inner(
             }
             return TDouble
           }
-          if name == "math_pow" {
+          if name == "math_pow" || name == "math_atan2" {
             if args.length() >= 1 {
               let aty = check_expr(tc, env, args[0], Some(TDouble))
               if !ty_compat(TDouble, aty) {
@@ -5175,10 +5423,10 @@ fn check_expr_inner(
                   tc,
                   expr_span(args[0]),
                   "E_TYPE_MISMATCH",
-                  "argument 1 of `math_pow` expects `Double`",
+                  "argument 1 of `" + name + "` expects `Double`",
                   "Double",
                   ty_to_string(aty),
-                  "pass a `Double` to `math_pow`",
+                  "pass a `Double` to `" + name + "`",
                 )
               }
             }
@@ -5189,10 +5437,10 @@ fn check_expr_inner(
                   tc,
                   expr_span(args[1]),
                   "E_TYPE_MISMATCH",
-                  "argument 2 of `math_pow` expects `Double`",
+                  "argument 2 of `" + name + "` expects `Double`",
                   "Double",
                   ty_to_string(bty),
-                  "pass a `Double` to `math_pow`",
+                  "pass a `Double` to `" + name + "`",
                 )
               }
             }
@@ -6432,7 +6680,7 @@ pub fn check_package_with_imports(
               }
               _ => resolve_type_expr(tc, param.ty, [])
             }
-            if !is_c_abi_param_ty(pty) {
+            if !ed.has_body && !is_c_abi_param_ty(pty) {
               let fix = match pty {
                 TString =>
                   "change parameter `" + param.name + "` to `Ptr` and pass `s.as_cstr()` at call sites"
@@ -6467,7 +6715,7 @@ pub fn check_package_with_imports(
             }
             _ => resolve_type_expr(tc, ed.ret_ty, [])
           }
-          if !is_c_abi_ret_ty(rty) {
+          if !ed.has_body && !is_c_abi_ret_ty(rty) {
             let fix = match rty {
               TString => "return `Ptr` from `extern \"C\" fn` instead of managed `String`"
               _ => "use a C-ABI safe return type (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Ptr`, or `Unit`)"
@@ -6857,6 +7105,32 @@ pub fn check_package_with_imports(
             None => ()
           }
         }
+        DExternFn(ed) =>
+          if ed.has_body {
+            match tc.extern_fns.get(ed.name) {
+              Some(einfo) => {
+                let env = env_new(einfo.ret_ty, [])
+                let mut pi = 0
+                while pi < ed.params.length() && pi < einfo.param_tys.length() {
+                  env_define(env, ed.params[pi].name, einfo.param_tys[pi], false)
+                  pi = pi + 1
+                }
+                let body_ty = check_stmts(tc, env, ed.body, Some(einfo.ret_ty))
+                if !ty_compat(einfo.ret_ty, body_ty) {
+                  tc_err(
+                    tc,
+                    ed.span,
+                    "E_TYPE_MISMATCH",
+                    "extern \"C\" function `" + ed.name + "` body type does not match declared return type",
+                    ty_to_string(einfo.ret_ty),
+                    ty_to_string(body_ty),
+                    "return a value of type `" + ty_to_string(einfo.ret_ty) + "`",
+                  )
+                }
+              }
+              None => ()
+            }
+          }
         DImpl(id) => {
           let impl_key = canon_trait_name(tc, id.trait_name) +
             "::" +

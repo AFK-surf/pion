@@ -2220,3 +2220,52 @@ test "p25a_extern_c_varargs_parse_and_sig" {
   let (ok_r, json_r, _) = check_one(ok_range)
   assert_true(ok_r, json_r)
 }
+
+///|
+test "p26b_extern_c_body_c_fn_ptr_zero_copy_math_sb_debug_assert" {
+  let good =
+    #|pub extern "C" fn cb_add(a : Int, b : Int) -> Int = "my_cb_add" {
+    #|  a + b
+    #|}
+    #|extern "C" fn cb_void(p : Ptr, x : Int) -> Unit {
+    #|  ptr_write_i32(p, 0L, x)
+    #|}
+    #|extern "C" fn cb_str(s : String) -> String {
+    #|  s + "!"
+    #|}
+    #|pub fn use_all(s : String, bs : Bytes, arr : Array[Double], p : Ptr) -> Double {
+    #|  let _f1 : Ptr = c_fn_ptr(cb_add)
+    #|  let _f2 : Ptr = c_fn_ptr(cb_void)
+    #|  let _f3 : Ptr = c_fn_ptr(cb_str)
+    #|  let _sp : Ptr = str_data_ptr(s)
+    #|  let _bp : Ptr = bytes_data_ptr(bs)
+    #|  let _ap : Ptr = array_data_ptr(arr)
+    #|  ptr_write_f64(p, 0L, 1.5)
+    #|  ptr_write_f32(p, 8L, 2.25)
+    #|  let v = ptr_read_f64(p, 0L) + ptr_read_f32(p, 8L)
+    #|  let sb = StringBuilder()
+    #|  sb.write_byte(b'A')
+    #|  sb.write_bytes(bs)
+    #|  debug_assert(sb.length() >= 1, "sb len", )
+    #|  v + math_tan(0.5) + math_asin(0.5) + math_acos(0.5) + math_atan(0.5) +
+    #|    math_atan2(1.0, 2.0) + math_exp(1.0) + math_log(2.0) + math_round(1.6) + math_trunc(1.6)
+    #|}
+  let (ok_g, json_g, _) = check_one(good)
+  assert_true(ok_g, json_g)
+
+  // c_fn_ptr on a normal Pion fn must fail with E_TYPE_MISMATCH
+  let bad_ptr =
+    #|fn normal(x : Int) -> Int { x }
+    #|fn f() -> Ptr { c_fn_ptr(normal) }
+  let (ok_bp, json_bp, _) = check_one(bad_ptr)
+  assert_true(
+    !ok_bp && str_contains(json_bp, "E_TYPE_MISMATCH") && str_contains(json_bp, "c_fn_ptr requires an extern"),
+    json_bp,
+  )
+
+  // variadic extern "C" fn with body must be a syntax error
+  let bad_va_body =
+    #|extern "C" fn bad_va(x : Int, ..., y : Int) -> Int { x + y }
+  let (ok_va, json_va, _) = check_one(bad_va_body)
+  assert_true(!ok_va && str_contains(json_va, "cannot be variadic"), json_va)
+}
