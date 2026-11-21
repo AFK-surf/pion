@@ -1,26 +1,22 @@
 #!/bin/sh
 set -eu
 
-export PATH="$HOME/.moon/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
-COMPILER_DIR="$ROOT_DIR/compiler"
 OUT_DIR="$ROOT_DIR/out"
 
-echo "=== [1/6] Stage 0 MoonBit Check & Unit Tests ==="
-(cd "$COMPILER_DIR" && moon check && moon test)
-
-echo "=== [2/6] Runtime Gate (libpionrt.a + MT bench + TSan + ASan + QBE smoke) ==="
+echo "=== [1/6] Runtime Gate (libpionrt.a + MT bench + TSan + ASan + QBE smoke) ==="
 sh "$ROOT_DIR/scripts/test-runtime.sh"
 
-echo "=== [3/6] 9/9 Fixed-Point Self-Hosting Bootstrap (pionc0 -> pionc1 -> pionc2) ==="
-sh "$ROOT_DIR/scripts/bootstrap.sh"
+echo "=== [2/6] 9/9 Pure-Pion Fixed-Point Self-Hosting Bootstrap (seed -> pionc0 -> pionc1 -> pionc2 + compiler/src/core tests) ==="
+PION_SKIP_RT_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
 
 PIONC2="$OUT_DIR/pionc2"
 export PION_QBE="$OUT_DIR/qbe"
 export PION_RT_LIB="$OUT_DIR/libpionrt.a"
 
-echo "=== [4/6] Standalone pionc2 Formatter Check ==="
+echo "=== [3/6] Standalone pionc2 Formatter Check ==="
 FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" \
   "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_loopback" \
   "$ROOT_DIR/tests/e2e/net_ffi.pion" "$ROOT_DIR/tests/e2e/link_z" "$ROOT_DIR/examples/http_kv_service" \
@@ -49,7 +45,7 @@ fi
 rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
-echo "=== [5/6] Standalone pionc2 Test Runner (examples/text_stats, std/json, std/http, std/net, std/regex, dogfood apps) ==="
+echo "=== [4/6] Standalone pionc2 Test Runner (examples/text_stats, std/*, dogfood apps, init, doc) ==="
 for TPKG in examples/text_stats std/json std/http std/net std/regex examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
   TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
   printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
@@ -84,7 +80,7 @@ for DPKG in std/json std/http std/regex; do
   "$PIONC2" doc --json "$ROOT_DIR/$DPKG" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("pionc2 doc --json %s -> valid JSON, %d package(s), %d public item(s)" % (sys.argv[1], len(d["packages"]), sum(len(p["items"]) for p in d["packages"])))' "$DPKG"
 done
 
-echo "=== [6/6] Standalone pionc2 Run (examples/text_stats, net_ffi) + Cross ELF64 .o ==="
+echo "=== [5/6] Standalone pionc2 Run + E2E Suites + Cross ELF64 .o ==="
 "$PIONC2" run "$ROOT_DIR/examples/text_stats"
 "$PIONC2" run "$ROOT_DIR/tests/e2e/net_ffi.pion"
 "$PIONC2" run "$ROOT_DIR/tests/e2e/utf8_text.pion"
@@ -114,31 +110,6 @@ if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
   echo "FAIL: p17a_ergonomics_mt output mismatch" >&2
   exit 1
 fi
-# Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent
-# stress) and the pure-pion libsqlite3 indexer cross-checked by the sqlite3 CLI.
-"$PIONC2" build --release -o "$OUT_DIR/http_kv_service" "$ROOT_DIR/examples/http_kv_service"
-"$OUT_DIR/http_kv_service" --self-test
-"$PIONC2" build --release -o "$OUT_DIR/http_event_server" "$ROOT_DIR/examples/http_event_server"
-"$OUT_DIR/http_event_server" --self-test
-"$PIONC2" build --release -o "$OUT_DIR/sqlite_indexer" "$ROOT_DIR/examples/sqlite_indexer"
-IDX_DB="$OUT_DIR/sqlite_indexer_check.db"
-rm -f "$IDX_DB"
-IDX_JSON=$("$OUT_DIR/sqlite_indexer" "$ROOT_DIR/compiler/src/core" "$IDX_DB")
-echo "sqlite_indexer -> $(printf '%s' "$IDX_JSON" | cut -c1-160)..."
-IDX_WANT=$(printf '%s' "$IDX_JSON" | python3 -c 'import json, sys; t = json.load(sys.stdin)["totals"]; print("%d|%d" % (t["files"], t["lines"]))')
-if command -v sqlite3 >/dev/null 2>&1; then
-  IDX_GOT=$(sqlite3 "$IDX_DB" "SELECT COUNT(*), SUM(lines) FROM files;")
-  if [ "$IDX_GOT" != "$IDX_WANT" ]; then
-    echo "FAIL: sqlite3 CLI sees $IDX_GOT, indexer reported $IDX_WANT" >&2
-    exit 1
-  fi
-  echo "sqlite3 CLI cross-check: $IDX_GOT (files|lines) == indexer JSON"
-fi
-rm -f "$IDX_DB" "$OUT_DIR/http_kv_service" "$OUT_DIR/http_event_server" "$OUT_DIR/sqlite_indexer"
-# std/http over a workspace dependency graph (http -> json) must build and link;
-# its real-TCP run is part of scripts/test-linux.sh.
-"$PIONC2" build -o "$OUT_DIR/http_loopback" "$ROOT_DIR/examples/http_loopback"
-rm -f "$OUT_DIR/http_loopback"
 # Native libraries: `[link]` in pion.toml, `-l<lib>` on the CLI, and a failing link without them.
 "$PIONC2" run "$ROOT_DIR/tests/e2e/link_z"
 "$PIONC2" build -lz -o "$OUT_DIR/link_z_cli" "$ROOT_DIR/tests/e2e/link_z/src/main.pion"
@@ -173,6 +144,33 @@ sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC2"
 # P26-B: C callbacks (extern "C" fn body + c_fn_ptr), zero-copy FFI/math/StringBuilder, cross-pkg generic Option mono & private exports.
 sh "$ROOT_DIR/tests/e2e/p26b_ffi_generics/run_e2e.sh" "$PIONC2"
+
+echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
+# Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent
+# stress) and the pure-pion libsqlite3 indexer cross-checked by the sqlite3 CLI.
+"$PIONC2" build --release -o "$OUT_DIR/http_kv_service" "$ROOT_DIR/examples/http_kv_service"
+"$OUT_DIR/http_kv_service" --self-test
+"$PIONC2" build --release -o "$OUT_DIR/http_event_server" "$ROOT_DIR/examples/http_event_server"
+"$OUT_DIR/http_event_server" --self-test
+"$PIONC2" build --release -o "$OUT_DIR/sqlite_indexer" "$ROOT_DIR/examples/sqlite_indexer"
+IDX_DB="$OUT_DIR/sqlite_indexer_check.db"
+rm -f "$IDX_DB"
+IDX_JSON=$("$OUT_DIR/sqlite_indexer" "$ROOT_DIR/compiler/src/core" "$IDX_DB")
+echo "sqlite_indexer -> $(printf '%s' "$IDX_JSON" | cut -c1-160)..."
+IDX_WANT=$(printf '%s' "$IDX_JSON" | python3 -c 'import json, sys; t = json.load(sys.stdin)["totals"]; print("%d|%d" % (t["files"], t["lines"]))')
+if command -v sqlite3 >/dev/null 2>&1; then
+  IDX_GOT=$(sqlite3 "$IDX_DB" "SELECT COUNT(*), SUM(lines) FROM files;")
+  if [ "$IDX_GOT" != "$IDX_WANT" ]; then
+    echo "FAIL: sqlite3 CLI sees $IDX_GOT, indexer reported $IDX_WANT" >&2
+    exit 1
+  fi
+  echo "sqlite3 CLI cross-check: $IDX_GOT (files|lines) == indexer JSON"
+fi
+rm -f "$IDX_DB" "$OUT_DIR/http_kv_service" "$OUT_DIR/http_event_server" "$OUT_DIR/sqlite_indexer"
+# std/http over a workspace dependency graph (http -> json) must build and link;
+# its real-TCP run is part of scripts/test-linux.sh.
+"$PIONC2" build -o "$OUT_DIR/http_loopback" "$ROOT_DIR/examples/http_loopback"
+rm -f "$OUT_DIR/http_loopback"
 # examples/https_server and examples/pion_station link the system OpenSSL; GitHub's macos-15 runner has no
 # Homebrew openssl@3, so this runs only where it is installed.
 if [ -d /opt/homebrew/opt/openssl@3/lib ]; then

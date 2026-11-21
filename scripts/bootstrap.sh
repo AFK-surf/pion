@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-export PATH="$HOME/.moon/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPILER_DIR="$ROOT_DIR/compiler"
@@ -18,23 +18,54 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 export PION_QBE="$OUT_DIR/qbe"
 export PION_RT_LIB="$OUT_DIR/libpionrt.a"
 
-echo "=== [1/9] Build QBE + Runtime (unit + MT + 4-core bench + TSan + ASan + smoke) ==="
+echo "=== [1/9] Build QBE + Runtime ==="
 sh "$ROOT_DIR/scripts/build-qbe.sh" "$PION_QBE"
-sh "$ROOT_DIR/scripts/test-runtime.sh"
+if [ "${PION_SKIP_RT_TEST:-0}" = "1" ] && [ -f "$PION_RT_LIB" ]; then
+  echo "Using pre-verified $PION_RT_LIB (PION_SKIP_RT_TEST=1)"
+else
+  sh "$ROOT_DIR/scripts/test-runtime.sh"
+fi
 
-echo "=== [2/9] Existing Frontend Gate (moon check / moon test / pionc0 frontend) ==="
-sh "$ROOT_DIR/scripts/test-frontend.sh"
-
-echo "=== [3/9] Stage 0: moon build --target native --release -> out/pionc0 ==="
+echo "=== [2/9] Stage 0: Bootstrap Seed -> out/pionc0 (zero MoonBit, pure C + QBE) ==="
 T_S0_0=$(now_ms)
-(cd "$COMPILER_DIR" && moon build --target native --release)
+if [ -n "${PION_STAGE0_BIN:-}" ]; then
+  cp "$PION_STAGE0_BIN" "$OUT_DIR/pionc0"
+  chmod +x "$OUT_DIR/pionc0"
+else
+  if [ -n "${PION_STAGE0_SSA:-}" ]; then
+    SEED_SSA="$PION_STAGE0_SSA"
+  else
+    SEED_GZ="$ROOT_DIR/bootstrap/pionc-seed.ssa.gz"
+    if [ ! -f "$SEED_GZ" ]; then
+      echo "FAIL: missing bootstrap seed $SEED_GZ (and PION_STAGE0_BIN / PION_STAGE0_SSA not set)" >&2
+      exit 1
+    fi
+    SEED_SSA="$TMP_DIR/pionc-seed.ssa"
+    gzip -dc "$SEED_GZ" > "$SEED_SSA"
+  fi
+  UNAME_S=$(uname -s)
+  UNAME_M=$(uname -m)
+  CC_BIN="${CC:-cc}"
+  if [ "$UNAME_S" = "Darwin" ]; then
+    "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
+    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+  elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "x86_64" ]; then
+    "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$SEED_SSA"
+    "$CC_BIN" "$TMP_DIR/pionc0.o" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+  elif [ "$UNAME_S" = "Linux" ] && { [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; }; then
+    "$PION_QBE" -t arm64 -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
+    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+  else
+    echo "FAIL: unsupported host platform $UNAME_S/$UNAME_M for Stage 0 bootstrap" >&2
+    exit 1
+  fi
+fi
 T_S0_1=$(now_ms)
-cp "$COMPILER_DIR/_build/native/release/build/compat_moon/compat_moon.exe" "$OUT_DIR/pionc0"
 S0_MS=$((T_S0_1 - T_S0_0))
 S0_BYTES=$(wc -c < "$OUT_DIR/pionc0" | tr -d ' ')
 echo "Stage 0 (pionc0): build=${S0_MS} ms, size=${S0_BYTES} bytes"
 
-echo "=== [4/9] Stage 1: pionc0 -> out/pionc1 (fresh CAS) ==="
+echo "=== [3/9] Stage 1: pionc0 -> out/pionc1 (fresh CAS) ==="
 CAS_S1="$TMP_DIR/cas_stage1"
 mkdir -p "$CAS_S1"
 T_S1_0=$(now_ms)
@@ -43,7 +74,7 @@ PION_CACHE_DIR="$CAS_S1" "$OUT_DIR/pionc0" build \
   --emit-asm "$OUT_DIR/stage1.s" \
   -o "$OUT_DIR/pionc1" \
   "$COMPILER_DIR/src/core" \
-  "$COMPILER_DIR/src/compat_pion/main.pion"
+  "$COMPILER_DIR/src/cli/main.pion"
 T_S1_1=$(now_ms)
 S1_MS=$((T_S1_1 - T_S1_0))
 S1_SSA_LINES=$(wc -l < "$OUT_DIR/stage1.ssa" | tr -d ' ')
@@ -52,7 +83,7 @@ S1_ASM_LINES=$(wc -l < "$OUT_DIR/stage1.s" | tr -d ' ')
 S1_BYTES=$(wc -c < "$OUT_DIR/pionc1" | tr -d ' ')
 echo "Stage 1 (pionc1): build=${S1_MS} ms, stage1.ssa=${S1_SSA_LINES} lines (${S1_SSA_BYTES} bytes), stage1.s=${S1_ASM_LINES} lines, binary=${S1_BYTES} bytes"
 
-echo "=== [5/9] Stage 2: pionc1 -> out/pionc2 (fresh CAS, pure pion native + multicore) ==="
+echo "=== [4/9] Stage 2: pionc1 -> out/pionc2 (fresh CAS, pure pion native + multicore) ==="
 CAS_S2="$TMP_DIR/cas_stage2"
 mkdir -p "$CAS_S2"
 T_S2_0=$(now_ms)
@@ -61,7 +92,7 @@ PION_CACHE_DIR="$CAS_S2" "$OUT_DIR/pionc1" build \
   --emit-asm "$OUT_DIR/stage2.s" \
   -o "$OUT_DIR/pionc2" \
   "$COMPILER_DIR/src/core" \
-  "$COMPILER_DIR/src/compat_pion/main.pion"
+  "$COMPILER_DIR/src/cli/main.pion"
 T_S2_1=$(now_ms)
 S2_MS=$((T_S2_1 - T_S2_0))
 S2_SSA_LINES=$(wc -l < "$OUT_DIR/stage2.ssa" | tr -d ' ')
@@ -70,11 +101,16 @@ S2_ASM_LINES=$(wc -l < "$OUT_DIR/stage2.s" | tr -d ' ')
 S2_BYTES=$(wc -c < "$OUT_DIR/pionc2" | tr -d ' ')
 echo "Stage 2 (pionc2): build=${S2_MS} ms, stage2.ssa=${S2_SSA_LINES} lines (${S2_SSA_BYTES} bytes), stage2.s=${S2_ASM_LINES} lines, binary=${S2_BYTES} bytes"
 
-echo "=== [6/9] Fixed-Point Proof (Stage 1 == Stage 2 bit-for-bit) ==="
-shasum -a 256 "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
+echo "=== [5/9] Fixed-Point Proof (Stage 1 == Stage 2 bit-for-bit) ==="
+if command -v shasum >/dev/null 2>&1; then
+  SHA_CMD="shasum -a 256"
+else
+  SHA_CMD="sha256sum"
+fi
+$SHA_CMD "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
 cmp "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
 echo "SSA fixed-point: BIT-FOR-BIT IDENTICAL"
-shasum -a 256 "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
+$SHA_CMD "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
 cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
 echo "ASM fixed-point: BIT-FOR-BIT IDENTICAL"
 
@@ -82,7 +118,17 @@ PIONC2="$OUT_DIR/pionc2"
 export PION_CACHE_DIR="$TMP_DIR/cas_pionc2"
 mkdir -p "$PION_CACHE_DIR"
 
-echo "=== [7/9] Standalone pionc2 Gate: Self-check + All Frontend Fixtures (zero moon/pionc0) ==="
+echo "=== [6/9] Standalone pionc2 Gate: Compiler Core Unit Tests (pionc2 test compiler/src/core) ==="
+CORE_TEST_OUT=$("$PIONC2" test --json "$COMPILER_DIR/src/core")
+CORE_TEST_SUMMARY=$(printf '%s' "$CORE_TEST_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')
+echo "pionc2 test --json compiler/src/core -> $CORE_TEST_SUMMARY"
+if ! printf '%s' "$CORE_TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$CORE_TEST_OUT" | grep -q '"failed":0'; then
+  echo "FAIL: pionc2 test --json compiler/src/core failed:" >&2
+  printf '%s\n' "$CORE_TEST_OUT" >&2
+  exit 1
+fi
+
+echo "=== [7/9] Standalone pionc2 Gate: Self-check + All Frontend Fixtures ==="
 SELF_CORE_OUT=$("$PIONC2" check --json "$COMPILER_DIR/src/core")
 printf 'pionc2 check compiler/src/core -> %s\n' "$SELF_CORE_OUT"
 if [ "$SELF_CORE_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
@@ -90,10 +136,10 @@ if [ "$SELF_CORE_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
   exit 1
 fi
 
-SELF_ALL_OUT=$("$PIONC2" check --json "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/compat_pion/main.pion")
-printf 'pionc2 check core + compat_pion  -> %s\n' "$SELF_ALL_OUT"
+SELF_ALL_OUT=$("$PIONC2" check --json "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/cli/main.pion")
+printf 'pionc2 check core + cli        -> %s\n' "$SELF_ALL_OUT"
 if [ "$SELF_ALL_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
-  echo "FAIL: pionc2 check core + compat_pion failed" >&2
+  echo "FAIL: pionc2 check core + cli failed" >&2
   exit 1
 fi
 
@@ -282,4 +328,5 @@ echo "=== SUMMARY ==="
 echo "Stage 0 (pionc0): ${S0_MS} ms | ${S0_BYTES} bytes"
 echo "Stage 1 (pionc1): ${S1_MS} ms | ${S1_BYTES} bytes | stage1.ssa=${S1_SSA_LINES} lines"
 echo "Stage 2 (pionc2): ${S2_MS} ms | ${S2_BYTES} bytes | stage2.ssa=${S2_SSA_LINES} lines"
-echo "ALL 9 D4 BOOTSTRAP & STANDALONE PIONC2 GATES PASSED!"
+echo "Core unit tests : ${CORE_TEST_SUMMARY}"
+echo "ALL 9 PURE-PION BOOTSTRAP & STANDALONE PIONC2 GATES PASSED!"

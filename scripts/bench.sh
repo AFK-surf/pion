@@ -29,14 +29,13 @@ GEN="$WORK/bin/gen_compile_bench"
 # Mode: --check-pion (verify all benchmarks/pion/*.pion + 10k-LOC generated Pion)
 # ---------------------------------------------------------------------------
 check_pion_sources() {
-  COMPILER_DIR="$ROOT_DIR/compiler"
-  PIONC0="$COMPILER_DIR/_build/native/debug/build/compat_moon/compat_moon.exe"
+  PIONC0="${PIONC:-$ROOT_DIR/out/pionc2}"
   if [ ! -x "$PIONC0" ]; then
-    echo "=== Building Stage 0 pionc0 (moon build --target native) ==="
-    (cd "$COMPILER_DIR" && moon build --target native)
+    echo "=== Bootstrapping pionc2 ==="
+    sh "$ROOT_DIR/scripts/bootstrap.sh"
   fi
 
-  echo "=== Checking benchmarks/pion/*.pion with pionc0 check --json ==="
+  echo "=== Checking benchmarks/pion/*.pion with pionc check --json ==="
   pion_fail=0
   for f in "$BENCH_DIR"/pion/*.pion; do
     base=$(basename "$f")

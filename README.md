@@ -14,11 +14,11 @@
 - **Zero LLVM**: per-package QBE SSA IL → embedded/vendored QBE 1.3 (native `jtbl` jump tables; ARM64 callee-saved/loop-spill/register-hint fixes, cross-block shift folding, `cbz`/`cbnz`, `tst`, `csel`, fused multiply and `extuw` peepholes) → **native objects written directly** (ARM64 Mach-O and x86_64 Linux ELF64 `.o`, no system assembler) → system linker + a C11 runtime (`libpionrt.a`: 59,616 B on macOS ARM64, 55,782 B on Linux x86_64, with short-string fast paths for compare/hash/concat).
 - **Runtime**: Biased Reference Counting (non-atomic on the owning thread, frozen to atomic when a value crosses threads) on a compact 24-byte `PionHeader`, 12-class slab allocator (32–256 B) with batched remote frees, null-niche `Option[Ref]` (`None` = null, `Some(p)` = `p`, no box, also for `Option[dyn Trait]`), `dyn Trait` as a 16-byte RC box `{data, vtable}` with one static vtable per (trait, type), immortal `.rodata` literals and payload-less enum constants, native OS threads, and a non-blocking `kqueue`/`epoll` event loop with `SO_REUSEPORT` multi-worker accept.
 - **Global CAS, zero worktree pollution**: `.pionsig`, `.ssa` and `.o` artifacts live in an LRU-evicted content-addressed cache (`$PION_CACHE_DIR`, default `~/.cache/pion/cas`; `pionc test` binaries too, under `testbin/`, keyed by every linked object) keyed by the compiler's self-fingerprint (`pionc-v0.10` ABI revision + the running `pionc` binary + `qbe` + runtime) and upstream `.pionsig` hashes; git dependencies (direct or through a git-index registry) are pinned in `pion.lock` and checked out once into the shared `$PION_CACHE_DIR/git/` cache; `git status --ignored` stays clean and parallel worktrees share work.
-- **Self-hosting**: `pionc0` (MoonBit host) → `pionc1` → `pionc2` reaches a bit-for-bit fixed point (identical SSA & assembly SHA-256) on ARM64 macOS; on x86_64 Linux the cross-emitted compiler rebuilds itself with Stage 3 == Stage 4 bit-for-bit, without ever invoking `as`.
+- **Self-hosting (zero MoonBit dependency)**: `bootstrap/pionc-seed.ssa.gz` (arch-independent QBE SSA) → `pionc0` (pure C + embedded QBE) → `pionc1` → `pionc2` reaches a bit-for-bit fixed point (identical SSA & assembly SHA-256) on ARM64 macOS; on x86_64 Linux the standalone bootstrap rebuilds itself with Stage 3 == Stage 4 bit-for-bit, without ever invoking `as`.
 
 ## Language at a Glance
 
-- `Pion ∩ MoonBit` syntax: the compiler core (`compiler/src/core/`) compiles unchanged with both `moon` and `pionc`.
+- Pure `Pion` self-hosted compiler (`compiler/src/core/` + `compiler/src/cli/`, zero `.mbt` files and zero external toolchain dependencies beyond a C11 compiler `cc`).
 - Data: `struct` / `val struct` (immutable, `Send`), `enum` ADTs, generics, tuples and destructuring, `Array`, `Map`, `Bytes`, `StringBuilder`, `Option` / `Result`.
 - Control flow: `match` with guards and exhaustiveness, postfix `?` on `Result` / `Option`, `for i in a..b`, `for x in arr`, string interpolation `"\{x}"`.
 - Concurrency: `scope` / `spawn` structured OS threads, `Channel[T]`, `Mutex[T]`, `AtomicInt`, compile-time `Send` checking.
@@ -252,22 +252,27 @@ Pion's `hello` fell from 71,976 B to 50,792 B stripped and the six V1 binaries f
 
 ## Quick Start & Full Reproduction
 
+Only a C11 compiler (`cc`) and `python3` are required — zero MoonBit or LLVM dependencies:
+
 ```sh
-# Build the toolchain and run all 6 gates on macOS ARM64:
-# Stage 0 unit tests, <64 KB runtime (O2 + TSan + ASan), 9/9 fixed-point
-# bootstrap, fmt (UTF-8), std/json/http/net/regex + dogfood app tests,
-# pionc init smoke, event-server self-test, cross ELF64 .o, dyn_trait,
-# pionc add/update registry e2e, examples/https_server + examples/pion_station tests
-# (with Homebrew openssl@3)
-sh scripts/verify-all.sh
+# Bootstrap pionc2 from bootstrap/pionc-seed.ssa.gz (pure C + QBE, fixed-point verified):
+sh scripts/bootstrap.sh
 out/pionc2 run examples/text_stats
 
-# Linux x86_64 with the macOS Stage 2 SSA: zero-`as` ELF64 objects, <56 KB runtime,
-# epoll event loop, Stage 3 == Stage 4, dyn_trait, pionc add/update e2e, std/tls client +
+# Full 6/6 gate on macOS ARM64:
+# <64 KB runtime (O2 + TSan + ASan), 9/9 pure-Pion fixed-point bootstrap +
+# compiler/src/core unit tests, fmt (UTF-8), std/json/http/net/regex + dogfood app tests,
+# pionc init smoke, e2e suites, cross ELF64 .o, dyn_trait, pionc add/update registry e2e,
+# examples/https_server + examples/pion_station tests (with Homebrew openssl@3)
+sh scripts/verify-all.sh
+
+# Full 6/6 gate on Linux x86_64 (standalone from bootstrap/pionc-seed.ssa.gz, or pass PION_LINUX_SSA):
+# zero-`as` ELF64 objects, <56 KB runtime, epoll event loop, Stage 3 == Stage 4,
+# compiler/src/core + std/* tests, dyn_trait, pionc add/update e2e, std/tls client +
 # server TLS 1.3/1.2 e2e (examples/https_server vs Python ssl and curl), KV service
 # 8x500 (with/without Keep-Alive), event-server self-test, examples/pion_station
 # tests + run_e2e.sh (with libsqlite3 and the sqlite3 CLI), V1 checksums
-PION_LINUX_SSA="$PWD/out/stage2.ssa" sh scripts/test-linux.sh
+sh scripts/test-linux.sh
 
 # Benchmarks
 sh scripts/bench-v2-exec.sh            # V2 real workloads, 6 languages
@@ -278,13 +283,13 @@ PIONC="$PWD/out/pionc2" sh scripts/bench.sh   # V1 classic kernels, 5 languages
 sh benchmarks/agent_eval/run.sh        # agent-in-the-loop, 4 languages
 ```
 
-CI (`.github/workflows/ci.yml`) runs `verify-all.sh` on `macos-15` and then `test-linux.sh` on `ubuntu-latest` with the uploaded `stage2.ssa`.
+CI (`.github/workflows/ci.yml`) runs `verify-all.sh` on `macos-15` (zero MoonBit) and then `test-linux.sh` on `ubuntu-latest` with the uploaded `stage2.ssa`.
 
 ## Repository Layout
 
-- `compiler/src/core/` — compiler core in the strict `Pion ∩ MoonBit` subset (`lexer`, `ast`, `parser`, `sig`, `types`, `qbe`, `cas`, `diag`, `query`, `fmt`, `manifest`)
-- `compiler/src/compat_moon/` — Stage 0 MoonBit host adapter
-- `compiler/src/compat_pion/` — Stage 1/2 native `Pion` CLI driver (parallel package compilation)
+- `bootstrap/pionc-seed.ssa.gz` — architecture-independent QBE SSA Stage 0 bootstrap seed (zero external compiler dependency)
+- `compiler/src/core/` — pure `Pion` compiler core (`lexer`, `ast`, `parser`, `sig`, `types`, `qbe`, `cas`, `diag`, `query`, `fmt`, `manifest`, plus native `pionc test` suites)
+- `compiler/src/cli/` — native `Pion` CLI driver (parallel package compilation, CAS, workspace/package manager)
 - `runtime/` — `<64 KB` C11 runtime (`pion_rt.h`, `pion_rt.c`, `test_rt.c`; BRC, slab allocator, threads, `kqueue`/`epoll` event loop)
 - `vendor/qbe/` — vendored QBE with direct Mach-O / ELF64 object emission and hardware `sqrt` lowering
 - `std/json`, `std/http`, `std/net`, `std/regex`, `std/tls` — standard packages in pure `Pion`

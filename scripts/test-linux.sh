@@ -121,10 +121,21 @@ grep -n 'sqrtsd' "$TMP_DIR/smoke_qbe.s"
 echo "[PASS] QBE amd64_sysv ABI & hardware sqrtsd smoke"
 
 echo "=== [5/6] Native Linux x86_64 pionc ELF Bootstrap & Self-Hosting Proof (direct ELF64 .o, zero as) ==="
-PION_LINUX_SSA="${PION_LINUX_SSA:-$OUT_DIR/stage2.ssa}"
+if [ -z "${PION_LINUX_SSA:-}" ]; then
+  if [ -f "$OUT_DIR/stage2.ssa" ]; then
+    PION_LINUX_SSA="$OUT_DIR/stage2.ssa"
+  elif [ -f "$ROOT_DIR/bootstrap/pionc-seed.ssa.gz" ]; then
+    PION_LINUX_SSA="$TMP_DIR/pionc-seed.ssa"
+    gzip -dc "$ROOT_DIR/bootstrap/pionc-seed.ssa.gz" > "$PION_LINUX_SSA"
+    echo "Using standalone bootstrap seed: bootstrap/pionc-seed.ssa.gz"
+  else
+    echo "FAIL: neither PION_LINUX_SSA, out/stage2.ssa, nor bootstrap/pionc-seed.ssa.gz exists" >&2
+    exit 1
+  fi
+fi
 if [ ! -f "$PION_LINUX_SSA" ]; then
-  echo "NOTE: $PION_LINUX_SSA not provided; skipping native pionc ELF cross-bootstrap."
-  exit 0
+  echo "FAIL: PION_LINUX_SSA not found: $PION_LINUX_SSA" >&2
+  exit 1
 fi
 
 T_B0="$(now_ms)"
@@ -159,7 +170,7 @@ T_S3_0="$(now_ms)"
   --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
   -o "$TMP_DIR/pionc_linux_s3" \
   compiler/src/core \
-  compiler/src/compat_pion/main.pion)
+  compiler/src/cli/main.pion)
 T_S3_1="$(now_ms)"
 S3_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s3" | tr -d ' ')"
 echo "Linux x86_64 native self-host Stage 3: build=$((T_S3_1 - T_S3_0))ms, binary=${S3_SIZE} bytes"
@@ -169,7 +180,7 @@ T_S4_0="$(now_ms)"
   --emit-ssa "$TMP_DIR/linux_stage4.ssa" \
   -o "$TMP_DIR/pionc_linux_s4" \
   compiler/src/core \
-  compiler/src/compat_pion/main.pion)
+  compiler/src/cli/main.pion)
 T_S4_1="$(now_ms)"
 S4_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s4" | tr -d ' ')"
 echo "Linux x86_64 native self-host Stage 4: build=$((T_S4_1 - T_S4_0))ms, binary=${S4_SIZE} bytes"
@@ -188,6 +199,12 @@ cmp "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
 echo "[PASS] Linux x86_64 Native Self-Hosting Fixed-Point (Stage 3 == Stage 4 SSA, x86_64 ASM & ELF64 .o BIT-FOR-BIT IDENTICAL, zero as)!"
 
 echo "=== [6/6] Native Linux x86_64 pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
+CORE_TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/compiler/src/core")"
+CORE_TEST_SUMMARY="$(printf '%s' "$CORE_TEST_JSON" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')"
+echo "pionc_linux test --json compiler/src/core -> $CORE_TEST_SUMMARY"
+printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'
+printf '%s' "$CORE_TEST_JSON" | grep -q '"failed":0'
+
 TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/examples/text_stats")"
 echo "pionc_linux test --json examples/text_stats -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'

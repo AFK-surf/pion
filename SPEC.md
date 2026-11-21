@@ -40,51 +40,51 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 
 ---
 
-## 2. Bootstrap Subset (`Pion ∩ MoonBit`) & Self-Hosting Strategy
+## 2. Self-Hosting Architecture (Pure Pion, Zero External Compiler Dependency)
 
-To achieve **zero-rewrite Stage 0 → Stage 1 → Stage 2 fixed-point self-hosting**:
+`Pion` is 100% self-hosted in pure `.pion` with zero MoonBit or LLVM dependency:
 
 ```
+bootstrap/
+  pionc-seed.ssa.gz        # Architecture-independent QBE SSA Stage 0 seed (gzip -9 -n)
 compiler/
-  moon.mod                 # Stage 0 MoonBit module definition (moon 0.1.20261117+)
   src/
-    core/                  # PURE Pion ∩ MoonBit compiler core (shared by Stage 0 & Stage 1!)
-      lexer.mbt
-      ast.mbt
-      parser.mbt
-      sig.mbt              # .pionsig serializer/deserializer
-      types.mbt            # Type checker + exhaustive match + Send + World capability
-      ir.mbt               # Typed MIR/SSA + Perceus-lite RC insertion
-      qbe.mbt              # QBE IL emitter (arm64_apple & amd64_sysv)
-      cas.mbt              # Global CAS hashing & LRU cache manager
-      diag.mbt             # JSON diagnostics & query engine
-      driver.mbt           # Package graph + compile pipeline
-    compat_moon/           # Thin Stage 0 adapter (~150 LOC, MoonBit extern "C" host IO)
-    compat_pion/           # Thin Stage 1 adapter (~150 LOC, Pion World + parallel scope/spawn)
+    core/                  # Pure Pion compiler core & native unit tests (*_test.pion)
+      lexer.pion
+      ast.pion
+      parser.pion
+      sig.pion             # .pionsig serializer/deserializer
+      types.pion           # Type checker + exhaustive match + Send + World capability
+      qbe.pion             # QBE IL emitter (arm64_apple & amd64_sysv)
+      cas.pion             # Global CAS hashing & LRU cache manager
+      diag.pion            # JSON diagnostics
+      query.pion           # Symbol/signature/call-graph/workspace query engine
+      fmt.pion             # Deterministic formatter
+      manifest.pion        # pion.toml / pion.lock / registry parser
+    cli/                   # Pure Pion native CLI driver (main.pion, World + parallel scope/spawn)
 ```
 
-- **Stage 0 (`pionc0`)**: `moon build --target native --release` compiles `src/core` + `src/compat_moon` → `pionc0`.
-- **Stage 1 (`pionc1`)**: `pionc0 build` compiles `src/core` + `src/compat_pion` → `pionc1` (native binary backed by `runtime/libpionrt.a` + QBE!).
-- **Stage 2 (`pionc2`)**: `pionc1 build` compiles `src/core` + `src/compat_pion` → `pionc2` (using `Pion`'s own native multithreaded package compilation!).
-- **Fixed-Point Proof**: QBE IL & assembly emitted by `pionc1` vs `pionc2` for `pionc` itself MUST be **bit-for-bit identical** (SHA-256 match).
+- **Stage 0 (`pionc0`)**: Decompress `bootstrap/pionc-seed.ssa.gz` and compile it with the embedded C11 `qbe` + `runtime/libpionrt.a` + system `cc` → `out/pionc0` (requires only a C11 compiler; works natively on macOS ARM64, Linux x86_64, and Linux ARM64).
+- **Stage 1 (`pionc1`)**: `pionc0 build` compiles `src/core` + `src/cli/main.pion` → `out/pionc1`.
+- **Stage 2 (`pionc2`)**: `pionc1 build` compiles `src/core` + `src/cli/main.pion` → `out/pionc2` (using `Pion`'s own native multithreaded package compilation).
+- **Fixed-Point Proof**: QBE IL & assembly emitted by `pionc1` vs `pionc2` for `pionc` itself MUST be **bit-for-bit identical** (SHA-256 match). On Linux x86_64, Stage 3 == Stage 4 is likewise bit-for-bit identical across `.ssa`, `.s`, and direct `qbe --obj` ELF64 `.o` (zero `as`).
 
 ---
 
-## 3. Core Language Grammar (v0.1 Bootstrap)
-
-Every construct below is valid in BOTH MoonBit (with thin helper aliases where needed) AND `Pion`:
+## 3. Core Language Grammar
 
 ### 3.1 Lexical Elements
-- Comments: `// line comment` (including `///|` MoonBit block separators ignored as comments).
+- Comments: `// line comment` (including `///|` block separators ignored as comments).
 - Identifiers: `[a-zA-Z_][a-zA-Z0-9_]*`
 - Literals:
   - `Int`: decimal `42`, hex `0xFF`, negative `-1`
   - `Int64`: `42L`
-  - `Double`: `3.14`
+  - `Double`: `3.14`, scientific notation `1e-9`, `1.5E+3`
   - `Bool`: `true`, `false`
   - `Byte`: `b'a'`, `b'\n'`, `b'\x00'`
   - `Char`: `'a'`, `'\n'`
-  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text, kept byte-for-byte by every compiler stage (Stage 0 decodes UTF-16, Stage 1/2 UTF-8 via `str_scalar_at`), with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`; MoonBit-compatible interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `Double`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings)
+  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text kept byte-for-byte, with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`, `\xHH`; string interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `Double`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings).
+  - Multi-line raw string literals: `#|...` — consecutive lines prefixed with `#|` (separated by `\n` and optional leading spaces/tabs, stripping `\r` in `\r\n`) are joined with `\n` verbatim without escape or interpolation processing (UTF-8 preserved byte-for-byte; `#derive(...)` attributes remain unaffected).
 - Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`, `import` (and contextual top-level `test`).
 
 ### 3.2 Top-Level Declarations
@@ -153,7 +153,7 @@ test "test name" {
   - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E]`) and `Option[T]` (enclosing function returns `Option[_]`)
   - `match scrutinee { Pat [if guard_cond] => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed; guarded arms do not satisfy exhaustiveness on their own, and failed guards release arm pattern bindings and fall through to subsequent arms)
   - `return [expr]`, `break`, `continue`
-- Closures: `fn(x : T) -> R { ... }` (captures by value / biased RC; inside `spawn(...)`, only `Send` or `move` captures allowed)
+- Closures: `fn(x : T) -> R { ... }` (captures by value / biased RC; local `let mut` variables are captured **by value copy** at closure creation time—mutations inside or outside the closure do not alias each other; use a mutable `struct` field, `Array`, `AtomicInt`, or `Mutex[T]` for shared mutable state. Inside `spawn(...)`, only `Send` or `move` captures are allowed.)
 - Concurrency (Pion native):
   - `scope(world, fn(s : Scope) -> Unit { spawn(s, fn() -> Unit { ... }) })`
   - `Channel::new(cap)`, `ch.send(v)`, `ch.recv() -> Option[T]`, `ch.close()`

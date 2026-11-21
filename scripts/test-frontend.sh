@@ -1,36 +1,45 @@
 #!/bin/sh
 set -eu
 
-export PATH="$HOME/.moon/bin:/opt/homebrew/bin:/usr/bin:/bin:$PATH"
+export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPILER_DIR="$ROOT_DIR/compiler"
-PIONC0="$COMPILER_DIR/_build/native/debug/build/compat_moon/compat_moon.exe"
+PIONC="${PIONC:-$ROOT_DIR/out/pionc2}"
 
-echo "=== [1/6] moon check --target native (zero warnings) ==="
-CHECK_OUT=$(cd "$COMPILER_DIR" && moon check --target native 2>&1)
-printf '%s\n' "$CHECK_OUT"
-if printf '%s\n' "$CHECK_OUT" | grep -q "Warning:"; then
-  echo "FAIL: moon check emitted warnings" >&2
-  exit 1
+if [ ! -x "$PIONC" ]; then
+  sh "$ROOT_DIR/scripts/bootstrap.sh"
 fi
 
-echo "=== [2/6] moon test --target native ==="
-(cd "$COMPILER_DIR" && moon test --target native)
+export PION_QBE="${PION_QBE:-$ROOT_DIR/out/qbe}"
+export PION_RT_LIB="${PION_RT_LIB:-$ROOT_DIR/out/libpionrt.a}"
 
-echo "=== [3/6] moon build --target native ==="
-(cd "$COMPILER_DIR" && moon build --target native)
-
-echo "=== [4/6] Self-eat check: pionc0 check --json compiler/src/core ==="
-SELF_OUT=$("$PIONC0" check --json "$COMPILER_DIR/src/core")
+echo "=== [1/5] Self-check: pionc check --json compiler/src/core ==="
+SELF_OUT=$("$PIONC" check --json "$COMPILER_DIR/src/core")
 printf '%s\n' "$SELF_OUT"
 if [ "$SELF_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
-  echo "FAIL: self-eat check did not return clean ok JSON" >&2
+  echo "FAIL: self-check did not return clean ok JSON" >&2
   exit 1
 fi
 
-echo "=== [5/6] CLI check --json positive & negative fixtures ==="
-OK_OUT=$("$PIONC0" check --json "$ROOT_DIR/tests/frontend/ok_full.pion")
+echo "=== [2/5] Self-check: pionc check --json compiler/src/core + cli ==="
+SELF_ALL=$("$PIONC" check --json "$COMPILER_DIR/src/core" "$COMPILER_DIR/src/cli/main.pion")
+printf '%s\n' "$SELF_ALL"
+if [ "$SELF_ALL" != '{"ok":true,"diagnostics":[]}' ]; then
+  echo "FAIL: self-check core + cli did not return clean ok JSON" >&2
+  exit 1
+fi
+
+echo "=== [3/5] Compiler core unit tests: pionc test --json compiler/src/core ==="
+TEST_OUT=$("$PIONC" test --json "$COMPILER_DIR/src/core")
+printf '%s' "$TEST_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))'
+if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
+  echo "FAIL: compiler/src/core unit tests failed" >&2
+  exit 1
+fi
+
+echo "=== [4/5] CLI check --json positive & negative fixtures ==="
+OK_OUT=$("$PIONC" check --json "$ROOT_DIR/tests/frontend/ok_full.pion")
 printf 'ok_full.pion -> %s\n' "$OK_OUT"
 if [ "$OK_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
   echo "FAIL: ok_full.pion expected ok:true" >&2
@@ -41,7 +50,7 @@ expect_err_code() {
   fixture="$1"
   code="$2"
   set +e
-  out=$("$PIONC0" check --json "$ROOT_DIR/tests/frontend/$fixture")
+  out=$("$PIONC" check --json "$ROOT_DIR/tests/frontend/$fixture")
   rc=$?
   set -e
   printf '%s -> %s\n' "$fixture" "$out"
@@ -63,11 +72,11 @@ expect_err_code "err_not_send.pion" "E_NOT_SEND"
 expect_err_code "err_use_after_move.pion" "E_USE_AFTER_MOVE"
 expect_err_code "err_capability_missing.pion" "E_CAPABILITY_MISSING"
 
-echo "=== [6/6] CLI query --json & .pionsig byte-for-byte stability ==="
-DEFS_OUT=$("$PIONC0" query defs --json "$ROOT_DIR/tests/frontend/ok_full.pion")
-SIG_OUT=$("$PIONC0" query sig --json "$ROOT_DIR/tests/frontend/ok_full.pion")
-CALLERS_OUT=$("$PIONC0" query callers --json "$ROOT_DIR/tests/frontend/ok_full.pion")
-DEPS_OUT=$("$PIONC0" query deps --json "$ROOT_DIR/tests/frontend/ok_full.pion")
+echo "=== [5/5] CLI query --json & .pionsig byte-for-byte stability ==="
+DEFS_OUT=$("$PIONC" query defs --json "$ROOT_DIR/tests/frontend/ok_full.pion")
+SIG_OUT=$("$PIONC" query sig --json "$ROOT_DIR/tests/frontend/ok_full.pion")
+CALLERS_OUT=$("$PIONC" query callers --json "$ROOT_DIR/tests/frontend/ok_full.pion")
+DEPS_OUT=$("$PIONC" query deps --json "$ROOT_DIR/tests/frontend/ok_full.pion")
 
 printf 'query defs    -> %s\n' "$DEFS_OUT"
 printf 'query sig     -> %s\n' "$SIG_OUT"
@@ -82,9 +91,9 @@ printf '%s' "$DEPS_OUT" | grep -q '"packages":\['
 TMP_SIG_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_SIG_DIR"' EXIT
 cp "$ROOT_DIR/tests/frontend/sig_v1.pion" "$TMP_SIG_DIR/mod.pion"
-"$PIONC0" emit-sig "$TMP_SIG_DIR/mod.pion" > "$TMP_SIG_DIR/v1.pionsig"
+"$PIONC" emit-sig "$TMP_SIG_DIR/mod.pion" > "$TMP_SIG_DIR/v1.pionsig"
 cp "$ROOT_DIR/tests/frontend/sig_v2.pion" "$TMP_SIG_DIR/mod.pion"
-"$PIONC0" emit-sig "$TMP_SIG_DIR/mod.pion" > "$TMP_SIG_DIR/v2.pionsig"
+"$PIONC" emit-sig "$TMP_SIG_DIR/mod.pion" > "$TMP_SIG_DIR/v2.pionsig"
 cmp "$TMP_SIG_DIR/v1.pionsig" "$TMP_SIG_DIR/v2.pionsig"
 echo "pionsig byte-for-byte stability: PASS"
 
