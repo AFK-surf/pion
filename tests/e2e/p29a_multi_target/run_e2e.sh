@@ -43,10 +43,11 @@ check_asm_target() {
   echo "  [asm OK] --target $tgt ($(wc -l < "$out_s" | tr -d ' ') lines)"
 }
 
-echo "=== P29-A [1/4] --emit-asm across all 9 targets ==="
+echo "=== P29-A/B [1/4] --emit-asm across all 10 targets ==="
 check_asm_target arm64_apple   '(^|[[:space:]])ret($|[[:space:]])'
 check_asm_target amd64_apple   '(^|[[:space:]])(ret|retq)($|[[:space:]])'
 check_asm_target amd64_sysv    '(^|[[:space:]])(ret|retq)($|[[:space:]])'
+check_asm_target amd64_win     '(^|[[:space:]])(ret|retq)($|[[:space:]])'
 check_asm_target arm64         '(^|[[:space:]])ret($|[[:space:]])'
 check_asm_target rv64          '(^|[[:space:]])(sd|ret)($|[[:space:]])'
 check_asm_target ios_arm64     '(^|[[:space:]])ret($|[[:space:]])'

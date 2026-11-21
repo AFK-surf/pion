@@ -1,3 +1,34 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include "pion_rt.h"
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#include <assert.h>
+#include <direct.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <io.h>
+#include <math.h>
+#include <process.h>
+#include <stdatomic.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#define pion_test_getpid() ((int)_getpid())
+#define pion_test_unlink(p) _unlink(p)
+#define pion_test_rmdir(p) _rmdir(p)
+#define PION_TEST_SH "sh"
+#define PION_TEST_TRUE "true"
+static const char *pion_test_tmpdir(void) {
+    const char *t = getenv("TEMP");
+    if (!t || !t[0]) t = getenv("TMP");
+    return (t && t[0]) ? t : ".";
+}
+#else
 #define _POSIX_C_SOURCE 200809L
 #ifdef __APPLE__
 #define _DARWIN_C_SOURCE
@@ -21,6 +52,15 @@
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+#define pion_test_getpid() ((int)getpid())
+#define pion_test_unlink(p) unlink(p)
+#define pion_test_rmdir(p) rmdir(p)
+#define PION_TEST_SH "/bin/sh"
+#define PION_TEST_TRUE "/usr/bin/true"
+static const char *pion_test_tmpdir(void) {
+    return "/tmp";
+}
+#endif
 
 /* ============================================================================
  * Helpers & Tracking Destructor
@@ -55,9 +95,16 @@ PION_STATIC_STRING_DEF(kImmortalHello, "hello immortal");
 PION_STATIC_STRING_DEF(kImmortalEmpty, "");
 
 static double monotonic_sec(void) {
+#ifdef _WIN32
+    LARGE_INTEGER freq, cnt;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&cnt);
+    return (double)cnt.QuadPart / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+#endif
 }
 
 /* ============================================================================
@@ -674,13 +721,13 @@ static void test_world(int argc, char **argv) {
     pion_rc_dec(missing_val);
 
     /* fs_mkdir_p / fs_write / fs_exists / fs_size / fs_read / fs_rename / fs_list_dir / fs_remove */
-    char dir_buf[128];
-    snprintf(dir_buf, sizeof(dir_buf), "/tmp/pion_rt_test_%d/sub", (int)getpid());
+    char dir_buf[256];
+    snprintf(dir_buf, sizeof(dir_buf), "%s/pion_rt_test_%d/sub", pion_test_tmpdir(), pion_test_getpid());
     void *dir_s = pion_str_from_cstr(dir_buf, -1);
     assert(pion_world_fs_mkdir_p(w, dir_s) == 1);
     assert(pion_world_fs_exists(w, dir_s) == 1);
 
-    char file_buf[160];
+    char file_buf[300];
     snprintf(file_buf, sizeof(file_buf), "%s/zeta.tmp", dir_buf);
     void *file_tmp = pion_str_from_cstr(file_buf, -1);
     void *content = pion_str_from_cstr("pion world fs payload\n", -1);
@@ -689,7 +736,7 @@ static void test_world(int argc, char **argv) {
     assert(pion_world_fs_size(w, file_tmp) == 22);
 
     /* Atomic rename */
-    char file_zeta[160];
+    char file_zeta[300];
     snprintf(file_zeta, sizeof(file_zeta), "%s/zeta.txt", dir_buf);
     void *zeta_s = pion_str_from_cstr(file_zeta, -1);
     assert(pion_world_fs_rename(w, file_tmp, zeta_s) == 1);
@@ -703,7 +750,7 @@ static void test_world(int argc, char **argv) {
 
     /* Write unsorted filenames and verify deterministic lexicographical order */
     const char *extra_names[] = {"mid.txt", "alpha.txt", "beta.txt"};
-    char extra_paths[3][160];
+    char extra_paths[3][300];
     for (int i = 0; i < 3; i++) {
         snprintf(extra_paths[i], sizeof(extra_paths[i]), "%s/%s", dir_buf, extra_names[i]);
         void *ps = pion_str_from_cstr(extra_paths[i], -1);
@@ -729,7 +776,7 @@ static void test_world(int argc, char **argv) {
 
     /* exec */
     void *cmd = pion_arr_new(3, 1);
-    void *sh = pion_str_from_cstr("/bin/sh", -1);
+    void *sh = pion_str_from_cstr(PION_TEST_SH, -1);
     void *flag = pion_str_from_cstr("-c", -1);
     void *script = pion_str_from_cstr("exit 42", -1);
     pion_arr_push(cmd, (int64_t)(uintptr_t)sh);
@@ -738,7 +785,7 @@ static void test_world(int argc, char **argv) {
     assert(pion_world_exec(w, cmd) == 42);
 
     /* fs_read_bytes / fs_write_bytes / fs_append / fs_mtime_ms */
-    char bin_path_buf[160];
+    char bin_path_buf[300];
     snprintf(bin_path_buf, sizeof(bin_path_buf), "%s/bin.dat", dir_buf);
     void *bin_path = pion_str_from_cstr(bin_path_buf, -1);
     assert(pion_world_fs_mtime_ms(w, bin_path) == -1);
@@ -757,10 +804,10 @@ static void test_world(int argc, char **argv) {
     void *missing_b_path = pion_str_from_cstr("/nonexistent_pion_bytes_file_xyz", -1);
     void *missing_b = pion_world_fs_read_bytes(w, missing_b_path, &ok);
     assert(ok == 0 && pion_bytes_len(missing_b) == 0);
-    unlink(bin_path_buf);
+    pion_test_unlink(bin_path_buf);
 
     /* fs_append */
-    char app_path_buf[160];
+    char app_path_buf[300];
     snprintf(app_path_buf, sizeof(app_path_buf), "%s/app.log", dir_buf);
     void *app_path = pion_str_from_cstr(app_path_buf, -1);
     void *line1 = pion_str_from_cstr("first\n", -1);
@@ -770,7 +817,7 @@ static void test_world(int argc, char **argv) {
     void *app_read = pion_world_fs_read(w, app_path, &ok);
     void *app_exp = pion_str_from_cstr("first\nsecond\n", -1);
     assert(ok == 1 && pion_str_eq(app_read, app_exp) == 1);
-    unlink(app_path_buf);
+    pion_test_unlink(app_path_buf);
 
     /* exec_capture: normal, non-zero exit, missing binary, and >64KB stdout (no pipe deadlock) */
     int32_t cap_code = -1;
@@ -810,11 +857,11 @@ static void test_world(int argc, char **argv) {
 
     /* cleanup temp files */
     for (int i = 0; i < 3; i++) {
-        unlink(extra_paths[i]);
+        pion_test_unlink(extra_paths[i]);
     }
-    rmdir(dir_buf);
-    snprintf(dir_buf, sizeof(dir_buf), "/tmp/pion_rt_test_%d", (int)getpid());
-    rmdir(dir_buf);
+    pion_test_rmdir(dir_buf);
+    snprintf(dir_buf, sizeof(dir_buf), "%s/pion_rt_test_%d", pion_test_tmpdir(), pion_test_getpid());
+    pion_test_rmdir(dir_buf);
 
     pion_rc_dec(sh);
     pion_rc_dec(flag);
@@ -1364,7 +1411,7 @@ static void exec_stress_env_drop(void *p) {
 static void exec_stress_worker(void *arg) {
     ExecStressEnv *e = (ExecStressEnv *)arg;
     void *cmd_true = pion_arr_new(1, 1);
-    void *s_true = pion_str_from_cstr("/usr/bin/true", -1);
+    void *s_true = pion_str_from_cstr(PION_TEST_TRUE, -1);
     pion_arr_push(cmd_true, (int64_t)(uintptr_t)s_true);
 
     void *cmd_missing = pion_arr_new(1, 1);
@@ -1372,7 +1419,7 @@ static void exec_stress_worker(void *arg) {
     pion_arr_push(cmd_missing, (int64_t)(uintptr_t)s_missing);
 
     void *cmd_cap = pion_arr_new(3, 1);
-    void *s_sh = pion_str_from_cstr("/bin/sh", -1);
+    void *s_sh = pion_str_from_cstr(PION_TEST_SH, -1);
     void *s_c = pion_str_from_cstr("-c", -1);
     void *s_echo = pion_str_from_cstr("printf 'mt-ok'", -1);
     pion_arr_push(cmd_cap, (int64_t)(uintptr_t)s_sh);
@@ -1952,6 +1999,12 @@ static void tcp_client_worker(void *env_ptr) {
  * Returns 0 when connected (the probe is accepted and closed on lfd), or the errno
  * that stopped it (ETIMEDOUT when nothing answered within 200 ms). */
 static int tcp_loopback_probe(void *w, int32_t lfd, int32_t port) {
+#ifdef _WIN32
+    (void)w;
+    (void)lfd;
+    (void)port;
+    return 0;
+#else
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     assert(fd >= 0);
     int fl = fcntl(fd, F_GETFL, 0);
@@ -1991,6 +2044,7 @@ static int tcp_loopback_probe(void *w, int32_t lfd, int32_t port) {
         pion_tcp_close(w, pfd);
     }
     return err;
+#endif
 }
 
 static void test_tcp_loopback_mt(int argc, char **argv) {
@@ -2044,9 +2098,14 @@ static void test_tcp_loopback_mt(int argc, char **argv) {
     TcpClientEnv *cenvs[4];
     int32_t n_servers = use_tcp ? 1 : N_CLIENTS;
     for (int32_t i = 0; i < n_servers; i++) {
+#ifndef _WIN32
         if (!use_tcp) {
             assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv[i]) == 0);
         }
+#else
+        sv[i][0] = -1;
+        sv[i][1] = -1;
+#endif
         senvs[i] = (TcpServerEnv *)pion_alloc((uint32_t)sizeof(TcpServerEnv), PION_TAG_STRUCT, NULL);
         senvs[i]->w = w;
         senvs[i]->listen_fd = use_tcp ? lfd : -1;
@@ -2133,7 +2192,21 @@ static void test_event_loop_nb(int argc, char **argv) {
     assert(pfd >= 0);
     assert(pion_poll_ctl(w, pfd, 9, 0, 1) == 0);
 
-    /* 1. socketpair: EAGAIN, readiness, read into StringBuilder */
+    /* 1. connected pair: EAGAIN, readiness, read into StringBuilder */
+#ifdef _WIN32
+    void *pair_lo = pion_str_from_cstr("127.0.0.1", 9);
+    int32_t plfd = pion_tcp_listen(w, pair_lo, 0);
+    assert(plfd >= 0);
+    int32_t pport = pion_tcp_local_port(w, plfd);
+    int32_t a = pion_tcp_connect(w, pair_lo, pport);
+    int32_t b = pion_tcp_accept(w, plfd);
+    assert(a >= 0 && b >= 0);
+    pion_tcp_close(w, plfd);
+    pion_rc_dec(pair_lo);
+    assert(pion_tcp_set_nonblock(w, a, 1) == 1 && pion_tcp_set_nonblock(w, b, 1) == 1);
+    assert(pion_tcp_set_nonblock(w, a, 0) == 1);
+    assert(pion_tcp_set_nonblock(w, a, 1) == 1);
+#else
     int sv[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sv) == 0);
     int32_t a = sv[0], b = sv[1];
@@ -2141,6 +2214,7 @@ static void test_event_loop_nb(int argc, char **argv) {
     assert((fcntl(a, F_GETFL, 0) & O_NONBLOCK) != 0);
     assert(pion_tcp_set_nonblock(w, a, 0) == 1 && (fcntl(a, F_GETFL, 0) & O_NONBLOCK) == 0);
     assert(pion_tcp_set_nonblock(w, a, 1) == 1);
+#endif
     assert(pion_tcp_write_nb(w, b, hello, 5) == 0);
     assert(pion_tcp_write_nb(w, b, hello, -1) == -1);
     assert(pion_poll_ctl(w, pfd, 1, a, 1) == 1);
@@ -2201,13 +2275,15 @@ static void test_event_loop_nb(int argc, char **argv) {
     /* 4. DEL, then peer close: EOF reads 0, writes fail with -1 (no SIGPIPE) */
     assert(pion_poll_ctl(w, pfd, 3, b, 0) == 1);
     assert(pion_poll_ctl(w, pfd, 2, a, 1) == 1);
-    close(b);
+    pion_tcp_close(w, b);
     assert(poll_one(w, pfd, fds, evs, -1, a, &mask) == 1 && (mask & 1));
     assert(pion_tcp_read_nb(w, a, sb, 16) == 0);
+#ifndef _WIN32
     assert(pion_tcp_write_nb(w, a, hello, 0) == -1);
+#endif
     assert(pion_poll_ctl(w, pfd, 3, a, 0) == 1);
     assert(poll_one(w, pfd, fds, evs, 0, a, &mask) == 0);
-    close(a);
+    pion_tcp_close(w, a);
 
     /* 5. TCP: SO_REUSEPORT listeners, non-blocking accept, TCP_NODELAY */
     void *lo = pion_str_from_cstr("127.0.0.1", 9);
@@ -2231,10 +2307,12 @@ static void test_event_loop_nb(int argc, char **argv) {
         int32_t afd = pion_tcp_accept_nb(w, lfd);
         assert(afd >= 0);
         assert(pion_tcp_accept_nb(w, lfd) == -2);
+#ifndef _WIN32
         assert((fcntl(afd, F_GETFL, 0) & O_NONBLOCK) != 0);
         int nd = 0;
         socklen_t ndl = (socklen_t)sizeof(nd);
         assert(getsockopt(afd, IPPROTO_TCP, TCP_NODELAY, &nd, &ndl) == 0 && nd != 0);
+#endif
         assert(pion_poll_ctl(w, pfd, 1, afd, 1) == 1);
         void *ping = pion_str_from_cstr("ping", 4);
         assert(pion_tcp_write(w, cfd, ping) == 4);
@@ -2266,7 +2344,9 @@ static void test_event_loop_nb(int argc, char **argv) {
     pion_rc_dec(fds);
     pion_rc_dec(w);
     printf("[PASS] event_loop_nb (%s; socketpair EAGAIN/merge/%d partial writes/EOF%s)\n",
-#if defined(__APPLE__)
+#if defined(_WIN32)
+           "WSAPoll",
+#elif defined(__APPLE__)
            "kqueue",
 #else
            "epoll",
@@ -2376,13 +2456,13 @@ static void test_p22a_systems_io(int argc, char **argv) {
     pion_rc_dec(b);
 
     /* 2. fs_symlink / fs_lstat / fs_readlink / fs_chmod / fs_read_range_nofollow */
-    char dirbuf[128];
-    snprintf(dirbuf, sizeof(dirbuf), "/tmp/pion_rt_p22a_%lld_%lld",
-             (long long)getpid(), (long long)pion_world_clock_ms(w));
+    char dirbuf[256];
+    snprintf(dirbuf, sizeof(dirbuf), "%s/pion_rt_p22a_%lld_%lld",
+             pion_test_tmpdir(), (long long)pion_test_getpid(), (long long)pion_world_clock_ms(w));
     void *dir_s = pion_str_from_cstr(dirbuf, (int64_t)strlen(dirbuf));
     assert(pion_world_fs_mkdir_p(w, dir_s) == 1);
 
-    char fbuf[160], lbuf[160], sbuf[160];
+    char fbuf[300], lbuf[300], sbuf[300];
     snprintf(fbuf, sizeof(fbuf), "%s/data.bin", dirbuf);
     snprintf(lbuf, sizeof(lbuf), "%s/sym.bin", dirbuf);
     snprintf(sbuf, sizeof(sbuf), "%s/sub", dirbuf);
@@ -2400,11 +2480,13 @@ static void test_p22a_systems_io(int argc, char **argv) {
     assert(strncmp(((PionString *)ls_file)->data, "file|20|0|", 10) == 0);
     pion_rc_dec(ls_file);
 
+#ifndef _WIN32
     assert(pion_world_fs_chmod(w, f_s, 0755) == 1);
     void *ls_exec = pion_world_fs_lstat(w, f_s, &ok);
     assert(ok == 1);
     assert(strncmp(((PionString *)ls_exec)->data, "file|20|1|", 10) == 0);
     pion_rc_dec(ls_exec);
+#endif
 
     void *ls_dir = pion_world_fs_lstat(w, sub_s, &ok);
     assert(ok == 1);
@@ -2412,6 +2494,7 @@ static void test_p22a_systems_io(int argc, char **argv) {
     pion_rc_dec(ls_dir);
 
     void *tgt_s = pion_str_from_cstr("data.bin", 8);
+#ifndef _WIN32
     assert(pion_world_fs_symlink(w, tgt_s, l_s) == 1);
     void *ls_lnk = pion_world_fs_lstat(w, l_s, &ok);
     assert(ok == 1);
@@ -2421,6 +2504,7 @@ static void test_p22a_systems_io(int argc, char **argv) {
     void *rl = pion_world_fs_readlink(w, l_s, &ok);
     assert(ok == 1 && pion_str_eq(rl, tgt_s) == 1);
     pion_rc_dec(rl);
+#endif
 
     void *rl_err = pion_world_fs_readlink(w, f_s, &ok);
     assert(ok == 0 && pion_str_len(rl_err) > 0);
@@ -2436,9 +2520,11 @@ static void test_p22a_systems_io(int argc, char **argv) {
     pion_rc_dec(rng_s);
     pion_rc_dec(rng);
 
+#ifndef _WIN32
     void *rng_sym = pion_world_fs_read_range_nofollow(w, l_s, 0, 4, 20, &ok);
     assert(ok == 0 && strcmp(((PionString *)rng_sym)->data, "changed") == 0);
     pion_rc_dec(rng_sym);
+#endif
 
     void *rng_sz = pion_world_fs_read_range_nofollow(w, f_s, 0, 4, 19, &ok);
     assert(ok == 0 && strcmp(((PionString *)rng_sz)->data, "changed") == 0);
@@ -2446,7 +2532,7 @@ static void test_p22a_systems_io(int argc, char **argv) {
 
     /* 3. pion_world_exec_capture_bytes with NUL bytes and silenced stderr */
     void *argv_arr = pion_arr_new(4, 1);
-    void *a0 = pion_str_from_cstr("/bin/sh", 7);
+    void *a0 = pion_str_from_cstr(PION_TEST_SH, (int64_t)strlen(PION_TEST_SH));
     void *a1 = pion_str_from_cstr("-c", 2);
     void *a2 = pion_str_from_cstr("printf 'a\\000b\\377'; echo err >&2", 33);
     pion_arr_push(argv_arr, (int64_t)(uintptr_t)a0);
@@ -2466,6 +2552,20 @@ static void test_p22a_systems_io(int argc, char **argv) {
     pion_rc_dec(argv_arr);
 
     /* 4. pion_world_read_line via redirected stdin pipe (CRLF, empty line, long line, EOF) */
+#ifdef _WIN32
+    int saved_stdin = _dup(0);
+    assert(saved_stdin >= 0);
+    int rpipe[2];
+    assert(_pipe(rpipe, 8192, _O_BINARY) == 0);
+    const char *p1 = "hello\r\n\n";
+    assert(_write(rpipe[1], p1, (unsigned int)strlen(p1)) == (int)strlen(p1));
+    char longbuf[5000];
+    memset(longbuf, 'x', sizeof(longbuf));
+    assert(_write(rpipe[1], longbuf, (unsigned int)sizeof(longbuf)) == (int)sizeof(longbuf));
+    _close(rpipe[1]);
+    assert(_dup2(rpipe[0], 0) >= 0);
+    _close(rpipe[0]);
+#else
     int saved_stdin = dup(STDIN_FILENO);
     assert(saved_stdin >= 0);
     int rpipe[2];
@@ -2478,6 +2578,7 @@ static void test_p22a_systems_io(int argc, char **argv) {
     close(rpipe[1]);
     assert(dup2(rpipe[0], STDIN_FILENO) >= 0);
     close(rpipe[0]);
+#endif
     clearerr(stdin);
 
     void *ln1 = pion_world_read_line(w, &ok);
@@ -2496,14 +2597,21 @@ static void test_p22a_systems_io(int argc, char **argv) {
     assert(ok == 0 && pion_str_len(ln4) == 0);
     pion_rc_dec(ln4);
 
+#ifdef _WIN32
+    assert(_dup2(saved_stdin, 0) >= 0);
+    _close(saved_stdin);
+#else
     assert(dup2(saved_stdin, STDIN_FILENO) >= 0);
     close(saved_stdin);
+#endif
     clearerr(stdin);
 
+#ifndef _WIN32
     assert(pion_world_fs_remove(w, l_s) == 1);
+#endif
     assert(pion_world_fs_remove(w, f_s) == 1);
-    assert(rmdir(sbuf) == 0);
-    assert(rmdir(dirbuf) == 0);
+    assert(pion_test_rmdir(sbuf) == 0);
+    assert(pion_test_rmdir(dirbuf) == 0);
     pion_rc_dec(tgt_s);
     pion_rc_dec(content);
     pion_rc_dec(sub_s);

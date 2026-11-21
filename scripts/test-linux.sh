@@ -44,8 +44,13 @@ echo "=== [1/6] Linux ${LINUX_ARCH_LABEL} Environment & QBE (${LINUX_TARGET}) Bu
 uname -a
 CC="$CC" sh "$ROOT_DIR/scripts/build-qbe.sh" "$OUT_DIR/qbe"
 
-echo "=== [2/6] Build libpionrt.a (-std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror) ==="
-"$CC" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
+if [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; then
+  RT_OPT="-Os"
+else
+  RT_OPT="-O2"
+fi
+echo "=== [2/6] Build libpionrt.a (-std=c11 ${RT_OPT} -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror) ==="
+"$CC" -std=c11 "$RT_OPT" -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
 rm -f "$OUT_DIR/libpionrt.a"
 ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libpionrt.a" | tr -d ' ')"

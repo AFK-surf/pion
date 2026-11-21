@@ -18,6 +18,9 @@ case "$OS" in
             *)       DEFTGT="T_amd64_apple" ;;
         esac
         ;;
+    *MINGW*|*MSYS*|*CYGWIN*)
+        DEFTGT="T_amd64_win"
+        ;;
     *)
         case "$ARCH" in
             *aarch64*|*arm64*) DEFTGT="T_arm64" ;;
@@ -28,7 +31,12 @@ case "$OS" in
 esac
 printf '#define Deftgt %s\n' "$DEFTGT" > "$BUILD_DIR/config.h"
 
-CC="${CC:-clang}"
+if [ -z "${CC:-}" ]; then
+    case "$OS" in
+        *MINGW*|*MSYS*|*CYGWIN*) CC="gcc" ;;
+        *) CC="clang" ;;
+    esac
+fi
 T0="$(python3 -c 'import time; print(int(time.time()*1000))')"
 
 SRCS="main util parse abi cfg mem ssa alias load copy fold gvn gcm simpl ifopt live spill rega emit \
