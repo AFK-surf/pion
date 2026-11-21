@@ -87,6 +87,113 @@ fn run_cb(f : () -> Unit) -> Unit {
   f()
 }
 
+fn run_cb_int(cb : () -> Int) -> Int {
+  cb()
+}
+
+struct Big40[T] {
+  f0 : T
+  f1 : T
+  f2 : T
+  f3 : T
+  f4 : T
+  f5 : T
+  f6 : T
+  f7 : T
+  f8 : T
+  f9 : T
+  f10 : T
+  f11 : T
+  f12 : T
+  f13 : T
+  f14 : T
+  f15 : T
+  f16 : T
+  f17 : T
+  f18 : T
+  f19 : T
+  f20 : T
+  f21 : T
+  f22 : T
+  f23 : T
+  f24 : T
+  f25 : T
+  f26 : T
+  f27 : T
+  f28 : T
+  f29 : T
+  f30 : T
+  f31 : T
+  f32 : T
+  f33 : T
+  f34 : T
+  f35 : T
+  f36 : T
+  f37 : T
+  f38 : T
+  f39 : T
+}
+
+fn test_bug14_large_drops(seed : Int) -> Int {
+  let s1 = "a" + seed.to_string()
+  let s2 = "b" + seed.to_string()
+  let s3 = "c" + seed.to_string()
+  let s4 = "d" + seed.to_string()
+  let s5 = "e" + seed.to_string()
+  let s6 = "f" + seed.to_string()
+  let s7 = "g" + seed.to_string()
+  let s8 = "h" + seed.to_string()
+  let s9 = "i" + seed.to_string()
+  let s10 = "j" + seed.to_string()
+  let s11 = "k" + seed.to_string()
+  let s12 = "l" + seed.to_string()
+  let s13 = "m" + seed.to_string()
+  let s14 = "n" + seed.to_string()
+  let s15 = "o" + seed.to_string()
+  let s16 = "p" + seed.to_string()
+  let s17 = "q" + seed.to_string()
+  let s18 = "r" + seed.to_string()
+  let s19 = "s" + seed.to_string()
+  let s20 = "t" + seed.to_string()
+  let s21 = "u" + seed.to_string()
+  let s22 = "v" + seed.to_string()
+  let s23 = "w" + seed.to_string()
+  let s24 = "x" + seed.to_string()
+  let s25 = "y" + seed.to_string()
+  let s26 = "z" + seed.to_string()
+  let s27 = "A" + seed.to_string()
+  let s28 = "B" + seed.to_string()
+  let s29 = "C" + seed.to_string()
+  let s30 = "D" + seed.to_string()
+  let s31 = "E" + seed.to_string()
+  let s32 = "F" + seed.to_string()
+  let s33 = "G" + seed.to_string()
+  let s34 = "H" + seed.to_string()
+  let s35 = "I" + seed.to_string()
+  let s36 = "J" + seed.to_string()
+  let s37 = "K" + seed.to_string()
+  let s38 = "L" + seed.to_string()
+  let s39 = "M" + seed.to_string()
+  let s40 = "N" + seed.to_string()
+  let clo_sum = run_cb_int(fn() -> Int {
+    s1.length() + s2.length() + s3.length() + s4.length() + s5.length() +
+    s6.length() + s7.length() + s8.length() + s9.length() + s10.length() +
+    s11.length() + s12.length() + s13.length() + s14.length() + s15.length() +
+    s16.length() + s17.length() + s18.length() + s19.length() + s20.length() +
+    s21.length() + s22.length() + s23.length() + s24.length() + s25.length() +
+    s26.length() + s27.length() + s28.length() + s29.length() + s30.length() +
+    s31.length() + s32.length() + s33.length() + s34.length() + s35.length() +
+    s36.length() + s37.length() + s38.length() + s39.length() + s40.length()
+  })
+  let big : Big40[String] = Big40::{
+    f0: s1, f1: s2, f2: s3, f3: s4, f4: s5, f5: s6, f6: s7, f7: s8, f8: s9, f9: s10,
+    f10: s11, f11: s12, f12: s13, f13: s14, f14: s15, f15: s16, f16: s17, f17: s18, f18: s19, f19: s20,
+    f20: s21, f21: s22, f22: s23, f23: s24, f24: s25, f25: s26, f26: s27, f27: s28, f28: s29, f29: s30,
+    f30: s31, f31: s32, f32: s33, f33: s34, f34: s35, f35: s36, f36: s37, f37: s38, f38: s39, f39: s40,
+  }
+  clo_sum + big.f0.length() + big.f39.length()
+}
+
 pub fn main(world : World) -> Int {
   // Bug #9: Array[T]::contains & FixedArray[T]::contains
   let ai : Array[Int] = [1, 2, 3]
@@ -172,6 +279,9 @@ pub fn main(world : World) -> Int {
   debug_assert('\u{0C}'.to_int() == 12, "char u0C")
   debug_assert('\u{4E2D}'.to_int() == 0x4E2D, "char u4E2D")
   debug_assert('\u{1F600}'.to_int() == 0x1F600, "char u1F600")
+
+  // Bug #14: >=32 RC slots in closures & generic structs (no negative symbol, 0 leaks under ASan/LSan)
+  debug_assert(test_bug14_large_drops(42) == 42 * 3, "bug14 40-slot closure + generic struct")
 
   io_println(world, "p30a_bugs9_to_13 ok")
   0

@@ -147,7 +147,8 @@ pub struct QbeGen {
   cstring_ids : Map[String, Int]
   enum_consts : Array[QbeEnumConst]
   enum_const_seen : Map[String, Bool]
-  slot_drop_masks : Array[Int]
+  slot_drop_keys : Array[String]
+  slot_drop_specs : Array[Array[Int]]
   slot_drop_seen : Map[String, Bool]
   fn_wrappers : Array[QbeFnWrapper]
   fn_wrapper_seen : Map[String, Bool]
@@ -5833,7 +5834,8 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     cstring_ids: Map([]),
     enum_consts: [],
     enum_const_seen: Map([]),
-    slot_drop_masks: [],
+    slot_drop_keys: [],
+    slot_drop_specs: [],
     slot_drop_seen: Map([]),
     fn_wrappers: [],
     fn_wrapper_seen: Map([]),
@@ -6008,14 +6010,118 @@ fn qbe_intern_cstring(g : QbeGen, s : String) -> Int {
 }
 
 ///|
-fn qbe_register_slot_drop(g : QbeGen, mask : Int) -> String {
-  if mask == 0 {
+fn qbe_hex_digit_char(n : Int) -> Char {
+  let d = n & 15
+  if d < 10 {
+    (48 + d).unsafe_to_char()
+  } else {
+    (97 + d - 10).unsafe_to_char()
+  }
+}
+
+///|
+fn qbe_sort_unique_slots(slots : Array[Int]) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < slots.length() {
+    let v = slots[i]
+    if v >= 0 {
+      let mut dup = false
+      let mut j = 0
+      while j < out.length() {
+        if out[j] == v {
+          dup = true
+          break
+        }
+        j = j + 1
+      }
+      if !dup {
+        out.push(v)
+        let mut k = out.length() - 1
+        while k > 0 && out[k - 1] > out[k] {
+          let tmp = out[k - 1]
+          out[k - 1] = out[k]
+          out[k] = tmp
+          k = k - 1
+        }
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qbe_slots_canonical_key(sorted : Array[Int]) -> String {
+  if sorted.length() == 0 {
+    return ""
+  }
+  let max_slot = sorted[sorted.length() - 1]
+  if max_slot < 31 {
+    let mut mask = 0
+    let mut i = 0
+    while i < sorted.length() {
+      mask = mask | (1 << sorted[i])
+      i = i + 1
+    }
+    return mask.to_string()
+  }
+  let n_chunks = max_slot / 16 + 1
+  let chunks : Array[Int] = []
+  let mut ci = 0
+  while ci < n_chunks {
+    chunks.push(0)
+    ci = ci + 1
+  }
+  let mut i = 0
+  while i < sorted.length() {
+    let s = sorted[i]
+    let idx = s / 16
+    let bit = s % 16
+    chunks[idx] = chunks[idx] | (1 << bit)
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  sb.write_string("x_")
+  ci = n_chunks - 1
+  while ci >= 0 {
+    let v = chunks[ci]
+    sb.write_char(qbe_hex_digit_char((v >> 12) & 15))
+    sb.write_char(qbe_hex_digit_char((v >> 8) & 15))
+    sb.write_char(qbe_hex_digit_char((v >> 4) & 15))
+    sb.write_char(qbe_hex_digit_char(v & 15))
+    ci = ci - 1
+  }
+  sb.to_string()
+}
+
+///|
+fn qbe_merge_slot_lists(a : Array[Int], b : Array[Int]) -> Array[Int] {
+  let out : Array[Int] = []
+  let mut i = 0
+  while i < a.length() {
+    out.push(a[i])
+    i = i + 1
+  }
+  i = 0
+  while i < b.length() {
+    out.push(b[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qbe_register_slot_drop(g : QbeGen, slots : Array[Int]) -> String {
+  let sorted = qbe_sort_unique_slots(slots)
+  if sorted.length() == 0 {
     return "0"
   }
-  let key = mask.to_string()
+  let key = qbe_slots_canonical_key(sorted)
   if !g.slot_drop_seen.contains(key) {
     g.slot_drop_seen.set(key, true)
-    g.slot_drop_masks.push(mask)
+    g.slot_drop_keys.push(key)
+    g.slot_drop_specs.push(sorted)
   }
   "$pion_drop_slots_" + key
 }
@@ -7650,37 +7756,39 @@ fn qbe_select_drop_by_tparam(
 }
 
 ///|
-fn qbe_add_tp_drop_bit(
+fn qbe_add_tp_drop_slot(
   tp_names : Array[String],
-  tp_masks : Array[Int],
+  tp_slots : Array[Array[Int]],
   tn : String,
-  bit : Int,
+  slot_idx : Int,
 ) -> Unit {
   let mut i = 0
   while i < tp_names.length() {
     if tp_names[i] == tn {
-      tp_masks[i] = tp_masks[i] | bit
+      tp_slots[i].push(slot_idx)
       return
     }
     i = i + 1
   }
   tp_names.push(tn)
-  tp_masks.push(bit)
+  let arr : Array[Int] = []
+  arr.push(slot_idx)
+  tp_slots.push(arr)
 }
 
 ///|
 fn qbe_emit_dynamic_slot_drop(
   g : QbeGen,
-  static_mask : Int,
+  static_slots : Array[Int],
   tp_names : Array[String],
-  tp_masks : Array[Int],
+  tp_slots : Array[Array[Int]],
 ) -> String {
   if tp_names.length() == 0 {
-    return qbe_register_slot_drop(g, static_mask)
+    return qbe_register_slot_drop(g, static_slots)
   }
   if tp_names.length() == 1 {
-    let s_obj = qbe_register_slot_drop(g, static_mask | tp_masks[0])
-    let s_prim = qbe_register_slot_drop(g, static_mask)
+    let s_obj = qbe_register_slot_drop(g, qbe_merge_slot_lists(static_slots, tp_slots[0]))
+    let s_prim = qbe_register_slot_drop(g, static_slots)
     if s_obj == s_prim {
       return s_prim
     }
@@ -7700,12 +7808,15 @@ fn qbe_emit_dynamic_slot_drop(
     qbe_emit(g, r + " =l loadl " + slot)
     return r
   }
-  let m0 = tp_masks[0]
-  let m1 = tp_masks[1]
-  let s00 = qbe_register_slot_drop(g, static_mask)
-  let s01 = qbe_register_slot_drop(g, static_mask | m1)
-  let s10 = qbe_register_slot_drop(g, static_mask | m0)
-  let s11 = qbe_register_slot_drop(g, static_mask | m0 | m1)
+  let m0 = tp_slots[0]
+  let m1 = tp_slots[1]
+  let s00 = qbe_register_slot_drop(g, static_slots)
+  let s01 = qbe_register_slot_drop(g, qbe_merge_slot_lists(static_slots, m1))
+  let s10 = qbe_register_slot_drop(g, qbe_merge_slot_lists(static_slots, m0))
+  let s11 = qbe_register_slot_drop(
+    g,
+    qbe_merge_slot_lists(qbe_merge_slot_lists(static_slots, m0), m1),
+  )
   let slot = qbe_alloc_slot(g)
   let l_1 = qbe_lbl(g, "sdp_1")
   let l_0 = qbe_lbl(g, "sdp_0")
@@ -8628,25 +8739,25 @@ fn qbe_emit_variant_ctor(
         }
         "$pion_drop_enum_" + qbe_sanitize_sym(resolved_enum)
       } else {
-        let mut mask = 0
+        let obj_slots : Array[Int] = []
         let tp_names : Array[String] = []
-        let tp_masks : Array[Int] = []
+        let tp_slots : Array[Array[Int]] = []
         let mut fi = 0
         while fi < arg_tys.length() {
           if qbe_is_obj_ty(arg_tys[fi]) {
-            mask = mask | (1 << (fi + 1))
+            obj_slots.push(fi + 1)
           } else {
             match arg_tys[fi] {
               TParam(tn) =>
                 if qbe_tp_live(g, tn) {
-                  qbe_add_tp_drop_bit(tp_names, tp_masks, tn, 1 << (fi + 1))
+                  qbe_add_tp_drop_slot(tp_names, tp_slots, tn, fi + 1)
                 }
               _ => ()
             }
           }
           fi = fi + 1
         }
-        qbe_emit_dynamic_slot_drop(g, mask, tp_names, tp_masks)
+        qbe_emit_dynamic_slot_drop(g, obj_slots, tp_names, tp_slots)
       }
       let obj = qbe_tmp(g)
       qbe_emit(
@@ -8749,12 +8860,12 @@ fn qbe_emit_closure_obj(
   }
 
   let n_slots = 1 + cap_locals.length() + cap_tparams.length()
-  let mut drop_mask = 0
+  let drop_slots : Array[Int] = []
   let mut has_tparam_cap = false
   let mut mi = 0
   while mi < cap_locals.length() {
     if qbe_is_obj_ty(cap_locals[mi].ty) {
-      drop_mask = drop_mask | (1 << (mi + 1))
+      drop_slots.push(mi + 1)
     } else {
       match cap_locals[mi].ty {
         TParam(tn) =>
@@ -8812,7 +8923,7 @@ fn qbe_emit_closure_obj(
     g.extra_fns.push(dsb.to_string())
     dsym
   } else {
-    qbe_register_slot_drop(g, drop_mask)
+    qbe_register_slot_drop(g, drop_slots)
   }
   let env_obj = qbe_tmp(g)
   qbe_emit(
@@ -15579,9 +15690,9 @@ fn qbe_emit_expr_inner(
               "0"
             }
           } else {
-            let mut mask = 0
+            let obj_slots : Array[Int] = []
             let tp_names : Array[String] = []
-            let tp_masks : Array[Int] = []
+            let tp_slots : Array[Array[Int]] = []
             let mut k = 0
             while k < n_fields {
               let concrete_ty = subst_ty(
@@ -15589,18 +15700,18 @@ fn qbe_emit_expr_inner(
                 g.cur_type_subst,
               )
               if qbe_is_obj_ty(concrete_ty) || qbe_is_obj_ty(slot_tys[k]) {
-                mask = mask | (1 << k)
+                obj_slots.push(k)
               } else {
                 match concrete_ty {
                   TParam(tn) =>
                     if qbe_tp_live(g, tn) {
-                      qbe_add_tp_drop_bit(tp_names, tp_masks, tn, 1 << k)
+                      qbe_add_tp_drop_slot(tp_names, tp_slots, tn, k)
                     }
                   _ =>
                     match slot_tys[k] {
                       TParam(tn) =>
                         if qbe_tp_live(g, tn) {
-                          qbe_add_tp_drop_bit(tp_names, tp_masks, tn, 1 << k)
+                          qbe_add_tp_drop_slot(tp_names, tp_slots, tn, k)
                         }
                       _ => ()
                     }
@@ -15608,7 +15719,7 @@ fn qbe_emit_expr_inner(
               }
               k = k + 1
             }
-            qbe_emit_dynamic_slot_drop(g, mask, tp_names, tp_masks)
+            qbe_emit_dynamic_slot_drop(g, obj_slots, tp_names, tp_slots)
           }
           let obj = qbe_tmp(g)
           let alloc_fn = if n_fields > 0 { "$pion_alloc_uninit" } else { "$pion_alloc" }
@@ -15650,9 +15761,9 @@ fn qbe_emit_expr_inner(
       }
       let vals : Array[String] = []
       let tys : Array[Ty] = []
-      let mut mask = 0
+      let obj_slots : Array[Int] = []
       let tp_names : Array[String] = []
-      let tp_masks : Array[Int] = []
+      let tp_slots : Array[Array[Int]] = []
       let mut i = 0
       while i < elems.length() {
         let elem_exp : Option[Ty] = if i < exp_elems.length() {
@@ -15670,12 +15781,12 @@ fn qbe_emit_expr_inner(
         vals.push(coerced)
         tys.push(slot_ty)
         if qbe_is_obj_ty(slot_ty) {
-          mask = mask | (1 << i)
+          obj_slots.push(i)
         } else {
           match slot_ty {
             TParam(tn) =>
               if qbe_tp_live(g, tn) {
-                qbe_add_tp_drop_bit(tp_names, tp_masks, tn, 1 << i)
+                qbe_add_tp_drop_slot(tp_names, tp_slots, tn, i)
               }
             _ => ()
           }
@@ -15683,7 +15794,7 @@ fn qbe_emit_expr_inner(
         i = i + 1
       }
       let sz = if elems.length() == 0 { 8 } else { elems.length() * 8 }
-      let drop_sym = qbe_emit_dynamic_slot_drop(g, mask, tp_names, tp_masks)
+      let drop_sym = qbe_emit_dynamic_slot_drop(g, obj_slots, tp_names, tp_slots)
       let obj = qbe_tmp(g)
       let alloc_fn = if elems.length() > 0 {
         "$pion_alloc_uninit"
@@ -19994,28 +20105,28 @@ fn qbe_emit_helper_drops(g : QbeGen, out : StringBuilder) -> Unit {
     out.write_string("\n")
   }
   let mut i = 0
-  while i < g.slot_drop_masks.length() {
-    let mask = g.slot_drop_masks[i]
+  while i < g.slot_drop_keys.length() {
+    let key = g.slot_drop_keys[i]
+    let slots = g.slot_drop_specs[i]
     out.write_string("function $pion_drop_slots_")
-    out.write_string(mask.to_string())
+    out.write_string(key)
     out.write_string("(l %p) {\n@start\n")
-    let mut bit = 0
-    while bit < 31 {
-      if ((mask >> bit) & 1) != 0 {
-        let off = bit * 8
-        out.write_string("    %a")
-        out.write_string(bit.to_string())
-        out.write_string(" =l add %p, ")
-        out.write_string(off.to_string())
-        out.write_string("\n    %v")
-        out.write_string(bit.to_string())
-        out.write_string(" =l loadl %a")
-        out.write_string(bit.to_string())
-        out.write_string("\n    call $pion_rc_dec(l %v")
-        out.write_string(bit.to_string())
-        out.write_string(")\n")
-      }
-      bit = bit + 1
+    let mut si = 0
+    while si < slots.length() {
+      let slot_idx = slots[si]
+      let off = slot_idx * 8
+      out.write_string("    %a")
+      out.write_string(slot_idx.to_string())
+      out.write_string(" =l add %p, ")
+      out.write_string(off.to_string())
+      out.write_string("\n    %v")
+      out.write_string(slot_idx.to_string())
+      out.write_string(" =l loadl %a")
+      out.write_string(slot_idx.to_string())
+      out.write_string("\n    call $pion_rc_dec(l %v")
+      out.write_string(slot_idx.to_string())
+      out.write_string(")\n")
+      si = si + 1
     }
     out.write_string("    ret\n}\n\n")
     i = i + 1
