@@ -36,7 +36,8 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
    - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly for `arm64_apple` (Mach-O arm64) and `amd64_sysv` (ELF64 x86-64) with no `as`; all other targets (`amd64_apple`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`) lower via `qbe -t <arch>` → target `cc -c` → `ld`/`cc` + prebuilt `<64 KB` `libpionrt.a`. `--emit-asm` or `PION_NO_DIRECT_OBJ=1` falls back to `qbe` text + assembler.
    - **Multi-target & library outputs**:
      - Host auto-detection (`$PION_TARGET`, else `$OS == Windows_NT`, else `uname -sm`): macOS ARM64 (`arm64_apple`), macOS x86_64 (`amd64_apple`), Linux x86_64 (`amd64_sysv`), Linux ARM64 (`arm64`), Linux RISC-V 64 (`rv64`), Windows x86_64 (`amd64_win`).
-     - Cross targets: `--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64`, with optional `--sysroot <dir>` (`-isysroot` on Apple, `--sysroot=` on ELF; iOS auto-probes `xcrun --sdk iphoneos|iphonesimulator --show-sdk-path`; Android honors `$PION_ANDROID_CC` / `$ANDROID_NDK_HOME`; Windows auto-links `-lws2_32`, links executables with a 16 MB main-thread stack (`-Wl,--stack,16777216`; MinGW defaults to 1 MB), spawns `scope` threads with 8 MB stacks, and omits `-fPIC`/`-rpath`).
+     - Cross targets: `--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32`, with optional `--sysroot <dir>` (`-isysroot` on Apple, `--sysroot=` on ELF; iOS auto-probes `xcrun --sdk iphoneos|iphonesimulator --show-sdk-path`; Android honors `$PION_ANDROID_CC` / `$ANDROID_NDK_HOME`; Windows auto-links `-lws2_32`, links executables with a 16 MB main-thread stack (`-Wl,--stack,16777216`; MinGW defaults to 1 MB), spawns `scope` threads with 8 MB stacks, and omits `-fPIC`/`-rpath`).
+     - **WebAssembly (`--target wasm32`)**: zero-toolchain direct `.wasm` binary emission from QBE SSA (`compiler/src/core/wasm.pion`) requiring no `emcc`/`wasi-sdk`/`wasm-ld`; runs in Browser and Node.js via the zero-dependency ES module `runtime/pion_wasm_rt.mjs` (`pionc run --target wasm32` invokes `node runtime/pion_wasm_rt.mjs` with `$PION_WASM_RT` override) using byte-for-byte identical linear-memory layouts to 64-bit `pion_rt.h`.
      - Artifact modes: `--emit-obj <out.o>`, `--emit-staticlib <out.a>` (`ar rcs` of package + `c_sources` `.o`), `--emit-cdylib <out.so|.dylib>` (`-dynamiclib` on Apple, `-shared` + `-fPIC` on Linux/Android), `--emit-asm <out.s>` (skips assembly when no link/object artifact is requested).
    - **Native libraries**: `-l <lib>` / `-l<lib>` / `--link <lib>` on `build`/`run`/`test`, plus `[link] libs = [...]` in `pion.toml` (dependencies first, de-duplicated) add `-l<lib>` to the link; the list is part of the binary's cache key.
    - **Release backend** (`--release`): the same embedded QBE pipeline (no LLVM, no separate optimizing toolchain) with release-mode IL, stripping `debug_assert`.
@@ -498,6 +499,9 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 
   [link.windows]                # optional; merged after [link] for `amd64_win`
   libs = ["bcrypt"]
+
+  [link.wasm]                   # optional; placeholder for `wasm32`
+  flags = []
 
   [registry]
   url = "https://example.com/pion-index.git"   # default registry for `pionc add <name>`

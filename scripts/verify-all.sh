@@ -147,6 +147,8 @@ sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p26b_ffi_generics/run_e2e.sh" "$PIONC2"
 # P29-A: multi-target (--target all 9 POSIX/mobile targets, --emit-asm, --emit-staticlib, --emit-cdylib, amd64_apple & ios_sim_arm64 cross checks).
 sh "$ROOT_DIR/tests/e2e/p29a_multi_target/run_e2e.sh" "$PIONC2"
+# P29-C: zero-toolchain WebAssembly (--target wasm32 + runtime/pion_wasm_rt.mjs + 4 V1 benchmarks in Node.js).
+sh "$ROOT_DIR/tests/e2e/p29c_wasm32/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent

@@ -1,0 +1,1731 @@
+// Pion WebAssembly (wasm32) Zero-Dependency Universal Runtime (Browser + Node.js)
+// Exact byte-for-byte linear memory layout parity with runtime/pion_rt.h (64-bit ABI):
+//   PionHeader  (24B @ payload - 24): owner_tid:u32@0, local_rc:u32@4, shared_rc:u32@8,
+//                                     type_tag:u16@12, flags:u16@14, drop_fn_idx:u64@16
+//   PionString  (8B+len): len:i64@0, data:u8[]@8
+//   PionBytes   (24B):    len:i64@0, cap:i64@8, data_ptr:i64@16
+//   PionStrBuf  (24B):    len:i64@0, cap:i64@8, data_ptr:i64@16
+//   PionArray   (32B):    len:i64@0, cap:i64@8, elem_is_obj:i32@16, pad:i32@20, data_ptr:i64@24
+//   PionMap     (32B):    len:i64@0, cap:i64@8, val_is_obj:i32@16, key_is_int:i32@20, entries_ptr:i64@24
+//   PionMapEntry(32B):    key:i64@0, hash:u64@8, val:i64@16, state:u8@24
+
+const TAG_STRING  = 1;
+const TAG_BYTES   = 2;
+const TAG_ARRAY   = 3;
+const TAG_STRUCT  = 4;
+const TAG_ENUM    = 5;
+const TAG_CLOSURE = 6;
+const TAG_MAP     = 7;
+const TAG_CHANNEL = 8;
+const TAG_MUTEX   = 9;
+const TAG_ATOMIC  = 10;
+const TAG_STRBUF  = 11;
+const TAG_SCOPE   = 12;
+const TAG_WORLD   = 13;
+
+const FLAG_FROZEN   = 1;
+const FLAG_IMMORTAL = 2;
+
+const HEADER_SIZE = 24;
+const PAGE_SIZE = 65536;
+
+// Size classes for O(1) free-list recycling (total block size incl. 8B size header for raw allocs)
+const FREE_CLASSES = [32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048];
+
+const textDecoder = new TextDecoder("utf-8", { fatal: false });
+const textEncoder = new TextEncoder();
+
+function formatG(v, sigDigits) {
+  if (Number.isNaN(v)) return "nan";
+  if (v === Infinity) return "inf";
+  if (v === -Infinity) return "-inf";
+  if (v === 0) return Object.is(v, -0) ? "-0" : "0";
+  const abs = Math.abs(v);
+  const exp = Math.floor(Math.log10(abs));
+  let s;
+  if (exp < -4 || exp >= sigDigits) {
+    s = v.toExponential(sigDigits - 1);
+    // Strip trailing zeros in mantissa before 'e'
+    const eIdx = s.indexOf("e");
+    let mant = s.slice(0, eIdx);
+    let expo = s.slice(eIdx + 1);
+    if (mant.includes(".")) {
+      mant = mant.replace(/\.?0+$/, "");
+    }
+    const sign = expo[0];
+    let digits = expo.slice(1);
+    if (digits.length < 2) digits = "0" + digits;
+    s = mant + "e" + sign + digits;
+  } else {
+    s = v.toPrecision(sigDigits);
+    if (s.includes(".")) {
+      s = s.replace(/\.?0+$/, "");
+    }
+  }
+  return s;
+}
+
+function hashBytesFNV1a(u8, off, len) {
+  let h = 0xcbf29ce484222325n;
+  const prime = 0x100000001b3n;
+  const mask = 0xffffffffffffffffn;
+  for (let i = 0; i < len; i++) {
+    h ^= BigInt(u8[off + i]);
+    h = (h * prime) & mask;
+  }
+  return h === 0n ? 1n : h;
+}
+
+function hashInt64(k) {
+  let x = BigInt.asUintN(64, k);
+  x ^= x >> 30n;
+  x = BigInt.asUintN(64, x * 0xbf58476d1ce4e5b9n);
+  x ^= x >> 27n;
+  x = BigInt.asUintN(64, x * 0x94d049bb133111ebn);
+  x ^= x >> 31n;
+  return x === 0n ? 1n : x;
+}
+
+export function createPionRuntime(options = {}) {
+  let memory = options.memory || null;
+  let exportsObj = options.exports || null;
+  let cachedBuf = null;
+  let dv = null;
+  let u8 = null;
+
+  let heapPtr = 0;
+  let heapEnd = 0;
+  const freeLists = FREE_CLASSES.map(() => []);
+
+  const stdoutChunks = [];
+  const stderrChunks = [];
+  const isNode = typeof process !== "undefined" && process.versions && process.versions.node;
+  const nodeFs = options.fs || null;
+  const nodeCrypto = options.crypto || null;
+  const nodeCp = options.child_process || null;
+  const cliArgs = Array.isArray(options.args) ? options.args.map(String) : [];
+
+  const printFn = options.print || (isNode
+    ? (s) => process.stdout.write(s)
+    : (s) => { stdoutChunks.push(s); if (typeof console !== "undefined") console.log(s); });
+  const printlnFn = options.println || (isNode
+    ? (s) => process.stdout.write(s + "\n")
+    : (s) => { stdoutChunks.push(s + "\n"); if (typeof console !== "undefined") console.log(s); });
+  const eprintlnFn = options.eprintln || (isNode
+    ? (s) => process.stderr.write(s + "\n")
+    : (s) => { stderrChunks.push(s + "\n"); if (typeof console !== "undefined") console.error(s); });
+
+  function syncViews() {
+    if (cachedBuf !== memory.buffer) {
+      cachedBuf = memory.buffer;
+      dv = new DataView(cachedBuf);
+      u8 = new Uint8Array(cachedBuf);
+      heapEnd = cachedBuf.byteLength;
+    }
+  }
+
+  function bindExports(exp) {
+    exportsObj = exp;
+    if (exp.memory) memory = exp.memory;
+    syncViews();
+    const hb = exp.__heap_base;
+    const base = typeof hb === "number" ? hb : (hb && typeof hb.value === "number" ? hb.value : 0x220000);
+    heapPtr = (base + 15) & ~15;
+    heapEnd = memory.buffer.byteLength;
+  }
+
+  function sizeClassIndex(totalSize) {
+    for (let i = 0; i < FREE_CLASSES.length; i++) {
+      if (totalSize <= FREE_CLASSES[i]) return i;
+    }
+    return -1;
+  }
+
+  // Raw allocation: stores 8-byte block size at ptr - 8 so rawFree knows its class.
+  function rawAlloc(size) {
+    syncViews();
+    const need = ((size + 7) & ~7) + 8;
+    const cls = sizeClassIndex(need);
+    if (cls >= 0 && freeLists[cls].length > 0) {
+      const base = freeLists[cls].pop();
+      const allocSz = FREE_CLASSES[cls];
+      dv.setUint32(base, allocSz, true);
+      dv.setUint32(base + 4, 0, true);
+      return base + 8;
+    }
+    const allocSz = cls >= 0 ? FREE_CLASSES[cls] : ((need + 15) & ~15);
+    if (heapPtr + allocSz > heapEnd) {
+      const missing = heapPtr + allocSz - heapEnd;
+      const growPages = Math.max(16, Math.ceil(missing / PAGE_SIZE));
+      memory.grow(growPages);
+      syncViews();
+    }
+    const base = heapPtr;
+    heapPtr += allocSz;
+    dv.setUint32(base, allocSz, true);
+    dv.setUint32(base + 4, 0, true);
+    return base + 8;
+  }
+
+  function rawAllocZero(size) {
+    const p = rawAlloc(size);
+    u8.fill(0, p, p + size);
+    return p;
+  }
+
+  function rawFree(ptr) {
+    if (!ptr) return;
+    syncViews();
+    const base = ptr - 8;
+    const allocSz = dv.getUint32(base, true);
+    const cls = sizeClassIndex(allocSz);
+    if (cls >= 0 && FREE_CLASSES[cls] === allocSz) {
+      freeLists[cls].push(base);
+    }
+  }
+
+  function pNum(v) {
+    return typeof v === "bigint" ? Number(v) : (v | 0);
+  }
+
+  function pBig(n) {
+    return BigInt(n >>> 0);
+  }
+
+  // --- Object allocation & RC ---
+  function pion_cur_tid() {
+    return 1n;
+  }
+
+  function pion_alloc(payloadSize, typeTag, dropFn) {
+    const sz = payloadSize >>> 0;
+    const hdr = rawAllocZero(HEADER_SIZE + sz);
+    dv.setUint32(hdr + 0, 1, true);          // owner_tid = 1
+    dv.setUint32(hdr + 4, 1, true);          // local_rc = 1
+    dv.setUint32(hdr + 8, 0, true);          // shared_rc = 0
+    dv.setUint16(hdr + 12, typeTag & 0xffff, true);
+    dv.setUint16(hdr + 14, 0, true);         // flags = 0
+    dv.setBigInt64(hdr + 16, BigInt(dropFn || 0n), true);
+    return pBig(hdr + HEADER_SIZE);
+  }
+
+  function pion_alloc_uninit(payloadSize, typeTag, dropFn) {
+    const sz = payloadSize >>> 0;
+    const hdr = rawAlloc(HEADER_SIZE + sz);
+    dv.setUint32(hdr + 0, 1, true);
+    dv.setUint32(hdr + 4, 1, true);
+    dv.setUint32(hdr + 8, 0, true);
+    dv.setUint16(hdr + 12, typeTag & 0xffff, true);
+    dv.setUint16(hdr + 14, 0, true);
+    dv.setBigInt64(hdr + 16, BigInt(dropFn || 0n), true);
+    return pBig(hdr + HEADER_SIZE);
+  }
+
+  function pion_rc_inc(obj) {
+    const p = pNum(obj);
+    if (p === 0) return;
+    syncViews();
+    const hdr = p - HEADER_SIZE;
+    const flags = dv.getUint16(hdr + 14, true);
+    if ((flags & FLAG_IMMORTAL) !== 0) return;
+    const tid = dv.getUint32(hdr + 0, true);
+    if (tid === 0) {
+      dv.setUint32(hdr + 8, (dv.getUint32(hdr + 8, true) + 1) >>> 0, true);
+    } else {
+      dv.setUint32(hdr + 4, (dv.getUint32(hdr + 4, true) + 1) >>> 0, true);
+    }
+  }
+
+  function pion_rc_dec(obj) {
+    const p = pNum(obj);
+    if (p === 0) return;
+    syncViews();
+    const hdr = p - HEADER_SIZE;
+    const flags = dv.getUint16(hdr + 14, true);
+    if ((flags & FLAG_IMMORTAL) !== 0) return;
+    const tid = dv.getUint32(hdr + 0, true);
+    let rc;
+    if (tid === 0) {
+      rc = (dv.getUint32(hdr + 8, true) - 1) >>> 0;
+      dv.setUint32(hdr + 8, rc, true);
+    } else {
+      rc = (dv.getUint32(hdr + 4, true) - 1) >>> 0;
+      dv.setUint32(hdr + 4, rc, true);
+    }
+    if (rc !== 0) return;
+
+    const dropIdx = Number(dv.getBigInt64(hdr + 16, true));
+    const tag = dv.getUint16(hdr + 12, true);
+    if (dropIdx !== 0 && exportsObj && exportsObj.__indirect_function_table) {
+      const fn = exportsObj.__indirect_function_table.get(dropIdx);
+      if (fn) fn(pBig(p));
+      syncViews();
+    }
+    if (tag === TAG_ARRAY) {
+      const len = Number(dv.getBigInt64(p + 0, true));
+      const elemIsObj = dv.getInt32(p + 16, true);
+      const dataPtr = Number(dv.getBigInt64(p + 24, true));
+      if (elemIsObj && dataPtr) {
+        for (let i = 0; i < len; i++) {
+          const ev = dv.getBigInt64(dataPtr + i * 8, true);
+          if (ev !== 0n) pion_rc_dec(ev);
+          syncViews();
+        }
+      }
+      if (dataPtr) rawFree(dataPtr);
+    } else if (tag === TAG_MAP) {
+      const cap = Number(dv.getBigInt64(p + 8, true));
+      const valIsObj = dv.getInt32(p + 16, true);
+      const keyIsInt = dv.getInt32(p + 20, true);
+      const entries = Number(dv.getBigInt64(p + 24, true));
+      if (entries) {
+        for (let i = 0; i < cap; i++) {
+          const e = entries + i * 32;
+          if (u8[e + 24] === 1) {
+            if (!keyIsInt) {
+              const k = dv.getBigInt64(e + 0, true);
+              if (k !== 0n) pion_rc_dec(k);
+              syncViews();
+            }
+            if (valIsObj) {
+              const v = dv.getBigInt64(e + 16, true);
+              if (v !== 0n) pion_rc_dec(v);
+              syncViews();
+            }
+          }
+        }
+        rawFree(entries);
+      }
+    } else if (tag === TAG_BYTES || tag === TAG_STRBUF) {
+      const dataPtr = Number(dv.getBigInt64(p + 16, true));
+      if (dataPtr) rawFree(dataPtr);
+    } else if (tag === TAG_MUTEX) {
+      const valIsObj = dv.getInt32(p + 8, true);
+      if (valIsObj) {
+        const v = dv.getBigInt64(p + 0, true);
+        if (v !== 0n) pion_rc_dec(v);
+      }
+    } else if (tag === TAG_CHANNEL) {
+      const ch = channels.get(p);
+      if (ch) {
+        if (ch.elemIsObj) {
+          for (const v of ch.queue) pion_rc_dec(v);
+        }
+        channels.delete(p);
+      }
+    }
+    rawFree(hdr);
+  }
+
+  function pion_rc_freeze(obj) {
+    const p = pNum(obj);
+    if (p === 0) return;
+    syncViews();
+    const hdr = p - HEADER_SIZE;
+    const flags = dv.getUint16(hdr + 14, true);
+    if ((flags & (FLAG_IMMORTAL | FLAG_FROZEN)) !== 0) return;
+    const lrc = dv.getUint32(hdr + 4, true);
+    const src = dv.getUint32(hdr + 8, true);
+    dv.setUint32(hdr + 0, 0, true);
+    dv.setUint32(hdr + 4, 0, true);
+    dv.setUint32(hdr + 8, (lrc + src) >>> 0, true);
+    dv.setUint16(hdr + 14, flags | FLAG_FROZEN, true);
+  }
+
+  function pion_rc_immortalize(obj) {
+    const p = pNum(obj);
+    if (p === 0) return;
+    syncViews();
+    const hdr = p - HEADER_SIZE;
+    const flags = dv.getUint16(hdr + 14, true);
+    dv.setUint16(hdr + 14, flags | FLAG_IMMORTAL, true);
+  }
+
+  // --- Helpers for reading/writing Pion strings & C strings ---
+  function readCStr(ptr) {
+    const p = pNum(ptr);
+    if (p === 0) return "";
+    syncViews();
+    let end = p;
+    while (u8[end] !== 0) end++;
+    return textDecoder.decode(u8.subarray(p, end));
+  }
+
+  function readPionStr(ptr) {
+    const p = pNum(ptr);
+    if (p === 0) return "";
+    syncViews();
+    const len = Number(dv.getBigInt64(p + 0, true));
+    return textDecoder.decode(u8.subarray(p + 8, p + 8 + len));
+  }
+
+  function makePionStrFromBytes(bytes) {
+    const len = bytes.length;
+    const obj = pion_alloc_uninit(8 + len + 1, TAG_STRING, 0n);
+    const p = pNum(obj);
+    syncViews();
+    dv.setBigInt64(p + 0, BigInt(len), true);
+    u8.set(bytes, p + 8);
+    u8[p + 8 + len] = 0;
+    return obj;
+  }
+
+  function makePionStr(jsStr) {
+    return makePionStrFromBytes(textEncoder.encode(jsStr));
+  }
+
+  function pion_panic(msgPtr, filePtr, line) {
+    const msg = readCStr(msgPtr);
+    const file = readCStr(filePtr);
+    const err = `pion panic at ${file}:${line}: ${msg}`;
+    eprintlnFn(err);
+    throw new Error(err);
+  }
+
+  function pion_panic_oob(idx, len) {
+    const err = `pion panic: index out of bounds: idx=${idx}, len=${len}`;
+    eprintlnFn(err);
+    throw new Error(err);
+  }
+
+  function pion_debug_assert(cond, msgStr, filePtr, line) {
+    if ((cond | 0) === 0) {
+      const msg = readPionStr(msgStr);
+      const file = readCStr(filePtr);
+      const err = `pion debug_assert failed at ${file}:${line}: ${msg}`;
+      eprintlnFn(err);
+      throw new Error(err);
+    }
+  }
+
+  // --- Math ---
+  const pion_math_sqrt = (x) => Math.sqrt(x);
+  const pion_math_abs = (x) => Math.abs(x);
+  const pion_math_floor = (x) => Math.floor(x);
+  const pion_math_ceil = (x) => Math.ceil(x);
+  const pion_math_sin = (x) => Math.sin(x);
+  const pion_math_cos = (x) => Math.cos(x);
+  const pion_math_pow = (x, y) => Math.pow(x, y);
+
+  // --- String ---
+  function pion_str_from_cstr(cstrPtr, len) {
+    const n = Number(len);
+    const src = pNum(cstrPtr);
+    const obj = pion_alloc_uninit(8 + n + 1, TAG_STRING, 0n);
+    const dst = pNum(obj);
+    syncViews();
+    dv.setBigInt64(dst, BigInt(n), true);
+    if (n > 0 && src !== 0) {
+      u8.copyWithin(dst + 8, src, src + n);
+    }
+    u8[dst + 8 + n] = 0;
+    return obj;
+  }
+
+  function pion_str_len(s) {
+    const p = pNum(s);
+    if (p === 0) return 0n;
+    syncViews();
+    return dv.getBigInt64(p, true);
+  }
+
+  function pion_str_byte_at(s, idx) {
+    const p = pNum(s);
+    syncViews();
+    const len = dv.getBigInt64(p, true);
+    if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
+    return u8[p + 8 + Number(idx)];
+  }
+
+  function pion_str_concat(a, b) {
+    const pa = pNum(a), pb = pNum(b);
+    syncViews();
+    const la = pa ? Number(dv.getBigInt64(pa, true)) : 0;
+    const lb = pb ? Number(dv.getBigInt64(pb, true)) : 0;
+    const total = la + lb;
+    const obj = pion_alloc_uninit(8 + total + 1, TAG_STRING, 0n);
+    const dst = pNum(obj);
+    syncViews();
+    dv.setBigInt64(dst, BigInt(total), true);
+    if (la > 0) u8.copyWithin(dst + 8, pa + 8, pa + 8 + la);
+    if (lb > 0) u8.copyWithin(dst + 8 + la, pb + 8, pb + 8 + lb);
+    u8[dst + 8 + total] = 0;
+    return obj;
+  }
+
+  function pion_str_concat_n(n, partsPtr) {
+    const count = Number(n);
+    const pp = pNum(partsPtr);
+    syncViews();
+    let total = 0;
+    const ptrs = new Array(count);
+    const lens = new Array(count);
+    for (let i = 0; i < count; i++) {
+      const sp = Number(dv.getBigInt64(pp + i * 8, true));
+      ptrs[i] = sp;
+      const l = sp ? Number(dv.getBigInt64(sp, true)) : 0;
+      lens[i] = l;
+      total += l;
+    }
+    const obj = pion_alloc_uninit(8 + total + 1, TAG_STRING, 0n);
+    const dst = pNum(obj);
+    syncViews();
+    dv.setBigInt64(dst, BigInt(total), true);
+    let off = 0;
+    for (let i = 0; i < count; i++) {
+      const l = lens[i];
+      if (l > 0) {
+        u8.copyWithin(dst + 8 + off, ptrs[i] + 8, ptrs[i] + 8 + l);
+        off += l;
+      }
+    }
+    u8[dst + 8 + total] = 0;
+    return obj;
+  }
+
+  function pion_str_eq(a, b) {
+    const pa = pNum(a), pb = pNum(b);
+    if (pa === pb) return 1;
+    if (!pa || !pb) return 0;
+    syncViews();
+    const la = Number(dv.getBigInt64(pa, true));
+    const lb = Number(dv.getBigInt64(pb, true));
+    if (la !== lb) return 0;
+    for (let i = 0; i < la; i++) {
+      if (u8[pa + 8 + i] !== u8[pb + 8 + i]) return 0;
+    }
+    return 1;
+  }
+
+  function pion_str_cmp(a, b) {
+    const pa = pNum(a), pb = pNum(b);
+    if (pa === pb) return 0;
+    syncViews();
+    const la = pa ? Number(dv.getBigInt64(pa, true)) : 0;
+    const lb = pb ? Number(dv.getBigInt64(pb, true)) : 0;
+    const m = Math.min(la, lb);
+    for (let i = 0; i < m; i++) {
+      const ca = u8[pa + 8 + i], cb = u8[pb + 8 + i];
+      if (ca !== cb) return ca < cb ? -1 : 1;
+    }
+    return la < lb ? -1 : (la > lb ? 1 : 0);
+  }
+
+  function pion_str_slice(s, start, end) {
+    const ps = pNum(s);
+    syncViews();
+    const len = Number(dv.getBigInt64(ps, true));
+    let a = Number(start), b = Number(end);
+    if (a < 0) a = 0;
+    if (b > len) b = len;
+    if (b < a) b = a;
+    const n = b - a;
+    const obj = pion_alloc_uninit(8 + n + 1, TAG_STRING, 0n);
+    const dst = pNum(obj);
+    syncViews();
+    dv.setBigInt64(dst, BigInt(n), true);
+    if (n > 0) u8.copyWithin(dst + 8, ps + 8 + a, ps + 8 + b);
+    u8[dst + 8 + n] = 0;
+    return obj;
+  }
+
+  function pion_int_to_str(v) {
+    return makePionStr(BigInt(v).toString(10));
+  }
+
+  function pion_uint64_to_str(v) {
+    return makePionStr(BigInt.asUintN(64, BigInt(v)).toString(10));
+  }
+
+  function pion_double_to_str(v) {
+    return makePionStr(formatG(v, 15));
+  }
+
+  function pion_float_to_str(v) {
+    return makePionStr(formatG(Math.fround(v), 7));
+  }
+
+  function pion_str_to_int(s, okOut) {
+    const txt = readPionStr(s).trim();
+    const okP = pNum(okOut);
+    syncViews();
+    if (!/^[+-]?\d+$/.test(txt)) {
+      if (okP) dv.setInt32(okP, 0, true);
+      return 0n;
+    }
+    try {
+      const v = BigInt(txt);
+      if (v < -9223372036854775808n || v > 9223372036854775807n) {
+        if (okP) dv.setInt32(okP, 0, true);
+        return 0n;
+      }
+      if (okP) dv.setInt32(okP, 1, true);
+      return v;
+    } catch {
+      if (okP) dv.setInt32(okP, 0, true);
+      return 0n;
+    }
+  }
+
+  function pion_str_to_double(s, okOut) {
+    const txt = readPionStr(s).trim();
+    const okP = pNum(okOut);
+    syncViews();
+    if (txt.length === 0) {
+      if (okP) dv.setInt32(okP, 0, true);
+      return 0.0;
+    }
+    const v = Number(txt);
+    if (Number.isNaN(v)) {
+      if (okP) dv.setInt32(okP, 0, true);
+      return 0.0;
+    }
+    if (okP) dv.setInt32(okP, 1, true);
+    return v;
+  }
+
+  function pion_str_starts_with(s, prefix) {
+    const ps = pNum(s), pp = pNum(prefix);
+    syncViews();
+    const ls = Number(dv.getBigInt64(ps, true));
+    const lp = Number(dv.getBigInt64(pp, true));
+    if (lp > ls) return 0;
+    for (let i = 0; i < lp; i++) {
+      if (u8[ps + 8 + i] !== u8[pp + 8 + i]) return 0;
+    }
+    return 1;
+  }
+
+  function pion_str_ends_with(s, suffix) {
+    const ps = pNum(s), pp = pNum(suffix);
+    syncViews();
+    const ls = Number(dv.getBigInt64(ps, true));
+    const lp = Number(dv.getBigInt64(pp, true));
+    if (lp > ls) return 0;
+    const off = ls - lp;
+    for (let i = 0; i < lp; i++) {
+      if (u8[ps + 8 + off + i] !== u8[pp + 8 + i]) return 0;
+    }
+    return 1;
+  }
+
+  function pion_str_index_of(s, needle) {
+    const ps = pNum(s), pn = pNum(needle);
+    syncViews();
+    const ls = Number(dv.getBigInt64(ps, true));
+    const ln = Number(dv.getBigInt64(pn, true));
+    if (ln === 0) return 0n;
+    if (ln > ls) return -1n;
+    const limit = ls - ln;
+    outer: for (let i = 0; i <= limit; i++) {
+      for (let j = 0; j < ln; j++) {
+        if (u8[ps + 8 + i + j] !== u8[pn + 8 + j]) continue outer;
+      }
+      return BigInt(i);
+    }
+    return -1n;
+  }
+
+  function pion_str_contains(s, needle) {
+    return pion_str_index_of(s, needle) >= 0n ? 1 : 0;
+  }
+
+  function pion_str_trim(s) {
+    const ps = pNum(s);
+    syncViews();
+    const len = Number(dv.getBigInt64(ps, true));
+    let a = 0, b = len;
+    const isWs = (c) => c === 32 || c === 9 || c === 10 || c === 13;
+    while (a < b && isWs(u8[ps + 8 + a])) a++;
+    while (b > a && isWs(u8[ps + 8 + b - 1])) b--;
+    return pion_str_slice(s, BigInt(a), BigInt(b));
+  }
+
+  function pion_str_split(s, sep) {
+    const str = readPionStr(s);
+    const sp = readPionStr(sep);
+    const parts = sp.length === 0 ? [str] : str.split(sp);
+    const arr = pion_arr_new(BigInt(parts.length), 1);
+    for (let i = 0; i < parts.length; i++) {
+      const partObj = makePionStr(parts[i]);
+      pion_arr_push_owned(arr, partObj);
+    }
+    return arr;
+  }
+
+  function pion_str_replace(s, from, to) {
+    const str = readPionStr(s);
+    const f = readPionStr(from);
+    const t = readPionStr(to);
+    if (f.length === 0) return makePionStr(str);
+    return makePionStr(str.split(f).join(t));
+  }
+
+  function pion_str_to_bytes(s) {
+    const ps = pNum(s);
+    syncViews();
+    const len = Number(dv.getBigInt64(ps, true));
+    const b = pion_bytes_new(BigInt(len));
+    const pb = pNum(b);
+    syncViews();
+    const dp = Number(dv.getBigInt64(pb + 16, true));
+    if (len > 0) u8.copyWithin(dp, ps + 8, ps + 8 + len);
+    return b;
+  }
+
+  function pion_bytes_to_str(b) {
+    const pb = pNum(b);
+    syncViews();
+    const len = Number(dv.getBigInt64(pb + 0, true));
+    const dp = Number(dv.getBigInt64(pb + 16, true));
+    const obj = pion_alloc_uninit(8 + len + 1, TAG_STRING, 0n);
+    const dst = pNum(obj);
+    syncViews();
+    dv.setBigInt64(dst, BigInt(len), true);
+    if (len > 0 && dp) u8.copyWithin(dst + 8, dp, dp + len);
+    u8[dst + 8 + len] = 0;
+    return obj;
+  }
+
+  // --- Bytes ---
+  function pion_bytes_new(len) {
+    const n = Math.max(0, Number(len));
+    const cap = Math.max(n, 16);
+    const obj = pion_alloc_uninit(24, TAG_BYTES, 0n);
+    const dp = rawAllocZero(cap);
+    const p = pNum(obj);
+    syncViews();
+    dv.setBigInt64(p + 0, BigInt(n), true);
+    dv.setBigInt64(p + 8, BigInt(cap), true);
+    dv.setBigInt64(p + 16, pBig(dp), true);
+    return obj;
+  }
+
+  function pion_bytes_len(b) {
+    syncViews();
+    return dv.getBigInt64(pNum(b), true);
+  }
+
+  function pion_bytes_get(b, idx) {
+    const pb = pNum(b);
+    syncViews();
+    const len = dv.getBigInt64(pb, true);
+    if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
+    const dp = Number(dv.getBigInt64(pb + 16, true));
+    return u8[dp + Number(idx)];
+  }
+
+  function pion_bytes_set(b, idx, val) {
+    const pb = pNum(b);
+    syncViews();
+    const len = dv.getBigInt64(pb, true);
+    if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
+    const dp = Number(dv.getBigInt64(pb + 16, true));
+    u8[dp + Number(idx)] = val & 0xff;
+  }
+
+  function pion_bytes_slice(b, start, end) {
+    const pb = pNum(b);
+    syncViews();
+    const len = Number(dv.getBigInt64(pb, true));
+    let a = Number(start), e = Number(end);
+    if (a < 0) a = 0;
+    if (e > len) e = len;
+    if (e < a) e = a;
+    const n = e - a;
+    const out = pion_bytes_new(BigInt(n));
+    const po = pNum(out);
+    syncViews();
+    const src = Number(dv.getBigInt64(pb + 16, true));
+    const dst = Number(dv.getBigInt64(po + 16, true));
+    if (n > 0) u8.copyWithin(dst, src + a, src + e);
+    return out;
+  }
+
+  function pion_bytes_concat(a, b) {
+    const pa = pNum(a), pb = pNum(b);
+    syncViews();
+    const la = Number(dv.getBigInt64(pa, true));
+    const lb = Number(dv.getBigInt64(pb, true));
+    const out = pion_bytes_new(BigInt(la + lb));
+    const po = pNum(out);
+    syncViews();
+    const da = Number(dv.getBigInt64(pa + 16, true));
+    const db = Number(dv.getBigInt64(pb + 16, true));
+    const dst = Number(dv.getBigInt64(po + 16, true));
+    if (la > 0) u8.copyWithin(dst, da, da + la);
+    if (lb > 0) u8.copyWithin(dst + la, db, db + lb);
+    return out;
+  }
+
+  function pion_bytes_from_ptr(ptr, len) {
+    const n = Math.max(0, Number(len));
+    const out = pion_bytes_new(BigInt(n));
+    const po = pNum(out);
+    const src = pNum(ptr);
+    syncViews();
+    const dst = Number(dv.getBigInt64(po + 16, true));
+    if (n > 0 && src) u8.copyWithin(dst, src, src + n);
+    return out;
+  }
+
+  function pion_bytes_copy_to_ptr(b, srcOff, dstPtr, len) {
+    const pb = pNum(b);
+    const dst = pNum(dstPtr);
+    const n = Math.max(0, Number(len));
+    const off = Math.max(0, Number(srcOff));
+    syncViews();
+    const src = Number(dv.getBigInt64(pb + 16, true));
+    if (n > 0 && dst && src) u8.copyWithin(dst, src + off, src + off + n);
+  }
+
+  // --- StringBuilder ---
+  function pion_strbuf_new(cap) {
+    const c = Math.max(Number(cap), 32);
+    const obj = pion_alloc_uninit(24, TAG_STRBUF, 0n);
+    const dp = rawAlloc(c);
+    const p = pNum(obj);
+    syncViews();
+    dv.setBigInt64(p + 0, 0n, true);
+    dv.setBigInt64(p + 8, BigInt(c), true);
+    dv.setBigInt64(p + 16, pBig(dp), true);
+    return obj;
+  }
+
+  function strbufEnsure(p, extra) {
+    syncViews();
+    const len = Number(dv.getBigInt64(p + 0, true));
+    let cap = Number(dv.getBigInt64(p + 8, true));
+    if (len + extra <= cap) return;
+    let newCap = Math.max(cap * 2, len + extra + 32);
+    const oldDp = Number(dv.getBigInt64(p + 16, true));
+    const newDp = rawAlloc(newCap);
+    syncViews();
+    if (len > 0 && oldDp) u8.copyWithin(newDp, oldDp, oldDp + len);
+    if (oldDp) rawFree(oldDp);
+    dv.setBigInt64(p + 8, BigInt(newCap), true);
+    dv.setBigInt64(p + 16, pBig(newDp), true);
+  }
+
+  function pion_strbuf_push_str(sb, s) {
+    const p = pNum(sb), ps = pNum(s);
+    if (!ps) return;
+    syncViews();
+    const slen = Number(dv.getBigInt64(ps, true));
+    if (slen === 0) return;
+    strbufEnsure(p, slen);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 16, true));
+    u8.copyWithin(dp + len, ps + 8, ps + 8 + slen);
+    dv.setBigInt64(p, BigInt(len + slen), true);
+  }
+
+  function pion_strbuf_push_byte(sb, b) {
+    const p = pNum(sb);
+    strbufEnsure(p, 1);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 16, true));
+    u8[dp + len] = b & 0xff;
+    dv.setBigInt64(p, BigInt(len + 1), true);
+  }
+
+  function pion_strbuf_push_char(sb, cp) {
+    const p = pNum(sb);
+    const c = cp >>> 0;
+    if (c < 0x80) {
+      pion_strbuf_push_byte(sb, c);
+      return;
+    }
+    const encoded = textEncoder.encode(String.fromCodePoint(c));
+    strbufEnsure(p, encoded.length);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 16, true));
+    u8.set(encoded, dp + len);
+    dv.setBigInt64(p, BigInt(len + encoded.length), true);
+  }
+
+  function pion_strbuf_push_int(sb, v) {
+    const p = pNum(sb);
+    const bytes = textEncoder.encode(BigInt(v).toString(10));
+    strbufEnsure(p, bytes.length);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 16, true));
+    u8.set(bytes, dp + len);
+    dv.setBigInt64(p, BigInt(len + bytes.length), true);
+  }
+
+  function pion_strbuf_reset(sb) {
+    syncViews();
+    dv.setBigInt64(pNum(sb), 0n, true);
+  }
+
+  function pion_strbuf_to_str(sb) {
+    const p = pNum(sb);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 16, true));
+    const obj = pion_alloc_uninit(8 + len + 1, TAG_STRING, 0n);
+    const dst = pNum(obj);
+    syncViews();
+    dv.setBigInt64(dst, BigInt(len), true);
+    if (len > 0 && dp) u8.copyWithin(dst + 8, dp, dp + len);
+    u8[dst + 8 + len] = 0;
+    return obj;
+  }
+
+  // --- Array ---
+  function pion_arr_new(cap, elemIsObj) {
+    const c = Math.max(Number(cap), 0);
+    const obj = pion_alloc_uninit(32, TAG_ARRAY, 0n);
+    const dp = c > 0 ? rawAllocZero(c * 8) : 0;
+    const p = pNum(obj);
+    syncViews();
+    dv.setBigInt64(p + 0, 0n, true);
+    dv.setBigInt64(p + 8, BigInt(c), true);
+    dv.setInt32(p + 16, elemIsObj | 0, true);
+    dv.setInt32(p + 20, 0, true);
+    dv.setBigInt64(p + 24, pBig(dp), true);
+    return obj;
+  }
+
+  function pion_arr_len(a) {
+    syncViews();
+    return dv.getBigInt64(pNum(a), true);
+  }
+
+  function arrEnsure(p, need) {
+    syncViews();
+    const cap = Number(dv.getBigInt64(p + 8, true));
+    if (need <= cap) return;
+    let newCap = cap < 8 ? 8 : cap * 2;
+    while (newCap < need) newCap *= 2;
+    const len = Number(dv.getBigInt64(p + 0, true));
+    const oldDp = Number(dv.getBigInt64(p + 24, true));
+    const newDp = rawAlloc(newCap * 8);
+    syncViews();
+    if (len > 0 && oldDp) u8.copyWithin(newDp, oldDp, oldDp + len * 8);
+    if (oldDp) rawFree(oldDp);
+    dv.setBigInt64(p + 8, BigInt(newCap), true);
+    dv.setBigInt64(p + 24, pBig(newDp), true);
+  }
+
+  function pion_arr_push(a, val) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const elemIsObj = dv.getInt32(p + 16, true);
+    arrEnsure(p, len + 1);
+    syncViews();
+    if (elemIsObj && val !== 0n) pion_rc_inc(val);
+    syncViews();
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    dv.setBigInt64(dp + len * 8, BigInt(val), true);
+    dv.setBigInt64(p, BigInt(len + 1), true);
+  }
+
+  function pion_arr_push_owned(a, val) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    arrEnsure(p, len + 1);
+    syncViews();
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    dv.setBigInt64(dp + len * 8, BigInt(val), true);
+    dv.setBigInt64(p, BigInt(len + 1), true);
+  }
+
+  function pion_arr_get(a, idx) {
+    const p = pNum(a);
+    syncViews();
+    const len = dv.getBigInt64(p, true);
+    if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const val = dv.getBigInt64(dp + Number(idx) * 8, true);
+    if (dv.getInt32(p + 16, true) && val !== 0n) pion_rc_inc(val);
+    return val;
+  }
+
+  function pion_arr_set(a, idx, val) {
+    const p = pNum(a);
+    syncViews();
+    const len = dv.getBigInt64(p, true);
+    if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
+    const elemIsObj = dv.getInt32(p + 16, true);
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const off = dp + Number(idx) * 8;
+    const oldVal = dv.getBigInt64(off, true);
+    if (elemIsObj && val !== 0n) pion_rc_inc(val);
+    syncViews();
+    dv.setBigInt64(off, BigInt(val), true);
+    if (elemIsObj && oldVal !== 0n) pion_rc_dec(oldVal);
+  }
+
+  function pion_arr_pop(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    if (len <= 0) pion_panic_oob(-1n, 0n);
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const val = dv.getBigInt64(dp + (len - 1) * 8, true);
+    dv.setBigInt64(p, BigInt(len - 1), true);
+    return val;
+  }
+
+  function pion_arr_copy(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const elemIsObj = dv.getInt32(p + 16, true);
+    const out = pion_arr_new(BigInt(len), elemIsObj);
+    const po = pNum(out);
+    syncViews();
+    const src = Number(dv.getBigInt64(p + 24, true));
+    const dst = Number(dv.getBigInt64(po + 24, true));
+    if (len > 0) {
+      u8.copyWithin(dst, src, src + len * 8);
+      if (elemIsObj) {
+        for (let i = 0; i < len; i++) {
+          const ev = dv.getBigInt64(dst + i * 8, true);
+          if (ev !== 0n) pion_rc_inc(ev);
+        }
+      }
+    }
+    dv.setBigInt64(po, BigInt(len), true);
+    return out;
+  }
+
+  function pion_arr_clear(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const elemIsObj = dv.getInt32(p + 16, true);
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    if (elemIsObj && dp) {
+      for (let i = 0; i < len; i++) {
+        const ev = dv.getBigInt64(dp + i * 8, true);
+        if (ev !== 0n) pion_rc_dec(ev);
+        syncViews();
+      }
+    }
+    dv.setBigInt64(p, 0n, true);
+  }
+
+  function pion_arr_reverse(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    for (let i = 0, j = len - 1; i < j; i++, j--) {
+      const va = dv.getBigInt64(dp + i * 8, true);
+      const vb = dv.getBigInt64(dp + j * 8, true);
+      dv.setBigInt64(dp + i * 8, vb, true);
+      dv.setBigInt64(dp + j * 8, va, true);
+    }
+  }
+
+  function pion_arr_join(a, sep) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const sp = readPionStr(sep);
+    const parts = new Array(len);
+    for (let i = 0; i < len; i++) {
+      parts[i] = readPionStr(dv.getBigInt64(dp + i * 8, true));
+    }
+    return makePionStr(parts.join(sp));
+  }
+
+  function pion_arr_sort_int(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    if (len <= 1) return;
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const vals = new Array(len);
+    for (let i = 0; i < len; i++) vals[i] = dv.getBigInt64(dp + i * 8, true);
+    vals.sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
+    for (let i = 0; i < len; i++) dv.setBigInt64(dp + i * 8, vals[i], true);
+  }
+
+  function pion_arr_sort_str(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    if (len <= 1) return;
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const vals = new Array(len);
+    for (let i = 0; i < len; i++) vals[i] = dv.getBigInt64(dp + i * 8, true);
+    vals.sort((x, y) => pion_str_cmp(x, y));
+    for (let i = 0; i < len; i++) dv.setBigInt64(dp + i * 8, vals[i], true);
+  }
+
+  // --- Hash Map (32B PionMapEntry: key@0, hash@8, val@16, state@24) ---
+  function mapAllocEntries(cap) {
+    return rawAllocZero(cap * 32);
+  }
+
+  function pion_map_new_common(valIsObj, keyIsInt) {
+    const initCap = 16;
+    const obj = pion_alloc_uninit(32, TAG_MAP, 0n);
+    const entries = mapAllocEntries(initCap);
+    const p = pNum(obj);
+    syncViews();
+    dv.setBigInt64(p + 0, 0n, true);
+    dv.setBigInt64(p + 8, BigInt(initCap), true);
+    dv.setInt32(p + 16, valIsObj | 0, true);
+    dv.setInt32(p + 20, keyIsInt | 0, true);
+    dv.setBigInt64(p + 24, pBig(entries), true);
+    return obj;
+  }
+
+  function pion_map_new(valIsObj) { return pion_map_new_common(valIsObj, 0); }
+  function pion_map_new_int(valIsObj) { return pion_map_new_common(valIsObj, 1); }
+
+  function pion_map_len(m) {
+    syncViews();
+    return dv.getBigInt64(pNum(m), true);
+  }
+
+  function mapKeyHash(key, keyIsInt) {
+    if (keyIsInt) return hashInt64(key);
+    const pk = pNum(key);
+    syncViews();
+    const len = Number(dv.getBigInt64(pk, true));
+    return hashBytesFNV1a(u8, pk + 8, len);
+  }
+
+  function mapKeyEq(a, b, keyIsInt) {
+    if (keyIsInt) return a === b;
+    return pion_str_eq(a, b) !== 0;
+  }
+
+  function mapGrow(p) {
+    syncViews();
+    const oldCap = Number(dv.getBigInt64(p + 8, true));
+    const oldEntries = Number(dv.getBigInt64(p + 24, true));
+    const newCap = oldCap < 16 ? 16 : oldCap * 2;
+    const newEntries = mapAllocEntries(newCap);
+    syncViews();
+    const mask = newCap - 1;
+    for (let i = 0; i < oldCap; i++) {
+      const oe = oldEntries + i * 32;
+      if (u8[oe + 24] === 1) {
+        const k = dv.getBigInt64(oe + 0, true);
+        const h = dv.getBigUint64(oe + 8, true);
+        const v = dv.getBigInt64(oe + 16, true);
+        let idx = Number(h & BigInt(mask));
+        while (u8[newEntries + idx * 32 + 24] === 1) {
+          idx = (idx + 1) & mask;
+        }
+        const ne = newEntries + idx * 32;
+        dv.setBigInt64(ne + 0, k, true);
+        dv.setBigUint64(ne + 8, h, true);
+        dv.setBigInt64(ne + 16, v, true);
+        u8[ne + 24] = 1;
+      }
+    }
+    if (oldEntries) rawFree(oldEntries);
+    dv.setBigInt64(p + 8, BigInt(newCap), true);
+    dv.setBigInt64(p + 24, pBig(newEntries), true);
+  }
+
+  function pion_map_set(m, key, val) {
+    const p = pNum(m);
+    syncViews();
+    let len = Number(dv.getBigInt64(p + 0, true));
+    let cap = Number(dv.getBigInt64(p + 8, true));
+    if ((len + 1) * 10 >= cap * 7) {
+      mapGrow(p);
+      syncViews();
+      cap = Number(dv.getBigInt64(p + 8, true));
+    }
+    const valIsObj = dv.getInt32(p + 16, true);
+    const keyIsInt = dv.getInt32(p + 20, true);
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const h = mapKeyHash(key, keyIsInt);
+    const mask = cap - 1;
+    let idx = Number(h & BigInt(mask));
+    while (true) {
+      const e = entries + idx * 32;
+      const st = u8[e + 24];
+      if (st === 0) {
+        if (!keyIsInt && key !== 0n) pion_rc_inc(key);
+        if (valIsObj && val !== 0n) pion_rc_inc(val);
+        syncViews();
+        dv.setBigInt64(e + 0, BigInt(key), true);
+        dv.setBigUint64(e + 8, h, true);
+        dv.setBigInt64(e + 16, BigInt(val), true);
+        u8[e + 24] = 1;
+        dv.setBigInt64(p + 0, BigInt(len + 1), true);
+        return;
+      }
+      if (dv.getBigUint64(e + 8, true) === h && mapKeyEq(dv.getBigInt64(e + 0, true), key, keyIsInt)) {
+        const oldVal = dv.getBigInt64(e + 16, true);
+        if (valIsObj && val !== 0n) pion_rc_inc(val);
+        syncViews();
+        dv.setBigInt64(e + 16, BigInt(val), true);
+        if (valIsObj && oldVal !== 0n) pion_rc_dec(oldVal);
+        return;
+      }
+      idx = (idx + 1) & mask;
+    }
+  }
+
+  function mapFindSlot(p, key) {
+    syncViews();
+    const cap = Number(dv.getBigInt64(p + 8, true));
+    if (cap === 0) return -1;
+    const keyIsInt = dv.getInt32(p + 20, true);
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const h = mapKeyHash(key, keyIsInt);
+    const mask = cap - 1;
+    let idx = Number(h & BigInt(mask));
+    for (let step = 0; step < cap; step++) {
+      const e = entries + idx * 32;
+      if (u8[e + 24] === 0) return -1;
+      if (dv.getBigUint64(e + 8, true) === h && mapKeyEq(dv.getBigInt64(e + 0, true), key, keyIsInt)) {
+        return idx;
+      }
+      idx = (idx + 1) & mask;
+    }
+    return -1;
+  }
+
+  function pion_map_has(m, key) {
+    return mapFindSlot(pNum(m), key) >= 0 ? 1 : 0;
+  }
+
+  function pion_map_get(m, key) {
+    const p = pNum(m);
+    const slot = mapFindSlot(p, key);
+    if (slot < 0) return 0n;
+    syncViews();
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const val = dv.getBigInt64(entries + slot * 32 + 16, true);
+    if (dv.getInt32(p + 16, true) && val !== 0n) pion_rc_inc(val);
+    return val;
+  }
+
+  function pion_map_try_get(m, key, outValPtr) {
+    const p = pNum(m);
+    const slot = mapFindSlot(p, key);
+    const op = pNum(outValPtr);
+    if (slot < 0) {
+      if (op) { syncViews(); dv.setBigInt64(op, 0n, true); }
+      return 0;
+    }
+    syncViews();
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const val = dv.getBigInt64(entries + slot * 32 + 16, true);
+    if (dv.getInt32(p + 16, true) && val !== 0n) pion_rc_inc(val);
+    syncViews();
+    if (op) dv.setBigInt64(op, val, true);
+    return 1;
+  }
+
+  function pion_map_remove(m, key) {
+    const p = pNum(m);
+    const slot = mapFindSlot(p, key);
+    if (slot < 0) return;
+    syncViews();
+    const cap = Number(dv.getBigInt64(p + 8, true));
+    const valIsObj = dv.getInt32(p + 16, true);
+    const keyIsInt = dv.getInt32(p + 20, true);
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const mask = cap - 1;
+
+    const e0 = entries + slot * 32;
+    const oldKey = dv.getBigInt64(e0 + 0, true);
+    const oldVal = dv.getBigInt64(e0 + 16, true);
+    u8[e0 + 24] = 0;
+
+    // Backward-shift deletion to preserve linear probing invariant (state only 0 or 1)
+    let hole = slot;
+    let cur = (slot + 1) & mask;
+    while (u8[entries + cur * 32 + 24] === 1) {
+      const h = dv.getBigUint64(entries + cur * 32 + 8, true);
+      const nat = Number(h & BigInt(mask));
+      const distCur = (cur - nat) & mask;
+      const distHole = (hole - nat) & mask;
+      if (distHole < distCur) {
+        u8.copyWithin(entries + hole * 32, entries + cur * 32, entries + cur * 32 + 32);
+        u8[entries + cur * 32 + 24] = 0;
+        hole = cur;
+      }
+      cur = (cur + 1) & mask;
+    }
+
+    const len = Number(dv.getBigInt64(p + 0, true));
+    dv.setBigInt64(p + 0, BigInt(len - 1), true);
+    if (!keyIsInt && oldKey !== 0n) pion_rc_dec(oldKey);
+    if (valIsObj && oldVal !== 0n) pion_rc_dec(oldVal);
+  }
+
+  function pion_map_clear(m) {
+    const p = pNum(m);
+    syncViews();
+    const cap = Number(dv.getBigInt64(p + 8, true));
+    const valIsObj = dv.getInt32(p + 16, true);
+    const keyIsInt = dv.getInt32(p + 20, true);
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    if (entries) {
+      for (let i = 0; i < cap; i++) {
+        const e = entries + i * 32;
+        if (u8[e + 24] === 1) {
+          const k = dv.getBigInt64(e + 0, true);
+          const v = dv.getBigInt64(e + 16, true);
+          u8[e + 24] = 0;
+          if (!keyIsInt && k !== 0n) pion_rc_dec(k);
+          if (valIsObj && v !== 0n) pion_rc_dec(v);
+          syncViews();
+        }
+      }
+    }
+    dv.setBigInt64(p + 0, 0n, true);
+  }
+
+  function pion_map_copy(m) {
+    const p = pNum(m);
+    syncViews();
+    const cap = Number(dv.getBigInt64(p + 8, true));
+    const valIsObj = dv.getInt32(p + 16, true);
+    const keyIsInt = dv.getInt32(p + 20, true);
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const out = pion_map_new_common(valIsObj, keyIsInt);
+    for (let i = 0; i < cap; i++) {
+      syncViews();
+      const e = entries + i * 32;
+      if (u8[e + 24] === 1) {
+        const k = dv.getBigInt64(e + 0, true);
+        const v = dv.getBigInt64(e + 16, true);
+        pion_map_set(out, k, v);
+      }
+    }
+    return out;
+  }
+
+  function pion_map_keys(m) {
+    const p = pNum(m);
+    syncViews();
+    const len = Number(dv.getBigInt64(p + 0, true));
+    const cap = Number(dv.getBigInt64(p + 8, true));
+    const keyIsInt = dv.getInt32(p + 20, true);
+    const entries = Number(dv.getBigInt64(p + 24, true));
+    const arr = pion_arr_new(BigInt(len), keyIsInt ? 0 : 1);
+    for (let i = 0; i < cap; i++) {
+      syncViews();
+      const e = entries + i * 32;
+      if (u8[e + 24] === 1) {
+        const k = dv.getBigInt64(e + 0, true);
+        pion_arr_push(arr, k);
+      }
+    }
+    return arr;
+  }
+
+  // --- Single-threaded Concurrency Stubs ---
+  const channels = new Map();
+
+  function pion_scope_begin() { return pion_alloc(8, TAG_SCOPE, 0n); }
+  function pion_scope_spawn(_scope, fnIdx, env) {
+    const idx = Number(fnIdx);
+    if (idx !== 0 && exportsObj && exportsObj.__indirect_function_table) {
+      const fn = exportsObj.__indirect_function_table.get(idx);
+      if (fn) fn(BigInt(env));
+    }
+  }
+  function pion_scope_end(scope) { pion_rc_dec(scope); }
+
+  function pion_chan_new(cap, elemIsObj) {
+    const obj = pion_alloc(16, TAG_CHANNEL, 0n);
+    channels.set(pNum(obj), { cap: Number(cap), elemIsObj: elemIsObj | 0, queue: [], closed: false });
+    return obj;
+  }
+  function pion_chan_send(ch, val) {
+    const c = channels.get(pNum(ch));
+    if (!c || c.closed) return 0;
+    if (c.elemIsObj && val !== 0n) pion_rc_inc(val);
+    c.queue.push(BigInt(val));
+    return 1;
+  }
+  function pion_chan_recv(ch, outValPtr) {
+    const c = channels.get(pNum(ch));
+    const op = pNum(outValPtr);
+    if (!c || c.queue.length === 0) {
+      if (op) { syncViews(); dv.setBigInt64(op, 0n, true); }
+      return 0;
+    }
+    const v = c.queue.shift();
+    if (op) { syncViews(); dv.setBigInt64(op, v, true); }
+    return 1;
+  }
+  function pion_chan_close(ch) {
+    const c = channels.get(pNum(ch));
+    if (c) c.closed = true;
+  }
+
+  function pion_mutex_new(initVal, valIsObj) {
+    const obj = pion_alloc(16, TAG_MUTEX, 0n);
+    const p = pNum(obj);
+    if (valIsObj && initVal !== 0n) pion_rc_inc(initVal);
+    syncViews();
+    dv.setBigInt64(p + 0, BigInt(initVal), true);
+    dv.setInt32(p + 8, valIsObj | 0, true);
+    return obj;
+  }
+  function pion_mutex_lock(m) {
+    syncViews();
+    return dv.getBigInt64(pNum(m), true);
+  }
+  function pion_mutex_set(m, newVal) {
+    const p = pNum(m);
+    syncViews();
+    const valIsObj = dv.getInt32(p + 8, true);
+    const oldVal = dv.getBigInt64(p + 0, true);
+    if (valIsObj && newVal !== 0n) pion_rc_inc(newVal);
+    syncViews();
+    dv.setBigInt64(p + 0, BigInt(newVal), true);
+    if (valIsObj && oldVal !== 0n) pion_rc_dec(oldVal);
+  }
+  function pion_mutex_set_and_unlock(m, newVal) { pion_mutex_set(m, newVal); }
+  function pion_mutex_unlock(_m) {}
+
+  function pion_atomic_new(initVal) {
+    const obj = pion_alloc(8, TAG_ATOMIC, 0n);
+    syncViews();
+    dv.setBigInt64(pNum(obj), BigInt(initVal), true);
+    return obj;
+  }
+  function pion_atomic_load(a) {
+    syncViews();
+    return dv.getBigInt64(pNum(a), true);
+  }
+  function pion_atomic_store(a, val) {
+    syncViews();
+    dv.setBigInt64(pNum(a), BigInt(val), true);
+  }
+  function pion_atomic_fetch_add(a, delta) {
+    const p = pNum(a);
+    syncViews();
+    const old = dv.getBigInt64(p, true);
+    dv.setBigInt64(p, BigInt.asIntN(64, old + BigInt(delta)), true);
+    return old;
+  }
+
+  // --- World Capabilities ---
+  function pion_world_init(_argc, _argv) {
+    return pion_alloc(16, TAG_WORLD, 0n);
+  }
+  function pion_world_argc(_w) { return BigInt(cliArgs.length); }
+  function pion_world_argv(_w, idx) {
+    const i = Number(idx);
+    if (i < 0 || i >= cliArgs.length) pion_panic_oob(idx, BigInt(cliArgs.length));
+    return makePionStr(cliArgs[i]);
+  }
+  function pion_world_args(_w) {
+    const arr = pion_arr_new(BigInt(cliArgs.length), 1);
+    for (let i = 0; i < cliArgs.length; i++) {
+      pion_arr_push_owned(arr, makePionStr(cliArgs[i]));
+    }
+    return arr;
+  }
+  function pion_world_print(_w, s) { printFn(readPionStr(s)); }
+  function pion_world_println(_w, s) { printlnFn(readPionStr(s)); }
+  function pion_world_eprintln(_w, s) { eprintlnFn(readPionStr(s)); }
+  function pion_world_clock_ms(_w) {
+    return BigInt(Math.floor(typeof performance !== "undefined" ? performance.now() : Date.now()));
+  }
+  function pion_world_env_get(_w, nameStr, okOut) {
+    const name = readPionStr(nameStr);
+    const op = pNum(okOut);
+    if (isNode && Object.prototype.hasOwnProperty.call(process.env, name)) {
+      if (op) { syncViews(); dv.setInt32(op, 1, true); }
+      return makePionStr(process.env[name] || "");
+    }
+    if (op) { syncViews(); dv.setInt32(op, 0, true); }
+    return makePionStr("");
+  }
+
+  function pion_world_fs_read(_w, pathStr, okOut) {
+    const op = pNum(okOut);
+    if (!nodeFs) { if (op) { syncViews(); dv.setInt32(op, 0, true); } return makePionStr(""); }
+    try {
+      const data = nodeFs.readFileSync(readPionStr(pathStr));
+      if (op) { syncViews(); dv.setInt32(op, 1, true); }
+      return makePionStrFromBytes(data);
+    } catch {
+      if (op) { syncViews(); dv.setInt32(op, 0, true); }
+      return makePionStr("");
+    }
+  }
+  function pion_world_fs_write(_w, pathStr, contentStr) {
+    if (!nodeFs) return 0;
+    try {
+      const ps = pNum(contentStr);
+      syncViews();
+      const len = Number(dv.getBigInt64(ps, true));
+      nodeFs.writeFileSync(readPionStr(pathStr), u8.subarray(ps + 8, ps + 8 + len));
+      return 1;
+    } catch { return 0; }
+  }
+  function pion_world_fs_read_bytes(_w, pathStr, okOut) {
+    const op = pNum(okOut);
+    if (!nodeFs) { if (op) { syncViews(); dv.setInt32(op, 0, true); } return pion_bytes_new(0n); }
+    try {
+      const data = nodeFs.readFileSync(readPionStr(pathStr));
+      const b = pion_bytes_new(BigInt(data.length));
+      const pb = pNum(b);
+      syncViews();
+      const dp = Number(dv.getBigInt64(pb + 16, true));
+      u8.set(data, dp);
+      if (op) dv.setInt32(op, 1, true);
+      return b;
+    } catch {
+      if (op) { syncViews(); dv.setInt32(op, 0, true); }
+      return pion_bytes_new(0n);
+    }
+  }
+  function pion_world_fs_write_bytes(_w, pathStr, bytesObj) {
+    if (!nodeFs) return 0;
+    try {
+      const pb = pNum(bytesObj);
+      syncViews();
+      const len = Number(dv.getBigInt64(pb, true));
+      const dp = Number(dv.getBigInt64(pb + 16, true));
+      nodeFs.writeFileSync(readPionStr(pathStr), u8.subarray(dp, dp + len));
+      return 1;
+    } catch { return 0; }
+  }
+  function pion_world_fs_append(_w, pathStr, contentStr) {
+    if (!nodeFs) return 0;
+    try { nodeFs.appendFileSync(readPionStr(pathStr), readPionStr(contentStr)); return 1; } catch { return 0; }
+  }
+  function pion_world_fs_exists(_w, pathStr) {
+    return nodeFs && nodeFs.existsSync(readPionStr(pathStr)) ? 1 : 0;
+  }
+  function pion_world_fs_is_dir(_w, pathStr) {
+    if (!nodeFs) return 0;
+    try { return nodeFs.statSync(readPionStr(pathStr)).isDirectory() ? 1 : 0; } catch { return 0; }
+  }
+  function pion_world_fs_mkdir_p(_w, pathStr) {
+    if (!nodeFs) return 0;
+    try { nodeFs.mkdirSync(readPionStr(pathStr), { recursive: true }); return 1; } catch { return 0; }
+  }
+  function pion_world_fs_list_dir(_w, pathStr) {
+    const arr = pion_arr_new(0n, 1);
+    if (!nodeFs) return arr;
+    try {
+      for (const name of nodeFs.readdirSync(readPionStr(pathStr))) {
+        pion_arr_push_owned(arr, makePionStr(name));
+      }
+    } catch {}
+    return arr;
+  }
+  function pion_world_fs_remove(_w, pathStr) {
+    if (!nodeFs) return 0;
+    try { nodeFs.rmSync(readPionStr(pathStr), { recursive: true, force: true }); return 1; } catch { return 0; }
+  }
+  function pion_world_fs_rename(_w, oldP, newP) {
+    if (!nodeFs) return 0;
+    try { nodeFs.renameSync(readPionStr(oldP), readPionStr(newP)); return 1; } catch { return 0; }
+  }
+  function pion_world_fs_size(_w, pathStr) {
+    if (!nodeFs) return -1n;
+    try { return BigInt(nodeFs.statSync(readPionStr(pathStr)).size); } catch { return -1n; }
+  }
+  function pion_world_fs_mtime_ms(_w, pathStr) {
+    if (!nodeFs) return -1n;
+    try { return BigInt(Math.floor(nodeFs.statSync(readPionStr(pathStr)).mtimeMs)); } catch { return -1n; }
+  }
+  function pion_world_read_line(_w, okOut) {
+    const op = pNum(okOut);
+    if (op) { syncViews(); dv.setInt32(op, 0, true); }
+    return makePionStr("");
+  }
+  function pion_sha256_hex(s) {
+    if (nodeCrypto) {
+      const ps = pNum(s);
+      syncViews();
+      const len = Number(dv.getBigInt64(ps, true));
+      const hex = nodeCrypto.createHash("sha256").update(u8.subarray(ps + 8, ps + 8 + len)).digest("hex");
+      return makePionStr(hex);
+    }
+    return makePionStr("");
+  }
+  function pion_world_exec(_w, _argv) { return -1; }
+  function pion_world_exec_capture(_w, _argv, ecOut) {
+    const ep = pNum(ecOut);
+    if (ep) { syncViews(); dv.setInt32(ep, -1, true); }
+    return makePionStr("");
+  }
+  function pion_world_exec_capture_bytes(_w, _argv, ecOut) {
+    const ep = pNum(ecOut);
+    if (ep) { syncViews(); dv.setInt32(ep, -1, true); }
+    return pion_bytes_new(0n);
+  }
+  function pion_world_fs_lstat(_w, _p, okOut) {
+    const op = pNum(okOut);
+    if (op) { syncViews(); dv.setInt32(op, 0, true); }
+    return makePionStr("");
+  }
+  function pion_world_fs_readlink(_w, _p, okOut) {
+    const op = pNum(okOut);
+    if (op) { syncViews(); dv.setInt32(op, 0, true); }
+    return makePionStr("");
+  }
+  function pion_world_fs_symlink(_w, _t, _l) { return 0; }
+  function pion_world_fs_chmod(_w, _p, _m) { return 0; }
+  function pion_world_fs_read_range_nofollow(_w, _p, _o, _l, _e, okOut) {
+    const op = pNum(okOut);
+    if (op) { syncViews(); dv.setInt32(op, 0, true); }
+    return pion_bytes_new(0n);
+  }
+
+  // --- Raw Pointer FFI ---
+  function pion_ptr_alloc(bytes) { return pBig(rawAllocZero(Number(bytes))); }
+  function pion_ptr_free(p) { rawFree(pNum(p)); }
+  function pion_ptr_offset(p, off) { return BigInt.asIntN(64, BigInt(p) + BigInt(off)); }
+  function pion_ptr_read_ptr(p, off) { syncViews(); return dv.getBigInt64(pNum(p) + Number(off), true); }
+  function pion_ptr_write_ptr(p, off, v) { syncViews(); dv.setBigInt64(pNum(p) + Number(off), BigInt(v), true); }
+  function pion_ptr_read_u8(p, off) { syncViews(); return u8[pNum(p) + Number(off)]; }
+  function pion_ptr_write_u8(p, off, v) { syncViews(); u8[pNum(p) + Number(off)] = v & 0xff; }
+  function pion_ptr_read_i32(p, off) { syncViews(); return dv.getInt32(pNum(p) + Number(off), true); }
+  function pion_ptr_write_i32(p, off, v) { syncViews(); dv.setInt32(pNum(p) + Number(off), v | 0, true); }
+  function pion_ptr_read_i64(p, off) { syncViews(); return dv.getBigInt64(pNum(p) + Number(off), true); }
+  function pion_ptr_write_i64(p, off, v) { syncViews(); dv.setBigInt64(pNum(p) + Number(off), BigInt(v), true); }
+  function pion_cstr_to_str(cstr) { return makePionStr(readCStr(cstr)); }
+
+  const imports = {
+    pion_rt: {
+      pion_cur_tid, pion_alloc, pion_alloc_uninit,
+      pion_rc_inc, pion_rc_dec, pion_rc_freeze, pion_rc_immortalize,
+      pion_panic, pion_panic_oob, pion_debug_assert,
+
+      // Math & C libm functions emitted directly by qbe.pion
+      pion_math_sqrt, pion_math_abs, pion_math_floor, pion_math_ceil,
+      pion_math_sin, pion_math_cos, pion_math_pow,
+      sqrt: Math.sqrt, fabs: Math.abs, floor: Math.floor, ceil: Math.ceil,
+      round: (x) => (x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
+      trunc: Math.trunc, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+      atan2: Math.atan2, log: Math.log, exp: Math.exp, fmod: (a, b) => a % b,
+      roundf: (x) => Math.fround(x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
+      truncf: (x) => Math.fround(Math.trunc(x)),
+      floorf: (x) => Math.fround(Math.floor(x)),
+      ceilf: (x) => Math.fround(Math.ceil(x)),
+      fabsf: (x) => Math.fround(Math.abs(x)),
+      sqrtf: (x) => Math.fround(Math.sqrt(x)),
+
+      // String
+      pion_str_from_cstr, pion_str_len, pion_str_byte_at,
+      pion_str_concat, pion_str_concat_n, pion_str_eq, pion_str_cmp,
+      pion_str_slice, pion_int_to_str, pion_uint64_to_str,
+      pion_double_to_str, pion_float_to_str,
+      pion_str_to_int, pion_str_to_double,
+      pion_str_starts_with, pion_str_ends_with, pion_str_contains,
+      pion_str_index_of, pion_str_trim, pion_str_split, pion_str_replace,
+      pion_str_to_bytes, pion_bytes_to_str,
+
+      // Bytes
+      pion_bytes_new, pion_bytes_len, pion_bytes_get, pion_bytes_set,
+      pion_bytes_slice, pion_bytes_concat, pion_bytes_from_ptr, pion_bytes_copy_to_ptr,
+
+      // StringBuilder
+      pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_byte,
+      pion_strbuf_push_char, pion_strbuf_push_int, pion_strbuf_reset, pion_strbuf_to_str,
+
+      // Array
+      pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned,
+      pion_arr_get, pion_arr_set, pion_arr_pop, pion_arr_copy,
+      pion_arr_clear, pion_arr_reverse, pion_arr_join,
+      pion_arr_sort_int, pion_arr_sort_str,
+
+      // Map
+      pion_map_new, pion_map_new_int, pion_map_len, pion_map_set,
+      pion_map_has, pion_map_get, pion_map_try_get, pion_map_remove,
+      pion_map_clear, pion_map_copy, pion_map_keys,
+
+      // Concurrency
+      pion_scope_begin, pion_scope_spawn, pion_scope_end,
+      pion_chan_new, pion_chan_send, pion_chan_recv, pion_chan_close,
+      pion_mutex_new, pion_mutex_lock, pion_mutex_set, pion_mutex_set_and_unlock, pion_mutex_unlock,
+      pion_atomic_new, pion_atomic_load, pion_atomic_store, pion_atomic_fetch_add,
+
+      // World
+      pion_world_init, pion_world_argc, pion_world_argv, pion_world_args,
+      pion_world_print, pion_world_println, pion_world_eprintln,
+      pion_world_read_line, pion_world_clock_ms, pion_world_env_get,
+      pion_world_fs_read, pion_world_fs_write, pion_world_fs_read_bytes,
+      pion_world_fs_write_bytes, pion_world_fs_append, pion_world_fs_mtime_ms,
+      pion_world_fs_exists, pion_world_fs_is_dir, pion_world_fs_mkdir_p,
+      pion_world_fs_list_dir, pion_world_fs_remove, pion_world_fs_rename,
+      pion_world_fs_size, pion_world_fs_lstat, pion_world_fs_readlink,
+      pion_world_fs_symlink, pion_world_fs_chmod, pion_world_fs_read_range_nofollow,
+      pion_world_exec, pion_world_exec_capture, pion_world_exec_capture_bytes,
+      pion_sha256_hex,
+
+      // Raw pointers
+      pion_ptr_alloc, pion_ptr_free, pion_ptr_offset,
+      pion_ptr_read_ptr, pion_ptr_write_ptr,
+      pion_ptr_read_u8, pion_ptr_write_u8,
+      pion_ptr_read_i32, pion_ptr_write_i32,
+      pion_ptr_read_i64, pion_ptr_write_i64,
+      pion_cstr_to_str,
+    },
+  };
+
+  if (exportsObj) bindExports(exportsObj);
+
+  return {
+    imports,
+    bindExports,
+    getStdout: () => stdoutChunks.join(""),
+    getStderr: () => stderrChunks.join(""),
+  };
+}
+
+export async function runWasmBytes(wasmBytes, args = [], options = {}) {
+  const rt = createPionRuntime({ ...options, args });
+  const { instance } = await WebAssembly.instantiate(wasmBytes, rt.imports);
+  rt.bindExports(instance.exports);
+  const mainFn = instance.exports.main || instance.exports._start || instance.exports.pion_main;
+  if (typeof mainFn !== "function") {
+    throw new Error("Wasm module does not export main()");
+  }
+  const rc = mainFn(args.length | 0, 0n);
+  return { exitCode: typeof rc === "number" ? rc : 0, runtime: rt, instance };
+}
+
+export async function runWasmFile(wasmPath, args = [], options = {}) {
+  const fs = await import("node:fs");
+  const crypto = await import("node:crypto");
+  const wasmBytes = fs.readFileSync(wasmPath);
+  return runWasmBytes(wasmBytes, args, { fs, crypto, ...options });
+}
+
+// CLI Runner: `node runtime/pion_wasm_rt.mjs <app.wasm> [args...]`
+if (typeof process !== "undefined" && process.versions && process.versions.node && process.argv[1]) {
+  const { fileURLToPath } = await import("node:url");
+  const { resolve } = await import("node:path");
+  const selfPath = resolve(fileURLToPath(import.meta.url));
+  const invokedPath = resolve(process.argv[1]);
+  if (selfPath === invokedPath) {
+    const wasmPath = process.argv[2];
+    if (!wasmPath) {
+      process.stderr.write("usage: node pion_wasm_rt.mjs <module.wasm> [args...]\n");
+      process.exit(2);
+    }
+    const progArgs = process.argv.slice(2);
+    try {
+      const { exitCode } = await runWasmFile(wasmPath, progArgs);
+      process.exit(exitCode | 0);
+    } catch (err) {
+      process.stderr.write((err && err.stack ? err.stack : String(err)) + "\n");
+      process.exit(1);
+    }
+  }
+}

@@ -1,0 +1,2559 @@
+///| Zero-toolchain QBE SSA -> WebAssembly 32-bit (wasm32) binary backend.
+///| Stage-0 bootstrap safe (uses only core Int/Int64/Double/Bytes/Array/Map/StringBuilder).
+
+///|
+let WASM_TY_VOID : Int = 0
+let WASM_TY_I32 : Int = 1
+let WASM_TY_I64 : Int = 2
+let WASM_TY_F32 : Int = 3
+let WASM_TY_F64 : Int = 4
+
+let WASM_STACK_BASE : Int = 2162688 // 0x210000 (64KB guard + 2MB shadow stack)
+let WASM_DATA_BASE : Int = 2162688  // 0x210000
+
+///|
+fn wasm_valtype_byte(ty : Int) -> Int {
+  if ty == WASM_TY_I32 {
+    0x7F
+  } else if ty == WASM_TY_I64 {
+    0x7E
+  } else if ty == WASM_TY_F32 {
+    0x7D
+  } else {
+    0x7C
+  }
+}
+
+///|
+fn wasm_parse_qbe_ty(s : String) -> Int {
+  if s == "w" || s == "ub" || s == "sb" || s == "uh" || s == "sh" {
+    WASM_TY_I32
+  } else if s == "l" {
+    WASM_TY_I64
+  } else if s == "s" {
+    WASM_TY_F32
+  } else if s == "d" {
+    WASM_TY_F64
+  } else {
+    WASM_TY_VOID
+  }
+}
+
+///|
+fn wasm_ushr64(x : Int64, n : Int) -> Int64 {
+  if n <= 0 {
+    x
+  } else {
+    ((x >> 1) & 0x7FFFFFFFFFFFFFFFL) >> (n - 1)
+  }
+}
+
+///|
+/// Convert IEEE-754 f64 bits (Int64) to f32 bits (Int), round-to-nearest-even.
+fn wasm_f64_bits_to_f32_bits(bits : Int64) -> Int {
+  let sign = (wasm_ushr64(bits, 63) & 1L).to_int() << 31
+  let exp64 = (wasm_ushr64(bits, 52) & 0x7FFL).to_int()
+  let frac64 = bits & 0xFFFFFFFFFFFFFL
+  if exp64 == 0x7FF {
+    if frac64 == 0L {
+      return sign | 0x7F800000
+    }
+    let payload = wasm_ushr64(frac64, 29).to_int() & 0x7FFFFF
+    return sign | 0x7FC00000 | payload
+  }
+  let exp32 = exp64 - 1023 + 127
+  if exp32 >= 255 {
+    return sign | 0x7F800000
+  }
+  if exp32 <= 0 {
+    if exp32 < -24 {
+      return sign
+    }
+    let mant = frac64 | 0x10000000000000L
+    let shift = 29 + (1 - exp32)
+    let q = wasm_ushr64(mant, shift).to_int()
+    let rem_mask = (1L << shift) - 1L
+    let rem = mant & rem_mask
+    let half = 1L << (shift - 1)
+    let rounded = if rem > half || (rem == half && (q & 1) != 0) {
+      q + 1
+    } else {
+      q
+    }
+    return sign | rounded
+  }
+  let q = wasm_ushr64(frac64, 29).to_int()
+  let rem = frac64 & 0x1FFFFFFFL
+  let half = 0x10000000L
+  let mut mant32 = if rem > half || (rem == half && (q & 1) != 0) {
+    q + 1
+  } else {
+    q
+  }
+  let mut e32 = exp32
+  if mant32 >= 0x800000 {
+    mant32 = 0
+    e32 = e32 + 1
+    if e32 >= 255 {
+      return sign | 0x7F800000
+    }
+  }
+  sign | (e32 << 23) | (mant32 & 0x7FFFFF)
+}
+
+///|
+fn wasm_push_u32(buf : Array[Int], v0 : Int) -> Unit {
+  let mut v = v0
+  while true {
+    let mut b = v & 0x7F
+    v = ushr32(v, 7)
+    if v != 0 {
+      b = b | 0x80
+    }
+    buf.push(b)
+    if v == 0 {
+      break
+    }
+  }
+}
+
+///|
+fn wasm_push_s32(buf : Array[Int], v0 : Int) -> Unit {
+  let mut v = v0
+  while true {
+    let b = v & 0x7F
+    v = v >> 7
+    let done = (v == 0 && (b & 0x40) == 0) || (v == -1 && (b & 0x40) != 0)
+    if done {
+      buf.push(b)
+      break
+    } else {
+      buf.push(b | 0x80)
+    }
+  }
+}
+
+///|
+fn wasm_push_s64(buf : Array[Int], v0 : Int64) -> Unit {
+  let mut v = v0
+  while true {
+    let b = (v & 0x7FL).to_int()
+    v = v >> 7
+    let done = (v == 0L && (b & 0x40) == 0) || (v == -1L && (b & 0x40) != 0)
+    if done {
+      buf.push(b)
+      break
+    } else {
+      buf.push(b | 0x80)
+    }
+  }
+}
+
+///|
+fn wasm_push_i32_le(buf : Array[Int], v0 : Int) -> Unit {
+  buf.push(v0 & 0xFF)
+  buf.push(ushr32(v0, 8) & 0xFF)
+  buf.push(ushr32(v0, 16) & 0xFF)
+  buf.push(ushr32(v0, 24) & 0xFF)
+}
+
+///|
+fn wasm_push_i64_le(buf : Array[Int], v0 : Int64) -> Unit {
+  let mut i = 0
+  while i < 8 {
+    buf.push((wasm_ushr64(v0, i * 8) & 0xFFL).to_int())
+    i = i + 1
+  }
+}
+
+///|
+fn wasm_push_str(buf : Array[Int], s : String) -> Unit {
+  let bs = str_to_utf8_ints(s)
+  wasm_push_u32(buf, bs.length())
+  let mut i = 0
+  while i < bs.length() {
+    buf.push(bs[i])
+    i = i + 1
+  }
+}
+
+///|
+fn wasm_push_bytes(dst : Array[Int], src : Array[Int]) -> Unit {
+  let mut i = 0
+  while i < src.length() {
+    dst.push(src[i])
+    i = i + 1
+  }
+}
+
+///|
+fn wasm_push_section(out : Array[Int], id : Int, body : Array[Int]) -> Unit {
+  out.push(id)
+  wasm_push_u32(out, body.length())
+  wasm_push_bytes(out, body)
+}
+
+///|
+fn wasm_trim(s : String) -> String {
+  let n = s.length()
+  let mut a = 0
+  while a < n {
+    let c = str_code_at(s, a)
+    if c == 32 || c == 9 || c == 13 || c == 10 {
+      a = a + 1
+    } else {
+      break
+    }
+  }
+  let mut b = n
+  while b > a {
+    let c = str_code_at(s, b - 1)
+    if c == 32 || c == 9 || c == 13 || c == 10 {
+      b = b - 1
+    } else {
+      break
+    }
+  }
+  slice_str(s, a, b)
+}
+
+///|
+fn wasm_strip_comment(line : String) -> String {
+  let n = line.length()
+  let mut in_str = false
+  let mut esc = false
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(line, i)
+    if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 35 {
+      return slice_str(line, 0, i)
+    }
+    i = i + 1
+  }
+  line
+}
+
+///|
+fn wasm_split_lines(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if str_code_at(s, i) == 10 {
+      out.push(slice_str(s, start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start < n {
+    out.push(slice_str(s, start, n))
+  }
+  out
+}
+
+///|
+fn wasm_find_char(s : String, ch : Int, from : Int) -> Int {
+  let n = s.length()
+  let mut i = from
+  while i < n {
+    if str_code_at(s, i) == ch {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn wasm_find_char_outside_str(s : String, ch : Int, from : Int) -> Int {
+  let n = s.length()
+  let mut in_str = false
+  let mut esc = false
+  let mut i = from
+  while i < n {
+    let c = str_code_at(s, i)
+    if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == ch {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+fn wasm_split_commas(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut in_str = false
+  let mut esc = false
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 44 {
+      let part = wasm_trim(slice_str(s, start, i))
+      if part.length() > 0 {
+        out.push(part)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  let tail = wasm_trim(slice_str(s, start, n))
+  if tail.length() > 0 {
+    out.push(tail)
+  }
+  out
+}
+
+///|
+fn wasm_split_ws(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    while i < n {
+      let c = str_code_at(s, i)
+      if c == 32 || c == 9 || c == 13 || c == 10 {
+        i = i + 1
+      } else {
+        break
+      }
+    }
+    let start = i
+    while i < n {
+      let c = str_code_at(s, i)
+      if c == 32 || c == 9 || c == 13 || c == 10 {
+        break
+      }
+      i = i + 1
+    }
+    if i > start {
+      out.push(slice_str(s, start, i))
+    }
+  }
+  out
+}
+
+///|
+fn wasm_parse_int64(raw : String) -> Int64 {
+  let s = wasm_trim(raw)
+  let n = s.length()
+  if n == 0 {
+    return 0L
+  }
+  let mut neg = false
+  let mut i = 0
+  let first = str_code_at(s, 0)
+  if first == 45 {
+    neg = true
+    i = 1
+  } else if first == 43 {
+    i = 1
+  }
+  let mut acc : Int64 = 0L
+  if i + 2 <= n && str_code_at(s, i) == 48 &&
+    (str_code_at(s, i + 1) == 120 || str_code_at(s, i + 1) == 88) {
+    i = i + 2
+    while i < n {
+      let c = str_code_at(s, i)
+      let d = if c >= 48 && c <= 57 {
+        c - 48
+      } else if c >= 97 && c <= 102 {
+        c - 97 + 10
+      } else if c >= 65 && c <= 70 {
+        c - 65 + 10
+      } else {
+        break
+      }
+      acc = (acc << 4) | d.to_int64()
+      i = i + 1
+    }
+  } else {
+    while i < n {
+      let c = str_code_at(s, i)
+      if c >= 48 && c <= 57 {
+        acc = acc * 10L + (c - 48).to_int64()
+      } else {
+        break
+      }
+      i = i + 1
+    }
+  }
+  if neg { 0L - acc } else { acc }
+}
+
+///|
+fn wasm_hex_digit(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 97 + 10
+  } else if c >= 65 && c <= 70 {
+    c - 65 + 10
+  } else {
+    -1
+  }
+}
+
+///|
+/// Unescape a QBE data string literal `"..."` into raw bytes.
+fn wasm_unescape_qbe_str(lit : String) -> Array[Int] {
+  let out : Array[Int] = []
+  let n = lit.length()
+  let mut i = 0
+  if i < n && str_code_at(lit, i) == 34 {
+    i = i + 1
+  }
+  let end = if n > 0 && str_code_at(lit, n - 1) == 34 { n - 1 } else { n }
+  while i < end {
+    let c = str_code_at(lit, i)
+    if c == 92 && i + 1 < end {
+      let nx = str_code_at(lit, i + 1)
+      if nx == 110 {
+        out.push(10)
+        i = i + 2
+      } else if nx == 114 {
+        out.push(13)
+        i = i + 2
+      } else if nx == 116 {
+        out.push(9)
+        i = i + 2
+      } else if nx == 34 {
+        out.push(34)
+        i = i + 2
+      } else if nx == 92 {
+        out.push(92)
+        i = i + 2
+      } else if nx == 120 && i + 3 < end {
+        let h1 = wasm_hex_digit(str_code_at(lit, i + 2))
+        let h2 = wasm_hex_digit(str_code_at(lit, i + 3))
+        if h1 >= 0 && h2 >= 0 {
+          out.push((h1 << 4) | h2)
+          i = i + 4
+        } else {
+          out.push(nx)
+          i = i + 2
+        }
+      } else if nx >= 48 && nx <= 55 {
+        // Octal escape \0 .. \377
+        let mut oct_v = nx - 48
+        let mut adv = 2
+        if i + 2 < end {
+          let o2 = str_code_at(lit, i + 2)
+          if o2 >= 48 && o2 <= 55 {
+            oct_v = oct_v * 8 + (o2 - 48)
+            adv = 3
+            if i + 3 < end {
+              let o3 = str_code_at(lit, i + 3)
+              if o3 >= 48 && o3 <= 55 {
+                oct_v = oct_v * 8 + (o3 - 48)
+                adv = 4
+              }
+            }
+          }
+        }
+        out.push(oct_v & 0xFF)
+        i = i + adv
+      } else {
+        out.push(nx)
+        i = i + 2
+      }
+    } else {
+      out.push(c & 0xFF)
+      i = i + 1
+    }
+  }
+  out
+}
+
+///|
+fn wasm_parse_double_bits(num_str : String) -> Int64 {
+  match num_str.to_double() {
+    Some(d) => d.to_bits()
+    None => 0L
+  }
+}
+
+///|
+struct WasmDataItem {
+  kind : String // "b", "h", "w", "l", "s", "d", "z"
+  raw : String  // raw value expression
+}
+
+///|
+struct WasmDataDef {
+  name : String
+  align : Int
+  items : Array[WasmDataItem]
+  mut addr : Int
+}
+
+///|
+struct WasmInst {
+  dst : String
+  dst_ty : Int
+  op : String
+  args : Array[String]
+  arg_tys : Array[Int] // for call arguments
+}
+
+///|
+struct WasmBlock {
+  label : String
+  insts : Array[WasmInst]
+}
+
+///|
+struct WasmFunc {
+  name : String
+  exported : Bool
+  ret_ty : Int
+  param_names : Array[String]
+  param_tys : Array[Int]
+  blocks : Array[WasmBlock]
+}
+
+///|
+struct WasmSig {
+  param_tys : Array[Int]
+  ret_ty : Int
+}
+
+///|
+fn wasm_sig_key(param_tys : Array[Int], ret_ty : Int) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < param_tys.length() {
+    sb.write_string(param_tys[i].to_string())
+    sb.write_char(',')
+    i = i + 1
+  }
+  sb.write_string("->")
+  sb.write_string(ret_ty.to_string())
+  sb.to_string()
+}
+
+///|
+fn wasm_parse_data_def(text : String) -> Option[WasmDataDef] {
+  let eq_idx = wasm_find_char(text, 61, 0)
+  if eq_idx < 0 {
+    return None
+  }
+  let lhs = wasm_trim(slice_str(text, 0, eq_idx))
+  let dollar_idx = wasm_find_char(lhs, 36, 0)
+  if dollar_idx < 0 {
+    return None
+  }
+  let name = wasm_trim(slice_str(lhs, dollar_idx + 1, lhs.length()))
+  let lb = wasm_find_char_outside_str(text, 123, eq_idx + 1)
+  let rb = wasm_find_char_outside_str(text, 125, if lb >= 0 { lb + 1 } else { eq_idx + 1 })
+  if lb < 0 || rb < 0 {
+    return None
+  }
+  let mid = wasm_trim(slice_str(text, eq_idx + 1, lb))
+  let mut align = 8
+  if mid.starts_with("align ") {
+    align = wasm_parse_int64(slice_str(mid, 6, mid.length())).to_int()
+    if align < 1 {
+      align = 1
+    }
+  }
+  let inner = slice_str(text, lb + 1, rb)
+  let parts = wasm_split_commas(inner)
+  let items : Array[WasmDataItem] = []
+  let mut i = 0
+  while i < parts.length() {
+    let p = wasm_trim(parts[i])
+    if p.length() > 0 {
+      let sp = wasm_find_char(p, 32, 0)
+      if sp > 0 {
+        let kind = slice_str(p, 0, sp)
+        let raw = wasm_trim(slice_str(p, sp + 1, p.length()))
+        items.push(WasmDataItem::{ kind: kind, raw: raw })
+      }
+    }
+    i = i + 1
+  }
+  Some(WasmDataDef::{ name: name, align: align, items: items, addr: 0 })
+}
+
+///|
+fn wasm_parse_call_args(arg_str : String, args_out : Array[String], tys_out : Array[Int]) -> Unit {
+  let parts = wasm_split_commas(arg_str)
+  let mut i = 0
+  while i < parts.length() {
+    let p = wasm_trim(parts[i])
+    if p == "..." || p.length() == 0 {
+      i = i + 1
+      continue
+    }
+    let toks = wasm_split_ws(p)
+    if toks.length() >= 2 {
+      if toks[0] == "env" {
+        tys_out.push(WASM_TY_I64)
+        args_out.push(toks[1])
+      } else {
+        let ty = wasm_parse_qbe_ty(toks[0])
+        tys_out.push(if ty == WASM_TY_VOID { WASM_TY_I64 } else { ty })
+        args_out.push(toks[1])
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn wasm_parse_inst(line : String) -> Option[WasmInst] {
+  let s = wasm_trim(line)
+  if s.length() == 0 {
+    return None
+  }
+  // Assignment: %dst =<ty> <op> ...
+  if str_code_at(s, 0) == 37 {
+    let eq_idx = wasm_find_char(s, 61, 0)
+    if eq_idx < 0 {
+      return None
+    }
+    let dst = wasm_trim(slice_str(s, 0, eq_idx))
+    let rest0 = wasm_trim(slice_str(s, eq_idx + 1, s.length()))
+    let sp1 = wasm_find_char(rest0, 32, 0)
+    if sp1 < 0 {
+      return None
+    }
+    let dst_ty = wasm_parse_qbe_ty(slice_str(rest0, 0, sp1))
+    let rest1 = wasm_trim(slice_str(rest0, sp1 + 1, rest0.length()))
+    if rest1.starts_with("call ") {
+      let after_call = wasm_trim(slice_str(rest1, 5, rest1.length()))
+      let lp = wasm_find_char(after_call, 40, 0)
+      let rp = wasm_find_char(after_call, 41, if lp >= 0 { lp + 1 } else { 0 })
+      if lp < 0 || rp < 0 {
+        return None
+      }
+      let callee = wasm_trim(slice_str(after_call, 0, lp))
+      let arg_str = slice_str(after_call, lp + 1, rp)
+      let args : Array[String] = [callee]
+      let arg_tys : Array[Int] = []
+      wasm_parse_call_args(arg_str, args, arg_tys)
+      return Some(WasmInst::{ dst: dst, dst_ty: dst_ty, op: "call", args: args, arg_tys: arg_tys })
+    }
+    let sp2 = wasm_find_char(rest1, 32, 0)
+    let op = if sp2 < 0 { rest1 } else { slice_str(rest1, 0, sp2) }
+    let arg_raw = if sp2 < 0 { "" } else { wasm_trim(slice_str(rest1, sp2 + 1, rest1.length())) }
+    if op == "phi" {
+      let pairs = wasm_split_commas(arg_raw)
+      let args : Array[String] = []
+      let mut pi = 0
+      while pi < pairs.length() {
+        let ptoks = wasm_split_ws(pairs[pi])
+        if ptoks.length() >= 2 {
+          args.push(ptoks[0])
+          args.push(ptoks[1])
+        }
+        pi = pi + 1
+      }
+      return Some(WasmInst::{ dst: dst, dst_ty: dst_ty, op: "phi", args: args, arg_tys: [] })
+    }
+    let args = wasm_split_commas(arg_raw)
+    return Some(WasmInst::{ dst: dst, dst_ty: dst_ty, op: op, args: args, arg_tys: [] })
+  }
+
+  // Void call
+  if s.starts_with("call ") {
+    let after_call = wasm_trim(slice_str(s, 5, s.length()))
+    let lp = wasm_find_char(after_call, 40, 0)
+    let rp = wasm_find_char(after_call, 41, if lp >= 0 { lp + 1 } else { 0 })
+    if lp < 0 || rp < 0 {
+      return None
+    }
+    let callee = wasm_trim(slice_str(after_call, 0, lp))
+    let arg_str = slice_str(after_call, lp + 1, rp)
+    let args : Array[String] = [callee]
+    let arg_tys : Array[Int] = []
+    wasm_parse_call_args(arg_str, args, arg_tys)
+    return Some(WasmInst::{ dst: "", dst_ty: WASM_TY_VOID, op: "call", args: args, arg_tys: arg_tys })
+  }
+
+  // Other non-assigning instruction: store*, jmp, jnz, jtbl, ret, hlt, blit
+  let sp = wasm_find_char(s, 32, 0)
+  let op = if sp < 0 { s } else { slice_str(s, 0, sp) }
+  let arg_raw = if sp < 0 { "" } else { wasm_trim(slice_str(s, sp + 1, s.length())) }
+  let args = wasm_split_commas(arg_raw)
+  Some(WasmInst::{ dst: "", dst_ty: WASM_TY_VOID, op: op, args: args, arg_tys: [] })
+}
+
+///|
+struct WasmModuleParsed {
+  datas : Array[WasmDataDef]
+  funcs : Array[WasmFunc]
+}
+
+///|
+fn wasm_parse_ssa(ssa : String) -> WasmModuleParsed {
+  let lines = wasm_split_lines(ssa)
+  let datas : Array[WasmDataDef] = []
+  let funcs : Array[WasmFunc] = []
+  let seen_datas : Map[String, Bool] = Map([])
+  let seen_funcs : Map[String, Bool] = Map([])
+  let n = lines.length()
+  let mut i = 0
+  while i < n {
+    let raw_line = wasm_trim(wasm_strip_comment(lines[i]))
+    if raw_line.length() == 0 {
+      i = i + 1
+      continue
+    }
+    if raw_line.starts_with("data ") || raw_line.starts_with("export data ") {
+      let sb = StringBuilder()
+      sb.write_string(raw_line)
+      while wasm_find_char_outside_str(sb.to_string(), 125, 0) < 0 && i + 1 < n {
+        i = i + 1
+        sb.write_char(' ')
+        sb.write_string(wasm_trim(wasm_strip_comment(lines[i])))
+      }
+      match wasm_parse_data_def(sb.to_string()) {
+        Some(dd) =>
+          match seen_datas.get(dd.name) {
+            Some(_) => ()
+            None => {
+              seen_datas.set(dd.name, true)
+              datas.push(dd)
+            }
+          }
+        None => ()
+      }
+      i = i + 1
+      continue
+    }
+    if raw_line.starts_with("function ") || raw_line.starts_with("export function ") {
+      let exported = raw_line.starts_with("export ")
+      let after_kw = if exported {
+        wasm_trim(slice_str(raw_line, 16, raw_line.length()))
+      } else {
+        wasm_trim(slice_str(raw_line, 9, raw_line.length()))
+      }
+      let dollar = wasm_find_char(after_kw, 36, 0)
+      let lp = wasm_find_char(after_kw, 40, if dollar >= 0 { dollar + 1 } else { 0 })
+      let rp = wasm_find_char(after_kw, 41, if lp >= 0 { lp + 1 } else { 0 })
+      if dollar < 0 || lp < 0 || rp < 0 {
+        i = i + 1
+        continue
+      }
+      let ret_ty_str = wasm_trim(slice_str(after_kw, 0, dollar))
+      let ret_ty = wasm_parse_qbe_ty(ret_ty_str)
+      let fn_name = wasm_trim(slice_str(after_kw, dollar + 1, lp))
+      let param_str = slice_str(after_kw, lp + 1, rp)
+      let param_names : Array[String] = []
+      let param_tys : Array[Int] = []
+      let pparts = wasm_split_commas(param_str)
+      let mut pi = 0
+      while pi < pparts.length() {
+        let pp = wasm_trim(pparts[pi])
+        if pp == "..." || pp.length() == 0 {
+          pi = pi + 1
+          continue
+        }
+        let ptoks = wasm_split_ws(pp)
+        if ptoks.length() >= 2 {
+          if ptoks[0] == "env" {
+            param_tys.push(WASM_TY_I64)
+            param_names.push(ptoks[1])
+          } else {
+            let pty = wasm_parse_qbe_ty(ptoks[0])
+            param_tys.push(if pty == WASM_TY_VOID { WASM_TY_I64 } else { pty })
+            param_names.push(ptoks[1])
+          }
+        }
+        pi = pi + 1
+      }
+      let blocks : Array[WasmBlock] = []
+      let mut cur_blk : Option[WasmBlock] = None
+      i = i + 1
+      while i < n {
+        let bl = wasm_trim(wasm_strip_comment(lines[i]))
+        if bl == "}" {
+          i = i + 1
+          break
+        }
+        if bl.length() == 0 {
+          i = i + 1
+          continue
+        }
+        if str_code_at(bl, 0) == 64 {
+          let nb = WasmBlock::{ label: bl, insts: [] }
+          blocks.push(nb)
+          cur_blk = Some(nb)
+        } else {
+          match cur_blk {
+            None => {
+              let nb = WasmBlock::{ label: "@start", insts: [] }
+              blocks.push(nb)
+              cur_blk = Some(nb)
+              match wasm_parse_inst(bl) {
+                Some(inst) => nb.insts.push(inst)
+                None => ()
+              }
+            }
+            Some(cb) =>
+              match wasm_parse_inst(bl) {
+                Some(inst) => cb.insts.push(inst)
+                None => ()
+              }
+          }
+        }
+        i = i + 1
+      }
+      match seen_funcs.get(fn_name) {
+        Some(_) => ()
+        None => {
+          seen_funcs.set(fn_name, true)
+          funcs.push(WasmFunc::{
+            name: fn_name,
+            exported: exported,
+            ret_ty: ret_ty,
+            param_names: param_names,
+            param_tys: param_tys,
+            blocks: blocks,
+          })
+        }
+      }
+      continue
+    }
+    i = i + 1
+  }
+  WasmModuleParsed::{ datas: datas, funcs: funcs }
+}
+
+///|
+fn wasm_data_item_size(item : WasmDataItem) -> Int {
+  if item.kind == "b" {
+    if item.raw.length() > 0 && str_code_at(item.raw, 0) == 34 {
+      wasm_unescape_qbe_str(item.raw).length()
+    } else {
+      1
+    }
+  } else if item.kind == "h" {
+    2
+  } else if item.kind == "w" || item.kind == "s" {
+    4
+  } else if item.kind == "l" || item.kind == "d" {
+    8
+  } else if item.kind == "z" {
+    wasm_parse_int64(item.raw).to_int()
+  } else {
+    0
+  }
+}
+
+///|
+fn wasm_align_up(n0 : Int, align : Int) -> Int {
+  if align <= 1 {
+    return n0
+  }
+  let rem = n0 % align
+  if rem == 0 { n0 } else { n0 + (align - rem) }
+}
+
+///|
+struct WasmModCtx {
+  sigs : Array[WasmSig]
+  sig_map : Map[String, Int]
+  import_names : Array[String]
+  import_sigs : Array[Int]
+  import_ret_tys : Array[Int]
+  import_map : Map[String, Int]
+  internal_map : Map[String, Int]
+  internal_ret_tys : Map[String, Int]
+  data_addrs : Map[String, Int]
+  fn_table_idx : Map[String, Int]
+  fn_table_list : Array[String]
+}
+
+///|
+fn wasm_intern_sig(ctx : WasmModCtx, param_tys : Array[Int], ret_ty : Int) -> Int {
+  let key = wasm_sig_key(param_tys, ret_ty)
+  match ctx.sig_map.get(key) {
+    Some(idx) => idx
+    None => {
+      let idx = ctx.sigs.length()
+      ctx.sigs.push(WasmSig::{ param_tys: param_tys, ret_ty: ret_ty })
+      ctx.sig_map.set(key, idx)
+      idx
+    }
+  }
+}
+
+///|
+fn wasm_register_fn_addr(ctx : WasmModCtx, sym : String) -> Unit {
+  let exists = match ctx.internal_map.get(sym) {
+    Some(_) => true
+    None =>
+      match ctx.import_map.get(sym) {
+        Some(_) => true
+        None => false
+      }
+  }
+  if exists {
+    match ctx.fn_table_idx.get(sym) {
+      Some(_) => ()
+      None => {
+        let slot = ctx.fn_table_list.length() + 1
+        ctx.fn_table_idx.set(sym, slot)
+        ctx.fn_table_list.push(sym)
+      }
+    }
+  }
+}
+
+///|
+fn wasm_scan_sym_operand(ctx : WasmModCtx, op : String) -> Unit {
+  if op.length() > 1 && str_code_at(op, 0) == 36 {
+    let sym = slice_str(op, 1, op.length())
+    wasm_register_fn_addr(ctx, sym)
+  }
+}
+
+///|
+fn wasm_eval_data_sym_expr(ctx : WasmModCtx, raw : String) -> Int64 {
+  let s = wasm_trim(raw)
+  if s.length() > 0 && str_code_at(s, 0) == 36 {
+    // Support `$sym`, `$sym + off`, `$sym - off`
+    let plus = wasm_find_char(s, 43, 1)
+    let minus = wasm_find_char(s, 45, 1)
+    let mut sym = slice_str(s, 1, s.length())
+    let mut off : Int64 = 0L
+    if plus > 0 {
+      sym = wasm_trim(slice_str(s, 1, plus))
+      off = wasm_parse_int64(slice_str(s, plus + 1, s.length()))
+    } else if minus > 0 {
+      sym = wasm_trim(slice_str(s, 1, minus))
+      off = 0L - wasm_parse_int64(slice_str(s, minus + 1, s.length()))
+    }
+    match ctx.data_addrs.get(sym) {
+      Some(addr) => return addr.to_int64() + off
+      None => ()
+    }
+    match ctx.fn_table_idx.get(sym) {
+      Some(slot) => return slot.to_int64() + off
+      None => ()
+    }
+    return 0L
+  }
+  wasm_parse_int64(s)
+}
+
+///|
+struct WasmFnCtx {
+  local_idx : Map[String, Int]
+  local_ty : Map[String, Int]
+  extra_local_tys : Array[Int]
+  n_params : Int
+  alloc_offsets : Map[String, Int]
+  frame_size : Int
+  fp_local : Int
+  pc_local : Int
+  block_idx : Map[String, Int]
+  // phi_moves[pred_blk][dst_blk] -> Array[(dst_local, dst_ty, src_operand)]
+  has_phi : Bool
+  phi_preds : Array[Int]
+  phi_dsts : Array[Int]
+  phi_dst_names : Array[String]
+  phi_dst_tys : Array[Int]
+  phi_src_ops : Array[String]
+  phi_tmp_i32 : Int
+  phi_tmp_i64 : Int
+  phi_tmp_f32 : Int
+  phi_tmp_f64 : Int
+}
+
+///|
+fn wasm_fn_alloc_local(fctx : WasmFnCtx, ty : Int) -> Int {
+  let idx = fctx.n_params + fctx.extra_local_tys.length()
+  fctx.extra_local_tys.push(ty)
+  idx
+}
+
+///|
+fn wasm_emit_operand(
+  ctx : WasmModCtx,
+  fctx : WasmFnCtx,
+  code : Array[Int],
+  op : String,
+  want_ty : Int,
+) -> Unit {
+  let s = wasm_trim(op)
+  if s.length() == 0 {
+    if want_ty == WASM_TY_I32 {
+      code.push(0x41)
+      wasm_push_s32(code, 0)
+    } else if want_ty == WASM_TY_I64 {
+      code.push(0x42)
+      wasm_push_s64(code, 0L)
+    } else if want_ty == WASM_TY_F32 {
+      code.push(0x43)
+      wasm_push_i32_le(code, 0)
+    } else {
+      code.push(0x44)
+      wasm_push_i64_le(code, 0L)
+    }
+    return
+  }
+  let c0 = str_code_at(s, 0)
+  // Local variable %...
+  if c0 == 37 {
+    let idx = match fctx.local_idx.get(s) {
+      Some(k) => k
+      None => 0
+    }
+    let lty = match fctx.local_ty.get(s) {
+      Some(t) => t
+      None => want_ty
+    }
+    code.push(0x20) // local.get
+    wasm_push_u32(code, idx)
+    if lty != want_ty {
+      if lty == WASM_TY_I64 && want_ty == WASM_TY_I32 {
+        code.push(0xA7) // i32.wrap_i64
+      } else if lty == WASM_TY_I32 && want_ty == WASM_TY_I64 {
+        code.push(0xAD) // i64.extend_i32_u
+      } else if lty == WASM_TY_F32 && want_ty == WASM_TY_F64 {
+        code.push(0xBB) // f64.promote_f32
+      } else if lty == WASM_TY_F64 && want_ty == WASM_TY_F32 {
+        code.push(0xB6) // f32.demote_f64
+      }
+    }
+    return
+  }
+  // Global symbol $...
+  if c0 == 36 {
+    let sym = slice_str(s, 1, s.length())
+    let mut addr : Int64 = 0L
+    match ctx.data_addrs.get(sym) {
+      Some(a) => addr = a.to_int64()
+      None =>
+        match ctx.fn_table_idx.get(sym) {
+          Some(slot) => addr = slot.to_int64()
+          None => ()
+        }
+    }
+    if want_ty == WASM_TY_I32 {
+      code.push(0x41)
+      wasm_push_s32(code, addr.to_int())
+    } else {
+      code.push(0x42)
+      wasm_push_s64(code, addr)
+    }
+    return
+  }
+  // Float / Double literal: d_... or s_...
+  if s.starts_with("d_") {
+    let bits = wasm_parse_double_bits(slice_str(s, 2, s.length()))
+    if want_ty == WASM_TY_F32 {
+      code.push(0x43)
+      wasm_push_i32_le(code, wasm_f64_bits_to_f32_bits(bits))
+    } else if want_ty == WASM_TY_I64 {
+      code.push(0x42)
+      wasm_push_s64(code, bits)
+    } else {
+      code.push(0x44)
+      wasm_push_i64_le(code, bits)
+    }
+    return
+  }
+  if s.starts_with("s_") {
+    let bits64 = wasm_parse_double_bits(slice_str(s, 2, s.length()))
+    let bits32 = wasm_f64_bits_to_f32_bits(bits64)
+    if want_ty == WASM_TY_F64 {
+      code.push(0x43)
+      wasm_push_i32_le(code, bits32)
+      code.push(0xBB) // f64.promote_f32
+    } else if want_ty == WASM_TY_I32 {
+      code.push(0x41)
+      wasm_push_s32(code, bits32)
+    } else {
+      code.push(0x43)
+      wasm_push_i32_le(code, bits32)
+    }
+    return
+  }
+  // Integer literal
+  let iv = wasm_parse_int64(s)
+  if want_ty == WASM_TY_I32 {
+    code.push(0x41)
+    wasm_push_s32(code, iv.to_int())
+  } else if want_ty == WASM_TY_I64 {
+    code.push(0x42)
+    wasm_push_s64(code, iv)
+  } else if want_ty == WASM_TY_F32 {
+    code.push(0x43)
+    wasm_push_i32_le(code, iv.to_int())
+  } else {
+    code.push(0x44)
+    wasm_push_i64_le(code, iv)
+  }
+}
+
+///|
+fn wasm_emit_addr(
+  ctx : WasmModCtx,
+  fctx : WasmFnCtx,
+  code : Array[Int],
+  op : String,
+) -> Unit {
+  wasm_emit_operand(ctx, fctx, code, op, WASM_TY_I32)
+}
+
+///|
+fn wasm_emit_phi_edge(
+  ctx : WasmModCtx,
+  fctx : WasmFnCtx,
+  code : Array[Int],
+  pred_idx : Int,
+  dst_idx : Int,
+) -> Unit {
+  if !fctx.has_phi {
+    return
+  }
+  let matched : Array[Int] = []
+  let mut i = 0
+  while i < fctx.phi_preds.length() {
+    if fctx.phi_preds[i] == pred_idx && fctx.phi_dsts[i] == dst_idx {
+      matched.push(i)
+    }
+    i = i + 1
+  }
+  if matched.length() == 0 {
+    return
+  }
+  // Push all source values onto the Wasm operand stack first (handles parallel phi swaps safely!),
+  // then pop them into destination locals in reverse order.
+  i = 0
+  while i < matched.length() {
+    let k = matched[i]
+    wasm_emit_operand(ctx, fctx, code, fctx.phi_src_ops[k], fctx.phi_dst_tys[k])
+    i = i + 1
+  }
+  i = matched.length() - 1
+  while i >= 0 {
+    let k = matched[i]
+    match fctx.local_idx.get(fctx.phi_dst_names[k]) {
+      Some(lidx) => {
+        code.push(0x21) // local.set
+        wasm_push_u32(code, lidx)
+      }
+      None => code.push(0x1A) // drop
+    }
+    i = i - 1
+  }
+}
+
+///|
+fn wasm_emit_jump_to(
+  ctx : WasmModCtx,
+  fctx : WasmFnCtx,
+  code : Array[Int],
+  cur_blk : Int,
+  target_lbl : String,
+  disp_depth : Int,
+) -> Unit {
+  let tidx = match fctx.block_idx.get(target_lbl) {
+    Some(k) => k
+    None => 0
+  }
+  wasm_emit_phi_edge(ctx, fctx, code, cur_blk, tidx)
+  code.push(0x41) // i32.const
+  wasm_push_s32(code, tidx)
+  code.push(0x21) // local.set $pc
+  wasm_push_u32(code, fctx.pc_local)
+  code.push(0x0C) // br $disp
+  wasm_push_u32(code, disp_depth)
+}
+
+///|
+fn wasm_emit_epilogue(fctx : WasmFnCtx, code : Array[Int]) -> Unit {
+  if fctx.frame_size > 0 {
+    code.push(0x20) // local.get $fp
+    wasm_push_u32(code, fctx.fp_local)
+    code.push(0x41) // i32.const frame_size
+    wasm_push_s32(code, fctx.frame_size)
+    code.push(0x6A) // i32.add
+    code.push(0x24) // global.set 0 ($__sp)
+    wasm_push_u32(code, 0)
+  }
+}
+
+///|
+fn wasm_emit_inst(
+  ctx : WasmModCtx,
+  fctx : WasmFnCtx,
+  fn_ret_ty : Int,
+  code : Array[Int],
+  inst : WasmInst,
+  cur_blk : Int,
+  disp_depth : Int,
+  multi_blk : Bool,
+) -> Bool {
+  let op = inst.op
+  if op == "phi" {
+    return false
+  }
+  if op == "hlt" {
+    code.push(0x00) // unreachable
+    return true
+  }
+  if op == "ret" {
+    if fn_ret_ty != WASM_TY_VOID {
+      let arg0 = if inst.args.length() > 0 { inst.args[0] } else { "0" }
+      wasm_emit_operand(ctx, fctx, code, arg0, fn_ret_ty)
+    }
+    wasm_emit_epilogue(fctx, code)
+    code.push(0x0F) // return
+    return true
+  }
+  if op == "jmp" {
+    if multi_blk && inst.args.length() > 0 {
+      wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[0], disp_depth)
+    }
+    return true
+  }
+  if op == "jnz" {
+    if multi_blk && inst.args.length() >= 3 {
+      let cond_op = inst.args[0]
+      let cond_ty = if cond_op.length() > 0 && str_code_at(cond_op, 0) == 37 {
+        match fctx.local_ty.get(cond_op) {
+          Some(t) => t
+          None => WASM_TY_I32
+        }
+      } else {
+        WASM_TY_I32
+      }
+      if cond_ty == WASM_TY_I64 {
+        wasm_emit_operand(ctx, fctx, code, cond_op, WASM_TY_I64)
+        code.push(0x42) // i64.const 0
+        wasm_push_s64(code, 0L)
+        code.push(0x52) // i64.ne
+      } else {
+        wasm_emit_operand(ctx, fctx, code, cond_op, WASM_TY_I32)
+      }
+      code.push(0x04) // if
+      code.push(0x40) // void
+      wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[1], disp_depth + 1)
+      code.push(0x05) // else
+      wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[2], disp_depth + 1)
+      code.push(0x0B) // end
+    }
+    return true
+  }
+  if op == "jtbl" {
+    // jtbl %idx, @def, @l0, @l1, ..., @l_{M-1}
+    if multi_blk && inst.args.length() >= 2 {
+      let idx_op = inst.args[0]
+      let def_lbl = inst.args[1]
+      let m = inst.args.length() - 2
+      // Nested block + br_table:
+      // block $j_def
+      //   block $j_{m-1} ... block $j_0
+      //     <idx>
+      //     br_table 0 1 ... m-1 m
+      //   end -> jump_to(@l0, disp_depth + m)
+      //   ...
+      // end -> jump_to(@def, disp_depth)
+      let mut k = 0
+      while k <= m {
+        code.push(0x02) // block
+        code.push(0x40) // void
+        k = k + 1
+      }
+      wasm_emit_operand(ctx, fctx, code, idx_op, WASM_TY_I32)
+      code.push(0x0E) // br_table
+      wasm_push_u32(code, m)
+      k = 0
+      while k < m {
+        wasm_push_u32(code, k)
+        k = k + 1
+      }
+      wasm_push_u32(code, m) // default -> $j_def
+      k = 0
+      while k < m {
+        code.push(0x0B) // end $j_k
+        wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[2 + k], disp_depth + (m - k))
+        k = k + 1
+      }
+      code.push(0x0B) // end $j_def
+      wasm_emit_jump_to(ctx, fctx, code, cur_blk, def_lbl, disp_depth)
+    }
+    return true
+  }
+
+  // Memory stores
+  if op == "storel" || op == "storew" || op == "storeh" || op == "storeb" || op == "stores" || op == "stored" {
+    if inst.args.length() >= 2 {
+      wasm_emit_addr(ctx, fctx, code, inst.args[1])
+      if op == "storel" {
+        wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
+        code.push(0x37) // i64.store
+      } else if op == "storew" {
+        wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+        code.push(0x36) // i32.store
+      } else if op == "storeh" {
+        wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+        code.push(0x3B) // i32.store16
+      } else if op == "storeb" {
+        wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+        code.push(0x3A) // i32.store8
+      } else if op == "stores" {
+        wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
+        code.push(0x38) // f32.store
+      } else {
+        wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
+        code.push(0x39) // f64.store
+      }
+      wasm_push_u32(code, 0) // align
+      wasm_push_u32(code, 0) // offset
+    }
+    return false
+  }
+
+  // blit src, dst, n -> memory.copy(dst, src, n)
+  if op == "blit" {
+    if inst.args.length() >= 3 {
+      wasm_emit_addr(ctx, fctx, code, inst.args[1]) // dst
+      wasm_emit_addr(ctx, fctx, code, inst.args[0]) // src
+      wasm_emit_operand(ctx, fctx, code, inst.args[2], WASM_TY_I32) // len
+      code.push(0xFC)
+      wasm_push_u32(code, 10) // memory.copy
+      code.push(0x00)
+      code.push(0x00)
+    }
+    return false
+  }
+
+  // Call (direct or indirect)
+  if op == "call" {
+    if inst.args.length() == 0 {
+      return false
+    }
+    let callee = inst.args[0]
+    let mut ai = 0
+    while ai < inst.arg_tys.length() {
+      wasm_emit_operand(ctx, fctx, code, inst.args[1 + ai], inst.arg_tys[ai])
+      ai = ai + 1
+    }
+    let mut actual_ret = inst.dst_ty
+    if str_code_at(callee, 0) == 36 {
+      let sym = slice_str(callee, 1, callee.length())
+      match ctx.internal_map.get(sym) {
+        Some(fidx) => {
+          code.push(0x10) // call
+          wasm_push_u32(code, fidx)
+          actual_ret = match ctx.internal_ret_tys.get(sym) {
+            Some(rt) => rt
+            None => WASM_TY_VOID
+          }
+        }
+        None =>
+          match ctx.import_map.get(sym) {
+            Some(iidx) => {
+              code.push(0x10) // call
+              wasm_push_u32(code, iidx)
+              actual_ret = ctx.import_ret_tys[iidx]
+            }
+            None => code.push(0x00) // unreachable
+          }
+      }
+    } else {
+      // Indirect call via function table
+      wasm_emit_operand(ctx, fctx, code, callee, WASM_TY_I32)
+      let sig_idx = wasm_intern_sig(ctx, inst.arg_tys, inst.dst_ty)
+      code.push(0x11) // call_indirect
+      wasm_push_u32(code, sig_idx)
+      code.push(0x00) // table 0
+      actual_ret = inst.dst_ty
+    }
+    if inst.dst.length() > 0 {
+      if actual_ret == WASM_TY_VOID && inst.dst_ty != WASM_TY_VOID {
+        wasm_emit_operand(ctx, fctx, code, "0", inst.dst_ty)
+      } else if actual_ret != inst.dst_ty {
+        if actual_ret == WASM_TY_I64 && inst.dst_ty == WASM_TY_I32 {
+          code.push(0xA7)
+        } else if actual_ret == WASM_TY_I32 && inst.dst_ty == WASM_TY_I64 {
+          code.push(0xAD)
+        }
+      }
+      match fctx.local_idx.get(inst.dst) {
+        Some(lidx) => {
+          code.push(0x21)
+          wasm_push_u32(code, lidx)
+        }
+        None => code.push(0x1A)
+      }
+    } else if actual_ret != WASM_TY_VOID {
+      code.push(0x1A) // drop unused return value
+    }
+    return false
+  }
+
+  // Value-producing instructions
+  let dty = inst.dst_ty
+  let dst_local = match fctx.local_idx.get(inst.dst) {
+    Some(k) => k
+    None => -1
+  }
+  if dst_local < 0 {
+    return false
+  }
+
+  // Stack allocation: alloc4 / alloc8 / alloc16
+  if op == "alloc4" || op == "alloc8" || op == "alloc16" {
+    let off = match fctx.alloc_offsets.get(inst.dst) {
+      Some(o) => o
+      None => 0
+    }
+    code.push(0x20) // local.get $fp
+    wasm_push_u32(code, fctx.fp_local)
+    if off != 0 {
+      code.push(0x41)
+      wasm_push_s32(code, off)
+      code.push(0x6A) // i32.add
+    }
+    if dty == WASM_TY_I64 {
+      code.push(0xAD) // i64.extend_i32_u
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  // copy
+  if op == "copy" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  // Loads
+  if op == "loadl" || op == "loadw" || op == "loadsw" || op == "loaduw" ||
+    op == "loadsh" || op == "loaduh" || op == "loadsb" || op == "loadub" ||
+    op == "loads" || op == "loadd" {
+    wasm_emit_addr(ctx, fctx, code, inst.args[0])
+    if op == "loadl" {
+      code.push(if dty == WASM_TY_I32 { 0x28 } else { 0x29 })
+    } else if op == "loadw" || op == "loaduw" {
+      code.push(if dty == WASM_TY_I64 { 0x35 } else { 0x28 })
+    } else if op == "loadsw" {
+      code.push(if dty == WASM_TY_I64 { 0x34 } else { 0x28 })
+    } else if op == "loadsh" {
+      code.push(if dty == WASM_TY_I64 { 0x32 } else { 0x2E })
+    } else if op == "loaduh" {
+      code.push(if dty == WASM_TY_I64 { 0x33 } else { 0x2F })
+    } else if op == "loadsb" {
+      code.push(if dty == WASM_TY_I64 { 0x30 } else { 0x2C })
+    } else if op == "loadub" {
+      code.push(if dty == WASM_TY_I64 { 0x31 } else { 0x2D })
+    } else if op == "loads" {
+      code.push(0x2A)
+    } else {
+      code.push(0x2B)
+    }
+    wasm_push_u32(code, 0) // align
+    wasm_push_u32(code, 0) // offset
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  // Unary ops: neg, sqrt, extsw, extuw, extsh, extuh, extsb, extub, exts, truncd, stosi, stoui, dtosi, dtoui, swtof, uwtof, sltof, ultof, cast
+  if op == "neg" {
+    if dty == WASM_TY_I32 {
+      code.push(0x41)
+      wasm_push_s32(code, 0)
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+      code.push(0x6B) // i32.sub
+    } else if dty == WASM_TY_I64 {
+      code.push(0x42)
+      wasm_push_s64(code, 0L)
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
+      code.push(0x7D) // i64.sub
+    } else if dty == WASM_TY_F32 {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
+      code.push(0x8C) // f32.neg
+    } else {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
+      code.push(0x9A) // f64.neg
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  if op == "sqrt" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
+    code.push(if dty == WASM_TY_F32 { 0x91 } else { 0x9F })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  if op == "extsw" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    if dty == WASM_TY_I64 {
+      code.push(0xAC) // i64.extend_i32_s
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "extuw" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    if dty == WASM_TY_I64 {
+      code.push(0xAD) // i64.extend_i32_u
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "extsh" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    code.push(0xC1) // i32.extend16_s
+    if dty == WASM_TY_I64 {
+      code.push(0xAC)
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "extuh" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    code.push(0x41)
+    wasm_push_s32(code, 65535)
+    code.push(0x71) // i32.and
+    if dty == WASM_TY_I64 {
+      code.push(0xAD)
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "extsb" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    code.push(0xC0) // i32.extend8_s
+    if dty == WASM_TY_I64 {
+      code.push(0xAC)
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "extub" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    code.push(0x41)
+    wasm_push_s32(code, 255)
+    code.push(0x71) // i32.and
+    if dty == WASM_TY_I64 {
+      code.push(0xAD)
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "exts" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
+    code.push(0xBB) // f64.promote_f32
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "truncd" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
+    code.push(0xB6) // f32.demote_f64
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "stosi" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
+    code.push(if dty == WASM_TY_I64 { 0xAE } else { 0xA8 })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "stoui" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
+    code.push(if dty == WASM_TY_I64 { 0xAF } else { 0xA9 })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "dtosi" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
+    code.push(if dty == WASM_TY_I64 { 0xB0 } else { 0xAA })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "dtoui" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
+    code.push(if dty == WASM_TY_I64 { 0xB1 } else { 0xAB })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "swtof" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    code.push(if dty == WASM_TY_F32 { 0xB2 } else { 0xB7 })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "uwtof" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+    code.push(if dty == WASM_TY_F32 { 0xB3 } else { 0xB8 })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "sltof" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
+    code.push(if dty == WASM_TY_F32 { 0xB4 } else { 0xB9 })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "ultof" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
+    code.push(if dty == WASM_TY_F32 { 0xB5 } else { 0xBA })
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+  if op == "cast" {
+    if dty == WASM_TY_I32 {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
+      code.push(0xBC) // i32.reinterpret_f32
+    } else if dty == WASM_TY_I64 {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
+      code.push(0xBD) // i64.reinterpret_f64
+    } else if dty == WASM_TY_F32 {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+      code.push(0xBE) // f32.reinterpret_i32
+    } else {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
+      code.push(0xBF) // f64.reinterpret_i64
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  // Binary arithmetic / bitwise / shifts
+  if op == "add" || op == "sub" || op == "mul" || op == "div" || op == "udiv" ||
+    op == "rem" || op == "urem" || op == "and" || op == "or" || op == "xor" ||
+    op == "shl" || op == "shr" || op == "sar" {
+    wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
+    wasm_emit_operand(ctx, fctx, code, inst.args[1], dty)
+    if dty == WASM_TY_I32 {
+      if op == "add" {
+        code.push(0x6A)
+      } else if op == "sub" {
+        code.push(0x6B)
+      } else if op == "mul" {
+        code.push(0x6C)
+      } else if op == "div" {
+        code.push(0x6D)
+      } else if op == "udiv" {
+        code.push(0x6E)
+      } else if op == "rem" {
+        code.push(0x6F)
+      } else if op == "urem" {
+        code.push(0x70)
+      } else if op == "and" {
+        code.push(0x71)
+      } else if op == "or" {
+        code.push(0x72)
+      } else if op == "xor" {
+        code.push(0x73)
+      } else if op == "shl" {
+        code.push(0x74)
+      } else if op == "sar" {
+        code.push(0x75)
+      } else {
+        code.push(0x76)
+      }
+    } else if dty == WASM_TY_I64 {
+      if op == "add" {
+        code.push(0x7C)
+      } else if op == "sub" {
+        code.push(0x7D)
+      } else if op == "mul" {
+        code.push(0x7E)
+      } else if op == "div" {
+        code.push(0x7F)
+      } else if op == "udiv" {
+        code.push(0x80)
+      } else if op == "rem" {
+        code.push(0x81)
+      } else if op == "urem" {
+        code.push(0x82)
+      } else if op == "and" {
+        code.push(0x83)
+      } else if op == "or" {
+        code.push(0x84)
+      } else if op == "xor" {
+        code.push(0x85)
+      } else if op == "shl" {
+        code.push(0x86)
+      } else if op == "sar" {
+        code.push(0x87)
+      } else {
+        code.push(0x88)
+      }
+    } else if dty == WASM_TY_F32 {
+      if op == "add" {
+        code.push(0x92)
+      } else if op == "sub" {
+        code.push(0x93)
+      } else if op == "mul" {
+        code.push(0x94)
+      } else {
+        code.push(0x95)
+      }
+    } else {
+      if op == "add" {
+        code.push(0xA0)
+      } else if op == "sub" {
+        code.push(0xA1)
+      } else if op == "mul" {
+        code.push(0xA2)
+      } else {
+        code.push(0xA3)
+      }
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  // Comparisons: c<pred><ty>
+  if op.length() >= 3 && str_code_at(op, 0) == 99 {
+    let last_c = str_code_at(op, op.length() - 1)
+    let cmp_ty = if last_c == 119 {
+      WASM_TY_I32
+    } else if last_c == 108 {
+      WASM_TY_I64
+    } else if last_c == 115 {
+      WASM_TY_F32
+    } else {
+      WASM_TY_F64
+    }
+    let pred = slice_str(op, 1, op.length() - 1)
+    if (cmp_ty == WASM_TY_F32 || cmp_ty == WASM_TY_F64) && (pred == "o" || pred == "uo") {
+      let eq_op = if cmp_ty == WASM_TY_F32 { 0x5B } else { 0x61 }
+      // a == a
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], cmp_ty)
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], cmp_ty)
+      code.push(eq_op)
+      // b == b
+      wasm_emit_operand(ctx, fctx, code, inst.args[1], cmp_ty)
+      wasm_emit_operand(ctx, fctx, code, inst.args[1], cmp_ty)
+      code.push(eq_op)
+      code.push(0x71) // i32.and (both ordered)
+      if pred == "uo" {
+        code.push(0x45) // i32.eqz
+      }
+    } else {
+      wasm_emit_operand(ctx, fctx, code, inst.args[0], cmp_ty)
+      wasm_emit_operand(ctx, fctx, code, inst.args[1], cmp_ty)
+      if cmp_ty == WASM_TY_I32 {
+        if pred == "eq" {
+          code.push(0x46)
+        } else if pred == "ne" {
+          code.push(0x47)
+        } else if pred == "slt" {
+          code.push(0x48)
+        } else if pred == "ult" {
+          code.push(0x49)
+        } else if pred == "sgt" {
+          code.push(0x4A)
+        } else if pred == "ugt" {
+          code.push(0x4B)
+        } else if pred == "sle" {
+          code.push(0x4C)
+        } else if pred == "ule" {
+          code.push(0x4D)
+        } else if pred == "sge" {
+          code.push(0x4E)
+        } else {
+          code.push(0x4F)
+        }
+      } else if cmp_ty == WASM_TY_I64 {
+        if pred == "eq" {
+          code.push(0x51)
+        } else if pred == "ne" {
+          code.push(0x52)
+        } else if pred == "slt" {
+          code.push(0x53)
+        } else if pred == "ult" {
+          code.push(0x54)
+        } else if pred == "sgt" {
+          code.push(0x55)
+        } else if pred == "ugt" {
+          code.push(0x56)
+        } else if pred == "sle" {
+          code.push(0x57)
+        } else if pred == "ule" {
+          code.push(0x58)
+        } else if pred == "sge" {
+          code.push(0x59)
+        } else {
+          code.push(0x5A)
+        }
+      } else if cmp_ty == WASM_TY_F32 {
+        if pred == "eq" {
+          code.push(0x5B)
+        } else if pred == "ne" {
+          code.push(0x5C)
+        } else if pred == "lt" {
+          code.push(0x5D)
+        } else if pred == "gt" {
+          code.push(0x5E)
+        } else if pred == "le" {
+          code.push(0x5F)
+        } else {
+          code.push(0x60)
+        }
+      } else {
+        if pred == "eq" {
+          code.push(0x61)
+        } else if pred == "ne" {
+          code.push(0x62)
+        } else if pred == "lt" {
+          code.push(0x63)
+        } else if pred == "gt" {
+          code.push(0x64)
+        } else if pred == "le" {
+          code.push(0x65)
+        } else {
+          code.push(0x66)
+        }
+      }
+    }
+    if dty == WASM_TY_I64 {
+      code.push(0xAD) // i64.extend_i32_u
+    }
+    code.push(0x21)
+    wasm_push_u32(code, dst_local)
+    return false
+  }
+
+  false
+}
+
+///|
+fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
+  let local_idx : Map[String, Int] = Map([])
+  let local_ty : Map[String, Int] = Map([])
+  let extra_local_tys : Array[Int] = []
+  let n_params = f.param_names.length()
+  let mut i = 0
+  while i < n_params {
+    local_idx.set(f.param_names[i], i)
+    local_ty.set(f.param_names[i], f.param_tys[i])
+    i = i + 1
+  }
+
+  let block_idx : Map[String, Int] = Map([])
+  let alloc_offsets : Map[String, Int] = Map([])
+  let mut frame_off = 0
+  let phi_preds : Array[Int] = []
+  let phi_dsts : Array[Int] = []
+  let phi_dst_names : Array[String] = []
+  let phi_dst_tys : Array[Int] = []
+  let phi_src_ops : Array[String] = []
+
+  // Pass 1: map block labels, locals, stack allocs
+  let nb = f.blocks.length()
+  let mut bi = 0
+  while bi < nb {
+    block_idx.set(f.blocks[bi].label, bi)
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      if inst.dst.length() > 0 && inst.dst_ty != WASM_TY_VOID {
+        match local_idx.get(inst.dst) {
+          Some(_) => ()
+          None => {
+            let lidx = n_params + extra_local_tys.length()
+            extra_local_tys.push(inst.dst_ty)
+            local_idx.set(inst.dst, lidx)
+            local_ty.set(inst.dst, inst.dst_ty)
+          }
+        }
+      }
+      if inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16" {
+        let align = if inst.op == "alloc16" {
+          16
+        } else if inst.op == "alloc8" {
+          8
+        } else {
+          4
+        }
+        let sz = if inst.args.length() > 0 {
+          wasm_parse_int64(inst.args[0]).to_int()
+        } else {
+          8
+        }
+        frame_off = wasm_align_up(frame_off, align)
+        alloc_offsets.set(inst.dst, frame_off)
+        frame_off = frame_off + (if sz < 1 { 4 } else { sz })
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+
+  // Pass 2: collect phi edges
+  bi = 0
+  while bi < nb {
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      if inst.op == "phi" {
+        let mut pi = 0
+        while pi + 1 < inst.args.length() {
+          match block_idx.get(inst.args[pi]) {
+            Some(pidx) => {
+              phi_preds.push(pidx)
+              phi_dsts.push(bi)
+              phi_dst_names.push(inst.dst)
+              phi_dst_tys.push(inst.dst_ty)
+              phi_src_ops.push(inst.args[pi + 1])
+            }
+            None => ()
+          }
+          pi = pi + 2
+        }
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+
+  let frame_size = wasm_align_up(frame_off, 16)
+  let fp_local = if frame_size > 0 {
+    let idx = n_params + extra_local_tys.length()
+    extra_local_tys.push(WASM_TY_I32)
+    idx
+  } else {
+    -1
+  }
+  let multi_blk = nb > 1
+  let pc_local = if multi_blk {
+    let idx = n_params + extra_local_tys.length()
+    extra_local_tys.push(WASM_TY_I32)
+    idx
+  } else {
+    -1
+  }
+
+  let fctx = WasmFnCtx::{
+    local_idx: local_idx,
+    local_ty: local_ty,
+    extra_local_tys: extra_local_tys,
+    n_params: n_params,
+    alloc_offsets: alloc_offsets,
+    frame_size: frame_size,
+    fp_local: fp_local,
+    pc_local: pc_local,
+    block_idx: block_idx,
+    has_phi: phi_preds.length() > 0,
+    phi_preds: phi_preds,
+    phi_dsts: phi_dsts,
+    phi_dst_names: phi_dst_names,
+    phi_dst_tys: phi_dst_tys,
+    phi_src_ops: phi_src_ops,
+    phi_tmp_i32: -1,
+    phi_tmp_i64: -1,
+    phi_tmp_f32: -1,
+    phi_tmp_f64: -1,
+  }
+
+  let code : Array[Int] = []
+  // Function prologue: allocate shadow stack frame
+  if frame_size > 0 {
+    code.push(0x23) // global.get 0 ($__sp)
+    wasm_push_u32(code, 0)
+    code.push(0x41) // i32.const frame_size
+    wasm_push_s32(code, frame_size)
+    code.push(0x6B) // i32.sub
+    code.push(0x22) // local.tee $fp
+    wasm_push_u32(code, fp_local)
+    code.push(0x24) // global.set 0 ($__sp)
+    wasm_push_u32(code, 0)
+  }
+
+  if nb == 0 {
+    if f.ret_ty != WASM_TY_VOID {
+      wasm_emit_operand(ctx, fctx, code, "0", f.ret_ty)
+    }
+    wasm_emit_epilogue(fctx, code)
+  } else if !multi_blk {
+    let insts = f.blocks[0].insts
+    let mut terminated = false
+    let mut ii = 0
+    while ii < insts.length() {
+      terminated = wasm_emit_inst(ctx, fctx, f.ret_ty, code, insts[ii], 0, 0, false)
+      ii = ii + 1
+    }
+    if !terminated {
+      if f.ret_ty != WASM_TY_VOID {
+        wasm_emit_operand(ctx, fctx, code, "0", f.ret_ty)
+      }
+      wasm_emit_epilogue(fctx, code)
+    }
+  } else {
+    // $pc = 0; loop $disp { block $b_{nb-1} ... block $b_0 { local.get $pc; br_table 0..nb-1 0 } <blk 0> ... <blk nb-1> unreachable }
+    code.push(0x41)
+    wasm_push_s32(code, 0)
+    code.push(0x21)
+    wasm_push_u32(code, pc_local)
+    code.push(0x03) // loop $disp
+    code.push(0x40) // void
+    bi = 0
+    while bi < nb {
+      code.push(0x02) // block $b
+      code.push(0x40) // void
+      bi = bi + 1
+    }
+    code.push(0x20) // local.get $pc
+    wasm_push_u32(code, pc_local)
+    code.push(0x0E) // br_table
+    wasm_push_u32(code, nb)
+    bi = 0
+    while bi < nb {
+      wasm_push_u32(code, bi)
+      bi = bi + 1
+    }
+    wasm_push_u32(code, 0) // default
+    bi = 0
+    while bi < nb {
+      code.push(0x0B) // end $b_{bi}
+      let disp_depth = nb - 1 - bi
+      let insts = f.blocks[bi].insts
+      let mut terminated = false
+      let mut ii = 0
+      while ii < insts.length() {
+        terminated = wasm_emit_inst(ctx, fctx, f.ret_ty, code, insts[ii], bi, disp_depth, true)
+        ii = ii + 1
+      }
+      if !terminated {
+        if bi + 1 < nb {
+          wasm_emit_jump_to(ctx, fctx, code, bi, f.blocks[bi + 1].label, disp_depth)
+        } else {
+          if f.ret_ty != WASM_TY_VOID {
+            wasm_emit_operand(ctx, fctx, code, "0", f.ret_ty)
+          }
+          wasm_emit_epilogue(fctx, code)
+          code.push(0x0F) // return
+        }
+      }
+      bi = bi + 1
+    }
+    code.push(0x00) // unreachable
+    code.push(0x0B) // end loop $disp
+    if f.ret_ty != WASM_TY_VOID {
+      code.push(0x00) // unreachable for non-void result validation after loop
+    }
+  }
+  code.push(0x0B) // end function
+
+  // Encode local declarations (run-length encoded) + code
+  let rle_cnt : Array[Int] = []
+  let rle_ty : Array[Int] = []
+  i = 0
+  while i < extra_local_tys.length() {
+    let t = extra_local_tys[i]
+    let k = rle_ty.length()
+    if k > 0 && rle_ty[k - 1] == t {
+      rle_cnt[k - 1] = rle_cnt[k - 1] + 1
+    } else {
+      rle_cnt.push(1)
+      rle_ty.push(t)
+    }
+    i = i + 1
+  }
+  let body : Array[Int] = []
+  wasm_push_u32(body, rle_cnt.length())
+  i = 0
+  while i < rle_cnt.length() {
+    wasm_push_u32(body, rle_cnt[i])
+    body.push(wasm_valtype_byte(rle_ty[i]))
+    i = i + 1
+  }
+  wasm_push_bytes(body, code)
+  body
+}
+
+///|
+fn wasm_int_array_to_bytes(arr : Array[Int]) -> Bytes {
+  let n = arr.length()
+  if n == 0 {
+    return Bytes::new(0)
+  }
+  let p = ptr_alloc(n.to_int64())
+  let mut i = 0
+  while i < n {
+    ptr_write_u8(p, i.to_int64(), arr[i] & 0xFF)
+    i = i + 1
+  }
+  let b = bytes_from_ptr(p, n)
+  ptr_free(p)
+  b
+}
+
+///|
+/// Compile QBE SSA text directly into a valid WebAssembly 32-bit (.wasm) binary.
+pub fn emit_wasm_from_ssa(ssa : String) -> Bytes {
+  let parsed = wasm_parse_ssa(ssa)
+
+  let ctx = WasmModCtx::{
+    sigs: [],
+    sig_map: Map([]),
+    import_names: [],
+    import_sigs: [],
+    import_ret_tys: [],
+    import_map: Map([]),
+    internal_map: Map([]),
+    internal_ret_tys: Map([]),
+    data_addrs: Map([]),
+    fn_table_idx: Map([]),
+    fn_table_list: [],
+  }
+
+  // 1. Lay out static data starting at WASM_DATA_BASE
+  let mut cur_addr = WASM_DATA_BASE
+  let mut di = 0
+  while di < parsed.datas.length() {
+    let dd = parsed.datas[di]
+    cur_addr = wasm_align_up(cur_addr, dd.align)
+    dd.addr = cur_addr
+    ctx.data_addrs.set(dd.name, cur_addr)
+    let mut ii = 0
+    while ii < dd.items.length() {
+      cur_addr = cur_addr + wasm_data_item_size(dd.items[ii])
+      ii = ii + 1
+    }
+    di = di + 1
+  }
+  let static_end = cur_addr
+  let heap_base = wasm_align_up(static_end, 16)
+
+  // 2. Register internal function names (indices will be shifted after imports are known)
+  let internal_def_set : Map[String, Int] = Map([])
+  let mut fi = 0
+  while fi < parsed.funcs.length() {
+    let f = parsed.funcs[fi]
+    internal_def_set.set(f.name, fi)
+    ctx.internal_ret_tys.set(f.name, f.ret_ty)
+    fi = fi + 1
+  }
+
+  // 3. Discover external imports from direct call instructions
+  let imp_param_tys : Map[String, Array[Int]] = Map([])
+  let imp_ret_ty : Map[String, Int] = Map([])
+  let imp_order : Array[String] = []
+  fi = 0
+  while fi < parsed.funcs.length() {
+    let f = parsed.funcs[fi]
+    let mut bi = 0
+    while bi < f.blocks.length() {
+      let insts = f.blocks[bi].insts
+      let mut ii = 0
+      while ii < insts.length() {
+        let inst = insts[ii]
+        if inst.op == "call" && inst.args.length() > 0 {
+          let callee = inst.args[0]
+          if str_code_at(callee, 0) == 36 {
+            let sym = slice_str(callee, 1, callee.length())
+            match internal_def_set.get(sym) {
+              Some(_) => ()
+              None => {
+                match imp_param_tys.get(sym) {
+                  None => {
+                    imp_order.push(sym)
+                    imp_param_tys.set(sym, inst.arg_tys)
+                    imp_ret_ty.set(sym, inst.dst_ty)
+                  }
+                  Some(_) =>
+                    if inst.dst_ty != WASM_TY_VOID {
+                      imp_ret_ty.set(sym, inst.dst_ty)
+                    }
+                }
+              }
+            }
+          }
+        }
+        ii = ii + 1
+      }
+      bi = bi + 1
+    }
+    fi = fi + 1
+  }
+
+  // Finalize import indices 0..num_imports-1
+  let mut imi = 0
+  while imi < imp_order.length() {
+    let sym = imp_order[imi]
+    let ptys = match imp_param_tys.get(sym) {
+      Some(p) => p
+      None => []
+    }
+    let rty = match imp_ret_ty.get(sym) {
+      Some(r) => r
+      None => WASM_TY_VOID
+    }
+    let sidx = wasm_intern_sig(ctx, ptys, rty)
+    ctx.import_map.set(sym, imi)
+    ctx.import_names.push(sym)
+    ctx.import_sigs.push(sidx)
+    ctx.import_ret_tys.push(rty)
+    imi = imi + 1
+  }
+  let num_imports = imp_order.length()
+
+  // Finalize internal function indices num_imports..
+  let internal_sig_idxs : Array[Int] = []
+  fi = 0
+  while fi < parsed.funcs.length() {
+    let f = parsed.funcs[fi]
+    ctx.internal_map.set(f.name, num_imports + fi)
+    internal_sig_idxs.push(wasm_intern_sig(ctx, f.param_tys, f.ret_ty))
+    fi = fi + 1
+  }
+
+  // 4. Discover address-taken internal functions (in data sections & non-direct-callee operands)
+  di = 0
+  while di < parsed.datas.length() {
+    let dd = parsed.datas[di]
+    let mut ii = 0
+    while ii < dd.items.length() {
+      let item = dd.items[ii]
+      if item.kind == "l" && item.raw.length() > 1 && str_code_at(item.raw, 0) == 36 {
+        let s = wasm_trim(item.raw)
+        let plus = wasm_find_char(s, 43, 1)
+        let minus = wasm_find_char(s, 45, 1)
+        let sym = if plus > 0 {
+          wasm_trim(slice_str(s, 1, plus))
+        } else if minus > 0 {
+          wasm_trim(slice_str(s, 1, minus))
+        } else {
+          slice_str(s, 1, s.length())
+        }
+        wasm_register_fn_addr(ctx, sym)
+      }
+      ii = ii + 1
+    }
+    di = di + 1
+  }
+  fi = 0
+  while fi < parsed.funcs.length() {
+    let f = parsed.funcs[fi]
+    let mut bi = 0
+    while bi < f.blocks.length() {
+      let insts = f.blocks[bi].insts
+      let mut ii = 0
+      while ii < insts.length() {
+        let inst = insts[ii]
+        let start_arg = if inst.op == "call" { 1 } else { 0 }
+        let mut ai = start_arg
+        while ai < inst.args.length() {
+          wasm_scan_sym_operand(ctx, inst.args[ai])
+          ai = ai + 1
+        }
+        ii = ii + 1
+      }
+      bi = bi + 1
+    }
+    fi = fi + 1
+  }
+
+  // 5. Compile all internal function bodies (also interns any call_indirect signatures)
+  let code_bodies : Array[Array[Int]] = []
+  fi = 0
+  while fi < parsed.funcs.length() {
+    code_bodies.push(wasm_compile_func(ctx, parsed.funcs[fi]))
+    fi = fi + 1
+  }
+
+  // 6. Materialize static data bytes
+  let data_bytes : Array[Int] = []
+  if static_end > WASM_DATA_BASE {
+    let mut pos = WASM_DATA_BASE
+    di = 0
+    while di < parsed.datas.length() {
+      let dd = parsed.datas[di]
+      while pos < dd.addr {
+        data_bytes.push(0)
+        pos = pos + 1
+      }
+      let mut ii = 0
+      while ii < dd.items.length() {
+        let item = dd.items[ii]
+        if item.kind == "b" {
+          if item.raw.length() > 0 && str_code_at(item.raw, 0) == 34 {
+            let bs = wasm_unescape_qbe_str(item.raw)
+            wasm_push_bytes(data_bytes, bs)
+            pos = pos + bs.length()
+          } else {
+            data_bytes.push(wasm_parse_int64(item.raw).to_int() & 0xFF)
+            pos = pos + 1
+          }
+        } else if item.kind == "h" {
+          let v = wasm_parse_int64(item.raw).to_int()
+          data_bytes.push(v & 0xFF)
+          data_bytes.push(ushr32(v, 8) & 0xFF)
+          pos = pos + 2
+        } else if item.kind == "w" {
+          let v = wasm_parse_int64(item.raw).to_int()
+          wasm_push_i32_le(data_bytes, v)
+          pos = pos + 4
+        } else if item.kind == "l" {
+          let v = wasm_eval_data_sym_expr(ctx, item.raw)
+          wasm_push_i64_le(data_bytes, v)
+          pos = pos + 8
+        } else if item.kind == "s" {
+          let raw_f = if item.raw.starts_with("s_") {
+            slice_str(item.raw, 2, item.raw.length())
+          } else {
+            item.raw
+          }
+          let bits32 = wasm_f64_bits_to_f32_bits(wasm_parse_double_bits(raw_f))
+          wasm_push_i32_le(data_bytes, bits32)
+          pos = pos + 4
+        } else if item.kind == "d" {
+          let raw_d = if item.raw.starts_with("d_") {
+            slice_str(item.raw, 2, item.raw.length())
+          } else {
+            item.raw
+          }
+          let bits64 = wasm_parse_double_bits(raw_d)
+          wasm_push_i64_le(data_bytes, bits64)
+          pos = pos + 8
+        } else if item.kind == "z" {
+          let zn = wasm_parse_int64(item.raw).to_int()
+          let mut zi = 0
+          while zi < zn {
+            data_bytes.push(0)
+            zi = zi + 1
+          }
+          pos = pos + zn
+        }
+        ii = ii + 1
+      }
+      di = di + 1
+    }
+  }
+
+  // 7. Assemble Wasm32 binary module
+  let out : Array[Int] = [0x00, 0x61, 0x73, 0x6D, 0x01, 0x00, 0x00, 0x00]
+
+  // Section 1: Type Section
+  let sec_type : Array[Int] = []
+  wasm_push_u32(sec_type, ctx.sigs.length())
+  let mut si = 0
+  while si < ctx.sigs.length() {
+    let sg = ctx.sigs[si]
+    sec_type.push(0x60)
+    wasm_push_u32(sec_type, sg.param_tys.length())
+    let mut pi = 0
+    while pi < sg.param_tys.length() {
+      sec_type.push(wasm_valtype_byte(sg.param_tys[pi]))
+      pi = pi + 1
+    }
+    if sg.ret_ty == WASM_TY_VOID {
+      sec_type.push(0x00)
+    } else {
+      sec_type.push(0x01)
+      sec_type.push(wasm_valtype_byte(sg.ret_ty))
+    }
+    si = si + 1
+  }
+  wasm_push_section(out, 1, sec_type)
+
+  // Section 2: Import Section
+  if ctx.import_names.length() > 0 {
+    let sec_imp : Array[Int] = []
+    wasm_push_u32(sec_imp, ctx.import_names.length())
+    imi = 0
+    while imi < ctx.import_names.length() {
+      wasm_push_str(sec_imp, "pion_rt")
+      wasm_push_str(sec_imp, ctx.import_names[imi])
+      sec_imp.push(0x00) // func import
+      wasm_push_u32(sec_imp, ctx.import_sigs[imi])
+      imi = imi + 1
+    }
+    wasm_push_section(out, 2, sec_imp)
+  }
+
+  // Section 3: Function Section
+  if internal_sig_idxs.length() > 0 {
+    let sec_fn : Array[Int] = []
+    wasm_push_u32(sec_fn, internal_sig_idxs.length())
+    fi = 0
+    while fi < internal_sig_idxs.length() {
+      wasm_push_u32(sec_fn, internal_sig_idxs[fi])
+      fi = fi + 1
+    }
+    wasm_push_section(out, 3, sec_fn)
+  }
+
+  // Section 4: Table Section (1 funcref table, slot 0 reserved null)
+  let table_len = ctx.fn_table_list.length() + 1
+  let sec_tbl : Array[Int] = []
+  wasm_push_u32(sec_tbl, 1)
+  sec_tbl.push(0x70) // funcref
+  sec_tbl.push(0x00) // min only
+  wasm_push_u32(sec_tbl, table_len)
+  wasm_push_section(out, 4, sec_tbl)
+
+  // Section 5: Memory Section (min 256 pages = 16 MB, or enough for static data + 16 MB)
+  let needed_pages = (heap_base / 65536) + 256
+  let min_pages = if needed_pages > 256 { needed_pages } else { 256 }
+  let sec_mem : Array[Int] = []
+  wasm_push_u32(sec_mem, 1)
+  sec_mem.push(0x00) // min only
+  wasm_push_u32(sec_mem, min_pages)
+  wasm_push_section(out, 5, sec_mem)
+
+  // Section 6: Global Section (global 0 = __pion_stack_ptr mut i32, global 1 = __heap_base const i32)
+  let sec_glob : Array[Int] = []
+  wasm_push_u32(sec_glob, 2)
+  sec_glob.push(0x7F) // i32
+  sec_glob.push(0x01) // mut
+  sec_glob.push(0x41) // i32.const
+  wasm_push_s32(sec_glob, WASM_STACK_BASE)
+  sec_glob.push(0x0B)
+  sec_glob.push(0x7F) // i32
+  sec_glob.push(0x00) // const
+  sec_glob.push(0x41) // i32.const
+  wasm_push_s32(sec_glob, heap_base)
+  sec_glob.push(0x0B)
+  wasm_push_section(out, 6, sec_glob)
+
+  // Section 7: Export Section
+  let exp_names : Array[String] = [
+    "memory",
+    "__indirect_function_table",
+    "__pion_stack_ptr",
+    "__heap_base",
+  ]
+  let exp_kinds : Array[Int] = [0x02, 0x01, 0x03, 0x03]
+  let exp_idxs : Array[Int] = [0, 0, 0, 1]
+  fi = 0
+  while fi < parsed.funcs.length() {
+    let f = parsed.funcs[fi]
+    if f.exported || f.name == "main" {
+      exp_names.push(f.name)
+      exp_kinds.push(0x00)
+      exp_idxs.push(num_imports + fi)
+    }
+    fi = fi + 1
+  }
+  let sec_exp : Array[Int] = []
+  wasm_push_u32(sec_exp, exp_names.length())
+  let mut ei = 0
+  while ei < exp_names.length() {
+    wasm_push_str(sec_exp, exp_names[ei])
+    sec_exp.push(exp_kinds[ei])
+    wasm_push_u32(sec_exp, exp_idxs[ei])
+    ei = ei + 1
+  }
+  wasm_push_section(out, 7, sec_exp)
+
+  // Section 9: Element Section (populate slots 1..N)
+  if ctx.fn_table_list.length() > 0 {
+    let sec_elem : Array[Int] = []
+    wasm_push_u32(sec_elem, 1)
+    sec_elem.push(0x00) // table 0 active
+    sec_elem.push(0x41) // i32.const 1
+    wasm_push_s32(sec_elem, 1)
+    sec_elem.push(0x0B)
+    wasm_push_u32(sec_elem, ctx.fn_table_list.length())
+    let mut ti = 0
+    while ti < ctx.fn_table_list.length() {
+      let tname = ctx.fn_table_list[ti]
+      let fidx = match ctx.internal_map.get(tname) {
+        Some(k) => k
+        None =>
+          match ctx.import_map.get(tname) {
+            Some(k) => k
+            None => 0
+          }
+      }
+      wasm_push_u32(sec_elem, fidx)
+      ti = ti + 1
+    }
+    wasm_push_section(out, 9, sec_elem)
+  }
+
+  // Section 10: Code Section
+  if code_bodies.length() > 0 {
+    let sec_code : Array[Int] = []
+    wasm_push_u32(sec_code, code_bodies.length())
+    fi = 0
+    while fi < code_bodies.length() {
+      wasm_push_u32(sec_code, code_bodies[fi].length())
+      wasm_push_bytes(sec_code, code_bodies[fi])
+      fi = fi + 1
+    }
+    wasm_push_section(out, 10, sec_code)
+  }
+
+  // Section 11: Data Section
+  if data_bytes.length() > 0 {
+    let sec_data : Array[Int] = []
+    wasm_push_u32(sec_data, 1)
+    sec_data.push(0x00) // mem 0 active
+    sec_data.push(0x41) // i32.const WASM_DATA_BASE
+    wasm_push_s32(sec_data, WASM_DATA_BASE)
+    sec_data.push(0x0B)
+    wasm_push_u32(sec_data, data_bytes.length())
+    wasm_push_bytes(sec_data, data_bytes)
+    wasm_push_section(out, 11, sec_data)
+  }
+
+  wasm_int_array_to_bytes(out)
+}
