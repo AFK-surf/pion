@@ -106,6 +106,35 @@ fn ListPlace::on_sight[K](self : ListPlace[K], s : Sight[Int], sl : SliceIds) ->
   apply_sight(s, fn(cur) { cur.keyed(ids, sl) })
 }
 
+fn find_opt_int(xs : Array[Int], target : Int) -> Option[Int] {
+  let mut i = 0
+  while i < xs.length() {
+    if xs[i] == target {
+      return Some(i)
+    }
+    i += 1
+  }
+  None
+}
+
+fn find_opt_str(xs : Array[String], target : String) -> Option[String] {
+  let mut i = 0
+  while i < xs.length() {
+    if xs[i] == target {
+      return Some(xs[i] + "!")
+    }
+    i += 1
+  }
+  None
+}
+
+fn take_opt_str(x : Option[String]) -> Int {
+  match x {
+    Some(s) => s.length()
+    None => 7
+  }
+}
+
 struct CellI {
   mut v : Int
 }
@@ -184,6 +213,31 @@ pub fn main(world : World) -> Int {
   let lp_int = ListPlace::{ ids: ListKeys::{ keys: [100, 200, 300] } }
   let res_int = lp_int.on_sight(Sight::{ item: 0 }, SliceIds::{ off: 2 })
   debug_assert(res_int.item == 300, "bug16b Sight::keyed Int")
+
+  // Bug #17: unannotated `let mut x = None` inferred via later assignment / call arg
+  let order : Array[Int] = [10, 20, 30, 40]
+  let mut before = None
+  let mut p = 2
+  while p >= 0 && before.is_none() {
+    before = find_opt_int(order, order[p])
+    p = p - 1
+  }
+  let before_next = match before {
+    Some(i) => i + 1
+    None => 0
+  }
+  debug_assert(before_next == 3, "bug17 Option[Int] match i + 1")
+
+  let mut found_s = None
+  found_s = find_opt_str(["aa", "bb"], "bb")
+  let got_bb = match found_s {
+    Some(s) => s
+    None => ""
+  }
+  debug_assert(got_bb == "bb!", "bug17 Option[String] assign")
+
+  let pass_none = None
+  debug_assert(take_opt_str(pass_none) == 7, "bug17 let x = None; take_opt(x)")
 
   io_println(world, "p30c_generic_infer ok")
   0
