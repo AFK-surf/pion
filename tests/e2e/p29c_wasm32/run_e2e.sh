@@ -180,4 +180,59 @@ verify_wasm_bench binarytrees "stretch=262143 long=131071 total=14592688"
 verify_wasm_bench fannkuchredux "73196 38"
 verify_wasm_bench hashmap_str "200000 208681440 205599 815496841"
 
+echo "=== P29-C [6/6] Multi-Package Closure call_indirect Isolation Regression ==="
+MP_DIR="$TMP_DIR/mp_clo"
+mkdir -p "$MP_DIR/pkg_a/src" "$MP_DIR/pkg_b/src" "$MP_DIR/app/src"
+cat > "$MP_DIR/pkg_a/pion.toml" <<'EOF'
+[package]
+name = "pkg_a"
+version = "0.1.0"
+EOF
+cat > "$MP_DIR/pkg_a/src/lib.pion" <<'EOF'
+pub fn make_unary(k : Int) -> (Int) -> Int {
+  fn(x : Int) -> Int { x + k }
+}
+pub fn label() -> String { "pkg_a_ok" }
+EOF
+cat > "$MP_DIR/pkg_b/pion.toml" <<'EOF'
+[package]
+name = "pkg_b"
+version = "0.1.0"
+EOF
+cat > "$MP_DIR/pkg_b/src/lib.pion" <<'EOF'
+pub fn make_binary(scale : Int) -> (Int, Int) -> Int {
+  fn(a : Int, b : Int) -> Int { (a + b) * scale }
+}
+pub fn label() -> String { "pkg_b_ok" }
+EOF
+cat > "$MP_DIR/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+pkg_a = { path = "../pkg_a" }
+pkg_b = { path = "../pkg_b" }
+EOF
+cat > "$MP_DIR/app/src/main.pion" <<'EOF'
+import "pkg_a"
+import "pkg_b"
+
+pub fn main(world : World) -> Int {
+  let f1 = pkg_a::make_unary(10)
+  let f2 = pkg_b::make_binary(3)
+  let r = f1(5) + f2(4, 5)
+  io_println(world, pkg_a::label() + ":" + pkg_b::label() + ":" + r.to_string())
+  0
+}
+EOF
+MP_WASM="$TMP_DIR/mp_clo.wasm"
+"$PIONC" build --release --target wasm32 -o "$MP_WASM" "$MP_DIR/app"
+MP_OUT=$(node "$PION_WASM_RT" "$MP_WASM")
+echo "  mp_clo (wasm32) -> '$MP_OUT'"
+if [ "$MP_OUT" != "pkg_a_ok:pkg_b_ok:42" ]; then
+  echo "FAIL: mp_clo wasm32 output mismatch: '$MP_OUT'" >&2
+  exit 1
+fi
+
 echo "p29c_wasm32 E2E: OK"

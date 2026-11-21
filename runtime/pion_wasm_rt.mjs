@@ -236,24 +236,11 @@ export function createPionRuntime(options = {}) {
     }
   }
 
-  function pion_rc_dec(obj) {
+  function pion_rc_dec_slow(obj) {
     const p = pNum(obj);
     if (p === 0) return;
     syncViews();
     const hdr = p - HEADER_SIZE;
-    const flags = dv.getUint16(hdr + 14, true);
-    if ((flags & FLAG_IMMORTAL) !== 0) return;
-    const tid = dv.getUint32(hdr + 0, true);
-    let rc;
-    if (tid === 0) {
-      rc = (dv.getUint32(hdr + 8, true) - 1) >>> 0;
-      dv.setUint32(hdr + 8, rc, true);
-    } else {
-      rc = (dv.getUint32(hdr + 4, true) - 1) >>> 0;
-      dv.setUint32(hdr + 4, rc, true);
-    }
-    if (rc !== 0) return;
-
     const dropIdx = Number(dv.getBigInt64(hdr + 16, true));
     const tag = dv.getUint16(hdr + 12, true);
     if (dropIdx !== 0 && exportsObj && exportsObj.__indirect_function_table) {
@@ -315,6 +302,26 @@ export function createPionRuntime(options = {}) {
       }
     }
     rawFree(hdr);
+  }
+
+  function pion_rc_dec(obj) {
+    const p = pNum(obj);
+    if (p === 0) return;
+    syncViews();
+    const hdr = p - HEADER_SIZE;
+    const flags = dv.getUint16(hdr + 14, true);
+    if ((flags & FLAG_IMMORTAL) !== 0) return;
+    const tid = dv.getUint32(hdr + 0, true);
+    let rc;
+    if (tid === 0) {
+      rc = (dv.getUint32(hdr + 8, true) - 1) >>> 0;
+      dv.setUint32(hdr + 8, rc, true);
+    } else {
+      rc = (dv.getUint32(hdr + 4, true) - 1) >>> 0;
+      dv.setUint32(hdr + 4, rc, true);
+    }
+    if (rc !== 0) return;
+    pion_rc_dec_slow(obj);
   }
 
   function pion_rc_freeze(obj) {
@@ -1603,7 +1610,7 @@ export function createPionRuntime(options = {}) {
   const imports = {
     pion_rt: {
       pion_cur_tid, pion_alloc, pion_alloc_uninit,
-      pion_rc_inc, pion_rc_dec, pion_rc_freeze, pion_rc_immortalize,
+      pion_rc_inc, pion_rc_dec, pion_rc_dec_slow, pion_rc_freeze, pion_rc_immortalize,
       pion_panic, pion_panic_oob, pion_debug_assert,
 
       // Math & C libm functions emitted directly by qbe.pion
