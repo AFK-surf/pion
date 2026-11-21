@@ -3088,3 +3088,107 @@ test "p30e_float_double_mod_fmod" {
   let f1 : Float = 7.5f % 2.0f
   assert_true(f1 == 1.5f, "7.5f % 2.0f == 1.5f")
 }
+
+///|
+test "p30h_cross_pkg_generic_mutex_channel_deep_freeze" {
+  let ui_src =
+    #|pub struct EventQueue[Ev] {
+    #|  q : Mutex[Array[Ev]]
+    #|}
+    #|pub fn EventQueue::new[Ev]() -> EventQueue[Ev] {
+    #|  EventQueue::{ q: Mutex::new([]) }
+    #|}
+    #|pub fn EventQueue::emit[Ev](self : EventQueue[Ev], ev : Ev) -> Unit {
+    #|  self.q.with_lock(fn(q) { q.push(ev) })
+    #|}
+    #|pub fn EventQueue::drain[Ev](self : EventQueue[Ev]) -> Array[Ev] {
+    #|  let batch : Array[Ev] = []
+    #|  self.q.with_lock(fn(q) {
+    #|    let mut i = 0
+    #|    while i < q.length() {
+    #|      batch.push(q[i])
+    #|      i = i + 1
+    #|    }
+    #|    q.clear()
+    #|  })
+    #|  batch
+    #|}
+    #|pub struct WorkerCtx[Cmd, Ev] {
+    #|  events : EventQueue[Ev]
+    #|}
+    #|pub fn WorkerCtx::emit[Cmd, Ev](self : WorkerCtx[Cmd, Ev], ev : Ev) -> Unit {
+    #|  self.events.emit(ev)
+    #|}
+    #|pub struct Worker[Cmd, Ev] {
+    #|  ch : Channel[Cmd]
+    #|  events : EventQueue[Ev]
+    #|}
+    #|pub fn Worker::new[Cmd, Ev](events : EventQueue[Ev]) -> Worker[Cmd, Ev] {
+    #|  Worker::{ ch: Channel::new(16), events: events }
+    #|}
+    #|pub fn Worker::send[Cmd, Ev](self : Worker[Cmd, Ev], cmd : Cmd) -> Bool {
+    #|  self.ch.send(move cmd)
+    #|}
+    #|pub fn Worker::ctx[Cmd, Ev](self : Worker[Cmd, Ev]) -> WorkerCtx[Cmd, Ev] {
+    #|  WorkerCtx::{ events: self.events }
+    #|}
+  let ui_cr = check_source_files_full("ui", ["lib.pion"], [ui_src])
+  assert_true(
+    ui_cr.diagnostics.length() == 0,
+    check_result_to_json(ui_cr.diagnostics),
+  )
+
+  let app_src =
+    #|import "ui"
+    #|enum Cmd {
+    #|  Run(Int, String)
+    #|}
+    #|enum Ev {
+    #|  JobDone(Int, String)
+    #|}
+    #|pub fn drive() -> Int {
+    #|  let eq : ui::EventQueue[Ev] = ui::EventQueue::new()
+    #|  let w : ui::Worker[Cmd, Ev] = ui::Worker::new(eq)
+    #|  let ctx : ui::WorkerCtx[Cmd, Ev] = w.ctx()
+    #|  let _ = w.send(Cmd::Run(1, "hello"))
+    #|  ctx.emit(Ev::JobDone(1, "world"))
+    #|  eq.emit(Ev::JobDone(2, "again"))
+    #|  let batch = eq.drain()
+    #|  batch.length()
+    #|}
+  let imported = [imported_pkg_new("ui", ui_cr.tc)]
+  let app_cr = check_source_files_with_imports("app", ["main.pion"], [app_src], imported, true)
+  assert_true(
+    app_cr.diagnostics.length() == 0,
+    check_result_to_json(app_cr.diagnostics),
+  )
+  let app_ssa = emit_qbe_package_multi(app_cr.pkg, app_cr.tc, false, false, ["ui"]).ssa
+
+  // 1. Cross-pkg EventQueue::emit, WorkerCtx::emit, Worker::send must monomorphize
+  assert_true(app_ssa.contains("EventQueue__emit__mono_Ev("), app_ssa)
+  assert_true(app_ssa.contains("WorkerCtx__emit__mono_Cmd_Ev("), app_ssa)
+  assert_true(app_ssa.contains("Worker__send__mono_Cmd_Ev("), app_ssa)
+
+  // 2. Monomorphized Worker::send must call $pion_freeze_en_Cmd (not shallow $pion_rc_freeze)
+  let ws_s = p18_find_from(app_ssa, "function l $pion_pkg_ui_m_Worker__send__mono_Cmd_Ev(", 0)
+  let ws_e = p18_find_from(app_ssa, "\n}", ws_s)
+  assert_true(ws_s >= 0 && ws_e > ws_s, app_ssa)
+  let ws_fz = p18_find_from(app_ssa, "call $pion_freeze_en_Cmd(", ws_s)
+  assert_true(ws_fz > ws_s && ws_fz < ws_e, app_ssa)
+
+  // 3. Monomorphized EventQueue::emit's closure must call $pion_freeze_en_Ev (deep freeze)
+  assert_true(app_ssa.contains("call $pion_freeze_en_Ev("), app_ssa)
+
+  // 4. Generated $pion_freeze_en_Cmd and $pion_freeze_en_Ev must recursively freeze String fields
+  let fc_s = p18_find_from(app_ssa, "function $pion_freeze_en_Cmd(", 0)
+  let fc_e = p18_find_from(app_ssa, "\n}", fc_s)
+  assert_true(fc_s >= 0 && fc_e > fc_s, app_ssa)
+  let fc_rc = p18_find_from(app_ssa, "call $pion_rc_freeze(l %v", fc_s)
+  assert_true(fc_rc > fc_s && fc_rc < fc_e, app_ssa)
+
+  let fe_s = p18_find_from(app_ssa, "function $pion_freeze_en_Ev(", 0)
+  let fe_e = p18_find_from(app_ssa, "\n}", fe_s)
+  assert_true(fe_s >= 0 && fe_e > fe_s, app_ssa)
+  let fe_rc = p18_find_from(app_ssa, "call $pion_rc_freeze(l %v", fe_s)
+  assert_true(fe_rc > fe_s && fe_rc < fe_e, app_ssa)
+}

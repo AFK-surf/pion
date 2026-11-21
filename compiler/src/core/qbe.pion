@@ -1845,6 +1845,504 @@ fn qbe_fn_uses_option(g : QbeGen, finfo : FnInfo, mpkg : String) -> Bool {
 }
 
 ///|
+fn qbe_ty_needs_deep_freeze(g : QbeGen, raw_ty : Ty, depth : Int) -> Bool {
+  if depth > 12 {
+    return false
+  }
+  let ty = subst_ty(raw_ty, g.cur_type_subst)
+  match ty {
+    TDynTrait(_) => true
+    TOption(inner) =>
+      if qbe_is_niche_opt_inner(inner) {
+        qbe_ty_needs_deep_freeze(g, inner, depth + 1)
+      } else {
+        qbe_is_obj_ty(inner)
+      }
+    TResult(ok_ty, err_ty) => qbe_is_obj_ty(ok_ty) || qbe_is_obj_ty(err_ty)
+    TTuple(elems) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_is_obj_ty(elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TStruct(sname, sargs) =>
+      match qbe_lookup_struct_info(g, sname) {
+        Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            let fty = subst_ty(sinfo.field_tys[fi], subst)
+            if qbe_is_obj_ty(fty) {
+              return true
+            }
+            fi = fi + 1
+          }
+          false
+        }
+        None => false
+      }
+    TEnum(ename, eargs) =>
+      match qbe_lookup_enum_info(g, ename) {
+        Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              let fty = subst_ty(v.field_tys[fi], subst)
+              if qbe_is_obj_ty(fty) {
+                return true
+              }
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          false
+        }
+        None => false
+      }
+    TArray(elem) | TFixedArray(elem) => qbe_is_obj_ty(elem)
+    TMap(_, vty) => qbe_is_obj_ty(vty)
+    _ => false
+  }
+}
+
+///|
+fn qbe_ty_has_sync_or_container(g : QbeGen, ty : Ty, depth : Int) -> Bool {
+  if depth > 12 {
+    return false
+  }
+  match ty {
+    TMutex(_) | TChannel(_) | TArray(_) | TFixedArray(_) | TMap(_, _) => true
+    TOption(e) => qbe_ty_has_sync_or_container(g, e, depth + 1)
+    TResult(a, b) =>
+      qbe_ty_has_sync_or_container(g, a, depth + 1) ||
+      qbe_ty_has_sync_or_container(g, b, depth + 1)
+    TTuple(elems) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_ty_has_sync_or_container(g, elems[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, r) => {
+      if qbe_ty_has_sync_or_container(g, r, depth + 1) {
+        return true
+      }
+      let mut i = 0
+      while i < ps.length() {
+        if qbe_ty_has_sync_or_container(g, ps[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TStruct(sname, sargs) => {
+      let mut i = 0
+      while i < sargs.length() {
+        if qbe_ty_has_sync_or_container(g, sargs[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      match qbe_lookup_struct_info(g, sname) {
+        Some(sinfo) => {
+          let qp = split_qual_name(sname)
+          let saved_pkg = g.mono_pkg
+          if qp.prefix != "" {
+            g.mono_pkg = qp.prefix
+          }
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            if qbe_ty_has_sync_or_container(g, sinfo.field_tys[fi], depth + 1) {
+              g.mono_pkg = saved_pkg
+              return true
+            }
+            fi = fi + 1
+          }
+          g.mono_pkg = saved_pkg
+        }
+        None => ()
+      }
+      false
+    }
+    TEnum(ename, eargs) => {
+      let mut i = 0
+      while i < eargs.length() {
+        if qbe_ty_has_sync_or_container(g, eargs[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      match qbe_lookup_enum_info(g, ename) {
+        Some(einfo) => {
+          let qp = split_qual_name(ename)
+          let saved_pkg = g.mono_pkg
+          if qp.prefix != "" {
+            g.mono_pkg = qp.prefix
+          }
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              if qbe_ty_has_sync_or_container(g, v.field_tys[fi], depth + 1) {
+                g.mono_pkg = saved_pkg
+                return true
+              }
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          g.mono_pkg = saved_pkg
+        }
+        None => ()
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn qbe_type_expr_has_sync_or_container(
+  g : QbeGen,
+  te : TypeExpr,
+  depth : Int,
+) -> Bool {
+  if depth > 12 {
+    return false
+  }
+  match te {
+    TyName(name, args, _) => {
+      if name == "Mutex" ||
+        name == "Channel" ||
+        name == "Array" ||
+        name == "FixedArray" ||
+        name == "Map" {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_type_expr_has_sync_or_container(g, args[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      match qbe_lookup_struct_info(g, name) {
+        Some(sinfo) => {
+          let qp = split_qual_name(name)
+          let saved_pkg = g.mono_pkg
+          if qp.prefix != "" {
+            g.mono_pkg = qp.prefix
+          }
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            if qbe_ty_has_sync_or_container(g, sinfo.field_tys[fi], depth + 1) {
+              g.mono_pkg = saved_pkg
+              return true
+            }
+            fi = fi + 1
+          }
+          g.mono_pkg = saved_pkg
+        }
+        None => ()
+      }
+      match qbe_lookup_enum_info(g, name) {
+        Some(einfo) => {
+          let qp = split_qual_name(name)
+          let saved_pkg = g.mono_pkg
+          if qp.prefix != "" {
+            g.mono_pkg = qp.prefix
+          }
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              if qbe_ty_has_sync_or_container(g, v.field_tys[fi], depth + 1) {
+                g.mono_pkg = saved_pkg
+                return true
+              }
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          g.mono_pkg = saved_pkg
+        }
+        None => ()
+      }
+      false
+    }
+    TyTuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_type_expr_has_sync_or_container(g, elems[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TyFn(ps, r, _) => {
+      if qbe_type_expr_has_sync_or_container(g, r, depth + 1) {
+        return true
+      }
+      let mut i = 0
+      while i < ps.length() {
+        if qbe_type_expr_has_sync_or_container(g, ps[i], depth + 1) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn qbe_expr_has_sync_or_container(g : QbeGen, depth : Int, e : Expr) -> Bool {
+  if depth > 16 {
+    return false
+  }
+  match e {
+    EScope(_, _, _) | ESpawn(_, _, _) => true
+    EPath(qual, _, _) => qual == "Mutex" || qual == "Channel"
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EUnit(_) => false
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | ETry(inner, _)
+    | EField(inner, _, _)
+    | ENamedArg(_, _, inner, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, inner)
+    EAs(inner, ty, _) =>
+      qbe_type_expr_has_sync_or_container(g, ty, 0) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, inner)
+    EBinary(_, l, r, _) | EIndex(l, r, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, l) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, r)
+    ECall(callee, args, _) => {
+      if qbe_expr_has_sync_or_container(g, depth + 1, callee) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_sync_or_container(g, depth + 1, args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EMethodCall(obj, mname, args, _) => {
+      if mname == "push" ||
+        mname == "set" ||
+        mname == "send" ||
+        mname == "with_lock" {
+        return true
+      }
+      if qbe_expr_has_sync_or_container(g, depth + 1, obj) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_sync_or_container(g, depth + 1, args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_expr_has_sync_or_container(g, depth + 1, elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(b) =>
+          if qbe_expr_has_sync_or_container(g, depth + 1, b) {
+            return true
+          }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_expr_has_sync_or_container(g, depth + 1, fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) => qbe_stmts_have_sync_or_container(g, depth + 1, stmts)
+    EIf(cond, then_s, else_opt, _) => {
+      if qbe_expr_has_sync_or_container(g, depth + 1, cond) ||
+        qbe_stmts_have_sync_or_container(g, depth + 1, then_s) {
+        return true
+      }
+      match else_opt {
+        Some(ee) => qbe_expr_has_sync_or_container(g, depth + 1, ee)
+        None => false
+      }
+    }
+    EIs(scrut, _, _) => qbe_expr_has_sync_or_container(g, depth + 1, scrut)
+    EMatch(scrut, arms, _) => {
+      if qbe_expr_has_sync_or_container(g, depth + 1, scrut) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_sync_or_container(g, depth + 1, ge) {
+              return true
+            }
+          None => ()
+        }
+        if qbe_expr_has_sync_or_container(g, depth + 1, arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EClosure(ps, rty, body, _) => {
+      if qbe_type_expr_has_sync_or_container(g, rty, 0) {
+        return true
+      }
+      let mut i = 0
+      while i < ps.length() {
+        if qbe_type_expr_has_sync_or_container(g, ps[i].ty, 0) {
+          return true
+        }
+        i = i + 1
+      }
+      qbe_stmts_have_sync_or_container(g, depth + 1, body)
+    }
+  }
+}
+
+///|
+fn qbe_stmt_has_sync_or_container(g : QbeGen, depth : Int, st : Stmt) -> Bool {
+  if depth > 16 {
+    return false
+  }
+  match st {
+    SLet(_, _, ty, init, _) | SLetTuple(_, ty, init, _) =>
+      qbe_type_expr_has_sync_or_container(g, ty, 0) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, init)
+    SAssign(l, r, _) | SCompoundAssign(_, l, r, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, l) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, r)
+    SWhile(c, body, _) | SGuard(c, body, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, c) ||
+      qbe_stmts_have_sync_or_container(g, depth + 1, body)
+    SFor(init, c, step, body, _) =>
+      qbe_stmt_has_sync_or_container(g, depth + 1, init) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, c) ||
+      qbe_stmt_has_sync_or_container(g, depth + 1, step) ||
+      qbe_stmts_have_sync_or_container(g, depth + 1, body)
+    SForRange(_, a, b, _, body, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, a) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, b) ||
+      qbe_stmts_have_sync_or_container(g, depth + 1, body)
+    SForIn(_, _, it, body, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, it) ||
+      qbe_stmts_have_sync_or_container(g, depth + 1, body)
+    SReturn(ro, _) =>
+      match ro {
+        Some(re) => qbe_expr_has_sync_or_container(g, depth + 1, re)
+        None => false
+      }
+    SBreak(_) | SContinue(_) => false
+    SDebugAssert(c, m, _) =>
+      qbe_expr_has_sync_or_container(g, depth + 1, c) ||
+      qbe_expr_has_sync_or_container(g, depth + 1, m)
+    SExpr(e, _) => qbe_expr_has_sync_or_container(g, depth + 1, e)
+  }
+}
+
+///|
+fn qbe_stmts_have_sync_or_container(
+  g : QbeGen,
+  depth : Int,
+  stmts : Array[Stmt],
+) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if qbe_stmt_has_sync_or_container(g, depth, stmts[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn qbe_fn_uses_sync_or_container(
+  g : QbeGen,
+  finfo : FnInfo,
+  mpkg : String,
+) -> Bool {
+  let fd = finfo.decl
+  let saved_pkg = g.mono_pkg
+  if mpkg != "" {
+    g.mono_pkg = mpkg
+  }
+  if qbe_ty_has_sync_or_container(g, finfo.ret_ty, 0) ||
+    qbe_type_expr_has_sync_or_container(g, fd.ret_ty, 0) {
+    g.mono_pkg = saved_pkg
+    return true
+  }
+  let mut i = 0
+  while i < finfo.param_tys.length() {
+    if qbe_ty_has_sync_or_container(g, finfo.param_tys[i], 0) {
+      g.mono_pkg = saved_pkg
+      return true
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < fd.params.length() {
+    if qbe_type_expr_has_sync_or_container(g, fd.params[i].ty, 0) {
+      g.mono_pkg = saved_pkg
+      return true
+    }
+    i = i + 1
+  }
+  let body_has = qbe_stmts_have_sync_or_container(g, 0, fd.body)
+  g.mono_pkg = saved_pkg
+  body_has
+}
+
+///|
 fn qbe_call_needs_mono(
   g : QbeGen,
   finfo : FnInfo,
@@ -1869,7 +2367,23 @@ fn qbe_call_needs_mono(
     }
     i = i + 1
   }
-  qbe_stmts_have_eq(g, 0, fd.body) || qbe_fn_uses_option(g, finfo, mpkg)
+  if qbe_stmts_have_eq(g, 0, fd.body) || qbe_fn_uses_option(g, finfo, mpkg) {
+    return true
+  }
+  let mut has_deep = false
+  i = 0
+  while i < fd.type_params.length() {
+    match subst.get(fd.type_params[i]) {
+      Some(t) =>
+        if qbe_ty_needs_deep_freeze(g, t, 0) {
+          has_deep = true
+          break
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  has_deep && qbe_fn_uses_sync_or_container(g, finfo, mpkg)
 }
 
 ///|
@@ -7495,9 +8009,10 @@ fn qbe_emit_adopt_if_frozen(
   g : QbeGen,
   container : String,
   val_l : String,
-  elem : Ty,
+  raw_elem : Ty,
   deep_only : Bool,
 ) -> Unit {
+  let elem = subst_ty(raw_elem, g.cur_type_subst)
   if !qbe_is_obj_ty(elem) {
     return
   }
@@ -9266,10 +9781,10 @@ fn qbe_emit_closure_obj(
       }
       _ => qbe_resolve_type(g, params[pi].ty)
     }
-    ptys.push(pty)
+    ptys.push(subst_ty(pty, g.cur_type_subst))
     pi = pi + 1
   }
-  let ret_ty = match ret_te {
+  let raw_ret_ty = match ret_te {
     TyMissing(_) => {
       let mut chosen = TError
       match expected {
@@ -9306,6 +9821,7 @@ fn qbe_emit_closure_obj(
     }
     _ => qbe_resolve_type(g, ret_te)
   }
+  let ret_ty = subst_ty(raw_ret_ty, g.cur_type_subst)
 
   let cap_tparams : Array[String] = []
   let mut tpi = 0
@@ -11203,7 +11719,7 @@ fn qbe_emit_method_call(
         return qval("0", TUnit)
       }
       if method_name == "with_lock" {
-        let fv = qbe_emit_expr(g, args[0], None)
+        let fv = qbe_emit_expr(g, args[0], Some(TFn([elem], TError)))
         let cur_v = qbe_tmp(g)
         qbe_emit(g, cur_v + " =l call $pion_mutex_lock(l " + obj_val + ")")
         qbe_rc_inc(g, cur_v, elem)
