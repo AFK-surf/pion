@@ -2009,3 +2009,58 @@ test "p24a_bug6_generic_drop_fn" {
   let wp_e = p18_find_from(ssa, "\n}", wp_s)
   assert_true(p18_find_from(ssa, "$pion_drop_slots_1", wp_s) < wp_e, ssa)
 }
+
+///|
+test "p24a_probe_shadowing" {
+  let src =
+    #|pub enum MyVal {
+    #|  MArr(Array[String])
+    #|  MEmpty
+    #|}
+    #|pub fn shadow_match(x : MyVal) -> Int {
+    #|  let out = match x {
+    #|    MyVal::MArr(x) => x
+    #|    _ => []
+    #|  }
+    #|  out.push("k")
+    #|  let out2 = match x {
+    #|    MyVal::MEmpty => []
+    #|    MyVal::MArr(x) => x
+    #|  }
+    #|  out2.push("v")
+    #|  out.length() + out2.length()
+    #|}
+    #|pub fn shadow_block(cond : Bool) -> Int {
+    #|  let x = 123
+    #|  let out = if cond {
+    #|    []
+    #|  } else {
+    #|    let x : Array[String] = ["hi"]
+    #|    x
+    #|  }
+    #|  out.push("there")
+    #|  x + out.length()
+    #|}
+  let cr = @core.check_source_files_full("p24a_sh", ["p24a_sh.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    @core.check_result_to_json(cr.diagnostics),
+  )
+  let ssa = @core.emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  // shadow_match: both empty [] arms must emit pion_arr_new(l 0, w 1), never w 0
+  let sm_s = p18_find_from(ssa, "$pion_fn_shadow_match(", 0)
+  let sm_e = p18_find_from(ssa, "\n}", sm_s)
+  assert_true(sm_s >= 0 && sm_e > sm_s, ssa)
+  let sm_new0 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 0)", sm_s)
+  assert_true(sm_new0 < 0 || sm_new0 > sm_e, ssa)
+  let sm_new1 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 1)", sm_s)
+  assert_true(sm_new1 > sm_s && sm_new1 < sm_e, ssa)
+  // shadow_block: if cond { [] } else { let x : Array[String] = ["hi"]; x } emits w 1
+  let sb_s = p18_find_from(ssa, "$pion_fn_shadow_block(", 0)
+  let sb_e = p18_find_from(ssa, "\n}", sb_s)
+  assert_true(sb_s >= 0 && sb_e > sb_s, ssa)
+  let sb_new0 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 0)", sb_s)
+  assert_true(sb_new0 < 0 || sb_new0 > sb_e, ssa)
+  let sb_new1 = p18_find_from(ssa, "call $pion_arr_new(l 0, w 1)", sb_s)
+  assert_true(sb_new1 > sb_s && sb_new1 < sb_e, ssa)
+}

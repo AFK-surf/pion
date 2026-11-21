@@ -121,6 +121,12 @@ pub struct QbeFnWrapper {
 }
 
 ///|
+pub struct QbeProbeHints {
+  names : Array[String]
+  tys : Array[Ty]
+}
+
+///|
 pub struct QbeGen {
   tc : TypeChecker
   release : Bool
@@ -6281,7 +6287,7 @@ fn qbe_emit_int_dispatch(
   let mut res_ty : Option[Ty] = if is_void {
     None
   } else {
-    qbe_probe_switch_arms_ty(g, arms, default_expr_opt, expected)
+    qbe_probe_switch_arms_ty(g, arms, default_expr_opt, default_bind_name, expected)
   }
   let mut saw_untyped_none = false
   let mut all_term = true
@@ -9681,31 +9687,202 @@ fn qbe_peek_expr_ty(g : QbeGen, e : Expr) -> Option[Ty] {
 }
 
 ///|
+fn qbe_hints_new() -> QbeProbeHints {
+  QbeProbeHints::{ names: [], tys: [] }
+}
+
+///|
+fn qbe_hints_copy(h : QbeProbeHints) -> QbeProbeHints {
+  let names : Array[String] = []
+  let tys : Array[Ty] = []
+  let mut i = 0
+  while i < h.names.length() {
+    names.push(h.names[i])
+    tys.push(h.tys[i])
+    i = i + 1
+  }
+  QbeProbeHints::{ names: names, tys: tys }
+}
+
+///|
+fn qbe_hints_set(h : QbeProbeHints, name : String, ty : Ty) -> Unit {
+  if name == "" || name == "_" {
+    return
+  }
+  h.names.push(name)
+  h.tys.push(ty)
+}
+
+///|
+fn qbe_hints_get(h : QbeProbeHints, name : String) -> Option[Ty] {
+  let mut i = h.names.length() - 1
+  while i >= 0 {
+    if h.names[i] == name {
+      return Some(h.tys[i])
+    }
+    i = i - 1
+  }
+  None
+}
+
+///|
+fn qbe_bind_pat_probe_hints(
+  g : QbeGen,
+  pat : Pattern,
+  scrut_ty_opt : Option[Ty],
+  hints : QbeProbeHints,
+) -> Unit {
+  match pat {
+    PWild(_) | PBool(_, _) | PInt(_, _) | PString(_, _) | PChar(_, _) => ()
+    PIdent(name, _) =>
+      if name != "_" {
+        match scrut_ty_opt {
+          Some(t) =>
+            if !ty_has_unresolved(t) {
+              qbe_hints_set(hints, name, t)
+            } else {
+              qbe_hints_set(hints, name, TError)
+            }
+          None => qbe_hints_set(hints, name, TError)
+        }
+      }
+    PTuple(subs, _) =>
+      match scrut_ty_opt {
+        Some(TTuple(elems)) => {
+          let mut i = 0
+          while i < subs.length() {
+            let sub_ty : Option[Ty] = if i < elems.length() {
+              Some(elems[i])
+            } else {
+              None
+            }
+            qbe_bind_pat_probe_hints(g, subs[i], sub_ty, hints)
+            i = i + 1
+          }
+        }
+        _ => {
+          let mut i = 0
+          while i < subs.length() {
+            qbe_bind_pat_probe_hints(g, subs[i], None, hints)
+            i = i + 1
+          }
+        }
+      }
+    PVariant(_, vname, subs, _) => {
+      let field_tys : Array[Ty] = []
+      match scrut_ty_opt {
+        Some(TOption(inner)) =>
+          if vname == "Some" {
+            field_tys.push(inner)
+          }
+        Some(TResult(ok, err)) =>
+          if vname == "Ok" {
+            field_tys.push(ok)
+          } else {
+            field_tys.push(err)
+          }
+        Some(TEnum(ename, eargs)) =>
+          match g.tc.enums.get(ename) {
+            Some(einfo) => {
+              let subst = make_subst(einfo.decl.type_params, eargs)
+              let mut vi = 0
+              while vi < einfo.variants.length() {
+                let v = einfo.variants[vi]
+                if v.name == vname {
+                  let mut fi = 0
+                  while fi < v.field_tys.length() {
+                    field_tys.push(subst_ty(v.field_tys[fi], subst))
+                    fi = fi + 1
+                  }
+                  break
+                }
+                vi = vi + 1
+              }
+            }
+            None => ()
+          }
+        _ => ()
+      }
+      let mut fi = 0
+      while fi < subs.length() {
+        let sub_ty : Option[Ty] = if fi < field_tys.length() {
+          Some(field_tys[fi])
+        } else {
+          None
+        }
+        qbe_bind_pat_probe_hints(g, subs[fi], sub_ty, hints)
+        fi = fi + 1
+      }
+    }
+  }
+}
+
+///|
 fn qbe_probe_stmts_ty(g : QbeGen, stmts : Array[Stmt]) -> Option[Ty] {
+  qbe_probe_stmts_ty_with(g, stmts, qbe_hints_new())
+}
+
+///|
+fn qbe_probe_stmts_ty_with(
+  g : QbeGen,
+  stmts : Array[Stmt],
+  outer_hints : QbeProbeHints,
+) -> Option[Ty] {
   if stmts.length() == 0 {
     return None
   }
-  let local_hints : Map[String, Ty] = Map([])
+  let local_hints = qbe_hints_copy(outer_hints)
   let mut i = 0
   while i < stmts.length() - 1 {
     match stmts[i] {
       SLet(name, _, te, init, _) =>
+        if name != "_" {
+          let mut bound_ty = TError
+          match te {
+            TyMissing(_) =>
+              match qbe_probe_expr_ty_with(g, init, local_hints) {
+                Some(t) =>
+                  if !ty_has_unresolved(t) {
+                    bound_ty = t
+                  }
+                None => ()
+              }
+            _ => {
+              let t = qbe_resolve_type(g, te)
+              if !ty_has_unresolved(t) {
+                bound_ty = t
+              }
+            }
+          }
+          qbe_hints_set(local_hints, name, bound_ty)
+        }
+      SLetTuple(names, te, init, _) => {
+        let mut tup_elems : Array[Ty] = []
         match te {
           TyMissing(_) =>
             match qbe_probe_expr_ty_with(g, init, local_hints) {
-              Some(t) =>
-                if !ty_has_unresolved(t) {
-                  local_hints.set(name, t)
-                }
-              None => ()
+              Some(TTuple(es)) => tup_elems = es
+              _ => ()
             }
-          _ => {
-            let t = qbe_resolve_type(g, te)
-            if !ty_has_unresolved(t) {
-              local_hints.set(name, t)
+          _ =>
+            match qbe_resolve_type(g, te) {
+              TTuple(es) => tup_elems = es
+              _ => ()
             }
-          }
         }
+        let mut ni = 0
+        while ni < names.length() {
+          if names[ni] != "_" {
+            let bt = if ni < tup_elems.length() && !ty_has_unresolved(tup_elems[ni]) {
+              tup_elems[ni]
+            } else {
+              TError
+            }
+            qbe_hints_set(local_hints, names[ni], bt)
+          }
+          ni = ni + 1
+        }
+      }
       _ => ()
     }
     i = i + 1
@@ -9718,14 +9895,14 @@ fn qbe_probe_stmts_ty(g : QbeGen, stmts : Array[Stmt]) -> Option[Ty] {
 
 ///|
 fn qbe_probe_expr_ty(g : QbeGen, e : Expr) -> Option[Ty] {
-  qbe_probe_expr_ty_with(g, e, Map([]))
+  qbe_probe_expr_ty_with(g, e, qbe_hints_new())
 }
 
 ///|
 fn qbe_probe_expr_ty_with(
   g : QbeGen,
   e : Expr,
-  hints : Map[String, Ty],
+  hints : QbeProbeHints,
 ) -> Option[Ty] {
   match e {
     EInt(_, _) => Some(TInt)
@@ -9737,7 +9914,8 @@ fn qbe_probe_expr_ty_with(
     EString(_, _) | EInterp(_, _) => Some(TString)
     EUnit(_) => Some(TUnit)
     EIdent(name, _) =>
-      match hints.get(name) {
+      match qbe_hints_get(hints, name) {
+        Some(TError) => None
         Some(t) => Some(t)
         None =>
           match qbe_lookup_local(g, name) {
@@ -9801,9 +9979,9 @@ fn qbe_probe_expr_ty_with(
       } else {
         None
       }
-    EBlock(stmts, _) => qbe_probe_stmts_ty(g, stmts)
+    EBlock(stmts, _) => qbe_probe_stmts_ty_with(g, stmts, hints)
     EIf(_, then_stmts, Some(el), _) =>
-      match qbe_probe_stmts_ty(g, then_stmts) {
+      match qbe_probe_stmts_ty_with(g, then_stmts, hints) {
         Some(t) =>
           if !ty_has_unresolved(t) {
             Some(t)
@@ -9812,7 +9990,10 @@ fn qbe_probe_expr_ty_with(
           }
         None => qbe_probe_expr_ty_with(g, el, hints)
       }
-    EMatch(_, arms, _) => qbe_probe_arms_ty(g, arms, None)
+    EMatch(scrut, arms, _) => {
+      let scrut_ty_opt = qbe_probe_expr_ty_with(g, scrut, hints)
+      qbe_probe_arms_ty_with(g, arms, scrut_ty_opt, None, hints)
+    }
     ECall(callee, args, _) =>
       match callee {
         EIdent(name, _) =>
@@ -9907,7 +10088,19 @@ fn qbe_probe_expr_ty_with(
 fn qbe_probe_arms_ty(
   g : QbeGen,
   arms : Array[MatchArm],
+  scrut_ty_opt : Option[Ty],
   expected : Option[Ty],
+) -> Option[Ty] {
+  qbe_probe_arms_ty_with(g, arms, scrut_ty_opt, expected, qbe_hints_new())
+}
+
+///|
+fn qbe_probe_arms_ty_with(
+  g : QbeGen,
+  arms : Array[MatchArm],
+  scrut_ty_opt : Option[Ty],
+  expected : Option[Ty],
+  outer_hints : QbeProbeHints,
 ) -> Option[Ty] {
   match expected {
     Some(et) =>
@@ -9918,7 +10111,9 @@ fn qbe_probe_arms_ty(
   }
   let mut i = 0
   while i < arms.length() {
-    match qbe_probe_expr_ty(g, arms[i].body) {
+    let arm_hints = qbe_hints_copy(outer_hints)
+    qbe_bind_pat_probe_hints(g, arms[i].pat, scrut_ty_opt, arm_hints)
+    match qbe_probe_expr_ty_with(g, arms[i].body, arm_hints) {
       Some(t) =>
         if !ty_has_unresolved(t) {
           return Some(t)
@@ -9935,6 +10130,7 @@ fn qbe_probe_switch_arms_ty(
   g : QbeGen,
   arms : Array[QbeSwitchArm],
   default_expr_opt : Option[Expr],
+  default_bind_name : String,
   expected : Option[Ty],
 ) -> Option[Ty] {
   match expected {
@@ -9944,11 +10140,12 @@ fn qbe_probe_switch_arms_ty(
       }
     None => ()
   }
+  let base_hints = qbe_hints_new()
   let mut i = 0
   while i < arms.length() {
     let probed = match arms[i].expr_opt {
-      Some(e) => qbe_probe_expr_ty(g, e)
-      None => qbe_probe_stmts_ty(g, arms[i].stmts)
+      Some(e) => qbe_probe_expr_ty_with(g, e, base_hints)
+      None => qbe_probe_stmts_ty_with(g, arms[i].stmts, base_hints)
     }
     match probed {
       Some(t) =>
@@ -9960,14 +10157,19 @@ fn qbe_probe_switch_arms_ty(
     i = i + 1
   }
   match default_expr_opt {
-    Some(de) =>
-      match qbe_probe_expr_ty(g, de) {
+    Some(de) => {
+      let def_hints = qbe_hints_copy(base_hints)
+      if default_bind_name != "" && default_bind_name != "_" {
+        qbe_hints_set(def_hints, default_bind_name, TInt)
+      }
+      match qbe_probe_expr_ty_with(g, de, def_hints) {
         Some(t) =>
           if !ty_has_unresolved(t) {
             return Some(t)
           }
         None => ()
       }
+    }
     None => ()
   }
   expected
@@ -10101,7 +10303,12 @@ fn qbe_try_emit_map_get_match(
       let l_end = qbe_lbl(g, "mget_end")
       qbe_emit_term(g, "jnz " + hw + ", " + l_hit + ", " + l_miss)
       let mut res_slot = ""
-      let mut res_ty : Option[Ty] = qbe_probe_arms_ty(g, arms, expected)
+      let mut res_ty : Option[Ty] = qbe_probe_arms_ty(
+        g,
+        arms,
+        Some(TOption(vty)),
+        expected,
+      )
       let mut saw_untyped_none = false
       qbe_emit_lbl(g, l_hit)
       qbe_scope_push(g)
@@ -13115,7 +13322,12 @@ fn qbe_emit_expr_inner(
                   }
                   qbe_emit_term(g, sb.to_string())
                   let mut res_slot = ""
-                  let mut res_ty : Option[Ty] = qbe_probe_arms_ty(g, arms, expected)
+                  let mut res_ty : Option[Ty] = qbe_probe_arms_ty(
+                    g,
+                    arms,
+                    Some(sv.ty),
+                    expected,
+                  )
                   let mut saw_untyped_none = false
                   k = 0
                   while k < var_tags.length() {
@@ -13252,7 +13464,12 @@ fn qbe_emit_expr_inner(
       }
       let mut res_slot = ""
       let l_end = qbe_lbl(g, "match_end")
-      let mut res_ty : Option[Ty] = qbe_probe_arms_ty(g, arms, expected)
+      let mut res_ty : Option[Ty] = qbe_probe_arms_ty(
+        g,
+        arms,
+        Some(sv.ty),
+        expected,
+      )
       let mut saw_untyped_none = false
       let mut i = 0
       while i < arms.length() {
