@@ -199,24 +199,31 @@ PION_MINSIZE double pion_math_pow(double x, double y) {
 #define PION_SLAB_CLASSES      16u
 #define PION_SLAB_MAX_TOTAL    1024u
 #define PION_SLAB_MAX_PAYLOAD  (PION_SLAB_MAX_TOTAL - (uint32_t)sizeof(PionHeader))
-#define PION_SLAB_CHUNK_BYTES  65536u
+#define PION_SLAB_CHUNK_BYTES  262144u
 #define PION_SLAB_REMOTE_BATCH 32u
 
-/* 4-tier per-thread medium-block cache (2K / 4K / 8K / 16K, max 8 blocks per tier).
- * Uses unused high bits of PionHeader.flags (bit 8 = flag, bits 9..10 = tier 0..3). */
+/* 6-tier per-thread medium-block cache (2K / 4K / 8K / 16K / 32K / 64K).
+ * Tiers 0..3 (2K..16K) cache up to 16 blocks each; tiers 4..5 (32K/64K) cache up to 4 blocks each.
+ * Uses unused high bits of PionHeader.flags (bit 8 = flag, bits 9..11 = tier 0..5). */
 #define PION_FLAG_MED_CACHE     ((uint16_t)256u)
 #define PION_FLAG_MED_CLS_SHIFT 9u
-#define PION_FLAG_MED_CLS_MASK  ((uint16_t)3u)
-#define PION_MED_CLASSES        4u
-#define PION_MED_MAX_BYTES      16384u
+#define PION_FLAG_MED_CLS_MASK  ((uint16_t)7u)
+#define PION_MED_CLASSES        6u
+#define PION_MED_MAX_BYTES      65536u
 #define PION_MED_MAX_PAYLOAD    (PION_MED_MAX_BYTES - (uint32_t)sizeof(PionHeader))
-#define PION_MED_MAX_CACHE      8u
 
 static inline uint32_t pion_med_cls_for(size_t total) {
+#if defined(__clang__) || defined(__GNUC__)
+    if (total <= 2048u) return 0u;
+    return (uint32_t)(53 - __builtin_clzll((unsigned long long)(total - 1u)));
+#else
     if (total <= 2048u) return 0u;
     if (total <= 4096u) return 1u;
     if (total <= 8192u) return 2u;
-    return 3u;
+    if (total <= 16384u) return 3u;
+    if (total <= 32768u) return 4u;
+    return 5u;
+#endif
 }
 
 typedef struct PionSlabTLS {
@@ -373,13 +380,15 @@ static PION_NOINLINE PION_COLD PION_MINSIZE PionHeader *pion_slab_alloc_slow(Pio
 #endif
         tls_slab = s;
     }
-    void *remote = atomic_exchange_explicit(&g_slab_remote[cls], NULL, memory_order_acquire);
-    if (remote) {
-        s->local_free[cls] = pion_slab_get_next(remote);
-        return (PionHeader *)remote;
+    if (__builtin_expect(atomic_load_explicit(&g_pion_mt, memory_order_relaxed) != 0, 0)) {
+        void *remote = atomic_exchange_explicit(&g_slab_remote[cls], NULL, memory_order_acquire);
+        if (remote) {
+            s->local_free[cls] = pion_slab_get_next(remote);
+            return (PionHeader *)remote;
+        }
     }
     uint32_t slot_sz = pion_slab_sizes[cls];
-    if (__builtin_expect(!s->chunk_cur || (size_t)(s->chunk_end - s->chunk_cur) < slot_sz, 0)) {
+    if (__builtin_expect((uintptr_t)s->chunk_end - (uintptr_t)s->chunk_cur < slot_sz, 0)) {
         char *chunk = (char *)malloc(PION_SLAB_CHUNK_BYTES);
         if (__builtin_expect(!chunk, 0)) {
             pion_panic("out of memory", __FILE__, __LINE__);
@@ -431,7 +440,8 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_med_alloc(uint32_t mcls) 
 static PION_NOINLINE PION_COLD PION_MINSIZE void pion_med_free(void *ptr, uint32_t mcls, int is_frozen) {
     if (__builtin_expect(!is_frozen, 1)) {
         PionSlabTLS *s = pion_slab_cur();
-        if (__builtin_expect(s != NULL && s->med_count[mcls] < PION_MED_MAX_CACHE, 1)) {
+        uint8_t max_c = (mcls < 4u) ? 16u : 4u;
+        if (__builtin_expect(s != NULL && s->med_count[mcls] < max_c, 1)) {
             pion_slab_set_next(ptr, s->med_free[mcls]);
             s->med_free[mcls] = ptr;
             s->med_count[mcls]++;
@@ -445,18 +455,25 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_med_free(void *ptr, uint32
 
 static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_t bytes) {
 #if PION_USE_SLAB
+    int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
     if (bytes <= PION_SLAB_MAX_TOTAL) {
         uint32_t cls = pion_slab_cls_for(bytes);
-        PionSlabTLS *s = pion_slab_cur();
-        if (s != NULL) {
-            void *node = s->local_free[cls];
-            if (node != NULL) {
-                s->local_free[cls] = pion_slab_get_next(node);
-                return node;
+        if (__builtin_expect(!mt, 1)) {
+            uint32_t slot_sz = pion_slab_sizes[cls];
+            char *cur = g_main_slab.chunk_cur;
+            if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= slot_sz, 1)) {
+                g_main_slab.chunk_cur = cur + slot_sz;
+                return (void *)cur;
             }
-            return (void *)pion_slab_alloc_slow(s, cls);
+            return (void *)pion_slab_alloc_slow(&g_main_slab, cls);
         }
-        return (void *)pion_slab_alloc_slow(NULL, cls);
+        PionSlabTLS *s = tls_slab;
+        if (s != NULL && s->local_free[cls] != NULL) {
+            void *node = s->local_free[cls];
+            s->local_free[cls] = pion_slab_get_next(node);
+            return node;
+        }
+        return (void *)pion_slab_alloc_slow(s, cls);
     }
     if (bytes <= PION_MED_MAX_BYTES) {
         return pion_med_alloc(pion_med_cls_for(bytes));
@@ -509,7 +526,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_slab_raw_free_slow(void *p
     free(ptr);
 }
 
-static void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
+static PION_NOINLINE void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
     if (!ptr) return;
 #if PION_USE_SLAB
     if (__builtin_expect(
@@ -525,22 +542,32 @@ static void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
     pion_slab_raw_free_slow(ptr, bytes, is_frozen);
 }
 
-static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_alloc_uninit_slow(
+static PION_NOINLINE void *pion_alloc_uninit_slow(
     uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
     PionHeader *hdr;
     uint16_t flags = 0;
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
 #if PION_USE_SLAB
-    if (payload_size <= PION_SLAB_MAX_PAYLOAD) {
-        uint32_t total = (uint32_t)sizeof(PionHeader) + payload_size;
-        uint32_t cls = pion_slab_cls_for(total);
-        PionSlabTLS *s = mt ? tls_slab : &g_main_slab;
-        if (s != NULL && s->local_free[cls] != NULL) {
-            void *node = s->local_free[cls];
-            s->local_free[cls] = pion_slab_get_next(node);
-            hdr = (PionHeader *)node;
+    if (__builtin_expect(payload_size <= PION_SLAB_MAX_PAYLOAD, 1)) {
+        uint32_t cls = pion_slab_cls_for((uint32_t)sizeof(PionHeader) + payload_size);
+        if (__builtin_expect(!mt, 1)) {
+            uint32_t slot_sz = pion_slab_sizes[cls];
+            char *cur = g_main_slab.chunk_cur;
+            if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= slot_sz, 1)) {
+                g_main_slab.chunk_cur = cur + slot_sz;
+                hdr = (PionHeader *)cur;
+            } else {
+                hdr = pion_slab_alloc_slow(&g_main_slab, cls);
+            }
         } else {
-            hdr = pion_slab_alloc_slow(s, cls);
+            PionSlabTLS *s = tls_slab;
+            if (s != NULL && s->local_free[cls] != NULL) {
+                void *node = s->local_free[cls];
+                s->local_free[cls] = pion_slab_get_next(node);
+                hdr = (PionHeader *)node;
+            } else {
+                hdr = pion_slab_alloc_slow(s, cls);
+            }
         }
         flags = (uint16_t)(PION_FLAG_SLAB | (cls << PION_FLAG_SLAB_CLS_SHIFT));
     } else if (payload_size <= PION_MED_MAX_PAYLOAD) {
@@ -629,7 +656,7 @@ static PION_NOINLINE void pion_destroy_slow(PionHeader *hdr, void *obj) {
     free(hdr);
 }
 
-static PION_NOINLINE PION_HOT void pion_destroy(PionHeader *hdr, void *obj) {
+static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
 #if PION_USE_SLAB
     uint16_t flags = hdr->flags;
     if (__builtin_expect(
@@ -645,7 +672,7 @@ static PION_NOINLINE PION_HOT void pion_destroy(PionHeader *hdr, void *obj) {
     pion_destroy_slow(hdr, obj);
 }
 
-PION_HOT void pion_destroy_obj(void *obj) {
+void pion_destroy_obj(void *obj) {
     pion_destroy(pion_hdr(obj), obj);
 }
 
@@ -1523,7 +1550,7 @@ PION_HOT void pion_arr_push(void *a_ptr, int64_t val) {
     a->data[a->len++] = val;
 }
 
-PION_HOT void pion_arr_push_owned(void *a_ptr, int64_t val) {
+void pion_arr_push_owned(void *a_ptr, int64_t val) {
     PionArray *a = (PionArray *)a_ptr;
     if (__builtin_expect(a->len == a->cap, 0)) {
         pion_arr_grow(a);

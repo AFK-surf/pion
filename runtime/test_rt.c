@@ -1414,17 +1414,18 @@ static void med_frozen_worker(void *env) {
 }
 
 static void test_med_cache_and_mt_frozen(void) {
-    /* 1. Single-thread 4-tier medium-block object cache (2K / 4K / 8K / 16K) */
-    const uint32_t tiers[4] = { 1500u, 3000u, 7000u, 15000u };
-    for (int t = 0; t < 4; t++) {
+    /* 1. Single-thread 6-tier medium-block object cache (2K / 4K / 8K / 16K / 32K / 64K) */
+    const uint32_t tiers[6] = { 1500u, 3000u, 7000u, 15000u, 30000u, 60000u };
+    for (int t = 0; t < 6; t++) {
         uint32_t psz = tiers[t];
-        /* Allocate > 8 blocks to exercise both cache hit and >8 overflow free() */
-        void *ptrs[12];
-        for (int i = 0; i < 12; i++) {
+        /* Allocate > tier cap (16 for 2K..16K, 4 for 32K/64K) to exercise hit + overflow free() */
+        int cnt = (t < 4) ? 20 : 8;
+        void *ptrs[20];
+        for (int i = 0; i < cnt; i++) {
             ptrs[i] = pion_alloc_uninit(psz, PION_TAG_STRUCT, NULL);
             memset(ptrs[i], (int)(0xA0 + i), psz);
         }
-        for (int i = 0; i < 12; i++) {
+        for (int i = 0; i < cnt; i++) {
             assert(((uint8_t *)ptrs[i])[0] == (uint8_t)(0xA0 + i));
             assert(((uint8_t *)ptrs[i])[psz - 1] == (uint8_t)(0xA0 + i));
             pion_rc_dec(ptrs[i]);
@@ -1440,27 +1441,47 @@ static void test_med_cache_and_mt_frozen(void) {
         }
     }
 
-    /* 2. Array and Map growth across 1K -> 2K -> 4K -> 8K -> 16K -> 32K boundaries */
-    for (int rep = 0; rep < 16; rep++) {
+    /* 2. Single-thread burst allocation of 10,000 new 48B objects spanning multiple 256 KB chunks */
+    {
+        const int burst_n = 10000;
+        void **burst = (void **)malloc((size_t)burst_n * sizeof(void *));
+        assert(burst != NULL);
+        for (int i = 0; i < burst_n; i++) {
+            int64_t *obj = (int64_t *)pion_alloc_uninit(48u, PION_TAG_STRUCT, NULL);
+            obj[0] = (int64_t)i;
+            obj[5] = (int64_t)(i * 7 + 13);
+            burst[i] = obj;
+        }
+        for (int i = 0; i < burst_n; i++) {
+            int64_t *obj = (int64_t *)burst[i];
+            assert(obj[0] == (int64_t)i);
+            assert(obj[5] == (int64_t)(i * 7 + 13));
+            pion_rc_dec(obj);
+        }
+        free(burst);
+    }
+
+    /* 3. Array and Map growth across 1K -> 2K -> 4K -> 8K -> 16K -> 32K -> 64K boundaries */
+    for (int rep = 0; rep < 12; rep++) {
         void *arr = pion_arr_new(0, 0);
-        for (int64_t i = 0; i < 4200; i++) {
+        for (int64_t i = 0; i < 9000; i++) {
             pion_arr_push(arr, i * 3 + rep);
         }
-        assert(pion_arr_len(arr) == 4200);
+        assert(pion_arr_len(arr) == 9000);
         assert(pion_arr_get(arr, 0) == rep);
-        assert(pion_arr_get(arr, 4199) == 4199 * 3 + rep);
+        assert(pion_arr_get(arr, 8999) == 8999 * 3 + rep);
         pion_rc_dec(arr);
 
         void *mp = pion_map_new_int(0);
-        for (int64_t i = 0; i < 520; i++) {
+        for (int64_t i = 0; i < 2100; i++) {
             pion_map_set(mp, (void *)(uintptr_t)(i + 1), i * 7 + rep);
         }
-        assert(pion_map_len(mp) == 520);
-        assert(pion_map_get(mp, (void *)(uintptr_t)520) == 519 * 7 + rep);
+        assert(pion_map_len(mp) == 2100);
+        assert(pion_map_get(mp, (void *)(uintptr_t)2100) == 2099 * 7 + rep);
         pion_rc_dec(mp);
     }
 
-    /* 3. Cross-thread frozen medium-block release (TSan/ASan stress) */
+    /* 4. Cross-thread frozen medium-block release across all 6 tiers (TSan/ASan stress) */
     void *ch = pion_chan_new(32, 1);
     void *sc = pion_scope_begin();
     for (int w = 0; w < 4; w++) {
@@ -1470,8 +1491,8 @@ static void test_med_cache_and_mt_frozen(void) {
         pion_scope_spawn(sc, med_frozen_worker, env);
         pion_rc_dec(env);
     }
-    for (int i = 0; i < 128; i++) {
-        uint32_t psz = tiers[i & 3];
+    for (int i = 0; i < 120; i++) {
+        uint32_t psz = tiers[i % 6];
         void *obj = pion_alloc_uninit(psz, PION_TAG_STRUCT, NULL);
         ((uint8_t *)obj)[0] = 0x5A;
         ((uint8_t *)obj)[psz - 1] = (uint8_t)i;
@@ -1481,7 +1502,7 @@ static void test_med_cache_and_mt_frozen(void) {
     pion_chan_close(ch);
     pion_scope_end(sc);
     pion_rc_dec(ch);
-    printf("[PASS] med_cache_and_mt_frozen (2K/4K/8K/16K TLS cache + Array/Map + MT frozen)\n");
+    printf("[PASS] med_cache_and_mt_frozen (2K..64K 6-tier TLS cache + 10k burst + Array/Map + MT frozen)\n");
 }
 
 typedef struct ExecStressEnv {
