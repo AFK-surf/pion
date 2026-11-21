@@ -6,7 +6,7 @@ Concise engineering rules for writing fast, race-free, maintainable Pion program
 
 When building desktop, mobile, or web GUI apps with Invar, **strictly isolate the render thread from business logic and blocking IO**:
 
-- Scaffold new apps with `pionc init --template invar-app <dir>` (produces `src/protocol.pion`, `src/worker.pion`, `src/view.pion`, `src/main.pion`, `main_test.pion`, `AGENTS.md`).
+- Scaffold new apps with `pionc init --template invar-app <dir>` (produces `src/protocol.pion`, `src/worker.pion`, `src/view.pion`, `src/main.pion`, `main_test.pion`).
 - **Render thread (`src/view.pion`)**: annotate every view builder and UI event entry point with `#render_thread` (alias `#no_io`).
   - Allowed: reading UI signals, handling `AppEvent` callbacks delivered via `worker.bind(...)`, constructing immutable `AppCmd`s and dispatching via `worker.send(cmd)` / `Channel::send`, pure layout/formatting, and non-`World` rendering `extern "C"` FFI.
   - Forbidden at compile time (`E_NO_IO_VIOLATION`): accepting or referencing `World`, calling `fs_*`, `tcp_*`, `proc_*`, `sleep_ms`, `io_*`, or `scope` — inside the function or any nested event-handler closure.
