@@ -1712,11 +1712,12 @@ static void test_slab_48b_and_arr_growth(void) {
     assert(empty_obj_arr->len == 0 && empty_obj_arr->cap == 0 && empty_obj_arr->data == NULL);
     pion_rc_dec(empty_obj_arr);
 
-    /* 2. 24B PionHeader + 12-class Slab (32B..256B, 16B payload -> 40B class 1) */
+    /* 2. 24B PionHeader + 16-class Slab (32B..1024B, 16B payload -> 40B class 1) */
     assert(sizeof(PionHeader) == 24);
     const uint32_t payloads[] = {
         0u, 8u, 9u, 16u, 17u, 24u, 25u, 32u, 33u, 40u, 41u, 56u, 57u, 72u, 73u,
-        88u, 89u, 104u, 105u, 136u, 137u, 168u, 169u, 232u, 233u
+        88u, 89u, 104u, 105u, 136u, 137u, 168u, 169u, 232u, 233u,
+        296u, 297u, 360u, 361u, 488u, 489u, 1000u, 1001u
     };
     const size_t n_payloads = sizeof(payloads) / sizeof(payloads[0]);
     void *ptrs[sizeof(payloads) / sizeof(payloads[0])];
@@ -1754,9 +1755,19 @@ static void test_slab_48b_and_arr_growth(void) {
                 assert(cls == 9u);  /* 160B class */
             } else if (sz <= 168u) {
                 assert(cls == 10u); /* 192B class */
-            } else {
+            } else if (sz <= 232u) {
                 assert(cls == 11u); /* 256B class */
+            } else if (sz <= 296u) {
+                assert(cls == 12u); /* 320B class */
+            } else if (sz <= 360u) {
+                assert(cls == 13u); /* 384B class */
+            } else if (sz <= 488u) {
+                assert(cls == 14u); /* 512B class */
+            } else {
+                assert(sz <= 1000u && cls == 15u); /* 1024B class */
             }
+        } else {
+            assert(sz > 1000u || 1); /* ASan disables slab */
         }
         ptrs[i] = p;
     }

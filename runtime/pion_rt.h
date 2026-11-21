@@ -110,11 +110,13 @@ typedef struct PionMap {
     static void *const sym = (void *)&sym##_storage.len
 
 /* Memory & Biased RC */
+extern uint32_t pion_mt_flag;
 uint64_t pion_cur_tid(void);
 void*    pion_alloc(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn);
 void*    pion_alloc_uninit(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn);
 void     pion_rc_inc(void *obj);
 void     pion_rc_dec(void *obj);
+void     pion_destroy_obj(void *obj);
 void     pion_rc_freeze(void *obj);
 void     pion_rc_immortalize(void *obj);
 void     pion_panic(const char *msg, const char *file, int32_t line) __attribute__((noreturn));

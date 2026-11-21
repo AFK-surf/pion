@@ -1,0 +1,420 @@
+///| Native QBE SSA post-pass: inline single-threaded Biased RC fast path
+///| and eliminate RC inc/dec on statically immortal objects (string literals, None, static enums).
+///| Stage-0 bootstrap safe (pure Pion, zero external dependencies).
+
+///|
+fn irc_is_ws(c : Int) -> Bool {
+  c == 32 || c == 9 || c == 13
+}
+
+///|
+fn irc_is_label_char(c : Int) -> Bool {
+  (c >= 97 && c <= 122) ||
+  (c >= 65 && c <= 90) ||
+  (c >= 48 && c <= 57) ||
+  c == 95 ||
+  c == 46 ||
+  c == 45
+}
+
+///|
+fn irc_trim(s : String) -> String {
+  let n = s.length()
+  let mut start = 0
+  while start < n && irc_is_ws(str_code_at(s, start)) {
+    start = start + 1
+  }
+  let mut end = n
+  while end > start && irc_is_ws(str_code_at(s, end - 1)) {
+    end = end - 1
+  }
+  if start == 0 && end == n {
+    s
+  } else {
+    slice_str(s, start, end)
+  }
+}
+
+///|
+fn irc_starts_with(s : String, pre : String) -> Bool {
+  let sl = s.length()
+  let pl = pre.length()
+  if sl < pl {
+    return false
+  }
+  let mut i = 0
+  while i < pl {
+    if str_code_at(s, i) != str_code_at(pre, i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn irc_ends_with(s : String, suf : String) -> Bool {
+  let sl = s.length()
+  let sufl = suf.length()
+  if sl < sufl {
+    return false
+  }
+  let off = sl - sufl
+  let mut i = 0
+  while i < sufl {
+    if str_code_at(s, off + i) != str_code_at(suf, i) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn irc_split_lines(s : String) -> Array[String] {
+  let lines : Array[String] = []
+  let n = s.length()
+  let mut start = 0
+  let mut i = 0
+  while i < n {
+    if str_code_at(s, i) == 10 {
+      lines.push(slice_str(s, start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start < n {
+    lines.push(slice_str(s, start, n))
+  }
+  lines
+}
+
+///|
+fn irc_is_valid_qbe_val(arg : String) -> Bool {
+  let n = arg.length()
+  if n < 2 {
+    return false
+  }
+  let c0 = str_code_at(arg, 0)
+  if c0 != 37 && c0 != 36 {
+    return false
+  }
+  let mut i = 1
+  while i < n {
+    let c = str_code_at(arg, i)
+    if irc_is_ws(c) || c == 44 || c == 41 || c == 40 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn irc_is_static_immortal_sym(sym : String) -> Bool {
+  irc_starts_with(sym, "$pion_str_") ||
+  irc_starts_with(sym, "$str_") ||
+  irc_starts_with(sym, "$pion_enum_") ||
+  sym == "$pion_none_hdr"
+}
+
+///|
+fn irc_is_immortal_arg(arg : String, immortal_regs : Map[String, Bool]) -> Bool {
+  if irc_is_static_immortal_sym(arg) {
+    return true
+  }
+  match immortal_regs.get(arg) {
+    Some(b) => b
+    None => false
+  }
+}
+
+///|
+/// Collect SSA temporaries known to hold pointers to statically immortal objects
+/// (e.g. `%t =l add $pion_str_0_hdr, 24`, `%t =l add $pion_none_hdr, 24`,
+/// `%t =l add $pion_enum_..., 24`, or `%t2 =l copy %t`).
+fn irc_collect_immortal_regs(fn_lines : Array[String]) -> Map[String, Bool] {
+  let imm : Map[String, Bool] = Map::new()
+  let mut i = 0
+  while i < fn_lines.length() {
+    let t = irc_trim(fn_lines[i])
+    if t.length() > 10 && str_code_at(t, 0) == 37 {
+      // Find " =l "
+      let mut eq_pos = -1
+      let mut j = 1
+      while j + 3 < t.length() {
+        if str_code_at(t, j) == 32 &&
+          str_code_at(t, j + 1) == 61 &&
+          str_code_at(t, j + 2) == 108 &&
+          str_code_at(t, j + 3) == 32 {
+          eq_pos = j
+          break
+        }
+        if irc_is_ws(str_code_at(t, j)) {
+          break
+        }
+        j = j + 1
+      }
+      if eq_pos > 1 {
+        let lhs = slice_str(t, 0, eq_pos)
+        let rhs = slice_str(t, eq_pos + 4, t.length())
+        if irc_starts_with(rhs, "add ") && irc_ends_with(rhs, ", 24") {
+          let sym = irc_trim(slice_str(rhs, 4, rhs.length() - 4))
+          if irc_is_static_immortal_sym(sym) {
+            imm.set(lhs, true)
+          }
+        } else if irc_starts_with(rhs, "copy ") {
+          let src = irc_trim(slice_str(rhs, 5, rhs.length()))
+          if irc_is_immortal_arg(src, imm) {
+            imm.set(lhs, true)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  imm
+}
+
+///|
+/// Parse a standalone `call $pion_rc_inc(l <arg>)` or `call $pion_rc_dec(l <arg>)`.
+/// Returns `1` for inc, `2` for dec, `0` otherwise.
+fn irc_match_rc_call(t : String) -> Int {
+  if irc_starts_with(t, "call $pion_rc_inc(l ") && irc_ends_with(t, ")") {
+    1
+  } else if irc_starts_with(t, "call $pion_rc_dec(l ") && irc_ends_with(t, ")") {
+    2
+  } else {
+    0
+  }
+}
+
+///|
+fn irc_extract_rc_arg(t : String) -> String {
+  // Both "call $pion_rc_inc(l " and "call $pion_rc_dec(l " have length 20
+  irc_trim(slice_str(t, 20, t.length() - 1))
+}
+
+///|
+fn irc_extract_label_tok(t : String) -> String {
+  let n = t.length()
+  let mut i = 1
+  while i < n && irc_is_label_char(str_code_at(t, i)) {
+    i = i + 1
+  }
+  slice_str(t, 0, i)
+}
+
+///|
+fn irc_rewrite_phi_line(
+  line : String,
+  tail_map : Map[String, String],
+  out : StringBuilder,
+) -> Unit {
+  let n = line.length()
+  let mut i = 0
+  let mut last = 0
+  while i < n {
+    if str_code_at(line, i) == 64 {
+      let mut j = i + 1
+      while j < n && irc_is_label_char(str_code_at(line, j)) {
+        j = j + 1
+      }
+      if j > i + 1 {
+        let lbl = slice_str(line, i, j)
+        match tail_map.get(lbl) {
+          Some(new_lbl) => {
+            if i > last {
+              out.write_string(slice_str(line, last, i))
+            }
+            out.write_string(new_lbl)
+            last = j
+          }
+          None => ()
+        }
+        i = j
+        continue
+      }
+    }
+    i = i + 1
+  }
+  if last == 0 {
+    out.write_string(line)
+  } else if last < n {
+    out.write_string(slice_str(line, last, n))
+  }
+}
+
+///|
+fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
+  let immortal_regs = irc_collect_immortal_regs(fn_lines)
+  let out_lines : Array[String] = []
+  let tail_map : Map[String, String] = Map::new()
+  let mut cur_orig = ""
+  let mut cur_tail = ""
+  let mut rc_id = 0
+
+  let mut i = 0
+  while i < fn_lines.length() {
+    let line = fn_lines[i]
+    let t = irc_trim(line)
+    if t.length() > 1 && str_code_at(t, 0) == 64 {
+      if cur_orig.length() > 0 && cur_tail != cur_orig {
+        tail_map.set(cur_orig, cur_tail)
+      }
+      let lbl = irc_extract_label_tok(t)
+      cur_orig = lbl
+      cur_tail = lbl
+      out_lines.push(line)
+    } else {
+      let kind = irc_match_rc_call(t)
+      if kind != 0 {
+        let arg = irc_extract_rc_arg(t)
+        if irc_is_valid_qbe_val(arg) {
+          if irc_is_immortal_arg(arg, immortal_regs) {
+            // Static immortal object: zero-instruction elimination
+            i = i + 1
+            continue
+          }
+          let id_s = rc_id.to_string()
+          rc_id = rc_id + 1
+          if kind == 1 {
+            out_lines.push("    %_rci_nz_" + id_s + " =w cnel " + arg + ", 0")
+            out_lines.push(
+              "    jnz %_rci_nz_" + id_s + ", @_rci_nn_" + id_s + ", @_rci_end_" + id_s,
+            )
+            out_lines.push("@_rci_nn_" + id_s)
+            out_lines.push("    %_rci_mt_" + id_s + " =w loaduw $pion_mt_flag")
+            out_lines.push(
+              "    jnz %_rci_mt_" + id_s + ", @_rci_slow_" + id_s + ", @_rci_st_" + id_s,
+            )
+            out_lines.push("@_rci_st_" + id_s)
+            out_lines.push("    %_rci_oa_" + id_s + " =l sub " + arg + ", 24")
+            out_lines.push("    %_rci_ot_" + id_s + " =w loaduw %_rci_oa_" + id_s)
+            out_lines.push(
+              "    jnz %_rci_ot_" + id_s + ", @_rci_fast_" + id_s + ", @_rci_imm_" + id_s,
+            )
+            out_lines.push("@_rci_imm_" + id_s)
+            out_lines.push("    %_rci_fa_" + id_s + " =l sub " + arg + ", 10")
+            out_lines.push("    %_rci_fl_" + id_s + " =w loaduh %_rci_fa_" + id_s)
+            out_lines.push("    %_rci_im_" + id_s + " =w and %_rci_fl_" + id_s + ", 2")
+            out_lines.push(
+              "    jnz %_rci_im_" + id_s + ", @_rci_end_" + id_s + ", @_rci_slow_" + id_s,
+            )
+            out_lines.push("@_rci_fast_" + id_s)
+            out_lines.push("    %_rci_ra_" + id_s + " =l sub " + arg + ", 20")
+            out_lines.push("    %_rci_rc_" + id_s + " =w loaduw %_rci_ra_" + id_s)
+            out_lines.push("    %_rci_r1_" + id_s + " =w add %_rci_rc_" + id_s + ", 1")
+            out_lines.push("    storew %_rci_r1_" + id_s + ", %_rci_ra_" + id_s)
+            out_lines.push("    jmp @_rci_end_" + id_s)
+            out_lines.push("@_rci_slow_" + id_s)
+            out_lines.push("    call $pion_rc_inc(l " + arg + ")")
+            out_lines.push("@_rci_end_" + id_s)
+            cur_tail = "@_rci_end_" + id_s
+          } else {
+            out_lines.push("    %_rcd_nz_" + id_s + " =w cnel " + arg + ", 0")
+            out_lines.push(
+              "    jnz %_rcd_nz_" + id_s + ", @_rcd_nn_" + id_s + ", @_rcd_end_" + id_s,
+            )
+            out_lines.push("@_rcd_nn_" + id_s)
+            out_lines.push("    %_rcd_mt_" + id_s + " =w loaduw $pion_mt_flag")
+            out_lines.push(
+              "    jnz %_rcd_mt_" + id_s + ", @_rcd_slow_" + id_s + ", @_rcd_st_" + id_s,
+            )
+            out_lines.push("@_rcd_st_" + id_s)
+            out_lines.push("    %_rcd_oa_" + id_s + " =l sub " + arg + ", 24")
+            out_lines.push("    %_rcd_ot_" + id_s + " =w loaduw %_rcd_oa_" + id_s)
+            out_lines.push(
+              "    jnz %_rcd_ot_" + id_s + ", @_rcd_fast_" + id_s + ", @_rcd_imm_" + id_s,
+            )
+            out_lines.push("@_rcd_imm_" + id_s)
+            out_lines.push("    %_rcd_fa_" + id_s + " =l sub " + arg + ", 10")
+            out_lines.push("    %_rcd_fl_" + id_s + " =w loaduh %_rcd_fa_" + id_s)
+            out_lines.push("    %_rcd_im_" + id_s + " =w and %_rcd_fl_" + id_s + ", 2")
+            out_lines.push(
+              "    jnz %_rcd_im_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_slow_" + id_s,
+            )
+            out_lines.push("@_rcd_fast_" + id_s)
+            out_lines.push("    %_rcd_ra_" + id_s + " =l sub " + arg + ", 20")
+            out_lines.push("    %_rcd_rc_" + id_s + " =w loaduw %_rcd_ra_" + id_s)
+            out_lines.push("    %_rcd_r1_" + id_s + " =w sub %_rcd_rc_" + id_s + ", 1")
+            out_lines.push("    storew %_rcd_r1_" + id_s + ", %_rcd_ra_" + id_s)
+            out_lines.push(
+              "    jnz %_rcd_r1_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_drop_" + id_s,
+            )
+            out_lines.push("@_rcd_drop_" + id_s)
+            out_lines.push("    call $pion_destroy_obj(l " + arg + ")")
+            out_lines.push("    jmp @_rcd_end_" + id_s)
+            out_lines.push("@_rcd_slow_" + id_s)
+            out_lines.push("    call $pion_rc_dec(l " + arg + ")")
+            out_lines.push("@_rcd_end_" + id_s)
+            cur_tail = "@_rcd_end_" + id_s
+          }
+          i = i + 1
+          continue
+        }
+      }
+      out_lines.push(line)
+    }
+    i = i + 1
+  }
+
+  if cur_orig.length() > 0 && cur_tail != cur_orig {
+    tail_map.set(cur_orig, cur_tail)
+  }
+
+  let has_remap = tail_map.length() > 0
+  let mut k = 0
+  while k < out_lines.length() {
+    let ln = out_lines[k]
+    if has_remap && ln.contains(" phi ") {
+      irc_rewrite_phi_line(ln, tail_map, out)
+    } else {
+      out.write_string(ln)
+    }
+    out.write_char('\n')
+    k = k + 1
+  }
+}
+
+///|
+/// Inline single-threaded Biased RC fast paths and eliminate static-immortal RC calls
+/// in native QBE SSA (for release builds; never called for wasm32).
+pub fn inline_native_rc_ssa(ssa : String) -> String {
+  if !ssa.contains("$pion_rc_inc") && !ssa.contains("$pion_rc_dec") {
+    return ssa
+  }
+  let lines = irc_split_lines(ssa)
+  let out = StringBuilder()
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    let t = irc_trim(line)
+    let is_fn_hdr = (irc_starts_with(t, "export function ") || irc_starts_with(t, "function ")) &&
+      irc_ends_with(t, "{")
+    if is_fn_hdr {
+      out.write_string(line)
+      out.write_char('\n')
+      let body : Array[String] = []
+      i = i + 1
+      while i < lines.length() {
+        let bl = lines[i]
+        if irc_trim(bl) == "}" {
+          break
+        }
+        body.push(bl)
+        i = i + 1
+      }
+      irc_process_fn_body(body, out)
+      if i < lines.length() {
+        out.write_string(lines[i])
+        out.write_char('\n')
+      }
+    } else {
+      out.write_string(line)
+      out.write_char('\n')
+    }
+    i = i + 1
+  }
+  out.to_string()
+}
