@@ -88,6 +88,12 @@ extern char **environ;
 #endif
 #endif
 
+#if defined(__clang__) || defined(__GNUC__)
+#define PION_NOINLINE __attribute__((noinline))
+#else
+#define PION_NOINLINE
+#endif
+
 /* ============================================================================
  * 1. Memory & Biased RC
  * ============================================================================ */
@@ -204,10 +210,6 @@ PION_MINSIZE double pion_math_pow(double x, double y) {
 #define PION_MED_MAX_PAYLOAD    (PION_MED_MAX_BYTES - (uint32_t)sizeof(PionHeader))
 #define PION_MED_MAX_CACHE      8u
 
-static const uint16_t pion_med_sizes[PION_MED_CLASSES] = {
-    2048u, 4096u, 8192u, 16384u
-};
-
 static inline uint32_t pion_med_cls_for(size_t total) {
     if (total <= 2048u) return 0u;
     if (total <= 4096u) return 1u;
@@ -286,7 +288,7 @@ static inline void pion_slab_set_next(void *slot, void *next) {
     memcpy(slot, &next, sizeof(next));
 }
 
-static void pion_slab_push_remote_list(uint32_t cls, void *head, void *tail) {
+static PION_MINSIZE void pion_slab_push_remote_list(uint32_t cls, void *head, void *tail) {
     void *cur = atomic_load_explicit(&g_slab_remote[cls], memory_order_relaxed);
     do {
         pion_slab_set_next(tail, cur);
@@ -352,7 +354,7 @@ static void pion_slab_key_init(void) {
 }
 #endif
 
-static PionHeader *pion_slab_alloc_slow(PionSlabTLS *s, uint32_t cls) {
+static PION_NOINLINE PION_MINSIZE PionHeader *pion_slab_alloc_slow(PionSlabTLS *s, uint32_t cls) {
     if (__builtin_expect(!s, 0)) {
         s = (PionSlabTLS *)calloc(1, sizeof(PionSlabTLS));
         if (__builtin_expect(!s, 0)) {
@@ -388,7 +390,28 @@ static PionHeader *pion_slab_alloc_slow(PionSlabTLS *s, uint32_t cls) {
     return hdr;
 }
 
-static void *pion_med_alloc(uint32_t mcls) {
+static PION_NOINLINE PION_MINSIZE void pion_slab_free_remote(void *ptr, uint32_t cls) {
+    PionSlabTLS *s = pion_slab_cur();
+    if (__builtin_expect(s != NULL, 1)) {
+        void *head = s->remote_head[cls];
+        pion_slab_set_next(ptr, head);
+        s->remote_head[cls] = ptr;
+        if (!head) {
+            s->remote_tail[cls] = ptr;
+        }
+        if (++s->remote_count[cls] >= PION_SLAB_REMOTE_BATCH) {
+            void *tail = s->remote_tail[cls];
+            s->remote_head[cls] = NULL;
+            s->remote_tail[cls] = NULL;
+            s->remote_count[cls] = 0;
+            pion_slab_push_remote_list(cls, ptr, tail);
+        }
+        return;
+    }
+    pion_slab_push_remote_list(cls, ptr, ptr);
+}
+
+static PION_NOINLINE PION_MINSIZE void *pion_med_alloc(uint32_t mcls) {
     PionSlabTLS *s = pion_slab_cur();
     if (__builtin_expect(s != NULL && s->med_free[mcls] != NULL, 1)) {
         void *node = s->med_free[mcls];
@@ -396,14 +419,14 @@ static void *pion_med_alloc(uint32_t mcls) {
         s->med_count[mcls]--;
         return node;
     }
-    void *mp = malloc(pion_med_sizes[mcls]);
+    void *mp = malloc((size_t)2048u << mcls);
     if (__builtin_expect(!mp, 0)) {
         pion_panic("out of memory", __FILE__, __LINE__);
     }
     return mp;
 }
 
-static void pion_med_free(void *ptr, uint32_t mcls, int is_frozen) {
+static PION_NOINLINE PION_MINSIZE void pion_med_free(void *ptr, uint32_t mcls, int is_frozen) {
     if (__builtin_expect(!is_frozen, 1)) {
         PionSlabTLS *s = pion_slab_cur();
         if (__builtin_expect(s != NULL && s->med_count[mcls] < PION_MED_MAX_CACHE, 1)) {
@@ -417,6 +440,28 @@ static void pion_med_free(void *ptr, uint32_t mcls, int is_frozen) {
 }
 
 #endif /* PION_USE_SLAB */
+
+static PION_NOINLINE PION_MINSIZE PionHeader *pion_alloc_large_hdr(uint32_t payload_size) {
+    PionHeader *hdr;
+    uint16_t flags = 0;
+#if PION_USE_SLAB
+    if (__builtin_expect(payload_size <= PION_MED_MAX_PAYLOAD, 1)) {
+        uint32_t total = (uint32_t)sizeof(PionHeader) + payload_size;
+        uint32_t mcls = pion_med_cls_for(total);
+        flags = (uint16_t)(PION_FLAG_MED_CACHE | (mcls << PION_FLAG_MED_CLS_SHIFT));
+        hdr = (PionHeader *)pion_med_alloc(mcls);
+        hdr->flags = flags;
+        return hdr;
+    }
+#endif
+    size_t total = sizeof(PionHeader) + (size_t)payload_size;
+    hdr = (PionHeader *)malloc(total);
+    if (__builtin_expect(!hdr, 0)) {
+        pion_panic("out of memory", __FILE__, __LINE__);
+    }
+    hdr->flags = flags;
+    return hdr;
+}
 
 static PION_HOT void *pion_slab_raw_alloc(size_t bytes) {
 #if PION_USE_SLAB
@@ -450,29 +495,12 @@ static PION_HOT void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) 
     if (__builtin_expect(bytes <= PION_SLAB_MAX_TOTAL, 1)) {
         uint32_t cls = pion_slab_cls_for(bytes);
         PionSlabTLS *s = pion_slab_cur();
-        if (__builtin_expect(!is_frozen, 1)) {
-            if (__builtin_expect(s != NULL, 1)) {
-                pion_slab_set_next(ptr, s->local_free[cls]);
-                s->local_free[cls] = ptr;
-                return;
-            }
-        } else if (__builtin_expect(s != NULL, 1)) {
-            void *head = s->remote_head[cls];
-            pion_slab_set_next(ptr, head);
-            s->remote_head[cls] = ptr;
-            if (!head) {
-                s->remote_tail[cls] = ptr;
-            }
-            if (++s->remote_count[cls] >= PION_SLAB_REMOTE_BATCH) {
-                void *tail = s->remote_tail[cls];
-                s->remote_head[cls] = NULL;
-                s->remote_tail[cls] = NULL;
-                s->remote_count[cls] = 0;
-                pion_slab_push_remote_list(cls, ptr, tail);
-            }
+        if (__builtin_expect(!is_frozen && s != NULL, 1)) {
+            pion_slab_set_next(ptr, s->local_free[cls]);
+            s->local_free[cls] = ptr;
             return;
         }
-        pion_slab_push_remote_list(cls, ptr, ptr);
+        pion_slab_free_remote(ptr, cls);
         return;
     }
     if (__builtin_expect(bytes <= PION_MED_MAX_BYTES, 1)) {
@@ -488,7 +516,6 @@ static PION_HOT void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) 
 
 static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
     PionHeader *hdr;
-    uint16_t flags = 0;
     int st = __builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1);
 #if PION_USE_SLAB
     if (__builtin_expect(payload_size <= PION_SLAB_MAX_PAYLOAD, 1)) {
@@ -506,34 +533,21 @@ static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag
         } else {
             hdr = pion_slab_alloc_slow(NULL, cls);
         }
-        flags = (uint16_t)(PION_FLAG_SLAB | (cls << PION_FLAG_SLAB_CLS_SHIFT));
-    } else if (__builtin_expect(payload_size <= PION_MED_MAX_PAYLOAD, 1)) {
-        uint32_t total = (uint32_t)sizeof(PionHeader) + payload_size;
-        uint32_t mcls = pion_med_cls_for(total);
-        hdr = (PionHeader *)pion_med_alloc(mcls);
-        flags = (uint16_t)(PION_FLAG_MED_CACHE | (mcls << PION_FLAG_MED_CLS_SHIFT));
+        hdr->flags = (uint16_t)(PION_FLAG_SLAB | (cls << PION_FLAG_SLAB_CLS_SHIFT));
     } else
 #endif
     {
-        size_t total = sizeof(PionHeader) + (size_t)payload_size;
-        hdr = (PionHeader *)malloc(total);
-        if (__builtin_expect(!hdr, 0)) {
-            pion_panic("out of memory", __FILE__, __LINE__);
-        }
+        hdr = pion_alloc_large_hdr(payload_size);
     }
     hdr->owner_tid = st ? 1u : pion_cur_tid_mt();
     hdr->local_rc = 1;
     atomic_init(&hdr->shared_rc, 0);
     hdr->type_tag = type_tag;
-    hdr->flags = flags;
     hdr->drop_fn = drop_fn;
     return (void *)(hdr + 1);
 }
 
-#if defined(__clang__) || defined(__GNUC__)
-__attribute__((noinline))
-#endif
-static PION_HOT void *pion_alloc_raw(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
+static PION_NOINLINE PION_HOT void *pion_alloc_raw(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
     return pion_alloc_raw_fast(payload_size, type_tag, drop_fn);
 }
 
@@ -549,7 +563,7 @@ PION_HOT void *pion_alloc_uninit(uint32_t payload_size, uint16_t type_tag, PionD
     return pion_alloc_raw_fast(payload_size, type_tag, drop_fn);
 }
 
-static void pion_destroy(PionHeader *hdr, void *obj) {
+static PION_NOINLINE PION_MINSIZE void pion_destroy(PionHeader *hdr, void *obj) {
     if (hdr->drop_fn) {
         hdr->drop_fn(obj);
     }
@@ -558,29 +572,12 @@ static void pion_destroy(PionHeader *hdr, void *obj) {
     if (__builtin_expect((flags & PION_FLAG_SLAB) != 0, 1)) {
         uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
         PionSlabTLS *s = pion_slab_cur();
-        if (__builtin_expect((flags & PION_FLAG_FROZEN) == 0, 1)) {
-            if (__builtin_expect(s != NULL, 1)) {
-                pion_slab_set_next(hdr, s->local_free[cls]);
-                s->local_free[cls] = hdr;
-                return;
-            }
-        } else if (__builtin_expect(s != NULL, 1)) {
-            void *head = s->remote_head[cls];
-            pion_slab_set_next(hdr, head);
-            s->remote_head[cls] = hdr;
-            if (!head) {
-                s->remote_tail[cls] = hdr;
-            }
-            if (++s->remote_count[cls] >= PION_SLAB_REMOTE_BATCH) {
-                void *tail = s->remote_tail[cls];
-                s->remote_head[cls] = NULL;
-                s->remote_tail[cls] = NULL;
-                s->remote_count[cls] = 0;
-                pion_slab_push_remote_list(cls, hdr, tail);
-            }
+        if (__builtin_expect((flags & PION_FLAG_FROZEN) == 0 && s != NULL, 1)) {
+            pion_slab_set_next(hdr, s->local_free[cls]);
+            s->local_free[cls] = hdr;
             return;
         }
-        pion_slab_push_remote_list(cls, hdr, hdr);
+        pion_slab_free_remote(hdr, cls);
         return;
     }
     if (__builtin_expect((flags & PION_FLAG_MED_CACHE) != 0, 0)) {
@@ -650,7 +647,7 @@ PION_MINSIZE static void pion_enter_mt(void) {
 static void pion_freeze_map_entries(PionMap *m);
 static void pion_freeze_arr_elems(PionArray *a);
 
-void pion_rc_freeze(void *obj) {
+PION_MINSIZE void pion_rc_freeze(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
     if ((hdr->flags & PION_FLAG_IMMORTAL) || hdr->owner_tid == 0) return;
@@ -817,7 +814,7 @@ int32_t pion_str_byte_at(void *s, int64_t idx) {
     return (int32_t)(unsigned char)str->data[idx];
 }
 
-void *pion_str_concat(void *a, void *b) {
+PION_MINSIZE void *pion_str_concat(void *a, void *b) {
     PionString *sa = (PionString *)a;
     PionString *sb = (PionString *)b;
     int64_t la = sa ? sa->len : 0;
@@ -832,7 +829,7 @@ void *pion_str_concat(void *a, void *b) {
     return out;
 }
 
-void *pion_str_concat_n(int64_t n, void **parts) {
+PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
     int64_t total = 0;
     for (int64_t i = 0; i < n; i++) {
         PionString *s = (PionString *)parts[i];
@@ -917,7 +914,7 @@ int32_t pion_str_cmp(void *a, void *b) {
     return 0;
 }
 
-void *pion_str_slice(void *s, int64_t start, int64_t end) {
+PION_MINSIZE void *pion_str_slice(void *s, int64_t start, int64_t end) {
     PionString *str = (PionString *)s;
     if (__builtin_expect(!str || start < 0 || end < start || end > str->len, 0)) {
         pion_panic("string slice out of bounds", __FILE__, __LINE__);
@@ -933,7 +930,7 @@ void *pion_str_slice(void *s, int64_t start, int64_t end) {
     return out;
 }
 
-void *pion_int_to_str(int64_t v) {
+PION_MINSIZE void *pion_int_to_str(int64_t v) {
     char tmp[24];
     char *end = tmp + sizeof(tmp);
     char *p = pion_fmt_i64_end(v, end);
@@ -1272,7 +1269,7 @@ PION_MINSIZE void pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst
  * 3. StringBuilder
  * ============================================================================ */
 
-static void pion_strbuf_drop(void *payload) {
+static PION_MINSIZE void pion_strbuf_drop(void *payload) {
     PionStrBuf *sb = (PionStrBuf *)payload;
     free(sb->data);
     sb->data = NULL;
@@ -1294,7 +1291,7 @@ static inline void pion_strbuf_reserve(PionStrBuf *sb, int64_t add) {
     }
 }
 
-void *pion_strbuf_new(int64_t cap) {
+PION_MINSIZE void *pion_strbuf_new(int64_t cap) {
     PionStrBuf *sb = (PionStrBuf *)pion_alloc_uninit((uint32_t)sizeof(PionStrBuf), PION_TAG_STRBUF, pion_strbuf_drop);
     int64_t init_cap = cap > 32 ? cap : 32;
     sb->data = (char *)malloc((size_t)init_cap);
@@ -1305,7 +1302,7 @@ void *pion_strbuf_new(int64_t cap) {
     return sb;
 }
 
-void pion_strbuf_push_str(void *sb_ptr, void *s_ptr) {
+PION_MINSIZE void pion_strbuf_push_str(void *sb_ptr, void *s_ptr) {
     PionStrBuf *sb = (PionStrBuf *)sb_ptr;
     PionString *s = (PionString *)s_ptr;
     if (__builtin_expect(!sb || !s || s->len == 0, 0)) return;
@@ -1324,7 +1321,7 @@ void pion_strbuf_push_byte(void *sb_ptr, int32_t b) {
     sb->data[sb->len] = '\0';
 }
 
-void pion_strbuf_push_char(void *sb_ptr, int32_t cp) {
+PION_MINSIZE void pion_strbuf_push_char(void *sb_ptr, int32_t cp) {
     PionStrBuf *sb = (PionStrBuf *)sb_ptr;
     if (__builtin_expect(!sb, 0)) return;
     if (__builtin_expect((uint32_t)cp < 0x80u, 1)) {
@@ -1359,7 +1356,7 @@ void pion_strbuf_push_char(void *sb_ptr, int32_t cp) {
     sb->data[sb->len] = '\0';
 }
 
-void pion_strbuf_push_int(void *sb_ptr, int64_t v) {
+PION_MINSIZE void pion_strbuf_push_int(void *sb_ptr, int64_t v) {
     PionStrBuf *sb = (PionStrBuf *)sb_ptr;
     if (!sb) return;
     char tmp[24];
@@ -1379,7 +1376,7 @@ void pion_strbuf_reset(void *sb_ptr) {
     if (sb->data) sb->data[0] = '\0';
 }
 
-void *pion_strbuf_to_str(void *sb_ptr) {
+PION_MINSIZE void *pion_strbuf_to_str(void *sb_ptr) {
     PionStrBuf *sb = (PionStrBuf *)sb_ptr;
     int64_t len = sb ? sb->len : 0;
     PionString *out = (PionString *)pion_alloc_uninit((uint32_t)(sizeof(PionString) + (size_t)len + 1),
@@ -1396,7 +1393,7 @@ void *pion_strbuf_to_str(void *sb_ptr) {
  * 4. Array
  * ============================================================================ */
 
-static void pion_arr_drop(void *payload) {
+static PION_MINSIZE void pion_arr_drop(void *payload) {
     PionArray *a = (PionArray *)payload;
     if (a->elem_is_obj) {
         for (int64_t i = 0; i < a->len; i++) {
@@ -1438,7 +1435,7 @@ static __attribute__((noinline)) PION_HOT void pion_arr_grow(PionArray *a) {
     a->cap = ncap;
 }
 
-void *pion_arr_new(int64_t cap, int32_t elem_is_obj) {
+PION_MINSIZE void *pion_arr_new(int64_t cap, int32_t elem_is_obj) {
     PionArray *a = (PionArray *)pion_alloc_uninit((uint32_t)sizeof(PionArray), PION_TAG_ARRAY, pion_arr_drop);
     a->len = 0;
     a->elem_is_obj = elem_is_obj ? 1 : 0;
@@ -1502,7 +1499,7 @@ void pion_arr_set(void *a_ptr, int64_t idx, int64_t val) {
     a->data[idx] = val;
 }
 
-int64_t pion_arr_pop(void *a_ptr) {
+PION_MINSIZE int64_t pion_arr_pop(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || a->len <= 0) {
         pion_panic("array pop on empty array", __FILE__, __LINE__);
@@ -1692,7 +1689,7 @@ static inline PionMapEntry *pion_map_probe(const PionMap *m, const PionString *k
     }
 }
 
-static void pion_map_drop(void *payload) {
+static PION_MINSIZE void pion_map_drop(void *payload) {
     PionMap *m = (PionMap *)payload;
     if (m->entries) {
         for (int64_t i = 0; i < m->cap; i++) {
@@ -1711,7 +1708,7 @@ static void pion_map_drop(void *payload) {
     }
 }
 
-static void pion_map_grow(PionMap *m, int64_t new_cap) {
+static PION_MINSIZE void pion_map_grow(PionMap *m, int64_t new_cap) {
     size_t new_bytes = (size_t)new_cap * sizeof(PionMapEntry);
     PionMapEntry *ne = (PionMapEntry *)pion_slab_raw_alloc(new_bytes);
     memset(ne, 0, new_bytes);
@@ -1733,7 +1730,7 @@ static void pion_map_grow(PionMap *m, int64_t new_cap) {
     m->cap = new_cap;
 }
 
-void *pion_map_new(int32_t val_is_obj) {
+PION_MINSIZE void *pion_map_new(int32_t val_is_obj) {
     PionMap *m = (PionMap *)pion_alloc_uninit((uint32_t)sizeof(PionMap), PION_TAG_MAP, pion_map_drop);
     m->val_is_obj = val_is_obj ? 1 : 0;
     m->key_is_int = 0;
@@ -1970,7 +1967,7 @@ static unsigned __stdcall pion_spawn_trampoline(void *arg) {
     return 0;
 }
 #else
-static void *pion_spawn_trampoline(void *arg) {
+static PION_MINSIZE void *pion_spawn_trampoline(void *arg) {
     PionSpawnTask *task = (PionSpawnTask *)arg;
     void (*fn)(void *) = task->fn;
     void *env = task->env;
@@ -2126,7 +2123,7 @@ PION_MINSIZE void *pion_chan_new(int64_t cap, int32_t elem_is_obj) {
     return c;
 }
 
-int32_t pion_chan_send(void *ch_ptr, int64_t val) {
+PION_MINSIZE int32_t pion_chan_send(void *ch_ptr, int64_t val) {
     PionChannel *c = (PionChannel *)ch_ptr;
     if (c->elem_is_obj && val != 0) {
         pion_rc_freeze((void *)(uintptr_t)val);
@@ -2174,7 +2171,7 @@ int32_t pion_chan_send(void *ch_ptr, int64_t val) {
     return 1;
 }
 
-int32_t pion_chan_recv(void *ch_ptr, int64_t *out_val) {
+PION_MINSIZE int32_t pion_chan_recv(void *ch_ptr, int64_t *out_val) {
     PionChannel *c = (PionChannel *)ch_ptr;
     pion_mu_lock(&c->mu);
     if (c->count == 0 && !c->closed) {
