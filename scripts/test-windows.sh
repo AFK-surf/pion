@@ -105,11 +105,23 @@ S4_SIZE="$(wc -c < "$TMP_DIR/pionc_win_s4.exe" | tr -d ' ')"
 echo "Windows x86_64 native self-host Stage 4: build=$((T_S4_1 - T_S4_0))ms, binary=${S4_SIZE} bytes"
 
 "$TMP_DIR/pionc_win_s4.exe" --version
-cmp "$TMP_DIR/win_stage3.ssa" "$TMP_DIR/win_stage4.ssa"
-"$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/win_stage3.s" "$TMP_DIR/win_stage3.ssa"
-"$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/win_stage4.s" "$TMP_DIR/win_stage4.ssa"
-cmp "$TMP_DIR/win_stage3.s" "$TMP_DIR/win_stage4.s"
-echo "[PASS] Windows x86_64 (amd64_win) Native Self-Hosting Fixed-Point (Stage 3 == Stage 4 SSA & ASM BIT-FOR-BIT IDENTICAL)!"
+FP_A=3
+FP_B=4
+if ! cmp -s "$TMP_DIR/win_stage3.ssa" "$TMP_DIR/win_stage4.ssa"; then
+  echo "Stage 3 (seed) != Stage 4 (new codegen); running Stage 5 (pionc_win_s4.exe -> pionc_win_s5.exe) to verify Stage 4 == Stage 5 fixed-point"
+  (cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_win_s5" "$TMP_DIR/pionc_win_s4.exe" build \
+    --emit-ssa "$TMP_DIR/win_stage5.ssa" \
+    -o "$TMP_DIR/pionc_win_s5.exe" \
+    compiler/src/core \
+    compiler/src/cli/main.pion)
+  FP_A=4
+  FP_B=5
+fi
+cmp "$TMP_DIR/win_stage${FP_A}.ssa" "$TMP_DIR/win_stage${FP_B}.ssa"
+"$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/win_stage${FP_A}.s" "$TMP_DIR/win_stage${FP_A}.ssa"
+"$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/win_stage${FP_B}.s" "$TMP_DIR/win_stage${FP_B}.ssa"
+cmp "$TMP_DIR/win_stage${FP_A}.s" "$TMP_DIR/win_stage${FP_B}.s"
+echo "[PASS] Windows x86_64 (amd64_win) Native Self-Hosting Fixed-Point (Stage ${FP_A} == Stage ${FP_B} SSA & ASM BIT-FOR-BIT IDENTICAL)!"
 
 cp "$TMP_DIR/pionc_win_s4.exe" "$OUT_DIR/pionc_win.exe"
 PIONC="$OUT_DIR/pionc_win.exe"

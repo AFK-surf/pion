@@ -241,9 +241,25 @@ S4_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s4" | tr -d ' ')"
 echo "Linux ${LINUX_ARCH_LABEL} native self-host Stage 4: build=$((T_S4_1 - T_S4_0))ms, binary=${S4_SIZE} bytes"
 
 "$TMP_DIR/pionc_linux_s4" --version
-sha256sum "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"
-cmp "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"
-for S in 3 4; do
+FP_A=3
+FP_B=4
+if ! cmp -s "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"; then
+  echo "Stage 3 (seed) != Stage 4 (new codegen); running Stage 5 (pionc_linux_s4 -> pionc_linux_s5) to verify Stage 4 == Stage 5 fixed-point"
+  T_S5_0="$(now_ms)"
+  (cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_linux_s5" "$TMP_DIR/pionc_linux_s4" build \
+    --emit-ssa "$TMP_DIR/linux_stage5.ssa" \
+    -o "$TMP_DIR/pionc_linux_s5" \
+    compiler/src/core \
+    compiler/src/cli/main.pion)
+  T_S5_1="$(now_ms)"
+  S5_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s5" | tr -d ' ')"
+  echo "Linux ${LINUX_ARCH_LABEL} native self-host Stage 5: build=$((T_S5_1 - T_S5_0))ms, binary=${S5_SIZE} bytes"
+  FP_A=4
+  FP_B=5
+fi
+sha256sum "$TMP_DIR/linux_stage${FP_A}.ssa" "$TMP_DIR/linux_stage${FP_B}.ssa"
+cmp "$TMP_DIR/linux_stage${FP_A}.ssa" "$TMP_DIR/linux_stage${FP_B}.ssa"
+for S in "$FP_A" "$FP_B"; do
   "$OUT_DIR/qbe" -t "$LINUX_TARGET" -o "$TMP_DIR/linux_stage$S.s" "$TMP_DIR/linux_stage$S.ssa"
   if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
     "$OUT_DIR/qbe" -t "$LINUX_TARGET" --obj -o "$TMP_DIR/linux_stage$S.o" "$TMP_DIR/linux_stage$S.ssa"
@@ -251,11 +267,11 @@ for S in 3 4; do
     "$CC" -c "$TMP_DIR/linux_stage$S.s" -o "$TMP_DIR/linux_stage$S.o"
   fi
 done
-sha256sum "$TMP_DIR/linux_stage3.s" "$TMP_DIR/linux_stage4.s"
-cmp "$TMP_DIR/linux_stage3.s" "$TMP_DIR/linux_stage4.s"
-sha256sum "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
-cmp "$TMP_DIR/linux_stage3.o" "$TMP_DIR/linux_stage4.o"
-echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Native Self-Hosting Fixed-Point (Stage 3 == Stage 4 SSA, ASM & ELF64 .o BIT-FOR-BIT IDENTICAL)!"
+sha256sum "$TMP_DIR/linux_stage${FP_A}.s" "$TMP_DIR/linux_stage${FP_B}.s"
+cmp "$TMP_DIR/linux_stage${FP_A}.s" "$TMP_DIR/linux_stage${FP_B}.s"
+sha256sum "$TMP_DIR/linux_stage${FP_A}.o" "$TMP_DIR/linux_stage${FP_B}.o"
+cmp "$TMP_DIR/linux_stage${FP_A}.o" "$TMP_DIR/linux_stage${FP_B}.o"
+echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Native Self-Hosting Fixed-Point (Stage ${FP_A} == Stage ${FP_B} SSA, ASM & ELF64 .o BIT-FOR-BIT IDENTICAL)!"
 # [6/6] must test the compiler built from this tree, not the (possibly older) seed.
 cp "$TMP_DIR/pionc_linux_s4" "$OUT_DIR/pionc_linux"
 PIONC="$OUT_DIR/pionc_linux"
@@ -442,6 +458,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p29a_multi_target/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p29c_wasm32/run_e2e.sh" "$PIONC"
 # P30-A: Bugs #9-#13 (Array/FixedArray::contains, tuple-Option-if match, E_CAPTURE_MUT_ASSIGN, Float bare lits, \u{...} escapes; native + ASan + Wasm32).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p30a_bugs9_to_13/run_e2e.sh" "$PIONC"
+# P30-B: single-thread RC fast path, borrow RC elision + adversarial ASan/LSan, Bug #15 unannotated closure param infer.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p30b_rc_borrow_perf/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

@@ -107,18 +107,35 @@ S2_ASM_LINES=$(wc -l < "$OUT_DIR/stage2.s" | tr -d ' ')
 S2_BYTES=$(wc -c < "$OUT_DIR/pionc2" | tr -d ' ')
 echo "Stage 2 (pionc2): build=${S2_MS} ms, stage2.ssa=${S2_SSA_LINES} lines (${S2_SSA_BYTES} bytes), stage2.s=${S2_ASM_LINES} lines, binary=${S2_BYTES} bytes"
 
-echo "=== [5/9] Fixed-Point Proof (Stage 1 == Stage 2 bit-for-bit) ==="
+echo "=== [5/9] Fixed-Point Proof ==="
 if command -v shasum >/dev/null 2>&1; then
   SHA_CMD="shasum -a 256"
 else
   SHA_CMD="sha256sum"
 fi
-$SHA_CMD "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
-cmp "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
-echo "SSA fixed-point: BIT-FOR-BIT IDENTICAL"
-$SHA_CMD "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
-cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
-echo "ASM fixed-point: BIT-FOR-BIT IDENTICAL"
+if cmp -s "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"; then
+  $SHA_CMD "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
+  echo "SSA fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
+  $SHA_CMD "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
+  cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
+  echo "ASM fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
+else
+  echo "Stage 1 (seed) != Stage 2 (new codegen); running Stage 3 (pionc2 -> pionc3) to verify Stage 2 == Stage 3 fixed-point"
+  CAS_S3="$TMP_DIR/cas_stage3"
+  mkdir -p "$CAS_S3"
+  PION_CACHE_DIR="$CAS_S3" "$OUT_DIR/pionc2" build \
+    --emit-ssa "$OUT_DIR/stage3.ssa" \
+    --emit-asm "$OUT_DIR/stage3.s" \
+    -o "$OUT_DIR/pionc3" \
+    "$COMPILER_DIR/src/core" \
+    "$COMPILER_DIR/src/cli/main.pion"
+  $SHA_CMD "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
+  cmp "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
+  echo "SSA fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
+  $SHA_CMD "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
+  cmp "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
+  echo "ASM fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
+fi
 
 PIONC2="$OUT_DIR/pionc2"
 export PION_CACHE_DIR="$TMP_DIR/cas_pionc2"
