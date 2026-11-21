@@ -2744,6 +2744,110 @@ static void test_p22a_systems_io(int argc, char **argv) {
     printf("[PASS] p22a_systems_io\n");
 }
 
+static void st_frozen_mt_worker(void *arg) {
+    void *ch = *(void **)arg;
+    int64_t v = 0;
+    while (pion_chan_recv(ch, &v)) {
+        void *obj = (void *)(uintptr_t)v;
+        assert(((uint64_t *)obj)[0] == 0xCAFEBABEULL);
+        pion_rc_dec(obj);
+    }
+}
+
+static void st_frozen_mt_env_drop(void *p) {
+    void **env = (void **)p;
+    pion_rc_dec(*env);
+}
+
+static void record_unique_ptr(void **seen, int *count, int max_seen, void *p) {
+    int limit = (*count < max_seen) ? *count : max_seen;
+    for (int k = 0; k < limit; k++) {
+        if (seen[k] == p) return;
+    }
+    if (*count < max_seen) {
+        seen[*count] = p;
+    }
+    (*count)++;
+}
+
+static void test_st_frozen_slab_recycle(void) {
+    /* Must run while still in single-thread mode (g_pion_mt == 0) */
+    assert(pion_mt_flag == 0);
+
+    void *obj_seen[8];
+    void *arr_seen[8];
+    void *med_seen[8];
+    int obj_uniq = 0, arr_uniq = 0, med_uniq = 0;
+
+    for (int i = 0; i < 50000; i++) {
+        void *obj = pion_alloc_uninit(48u, PION_TAG_STRUCT, NULL);
+        ((uint64_t *)obj)[0] = (uint64_t)i;
+        void *arr = pion_arr_new(8, 0);
+        pion_arr_push(arr, (int64_t)i);
+        void *med = pion_arr_new(4096, 0); /* 32 KB backing buffer */
+        pion_arr_push(med, (int64_t)i);
+
+        if (i >= 10) {
+            record_unique_ptr(obj_seen, &obj_uniq, 8, obj);
+            record_unique_ptr(arr_seen, &arr_uniq, 8, ((PionArray *)arr)->data);
+            record_unique_ptr(med_seen, &med_uniq, 8, ((PionArray *)med)->data);
+        }
+
+        pion_rc_freeze(obj);
+        pion_rc_freeze(arr);
+        pion_rc_freeze(med);
+
+        pion_rc_dec(obj);
+        pion_rc_dec(arr);
+        pion_rc_dec(med);
+    }
+
+#if !defined(__SANITIZE_ADDRESS__)
+#if defined(__has_feature)
+#if !__has_feature(address_sanitizer)
+    assert(obj_uniq >= 1 && obj_uniq <= 4);
+    assert(arr_uniq >= 1 && arr_uniq <= 4);
+    assert(med_uniq >= 1 && med_uniq <= 4);
+#endif
+#else
+    assert(obj_uniq >= 1 && obj_uniq <= 4);
+    assert(arr_uniq >= 1 && arr_uniq <= 4);
+    assert(med_uniq >= 1 && med_uniq <= 4);
+#endif
+#endif
+
+    /* Transition ST -> MT (g_pion_mt = 1) right after ST frozen slab recycling
+     * and verify cross-thread frozen slab release under ASan + TSan. */
+    void *pre_objs[32];
+    for (int i = 0; i < 32; i++) {
+        pre_objs[i] = pion_alloc_uninit(48u, PION_TAG_STRUCT, NULL);
+        ((uint64_t *)pre_objs[i])[0] = 0xCAFEBABEULL;
+        pion_rc_freeze(pre_objs[i]);
+    }
+    void *ch = pion_chan_new(64, 1);
+    void *sc = pion_scope_begin();
+    void **env = (void **)pion_alloc((uint32_t)sizeof(void *), PION_TAG_STRUCT, st_frozen_mt_env_drop);
+    pion_rc_inc(ch);
+    *env = ch;
+    pion_scope_spawn(sc, st_frozen_mt_worker, env);
+    pion_rc_dec(env);
+    for (int i = 0; i < 32; i++) {
+        pion_chan_send(ch, (int64_t)(uintptr_t)pre_objs[i]);
+        pion_rc_dec(pre_objs[i]);
+    }
+    for (int i = 0; i < 32; i++) {
+        void *mt_obj = pion_alloc_uninit(48u, PION_TAG_STRUCT, NULL);
+        ((uint64_t *)mt_obj)[0] = 0xCAFEBABEULL;
+        pion_chan_send(ch, (int64_t)(uintptr_t)mt_obj);
+        pion_rc_dec(mt_obj);
+    }
+    pion_chan_close(ch);
+    pion_scope_end(sc);
+    pion_rc_dec(ch);
+    printf("[PASS] st_frozen_slab_recycle (50k ST frozen uniq: slab=%d arr=%d med32k=%d + ST->MT handoff)\n",
+           obj_uniq, arr_uniq, med_uniq);
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -2767,6 +2871,7 @@ int main(int argc, char **argv) {
     test_ffi_ptr_and_cstr();
     test_str_to_double();
 
+    test_st_frozen_slab_recycle();
     test_mt_shared_rc();
     test_mt_channel_10k();
     test_mt_mutex_and_atomic();

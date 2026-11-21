@@ -272,11 +272,15 @@ static PionSlabTLS g_main_slab;
 static _Thread_local PionSlabTLS *tls_slab = NULL;
 static _Atomic(void *) g_slab_remote[PION_SLAB_CLASSES];
 
+static PION_NOINLINE PION_COLD PION_MINSIZE PionSlabTLS *pion_slab_cur_mt(void) {
+    return tls_slab;
+}
+
 static inline PionSlabTLS *pion_slab_cur(void) {
     if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
         return &g_main_slab;
     }
-    return tls_slab;
+    return pion_slab_cur_mt();
 }
 #ifdef _WIN32
 static INIT_ONCE g_slab_fls_once = INIT_ONCE_STATIC_INIT;
@@ -438,8 +442,9 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_med_alloc(uint32_t mcls) 
 }
 
 static PION_NOINLINE PION_COLD PION_MINSIZE void pion_med_free(void *ptr, uint32_t mcls, int is_frozen) {
-    if (__builtin_expect(!is_frozen, 1)) {
-        PionSlabTLS *s = pion_slab_cur();
+    int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+    if (__builtin_expect(!mt || !is_frozen, 1)) {
+        PionSlabTLS *s = mt ? pion_slab_cur_mt() : &g_main_slab;
         uint8_t max_c = (mcls < 4u) ? 16u : 4u;
         if (__builtin_expect(s != NULL && s->med_count[mcls] < max_c, 1)) {
             pion_slab_set_next(ptr, s->med_free[mcls]);
@@ -467,7 +472,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_
             }
             return (void *)pion_slab_alloc_slow(&g_main_slab, cls);
         }
-        PionSlabTLS *s = tls_slab;
+        PionSlabTLS *s = pion_slab_cur_mt();
         if (s != NULL && s->local_free[cls] != NULL) {
             void *node = s->local_free[cls];
             s->local_free[cls] = pion_slab_get_next(node);
@@ -506,8 +511,9 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_slab_raw_free_slow(void *p
 #if PION_USE_SLAB
     if (bytes <= PION_SLAB_MAX_TOTAL) {
         uint32_t cls = pion_slab_cls_for(bytes);
-        PionSlabTLS *s = pion_slab_cur();
-        if (!is_frozen && s != NULL) {
+        int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+        PionSlabTLS *s = mt ? pion_slab_cur_mt() : &g_main_slab;
+        if ((!mt || !is_frozen) && s != NULL) {
             pion_slab_set_next(ptr, s->local_free[cls]);
             s->local_free[cls] = ptr;
             return;
@@ -530,7 +536,6 @@ static PION_NOINLINE void pion_slab_raw_free(void *ptr, size_t bytes, int is_fro
     if (!ptr) return;
 #if PION_USE_SLAB
     if (__builtin_expect(
-            !is_frozen &&
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
             bytes <= PION_SLAB_MAX_TOTAL, 1)) {
         uint32_t cls = pion_slab_cls_for(bytes);
@@ -560,7 +565,7 @@ static PION_NOINLINE void *pion_alloc_uninit_slow(
                 hdr = pion_slab_alloc_slow(&g_main_slab, cls);
             }
         } else {
-            PionSlabTLS *s = tls_slab;
+            PionSlabTLS *s = pion_slab_cur_mt();
             if (s != NULL && s->local_free[cls] != NULL) {
                 void *node = s->local_free[cls];
                 s->local_free[cls] = pion_slab_get_next(node);
@@ -638,8 +643,9 @@ static PION_NOINLINE void pion_destroy_slow(PionHeader *hdr, void *obj) {
     uint16_t flags = hdr->flags;
     if (__builtin_expect((flags & PION_FLAG_SLAB) != 0, 1)) {
         uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
-        PionSlabTLS *s = pion_slab_cur();
-        if (__builtin_expect((flags & PION_FLAG_FROZEN) == 0 && s != NULL, 1)) {
+        int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+        PionSlabTLS *s = mt ? pion_slab_cur_mt() : &g_main_slab;
+        if (__builtin_expect((!mt || (flags & PION_FLAG_FROZEN) == 0) && s != NULL, 1)) {
             pion_slab_set_next(hdr, s->local_free[cls]);
             s->local_free[cls] = hdr;
             return;
@@ -662,7 +668,7 @@ static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
     if (__builtin_expect(
             hdr->drop_fn == NULL &&
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
-            (flags & (PION_FLAG_SLAB | PION_FLAG_FROZEN)) == PION_FLAG_SLAB, 1)) {
+            (flags & PION_FLAG_SLAB) != 0, 1)) {
         uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
         pion_slab_set_next(hdr, g_main_slab.local_free[cls]);
         g_main_slab.local_free[cls] = hdr;
