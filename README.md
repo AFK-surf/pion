@@ -4,7 +4,13 @@
 
 `Pion` is a strict subset/evolution of MoonBit syntax built for deterministic machine & human collaboration: explicit top-level signatures, structured JSON compiler APIs with fix-its, an embedded QBE backend that writes native objects directly, biased reference counting, compile-time data-race freedom, explicit `World` capabilities, and a global content-addressed cache that leaves zero `target/` or `_build/` in source worktrees.
 
-[`SPEC.md`](SPEC.md) is the authoritative grammar, type system, runtime ABI and JSON protocol specification.
+[`SPEC.md`](SPEC.md) is the authoritative grammar, type system, runtime ABI and JSON protocol specification. See [`BEST_PRACTICES.md`](BEST_PRACTICES.md) for engineering guidelines and [`.agents/skills/pion/SKILL.md`](.agents/skills/pion/SKILL.md) (or `pionc skill`) for the portable AI Agent skill.
+
+## For AI Agents
+
+- **Load the built-in skill first**: run `pionc skill` (embedded in the compiler, zero network) or read [`.agents/skills/pion/SKILL.md`](.agents/skills/pion/SKILL.md) and [`BEST_PRACTICES.md`](BEST_PRACTICES.md); install it for Claude Code / Codex / Cursor / Antigravity with `pionc skill install [--global]`.
+- **GUI / Invar apps**: scaffold with `pionc init --template invar-app <dir>`, keep `#render_thread` on view/event functions, and never pass `World` into the render thread — on `E_NO_IO_VIOLATION`, move blocking IO into the background worker (`ui::Worker::pair()` + `ui::wake_now()`).
+- **Verify every edit**: close the loop with `pionc check --json <path>` (apply `edits` when provided) and `pionc test --json <path>`.
 
 ---
 
@@ -110,7 +116,8 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 | `pionc run [--release] [--target <t>] [-l <lib>] <path> [-- args...]` | Build and execute a package or `.pion` file (`--target wasm32` runs via `node runtime/pion_wasm_rt.mjs`) |
 | `pionc test [--json] [--package <name>] [--filter <name>] [--jobs <n>] [-l <lib>] <path>` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert`; a workspace directory runs every local package's tests in one pass and one report, with test binaries cached in the CAS (`testbin/`) and built and run in parallel (`--jobs`, `$PION_JOBS`) |
 | `pionc fmt [--check] [--json] <path...>` | Deterministic, idempotent, comment- and UTF-8-preserving formatter |
-| `pionc init [--json] <dir>` | Scaffold `pion.toml`, `src/main.pion` and `main_test.pion`; the result passes `check`, `test`, `run` and `fmt --check` as is |
+| `pionc init [--template cli\|service\|invar-app] [--json] <dir>` | Scaffold a package from a template (`cli` default, `service` background worker, or `invar-app` `#render_thread`-guarded dual-thread GUI skeleton) plus `AGENTS.md` and `.agents/skills/pion/SKILL.md`; passes `check`, `test`, `run` and `fmt --check` as is |
+| `pionc skill [install [--global] [--json] [dir]]` | Print the built-in Pion & Invar agent skill to stdout, or install it to `.agents/skills/pion/SKILL.md` and `.claude/skills/pion/SKILL.md` (project-local or `$HOME` with `--global`) |
 | `pionc fetch [--json] [dir]` | Resolve `git` dependencies into the global git cache and write/verify `pion.lock` |
 | `pionc add [--json] <name> (--path <p> \| --git <url> [--tag\|--rev\|--branch <r>] [--subdir <s>] \| [--registry <url>]) [dir]` | Add or change one dependency in `pion.toml` (in place, idempotent) and lock it; files restored on failure |
 | `pionc update [--json] [pkg] [dir]` | Re-read registry entries, re-resolve git dependencies to their newest target refs, rewrite `pion.lock`, re-check the workspace (restored on failure) |

@@ -5452,6 +5452,109 @@ fn drv_run_doc_cmd(world : World, targets : Array[String], as_json : Bool) -> In
 }
 
 ///|
+/// Scans every dependency package in `nodes` (excluding `root_dir`) for agent
+/// skills under `<pkg>/.agents/skills/*/SKILL.md` and `<pkg>/skills/*/SKILL.md`.
+fn drv_discover_dep_skills(
+  world : World,
+  root_dir : String,
+  nodes : Array[PkgNodeInput],
+) -> Array[String] {
+  let root_norm = drv_normalize_path(root_dir)
+  let found : Array[String] = []
+  let mut i = 0
+  while i < nodes.length() {
+    let dir = drv_normalize_path(nodes[i].dir)
+    if dir != root_norm {
+      let da_dir = drv_join_path(dir, ".agents/skills")
+      let sk_dir = drv_join_path(dir, "skills")
+      let da_entries : Array[String] = if fs_exists(world, da_dir) {
+        fs_list_dir(world, da_dir)
+      } else {
+        []
+      }
+      let sk_entries : Array[String] = if fs_exists(world, sk_dir) {
+        fs_list_dir(world, sk_dir)
+      } else {
+        []
+      }
+      let cands = collect_dep_skill_candidates(dir, da_entries, sk_entries)
+      let mut ci = 0
+      while ci < cands.length() {
+        if fs_exists(world, cands[ci]) {
+          push_unique_lib(found, cands[ci])
+        }
+        ci = ci + 1
+      }
+    }
+    i = i + 1
+  }
+  found
+}
+
+///|
+/// `pionc skill [install [--global] [--json] [dir]]`:
+/// prints the built-in Pion & Invar agent skill, or installs it to
+/// `.agents/skills/pion/SKILL.md` and `.claude/skills/pion/SKILL.md`.
+fn drv_run_skill_cmd(world : World, args : Array[String]) -> Int {
+  if args.length() == 2 {
+    io_print(world, pion_builtin_skill_md())
+    return 0
+  }
+  if args[2] != "install" {
+    drv_usage(world)
+    return 1
+  }
+  let mut is_global = false
+  let mut as_json = false
+  let mut dir = "."
+  let mut i = 3
+  while i < args.length() {
+    let a = args[i]
+    if a == "--global" {
+      is_global = true
+    } else if a == "--json" {
+      as_json = true
+    } else {
+      dir = a
+    }
+    i = i + 1
+  }
+  let base = if is_global {
+    let home = drv_env_str(world, "HOME")
+    if home.length() == 0 {
+      return drv_cmd_fail(world, as_json, "$HOME is not set; pass a directory or omit --global")
+    }
+    home
+  } else {
+    dir
+  }
+  let d1 = drv_join_path(base, ".agents/skills/pion")
+  let d2 = drv_join_path(base, ".claude/skills/pion")
+  let p1 = drv_join_path(d1, "SKILL.md")
+  let p2 = drv_join_path(d2, "SKILL.md")
+  let _ = fs_mkdir_p(world, d1)
+  let _ = fs_mkdir_p(world, d2)
+  let body = pion_builtin_skill_md()
+  match fs_write(world, p1, body) {
+    Err(e) => return drv_cmd_fail(world, as_json, "failed to write " + p1 + ": " + e)
+    Ok(_) => ()
+  }
+  match fs_write(world, p2, body) {
+    Err(e) => return drv_cmd_fail(world, as_json, "failed to write " + p2 + ": " + e)
+    Ok(_) => ()
+  }
+  if as_json {
+    io_println(
+      world,
+      "{\"ok\":true,\"files\":[" + json_quote(p1) + "," + json_quote(p2) + "]}",
+    )
+  } else {
+    io_println(world, "installed Pion agent skill to:\n  " + p1 + "\n  " + p2)
+  }
+  0
+}
+
+///|
 /// `pionc fetch [dir]`: resolves every git dependency of the workspace into the
 /// shared git cache and writes/verifies `pion.lock`; prints a JSON summary.
 fn drv_run_fetch_cmd(world : World, dir : String) -> Int {
@@ -5469,6 +5572,7 @@ fn drv_run_fetch_cmd(world : World, dir : String) -> Int {
     }
     Ok(v) => v
   }
+  let dep_skills = drv_discover_dep_skills(world, root_dir, ws.nodes)
   let sb = StringBuilder()
   sb.write_string("{\"ok\":true,\"lock\":")
   sb.write_string(json_quote(if ws.lock.length() > 0 || fs_exists(world, ws.lock_path) { ws.lock_path } else { "" }))
@@ -5510,26 +5614,85 @@ fn drv_run_fetch_cmd(world : World, dir : String) -> Int {
     sb.write_string("}")
     i = i + 1
   }
+  sb.write_string("],\"agent_skills\":[")
+  i = 0
+  while i < dep_skills.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(json_quote(dep_skills[i]))
+    i = i + 1
+  }
   sb.write_string("]}")
   io_println(world, sb.to_string())
   0
 }
 
 ///|
-/// `pionc init <dir>`: scaffolds `pion.toml`, `src/main.pion` and `main_test.pion`;
-/// refuses to touch a directory that already has any of them.
-fn drv_run_init_cmd(world : World, dir : String, as_json : Bool) -> Int {
+/// `pionc init [--template cli|service|invar-app] [--json] <dir>`: scaffolds a package;
+/// refuses to touch a directory that already has any of its target files.
+fn drv_run_init_cmd(
+  world : World,
+  dir : String,
+  tmpl : String,
+  as_json : Bool,
+) -> Int {
   let name = init_package_name(drv_normalize_path(dir))
-  let files : Array[String] = [
-    drv_join_path(dir, "pion.toml"),
-    drv_join_path(dir, "src/main.pion"),
-    drv_join_path(dir, "main_test.pion"),
-  ]
-  let contents : Array[String] = [
-    init_pion_toml(name),
-    init_main_source(name),
-    init_test_source(name),
-  ]
+  let files : Array[String] = []
+  let contents : Array[String] = []
+  if tmpl == "cli" {
+    files.push(drv_join_path(dir, "pion.toml"))
+    files.push(drv_join_path(dir, "src/main.pion"))
+    files.push(drv_join_path(dir, "main_test.pion"))
+    files.push(drv_join_path(dir, "AGENTS.md"))
+    files.push(drv_join_path(dir, ".agents/skills/pion/SKILL.md"))
+    contents.push(init_pion_toml(name))
+    contents.push(init_main_source(name))
+    contents.push(init_test_source(name))
+    contents.push(init_default_agents_md(name))
+    contents.push(pion_builtin_skill_md())
+  } else if tmpl == "service" {
+    files.push(drv_join_path(dir, "pion.toml"))
+    files.push(drv_join_path(dir, "src/worker.pion"))
+    files.push(drv_join_path(dir, "src/main.pion"))
+    files.push(drv_join_path(dir, "main_test.pion"))
+    files.push(drv_join_path(dir, "AGENTS.md"))
+    files.push(drv_join_path(dir, ".agents/skills/pion/SKILL.md"))
+    contents.push(init_service_pion_toml(name))
+    contents.push(init_service_worker_source(name))
+    contents.push(init_service_main_source(name))
+    contents.push(init_service_test_source(name))
+    contents.push(init_default_agents_md(name))
+    contents.push(pion_builtin_skill_md())
+  } else if tmpl == "invar-app" {
+    files.push(drv_join_path(dir, "pion.toml"))
+    files.push(drv_join_path(dir, "src/protocol.pion"))
+    files.push(drv_join_path(dir, "src/worker.pion"))
+    files.push(drv_join_path(dir, "src/view.pion"))
+    files.push(drv_join_path(dir, "src/main.pion"))
+    files.push(drv_join_path(dir, "main_test.pion"))
+    files.push(drv_join_path(dir, "AGENTS.md"))
+    files.push(drv_join_path(dir, ".agents/skills/pion/SKILL.md"))
+    contents.push(init_invar_pion_toml(name))
+    contents.push(init_invar_protocol_source(name))
+    contents.push(init_invar_worker_source(name))
+    contents.push(init_invar_view_source(name))
+    contents.push(init_invar_main_source(name))
+    contents.push(init_invar_test_source(name))
+    contents.push(init_invar_agents_md(name))
+    contents.push(pion_builtin_skill_md())
+  } else {
+    let err_msg = "unknown template `" + tmpl + "`; expected one of: cli, service, invar-app"
+    if as_json {
+      io_println(
+        world,
+        "{\"ok\":false,\"error\":" + json_quote(err_msg) + "}",
+      )
+    } else {
+      io_eprintln(world, "error: " + err_msg)
+    }
+    return 1
+  }
   let mut i = 0
   while i < files.length() {
     if fs_exists(world, files[i]) {
@@ -5546,6 +5709,7 @@ fn drv_run_init_cmd(world : World, dir : String, as_json : Bool) -> Int {
     i = i + 1
   }
   let _ = fs_mkdir_p(world, drv_join_path(dir, "src"))
+  let _ = fs_mkdir_p(world, drv_join_path(dir, ".agents/skills/pion"))
   i = 0
   while i < files.length() {
     match fs_write(world, files[i], contents[i]) {
@@ -5561,6 +5725,8 @@ fn drv_run_init_cmd(world : World, dir : String, as_json : Bool) -> Int {
     let sb = StringBuilder()
     sb.write_string("{\"ok\":true,\"package\":")
     sb.write_string(json_quote(name))
+    sb.write_string(",\"template\":")
+    sb.write_string(json_quote(tmpl))
     sb.write_string(",\"dir\":")
     sb.write_string(json_quote(dir))
     sb.write_string(",\"files\":[")
@@ -5575,7 +5741,7 @@ fn drv_run_init_cmd(world : World, dir : String, as_json : Bool) -> Int {
     sb.write_string("]}")
     io_println(world, sb.to_string())
   } else {
-    io_println(world, "created package `" + name + "` in " + dir)
+    io_println(world, "created package `" + name + "` (" + tmpl + ") in " + dir)
   }
   0
 }
@@ -5917,6 +6083,7 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
     )
   }
   let locked = lock_rev_of(ws.lock, name)
+  let dep_skills = drv_discover_dep_skills(world, root_dir, ws.nodes)
   if as_json {
     let sb = StringBuilder()
     sb.write_string("{\"ok\":true,\"action\":\"add\",\"package\":")
@@ -5931,7 +6098,16 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
     sb.write_string(json_quote(locked))
     sb.write_string(",\"changed\":")
     sb.write_string(if changed { "true" } else { "false" })
-    sb.write_string("}")
+    sb.write_string(",\"agent_skills\":[")
+    let mut si = 0
+    while si < dep_skills.length() {
+      if si > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(json_quote(dep_skills[si]))
+      si = si + 1
+    }
+    sb.write_string("]}")
     io_println(world, sb.to_string())
   } else {
     io_println(
@@ -5945,6 +6121,14 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
       (if locked.length() > 0 { " @ " + locked } else { "" }) +
       ")",
     )
+    let mut si = 0
+    while si < dep_skills.length() {
+      io_println(
+        world,
+        "note: dependency agent skill(s) found (read before writing code): " + dep_skills[si],
+      )
+      si = si + 1
+    }
   }
   0
 }
@@ -6129,7 +6313,8 @@ fn drv_usage(world : World) -> Unit {
     "  pionc fmt [--check] [--json] <input1> [input2 ...]\n" +
     "  pionc test [--json] [--package <name>] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] <input>\n" +
     "  pionc doc [--json] <input1> [input2 ...]\n" +
-    "  pionc init [--json] <dir>\n" +
+    "  pionc init [--template cli|service|invar-app] [--json] <dir>\n" +
+    "  pionc skill [install [--global] [--json] [dir]]\n" +
     "  pionc fetch [--json] [dir]\n" +
     "  pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]\n" +
     "  pionc update [--json] [pkg] [dir]",
@@ -6143,6 +6328,9 @@ pub fn main(world : World) -> Int {
     (args[1] == "--version" || args[1] == "-V" || args[1] == "version") {
     io_println(world, "pionc2 0.1.0 (self-hosted Pion native compiler)")
     return 0
+  }
+  if args.length() >= 2 && args[1] == "skill" {
+    return drv_run_skill_cmd(world, args)
   }
   if args.length() >= 2 && args[1] == "add" {
     return drv_run_add_cmd(world, args)
@@ -6168,13 +6356,24 @@ pub fn main(world : World) -> Int {
   let cmd = args[1]
   if cmd == "init" {
     let mut as_json = false
+    let mut tmpl = "cli"
     let mut dir = ""
     let mut i = 2
     while i < args.length() {
-      if args[i] == "--json" {
+      let a = args[i]
+      if a == "--json" {
         as_json = true
+      } else if a == "--template" {
+        if i + 1 >= args.length() {
+          drv_usage(world)
+          return 1
+        }
+        i = i + 1
+        tmpl = args[i]
+      } else if drv_starts_with(a, "--template=") {
+        tmpl = slice_str(a, 11, a.length())
       } else {
-        dir = args[i]
+        dir = a
       }
       i = i + 1
     }
@@ -6182,7 +6381,7 @@ pub fn main(world : World) -> Int {
       drv_usage(world)
       return 1
     }
-    return drv_run_init_cmd(world, dir, as_json)
+    return drv_run_init_cmd(world, dir, tmpl, as_json)
   }
   if cmd == "check" {
     let targets : Array[String] = []

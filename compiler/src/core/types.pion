@@ -210,6 +210,9 @@ pub struct Env {
   mut inferred_ret : Option[Ty]
   /// True while checking a callee's default parameter expression (allows transitive/package-private symbols).
   mut in_default_arg : Bool
+  /// True while checking a `#no_io` / `#render_thread` function (or any closure inside it).
+  mut in_no_io : Bool
+  mut no_io_fn_name : String
 }
 
 ///|
@@ -313,6 +316,8 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     closure_scope_floor: 0,
     inferred_ret: None,
     in_default_arg: false,
+    in_no_io: false,
+    no_io_fn_name: "",
   }
 }
 
@@ -884,6 +889,7 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
     }
     FnDecl::{
       is_pub: d.is_pub,
+      no_io: d.no_io,
       receiver_type: d.receiver_type,
       name: d.name,
       type_params: d.type_params,
@@ -1163,6 +1169,7 @@ fn qualify_fn_bounds(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
   FnInfo::{
     decl: FnDecl::{
       is_pub: d.is_pub,
+      no_io: false,
       receiver_type: d.receiver_type,
       name: d.name,
       type_params: d.type_params,
@@ -2850,6 +2857,18 @@ fn check_rt_prim_call(
   let off = if pr.world { 1 } else { 0 }
   let want = pr.param_tys.length() + off
   if pr.world {
+    if env.in_no_io {
+      tc_err(
+        tc,
+        sp,
+        "E_NO_IO_VIOLATION",
+        "calling `" + name + "` is forbidden inside `#no_io` / `#render_thread` function `" + env.no_io_fn_name + "`",
+        "non-blocking UI logic (no World IO)",
+        "World IO call `" + name + "`",
+        "send a command over `Channel` to a background worker thread (`spawn`) that owns `World`, then wake the render thread with the result (run 'pionc skill' for the dual-thread guide)",
+      )
+      return pr.ret_ty
+    }
     let mut has_world = false
     if args.length() > 0 {
       match check_expr(tc, env, args[0], Some(TWorld)) {
@@ -2930,7 +2949,17 @@ fn check_world_builtin_call(
       _ => ()
     }
   }
-  if !env.has_world && !has_world_arg {
+  if env.in_no_io {
+    tc_err(
+      tc,
+      sp,
+      "E_NO_IO_VIOLATION",
+      "calling `" + name + "` is forbidden inside `#no_io` / `#render_thread` function `" + env.no_io_fn_name + "`",
+      "non-blocking UI logic (no World IO)",
+      "World IO call `" + name + "`",
+      "send a command over `Channel` to a background worker thread (`spawn`) that owns `World`, then wake the render thread with the result (run 'pionc skill' for the dual-thread guide)",
+    )
+  } else if !env.has_world && !has_world_arg {
     tc_err(
       tc,
       sp,
@@ -6739,6 +6768,23 @@ fn check_expr_inner(
       }
       match env_lookup(env, name) {
         Some(b) => {
+          if env.in_no_io {
+            match b.ty {
+              TWorld => {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_NO_IO_VIOLATION",
+                  "`#no_io` / `#render_thread` function `" + env.no_io_fn_name + "` cannot reference a `World` capability (blocking IO is forbidden on the render thread)",
+                  "no World value",
+                  "World",
+                  "move blocking IO/compute into a background worker thread (`spawn` + `Channel` + `wake_now`) and pass only a command sender into the render function (run 'pionc skill' for the dual-thread guide)",
+                )
+                return TError
+              }
+              _ => ()
+            }
+          }
           if b.decl_span.line > 0 && tc.infer_pending.contains(span_key(b.decl_span)) {
             match expected {
               Some(exp_ty) =>
@@ -8462,7 +8508,25 @@ fn check_expr_inner(
       env_push(env)
       let mut j = 0
       while j < params.length() {
-        env_define(env, params[j].name, ptys[j], false)
+        let mut pty_def = ptys[j]
+        if env.in_no_io {
+          match ptys[j] {
+            TWorld => {
+              tc_err(
+                tc,
+                params[j].span,
+                "E_NO_IO_VIOLATION",
+                "`#no_io` / `#render_thread` function `" + env.no_io_fn_name + "` cannot accept a `World` capability (blocking IO is forbidden on the render thread)",
+                "no World parameter",
+                "World",
+                "move blocking IO/compute into a background worker thread (`spawn` + `Channel` + `wake_now`) and pass only a command sender into the render function (run 'pionc skill' for the dual-thread guide)",
+              )
+              pty_def = TError
+            }
+            _ => ()
+          }
+        }
+        env_define(env, params[j].name, pty_def, false)
         j = j + 1
       }
       let body_ty = check_stmts(tc, env, body, ret_opt)
@@ -8496,6 +8560,19 @@ fn check_expr_inner(
       clo_ty
     }
     EScope(w_expr, f_expr, sp) => {
+      if env.in_no_io {
+        tc_err(
+          tc,
+          sp,
+          "E_NO_IO_VIOLATION",
+          "calling `scope` is forbidden inside `#no_io` / `#render_thread` function `" + env.no_io_fn_name + "`",
+          "non-blocking UI logic (no World IO)",
+          "World IO call `scope`",
+          "send a command over `Channel` to a background worker thread (`spawn`) that owns `World`, then wake the render thread with the result (run 'pionc skill' for the dual-thread guide)",
+        )
+        let _ = check_expr(tc, env, f_expr, Some(TFn([TScope], TUnit)))
+        return TUnit
+      }
       let wty = check_expr(tc, env, w_expr, Some(TWorld))
       if !ty_compat(TWorld, wty) {
         tc_err(
@@ -9410,6 +9487,12 @@ pub fn check_package_with_imports(
               let env = env_new(finfo.ret_ty, fd.type_params)
               env.fn_lparen_span = fd.lparen_span
               env.fn_has_params = fd.params.length() > 0
+              env.in_no_io = fd.no_io
+              env.no_io_fn_name = if fd.receiver_type != "" {
+                fd.receiver_type + "::" + fd.name
+              } else {
+                fd.name
+              }
               if fd.type_params.length() > 0 {
                 env.fn_key = span_key(fd.span)
               }
@@ -9450,7 +9533,25 @@ pub fn check_package_with_imports(
                   }
                   None => ()
                 }
-                env_define(env, fd.params[pi].name, finfo.param_tys[pi], false)
+                let mut pty_def = finfo.param_tys[pi]
+                if fd.no_io {
+                  match finfo.param_tys[pi] {
+                    TWorld => {
+                      tc_err(
+                        tc,
+                        fd.params[pi].span,
+                        "E_NO_IO_VIOLATION",
+                        "`#no_io` / `#render_thread` function `" + env.no_io_fn_name + "` cannot accept a `World` capability (blocking IO is forbidden on the render thread)",
+                        "no World parameter",
+                        "World",
+                        "move blocking IO/compute into a background worker thread (`spawn` + `Channel` + `wake_now`) and pass only a command sender into the render function (run 'pionc skill' for the dual-thread guide)",
+                      )
+                      pty_def = TError
+                    }
+                    _ => ()
+                  }
+                }
+                env_define(env, fd.params[pi].name, pty_def, false)
                 pi = pi + 1
               }
               let body_ty = check_stmts(tc, env, fd.body, Some(finfo.ret_ty))
@@ -9549,9 +9650,33 @@ pub fn check_package_with_imports(
                 match iinfo.methods.get(md.name) {
                   Some(finfo) => {
                     let env = env_new(finfo.ret_ty, [])
+                    env.in_no_io = md.no_io
+                    env.no_io_fn_name = if md.receiver_type != "" {
+                      md.receiver_type + "::" + md.name
+                    } else {
+                      md.name
+                    }
                     let mut pi = 0
                     while pi < md.params.length() && pi < finfo.param_tys.length() {
-                      env_define(env, md.params[pi].name, finfo.param_tys[pi], false)
+                      let mut pty_def = finfo.param_tys[pi]
+                      if md.no_io {
+                        match finfo.param_tys[pi] {
+                          TWorld => {
+                            tc_err(
+                              tc,
+                              md.params[pi].span,
+                              "E_NO_IO_VIOLATION",
+                              "`#no_io` / `#render_thread` function `" + env.no_io_fn_name + "` cannot accept a `World` capability (blocking IO is forbidden on the render thread)",
+                              "no World parameter",
+                              "World",
+                              "move blocking IO/compute into a background worker thread (`spawn` + `Channel` + `wake_now`) and pass only a command sender into the render function (run 'pionc skill' for the dual-thread guide)",
+                            )
+                            pty_def = TError
+                          }
+                          _ => ()
+                        }
+                      }
+                      env_define(env, md.params[pi].name, pty_def, false)
                       pi = pi + 1
                     }
                     let body_ty = check_stmts(tc, env, md.body, Some(finfo.ret_ty))
