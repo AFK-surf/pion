@@ -426,10 +426,103 @@ fn drv_resolve_qbe_bin(world : World) -> String {
 }
 
 ///|
-fn drv_resolve_rt_lib(world : World) -> String {
+fn drv_find_pion_rt_c(world : World) -> String {
+  let env_src = drv_env_str(world, "PION_SRC")
+  if env_src.length() > 0 {
+    let c0 = drv_join_path(env_src, "runtime/pion_rt.c")
+    if fs_exists(world, c0) {
+      return c0
+    }
+  }
+  let args = world_args(world)
+  if args.length() > 0 {
+    let exe_dir = drv_parent_dir(args[0])
+    if exe_dir.length() > 0 {
+      let c1 = drv_join_path(drv_parent_dir(exe_dir), "runtime/pion_rt.c")
+      if fs_exists(world, c1) {
+        return c1
+      }
+    }
+  }
+  if fs_exists(world, "runtime/pion_rt.c") {
+    return "runtime/pion_rt.c"
+  }
+  if fs_exists(world, "../runtime/pion_rt.c") {
+    return "../runtime/pion_rt.c"
+  }
+  ""
+}
+
+///|
+fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
+  let rt_c = drv_find_pion_rt_c(world)
+  if rt_c.length() == 0 {
+    return None
+  }
+  let c_txt = match fs_read(world, rt_c) {
+    Ok(t) => t
+    Err(_) => return None
+  }
+  let c_hash = sha256_hex(c_txt)
+  let rt_h = drv_join_path(drv_parent_dir(rt_c), "pion_rt.h")
+  let h_hash = if fs_exists(world, rt_h) {
+    match fs_read(world, rt_h) {
+      Ok(t) => sha256_hex(t)
+      Err(_) => ""
+    }
+  } else {
+    ""
+  }
+  let key = sha256_hex("pion-rt-msvc-v1|" + cc_bin + "|" + c_hash + "|" + h_hash)
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let obj_path = cache_dir + "/obj/pion_rt_msvc_" + key + ".o"
+  if fs_exists(world, obj_path) {
+    return Some(obj_path)
+  }
+  let stamp = clock_now_ms(world).to_string()
+  let obj_tmp = obj_path + ".tmp." + stamp
+  let argv : Array[String] = [
+    cc_bin,
+    "-std=c11",
+    "-O2",
+    "-fno-asynchronous-unwind-tables",
+    "-D_CRT_SECURE_NO_WARNINGS",
+    "-c",
+    rt_c,
+    "-o",
+    obj_tmp,
+  ]
+  let rc = proc_exec(world, argv)
+  if rc != 0 {
+    let _ = fs_remove(world, obj_tmp)
+    return None
+  }
+  let _ = fs_rename(world, obj_tmp, obj_path)
+  let sz = fs_size(world, obj_path)
+  drv_cas_record_and_evict(
+    world,
+    cache_dir,
+    "pion_rt_msvc_" + key,
+    if sz > 0L { sz } else { 0L },
+  )
+  Some(obj_path)
+}
+
+///|
+fn drv_resolve_rt_lib(world : World, qbe_target : String) -> String {
   let env_rt = drv_env_str(world, "PION_RT_LIB")
   if env_rt.length() > 0 {
     return env_rt
+  }
+  if drv_target_is_windows(qbe_target) {
+    let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
+    if drv_is_windows_msvc_cc(world, qbe_target, cc_bin) {
+      match drv_ensure_msvc_rt_obj(world, cc_bin) {
+        Some(obj_path) => return obj_path
+        None => ()
+      }
+    }
   }
   if fs_exists(world, "out/libpionrt.a") {
     return "out/libpionrt.a"
@@ -589,6 +682,43 @@ fn drv_resolve_android_ndk_tool(
 }
 
 ///|
+fn drv_win_translate_msvc_flags(
+  flags : Array[String],
+  is_cdylib : Bool,
+) -> Array[String] {
+  win_translate_msvc_flags(flags, is_cdylib)
+}
+
+///|
+fn drv_is_windows_msvc_cc(
+  world : World,
+  qbe_target : String,
+  cc_bin : String,
+) -> Bool {
+  if !drv_target_is_windows(qbe_target) {
+    return false
+  }
+  let abi = drv_env_str(world, "PION_WIN_ABI")
+  if abi == "msvc" {
+    return true
+  }
+  if abi == "mingw" || abi == "gnu" {
+    return false
+  }
+  if drv_ends_with(cc_bin, "clang-cl") ||
+    drv_ends_with(cc_bin, "clang-cl.exe") ||
+    drv_ends_with(cc_bin, "clang-cl.EXE") {
+    return true
+  }
+  match proc_exec_capture(world, [cc_bin, "-dumpmachine"]) {
+    Ok(out) =>
+      drv_find_substr(out, "msvc", 0) >= 0 ||
+      drv_find_substr(out, "MSVC", 0) >= 0
+    Err(_) => false
+  }
+}
+
+///|
 fn drv_resolve_cc_driver(
   world : World,
   qbe_target : String,
@@ -610,7 +740,12 @@ fn drv_resolve_cc_driver(
     if e.length() > 0 {
       e
     } else if drv_target_is_windows(qbe_target) {
-      "g++"
+      let derived = win_derive_cxx_from_cc(drv_env_str(world, "CC"))
+      if derived.length() > 0 {
+        derived
+      } else {
+        "g++"
+      }
     } else {
       "c++"
     }
@@ -1898,6 +2033,16 @@ fn drv_compile_pkg_c_sources(
   if alt_rt_dir != rt_dir &&
     fs_exists(world, drv_join_path(alt_rt_dir, "pion_rt.h")) {
     rt_inc_dirs.push(alt_rt_dir)
+  } else if !fs_exists(world, drv_join_path(rt_dir, "pion_rt.h")) {
+    let rt_c = drv_find_pion_rt_c(world)
+    if rt_c.length() > 0 {
+      let src_rt_dir = drv_parent_dir(rt_c)
+      if src_rt_dir.length() > 0 &&
+        src_rt_dir != rt_dir &&
+        fs_exists(world, drv_join_path(src_rt_dir, "pion_rt.h")) {
+        rt_inc_dirs.push(src_rt_dir)
+      }
+    }
   }
   let cc_flags_joined = drv_join_char(cc_flags, "\n")
   let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
@@ -1994,6 +2139,229 @@ fn drv_compile_pkg_c_sources(
     si = si + 1
   }
   Ok(any_cxx)
+}
+
+///|
+fn drv_find_in_path(world : World, bin_name : String) -> String {
+  let path_env = drv_env_str(world, "PATH")
+  if path_env.length() == 0 {
+    return ""
+  }
+  let sep = if drv_env_str(world, "OS") == "Windows_NT" ||
+    drv_find_substr(path_env, ";", 0) >= 0 {
+    59
+  } else {
+    58
+  }
+  let dirs = drv_split_char(path_env, sep)
+  let mut i = 0
+  while i < dirs.length() {
+    let d = dirs[i]
+    if d.length() > 0 {
+      let cand = drv_join_path(d, bin_name)
+      if fs_exists(world, cand) {
+        return cand
+      }
+    }
+    i = i + 1
+  }
+  ""
+}
+
+///|
+fn drv_resolve_win_rc_bin(
+  world : World,
+  cc_bin : String,
+  is_msvc : Bool,
+) -> String {
+  let cc_dir = drv_parent_dir(cc_bin)
+  if is_msvc {
+    if cc_dir.length() > 0 {
+      let c1 = drv_join_path(cc_dir, "llvm-rc.exe")
+      if fs_exists(world, c1) {
+        return c1
+      }
+      let c2 = drv_join_path(cc_dir, "llvm-rc")
+      if fs_exists(world, c2) {
+        return c2
+      }
+    }
+    let p1 = drv_find_in_path(world, "llvm-rc.exe")
+    if p1.length() > 0 {
+      return p1
+    }
+    let p2 = drv_find_in_path(world, "llvm-rc")
+    if p2.length() > 0 {
+      return p2
+    }
+    let p3 = drv_find_in_path(world, "rc.exe")
+    if p3.length() > 0 {
+      return p3
+    }
+    "llvm-rc"
+  } else {
+    if cc_dir.length() > 0 {
+      let w1 = drv_join_path(cc_dir, "windres.exe")
+      if fs_exists(world, w1) {
+        return w1
+      }
+      let w2 = drv_join_path(cc_dir, "windres")
+      if fs_exists(world, w2) {
+        return w2
+      }
+    }
+    "windres"
+  }
+}
+
+///|
+fn drv_rc_dir_fp(world : World, rc_dir : String) -> String {
+  if rc_dir.length() == 0 || !fs_is_dir(world, rc_dir) {
+    return ""
+  }
+  let entries = fs_list_dir(world, rc_dir)
+  drv_sort_strings(entries)
+  let parts : Array[String] = []
+  let mut i = 0
+  while i < entries.length() {
+    let name = entries[i]
+    if name.length() > 0 && str_code_at(name, 0) != 46 {
+      let full = drv_join_path(rc_dir, name)
+      if !fs_is_dir(world, full) {
+        let sz = fs_size(world, full)
+        let mt = fs_mtime_ms(world, full)
+        let content_h = if sz >= 0L && sz <= 4194304L {
+          match fs_read_bytes(world, full) {
+            Ok(bs) => sha256_hex(bs.to_string())
+            Err(_) => ""
+          }
+        } else {
+          ""
+        }
+        parts.push(
+          name + ":" + sz.to_string() + ":" + mt.to_string() + ":" + content_h,
+        )
+      }
+    }
+    i = i + 1
+  }
+  sha256_hex(drv_join_char(parts, "\n"))
+}
+
+///|
+/// Compiles a package's Windows `.rc` resource scripts (`[link.windows] rc_sources`)
+/// into CAS-cached `$PION_CACHE_DIR/obj/rc_<key>.res` objects (Windows targets only).
+fn drv_compile_pkg_rc_sources(
+  world : World,
+  node : PkgNodeInput,
+  qbe_target : String,
+  cache_dir : String,
+  trace_cas : Bool,
+  out_res : Array[String],
+  out_keys : Array[String],
+  out_new_keys : Array[String],
+  out_new_sizes : Array[Int64],
+) -> Result[Unit, String] {
+  if !drv_target_is_windows(qbe_target) {
+    return Ok(())
+  }
+  let rc_sources : Array[String] = []
+  let mut i = 0
+  while i < node.link_common.rc_sources.length() {
+    push_unique_lib(
+      rc_sources,
+      drv_resolve_pkg_path(node.dir, node.link_common.rc_sources[i]),
+    )
+    i = i + 1
+  }
+  i = 0
+  while i < node.link_windows.rc_sources.length() {
+    push_unique_lib(
+      rc_sources,
+      drv_resolve_pkg_path(node.dir, node.link_windows.rc_sources[i]),
+    )
+    i = i + 1
+  }
+  if rc_sources.length() == 0 {
+    return Ok(())
+  }
+  let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
+  let is_msvc = drv_is_windows_msvc_cc(world, qbe_target, cc_bin)
+  let rc_bin = drv_resolve_win_rc_bin(world, cc_bin, is_msvc)
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let mut ri = 0
+  while ri < rc_sources.length() {
+    let rc_path = rc_sources[ri]
+    if !fs_exists(world, rc_path) {
+      return Err("rc_source does not exist: " + rc_path)
+    }
+    let rc_txt = match fs_read(world, rc_path) {
+      Ok(t) => t
+      Err(e) => return Err("failed to read rc_source " + rc_path + ": " + e)
+    }
+    let rc_hash = sha256_hex(rc_txt)
+    let rc_dir_raw = drv_parent_dir(rc_path)
+    let rc_dir = if rc_dir_raw.length() > 0 { rc_dir_raw } else { "." }
+    let res_fp = drv_rc_dir_fp(world, rc_dir)
+    let key = sha256_hex(
+      "rc-v1|" +
+      qbe_target +
+      "|" +
+      (if is_msvc { "msvc" } else { "mingw" }) +
+      "|" +
+      rc_bin +
+      "|" +
+      rc_path +
+      "|" +
+      rc_hash +
+      "|" +
+      res_fp,
+    )
+    let res_path = cache_dir + "/obj/rc_" + key + ".res"
+    if fs_exists(world, res_path) {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas] rc=" + rc_path + " HIT key=" + drv_prefix16(key),
+        )
+      }
+    } else {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas] rc=" + rc_path + " MISS key=" + drv_prefix16(key),
+        )
+      }
+      let stamp = clock_now_ms(world).to_string()
+      let res_tmp = res_path + ".tmp." + stamp + "_" + ri.to_string()
+      let argv : Array[String] = if is_msvc {
+        [rc_bin, "-I", rc_dir, "-fo", res_tmp, rc_path]
+      } else {
+        [rc_bin, "-I", rc_dir, rc_path, "-O", "coff", "-o", res_tmp]
+      }
+      let rc = proc_exec(world, argv)
+      if rc != 0 {
+        let _ = fs_remove(world, res_tmp)
+        return Err(
+          "failed to compile rc_source " +
+          rc_path +
+          " with " +
+          rc_bin +
+          " (exit code " +
+          rc.to_string() +
+          ")",
+        )
+      }
+      let _ = fs_rename(world, res_tmp, res_path)
+      let sz = fs_size(world, res_path)
+      out_new_keys.push("rc_" + key)
+      out_new_sizes.push(if sz > 0L { sz } else { 0L })
+    }
+    out_res.push(res_path)
+    out_keys.push(key)
+    ri = ri + 1
+  }
+  Ok(())
 }
 
 ///|
@@ -2273,22 +2641,35 @@ fn drv_link_shared_lib(
       fwi = fwi + 1
     }
   }
+  let is_win_msvc = drv_is_windows_msvc_cc(world, qbe_target, driver)
   let mut li = 0
   while li < opts.libs.length() {
-    ld_argv.push("-l" + opts.libs[li])
+    let lib = opts.libs[li]
+    if !is_win_msvc || (lib != "m" && lib != "pthread") {
+      ld_argv.push("-l" + lib)
+    }
     li = li + 1
   }
-  let mut fli = 0
-  while fli < opts.flags.length() {
-    ld_argv.push(opts.flags[fli])
-    fli = fli + 1
-  }
-  if !drv_target_is_apple(qbe_target) {
-    ld_argv.push("-lm")
-    if drv_target_is_windows(qbe_target) {
-      ld_argv.push("-lws2_32")
-    } else if !drv_target_is_android(qbe_target) {
-      ld_argv.push("-lpthread")
+  if is_win_msvc {
+    let t_flags = drv_win_translate_msvc_flags(opts.flags, true)
+    let mut fli = 0
+    while fli < t_flags.length() {
+      ld_argv.push(t_flags[fli])
+      fli = fli + 1
+    }
+  } else {
+    let mut fli = 0
+    while fli < opts.flags.length() {
+      ld_argv.push(opts.flags[fli])
+      fli = fli + 1
+    }
+    if !drv_target_is_apple(qbe_target) {
+      ld_argv.push("-lm")
+      if drv_target_is_windows(qbe_target) {
+        ld_argv.push("-lws2_32")
+      } else if !drv_target_is_android(qbe_target) {
+        ld_argv.push("-lpthread")
+      }
     }
   }
   ld_argv.push("-o")
@@ -2390,25 +2771,38 @@ fn drv_link_objects(
         fwi = fwi + 1
       }
     }
+    let is_win_msvc = drv_is_windows_msvc_cc(world, qbe_target, driver)
     let mut li = 0
     while li < opts.libs.length() {
-      ld_argv.push("-l" + opts.libs[li])
+      let lib = opts.libs[li]
+      if !is_win_msvc || (lib != "m" && lib != "pthread") {
+        ld_argv.push("-l" + lib)
+      }
       li = li + 1
     }
-    let mut fli = 0
-    while fli < opts.flags.length() {
-      ld_argv.push(opts.flags[fli])
-      fli = fli + 1
-    }
-    if !drv_target_is_apple(qbe_target) {
-      ld_argv.push("-lm")
-      if drv_target_is_windows(qbe_target) {
-        ld_argv.push("-lws2_32")
-        // MinGW-w64 defaults the main thread to a 1 MB stack (macOS/Linux: 8 MB);
-        // deep recursion (e.g. self-hosting 43K lines) needs 16 MB.
-        ld_argv.push("-Wl,--stack,16777216")
-      } else if !drv_target_is_android(qbe_target) {
-        ld_argv.push("-lpthread")
+    if is_win_msvc {
+      let t_flags = drv_win_translate_msvc_flags(opts.flags, false)
+      let mut fli = 0
+      while fli < t_flags.length() {
+        ld_argv.push(t_flags[fli])
+        fli = fli + 1
+      }
+    } else {
+      let mut fli = 0
+      while fli < opts.flags.length() {
+        ld_argv.push(opts.flags[fli])
+        fli = fli + 1
+      }
+      if !drv_target_is_apple(qbe_target) {
+        ld_argv.push("-lm")
+        if drv_target_is_windows(qbe_target) {
+          ld_argv.push("-lws2_32")
+          // MinGW-w64 defaults the main thread to a 1 MB stack (macOS/Linux: 8 MB);
+          // deep recursion (e.g. self-hosting 43K lines) needs 16 MB.
+          ld_argv.push("-Wl,--stack,16777216")
+        } else if !drv_target_is_android(qbe_target) {
+          ld_argv.push("-lpthread")
+        }
       }
     }
     ld_argv.push("-o")
@@ -2796,7 +3190,7 @@ fn drv_build_nodes_objects(
 
   let qbe_target = drv_pick_target(world, target_override)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib(world)
+  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -3031,6 +3425,29 @@ fn drv_build_nodes_objects(
       link_key_sb.write_string(":cstub:")
       link_key_sb.write_string(cstub_keys[ci])
       ci = ci + 1
+    }
+    let rc_objs : Array[String] = []
+    let rc_keys : Array[String] = []
+    match drv_compile_pkg_rc_sources(
+      world,
+      node,
+      qbe_target,
+      cache_dir,
+      trace_cas,
+      rc_objs,
+      rc_keys,
+      cstub_new_keys,
+      cstub_new_sizes,
+    ) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    let mut rci = 0
+    while rci < rc_objs.length() {
+      push_unique_lib(ws_link_opts.objects, rc_objs[rci])
+      link_key_sb.write_string(":rc:")
+      link_key_sb.write_string(rc_keys[rci])
+      rci = rci + 1
     }
     k = k + 1
   }
@@ -3270,7 +3687,7 @@ fn drv_build_targets(
           li = li + 1
         }
         let qbe_target = drv_pick_target(world, target_override)
-        let rt_lib = drv_resolve_rt_lib(world)
+        let rt_lib = drv_resolve_rt_lib(world, qbe_target)
         if emit_cdylib_path != "" {
           return drv_link_shared_lib(
             world,
@@ -3342,7 +3759,7 @@ fn drv_build_targets(
   let qbe_target = drv_pick_target(world, target_override)
   let qbe_arch = drv_target_qbe_arch(qbe_target)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib_fp = drv_resolve_rt_lib(world)
+  let rt_lib_fp = drv_resolve_rt_lib(world, qbe_target)
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib_fp)
   let fp_pre = drv_prefix16(compiler_fp)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
@@ -3843,7 +4260,7 @@ fn drv_build_targets(
     if out_bin_arg != "" {
       drv_ensure_parent_dir(world, out_bin_arg)
     }
-    let rt_lib = drv_resolve_rt_lib(world)
+    let rt_lib = drv_resolve_rt_lib(world, qbe_target)
     match drv_link_objects(world, qbe_target, apple_tools, ld_ver, sysroot, obj_paths, rt_lib, link_opts, final_bin) {
       Err(e) => return Err(e)
       Ok(_) => ()
@@ -4053,7 +4470,7 @@ fn drv_build_targets(
   if emit_staticlib_path != "" {
     return drv_archive_static_lib(world, [obj_path], emit_staticlib_path)
   }
-  let rt_lib = drv_resolve_rt_lib(world)
+  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
   if emit_cdylib_path != "" {
     return drv_link_shared_lib(
       world,
@@ -4291,7 +4708,7 @@ fn drv_exec_test_jobs(
   let _ = fs_mkdir_p(world, tb_dir)
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib(world)
+  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -4750,7 +5167,7 @@ fn drv_build_needed_objects(
   let _ = fs_mkdir_p(world, cache_dir + "/obj")
   let qbe_target = drv_resolve_qbe_target(world)
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib(world)
+  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -5006,16 +5423,18 @@ fn drv_run_ws_tests(
   }
   let t_built = clock_now_ms(world)
   let qbe_target = drv_resolve_qbe_target(world)
-  let rt_lib = drv_resolve_rt_lib(world)
+  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
   let cache_dir = drv_resolve_cache_dir(world)
   let need_cstub : Array[Bool] = []
   let pkg_cstub_objs : Array[Array[String]] = []
   let pkg_cstub_cxx : Array[Bool] = []
+  let pkg_rc_objs : Array[Array[String]] = []
   k = 0
   while k < n {
     need_cstub.push(need[k])
     pkg_cstub_objs.push([])
     pkg_cstub_cxx.push(false)
+    pkg_rc_objs.push([])
     k = k + 1
   }
   si = 0
@@ -5052,6 +5471,25 @@ fn drv_run_ws_tests(
           pkg_cstub_objs[k] = cstub_objs
           pkg_cstub_cxx[k] = has_cxx
         }
+      }
+      let rc_objs : Array[String] = []
+      let rc_keys : Array[String] = []
+      match drv_compile_pkg_rc_sources(
+        world,
+        nodes[topo.order[k]],
+        qbe_target,
+        cache_dir,
+        trace,
+        rc_objs,
+        rc_keys,
+        cstub_new_keys,
+        cstub_new_sizes,
+      ) {
+        Err(msg) => {
+          io_eprintln(world, "error: " + msg)
+          return 1
+        }
+        Ok(_) => pkg_rc_objs[k] = rc_objs
       }
     }
     k = k + 1
@@ -5118,6 +5556,12 @@ fn drv_run_ws_tests(
           job_opts.has_cxx = true
         }
         drv_collect_node_link_opts(dn, qbe_target, job_opts)
+        let drcs = pkg_rc_objs[tu]
+        let mut rci = 0
+        while rci < drcs.length() {
+          push_unique_lib(job_opts.objects, drcs[rci])
+          rci = rci + 1
+        }
         u = u + 1
       }
       let self_cstubs = pkg_cstub_objs[tk]
@@ -5130,6 +5574,12 @@ fn drv_run_ws_tests(
         job_opts.has_cxx = true
       }
       drv_collect_node_link_opts(node, qbe_target, job_opts)
+      let self_rcs = pkg_rc_objs[tk]
+      let mut rci = 0
+      while rci < self_rcs.length() {
+        push_unique_lib(job_opts.objects, self_rcs[rci])
+        rci = rci + 1
+      }
       let mut li = 0
       while li < cli_libs.length() {
         push_unique_lib(job_opts.libs, cli_libs[li])
