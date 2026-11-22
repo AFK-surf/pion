@@ -108,18 +108,22 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 
 | Command | Purpose |
 |---|---|
-| `pionc check [--json] <path...>` | Type, exhaustiveness, must-use `Result`, `Send`, `World` and visibility checks; JSON diagnostics with fix-its and machine-applicable `edits` (`[{file,line,col,end_line,end_col,replacement}]`) |
+| `pionc check [--fix] [--json] [path...]` | Type, exhaustiveness, must-use `Result`, `Send`, `World` and visibility checks; JSON diagnostics with fix-its and machine-applicable `edits` (`--fix` applies edits in up to 3 rounds and re-checks; defaults to `.` when `pion.toml` or `src/` exists) |
 | `pionc query defs\|sig\|callers\|deps [--json] <path...>` | Symbol definitions, exported `.pionsig` interface, call graph, package dependency graph; a path may be a file, a package directory or a whole workspace |
-| `pionc doc [--json] <path...>` | Public API of each package (dependencies first) |
+| `pionc doc [--json] [path...]` | Public API of each package (dependencies first; defaults to `.`) |
 | `pionc emit-sig <path...>` | Print the `.pionsig` export table |
-| `pionc build [--release] [--target <t>] [--sysroot <dir>] [--emit-obj <f>] [--emit-staticlib <f.a>] [--emit-cdylib <f.so\|.dylib\|.dll>] [--emit-ssa <f>] [--emit-asm <f>] [--jobs <n>] [-l <lib>] [-o <bin>] <path...>` | Native binary, `.o`, C staticlib (`.a`), C cdylib (`.dylib`/`.so`/`.dll`), or zero-toolchain `.wasm` binary via the global CAS across `arm64_apple`, `amd64_apple`, `amd64_sysv`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`, and `wasm32` (`--release` strips `debug_assert`) |
-| `pionc run [--release] [--target <t>] [-l <lib>] <path> [-- args...]` | Build and execute a package or `.pion` file (`--target wasm32` runs via `node runtime/pion_wasm_rt.mjs`) |
-| `pionc test [--json] [--package <name>] [--filter <name>] [--jobs <n>] [-l <lib>] <path>` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert`; a workspace directory runs every local package's tests in one pass and one report, with test binaries cached in the CAS (`testbin/`) and built and run in parallel (`--jobs`, `$PION_JOBS`) |
-| `pionc fmt [--check] [--json] <path...>` | Deterministic, idempotent, comment- and UTF-8-preserving formatter |
+| `pionc build [--release] [--target <t>] [--sysroot <dir>] [--emit-obj <f>] [--emit-staticlib <f.a>] [--emit-cdylib <f.so\|.dylib\|.dll>] [--emit-ssa <f>] [--emit-asm <f>] [--jobs <n>] [-l <lib>] [-o <bin>] [path...]` | Native binary, `.o`, C staticlib (`.a`), C cdylib (`.dylib`/`.so`/`.dll`), or zero-toolchain `.wasm` binary via the global CAS across `arm64_apple`, `amd64_apple`, `amd64_sysv`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`, and `wasm32` (`--release` strips `debug_assert`; defaults to `.`) |
+| `pionc run [--release] [--target <t>] [-l <lib>] [path] [-- args...]` | Build and execute a package or `.pion` file (`--target wasm32` runs via `node pion_wasm_rt.mjs`; defaults to `.`) |
+| `pionc test [--json] [--package <name>] [--filter <name>] [--jobs <n>] [-l <lib>] [path]` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert`; a workspace directory runs every local package's tests in one pass and one report, with test binaries cached in the CAS (`testbin/`) and built and run in parallel (`--jobs`, `$PION_JOBS`; defaults to `.`) |
+| `pionc fmt [--check] [--json] [path...]` | Deterministic, idempotent, comment- and UTF-8-preserving formatter (defaults to `.`) |
 | `pionc init [--template cli\|service\|invar-app] [--json] <dir>` | Scaffold a package from a template (`cli` default, `service` background worker, or `invar-app` `#render_thread`-guarded dual-thread GUI skeleton); the result passes `check`, `test`, `run` and `fmt --check` as is |
 | `pionc fetch [--json] [dir]` | Resolve `git` dependencies into the global git cache and write/verify `pion.lock` |
 | `pionc add [--json] <name> (--path <p> \| --git <url> [--tag\|--rev\|--branch <r>] [--subdir <s>] \| [--registry <url>]) [dir]` | Add or change one dependency in `pion.toml` (in place, idempotent) and lock it; files restored on failure |
+| `pionc remove [--json] <name> [dir]` | Remove a dependency from `pion.toml` (preserving comments and formatting) and prune `pion.lock` |
 | `pionc update [--json] [pkg] [dir]` | Re-read registry entries, re-resolve git dependencies to their newest target refs, rewrite `pion.lock`, re-check the workspace (restored on failure) |
+| `pionc doctor [--json]` | Inspect toolchain health (`pionc`, `qbe`, `libpionrt.a`, `pion_wasm_rt.mjs`, `cc`/`cxx`, `node`, `git`, CAS stats) |
+| `pionc cache stats\|prune\|clear [--all] [--json]` / `pionc clean [--all] [--json]` | Inspect, LRU-prune, or clear the global CAS (`--all` also clears cached `git/` and `registry/` repos) |
+| `pionc --version\|-V\|version [--json]` / `pionc --help\|-h\|help` | Print compiler version + host target (or JSON) / full CLI usage (exit 0) |
 
 ---
 
@@ -261,7 +265,16 @@ Pion's `hello` fell from 71,976 B to 50,792 B stripped and the six V1 binaries f
 Only a C11 compiler (`cc`) and `python3` are required — zero MoonBit or LLVM dependencies:
 
 ```sh
-# Bootstrap pionc2 from bootstrap/pionc-seed.ssa.gz (pure C + QBE, fixed-point verified):
+# One-command relocatable install to ~/.pion (bootstraps if needed, verifies via `pionc doctor`):
+sh scripts/install.sh
+export PATH="$HOME/.pion/bin:$PATH"
+pionc doctor
+pionc init demo && cd demo && pionc check && pionc test --json && pionc run
+
+# Build a relocatable release archive (tar.gz / zip + .sha256, with zero-env self-check):
+sh scripts/package-release.sh dist
+
+# Or bootstrap directly in-tree from bootstrap/pionc-seed.ssa.gz (pure C + QBE, fixed-point verified):
 sh scripts/bootstrap.sh
 out/pionc2 run examples/text_stats
 
