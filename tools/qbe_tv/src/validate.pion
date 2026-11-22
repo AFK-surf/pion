@@ -1,0 +1,2365 @@
+///| Verified QBE SSA translation validator — the checker.
+///|
+///| `validate_fn(src, tgt)` accepts only when every execution of `tgt`
+///| performs the side effects of an execution of `src` in the same order with
+///| equal operands and ends the same way (same return value, `hlt`, or
+///| divergence). Dead loads, allocations and trapping divisions of `src` may
+///| be dropped (QBE semantics: a trap is undefined behaviour).
+///|
+///| Structure (solver vs. checker):
+///| 1. `wf_code`: dense ids, single assignment, `par` only at the entry.
+///| 2. `src_vids`: one canonical symbolic value per source temp (`canon.pion`).
+///| 3. `compute_avail` (solver) / `check_avail` (checker): every use is
+///|    initialised on every path, and no value available at the entry of a
+///|    block depends on a phi / effect of that block (so a value's symbolic
+///|    denotation stays its current value while it is available).
+///| 4. `compute_facts` / `check_facts`: values known to be zero / non-zero at
+///|    a block entry (dominating `jnz`, `vendor/qbe/gvn.c` `propjnz0`).
+///| 5. `walk`: a product exploration of both CFGs from (0, 0): matched blocks
+///|    run in lock step, side effects are compared one by one, a side whose
+///|    block ends with `jmp` may absorb the next block (`simplcfg` merges,
+///|    empty blocks), terminators are compared, and successor pairs are
+///|    queued. Target temps get the symbolic value of their source
+///|    counterpart; target phis are checked on every matched edge.
+
+///|
+///| CFG helpers.
+///|
+
+pub fn term_nsucc(t : Term) -> Int {
+  match t {
+    Jmp(_) => 1
+    Jnz(_, _, _) => 2
+    _ => 0
+  }
+}
+
+pub fn term_succ(t : Term, k : Int) -> Int {
+  match t {
+    Jmp(s) => if k == 0 { s } else { -1 }
+    Jnz(_, s1, s2) => if k == 0 { s1 } else if k == 1 { s2 } else { -1 }
+    _ => -1
+  }
+}
+
+pub fn is_edge(f : Func, p : Int, s : Int) -> Bool {
+  let t = f.blocks[p].term
+  let n = term_nsucc(t)
+  let mut k = 0
+  while k < n {
+    if term_succ(t, k) == s {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+pub fn inst_dst(inst : Inst) -> Int {
+  match inst {
+    Par(d, _, _) => d
+    Un(d, _, _, _) => d
+    Bin(d, _, _, _, _) => d
+    Load(d, _, _, _, _) => d
+    Store(_, _, _) => -1
+    Call(d, _, h, _, _) => if h { d } else { -1 }
+    Alloc(d, _, _) => d
+  }
+}
+
+pub fn contains_int(xs : Array[Int], x : Int) -> Bool {
+  for y in xs {
+    if y == x {
+      return true
+    }
+  }
+  false
+}
+
+pub fn iota(n : Int) -> Array[Int] {
+  let mut xs = Array::make(n, 0)
+  let mut i = 0
+  while i < n {
+    xs[i] = i
+    i = i + 1
+  }
+  xs
+}
+
+///| Static facts about a well-formed function.
+pub struct FnInfo {
+  nb : Int
+  nt : Int
+  ninst : Int
+  /// 0 undefined, 1 phi, 2 instruction.
+  def_kind : Array[Int]
+  def_blk : Array[Int]
+  def_idx : Array[Int]
+  reach : Array[Bool]
+  /// Number of incoming CFG edges.
+  npred : Array[Int]
+}
+
+pub fn build_info(f : Func) -> FnInfo {
+  let nb = f.blocks.length()
+  let nt = f.ntemps
+  let mut dk = Array::make(nt, 0)
+  let mut db = Array::make(nt, -1)
+  let mut di = Array::make(nt, -1)
+  let mut ninst = 0
+  let mut b = 0
+  while b < nb {
+    let np = f.blocks[b].phis.length()
+    let mut k = 0
+    while k < np {
+      let d = f.blocks[b].phis[k].dst
+      dk[d] = 1
+      db[d] = b
+      di[d] = k
+      k = k + 1
+    }
+    let ni = f.blocks[b].insts.length()
+    let mut i = 0
+    while i < ni {
+      let d = inst_dst(f.blocks[b].insts[i])
+      if d >= 0 {
+        dk[d] = 2
+        db[d] = b
+        di[d] = i
+      }
+      i = i + 1
+    }
+    ninst = ninst + ni
+    b = b + 1
+  }
+  let mut npred = Array::make(nb, 0)
+  let mut y = 0
+  while y < nb {
+    let t = f.blocks[y].term
+    let n = term_nsucc(t)
+    let mut k = 0
+    while k < n {
+      let s = term_succ(t, k)
+      if s >= 0 && s < nb {
+        npred[s] = npred[s] + 1
+      }
+      k = k + 1
+    }
+    y = y + 1
+  }
+  let mut reach = Array::make(nb, false)
+  reach[0] = true
+  let mut changed = true
+  let mut rounds = 0
+  while changed && rounds <= nb {
+    changed = false
+    let mut x = 0
+    while x < nb {
+      if reach[x] {
+        let t = f.blocks[x].term
+        let n = term_nsucc(t)
+        let mut k = 0
+        while k < n {
+          let s = term_succ(t, k)
+          if s >= 0 && s < nb && !reach[s] {
+            reach[s] = true
+            changed = true
+          }
+          k = k + 1
+        }
+      }
+      x = x + 1
+    }
+    rounds = rounds + 1
+  }
+  FnInfo::{ nb, nt, ninst, def_kind: dk, def_blk: db, def_idx: di, reach, npred }
+}
+
+///|
+///| 1. Well-formedness.
+///|
+
+fn temp_ok(nt : Int, t : Int) -> Bool {
+  t >= 0 && t < nt
+}
+
+fn atom_ok(nt : Int, a : Atom) -> Bool {
+  match a {
+    Temp(t) => temp_ok(nt, t)
+    _ => true
+  }
+}
+
+fn inst_atoms_ok(nt : Int, inst : Inst) -> Bool {
+  match inst {
+    Par(_, _, _) => true
+    Un(_, _, _, a) => atom_ok(nt, a)
+    Bin(_, _, _, a, b) => atom_ok(nt, a) && atom_ok(nt, b)
+    Load(_, _, _, _, a) => atom_ok(nt, a)
+    Store(_, v, a) => atom_ok(nt, v) && atom_ok(nt, a)
+    Call(_, _, _, c, args) => {
+      if !atom_ok(nt, c) {
+        return false
+      }
+      for x in args {
+        if !atom_ok(nt, x.arg) {
+          return false
+        }
+      }
+      true
+    }
+    Alloc(_, _, _) => true
+  }
+}
+
+fn target_ok(nb : Int, s : Int) -> Bool {
+  s > 0 && s < nb
+}
+
+///| 0 when `f` is well formed, else a failure code.
+pub fn wf_code(f : Func) -> Int {
+  let nb = f.blocks.length()
+  if nb == 0 {
+    return 1
+  }
+  if f.ntemps < 0 || f.nparams < 0 {
+    return 2
+  }
+  let nt = f.ntemps
+  let mut defs = Array::make(nt, 0)
+  let mut b = 0
+  while b < nb {
+    if f.blocks[b].id != b {
+      return 3
+    }
+    if b == 0 && f.blocks[b].phis.length() > 0 {
+      return 4
+    }
+    for phi in f.blocks[b].phis {
+      if !temp_ok(nt, phi.dst) {
+        return 5
+      }
+      defs[phi.dst] = defs[phi.dst] + 1
+      for arm in phi.arms {
+        if arm.pred < 0 || arm.pred >= nb {
+          return 6
+        }
+        if !atom_ok(nt, arm.value) {
+          return 7
+        }
+      }
+    }
+    let mut seen_other = false
+    for inst in f.blocks[b].insts {
+      match inst {
+        Par(_, _, k) => {
+          if b != 0 || seen_other {
+            return 8
+          }
+          if k < 0 || k >= f.nparams {
+            return 9
+          }
+        }
+        _ => seen_other = true
+      }
+      if !inst_atoms_ok(nt, inst) {
+        return 10
+      }
+      let d = inst_dst(inst)
+      if d >= 0 {
+        if !temp_ok(nt, d) {
+          return 11
+        }
+        defs[d] = defs[d] + 1
+      }
+    }
+    match f.blocks[b].term {
+      Jmp(s) => if !target_ok(nb, s) {
+        return 12
+      }
+      Jnz(a, s1, s2) => if !atom_ok(nt, a) || !target_ok(nb, s1) || !target_ok(nb, s2) {
+        return 13
+      }
+      Ret(_, _, a) => if !atom_ok(nt, a) {
+        return 14
+      }
+      Hlt => ()
+    }
+    b = b + 1
+  }
+  let mut t = 0
+  while t < nt {
+    if defs[t] > 1 {
+      return 15
+    }
+    t = t + 1
+  }
+  0
+}
+
+pub fn wf_fn(f : Func) -> Bool {
+  wf_code(f) == 0
+}
+
+///|
+///| 2. Symbolic values.
+///|
+
+///| The value of atom `a` read at class `cls` (-1 when unknown).
+pub fn atom_use(mut vg : ValGraph, vids : Array[Int], cls : Cls, a : Atom) -> Int {
+  match a {
+    Temp(t) =>
+    if t >= 0 && t < vids.length() {
+      vg_use(mut vg, cls, vids[t])
+    } else {
+      -1
+    }
+    Const(v) => vg_konst(mut vg, cls, v)
+    Sym(id, off) => {
+      let s = vg_intern(mut vg, SSym(id))
+      let r = if off == 0UL {
+        s
+      } else {
+        let o = vg_konst(mut vg, L, off)
+        vg_canon_bin(mut vg, L, Add, s, o)
+      }
+      vg_use(mut vg, cls, r)
+    }
+  }
+}
+
+///| A division that cannot trap (`is_safe_div_const` on canonical operands).
+pub fn bin_safe(vg : ValGraph, cls : Cls, op : BinOp, av : Int, bv : Int) -> Bool {
+  match vg_const(vg, bv) {
+    Some(y) => is_safe_div_const(cls, op, vg_const(vg, av), y)
+    None => false
+  }
+}
+
+///| The value an instruction defines; effects are the leaf `SEffect(cls, b,
+///| i)` when `leaf_effects`, else -1 (target effects get their value by
+///| matching).
+pub fn eval_inst(
+  mut vg : ValGraph,
+  vids : Array[Int],
+  inst : Inst,
+  b : Int,
+  i : Int,
+  leaf_effects : Bool,
+) -> Int {
+  match inst {
+    Par(_, c, k) => vg_intern(mut vg, SParam(c, k))
+    Un(_, c, op, a) => {
+      let av = atom_use(mut vg, vids, unop_arg_cls(op, c), a)
+      vg_canon_un(mut vg, c, op, av)
+    }
+    Bin(_, c, op, a, x) => {
+      let av = atom_use(mut vg, vids, binop_arg_cls(op, c, 0), a)
+      let bv = atom_use(mut vg, vids, binop_arg_cls(op, c, 1), x)
+      if is_trapping_binop(op) && !bin_safe(vg, c, op, av, bv) {
+        if leaf_effects {
+          vg_intern(mut vg, SEffect(c, b, i))
+        } else {
+          -1
+        }
+      } else {
+        vg_canon_bin(mut vg, c, op, av, bv)
+      }
+    }
+    Load(_, c, _, _, _) =>
+    if leaf_effects {
+      vg_intern(mut vg, SEffect(c, b, i))
+    } else {
+      -1
+    }
+    Call(_, c, _, _, _) =>
+    if leaf_effects {
+      vg_intern(mut vg, SEffect(c, b, i))
+    } else {
+      -1
+    }
+    Alloc(_, _, _) =>
+    if leaf_effects {
+      vg_intern(mut vg, SEffect(L, b, i))
+    } else {
+      -1
+    }
+    Store(_, _, _) => -1
+  }
+}
+
+fn atom_known(vids : Array[Int], a : Atom) -> Bool {
+  match a {
+    Temp(t) => t >= 0 && t < vids.length() && vids[t] >= 0
+    _ => true
+  }
+}
+
+///| Operands needed before `eval_inst` (effects need none).
+fn operands_known(vids : Array[Int], inst : Inst) -> Bool {
+  match inst {
+    Un(_, _, _, a) => atom_known(vids, a)
+    Bin(_, _, _, a, b) => atom_known(vids, a) && atom_known(vids, b)
+    _ => true
+  }
+}
+
+fn phi_arm_index(f : Func, b : Int, k : Int, pred : Int) -> Int {
+  let n = f.blocks[b].phis[k].arms.length()
+  let mut j = 0
+  while j < n {
+    if f.blocks[b].phis[k].arms[j].pred == pred {
+      return j
+    }
+    j = j + 1
+  }
+  -1
+}
+
+fn is_self_arm(a : Atom, d : Int) -> Bool {
+  match a {
+    Temp(t) => t == d
+    _ => false
+  }
+}
+
+///| Phi k1 and phi k2 of block b take equal arguments on every edge.
+fn phis_same_args(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k1 : Int, k2 : Int) -> Bool {
+  let n2 = f.blocks[b].phis[k2].arms.length()
+  if n2 != f.blocks[b].phis[k1].arms.length() {
+    return false
+  }
+  let c = f.blocks[b].phis[k2].cls
+  let d1 = f.blocks[b].phis[k1].dst
+  let d2 = f.blocks[b].phis[k2].dst
+  let mut j = 0
+  while j < n2 {
+    let p = f.blocks[b].phis[k2].arms[j].pred
+    let a2 = f.blocks[b].phis[k2].arms[j].value
+    let j1 = phi_arm_index(f, b, k1, p)
+    if j1 < 0 {
+      return false
+    }
+    let a1 = f.blocks[b].phis[k1].arms[j1].value
+    if !(is_self_arm(a1, d1) && is_self_arm(a2, d2)) {
+      let v1 = atom_use(mut vg, vids, c, a1)
+      let v2 = atom_use(mut vg, vids, c, a2)
+      if v1 < 0 || v2 < 0 || v1 != v2 {
+        return false
+      }
+    }
+    j = j + 1
+  }
+  true
+}
+
+///| The only predecessor of block p (-1 when it has none or several edges).
+fn sole_pred(f : Func, p : Int) -> Int {
+  let nb = f.blocks.length()
+  let mut found = -1
+  let mut count = 0
+  let mut x = 0
+  while x < nb {
+    let t = f.blocks[x].term
+    let n = term_nsucc(t)
+    let mut k = 0
+    while k < n {
+      if term_succ(t, k) == p {
+        found = x
+        count = count + 1
+      }
+      k = k + 1
+    }
+    x = x + 1
+  }
+  if count == 1 {
+    found
+  } else {
+    -1
+  }
+}
+
+///| `vendor/qbe/copy.c` `phicopyref`: `b: x = phi @p1 1, @p0 0` where block d
+///| ends with `jnz c, @p1, @p0` on a 0/1 value `c`, and p1 / p0 have d as
+///| only predecessor and jump to b, is `c`. -1: no, -2: `c` not known yet.
+fn phi_select(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) -> Int {
+  if f.blocks[b].phis[k].arms.length() != 2 {
+    return -1
+  }
+  let c = f.blocks[b].phis[k].cls
+  let mut p1 = -1
+  let mut p0 = -1
+  let mut j = 0
+  while j < 2 {
+    let arm_p = f.blocks[b].phis[k].arms[j].pred
+    let a = f.blocks[b].phis[k].arms[j].value
+    if !atom_known(vids, a) {
+      return -2
+    }
+    let av = atom_use(mut vg, vids, c, a)
+    if vg_is_const(vg, av, 1UL) {
+      p1 = arm_p
+    } else if vg_is_const(vg, av, 0UL) {
+      p0 = arm_p
+    }
+    j = j + 1
+  }
+  if p1 < 0 || p0 < 0 || p1 == p0 {
+    return -1
+  }
+  match f.blocks[p1].term {
+    Jmp(s) => if s != b {
+      return -1
+    }
+    _ => return -1
+  }
+  match f.blocks[p0].term {
+    Jmp(s) => if s != b {
+      return -1
+    }
+    _ => return -1
+  }
+  let d = sole_pred(f, p1)
+  if d < 0 || d != sole_pred(f, p0) {
+    return -1
+  }
+  match f.blocks[d].term {
+    Jnz(cond, s1, s2) => {
+      if s1 != p1 || s2 != p0 {
+        return -1
+      }
+      if !atom_known(vids, cond) {
+        return -2
+      }
+      let cv = atom_use(mut vg, vids, W, cond)
+      if !is_bool_node(vg, cv) {
+        return -1
+      }
+      let v = vg_use(mut vg, c, cv)
+      if v < 0 || vid_mentions_blk(vg, v, b) || vid_mentions_blk(vg, v, p1) || vid_mentions_blk(vg, v, p0) {
+        return -1
+      }
+      v
+    }
+    _ => -1
+  }
+}
+
+///| Value of phi k of block b, or -1 while an argument is unknown:
+///| identical non-self arguments not depending on b give that value
+///| (`gvn.c` `dedupphi`), a phi equal to an earlier one shares its value,
+///| anything else is the leaf `SPhi(cls, b, k)`.
+fn phi_try(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) -> Int {
+  let d = f.blocks[b].phis[k].dst
+  let c = f.blocks[b].phis[k].cls
+  let n = f.blocks[b].phis[k].arms.length()
+  let mut cand = -1
+  let mut same = true
+  let mut j = 0
+  while j < n {
+    let a = f.blocks[b].phis[k].arms[j].value
+    if !is_self_arm(a, d) {
+      let v = atom_use(mut vg, vids, c, a)
+      if v < 0 {
+        return -1
+      }
+      if cand < 0 {
+        cand = v
+      } else if v != cand {
+        same = false
+      }
+    }
+    j = j + 1
+  }
+  if same && cand >= 0 && !vid_mentions_blk(vg, cand, b) {
+    return cand
+  }
+  let sel = phi_select(mut vg, f, vids, b, k)
+  if sel == -2 {
+    return -1
+  }
+  if sel >= 0 {
+    return sel
+  }
+  let mut k1 = 0
+  while k1 < k {
+    let d1 = f.blocks[b].phis[k1].dst
+    if f.blocks[b].phis[k1].cls == c && vids[d1] >= 0 && phis_same_args(mut vg, f, vids, b, k1, k) {
+      return vids[d1]
+    }
+    k1 = k1 + 1
+  }
+  vg_intern(mut vg, SPhi(c, b, k))
+}
+
+///| Symbolic value of every source temp (-1 for temps never defined).
+pub fn src_vids(mut vg : ValGraph, f : Func, info : FnInfo) -> Array[Int] {
+  let nt = info.nt
+  let nb = info.nb
+  let mut vids = Array::make(nt, -1)
+  let limit = 2 * nt + nb + 4
+  let mut rounds = 0
+  while rounds < limit {
+    rounds = rounds + 1
+    let mut progress = false
+    let mut pend_b = -1
+    let mut pend_k = -1
+    let mut b = 0
+    while b < nb {
+      let np = f.blocks[b].phis.length()
+      let mut k = 0
+      while k < np {
+        let d = f.blocks[b].phis[k].dst
+        if vids[d] < 0 {
+          let r = phi_try(mut vg, f, vids, b, k)
+          if r >= 0 {
+            vids[d] = r
+            progress = true
+          } else if pend_b < 0 {
+            pend_b = b
+            pend_k = k
+          }
+        }
+        k = k + 1
+      }
+      let ni = f.blocks[b].insts.length()
+      let mut i = 0
+      while i < ni {
+        let d = inst_dst(f.blocks[b].insts[i])
+        if d >= 0 && vids[d] < 0 && operands_known(vids, f.blocks[b].insts[i]) {
+          let v = eval_inst(mut vg, vids, f.blocks[b].insts[i], b, i, true)
+          if v >= 0 {
+            vids[d] = v
+            progress = true
+          }
+        }
+        i = i + 1
+      }
+      b = b + 1
+    }
+    if !progress {
+      if pend_b < 0 {
+        break
+      }
+      // A cycle through phis: the first waiting phi becomes a leaf.
+      let d = f.blocks[pend_b].phis[pend_k].dst
+      let c = f.blocks[pend_b].phis[pend_k].cls
+      vids[d] = vg_intern(mut vg, SPhi(c, pend_b, pend_k))
+    }
+  }
+  vids
+}
+
+///| Pure (re-materialisable) temps: `Un`, and `Bin` that cannot trap.
+pub fn pure_table(vg : ValGraph, f : Func, info : FnInfo, vids : Array[Int]) -> Array[Bool] {
+  let nt = info.nt
+  let mut pure = Array::make(nt, false)
+  let mut t = 0
+  while t < nt {
+    if info.def_kind[t] == 2 {
+      match f.blocks[info.def_blk[t]].insts[info.def_idx[t]] {
+        Un(_, _, _, _) => pure[t] = true
+        Bin(_, _, op, _, _) =>
+        pure[t] = !is_trapping_binop(op) ||
+        (t < vids.length() && vids[t] >= 0 && !vg_is_effect_leaf(vg, vids[t]))
+        _ => ()
+      }
+    }
+    t = t + 1
+  }
+  pure
+}
+
+///|
+///| 3. Initialisation certificate.
+///|
+
+fn block_cur(f : Func, info : FnInfo, av : Array[Bool], b : Int) -> Array[Bool] {
+  let nt = info.nt
+  let mut cur = Array::make(nt, false)
+  let mut t = 0
+  while t < nt {
+    cur[t] = av[b * nt + t]
+    t = t + 1
+  }
+  for phi in f.blocks[b].phis {
+    cur[phi.dst] = true
+  }
+  for inst in f.blocks[b].insts {
+    let d = inst_dst(inst)
+    if d >= 0 {
+      cur[d] = true
+    }
+  }
+  cur
+}
+
+///| Solver: `avail_in[b * nt + t]` — temp t is defined on every path to the
+///| entry of b (greatest fixpoint, entry block all false).
+pub fn compute_avail(f : Func, info : FnInfo) -> Array[Bool] {
+  let nb = info.nb
+  let nt = info.nt
+  let mut av = Array::make(nb * nt, true)
+  let mut t = 0
+  while t < nt {
+    av[t] = false
+    t = t + 1
+  }
+  let mut changed = true
+  let mut rounds = 0
+  while changed && rounds < nb + 3 {
+    changed = false
+    rounds = rounds + 1
+    let mut b = 0
+    while b < nb {
+      if info.reach[b] {
+        let cur = block_cur(f, info, av, b)
+        let tm = f.blocks[b].term
+        let n = term_nsucc(tm)
+        let mut k = 0
+        while k < n {
+          let s = term_succ(tm, k)
+          if s > 0 && s < nb {
+            let mut x = 0
+            while x < nt {
+              if av[s * nt + x] && !cur[x] {
+                av[s * nt + x] = false
+                changed = true
+              }
+              x = x + 1
+            }
+          }
+          k = k + 1
+        }
+      }
+      b = b + 1
+    }
+  }
+  av
+}
+
+///| Temp t is usable: defined on every path (`cur`), or — in floating mode
+///| (GVN output, whose pure instructions are placed later by GCM) — a pure
+///| instruction whose operands are usable.
+fn avail_temp(
+  f : Func,
+  info : FnInfo,
+  cur : Array[Bool],
+  t : Int,
+  floating : Bool,
+  pure : Array[Bool],
+  fuel : Int,
+) -> Bool {
+  if t < 0 || t >= cur.length() {
+    return false
+  }
+  if cur[t] {
+    return true
+  }
+  if !floating || fuel <= 0 || !pure[t] || info.def_kind[t] != 2 {
+    return false
+  }
+  avail_inst_ops(f, info, cur, f.blocks[info.def_blk[t]].insts[info.def_idx[t]], floating, pure, fuel - 1)
+}
+
+fn avail_atom(
+  f : Func,
+  info : FnInfo,
+  cur : Array[Bool],
+  a : Atom,
+  floating : Bool,
+  pure : Array[Bool],
+  fuel : Int,
+) -> Bool {
+  match a {
+    Temp(t) => avail_temp(f, info, cur, t, floating, pure, fuel)
+    _ => true
+  }
+}
+
+fn avail_inst_ops(
+  f : Func,
+  info : FnInfo,
+  cur : Array[Bool],
+  inst : Inst,
+  floating : Bool,
+  pure : Array[Bool],
+  fuel : Int,
+) -> Bool {
+  match inst {
+    Par(_, _, _) => true
+    Un(_, _, _, a) => avail_atom(f, info, cur, a, floating, pure, fuel)
+    Bin(_, _, _, a, b) =>
+    avail_atom(f, info, cur, a, floating, pure, fuel) &&
+    avail_atom(f, info, cur, b, floating, pure, fuel)
+    Load(_, _, _, _, a) => avail_atom(f, info, cur, a, floating, pure, fuel)
+    Store(_, v, a) =>
+    avail_atom(f, info, cur, v, floating, pure, fuel) &&
+    avail_atom(f, info, cur, a, floating, pure, fuel)
+    Call(_, _, _, c, args) => {
+      if !avail_atom(f, info, cur, c, floating, pure, fuel) {
+        return false
+      }
+      for x in args {
+        if !avail_atom(f, info, cur, x.arg, floating, pure, fuel) {
+          return false
+        }
+      }
+      true
+    }
+    Alloc(_, _, _) => true
+  }
+}
+
+fn avail_term_ops(
+  f : Func,
+  info : FnInfo,
+  cur : Array[Bool],
+  t : Term,
+  floating : Bool,
+  pure : Array[Bool],
+  fuel : Int,
+) -> Bool {
+  match t {
+    Jnz(a, _, _) => avail_atom(f, info, cur, a, floating, pure, fuel)
+    Ret(h, _, a) => !h || avail_atom(f, info, cur, a, floating, pure, fuel)
+    _ => true
+  }
+}
+
+///| Checker for `compute_avail`'s certificate; `bm_t[j]` runs source block
+///| `bm_s[j]` (the identity for a source function). 0 when it holds, else
+///| the failing block + 1.
+pub fn check_avail(
+  vg : ValGraph,
+  f : Func,
+  info : FnInfo,
+  av : Array[Bool],
+  vids : Array[Int],
+  bm_t : Array[Int],
+  bm_s : Array[Int],
+  floating : Bool,
+  pure : Array[Bool],
+) -> Int {
+  let nb = info.nb
+  let nt = info.nt
+  if av.length() != nb * nt || vids.length() != nt || pure.length() != nt {
+    return 1
+  }
+  let mut t = 0
+  while t < nt {
+    if av[t] {
+      return 1
+    }
+    t = t + 1
+  }
+  let mut b = 0
+  while b < nb {
+    if info.reach[b] {
+      // Values available at the entry of b must not depend on b.
+      let mut xs = Array::make(0, 0)
+      let mut j = 0
+      while j < bm_t.length() && j < bm_s.length() {
+        if bm_t[j] == b && !contains_int(xs, bm_s[j]) {
+          xs.push(bm_s[j])
+        }
+        j = j + 1
+      }
+      let mut x = 0
+      while x < nt {
+        if av[b * nt + x] && vids[x] >= 0 {
+          for sb in xs {
+            if vid_mentions_blk(vg, vids[x], sb) {
+              return b + 1
+            }
+          }
+        }
+        x = x + 1
+      }
+      let mut cur = Array::make(nt, false)
+      let mut y = 0
+      while y < nt {
+        cur[y] = av[b * nt + y]
+        y = y + 1
+      }
+      for phi in f.blocks[b].phis {
+        cur[phi.dst] = true
+      }
+      for inst in f.blocks[b].insts {
+        if !avail_inst_ops(f, info, cur, inst, floating, pure, nt) {
+          return b + 1
+        }
+        let d = inst_dst(inst)
+        if d >= 0 {
+          cur[d] = true
+        }
+      }
+      let tm = f.blocks[b].term
+      if !avail_term_ops(f, info, cur, tm, floating, pure, nt) {
+        return b + 1
+      }
+      let n = term_nsucc(tm)
+      let mut k = 0
+      while k < n {
+        let s = term_succ(tm, k)
+        if s <= 0 || s >= nb {
+          return b + 1
+        }
+        let mut z = 0
+        while z < nt {
+          if av[s * nt + z] && !cur[z] {
+            return b + 1
+          }
+          z = z + 1
+        }
+        let np = f.blocks[s].phis.length()
+        let mut q = 0
+        while q < np {
+          let ai = phi_arm_index(f, s, q, b)
+          if ai < 0 {
+            return b + 1
+          }
+          if !avail_atom(f, info, cur, f.blocks[s].phis[q].arms[ai].value, floating, pure, nt) {
+            return b + 1
+          }
+          q = q + 1
+        }
+        k = k + 1
+      }
+    }
+    b = b + 1
+  }
+  0
+}
+
+///|
+///| Liveness (for dead source effects).
+///|
+
+fn mark_atom(mut live : Array[Bool], a : Atom) -> Bool {
+  match a {
+    Temp(t) =>
+    if t >= 0 && t < live.length() && !live[t] {
+      live[t] = true
+      true
+    } else {
+      false
+    }
+    _ => false
+  }
+}
+
+fn mark_inst_ops(mut live : Array[Bool], inst : Inst) -> Bool {
+  match inst {
+    Un(_, _, _, a) => mark_atom(mut live, a)
+    Bin(_, _, _, a, b) => {
+      let x = mark_atom(mut live, a)
+      let y = mark_atom(mut live, b)
+      x || y
+    }
+    Load(_, _, _, _, a) => mark_atom(mut live, a)
+    Store(_, v, a) => {
+      let x = mark_atom(mut live, v)
+      let y = mark_atom(mut live, a)
+      x || y
+    }
+    Call(_, _, _, c, args) => {
+      let mut ch = mark_atom(mut live, c)
+      for x in args {
+        if mark_atom(mut live, x.arg) {
+          ch = true
+        }
+      }
+      ch
+    }
+    _ => false
+  }
+}
+
+///| Temps whose value may reach a store, call, branch, return or live phi.
+pub fn src_live(f : Func, info : FnInfo) -> Array[Bool] {
+  let nb = info.nb
+  let nt = info.nt
+  let mut live = Array::make(nt, false)
+  let mut b = 0
+  while b < nb {
+    for inst in f.blocks[b].insts {
+      match inst {
+        Store(_, _, _) => {
+          let _ = mark_inst_ops(mut live, inst)
+        }
+        Call(_, _, _, _, _) => {
+          let _ = mark_inst_ops(mut live, inst)
+        }
+        _ => ()
+      }
+    }
+    match f.blocks[b].term {
+      Jnz(a, _, _) => {
+        let _ = mark_atom(mut live, a)
+      }
+      Ret(h, _, a) => if h {
+        let _ = mark_atom(mut live, a)
+      }
+      _ => ()
+    }
+    b = b + 1
+  }
+  let mut changed = true
+  let mut rounds = 0
+  while changed && rounds <= nt + 1 {
+    changed = false
+    rounds = rounds + 1
+    let mut x = 0
+    while x < nb {
+      for phi in f.blocks[x].phis {
+        if live[phi.dst] {
+          for arm in phi.arms {
+            if mark_atom(mut live, arm.value) {
+              changed = true
+            }
+          }
+        }
+      }
+      for inst in f.blocks[x].insts {
+        let d = inst_dst(inst)
+        if d >= 0 && live[d] {
+          if mark_inst_ops(mut live, inst) {
+            changed = true
+          }
+        }
+      }
+      x = x + 1
+    }
+  }
+  live
+}
+
+///| A source load / alloc / trapping division whose result is dead may be
+///| dropped by the target (`vendor/qbe/gcm.c` `canelim`).
+fn src_effect_elidable(live : Array[Bool], inst : Inst) -> Bool {
+  match inst {
+    Load(d, _, _, _, _) => d >= 0 && d < live.length() && !live[d]
+    Alloc(d, _, _) => d >= 0 && d < live.length() && !live[d]
+    Bin(d, _, op, _, _) => is_trapping_binop(op) && d >= 0 && d < live.length() && !live[d]
+    _ => false
+  }
+}
+
+///|
+///| 4. Branch facts.
+///|
+
+///| At the entry of `blk`, the value `vid` is zero (`zero`) or non-zero.
+pub struct Fact {
+  blk : Int
+  vid : Int
+  zero : Bool
+}
+
+pub fn facts_of(facts : Array[Fact], b : Int) -> Array[Fact] {
+  let mut out : Array[Fact] = []
+  for fa in facts {
+    if fa.blk == b {
+      out.push(fa)
+    }
+  }
+  out
+}
+
+fn fact_in(fs : Array[Fact], vid : Int, zero : Bool) -> Bool {
+  for fa in fs {
+    if fa.vid == vid && fa.zero == zero {
+      return true
+    }
+  }
+  false
+}
+
+fn fact_in_blk(fs : Array[Fact], b : Int, vid : Int, zero : Bool) -> Bool {
+  for fa in fs {
+    if fa.blk == b && fa.vid == vid && fa.zero == zero {
+      return true
+    }
+  }
+  false
+}
+
+///| Facts established by taking the edge p -> s (`jnz` condition and its
+///| `ceq` / `cne` against 0), with `blk = s`.
+pub fn edge_facts(mut vg : ValGraph, f : Func, vids : Array[Int], p : Int, s : Int) -> Array[Fact] {
+  let mut out : Array[Fact] = []
+  match f.blocks[p].term {
+    Jnz(c, s1, s2) =>
+    if s1 != s2 && (s == s1 || s == s2) {
+      let cv = atom_use(mut vg, vids, W, c)
+      if cv >= 0 {
+        let taken = s == s1
+        out.push(Fact::{ blk: s, vid: cv, zero: !taken })
+        match vg.nodes[cv] {
+          SBin(_, CEq(_), x, y) => if vg_is_const(vg, y, 0UL) {
+            out.push(Fact::{ blk: s, vid: x, zero: taken })
+          }
+          SBin(_, CNe(_), x, y) => if vg_is_const(vg, y, 0UL) {
+            out.push(Fact::{ blk: s, vid: x, zero: !taken })
+          }
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  out
+}
+
+fn retarget(fs : Array[Fact], b : Int) -> Array[Fact] {
+  let mut out : Array[Fact] = []
+  for fa in fs {
+    out.push(Fact::{ blk: b, vid: fa.vid, zero: fa.zero })
+  }
+  out
+}
+
+fn fact_intersect(a : Array[Fact], b : Array[Fact]) -> Array[Fact] {
+  let mut out : Array[Fact] = []
+  for fa in a {
+    if fact_in(b, fa.vid, fa.zero) && !fact_in(out, fa.vid, fa.zero) {
+      out.push(fa)
+    }
+  }
+  out
+}
+
+fn fact_same_set(a : Array[Fact], b : Array[Fact]) -> Bool {
+  for fa in a {
+    if !fact_in(b, fa.vid, fa.zero) {
+      return false
+    }
+  }
+  for fb in b {
+    if !fact_in(a, fb.vid, fb.zero) {
+      return false
+    }
+  }
+  true
+}
+
+fn replace_facts(facts : Array[Fact], b : Int, fs : Array[Fact]) -> Array[Fact] {
+  let mut out : Array[Fact] = []
+  for fa in facts {
+    if fa.blk != b {
+      out.push(fa)
+    }
+  }
+  for fb in fs {
+    out.push(fb)
+  }
+  out
+}
+
+///| Facts of `p` and of the edge p -> s, as facts of s.
+pub fn edge_fact_set(mut vg : ValGraph, f : Func, vids : Array[Int], facts : Array[Fact], p : Int, s : Int) -> Array[Fact] {
+  let mut out = retarget(facts_of(facts, p), s)
+  let ef = edge_facts(mut vg, f, vids, p, s)
+  for fa in ef {
+    if !fact_in(out, fa.vid, fa.zero) {
+      out.push(fa)
+    }
+  }
+  out
+}
+
+///| Solver: facts holding at every block entry (optimistic iteration).
+pub fn compute_facts(mut vg : ValGraph, f : Func, info : FnInfo, vids : Array[Int]) -> Array[Fact] {
+  let nb = info.nb
+  let mut known = Array::make(nb, false)
+  known[0] = true
+  let mut facts : Array[Fact] = []
+  let mut changed = true
+  let mut rounds = 0
+  while changed && rounds < nb + 3 {
+    changed = false
+    rounds = rounds + 1
+    let mut b = 1
+    while b < nb {
+      if info.reach[b] {
+        let mut cand : Array[Fact] = []
+        let mut have = false
+        let mut p = 0
+        while p < nb {
+          if info.reach[p] && known[p] && is_edge(f, p, b) {
+            let set = edge_fact_set(mut vg, f, vids, facts, p, b)
+            if have {
+              cand = fact_intersect(cand, set)
+            } else {
+              cand = set
+              have = true
+            }
+          }
+          p = p + 1
+        }
+        if have {
+          let mut keep : Array[Fact] = []
+          for fa in cand {
+            if !vid_mentions_blk(vg, fa.vid, b) && !fact_in(keep, fa.vid, fa.zero) {
+              keep.push(fa)
+            }
+          }
+          if !known[b] || !fact_same_set(facts_of(facts, b), keep) {
+            facts = replace_facts(facts, b, keep)
+            known[b] = true
+            changed = true
+          }
+        }
+      }
+      b = b + 1
+    }
+  }
+  facts
+}
+
+///| Checker: every fact of a block holds on every incoming edge and does not
+///| depend on the block. 0 when it holds, else the failing block + 1.
+pub fn check_facts(mut vg : ValGraph, f : Func, info : FnInfo, vids : Array[Int], facts : Array[Fact]) -> Int {
+  let nb = info.nb
+  for fa in facts {
+    let b = fa.blk
+    if b <= 0 || b >= nb || !info.reach[b] {
+      return 1
+    }
+    if !vg_valid(vg, fa.vid) || vid_mentions_blk(vg, fa.vid, b) {
+      return b + 1
+    }
+    let mut p = 0
+    while p < nb {
+      if info.reach[p] && is_edge(f, p, b) {
+        if !fact_in_blk(facts, p, fa.vid, fa.zero) {
+          let ef = edge_facts(mut vg, f, vids, p, b)
+          if !fact_in(ef, fa.vid, fa.zero) {
+            return b + 1
+          }
+        }
+      }
+      p = p + 1
+    }
+  }
+  0
+}
+
+fn fact_post(mut vg : ValGraph, fs : Array[Fact], r : Int) -> Int {
+  if !vg_valid(vg, r) {
+    return r
+  }
+  let c = vg_cls(vg, r)
+  if fact_in(fs, r, true) {
+    return vg_konst(mut vg, c, 0UL)
+  }
+  match vg.nodes[r] {
+    SBin(_, op, x, y) =>
+    if binop_is_cmp(op) {
+      if fact_in(fs, r, false) {
+        return vg_konst(mut vg, c, 1UL)
+      }
+      if vg_is_const(vg, y, 0UL) && fact_in(fs, x, false) {
+        match op {
+          CEq(_) => return vg_konst(mut vg, c, 0UL)
+          CNe(_) => return vg_konst(mut vg, c, 1UL)
+          _ => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  r
+}
+
+///| `v` with the facts `fs` substituted and re-canonicalised.
+pub fn apply_facts(mut vg : ValGraph, fs : Array[Fact], v : Int) -> Int {
+  if !vg_valid(vg, v) || fs.length() == 0 {
+    return v
+  }
+  let n0 = v + 1
+  let mut mark = Array::make(n0, false)
+  mark[v] = true
+  let mut i = v
+  while i >= 0 {
+    if mark[i] {
+      match vg.nodes[i] {
+        SUn(_, _, a) => if a >= 0 && a < i {
+          mark[a] = true
+        }
+        SBin(_, _, a, b) => {
+          if a >= 0 && a < i {
+            mark[a] = true
+          }
+          if b >= 0 && b < i {
+            mark[b] = true
+          }
+        }
+        _ => ()
+      }
+    }
+    i = i - 1
+  }
+  let mut memo = Array::make(n0, -1)
+  let mut j = 0
+  while j < n0 {
+    if mark[j] {
+      let n = vg.nodes[j]
+      let r = match n {
+        SUn(c, op, a) => if a >= 0 && a < j {
+          vg_canon_un(mut vg, c, op, memo[a])
+        } else {
+          j
+        }
+        SBin(c, op, a, b) => if a >= 0 && a < j && b >= 0 && b < j {
+          vg_canon_bin(mut vg, c, op, memo[a], memo[b])
+        } else {
+          j
+        }
+        _ => j
+      }
+      memo[j] = fact_post(mut vg, fs, r)
+    }
+    j = j + 1
+  }
+  memo[v]
+}
+
+///| Equal values under the facts `fs` (both must be known).
+pub fn eq_under(mut vg : ValGraph, fs : Array[Fact], x : Int, y : Int) -> Bool {
+  if !vg_valid(vg, x) || !vg_valid(vg, y) {
+    return false
+  }
+  if x == y {
+    return true
+  }
+  if fs.length() == 0 {
+    return false
+  }
+  let x1 = apply_facts(mut vg, fs, x)
+  let y1 = apply_facts(mut vg, fs, y)
+  x1 >= 0 && x1 == y1
+}
+
+///|
+///| 5. Target values and the product walk.
+///|
+
+pub struct TgtState {
+  /// Symbolic value of each target temp (-1 unknown).
+  mut tvid : Array[Int]
+  /// Matched block pairs (queue).
+  mut ps : Array[Int]
+  mut pt : Array[Int]
+  /// Matched edges (source pred, target pred) -> (source head, target head).
+  mut e_sp : Array[Int]
+  mut e_tp : Array[Int]
+  mut e_sh : Array[Int]
+  mut e_th : Array[Int]
+  /// Target block `bm_t[j]` runs source block `bm_s[j]`.
+  mut bm_t : Array[Int]
+  mut bm_s : Array[Int]
+  /// Target phi `ph_d[j]` of block `ph_t[j]` got a value at the entry of
+  /// source head `ph_s[j]` (-1: absorbed block).
+  mut ph_t : Array[Int]
+  mut ph_d : Array[Int]
+  mut ph_s : Array[Int]
+  /// Diagnostics only: the walk's steps (`act * 1_000_000 + src * 1000 + tgt`).
+  mut trace : Array[Int]
+}
+
+pub fn tgt_state_new(nt : Int) -> TgtState {
+  TgtState::{
+    tvid: Array::make(nt, -1),
+    ps: Array::make(0, 0),
+    pt: Array::make(0, 0),
+    e_sp: Array::make(0, 0),
+    e_tp: Array::make(0, 0),
+    e_sh: Array::make(0, 0),
+    e_th: Array::make(0, 0),
+    bm_t: Array::make(0, 0),
+    bm_s: Array::make(0, 0),
+    ph_t: Array::make(0, 0),
+    ph_d: Array::make(0, 0),
+    ph_s: Array::make(0, 0),
+    trace: Array::make(0, 0),
+  }
+}
+
+fn pending_operand(tv : Array[Int], inst : Inst) -> Int {
+  match inst {
+    Un(_, _, _, a) =>
+    match a {
+      Temp(t) => if t >= 0 && t < tv.length() && tv[t] < 0 { t } else { -1 }
+      _ => -1
+    }
+    Bin(_, _, _, a, b) => {
+      match a {
+        Temp(t) => if t >= 0 && t < tv.length() && tv[t] < 0 {
+          return t
+        }
+        _ => ()
+      }
+      match b {
+        Temp(t) => if t >= 0 && t < tv.length() && tv[t] < 0 { t } else { -1 }
+        _ => -1
+      }
+    }
+    _ => -1
+  }
+}
+
+///| Value of target temp t0, evaluating pure definitions on demand (phis and
+///| effects get theirs from the walk); -1 when unknown.
+pub fn t_eval(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnInfo, t0 : Int) -> Int {
+  if t0 < 0 || t0 >= ts.tvid.length() {
+    return -1
+  }
+  if ts.tvid[t0] >= 0 {
+    return ts.tvid[t0]
+  }
+  let mut stack = [t0]
+  let mut fuel = 4 * ti.nt + 16
+  while stack.length() > 0 {
+    if fuel <= 0 {
+      return -1
+    }
+    fuel = fuel - 1
+    let t = stack[stack.length() - 1]
+    if ts.tvid[t] >= 0 {
+      let _ = stack.pop()
+    } else {
+      if ti.def_kind[t] != 2 {
+        return -1
+      }
+      let b = ti.def_blk[t]
+      let i = ti.def_idx[t]
+      let need = pending_operand(ts.tvid, tgt.blocks[b].insts[i])
+      if need >= 0 {
+        if contains_int(stack, need) {
+          return -1
+        }
+        stack.push(need)
+      } else {
+        let v = eval_inst(mut vg, ts.tvid, tgt.blocks[b].insts[i], b, i, false)
+        if v < 0 {
+          return -1
+        }
+        ts.tvid[t] = v
+        let _ = stack.pop()
+      }
+    }
+  }
+  ts.tvid[t0]
+}
+
+pub fn t_atom(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnInfo, cls : Cls, a : Atom) -> Int {
+  match a {
+    Temp(t) => {
+      let v = t_eval(mut vg, mut ts, tgt, ti, t)
+      vg_use(mut vg, cls, v)
+    }
+    _ => atom_use(mut vg, ts.tvid, cls, a)
+  }
+}
+
+fn src_inst_is_effect(vg : ValGraph, svid : Array[Int], inst : Inst) -> Bool {
+  match inst {
+    Par(_, _, _) => false
+    Un(_, _, _, _) => false
+    Bin(d, _, op, _, _) =>
+    is_trapping_binop(op) &&
+    (d < 0 || d >= svid.length() || svid[d] < 0 || vg_is_effect_leaf(vg, svid[d]))
+    _ => true
+  }
+}
+
+fn tgt_inst_is_effect(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnInfo, inst : Inst) -> Bool {
+  match inst {
+    Par(_, _, _) => false
+    Un(_, _, _, _) => false
+    Bin(_, c, op, a, b) =>
+    if !is_trapping_binop(op) {
+      false
+    } else {
+      let av = t_atom(mut vg, mut ts, tgt, ti, binop_arg_cls(op, c, 0), a)
+      let bv = t_atom(mut vg, mut ts, tgt, ti, binop_arg_cls(op, c, 1), b)
+      !bin_safe(vg, c, op, av, bv)
+    }
+    _ => true
+  }
+}
+
+///| A block with no phi and no side effect that ends with `jmp`.
+fn is_trivial(f : Func, b : Int) -> Bool {
+  if f.blocks[b].phis.length() > 0 {
+    return false
+  }
+  for inst in f.blocks[b].insts {
+    match inst {
+      Par(_, _, _) => ()
+      Un(_, _, _, _) => ()
+      Bin(_, _, op, _, _) => if is_trapping_binop(op) {
+        return false
+      }
+      _ => return false
+    }
+  }
+  match f.blocks[b].term {
+    Jmp(_) => true
+    _ => false
+  }
+}
+
+///| A block with no side effect that ends with `jnz`.
+fn is_pure_branch(f : Func, b : Int) -> Bool {
+  for inst in f.blocks[b].insts {
+    match inst {
+      Par(_, _, _) => ()
+      Un(_, _, _, _) => ()
+      Bin(_, _, op, _, _) => if is_trapping_binop(op) {
+        return false
+      }
+      _ => return false
+    }
+  }
+  match f.blocks[b].term {
+    Jnz(_, _, _) => true
+    _ => false
+  }
+}
+
+fn resolve_trivial(f : Func, b0 : Int) -> Int {
+  let nb = f.blocks.length()
+  let mut b = b0
+  let mut steps = 0
+  while steps < nb && is_trivial(f, b) {
+    match f.blocks[b].term {
+      Jmp(n) => b = n
+      _ => ()
+    }
+    steps = steps + 1
+  }
+  b
+}
+
+///| Both targets of a `jnz` reach the same phi-free block through empty
+///| blocks (`vendor/qbe/cfg.c` `simplcfg`): the branch is a `jmp`.
+fn same_empty_target(f : Func, s1 : Int, s2 : Int) -> Bool {
+  let r1 = resolve_trivial(f, s1)
+  let r2 = resolve_trivial(f, s2)
+  r1 == r2 && f.blocks[r1].phis.length() == 0
+}
+
+///| A terminator after constant folding under the block's facts.
+enum TView {
+  VJmp(Int)
+  VJnz(Int, Int, Int)
+  VRet(Bool, Cls, Int)
+  VHlt
+}
+
+fn view_jmp(v : TView) -> Int {
+  match v {
+    VJmp(s) => s
+    _ => -1
+  }
+}
+
+fn src_view(mut vg : ValGraph, f : Func, svid : Array[Int], fs : Array[Fact], b : Int) -> TView {
+  match f.blocks[b].term {
+    Jmp(s) => VJmp(s)
+    Jnz(c, s1, s2) => {
+      if s1 == s2 {
+        return VJmp(s1)
+      }
+      let cv0 = atom_use(mut vg, svid, W, c)
+      let cv = apply_facts(mut vg, fs, cv0)
+      match vg_const(vg, cv) {
+        Some(x) => return VJmp(if x != 0UL { s1 } else { s2 })
+        None => ()
+      }
+      if same_empty_target(f, s1, s2) {
+        return VJmp(s1)
+      }
+      VJnz(cv, s1, s2)
+    }
+    Ret(h, c, a) =>
+    if h {
+      let v0 = atom_use(mut vg, svid, c, a)
+      VRet(h, c, apply_facts(mut vg, fs, v0))
+    } else {
+      VRet(h, c, -1)
+    }
+    Hlt => VHlt
+  }
+}
+
+fn tgt_view(mut vg : ValGraph, mut ts : TgtState, f : Func, ti : FnInfo, fs : Array[Fact], b : Int) -> TView {
+  match f.blocks[b].term {
+    Jmp(s) => VJmp(s)
+    Jnz(c, s1, s2) => {
+      if s1 == s2 {
+        return VJmp(s1)
+      }
+      let cv0 = t_atom(mut vg, mut ts, f, ti, W, c)
+      let cv = apply_facts(mut vg, fs, cv0)
+      match vg_const(vg, cv) {
+        Some(x) => return VJmp(if x != 0UL { s1 } else { s2 })
+        None => ()
+      }
+      if same_empty_target(f, s1, s2) {
+        return VJmp(s1)
+      }
+      VJnz(cv, s1, s2)
+    }
+    Ret(h, c, a) =>
+    if h {
+      let v0 = t_atom(mut vg, mut ts, f, ti, c, a)
+      VRet(h, c, apply_facts(mut vg, fs, v0))
+    } else {
+      VRet(h, c, -1)
+    }
+    Hlt => VHlt
+  }
+}
+
+///| Compare a source and a target operand read at class `cls`.
+fn obs_eq(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  tgt : Func,
+  ti : FnInfo,
+  svid : Array[Int],
+  fs : Array[Fact],
+  cls : Cls,
+  sa : Atom,
+  ta : Atom,
+) -> Bool {
+  let sv = atom_use(mut vg, svid, cls, sa)
+  let tv = t_atom(mut vg, mut ts, tgt, ti, cls, ta)
+  eq_under(mut vg, fs, sv, tv)
+}
+
+///| The bits a store of width `w` writes, as a value.
+fn store_view(mut vg : ValGraph, w : MemWidth, v : Int) -> Int {
+  match w {
+    B1 => {
+      let x = vg_use(mut vg, W, v)
+      vg_canon_un(mut vg, W, ExtUB, x)
+    }
+    B2 => {
+      let x = vg_use(mut vg, W, v)
+      vg_canon_un(mut vg, W, ExtUH, x)
+    }
+    B4 => vg_use(mut vg, W, v)
+    B8 => vg_use(mut vg, L, v)
+  }
+}
+
+fn store_cls(w : MemWidth) -> Cls {
+  match w {
+    B8 => L
+    _ => W
+  }
+}
+
+fn assign_tgt(mut ts : TgtState, td : Int, v : Int) -> Int {
+  if v < 0 || td < 0 || td >= ts.tvid.length() {
+    return 2
+  }
+  if ts.tvid[td] >= 0 && ts.tvid[td] != v {
+    return 2
+  }
+  ts.tvid[td] = v
+  0
+}
+
+///| 0: equal effects (the target result gets the source value), 1: different,
+///| 2: the target result already has another value.
+fn match_effect(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  tgt : Func,
+  ti : FnInfo,
+  svid : Array[Int],
+  fs : Array[Fact],
+  sinst : Inst,
+  tinst : Inst,
+) -> Int {
+  match sinst {
+    Load(sd, sc, sw, ssg, sa) =>
+    match tinst {
+      Load(td, tc, tw, tsg, ta) => {
+        if sc != tc || sw != tw || ssg != tsg {
+          return 1
+        }
+        if !obs_eq(mut vg, mut ts, tgt, ti, svid, fs, L, sa, ta) {
+          return 1
+        }
+        assign_tgt(mut ts, td, svid[sd])
+      }
+      _ => 1
+    }
+    Store(sw, sv, sa) =>
+    match tinst {
+      Store(tw, tv, ta) => {
+        if sw != tw {
+          return 1
+        }
+        if !obs_eq(mut vg, mut ts, tgt, ti, svid, fs, L, sa, ta) {
+          return 1
+        }
+        let c = store_cls(sw)
+        let s0 = atom_use(mut vg, svid, c, sv)
+        let t0 = t_atom(mut vg, mut ts, tgt, ti, c, tv)
+        let s1 = store_view(mut vg, sw, s0)
+        let t1 = store_view(mut vg, sw, t0)
+        if eq_under(mut vg, fs, s1, t1) {
+          0
+        } else {
+          1
+        }
+      }
+      _ => 1
+    }
+    Call(sd, sc, sh, scal, sargs) =>
+    match tinst {
+      Call(td, tc, th, tcal, targs) => {
+        if sh != th || (sh && sc != tc) {
+          return 1
+        }
+        if !obs_eq(mut vg, mut ts, tgt, ti, svid, fs, L, scal, tcal) {
+          return 1
+        }
+        let n = sargs.length()
+        if n != targs.length() {
+          return 1
+        }
+        let mut j = 0
+        while j < n {
+          if sargs[j].cls != targs[j].cls {
+            return 1
+          }
+          if !obs_eq(mut vg, mut ts, tgt, ti, svid, fs, sargs[j].cls, sargs[j].arg, targs[j].arg) {
+            return 1
+          }
+          j = j + 1
+        }
+        if sh {
+          assign_tgt(mut ts, td, svid[sd])
+        } else {
+          0
+        }
+      }
+      _ => 1
+    }
+    Alloc(sd, sal, ssz) =>
+    match tinst {
+      Alloc(td, tal, tsz) =>
+      if sal == tal && ssz == tsz {
+        assign_tgt(mut ts, td, svid[sd])
+      } else {
+        1
+      }
+      _ => 1
+    }
+    Bin(sd, sc, sop, sa, sb) =>
+    match tinst {
+      Bin(td, tc, top, ta, tb) => {
+        if sc != tc || sop != top {
+          return 1
+        }
+        if !obs_eq(mut vg, mut ts, tgt, ti, svid, fs, binop_arg_cls(sop, sc, 0), sa, ta) {
+          return 1
+        }
+        if !obs_eq(mut vg, mut ts, tgt, ti, svid, fs, binop_arg_cls(sop, sc, 1), sb, tb) {
+          return 1
+        }
+        assign_tgt(mut ts, td, svid[sd])
+      }
+      _ => 1
+    }
+    _ => 1
+  }
+}
+
+fn find_phi(f : Func, b : Int, d : Int) -> Int {
+  let n = f.blocks[b].phis.length()
+  let mut k = 0
+  while k < n {
+    if f.blocks[b].phis[k].dst == d {
+      return k
+    }
+    k = k + 1
+  }
+  -1
+}
+
+fn bm_add(mut ts : TgtState, tb : Int, sb : Int) -> Unit {
+  let n = ts.bm_t.length()
+  let mut j = 0
+  while j < n {
+    if ts.bm_t[j] == tb && ts.bm_s[j] == sb {
+      return
+    }
+    j = j + 1
+  }
+  ts.bm_t.push(tb)
+  ts.bm_s.push(sb)
+}
+
+fn enqueue(mut ts : TgtState, sp : Int, tp : Int, sh : Int, th : Int) -> Unit {
+  ts.e_sp.push(sp)
+  ts.e_tp.push(tp)
+  ts.e_sh.push(sh)
+  ts.e_th.push(th)
+  let n = ts.ps.length()
+  let mut j = 0
+  while j < n {
+    if ts.ps[j] == sh && ts.pt[j] == th {
+      return
+    }
+    j = j + 1
+  }
+  ts.ps.push(sh)
+  ts.pt.push(th)
+}
+
+///| Values of the phis of target head `tb` entered with source head `sb`:
+///| the source phi of the same temp at `sb` (a front-end hint), else that
+///| temp's source value when it does not depend on `sb`. Checked on every
+///| matched edge afterwards (`phi_arm_checks`).
+fn map_head_phis(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  src : Func,
+  si : FnInfo,
+  svid : Array[Int],
+  tgt : Func,
+  sb : Int,
+  tb : Int,
+) -> Option[TvFail] {
+  let np = tgt.blocks[tb].phis.length()
+  let mut j = 0
+  while j < np {
+    let d = tgt.blocks[tb].phis[j].dst
+    let c = tgt.blocks[tb].phis[j].cls
+    let mut h = -1
+    if d >= 0 && d < si.nt && d < svid.length() {
+      let k = find_phi(src, sb, d)
+      if k >= 0 {
+        if src.blocks[sb].phis[k].cls == c {
+          h = svid[d]
+        }
+      } else if si.def_kind[d] != 0 && svid[d] >= 0 {
+        let v = vg_use(mut vg, c, svid[d])
+        if v >= 0 && !vid_mentions_blk(vg, v, sb) {
+          h = v
+        }
+      }
+    }
+    if h < 0 {
+      return Some(PhiUnmapped(tb, d))
+    }
+    if ts.tvid[d] >= 0 {
+      if ts.tvid[d] != h {
+        return Some(PhiConflict(d))
+      }
+    } else {
+      ts.tvid[d] = h
+      ts.ph_t.push(tb)
+      ts.ph_d.push(d)
+      ts.ph_s.push(sb)
+    }
+    j = j + 1
+  }
+  None
+}
+
+fn is_phi_of_blk(f : Func, b : Int, a : Atom) -> Bool {
+  match a {
+    Temp(t) => find_phi(f, b, t) >= 0
+    _ => false
+  }
+}
+
+///| Phis of a target block absorbed from `pred`: the argument on that edge
+///| (all read before any is written).
+fn absorb_tgt_phis(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnInfo, m : Int, pred : Int) -> Option[TvFail] {
+  let np = tgt.blocks[m].phis.length()
+  let mut vals = Array::make(np, -1)
+  let mut j = 0
+  while j < np {
+    let d = tgt.blocks[m].phis[j].dst
+    let c = tgt.blocks[m].phis[j].cls
+    let ai = phi_arm_index(tgt, m, j, pred)
+    if ai < 0 {
+      return Some(PhiUnmapped(m, d))
+    }
+    let a = tgt.blocks[m].phis[j].arms[ai].value
+    if is_phi_of_blk(tgt, m, a) {
+      return Some(UnknownValue(d))
+    }
+    let v = t_atom(mut vg, mut ts, tgt, ti, c, a)
+    if v < 0 {
+      return Some(UnknownValue(d))
+    }
+    vals[j] = v
+    j = j + 1
+  }
+  let mut k = 0
+  while k < np {
+    let d = tgt.blocks[m].phis[k].dst
+    if ts.tvid[d] >= 0 && ts.tvid[d] != vals[k] {
+      return Some(PhiConflict(d))
+    }
+    if ts.tvid[d] < 0 {
+      ts.tvid[d] = vals[k]
+      ts.ph_t.push(m)
+      ts.ph_d.push(d)
+      ts.ph_s.push(-1)
+    }
+    k = k + 1
+  }
+  None
+}
+
+fn term_compare(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  fs : Array[Fact],
+  sv : TView,
+  tv : TView,
+  sc : Int,
+  tc : Int,
+) -> Option[TvFail] {
+  match sv {
+    VRet(sh, scls, svv) =>
+    match tv {
+      VRet(th, tcls, tvv) =>
+      if sh != th {
+        Some(RetMismatch(sc, tc))
+      } else if sh && (scls != tcls || !eq_under(mut vg, fs, svv, tvv)) {
+        Some(RetMismatch(sc, tc))
+      } else {
+        None
+      }
+      _ => Some(TermMismatch(sc, tc))
+    }
+    VHlt =>
+    match tv {
+      VHlt => None
+      _ => Some(TermMismatch(sc, tc))
+    }
+    VJnz(cs, s1, s2) =>
+    match tv {
+      VJnz(ct, t1, t2) =>
+      if eq_under(mut vg, fs, cs, ct) {
+        enqueue(mut ts, sc, tc, s1, t1)
+        enqueue(mut ts, sc, tc, s2, t2)
+        None
+      } else {
+        let z = vg_konst(mut vg, W, 0UL)
+        let ns = vg_canon_bin(mut vg, W, CEq(W), cs, z)
+        let nt = vg_canon_bin(mut vg, W, CEq(W), ct, z)
+        if eq_under(mut vg, fs, ns, ct) || eq_under(mut vg, fs, cs, nt) {
+          enqueue(mut ts, sc, tc, s1, t2)
+          enqueue(mut ts, sc, tc, s2, t1)
+          None
+        } else {
+          Some(CondMismatch(sc, tc))
+        }
+      }
+      _ => Some(TermMismatch(sc, tc))
+    }
+    VJmp(_) => Some(TermMismatch(sc, tc))
+  }
+}
+
+///| Run the matched pair (sb, tb) in lock step until both reach terminators
+///| that end it (return, `hlt`, or branches to queued pairs).
+fn walk_one(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  src : Func,
+  si : FnInfo,
+  svid : Array[Int],
+  slive : Array[Bool],
+  facts : Array[Fact],
+  tgt : Func,
+  ti : FnInfo,
+  sb : Int,
+  tb : Int,
+) -> Option[TvFail] {
+  ts.trace.push(9000000 + sb * 1000 + tb)
+  match map_head_phis(mut vg, mut ts, src, si, svid, tgt, sb, tb) {
+    Some(e) => return Some(e)
+    None => ()
+  }
+  bm_add(mut ts, tb, sb)
+  let mut sc = sb
+  let mut sx = 0
+  let mut tc = tb
+  let mut tx = 0
+  let mut schain = [sb]
+  let mut tchain = [tb]
+  let mut fuel = 2 * (si.ninst + ti.ninst + si.nb + ti.nb) + 16
+  while fuel > 0 {
+    fuel = fuel - 1
+    let slen = src.blocks[sc].insts.length()
+    while sx < slen && !src_inst_is_effect(vg, svid, src.blocks[sc].insts[sx]) {
+      sx = sx + 1
+    }
+    let tlen = tgt.blocks[tc].insts.length()
+    while tx < tlen && !tgt_inst_is_effect(mut vg, mut ts, tgt, ti, tgt.blocks[tc].insts[tx]) {
+      tx = tx + 1
+    }
+    let s_has = sx < slen
+    let t_has = tx < tlen
+    let fs = facts_of(facts, sc)
+    // What to do next: 1 advance both, 2 skip a dead source effect,
+    // 3 absorb the source jump target, 4 absorb the target jump target,
+    // 5 done.
+    let mut act = 0
+    let mut nxt = -1
+    if s_has {
+      let s_elide = src_effect_elidable(slive, src.blocks[sc].insts[sx])
+      if t_has {
+        let r = match_effect(mut vg, mut ts, tgt, ti, svid, fs, src.blocks[sc].insts[sx], tgt.blocks[tc].insts[tx])
+        if r == 0 {
+          act = 1
+        } else if r == 1 && s_elide {
+          act = 2
+        } else if r == 2 {
+          return Some(EffectConflict(tc))
+        } else {
+          return Some(EffectMismatch(sc, tc))
+        }
+      } else if s_elide {
+        act = 2
+      } else {
+        let tj = view_jmp(tgt_view(mut vg, mut ts, tgt, ti, fs, tc))
+        if tj > 0 && !contains_int(tchain, tj) {
+          act = 4
+          nxt = tj
+        } else {
+          return Some(EffectMismatch(sc, tc))
+        }
+      }
+    } else if t_has {
+      let sj = view_jmp(src_view(mut vg, src, svid, fs, sc))
+      if sj > 0 && !contains_int(schain, sj) {
+        act = 3
+        nxt = sj
+      } else {
+        return Some(EffectMismatch(sc, tc))
+      }
+    } else {
+      let sv = src_view(mut vg, src, svid, fs, sc)
+      let tv = tgt_view(mut vg, mut ts, tgt, ti, fs, tc)
+      let sj = view_jmp(sv)
+      let tj = view_jmp(tv)
+      if sj >= 0 && tj >= 0 {
+        // Run on through empty blocks, and into blocks only this edge
+        // reaches — on both sides at once when both can, so that they stay
+        // in step; a source block reached by one edge may have been merged
+        // into its predecessor by `simplcfg`. Otherwise the two targets
+        // form a new pair (a target block left with one predecessor after
+        // GVN dropped a dead edge is still the source join block).
+        let s_ok = sj > 0 && !contains_int(schain, sj)
+        let t_ok = tj > 0 && !contains_int(tchain, tj)
+        let s_triv = s_ok && is_trivial(src, sj)
+        let t_triv = t_ok && is_trivial(tgt, tj)
+        let s_one = s_ok && si.npred[sj] == 1
+        let t_one = t_ok && ti.npred[tj] == 1
+        if (s_triv && t_triv) || (s_one && t_one) {
+          act = 6
+        } else if s_triv {
+          act = 3
+          nxt = sj
+        } else if t_triv {
+          act = 4
+          nxt = tj
+        } else if s_one {
+          act = 3
+          nxt = sj
+        } else {
+          enqueue(mut ts, sc, tc, sj, tj)
+          act = 5
+        }
+      } else if sj >= 0 {
+        if sj > 0 && !contains_int(schain, sj) {
+          act = 3
+          nxt = sj
+        } else {
+          match tv {
+            // The target branches where the source does not: both target
+            // paths must follow the one source path.
+            VJnz(_, t1, t2) => {
+              enqueue(mut ts, sc, tc, sj, t1)
+              enqueue(mut ts, sc, tc, sj, t2)
+              act = 5
+            }
+            _ => return Some(TermMismatch(sc, tc))
+          }
+        }
+      } else if tj >= 0 {
+        if tj > 0 && !contains_int(tchain, tj) && ti.npred[tj] == 1 {
+          act = 4
+          nxt = tj
+        } else {
+          match sv {
+            // The source branches where the target does not (a branch the
+            // target folded, or two empty arms): the one target path must
+            // follow both source paths.
+            VJnz(_, s1, s2) =>
+            if tj > 0 && !contains_int(tchain, tj) && is_pure_branch(tgt, tj) {
+              // The target merged the block holding the branch.
+              act = 4
+              nxt = tj
+            } else {
+              enqueue(mut ts, sc, tc, s1, tj)
+              enqueue(mut ts, sc, tc, s2, tj)
+              act = 5
+            }
+            _ =>
+            if tj > 0 && !contains_int(tchain, tj) {
+              act = 4
+              nxt = tj
+            } else {
+              return Some(TermMismatch(sc, tc))
+            }
+          }
+        }
+      } else {
+        return term_compare(mut vg, mut ts, fs, sv, tv, sc, tc)
+      }
+    }
+    ts.trace.push(act * 1000000 + sc * 1000 + tc)
+    if act == 1 {
+      sx = sx + 1
+      tx = tx + 1
+    } else if act == 2 {
+      sx = sx + 1
+    } else if act == 3 {
+      schain.push(nxt)
+      sc = nxt
+      sx = 0
+      bm_add(mut ts, tc, nxt)
+    } else if act == 4 {
+      match absorb_tgt_phis(mut vg, mut ts, tgt, ti, nxt, tc) {
+        Some(e) => return Some(e)
+        None => ()
+      }
+      tchain.push(nxt)
+      tc = nxt
+      tx = 0
+    } else if act == 6 {
+      let sj = view_jmp(src_view(mut vg, src, svid, fs, sc))
+      let tj = view_jmp(tgt_view(mut vg, mut ts, tgt, ti, fs, tc))
+      match absorb_tgt_phis(mut vg, mut ts, tgt, ti, tj, tc) {
+        Some(e) => return Some(e)
+        None => ()
+      }
+      tchain.push(tj)
+      tc = tj
+      tx = 0
+      schain.push(sj)
+      sc = sj
+      sx = 0
+      bm_add(mut ts, tc, sc)
+    } else {
+      return None
+    }
+  }
+  Some(WorkLimit(sb))
+}
+
+fn walk(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  src : Func,
+  si : FnInfo,
+  svid : Array[Int],
+  slive : Array[Bool],
+  facts : Array[Fact],
+  tgt : Func,
+  ti : FnInfo,
+) -> Option[TvFail] {
+  ts.ps.push(0)
+  ts.pt.push(0)
+  let limit = (si.nb + 1) * (ti.nb + 1) + 1
+  let mut q = 0
+  while q < ts.ps.length() {
+    if q >= limit {
+      return Some(WorkLimit(q))
+    }
+    let sb = ts.ps[q]
+    let tb = ts.pt[q]
+    match walk_one(mut vg, mut ts, src, si, svid, slive, facts, tgt, ti, sb, tb) {
+      Some(e) => return Some(e)
+      None => ()
+    }
+    q = q + 1
+  }
+  None
+}
+
+///| On every matched edge, each target phi argument equals the source value
+///| the phi stands for (the source phi's argument on that edge, or its
+///| value when the phi was folded).
+fn phi_arm_checks(
+  mut vg : ValGraph,
+  mut ts : TgtState,
+  src : Func,
+  svid : Array[Int],
+  facts : Array[Fact],
+  tgt : Func,
+  ti : FnInfo,
+) -> Option[TvFail] {
+  let ne = ts.e_sp.length()
+  let mut e = 0
+  while e < ne {
+    let sp = ts.e_sp[e]
+    let tp = ts.e_tp[e]
+    let sh = ts.e_sh[e]
+    let th = ts.e_th[e]
+    let fs = edge_fact_set(mut vg, src, svid, facts, sp, sh)
+    let np = tgt.blocks[th].phis.length()
+    let mut j = 0
+    while j < np {
+      let d = tgt.blocks[th].phis[j].dst
+      let c = tgt.blocks[th].phis[j].cls
+      let ai = phi_arm_index(tgt, th, j, tp)
+      if ai < 0 {
+        return Some(PhiArmMismatch(th, d))
+      }
+      let tv = t_atom(mut vg, mut ts, tgt, ti, c, tgt.blocks[th].phis[j].arms[ai].value)
+      let k = if d >= 0 && d < svid.length() { find_phi(src, sh, d) } else { -1 }
+      let mut sv = -1
+      if k >= 0 && vg_is_phi_of(vg, svid[d], sh) {
+        let si_ = phi_arm_index(src, sh, k, sp)
+        if si_ < 0 {
+          return Some(PhiArmMismatch(th, d))
+        }
+        sv = atom_use(mut vg, svid, c, src.blocks[sh].phis[k].arms[si_].value)
+      } else {
+        sv = ts.tvid[d]
+      }
+      if !eq_under(mut vg, fs, sv, tv) {
+        return Some(PhiArmMismatch(th, d))
+      }
+      j = j + 1
+    }
+    e = e + 1
+  }
+  None
+}
+
+///| A target phi value must stay valid over its whole block: it may depend on
+///| no source block the target block runs (except the phi leaf of the head).
+fn phi_scope_checks(vg : ValGraph, ts : TgtState) -> Option[TvFail] {
+  let n = ts.ph_t.length()
+  let mut j = 0
+  while j < n {
+    let tb = ts.ph_t[j]
+    let d = ts.ph_d[j]
+    let sb = ts.ph_s[j]
+    let v = ts.tvid[d]
+    let m = ts.bm_t.length()
+    let mut k = 0
+    while k < m {
+      if ts.bm_t[k] == tb {
+        let x = ts.bm_s[k]
+        let exempt = sb >= 0 && x == sb && vg_is_phi_of(vg, v, sb)
+        if !exempt && vid_mentions_blk(vg, v, x) {
+          return Some(PhiScope(tb, d))
+        }
+      }
+      k = k + 1
+    }
+    j = j + 1
+  }
+  None
+}
+
+///| Validate `tgt` against `src`. `*_floating`: the function is a GVN output
+///| whose pure instructions may sit anywhere (`avail_temp`).
+pub fn validate_fn_mode(src : Func, tgt : Func, src_floating : Bool, tgt_floating : Bool) -> TvResult {
+  let ws = wf_code(src)
+  if ws != 0 {
+    return Rejected(BadSrc(ws))
+  }
+  let wt = wf_code(tgt)
+  if wt != 0 {
+    return Rejected(BadTgt(wt))
+  }
+  let si = build_info(src)
+  let ti = build_info(tgt)
+  let mut vg = vg_new()
+  let svid = src_vids(mut vg, src, si)
+  let spure = pure_table(vg, src, si, svid)
+  let savail = compute_avail(src, si)
+  let ids = iota(si.nb)
+  let ca = check_avail(vg, src, si, savail, svid, ids, ids, src_floating, spure)
+  if ca != 0 {
+    return Rejected(SrcAvail(ca - 1))
+  }
+  let slive = src_live(src, si)
+  let facts = compute_facts(mut vg, src, si, svid)
+  let cf = check_facts(mut vg, src, si, svid, facts)
+  if cf != 0 {
+    return Rejected(SrcFacts(cf - 1))
+  }
+  let mut ts = tgt_state_new(ti.nt)
+  match walk(mut vg, mut ts, src, si, svid, slive, facts, tgt, ti) {
+    Some(e) => return Rejected(e)
+    None => ()
+  }
+  match phi_arm_checks(mut vg, mut ts, src, svid, facts, tgt, ti) {
+    Some(e) => return Rejected(e)
+    None => ()
+  }
+  match phi_scope_checks(vg, ts) {
+    Some(e) => return Rejected(e)
+    None => ()
+  }
+  let tpure = pure_table(vg, tgt, ti, ts.tvid)
+  let tavail = compute_avail(tgt, ti)
+  let ct = check_avail(vg, tgt, ti, tavail, ts.tvid, ts.bm_t, ts.bm_s, tgt_floating, tpure)
+  if ct != 0 {
+    return Rejected(TgtAvail(ct - 1))
+  }
+  Valid
+}
+
+pub fn validate_fn_diag(src : Func, tgt : Func) -> TvResult {
+  validate_fn_mode(src, tgt, false, false)
+}
+
+pub fn validate_fn(src : Func, tgt : Func) -> Bool {
+  match validate_fn_diag(src, tgt) {
+    Valid => true
+    _ => false
+  }
+}
+
+///| Diagnostics only (not part of the checker): the steps of the product
+///| walk, `9_000_000 + src * 1000 + tgt` at each pair and
+///| `act * 1_000_000 + src * 1000 + tgt` per step.
+pub fn debug_walk_trace(src : Func, tgt : Func) -> Array[Int] {
+  if wf_code(src) != 0 || wf_code(tgt) != 0 {
+    return Array::make(0, 0)
+  }
+  let si = build_info(src)
+  let ti = build_info(tgt)
+  let mut vg = vg_new()
+  let svid = src_vids(mut vg, src, si)
+  let slive = src_live(src, si)
+  let facts = compute_facts(mut vg, src, si, svid)
+  let mut ts = tgt_state_new(ti.nt)
+  let _ = walk(mut vg, mut ts, src, si, svid, slive, facts, tgt, ti)
+  ts.trace.copy()
+}

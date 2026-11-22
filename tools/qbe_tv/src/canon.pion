@@ -1,0 +1,706 @@
+///| Verified QBE SSA translation validator — canonical value graph.
+///|
+///| `ValGraph` is an append-only hash-consed DAG: `vg_intern` returns the
+///| index of an existing identical node or appends a new one, and every
+///| child index of a node is strictly smaller than the node's own index.
+///| A node denotes a 64-bit value over the symbolic environment of the
+///| *source* function:
+///| - `SParam(c, k)`: the k-th parameter;
+///| - `SPhi(c, b, k)`: the value phi k of source block b took at the most
+///|   recent entry into b;
+///| - `SEffect(c, b, i)`: the result of instruction i of source block b at
+///|   its most recent execution;
+///| - `SUn` / `SBin`: the operator applied to the children (`W` results are
+///|   zero-extended 32-bit values).
+///| Every rewrite in `vg_canon_un` / `vg_canon_bin` / `vg_trunc_w` is an
+///| exact 32 / 64-bit bit-vector identity, so equal indices denote equal
+///| values.
+
+#derive(Eq)
+pub enum SymNode {
+  SConst(Cls, UInt64)
+  SSym(Int)
+  SParam(Cls, Int)
+  SPhi(Cls, Int, Int)
+  SEffect(Cls, Int, Int)
+  SUn(Cls, UnOp, Int)
+  SBin(Cls, BinOp, Int, Int)
+}
+
+pub struct ValGraph {
+  mut nodes : Array[SymNode]
+}
+
+pub fn vg_new() -> ValGraph {
+  let nodes : Array[SymNode] = []
+  ValGraph::{ nodes: nodes }
+}
+
+pub fn sym_node_eq(a : SymNode, b : SymNode) -> Bool {
+  a == b
+}
+
+///| Index of `n` in `vg`, appending it when absent (never mutates a node).
+pub fn vg_intern(mut vg : ValGraph, n : SymNode) -> Int {
+  let len = vg.nodes.length()
+  let mut i = 0
+  while i < len {
+    if sym_node_eq(vg.nodes[i], n) {
+      return i
+    }
+    i = i + 1
+  }
+  vg.nodes.push(n)
+  len
+}
+
+pub fn vg_valid(vg : ValGraph, v : Int) -> Bool {
+  v >= 0 && v < vg.nodes.length()
+}
+
+pub fn vg_cls(vg : ValGraph, v : Int) -> Cls {
+  if !vg_valid(vg, v) {
+    return L
+  }
+  match vg.nodes[v] {
+    SConst(c, _) => c
+    SSym(_) => L
+    SParam(c, _) => c
+    SPhi(c, _, _) => c
+    SEffect(c, _, _) => c
+    SUn(c, _, _) => c
+    SBin(c, _, _, _) => c
+  }
+}
+
+pub fn vg_const(vg : ValGraph, v : Int) -> Option[UInt64] {
+  if !vg_valid(vg, v) {
+    return None
+  }
+  match vg.nodes[v] {
+    SConst(_, x) => Some(x)
+    _ => None
+  }
+}
+
+pub fn vg_is_const(vg : ValGraph, v : Int, x : UInt64) -> Bool {
+  match vg_const(vg, v) {
+    Some(y) => y == x
+    None => false
+  }
+}
+
+pub fn vg_konst(mut vg : ValGraph, cls : Cls, v : UInt64) -> Int {
+  vg_intern(mut vg, SConst(cls, mask_cls(cls, v)))
+}
+
+pub fn vg_is_effect_leaf(vg : ValGraph, v : Int) -> Bool {
+  if !vg_valid(vg, v) {
+    return false
+  }
+  match vg.nodes[v] {
+    SEffect(_, _, _) => true
+    _ => false
+  }
+}
+
+pub fn vg_is_phi_of(vg : ValGraph, v : Int, blk : Int) -> Bool {
+  if !vg_valid(vg, v) {
+    return false
+  }
+  match vg.nodes[v] {
+    SPhi(_, b, _) => b == blk
+    _ => false
+  }
+}
+
+///|
+///| Exact constant evaluation (`vendor/qbe/fold.c`).
+///|
+
+pub fn sext32(v : UInt64) -> UInt64 {
+  let x = v & 0xFFFF_FFFFUL
+  if (x & 0x8000_0000UL) != 0UL {
+    x | 0xFFFF_FFFF_0000_0000UL
+  } else {
+    x
+  }
+}
+
+pub fn as_signed(cls : Cls, v : UInt64) -> Int64 {
+  match cls {
+    W => sext32(v).reinterpret_as_int64()
+    L => v.reinterpret_as_int64()
+  }
+}
+
+///| `fold.c:80-82`: the shift count is masked to `31` / `63`.
+pub fn shift_amount(cls : Cls, b : UInt64) -> Int {
+  match cls {
+    W => (b & 31UL).to_int()
+    L => (b & 63UL).to_int()
+  }
+}
+
+pub fn bool_u64(b : Bool) -> UInt64 {
+  if b {
+    1UL
+  } else {
+    0UL
+  }
+}
+
+pub fn eval_un_const(cls : Cls, op : UnOp, v : UInt64) -> UInt64 {
+  match op {
+    Copy => mask_cls(cls, v)
+    Neg => mask_cls(cls, 0UL - v)
+    ExtSB => {
+      let x = v & 0xFFUL
+      mask_cls(
+        cls,
+        if (x & 0x80UL) != 0UL {
+          x | 0xFFFF_FFFF_FFFF_FF00UL
+        } else {
+          x
+        },
+      )
+    }
+    ExtUB => mask_cls(cls, v & 0xFFUL)
+    ExtSH => {
+      let x = v & 0xFFFFUL
+      mask_cls(
+        cls,
+        if (x & 0x8000UL) != 0UL {
+          x | 0xFFFF_FFFF_FFFF_0000UL
+        } else {
+          x
+        },
+      )
+    }
+    ExtUH => mask_cls(cls, v & 0xFFFFUL)
+    ExtSW => mask_cls(cls, sext32(v))
+    ExtUW => mask_cls(cls, v & 0xFFFF_FFFFUL)
+  }
+}
+
+///| `None` exactly when the operation may trap (`is_safe_div_const`).
+pub fn eval_bin_const(cls : Cls, op : BinOp, a0 : UInt64, b0 : UInt64) -> Option[UInt64] {
+  let a = mask_cls(cls, a0)
+  let b = mask_cls(cls, b0)
+  match op {
+    Add => Some(mask_cls(cls, a + b))
+    Sub => Some(mask_cls(cls, a - b))
+    Mul => Some(mask_cls(cls, a * b))
+    And => Some(a & b)
+    Or => Some(a | b)
+    Xor => Some(a ^ b)
+    Shl => Some(mask_cls(cls, a << shift_amount(cls, b0)))
+    Shr => Some(a >> shift_amount(cls, b0))
+    Sar => Some(mask_cls(cls, (as_signed(cls, a) >> shift_amount(cls, b0)).reinterpret_as_uint64()))
+    Div =>
+    if is_safe_div_const(cls, op, Some(a), b) {
+      Some(mask_cls(cls, (as_signed(cls, a) / as_signed(cls, b)).reinterpret_as_uint64()))
+    } else {
+      None
+    }
+    Rem =>
+    if is_safe_div_const(cls, op, Some(a), b) {
+      Some(mask_cls(cls, (as_signed(cls, a) % as_signed(cls, b)).reinterpret_as_uint64()))
+    } else {
+      None
+    }
+    UDiv =>
+    if is_safe_div_const(cls, op, Some(a), b) {
+      Some(a / b)
+    } else {
+      None
+    }
+    URem =>
+    if is_safe_div_const(cls, op, Some(a), b) {
+      Some(a % b)
+    } else {
+      None
+    }
+    CEq(c) => Some(bool_u64(mask_cls(c, a0) == mask_cls(c, b0)))
+    CNe(c) => Some(bool_u64(mask_cls(c, a0) != mask_cls(c, b0)))
+    CSlt(c) => Some(bool_u64(as_signed(c, a0) < as_signed(c, b0)))
+    CSle(c) => Some(bool_u64(as_signed(c, a0) <= as_signed(c, b0)))
+    CSgt(c) => Some(bool_u64(as_signed(c, a0) > as_signed(c, b0)))
+    CSge(c) => Some(bool_u64(as_signed(c, a0) >= as_signed(c, b0)))
+    CUlt(c) => Some(bool_u64(mask_cls(c, a0) < mask_cls(c, b0)))
+    CUle(c) => Some(bool_u64(mask_cls(c, a0) <= mask_cls(c, b0)))
+    CUgt(c) => Some(bool_u64(mask_cls(c, a0) > mask_cls(c, b0)))
+    CUge(c) => Some(bool_u64(mask_cls(c, a0) >= mask_cls(c, b0)))
+  }
+}
+
+///| `k` when `y == 1 << k` with `1 <= k < bits`, else -1.
+pub fn log2_exact(cls : Cls, y : UInt64) -> Int {
+  let bits = cls_bits(cls)
+  let mut k = 1
+  while k < bits {
+    if (1UL << k) == y {
+      return k
+    }
+    k = k + 1
+  }
+  -1
+}
+
+///| `n` when `y == 2^n - 1` with `1 <= n < 64`, else -1.
+pub fn low_mask_bits(y : UInt64) -> Int {
+  let mut n = 1
+  while n < 64 {
+    if (1UL << n) - 1UL == y {
+      return n
+    }
+    n = n + 1
+  }
+  -1
+}
+
+///|
+///| Width facts (`vendor/qbe/copy.c` `dwl`): the `W` value of `v` is below
+///| `2^w`.
+///|
+pub fn fits_bits(vg : ValGraph, v : Int, w : Int) -> Bool {
+  if !vg_valid(vg, v) {
+    return false
+  }
+  if vg_cls(vg, v) != W {
+    return false
+  }
+  if w >= 32 {
+    return true
+  }
+  if w <= 0 {
+    return vg_is_const(vg, v, 0UL)
+  }
+  match vg.nodes[v] {
+    SConst(_, x) => (x >> w) == 0UL
+    SBin(_, op, a, b) =>
+    if binop_is_cmp(op) {
+      true
+    } else {
+      match op {
+        And => fits_bits(vg, a, w) || fits_bits(vg, b, w)
+        Or => fits_bits(vg, a, w) && fits_bits(vg, b, w)
+        Xor => fits_bits(vg, a, w) && fits_bits(vg, b, w)
+        Shr =>
+        match vg_const(vg, b) {
+          Some(k0) => {
+            let k = (k0 & 31UL).to_int()
+            if k > 0 && w + k >= 32 {
+              true
+            } else {
+              fits_bits(vg, a, if w + k < 32 { w + k } else { 32 })
+            }
+          }
+          None => fits_bits(vg, a, w)
+        }
+        Sar =>
+        match vg_const(vg, b) {
+          Some(k0) => {
+            let k = (k0 & 31UL).to_int()
+            fits_bits(vg, a, if w + k < 31 { w + k } else { 31 })
+          }
+          None => fits_bits(vg, a, w)
+        }
+        _ => false
+      }
+    }
+    SUn(_, op, x) =>
+    match op {
+      ExtUB => w >= 8 || fits_bits(vg, x, w)
+      ExtUH => w >= 16 || fits_bits(vg, x, w)
+      ExtSB => fits_bits(vg, x, if w < 7 { w } else { 7 })
+      ExtSH => fits_bits(vg, x, if w < 15 { w } else { 15 })
+      _ => false
+    }
+    _ => false
+  }
+}
+
+pub fn is_bool_node(vg : ValGraph, v : Int) -> Bool {
+  fits_bits(vg, v, 1)
+}
+
+///|
+///| Canonicalisation.
+///|
+
+///| `v` read at class `cls`: a `W` use of an `L` value is its low 32 bits.
+///| An `L` use of a `W` value has undefined upper bits in QBE, except that
+///| every target keeps a `W` result extended (zero-extended on amd64 /
+///| arm64, sign-extended on rv64), so a `W` value below `2^31` reads as its
+///| zero extension; anything else stays opaque (`SUn(L, Copy, v)`).
+pub fn vg_use(mut vg : ValGraph, cls : Cls, v : Int) -> Int {
+  if !vg_valid(vg, v) {
+    return -1
+  }
+  if vg_cls(vg, v) == cls {
+    return v
+  }
+  match cls {
+    W => vg_trunc_w(mut vg, v)
+    L =>
+    if fits_bits(vg, v, 31) {
+      vg_canon_un(mut vg, L, ExtUW, v)
+    } else {
+      vg_intern(mut vg, SUn(L, Copy, v))
+    }
+  }
+}
+
+fn is_ring_op(op : BinOp) -> Bool {
+  match op {
+    Add => true
+    Sub => true
+    Mul => true
+    And => true
+    Or => true
+    Xor => true
+    _ => false
+  }
+}
+
+///| Low 32 bits of the `L` value `v` as a `W` value.
+pub fn vg_trunc_w(mut vg : ValGraph, v : Int) -> Int {
+  if !vg_valid(vg, v) {
+    return -1
+  }
+  let n = vg.nodes[v]
+  match n {
+    SConst(_, x) => vg_konst(mut vg, W, x)
+    SUn(_, op, a) => {
+      let k = unop_ext_bits(op)
+      if k == 32 || op == Copy {
+        if vg_cls(vg, a) == W {
+          a
+        } else {
+          vg_intern(mut vg, SUn(W, Copy, v))
+        }
+      } else if k > 0 {
+        vg_canon_un(mut vg, W, op, a)
+      } else {
+        let ta = vg_trunc_w(mut vg, a)
+        vg_canon_un(mut vg, W, op, ta)
+      }
+    }
+    SBin(_, op, a, b) =>
+    if binop_is_cmp(op) {
+      vg_canon_bin(mut vg, W, op, a, b)
+    } else if is_ring_op(op) {
+      let ta = vg_trunc_w(mut vg, a)
+      let tb = vg_trunc_w(mut vg, b)
+      vg_canon_bin(mut vg, W, op, ta, tb)
+    } else {
+      vg_intern(mut vg, SUn(W, Copy, v))
+    }
+    _ => vg_intern(mut vg, SUn(W, Copy, v))
+  }
+}
+
+///| `cls op a` where `a` already has class `unop_arg_cls(op, cls)`.
+pub fn vg_canon_un(mut vg : ValGraph, cls : Cls, op : UnOp, a : Int) -> Int {
+  if !vg_valid(vg, a) {
+    return -1
+  }
+  match vg_const(vg, a) {
+    Some(x) => return vg_konst(mut vg, cls, eval_un_const(cls, op, x))
+    None => ()
+  }
+  if op == Copy {
+    return a
+  }
+  let na = vg.nodes[a]
+  if op == Neg {
+    match na {
+      SUn(c2, op2, x) => if c2 == cls && op2 == Neg {
+        return x
+      }
+      _ => ()
+    }
+    return vg_intern(mut vg, SUn(cls, op, a))
+  }
+  let k = unop_ext_bits(op)
+  // `w =w extsw / extuw x` is `x`.
+  if k == 32 && cls == W {
+    return a
+  }
+  // An extension only reads the low k bits of its operand, which an inner
+  // extension keeping at least k bits leaves unchanged.
+  match na {
+    SUn(c2, op2, x) => {
+      let k2 = unop_ext_bits(op2)
+      if k2 >= k && vg_cls(vg, x) == W {
+        if op2 == op && c2 == cls {
+          return a
+        }
+        return vg_canon_un(mut vg, cls, op, x)
+      }
+    }
+    _ => ()
+  }
+  // `vendor/qbe/copy.c` `defwidthle`: the extension is the identity on a
+  // `W` value that already fits.
+  if cls == W {
+    if unop_ext_signed(op) {
+      if fits_bits(vg, a, k - 1) {
+        return a
+      }
+    } else if fits_bits(vg, a, k) {
+      return a
+    }
+  }
+  vg_intern(mut vg, SUn(cls, op, a))
+}
+
+fn swap_cmp(op : BinOp) -> Option[BinOp] {
+  match op {
+    CSgt(c) => Some(CSlt(c))
+    CSge(c) => Some(CSle(c))
+    CUgt(c) => Some(CUlt(c))
+    CUge(c) => Some(CUle(c))
+    _ => None
+  }
+}
+
+///| `cls op a, b` where `a` / `b` already have class `binop_arg_cls`.
+pub fn vg_canon_bin(mut vg : ValGraph, cls : Cls, op0 : BinOp, a0 : Int, b0 : Int) -> Int {
+  if !vg_valid(vg, a0) || !vg_valid(vg, b0) {
+    return -1
+  }
+  // 4. `a > b` is `b < a`, `a >= b` is `b <= a`.
+  let mut op = op0
+  let mut a = a0
+  let mut b = b0
+  match swap_cmp(op0) {
+    Some(o) => {
+      op = o
+      a = b0
+      b = a0
+    }
+    None => ()
+  }
+  // 1. constant folding.
+  match vg_const(vg, a) {
+    Some(x) =>
+    match vg_const(vg, b) {
+      Some(y) =>
+      match eval_bin_const(cls, op, x, y) {
+        Some(r) => return vg_konst(mut vg, cls, r)
+        None => ()
+      }
+      None => ()
+    }
+    None => ()
+  }
+  // `x - c` is `x + (-c)`.
+  if op == Sub {
+    match vg_const(vg, b) {
+      Some(y) => {
+        let nb = vg_konst(mut vg, cls, 0UL - y)
+        return vg_canon_bin(mut vg, cls, Add, a, nb)
+      }
+      None => ()
+    }
+  }
+  // 5. commutative operands: constants on the right, else ascending ids.
+  if binop_commutes(op) {
+    let ca = vg_const(vg, a).is_some()
+    let cb = vg_const(vg, b).is_some()
+    if (ca && !cb) || (!ca && !cb && a > b) {
+      let t = a
+      a = b
+      b = t
+    }
+  }
+  // 6. / 7. / 8. identities with a constant right operand.
+  match vg_const(vg, b) {
+    Some(y0) => {
+      let r = canon_bin_rconst(mut vg, cls, op, a, b, y0)
+      if r >= 0 {
+        return r
+      }
+    }
+    None => ()
+  }
+  // 6. identical operands.
+  if a == b {
+    match op {
+      Sub => return vg_konst(mut vg, cls, 0UL)
+      Xor => return vg_konst(mut vg, cls, 0UL)
+      And => return a
+      Or => return a
+      CEq(_) => return vg_konst(mut vg, cls, 1UL)
+      CSle(_) => return vg_konst(mut vg, cls, 1UL)
+      CUle(_) => return vg_konst(mut vg, cls, 1UL)
+      CNe(_) => return vg_konst(mut vg, cls, 0UL)
+      CSlt(_) => return vg_konst(mut vg, cls, 0UL)
+      CUlt(_) => return vg_konst(mut vg, cls, 0UL)
+      _ => ()
+    }
+  }
+  vg_intern(mut vg, SBin(cls, op, a, b))
+}
+
+fn is_assoc_op(op : BinOp) -> Bool {
+  match op {
+    Add => true
+    Mul => true
+    And => true
+    Or => true
+    Xor => true
+    _ => false
+  }
+}
+
+///| Rewrites of `cls op a, b` where `b` is the constant `y0`; -1 if none.
+fn canon_bin_rconst(mut vg : ValGraph, cls : Cls, op : BinOp, a : Int, b : Int, y0 : UInt64) -> Int {
+  let y = mask_cls(binop_arg_cls(op, cls, 1), y0)
+  match op {
+    Add => if y == 0UL {
+      return a
+    }
+    Mul => {
+      if y == 0UL {
+        return vg_konst(mut vg, cls, 0UL)
+      }
+      if y == 1UL {
+        return a
+      }
+      let k = log2_exact(cls, y)
+      if k > 0 {
+        let kv = vg_konst(mut vg, W, k.to_int64().reinterpret_as_uint64())
+        return vg_canon_bin(mut vg, cls, Shl, a, kv)
+      }
+    }
+    And => {
+      if y == 0UL {
+        return vg_konst(mut vg, cls, 0UL)
+      }
+      if y == all_ones(cls) {
+        return a
+      }
+      if cls == W {
+        let n = low_mask_bits(y)
+        if n > 0 && fits_bits(vg, a, n) {
+          return a
+        }
+      }
+    }
+    Or => {
+      if y == 0UL {
+        return a
+      }
+      if y == all_ones(cls) {
+        return b
+      }
+    }
+    Xor => if y == 0UL {
+      return a
+    }
+    Shl => if shift_amount(cls, y) == 0 {
+      return a
+    }
+    Shr => if shift_amount(cls, y) == 0 {
+      return a
+    }
+    Sar => if shift_amount(cls, y) == 0 {
+      return a
+    }
+    Div => if y == 1UL {
+      return a
+    }
+    UDiv => {
+      if y == 1UL {
+        return a
+      }
+      let k = log2_exact(cls, y)
+      if k > 0 {
+        let kv = vg_konst(mut vg, W, k.to_int64().reinterpret_as_uint64())
+        return vg_canon_bin(mut vg, cls, Shr, a, kv)
+      }
+    }
+    Rem => if y == 1UL {
+      return vg_konst(mut vg, cls, 0UL)
+    }
+    URem => {
+      if y == 1UL {
+        return vg_konst(mut vg, cls, 0UL)
+      }
+      let k = log2_exact(cls, y)
+      if k > 0 {
+        let mv = vg_konst(mut vg, cls, y - 1UL)
+        return vg_canon_bin(mut vg, cls, And, a, mv)
+      }
+    }
+    // `copy.c` identity values of `ceqw` / `cnew` on 0/1 values.
+    CEq(c) => if c == W && cls == W && y == 1UL && is_bool_node(vg, a) {
+      return a
+    }
+    CNe(c) => if c == W && cls == W && y == 0UL && is_bool_node(vg, a) {
+      return a
+    }
+    _ => ()
+  }
+  // 7. `(x op c1) op c2` is `x op (c1 op c2)` (`gvn.c` `assoccon`).
+  if is_assoc_op(op) && vg_valid(vg, a) {
+    match vg.nodes[a] {
+      SBin(c2, op2, x, z) =>
+      if c2 == cls && op2 == op {
+        match vg_const(vg, z) {
+          Some(zc) =>
+          match eval_bin_const(cls, op, zc, y) {
+            Some(r) => {
+              let rv = vg_konst(mut vg, cls, r)
+              return vg_canon_bin(mut vg, cls, op, x, rv)
+            }
+            None => ()
+          }
+          None => ()
+        }
+      }
+      _ => ()
+    }
+  }
+  -1
+}
+
+///| Whether the value `vid` depends on a phi or an effect of source block
+///| `blk` (one backward sweep over the DAG: children precede parents).
+pub fn vid_mentions_blk(vg : ValGraph, vid : Int, blk : Int) -> Bool {
+  if !vg_valid(vg, vid) {
+    return false
+  }
+  let mut mark = Array::make(vid + 1, false)
+  mark[vid] = true
+  let mut i = vid
+  while i >= 0 {
+    if mark[i] {
+      match vg.nodes[i] {
+        SPhi(_, b, _) => if b == blk {
+          return true
+        }
+        SEffect(_, b, _) => if b == blk {
+          return true
+        }
+        SUn(_, _, a) => if a >= 0 && a < i {
+          mark[a] = true
+        }
+        SBin(_, _, a, c) => {
+          if a >= 0 && a < i {
+            mark[a] = true
+          }
+          if c >= 0 && c < i {
+            mark[c] = true
+          }
+        }
+        _ => ()
+      }
+    }
+    i = i - 1
+  }
+  false
+}

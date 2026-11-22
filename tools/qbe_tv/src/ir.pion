@@ -1,0 +1,331 @@
+///| Verified QBE SSA translation validator — IR.
+///|
+///| A dense-integer image of the integer / control-flow / memory subset of
+///| QBE SSA (`vendor/qbe/ops.h`) as printed by `printfn()` between the
+///| optimisation passes (`qbe -d MG`). Temporaries, blocks and symbols are
+///| dense ids assigned by the untrusted front end (`tools/qbe_tv_cli`); the
+///| block with id 0 is the entry block.
+///|
+///| Value model: every value is a `UInt64`; a `W` value is always kept
+///| zero-extended (`mask_cls`). A `W` use of an `L` value reads its low 32
+///| bits; an `L` use of a `W` value is kept opaque (`canon.pion`).
+
+#derive(Eq)
+pub enum Cls {
+  W
+  L
+}
+
+#derive(Eq)
+pub enum BinOp {
+  Add
+  Sub
+  Mul
+  And
+  Or
+  Xor
+  Shl
+  Shr
+  Sar
+  Div
+  UDiv
+  Rem
+  URem
+  CEq(Cls)
+  CNe(Cls)
+  CSlt(Cls)
+  CSle(Cls)
+  CSgt(Cls)
+  CSge(Cls)
+  CUlt(Cls)
+  CUle(Cls)
+  CUgt(Cls)
+  CUge(Cls)
+}
+
+#derive(Eq)
+pub enum UnOp {
+  Copy
+  Neg
+  ExtSB
+  ExtUB
+  ExtSH
+  ExtUH
+  ExtSW
+  ExtUW
+}
+
+#derive(Eq)
+pub enum MemWidth {
+  B1
+  B2
+  B4
+  B8
+}
+
+///| `Sym(id, off)` is the address constant `$sym+off`.
+#derive(Eq)
+pub enum Atom {
+  Temp(Int)
+  Const(UInt64)
+  Sym(Int, UInt64)
+}
+
+///| One `arg<cls> <value>` of a call.
+pub struct CallArg {
+  cls : Cls
+  arg : Atom
+}
+
+pub enum Inst {
+  /// `dst =cls par` (the k-th parameter).
+  Par(Int, Cls, Int)
+  /// `dst =cls op a`.
+  Un(Int, Cls, UnOp, Atom)
+  /// `dst =cls op a, b`.
+  Bin(Int, Cls, BinOp, Atom, Atom)
+  /// `(dst, cls, width, is_signed, addr)`.
+  Load(Int, Cls, MemWidth, Bool, Atom)
+  /// `(width, value, addr)`.
+  Store(MemWidth, Atom, Atom)
+  /// `(dst, cls, has_dst, callee, args)`.
+  Call(Int, Cls, Bool, Atom, Array[CallArg])
+  /// `(dst, align, size)`.
+  Alloc(Int, Int, Int)
+}
+
+pub struct PhiArm {
+  pred : Int
+  value : Atom
+}
+
+pub struct Phi {
+  dst : Int
+  cls : Cls
+  arms : Array[PhiArm]
+}
+
+pub enum Term {
+  Jmp(Int)
+  Jnz(Atom, Int, Int)
+  /// `(has_value, cls, value)`.
+  Ret(Bool, Cls, Atom)
+  Hlt
+}
+
+pub struct Block {
+  id : Int
+  phis : Array[Phi]
+  insts : Array[Inst]
+  term : Term
+}
+
+pub struct Func {
+  nparams : Int
+  ntemps : Int
+  blocks : Array[Block]
+}
+
+///| Why a pair was rejected (block / temporary ids for diagnostics).
+pub enum TvFail {
+  /// `wf_code` of the source / target.
+  BadSrc(Int)
+  BadTgt(Int)
+  /// The initialisation certificate of the source / target fails at a block.
+  SrcAvail(Int)
+  TgtAvail(Int)
+  /// The branch-fact certificate fails at a source block.
+  SrcFacts(Int)
+  /// Side-effect traces differ: (source block, target block).
+  EffectMismatch(Int, Int)
+  /// A target effect matched two different source effects (target temp).
+  EffectConflict(Int)
+  /// Terminators of a matched pair differ: (source block, target block).
+  TermMismatch(Int, Int)
+  CondMismatch(Int, Int)
+  RetMismatch(Int, Int)
+  /// A target phi has no source counterpart: (target block, target temp).
+  PhiUnmapped(Int, Int)
+  /// A target temp would get two different symbolic values.
+  PhiConflict(Int)
+  /// A target phi argument differs on a matched edge: (target block, temp).
+  PhiArmMismatch(Int, Int)
+  /// A target phi value is not stable over its block: (target block, temp).
+  PhiScope(Int, Int)
+  /// A target temp has no symbolic value where it is observed.
+  UnknownValue(Int)
+  /// The bounded exploration ran out of steps.
+  WorkLimit(Int)
+}
+
+pub enum TvResult {
+  Valid
+  Rejected(TvFail)
+}
+
+///| A `W` value keeps only its low 32 bits.
+pub fn mask_cls(cls : Cls, v : UInt64) -> UInt64 {
+  match cls {
+    W => v & 0xFFFF_FFFFUL
+    L => v
+  }
+}
+
+pub fn all_ones(cls : Cls) -> UInt64 {
+  mask_cls(cls, 0xFFFF_FFFF_FFFF_FFFFUL)
+}
+
+pub fn int_min_of(cls : Cls) -> UInt64 {
+  match cls {
+    W => 0x8000_0000UL
+    L => 0x8000_0000_0000_0000UL
+  }
+}
+
+pub fn cls_bits(cls : Cls) -> Int {
+  match cls {
+    W => 32
+    L => 64
+  }
+}
+
+///| Only the four integer divisions may trap.
+pub fn is_trapping_binop(op : BinOp) -> Bool {
+  match op {
+    Div => true
+    UDiv => true
+    Rem => true
+    URem => true
+    _ => false
+  }
+}
+
+pub fn is_signed_div(op : BinOp) -> Bool {
+  match op {
+    Div => true
+    Rem => true
+    _ => false
+  }
+}
+
+///| `vendor/qbe/fold.c:58-66`: a division by a constant cannot trap when the
+///| divisor is not 0 and, for signed `div` / `rem` by -1, the dividend is a
+///| known constant other than `INT32_MIN` / `INT64_MIN`.
+pub fn is_safe_div_const(
+  cls : Cls,
+  op : BinOp,
+  lhs_const : Option[UInt64],
+  rhs_val : UInt64,
+) -> Bool {
+  let r = mask_cls(cls, rhs_val)
+  if r == 0UL {
+    return false
+  }
+  if is_signed_div(op) && r == all_ones(cls) {
+    match lhs_const {
+      Some(l) => mask_cls(cls, l) != int_min_of(cls)
+      None => false
+    }
+  } else {
+    true
+  }
+}
+
+pub fn binop_is_cmp(op : BinOp) -> Bool {
+  match op {
+    CEq(_) => true
+    CNe(_) => true
+    CSlt(_) => true
+    CSle(_) => true
+    CSgt(_) => true
+    CSge(_) => true
+    CUlt(_) => true
+    CUle(_) => true
+    CUgt(_) => true
+    CUge(_) => true
+    _ => false
+  }
+}
+
+///| The operand width of a comparison (`dflt` for other operators).
+pub fn binop_cmp_cls(op : BinOp, dflt : Cls) -> Cls {
+  match op {
+    CEq(c) => c
+    CNe(c) => c
+    CSlt(c) => c
+    CSle(c) => c
+    CSgt(c) => c
+    CSge(c) => c
+    CUlt(c) => c
+    CUle(c) => c
+    CUgt(c) => c
+    CUge(c) => c
+    _ => dflt
+  }
+}
+
+pub fn binop_is_shift(op : BinOp) -> Bool {
+  match op {
+    Shl => true
+    Shr => true
+    Sar => true
+    _ => false
+  }
+}
+
+///| Class at which operand `n` (0 or 1) of `cls op a, b` is read
+///| (`vendor/qbe/ops.h`): comparisons read their own width, shift counts are
+///| always `w`.
+pub fn binop_arg_cls(op : BinOp, cls : Cls, n : Int) -> Cls {
+  if binop_is_cmp(op) {
+    binop_cmp_cls(op, cls)
+  } else if binop_is_shift(op) && n == 1 {
+    W
+  } else {
+    cls
+  }
+}
+
+///| Class at which the operand of `cls op a` is read: extensions read `w`.
+pub fn unop_arg_cls(op : UnOp, cls : Cls) -> Cls {
+  match op {
+    Copy => cls
+    Neg => cls
+    _ => W
+  }
+}
+
+pub fn binop_commutes(op : BinOp) -> Bool {
+  match op {
+    Add => true
+    Mul => true
+    And => true
+    Or => true
+    Xor => true
+    CEq(_) => true
+    CNe(_) => true
+    _ => false
+  }
+}
+
+///| Number of low bits an extension keeps (0 for `copy` / `neg`).
+pub fn unop_ext_bits(op : UnOp) -> Int {
+  match op {
+    ExtSB => 8
+    ExtUB => 8
+    ExtSH => 16
+    ExtUH => 16
+    ExtSW => 32
+    ExtUW => 32
+    _ => 0
+  }
+}
+
+pub fn unop_ext_signed(op : UnOp) -> Bool {
+  match op {
+    ExtSB => true
+    ExtSH => true
+    ExtSW => true
+    _ => false
+  }
+}
