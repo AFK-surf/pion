@@ -46,7 +46,7 @@ function hashI64(k) {
 
 export function createPionRuntime(opts = {}) {
   let memory = opts.memory || null, exp = opts.exports || null, buf = null, dv = null, u8 = null;
-  let heapBase = 0, heapPtr = 0, heapEnd = 0;
+  let heapBase = 0, heapPtr = 0, heapEnd = 0, slabCtl = 0;
   const free = FREE_CLASSES.map(() => []);
   const largeFree = new Map();
   const out = [], err = [];
@@ -57,6 +57,7 @@ export function createPionRuntime(opts = {}) {
   const sync = () => {
     if (buf !== memory.buffer) {
       buf = memory.buffer; dv = new DataView(buf); u8 = new Uint8Array(buf); heapEnd = buf.byteLength;
+      if (slabCtl > 0) dv.setUint32(slabCtl + 40, heapEnd >>> 0, true);
     }
   };
   const pNum = (v) => (typeof v === "bigint" ? Number(v) : (v | 0));
@@ -67,12 +68,20 @@ export function createPionRuntime(opts = {}) {
   const s32 = (p, v) => dv.setInt32(p, v | 0, true);
   const gu32 = (p) => dv.getUint32(p, true);
   const su32 = (p, v) => dv.setUint32(p, v >>> 0, true);
+  const getHp = () => (slabCtl > 0 ? gu32(slabCtl + 36) : heapPtr);
+  const setHp = (v) => { heapPtr = v >>> 0; if (slabCtl > 0) su32(slabCtl + 36, heapPtr); };
 
   function bindExports(e) {
-    exp = e; if (e.memory) memory = e.memory; sync();
+    exp = e; if (e.memory) memory = e.memory; slabCtl = 0; sync();
     const hb = e.__heap_base;
     const base = typeof hb === "number" ? hb : (hb && typeof hb.value === "number" ? hb.value : 0x30000);
     heapBase = (base + 15) & ~15; heapPtr = heapBase; heapEnd = memory.buffer.byteLength;
+    const sc = e.__pion_slab_ctl;
+    slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
+    if (slabCtl > 0) {
+      u8.fill(0, slabCtl, slabCtl + 64);
+      su32(slabCtl + 36, heapPtr); su32(slabCtl + 40, heapEnd); su32(slabCtl + 44, heapBase);
+    }
     for (let i = 0; i < free.length; i++) free[i].length = 0;
     largeFree.clear();
   }
@@ -88,33 +97,41 @@ export function createPionRuntime(opts = {}) {
   function rawAlloc(sz) {
     sync();
     const need = ((sz + 7) & ~7) + 8, c = clsIdx(need);
-    if (c >= 0 && free[c].length) {
-      const b = free[c].pop(); su32(b, FREE_CLASSES[c]); su32(b + 4, ALLOC_MAGIC); return b + 8;
+    if (c >= 0) {
+      if (slabCtl > 0 && c < 9) {
+        const so = slabCtl + c * 4, h = gu32(so);
+        if (h !== 0) { su32(so, gu32(h + 8)); su32(h, FREE_CLASSES[c]); su32(h + 4, ALLOC_MAGIC); return h + 8; }
+      } else if (free[c].length) {
+        const b = free[c].pop(); su32(b, FREE_CLASSES[c]); su32(b + 4, ALLOC_MAGIC); return b + 8;
+      }
     }
     const asz = c >= 0 ? FREE_CLASSES[c] : ((need + 15) & ~15);
     if (c < 0) {
       const bk = largeFree.get(asz);
       if (bk && bk.length) { const b = bk.pop(); su32(b, asz); su32(b + 4, ALLOC_MAGIC); return b + 8; }
     }
-    if (heapPtr + asz > heapEnd) {
-      memory.grow(Math.max(16, Math.ceil((heapPtr + asz - heapEnd) / PAGE))); sync();
+    const hp = getHp();
+    if (hp + asz > heapEnd) {
+      memory.grow(Math.max(16, Math.ceil((hp + asz - heapEnd) / PAGE))); sync();
     }
-    const b = heapPtr; heapPtr += asz; su32(b, asz); su32(b + 4, ALLOC_MAGIC); return b + 8;
+    const b = hp; setHp(hp + asz); su32(b, asz); su32(b + 4, ALLOC_MAGIC); return b + 8;
   }
   const rawZero = (sz) => { const p = rawAlloc(sz); u8.fill(0, p, p + sz); return p; };
   function rawFree(ptr) {
     if (!ptr) return; sync();
-    const b = ptr - 8;
-    if (b < heapBase || b + 8 > heapPtr || (b & 7) !== 0) return;
+    const hp = getHp(), b = ptr - 8;
+    if (b < heapBase || b + 8 > hp || (b & 7) !== 0) return;
     const mg = gu32(b + 4);
     if (mg === FREE_MAGIC || mg !== ALLOC_MAGIC) return;
     const asz = gu32(b);
-    if (asz < 16 || b + asz > heapPtr) return;
+    if (asz < 16 || b + asz > hp) return;
     su32(b + 4, FREE_MAGIC);
-    if (b + asz === heapPtr) { heapPtr = b; return; }
+    if (b + asz === hp) { setHp(b); return; }
     const c = FREE_CLASS_IDX.get(asz);
-    if (c !== undefined) { free[c].push(b); }
-    else { let bk = largeFree.get(asz); if (!bk) { bk = []; largeFree.set(asz, bk); } bk.push(b); }
+    if (c !== undefined) {
+      if (slabCtl > 0 && c < 9) { const so = slabCtl + c * 4; su32(b + 8, gu32(so)); su32(so, b); }
+      else free[c].push(b);
+    } else { let bk = largeFree.get(asz); if (!bk) { bk = []; largeFree.set(asz, bk); } bk.push(b); }
   }
 
   function allocObj(sz, tag, drop, zero) {

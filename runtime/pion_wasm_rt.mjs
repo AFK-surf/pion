@@ -109,6 +109,7 @@ export function createPionRuntime(options = {}) {
   let heapBase = 0;
   let heapPtr = 0;
   let heapEnd = 0;
+  let slabCtl = 0;
   const freeLists = FREE_CLASSES.map(() => []);
   const largeFree = new Map();
 
@@ -136,18 +137,41 @@ export function createPionRuntime(options = {}) {
       dv = new DataView(cachedBuf);
       u8 = new Uint8Array(cachedBuf);
       heapEnd = cachedBuf.byteLength;
+      if (slabCtl > 0) {
+        dv.setUint32(slabCtl + 40, heapEnd >>> 0, true);
+      }
+    }
+  }
+
+  function getHeapPtr() {
+    return slabCtl > 0 ? dv.getUint32(slabCtl + 36, true) : heapPtr;
+  }
+
+  function setHeapPtr(v) {
+    heapPtr = v >>> 0;
+    if (slabCtl > 0) {
+      dv.setUint32(slabCtl + 36, heapPtr, true);
     }
   }
 
   function bindExports(exp) {
     exportsObj = exp;
     if (exp.memory) memory = exp.memory;
+    slabCtl = 0;
     syncViews();
     const hb = exp.__heap_base;
     const base = typeof hb === "number" ? hb : (hb && typeof hb.value === "number" ? hb.value : 0x220000);
     heapBase = (base + 15) & ~15;
     heapPtr = heapBase;
     heapEnd = memory.buffer.byteLength;
+    const sc = exp.__pion_slab_ctl;
+    slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
+    if (slabCtl > 0) {
+      u8.fill(0, slabCtl, slabCtl + 64);
+      dv.setUint32(slabCtl + 36, heapPtr >>> 0, true);
+      dv.setUint32(slabCtl + 40, heapEnd >>> 0, true);
+      dv.setUint32(slabCtl + 44, heapBase >>> 0, true);
+    }
     for (let i = 0; i < freeLists.length; i++) freeLists[i].length = 0;
     largeFree.clear();
   }
@@ -174,7 +198,18 @@ export function createPionRuntime(options = {}) {
     const need = ((size + 7) & ~7) + 8;
     const cls = sizeClassIndex(need);
     if (cls >= 0) {
-      if (freeLists[cls].length > 0) {
+      if (slabCtl > 0 && cls < 9) {
+        const slotOff = slabCtl + cls * 4;
+        const head = dv.getUint32(slotOff, true);
+        if (head !== 0) {
+          const next = dv.getUint32(head + 8, true);
+          dv.setUint32(slotOff, next, true);
+          const allocSz = FREE_CLASSES[cls];
+          dv.setUint32(head, allocSz, true);
+          dv.setUint32(head + 4, ALLOC_MAGIC, true);
+          return head + 8;
+        }
+      } else if (freeLists[cls].length > 0) {
         const base = freeLists[cls].pop();
         const allocSz = FREE_CLASSES[cls];
         dv.setUint32(base, allocSz, true);
@@ -192,14 +227,15 @@ export function createPionRuntime(options = {}) {
         return base + 8;
       }
     }
-    if (heapPtr + allocSz > heapEnd) {
-      const missing = heapPtr + allocSz - heapEnd;
+    const hp = getHeapPtr();
+    if (hp + allocSz > heapEnd) {
+      const missing = hp + allocSz - heapEnd;
       const growPages = Math.max(16, Math.ceil(missing / PAGE_SIZE));
       memory.grow(growPages);
       syncViews();
     }
-    const base = heapPtr;
-    heapPtr += allocSz;
+    const base = hp;
+    setHeapPtr(hp + allocSz);
     dv.setUint32(base, allocSz, true);
     dv.setUint32(base + 4, ALLOC_MAGIC, true);
     return base + 8;
@@ -214,21 +250,29 @@ export function createPionRuntime(options = {}) {
   function rawFree(ptr) {
     if (!ptr) return;
     syncViews();
+    const hp = getHeapPtr();
     const base = ptr - 8;
-    if (base < heapBase || base + 8 > heapPtr || (base & 7) !== 0) return;
+    if (base < heapBase || base + 8 > hp || (base & 7) !== 0) return;
     const magic = dv.getUint32(base + 4, true);
     if (magic === FREE_MAGIC) return;
     if (magic !== ALLOC_MAGIC) return;
     const allocSz = dv.getUint32(base, true);
-    if (allocSz < 16 || base + allocSz > heapPtr) return;
+    if (allocSz < 16 || base + allocSz > hp) return;
     dv.setUint32(base + 4, FREE_MAGIC, true);
-    if (base + allocSz === heapPtr) {
-      heapPtr = base;
+    if (base + allocSz === hp) {
+      setHeapPtr(base);
       return;
     }
     const cls = FREE_CLASS_IDX.get(allocSz);
     if (cls !== undefined) {
-      freeLists[cls].push(base);
+      if (slabCtl > 0 && cls < 9) {
+        const slotOff = slabCtl + cls * 4;
+        const head = dv.getUint32(slotOff, true);
+        dv.setUint32(base + 8, head, true);
+        dv.setUint32(slotOff, base >>> 0, true);
+      } else {
+        freeLists[cls].push(base);
+      }
     } else {
       let bucket = largeFree.get(allocSz);
       if (!bucket) {

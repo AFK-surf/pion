@@ -469,9 +469,35 @@ if (memBytes > limitBytes) {
   console.error("FAIL (" + rtLabel + "): rc_read_leak linear memory grew too large:", memBytes, ">", limitBytes);
   process.exit(1);
 }
-const liveStructs = allocStructs - freedStructs;
-if (allocStructs <= 0 || liveStructs !== 0) {
-  console.error("FAIL (" + rtLabel + "): TAG_STRUCT RC leak detected: alloc=" + allocStructs + " freed=" + freedStructs + " live=" + liveStructs);
+// Verify all 200 * 16 * 3 = 9600 Box structs were freed and ZERO live TAG_STRUCT blocks remain in linear memory
+const expectedStructs = 200 * 16 * 3;
+if (freedStructs !== expectedStructs) {
+  console.error("FAIL (" + rtLabel + "): expected freedStructs=" + expectedStructs + ", got " + freedStructs + " (jsAlloc=" + allocStructs + ")");
+  process.exit(1);
+}
+let liveStructs = 0;
+if (instance.exports.__pion_slab_ctl) {
+  const dv = new DataView(memRef.buffer);
+  const ctl = instance.exports.__pion_slab_ctl.value;
+  const hp = dv.getUint32(ctl + 36, true);
+  const hb = dv.getUint32(ctl + 44, true);
+  for (let b = hb; b < hp; ) {
+    const asz = dv.getUint32(b, true);
+    const mg = dv.getUint32(b + 4, true);
+    if (asz < 16 || b + asz > hp) {
+      console.error("FAIL (" + rtLabel + "): corrupt heap block at " + b + " asz=" + asz + " hp=" + hp);
+      process.exit(1);
+    }
+    if (mg === 0x50494f4e && dv.getUint16(b + 8 + 12, true) === 4) {
+      liveStructs++;
+    }
+    b += asz;
+  }
+} else {
+  liveStructs = allocStructs - freedStructs;
+}
+if (liveStructs !== 0) {
+  console.error("FAIL (" + rtLabel + "): TAG_STRUCT RC leak detected: jsAlloc=" + allocStructs + " freed=" + freedStructs + " live=" + liveStructs);
   process.exit(1);
 }
 
@@ -493,7 +519,7 @@ if (rcAfter !== rcBefore) {
 prt.pion_rc_dec(elemPtr);
 prt.pion_rc_dec(arrPtr);
 
-console.log("  rc_read_leak (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=16MiB) allocStructs=" + allocStructs + " liveStructs=" + liveStructs + " arr_get_rc=" + rcBefore + "->" + rcAfter + " OK");
+console.log("  rc_read_leak (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=16MiB) freedStructs=" + freedStructs + " liveStructs=" + liveStructs + " jsAlloc=" + allocStructs + " arr_get_rc=" + rcBefore + "->" + rcAfter + " OK");
 ' "$RC_LEAK_WASM" "$rt_path"
 done
 
@@ -754,5 +780,106 @@ for (const rtPath of rtPaths) {
 }
 console.log("  mem2reg (pure+mix): zero_shadow_stack=OK pure_raw=" + pureBytes.length + "B mix_raw=" + mixBytes.length + "B (Node+Web OK)");
 ' "$M2R_PURE_RAW" "$M2R_MIX_RAW" "$PION_WASM_RT" "$PION_WASM_RT_WEB"
+
+echo "=== P29-C [11/11] Pure-Wasm In-Memory Slab (<=512B) + Mixed Wasm/JS Alloc-Free & Tree Recycling ==="
+cat > "$TMP_DIR/slab_mix.pion" <<'EOF'
+enum Tree {
+  Leaf
+  Node(Tree, Tree)
+}
+
+fn make_tree(d : Int) -> Tree {
+  if d == 0 {
+    Tree::Leaf
+  } else {
+    Tree::Node(make_tree(d - 1), make_tree(d - 1))
+  }
+}
+
+fn check_tree(t : Tree) -> Int {
+  match t {
+    Tree::Leaf => 1
+    Tree::Node(l, r) => 1 + check_tree(l) + check_tree(r)
+  }
+}
+
+pub fn main(world : World) -> Int {
+  let mut total = 0
+  let mut i = 0
+  while i < 80 {
+    let t = make_tree(10)
+    total = total + check_tree(t)
+    // Mix Wasm-allocated structs/closures with JS-allocated strings & maps
+    let s = "iter:" + i.to_string()
+    if i % 10 == 0 {
+      total = total + s.length()
+    }
+    i = i + 1
+  }
+  io_println(world, total.to_string())
+  0
+}
+EOF
+SLAB_WASM="$TMP_DIR/slab_mix.wasm"
+"$PIONC" build --release --target wasm32 -o "$SLAB_WASM" "$TMP_DIR/slab_mix.pion"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + rtLabel + "): slab_mix.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+if (!instance.exports.__pion_slab_ctl) {
+  console.error("FAIL (" + rtLabel + "): missing __pion_slab_ctl export");
+  process.exit(1);
+}
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+// 80 * (2^11 - 1 = 2047) = 163760; i=0 -> len("iter:0")=6, i=10..70 (7 times) -> len=7 => 6+49=55 => 163815
+if ((rc | 0) !== 0 || out !== "163815") {
+  console.error("FAIL (" + rtLabel + "): slab_mix mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+const limitBytes = 4 * 1024 * 1024;
+if (memBytes > limitBytes) {
+  console.error("FAIL (" + rtLabel + "): slab_mix linear memory leaked:", memBytes, ">", limitBytes);
+  process.exit(1);
+}
+
+// Cross-boundary check: JS pion_alloc_uninit + pion_rc_dec on small slab classes
+const { pion_alloc_uninit, pion_rc_dec } = rt.imports.pion_rt;
+const p1 = pion_alloc_uninit(16, 4, 0n);
+const p2 = pion_alloc_uninit(16, 4, 0n);
+pion_rc_dec(p1);
+const p3 = pion_alloc_uninit(16, 4, 0n);
+if (p3 !== p1) {
+  console.error("FAIL (" + rtLabel + "): expected slab freelist reuse p3 === p1:", p3, "!==", p1);
+  process.exit(1);
+}
+pion_rc_dec(p3);
+pion_rc_dec(p2);
+
+console.log("  slab_mix (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=4MiB) slab_reuse=OK");
+' "$SLAB_WASM" "$rt_path"
+done
 
 echo "p29c_wasm32 E2E: OK"
