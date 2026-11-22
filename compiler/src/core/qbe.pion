@@ -2686,7 +2686,7 @@ fn qbe_try_emit_borrowed_arr_elem(
 ) -> Option[QbeVal] {
   if qbe_expr_has_assign(idx_expr) ||
     qbe_expr_assigns_ident(idx_expr, aname) ||
-    !qbe_loop_has_no_calls_expr(idx_expr) {
+    !qbe_loop_has_no_calls_expr(g, idx_expr) {
     return None
   }
   match qbe_lookup_local(g, aname) {
@@ -4568,9 +4568,65 @@ fn qbe_is_double_two(e : Expr) -> Bool {
 }
 
 ///|
-/// Conservative check: returns true only when `e` contains no calls (except pure `math_sqrt`)
+fn qbe_is_pure_builtin_method(recv_ty : Ty, mname : String, nargs : Int) -> Bool {
+  match recv_ty {
+    TDouble | TFloat | TInt | TInt64 | TUInt | TUInt64 | TByte | TChar | TBool =>
+      mname == "sqrt" ||
+      mname == "abs" ||
+      mname == "floor" ||
+      mname == "ceil" ||
+      mname == "round" ||
+      mname == "trunc" ||
+      mname == "sin" ||
+      mname == "cos" ||
+      mname == "tan" ||
+      mname == "asin" ||
+      mname == "acos" ||
+      mname == "atan" ||
+      mname == "atan2" ||
+      mname == "exp" ||
+      mname == "log" ||
+      mname == "pow" ||
+      mname == "min" ||
+      mname == "max" ||
+      mname == "clamp" ||
+      mname == "to_int" ||
+      mname == "to_int64" ||
+      mname == "to_uint" ||
+      mname == "to_uint64" ||
+      mname == "to_double" ||
+      mname == "to_float" ||
+      mname == "to_byte" ||
+      mname == "unsafe_to_char" ||
+      mname == "reinterpret_as_int" ||
+      mname == "reinterpret_as_uint" ||
+      mname == "reinterpret_as_int64" ||
+      mname == "reinterpret_as_uint64" ||
+      mname == "reinterpret_as_double" ||
+      mname == "reinterpret_as_float"
+    TString =>
+      (mname == "length" && nargs == 0) ||
+      (mname == "code_unit_at" && nargs == 1)
+    TArray(_) | TFixedArray(_) | TBytes | TMap(_, _) =>
+      mname == "length" && nargs == 0
+    _ => false
+  }
+}
+
+///|
+/// Conservative check: returns true only when `e` contains no calls (except pure built-in
+/// math/conversion/length calls on statically known built-in receiver types)
 /// and no closures/scope/spawn, guaranteeing zero hidden aliasing writes.
-fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
+fn qbe_loop_has_no_calls_expr(g : QbeGen, e : Expr) -> Bool {
+  qbe_loop_has_no_calls_expr_with(g, e, qbe_hints_new())
+}
+
+///|
+fn qbe_loop_has_no_calls_expr_with(
+  g : QbeGen,
+  e : Expr,
+  hints : QbeProbeHints,
+) -> Bool {
   match e {
     EInt(_, _)
     | EInt64(_, _)
@@ -4586,9 +4642,10 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
     | EPath(_, _, _)
     | EUnit(_) => true
     EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) =>
-      qbe_loop_has_no_calls_expr(inner)
+      qbe_loop_has_no_calls_expr_with(g, inner, hints)
     EBinary(_, l, r, _) | EIndex(l, r, _) =>
-      qbe_loop_has_no_calls_expr(l) && qbe_loop_has_no_calls_expr(r)
+      qbe_loop_has_no_calls_expr_with(g, l, hints) &&
+      qbe_loop_has_no_calls_expr_with(g, r, hints)
     ECall(callee, args, _) =>
       match callee {
         EIdent(fname, _) =>
@@ -4616,7 +4673,7 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
             fname == "ptr_read_f32" {
             let mut i = 0
             while i < args.length() {
-              if !qbe_loop_has_no_calls_expr(args[i]) {
+              if !qbe_loop_has_no_calls_expr_with(g, args[i], hints) {
                 return false
               }
               i = i + 1
@@ -4627,12 +4684,33 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
           }
         _ => false
       }
-    EMethodCall(_, _, _, _) | EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) | EInterp(_, _) | EDotVariant(_, _, _) =>
+    EMethodCall(obj, mname, args, _) => {
+      if !qbe_loop_has_no_calls_expr_with(g, obj, hints) {
+        return false
+      }
+      let mut i = 0
+      while i < args.length() {
+        if !qbe_loop_has_no_calls_expr_with(g, args[i], hints) {
+          return false
+        }
+        i = i + 1
+      }
+      match qbe_probe_expr_ty_with(g, obj, hints) {
+        Some(raw_ty) =>
+          qbe_is_pure_builtin_method(
+            subst_ty(raw_ty, g.cur_type_subst),
+            mname,
+            args.length(),
+          )
+        None => false
+      }
+    }
+    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) | EInterp(_, _) | EDotVariant(_, _, _) =>
       false
     EArrayLit(elems, _) | ETuple(elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        if !qbe_loop_has_no_calls_expr(elems[i]) {
+        if !qbe_loop_has_no_calls_expr_with(g, elems[i], hints) {
           return false
         }
         i = i + 1
@@ -4641,43 +4719,44 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
     }
     EStructLit(_, spread_opt, fields, _) => {
       match spread_opt {
-        Some(b) => if !qbe_loop_has_no_calls_expr(b) { return false }
+        Some(b) => if !qbe_loop_has_no_calls_expr_with(g, b, hints) { return false }
         None => ()
       }
       let mut i = 0
       while i < fields.length() {
-        if !qbe_loop_has_no_calls_expr(fields[i].value) {
+        if !qbe_loop_has_no_calls_expr_with(g, fields[i].value, hints) {
           return false
         }
         i = i + 1
       }
       true
     }
-    EBlock(stmts, _) => qbe_loop_has_no_calls_stmts(stmts)
+    EBlock(stmts, _) => qbe_loop_has_no_calls_stmts_with(g, stmts, hints)
     EIf(cond, then_stmts, else_opt, _) => {
-      if !qbe_loop_has_no_calls_expr(cond) || !qbe_loop_has_no_calls_stmts(then_stmts) {
+      if !qbe_loop_has_no_calls_expr_with(g, cond, hints) ||
+        !qbe_loop_has_no_calls_stmts_with(g, then_stmts, hints) {
         return false
       }
       match else_opt {
         None => true
-        Some(el) => qbe_loop_has_no_calls_expr(el)
+        Some(el) => qbe_loop_has_no_calls_expr_with(g, el, hints)
       }
     }
-    EIs(scrut, _, _) => qbe_loop_has_no_calls_expr(scrut)
+    EIs(scrut, _, _) => qbe_loop_has_no_calls_expr_with(g, scrut, hints)
     EMatch(scrut, arms, _) => {
-      if !qbe_loop_has_no_calls_expr(scrut) {
+      if !qbe_loop_has_no_calls_expr_with(g, scrut, hints) {
         return false
       }
       let mut i = 0
       while i < arms.length() {
         match arms[i].guard_expr {
           Some(ge) =>
-            if !qbe_loop_has_no_calls_expr(ge) {
+            if !qbe_loop_has_no_calls_expr_with(g, ge, hints) {
               return false
             }
           None => ()
         }
-        if !qbe_loop_has_no_calls_expr(arms[i].body) {
+        if !qbe_loop_has_no_calls_expr_with(g, arms[i].body, hints) {
           return false
         }
         i = i + 1
@@ -4688,44 +4767,116 @@ fn qbe_loop_has_no_calls_expr(e : Expr) -> Bool {
 }
 
 ///|
-fn qbe_loop_has_no_calls_stmt(s : Stmt) -> Bool {
+fn qbe_loop_has_no_calls_stmt_with(
+  g : QbeGen,
+  s : Stmt,
+  hints : QbeProbeHints,
+) -> Bool {
   match s {
-    SLet(_, _, _, init, _) => qbe_loop_has_no_calls_expr(init)
-    SLetTuple(_, _, init, _) => qbe_loop_has_no_calls_expr(init)
+    SLet(_, _, _, init, _) => qbe_loop_has_no_calls_expr_with(g, init, hints)
+    SLetTuple(_, _, init, _) => qbe_loop_has_no_calls_expr_with(g, init, hints)
     SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
-      qbe_loop_has_no_calls_expr(lhs) && qbe_loop_has_no_calls_expr(rhs)
+      qbe_loop_has_no_calls_expr_with(g, lhs, hints) &&
+      qbe_loop_has_no_calls_expr_with(g, rhs, hints)
     SWhile(cond, body, _) | SGuard(cond, body, _) =>
-      qbe_loop_has_no_calls_expr(cond) && qbe_loop_has_no_calls_stmts(body)
+      qbe_loop_has_no_calls_expr_with(g, cond, hints) &&
+      qbe_loop_has_no_calls_stmts_with(g, body, hints)
     SFor(init_s, cond, step_s, body, _) =>
-      qbe_loop_has_no_calls_stmt(init_s) &&
-      qbe_loop_has_no_calls_expr(cond) &&
-      qbe_loop_has_no_calls_stmt(step_s) &&
-      qbe_loop_has_no_calls_stmts(body)
+      qbe_loop_has_no_calls_stmt_with(g, init_s, hints) &&
+      qbe_loop_has_no_calls_expr_with(g, cond, hints) &&
+      qbe_loop_has_no_calls_stmt_with(g, step_s, hints) &&
+      qbe_loop_has_no_calls_stmts_with(g, body, hints)
     SForRange(_, start_e, end_e, _, body, _) =>
-      qbe_loop_has_no_calls_expr(start_e) &&
-      qbe_loop_has_no_calls_expr(end_e) &&
-      qbe_loop_has_no_calls_stmts(body)
+      qbe_loop_has_no_calls_expr_with(g, start_e, hints) &&
+      qbe_loop_has_no_calls_expr_with(g, end_e, hints) &&
+      qbe_loop_has_no_calls_stmts_with(g, body, hints)
     SForIn(_, _, iter_e, body, _) =>
-      qbe_loop_has_no_calls_expr(iter_e) &&
-      qbe_loop_has_no_calls_stmts(body)
+      qbe_loop_has_no_calls_expr_with(g, iter_e, hints) &&
+      qbe_loop_has_no_calls_stmts_with(g, body, hints)
     SReturn(opt, _) =>
       match opt {
         None => true
-        Some(e) => qbe_loop_has_no_calls_expr(e)
+        Some(e) => qbe_loop_has_no_calls_expr_with(g, e, hints)
       }
     SBreak(_) | SContinue(_) => true
     SDebugAssert(c, m, _) =>
-      qbe_loop_has_no_calls_expr(c) && qbe_loop_has_no_calls_expr(m)
-    SExpr(e, _) => qbe_loop_has_no_calls_expr(e)
+      qbe_loop_has_no_calls_expr_with(g, c, hints) &&
+      qbe_loop_has_no_calls_expr_with(g, m, hints)
+    SExpr(e, _) => qbe_loop_has_no_calls_expr_with(g, e, hints)
   }
 }
 
 ///|
-fn qbe_loop_has_no_calls_stmts(stmts : Array[Stmt]) -> Bool {
+fn qbe_loop_has_no_calls_stmts(g : QbeGen, stmts : Array[Stmt]) -> Bool {
+  qbe_loop_has_no_calls_stmts_with(g, stmts, qbe_hints_new())
+}
+
+///|
+fn qbe_loop_has_no_calls_stmts_with(
+  g : QbeGen,
+  stmts : Array[Stmt],
+  outer_hints : QbeProbeHints,
+) -> Bool {
+  let local_hints = qbe_hints_copy(outer_hints)
   let mut i = 0
   while i < stmts.length() {
-    if !qbe_loop_has_no_calls_stmt(stmts[i]) {
+    if !qbe_loop_has_no_calls_stmt_with(g, stmts[i], local_hints) {
       return false
+    }
+    match stmts[i] {
+      SLet(name, _, te, init, let_sp) =>
+        if name != "_" {
+          let mut bound_ty = TError
+          match te {
+            TyMissing(_) =>
+              match qbe_let_infer(g, let_sp) {
+                Some(t) => bound_ty = t
+                None =>
+                  match qbe_probe_expr_ty_with(g, init, local_hints) {
+                    Some(t) =>
+                      if !ty_has_unresolved(t) {
+                        bound_ty = t
+                      }
+                    None => ()
+                  }
+              }
+            _ => {
+              let t = qbe_resolve_type(g, te)
+              if !ty_has_unresolved(t) {
+                bound_ty = t
+              }
+            }
+          }
+          qbe_hints_set(local_hints, name, bound_ty)
+        }
+      SLetTuple(names, te, init, _) => {
+        let mut tup_elems : Array[Ty] = []
+        match te {
+          TyMissing(_) =>
+            match qbe_probe_expr_ty_with(g, init, local_hints) {
+              Some(TTuple(es)) => tup_elems = es
+              _ => ()
+            }
+          _ =>
+            match qbe_resolve_type(g, te) {
+              TTuple(es) => tup_elems = es
+              _ => ()
+            }
+        }
+        let mut ni = 0
+        while ni < names.length() {
+          if names[ni] != "_" {
+            let bt = if ni < tup_elems.length() && !ty_has_unresolved(tup_elems[ni]) {
+              tup_elems[ni]
+            } else {
+              TError
+            }
+            qbe_hints_set(local_hints, names[ni], bt)
+          }
+          ni = ni + 1
+        }
+      }
+      _ => ()
     }
     i = i + 1
   }
@@ -6886,7 +7037,7 @@ fn qbe_alloc_slot_for(g : QbeGen, ty : Ty) -> String {
   if qbe_is_double_ty(ty) {
     g.fn_allocs.write_string(" =l alloc8 8\n")
     g.fn_allocs.write_string("    stored d_0.0, ")
-  } else if qbe_is_int32_ty(ty) {
+  } else if qbe_is_int32_ty(ty) || qbe_is_uint32_ty(ty) {
     g.fn_allocs.write_string(" =l alloc4 4\n")
     g.fn_allocs.write_string("    storew 0, ")
   } else {
@@ -12861,8 +13012,8 @@ fn qbe_emit_cond_branch(
       if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
         let can_borrow = !qbe_expr_has_assign(lhs) && !qbe_expr_has_assign(rhs)
         let can_borrow_af = can_borrow &&
-          qbe_loop_has_no_calls_expr(lhs) &&
-          qbe_loop_has_no_calls_expr(rhs)
+          qbe_loop_has_no_calls_expr(g, lhs) &&
+          qbe_loop_has_no_calls_expr(g, rhs)
         let la = match lhs {
           EInt(raw, _) => {
             let v32 = qbe_parse_int64_lit(raw).to_int().to_int64().to_string()
@@ -13549,12 +13700,22 @@ fn qbe_probe_expr_ty_with(
         Some(TString) =>
           if mname == "split" {
             Some(TArray(TString))
+          } else if mname == "length" || mname == "code_unit_at" {
+            Some(TInt)
           } else {
             None
           }
         Some(TArray(et)) =>
           if mname == "copy" && !ty_has_unresolved(et) {
             Some(TArray(et))
+          } else if mname == "length" {
+            Some(TInt)
+          } else {
+            None
+          }
+        Some(TFixedArray(_)) | Some(TBytes) =>
+          if mname == "length" {
+            Some(TInt)
           } else {
             None
           }
@@ -13563,24 +13724,92 @@ fn qbe_probe_expr_ty_with(
             Some(TMap(k, v))
           } else if mname == "keys" {
             Some(TArray(k))
+          } else if mname == "length" {
+            Some(TInt)
           } else {
             None
           }
-        Some(TStruct(sn, sargs)) =>
-          if sargs.length() == 0 {
-            match qbe_lookup_method_info(g, sn, mname) {
-              Some(mi) =>
-                if mi.decl.type_params.length() == 0 && !ty_has_unresolved(mi.ret_ty) {
-                  Some(mi.ret_ty)
-                } else {
-                  None
+        Some(st) =>
+          match st {
+            TDouble | TFloat | TInt | TInt64 | TUInt | TUInt64 | TByte | TChar | TBool =>
+              if mname == "to_int" || mname == "reinterpret_as_int" {
+                Some(TInt)
+              } else if mname == "to_int64" || mname == "reinterpret_as_int64" {
+                Some(TInt64)
+              } else if mname == "to_uint" || mname == "reinterpret_as_uint" {
+                Some(TUInt)
+              } else if mname == "to_uint64" || mname == "reinterpret_as_uint64" {
+                Some(TUInt64)
+              } else if mname == "to_double" || mname == "reinterpret_as_double" {
+                Some(TDouble)
+              } else if mname == "to_float" || mname == "reinterpret_as_float" {
+                Some(TFloat)
+              } else if mname == "to_byte" {
+                Some(TByte)
+              } else if mname == "unsafe_to_char" {
+                Some(TChar)
+              } else if mname == "sqrt" ||
+                mname == "abs" ||
+                mname == "floor" ||
+                mname == "ceil" ||
+                mname == "round" ||
+                mname == "trunc" ||
+                mname == "sin" ||
+                mname == "cos" ||
+                mname == "tan" ||
+                mname == "asin" ||
+                mname == "acos" ||
+                mname == "atan" ||
+                mname == "atan2" ||
+                mname == "exp" ||
+                mname == "log" ||
+                mname == "pow" ||
+                mname == "min" ||
+                mname == "max" ||
+                mname == "clamp" {
+                Some(st)
+              } else {
+                None
+              }
+            TStruct(sn, sargs) =>
+              if sargs.length() == 0 {
+                match qbe_lookup_method_info(g, sn, mname) {
+                  Some(mi) =>
+                    if mi.decl.type_params.length() == 0 && !ty_has_unresolved(mi.ret_ty) {
+                      Some(mi.ret_ty)
+                    } else {
+                      None
+                    }
+                  None => None
                 }
-              None => None
-            }
-          } else {
-            None
+              } else {
+                None
+              }
+            _ => None
           }
+        None => None
+      }
+    EIndex(obj, _, _) =>
+      match qbe_probe_expr_ty_with(g, obj, hints) {
+        Some(TArray(et)) | Some(TFixedArray(et)) =>
+          if !ty_has_unresolved(et) { Some(et) } else { None }
+        Some(TBytes) => Some(TByte)
         _ => None
+      }
+    EUnary(op, inner, _) =>
+      if op == "!" {
+        Some(TBool)
+      } else {
+        qbe_probe_expr_ty_with(g, inner, hints)
+      }
+    EBinary(op, lhs, rhs, _) =>
+      if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "&&" || op == "||" {
+        Some(TBool)
+      } else {
+        match qbe_probe_expr_ty_with(g, lhs, hints) {
+          Some(t) => Some(t)
+          None => qbe_probe_expr_ty_with(g, rhs, hints)
+        }
       }
     EMove(inner, _) => qbe_probe_expr_ty_with(g, inner, hints)
     _ => None
@@ -15074,7 +15303,7 @@ fn qbe_emit_expr_inner(
               if can_borrow_af {
                 let mut ci = 0
                 while ci < parts.length() {
-                  if !qbe_loop_has_no_calls_expr(parts[ci]) {
+                  if !qbe_loop_has_no_calls_expr(g, parts[ci]) {
                     can_borrow_af = false
                     break
                   }
@@ -15144,8 +15373,8 @@ fn qbe_emit_expr_inner(
         !qbe_expr_has_assign(lhs) &&
         !qbe_expr_has_assign(rhs)
       let cmp_borrow_af = cmp_borrow &&
-        qbe_loop_has_no_calls_expr(lhs) &&
-        qbe_loop_has_no_calls_expr(rhs)
+        qbe_loop_has_no_calls_expr(g, lhs) &&
+        qbe_loop_has_no_calls_expr(g, rhs)
       let is_arith_or_bit = op != "==" &&
         op != "!=" &&
         op != "<" &&
@@ -16909,7 +17138,7 @@ fn qbe_emit_expr_inner(
           }
           EIndex(EIdent(outer, _), idx1, _) =>
             if !qbe_expr_has_assign(idx1) &&
-              qbe_loop_has_no_calls_expr(idx) &&
+              qbe_loop_has_no_calls_expr(g, idx) &&
               !qbe_expr_assigns_ident(idx, outer) {
               match qbe_lookup_local(g, outer) {
                 Some(oloc) =>
@@ -19587,8 +19816,8 @@ fn qbe_try_emit_while_field_promoted(
 ) -> Bool {
   if body.length() == 0 ||
     !qbe_is_pure_small_cond(cond, 12) ||
-    !qbe_loop_has_no_calls_expr(cond) ||
-    !qbe_loop_has_no_calls_stmts(body) ||
+    !qbe_loop_has_no_calls_expr(g, cond) ||
+    !qbe_loop_has_no_calls_stmts(g, body) ||
     qbe_stmts_has_nested_loop(body) ||
     qbe_stmts_has_cf(body, true, true, true) {
     return false
@@ -19761,7 +19990,7 @@ fn qbe_try_emit_while_field_promoted(
             if sinfo.field_names[fi] == fname {
               let fty = subst_ty(sinfo.field_tys[fi], subst)
               let is_prom_ty = match fty {
-                TDouble | TInt | TInt64 => true
+                TDouble | TFloat | TInt | TInt64 | TUInt | TUInt64 => true
                 _ => false
               }
               if is_prom_ty {
@@ -20035,8 +20264,8 @@ fn qbe_try_emit_while_sq_reuse(
   body : Array[Stmt],
 ) -> Bool {
   if body.length() < 2 ||
-    !qbe_loop_has_no_calls_expr(cond) ||
-    !qbe_loop_has_no_calls_stmts(body) ||
+    !qbe_loop_has_no_calls_expr(g, cond) ||
+    !qbe_loop_has_no_calls_stmts(g, body) ||
     qbe_stmts_has_nested_loop(body) ||
     qbe_stmts_has_cf(body, false, true, false) {
     return false
@@ -21042,8 +21271,8 @@ fn qbe_emit_stmt(
               }
               EIndex(EIdent(outer, _), idx1, _) =>
                 if !qbe_expr_has_assign(idx1) &&
-                  qbe_loop_has_no_calls_expr(idx) &&
-                  qbe_loop_has_no_calls_expr(rhs) &&
+                  qbe_loop_has_no_calls_expr(g, idx) &&
+                  qbe_loop_has_no_calls_expr(g, rhs) &&
                   !qbe_expr_assigns_ident(idx, outer) &&
                   !qbe_expr_assigns_ident(rhs, outer) {
                   match qbe_lookup_local(g, outer) {
@@ -21118,7 +21347,7 @@ fn qbe_emit_stmt(
               if qbe_is_prim_array_elem(elem) {
                 let idx_key = if borrowed &&
                   arr_local_name != "" &&
-                  qbe_loop_has_no_calls_expr(rhs) &&
+                  qbe_loop_has_no_calls_expr(g, rhs) &&
                   !qbe_expr_assigns_ident(rhs, arr_local_name) {
                   qbe_pure_idx_key(idx)
                 } else {
@@ -21509,7 +21738,8 @@ fn qbe_emit_stmt(
         return qval("0", TUnit)
       }
       qbe_invalidate_escaping_unfrozen_arrs(g, Some(cond), None, body)
-      let loop_no_calls = qbe_loop_has_no_calls_expr(cond) && qbe_loop_has_no_calls_stmts(body)
+      let loop_no_calls = qbe_loop_has_no_calls_expr(g, cond) &&
+        qbe_loop_has_no_calls_stmts(g, body)
       // Loop-invariant Array header (len + data pointer) & String (len + data ptr) hoisting
       let cand_arrs : Array[String] = []
       let cand_counts : Map[String, Int] = Map([])
