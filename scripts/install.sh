@@ -68,7 +68,7 @@ if ! PIONC_BIN=$(find_pionc); then
       -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
     rm -f "$OUT_DIR/libpionrt.a"
     ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
-    PION_SKIP_RT_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
+    PION_SKIP_RT_TEST=1 CC="$CC_BIN" sh "$ROOT_DIR/scripts/bootstrap.sh"
   else
     sh "$ROOT_DIR/scripts/bootstrap.sh"
   fi
