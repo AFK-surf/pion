@@ -16,6 +16,56 @@ fn fmt_is_closer(c : Int) -> Bool {
 }
 
 ///|
+fn fmt_is_ascii_ident_start(c : Int) -> Bool {
+  (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+}
+
+///|
+fn fmt_is_ascii_ident_part(c : Int) -> Bool {
+  fmt_is_ascii_ident_start(c) || (c >= 48 && c <= 57)
+}
+
+///|
+fn fmt_prev_allows_jsx(body : String, lt_pos : Int, last_sig_char : Int, last_sig_pos : Int) -> Bool {
+  if last_sig_char == 0 {
+    return true
+  }
+  // Never treat `..<n`, `a < b`, `0 < x`, `f() < b`, `a[0] < b`, `"a" < b`, `'a' < b`, `x? < b` as JSX.
+  if last_sig_char == 46 ||
+    last_sig_char == 41 ||
+    last_sig_char == 93 ||
+    last_sig_char == 34 ||
+    last_sig_char == 39 ||
+    last_sig_char == 63 {
+    return false
+  }
+  if fmt_is_ascii_ident_part(last_sig_char) {
+    // Allow JSX immediately after `return` or `else` keyword (e.g. `return <Box />`).
+    let mut start = last_sig_pos
+    while start > 0 && fmt_is_ascii_ident_part(str_code_at(body, start - 1)) {
+      start = start - 1
+    }
+    let word = slice_str(body, start, last_sig_pos + 1)
+    return word == "return" || word == "else"
+  }
+  let _ = lt_pos
+  true
+}
+
+///|
+fn fmt_skip_jsx_close_tag(body : String, blen : Int, start : Int) -> Int {
+  // `start` points to `<` of `</...>`
+  let mut j = start + 2
+  while j < blen {
+    if str_code_at(body, j) == 62 {
+      return j + 1
+    }
+    j = j + 1
+  }
+  blen
+}
+
+///|
 fn fmt_write_indent(sb : StringBuilder, level : Int) -> Unit {
   let mut i = 0
   while i < level {
@@ -97,6 +147,8 @@ pub fn format_source(source : String) -> String {
   let len = source.length()
   let out = StringBuilder()
   let opener_indents : Array[Int] = []
+  // 0 = delimiter `{`/`(`/`[`, 1 = JSX opening tag header `<Tag`, 2 = JSX element body `>...</Tag>`
+  let opener_kinds : Array[Int] = []
   let mut cur_indent = 0
   let mut pending_blank = false
   let mut wrote_any = false
@@ -140,15 +192,50 @@ pub fn format_source(source : String) -> String {
     let body = fmt_normalize_line_body(source, trim_start, line_end)
     let blen = body.length()
 
-    // Consume leading closing delimiters (`}`, `)`, `]`) to compute this line's indent
+    // Consume leading closing delimiters (`}`, `)`, `]`, `</...>`, or multi-line JSX `>` / `/>`)
     let mut line_indent = cur_indent
     let mut i = 0
+    let mut opened_unclosed = 0
+    if opener_kinds.length() > 0 && opener_kinds[opener_kinds.length() - 1] == 1 {
+      if i + 1 < blen && str_code_at(body, i) == 47 && str_code_at(body, i + 1) == 62 {
+        match opener_indents.pop() {
+          Some(prev_indent) => line_indent = prev_indent
+          None => line_indent = 0
+        }
+        let _ = opener_kinds.pop()
+        i = i + 2
+      } else if i < blen && str_code_at(body, i) == 62 {
+        match opener_indents.pop() {
+          Some(prev_indent) => line_indent = prev_indent
+          None => line_indent = 0
+        }
+        let _ = opener_kinds.pop()
+        opener_indents.push(line_indent)
+        opener_kinds.push(2)
+        opened_unclosed = opened_unclosed + 1
+        i = i + 1
+      }
+    }
     while i < blen && fmt_is_closer(str_code_at(body, i)) {
       match opener_indents.pop() {
         Some(prev_indent) => line_indent = prev_indent
         None => line_indent = 0
       }
+      let _ = opener_kinds.pop()
       i = i + 1
+    }
+    let in_hdr_after_closers = opener_kinds.length() > 0 &&
+      opener_kinds[opener_kinds.length() - 1] == 1
+    if !in_hdr_after_closers &&
+      i + 1 < blen &&
+      str_code_at(body, i) == 60 &&
+      str_code_at(body, i + 1) == 47 {
+      match opener_indents.pop() {
+        Some(prev_indent) => line_indent = prev_indent
+        None => line_indent = 0
+      }
+      let _ = opener_kinds.pop()
+      i = fmt_skip_jsx_close_tag(body, blen, i)
     }
 
     fmt_write_indent(out, line_indent)
@@ -158,7 +245,8 @@ pub fn format_source(source : String) -> String {
 
     // Scan remaining characters on this line outside literals/comments to update indent stack
     let mut cur_base = line_indent
-    let mut opened_unclosed = 0
+    let mut last_sig_char = if i > 0 { str_code_at(body, i - 1) } else { 0 }
+    let mut last_sig_pos = if i > 0 { i - 1 } else { -1 }
     while i < blen {
       let c = str_code_at(body, i)
       // Line comment: ignore rest of line for delimiter tracking
@@ -167,6 +255,7 @@ pub fn format_source(source : String) -> String {
       }
       // String literal
       if c == 34 {
+        let start_q = i
         i = i + 1
         while i < blen {
           let sc = str_code_at(body, i)
@@ -177,10 +266,13 @@ pub fn format_source(source : String) -> String {
             break
           }
         }
+        last_sig_char = 34
+        last_sig_pos = if i > start_q { i - 1 } else { start_q }
         continue
       }
       // Char / byte literal
       if c == 39 {
+        let start_q = i
         i = i + 1
         while i < blen {
           let cc = str_code_at(body, i)
@@ -191,21 +283,123 @@ pub fn format_source(source : String) -> String {
             break
           }
         }
+        last_sig_char = 39
+        last_sig_pos = if i > start_q { i - 1 } else { start_q }
         continue
       }
-      if fmt_is_opener(c) {
-        opener_indents.push(cur_base)
-        opened_unclosed = opened_unclosed + 1
-      } else if fmt_is_closer(c) {
-        if opened_unclosed > 0 {
-          opened_unclosed = opened_unclosed - 1
-          let _ = opener_indents.pop()
-        } else {
-          match opener_indents.pop() {
-            Some(prev_indent) => cur_base = prev_indent
-            None => cur_base = 0
+      let in_jsx_hdr = opener_kinds.length() > 0 &&
+        opener_kinds[opener_kinds.length() - 1] == 1
+      if in_jsx_hdr {
+        if fmt_is_opener(c) {
+          opener_indents.push(cur_base)
+          opener_kinds.push(0)
+          opened_unclosed = opened_unclosed + 1
+          last_sig_char = c
+          last_sig_pos = i
+          i = i + 1
+          continue
+        } else if fmt_is_closer(c) {
+          if opened_unclosed > 0 {
+            opened_unclosed = opened_unclosed - 1
+            let _ = opener_indents.pop()
+            let _ = opener_kinds.pop()
+          } else {
+            match opener_indents.pop() {
+              Some(prev_indent) => cur_base = prev_indent
+              None => cur_base = 0
+            }
+            let _ = opener_kinds.pop()
+          }
+          last_sig_char = c
+          last_sig_pos = i
+          i = i + 1
+          continue
+        } else if c == 47 && i + 1 < blen && str_code_at(body, i + 1) == 62 {
+          if opened_unclosed > 0 {
+            opened_unclosed = opened_unclosed - 1
+            let _ = opener_indents.pop()
+            let _ = opener_kinds.pop()
+          } else {
+            match opener_indents.pop() {
+              Some(prev_indent) => cur_base = prev_indent
+              None => cur_base = 0
+            }
+            let _ = opener_kinds.pop()
+          }
+          last_sig_char = 62
+          last_sig_pos = i + 1
+          i = i + 2
+          continue
+        } else if c == 62 {
+          let prev_c = if i > 0 { str_code_at(body, i - 1) } else { 0 }
+          if prev_c != 61 && prev_c != 45 && prev_c != 124 {
+            let _ = opener_kinds.pop()
+            opener_kinds.push(2)
+          }
+          last_sig_char = 62
+          last_sig_pos = i
+          i = i + 1
+          continue
+        }
+      } else {
+        if c == 60 {
+          if i + 1 < blen && str_code_at(body, i + 1) == 47 {
+            if opened_unclosed > 0 {
+              opened_unclosed = opened_unclosed - 1
+              let _ = opener_indents.pop()
+              let _ = opener_kinds.pop()
+            } else {
+              match opener_indents.pop() {
+                Some(prev_indent) => cur_base = prev_indent
+                None => cur_base = 0
+              }
+              let _ = opener_kinds.pop()
+            }
+            i = fmt_skip_jsx_close_tag(body, blen, i)
+            last_sig_char = 62
+            last_sig_pos = if i > 0 { i - 1 } else { 0 }
+            continue
+          }
+          let nc = if i + 1 < blen { str_code_at(body, i + 1) } else { 0 }
+          if (nc == 62 || fmt_is_ascii_ident_start(nc)) &&
+            fmt_prev_allows_jsx(body, i, last_sig_char, last_sig_pos) {
+            opener_indents.push(cur_base)
+            opened_unclosed = opened_unclosed + 1
+            if nc == 62 {
+              opener_kinds.push(2)
+              last_sig_char = 62
+              last_sig_pos = i + 1
+              i = i + 2
+            } else {
+              opener_kinds.push(1)
+              last_sig_char = 60
+              last_sig_pos = i
+              i = i + 1
+            }
+            continue
           }
         }
+        if fmt_is_opener(c) {
+          opener_indents.push(cur_base)
+          opener_kinds.push(0)
+          opened_unclosed = opened_unclosed + 1
+        } else if fmt_is_closer(c) {
+          if opened_unclosed > 0 {
+            opened_unclosed = opened_unclosed - 1
+            let _ = opener_indents.pop()
+            let _ = opener_kinds.pop()
+          } else {
+            match opener_indents.pop() {
+              Some(prev_indent) => cur_base = prev_indent
+              None => cur_base = 0
+            }
+            let _ = opener_kinds.pop()
+          }
+        }
+      }
+      if !fmt_is_hspace(c) {
+        last_sig_char = c
+        last_sig_pos = i
       }
       i = i + 1
     }

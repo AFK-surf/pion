@@ -275,6 +275,8 @@ pub struct TypeChecker {
   let_infer : Map[String, Ty]
   /// `span_key` of a closure expression -> its inferred `TFn(params, ret)` type.
   closure_infer : Map[String, Ty]
+  /// `span_key` of a leading-dot `.Variant` expression -> canonical enum name.
+  dot_variant_resolve : Map[String, String]
   /// `span_key`s of such `let`s whose element type is still unknown.
   infer_pending : Map[String, Bool]
   /// Argument types of the `push` / `set` just checked on a collection with an
@@ -675,6 +677,15 @@ fn qualify_imported_expr(ipkg : ImportedPkg, e : Expr, bound : Array[String]) ->
         i = i + 1
       }
       EInterp(qelems, sp)
+    }
+    EDotVariant(vname, args, sp) => {
+      let qargs : Array[Expr] = []
+      let mut i = 0
+      while i < args.length() {
+        qargs.push(qualify_imported_expr(ipkg, args[i], bound))
+        i = i + 1
+      }
+      EDotVariant(vname, qargs, sp)
     }
     EBlock(stmts, sp) => EBlock(qualify_imported_stmts(ipkg, stmts, bound), sp)
     EIf(cond, then_s, else_opt, sp) => {
@@ -1365,6 +1376,12 @@ fn expr_end_col(e : Expr) -> Int {
     EByte(s, sp) => sp.col + s.length() + 3
     EUnit(sp) => sp.col + 2
     EPath(q, m, sp) => sp.col + q.length() + 2 + m.length()
+    EDotVariant(vname, args, sp) =>
+      if args.length() == 0 {
+        sp.col + 1 + vname.length()
+      } else {
+        -1
+      }
     EField(obj, fname, sp) =>
       if expr_span(obj).line == sp.line {
         sp.col + 1 + fname.length()
@@ -3328,7 +3345,7 @@ fn collect_expr_captures(
     }
     EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
       collect_expr_captures(inner, locals, out)
-    EInterp(parts, _) => {
+    EInterp(parts, _) | EDotVariant(_, parts, _) => {
       let mut i = 0
       while i < parts.length() {
         collect_expr_captures(parts[i], locals, out)
@@ -7013,6 +7030,254 @@ fn check_expr_inner(
       )
       TError
     }
+    EDotVariant(vname, args, sp) =>
+      match expected {
+        Some(TEnum(ename, eargs)) => {
+          let einfo_opt : Option[EnumInfo] = match tc.enums.get(ename) {
+            Some(ei) => Some(ei)
+            None =>
+              if has_qual_sep(ename) {
+                let qpe = split_qual_name(ename)
+                match lookup_imported_pkg_transitive(tc, qpe.prefix) {
+                  Some(ipkg) => ipkg.tc.enums.get(qpe.name)
+                  None => None
+                }
+              } else {
+                None
+              }
+          }
+          match einfo_opt {
+            None => {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "cannot infer enum type for leading-dot variant `." + vname + "`",
+                "known enum, Option, or Result type",
+                ename,
+                "qualify the variant with its enum name (e.g. `Enum::" + vname + "`) or add a type annotation",
+              )
+              TError
+            }
+            Some(einfo) => {
+              let mut found_idx = -1
+              let mut vi = 0
+              while vi < einfo.variants.length() {
+                if einfo.variants[vi].name == vname {
+                  found_idx = vi
+                  break
+                }
+                vi = vi + 1
+              }
+              if found_idx < 0 {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "enum `" + ename + "` has no variant `" + vname + "`",
+                  "valid variant of `" + ename + "`",
+                  "." + vname,
+                  "check the variant name on enum `" + ename + "`",
+                )
+                return TError
+              }
+              tc.dot_variant_resolve.set(span_key(sp), ename)
+              let subst : Map[String, Ty] = Map([])
+              let mut k = 0
+              while k < einfo.decl.type_params.length() && k < eargs.length() {
+                subst.set(einfo.decl.type_params[k], eargs[k])
+                k = k + 1
+              }
+              let v = einfo.variants[found_idx]
+              if args.length() != v.field_tys.length() {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "variant `" +
+                  vname +
+                  "` expects " +
+                  v.field_tys.length().to_string() +
+                  " argument(s), found " +
+                  args.length().to_string(),
+                  v.field_tys.length().to_string() + " args",
+                  args.length().to_string() + " args",
+                  "pass the exact number of fields for `." + vname + "`",
+                )
+              }
+              let mut fi = 0
+              while fi < args.length() && fi < v.field_tys.length() {
+                let exp_f = subst_ty(v.field_tys[fi], subst)
+                let aty = check_expr(tc, env, args[fi], Some(exp_f))
+                unify_tparams(v.field_tys[fi], aty, subst)
+                let exp_f2 = subst_ty(v.field_tys[fi], subst)
+                if !ty_compat(exp_f2, aty) {
+                  tc_err(
+                    tc,
+                    expr_span(args[fi]),
+                    "E_TYPE_MISMATCH",
+                    "variant `" + vname + "` argument type mismatch",
+                    ty_to_string(exp_f2),
+                    ty_to_string(aty),
+                    "pass a value of type `" + ty_to_string(exp_f2) + "`",
+                  )
+                }
+                fi = fi + 1
+              }
+              let targs : Array[Ty] = []
+              let mut ti = 0
+              while ti < einfo.decl.type_params.length() {
+                match subst.get(einfo.decl.type_params[ti]) {
+                  Some(t) => targs.push(t)
+                  None => targs.push(TError)
+                }
+                ti = ti + 1
+              }
+              TEnum(ename, targs)
+            }
+          }
+        }
+        Some(TOption(inner)) =>
+          if vname == "None" {
+            if args.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `None` expects 0 argument(s), found " + args.length().to_string(),
+                "0 args",
+                args.length().to_string() + " args",
+                "write `.None` with no arguments",
+              )
+            }
+            tc.dot_variant_resolve.set(span_key(sp), "Option")
+            TOption(inner)
+          } else if vname == "Some" {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `Some` expects 1 argument(s), found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "write `.Some(value)`",
+              )
+              tc.dot_variant_resolve.set(span_key(sp), "Option")
+              return TOption(inner)
+            }
+            tc.dot_variant_resolve.set(span_key(sp), "Option")
+            let aty = check_expr(tc, env, args[0], Some(inner))
+            if !ty_compat(inner, aty) {
+              tc_err(
+                tc,
+                expr_span(args[0]),
+                "E_TYPE_MISMATCH",
+                "variant `Some` argument type mismatch",
+                ty_to_string(inner),
+                ty_to_string(aty),
+                "pass a value of type `" + ty_to_string(inner) + "`",
+              )
+            }
+            TOption(ty_prefer_concrete(inner, aty))
+          } else {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`Option` has no variant `" + vname + "`",
+              "`Some` or `None`",
+              "." + vname,
+              "use `.Some(v)` or `.None`",
+            )
+            TError
+          }
+        Some(TResult(ok_t, err_t)) =>
+          if vname == "Ok" {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `Ok` expects 1 argument(s), found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "write `.Ok(value)`",
+              )
+              tc.dot_variant_resolve.set(span_key(sp), "Result")
+              return TResult(ok_t, err_t)
+            }
+            tc.dot_variant_resolve.set(span_key(sp), "Result")
+            let aty = check_expr(tc, env, args[0], Some(ok_t))
+            if !ty_compat(ok_t, aty) {
+              tc_err(
+                tc,
+                expr_span(args[0]),
+                "E_TYPE_MISMATCH",
+                "variant `Ok` argument type mismatch",
+                ty_to_string(ok_t),
+                ty_to_string(aty),
+                "pass a value of type `" + ty_to_string(ok_t) + "`",
+              )
+            }
+            TResult(ty_prefer_concrete(ok_t, aty), err_t)
+          } else if vname == "Err" {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `Err` expects 1 argument(s), found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "write `.Err(error)`",
+              )
+              tc.dot_variant_resolve.set(span_key(sp), "Result")
+              return TResult(ok_t, err_t)
+            }
+            tc.dot_variant_resolve.set(span_key(sp), "Result")
+            let aty = check_expr(tc, env, args[0], Some(err_t))
+            if !ty_compat(err_t, aty) {
+              tc_err(
+                tc,
+                expr_span(args[0]),
+                "E_TYPE_MISMATCH",
+                "variant `Err` argument type mismatch",
+                ty_to_string(err_t),
+                ty_to_string(aty),
+                "pass a value of type `" + ty_to_string(err_t) + "`",
+              )
+            }
+            TResult(ok_t, ty_prefer_concrete(err_t, aty))
+          } else {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "`Result` has no variant `" + vname + "`",
+              "`Ok` or `Err`",
+              "." + vname,
+              "use `.Ok(v)` or `.Err(e)`",
+            )
+            TError
+          }
+        _ => {
+          let found_ty = match expected {
+            Some(t) => ty_to_string(t)
+            None => "unknown expected type"
+          }
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "cannot infer enum type for leading-dot variant `." + vname + "`",
+            "known enum, Option, or Result type",
+            found_ty,
+            "qualify the variant with its enum name (e.g. `Enum::" + vname + "`) or add a type annotation",
+          )
+          TError
+        }
+      }
     EMove(inner, sp) =>
       match inner {
         EIdent(name, isp) => {
@@ -7076,8 +7341,19 @@ fn check_expr_inner(
         op != ">" &&
         op != ">="
       let lhs_exp : Option[Ty] = if is_arith_or_bit { expected } else { None }
-      let lty = check_expr(tc, env, lhs, lhs_exp)
-      let rty = check_expr(tc, env, rhs, Some(lty))
+      let lhs_is_dot_variant = match lhs {
+        EDotVariant(_, _, _) => true
+        _ => false
+      }
+      let mut lty = TError
+      let mut rty = TError
+      if (op == "==" || op == "!=") && lhs_is_dot_variant {
+        rty = check_expr(tc, env, rhs, None)
+        lty = check_expr(tc, env, lhs, Some(rty))
+      } else {
+        lty = check_expr(tc, env, lhs, lhs_exp)
+        rty = check_expr(tc, env, rhs, Some(lty))
+      }
       if op == "&&" || op == "||" {
         if !ty_compat(TBool, lty) || !ty_compat(TBool, rty) {
           tc_err(
@@ -9017,6 +9293,7 @@ pub fn check_package_with_imports(
     edit_keys: Map([]),
     let_infer: Map([]),
     closure_infer: Map([]),
+    dot_variant_resolve: Map([]),
     infer_pending: Map([]),
     infer_hit: [],
   }

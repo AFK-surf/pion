@@ -9,11 +9,19 @@ pub struct Parser {
   tokens : Array[Token]
   mut pos : Int
   diagnostics : Array[Diagnostic]
+  jsx_parent_stack : Array[String]
+  mut jsx_next_id : Int
 }
 
 ///|
 fn parser_new(tokens : Array[Token], diags : Array[Diagnostic]) -> Parser {
-  Parser::{ tokens: tokens, pos: 0, diagnostics: diags }
+  Parser::{
+    tokens: tokens,
+    pos: 0,
+    diagnostics: diags,
+    jsx_parent_stack: [],
+    jsx_next_id: 0,
+  }
 }
 
 ///|
@@ -1470,10 +1478,15 @@ fn p_parse_bin_expr(p : Parser, min_prec : Int) -> Expr {
     if prec == 0 || prec < min_prec {
       break
     }
-    // Avoid treating a leading unary `-` on a new line as binary subtraction
+    // Avoid treating a leading unary `-` or JSX `<Tag` / `<>` / `</` on a new line as binary op
     if tok.newline_before {
       match tok.kind {
         Minus => break
+        Lt =>
+          match p_peek_at(p, 1).kind {
+            Ident(_) | Gt | Slash => break
+            _ => ()
+          }
         _ => ()
       }
     }
@@ -1596,6 +1609,15 @@ fn p_parse_postfix_expr(p : Parser) -> Expr {
     let tok = p_peek(p)
     match tok.kind {
       Dot => {
+        if tok.newline_before {
+          match p_peek_at(p, 1).kind {
+            Ident(m) =>
+              if is_upper_start(m) {
+                break
+              }
+            _ => ()
+          }
+        }
         let _ = p_advance(p)
         match p_peek(p).kind {
           IntLit(idx_str) => {
@@ -1793,6 +1815,12 @@ fn p_parse_pattern(p : Parser) -> Pattern {
       let _ = p_advance(p)
       PChar(s, tok.span)
     }
+    Dot => {
+      let _ = p_advance(p)
+      let vname = p_expect_ident(p, "variant name after `.`")
+      let sub = p_parse_pattern_args(p)
+      PVariant("", vname, sub, tok.span)
+    }
     LParen => {
       let _ = p_advance(p)
       let pats : Array[Pattern] = []
@@ -1961,6 +1989,388 @@ fn p_parse_match_expr(p : Parser) -> Expr {
     }
   }
   EMatch(scrut, arms, tok.span)
+}
+
+///|
+fn p_jsx_save_and_clear_stack(p : Parser) -> Array[String] {
+  let saved : Array[String] = []
+  let mut i = 0
+  while i < p.jsx_parent_stack.length() {
+    saved.push(p.jsx_parent_stack[i])
+    i = i + 1
+  }
+  while p.jsx_parent_stack.length() > 0 {
+    let _ = p.jsx_parent_stack.pop()
+  }
+  saved
+}
+
+///|
+fn p_jsx_restore_stack(p : Parser, saved : Array[String]) -> Unit {
+  while p.jsx_parent_stack.length() > 0 {
+    let _ = p.jsx_parent_stack.pop()
+  }
+  let mut i = 0
+  while i < saved.length() {
+    p.jsx_parent_stack.push(saved[i])
+    i = i + 1
+  }
+}
+
+///|
+fn p_parse_jsx_children(p : Parser) -> Array[Stmt] {
+  let stmts : Array[Stmt] = []
+  while !p_is_eof(p) {
+    let ctok = p_peek(p)
+    match ctok.kind {
+      Lt =>
+        match p_peek_at(p, 1).kind {
+          Slash => break
+          _ => {
+            let prev_pos = p.pos
+            let e = p_parse_primary_expr(p)
+            stmts.push(SExpr(e, ctok.span))
+            if p.pos == prev_pos {
+              let _ = p_advance(p)
+            }
+          }
+        }
+      KwIf | KwFor | KwWhile | KwMatch | KwLet => {
+        let prev_pos = p.pos
+        let st = p_parse_stmt(p)
+        stmts.push(st)
+        p_skip_semis(p)
+        if p.pos == prev_pos {
+          let _ = p_advance(p)
+        }
+      }
+      LBrace => {
+        let _ = p_advance(p)
+        while !p_is_eof(p) {
+          p_skip_semis(p)
+          match p_peek(p).kind {
+            RBrace => {
+              let _ = p_advance(p)
+              break
+            }
+            _ => {
+              let prev_pos = p.pos
+              let st = p_parse_stmt(p)
+              stmts.push(st)
+              p_skip_semis(p)
+              if p.pos == prev_pos {
+                let _ = p_advance(p)
+              }
+            }
+          }
+        }
+      }
+      Semi => {
+        let _ = p_advance(p)
+      }
+      _ => {
+        p_err(
+          p,
+          ctok.span,
+          "unexpected token `" + ctok.raw + "` inside JSX children",
+          "JSX element, control flow, `{ ... }`, or closing tag",
+          ctok.raw,
+          "wrap expressions in `{ ... }` or close the JSX element",
+        )
+        let _ = p_advance(p)
+      }
+    }
+  }
+  stmts
+}
+
+///|
+fn p_parse_jsx_fragment(p : Parser, start_span : Span) -> Expr {
+  let _ = p_advance(p) // consume '<'
+  let _ = p_advance(p) // consume '>'
+  let child_stmts = p_parse_jsx_children(p)
+  let mut closed_ok = false
+  match p_peek(p).kind {
+    Lt =>
+      match p_peek_at(p, 1).kind {
+        Slash => {
+          let _ = p_advance(p)
+          let _ = p_advance(p)
+          match p_peek(p).kind {
+            Gt => {
+              let _ = p_advance(p)
+              closed_ok = true
+            }
+            _ => ()
+          }
+        }
+        _ => ()
+      }
+    _ => ()
+  }
+  if !closed_ok {
+    let t = p_peek(p)
+    p_err(
+      p,
+      t.span,
+      "expected `</>` to close JSX fragment",
+      "`</>`",
+      t.raw,
+      "close the fragment with `</>`",
+    )
+  }
+  EBlock(child_stmts, start_span)
+}
+
+///|
+fn p_parse_jsx_element(p : Parser, start_span : Span) -> Expr {
+  let _ = p_advance(p) // consume '<'
+  let a_tok = p_advance(p)
+  let a_name = match a_tok.kind {
+    Ident(s) => s
+    _ => ""
+  }
+  let mut tag_name = a_name
+  let mut callee = EIdent(a_name, a_tok.span)
+  if p_match_kind_coloncolon(p) {
+    let b_name = p_expect_ident(p, "component name after `::`")
+    tag_name = a_name + "::" + b_name
+    callee = EPath(a_name, b_name, a_tok.span)
+  }
+
+  let mut explicit_parent : Option[Expr] = None
+  let named_args : Array[Expr] = []
+  while !p_is_eof(p) {
+    let atok = p_peek(p)
+    match atok.kind {
+      Gt | Slash => break
+      Ident(_) | KwIn => {
+        let _ = p_advance(p)
+        let aname = match atok.kind {
+          Ident(s) => s
+          KwIn => "in"
+          _ => ""
+        }
+        let aval = match p_peek(p).kind {
+          Eq => {
+            let _ = p_advance(p)
+            let saved = p_jsx_save_and_clear_stack(p)
+            let v = match p_peek(p).kind {
+              StringLit(_) | InterpStart(_) => p_parse_primary_expr(p)
+              LBrace => {
+                let _ = p_advance(p)
+                let inner = p_parse_expr(p)
+                p_expect_rbrace(p)
+                inner
+              }
+              _ => {
+                let bad = p_peek(p)
+                p_err(
+                  p,
+                  bad.span,
+                  "expected string literal or `{expr}` for JSX attribute `" + aname + "`",
+                  "string literal or `{expr}`",
+                  bad.raw,
+                  "write `" + aname + "=\"...\"` or `" + aname + "={expr}`",
+                )
+                EUnit(bad.span)
+              }
+            }
+            p_jsx_restore_stack(p, saved)
+            v
+          }
+          FatArrow => {
+            let _ = p_advance(p)
+            let saved = p_jsx_save_and_clear_stack(p)
+            let v = match p_peek(p).kind {
+              LBrace => {
+                let body_stmts = p_parse_block_stmts(p)
+                EClosure([], TyMissing(atok.span), body_stmts, atok.span)
+              }
+              _ => {
+                let bad = p_peek(p)
+                p_err(
+                  p,
+                  bad.span,
+                  "expected `{ ... }` after `=>` for JSX attribute `" + aname + "`",
+                  "`{ ... }`",
+                  bad.raw,
+                  "write `" + aname + "=>{ ... }`",
+                )
+                EUnit(bad.span)
+              }
+            }
+            p_jsx_restore_stack(p, saved)
+            v
+          }
+          _ => EBool(true, atok.span)
+        }
+        if aname == "in" {
+          match explicit_parent {
+            Some(_) =>
+              p_err(
+                p,
+                atok.span,
+                "duplicate `in` attribute on JSX element `<" + tag_name + ">`",
+                "single `in` attribute",
+                "duplicate `in`",
+                "remove the duplicate `in={...}` attribute",
+              )
+            None => explicit_parent = Some(aval)
+          }
+        } else {
+          named_args.push(ENamedArg(aname, false, aval, atok.span))
+        }
+      }
+      _ => {
+        p_err(
+          p,
+          atok.span,
+          "expected attribute name, `>`, or `/>` in JSX element `<" + tag_name + ">`",
+          "attribute name, `>`, or `/>`",
+          atok.raw,
+          "close the JSX tag with `>` or `/>`",
+        )
+        let _ = p_advance(p)
+      }
+    }
+  }
+
+  let call_args : Array[Expr] = []
+  match explicit_parent {
+    Some(pe) => call_args.push(pe)
+    None =>
+      if p.jsx_parent_stack.length() > 0 {
+        let parent_ident = p.jsx_parent_stack[p.jsx_parent_stack.length() - 1]
+        call_args.push(EIdent(parent_ident, start_span))
+      }
+  }
+  let mut ni = 0
+  while ni < named_args.length() {
+    call_args.push(named_args[ni])
+    ni = ni + 1
+  }
+
+  match p_peek(p).kind {
+    Slash => {
+      let _ = p_advance(p)
+      match p_peek(p).kind {
+        Gt => {
+          let _ = p_advance(p)
+        }
+        _ => {
+          let t = p_peek(p)
+          p_err(
+            p,
+            t.span,
+            "expected `>` after `/` in self-closing JSX tag `<" + tag_name + " />`",
+            "`>`",
+            t.raw,
+            "close self-closing tag with `/>`",
+          )
+        }
+      }
+      ECall(callee, call_args, start_span)
+    }
+    Gt => {
+      let _ = p_advance(p)
+      let pname = "__jsx_p_" + p.jsx_next_id.to_string()
+      p.jsx_next_id = p.jsx_next_id + 1
+      p.jsx_parent_stack.push(pname)
+      let child_stmts = p_parse_jsx_children(p)
+      let _ = p.jsx_parent_stack.pop()
+
+      let mut closed_header = false
+      match p_peek(p).kind {
+        Lt =>
+          match p_peek_at(p, 1).kind {
+            Slash => {
+              let _ = p_advance(p)
+              let _ = p_advance(p)
+              closed_header = true
+            }
+            _ => ()
+          }
+        _ => ()
+      }
+      if closed_header {
+        let ca = p_expect_ident(p, "closing JSX tag name")
+        let close_name = if p_match_kind_coloncolon(p) {
+          let cb = p_expect_ident(p, "closing JSX component name after `::`")
+          ca + "::" + cb
+        } else {
+          ca
+        }
+        if close_name != tag_name {
+          p_err(
+            p,
+            p_peek(p).span,
+            "mismatched JSX closing tag: expected `</" + tag_name + ">`, found `</" + close_name + ">`",
+            "`</" + tag_name + ">`",
+            "`</" + close_name + ">`",
+            "change closing tag to `</" + tag_name + ">`",
+          )
+        }
+        match p_peek(p).kind {
+          Gt => {
+            let _ = p_advance(p)
+          }
+          _ => {
+            let t = p_peek(p)
+            p_err(
+              p,
+              t.span,
+              "expected `>` to finish closing tag `</" + tag_name + ">`",
+              "`>`",
+              t.raw,
+              "add `>` after `</" + tag_name + "`",
+            )
+          }
+        }
+      } else {
+        let t = p_peek(p)
+        p_err(
+          p,
+          t.span,
+          "expected closing tag `</" + tag_name + ">`",
+          "`</" + tag_name + ">`",
+          t.raw,
+          "close `<" + tag_name + ">` with `</" + tag_name + ">`",
+        )
+      }
+
+      if child_stmts.length() > 0 {
+        let child_param = Param::{
+          name: pname,
+          ty: TyMissing(start_span),
+          label_kind: 0,
+          default_expr: None,
+          span: start_span,
+        }
+        call_args.push(
+          ENamedArg(
+            "children",
+            false,
+            EClosure([child_param], TyMissing(start_span), child_stmts, start_span),
+            start_span,
+          ),
+        )
+      }
+      ECall(callee, call_args, start_span)
+    }
+    _ => {
+      let t = p_peek(p)
+      p_err(
+        p,
+        t.span,
+        "unterminated JSX opening tag `<" + tag_name + ">`",
+        "`>` or `/>`",
+        t.raw,
+        "close `<" + tag_name + "` with `>` or `/>`",
+      )
+      ECall(callee, call_args, start_span)
+    }
+  }
 }
 
 ///|
@@ -2147,6 +2557,50 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
       } else {
         let stmts = p_parse_block_stmts(p)
         EBlock(stmts, tok.span)
+      }
+    Dot =>
+      match p_peek_at(p, 1).kind {
+        Ident(vname) => {
+          let _ = p_advance(p)
+          let _ = p_advance(p)
+          let args = match p_peek(p).kind {
+            LParen => p_parse_arg_list(p)
+            _ => []
+          }
+          EDotVariant(vname, args, tok.span)
+        }
+        _ => {
+          let next_tok = p_peek_at(p, 1)
+          p_err(
+            p,
+            tok.span,
+            "expected variant name after `.`",
+            "variant identifier",
+            next_tok.raw,
+            "write `.Variant` or `.Variant(args...)`",
+          )
+          let _ = p_advance(p)
+          EUnit(tok.span)
+        }
+      }
+    Lt =>
+      match p_peek_at(p, 1).kind {
+        Gt => p_parse_jsx_fragment(p, tok.span)
+        Ident(_) => p_parse_jsx_element(p, tok.span)
+        _ => {
+          p_err(
+            p,
+            tok.span,
+            "expected expression, found `" + tok.raw + "`",
+            "expression",
+            tok.raw,
+            "provide a valid expression",
+          )
+          if !p_is_eof(p) {
+            let _ = p_advance(p)
+          }
+          EUnit(tok.span)
+        }
       }
     Ident(name) => {
       let _ = p_advance(p)

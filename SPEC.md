@@ -164,6 +164,20 @@ test "test name" {
   - `return [expr]`, `break`, `continue`
 - Closures: `fn(x : T) -> R { ... }` (captures immutable variables by value / biased RC; outer `let mut` variables captured by a local non-`spawn` closure are automatically promoted to a shared 1-slot RC heap cell so outer and inner scopes—including nested closures—share live reads and writes with zero manual boxing, while uncaptured `let mut` variables remain zero-overhead stack locals. Inside `spawn(...)`, capturing any outer `let mut` variable—directly or via a nested closure—remains a compile-time error `E_NOT_SEND`, and only `Send` or `move` captures are allowed.)
 - Callable struct fields: when `d.f(args...)` is called on a `struct` value `d` and no method `Struct::f` exists, if `d` has a field `f` of function type `(P...) -> R`, the compiler loads and invokes the closure directly (methods still take precedence when both exist).
+- Leading-dot enum variant inference (`.Variant` / `.Variant(args...)`):
+  - In any expression context with a known expected `enum`, `Option[T]`, or `Result[T, E]` type (function/named/optional parameters including `opt? : E` via `opt=.Variant`, `let x : E = .Variant`, return expressions, struct fields, array/tuple elements, `match` arms, and bidirectional `==`/`!=` comparisons `x == .Variant` or `.Variant == x`), `.Variant` / `.Variant(args...)` resolves the variant from the expected type (same-package or cross-package) with zero runtime overhead. Without a known enum/Option/Result expected type, it reports `E_TYPE_MISMATCH`.
+  - Patterns also accept leading-dot syntax `.Variant` / `.Variant(pats...)` in `match` and `is` (resolving against the scrutinee type).
+- Pure compile-time desugared Pion-JSX (`<Tag ... />`, `<Tag ...> ... </Tag>`, `<> ... </>`):
+  - Zero new keywords, zero framework coupling, zero VDOM: JSX is desugared purely in the parser into ordinary Pion function calls (`ECall`) and blocks (`EBlock`). Because Pion generics use `[T]`, `<` in primary expression position is unambiguous.
+  - Tag name: `Tag` (`EIdent`) or `pkg::Tag` (`EPath`).
+  - Attribute forms:
+    1. `prop="text"` / `prop="text \{expr}"` -> `prop="text"` (string literal or interpolation)
+    2. `prop={expr}` -> `prop=expr` (arbitrary Pion expression; outer JSX parent stack is isolated inside attribute expressions)
+    3. `prop=>{ stmts }` -> `prop=fn() { stmts }` (zero-argument closure shorthand for reactive getters and event callbacks)
+    4. `prop` (bare attribute) -> `prop=true` (boolean flag)
+  - Parent injection (`in={parent}`): if `in={expr}` is written, `expr` is passed as the first positional argument (duplicate `in` is `E_PARSE`); otherwise, when nested inside a parent element `<Parent>...</Parent>`, the parent's synthetic child parameter `__jsx_p_N` is injected automatically as the first positional argument (including inside `if`/`for`/`while`/`match`/`{ ... }` blocks in children).
+  - Children: non-empty `<Tag ...> children... </Tag>` appends `children=fn(__jsx_p_N) { children... }` as a named argument; self-closing `<Tag ... />` or empty `<Tag></Tag>` omits `children`. Fragments `<> ... </>` desugar to `{ ... }` while preserving the enclosing parent stack. Mismatched closing tags report `E_PARSE`.
+  - `pionc fmt` formats Pion-JSX (nested tags, fragments, self-closing tags, multi-line attributes) deterministically and idempotently without disturbing `<` / `>` / `..<` / `=>` / `->` operators.
 - Concurrency (Pion native):
   - `scope(world, fn(s : Scope) -> Unit { spawn(s, fn() -> Unit { ... }) })`
   - `Channel::new(cap)`, `ch.send(v)`, `ch.recv() -> Option[T]`, `ch.close()`
