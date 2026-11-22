@@ -742,7 +742,7 @@ PION_MINSIZE static void pion_enter_mt(void) {
 }
 
 static void pion_freeze_map_entries(PionMap *m);
-static void pion_freeze_arr_elems(PionArray *a);
+static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj(PionArray *a, void (*fn)(void *));
 
 PION_COLD PION_MINSIZE void pion_rc_freeze(void *obj) {
     if (!obj) return;
@@ -759,7 +759,7 @@ PION_COLD PION_MINSIZE void pion_rc_freeze(void *obj) {
     if (hdr->type_tag == PION_TAG_MAP) {
         pion_freeze_map_entries((PionMap *)obj);
     } else if (hdr->type_tag == PION_TAG_ARRAY) {
-        pion_freeze_arr_elems((PionArray *)obj);
+        pion_arr_foreach_obj((PionArray *)obj, pion_rc_freeze);
     }
 }
 
@@ -775,15 +775,6 @@ PION_MINSIZE static void pion_freeze_map_entries(PionMap *m) {
     }
 }
 
-/* Likewise a frozen `Array` (`Mutex[Array[T]]`, or a value of a frozen map):
- * every element now and every object stored later is frozen. */
-PION_MINSIZE static void pion_freeze_arr_elems(PionArray *a) {
-    if (!a->elem_is_obj) return;
-    for (int64_t i = 0; i < a->len; i++) {
-        pion_rc_freeze((void *)(uintptr_t)a->data[i]);
-    }
-}
-
 PION_MINSIZE void pion_rc_immortalize(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
@@ -792,12 +783,7 @@ PION_MINSIZE void pion_rc_immortalize(void *obj) {
     hdr->local_rc = 0;
     hdr->flags |= (PION_FLAG_FROZEN | PION_FLAG_IMMORTAL);
     if (hdr->type_tag == PION_TAG_ARRAY) {
-        PionArray *a = (PionArray *)obj;
-        if (a->elem_is_obj) {
-            for (int64_t i = 0; i < a->len; i++) {
-                pion_rc_immortalize((void *)(uintptr_t)a->data[i]);
-            }
-        }
+        pion_arr_foreach_obj((PionArray *)obj, pion_rc_immortalize);
     } else if (hdr->type_tag == PION_TAG_MAP) {
         PionMap *m = (PionMap *)obj;
         for (int64_t i = 0; i < m->cap; i++) {
@@ -1496,13 +1482,21 @@ static inline size_t pion_arr_stride(const PionArray *a) {
     return a->elem_stride ? (size_t)a->elem_stride : sizeof(int64_t);
 }
 
-static PION_MINSIZE void pion_arr_drop(void *payload) {
-    PionArray *a = (PionArray *)payload;
-    if (a->elem_is_obj) {
-        for (int64_t i = 0; i < a->len; i++) {
-            pion_rc_dec((void *)(uintptr_t)a->data[i]);
+static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj(PionArray *a, void (*fn)(void *)) {
+    if (!a->elem_is_obj || a->len <= 0) return;
+    size_t words = a->elem_stride > 8 ? ((size_t)a->elem_stride >> 3) : 1;
+    uint32_t mask = (uint32_t)a->elem_is_obj;
+    int64_t *slot = a->data;
+    for (int64_t i = 0; i < a->len; i++, slot += words) {
+        for (uint32_t m = mask, k = 0; m; m >>= 1, k++) {
+            if (m & 1u) fn((void *)(uintptr_t)slot[k]);
         }
     }
+}
+
+static PION_MINSIZE void pion_arr_drop(void *payload) {
+    PionArray *a = (PionArray *)payload;
+    pion_arr_foreach_obj(a, pion_rc_dec);
     if (a->data) {
         pion_slab_raw_free(a->data, (size_t)a->cap * pion_arr_stride(a),
                            (pion_hdr(a)->flags & PION_FLAG_FROZEN) != 0);
@@ -1542,8 +1536,8 @@ static PION_NOINLINE PION_MINSIZE void pion_arr_grow(PionArray *a) {
 PION_MINSIZE void *pion_arr_new(int64_t cap, int32_t elem_flags) {
     PionArray *a = (PionArray *)pion_alloc_raw_fast((uint32_t)sizeof(PionArray), PION_TAG_ARRAY, pion_arr_drop);
     a->len = 0;
-    a->elem_is_obj = (elem_flags == 1) ? 1 : 0;
-    a->elem_stride = (elem_flags == 2) ? 1 : ((elem_flags > 2) ? elem_flags : 0);
+    a->elem_is_obj = (elem_flags > 2) ? (elem_flags >> 8) : ((elem_flags == 1) ? 1 : 0);
+    a->elem_stride = (elem_flags == 2) ? 1 : ((elem_flags > 2) ? (elem_flags & 0xFF) : 0);
     if (cap > 0) {
         a->data = (int64_t *)pion_slab_raw_alloc((size_t)cap * pion_arr_stride(a));
         a->cap = cap;
@@ -1639,16 +1633,13 @@ int64_t pion_arr_pop(void *a_ptr) {
 PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a) return pion_arr_new(0, 0);
-    int32_t flags = a->elem_stride > 1 ? a->elem_stride : (a->elem_stride == 1 ? 2 : a->elem_is_obj);
+    int32_t flags = (a->elem_stride > 1) ? (a->elem_stride | (a->elem_is_obj << 8))
+                                         : (a->elem_stride == 1 ? 2 : a->elem_is_obj);
     PionArray *cp = (PionArray *)pion_arr_new(a->len, flags);
     if (a->len > 0) {
         memcpy(cp->data, a->data, (size_t)a->len * pion_arr_stride(a));
         cp->len = a->len;
-        if (a->elem_is_obj) {
-            for (int64_t i = 0; i < a->len; i++) {
-                pion_rc_inc((void *)(uintptr_t)cp->data[i]);
-            }
-        }
+        pion_arr_foreach_obj(cp, pion_rc_inc);
     }
     return cp;
 }
@@ -1656,11 +1647,7 @@ PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
 PION_MINSIZE void pion_arr_clear(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || a->len <= 0) return;
-    if (a->elem_is_obj) {
-        for (int64_t i = 0; i < a->len; i++) {
-            pion_rc_dec((void *)(uintptr_t)a->data[i]);
-        }
-    }
+    pion_arr_foreach_obj(a, pion_rc_dec);
     a->len = 0;
 }
 
@@ -1670,7 +1657,7 @@ PION_MINSIZE void pion_arr_reverse(void *a_ptr) {
     size_t stride = pion_arr_stride(a);
     int64_t i = 0;
     int64_t j = a->len - 1;
-    uint8_t tmp[32];
+    uint8_t tmp[64];
     uint8_t *base = (uint8_t *)a->data;
     while (i < j) {
         uint8_t *pi = base + (size_t)i * stride;

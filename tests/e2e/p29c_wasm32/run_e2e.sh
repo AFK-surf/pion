@@ -1926,4 +1926,93 @@ console.log("  web_concurrency (" + mode + "/" + rtLabel + "): out=" + out + " O
 done
 done
 
+echo "[20/20] P41-A flat RC struct arrays (release + dev x Node + Web, leaked=0)"
+cat > "$TMP_DIR/flat_rc_arr.pion" <<'EOF'
+struct Pair {
+  key : String
+  nums : Array[Int]
+}
+
+struct Rec {
+  id : Int64
+  name : String
+  active : Bool
+  score : Int64
+  tags : Array[String]
+}
+
+pub fn main(world : World) -> Int {
+  let mut checksum : Int64 = 0L
+  let mut round = 0
+  while round < 300 {
+    let ps : Array[Pair] = Array::with_capacity(4)
+    ps.push(Pair::{ key: "a" + round.to_string(), nums: [1, 2] })
+    ps.push(Pair::{ key: "b" + round.to_string(), nums: [3, 4, 5] })
+    ps[0] = ps[0]
+    ps[1] = Pair::{ key: ps[1].key + "x", nums: [9] }
+    let cp = ps.copy()
+    cp.reverse()
+    let pop_len = match cp.pop() {
+      Some(v) => v.key.length().to_int64() + v.nums.length().to_int64()
+      None => 0L
+    }
+    cp.clear()
+    let rs : Array[Rec] = Array::with_capacity(2)
+    rs.push(Rec::{ id: round.to_int64(), name: "u" + round.to_string(), active: round % 2 == 0, score: 10L, tags: ["t0", "t1"] })
+    let r = rs[0]
+    checksum = checksum + pop_len + r.score + r.tags.length().to_int64()
+    round = round + 1
+  }
+  io_println(world, checksum.to_string())
+  0
+}
+EOF
+FRC_REL_WASM="$TMP_DIR/flat_rc_arr_rel.wasm"
+FRC_DEV_WASM="$TMP_DIR/flat_rc_arr_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$FRC_REL_WASM" "$TMP_DIR/flat_rc_arr.pion"
+"$PIONC" build --target wasm32 -o "$FRC_DEV_WASM" "$TMP_DIR/flat_rc_arr.pion"
+for mode_wasm in "release:$FRC_REL_WASM" "dev:$FRC_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): flat_rc_arr.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+const memBytes = instance.exports.memory.buffer.byteLength;
+if ((rc | 0) !== 0 || out !== "5290") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): flat_rc_arr mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): flat_rc_arr linear memory leaked:", memBytes);
+  process.exit(1);
+}
+console.log("  flat_rc_arr (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + memBytes + "B OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

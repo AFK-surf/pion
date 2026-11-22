@@ -339,9 +339,9 @@ fn qbe_arr_new_flags_w(g : QbeGen, raw_t : Ty) -> String {
   if qbe_is_u8_array_elem(g, raw_t) {
     "2"
   } else {
-    let s = qbe_flat_pod_stride(g, raw_t)
-    if s > 0 {
-      s.to_string()
+    let fl = qbe_flat_struct_flags(g, raw_t)
+    if fl > 0 {
+      fl.to_string()
     } else {
       qbe_is_obj_flag_w(g, raw_t)
     }
@@ -7433,7 +7433,7 @@ fn qbe_collect_pkg_inline_fns(
             }
             if fd.body.length() <= 8 {
               let cost = qbe_stmts_inline_cost(fd.body, key)
-              if cost >= 0 && cost <= 36 {
+              if cost >= 0 && cost <= 42 {
                 m.set(key, fd)
                 mc.set(key, cost)
                 mf.set(key, fi)
@@ -8101,8 +8101,8 @@ fn qbe_try_inline_fn_call(
     Some(inl_fd) => {
       let max_cost = match g.inline_fn_file.get(key) {
         Some(fidx) =>
-          if g.cur_file_idx < 0 || fidx == g.cur_file_idx { 36 } else { 22 }
-        None => 36
+          if g.cur_file_idx < 0 || fidx == g.cur_file_idx { 42 } else { 22 }
+        None => 42
       }
       let fn_cost = match g.inline_fn_costs.get(key) {
         Some(c) => c
@@ -9398,8 +9398,9 @@ fn qbe_is_obj_flag_w(g : QbeGen, raw_t : Ty) -> String {
 
 ///|
 /// Returns Some(sinfo) when `raw_ty` (after substitution) is an immutable
-/// pure-scalar POD struct with 2..=4 fields, stored flat inline in arrays
-/// (`elem_stride = N * 8` in {16, 24, 32}, `elem_is_obj = 0`).
+/// 2..=6-field struct whose fields are primitive scalars or concrete RC objects
+/// (excluding TDynTrait/TParam/TError), stored flat inline in arrays
+/// (`elem_stride = N * 8` in {16, 24, 32, 40, 48}, `elem_is_obj = RC bitmask`).
 fn qbe_flat_pod_struct_info(g : QbeGen, raw_ty : Ty) -> Option[StructInfo] {
   let ty = subst_ty(raw_ty, g.cur_type_subst)
   match ty {
@@ -9407,7 +9408,7 @@ fn qbe_flat_pod_struct_info(g : QbeGen, raw_ty : Ty) -> Option[StructInfo] {
       match qbe_lookup_struct_info(g, sname) {
         Some(sinfo) => {
           let n = sinfo.field_names.length()
-          if n < 2 || n > 4 {
+          if n < 2 || n > 6 {
             return None
           }
           let subst = make_subst(sinfo.decl.type_params, sargs)
@@ -9418,7 +9419,13 @@ fn qbe_flat_pod_struct_info(g : QbeGen, raw_ty : Ty) -> Option[StructInfo] {
             }
             let fty = subst_ty(sinfo.field_tys[i], subst)
             if !qbe_is_prim_array_elem(fty) {
-              return None
+              let ok_rc = match fty {
+                TDynTrait(_) | TParam(_) | TError => false
+                _ => qbe_is_obj_ty(fty)
+              }
+              if !ok_rc {
+                return None
+              }
             }
             i = i + 1
           }
@@ -9427,6 +9434,59 @@ fn qbe_flat_pod_struct_info(g : QbeGen, raw_ty : Ty) -> Option[StructInfo] {
         None => None
       }
     _ => None
+  }
+}
+
+///|
+fn qbe_flat_struct_field_tys(
+  g : QbeGen,
+  sinfo : StructInfo,
+  raw_ty : Ty,
+) -> Array[Ty] {
+  let sargs = match subst_ty(raw_ty, g.cur_type_subst) {
+    TStruct(_, a) => a
+    _ => []
+  }
+  let subst = make_subst(sinfo.decl.type_params, sargs)
+  let out : Array[Ty] = []
+  let mut i = 0
+  while i < sinfo.field_tys.length() {
+    out.push(subst_ty(sinfo.field_tys[i], subst))
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn qbe_flat_struct_obj_mask(g : QbeGen, raw_ty : Ty) -> Int {
+  match qbe_flat_pod_struct_info(g, raw_ty) {
+    Some(sinfo) => {
+      let ftys = qbe_flat_struct_field_tys(g, sinfo, raw_ty)
+      let mut mask = 0
+      let mut bit = 1
+      let mut i = 0
+      while i < ftys.length() {
+        if qbe_is_obj_ty(ftys[i]) {
+          mask = mask + bit
+        }
+        bit = bit * 2
+        i = i + 1
+      }
+      mask
+    }
+    None => 0
+  }
+}
+
+///|
+fn qbe_flat_struct_flags(g : QbeGen, raw_ty : Ty) -> Int {
+  match qbe_flat_pod_struct_info(g, raw_ty) {
+    Some(sinfo) => {
+      let stride = sinfo.field_names.length() * 8
+      let mask = qbe_flat_struct_obj_mask(g, raw_ty)
+      stride + mask * 256
+    }
+    None => 0
   }
 }
 
@@ -9451,8 +9511,8 @@ fn qbe_emit_arr_elem_addr(
     qbe_emit(g, off + " =l shl " + idx_l + ", 4")
   } else if stride == 32 {
     qbe_emit(g, off + " =l shl " + idx_l + ", 5")
-  } else if stride == 24 {
-    qbe_emit(g, off + " =l mul " + idx_l + ", 24")
+  } else if stride == 24 || stride == 40 || stride == 48 {
+    qbe_emit(g, off + " =l mul " + idx_l + ", " + stride.to_string())
   } else {
     qbe_emit(g, off + " =l shl " + idx_l + ", 3")
   }
@@ -9461,12 +9521,18 @@ fn qbe_emit_arr_elem_addr(
 }
 
 ///|
-fn qbe_emit_flat_copy_slots(
+fn qbe_emit_flat_copy_slots_rc(
   g : QbeGen,
   dst_ep : String,
   src_p : String,
-  nfields : Int,
+  sinfo : StructInfo,
+  raw_elem : Ty,
+  inc_rc : Bool,
+  dec_old : Bool,
+  adopt_arr : String,
 ) -> Unit {
+  let ftys = qbe_flat_struct_field_tys(g, sinfo, raw_elem)
+  let nfields = ftys.length()
   let vals : Array[String] = []
   let mut fi = 0
   while fi < nfields {
@@ -9482,6 +9548,45 @@ fn qbe_emit_flat_copy_slots(
     vals.push(v)
     fi = fi + 1
   }
+  if inc_rc {
+    fi = 0
+    while fi < nfields {
+      if qbe_is_obj_ty(ftys[fi]) {
+        qbe_rc_inc(g, vals[fi], ftys[fi])
+      }
+      fi = fi + 1
+    }
+  }
+  if adopt_arr != "" {
+    fi = 0
+    while fi < nfields {
+      if qbe_is_obj_ty(ftys[fi]) {
+        qbe_emit_adopt_if_frozen(g, adopt_arr, vals[fi], ftys[fi], !inc_rc)
+      }
+      fi = fi + 1
+    }
+  }
+  let old_vals : Array[String] = []
+  let old_tys : Array[Ty] = []
+  if dec_old {
+    fi = 0
+    while fi < nfields {
+      if qbe_is_obj_ty(ftys[fi]) {
+        let dp_f = if fi == 0 {
+          dst_ep
+        } else {
+          let t = qbe_tmp(g)
+          qbe_emit(g, t + " =l add " + dst_ep + ", " + (fi * 8).to_string())
+          t
+        }
+        let ov = qbe_tmp(g)
+        qbe_emit(g, ov + " =l loadl " + dp_f)
+        old_vals.push(ov)
+        old_tys.push(ftys[fi])
+      }
+      fi = fi + 1
+    }
+  }
   fi = 0
   while fi < nfields {
     let dp_f = if fi == 0 {
@@ -9494,20 +9599,99 @@ fn qbe_emit_flat_copy_slots(
     qbe_emit(g, "storel " + vals[fi] + ", " + dp_f)
     fi = fi + 1
   }
+  if dec_old {
+    let mut oi = 0
+    while oi < old_vals.length() {
+      qbe_rc_dec(g, old_vals[oi], old_tys[oi])
+      oi = oi + 1
+    }
+  }
+}
+
+///|
+fn qbe_emit_flat_adopt_vals(
+  g : QbeGen,
+  arr_reg : String,
+  slot_vals : Array[QbeVal],
+) -> Unit {
+  if arr_reg == "" {
+    return
+  }
+  let mut fi = 0
+  while fi < slot_vals.length() {
+    if qbe_is_obj_ty(slot_vals[fi].ty) {
+      let vl = qbe_as_l(g, slot_vals[fi])
+      qbe_emit_adopt_if_frozen(g, arr_reg, vl, slot_vals[fi].ty, false)
+    }
+    fi = fi + 1
+  }
+}
+
+///|
+fn qbe_emit_flat_store_vals_rc(
+  g : QbeGen,
+  dst_ep : String,
+  slot_vals : Array[QbeVal],
+  dec_old : Bool,
+  adopt_arr : String,
+) -> Unit {
+  qbe_emit_flat_adopt_vals(g, adopt_arr, slot_vals)
+  let old_vals : Array[String] = []
+  let old_tys : Array[Ty] = []
+  if dec_old {
+    let mut fi = 0
+    while fi < slot_vals.length() {
+      if qbe_is_obj_ty(slot_vals[fi].ty) {
+        let dp_f = if fi == 0 {
+          dst_ep
+        } else {
+          let t = qbe_tmp(g)
+          qbe_emit(g, t + " =l add " + dst_ep + ", " + (fi * 8).to_string())
+          t
+        }
+        let ov = qbe_tmp(g)
+        qbe_emit(g, ov + " =l loadl " + dp_f)
+        old_vals.push(ov)
+        old_tys.push(slot_vals[fi].ty)
+      }
+      fi = fi + 1
+    }
+  }
+  qbe_emit_flat_store_vals(g, dst_ep, slot_vals)
+  if dec_old {
+    let mut oi = 0
+    while oi < old_vals.length() {
+      qbe_rc_dec(g, old_vals[oi], old_tys[oi])
+      oi = oi + 1
+    }
+  }
 }
 
 ///|
 fn qbe_emit_flat_materialize(
   g : QbeGen,
   ep : String,
-  nfields : Int,
+  sinfo : StructInfo,
+  raw_elem : Ty,
+  inc_rc : Bool,
 ) -> String {
+  let ftys = qbe_flat_struct_field_tys(g, sinfo, raw_elem)
+  let nfields = ftys.length()
+  let obj_slots : Array[Int] = []
+  let mut fi = 0
+  while fi < nfields {
+    if qbe_is_obj_ty(ftys[fi]) {
+      obj_slots.push(fi)
+    }
+    fi = fi + 1
+  }
+  let drop_sym = qbe_register_slot_drop(g, obj_slots)
   let box_p = qbe_tmp(g)
   qbe_emit(
     g,
-    box_p + " =l call $pion_alloc_uninit(w " + (nfields * 8).to_string() + ", w 4, l 0)",
+    box_p + " =l call $pion_alloc_uninit(w " + (nfields * 8).to_string() + ", w 4, l " + drop_sym + ")",
   )
-  qbe_emit_flat_copy_slots(g, box_p, ep, nfields)
+  qbe_emit_flat_copy_slots_rc(g, box_p, ep, sinfo, raw_elem, inc_rc, false, "")
   box_p
 }
 
@@ -10227,8 +10411,65 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
         None => "$pion_rc_freeze"
       }
     TArray(elem) | TFixedArray(elem) => {
-      if !qbe_is_obj_ty(elem) || qbe_flat_pod_stride(g, elem) > 0 {
+      if !qbe_is_obj_ty(elem) {
         return "$pion_rc_freeze"
+      }
+      match qbe_flat_pod_struct_info(g, elem) {
+        Some(sinfo) => {
+          let ftys = qbe_flat_struct_field_tys(g, sinfo, elem)
+          let obj_fis : Array[Int] = []
+          let mut fi = 0
+          while fi < ftys.length() {
+            if qbe_is_obj_ty(ftys[fi]) {
+              obj_fis.push(fi)
+            }
+            fi = fi + 1
+          }
+          if obj_fis.length() == 0 {
+            return "$pion_rc_freeze"
+          }
+          let fn_sym = "$pion_freeze_" + qbe_freeze_ty_key(ty)
+          if g.freeze_fn_seen.contains(fn_sym) {
+            return fn_sym
+          }
+          g.freeze_fn_seen.set(fn_sym, true)
+          let child_syms : Array[String] = []
+          let mut ci = 0
+          while ci < obj_fis.length() {
+            child_syms.push(qbe_ensure_freeze_fn(g, ftys[obj_fis[ci]]))
+            ci = ci + 1
+          }
+          let stride = ftys.length() * 8
+          let sb = StringBuilder()
+          sb.write_string("function ")
+          sb.write_string(fn_sym)
+          sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %len =l loadl %obj\n    %dp_p =l add %obj, 24\n    %dp =l loadl %dp_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %len\n    jnz %c, @step, @done\n@step\n    %off =l mul %i, ")
+          sb.write_string(stride.to_string())
+          sb.write_string("\n    %ep =l add %dp, %off\n")
+          ci = 0
+          while ci < obj_fis.length() {
+            let f_idx = obj_fis[ci]
+            let f_off = f_idx * 8
+            sb.write_string("    %fp_")
+            sb.write_string(ci.to_string())
+            sb.write_string(" =l add %ep, ")
+            sb.write_string(f_off.to_string())
+            sb.write_string("\n    %fv_")
+            sb.write_string(ci.to_string())
+            sb.write_string(" =l loadl %fp_")
+            sb.write_string(ci.to_string())
+            sb.write_string("\n    call ")
+            sb.write_string(child_syms[ci])
+            sb.write_string("(l %fv_")
+            sb.write_string(ci.to_string())
+            sb.write_string(")\n")
+            ci = ci + 1
+          }
+          sb.write_string("    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
+          g.extra_fns.push(sb.to_string())
+          return fn_sym
+        }
+        None => ()
       }
       let fn_sym = "$pion_freeze_" + qbe_freeze_ty_key(ty)
       if g.freeze_fn_seen.contains(fn_sym) {
@@ -13946,18 +14187,22 @@ fn qbe_emit_method_call(
           qbe_emit(g, cmp_i + " =w csltl " + cur_i + ", " + alen)
           qbe_emit_term(g, "jnz " + cmp_i + ", " + l_body + ", " + l_end)
           qbe_emit_lbl(g, l_body)
-          if flat_stride > 0 {
-            let ep = qbe_emit_arr_elem_addr(g, dp, cur_i, flat_stride)
-            qbe_emit_flat_copy_slots(g, ep, vl, flat_stride / 8)
-          } else if is_prim {
-            let off = qbe_tmp(g)
-            let ep = qbe_tmp(g)
-            qbe_emit(g, off + " =l shl " + cur_i + ", 3")
-            qbe_emit(g, ep + " =l add " + dp + ", " + off)
-            qbe_emit(g, "storel " + vl + ", " + ep)
-          } else {
-            qbe_emit_adopt_if_frozen(g, obj_val, vl, elem, true)
-            qbe_emit(g, "call $pion_arr_set(l " + obj_val + ", l " + cur_i + ", l " + vl + ")")
+          match qbe_flat_pod_struct_info(g, elem) {
+            Some(sinfo) => {
+              let ep = qbe_emit_arr_elem_addr(g, dp, cur_i, flat_stride)
+              qbe_emit_flat_copy_slots_rc(g, ep, vl, sinfo, elem, true, true, obj_val)
+            }
+            None =>
+              if is_prim {
+                let off = qbe_tmp(g)
+                let ep = qbe_tmp(g)
+                qbe_emit(g, off + " =l shl " + cur_i + ", 3")
+                qbe_emit(g, ep + " =l add " + dp + ", " + off)
+                qbe_emit(g, "storel " + vl + ", " + ep)
+              } else {
+                qbe_emit_adopt_if_frozen(g, obj_val, vl, elem, true)
+                qbe_emit(g, "call $pion_arr_set(l " + obj_val + ", l " + cur_i + ", l " + vl + ")")
+              }
           }
           let next_i = qbe_tmp(g)
           qbe_emit(g, next_i + " =l add " + cur_i + ", 1")
@@ -14075,7 +14320,11 @@ fn qbe_emit_method_call(
         } else if flat_stride > 0 {
           let fsp = qbe_emit_arr_elem_addr(g, sdp, fsi, flat_stride)
           let fdp = qbe_emit_arr_elem_addr(g, ddp, fdi, flat_stride)
-          qbe_emit_flat_copy_slots(g, fdp, fsp, flat_stride / 8)
+          match qbe_flat_pod_struct_info(g, elem) {
+            Some(sinfo) =>
+              qbe_emit_flat_copy_slots_rc(g, fdp, fsp, sinfo, elem, true, true, dst_v)
+            None => ()
+          }
         } else {
           let fsoff = qbe_tmp(g)
           let fsp = qbe_tmp(g)
@@ -14125,7 +14374,11 @@ fn qbe_emit_method_call(
         } else if flat_stride > 0 {
           let rsp = qbe_emit_arr_elem_addr(g, sdp, rsi, flat_stride)
           let rdp = qbe_emit_arr_elem_addr(g, ddp, rdi, flat_stride)
-          qbe_emit_flat_copy_slots(g, rdp, rsp, flat_stride / 8)
+          match qbe_flat_pod_struct_info(g, elem) {
+            Some(sinfo) =>
+              qbe_emit_flat_copy_slots_rc(g, rdp, rsp, sinfo, elem, true, true, dst_v)
+            None => ()
+          }
         } else {
           let rsoff = qbe_tmp(g)
           let rsp = qbe_tmp(g)
@@ -14204,8 +14457,14 @@ fn qbe_emit_method_call(
                 }
               _ => None
             }
+            let is_unfrozen_local = match obj_expr {
+              EIdent(aname, _) => g.unfrozen_local_arrs.contains(aname)
+              _ => false
+            }
+            let adopt_arr = if is_unfrozen_local { "" } else { obj_val }
             match direct_slots_opt {
               Some(slot_vals) => {
+                qbe_emit_flat_adopt_vals(g, adopt_arr, slot_vals)
                 let alen = qbe_tmp(g)
                 let cap_p = qbe_tmp(g)
                 let acap = qbe_tmp(g)
@@ -14274,7 +14533,7 @@ fn qbe_emit_method_call(
                 qbe_emit(g, dp_p + " =l add " + obj_val + ", 24")
                 qbe_emit(g, dp + " =l loadl " + dp_p)
                 let ep = qbe_emit_arr_elem_addr(g, dp, alen, stride)
-                qbe_emit_flat_copy_slots(g, ep, vl, nfields)
+                qbe_emit_flat_copy_slots_rc(g, ep, vl, sinfo, elem, true, false, adopt_arr)
                 let nlen = qbe_tmp(g)
                 qbe_emit(g, nlen + " =l add " + alen + ", 1")
                 qbe_emit(g, "storel " + nlen + ", " + obj_val)
@@ -14282,7 +14541,7 @@ fn qbe_emit_method_call(
                 qbe_emit_lbl(g, l_slow)
                 let ep_s = qbe_tmp(g)
                 qbe_emit(g, ep_s + " =l call $pion_arr_push_flat_grow(l " + obj_val + ")")
-                qbe_emit_flat_copy_slots(g, ep_s, vl, nfields)
+                qbe_emit_flat_copy_slots_rc(g, ep_s, vl, sinfo, elem, true, false, adopt_arr)
                 let nlen_s = qbe_tmp(g)
                 qbe_emit(g, nlen_s + " =l add " + alen + ", 1")
                 qbe_emit(g, "storel " + nlen_s + ", " + obj_val)
@@ -14386,19 +14645,22 @@ fn qbe_emit_method_call(
         qbe_emit(g, "storel " + n1 + ", " + obj_val)
         qbe_emit(g, dp_p + " =l add " + obj_val + ", 24")
         qbe_emit(g, dp + " =l loadl " + dp_p)
-        let flat_stride = qbe_flat_pod_stride(g, elem)
-        let pv = if flat_stride > 0 {
-          let ep = qbe_emit_arr_elem_addr(g, dp, n1, flat_stride)
-          qbe_emit_flat_materialize(g, ep, flat_stride / 8)
-        } else {
-          let is_u8 = qbe_is_u8_array_elem(g, elem)
-          let ep = qbe_emit_arr_ep(g, dp, n1, is_u8)
-          if is_u8 {
-            qbe_load_arr_u8(g, ep)
-          } else {
-            let t = qbe_tmp(g)
-            qbe_emit(g, t + " =l loadl " + ep)
-            t
+        let pv = match qbe_flat_pod_struct_info(g, elem) {
+          Some(sinfo) => {
+            let flat_stride = sinfo.field_names.length() * 8
+            let ep = qbe_emit_arr_elem_addr(g, dp, n1, flat_stride)
+            qbe_emit_flat_materialize(g, ep, sinfo, elem, false)
+          }
+          None => {
+            let is_u8 = qbe_is_u8_array_elem(g, elem)
+            let ep = qbe_emit_arr_ep(g, dp, n1, is_u8)
+            if is_u8 {
+              qbe_load_arr_u8(g, ep)
+            } else {
+              let t = qbe_tmp(g)
+              qbe_emit(g, t + " =l loadl " + ep)
+              t
+            }
           }
         }
         let some_obj = qbe_emit_some(g, pv, elem)
@@ -19224,18 +19486,21 @@ fn qbe_emit_expr_inner(
               qbe_emit(g, cc + " =w csltl " + ci + ", " + len_l)
               qbe_emit_term(g, "jnz " + cc + ", " + l_body + ", " + l_done)
               qbe_emit_lbl(g, l_body)
-              if flat_stride > 0 {
-                let ep = qbe_emit_arr_elem_addr(g, dp, ci, flat_stride)
-                qbe_emit_flat_copy_slots(g, ep, init_l, flat_stride / 8)
-              } else {
-                if !qbe_is_prim_array_elem(elem) {
-                  qbe_rc_inc(g, init_l, elem)
+              match qbe_flat_pod_struct_info(g, elem) {
+                Some(sinfo) => {
+                  let ep = qbe_emit_arr_elem_addr(g, dp, ci, flat_stride)
+                  qbe_emit_flat_copy_slots_rc(g, ep, init_l, sinfo, elem, true, false, "")
                 }
-                let off = qbe_tmp(g)
-                let ep = qbe_tmp(g)
-                qbe_emit(g, off + " =l shl " + ci + ", 3")
-                qbe_emit(g, ep + " =l add " + dp + ", " + off)
-                qbe_emit(g, "storel " + init_l + ", " + ep)
+                None => {
+                  if !qbe_is_prim_array_elem(elem) {
+                    qbe_rc_inc(g, init_l, elem)
+                  }
+                  let off = qbe_tmp(g)
+                  let ep = qbe_tmp(g)
+                  qbe_emit(g, off + " =l shl " + ci + ", 3")
+                  qbe_emit(g, ep + " =l add " + dp + ", " + off)
+                  qbe_emit(g, "storel " + init_l + ", " + ep)
+                }
               }
               let ni = qbe_tmp(g)
               qbe_emit(g, ni + " =l add " + ci + ", 1")
@@ -19300,16 +19565,19 @@ fn qbe_emit_expr_inner(
             qbe_emit(g, iw + " =w copy " + ci)
             qbe_emit(g, "call $pion_rc_inc(l " + fn_v.reg + ")")
             let res_l = qbe_emit_closure_call(g, fn_v.reg, [iw], [TInt])
-            if flat_stride > 0 {
-              let ep = qbe_emit_arr_elem_addr(g, dp, ci, flat_stride)
-              qbe_emit_flat_copy_slots(g, ep, res_l, flat_stride / 8)
-              qbe_emit(g, "call $pion_rc_dec(l " + res_l + ")")
-            } else {
-              let ep = qbe_emit_arr_ep(g, dp, ci, is_u8)
-              if is_u8 {
-                qbe_store_arr_u8(g, res_l, ep)
-              } else {
-                qbe_emit(g, "storel " + res_l + ", " + ep)
+            match qbe_flat_pod_struct_info(g, elem) {
+              Some(sinfo) => {
+                let ep = qbe_emit_arr_elem_addr(g, dp, ci, flat_stride)
+                qbe_emit_flat_copy_slots_rc(g, ep, res_l, sinfo, elem, true, false, "")
+                qbe_emit(g, "call $pion_rc_dec(l " + res_l + ")")
+              }
+              None => {
+                let ep = qbe_emit_arr_ep(g, dp, ci, is_u8)
+                if is_u8 {
+                  qbe_store_arr_u8(g, res_l, ep)
+                } else {
+                  qbe_emit(g, "storel " + res_l + ", " + ep)
+                }
               }
             }
             let ni = qbe_tmp(g)
@@ -20030,14 +20298,17 @@ fn qbe_emit_expr_inner(
               t
             }
           }
-          let flat_stride = qbe_flat_pod_stride(g, elem)
-          if flat_stride > 0 {
-            let ep = qbe_emit_arr_elem_addr(g, dp, il, flat_stride)
-            let box_p = qbe_emit_flat_materialize(g, ep, flat_stride / 8)
-            if !borrowed {
-              qbe_rc_dec(g, ov.reg, ov.ty)
+          match qbe_flat_pod_struct_info(g, elem) {
+            Some(sinfo) => {
+              let flat_stride = sinfo.field_names.length() * 8
+              let ep = qbe_emit_arr_elem_addr(g, dp, il, flat_stride)
+              let box_p = qbe_emit_flat_materialize(g, ep, sinfo, elem, true)
+              if !borrowed {
+                qbe_rc_dec(g, ov.reg, ov.ty)
+              }
+              return qval(box_p, elem)
             }
-            return qval(box_p, elem)
+            None => ()
           }
           let is_u8 = qbe_is_u8_array_elem(g, elem)
           let ep = qbe_emit_arr_ep(g, dp, il, is_u8)
@@ -20192,47 +20463,49 @@ fn qbe_emit_expr_inner(
         let dp = qbe_tmp(g)
         qbe_emit(g, dp_p + " =l add " + arr + ", 24")
         qbe_emit(g, dp + " =l loadl " + dp_p)
-        if flat_stride > 0 {
-          let nfields = flat_stride / 8
-          i = 0
-          while i < n_elems {
-            let ep = if i == 0 {
-              dp
-            } else {
-              let p = qbe_tmp(g)
-              qbe_emit(g, p + " =l add " + dp + ", " + (i * flat_stride).to_string())
-              p
-            }
-            qbe_emit_flat_copy_slots(g, ep, elem_vals[i], nfields)
-            qbe_rc_dec(g, elem_vals[i], elem_tys[i])
-            i = i + 1
-          }
-        } else {
-          let elem_is_owned = match subst_ty(elem_ty, g.cur_type_subst) {
-            TParam(_) => true
-            t => qbe_is_obj_ty(t)
-          }
-          let elem_step = if is_u8 { 1 } else { 8 }
-          i = 0
-          while i < n_elems {
-            let coerced = qbe_coerce_val(g, qval(elem_vals[i], elem_tys[i]), elem_ty)
-            let el = qbe_as_l(g, qval(coerced, elem_ty))
-            let ep = if i == 0 {
-              dp
-            } else {
-              let p = qbe_tmp(g)
-              qbe_emit(g, p + " =l add " + dp + ", " + (i * elem_step).to_string())
-              p
-            }
-            if is_u8 {
-              qbe_store_arr_u8(g, el, ep)
-            } else {
-              qbe_emit(g, "storel " + el + ", " + ep)
-            }
-            if !elem_is_owned {
+        match qbe_flat_pod_struct_info(g, elem_ty) {
+          Some(sinfo) => {
+            i = 0
+            while i < n_elems {
+              let ep = if i == 0 {
+                dp
+              } else {
+                let p = qbe_tmp(g)
+                qbe_emit(g, p + " =l add " + dp + ", " + (i * flat_stride).to_string())
+                p
+              }
+              qbe_emit_flat_copy_slots_rc(g, ep, elem_vals[i], sinfo, elem_ty, true, false, "")
               qbe_rc_dec(g, elem_vals[i], elem_tys[i])
+              i = i + 1
             }
-            i = i + 1
+          }
+          None => {
+            let elem_is_owned = match subst_ty(elem_ty, g.cur_type_subst) {
+              TParam(_) => true
+              t => qbe_is_obj_ty(t)
+            }
+            let elem_step = if is_u8 { 1 } else { 8 }
+            i = 0
+            while i < n_elems {
+              let coerced = qbe_coerce_val(g, qval(elem_vals[i], elem_tys[i]), elem_ty)
+              let el = qbe_as_l(g, qval(coerced, elem_ty))
+              let ep = if i == 0 {
+                dp
+              } else {
+                let p = qbe_tmp(g)
+                qbe_emit(g, p + " =l add " + dp + ", " + (i * elem_step).to_string())
+                p
+              }
+              if is_u8 {
+                qbe_store_arr_u8(g, el, ep)
+              } else {
+                qbe_emit(g, "storel " + el + ", " + ep)
+              }
+              if !elem_is_owned {
+                qbe_rc_dec(g, elem_vals[i], elem_tys[i])
+              }
+              i = i + 1
+            }
           }
         }
         qbe_emit(g, "storel " + n_elems.to_string() + ", " + arr)
@@ -24230,7 +24503,8 @@ fn qbe_emit_stmt(
                       TArray(elem) | TFixedArray(elem) => {
                         arr_local_name = lname
                         borrowed = true
-                        if (qbe_is_prim_array_elem(elem) || qbe_flat_pod_stride(g, elem) > 0) &&
+                        if (qbe_is_prim_array_elem(elem) ||
+                            (qbe_flat_pod_stride(g, elem) > 0 && qbe_flat_struct_obj_mask(g, elem) == 0)) &&
                           g.hoisted_arr_len.contains(lname) &&
                           g.hoisted_arr_dp.contains(lname) {
                           ov = qval("0", loc.ty)
@@ -24263,7 +24537,8 @@ fn qbe_emit_stmt(
                   Some(hv) =>
                     match hv.ty {
                       TFixedArray(elem) =>
-                        if (qbe_is_prim_array_elem(elem) || qbe_flat_pod_stride(g, elem) > 0) &&
+                        if (qbe_is_prim_array_elem(elem) ||
+                            (qbe_flat_pod_stride(g, elem) > 0 && qbe_flat_struct_obj_mask(g, elem) == 0)) &&
                           g.hoisted_arr_len.contains(fkey) &&
                           g.hoisted_arr_dp.contains(fkey) {
                           arr_local_name = fkey
@@ -24405,12 +24680,16 @@ fn qbe_emit_stmt(
                     }
                   }
                   let ep = qbe_emit_arr_elem_addr(g, dp, il, stride)
+                  let is_unfrozen_local = arr_local_name != "" &&
+                    g.unfrozen_local_arrs.contains(arr_local_name)
+                  let adopt_arr = if is_unfrozen_local || ov.reg == "0" { "" } else { ov.reg }
                   match lit_vals_opt {
-                    Some(slot_vals) => qbe_emit_flat_store_vals(g, ep, slot_vals)
+                    Some(slot_vals) =>
+                      qbe_emit_flat_store_vals_rc(g, ep, slot_vals, true, adopt_arr)
                     None =>
                       match rv_opt {
                         Some(rv) => {
-                          qbe_emit_flat_copy_slots(g, ep, rv.reg, nfields)
+                          qbe_emit_flat_copy_slots_rc(g, ep, rv.reg, sinfo, elem, true, true, adopt_arr)
                           qbe_rc_dec(g, rv.reg, rv.ty)
                         }
                         None => ()

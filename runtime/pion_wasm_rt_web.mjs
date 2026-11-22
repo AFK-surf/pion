@@ -161,8 +161,8 @@ export function createPionRuntime(opts = {}) {
       if (fn) fn(pBig(p)); sync();
     }
     if (tag === TAG_ARRAY) {
-      const len = Number(g64(p)), isObj = g32(p + 16), dp = Number(g64(p + 24));
-      if (isObj && dp) for (let i = 0; i < len; i++) { const v = g64(dp + i * 8); if (v) pion_rc_dec(v); sync(); }
+      const len = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
+      arrRcAll(dp, len, isObj, st, false);
       if (dp) rawFree(dp);
     } else if (tag === TAG_MAP) {
       const cap = Number(g64(p + 8)), vObj = g32(p + 16), kInt = g32(p + 20), es = Number(g64(p + 24));
@@ -390,9 +390,23 @@ export function createPionRuntime(opts = {}) {
   }
 
   const arrStride = (p) => { const s = g32(p + 20); return s > 0 ? s : 8; };
+  function arrRcAll(dp, len, isObj, st, isInc) {
+    if (!isObj || !dp || len <= 0) return;
+    if (st <= 8) {
+      for (let i = 0; i < len; i++) { const v = g64(dp + i * 8); if (v) { if (isInc) pion_rc_inc(v); else pion_rc_dec(v); sync(); } }
+    } else {
+      const mask = isObj >>> 0;
+      for (let i = 0; i < len; i++) {
+        const base = dp + i * st;
+        for (let m = mask, k = 0; m !== 0; m >>>= 1, k++) {
+          if (m & 1) { const v = g64(base + k * 8); if (v) { if (isInc) pion_rc_inc(v); else pion_rc_dec(v); sync(); } }
+        }
+      }
+    }
+  }
   function pion_arr_new(cap, flags) {
     const c = Math.max(Number(cap), 0), f = flags | 0;
-    const isObj = f === 1 ? 1 : 0, st = f === 2 ? 1 : (f > 2 ? f : 0), esz = st || 8;
+    const isObj = f > 2 ? (f >>> 8) : (f === 1 ? 1 : 0), st = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0), esz = st || 8;
     const o = pion_alloc_uninit(32, TAG_ARRAY, 0n);
     const dp = c ? rawZero(c * esz) : 0, p = pNum(o); sync();
     s64(p, 0); s64(p + 8, c); s32(p + 16, isObj); s32(p + 20, st); s64(p + 24, pBig(dp)); return o;
@@ -442,14 +456,14 @@ export function createPionRuntime(opts = {}) {
   }
   function pion_arr_copy(a) {
     const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20);
-    const fl = st > 1 ? st : (st === 1 ? 2 : isObj), esz = st || 8, o = pion_arr_new(BigInt(l), fl);
+    const fl = st > 1 ? (st | (isObj << 8)) : (st === 1 ? 2 : isObj), esz = st || 8, o = pion_arr_new(BigInt(l), fl);
     const po = pNum(o); sync(); const src = Number(g64(p + 24)), dst = Number(g64(po + 24));
-    if (l) { u8.copyWithin(dst, src, src + l * esz); if (isObj) for (let i = 0; i < l; i++) { const v = g64(dst + i * 8); if (v) pion_rc_inc(v); } }
+    if (l) { u8.copyWithin(dst, src, src + l * esz); arrRcAll(dst, l, isObj, st, true); }
     s64(po, l); return o;
   }
   function pion_arr_clear(a) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), dp = Number(g64(p + 24));
-    if (isObj && dp) for (let i = 0; i < l; i++) { const v = g64(dp + i * 8); if (v) pion_rc_dec(v); sync(); }
+    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
+    arrRcAll(dp, l, isObj, st, false);
     s64(p, 0);
   }
   function pion_arr_reverse(a) {
