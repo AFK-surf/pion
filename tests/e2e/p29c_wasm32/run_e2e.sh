@@ -1435,4 +1435,159 @@ console.log("  hof_strbuf_fast (" + mode + "/" + rtLabel + "): out=" + out + " O
 done
 done
 
+echo "=== P29-C [16/16] Pure-Wasm Container Destructors (Array/Map/Bytes/StrBuf) & String::split Regression ==="
+cat > "$TMP_DIR/container_drop_split.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn drop_containers_round(r : Int) -> Int {
+  // Nested Array[Array[String]] (both small <=512B slab and large >512B backing buffer)
+  let outer : Array[Array[String]] = []
+  let mut i = 0
+  while i < 8 {
+    let inner : Array[String] = []
+    let mut j = 0
+    while j < 4 {
+      inner.push("a_" + r.to_string() + "_" + i.to_string() + "_" + j.to_string())
+      j = j + 1
+    }
+    outer.push(inner)
+    i = i + 1
+  }
+  let big_arr : Array[String] = []
+  i = 0
+  while i < 80 {
+    big_arr.push("b_" + i.to_string())
+    i = i + 1
+  }
+
+  // Map[String, Array[String]] (small + large)
+  let m : Map[String, Array[String]] = Map([])
+  i = 0
+  while i < 6 {
+    let v : Array[String] = ["v0_" + i.to_string(), "v1_" + r.to_string()]
+    m.set("k_" + i.to_string(), v)
+    i = i + 1
+  }
+
+  // Bytes & StringBuilder (small slab + >512B large buffer)
+  let bs_small = Bytes::new(64)
+  bs_small[0] = (r & 255).to_byte()
+  let bs_big = Bytes::new(1024)
+  bs_big[1023] = ((r + 1) & 255).to_byte()
+
+  let sb = StringBuilder::new()
+  sb.write_string("hdr:")
+  i = 0
+  while i < 32 {
+    sb.write_string("chunk_" + i.to_string() + ";")
+    i = i + 1
+  }
+  let built = sb.to_string()
+
+  outer.length() + big_arr.length() + m.length() + bs_small[0].to_int() + bs_big[1023].to_int() + built.length()
+}
+
+fn main(world : World) -> Int {
+  // 1. 500 rounds of nested container allocation & drop (assert linear memory <= 4 MiB, zero leak)
+  let mut acc = 0
+  let mut r = 0
+  while r < 500 {
+    acc = acc + drop_containers_round(r)
+    r = r + 1
+  }
+
+  // 2. String::split edge cases (1-byte, multi-byte, empty sep, UTF-8)
+  let p1 = ",a,,b,".split(",")
+  must(p1.length() == 5, "split ,a,,b, len")
+  must(p1[0] == "" && p1[1] == "a" && p1[2] == "" && p1[3] == "b" && p1[4] == "", "split ,a,,b, vals")
+
+  let p2 = "".split(",")
+  must(p2.length() == 1 && p2[0] == "", "split empty str")
+
+  let p3 = "abc".split(",")
+  must(p3.length() == 1 && p3[0] == "abc", "split no match")
+
+  let p4 = "a::b::::c".split("::")
+  must(p4.length() == 4, "split :: len")
+  must(p4[0] == "a" && p4[1] == "b" && p4[2] == "" && p4[3] == "c", "split :: vals")
+
+  let p5 = "::".split("::")
+  must(p5.length() == 2 && p5[0] == "" && p5[1] == "", "split exact multi-byte")
+
+  let p6 = "hi".split("")
+  must(p6.length() == 1 && p6[0] == "hi", "split empty sep")
+
+  let p7 = "甲、乙、、丙".split("、")
+  must(p7.length() == 4, "split utf8 len")
+  must(p7[0] == "甲" && p7[1] == "乙" && p7[2] == "" && p7[3] == "丙", "split utf8 vals")
+
+  // Larger 1-byte split (>60 parts -> JS slow arr_new, pure-Wasm 2-pass fill + pure-Wasm array drop)
+  let sb_words = StringBuilder::new()
+  let mut w = 0
+  while w < 100 {
+    if w > 0 {
+      sb_words.write_string(" ")
+    }
+    sb_words.write_string("w" + w.to_string())
+    w = w + 1
+  }
+  let words = sb_words.to_string().split(" ")
+  must(words.length() == 100 && words[0] == "w0" && words[99] == "w99", "split 100 words")
+
+  io_println(world, acc.to_string() + ":" + p1.length().to_string() + ":" + p4.length().to_string() + ":" + p7.length().to_string() + ":" + words.length().to_string())
+  0
+}
+EOF
+CDS_REL_WASM="$TMP_DIR/container_drop_split_rel.wasm"
+CDS_DEV_WASM="$TMP_DIR/container_drop_split_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$CDS_REL_WASM" "$TMP_DIR/container_drop_split.pion"
+"$PIONC" build --target wasm32 -o "$CDS_DEV_WASM" "$TMP_DIR/container_drop_split.pion"
+for mode_wasm in "release:$CDS_REL_WASM" "dev:$CDS_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): container_drop_split.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || !out.endsWith(":5:4:4:100")) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): container_drop_split mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): container_drop_split linear memory leaked:", memBytes);
+  process.exit(1);
+}
+console.log("  container_drop_split (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
