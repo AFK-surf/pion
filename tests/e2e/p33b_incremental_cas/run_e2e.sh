@@ -313,4 +313,67 @@ if [ "$WRUN3" != "v2=132" ]; then
   exit 1
 fi
 
-echo "p33b_incremental_cas: ALL PASSED (check 6/6 cold->warm->body-edit->err-no-cache + wasm32 5-pkg .ssa/.wasm CAS)"
+# --- 6. Single-package multi-file incremental unit CAS soundness (P34-B) ---
+# Verifies: (a) cold --release multi-file build works, (b) editing ONLY b.pion
+# (while a.pion is loaded as a `{ panic() }` .stub) never inlines panic stubs,
+# and (c) editing ONLY a.pion's private body & const value (same .sig) updates
+# output immediately with zero stale cross-file inline or const folding.
+SPKG="$TMP_DIR/single_pkg_units"
+mkdir -p "$SPKG"
+cat > "$SPKG/a.pion" <<'EOF'
+let K : Int = 7
+
+fn tiny_add(x : Int) -> Int {
+  x + 10
+}
+EOF
+cat > "$SPKG/b.pion" <<'EOF'
+fn run(x : Int) -> Int {
+  tiny_add(x) + K
+}
+EOF
+cat > "$SPKG/main.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  io_println(world, "u=" + run(5).to_string())
+  0
+}
+EOF
+
+UBIN="$TMP_DIR/unit_app"
+# 6a. Cold --release build
+"$PIONC" build --release -o "$UBIN" "$SPKG"
+UOUT1="$("$UBIN")"
+if [ "$UOUT1" != "u=22" ]; then
+  echo "FAIL: P34-B cold multi-file unit build expected 'u=22', got '$UOUT1'" >&2
+  exit 1
+fi
+
+# 6b. Edit ONLY b.pion -> a.pion is parsed from `{ panic() }` stub; must NOT panic
+cat > "$SPKG/b.pion" <<'EOF'
+fn run(x : Int) -> Int {
+  tiny_add(x) + K + 5
+}
+EOF
+"$PIONC" build --release -o "$UBIN" "$SPKG"
+UOUT2="$("$UBIN")"
+if [ "$UOUT2" != "u=27" ]; then
+  echo "FAIL: P34-B incremental edit of b.pion expected 'u=27', got '$UOUT2'" >&2
+  exit 1
+fi
+
+# 6c. Edit ONLY a.pion body & const value (identical .sig) -> b.o CAS hit must see new values
+cat > "$SPKG/a.pion" <<'EOF'
+let K : Int = 13
+
+fn tiny_add(x : Int) -> Int {
+  x + 100
+}
+EOF
+"$PIONC" build --release -o "$UBIN" "$SPKG"
+UOUT3="$("$UBIN")"
+if [ "$UOUT3" != "u=123" ]; then
+  echo "FAIL: P34-B incremental edit of a.pion body/const expected 'u=123', got '$UOUT3'" >&2
+  exit 1
+fi
+
+echo "p33b_incremental_cas: ALL PASSED (check 6/6 cold->warm->body-edit->err-no-cache + wasm32 5-pkg .ssa/.wasm CAS + P34-B single-pkg unit CAS soundness)"
