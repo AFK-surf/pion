@@ -3750,4 +3750,159 @@ console.log("  p52a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P53-A Regression: Selective Hot-Site Inlining (80 Cold Branches Size Cap + Hot Loop & Self-Rec Correctness) ==="
+{
+  cat <<'EOF'
+enum P53Node {
+  Leaf(Int64)
+  Pair(Int64, Int64)
+}
+
+struct P53Tree {
+  left : Option[P53Tree]
+  right : Option[P53Tree]
+}
+
+fn hot_rec_tree(d : Int) -> P53Tree {
+  if d == 0 {
+    P53Tree::{ left: None, right: None }
+  } else {
+    P53Tree::{ left: Some(hot_rec_tree(d - 1)), right: Some(hot_rec_tree(d - 1)) }
+  }
+}
+
+fn count_p53_tree(t : P53Tree) -> Int64 {
+  match t.left {
+    None =>
+      match t.right {
+        None => 1L
+        Some(r) => 1L + count_p53_tree(r)
+      }
+    Some(l) =>
+      match t.right {
+        None => 1L + count_p53_tree(l)
+        Some(r) => 1L + count_p53_tree(l) + count_p53_tree(r)
+      }
+  }
+}
+
+fn cold_dispatch(k : Int, out : Array[P53Node]) -> Int64 {
+EOF
+  i=0
+  while [ "$i" -lt 80 ]; do
+    if [ "$i" -eq 0 ]; then
+      printf '  if k == %d { let x = Pair(%dL, %dL); out.push(x); return %dL }\n' "$i" "$i" "$((i + 1))" "$((2 * i + 1))"
+    else
+      printf '  else if k == %d { let x = Pair(%dL, %dL); out.push(x); return %dL }\n' "$i" "$i" "$((i + 1))" "$((2 * i + 1))"
+    fi
+    i=$((i + 1))
+  done
+  cat <<'EOF'
+  else { let x = Pair(999L, 1L); out.push(x); return 1000L }
+}
+
+fn hot_loop_build(n : Int) -> Int64 {
+  let arr : Array[P53Node] = []
+  let mut i = 0
+  let mut sum = 0L
+  while i < n {
+    if i == -1 {
+      let err_box = Pair(777L, 888L)
+      arr.push(err_box)
+      return 777L
+    }
+    let bx = Pair(i.to_int64(), (i * 2).to_int64())
+    arr.push(bx)
+    sum = sum + (i * 3).to_int64()
+    i = i + 1
+  }
+  sum + arr.length().to_int64()
+}
+
+pub fn main(world : World) -> Int {
+  let cold_out : Array[P53Node] = []
+  let c0 = cold_dispatch(0, cold_out)
+  let c37 = cold_dispatch(37, cold_out)
+  let c79 = cold_dispatch(79, cold_out)
+  let cdef = cold_dispatch(999, cold_out)
+  let hloop = hot_loop_build(200)
+  let htree = count_p53_tree(hot_rec_tree(10))
+  io_println(world, "p53a_ok:" + (c0 + c37 + c79 + cdef).to_string() + ":" + cold_out.length().to_string() + ":" + hloop.to_string() + ":" + htree.to_string())
+  0
+}
+EOF
+} > "$TMP_DIR/p53a_cold_bloat.pion"
+P53A_REL_WASM="$TMP_DIR/p53a_rel.wasm"
+P53A_DEV_WASM="$TMP_DIR/p53a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P53A_REL_WASM" "$TMP_DIR/p53a_cold_bloat.pion"
+"$PIONC" build --target wasm32 -o "$P53A_DEV_WASM" "$TMP_DIR/p53a_cold_bloat.pion"
+for mode_wasm in "release:$P53A_REL_WASM" "dev:$P53A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p53a failed WebAssembly.validate()");
+  process.exit(1);
+}
+// Unconditional inline of 80 cold alloc+push branches bloats release wasm to ~34KB+; selective inline keeps it <23KB (~19.5KB)
+if (mode === "release" && bytes.length > 23000) {
+  console.error("FAIL (release/" + rtLabel + "): p53a_cold_bloat.wasm bloated to " + bytes.length + "B (>23000B)");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+// c0=1, c37=75, c79=159, cdef=1000 => 1235; cold_out.len=4; hloop=3*(199*200/2)+200=59900; htree=2047
+if ((rc | 0) !== 0 || out !== "p53a_ok:1235:4:59900:2047") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p53a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p53a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p53a (" + mode + "/" + rtLabel + "): " + out + " size=" + bytes.length + "B freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

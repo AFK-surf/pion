@@ -2036,6 +2036,7 @@ struct WasmFnCtx {
   const_copies : Map[String, String]
   addr_off_base : Map[String, String]
   addr_off_const : Map[String, Int]
+  hot_blk : Array[Bool]
   mut div_tmp_i32 : Int
   mut div_tmp_i64 : Int
   mut alloc_tmp_i32 : Int
@@ -2831,8 +2832,9 @@ fn wasm_emit_inst(
       return false
     }
     let callee = inst.args[0]
-    // P45-A: Inline cls=0/1 (<= 48B) free-list pop fast path for small-constant pion_alloc_uninit(size<=16, tag, drop_fn)
-    if callee == "$pion_alloc_uninit" && inst.args.length() >= 4 && inst.dst.length() > 0 && inst.dst_ty == WASM_TY_I64 {
+    let is_hot_site = cur_blk >= 0 && cur_blk < fctx.hot_blk.length() && fctx.hot_blk[cur_blk]
+    // P45-A/P53-A: Inline cls=0..3 (<= 96B) free-list/bump fast path for small-constant pion_alloc_uninit at hot sites only
+    if is_hot_site && callee == "$pion_alloc_uninit" && inst.args.length() >= 4 && inst.dst.length() > 0 && inst.dst_ty == WASM_TY_I64 {
       match ctx.internal_map.get("pion_alloc_uninit") {
         Some(alloc_u_fidx) => {
           let raw_sz = wasm_trim(inst.args[1])
@@ -2948,8 +2950,8 @@ fn wasm_emit_inst(
         None => ()
       }
     }
-    // P52-A: Inline `len < cap && stride != 1` fast path for `pion_arr_push_owned(arr, val)`
-    if callee == "$pion_arr_push_owned" && inst.args.length() >= 3 && inst.dst.length() == 0 {
+    // P52-A/P53-A: Inline `len < cap && stride != 1` fast path for `pion_arr_push_owned(arr, val)` at hot sites only
+    if is_hot_site && callee == "$pion_arr_push_owned" && inst.args.length() >= 3 && inst.dst.length() == 0 {
       match ctx.internal_map.get("pion_arr_push_owned") {
         Some(arr_po_fidx) => {
           let p_lidx = if fctx.alloc_tmp_i32 >= 0 {
@@ -4433,6 +4435,180 @@ fn wasm_assign_colored_locals(
 }
 
 ///|
+/// P53-A: Identify hot basic blocks where inlining `pion_alloc_uninit` (~140B)
+/// and `pion_arr_push_owned` (~55B) is worthwhile:
+///   - Condition A: self-recursive function (`call "$" + f.name`), excluding panic (`hlt`) blocks
+///   - Condition B: natural loop bodies (exact backward reachability from back-edge `src -> dst` within `p >= dst`)
+/// Cold blocks (initialization, one-shot branches, error/early-return paths) emit compact 4B `call`s.
+fn wasm_compute_hot_blocks(
+  f : WasmFunc,
+  block_idx : Map[String, Int],
+) -> Array[Bool] {
+  let nb = f.blocks.length()
+  let hot : Array[Bool] = []
+  let mut bi = 0
+  while bi < nb {
+    hot.push(false)
+    bi = bi + 1
+  }
+  if nb == 0 {
+    return hot
+  }
+
+  // Condition A: self-recursive function (e.g., make_tree, jp_parse_value)
+  let self_callee = "$" + f.name
+  let mut is_self_rec = false
+  bi = 0
+  while bi < nb && !is_self_rec {
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      if inst.op == "call" && inst.args.length() > 0 && inst.args[0] == self_callee {
+        is_self_rec = true
+        break
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+  if is_self_rec {
+    bi = 0
+    while bi < nb {
+      let insts = f.blocks[bi].insts
+      let last_is_hlt = insts.length() > 0 && insts[insts.length() - 1].op == "hlt"
+      if !last_is_hlt {
+        hot[bi] = true
+      }
+      bi = bi + 1
+    }
+    return hot
+  }
+
+  // Condition B: natural loop bodies via exact backward reachability from back-edge sources (dst <= src)
+  let pred_head : Array[Int] = []
+  let seen_stamp : Array[Int] = []
+  bi = 0
+  while bi < nb {
+    pred_head.push(-1)
+    seen_stamp.push(0)
+    bi = bi + 1
+  }
+  let pred_src : Array[Int] = []
+  let pred_next : Array[Int] = []
+  let back_src : Array[Int] = []
+  let back_dst : Array[Int] = []
+
+  bi = 0
+  while bi < nb {
+    let insts = f.blocks[bi].insts
+    let n = insts.length()
+    if n > 0 {
+      let term = insts[n - 1]
+      if term.op == "jmp" && term.args.length() >= 1 {
+        match block_idx.get(term.args[0]) {
+          Some(v) => {
+            pred_src.push(bi)
+            pred_next.push(pred_head[v])
+            pred_head[v] = pred_src.length() - 1
+            if v <= bi {
+              back_src.push(bi)
+              back_dst.push(v)
+            }
+          }
+          None => ()
+        }
+      } else if term.op == "jnz" && term.args.length() >= 3 {
+        match block_idx.get(term.args[1]) {
+          Some(v) => {
+            pred_src.push(bi)
+            pred_next.push(pred_head[v])
+            pred_head[v] = pred_src.length() - 1
+            if v <= bi {
+              back_src.push(bi)
+              back_dst.push(v)
+            }
+          }
+          None => ()
+        }
+        match block_idx.get(term.args[2]) {
+          Some(v) => {
+            pred_src.push(bi)
+            pred_next.push(pred_head[v])
+            pred_head[v] = pred_src.length() - 1
+            if v <= bi {
+              back_src.push(bi)
+              back_dst.push(v)
+            }
+          }
+          None => ()
+        }
+      } else if term.op == "jtbl" && term.args.length() >= 2 {
+        let mut ti = 1
+        while ti < term.args.length() {
+          match block_idx.get(term.args[ti]) {
+            Some(v) => {
+              pred_src.push(bi)
+              pred_next.push(pred_head[v])
+              pred_head[v] = pred_src.length() - 1
+              if v <= bi {
+                back_src.push(bi)
+                back_dst.push(v)
+              }
+            }
+            None => ()
+          }
+          ti = ti + 1
+        }
+      } else if term.op != "ret" && term.op != "hlt" && bi + 1 < nb {
+        let v = bi + 1
+        pred_src.push(bi)
+        pred_next.push(pred_head[v])
+        pred_head[v] = pred_src.length() - 1
+      }
+    } else if bi + 1 < nb {
+      let v = bi + 1
+      pred_src.push(bi)
+      pred_next.push(pred_head[v])
+      pred_head[v] = pred_src.length() - 1
+    }
+    bi = bi + 1
+  }
+
+  let mut ei = 0
+  while ei < back_src.length() {
+    let src = back_src[ei]
+    let dst = back_dst[ei]
+    let stamp = ei + 1
+    hot[dst] = true
+    seen_stamp[dst] = stamp
+    let wl : Array[Int] = []
+    if seen_stamp[src] != stamp {
+      seen_stamp[src] = stamp
+      hot[src] = true
+      wl.push(src)
+    }
+    let mut wi = 0
+    while wi < wl.length() {
+      let cur = wl[wi]
+      wi = wi + 1
+      let mut pe = pred_head[cur]
+      while pe >= 0 {
+        let p = pred_src[pe]
+        if p >= dst && seen_stamp[p] != stamp {
+          seen_stamp[p] = stamp
+          hot[p] = true
+          wl.push(p)
+        }
+        pe = pred_next[pe]
+      }
+    }
+    ei = ei + 1
+  }
+  hot
+}
+
+///|
 fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
   let local_idx : Map[String, Int] = Map([])
   let local_ty : Map[String, Int] = Map([])
@@ -4837,6 +5013,8 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     )
   }
 
+  let hot_blk = wasm_compute_hot_blocks(f, block_idx)
+
   let fctx = WasmFnCtx::{
     local_idx: local_idx,
     local_ty: local_ty,
@@ -4866,6 +5044,7 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     const_copies: const_copies,
     addr_off_base: addr_off_base,
     addr_off_const: addr_off_const,
+    hot_blk: hot_blk,
     div_tmp_i32: -1,
     div_tmp_i64: -1,
     alloc_tmp_i32: -1,
