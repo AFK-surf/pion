@@ -681,9 +681,11 @@ static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
 #if PION_USE_SLAB
     uint16_t flags = hdr->flags;
     if (__builtin_expect(
-            hdr->drop_fn == NULL &&
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
             (flags & PION_FLAG_SLAB) != 0, 1)) {
+        if (hdr->drop_fn) {
+            hdr->drop_fn(obj);
+        }
         uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
         pion_slab_set_next(hdr, g_main_slab.local_free[cls]);
         g_main_slab.local_free[cls] = hdr;
@@ -1154,19 +1156,9 @@ static PION_NOINLINE PION_MINSIZE void pion_split_emit(PionArray *a, const char 
     a->data[a->len++] = (int64_t)(uintptr_t)pion_str_from_cstr(s, len);
 }
 
-/* Splits s by sep into PionArray of PionString*.
- * Empty sep splits into individual bytes (empty string -> empty array). */
-void *pion_str_split(void *s, void *sep) {
-    PionString *ss = (PionString *)s;
-    PionString *sp = (PionString *)sep;
-    int64_t sl = ss ? ss->len : 0;
-    int64_t pl = sp ? sp->len : 0;
-    int64_t init_cap = 8;
-    if (pl == 1 && sl >= 256) {
-        init_cap = sl / 6;
-        if (init_cap > 262144) init_cap = 262144;
-    }
-    PionArray *arr = (PionArray *)pion_arr_new(init_cap, 1);
+static PION_NOINLINE PION_MINSIZE void *pion_str_split_cold(
+    PionString *ss, PionString *sp, int64_t sl, int64_t pl) {
+    PionArray *arr = (PionArray *)pion_arr_new(8, 1);
     if (pl == 0) {
         for (int64_t i = 0; i < sl; i++) {
             pion_split_emit(arr, ss->data + i, 1);
@@ -1178,71 +1170,6 @@ void *pion_str_split(void *s, void *sep) {
         return arr;
     }
     int64_t pos = 0;
-    if (__builtin_expect(pl == 1, 1)) {
-        int sep_ch = (unsigned char)sp->data[0];
-        const char *base = ss->data;
-#if PION_USE_SLAB
-        int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
-#endif
-        while (pos <= sl) {
-            const char *hit = (const char *)memchr(base + pos, sep_ch, (size_t)(sl - pos));
-            int64_t end = hit ? (int64_t)(hit - base) : sl;
-            int64_t tok_len = end - pos;
-            void *part;
-#if PION_USE_SLAB
-            if (__builtin_expect(!mt && tok_len <= 7, 1)) {
-                PionHeader *hdr = (PionHeader *)g_main_slab.local_free[1];
-                if (__builtin_expect(hdr != NULL, 0)) {
-                    g_main_slab.local_free[1] = pion_slab_get_next(hdr);
-                } else {
-                    char *cur = g_main_slab.chunk_cur;
-                    if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= 40u, 1)) {
-                        g_main_slab.chunk_cur = cur + 40u;
-                        hdr = (PionHeader *)cur;
-                    }
-                }
-                if (__builtin_expect(hdr != NULL, 1)) {
-                    hdr->owner_tid = 1u;
-                    hdr->local_rc = 1;
-                    atomic_init(&hdr->shared_rc, 0);
-                    hdr->type_tag = PION_TAG_STRING;
-                    hdr->flags = (uint16_t)(PION_FLAG_SLAB | (1u << PION_FLAG_SLAB_CLS_SHIFT));
-                    hdr->drop_fn = NULL;
-                    PionString *str = (PionString *)(hdr + 1);
-                    str->len = tok_len;
-                    const char *src = base + pos;
-                    char *dst = str->data;
-                    if (__builtin_expect(tok_len >= 4, 1)) {
-                        uint32_t w0, w1;
-                        memcpy(&w0, src, 4);
-                        memcpy(&w1, src + tok_len - 4, 4);
-                        memcpy(dst, &w0, 4);
-                        memcpy(dst + tok_len - 4, &w1, 4);
-                    } else if (tok_len >= 2) {
-                        uint16_t h0;
-                        memcpy(&h0, src, 2);
-                        memcpy(dst, &h0, 2);
-                        dst[tok_len - 1] = src[tok_len - 1];
-                    } else if (tok_len == 1) {
-                        dst[0] = src[0];
-                    }
-                    dst[tok_len] = '\0';
-                    part = str;
-                    goto push_part;
-                }
-            }
-#endif
-            part = pion_str_from_cstr(base + pos, tok_len);
-#if PION_USE_SLAB
-        push_part:
-#endif
-            if (__builtin_expect(arr->len == arr->cap, 0)) pion_arr_grow(arr);
-            arr->data[arr->len++] = (int64_t)(uintptr_t)part;
-            if (!hit) break;
-            pos = end + 1;
-        }
-        return arr;
-    }
     while (pos <= sl) {
         const char *hit = pion_memmem(ss->data + pos, sl - pos, sp->data, pl);
         if (!hit) {
@@ -1252,6 +1179,101 @@ void *pion_str_split(void *s, void *sep) {
         int64_t off = (int64_t)(hit - ss->data);
         pion_split_emit(arr, ss->data + pos, off - pos);
         pos = off + pl;
+    }
+    return arr;
+}
+
+/* Splits s by sep into PionArray of PionString*.
+ * Empty sep splits into individual bytes (empty string -> empty array). */
+void *pion_str_split(void *s, void *sep) {
+    PionString *ss = (PionString *)s;
+    PionString *sp = (PionString *)sep;
+    int64_t sl = ss ? ss->len : 0;
+    int64_t pl = sp ? sp->len : 0;
+    if (__builtin_expect(pl != 1 || !ss || sl == 0, 0)) {
+        return pion_str_split_cold(ss, sp, sl, pl);
+    }
+    int64_t init_cap = 8;
+    if (sl >= 256) {
+        init_cap = sl / 6;
+        if (init_cap > 262144) init_cap = 262144;
+    }
+    PionArray *arr = (PionArray *)pion_arr_new(init_cap, 1);
+    int64_t pos = 0;
+    int sep_ch = (unsigned char)sp->data[0];
+    const char *base = ss->data;
+    const char *lim = base + sl;
+#if PION_USE_SLAB
+    int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+#endif
+    while (pos <= sl) {
+        const char *p = base + pos;
+        const char *fast_lim = (lim - p > 16) ? p + 16 : lim;
+        while (p < fast_lim && (unsigned char)*p != (unsigned char)sep_ch) {
+            p++;
+        }
+        const char *hit;
+        if (p < fast_lim) {
+            hit = p;
+        } else if (p < lim) {
+            hit = (const char *)memchr(p, sep_ch, (size_t)(lim - p));
+        } else {
+            hit = NULL;
+        }
+        int64_t end = hit ? (int64_t)(hit - base) : sl;
+        int64_t tok_len = end - pos;
+        void *part;
+#if PION_USE_SLAB
+        if (__builtin_expect(!mt && tok_len <= 7, 1)) {
+            PionHeader *hdr = (PionHeader *)g_main_slab.local_free[1];
+            if (__builtin_expect(hdr != NULL, 0)) {
+                g_main_slab.local_free[1] = pion_slab_get_next(hdr);
+            } else {
+                char *cur = g_main_slab.chunk_cur;
+                if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= 40u, 1)) {
+                    g_main_slab.chunk_cur = cur + 40u;
+                    hdr = (PionHeader *)cur;
+                }
+            }
+            if (__builtin_expect(hdr != NULL, 1)) {
+                hdr->owner_tid = 1u;
+                hdr->local_rc = 1;
+                atomic_init(&hdr->shared_rc, 0);
+                hdr->type_tag = PION_TAG_STRING;
+                hdr->flags = (uint16_t)(PION_FLAG_SLAB | (1u << PION_FLAG_SLAB_CLS_SHIFT));
+                hdr->drop_fn = NULL;
+                PionString *str = (PionString *)(hdr + 1);
+                str->len = tok_len;
+                const char *src = base + pos;
+                char *dst = str->data;
+                if (__builtin_expect(tok_len >= 4, 1)) {
+                    uint32_t w0, w1;
+                    memcpy(&w0, src, 4);
+                    memcpy(&w1, src + tok_len - 4, 4);
+                    memcpy(dst, &w0, 4);
+                    memcpy(dst + tok_len - 4, &w1, 4);
+                } else if (tok_len >= 2) {
+                    uint16_t h0;
+                    memcpy(&h0, src, 2);
+                    memcpy(dst, &h0, 2);
+                    dst[tok_len - 1] = src[tok_len - 1];
+                } else if (tok_len == 1) {
+                    dst[0] = src[0];
+                }
+                dst[tok_len] = '\0';
+                part = str;
+                goto push_part;
+            }
+        }
+#endif
+        part = pion_str_from_cstr(base + pos, tok_len);
+#if PION_USE_SLAB
+    push_part:
+#endif
+        if (__builtin_expect(arr->len == arr->cap, 0)) pion_arr_grow(arr);
+        arr->data[arr->len++] = (int64_t)(uintptr_t)part;
+        if (!hit) break;
+        pos = end + 1;
     }
     return arr;
 }
@@ -1568,9 +1590,38 @@ static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj(PionArray *a, void (
     }
 }
 
-static PION_MINSIZE void pion_arr_drop(void *payload) {
+static void pion_arr_drop(void *payload) {
     PionArray *a = (PionArray *)payload;
-    pion_arr_foreach_obj(a, pion_rc_dec);
+    if (a->elem_is_obj == 1 && a->elem_stride <= 8 && a->len > 0 &&
+        __builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
+        int64_t *data = a->data;
+        int64_t n = a->len;
+        for (int64_t i = 0; i < n; i++) {
+            void *e = (void *)(uintptr_t)data[i];
+            if (!e) continue;
+            PionHeader *h = pion_hdr(e);
+            uint16_t flags = h->flags;
+            if (__builtin_expect((flags & PION_FLAG_IMMORTAL) != 0, 0)) continue;
+            if (__builtin_expect(h->owner_tid != 0, 1)) {
+                if (--h->local_rc == 0) {
+#if PION_USE_SLAB
+                    if (__builtin_expect(h->drop_fn == NULL && (flags & PION_FLAG_SLAB) != 0, 1)) {
+                        uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
+                        pion_slab_set_next(h, g_main_slab.local_free[cls]);
+                        g_main_slab.local_free[cls] = h;
+                    } else
+#endif
+                    {
+                        pion_destroy(h, e);
+                    }
+                }
+            } else {
+                pion_rc_dec(e);
+            }
+        }
+    } else {
+        pion_arr_foreach_obj(a, pion_rc_dec);
+    }
     if (a->data) {
         pion_slab_raw_free(a->data, (size_t)a->cap * pion_arr_stride(a),
                            (pion_hdr(a)->flags & PION_FLAG_FROZEN) != 0);
@@ -1907,13 +1958,13 @@ static PION_NOINLINE PION_MINSIZE void pion_map_hint_invalidate(const PionMap *m
 }
 
 static inline PionMapEntry *pion_map_hint_hit(const PionMap *m, const PionString *k, int inline_eq) {
-    (void)inline_eq;
-    if (__builtin_expect(
-            !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
-            g_map_hint.map == m && g_map_hint.key == k, 0)) {
+    if (!atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
+        g_map_hint.map == m && g_map_hint.key == k) {
         PionMapEntry *e = g_map_hint.entry;
-        if (__builtin_expect(
-                e->key == k || (!m->key_is_int && pion_str_eq((void *)e->key, (void *)k)), 1)) {
+        int eq = e->key == k ||
+            (!m->key_is_int && (inline_eq ? pion_str_eq_fast(e->key, k)
+                                          : pion_str_eq((void *)e->key, (void *)k)));
+        if (__builtin_expect(eq, 1)) {
             return e;
         }
     }
@@ -1989,7 +2040,7 @@ PION_HOT void pion_map_set(void *m_ptr, void *key_str, int64_t val) {
     PionString *k = (PionString *)key_str;
     if (__builtin_expect(!m || (!m->key_is_int && !k), 0)) pion_die("null map or key");
     PionMapEntry *e = pion_map_hint_hit(m, k, 1);
-    if (__builtin_expect(e != NULL, 0)) {
+    if (e != NULL) {
         goto update_existing;
     }
     if (__builtin_expect(m->cap == 0, 0)) {
@@ -2046,20 +2097,7 @@ PION_HOT int32_t pion_map_try_get(void *m_ptr, void *key_str, int64_t *out_val) 
 }
 
 int32_t pion_map_has(void *m_ptr, void *key_str) {
-    PionMap *m = (PionMap *)m_ptr;
-    PionString *k = (PionString *)key_str;
-    if (__builtin_expect(!m || (!m->key_is_int && !k) || m->len == 0, 0)) return 0;
-    uint64_t h = pion_map_key_hash(m, k);
-    PionMapEntry *e = pion_map_probe(m, k, h);
-    if (e->state == 1) {
-        if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
-            g_map_hint.map = m;
-            g_map_hint.key = k;
-            g_map_hint.entry = e;
-        }
-        return 1;
-    }
-    return 0;
+    return pion_map_try_get(m_ptr, key_str, NULL);
 }
 
 PION_HOT int64_t pion_map_get(void *m_ptr, void *key_str) {
