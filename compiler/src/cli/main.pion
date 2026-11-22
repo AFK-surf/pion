@@ -1300,6 +1300,37 @@ fn drv_compute_compiler_fp(
 }
 
 ///|
+/// Lightweight compiler fingerprint that depends only on the running `pionc`
+/// executable (size + mtime), version, `tag`, and `$PION_CACHE_SALT`, without
+/// probing `qbe` or `libpionrt.a` (used by `pionc check` and zero-toolchain
+/// `--target wasm32` CAS).
+fn drv_compute_self_fp(world : World, tag : String) -> String {
+  let self_bin = drv_self_exe_path(world)
+  let self_sz = if self_bin.length() > 0 && fs_exists(world, self_bin) {
+    fs_size(world, self_bin)
+  } else {
+    0L
+  }
+  let self_mt = if self_bin.length() > 0 && fs_exists(world, self_bin) {
+    fs_mtime_ms(world, self_bin)
+  } else {
+    0L
+  }
+  let env_salt = drv_env_str(world, "PION_CACHE_SALT")
+  cas_compiler_fp(
+    self_sz,
+    0L,
+    tag +
+    "|0.1.0|self:" +
+    self_sz.to_string() +
+    ":" +
+    self_mt.to_string() +
+    "|" +
+    env_salt,
+  )
+}
+
+///|
 fn drv_normalize_path(path : String) -> String {
   let is_abs = path.length() > 0 && str_code_at(path, 0) == 47
   let parts : Array[String] = []
@@ -4043,10 +4074,30 @@ fn drv_build_wasm_targets(
   out_bin_arg : String,
 ) -> Result[String, String] {
   let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/sig")
+  let _ = fs_mkdir_p(world, cache_dir + "/ssa")
   let _ = fs_mkdir_p(world, cache_dir + "/bin")
+  let trace_cas = drv_env_str(world, "PION_TRACE_CAS") == "1"
+  let no_wasm_opt = match env_get(world, "PION_NO_WASM_OPT") {
+    Some(v) => v == "1"
+    None => false
+  }
+  let wopt_bin = if release && !no_wasm_opt {
+    match proc_exec_capture(world, ["which", "wasm-opt"]) {
+      Ok(found) => drv_trim_ws(found)
+      Err(_) => ""
+    }
+  } else {
+    ""
+  }
+  let wopt_tag = if wopt_bin != "" {
+    "wopt:" + wopt_bin + ":" + fs_size(world, wopt_bin).to_string()
+  } else {
+    "raw"
+  }
+
   let mut pkg_name = "app"
   let mut all_ssa = ""
-
   let mut handled_ws = false
   if targets.length() == 1 {
     match drv_detect_manifest_dir(world, targets[0]) {
@@ -4072,55 +4123,242 @@ fn drv_build_wasm_targets(
         let n = topo.order.length()
         let trans = drv_trans_deps(nodes, topo.order)
         let trans_dep_topo = trans.topo
+        let trans_dep_names = trans.names
+        let wasm_fp = drv_compute_self_fp(world, "wasm32-v1")
         let loaded_imported : Array[Option[ImportedPkg]] = []
+        let stub_paths : Array[String] = []
         let mut k = 0
         while k < n {
           loaded_imported.push(None)
+          stub_paths.push("")
           k = k + 1
         }
+        let sig_hashes : Map[String, String] = Map([])
         let dep_pkg_names : Array[String] = []
-        let ssa_sb = StringBuilder()
+        let pkg_ssa_paths : Array[String] = []
+        let pkg_ssa_mem : Array[String] = []
+        let new_keys : Array[String] = []
+        let new_sizes : Array[Int64] = []
+        let link_key_sb = StringBuilder()
         k = 0
         while k < n {
           let node = nodes[topo.order[k]]
           let is_entry = k == n - 1
-          let k_imports : Array[ImportedPkg] = []
-          let deps_k = trans_dep_topo[k]
-          let mut di = 0
-          while di < deps_k.length() {
-            match loaded_imported[deps_k[di]] {
-              Some(ip) => k_imports.push(ip)
-              None => ()
+          let upstream_sigs : Array[String] = []
+          let t_names = trans_dep_names[k]
+          let mut u = 0
+          while u < t_names.length() {
+            let un = t_names[u]
+            let sh = match sig_hashes.get(un) {
+              Some(h) => h
+              None => ""
             }
-            di = di + 1
+            upstream_sigs.push(un + ":" + sh)
+            u = u + 1
           }
-          let cr = check_source_files_with_imports(
+          let target_key = if is_entry {
+            "wasm32_entry:" + drv_join_comma(dep_pkg_names)
+          } else {
+            "wasm32"
+          }
+          let key = cas_compute_key(
             node.name,
             node.paths,
             node.sources,
-            k_imports,
-            true,
-          )
-          if cr.diagnostics.length() > 0 {
-            return Err(check_result_to_json(cr.diagnostics))
-          }
-          loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
-          let res = emit_qbe_package_multi(
-            cr.pkg,
-            cr.tc,
+            upstream_sigs,
+            target_key,
             release,
-            is_entry,
-            dep_pkg_names,
+            wasm_fp,
           )
-          ssa_sb.write_string(wasm_namespace_local_ssa(res.ssa, "u" + k.to_string() + "__"))
-          ssa_sb.write_char('\n')
+          let sig_path = cache_dir + "/sig/" + key + ".pionsig"
+          let stub_path = cache_dir + "/sig/" + key + ".pionstub"
+          let ssa_path = cache_dir + "/ssa/" + key + ".ssa"
+          let mut cas_hit = false
+          if fs_exists(world, sig_path) &&
+            fs_exists(world, stub_path) &&
+            fs_exists(world, ssa_path) {
+            match fs_read(world, sig_path) {
+              Ok(sig_text) => {
+                sig_hashes.set(node.name, sha256_hex(sig_text))
+                stub_paths[k] = stub_path
+                pkg_ssa_paths.push(ssa_path)
+                pkg_ssa_mem.push("")
+                cas_hit = true
+                if trace_cas {
+                  io_eprintln(
+                    world,
+                    "[cas-wasm] pkg=" + node.name + " HIT key=" + drv_prefix16(key),
+                  )
+                }
+              }
+              Err(_) => ()
+            }
+          }
+          if !cas_hit {
+            if trace_cas {
+              io_eprintln(
+                world,
+                "[cas-wasm] pkg=" + node.name + " MISS key=" + drv_prefix16(key),
+              )
+            }
+            let k_imports = drv_ensure_ws_imports(
+              world,
+              nodes,
+              topo.order,
+              trans_dep_topo,
+              stub_paths,
+              loaded_imported,
+              k,
+            )
+            let cr = check_source_files_with_imports(
+              node.name,
+              node.paths,
+              node.sources,
+              k_imports,
+              true,
+            )
+            if cr.diagnostics.length() > 0 {
+              return Err(check_result_to_json(cr.diagnostics))
+            }
+            loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
+            let pionsig = emit_pionsig(cr.pkg)
+            sig_hashes.set(node.name, sha256_hex(pionsig))
+            let pionstub = emit_pion_stub(cr.pkg)
+            let res = emit_qbe_package_multi(
+              cr.pkg,
+              cr.tc,
+              release,
+              is_entry,
+              dep_pkg_names,
+            )
+            let _ = drv_write_text_atomic(world, sig_path, pionsig)
+            let _ = drv_write_text_atomic(world, stub_path, pionstub)
+            if !drv_write_text_atomic(world, ssa_path, res.ssa) {
+              return Err("failed to write CAS wasm ssa: " + ssa_path)
+            }
+            stub_paths[k] = stub_path
+            pkg_ssa_paths.push(ssa_path)
+            pkg_ssa_mem.push(res.ssa)
+            new_keys.push(key)
+            new_sizes.push(
+              (pionsig.length() + pionstub.length() + res.ssa.length()).to_int64(),
+            )
+          }
           if !is_entry {
             dep_pkg_names.push(node.name)
           }
+          link_key_sb.write_string(":")
+          link_key_sb.write_string(key)
           k = k + 1
         }
-        pkg_name = nodes[topo.order[n - 1]].name
+        if new_keys.length() > 0 {
+          drv_cas_record_batch_and_evict(world, cache_dir, new_keys, new_sizes)
+        }
+        let wasm_bin_key = sha256_hex(
+          "wasm-bin-v1|" +
+          wasm_fp +
+          "|" +
+          (if release { "rel" } else { "dbg" }) +
+          "|" +
+          wopt_tag +
+          "|" +
+          link_key_sb.to_string(),
+        )
+        let cached_wasm = cache_dir + "/bin/wasm_" + wasm_bin_key + ".wasm"
+        if emit_ssa_path == "" && fs_exists(world, cached_wasm) {
+          if trace_cas {
+            io_eprintln(
+              world,
+              "[cas-wasm-bin] HIT key=" + drv_prefix16(wasm_bin_key),
+            )
+          }
+          if out_bin_arg != "" {
+            return drv_copy_file(world, cached_wasm, out_bin_arg)
+          }
+          return Ok(cached_wasm)
+        }
+        if trace_cas {
+          io_eprintln(
+            world,
+            "[cas-wasm-bin] MISS key=" + drv_prefix16(wasm_bin_key),
+          )
+        }
+        let ssa_sb = StringBuilder()
+        k = 0
+        while k < n {
+          let pkg_ssa = if pkg_ssa_mem[k].length() > 0 {
+            pkg_ssa_mem[k]
+          } else {
+            match fs_read(world, pkg_ssa_paths[k]) {
+              Ok(t) => t
+              Err(e) => return Err("failed to read CAS wasm ssa " + pkg_ssa_paths[k] + ": " + e)
+            }
+          }
+          ssa_sb.write_string(
+            wasm_namespace_local_ssa(pkg_ssa, "u" + k.to_string() + "__"),
+          )
+          ssa_sb.write_char('\n')
+          k = k + 1
+        }
         all_ssa = ssa_sb.to_string()
+        if emit_ssa_path != "" {
+          drv_ensure_parent_dir(world, emit_ssa_path)
+          if !drv_write_text_atomic(world, emit_ssa_path, all_ssa) {
+            return Err("failed to write --emit-ssa file: " + emit_ssa_path)
+          }
+        }
+        let wasm_bytes = emit_wasm_from_ssa(all_ssa)
+        let tmp_bin = cached_wasm + ".tmp." + clock_now_ms(world).to_string()
+        if wopt_bin != "" {
+          let tmp_raw = cached_wasm + ".raw." + clock_now_ms(world).to_string()
+          match fs_write_bytes(world, tmp_raw, wasm_bytes) {
+            Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
+            Ok(_) => ()
+          }
+          let opt_res = proc_exec_capture(
+            world,
+            [
+              wopt_bin,
+              "-Oz",
+              "--enable-bulk-memory",
+              "--enable-sign-ext",
+              "--enable-mutable-globals",
+              tmp_raw,
+              "-o",
+              tmp_bin,
+            ],
+          )
+          let _ = fs_remove(world, tmp_raw)
+          match opt_res {
+            Ok(_) => ()
+            Err(e) => {
+              let _ = fs_remove(world, tmp_bin)
+              return Err("wasm-opt failed on " + cached_wasm + ": " + e)
+            }
+          }
+        } else {
+          match fs_write_bytes(world, tmp_bin, wasm_bytes) {
+            Err(e) => return Err("failed to write wasm file " + tmp_bin + ": " + e)
+            Ok(_) => ()
+          }
+        }
+        if !fs_rename(world, tmp_bin, cached_wasm) {
+          let _ = fs_remove(world, tmp_bin)
+          if !fs_exists(world, cached_wasm) {
+            return Err("failed to commit CAS wasm binary: " + cached_wasm)
+          }
+        }
+        let bsz = fs_size(world, cached_wasm)
+        drv_cas_record_batch_and_evict(
+          world,
+          cache_dir,
+          [wasm_bin_key],
+          [if bsz > 0L { bsz } else { 0L }],
+        )
+        if out_bin_arg != "" {
+          return drv_copy_file(world, cached_wasm, out_bin_arg)
+        }
+        return Ok(cached_wasm)
       }
       None => ()
     }
@@ -4155,41 +4393,29 @@ fn drv_build_wasm_targets(
   if out_bin_arg != "" {
     drv_ensure_parent_dir(world, out_bin_arg)
   }
-  let no_wasm_opt = match env_get(world, "PION_NO_WASM_OPT") {
-    Some(v) => v == "1"
-    None => false
-  }
-  if release && !no_wasm_opt {
-    match proc_exec_capture(world, ["which", "wasm-opt"]) {
-      Ok(found) => {
-        let wopt_bin = drv_trim_ws(found)
-        if wopt_bin != "" {
-          let tmp_raw = final_wasm + ".raw.wasm"
-          match fs_write_bytes(world, tmp_raw, wasm_bytes) {
-            Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
-            Ok(_) => ()
-          }
-          let opt_res = proc_exec_capture(
-            world,
-            [
-              wopt_bin,
-              "-Oz",
-              "--enable-bulk-memory",
-              "--enable-sign-ext",
-              "--enable-mutable-globals",
-              tmp_raw,
-              "-o",
-              final_wasm,
-            ],
-          )
-          let _ = fs_remove(world, tmp_raw)
-          match opt_res {
-            Ok(_) => return Ok(final_wasm)
-            Err(e) => return Err("wasm-opt failed on " + final_wasm + ": " + e)
-          }
-        }
-      }
-      Err(_) => ()
+  if wopt_bin != "" {
+    let tmp_raw = final_wasm + ".raw.wasm"
+    match fs_write_bytes(world, tmp_raw, wasm_bytes) {
+      Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
+      Ok(_) => ()
+    }
+    let opt_res = proc_exec_capture(
+      world,
+      [
+        wopt_bin,
+        "-Oz",
+        "--enable-bulk-memory",
+        "--enable-sign-ext",
+        "--enable-mutable-globals",
+        tmp_raw,
+        "-o",
+        final_wasm,
+      ],
+    )
+    let _ = fs_remove(world, tmp_raw)
+    match opt_res {
+      Ok(_) => return Ok(final_wasm)
+      Err(e) => return Err("wasm-opt failed on " + final_wasm + ": " + e)
     }
   }
   match fs_write_bytes(world, final_wasm, wasm_bytes) {
@@ -6855,6 +7081,157 @@ fn drv_ws_diagnostics(nodes : Array[PkgNodeInput]) -> Array[Diagnostic] {
 }
 
 ///|
+/// Incremental CAS-backed workspace type check: caches clean packages'
+/// `.pionsig` and `.pionstub` in `$PION_CACHE_DIR/sig/` keyed by package
+/// sources, upstream `.pionsig` hashes, and `pionc` self-fingerprint (never
+/// probing `qbe`/`libpionrt.a`). Packages with diagnostics or errored upstream
+/// dependencies are never cached.
+fn drv_ws_diagnostics_cached(
+  world : World,
+  nodes : Array[PkgNodeInput],
+) -> Array[Diagnostic] {
+  let names : Array[String] = []
+  let dep_lists : Array[Array[String]] = []
+  let mut ni = 0
+  while ni < nodes.length() {
+    names.push(nodes[ni].name)
+    dep_lists.push(nodes[ni].deps)
+    ni = ni + 1
+  }
+  let topo = topo_sort_packages(names, dep_lists)
+  if topo.diagnostics.length() > 0 {
+    return topo.diagnostics
+  }
+  let n = topo.order.length()
+  let trans = drv_trans_deps(nodes, topo.order)
+  let trans_dep_topo = trans.topo
+  let trans_dep_names = trans.names
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/sig")
+  let check_fp = drv_compute_self_fp(world, "check-v1")
+  let trace_cas = drv_env_str(world, "PION_TRACE_CAS") == "1"
+
+  let stub_paths : Array[String] = []
+  let loaded_imported : Array[Option[ImportedPkg]] = []
+  let pkg_has_err : Array[Bool] = []
+  let mut k = 0
+  while k < n {
+    stub_paths.push("")
+    loaded_imported.push(None)
+    pkg_has_err.push(false)
+    k = k + 1
+  }
+  let sig_hashes : Map[String, String] = Map([])
+  let new_keys : Array[String] = []
+  let new_sizes : Array[Int64] = []
+  let all_diags : Array[Diagnostic] = []
+
+  k = 0
+  while k < n {
+    let node = nodes[topo.order[k]]
+    let deps_k = trans_dep_topo[k]
+    let mut any_dep_err = false
+    let mut di = 0
+    while di < deps_k.length() {
+      if pkg_has_err[deps_k[di]] {
+        any_dep_err = true
+        break
+      }
+      di = di + 1
+    }
+    let upstream_sigs : Array[String] = []
+    let t_names = trans_dep_names[k]
+    let mut u = 0
+    while u < t_names.length() {
+      let un = t_names[u]
+      let sh = match sig_hashes.get(un) {
+        Some(h) => h
+        None => ""
+      }
+      upstream_sigs.push(un + ":" + sh)
+      u = u + 1
+    }
+    let key = cas_compute_key(
+      node.name,
+      node.paths,
+      node.sources,
+      upstream_sigs,
+      "check",
+      false,
+      check_fp,
+    )
+    let sig_path = cache_dir + "/sig/" + key + ".pionsig"
+    let stub_path = cache_dir + "/sig/" + key + ".pionstub"
+    let mut cas_hit = false
+    if !any_dep_err && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
+      match fs_read(world, sig_path) {
+        Ok(sig_text) => {
+          sig_hashes.set(node.name, sha256_hex(sig_text))
+          stub_paths[k] = stub_path
+          cas_hit = true
+          if trace_cas {
+            io_eprintln(
+              world,
+              "[cas-check] pkg=" + node.name + " HIT key=" + drv_prefix16(key),
+            )
+          }
+        }
+        Err(_) => ()
+      }
+    }
+    if !cas_hit {
+      if trace_cas {
+        io_eprintln(
+          world,
+          "[cas-check] pkg=" + node.name + " MISS key=" + drv_prefix16(key),
+        )
+      }
+      let k_imports = drv_ensure_ws_imports(
+        world,
+        nodes,
+        topo.order,
+        trans_dep_topo,
+        stub_paths,
+        loaded_imported,
+        k,
+      )
+      let cr = check_source_files_with_imports(
+        node.name,
+        node.paths,
+        node.sources,
+        k_imports,
+        true,
+      )
+      loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
+      if cr.diagnostics.length() > 0 {
+        let mut ei = 0
+        while ei < cr.diagnostics.length() {
+          all_diags.push(cr.diagnostics[ei])
+          ei = ei + 1
+        }
+        pkg_has_err[k] = true
+      } else {
+        let pionsig = emit_pionsig(cr.pkg)
+        sig_hashes.set(node.name, sha256_hex(pionsig))
+        if !any_dep_err {
+          let pionstub = emit_pion_stub(cr.pkg)
+          let _ = drv_write_text_atomic(world, sig_path, pionsig)
+          let _ = drv_write_text_atomic(world, stub_path, pionstub)
+          stub_paths[k] = stub_path
+          new_keys.push(key)
+          new_sizes.push((pionsig.length() + pionstub.length()).to_int64())
+        }
+      }
+    }
+    k = k + 1
+  }
+  if new_keys.length() > 0 {
+    drv_cas_record_batch_and_evict(world, cache_dir, new_keys, new_sizes)
+  }
+  all_diags
+}
+
+///|
 /// `pionc add [--json] <name> (--path <p> | --git <url> [--tag|--rev|--branch <r>]
 /// [--subdir <s>] | [--registry <url_or_path>]) [dir]`: sets the dependency in
 /// `pion.toml` (in place, idempotent), resolves it into the shared cache and
@@ -7219,7 +7596,7 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
     }
     Ok(v) => v
   }
-  let diags = drv_ws_diagnostics(ws.nodes)
+  let diags = drv_ws_diagnostics_cached(world, ws.nodes)
   if diags.length() > 0 {
     drv_restore_file(world, mf_path, true, text)
     drv_restore_file(world, lock_path, lock_existed, lock_text)
@@ -7354,7 +7731,7 @@ fn drv_collect_check_diags(
       Some(root_dir) =>
         match drv_load_workspace_nodes(world, root_dir) {
           Err(msg) => return Err(msg)
-          Ok(nodes) => return Ok(drv_ws_diagnostics(nodes))
+          Ok(nodes) => return Ok(drv_ws_diagnostics_cached(world, nodes))
         }
       None => ()
     }
@@ -8467,7 +8844,7 @@ pub fn main(world : World) -> Int {
               return 1
             }
             Ok(nodes) => {
-              let all_diags = drv_ws_diagnostics(nodes)
+              let all_diags = drv_ws_diagnostics_cached(world, nodes)
               io_println(world, check_result_to_json(all_diags))
               if all_diags.length() > 0 {
                 return 1
