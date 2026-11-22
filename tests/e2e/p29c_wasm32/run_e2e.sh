@@ -1835,4 +1835,95 @@ console.log("  flat_pod_arr (" + mode + "/" + rtLabel + "): out=" + out + " mem=
 done
 done
 
+echo "[19/19] Web Runtime Single-Threaded Concurrency Primitives Regression (release+dev x Node+Web)"
+cat > "$TMP_DIR/web_concurrency.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  let mx : Mutex[Int] = Mutex::new(10)
+  let v0 = mx.lock()
+  mx.set(v0 + 5)
+  mx.unlock()
+  let v1 = mx.lock()
+  mx.unlock()
+
+  let smx : Mutex[String] = Mutex::new("init")
+  let s0 = smx.lock()
+  smx.set(s0 + "_ok")
+  smx.unlock()
+  let s1 = smx.lock()
+  smx.unlock()
+
+  let at = AtomicInt::new(1)
+  at.store(10)
+  let prev = at.fetch_add(7)
+  let cur = at.load()
+
+  let ch : Channel[String] = Channel::new(4)
+  scope(world, fn(sc : Scope) -> Unit {
+    spawn(sc, fn() -> Unit {
+      let _ = ch.send("alpha")
+      let _ = ch.send("beta")
+    })
+  })
+  let r1 = match ch.recv() {
+    Some(s) => s
+    None => "none"
+  }
+  let r2 = match ch.recv() {
+    Some(s) => s
+    None => "none"
+  }
+  ch.close()
+  let closed_send = if ch.send("gamma") { 1 } else { 0 }
+  let r3 = match ch.recv() {
+    Some(s) => s
+    None => "empty"
+  }
+
+  io_println(world, v1.to_string() + ":" + s1 + ":" + prev.to_string() + ":" + cur.to_string() + ":" + r1 + ":" + r2 + ":" + closed_send.to_string() + ":" + r3)
+  0
+}
+EOF
+WC_REL_WASM="$TMP_DIR/web_concurrency_rel.wasm"
+WC_DEV_WASM="$TMP_DIR/web_concurrency_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$WC_REL_WASM" "$TMP_DIR/web_concurrency.pion"
+"$PIONC" build --target wasm32 -o "$WC_DEV_WASM" "$TMP_DIR/web_concurrency.pion"
+for mode_wasm in "release:$WC_REL_WASM" "dev:$WC_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): web_concurrency.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "15:init_ok:10:17:alpha:beta:0:empty") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): web_concurrency mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+console.log("  web_concurrency (" + mode + "/" + rtLabel + "): out=" + out + " OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
