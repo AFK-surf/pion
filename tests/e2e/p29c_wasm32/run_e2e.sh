@@ -3217,4 +3217,159 @@ console.log("  p49a (" + mode + "/" + rtLabel + "): " + out + " seed=0x" + seedV
 done
 done
 
+echo "=== P50-A 2-Slot Fast Tail-Loop (100k Left/Right Skewed Trees + Leaf Inline Recycle) + sz=40 Struct Slab ==="
+cat > "$TMP_DIR/p50a_2slot_slab.pion" <<'EOF'
+struct BinNode {
+  left : Option[BinNode]
+  right : Option[BinNode]
+}
+
+struct Rec40 {
+  id : Int
+  name : String
+  active : Bool
+  score : Int
+  tag : String
+}
+
+fn make_tree(d : Int) -> BinNode {
+  if d == 0 {
+    BinNode::{ left: None, right: None }
+  } else {
+    BinNode::{ left: Some(make_tree(d - 1)), right: Some(make_tree(d - 1)) }
+  }
+}
+
+fn count_tree(n : BinNode) -> Int {
+  let l = match n.left {
+    Some(x) => count_tree(x)
+    None => 0
+  }
+  let r = match n.right {
+    Some(x) => count_tree(x)
+    None => 0
+  }
+  1 + l + r
+}
+
+fn test_skewed_left(n : Int) -> Int {
+  let mut cur : Option[BinNode] = None
+  let mut i = 0
+  while i < n {
+    cur = Some(BinNode::{ left: cur, right: None })
+    i = i + 1
+  }
+  match cur {
+    Some(_) => n
+    None => 0
+  }
+}
+
+fn test_skewed_right(n : Int) -> Int {
+  let mut cur : Option[BinNode] = None
+  let mut i = 0
+  while i < n {
+    cur = Some(BinNode::{ left: None, right: cur })
+    i = i + 1
+  }
+  match cur {
+    Some(_) => n
+    None => 0
+  }
+}
+
+fn test_rec40(n : Int) -> Int {
+  let mut sum = 0
+  let mut i = 0
+  while i < n {
+    let r = Rec40::{
+      id: i,
+      name: "r" + i.to_string(),
+      active: (i % 2) == 0,
+      score: i * 3,
+      tag: "t" + (i % 10).to_string(),
+    }
+    sum = sum + r.id + r.score + r.name.length() + r.tag.length()
+    i = i + 1
+  }
+  sum
+}
+
+pub fn main(world : World) -> Int {
+  let t = make_tree(12)
+  let tc = count_tree(t)
+  let sl = test_skewed_left(100000)
+  let sr = test_skewed_right(100000)
+  let rs = test_rec40(2000)
+  io_println(world, "p50a_ok:" + tc.to_string() + ":" + sl.to_string() + ":" + sr.to_string() + ":" + rs.to_string())
+  0
+}
+EOF
+P50A_REL_WASM="$TMP_DIR/p50a_rel.wasm"
+P50A_DEV_WASM="$TMP_DIR/p50a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P50A_REL_WASM" "$TMP_DIR/p50a_2slot_slab.pion"
+"$PIONC" build --target wasm32 -o "$P50A_DEV_WASM" "$TMP_DIR/p50a_2slot_slab.pion"
+for mode_wasm in "release:$P50A_REL_WASM" "dev:$P50A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p50a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || !out.startsWith("p50a_ok:8191:100000:100000:")) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p50a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p50a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p50a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
