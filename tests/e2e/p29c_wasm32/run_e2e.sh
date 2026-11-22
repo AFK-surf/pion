@@ -2323,4 +2323,172 @@ console.log("  p44a_slab (" + mode + "/" + rtLabel + "): " + out + " mem=" + (me
 done
 done
 
+echo "=== P45-A: Nested Loop Outlining (0/1/3 live_out, break/continue, float+array) + strbuf_push_int Zero-Div Boundaries + Small Struct Inline Slab (Node + Web leaked=0) ==="
+cat > "$TMP_DIR/p45a_wasm_turbo.pion" <<'EOF'
+struct Pair {
+  a : Int64
+  b : Int64
+}
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Nested loop outlining with 0 live_out (array mutation only)
+  let grid : Array[Int] = Array::make(128, 0)
+  let mut r = 0
+  while r < 8 {
+    let mut c = 0
+    while c < 16 {
+      let idx = r * 16 + c
+      grid[idx] = (r + 1) * (c + 2)
+      c = c + 1
+    }
+    r = r + 1
+  }
+  must(grid[0] == 2 && grid[127] == 8 * 17, "0 live_out")
+
+  // 2. Nested loop outlining with 1 live_out + float + continue + early break
+  let mut fsum : Double = 0.0
+  let mut y = 0
+  while y < 12 {
+    let mut x = 0
+    while x < 20 {
+      if x == 3 {
+        x = x + 1
+        continue
+      }
+      if x == 15 {
+        break
+      }
+      fsum = fsum + (y.to_double() + 0.5) * (x.to_double() + 1.0)
+      x = x + 1
+    }
+    y = y + 1
+  }
+  // y=0..11 => sum(y+0.5) = 66 + 6 = 72.0; x=0..14 except 3 => sum(x+1) = 120 - 4 = 116.0 => 72 * 116 = 8352.0
+  must(fsum == 8352.0, "1 live_out float break/continue")
+
+  // 3. Nested loop outlining with 3 live_out (s1, s2, s3) + outer variable update
+  let mut s1 : Int64 = 0L
+  let mut s2 : Int = 0
+  let mut s3 : Double = 0.0
+  let mut o = 0
+  while o < 6 {
+    let mut k = 0
+    while k < 10 {
+      let v = grid[o * 16 + k]
+      s1 = s1 + v.to_int64()
+      s2 = s2 + (v % 7)
+      s3 = s3 + v.to_double() * 0.25
+      k = k + 1
+    }
+    o = o + 1
+  }
+  must(s1 > 0L && s2 > 0 && s3 == s1.to_double() * 0.25, "3 live_out")
+
+  // 4. StringBuilder::write_string(v.to_string()) zero-division boundary values
+  let sb = StringBuilder()
+  let imin32 : Int = -2147483647 - 1
+  let imax64 : Int64 = 9223372036854775807L
+  let imin64 : Int64 = -9223372036854775807L - 1L
+  sb.write_string((0).to_string()); sb.write_string(",")
+  sb.write_string((9).to_string()); sb.write_string(",")
+  sb.write_string((10).to_string()); sb.write_string(",")
+  sb.write_string((99999999).to_string()); sb.write_string(",")
+  sb.write_string((4294967295L).to_string()); sb.write_string(",")
+  sb.write_string((4294967296L).to_string()); sb.write_string(",")
+  sb.write_string((-1).to_string()); sb.write_string(",")
+  sb.write_string(imin32.to_string()); sb.write_string(",")
+  sb.write_string(imax64.to_string()); sb.write_string(",")
+  sb.write_string(imin64.to_string())
+  let got_s = sb.to_string()
+  let exp_s = "0,9,10,99999999,4294967295,4294967296,-1,-2147483648,9223372036854775807,-9223372036854775808"
+  must(got_s == exp_s, "strbuf_push_int boundaries: " + got_s)
+
+  // 5. High-frequency small struct (size=16 -> cls=1) inline slab alloc/free reuse
+  let mut psum : Int64 = 0L
+  let mut it = 0
+  while it < 2000 {
+    let p = Pair::{ a: it.to_int64(), b: (it * 3).to_int64() }
+    psum = psum + p.a + p.b
+    it = it + 1
+  }
+  // sum(4 * it for it in 0..1999) = 4 * 1999 * 2000 / 2 = 7996000
+  must(psum == 7996000L, "small struct inline slab")
+
+  io_println(world, "p45a_ok:" + s1.to_string() + ":" + psum.to_string())
+  0
+}
+EOF
+P45A_REL_WASM="$TMP_DIR/p45a_rel.wasm"
+P45A_DEV_WASM="$TMP_DIR/p45a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P45A_REL_WASM" "$TMP_DIR/p45a_wasm_turbo.pion"
+"$PIONC" build --target wasm32 -o "$P45A_DEV_WASM" "$TMP_DIR/p45a_wasm_turbo.pion"
+for mode_wasm in "release:$P45A_REL_WASM" "dev:$P45A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p45a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || !out.startsWith("p45a_ok:") || !out.endsWith(":7996000")) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p45a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p45a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p45a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
