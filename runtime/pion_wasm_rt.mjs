@@ -29,8 +29,21 @@ const FLAG_IMMORTAL = 2;
 const HEADER_SIZE = 24;
 const PAGE_SIZE = 65536;
 
-// Size classes for O(1) free-list recycling (total block size incl. 8B size header for raw allocs)
-const FREE_CLASSES = [32, 48, 64, 96, 128, 192, 256, 512, 1024, 2048];
+// Size classes for O(1) free-list recycling (total block size incl. 8B block header for raw allocs).
+// Small classes [32..2048] plus 16B-aligned p+16 and 1.5*p+16 tiers up to 256 MiB + 16.
+const FREE_CLASSES = (() => {
+  const set = new Set([32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]);
+  for (let p = 2048; p <= 268435456; p *= 2) {
+    set.add(p + 16);
+    if (p < 268435456) {
+      set.add(((p * 3) / 2) + 16);
+    }
+  }
+  return Array.from(set).sort((a, b) => a - b);
+})();
+const FREE_CLASS_IDX = new Map(FREE_CLASSES.map((sz, i) => [sz, i]));
+const ALLOC_MAGIC = 0x50494f4e; // "PION"
+const FREE_MAGIC  = 0x46524545; // "FREE"
 
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 const textEncoder = new TextEncoder();
@@ -93,9 +106,11 @@ export function createPionRuntime(options = {}) {
   let dv = null;
   let u8 = null;
 
+  let heapBase = 0;
   let heapPtr = 0;
   let heapEnd = 0;
   const freeLists = FREE_CLASSES.map(() => []);
+  const largeFree = new Map();
 
   const stdoutChunks = [];
   const stderrChunks = [];
@@ -130,30 +145,53 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const hb = exp.__heap_base;
     const base = typeof hb === "number" ? hb : (hb && typeof hb.value === "number" ? hb.value : 0x220000);
-    heapPtr = (base + 15) & ~15;
+    heapBase = (base + 15) & ~15;
+    heapPtr = heapBase;
     heapEnd = memory.buffer.byteLength;
+    for (let i = 0; i < freeLists.length; i++) freeLists[i].length = 0;
+    largeFree.clear();
   }
 
   function sizeClassIndex(totalSize) {
-    for (let i = 0; i < FREE_CLASSES.length; i++) {
-      if (totalSize <= FREE_CLASSES[i]) return i;
+    let lo = 0;
+    let hi = FREE_CLASSES.length - 1;
+    let ans = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >>> 1;
+      if (FREE_CLASSES[mid] >= totalSize) {
+        ans = mid;
+        hi = mid - 1;
+      } else {
+        lo = mid + 1;
+      }
     }
-    return -1;
+    return ans;
   }
 
-  // Raw allocation: stores 8-byte block size at ptr - 8 so rawFree knows its class.
+  // Raw allocation: stores 8-byte block header (size:u32 @ base, magic:u32 @ base+4) at ptr - 8.
   function rawAlloc(size) {
     syncViews();
     const need = ((size + 7) & ~7) + 8;
     const cls = sizeClassIndex(need);
-    if (cls >= 0 && freeLists[cls].length > 0) {
-      const base = freeLists[cls].pop();
-      const allocSz = FREE_CLASSES[cls];
-      dv.setUint32(base, allocSz, true);
-      dv.setUint32(base + 4, 0, true);
-      return base + 8;
+    if (cls >= 0) {
+      if (freeLists[cls].length > 0) {
+        const base = freeLists[cls].pop();
+        const allocSz = FREE_CLASSES[cls];
+        dv.setUint32(base, allocSz, true);
+        dv.setUint32(base + 4, ALLOC_MAGIC, true);
+        return base + 8;
+      }
     }
     const allocSz = cls >= 0 ? FREE_CLASSES[cls] : ((need + 15) & ~15);
+    if (cls < 0) {
+      const bucket = largeFree.get(allocSz);
+      if (bucket && bucket.length > 0) {
+        const base = bucket.pop();
+        dv.setUint32(base, allocSz, true);
+        dv.setUint32(base + 4, ALLOC_MAGIC, true);
+        return base + 8;
+      }
+    }
     if (heapPtr + allocSz > heapEnd) {
       const missing = heapPtr + allocSz - heapEnd;
       const growPages = Math.max(16, Math.ceil(missing / PAGE_SIZE));
@@ -163,7 +201,7 @@ export function createPionRuntime(options = {}) {
     const base = heapPtr;
     heapPtr += allocSz;
     dv.setUint32(base, allocSz, true);
-    dv.setUint32(base + 4, 0, true);
+    dv.setUint32(base + 4, ALLOC_MAGIC, true);
     return base + 8;
   }
 
@@ -177,10 +215,27 @@ export function createPionRuntime(options = {}) {
     if (!ptr) return;
     syncViews();
     const base = ptr - 8;
+    if (base < heapBase || base + 8 > heapPtr || (base & 7) !== 0) return;
+    const magic = dv.getUint32(base + 4, true);
+    if (magic === FREE_MAGIC) return;
+    if (magic !== ALLOC_MAGIC) return;
     const allocSz = dv.getUint32(base, true);
-    const cls = sizeClassIndex(allocSz);
-    if (cls >= 0 && FREE_CLASSES[cls] === allocSz) {
+    if (allocSz < 16 || base + allocSz > heapPtr) return;
+    dv.setUint32(base + 4, FREE_MAGIC, true);
+    if (base + allocSz === heapPtr) {
+      heapPtr = base;
+      return;
+    }
+    const cls = FREE_CLASS_IDX.get(allocSz);
+    if (cls !== undefined) {
       freeLists[cls].push(base);
+    } else {
+      let bucket = largeFree.get(allocSz);
+      if (!bucket) {
+        bucket = [];
+        largeFree.set(allocSz, bucket);
+      }
+      bucket.push(base);
     }
   }
 

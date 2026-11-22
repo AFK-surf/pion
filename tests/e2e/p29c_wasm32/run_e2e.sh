@@ -257,4 +257,97 @@ if (hasWopt && optBytes.length >= rawBytes.length) {
 console.log("  mp_clo export check OK:", exps, "raw=" + rawBytes.length + "B opt=" + optBytes.length + "B");
 ' "$MP_WASM" "$MP_RAW" "$(command -v wasm-opt >/dev/null 2>&1 && echo 1 || echo 0)"
 
+echo "=== P29-C [7/7] Large-Block Recycling (> 2048B) & Double-Free Guard Regression ==="
+cat > "$TMP_DIR/large_recycle.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  let mut sum : Double = 0.0
+  let mut i = 0
+  while i < 4000 {
+    let a : Array[Double] = Array::make(512, 1.5)
+    sum = sum + a[0] + a[511]
+    i = i + 1
+  }
+  let mut j = 0
+  while j < 500 {
+    let b : Array[Double] = Array::make(8192, 2.5)
+    sum = sum + b[0] + b[8191]
+    j = j + 1
+  }
+  let mut k = 0
+  while k < 50 {
+    let c : Array[Double] = Array::make(65536, 3.5)
+    sum = sum + c[0] + c[65535]
+    k = k + 1
+  }
+  io_println(world, sum.to_string())
+  0
+}
+EOF
+LARGE_WASM="$TMP_DIR/large_recycle.wasm"
+"$PIONC" build --release --target wasm32 -o "$LARGE_WASM" "$TMP_DIR/large_recycle.pion"
+node --input-type=module -e '
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const outLines = [];
+const rt = createPionRuntime({
+  print: (s) => outLines.push(s),
+  println: (s) => outLines.push(s + "\n"),
+});
+const bytes = fs.readFileSync(wasmPath);
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+if ((rc | 0) !== 0) {
+  console.error("FAIL: large_recycle exited with", rc);
+  process.exit(1);
+}
+const out = outLines.join("").trim();
+if (out !== "14850") {
+  console.error("FAIL: large_recycle checksum mismatch: expected 14850, got", JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+const limitBytes = 16 * 1024 * 1024;
+if (memBytes > limitBytes) {
+  console.error("FAIL: large_recycle linear memory grew too large:", memBytes, ">", limitBytes);
+  process.exit(1);
+}
+
+// Verify double-free guard does not duplicate free-list entries or corrupt subsequent reuse
+const { pion_ptr_alloc, pion_ptr_free } = rt.imports.pion_rt;
+const p1 = pion_ptr_alloc(4096n);
+const p2 = pion_ptr_alloc(4096n);
+pion_ptr_free(p1);
+pion_ptr_free(p1); // double-free of free-listed block
+const q1 = pion_ptr_alloc(4096n);
+const q2 = pion_ptr_alloc(4096n);
+if (q1 !== p1) {
+  console.error("FAIL: expected q1 to reuse p1:", q1, "!==", p1);
+  process.exit(1);
+}
+if (q2 === q1) {
+  console.error("FAIL: double-free duplicated p1 in free-list:", q1, "===", q2);
+  process.exit(1);
+}
+// Also double-free a heap-top LIFO block and confirm clean subsequent alloc
+pion_ptr_free(q2);
+pion_ptr_free(q2);
+const q3 = pion_ptr_alloc(4096n);
+if (q3 !== q2) {
+  console.error("FAIL: expected q3 to reuse LIFO-shrunk q2:", q3, "!==", q2);
+  process.exit(1);
+}
+pion_ptr_free(q3);
+pion_ptr_free(q1);
+pion_ptr_free(p2);
+
+console.log("  large_recycle (wasm32): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=16MiB) double-free=OK");
+' "$LARGE_WASM" "$PION_WASM_RT"
+
 echo "p29c_wasm32 E2E: OK"
