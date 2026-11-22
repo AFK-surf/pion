@@ -165,6 +165,7 @@ export function createPionRuntime(opts = {}) {
       arrRcAll(dp, len, isObj, st, false);
       if (dp) rawFree(dp);
     } else if (tag === TAG_MAP) {
+      if (slabCtl > 0) su32(slabCtl + 48, 0);
       const cap = Number(g64(p + 8)), vObj = g32(p + 16), kInt = g32(p + 20), es = Number(g64(p + 24));
       if (es) {
         for (let i = 0; i < cap; i++) {
@@ -515,7 +516,7 @@ export function createPionRuntime(opts = {}) {
         u8.copyWithin(ne + idx * 32, s, s + 32);
       }
     }
-    if (oe) rawFree(oe); s64(p + 8, nc); s64(p + 24, pBig(ne));
+    if (oe) rawFree(oe); if (slabCtl > 0) su32(slabCtl + 48, 0); s64(p + 8, nc); s64(p + 24, pBig(ne));
   }
   function pion_map_set(m, k, v) {
     const p = pNum(m); sync(); const len = Number(g64(p)); let cap = Number(g64(p + 8));
@@ -559,6 +560,7 @@ export function createPionRuntime(opts = {}) {
   }
   function pion_map_remove(m, k) {
     const p = pNum(m), sl = mapSlot(p, k); if (sl < 0) return; sync();
+    if (slabCtl > 0) su32(slabCtl + 48, 0);
     const cap = Number(g64(p + 8)), vObj = g32(p + 16), kInt = g32(p + 20), es = Number(g64(p + 24)), mask = cap - 1;
     const e0 = es + sl * 32, ok = g64(e0), ov = g64(e0 + 16); u8[e0 + 24] = 0;
     let hole = sl, cur = (sl + 1) & mask;
@@ -572,7 +574,7 @@ export function createPionRuntime(opts = {}) {
     s64(p, Number(g64(p)) - 1); if (!kInt && ok) pion_rc_dec(ok); if (vObj && ov) pion_rc_dec(ov);
   }
   function pion_map_clear(m) {
-    const p = pNum(m); sync(); const cap = Number(g64(p + 8)), vObj = g32(p + 16), kInt = g32(p + 20), es = Number(g64(p + 24));
+    const p = pNum(m); sync(); if (slabCtl > 0) su32(slabCtl + 48, 0); const cap = Number(g64(p + 8)), vObj = g32(p + 16), kInt = g32(p + 20), es = Number(g64(p + 24));
     if (es) for (let i = 0; i < cap; i++) {
       const e = es + i * 32;
       if (u8[e + 24] === 1) {

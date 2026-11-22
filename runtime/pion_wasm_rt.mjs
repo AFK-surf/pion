@@ -373,6 +373,7 @@ export function createPionRuntime(options = {}) {
       arrRcAll(dataPtr, len, elemIsObj, stride, false);
       if (dataPtr) rawFree(dataPtr);
     } else if (tag === TAG_MAP) {
+      if (slabCtl > 0) dv.setUint32(slabCtl + 48, 0, true);
       const cap = Number(dv.getBigInt64(p + 8, true));
       const valIsObj = dv.getInt32(p + 16, true);
       const keyIsInt = dv.getInt32(p + 20, true);
@@ -1327,6 +1328,7 @@ export function createPionRuntime(options = {}) {
       }
     }
     if (oldEntries) rawFree(oldEntries);
+    if (slabCtl > 0) dv.setUint32(slabCtl + 48, 0, true);
     dv.setBigInt64(p + 8, BigInt(newCap), true);
     dv.setBigInt64(p + 24, pBig(newEntries), true);
   }
@@ -1426,6 +1428,7 @@ export function createPionRuntime(options = {}) {
     const slot = mapFindSlot(p, key);
     if (slot < 0) return;
     syncViews();
+    if (slabCtl > 0) dv.setUint32(slabCtl + 48, 0, true);
     const cap = Number(dv.getBigInt64(p + 8, true));
     const valIsObj = dv.getInt32(p + 16, true);
     const keyIsInt = dv.getInt32(p + 20, true);
@@ -1462,6 +1465,7 @@ export function createPionRuntime(options = {}) {
   function pion_map_clear(m) {
     const p = pNum(m);
     syncViews();
+    if (slabCtl > 0) dv.setUint32(slabCtl + 48, 0, true);
     const cap = Number(dv.getBigInt64(p + 8, true));
     const valIsObj = dv.getInt32(p + 16, true);
     const keyIsInt = dv.getInt32(p + 20, true);

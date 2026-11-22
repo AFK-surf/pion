@@ -2491,4 +2491,225 @@ console.log("  p45a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P46-A: map_hint ABA + str_split (0..20B) + str_eq (0..32B) + Zero-Drop Leaf Inline rc_dec (Node + Web leaked=0) ==="
+cat > "$TMP_DIR/p46a_wasm_opt.pion" <<'EOF'
+struct Leaf {
+  x : Int64
+  y : Int64
+}
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn drop_temp_map() -> Int {
+  let tmp : Map[String, Int] = Map([])
+  tmp.set("k1", 10)
+  tmp.set("k2", 20)
+  let v = tmp.get("k1")
+  match v {
+    Some(n) => n
+    None => 0
+  }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. map_hint ABA safety: get->set hit, remove, clear, grow, drop-and-reuse, String + Int keys
+  let sm : Map[String, Int] = Map([])
+  sm.set("alpha", 1)
+  sm.set("beta", 2)
+  must(sm.contains("alpha"), "contains alpha")
+  sm.set("alpha", 11)
+  match sm.get("alpha") {
+    Some(v) => must(v == 11, "hint update after contains")
+    None => must(false, "missing alpha")
+  }
+  sm.set("alpha", 111)
+  match sm.get("alpha") {
+    Some(v) => must(v == 111, "hint update after get")
+    None => must(false, "missing alpha 2")
+  }
+  // Invalidate via remove, then re-set
+  let _ = sm.get("beta")
+  sm.remove("beta")
+  sm.set("beta", 22)
+  match sm.get("beta") {
+    Some(v) => must(v == 22, "after remove")
+    None => must(false, "missing beta")
+  }
+  // Invalidate via grow (>16 entries)
+  let _ = sm.get("alpha")
+  let mut gi = 0
+  while gi < 40 {
+    let k = "key_" + gi.to_string()
+    sm.set(k, gi)
+    gi = gi + 1
+  }
+  sm.set("alpha", 999)
+  match sm.get("alpha") {
+    Some(v) => must(v == 999, "after grow")
+    None => must(false, "missing alpha after grow")
+  }
+  // Invalidate via clear
+  let _ = sm.get("alpha")
+  sm.clear()
+  sm.set("alpha", 7)
+  must(sm.length() == 1, "len after clear+set")
+  match sm.get("alpha") {
+    Some(v) => must(v == 7, "val after clear+set")
+    None => must(false, "missing alpha after clear")
+  }
+  // Invalidate via TAG_MAP drop + new map at recycled address
+  must(drop_temp_map() == 10, "drop_temp_map")
+  let sm2 : Map[String, Int] = Map([])
+  sm2.set("k1", 77)
+  match sm2.get("k1") {
+    Some(v) => must(v == 77, "new map after drop")
+    None => must(false, "missing k1")
+  }
+  // Int-keyed map hint + remove + grow
+  let im : Map[Int, Int] = Map([])
+  let mut ii = 0
+  while ii < 32 {
+    im.set(ii, ii * 2)
+    ii = ii + 1
+  }
+  ii = 0
+  while ii < 32 {
+    match im.get(ii) {
+      Some(v) => im.set(ii, v + 1)
+      None => must(false, "missing int key")
+    }
+    ii = ii + 1
+  }
+  im.remove(5)
+  im.set(5, 555)
+  match im.get(5) {
+    Some(v) => must(v == 555, "int key after remove")
+    None => must(false, "missing int key 5")
+  }
+
+  // 2. str_split covering seg_len = 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 20 + high-freq short token reuse
+  let sample = "|a|bc|def|ghij|klmno|pqrstu|vwxyz12|abcdefgh|123456789|0123456789abcdefghij|"
+  let parts = sample.split("|")
+  must(parts.length() == 12, "split len")
+  must(parts[0] == "", "len 0 head")
+  must(parts[1] == "a", "len 1")
+  must(parts[2] == "bc", "len 2")
+  must(parts[3] == "def", "len 3")
+  must(parts[4] == "ghij", "len 4")
+  must(parts[5] == "klmno", "len 5")
+  must(parts[6] == "pqrstu", "len 6")
+  must(parts[7] == "vwxyz12", "len 7")
+  must(parts[8] == "abcdefgh", "len 8")
+  must(parts[9] == "123456789", "len 9")
+  must(parts[10] == "0123456789abcdefghij", "len 20")
+  must(parts[11] == "", "len 0 tail")
+
+  let mut tok_sum = 0
+  let mut rep = 0
+  while rep < 300 {
+    let ws = "a bb ccc dddd eeeee ffffff ggggggg".split(" ")
+    tok_sum = tok_sum + ws.length()
+    rep = rep + 1
+  }
+  must(tok_sum == 2100, "short token reuse")
+
+  // 3. str_eq covering 0..32 bytes equal and last-byte-diff
+  let full32 = "0123456789abcdefghijklmnopqrstuv"
+  let mut ln = 0
+  while ln <= 32 {
+    let a = full32.slice(0, ln)
+    let b = full32.slice(0, ln)
+    must(a == b, "str_eq equal len=" + ln.to_string())
+    if ln > 0 {
+      let c = full32.slice(0, ln - 1) + "Z"
+      must(a != c, "str_eq last-byte diff len=" + ln.to_string())
+    }
+    ln = ln + 1
+  }
+
+  // 4. Zero-drop_fn leaf struct & short string inline rc_dec free
+  let mut lsum : Int64 = 0L
+  let mut li = 0
+  while li < 2000 {
+    let lf = Leaf::{ x: li.to_int64(), y: (li + 7).to_int64() }
+    lsum = lsum + lf.x + lf.y
+    li = li + 1
+  }
+  must(lsum == 4012000L, "leaf inline rc_dec")
+
+  io_println(world, "p46a_ok:" + tok_sum.to_string() + ":" + lsum.to_string())
+  0
+}
+EOF
+P46A_REL_WASM="$TMP_DIR/p46a_rel.wasm"
+P46A_DEV_WASM="$TMP_DIR/p46a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P46A_REL_WASM" "$TMP_DIR/p46a_wasm_opt.pion"
+"$PIONC" build --target wasm32 -o "$P46A_DEV_WASM" "$TMP_DIR/p46a_wasm_opt.pion"
+for mode_wasm in "release:$P46A_REL_WASM" "dev:$P46A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p46a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p46a_ok:2100:4012000") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p46a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p46a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p46a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

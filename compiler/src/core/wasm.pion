@@ -6277,6 +6277,14 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x41); wasm_push_s32(body, 7)
   body.push(0x46)
   body.push(0x04); body.push(0x40)
+  // P46-A: Invalidate single-slot map_hint (ctl + 48 = 0) on map drop for ABA safety
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x22); wasm_push_u32(body, 9)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x41); wasm_push_s32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 48)
+  body.push(0x0B)
   // es = i32.wrap_i64(i64.load(p + 24)); if (es != 0)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
@@ -6426,8 +6434,129 @@ fn wasm_build_rc_dec_slow_body(
 ///|
 /// Emit Wasm instructions to allocate a `PionString` slice `[start .. start + seg_len]`
 /// from `ps` (local 2), `start` (local 7), `seg_len` (local 13) into `part` (local 18, i64)
-/// using `dst` (local 14, i32).
-fn wasm_emit_str_split_alloc_seg(body : Array[Int], alloc_uninit_idx : Int) -> Unit {
+/// using `dst` (local 14, i32) and scratch locals `19=ctl, 20=base, 21=src` (all i32).
+/// P46-A: For short segments (`seg_len <= 7`, `cls=1`, 48B), inlines Slab freelist/bump
+/// allocation + fixed-width copy (zero `alloc_uninit` / `memory.copy` calls).
+fn wasm_emit_str_split_alloc_seg(body : Array[Int], alloc_uninit_idx : Int, inline_short : Bool) -> Unit {
+  if inline_short {
+  // base = 0
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 20)
+  // if (i32.le_u(seg_len, 7) && (ctl = global.get 2) != 0)
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x41); wasm_push_s32(body, 7)
+  body.push(0x4D) // i32.le_u
+  body.push(0x04); body.push(0x40)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x22); wasm_push_u32(body, 19) // ctl
+  body.push(0x04); body.push(0x40)
+  // Try cls=1 freelist pop at ctl + 4
+  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x22); wasm_push_u32(body, 20) // base
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x05) // else: bump allocate 48B from ctl + 36 if hp + 48 <= heapEnd (ctl + 40)
+  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
+  body.push(0x22); wasm_push_u32(body, 21) // hp
+  body.push(0x41); wasm_push_s32(body, 48)
+  body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 14) // new_hp
+  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 40)
+  body.push(0x4D) // i32.le_u
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x20); wasm_push_u32(body, 14)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
+  body.push(0x20); wasm_push_u32(body, 21)
+  body.push(0x21); wasm_push_u32(body, 20) // base = hp
+  body.push(0x0B)
+  body.push(0x0B) // end freelist vs bump
+  body.push(0x0B) // end if (ctl != 0)
+  body.push(0x0B) // end if (seg_len <= 7)
+
+  // if (base != 0): fast inline cls=1 header + fixed-width copy
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x04); body.push(0x40)
+  // base+0: alloc_sz=48 | (ALLOC_MAGIC<<32)
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x42); wasm_push_s64(body, 0x50494F4E00000030L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  // base+8: owner_tid=1 | (local_rc=1 << 32)
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x42); wasm_push_s64(body, 0x0000000100000001L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  // base+16: shared_rc=0 | ((TAG_STRING(1) | (FLAG_SLAB(0x10)<<16) | (cls=1<<24)) << 32)
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x42); wasm_push_s64(body, 0x0110000100000000L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  // base+24: drop_fn = 0L
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
+  // dst = base + 32; part = i64.extend_i32_u(dst)
+  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x41); wasm_push_s32(body, 32)
+  body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 14) // dst
+  body.push(0xAD)
+  body.push(0x21); wasm_push_u32(body, 18) // part
+  // i64.store(dst, i64.extend_i32_u(seg_len))
+  body.push(0x20); wasm_push_u32(body, 14)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0xAD)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  // src = ps + start + 8
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 21)
+  // Fixed-width overlapping copy for seg_len in 0..7
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x41); wasm_push_s32(body, 4)
+  body.push(0x4F) // i32.ge_u(seg_len, 4)
+  body.push(0x04); body.push(0x40)
+  // 4..7 bytes: two overlapping i32 load/store
+  body.push(0x20); wasm_push_u32(body, 14)
+  body.push(0x20); wasm_push_u32(body, 21); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, 21); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 4); body.push(0x6B)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 0); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x41); wasm_push_s32(body, 2)
+  body.push(0x4F) // i32.ge_u(seg_len, 2)
+  body.push(0x04); body.push(0x40)
+  // 2..3 bytes: i16 + overlapping last i8
+  body.push(0x20); wasm_push_u32(body, 14)
+  body.push(0x20); wasm_push_u32(body, 21); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x3B); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, 21); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 7)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x04); body.push(0x40)
+  // 1 byte
+  body.push(0x20); wasm_push_u32(body, 14)
+  body.push(0x20); wasm_push_u32(body, 21); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  // NUL terminator: i32.store8(dst + 8 + seg_len, 0)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 0)
+  body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x05) // else (seg_len > 7 or ctl == 0 or heap full): slow path
   // part = pion_alloc_uninit(9 + seg_len, TAG_STRING=1, 0L)
   body.push(0x20); wasm_push_u32(body, 13)
   body.push(0x41); wasm_push_s32(body, 9)
@@ -6454,6 +6583,32 @@ fn wasm_emit_str_split_alloc_seg(body : Array[Int], alloc_uninit_idx : Int) -> U
   body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x0B) // end if (base != 0)
+  } else {
+  // Cold call sites: compact call alloc_uninit + memory.copy + NUL
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x41); wasm_push_s32(body, 9)
+  body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x10); wasm_push_u32(body, alloc_uninit_idx)
+  body.push(0x22); wasm_push_u32(body, 18) // part
+  body.push(0xA7)
+  body.push(0x22); wasm_push_u32(body, 14) // dst
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0xAD)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0xFC); wasm_push_u32(body, 10); body.push(0x00); body.push(0x00)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 0)
+  body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  }
 }
 
 ///|
@@ -6470,7 +6625,8 @@ fn wasm_build_str_split_body(
   // 15 i32 locals (2=ps, 3=psep, 4=slen, 5=seplen, 6=i, 7=start, 8=cnt, 9=sb0,
   //                10=arr_p, 11=dp, 12=out_idx, 13=seg_len, 14=dst, 15=j, 16=limit)
   // + 2 i64 locals (17=arr, 18=part)
-  let body : Array[Int] = [0x02, 0x0F, 0x7F, 0x02, 0x7E]
+  // + 3 i32 scratch locals (19=ctl, 20=base, 21=src) for inline short-string Slab alloc
+  let body : Array[Int] = [0x03, 0x0F, 0x7F, 0x02, 0x7E, 0x03, 0x7F]
 
   // ps = i32.wrap_i64(s); psep = i32.wrap_i64(sep)
   body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 2)
@@ -6561,7 +6717,7 @@ fn wasm_build_str_split_body(
   // seg_len = i - start
   body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, true)
   // i64.store(dp + (out_idx << 3), part)
   body.push(0x20); wasm_push_u32(body, 11)
   body.push(0x20); wasm_push_u32(body, 12); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74)
@@ -6582,7 +6738,7 @@ fn wasm_build_str_split_body(
   // Trailing segment [start .. slen]
   body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false)
   body.push(0x20); wasm_push_u32(body, 11)
   body.push(0x20); wasm_push_u32(body, 12); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74)
   body.push(0x6A)
@@ -6652,7 +6808,7 @@ fn wasm_build_str_split_body(
   body.push(0x04); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false)
   body.push(0x20); wasm_push_u32(body, 17); body.push(0x20); wasm_push_u32(body, 18)
   body.push(0x10); wasm_push_u32(body, arr_push_owned_idx)
   // i += seplen; start = i; continue outer loop (depth 2: if-match -> if-sb0 -> loop)
@@ -6672,7 +6828,7 @@ fn wasm_build_str_split_body(
   // Trailing segment [start .. slen]
   body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false)
   body.push(0x20); wasm_push_u32(body, 17); body.push(0x20); wasm_push_u32(body, 18)
   body.push(0x10); wasm_push_u32(body, arr_push_owned_idx)
 
@@ -6682,7 +6838,9 @@ fn wasm_build_str_split_body(
 }
 
 ///|
-/// Pure-Wasm internal `pion_str_eq(a: i64, b: i64) -> i32` (8-byte word compare + tail bytes).
+/// Pure-Wasm internal `pion_str_eq(a: i64, b: i64) -> i32`.
+/// P46-A: 8-byte word compare + single overlapping tail `i64.load` for `len >= 8`,
+/// and zero-loop fixed-width overlapping compare for short strings (`len < 8`).
 fn wasm_build_str_eq_body() -> Array[Int] {
   // 5 i32 locals: 2=pa, 3=pb, 4=la, 5=i, 6=end8
   let body : Array[Int] = [0x01, 0x05, 0x7F]
@@ -6709,11 +6867,53 @@ fn wasm_build_str_eq_body() -> Array[Int] {
   body.push(0x04); body.push(0x40)
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x0F)
   body.push(0x0B)
-  // end8 = la & -8; i = 0
+  // if (i32.lt_u(la, 8)): zero-loop fixed-width short string compare
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, 8); body.push(0x49) // i32.lt_u
+  body.push(0x04); body.push(0x40)
+  // if (la >= 4): compare [0..3] and [la-4..la-1]
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, 4); body.push(0x4F) // i32.ge_u
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x46) // i32.eq
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 4) // pa + la + 4
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 4) // pb + la + 4
+  body.push(0x46) // i32.eq
+  body.push(0x71) // i32.and
+  body.push(0x0F)
+  body.push(0x0B)
+  // if (la >= 2): compare [0..1] and [la-1]
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 7) // pa + la + 7
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 7) // pb + la + 7
+  body.push(0x46)
+  body.push(0x71)
+  body.push(0x0F)
+  body.push(0x0B)
+  // if (la == 1): compare [0]
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x46)
+  body.push(0x0F)
+  body.push(0x0B)
+  // la == 0 -> return 1
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x0F)
+  body.push(0x0B) // end if (la < 8)
+
+  // la >= 8: 8-byte word loop for [0 .. (la & -8))
   body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, -8); body.push(0x71)
   body.push(0x21); wasm_push_u32(body, 6)
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 5)
-  // 8-byte loop
   body.push(0x02); body.push(0x40) // block
   body.push(0x03); body.push(0x40) // loop
   body.push(0x20); wasm_push_u32(body, 5)
@@ -6733,27 +6933,12 @@ fn wasm_build_str_eq_body() -> Array[Int] {
   body.push(0x0C); wasm_push_u32(body, 0)
   body.push(0x0B) // end loop
   body.push(0x0B) // end block
-  // Tail byte loop
-  body.push(0x02); body.push(0x40) // block
-  body.push(0x03); body.push(0x40) // loop
-  body.push(0x20); wasm_push_u32(body, 5)
-  body.push(0x20); wasm_push_u32(body, 4)
-  body.push(0x4F) // i32.ge_u
-  body.push(0x0D); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 5); body.push(0x6A)
-  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8) // i32.load8_u offset=8
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 5); body.push(0x6A)
-  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
-  body.push(0x47) // i32.ne
-  body.push(0x04); body.push(0x40)
-  body.push(0x41); wasm_push_s32(body, 0); body.push(0x0F)
-  body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 5); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 5)
-  body.push(0x0C); wasm_push_u32(body, 0)
-  body.push(0x0B) // end loop
-  body.push(0x0B) // end block
-  body.push(0x41); wasm_push_s32(body, 1)
+  // Single overlapping 8-byte tail compare at [la - 8 .. la - 1] (addr = p + 8 + la - 8 = p + la)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x29); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x29); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x51) // i64.eq
   body.push(0x0B) // end func
   body
 }
@@ -7132,28 +7317,51 @@ fn wasm_build_map_find_body(map_hash_idx : Int, str_eq_idx : Int) -> Array[Int] 
 
 ///|
 /// Pure-Wasm internal `pion_map_has(m: i64, key: i64) -> i32`.
+/// P46-A: Records single-slot ABA-safe `map_hint` at `__pion_slab_ctl + 48..63` on hit.
 fn wasm_build_map_has_body(map_find_idx : Int) -> Array[Int] {
-  let body : Array[Int] = [0x00] // 0 locals
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7)
+  let body : Array[Int] = [0x01, 0x03, 0x7F] // local 2=p, 3=e, 4=ctl
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 2)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x10); wasm_push_u32(body, map_find_idx)
+  body.push(0x22); wasm_push_u32(body, 3)
+  body.push(0x04); body.push(0x40) // if (e != 0)
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 4) // ctl
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 48)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 52)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 56)
+  body.push(0x0B)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x0F)
+  body.push(0x0B)
   body.push(0x41); wasm_push_s32(body, 0)
-  body.push(0x47) // i32.ne
   body.push(0x0B)
   body
 }
 
 ///|
 /// Pure-Wasm internal `pion_map_get(m: i64, key: i64) -> i64` (borrowed return, parity with JS).
+/// P46-A: Records single-slot ABA-safe `map_hint` at `__pion_slab_ctl + 48..63` on hit.
 fn wasm_build_map_get_body(map_find_idx : Int) -> Array[Int] {
-  let body : Array[Int] = [0x01, 0x01, 0x7F] // local 2 = e
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7)
+  let body : Array[Int] = [0x01, 0x03, 0x7F] // local 2=e, 3=p, 4=ctl
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 3)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x10); wasm_push_u32(body, map_find_idx)
   body.push(0x22); wasm_push_u32(body, 2)
   body.push(0x45)
   body.push(0x04); body.push(0x40)
   body.push(0x42); wasm_push_s64(body, 0L); body.push(0x0F)
+  body.push(0x0B)
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 4) // ctl
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 48)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 52)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 56)
   body.push(0x0B)
   body.push(0x20); wasm_push_u32(body, 2)
   body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
@@ -7163,9 +7371,10 @@ fn wasm_build_map_get_body(map_find_idx : Int) -> Array[Int] {
 
 ///|
 /// Pure-Wasm internal `pion_map_try_get(m: i64, key: i64, out_ptr: i64) -> i32`.
+/// P46-A: Records single-slot ABA-safe `map_hint` at `__pion_slab_ctl + 48..63` on hit.
 fn wasm_build_map_try_get_body(map_find_idx : Int) -> Array[Int] {
-  let body : Array[Int] = [0x01, 0x02, 0x7F] // local 3=e, 4=op
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7)
+  let body : Array[Int] = [0x01, 0x04, 0x7F] // local 3=e, 4=op, 5=p, 6=ctl
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 5)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x10); wasm_push_u32(body, map_find_idx)
   body.push(0x21); wasm_push_u32(body, 3)
@@ -7178,6 +7387,16 @@ fn wasm_build_map_try_get_body(map_find_idx : Int) -> Array[Int] {
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   body.push(0x0B)
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x0F)
+  body.push(0x0B)
+  // Record map_hint on hit
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 6) // ctl
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 5)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 48)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 52)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 56)
   body.push(0x0B)
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x04); body.push(0x40)
@@ -7192,7 +7411,8 @@ fn wasm_build_map_try_get_body(map_find_idx : Int) -> Array[Int] {
 
 ///|
 /// Pure-Wasm internal `pion_map_set(m: i64, key: i64, val: i64) -> void` (non-grow fast path).
-/// Falls back to JS `pion_map_set` when `(len + 1) * 10 >= cap * 7 || cap == 0` (triggers mapGrow).
+/// P46-A: Checks ABA-safe single-slot `map_hint` (`ctl + 48..63`) before grow/hash/probe;
+/// falls back to JS `pion_map_set` when `(len + 1) * 10 >= cap * 7 || cap == 0` (triggers mapGrow).
 fn wasm_build_map_set_body(
   slow_imp_idx : Int,
   map_hash_idx : Int,
@@ -7202,8 +7422,67 @@ fn wasm_build_map_set_body(
 ) -> Array[Int] {
   // 7 i32 locals (3=p, 4=val_is_obj, 5=key_is_int, 6=entries, 7=mask, 8=idx, 9=e)
   // 4 i64 locals (10=len, 11=cap, 12=h, 13=old_val)
-  let body : Array[Int] = [0x02, 0x07, 0x7F, 0x04, 0x7E]
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 3) // p
+  // 1 i32 local (14=ctl)
+  let body : Array[Int] = [0x03, 0x07, 0x7F, 0x04, 0x7E, 0x01, 0x7F]
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x21); wasm_push_u32(body, 3) // p
+  // P46-A: ABA-safe single-slot map_hint fast path (BEFORE grow check & hash!)
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 14) // ctl
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 48)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x46) // u32[ctl+48] == p
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 56)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x51) // i64[ctl+56] == key
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 52)
+  body.push(0x22); wasm_push_u32(body, 9) // e
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 24)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x46) // u8[e+24] == 1
+  body.push(0x04); body.push(0x40)
+  // Secondary verify: i64[e] == key || (!key_is_int && str_eq(i64[e], key))
+  body.push(0x20); wasm_push_u32(body, 9); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x51)
+  body.push(0x04); body.push(0x7F) // if (i64[e] == key) -> 1
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 20)
+  body.push(0x45) // !key_is_int
+  body.push(0x04); body.push(0x7F)
+  body.push(0x20); wasm_push_u32(body, 9); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x10); wasm_push_u32(body, str_eq_idx)
+  body.push(0x05)
+  body.push(0x41); wasm_push_s32(body, 0)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x04); body.push(0x40) // if (verified)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x21); wasm_push_u32(body, 4) // val_is_obj
+  body.push(0x20); wasm_push_u32(body, 9); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x21); wasm_push_u32(body, 13) // old_val
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x10); wasm_push_u32(body, rc_inc_idx)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 9); body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x10); wasm_push_u32(body, rc_dec_idx)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0F) // return
+  body.push(0x0B) // end if (verified)
+  body.push(0x0B) // end if (u8[e+24] == 1)
+  body.push(0x0B) // end if (mh_key == key)
+  body.push(0x0B) // end if (mh_map == p)
+  body.push(0x0B) // end if (ctl != 0)
+
+  body.push(0x20); wasm_push_u32(body, 3)
   body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0); body.push(0x21); wasm_push_u32(body, 10) // len
   body.push(0x20); wasm_push_u32(body, 3); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
   body.push(0x22); wasm_push_u32(body, 11) // cap
@@ -8340,13 +8619,65 @@ fn wasm_is_work_op(op : String) -> Bool {
 }
 
 ///|
-/// P45-A: SSA-level nested hot loop outlining (depth == 2 loops inside an outer loop).
+fn wasm_is_int_cmp_op(op : String) -> Bool {
+  op == "csltl" || op == "cslel" || op == "cultl" || op == "culel" ||
+    op == "csltw" || op == "cslew" || op == "cultw" || op == "culew" ||
+    op == "csgtl" || op == "csgel" || op == "cugtl" || op == "cugel" ||
+    op == "csgtw" || op == "csgew" || op == "cugtw" || op == "cugew" ||
+    op == "ceql" || op == "cnel" || op == "ceqw" || op == "cnew"
+}
+
+///|
+fn wasm_is_small_const_le64(s : String) -> Bool {
+  let n = s.length()
+  if n == 0 || n > 2 {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    let ch = str_code_at(s, i)
+    if ch < 48 || ch > 57 {
+      return false
+    }
+    i = i + 1
+  }
+  wasm_parse_int64(s) <= 64L
+}
+
+///|
+fn wasm_block_has_small_const_jnz(blk : WasmBlock) -> Bool {
+  let n = blk.insts.length()
+  if n < 2 {
+    return false
+  }
+  let term = blk.insts[n - 1]
+  if term.op != "jnz" || term.args.length() < 1 {
+    return false
+  }
+  let cond_sym = term.args[0]
+  let mut i = n - 2
+  while i >= 0 {
+    let inst = blk.insts[i]
+    if inst.dst == cond_sym {
+      if wasm_is_int_cmp_op(inst.op) && inst.args.length() == 2 {
+        return wasm_is_small_const_le64(inst.args[0]) || wasm_is_small_const_le64(inst.args[1])
+      }
+      return false
+    }
+    i = i - 1
+  }
+  false
+}
+
+///|
+/// P45-A / P46-A: SSA-level nested hot loop outlining (depth == 2 loops inside an outer loop).
 /// Outlining inner loops into standalone Wasm functions allows default Node/V8 to tier-up
 /// hot loops from Liftoff to TurboFan automatically (zero CLI flags).
 fn wasm_outline_nested_loops(funcs : Array[WasmFunc]) -> Array[WasmFunc] {
-  // Pre-scan: collect functions already directly called inside any loop of any function.
-  // V8 already tiers up those callees at their call boundary, so outlining short inner loops
-  // inside them (e.g. nbody::advance) would only add millions of extra calls.
+  // Pre-scan: collect functions directly called inside any hot/dynamic loop (not small-const <= 64).
+  // V8 already tiers up callees called inside large/dynamic loops (e.g. nbody::advance in while s < 7M),
+  // whereas callees only called inside small-const loops (e.g. spectral_norm::mul_av in while r < 10)
+  // still need nested-loop outlining to trigger TurboFan tier-up.
   let called_in_loop : Map[String, Bool] = Map([])
   let mut pfi = 0
   while pfi < funcs.length() {
@@ -8361,27 +8692,31 @@ fn wasm_outline_nested_loops(funcs : Array[WasmFunc]) -> Array[WasmFunc] {
       }
       let ple = wasm_analyze_structured_cfg(pf, pbidx)
       if ple.length() == pnb {
-        let in_any_loop : Array[Bool] = []
+        let in_hot_loop : Array[Bool] = []
         pbi = 0
         while pbi < pnb {
-          in_any_loop.push(false)
+          in_hot_loop.push(false)
           pbi = pbi + 1
         }
         pbi = 0
         while pbi < pnb {
           if ple[pbi] >= 0 {
-            let mut k = pbi
             let ke = ple[pbi]
-            while k <= ke {
-              in_any_loop[k] = true
-              k = k + 1
+            let small_bound = wasm_block_has_small_const_jnz(pf.blocks[pbi]) ||
+              wasm_block_has_small_const_jnz(pf.blocks[ke])
+            if !small_bound {
+              let mut k = pbi
+              while k <= ke {
+                in_hot_loop[k] = true
+                k = k + 1
+              }
             }
           }
           pbi = pbi + 1
         }
         pbi = 0
         while pbi < pnb {
-          if in_any_loop[pbi] {
+          if in_hot_loop[pbi] {
             let insts = pf.blocks[pbi].insts
             let mut ii = 0
             while ii < insts.length() {
