@@ -89,9 +89,12 @@ extern char **environ;
 #endif
 #endif
 
-#if defined(__clang__) || defined(__GNUC__)
+#if defined(__clang__)
 #define PION_NOINLINE __attribute__((noinline))
 #define PION_COLD __attribute__((cold))
+#elif defined(__GNUC__)
+#define PION_NOINLINE __attribute__((noinline))
+#define PION_COLD
 #else
 #define PION_NOINLINE
 #define PION_COLD
@@ -473,12 +476,6 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_
     if (bytes <= PION_SLAB_MAX_TOTAL) {
         uint32_t cls = pion_slab_cls_for(bytes);
         if (__builtin_expect(!mt, 1)) {
-            uint32_t slot_sz = pion_slab_sizes[cls];
-            char *cur = g_main_slab.chunk_cur;
-            if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= slot_sz, 1)) {
-                g_main_slab.chunk_cur = cur + slot_sz;
-                return (void *)cur;
-            }
             return (void *)pion_slab_alloc_slow(&g_main_slab, cls);
         }
         PionSlabTLS *s = pion_slab_cur_mt();
@@ -500,7 +497,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_
     return p;
 }
 
-static PION_NOINLINE PION_MINSIZE void *pion_slab_raw_alloc(size_t bytes) {
+static PION_NOINLINE PION_HOT void *pion_slab_raw_alloc(size_t bytes) {
 #if PION_USE_SLAB
     if (__builtin_expect(
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
@@ -510,6 +507,12 @@ static PION_NOINLINE PION_MINSIZE void *pion_slab_raw_alloc(size_t bytes) {
         if (__builtin_expect(node != NULL, 1)) {
             g_main_slab.local_free[cls] = pion_slab_get_next(node);
             return node;
+        }
+        uint32_t slot_sz = pion_slab_sizes[cls];
+        char *cur = g_main_slab.chunk_cur;
+        if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur >= slot_sz, 1)) {
+            g_main_slab.chunk_cur = cur + slot_sz;
+            return (void *)cur;
         }
     }
 #endif
@@ -541,7 +544,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_slab_raw_free_slow(void *p
     free(ptr);
 }
 
-static PION_NOINLINE PION_MINSIZE void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
+static PION_NOINLINE PION_HOT void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
     if (!ptr) return;
 #if PION_USE_SLAB
     if (__builtin_expect(
@@ -927,11 +930,27 @@ PION_MINSIZE int32_t pion_str_byte_at(void *s, int64_t idx) {
     return (int32_t)(unsigned char)str->data[idx];
 }
 
-PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts);
+static PION_NOINLINE PION_HOT void pion_copy_small(char *dst, const char *src, size_t n) {
+    pion_copy_short(dst, src, n);
+}
 
-PION_MINSIZE void *pion_str_concat(void *a, void *b) {
-    void *parts[2] = { a, b };
-    return pion_str_concat_n(2, parts);
+PION_HOT void *pion_str_concat(void *a, void *b) {
+    PionString *sa = (PionString *)a;
+    PionString *sb = (PionString *)b;
+    int64_t la = sa ? sa->len : 0;
+    int64_t lb = sb ? sb->len : 0;
+    if (__builtin_expect((uint64_t)la > (uint64_t)PION_MAX_CONTAINER_LEN ||
+                         (uint64_t)lb > (uint64_t)(PION_MAX_CONTAINER_LEN - la), 0)) {
+        pion_die_len();
+    }
+    int64_t total = la + lb;
+    PionString *out = (PionString *)pion_alloc_uninit(
+        (uint32_t)(sizeof(PionString) + (size_t)total + 1), PION_TAG_STRING, NULL);
+    out->len = total;
+    if (la > 0) pion_copy_small(out->data, sa->data, (size_t)la);
+    if (lb > 0) pion_copy_small(out->data + la, sb->data, (size_t)lb);
+    out->data[total] = '\0';
+    return out;
 }
 
 PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
@@ -1020,27 +1039,19 @@ PION_MINSIZE int32_t pion_str_cmp(void *a, void *b) {
     return 0;
 }
 
-PION_MINSIZE void *pion_str_slice(void *s, int64_t start, int64_t end) {
+PION_HOT void *pion_str_slice(void *s, int64_t start, int64_t end) {
     PionString *str = (PionString *)s;
     if (__builtin_expect(!str || start < 0 || end < start || end > str->len, 0)) {
         pion_die("string slice out of bounds");
     }
-    int64_t n = end - start;
-    PionString *out = pion_str_alloc_checked(n);
-    if (n > 0) {
-        memcpy(out->data, str->data + start, (size_t)n);
-    }
-    return out;
+    return pion_str_from_cstr(str->data + start, end - start);
 }
 
-PION_MINSIZE void *pion_int_to_str(int64_t v) {
+PION_HOT void *pion_int_to_str(int64_t v) {
     char tmp[24];
     char *end = tmp + sizeof(tmp);
     char *p = pion_fmt_i64_end(v, end);
-    size_t n = (size_t)(end - p);
-    PionString *str = pion_str_alloc_checked((int64_t)n);
-    memcpy(str->data, p, n);
-    return str;
+    return pion_str_from_cstr(p, (int64_t)(end - p));
 }
 
 PION_MINSIZE void *pion_double_to_str(double v) {
@@ -1191,6 +1202,17 @@ static PION_NOINLINE PION_MINSIZE void *pion_str_split_cold(
     return arr;
 }
 
+static PION_NOINLINE PION_MINSIZE int64_t pion_split_est_cap(const char *base, int64_t sl, int sep_ch) {
+    uint64_t sample_cnt = 0;
+    for (int i = 0; i < 4096; i++) {
+        if ((unsigned char)base[i] == (unsigned char)sep_ch) sample_cnt++;
+    }
+    uint64_t est = ((uint64_t)sl / 4096u) * (sample_cnt + 1u) + 64u;
+    if (est > 16777216u) est = 16777216u;
+    if (est > (uint64_t)sl + 1u) est = (uint64_t)sl + 1u;
+    return (int64_t)est;
+}
+
 /* Splits s by sep into PionArray of PionString*.
  * Empty sep splits into individual bytes (empty string -> empty array). */
 void *pion_str_split(void *s, void *sep) {
@@ -1201,15 +1223,16 @@ void *pion_str_split(void *s, void *sep) {
     if (__builtin_expect(pl != 1 || !ss || sl == 0, 0)) {
         return pion_str_split_cold(ss, sp, sl, pl);
     }
+    int sep_ch = (unsigned char)sp->data[0];
+    const char *base = ss->data;
     int64_t init_cap = 8;
-    if (sl >= 256) {
+    if (sl >= 4096) {
+        init_cap = pion_split_est_cap(base, sl, sep_ch);
+    } else if (sl >= 256) {
         init_cap = sl / 6;
-        if (init_cap > 262144) init_cap = 262144;
     }
     PionArray *arr = (PionArray *)pion_arr_new(init_cap, 1);
     int64_t pos = 0;
-    int sep_ch = (unsigned char)sp->data[0];
-    const char *base = ss->data;
     const char *lim = base + sl;
 #if PION_USE_SLAB
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
@@ -1701,7 +1724,7 @@ static PION_NOINLINE PION_MINSIZE void pion_arr_grow(PionArray *a) {
     a->cap = ncap;
 }
 
-PION_MINSIZE void *pion_arr_new(int64_t cap, int32_t elem_flags) {
+PION_HOT void *pion_arr_new(int64_t cap, int32_t elem_flags) {
     int32_t elem_stride = (elem_flags == 2) ? 1 : ((elem_flags > 2) ? (elem_flags & 0xFF) : 0);
     size_t stride = elem_stride ? (size_t)elem_stride : sizeof(int64_t);
     if (__builtin_expect(cap > PION_MAX_CONTAINER_LEN || (sizeof(size_t) < 8 && cap > 0 && (size_t)cap > SIZE_MAX / stride), 0)) {

@@ -2848,6 +2848,110 @@ static void test_st_frozen_slab_recycle(void) {
            obj_uniq, arr_uniq, med_uniq);
 }
 
+static void test_p57b_hot_str_and_split(void) {
+    /* 1. pion_str_slice: 0B / 1B / 2..16B / >16B */
+    void *base = pion_str_from_cstr("abcdefghijklmnopqrstuvwxyz0123456789", 36);
+    void *s0 = pion_str_slice(base, 5, 5);
+    assert(pion_str_len(s0) == 0 && strcmp(((PionString *)s0)->data, "") == 0);
+    void *s1 = pion_str_slice(base, 3, 4);
+    assert(pion_str_len(s1) == 1 && strcmp(((PionString *)s1)->data, "d") == 0);
+    for (int len = 2; len <= 16; len++) {
+        void *sk = pion_str_slice(base, 2, 2 + len);
+        assert(pion_str_len(sk) == len);
+        assert(memcmp(((PionString *)sk)->data, "cdefghijklmnopqrstuvwxyz", (size_t)len) == 0);
+        assert(((PionString *)sk)->data[len] == '\0');
+        pion_rc_dec(sk);
+    }
+    void *slong = pion_str_slice(base, 0, 26);
+    assert(pion_str_len(slong) == 26 && strcmp(((PionString *)slong)->data, "abcdefghijklmnopqrstuvwxyz") == 0);
+    pion_rc_dec(s0);
+    pion_rc_dec(s1);
+    pion_rc_dec(slong);
+    pion_rc_dec(base);
+
+    /* 2. pion_int_to_str: 0 / single digit / negative / INT64_MIN / INT64_MAX */
+    struct { int64_t v; const char *exp; } icases[] = {
+        { 0, "0" },
+        { 7, "7" },
+        { -9, "-9" },
+        { -123456, "-123456" },
+        { INT64_MIN, "-9223372036854775808" },
+        { INT64_MAX, "9223372036854775807" },
+    };
+    for (size_t i = 0; i < sizeof(icases) / sizeof(icases[0]); i++) {
+        void *si = pion_int_to_str(icases[i].v);
+        assert(strcmp(((PionString *)si)->data, icases[i].exp) == 0);
+        assert(pion_str_len(si) == (int64_t)strlen(icases[i].exp));
+        pion_rc_dec(si);
+    }
+
+    /* 3. pion_str_concat: empty / NULL / short / long */
+    void *emp = pion_str_from_cstr("", 0);
+    void *sh1 = pion_str_from_cstr("foo", 3);
+    void *sh2 = pion_str_from_cstr("bar!", 4);
+    void *lg1 = pion_str_from_cstr("0123456789abcdef0123456789abcdef", 32);
+    void *c_null = pion_str_concat(NULL, NULL);
+    assert(pion_str_len(c_null) == 0 && strcmp(((PionString *)c_null)->data, "") == 0);
+    void *c_emp = pion_str_concat(emp, sh1);
+    assert(strcmp(((PionString *)c_emp)->data, "foo") == 0);
+    void *c_sh = pion_str_concat(sh1, sh2);
+    assert(strcmp(((PionString *)c_sh)->data, "foobar!") == 0);
+    void *c_lg = pion_str_concat(lg1, sh2);
+    assert(pion_str_len(c_lg) == 36 && strcmp(((PionString *)c_lg)->data, "0123456789abcdef0123456789abcdefbar!") == 0);
+    pion_rc_dec(c_null);
+    pion_rc_dec(c_emp);
+    pion_rc_dec(c_sh);
+    pion_rc_dec(c_lg);
+    pion_rc_dec(emp);
+    pion_rc_dec(sh1);
+    pion_rc_dec(sh2);
+    pion_rc_dec(lg1);
+
+    /* 4. pion_str_split: >8KB multi-separator & >8KB zero-separator */
+    size_t big_n = 12000;
+    char *buf = (char *)malloc(big_n);
+    assert(buf != NULL);
+    for (size_t i = 0; i < big_n; i++) {
+        buf[i] = (i % 5 == 4) ? ',' : (char)('a' + (i % 26));
+    }
+    void *big_multi = pion_str_from_cstr(buf, (int64_t)big_n);
+    void *sep_comma = pion_str_from_cstr(",", 1);
+    void *parts_multi = pion_str_split(big_multi, sep_comma);
+    assert(pion_arr_len(parts_multi) == (int64_t)(big_n / 5 + 1));
+    assert(((PionArray *)parts_multi)->cap >= pion_arr_len(parts_multi));
+    pion_rc_dec(parts_multi);
+    pion_rc_dec(big_multi);
+
+    memset(buf, 'z', big_n);
+    void *big_none = pion_str_from_cstr(buf, (int64_t)big_n);
+    void *parts_none = pion_str_split(big_none, sep_comma);
+    assert(pion_arr_len(parts_none) == 1);
+    void *only = (void *)(uintptr_t)pion_arr_get(parts_none, 0);
+    assert(pion_str_len(only) == (int64_t)big_n);
+    pion_rc_dec(parts_none);
+    pion_rc_dec(big_none);
+    pion_rc_dec(sep_comma);
+    free(buf);
+
+    /* 5. pion_arr_new slab bump & recycle */
+    void *arrs[64];
+    for (int i = 0; i < 64; i++) {
+        arrs[i] = pion_arr_new(4, 0);
+        pion_arr_push(arrs[i], (int64_t)i * 3);
+        assert(pion_arr_get(arrs[i], 0) == (int64_t)i * 3);
+    }
+    for (int i = 0; i < 64; i++) {
+        pion_rc_dec(arrs[i]);
+    }
+    for (int i = 0; i < 64; i++) {
+        void *a = pion_arr_new(4, 0);
+        pion_arr_push(a, (int64_t)i + 100);
+        assert(pion_arr_get(a, 0) == (int64_t)i + 100);
+        pion_rc_dec(a);
+    }
+    printf("[PASS] p57b_hot_str_and_split\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -2870,6 +2974,7 @@ int main(int argc, char **argv) {
     test_p22a_systems_io(argc, argv);
     test_ffi_ptr_and_cstr();
     test_str_to_double();
+    test_p57b_hot_str_and_split();
 
     test_st_frozen_slab_recycle();
     test_mt_shared_rc();
