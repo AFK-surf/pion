@@ -1484,11 +1484,375 @@ fn drv_rm_rf(world : World, path : String) -> Unit {
 }
 
 ///|
+struct DrvEnclosingWs {
+  root_dir : String
+  manifest : PackageManifest
+}
+
+///|
 struct DrvGitCtx {
   git_root : String
   old_lock : Array[LockEntry]
   new_lock : Array[LockEntry]
   fetched : Map[String, Bool]
+  ws_root : Option[DrvEnclosingWs]
+}
+
+///|
+fn drv_cwd(world : World) -> String {
+  match proc_exec_capture(world, ["pwd"]) {
+    Ok(p) => {
+      let t = drv_trim_ws(p)
+      if t.length() > 0 { t } else { drv_env_str(world, "PWD") }
+    }
+    Err(_) => drv_env_str(world, "PWD")
+  }
+}
+
+///|
+fn drv_abs_path(world : World, path : String) -> String {
+  if path.length() > 0 && str_code_at(path, 0) == 47 {
+    return drv_normalize_path(path)
+  }
+  let cwd = drv_cwd(world)
+  if cwd.length() > 0 && str_code_at(cwd, 0) == 47 {
+    drv_normalize_path(drv_join_path(cwd, path))
+  } else {
+    drv_normalize_path(path)
+  }
+}
+
+///|
+/// Walks upward from `start_dir` (up to 16 parent levels) to find the nearest
+/// enclosing directory whose `pion.toml` declares `[workspace]`.
+fn drv_find_enclosing_workspace(
+  world : World,
+  start_dir : String,
+) -> Option[DrvEnclosingWs] {
+  let mut cur = drv_abs_path(world, start_dir)
+  let mut depth = 0
+  while depth < 16 {
+    let mf_path = drv_join_path(cur, "pion.toml")
+    if fs_exists(world, mf_path) {
+      match fs_read(world, mf_path) {
+        Ok(txt) =>
+          match parse_pion_toml(txt) {
+            Ok(mf) =>
+              if mf.is_workspace {
+                return Some(DrvEnclosingWs::{ root_dir: cur, manifest: mf })
+              }
+            Err(_) => ()
+          }
+        Err(_) => ()
+      }
+    }
+    if cur == "/" || cur == "." || cur.length() == 0 {
+      break
+    }
+    let parent = drv_parent_dir(cur)
+    if parent == cur || parent.length() == 0 {
+      break
+    }
+    cur = parent
+    depth = depth + 1
+  }
+  None
+}
+
+///|
+fn drv_str_has_star(s : String) -> Bool {
+  let mut i = 0
+  while i < s.length() {
+    if str_code_at(s, i) == 42 {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn drv_split_rel_segs(norm : String) -> Array[String] {
+  let segs : Array[String] = []
+  let n = norm.length()
+  let mut start = 0
+  if n > 0 && str_code_at(norm, 0) == 47 {
+    start = 1
+  }
+  let mut i = start
+  while i <= n {
+    if i == n || str_code_at(norm, i) == 47 {
+      if i > start {
+        let seg = slice_str(norm, start, i)
+        if seg != "." {
+          segs.push(seg)
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  segs
+}
+
+///|
+fn drv_glob_member_dirs(
+  world : World,
+  ws_root : String,
+  cur_rel : String,
+  depth : Int,
+  pat_segs : Array[String],
+  pat : String,
+  seen : Map[String, Bool],
+  out : Array[String],
+) -> Unit {
+  if depth == pat_segs.length() {
+    if manifest_match_member_pattern(pat, cur_rel) {
+      let full = drv_resolve_rel_path(ws_root, cur_rel)
+      if fs_exists(world, drv_join_path(full, "pion.toml")) && !seen.contains(full) {
+        seen.set(full, true)
+        out.push(full)
+      }
+    }
+    return
+  }
+  let dir_to_list = if cur_rel.length() == 0 {
+    ws_root
+  } else {
+    drv_join_path(ws_root, cur_rel)
+  }
+  if !fs_is_dir(world, dir_to_list) {
+    return
+  }
+  let seg_pat = pat_segs[depth]
+  let seg_is_exact = !drv_str_has_star(seg_pat)
+  let entries = fs_list_dir(world, dir_to_list)
+  let mut i = 0
+  while i < entries.length() {
+    let name = entries[i]
+    if name.length() > 0 &&
+      str_code_at(name, 0) != 46 &&
+      name != "_build" &&
+      name != "target" &&
+      name != "out" &&
+      name != "vendor" {
+      if !seg_is_exact || name == seg_pat {
+        let next_rel = if cur_rel.length() == 0 { name } else { cur_rel + "/" + name }
+        let full = drv_join_path(ws_root, next_rel)
+        if fs_is_dir(world, full) {
+          drv_glob_member_dirs(
+            world,
+            ws_root,
+            next_rel,
+            depth + 1,
+            pat_segs,
+            pat,
+            seen,
+            out,
+          )
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// Expands `[workspace] members` patterns (exact paths and single-segment globs
+/// such as `packages/*`) under `ws_root_dir`, sorted lexicographically and
+/// deduplicated. Hybrid roots (both `[package]` and `[workspace]`) include
+/// `ws_root_dir` itself.
+fn drv_expand_workspace_members(
+  world : World,
+  ws_root_dir : String,
+  ws_mf : PackageManifest,
+) -> Result[Array[String], String] {
+  let norm_root = drv_normalize_path(ws_root_dir)
+  let seen : Map[String, Bool] = Map([])
+  let out : Array[String] = []
+  if ws_mf.name.length() > 0 {
+    seen.set(norm_root, true)
+    out.push(norm_root)
+  }
+  let mut i = 0
+  while i < ws_mf.workspace_members.length() {
+    let pat = ws_mf.workspace_members[i]
+    let norm_pat = drv_normalize_path(pat)
+    if drv_str_has_star(norm_pat) {
+      let pat_segs = drv_split_rel_segs(norm_pat)
+      drv_glob_member_dirs(world, norm_root, "", 0, pat_segs, norm_pat, seen, out)
+    } else {
+      let cand = drv_resolve_rel_path(norm_root, norm_pat)
+      if !fs_exists(world, drv_join_path(cand, "pion.toml")) {
+        return Err(
+          "workspace member `" + pat + "` has no pion.toml at " + cand,
+        )
+      }
+      if !seen.contains(cand) {
+        seen.set(cand, true)
+        out.push(cand)
+      }
+    }
+    i = i + 1
+  }
+  drv_sort_strings(out)
+  Ok(out)
+}
+
+///|
+fn drv_pkg_dir_has_main(world : World, pkg_dir : String, pkg_name : String) -> Bool {
+  match drv_load_pkg_dir_sources(world, pkg_dir) {
+    Err(_) => false
+    Ok(loaded) => {
+      let pkg = parse_package(pkg_name, loaded.paths, loaded.sources)
+      let mut fi = 0
+      while fi < pkg.files.length() {
+        let f = pkg.files[fi]
+        let mut di = 0
+        while di < f.decls.length() {
+          match f.decls[di] {
+            DFn(fd) =>
+              if fd.name == "main" {
+                return true
+              }
+            _ => ()
+          }
+          di = di + 1
+        }
+        fi = fi + 1
+      }
+      false
+    }
+  }
+}
+
+///|
+fn drv_join_comma(items : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < items.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(items[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Resolves `root_dir` + optional `--package <name>` into a single concrete
+/// package directory for `pionc build` / `pionc run`.
+fn drv_resolve_build_pkg_dir(
+  world : World,
+  root_dir : String,
+  only_pkg : String,
+) -> Result[String, String] {
+  let mf_path = drv_join_path(drv_normalize_path(root_dir), "pion.toml")
+  let mf_txt = match fs_read(world, mf_path) {
+    Err(e) => return Err("failed to read " + mf_path + ": " + e)
+    Ok(t) => t
+  }
+  let mf = match parse_pion_toml(mf_txt) {
+    Err(e) => return Err(e)
+    Ok(m) => m
+  }
+  if only_pkg.length() > 0 {
+    if mf.is_workspace {
+      let ws_abs = drv_abs_path(world, root_dir)
+      let members = match drv_expand_workspace_members(world, ws_abs, mf) {
+        Err(e) => return Err(e)
+        Ok(ms) => ms
+      }
+      let avail : Array[String] = []
+      let mut i = 0
+      while i < members.length() {
+        let mdir = members[i]
+        match fs_read(world, drv_join_path(mdir, "pion.toml")) {
+          Ok(mt) =>
+            match parse_pion_toml(mt) {
+              Ok(mmf) => {
+                if mmf.name == only_pkg {
+                  return Ok(mdir)
+                }
+                if mmf.name.length() > 0 {
+                  avail.push(mmf.name)
+                }
+              }
+              Err(_) => ()
+            }
+          Err(_) => ()
+        }
+        i = i + 1
+      }
+      return Err(
+        "no workspace member named `" +
+        only_pkg +
+        "` in " +
+        root_dir +
+        " (available: " +
+        drv_join_comma(avail) +
+        ")",
+      )
+    }
+    if mf.name == only_pkg {
+      return Ok(root_dir)
+    }
+    match drv_find_enclosing_workspace(world, root_dir) {
+      Some(ws) =>
+        return drv_resolve_build_pkg_dir(world, ws.root_dir, only_pkg)
+      None =>
+        return Err("no package `" + only_pkg + "` in " + root_dir)
+    }
+  }
+  if !mf.is_workspace || mf.name.length() > 0 {
+    return Ok(root_dir)
+  }
+  // Pure virtual workspace root without --package: pick the unique member with `fn main`.
+  let ws_abs = drv_abs_path(world, root_dir)
+  let members = match drv_expand_workspace_members(world, ws_abs, mf) {
+    Err(e) => return Err(e)
+    Ok(ms) => ms
+  }
+  let main_dirs : Array[String] = []
+  let main_names : Array[String] = []
+  let all_names : Array[String] = []
+  let mut i = 0
+  while i < members.length() {
+    let mdir = members[i]
+    match fs_read(world, drv_join_path(mdir, "pion.toml")) {
+      Ok(mt) =>
+        match parse_pion_toml(mt) {
+          Ok(mmf) => {
+            if mmf.name.length() > 0 {
+              all_names.push(mmf.name)
+              if drv_pkg_dir_has_main(world, mdir, mmf.name) {
+                main_dirs.push(mdir)
+                main_names.push(mmf.name)
+              }
+            }
+          }
+          Err(_) => ()
+        }
+      Err(_) => ()
+    }
+    i = i + 1
+  }
+  if main_dirs.length() == 1 {
+    return Ok(main_dirs[0])
+  }
+  if main_dirs.length() > 1 {
+    return Err(
+      "virtual workspace has multiple binary members (" +
+      drv_join_comma(main_names) +
+      "); specify one with --package <name>",
+    )
+  }
+  Err(
+    "virtual workspace has no member with `fn main`; specify a member with --package <name> (members: " +
+    drv_join_comma(all_names) +
+    ")",
+  )
 }
 
 ///|
@@ -1722,7 +2086,30 @@ fn drv_load_workspace_dfs(
   let dep_names : Array[String] = []
   let mut i = 0
   while i < mf.deps.length() {
-    let dep = mf.deps[i]
+    let raw_dep = mf.deps[i]
+    let dep = if raw_dep.workspace {
+      match ctx.ws_root {
+        Some(ws) =>
+          match manifest_resolve_ws_dep(
+            raw_dep,
+            ws.root_dir,
+            norm_dir,
+            ws.manifest.workspace_deps,
+          ) {
+            Ok(d) => d
+            Err(e) => return Err(e)
+          }
+        None =>
+          return Err(
+            "dependency '" +
+            raw_dep.name +
+            "' marked workspace = true but no enclosing [workspace] pion.toml found for " +
+            norm_dir,
+          )
+      }
+    } else {
+      raw_dep
+    }
     dep_names.push(dep.name)
     let dep_dir = if manifest_dep_is_git(dep) {
       match drv_git_dep_dir(world, ctx, dep) {
@@ -1786,7 +2173,31 @@ fn drv_load_workspace_ex(
   unlock_all : Bool,
   unlock_name : String,
 ) -> Result[DrvWsLoad, String] {
-  let lock_path = drv_join_path(drv_normalize_path(root_dir), "pion.lock")
+  let root_mf_path = drv_join_path(drv_normalize_path(root_dir), "pion.toml")
+  if !fs_exists(world, root_mf_path) {
+    return Err("missing pion.toml in " + drv_normalize_path(root_dir))
+  }
+  let root_mf_txt = match fs_read(world, root_mf_path) {
+    Err(e) => return Err("failed to read " + root_mf_path + ": " + e)
+    Ok(t) => t
+  }
+  let root_mf = match parse_pion_toml(root_mf_txt) {
+    Err(e) => return Err(e)
+    Ok(m) => m
+  }
+  let enclosing_ws = if root_mf.is_workspace {
+    Some(DrvEnclosingWs::{
+      root_dir: drv_abs_path(world, root_dir),
+      manifest: root_mf,
+    })
+  } else {
+    drv_find_enclosing_workspace(world, root_dir)
+  }
+  let lock_base = match enclosing_ws {
+    Some(ws) => ws.root_dir
+    None => drv_normalize_path(root_dir)
+  }
+  let lock_path = drv_join_path(lock_base, "pion.lock")
   let has_lock = fs_exists(world, lock_path)
   let old_text = if has_lock {
     match fs_read(world, lock_path) {
@@ -1819,15 +2230,77 @@ fn drv_load_workspace_ex(
     old_lock: old_lock,
     new_lock: [],
     fetched: Map([]),
+    ws_root: enclosing_ws,
   }
   let visited : Map[String, Bool] = Map([])
   let out : Array[PkgNodeInput] = []
-  match drv_load_workspace_dfs(world, ctx, root_dir, visited, out) {
-    Err(e) => return Err(e)
-    Ok(_) => ()
+  if root_mf.is_workspace {
+    let ws_abs = drv_abs_path(world, root_dir)
+    let members = match drv_expand_workspace_members(world, ws_abs, root_mf) {
+      Err(e) => return Err(e)
+      Ok(ms) => ms
+    }
+    let mut mi = 0
+    while mi < members.length() {
+      match drv_load_workspace_dfs(world, ctx, members[mi], visited, out) {
+        Err(e) => return Err(e)
+        Ok(_) => ()
+      }
+      mi = mi + 1
+    }
+    let mut wi = 0
+    while wi < root_mf.workspace_deps.length() {
+      let wdep = root_mf.workspace_deps[wi]
+      if manifest_dep_is_git(wdep) {
+        match drv_git_dep_dir(world, ctx, wdep) {
+          Err(e) => return Err(e)
+          Ok(_) => ()
+        }
+      }
+      wi = wi + 1
+    }
+  } else {
+    let start_dir = match enclosing_ws {
+      Some(_) => drv_abs_path(world, root_dir)
+      None => root_dir
+    }
+    match drv_load_workspace_dfs(world, ctx, start_dir, visited, out) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
   }
-  if has_lock || ctx.new_lock.length() > 0 {
-    let new_text = format_pion_lock(ctx.new_lock)
+  let final_lock : Array[LockEntry] = []
+  let mut nl_i = 0
+  while nl_i < ctx.new_lock.length() {
+    final_lock.push(ctx.new_lock[nl_i])
+    nl_i = nl_i + 1
+  }
+  let partial_member_load = !root_mf.is_workspace &&
+    (match enclosing_ws {
+      Some(_) => true
+      None => false
+    })
+  if partial_member_load {
+    let mut ol_i = 0
+    while ol_i < ctx.old_lock.length() {
+      let oe = ctx.old_lock[ol_i]
+      let mut present = false
+      let mut fl_i = 0
+      while fl_i < final_lock.length() {
+        if final_lock[fl_i].name == oe.name {
+          present = true
+          break
+        }
+        fl_i = fl_i + 1
+      }
+      if !present {
+        final_lock.push(oe)
+      }
+      ol_i = ol_i + 1
+    }
+  }
+  if has_lock || final_lock.length() > 0 {
+    let new_text = format_pion_lock(final_lock)
     if new_text != old_text {
       if !drv_write_text_atomic(world, lock_path, new_text) {
         return Err("failed to write " + lock_path)
@@ -1836,7 +2309,7 @@ fn drv_load_workspace_ex(
   }
   Ok(DrvWsLoad::{
     nodes: out,
-    lock: ctx.new_lock,
+    lock: final_lock,
     lock_path: lock_path,
     git_root: ctx.git_root,
   })
@@ -5878,6 +6351,7 @@ fn drv_run_fmt_cmd(
   as_json : Bool,
 ) -> Int {
   let files : Array[String] = []
+  let seen_files : Map[String, Bool] = Map([])
   let mut t = 0
   while t < targets.length() {
     let target = targets[t]
@@ -5885,10 +6359,68 @@ fn drv_run_fmt_cmd(
       io_eprintln(world, "error: path does not exist: " + target)
       return 1
     }
-    if fs_is_dir(world, target) {
-      drv_collect_fmt_files_dir(world, target, files)
-    } else {
-      files.push(target)
+    let mut expanded_ws = false
+    match drv_detect_manifest_dir(world, target) {
+      Some(root_dir) =>
+        match fs_read(world, drv_join_path(root_dir, "pion.toml")) {
+          Ok(txt) =>
+            match parse_pion_toml(txt) {
+              Ok(mf) =>
+                if mf.is_workspace {
+                  expanded_ws = true
+                  let members = match drv_expand_workspace_members(
+                    world,
+                    drv_abs_path(world, root_dir),
+                    mf,
+                  ) {
+                    Err(e) => {
+                      io_eprintln(world, "error: " + e)
+                      return 1
+                    }
+                    Ok(ms) => ms
+                  }
+                  let mut mi = 0
+                  while mi < members.length() {
+                    let mfiles : Array[String] = []
+                    drv_collect_fmt_files_dir(world, members[mi], mfiles)
+                    let mut fi = 0
+                    while fi < mfiles.length() {
+                      let nf = drv_normalize_path(mfiles[fi])
+                      if !seen_files.contains(nf) {
+                        seen_files.set(nf, true)
+                        files.push(mfiles[fi])
+                      }
+                      fi = fi + 1
+                    }
+                    mi = mi + 1
+                  }
+                }
+              Err(_) => ()
+            }
+          Err(_) => ()
+        }
+      None => ()
+    }
+    if !expanded_ws {
+      if fs_is_dir(world, target) {
+        let dfiles : Array[String] = []
+        drv_collect_fmt_files_dir(world, target, dfiles)
+        let mut fi = 0
+        while fi < dfiles.length() {
+          let nf = drv_normalize_path(dfiles[fi])
+          if !seen_files.contains(nf) {
+            seen_files.set(nf, true)
+            files.push(dfiles[fi])
+          }
+          fi = fi + 1
+        }
+      } else {
+        let nf = drv_normalize_path(target)
+        if !seen_files.contains(nf) {
+          seen_files.set(nf, true)
+          files.push(target)
+        }
+      }
     }
     t = t + 1
   }
@@ -6581,17 +7113,61 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
     Err(e) => return drv_cmd_fail(world, as_json, e)
     Ok(m) => m
   }
+  let enclosing_ws = if mf.is_workspace {
+    Some(DrvEnclosingWs::{
+      root_dir: drv_abs_path(world, root_dir),
+      manifest: mf,
+    })
+  } else {
+    drv_find_enclosing_workspace(world, root_dir)
+  }
   if pkg.length() > 0 {
     let mut known = false
     let mut di = 0
     while di < mf.deps.length() {
       if mf.deps[di].name == pkg {
         known = true
-        if !manifest_dep_is_git(mf.deps[di]) {
+        let resolved_d = if mf.deps[di].workspace {
+          match enclosing_ws {
+            Some(ws) =>
+              match manifest_resolve_ws_dep(
+                mf.deps[di],
+                ws.root_dir,
+                drv_abs_path(world, root_dir),
+                ws.manifest.workspace_deps,
+              ) {
+                Ok(rd) => rd
+                Err(e) => return drv_cmd_fail(world, as_json, e)
+              }
+            None =>
+              return drv_cmd_fail(
+                world,
+                as_json,
+                "dependency '" +
+                pkg +
+                "' marked workspace = true but no enclosing [workspace] pion.toml found",
+              )
+          }
+        } else {
+          mf.deps[di]
+        }
+        if !manifest_dep_is_git(resolved_d) {
           return drv_cmd_fail(world, as_json, "`" + pkg + "` is a path dependency; nothing to update")
         }
       }
       di = di + 1
+    }
+    if !known && mf.is_workspace {
+      let mut wi = 0
+      while wi < mf.workspace_deps.length() {
+        if mf.workspace_deps[wi].name == pkg {
+          known = true
+          if !manifest_dep_is_git(mf.workspace_deps[wi]) {
+            return drv_cmd_fail(world, as_json, "`" + pkg + "` is a path dependency; nothing to update")
+          }
+        }
+        wi = wi + 1
+      }
     }
     if !known {
       return drv_cmd_fail(world, as_json, "no dependency `" + pkg + "` in " + mf_path)
@@ -6610,7 +7186,11 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
     }
     di = di + 1
   }
-  let lock_path = drv_join_path(drv_normalize_path(root_dir), "pion.lock")
+  let lock_base = match enclosing_ws {
+    Some(ws) => ws.root_dir
+    None => drv_normalize_path(root_dir)
+  }
+  let lock_path = drv_join_path(lock_base, "pion.lock")
   let lock_existed = fs_exists(world, lock_path)
   let lock_text = if lock_existed {
     match fs_read(world, lock_path) {
@@ -7735,12 +8315,12 @@ fn drv_run_remove_cmd(world : World, args : Array[String]) -> Int {
 fn drv_usage_text() -> String {
   "usage:\n" +
   "  pionc check [--fix] [--json] [input1 ...]\n" +
-  "  pionc query defs|sig|callers|deps [--json] <input1> [input2 ...]\n" +
+  "  pionc query defs|sig|callers|deps [--json] [input1 ...]\n" +
   "  pionc emit-sig <input1> [input2 ...]\n" +
-  "  pionc build [--release] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--sysroot <dir>] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
-  "  pionc run [--release] [--target <target>] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
+  "  pionc build [--package <name>|-p <name>] [--release] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--sysroot <dir>] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
+  "  pionc run [--package <name>|-p <name>] [--release] [--target <target>] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
-  "  pionc test [--json] [--package <name>] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
+  "  pionc test [--json] [--package <name>|-p <name>] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
   "  pionc doc [--json] [input1 ...]\n" +
   "  pionc init [--template cli|service|invar-app] [--json] <dir>\n" +
   "  pionc fetch [--json] [dir]\n" +
@@ -7918,7 +8498,7 @@ pub fn main(world : World) -> Int {
       }
     }
   } else if cmd == "query" {
-    if args.length() < 4 {
+    if args.length() < 3 {
       drv_usage(world)
       return 1
     }
@@ -7932,8 +8512,15 @@ pub fn main(world : World) -> Int {
       i = i + 1
     }
     if targets.length() == 0 {
-      drv_usage(world)
-      return 1
+      if drv_has_default_project(world) {
+        targets.push(".")
+      } else {
+        io_eprintln(
+          world,
+          "error: no target specified and no pion.toml in current directory",
+        )
+        return 1
+      }
     }
     if kind != "deps" && targets.length() == 1 {
       match drv_detect_manifest_dir(world, targets[0]) {
@@ -8088,6 +8675,7 @@ pub fn main(world : World) -> Int {
     let mut emit_staticlib = ""
     let mut emit_cdylib = ""
     let mut sysroot = ""
+    let mut only_pkg = ""
     let libs : Array[String] = []
     let targets : Array[String] = []
     let mut i = 2
@@ -8100,6 +8688,11 @@ pub fn main(world : World) -> Int {
       }
       if a == "--release" {
         release = true
+      } else if (a == "--package" || a == "-p") && i + 1 < args.length() {
+        only_pkg = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--package=") {
+        only_pkg = slice_str(a, 10, a.length())
       } else if a == "--target" && i + 1 < args.length() {
         target_override = args[i + 1]
         i = i + 1
@@ -8143,6 +8736,26 @@ pub fn main(world : World) -> Int {
         return 1
       }
     }
+    if targets.length() == 1 {
+      match drv_detect_manifest_dir(world, targets[0]) {
+        Some(root_dir) =>
+          match drv_resolve_build_pkg_dir(world, root_dir, only_pkg) {
+            Err(msg) => {
+              io_eprintln(world, "error: " + msg)
+              return 1
+            }
+            Ok(pkg_dir) => targets[0] = pkg_dir
+          }
+        None =>
+          if only_pkg.length() > 0 {
+            io_eprintln(world, "error: --package needs a pion.toml workspace")
+            return 1
+          }
+      }
+    } else if only_pkg.length() > 0 {
+      io_eprintln(world, "error: --package needs a single pion.toml workspace")
+      return 1
+    }
     if target_override != "" && !drv_target_is_valid(target_override) {
       io_eprintln(
         world,
@@ -8176,6 +8789,7 @@ pub fn main(world : World) -> Int {
   } else if cmd == "run" {
     let mut release = false
     let mut target_override = ""
+    let mut only_pkg = ""
     let mut target = ""
     let libs : Array[String] = []
     let prog_args : Array[String] = []
@@ -8196,6 +8810,13 @@ pub fn main(world : World) -> Int {
         after_sep = true
       } else if a == "--release" && target == "" {
         release = true
+      } else if (a == "--package" || a == "-p") &&
+        target == "" &&
+        i + 1 < args.length() {
+        only_pkg = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--package=") && target == "" {
+        only_pkg = slice_str(a, 10, a.length())
       } else if a == "--target" && target == "" && i + 1 < args.length() {
         target_override = args[i + 1]
         i = i + 1
@@ -8216,6 +8837,21 @@ pub fn main(world : World) -> Int {
         )
         return 1
       }
+    }
+    match drv_detect_manifest_dir(world, target) {
+      Some(root_dir) =>
+        match drv_resolve_build_pkg_dir(world, root_dir, only_pkg) {
+          Err(msg) => {
+            io_eprintln(world, "error: " + msg)
+            return 1
+          }
+          Ok(pkg_dir) => target = pkg_dir
+        }
+      None =>
+        if only_pkg.length() > 0 {
+          io_eprintln(world, "error: --package needs a pion.toml workspace")
+          return 1
+        }
     }
     if target_override != "" && !drv_target_is_valid(target_override) {
       io_eprintln(
@@ -8313,9 +8949,11 @@ pub fn main(world : World) -> Int {
       } else if a == "--filter" && i + 1 < args.length() {
         filter = args[i + 1]
         i = i + 1
-      } else if a == "--package" && i + 1 < args.length() {
+      } else if (a == "--package" || a == "-p") && i + 1 < args.length() {
         only_pkg = args[i + 1]
         i = i + 1
+      } else if drv_starts_with(a, "--package=") {
+        only_pkg = slice_str(a, 10, a.length())
       } else if a == "--jobs" && i + 1 < args.length() {
         jobs = drv_parse_pos_int(args[i + 1], jobs)
         i = i + 1

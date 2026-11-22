@@ -89,15 +89,25 @@ test "pair_swap works" {
 }
 ```
 
-Multi-package projects use `pion.toml` with package-level `.pionsig` incremental isolation and visibility enforcement (`pub` vs `E_PRIVATE_SYMBOL`):
+Multi-package projects use `pion.toml` with package-level `.pionsig` incremental isolation and visibility enforcement (`pub` vs `E_PRIVATE_SYMBOL`), and monorepos can centralize members and shared dependencies in a root `[workspace]` `pion.toml` (virtual or hybrid) with a shared `pion.lock`:
 
 ```toml
+# Root pion.toml (virtual workspace)
+[workspace]
+members = ["packages/*", "cmd/*"]
+
+[workspace.dependencies]
+core = { path = "packages/core" }
+invar = { git = "https://github.com/AFK-surf/invar.git", branch = "main" }
+
+# Sub-package cmd/app/pion.toml
 [package]
-name = "text_stats"
+name = "app"
 version = "0.1.0"
 
 [dependencies]
-analyzer = { path = "./deps/analyzer" }
+core = { workspace = true }
+invar = { workspace = true }
 ```
 
 See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package project.
@@ -109,12 +119,12 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 | Command | Purpose |
 |---|---|
 | `pionc check [--fix] [--json] [path...]` | Type, exhaustiveness, must-use `Result`, `Send`, `World` and visibility checks; JSON diagnostics with fix-its and machine-applicable `edits` (`--fix` applies edits in up to 3 rounds and re-checks; defaults to `.` when `pion.toml` or `src/` exists) |
-| `pionc query defs\|sig\|callers\|deps [--json] <path...>` | Symbol definitions, exported `.pionsig` interface, call graph, package dependency graph; a path may be a file, a package directory or a whole workspace |
+| `pionc query defs\|sig\|callers\|deps [--json] [path...]` | Symbol definitions, exported `.pionsig` interface, call graph, package dependency graph; a path may be a file, a package directory or a whole workspace (defaults to `.`) |
 | `pionc doc [--json] [path...]` | Public API of each package (dependencies first; defaults to `.`) |
 | `pionc emit-sig <path...>` | Print the `.pionsig` export table |
-| `pionc build [--release] [--target <t>] [--sysroot <dir>] [--emit-obj <f>] [--emit-staticlib <f.a>] [--emit-cdylib <f.so\|.dylib\|.dll>] [--emit-ssa <f>] [--emit-asm <f>] [--jobs <n>] [-l <lib>] [-o <bin>] [path...]` | Native binary, `.o`, C staticlib (`.a`), C cdylib (`.dylib`/`.so`/`.dll`), or zero-toolchain `.wasm` binary via the global CAS across `arm64_apple`, `amd64_apple`, `amd64_sysv`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`, and `wasm32` (`--release` strips `debug_assert`; defaults to `.`) |
-| `pionc run [--release] [--target <t>] [-l <lib>] [path] [-- args...]` | Build and execute a package or `.pion` file (`--target wasm32` runs via `node pion_wasm_rt.mjs`; defaults to `.`) |
-| `pionc test [--json] [--package <name>] [--filter <name>] [--jobs <n>] [-l <lib>] [path]` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert`; a workspace directory runs every local package's tests in one pass and one report, with test binaries cached in the CAS (`testbin/`) and built and run in parallel (`--jobs`, `$PION_JOBS`; defaults to `.`) |
+| `pionc build [--package\|-p <name>] [--release] [--target <t>] [--sysroot <dir>] [--emit-obj <f>] [--emit-staticlib <f.a>] [--emit-cdylib <f.so\|.dylib\|.dll>] [--emit-ssa <f>] [--emit-asm <f>] [--jobs <n>] [-l <lib>] [-o <bin>] [path...]` | Native binary, `.o`, C staticlib (`.a`), C cdylib (`.dylib`/`.so`/`.dll`), or zero-toolchain `.wasm` binary via the global CAS across `arm64_apple`, `amd64_apple`, `amd64_sysv`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`, and `wasm32` (`--release` strips `debug_assert`; `--package`/`-p` selects a `[workspace]` member; defaults to `.`) |
+| `pionc run [--package\|-p <name>] [--release] [--target <t>] [-l <lib>] [path] [-- args...]` | Build and execute a package, workspace member (`--package`/`-p`, or auto-selected unique `main` member), or `.pion` file (`--target wasm32` runs via `node pion_wasm_rt.mjs`; defaults to `.`) |
+| `pionc test [--json] [--package\|-p <name>] [--filter <name>] [--jobs <n>] [-l <lib>] [path]` | Run `test "name" { ... }` blocks in isolated child processes with active `debug_assert`; a workspace directory runs every local package's tests in one pass and one report, with test binaries cached in the CAS (`testbin/`) and built and run in parallel (`--jobs`, `$PION_JOBS`; defaults to `.`) |
 | `pionc fmt [--check] [--json] [path...]` | Deterministic, idempotent, comment- and UTF-8-preserving formatter (defaults to `.`) |
 | `pionc init [--template cli\|service\|invar-app] [--json] <dir>` | Scaffold a package from a template (`cli` default, `service` background worker, or `invar-app` `#render_thread`-guarded dual-thread GUI skeleton); the result passes `check`, `test`, `run` and `fmt --check` as is |
 | `pionc fetch [--json] [dir]` | Resolve `git` dependencies into the global git cache and write/verify `pion.lock` |

@@ -470,6 +470,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p31a_ergonomics/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p31c_jsx_dot/run_e2e.sh" "$PIONC"
 # P32-A: relocatable zero-env toolchain, default ".", --help/--version, check --fix, doctor, cache/clean, remove, package-release.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32a_toolchain/run_e2e.sh" "$PIONC"
+# P32-B: multi-package virtual [workspace], [workspace.dependencies], { workspace = true }, shared pion.lock, CLI --package/-p.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32b_workspace/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"
