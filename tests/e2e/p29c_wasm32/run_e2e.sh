@@ -2015,4 +2015,164 @@ console.log("  flat_rc_arr (" + mode + "/" + rtLabel + "): out=" + out + " mem="
 done
 done
 
+echo "[21/21] P42-C Wasm32 memarg.offset + jnz NaN/int cmp + const div/rem strength reduction (release+dev x Node+Web)"
+cat > "$TMP_DIR/p42c_wasm_opts.pion" <<'EOF'
+struct Box4 {
+  mut a : Int
+  mut b : Int64
+  mut c : Double
+  mut d : Int
+}
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn ref_div32(x : Int, d : Int) -> Int {
+  let dd = d
+  x / dd
+}
+
+fn ref_rem32(x : Int, d : Int) -> Int {
+  let dd = d
+  x % dd
+}
+
+fn ref_div64(x : Int64, d : Int64) -> Int64 {
+  let dd = d
+  x / dd
+}
+
+fn ref_rem64(x : Int64, d : Int64) -> Int64 {
+  let dd = d
+  x % dd
+}
+
+fn check_i32_divrem(x : Int) -> Unit {
+  must(x / 2 == ref_div32(x, 2) && x % 2 == ref_rem32(x, 2), "i32 /2")
+  must(x / 3 == ref_div32(x, 3) && x % 3 == ref_rem32(x, 3), "i32 /3")
+  must(x / 4 == ref_div32(x, 4) && x % 4 == ref_rem32(x, 4), "i32 /4")
+  must(x / 5 == ref_div32(x, 5) && x % 5 == ref_rem32(x, 5), "i32 /5")
+  must(x / 7 == ref_div32(x, 7) && x % 7 == ref_rem32(x, 7), "i32 /7")
+  must(x / 8 == ref_div32(x, 8) && x % 8 == ref_rem32(x, 8), "i32 /8")
+  must(x / 10 == ref_div32(x, 10) && x % 10 == ref_rem32(x, 10), "i32 /10")
+  must(x / 1000 == ref_div32(x, 1000) && x % 1000 == ref_rem32(x, 1000), "i32 /1000")
+  must(x / 100003 == ref_div32(x, 100003) && x % 100003 == ref_rem32(x, 100003), "i32 /100003")
+  must(x / 1000003 == ref_div32(x, 1000003) && x % 1000003 == ref_rem32(x, 1000003), "i32 /1000003")
+}
+
+fn check_i64_divrem(x : Int64) -> Unit {
+  must(x / 2L == ref_div64(x, 2L) && x % 2L == ref_rem64(x, 2L), "i64 /2")
+  must(x / 4L == ref_div64(x, 4L) && x % 4L == ref_rem64(x, 4L), "i64 /4")
+  must(x / 8L == ref_div64(x, 8L) && x % 8L == ref_rem64(x, 8L), "i64 /8")
+  must(x / 1024L == ref_div64(x, 1024L) && x % 1024L == ref_rem64(x, 1024L), "i64 /1024")
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Struct & Array memarg.offset read/write
+  let bx = Box4::{ a: 11, b: 222L, c: 3.5, d: 44 }
+  bx.a = bx.a + 1
+  bx.b = bx.b + 10L
+  bx.c = bx.c + 0.5
+  bx.d = bx.d + 2
+  must(bx.a == 12 && bx.b == 232L && bx.c == 4.0 && bx.d == 46, "struct offset")
+
+  let arr : Array[Int] = [10, 20, 30, 40]
+  arr[2] = arr[1] + arr[3]
+  must(arr.length() == 4 && arr[2] == 60, "arr offset")
+
+  // 2. jnz integer comparison + float NaN comparison semantics
+  let zero_d : Double = 0.0
+  let nan_d : Double = zero_d / zero_d
+  let mut nan_flags = 0
+  if nan_d < 1.0 { nan_flags = nan_flags + 1 }
+  if nan_d > 1.0 { nan_flags = nan_flags + 2 }
+  if nan_d <= 1.0 { nan_flags = nan_flags + 4 }
+  if nan_d >= 1.0 { nan_flags = nan_flags + 8 }
+  if nan_d == nan_d { nan_flags = nan_flags + 16 }
+  if nan_d != nan_d { nan_flags = nan_flags + 32 }
+  if !(nan_d < 1.0) { nan_flags = nan_flags + 64 }
+  must(nan_flags == 96, "nan jnz")
+
+  // 3. Signed i32 constant div/rem boundaries (incl. INT32_MIN / INT32_MAX)
+  let imin32 : Int = -2147483647 - 1
+  let imax32 : Int = 2147483647
+  let cases32 : Array[Int] = [
+    0, 1, -1, 2, -2, 3, -3, 4, -4, 5, -5, 6, -6, 7, -7, 8, -8, 9, -9, 10, -10, 11, -11,
+    999, 1000, 1001, -999, -1000, -1001,
+    100002, 100003, 100004, -100002, -100003, -100004,
+    1000002, 1000003, 1000004, -1000002, -1000003, -1000004,
+    imax32, imax32 - 1, imin32, imin32 + 1
+  ]
+  let mut i = 0
+  while i < cases32.length() {
+    check_i32_divrem(cases32[i])
+    i = i + 1
+  }
+
+  // 4. Signed i64 power-of-2 div/rem boundaries (incl. INT64_MIN / INT64_MAX)
+  let imin64 : Int64 = -9223372036854775807L - 1L
+  let imax64 : Int64 = 9223372036854775807L
+  let cases64 : Array[Int64] = [0L, 1L, -1L, 2L, -2L, 3L, -3L, 7L, -7L, 8L, -8L, 1023L, -1023L, 1024L, -1024L, imax64, imin64]
+  i = 0
+  while i < cases64.length() {
+    check_i64_divrem(cases64[i])
+    i = i + 1
+  }
+
+  // 5. Unsigned udiv/urem power-of-2
+  let u32 : UInt = 0xFFFF_FFFDU
+  must(u32 / 8U == 0x1FFF_FFFFU && u32 % 8U == 5U, "u32 pow2")
+  let u64 : UInt64 = 0xFFFF_FFFF_FFFF_FFFDUL
+  must(u64 / 16UL == 0x0FFF_FFFF_FFFF_FFFFUL && u64 % 16UL == 13UL, "u64 pow2")
+
+  io_println(world, "p42c_wasm_opts ok:" + bx.b.to_string() + ":" + arr[2].to_string() + ":" + nan_flags.to_string())
+  0
+}
+EOF
+P42C_REL_WASM="$TMP_DIR/p42c_opts_rel.wasm"
+P42C_DEV_WASM="$TMP_DIR/p42c_opts_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P42C_REL_WASM" "$TMP_DIR/p42c_wasm_opts.pion"
+"$PIONC" build --target wasm32 -o "$P42C_DEV_WASM" "$TMP_DIR/p42c_wasm_opts.pion"
+for mode_wasm in "release:$P42C_REL_WASM" "dev:$P42C_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p42c_wasm_opts.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p42c_wasm_opts ok:232:60:96") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p42c_wasm_opts mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+console.log("  p42c_wasm_opts (" + mode + "/" + rtLabel + "): out=" + out + " OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

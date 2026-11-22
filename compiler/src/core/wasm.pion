@@ -1881,6 +1881,10 @@ struct WasmFnCtx {
   promoted_alloc_touched : Map[String, Bool]
   blk0_is_target : Bool
   const_copies : Map[String, String]
+  addr_off_base : Map[String, String]
+  addr_off_const : Map[String, Int]
+  mut div_tmp_i32 : Int
+  mut div_tmp_i64 : Int
   mut last_set_pos : Int
   mut last_set_end : Int
   mut last_set_sym : String
@@ -1894,6 +1898,225 @@ fn wasm_fn_alloc_local(fctx : WasmFnCtx, ty : Int) -> Int {
   let idx = fctx.n_params + fctx.extra_local_tys.length()
   fctx.extra_local_tys.push(ty)
   idx
+}
+
+///|
+fn wasm_get_div_tmp_i32(fctx : WasmFnCtx) -> Int {
+  if fctx.div_tmp_i32 < 0 {
+    fctx.div_tmp_i32 = wasm_fn_alloc_local(fctx, WASM_TY_I32)
+  }
+  fctx.div_tmp_i32
+}
+
+///|
+fn wasm_get_div_tmp_i64(fctx : WasmFnCtx) -> Int {
+  if fctx.div_tmp_i64 < 0 {
+    fctx.div_tmp_i64 = wasm_fn_alloc_local(fctx, WASM_TY_I64)
+  }
+  fctx.div_tmp_i64
+}
+
+///|
+fn wasm_try_parse_nonneg_i32_const(raw : String) -> Int64 {
+  let s = wasm_trim(raw)
+  let n = s.length()
+  if n == 0 || n > 10 {
+    return -1L
+  }
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c < 48 || c > 57 {
+      return -1L
+    }
+    i = i + 1
+  }
+  let v = wasm_parse_int64(s)
+  if v >= 0L && v <= 2147483647L {
+    v
+  } else {
+    -1L
+  }
+}
+
+///|
+fn wasm_try_parse_pos_i64_const(fctx : WasmFnCtx, raw : String) -> Int64 {
+  let mut s = wasm_trim(raw)
+  if s.length() > 0 && str_code_at(s, 0) == 37 {
+    match fctx.const_copies.get(s) {
+      Some(imm) => s = wasm_trim(imm)
+      None => return 0L
+    }
+  }
+  let n = s.length()
+  if n == 0 || n > 19 {
+    return 0L
+  }
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c < 48 || c > 57 {
+      return 0L
+    }
+    i = i + 1
+  }
+  let v = wasm_parse_int64(s)
+  if v > 0L {
+    v
+  } else {
+    0L
+  }
+}
+
+///|
+fn wasm_pow2_shift(d : Int64) -> Int {
+  if d < 2L || (d & (d - 1L)) != 0L {
+    return 0
+  }
+  let mut k = 0
+  let mut v = d
+  while v > 1L {
+    v = v >> 1
+    k = k + 1
+  }
+  k
+}
+
+///|
+fn wasm_sdiv32_magic_p(d : Int64) -> Int {
+  let lim : Int64 = 1L << 31
+  let mut p = 32
+  while p <= 62 {
+    let two_p : Int64 = 1L << p
+    let rem = two_p % d
+    let delta = d - rem
+    if two_p > lim * delta {
+      return p
+    }
+    p = p + 1
+  }
+  -1
+}
+
+///|
+fn wasm_is_mem_load_op(op : String) -> Bool {
+  op == "loadl" || op == "loadw" || op == "loadsw" || op == "loaduw" ||
+  op == "loadsh" || op == "loaduh" || op == "loadsb" || op == "loadub" ||
+  op == "loads" || op == "loadd"
+}
+
+///|
+fn wasm_is_mem_store_op(op : String) -> Bool {
+  op == "storel" || op == "storew" || op == "storeh" || op == "storeb" ||
+  op == "stores" || op == "stored"
+}
+
+///|
+fn wasm_invert_int_cmp_op(op : String) -> String {
+  if op == "ceqw" {
+    "cnew"
+  } else if op == "cnew" {
+    "ceqw"
+  } else if op == "csltw" {
+    "csgew"
+  } else if op == "csgew" {
+    "csltw"
+  } else if op == "cslew" {
+    "csgtw"
+  } else if op == "csgtw" {
+    "cslew"
+  } else if op == "cultw" {
+    "cugew"
+  } else if op == "cugew" {
+    "cultw"
+  } else if op == "culew" {
+    "cugtw"
+  } else if op == "cugtw" {
+    "culew"
+  } else if op == "ceql" {
+    "cnel"
+  } else if op == "cnel" {
+    "ceql"
+  } else if op == "csltl" {
+    "csgel"
+  } else if op == "csgel" {
+    "csltl"
+  } else if op == "cslel" {
+    "csgtl"
+  } else if op == "csgtl" {
+    "cslel"
+  } else if op == "cultl" {
+    "cugel"
+  } else if op == "cugel" {
+    "cultl"
+  } else if op == "culel" {
+    "cugtl"
+  } else if op == "cugtl" {
+    "culel"
+  } else {
+    ""
+  }
+}
+
+///|
+fn wasm_emit_int_cmp_stack(
+  ctx : WasmModCtx,
+  fctx : WasmFnCtx,
+  code : Array[Int],
+  op : String,
+  a0 : String,
+  a1 : String,
+) -> Unit {
+  let last_c = str_code_at(op, op.length() - 1)
+  let cmp_ty = if last_c == 119 { WASM_TY_I32 } else { WASM_TY_I64 }
+  let pred = slice_str(op, 1, op.length() - 1)
+  wasm_emit_operand(ctx, fctx, code, a0, cmp_ty)
+  wasm_emit_operand(ctx, fctx, code, a1, cmp_ty)
+  if cmp_ty == WASM_TY_I32 {
+    if pred == "eq" {
+      code.push(0x46)
+    } else if pred == "ne" {
+      code.push(0x47)
+    } else if pred == "slt" {
+      code.push(0x48)
+    } else if pred == "ult" {
+      code.push(0x49)
+    } else if pred == "sgt" {
+      code.push(0x4A)
+    } else if pred == "ugt" {
+      code.push(0x4B)
+    } else if pred == "sle" {
+      code.push(0x4C)
+    } else if pred == "ule" {
+      code.push(0x4D)
+    } else if pred == "sge" {
+      code.push(0x4E)
+    } else {
+      code.push(0x4F)
+    }
+  } else {
+    if pred == "eq" {
+      code.push(0x51)
+    } else if pred == "ne" {
+      code.push(0x52)
+    } else if pred == "slt" {
+      code.push(0x53)
+    } else if pred == "ult" {
+      code.push(0x54)
+    } else if pred == "sgt" {
+      code.push(0x55)
+    } else if pred == "ugt" {
+      code.push(0x56)
+    } else if pred == "sle" {
+      code.push(0x57)
+    } else if pred == "ule" {
+      code.push(0x58)
+    } else if pred == "sge" {
+      code.push(0x59)
+    } else {
+      code.push(0x5A)
+    }
+  }
 }
 
 ///|
@@ -2379,7 +2602,18 @@ fn wasm_emit_inst(
           None => ()
         }
       }
-      wasm_emit_addr(ctx, fctx, code, inst.args[1])
+      let store_addr_key = wasm_trim(inst.args[1])
+      let mut store_off = 0
+      match fctx.addr_off_base.get(store_addr_key) {
+        Some(base_op) => {
+          wasm_emit_addr(ctx, fctx, code, base_op)
+          store_off = match fctx.addr_off_const.get(store_addr_key) {
+            Some(c) => c
+            None => 0
+          }
+        }
+        None => wasm_emit_addr(ctx, fctx, code, inst.args[1])
+      }
       let mut align_log2 = 0
       if op == "storel" {
         wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
@@ -2407,7 +2641,7 @@ fn wasm_emit_inst(
         align_log2 = 3
       }
       wasm_push_u32(code, align_log2) // natural alignment
-      wasm_push_u32(code, 0) // offset
+      wasm_push_u32(code, store_off) // offset
     }
     return false
   }
@@ -2571,7 +2805,18 @@ fn wasm_emit_inst(
         None => ()
       }
     }
-    wasm_emit_addr(ctx, fctx, code, inst.args[0])
+    let load_addr_key = wasm_trim(inst.args[0])
+    let mut load_off = 0
+    match fctx.addr_off_base.get(load_addr_key) {
+      Some(base_op) => {
+        wasm_emit_addr(ctx, fctx, code, base_op)
+        load_off = match fctx.addr_off_const.get(load_addr_key) {
+          Some(c) => c
+          None => 0
+        }
+      }
+      None => wasm_emit_addr(ctx, fctx, code, inst.args[0])
+    }
     let mut align_log2 = 0
     if op == "loadl" {
       if dty == WASM_TY_I32 {
@@ -2607,7 +2852,7 @@ fn wasm_emit_inst(
       align_log2 = 3
     }
     wasm_push_u32(code, align_log2) // natural alignment
-    wasm_push_u32(code, 0) // offset
+    wasm_push_u32(code, load_off) // offset
     wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
@@ -2782,6 +3027,158 @@ fn wasm_emit_inst(
   if op == "add" || op == "sub" || op == "mul" || op == "div" || op == "udiv" ||
     op == "rem" || op == "urem" || op == "and" || op == "or" || op == "xor" ||
     op == "shl" || op == "shr" || op == "sar" {
+    if op == "add" && inst.dst.length() > 0 && fctx.addr_off_base.contains(inst.dst) {
+      return false
+    }
+    // P42-C: Constant div/rem strength reduction (i32 & i64)
+    if (dty == WASM_TY_I32 || dty == WASM_TY_I64) &&
+      (op == "udiv" || op == "urem" || op == "div" || op == "rem") {
+      let d = wasm_try_parse_pos_i64_const(fctx, inst.args[1])
+      if d >= 2L {
+        let k = wasm_pow2_shift(d)
+        if op == "udiv" && k > 0 && ((dty == WASM_TY_I32 && k <= 31) || (dty == WASM_TY_I64 && k <= 63)) {
+          wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
+          if dty == WASM_TY_I32 {
+            code.push(0x41)
+            wasm_push_s32(code, k)
+            code.push(0x76) // i32.shr_u
+          } else {
+            code.push(0x42)
+            wasm_push_s64(code, k.to_int64())
+            code.push(0x88) // i64.shr_u
+          }
+          wasm_emit_set_local(fctx, code, inst.dst, dty)
+          return false
+        }
+        if op == "urem" && k > 0 && ((dty == WASM_TY_I32 && k <= 31) || (dty == WASM_TY_I64 && k <= 63)) {
+          wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
+          if dty == WASM_TY_I32 {
+            code.push(0x41)
+            wasm_push_s32(code, (d - 1L).to_int())
+            code.push(0x71) // i32.and
+          } else {
+            code.push(0x42)
+            wasm_push_s64(code, d - 1L)
+            code.push(0x83) // i64.and
+          }
+          wasm_emit_set_local(fctx, code, inst.dst, dty)
+          return false
+        }
+        if (op == "div" || op == "rem") && k > 0 &&
+          ((dty == WASM_TY_I32 && k <= 30) || (dty == WASM_TY_I64 && k <= 62)) {
+          if dty == WASM_TY_I32 {
+            let xloc = wasm_get_div_tmp_i32(fctx)
+            wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+            code.push(0x22) // local.tee $x
+            wasm_push_u32(code, xloc)
+            if op == "rem" {
+              code.push(0x20) // local.get $x (left operand of sub)
+              wasm_push_u32(code, xloc)
+            }
+            code.push(0x20) // local.get $x
+            wasm_push_u32(code, xloc)
+            if k == 1 {
+              code.push(0x41)
+              wasm_push_s32(code, 31)
+              code.push(0x76) // i32.shr_u
+            } else {
+              code.push(0x41)
+              wasm_push_s32(code, 31)
+              code.push(0x75) // i32.shr_s
+              code.push(0x41)
+              wasm_push_s32(code, 32 - k)
+              code.push(0x76) // i32.shr_u
+            }
+            code.push(0x6A) // i32.add
+            if op == "div" {
+              code.push(0x41)
+              wasm_push_s32(code, k)
+              code.push(0x75) // i32.shr_s
+            } else {
+              code.push(0x41)
+              wasm_push_s32(code, (0L - d).to_int())
+              code.push(0x71) // i32.and
+              code.push(0x6B) // i32.sub
+            }
+          } else {
+            let xloc = wasm_get_div_tmp_i64(fctx)
+            wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
+            code.push(0x22) // local.tee $x
+            wasm_push_u32(code, xloc)
+            if op == "rem" {
+              code.push(0x20) // local.get $x (left operand of sub)
+              wasm_push_u32(code, xloc)
+            }
+            code.push(0x20) // local.get $x
+            wasm_push_u32(code, xloc)
+            if k == 1 {
+              code.push(0x42)
+              wasm_push_s64(code, 63L)
+              code.push(0x88) // i64.shr_u
+            } else {
+              code.push(0x42)
+              wasm_push_s64(code, 63L)
+              code.push(0x87) // i64.shr_s
+              code.push(0x42)
+              wasm_push_s64(code, (64 - k).to_int64())
+              code.push(0x88) // i64.shr_u
+            }
+            code.push(0x7C) // i64.add
+            if op == "div" {
+              code.push(0x42)
+              wasm_push_s64(code, k.to_int64())
+              code.push(0x87) // i64.shr_s
+            } else {
+              code.push(0x42)
+              wasm_push_s64(code, 0L - d)
+              code.push(0x83) // i64.and
+              code.push(0x7D) // i64.sub
+            }
+          }
+          wasm_emit_set_local(fctx, code, inst.dst, dty)
+          return false
+        }
+        // Signed i32 non-power-of-2 constant div/rem via 64-bit magic multiplier
+        if dty == WASM_TY_I32 && (op == "div" || op == "rem") && k == 0 && d >= 3L && d <= 1073741823L {
+          let p = wasm_sdiv32_magic_p(d)
+          if p >= 32 {
+            let m : Int64 = (1L << p) / d + 1L
+            if m < (1L << 32) {
+              let xloc = wasm_get_div_tmp_i32(fctx)
+              wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
+              code.push(0x22) // local.tee $x
+              wasm_push_u32(code, xloc)
+              if op == "rem" {
+                code.push(0x20) // local.get $x
+                wasm_push_u32(code, xloc)
+              }
+              code.push(0xAC) // i64.extend_i32_s
+              code.push(0x42) // i64.const m
+              wasm_push_s64(code, m)
+              code.push(0x7E) // i64.mul
+              code.push(0x42) // i64.const p
+              wasm_push_s64(code, p.to_int64())
+              code.push(0x87) // i64.shr_s
+              code.push(0xA7) // i32.wrap_i64
+              code.push(0x20) // local.get $x
+              wasm_push_u32(code, xloc)
+              code.push(0x41) // i32.const 31
+              wasm_push_s32(code, 31)
+              code.push(0x76) // i32.shr_u
+              code.push(0x6A) // i32.add -> q
+              if op == "rem" {
+                code.push(0x41) // i32.const d
+                wasm_push_s32(code, d.to_int())
+                code.push(0x6C) // i32.mul
+                code.push(0x6B) // i32.sub -> x - q * d
+              }
+              wasm_emit_set_local(fctx, code, inst.dst, WASM_TY_I32)
+              return false
+            }
+          }
+        }
+      }
+    }
     wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
     wasm_emit_operand(ctx, fctx, code, inst.args[1], dty)
     if dty == WASM_TY_I32 {
@@ -3204,6 +3601,40 @@ fn wasm_emit_structured_block(
   while ii < insts.length() {
     let inst = insts[ii]
     let op = inst.op
+    // P42-C: Fuse single-use integer comparison + inverted jnz fallthrough (zero i32.eqz!)
+    if ii + 1 < insts.length() && insts[ii + 1].op == "jnz" && insts[ii + 1].args.length() >= 3 {
+      let inv_op = wasm_invert_int_cmp_op(op)
+      if inv_op.length() > 0 && inst.dst.length() > 0 && inst.args.length() >= 2 {
+        let jnz = insts[ii + 1]
+        if wasm_trim(jnz.args[0]) == inst.dst {
+          let ucnt = match fctx.use_counts.get(inst.dst) { Some(c) => c; None => 0 }
+          let dcnt = match fctx.def_counts.get(inst.dst) { Some(c) => c; None => 0 }
+          if ucnt == 1 && dcnt == 1 {
+            let t_lbl = jnz.args[1]
+            let f_lbl = jnz.args[2]
+            let t_idx = match fctx.block_idx.get(t_lbl) { Some(k) => k; None => 0 }
+            let f_idx = match fctx.block_idx.get(f_lbl) { Some(k) => k; None => 0 }
+            let t_has_phi = wasm_has_phi_edge(fctx, bi, t_idx)
+            let f_has_phi = wasm_has_phi_edge(fctx, bi, f_idx)
+            if !f_has_phi && (t_has_phi || (t_idx == bi + 1 && f_idx != bi + 1)) {
+              wasm_emit_int_cmp_stack(ctx, fctx, code, inv_op, inst.args[0], inst.args[1])
+              let f_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, f_idx, 0)
+              code.push(0x0D) // br_if
+              wasm_push_u32(code, f_depth)
+              wasm_emit_phi_edge(ctx, fctx, code, bi, t_idx)
+              if t_idx != bi + 1 {
+                let t_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, t_idx, 0)
+                code.push(0x0C) // br
+                wasm_push_u32(code, t_depth)
+              }
+              terminated = true
+              ii = ii + 2
+              continue
+            }
+          }
+        }
+      }
+    }
     if op == "jmp" {
       if inst.args.length() > 0 {
         wasm_emit_structured_jump(ctx, fctx, code, bi, inst.args[0], scope_is_loop, scope_target, 0, true)
@@ -3218,19 +3649,8 @@ fn wasm_emit_structured_block(
         let t_has_phi = wasm_has_phi_edge(fctx, bi, t_idx)
         let f_has_phi = wasm_has_phi_edge(fctx, bi, f_idx)
         wasm_emit_cond_i32(ctx, fctx, code, inst.args[0])
-        if !t_has_phi {
-          // Fast path: br_if directly to true target, then handle false target (with fallthrough!)
-          let t_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, t_idx, 0)
-          code.push(0x0D) // br_if
-          wasm_push_u32(code, t_depth)
-          wasm_emit_phi_edge(ctx, fctx, code, bi, f_idx)
-          if f_idx != bi + 1 {
-            let f_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, f_idx, 0)
-            code.push(0x0C) // br
-            wasm_push_u32(code, f_depth)
-          }
-        } else if !f_has_phi {
-          // Invert condition: br_if directly to false target, then handle true target
+        if !f_has_phi && (t_has_phi || (t_idx == bi + 1 && f_idx != bi + 1)) {
+          // Invert condition: br_if directly to false target, then fallthrough/jump to true target
           code.push(0x45) // i32.eqz
           let f_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, f_idx, 0)
           code.push(0x0D) // br_if
@@ -3240,6 +3660,17 @@ fn wasm_emit_structured_block(
             let t_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, t_idx, 0)
             code.push(0x0C) // br
             wasm_push_u32(code, t_depth)
+          }
+        } else if !t_has_phi {
+          // Fast path: br_if directly to true target, then handle false target (with fallthrough!)
+          let t_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, t_idx, 0)
+          code.push(0x0D) // br_if
+          wasm_push_u32(code, t_depth)
+          wasm_emit_phi_edge(ctx, fctx, code, bi, f_idx)
+          if f_idx != bi + 1 {
+            let f_depth = wasm_scope_depth(scope_is_loop, scope_target, bi, f_idx, 0)
+            code.push(0x0C) // br
+            wasm_push_u32(code, f_depth)
           }
         } else {
           code.push(0x04) // if
@@ -3632,6 +4063,120 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     ci = ci + 1
   }
 
+  // Pass 2b (P42-C): fold `%p =l add %base, C` into load/store memarg.offset when all uses of %p are mem addresses
+  let addr_cand_names : Array[String] = []
+  let addr_cand_base : Map[String, String] = Map([])
+  let addr_cand_off : Map[String, Int] = Map([])
+  let addr_cand_ok : Map[String, Bool] = Map([])
+  bi = 0
+  while bi < nb {
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      if inst.op == "add" && inst.dst_ty == WASM_TY_I64 && inst.dst.length() > 0 && inst.args.length() >= 2 {
+        let dcnt = match def_counts.get(inst.dst) { Some(c) => c; None => 0 }
+        let ucnt = match use_counts.get(inst.dst) { Some(c) => c; None => 0 }
+        if dcnt == 1 && ucnt >= 1 && !param_set.contains(inst.dst) && !const_copies.contains(inst.dst) {
+          let a0 = wasm_trim(inst.args[0])
+          let a1 = wasm_trim(inst.args[1])
+          let mut base = ""
+          let mut off : Int64 = -1L
+          if a0.length() > 0 && str_code_at(a0, 0) == 37 {
+            let c1 = wasm_try_parse_nonneg_i32_const(a1)
+            if c1 >= 0L {
+              base = a0
+              off = c1
+            }
+          }
+          if off < 0L && a1.length() > 0 && str_code_at(a1, 0) == 37 {
+            let c0 = wasm_try_parse_nonneg_i32_const(a0)
+            if c0 >= 0L {
+              base = a1
+              off = c0
+            }
+          }
+          if off >= 0L && base != inst.dst && !promoted_alloc_ty.contains(base) && !const_copies.contains(base) {
+            let b_dcnt = match def_counts.get(base) { Some(c) => c; None => 0 }
+            let b_ty = match local_ty.get(base) { Some(t) => t; None => -1 }
+            if b_dcnt == 1 && (b_ty == WASM_TY_I64 || b_ty == WASM_TY_I32) {
+              addr_cand_names.push(inst.dst)
+              addr_cand_base.set(inst.dst, base)
+              addr_cand_off.set(inst.dst, off.to_int())
+              addr_cand_ok.set(inst.dst, true)
+            }
+          }
+        }
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+  let addr_off_base : Map[String, String] = Map([])
+  let addr_off_const : Map[String, Int] = Map([])
+  if addr_cand_names.length() > 0 {
+    bi = 0
+    while bi < nb {
+      let insts = f.blocks[bi].insts
+      let mut ii = 0
+      while ii < insts.length() {
+        let inst = insts[ii]
+        let op = inst.op
+        if op == "phi" {
+          let mut pi = 0
+          while pi + 1 < inst.args.length() {
+            let s = wasm_trim(inst.args[pi + 1])
+            if addr_cand_ok.contains(s) {
+              addr_cand_ok.set(s, false)
+            }
+            pi = pi + 2
+          }
+        } else if wasm_is_mem_load_op(op) {
+          // args[0] is a valid memory address use
+          ()
+        } else if wasm_is_mem_store_op(op) {
+          // args[0] is stored value (NOT address), args[1] is valid memory address use
+          if inst.args.length() >= 1 {
+            let s0 = wasm_trim(inst.args[0])
+            if addr_cand_ok.contains(s0) {
+              addr_cand_ok.set(s0, false)
+            }
+          }
+        } else {
+          let mut ai = 0
+          while ai < inst.args.length() {
+            let s = wasm_trim(inst.args[ai])
+            if addr_cand_ok.contains(s) {
+              addr_cand_ok.set(s, false)
+            }
+            ai = ai + 1
+          }
+        }
+        ii = ii + 1
+      }
+      bi = bi + 1
+    }
+    let mut ai = 0
+    while ai < addr_cand_names.length() {
+      let pname = addr_cand_names[ai]
+      match addr_cand_ok.get(pname) {
+        Some(true) => {
+          let base = match addr_cand_base.get(pname) { Some(b) => b; None => "" }
+          let off = match addr_cand_off.get(pname) { Some(o) => o; None => 0 }
+          if base.length() > 0 {
+            addr_off_base.set(pname, base)
+            addr_off_const.set(pname, off)
+            let p_uses = match use_counts.get(pname) { Some(c) => c; None => 1 }
+            let b_uses = match use_counts.get(base) { Some(c) => c; None => 0 }
+            use_counts.set(base, b_uses - 1 + p_uses)
+          }
+        }
+        _ => ()
+      }
+      ai = ai + 1
+    }
+  }
+
   // Assign shadow-stack frame offsets ONLY for non-promoted allocs (skipped when function has no allocs)
   if has_any_alloc {
     bi = 0
@@ -3710,6 +4255,10 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     promoted_alloc_touched: Map([]),
     blk0_is_target: blk0_is_target,
     const_copies: const_copies,
+    addr_off_base: addr_off_base,
+    addr_off_const: addr_off_const,
+    div_tmp_i32: -1,
+    div_tmp_i64: -1,
     last_set_pos: -1,
     last_set_end: -1,
     last_set_sym: "",
