@@ -995,6 +995,14 @@ struct WasmFnCtx {
   phi_tmp_i64 : Int
   phi_tmp_f32 : Int
   phi_tmp_f64 : Int
+  use_counts : Map[String, Int]
+  def_counts : Map[String, Int]
+  mut last_set_pos : Int
+  mut last_set_end : Int
+  mut last_set_sym : String
+  mut last_set_ty : Int
+  mut last_set_lidx : Int
+  mut last_set_fresh : Bool
 }
 
 ///|
@@ -1002,6 +1010,69 @@ fn wasm_fn_alloc_local(fctx : WasmFnCtx, ty : Int) -> Int {
   let idx = fctx.n_params + fctx.extra_local_tys.length()
   fctx.extra_local_tys.push(ty)
   idx
+}
+
+///|
+fn wasm_fn_get_or_alloc_local(fctx : WasmFnCtx, sym : String, ty : Int) -> Int {
+  match fctx.local_idx.get(sym) {
+    Some(k) => k
+    None => {
+      let idx = fctx.n_params + fctx.extra_local_tys.length()
+      fctx.extra_local_tys.push(ty)
+      fctx.local_idx.set(sym, idx)
+      idx
+    }
+  }
+}
+
+///|
+fn wasm_inc_sym_count(counts : Map[String, Int], raw : String) -> Unit {
+  let s = wasm_trim(raw)
+  if s.length() > 0 && str_code_at(s, 0) == 37 {
+    let prev = match counts.get(s) {
+      Some(c) => c
+      None => 0
+    }
+    counts.set(s, prev + 1)
+  }
+}
+
+///|
+fn wasm_emit_set_local(
+  fctx : WasmFnCtx,
+  code : Array[Int],
+  sym : String,
+  lty : Int,
+) -> Unit {
+  let use_cnt = match fctx.use_counts.get(sym) {
+    Some(c) => c
+    None => 0
+  }
+  let mut fresh = false
+  let lidx = match fctx.local_idx.get(sym) {
+    Some(k) => k
+    None => {
+      if use_cnt == 0 {
+        fctx.last_set_pos = -1
+        code.push(0x1A) // drop unused value without allocating a local slot
+        return
+      }
+      fresh = true
+      let idx = fctx.n_params + fctx.extra_local_tys.length()
+      fctx.extra_local_tys.push(lty)
+      fctx.local_idx.set(sym, idx)
+      idx
+    }
+  }
+  let pos = code.length()
+  code.push(0x21) // local.set
+  wasm_push_u32(code, lidx)
+  fctx.last_set_pos = pos
+  fctx.last_set_end = code.length()
+  fctx.last_set_sym = sym
+  fctx.last_set_ty = lty
+  fctx.last_set_lidx = lidx
+  fctx.last_set_fresh = fresh
 }
 
 ///|
@@ -1014,6 +1085,7 @@ fn wasm_emit_operand(
 ) -> Unit {
   let s = wasm_trim(op)
   if s.length() == 0 {
+    fctx.last_set_pos = -1
     if want_ty == WASM_TY_I32 {
       code.push(0x41)
       wasm_push_s32(code, 0)
@@ -1032,16 +1104,45 @@ fn wasm_emit_operand(
   let c0 = str_code_at(s, 0)
   // Local variable %...
   if c0 == 37 {
-    let idx = match fctx.local_idx.get(s) {
-      Some(k) => k
-      None => 0
-    }
     let lty = match fctx.local_ty.get(s) {
       Some(t) => t
       None => want_ty
     }
-    code.push(0x20) // local.get
-    wasm_push_u32(code, idx)
+    if fctx.last_set_pos >= 0 && code.length() == fctx.last_set_end &&
+      s == fctx.last_set_sym && lty == fctx.last_set_ty {
+      let use_cnt = match fctx.use_counts.get(s) {
+        Some(c) => c
+        None => 0
+      }
+      let def_cnt = match fctx.def_counts.get(s) {
+        Some(c) => c
+        None => 0
+      }
+      let set_pos = fctx.last_set_pos
+      let set_end = fctx.last_set_end
+      let set_lidx = fctx.last_set_lidx
+      let set_fresh = fctx.last_set_fresh
+      fctx.last_set_pos = -1
+      if use_cnt == 1 && def_cnt == 1 {
+        let mut pop_n = set_end - set_pos
+        while pop_n > 0 {
+          let _ = code.pop()
+          pop_n = pop_n - 1
+        }
+        if set_fresh && set_lidx == fctx.n_params + fctx.extra_local_tys.length() - 1 {
+          let _ = fctx.extra_local_tys.pop()
+          fctx.local_idx.remove(s)
+        }
+      } else {
+        // Multi-use adjacent read: convert local.set (0x21) -> local.tee (0x22)
+        code[set_pos] = 0x22
+      }
+    } else {
+      fctx.last_set_pos = -1
+      let idx = wasm_fn_get_or_alloc_local(fctx, s, lty)
+      code.push(0x20) // local.get
+      wasm_push_u32(code, idx)
+    }
     if lty != want_ty {
       if lty == WASM_TY_I64 && want_ty == WASM_TY_I32 {
         code.push(0xA7) // i32.wrap_i64
@@ -1055,6 +1156,7 @@ fn wasm_emit_operand(
     }
     return
   }
+  fctx.last_set_pos = -1
   // Global symbol $...
   if c0 == 36 {
     let sym = slice_str(s, 1, s.length())
@@ -1157,6 +1259,7 @@ fn wasm_emit_phi_edge(
   pred_idx : Int,
   dst_idx : Int,
 ) -> Unit {
+  fctx.last_set_pos = -1
   if !fctx.has_phi {
     return
   }
@@ -1182,15 +1285,12 @@ fn wasm_emit_phi_edge(
   i = matched.length() - 1
   while i >= 0 {
     let k = matched[i]
-    match fctx.local_idx.get(fctx.phi_dst_names[k]) {
-      Some(lidx) => {
-        code.push(0x21) // local.set
-        wasm_push_u32(code, lidx)
-      }
-      None => code.push(0x1A) // drop
-    }
+    let lidx = wasm_fn_get_or_alloc_local(fctx, fctx.phi_dst_names[k], fctx.phi_dst_tys[k])
+    code.push(0x21) // local.set
+    wasm_push_u32(code, lidx)
     i = i - 1
   }
+  fctx.last_set_pos = -1
 }
 
 ///|
@@ -1202,6 +1302,7 @@ fn wasm_emit_jump_to(
   target_lbl : String,
   disp_depth : Int,
 ) -> Unit {
+  fctx.last_set_pos = -1
   let tidx = match fctx.block_idx.get(target_lbl) {
     Some(k) => k
     None => 0
@@ -1213,10 +1314,12 @@ fn wasm_emit_jump_to(
   wasm_push_u32(code, fctx.pc_local)
   code.push(0x0C) // br $disp
   wasm_push_u32(code, disp_depth)
+  fctx.last_set_pos = -1
 }
 
 ///|
 fn wasm_emit_epilogue(fctx : WasmFnCtx, code : Array[Int]) -> Unit {
+  fctx.last_set_pos = -1
   if fctx.frame_size > 0 {
     code.push(0x20) // local.get $fp
     wasm_push_u32(code, fctx.fp_local)
@@ -1244,6 +1347,7 @@ fn wasm_emit_inst(
     return false
   }
   if op == "hlt" {
+    fctx.last_set_pos = -1
     code.push(0x00) // unreachable
     return true
   }
@@ -1254,12 +1358,14 @@ fn wasm_emit_inst(
     }
     wasm_emit_epilogue(fctx, code)
     code.push(0x0F) // return
+    fctx.last_set_pos = -1
     return true
   }
   if op == "jmp" {
     if multi_blk && inst.args.length() > 0 {
       wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[0], disp_depth)
     }
+    fctx.last_set_pos = -1
     return true
   }
   if op == "jnz" {
@@ -1281,6 +1387,7 @@ fn wasm_emit_inst(
       } else {
         wasm_emit_operand(ctx, fctx, code, cond_op, WASM_TY_I32)
       }
+      fctx.last_set_pos = -1
       code.push(0x04) // if
       code.push(0x40) // void
       wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[1], disp_depth + 1)
@@ -1288,6 +1395,7 @@ fn wasm_emit_inst(
       wasm_emit_jump_to(ctx, fctx, code, cur_blk, inst.args[2], disp_depth + 1)
       code.push(0x0B) // end
     }
+    fctx.last_set_pos = -1
     return true
   }
   if op == "jtbl" {
@@ -1423,7 +1531,7 @@ fn wasm_emit_inst(
       code.push(0x00) // table 0
       actual_ret = inst.dst_ty
     }
-    if inst.dst.length() > 0 {
+      if inst.dst.length() > 0 {
       if actual_ret == WASM_TY_VOID && inst.dst_ty != WASM_TY_VOID {
         wasm_emit_operand(ctx, fctx, code, "0", inst.dst_ty)
       } else if actual_ret != inst.dst_ty {
@@ -1433,31 +1541,31 @@ fn wasm_emit_inst(
           code.push(0xAD)
         }
       }
-      match fctx.local_idx.get(inst.dst) {
-        Some(lidx) => {
-          code.push(0x21)
-          wasm_push_u32(code, lidx)
-        }
-        None => code.push(0x1A)
+      if inst.dst_ty != WASM_TY_VOID {
+        wasm_emit_set_local(fctx, code, inst.dst, inst.dst_ty)
+      } else {
+        fctx.last_set_pos = -1
+        code.push(0x1A)
       }
     } else if actual_ret != WASM_TY_VOID {
+      fctx.last_set_pos = -1
       code.push(0x1A) // drop unused return value
+    } else {
+      fctx.last_set_pos = -1
     }
     return false
   }
 
   // Value-producing instructions
   let dty = inst.dst_ty
-  let dst_local = match fctx.local_idx.get(inst.dst) {
-    Some(k) => k
-    None => -1
-  }
-  if dst_local < 0 {
+  if inst.dst.length() == 0 || dty == WASM_TY_VOID {
+    fctx.last_set_pos = -1
     return false
   }
 
   // Stack allocation: alloc4 / alloc8 / alloc16
   if op == "alloc4" || op == "alloc8" || op == "alloc16" {
+    fctx.last_set_pos = -1
     let off = match fctx.alloc_offsets.get(inst.dst) {
       Some(o) => o
       None => 0
@@ -1472,16 +1580,14 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAD) // i64.extend_i32_u
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
   // copy
   if op == "copy" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
@@ -1526,19 +1632,20 @@ fn wasm_emit_inst(
     }
     wasm_push_u32(code, align_log2) // natural alignment
     wasm_push_u32(code, 0) // offset
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
   // Unary ops: neg, sqrt, extsw, extuw, extsh, extuh, extsb, extub, exts, truncd, stosi, stoui, dtosi, dtoui, swtof, uwtof, sltof, ultof, cast
   if op == "neg" {
     if dty == WASM_TY_I32 {
+      fctx.last_set_pos = -1
       code.push(0x41)
       wasm_push_s32(code, 0)
       wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
       code.push(0x6B) // i32.sub
     } else if dty == WASM_TY_I64 {
+      fctx.last_set_pos = -1
       code.push(0x42)
       wasm_push_s64(code, 0L)
       wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
@@ -1550,16 +1657,14 @@ fn wasm_emit_inst(
       wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
       code.push(0x9A) // f64.neg
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
   if op == "sqrt" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
     code.push(if dty == WASM_TY_F32 { 0x91 } else { 0x9F })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
@@ -1568,8 +1673,7 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAC) // i64.extend_i32_s
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "extuw" {
@@ -1577,8 +1681,7 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAD) // i64.extend_i32_u
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "extsh" {
@@ -1587,8 +1690,7 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAC)
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "extuh" {
@@ -1599,8 +1701,7 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAD)
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "extsb" {
@@ -1609,8 +1710,7 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAC)
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "extub" {
@@ -1621,78 +1721,67 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAD)
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "exts" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
     code.push(0xBB) // f64.promote_f32
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "truncd" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
     code.push(0xB6) // f32.demote_f64
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "stosi" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
     code.push(if dty == WASM_TY_I64 { 0xAE } else { 0xA8 })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "stoui" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F32)
     code.push(if dty == WASM_TY_I64 { 0xAF } else { 0xA9 })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "dtosi" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
     code.push(if dty == WASM_TY_I64 { 0xB0 } else { 0xAA })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "dtoui" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_F64)
     code.push(if dty == WASM_TY_I64 { 0xB1 } else { 0xAB })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "swtof" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
     code.push(if dty == WASM_TY_F32 { 0xB2 } else { 0xB7 })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "uwtof" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I32)
     code.push(if dty == WASM_TY_F32 { 0xB3 } else { 0xB8 })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "sltof" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
     code.push(if dty == WASM_TY_F32 { 0xB4 } else { 0xB9 })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "ultof" {
     wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
     code.push(if dty == WASM_TY_F32 { 0xB5 } else { 0xBA })
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
   if op == "cast" {
@@ -1709,8 +1798,7 @@ fn wasm_emit_inst(
       wasm_emit_operand(ctx, fctx, code, inst.args[0], WASM_TY_I64)
       code.push(0xBF) // f64.reinterpret_i64
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
@@ -1797,8 +1885,7 @@ fn wasm_emit_inst(
         code.push(0xA3)
       }
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
@@ -1909,8 +1996,7 @@ fn wasm_emit_inst(
     if dty == WASM_TY_I64 {
       code.push(0xAD) // i64.extend_i32_u
     }
-    code.push(0x21)
-    wasm_push_u32(code, dst_local)
+    wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
   }
 
@@ -2084,6 +2170,7 @@ fn wasm_emit_structured_jump(
   extra_depth : Int,
   allow_fallthrough : Bool,
 ) -> Unit {
+  fctx.last_set_pos = -1
   let tidx = match fctx.block_idx.get(target_lbl) {
     Some(k) => k
     None => 0
@@ -2095,6 +2182,7 @@ fn wasm_emit_structured_jump(
   let depth = wasm_scope_depth(scope_is_loop, scope_target, cur_blk, tidx, extra_depth)
   code.push(0x0C) // br
   wasm_push_u32(code, depth)
+  fctx.last_set_pos = -1
 }
 
 ///|
@@ -2132,6 +2220,7 @@ fn wasm_emit_structured_block(
   scope_is_loop : Array[Bool],
   scope_target : Array[Int],
 ) -> Unit {
+  fctx.last_set_pos = -1
   let nb = f.blocks.length()
   let insts = f.blocks[bi].insts
   let mut terminated = false
@@ -2309,11 +2398,14 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
   let local_idx : Map[String, Int] = Map([])
   let local_ty : Map[String, Int] = Map([])
   let extra_local_tys : Array[Int] = []
+  let use_counts : Map[String, Int] = Map([])
+  let def_counts : Map[String, Int] = Map([])
   let n_params = f.param_names.length()
   let mut i = 0
   while i < n_params {
     local_idx.set(f.param_names[i], i)
     local_ty.set(f.param_names[i], f.param_tys[i])
+    wasm_inc_sym_count(def_counts, f.param_names[i])
     i = i + 1
   }
 
@@ -2326,7 +2418,8 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
   let phi_dst_tys : Array[Int] = []
   let phi_src_ops : Array[String] = []
 
-  // Pass 1: map block labels, locals, stack allocs
+  // Pass 1: map block labels, local types, def/use counts, and stack allocs
+  // (Local indices are allocated lazily during emission so single-use adjacent temps consume 0 local slots.)
   let nb = f.blocks.length()
   let mut bi = 0
   while bi < nb {
@@ -2336,14 +2429,33 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     while ii < insts.length() {
       let inst = insts[ii]
       if inst.dst.length() > 0 && inst.dst_ty != WASM_TY_VOID {
-        match local_idx.get(inst.dst) {
+        match local_ty.get(inst.dst) {
           Some(_) => ()
-          None => {
-            let lidx = n_params + extra_local_tys.length()
-            extra_local_tys.push(inst.dst_ty)
-            local_idx.set(inst.dst, lidx)
-            local_ty.set(inst.dst, inst.dst_ty)
-          }
+          None => local_ty.set(inst.dst, inst.dst_ty)
+        }
+        wasm_inc_sym_count(def_counts, inst.dst)
+      }
+      if inst.op == "phi" {
+        let mut pi = 0
+        while pi + 1 < inst.args.length() {
+          wasm_inc_sym_count(use_counts, inst.args[pi + 1])
+          pi = pi + 2
+        }
+      } else if inst.op == "cos" || inst.op == "cod" || inst.op == "cuos" || inst.op == "cuod" {
+        // Float ordered/unordered comparisons emit each operand twice (a == a && b == b)
+        if inst.args.length() >= 1 {
+          wasm_inc_sym_count(use_counts, inst.args[0])
+          wasm_inc_sym_count(use_counts, inst.args[0])
+        }
+        if inst.args.length() >= 2 {
+          wasm_inc_sym_count(use_counts, inst.args[1])
+          wasm_inc_sym_count(use_counts, inst.args[1])
+        }
+      } else {
+        let mut ai = 0
+        while ai < inst.args.length() {
+          wasm_inc_sym_count(use_counts, inst.args[ai])
+          ai = ai + 1
         }
       }
       if inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16" {
@@ -2435,6 +2547,14 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     phi_tmp_i64: -1,
     phi_tmp_f32: -1,
     phi_tmp_f64: -1,
+    use_counts: use_counts,
+    def_counts: def_counts,
+    last_set_pos: -1,
+    last_set_end: -1,
+    last_set_sym: "",
+    last_set_ty: -1,
+    last_set_lidx: -1,
+    last_set_fresh: false,
   }
 
   let code : Array[Int] = []
@@ -2503,6 +2623,7 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     wasm_push_u32(code, 0) // default
     bi = 0
     while bi < nb {
+      fctx.last_set_pos = -1
       code.push(0x0B) // end $b_{bi}
       let disp_depth = nb - 1 - bi
       let insts = f.blocks[bi].insts
@@ -2607,6 +2728,26 @@ fn wasm_is_internal_mangled_export(name : String) -> Bool {
   name.starts_with("pion_impl_") ||
   name.starts_with("pion_trait_") ||
   name.starts_with("pion_vtable_")
+}
+
+///|
+fn wasm_has_explicit_roots(funcs : Array[WasmFunc]) -> Bool {
+  let mut i = 0
+  while i < funcs.length() {
+    let f = funcs[i]
+    if f.name == "main" || f.name == "_start" ||
+      (f.exported && !wasm_is_internal_mangled_export(f.name)) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn wasm_is_export_root(f : WasmFunc, has_explicit_roots : Bool) -> Bool {
+  f.name == "main" || f.name == "_start" ||
+    (f.exported && (!has_explicit_roots || !wasm_is_internal_mangled_export(f.name)))
 }
 
 ///|
@@ -2789,14 +2930,8 @@ fn wasm_dedup_module(parsed : WasmModuleParsed) -> WasmModuleParsed {
   }
 
   let mut cur_funcs = parsed.funcs
-  let mut has_main = false
+  let has_explicit_roots = wasm_has_explicit_roots(cur_funcs)
   let mut fi = 0
-  while fi < cur_funcs.length() {
-    if cur_funcs[fi].name == "main" {
-      has_main = true
-    }
-    fi = fi + 1
-  }
 
   // Rewrite data aliases into funcs first, then run 2 rounds of identical-function dedup
   let mut round = 0
@@ -2846,8 +2981,7 @@ fn wasm_dedup_module(parsed : WasmModuleParsed) -> WasmModuleParsed {
     fi = 0
     while fi < cur_funcs.length() {
       let f = cur_funcs[fi]
-      let is_root = f.name == "main" || f.name == "_start" ||
-        (f.exported && (!has_main || !wasm_is_internal_mangled_export(f.name)))
+      let is_root = wasm_is_export_root(f, has_explicit_roots)
       if is_root {
         next_funcs.push(f)
       } else {
@@ -2911,14 +3045,11 @@ fn wasm_dedup_module(parsed : WasmModuleParsed) -> WasmModuleParsed {
 /// Opt 1: Call-graph & static-data reachability DCE from root exports (`main` + explicit `export`).
 fn wasm_dce_module(parsed : WasmModuleParsed) -> WasmModuleParsed {
   let func_by_name : Map[String, Int] = Map([])
-  let mut has_main = false
+  let has_explicit_roots = wasm_has_explicit_roots(parsed.funcs)
   let mut fi = 0
   while fi < parsed.funcs.length() {
     let fname = parsed.funcs[fi].name
     func_by_name.set(fname, fi)
-    if fname == "main" {
-      has_main = true
-    }
     fi = fi + 1
   }
   let data_by_name : Map[String, Int] = Map([])
@@ -2933,12 +3064,11 @@ fn wasm_dce_module(parsed : WasmModuleParsed) -> WasmModuleParsed {
   let func_q : Array[Int] = []
   let data_q : Array[Int] = []
 
-  // Seed roots: `main`, plus explicit external exports (excluding cross-package `pion_pkg_*` linkage symbols when `main` is present)
+  // Seed roots: `main`, `_start`, plus explicit external exports (excluding internal mangled exports when explicit roots exist)
   fi = 0
   while fi < parsed.funcs.length() {
     let f = parsed.funcs[fi]
-    let is_root = f.name == "main" ||
-      (f.exported && (!has_main || !wasm_is_internal_mangled_export(f.name)))
+    let is_root = wasm_is_export_root(f, has_explicit_roots)
     if is_root {
       match live_funcs.get(f.name) {
         Some(_) => ()
@@ -3643,19 +3773,11 @@ pub fn emit_wasm_from_ssa(ssa : String) -> Bytes {
   ]
   let exp_kinds : Array[Int] = [0x02, 0x01, 0x03]
   let exp_idxs : Array[Int] = [0, 0, 1]
-  let mut mod_has_main = false
-  fi = 0
-  while fi < parsed.funcs.length() {
-    if parsed.funcs[fi].name == "main" {
-      mod_has_main = true
-    }
-    fi = fi + 1
-  }
+  let has_explicit_roots = wasm_has_explicit_roots(parsed.funcs)
   fi = 0
   while fi < parsed.funcs.length() {
     let f = parsed.funcs[fi]
-    if f.name == "main" || f.name == "_start" ||
-      (f.exported && (!mod_has_main || !wasm_is_internal_mangled_export(f.name))) {
+    if wasm_is_export_root(f, has_explicit_roots) {
       exp_names.push(f.name)
       exp_kinds.push(0x00)
       exp_idxs.push(num_imports + fi)

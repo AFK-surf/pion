@@ -497,4 +497,102 @@ console.log("  rc_read_leak (" + rtLabel + "): out=" + out + " mem=" + (memBytes
 ' "$RC_LEAK_WASM" "$rt_path"
 done
 
+echo "=== P29-C [9/9] Library-Mode (No main, extern \"C\" exports) Export Hygiene & Built-in DCE Regression ==="
+WL_DIR="$TMP_DIR/web_lib"
+mkdir -p "$WL_DIR/lib_pkg/src" "$WL_DIR/web_app/src"
+cat > "$WL_DIR/lib_pkg/pion.toml" <<'EOF'
+[package]
+name = "lib_pkg"
+version = "0.1.0"
+EOF
+cat > "$WL_DIR/lib_pkg/src/lib.pion" <<'EOF'
+pub fn live_calc(x : Int) -> Int {
+  x * 3 + 7
+}
+
+pub fn dead_leaf(n : Int) -> String {
+  let s = "P33A_DEAD_SENTINEL_STRING_DO_NOT_EMIT"
+  s + ":" + n.to_string()
+}
+
+pub fn dead_big_helper(x : Int) -> String {
+  let mut acc = dead_leaf(x)
+  let mut i = 0
+  while i < 8 {
+    acc = acc + "|" + dead_leaf(x + i)
+    i = i + 1
+  }
+  acc
+}
+EOF
+cat > "$WL_DIR/web_app/pion.toml" <<'EOF'
+[package]
+name = "web_app"
+version = "0.1.0"
+
+[dependencies]
+lib_pkg = { path = "../lib_pkg" }
+EOF
+cat > "$WL_DIR/web_app/src/main.pion" <<'EOF'
+import "lib_pkg"
+
+pub extern "C" fn web_calc(x : Int) -> Int {
+  lib_pkg::live_calc(x)
+}
+
+pub extern "C" fn web_tag() -> Int {
+  3301
+}
+EOF
+WL_RAW="$TMP_DIR/web_app_raw.wasm"
+WL_OPT="$TMP_DIR/web_app_opt.wasm"
+PION_NO_WASM_OPT=1 "$PIONC" build --release --target wasm32 -o "$WL_RAW" "$WL_DIR/web_app"
+"$PIONC" build --release --target wasm32 -o "$WL_OPT" "$WL_DIR/web_app"
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const rawPath = process.argv[1];
+const optPath = process.argv[2];
+const rtPaths = [process.argv[3], process.argv[4]];
+
+const rawBytes = fs.readFileSync(rawPath);
+const optBytes = fs.readFileSync(optPath);
+if (!WebAssembly.validate(rawBytes)) {
+  console.error("FAIL: web_app raw.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const mod = new WebAssembly.Module(rawBytes);
+const fnExports = WebAssembly.Module.exports(mod)
+  .filter(e => e.kind === "function")
+  .map(e => e.name)
+  .sort();
+const expected = ["web_calc", "web_tag"];
+if (JSON.stringify(fnExports) !== JSON.stringify(expected)) {
+  console.error("FAIL: web_app raw.wasm function exports mismatch! expected=" + JSON.stringify(expected) + " got=" + JSON.stringify(fnExports));
+  process.exit(1);
+}
+const sentinel = Buffer.from("P33A_DEAD_SENTINEL_STRING_DO_NOT_EMIT", "utf8");
+if (rawBytes.includes(sentinel)) {
+  console.error("FAIL: dead sentinel string survived in raw.wasm (built-in DCE failed for no-main library)");
+  process.exit(1);
+}
+
+for (const rtPath of rtPaths) {
+  const rtLabel = path.basename(rtPath);
+  const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+  const rt = createPionRuntime({});
+  const { instance } = await WebAssembly.instantiate(rawBytes, rt.imports);
+  rt.bindExports(instance.exports);
+  const c = instance.exports.web_calc(20);
+  const t = instance.exports.web_tag();
+  if ((c | 0) !== 67 || (t | 0) !== 3301) {
+    console.error("FAIL (" + rtLabel + "): web_app return mismatch: web_calc(20)=" + c + " web_tag()=" + t);
+    process.exit(1);
+  }
+}
+console.log("  web_app (no-main library): exports=" + JSON.stringify(fnExports) + " dead_sentinel=ELIMINATED raw=" + rawBytes.length + "B opt=" + optBytes.length + "B (Node+Web OK)");
+' "$WL_RAW" "$WL_OPT" "$PION_WASM_RT" "$PION_WASM_RT_WEB"
+
 echo "p29c_wasm32 E2E: OK"
