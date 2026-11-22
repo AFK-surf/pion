@@ -172,6 +172,12 @@ if [ "$OK_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
   echo "FAIL: ok_full.pion expected ok:true" >&2
   exit 1
 fi
+OKV_OUT=$("$PIONC2" check --json "$ROOT_DIR/tests/frontend/ok_verify_mut.pion")
+printf 'ok_verify_mut.pion -> %s\n' "$OKV_OUT"
+if [ "$OKV_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
+  echo "FAIL: ok_verify_mut.pion expected ok:true" >&2
+  exit 1
+fi
 
 expect_err_code_pionc2() {
   fixture="$1"
@@ -198,6 +204,13 @@ expect_err_code_pionc2 "err_non_exhaustive.pion" "E_NON_EXHAUSTIVE"
 expect_err_code_pionc2 "err_not_send.pion" "E_NOT_SEND"
 expect_err_code_pionc2 "err_use_after_move.pion" "E_USE_AFTER_MOVE"
 expect_err_code_pionc2 "err_capability_missing.pion" "E_CAPABILITY_MISSING"
+expect_err_code_pionc2 "err_verify_unsupported.pion" "E_VERIFY_UNSUPPORTED"
+expect_err_code_pionc2 "err_verify_move.pion" "E_VERIFY_MOVE"
+expect_err_code_pionc2 "err_verify_borrow_escape.pion" "E_VERIFY_BORROW_ESCAPE"
+expect_err_code_pionc2 "err_verify_mut_escape.pion" "E_VERIFY_MUT_ESCAPE"
+expect_err_code_pionc2 "err_verify_aliasing.pion" "E_VERIFY_ALIASING"
+expect_err_code_pionc2 "err_verify_closure_capture.pion" "E_VERIFY_CLOSURE_CAPTURE"
+expect_err_code_pionc2 "err_verify_unverified_callee.pion" "E_VERIFY_UNVERIFIED_CALLEE"
 
 DEFS_OUT=$("$PIONC2" query defs --json "$ROOT_DIR/tests/frontend/ok_full.pion")
 SIG_OUT=$("$PIONC2" query sig --json "$ROOT_DIR/tests/frontend/ok_full.pion")

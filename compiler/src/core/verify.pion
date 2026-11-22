@@ -1,0 +1,1099 @@
+///| `#verify` static rules (SPEC §3.4), run after a `#verify` function body
+///| type-checks, over its AST and the checker's `expr_tys` side table:
+///|   - `E_VERIFY_UNSUPPORTED`     forbidden types (World, Ptr, Map, Double, dyn, ...)
+///|   - `E_VERIFY_MOVE`            use of a moved `Unique` binding
+///|   - `E_VERIFY_BORROW_ESCAPE`   a read-only `Unique` parameter written or escaping
+///|   - `E_VERIFY_MUT_ESCAPE`      a `mut` parameter escaping
+///|   - `E_VERIFY_CLOSURE_CAPTURE` a closure capturing `let mut` / `Unique` / `mut` bindings
+///| (`E_VERIFY_ALIASING` and `E_VERIFY_UNVERIFIED_CALLEE` are checked at call
+///| sites by the type checker.)
+
+///|
+/// Binding kinds of the `#verify` move/borrow analysis.
+let vk_local : Int = 0
+
+///|
+let vk_mut_param : Int = 1
+
+///|
+/// A read-only view of a `Unique` value (non-`mut` parameter, or a pattern /
+/// loop binding projected out of one): may be read, never written or moved.
+let vk_borrowed : Int = 2
+
+///|
+/// A plain (`Copy`-typed) parameter.
+let vk_plain : Int = 3
+
+///|
+/// A `Unique` binding projected out of a `mut` parameter.
+let vk_mut_view : Int = 4
+
+///|
+struct VBind {
+  ty : Ty
+  kind : Int
+  is_mut : Bool
+}
+
+///|
+/// Set of moved bindings (insertion-ordered, so copies and unions are
+/// deterministic).
+struct VMoved {
+  names : Array[String]
+}
+
+///|
+fn vm_new() -> VMoved {
+  VMoved::{ names: [] }
+}
+
+///|
+fn vm_contains(m : VMoved, n : String) -> Bool {
+  str_arr_contains(m.names, n)
+}
+
+///|
+fn vm_add(m : VMoved, n : String) -> Unit {
+  if !str_arr_contains(m.names, n) {
+    m.names.push(n)
+  }
+}
+
+///|
+fn vm_remove(m : VMoved, n : String) -> Unit {
+  let keep : Array[String] = []
+  let mut i = 0
+  while i < m.names.length() {
+    if m.names[i] != n {
+      keep.push(m.names[i])
+    }
+    i = i + 1
+  }
+  m.names.clear()
+  i = 0
+  while i < keep.length() {
+    m.names.push(keep[i])
+    i = i + 1
+  }
+}
+
+///|
+struct VCtx {
+  tc : TypeChecker
+  fn_name : String
+  scopes : Array[Map[String, VBind]]
+  mut moved : VMoved
+  mut diverged : Bool
+  reported : Map[String, Bool]
+  forbidden_seen : Map[String, Bool]
+  /// Roots of live borrowed views (`for x in r`, a pattern binding a
+  /// `Unique` part of `r`): `r` cannot be written, rebound, passed `mut` or
+  /// moved while the view is alive (stack, nested scopes push / pop).
+  pinned : Array[String]
+}
+
+///|
+fn v_err(
+  ctx : VCtx,
+  sp : Span,
+  code : String,
+  msg : String,
+  expected : String,
+  found : String,
+  fixit : String,
+) -> Unit {
+  let k = code + "@" + span_key(sp)
+  if ctx.reported.contains(k) {
+    return
+  }
+  ctx.reported.set(k, true)
+  tc_err(ctx.tc, sp, code, msg, expected, found, fixit)
+}
+
+///|
+fn v_lookup_struct(tc : TypeChecker, name : String) -> Option[StructInfo] {
+  match tc.structs.get(name) {
+    Some(si) => Some(si)
+    None => {
+      let qp = split_qual_name(name)
+      if qp.prefix.length() > 0 {
+        match lookup_imported_pkg_transitive(tc, qp.prefix) {
+          Some(ipkg) =>
+            match ipkg.tc.structs.get(qp.name) {
+              Some(si) => Some(qbe_free_qualify_struct(qp.prefix, si))
+              None => None
+            }
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
+fn qbe_free_qualify_struct(pkg : String, si : StructInfo) -> StructInfo {
+  let ftys : Array[Ty] = []
+  let mut i = 0
+  while i < si.field_tys.length() {
+    ftys.push(qualify_imported_ty(pkg, si.field_tys[i]))
+    i = i + 1
+  }
+  StructInfo::{
+    decl: si.decl,
+    field_names: si.field_names,
+    field_muts: si.field_muts,
+    field_tys: ftys,
+  }
+}
+
+///|
+fn v_lookup_enum(tc : TypeChecker, name : String) -> Option[EnumInfo] {
+  match tc.enums.get(name) {
+    Some(ei) => Some(ei)
+    None => {
+      let qp = split_qual_name(name)
+      if qp.prefix.length() > 0 {
+        match lookup_imported_pkg_transitive(tc, qp.prefix) {
+          Some(ipkg) =>
+            match ipkg.tc.enums.get(qp.name) {
+              Some(ei) => {
+                let vs : Array[VariantInfo] = []
+                let mut i = 0
+                while i < ei.variants.length() {
+                  let ftys : Array[Ty] = []
+                  let mut j = 0
+                  while j < ei.variants[i].field_tys.length() {
+                    ftys.push(qualify_imported_ty(qp.prefix, ei.variants[i].field_tys[j]))
+                    j = j + 1
+                  }
+                  vs.push(VariantInfo::{ name: ei.variants[i].name, field_tys: ftys })
+                  i = i + 1
+                }
+                Some(EnumInfo::{ decl: ei.decl, variants: vs })
+              }
+              None => None
+            }
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
+/// Name of the forbidden component of `t` inside `#verify` code, or "".
+fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String {
+  match t {
+    TWorld | TPtr | TScope | TAtomicInt | TStringBuilder | TDouble | TFloat =>
+      ty_to_string(t)
+    TChannel(_) => "Channel"
+    TMutex(_) => "Mutex"
+    TMap(_, _) => "Map"
+    TDynTrait(n) => "dyn " + n
+    TArray(e) | TFixedArray(e) | TOption(e) => v_forbidden_in(tc, e, visiting)
+    TResult(a, b) => {
+      let fa = v_forbidden_in(tc, a, visiting)
+      if fa != "" {
+        fa
+      } else {
+        v_forbidden_in(tc, b, visiting)
+      }
+    }
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        let f = v_forbidden_in(tc, es[i], visiting)
+        if f != "" {
+          return f
+        }
+        i = i + 1
+      }
+      ""
+    }
+    TFn(ps, r) => {
+      let mut i = 0
+      while i < ps.length() {
+        let f = v_forbidden_in(tc, ps[i], visiting)
+        if f != "" {
+          return f
+        }
+        i = i + 1
+      }
+      v_forbidden_in(tc, r, visiting)
+    }
+    TStruct(name, args) => {
+      if str_arr_contains(visiting, name) {
+        return ""
+      }
+      visiting.push(name)
+      let mut res = ""
+      match v_lookup_struct(tc, name) {
+        Some(si) => {
+          let subst = make_subst(si.decl.type_params, args)
+          let mut i = 0
+          while i < si.field_tys.length() {
+            let f = v_forbidden_in(tc, subst_ty(si.field_tys[i], subst), visiting)
+            if f != "" {
+              res = f
+              break
+            }
+            i = i + 1
+          }
+        }
+        None => ()
+      }
+      let _ = visiting.pop()
+      res
+    }
+    TEnum(name, args) => {
+      if str_arr_contains(visiting, name) {
+        return ""
+      }
+      visiting.push(name)
+      let mut res = ""
+      match v_lookup_enum(tc, name) {
+        Some(ei) => {
+          let subst = make_subst(ei.decl.type_params, args)
+          let mut i = 0
+          while i < ei.variants.length() && res == "" {
+            let v = ei.variants[i]
+            let mut j = 0
+            while j < v.field_tys.length() {
+              let f = v_forbidden_in(tc, subst_ty(v.field_tys[j], subst), visiting)
+              if f != "" {
+                res = f
+                break
+              }
+              j = j + 1
+            }
+            i = i + 1
+          }
+        }
+        None => ()
+      }
+      let _ = visiting.pop()
+      res
+    }
+    _ => ""
+  }
+}
+
+///|
+fn v_unique_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
+  match t {
+    TArray(_) | TFixedArray(_) | TBytes => true
+    // Generic parameters may be instantiated with `Unique` types.
+    TParam(_) => true
+    TOption(e) => v_unique_in(tc, e, visiting)
+    TResult(a, b) => v_unique_in(tc, a, visiting) || v_unique_in(tc, b, visiting)
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        if v_unique_in(tc, es[i], visiting) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TStruct(name, args) => {
+      if str_arr_contains(visiting, name) {
+        return false
+      }
+      visiting.push(name)
+      let mut res = false
+      match v_lookup_struct(tc, name) {
+        Some(si) => {
+          let subst = make_subst(si.decl.type_params, args)
+          let mut i = 0
+          while i < si.field_tys.length() {
+            if si.field_muts[i] || v_unique_in(tc, subst_ty(si.field_tys[i], subst), visiting) {
+              res = true
+              break
+            }
+            i = i + 1
+          }
+        }
+        None => ()
+      }
+      let _ = visiting.pop()
+      res
+    }
+    TEnum(name, args) => {
+      if str_arr_contains(visiting, name) {
+        return false
+      }
+      visiting.push(name)
+      let mut res = false
+      match v_lookup_enum(tc, name) {
+        Some(ei) => {
+          let subst = make_subst(ei.decl.type_params, args)
+          let mut i = 0
+          while i < ei.variants.length() && !res {
+            let v = ei.variants[i]
+            let mut j = 0
+            while j < v.field_tys.length() {
+              if v_unique_in(tc, subst_ty(v.field_tys[j], subst), visiting) {
+                res = true
+                break
+              }
+              j = j + 1
+            }
+            i = i + 1
+          }
+        }
+        None => ()
+      }
+      let _ = visiting.pop()
+      res
+    }
+    _ => false
+  }
+}
+
+///|
+/// `#verify` type classes: `Forbidden` (rejected with `E_VERIFY_UNSUPPORTED`).
+pub fn is_verify_forbidden_ty(tc : TypeChecker, t : Ty) -> Bool {
+  v_forbidden_in(tc, t, []) != ""
+}
+
+///|
+/// `#verify` type classes: `Unique` (moved on assignment / storage / return,
+/// borrowed read-only when passed to a non-`mut` parameter).
+pub fn is_verify_unique_ty(tc : TypeChecker, t : Ty) -> Bool {
+  !is_verify_forbidden_ty(tc, t) && v_unique_in(tc, t, [])
+}
+
+///|
+/// `#verify` type classes: `Copy` (value semantics, freely duplicated).
+pub fn is_verify_copy_ty(tc : TypeChecker, t : Ty) -> Bool {
+  !is_verify_forbidden_ty(tc, t) && !v_unique_in(tc, t, [])
+}
+
+///|
+fn v_is_unique(ctx : VCtx, t : Ty) -> Bool {
+  v_unique_in(ctx.tc, t, [])
+}
+
+///|
+fn v_check_forbidden(ctx : VCtx, t : Ty, sp : Span) -> Unit {
+  let f = v_forbidden_in(ctx.tc, t, [])
+  if f != "" && !ctx.forbidden_seen.contains(f) {
+    ctx.forbidden_seen.set(f, true)
+    v_err(
+      ctx,
+      sp,
+      "E_VERIFY_UNSUPPORTED",
+      "type `" + f + "` is not supported in `#verify` function `" + ctx.fn_name + "`",
+      "Int / Int64 / UInt / UInt64 / Bool / Byte / Char / Unit / String, structs, enums, Array, FixedArray, Bytes",
+      f,
+      "move this code into a `#verify_opaque` helper, or use a supported type",
+    )
+  }
+}
+
+///|
+fn v_expr_ty(ctx : VCtx, e : Expr) -> Ty {
+  match ctx.tc.expr_tys.get(span_key(expr_span(e))) {
+    Some(t) => t
+    None => TError
+  }
+}
+
+///|
+fn v_push(ctx : VCtx) -> Unit {
+  ctx.scopes.push(Map([]))
+}
+
+///|
+fn v_pop(ctx : VCtx) -> Unit {
+  if ctx.scopes.length() > 1 {
+    let _ = ctx.scopes.pop()
+  }
+}
+
+///|
+fn v_define(ctx : VCtx, name : String, ty : Ty, kind : Int, is_mut : Bool) -> Unit {
+  ctx.scopes[ctx.scopes.length() - 1].set(name, VBind::{
+    ty: ty,
+    kind: kind,
+    is_mut: is_mut,
+  })
+  vm_remove(ctx.moved, name)
+}
+
+///|
+fn v_lookup(ctx : VCtx, name : String) -> Option[VBind] {
+  let mut i = ctx.scopes.length() - 1
+  while i >= 0 {
+    match ctx.scopes[i].get(name) {
+      Some(b) => return Some(b)
+      None => ()
+    }
+    i = i - 1
+  }
+  None
+}
+
+///|
+fn v_copy_moved(m : VMoved) -> VMoved {
+  let out = vm_new()
+  let mut i = 0
+  while i < m.names.length() {
+    out.names.push(m.names[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn v_union_into(dst : VMoved, src : VMoved) -> Unit {
+  let mut i = 0
+  while i < src.names.length() {
+    vm_add(dst, src.names[i])
+    i = i + 1
+  }
+}
+
+///|
+fn v_place_root(e : Expr) -> String {
+  match e {
+    EIdent(n, _) => n
+    EField(o, _, _) => v_place_root(o)
+    EIndex(o, _, _) => v_place_root(o)
+    EMutArg(inner, _) => v_place_root(inner)
+    _ => ""
+  }
+}
+
+///|
+/// A `Unique` value flows into a new owner (binding, field, element, return).
+fn v_consume(ctx : VCtx, e : Expr) -> Unit {
+  let root = v_place_root(e)
+  if root == "" {
+    return
+  }
+  let ty = v_expr_ty(ctx, e)
+  if !v_is_unique(ctx, ty) {
+    return
+  }
+  match v_lookup(ctx, root) {
+    None => ()
+    Some(b) => {
+      let sp = expr_span(e)
+      if b.kind == vk_borrowed {
+        v_err(
+          ctx,
+          sp,
+          "E_VERIFY_BORROW_ESCAPE",
+          "read-only `Unique` value `" + root + "` cannot escape (stored, returned, or bound by `let`) in `#verify` function `" + ctx.fn_name + "`",
+          "read / pass on read-only",
+          "escape of `" + root + "`",
+          "use `" + root + ".copy()` to take an owned copy, or declare the parameter `mut`",
+        )
+      } else if b.kind == vk_mut_param || b.kind == vk_mut_view {
+        v_err(
+          ctx,
+          sp,
+          "E_VERIFY_MUT_ESCAPE",
+          "`mut` parameter `" + root + "` cannot escape (stored, returned, or bound by `let`) in `#verify` function `" + ctx.fn_name + "`",
+          "in-place use of the `mut` parameter",
+          "escape of `" + root + "`",
+          "use `" + root + ".copy()` to take an owned copy",
+        )
+      } else if b.kind == vk_local {
+        v_pin_check(ctx, root, sp, "move")
+        vm_add(ctx.moved, root)
+      }
+    }
+  }
+}
+
+///|
+fn v_unpin_to(ctx : VCtx, n : Int) -> Unit {
+  while ctx.pinned.length() > n {
+    let _ = ctx.pinned.pop()
+  }
+}
+
+///|
+/// `E_VERIFY_ALIASING`: `root` is pinned by a live `for` iteration or
+/// pattern-binding view and must not be modified, rebound or moved.
+fn v_pin_check(ctx : VCtx, root : String, sp : Span, what : String) -> Unit {
+  if root != "" && str_arr_contains(ctx.pinned, root) {
+    v_err(
+      ctx,
+      sp,
+      "E_VERIFY_ALIASING",
+      "cannot " + what + " `" + root + "` while a borrowed view of it (`for` iteration or pattern binding) is alive in `#verify` function `" + ctx.fn_name + "`",
+      "no modification of `" + root + "` during the view",
+      what + " `" + root + "`",
+      "iterate / match over `" + root + ".copy()`, or move the modification after the loop / match",
+    )
+  }
+}
+
+///|
+fn v_check_write(ctx : VCtx, lhs : Expr) -> Unit {
+  let root = v_place_root(lhs)
+  if root == "" {
+    return
+  }
+  v_pin_check(ctx, root, expr_span(lhs), "modify")
+  match v_lookup(ctx, root) {
+    Some(b) =>
+      if b.kind == vk_borrowed {
+        v_err(
+          ctx,
+          expr_span(lhs),
+          "E_VERIFY_BORROW_ESCAPE",
+          "cannot write through read-only `Unique` value `" + root + "` in `#verify` function `" + ctx.fn_name + "`",
+          "`mut` parameter or owned local",
+          "write to read-only `" + root + "`",
+          "declare the parameter `mut " + root + " : ...` and pass `mut` at call sites",
+        )
+      }
+    None => ()
+  }
+}
+
+///|
+fn v_is_mutating_builtin(m : String) -> Bool {
+  m == "push" ||
+  m == "pop" ||
+  m == "set" ||
+  m == "swap" ||
+  m == "clear" ||
+  m == "reverse" ||
+  m == "sort" ||
+  m == "fill" ||
+  m == "remove" ||
+  m == "insert" ||
+  m == "truncate"
+}
+
+///|
+fn v_is_storing_builtin(m : String) -> Bool {
+  m == "push" || m == "set" || m == "fill" || m == "insert" || m == "unwrap_or"
+}
+
+///|
+fn v_is_builtin_call(ctx : VCtx, sp : Span) -> Bool {
+  match ctx.tc.call_targets.get(span_key(sp)) {
+    Some(t) => t.length() >= 9 && slice_str(t, 0, 9) == "builtin::"
+    None => true
+  }
+}
+
+///|
+/// Binding kind of a pattern / loop variable projected out of `scrut`.
+fn v_projected_kind(ctx : VCtx, scrut : Expr) -> Int {
+  let root = v_place_root(scrut)
+  if root == "" {
+    return vk_local
+  }
+  match v_lookup(ctx, root) {
+    Some(b) =>
+      if b.kind == vk_borrowed {
+        vk_borrowed
+      } else if b.kind == vk_mut_param || b.kind == vk_mut_view {
+        vk_mut_view
+      } else {
+        vk_borrowed
+      }
+    None => vk_local
+  }
+}
+
+///|
+/// Binds a pattern's variables; true when one of them is `Unique`.
+fn v_bind_pattern(ctx : VCtx, pat : Pattern, kind : Int) -> Bool {
+  match pat {
+    PIdent(name, sp) => {
+      let ty = match ctx.tc.expr_tys.get(span_key(sp)) {
+        Some(t) => t
+        None => TError
+      }
+      v_check_forbidden(ctx, ty, sp)
+      let uniq = v_is_unique(ctx, ty)
+      let k = if uniq { kind } else { vk_local }
+      v_define(ctx, name, ty, k, false)
+      uniq
+    }
+    PVariant(_, _, pats, _) | PTuple(pats, _) => {
+      let mut any = false
+      let mut i = 0
+      while i < pats.length() {
+        if v_bind_pattern(ctx, pats[i], kind) {
+          any = true
+        }
+        i = i + 1
+      }
+      any
+    }
+    _ => false
+  }
+}
+
+///|
+/// Pins the scrutinee's root while `Unique` pattern bindings view it.
+fn v_pin_scrutinee(ctx : VCtx, scrut : Expr, bound_unique : Bool) -> Unit {
+  let r = v_place_root(scrut)
+  if bound_unique && r != "" {
+    ctx.pinned.push(r)
+  }
+}
+
+///|
+/// Scrutinee of a `match` / `is`: a temporary is owned by the pattern
+/// bindings; a place is viewed read-only (its `Unique` parts cannot be moved
+/// out without `.copy()`).
+fn v_scrutinee(ctx : VCtx, scrut : Expr) -> Int {
+  v_expr(ctx, scrut, false)
+  v_projected_kind(ctx, scrut)
+}
+
+///|
+fn v_closure(ctx : VCtx, params : Array[Param], body : Array[Stmt], sp : Span) -> Unit {
+  let locals : Map[String, Bool] = Map([])
+  let mut i = 0
+  while i < params.length() {
+    locals.set(params[i].name, true)
+    i = i + 1
+  }
+  let caps : Array[CaptureInfo] = []
+  collect_stmts_captures(body, locals, caps)
+  let seen : Map[String, Bool] = Map([])
+  i = 0
+  while i < caps.length() {
+    let cn = caps[i].name
+    if !seen.contains(cn) {
+      seen.set(cn, true)
+      match v_lookup(ctx, cn) {
+        Some(b) =>
+          if b.is_mut || b.kind == vk_mut_param || v_is_unique(ctx, b.ty) {
+            v_err(
+              ctx,
+              caps[i].span,
+              "E_VERIFY_CLOSURE_CAPTURE",
+              "closure in `#verify` function `" + ctx.fn_name + "` captures `" + cn + "`" +
+              (if b.is_mut { " (a mutable binding)" } else { " (a `Unique` value)" }),
+              "immutable `Copy` capture",
+              cn,
+              "pass `" + cn + "` to the closure as a parameter, or capture an immutable `Copy` value",
+            )
+          }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+  let ptys : Array[Ty] = match ctx.tc.closure_infer.get(span_key(sp)) {
+    Some(TFn(ps, _)) => ps
+    _ => []
+  }
+  let saved_moved = v_copy_moved(ctx.moved)
+  let saved_div = ctx.diverged
+  v_push(ctx)
+  i = 0
+  while i < params.length() {
+    let pt = if i < ptys.length() { ptys[i] } else { TError }
+    v_check_forbidden(ctx, pt, params[i].span)
+    let k = if v_is_unique(ctx, pt) { vk_borrowed } else { vk_plain }
+    v_define(ctx, params[i].name, pt, k, false)
+    i = i + 1
+  }
+  v_stmts(ctx, body, true)
+  v_pop(ctx)
+  ctx.moved = saved_moved
+  ctx.diverged = saved_div
+}
+
+///|
+fn v_args(ctx : VCtx, args : Array[Expr], consume : Bool) -> Unit {
+  let mut i = 0
+  while i < args.length() {
+    let a = match args[i] {
+      ENamedArg(_, _, inner, _) => inner
+      other => other
+    }
+    match a {
+      EMutArg(inner, _) => {
+        v_pin_check(ctx, v_place_root(inner), expr_span(inner), "pass as `mut`")
+        v_expr(ctx, inner, false)
+      }
+      _ => v_expr(ctx, a, consume)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
+  match ctx.tc.expr_tys.get(span_key(expr_span(e))) {
+    Some(t) => v_check_forbidden(ctx, t, expr_span(e))
+    None => ()
+  }
+  match e {
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EDouble(_, _) | EFloat(_, _) => ()
+    EBool(_, _) | EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) | EPath(_, _, _) => ()
+    EIdent(n, sp) => {
+      if vm_contains(ctx.moved, n) {
+        v_err(
+          ctx,
+          sp,
+          "E_VERIFY_MOVE",
+          "use of moved `Unique` value `" + n + "` in `#verify` function `" + ctx.fn_name + "`",
+          "live binding",
+          "moved `" + n + "`",
+          "use `" + n + ".copy()` where it was moved, or reassign `" + n + "` before this use",
+        )
+      }
+      if consume {
+        v_consume(ctx, e)
+      }
+    }
+    EField(obj, _, _) => {
+      v_expr(ctx, obj, false)
+      if consume {
+        v_consume(ctx, e)
+      }
+    }
+    EIndex(obj, idx, _) => {
+      v_expr(ctx, obj, false)
+      v_expr(ctx, idx, false)
+      if consume {
+        v_consume(ctx, e)
+      }
+    }
+    EMutArg(inner, _) => {
+      v_pin_check(ctx, v_place_root(inner), expr_span(inner), "pass as `mut`")
+      v_expr(ctx, inner, false)
+    }
+    ENamedArg(_, _, inner, _) => v_expr(ctx, inner, consume)
+    EMove(inner, _) => v_expr(ctx, inner, true)
+    EDotVariant(_, args, _) => v_args(ctx, args, true)
+    EUnary(_, inner, _) => v_expr(ctx, inner, false)
+    EBinary(_, l, r, _) => {
+      v_expr(ctx, l, false)
+      v_expr(ctx, r, false)
+    }
+    ECall(callee, args, sp) => {
+      match callee {
+        EIdent(_, _) | EPath(_, _, _) => v_expr(ctx, callee, false)
+        _ => v_expr(ctx, callee, false)
+      }
+      // Builtins and variant constructors store their arguments; user
+      // functions borrow non-`mut` arguments.
+      v_args(ctx, args, v_is_builtin_call(ctx, sp))
+    }
+    EMethodCall(obj, m, args, sp) => {
+      v_expr(ctx, obj, false)
+      let builtin = v_is_builtin_call(ctx, sp)
+      if builtin && v_is_mutating_builtin(m) {
+        v_check_write(ctx, obj)
+      }
+      if builtin && m == "blit_to" && args.length() > 0 {
+        v_check_write(ctx, args[0])
+      }
+      if ctx.tc.mut_recv_calls.contains(span_key(sp)) {
+        v_check_write(ctx, obj)
+      }
+      v_args(ctx, args, builtin && v_is_storing_builtin(m))
+    }
+    EArrayLit(elems, _) => v_args(ctx, elems, true)
+    ETuple(elems, _) => v_args(ctx, elems, true)
+    EStructLit(_, spread, fields, _) => {
+      let mut i = 0
+      while i < fields.length() {
+        v_expr(ctx, fields[i].value, true)
+        i = i + 1
+      }
+      match spread {
+        Some(base) => v_expr(ctx, base, true)
+        None => ()
+      }
+    }
+    EBlock(stmts, _) => {
+      v_push(ctx)
+      v_stmts(ctx, stmts, consume)
+      v_pop(ctx)
+    }
+    EIf(cond, then_stmts, else_opt, _) => {
+      let pin_base = ctx.pinned.length()
+      v_push(ctx)
+      v_cond(ctx, cond)
+      let m0 = v_copy_moved(ctx.moved)
+      let d0 = ctx.diverged
+      v_stmts(ctx, then_stmts, consume)
+      v_pop(ctx)
+      v_unpin_to(ctx, pin_base)
+      let m1 = ctx.moved
+      let d1 = ctx.diverged
+      ctx.moved = v_copy_moved(m0)
+      ctx.diverged = d0
+      match else_opt {
+        Some(el) => v_expr(ctx, el, consume)
+        None => ()
+      }
+      let d2 = ctx.diverged
+      if d1 && !d2 {
+        ()
+      } else if d2 && !d1 {
+        ctx.moved = m1
+      } else {
+        v_union_into(ctx.moved, m1)
+      }
+      ctx.diverged = d0 || (d1 && d2)
+    }
+    EIs(scrut, pat, _) => {
+      let k = v_scrutinee(ctx, scrut)
+      let bu = v_bind_pattern(ctx, pat, k)
+      v_pin_scrutinee(ctx, scrut, bu)
+    }
+    EMatch(scrut, arms, _) => {
+      let k = v_scrutinee(ctx, scrut)
+      let m0 = v_copy_moved(ctx.moved)
+      let d0 = ctx.diverged
+      let merged = vm_new()
+      let mut all_div = arms.length() > 0
+      let mut i = 0
+      while i < arms.length() {
+        ctx.moved = v_copy_moved(m0)
+        ctx.diverged = d0
+        v_push(ctx)
+        let pin_base = ctx.pinned.length()
+        let bu = v_bind_pattern(ctx, arms[i].pat, k)
+        v_pin_scrutinee(ctx, scrut, bu)
+        match arms[i].guard_expr {
+          Some(g) => v_expr(ctx, g, false)
+          None => ()
+        }
+        v_expr(ctx, arms[i].body, consume)
+        v_unpin_to(ctx, pin_base)
+        v_pop(ctx)
+        if !ctx.diverged {
+          all_div = false
+          v_union_into(merged, ctx.moved)
+        }
+        i = i + 1
+      }
+      if all_div {
+        ctx.moved = m0
+      } else {
+        ctx.moved = merged
+      }
+      ctx.diverged = d0 || all_div
+    }
+    EClosure(params, _, body, sp) => v_closure(ctx, params, body, sp)
+    EScope(a, b, _) | ESpawn(a, b, _) => {
+      v_expr(ctx, a, false)
+      v_expr(ctx, b, false)
+    }
+    EAs(inner, _, _) => v_expr(ctx, inner, consume)
+    ETry(inner, _) => v_expr(ctx, inner, consume)
+    EInterp(parts, _) => v_args(ctx, parts, false)
+  }
+}
+
+///|
+/// Condition of `if` / `while` / `guard`: `is` patterns bind into the
+/// current scope (the branch scope pushed by the caller).
+fn v_cond(ctx : VCtx, cond : Expr) -> Unit {
+  match cond {
+    EBinary("&&", l, r, _) => {
+      v_cond(ctx, l)
+      v_cond(ctx, r)
+    }
+    _ => v_expr(ctx, cond, false)
+  }
+}
+
+///|
+fn v_loop_body(ctx : VCtx, run : (Int) -> Unit) -> Unit {
+  let d0 = ctx.diverged
+  // Twice: a `Unique` value moved in one iteration is caught when the next
+  // iteration reads it.
+  run(0)
+  ctx.diverged = d0
+  run(1)
+  ctx.diverged = d0
+}
+
+///|
+fn v_stmts(ctx : VCtx, stmts : Array[Stmt], consume_tail : Bool) -> Unit {
+  // Views opened by `guard ... is` / bare `is` live to the end of the block.
+  let pin_base = ctx.pinned.length()
+  let mut i = 0
+  while i < stmts.length() {
+    let is_tail = i == stmts.length() - 1
+    v_stmt(ctx, stmts[i], consume_tail && is_tail)
+    i = i + 1
+  }
+  v_unpin_to(ctx, pin_base)
+}
+
+///|
+fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
+  match st {
+    SLet(name, is_mut, _, init, _) => {
+      v_expr(ctx, init, true)
+      v_define(ctx, name, v_expr_ty(ctx, init), vk_local, is_mut)
+    }
+    SLetTuple(names, _, init, _) => {
+      v_expr(ctx, init, true)
+      let ety = v_expr_ty(ctx, init)
+      let mut i = 0
+      while i < names.length() {
+        let t = match ety {
+          TTuple(es) => if i < es.length() { es[i] } else { TError }
+          _ => TError
+        }
+        if names[i] != "_" {
+          v_define(ctx, names[i], t, vk_local, false)
+        }
+        i = i + 1
+      }
+    }
+    SAssign(lhs, rhs, _) => {
+      v_expr(ctx, rhs, true)
+      match lhs {
+        EIdent(n, nsp) => {
+          v_pin_check(ctx, n, nsp, "rebind")
+          vm_remove(ctx.moved, n)
+        }
+        EField(o, _, _) => {
+          v_expr(ctx, o, false)
+          v_check_write(ctx, lhs)
+        }
+        EIndex(o, idx, _) => {
+          v_expr(ctx, o, false)
+          v_expr(ctx, idx, false)
+          v_check_write(ctx, lhs)
+        }
+        _ => v_expr(ctx, lhs, false)
+      }
+    }
+    SCompoundAssign(_, lhs, rhs, _) => {
+      v_expr(ctx, rhs, false)
+      v_expr(ctx, lhs, false)
+      v_check_write(ctx, lhs)
+    }
+    SGuard(cond, else_body, _) => {
+      v_cond(ctx, cond)
+      let m0 = v_copy_moved(ctx.moved)
+      let d0 = ctx.diverged
+      v_push(ctx)
+      v_stmts(ctx, else_body, false)
+      v_pop(ctx)
+      ctx.moved = m0
+      ctx.diverged = d0
+    }
+    SWhile(cond, body, _) =>
+      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+        let pin_base = ctx.pinned.length()
+        v_push(ctx)
+        v_cond(ctx, cond)
+        v_stmts(ctx, body, false)
+        v_pop(ctx)
+        v_unpin_to(ctx, pin_base)
+      })
+    SFor(init_s, cond, step_s, body, _) => {
+      v_push(ctx)
+      v_stmt(ctx, init_s, false)
+      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+        v_expr(ctx, cond, false)
+        v_push(ctx)
+        v_stmts(ctx, body, false)
+        v_pop(ctx)
+        v_stmt(ctx, step_s, false)
+      })
+      v_pop(ctx)
+    }
+    SForRange(vname, start_e, end_e, _, body, _) => {
+      v_expr(ctx, start_e, false)
+      v_expr(ctx, end_e, false)
+      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+        v_push(ctx)
+        v_define(ctx, vname, TInt, vk_local, false)
+        v_stmts(ctx, body, false)
+        v_pop(ctx)
+      })
+    }
+    SForIn(idx_name, vname, iter_e, body, _) => {
+      v_expr(ctx, iter_e, false)
+      let elem = match v_expr_ty(ctx, iter_e) {
+        TArray(el) | TFixedArray(el) => el
+        _ => TError
+      }
+      let iter_root = v_place_root(iter_e)
+      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+        let pin_base = ctx.pinned.length()
+        if iter_root != "" {
+          ctx.pinned.push(iter_root)
+        }
+        v_push(ctx)
+        if idx_name != "" {
+          v_define(ctx, idx_name, TInt, vk_local, false)
+        }
+        let k = if v_is_unique(ctx, elem) { vk_borrowed } else { vk_local }
+        v_define(ctx, vname, elem, k, false)
+        v_stmts(ctx, body, false)
+        v_pop(ctx)
+        v_unpin_to(ctx, pin_base)
+      })
+    }
+    SReturn(opt, _) => {
+      match opt {
+        Some(e) => v_expr(ctx, e, true)
+        None => ()
+      }
+      ctx.diverged = true
+    }
+    SBreak(_) | SContinue(_) => ctx.diverged = true
+    SDebugAssert(c, m, _) => {
+      v_expr(ctx, c, false)
+      v_expr(ctx, m, false)
+    }
+    SExpr(e, _) => v_expr(ctx, e, consume)
+  }
+}
+
+///|
+/// Entry point: run the `#verify` rules over one checked function body.
+pub fn verify_check_fn(tc : TypeChecker, fd : FnDecl, finfo : FnInfo, fn_name : String) -> Unit {
+  let ctx = VCtx::{
+    tc: tc,
+    fn_name: fn_name,
+    scopes: [Map([])],
+    moved: vm_new(),
+    diverged: false,
+    reported: Map([]),
+    forbidden_seen: Map([]),
+    pinned: [],
+  }
+  let mut i = 0
+  while i < fd.params.length() && i < finfo.param_tys.length() {
+    let pt = finfo.param_tys[i]
+    v_check_forbidden(ctx, pt, fd.params[i].span)
+    let kind = if fd.params[i].is_mut {
+      vk_mut_param
+    } else if v_is_unique(ctx, pt) {
+      vk_borrowed
+    } else {
+      vk_plain
+    }
+    v_define(ctx, fd.params[i].name, pt, kind, fd.params[i].is_mut)
+    i = i + 1
+  }
+  v_check_forbidden(ctx, finfo.ret_ty, fd.span)
+  let consume_tail = match finfo.ret_ty {
+    TUnit => false
+    _ => true
+  }
+  v_stmts(ctx, fd.body, consume_tail)
+}
