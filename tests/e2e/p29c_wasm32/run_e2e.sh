@@ -3013,4 +3013,208 @@ console.log("  p48a (" + rtLabel + "): " + out1 + " + OOB trap OK (" + trapMsg.s
 ' "$P48A_OK_WASM" "$P48A_TRAP_WASM" "$rt_path"
 done
 
+echo "=== P49-A Flat-Array, Cap0-Push, Short-Slice, StrBuf-Slice & 64-bit Seeded Hash Consistency ==="
+cat > "$TMP_DIR/p49a_fast_paths.pion" <<'EOF'
+struct FlatPair {
+  label : String
+  a : Int
+  b : Int
+}
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn make_key(n : Int) -> String {
+  let sb = StringBuilder::with_capacity(n + 4)
+  let mut i = 0
+  while i < n {
+    let ch = 97 + ((i * 7 + n * 3) % 26)
+    sb.write_byte(ch.to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Array[FlatPair]::with_capacity(5) (flags > 2 pure-Wasm slab alloc + drop)
+  let mut flat_sum = 0
+  let mut iter = 0
+  while iter < 100 {
+    let fields : Array[FlatPair] = Array::with_capacity(5)
+    fields.push(FlatPair::{ label: "k" + iter.to_string(), a: iter, b: iter * 2 })
+    fields.push(FlatPair::{ label: "v" + iter.to_string(), a: iter + 1, b: iter * 3 })
+    flat_sum = flat_sum + fields[0].a + fields[1].b + fields[0].label.length()
+    iter = iter + 1
+  }
+
+  // 2. [].push(...) (cap == 0 pure-Wasm initial slab alloc for scalar, obj, compact byte)
+  let mut empty_sum = 0
+  let mut j = 0
+  while j < 50 {
+    let ai : Array[Int] = []
+    let mut k = 0
+    while k < 12 {
+      ai.push(j + k)
+      k = k + 1
+    }
+    let as_arr : Array[String] = []
+    as_arr.push("s" + j.to_string())
+    as_arr.push("t" + j.to_string())
+    let ab : Array[Byte] = []
+    ab.push((j % 251).to_byte())
+    ab.push(((j + 7) % 251).to_byte())
+    empty_sum = empty_sum + ai[0] + ai[11] + as_arr[1].length() + ab[0].to_int()
+    j = j + 1
+  }
+
+  // 3. str.slice(a, b) for lengths 0..20 + clamping
+  let src = "0123456789abcdefghijklmno"
+  let expect_prefix = "23456789abcdefghijklmno"
+  let mut slice_sum = 0
+  let mut sl = 0
+  while sl <= 20 {
+    let sub = src.slice(2, 2 + sl)
+    must(sub.length() == sl, "slice len")
+    must(expect_prefix.starts_with(sub), "slice content")
+    slice_sum = slice_sum + sub.length()
+    sl = sl + 1
+  }
+  must(src.slice(-5, 3) == "012", "slice clamp neg")
+  must(src.slice(22, 100) == "mno", "slice clamp end")
+  must(src.slice(10, 5) == "", "slice empty")
+
+  // 4. sb.write_substring + write_string + write_string(int.to_string()) (short 0..16B + >16B + grow)
+  let sb = StringBuilder::with_capacity(8)
+  sb.write_substring(src, 0, 0)
+  sb.write_substring(src, 0, 1)
+  sb.write_substring(src, 1, 3)
+  sb.write_substring(src, 3, 6)
+  sb.write_substring(src, 6, 10)
+  sb.write_substring(src, 10, 18)
+  sb.write_substring(src, 18, 25)
+  sb.write_string(":")
+  sb.write_string((-1234567890).to_string())
+  let built = sb.to_string()
+  must(built == "0123456789abcdefghijklmno:-1234567890", "sb build mismatch: " + built)
+
+  // 5. Cross-Wasm/JS 64-bit seeded hash consistency over lengths 0,1,2,3,4,5,6,7,8,9,15,16,17,31,32,33,64 + mapGrow + remove
+  let m : Map[String, Int] = Map::new()
+  let lens : Array[Int] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 15, 16, 17, 31, 32, 33, 64]
+  let mut li = 0
+  while li < lens.length() {
+    let k = make_key(lens[li])
+    m.set(k, lens[li] * 100 + 7)
+    li = li + 1
+  }
+  // Force multiple JS mapGrow rehashes
+  let mut g = 0
+  while g < 60 {
+    m.set("grow_key_" + g.to_string(), g * 13 + 1)
+    g = g + 1
+  }
+  // Verify every length key survived JS mapGrow and matches Wasm map_find/map_get
+  let mut map_sum = 0
+  li = 0
+  while li < lens.length() {
+    let k = make_key(lens[li])
+    must(m.contains(k), "m missing len key")
+    match m.get(k) {
+      Some(v) => {
+        must(v == lens[li] * 100 + 7, "m val mismatch")
+        map_sum = map_sum + v
+      }
+      None => { must(false, "m get none") }
+    }
+    li = li + 1
+  }
+  // Remove & re-insert via JS/Wasm
+  let k7 = make_key(7)
+  let k16 = make_key(16)
+  m.remove(k7)
+  m.remove(k16)
+  must(!m.contains(k7) && !m.contains(k16), "m remove failed")
+  m.set(k7, 777)
+  must(m.contains(k7) && m[k7] == 777, "m reinsert failed")
+
+  io_println(world, "p49a_ok:" + flat_sum.to_string() + ":" + empty_sum.to_string() + ":" + slice_sum.to_string() + ":" + map_sum.to_string())
+  0
+}
+EOF
+P49A_REL_WASM="$TMP_DIR/p49a_rel.wasm"
+P49A_DEV_WASM="$TMP_DIR/p49a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P49A_REL_WASM" "$TMP_DIR/p49a_fast_paths.pion"
+"$PIONC" build --target wasm32 -o "$P49A_DEV_WASM" "$TMP_DIR/p49a_fast_paths.pion"
+for mode_wasm in "release:$P49A_REL_WASM" "dev:$P49A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+PION_HASH_SEED=0x123456789abcdef0 node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p49a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+// Verify slabCtl+64 seed was initialized (for Node rt, must equal PION_HASH_SEED)
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const seedVal = dv.getBigUint64(ctl + 64, true);
+if (rtLabel === "pion_wasm_rt.mjs" && seedVal !== 0x123456789abcdef0n) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): PION_HASH_SEED mismatch:", seedVal.toString(16));
+  process.exit(1);
+}
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || !out.startsWith("p49a_ok:")) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p49a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+// Heap leak check (re-read buffer in case memory grew)
+const dv2 = new DataView(instance.exports.memory.buffer);
+const hp = dv2.getUint32(ctl + 36, true);
+const hb = dv2.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0;
+while (cur + 8 <= hp) {
+  const sz = dv2.getUint32(cur, true);
+  const magic = dv2.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv2.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p49a leaked=" + leaked);
+  process.exit(1);
+}
+console.log("  p49a (" + mode + "/" + rtLabel + "): " + out + " seed=0x" + seedVal.toString(16) + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

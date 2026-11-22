@@ -30,9 +30,26 @@ function fmtG(v, d) {
   return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
 }
 
-function hashBytes(u8, off, len) {
-  let h = 0xcbf29ce484222325n;
-  for (let i = 0; i < len; i++) h = ((h ^ BigInt(u8[off + i])) * 0x100000001b3n) & 0xffffffffffffffffn;
+function hashBytes(u8, dv, off, len, seed) {
+  const K = 0x9e3779b97f4a7c15n;
+  let h = BigInt.asUintN(64, (0x517cc1b727220a95n ^ seed) ^ BigInt.asUintN(64, BigInt(len) * K));
+  let p = off, rem = len;
+  while (rem >= 8) {
+    h = BigInt.asUintN(64, (h ^ dv.getBigUint64(p, true)) * K);
+    h ^= h >> 32n; p += 8; rem -= 8;
+  }
+  let tail = 0n;
+  if (rem >= 4) {
+    tail = BigInt(dv.getUint32(p, true)); p += 4; rem -= 4;
+    if (rem >= 2) { tail |= BigInt(dv.getUint16(p, true)) << 32n; p += 2; rem -= 2; }
+    if (rem === 1) tail |= BigInt(u8[p]) << 48n;
+  } else {
+    if (rem >= 2) { tail = BigInt(dv.getUint16(p, true)); p += 2; rem -= 2; }
+    if (rem === 1) tail |= BigInt(u8[p]) << 16n;
+  }
+  h ^= tail;
+  h = BigInt.asUintN(64, h * 0xbf58476d1ce4e5b9n); h ^= h >> 27n;
+  h = BigInt.asUintN(64, h * 0x94d049bb133111ebn); h ^= h >> 31n;
   return h === 0n ? 1n : h;
 }
 
@@ -46,7 +63,7 @@ function hashI64(k) {
 
 export function createPionRuntime(opts = {}) {
   let memory = opts.memory || null, exp = opts.exports || null, buf = null, dv = null, u8 = null;
-  let heapBase = 0, heapPtr = 0, heapEnd = 0, slabCtl = 0;
+  let heapBase = 0, heapPtr = 0, heapEnd = 0, slabCtl = 0, hashSeed = 0n;
   const free = FREE_CLASSES.map(() => []);
   const largeFree = new Map();
   const channels = new Map();
@@ -79,9 +96,15 @@ export function createPionRuntime(opts = {}) {
     heapBase = (base + 15) & ~15; heapPtr = heapBase; heapEnd = memory.buffer.byteLength;
     const sc = e.__pion_slab_ctl;
     slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
+    if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
+      const sb = new BigUint64Array(1); globalThis.crypto.getRandomValues(sb); hashSeed = sb[0];
+    } else {
+      hashSeed = BigInt.asUintN(64, (BigInt(Math.floor(Math.random() * 0xffffffff)) << 32n) ^ BigInt(Date.now()));
+    }
     if (slabCtl > 0) {
-      u8.fill(0, slabCtl, slabCtl + 64);
+      u8.fill(0, slabCtl, slabCtl + 80);
       su32(slabCtl + 36, heapPtr); su32(slabCtl + 40, heapEnd); su32(slabCtl + 44, heapBase);
+      dv.setBigUint64(slabCtl + 64, hashSeed, true);
     }
     for (let i = 0; i < free.length; i++) free[i].length = 0;
     largeFree.clear();
@@ -526,7 +549,7 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_map_new = (v) => mapNew(v, 0), pion_map_new_int = (v) => mapNew(v, 1);
   const pion_map_len = (m) => { sync(); return g64(pNum(m)); };
-  const mHash = (k, kInt) => (kInt ? hashI64(k) : (sync(), hashBytes(u8, pNum(k) + 8, Number(g64(pNum(k))))));
+  const mHash = (k, kInt) => (kInt ? hashI64(k) : (sync(), hashBytes(u8, dv, pNum(k) + 8, Number(g64(pNum(k))), hashSeed)));
   const mEq = (a, b, kInt) => (kInt ? a === b : pion_str_eq(a, b) !== 0);
   function mapGrow(p) {
     sync(); const oc = Number(g64(p + 8)), oe = Number(g64(p + 24)), nc = oc < 16 ? 16 : oc * 2;

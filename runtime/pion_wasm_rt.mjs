@@ -89,14 +89,46 @@ function formatG(v, sigDigits) {
   return s;
 }
 
-function hashBytesFNV1a(u8, off, len) {
-  let h = 0xcbf29ce484222325n;
-  const prime = 0x100000001b3n;
-  const mask = 0xffffffffffffffffn;
-  for (let i = 0; i < len; i++) {
-    h ^= BigInt(u8[off + i]);
-    h = (h * prime) & mask;
+function hashBytes64(u8, dv, off, len, seed) {
+  const K = 0x9e3779b97f4a7c15n;
+  let h = BigInt.asUintN(64, (0x517cc1b727220a95n ^ seed) ^ BigInt.asUintN(64, BigInt(len) * K));
+  let p = off;
+  let rem = len;
+  while (rem >= 8) {
+    const w = dv.getBigUint64(p, true);
+    h = BigInt.asUintN(64, (h ^ w) * K);
+    h ^= h >> 32n;
+    p += 8;
+    rem -= 8;
   }
+  let tail = 0n;
+  if (rem >= 4) {
+    tail = BigInt(dv.getUint32(p, true));
+    p += 4;
+    rem -= 4;
+    if (rem >= 2) {
+      tail |= BigInt(dv.getUint16(p, true)) << 32n;
+      p += 2;
+      rem -= 2;
+    }
+    if (rem === 1) {
+      tail |= BigInt(u8[p]) << 48n;
+    }
+  } else {
+    if (rem >= 2) {
+      tail = BigInt(dv.getUint16(p, true));
+      p += 2;
+      rem -= 2;
+    }
+    if (rem === 1) {
+      tail |= BigInt(u8[p]) << 16n;
+    }
+  }
+  h ^= tail;
+  h = BigInt.asUintN(64, h * 0xbf58476d1ce4e5b9n);
+  h ^= h >> 27n;
+  h = BigInt.asUintN(64, h * 0x94d049bb133111ebn);
+  h ^= h >> 31n;
   return h === 0n ? 1n : h;
 }
 
@@ -121,6 +153,7 @@ export function createPionRuntime(options = {}) {
   let heapPtr = 0;
   let heapEnd = 0;
   let slabCtl = 0;
+  let hashSeed = 0n;
   let freeLists = null;
   const largeFree = new Map();
 
@@ -177,11 +210,21 @@ export function createPionRuntime(options = {}) {
     heapEnd = memory.buffer.byteLength;
     const sc = exp.__pion_slab_ctl;
     slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
+    if (isNode && typeof process !== "undefined" && process.env && process.env.PION_HASH_SEED !== undefined && process.env.PION_HASH_SEED !== "") {
+      hashSeed = BigInt.asUintN(64, BigInt(process.env.PION_HASH_SEED));
+    } else if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
+      const seedBuf = new BigUint64Array(1);
+      globalThis.crypto.getRandomValues(seedBuf);
+      hashSeed = seedBuf[0];
+    } else {
+      hashSeed = BigInt.asUintN(64, (BigInt(Date.now()) * 0x9e3779b97f4a7c15n) ^ 0xbf58476d1ce4e5b9n);
+    }
     if (slabCtl > 0) {
-      u8.fill(0, slabCtl, slabCtl + 64);
+      u8.fill(0, slabCtl, slabCtl + 80);
       dv.setUint32(slabCtl + 36, heapPtr >>> 0, true);
       dv.setUint32(slabCtl + 40, heapEnd >>> 0, true);
       dv.setUint32(slabCtl + 44, heapBase >>> 0, true);
+      dv.setBigUint64(slabCtl + 64, hashSeed, true);
     }
     if (freeLists) {
       for (let i = 0; i < freeLists.length; i++) {
@@ -1339,7 +1382,7 @@ export function createPionRuntime(options = {}) {
     const pk = pNum(key);
     syncViews();
     const len = Number(dv.getBigInt64(pk, true));
-    return hashBytesFNV1a(u8, pk + 8, len);
+    return hashBytes64(u8, dv, pk + 8, len, hashSeed);
   }
 
   function mapKeyEq(a, b, keyIsInt) {
