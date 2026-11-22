@@ -882,4 +882,152 @@ console.log("  slab_mix (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (
 ' "$SLAB_WASM" "$rt_path"
 done
 
+echo "=== P29-C [12/12] Pure-Wasm String & HashMap Hot Paths (INT64_MIN, str_eq, concat_n, Map grow + RC) ==="
+cat > "$TMP_DIR/str_map_fast.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. pion_int_to_str: 0, positive, negative, INT64_MIN, INT64_MAX
+  let i64_min : Int64 = -9223372036854775807L - 1L
+  let i64_max : Int64 = 9223372036854775807L
+  must((0L).to_string() == "0", "0L")
+  must((-1L).to_string() == "-1", "-1L")
+  must((42L).to_string() == "42", "42L")
+  must(i64_min.to_string() == "-9223372036854775808", "INT64_MIN")
+  must(i64_max.to_string() == "9223372036854775807", "INT64_MAX")
+
+  // 2. pion_str_eq: empty, short, 8B-aligned, long, mismatch
+  must("" == "", "empty eq")
+  must(("" + "x") == "x", "empty concat eq")
+  must("a" != "b", "short ne")
+  must("12345678" == "12345678", "8B eq")
+  must("12345678" != "12345679", "8B ne")
+  must("abcdefghijklmnop123" == "abcdefghijklmnop123", "long eq")
+  must("abcdefghijklmnop123" != "abcdefghijklmnop124", "long tail ne")
+
+  // 3. pion_str_concat + pion_str_concat_n
+  let c2 = "hello" + "_world"
+  let c4 = "k_" + (123).to_string() + "_" + (-45).to_string()
+  must(c2 == "hello_world", "concat2")
+  must(c4 == "k_123_-45", "concat4")
+
+  // 4. Map[String, Int] across multiple mapGrow resizes
+  let msi : Map[String, Int] = Map::new()
+  let mut i = 0
+  while i < 400 {
+    let k = "key_" + i.to_string() + "_" + (i * 7).to_string()
+    msi.set(k, i * 3 + 1)
+    i = i + 1
+  }
+  // Overwrite subset
+  let mut j = 0
+  while j < 100 {
+    let k = "key_" + j.to_string() + "_" + (j * 7).to_string()
+    msi.set(k, j * 5 + 2)
+    j = j + 1
+  }
+  let mut sum_si = 0
+  let mut q = 0
+  while q < 400 {
+    let k = "key_" + q.to_string() + "_" + (q * 7).to_string()
+    must(msi.contains(k), "msi contains")
+    match msi.get(k) {
+      Some(v) => { sum_si = sum_si + v }
+      None => { must(false, "msi missing") }
+    }
+    must(!msi.contains("nope_" + q.to_string()), "msi miss")
+    q = q + 1
+  }
+  msi.remove("key_10_70")
+  must(!msi.contains("key_10_70") && msi.length() == 399, "msi remove")
+
+  // 5. Map[String, String] (val_is_obj=1) with repeated overwrites, self-assignment + clear (RC leak check)
+  let mss : Map[String, String] = Map::new()
+  mss.set("a", "self_" + (99).to_string())
+  match mss.get("a") {
+    Some(same_v) => { mss.set("a", same_v) }
+    None => { must(false, "mss self missing") }
+  }
+  must(mss["a"] == "self_99", "mss self-assign")
+  mss.remove("a")
+  let mut r = 0
+  while r < 200 {
+    let k = "s_" + (r % 32).to_string()
+    let v = "val_" + r.to_string() + "_" + (r * 13).to_string()
+    mss.set(k, v)
+    r = r + 1
+  }
+  must(mss.length() == 32, "mss len")
+  must(mss["s_0"] == "val_192_2496", "mss overwrite")
+  mss.clear()
+
+  // 6. Map[Int, String] (key_is_int=1) across mapGrow + negative keys + remove
+  let mis : Map[Int, String] = Map::new()
+  let mut t = -150
+  while t < 150 {
+    mis.set(t, "n" + t.to_string())
+    t = t + 1
+  }
+  must(mis.length() == 300, "mis len")
+  must(mis[-150] == "n-150" && mis[0] == "n0" && mis[149] == "n149", "mis get")
+  mis.remove(0)
+  must(!mis.contains(0) && mis.length() == 299, "mis remove")
+
+  io_println(world, sum_si.to_string() + ":" + c4)
+  0
+}
+EOF
+STR_MAP_WASM="$TMP_DIR/str_map_fast.wasm"
+STR_MAP_DEV_WASM="$TMP_DIR/str_map_fast_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$STR_MAP_WASM" "$TMP_DIR/str_map_fast.pion"
+"$PIONC" build --target wasm32 -o "$STR_MAP_DEV_WASM" "$TMP_DIR/str_map_fast.pion"
+for mode_wasm in "release:$STR_MAP_WASM" "dev:$STR_MAP_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): str_map_fast.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+// sum_{0..99}(5j+2) = 5*4950+200 = 24950; sum_{100..399}(3q+1) = 3*(79800-4950)+300 = 224850 => 249800
+if ((rc | 0) !== 0 || out !== "249800:k_123_-45") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): str_map_fast mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): str_map_fast linear memory leaked:", memBytes);
+  process.exit(1);
+}
+console.log("  str_map_fast (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
