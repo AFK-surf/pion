@@ -376,7 +376,7 @@ export function createPionRuntime(options = {}) {
       dv.setUint32(hdr + 4, rc, true);
     }
     if (rc !== 0) return;
-    pion_rc_dec_slow(obj);
+    imports.pion_rt.pion_rc_dec_slow(obj);
   }
 
   function pion_rc_freeze(obj) {
@@ -1006,9 +1006,7 @@ export function createPionRuntime(options = {}) {
     const len = dv.getBigInt64(p, true);
     if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
     const dp = Number(dv.getBigInt64(p + 24, true));
-    const val = dv.getBigInt64(dp + Number(idx) * 8, true);
-    if (dv.getInt32(p + 16, true) && val !== 0n) pion_rc_inc(val);
-    return val;
+    return dv.getBigInt64(dp + Number(idx) * 8, true);
   }
 
   function pion_arr_set(a, idx, val) {
@@ -1268,9 +1266,7 @@ export function createPionRuntime(options = {}) {
     if (slot < 0) return 0n;
     syncViews();
     const entries = Number(dv.getBigInt64(p + 24, true));
-    const val = dv.getBigInt64(entries + slot * 32 + 16, true);
-    if (dv.getInt32(p + 16, true) && val !== 0n) pion_rc_inc(val);
-    return val;
+    return dv.getBigInt64(entries + slot * 32 + 16, true);
   }
 
   function pion_map_try_get(m, key, outValPtr) {
@@ -1284,8 +1280,6 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const entries = Number(dv.getBigInt64(p + 24, true));
     const val = dv.getBigInt64(entries + slot * 32 + 16, true);
-    if (dv.getInt32(p + 16, true) && val !== 0n) pion_rc_inc(val);
-    syncViews();
     if (op) dv.setBigInt64(op, val, true);
     return 1;
   }

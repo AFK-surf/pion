@@ -285,12 +285,16 @@ pub fn main(world : World) -> Int {
 EOF
 LARGE_WASM="$TMP_DIR/large_recycle.wasm"
 "$PIONC" build --release --target wasm32 -o "$LARGE_WASM" "$TMP_DIR/large_recycle.pion"
+PION_WASM_RT_WEB="$ROOT_DIR/runtime/pion_wasm_rt_web.mjs"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
 node --input-type=module -e '
 import fs from "node:fs";
+import path from "node:path";
 import { pathToFileURL } from "node:url";
 
 const wasmPath = process.argv[1];
 const rtPath = process.argv[2];
+const rtLabel = path.basename(rtPath);
 const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
 
 const outLines = [];
@@ -304,18 +308,18 @@ rt.bindExports(instance.exports);
 
 const rc = instance.exports.main(0, 0n);
 if ((rc | 0) !== 0) {
-  console.error("FAIL: large_recycle exited with", rc);
+  console.error("FAIL (" + rtLabel + "): large_recycle exited with", rc);
   process.exit(1);
 }
 const out = outLines.join("").trim();
 if (out !== "14850") {
-  console.error("FAIL: large_recycle checksum mismatch: expected 14850, got", JSON.stringify(out));
+  console.error("FAIL (" + rtLabel + "): large_recycle checksum mismatch: expected 14850, got", JSON.stringify(out));
   process.exit(1);
 }
 const memBytes = instance.exports.memory.buffer.byteLength;
 const limitBytes = 16 * 1024 * 1024;
 if (memBytes > limitBytes) {
-  console.error("FAIL: large_recycle linear memory grew too large:", memBytes, ">", limitBytes);
+  console.error("FAIL (" + rtLabel + "): large_recycle linear memory grew too large:", memBytes, ">", limitBytes);
   process.exit(1);
 }
 
@@ -328,11 +332,11 @@ pion_ptr_free(p1); // double-free of free-listed block
 const q1 = pion_ptr_alloc(4096n);
 const q2 = pion_ptr_alloc(4096n);
 if (q1 !== p1) {
-  console.error("FAIL: expected q1 to reuse p1:", q1, "!==", p1);
+  console.error("FAIL (" + rtLabel + "): expected q1 to reuse p1:", q1, "!==", p1);
   process.exit(1);
 }
 if (q2 === q1) {
-  console.error("FAIL: double-free duplicated p1 in free-list:", q1, "===", q2);
+  console.error("FAIL (" + rtLabel + "): double-free duplicated p1 in free-list:", q1, "===", q2);
   process.exit(1);
 }
 // Also double-free a heap-top LIFO block and confirm clean subsequent alloc
@@ -340,14 +344,157 @@ pion_ptr_free(q2);
 pion_ptr_free(q2);
 const q3 = pion_ptr_alloc(4096n);
 if (q3 !== q2) {
-  console.error("FAIL: expected q3 to reuse LIFO-shrunk q2:", q3, "!==", q2);
+  console.error("FAIL (" + rtLabel + "): expected q3 to reuse LIFO-shrunk q2:", q3, "!==", q2);
   process.exit(1);
 }
 pion_ptr_free(q3);
 pion_ptr_free(q1);
 pion_ptr_free(p2);
 
-console.log("  large_recycle (wasm32): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=16MiB) double-free=OK");
-' "$LARGE_WASM" "$PION_WASM_RT"
+console.log("  large_recycle (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=16MiB) double-free=OK");
+' "$LARGE_WASM" "$rt_path"
+done
+
+echo "=== P29-C [8/8] Map/Array Read Zero RC Leak Regression (Node + Web Runtimes) ==="
+cat > "$TMP_DIR/rc_read_leak.pion" <<'EOF'
+struct Box {
+  payload : Array[Int]
+}
+
+pub fn main(world : World) -> Int {
+  let mut checksum : Int = 0
+  let mut r = 0
+  while r < 200 {
+    let ms : Map[String, Box] = Map::new()
+    let mi : Map[Int, Box] = Map::new()
+    let arr : Array[Box] = Array::new()
+    let mut i = 0
+    while i < 16 {
+      let key = "k" + i.to_string()
+      ms.set(key, Box::{ payload: Array::make(512, r + i) })
+      mi.set(i, Box::{ payload: Array::make(512, r + i + 1) })
+      arr.push(Box::{ payload: Array::make(512, r + i + 2) })
+      i = i + 1
+    }
+    let mut j = 0
+    while j < 16 {
+      let key = "k" + j.to_string()
+      match ms.get(key) {
+        Some(b) => { checksum = checksum + b.payload[0] }
+        None => { checksum = checksum - 1000000 }
+      }
+      let bs = ms[key]
+      checksum = checksum + bs.payload[511]
+      match mi.get(j) {
+        Some(b) => { checksum = checksum + b.payload[0] }
+        None => { checksum = checksum - 1000000 }
+      }
+      let bi = mi[j]
+      checksum = checksum + bi.payload[511]
+      let ba = arr[j]
+      checksum = checksum + ba.payload[0] + ba.payload[511]
+      j = j + 1
+    }
+    ms.clear()
+    mi.clear()
+    arr.clear()
+    r = r + 1
+  }
+  io_println(world, checksum.to_string())
+  0
+}
+EOF
+RC_LEAK_WASM="$TMP_DIR/rc_read_leak.wasm"
+"$PIONC" build --release --target wasm32 -o "$RC_LEAK_WASM" "$TMP_DIR/rc_read_leak.pion"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const outLines = [];
+const rt = createPionRuntime({
+  print: (s) => outLines.push(s),
+  println: (s) => outLines.push(s + "\n"),
+});
+
+let allocStructs = 0;
+let freedStructs = 0;
+let memRef = null;
+const prt = rt.imports.pion_rt;
+const origAlloc = prt.pion_alloc;
+const origAllocUninit = prt.pion_alloc_uninit;
+const origRcDecSlow = prt.pion_rc_dec_slow;
+
+prt.pion_alloc = (sz, tag, dropFn) => {
+  if ((tag & 0xffff) === 4) allocStructs++;
+  return origAlloc(sz, tag, dropFn);
+};
+prt.pion_alloc_uninit = (sz, tag, dropFn) => {
+  if ((tag & 0xffff) === 4) allocStructs++;
+  return origAllocUninit(sz, tag, dropFn);
+};
+prt.pion_rc_dec_slow = (obj) => {
+  const p = Number(obj);
+  if (p !== 0 && memRef) {
+    const tag = new DataView(memRef.buffer).getUint16(p - 24 + 12, true);
+    if (tag === 4) freedStructs++;
+  }
+  return origRcDecSlow(obj);
+};
+
+const bytes = fs.readFileSync(wasmPath);
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+memRef = instance.exports.memory;
+
+const rc = instance.exports.main(0, 0n);
+if ((rc | 0) !== 0) {
+  console.error("FAIL (" + rtLabel + "): rc_read_leak exited with", rc);
+  process.exit(1);
+}
+const out = outLines.join("").trim();
+if (out !== "2073600") {
+  console.error("FAIL (" + rtLabel + "): rc_read_leak checksum mismatch: expected 2073600, got", JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = memRef.buffer.byteLength;
+const limitBytes = 16 * 1024 * 1024;
+if (memBytes > limitBytes) {
+  console.error("FAIL (" + rtLabel + "): rc_read_leak linear memory grew too large:", memBytes, ">", limitBytes);
+  process.exit(1);
+}
+const liveStructs = allocStructs - freedStructs;
+if (allocStructs <= 0 || liveStructs !== 0) {
+  console.error("FAIL (" + rtLabel + "): TAG_STRUCT RC leak detected: alloc=" + allocStructs + " freed=" + freedStructs + " live=" + liveStructs);
+  process.exit(1);
+}
+
+// Direct pion_arr_get check: must NOT increment element local_rc
+const arrPtr = prt.pion_arr_new(1n, 1);
+const elemPtr = origAlloc(16, 4, 0n);
+prt.pion_arr_push(arrPtr, elemPtr);
+const rcBefore = new DataView(memRef.buffer).getUint32(Number(elemPtr) - 24 + 4, true);
+const gotPtr = prt.pion_arr_get(arrPtr, 0n);
+const rcAfter = new DataView(memRef.buffer).getUint32(Number(elemPtr) - 24 + 4, true);
+if (gotPtr !== elemPtr) {
+  console.error("FAIL (" + rtLabel + "): pion_arr_get returned wrong ptr:", gotPtr, "!==", elemPtr);
+  process.exit(1);
+}
+if (rcAfter !== rcBefore) {
+  console.error("FAIL (" + rtLabel + "): pion_arr_get mutated element local_rc:", rcBefore, "->", rcAfter);
+  process.exit(1);
+}
+prt.pion_rc_dec(elemPtr);
+prt.pion_rc_dec(arrPtr);
+
+console.log("  rc_read_leak (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=16MiB) allocStructs=" + allocStructs + " liveStructs=" + liveStructs + " arr_get_rc=" + rcBefore + "->" + rcAfter + " OK");
+' "$RC_LEAK_WASM" "$rt_path"
+done
 
 echo "p29c_wasm32 E2E: OK"
