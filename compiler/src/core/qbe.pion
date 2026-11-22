@@ -162,6 +162,7 @@ pub struct QbeGen {
   const_int_vals : Map[String, Int]
   const_i64_vals : Map[String, Int64]
   const_bool_vals : Map[String, Bool]
+  global_min_len_arrs : Map[String, Int]
   freeze_fn_seen : Map[String, Bool]
   eq_fn_seen : Map[String, Bool]
   strings : Array[String]
@@ -5886,10 +5887,392 @@ fn qbe_invalidate_known_min_len_if_dyn(g : QbeGen, name : String) -> Unit {
   match qbe_lookup_local(g, name) {
     Some(loc) =>
       match loc.ty {
-        TFixedArray(_) => ()
+        TFixedArray(_) | TString | TBytes => ()
         _ => g.known_min_len_arrs.remove(name)
       }
     None => g.known_min_len_arrs.remove(name)
+  }
+}
+
+///|
+fn qbe_eval_const_int_expr(g : QbeGen, e : Expr) -> Option[Int] {
+  match e {
+    EInt(raw, _) => Some(qbe_parse_int64_lit(raw).to_int())
+    EIdent(name, _) =>
+      match qbe_lookup_local(g, name) {
+        Some(_) => None
+        None => g.const_int_vals.get(name)
+      }
+    _ => None
+  }
+}
+
+///|
+fn qbe_expr_is_u7_range(g : QbeGen, e : Expr) -> Bool {
+  match e {
+    EBinary("&", l, r, _) => {
+      let l_ok = match qbe_eval_const_int_expr(g, l) {
+        Some(v) => v >= 0 && v <= 127
+        None => false
+      }
+      let r_ok = match qbe_eval_const_int_expr(g, r) {
+        Some(v) => v >= 0 && v <= 127
+        None => false
+      }
+      l_ok || r_ok
+    }
+    _ => false
+  }
+}
+
+///|
+fn qbe_expr_as_len_target(g : QbeGen, e : Expr) -> String {
+  let cand = match e {
+    EMethodCall(EIdent(an, _), mn, ma, _) =>
+      if mn == "length" && ma.length() == 0 {
+        an
+      } else {
+        ""
+      }
+    EIdent(n_name, _) =>
+      match g.len_aliases.get(n_name) {
+        Some(an) => an
+        None => ""
+      }
+    _ => ""
+  }
+  if cand == "" {
+    return ""
+  }
+  match qbe_lookup_local(g, cand) {
+    Some(loc) =>
+      if !loc.is_cell {
+        match loc.ty {
+          TFixedArray(_) | TArray(_) | TString | TBytes => cand
+          _ => ""
+        }
+      } else {
+        ""
+      }
+    None => ""
+  }
+}
+
+///|
+fn qbe_collect_pos_min_lens(
+  g : QbeGen,
+  cond : Expr,
+  out_names : Array[String],
+  out_mins : Array[Int],
+) -> Unit {
+  match cond {
+    EBinary("&&", l, r, _) => {
+      qbe_collect_pos_min_lens(g, l, out_names, out_mins)
+      qbe_collect_pos_min_lens(g, r, out_names, out_mins)
+    }
+    EBinary(">=", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, lhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, rhs) {
+          Some(k) =>
+            if k >= 1 {
+              out_names.push(an)
+              out_mins.push(k)
+            }
+          None => ()
+        }
+      }
+    }
+    EBinary("==", lhs, rhs, _) => {
+      let an_l = qbe_expr_as_len_target(g, lhs)
+      if an_l != "" {
+        match qbe_eval_const_int_expr(g, rhs) {
+          Some(k) =>
+            if k >= 1 {
+              out_names.push(an_l)
+              out_mins.push(k)
+            }
+          None => ()
+        }
+      } else {
+        let an_r = qbe_expr_as_len_target(g, rhs)
+        if an_r != "" {
+          match qbe_eval_const_int_expr(g, lhs) {
+            Some(k) =>
+              if k >= 1 {
+                out_names.push(an_r)
+                out_mins.push(k)
+              }
+            None => ()
+          }
+        }
+      }
+    }
+    EBinary(">", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, lhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, rhs) {
+          Some(k) =>
+            if k >= 0 && k < 2147483647 {
+              out_names.push(an)
+              out_mins.push(k + 1)
+            }
+          None => ()
+        }
+      }
+    }
+    EBinary("<=", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, rhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, lhs) {
+          Some(k) =>
+            if k >= 1 {
+              out_names.push(an)
+              out_mins.push(k)
+            }
+          None => ()
+        }
+      }
+    }
+    EBinary("<", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, rhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, lhs) {
+          Some(k) =>
+            if k >= 0 && k < 2147483647 {
+              out_names.push(an)
+              out_mins.push(k + 1)
+            }
+          None => ()
+        }
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn qbe_collect_neg_min_lens(
+  g : QbeGen,
+  cond : Expr,
+  out_names : Array[String],
+  out_mins : Array[Int],
+) -> Unit {
+  match cond {
+    EBinary("||", l, r, _) => {
+      qbe_collect_neg_min_lens(g, l, out_names, out_mins)
+      qbe_collect_neg_min_lens(g, r, out_names, out_mins)
+    }
+    EBinary("<", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, lhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, rhs) {
+          Some(k) =>
+            if k >= 1 {
+              out_names.push(an)
+              out_mins.push(k)
+            }
+          None => ()
+        }
+      }
+    }
+    EBinary("!=", lhs, rhs, _) => {
+      let an_l = qbe_expr_as_len_target(g, lhs)
+      if an_l != "" {
+        match qbe_eval_const_int_expr(g, rhs) {
+          Some(k) =>
+            if k >= 1 {
+              out_names.push(an_l)
+              out_mins.push(k)
+            }
+          None => ()
+        }
+      } else {
+        let an_r = qbe_expr_as_len_target(g, rhs)
+        if an_r != "" {
+          match qbe_eval_const_int_expr(g, lhs) {
+            Some(k) =>
+              if k >= 1 {
+                out_names.push(an_r)
+                out_mins.push(k)
+              }
+            None => ()
+          }
+        }
+      }
+    }
+    EBinary("<=", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, lhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, rhs) {
+          Some(k) =>
+            if k >= 0 && k < 2147483647 {
+              out_names.push(an)
+              out_mins.push(k + 1)
+            }
+          None => ()
+        }
+      }
+    }
+    EBinary(">", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, rhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, lhs) {
+          Some(k) =>
+            if k >= 1 {
+              out_names.push(an)
+              out_mins.push(k)
+            }
+          None => ()
+        }
+      }
+    }
+    EBinary(">=", lhs, rhs, _) => {
+      let an = qbe_expr_as_len_target(g, rhs)
+      if an != "" {
+        match qbe_eval_const_int_expr(g, lhs) {
+          Some(k) =>
+            if k >= 0 && k < 2147483647 {
+              out_names.push(an)
+              out_mins.push(k + 1)
+            }
+          None => ()
+        }
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn qbe_cond_min_len_safe(g : QbeGen, cond : Expr, nm : String) -> Bool {
+  if qbe_expr_assigns_ident(cond, nm) {
+    return false
+  }
+  match qbe_lookup_local(g, nm) {
+    Some(loc) =>
+      match loc.ty {
+        TArray(_) => qbe_arr_is_stable_expr(cond, nm, true)
+        _ => true
+      }
+    None => false
+  }
+}
+
+///|
+fn qbe_apply_min_lens(
+  g : QbeGen,
+  cond : Expr,
+  names : Array[String],
+  mins : Array[Int],
+) -> Unit {
+  let mut i = 0
+  while i < names.length() {
+    let nm = names[i]
+    if qbe_cond_min_len_safe(g, cond, nm) {
+      let ml = mins[i]
+      let cur = match g.known_min_len_arrs.get(nm) {
+        Some(v) => v
+        None => 0
+      }
+      if ml > cur {
+        g.known_min_len_arrs.set(nm, ml)
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn qbe_stmt_const_inc_step(s : Stmt, name : String) -> Int {
+  match s {
+    SAssign(EIdent(lhs_n, _), EBinary("+", EIdent(rhs_n, _), EInt(raw, _), _), _) =>
+      if lhs_n == name && rhs_n == name {
+        let v = qbe_parse_int64_lit(raw)
+        if v >= 1L && v <= 32L { v.to_int() } else { 0 }
+      } else {
+        0
+      }
+    SCompoundAssign("+", EIdent(lhs_n, _), EInt(raw, _), _) =>
+      if lhs_n == name {
+        let v = qbe_parse_int64_lit(raw)
+        if v >= 1L && v <= 32L { v.to_int() } else { 0 }
+      } else {
+        0
+      }
+    _ => 0
+  }
+}
+
+///|
+/// Collect provably overflow-free `iv <= len(x) - K` (0 <= c < K) and
+/// `iv < len(x) - K` (0 <= c <= K) window BCE keys for a `then` block.
+fn qbe_collect_pos_window_bce(
+  g : QbeGen,
+  cond : Expr,
+  body : Array[Stmt],
+  out_keys : Array[String],
+) -> Unit {
+  match cond {
+    EBinary("&&", l, r, _) => {
+      qbe_collect_pos_window_bce(g, l, body, out_keys)
+      qbe_collect_pos_window_bce(g, r, body, out_keys)
+    }
+    EBinary(op, EIdent(iv, _), EBinary("-", len_e, k_e, _), _) =>
+      if op == "<=" || op == "<" {
+        let mut iv_ok = false
+        match qbe_lookup_local(g, iv) {
+          Some(iloc) =>
+            match iloc.ty {
+              TInt =>
+                match g.nonneg_vars.get(iv) {
+                  Some(true) => iv_ok = true
+                  _ => ()
+                }
+              _ => ()
+            }
+          None => ()
+        }
+        let arr = qbe_expr_as_len_target(g, len_e)
+        let arr_stable = if arr == "" {
+          false
+        } else {
+          match qbe_lookup_local(g, arr) {
+            Some(aloc) =>
+              match aloc.ty {
+                TArray(_) =>
+                  qbe_arr_is_stable_expr(cond, arr, true) &&
+                  qbe_arr_is_stable_stmts(body, 0, arr, true)
+                _ =>
+                  !qbe_expr_assigns_ident(cond, arr) &&
+                  !qbe_stmts_assigns_ident(body, arr) &&
+                  !qbe_stmts_rebinds_ident(body, arr)
+              }
+            None => false
+          }
+        }
+        if iv_ok &&
+          arr_stable &&
+          !qbe_expr_assigns_ident(cond, iv) &&
+          !qbe_stmts_assigns_ident(body, iv) &&
+          !qbe_stmts_rebinds_ident(body, iv) {
+          match qbe_eval_const_int_expr(g, k_e) {
+            Some(k) => {
+              let max_excl = if op == "<=" { k } else { k + 1 }
+              if max_excl >= 1 && max_excl <= 32 {
+                out_keys.push(arr + ":iv:" + iv)
+                let mut c = 0
+                while c < max_excl {
+                  out_keys.push(arr + ":iv+:" + iv + ":" + c.to_string())
+                  c = c + 1
+                }
+              }
+            }
+            None => ()
+          }
+        }
+      }
+    _ => ()
   }
 }
 
@@ -5981,8 +6364,35 @@ fn qbe_bce_expr_is_safe(g : QbeGen, arr : String, idx : Expr) -> Bool {
   if matched {
     return true
   }
-  match g.known_min_len_arrs.get(arr) {
-    Some(min_len) => min_len >= 256 && qbe_expr_is_u8_range(g, idx)
+  let min_len_opt = match g.known_min_len_arrs.get(arr) {
+    Some(ml) => Some(ml)
+    None =>
+      match qbe_lookup_local(g, arr) {
+        Some(_) => None
+        None =>
+          if g.mono_pkg == "" {
+            g.global_min_len_arrs.get(arr)
+          } else {
+            None
+          }
+      }
+  }
+  match min_len_opt {
+    Some(min_len) => {
+      if min_len >= 256 && qbe_expr_is_u8_range(g, idx) {
+        return true
+      }
+      if min_len >= 128 && qbe_expr_is_u7_range(g, idx) {
+        return true
+      }
+      match idx {
+        EInt(raw, _) => {
+          let k = qbe_parse_int64_lit(raw)
+          k >= 0L && k < min_len.to_int64()
+        }
+        _ => false
+      }
+    }
     None => false
   }
 }
@@ -10482,6 +10892,7 @@ fn qbe_new_for_target(
     const_int_vals: Map([]),
     const_i64_vals: Map([]),
     const_bool_vals: Map([]),
+    global_min_len_arrs: Map([]),
     freeze_fn_seen: Map([]),
     eq_fn_seen: Map([]),
     strings: [],
@@ -12265,6 +12676,24 @@ fn qbe_record_scalar_const(g : QbeGen, cd : ConstDecl, cty : Ty) -> Unit {
     TBool =>
       match cd.value {
         EBool(b, _) => g.const_bool_vals.set(cd.name, b)
+        _ => ()
+      }
+    TFixedArray(_) =>
+      match cd.value {
+        EArrayLit(elems, _) =>
+          if elems.length() >= 1 {
+            g.global_min_len_arrs.set(cd.name, elems.length())
+          }
+        ECall(EPath("FixedArray", "make", _), args, _) =>
+          if args.length() == 2 {
+            match qbe_eval_const_int_expr(g, args[0]) {
+              Some(n) =>
+                if n >= 1 {
+                  g.global_min_len_arrs.set(cd.name, n)
+                }
+              None => ()
+            }
+          }
         _ => ()
       }
     _ => ()
@@ -22792,7 +23221,10 @@ fn qbe_emit_expr_inner(
                   _ => ()
                 }
                 }
-              None => ()
+              None =>
+                if g.mono_pkg == "" && g.global_min_len_arrs.contains(lname) {
+                  arr_local_name = lname
+                }
             }
           EField(EIdent(vname, _), fname, _) => {
             let fkey = vname + "." + fname
@@ -23617,13 +24049,58 @@ fn qbe_emit_expr_inner(
             qbe_emit_lbl(g, l_then)
             qbe_scope_push(g)
           }
+          let pos_names : Array[String] = []
+          let pos_mins : Array[Int] = []
+          qbe_collect_pos_min_lens(g, cond, pos_names, pos_mins)
+          let saved_pos_vals : Array[Option[Int]] = []
+          let mut pni = 0
+          while pni < pos_names.length() {
+            saved_pos_vals.push(g.known_min_len_arrs.get(pos_names[pni]))
+            pni = pni + 1
+          }
+          qbe_apply_min_lens(g, cond, pos_names, pos_mins)
+          let win_keys : Array[String] = []
+          qbe_collect_pos_window_bce(g, cond, then_stmts, win_keys)
+          let added_win : Array[String] = []
+          let mut wki = 0
+          while wki < win_keys.length() {
+            let wk = win_keys[wki]
+            if !g.bce_safe_exprs.contains(wk) {
+              g.bce_safe_exprs.set(wk, true)
+              added_win.push(wk)
+            }
+            wki = wki + 1
+          }
           let tv = qbe_emit_stmts(g, then_stmts, None)
-          if !g.block_term {
+          let then_term = g.block_term
+          wki = 0
+          while wki < added_win.length() {
+            g.bce_safe_exprs.remove(added_win[wki])
+            wki = wki + 1
+          }
+          pni = pos_names.length() - 1
+          while pni >= 0 {
+            let nm = pos_names[pni]
+            if then_term || g.known_min_len_arrs.contains(nm) {
+              match saved_pos_vals[pni] {
+                Some(old_v) => g.known_min_len_arrs.set(nm, old_v)
+                None => g.known_min_len_arrs.remove(nm)
+              }
+            }
+            pni = pni - 1
+          }
+          if !then_term {
             qbe_rc_dec(g, tv.reg, tv.ty)
           }
           qbe_scope_pop(g)
           qbe_emit_term(g, "jmp " + l_end)
           qbe_emit_lbl(g, l_end)
+          if then_term {
+            let neg_names : Array[String] = []
+            let neg_mins : Array[Int] = []
+            qbe_collect_neg_min_lens(g, cond, neg_names, neg_mins)
+            qbe_apply_min_lens(g, cond, neg_names, neg_mins)
+          }
           qval("0", TUnit)
         }
         Some(el) => {
@@ -23696,8 +24173,49 @@ fn qbe_emit_expr_inner(
             qbe_emit_lbl(g, l_then)
             qbe_scope_push(g)
           }
+          let pos_names : Array[String] = []
+          let pos_mins : Array[Int] = []
+          qbe_collect_pos_min_lens(g, cond, pos_names, pos_mins)
+          let saved_pos_vals : Array[Option[Int]] = []
+          let mut pni = 0
+          while pni < pos_names.length() {
+            saved_pos_vals.push(g.known_min_len_arrs.get(pos_names[pni]))
+            pni = pni + 1
+          }
+          qbe_apply_min_lens(g, cond, pos_names, pos_mins)
+          let win_keys : Array[String] = []
+          qbe_collect_pos_window_bce(g, cond, then_stmts, win_keys)
+          let added_win : Array[String] = []
+          let mut wki = 0
+          while wki < win_keys.length() {
+            let wk = win_keys[wki]
+            if !g.bce_safe_exprs.contains(wk) {
+              g.bce_safe_exprs.set(wk, true)
+              added_win.push(wk)
+            }
+            wki = wki + 1
+          }
           let tv = qbe_emit_stmts(g, then_stmts, branch_exp)
           let then_term = g.block_term
+          wki = 0
+          while wki < added_win.length() {
+            g.bce_safe_exprs.remove(added_win[wki])
+            wki = wki + 1
+          }
+          let then_dropped : Array[Bool] = []
+          pni = 0
+          while pni < pos_names.length() {
+            then_dropped.push(!then_term && !g.known_min_len_arrs.contains(pos_names[pni]))
+            pni = pni + 1
+          }
+          pni = pos_names.length() - 1
+          while pni >= 0 {
+            match saved_pos_vals[pni] {
+              Some(old_v) => g.known_min_len_arrs.set(pos_names[pni], old_v)
+              None => g.known_min_len_arrs.remove(pos_names[pni])
+            }
+            pni = pni - 1
+          }
           let then_ty = match branch_exp {
             Some(et) => et
             None => tv.ty
@@ -23746,6 +24264,13 @@ fn qbe_emit_expr_inner(
           qbe_scope_pop(g)
           qbe_emit_term(g, "jmp " + l_end)
           qbe_emit_lbl(g, l_end)
+          pni = 0
+          while pni < pos_names.length() {
+            if then_dropped[pni] {
+              g.known_min_len_arrs.remove(pos_names[pni])
+            }
+            pni = pni + 1
+          }
           if then_term && else_term {
             qval("0", TNever)
           } else {
@@ -29745,6 +30270,10 @@ fn qbe_emit_stmt(
         cur_sc.locals.push(new_locals[ni])
         ni = ni - 1
       }
+      let grd_names : Array[String] = []
+      let grd_mins : Array[Int] = []
+      qbe_collect_pos_min_lens(g, cond, grd_names, grd_mins)
+      qbe_apply_min_lens(g, cond, grd_names, grd_mins)
       qval("0", TUnit)
     }
     SWhile(cond, body, _) => {
@@ -30039,16 +30568,118 @@ fn qbe_emit_stmt(
       }
       // Conservative provably-safe Bounds Check Elimination (BCE)
       let mut added_bce_key = ""
+      let added_win_bce_keys : Array[String] = []
       let bce_cond_lhs = match cond {
         EBinary("&&", lhs, rhs, _) =>
           match lhs {
-            EBinary("<", EIdent(iv0, _), _, _) =>
+            EBinary("<", EIdent(iv0, _), _, _) | EBinary("<=", EIdent(iv0, _), _, _) =>
               if !qbe_expr_assigns_ident(rhs, iv0) { lhs } else { cond }
             _ => cond
           }
         _ => cond
       }
       match bce_cond_lhs {
+        EBinary("<", EIdent(iv, _), EBinary("-", len_e, k_e, _), _)
+        | EBinary("<=", EIdent(iv, _), EBinary("-", len_e, k_e, _), _) => {
+          let is_le = match bce_cond_lhs {
+            EBinary("<=", _, _, _) => true
+            _ => false
+          }
+          let mut iv_ok = false
+          match qbe_lookup_local(g, iv) {
+            Some(iloc) =>
+              match iloc.ty {
+                TInt =>
+                  match g.nonneg_vars.get(iv) {
+                    Some(true) => iv_ok = true
+                    _ => ()
+                  }
+                _ => ()
+              }
+            None => ()
+          }
+          let k_opt = qbe_eval_const_int_expr(g, k_e)
+          let step = if body.length() >= 1 {
+            qbe_stmt_const_inc_step(body[body.length() - 1], iv)
+          } else {
+            0
+          }
+          match k_opt {
+            Some(k) => {
+              let max_excl = if is_le { k } else { k + 1 }
+              // Overflow-free proof: `i <= len - k` with `step <= k` (or `i < len - k` with `step <= k + 1`)
+              // guarantees `i + step <= INT32_MAX`, so `i` stays >= 0 and `i + c < len` for all `0 <= c < max_excl`.
+              if iv_ok && max_excl >= 1 && max_excl <= 32 && step >= 1 && step <= max_excl {
+                let mut other_write = false
+                let mut bi = 0
+                while bi < body.length() - 1 {
+                  if qbe_stmt_assigns_ident(body[bi], iv) {
+                    other_write = true
+                    break
+                  }
+                  bi = bi + 1
+                }
+                if !other_write {
+                  let bound_arr = match len_e {
+                    EMethodCall(EIdent(an, _), mn, ma, _) =>
+                      if mn == "length" && ma.length() == 0 { an } else { "" }
+                    EMethodCall(EField(EIdent(vn, _), fnm, _), mn, ma, _) =>
+                      if mn == "length" && ma.length() == 0 { vn + "." + fnm } else { "" }
+                    EIdent(n_name, _) =>
+                      if !qbe_stmts_assigns_ident(body, n_name) {
+                        match g.len_aliases.get(n_name) {
+                          Some(an) => an
+                          None => ""
+                        }
+                      } else {
+                        ""
+                      }
+                    _ => ""
+                  }
+                  let bound_stable = if bound_arr == "" {
+                    false
+                  } else if g.hoisted_arr_len.contains(bound_arr) ||
+                    g.hoisted_str_len.contains(bound_arr) ||
+                    g.hoisted_bytes_len.contains(bound_arr) {
+                    true
+                  } else {
+                    match qbe_lookup_local(g, bound_arr) {
+                      Some(bloc) =>
+                        match bloc.ty {
+                          TString | TBytes =>
+                            !qbe_expr_assigns_ident(cond, bound_arr) &&
+                            !qbe_stmts_assigns_ident(body, bound_arr) &&
+                            !qbe_expr_rebinds_ident(cond, bound_arr) &&
+                            !qbe_stmts_rebinds_ident(body, bound_arr)
+                          _ =>
+                            qbe_arr_is_stable_expr(cond, bound_arr, true) &&
+                            qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
+                        }
+                      None => false
+                    }
+                  }
+                  if bound_stable {
+                    let k0 = bound_arr + ":iv:" + iv
+                    if !g.bce_safe_exprs.contains(k0) {
+                      g.bce_safe_exprs.set(k0, true)
+                      added_win_bce_keys.push(k0)
+                    }
+                    let mut c = 0
+                    while c < max_excl {
+                      let kc = bound_arr + ":iv+:" + iv + ":" + c.to_string()
+                      if !g.bce_safe_exprs.contains(kc) {
+                        g.bce_safe_exprs.set(kc, true)
+                        added_win_bce_keys.push(kc)
+                      }
+                      c = c + 1
+                    }
+                  }
+                }
+              }
+            }
+            None => ()
+          }
+        }
         EBinary("<", EIdent(iv, _), bound, _) => {
           let mut iv_ok = false
           match qbe_lookup_local(g, iv) {
@@ -30262,6 +30893,11 @@ fn qbe_emit_stmt(
       }
       if added_bce_key != "" {
         g.bce_safe_indices.remove(added_bce_key)
+      }
+      let mut wbi = 0
+      while wbi < added_win_bce_keys.length() {
+        g.bce_safe_exprs.remove(added_win_bce_keys[wbi])
+        wbi = wbi + 1
       }
       let mut ppi = 0
       while ppi < newly_prom_push_names.length() {
