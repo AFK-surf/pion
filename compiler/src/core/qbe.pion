@@ -18812,6 +18812,383 @@ fn qbe_emit_short_str_eq_val(
 }
 
 ///|
+/// Evaluate a constant integer expression to Int64 for strength reduction.
+fn qbe_eval_const_i64_expr(g : QbeGen, e : Expr) -> Option[Int64] {
+  match e {
+    EInt(raw, _) => Some(qbe_parse_int64_lit(raw))
+    EInt64(raw, _) => Some(qbe_parse_int64_lit(raw))
+    EUInt(raw, _) => Some(qbe_parse_int64_lit(raw))
+    EUInt64(raw, _) => Some(qbe_parse_int64_lit(raw))
+    EIdent(name, _) =>
+      match qbe_lookup_local(g, name) {
+        Some(_) => None
+        None =>
+          match g.const_int_vals.get(name) {
+            Some(v) => Some(v.to_int64())
+            None => None
+          }
+      }
+    _ => None
+  }
+}
+
+///|
+/// Parse a plain positive decimal immediate register string (e.g. "10") to Int64.
+fn qbe_try_parse_pos_i64_reg(reg : String) -> Option[Int64] {
+  let n = reg.length()
+  if n == 0 || n > 18 {
+    return None
+  }
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(reg, i)
+    if c < 48 || c > 57 {
+      return None
+    }
+    i = i + 1
+  }
+  Some(qbe_parse_int64_lit(reg))
+}
+
+///|
+fn qbe_is_zero_int_lit(g : QbeGen, e : Expr) -> Bool {
+  match qbe_eval_const_i64_expr(g, e) {
+    Some(v) => v == 0L
+    None => false
+  }
+}
+
+///|
+fn qbe_pow2_log2_i64(d : Int64, max_k : Int) -> Option[Int] {
+  if d < 2L || (d & (d - 1L)) != 0L {
+    return None
+  }
+  let mut k = 0
+  let mut v = d
+  while v > 1L {
+    v = v >> 1
+    k = k + 1
+  }
+  if k <= max_k {
+    Some(k)
+  } else {
+    None
+  }
+}
+
+///|
+fn qbe_expr_is_nonneg_int(g : QbeGen, e : Expr) -> Bool {
+  match e {
+    EIdent(name, _) => g.nonneg_vars.contains(name)
+    EInt(raw, _) => {
+      let v = qbe_parse_int64_lit(raw)
+      v >= 0L && v <= 2147483647L
+    }
+    EBinary("&", l, r, _) => {
+      let l_ok = match qbe_eval_const_i64_expr(g, l) {
+        Some(v) => v >= 0L && v <= 2147483647L
+        None => false
+      }
+      let r_ok = match qbe_eval_const_i64_expr(g, r) {
+        Some(v) => v >= 0L && v <= 2147483647L
+        None => false
+      }
+      l_ok || r_ok
+    }
+    EMethodCall(EIdent(an, _), mn, ma, _) =>
+      if mn == "length" && ma.length() == 0 {
+        match qbe_lookup_local(g, an) {
+          Some(loc) =>
+            match loc.ty {
+              TString | TArray(_) | TFixedArray(_) | TBytes | TMap(_, _) => true
+              _ => false
+            }
+          None => false
+        }
+      } else {
+        false
+      }
+    _ => false
+  }
+}
+
+///|
+/// Fold `(x % pow2) == 0` / `(x % pow2) != 0` (and symmetric `0 == (x % pow2)`)
+/// into `(x & (pow2 - 1)) == 0` / `!= 0`, exact across the entire signed/unsigned
+/// 32-bit and 64-bit domains (including INT32_MIN and INT64_MIN).
+fn qbe_try_emit_mod_pow2_eq_zero(
+  g : QbeGen,
+  op : String,
+  lhs : Expr,
+  rhs : Expr,
+) -> Option[String] {
+  if op != "==" && op != "!=" {
+    return None
+  }
+  let mod_pair : Option[(Expr, Expr)] = match lhs {
+    EBinary("%", x_e, d_e, _) =>
+      if qbe_is_zero_int_lit(g, rhs) {
+        Some((x_e, d_e))
+      } else {
+        None
+      }
+    _ =>
+      match rhs {
+        EBinary("%", x_e, d_e, _) =>
+          if qbe_is_zero_int_lit(g, lhs) {
+            Some((x_e, d_e))
+          } else {
+            None
+          }
+        _ => None
+      }
+  }
+  let (x_expr, d_expr) = match mod_pair {
+    Some(p) => p
+    None => return None
+  }
+  let d = match qbe_eval_const_i64_expr(g, d_expr) {
+    Some(v) => v
+    None => return None
+  }
+  if d < 2L || d > 4611686018427387904L || (d & (d - 1L)) != 0L {
+    return None
+  }
+  let xv = qbe_emit_expr(g, x_expr, None)
+  let mask = (d - 1L).to_string()
+  match xv.ty {
+    TInt | TUInt =>
+      if d <= 1073741824L {
+        let masked = qbe_tmp(g)
+        qbe_emit(g, masked + " =w and " + xv.reg + ", " + mask)
+        let cw = qbe_tmp(g)
+        let cop = if op == "==" { "ceqw" } else { "cnew" }
+        qbe_emit(g, cw + " =w " + cop + " " + masked + ", 0")
+        Some(cw)
+      } else {
+        let rem = qbe_tmp(g)
+        let rop = match xv.ty {
+          TUInt => "urem"
+          _ => "rem"
+        }
+        qbe_emit(g, rem + " =w " + rop + " " + xv.reg + ", " + d.to_string())
+        let cw = qbe_tmp(g)
+        let cop = if op == "==" { "ceqw" } else { "cnew" }
+        qbe_emit(g, cw + " =w " + cop + " " + rem + ", 0")
+        Some(cw)
+      }
+    TInt64 | TUInt64 => {
+      let masked = qbe_tmp(g)
+      qbe_emit(g, masked + " =l and " + xv.reg + ", " + mask)
+      let cw = qbe_tmp(g)
+      let cop = if op == "==" { "ceql" } else { "cnel" }
+      qbe_emit(g, cw + " =w " + cop + " " + masked + ", 0")
+      Some(cw)
+    }
+    TByte => {
+      let masked = qbe_tmp(g)
+      qbe_emit(g, masked + " =w and " + xv.reg + ", " + mask)
+      let cw = qbe_tmp(g)
+      let cop = if op == "==" { "ceqw" } else { "cnew" }
+      qbe_emit(g, cw + " =w " + cop + " " + masked + ", 0")
+      Some(cw)
+    }
+    _ => None
+  }
+}
+
+///|
+/// Strength-reduce signed 32-bit `/` and `%` by positive constant `2 <= d <= 2147483647`.
+/// Uses shift/mask for powers of 2 and Hacker's Delight Ch. 10-4 64-bit magic multiply otherwise.
+fn qbe_emit_i32_const_div_rem(
+  g : QbeGen,
+  op : String,
+  lw : String,
+  d : Int64,
+  is_nonneg : Bool,
+  is_even : Bool,
+) -> Option[String] {
+  if d < 2L || d > 2147483647L {
+    return None
+  }
+  match qbe_pow2_log2_i64(d, 30) {
+    Some(k) => {
+      if op == "/" {
+        if is_nonneg || (k == 1 && is_even) {
+          let q = qbe_tmp(g)
+          qbe_emit(g, q + " =w sar " + lw + ", " + k.to_string())
+          return Some(q)
+        }
+        let bias = if k == 1 {
+          let b = qbe_tmp(g)
+          qbe_emit(g, b + " =w shr " + lw + ", 31")
+          b
+        } else {
+          let s = qbe_tmp(g)
+          qbe_emit(g, s + " =w sar " + lw + ", 31")
+          let b = qbe_tmp(g)
+          qbe_emit(g, b + " =w shr " + s + ", " + (32 - k).to_string())
+          b
+        }
+        let adj = qbe_tmp(g)
+        qbe_emit(g, adj + " =w add " + lw + ", " + bias)
+        let q = qbe_tmp(g)
+        qbe_emit(g, q + " =w sar " + adj + ", " + k.to_string())
+        return Some(q)
+      } else {
+        if is_nonneg {
+          let r = qbe_tmp(g)
+          qbe_emit(g, r + " =w and " + lw + ", " + (d - 1L).to_string())
+          return Some(r)
+        }
+        let bias = if k == 1 {
+          let b = qbe_tmp(g)
+          qbe_emit(g, b + " =w shr " + lw + ", 31")
+          b
+        } else {
+          let s = qbe_tmp(g)
+          qbe_emit(g, s + " =w sar " + lw + ", 31")
+          let b = qbe_tmp(g)
+          qbe_emit(g, b + " =w shr " + s + ", " + (32 - k).to_string())
+          b
+        }
+        let adj = qbe_tmp(g)
+        qbe_emit(g, adj + " =w add " + lw + ", " + bias)
+        let masked = qbe_tmp(g)
+        qbe_emit(g, masked + " =w and " + adj + ", " + (0L - d).to_string())
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =w sub " + lw + ", " + masked)
+        return Some(r)
+      }
+    }
+    None => ()
+  }
+  // Non-power-of-2: Hacker's Delight Ch. 10-4 signed 32-bit via 64-bit multiply
+  let nc = 2147483648L - (2147483648L % d) - 1L
+  let mut p = 32
+  let mut found_m = 0L
+  while p <= 62 {
+    let two_p = 1L << p
+    let rem = two_p % d
+    let delta = d - rem
+    if two_p / delta > nc || (two_p / delta == nc && two_p % delta > 0L) {
+      found_m = (two_p + delta) / d
+      break
+    }
+    p = p + 1
+  }
+  if p > 62 || found_m <= 0L || found_m > 4294967295L {
+    return None
+  }
+  let xl = qbe_tmp(g)
+  qbe_emit(g, xl + " =l extsw " + lw)
+  let prod = qbe_tmp(g)
+  qbe_emit(g, prod + " =l mul " + xl + ", " + found_m.to_string())
+  let ql = qbe_tmp(g)
+  qbe_emit(g, ql + " =l sar " + prod + ", " + p.to_string())
+  let qw0 = qbe_tmp(g)
+  qbe_emit(g, qw0 + " =w copy " + ql)
+  let q = if is_nonneg {
+    qw0
+  } else {
+    let sign = qbe_tmp(g)
+    qbe_emit(g, sign + " =w shr " + lw + ", 31")
+    let q_adj = qbe_tmp(g)
+    qbe_emit(g, q_adj + " =w add " + qw0 + ", " + sign)
+    q_adj
+  }
+  if op == "/" {
+    Some(q)
+  } else {
+    let qd = qbe_tmp(g)
+    qbe_emit(g, qd + " =w mul " + q + ", " + d.to_string())
+    let rem = qbe_tmp(g)
+    qbe_emit(g, rem + " =w sub " + lw + ", " + qd)
+    Some(rem)
+  }
+}
+
+///|
+fn qbe_emit_u32_const_div_rem(
+  g : QbeGen,
+  op : String,
+  lw : String,
+  d : Int64,
+) -> Option[String] {
+  match qbe_pow2_log2_i64(d, 30) {
+    Some(k) => {
+      let r = qbe_tmp(g)
+      if op == "/" {
+        qbe_emit(g, r + " =w shr " + lw + ", " + k.to_string())
+      } else {
+        qbe_emit(g, r + " =w and " + lw + ", " + (d - 1L).to_string())
+      }
+      Some(r)
+    }
+    None => None
+  }
+}
+
+///|
+fn qbe_emit_u64_const_div_rem(
+  g : QbeGen,
+  op : String,
+  ll : String,
+  d : Int64,
+) -> Option[String] {
+  match qbe_pow2_log2_i64(d, 62) {
+    Some(k) => {
+      let r = qbe_tmp(g)
+      if op == "/" {
+        qbe_emit(g, r + " =l shr " + ll + ", " + k.to_string())
+      } else {
+        qbe_emit(g, r + " =l and " + ll + ", " + (d - 1L).to_string())
+      }
+      Some(r)
+    }
+    None => None
+  }
+}
+
+///|
+fn qbe_emit_i64_const_div_rem(
+  g : QbeGen,
+  op : String,
+  ll : String,
+  d : Int64,
+) -> Option[String] {
+  match qbe_pow2_log2_i64(d, 62) {
+    Some(k) => {
+      let bias = if k == 1 {
+        let b = qbe_tmp(g)
+        qbe_emit(g, b + " =l shr " + ll + ", 63")
+        b
+      } else {
+        let s = qbe_tmp(g)
+        qbe_emit(g, s + " =l sar " + ll + ", 63")
+        let b = qbe_tmp(g)
+        qbe_emit(g, b + " =l shr " + s + ", " + (64 - k).to_string())
+        b
+      }
+      let adj = qbe_tmp(g)
+      qbe_emit(g, adj + " =l add " + ll + ", " + bias)
+      if op == "/" {
+        let q = qbe_tmp(g)
+        qbe_emit(g, q + " =l sar " + adj + ", " + k.to_string())
+        Some(q)
+      } else {
+        let masked = qbe_tmp(g)
+        qbe_emit(g, masked + " =l and " + adj + ", " + (0L - d).to_string())
+        let r = qbe_tmp(g)
+        qbe_emit(g, r + " =l sub " + ll + ", " + masked)
+        Some(r)
+      }
+    }
+    None => None
+  }
+}
+
+///|
 /// Emit fused compare-and-branch (no `extuw` before `jnz`) so QBE arm64 `seljmp`
 /// fuses `cmp/fcmp + b.cc` directly, and short-circuits `!`, `&&`, `||` with zero stack slots.
 fn qbe_emit_cond_branch(
@@ -18847,6 +19224,13 @@ fn qbe_emit_cond_branch(
           qbe_loop_has_no_calls_expr(g, lhs) &&
           qbe_loop_has_no_calls_expr(g, rhs)
         if op == "==" || op == "!=" {
+          match qbe_try_emit_mod_pow2_eq_zero(g, op, lhs, rhs) {
+            Some(cw) => {
+              qbe_emit_term(g, "jnz " + cw + ", " + l_true + ", " + l_false)
+              return
+            }
+            None => ()
+          }
           let mut short_bytes : Option[Array[Int]] = None
           let mut other_expr : Option[Expr] = None
           match rhs {
@@ -21125,6 +21509,16 @@ fn qbe_emit_expr_inner(
       }
     }
     EBinary(op, lhs, rhs, bin_sp) => {
+      if op == "==" || op == "!=" {
+        match qbe_try_emit_mod_pow2_eq_zero(g, op, lhs, rhs) {
+          Some(cw) => {
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =l extuw " + cw)
+            return qval(r, TBool)
+          }
+          None => ()
+        }
+      }
       if op == "&&" {
         let res_slot = qbe_alloc_slot(g)
         let lv = qbe_emit_expr(g, lhs, Some(TBool))
@@ -21530,43 +21924,22 @@ fn qbe_emit_expr_inner(
             qbe_emit(g, r + " =l extuw " + cw)
             qval(r, TBool)
           } else {
-            // Power-of-2 signed division shift optimization (truncating toward zero)
-            if op == "/" {
-              match rhs {
-                EInt(raw, _) => {
-                  let d = qbe_parse_int64_lit(raw)
-                  if d >= 2L && d <= 1073741824L && (d & (d - 1L)) == 0L {
-                    let mut k = 0
-                    let mut p2 = 1L
-                    while p2 < d {
-                      p2 = p2 << 1
-                      k = k + 1
-                    }
-                    let aw = qbe_tmp(g)
-                    if k == 1 {
-                      if qbe_expr_is_even_int(lhs) {
-                        qbe_emit(g, aw + " =w sar " + lw + ", 1")
-                      } else {
-                        let s = qbe_tmp(g)
-                        let a = qbe_tmp(g)
-                        qbe_emit(g, s + " =w shr " + lw + ", 31")
-                        qbe_emit(g, a + " =w add " + lw + ", " + s)
-                        qbe_emit(g, aw + " =w sar " + a + ", 1")
-                      }
-                    } else {
-                      let s = qbe_tmp(g)
-                      let b = qbe_tmp(g)
-                      let a = qbe_tmp(g)
-                      let mask = (d - 1L).to_string()
-                      qbe_emit(g, s + " =w sar " + lw + ", 31")
-                      qbe_emit(g, b + " =w and " + s + ", " + mask)
-                      qbe_emit(g, a + " =w add " + lw + ", " + b)
-                      qbe_emit(g, aw + " =w sar " + a + ", " + k.to_string())
-                    }
-                    return qval(aw, TInt)
+            // Constant positive divisor strength reduction (`/` and `%`, pow2 & 64-bit magic)
+            if op == "/" || op == "%" {
+              match qbe_eval_const_i64_expr(g, rhs) {
+                Some(d) =>
+                  match qbe_emit_i32_const_div_rem(
+                    g,
+                    op,
+                    lw,
+                    d,
+                    qbe_expr_is_nonneg_int(g, lhs),
+                    qbe_expr_is_even_int(lhs),
+                  ) {
+                    Some(aw) => return qval(aw, TInt)
+                    None => ()
                   }
-                }
-                _ => ()
+                None => ()
               }
             }
             let aop = if op == "+" {
@@ -21618,6 +21991,16 @@ fn qbe_emit_expr_inner(
             qbe_emit(g, r + " =l extuw " + cw)
             qval(r, TBool)
           } else {
+            if op == "/" || op == "%" {
+              match qbe_eval_const_i64_expr(g, rhs) {
+                Some(d) =>
+                  match qbe_emit_u32_const_div_rem(g, op, lw, d) {
+                    Some(aw) => return qval(aw, TUInt)
+                    None => ()
+                  }
+                None => ()
+              }
+            }
             let aop = if op == "+" {
               "add"
             } else if op == "-" {
@@ -21673,6 +22056,16 @@ fn qbe_emit_expr_inner(
             qbe_emit(g, al + " =l " + aop + " " + ll + ", " + rw)
             qval(al, TUInt64)
           } else {
+            if op == "/" || op == "%" {
+              match qbe_eval_const_i64_expr(g, rhs) {
+                Some(d) =>
+                  match qbe_emit_u64_const_div_rem(g, op, ll, d) {
+                    Some(al) => return qval(al, TUInt64)
+                    None => ()
+                  }
+                None => ()
+              }
+            }
             let rl = qbe_coerce_val(g, rv, TUInt64)
             let aop = if op == "+" {
               "add"
@@ -21841,6 +22234,20 @@ fn qbe_emit_expr_inner(
             qbe_emit(g, r + " =l " + sop + " " + lv.reg + ", " + rw)
             qval(r, lv.ty)
           } else {
+            if op == "/" || op == "%" {
+              match lv.ty {
+                TInt64 =>
+                  match qbe_eval_const_i64_expr(g, rhs) {
+                    Some(d) =>
+                      match qbe_emit_i64_const_div_rem(g, op, lv.reg, d) {
+                        Some(al) => return qval(al, TInt64)
+                        None => ()
+                      }
+                    None => ()
+                  }
+                _ => ()
+              }
+            }
             let aop = if op == "+" {
               "add"
             } else if op == "-" {
@@ -28861,6 +29268,16 @@ fn qbe_emit_compound_binop(
     }
     TUInt => {
       let rw = qbe_coerce_val(g, rv, TUInt)
+      if op == "/" || op == "%" {
+        match qbe_try_parse_pos_i64_reg(rw) {
+          Some(d) =>
+            match qbe_emit_u32_const_div_rem(g, op, old_reg, d) {
+              Some(aw) => return aw
+              None => ()
+            }
+          None => ()
+        }
+      }
       let qop = if op == "+" {
         "add"
       } else if op == "-" {
@@ -28895,6 +29312,16 @@ fn qbe_emit_compound_binop(
         r
       } else {
         let rl = qbe_coerce_val(g, rv, TUInt64)
+        if op == "/" || op == "%" {
+          match qbe_try_parse_pos_i64_reg(rl) {
+            Some(d) =>
+              match qbe_emit_u64_const_div_rem(g, op, old_reg, d) {
+                Some(al) => return al
+                None => ()
+              }
+            None => ()
+          }
+        }
         let qop = if op == "+" {
           "add"
         } else if op == "-" {
@@ -28926,6 +29353,16 @@ fn qbe_emit_compound_binop(
         r
       } else {
         let rl = qbe_coerce_val(g, rv, TInt64)
+        if op == "/" || op == "%" {
+          match qbe_try_parse_pos_i64_reg(rl) {
+            Some(d) =>
+              match qbe_emit_i64_const_div_rem(g, op, old_reg, d) {
+                Some(al) => return al
+                None => ()
+              }
+            None => ()
+          }
+        }
         let qop = if op == "+" {
           "add"
         } else if op == "-" {
@@ -28950,6 +29387,20 @@ fn qbe_emit_compound_binop(
     }
     _ => {
       let rw = qbe_coerce_val(g, rv, TInt)
+      if op == "/" || op == "%" {
+        match ty {
+          TInt =>
+            match qbe_try_parse_pos_i64_reg(rw) {
+              Some(d) =>
+                match qbe_emit_i32_const_div_rem(g, op, old_reg, d, false, false) {
+                  Some(aw) => return aw
+                  None => ()
+                }
+              None => ()
+            }
+          _ => ()
+        }
+      }
       let qop = if op == "+" {
         "add"
       } else if op == "-" {
