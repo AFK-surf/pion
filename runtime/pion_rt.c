@@ -127,7 +127,7 @@ static inline uint32_t pion_cur_tid_fast(void) {
     return pion_cur_tid_mt();
 }
 
-uint64_t pion_cur_tid(void) {
+PION_MINSIZE uint64_t pion_cur_tid(void) {
     return (uint64_t)pion_cur_tid_fast();
 }
 
@@ -556,7 +556,7 @@ static PION_NOINLINE PION_MINSIZE void pion_slab_raw_free(void *ptr, size_t byte
     pion_slab_raw_free_slow(ptr, bytes, is_frozen);
 }
 
-static PION_NOINLINE void *pion_alloc_uninit_slow(
+static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
     uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
     PionHeader *hdr;
     uint16_t flags = 0;
@@ -696,7 +696,7 @@ static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
     pion_destroy_slow(hdr, obj);
 }
 
-void pion_destroy_obj(void *obj) {
+PION_MINSIZE void pion_destroy_obj(void *obj) {
     pion_destroy(pion_hdr(obj), obj);
 }
 
@@ -894,12 +894,12 @@ PION_NOINLINE PION_HOT void *pion_str_from_cstr(const char *s, int64_t len) {
     return str;
 }
 
-int64_t pion_str_len(void *s) {
+PION_MINSIZE int64_t pion_str_len(void *s) {
     if (!s) return 0;
     return ((PionString *)s)->len;
 }
 
-int32_t pion_str_byte_at(void *s, int64_t idx) {
+PION_MINSIZE int32_t pion_str_byte_at(void *s, int64_t idx) {
     PionString *str = (PionString *)s;
     if (__builtin_expect(!str || idx < 0 || idx >= str->len, 0)) {
         pion_die("string index out of bounds");
@@ -907,19 +907,11 @@ int32_t pion_str_byte_at(void *s, int64_t idx) {
     return (int32_t)(unsigned char)str->data[idx];
 }
 
+PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts);
+
 PION_MINSIZE void *pion_str_concat(void *a, void *b) {
-    PionString *sa = (PionString *)a;
-    PionString *sb = (PionString *)b;
-    int64_t la = sa ? sa->len : 0;
-    int64_t lb = sb ? sb->len : 0;
-    int64_t total = la + lb;
-    PionString *out = (PionString *)pion_alloc_raw((uint32_t)(sizeof(PionString) + (size_t)total + 1),
-                                             PION_TAG_STRING, NULL);
-    out->len = total;
-    if (la > 0) memcpy(out->data, sa->data, (size_t)la);
-    if (lb > 0) memcpy(out->data + la, sb->data, (size_t)lb);
-    out->data[total] = '\0';
-    return out;
+    void *parts[2] = { a, b };
+    return pion_str_concat_n(2, parts);
 }
 
 PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
@@ -936,7 +928,7 @@ PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
     for (int64_t i = 0; i < n; i++) {
         PionString *s = (PionString *)parts[i];
         if (s && s->len > 0) {
-            pion_copy_short(dst, s->data, (size_t)s->len);
+            memcpy(dst, s->data, (size_t)s->len);
             dst += s->len;
         }
     }
@@ -1007,7 +999,7 @@ PION_MINSIZE int32_t pion_str_cmp(void *a, void *b) {
     return 0;
 }
 
-void *pion_str_slice(void *s, int64_t start, int64_t end) {
+PION_MINSIZE void *pion_str_slice(void *s, int64_t start, int64_t end) {
     PionString *str = (PionString *)s;
     if (__builtin_expect(!str || start < 0 || end < start || end > str->len, 0)) {
         pion_die("string slice out of bounds");
@@ -1017,13 +1009,13 @@ void *pion_str_slice(void *s, int64_t start, int64_t end) {
                                              PION_TAG_STRING, NULL);
     out->len = n;
     if (n > 0) {
-        pion_copy_short(out->data, str->data + start, (size_t)n);
+        memcpy(out->data, str->data + start, (size_t)n);
     }
     out->data[n] = '\0';
     return out;
 }
 
-void *pion_int_to_str(int64_t v) {
+PION_MINSIZE void *pion_int_to_str(int64_t v) {
     char tmp[24];
     char *end = tmp + sizeof(tmp);
     char *p = pion_fmt_i64_end(v, end);
@@ -1085,7 +1077,7 @@ PION_MINSIZE double pion_str_to_double(void *s, int32_t *ok_out) {
     return v;
 }
 
-PION_MINSIZE static const char *pion_memmem(const char *hay, int64_t hlen, const char *ndl, int64_t nlen) {
+PION_NOINLINE PION_MINSIZE static const char *pion_memmem(const char *hay, int64_t hlen, const char *ndl, int64_t nlen) {
     if (nlen == 0) return hay;
     if (nlen > hlen) return NULL;
     if (nlen == 1) return (const char *)memchr(hay, (unsigned char)ndl[0], (size_t)hlen);
@@ -1522,34 +1514,25 @@ void pion_strbuf_push_byte(void *sb_ptr, int32_t b) {
 }
 
 PION_MINSIZE void pion_strbuf_push_char(void *sb_ptr, int32_t cp) {
-    PionStrBuf *sb = (PionStrBuf *)sb_ptr;
-    if (__builtin_expect(!sb, 0)) return;
     if (__builtin_expect((uint32_t)cp < 0x80u, 1)) {
-        int64_t len = sb->len;
-        if (__builtin_expect(len + 2 > sb->cap, 0)) {
-            pion_strbuf_grow(sb, len + 2);
-        }
-        sb->data[len] = (char)cp;
-        sb->data[len + 1] = '\0';
-        sb->len = len + 1;
+        pion_strbuf_push_byte(sb_ptr, cp);
         return;
     }
-    if (cp < 0 || cp > 0x10FFFF) return;
+    PionStrBuf *sb = (PionStrBuf *)sb_ptr;
+    if (!sb || cp < 0 || cp > 0x10FFFF) return;
     char buf[4];
     int n = 0;
     if (cp < 0x800) {
         buf[n++] = (char)(0xC0 | (cp >> 6));
-        buf[n++] = (char)(0x80 | (cp & 0x3F));
     } else if (cp < 0x10000) {
         buf[n++] = (char)(0xE0 | (cp >> 12));
         buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        buf[n++] = (char)(0x80 | (cp & 0x3F));
     } else {
         buf[n++] = (char)(0xF0 | (cp >> 18));
         buf[n++] = (char)(0x80 | ((cp >> 12) & 0x3F));
         buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
-        buf[n++] = (char)(0x80 | (cp & 0x3F));
     }
+    buf[n++] = (char)(0x80 | (cp & 0x3F));
     pion_strbuf_reserve(sb, n);
     memcpy(sb->data + sb->len, buf, (size_t)n);
     sb->len += n;
@@ -1701,7 +1684,7 @@ PION_NOINLINE PION_MINSIZE void *pion_arr_push_flat_grow(void *a_ptr) {
     return (char *)a->data + (size_t)a->len * pion_arr_stride(a);
 }
 
-int64_t pion_arr_len(void *a_ptr) {
+PION_MINSIZE int64_t pion_arr_len(void *a_ptr) {
     if (!a_ptr) return 0;
     return ((PionArray *)a_ptr)->len;
 }
@@ -1899,17 +1882,8 @@ static PION_MINSIZE __attribute__((constructor)) void pion_rt_init_hash_seed(voi
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(&seed, sizeof(seed));
 #elif defined(__linux__)
-    ssize_t got = getrandom(&seed, sizeof(seed), 0);
-    if (got != (ssize_t)sizeof(seed)) {
-        int fd = open("/dev/urandom", O_RDONLY);
-        if (fd >= 0) {
-            ssize_t r = read(fd, &seed, sizeof(seed));
-            close(fd);
-            if (r == (ssize_t)sizeof(seed)) got = r;
-        }
-        if (got != (ssize_t)sizeof(seed)) {
-            seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
-        }
+    if (getrandom(&seed, sizeof(seed), 0) != (ssize_t)sizeof(seed)) {
+        seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
     }
 #elif defined(_WIN32)
     seed = (uint64_t)GetTickCount64() ^ ((uint64_t)GetCurrentProcessId() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
@@ -2086,7 +2060,7 @@ PION_MINSIZE void *pion_map_new_int(int32_t val_is_obj) {
     return m;
 }
 
-int64_t pion_map_len(void *m_ptr) {
+PION_MINSIZE int64_t pion_map_len(void *m_ptr) {
     if (!m_ptr) return 0;
     return ((PionMap *)m_ptr)->len;
 }
@@ -2642,15 +2616,15 @@ PION_MINSIZE void *pion_atomic_new(int64_t init_val) {
     return a;
 }
 
-int64_t pion_atomic_load(void *a_ptr) {
+PION_MINSIZE int64_t pion_atomic_load(void *a_ptr) {
     return atomic_load_explicit(&((PionAtomic *)a_ptr)->val, memory_order_seq_cst);
 }
 
-void pion_atomic_store(void *a_ptr, int64_t val) {
+PION_MINSIZE void pion_atomic_store(void *a_ptr, int64_t val) {
     atomic_store_explicit(&((PionAtomic *)a_ptr)->val, val, memory_order_seq_cst);
 }
 
-int64_t pion_atomic_fetch_add(void *a_ptr, int64_t delta) {
+PION_MINSIZE int64_t pion_atomic_fetch_add(void *a_ptr, int64_t delta) {
     return atomic_fetch_add_explicit(&((PionAtomic *)a_ptr)->val, delta, memory_order_seq_cst);
 }
 
@@ -2780,7 +2754,7 @@ PION_MINSIZE void *pion_world_read_line(void *w_ptr, int32_t *ok_out) {
 #endif
 }
 
-PION_MINSIZE static char *pion_read_file_raw(void *path_str, int64_t *len_out) {
+static PION_NOINLINE PION_MINSIZE char *pion_read_file_raw(void *path_str, int64_t *len_out) {
     PionString *path = (PionString *)path_str;
     if (!path) return NULL;
     FILE *f = fopen(path->data, "rb");
@@ -2814,7 +2788,7 @@ PION_MINSIZE void *pion_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_o
     return out;
 }
 
-PION_MINSIZE static int32_t pion_write_file_raw(void *path_str, const char *mode,
+static PION_NOINLINE PION_MINSIZE int32_t pion_write_file_raw(void *path_str, const char *mode,
                                                 const void *data, int64_t len) {
     PionString *path = (PionString *)path_str;
     if (!path) return 0;
@@ -3060,7 +3034,7 @@ PION_MINSIZE int64_t pion_world_fs_size(void *w_ptr, void *path_str) {
 #endif
 }
 
-PION_MINSIZE static void *pion_errno_str(int err) {
+static PION_NOINLINE PION_MINSIZE void *pion_errno_str(int err) {
     char errbuf[96];
 #ifdef _WIN32
     if (strerror_s(errbuf, sizeof(errbuf), err) != 0) {
@@ -3407,7 +3381,7 @@ PION_MINSIZE int32_t pion_world_exec(void *w_ptr, void *argv_arr) {
 #endif
 }
 
-static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stderr,
+static PION_NOINLINE PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stderr,
                                                 size_t *out_len, int32_t *exit_code_out) {
     if (out_len) *out_len = 0;
     if (exit_code_out) *exit_code_out = -1;
@@ -3503,7 +3477,9 @@ static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stde
     (void)fcntl(pfd[1], F_SETFD, FD_CLOEXEC);
 
     char **argv = (char **)malloc(((size_t)arr->len + 1) * sizeof(char *));
-    if (!argv) {
+    posix_spawn_file_actions_t actions;
+    if (!argv || posix_spawn_file_actions_init(&actions) != 0) {
+        free(argv);
         close(pfd[0]);
         close(pfd[1]);
         return NULL;
@@ -3513,14 +3489,6 @@ static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stde
         argv[i] = s ? s->data : (char *)"";
     }
     argv[arr->len] = NULL;
-
-    posix_spawn_file_actions_t actions;
-    if (posix_spawn_file_actions_init(&actions) != 0) {
-        free(argv);
-        close(pfd[0]);
-        close(pfd[1]);
-        return NULL;
-    }
     (void)posix_spawn_file_actions_addclose(&actions, pfd[0]);
     (void)posix_spawn_file_actions_adddup2(&actions, pfd[1], STDOUT_FILENO);
     (void)posix_spawn_file_actions_addclose(&actions, pfd[1]);
@@ -3543,22 +3511,14 @@ static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stde
     size_t cap = 4096;
     size_t len = 0;
     char *buf = (char *)malloc(cap);
-    if (!buf) {
-        close(pfd[0]);
-        int st_ign = 0;
-        while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
-        return NULL;
-    }
+    if (!buf) goto err_reap;
     for (;;) {
         if (len + 4096 > cap) {
             cap *= 2;
             char *nb = (char *)realloc(buf, cap);
             if (!nb) {
                 free(buf);
-                close(pfd[0]);
-                int st_ign = 0;
-                while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
-                return NULL;
+                goto err_reap;
             }
             buf = nb;
         }
@@ -3588,6 +3548,11 @@ static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stde
     if (exit_code_out) *exit_code_out = code;
     if (out_len) *out_len = len;
     return buf;
+err_reap:
+    close(pfd[0]);
+    int st_ign = 0;
+    while (waitpid(pid, &st_ign, 0) < 0 && errno == EINTR) {}
+    return NULL;
 #endif
 }
 
@@ -3625,7 +3590,7 @@ static inline uint32_t rotr32(uint32_t x, uint32_t n) {
     return (x >> n) | (x << (32u - n));
 }
 
-PION_MINSIZE static void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
+static PION_NOINLINE PION_MINSIZE void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
     uint32_t w[64];
     for (int i = 0; i < 16; i++) {
         w[i] = ((uint32_t)blk[i * 4] << 24) | ((uint32_t)blk[i * 4 + 1] << 16) |
@@ -3799,7 +3764,7 @@ PION_MINSIZE static int pion_parse_ipv4_addr(void *host_str, int32_t port, int a
     return inet_pton(AF_INET, hs, &addr->sin_addr) == 1;
 }
 
-PION_MINSIZE static int32_t pion_tcp_listen_impl(void *host_str, int32_t port, int reuse_port) {
+static PION_NOINLINE PION_MINSIZE int32_t pion_tcp_listen_impl(void *host_str, int32_t port, int reuse_port) {
     pion_net_init();
     if (port < 0 || port > 65535) return -1;
     struct sockaddr_in addr;
@@ -4131,7 +4096,7 @@ PION_MINSIZE static void pion_ignore_sigpipe_init(void) {
     (void)signal(SIGPIPE, SIG_IGN);
 }
 
-PION_MINSIZE static int pion_parse_ipv4_addr(void *host_str, int32_t port, int allow_any,
+static PION_NOINLINE PION_MINSIZE int pion_parse_ipv4_addr(void *host_str, int32_t port, int allow_any,
                                          struct sockaddr_in *addr) {
     memset(addr, 0, sizeof(*addr));
 #ifdef __APPLE__
@@ -4150,7 +4115,7 @@ PION_MINSIZE static int pion_parse_ipv4_addr(void *host_str, int32_t port, int a
     return inet_pton(AF_INET, hs, &addr->sin_addr) == 1;
 }
 
-PION_MINSIZE static int32_t pion_tcp_listen_impl(void *host_str, int32_t port, int reuse_port) {
+static PION_NOINLINE PION_MINSIZE int32_t pion_tcp_listen_impl(void *host_str, int32_t port, int reuse_port) {
     pthread_once(&g_sigpipe_once, pion_ignore_sigpipe_init);
     if (port < 0 || port > 65535) return -1;
     struct sockaddr_in addr;
@@ -4281,7 +4246,7 @@ PION_MINSIZE static int pion_io_would_block(void) {
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 
-PION_MINSIZE static int pion_fd_set_nonblock(int fd, int enable) {
+static PION_NOINLINE PION_MINSIZE int pion_fd_set_nonblock(int fd, int enable) {
     int fl = fcntl(fd, F_GETFL, 0);
     if (fl < 0) return 0;
     int nfl = enable ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK);
