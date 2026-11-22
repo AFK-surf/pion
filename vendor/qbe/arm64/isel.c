@@ -928,15 +928,23 @@ arm64_hoist_consts(Fn *fn)
 	Blk *b, *d, *p, **order;
 	Ins *i, ins;
 	Con *c;
-	uint *nhoist;
+	uint *nhoist_fp, *nhoist_int;
 	uint k, n, j, pos, bestloop;
 
 	if (fn->nblk == 0)
 		return;
-	nhoist = alloc(fn->nblk * sizeof *nhoist);
+	nhoist_fp = alloc(fn->nblk * sizeof *nhoist_fp);
+	nhoist_int = alloc(fn->nblk * sizeof *nhoist_int);
 	order = alloc(fn->nblk * sizeof *order);
 	n = 0;
 	for (b = fn->start; b; b = b->link) {
+		b->hascall = 0;
+		for (k = 0; k < b->nins; k++) {
+			if (b->ins[k].op == Ocall) {
+				b->hascall = 1;
+				break;
+			}
+		}
 		if (b->loop > 1)
 			order[n++] = b;
 	}
@@ -952,8 +960,12 @@ arm64_hoist_consts(Fn *fn)
 	for (j = 0; j < n; j++) {
 		b = order[j];
 		for (k = 0; k < b->nins; k++) {
+			int is_int;
 			i = &b->ins[k];
-			if (i->op != Ocopy || KBASE(i->cls) != 1)
+			if (i->op != Ocopy)
+				continue;
+			is_int = (KBASE(i->cls) == 0);
+			if (!is_int && KBASE(i->cls) != 1)
 				continue;
 			if (rtype(i->arg[0]) != RCon)
 				continue;
@@ -964,6 +976,26 @@ arm64_hoist_consts(Fn *fn)
 			c = &fn->con[i->arg[0].val];
 			if (c->type != CBits || c->bits.i == 0)
 				continue;
+			if (is_int) {
+				int single_insn;
+				if (b->hascall)
+					continue;
+				if (i->cls == Kw) {
+					uint32_t u = (uint32_t)c->bits.i;
+					int64_t nv = (int32_t)u;
+					single_insn = ((u & ~0xffffu) == 0
+						|| (nv | 0xffff) == -1
+						|| arm64_logimm(u, Kw));
+				} else {
+					uint64_t u = (uint64_t)c->bits.i;
+					int64_t nv = c->bits.i;
+					single_insn = ((u & ~0xffffULL) == 0
+						|| (nv | 0xffff) == -1
+						|| arm64_logimm(u, Kl));
+				}
+				if (single_insn)
+					continue;
+			}
 
 			d = 0;
 			bestloop = (uint)b->loop;
@@ -975,7 +1007,9 @@ arm64_hoist_consts(Fn *fn)
 						break;
 				}
 			}
-			if (!d || nhoist[d->id] >= 8)
+			if (!d)
+				continue;
+			if (is_int ? (nhoist_int[d->id] >= 4) : (nhoist_fp[d->id] >= 8))
 				continue;
 
 			ins = *i;
@@ -995,14 +1029,17 @@ arm64_hoist_consts(Fn *fn)
 					(d->nins - pos) * sizeof(Ins));
 			d->ins[pos] = ins;
 			d->nins++;
-			nhoist[d->id]++;
+			if (is_int)
+				nhoist_int[d->id]++;
+			else
+				nhoist_fp[d->id]++;
 			fn->tmp[ins.to.val].bid = d->id;
 			fn->tmp[ins.to.val].def = &d->ins[pos];
 			b->ins[k] = (Ins){.op = Onop};
 		}
 	}
 	for (b = fn->start; b; b = b->link) {
-		if (!nhoist[b->id])
+		if (!nhoist_fp[b->id] && !nhoist_int[b->id])
 			continue;
 		for (k = 0; k < b->nins; k++) {
 			Ref to = b->ins[k].to;

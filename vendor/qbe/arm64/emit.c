@@ -766,6 +766,37 @@ arm64_emitfn(Fn *fn, FILE *out)
 			if (i->op == Oextuw && req(i->to, i->arg[0])
 			&& isreg(i->to) && i->to.val == last_w32)
 				continue;
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
+			&& i->op == Omul && KBASE(i->cls) == 0
+			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
+				Ins *i1 = i + 1;
+				if (i1->cls == i->cls && isreg(i1->to) && req(i1->to, i->to)) {
+					if (i1->op == Osub && isreg(i1->arg[0])
+					&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
+						fprintf(e->f, "\tmsub\t%s, %s, %s, %s\n",
+							rname(i1->to.val, i1->cls),
+							rname(i->arg[0].val, i->cls),
+							rname(i->arg[1].val, i->cls),
+							rname(i1->arg[0].val, i->cls));
+						last_w32 = w32_def_reg(i1, last_w32);
+						i++;
+						continue;
+					}
+					if (i1->op == Oadd
+					&& ((isreg(i1->arg[0]) && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
+					 || (isreg(i1->arg[1]) && req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)))) {
+						Ref ra = req(i1->arg[1], i->to) ? i1->arg[0] : i1->arg[1];
+						fprintf(e->f, "\tmadd\t%s, %s, %s, %s\n",
+							rname(i1->to.val, i1->cls),
+							rname(i->arg[0].val, i->cls),
+							rname(i->arg[1].val, i->cls),
+							rname(ra.val, i->cls));
+						last_w32 = w32_def_reg(i1, last_w32);
+						i++;
+						continue;
+					}
+				}
+			}
 			int next_w32 = w32_def_reg(i, last_w32);
 			emitins(i, e);
 			last_w32 = next_w32;

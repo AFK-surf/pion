@@ -1560,6 +1560,40 @@ arm64_macho_fn(Fn *fn)
 			if (i->op == Oextuw && req(i->to, i->arg[0])
 			&& isreg(i->to) && i->to.val == last_w32)
 				continue;
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
+			&& i->op == Omul && KBASE(i->cls) == 0
+			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
+				Ins *i1 = i + 1;
+				if (i1->cls == i->cls && isreg(i1->to) && req(i1->to, i->to)) {
+					uint32_t sf = (i->cls == Kl) ? 1u : 0u;
+					if (i1->op == Osub && isreg(i1->arg[0])
+					&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
+						/* msub rd, rn, rm, ra */
+						emit_u32(0x1b008000u | (sf << 31)
+							| (greg(i->arg[1].val) << 16)
+							| (greg(i1->arg[0].val) << 10)
+							| (greg(i->arg[0].val) << 5)
+							| greg(i1->to.val));
+						last_w32 = me_w32_def_reg(i1, last_w32);
+						i++;
+						continue;
+					}
+					if (i1->op == Oadd
+					&& ((isreg(i1->arg[0]) && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
+					 || (isreg(i1->arg[1]) && req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)))) {
+						Ref ra = req(i1->arg[1], i->to) ? i1->arg[0] : i1->arg[1];
+						/* madd rd, rn, rm, ra */
+						emit_u32(0x1b000000u | (sf << 31)
+							| (greg(i->arg[1].val) << 16)
+							| (greg(ra.val) << 10)
+							| (greg(i->arg[0].val) << 5)
+							| greg(i1->to.val));
+						last_w32 = me_w32_def_reg(i1, last_w32);
+						i++;
+						continue;
+					}
+				}
+			}
 			int next_w32 = me_w32_def_reg(i, last_w32);
 			me_emitins(i, &e);
 			last_w32 = next_w32;
