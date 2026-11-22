@@ -60,6 +60,7 @@
 #include <sys/event.h>
 #elif defined(__linux__)
 #include <sys/epoll.h>
+#include <sys/random.h>
 /* glibc hides SO_REUSEPORT under _POSIX_C_SOURCE; 15 is the asm-generic value. */
 #if !defined(SO_REUSEPORT) && (defined(__x86_64__) || defined(__aarch64__) || defined(__riscv) || \
                                defined(__i386__) || defined(__arm__) || defined(__powerpc__))
@@ -1030,7 +1031,7 @@ void *pion_int_to_str(int64_t v) {
     PionString *str = (PionString *)pion_alloc_raw((uint32_t)(sizeof(PionString) + n + 1),
                                              PION_TAG_STRING, NULL);
     str->len = (int64_t)n;
-    pion_copy_short(str->data, p, n);
+    memcpy(str->data, p, n);
     str->data[n] = '\0';
     return str;
 }
@@ -1492,7 +1493,7 @@ void pion_strbuf_push_str(void *sb_ptr, void *s_ptr) {
     if (__builtin_expect(!sb || !s || s->len == 0, 0)) return;
     int64_t slen = s->len;
     pion_strbuf_reserve(sb, slen);
-    memcpy(sb->data + sb->len, s->data, (size_t)slen);
+    pion_copy_short(sb->data + sb->len, s->data, (size_t)slen);
     sb->len += slen;
     sb->data[sb->len] = '\0';
 }
@@ -1885,10 +1886,44 @@ PION_MINSIZE void pion_arr_sort_str(void *a_ptr) {
  * 5. String-Keyed Hash Map (Open Addressing, 64-bit Block Hash)
  * ============================================================================ */
 
+static uint64_t g_pion_hash_seed = 0;
+
+#if defined(__GNUC__) || defined(__clang__)
+static PION_MINSIZE __attribute__((constructor)) void pion_rt_init_hash_seed(void) {
+    const char *env = getenv("PION_HASH_SEED");
+    if (env && env[0] != '\0') {
+        g_pion_hash_seed = (uint64_t)strtoull(env, NULL, 0);
+        return;
+    }
+    uint64_t seed = 0;
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+    arc4random_buf(&seed, sizeof(seed));
+#elif defined(__linux__)
+    ssize_t got = getrandom(&seed, sizeof(seed), 0);
+    if (got != (ssize_t)sizeof(seed)) {
+        int fd = open("/dev/urandom", O_RDONLY);
+        if (fd >= 0) {
+            ssize_t r = read(fd, &seed, sizeof(seed));
+            close(fd);
+            if (r == (ssize_t)sizeof(seed)) got = r;
+        }
+        if (got != (ssize_t)sizeof(seed)) {
+            seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+        }
+    }
+#elif defined(_WIN32)
+    seed = (uint64_t)GetTickCount64() ^ ((uint64_t)GetCurrentProcessId() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+#else
+    seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+#endif
+    g_pion_hash_seed = seed;
+}
+#endif
+
 static inline uint64_t pion_str_hash(const PionString *s) {
     const unsigned char *p = (const unsigned char *)s->data;
     size_t len = (size_t)s->len;
-    uint64_t h = 0x517cc1b727220a95ULL ^ ((uint64_t)len * 0x9e3779b97f4a7c15ULL);
+    uint64_t h = (0x517cc1b727220a95ULL ^ g_pion_hash_seed) ^ ((uint64_t)len * 0x9e3779b97f4a7c15ULL);
     while (len >= 8) {
         uint64_t w;
         memcpy(&w, p, 8);
