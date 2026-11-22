@@ -1051,3 +1051,104 @@ amd64_isel(Fn *fn)
 		printfn(fn, stderr);
 	}
 }
+
+void
+amd64_hoist_consts(Fn *fn)
+{
+	Blk *b, *d, *p, **order;
+	Ins *i, ins;
+	Con *c;
+	uint *nhoist;
+	uint k, n, j, pos, bestloop;
+
+	if (fn->nblk == 0)
+		return;
+	nhoist = alloc(fn->nblk * sizeof *nhoist);
+	order = alloc(fn->nblk * sizeof *order);
+	n = 0;
+	for (b = fn->start; b; b = b->link) {
+		b->hascall = 0;
+		for (k = 0; k < b->nins; k++) {
+			if (b->ins[k].op == Ocall) {
+				b->hascall = 1;
+				break;
+			}
+		}
+		if (b->loop > 1)
+			order[n++] = b;
+	}
+	for (k = 1; k < n; k++) {
+		Blk *key = order[k];
+		j = k;
+		while (j > 0 && order[j - 1]->loop < key->loop) {
+			order[j] = order[j - 1];
+			j--;
+		}
+		order[j] = key;
+	}
+	for (j = 0; j < n; j++) {
+		b = order[j];
+		if (b->hascall)
+			continue;
+		for (k = 0; k < b->nins; k++) {
+			i = &b->ins[k];
+			if (i->op != Ocopy || i->cls != Kl)
+				continue;
+			if (rtype(i->arg[0]) != RCon)
+				continue;
+			if (rtype(i->to) != RTmp || isreg(i->to))
+				continue;
+			if (fn->tmp[i->to.val].slot != -1 || fn->tmp[i->to.val].ndef != 1)
+				continue;
+			c = &fn->con[i->arg[0].val];
+			if (c->type != CBits)
+				continue;
+			if (c->bits.i >= INT32_MIN && c->bits.i <= INT32_MAX)
+				continue;
+
+			d = 0;
+			bestloop = (uint)b->loop;
+			for (p = b->idom; p; p = p->idom) {
+				if ((uint)p->loop < bestloop) {
+					bestloop = (uint)p->loop;
+					d = p;
+					if (bestloop == 1)
+						break;
+				}
+			}
+			if (!d || nhoist[d->id] >= 3)
+				continue;
+
+			ins = *i;
+			pos = d->nins;
+			while (pos > 0) {
+				int op = d->ins[pos - 1].op;
+				if (op == Oxcmp || op == Oxtest
+				 || INRANGE(op, Oflag, Oflag1)
+				 || isxsel(op))
+					pos--;
+				else
+					break;
+			}
+			vgrow(&d->ins, d->nins + 1);
+			if (pos < d->nins)
+				memmove(&d->ins[pos + 1], &d->ins[pos],
+					(d->nins - pos) * sizeof(Ins));
+			d->ins[pos] = ins;
+			d->nins++;
+			nhoist[d->id]++;
+			fn->tmp[ins.to.val].bid = d->id;
+			fn->tmp[ins.to.val].def = &d->ins[pos];
+			b->ins[k] = (Ins){.op = Onop};
+		}
+	}
+	for (b = fn->start; b; b = b->link) {
+		if (!nhoist[b->id])
+			continue;
+		for (k = 0; k < b->nins; k++) {
+			Ref to = b->ins[k].to;
+			if (rtype(to) == RTmp && !isreg(to) && fn->tmp[to.val].ndef == 1)
+				fn->tmp[to.val].def = &b->ins[k];
+		}
+	}
+}

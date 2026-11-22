@@ -1506,6 +1506,28 @@ me_w32_def_reg(const Ins *i, int cur_reg)
 	}
 }
 
+static int
+me_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg)
+{
+	for (Ins *ins = start; ins < end; ins++) {
+		if (ins->op == Ocall)
+			return 0;
+		for (int j = 0; j < 2; j++) {
+			Ref a = ins->arg[j];
+			if (req(a, reg))
+				return 0;
+			if (rtype(a) == RMem) {
+				Mem *m = &fn->mem[a.val];
+				if (req(m->base, reg) || req(m->index, reg))
+					return 0;
+			}
+		}
+		if (req(ins->to, reg) && ins->op != Osel0 && !isxsel(ins->op))
+			return 1;
+	}
+	return 0;
+}
+
 void
 arm64_macho_fn(Fn *fn)
 {
@@ -1564,7 +1586,8 @@ arm64_macho_fn(Fn *fn)
 			&& i->op == Omul && KBASE(i->cls) == 0
 			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
 				Ins *i1 = i + 1;
-				if (i1->cls == i->cls && isreg(i1->to) && req(i1->to, i->to)) {
+				if (i1->cls == i->cls && isreg(i1->to)
+				&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to))) {
 					uint32_t sf = (i->cls == Kl) ? 1u : 0u;
 					if (i1->op == Osub && isreg(i1->arg[0])
 					&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
@@ -1574,6 +1597,8 @@ arm64_macho_fn(Fn *fn)
 							| (greg(i1->arg[0].val) << 10)
 							| (greg(i->arg[0].val) << 5)
 							| greg(i1->to.val));
+						if (last_w32 == i->to.val)
+							last_w32 = -1;
 						last_w32 = me_w32_def_reg(i1, last_w32);
 						i++;
 						continue;
@@ -1588,9 +1613,56 @@ arm64_macho_fn(Fn *fn)
 							| (greg(ra.val) << 10)
 							| (greg(i->arg[0].val) << 5)
 							| greg(i1->to.val));
+						if (last_w32 == i->to.val)
+							last_w32 = -1;
 						last_w32 = me_w32_def_reg(i1, last_w32);
 						i++;
 						continue;
+					}
+				}
+			}
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
+			&& i->op == Oshl && KBASE(i->cls) == 0
+			&& isreg(i->to) && isreg(i->arg[0]) && i->arg[0].val != SP
+			&& rtype(i->arg[1]) == RCon) {
+				Con *sc = &fn->con[i->arg[1].val];
+				if (sc->type == CBits) {
+					uint32_t maxsh = (i->cls == Kl) ? 63u : 31u;
+					uint32_t sh = (uint32_t)sc->bits.i & maxsh;
+					Ins *i1 = i + 1;
+					if (sh >= 1 && i1->cls == i->cls && isreg(i1->to) && i1->to.val != SP
+					&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to))) {
+						uint32_t sf = (i->cls == Kl) ? 1u : 0u;
+						if (i1->op == Oadd
+						&& ((isreg(i1->arg[0]) && i1->arg[0].val != SP && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
+						 || (isreg(i1->arg[1]) && i1->arg[1].val != SP && req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)))) {
+							Ref ra = req(i1->arg[1], i->to) ? i1->arg[0] : i1->arg[1];
+							/* add rd, ra, rn, lsl #sh */
+							emit_u32(0x0b000000u | (sf << 31)
+								| (greg(i->arg[0].val) << 16)
+								| (sh << 10)
+								| (greg(ra.val) << 5)
+								| greg(i1->to.val));
+							if (last_w32 == i->to.val)
+								last_w32 = -1;
+							last_w32 = me_w32_def_reg(i1, last_w32);
+							i++;
+							continue;
+						}
+						if (i1->op == Osub && isreg(i1->arg[0]) && i1->arg[0].val != SP
+						&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
+							/* sub rd, ra, rn, lsl #sh */
+							emit_u32(0x4b000000u | (sf << 31)
+								| (greg(i->arg[0].val) << 16)
+								| (sh << 10)
+								| (greg(i1->arg[0].val) << 5)
+								| greg(i1->to.val));
+							if (last_w32 == i->to.val)
+								last_w32 = -1;
+							last_w32 = me_w32_def_reg(i1, last_w32);
+							i++;
+							continue;
+						}
 					}
 				}
 			}

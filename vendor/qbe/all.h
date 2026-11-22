@@ -649,6 +649,9 @@ void pe_emitfin(FILE *);
 /* arm64/isel.c */
 void arm64_hoist_consts(Fn *);
 
+/* amd64/isel.c */
+void amd64_hoist_consts(Fn *);
+
 /* arm64/macho.c */
 void arm64_macho_begin(uint32_t macos_ver);
 void arm64_macho_dat(Dat *);

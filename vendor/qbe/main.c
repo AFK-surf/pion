@@ -142,6 +142,10 @@ func(Fn *fn)
 		filldom(fn);
 		fillloop(fn);
 		arm64_hoist_consts(fn);
+	} else if (strncmp(T.name, "amd64", 5) == 0) {
+		filldom(fn);
+		fillloop(fn);
+		amd64_hoist_consts(fn);
 	}
 	filllive(fn);
 	fillloop(fn);
