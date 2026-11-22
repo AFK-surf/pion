@@ -823,7 +823,7 @@ static const char pion_digits200[201] =
     "6061626364656667686970717273747576777879"
     "8081828384858687888990919293949596979899";
 
-static inline char *pion_fmt_i64_end(int64_t v, char *end) {
+static PION_NOINLINE char *pion_fmt_i64_end(int64_t v, char *end) {
     char *p = end;
     int neg = v < 0;
     uint64_t u = neg ? ((uint64_t)(-(v + 1)) + 1ULL) : (uint64_t)v;
@@ -1037,13 +1037,13 @@ void *pion_int_to_str(int64_t v) {
 
 PION_MINSIZE void *pion_double_to_str(double v) {
     char buf[64];
-    int n = snprintf(buf, sizeof(buf), "%.15g", v);
-    if (n < 0) {
-        return pion_str_from_cstr("", 0);
+    int n = 0;
+    for (int prec = 15; prec <= 17; prec++) {
+        n = snprintf(buf, sizeof(buf), "%.*g", prec, v);
+        if (!isfinite(v) || prec == 17 || (n > 0 && strtod(buf, NULL) == v)) break;
     }
-    if (n >= (int)sizeof(buf)) {
-        n = (int)sizeof(buf) - 1;
-    }
+    if (n < 0) return pion_str_from_cstr("", 0);
+    if (n >= (int)sizeof(buf)) n = (int)sizeof(buf) - 1;
     return pion_str_from_cstr(buf, (int64_t)n);
 }
 
@@ -1491,6 +1491,21 @@ void pion_strbuf_push_str(void *sb_ptr, void *s_ptr) {
     pion_strbuf_reserve(sb, slen);
     memcpy(sb->data + sb->len, s->data, (size_t)slen);
     sb->len += slen;
+    sb->data[sb->len] = '\0';
+}
+
+void pion_strbuf_push_slice(void *sb_ptr, void *s_ptr, int64_t start, int64_t end) {
+    PionStrBuf *sb = (PionStrBuf *)sb_ptr;
+    PionString *s = (PionString *)s_ptr;
+    if (__builtin_expect(!sb || !s, 0)) return;
+    int64_t slen = s->len;
+    if (start < 0) start = 0;
+    if (end > slen) end = slen;
+    if (start >= end) return;
+    int64_t n = end - start;
+    pion_strbuf_reserve(sb, n);
+    memcpy(sb->data + sb->len, s->data + start, (size_t)n);
+    sb->len += n;
     sb->data[sb->len] = '\0';
 }
 

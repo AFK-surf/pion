@@ -207,6 +207,13 @@ export function createPionRuntime(options = {}) {
     return ans;
   }
 
+  function roundLargeSize(need) {
+    let p = 32768;
+    while (p < need) p *= 2;
+    const threeQuarter = (p / 2) + (p / 4);
+    return need <= threeQuarter ? threeQuarter : p;
+  }
+
   // Raw allocation: stores 8-byte block header (size:u32 @ base, magic:u32 @ base+4) at ptr - 8.
   function rawAlloc(size) {
     syncViews();
@@ -232,7 +239,7 @@ export function createPionRuntime(options = {}) {
         return base + 8;
       }
     }
-    const allocSz = cls >= 0 ? FREE_CLASSES[cls] : ((need + 15) & ~15);
+    const allocSz = cls >= 0 ? FREE_CLASSES[cls] : roundLargeSize(need);
     if (cls < 0) {
       const bucket = largeFree.get(allocSz);
       if (bucket && bucket.length > 0) {
@@ -672,7 +679,12 @@ export function createPionRuntime(options = {}) {
   }
 
   function pion_double_to_str(v) {
-    return makePionStr(formatG(v, 15));
+    let s = formatG(v, 15);
+    if (Number.isFinite(v) && Number(s) !== v) {
+      s = formatG(v, 16);
+      if (Number(s) !== v) s = formatG(v, 17);
+    }
+    return makePionStr(s);
   }
 
   function pion_float_to_str(v) {
@@ -953,6 +965,25 @@ export function createPionRuntime(options = {}) {
     const dp = Number(dv.getBigInt64(p + 16, true));
     u8.copyWithin(dp + len, ps + 8, ps + 8 + slen);
     dv.setBigInt64(p, BigInt(len + slen), true);
+  }
+
+  function pion_strbuf_push_slice(sb, s, start, end) {
+    const p = pNum(sb), ps = pNum(s);
+    if (!p || !ps) return;
+    syncViews();
+    const slen = Number(dv.getBigInt64(ps, true));
+    let a = Number(start);
+    let b = Number(end);
+    if (a < 0) a = 0;
+    if (b > slen) b = slen;
+    if (a >= b) return;
+    const n = b - a;
+    strbufEnsure(p, n);
+    syncViews();
+    const len = Number(dv.getBigInt64(p, true));
+    const dp = Number(dv.getBigInt64(p + 16, true));
+    u8.copyWithin(dp + len, ps + 8 + a, ps + 8 + b);
+    dv.setBigInt64(p, BigInt(len + n), true);
   }
 
   function pion_strbuf_push_byte(sb, b) {
@@ -1849,7 +1880,7 @@ export function createPionRuntime(options = {}) {
       pion_bytes_slice, pion_bytes_concat, pion_bytes_from_ptr, pion_bytes_copy_to_ptr,
 
       // StringBuilder
-      pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_byte,
+      pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_slice, pion_strbuf_push_byte,
       pion_strbuf_push_char, pion_strbuf_push_int, pion_strbuf_reset, pion_strbuf_to_str,
 
       // Array
@@ -1959,13 +1990,13 @@ if (IS_NODE_ENV && process.argv[1]) {
         const wasmBytes = fs.readFileSync(wasmPath);
         if (wasmBytes.byteLength <= SYNC_INSTANTIATE_LIMIT) {
           const { exitCode } = runWasmBytesSync(wasmBytes, progArgs, { fs });
-          process.exit(exitCode | 0);
+          process.exitCode = exitCode | 0;
         } else {
           runWasmBytes(wasmBytes, progArgs, { fs }).then(
-            ({ exitCode }) => process.exit(exitCode | 0),
+            ({ exitCode }) => { process.exitCode = exitCode | 0; },
             (err) => {
               process.stderr.write((err && err.stack ? err.stack : String(err)) + "\n");
-              process.exit(1);
+              process.exitCode = 1;
             },
           );
         }
@@ -1986,10 +2017,10 @@ if (IS_NODE_ENV && process.argv[1]) {
       }
       const progArgs = process.argv.slice(2);
       const { exitCode } = await runWasmFile(wasmPath, progArgs);
-      process.exit(exitCode | 0);
+      process.exitCode = exitCode | 0;
     })().catch((err) => {
       process.stderr.write((err && err.stack ? err.stack : String(err)) + "\n");
-      process.exit(1);
+      process.exitCode = 1;
     });
   }
 }

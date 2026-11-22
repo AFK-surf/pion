@@ -168,6 +168,7 @@ void     pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst, int64_t
 /* StringBuilder */
 void*    pion_strbuf_new(int64_t cap);
 void     pion_strbuf_push_str(void *sb, void *s);
+void     pion_strbuf_push_slice(void *sb, void *s, int64_t start, int64_t end);
 void     pion_strbuf_push_byte(void *sb, int32_t b);
 void     pion_strbuf_push_char(void *sb, int32_t cp);
 void     pion_strbuf_push_int(void *sb, int64_t v);

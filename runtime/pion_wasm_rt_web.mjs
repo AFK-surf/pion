@@ -96,6 +96,11 @@ export function createPionRuntime(opts = {}) {
     }
     return ans;
   }
+  function roundLarge(need) {
+    let p = 32768; while (p < need) p *= 2;
+    const tq = (p / 2) + (p / 4);
+    return need <= tq ? tq : p;
+  }
   function rawAlloc(sz) {
     sync();
     const need = ((sz + 7) & ~7) + 8, c = clsIdx(need);
@@ -107,7 +112,7 @@ export function createPionRuntime(opts = {}) {
         const b = free[c].pop(); su32(b, FREE_CLASSES[c]); su32(b + 4, ALLOC_MAGIC); return b + 8;
       }
     }
-    const asz = c >= 0 ? FREE_CLASSES[c] : ((need + 15) & ~15);
+    const asz = c >= 0 ? FREE_CLASSES[c] : roundLarge(need);
     if (c < 0) {
       const bk = largeFree.get(asz);
       if (bk && bk.length) { const b = bk.pop(); su32(b, asz); su32(b + 4, ALLOC_MAGIC); return b + 8; }
@@ -276,7 +281,11 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_int_to_str = (v) => mkStr(BigInt(v).toString(10));
   const pion_uint64_to_str = (v) => mkStr(BigInt.asUintN(64, BigInt(v)).toString(10));
-  const pion_double_to_str = (v) => mkStr(fmtG(v, 15));
+  function pion_double_to_str(v) {
+    let s = fmtG(v, 15);
+    if (Number.isFinite(v) && Number(s) !== v) { s = fmtG(v, 16); if (Number(s) !== v) s = fmtG(v, 17); }
+    return mkStr(s);
+  }
   const pion_float_to_str = (v) => mkStr(fmtG(Math.fround(v), 7));
   function pion_str_to_int(s, ok) {
     const t = readStr(s).trim(), op = pNum(ok); sync();
@@ -377,6 +386,12 @@ export function createPionRuntime(opts = {}) {
     const p = pNum(sb), ps = pNum(s); if (!ps) return; sync(); const sl = Number(g64(ps)); if (!sl) return;
     sbEnsure(p, sl); sync(); const l = Number(g64(p));
     u8.copyWithin(Number(g64(p + 16)) + l, ps + 8, ps + 8 + sl); s64(p, l + sl);
+  }
+  function pion_strbuf_push_slice(sb, s, st, en) {
+    const p = pNum(sb), ps = pNum(s); if (!p || !ps) return; sync(); const sl = Number(g64(ps));
+    let a = Math.max(0, Number(st)), b = Math.min(sl, Number(en)); if (a >= b) return;
+    const n = b - a; sbEnsure(p, n); sync(); const l = Number(g64(p));
+    u8.copyWithin(Number(g64(p + 16)) + l, ps + 8 + a, ps + 8 + b); s64(p, l + n);
   }
   function pion_strbuf_push_byte(sb, b) {
     const p = pNum(sb); sbEnsure(p, 1); sync(); const l = Number(g64(p));
@@ -669,7 +684,7 @@ export function createPionRuntime(opts = {}) {
       pion_str_trim, pion_str_split, pion_str_replace, pion_str_to_bytes, pion_bytes_to_str,
       pion_bytes_new, pion_bytes_len, pion_bytes_get, pion_bytes_set,
       pion_bytes_slice, pion_bytes_concat, pion_bytes_from_ptr, pion_bytes_copy_to_ptr,
-      pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_byte, pion_strbuf_push_char,
+      pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_slice, pion_strbuf_push_byte, pion_strbuf_push_char,
       pion_strbuf_push_int, pion_strbuf_reset, pion_strbuf_to_str,
       pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_push_flat_grow, pion_arr_get,
       pion_arr_set, pion_arr_pop, pion_arr_copy, pion_arr_clear, pion_arr_reverse,
