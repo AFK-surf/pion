@@ -6869,6 +6869,162 @@ fn qbe_stmts_inline_cost(stmts : Array[Stmt], self_name : String) -> Int {
 }
 
 ///|
+fn qbe_expr_loop_inline_cost(e : Expr, self_name : String) -> Int {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => 1
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | EField(inner, _, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _) => {
+      let c = qbe_expr_loop_inline_cost(inner, self_name)
+      if c < 0 { -1 } else { c + 1 }
+    }
+    EBinary(_, l, r, _) | EIndex(l, r, _) => {
+      let cl = qbe_expr_loop_inline_cost(l, self_name)
+      if cl < 0 {
+        return -1
+      }
+      let cr = qbe_expr_loop_inline_cost(r, self_name)
+      if cr < 0 { -1 } else { cl + cr + 1 }
+    }
+    EMethodCall(obj, mname, args, _) => {
+      if has_qual_sep(self_name) && split_qual_name(self_name).name == mname {
+        return -1
+      }
+      if mname != "length" &&
+        mname != "sqrt" &&
+        mname != "abs" &&
+        mname != "floor" &&
+        mname != "ceil" &&
+        mname != "trunc" &&
+        mname != "to_int" &&
+        mname != "to_int64" &&
+        mname != "to_double" &&
+        mname != "to_float" &&
+        mname != "to_byte" &&
+        mname != "code_unit_at" {
+        return -1
+      }
+      let mut tot = qbe_expr_loop_inline_cost(obj, self_name)
+      if tot < 0 {
+        return -1
+      }
+      let mut i = 0
+      while i < args.length() {
+        let ca = qbe_expr_loop_inline_cost(args[i], self_name)
+        if ca < 0 {
+          return -1
+        }
+        tot = tot + ca
+        i = i + 1
+      }
+      tot + 2
+    }
+    EBlock(stmts, _) => qbe_stmts_loop_inline_cost_in(stmts, self_name, 0)
+    EIf(cond, then_stmts, else_opt, _) => {
+      let cc = qbe_expr_loop_inline_cost(cond, self_name)
+      if cc < 0 {
+        return -1
+      }
+      let ct = qbe_stmts_loop_inline_cost_in(then_stmts, self_name, 0)
+      if ct < 0 {
+        return -1
+      }
+      let ce = match else_opt {
+        None => 0
+        Some(el) => qbe_expr_loop_inline_cost(el, self_name)
+      }
+      if ce < 0 { -1 } else { cc + ct + ce + 2 }
+    }
+    _ => -1
+  }
+}
+
+///|
+fn qbe_stmts_loop_inline_cost_in(
+  stmts : Array[Stmt],
+  self_name : String,
+  loop_depth : Int,
+) -> Int {
+  let mut tot = 0
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(_, _, _, init, _) => {
+        let c = qbe_expr_loop_inline_cost(init, self_name)
+        if c < 0 {
+          return -1
+        }
+        tot = tot + c + 1
+      }
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        let cl = qbe_expr_loop_inline_cost(lhs, self_name)
+        if cl < 0 {
+          return -1
+        }
+        let cr = qbe_expr_loop_inline_cost(rhs, self_name)
+        if cr < 0 {
+          return -1
+        }
+        tot = tot + cl + cr + 1
+      }
+      SExpr(e, _) => {
+        let c = qbe_expr_loop_inline_cost(e, self_name)
+        if c < 0 {
+          return -1
+        }
+        tot = tot + c
+      }
+      SWhile(wcond, wbody, _) =>
+        if loop_depth < 1 && !qbe_stmts_has_cf(wbody, false, false, true) {
+          let cc = qbe_expr_loop_inline_cost(wcond, self_name)
+          if cc < 0 {
+            return -1
+          }
+          let cb = qbe_stmts_loop_inline_cost_in(wbody, self_name, loop_depth + 1)
+          if cb < 0 {
+            return -1
+          }
+          tot = tot + cc + cb + 2
+        } else {
+          return -1
+        }
+      SBreak(_) | SContinue(_) =>
+        if loop_depth > 0 {
+          tot = tot + 1
+        } else {
+          return -1
+        }
+      _ => return -1
+    }
+    if tot > 96 {
+      return -1
+    }
+    i = i + 1
+  }
+  tot
+}
+
+///|
+fn qbe_stmts_loop_inline_cost(stmts : Array[Stmt], self_name : String) -> Int {
+  qbe_stmts_loop_inline_cost_in(stmts, self_name, 0)
+}
+
+///|
 fn qbe_hof_param_is_call_only_expr(e : Expr, pname : String) -> Bool {
   match e {
     EInt(_, _)
@@ -7434,11 +7590,21 @@ fn qbe_collect_pkg_inline_fns(
             } else {
               fd.name
             }
+            let mut collected = false
             if fd.body.length() <= 8 {
               let cost = qbe_stmts_inline_cost(fd.body, key)
               if cost >= 0 && cost <= 42 {
                 m.set(key, fd)
                 mc.set(key, cost)
+                mf.set(key, fi)
+                collected = true
+              }
+            }
+            if !collected && !fd.is_pub && fd.body.length() <= 12 {
+              let lcost = qbe_stmts_loop_inline_cost(fd.body, key)
+              if lcost >= 0 && lcost <= 96 {
+                m.set(key, fd)
+                mc.set(key, if lcost <= 42 { 43 } else { lcost })
                 mf.set(key, fi)
               }
             }
@@ -8129,10 +8295,18 @@ fn qbe_try_inline_fn_call(
   }
   match g.inline_fns.get(key) {
     Some(inl_fd) => {
-      let max_cost = match g.inline_fn_file.get(key) {
-        Some(fidx) =>
-          if g.cur_file_idx < 0 || fidx == g.cur_file_idx { 42 } else { 22 }
-        None => 42
+      let same_file = match g.inline_fn_file.get(key) {
+        Some(fidx) => g.cur_file_idx < 0 || fidx == g.cur_file_idx
+        None => true
+      }
+      let base_max_cost = if same_file { 42 } else { 22 }
+      let max_cost = if same_file &&
+        !inl_fd.is_pub &&
+        g.inline_depth == 0 &&
+        g.loop_breaks.length() > 0 {
+        96
+      } else {
+        base_max_cost
       }
       let fn_cost = match g.inline_fn_costs.get(key) {
         Some(c) => c
@@ -20843,7 +21017,64 @@ fn qbe_emit_expr_inner(
             None => ()
           }
           let payload_sz = if n_fields == 0 { 8 } else { n_fields * 8 }
-          let drop_sym = if sinfo.decl.type_params.length() == 0 {
+          let mut all_immut_struct = match spread_opt {
+            None => true
+            Some(_) => false
+          }
+          if all_immut_struct {
+            let mut mk = 0
+            while mk < n_fields {
+              if sinfo.field_muts[mk] || !overridden[mk] {
+                all_immut_struct = false
+                break
+              }
+              mk = mk + 1
+            }
+          }
+          let mut all_obj_fields_static_null = all_immut_struct
+          if all_obj_fields_static_null {
+            let mut fk = 0
+            while fk < n_fields {
+              let concrete_fk = subst_ty(
+                subst_ty(sinfo.field_tys[fk], subst),
+                g.cur_type_subst,
+              )
+              let needs_drop_fk = qbe_is_obj_ty(concrete_fk) ||
+                qbe_is_obj_ty(slot_tys[fk]) ||
+                match concrete_fk {
+                  TParam(tn) => qbe_tp_live(g, tn)
+                  _ =>
+                    match slot_tys[fk] {
+                      TParam(tn) => qbe_tp_live(g, tn)
+                      _ => false
+                    }
+                }
+              if needs_drop_fk {
+                let mut is_null_lit = false
+                let mut ffi = 0
+                while ffi < fields.length() {
+                  if fields[ffi].name == sinfo.field_names[fk] {
+                    is_null_lit = match fields[ffi].value {
+                      EIdent(idn, _) => idn == "None"
+                      EPath(_, mem, _) => mem == "None"
+                      EUnit(_) => true
+                      _ => false
+                    }
+                    break
+                  }
+                  ffi = ffi + 1
+                }
+                if !is_null_lit {
+                  all_obj_fields_static_null = false
+                  break
+                }
+              }
+              fk = fk + 1
+            }
+          }
+          let drop_sym = if all_obj_fields_static_null {
+            "0"
+          } else if sinfo.decl.type_params.length() == 0 {
             let mut has_obj = false
             let mut k = 0
             while k < n_fields {
@@ -27776,17 +28007,28 @@ fn qbe_emit_struct_drops(g : QbeGen, out : StringBuilder) -> Unit {
             let mut j = 0
             while j < obj_slots.length() {
               let off = obj_slots[j] * 8
+              let js = j.to_string()
               out.write_string("    %a")
-              out.write_string(j.to_string())
+              out.write_string(js)
               out.write_string(" =l add %p, ")
               out.write_string(off.to_string())
               out.write_string("\n    %v")
-              out.write_string(j.to_string())
+              out.write_string(js)
               out.write_string(" =l loadl %a")
-              out.write_string(j.to_string())
+              out.write_string(js)
+              out.write_string("\n    jnz %v")
+              out.write_string(js)
+              out.write_string(", @d")
+              out.write_string(js)
+              out.write_string(", @n")
+              out.write_string(js)
+              out.write_string("\n@d")
+              out.write_string(js)
               out.write_string("\n    call $pion_rc_dec(l %v")
-              out.write_string(j.to_string())
-              out.write_string(")\n")
+              out.write_string(js)
+              out.write_string(")\n@n")
+              out.write_string(js)
+              out.write_string("\n")
               j = j + 1
             }
             out.write_string("    ret\n}\n\n")
@@ -27917,17 +28159,28 @@ fn qbe_emit_helper_drops(g : QbeGen, out : StringBuilder) -> Unit {
     while si < slots.length() {
       let slot_idx = slots[si]
       let off = slot_idx * 8
+      let ss = slot_idx.to_string()
       out.write_string("    %a")
-      out.write_string(slot_idx.to_string())
+      out.write_string(ss)
       out.write_string(" =l add %p, ")
       out.write_string(off.to_string())
       out.write_string("\n    %v")
-      out.write_string(slot_idx.to_string())
+      out.write_string(ss)
       out.write_string(" =l loadl %a")
-      out.write_string(slot_idx.to_string())
+      out.write_string(ss)
+      out.write_string("\n    jnz %v")
+      out.write_string(ss)
+      out.write_string(", @d")
+      out.write_string(ss)
+      out.write_string(", @n")
+      out.write_string(ss)
+      out.write_string("\n@d")
+      out.write_string(ss)
       out.write_string("\n    call $pion_rc_dec(l %v")
-      out.write_string(slot_idx.to_string())
-      out.write_string(")\n")
+      out.write_string(ss)
+      out.write_string(")\n@n")
+      out.write_string(ss)
+      out.write_string("\n")
       si = si + 1
     }
     out.write_string("    ret\n}\n\n")
