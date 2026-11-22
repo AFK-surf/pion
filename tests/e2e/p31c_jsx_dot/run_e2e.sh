@@ -58,6 +58,11 @@ pub enum Border {
   Is(Bool)
 }
 
+pub enum Dir {
+  Row
+  Col
+}
+
 pub struct View {
   pub id : Int
   pub kind : String
@@ -217,6 +222,34 @@ pub fn For[T](
   }
   list_node
 }
+
+// P31-C2: same-package fn `Row` shadows unqualified `Dir::Row` variant in ECall / JSX
+pub fn Row(
+  parent : View,
+  gap~ : Int = 0,
+  children? : (View) -> Unit,
+) -> View {
+  let node = make_child(parent, "Row")
+  node.props.push("gap=" + gap.to_string())
+  match children {
+    .Some(f) => f(node)
+    .None => ()
+  }
+  node
+}
+
+pub fn build_same_pkg_row(root : View) -> Int {
+  let d1 : Dir = .Row
+  let d2 = Dir::Row
+  let _ = <Row in={root} gap={8}>
+    <Row gap={4} />
+  </Row>
+  if d1 == d2 && d1 == .Row && d1 != .Col {
+    1
+  } else {
+    0
+  }
+}
 EOF
 
 cat > "$PKG_DIR/lg/pion.toml" <<'EOF'
@@ -368,13 +401,16 @@ pub fn main(world : World) -> Int {
   debug_assert(dpi.get() == 1600, "on_press updated dpi signal to 1600")
   let (n2, s2, t2) = count_and_trigger(root, "")
   let dv = check_dot_variants()
+  let row_ok = view::build_same_pkg_row(root)
+  debug_assert(row_ok == 1, "same-pkg Row fn vs Dir::Row variant")
   io_println(
     world,
     "p31c_jsx_dot ok n=" + n1.to_string() + "," + n2.to_string() +
     " sel=" + s1.to_string() + "," + s2.to_string() +
     " tlen=" + t1.to_string() + "," + t2.to_string() +
     " dpi=" + dpi.get().to_string() +
-    " dv=" + dv.to_string(),
+    " dv=" + dv.to_string() +
+    " row=" + row_ok.to_string(),
   )
   0
 }
@@ -392,7 +428,7 @@ fi
 "$PIONC" build --release -o "$TMP_DIR/p31c_rel" "$PKG_DIR/app"
 REL_OUT=$("$TMP_DIR/p31c_rel")
 echo "p31c_jsx_dot native release -> $REL_OUT"
-EXPECTED="p31c_jsx_dot ok n=20,20 sel=2,2 tlen=3,4 dpi=1600 dv=42"
+EXPECTED="p31c_jsx_dot ok n=20,20 sel=2,2 tlen=3,4 dpi=1600 dv=42 row=1"
 if [ "$REL_OUT" != "$EXPECTED" ]; then
   echo "FAIL: p31c_jsx_dot native release expected '$EXPECTED', got '$REL_OUT'" >&2
   exit 1
@@ -464,6 +500,11 @@ enum Size {
 enum Border {
   None
   Is(Bool)
+}
+
+enum Dir {
+  Row
+  Col
 }
 
 struct View {
@@ -621,6 +662,16 @@ fn Chip(
   node
 }
 
+fn Row(parent : View, gap~ : Int = 0, children? : (View) -> Unit) -> View {
+  let node = make_child(parent, "Row")
+  node.props.push("gap=" + gap.to_string())
+  match children {
+    .Some(f) => f(node)
+    .None => ()
+  }
+  node
+}
+
 fn count_and_trigger(v : View, press_target : String) -> (Int, Int, Int) {
   let mut nodes = 1
   let mut selected_count = 0
@@ -698,13 +749,20 @@ pub fn main(world : World) -> Int {
   let (n2, s2, t2) = count_and_trigger(root, "")
   let a : Along = .Middle
   let dv = if a == .Middle && .Middle == a && .Start != a { 42 } else { 0 }
+  let d1 : Dir = .Row
+  let d2 = Dir::Row
+  let _ = <Row in={root} gap={8}>
+    <Row gap={4} />
+  </Row>
+  let row_ok = if d1 == d2 && d1 == .Row && d1 != .Col { 1 } else { 0 }
   io_println(
     world,
     "p31c_jsx_dot ok n=" + n1.to_string() + "," + n2.to_string() +
     " sel=" + s1.to_string() + "," + s2.to_string() +
     " tlen=" + t1.to_string() + "," + t2.to_string() +
     " dpi=" + dpi.get().to_string() +
-    " dv=" + dv.to_string(),
+    " dv=" + dv.to_string() +
+    " row=" + row_ok.to_string(),
   )
   0
 }
