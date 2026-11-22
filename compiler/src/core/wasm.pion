@@ -2039,6 +2039,7 @@ struct WasmFnCtx {
   mut div_tmp_i32 : Int
   mut div_tmp_i64 : Int
   mut alloc_tmp_i32 : Int
+  mut alloc_tmp2_i32 : Int
   mut last_set_pos : Int
   mut last_set_end : Int
   mut last_set_sym : String
@@ -2853,6 +2854,15 @@ fn wasm_emit_inst(
             } else {
               3
             }
+            let blk_sz = if cls == 0 {
+              32
+            } else if cls == 1 {
+              48
+            } else if cls == 2 {
+              64
+            } else {
+              96
+            }
             let slot_off = cls * 4
             let tag_flags_u32 : Int64 = (tag_v & 65535L) | 1048576L | (cls.to_int64() << 24)
             let base_lidx = if fctx.alloc_tmp_i32 >= 0 {
@@ -2862,21 +2872,51 @@ fn wasm_emit_inst(
               fctx.alloc_tmp_i32 = idx
               idx
             }
+            let hp_lidx = if fctx.alloc_tmp2_i32 >= 0 {
+              fctx.alloc_tmp2_i32
+            } else {
+              let idx = wasm_fn_alloc_local(fctx, WASM_TY_I32)
+              fctx.alloc_tmp2_i32 = idx
+              idx
+            }
             fctx.last_set_pos = -1
+            // P51-A: Inline Slab freelist pop OR bump-pointer alloc (hp + blk_sz <= heap_end)
             // global.get 2 is immutable slab_ctl_addr (>= WASM_DATA_BASE); linear memory is zero-init
             code.push(0x23); wasm_push_u32(code, 2)
             code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, slot_off)
             code.push(0x22); wasm_push_u32(code, base_lidx)
-            code.push(0x04); code.push(0x7E) // if (base != 0) -> i64
-            // Pop freelist: i32.store(global.get 2 + slot_off, i32.load(base + 8))
+            code.push(0x04); code.push(0x40) // if (base != 0): pop freelist
             code.push(0x23); wasm_push_u32(code, 2)
             code.push(0x20); wasm_push_u32(code, base_lidx)
             code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, 8)
             code.push(0x36); wasm_push_u32(code, 2); wasm_push_u32(code, slot_off)
-            // ALLOC_MAGIC @ base+4
+            code.push(0x05) // else: try inline bump-pointer allocation
+            code.push(0x23); wasm_push_u32(code, 2)
+            code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, 36)
+            code.push(0x22); wasm_push_u32(code, hp_lidx) // hp
+            code.push(0x41); wasm_push_s32(code, blk_sz)
+            code.push(0x6A) // new_hp = hp + blk_sz
+            code.push(0x22); wasm_push_u32(code, base_lidx) // temp hold new_hp in base_lidx
+            code.push(0x23); wasm_push_u32(code, 2)
+            code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, 40) // heap_end
+            code.push(0x4D) // i32.le_u(new_hp, heap_end)
+            code.push(0x04); code.push(0x40)
+            code.push(0x23); wasm_push_u32(code, 2)
             code.push(0x20); wasm_push_u32(code, base_lidx)
-            code.push(0x41); wasm_push_s32(code, 0x50494F4E)
-            code.push(0x36); wasm_push_u32(code, 2); wasm_push_u32(code, 4)
+            code.push(0x36); wasm_push_u32(code, 2); wasm_push_u32(code, 36) // heap_ptr = new_hp
+            code.push(0x20); wasm_push_u32(code, hp_lidx)
+            code.push(0x21); wasm_push_u32(code, base_lidx) // base = hp
+            code.push(0x05)
+            code.push(0x41); wasm_push_s32(code, 0)
+            code.push(0x21); wasm_push_u32(code, base_lidx) // base = 0
+            code.push(0x0B)
+            code.push(0x0B) // end freelist vs bump
+            code.push(0x20); wasm_push_u32(code, base_lidx)
+            code.push(0x04); code.push(0x7E) // if (base != 0) -> i64
+            // alloc_sz=blk_sz @ base+0, ALLOC_MAGIC @ base+4 (single i64.store)
+            code.push(0x20); wasm_push_u32(code, base_lidx)
+            code.push(0x42); wasm_push_s64(code, (0x50494F4EL << 32) | blk_sz.to_int64())
+            code.push(0x37); wasm_push_u32(code, 2); wasm_push_u32(code, 0)
             // owner_tid=1 @ base+8, local_rc=1 @ base+12 (single i64.store)
             code.push(0x20); wasm_push_u32(code, base_lidx)
             code.push(0x42); wasm_push_s64(code, (1L << 32) | 1L)
@@ -4774,6 +4814,7 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     div_tmp_i32: -1,
     div_tmp_i64: -1,
     alloc_tmp_i32: -1,
+    alloc_tmp2_i32: -1,
     last_set_pos: -1,
     last_set_end: -1,
     last_set_sym: "",
@@ -6960,194 +7001,322 @@ fn wasm_build_rc_dec_slow_body(
 
 ///|
 /// Emit Wasm instructions to allocate a `PionString` slice `[start .. start + seg_len]`
-/// from `ps` (local 2), `start` (local 7), `seg_len` (local 13) into `part` (local 18, i64)
-/// using `dst` (local 14, i32) and scratch locals `19=ctl, 20=base, 21=src` (all i32).
+/// from `l_ps`, `l_start`, `l_seg_len` into `l_part` (i64) using `l_dst` and scratch locals
+/// `l_ctl`, `l_base`, `l_src` (all i32).
 /// P46-A: For short segments (`seg_len <= 7`, `cls=1`, 48B), inlines Slab freelist/bump
 /// allocation + fixed-width copy (zero `alloc_uninit` / `memory.copy` calls).
-fn wasm_emit_str_split_alloc_seg(body : Array[Int], alloc_uninit_idx : Int, inline_short : Bool) -> Unit {
+fn wasm_emit_str_split_alloc_seg(
+  body : Array[Int],
+  alloc_uninit_idx : Int,
+  inline_short : Bool,
+  l_ps : Int,
+  l_start : Int,
+  l_seg_len : Int,
+  l_dst : Int,
+  l_part : Int,
+  l_ctl : Int,
+  l_base : Int,
+  l_src : Int,
+) -> Unit {
   if inline_short {
   // base = 0
-  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 20)
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, l_base)
   // if (i32.le_u(seg_len, 7) && (ctl = global.get 2) != 0)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x41); wasm_push_s32(body, 7)
   body.push(0x4D) // i32.le_u
   body.push(0x04); body.push(0x40)
   body.push(0x23); wasm_push_u32(body, 2)
-  body.push(0x22); wasm_push_u32(body, 19) // ctl
+  body.push(0x22); wasm_push_u32(body, l_ctl) // ctl
   body.push(0x04); body.push(0x40)
   // Try cls=1 freelist pop at ctl + 4
-  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x20); wasm_push_u32(body, l_ctl)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
-  body.push(0x22); wasm_push_u32(body, 20) // base
+  body.push(0x22); wasm_push_u32(body, l_base) // base
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 19)
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_ctl)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
   body.push(0x05) // else: bump allocate 48B from ctl + 36 if hp + 48 <= heapEnd (ctl + 40)
-  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x20); wasm_push_u32(body, l_ctl)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
-  body.push(0x22); wasm_push_u32(body, 21) // hp
+  body.push(0x22); wasm_push_u32(body, l_src) // hp
   body.push(0x41); wasm_push_s32(body, 48)
   body.push(0x6A)
-  body.push(0x22); wasm_push_u32(body, 14) // new_hp
-  body.push(0x20); wasm_push_u32(body, 19)
+  body.push(0x22); wasm_push_u32(body, l_dst) // new_hp
+  body.push(0x20); wasm_push_u32(body, l_ctl)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 40)
   body.push(0x4D) // i32.le_u
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 19)
-  body.push(0x20); wasm_push_u32(body, 14)
+  body.push(0x20); wasm_push_u32(body, l_ctl)
+  body.push(0x20); wasm_push_u32(body, l_dst)
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
-  body.push(0x20); wasm_push_u32(body, 21)
-  body.push(0x21); wasm_push_u32(body, 20) // base = hp
+  body.push(0x20); wasm_push_u32(body, l_src)
+  body.push(0x21); wasm_push_u32(body, l_base) // base = hp
   body.push(0x0B)
   body.push(0x0B) // end freelist vs bump
   body.push(0x0B) // end if (ctl != 0)
   body.push(0x0B) // end if (seg_len <= 7)
 
   // if (base != 0): fast inline cls=1 header + fixed-width copy
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x04); body.push(0x40)
   // base+0: alloc_sz=48 | (ALLOC_MAGIC<<32)
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x42); wasm_push_s64(body, 0x50494F4E00000030L)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   // base+8: owner_tid=1 | (local_rc=1 << 32)
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x42); wasm_push_s64(body, 0x0000000100000001L)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
   // base+16: shared_rc=0 | ((TAG_STRING(1) | (FLAG_SLAB(0x10)<<16) | (cls=1<<24)) << 32)
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x42); wasm_push_s64(body, 0x0110000100000000L)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
   // base+24: drop_fn = 0L
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
   // dst = base + 32; part = i64.extend_i32_u(dst)
-  body.push(0x20); wasm_push_u32(body, 20)
+  body.push(0x20); wasm_push_u32(body, l_base)
   body.push(0x41); wasm_push_s32(body, 32)
   body.push(0x6A)
-  body.push(0x22); wasm_push_u32(body, 14) // dst
+  body.push(0x22); wasm_push_u32(body, l_dst) // dst
   body.push(0xAD)
-  body.push(0x21); wasm_push_u32(body, 18) // part
+  body.push(0x21); wasm_push_u32(body, l_part) // part
   // i64.store(dst, i64.extend_i32_u(seg_len))
-  body.push(0x20); wasm_push_u32(body, 14)
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0xAD)
+  body.push(0x20); wasm_push_u32(body, l_dst)
+  body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0xAD)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   // src = ps + start + 8
-  body.push(0x20); wasm_push_u32(body, 2)
-  body.push(0x20); wasm_push_u32(body, 7); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_ps)
+  body.push(0x20); wasm_push_u32(body, l_start); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 21)
+  body.push(0x21); wasm_push_u32(body, l_src)
   // Fixed-width overlapping copy for seg_len in 0..7
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x41); wasm_push_s32(body, 4)
   body.push(0x4F) // i32.ge_u(seg_len, 4)
   body.push(0x04); body.push(0x40)
   // 4..7 bytes: two overlapping i32 load/store
-  body.push(0x20); wasm_push_u32(body, 14)
-  body.push(0x20); wasm_push_u32(body, 21); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, l_dst)
+  body.push(0x20); wasm_push_u32(body, l_src); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
   body.push(0x36); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 21); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_src); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 4); body.push(0x6B)
   body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
   body.push(0x36); wasm_push_u32(body, 0); wasm_push_u32(body, 4)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x41); wasm_push_s32(body, 2)
   body.push(0x4F) // i32.ge_u(seg_len, 2)
   body.push(0x04); body.push(0x40)
   // 2..3 bytes: i16 + overlapping last i8
-  body.push(0x20); wasm_push_u32(body, 14)
-  body.push(0x20); wasm_push_u32(body, 21); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, l_dst)
+  body.push(0x20); wasm_push_u32(body, l_src); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
   body.push(0x3B); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 21); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_src); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
   body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
   body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 7)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x04); body.push(0x40)
   // 1 byte
-  body.push(0x20); wasm_push_u32(body, 14)
-  body.push(0x20); wasm_push_u32(body, 21); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, l_dst)
+  body.push(0x20); wasm_push_u32(body, l_src); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
   body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
   body.push(0x0B)
   body.push(0x0B)
   body.push(0x0B)
   // NUL terminator: i32.store8(dst + 8 + seg_len, 0)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
   body.push(0x05) // else (seg_len > 7 or ctl == 0 or heap full): slow path
   // part = pion_alloc_uninit(9 + seg_len, TAG_STRING=1, 0L)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x41); wasm_push_s32(body, 9)
   body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 1)
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x10); wasm_push_u32(body, alloc_uninit_idx)
-  body.push(0x22); wasm_push_u32(body, 18) // part
+  body.push(0x22); wasm_push_u32(body, l_part) // part
   body.push(0xA7)
-  body.push(0x22); wasm_push_u32(body, 14) // dst
+  body.push(0x22); wasm_push_u32(body, l_dst) // dst
   // i64.store(dst, i64.extend_i32_u(seg_len))
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0xAD)
+  body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0xAD)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   // if (seg_len > 0) memory.copy(dst + 8, ps + 8 + start, seg_len)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_ps); body.push(0x20); wasm_push_u32(body, l_start); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0xFC); wasm_push_u32(body, 10); body.push(0x00); body.push(0x00)
   body.push(0x0B)
   // i32.store8(dst + 8 + seg_len, 0)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
   body.push(0x0B) // end if (base != 0)
   } else {
   // Cold call sites: compact call alloc_uninit + memory.copy + NUL
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x41); wasm_push_s32(body, 9)
   body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 1)
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x10); wasm_push_u32(body, alloc_uninit_idx)
-  body.push(0x22); wasm_push_u32(body, 18) // part
+  body.push(0x22); wasm_push_u32(body, l_part) // part
   body.push(0xA7)
-  body.push(0x22); wasm_push_u32(body, 14) // dst
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0xAD)
+  body.push(0x22); wasm_push_u32(body, l_dst) // dst
+  body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0xAD)
   body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_ps); body.push(0x20); wasm_push_u32(body, l_start); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, l_seg_len)
   body.push(0xFC); wasm_push_u32(body, 10); body.push(0x00); body.push(0x00)
   body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x20); wasm_push_u32(body, 13); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, l_dst); body.push(0x20); wasm_push_u32(body, l_seg_len); body.push(0x6A)
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
   }
 }
 
 ///|
+/// P51-A: Pure-Wasm chunk helper `__pion_str_split1_count(ps: i32, i: i32, end: i32, sb0: i32) -> i32`.
+/// Called in 4096B chunks from `pion_str_split` so V8 tiers it up to TurboFan even on a single split call.
+/// Uses borrow-free 8-byte SWAR + `i64.popcnt` for 8B/iter counting.
+fn wasm_build_str_split1_count_body() -> Array[Int] {
+  // Params: 0=ps, 1=i, 2=end, 3=sb0
+  // Locals: 4=cnt (i32), 5=end8 (i32), 6=rep (i64), 7=x (i64)
+  let body : Array[Int] = [0x02, 0x02, 0x7F, 0x02, 0x7E]
+  // if (end - i >= 8): 8-byte borrow-free SWAR loop
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 1); body.push(0x6B)
+  body.push(0x41); wasm_push_s32(body, 8); body.push(0x4F) // i32.ge_u
+  body.push(0x04); body.push(0x40)
+  // rep = i64.extend_i32_u(sb0) * 0x0101010101010101L
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0xAD)
+  body.push(0x42); wasm_push_s64(body, 72340172838076673L)
+  body.push(0x7E) // i64.mul
+  body.push(0x21); wasm_push_u32(body, 6)
+  // end8 = end - 7
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 7); body.push(0x6B)
+  body.push(0x21); wasm_push_u32(body, 5)
+  body.push(0x02); body.push(0x40) // block
+  body.push(0x03); body.push(0x40) // loop
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x20); wasm_push_u32(body, 5); body.push(0x4F) // i >= end8
+  body.push(0x0D); wasm_push_u32(body, 1)
+  // x = i64.load(ps + i + 8) ^ rep
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0x20); wasm_push_u32(body, 1); body.push(0x6A)
+  body.push(0x29); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x85) // xor
+  body.push(0x22); wasm_push_u32(body, 7)
+  // m = ~(((x & 0x7F..7F) + 0x7F..7F) | x | 0x7F..7F)
+  body.push(0x42); wasm_push_s64(body, 9187201950435737471L) // 0x7F7F7F7F7F7F7F7F
+  body.push(0x83) // i64.and
+  body.push(0x42); wasm_push_s64(body, 9187201950435737471L)
+  body.push(0x7C) // i64.add
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x84) // i64.or
+  body.push(0x42); wasm_push_s64(body, 9187201950435737471L); body.push(0x84) // i64.or
+  body.push(0x42); wasm_push_s64(body, -1L); body.push(0x85) // i64.xor (~)
+  body.push(0x7B) // i64.popcnt
+  body.push(0xA7) // i32.wrap_i64
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 1)
+  body.push(0x0C); wasm_push_u32(body, 0)
+  body.push(0x0B) // end loop
+  body.push(0x0B) // end block
+  body.push(0x0B) // end if
+  // Byte tail loop: while i < end
+  body.push(0x02); body.push(0x40)
+  body.push(0x03); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x20); wasm_push_u32(body, 2); body.push(0x4F)
+  body.push(0x0D); wasm_push_u32(body, 1)
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0x20); wasm_push_u32(body, 1); body.push(0x6A)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 1)
+  body.push(0x0C); wasm_push_u32(body, 0)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x0B)
+  body
+}
+
+///|
+/// P51-A: Pure-Wasm chunk helper `__pion_str_split1_emit(ps, i, end, start, sb0, dp, out_idx) -> i64`.
+/// Returns `(i64(new_out_idx) << 32) | i64(new_start)`.
+/// Called in 4096B chunks from `pion_str_split` so V8 tiers Pass 2 up to TurboFan on a single split.
+fn wasm_build_str_split1_emit_body(alloc_uninit_idx : Int) -> Array[Int] {
+  // Params: 0=ps, 1=i, 2=end, 3=start, 4=sb0, 5=dp, 6=out_idx
+  // Locals: 7=seg_len, 8=dst, 9=ctl, 10=base, 11=src (5 i32) + 12=part (1 i64)
+  let body : Array[Int] = [0x02, 0x05, 0x7F, 0x01, 0x7E]
+  body.push(0x02); body.push(0x40) // block
+  body.push(0x03); body.push(0x40) // loop
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x20); wasm_push_u32(body, 2); body.push(0x4F) // i >= end
+  body.push(0x0D); wasm_push_u32(body, 1)
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0x20); wasm_push_u32(body, 1); body.push(0x6A)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  // seg_len = i - start
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x20); wasm_push_u32(body, 3); body.push(0x6B)
+  body.push(0x21); wasm_push_u32(body, 7)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, true, 0, 3, 7, 8, 12, 9, 10, 11)
+  // i64.store(dp + (out_idx << 3), part)
+  body.push(0x20); wasm_push_u32(body, 5)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74)
+  body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, 12)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  // out_idx += 1; start = i + 1
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 3)
+  body.push(0x0B) // end if (byte == sb0)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 1)
+  body.push(0x0C); wasm_push_u32(body, 0)
+  body.push(0x0B) // end loop
+  body.push(0x0B) // end block
+  // return (i64.extend_i32_u(out_idx) << 32) | i64.extend_i32_u(start)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0xAD)
+  body.push(0x42); wasm_push_s64(body, 32L); body.push(0x86)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0xAD)
+  body.push(0x84) // i64.or
+  body.push(0x0B)
+  body
+}
+
+///|
 /// Pure-Wasm internal `pion_str_split(s: i64, sep: i64) -> i64`.
 /// - `seplen == 0`: falls back to JS `pion_str_split` (identical `[str]` semantics).
-/// - `seplen == 1`: 2-pass exact-capacity split with zero `arrGrow` and zero JS crossings.
+/// - `seplen == 1`: 2-pass exact-capacity split with 4096B chunked TurboFan helpers.
 /// - `seplen > 1`: first-byte filter + byte-level match with internal `pion_arr_push_owned`.
 fn wasm_build_str_split_body(
   alloc_uninit_idx : Int,
   arr_new_idx : Int,
   arr_push_owned_idx : Int,
   slow_imp_idx : Int,
+  split1_count_idx : Int,
+  split1_emit_idx : Int,
 ) -> Array[Int] {
   // 15 i32 locals (2=ps, 3=psep, 4=slen, 5=seplen, 6=i, 7=start, 8=cnt, 9=sb0,
   //                10=arr_p, 11=dp, 12=out_idx, 13=seg_len, 14=dst, 15=j, 16=limit)
@@ -7193,7 +7362,7 @@ fn wasm_build_str_split_body(
   body.push(0x41); wasm_push_s32(body, 1)
   body.push(0x46)
   body.push(0x04); body.push(0x40)
-  // Pass 1: count matches of sb0 in s
+  // Pass 1: count matches of sb0 in s in 4096B chunks (triggers V8 TurboFan tier-up)
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 8) // cnt = 0
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 6) // i = 0
   body.push(0x02); body.push(0x40) // block
@@ -7202,16 +7371,22 @@ fn wasm_build_str_split_body(
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x4F) // i32.ge_u
   body.push(0x0D); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 6); body.push(0x6A)
-  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
-  body.push(0x20); wasm_push_u32(body, 9)
-  body.push(0x46)
+  // limit = min(i + 4096, slen)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 4096); body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x4B) // i32.gt_u
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 8); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x21); wasm_push_u32(body, 16)
   body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 6)
+  // cnt += split1_count(ps, i, limit, sb0)
+  body.push(0x20); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x10); wasm_push_u32(body, split1_count_idx)
+  body.push(0x6A); body.push(0x21); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x21); wasm_push_u32(body, 6)
   body.push(0x0C); wasm_push_u32(body, 0)
   body.push(0x0B) // end loop
   body.push(0x0B) // end block
@@ -7226,7 +7401,7 @@ fn wasm_build_str_split_body(
   body.push(0x22); wasm_push_u32(body, 10) // arr_p
   body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24); body.push(0xA7)
   body.push(0x21); wasm_push_u32(body, 11) // dp
-  // Pass 2: split and write directly to dp[out_idx * 8]
+  // Pass 2: split in 4096B chunks via TurboFan-tiered split1_emit helper
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 7) // start = 0
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 6) // i = 0
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 12) // out_idx = 0
@@ -7236,36 +7411,34 @@ fn wasm_build_str_split_body(
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x4F) // i32.ge_u
   body.push(0x0D); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 6); body.push(0x6A)
-  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
-  body.push(0x20); wasm_push_u32(body, 9)
-  body.push(0x46)
+  // limit = min(i + 4096, slen)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 4096); body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x4B) // i32.gt_u
   body.push(0x04); body.push(0x40)
-  // seg_len = i - start
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
-  body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, true)
-  // i64.store(dp + (out_idx << 3), part)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x21); wasm_push_u32(body, 16)
+  body.push(0x0B)
+  // part = split1_emit(ps, i, limit, start, sb0, dp, out_idx)
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x20); wasm_push_u32(body, 9)
   body.push(0x20); wasm_push_u32(body, 11)
-  body.push(0x20); wasm_push_u32(body, 12); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74)
-  body.push(0x6A)
-  body.push(0x20); wasm_push_u32(body, 18)
-  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  // out_idx += 1; start = i + 1
-  body.push(0x20); wasm_push_u32(body, 12); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 12)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 7)
-  body.push(0x0B) // end if (byte == sb0)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, 12)
+  body.push(0x10); wasm_push_u32(body, split1_emit_idx)
+  body.push(0x22); wasm_push_u32(body, 18) // packed (out_idx << 32) | start
+  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 7) // start
+  body.push(0x20); wasm_push_u32(body, 18); body.push(0x42); wasm_push_s64(body, 32L); body.push(0x88)
+  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 12) // out_idx
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x21); wasm_push_u32(body, 6)
   body.push(0x0C); wasm_push_u32(body, 0)
   body.push(0x0B) // end loop
   body.push(0x0B) // end block
   // Trailing segment [start .. slen]
   body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false, 2, 7, 13, 14, 18, 19, 20, 21)
   body.push(0x20); wasm_push_u32(body, 11)
   body.push(0x20); wasm_push_u32(body, 12); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74)
   body.push(0x6A)
@@ -7335,7 +7508,7 @@ fn wasm_build_str_split_body(
   body.push(0x04); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false, 2, 7, 13, 14, 18, 19, 20, 21)
   body.push(0x20); wasm_push_u32(body, 17); body.push(0x20); wasm_push_u32(body, 18)
   body.push(0x10); wasm_push_u32(body, arr_push_owned_idx)
   // i += seplen; start = i; continue outer loop (depth 2: if-match -> if-sb0 -> loop)
@@ -7355,7 +7528,7 @@ fn wasm_build_str_split_body(
   // Trailing segment [start .. slen]
   body.push(0x20); wasm_push_u32(body, 4); body.push(0x20); wasm_push_u32(body, 7); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 13)
-  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false)
+  wasm_emit_str_split_alloc_seg(body, alloc_uninit_idx, false, 2, 7, 13, 14, 18, 19, 20, 21)
   body.push(0x20); wasm_push_u32(body, 17); body.push(0x20); wasm_push_u32(body, 18)
   body.push(0x10); wasm_push_u32(body, arr_push_owned_idx)
 
@@ -7717,117 +7890,219 @@ fn wasm_build_str_concat_n_body(alloc_uninit_idx : Int, slow_imp_idx : Int) -> A
 ///|
 /// Pure-Wasm internal `__pion_map_hash(key: i64, key_is_int: i32) -> i64`.
 /// Bit-exact with JS `hashInt64` (splitmix64) and `hashBytes64` (64-bit chunked hash + per-instance seed at slab_ctl+64).
-fn wasm_build_map_hash_body() -> Array[Int] {
-  // 4 i32 locals (2=p, 3=rem, 4=len, 5=ctl) + 2 i64 locals (6=h, 7=tail)
-  let body : Array[Int] = [0x02, 0x04, 0x7F, 0x02, 0x7E]
-  body.push(0x20); wasm_push_u32(body, 1) // key_is_int
+///|
+/// P51-A: Emit inline short-string (`len < 8`) equality check with fallback to `str_eq_idx`.
+/// Reads i32 pointers from `pa_l`, `pb_l`, uses `la_l` (i32 scratch), leaves i32 (0 or 1) on stack.
+fn wasm_emit_str_eq_fast(
+  body : Array[Int],
+  pa_l : Int,
+  pb_l : Int,
+  la_l : Int,
+  str_eq_idx : Int,
+) -> Unit {
+  // if (pa == pb) -> 1
+  body.push(0x20); wasm_push_u32(body, pa_l)
+  body.push(0x20); wasm_push_u32(body, pb_l)
+  body.push(0x46)
+  body.push(0x04); body.push(0x7F)
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x05)
+  // else if (pa == 0 || pb == 0) -> 0
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x45)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x45)
+  body.push(0x72)
+  body.push(0x04); body.push(0x7F)
+  body.push(0x41); wasm_push_s32(body, 0)
+  body.push(0x05)
+  // else if (i64.load(pa) != i64.load(pb)) -> 0
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x52) // i64.ne
+  body.push(0x04); body.push(0x7F)
+  body.push(0x41); wasm_push_s32(body, 0)
+  body.push(0x05)
+  // la = i32.load(pa); if (i32.lt_u(la, 8))
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x22); wasm_push_u32(body, la_l)
+  body.push(0x41); wasm_push_s32(body, 8); body.push(0x49) // i32.lt_u
+  body.push(0x04); body.push(0x7F)
+  // if (la >= 4)
+  body.push(0x20); wasm_push_u32(body, la_l); body.push(0x41); wasm_push_s32(body, 4); body.push(0x4F)
+  body.push(0x04); body.push(0x7F)
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x20); wasm_push_u32(body, la_l); body.push(0x6A)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 4)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x20); wasm_push_u32(body, la_l); body.push(0x6A)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 4)
+  body.push(0x46)
+  body.push(0x71)
+  body.push(0x05)
+  // else if (la >= 2)
+  body.push(0x20); wasm_push_u32(body, la_l); body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F)
+  body.push(0x04); body.push(0x7F)
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x20); wasm_push_u32(body, la_l); body.push(0x6A)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 7)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x20); wasm_push_u32(body, la_l); body.push(0x6A)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 7)
+  body.push(0x46)
+  body.push(0x71)
+  body.push(0x05)
+  // else if (la != 0)
+  body.push(0x20); wasm_push_u32(body, la_l)
+  body.push(0x04); body.push(0x7F)
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 8)
+  body.push(0x46)
+  body.push(0x05)
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x05)
+  // la >= 8: call str_eq_idx(i64(pa), i64(pb))
+  body.push(0x20); wasm_push_u32(body, pa_l); body.push(0xAD)
+  body.push(0x20); wasm_push_u32(body, pb_l); body.push(0xAD)
+  body.push(0x10); wasm_push_u32(body, str_eq_idx)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+}
+
+///|
+/// Emit inline map hash computation (bit-for-bit identical to `wasm_build_map_hash_body`).
+/// Writes non-zero i64 hash into `h_l`.
+fn wasm_emit_map_hash_inline(
+  body : Array[Int],
+  key_l : Int,
+  key_is_int_l : Int,
+  p_l : Int,
+  rem_l : Int,
+  len_l : Int,
+  ctl_l : Int,
+  h_l : Int,
+  tail_l : Int,
+) -> Unit {
+  body.push(0x20); wasm_push_u32(body, key_is_int_l)
   body.push(0x04); body.push(0x40)
   // splitmix64(key)
-  body.push(0x20); wasm_push_u32(body, 0)
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0x42); wasm_push_s64(body, 30L); body.push(0x88) // shr_u 30
-  body.push(0x85) // xor
-  body.push(0x42); wasm_push_s64(body, -4658895280553007687L); body.push(0x7E) // * 0xbf58476d1ce4e5b9
-  body.push(0x22); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 27L); body.push(0x88)
+  body.push(0x20); wasm_push_u32(body, key_l)
+  body.push(0x20); wasm_push_u32(body, key_l); body.push(0x42); wasm_push_s64(body, 30L); body.push(0x88)
   body.push(0x85)
-  body.push(0x42); wasm_push_s64(body, -7723592293110705685L); body.push(0x7E) // * 0x94d049bb133111eb
-  body.push(0x22); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 31L); body.push(0x88)
+  body.push(0x42); wasm_push_s64(body, -4658895280553007687L); body.push(0x7E)
+  body.push(0x22); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x42); wasm_push_s64(body, 27L); body.push(0x88)
   body.push(0x85)
-  body.push(0x21); wasm_push_u32(body, 6)
+  body.push(0x42); wasm_push_s64(body, -7723592293110705685L); body.push(0x7E)
+  body.push(0x22); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x42); wasm_push_s64(body, 31L); body.push(0x88)
+  body.push(0x85)
+  body.push(0x21); wasm_push_u32(body, h_l)
   body.push(0x05)
   // 64-bit chunked hash over PionString bytes with per-instance seed at slab_ctl+64
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 2) // pk
+  body.push(0x20); wasm_push_u32(body, key_l); body.push(0xA7); body.push(0x22); wasm_push_u32(body, p_l)
   body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0); body.push(0xA7)
-  body.push(0x22); wasm_push_u32(body, 4) // len
-  body.push(0x21); wasm_push_u32(body, 3) // rem = len
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 2) // p = pk + 8
+  body.push(0x22); wasm_push_u32(body, len_l)
+  body.push(0x21); wasm_push_u32(body, rem_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, p_l)
+  body.push(0x42); wasm_push_s64(body, 0L); body.push(0x21); wasm_push_u32(body, tail_l)
   // h = (0x517cc1b727220a95 ^ seed) ^ (i64(len) * 0x9e3779b97f4a7c15)
   body.push(0x42); wasm_push_s64(body, 5871781006564002453L)
-  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 5) // ctl
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, ctl_l)
   body.push(0x04); body.push(0x7E)
-  body.push(0x20); wasm_push_u32(body, 5); body.push(0x29); wasm_push_u32(body, 3); wasm_push_u32(body, 64)
+  body.push(0x20); wasm_push_u32(body, ctl_l); body.push(0x29); wasm_push_u32(body, 3); wasm_push_u32(body, 64)
   body.push(0x05)
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x0B)
-  body.push(0x85) // 0x517cc1b727220a95 ^ seed
-  body.push(0x20); wasm_push_u32(body, 4); body.push(0xAD)
+  body.push(0x85)
+  body.push(0x20); wasm_push_u32(body, len_l); body.push(0xAD)
   body.push(0x42); wasm_push_s64(body, -7046029254386353131L); body.push(0x7E)
   body.push(0x85)
-  body.push(0x21); wasm_push_u32(body, 6) // h
+  body.push(0x21); wasm_push_u32(body, h_l)
   // 8-byte loop: while rem >= 8
   body.push(0x02); body.push(0x40)
   body.push(0x03); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 8); body.push(0x49) // i32.lt_u
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 8); body.push(0x49)
   body.push(0x0D); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x29); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
-  body.push(0x85) // h ^ w
-  body.push(0x42); wasm_push_s64(body, -7046029254386353131L); body.push(0x7E) // * 0x9e3779b97f4a7c15
-  body.push(0x22); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 32L); body.push(0x88)
+  body.push(0x20); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x29); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
   body.push(0x85)
-  body.push(0x21); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A); body.push(0x21); wasm_push_u32(body, 2)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B); body.push(0x21); wasm_push_u32(body, 3)
+  body.push(0x42); wasm_push_s64(body, -7046029254386353131L); body.push(0x7E)
+  body.push(0x22); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x42); wasm_push_s64(body, 32L); body.push(0x88)
+  body.push(0x85)
+  body.push(0x21); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A); body.push(0x21); wasm_push_u32(body, p_l)
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B); body.push(0x21); wasm_push_u32(body, rem_l)
   body.push(0x0C); wasm_push_u32(body, 0)
   body.push(0x0B)
   body.push(0x0B)
-  // Tail bytes (4/2/1, exact match with pion_rt.c:1901-1929)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 4); body.push(0x4F) // rem >= 4
+  // Tail bytes (4/2/1)
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 4); body.push(0x4F)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
-  body.push(0x21); wasm_push_u32(body, 7) // tail = u32_le(p)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 4); body.push(0x6A); body.push(0x21); wasm_push_u32(body, 2)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 4); body.push(0x6B); body.push(0x22); wasm_push_u32(body, 3)
-  body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F) // rem >= 2
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
+  body.push(0x21); wasm_push_u32(body, tail_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x41); wasm_push_s32(body, 4); body.push(0x6A); body.push(0x21); wasm_push_u32(body, p_l)
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 4); body.push(0x6B); body.push(0x22); wasm_push_u32(body, rem_l)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 7)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
+  body.push(0x20); wasm_push_u32(body, tail_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
   body.push(0x42); wasm_push_s64(body, 32L); body.push(0x86); body.push(0x84)
-  body.push(0x21); wasm_push_u32(body, 7)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6A); body.push(0x21); wasm_push_u32(body, 2)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6B); body.push(0x21); wasm_push_u32(body, 3)
+  body.push(0x21); wasm_push_u32(body, tail_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6A); body.push(0x21); wasm_push_u32(body, p_l)
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6B); body.push(0x21); wasm_push_u32(body, rem_l)
   body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 1); body.push(0x46) // rem == 1
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 7)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
+  body.push(0x20); wasm_push_u32(body, tail_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
   body.push(0x42); wasm_push_s64(body, 48L); body.push(0x86); body.push(0x84)
-  body.push(0x21); wasm_push_u32(body, 7)
+  body.push(0x21); wasm_push_u32(body, tail_l)
   body.push(0x0B)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F) // rem >= 2
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
-  body.push(0x21); wasm_push_u32(body, 7)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6A); body.push(0x21); wasm_push_u32(body, 2)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6B); body.push(0x21); wasm_push_u32(body, 3)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
+  body.push(0x21); wasm_push_u32(body, tail_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6A); body.push(0x21); wasm_push_u32(body, p_l)
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 2); body.push(0x6B); body.push(0x21); wasm_push_u32(body, rem_l)
   body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 1); body.push(0x46) // rem == 1
+  body.push(0x20); wasm_push_u32(body, rem_l); body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 7)
-  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
+  body.push(0x20); wasm_push_u32(body, tail_l)
+  body.push(0x20); wasm_push_u32(body, p_l); body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0); body.push(0xAD)
   body.push(0x42); wasm_push_s64(body, 16L); body.push(0x86); body.push(0x84)
-  body.push(0x21); wasm_push_u32(body, 7)
+  body.push(0x21); wasm_push_u32(body, tail_l)
   body.push(0x0B)
   body.push(0x0B)
   // Final avalanche mix
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 7); body.push(0x85)
-  body.push(0x42); wasm_push_s64(body, -4658895280553007687L); body.push(0x7E) // * 0xbf58476d1ce4e5b9
-  body.push(0x22); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 27L); body.push(0x88); body.push(0x85)
-  body.push(0x42); wasm_push_s64(body, -7723592293110705685L); body.push(0x7E) // * 0x94d049bb133111eb
-  body.push(0x22); wasm_push_u32(body, 6)
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 31L); body.push(0x88); body.push(0x85)
-  body.push(0x21); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x20); wasm_push_u32(body, tail_l); body.push(0x85)
+  body.push(0x42); wasm_push_s64(body, -4658895280553007687L); body.push(0x7E)
+  body.push(0x22); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x42); wasm_push_s64(body, 27L); body.push(0x88); body.push(0x85)
+  body.push(0x42); wasm_push_s64(body, -7723592293110705685L); body.push(0x7E)
+  body.push(0x22); wasm_push_u32(body, h_l)
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x42); wasm_push_s64(body, 31L); body.push(0x88); body.push(0x85)
+  body.push(0x21); wasm_push_u32(body, h_l)
   body.push(0x0B) // end if (key_is_int)
-  // return h == 0 ? 1 : h
-  body.push(0x20); wasm_push_u32(body, 6); body.push(0x50)
+  // if (h == 0) h = 1L
+  body.push(0x20); wasm_push_u32(body, h_l); body.push(0x50)
   body.push(0x04); body.push(0x40)
-  body.push(0x42); wasm_push_s64(body, 1L); body.push(0x0F)
+  body.push(0x42); wasm_push_s64(body, 1L); body.push(0x21); wasm_push_u32(body, h_l)
   body.push(0x0B)
+}
+
+fn wasm_build_map_hash_body() -> Array[Int] {
+  // 4 i32 locals (2=p, 3=rem, 4=len, 5=ctl) + 2 i64 locals (6=h, 7=tail)
+  let body : Array[Int] = [0x02, 0x04, 0x7F, 0x02, 0x7E]
+  wasm_emit_map_hash_inline(body, 0, 1, 2, 3, 4, 5, 6, 7)
   body.push(0x20); wasm_push_u32(body, 6)
   body.push(0x0B)
   body
@@ -7835,9 +8110,11 @@ fn wasm_build_map_hash_body() -> Array[Int] {
 
 ///|
 /// Pure-Wasm internal `__pion_map_find(m_ptr: i32, key: i64) -> i32` (entry byte addr or 0).
-fn wasm_build_map_find_body(map_hash_idx : Int, str_eq_idx : Int) -> Array[Int] {
+/// P51-A: Inlines `map_hash` + `len < 8` short-string equality (zero nested calls on short keys).
+fn wasm_build_map_find_body(_map_hash_idx : Int, str_eq_idx : Int) -> Array[Int] {
   // 7 i32 locals (2=cap, 3=key_is_int, 4=entries, 5=mask, 6=idx, 7=step, 8=e) + 1 i64 local (9=h)
-  let body : Array[Int] = [0x02, 0x07, 0x7F, 0x01, 0x7E]
+  // + 7 i32 locals (10=p, 11=rem, 12=len, 13=ctl, 14=pa, 15=pb, 16=la) + 1 i64 local (17=tail)
+  let body : Array[Int] = [0x04, 0x07, 0x7F, 0x01, 0x7E, 0x07, 0x7F, 0x01, 0x7E]
   // cap = i32.wrap_i64(i64.load(m_ptr + 8)); if (cap == 0) return 0
   body.push(0x20); wasm_push_u32(body, 0)
   body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 8); body.push(0xA7)
@@ -7851,12 +8128,10 @@ fn wasm_build_map_find_body(map_hash_idx : Int, str_eq_idx : Int) -> Array[Int] 
   body.push(0x21); wasm_push_u32(body, 3)
   body.push(0x20); wasm_push_u32(body, 0); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24); body.push(0xA7)
   body.push(0x21); wasm_push_u32(body, 4)
-  // h = call map_hash(key, key_is_int)
-  body.push(0x20); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 3)
-  body.push(0x10); wasm_push_u32(body, map_hash_idx)
-  body.push(0x22); wasm_push_u32(body, 9)
+  // h = inline map_hash(key, key_is_int)
+  wasm_emit_map_hash_inline(body, 1, 3, 10, 11, 12, 13, 9, 17)
   // mask = cap - 1; idx = i32.wrap_i64(h) & mask
+  body.push(0x20); wasm_push_u32(body, 9)
   body.push(0xA7)
   body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
   body.push(0x22); wasm_push_u32(body, 5)
@@ -7888,8 +8163,9 @@ fn wasm_build_map_find_body(map_hash_idx : Int, str_eq_idx : Int) -> Array[Int] 
   body.push(0x0B)
   body.push(0x05)
   body.push(0x20); wasm_push_u32(body, 8); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x20); wasm_push_u32(body, 1)
-  body.push(0x10); wasm_push_u32(body, str_eq_idx)
+  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 14) // pa
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0xA7); body.push(0x21); wasm_push_u32(body, 15) // pb
+  wasm_emit_str_eq_fast(body, 14, 15, 16, str_eq_idx)
   body.push(0x04); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 8); body.push(0x0F)
   body.push(0x0B)
@@ -8015,8 +8291,8 @@ fn wasm_build_map_set_body(
 ) -> Array[Int] {
   // 7 i32 locals (3=p, 4=val_is_obj, 5=key_is_int, 6=entries, 7=mask, 8=idx, 9=e)
   // 4 i64 locals (10=len, 11=cap, 12=h, 13=old_val)
-  // 1 i32 local (14=ctl)
-  let body : Array[Int] = [0x03, 0x07, 0x7F, 0x04, 0x7E, 0x01, 0x7F]
+  // 4 i32 locals (14=ctl, 15=pa, 16=pb, 17=la)
+  let body : Array[Int] = [0x03, 0x07, 0x7F, 0x04, 0x7E, 0x04, 0x7F]
   body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x21); wasm_push_u32(body, 3) // p
   // P46-A: ABA-safe single-slot map_hint fast path (BEFORE grow check & hash!)
   body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 14) // ctl
@@ -8042,7 +8318,9 @@ fn wasm_build_map_set_body(
   body.push(0x45) // !key_is_int
   body.push(0x04); body.push(0x7F)
   body.push(0x20); wasm_push_u32(body, 9); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x20); wasm_push_u32(body, 1); body.push(0x10); wasm_push_u32(body, str_eq_idx)
+  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 15) // pa
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0xA7); body.push(0x21); wasm_push_u32(body, 16) // pb
+  wasm_emit_str_eq_fast(body, 15, 16, 17, str_eq_idx)
   body.push(0x05)
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x0B)
@@ -8159,7 +8437,9 @@ fn wasm_build_map_set_body(
   body.push(0x20); wasm_push_u32(body, 1); body.push(0x51)
   body.push(0x05)
   body.push(0x20); wasm_push_u32(body, 9); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x20); wasm_push_u32(body, 1); body.push(0x10); wasm_push_u32(body, str_eq_idx)
+  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 15) // pa
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0xA7); body.push(0x21); wasm_push_u32(body, 16) // pb
+  wasm_emit_str_eq_fast(body, 15, 16, 17, str_eq_idx)
   body.push(0x0B)
   body.push(0x04); body.push(0x40) // if (matched)
   body.push(0x20); wasm_push_u32(body, 9); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
@@ -9709,6 +9989,7 @@ fn wasm_outline_nested_loops(funcs : Array[WasmFunc]) -> Array[WasmFunc] {
     let slot_ok : Map[String, Bool] = Map([])
     let slot_ty : Map[String, Int] = Map([])
     let all_allocs : Array[String] = []
+    let entry_single_allocs : Map[String, Bool] = Map([])
     bi = 0
     while bi < nb {
       let insts = f.blocks[bi].insts
@@ -9720,10 +10001,13 @@ fn wasm_outline_nested_loops(funcs : Array[WasmFunc]) -> Array[WasmFunc] {
           if bi == 0 {
             let sz = if inst.args.length() > 0 { wasm_parse_int64(inst.args[0]).to_int() } else { 8 }
             let dcnt = match def_counts.get(inst.dst) { Some(c) => c; None => 0 }
-            if sz >= 1 && sz <= 8 && dcnt == 1 && !param_set.contains(inst.dst) {
-              cand_names.push(inst.dst)
-              slot_ok.set(inst.dst, true)
-              slot_ty.set(inst.dst, -1)
+            if dcnt == 1 && !param_set.contains(inst.dst) {
+              entry_single_allocs.set(inst.dst, true)
+              if sz >= 1 && sz <= 8 {
+                cand_names.push(inst.dst)
+                slot_ok.set(inst.dst, true)
+                slot_ty.set(inst.dst, -1)
+              }
             }
           }
         }
@@ -9789,11 +10073,14 @@ fn wasm_outline_nested_loops(funcs : Array[WasmFunc]) -> Array[WasmFunc] {
       }
       ci = ci + 1
     }
+    // P51-A: entry-block single-def allocs (`entry_single_allocs`) remain alive on the caller's
+    // shadow stack across outlined calls, so non-promoted entry allocs can be safely passed as
+    // read-only `i64` `in_ssa` pointer parameters; only non-entry or multi-def allocs are forbidden.
     let non_promoted_allocs : Map[String, Bool] = Map([])
     ci = 0
     while ci < all_allocs.length() {
       let aname = all_allocs[ci]
-      if !promoted_alloc_ty.contains(aname) {
+      if !promoted_alloc_ty.contains(aname) && !entry_single_allocs.contains(aname) {
         non_promoted_allocs.set(aname, true)
       }
       ci = ci + 1
@@ -10153,7 +10440,7 @@ fn wasm_outline_nested_loops(funcs : Array[WasmFunc]) -> Array[WasmFunc] {
 
       let n_in = in_slots.length() + in_ssa.length()
       let n_out = out_names.length()
-      if n_in > 16 || n_out > 8 {
+      if n_in > 24 || n_out > 8 {
         continue
       }
 
@@ -11164,7 +11451,33 @@ pub fn emit_wasm_from_ssa_units_traced(
       wasm_intern_sig(ctx, [WASM_TY_I64, WASM_TY_I64], WASM_TY_I32),
     )
   }
+  let mut str_split1_count_internal_idx = -1
+  let mut str_split1_emit_internal_idx = -1
   if uses_str_split {
+    str_split1_count_internal_idx = num_imports + internal_sig_idxs.length()
+    internal_sig_idxs.push(
+      wasm_intern_sig(
+        ctx,
+        [WASM_TY_I32, WASM_TY_I32, WASM_TY_I32, WASM_TY_I32],
+        WASM_TY_I32,
+      ),
+    )
+    str_split1_emit_internal_idx = num_imports + internal_sig_idxs.length()
+    internal_sig_idxs.push(
+      wasm_intern_sig(
+        ctx,
+        [
+          WASM_TY_I32,
+          WASM_TY_I32,
+          WASM_TY_I32,
+          WASM_TY_I32,
+          WASM_TY_I32,
+          WASM_TY_I32,
+          WASM_TY_I32,
+        ],
+        WASM_TY_I64,
+      ),
+    )
     let idx = num_imports + internal_sig_idxs.length()
     ctx.internal_map.set("pion_str_split", idx)
     ctx.internal_ret_tys.set("pion_str_split", WASM_TY_I64)
@@ -11519,12 +11832,16 @@ pub fn emit_wasm_from_ssa_units_traced(
       Some(k) => k
       None => 0
     }
+    code_bodies.push(wasm_build_str_split1_count_body())
+    code_bodies.push(wasm_build_str_split1_emit_body(alloc_uninit_internal_idx))
     code_bodies.push(
       wasm_build_str_split_body(
         alloc_uninit_internal_idx,
         arr_new_internal_idx,
         arr_push_owned_internal_idx,
         str_split_imp_idx,
+        str_split1_count_internal_idx,
+        str_split1_emit_internal_idx,
       ),
     )
   }

@@ -3372,4 +3372,161 @@ console.log("  p50a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P51-A Regression: Chunked SWAR str.split + Inline map_hash/str_eq_fast + Inline Bump alloc_uninit + Entry non_promoted_allocs ==="
+cat > "$TMP_DIR/p51a_wasm_opt.pion" <<'EOF'
+struct P51Box {
+  a : Int64
+  b : Int64
+  c : Int64
+}
+
+fn nested_entry_struct(n : Int) -> Int64 {
+  let mut st = P51Box::{ a: 1L, b: 2L, c: 3L }
+  let mut acc : Int64 = 0L
+  let mut i = 0
+  while i < n {
+    let mut j = 0
+    while j < 10 {
+      acc = acc + st.a + st.b + st.c + (i + j).to_int64()
+      j = j + 1
+    }
+    st = P51Box::{ a: st.a + 1L, b: st.b, c: st.c }
+    i = i + 1
+  }
+  acc
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Multi-chunk (> 10KB, > 2x 4096B chunks) str.split(" ") with adjacent 0x01/0x20/0x21 bytes
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < 2000 {
+    if i > 0 { sb.write_string(" ") }
+    if i % 17 == 0 {
+      sb.write_string("!") // 0x21 adjacent to space 0x20 (exercises borrow-free SWAR)
+    } else if i % 13 == 0 {
+      sb.write_string("") // consecutive spaces
+    } else {
+      sb.write_string("w" + (i % 97).to_string())
+    }
+    i = i + 1
+  }
+  let big = sb.to_string()
+  let parts = big.split(" ")
+  let mut empty_cnt = 0
+  let mut bang_cnt = 0
+  let mut pi = 0
+  while pi < parts.length() {
+    if parts[pi] == "" { empty_cnt = empty_cnt + 1 }
+    if parts[pi] == "!" { bang_cnt = bang_cnt + 1 }
+    pi = pi + 1
+  }
+
+  // 2. Map[String, Int64] across key lengths 0..16 with fresh-pointer get+set (map_hint + str_eq_fast)
+  let m : Map[String, Int64] = Map([])
+  let mut mi = 0
+  while mi < parts.length() {
+    let k = parts[mi]
+    let cur = match m.get(k) { Some(v) => v; None => 0L }
+    m.set(k, cur + 1L)
+    mi = mi + 1
+  }
+  let long_keys = ["", "a", "ab", "abc", "abcd", "abcde", "abcdef", "abcdefg", "abcdefgh", "abcdefghijkl", "0123456789abcdef"]
+  let mut li = 0
+  while li < long_keys.length() {
+    let lk = long_keys[li]
+    m.set(lk, (li + 100).to_int64())
+    li = li + 1
+  }
+  let mut long_sum : Int64 = 0L
+  li = 0
+  while li < long_keys.length() {
+    let fresh = (long_keys[li] + "_").slice(0, long_keys[li].length())
+    let v = match m.get(fresh) { Some(x) => x; None => -1L }
+    m.set(fresh, v + 1L)
+    long_sum = long_sum + (match m.get(fresh) { Some(x) => x; None => -1L })
+    li = li + 1
+  }
+
+  // 3. Inline bump-pointer alloc_uninit (> 5000 live allocations across cls 0..3) + nested entry struct
+  let boxes : Array[P51Box] = Array::with_capacity(5000)
+  let mut bi = 0
+  while bi < 5000 {
+    boxes.push(P51Box::{ a: bi.to_int64(), b: (bi * 2).to_int64(), c: (bi * 3).to_int64() })
+    bi = bi + 1
+  }
+  let bsum = boxes[4999].a + boxes[4999].b + boxes[4999].c
+  let nsum = nested_entry_struct(50)
+
+  io_println(world, "p51a_ok:" + parts.length().to_string() + ":" + empty_cnt.to_string() + ":" + bang_cnt.to_string() + ":" + long_sum.to_string() + ":" + bsum.to_string() + ":" + nsum.to_string())
+  0
+}
+EOF
+P51A_REL_WASM="$TMP_DIR/p51a_rel.wasm"
+P51A_DEV_WASM="$TMP_DIR/p51a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P51A_REL_WASM" "$TMP_DIR/p51a_wasm_opt.pion"
+"$PIONC" build --target wasm32 -o "$P51A_DEV_WASM" "$TMP_DIR/p51a_wasm_opt.pion"
+for mode_wasm in "release:$P51A_REL_WASM" "dev:$P51A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p51a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p51a_ok:2000:144:118:1166:29994:29750") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p51a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p51a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p51a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
