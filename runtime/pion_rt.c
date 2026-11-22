@@ -141,6 +141,14 @@ PION_MINSIZE void pion_panic(const char *msg, const char *file, int32_t line) {
     abort();
 }
 
+static _Noreturn PION_NOINLINE PION_COLD PION_MINSIZE void pion_oom(void) {
+    pion_panic("out of memory", __FILE__, __LINE__);
+}
+
+static _Noreturn PION_NOINLINE PION_COLD PION_MINSIZE void pion_die(const char *msg) {
+    pion_panic(msg, __FILE__, __LINE__);
+}
+
 PION_MINSIZE void pion_panic_oob(int64_t idx, int64_t len) {
     fprintf(stderr, "pion panic: index %" PRId64 " out of bounds (len %" PRId64 ")\n", idx, len);
     fflush(stderr);
@@ -371,7 +379,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE PionHeader *pion_slab_alloc_slow(Pio
     if (__builtin_expect(!s, 0)) {
         s = (PionSlabTLS *)calloc(1, sizeof(PionSlabTLS));
         if (__builtin_expect(!s, 0)) {
-            pion_panic("out of memory", __FILE__, __LINE__);
+            pion_oom();
         }
 #ifdef _WIN32
         InitOnceExecuteOnce(&g_slab_fls_once, pion_slab_fls_init, NULL, NULL);
@@ -395,7 +403,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE PionHeader *pion_slab_alloc_slow(Pio
     if (__builtin_expect((uintptr_t)s->chunk_end - (uintptr_t)s->chunk_cur < slot_sz, 0)) {
         char *chunk = (char *)malloc(PION_SLAB_CHUNK_BYTES);
         if (__builtin_expect(!chunk, 0)) {
-            pion_panic("out of memory", __FILE__, __LINE__);
+            pion_oom();
         }
         s->chunk_cur = chunk;
         s->chunk_end = chunk + PION_SLAB_CHUNK_BYTES;
@@ -436,7 +444,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_med_alloc(uint32_t mcls) 
     }
     void *mp = malloc((size_t)2048u << mcls);
     if (__builtin_expect(!mp, 0)) {
-        pion_panic("out of memory", __FILE__, __LINE__);
+        pion_oom();
     }
     return mp;
 }
@@ -486,7 +494,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_
 #endif
     void *p = malloc(bytes);
     if (__builtin_expect(!p, 0)) {
-        pion_panic("out of memory", __FILE__, __LINE__);
+        pion_oom();
     }
     return p;
 }
@@ -586,7 +594,7 @@ static PION_NOINLINE void *pion_alloc_uninit_slow(
         size_t total = sizeof(PionHeader) + (size_t)payload_size;
         hdr = (PionHeader *)malloc(total);
         if (__builtin_expect(!hdr, 0)) {
-            pion_panic("out of memory", __FILE__, __LINE__);
+            pion_oom();
         }
     }
     hdr->owner_tid = mt ? pion_cur_tid_mt() : 1u;
@@ -741,7 +749,7 @@ PION_COLD PION_MINSIZE void pion_rc_freeze(void *obj) {
     PionHeader *hdr = pion_hdr(obj);
     if ((hdr->flags & PION_FLAG_IMMORTAL) || hdr->owner_tid == 0) return;
     if (hdr->owner_tid != pion_cur_tid_fast()) {
-        pion_panic("pion_rc_freeze called from non-owning thread", __FILE__, __LINE__);
+        pion_die("pion_rc_freeze called from non-owning thread");
     }
     uint32_t rc = hdr->local_rc;
     hdr->local_rc = 0;
@@ -898,7 +906,7 @@ int64_t pion_str_len(void *s) {
 int32_t pion_str_byte_at(void *s, int64_t idx) {
     PionString *str = (PionString *)s;
     if (__builtin_expect(!str || idx < 0 || idx >= str->len, 0)) {
-        pion_panic("string index out of bounds", __FILE__, __LINE__);
+        pion_die("string index out of bounds");
     }
     return (int32_t)(unsigned char)str->data[idx];
 }
@@ -1006,7 +1014,7 @@ int32_t pion_str_cmp(void *a, void *b) {
 void *pion_str_slice(void *s, int64_t start, int64_t end) {
     PionString *str = (PionString *)s;
     if (__builtin_expect(!str || start < 0 || end < start || end > str->len, 0)) {
-        pion_panic("string slice out of bounds", __FILE__, __LINE__);
+        pion_die("string slice out of bounds");
     }
     int64_t n = end - start;
     PionString *out = (PionString *)pion_alloc_raw((uint32_t)(sizeof(PionString) + (size_t)n + 1),
@@ -1255,7 +1263,7 @@ static __attribute__((noinline)) PION_MINSIZE PionBytes *pion_bytes_alloc_uninit
     b->cap = len;
     if (len > 0) {
         b->data = (uint8_t *)malloc((size_t)len);
-        if (!b->data) pion_panic("out of memory in bytes", __FILE__, __LINE__);
+        if (!b->data) pion_oom();
     } else {
         b->data = NULL;
     }
@@ -1264,7 +1272,7 @@ static __attribute__((noinline)) PION_MINSIZE PionBytes *pion_bytes_alloc_uninit
 
 PION_MINSIZE void *pion_bytes_new(int64_t len) {
     if (__builtin_expect(len < 0, 0)) {
-        pion_panic("negative bytes length", __FILE__, __LINE__);
+        pion_die("negative bytes length");
     }
     PionBytes *b = pion_bytes_alloc_uninit(len);
     if (len > 0) {
@@ -1349,7 +1357,7 @@ PION_MINSIZE void pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst
         pion_panic_oob(src_off + len, blen);
     }
     if (len > 0) {
-        if (!dst) pion_panic("null dst in bytes_copy_to_ptr", __FILE__, __LINE__);
+        if (!dst) pion_die("null dst in bytes_copy_to_ptr");
         memcpy(dst, b->data + src_off, (size_t)len);
     }
 }
@@ -1368,7 +1376,7 @@ static __attribute__((noinline)) PION_MINSIZE void pion_strbuf_grow(PionStrBuf *
     int64_t ncap = sb->cap > 0 ? sb->cap * 2 : 32;
     while (ncap < need) ncap *= 2;
     char *nd = (char *)realloc(sb->data, (size_t)ncap);
-    if (!nd) pion_panic("out of memory in strbuf", __FILE__, __LINE__);
+    if (!nd) pion_oom();
     sb->data = nd;
     sb->cap = ncap;
 }
@@ -1384,7 +1392,7 @@ void *pion_strbuf_new(int64_t cap) {
     PionStrBuf *sb = (PionStrBuf *)pion_alloc_uninit((uint32_t)sizeof(PionStrBuf), PION_TAG_STRBUF, pion_strbuf_drop);
     int64_t init_cap = cap > 32 ? cap : 32;
     sb->data = (char *)malloc((size_t)init_cap);
-    if (!sb->data) pion_panic("out of memory in strbuf_new", __FILE__, __LINE__);
+    if (!sb->data) pion_oom();
     sb->data[0] = '\0';
     sb->len = 0;
     sb->cap = init_cap;
@@ -1486,7 +1494,7 @@ static inline size_t pion_arr_stride(const PionArray *a) {
     return a->elem_stride ? (size_t)a->elem_stride : sizeof(int64_t);
 }
 
-static void pion_arr_drop(void *payload) {
+static PION_MINSIZE void pion_arr_drop(void *payload) {
     PionArray *a = (PionArray *)payload;
     if (a->elem_is_obj) {
         for (int64_t i = 0; i < a->len; i++) {
@@ -1500,7 +1508,7 @@ static void pion_arr_drop(void *payload) {
     }
 }
 
-static PION_NOINLINE void pion_arr_grow(PionArray *a) {
+static PION_NOINLINE PION_MINSIZE void pion_arr_grow(PionArray *a) {
     size_t stride = pion_arr_stride(a);
     int64_t ocap = a->cap;
     int64_t ncap = ocap > 0 ? ocap * 2 : 4;
@@ -1510,7 +1518,7 @@ static PION_NOINLINE void pion_arr_grow(PionArray *a) {
     size_t old_bytes = (size_t)ocap * stride;
     if (old_bytes > PION_MED_MAX_BYTES && new_bytes > PION_MED_MAX_BYTES) {
         nd = (int64_t *)realloc(a->data, new_bytes);
-        if (!nd) pion_panic("out of memory in arr_push", __FILE__, __LINE__);
+        if (!nd) pion_oom();
     } else {
         nd = (int64_t *)pion_slab_raw_alloc(new_bytes);
         if (a->len > 0) {
@@ -1523,13 +1531,13 @@ static PION_NOINLINE void pion_arr_grow(PionArray *a) {
     }
 #else
     nd = (int64_t *)realloc(a->data, new_bytes);
-    if (!nd) pion_panic("out of memory in arr_push", __FILE__, __LINE__);
+    if (!nd) pion_oom();
 #endif
     a->data = nd;
     a->cap = ncap;
 }
 
-void *pion_arr_new(int64_t cap, int32_t elem_flags) {
+PION_MINSIZE void *pion_arr_new(int64_t cap, int32_t elem_flags) {
     PionArray *a = (PionArray *)pion_alloc_raw_fast((uint32_t)sizeof(PionArray), PION_TAG_ARRAY, pion_arr_drop);
     a->len = 0;
     a->elem_is_obj = (elem_flags == 1) ? 1 : 0;
@@ -1589,7 +1597,7 @@ void pion_arr_push_owned(void *a_ptr, int64_t val) {
 PION_MINSIZE int64_t pion_arr_get(void *a_ptr, int64_t idx) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || idx < 0 || idx >= a->len) {
-        pion_panic("array index out of bounds", __FILE__, __LINE__);
+        pion_die("array index out of bounds");
     }
     if (a->elem_stride == 1) {
         return (int64_t)((uint8_t *)a->data)[idx];
@@ -1600,7 +1608,7 @@ PION_MINSIZE int64_t pion_arr_get(void *a_ptr, int64_t idx) {
 PION_MINSIZE void pion_arr_set(void *a_ptr, int64_t idx, int64_t val) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || idx < 0 || idx >= a->len) {
-        pion_panic("array set index out of bounds", __FILE__, __LINE__);
+        pion_die("array set index out of bounds");
     }
     if (a->elem_stride == 1) {
         ((uint8_t *)a->data)[idx] = (uint8_t)val;
@@ -1617,7 +1625,7 @@ PION_MINSIZE void pion_arr_set(void *a_ptr, int64_t idx, int64_t val) {
 int64_t pion_arr_pop(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || a->len <= 0) {
-        pion_panic("array pop on empty array", __FILE__, __LINE__);
+        pion_die("array pop on empty array");
     }
     if (__builtin_expect(a->elem_stride == 1, 0)) {
         return (int64_t)((uint8_t *)a->data)[--a->len];
@@ -1660,26 +1668,16 @@ PION_MINSIZE void pion_arr_reverse(void *a_ptr) {
     size_t stride = pion_arr_stride(a);
     int64_t i = 0;
     int64_t j = a->len - 1;
-    if (stride == sizeof(int64_t)) {
-        while (i < j) {
-            int64_t t = a->data[i];
-            a->data[i] = a->data[j];
-            a->data[j] = t;
-            i++;
-            j--;
-        }
-    } else {
-        uint8_t tmp[32];
-        uint8_t *base = (uint8_t *)a->data;
-        while (i < j) {
-            uint8_t *pi = base + (size_t)i * stride;
-            uint8_t *pj = base + (size_t)j * stride;
-            memcpy(tmp, pi, stride);
-            memcpy(pi, pj, stride);
-            memcpy(pj, tmp, stride);
-            i++;
-            j--;
-        }
+    uint8_t tmp[32];
+    uint8_t *base = (uint8_t *)a->data;
+    while (i < j) {
+        uint8_t *pi = base + (size_t)i * stride;
+        uint8_t *pj = base + (size_t)j * stride;
+        memcpy(tmp, pi, stride);
+        memcpy(pi, pj, stride);
+        memcpy(pj, tmp, stride);
+        i++;
+        j--;
     }
 }
 
@@ -1898,7 +1896,7 @@ int64_t pion_map_len(void *m_ptr) {
 PION_HOT void pion_map_set(void *m_ptr, void *key_str, int64_t val) {
     PionMap *m = (PionMap *)m_ptr;
     PionString *k = (PionString *)key_str;
-    if (__builtin_expect(!m || (!m->key_is_int && !k), 0)) pion_panic("null map or key", __FILE__, __LINE__);
+    if (__builtin_expect(!m || (!m->key_is_int && !k), 0)) pion_die("null map or key");
     if (__builtin_expect(m->cap == 0, 0)) {
         pion_map_grow(m, 16);
     } else if (__builtin_expect((m->len + 1) * 10 >= m->cap * 7, 0)) {
@@ -1957,14 +1955,14 @@ PION_HOT int64_t pion_map_get(void *m_ptr, void *key_str) {
     PionMap *m = (PionMap *)m_ptr;
     PionString *k = (PionString *)key_str;
     if (__builtin_expect(!m || (!m->key_is_int && !k) || m->len == 0, 0)) {
-        pion_panic("map key not found", __FILE__, __LINE__);
+        pion_die("map key not found");
     }
     uint64_t h = pion_map_key_hash(m, k);
     PionMapEntry *e = pion_map_probe(m, k, h);
     if (__builtin_expect(e->state == 1, 1)) {
         return e->val;
     }
-    pion_panic("map key not found", __FILE__, __LINE__);
+    pion_die("map key not found");
 }
 
 PION_MINSIZE void pion_map_remove(void *m_ptr, void *key_str) {
@@ -2144,7 +2142,7 @@ PION_MINSIZE void *pion_scope_begin(void) {
 PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void *env) {
     pion_enter_mt();
     PionScope *s = (PionScope *)scope_ptr;
-    if (!s || !fn) pion_panic("invalid scope_spawn", __FILE__, __LINE__);
+    if (!s || !fn) pion_die("invalid scope_spawn");
     if (env) {
         pion_rc_freeze(env);
         pion_rc_inc(env);
@@ -2152,7 +2150,7 @@ PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void 
     PionSpawnTask *task = (PionSpawnTask *)malloc(sizeof(PionSpawnTask));
     if (!task) {
         if (env) pion_rc_dec(env);
-        pion_panic("out of memory in scope_spawn", __FILE__, __LINE__);
+        pion_oom();
     }
     task->fn = fn;
     task->env = env;
@@ -2163,7 +2161,7 @@ PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void 
     if (h == 0) {
         free(task);
         if (env) pion_rc_dec(env);
-        pion_panic("_beginthreadex failed", __FILE__, __LINE__);
+        pion_die("_beginthreadex failed");
     }
     th = (HANDLE)h;
 #else
@@ -2171,7 +2169,7 @@ PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void 
     if (rc != 0) {
         free(task);
         if (env) pion_rc_dec(env);
-        pion_panic("pthread_create failed", __FILE__, __LINE__);
+        pion_die("pthread_create failed");
     }
 #endif
 
@@ -2181,7 +2179,7 @@ PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void 
         pion_thread_t *nt = (pion_thread_t *)realloc(s->threads, ncap * sizeof(pion_thread_t));
         if (!nt) {
             pion_mu_unlock(&s->mu);
-            pion_panic("out of memory growing scope threads", __FILE__, __LINE__);
+            pion_oom();
         }
         s->threads = nt;
         s->cap = ncap;
@@ -2256,7 +2254,7 @@ PION_MINSIZE void *pion_chan_new(int64_t cap, int32_t elem_is_obj) {
     c->bounded = cap > 0 ? 1 : 0;
     c->cap = cap > 0 ? cap : 16;
     c->buf = (int64_t *)malloc((size_t)c->cap * sizeof(int64_t));
-    if (!c->buf) pion_panic("out of memory in chan_new", __FILE__, __LINE__);
+    if (!c->buf) pion_oom();
     c->head = 0;
     c->count = 0;
     c->closed = 0;
@@ -2289,7 +2287,7 @@ PION_COLD PION_MINSIZE int32_t pion_chan_send(void *ch_ptr, int64_t val) {
         int64_t *nb = (int64_t *)malloc((size_t)ncap * sizeof(int64_t));
         if (!nb) {
             pion_mu_unlock(&c->mu);
-            pion_panic("out of memory growing unbounded channel", __FILE__, __LINE__);
+            pion_oom();
         }
         for (int64_t i = 0; i < c->count; i++) {
             int64_t idx = c->head + i;
@@ -2470,7 +2468,7 @@ PION_MINSIZE int64_t pion_world_argc(void *w_ptr) {
 PION_MINSIZE void *pion_world_argv(void *w_ptr, int64_t idx) {
     PionWorld *w = (PionWorld *)w_ptr;
     if (!w || idx < 0 || idx >= w->argc) {
-        pion_panic("argv index out of bounds", __FILE__, __LINE__);
+        pion_die("argv index out of bounds");
     }
     const char *arg = w->argv[idx] ? w->argv[idx] : "";
     return pion_str_from_cstr(arg, (int64_t)strlen(arg));
@@ -3095,7 +3093,7 @@ PION_MINSIZE static void pion_win_sb_append(char **buf, size_t *len, size_t *cap
     if (*len + 2 > *cap) {
         size_t ncap = (*cap == 0) ? 256u : (*cap * 2u);
         char *nb = (char *)realloc(*buf, ncap);
-        if (!nb) pion_panic("out of memory building win32 cmdline", __FILE__, __LINE__);
+        if (!nb) pion_oom();
         *buf = nb;
         *cap = ncap;
     }
@@ -3492,7 +3490,7 @@ PION_MINSIZE void *pion_sha256_hex(void *s_ptr) {
 PION_MINSIZE void *pion_ptr_alloc(int64_t bytes) {
     size_t sz = bytes > 0 ? (size_t)bytes : 1u;
     void *p = calloc(1u, sz);
-    if (!p) pion_panic("out of memory in ptr_alloc", __FILE__, __LINE__);
+    if (!p) pion_oom();
     return p;
 }
 
