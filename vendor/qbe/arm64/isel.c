@@ -949,6 +949,54 @@ arm64_isel(Fn *fn)
 	}
 }
 
+static void
+arm64_subst_tmp(Fn *fn, Ref oldr, Ref newr)
+{
+	Blk *b;
+	Phi *p;
+	uint k;
+	int mi;
+
+	for (b = fn->start; b; b = b->link) {
+		for (p = b->phi; p; p = p->link)
+			for (k = 0; k < p->narg; k++)
+				if (req(p->arg[k], oldr)) {
+					p->arg[k] = newr;
+					chuse(oldr, -1, fn);
+					chuse(newr, +1, fn);
+				}
+		for (k = 0; k < b->nins; k++) {
+			if (req(b->ins[k].arg[0], oldr)) {
+				b->ins[k].arg[0] = newr;
+				chuse(oldr, -1, fn);
+				chuse(newr, +1, fn);
+			}
+			if (req(b->ins[k].arg[1], oldr)) {
+				b->ins[k].arg[1] = newr;
+				chuse(oldr, -1, fn);
+				chuse(newr, +1, fn);
+			}
+		}
+		if (req(b->jmp.arg, oldr)) {
+			b->jmp.arg = newr;
+			chuse(oldr, -1, fn);
+			chuse(newr, +1, fn);
+		}
+	}
+	for (mi = 0; mi < fn->nmem; mi++) {
+		if (req(fn->mem[mi].base, oldr)) {
+			fn->mem[mi].base = newr;
+			chuse(oldr, -1, fn);
+			chuse(newr, +1, fn);
+		}
+		if (req(fn->mem[mi].index, oldr)) {
+			fn->mem[mi].index = newr;
+			chuse(oldr, -1, fn);
+			chuse(newr, +1, fn);
+		}
+	}
+}
+
 void
 arm64_hoist_consts(Fn *fn)
 {
@@ -1024,6 +1072,36 @@ arm64_hoist_consts(Fn *fn)
 								break;
 						}
 					}
+					if (d) {
+						/* Reuse an already-hoisted identical .Lfp load in preheader d */
+						Ref existing = R;
+						for (uint m = 0; m + 1 < d->nins; m++) {
+							Ref cand = d->ins[m + 1].to;
+							if (d->ins[m].op == Ocopy && d->ins[m].cls == Kl
+							&& rtype(d->ins[m].arg[0]) == RCon
+							&& d->ins[m + 1].op == Oload
+							&& d->ins[m + 1].cls == b->ins[k + 1].cls
+							&& req(d->ins[m + 1].arg[0], d->ins[m].to)
+							&& rtype(cand) == RTmp && !isreg(cand)
+							&& fn->tmp[cand.val].slot == -1
+							&& fn->tmp[cand.val].ndef == 1) {
+								Con *ec = &fn->con[d->ins[m].arg[0].val];
+								if (ec->type == CAddr && ec->bits.i == 0
+								&& symeq(ec->sym, c->sym)) {
+									existing = cand;
+									break;
+								}
+							}
+						}
+						if (!req(existing, R)) {
+							Ref oldr = b->ins[k + 1].to;
+							b->ins[k] = (Ins){.op = Onop};
+							b->ins[k + 1] = (Ins){.op = Onop};
+							arm64_subst_tmp(fn, oldr, existing);
+							k++;
+							continue;
+						}
+					}
 					if (d && nhoist_fp[d->id] < 8) {
 						Ins ins0 = *i;
 						Ins ins1 = b->ins[k + 1];
@@ -1091,6 +1169,30 @@ arm64_hoist_consts(Fn *fn)
 			}
 			if (!d)
 				continue;
+			/* Reuse an already-hoisted identical CBits constant in preheader d */
+			{
+				Ref existing = R;
+				for (uint m = 0; m < d->nins; m++) {
+					Ref cand = d->ins[m].to;
+					if (d->ins[m].op == Ocopy && d->ins[m].cls == i->cls
+					&& rtype(d->ins[m].arg[0]) == RCon
+					&& rtype(cand) == RTmp && !isreg(cand)
+					&& fn->tmp[cand.val].slot == -1
+					&& fn->tmp[cand.val].ndef == 1) {
+						Con *ec = &fn->con[d->ins[m].arg[0].val];
+						if (ec->type == CBits && ec->bits.i == c->bits.i) {
+							existing = cand;
+							break;
+						}
+					}
+				}
+				if (!req(existing, R)) {
+					Ref oldr = i->to;
+					b->ins[k] = (Ins){.op = Onop};
+					arm64_subst_tmp(fn, oldr, existing);
+					continue;
+				}
+			}
 			if (is_int ? (nhoist_int[d->id] >= 4) : (nhoist_fp[d->id] >= 8))
 				continue;
 

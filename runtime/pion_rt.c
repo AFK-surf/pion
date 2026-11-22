@@ -650,7 +650,7 @@ void *pion_alloc(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
     return payload;
 }
 
-static PION_NOINLINE void pion_destroy_slow(PionHeader *hdr, void *obj) {
+static PION_NOINLINE PION_MINSIZE void pion_destroy_slow(PionHeader *hdr, void *obj) {
     if (hdr->drop_fn) {
         hdr->drop_fn(obj);
     }
@@ -941,7 +941,7 @@ PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
     return out;
 }
 
-static inline int32_t pion_str_eq_fast(const PionString *sa, const PionString *sb) {
+static inline __attribute__((always_inline)) int32_t pion_str_eq_fast(const PionString *sa, const PionString *sb) {
     if (sa == sb) return 1;
     if (!sa || !sb) return 0;
     int64_t len = sa->len;
@@ -1028,7 +1028,7 @@ void *pion_int_to_str(int64_t v) {
     PionString *str = (PionString *)pion_alloc_raw((uint32_t)(sizeof(PionString) + n + 1),
                                              PION_TAG_STRING, NULL);
     str->len = (int64_t)n;
-    memcpy(str->data, p, n);
+    pion_copy_short(str->data, p, n);
     str->data[n] = '\0';
     return str;
 }
@@ -1907,19 +1907,20 @@ static PION_NOINLINE PION_MINSIZE void pion_map_hint_invalidate(const PionMap *m
 }
 
 static inline PionMapEntry *pion_map_hint_hit(const PionMap *m, const PionString *k, int inline_eq) {
+    (void)inline_eq;
     if (__builtin_expect(
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
             g_map_hint.map == m && g_map_hint.key == k, 0)) {
         PionMapEntry *e = g_map_hint.entry;
         if (__builtin_expect(
-                e->key == k || (!m->key_is_int && (inline_eq ? pion_str_eq_fast(e->key, k) : pion_str_eq((void *)e->key, (void *)k))), 1)) {
+                e->key == k || (!m->key_is_int && pion_str_eq((void *)e->key, (void *)k)), 1)) {
             return e;
         }
     }
     return NULL;
 }
 
-static void pion_map_drop(void *payload) {
+PION_MINSIZE static void pion_map_drop(void *payload) {
     PionMap *m = (PionMap *)payload;
     pion_map_hint_invalidate(m);
     if (m->entries) {
@@ -1962,7 +1963,7 @@ static PION_NOINLINE PION_MINSIZE void pion_map_grow(PionMap *m, int64_t new_cap
     m->cap = new_cap;
 }
 
-void *pion_map_new(int32_t val_is_obj) {
+PION_MINSIZE void *pion_map_new(int32_t val_is_obj) {
     PionMap *m = (PionMap *)pion_alloc_uninit((uint32_t)sizeof(PionMap), PION_TAG_MAP, pion_map_drop);
     m->val_is_obj = val_is_obj ? 1 : 0;
     m->key_is_int = 0;

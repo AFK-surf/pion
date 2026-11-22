@@ -1788,56 +1788,89 @@ arm64_macho_fn(Fn *fn)
 					}
 				}
 			}
-			/* Pair adjacent 64-bit loads/stores into ldp/stp */
+			/* Pair adjacent 64-bit or 32-bit loads/stores into ldp/stp */
 			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins) {
 				Ins *i1 = i + 1;
 				int b0, b1;
 				int64_t o0, o1;
-				if (i->op == Oload && i1->op == Oload
-				&& i->cls == i1->cls && (i->cls == Kl || i->cls == Kd)
+				if ((i->op == Oload || i->op == Oloaduw) && i1->op == i->op
+				&& i->cls == i1->cls
+				&& ((i->op == Oload && (i->cls == Kl || i->cls == Kd || i->cls == Kw || i->cls == Ks))
+				 || (i->op == Oloaduw && i->cls == Kw))
 				&& isreg(i->to) && isreg(i1->to)
 				&& i->to.val != SP && i1->to.val != SP
 				&& i->to.val != i1->to.val
 				&& me_mem_base_off(i->arg[0], fn, &b0, &o0)
 				&& me_mem_base_off(i1->arg[0], fn, &b1, &o1)
-				&& b0 == b1 && o1 == o0 + 8 && i->to.val != b0
-				&& (o0 & 7) == 0 && o0 >= -512 && o0 <= 504) {
-					uint32_t imm7 = (uint32_t)(o0 / 8) & 0x7fu;
-					if (i->cls == Kl)
-						emit_u32(0xa9400000u | (imm7 << 15)
-							| (greg(i1->to.val) << 10)
-							| (greg(b0) << 5)
-							| greg(i->to.val));
-					else
-						emit_u32(0x6d400000u | (imm7 << 15)
-							| (freg(i1->to.val) << 10)
-							| (greg(b0) << 5)
-							| freg(i->to.val));
-					if (last_w32 == i->to.val || last_w32 == i1->to.val)
-						last_w32 = -1;
-					i++;
-					continue;
+				&& b0 == b1 && i->to.val != b0) {
+					int64_t step = (i->cls == Kl || i->cls == Kd) ? 8 : 4;
+					int64_t mino = (step == 8) ? -512 : -256;
+					int64_t maxo = (step == 8) ? 504 : 252;
+					if (o1 == o0 + step && (o0 & (step - 1)) == 0
+					&& o0 >= mino && o0 <= maxo) {
+						uint32_t imm7 = (uint32_t)(o0 / step) & 0x7fu;
+						if (i->cls == Kl)
+							emit_u32(0xa9400000u | (imm7 << 15)
+								| (greg(i1->to.val) << 10)
+								| (greg(b0) << 5)
+								| greg(i->to.val));
+						else if (i->cls == Kw)
+							emit_u32(0x29400000u | (imm7 << 15)
+								| (greg(i1->to.val) << 10)
+								| (greg(b0) << 5)
+								| greg(i->to.val));
+						else if (i->cls == Kd)
+							emit_u32(0x6d400000u | (imm7 << 15)
+								| (freg(i1->to.val) << 10)
+								| (greg(b0) << 5)
+								| freg(i->to.val));
+						else
+							emit_u32(0x2d400000u | (imm7 << 15)
+								| (freg(i1->to.val) << 10)
+								| (greg(b0) << 5)
+								| freg(i->to.val));
+						if (last_w32 == i->to.val || last_w32 == i1->to.val)
+							last_w32 = -1;
+						i++;
+						continue;
+					}
 				}
-				if ((i->op == Ostorel || i->op == Ostored) && i1->op == i->op
+				if ((i->op == Ostorel || i->op == Ostored || i->op == Ostorew || i->op == Ostores)
+				&& i1->op == i->op
 				&& isreg(i->arg[0]) && isreg(i1->arg[0])
 				&& i->arg[0].val != SP && i1->arg[0].val != SP
 				&& me_mem_base_off(i->arg[1], fn, &b0, &o0)
 				&& me_mem_base_off(i1->arg[1], fn, &b1, &o1)
-				&& b0 == b1 && o1 == o0 + 8
-				&& (o0 & 7) == 0 && o0 >= -512 && o0 <= 504) {
-					uint32_t imm7 = (uint32_t)(o0 / 8) & 0x7fu;
-					if (i->op == Ostorel)
-						emit_u32(0xa9000000u | (imm7 << 15)
-							| (greg(i1->arg[0].val) << 10)
-							| (greg(b0) << 5)
-							| greg(i->arg[0].val));
-					else
-						emit_u32(0x6d000000u | (imm7 << 15)
-							| (freg(i1->arg[0].val) << 10)
-							| (greg(b0) << 5)
-							| freg(i->arg[0].val));
-					i++;
-					continue;
+				&& b0 == b1) {
+					int64_t step = (i->op == Ostorel || i->op == Ostored) ? 8 : 4;
+					int64_t mino = (step == 8) ? -512 : -256;
+					int64_t maxo = (step == 8) ? 504 : 252;
+					if (o1 == o0 + step && (o0 & (step - 1)) == 0
+					&& o0 >= mino && o0 <= maxo) {
+						uint32_t imm7 = (uint32_t)(o0 / step) & 0x7fu;
+						if (i->op == Ostorel)
+							emit_u32(0xa9000000u | (imm7 << 15)
+								| (greg(i1->arg[0].val) << 10)
+								| (greg(b0) << 5)
+								| greg(i->arg[0].val));
+						else if (i->op == Ostorew)
+							emit_u32(0x29000000u | (imm7 << 15)
+								| (greg(i1->arg[0].val) << 10)
+								| (greg(b0) << 5)
+								| greg(i->arg[0].val));
+						else if (i->op == Ostored)
+							emit_u32(0x6d000000u | (imm7 << 15)
+								| (freg(i1->arg[0].val) << 10)
+								| (greg(b0) << 5)
+								| freg(i->arg[0].val));
+						else
+							emit_u32(0x2d000000u | (imm7 << 15)
+								| (freg(i1->arg[0].val) << 10)
+								| (greg(b0) << 5)
+								| freg(i->arg[0].val));
+						i++;
+						continue;
+					}
 				}
 			}
 			if (i + 2 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 2 != cbz_ins
