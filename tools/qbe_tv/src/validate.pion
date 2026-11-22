@@ -1,26 +1,29 @@
-///| Verified QBE SSA translation validator — the checker.
+///| Verified QBE SSA translation validator.
 ///|
 ///| `validate_fn(src, tgt)` accepts only when every execution of `tgt`
 ///| performs the side effects of an execution of `src` in the same order with
-///| equal operands and ends the same way (same return value, `hlt`, or
-///| divergence). Dead loads, allocations and trapping divisions of `src` may
-///| be dropped (QBE semantics: a trap is undefined behaviour).
+///| equal operands and ends the same way (same return value or `hlt`). Loads
+///| and trapping divisions of `src` may be dropped (when they do not trap they
+///| do not change the world; a trap is undefined behaviour).
 ///|
-///| Structure (solver vs. checker):
+///| Solver vs. checker: `build_cert` (untrusted) searches a certificate and
+///| `verify_cert` (trusted, the only part the soundness proof covers) checks
+///| it, recomputing everything it relies on:
 ///| 1. `wf_code`: dense ids, single assignment, `par` only at the entry.
-///| 2. `src_vids`: one canonical symbolic value per source temp (`canon.pion`).
-///| 3. `compute_avail` (solver) / `check_avail` (checker): every use is
-///|    initialised on every path, and no value available at the entry of a
-///|    block depends on a phi / effect of that block (so a value's symbolic
+///| 2. `check_src_defs` / `check_tgt_defs`: the symbolic value (`canon.pion`)
+///|    of every temp is the value of its definition; a phi may fold only
+///|    over its live edges (`edge_dead`).
+///| 3. `check_avail`: every use is initialised on every path, and no value
+///|    available at the entry of a block depends on a phi / effect of a
+///|    source block entered while that block runs (so a value's symbolic
 ///|    denotation stays its current value while it is available).
-///| 4. `compute_facts` / `check_facts`: values known to be zero / non-zero at
-///|    a block entry (dominating `jnz`, `vendor/qbe/gvn.c` `propjnz0`).
-///| 5. `walk`: a product exploration of both CFGs from (0, 0): matched blocks
-///|    run in lock step, side effects are compared one by one, a side whose
-///|    block ends with `jmp` may absorb the next block (`simplcfg` merges,
-///|    empty blocks), terminators are compared, and successor pairs are
-///|    queued. Target temps get the symbolic value of their source
-///|    counterpart; target phis are checked on every matched edge.
+///| 4. `check_facts`: values known to be zero / non-zero at a block entry
+///|    (dominating `jnz`, `vendor/qbe/gvn.c` `propjnz0`).
+///| 5. `replay_pair`: every matched pair of blocks (from (0, 0)) runs in lock
+///|    step by its recorded steps: side effects are compared one by one, a
+///|    side whose block ends with `jmp` may enter the next block (`simplcfg`
+///|    merges, empty blocks), terminators are compared, the successor pairs
+///|    must be certified, and target phis are checked on every matched edge.
 
 ///|
 ///| CFG helpers.
@@ -545,11 +548,53 @@ fn phi_select(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) 
   }
 }
 
-///| Value of phi k of block b, or -1 while an argument is unknown:
-///| identical non-self arguments not depending on b give that value
-///| (`gvn.c` `dedupphi`), a phi equal to an earlier one shares its value,
-///| anything else is the leaf `SPhi(cls, b, k)`.
-fn phi_try(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) -> Int {
+///| Facts claiming a value both zero and non-zero: the block is never
+///| entered.
+fn facts_contradict(fs : Array[Fact]) -> Bool {
+  for fa in fs {
+    if fa.zero && fact_in(fs, fa.vid, false) {
+      return true
+    }
+  }
+  false
+}
+
+///| The edge p -> b is never taken: p is unreachable, its facts contradict,
+///| or its `jnz` folds (under its facts) to the other successor.
+pub fn edge_dead(
+  mut vg : ValGraph,
+  f : Func,
+  info : FnInfo,
+  vids : Array[Int],
+  facts : Array[Fact],
+  p : Int,
+  b : Int,
+) -> Bool {
+  if p < 0 || p >= info.nb || !info.reach[p] {
+    return true
+  }
+  let fs = facts_of(facts, p)
+  if facts_contradict(fs) {
+    return true
+  }
+  match f.blocks[p].term {
+    Jnz(c, s1, s2) =>
+    if s1 != s2 && atom_known(vids, c) {
+      let cv = apply_facts(mut vg, fs, atom_use(mut vg, vids, W, c))
+      match vg_const(vg, cv) {
+        Some(x) => return (if x != 0UL { s1 } else { s2 }) != b
+        None => ()
+      }
+    }
+    _ => ()
+  }
+  false
+}
+
+///| Phi k of block b when all its arguments on live edges, other than itself,
+///| are one value not depending on b (`gvn.c` `dedupphi`): that value; -1
+///| when they differ, -2 while an argument is unknown.
+fn phi_fold(mut vg : ValGraph, f : Func, info : FnInfo, vids : Array[Int], facts : Array[Fact], b : Int, k : Int) -> Int {
   let d = f.blocks[b].phis[k].dst
   let c = f.blocks[b].phis[k].cls
   let n = f.blocks[b].phis[k].arms.length()
@@ -558,10 +603,11 @@ fn phi_try(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) -> 
   let mut j = 0
   while j < n {
     let a = f.blocks[b].phis[k].arms[j].value
-    if !is_self_arm(a, d) {
+    let p = f.blocks[b].phis[k].arms[j].pred
+    if !is_self_arm(a, d) && !edge_dead(mut vg, f, info, vids, facts, p, b) {
       let v = atom_use(mut vg, vids, c, a)
       if v < 0 {
-        return -1
+        return -2
       }
       if cand < 0 {
         cand = v
@@ -572,7 +618,23 @@ fn phi_try(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) -> 
     j = j + 1
   }
   if same && cand >= 0 && !vid_mentions_blk(vg, cand, b) {
-    return cand
+    cand
+  } else {
+    -1
+  }
+}
+
+///| Value of phi k of block b, or -1 while an argument is unknown: a folded
+///| phi (`phi_fold`), a 0/1 select (`phi_select`), the value of an earlier
+///| phi with the same arguments, else the leaf `SPhi(cls, b, k)`.
+fn phi_try(mut vg : ValGraph, f : Func, info : FnInfo, vids : Array[Int], facts : Array[Fact], b : Int, k : Int) -> Int {
+  let c = f.blocks[b].phis[k].cls
+  let fold = phi_fold(mut vg, f, info, vids, facts, b, k)
+  if fold == -2 {
+    return -1
+  }
+  if fold >= 0 {
+    return fold
   }
   let sel = phi_select(mut vg, f, vids, b, k)
   if sel == -2 {
@@ -592,8 +654,9 @@ fn phi_try(mut vg : ValGraph, f : Func, vids : Array[Int], b : Int, k : Int) -> 
   vg_intern(mut vg, SPhi(c, b, k))
 }
 
-///| Symbolic value of every source temp (-1 for temps never defined).
-pub fn src_vids(mut vg : ValGraph, f : Func, info : FnInfo) -> Array[Int] {
+///| Symbolic value of every source temp (-1 for temps never defined); `facts`
+///| (possibly empty) mark dead edges for `phi_fold`.
+pub fn src_vids(mut vg : ValGraph, f : Func, info : FnInfo, facts : Array[Fact]) -> Array[Int] {
   let nt = info.nt
   let nb = info.nb
   let mut vids = Array::make(nt, -1)
@@ -611,7 +674,7 @@ pub fn src_vids(mut vg : ValGraph, f : Func, info : FnInfo) -> Array[Int] {
       while k < np {
         let d = f.blocks[b].phis[k].dst
         if vids[d] < 0 {
-          let r = phi_try(mut vg, f, vids, b, k)
+          let r = phi_try(mut vg, f, info, vids, facts, b, k)
           if r >= 0 {
             vids[d] = r
             progress = true
@@ -648,26 +711,6 @@ pub fn src_vids(mut vg : ValGraph, f : Func, info : FnInfo) -> Array[Int] {
     }
   }
   vids
-}
-
-///| Pure (re-materialisable) temps: `Un`, and `Bin` that cannot trap.
-pub fn pure_table(vg : ValGraph, f : Func, info : FnInfo, vids : Array[Int]) -> Array[Bool] {
-  let nt = info.nt
-  let mut pure = Array::make(nt, false)
-  let mut t = 0
-  while t < nt {
-    if info.def_kind[t] == 2 {
-      match f.blocks[info.def_blk[t]].insts[info.def_idx[t]] {
-        Un(_, _, _, _) => pure[t] = true
-        Bin(_, _, op, _, _) =>
-        pure[t] = !is_trapping_binop(op) ||
-        (t < vids.length() && vids[t] >= 0 && !vg_is_effect_leaf(vg, vids[t]))
-        _ => ()
-      }
-    }
-    t = t + 1
-  }
-  pure
 }
 
 ///|
@@ -738,70 +781,26 @@ pub fn compute_avail(f : Func, info : FnInfo) -> Array[Bool] {
   av
 }
 
-///| Temp t is usable: defined on every path (`cur`), or — in floating mode
-///| (GVN output, whose pure instructions are placed later by GCM) — a pure
-///| instruction whose operands are usable.
-fn avail_temp(
-  f : Func,
-  info : FnInfo,
-  cur : Array[Bool],
-  t : Int,
-  floating : Bool,
-  pure : Array[Bool],
-  fuel : Int,
-) -> Bool {
-  if t < 0 || t >= cur.length() {
-    return false
-  }
-  if cur[t] {
-    return true
-  }
-  if !floating || fuel <= 0 || !pure[t] || info.def_kind[t] != 2 {
-    return false
-  }
-  avail_inst_ops(f, info, cur, f.blocks[info.def_blk[t]].insts[info.def_idx[t]], floating, pure, fuel - 1)
-}
-
-fn avail_atom(
-  f : Func,
-  info : FnInfo,
-  cur : Array[Bool],
-  a : Atom,
-  floating : Bool,
-  pure : Array[Bool],
-  fuel : Int,
-) -> Bool {
+fn avail_atom(cur : Array[Bool], a : Atom) -> Bool {
   match a {
-    Temp(t) => avail_temp(f, info, cur, t, floating, pure, fuel)
+    Temp(t) => t >= 0 && t < cur.length() && cur[t]
     _ => true
   }
 }
 
-fn avail_inst_ops(
-  f : Func,
-  info : FnInfo,
-  cur : Array[Bool],
-  inst : Inst,
-  floating : Bool,
-  pure : Array[Bool],
-  fuel : Int,
-) -> Bool {
+fn avail_inst_ops(cur : Array[Bool], inst : Inst) -> Bool {
   match inst {
     Par(_, _, _) => true
-    Un(_, _, _, a) => avail_atom(f, info, cur, a, floating, pure, fuel)
-    Bin(_, _, _, a, b) =>
-    avail_atom(f, info, cur, a, floating, pure, fuel) &&
-    avail_atom(f, info, cur, b, floating, pure, fuel)
-    Load(_, _, _, _, a) => avail_atom(f, info, cur, a, floating, pure, fuel)
-    Store(_, v, a) =>
-    avail_atom(f, info, cur, v, floating, pure, fuel) &&
-    avail_atom(f, info, cur, a, floating, pure, fuel)
+    Un(_, _, _, a) => avail_atom(cur, a)
+    Bin(_, _, _, a, b) => avail_atom(cur, a) && avail_atom(cur, b)
+    Load(_, _, _, _, a) => avail_atom(cur, a)
+    Store(_, v, a) => avail_atom(cur, v) && avail_atom(cur, a)
     Call(_, _, _, c, args) => {
-      if !avail_atom(f, info, cur, c, floating, pure, fuel) {
+      if !avail_atom(cur, c) {
         return false
       }
       for x in args {
-        if !avail_atom(f, info, cur, x.arg, floating, pure, fuel) {
+        if !avail_atom(cur, x.arg) {
           return false
         }
       }
@@ -811,18 +810,10 @@ fn avail_inst_ops(
   }
 }
 
-fn avail_term_ops(
-  f : Func,
-  info : FnInfo,
-  cur : Array[Bool],
-  t : Term,
-  floating : Bool,
-  pure : Array[Bool],
-  fuel : Int,
-) -> Bool {
+fn avail_term_ops(cur : Array[Bool], t : Term) -> Bool {
   match t {
-    Jnz(a, _, _) => avail_atom(f, info, cur, a, floating, pure, fuel)
-    Ret(h, _, a) => !h || avail_atom(f, info, cur, a, floating, pure, fuel)
+    Jnz(a, _, _) => avail_atom(cur, a)
+    Ret(h, _, a) => !h || avail_atom(cur, a)
     _ => true
   }
 }
@@ -838,12 +829,10 @@ pub fn check_avail(
   vids : Array[Int],
   bm_t : Array[Int],
   bm_s : Array[Int],
-  floating : Bool,
-  pure : Array[Bool],
 ) -> Int {
   let nb = info.nb
   let nt = info.nt
-  if av.length() != nb * nt || vids.length() != nt || pure.length() != nt {
+  if av.length() != nb * nt || vids.length() != nt {
     return 1
   }
   let mut t = 0
@@ -886,7 +875,7 @@ pub fn check_avail(
         cur[phi.dst] = true
       }
       for inst in f.blocks[b].insts {
-        if !avail_inst_ops(f, info, cur, inst, floating, pure, nt) {
+        if !avail_inst_ops(cur, inst) {
           return b + 1
         }
         let d = inst_dst(inst)
@@ -895,7 +884,7 @@ pub fn check_avail(
         }
       }
       let tm = f.blocks[b].term
-      if !avail_term_ops(f, info, cur, tm, floating, pure, nt) {
+      if !avail_term_ops(cur, tm) {
         return b + 1
       }
       let n = term_nsucc(tm)
@@ -919,7 +908,7 @@ pub fn check_avail(
           if ai < 0 {
             return b + 1
           }
-          if !avail_atom(f, info, cur, f.blocks[s].phis[q].arms[ai].value, floating, pure, nt) {
+          if !avail_atom(cur, f.blocks[s].phis[q].arms[ai].value) {
             return b + 1
           }
           q = q + 1
@@ -1035,12 +1024,12 @@ pub fn src_live(f : Func, info : FnInfo) -> Array[Bool] {
   live
 }
 
-///| A source load / alloc / trapping division whose result is dead may be
-///| dropped by the target (`vendor/qbe/gcm.c` `canelim`).
+///| A source load / trapping division whose result is dead may be dropped by
+///| the target (`vendor/qbe/gcm.c` `canelim`): neither changes the world when
+///| it does not trap. An `alloc` is never dropped.
 fn src_effect_elidable(live : Array[Bool], inst : Inst) -> Bool {
   match inst {
     Load(d, _, _, _, _) => d >= 0 && d < live.length() && !live[d]
-    Alloc(d, _, _) => d >= 0 && d < live.length() && !live[d]
     Bin(d, _, op, _, _) => is_trapping_binop(op) && d >= 0 && d < live.length() && !live[d]
     _ => false
   }
@@ -1360,13 +1349,13 @@ pub struct TgtState {
   /// Target block `bm_t[j]` runs source block `bm_s[j]`.
   mut bm_t : Array[Int]
   mut bm_s : Array[Int]
-  /// Target phi `ph_d[j]` of block `ph_t[j]` got a value at the entry of
-  /// source head `ph_s[j]` (-1: absorbed block).
-  mut ph_t : Array[Int]
-  mut ph_d : Array[Int]
-  mut ph_s : Array[Int]
   /// Diagnostics only: the walk's steps (`act * 1_000_000 + src * 1000 + tgt`).
   mut trace : Array[Int]
+  /// Certificate of the pair being walked, and of the pairs walked so far
+  /// (`pcs[q]` is pair `(ps[q], pt[q])`).
+  mut cur_steps : Array[Step]
+  mut cur_fin : EndCert
+  mut pcs : Array[PairCert]
 }
 
 pub fn tgt_state_new(nt : Int) -> TgtState {
@@ -1380,10 +1369,10 @@ pub fn tgt_state_new(nt : Int) -> TgtState {
     e_th: Array::make(0, 0),
     bm_t: Array::make(0, 0),
     bm_s: Array::make(0, 0),
-    ph_t: Array::make(0, 0),
-    ph_d: Array::make(0, 0),
-    ph_s: Array::make(0, 0),
     trace: Array::make(0, 0),
+    cur_steps: [],
+    cur_fin: EndHlt,
+    pcs: [],
   }
 }
 
@@ -1491,6 +1480,18 @@ fn tgt_inst_is_effect(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnI
   }
 }
 
+///| Some phi of source block b is the leaf `SPhi(_, b, _)`: entering b
+///| redefines it, so b must not be run in the middle of a matched pair.
+fn blk_has_phi_leaf(vg : ValGraph, f : Func, svid : Array[Int], b : Int) -> Bool {
+  for phi in f.blocks[b].phis {
+    let d = phi.dst
+    if d >= 0 && d < svid.length() && vg_is_phi_of(vg, svid[d], b) {
+      return true
+    }
+  }
+  false
+}
+
 ///| A block with no phi and no side effect that ends with `jmp`.
 fn is_trivial(f : Func, b : Int) -> Bool {
   if f.blocks[b].phis.length() > 0 {
@@ -1512,6 +1513,68 @@ fn is_trivial(f : Func, b : Int) -> Bool {
   }
 }
 
+///| A block with no side effect that ends with `jmp` (phis allowed).
+fn is_pure_jmp(f : Func, b : Int) -> Bool {
+  for inst in f.blocks[b].insts {
+    match inst {
+      Par(_, _, _) => ()
+      Un(_, _, _, _) => ()
+      Bin(_, _, op, _, _) => if is_trapping_binop(op) {
+        return false
+      }
+      _ => return false
+    }
+  }
+  match f.blocks[b].term {
+    Jmp(_) => true
+    _ => false
+  }
+}
+
+///| The block reached from b0 through blocks with no phi and no side effect
+///| ending with `jmp` (at most `nb` of them).
+pub fn resolve_trivial(f : Func, b0 : Int) -> Int {
+  let nb = f.blocks.length()
+  let mut b = b0
+  let mut steps = 0
+  while steps < nb && is_trivial(f, b) {
+    match f.blocks[b].term {
+      Jmp(n) => b = n
+      _ => ()
+    }
+    steps = steps + 1
+  }
+  b
+}
+
+///| Source block b ends with `jnz` whose two arms reach the same block r
+///| through empty blocks (`vendor/qbe/cfg.c` `simplcfg`): r, else -1. No
+///| branch fact is assumed at r: both arms get there.
+pub fn src_join(f : Func, b : Int) -> Int {
+  match f.blocks[b].term {
+    Jnz(_, s1, s2) => {
+      let r1 = resolve_trivial(f, s1)
+      let r2 = resolve_trivial(f, s2)
+      if r1 == r2 {
+        r1
+      } else {
+        -1
+      }
+    }
+    _ => -1
+  }
+}
+
+///| `src_join` of the current source block when the walk may enter it.
+fn src_join_ok(vg : ValGraph, src : Func, svid : Array[Int], sc : Int, schain : Array[Int]) -> Int {
+  let r = src_join(src, sc)
+  if r > 0 && !contains_int(schain, r) && !blk_has_phi_leaf(vg, src, svid, r) {
+    r
+  } else {
+    -1
+  }
+}
+
 ///| A block with no side effect that ends with `jnz`.
 fn is_pure_branch(f : Func, b : Int) -> Bool {
   for inst in f.blocks[b].insts {
@@ -1528,28 +1591,6 @@ fn is_pure_branch(f : Func, b : Int) -> Bool {
     Jnz(_, _, _) => true
     _ => false
   }
-}
-
-fn resolve_trivial(f : Func, b0 : Int) -> Int {
-  let nb = f.blocks.length()
-  let mut b = b0
-  let mut steps = 0
-  while steps < nb && is_trivial(f, b) {
-    match f.blocks[b].term {
-      Jmp(n) => b = n
-      _ => ()
-    }
-    steps = steps + 1
-  }
-  b
-}
-
-///| Both targets of a `jnz` reach the same phi-free block through empty
-///| blocks (`vendor/qbe/cfg.c` `simplcfg`): the branch is a `jmp`.
-fn same_empty_target(f : Func, s1 : Int, s2 : Int) -> Bool {
-  let r1 = resolve_trivial(f, s1)
-  let r2 = resolve_trivial(f, s2)
-  r1 == r2 && f.blocks[r1].phis.length() == 0
 }
 
 ///| A terminator after constant folding under the block's facts.
@@ -1580,9 +1621,6 @@ fn src_view(mut vg : ValGraph, f : Func, svid : Array[Int], fs : Array[Fact], b 
         Some(x) => return VJmp(if x != 0UL { s1 } else { s2 })
         None => ()
       }
-      if same_empty_target(f, s1, s2) {
-        return VJmp(s1)
-      }
       VJnz(cv, s1, s2)
     }
     Ret(h, c, a) =>
@@ -1608,9 +1646,6 @@ fn tgt_view(mut vg : ValGraph, mut ts : TgtState, f : Func, ti : FnInfo, fs : Ar
       match vg_const(vg, cv) {
         Some(x) => return VJmp(if x != 0UL { s1 } else { s2 })
         None => ()
-      }
-      if same_empty_target(f, s1, s2) {
-        return VJmp(s1)
       }
       VJnz(cv, s1, s2)
     }
@@ -1810,7 +1845,9 @@ fn bm_add(mut ts : TgtState, tb : Int, sb : Int) -> Unit {
   ts.bm_s.push(sb)
 }
 
-fn enqueue(mut ts : TgtState, sp : Int, tp : Int, sh : Int, th : Int) -> Unit {
+///| Queue the pair (sh, th) entered by the edges sp -> sh / tp -> th; its
+///| index in the queue.
+fn enqueue(mut ts : TgtState, sp : Int, tp : Int, sh : Int, th : Int) -> Int {
   ts.e_sp.push(sp)
   ts.e_tp.push(tp)
   ts.e_sh.push(sh)
@@ -1819,12 +1856,13 @@ fn enqueue(mut ts : TgtState, sp : Int, tp : Int, sh : Int, th : Int) -> Unit {
   let mut j = 0
   while j < n {
     if ts.ps[j] == sh && ts.pt[j] == th {
-      return
+      return j
     }
     j = j + 1
   }
   ts.ps.push(sh)
   ts.pt.push(th)
+  n
 }
 
 ///| Values of the phis of target head `tb` entered with source head `sb`:
@@ -1863,15 +1901,20 @@ fn map_head_phis(
     if h < 0 {
       return Some(PhiUnmapped(tb, d))
     }
+    // A target phi entered with source head sb stands for a phi of sb or a
+    // value independent of the edge; never for a phi of another block.
+    match vg.nodes[h] {
+      SPhi(_, b0, _) => if b0 != sb {
+        return Some(PhiUnmapped(tb, d))
+      }
+      _ => ()
+    }
     if ts.tvid[d] >= 0 {
       if ts.tvid[d] != h {
         return Some(PhiConflict(d))
       }
     } else {
       ts.tvid[d] = h
-      ts.ph_t.push(tb)
-      ts.ph_d.push(d)
-      ts.ph_s.push(sb)
     }
     j = j + 1
   }
@@ -1917,9 +1960,6 @@ fn absorb_tgt_phis(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnInfo
     }
     if ts.tvid[d] < 0 {
       ts.tvid[d] = vals[k]
-      ts.ph_t.push(m)
-      ts.ph_d.push(d)
-      ts.ph_s.push(-1)
     }
     k = k + 1
   }
@@ -1944,29 +1984,35 @@ fn term_compare(
       } else if sh && (scls != tcls || !eq_under(mut vg, fs, svv, tvv)) {
         Some(RetMismatch(sc, tc))
       } else {
+        ts.cur_fin = EndRet
         None
       }
       _ => Some(TermMismatch(sc, tc))
     }
     VHlt =>
     match tv {
-      VHlt => None
+      VHlt => {
+        ts.cur_fin = EndHlt
+        None
+      }
       _ => Some(TermMismatch(sc, tc))
     }
     VJnz(cs, s1, s2) =>
     match tv {
       VJnz(ct, t1, t2) =>
       if eq_under(mut vg, fs, cs, ct) {
-        enqueue(mut ts, sc, tc, s1, t1)
-        enqueue(mut ts, sc, tc, s2, t2)
+        let i1 = enqueue(mut ts, sc, tc, s1, t1)
+        let i2 = enqueue(mut ts, sc, tc, s2, t2)
+        ts.cur_fin = EndJnz(false, i1, i2)
         None
       } else {
         let z = vg_konst(mut vg, W, 0UL)
         let ns = vg_canon_bin(mut vg, W, CEq(W), cs, z)
         let nt = vg_canon_bin(mut vg, W, CEq(W), ct, z)
         if eq_under(mut vg, fs, ns, ct) || eq_under(mut vg, fs, cs, nt) {
-          enqueue(mut ts, sc, tc, s1, t2)
-          enqueue(mut ts, sc, tc, s2, t1)
+          let i1 = enqueue(mut ts, sc, tc, s1, t2)
+          let i2 = enqueue(mut ts, sc, tc, s2, t1)
+          ts.cur_fin = EndJnz(true, i1, i2)
           None
         } else {
           Some(CondMismatch(sc, tc))
@@ -1999,6 +2045,7 @@ fn walk_one(
     None => ()
   }
   bm_add(mut ts, tb, sb)
+  ts.cur_steps = []
   let mut sc = sb
   let mut sx = 0
   let mut tc = tb
@@ -2021,7 +2068,8 @@ fn walk_one(
     let fs = facts_of(facts, sc)
     // What to do next: 1 advance both, 2 skip a dead source effect,
     // 3 absorb the source jump target, 4 absorb the target jump target,
-    // 5 done.
+    // 5 done, 6 absorb both jump targets, 7 absorb the join of a source
+    // `jnz` whose arms are empty (`src_join`).
     let mut act = 0
     let mut nxt = -1
     if s_has {
@@ -2050,11 +2098,17 @@ fn walk_one(
       }
     } else if t_has {
       let sj = view_jmp(src_view(mut vg, src, svid, fs, sc))
-      if sj > 0 && !contains_int(schain, sj) {
+      if sj > 0 && !contains_int(schain, sj) && !blk_has_phi_leaf(vg, src, svid, sj) {
         act = 3
         nxt = sj
       } else {
-        return Some(EffectMismatch(sc, tc))
+        let r = src_join_ok(vg, src, svid, sc, schain)
+        if sj < 0 && r > 0 {
+          act = 7
+          nxt = r
+        } else {
+          return Some(EffectMismatch(sc, tc))
+        }
       }
     } else {
       let sv = src_view(mut vg, src, svid, fs, sc)
@@ -2068,9 +2122,9 @@ fn walk_one(
         // into its predecessor by `simplcfg`. Otherwise the two targets
         // form a new pair (a target block left with one predecessor after
         // GVN dropped a dead edge is still the source join block).
-        let s_ok = sj > 0 && !contains_int(schain, sj)
+        let s_ok = sj > 0 && !contains_int(schain, sj) && !blk_has_phi_leaf(vg, src, svid, sj)
         let t_ok = tj > 0 && !contains_int(tchain, tj)
-        let s_triv = s_ok && is_trivial(src, sj)
+        let s_triv = s_ok && is_pure_jmp(src, sj)
         let t_triv = t_ok && is_trivial(tgt, tj)
         let s_one = s_ok && si.npred[sj] == 1
         let t_one = t_ok && ti.npred[tj] == 1
@@ -2086,11 +2140,12 @@ fn walk_one(
           act = 3
           nxt = sj
         } else {
-          enqueue(mut ts, sc, tc, sj, tj)
+          let i = enqueue(mut ts, sc, tc, sj, tj)
+          ts.cur_fin = EndJmp(i)
           act = 5
         }
       } else if sj >= 0 {
-        if sj > 0 && !contains_int(schain, sj) {
+        if sj > 0 && !contains_int(schain, sj) && !blk_has_phi_leaf(vg, src, svid, sj) {
           act = 3
           nxt = sj
         } else {
@@ -2098,8 +2153,9 @@ fn walk_one(
             // The target branches where the source does not: both target
             // paths must follow the one source path.
             VJnz(_, t1, t2) => {
-              enqueue(mut ts, sc, tc, sj, t1)
-              enqueue(mut ts, sc, tc, sj, t2)
+              let i1 = enqueue(mut ts, sc, tc, sj, t1)
+              let i2 = enqueue(mut ts, sc, tc, sj, t2)
+              ts.cur_fin = EndTgtBranch(i1, i2)
               act = 5
             }
             _ => return Some(TermMismatch(sc, tc))
@@ -2120,8 +2176,9 @@ fn walk_one(
               act = 4
               nxt = tj
             } else {
-              enqueue(mut ts, sc, tc, s1, tj)
-              enqueue(mut ts, sc, tc, s2, tj)
+              let i1 = enqueue(mut ts, sc, tc, s1, tj)
+              let i2 = enqueue(mut ts, sc, tc, s2, tj)
+              ts.cur_fin = EndSrcBranch(i1, i2)
               act = 5
             }
             _ =>
@@ -2134,21 +2191,38 @@ fn walk_one(
           }
         }
       } else {
-        return term_compare(mut vg, mut ts, fs, sv, tv, sc, tc)
+        let r = src_join_ok(vg, src, svid, sc, schain)
+        let t_branch = match tv {
+          VJnz(_, _, _) => true
+          _ => false
+        }
+        if r > 0 && !t_branch {
+          act = 7
+          nxt = r
+        } else {
+          match term_compare(mut vg, mut ts, fs, sv, tv, sc, tc) {
+            Some(e) => return Some(e)
+            None => act = 5
+          }
+        }
       }
     }
     ts.trace.push(act * 1000000 + sc * 1000 + tc)
     if act == 1 {
+      ts.cur_steps.push(MatchEff)
       sx = sx + 1
       tx = tx + 1
     } else if act == 2 {
+      ts.cur_steps.push(SkipSrcReadOnly)
       sx = sx + 1
-    } else if act == 3 {
+    } else if act == 3 || act == 7 {
+      ts.cur_steps.push(if act == 3 { SrcJmp } else { SrcJoin })
       schain.push(nxt)
       sc = nxt
       sx = 0
       bm_add(mut ts, tc, nxt)
     } else if act == 4 {
+      ts.cur_steps.push(TgtJmp)
       match absorb_tgt_phis(mut vg, mut ts, tgt, ti, nxt, tc) {
         Some(e) => return Some(e)
         None => ()
@@ -2157,6 +2231,7 @@ fn walk_one(
       tc = nxt
       tx = 0
     } else if act == 6 {
+      ts.cur_steps.push(BothJmp)
       let sj = view_jmp(src_view(mut vg, src, svid, fs, sc))
       let tj = view_jmp(tgt_view(mut vg, mut ts, tgt, ti, fs, tc))
       match absorb_tgt_phis(mut vg, mut ts, tgt, ti, tj, tc) {
@@ -2171,6 +2246,7 @@ fn walk_one(
       sx = 0
       bm_add(mut ts, tc, sc)
     } else {
+      ts.pcs.push(PairCert::{ sb, tb, steps: ts.cur_steps.copy(), fin: ts.cur_fin })
       return None
     }
   }
@@ -2258,91 +2334,795 @@ fn phi_arm_checks(
   None
 }
 
-///| A target phi value must stay valid over its whole block: it may depend on
-///| no source block the target block runs (except the phi leaf of the head).
-fn phi_scope_checks(vg : ValGraph, ts : TgtState) -> Option[TvFail] {
-  let n = ts.ph_t.length()
-  let mut j = 0
-  while j < n {
-    let tb = ts.ph_t[j]
-    let d = ts.ph_d[j]
-    let sb = ts.ph_s[j]
-    let v = ts.tvid[d]
-    let m = ts.bm_t.length()
-    let mut k = 0
-    while k < m {
-      if ts.bm_t[k] == tb {
-        let x = ts.bm_s[k]
-        let exempt = sb >= 0 && x == sb && vg_is_phi_of(vg, v, sb)
-        if !exempt && vid_mentions_blk(vg, v, x) {
-          return Some(PhiScope(tb, d))
-        }
-      }
-      k = k + 1
-    }
-    j = j + 1
-  }
-  None
+///|
+///| 6. Certificates: the solver above (`build_cert`) and the checker
+///| (`verify_cert`), which trusts nothing the solver computed.
+///|
+
+///| One step of a matched pair, after both sides skipped their pure
+///| instructions.
+pub enum Step {
+  /// The next source and target side effects are equal.
+  MatchEff
+  /// The next source effect (a load or a division) is dropped.
+  SkipSrcReadOnly
+  /// The source (no effect left) enters the block its `jmp` goes to.
+  SrcJmp
+  /// The source (no effect left) enters the join of its `jnz` (`src_join`).
+  SrcJoin
+  /// The target (no effect left) enters the block its `jmp` goes to.
+  TgtJmp
+  /// Both (no effect left) enter the blocks their `jmp`s go to.
+  BothJmp
 }
 
-///| Validate `tgt` against `src`. `*_floating`: the function is a GVN output
-///| whose pure instructions may sit anywhere (`avail_temp`).
-pub fn validate_fn_mode(src : Func, tgt : Func, src_floating : Bool, tgt_floating : Bool) -> TvResult {
+///| How a matched pair ends; pair arguments are indices into `Cert.pairs`.
+pub enum EndCert {
+  EndRet
+  EndHlt
+  /// Both jump: (successor pair).
+  EndJmp(Int)
+  /// Both branch on equal (or, swapped, complementary) conditions.
+  EndJnz(Bool, Int, Int)
+  /// The source branches, the target jumps: (pair true, pair false).
+  EndSrcBranch(Int, Int)
+  /// The source jumps, the target branches: (pair true, pair false).
+  EndTgtBranch(Int, Int)
+}
+
+///| Source head `sb` runs in lock step with target head `tb`.
+pub struct PairCert {
+  sb : Int
+  tb : Int
+  steps : Array[Step]
+  fin : EndCert
+}
+
+pub struct Cert {
+  /// Frozen value graph (the checker copies it and may only append).
+  vg : ValGraph
+  svid : Array[Int]
+  tvid : Array[Int]
+  savail : Array[Bool]
+  tavail : Array[Bool]
+  facts : Array[Fact]
+  /// `pairs[0]` is (0, 0).
+  pairs : Array[PairCert]
+  /// Target block `bm_t[j]` runs source block `bm_s[j]`.
+  bm_t : Array[Int]
+  bm_s : Array[Int]
+}
+
+pub enum CertResult {
+  CertOk(Cert)
+  CertFail(TvFail)
+}
+
+///| The solver: a certificate, or why none was found.
+pub fn build_cert_diag(src : Func, tgt : Func) -> CertResult {
   let ws = wf_code(src)
   if ws != 0 {
-    return Rejected(BadSrc(ws))
+    return CertFail(BadSrc(ws))
   }
   let wt = wf_code(tgt)
   if wt != 0 {
-    return Rejected(BadTgt(wt))
+    return CertFail(BadTgt(wt))
   }
   let si = build_info(src)
   let ti = build_info(tgt)
   let mut vg = vg_new()
-  let svid = src_vids(mut vg, src, si)
-  let spure = pure_table(vg, src, si, svid)
+  let svid0 = src_vids(mut vg, src, si, [])
+  let facts0 = compute_facts(mut vg, src, si, svid0)
+  let svid = src_vids(mut vg, src, si, facts0)
   let savail = compute_avail(src, si)
   let ids = iota(si.nb)
-  let ca = check_avail(vg, src, si, savail, svid, ids, ids, src_floating, spure)
+  let ca = check_avail(vg, src, si, savail, svid, ids, ids)
   if ca != 0 {
-    return Rejected(SrcAvail(ca - 1))
+    return CertFail(SrcAvail(ca - 1))
   }
   let slive = src_live(src, si)
   let facts = compute_facts(mut vg, src, si, svid)
   let cf = check_facts(mut vg, src, si, svid, facts)
   if cf != 0 {
-    return Rejected(SrcFacts(cf - 1))
+    return CertFail(SrcFacts(cf - 1))
   }
   let mut ts = tgt_state_new(ti.nt)
   match walk(mut vg, mut ts, src, si, svid, slive, facts, tgt, ti) {
-    Some(e) => return Rejected(e)
+    Some(e) => return CertFail(e)
     None => ()
   }
   match phi_arm_checks(mut vg, mut ts, src, svid, facts, tgt, ti) {
-    Some(e) => return Rejected(e)
+    Some(e) => return CertFail(e)
     None => ()
   }
-  match phi_scope_checks(vg, ts) {
-    Some(e) => return Rejected(e)
-    None => ()
-  }
-  let tpure = pure_table(vg, tgt, ti, ts.tvid)
   let tavail = compute_avail(tgt, ti)
-  let ct = check_avail(vg, tgt, ti, tavail, ts.tvid, ts.bm_t, ts.bm_s, tgt_floating, tpure)
+  let ct = check_avail(vg, tgt, ti, tavail, ts.tvid, ts.bm_t, ts.bm_s)
   if ct != 0 {
-    return Rejected(TgtAvail(ct - 1))
+    return CertFail(TgtAvail(ct - 1))
   }
-  Valid
+  CertOk(Cert::{
+    vg,
+    svid,
+    tvid: ts.tvid.copy(),
+    savail,
+    tavail,
+    facts,
+    pairs: ts.pcs.copy(),
+    bm_t: ts.bm_t.copy(),
+    bm_s: ts.bm_s.copy(),
+  })
+}
+
+pub fn build_cert(src : Func, tgt : Func) -> Option[Cert] {
+  match build_cert_diag(src, tgt) {
+    CertOk(c) => Some(c)
+    CertFail(_) => None
+  }
+}
+
+///| Every child index of node i is below i.
+pub fn check_vg_dag(vg : ValGraph) -> Bool {
+  let n = vg.nodes.length()
+  let mut i = 0
+  while i < n {
+    match vg.nodes[i] {
+      SUn(_, _, a) => if a < 0 || a >= i {
+        return false
+      }
+      SBin(_, _, a, b) => if a < 0 || a >= i || b < 0 || b >= i {
+        return false
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  true
+}
+
+///| Every entry is -1 or a node.
+fn vids_ok(vg : ValGraph, vids : Array[Int], n : Int) -> Bool {
+  if vids.length() != n {
+    return false
+  }
+  for v in vids {
+    if v != -1 && !vg_valid(vg, v) {
+      return false
+    }
+  }
+  true
+}
+
+///| Phi k of source block b has the value `svid[dst]`: its leaf, its folded
+///| value, its 0/1 select, or the value of an earlier phi with the same
+///| arguments.
+fn src_phi_def_ok(
+  mut vg : ValGraph,
+  f : Func,
+  info : FnInfo,
+  svid : Array[Int],
+  facts : Array[Fact],
+  b : Int,
+  k : Int,
+) -> Bool {
+  let d = f.blocks[b].phis[k].dst
+  let c = f.blocks[b].phis[k].cls
+  let v = svid[d]
+  if !vg_valid(vg, v) {
+    return false
+  }
+  if sym_node_eq(vg.nodes[v], SPhi(c, b, k)) {
+    return true
+  }
+  if phi_fold(mut vg, f, info, svid, facts, b, k) == v {
+    return true
+  }
+  if phi_select(mut vg, f, svid, b, k) == v {
+    return true
+  }
+  let mut k1 = 0
+  while k1 < k {
+    let d1 = f.blocks[b].phis[k1].dst
+    if f.blocks[b].phis[k1].cls == c && svid[d1] == v && phis_same_args(mut vg, f, svid, b, k1, k) {
+      return true
+    }
+    k1 = k1 + 1
+  }
+  false
+}
+
+///| Every source temp defined by the code has the value of its definition.
+pub fn check_src_defs(mut vg : ValGraph, f : Func, info : FnInfo, svid : Array[Int], facts : Array[Fact]) -> Bool {
+  let mut b = 0
+  while b < info.nb {
+    let np = f.blocks[b].phis.length()
+    let mut k = 0
+    while k < np {
+      if !src_phi_def_ok(mut vg, f, info, svid, facts, b, k) {
+        return false
+      }
+      k = k + 1
+    }
+    let ni = f.blocks[b].insts.length()
+    let mut i = 0
+    while i < ni {
+      let d = inst_dst(f.blocks[b].insts[i])
+      if d >= 0 {
+        let v = svid[d]
+        if v < 0 || v != eval_inst(mut vg, svid, f.blocks[b].insts[i], b, i, true) {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  true
+}
+
+///| A target instruction whose value comes from matching (a side effect or a
+///| division that may trap).
+fn tgt_effect_c(mut vg : ValGraph, tvid : Array[Int], inst : Inst) -> Bool {
+  match inst {
+    Par(_, _, _) => false
+    Un(_, _, _, _) => false
+    Bin(_, c, op, a, b) =>
+    if !is_trapping_binop(op) {
+      false
+    } else {
+      let av = atom_use(mut vg, tvid, binop_arg_cls(op, c, 0), a)
+      let bv = atom_use(mut vg, tvid, binop_arg_cls(op, c, 1), b)
+      !bin_safe(vg, c, op, av, bv)
+    }
+    _ => true
+  }
+}
+
+///| Every pure target temp with a value has the value of its definition
+///| (effects and phis are checked by the replay).
+pub fn check_tgt_defs(mut vg : ValGraph, f : Func, info : FnInfo, tvid : Array[Int]) -> Bool {
+  let mut b = 0
+  while b < info.nb {
+    let ni = f.blocks[b].insts.length()
+    let mut i = 0
+    while i < ni {
+      let d = inst_dst(f.blocks[b].insts[i])
+      if d >= 0 && tvid[d] >= 0 && !tgt_effect_c(mut vg, tvid, f.blocks[b].insts[i]) {
+        if tvid[d] != eval_inst(mut vg, tvid, f.blocks[b].insts[i], b, i, false) {
+          return false
+        }
+      }
+      i = i + 1
+    }
+    b = b + 1
+  }
+  true
+}
+
+fn bm_has(cert : Cert, tb : Int, sb : Int) -> Bool {
+  let n = cert.bm_t.length()
+  let mut j = 0
+  while j < n && j < cert.bm_s.length() {
+    if cert.bm_t[j] == tb && cert.bm_s[j] == sb {
+      return true
+    }
+    j = j + 1
+  }
+  false
+}
+
+fn skip_src_pure(vg : ValGraph, f : Func, svid : Array[Int], b : Int, x0 : Int) -> Int {
+  let n = f.blocks[b].insts.length()
+  let mut x = x0
+  while x < n && !src_inst_is_effect(vg, svid, f.blocks[b].insts[x]) {
+    x = x + 1
+  }
+  x
+}
+
+fn skip_tgt_pure(mut vg : ValGraph, f : Func, tvid : Array[Int], b : Int, x0 : Int) -> Int {
+  let n = f.blocks[b].insts.length()
+  let mut x = x0
+  while x < n && !tgt_effect_c(mut vg, tvid, f.blocks[b].insts[x]) {
+    x = x + 1
+  }
+  x
+}
+
+fn tgt_view_c(mut vg : ValGraph, f : Func, tvid : Array[Int], fs : Array[Fact], b : Int) -> TView {
+  match f.blocks[b].term {
+    Jmp(s) => VJmp(s)
+    Jnz(c, s1, s2) => {
+      if s1 == s2 {
+        return VJmp(s1)
+      }
+      let cv = apply_facts(mut vg, fs, atom_use(mut vg, tvid, W, c))
+      match vg_const(vg, cv) {
+        Some(x) => VJmp(if x != 0UL { s1 } else { s2 })
+        None => VJnz(cv, s1, s2)
+      }
+    }
+    Ret(h, c, a) =>
+    if h {
+      VRet(h, c, apply_facts(mut vg, fs, atom_use(mut vg, tvid, c, a)))
+    } else {
+      VRet(h, c, -1)
+    }
+    Hlt => VHlt
+  }
+}
+
+fn obs_eq_c(mut vg : ValGraph, svid : Array[Int], tvid : Array[Int], fs : Array[Fact], cls : Cls, sa : Atom, ta : Atom) -> Bool {
+  let sv = atom_use(mut vg, svid, cls, sa)
+  let tv = atom_use(mut vg, tvid, cls, ta)
+  eq_under(mut vg, fs, sv, tv)
+}
+
+///| The target result of a matched effect has the source result's value.
+fn same_result(svid : Array[Int], tvid : Array[Int], sd : Int, td : Int) -> Bool {
+  sd >= 0 && sd < svid.length() && td >= 0 && td < tvid.length() && svid[sd] >= 0 && tvid[td] == svid[sd]
+}
+
+///| Checker counterpart of `match_effect`.
+fn match_effect_c(
+  mut vg : ValGraph,
+  svid : Array[Int],
+  tvid : Array[Int],
+  fs : Array[Fact],
+  sinst : Inst,
+  tinst : Inst,
+) -> Bool {
+  match sinst {
+    Load(sd, sc, sw, ssg, sa) =>
+    match tinst {
+      Load(td, tc, tw, tsg, ta) =>
+      sc == tc && sw == tw && ssg == tsg && obs_eq_c(mut vg, svid, tvid, fs, L, sa, ta) &&
+      same_result(svid, tvid, sd, td)
+      _ => false
+    }
+    Store(sw, sv, sa) =>
+    match tinst {
+      Store(tw, tv, ta) => {
+        if sw != tw || !obs_eq_c(mut vg, svid, tvid, fs, L, sa, ta) {
+          return false
+        }
+        let c = store_cls(sw)
+        let s1 = store_view(mut vg, sw, atom_use(mut vg, svid, c, sv))
+        let t1 = store_view(mut vg, sw, atom_use(mut vg, tvid, c, tv))
+        eq_under(mut vg, fs, s1, t1)
+      }
+      _ => false
+    }
+    Call(sd, sc, sh, scal, sargs) =>
+    match tinst {
+      Call(td, tc, th, tcal, targs) => {
+        if sh != th || (sh && sc != tc) || !obs_eq_c(mut vg, svid, tvid, fs, L, scal, tcal) {
+          return false
+        }
+        let n = sargs.length()
+        if n != targs.length() {
+          return false
+        }
+        let mut j = 0
+        while j < n {
+          if sargs[j].cls != targs[j].cls || !obs_eq_c(mut vg, svid, tvid, fs, sargs[j].cls, sargs[j].arg, targs[j].arg) {
+            return false
+          }
+          j = j + 1
+        }
+        !sh || same_result(svid, tvid, sd, td)
+      }
+      _ => false
+    }
+    Alloc(sd, sal, ssz) =>
+    match tinst {
+      Alloc(td, tal, tsz) => sal == tal && ssz == tsz && same_result(svid, tvid, sd, td)
+      _ => false
+    }
+    Bin(sd, sc, sop, sa, sb) =>
+    match tinst {
+      Bin(td, tc, top, ta, tb) =>
+      sc == tc && sop == top &&
+      obs_eq_c(mut vg, svid, tvid, fs, binop_arg_cls(sop, sc, 0), sa, ta) &&
+      obs_eq_c(mut vg, svid, tvid, fs, binop_arg_cls(sop, sc, 1), sb, tb) &&
+      same_result(svid, tvid, sd, td)
+      _ => false
+    }
+    _ => false
+  }
+}
+
+///| A source effect the target may drop: a load or a division (neither
+///| changes the world when it does not trap).
+fn src_skippable(inst : Inst) -> Bool {
+  match inst {
+    Load(_, _, _, _, _) => true
+    Bin(_, _, op, _, _) => is_trapping_binop(op)
+    _ => false
+  }
+}
+
+///| Target phis of head `tb` entered with source head `sb`: a phi of the
+///| same temp that is a leaf of `sb` (same value), or a value that depends
+///| on no phi / effect of `sb` and is no phi leaf.
+fn head_ok(mut vg : ValGraph, src : Func, svid : Array[Int], tgt : Func, tvid : Array[Int], sb : Int, tb : Int) -> Bool {
+  let np = tgt.blocks[tb].phis.length()
+  let mut j = 0
+  while j < np {
+    let d = tgt.blocks[tb].phis[j].dst
+    let c = tgt.blocks[tb].phis[j].cls
+    let v = tvid[d]
+    if !vg_valid(vg, v) {
+      return false
+    }
+    let k = if d < svid.length() { find_phi(src, sb, d) } else { -1 }
+    if k >= 0 && vg_is_phi_of(vg, svid[d], sb) {
+      if src.blocks[sb].phis[k].cls != c || v != svid[d] {
+        return false
+      }
+    } else {
+      if vid_mentions_blk(vg, v, sb) {
+        return false
+      }
+      match vg.nodes[v] {
+        SPhi(_, _, _) => return false
+        _ => ()
+      }
+    }
+    j = j + 1
+  }
+  true
+}
+
+///| The target phis of an absorbed block m get their argument on the edge
+///| from `pred` (read before any is written).
+fn absorb_ok(mut vg : ValGraph, tgt : Func, tvid : Array[Int], m : Int, pred : Int) -> Bool {
+  let np = tgt.blocks[m].phis.length()
+  let mut j = 0
+  while j < np {
+    let d = tgt.blocks[m].phis[j].dst
+    let c = tgt.blocks[m].phis[j].cls
+    let ai = phi_arm_index(tgt, m, j, pred)
+    if ai < 0 {
+      return false
+    }
+    let a = tgt.blocks[m].phis[j].arms[ai].value
+    if is_phi_of_blk(tgt, m, a) {
+      return false
+    }
+    let v = atom_use(mut vg, tvid, c, a)
+    if v < 0 || tvid[d] != v {
+      return false
+    }
+    j = j + 1
+  }
+  true
+}
+
+///| No phi value of target block tc depends on source block sj (which the
+///| source is about to enter while the target stays in tc).
+fn src_enter_scope_ok(vg : ValGraph, tgt : Func, tvid : Array[Int], tc : Int, sj : Int) -> Bool {
+  for phi in tgt.blocks[tc].phis {
+    if vid_mentions_blk(vg, tvid[phi.dst], sj) {
+      return false
+    }
+  }
+  true
+}
+
+///| On the edges sp -> sh / tp -> th every target phi argument of th equals
+///| the source value the phi stands for (`head_ok`).
+fn edge_ok(
+  mut vg : ValGraph,
+  src : Func,
+  svid : Array[Int],
+  facts : Array[Fact],
+  tgt : Func,
+  tvid : Array[Int],
+  sp : Int,
+  tp : Int,
+  sh : Int,
+  th : Int,
+) -> Bool {
+  let fs = edge_fact_set(mut vg, src, svid, facts, sp, sh)
+  let np = tgt.blocks[th].phis.length()
+  let mut j = 0
+  while j < np {
+    let d = tgt.blocks[th].phis[j].dst
+    let c = tgt.blocks[th].phis[j].cls
+    let ai = phi_arm_index(tgt, th, j, tp)
+    if ai < 0 {
+      return false
+    }
+    let tv = atom_use(mut vg, tvid, c, tgt.blocks[th].phis[j].arms[ai].value)
+    let k = if d < svid.length() { find_phi(src, sh, d) } else { -1 }
+    let mut sv = tvid[d]
+    if k >= 0 && vg_is_phi_of(vg, svid[d], sh) {
+      let sa = phi_arm_index(src, sh, k, sp)
+      if sa < 0 {
+        return false
+      }
+      sv = atom_use(mut vg, svid, c, src.blocks[sh].phis[k].arms[sa].value)
+    }
+    if !eq_under(mut vg, fs, sv, tv) {
+      return false
+    }
+    j = j + 1
+  }
+  true
+}
+
+///| `pairs[i]` is (sh, th) and the edges into it check.
+fn next_ok(mut vg : ValGraph, src : Func, svid : Array[Int], tgt : Func, cert : Cert, i : Int, sp : Int, tp : Int, sh : Int, th : Int) -> Bool {
+  i >= 0 && i < cert.pairs.length() && cert.pairs[i].sb == sh && cert.pairs[i].tb == th &&
+  edge_ok(mut vg, src, svid, cert.facts, tgt, cert.tvid, sp, tp, sh, th)
+}
+
+fn cmp_zero(mut vg : ValGraph, c : Int) -> Int {
+  let z = vg_konst(mut vg, W, 0UL)
+  vg_canon_bin(mut vg, W, CEq(W), c, z)
+}
+
+///| The terminators of the replayed pair end as `fin` says.
+fn check_end(
+  mut vg : ValGraph,
+  src : Func,
+  tgt : Func,
+  cert : Cert,
+  fs : Array[Fact],
+  sc : Int,
+  tc : Int,
+  fin : EndCert,
+) -> Bool {
+  let sv = src_view(mut vg, src, cert.svid, fs, sc)
+  let tv = tgt_view_c(mut vg, tgt, cert.tvid, fs, tc)
+  match fin {
+    EndRet =>
+    match sv {
+      VRet(sh, scls, svv) =>
+      match tv {
+        VRet(th, tcls, tvv) => sh == th && (!sh || (scls == tcls && eq_under(mut vg, fs, svv, tvv)))
+        _ => false
+      }
+      _ => false
+    }
+    EndHlt =>
+    match sv {
+      VHlt =>
+      match tv {
+        VHlt => true
+        _ => false
+      }
+      _ => false
+    }
+    EndJmp(i) =>
+    match sv {
+      VJmp(sj) =>
+      match tv {
+        VJmp(tj) => next_ok(mut vg, src, cert.svid, tgt, cert, i, sc, tc, sj, tj)
+        _ => false
+      }
+      _ => false
+    }
+    EndJnz(sw, i1, i2) =>
+    match sv {
+      VJnz(cs, s1, s2) =>
+      match tv {
+        VJnz(ct, t1, t2) =>
+        if !sw {
+          eq_under(mut vg, fs, cs, ct) && next_ok(mut vg, src, cert.svid, tgt, cert, i1, sc, tc, s1, t1) &&
+          next_ok(mut vg, src, cert.svid, tgt, cert, i2, sc, tc, s2, t2)
+        } else {
+          let ns = cmp_zero(mut vg, cs)
+          let nt = cmp_zero(mut vg, ct)
+          (eq_under(mut vg, fs, ns, ct) || eq_under(mut vg, fs, cs, nt)) &&
+          next_ok(mut vg, src, cert.svid, tgt, cert, i1, sc, tc, s1, t2) &&
+          next_ok(mut vg, src, cert.svid, tgt, cert, i2, sc, tc, s2, t1)
+        }
+        _ => false
+      }
+      _ => false
+    }
+    EndSrcBranch(i1, i2) =>
+    match sv {
+      VJnz(_, s1, s2) =>
+      match tv {
+        VJmp(tj) =>
+        next_ok(mut vg, src, cert.svid, tgt, cert, i1, sc, tc, s1, tj) &&
+        next_ok(mut vg, src, cert.svid, tgt, cert, i2, sc, tc, s2, tj)
+        _ => false
+      }
+      _ => false
+    }
+    EndTgtBranch(i1, i2) =>
+    match sv {
+      VJmp(sj) =>
+      match tv {
+        VJnz(_, t1, t2) =>
+        next_ok(mut vg, src, cert.svid, tgt, cert, i1, sc, tc, sj, t1) &&
+        next_ok(mut vg, src, cert.svid, tgt, cert, i2, sc, tc, sj, t2)
+        _ => false
+      }
+      _ => false
+    }
+  }
+}
+
+///| Replay pair p: its steps consume every side effect of both block chains
+///| and its end checks the terminators and the successor pairs (0, else
+///| the number of the failed check).
+fn replay_pair(mut vg : ValGraph, src : Func, si : FnInfo, tgt : Func, ti : FnInfo, cert : Cert, p : PairCert) -> Int {
+  let sb = p.sb
+  let tb = p.tb
+  if sb < 0 || sb >= si.nb || tb < 0 || tb >= ti.nb {
+    return 1
+  }
+  if !head_ok(mut vg, src, cert.svid, tgt, cert.tvid, sb, tb) || !bm_has(cert, tb, sb) {
+    return 2
+  }
+  let mut sc = sb
+  let mut sx = 0
+  let mut tc = tb
+  let mut tx = 0
+  let mut schain = [sb]
+  let mut tchain = [tb]
+  for st in p.steps {
+    sx = skip_src_pure(vg, src, cert.svid, sc, sx)
+    tx = skip_tgt_pure(mut vg, tgt, cert.tvid, tc, tx)
+    let s_has = sx < src.blocks[sc].insts.length()
+    let t_has = tx < tgt.blocks[tc].insts.length()
+    let fs = facts_of(cert.facts, sc)
+    // Where each side goes next (-1: stays).
+    let mut sj = -1
+    let mut tj = -1
+    match st {
+      MatchEff => {
+        if !s_has || !t_has || !match_effect_c(mut vg, cert.svid, cert.tvid, fs, src.blocks[sc].insts[sx], tgt.blocks[tc].insts[tx]) {
+          return 3
+        }
+        sx = sx + 1
+        tx = tx + 1
+      }
+      SkipSrcReadOnly => {
+        if !s_has || !src_skippable(src.blocks[sc].insts[sx]) {
+          return 4
+        }
+        sx = sx + 1
+      }
+      SrcJmp => {
+        if s_has {
+          return 5
+        }
+        sj = view_jmp(src_view(mut vg, src, cert.svid, fs, sc))
+      }
+      SrcJoin => {
+        if s_has {
+          return 6
+        }
+        match src_view(mut vg, src, cert.svid, fs, sc) {
+          VJnz(_, _, _) => sj = src_join(src, sc)
+          _ => return 7
+        }
+      }
+      TgtJmp => {
+        if t_has {
+          return 8
+        }
+        tj = view_jmp(tgt_view_c(mut vg, tgt, cert.tvid, fs, tc))
+      }
+      BothJmp => {
+        if s_has || t_has {
+          return 9
+        }
+        sj = view_jmp(src_view(mut vg, src, cert.svid, fs, sc))
+        tj = view_jmp(tgt_view_c(mut vg, tgt, cert.tvid, fs, tc))
+        if sj < 0 || tj < 0 {
+          return 10
+        }
+      }
+    }
+    // The target moves first: its phis read their arguments before the
+    // source enters a block.
+    if tj >= 0 {
+      if tj <= 0 || tj >= ti.nb || contains_int(tchain, tj) || !absorb_ok(mut vg, tgt, cert.tvid, tj, tc) {
+        return 11
+      }
+      // The source block stays the one it entered before: a value of it
+      // that is available now stays valid in tj (no `bm` entry needed).
+      tchain.push(tj)
+      tc = tj
+      tx = 0
+    }
+    if sj >= 0 {
+      if sj <= 0 || sj >= si.nb || contains_int(schain, sj) || blk_has_phi_leaf(vg, src, cert.svid, sj) {
+        return 13
+      }
+      if !src_enter_scope_ok(vg, tgt, cert.tvid, tc, sj) || !bm_has(cert, tc, sj) {
+        return 14
+      }
+      schain.push(sj)
+      sc = sj
+      sx = 0
+    }
+  }
+  sx = skip_src_pure(vg, src, cert.svid, sc, sx)
+  tx = skip_tgt_pure(mut vg, tgt, cert.tvid, tc, tx)
+  if sx < src.blocks[sc].insts.length() || tx < tgt.blocks[tc].insts.length() {
+    return 15
+  }
+  if check_end(mut vg, src, tgt, cert, facts_of(cert.facts, sc), sc, tc, p.fin) {
+    0
+  } else {
+    16
+  }
+}
+
+///| 0 when the certificate checks, else the number of the failed check.
+pub fn cert_fail_code(src : Func, tgt : Func, cert : Cert) -> Int {
+  if wf_code(src) != 0 || wf_code(tgt) != 0 {
+    return 1
+  }
+  if !check_vg_dag(cert.vg) {
+    return 2
+  }
+  let si = build_info(src)
+  let ti = build_info(tgt)
+  if !vids_ok(cert.vg, cert.svid, si.nt) || !vids_ok(cert.vg, cert.tvid, ti.nt) {
+    return 3
+  }
+  let mut vg = ValGraph::{ nodes: cert.vg.nodes.copy() }
+  if !check_src_defs(mut vg, src, si, cert.svid, cert.facts) {
+    return 4
+  }
+  if !check_tgt_defs(mut vg, tgt, ti, cert.tvid) {
+    return 5
+  }
+  let ids = iota(si.nb)
+  if check_avail(vg, src, si, cert.savail, cert.svid, ids, ids) != 0 {
+    return 6
+  }
+  if check_avail(vg, tgt, ti, cert.tavail, cert.tvid, cert.bm_t, cert.bm_s) != 0 {
+    return 7
+  }
+  if check_facts(mut vg, src, si, cert.svid, cert.facts) != 0 {
+    return 8
+  }
+  if cert.pairs.length() == 0 || cert.pairs[0].sb != 0 || cert.pairs[0].tb != 0 {
+    return 9
+  }
+  for p in cert.pairs {
+    let r = replay_pair(mut vg, src, si, tgt, ti, cert, p)
+    if r != 0 {
+      return 100 + r
+    }
+  }
+  0
+}
+
+///| The checker: `tgt` refines `src` by the certificate `cert`.
+pub fn verify_cert(src : Func, tgt : Func, cert : Cert) -> Bool {
+  cert_fail_code(src, tgt, cert) == 0
 }
 
 pub fn validate_fn_diag(src : Func, tgt : Func) -> TvResult {
-  validate_fn_mode(src, tgt, false, false)
+  match build_cert_diag(src, tgt) {
+    CertFail(e) => Rejected(e)
+    CertOk(cert) => {
+      let code = cert_fail_code(src, tgt, cert)
+      if code == 0 {
+        Valid
+      } else {
+        Rejected(CertRejected(code))
+      }
+    }
+  }
 }
 
+///| `tgt` refines `src`: the solver finds a certificate and the checker
+///| accepts it.
 pub fn validate_fn(src : Func, tgt : Func) -> Bool {
-  match validate_fn_diag(src, tgt) {
-    Valid => true
-    _ => false
+  match build_cert(src, tgt) {
+    None => false
+    Some(cert) => verify_cert(src, tgt, cert)
   }
 }
 
@@ -2356,7 +3136,9 @@ pub fn debug_walk_trace(src : Func, tgt : Func) -> Array[Int] {
   let si = build_info(src)
   let ti = build_info(tgt)
   let mut vg = vg_new()
-  let svid = src_vids(mut vg, src, si)
+  let svid0 = src_vids(mut vg, src, si, [])
+  let facts0 = compute_facts(mut vg, src, si, svid0)
+  let svid = src_vids(mut vg, src, si, facts0)
   let slive = src_live(src, si)
   let facts = compute_facts(mut vg, src, si, svid)
   let mut ts = tgt_state_new(ti.nt)

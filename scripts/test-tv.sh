@@ -7,8 +7,10 @@ set -eu
 #   1. build `qbe-tv` with <pionc>;
 #   2. compile tests/tv/opt_suite.pion and tests/lean/{codec,algos,captable}
 #      to QBE SSA, run the real optimiser `<qbe> -d MG` and validate every
-#      function's load elimination -> slot coalescing -> GVN -> GCM snapshots
-#      (`qbe-tv --trace`): 0 rejected; opt_suite also 0 skipped;
+#      function's `After load elimination` snapshot directly against its
+#      `After GCM` snapshot with the strict checker (`qbe-tv --trace`):
+#      0 rejected; opt_suite also 0 skipped; then swap a `jnz` of every
+#      opt_suite function after GCM: all rejected;
 #   3. `qbe-tv --pair` on tests/tv/good (correct rewrites): all validated;
 #   4. `qbe-tv --pair` on tests/tv/adversarial (miscompilations): every
 #      pair rejected.

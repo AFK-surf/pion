@@ -532,4 +532,7 @@ BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_benc
 # Same load over HTTP/1.1 keep-alive (one connection per client thread).
 KEEP_ALIVE=1 BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$PIONC" 8 500 8
 
+# Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
+sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
+
 echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"
