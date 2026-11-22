@@ -31,19 +31,30 @@ const PAGE_SIZE = 65536;
 
 // Size classes for O(1) free-list recycling (total block size incl. 8B block header for raw allocs).
 // Small classes [32..2048] plus 16B-aligned p+16 and 1.5*p+16 tiers up to 256 MiB + 16.
-const FREE_CLASSES = (() => {
-  const set = new Set([32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048]);
-  for (let p = 2048; p <= 268435456; p *= 2) {
-    set.add(p + 16);
-    if (p < 268435456) {
-      set.add(((p * 3) / 2) + 16);
-    }
+const FREE_CLASSES = [
+  32, 48, 64, 96, 128, 192, 256, 384, 512, 768, 1024, 1536, 2048,
+  2064, 3088, 4112, 6160, 8208, 12304, 16400, 24592, 32784, 49168,
+  65552, 98320, 131088, 196624, 262160, 393232, 524304, 786448,
+  1048592, 1572880, 2097168, 3145744, 4194320, 6291472, 8388624,
+  12582928, 16777232, 25165840, 33554448, 50331664, 67108880,
+  100663312, 134217744, 201326608, 268435472,
+];
+let _freeClassIdx = null;
+function getFreeClassIdx(sz) {
+  if (_freeClassIdx === null) {
+    _freeClassIdx = new Map();
+    for (let i = 0; i < FREE_CLASSES.length; i++) _freeClassIdx.set(FREE_CLASSES[i], i);
   }
-  return Array.from(set).sort((a, b) => a - b);
-})();
-const FREE_CLASS_IDX = new Map(FREE_CLASSES.map((sz, i) => [sz, i]));
+  return _freeClassIdx.get(sz);
+}
 const ALLOC_MAGIC = 0x50494f4e; // "PION"
 const FREE_MAGIC  = 0x46524545; // "FREE"
+
+const IS_NODE_ENV = typeof process !== "undefined" && Boolean(process.versions && process.versions.node);
+const HAS_GET_BUILTIN = IS_NODE_ENV && typeof process.getBuiltinModule === "function";
+function getBuiltin(name) {
+  return HAS_GET_BUILTIN ? process.getBuiltinModule(name) : null;
+}
 
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 const textEncoder = new TextEncoder();
@@ -110,14 +121,14 @@ export function createPionRuntime(options = {}) {
   let heapPtr = 0;
   let heapEnd = 0;
   let slabCtl = 0;
-  const freeLists = FREE_CLASSES.map(() => []);
+  let freeLists = null;
   const largeFree = new Map();
 
   const stdoutChunks = [];
   const stderrChunks = [];
-  const isNode = typeof process !== "undefined" && process.versions && process.versions.node;
+  const isNode = IS_NODE_ENV;
   const nodeFs = options.fs || null;
-  const nodeCrypto = options.crypto || null;
+  let nodeCrypto = options.crypto || null;
   const nodeCp = options.child_process || null;
   const cliArgs = Array.isArray(options.args) ? options.args.map(String) : [];
 
@@ -172,7 +183,11 @@ export function createPionRuntime(options = {}) {
       dv.setUint32(slabCtl + 40, heapEnd >>> 0, true);
       dv.setUint32(slabCtl + 44, heapBase >>> 0, true);
     }
-    for (let i = 0; i < freeLists.length; i++) freeLists[i].length = 0;
+    if (freeLists) {
+      for (let i = 0; i < freeLists.length; i++) {
+        if (freeLists[i]) freeLists[i].length = 0;
+      }
+    }
     largeFree.clear();
   }
 
@@ -209,7 +224,7 @@ export function createPionRuntime(options = {}) {
           dv.setUint32(head + 4, ALLOC_MAGIC, true);
           return head + 8;
         }
-      } else if (freeLists[cls].length > 0) {
+      } else if (freeLists && freeLists[cls] && freeLists[cls].length > 0) {
         const base = freeLists[cls].pop();
         const allocSz = FREE_CLASSES[cls];
         dv.setUint32(base, allocSz, true);
@@ -263,7 +278,7 @@ export function createPionRuntime(options = {}) {
       setHeapPtr(base);
       return;
     }
-    const cls = FREE_CLASS_IDX.get(allocSz);
+    const cls = getFreeClassIdx(allocSz);
     if (cls !== undefined) {
       if (slabCtl > 0 && cls < 9) {
         const slotOff = slabCtl + cls * 4;
@@ -271,7 +286,10 @@ export function createPionRuntime(options = {}) {
         dv.setUint32(base + 8, head, true);
         dv.setUint32(slotOff, base >>> 0, true);
       } else {
-        freeLists[cls].push(base);
+        if (!freeLists) freeLists = new Array(FREE_CLASSES.length);
+        let fl = freeLists[cls];
+        if (!fl) fl = freeLists[cls] = [];
+        fl.push(base);
       }
     } else {
       let bucket = largeFree.get(allocSz);
@@ -1723,6 +1741,9 @@ export function createPionRuntime(options = {}) {
     return makePionStr("");
   }
   function pion_sha256_hex(s) {
+    if (!nodeCrypto && isNode) {
+      nodeCrypto = getBuiltin("node:crypto");
+    }
     if (nodeCrypto) {
       const ps = pNum(s);
       syncViews();
@@ -1863,7 +1884,25 @@ export function createPionRuntime(options = {}) {
   };
 }
 
+const SYNC_INSTANTIATE_LIMIT = 8 * 1024 * 1024;
+
+export function runWasmBytesSync(wasmBytes, args = [], options = {}) {
+  const rt = createPionRuntime({ ...options, args });
+  const mod = new WebAssembly.Module(wasmBytes);
+  const instance = new WebAssembly.Instance(mod, rt.imports);
+  rt.bindExports(instance.exports);
+  const mainFn = instance.exports.main || instance.exports._start || instance.exports.pion_main;
+  if (typeof mainFn !== "function") {
+    throw new Error("Wasm module does not export main()");
+  }
+  const rc = mainFn(args.length | 0, 0n);
+  return { exitCode: typeof rc === "number" ? rc : 0, runtime: rt, instance };
+}
+
 export async function runWasmBytes(wasmBytes, args = [], options = {}) {
+  if (IS_NODE_ENV && wasmBytes && wasmBytes.byteLength <= SYNC_INSTANTIATE_LIMIT) {
+    return runWasmBytesSync(wasmBytes, args, options);
+  }
   const rt = createPionRuntime({ ...options, args });
   const { instance } = await WebAssembly.instantiate(wasmBytes, rt.imports);
   rt.bindExports(instance.exports);
@@ -1876,31 +1915,63 @@ export async function runWasmBytes(wasmBytes, args = [], options = {}) {
 }
 
 export async function runWasmFile(wasmPath, args = [], options = {}) {
-  const fs = await import("node:fs");
-  const crypto = await import("node:crypto");
+  const fs = options.fs || getBuiltin("node:fs") || (await import("node:fs"));
   const wasmBytes = fs.readFileSync(wasmPath);
+  if (HAS_GET_BUILTIN) {
+    return runWasmBytes(wasmBytes, args, { fs, ...options });
+  }
+  const crypto = options.crypto || (await import("node:crypto"));
   return runWasmBytes(wasmBytes, args, { fs, crypto, ...options });
 }
 
 // CLI Runner: `node runtime/pion_wasm_rt.mjs <app.wasm> [args...]`
-if (typeof process !== "undefined" && process.versions && process.versions.node && process.argv[1]) {
-  const { fileURLToPath } = await import("node:url");
-  const { resolve } = await import("node:path");
-  const selfPath = resolve(fileURLToPath(import.meta.url));
-  const invokedPath = resolve(process.argv[1]);
-  if (selfPath === invokedPath) {
-    const wasmPath = process.argv[2];
-    if (!wasmPath) {
-      process.stderr.write("usage: node pion_wasm_rt.mjs <module.wasm> [args...]\n");
-      process.exit(2);
+if (IS_NODE_ENV && process.argv[1]) {
+  const urlMod = getBuiltin("node:url");
+  const pathMod = getBuiltin("node:path");
+  if (urlMod && pathMod) {
+    if (pathMod.resolve(urlMod.fileURLToPath(import.meta.url)) === pathMod.resolve(process.argv[1])) {
+      const wasmPath = process.argv[2];
+      if (!wasmPath) {
+        process.stderr.write("usage: node pion_wasm_rt.mjs <module.wasm> [args...]\n");
+        process.exit(2);
+      }
+      const progArgs = process.argv.slice(2);
+      try {
+        const fs = getBuiltin("node:fs");
+        const wasmBytes = fs.readFileSync(wasmPath);
+        if (wasmBytes.byteLength <= SYNC_INSTANTIATE_LIMIT) {
+          const { exitCode } = runWasmBytesSync(wasmBytes, progArgs, { fs });
+          process.exit(exitCode | 0);
+        } else {
+          runWasmBytes(wasmBytes, progArgs, { fs }).then(
+            ({ exitCode }) => process.exit(exitCode | 0),
+            (err) => {
+              process.stderr.write((err && err.stack ? err.stack : String(err)) + "\n");
+              process.exit(1);
+            },
+          );
+        }
+      } catch (err) {
+        process.stderr.write((err && err.stack ? err.stack : String(err)) + "\n");
+        process.exit(1);
+      }
     }
-    const progArgs = process.argv.slice(2);
-    try {
+  } else {
+    (async () => {
+      const { fileURLToPath } = await import("node:url");
+      const { resolve } = await import("node:path");
+      if (resolve(fileURLToPath(import.meta.url)) !== resolve(process.argv[1])) return;
+      const wasmPath = process.argv[2];
+      if (!wasmPath) {
+        process.stderr.write("usage: node pion_wasm_rt.mjs <module.wasm> [args...]\n");
+        process.exit(2);
+      }
+      const progArgs = process.argv.slice(2);
       const { exitCode } = await runWasmFile(wasmPath, progArgs);
       process.exit(exitCode | 0);
-    } catch (err) {
+    })().catch((err) => {
       process.stderr.write((err && err.stack ? err.stack : String(err)) + "\n");
       process.exit(1);
-    }
+    });
   }
 }
