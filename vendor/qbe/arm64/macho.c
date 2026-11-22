@@ -1459,6 +1459,45 @@ me_can_fuse_cbz(Blk *b, Fn *fn)
 	return 0;
 }
 
+static Ins *
+me_can_fuse_flag_cbz(Blk *b, Ins *cbz_ins, uint64_t live_out)
+{
+	Ins *p;
+
+	if (!cbz_ins)
+		return 0;
+	for (p = cbz_ins; p > b->ins;) {
+		--p;
+		if (p->op == Onop || p->op == Odbgloc)
+			continue;
+		if (INRANGE(p->op, Oflag, Oflag1)
+		&& req(p->to, cbz_ins->arg[0])
+		&& (live_out & BIT(p->to.val)) == 0)
+			return p;
+		return 0;
+	}
+	return 0;
+}
+
+static int
+me_mem_base_off(Ref r, Fn *fn, int *base_out, int64_t *off_out)
+{
+	if (rtype(r) == RTmp && isreg(r)) {
+		*base_out = r.val;
+		*off_out = 0;
+		return 1;
+	}
+	if (rtype(r) == RMem) {
+		Mem *m = &fn->mem[r.val];
+		if (isreg(m->base) && req(m->index, R) && m->offset.type == CBits) {
+			*base_out = m->base.val;
+			*off_out = m->offset.bits.i;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int
 me_w32_def_reg(const Ins *i, int cur_reg)
 {
@@ -1649,19 +1688,20 @@ arm64_macho_fn(Fn *fn)
 
 	uint64_t *gpr_out = me_compute_gpr_out(fn);
 	for (Blk *b = fn->start; b; b = b->link) {
-		Ins *cbz_ins = me_can_fuse_cbz(b, fn);
-		int last_w32 = -1;
 		uint64_t live_out = gpr_out[b->id];
+		Ins *cbz_ins = me_can_fuse_cbz(b, fn);
+		Ins *flag_ins = me_can_fuse_flag_cbz(b, cbz_ins, live_out);
+		int last_w32 = -1;
 		blk_off[b->id] = text_pos();
 		for (Ins *i = b->ins; i != &b->ins[b->nins]; i++) {
-			if (i == cbz_ins) {
+			if (i == cbz_ins || i == flag_ins) {
 				last_w32 = -1;
 				continue;
 			}
 			if (i->op == Oextuw && req(i->to, i->arg[0])
 			&& isreg(i->to) && i->to.val == last_w32)
 				continue;
-			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins
 			&& i->op == Omul && KBASE(i->cls) == 0
 			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
 				Ins *i1 = i + 1;
@@ -1700,14 +1740,15 @@ arm64_macho_fn(Fn *fn)
 					}
 				}
 			}
-			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
-			&& i->op == Oshl && KBASE(i->cls) == 0
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins
+			&& (i->op == Oshl || i->op == Oshr || i->op == Osar) && KBASE(i->cls) == 0
 			&& isreg(i->to) && isreg(i->arg[0]) && i->arg[0].val != SP
 			&& rtype(i->arg[1]) == RCon) {
 				Con *sc = &fn->con[i->arg[1].val];
 				if (sc->type == CBits) {
 					uint32_t maxsh = (i->cls == Kl) ? 63u : 31u;
 					uint32_t sh = (uint32_t)sc->bits.i & maxsh;
+					uint32_t sh_type = (i->op == Oshl) ? 0u : (i->op == Oshr ? 1u : 2u);
 					Ins *i1 = i + 1;
 					if (sh >= 1 && i1->cls == i->cls && isreg(i1->to) && i1->to.val != SP
 					&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to, live_out))) {
@@ -1716,8 +1757,9 @@ arm64_macho_fn(Fn *fn)
 						&& ((isreg(i1->arg[0]) && i1->arg[0].val != SP && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
 						 || (isreg(i1->arg[1]) && i1->arg[1].val != SP && req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)))) {
 							Ref ra = req(i1->arg[1], i->to) ? i1->arg[0] : i1->arg[1];
-							/* add rd, ra, rn, lsl #sh */
+							/* add rd, ra, rn, <lsl|lsr|asr> #sh */
 							emit_u32(0x0b000000u | (sf << 31)
+								| (sh_type << 22)
 								| (greg(i->arg[0].val) << 16)
 								| (sh << 10)
 								| (greg(ra.val) << 5)
@@ -1730,8 +1772,9 @@ arm64_macho_fn(Fn *fn)
 						}
 						if (i1->op == Osub && isreg(i1->arg[0]) && i1->arg[0].val != SP
 						&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
-							/* sub rd, ra, rn, lsl #sh */
+							/* sub rd, ra, rn, <lsl|lsr|asr> #sh */
 							emit_u32(0x4b000000u | (sf << 31)
+								| (sh_type << 22)
 								| (greg(i->arg[0].val) << 16)
 								| (sh << 10)
 								| (greg(i1->arg[0].val) << 5)
@@ -1745,7 +1788,60 @@ arm64_macho_fn(Fn *fn)
 					}
 				}
 			}
+			/* Pair adjacent 64-bit loads/stores into ldp/stp */
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins) {
+				Ins *i1 = i + 1;
+				int b0, b1;
+				int64_t o0, o1;
+				if (i->op == Oload && i1->op == Oload
+				&& i->cls == i1->cls && (i->cls == Kl || i->cls == Kd)
+				&& isreg(i->to) && isreg(i1->to)
+				&& i->to.val != SP && i1->to.val != SP
+				&& i->to.val != i1->to.val
+				&& me_mem_base_off(i->arg[0], fn, &b0, &o0)
+				&& me_mem_base_off(i1->arg[0], fn, &b1, &o1)
+				&& b0 == b1 && o1 == o0 + 8 && i->to.val != b0
+				&& (o0 & 7) == 0 && o0 >= -512 && o0 <= 504) {
+					uint32_t imm7 = (uint32_t)(o0 / 8) & 0x7fu;
+					if (i->cls == Kl)
+						emit_u32(0xa9400000u | (imm7 << 15)
+							| (greg(i1->to.val) << 10)
+							| (greg(b0) << 5)
+							| greg(i->to.val));
+					else
+						emit_u32(0x6d400000u | (imm7 << 15)
+							| (freg(i1->to.val) << 10)
+							| (greg(b0) << 5)
+							| freg(i->to.val));
+					if (last_w32 == i->to.val || last_w32 == i1->to.val)
+						last_w32 = -1;
+					i++;
+					continue;
+				}
+				if ((i->op == Ostorel || i->op == Ostored) && i1->op == i->op
+				&& isreg(i->arg[0]) && isreg(i1->arg[0])
+				&& i->arg[0].val != SP && i1->arg[0].val != SP
+				&& me_mem_base_off(i->arg[1], fn, &b0, &o0)
+				&& me_mem_base_off(i1->arg[1], fn, &b1, &o1)
+				&& b0 == b1 && o1 == o0 + 8
+				&& (o0 & 7) == 0 && o0 >= -512 && o0 <= 504) {
+					uint32_t imm7 = (uint32_t)(o0 / 8) & 0x7fu;
+					if (i->op == Ostorel)
+						emit_u32(0xa9000000u | (imm7 << 15)
+							| (greg(i1->arg[0].val) << 10)
+							| (greg(b0) << 5)
+							| greg(i->arg[0].val));
+					else
+						emit_u32(0x6d000000u | (imm7 << 15)
+							| (freg(i1->arg[0].val) << 10)
+							| (greg(b0) << 5)
+							| freg(i->arg[0].val));
+					i++;
+					continue;
+				}
+			}
 			if (i + 2 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 2 != cbz_ins
+			&& i + 1 != flag_ins && i + 2 != flag_ins
 			&& i->op == Oadd && KBASE(i->cls) == 0
 			&& isreg(i->to) && i->to.val != SP) {
 				Ref ra = R;
@@ -1893,7 +1989,13 @@ arm64_macho_fn(Fn *fn)
 			} else {
 				inv = 1;
 			}
-			if (cbz_ins) {
+			if (flag_ins) {
+				int fc = flag_ins->op - Oflag;
+				int fn_inv = (c == Cieq) ? (inv ^ 1) : inv;
+				uint32_t base = 0x54000000u | cmp_cc[fc][fn_inv];
+				me_add_fixup(&e, text_pos(), b->s2->id, base, 1);
+				emit_u32(base);
+			} else if (cbz_ins) {
 				int is_nz = (c == Cine) ^ inv;
 				uint32_t sf = KWIDE(cbz_ins->cls) ? 1u : 0u;
 				uint32_t rt = greg(cbz_ins->arg[0].val);

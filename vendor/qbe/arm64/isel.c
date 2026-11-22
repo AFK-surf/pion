@@ -220,6 +220,28 @@ selcmp_ex(Ref arg[2], int k, int eqne, Blk *b, Ins *cur, Fn *fn)
 				*d = (Ins){.op = Onop};
 				return 0;
 			}
+			/* Fuse `rem/urem t, x, +/-2^k; cmp t, #0` (eq/ne, single-use t) -> `tst x, #(2^k - 1)` */
+			if (d && (d->op == Orem || d->op == Ourem) && d->cls == k
+			&& fn->tmp[arg[0].val].nuse == 1 && rtype(d->arg[1]) == RCon) {
+				Con *dc = &fn->con[d->arg[1].val];
+				if (dc->type == CBits) {
+					int64_t dv = KWIDE(k) ? dc->bits.i : (int64_t)(int32_t)dc->bits.i;
+					uint64_t ad = (d->op == Ourem)
+						? (KWIDE(k) ? (uint64_t)dc->bits.i : (uint64_t)(uint32_t)dc->bits.i)
+						: (dv < 0 ? (uint64_t)(-(dv + 1)) + 1ULL : (uint64_t)dv);
+					if (ad >= 2 && (ad & (ad - 1)) == 0) {
+						uint64_t mask = ad - 1;
+						if (arm64_logimm((int64_t)mask, k)) {
+							emit(Oatst, k, R, d->arg[0], getcon((int64_t)mask, fn));
+							iarg = curi->arg;
+							fixarg(&iarg[0], k, 0, fn);
+							chuse(arg[0], -1, fn);
+							*d = (Ins){.op = Onop};
+							return 0;
+						}
+					}
+				}
+			}
 		}
 	}
 	fix = 1;
@@ -979,6 +1001,61 @@ arm64_hoist_consts(Fn *fn)
 			if (fn->tmp[i->to.val].slot != -1 || fn->tmp[i->to.val].ndef != 1)
 				continue;
 			c = &fn->con[i->arg[0].val];
+			/* Hoist read-only FP constant-pool loads: Ocopy addr, CAddr(".LfpN") + Oload dst, addr */
+			if (is_int && i->cls == Kl && c->type == CAddr && c->bits.i == 0
+			&& k + 1 < b->nins && b->ins[k + 1].op == Oload
+			&& KBASE(b->ins[k + 1].cls) == 1
+			&& req(b->ins[k + 1].arg[0], i->to)
+			&& rtype(b->ins[k + 1].to) == RTmp && !isreg(b->ins[k + 1].to)
+			&& fn->tmp[i->to.val].nuse == 1
+			&& fn->tmp[b->ins[k + 1].to.val].slot == -1
+			&& fn->tmp[b->ins[k + 1].to.val].ndef == 1) {
+				char *sname = str(c->sym.id);
+				size_t alen = strlen(T.asloc);
+				if (sname[0] == '"' && strncmp(sname + 1, T.asloc, alen) == 0
+				&& strncmp(sname + 1 + alen, "fp", 2) == 0) {
+					d = 0;
+					bestloop = (uint)b->loop;
+					for (p = b->idom; p; p = p->idom) {
+						if ((uint)p->loop < bestloop) {
+							bestloop = (uint)p->loop;
+							d = p;
+							if (bestloop == 1)
+								break;
+						}
+					}
+					if (d && nhoist_fp[d->id] < 8) {
+						Ins ins0 = *i;
+						Ins ins1 = b->ins[k + 1];
+						pos = d->nins;
+						while (pos > 0) {
+							int op = d->ins[pos - 1].op;
+							if (op == Oacmp || op == Oacmn || op == Oatst || op == Oafcmp
+							 || INRANGE(op, Oflag, Oflag1)
+							 || isxsel(op))
+								pos--;
+							else
+								break;
+						}
+						vgrow(&d->ins, d->nins + 2);
+						if (pos < d->nins)
+							memmove(&d->ins[pos + 2], &d->ins[pos],
+								(d->nins - pos) * sizeof(Ins));
+						d->ins[pos] = ins0;
+						d->ins[pos + 1] = ins1;
+						d->nins += 2;
+						nhoist_fp[d->id]++;
+						fn->tmp[ins0.to.val].bid = d->id;
+						fn->tmp[ins0.to.val].def = &d->ins[pos];
+						fn->tmp[ins1.to.val].bid = d->id;
+						fn->tmp[ins1.to.val].def = &d->ins[pos + 1];
+						b->ins[k] = (Ins){.op = Onop};
+						b->ins[k + 1] = (Ins){.op = Onop};
+						k++;
+						continue;
+					}
+				}
+			}
 			if (c->type != CBits || c->bits.i == 0)
 				continue;
 			if (is_int) {

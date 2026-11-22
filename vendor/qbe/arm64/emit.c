@@ -647,6 +647,45 @@ can_fuse_cbz(Blk *b, Fn *fn)
 	return 0;
 }
 
+static Ins *
+can_fuse_flag_cbz(Blk *b, Ins *cbz_ins, uint64_t live_out)
+{
+	Ins *p;
+
+	if (!cbz_ins)
+		return 0;
+	for (p = cbz_ins; p > b->ins;) {
+		--p;
+		if (p->op == Onop || p->op == Odbgloc)
+			continue;
+		if (INRANGE(p->op, Oflag, Oflag1)
+		&& req(p->to, cbz_ins->arg[0])
+		&& (live_out & BIT(p->to.val)) == 0)
+			return p;
+		return 0;
+	}
+	return 0;
+}
+
+static int
+arm64_mem_base_off(Ref r, Fn *fn, int *base_out, int64_t *off_out)
+{
+	if (rtype(r) == RTmp && isreg(r)) {
+		*base_out = r.val;
+		*off_out = 0;
+		return 1;
+	}
+	if (rtype(r) == RMem) {
+		Mem *m = &fn->mem[r.val];
+		if (isreg(m->base) && req(m->index, R) && m->offset.type == CBits) {
+			*base_out = m->base.val;
+			*off_out = m->offset.bits.i;
+			return 1;
+		}
+	}
+	return 0;
+}
+
 static int
 w32_def_reg(const Ins *i, int cur_reg)
 {
@@ -869,20 +908,21 @@ arm64_emitfn(Fn *fn, FILE *out)
 
 	uint64_t *gpr_out = arm64_compute_gpr_out(e->fn);
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
-		Ins *cbz_ins = can_fuse_cbz(b, e->fn);
-		int last_w32 = -1;
 		uint64_t live_out = gpr_out[b->id];
+		Ins *cbz_ins = can_fuse_cbz(b, e->fn);
+		Ins *flag_ins = can_fuse_flag_cbz(b, cbz_ins, live_out);
+		int last_w32 = -1;
 		if (lbl || b->npred > 1)
 			fprintf(e->f, "%s%d:\n", T.asloc, id0+b->id);
 		for (i=b->ins; i!=&b->ins[b->nins]; i++) {
-			if (i == cbz_ins) {
+			if (i == cbz_ins || i == flag_ins) {
 				last_w32 = -1;
 				continue;
 			}
 			if (i->op == Oextuw && req(i->to, i->arg[0])
 			&& isreg(i->to) && i->to.val == last_w32)
 				continue;
-			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins
 			&& i->op == Omul && KBASE(i->cls) == 0
 			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
 				Ins *i1 = i + 1;
@@ -920,14 +960,16 @@ arm64_emitfn(Fn *fn, FILE *out)
 					}
 				}
 			}
-			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins
-			&& i->op == Oshl && KBASE(i->cls) == 0
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins
+			&& (i->op == Oshl || i->op == Oshr || i->op == Osar) && KBASE(i->cls) == 0
 			&& isreg(i->to) && isreg(i->arg[0]) && i->arg[0].val != SP
 			&& rtype(i->arg[1]) == RCon) {
 				Con *sc = &fn->con[i->arg[1].val];
 				if (sc->type == CBits) {
 					uint maxsh = (i->cls == Kl) ? 63u : 31u;
 					uint sh = (uint)sc->bits.i & maxsh;
+					const char *shname = (i->op == Oshl) ? "lsl"
+						: (i->op == Oshr ? "lsr" : "asr");
 					Ins *i1 = i + 1;
 					if (sh >= 1 && i1->cls == i->cls && isreg(i1->to) && i1->to.val != SP
 					&& (req(i1->to, i->to) || arm64_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to, live_out))) {
@@ -939,7 +981,7 @@ arm64_emitfn(Fn *fn, FILE *out)
 							strcpy(rd, rname(i1->to.val, i1->cls));
 							strcpy(rbase, rname(ra_ref.val, i->cls));
 							strcpy(rsh, rname(i->arg[0].val, i->cls));
-							fprintf(e->f, "\tadd\t%s, %s, %s, lsl #%u\n", rd, rbase, rsh, sh);
+							fprintf(e->f, "\tadd\t%s, %s, %s, %s #%u\n", rd, rbase, rsh, shname, sh);
 							if (last_w32 == i->to.val)
 								last_w32 = -1;
 							last_w32 = w32_def_reg(i1, last_w32);
@@ -952,7 +994,7 @@ arm64_emitfn(Fn *fn, FILE *out)
 							strcpy(rd, rname(i1->to.val, i1->cls));
 							strcpy(rbase, rname(i1->arg[0].val, i->cls));
 							strcpy(rsh, rname(i->arg[0].val, i->cls));
-							fprintf(e->f, "\tsub\t%s, %s, %s, lsl #%u\n", rd, rbase, rsh, sh);
+							fprintf(e->f, "\tsub\t%s, %s, %s, %s #%u\n", rd, rbase, rsh, shname, sh);
 							if (last_w32 == i->to.val)
 								last_w32 = -1;
 							last_w32 = w32_def_reg(i1, last_w32);
@@ -962,7 +1004,55 @@ arm64_emitfn(Fn *fn, FILE *out)
 					}
 				}
 			}
+			/* Pair adjacent 64-bit loads/stores into ldp/stp */
+			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins) {
+				Ins *i1 = i + 1;
+				int b0, b1;
+				int64_t o0, o1;
+				if (i->op == Oload && i1->op == Oload
+				&& i->cls == i1->cls && (i->cls == Kl || i->cls == Kd)
+				&& isreg(i->to) && isreg(i1->to)
+				&& i->to.val != SP && i1->to.val != SP
+				&& i->to.val != i1->to.val
+				&& arm64_mem_base_off(i->arg[0], fn, &b0, &o0)
+				&& arm64_mem_base_off(i1->arg[0], fn, &b1, &o1)
+				&& b0 == b1 && o1 == o0 + 8 && i->to.val != b0
+				&& (o0 & 7) == 0 && o0 >= -512 && o0 <= 504) {
+					char r1[4], r2[4], rb[4];
+					strcpy(r1, rname(i->to.val, i->cls));
+					strcpy(r2, rname(i1->to.val, i1->cls));
+					strcpy(rb, rname(b0, Kl));
+					if (o0 == 0)
+						fprintf(e->f, "\tldp\t%s, %s, [%s]\n", r1, r2, rb);
+					else
+						fprintf(e->f, "\tldp\t%s, %s, [%s, #%"PRIi64"]\n", r1, r2, rb, o0);
+					if (last_w32 == i->to.val || last_w32 == i1->to.val)
+						last_w32 = -1;
+					i++;
+					continue;
+				}
+				if ((i->op == Ostorel || i->op == Ostored) && i1->op == i->op
+				&& isreg(i->arg[0]) && isreg(i1->arg[0])
+				&& i->arg[0].val != SP && i1->arg[0].val != SP
+				&& arm64_mem_base_off(i->arg[1], fn, &b0, &o0)
+				&& arm64_mem_base_off(i1->arg[1], fn, &b1, &o1)
+				&& b0 == b1 && o1 == o0 + 8
+				&& (o0 & 7) == 0 && o0 >= -512 && o0 <= 504) {
+					int sc = (i->op == Ostored) ? Kd : Kl;
+					char r1[4], r2[4], rb[4];
+					strcpy(r1, rname(i->arg[0].val, sc));
+					strcpy(r2, rname(i1->arg[0].val, sc));
+					strcpy(rb, rname(b0, Kl));
+					if (o0 == 0)
+						fprintf(e->f, "\tstp\t%s, %s, [%s]\n", r1, r2, rb);
+					else
+						fprintf(e->f, "\tstp\t%s, %s, [%s, #%"PRIi64"]\n", r1, r2, rb, o0);
+					i++;
+					continue;
+				}
+			}
 			if (i + 2 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 2 != cbz_ins
+			&& i + 1 != flag_ins && i + 2 != flag_ins
 			&& i->op == Oadd && KBASE(i->cls) == 0
 			&& isreg(i->to) && i->to.val != SP) {
 				Ref ra = R;
@@ -1127,7 +1217,14 @@ arm64_emitfn(Fn *fn, FILE *out)
 				n = 0;
 			} else
 				n = 1;
-			if (cbz_ins) {
+			if (flag_ins) {
+				int fc = flag_ins->op - Oflag;
+				int fn_inv = (c == Cieq) ? (n ^ 1) : n;
+				fprintf(e->f,
+					"\tb%s\t%s%d\n",
+					ctoa[fc][fn_inv], T.asloc, id0+b->s2->id
+				);
+			} else if (cbz_ins) {
 				int is_nz = (c == Cine) ^ n;
 				fprintf(e->f,
 					"\t%s\t%s, %s%d\n",

@@ -1523,7 +1523,7 @@ void pion_strbuf_push_int(void *sb_ptr, int64_t v) {
     char *p = pion_fmt_i64_end(v, end);
     size_t n = (size_t)(end - p);
     pion_strbuf_reserve(sb, (int64_t)n);
-    memcpy(sb->data + sb->len, p, n);
+    pion_copy_short(sb->data + sb->len, p, n);
     sb->len += (int64_t)n;
     sb->data[sb->len] = '\0';
 }
