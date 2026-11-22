@@ -3378,21 +3378,20 @@ fn wasm_emit_inst(
 
 ///|
 /// Opt 2: Structured CFG analysis & lowering (DAG + properly-nested natural loops).
-/// Returns loop_end[bi] >= 0 for each loop header bi, or empty array if CFG is irreducible.
+/// Returns loop_end[bi] >= 0 for reachable loop headers, -1 for reachable non-headers,
+/// -2 for unreachable dead blocks, or empty array if reachable CFG is irreducible.
 fn wasm_analyze_structured_cfg(f : WasmFunc, block_idx : Map[String, Int]) -> Array[Int] {
   let nb = f.blocks.length()
   let loop_end : Array[Int] = []
+  let blk_e0 : Array[Int] = []
+  let blk_e1 : Array[Int] = []
+  let all_v : Array[Int] = []
+  let reach : Array[Bool] = []
   let mut bi = 0
   while bi < nb {
     loop_end.push(-1)
-    bi = bi + 1
-  }
-
-  // Pass 1: collect all CFG edges and find loop_end[hdr] for back-edges (dst <= src)
-  let edge_u : Array[Int] = []
-  let edge_v : Array[Int] = []
-  bi = 0
-  while bi < nb {
+    reach.push(false)
+    blk_e0.push(all_v.length())
     let insts = f.blocks[bi].insts
     let mut terminated = false
     let mut ii = 0
@@ -3402,35 +3401,17 @@ fn wasm_analyze_structured_cfg(f : WasmFunc, block_idx : Map[String, Int]) -> Ar
       if op == "jmp" && inst.args.length() > 0 {
         terminated = true
         match block_idx.get(inst.args[0]) {
-          Some(tidx) => {
-            edge_u.push(bi)
-            edge_v.push(tidx)
-            if tidx <= bi && bi > loop_end[tidx] {
-              loop_end[tidx] = bi
-            }
-          }
+          Some(tidx) => all_v.push(tidx)
           None => ()
         }
       } else if op == "jnz" && inst.args.length() >= 3 {
         terminated = true
         match block_idx.get(inst.args[1]) {
-          Some(t1) => {
-            edge_u.push(bi)
-            edge_v.push(t1)
-            if t1 <= bi && bi > loop_end[t1] {
-              loop_end[t1] = bi
-            }
-          }
+          Some(t1) => all_v.push(t1)
           None => ()
         }
         match block_idx.get(inst.args[2]) {
-          Some(t2) => {
-            edge_u.push(bi)
-            edge_v.push(t2)
-            if t2 <= bi && bi > loop_end[t2] {
-              loop_end[t2] = bi
-            }
-          }
+          Some(t2) => all_v.push(t2)
           None => ()
         }
       } else if op == "jtbl" && inst.args.length() >= 2 {
@@ -3438,13 +3419,7 @@ fn wasm_analyze_structured_cfg(f : WasmFunc, block_idx : Map[String, Int]) -> Ar
         let mut ai = 1
         while ai < inst.args.length() {
           match block_idx.get(inst.args[ai]) {
-            Some(ti) => {
-              edge_u.push(bi)
-              edge_v.push(ti)
-              if ti <= bi && bi > loop_end[ti] {
-                loop_end[ti] = bi
-              }
-            }
+            Some(ti) => all_v.push(ti)
             None => ()
           }
           ai = ai + 1
@@ -3455,8 +3430,52 @@ fn wasm_analyze_structured_cfg(f : WasmFunc, block_idx : Map[String, Int]) -> Ar
       ii = ii + 1
     }
     if !terminated && bi + 1 < nb {
-      edge_u.push(bi)
-      edge_v.push(bi + 1)
+      all_v.push(bi + 1)
+    }
+    blk_e1.push(all_v.length())
+    bi = bi + 1
+  }
+
+  // BFS reachability from entry block 0 so unreachable dead blocks cannot pollute CFG edges
+  if nb > 0 {
+    let queue : Array[Int] = [0]
+    reach[0] = true
+    let mut qi = 0
+    while qi < queue.length() {
+      let u = queue[qi]
+      qi = qi + 1
+      let mut ei = blk_e0[u]
+      let e1 = blk_e1[u]
+      while ei < e1 {
+        let v = all_v[ei]
+        if !reach[v] {
+          reach[v] = true
+          queue.push(v)
+        }
+        ei = ei + 1
+      }
+    }
+  }
+
+  // Pass 1: collect reachable CFG edges and find loop_end[hdr] for back-edges (dst <= src)
+  let edge_u : Array[Int] = []
+  let edge_v : Array[Int] = []
+  bi = 0
+  while bi < nb {
+    if !reach[bi] {
+      loop_end[bi] = -2
+    } else {
+      let mut ei = blk_e0[bi]
+      let e1 = blk_e1[bi]
+      while ei < e1 {
+        let v = all_v[ei]
+        edge_u.push(bi)
+        edge_v.push(v)
+        if v <= bi && bi > loop_end[v] {
+          loop_end[v] = bi
+        }
+        ei = ei + 1
+      }
     }
     bi = bi + 1
   }
@@ -3793,6 +3812,8 @@ fn wasm_emit_structured_region(
       code.push(0x0B) // end loop $L_hdr
       let _ = scope_is_loop.pop()
       let _ = scope_target.pop()
+    } else if loop_end[item_start[idx]] == -2 {
+      code.push(0x00) // unreachable dead block
     } else {
       wasm_emit_structured_block(ctx, fctx, f, code, item_start[idx], scope_is_loop, scope_target)
     }
@@ -5235,19 +5256,10 @@ fn wasm_build_rc_dec_body(slow_imp_idx : Int) -> Array[Int] {
   body.push(0x04); body.push(0x40)
   body.push(0x0F)
   body.push(0x0B)
-  // if (owner_tid == 0) { rc = shared_rc - 1; shared_rc = rc } else { rc = local_rc - 1; local_rc = rc }
+  // Hot path first: if (owner_tid != 0) { rc = local_rc - 1; local_rc = rc } else { rc = shared_rc - 1; shared_rc = rc }
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x45)
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 1)
-  body.push(0x20); wasm_push_u32(body, 1)
-  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
-  body.push(0x41); wasm_push_s32(body, 1)
-  body.push(0x6B)
-  body.push(0x22); wasm_push_u32(body, 2) // local.tee 2 (rc)
-  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
-  body.push(0x05)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
@@ -5255,6 +5267,14 @@ fn wasm_build_rc_dec_body(slow_imp_idx : Int) -> Array[Int] {
   body.push(0x6B)
   body.push(0x22); wasm_push_u32(body, 2) // local.tee 2 (rc)
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 2) // local.tee 2 (rc)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
   body.push(0x0B)
   // if (rc == 0) call $pion_rc_dec_slow(ptr)
   body.push(0x20); wasm_push_u32(body, 2)
@@ -5298,11 +5318,12 @@ fn wasm_build_alloc_body(slow_imp_idx : Int, zero_payload : Bool) -> Array[Int] 
   body.push(0x21); wasm_push_u32(body, 3) // local.set 3 (need)
 
   // Map need -> (cls, alloc_sz) for FREE_CLASSES[0..8] = [32, 48, 64, 96, 128, 192, 256, 384, 512]
+  // Fast path: need <= 48 covers >90% of allocations (binary_trees / map_count / json) in 1-2 compares.
   body.push(0x20); wasm_push_u32(body, 3)
-  body.push(0x41); wasm_push_s32(body, 64)
+  body.push(0x41); wasm_push_s32(body, 48)
   body.push(0x4D) // i32.le_u
   body.push(0x04); body.push(0x40)
-  // need <= 64
+  // need <= 48: 32 -> 0, 48 -> 1
   body.push(0x20); wasm_push_u32(body, 3)
   body.push(0x41); wasm_push_s32(body, 32)
   body.push(0x4D)
@@ -5310,24 +5331,23 @@ fn wasm_build_alloc_body(slow_imp_idx : Int, zero_payload : Bool) -> Array[Int] 
   body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 32); body.push(0x21); wasm_push_u32(body, 5)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 3)
-  body.push(0x41); wasm_push_s32(body, 48)
-  body.push(0x4D)
-  body.push(0x04); body.push(0x40)
   body.push(0x41); wasm_push_s32(body, 1); body.push(0x21); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 48); body.push(0x21); wasm_push_u32(body, 5)
-  body.push(0x05)
-  body.push(0x41); wasm_push_s32(body, 2); body.push(0x21); wasm_push_u32(body, 4)
-  body.push(0x41); wasm_push_s32(body, 64); body.push(0x21); wasm_push_u32(body, 5)
-  body.push(0x0B)
   body.push(0x0B)
   body.push(0x05)
-  // need > 64
+  // need > 48: binary search [64, 96, 128] vs [192, 256, 384, 512]
   body.push(0x20); wasm_push_u32(body, 3)
-  body.push(0x41); wasm_push_s32(body, 192)
+  body.push(0x41); wasm_push_s32(body, 128)
   body.push(0x4D)
   body.push(0x04); body.push(0x40)
-  // 65..192
+  // 56..128
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x41); wasm_push_s32(body, 64)
+  body.push(0x4D)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x41); wasm_push_s32(body, 64); body.push(0x21); wasm_push_u32(body, 5)
+  body.push(0x05)
   body.push(0x20); wasm_push_u32(body, 3)
   body.push(0x41); wasm_push_s32(body, 96)
   body.push(0x4D)
@@ -5335,26 +5355,29 @@ fn wasm_build_alloc_body(slow_imp_idx : Int, zero_payload : Bool) -> Array[Int] 
   body.push(0x41); wasm_push_s32(body, 3); body.push(0x21); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 96); body.push(0x21); wasm_push_u32(body, 5)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 3)
-  body.push(0x41); wasm_push_s32(body, 128)
-  body.push(0x4D)
-  body.push(0x04); body.push(0x40)
   body.push(0x41); wasm_push_s32(body, 4); body.push(0x21); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 128); body.push(0x21); wasm_push_u32(body, 5)
-  body.push(0x05)
-  body.push(0x41); wasm_push_s32(body, 5); body.push(0x21); wasm_push_u32(body, 4)
-  body.push(0x41); wasm_push_s32(body, 192); body.push(0x21); wasm_push_u32(body, 5)
   body.push(0x0B)
   body.push(0x0B)
   body.push(0x05)
-  // 193..512
+  // 136..512
   body.push(0x20); wasm_push_u32(body, 3)
   body.push(0x41); wasm_push_s32(body, 256)
   body.push(0x4D)
   body.push(0x04); body.push(0x40)
+  // 136..256
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x41); wasm_push_s32(body, 192)
+  body.push(0x4D)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 5); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x41); wasm_push_s32(body, 192); body.push(0x21); wasm_push_u32(body, 5)
+  body.push(0x05)
   body.push(0x41); wasm_push_s32(body, 6); body.push(0x21); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 256); body.push(0x21); wasm_push_u32(body, 5)
+  body.push(0x0B)
   body.push(0x05)
+  // 264..512
   body.push(0x20); wasm_push_u32(body, 3)
   body.push(0x41); wasm_push_s32(body, 384)
   body.push(0x4D)
@@ -5425,7 +5448,7 @@ fn wasm_build_alloc_body(slow_imp_idx : Int, zero_payload : Bool) -> Array[Int] 
   //   base+8:  owner_tid = 1
   //   base+12: local_rc = 1
   //   base+16: shared_rc = 0
-  //   base+20: type_tag:u16 | (flags=0 << 16)
+  //   base+20: type_tag:u16 | ((FLAG_SLAB(0x10) | (cls << 8)) << 16)
   //   base+24: drop_fn:i64
   body.push(0x20); wasm_push_u32(body, 6)
   body.push(0x41); wasm_push_s32(body, 1)
@@ -5439,7 +5462,13 @@ fn wasm_build_alloc_body(slow_imp_idx : Int, zero_payload : Bool) -> Array[Int] 
   body.push(0x20); wasm_push_u32(body, 6)
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x41); wasm_push_s32(body, 0xFFFF)
-  body.push(0x71)
+  body.push(0x71) // i32.and
+  body.push(0x41); wasm_push_s32(body, 0x100000) // FLAG_SLAB(0x10) << 16
+  body.push(0x72) // i32.or
+  body.push(0x20); wasm_push_u32(body, 4) // cls
+  body.push(0x41); wasm_push_s32(body, 24)
+  body.push(0x74) // i32.shl
+  body.push(0x72) // i32.or
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 20)
   body.push(0x20); wasm_push_u32(body, 6)
   body.push(0x20); wasm_push_u32(body, 2)
@@ -5564,28 +5593,70 @@ fn wasm_build_raw_free_slab_body() -> Array[Int] {
   body.push(0x0F)
   body.push(0x0B)
 
-  // Exact match alloc_sz -> cls in [0..8] for [32, 48, 64, 96, 128, 192, 256, 384, 512], else -1
+  // Exact match alloc_sz -> cls in [0..8] for [32, 48, 64, 96, 128, 192, 256, 384, 512] via binary search, else -1
   body.push(0x41); wasm_push_s32(body, -1)
   body.push(0x21); wasm_push_u32(body, 4) // cls = -1
-  let class_sizes : Array[Int] = [32, 48, 64, 96, 128, 192, 256, 384, 512]
-  let mut ci = 0
-  while ci < class_sizes.length() {
-    body.push(0x20); wasm_push_u32(body, 3)
-    body.push(0x41); wasm_push_s32(body, class_sizes[ci])
-    body.push(0x46) // i32.eq
-    body.push(0x04); body.push(0x40)
-    body.push(0x41); wasm_push_s32(body, ci)
-    body.push(0x21); wasm_push_u32(body, 4)
-    if ci + 1 < class_sizes.length() {
-      body.push(0x05)
-    }
-    ci = ci + 1
-  }
-  ci = 0
-  while ci < class_sizes.length() {
-    body.push(0x0B)
-    ci = ci + 1
-  }
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x41); wasm_push_s32(body, 128)
+  body.push(0x4D) // i32.le_u
+  body.push(0x04); body.push(0x40)
+  // <= 128: [32, 48] vs [64, 96, 128]
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x41); wasm_push_s32(body, 48)
+  body.push(0x4D)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 32); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 48); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 64); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 96); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 3); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 128); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 4); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x05)
+  // > 128: [192, 256] vs [384, 512]
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x41); wasm_push_s32(body, 256)
+  body.push(0x4D)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 192); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 5); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 256); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 6); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 384); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 7); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 512); body.push(0x46)
+  body.push(0x04); body.push(0x40)
+  body.push(0x41); wasm_push_s32(body, 8); body.push(0x21); wasm_push_u32(body, 4)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
 
   // if (cls < 0) return 0
   body.push(0x20); wasm_push_u32(body, 4)
@@ -5689,6 +5760,53 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x20); wasm_push_u32(body, 0)
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x11); wasm_push_u32(body, drop_sig_idx); body.push(0x00)
+  body.push(0x0B)
+
+  // P44-A: Inline Slab free fast path for TAG_STRING(1), TAG_STRUCT(4), TAG_ENUM(5) (no backing buffer)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 4); body.push(0x46)
+  body.push(0x72) // i32.or
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 5); body.push(0x46)
+  body.push(0x72) // i32.or
+  body.push(0x04); body.push(0x40)
+  // flags = i32.load16_u(hdr + 14); if ((flags & FLAG_SLAB(0x10)) != 0)
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
+  body.push(0x22); wasm_push_u32(body, 4) // local.tee 4 (flags)
+  body.push(0x41); wasm_push_s32(body, 0x10)
+  body.push(0x71) // i32.and
+  body.push(0x04); body.push(0x40)
+  // base = hdr - 8 (local 6)
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x41); wasm_push_s32(body, 8)
+  body.push(0x6B)
+  body.push(0x21); wasm_push_u32(body, 6)
+  // slot = global.get(2) + (((flags >> 8) & 15) << 2) (local 7)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x41); wasm_push_s32(body, 8)
+  body.push(0x76) // i32.shr_u
+  body.push(0x41); wasm_push_s32(body, 15)
+  body.push(0x71) // i32.and
+  body.push(0x41); wasm_push_s32(body, 2)
+  body.push(0x74) // i32.shl
+  body.push(0x6A) // i32.add
+  body.push(0x21); wasm_push_u32(body, 7)
+  // i32.store(base + 4, FREE_MAGIC(0x46524545))
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x41); wasm_push_s32(body, 0x46524545)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  // i32.store(base + 8, i32.load(slot))
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  // i32.store(slot, base); return
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x0F)
+  body.push(0x0B)
   body.push(0x0B)
 
   // Container-specific cleanup: TAG_ARRAY (3), TAG_MAP (7), TAG_BYTES (2) | TAG_STRBUF (11)

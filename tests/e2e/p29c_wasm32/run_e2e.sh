@@ -2175,4 +2175,152 @@ console.log("  p42c_wasm_opts (" + mode + "/" + rtLabel + "): out=" + out + " OK
 done
 done
 
+echo "=== P44-A: Inline FLAG_SLAB Free + Recursive drop_fn + Container Mix + >512B Fallback (Node + Web leaked=0) ==="
+cat > "$TMP_DIR/p44a_slab_inline_free.pion" <<'EOF'
+enum Tree {
+  Leaf(Int)
+  Branch(Tree, Tree, String)
+}
+
+struct Holder {
+  tag : String
+  tree : Tree
+  nums : Array[Int]
+}
+
+fn build_tree(depth : Int, seed : Int) -> Tree {
+  if depth <= 0 {
+    Tree::Leaf(seed)
+  } else {
+    let l = build_tree(depth - 1, seed + 1)
+    let r = build_tree(depth - 1, seed + 2)
+    Tree::Branch(l, r, "n" + seed.to_string())
+  }
+}
+
+fn sum_tree(t : Tree) -> Int {
+  match t {
+    Tree::Leaf(v) => v
+    Tree::Branch(l, r, s) => sum_tree(l) + sum_tree(r) + s.length()
+  }
+}
+
+pub fn main(world : World) -> Int {
+  let mut acc = 0
+  // 1. High-volume alloc/free/reuse of TAG_STRING, TAG_STRUCT, TAG_ENUM (with recursive drop_fn)
+  let mut i = 0
+  while i < 60 {
+    let t = build_tree(8, i)
+    let h = Holder::{ tag: "h:" + i.to_string(), tree: t, nums: [i, i + 1, i + 2, i + 3] }
+    acc = acc + sum_tree(h.tree) + h.tag.length() + h.nums[3]
+    i = i + 1
+  }
+
+  // 2. Container mix (Array[String] + Map[String, Holder]) exercising slab + container drop
+  let m : Map[String, Holder] = Map::new()
+  let arr : Array[String] = []
+  let mut j = 0
+  while j < 40 {
+    let k = "k_" + j.to_string()
+    arr.push(k)
+    m.set(k, Holder::{ tag: k, tree: build_tree(4, j), nums: [j, j * 2] })
+    j = j + 1
+  }
+  acc = acc + m.length() + arr.length()
+
+  // 3. Large >512B String & Array objects falling back to JS slow path
+  let mut k = 0
+  while k < 30 {
+    let sb = StringBuilder()
+    let mut c = 0
+    while c < 120 {
+      sb.write_string("0123456789")
+      c = c + 1
+    }
+    let big_s = sb.to_string() // 1200B (>512B)
+    let big_a : Array[Int] = Array::make(256, k) // 2048B (>512B)
+    acc = acc + big_s.length() + big_a[0]
+    k = k + 1
+  }
+
+  io_println(world, "p44a_slab_ok:" + acc.to_string())
+  0
+}
+EOF
+P44A_REL_WASM="$TMP_DIR/p44a_slab_rel.wasm"
+P44A_DEV_WASM="$TMP_DIR/p44a_slab_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P44A_REL_WASM" "$TMP_DIR/p44a_slab_inline_free.pion"
+"$PIONC" build --target wasm32 -o "$P44A_DEV_WASM" "$TMP_DIR/p44a_slab_inline_free.pion"
+for mode_wasm in "release:$P44A_REL_WASM" "dev:$P44A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p44a_slab failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || !out.startsWith("p44a_slab_ok:")) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p44a_slab bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p44a_slab memory grew too large:", memBytes);
+  process.exit(1);
+}
+// Walk linear memory heap from heap_base to heap_ptr and verify 0 leaked non-immortal blocks
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb;
+let leaked = 0;
+let freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz, "hp=", hp);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    // Check FLAG_IMMORTAL (2) at hdr+14 (cur+22) if block holds a PionHeader
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p44a_slab leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p44a_slab (" + mode + "/" + rtLabel + "): " + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
