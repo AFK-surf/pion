@@ -2040,6 +2040,7 @@ struct WasmFnCtx {
   mut div_tmp_i64 : Int
   mut alloc_tmp_i32 : Int
   mut alloc_tmp2_i32 : Int
+  mut push_tmp_i64 : Int
   mut last_set_pos : Int
   mut last_set_end : Int
   mut last_set_sym : String
@@ -2880,7 +2881,7 @@ fn wasm_emit_inst(
               idx
             }
             fctx.last_set_pos = -1
-            // P51-A: Inline Slab freelist pop OR bump-pointer alloc (hp + blk_sz <= heap_end)
+            // P51-A/P52-A: Compact inline Slab freelist pop OR bump-pointer alloc (hp + blk_sz <= heap_end)
             // global.get 2 is immutable slab_ctl_addr (>= WASM_DATA_BASE); linear memory is zero-init
             code.push(0x23); wasm_push_u32(code, 2)
             code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, slot_off)
@@ -2943,6 +2944,60 @@ fn wasm_emit_inst(
             wasm_emit_set_local(fctx, code, inst.dst, WASM_TY_I64)
             return false
           }
+        }
+        None => ()
+      }
+    }
+    // P52-A: Inline `len < cap && stride != 1` fast path for `pion_arr_push_owned(arr, val)`
+    if callee == "$pion_arr_push_owned" && inst.args.length() >= 3 && inst.dst.length() == 0 {
+      match ctx.internal_map.get("pion_arr_push_owned") {
+        Some(arr_po_fidx) => {
+          let p_lidx = if fctx.alloc_tmp_i32 >= 0 {
+            fctx.alloc_tmp_i32
+          } else {
+            let idx = wasm_fn_alloc_local(fctx, WASM_TY_I32)
+            fctx.alloc_tmp_i32 = idx
+            idx
+          }
+          let len_lidx = if fctx.push_tmp_i64 >= 0 {
+            fctx.push_tmp_i64
+          } else {
+            let idx = wasm_fn_alloc_local(fctx, WASM_TY_I64)
+            fctx.push_tmp_i64 = idx
+            idx
+          }
+          fctx.last_set_pos = -1
+          wasm_emit_operand(ctx, fctx, code, inst.args[1], WASM_TY_I64)
+          code.push(0xA7) // i32.wrap_i64 -> p
+          code.push(0x22); wasm_push_u32(code, p_lidx)
+          code.push(0x29); wasm_push_u32(code, 2); wasm_push_u32(code, 0) // len
+          code.push(0x22); wasm_push_u32(code, len_lidx)
+          code.push(0x20); wasm_push_u32(code, p_lidx)
+          code.push(0x29); wasm_push_u32(code, 2); wasm_push_u32(code, 8) // cap
+          code.push(0x53) // i64.lt_s(len, cap)
+          code.push(0x20); wasm_push_u32(code, p_lidx)
+          code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, 20) // stride
+          code.push(0x41); wasm_push_s32(code, 1); code.push(0x47) // stride != 1
+          code.push(0x71) // i32.and
+          code.push(0x04); code.push(0x40) // if (len < cap && stride != 1)
+          // dp = i32.wrap_i64(i64.load(p + 24)); i64.store(dp + (i32(len) << 3), val)
+          code.push(0x20); wasm_push_u32(code, p_lidx)
+          code.push(0x29); wasm_push_u32(code, 2); wasm_push_u32(code, 24); code.push(0xA7)
+          code.push(0x20); wasm_push_u32(code, len_lidx); code.push(0xA7)
+          code.push(0x41); wasm_push_s32(code, 3); code.push(0x74); code.push(0x6A)
+          wasm_emit_operand(ctx, fctx, code, inst.args[2], WASM_TY_I64)
+          code.push(0x37); wasm_push_u32(code, 2); wasm_push_u32(code, 0)
+          // i64.store(p + 0, len + 1L)
+          code.push(0x20); wasm_push_u32(code, p_lidx)
+          code.push(0x20); wasm_push_u32(code, len_lidx)
+          code.push(0x42); wasm_push_s64(code, 1L); code.push(0x7C)
+          code.push(0x37); wasm_push_u32(code, 2); wasm_push_u32(code, 0)
+          code.push(0x05) // else: call pion_arr_push_owned(i64(p), val)
+          code.push(0x20); wasm_push_u32(code, p_lidx); code.push(0xAD)
+          wasm_emit_operand(ctx, fctx, code, inst.args[2], WASM_TY_I64)
+          code.push(0x10); wasm_push_u32(code, arr_po_fidx)
+          code.push(0x0B) // end if
+          return false
         }
         None => ()
       }
@@ -4815,6 +4870,7 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     div_tmp_i64: -1,
     alloc_tmp_i32: -1,
     alloc_tmp2_i32: -1,
+    push_tmp_i64: -1,
     last_set_pos: -1,
     last_set_end: -1,
     last_set_sym: "",
@@ -5791,7 +5847,17 @@ fn wasm_build_rc_dec_body(slow_imp_idx : Int) -> Array[Int] {
   body.push(0x04); body.push(0x40)
   body.push(0x0F)
   body.push(0x0B)
-  // Hot path first: if (owner_tid != 0) { rc = local_rc - 1; local_rc = rc } else { rc = shared_rc - 1; shared_rc = rc }
+  // P52-A: Unique-owner fast path: owner_tid==1 && local_rc==1 -> call rc_dec_slow directly (zero dead local_rc=0 store)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x42); wasm_push_s64(body, 0x0000000100000001L)
+  body.push(0x51)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 0)
+  body.push(0x10); wasm_push_u32(body, slow_imp_idx)
+  body.push(0x0F)
+  body.push(0x0B)
+  // Hot path: if (owner_tid != 0) { rc = local_rc - 1; local_rc = rc } else { rc = shared_rc - 1; shared_rc = rc }
   body.push(0x20); wasm_push_u32(body, 1)
   body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   body.push(0x04); body.push(0x40)
@@ -6231,6 +6297,63 @@ fn wasm_build_raw_free_slab_body() -> Array[Int] {
 }
 
 ///|
+/// P52-A: Compact inline unique-owner (`owner_tid==1 && local_rc==1`) leaf Slab recycle for `ev` (local 10, i64, non-zero).
+/// Uses single `i64.load(thdr)==0x0000000100000001L` check (zero dead `local_rc=0` store!) + `(tflags & 0x12)==0x10`.
+/// Uses locals `13=thdr, 14=tflags, 15=ttag, 16=tslot, 18=tbase`; preserves locals `1..11`.
+fn wasm_emit_inline_rc_dec_leaf(
+  body : Array[Int],
+  rc_dec_internal_idx : Int,
+  rc_dec_slow_internal_idx : Int,
+) -> Unit {
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0xA7)
+  body.push(0x41); wasm_push_s32(body, 24); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 13) // thdr
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x42); wasm_push_s64(body, 0x0000000100000001L)
+  body.push(0x51) // owner_tid == 1 && local_rc == 1
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
+  body.push(0x22); wasm_push_u32(body, 14) // tflags
+  body.push(0x41); wasm_push_s32(body, 0x12); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x46) // FLAG_SLAB && !FLAG_IMMORTAL
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16); body.push(0x50)
+  body.push(0x71) // && drop_fn == 0L
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 12)
+  body.push(0x22); wasm_push_u32(body, 15) // ttag
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 4); body.push(0x46); body.push(0x72)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 5); body.push(0x46); body.push(0x72)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 18) // tbase
+  body.push(0x41); wasm_push_s32(body, 0x46524545)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x76)
+  body.push(0x41); wasm_push_s32(body, 15); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x74); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 16) // tslot
+  body.push(0x20); wasm_push_u32(body, 18)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x20); wasm_push_u32(body, 18)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_slow_internal_idx)
+  body.push(0x0B)
+  body.push(0x05) // not leaf slab (could be immortal or container/drop_fn!=0)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 2); body.push(0x71); body.push(0x45)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_slow_internal_idx)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x05) // rc > 1 or shared
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
+  body.push(0x0B)
+}
+
+///|
 /// Pure-Wasm internal `pion_rc_dec_slow(obj: i64) -> void` fast path.
 /// Handles String/Bytes/Array/Struct/Enum/Closure/Map/StrBuf (tags 1..7, 11) natively:
 /// runs drop_fn via `call_indirect`, recursively rc_dec's Array/Map elements in Wasm,
@@ -6246,8 +6369,8 @@ fn wasm_build_rc_dec_slow_body(
   // 9 i32 locals (1=p, 2=hdr, 3=tag, 4=drop_idx/flag1, 5=dp/es, 6=len/cap/base, 7=i/slot, 8=flag2/stride, 9=entry/tbase)
   // + 1 i64 local (10=ev/ev0) + 1 i32 local (11=mask_cur)
   // + 1 i64 local (12=tail_next/ev1) + 4 i32 locals (13=thdr, 14=tflags, 15=trc/ttag, 16=tslot)
-  // + 1 i64 local (17=tdrop)
-  let body : Array[Int] = [0x06, 0x09, 0x7F, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7E, 0x04, 0x7F, 0x01, 0x7E]
+  // + 1 i64 local (17=tdrop) + 3 i32 locals (18=sp0/tbase_arr, 19=stk_base, 20=sp)
+  let body : Array[Int] = [0x07, 0x09, 0x7F, 0x01, 0x7E, 0x01, 0x7F, 0x01, 0x7E, 0x04, 0x7F, 0x01, 0x7E, 0x03, 0x7F]
 
   // P47-A: Tail-loop wrapper ($tail at depth 0) for zero-call_indirect iterative tree/list destruction
   body.push(0x03); body.push(0x40) // loop $tail (depth 0)
@@ -6293,19 +6416,13 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0xA7)
   body.push(0x22); wasm_push_u32(body, 4)
   body.push(0x04); body.push(0x40) // if (drop_idx != 0) [depth 1]
-  // Clear drop_fn before calling so re-entry or fallback to JS slow path cannot double-drop
-  body.push(0x20); wasm_push_u32(body, 2)
-  body.push(0x42); wasm_push_s64(body, 0L)
-  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
   // P47-A: if (drop_idx < 0): Tagged Slot-Mask (bit 31 set -> zero call_indirect!)
+  // P52-A: Skip dead drop_fn=0L store on tagged masks (pure Wasm, never re-enters or calls JS).
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x48) // i32.lt_s
   body.push(0x04); body.push(0x40) // if (drop_idx < 0) [depth 2]
-  // P50-A: Specialized zero-loop fast path for 2-slot tagged mask 0x80000003 (-2147483645)
-  // (covers binary_trees::Node, JsonField, binary trees & linked lists):
-  // reads ev0/ev1 directly, recycles current Slab node LIFO, inline-recycles leaf children
-  // (including 0x80000003 nodes whose both slots are null), and tail-loops the sole/right child.
+  // P50-A + P52-A: Specialized tight loop $s2 for 2-slot tagged mask 0x80000003 (-2147483645)
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, -2147483645)
   body.push(0x46) // i32.eq
@@ -6318,6 +6435,7 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x22); wasm_push_u32(body, 8) // flags in local 8 (preserve drop_idx in local 4 if not slab)
   body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x71)
   body.push(0x04); body.push(0x40) // if ((flags & FLAG_SLAB) != 0) [depth 5]
+  body.push(0x03); body.push(0x40) // loop $s2 [depth 6]
   // ev0 (10) = i64.load(p + 0); ev1 (12) = i64.load(p + 8)
   body.push(0x20); wasm_push_u32(body, 1); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
   body.push(0x21); wasm_push_u32(body, 10)
@@ -6345,25 +6463,18 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x42); wasm_push_s64(body, 0L); body.push(0x21); wasm_push_u32(body, 10)
   body.push(0x0B)
   // Process ev0 (left child when both children are non-null)
+  // P52-A: Single `i64.load(thdr) == 0x0000000100000001L` check (zero dead `local_rc=0` store!)
   body.push(0x20); wasm_push_u32(body, 10); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
   body.push(0x04); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 10); body.push(0xA7); body.push(0x41); wasm_push_s32(body, 24); body.push(0x6B)
   body.push(0x22); wasm_push_u32(body, 13) // thdr
-  body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x42); wasm_push_s64(body, 0x0000000100000001L); body.push(0x51)
+  body.push(0x04); body.push(0x40) // unique owner (tid==1 && rc==1)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
   body.push(0x22); wasm_push_u32(body, 14) // tflags
-  body.push(0x41); wasm_push_s32(body, 2); body.push(0x71); body.push(0x45) // not immortal
-  body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0) // owner_tid
-  body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 13)
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
-  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
-  body.push(0x22); wasm_push_u32(body, 15) // trc
-  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
-  body.push(0x20); wasm_push_u32(body, 15); body.push(0x45) // trc == 0
-  body.push(0x04); body.push(0x40)
-  // Inline leaf Slab recycle if (tflags & 0x10) && ttag in {1,4,5} && (tdrop == 0 || (tdrop == 0x80000003 && (ev0[0]|ev0[1]) == 0))
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 0x12); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x46) // FLAG_SLAB && !FLAG_IMMORTAL
   body.push(0x04); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 12)
   body.push(0x22); wasm_push_u32(body, 15) // ttag
@@ -6377,76 +6488,6 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x04); body.push(0x7F)
   body.push(0x41); wasm_push_s32(body, 1)
   body.push(0x05)
-  body.push(0x20); wasm_push_u32(body, 17); body.push(0x42); wasm_push_s64(body, 2147483651L); body.push(0x51) // tdrop == 0x80000003L
-  body.push(0x04); body.push(0x7F)
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 32)
-  body.push(0x84); body.push(0x50) // (ev0[0] | ev0[1]) == 0L
-  body.push(0x05)
-  body.push(0x41); wasm_push_s32(body, 0)
-  body.push(0x0B)
-  body.push(0x0B)
-  body.push(0x04); body.push(0x40) // if is_leaf
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
-  body.push(0x21); wasm_push_u32(body, 9) // tbase
-  body.push(0x23); wasm_push_u32(body, 2)
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x76)
-  body.push(0x41); wasm_push_s32(body, 15); body.push(0x71)
-  body.push(0x41); wasm_push_s32(body, 2); body.push(0x74); body.push(0x6A)
-  body.push(0x21); wasm_push_u32(body, 16) // tslot
-  body.push(0x20); wasm_push_u32(body, 9); body.push(0x41); wasm_push_s32(body, 0x46524545)
-  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
-  body.push(0x20); wasm_push_u32(body, 9)
-  body.push(0x20); wasm_push_u32(body, 16); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
-  body.push(0x20); wasm_push_u32(body, 16); body.push(0x20); wasm_push_u32(body, 9)
-  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x42); wasm_push_s64(body, 0L); body.push(0x21); wasm_push_u32(body, 10) // mark freed
-  body.push(0x0B)
-  body.push(0x0B)
-  body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 10); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
-  body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_slow_internal_idx)
-  body.push(0x0B)
-  body.push(0x0B) // end trc == 0
-  body.push(0x05) // else owner_tid == 0
-  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
-  body.push(0x0B)
-  body.push(0x0B) // end not immortal
-  body.push(0x0B) // end ev0 != 0
-  // Process ev1 (right/sole child): inline-recycle leaf & return, else tail-loop via br $tail!
-  body.push(0x20); wasm_push_u32(body, 12); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
-  body.push(0x04); body.push(0x40) // [depth 6]
-  body.push(0x20); wasm_push_u32(body, 12); body.push(0xA7); body.push(0x41); wasm_push_s32(body, 24); body.push(0x6B)
-  body.push(0x22); wasm_push_u32(body, 13) // thdr
-  body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
-  body.push(0x22); wasm_push_u32(body, 14) // tflags
-  body.push(0x41); wasm_push_s32(body, 2); body.push(0x71); body.push(0x45) // not immortal
-  body.push(0x04); body.push(0x40) // [depth 7]
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0) // owner_tid
-  body.push(0x04); body.push(0x40) // [depth 8]
-  body.push(0x20); wasm_push_u32(body, 13)
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
-  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
-  body.push(0x22); wasm_push_u32(body, 15) // trc
-  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
-  body.push(0x20); wasm_push_u32(body, 15); body.push(0x45) // trc == 0
-  body.push(0x04); body.push(0x40) // [depth 9]
-  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x71)
-  body.push(0x04); body.push(0x40) // [depth 10]
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 12)
-  body.push(0x22); wasm_push_u32(body, 15) // ttag
-  body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
-  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 4); body.push(0x46); body.push(0x72)
-  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 5); body.push(0x46); body.push(0x72)
-  body.push(0x04); body.push(0x40) // [depth 11]
-  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
-  body.push(0x22); wasm_push_u32(body, 17) // tdrop
-  body.push(0x50)
-  body.push(0x04); body.push(0x7F)
-  body.push(0x41); wasm_push_s32(body, 1)
-  body.push(0x05)
   body.push(0x20); wasm_push_u32(body, 17); body.push(0x42); wasm_push_s64(body, 2147483651L); body.push(0x51)
   body.push(0x04); body.push(0x7F)
   body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
@@ -6456,7 +6497,180 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x0B)
   body.push(0x0B)
-  body.push(0x04); body.push(0x40) // if is_leaf [depth 12]
+  body.push(0x04); body.push(0x40) // if is_leaf
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 9) // tbase
+  body.push(0x41); wasm_push_s32(body, 0x46524545)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x76)
+  body.push(0x41); wasm_push_s32(body, 15); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x74); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 16) // tslot
+  body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_slow_internal_idx)
+  body.push(0x0B)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_slow_internal_idx)
+  body.push(0x0B)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 2); body.push(0x71); body.push(0x45)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_slow_internal_idx)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x05) // else rc > 1 or shared
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
+  body.push(0x0B)
+  body.push(0x0B) // end ev0 != 0
+  // Process ev1 (right/sole child): single i64.load check; leaf -> recycle; 0x80000003 -> br $s2; else br $tail!
+  body.push(0x20); wasm_push_u32(body, 12); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
+  body.push(0x04); body.push(0x40) // [depth 7]
+  body.push(0x20); wasm_push_u32(body, 12); body.push(0xA7); body.push(0x41); wasm_push_s32(body, 24); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 13) // thdr
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x42); wasm_push_s64(body, 0x0000000100000001L); body.push(0x51)
+  body.push(0x04); body.push(0x40) // [depth 8: unique owner]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
+  body.push(0x22); wasm_push_u32(body, 14) // tflags
+  body.push(0x41); wasm_push_s32(body, 0x12); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x46) // FLAG_SLAB && !FLAG_IMMORTAL
+  body.push(0x04); body.push(0x40) // [depth 9]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 12)
+  body.push(0x22); wasm_push_u32(body, 15) // ttag
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 4); body.push(0x46); body.push(0x72)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 5); body.push(0x46); body.push(0x72)
+  body.push(0x04); body.push(0x40) // [depth 10]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x22); wasm_push_u32(body, 17) // tdrop
+  body.push(0x50) // tdrop == 0L
+  body.push(0x04); body.push(0x40) // [depth 11]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 9)
+  body.push(0x41); wasm_push_s32(body, 0x46524545)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x76)
+  body.push(0x41); wasm_push_s32(body, 15); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x74); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x0F)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 17); body.push(0x42); wasm_push_s64(body, 2147483651L); body.push(0x51)
+  body.push(0x04); body.push(0x40) // [depth 12]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 32)
+  body.push(0x84); body.push(0x50)
+  body.push(0x04); body.push(0x40) // [depth 13]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 9)
+  body.push(0x41); wasm_push_s32(body, 0x46524545)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 8); body.push(0x76)
+  body.push(0x41); wasm_push_s32(body, 15); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x74); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 16); body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x0F)
+  body.push(0x05) // non-leaf 0x80000003 Slab node -> br 7 to loop $s2 (depth 6 from $tail)!
+  body.push(0x20); wasm_push_u32(body, 12); body.push(0xA7); body.push(0x21); wasm_push_u32(body, 1) // p
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x21); wasm_push_u32(body, 2) // hdr
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x21); wasm_push_u32(body, 8) // flags
+  body.push(0x0C); wasm_push_u32(body, 7) // br $s2 (depth 13 - 6 = 7!)
+  body.push(0x0B) // end leaf
+  body.push(0x0B) // end tdrop == 0x80000003
+  body.push(0x0B) // end tdrop == 0L
+  body.push(0x0B) // end ttag
+  body.push(0x0B) // end FLAG_SLAB && !IMMORTAL
+  // If not immortal -> tail-loop via br 8 (to loop $tail at depth 0)!
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 2); body.push(0x71); body.push(0x45)
+  body.push(0x04); body.push(0x40) // [depth 9]
+  body.push(0x20); wasm_push_u32(body, 12); body.push(0x21); wasm_push_u32(body, 0)
+  body.push(0x0C); wasm_push_u32(body, 9) // br $tail (depth 9 - 0 = 9!)
+  body.push(0x0B)
+  body.push(0x05) // else rc > 1 or shared
+  body.push(0x20); wasm_push_u32(body, 12); body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
+  body.push(0x0B)
+  body.push(0x0B) // end ev1 != 0
+  body.push(0x0F) // return
+  body.push(0x0B) // end loop $s2
+  body.push(0x0B) // end FLAG_SLAB
+  body.push(0x0B) // end tag in {1, 4, 5}
+  body.push(0x0B) // end drop_idx == 0x80000003
+  // P52-A: Specialized 1-slot fast path for 0x80000002 (-2147483646: JStr/JObj/JArr/Some)
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x41); wasm_push_s32(body, -2147483646)
+  body.push(0x46)
+  body.push(0x04); body.push(0x40) // [depth 3]
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 4); body.push(0x46); body.push(0x72)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 5); body.push(0x46); body.push(0x72)
+  body.push(0x04); body.push(0x40) // [depth 4]
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
+  body.push(0x22); wasm_push_u32(body, 8)
+  body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x71)
+  body.push(0x04); body.push(0x40) // [depth 5]
+  // ev1 (10) = i64.load(p + 8); recycle current Slab object immediately
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x21); wasm_push_u32(body, 10)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
+  body.push(0x21); wasm_push_u32(body, 6) // base
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x41); wasm_push_s32(body, 8); body.push(0x76)
+  body.push(0x41); wasm_push_s32(body, 15); body.push(0x71)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x74); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 7) // slot
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 0x46524545)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  // Release sole child ev1 (local 10) with inline leaf Slab recycle (or br $tail)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
+  body.push(0x04); body.push(0x40) // [depth 6]
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0xA7); body.push(0x41); wasm_push_s32(body, 24); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 13)
+  body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 14)
+  body.push(0x22); wasm_push_u32(body, 14)
+  body.push(0x41); wasm_push_s32(body, 2); body.push(0x71); body.push(0x45)
+  body.push(0x04); body.push(0x40) // [depth 7]
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x04); body.push(0x40) // [depth 8]
+  body.push(0x20); wasm_push_u32(body, 13)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
+  body.push(0x22); wasm_push_u32(body, 15)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x45)
+  body.push(0x04); body.push(0x40) // [depth 9]
+  body.push(0x20); wasm_push_u32(body, 14); body.push(0x41); wasm_push_s32(body, 0x10); body.push(0x71)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 16); body.push(0x50)
+  body.push(0x71)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 13); body.push(0x2F); wasm_push_u32(body, 1); wasm_push_u32(body, 12)
+  body.push(0x22); wasm_push_u32(body, 15)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x46)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 4); body.push(0x46); body.push(0x72)
+  body.push(0x20); wasm_push_u32(body, 15); body.push(0x41); wasm_push_s32(body, 5); body.push(0x46); body.push(0x72)
+  body.push(0x04); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 13); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6B)
   body.push(0x21); wasm_push_u32(body, 9)
   body.push(0x23); wasm_push_u32(body, 2)
@@ -6471,23 +6685,26 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
   body.push(0x20); wasm_push_u32(body, 16); body.push(0x20); wasm_push_u32(body, 9)
   body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x0F) // leaf recycled inline -> return!
+  body.push(0x0F)
   body.push(0x0B)
   body.push(0x0B)
-  body.push(0x0B)
-  // Non-leaf ev1 -> tail-loop via br 9 (to loop $tail at depth 0)
-  body.push(0x20); wasm_push_u32(body, 12); body.push(0x21); wasm_push_u32(body, 0)
+  // Non-leaf sole child -> tail-loop br 9 ($tail)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x21); wasm_push_u32(body, 0)
   body.push(0x0C); wasm_push_u32(body, 9)
   body.push(0x0B) // end trc == 0
-  body.push(0x05) // else owner_tid == 0
-  body.push(0x20); wasm_push_u32(body, 12); body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 10); body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
   body.push(0x0B)
-  body.push(0x0B) // end not immortal
-  body.push(0x0B) // end ev1 != 0
-  body.push(0x0F) // return
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0F)
   body.push(0x0B) // end FLAG_SLAB
   body.push(0x0B) // end tag in {1, 4, 5}
-  body.push(0x0B) // end drop_idx == 0x80000003
+  body.push(0x0B) // end drop_idx == 0x80000002
+  // Clear drop_fn before general bitmap loop so non-Slab (>480B) JS slow-path fallback cannot double-drop
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
   // mask_cur (11) = drop_idx & 0x7FFFFFFF; tail_next (12) = 0L
   body.push(0x20); wasm_push_u32(body, 4)
   body.push(0x41); wasm_push_s32(body, 0x7FFFFFFF)
@@ -6651,6 +6868,10 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
   body.push(0x0B)
   body.push(0x05) // else (drop_idx > 0: normal function table slot)
+  // Clear drop_fn before calling so re-entry or fallback to JS slow path cannot double-drop
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
   // call_indirect (type drop_sig_idx) (obj, drop_idx)
   body.push(0x20); wasm_push_u32(body, 0)
   body.push(0x20); wasm_push_u32(body, 4)
@@ -6756,8 +6977,7 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x52) // i64.ne
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 10)
-  body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
+  wasm_emit_inline_rc_dec_leaf(body, rc_dec_internal_idx, rc_dec_slow_internal_idx)
   body.push(0x0B)
   body.push(0x20); wasm_push_u32(body, 7)
   body.push(0x41); wasm_push_s32(body, 1)
@@ -6767,7 +6987,7 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x0B) // end loop
   body.push(0x0B) // end block
   body.push(0x05) // else (stride > 8: flat struct array with RC bitmask)
-  // i = 0; while (i < len) { base = dp + i * stride; m = mask; while (m != 0) { if (m & 1) { ev = i64.load(base); if (ev != 0) rc_dec(ev) } m >>>= 1; base += 8 } i++ }
+  // i = 0; while (i < len) { base = dp + i * stride; m = mask; while (m != 0) { if (m & 1) { ev = i64.load(base); if (ev != 0) inline_rc_dec_leaf(ev) } m >>>= 1; base += 8 } i++ }
   body.push(0x41); wasm_push_s32(body, 0)
   body.push(0x21); wasm_push_u32(body, 7)
   body.push(0x02); body.push(0x40) // outer block
@@ -6800,8 +7020,7 @@ fn wasm_build_rc_dec_slow_body(
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x52) // i64.ne
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 10)
-  body.push(0x10); wasm_push_u32(body, rc_dec_internal_idx)
+  wasm_emit_inline_rc_dec_leaf(body, rc_dec_internal_idx, rc_dec_slow_internal_idx)
   body.push(0x0B)
   body.push(0x0B) // end if (m & 1)
   body.push(0x20); wasm_push_u32(body, 11)
@@ -8648,11 +8867,45 @@ fn wasm_build_arr_new_body(alloc_uninit_idx : Int, slow_imp_idx : Int) -> Array[
   body.push(0x20); wasm_push_u32(body, 10) // byte_len
   body.push(0xFC); wasm_push_u32(body, 11); body.push(0x00) // memory.fill(dp, 0, byte_len)
   body.push(0x0B) // end if (c > 0)
-  // Allocate PionArray(32B, TAG_ARRAY=3)
+  // P52-A: Inline cls=2 (64B) Slab freelist/bump for PionArray(32B, TAG_ARRAY=3) header
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 7) // ctl
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8) // freelist[cls=2]
+  body.push(0x22); wasm_push_u32(body, 6) // base
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
+  body.push(0x22); wasm_push_u32(body, 6) // hp
+  body.push(0x41); wasm_push_s32(body, 64); body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 5) // new_hp
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 40)
+  body.push(0x4D)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x20); wasm_push_u32(body, 5)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
+  body.push(0x05)
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 6)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x04); body.push(0x7E) // if (base != 0) -> i64
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 0x50494F4E00000040L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 0x0000000100000001L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 0x0210000300000000L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x41); wasm_push_s32(body, 32); body.push(0x6A); body.push(0xAD)
+  body.push(0x05)
   body.push(0x41); wasm_push_s32(body, 32)
   body.push(0x41); wasm_push_s32(body, 3)
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x10); wasm_push_u32(body, alloc_uninit_idx)
+  body.push(0x0B)
   body.push(0x22); wasm_push_u32(body, 14) // obj
   body.push(0xA7); body.push(0x22); wasm_push_u32(body, 9) // p
   body.push(0x42); wasm_push_s64(body, 0L); body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0) // len=0
@@ -9262,6 +9515,96 @@ fn wasm_build_str_slice_body(alloc_uninit_idx : Int) -> Array[Int] {
   body.push(0x42); wasm_push_s64(body, 0L)
   body.push(0x0B)
   body.push(0x21); wasm_push_u32(body, 11) // len
+  // P52-A: Straight-line fast path for valid in-bounds short slices (0 <= start <= end <= len, n <= 7, cls=1 48B)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x20); wasm_push_u32(body, 2); body.push(0x58) // i64.le_u(start, end)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 11); body.push(0x58) // i64.le_u(end, len)
+  body.push(0x71)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x20); wasm_push_u32(body, 1); body.push(0x7D) // end - start
+  body.push(0xA7); body.push(0x22); wasm_push_u32(body, 4) // n
+  body.push(0x41); wasm_push_s32(body, 7); body.push(0x4D) // i32.le_u(n, 7)
+  body.push(0x04); body.push(0x40)
+  body.push(0x23); wasm_push_u32(body, 2); body.push(0x22); wasm_push_u32(body, 7) // ctl
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x22); wasm_push_u32(body, 8) // base
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 4)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
+  body.push(0x22); wasm_push_u32(body, 8) // hp
+  body.push(0x41); wasm_push_s32(body, 48); body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 9) // new_hp
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 40)
+  body.push(0x4D) // new_hp <= heap_end
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x20); wasm_push_u32(body, 9)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 36)
+  body.push(0x05)
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 8)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 8)
+  body.push(0x04); body.push(0x40)
+  // Write cls=1 header + len + copy + NUL + return
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x42); wasm_push_s64(body, 0x50494F4E00000030L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x42); wasm_push_s64(body, 0x0000000100000001L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x42); wasm_push_s64(body, 0x0110000100000000L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x41); wasm_push_s32(body, 32); body.push(0x6A)
+  body.push(0x22); wasm_push_u32(body, 5) // base + 32
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0xAD)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0xA7); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 6) // src
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x41); wasm_push_s32(body, 8); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 5) // payload dst
+  // 0..7B fixed-width copy
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, 4); body.push(0x4F)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 4); body.push(0x6B)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 4); body.push(0x6B)
+  body.push(0x28); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x36); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 4); body.push(0x41); wasm_push_s32(body, 2); body.push(0x4F)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x2F); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x3B); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
+  body.push(0x20); wasm_push_u32(body, 6); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x05)
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x2D); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x20); wasm_push_u32(body, 4); body.push(0x6A)
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x3A); wasm_push_u32(body, 0); wasm_push_u32(body, 0)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x41); wasm_push_s32(body, 32); body.push(0x6A); body.push(0xAD)
+  body.push(0x0F)
+  body.push(0x0B) // end if (base != 0)
+  body.push(0x0B) // end if (n <= 7)
+  body.push(0x0B) // end if (start <= end <= len)
   // a = start < 0 ? 0 : start
   body.push(0x20); wasm_push_u32(body, 1); body.push(0x42); wasm_push_s64(body, 0L); body.push(0x53)
   body.push(0x04); body.push(0x7E)

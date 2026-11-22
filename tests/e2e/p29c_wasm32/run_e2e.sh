@@ -3529,4 +3529,225 @@ console.log("  p51a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P52-A Regression: Tight 2-slot/1-slot RC-1 Drop + DAG Shared Nodes + Deep Chains + Mixed Array Drop & Push Grow ==="
+cat > "$TMP_DIR/p52a_rc_tree_arr.pion" <<'EOF'
+struct P52Node {
+  left : Option[P52Node]
+  right : Option[P52Node]
+}
+
+enum P52Val {
+  VInt(Int64)
+  VStr(String)
+  VArr(Array[P52Val])
+}
+
+struct P52Pair {
+  k : String
+  v : P52Val
+}
+
+// Non-Slab (>480B: 65 fields = 520B) struct with bitmap drop_idx to verify JS slow-path fallback does not double-drop
+struct P52BigNonSlab {
+  s0 : String
+  s1 : String
+  f0 : Int64; f1 : Int64; f2 : Int64; f3 : Int64; f4 : Int64; f5 : Int64; f6 : Int64; f7 : Int64
+  f8 : Int64; f9 : Int64; f10 : Int64; f11 : Int64; f12 : Int64; f13 : Int64; f14 : Int64; f15 : Int64
+  f16 : Int64; f17 : Int64; f18 : Int64; f19 : Int64; f20 : Int64; f21 : Int64; f22 : Int64; f23 : Int64
+  f24 : Int64; f25 : Int64; f26 : Int64; f27 : Int64; f28 : Int64; f29 : Int64; f30 : Int64; f31 : Int64
+  f32 : Int64; f33 : Int64; f34 : Int64; f35 : Int64; f36 : Int64; f37 : Int64; f38 : Int64; f39 : Int64
+  f40 : Int64; f41 : Int64; f42 : Int64; f43 : Int64; f44 : Int64; f45 : Int64; f46 : Int64; f47 : Int64
+  f48 : Int64; f49 : Int64; f50 : Int64; f51 : Int64; f52 : Int64; f53 : Int64; f54 : Int64; f55 : Int64
+  f56 : Int64; f57 : Int64; f58 : Int64; f59 : Int64; f60 : Int64; f61 : Int64; f62 : Int64
+}
+
+fn drop_big_non_slab(shared_s : String, n : Int) -> Int64 {
+  let uniq_s = "big_uniq_" + n.to_string()
+  let b = P52BigNonSlab::{
+    s0: uniq_s, s1: shared_s,
+    f0: 0L, f1: 1L, f2: 2L, f3: 3L, f4: 4L, f5: 5L, f6: 6L, f7: 7L,
+    f8: 8L, f9: 9L, f10: 10L, f11: 11L, f12: 12L, f13: 13L, f14: 14L, f15: 15L,
+    f16: 16L, f17: 17L, f18: 18L, f19: 19L, f20: 20L, f21: 21L, f22: 22L, f23: 23L,
+    f24: 24L, f25: 25L, f26: 26L, f27: 27L, f28: 28L, f29: 29L, f30: 30L, f31: 31L,
+    f32: 32L, f33: 33L, f34: 34L, f35: 35L, f36: 36L, f37: 37L, f38: 38L, f39: 39L,
+    f40: 40L, f41: 41L, f42: 42L, f43: 43L, f44: 44L, f45: 45L, f46: 46L, f47: 47L,
+    f48: 48L, f49: 49L, f50: 50L, f51: 51L, f52: 52L, f53: 53L, f54: 54L, f55: 55L,
+    f56: 56L, f57: 57L, f58: 58L, f59: 59L, f60: 60L, f61: 61L, f62: 62L
+  }
+  b.f62 + b.s0.length().to_int64() + b.s1.length().to_int64()
+}
+
+fn make_balanced(d : Int) -> P52Node {
+  if d == 0 {
+    P52Node::{ left: None, right: None }
+  } else {
+    P52Node::{ left: Some(make_balanced(d - 1)), right: Some(make_balanced(d - 1)) }
+  }
+}
+
+fn count_nodes(n : P52Node) -> Int64 {
+  match n.left {
+    None =>
+      match n.right {
+        None => 1L
+        Some(r) => 1L + count_nodes(r)
+      }
+    Some(l) =>
+      match n.right {
+        None => 1L + count_nodes(l)
+        Some(r) => 1L + count_nodes(l) + count_nodes(r)
+      }
+  }
+}
+
+fn make_deep_spine(d : Int) -> P52Node {
+  let mut cur = P52Node::{ left: None, right: None }
+  let mut i = 0
+  while i < d {
+    let side = make_balanced(2)
+    if i % 2 == 0 {
+      cur = P52Node::{ left: Some(cur), right: Some(side) }
+    } else {
+      cur = P52Node::{ left: Some(side), right: Some(cur) }
+    }
+    i = i + 1
+  }
+  cur
+}
+
+fn make_chain(n : Int, left_side : Bool) -> P52Node {
+  let mut cur = P52Node::{ left: None, right: None }
+  let mut i = 0
+  while i < n {
+    if left_side {
+      cur = P52Node::{ left: Some(cur), right: None }
+    } else {
+      cur = P52Node::{ left: None, right: Some(cur) }
+    }
+    i = i + 1
+  }
+  cur
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Balanced tree (depth 12 = 8191 nodes) + deep spine (depth 72 > 64)
+  let b12 = count_nodes(make_balanced(12))
+  let spine72 = count_nodes(make_deep_spine(72))
+
+  // 2. Left-leaning & right-leaning 100k chains (O(1) stack)
+  let lc = make_chain(100000, true)
+  let rc_chain = make_chain(100000, false)
+  let chain_ok = match lc.left { Some(_) => 1; None => 0 } + (match rc_chain.right { Some(_) => 1; None => 0 })
+
+  // 3. Shared DAG tree (rc > 1 on both ev0 and ev1 cold paths)
+  let shared_leaf = make_balanced(3) // 15 nodes
+  let shared_mid = P52Node::{ left: Some(shared_leaf), right: Some(shared_leaf) }
+  let dag_root = P52Node::{ left: Some(shared_mid), right: Some(shared_mid) }
+  let dag_cnt = count_nodes(dag_root) // 1 + 2*(1 + 2*15) = 63
+
+  // 4. Mixed leaf/non-leaf Array[P52Val] + flat struct Array[P52Pair] + arr_push_owned growth + str.slice short/long/clamp
+  let src = "abcdefghijklmno"
+  let s_short = src.slice(1, 5)   // "bcde" (4B, cls=1 fast path)
+  let s_empty = src.slice(3, 3)   // "" (0B, cls=1 fast path)
+  let s_long = src.slice(0, 12)   // "abcdefghijkl" (12B)
+  let s_clamp = src.slice(-5, 99) // "abcdefghijklmno" (clamped)
+
+  let vals : Array[P52Val] = []
+  let pairs : Array[P52Pair] = []
+  let mut i = 0
+  while i < 2000 {
+    if i % 3 == 0 {
+      vals.push(VInt(i.to_int64()))
+      pairs.push(P52Pair::{ k: s_short, v: VInt(i.to_int64()) })
+    } else if i % 3 == 1 {
+      let tok = src.slice(i % 7, (i % 7) + 4)
+      vals.push(VStr(tok))
+      pairs.push(P52Pair::{ k: tok, v: VStr(s_long) })
+    } else {
+      let inner : Array[P52Val] = [VStr(s_short), VInt(7L)]
+      vals.push(VArr(inner))
+      pairs.push(P52Pair::{ k: s_clamp, v: VArr([VStr(s_empty), VStr(s_short)]) })
+    }
+    i = i + 1
+  }
+
+  // 5. Non-Slab (>480B) struct with bitmap drop_idx: verify JS slow-path fallback does not double-drop shared/unique strings
+  let keep_big = "shared_big_" + (42).to_string()
+  let big_res = drop_big_non_slab(keep_big, 7)
+  let churn = "churn_over_" + (99).to_string()
+  if keep_big != "shared_big_42" {
+    panic("non-slab double-drop corrupted shared string")
+  }
+
+  io_println(world, "p52a_ok:" + b12.to_string() + ":" + spine72.to_string() + ":" + chain_ok.to_string() + ":" + dag_cnt.to_string() + ":" + vals.length().to_string() + ":" + pairs.length().to_string() + ":" + s_short + ":" + s_clamp.length().to_string() + ":" + big_res.to_string() + ":" + keep_big + ":" + churn.length().to_string())
+  0
+}
+EOF
+P52A_REL_WASM="$TMP_DIR/p52a_rel.wasm"
+P52A_DEV_WASM="$TMP_DIR/p52a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P52A_REL_WASM" "$TMP_DIR/p52a_rc_tree_arr.pion"
+"$PIONC" build --target wasm32 -o "$P52A_DEV_WASM" "$TMP_DIR/p52a_rc_tree_arr.pion"
+for mode_wasm in "release:$P52A_REL_WASM" "dev:$P52A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p52a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p52a_ok:8191:577:2:63:2000:2000:bcde:15:85:shared_big_42:13") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p52a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p52a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p52a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
