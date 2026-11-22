@@ -1662,6 +1662,19 @@ def atomVal {W : Type} (o : WorldOracle W) (regs : Nat → BitVec 64) (c : Cls) 
 def argVal (args : List (BitVec 64)) (k : Std.I32) : BitVec 64 :=
   if 0 ≤ k.val then (args[k.val.toNat]?).getD 0 else 0
 
+/-- The class a store of width `wd` reads its value at (`store_cls`). -/
+def storeCls : MemWidth → Cls
+  | .B8 => .L
+  | _ => .W
+
+/-- The bits a store of width `wd` writes (`storeb` / `storeh` / `storew` /
+`storel`), zero-extended. -/
+def maskWidth : MemWidth → BitVec 64 → BitVec 64
+  | .B1, v => v &&& 0xFF#64
+  | .B2, v => v &&& 0xFFFF#64
+  | .B4, v => v &&& 0xFFFFFFFF#64
+  | .B8, v => v
+
 /-- One instruction; `none` is a trap (division) or a fault of the world. -/
 def execInst {W : Type} (o : WorldOracle W) (args : List (BitVec 64)) (s : MState W) :
     Inst → Option (MState W)
@@ -1674,7 +1687,7 @@ def execInst {W : Type} (o : WorldOracle W) (args : List (BitVec 64)) (s : MStat
     (o.load s.world wd sg (atomVal o s.regs .L addr)).map
       fun v => { s with regs := setReg s.regs d (maskC c v) }
   | .Store wd v addr =>
-    (o.store s.world wd (atomVal o s.regs .L v) (atomVal o s.regs .L addr)).map
+    (o.store s.world wd (maskWidth wd (atomVal o s.regs (storeCls wd) v)) (atomVal o s.regs .L addr)).map
       fun w => { s with world := w }
   | .Call d c hasd callee cargs =>
     (o.call s.world (atomVal o s.regs .L callee)

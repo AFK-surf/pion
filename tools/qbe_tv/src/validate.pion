@@ -9,7 +9,8 @@
 ///| Solver vs. checker: `build_cert` (untrusted) searches a certificate and
 ///| `verify_cert` (trusted, the only part the soundness proof covers) checks
 ///| it, recomputing everything it relies on:
-///| 1. `wf_code`: dense ids, single assignment, `par` only at the entry.
+///| 1. `wf_code`: dense ids, temps in range, single assignment, `par` only at
+///|    the entry.
 ///| 2. `check_src_defs` / `check_tgt_defs`: the symbolic value (`canon.pion`)
 ///|    of every temp is the value of its definition; a phi may fold only
 ///|    over its live edges (`edge_dead`).
@@ -219,6 +220,32 @@ fn target_ok(nb : Int, s : Int) -> Bool {
   s > 0 && s < nb
 }
 
+///| An instruction that writes a temp names one in range (`setreg` of a
+///| negative id would write some other temp).
+fn dst_ok(nt : Int, inst : Inst) -> Bool {
+  match inst {
+    Par(d, _, _) => temp_ok(nt, d)
+    Un(d, _, _, _) => temp_ok(nt, d)
+    Bin(d, _, _, _, _) => temp_ok(nt, d)
+    Load(d, _, _, _, _) => temp_ok(nt, d)
+    Store(_, _, _) => true
+    Call(d, _, h, _, _) => !h || temp_ok(nt, d)
+    Alloc(d, _, _) => temp_ok(nt, d)
+  }
+}
+
+///| Every instruction of `f` passes `dst_ok`.
+fn dsts_ok(f : Func) -> Bool {
+  for blk in f.blocks {
+    for inst in blk.insts {
+      if !dst_ok(f.ntemps, inst) {
+        return false
+      }
+    }
+  }
+  true
+}
+
 ///| 0 when `f` is well formed, else a failure code.
 pub fn wf_code(f : Func) -> Int {
   let nb = f.blocks.length()
@@ -227,6 +254,9 @@ pub fn wf_code(f : Func) -> Int {
   }
   if f.ntemps < 0 || f.nparams < 0 {
     return 2
+  }
+  if !dsts_ok(f) {
+    return 16
   }
   let nt = f.ntemps
   let mut defs = Array::make(nt, 0)
@@ -580,7 +610,8 @@ pub fn edge_dead(
   match f.blocks[p].term {
     Jnz(c, s1, s2) =>
     if s1 != s2 && atom_known(vids, c) {
-      let cv = apply_facts(mut vg, fs, atom_use(mut vg, vids, W, c))
+      let cv0 = atom_use(mut vg, vids, W, c)
+      let cv = apply_facts(mut vg, fs, cv0)
       match vg_const(vg, cv) {
         Some(x) => return (if x != 0UL { s1 } else { s2 }) != b
         None => ()
@@ -1086,10 +1117,12 @@ pub fn edge_facts(mut vg : ValGraph, f : Func, vids : Array[Int], p : Int, s : I
         let taken = s == s1
         out.push(Fact::{ blk: s, vid: cv, zero: !taken })
         match vg.nodes[cv] {
-          SBin(_, CEq(_), x, y) => if vg_is_const(vg, y, 0UL) {
+          // `x == 0` / `x != 0` read at class cc says x is zero only when x
+          // has class cc (the certificate's graph is untrusted).
+          SBin(_, CEq(cc), x, y) => if vg_is_const(vg, y, 0UL) && vg_cls(vg, x) == cc {
             out.push(Fact::{ blk: s, vid: x, zero: taken })
           }
-          SBin(_, CNe(_), x, y) => if vg_is_const(vg, y, 0UL) {
+          SBin(_, CNe(cc), x, y) => if vg_is_const(vg, y, 0UL) && vg_cls(vg, x) == cc {
             out.push(Fact::{ blk: s, vid: x, zero: !taken })
           }
           _ => ()
@@ -1251,8 +1284,12 @@ fn fact_post(mut vg : ValGraph, fs : Array[Fact], r : Int) -> Int {
       }
       if vg_is_const(vg, y, 0UL) && fact_in(fs, x, false) {
         match op {
-          CEq(_) => return vg_konst(mut vg, c, 0UL)
-          CNe(_) => return vg_konst(mut vg, c, 1UL)
+          CEq(cc) => if vg_cls(vg, x) == cc {
+            return vg_konst(mut vg, c, 0UL)
+          }
+          CNe(cc) => if vg_cls(vg, x) == cc {
+            return vg_konst(mut vg, c, 1UL)
+          }
           _ => ()
         }
       }
@@ -1295,14 +1332,24 @@ pub fn apply_facts(mut vg : ValGraph, fs : Array[Fact], v : Int) -> Int {
   while j < n0 {
     if mark[j] {
       let n = vg.nodes[j]
+      // The operands are read at the classes `vg_canon_un` / `vg_canon_bin`
+      // assume (a node like `vg_trunc_w`'s `SUn(W, Copy, l)` has an `L`
+      // child); a division that may trap keeps its operation.
       let r = match n {
         SUn(c, op, a) => if a >= 0 && a < j {
-          vg_canon_un(mut vg, c, op, memo[a])
+          let ua = vg_use(mut vg, unop_arg_cls(op, c), memo[a])
+          vg_canon_un(mut vg, c, op, ua)
         } else {
           j
         }
         SBin(c, op, a, b) => if a >= 0 && a < j && b >= 0 && b < j {
-          vg_canon_bin(mut vg, c, op, memo[a], memo[b])
+          let ua = vg_use(mut vg, binop_arg_cls(op, c, 0), memo[a])
+          let ub = vg_use(mut vg, binop_arg_cls(op, c, 1), memo[b])
+          if is_trapping_binop(op) && !bin_safe(vg, c, op, ua, ub) {
+            vg_intern(mut vg, SBin(c, op, memo[a], memo[b]))
+          } else {
+            vg_canon_bin(mut vg, c, op, ua, ub)
+          }
         } else {
           j
         }
@@ -1453,13 +1500,19 @@ pub fn t_atom(mut vg : ValGraph, mut ts : TgtState, tgt : Func, ti : FnInfo, cls
   }
 }
 
-fn src_inst_is_effect(vg : ValGraph, svid : Array[Int], inst : Inst) -> Bool {
+///| Instruction i of source block b is a side effect: anything but a pure
+///| instruction, and a division whose value is its own leaf `SEffect(c, b,
+///| i)` (`eval_inst`). A division `check_src_defs` gave a canonical value is
+///| pure even when that value is the effect leaf of another instruction (a
+///| target result matched with it would hold that leaf after the source
+///| re-enters its block).
+fn src_inst_is_effect(vg : ValGraph, svid : Array[Int], inst : Inst, b : Int, i : Int) -> Bool {
   match inst {
     Par(_, _, _) => false
     Un(_, _, _, _) => false
-    Bin(d, _, op, _, _) =>
+    Bin(d, c, op, _, _) =>
     is_trapping_binop(op) &&
-    (d < 0 || d >= svid.length() || svid[d] < 0 || vg_is_effect_leaf(vg, svid[d]))
+    (d < 0 || d >= svid.length() || !vg_valid(vg, svid[d]) || sym_node_eq(vg.nodes[svid[d]], SEffect(c, b, i)))
     _ => true
   }
 }
@@ -2056,7 +2109,7 @@ fn walk_one(
   while fuel > 0 {
     fuel = fuel - 1
     let slen = src.blocks[sc].insts.length()
-    while sx < slen && !src_inst_is_effect(vg, svid, src.blocks[sc].insts[sx]) {
+    while sx < slen && !src_inst_is_effect(vg, svid, src.blocks[sc].insts[sx], sc, sx) {
       sx = sx + 1
     }
     let tlen = tgt.blocks[tc].insts.length()
@@ -2613,16 +2666,35 @@ fn bm_has(cert : Cert, tb : Int, sb : Int) -> Bool {
 fn skip_src_pure(vg : ValGraph, f : Func, svid : Array[Int], b : Int, x0 : Int) -> Int {
   let n = f.blocks[b].insts.length()
   let mut x = x0
-  while x < n && !src_inst_is_effect(vg, svid, f.blocks[b].insts[x]) {
+  while x < n && !src_inst_is_effect(vg, svid, f.blocks[b].insts[x], b, x) {
     x = x + 1
   }
   x
 }
 
+///| Instruction i of target block b runs as a pure instruction in the
+///| replay: no effect, and a division that cannot trap has, when it has a
+///| value, the value of its definition in the graph as it is now (the graph
+///| grew since `check_tgt_defs` classified it).
+fn tgt_pure_c(mut vg : ValGraph, f : Func, tvid : Array[Int], b : Int, i : Int) -> Bool {
+  if tgt_effect_c(mut vg, tvid, f.blocks[b].insts[i]) {
+    return false
+  }
+  match f.blocks[b].insts[i] {
+    Bin(d, _, op, _, _) =>
+    if is_trapping_binop(op) && d >= 0 && d < tvid.length() && tvid[d] >= 0 {
+      tvid[d] == eval_inst(mut vg, tvid, f.blocks[b].insts[i], b, i, false)
+    } else {
+      true
+    }
+    _ => true
+  }
+}
+
 fn skip_tgt_pure(mut vg : ValGraph, f : Func, tvid : Array[Int], b : Int, x0 : Int) -> Int {
   let n = f.blocks[b].insts.length()
   let mut x = x0
-  while x < n && !tgt_effect_c(mut vg, tvid, f.blocks[b].insts[x]) {
+  while x < n && tgt_pure_c(mut vg, f, tvid, b, x) {
     x = x + 1
   }
   x
@@ -2635,7 +2707,8 @@ fn tgt_view_c(mut vg : ValGraph, f : Func, tvid : Array[Int], fs : Array[Fact], 
       if s1 == s2 {
         return VJmp(s1)
       }
-      let cv = apply_facts(mut vg, fs, atom_use(mut vg, tvid, W, c))
+      let cv0 = atom_use(mut vg, tvid, W, c)
+      let cv = apply_facts(mut vg, fs, cv0)
       match vg_const(vg, cv) {
         Some(x) => VJmp(if x != 0UL { s1 } else { s2 })
         None => VJnz(cv, s1, s2)
@@ -2643,7 +2716,8 @@ fn tgt_view_c(mut vg : ValGraph, f : Func, tvid : Array[Int], fs : Array[Fact], 
     }
     Ret(h, c, a) =>
     if h {
-      VRet(h, c, apply_facts(mut vg, fs, atom_use(mut vg, tvid, c, a)))
+      let v0 = atom_use(mut vg, tvid, c, a)
+      VRet(h, c, apply_facts(mut vg, fs, v0))
     } else {
       VRet(h, c, -1)
     }
@@ -2686,8 +2760,10 @@ fn match_effect_c(
           return false
         }
         let c = store_cls(sw)
-        let s1 = store_view(mut vg, sw, atom_use(mut vg, svid, c, sv))
-        let t1 = store_view(mut vg, sw, atom_use(mut vg, tvid, c, tv))
+        let sv0 = atom_use(mut vg, svid, c, sv)
+        let s1 = store_view(mut vg, sw, sv0)
+        let tv0 = atom_use(mut vg, tvid, c, tv)
+        let t1 = store_view(mut vg, sw, tv0)
         eq_under(mut vg, fs, s1, t1)
       }
       _ => false
