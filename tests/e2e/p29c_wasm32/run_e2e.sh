@@ -1030,4 +1030,147 @@ console.log("  str_map_fast (" + mode + "/" + rtLabel + "): out=" + out + " mem=
 done
 done
 
+echo "=== P29-C [13/13] Pure-Wasm Array / StringBuilder / String::slice+cmp+affix / Ptr Hot Paths ==="
+cat > "$TMP_DIR/arr_sb_ptr_fast.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Array::new (cap=0, small slab cap<=60, large cap>60), push, pop, set (incl. self-assign & grow)
+  let a0 : Array[Int] = Array::new()
+  must(a0.length() == 0, "a0 len")
+  let mut i = 0
+  while i < 120 {
+    a0.push(i * 3 + 1)
+    i = i + 1
+  }
+  must(a0.length() == 120 && a0[0] == 1 && a0[119] == 358, "a0 grow")
+  a0[10] = 999
+  must(a0[10] == 999, "a0 set")
+  match a0.pop() {
+    Some(popped) => must(popped == 358 && a0.length() == 119, "a0 pop")
+    None => must(false, "a0 pop none")
+  }
+
+  let a_small : Array[Int] = Array::make(12, 7)
+  must(a_small.length() == 12 && a_small[0] == 7 && a_small[11] == 7, "a_small make")
+  let a_big : Array[Int] = Array::make(80, 5)
+  must(a_big.length() == 80 && a_big[79] == 5, "a_big make")
+
+  // Object Array with self-assignment + repeated overwrite (RC zero leak)
+  let ao : Array[String] = Array::new()
+  let mut k = 0
+  while k < 40 {
+    ao.push("item_" + k.to_string())
+    k = k + 1
+  }
+  ao[5] = ao[5]
+  must(ao[5] == "item_5", "ao self-assign")
+  ao[5] = "replaced_" + (55).to_string()
+  must(ao[5] == "replaced_55", "ao overwrite")
+  match ao.pop() {
+    Some(pstr) => must(pstr == "item_39" && ao.length() == 39, "ao pop")
+    None => must(false, "ao pop none")
+  }
+
+  // 2. StringBuilder: ASCII + CJK UTF-8 + long grow + reset + to_string
+  let sb = StringBuilder::new()
+  sb.write_string("hi:")
+  sb.write_char('A')
+  sb.write_char('中')
+  sb.write_char('文')
+  let mut n = 0
+  while n < 40 {
+    sb.write_string("0123456789")
+    n = n + 1
+  }
+  let s1 = sb.to_string()
+  must(s1.starts_with("hi:A中文0123456789"), "sb starts_with")
+  must(s1.ends_with("0123456789"), "sb ends_with")
+  must(s1.length() == 3 + 1 + 6 + 400, "sb len")
+  sb.reset()
+  sb.write_string("ok")
+  must(sb.to_string() == "ok", "sb reset")
+
+  // 3. String::slice (normal, negative, OOB, reversed) + cmp + starts_with + ends_with
+  let base = "abcdef"
+  must(base.slice(1, 4) == "bcd", "slice mid")
+  must(base.slice(-5, 2) == "ab", "slice neg start")
+  must(base.slice(4, 100) == "ef", "slice oob end")
+  must(base.slice(5, 2) == "", "slice reversed")
+  must(base.slice(10, 20) == "", "slice past end")
+  must("abc" < "abd" && "abd" > "abc" && "ab" < "abc" && "abc" <= "abc", "str cmp")
+  must(base.starts_with("abc") && !base.starts_with("abd") && base.starts_with(""), "starts_with")
+  must(base.ends_with("def") && !base.ends_with("cef") && base.ends_with(""), "ends_with")
+  must(!"ab".starts_with("abc") && !"ab".ends_with("abc"), "affix longer")
+
+  // 4. Ptr offset + u8 / i32 / i64 / ptr read/write
+  let buf = ptr_alloc(64L)
+  let p1 = ptr_offset(buf, 8L)
+  ptr_write_u8(buf, 0L, 0xAB)
+  ptr_write_i32(buf, 4L, -123456)
+  ptr_write_i64(p1, 0L, 0x1122334455667788L)
+  ptr_write_ptr(buf, 16L, p1)
+  must(ptr_read_u8(buf, 0L) == 0xAB, "ptr u8")
+  must(ptr_read_i32(buf, 4L) == -123456, "ptr i32")
+  must(ptr_read_i64(buf, 8L) == 0x1122334455667788L, "ptr i64")
+  let rp = ptr_read_ptr(buf, 16L)
+  must(ptr_read_i64(rp, 0L) == 0x1122334455667788L, "ptr read_ptr")
+  ptr_free(buf)
+
+  io_println(world, a0.length().to_string() + ":" + s1.length().to_string() + ":" + base.slice(1, 4))
+  0
+}
+EOF
+ASP_REL_WASM="$TMP_DIR/arr_sb_ptr_rel.wasm"
+ASP_DEV_WASM="$TMP_DIR/arr_sb_ptr_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$ASP_REL_WASM" "$TMP_DIR/arr_sb_ptr_fast.pion"
+"$PIONC" build --target wasm32 -o "$ASP_DEV_WASM" "$TMP_DIR/arr_sb_ptr_fast.pion"
+for mode_wasm in "release:$ASP_REL_WASM" "dev:$ASP_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): arr_sb_ptr_fast.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "119:410:bcd") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): arr_sb_ptr_fast mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): arr_sb_ptr_fast linear memory leaked:", memBytes);
+  process.exit(1);
+}
+console.log("  arr_sb_ptr_fast (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
