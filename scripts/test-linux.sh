@@ -533,6 +533,8 @@ BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_benc
 KEEP_ALIVE=1 BENCH_LOAD="$OUT_DIR/bench_load" sh "$ROOT_DIR/examples/http_kv_service/run_bench.sh" "$PIONC" 8 500 8
 
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
-sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
+# Real `as`: its [5/5] builds the tests/tv/qbe_bugs reproducers through QBE text
+# assembly (and cc compiles their C driver) besides `--obj`.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
 
 echo "ALL LINUX ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) NATIVE BUILD, SELF-HOST & BENCHMARK CHECKSUM GATES PASSED!"

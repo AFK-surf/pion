@@ -435,7 +435,7 @@ dedupjmp(Fn *fn, Blk *b)
 	if (b->s1 == b->s2
 	|| isconbits(fn, b->jmp.arg, &v)
 	|| zeroval(fn, b, b->jmp.arg, Kw, &z)) {
-		if (v == 0 || z)
+		if ((uint32_t)v == 0 || z)
 			b->s1 = b->s2;
 		/* we later move active ins out of dead blks */
 		b->s2 = 0;

@@ -13,7 +13,12 @@ set -eu
 #      opt_suite function after GCM: all rejected;
 #   3. `qbe-tv --pair` on tests/tv/good (correct rewrites): all validated;
 #   4. `qbe-tv --pair` on tests/tv/adversarial (miscompilations): every
-#      pair rejected.
+#      pair rejected;
+#   5. tests/tv/qbe_bugs: reproducers of vendor/qbe bugs B1-B6 found by
+#      qbe-tv + differential fuzzing, built through text assembly and, where
+#      the target has it, `--obj`, and run against exact expected results;
+#      their `-d MG` trace validated by the strict checker (all but bug1,
+#      whose fold is beyond qbe-tv's completeness).
 #
 # usage: sh scripts/test-tv.sh <pionc> <qbe>
 
@@ -29,11 +34,11 @@ if [ -z "${PION_RT_LIB:-}" ] && [ -f "$(dirname "$QBE")/libpionrt.a" ]; then
   export PION_RT_LIB="$(dirname "$QBE")/libpionrt.a"
 fi
 
-echo "=== [1/4] build qbe-tv ==="
+echo "=== [1/5] build qbe-tv ==="
 PION_CACHE_DIR="$WORK/cas_cli" "$PIONC" build -o "$WORK/qbe-tv" "$ROOT_DIR/tools/qbe_tv_cli"
 TV="$WORK/qbe-tv"
 
-echo "=== [2/4] real qbe -d MG traces ==="
+echo "=== [2/5] real qbe -d MG traces ==="
 FAIL=0
 for spec in "opt_suite:tests/tv/opt_suite.pion:strict" "codec:tests/lean/codec:" "algos:tests/lean/algos:" "captable:tests/lean/captable:"; do
   name=${spec%%:*}
@@ -71,7 +76,7 @@ if [ "$FAIL" -ne 0 ]; then
   exit 1
 fi
 
-echo "=== [2b/4] tampered real traces: swapped jnz targets after GCM ==="
+echo "=== [2b/5] tampered real traces: swapped jnz targets after GCM ==="
 for dump in "$WORK"/opt_suite.*.mg; do
   awk '
     /^\*\*\*\* Function / { fn = $3; done = 0 }
@@ -104,7 +109,7 @@ for dump in "$WORK"/opt_suite.*.mg; do
   echo "tampered: $M/$T functions rejected"
 done
 
-echo "=== [3/4] correct rewrites (tests/tv/good) ==="
+echo "=== [3/5] correct rewrites (tests/tv/good) ==="
 for before in "$ROOT_DIR"/tests/tv/good/*.before.ssa; do
   after=${before%.before.ssa}.after.ssa
   case_name=$(basename "$before" .before.ssa)
@@ -117,7 +122,7 @@ for before in "$ROOT_DIR"/tests/tv/good/*.before.ssa; do
   fi
 done
 
-echo "=== [4/4] adversarial miscompilations (tests/tv/adversarial) ==="
+echo "=== [4/5] adversarial miscompilations (tests/tv/adversarial) ==="
 N=0
 for before in "$ROOT_DIR"/tests/tv/adversarial/*.before.ssa; do
   after=${before%.before.ssa}.after.ssa
@@ -140,4 +145,41 @@ if [ "$N" -lt 10 ]; then
   exit 1
 fi
 echo "adversarial: $N/$N rejected"
+
+echo "=== [5/5] vendor/qbe miscompilation regressions (tests/tv/qbe_bugs) ==="
+BUGS="$ROOT_DIR/tests/tv/qbe_bugs"
+"$QBE" -o "$WORK/qbe_bugs.s" "$BUGS/qbe_bugs.ssa"
+cc "$WORK/qbe_bugs.s" "$BUGS/driver.c" -o "$WORK/qbe_bugs_asm"
+printf "asm: "
+"$WORK/qbe_bugs_asm"
+# --obj emits arm64_apple Mach-O / amd64_sysv ELF64 only.
+case "$(uname -s):$(uname -m)" in
+  Darwin:arm64|Linux:x86_64|Linux:amd64)
+    "$QBE" --obj -o "$WORK/qbe_bugs.o" "$BUGS/qbe_bugs.ssa"
+    cc "$WORK/qbe_bugs.o" "$BUGS/driver.c" -o "$WORK/qbe_bugs_obj"
+    printf "obj: "
+    "$WORK/qbe_bugs_obj"
+    ;;
+  *) echo "obj: --obj not supported on $(uname -s) $(uname -m), skipped" ;;
+esac
+"$QBE" -d MG -o /dev/null "$BUGS/qbe_bugs.ssa" 2> "$WORK/qbe_bugs.mg"
+set +e
+OUT=$("$TV" --trace "$WORK/qbe_bugs.mg" --strict)
+set -e
+printf '%s\n' "$OUT"
+# bug1's fold of `jnz 4294967296` (only the low 32 bits count) is beyond
+# qbe-tv's completeness, so it is not required to validate; the driver checks
+# it. Every other reproducer must validate.
+for f in bug2_phi_class bug3_dwl_shr32 bug4a_amd64_jnz_l_and bug4b_amd64_jnz_l_neg \
+         bug4c_amd64_sel_l_and bug5_amd64_shift_zflag bug6_amd64_shift_imm; do
+  if ! printf '%s\n' "$OUT" | grep -qx "VALIDATED $f"; then
+    echo "FAIL: qbe_bugs trace: $f not validated" >&2
+    exit 1
+  fi
+done
+if printf '%s\n' "$OUT" | grep -E '^(REJECTED|SKIPPED) ' | grep -vq '^REJECTED bug1_dedupjmp_lowbits: '; then
+  echo "FAIL: qbe_bugs trace: unexpected rejection" >&2
+  exit 1
+fi
+echo "qbe_bugs: asm + obj exact, trace 7/7 validated (bug1 outside qbe-tv completeness)"
 echo "PASS: test-tv"

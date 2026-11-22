@@ -349,7 +349,13 @@ Next:
 			break;
 		case RCon:
 			fputc('$', e->f);
-			emitcon(&e->fn->con[ref.val], e);
+			if (sz == SByte
+			&& e->fn->con[ref.val].type == CBits)
+				/* x86 masks shift counts; match elf.c */
+				fprintf(e->f, "%d",
+					(int)(e->fn->con[ref.val].bits.i & 0xff));
+			else
+				emitcon(&e->fn->con[ref.val], e);
 			break;
 		default:
 			die("unreachable");
