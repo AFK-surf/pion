@@ -556,6 +556,72 @@ isconbits(Fn *fn, Ref r, int64_t *v)
 	return 0;
 }
 
+/* Hacker's Delight (Warren, Ch. 10, Fig. 10-1):
+ * Exact signed division magic multiplier for |d| >= 2, d != -(1 << (W-1)).
+ * Pure uint64_t arithmetic (no __int128) for full MSVC/C11 portability.
+ */
+static MagicS
+magic_signed(int64_t d, int W)
+{
+	uint64_t twoW1, ad, t, anc, q1, r1, q2, r2, delta, mu;
+	int64_t m;
+	int p, add;
+
+	twoW1 = 1ULL << (W - 1);
+	ad = d < 0 ? (uint64_t)(0ULL - (uint64_t)d) : (uint64_t)d;
+	t = twoW1 + (d < 0 ? 1ULL : 0ULL);
+	anc = t - 1ULL - (t % ad);
+	p = W - 1;
+	q1 = twoW1 / anc;
+	r1 = twoW1 - q1 * anc;
+	q2 = twoW1 / ad;
+	r2 = twoW1 - q2 * ad;
+	do {
+		p++;
+		q1 = 2ULL * q1;
+		r1 = 2ULL * r1;
+		if (r1 >= anc) {
+			q1++;
+			r1 -= anc;
+		}
+		q2 = 2ULL * q2;
+		r2 = 2ULL * r2;
+		if (r2 >= ad) {
+			q2++;
+			r2 -= ad;
+		}
+		delta = ad - r2;
+	} while (q1 < delta || (q1 == delta && r1 == 0));
+
+	mu = q2 + 1ULL;
+	if (W == 32) {
+		uint32_t m32 = (uint32_t)mu;
+		if (d < 0)
+			m32 = 0U - m32;
+		m = (int64_t)(int32_t)m32;
+	} else {
+		m = d < 0 ? (int64_t)(0ULL - mu) : (int64_t)mu;
+	}
+	add = 0;
+	if (d > 0 && m < 0)
+		add = 1;
+	else if (d < 0 && m > 0)
+		add = -1;
+	return (MagicS){ .m = m, .s = p - W, .add = add };
+}
+
+MagicS
+magic_s32(int32_t d)
+{
+	return magic_signed((int64_t)d, 32);
+}
+
+MagicS
+magic_s64(int64_t d)
+{
+	return magic_signed(d, 64);
+}
+
 void
 salloc(Ref rt, Ref rs, Fn *fn)
 {

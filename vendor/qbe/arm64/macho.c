@@ -1156,6 +1156,12 @@ me_emitins(Ins *i, ME *e)
 		}
 		break;
 
+	case Osmulh:
+		/* smulh rd, rn, rm */
+		emit_u32(0x9b407c00u | (greg(i->arg[1].val) << 16)
+			| (greg(i->arg[0].val) << 5) | greg(i->to.val));
+		break;
+
 	case Odiv:
 		if (KBASE(k) == 1) {
 			emit_u32(0x1e201800u | (ftype << 22) | (freg(i->arg[1].val) << 16)

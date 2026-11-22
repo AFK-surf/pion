@@ -520,6 +520,13 @@ Ref newcon(Con *, Fn *);
 Ref getcon(int64_t, Fn *);
 int addcon(Con *, Con *, int);
 int isconbits(Fn *fn, Ref r, int64_t *v);
+typedef struct {
+	int64_t m;
+	int s;
+	int add;
+} MagicS;
+MagicS magic_s32(int32_t);
+MagicS magic_s64(int64_t);
 void salloc(Ref, Ref, Fn *);
 void dumpts(BSet *, Tmp *, FILE *);
 void runmatch(uchar *, Num *, Ref, Ref *);

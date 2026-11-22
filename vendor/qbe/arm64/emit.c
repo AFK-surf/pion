@@ -54,6 +54,7 @@ static struct {
 	{ Oshl,    Ki, "lsl %=, %0, %1" },
 	{ Omul,    Ki, "mul %=, %0, %1" },
 	{ Omul,    Ka, "fmul %=, %0, %1" },
+	{ Osmulh,  Kl, "smulh %=, %0, %1" },
 	{ Odiv,    Ki, "sdiv %=, %0, %1" },
 	{ Odiv,    Ka, "fdiv %=, %0, %1" },
 	{ Oudiv,   Ki, "udiv %=, %0, %1" },

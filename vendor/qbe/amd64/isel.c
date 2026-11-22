@@ -275,6 +275,88 @@ sel(Ins i, Num *tn, Fn *fn)
 	case Ourem:
 		if (KBASE(k) == 1)
 			goto Emit;
+		if ((i.op == Odiv || i.op == Orem) && rtype(i.arg[1]) == RCon
+		&& fn->con[i.arg[1].val].type == CBits) {
+			int W = KWIDE(k) ? 64 : 32;
+			int64_t d = KWIDE(k) ? fn->con[i.arg[1].val].bits.i
+				: (int64_t)(int32_t)fn->con[i.arg[1].val].bits.i;
+			int64_t min_d = KWIDE(k) ? INT64_MIN : (int64_t)INT32_MIN;
+			if (d != min_d && (d >= 2 || d <= -2)) {
+				uint64_t ad = d < 0 ? (uint64_t)(0ULL - (uint64_t)d) : (uint64_t)d;
+				Ref rx = i.arg[0];
+				int need_fix_x = (rtype(rx) == RCon || rslot(rx, fn) != -1);
+				if (need_fix_x)
+					rx = newtmp("div", k, fn);
+
+				if ((ad & (ad - 1ULL)) == 0) {
+					int sh = 0;
+					while ((1ULL << sh) != ad)
+						sh++;
+					Ref q, t1, t2;
+					if (i.op == Orem) {
+						Ref prod = newtmp("div", k, fn);
+						q = newtmp("div", k, fn);
+						emit(Osub, k, i.to, rx, prod);
+						emit(Oshl, k, prod, q, getcon(sh, fn));
+					} else if (d < 0) {
+						q = newtmp("div", k, fn);
+						emit(Oneg, k, i.to, q, R);
+					} else {
+						q = i.to;
+					}
+					t2 = newtmp("div", k, fn);
+					t1 = newtmp("div", k, fn);
+					emit(Osar, k, q, t2, getcon(sh, fn));
+					emit(Oadd, k, t2, rx, t1);
+					if (sh == 1) {
+						emit(Oshr, k, t1, rx, getcon(W - 1, fn));
+					} else {
+						Ref t0 = newtmp("div", k, fn);
+						emit(Oshr, k, t1, t0, getcon(W - sh, fn));
+						emit(Osar, k, t0, rx, getcon(W - 1, fn));
+					}
+				} else {
+					MagicS mg = KWIDE(k) ? magic_s64(d) : magic_s32((int32_t)d);
+					Ref q, q2, q1, q0, sgn, mreg;
+					if (i.op == Orem) {
+						Ref prod = newtmp("div", k, fn);
+						q = newtmp("div", k, fn);
+						emit(Osub, k, i.to, rx, prod);
+						emit(Omul, k, prod, q, getcon(d, fn));
+						fixarg(&curi->arg[1], k, curi, fn);
+					} else {
+						q = i.to;
+					}
+					q2 = newtmp("div", k, fn);
+					sgn = newtmp("div", k, fn);
+					emit(Oadd, k, q, q2, sgn);
+					emit(Oshr, k, sgn, q2, getcon(W - 1, fn));
+					if (mg.s > 0) {
+						q1 = newtmp("div", k, fn);
+						emit(Osar, k, q2, q1, getcon(mg.s, fn));
+					} else {
+						q1 = q2;
+					}
+					if (mg.add != 0) {
+						q0 = newtmp("div", k, fn);
+						emit(mg.add > 0 ? Oadd : Osub, k, q1, q0, rx);
+					} else {
+						q0 = q1;
+					}
+					mreg = newtmp("div", k, fn);
+					emit(Ocopy, k, q0, TMP(RDX), R);
+					emit(Ocopy, k, R, TMP(RAX), R);
+					emit(Oximul, k, TMP(RDX), mreg, R);
+					emit(Ocopy, k, TMP(RAX), rx, R);
+					emit(Ocopy, k, mreg, getcon(mg.m, fn), R);
+				}
+				if (need_fix_x) {
+					emit(Ocopy, k, rx, i.arg[0], R);
+					fixarg(&curi->arg[0], k, curi, fn);
+				}
+				break;
+			}
+		}
 		if (i.op == Odiv || i.op == Oudiv)
 			r0 = TMP(RAX), r1 = TMP(RDX);
 		else

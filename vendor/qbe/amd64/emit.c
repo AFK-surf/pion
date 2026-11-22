@@ -120,6 +120,7 @@ static struct {
 	{ Osign,    Kw, "cltd" },
 	{ Oxdiv,    Ki, "div%k %0" },
 	{ Oxidiv,   Ki, "idiv%k %0" },
+	{ Oximul,   Ki, "imul%k %0" },
 	{ Oxcmp,    Ks, "ucomiss %S0, %S1" },
 	{ Oxcmp,    Kd, "ucomisd %D0, %D1" },
 	{ Oxcmp,    Ki, "cmp%k %0, %1" },

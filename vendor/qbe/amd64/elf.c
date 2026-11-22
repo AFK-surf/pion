@@ -1252,6 +1252,12 @@ emitins(Ins i, EF *e)
 		break;
 	}
 
+	case Oximul: {
+		RmOp s = ref_to_rm(i.arg[0], 0, e);
+		emit_modrm(0, is64, 0, 0xf7, -1, 5, s, 0, 0);
+		break;
+	}
+
 	case Ostorel:
 	case Ostorew:
 	case Ostoreh:
