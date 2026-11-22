@@ -360,10 +360,24 @@ export function createPionRuntime(options = {}) {
     const hdr = p - HEADER_SIZE;
     const dropIdx = Number(dv.getBigInt64(hdr + 16, true));
     const tag = dv.getUint16(hdr + 12, true);
-    if (dropIdx !== 0 && exportsObj && exportsObj.__indirect_function_table) {
-      const fn = exportsObj.__indirect_function_table.get(dropIdx);
-      if (fn) fn(pBig(p));
-      syncViews();
+    if (dropIdx !== 0) {
+      dv.setBigInt64(hdr + 16, 0n, true);
+      if ((dropIdx & 0x80000000) !== 0) {
+        let m = dropIdx & 0x7fffffff;
+        for (let b = 0; m !== 0; b++, m >>>= 1) {
+          if (m & 1) {
+            const ev = dv.getBigInt64(p + b * 8, true);
+            if (ev !== 0n) {
+              pion_rc_dec(ev);
+              syncViews();
+            }
+          }
+        }
+      } else if (exportsObj && exportsObj.__indirect_function_table) {
+        const fn = exportsObj.__indirect_function_table.get(dropIdx);
+        if (fn) fn(pBig(p));
+        syncViews();
+      }
     }
     if (tag === TAG_ARRAY) {
       const len = Number(dv.getBigInt64(p + 0, true));

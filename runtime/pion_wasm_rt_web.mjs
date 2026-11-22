@@ -156,9 +156,17 @@ export function createPionRuntime(opts = {}) {
     const p = pNum(obj); if (!p) return; sync();
     const h = p - HDR;
     const dropIdx = Number(g64(h + 16)), tag = dv.getUint16(h + 12, true);
-    if (dropIdx && exp && exp.__indirect_function_table) {
-      const fn = exp.__indirect_function_table.get(dropIdx);
-      if (fn) fn(pBig(p)); sync();
+    if (dropIdx) {
+      s64(h + 16, 0);
+      if ((dropIdx & 0x80000000) !== 0) {
+        let m = dropIdx & 0x7fffffff;
+        for (let b = 0; m !== 0; b++, m >>>= 1) {
+          if (m & 1) { const ev = g64(p + b * 8); if (ev) { pion_rc_dec(ev); sync(); } }
+        }
+      } else if (exp && exp.__indirect_function_table) {
+        const fn = exp.__indirect_function_table.get(dropIdx);
+        if (fn) fn(pBig(p)); sync();
+      }
     }
     if (tag === TAG_ARRAY) {
       const len = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));

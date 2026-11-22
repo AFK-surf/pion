@@ -2712,4 +2712,169 @@ console.log("  p46a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P47-A: Tagged Slot-Mask Zero-call_indirect Tail-Loop Destructor + Deep List + Tree + Multi-Slot (Node + Web leaked=0) ==="
+cat > "$TMP_DIR/p47a_slot_mask_drop.pion" <<'EOF'
+struct TreeNode {
+  left : Option[TreeNode]
+  right : Option[TreeNode]
+}
+
+struct ListNode {
+  item_val : Int64
+  next : Option[ListNode]
+}
+
+struct MultiSlot {
+  a : Int64
+  s1 : String
+  b : Int64
+  s2 : String
+  next : Option[MultiSlot]
+}
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn make_tree(depth : Int) -> TreeNode {
+  if depth == 0 {
+    TreeNode::{ left: None, right: None }
+  } else {
+    TreeNode::{ left: Some(make_tree(depth - 1)), right: Some(make_tree(depth - 1)) }
+  }
+}
+
+fn check_tree(n : TreeNode) -> Int {
+  match n.left {
+    Some(l) => match n.right {
+      Some(r) => 1 + check_tree(l) + check_tree(r)
+      None => 1 + check_tree(l)
+    }
+    None => 1
+  }
+}
+
+fn build_deep_list(len : Int) -> Option[ListNode] {
+  let mut cur : Option[ListNode] = None
+  let mut i = 0
+  while i < len {
+    cur = Some(ListNode::{ item_val: i.to_int64(), next: cur })
+    i = i + 1
+  }
+  cur
+}
+
+fn build_multi_chain(len : Int) -> Option[MultiSlot] {
+  let mut cur : Option[MultiSlot] = None
+  let mut i = 0
+  while i < len {
+    cur = Some(MultiSlot::{
+      a: i.to_int64(),
+      s1: "p_" + i.to_string(),
+      b: (i * 3).to_int64(),
+      s2: "q_" + i.to_string(),
+      next: cur,
+    })
+    i = i + 1
+  }
+  cur
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Binary tree (depth=12 -> 8191 nodes, mixed internal + zero-drop leaf)
+  let t = make_tree(12)
+  let tc = check_tree(t)
+  must(tc == 8191, "tree check")
+
+  // 2. Deep singly-linked list (100_000 nodes -> would overflow Wasm call stack if not tail-looped!)
+  let lst = build_deep_list(100000)
+  let mut head_v : Int64 = -1L
+  match lst {
+    Some(n) => head_v = n.item_val
+    None => ()
+  }
+  must(head_v == 99999L, "deep list head")
+
+  // 3. Multi-slot struct chain (non-contiguous pointer slots + leaf strings + tail-loop)
+  let mc = build_multi_chain(500)
+  let mut mc_ok = false
+  match mc {
+    Some(m) => mc_ok = m.s1 == "p_499" && m.s2 == "q_499"
+    None => ()
+  }
+  must(mc_ok, "multi-slot chain")
+
+  io_println(world, "p47a_ok:" + tc.to_string() + ":" + head_v.to_string())
+  0
+}
+EOF
+P47A_REL_WASM="$TMP_DIR/p47a_rel.wasm"
+P47A_DEV_WASM="$TMP_DIR/p47a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P47A_REL_WASM" "$TMP_DIR/p47a_slot_mask_drop.pion"
+"$PIONC" build --target wasm32 -o "$P47A_DEV_WASM" "$TMP_DIR/p47a_slot_mask_drop.pion"
+for mode_wasm in "release:$P47A_REL_WASM" "dev:$P47A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p47a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p47a_ok:8191:99999") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p47a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p47a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p47a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
