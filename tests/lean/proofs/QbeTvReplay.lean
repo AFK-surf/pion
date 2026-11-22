@@ -776,7 +776,7 @@ theorem edge_dead_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pion.
       exact absurd h1 (by decide)
   rename_i h1
   obtain ⟨fs, hfs, h⟩ := bind_eq_ok h
-  have hfs' : ∀ fa, fa ∈ fs.val ↔ fa ∈ facts.val ∧ fa.blk = p := fun fa => mem_facts_of hfs
+  have hfs' : ∀ fa, fa ∈ fs.val → fa ∈ facts.val ∧ fa.blk = p := fun fa hfa => mem_facts_of hfs hfa
   obtain ⟨t3, ht3, h⟩ := bind_eq_ok h
   split at h
   · rename_i h3
@@ -784,8 +784,8 @@ theorem edge_dead_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pion.
     refine ⟨vg_extends_refl _, hd, fun _ G _ W o regs env hrun => ?_⟩
     obtain ⟨-, -, -, hfacts, -⟩ := hrun
     obtain ⟨fa, hfa, hz, fb, hfb, hfbv, hfbz⟩ := facts_contradict_true (h3 ▸ ht3)
-    have ha := hfacts fa ((hfs' fa).1 hfa).1 ((hfs' fa).1 hfa).2
-    have hb := hfacts fb ((hfs' fb).1 hfb).1 ((hfs' fb).1 hfb).2
+    have ha := hfacts fa (hfs' fa hfa).1 (hfs' fa hfa).2
+    have hb := hfacts fb (hfs' fb hfb).1 (hfs' fb hfb).2
     obtain ⟨-, -, hbn⟩ := hb
     obtain ⟨-, haz, -⟩ := ha
     rw [hfbv] at hbn
@@ -838,7 +838,7 @@ theorem edge_dead_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pion.
         obtain ⟨vcv0, -, -, -⟩ := h1u hcv0
         obtain ⟨vcv, valcv⟩ := h2v vcv0
         have hfsh : FactsHold G env fs.val := fun fa hfa =>
-          hfacts fa ((hfs' fa).1 hfa).1 ((hfs' fa).1 hfa).2
+          hfacts fa (hfs' fa hfa).1 (hfs' fa hfa).2
         have hcond : atomVal o regs .W c = x.bv := by
           have hag : AtomAgree vg env vids.val o regs c :=
             atomAgree_down (vg_extends_trans e1 (vg_extends_trans e2 hG)) hca

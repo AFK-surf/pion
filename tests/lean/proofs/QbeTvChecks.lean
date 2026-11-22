@@ -1309,39 +1309,42 @@ theorem vg_is_phi_of_spec {vg : ValGraph} {v blk : Std.I32} {r : Bool} (h : vg_i
 theorem bm_has_true {cert : Cert} {tb sb : Std.I32} (h : bm_has cert tb sb = ok true) :
     ∃ j : Nat, cert.bm_t.val[j]? = some tb ∧ cert.bm_s.val[j]? = some sb := by
   unfold bm_has at h
-  obtain ⟨n, hn, h1⟩ := bind_eq_ok h
-  obtain ⟨s, hs, h2⟩ := bind_eq_ok h1
-  unfold bm_has_loop0 at hs
-  have key := loop_ok_inv (fun j => bm_has_loop0.body n cert tb sb j) (fun _ => True)
+  obtain ⟨n, -, h⟩ := bind_eq_ok h
+  obtain ⟨q, -, h⟩ := bind_eq_ok h
+  obtain ⟨lo1, hi1⟩ := q
+  try simp only [uncurry_apply_pair] at h
+  obtain ⟨s, hs, h2⟩ := bind_eq_ok h
+  unfold bm_has_loop1 at hs
+  have key := loop_ok_inv (fun j => bm_has_loop1.body n cert tb sb j) (fun _ => True)
     (fun r => match r with
       | .inl b => b = true → ∃ j : Nat, cert.bm_t.val[j]? = some tb ∧ cert.bm_s.val[j]? = some sb
       | .inr _ => True)
     (by
       intro j c _ hc
-      unfold bm_has_loop0.body at hc
-      obtain ⟨t2, -, hc1⟩ := bind_eq_ok hc
-      cases t2 with
-      | false => simp only [Bool.false_eq_true, ↓reduceIte] at hc1; rw [← ok_inj' hc1]; trivial
-      | true =>
-        simp only [↓reduceIte] at hc1
-        obtain ⟨t3, ht3, hc2⟩ := bind_eq_ok hc1
-        obtain ⟨_, ht3l, ht3v⟩ := arr_get_ok ht3
-        obtain ⟨t5, ht5, hc3⟩ := bind_eq_ok hc2
-        cases t5 with
-        | false => simp only [Bool.false_eq_true, ↓reduceIte] at hc3; rw [← ok_inj' hc3]; trivial
-        | true =>
-          simp only [↓reduceIte] at hc3
-          rw [← ok_inj' hc3]
+      unfold bm_has_loop1.body at hc
+      obtain ⟨t4, -, hc⟩ := bind_eq_ok hc
+      obtain ⟨t6, ht6, hc⟩ := bind_eq_ok hc
+      split at hc
+      · rename_i h6
+        obtain ⟨t7, ht7, hc⟩ := bind_eq_ok hc
+        obtain ⟨_, ht7l, ht7v⟩ := arr_get_ok ht7
+        split at hc
+        · rename_i he
+          rw [← ok_inj' hc]
           intro _
-          split at ht5
-          · rename_i he
-            obtain ⟨t4, ht4, ht5'⟩ := bind_eq_ok ht5
-            obtain ⟨_, ht4l, ht4v⟩ := arr_get_ok ht4
-            have := ok_inj' ht5'
-            refine ⟨j.val.toNat, by rw [List.getElem?_eq_getElem ht3l, ht3v, he], ?_⟩
-            rw [List.getElem?_eq_getElem ht4l, ht4v]
-            simpa using this.symm
-          · cases ok_inj' ht5)
+          split at ht6
+          · obtain ⟨t5, ht5, ht6⟩ := bind_eq_ok ht6
+            obtain ⟨_, ht5l, ht5v⟩ := arr_get_ok ht5
+            have := ok_inj' ht6
+            subst this
+            refine ⟨j.val.toNat, ?_, by rw [List.getElem?_eq_getElem ht7l, ht7v, he]⟩
+            rw [List.getElem?_eq_getElem ht5l, ht5v, (i32_beq_iff _ _).1 h6]
+          · cases ok_inj' ht6
+            cases h6
+        · rw [← ok_inj' hc]
+          trivial
+      · rw [← ok_inj' hc]
+        trivial)
     _ _ hs trivial
   cases s with
   | inl b =>

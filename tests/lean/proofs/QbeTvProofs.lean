@@ -498,7 +498,7 @@ theorem factsHold_of_facts_of {G : ValGraph} {env : SymEnv} {facts : Pion.Array 
     (h : ∀ fa ∈ facts.val, fa.blk.val = b.val.toNat → FactOK G env fa) (hb : 0 ≤ b.val) :
     FactsHold G env fs.val := by
   intro fa hfa
-  obtain ⟨hm, he⟩ := (mem_facts_of hfs).1 hfa
+  obtain ⟨hm, he⟩ := mem_facts_of hfs hfa
   exact h fa hm (by rw [he]; omega)
 
 /-- The state after the instructions a replay step runs, before the blocks it may enter. -/
@@ -2072,12 +2072,11 @@ theorem factOK_restrict {vg vg' : ValGraph} (hp : vg_extends vg vg') {env : SymE
 
 theorem stable_transport {vg G : ValGraph} (hp : vg_extends vg G) {vids : List Std.I32} (hv : VidsOK vg vids)
     {x : Nat} {v sb : Std.I32} (hx : vids[x]? = some v) (h0 : 0 ≤ v.val)
-    (hm : vid_mentions_blk vg v sb = ok false) :
+    (hm : Valid vg v ∧ Indep vg sb v.val.toNat) :
     ∀ env env', AgreeExcept sb env env' → evI G env' v = evI G env v := by
   intro env env' hag
-  have hval : Valid vg v := (hv x v hx).resolve_left (fun e => by rw [e] at h0; simp at h0)
-  rw [extends_evI hp env' hval, extends_evI hp env hval]
-  exact vid_mentions_blk_sound hm h0 hag
+  rw [extends_evI hp env' hm.1, extends_evI hp env hm.1]
+  exact hm.2 env env' hag
 
 /-- `cert_fail_code` returning `0`: the source and target contexts in the final graph, every pair
 replayed in it, and the first pair at the two entries. -/

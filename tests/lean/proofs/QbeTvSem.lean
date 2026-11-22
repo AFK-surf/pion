@@ -1040,68 +1040,106 @@ theorem vg_is_const_eq {vg : ValGraph} (hl : vg.nodes.val.length ≤ 2147483647)
 by at most `n` itself. -/
 def InternRes (vg : ValGraph) (n : SymNode) (r : Std.I32) (vg' : ValGraph) : Prop :=
   vg_extends vg vg' ∧ nodeAt vg' r = some n ∧
-    (vg' = vg ∨ (vg'.nodes.val = vg.nodes.val ++ [n] ∧ r.val = vg.nodes.val.length))
+    (vg'.nodes.val = vg.nodes.val ∨ (vg'.nodes.val = vg.nodes.val ++ [n] ∧ r.val = vg.nodes.val.length))
 
-theorem vg_intern_loop_ok (len : Std.I32) (vg : ValGraph) (n : SymNode) :
-    ∀ i r, vg_intern_loop0 len vg n i = ok r → 0 ≤ i.val →
+theorem nodeAt_congr {g g' : ValGraph} (h : g.nodes.val = g'.nodes.val) (a : Std.I32) :
+    nodeAt g a = nodeAt g' a := by
+  simp only [nodeAt, h]
+
+/-- The probe of `vg_intern`: it returns an index only after comparing its node with `n`, or
+appends `n`; the graph it carries is never changed (only its `buckets` on the append). -/
+theorem vg_intern_loop_ok (cap h mask : Std.I32) (n : SymNode) (len : Std.I32) (vg : ValGraph) :
+    ∀ (x : Std.I32 × ValGraph) r, vg_intern_loop1 cap h mask n len x.1 x.2 = ok r → x.2 = vg →
       match r with
-      | .inl (r, vg2) => vg2 = vg ∧ nodeAt vg r = some n
-      | .inr _ => True := by
-  intro i0 r0 h0 hi0
-  unfold vg_intern_loop0 at h0
-  refine loop_ok_inv (fun i => vg_intern_loop0.body len vg n i) (fun i : Std.I32 => 0 ≤ i.val)
+      | .inl (r, vg2) => (vg2.nodes.val = vg.nodes.val ∧ nodeAt vg r = some n) ∨
+          (vg2.nodes.val = vg.nodes.val ++ [n] ∧ r = len)
+      | .inr (_, vg2) => vg2 = vg := by
+  intro x r0 h0 hx
+  unfold vg_intern_loop1 at h0
+  refine loop_ok_inv (fun (p : Std.I32 × ValGraph) => vg_intern_loop1.body cap h mask n len p.1 p.2)
+    (fun p => p.2 = vg)
     (fun r => match r with
-      | .inl (r, vg2) => vg2 = vg ∧ nodeAt vg r = some n
-      | .inr _ => True) ?_ i0 r0 h0 hi0
-  intro i c hi hc
-  unfold vg_intern_loop0.body at hc
+      | .inl (r, vg2) => (vg2.nodes.val = vg.nodes.val ∧ nodeAt vg r = some n) ∨
+          (vg2.nodes.val = vg.nodes.val ++ [n] ∧ r = len)
+      | .inr (_, vg2) => vg2 = vg) ?_ x r0 h0 hx
+  rintro ⟨step, g⟩ c hg hc
+  simp only at hg hc
+  subst hg
+  unfold vg_intern_loop1.body at hc
   split at hc
-  · rename_i hlt
-    obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
-    obtain ⟨e, he, hc⟩ := bind_eq_ok hc
-    have hnode := nodes_get_ok ht
-    have he' := sym_node_eq_ok he
+  · obtain ⟨idx, -, hc⟩ := bind_eq_ok hc
     split at hc
-    · rename_i htrue
+    · obtain ⟨b2, -, hc⟩ := bind_eq_ok hc
       rw [← ok_inj' hc]
-      exact ⟨rfl, by rw [hnode, he'.1 htrue]⟩
-    · rw [← ok_inj' hc]
-      have hlt' : i.val < len.val := hlt
-      have := len.hmax
-      show 0 ≤ (Pion.I32.add i 1#i32).val
-      rw [i32_add_val i 1#i32 (by simp; omega) (by simp [IScalarTy.numBits] at this ⊢; omega)]
-      simp; omega
+      exact Or.inr ⟨rfl, rfl⟩
+    · obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
+      split at hc
+      · rename_i htrue
+        rw [← ok_inj' hc]
+        refine Or.inl ⟨rfl, ?_⟩
+        split at ht
+        · obtain ⟨m, hm, ht⟩ := bind_eq_ok ht
+          obtain ⟨e, he, ht⟩ := bind_eq_ok ht
+          have := ok_inj' ht
+          subst this
+          rw [nodes_get_ok hm, (sym_node_eq_ok he).1 htrue]
+        · have := ok_inj' ht
+          subst this
+          cases htrue
+      · rw [← ok_inj' hc]
   · rw [← ok_inj' hc]
-    trivial
 
 theorem vg_intern_ok {vg : ValGraph} {n : SymNode} {r : Std.I32} {vg' : ValGraph}
     (h : vg_intern vg n = ok (r, vg')) : InternRes vg n r vg' := by
   unfold vg_intern at h
   obtain ⟨len, hlen, h⟩ := bind_eq_ok h
-  obtain ⟨hl1, hl2⟩ := arr_length_ok hlen
-  obtain ⟨s, hs, h⟩ := bind_eq_ok h
-  have hloop := vg_intern_loop_ok len vg n _ s hs (by simp)
+  obtain ⟨hl1, -⟩ := arr_length_ok hlen
+  obtain ⟨cap0, -, h⟩ := bind_eq_ok h
+  obtain ⟨vg1, hvg1, h⟩ := bind_eq_ok h
+  have hn1 : vg1.nodes.val = vg.nodes.val := by
+    split at hvg1
+    · obtain ⟨c1, -, hvg1⟩ := bind_eq_ok hvg1
+      obtain ⟨b, -, hvg1⟩ := bind_eq_ok hvg1
+      rw [← ok_inj' hvg1]
+    · rw [← ok_inj' hvg1]
+  obtain ⟨cap1, -, h⟩ := bind_eq_ok h
+  obtain ⟨hh, -, h⟩ := bind_eq_ok h
+  obtain ⟨s, hs, hk⟩ := bind_eq_ok h
+  clear h
+  have hloop := vg_intern_loop_ok _ _ _ n len vg1 (0#i32, vg1) s hs rfl
+  have happ : ∀ vg2 : ValGraph, vg2.nodes.val = vg.nodes.val ++ [n] →
+      InternRes vg n len vg2 := by
+    intro vg2 e
+    refine ⟨⟨[n], e.symm⟩, ?_, Or.inr ⟨e, hl1⟩⟩
+    simp [nodeAt, e, hl1]
   cases s with
   | inl p =>
     obtain ⟨r2, vg2⟩ := p
-    obtain ⟨e1, e2⟩ := hloop
-    have := ok_inj' h
+    have := ok_inj' hk
     simp only [Prod.mk.injEq] at this
     obtain ⟨rfl, rfl⟩ := this
-    subst e1
-    exact ⟨vg_extends_refl _, e2, Or.inl rfl⟩
-  | inr _ =>
-    have := ok_inj' h
+    rcases hloop with ⟨e1, e2⟩ | ⟨e1, rfl⟩
+    · have e : vg2.nodes.val = vg.nodes.val := by rw [e1, hn1]
+      refine ⟨by show vg.nodes.val <+: vg2.nodes.val; rw [e], ?_, Or.inl e⟩
+      rw [nodeAt_congr (e.trans hn1.symm)]
+      exact e2
+    · exact happ vg2 (by rw [e1, hn1])
+  | inr p =>
+    obtain ⟨st, vg3⟩ := p
+    have hv3 : vg3 = vg1 := hloop
+    subst hv3
+    have := ok_inj' hk
     simp only [Prod.mk.injEq] at this
     obtain ⟨rfl, rfl⟩ := this
-    refine ⟨⟨[n], rfl⟩, ?_, Or.inr ⟨rfl, hl1⟩⟩
-    simp [nodeAt, hl1]
+    exact happ _ (by show vg3.nodes.val ++ [n] = _; rw [hn1])
 
 theorem intern_dag {vg : ValGraph} {n : SymNode} {r : Std.I32} {vg' : ValGraph}
     (hd : ValGraphDAG vg) (hc : childrenBelow n vg.nodes.val.length) (h : InternRes vg n r vg') :
     ValGraphDAG vg' := by
-  rcases h.2.2 with rfl | ⟨he, _⟩
-  · exact hd
+  rcases h.2.2 with he | ⟨he, _⟩
+  · intro i m hm
+    rw [he] at hm
+    exact hd i m hm
   · intro i m hm
     rw [he] at hm
     by_cases hi : i < vg.nodes.val.length
@@ -1780,5 +1818,169 @@ theorem evalFrom_fuel {W : Type} (o : WorldOracle W) (args : List (BitVec 64)) (
           exact ih _ _ _ _ h
       | Ret has c a => exact h
       | Hlt => exact h
+
+/-! ## `blk_mentions_table`: the dependency check for every node at once -/
+
+/-- Node `j` has the same value under any two environments that differ only on block `blk`. -/
+def Indep (vg : ValGraph) (blk : Std.I32) (j : Nat) : Prop :=
+  ∀ env env', AgreeExcept blk env env' → evalSym vg env' j = evalSym vg env j
+
+/-- A node whose leaf is of another block and whose in-range children are independent of `blk`
+is independent of `blk`. -/
+theorem indep_node {vg : ValGraph} {blk : Std.I32} {i : Nat} {t : SymNode}
+    (hn : vg.nodes.val[i]? = some t)
+    (hleaf : ∀ c b k, (t = .SPhi c b k ∨ t = .SEffect c b k) → b ≠ blk)
+    (hch : ∀ a : Std.I32, ((∃ c op, t = .SUn c op a) ∨ (∃ c op x, t = .SBin c op a x ∨ t = .SBin c op x a)) →
+      0 ≤ a.val → a.val.toNat < i → Indep vg blk a.val.toNat) :
+    Indep vg blk i := by
+  intro env env' ha
+  obtain ⟨hp, hsym, hphi, heff⟩ := ha
+  have sub_eq : ∀ a : Std.I32, (0 ≤ a.val ∧ a.val.toNat < i → Indep vg blk a.val.toNat) →
+      (if h : 0 ≤ a.val ∧ a.val.toNat < i then evalSym vg env' a.val.toNat else 0) =
+      (if h : 0 ≤ a.val ∧ a.val.toNat < i then evalSym vg env a.val.toNat else 0) := by
+    intro a ham
+    by_cases hc : 0 ≤ a.val ∧ a.val.toNat < i
+    · simp only [hc, and_self, ↓reduceDIte]
+      exact ham hc env env' ⟨hp, hsym, hphi, heff⟩
+    · simp only [hc, ↓reduceDIte]
+  rw [evalSym_unfold, evalSym_unfold, hn]
+  cases t with
+  | SConst c x => rfl
+  | SSym x => simp only [evalNode, hsym]
+  | SParam c k => simp only [evalNode, hp]
+  | SPhi c b k => simp only [evalNode, hphi c b k (hleaf c b k (Or.inl rfl))]
+  | SEffect c b k => simp only [evalNode, heff c b k (hleaf c b k (Or.inr rfl))]
+  | SUn c op a =>
+    simp only [evalNode]
+    rw [sub_eq a (fun h => hch a (Or.inl ⟨c, op, rfl⟩) h.1 h.2)]
+  | SBin c op a b =>
+    simp only [evalNode]
+    rw [sub_eq a (fun h => hch a (Or.inr ⟨c, op, b, Or.inl rfl⟩) h.1 h.2),
+      sub_eq b (fun h => hch b (Or.inr ⟨c, op, a, Or.inr rfl⟩) h.1 h.2)]
+
+/-- The guarded mark read `a >= 0 && a < i && m[a]` of `blk_mentions_table` returning `false`. -/
+theorem guard_get_false {m : Pion.Array Bool} {a i : Std.I32} {r : Bool}
+    (h : (if ((decide (a >= 0#i32)) && (decide (a < i))) then
+        (do let x ← Pion.Array.get m a; ok x) else ok false) = ok r)
+    (hr : r = false) (ha0 : 0 ≤ a.val) (hai : a.val < i.val) : m.val[a.val.toNat]? = some false := by
+  subst hr
+  split at h
+  · obtain ⟨x, hx, h⟩ := bind_eq_ok h
+    obtain ⟨_, hxl, hxv⟩ := arr_get_ok hx
+    have := ok_inj' h
+    subst this
+    rw [List.getElem?_eq_getElem hxl, hxv]
+  · rename_i hneg
+    exfalso
+    apply hneg
+    simp only [Bool.and_eq_true, decide_eq_true_eq, ge_iff_le, i32_le_iff, i32_lt_iff, i32_zero_val]
+    exact ⟨ha0, hai⟩
+
+/-- `blk_mentions_table vg blk`: one mark per node, and an unmarked node does not depend on
+block `blk`. -/
+theorem blk_mentions_table_sound {vg : ValGraph} {blk : Std.I32} {m : Pion.Array Bool}
+    (h : blk_mentions_table vg blk = ok m) :
+    m.val.length = vg.nodes.val.length ∧ ∀ i, m.val[i]? = some false → Indep vg blk i := by
+  unfold blk_mentions_table at h
+  obtain ⟨n, hn, h⟩ := bind_eq_ok h
+  obtain ⟨hn1, hn2⟩ := arr_length_ok hn
+  obtain ⟨q, hq, h⟩ := bind_eq_ok h
+  obtain ⟨i1, m1⟩ := q
+  try simp only [uncurry_apply_pair] at h
+  cases ok_inj' h
+  unfold blk_mentions_table_loop0 at hq
+  refine loop_ok_inv (fun (p : Std.I32 × Pion.Array Bool) => blk_mentions_table_loop0.body n vg blk p.1 p.2)
+    (fun p => 0 ≤ p.1.val ∧ p.2.val.length = vg.nodes.val.length ∧
+      ∀ j, j < p.1.val.toNat → p.2.val[j]? = some false → Indep vg blk j)
+    (fun p => p.2.val.length = vg.nodes.val.length ∧ ∀ j, p.2.val[j]? = some false → Indep vg blk j)
+    ?_ _ _ hq ⟨by simp, by simp [Pion.Array.make, listMake]; omega, fun j hj => by simp at hj⟩
+  rintro ⟨i, mm⟩ c ⟨hi0, hl, hall⟩ hc
+  simp only at hi0 hl hall hc
+  unfold blk_mentions_table_loop0.body at hc
+  split at hc
+  · rename_i hlt
+    have hlt' : i.val < vg.nodes.val.length := by simp only [i32_lt_iff] at hlt; omega
+    obtain ⟨t, ht, hc⟩ := bind_eq_ok hc
+    obtain ⟨_, htl, htv⟩ := arr_get_ok ht
+    have htn : vg.nodes.val[i.val.toNat]? = some t := by rw [List.getElem?_eq_getElem htl, htv]
+    obtain ⟨hit, hhit, hc⟩ := bind_eq_ok hc
+    obtain ⟨m1, hm1, hc⟩ := bind_eq_ok hc
+    rw [← ok_inj' hc]
+    have his : (Pion.I32.add i 1#i32).val = i.val + 1 := by
+      have h2 := i.hmin
+      simp only [IScalarTy.numBits] at h2
+      exact i32_add_val i 1#i32 (by simp; omega) (by simp; omega)
+    have hm1' : m1.val.length = vg.nodes.val.length ∧
+        (∀ j, j < i.val.toNat → m1.val[j]? = mm.val[j]?) ∧
+        (hit = false → m1.val[i.val.toNat]? = mm.val[i.val.toNat]?) ∧
+        (hit = true → m1.val[i.val.toNat]? ≠ some false) := by
+      split at hm1
+      · rename_i hh
+        obtain ⟨m2, hm2, hm1⟩ := bind_eq_ok hm1
+        cases ok_inj' hm1
+        have hs := arr_set_ok hm2
+        refine ⟨?_, ?_, ?_, ?_⟩
+        · rw [hs]; simp [hl]
+        · intro j hj
+          rw [hs, List.getElem?_set_ne (by omega)]
+        · intro hf
+          rw [hf] at hh
+          cases hh
+        · intro _
+          rw [hs]; simp [List.getElem?_set, hl, hlt']
+      · rename_i hh
+        cases ok_inj' hm1
+        exact ⟨hl, fun _ _ => rfl, fun _ => rfl, fun ht' => absurd ht' hh⟩
+    dsimp only
+    refine ⟨by rw [his]; omega, hm1'.1, fun j hj hjf => ?_⟩
+    rw [his] at hj
+    have hj' : j < i.val.toNat + 1 := by omega
+    by_cases hji : j < i.val.toNat
+    · rw [hm1'.2.1 j hji] at hjf
+      exact hall j hji hjf
+    · have hje : j = i.val.toNat := by omega
+      subst hje
+      cases hit with
+      | true => exact absurd hjf (hm1'.2.2.2 rfl)
+      | false =>
+        apply indep_node htn
+        · intro c b k hor e
+          rcases hor with rfl | rfl
+          all_goals
+            dsimp only at hhit
+            have := ok_inj' hhit
+            subst e
+            simp at this
+        · intro a hor ha0 hai
+          rcases hor with ⟨c, op, rfl⟩ | ⟨c, op, x, rfl | rfl⟩
+          · dsimp only at hhit
+            exact hall _ hai (guard_get_false hhit rfl ha0 (by omega))
+          · dsimp only at hhit
+            obtain ⟨t6, h6, h'⟩ := bind_eq_ok hhit
+            split at h'
+            · exact absurd (ok_inj' h') (by decide)
+            · rename_i h6f
+              exact hall _ hai (guard_get_false h6 (by simpa using h6f) ha0 (by omega))
+          · dsimp only at hhit
+            obtain ⟨t6, h6, h'⟩ := bind_eq_ok hhit
+            split at h'
+            · exact absurd (ok_inj' h') (by decide)
+            · exact hall _ hai (guard_get_false h' rfl ha0 (by omega))
+  · rename_i hge
+    rw [← ok_inj' hc]
+    dsimp only
+    refine ⟨hl, fun j hj => ?_⟩
+    have hjl : j < vg.nodes.val.length := by
+      by_contra hc'
+      rw [List.getElem?_eq_none (by omega)] at hj
+      cases hj
+    exact hall j (by simp only [i32_lt_iff] at hge; omega) hj
+
+/-- An unmarked node keeps its independence in every graph extending the table's. -/
+theorem indep_extends {vg G : ValGraph} (hp : vg_extends vg G) {blk : Std.I32} {j : Nat}
+    (hj : j < vg.nodes.val.length) (h : Indep vg blk j) : Indep G blk j := by
+  intro env env' ha
+  rw [evalSym_extends hp env' j hj, evalSym_extends hp env j hj]
+  exact h env env' ha
 
 end PionProofs.QbeTvP

@@ -72,6 +72,12 @@ import PionProofs.QbeTvProofs
 #print axioms PionProofs.QbeTvP.check_vg_dag_sound
 #print axioms PionProofs.QbeTvP.sweep_eval
 #print axioms PionProofs.QbeTvP.vid_mentions_blk_sound
+#print axioms PionProofs.QbeTvP.nodeAt_congr
+#print axioms PionProofs.QbeTvP.indep_node
+#print axioms PionProofs.QbeTvP.guard_get_false
+#print axioms PionProofs.QbeTvP.blk_mentions_table_sound
+#print axioms PionProofs.QbeTvP.indep_extends
+#print axioms PionProofs.QbeTvP.avail_loop4
 #print axioms PionProofs.QbeTvP.evalFrom_fuel
 #print axioms PionProofs.QbeTvP.constOf_evI
 #print axioms PionProofs.QbeTvP.evI_masked
@@ -215,7 +221,6 @@ import PionProofs.QbeTvProofs
 #print axioms PionProofs.QbeTvP.is_edge_false
 #print axioms PionProofs.QbeTvP.inst_dst_spec
 #print axioms PionProofs.QbeTvP.contains_int_spec
-#print axioms PionProofs.QbeTvP.facts_of_spec
 #print axioms PionProofs.QbeTvP.mem_facts_of
 #print axioms PionProofs.QbeTvP.fact_in_spec
 #print axioms PionProofs.QbeTvP.fact_in_blk_spec

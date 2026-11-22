@@ -29,26 +29,142 @@ pub enum SymNode {
 
 pub struct ValGraph {
   mut nodes : Array[SymNode]
+  /// Open-addressing hash index of `nodes` (`-1`: empty slot), a power of two
+  /// long or empty. Only a lookup accelerator: no proof reads it, and an
+  /// entry that is out of range or names another node is just skipped.
+  mut buckets : Array[Int]
 }
 
 pub fn vg_new() -> ValGraph {
   let nodes : Array[SymNode] = []
-  ValGraph::{ nodes: nodes }
+  let buckets : Array[Int] = []
+  ValGraph::{ nodes, buckets }
 }
 
 pub fn sym_node_eq(a : SymNode, b : SymNode) -> Bool {
   a == b
 }
 
-///| Index of `n` in `vg`, appending it when absent (never mutates a node).
-pub fn vg_intern(mut vg : ValGraph, n : SymNode) -> Int {
-  let len = vg.nodes.length()
+fn cls_tag(c : Cls) -> Int {
+  match c {
+    W => 1
+    L => 2
+  }
+}
+
+fn unop_tag(op : UnOp) -> Int {
+  match op {
+    Copy => 1
+    Neg => 2
+    ExtSB => 3
+    ExtUB => 4
+    ExtSH => 5
+    ExtUH => 6
+    ExtSW => 7
+    ExtUW => 8
+  }
+}
+
+fn binop_tag(op : BinOp) -> Int {
+  match op {
+    Add => 1
+    Sub => 2
+    Mul => 3
+    And => 4
+    Or => 5
+    Xor => 6
+    Shl => 7
+    Shr => 8
+    Sar => 9
+    Div => 10
+    UDiv => 11
+    Rem => 12
+    URem => 13
+    CEq(c) => 16 + cls_tag(c)
+    CNe(c) => 20 + cls_tag(c)
+    CSlt(c) => 24 + cls_tag(c)
+    CSle(c) => 28 + cls_tag(c)
+    CSgt(c) => 32 + cls_tag(c)
+    CSge(c) => 36 + cls_tag(c)
+    CUlt(c) => 40 + cls_tag(c)
+    CUle(c) => 44 + cls_tag(c)
+    CUgt(c) => 48 + cls_tag(c)
+    CUge(c) => 52 + cls_tag(c)
+  }
+}
+
+fn hash_mix(h : Int, x : Int) -> Int {
+  (h ^ x) * 16777619 + 40503
+}
+
+///| A hash of a node (wrapping 32-bit arithmetic).
+pub fn sym_node_hash(n : SymNode) -> Int {
+  match n {
+    SConst(c, x) => {
+      let lo = (x & 0xFFFF_FFFFUL).to_int()
+      let hi = (x >> 32).to_int()
+      hash_mix(hash_mix(hash_mix(1, cls_tag(c)), lo), hi)
+    }
+    SSym(s) => hash_mix(2, s)
+    SParam(c, k) => hash_mix(hash_mix(3, cls_tag(c)), k)
+    SPhi(c, b, k) => hash_mix(hash_mix(hash_mix(4, cls_tag(c)), b), k)
+    SEffect(c, b, i) => hash_mix(hash_mix(hash_mix(5, cls_tag(c)), b), i)
+    SUn(c, op, a) => hash_mix(hash_mix(hash_mix(6, cls_tag(c)), unop_tag(op)), a)
+    SBin(c, op, a, b) => hash_mix(hash_mix(hash_mix(hash_mix(7, cls_tag(c)), binop_tag(op)), a), b)
+  }
+}
+
+///| A fresh index of `nodes` with `cap` slots (`cap` a power of two).
+pub fn vg_build_buckets(nodes : Array[SymNode], cap : Int) -> Array[Int] {
+  let mut bk = Array::make(cap, -1)
+  let mask = cap - 1
+  let n = nodes.length()
   let mut i = 0
-  while i < len {
-    if sym_node_eq(vg.nodes[i], n) {
-      return i
+  while i < n {
+    let h = sym_node_hash(nodes[i])
+    let mut step = 0
+    while step < cap {
+      let slot = (h + step) & mask
+      if bk[slot] < 0 {
+        bk[slot] = i
+        break
+      }
+      step = step + 1
     }
     i = i + 1
+  }
+  bk
+}
+
+///| Index of `n` in `vg`, appending it when absent (never mutates a node).
+///| The probe only ever returns an index whose node it compared equal to
+///| `n`; the index is rebuilt (at load below one half) before the probe.
+pub fn vg_intern(mut vg : ValGraph, n : SymNode) -> Int {
+  let len = vg.nodes.length()
+  let cap0 = vg.buckets.length()
+  if cap0 == 0 || (len + 1) * 2 >= cap0 {
+    let mut cap = 64
+    while cap <= (len + 1) * 2 && cap < 1073741824 {
+      cap = cap * 2
+    }
+    vg.buckets = vg_build_buckets(vg.nodes, cap)
+  }
+  let cap = vg.buckets.length()
+  let mask = cap - 1
+  let h = sym_node_hash(n)
+  let mut step = 0
+  while step < cap {
+    let slot = (h + step) & mask
+    let idx = vg.buckets[slot]
+    if idx < 0 {
+      vg.nodes.push(n)
+      vg.buckets[slot] = len
+      return len
+    }
+    if idx < len && sym_node_eq(vg.nodes[idx], n) {
+      return idx
+    }
+    step = step + 1
   }
   vg.nodes.push(n)
   len
@@ -707,4 +823,27 @@ pub fn vid_mentions_blk(vg : ValGraph, vid : Int, blk : Int) -> Bool {
     i = i - 1
   }
   false
+}
+
+///| `m[i]`: node i may depend on a phi or an effect of source block `blk`
+///| (one forward sweep: children precede parents). `m[i] == false` is what
+///| `vid_mentions_blk(vg, i, blk) == false` says, for every node at once.
+pub fn blk_mentions_table(vg : ValGraph, blk : Int) -> Array[Bool] {
+  let n = vg.nodes.length()
+  let mut m = Array::make(n, false)
+  let mut i = 0
+  while i < n {
+    let hit = match vg.nodes[i] {
+      SPhi(_, b, _) => b == blk
+      SEffect(_, b, _) => b == blk
+      SUn(_, _, a) => a >= 0 && a < i && m[a]
+      SBin(_, _, a, c) => (a >= 0 && a < i && m[a]) || (c >= 0 && c < i && m[c])
+      _ => false
+    }
+    if hit {
+      m[i] = true
+    }
+    i = i + 1
+  }
+  m
 }
