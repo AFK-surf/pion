@@ -5576,3 +5576,157 @@ test "p45c_target_wasm_loop_inline_split" {
   assert_eq(ci, 6)
   assert_eq(sum, 15)
 }
+
+///|
+struct P46cScanner {
+  src : String
+  len : Int
+  mut pos : Int
+}
+
+///|
+fn p46c_skip_ws(p : P46cScanner) -> Unit {
+  while p.pos < p.len {
+    let c = p.src.code_unit_at(p.pos)
+    if c == 32 || c == 9 {
+      p.pos = p.pos + 1
+    } else {
+      break
+    }
+  }
+}
+
+///|
+test "p46c_borrowed_arr_arg_and_field_promoted_bce" {
+  // 1. SSA assertions:
+  //    (a) `match counts.get(ks[ki])` & `sb.write_string(ks[ki])` borrow `ks[ki]` with zero rc_inc/rc_dec
+  //    (b) Field-promoted `while p.pos < p.len` scanner emits BCE fast loop `@wh_pfb` with zero `pion_panic_oob`
+  //    (c) Unsafe post-increment read (`p.pos = p.pos + 1; p.src.code_unit_at(p.pos)`) does NOT emit `@wh_pfb`
+  let src =
+    #|struct Scan {
+    #|  src : String
+    #|  len : Int
+    #|  mut pos : Int
+    #|}
+    #|
+    #|fn lookup_keys(counts : Map[String, Int64], ks : Array[String]) -> Int64 {
+    #|  let mut acc : Int64 = 0L
+    #|  let mut i = 0
+    #|  while i < ks.length() {
+    #|    let v = match counts.get(ks[i]) {
+    #|      Some(x) => x
+    #|      None => 0L
+    #|    }
+    #|    acc = acc + v
+    #|    i = i + 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|fn join_arr(ks : Array[String]) -> String {
+    #|  let sb = StringBuilder()
+    #|  let mut i = 0
+    #|  while i < ks.length() {
+    #|    sb.write_string(ks[i])
+    #|    i = i + 1
+    #|  }
+    #|  sb.to_string()
+    #|}
+    #|
+    #|fn scan_safe(p : Scan) -> Unit {
+    #|  while p.pos < p.len {
+    #|    let c = p.src.code_unit_at(p.pos)
+    #|    if c == 32 {
+    #|      p.pos = p.pos + 1
+    #|    } else {
+    #|      break
+    #|    }
+    #|  }
+    #|}
+    #|
+    #|fn scan_unsafe_post_inc(p : Scan) -> Int {
+    #|  let mut last = 0
+    #|  while p.pos < p.len {
+    #|    p.pos = p.pos + 1
+    #|    if p.pos < p.len {
+    #|      last = p.src.code_unit_at(p.pos)
+    #|    }
+    #|  }
+    #|  last
+    #|}
+  let cr = check_source_files_full("p46c", ["p46c.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    check_result_to_json(cr.diagnostics),
+  )
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let funcs = ssa.split("function ")
+  let mut lk_ssa = ""
+  let mut ja_ssa = ""
+  let mut safe_ssa = ""
+  let mut unsafe_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    let f = funcs[fi]
+    if f.contains("$pion_fn_lookup_keys(") {
+      lk_ssa = f
+    } else if f.contains("$pion_fn_join_arr(") {
+      ja_ssa = f
+    } else if f.contains("$pion_fn_scan_safe(") {
+      safe_ssa = f
+    } else if f.contains("$pion_fn_scan_unsafe_post_inc(") {
+      unsafe_ssa = f
+    }
+    fi = fi + 1
+  }
+  assert_true(
+    lk_ssa.length() > 0 && !lk_ssa.contains("pion_rc_inc") && !lk_ssa.contains("pion_rc_dec"),
+    lk_ssa,
+  )
+  // join_arr drops `sb` once at exit, but must have zero rc_inc inside the loop
+  assert_true(ja_ssa.length() > 0 && !ja_ssa.contains("pion_rc_inc"), ja_ssa)
+  // scan_safe emits @wh_pfb fast path with zero pion_panic_oob before @wh_pb slow fallback
+  assert_true(safe_ssa.contains("@wh_pfb_"), safe_ssa)
+  let pfb_parts = safe_ssa.split("@wh_pfb_")
+  assert_true(pfb_parts.length() >= 2, safe_ssa)
+  let fast_only = pfb_parts[1].split("@wh_pb_")[0]
+  assert_true(!fast_only.contains("pion_panic_oob"), fast_only)
+  // scan_unsafe_post_inc must NOT emit @wh_pfb_
+  assert_true(unsafe_ssa.length() > 0 && !unsafe_ssa.contains("@wh_pfb_"), unsafe_ssa)
+
+  // 2. Runtime assertions (also verified under ASan/TSan)
+  let m : Map[String, Int64] = Map([])
+  let ks = ["alpha", "beta", "gamma"]
+  let mut i = 0
+  while i < ks.length() {
+    m.set(ks[i], (i + 1).to_int64() * 10L)
+    i = i + 1
+  }
+  let mut total : Int64 = 0L
+  let mut ki = 0
+  while ki < ks.length() {
+    let v = match m.get(ks[ki]) {
+      Some(x) => x
+      None => 0L
+    }
+    total = total + v
+    ki = ki + 1
+  }
+  assert_eq(total, 60L)
+  let sb = StringBuilder()
+  let mut si = 0
+  while si < ks.length() {
+    sb.write_string(ks[si])
+    si = si + 1
+  }
+  assert_eq(sb.to_string(), "alphabetagamma")
+
+  // Fast path: p.len <= p.src.length()
+  let p1 = P46cScanner::{ src: "  \tabc", len: 6, pos: 0 }
+  p46c_skip_ws(p1)
+  assert_eq(p1.pos, 3)
+  // Slow fallback path: p.len > p.src.length(), breaks safely before OOB
+  let p2 = P46cScanner::{ src: "  x", len: 99, pos: 0 }
+  p46c_skip_ws(p2)
+  assert_eq(p2.pos, 2)
+}
