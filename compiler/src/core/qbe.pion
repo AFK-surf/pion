@@ -122,6 +122,15 @@ pub struct QbeFnWrapper {
 }
 
 ///|
+pub struct QbeInlineClosure {
+  params : Array[Param]
+  param_tys : Array[Ty]
+  ret_ty : Ty
+  body : Array[Stmt]
+  cap_locals : Array[QbeLocal]
+}
+
+///|
 pub struct QbeProbeHints {
   names : Array[String]
   tys : Array[Ty]
@@ -163,6 +172,13 @@ pub struct QbeGen {
   mut inline_fns : Map[String, FnDecl]
   mut inline_fn_costs : Map[String, Int]
   mut inline_fn_file : Map[String, Int]
+  mut hof_inline_fns : Map[String, FnDecl]
+  mut hof_inline_fn_file : Map[String, Int]
+  mut inline_closures : Map[String, QbeInlineClosure]
+  mut inline_ret_lbl : String
+  mut inline_ret_slot : String
+  mut inline_ret_ty : Ty
+  mut inline_ret_scope_depth : Int
   mut cur_file_idx : Int
   mut inline_depth : Int
   inline_stack : Array[String]
@@ -6715,6 +6731,541 @@ fn qbe_stmts_inline_cost(stmts : Array[Stmt], self_name : String) -> Int {
 }
 
 ///|
+fn qbe_hof_param_is_call_only_expr(e : Expr, pname : String) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => true
+    EIdent(n, _) => n != pname
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
+      qbe_hof_param_is_call_only_expr(inner, pname)
+    EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
+      qbe_hof_param_is_call_only_expr(l, pname) &&
+      qbe_hof_param_is_call_only_expr(r, pname)
+    ECall(callee, args, _) => {
+      let callee_ok = match callee {
+        EIdent(cname, _) =>
+          if cname == pname { true } else { qbe_hof_param_is_call_only_expr(callee, pname) }
+        _ => qbe_hof_param_is_call_only_expr(callee, pname)
+      }
+      if !callee_ok {
+        return false
+      }
+      let mut i = 0
+      while i < args.length() {
+        if !qbe_hof_param_is_call_only_expr(args[i], pname) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EMethodCall(obj, _, args, _) => {
+      if !qbe_hof_param_is_call_only_expr(obj, pname) {
+        return false
+      }
+      let mut i = 0
+      while i < args.length() {
+        if !qbe_hof_param_is_call_only_expr(args[i], pname) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EDotVariant(_, elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if !qbe_hof_param_is_call_only_expr(elems[i], pname) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(se) =>
+          if !qbe_hof_param_is_call_only_expr(se, pname) {
+            return false
+          }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if !qbe_hof_param_is_call_only_expr(fields[i].value, pname) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EBlock(stmts, _) => qbe_hof_param_is_call_only_stmts(stmts, pname)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if !qbe_hof_param_is_call_only_expr(cond, pname) ||
+        !qbe_hof_param_is_call_only_stmts(then_stmts, pname) {
+        return false
+      }
+      match else_opt {
+        None => true
+        Some(el) => qbe_hof_param_is_call_only_expr(el, pname)
+      }
+    }
+    EIs(scrut, _, _) => qbe_hof_param_is_call_only_expr(scrut, pname)
+    EMatch(scrut, arms, _) => {
+      if !qbe_hof_param_is_call_only_expr(scrut, pname) {
+        return false
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if !qbe_hof_param_is_call_only_expr(ge, pname) {
+              return false
+            }
+          None => ()
+        }
+        if !qbe_hof_param_is_call_only_expr(arms[i].body, pname) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        if !qbe_hof_param_is_call_only_expr(parts[i], pname) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EClosure(_, _, body, _) => qbe_hof_param_is_call_only_stmts(body, pname)
+  }
+}
+
+///|
+fn qbe_hof_param_is_call_only_stmts(stmts : Array[Stmt], pname : String) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    let ok = match stmts[i] {
+      SLet(n, _, _, init, _) =>
+        n != pname && qbe_hof_param_is_call_only_expr(init, pname)
+      SLetTuple(_, _, init, _) => qbe_hof_param_is_call_only_expr(init, pname)
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+        qbe_hof_param_is_call_only_expr(lhs, pname) &&
+        qbe_hof_param_is_call_only_expr(rhs, pname)
+      SExpr(e, _) => qbe_hof_param_is_call_only_expr(e, pname)
+      SWhile(c, b, _) | SGuard(c, b, _) =>
+        qbe_hof_param_is_call_only_expr(c, pname) &&
+        qbe_hof_param_is_call_only_stmts(b, pname)
+      SFor(is_, c, ss, b, _) =>
+        qbe_hof_param_is_call_only_stmts([is_], pname) &&
+        qbe_hof_param_is_call_only_expr(c, pname) &&
+        qbe_hof_param_is_call_only_stmts([ss], pname) &&
+        qbe_hof_param_is_call_only_stmts(b, pname)
+      SForRange(vn, s, e, _, b, _) =>
+        vn != pname &&
+        qbe_hof_param_is_call_only_expr(s, pname) &&
+        qbe_hof_param_is_call_only_expr(e, pname) &&
+        qbe_hof_param_is_call_only_stmts(b, pname)
+      SForIn(inm, vn, it, b, _) =>
+        inm != pname &&
+        vn != pname &&
+        qbe_hof_param_is_call_only_expr(it, pname) &&
+        qbe_hof_param_is_call_only_stmts(b, pname)
+      SReturn(opt, _) =>
+        match opt {
+          Some(e) => qbe_hof_param_is_call_only_expr(e, pname)
+          None => true
+        }
+      SDebugAssert(c, m, _) =>
+        qbe_hof_param_is_call_only_expr(c, pname) &&
+        qbe_hof_param_is_call_only_expr(m, pname)
+      SBreak(_) | SContinue(_) => true
+    }
+    if !ok {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn qbe_hof_expr_cost(e : Expr, self_name : String) -> Int {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => 1
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ENamedArg(_, _, inner, _) => {
+      let c = qbe_hof_expr_cost(inner, self_name)
+      if c < 0 { -1 } else { c + 1 }
+    }
+    EBinary(_, l, r, _) | EIndex(l, r, _) => {
+      let cl = qbe_hof_expr_cost(l, self_name)
+      if cl < 0 {
+        return -1
+      }
+      let cr = qbe_hof_expr_cost(r, self_name)
+      if cr < 0 { -1 } else { cl + cr + 1 }
+    }
+    ECall(callee, args, _) => {
+      match callee {
+        EIdent(cname, _) =>
+          if cname == self_name || cname == "panic" || cname == "abort" {
+            return -1
+          }
+        EPath(qual, mem, _) =>
+          if qual + "::" + mem == self_name {
+            return -1
+          }
+        _ => ()
+      }
+      let mut tot = qbe_hof_expr_cost(callee, self_name)
+      if tot < 0 {
+        return -1
+      }
+      let mut i = 0
+      while i < args.length() {
+        let ca = qbe_hof_expr_cost(args[i], self_name)
+        if ca < 0 {
+          return -1
+        }
+        tot = tot + ca
+        i = i + 1
+      }
+      tot + 2
+    }
+    EMethodCall(obj, mname, args, _) => {
+      if has_qual_sep(self_name) && split_qual_name(self_name).name == mname {
+        return -1
+      }
+      let mut tot = qbe_hof_expr_cost(obj, self_name)
+      if tot < 0 {
+        return -1
+      }
+      let mut i = 0
+      while i < args.length() {
+        let ca = qbe_hof_expr_cost(args[i], self_name)
+        if ca < 0 {
+          return -1
+        }
+        tot = tot + ca
+        i = i + 1
+      }
+      tot + 2
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EDotVariant(_, elems, _) => {
+      let mut tot = 2
+      let mut i = 0
+      while i < elems.length() {
+        let ca = qbe_hof_expr_cost(elems[i], self_name)
+        if ca < 0 {
+          return -1
+        }
+        tot = tot + ca
+        i = i + 1
+      }
+      tot
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(_) => return -1
+        None => ()
+      }
+      let mut tot = 2
+      let mut i = 0
+      while i < fields.length() {
+        let ca = qbe_hof_expr_cost(fields[i].value, self_name)
+        if ca < 0 {
+          return -1
+        }
+        tot = tot + ca
+        i = i + 1
+      }
+      tot
+    }
+    EBlock(stmts, _) => qbe_hof_stmts_cost(stmts, self_name)
+    EIf(cond, then_stmts, else_opt, _) => {
+      let cc = qbe_hof_expr_cost(cond, self_name)
+      if cc < 0 {
+        return -1
+      }
+      let ct = qbe_hof_stmts_cost(then_stmts, self_name)
+      if ct < 0 {
+        return -1
+      }
+      let ce = match else_opt {
+        None => 0
+        Some(el) => qbe_hof_expr_cost(el, self_name)
+      }
+      if ce < 0 { -1 } else { cc + ct + ce + 2 }
+    }
+    EIs(scrut, _, _) => qbe_hof_expr_cost(scrut, self_name)
+    EMatch(scrut, arms, _) => {
+      let mut tot = qbe_hof_expr_cost(scrut, self_name)
+      if tot < 0 {
+        return -1
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => {
+            let cg = qbe_hof_expr_cost(ge, self_name)
+            if cg < 0 {
+              return -1
+            }
+            tot = tot + cg
+          }
+          None => ()
+        }
+        let cb = qbe_hof_expr_cost(arms[i].body, self_name)
+        if cb < 0 {
+          return -1
+        }
+        tot = tot + cb + 1
+        i = i + 1
+      }
+      tot + 2
+    }
+    EClosure(_, _, _, _) | EScope(_, _, _) | ESpawn(_, _, _) | ETry(_, _) | EInterp(_, _) =>
+      -1
+  }
+}
+
+///|
+fn qbe_hof_stmts_cost(stmts : Array[Stmt], self_name : String) -> Int {
+  let mut tot = 0
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(_, _, _, init, _) => {
+        let c = qbe_hof_expr_cost(init, self_name)
+        if c < 0 {
+          return -1
+        }
+        tot = tot + c + 1
+      }
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        let cl = qbe_hof_expr_cost(lhs, self_name)
+        if cl < 0 {
+          return -1
+        }
+        let cr = qbe_hof_expr_cost(rhs, self_name)
+        if cr < 0 {
+          return -1
+        }
+        tot = tot + cl + cr + 1
+      }
+      SExpr(e, _) => {
+        let c = qbe_hof_expr_cost(e, self_name)
+        if c < 0 {
+          return -1
+        }
+        tot = tot + c
+      }
+      SWhile(wcond, wbody, _) => {
+        let cc = qbe_hof_expr_cost(wcond, self_name)
+        if cc < 0 {
+          return -1
+        }
+        let cb = qbe_hof_stmts_cost(wbody, self_name)
+        if cb < 0 {
+          return -1
+        }
+        tot = tot + cc + cb + 2
+      }
+      SBreak(_) | SContinue(_) => tot = tot + 1
+      SLetTuple(_, _, _, _) | SGuard(_, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _, _) | SForIn(_, _, _, _, _) | SReturn(_, _) | SDebugAssert(_, _, _) =>
+        return -1
+    }
+    if tot > 80 {
+      return -1
+    }
+    i = i + 1
+  }
+  tot
+}
+
+///|
+fn qbe_expr_has_nested_clo_or_conc(e : Expr) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => false
+    EClosure(_, _, _, _) | EScope(_, _, _, ) | ESpawn(_, _, _) => true
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | EField(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
+      qbe_expr_has_nested_clo_or_conc(inner)
+    EBinary(_, l, r, _) | EIndex(l, r, _) =>
+      qbe_expr_has_nested_clo_or_conc(l) || qbe_expr_has_nested_clo_or_conc(r)
+    ECall(callee, args, _) => {
+      if qbe_expr_has_nested_clo_or_conc(callee) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_nested_clo_or_conc(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EMethodCall(obj, _, args, _) => {
+      if qbe_expr_has_nested_clo_or_conc(obj) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_nested_clo_or_conc(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EDotVariant(_, elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_expr_has_nested_clo_or_conc(elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(se) =>
+          if qbe_expr_has_nested_clo_or_conc(se) {
+            return true
+          }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_expr_has_nested_clo_or_conc(fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) => qbe_stmts_has_nested_clo_or_conc(stmts)
+    EIf(cond, then_stmts, else_opt, _) =>
+      qbe_expr_has_nested_clo_or_conc(cond) ||
+      qbe_stmts_has_nested_clo_or_conc(then_stmts) ||
+      match else_opt {
+        None => false
+        Some(el) => qbe_expr_has_nested_clo_or_conc(el)
+      }
+    EIs(scrut, _, _) => qbe_expr_has_nested_clo_or_conc(scrut)
+    EMatch(scrut, arms, _) => {
+      if qbe_expr_has_nested_clo_or_conc(scrut) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if qbe_expr_has_nested_clo_or_conc(ge) {
+              return true
+            }
+          None => ()
+        }
+        if qbe_expr_has_nested_clo_or_conc(arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        if qbe_expr_has_nested_clo_or_conc(parts[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+  }
+}
+
+///|
+fn qbe_stmts_has_nested_clo_or_conc(stmts : Array[Stmt]) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    let hit = match stmts[i] {
+      SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) =>
+        qbe_expr_has_nested_clo_or_conc(init)
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+        qbe_expr_has_nested_clo_or_conc(lhs) || qbe_expr_has_nested_clo_or_conc(rhs)
+      SExpr(e, _) => qbe_expr_has_nested_clo_or_conc(e)
+      SWhile(c, b, _) | SGuard(c, b, _) =>
+        qbe_expr_has_nested_clo_or_conc(c) || qbe_stmts_has_nested_clo_or_conc(b)
+      SFor(is_, c, ss, b, _) =>
+        qbe_stmts_has_nested_clo_or_conc([is_]) ||
+        qbe_expr_has_nested_clo_or_conc(c) ||
+        qbe_stmts_has_nested_clo_or_conc([ss]) ||
+        qbe_stmts_has_nested_clo_or_conc(b)
+      SForRange(_, s, e, _, b, _) =>
+        qbe_expr_has_nested_clo_or_conc(s) ||
+        qbe_expr_has_nested_clo_or_conc(e) ||
+        qbe_stmts_has_nested_clo_or_conc(b)
+      SForIn(_, _, it, b, _) =>
+        qbe_expr_has_nested_clo_or_conc(it) || qbe_stmts_has_nested_clo_or_conc(b)
+      SReturn(opt, _) =>
+        match opt {
+          Some(e) => qbe_expr_has_nested_clo_or_conc(e)
+          None => false
+        }
+      SDebugAssert(c, m, _) =>
+        qbe_expr_has_nested_clo_or_conc(c) || qbe_expr_has_nested_clo_or_conc(m)
+      SBreak(_) | SContinue(_) => false
+    }
+    if hit {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
 fn qbe_collect_pkg_inline_fns(
   g : QbeGen,
   pkg : Package,
@@ -6723,6 +7274,8 @@ fn qbe_collect_pkg_inline_fns(
   let m : Map[String, FnDecl] = Map([])
   let mc : Map[String, Int] = Map([])
   let mf : Map[String, Int] = Map([])
+  let hm : Map[String, FnDecl] = Map([])
+  let hmf : Map[String, Int] = Map([])
   let mut fi = if only_file_idx >= 0 { only_file_idx } else { 0 }
   let end_fi = if only_file_idx >= 0 {
     if only_file_idx < pkg.files.length() { only_file_idx + 1 } else { 0 }
@@ -6737,18 +7290,40 @@ fn qbe_collect_pkg_inline_fns(
         DFn(fd) =>
           if fd.type_params.length() == 0 &&
             (fd.receiver_type != "" || fd.name != "main") &&
-            fd.body.length() >= 1 &&
-            fd.body.length() <= 8 {
+            fd.body.length() >= 1 {
             let key = if fd.receiver_type != "" {
               fd.receiver_type + "::" + fd.name
             } else {
               fd.name
             }
-            let cost = qbe_stmts_inline_cost(fd.body, key)
-            if cost >= 0 && cost <= 36 {
-              m.set(key, fd)
-              mc.set(key, cost)
-              mf.set(key, fi)
+            if fd.body.length() <= 8 {
+              let cost = qbe_stmts_inline_cost(fd.body, key)
+              if cost >= 0 && cost <= 36 {
+                m.set(key, fd)
+                mc.set(key, cost)
+                mf.set(key, fi)
+              }
+            }
+            if fd.body.length() <= 16 {
+              let mut has_fn_param = false
+              let mut pi = 0
+              while pi < fd.params.length() {
+                match fd.params[pi].ty {
+                  TyFn(_, _, _) => {
+                    has_fn_param = true
+                    break
+                  }
+                  _ => ()
+                }
+                pi = pi + 1
+              }
+              if has_fn_param {
+                let hcost = qbe_hof_stmts_cost(fd.body, key)
+                if hcost >= 0 && hcost <= 80 {
+                  hm.set(key, fd)
+                  hmf.set(key, fi)
+                }
+              }
             }
           }
         _ => ()
@@ -6760,6 +7335,405 @@ fn qbe_collect_pkg_inline_fns(
   g.inline_fns = m
   g.inline_fn_costs = mc
   g.inline_fn_file = mf
+  g.hof_inline_fns = hm
+  g.hof_inline_fn_file = hmf
+}
+
+///|
+fn qbe_try_inline_hof_call(
+  g : QbeGen,
+  key : String,
+  finfo : FnInfo,
+  norm_args : Array[Expr],
+) -> Option[QbeVal] {
+  if g.inline_depth >= 2 ||
+    finfo.decl.type_params.length() != 0 ||
+    str_arr_contains(g.inline_stack, key) {
+    return None
+  }
+  match g.hof_inline_fns.get(key) {
+    None => None
+    Some(hof_fd) => {
+      if g.unit_mode {
+        match g.hof_inline_fn_file.get(key) {
+          Some(fidx) =>
+            if g.cur_file_idx >= 0 && fidx != g.cur_file_idx {
+              return None
+            }
+          None => ()
+        }
+      }
+      if norm_args.length() != hof_fd.params.length() ||
+        norm_args.length() != finfo.param_tys.length() {
+        return None
+      }
+      let is_spec : Array[Bool] = []
+      let spec_map : Map[String, QbeInlineClosure] = Map([])
+      let mut spec_count = 0
+      let mut i = 0
+      while i < norm_args.length() {
+        let mut did_spec = false
+        match (norm_args[i], finfo.param_tys[i]) {
+          (EClosure(cparams, _, cbody, _), TFn(fptys, frty)) => {
+            let pname = hof_fd.params[i].name
+            if cparams.length() == fptys.length() &&
+              cbody.length() <= 16 &&
+              qbe_hof_param_is_call_only_stmts(hof_fd.body, pname) &&
+              !qbe_stmts_has_nested_clo_or_conc(cbody) {
+              let clocals : Map[String, Bool] = Map([])
+              let mut cpi = 0
+              while cpi < cparams.length() {
+                clocals.set(cparams[cpi].name, true)
+                cpi = cpi + 1
+              }
+              let raw_caps : Array[CaptureInfo] = []
+              collect_stmts_captures(cbody, clocals, raw_caps)
+              let snap_caps : Array[QbeLocal] = []
+              let seen_caps : Map[String, Bool] = Map([])
+              let mut caps_ok = true
+              let mut ci = 0
+              while ci < raw_caps.length() {
+                let cname = raw_caps[ci].name
+                if !seen_caps.contains(cname) {
+                  match qbe_lookup_local(g, cname) {
+                    Some(loc) =>
+                      if loc.is_cell || qbe_stmts_assigns_ident(cbody, cname) {
+                        caps_ok = false
+                        break
+                      } else {
+                        seen_caps.set(cname, true)
+                        snap_caps.push(
+                          QbeLocal::{
+                            name: loc.name,
+                            slot: loc.slot,
+                            ty: loc.ty,
+                            owned: false,
+                            is_cell: false,
+                          },
+                        )
+                      }
+                    None => ()
+                  }
+                }
+                ci = ci + 1
+              }
+              if caps_ok {
+                spec_map.set(
+                  pname,
+                  QbeInlineClosure::{
+                    params: cparams,
+                    param_tys: fptys,
+                    ret_ty: frty,
+                    body: cbody,
+                    cap_locals: snap_caps,
+                  },
+                )
+                did_spec = true
+                spec_count = spec_count + 1
+              }
+            }
+          }
+          _ => ()
+        }
+        is_spec.push(did_spec)
+        i = i + 1
+      }
+      if spec_count == 0 {
+        return None
+      }
+      // Evaluate non-specialized arguments in caller scope
+      let can_borrow = !qbe_args_have_assign(norm_args)
+      let arg_vals : Array[String] = []
+      let arg_tys : Array[Ty] = []
+      let arg_borrowed : Array[Bool] = []
+      i = 0
+      while i < norm_args.length() {
+        if is_spec[i] {
+          arg_vals.push("0")
+          arg_tys.push(finfo.param_tys[i])
+          arg_borrowed.push(true)
+        } else {
+          match norm_args[i] {
+            EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
+            _ => ()
+          }
+          let aa = qbe_emit_arg_maybe_borrow(
+            g,
+            norm_args[i],
+            Some(finfo.param_tys[i]),
+            can_borrow,
+          )
+          arg_vals.push(aa.qv.reg)
+          arg_tys.push(aa.qv.ty)
+          arg_borrowed.push(aa.borrowed)
+        }
+        i = i + 1
+      }
+      g.inline_depth = g.inline_depth + 1
+      g.inline_stack.push(key)
+      let inl_hlen = g.hoisted_arr_len
+      let inl_hdp = g.hoisted_arr_dp
+      let inl_hslen = g.hoisted_str_len
+      let inl_hsdp = g.hoisted_str_dp
+      let inl_hblen = g.hoisted_bytes_len
+      let inl_hbdp = g.hoisted_bytes_dp
+      let inl_hfields = g.hoisted_fields
+      let inl_bfields = g.block_immut_fields
+      let inl_lalias = g.len_aliases
+      let inl_lkeys = g.len_alias_keys
+      let inl_nonneg = g.nonneg_vars
+      let inl_bce = g.bce_safe_indices
+      let inl_bce_exprs = g.bce_safe_exprs
+      let inl_prom = g.promoted_fields
+      let inl_prom_tys = g.promoted_field_tys
+      let inl_w2l = g.w_to_l_ext
+      let inl_lw2l = g.local_w_to_l_ext
+      let inl_unfrozen = g.unfrozen_local_arrs
+      let inl_mov = g.movable_locals
+      let inl_moved = g.moved_slots
+      let inl_clos = g.inline_closures
+      let inl_rlbl = g.inline_ret_lbl
+      let inl_rslot = g.inline_ret_slot
+      let inl_rty = g.inline_ret_ty
+      let inl_rdep = g.inline_ret_scope_depth
+      g.hoisted_arr_len = Map([])
+      g.hoisted_arr_dp = Map([])
+      g.hoisted_str_len = Map([])
+      g.hoisted_str_dp = Map([])
+      g.hoisted_bytes_len = Map([])
+      g.hoisted_bytes_dp = Map([])
+      g.inline_closures = Map([])
+      g.inline_ret_lbl = ""
+      g.hoisted_fields = Map([])
+      g.block_immut_fields = Map([])
+      g.len_aliases = Map([])
+      g.len_alias_keys = []
+      g.nonneg_vars = Map([])
+      g.bce_safe_indices = Map([])
+      g.bce_safe_exprs = Map([])
+      g.promoted_fields = Map([])
+      g.promoted_field_tys = Map([])
+      g.w_to_l_ext = Map([])
+      g.local_w_to_l_ext = Map([])
+      g.unfrozen_local_arrs = Map([])
+      g.movable_locals = Map([])
+      g.moved_slots = Map([])
+      g.inline_closures = spec_map
+      g.inline_ret_lbl = ""
+      g.inline_ret_slot = ""
+      g.inline_ret_ty = TUnit
+      g.inline_ret_scope_depth = 0
+      qbe_scope_push(g)
+      let mut pi = 0
+      while pi < hof_fd.params.length() {
+        if !is_spec[pi] {
+          let pty = finfo.param_tys[pi]
+          let pname = hof_fd.params[pi].name
+          let pv = qbe_coerce_val(g, qval(arg_vals[pi], arg_tys[pi]), pty)
+          let mut p_owned = !arg_borrowed[pi]
+          if arg_borrowed[pi] && qbe_stmts_assigns_ident(hof_fd.body, pname) {
+            qbe_rc_inc(g, pv, pty)
+            p_owned = true
+          }
+          let loc = qbe_define_local(g, pname, pty, p_owned)
+          qbe_store_local_slot(g, pv, loc.slot, pty)
+        }
+        pi = pi + 1
+      }
+      let bres = qbe_emit_stmts(g, hof_fd.body, Some(finfo.ret_ty))
+      let out_reg = qbe_coerce_val(g, bres, finfo.ret_ty)
+      qbe_scope_pop(g)
+      g.hoisted_arr_len = inl_hlen
+      g.hoisted_arr_dp = inl_hdp
+      g.hoisted_str_len = inl_hslen
+      g.hoisted_str_dp = inl_hsdp
+      g.hoisted_bytes_len = inl_hblen
+      g.hoisted_bytes_dp = inl_hbdp
+      g.hoisted_fields = inl_hfields
+      g.block_immut_fields = Map([])
+      g.len_aliases = inl_lalias
+      g.len_alias_keys = inl_lkeys
+      g.nonneg_vars = inl_nonneg
+      g.bce_safe_indices = inl_bce
+      g.bce_safe_exprs = inl_bce_exprs
+      g.promoted_fields = inl_prom
+      g.promoted_field_tys = inl_prom_tys
+      g.w_to_l_ext = inl_w2l
+      g.local_w_to_l_ext = inl_lw2l
+      g.unfrozen_local_arrs = inl_unfrozen
+      g.movable_locals = inl_mov
+      g.moved_slots = inl_moved
+      g.inline_closures = inl_clos
+      g.inline_ret_lbl = inl_rlbl
+      g.inline_ret_slot = inl_rslot
+      g.inline_ret_ty = inl_rty
+      g.inline_ret_scope_depth = inl_rdep
+      let _ = inl_bfields
+      let _ = g.inline_stack.pop()
+      g.inline_depth = g.inline_depth - 1
+      Some(qval(out_reg, finfo.ret_ty))
+    }
+  }
+}
+
+///|
+fn qbe_emit_inline_closure_call(
+  g : QbeGen,
+  iclo : QbeInlineClosure,
+  args : Array[Expr],
+) -> QbeVal {
+  let can_borrow = !qbe_args_have_assign(args)
+  let arg_vals : Array[String] = []
+  let arg_tys : Array[Ty] = []
+  let arg_borrowed : Array[Bool] = []
+  let mut i = 0
+  while i < args.length() {
+    let ep : Option[Ty] = if i < iclo.param_tys.length() {
+      Some(iclo.param_tys[i])
+    } else {
+      None
+    }
+    let aa = qbe_emit_arg_maybe_borrow(g, args[i], ep, can_borrow)
+    arg_vals.push(aa.qv.reg)
+    arg_tys.push(aa.qv.ty)
+    arg_borrowed.push(aa.borrowed)
+    i = i + 1
+  }
+  let saved_scopes = g.scopes
+  let saved_breaks = g.loop_breaks
+  let saved_conts = g.loop_conts
+  let saved_depths = g.loop_depths
+  let saved_hlen = g.hoisted_arr_len
+  let saved_hdp = g.hoisted_arr_dp
+  let saved_hslen = g.hoisted_str_len
+  let saved_hsdp = g.hoisted_str_dp
+  let saved_hblen = g.hoisted_bytes_len
+  let saved_hbdp = g.hoisted_bytes_dp
+  let saved_hfields = g.hoisted_fields
+  let saved_bfields = g.block_immut_fields
+  let saved_lalias = g.len_aliases
+  let saved_lkeys = g.len_alias_keys
+  let saved_nonneg = g.nonneg_vars
+  let saved_bce = g.bce_safe_indices
+  let saved_bce_exprs = g.bce_safe_exprs
+  let saved_prom = g.promoted_fields
+  let saved_prom_tys = g.promoted_field_tys
+  let saved_w2l = g.w_to_l_ext
+  let saved_lw2l = g.local_w_to_l_ext
+  let saved_unfrozen = g.unfrozen_local_arrs
+  let saved_mov = g.movable_locals
+  let saved_moved = g.moved_slots
+  let saved_clos = g.inline_closures
+  let saved_rlbl = g.inline_ret_lbl
+  let saved_rslot = g.inline_ret_slot
+  let saved_rty = g.inline_ret_ty
+  let saved_rdep = g.inline_ret_scope_depth
+
+  g.scopes = [QbeScope::{ locals: iclo.cap_locals }]
+  g.loop_breaks = []
+  g.loop_conts = []
+  g.loop_depths = []
+  g.hoisted_arr_len = Map([])
+  g.hoisted_arr_dp = Map([])
+  g.hoisted_str_len = Map([])
+  g.hoisted_str_dp = Map([])
+  g.hoisted_bytes_len = Map([])
+  g.hoisted_bytes_dp = Map([])
+  g.inline_closures = Map([])
+  g.inline_ret_lbl = ""
+  g.hoisted_fields = Map([])
+  g.block_immut_fields = Map([])
+  g.len_aliases = Map([])
+  g.len_alias_keys = []
+  g.nonneg_vars = Map([])
+  g.bce_safe_indices = Map([])
+  g.bce_safe_exprs = Map([])
+  g.promoted_fields = Map([])
+  g.promoted_field_tys = Map([])
+  g.w_to_l_ext = Map([])
+  g.local_w_to_l_ext = Map([])
+  g.unfrozen_local_arrs = Map([])
+  g.movable_locals = Map([])
+  g.moved_slots = Map([])
+  g.inline_closures = Map([])
+
+  qbe_scope_push(g)
+  let mut pi = 0
+  while pi < iclo.params.length() && pi < iclo.param_tys.length() {
+    let pty = iclo.param_tys[pi]
+    let pname = iclo.params[pi].name
+    let pv = qbe_coerce_val(g, qval(arg_vals[pi], arg_tys[pi]), pty)
+    let mut p_owned = !arg_borrowed[pi]
+    if arg_borrowed[pi] && qbe_stmts_assigns_ident(iclo.body, pname) {
+      qbe_rc_inc(g, pv, pty)
+      p_owned = true
+    }
+    let loc = qbe_define_local(g, pname, pty, p_owned)
+    qbe_store_local_slot(g, pv, loc.slot, pty)
+    pi = pi + 1
+  }
+
+  let has_ret = qbe_stmts_has_cf(iclo.body, false, false, true)
+  let out_reg = if !has_ret {
+    g.inline_ret_lbl = ""
+    g.inline_ret_slot = ""
+    g.inline_ret_ty = TUnit
+    g.inline_ret_scope_depth = 0
+    let bres = qbe_emit_stmts(g, iclo.body, Some(iclo.ret_ty))
+    let r = qbe_coerce_val(g, bres, iclo.ret_ty)
+    qbe_scope_pop(g)
+    r
+  } else {
+    let ret_lbl = qbe_lbl(g, "iclo_ret")
+    let ret_slot = qbe_alloc_slot_for(g, iclo.ret_ty)
+    g.inline_ret_lbl = ret_lbl
+    g.inline_ret_slot = ret_slot
+    g.inline_ret_ty = iclo.ret_ty
+    g.inline_ret_scope_depth = 1
+    let bres = qbe_emit_stmts(g, iclo.body, Some(iclo.ret_ty))
+    if !g.block_term {
+      let r = qbe_coerce_val(g, bres, iclo.ret_ty)
+      qbe_store_local_slot(g, r, ret_slot, iclo.ret_ty)
+      qbe_scope_pop(g)
+      qbe_emit_term(g, "jmp " + ret_lbl)
+    } else {
+      let _ = g.scopes.pop()
+    }
+    qbe_emit_lbl(g, ret_lbl)
+    qbe_load_local_slot(g, ret_slot, iclo.ret_ty)
+  }
+
+  g.scopes = saved_scopes
+  g.loop_breaks = saved_breaks
+  g.loop_conts = saved_conts
+  g.loop_depths = saved_depths
+  g.hoisted_arr_len = saved_hlen
+  g.hoisted_arr_dp = saved_hdp
+  g.hoisted_str_len = saved_hslen
+  g.hoisted_str_dp = saved_hsdp
+  g.hoisted_bytes_len = saved_hblen
+  g.hoisted_bytes_dp = saved_hbdp
+  g.hoisted_fields = saved_hfields
+  g.block_immut_fields = Map([])
+  g.len_aliases = saved_lalias
+  g.len_alias_keys = saved_lkeys
+  g.nonneg_vars = saved_nonneg
+  g.bce_safe_indices = saved_bce
+  g.bce_safe_exprs = saved_bce_exprs
+  g.promoted_fields = saved_prom
+  g.promoted_field_tys = saved_prom_tys
+  g.w_to_l_ext = saved_w2l
+  g.local_w_to_l_ext = saved_lw2l
+  g.unfrozen_local_arrs = saved_unfrozen
+  g.movable_locals = saved_mov
+  g.moved_slots = saved_moved
+  g.inline_closures = saved_clos
+  g.inline_ret_lbl = saved_rlbl
+  g.inline_ret_slot = saved_rslot
+  g.inline_ret_ty = saved_rty
+  g.inline_ret_scope_depth = saved_rdep
+  let _ = saved_bfields
+  qval(out_reg, iclo.ret_ty)
 }
 
 ///|
@@ -6814,6 +7788,11 @@ fn qbe_try_inline_fn_call(
         let inl_unfrozen = g.unfrozen_local_arrs
         let inl_mov = g.movable_locals
         let inl_moved = g.moved_slots
+        let inl_clos = g.inline_closures
+        let inl_rlbl = g.inline_ret_lbl
+        let inl_rslot = g.inline_ret_slot
+        let inl_rty = g.inline_ret_ty
+        let inl_rdep = g.inline_ret_scope_depth
         g.hoisted_arr_len = Map([])
         g.hoisted_arr_dp = Map([])
         g.hoisted_str_len = Map([])
@@ -6834,6 +7813,11 @@ fn qbe_try_inline_fn_call(
         g.unfrozen_local_arrs = Map([])
         g.movable_locals = Map([])
         g.moved_slots = Map([])
+        g.inline_closures = Map([])
+        g.inline_ret_lbl = ""
+        g.inline_ret_slot = ""
+        g.inline_ret_ty = TUnit
+        g.inline_ret_scope_depth = 0
         qbe_scope_push(g)
         let mut pi = 0
         while pi < inl_fd.params.length() {
@@ -6872,6 +7856,11 @@ fn qbe_try_inline_fn_call(
         g.unfrozen_local_arrs = inl_unfrozen
         g.movable_locals = inl_mov
         g.moved_slots = inl_moved
+        g.inline_closures = inl_clos
+        g.inline_ret_lbl = inl_rlbl
+        g.inline_ret_slot = inl_rslot
+        g.inline_ret_ty = inl_rty
+        g.inline_ret_scope_depth = inl_rdep
         let _ = inl_bfields
         let _ = g.inline_stack.pop()
         g.inline_depth = g.inline_depth - 1
@@ -6921,6 +7910,13 @@ fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
     inline_fns: Map([]),
     inline_fn_costs: Map([]),
     inline_fn_file: Map([]),
+    hof_inline_fns: Map([]),
+    hof_inline_fn_file: Map([]),
+    inline_closures: Map([]),
+    inline_ret_lbl: "",
+    inline_ret_slot: "",
+    inline_ret_ty: TUnit,
+    inline_ret_scope_depth: 0,
     cur_file_idx: -1,
     inline_depth: 0,
     inline_stack: [],
@@ -10470,6 +11466,11 @@ fn qbe_emit_closure_obj(
   let saved_local_w2l = g.local_w_to_l_ext
   let saved_unfrozen = g.unfrozen_local_arrs
   let saved_boxed_mut = g.boxed_mut_vars
+  let saved_iclos = g.inline_closures
+  let saved_irlbl = g.inline_ret_lbl
+  let saved_irslot = g.inline_ret_slot
+  let saved_irty = g.inline_ret_ty
+  let saved_irdep = g.inline_ret_scope_depth
 
   g.fn_allocs = StringBuilder()
   g.fn_body = StringBuilder()
@@ -10487,6 +11488,8 @@ fn qbe_emit_closure_obj(
   g.hoisted_str_dp = Map([])
   g.hoisted_bytes_len = Map([])
   g.hoisted_bytes_dp = Map([])
+  g.inline_closures = Map([])
+  g.inline_ret_lbl = ""
   g.hoisted_fields = Map([])
   g.block_immut_fields = Map([])
   g.len_aliases = Map([])
@@ -10505,6 +11508,11 @@ fn qbe_emit_closure_obj(
   g.local_w_to_l_ext = Map([])
   g.unfrozen_local_arrs = Map([])
   g.boxed_mut_vars = qbe_collect_boxed_mut_vars(body)
+  g.inline_closures = Map([])
+  g.inline_ret_lbl = ""
+  g.inline_ret_slot = ""
+  g.inline_ret_ty = TUnit
+  g.inline_ret_scope_depth = 0
 
   qbe_scope_push(g)
   tpi = 0
@@ -10624,6 +11632,11 @@ fn qbe_emit_closure_obj(
   g.sq_reuse_slot = saved_sq_slot
   g.sq_reuse_state = saved_sq_state
   g.promoted_fields = saved_prom
+  g.inline_closures = saved_iclos
+  g.inline_ret_lbl = saved_irlbl
+  g.inline_ret_slot = saved_irslot
+  g.inline_ret_ty = saved_irty
+  g.inline_ret_scope_depth = saved_irdep
   g.promoted_field_tys = saved_prom_tys
   g.w_to_l_ext = saved_w2l
   g.local_w_to_l_ext = saved_local_w2l
@@ -11529,6 +12542,110 @@ fn qbe_emit_method_call(
     }
     TStringBuilder => {
       if method_name == "write_string" {
+        match args[0] {
+          EMethodCall(inner, mname, margs, _) =>
+            if mname == "to_string" && margs.length() == 0 {
+              match qbe_probe_expr_ty(g, inner) {
+                Some(TInt) => {
+                  let iv = qbe_emit_expr(g, inner, Some(TInt))
+                  let iw = qbe_coerce_val(g, iv, TInt)
+                  let il = qbe_tmp(g)
+                  qbe_emit(g, il + " =l extsw " + iw)
+                  qbe_emit(g, "call $pion_strbuf_push_int(l " + obj_val + ", l " + il + ")")
+                  if !obj_borrowed {
+                    qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+                  }
+                  return qval("0", TUnit)
+                }
+                Some(TInt64) => {
+                  let iv = qbe_emit_expr(g, inner, Some(TInt64))
+                  let il = qbe_coerce_val(g, iv, TInt64)
+                  qbe_emit(g, "call $pion_strbuf_push_int(l " + obj_val + ", l " + il + ")")
+                  if !obj_borrowed {
+                    qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+                  }
+                  return qval("0", TUnit)
+                }
+                _ => ()
+              }
+            }
+          EString(s, _) => {
+            let slen_lit = s.length()
+            if slen_lit >= 1 && slen_lit <= 8 {
+              let mut all_ascii = true
+              let mut si = 0
+              while si < slen_lit {
+                let c = str_code_at(s, si)
+                if c < 1 || c >= 128 {
+                  all_ascii = false
+                  break
+                }
+                si = si + 1
+              }
+              if all_ascii {
+                let slen = qbe_tmp(g)
+                let nlen = qbe_tmp(g)
+                let cap_p = qbe_tmp(g)
+                let scap = qbe_tmp(g)
+                let has_cap = qbe_tmp(g)
+                let l_fast = qbe_lbl(g, "sbl_f")
+                let l_slow = qbe_lbl(g, "sbl_s")
+                let l_end = qbe_lbl(g, "sbl_e")
+                qbe_emit(g, slen + " =l loadl " + obj_val)
+                qbe_emit(g, nlen + " =l add " + slen + ", " + slen_lit.to_string())
+                qbe_emit(g, cap_p + " =l add " + obj_val + ", 8")
+                qbe_emit(g, scap + " =l loadl " + cap_p)
+                qbe_emit(g, has_cap + " =w csltl " + nlen + ", " + scap)
+                qbe_emit_term(g, "jnz " + has_cap + ", " + l_fast + ", " + l_slow)
+                qbe_emit_lbl(g, l_fast)
+                let dp_p = qbe_tmp(g)
+                let dp = qbe_tmp(g)
+                let ep = qbe_tmp(g)
+                qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
+                qbe_emit(g, dp + " =l loadl " + dp_p)
+                qbe_emit(g, ep + " =l add " + dp + ", " + slen)
+                si = 0
+                while si < slen_lit {
+                  let ch = str_code_at(s, si).to_string()
+                  if si == 0 {
+                    qbe_emit(g, "storeb " + ch + ", " + ep)
+                  } else {
+                    let pk = qbe_tmp(g)
+                    qbe_emit(g, pk + " =l add " + ep + ", " + si.to_string())
+                    qbe_emit(g, "storeb " + ch + ", " + pk)
+                  }
+                  si = si + 1
+                }
+                let pz = qbe_tmp(g)
+                qbe_emit(g, pz + " =l add " + ep + ", " + slen_lit.to_string())
+                qbe_emit(g, "storeb 0, " + pz)
+                qbe_emit(g, "storel " + nlen + ", " + obj_val)
+                qbe_emit_term(g, "jmp " + l_end)
+                qbe_emit_lbl(g, l_slow)
+                if slen_lit == 1 {
+                  qbe_emit(
+                    g,
+                    "call $pion_strbuf_push_byte(l " +
+                    obj_val +
+                    ", w " +
+                    str_code_at(s, 0).to_string() +
+                    ")",
+                  )
+                } else {
+                  let slit = qbe_emit_string_lit(g, s)
+                  qbe_emit(g, "call $pion_strbuf_push_str(l " + obj_val + ", l " + slit + ")")
+                }
+                qbe_emit_term(g, "jmp " + l_end)
+                qbe_emit_lbl(g, l_end)
+                if !obj_borrowed {
+                  qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+                }
+                return qval("0", TUnit)
+              }
+            }
+          }
+          _ => ()
+        }
         let sa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
         let sv = sa.qv
         qbe_emit(g, "call $pion_strbuf_push_str(l " + obj_val + ", l " + sv.reg + ")")
@@ -13652,6 +14769,10 @@ fn qbe_probe_expr_ty_with(
                   return Some(rt)
                 }
               _ => ()
+            }
+            match g.inline_closures.get(name) {
+              Some(iclo) => return Some(iclo.ret_ty)
+              None => ()
             }
             match qbe_lookup_local(g, name) {
               Some(loc) =>
@@ -16131,6 +17252,13 @@ fn qbe_emit_expr_inner(
             )
             return qval("0", TNever)
           }
+          match g.inline_closures.get(name) {
+            Some(iclo) =>
+              if args.length() == iclo.params.length() {
+                return qbe_emit_inline_closure_call(g, iclo, args)
+              }
+            None => ()
+          }
           match qbe_lookup_local(g, name) {
             Some(loc) =>
               match loc.ty {
@@ -16196,6 +17324,12 @@ fn qbe_emit_expr_inner(
           match g.tc.fns.get(name) {
             Some(finfo) => {
               let norm_args = resolve_call_args_qbe(finfo.decl.params, 0, args, sp)
+              if finfo.decl.type_params.length() == 0 {
+                match qbe_try_inline_hof_call(g, name, finfo, norm_args) {
+                  Some(qv) => return qv
+                  None => ()
+                }
+              }
               let subst : Map[String, Ty] = Map([])
               match expected {
                 Some(et) => unify_tparams(finfo.ret_ty, et, subst)
@@ -16741,6 +17875,15 @@ fn qbe_emit_expr_inner(
                 None => ()
               }
               let can_borrow = !qbe_args_have_assign(norm_args)
+              if target_pkg == "" &&
+                g.mono_pkg == "" &&
+                !has_qual_sep(qual) &&
+                minfo.decl.type_params.length() == 0 {
+                match qbe_try_inline_hof_call(g, qual + "::" + mem, minfo, norm_args) {
+                  Some(qv) => return qv
+                  None => ()
+                }
+              }
               let arg_vals : Array[String] = []
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
@@ -22426,6 +23569,19 @@ fn qbe_emit_stmt(
       qval("0", TUnit)
     }
     SReturn(opt, _) => {
+      if g.inline_ret_lbl != "" {
+        let rv = match opt {
+          Some(e) => {
+            let ev = qbe_emit_expr(g, e, Some(g.inline_ret_ty))
+            qbe_coerce_val(g, ev, g.inline_ret_ty)
+          }
+          None => qbe_zero_reg(g.inline_ret_ty)
+        }
+        qbe_store_local_slot(g, rv, g.inline_ret_slot, g.inline_ret_ty)
+        qbe_release_scopes_down_to(g, g.inline_ret_scope_depth)
+        qbe_emit_term(g, "jmp " + g.inline_ret_lbl)
+        return qval("0", TNever)
+      }
       let target_abi_ty = g.cur_ret_abi_ty
       let old_mov = g.movable_locals
       let old_moved = g.moved_slots
@@ -22602,6 +23758,8 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       g.hoisted_str_dp = Map([])
       g.hoisted_bytes_len = Map([])
       g.hoisted_bytes_dp = Map([])
+      g.inline_closures = Map([])
+      g.inline_ret_lbl = ""
       g.hoisted_fields = Map([])
       g.block_immut_fields = Map([])
       g.len_aliases = Map([])
@@ -22720,6 +23878,8 @@ fn qbe_emit_extern_fn_decl(g : QbeGen, ed : ExternFnDecl) -> String {
       g.hoisted_str_dp = Map([])
       g.hoisted_bytes_len = Map([])
       g.hoisted_bytes_dp = Map([])
+      g.inline_closures = Map([])
+      g.inline_ret_lbl = ""
       g.hoisted_fields = Map([])
       g.block_immut_fields = Map([])
       g.len_aliases = Map([])
@@ -22838,6 +23998,8 @@ fn qbe_emit_impl_method(g : QbeGen, id : ImplDecl, md : FnDecl) -> String {
           g.hoisted_str_dp = Map([])
           g.hoisted_bytes_len = Map([])
           g.hoisted_bytes_dp = Map([])
+          g.inline_closures = Map([])
+          g.inline_ret_lbl = ""
           g.hoisted_fields = Map([])
           g.block_immut_fields = Map([])
           g.len_aliases = Map([])
@@ -22945,6 +24107,8 @@ fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
   g.hoisted_str_dp = Map([])
   g.hoisted_bytes_len = Map([])
   g.hoisted_bytes_dp = Map([])
+  g.inline_closures = Map([])
+  g.inline_ret_lbl = ""
   g.hoisted_fields = Map([])
   g.block_immut_fields = Map([])
   g.len_aliases = Map([])
@@ -24235,6 +25399,8 @@ pub fn emit_qbe_test_package(
     g.hoisted_str_dp = Map([])
     g.hoisted_bytes_len = Map([])
     g.hoisted_bytes_dp = Map([])
+    g.inline_closures = Map([])
+    g.inline_ret_lbl = ""
     g.hoisted_fields = Map([])
     g.block_immut_fields = Map([])
     g.len_aliases = Map([])

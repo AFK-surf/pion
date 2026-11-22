@@ -1322,4 +1322,117 @@ console.log("  bytes_clear_fast (" + mode + "/" + rtLabel + "): out=" + out + " 
 done
 done
 
+echo "=== P29-C [15/15] HOF Closure Inline Specialization + Pure-Wasm strbuf_push_int & Short-Lit Fast Path ==="
+cat > "$TMP_DIR/hof_strbuf_fast.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn fold_items(
+  items : Array[Int],
+  m : (Int) -> Int,
+  keep : (Int) -> Bool,
+  step : (Int, Int) -> Int,
+) -> Int {
+  let mut acc = 0
+  let len = items.length()
+  let mut i = 0
+  while i < len {
+    let y = m(items[i])
+    if keep(y) {
+      acc = step(acc, y)
+    }
+    i = i + 1
+  }
+  acc
+}
+
+fn main(world : World) -> Int {
+  let xs : Array[Int] = []
+  let mut i = 0
+  while i < 100 {
+    xs.push(i)
+    i = i + 1
+  }
+  let r = 3
+  let total = fold_items(
+    xs,
+    fn(x : Int) -> Int { x * 2 + r },
+    fn(y : Int) -> Bool {
+      if y < 10 {
+        return false
+      }
+      y % 3 == 0
+    },
+    fn(a : Int, y : Int) -> Int { a + y },
+  )
+  // Verify StringBuilder::write_string(int.to_string()) + 1..8B literal fast path + grow past 32B
+  let sb = StringBuilder()
+  sb.write_string("v=")
+  sb.write_string((0).to_string())
+  sb.write_string(",")
+  sb.write_string((-42).to_string())
+  sb.write_string(",")
+  let min64 : Int64 = -9223372036854775807L - 1L
+  sb.write_string(min64.to_string())
+  sb.write_string(";")
+  i = 0
+  while i < 20 {
+    sb.write_string("item-")
+    sb.write_string(i.to_string())
+    sb.write_string(";")
+    i = i + 1
+  }
+  let s = sb.to_string()
+  must(s.starts_with("v=0,-42,-9223372036854775808;item-0;item-1;"), "sb prefix")
+  must(s.ends_with("item-19;"), "sb suffix")
+  io_println(world, total.to_string() + ":" + s.length().to_string())
+  0
+}
+EOF
+HS_REL_WASM="$TMP_DIR/hof_strbuf_rel.wasm"
+HS_DEV_WASM="$TMP_DIR/hof_strbuf_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$HS_REL_WASM" "$TMP_DIR/hof_strbuf_fast.pion"
+"$PIONC" build --target wasm32 -o "$HS_DEV_WASM" "$TMP_DIR/hof_strbuf_fast.pion"
+for mode_wasm in "release:$HS_REL_WASM" "dev:$HS_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): hof_strbuf_fast.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "3456:179") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): hof_strbuf_fast mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+console.log("  hof_strbuf_fast (" + mode + "/" + rtLabel + "): out=" + out + " OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
