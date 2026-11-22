@@ -68,6 +68,7 @@ pub struct QbeBceGuard {
 pub struct QbeSqCand {
   name : String
   assign_idx : Int
+  recompute_at_assign : Bool
 }
 
 ///|
@@ -14666,14 +14667,22 @@ fn qbe_emit_pat_test(
       qbe_emit_term(g, "jnz " + eq + ", " + ok_lbl + ", " + fail_lbl)
       qbe_emit_lbl(g, ok_lbl)
     }
-    PString(s, _) => {
-      let lit = qbe_emit_string_lit(g, s)
-      let eq = qbe_tmp(g)
-      let ok_lbl = qbe_lbl(g, "pat_ok")
-      qbe_emit(g, eq + " =w call $pion_str_eq(l " + vreg + ", l " + lit + ")")
-      qbe_emit_term(g, "jnz " + eq + ", " + ok_lbl + ", " + fail_lbl)
-      qbe_emit_lbl(g, ok_lbl)
-    }
+    PString(s, _) =>
+      match qbe_short_ascii_bytes(s) {
+        Some(bytes) => {
+          let ok_lbl = qbe_lbl(g, "pat_ok")
+          qbe_emit_short_str_eq_branch(g, vreg, bytes, ok_lbl, fail_lbl)
+          qbe_emit_lbl(g, ok_lbl)
+        }
+        None => {
+          let lit = qbe_emit_string_lit(g, s)
+          let eq = qbe_tmp(g)
+          let ok_lbl = qbe_lbl(g, "pat_ok")
+          qbe_emit(g, eq + " =w call $pion_str_eq(l " + vreg + ", l " + lit + ")")
+          qbe_emit_term(g, "jnz " + eq + ", " + ok_lbl + ", " + fail_lbl)
+          qbe_emit_lbl(g, ok_lbl)
+        }
+      }
     PTuple(subs, _) =>
       match scrut_ty {
         TTuple(elems) => {
@@ -14938,6 +14947,138 @@ fn qbe_emit_cond_branch_bind(
 }
 
 ///|
+fn qbe_short_ascii_bytes(s : String) -> Option[Array[Int]] {
+  let n = s.length()
+  if n < 0 || n > 8 {
+    return None
+  }
+  let bytes : Array[Int] = []
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c < 0 || c >= 128 {
+      return None
+    }
+    bytes.push(c)
+    i = i + 1
+  }
+  Some(bytes)
+}
+
+///|
+fn qbe_pack_le32_ascii(bytes : Array[Int], off : Int) -> Int64 {
+  bytes[off].to_int64() +
+  bytes[off + 1].to_int64() * 256L +
+  bytes[off + 2].to_int64() * 65536L +
+  bytes[off + 3].to_int64() * 16777216L
+}
+
+///|
+fn qbe_emit_short_str_eq_branch(
+  g : QbeGen,
+  str_reg : String,
+  bytes : Array[Int],
+  l_true : String,
+  l_false : String,
+) -> Unit {
+  let n = bytes.length()
+  let l_len = qbe_lbl(g, "seq_l")
+  let nz = qbe_tmp(g)
+  qbe_emit(g, nz + " =w cnel " + str_reg + ", 0")
+  qbe_emit_term(g, "jnz " + nz + ", " + l_len + ", " + l_false)
+  qbe_emit_lbl(g, l_len)
+  let len_r = qbe_tmp(g)
+  let len_ok = qbe_tmp(g)
+  qbe_emit(g, len_r + " =l loadl " + str_reg)
+  qbe_emit(g, len_ok + " =w ceql " + len_r + ", " + n.to_string())
+  if n == 0 {
+    qbe_emit_term(g, "jnz " + len_ok + ", " + l_true + ", " + l_false)
+    return
+  }
+  let l_data = qbe_lbl(g, "seq_d")
+  qbe_emit_term(g, "jnz " + len_ok + ", " + l_data + ", " + l_false)
+  qbe_emit_lbl(g, l_data)
+  let dp = qbe_tmp(g)
+  qbe_emit(g, dp + " =l add " + str_reg + ", 8")
+  let eq = qbe_tmp(g)
+  if n == 1 {
+    let b0 = qbe_tmp(g)
+    qbe_emit(g, b0 + " =w loadub " + dp)
+    qbe_emit(g, eq + " =w ceqw " + b0 + ", " + bytes[0].to_string())
+  } else if n == 2 {
+    let w2 = qbe_tmp(g)
+    let le16 = bytes[0] + bytes[1] * 256
+    qbe_emit(g, w2 + " =w loaduh " + dp)
+    qbe_emit(g, eq + " =w ceqw " + w2 + ", " + le16.to_string())
+  } else if n == 3 {
+    let w2 = qbe_tmp(g)
+    let dp2 = qbe_tmp(g)
+    let b2 = qbe_tmp(g)
+    let x0 = qbe_tmp(g)
+    let x1 = qbe_tmp(g)
+    let o = qbe_tmp(g)
+    let le16 = bytes[0] + bytes[1] * 256
+    qbe_emit(g, w2 + " =w loaduh " + dp)
+    qbe_emit(g, dp2 + " =l add " + dp + ", 2")
+    qbe_emit(g, b2 + " =w loadub " + dp2)
+    qbe_emit(g, x0 + " =w xor " + w2 + ", " + le16.to_string())
+    qbe_emit(g, x1 + " =w xor " + b2 + ", " + bytes[2].to_string())
+    qbe_emit(g, o + " =w or " + x0 + ", " + x1)
+    qbe_emit(g, eq + " =w ceqw " + o + ", 0")
+  } else if n == 4 {
+    let w4 = qbe_tmp(g)
+    let le32 = qbe_pack_le32_ascii(bytes, 0)
+    qbe_emit(g, w4 + " =w loaduw " + dp)
+    qbe_emit(g, eq + " =w ceqw " + w4 + ", " + le32.to_string())
+  } else if n < 8 {
+    let off = n - 4
+    let w0 = qbe_tmp(g)
+    let dp2 = qbe_tmp(g)
+    let w1 = qbe_tmp(g)
+    let x0 = qbe_tmp(g)
+    let x1 = qbe_tmp(g)
+    let o = qbe_tmp(g)
+    let le32_lo = qbe_pack_le32_ascii(bytes, 0)
+    let le32_hi = qbe_pack_le32_ascii(bytes, off)
+    qbe_emit(g, w0 + " =w loaduw " + dp)
+    qbe_emit(g, dp2 + " =l add " + dp + ", " + off.to_string())
+    qbe_emit(g, w1 + " =w loaduw " + dp2)
+    qbe_emit(g, x0 + " =w xor " + w0 + ", " + le32_lo.to_string())
+    qbe_emit(g, x1 + " =w xor " + w1 + ", " + le32_hi.to_string())
+    qbe_emit(g, o + " =w or " + x0 + ", " + x1)
+    qbe_emit(g, eq + " =w ceqw " + o + ", 0")
+  } else {
+    let w8 = qbe_tmp(g)
+    let lo = qbe_pack_le32_ascii(bytes, 0)
+    let hi = qbe_pack_le32_ascii(bytes, 4)
+    let le64 = lo + hi * 4294967296L
+    qbe_emit(g, w8 + " =l loadl " + dp)
+    qbe_emit(g, eq + " =w ceql " + w8 + ", " + le64.to_string())
+  }
+  qbe_emit_term(g, "jnz " + eq + ", " + l_true + ", " + l_false)
+}
+
+///|
+fn qbe_emit_short_str_eq_val(
+  g : QbeGen,
+  str_reg : String,
+  bytes : Array[Int],
+) -> String {
+  let l_t = qbe_lbl(g, "seq_t")
+  let l_f = qbe_lbl(g, "seq_f")
+  let l_end = qbe_lbl(g, "seq_e")
+  qbe_emit_short_str_eq_branch(g, str_reg, bytes, l_t, l_f)
+  qbe_emit_lbl(g, l_t)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_f)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_end)
+  let res = qbe_tmp(g)
+  qbe_emit(g, res + " =w phi " + l_t + " 1, " + l_f + " 0")
+  res
+}
+
+///|
 /// Emit fused compare-and-branch (no `extuw` before `jnz`) so QBE arm64 `seljmp`
 /// fuses `cmp/fcmp + b.cc` directly, and short-circuits `!`, `&&`, `||` with zero stack slots.
 fn qbe_emit_cond_branch(
@@ -14972,6 +15113,62 @@ fn qbe_emit_cond_branch(
         let can_borrow_af = can_borrow &&
           qbe_loop_has_no_calls_expr(g, lhs) &&
           qbe_loop_has_no_calls_expr(g, rhs)
+        if op == "==" || op == "!=" {
+          let mut short_bytes : Option[Array[Int]] = None
+          let mut other_expr : Option[Expr] = None
+          match rhs {
+            EString(lit, _) =>
+              match qbe_short_ascii_bytes(lit) {
+                Some(bs) => {
+                  short_bytes = Some(bs)
+                  other_expr = Some(lhs)
+                }
+                None => ()
+              }
+            _ => ()
+          }
+          match short_bytes {
+            None =>
+              match lhs {
+                EString(lit, _) =>
+                  match qbe_short_ascii_bytes(lit) {
+                    Some(bs) => {
+                      short_bytes = Some(bs)
+                      other_expr = Some(rhs)
+                    }
+                    None => ()
+                  }
+                _ => ()
+              }
+            Some(_) => ()
+          }
+          match short_bytes {
+            Some(bs) =>
+              match other_expr {
+                Some(oexpr) => {
+                  let oa = qbe_emit_arg_maybe_borrow_ext(
+                    g,
+                    oexpr,
+                    Some(TString),
+                    can_borrow,
+                    can_borrow_af,
+                  )
+                  let lt = if op == "==" { l_true } else { l_false }
+                  let lf = if op == "==" { l_false } else { l_true }
+                  if oa.borrowed {
+                    qbe_emit_short_str_eq_branch(g, oa.qv.reg, bs, lt, lf)
+                  } else {
+                    let eq = qbe_emit_short_str_eq_val(g, oa.qv.reg, bs)
+                    qbe_rc_dec(g, oa.qv.reg, oa.qv.ty)
+                    qbe_emit_term(g, "jnz " + eq + ", " + lt + ", " + lf)
+                  }
+                  return
+                }
+                None => ()
+              }
+            None => ()
+          }
+        }
         let la = match lhs {
           EInt(raw, _) => {
             let v32 = qbe_parse_int64_lit(raw).to_int().to_int64().to_string()
@@ -17337,6 +17534,67 @@ fn qbe_emit_expr_inner(
       let cmp_borrow_af = cmp_borrow &&
         qbe_loop_has_no_calls_expr(g, lhs) &&
         qbe_loop_has_no_calls_expr(g, rhs)
+      if op == "==" || op == "!=" {
+        let mut short_bytes : Option[Array[Int]] = None
+        let mut other_expr : Option[Expr] = None
+        match rhs {
+          EString(lit, _) =>
+            match qbe_short_ascii_bytes(lit) {
+              Some(bs) => {
+                short_bytes = Some(bs)
+                other_expr = Some(lhs)
+              }
+              None => ()
+            }
+          _ => ()
+        }
+        match short_bytes {
+          None =>
+            match lhs {
+              EString(lit, _) =>
+                match qbe_short_ascii_bytes(lit) {
+                  Some(bs) => {
+                    short_bytes = Some(bs)
+                    other_expr = Some(rhs)
+                  }
+                  None => ()
+                }
+              _ => ()
+            }
+          Some(_) => ()
+        }
+        match short_bytes {
+          Some(bs) =>
+            match other_expr {
+              Some(oexpr) => {
+                let oa = qbe_emit_arg_maybe_borrow_ext(
+                  g,
+                  oexpr,
+                  Some(TString),
+                  cmp_borrow,
+                  cmp_borrow_af,
+                )
+                let eq = qbe_emit_short_str_eq_val(g, oa.qv.reg, bs)
+                if !oa.borrowed {
+                  qbe_rc_dec(g, oa.qv.reg, oa.qv.ty)
+                }
+                if op == "==" {
+                  let r = qbe_tmp(g)
+                  qbe_emit(g, r + " =l extuw " + eq)
+                  return qval(r, TBool)
+                } else {
+                  let ne = qbe_tmp(g)
+                  let r = qbe_tmp(g)
+                  qbe_emit(g, ne + " =w ceqw " + eq + ", 0")
+                  qbe_emit(g, r + " =l extuw " + ne)
+                  return qval(r, TBool)
+                }
+              }
+              None => ()
+            }
+          None => ()
+        }
+      }
       let is_arith_or_bit = op != "==" &&
         op != "!=" &&
         op != "<" &&
@@ -22429,7 +22687,6 @@ fn qbe_try_emit_while_sq_reuse(
       SAssign(EIdent(vname, _), rhs, _) =>
         if !seen.contains(vname) &&
           !g.sq_reuse_slot.contains(vname) &&
-          !qbe_expr_mentions_ident(cond, vname) &&
           !qbe_stmts_rebinds_ident(body, vname) &&
           !qbe_expr_assigns_ident(rhs, vname) &&
           qbe_stmts_count_assigns_ident(body, vname) == 1 {
@@ -22447,28 +22704,40 @@ fn qbe_try_emit_while_sq_reuse(
                   bi = bi + 1
                 }
                 if has_before {
-                  // Must have an unconditionally-executed v * v in body[si + 1 .. len - 1]
-                  // with no earlier branch-only v * v and no earlier break/return
-                  let mut has_after = false
-                  let mut ok_after = true
-                  let mut ai = si + 1
-                  while ai < body.length() {
-                    if qbe_stmt_uncond_has_sq(body[ai], vname) {
-                      has_after = true
-                      break
+                  if !qbe_expr_mentions_ident(cond, vname) {
+                    // Must have an unconditionally-executed v * v in body[si + 1 .. len - 1]
+                    // with no earlier branch-only v * v and no earlier break/return
+                    let mut has_after = false
+                    let mut ok_after = true
+                    let mut ai = si + 1
+                    while ai < body.length() {
+                      if qbe_stmt_uncond_has_sq(body[ai], vname) {
+                        has_after = true
+                        break
+                      }
+                      if qbe_stmt_has_branch_sq(body[ai], vname) ||
+                        qbe_stmt_has_cf(body[ai], true, true, true) {
+                        ok_after = false
+                        break
+                      }
+                      ai = ai + 1
                     }
-                    if qbe_stmt_has_branch_sq(body[ai], vname) ||
-                      qbe_stmt_has_cf(body[ai], true, true, true) {
-                      ok_after = false
-                      break
+                    if has_after && ok_after {
+                      seen.set(vname, true)
+                      cands.push(QbeSqCand::{
+                        name: vname,
+                        assign_idx: si,
+                        recompute_at_assign: false,
+                      })
                     }
-                    ai = ai + 1
-                  }
-                  if has_after && ok_after {
+                  } else if qbe_expr_has_sq(cond, vname) &&
+                    !qbe_expr_assigns_ident(cond, vname) {
+                    // Condition and body share `v * v`: recompute square right after assign
                     seen.set(vname, true)
                     cands.push(QbeSqCand::{
                       name: vname,
                       assign_idx: si,
+                      recompute_at_assign: true,
                     })
                   }
                 }
@@ -22484,36 +22753,81 @@ fn qbe_try_emit_while_sq_reuse(
     return false
   }
 
-  let rotated = qbe_is_pure_small_cond(cond, 12)
+  let mut has_cond_cand = false
+  let mut has_non_cond_cand = false
+  let mut ci = 0
+  while ci < cands.length() {
+    if cands[ci].recompute_at_assign {
+      has_cond_cand = true
+    } else {
+      has_non_cond_cand = true
+    }
+    ci = ci + 1
+  }
+
+  let rotated = qbe_is_pure_small_cond(cond, 16)
   let l_init = qbe_lbl(g, "wh_sqi")
   let l_body = qbe_lbl(g, "wh_b")
   let l_cond = qbe_lbl(g, "wh_c")
   let l_end = qbe_lbl(g, "wh_e")
 
-  if rotated {
-    qbe_emit_cond_branch(g, cond, l_init, l_end)
-    qbe_emit_lbl(g, l_init)
-  }
-  let mut ci = 0
-  while ci < cands.length() {
-    let cname = cands[ci].name
-    let cslot = match qbe_lookup_local(g, cname) {
-      Some(cloc) => cloc.slot
-      None => ""
+  // Initialize condition-shared candidates before the entry condition check
+  if has_cond_cand {
+    ci = 0
+    while ci < cands.length() {
+      if cands[ci].recompute_at_assign {
+        let cname = cands[ci].name
+        let cslot = match qbe_lookup_local(g, cname) {
+          Some(cloc) => cloc.slot
+          None => ""
+        }
+        let sq_slot = qbe_alloc_slot_for(g, TDouble)
+        let v0 = qbe_tmp(g)
+        let sq0 = qbe_tmp(g)
+        qbe_emit(g, v0 + " =d loadd " + cslot)
+        qbe_emit(g, sq0 + " =d mul " + v0 + ", " + v0)
+        qbe_emit(g, "stored " + sq0 + ", " + sq_slot)
+        g.sq_reuse_slot.set(cname, sq_slot)
+        g.sq_reuse_state.set(cname, 1)
+      }
+      ci = ci + 1
     }
-    let sq_slot = qbe_alloc_slot_for(g, TDouble)
-    let v0 = qbe_tmp(g)
-    let sq0 = qbe_tmp(g)
-    qbe_emit(g, v0 + " =d loadd " + cslot)
-    qbe_emit(g, sq0 + " =d mul " + v0 + ", " + v0)
-    qbe_emit(g, "stored " + sq0 + ", " + sq_slot)
-    g.sq_reuse_slot.set(cname, sq_slot)
-    g.sq_reuse_state.set(cname, 1)
-    ci = ci + 1
   }
 
   if rotated {
-    qbe_emit_term(g, "jmp " + l_body)
+    if has_non_cond_cand {
+      qbe_emit_cond_branch(g, cond, l_init, l_end)
+      qbe_emit_lbl(g, l_init)
+    } else {
+      qbe_emit_cond_branch(g, cond, l_body, l_end)
+    }
+  }
+  if has_non_cond_cand {
+    ci = 0
+    while ci < cands.length() {
+      if !cands[ci].recompute_at_assign {
+        let cname = cands[ci].name
+        let cslot = match qbe_lookup_local(g, cname) {
+          Some(cloc) => cloc.slot
+          None => ""
+        }
+        let sq_slot = qbe_alloc_slot_for(g, TDouble)
+        let v0 = qbe_tmp(g)
+        let sq0 = qbe_tmp(g)
+        qbe_emit(g, v0 + " =d loadd " + cslot)
+        qbe_emit(g, sq0 + " =d mul " + v0 + ", " + v0)
+        qbe_emit(g, "stored " + sq0 + ", " + sq_slot)
+        g.sq_reuse_slot.set(cname, sq_slot)
+        g.sq_reuse_state.set(cname, 1)
+      }
+      ci = ci + 1
+    }
+  }
+
+  if rotated {
+    if has_non_cond_cand {
+      qbe_emit_term(g, "jmp " + l_body)
+    }
   } else {
     qbe_emit_term(g, "jmp " + l_cond)
     qbe_emit_lbl(g, l_cond)
@@ -22600,13 +22914,35 @@ fn qbe_try_emit_while_sq_reuse(
     if !g.block_term {
       qbe_rc_dec(g, sv.reg, sv.ty)
     }
-    // After emitting assign_idx for a candidate, switch it to SqUpdate (state 2)
-    ci = 0
-    while ci < cands.length() {
-      if cands[ci].assign_idx == si {
-        g.sq_reuse_state.set(cands[ci].name, 2)
+    // After emitting assign_idx for a candidate, either recompute square immediately
+    // (for cond-shared candidates) or switch it to SqUpdate (state 2).
+    if !g.block_term {
+      ci = 0
+      while ci < cands.length() {
+        if cands[ci].assign_idx == si {
+          if cands[ci].recompute_at_assign {
+            let cname = cands[ci].name
+            let cslot = match qbe_lookup_local(g, cname) {
+              Some(cloc) => cloc.slot
+              None => ""
+            }
+            match g.sq_reuse_slot.get(cname) {
+              Some(sq_slot) => {
+                let nv = qbe_tmp(g)
+                let nsq = qbe_tmp(g)
+                qbe_emit(g, nv + " =d loadd " + cslot)
+                qbe_emit(g, nsq + " =d mul " + nv + ", " + nv)
+                qbe_emit(g, "stored " + nsq + ", " + sq_slot)
+                g.sq_reuse_state.set(cname, 1)
+              }
+              None => ()
+            }
+          } else {
+            g.sq_reuse_state.set(cands[ci].name, 2)
+          }
+        }
+        ci = ci + 1
       }
-      ci = ci + 1
     }
     si = si + 1
   }
