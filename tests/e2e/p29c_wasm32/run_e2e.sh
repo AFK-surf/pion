@@ -4246,7 +4246,7 @@ if ((rc | 0) !== 0 || out !== "p57a_ok:999:16383:2:505") {
   console.error("FAIL (" + mode + "/" + rtLabel + "): p57a bad output: rc=" + rc + " out=" + JSON.stringify(out));
   process.exit(1);
 }
-if (rtLabel === "pion_wasm_rt.mjs" && growCount > 12) {
+if (growCount > 12) {
   console.error("FAIL (" + mode + "/" + rtLabel + "): p57a expected <=12 memory.grow calls, got " + growCount);
   process.exit(1);
 }
@@ -4275,6 +4275,96 @@ if (leaked !== 0) {
   process.exit(1);
 }
 console.log("  p57a (" + mode + "/" + rtLabel + "): " + out + " grows=" + growCount + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
+echo "=== P58-A Regression: Container Slab Header Inline Recycle (Array/Bytes/StrBuf/Map x2000) ==="
+cat > "$TMP_DIR/p58a_regression.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  let mut acc = 0
+  let mut i = 0
+  while i < 2000 {
+    let ai : Array[Int] = [i, i + 1, i + 2, i + 3]
+    let as_ : Array[String] = ["k" + i.to_string(), "v" + (i % 13).to_string()]
+    let bs = Bytes::new(40)
+    let sb = StringBuilder::new()
+    sb.write_string("p58_")
+    sb.write_string(i.to_string())
+    let s = sb.to_string()
+    let m : Map[String, Int] = Map::new()
+    m.set("a", i)
+    m.set("b", i + 1)
+    acc = acc + ai.length() + as_.length() + bs.length() + s.length() + m.length()
+    i = i + 1
+  }
+  io_println(world, "p58a_ok:" + acc.to_string())
+  0
+}
+EOF
+P58A_REL_WASM="$TMP_DIR/p58a_rel.wasm"
+P58A_DEV_WASM="$TMP_DIR/p58a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P58A_REL_WASM" "$TMP_DIR/p58a_regression.pion"
+"$PIONC" build --target wasm32 -o "$P58A_DEV_WASM" "$TMP_DIR/p58a_regression.pion"
+for mode_wasm in "release:$P58A_REL_WASM" "dev:$P58A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p58a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p58a_ok:110890") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p58a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p58a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p58a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
 ' "$wasm_f" "$rt_path" "$mode"
 done
 done

@@ -142,7 +142,14 @@ export function createPionRuntime(opts = {}) {
     }
     const hp = getHp();
     if (hp + asz > heapEnd) {
-      memory.grow(Math.max(16, Math.ceil((hp + asz - heapEnd) / PAGE))); sync();
+      const missing = hp + asz - heapEnd;
+      const curPages = heapEnd >>> 16;
+      const minGrow = Math.ceil(missing / PAGE);
+      const expGrow = Math.min(curPages, 2048);
+      const maxAllowed = Math.max(0, 65535 - curPages);
+      const targetGrow = Math.max(16, minGrow, expGrow);
+      const growPages = minGrow > maxAllowed ? minGrow : Math.min(maxAllowed, targetGrow);
+      memory.grow(growPages); sync();
     }
     const b = hp; setHp(hp + asz); su32(b, asz); su32(b + 4, ALLOC_MAGIC); return b + 8;
   }
