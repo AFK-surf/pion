@@ -3905,4 +3905,208 @@ console.log("  p53a (" + mode + "/" + rtLabel + "): " + out + " size=" + bytes.l
 done
 done
 
+echo "=== P56-A Regression: pion_drop_s2 Hetero/Shared/100k-Chains + int_to_str(0..9/neg/MIN/MAX) + str_concat/str_slice(0..16B) + strbuf 1B + Array::with_capacity ==="
+cat > "$TMP_DIR/p56a_opt_suite.pion" <<'EOF'
+struct P56Tree {
+  left : Option[P56Tree]
+  right : Option[P56Tree]
+}
+
+struct P56Hetero {
+  tag_str : String
+  child : Option[P56Tree]
+}
+
+struct P56Flat {
+  a : Int64
+  b : Int64
+  c : String
+}
+
+fn make_p56_tree(d : Int) -> P56Tree {
+  if d == 0 {
+    P56Tree::{ left: None, right: None }
+  } else {
+    P56Tree::{ left: Some(make_p56_tree(d - 1)), right: Some(make_p56_tree(d - 1)) }
+  }
+}
+
+fn count_p56_tree(t : P56Tree) -> Int64 {
+  match t.left {
+    None =>
+      match t.right {
+        None => 1L
+        Some(r) => 1L + count_p56_tree(r)
+      }
+    Some(l) =>
+      match t.right {
+        None => 1L + count_p56_tree(l)
+        Some(r) => 1L + count_p56_tree(l) + count_p56_tree(r)
+      }
+  }
+}
+
+fn make_p56_chain(n : Int, is_left : Bool) -> P56Tree {
+  let mut cur = P56Tree::{ left: None, right: None }
+  let mut i = 0
+  while i < n {
+    if is_left {
+      cur = P56Tree::{ left: Some(cur), right: None }
+    } else {
+      cur = P56Tree::{ left: None, right: Some(cur) }
+    }
+    i = i + 1
+  }
+  cur
+}
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. pion_drop_s2: balanced tree, shared DAG (rc > 1), hetero (String + Tree), 100k left & right chains
+  let t12 = count_p56_tree(make_p56_tree(12))
+  let shared = make_p56_tree(4)
+  let dag = P56Tree::{ left: Some(shared), right: Some(shared) }
+  let dag_cnt = count_p56_tree(dag)
+  let hetero = P56Hetero::{ tag_str: "het_" + (7).to_string(), child: Some(make_p56_tree(5)) }
+  must(hetero.tag_str == "het_7", "hetero str")
+  let lchain = make_p56_chain(100000, true)
+  let rchain = make_p56_chain(100000, false)
+  let ch_ok = match lchain.left { Some(_) => 1; None => 0 } + (match rchain.right { Some(_) => 1; None => 0 })
+
+  // 2. int_to_str: 0, 1..9 fast path, -1, multi-digit, INT64_MIN, INT64_MAX
+  let mut digits = ""
+  let mut d = 0
+  while d < 10 {
+    let ds = d.to_string()
+    must(ds.length() == 1, "digit len")
+    digits = digits + ds
+    d = d + 1
+  }
+  must(digits == "0123456789", "0..9 digits")
+  must((-1).to_string() == "-1", "-1")
+  must((1234567890L).to_string() == "1234567890", "10-digit")
+  let i64_min : Int64 = -9223372036854775807L - 1L
+  let i64_max : Int64 = 9223372036854775807L
+  must(i64_min.to_string() == "-9223372036854775808", "INT64_MIN")
+  must(i64_max.to_string() == "9223372036854775807", "INT64_MAX")
+
+  // 3. str_concat: 0B, 1B, 7B, 16B, 32B
+  must("" + "" == "", "c0")
+  must("a" + "" == "a", "c1a")
+  must("" + "b" == "b", "c1b")
+  must("user" + (9).to_string() == "user9", "c5")
+  must("1234567" + "890123456" == "1234567890123456", "c16")
+  let s32 = "0123456789abcdef" + "fedcba9876543210"
+  must(s32.length() == 32 && s32 == "0123456789abcdeffedcba9876543210", "c32")
+
+  // 4. str_slice: 0B, 1B, 7B (cls=1), 8B, 10B, 15B (cls=2), 16B, out-of-bounds/negative clamp
+  let base = "0123456789abcdefghijklmnopqrstuvwxyz"
+  must(base.slice(5, 5) == "", "sl0")
+  must(base.slice(3, 4) == "3", "sl1")
+  must(base.slice(1, 8) == "1234567", "sl7")
+  must(base.slice(2, 10) == "23456789", "sl8")
+  must(base.slice(0, 10) == "0123456789", "sl10")
+  must(base.slice(5, 20) == "56789abcdefghij", "sl15")
+  must(base.slice(0, 16) == "0123456789abcdef", "sl16")
+  must(base.slice(-10, 4) == "0123", "sl_neg")
+  must(base.slice(32, 999) == "wxyz", "sl_oob")
+
+  // 5. strbuf_push_str: 1B fast path repeated + grow trigger
+  let sb = StringBuilder::new()
+  let mut k = 0
+  while k < 300 {
+    sb.write_string("\"")
+    sb.write_string("x")
+    sb.write_string(",")
+    k = k + 1
+  }
+  let sb_out = sb.to_string()
+  must(sb_out.length() == 900 && sb_out.slice(0, 6) == "\"x,\"x,", "sb 1B")
+
+  // 6. Array::with_capacity (no dead memory.fill): scalar, ref, flat struct + partial fill
+  let a0 : Array[Int64] = Array::with_capacity(0)
+  let a5 : Array[String] = Array::with_capacity(5)
+  a5.push("u" + (1).to_string())
+  a5.push("u" + (2).to_string())
+  let af : Array[P56Flat] = Array::with_capacity(8)
+  af.push(P56Flat::{ a: 10L, b: 20L, c: "f" + (3).to_string() })
+  af.push(P56Flat::{ a: 30L, b: 40L, c: "f" + (4).to_string() })
+  must(a0.length() == 0 && a5.length() == 2 && a5[1] == "u2" && af.length() == 2 && af[1].c == "f4", "arr cap")
+
+  io_println(world, "p56a_ok:" + t12.to_string() + ":" + dag_cnt.to_string() + ":" + ch_ok.to_string() + ":" + sb_out.length().to_string() + ":" + af.length().to_string())
+  0
+}
+EOF
+P56A_REL_WASM="$TMP_DIR/p56a_rel.wasm"
+P56A_DEV_WASM="$TMP_DIR/p56a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P56A_REL_WASM" "$TMP_DIR/p56a_opt_suite.pion"
+"$PIONC" build --target wasm32 -o "$P56A_DEV_WASM" "$TMP_DIR/p56a_opt_suite.pion"
+for mode_wasm in "release:$P56A_REL_WASM" "dev:$P56A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p56a failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "p56a_ok:8191:63:2:900:2") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p56a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p56a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p56a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
