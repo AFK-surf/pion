@@ -773,11 +773,12 @@ arm64_emitfn(Fn *fn, FILE *out)
 				if (i1->cls == i->cls && isreg(i1->to) && req(i1->to, i->to)) {
 					if (i1->op == Osub && isreg(i1->arg[0])
 					&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
-						fprintf(e->f, "\tmsub\t%s, %s, %s, %s\n",
-							rname(i1->to.val, i1->cls),
-							rname(i->arg[0].val, i->cls),
-							rname(i->arg[1].val, i->cls),
-							rname(i1->arg[0].val, i->cls));
+						char rd[4], rn[4], rm[4], ra[4];
+						strcpy(rd, rname(i1->to.val, i1->cls));
+						strcpy(rn, rname(i->arg[0].val, i->cls));
+						strcpy(rm, rname(i->arg[1].val, i->cls));
+						strcpy(ra, rname(i1->arg[0].val, i->cls));
+						fprintf(e->f, "\tmsub\t%s, %s, %s, %s\n", rd, rn, rm, ra);
 						last_w32 = w32_def_reg(i1, last_w32);
 						i++;
 						continue;
@@ -785,12 +786,13 @@ arm64_emitfn(Fn *fn, FILE *out)
 					if (i1->op == Oadd
 					&& ((isreg(i1->arg[0]) && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
 					 || (isreg(i1->arg[1]) && req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)))) {
-						Ref ra = req(i1->arg[1], i->to) ? i1->arg[0] : i1->arg[1];
-						fprintf(e->f, "\tmadd\t%s, %s, %s, %s\n",
-							rname(i1->to.val, i1->cls),
-							rname(i->arg[0].val, i->cls),
-							rname(i->arg[1].val, i->cls),
-							rname(ra.val, i->cls));
+						Ref ra_ref = req(i1->arg[1], i->to) ? i1->arg[0] : i1->arg[1];
+						char rd[4], rn[4], rm[4], ra[4];
+						strcpy(rd, rname(i1->to.val, i1->cls));
+						strcpy(rn, rname(i->arg[0].val, i->cls));
+						strcpy(rm, rname(i->arg[1].val, i->cls));
+						strcpy(ra, rname(ra_ref.val, i->cls));
+						fprintf(e->f, "\tmadd\t%s, %s, %s, %s\n", rd, rn, rm, ra);
 						last_w32 = w32_def_reg(i1, last_w32);
 						i++;
 						continue;
