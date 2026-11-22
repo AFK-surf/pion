@@ -4066,6 +4066,22 @@ fn drv_build_nodes_objects(
 }
 
 ///|
+fn drv_wasm_ns_ident(name : String) -> String {
+  let sb = StringBuilder()
+  let n = name.length()
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(name, i)
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+      sb.write_string(slice_str(name, i, i + 1))
+    } else {
+      sb.write_char('_')
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
 fn drv_build_wasm_targets(
   world : World,
   targets : Array[String],
@@ -4078,6 +4094,8 @@ fn drv_build_wasm_targets(
   let _ = fs_mkdir_p(world, cache_dir + "/ssa")
   let _ = fs_mkdir_p(world, cache_dir + "/bin")
   let trace_cas = drv_env_str(world, "PION_TRACE_CAS") == "1"
+  let trace_time = drv_env_str(world, "PION_TRACE_WASM_TIME") == "1"
+  let t_wasm_start = if trace_time { clock_now_ms(world) } else { 0L }
   let no_wasm_opt = match env_get(world, "PION_NO_WASM_OPT") {
     Some(v) => v == "1"
     None => false
@@ -4124,7 +4142,7 @@ fn drv_build_wasm_targets(
         let trans = drv_trans_deps(nodes, topo.order)
         let trans_dep_topo = trans.topo
         let trans_dep_names = trans.names
-        let wasm_fp = drv_compute_self_fp(world, "wasm32-v1")
+        let wasm_fp = drv_compute_self_fp(world, "wasm32-v2")
         let loaded_imported : Array[Option[ImportedPkg]] = []
         let stub_paths : Array[String] = []
         let mut k = 0
@@ -4231,17 +4249,19 @@ fn drv_build_wasm_targets(
               is_entry,
               dep_pkg_names,
             )
+            let ns_prefix = "p_" + drv_wasm_ns_ident(node.name) + "__"
+            let ns_ssa = wasm_namespace_local_ssa(res.ssa, ns_prefix)
             let _ = drv_write_text_atomic(world, sig_path, pionsig)
             let _ = drv_write_text_atomic(world, stub_path, pionstub)
-            if !drv_write_text_atomic(world, ssa_path, res.ssa) {
+            if !drv_write_text_atomic(world, ssa_path, ns_ssa) {
               return Err("failed to write CAS wasm ssa: " + ssa_path)
             }
             stub_paths[k] = stub_path
             pkg_ssa_paths.push(ssa_path)
-            pkg_ssa_mem.push(res.ssa)
+            pkg_ssa_mem.push(ns_ssa)
             new_keys.push(key)
             new_sizes.push(
-              (pionsig.length() + pionstub.length() + res.ssa.length()).to_int64(),
+              (pionsig.length() + pionstub.length() + ns_ssa.length()).to_int64(),
             )
           }
           if !is_entry {
@@ -4255,7 +4275,7 @@ fn drv_build_wasm_targets(
           drv_cas_record_batch_and_evict(world, cache_dir, new_keys, new_sizes)
         }
         let wasm_bin_key = sha256_hex(
-          "wasm-bin-v1|" +
+          "wasm-bin-v2|" +
           wasm_fp +
           "|" +
           (if release { "rel" } else { "dbg" }) +
@@ -4283,7 +4303,15 @@ fn drv_build_wasm_targets(
             "[cas-wasm-bin] MISS key=" + drv_prefix16(wasm_bin_key),
           )
         }
-        let ssa_sb = StringBuilder()
+        let t_pkgs_done = if trace_time { clock_now_ms(world) } else { 0L }
+        if trace_time {
+          io_eprintln(
+            world,
+            "[wasm-time] cas_and_pkg_emit=" + (t_pkgs_done - t_wasm_start).to_string() + "ms (pkgs=" + n.to_string() + ")",
+          )
+        }
+        let pkg_ssas : Array[String] = []
+        let mut total_ssa_bytes = 0
         k = 0
         while k < n {
           let pkg_ssa = if pkg_ssa_mem[k].length() > 0 {
@@ -4294,20 +4322,41 @@ fn drv_build_wasm_targets(
               Err(e) => return Err("failed to read CAS wasm ssa " + pkg_ssa_paths[k] + ": " + e)
             }
           }
-          ssa_sb.write_string(
-            wasm_namespace_local_ssa(pkg_ssa, "u" + k.to_string() + "__"),
-          )
-          ssa_sb.write_char('\n')
+          total_ssa_bytes = total_ssa_bytes + pkg_ssa.length()
+          pkg_ssas.push(pkg_ssa)
           k = k + 1
         }
-        all_ssa = ssa_sb.to_string()
+        let t_ns_done = if trace_time { clock_now_ms(world) } else { 0L }
+        if trace_time {
+          io_eprintln(
+            world,
+            "[wasm-time] read_cas_ssa=" + (t_ns_done - t_pkgs_done).to_string() + "ms (ssa_bytes=" + total_ssa_bytes.to_string() + ")",
+          )
+        }
         if emit_ssa_path != "" {
+          let ssa_sb = StringBuilder()
+          k = 0
+          while k < pkg_ssas.length() {
+            ssa_sb.write_string(pkg_ssas[k])
+            ssa_sb.write_char('\n')
+            k = k + 1
+          }
+          all_ssa = ssa_sb.to_string()
           drv_ensure_parent_dir(world, emit_ssa_path)
           if !drv_write_text_atomic(world, emit_ssa_path, all_ssa) {
             return Err("failed to write --emit-ssa file: " + emit_ssa_path)
           }
         }
-        let wasm_bytes = emit_wasm_from_ssa(all_ssa)
+        let t_stage : Array[Int64] = [if trace_time { clock_now_ms(world) } else { 0L }]
+        let wasm_bytes = if trace_time {
+          emit_wasm_from_ssa_units_traced(pkg_ssas, fn(label : String) -> Unit {
+            let now = clock_now_ms(world)
+            io_eprintln(world, "[wasm-time] " + label + "=" + (now - t_stage[0]).to_string() + "ms")
+            t_stage[0] = now
+          })
+        } else {
+          emit_wasm_from_ssa_units(pkg_ssas)
+        }
         let tmp_bin = cached_wasm + ".tmp." + clock_now_ms(world).to_string()
         if wopt_bin != "" {
           let tmp_raw = cached_wasm + ".raw." + clock_now_ms(world).to_string()
