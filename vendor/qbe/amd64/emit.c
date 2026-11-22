@@ -676,7 +676,7 @@ emitjtbl(Blk *b, int id0, E *e)
 	for (jk = 0; jk < b->njtbl; jk++)
 		fprintf(f, "\t.long %sbb%d - %sjt%d\n",
 			T.asloc, id0 + b->jtbl[jk]->id, T.asloc, jtid);
-	fprintf(f, ".text\n");
+	fprintf(f, (!T.apple && !T.windows) ? ".previous\n" : ".text\n");
 }
 
 static void

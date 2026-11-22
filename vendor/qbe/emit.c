@@ -42,6 +42,13 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 		fprintf(f, ".section %s", l->sec);
 		if (l->secf)
 			fprintf(f, ",%s", l->secf);
+	} else if (!T.apple && !T.windows && !l->thread && n[0] != '"' && n[0] != '\0') {
+		if (s == SecText)
+			fprintf(f, ".section .text.%s,\"ax\",%%progbits", n);
+		else if (s == SecData)
+			fprintf(f, ".section .data.%s,\"aw\",%%progbits", n);
+		else
+			fprintf(f, ".section .bss.%s,\"aw\",%%nobits", n);
 	} else
 		fputs(sec[l->thread != 0][s], f);
 	fputc('\n', f);

@@ -607,7 +607,7 @@ rv64_emitfn(Fn *fn, FILE *f)
 			for (jk = 0; jk < b->njtbl; jk++)
 				fprintf(f, "\t.word .L%d - .Ljt%d\n",
 					id0 + b->jtbl[jk]->id, jtid);
-			fprintf(f, ".text\n");
+			fprintf(f, (!T.apple && !T.windows) ? ".previous\n" : ".text\n");
 			break;
 		}
 		}
