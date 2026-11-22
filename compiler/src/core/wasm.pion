@@ -997,6 +997,11 @@ struct WasmFnCtx {
   phi_tmp_f64 : Int
   use_counts : Map[String, Int]
   def_counts : Map[String, Int]
+  promoted_alloc_ty : Map[String, Int]
+  promoted_alloc_lidx : Map[String, Int]
+  promoted_alloc_touched : Map[String, Bool]
+  blk0_is_target : Bool
+  const_copies : Map[String, String]
   mut last_set_pos : Int
   mut last_set_end : Int
   mut last_set_sym : String
@@ -1107,6 +1112,25 @@ fn wasm_emit_operand(
     let lty = match fctx.local_ty.get(s) {
       Some(t) => t
       None => want_ty
+    }
+    match fctx.const_copies.get(s) {
+      Some(imm) => {
+        fctx.last_set_pos = -1
+        wasm_emit_operand(ctx, fctx, code, imm, lty)
+        if lty != want_ty {
+          if lty == WASM_TY_I64 && want_ty == WASM_TY_I32 {
+            code.push(0xA7) // i32.wrap_i64
+          } else if lty == WASM_TY_I32 && want_ty == WASM_TY_I64 {
+            code.push(0xAD) // i64.extend_i32_u
+          } else if lty == WASM_TY_F32 && want_ty == WASM_TY_F64 {
+            code.push(0xBB) // f64.promote_f32
+          } else if lty == WASM_TY_F64 && want_ty == WASM_TY_F32 {
+            code.push(0xB6) // f32.demote_f64
+          }
+        }
+        return
+      }
+      None => ()
     }
     if fctx.last_set_pos >= 0 && code.length() == fctx.last_set_end &&
       s == fctx.last_set_sym && lty == fctx.last_set_ty {
@@ -1442,6 +1466,40 @@ fn wasm_emit_inst(
   // Memory stores
   if op == "storel" || op == "storew" || op == "storeh" || op == "storeb" || op == "stores" || op == "stored" {
     if inst.args.length() >= 2 {
+      if op == "storel" || op == "storew" || op == "stores" || op == "stored" {
+        let addr = wasm_trim(inst.args[1])
+        match fctx.promoted_alloc_ty.get(addr) {
+          Some(sty) => {
+            if sty >= 0 {
+              let val_s = wasm_trim(inst.args[0])
+              let val_eff = match fctx.const_copies.get(val_s) {
+                Some(imm) => imm
+                None => val_s
+              }
+              if cur_blk == 0 && !fctx.blk0_is_target && !fctx.promoted_alloc_touched.contains(addr) &&
+                (val_eff == "0" || val_eff == "d_0.0" || val_eff == "s_0.0") {
+                fctx.last_set_pos = -1
+                return false
+              }
+              fctx.promoted_alloc_touched.set(addr, true)
+              let lidx = match fctx.promoted_alloc_lidx.get(addr) {
+                Some(k) => k
+                None => {
+                  let k = wasm_fn_alloc_local(fctx, sty)
+                  fctx.promoted_alloc_lidx.set(addr, k)
+                  k
+                }
+              }
+              wasm_emit_operand(ctx, fctx, code, inst.args[0], sty)
+              code.push(0x21) // local.set
+              wasm_push_u32(code, lidx)
+            }
+            fctx.last_set_pos = -1
+            return false
+          }
+          None => ()
+        }
+      }
       wasm_emit_addr(ctx, fctx, code, inst.args[1])
       let mut align_log2 = 0
       if op == "storel" {
@@ -1566,6 +1624,9 @@ fn wasm_emit_inst(
   // Stack allocation: alloc4 / alloc8 / alloc16
   if op == "alloc4" || op == "alloc8" || op == "alloc16" {
     fctx.last_set_pos = -1
+    if fctx.promoted_alloc_ty.contains(inst.dst) {
+      return false
+    }
     let off = match fctx.alloc_offsets.get(inst.dst) {
       Some(o) => o
       None => 0
@@ -1586,6 +1647,9 @@ fn wasm_emit_inst(
 
   // copy
   if op == "copy" {
+    if fctx.const_copies.contains(inst.dst) {
+      return false
+    }
     wasm_emit_operand(ctx, fctx, code, inst.args[0], dty)
     wasm_emit_set_local(fctx, code, inst.dst, dty)
     return false
@@ -1595,6 +1659,39 @@ fn wasm_emit_inst(
   if op == "loadl" || op == "loadw" || op == "loadsw" || op == "loaduw" ||
     op == "loadsh" || op == "loaduh" || op == "loadsb" || op == "loadub" ||
     op == "loads" || op == "loadd" {
+    if op == "loadl" || op == "loadw" || op == "loadsw" || op == "loaduw" || op == "loads" || op == "loadd" {
+      let addr = wasm_trim(inst.args[0])
+      match fctx.promoted_alloc_ty.get(addr) {
+        Some(sty) => {
+          if sty >= 0 {
+            fctx.promoted_alloc_touched.set(addr, true)
+            let lidx = match fctx.promoted_alloc_lidx.get(addr) {
+              Some(k) => k
+              None => {
+                let k = wasm_fn_alloc_local(fctx, sty)
+                fctx.promoted_alloc_lidx.set(addr, k)
+                k
+              }
+            }
+            fctx.last_set_pos = -1
+            code.push(0x20) // local.get
+            wasm_push_u32(code, lidx)
+            if op == "loadsw" && dty == WASM_TY_I64 {
+              code.push(0xAC) // i64.extend_i32_s
+            } else if (op == "loadw" || op == "loaduw") && dty == WASM_TY_I64 {
+              code.push(0xAD) // i64.extend_i32_u
+            } else if op == "loadl" && dty == WASM_TY_I32 {
+              code.push(0xA7) // i32.wrap_i64
+            }
+            wasm_emit_set_local(fctx, code, inst.dst, dty)
+          } else {
+            fctx.last_set_pos = -1
+          }
+          return false
+        }
+        None => ()
+      }
+    }
     wasm_emit_addr(ctx, fctx, code, inst.args[0])
     let mut align_log2 = 0
     if op == "loadl" {
@@ -2394,17 +2491,49 @@ fn wasm_emit_structured_region(
 }
 
 ///|
+fn wasm_mark_slot_type(
+  slot_ok : Map[String, Bool],
+  slot_ty : Map[String, Int],
+  name : String,
+  req_ty : Int,
+) -> Unit {
+  match slot_ok.get(name) {
+    Some(true) =>
+      match slot_ty.get(name) {
+        Some(cur) =>
+          if cur == -1 {
+            slot_ty.set(name, req_ty)
+          } else if cur != req_ty {
+            slot_ok.set(name, false)
+          }
+        None => ()
+      }
+    _ => ()
+  }
+}
+
+///|
+fn wasm_escape_slot(slot_ok : Map[String, Bool], raw : String) -> Unit {
+  let s = wasm_trim(raw)
+  if slot_ok.contains(s) {
+    slot_ok.set(s, false)
+  }
+}
+
+///|
 fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
   let local_idx : Map[String, Int] = Map([])
   let local_ty : Map[String, Int] = Map([])
   let extra_local_tys : Array[Int] = []
   let use_counts : Map[String, Int] = Map([])
   let def_counts : Map[String, Int] = Map([])
+  let param_set : Map[String, Bool] = Map([])
   let n_params = f.param_names.length()
   let mut i = 0
   while i < n_params {
     local_idx.set(f.param_names[i], i)
     local_ty.set(f.param_names[i], f.param_tys[i])
+    param_set.set(f.param_names[i], true)
     wasm_inc_sym_count(def_counts, f.param_names[i])
     i = i + 1
   }
@@ -2418,7 +2547,7 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
   let phi_dst_tys : Array[Int] = []
   let phi_src_ops : Array[String] = []
 
-  // Pass 1: map block labels, local types, def/use counts, and stack allocs
+  // Pass 1: map block labels, local types, and def/use counts
   // (Local indices are allocated lazily during emission so single-use adjacent temps consume 0 local slots.)
   let nb = f.blocks.length()
   let mut bi = 0
@@ -2458,7 +2587,172 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
           ai = ai + 1
         }
       }
-      if inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16" {
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+
+  // Pass 1b: collect non-escaping scalar alloc candidates in block 0 + pure-constant copies
+  let cand_names : Array[String] = []
+  let slot_ok : Map[String, Bool] = Map([])
+  let slot_ty : Map[String, Int] = Map([])
+  if nb > 0 {
+    let b0_insts = f.blocks[0].insts
+    let mut ii = 0
+    while ii < b0_insts.length() {
+      let inst = b0_insts[ii]
+      if (inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16") && inst.dst.length() > 0 {
+        let sz = if inst.args.length() > 0 {
+          wasm_parse_int64(inst.args[0]).to_int()
+        } else {
+          8
+        }
+        let dcnt = match def_counts.get(inst.dst) {
+          Some(c) => c
+          None => 0
+        }
+        if sz >= 1 && sz <= 8 && dcnt == 1 && !param_set.contains(inst.dst) {
+          cand_names.push(inst.dst)
+          slot_ok.set(inst.dst, true)
+          slot_ty.set(inst.dst, -1)
+        }
+      }
+      ii = ii + 1
+    }
+  }
+
+  // Pass 2: escape & single-type consistency analysis, blk0_is_target, const_copies, and phi edges
+  let blk0_lbl = if nb > 0 { f.blocks[0].label } else { "" }
+  let mut blk0_is_target = false
+  let const_copies : Map[String, String] = Map([])
+  bi = 0
+  while bi < nb {
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      let op = inst.op
+      if op == "phi" {
+        let mut pi = 0
+        while pi + 1 < inst.args.length() {
+          match block_idx.get(inst.args[pi]) {
+            Some(pidx) => {
+              phi_preds.push(pidx)
+              phi_dsts.push(bi)
+              phi_dst_names.push(inst.dst)
+              phi_dst_tys.push(inst.dst_ty)
+              phi_src_ops.push(inst.args[pi + 1])
+            }
+            None => ()
+          }
+          wasm_escape_slot(slot_ok, inst.args[pi + 1])
+          pi = pi + 2
+        }
+      } else if op == "storel" || op == "storew" || op == "stores" || op == "stored" {
+        if inst.args.length() >= 2 {
+          let v_op = wasm_trim(inst.args[0])
+          let a_op = wasm_trim(inst.args[1])
+          wasm_escape_slot(slot_ok, v_op)
+          if a_op != v_op {
+            let req_ty = if op == "storel" {
+              WASM_TY_I64
+            } else if op == "storew" {
+              WASM_TY_I32
+            } else if op == "stores" {
+              WASM_TY_F32
+            } else {
+              WASM_TY_F64
+            }
+            wasm_mark_slot_type(slot_ok, slot_ty, a_op, req_ty)
+          }
+        } else {
+          let mut ai = 0
+          while ai < inst.args.length() {
+            wasm_escape_slot(slot_ok, inst.args[ai])
+            ai = ai + 1
+          }
+        }
+      } else if op == "loadl" || op == "loadw" || op == "loadsw" || op == "loaduw" || op == "loads" || op == "loadd" {
+        if inst.args.length() >= 1 {
+          let a_op = wasm_trim(inst.args[0])
+          let req_ty = if op == "loadl" {
+            WASM_TY_I64
+          } else if op == "loads" {
+            WASM_TY_F32
+          } else if op == "loadd" {
+            WASM_TY_F64
+          } else {
+            WASM_TY_I32
+          }
+          wasm_mark_slot_type(slot_ok, slot_ty, a_op, req_ty)
+        }
+      } else {
+        if op == "jmp" && inst.args.length() >= 1 {
+          if inst.args[0] == blk0_lbl {
+            blk0_is_target = true
+          }
+        } else if op == "jnz" && inst.args.length() >= 3 {
+          if inst.args[1] == blk0_lbl || inst.args[2] == blk0_lbl {
+            blk0_is_target = true
+          }
+        } else if op == "jtbl" && inst.args.length() >= 2 {
+          let mut ji = 1
+          while ji < inst.args.length() {
+            if inst.args[ji] == blk0_lbl {
+              blk0_is_target = true
+            }
+            ji = ji + 1
+          }
+        } else if op == "copy" && inst.dst.length() > 0 && inst.dst_ty != WASM_TY_VOID && inst.args.length() >= 1 {
+          let dcnt = match def_counts.get(inst.dst) {
+            Some(c) => c
+            None => 0
+          }
+          let src = wasm_trim(inst.args[0])
+          if dcnt == 1 && !param_set.contains(inst.dst) && src.length() > 0 {
+            let sc0 = str_code_at(src, 0)
+            if sc0 != 37 && sc0 != 36 {
+              const_copies.set(inst.dst, src)
+            }
+          }
+        }
+        let mut ai = 0
+        while ai < inst.args.length() {
+          wasm_escape_slot(slot_ok, inst.args[ai])
+          ai = ai + 1
+        }
+      }
+      ii = ii + 1
+    }
+    bi = bi + 1
+  }
+
+  let promoted_alloc_ty : Map[String, Int] = Map([])
+  let mut ci = 0
+  while ci < cand_names.length() {
+    let cname = cand_names[ci]
+    match slot_ok.get(cname) {
+      Some(true) => {
+        let sty = match slot_ty.get(cname) {
+          Some(t) => t
+          None => -1
+        }
+        promoted_alloc_ty.set(cname, sty)
+      }
+      _ => ()
+    }
+    ci = ci + 1
+  }
+
+  // Assign shadow-stack frame offsets ONLY for non-promoted allocs
+  bi = 0
+  while bi < nb {
+    let insts = f.blocks[bi].insts
+    let mut ii = 0
+    while ii < insts.length() {
+      let inst = insts[ii]
+      if (inst.op == "alloc4" || inst.op == "alloc8" || inst.op == "alloc16") &&
+        !promoted_alloc_ty.contains(inst.dst) {
         let align = if inst.op == "alloc16" {
           16
         } else if inst.op == "alloc8" {
@@ -2474,34 +2768,6 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
         frame_off = wasm_align_up(frame_off, align)
         alloc_offsets.set(inst.dst, frame_off)
         frame_off = frame_off + (if sz < 1 { 4 } else { sz })
-      }
-      ii = ii + 1
-    }
-    bi = bi + 1
-  }
-
-  // Pass 2: collect phi edges
-  bi = 0
-  while bi < nb {
-    let insts = f.blocks[bi].insts
-    let mut ii = 0
-    while ii < insts.length() {
-      let inst = insts[ii]
-      if inst.op == "phi" {
-        let mut pi = 0
-        while pi + 1 < inst.args.length() {
-          match block_idx.get(inst.args[pi]) {
-            Some(pidx) => {
-              phi_preds.push(pidx)
-              phi_dsts.push(bi)
-              phi_dst_names.push(inst.dst)
-              phi_dst_tys.push(inst.dst_ty)
-              phi_src_ops.push(inst.args[pi + 1])
-            }
-            None => ()
-          }
-          pi = pi + 2
-        }
       }
       ii = ii + 1
     }
@@ -2549,6 +2815,11 @@ fn wasm_compile_func(ctx : WasmModCtx, f : WasmFunc) -> Array[Int] {
     phi_tmp_f64: -1,
     use_counts: use_counts,
     def_counts: def_counts,
+    promoted_alloc_ty: promoted_alloc_ty,
+    promoted_alloc_lidx: Map([]),
+    promoted_alloc_touched: Map([]),
+    blk0_is_target: blk0_is_target,
+    const_copies: const_copies,
     last_set_pos: -1,
     last_set_end: -1,
     last_set_sym: "",

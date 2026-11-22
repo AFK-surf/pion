@@ -595,4 +595,164 @@ for (const rtPath of rtPaths) {
 console.log("  web_app (no-main library): exports=" + JSON.stringify(fnExports) + " dead_sentinel=ELIMINATED raw=" + rawBytes.length + "B opt=" + optBytes.length + "B (Node+Web OK)");
 ' "$WL_RAW" "$WL_OPT" "$PION_WASM_RT" "$PION_WASM_RT_WEB"
 
+echo "=== P29-C [10/10] mem2reg Stack-Slot Promotion + Dead Zero-Init + Const Copy Inlining Regression ==="
+cat > "$TMP_DIR/mem2reg_pure.pion" <<'EOF'
+pub extern "C" fn clamp_u8(x : Double) -> Int {
+  let mut v = x * 255.0 + 0.5
+  if v < 0.0 {
+    v = 0.0
+  } else if v > 255.0 {
+    v = 255.0
+  }
+  v.to_int()
+}
+
+pub extern "C" fn signed_loop(n : Int, seed : Int) -> Int64 {
+  let mut acc : Int64 = 0L
+  let mut i = 0
+  let mut neg = -seed
+  while i < n {
+    let step : Int = if i % 2 == 0 { neg + i } else { i * 3 - 7 }
+    acc = acc + step.to_int64()
+    neg = neg + 1
+    i = i + 1
+  }
+  acc
+}
+EOF
+M2R_PURE_RAW="$TMP_DIR/mem2reg_pure_raw.wasm"
+PION_NO_WASM_OPT=1 "$PIONC" build --release --target wasm32 -o "$M2R_PURE_RAW" "$TMP_DIR/mem2reg_pure.pion"
+
+cat > "$TMP_DIR/mem2reg_mix.pion" <<'EOF'
+struct Pair {
+  a : Int
+  b : Float
+}
+
+fn make_mul(k : Int) -> (Int) -> Int {
+  let bias = k * 2
+  fn(x : Int) -> Int { x * k + bias }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Float local (storel + loads mixed-type slot -> safely stays on shadow stack)
+  let mut f : Float = 1.25f
+  let mut i = 0
+  while i < 4 {
+    f = f + 0.5f
+    i = i + 1
+  }
+  // f = 3.25f -> to_bits = 0x40500000
+  let fbits = f.to_bits()
+
+  // 2. Signed Int -> Int64 extension + loop mutation of promoted locals
+  let mut acc : Int64 = 0L
+  let mut j = -5
+  while j < 5 {
+    let v : Int = j * 3 - 2
+    acc = acc + v.to_int64()
+    j = j + 1
+  }
+  // sum_{j=-5..4} (3*j - 2) = 3*(-5) - 20 = -35
+
+  // 3. Struct + Array + Closure mixed with promoted locals
+  let arr : Array[Pair] = Array::new()
+  arr.push(Pair::{ a: 10, b: f })
+  arr.push(Pair::{ a: 20, b: 2.5f })
+  let mul = make_mul(3)
+  let total = mul(arr[0].a) + arr[1].a + (arr[0].b + arr[1].b).to_int()
+  // mul(10)=36, +20=56, +(3.25+2.5=5.75).to_int()=5 => 61
+
+  io_println(world, fbits.to_string() + ":" + acc.to_string() + ":" + total.to_string())
+  0
+}
+EOF
+M2R_MIX_RAW="$TMP_DIR/mem2reg_mix_raw.wasm"
+PION_NO_WASM_OPT=1 "$PIONC" build --release --target wasm32 -o "$M2R_MIX_RAW" "$TMP_DIR/mem2reg_mix.pion"
+
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const purePath = process.argv[1];
+const mixPath = process.argv[2];
+const rtPaths = [process.argv[3], process.argv[4]];
+
+const pureBytes = fs.readFileSync(purePath);
+const mixBytes = fs.readFileSync(mixPath);
+if (!WebAssembly.validate(pureBytes)) {
+  console.error("FAIL: mem2reg_pure_raw.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+if (!WebAssembly.validate(mixBytes)) {
+  console.error("FAIL: mem2reg_mix_raw.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+
+// Parse Code Section (id=10) of pureBytes and assert ZERO shadow-stack prologue `global.get 0` (0x23 0x00)
+let off = 8;
+let codeSec = null;
+while (off < pureBytes.length) {
+  const id = pureBytes[off++];
+  let sz = 0, shift = 0;
+  while (true) {
+    const b = pureBytes[off++];
+    sz |= (b & 0x7f) << shift;
+    if ((b & 0x80) === 0) break;
+    shift += 7;
+  }
+  if (id === 10) {
+    codeSec = pureBytes.subarray(off, off + sz);
+    break;
+  }
+  off += sz;
+}
+if (!codeSec) {
+  console.error("FAIL: Code section not found in mem2reg_pure_raw.wasm");
+  process.exit(1);
+}
+const hasGlobalGet0 = codeSec.includes(Buffer.from([0x23, 0x00]));
+if (hasGlobalGet0) {
+  console.error("FAIL: mem2reg_pure_raw.wasm still emits shadow-stack global.get 0 (0x23 0x00)!");
+  process.exit(1);
+}
+
+for (const rtPath of rtPaths) {
+  const rtLabel = path.basename(rtPath);
+  const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+  // Test pure promoted module
+  const rt1 = createPionRuntime({});
+  const { instance: inst1 } = await WebAssembly.instantiate(pureBytes, rt1.imports);
+  rt1.bindExports(inst1.exports);
+  const c0 = inst1.exports.clamp_u8(-0.2);
+  const c1 = inst1.exports.clamp_u8(0.5);
+  const c2 = inst1.exports.clamp_u8(1.5);
+  const sl = inst1.exports.signed_loop(10, 5);
+  // i=0,2,4,6,8: neg=-5,-3,-1,1,3 -> neg+i = -5,-1,3,7,11 -> sum=15
+  // i=1,3,5,7,9: i*3-7 = -4,2,8,14,20 -> sum=40 => total=55n
+  if ((c0 | 0) !== 0 || (c1 | 0) !== 128 || (c2 | 0) !== 255 || sl !== 55n) {
+    console.error("FAIL (" + rtLabel + "): mem2reg_pure mismatch:", { c0, c1, c2, sl });
+    process.exit(1);
+  }
+
+  // Test mixed Float + signed Int64 + Struct/Array/Closure module
+  const lines = [];
+  const rt2 = createPionRuntime({
+    print: (s) => lines.push(s),
+    println: (s) => lines.push(s + "\n"),
+  });
+  const { instance: inst2 } = await WebAssembly.instantiate(mixBytes, rt2.imports);
+  rt2.bindExports(inst2.exports);
+  const rc = inst2.exports.main(0, 0n);
+  const out = lines.join("").trim();
+  if ((rc | 0) !== 0 || out !== "1078984704:-35:61") {
+    console.error("FAIL (" + rtLabel + "): mem2reg_mix mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+    process.exit(1);
+  }
+}
+console.log("  mem2reg (pure+mix): zero_shadow_stack=OK pure_raw=" + pureBytes.length + "B mix_raw=" + mixBytes.length + "B (Node+Web OK)");
+' "$M2R_PURE_RAW" "$M2R_MIX_RAW" "$PION_WASM_RT" "$PION_WASM_RT_WEB"
+
 echo "p29c_wasm32 E2E: OK"
