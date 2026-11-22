@@ -3310,12 +3310,13 @@ fn collect_expr_captures(
     }
     EIs(scrut, _, _) => collect_expr_captures(scrut, locals, out)
     EClosure(params, _, body, _) => {
+      let inner_locals = locals.copy()
       let mut i = 0
       while i < params.length() {
-        locals.set(params[i].name, true)
+        inner_locals.set(params[i].name, true)
         i = i + 1
       }
-      collect_stmts_captures(body, locals, out)
+      collect_stmts_captures(body, inner_locals, out)
     }
     EScope(w, f, _) => {
       collect_expr_captures(w, locals, out)
@@ -3729,13 +3730,33 @@ fn check_stmts_ex(
     }
     pi = pi + 1
   }
+  // When a block expects `Unit`, implicitly discard a non-`Result` tail expression;
+  // an unhandled `Result` in tail position still triggers `E_UNHANDLED_RESULT`.
+  match expected {
+    Some(TUnit) =>
+      match stmts[stmts.length() - 1] {
+        SExpr(_, _) =>
+          match last_ty {
+            TUnit | TError | TNever => ()
+            TResult(_, _) => {
+              if tail_used {
+                check_unhandled_result(tc, stmts[stmts.length() - 1], last_ty)
+              }
+              last_ty = TUnit
+            }
+            _ => last_ty = TUnit
+          }
+        _ => ()
+      }
+    _ => ()
+  }
   last_ty
 }
 
 ///|
-/// 1 for an empty array initializer (`[]`, `Array::new()`), 2 for an empty map
-/// (`Map([])`, `Map()`, `Map::new()`), 3 for an untyped `None` (`None`,
-/// `Option::None`), 0 otherwise.
+/// 1 for an empty array initializer (`[]`, `Array::new()`, `Array::with_capacity(n)`),
+/// 2 for an empty map (`Map([])`, `Map()`, `Map::new()`, `Map::with_capacity(n)`),
+/// 3 for an untyped `None` (`None`, `Option::None`), 0 otherwise.
 fn infer_empty_kind(init : Expr) -> Int {
   match init {
     EArrayLit(elems, _) => if elems.length() == 0 { 1 } else { 0 }
@@ -3751,7 +3772,9 @@ fn infer_empty_kind(init : Expr) -> Int {
         0
       }
     ECall(EPath("Map", "new", _), args, _) => if args.length() == 0 { 2 } else { 0 }
+    ECall(EPath("Map", "with_capacity", _), args, _) => if args.length() == 1 { 2 } else { 0 }
     ECall(EPath("Array", "new", _), args, _) => if args.length() == 0 { 1 } else { 0 }
+    ECall(EPath("Array", "with_capacity", _), args, _) => if args.length() == 1 { 1 } else { 0 }
     EIdent("None", _) => 3
     EPath("Option", "None", _) => 3
     _ => 0
@@ -4423,19 +4446,6 @@ fn check_stmt(
                 if b.decl_span.line > 0 {
                   tc_add_edit(tc, text_edit_insert(b.decl_span, 4, "mut "))
                 }
-              } else if env.closure_scope_floor > 0 &&
-                env_lookup_depth(env, name) < env.closure_scope_floor {
-                tc_err(
-                  tc,
-                  lsp,
-                  "E_CAPTURE_MUT_ASSIGN",
-                  "cannot assign to captured `let mut` variable `" +
-                  name +
-                  "` inside a closure (closures capture by value)",
-                  "local mutable binding",
-                  "captured `let mut " + name + "`",
-                  "use a single-field `mut` struct or a single-element `Array` to share mutable state with a closure",
-                )
               }
               let is_pending = b.decl_span.line > 0 &&
                 tc.infer_pending.contains(span_key(b.decl_span))
@@ -4500,19 +4510,6 @@ fn check_stmt(
                   "mutable binding",
                   "immutable `" + name + "`",
                   "declare `" + name + "` with `let mut " + name + "`",
-                )
-              } else if env.closure_scope_floor > 0 &&
-                env_lookup_depth(env, name) < env.closure_scope_floor {
-                tc_err(
-                  tc,
-                  lsp,
-                  "E_CAPTURE_MUT_ASSIGN",
-                  "cannot assign to captured `let mut` variable `" +
-                  name +
-                  "` inside a closure (closures capture by value)",
-                  "local mutable binding",
-                  "captured `let mut " + name + "`",
-                  "use a single-field `mut` struct or a single-element `Array` to share mutable state with a closure",
                 )
               }
               b.ty
@@ -6510,6 +6507,83 @@ fn check_method_call(
               None => ()
             }
           }
+          // Fallback: callable function-typed struct field (`d.refresh()`, `d.set_dpi(v, lod)`)
+          let sinfo_opt : Option[StructInfo] = match tc.structs.get(sname) {
+            Some(si) => Some(si)
+            None =>
+              if canon_pkg.length() > 0 {
+                match lookup_imported_pkg_transitive(tc, canon_pkg) {
+                  Some(ipkg) => ipkg.tc.structs.get(st_name)
+                  None => None
+                }
+              } else {
+                None
+              }
+          }
+          match sinfo_opt {
+            Some(sinfo) => {
+              let subst = make_subst(sinfo.decl.type_params, sargs)
+              let mut fi = 0
+              while fi < sinfo.field_names.length() {
+                if sinfo.field_names[fi] == method_name {
+                  let raw_fty = if !tc.structs.contains(sname) && canon_pkg.length() > 0 {
+                    qualify_imported_ty(canon_pkg, sinfo.field_tys[fi])
+                  } else {
+                    sinfo.field_tys[fi]
+                  }
+                  let fty = subst_ty(raw_fty, subst)
+                  match fty {
+                    TFn(ptys, rty) => {
+                      if args.length() != ptys.length() {
+                        tc_err(
+                          tc,
+                          sp,
+                          "E_TYPE_MISMATCH",
+                          "field `" +
+                          sname +
+                          "." +
+                          method_name +
+                          "` expects " +
+                          ptys.length().to_string() +
+                          " argument(s), found " +
+                          args.length().to_string(),
+                          ptys.length().to_string() + " args",
+                          args.length().to_string() + " args",
+                          "pass " + ptys.length().to_string() + " argument(s)",
+                        )
+                      }
+                      let mut ai = 0
+                      while ai < args.length() {
+                        let exp_p : Option[Ty] = if ai < ptys.length() {
+                          Some(ptys[ai])
+                        } else {
+                          None
+                        }
+                        let aty = check_expr(tc, env, args[ai], exp_p)
+                        if ai < ptys.length() && !ty_compat(ptys[ai], aty) {
+                          tc_err(
+                            tc,
+                            expr_span(args[ai]),
+                            "E_TYPE_MISMATCH",
+                            "argument type mismatch in call to `" + sname + "." + method_name + "`",
+                            ty_to_string(ptys[ai]),
+                            ty_to_string(aty),
+                            "pass a value of type `" + ty_to_string(ptys[ai]) + "`",
+                          )
+                        }
+                        ai = ai + 1
+                      }
+                      return rty
+                    }
+                    _ => ()
+                  }
+                  break
+                }
+                fi = fi + 1
+              }
+            }
+            None => ()
+          }
         }
       }
     }
@@ -7656,7 +7730,67 @@ fn check_expr_inner(
               _ => TMap(TString, TError)
             }
           }
+          if qual == "Map" && mem == "with_capacity" {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "`Map::with_capacity` expects 1 argument, found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "pass an `Int` capacity: `Map::with_capacity(cap)`",
+              )
+            } else {
+              let cty = check_expr(tc, env, args[0], Some(TInt))
+              if !ty_compat(TInt, cty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`Map::with_capacity` capacity must be `Int`",
+                  "Int",
+                  ty_to_string(cty),
+                  "pass an `Int` capacity",
+                )
+              }
+            }
+            return match expected {
+              Some(TMap(k, v)) => TMap(k, v)
+              _ => TMap(TString, TError)
+            }
+          }
           if qual == "Array" && mem == "new" {
+            return match expected {
+              Some(TArray(e)) => TArray(e)
+              _ => TArray(TError)
+            }
+          }
+          if qual == "Array" && mem == "with_capacity" {
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "`Array::with_capacity` expects 1 argument, found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "pass an `Int` capacity: `Array::with_capacity(cap)`",
+              )
+            } else {
+              let cty = check_expr(tc, env, args[0], Some(TInt))
+              if !ty_compat(TInt, cty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`Array::with_capacity` capacity must be `Int`",
+                  "Int",
+                  ty_to_string(cty),
+                  "pass an `Int` capacity",
+                )
+              }
+            }
             return match expected {
               Some(TArray(e)) => TArray(e)
               _ => TArray(TError)
@@ -8437,6 +8571,26 @@ fn check_expr_inner(
             match bty {
               TNever => ()
               _ => res_ty = Some(bty)
+            }
+          Some(TUnit) =>
+            match bty {
+              TUnit | TError | TNever => ()
+              TResult(_, _) => {
+                let bsp = expr_span(arms[i].body)
+                tc_err(
+                  tc,
+                  bsp,
+                  "E_UNHANDLED_RESULT",
+                  "value of type `" +
+                  ty_to_string(bty) +
+                  "` is silently discarded",
+                  "handled Result",
+                  ty_to_string(bty),
+                  "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`",
+                )
+                tc_add_edit(tc, text_edit_insert(bsp, 0, "let _ = "))
+              }
+              _ => ()
             }
           Some(rt) => {
             if !ty_compat(rt, bty) {

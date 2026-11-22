@@ -295,8 +295,8 @@ if [ "$OUT" != "p30a_bugs9_to_13 ok" ]; then
   exit 1
 fi
 
-# 2. Negative compile-time checks (E_CAPTURE_MUT_ASSIGN, Double var -> Float)
-cat > "$TMP_DIR/bad_mut_cap.pion" <<'EOF'
+# 2. P31-A: local closure `let mut` auto-boxing works; `spawn` capturing `let mut` is still E_NOT_SEND; Double var -> Float is E_TYPE_MISMATCH
+cat > "$TMP_DIR/ok_mut_cap.pion" <<'EOF'
 fn run_cb(f : () -> Unit) -> Unit {
   f()
 }
@@ -304,12 +304,23 @@ pub fn main(world : World) -> Int {
   let _ = world
   let mut x = false
   run_cb(fn() -> Unit { x = true })
+  if x { 0 } else { 1 }
+}
+EOF
+"$PIONC" run "$TMP_DIR/ok_mut_cap.pion"
+
+cat > "$TMP_DIR/bad_spawn_mut_cap.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  let mut x = false
+  scope(world, fn(s : Scope) -> Unit {
+    spawn(s, fn() -> Unit { x = true })
+  })
   if x { 1 } else { 0 }
 }
 EOF
-BAD1=$("$PIONC" check --json "$TMP_DIR/bad_mut_cap.pion" || true)
-if ! printf '%s' "$BAD1" | grep -q '"code":"E_CAPTURE_MUT_ASSIGN"'; then
-  echo "FAIL: expected E_CAPTURE_MUT_ASSIGN, got: $BAD1" >&2
+BAD1=$("$PIONC" check --json "$TMP_DIR/bad_spawn_mut_cap.pion" || true)
+if ! printf '%s' "$BAD1" | grep -q '"code":"E_NOT_SEND"'; then
+  echo "FAIL: expected E_NOT_SEND for spawn capturing let mut, got: $BAD1" >&2
   exit 1
 fi
 
@@ -327,7 +338,7 @@ if ! printf '%s' "$BAD2" | grep -q '"code":"E_TYPE_MISMATCH"'; then
   echo "FAIL: expected E_TYPE_MISMATCH for Double -> Float, got: $BAD2" >&2
   exit 1
 fi
-echo "p30a_bugs9_to_13 negative checks (E_CAPTURE_MUT_ASSIGN, Double->Float): OK"
+echo "p30a_bugs9_to_13 checks (local mut cap OK, spawn E_NOT_SEND, Double->Float): OK"
 
 # 3. ASan/LSan leak check (skip if host cc cannot link -fsanitize=address)
 CC_BIN="${CC:-cc}"
