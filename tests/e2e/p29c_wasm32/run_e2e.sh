@@ -1590,4 +1590,249 @@ console.log("  container_drop_split (" + mode + "/" + rtLabel + "): out=" + out 
 done
 done
 
+echo "[17/18] P38-B Compact 1-Byte Array/FixedArray[Bool|Byte] Regression (release+dev x Node+Web)"
+cat > "$TMP_DIR/p38b_compact_u8.pion" <<'EOF'
+fn id_arr[T](a : Array[T]) -> Array[T] {
+  a
+}
+
+fn first_elem[T](a : Array[T]) -> T {
+  a[0]
+}
+
+pub fn main(world : World) -> Int {
+  let n = 10000
+  let flags = Array::make(n, true)
+  flags[0] = false
+  flags[1] = false
+  let mut i = 2
+  while i * i < n {
+    if flags[i] {
+      let mut j = i * i
+      while j < n {
+        flags[j] = false
+        j = j + i
+      }
+    }
+    i = i + 1
+  }
+  let mut primes = 0
+  let mut k = 0
+  while k < n {
+    if flags[k] {
+      primes = primes + 1
+    }
+    k = k + 1
+  }
+
+  let bs : Array[Byte] = Array::new()
+  let mut m = 0
+  while m < 600 {
+    bs.push(((m * 37 + 11) & 255).to_byte())
+    m = m + 1
+  }
+  let popped = match bs.pop() {
+    Some(v) => v.to_int()
+    None => -1
+  }
+  let bs_cp = bs.copy()
+  bs_cp[0] = (254).to_byte()
+  let bs_lit : Array[Byte] = [(200).to_byte(), (5).to_byte(), (255).to_byte(), (42).to_byte()]
+  bs_lit.reverse()
+  let g0 = first_elem(id_arr(bs_lit)).to_int()
+
+  let fb = FixedArray::make(32, false)
+  fb.fill(true)
+  fb[7] = false
+  let fb2 = FixedArray::makei(16, fn(x : Int) -> Bool { x % 3 == 0 })
+  let fby = FixedArray::makei(10, fn(x : Int) -> Byte { (x * 20 + 3).to_byte() })
+  let fby2 = FixedArray::make(10, (0).to_byte())
+  fby.blit_to(fby2, len=5, src_offset=1, dst_offset=2)
+  fby.blit_to(fby, len=4, src_offset=0, dst_offset=3)
+  let ok_b = if !flags[0] && flags[9973] && bs_cp.contains((254).to_byte()) && !fb[7] && fb2[6] && !fb2[7] { 1 } else { 0 }
+
+  io_println(
+    world,
+    primes.to_string() + ":" + popped.to_string() + ":" + g0.to_string() + ":" + fby2[2].to_int().to_string() + ":" + fby[6].to_int().to_string() + ":" + ok_b.to_string(),
+  )
+  0
+}
+EOF
+P38B_REL_WASM="$TMP_DIR/p38b_rel.wasm"
+P38B_DEV_WASM="$TMP_DIR/p38b_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P38B_REL_WASM" "$TMP_DIR/p38b_compact_u8.pion"
+"$PIONC" build --target wasm32 -o "$P38B_DEV_WASM" "$TMP_DIR/p38b_compact_u8.pion"
+for mode_wasm in "release:$P38B_REL_WASM" "dev:$P38B_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p38b_compact_u8.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "1229:158:42:23:63:1") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p38b_compact_u8 mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+console.log("  p38b_compact_u8 (" + mode + "/" + rtLabel + "): out=" + out + " OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
+echo "[18/18] P38-C Flat POD Struct Arrays & HOF Fusion Regression (release+dev x Node+Web)"
+cat > "$TMP_DIR/flat_pod_arr.pion" <<'EOF'
+#derive(Eq)
+struct Pt2 { x : Int64, y : Int64 }
+struct Vec3 { x : Double, y : Double, z : Double }
+struct Rect4 { x : Int, y : Int, w : Int, h : Int }
+struct MutBody { mut x : Int, mut y : Int }
+struct Named { id : Int, label : String }
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn esc_pt(a : Array[Pt2], i : Int) -> Pt2 { a[i] }
+
+fn map_pts(pts : Array[Pt2], f : (Pt2) -> Pt2) -> Array[Pt2] {
+  let len = pts.length()
+  let out : Array[Pt2] = Array::with_capacity(len)
+  let mut i = 0
+  while i < len {
+    out.push(f(pts[i]))
+    i = i + 1
+  }
+  out
+}
+
+pub fn main(world : World) -> Int {
+  let pts : Array[Pt2] = Array::new()
+  let mut i = 0
+  while i < 100 {
+    pts.push(Pt2::{ x: i.to_int64(), y: (i * 3).to_int64() })
+    i = i + 1
+  }
+  let mapped = map_pts(pts, fn(p : Pt2) -> Pt2 { Pt2::{ x: p.x + 1L, y: p.y + 2L } })
+  must(mapped[0].x == 1L && mapped[99].y == 299L, "pt2 hof map")
+  let cp = pts.copy()
+  cp.reverse()
+  must(cp[0].x == 99L && cp[99].x == 0L, "pt2 reverse")
+  let popped = match cp.pop() {
+    Some(p) => p.x + p.y
+    None => -1L
+  }
+  must(popped == 0L && cp.length() == 99, "pt2 pop")
+  let e = esc_pt(pts, 42)
+  must(e.x == 42L && e.y == 126L, "pt2 escape")
+  must(pts.contains(Pt2::{ x: 50L, y: 150L }), "pt2 contains")
+  pts[10] = Pt2::{ x: 1000L, y: 2000L }
+  let mut s2 = 0L
+  i = 0
+  while i < pts.length() {
+    let p = pts[i]
+    s2 = s2 + p.x + p.y
+    i = i + 1
+  }
+
+  let v3 = FixedArray::makei(8, fn(k : Int) -> Vec3 {
+    Vec3::{ x: k.to_double(), y: (k * 2).to_double(), z: (k * 4).to_double() }
+  })
+  let v3b = FixedArray::make(8, Vec3::{ x: 0.0, y: 0.0, z: 0.0 })
+  v3.blit_to(v3b, len=4, src_offset=3, dst_offset=2)
+  must(v3b[2].x.to_int() == 3 && v3b[5].z.to_int() == 24, "vec3 blit")
+  v3b.fill(Vec3::{ x: 1.0, y: 2.0, z: 3.0 })
+  let s3 = (v3b[0].x + v3b[7].z).to_int()
+
+  let r4 : Array[Rect4] = Array::new()
+  i = 0
+  while i < 16 {
+    r4.push(Rect4::{ x: i, y: i + 1, w: i + 2, h: i + 3 })
+    i = i + 1
+  }
+  r4.reverse()
+  let s4 = r4[0].x + r4[0].h + r4[15].h
+
+  let mb : Array[MutBody] = [MutBody::{ x: 5, y: 6 }]
+  let m0 = mb[0]
+  m0.x = 77
+  must(mb[0].x == 77, "mut alias")
+  let nm : Array[Named] = [Named::{ id: 1, label: "ok" }]
+  nm.push(Named::{ id: 2, label: "go" })
+  nm.reverse()
+  io_println(world, s2.to_string() + ":" + s3.to_string() + ":" + s4.to_string() + ":" + mb[0].x.to_string() + ":" + nm[0].label)
+  0
+}
+EOF
+FP_REL_WASM="$TMP_DIR/flat_pod_rel.wasm"
+FP_DEV_WASM="$TMP_DIR/flat_pod_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$FP_REL_WASM" "$TMP_DIR/flat_pod_arr.pion"
+"$PIONC" build --target wasm32 -o "$FP_DEV_WASM" "$TMP_DIR/flat_pod_arr.pion"
+for mode_wasm in "release:$FP_REL_WASM" "dev:$FP_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): flat_pod_arr.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "22760:4:36:77:go") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): flat_pod_arr mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): flat_pod_arr linear memory leaked:", memBytes);
+  process.exit(1);
+}
+console.log("  flat_pod_arr (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

@@ -984,16 +984,25 @@ export function createPionRuntime(options = {}) {
   }
 
   // --- Array ---
-  function pion_arr_new(cap, elemIsObj) {
+  function arrStride(p) {
+    const s = dv.getInt32(p + 20, true);
+    return s > 0 ? s : 8;
+  }
+
+  function pion_arr_new(cap, elemFlags) {
     const c = Math.max(Number(cap), 0);
+    const f = elemFlags | 0;
+    const elemIsObj = f === 1 ? 1 : 0;
+    const elemStride = f === 2 ? 1 : (f > 2 ? f : 0);
+    const esz = elemStride || 8;
     const obj = pion_alloc_uninit(32, TAG_ARRAY, 0n);
-    const dp = c > 0 ? rawAllocZero(c * 8) : 0;
+    const dp = c > 0 ? rawAllocZero(c * esz) : 0;
     const p = pNum(obj);
     syncViews();
     dv.setBigInt64(p + 0, 0n, true);
     dv.setBigInt64(p + 8, BigInt(c), true);
-    dv.setInt32(p + 16, elemIsObj | 0, true);
-    dv.setInt32(p + 20, 0, true);
+    dv.setInt32(p + 16, elemIsObj, true);
+    dv.setInt32(p + 20, elemStride, true);
     dv.setBigInt64(p + 24, pBig(dp), true);
     return obj;
   }
@@ -1010,13 +1019,25 @@ export function createPionRuntime(options = {}) {
     let newCap = cap < 8 ? 8 : cap * 2;
     while (newCap < need) newCap *= 2;
     const len = Number(dv.getBigInt64(p + 0, true));
+    const esz = arrStride(p);
     const oldDp = Number(dv.getBigInt64(p + 24, true));
-    const newDp = rawAlloc(newCap * 8);
+    const newDp = rawAlloc(newCap * esz);
     syncViews();
-    if (len > 0 && oldDp) u8.copyWithin(newDp, oldDp, oldDp + len * 8);
+    if (len > 0 && oldDp) u8.copyWithin(newDp, oldDp, oldDp + len * esz);
     if (oldDp) rawFree(oldDp);
     dv.setBigInt64(p + 8, BigInt(newCap), true);
     dv.setBigInt64(p + 24, pBig(newDp), true);
+  }
+
+  function pion_arr_push_flat_grow(a) {
+    const p = pNum(a);
+    syncViews();
+    const len = Number(dv.getBigInt64(p + 0, true));
+    arrEnsure(p, len + 1);
+    syncViews();
+    const dp = Number(dv.getBigInt64(p + 24, true));
+    const stride = arrStride(p);
+    return pBig(dp + len * stride);
   }
 
   function pion_arr_push(a, val) {
@@ -1024,8 +1045,15 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const len = Number(dv.getBigInt64(p, true));
     const elemIsObj = dv.getInt32(p + 16, true);
+    const stride = dv.getInt32(p + 20, true);
     arrEnsure(p, len + 1);
     syncViews();
+    if (stride === 1) {
+      const dp = Number(dv.getBigInt64(p + 24, true));
+      u8[dp + len] = Number(val) & 0xff;
+      dv.setBigInt64(p, BigInt(len + 1), true);
+      return;
+    }
     if (elemIsObj && val !== 0n) pion_rc_inc(val);
     syncViews();
     const dp = Number(dv.getBigInt64(p + 24, true));
@@ -1037,10 +1065,15 @@ export function createPionRuntime(options = {}) {
     const p = pNum(a);
     syncViews();
     const len = Number(dv.getBigInt64(p, true));
+    const stride = dv.getInt32(p + 20, true);
     arrEnsure(p, len + 1);
     syncViews();
     const dp = Number(dv.getBigInt64(p + 24, true));
-    dv.setBigInt64(dp + len * 8, BigInt(val), true);
+    if (stride === 1) {
+      u8[dp + len] = Number(val) & 0xff;
+    } else {
+      dv.setBigInt64(dp + len * 8, BigInt(val), true);
+    }
     dv.setBigInt64(p, BigInt(len + 1), true);
   }
 
@@ -1050,6 +1083,9 @@ export function createPionRuntime(options = {}) {
     const len = dv.getBigInt64(p, true);
     if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
     const dp = Number(dv.getBigInt64(p + 24, true));
+    if (dv.getInt32(p + 20, true) === 1) {
+      return BigInt(u8[dp + Number(idx)]);
+    }
     return dv.getBigInt64(dp + Number(idx) * 8, true);
   }
 
@@ -1058,8 +1094,12 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const len = dv.getBigInt64(p, true);
     if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
-    const elemIsObj = dv.getInt32(p + 16, true);
     const dp = Number(dv.getBigInt64(p + 24, true));
+    if (dv.getInt32(p + 20, true) === 1) {
+      u8[dp + Number(idx)] = Number(val) & 0xff;
+      return;
+    }
+    const elemIsObj = dv.getInt32(p + 16, true);
     const off = dp + Number(idx) * 8;
     const oldVal = dv.getBigInt64(off, true);
     if (elemIsObj && val !== 0n) pion_rc_inc(val);
@@ -1074,7 +1114,9 @@ export function createPionRuntime(options = {}) {
     const len = Number(dv.getBigInt64(p, true));
     if (len <= 0) pion_panic_oob(-1n, 0n);
     const dp = Number(dv.getBigInt64(p + 24, true));
-    const val = dv.getBigInt64(dp + (len - 1) * 8, true);
+    const val = dv.getInt32(p + 20, true) === 1
+      ? BigInt(u8[dp + (len - 1)])
+      : dv.getBigInt64(dp + (len - 1) * 8, true);
     dv.setBigInt64(p, BigInt(len - 1), true);
     return val;
   }
@@ -1084,13 +1126,16 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const len = Number(dv.getBigInt64(p, true));
     const elemIsObj = dv.getInt32(p + 16, true);
-    const out = pion_arr_new(BigInt(len), elemIsObj);
+    const stride = dv.getInt32(p + 20, true);
+    const flags = stride > 1 ? stride : (stride === 1 ? 2 : elemIsObj);
+    const esz = stride || 8;
+    const out = pion_arr_new(BigInt(len), flags);
     const po = pNum(out);
     syncViews();
     const src = Number(dv.getBigInt64(p + 24, true));
     const dst = Number(dv.getBigInt64(po + 24, true));
     if (len > 0) {
-      u8.copyWithin(dst, src, src + len * 8);
+      u8.copyWithin(dst, src, src + len * esz);
       if (elemIsObj) {
         for (let i = 0; i < len; i++) {
           const ev = dv.getBigInt64(dst + i * 8, true);
@@ -1123,11 +1168,23 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const len = Number(dv.getBigInt64(p, true));
     const dp = Number(dv.getBigInt64(p + 24, true));
-    for (let i = 0, j = len - 1; i < j; i++, j--) {
-      const va = dv.getBigInt64(dp + i * 8, true);
-      const vb = dv.getBigInt64(dp + j * 8, true);
-      dv.setBigInt64(dp + i * 8, vb, true);
-      dv.setBigInt64(dp + j * 8, va, true);
+    const stride = arrStride(p);
+    if (stride === 8) {
+      for (let i = 0, j = len - 1; i < j; i++, j--) {
+        const va = dv.getBigInt64(dp + i * 8, true);
+        const vb = dv.getBigInt64(dp + j * 8, true);
+        dv.setBigInt64(dp + i * 8, vb, true);
+        dv.setBigInt64(dp + j * 8, va, true);
+      }
+    } else {
+      const tmp = new Uint8Array(stride);
+      for (let i = 0, j = len - 1; i < j; i++, j--) {
+        const oi = dp + i * stride;
+        const oj = dp + j * stride;
+        tmp.set(u8.subarray(oi, oi + stride));
+        u8.copyWithin(oi, oj, oj + stride);
+        u8.set(tmp, oj);
+      }
     }
   }
 
@@ -1150,6 +1207,10 @@ export function createPionRuntime(options = {}) {
     const len = Number(dv.getBigInt64(p, true));
     if (len <= 1) return;
     const dp = Number(dv.getBigInt64(p + 24, true));
+    if (dv.getInt32(p + 20, true) === 1) {
+      u8.subarray(dp, dp + len).sort();
+      return;
+    }
     const vals = new Array(len);
     for (let i = 0; i < len; i++) vals[i] = dv.getBigInt64(dp + i * 8, true);
     vals.sort((x, y) => (x < y ? -1 : x > y ? 1 : 0));
@@ -1739,7 +1800,7 @@ export function createPionRuntime(options = {}) {
       pion_strbuf_push_char, pion_strbuf_push_int, pion_strbuf_reset, pion_strbuf_to_str,
 
       // Array
-      pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned,
+      pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_push_flat_grow,
       pion_arr_get, pion_arr_set, pion_arr_pop, pion_arr_copy,
       pion_arr_clear, pion_arr_reverse, pion_arr_join,
       pion_arr_sort_int, pion_arr_sort_str,

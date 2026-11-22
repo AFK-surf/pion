@@ -299,10 +299,11 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void* pion_strbuf_to_str(void *sb);`
 - `StringBuilder::length() -> Int` (reads `PionStrBuf.len` at offset 0)
 
-**Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int64_t *data; }` — uniform 64-bit slots!):**
-- `void*   pion_arr_new(int64_t cap, int32_t elem_is_obj);`
+**Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int32_t elem_stride; int64_t *data; }` — `elem_stride` at `+20`: `0`/`8` = 8-byte slots, `1` = compact 1-byte `Bool`/`Byte` slots with `elem_is_obj = 0`, `16`/`24`/`32` = flat inline 2..4-field immutable scalar POD structs with `elem_is_obj = 0`):**
+- `void*   pion_arr_new(int64_t cap, int32_t elem_flags);` (`0` = 8B scalar, `1` = 8B RC object, `2` = 1B compact `Bool`/`Byte`, `> 2` = flat POD struct stride `16`/`24`/`32`)
 - `int64_t pion_arr_len(void *a);`
 - `void    pion_arr_push(void *a, int64_t val);` (retains if `elem_is_obj`)
+- `void*   pion_arr_push_flat_grow(void *a);` (slow-path grow for flat-stride arrays, returning `&data[len * stride]`)
 - `int64_t pion_arr_get(void *a, int64_t idx);` (bounds-checked!)
 - `void    pion_arr_set(void *a, int64_t idx, int64_t val);` (bounds-checked; retains new, releases old if `elem_is_obj`)
 - `int64_t pion_arr_pop(void *a);`

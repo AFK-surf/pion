@@ -76,7 +76,7 @@ typedef struct PionArray {
     int64_t len;
     int64_t cap;
     int32_t elem_is_obj;
-    int32_t _pad;
+    int32_t elem_stride; /* 0/8 = 8B slots; 1 = 1B Bool/Byte; 16/24/32 = flat POD struct */
     int64_t *data;
 } PionArray;
 
@@ -174,11 +174,12 @@ void     pion_strbuf_push_int(void *sb, int64_t v);
 void     pion_strbuf_reset(void *sb);
 void*    pion_strbuf_to_str(void *sb);
 
-/* Array */
-void*    pion_arr_new(int64_t cap, int32_t elem_is_obj);
+/* Array (flags: 0 = 8B scalar, 1 = 8B RC obj, 2 = 1B compact Bool/Byte, >2 = flat stride) */
+void*    pion_arr_new(int64_t cap, int32_t elem_flags);
 int64_t  pion_arr_len(void *a);
 void     pion_arr_push(void *a, int64_t val);
 void     pion_arr_push_owned(void *a, int64_t val);
+void*    pion_arr_push_flat_grow(void *a);
 int64_t  pion_arr_get(void *a, int64_t idx);
 void     pion_arr_set(void *a, int64_t idx, int64_t val);
 int64_t  pion_arr_pop(void *a);

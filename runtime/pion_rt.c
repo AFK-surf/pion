@@ -1482,6 +1482,10 @@ void *pion_strbuf_to_str(void *sb_ptr) {
  * 4. Array
  * ============================================================================ */
 
+static inline size_t pion_arr_stride(const PionArray *a) {
+    return a->elem_stride ? (size_t)a->elem_stride : sizeof(int64_t);
+}
+
 static void pion_arr_drop(void *payload) {
     PionArray *a = (PionArray *)payload;
     if (a->elem_is_obj) {
@@ -1490,26 +1494,27 @@ static void pion_arr_drop(void *payload) {
         }
     }
     if (a->data) {
-        pion_slab_raw_free(a->data, (size_t)a->cap * sizeof(int64_t),
+        pion_slab_raw_free(a->data, (size_t)a->cap * pion_arr_stride(a),
                            (pion_hdr(a)->flags & PION_FLAG_FROZEN) != 0);
         a->data = NULL;
     }
 }
 
 static PION_NOINLINE void pion_arr_grow(PionArray *a) {
+    size_t stride = pion_arr_stride(a);
     int64_t ocap = a->cap;
     int64_t ncap = ocap > 0 ? ocap * 2 : 4;
-    size_t new_bytes = (size_t)ncap * sizeof(int64_t);
+    size_t new_bytes = (size_t)ncap * stride;
     int64_t *nd;
 #if PION_USE_SLAB
-    size_t old_bytes = (size_t)ocap * sizeof(int64_t);
+    size_t old_bytes = (size_t)ocap * stride;
     if (old_bytes > PION_MED_MAX_BYTES && new_bytes > PION_MED_MAX_BYTES) {
         nd = (int64_t *)realloc(a->data, new_bytes);
         if (!nd) pion_panic("out of memory in arr_push", __FILE__, __LINE__);
     } else {
         nd = (int64_t *)pion_slab_raw_alloc(new_bytes);
         if (a->len > 0) {
-            memcpy(nd, a->data, (size_t)a->len * sizeof(int64_t));
+            memcpy(nd, a->data, (size_t)a->len * stride);
         }
         if (a->data) {
             pion_slab_raw_free(a->data, old_bytes,
@@ -1524,19 +1529,25 @@ static PION_NOINLINE void pion_arr_grow(PionArray *a) {
     a->cap = ncap;
 }
 
-void *pion_arr_new(int64_t cap, int32_t elem_is_obj) {
+void *pion_arr_new(int64_t cap, int32_t elem_flags) {
     PionArray *a = (PionArray *)pion_alloc_raw_fast((uint32_t)sizeof(PionArray), PION_TAG_ARRAY, pion_arr_drop);
     a->len = 0;
-    a->elem_is_obj = elem_is_obj ? 1 : 0;
-    a->_pad = 0;
+    a->elem_is_obj = (elem_flags == 1) ? 1 : 0;
+    a->elem_stride = (elem_flags == 2) ? 1 : ((elem_flags > 2) ? elem_flags : 0);
     if (cap > 0) {
-        a->data = (int64_t *)pion_slab_raw_alloc((size_t)cap * sizeof(int64_t));
+        a->data = (int64_t *)pion_slab_raw_alloc((size_t)cap * pion_arr_stride(a));
         a->cap = cap;
     } else {
         a->data = NULL;
         a->cap = 0;
     }
     return a;
+}
+
+PION_NOINLINE PION_MINSIZE void *pion_arr_push_flat_grow(void *a_ptr) {
+    PionArray *a = (PionArray *)a_ptr;
+    pion_arr_grow(a);
+    return (char *)a->data + (size_t)a->len * pion_arr_stride(a);
 }
 
 int64_t pion_arr_len(void *a_ptr) {
@@ -1548,6 +1559,10 @@ PION_HOT void pion_arr_push(void *a_ptr, int64_t val) {
     PionArray *a = (PionArray *)a_ptr;
     if (__builtin_expect(a->len == a->cap, 0)) {
         pion_arr_grow(a);
+    }
+    if (__builtin_expect(a->elem_stride == 1, 0)) {
+        ((uint8_t *)a->data)[a->len++] = (uint8_t)val;
+        return;
     }
     if (a->elem_is_obj) {
         pion_adopt(a, val);
@@ -1561,6 +1576,10 @@ void pion_arr_push_owned(void *a_ptr, int64_t val) {
     if (__builtin_expect(a->len == a->cap, 0)) {
         pion_arr_grow(a);
     }
+    if (__builtin_expect(a->elem_stride == 1, 0)) {
+        ((uint8_t *)a->data)[a->len++] = (uint8_t)val;
+        return;
+    }
     if (a->elem_is_obj) {
         pion_adopt(a, val);
     }
@@ -1572,6 +1591,9 @@ PION_MINSIZE int64_t pion_arr_get(void *a_ptr, int64_t idx) {
     if (!a || idx < 0 || idx >= a->len) {
         pion_panic("array index out of bounds", __FILE__, __LINE__);
     }
+    if (a->elem_stride == 1) {
+        return (int64_t)((uint8_t *)a->data)[idx];
+    }
     return a->data[idx];
 }
 
@@ -1579,6 +1601,10 @@ PION_MINSIZE void pion_arr_set(void *a_ptr, int64_t idx, int64_t val) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || idx < 0 || idx >= a->len) {
         pion_panic("array set index out of bounds", __FILE__, __LINE__);
+    }
+    if (a->elem_stride == 1) {
+        ((uint8_t *)a->data)[idx] = (uint8_t)val;
+        return;
     }
     if (a->elem_is_obj) {
         pion_adopt(a, val);
@@ -1593,6 +1619,9 @@ int64_t pion_arr_pop(void *a_ptr) {
     if (!a || a->len <= 0) {
         pion_panic("array pop on empty array", __FILE__, __LINE__);
     }
+    if (__builtin_expect(a->elem_stride == 1, 0)) {
+        return (int64_t)((uint8_t *)a->data)[--a->len];
+    }
     /* Transfers slot ownership to caller (no RC dec) */
     return a->data[--a->len];
 }
@@ -1600,9 +1629,10 @@ int64_t pion_arr_pop(void *a_ptr) {
 PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a) return pion_arr_new(0, 0);
-    PionArray *cp = (PionArray *)pion_arr_new(a->len, a->elem_is_obj);
+    int32_t flags = a->elem_stride > 1 ? a->elem_stride : (a->elem_stride == 1 ? 2 : a->elem_is_obj);
+    PionArray *cp = (PionArray *)pion_arr_new(a->len, flags);
     if (a->len > 0) {
-        memcpy(cp->data, a->data, (size_t)a->len * sizeof(int64_t));
+        memcpy(cp->data, a->data, (size_t)a->len * pion_arr_stride(a));
         cp->len = a->len;
         if (a->elem_is_obj) {
             for (int64_t i = 0; i < a->len; i++) {
@@ -1627,14 +1657,29 @@ PION_MINSIZE void pion_arr_clear(void *a_ptr) {
 PION_MINSIZE void pion_arr_reverse(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || a->len <= 1) return;
+    size_t stride = pion_arr_stride(a);
     int64_t i = 0;
     int64_t j = a->len - 1;
-    while (i < j) {
-        int64_t t = a->data[i];
-        a->data[i] = a->data[j];
-        a->data[j] = t;
-        i++;
-        j--;
+    if (stride == sizeof(int64_t)) {
+        while (i < j) {
+            int64_t t = a->data[i];
+            a->data[i] = a->data[j];
+            a->data[j] = t;
+            i++;
+            j--;
+        }
+    } else {
+        uint8_t tmp[32];
+        uint8_t *base = (uint8_t *)a->data;
+        while (i < j) {
+            uint8_t *pi = base + (size_t)i * stride;
+            uint8_t *pj = base + (size_t)j * stride;
+            memcpy(tmp, pi, stride);
+            memcpy(pi, pj, stride);
+            memcpy(pj, tmp, stride);
+            i++;
+            j--;
+        }
     }
 }
 
@@ -1675,9 +1720,19 @@ static PION_MINSIZE int pion_cmp_i64_qsort(const void *pa, const void *pb) {
     return (a > b) - (a < b);
 }
 
+static PION_MINSIZE int pion_cmp_u8_qsort(const void *pa, const void *pb) {
+    uint8_t a = *(const uint8_t *)pa;
+    uint8_t b = *(const uint8_t *)pb;
+    return (int)a - (int)b;
+}
+
 PION_MINSIZE void pion_arr_sort_int(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || a->len <= 1) return;
+    if (a->elem_stride == 1) {
+        qsort(a->data, (size_t)a->len, 1, pion_cmp_u8_qsort);
+        return;
+    }
     qsort(a->data, (size_t)a->len, sizeof(int64_t), pion_cmp_i64_qsort);
 }
 
