@@ -1154,6 +1154,13 @@ PION_MINSIZE void *pion_str_trim(void *s) {
     return pion_str_from_cstr(str->data + lo, hi - lo);
 }
 
+static PION_NOINLINE PION_MINSIZE void pion_arr_grow(PionArray *a);
+
+static PION_NOINLINE PION_MINSIZE void pion_split_emit(PionArray *a, const char *s, int64_t len) {
+    if (__builtin_expect(a->len == a->cap, 0)) pion_arr_grow(a);
+    a->data[a->len++] = (int64_t)(uintptr_t)pion_str_from_cstr(s, len);
+}
+
 /* Splits s by sep into PionArray of PionString*.
  * Empty sep splits into individual bytes (empty string -> empty array). */
 PION_MINSIZE void *pion_str_split(void *s, void *sep) {
@@ -1161,34 +1168,29 @@ PION_MINSIZE void *pion_str_split(void *s, void *sep) {
     PionString *sp = (PionString *)sep;
     int64_t sl = ss ? ss->len : 0;
     int64_t pl = sp ? sp->len : 0;
-    void *arr = pion_arr_new(8, 1);
+    PionArray *arr = (PionArray *)pion_arr_new(8, 1);
     if (pl == 0) {
         for (int64_t i = 0; i < sl; i++) {
-            void *ch = pion_str_from_cstr(ss->data + i, 1);
-            pion_arr_push(arr, (int64_t)(uintptr_t)ch);
-            pion_rc_dec(ch);
+            pion_split_emit(arr, ss->data + i, 1);
         }
         return arr;
     }
     if (!ss || sl == 0) {
-        void *empty = pion_str_from_cstr("", 0);
-        pion_arr_push(arr, (int64_t)(uintptr_t)empty);
-        pion_rc_dec(empty);
+        pion_split_emit(arr, "", 0);
         return arr;
     }
     int64_t pos = 0;
+    int sep_ch = (unsigned char)sp->data[0];
     while (pos <= sl) {
-        const char *hit = pion_memmem(ss->data + pos, sl - pos, sp->data, pl);
+        const char *hit = __builtin_expect(pl == 1, 1)
+            ? (const char *)memchr(ss->data + pos, sep_ch, (size_t)(sl - pos))
+            : pion_memmem(ss->data + pos, sl - pos, sp->data, pl);
         if (!hit) {
-            void *part = pion_str_from_cstr(ss->data + pos, sl - pos);
-            pion_arr_push(arr, (int64_t)(uintptr_t)part);
-            pion_rc_dec(part);
+            pion_split_emit(arr, ss->data + pos, sl - pos);
             break;
         }
         int64_t off = (int64_t)(hit - ss->data);
-        void *part = pion_str_from_cstr(ss->data + pos, off - pos);
-        pion_arr_push(arr, (int64_t)(uintptr_t)part);
-        pion_rc_dec(part);
+        pion_split_emit(arr, ss->data + pos, off - pos);
         pos = off + pl;
     }
     return arr;
@@ -1831,8 +1833,34 @@ static inline PionMapEntry *pion_map_probe(const PionMap *m, const PionString *k
     }
 }
 
+static struct {
+    const PionMap *map;
+    const void *key;
+    PionMapEntry *entry;
+} g_map_hint;
+
+static PION_NOINLINE PION_MINSIZE void pion_map_hint_invalidate(const PionMap *m) {
+    if (!atomic_load_explicit(&g_pion_mt, memory_order_relaxed) && g_map_hint.map == m) {
+        g_map_hint.map = NULL;
+    }
+}
+
+static inline PionMapEntry *pion_map_hint_hit(const PionMap *m, const PionString *k) {
+    if (__builtin_expect(
+            !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
+            g_map_hint.map == m && g_map_hint.key == k, 0)) {
+        PionMapEntry *e = g_map_hint.entry;
+        if (__builtin_expect(
+                e->key == k || (!m->key_is_int && pion_str_eq((void *)e->key, (void *)k)), 1)) {
+            return e;
+        }
+    }
+    return NULL;
+}
+
 static void pion_map_drop(void *payload) {
     PionMap *m = (PionMap *)payload;
+    pion_map_hint_invalidate(m);
     if (m->entries) {
         for (int64_t i = 0; i < m->cap; i++) {
             if (m->entries[i].state == 1) {
@@ -1851,6 +1879,7 @@ static void pion_map_drop(void *payload) {
 }
 
 static void pion_map_grow(PionMap *m, int64_t new_cap) {
+    pion_map_hint_invalidate(m);
     size_t new_bytes = (size_t)new_cap * sizeof(PionMapEntry);
     PionMapEntry *ne = (PionMapEntry *)pion_slab_raw_alloc(new_bytes);
     memset(ne, 0, new_bytes);
@@ -1897,22 +1926,28 @@ PION_HOT void pion_map_set(void *m_ptr, void *key_str, int64_t val) {
     PionMap *m = (PionMap *)m_ptr;
     PionString *k = (PionString *)key_str;
     if (__builtin_expect(!m || (!m->key_is_int && !k), 0)) pion_die("null map or key");
+    PionMapEntry *e = pion_map_hint_hit(m, k);
+    if (__builtin_expect(e != NULL, 0)) {
+        goto update_existing;
+    }
     if (__builtin_expect(m->cap == 0, 0)) {
         pion_map_grow(m, 16);
     } else if (__builtin_expect((m->len + 1) * 10 >= m->cap * 7, 0)) {
         pion_map_grow(m, m->cap * 2);
     }
     uint64_t h = pion_map_key_hash(m, k);
-    PionMapEntry *e = pion_map_probe(m, k, h);
-    if (m->val_is_obj) {
-        pion_adopt(m, val);
-    }
+    e = pion_map_probe(m, k, h);
     if (e->state == 1) {
+    update_existing:
         if (m->val_is_obj) {
+            pion_adopt(m, val);
             pion_rc_inc((void *)(uintptr_t)val);
-            pion_rc_dec((void *)(uintptr_t)e->val);
+            int64_t old_val = e->val;
+            e->val = val;
+            pion_rc_dec((void *)(uintptr_t)old_val);
+        } else {
+            e->val = val;
         }
-        e->val = val;
         return;
     }
     if (!m->key_is_int) {
@@ -1920,6 +1955,7 @@ PION_HOT void pion_map_set(void *m_ptr, void *key_str, int64_t val) {
         pion_rc_inc(k);
     }
     if (m->val_is_obj) {
+        pion_adopt(m, val);
         pion_rc_inc((void *)(uintptr_t)val);
     }
     e->key = k;
@@ -1936,6 +1972,11 @@ PION_HOT int32_t pion_map_try_get(void *m_ptr, void *key_str, int64_t *out_val) 
     uint64_t h = pion_map_key_hash(m, k);
     PionMapEntry *e = pion_map_probe(m, k, h);
     if (e->state == 1) {
+        if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
+            g_map_hint.map = m;
+            g_map_hint.key = k;
+            g_map_hint.entry = e;
+        }
         if (out_val) *out_val = e->val;
         return 1;
     }
@@ -1948,7 +1989,15 @@ int32_t pion_map_has(void *m_ptr, void *key_str) {
     if (__builtin_expect(!m || (!m->key_is_int && !k) || m->len == 0, 0)) return 0;
     uint64_t h = pion_map_key_hash(m, k);
     PionMapEntry *e = pion_map_probe(m, k, h);
-    return e->state == 1 ? 1 : 0;
+    if (e->state == 1) {
+        if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
+            g_map_hint.map = m;
+            g_map_hint.key = k;
+            g_map_hint.entry = e;
+        }
+        return 1;
+    }
+    return 0;
 }
 
 PION_HOT int64_t pion_map_get(void *m_ptr, void *key_str) {
@@ -1956,6 +2005,10 @@ PION_HOT int64_t pion_map_get(void *m_ptr, void *key_str) {
     PionString *k = (PionString *)key_str;
     if (__builtin_expect(!m || (!m->key_is_int && !k) || m->len == 0, 0)) {
         pion_die("map key not found");
+    }
+    PionMapEntry *he = pion_map_hint_hit(m, k);
+    if (__builtin_expect(he != NULL, 0)) {
+        return he->val;
     }
     uint64_t h = pion_map_key_hash(m, k);
     PionMapEntry *e = pion_map_probe(m, k, h);
@@ -1972,6 +2025,7 @@ PION_MINSIZE void pion_map_remove(void *m_ptr, void *key_str) {
     uint64_t h = pion_map_key_hash(m, k);
     PionMapEntry *e = pion_map_probe(m, k, h);
     if (e->state == 0) return;
+    pion_map_hint_invalidate(m);
     uint64_t mask = (uint64_t)(m->cap - 1);
     uint64_t idx = (uint64_t)(e - m->entries);
     if (!m->key_is_int) {
@@ -2001,6 +2055,7 @@ PION_MINSIZE void pion_map_remove(void *m_ptr, void *key_str) {
 PION_MINSIZE void pion_map_clear(void *m_ptr) {
     PionMap *m = (PionMap *)m_ptr;
     if (!m || m->len == 0 || !m->entries) return;
+    pion_map_hint_invalidate(m);
     for (int64_t i = 0; i < m->cap; i++) {
         if (m->entries[i].state == 1) {
             if (!m->key_is_int) {
