@@ -1,0 +1,3135 @@
+///| Pure functional lowering of Pion-LLBC and the Lean 4 emitter of
+///| `pionc extract-lean` (SPEC §3.5). For every extracted package `pkg` it
+///| produces `<Pkg>/Types.lean`, `<Pkg>/Funs.lean` and
+///| `<Pkg>/FunsExternal_Template.lean` (plus `<Pkg>/FunsExternal.lean` while
+///| it is absent or unedited), in the style of Aeneas-generated code on top of `Aeneas.Std`
+///| and `PionLean`:
+///|   - mutable state is threaded functionally (every rebinding gets a fresh
+///|     SSA name; `mut` parameters are returned in a tuple after the result);
+///|   - every loop becomes `<fn>_loop<N>.body` (`ControlFlow σ σ`, or
+///|     `ControlFlow σ (Sum R σ)` with early `return`) and `<fn>_loop<N>`
+///|     (`Aeneas.Std.loop`);
+///|   - an `if` / `match` that updates outer variables returns them in a tuple
+///|     (a `Sum` with early `return`); one whose other branches diverge, or that
+///|     contains `break` / `continue`, gets the rest of the block in its branches;
+///|   - (mutually) recursive functions are `partial_fixpoint` definitions.
+
+///|
+pub struct LeanFile {
+  /// Path relative to the output directory (`Vlib/Types.lean`).
+  path : String
+  content : String
+  /// The user's file (`FunsExternal.lean`): written only when absent or still
+  /// identical to the previously generated template.
+  only_if_absent : Bool
+}
+
+///|
+pub struct LeanPkgOut {
+  name : String
+  lean_mod : String
+  files : Array[LeanFile]
+  types : Int
+  funs : Int
+  externals : Array[String]
+}
+
+// ---------------------------------------------------------------------------
+// Names.
+// ---------------------------------------------------------------------------
+
+///|
+fn lean_keywords() -> Array[String] {
+  [
+  "at", "attribute", "axiom", "by", "calc", "catch", "class", "deriving", "def",
+  "do", "else", "end", "example", "export", "finally", "for", "from", "fun",
+  "have", "if", "import", "in", "include", "inductive", "infix", "infixl",
+  "infixr", "instance", "let", "local", "macro", "match", "mut", "mutual",
+  "namespace", "noncomputable", "nomatch", "nofun", "notation", "omit", "open",
+  "opaque", "partial", "postfix", "prefix", "private", "protected", "repeat",
+  "return", "scoped", "section", "set_option", "show", "structure", "suffices",
+  "syntax", "termination_by", "decreasing_by", "then", "theorem", "try",
+  "unless", "universe", "unsafe", "variable", "where", "while", "with",
+  "Type", "Prop", "Sort", "abbrev", "elab", "break", "continue", "lemma",
+  "instance", "extends", "obtain", "this", "nonrec", "public", "meta",
+  ]
+}
+
+///|
+/// Names the generated code relies on unqualified (opened from `Aeneas.Std`,
+/// `Result`, `ControlFlow`, `Error`, `Pion`): a user item with such a name is
+/// emitted with a trailing `_`.
+fn lean_reserved_items() -> Array[String] {
+  [
+  "ok", "fail", "div", "loop", "cont", "done", "bind", "pure", "lift",
+  "massert", "Result", "Error", "ControlFlow", "Option", "Bool", "Char",
+  "String", "Unit", "Prod", "Sum", "List", "Nat", "Int", "Array", "Pion",
+  "Std", "Aeneas", "Eq", "Res", "FixedArray", "Bytes", "inl", "inr", "some",
+  "none", "true", "false", "panic", "debugAssert", "decide",
+  ]
+}
+
+///|
+fn ln_in(arr : Array[String], s : String) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == s {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// One identifier component, `«...»`-escaped when it is a Lean keyword.
+pub fn lean_ident(s : String) -> String {
+  if ln_in(lean_keywords(), s) {
+    "«" + s + "»"
+  } else {
+    s
+  }
+}
+
+///|
+/// A dotted name, each component escaped.
+pub fn lean_dotted(s : String) -> String {
+  let sb = StringBuilder()
+  let mut start = 0
+  let mut i = 0
+  while i <= s.length() {
+    if i == s.length() || str_code_at(s, i) == 46 {
+      if start > 0 {
+        sb.write_string(".")
+      }
+      sb.write_string(lean_ident(slice_str(s, start, i)))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// A user item (type / function) name inside its package namespace.
+fn ln_item(s : String) -> String {
+  if ln_in(lean_reserved_items(), s) {
+    s + "_"
+  } else {
+    s
+  }
+}
+
+///|
+/// `vlib` -> `Vlib`, `my_pkg` -> `MyPkg`: the Lean module root of a package.
+pub fn lean_module_name(pkg : String) -> String {
+  let sb = StringBuilder()
+  let mut up = true
+  let mut i = 0
+  while i < pkg.length() {
+    let c = str_code_at(pkg, i)
+    if c == 95 || c == 45 || c == 46 {
+      up = true
+    } else if up && c >= 97 && c <= 122 {
+      sb.write_char((c - 32).unsafe_to_char())
+      up = false
+    } else {
+      sb.write_char(c.unsafe_to_char())
+      up = false
+    }
+    i = i + 1
+  }
+  let r = sb.to_string()
+  if r.length() == 0 {
+    "Pkg"
+  } else if str_code_at(r, 0) >= 48 && str_code_at(r, 0) <= 57 {
+    "P" + r
+  } else {
+    r
+  }
+}
+
+///|
+/// Lean reference to a type item `pkg::Name` from package `cur`.
+fn ln_type_ref(cur : String, gname : String) -> String {
+  let qp = split_qual_name(gname)
+  let local = lean_ident(ln_item(qp.name))
+  if qp.prefix == cur || qp.prefix.length() == 0 {
+    local
+  } else {
+    lean_ident(qp.prefix) + "." + local
+  }
+}
+
+///|
+/// Lean name of an item inside its namespace (`f`, `Acc.record`).
+fn ln_item_dotted(lean_name : String) -> String {
+  let sb = StringBuilder()
+  let mut start = 0
+  let mut i = 0
+  let mut first = true
+  while i <= lean_name.length() {
+    if i == lean_name.length() || str_code_at(lean_name, i) == 46 {
+      if !first {
+        sb.write_string(".")
+      }
+      sb.write_string(lean_ident(ln_item(slice_str(lean_name, start, i))))
+      first = false
+      start = i + 1
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_qual_item(cur : String, pkg : String, lean_name : String) -> String {
+  if pkg == cur {
+    ln_item_dotted(lean_name)
+  } else {
+    lean_ident(pkg) + "." + ln_item_dotted(lean_name)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Types.
+// ---------------------------------------------------------------------------
+
+///|
+/// Lean type of a Pion type, as an atom (parenthesized when compound).
+pub fn lean_ty(cur : String, t : Ty) -> String {
+  match t {
+    TInt => "Std.I32"
+    TInt64 => "Std.I64"
+    TUInt => "Std.U32"
+    TUInt64 => "Std.U64"
+    TByte => "Std.U8"
+    TBool => "Bool"
+    TChar => "Char"
+    TString => "String"
+    TUnit | TNever => "Unit"
+    TBytes => "Pion.Bytes"
+    TArray(e) => "(Pion.Array " + lean_ty(cur, e) + ")"
+    TFixedArray(e) => "(Pion.FixedArray " + lean_ty(cur, e) + ")"
+    TOption(e) => "(Option " + lean_ty(cur, e) + ")"
+    TResult(a, b) => "(Pion.Res " + lean_ty(cur, a) + " " + lean_ty(cur, b) + ")"
+    TTuple(es) => lean_tuple_ty(cur, es)
+    TStruct(n, args) | TEnum(n, args) => {
+      if args.length() == 0 {
+        return ln_type_ref(cur, n)
+      }
+      let sb = StringBuilder()
+      sb.write_string("(")
+      sb.write_string(ln_type_ref(cur, n))
+      let mut i = 0
+      while i < args.length() {
+        sb.write_string(" ")
+        sb.write_string(lean_ty(cur, args[i]))
+        i = i + 1
+      }
+      sb.write_string(")")
+      sb.to_string()
+    }
+    TParam(n) => lean_ident(n)
+    TFn(ps, r) => {
+      let sb = StringBuilder()
+      sb.write_string("(")
+      let mut i = 0
+      while i < ps.length() {
+        sb.write_string(lean_ty(cur, ps[i]))
+        sb.write_string(" → ")
+        i = i + 1
+      }
+      sb.write_string("Result ")
+      sb.write_string(lean_ty(cur, r))
+      sb.write_string(")")
+      sb.to_string()
+    }
+    _ => "Unit"
+  }
+}
+
+///|
+fn lean_tuple_ty(cur : String, es : Array[Ty]) -> String {
+  if es.length() == 0 {
+    return "Unit"
+  }
+  if es.length() == 1 {
+    return lean_ty(cur, es[0])
+  }
+  let sb = StringBuilder()
+  sb.write_string("(")
+  let mut i = 0
+  while i < es.length() {
+    if i > 0 {
+      sb.write_string(" × ")
+    }
+    sb.write_string(lean_ty(cur, es[i]))
+    i = i + 1
+  }
+  sb.write_string(")")
+  sb.to_string()
+}
+
+///|
+fn ln_ty_has_param(t : Ty) -> Bool {
+  match t {
+    TParam(_) => true
+    TArray(e) | TFixedArray(e) | TOption(e) => ln_ty_has_param(e)
+    TResult(a, b) => ln_ty_has_param(a) || ln_ty_has_param(b)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if ln_ty_has_param(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Literals and pure expressions.
+// ---------------------------------------------------------------------------
+
+///|
+fn ln_scalar_suffix(t : Ty) -> String {
+  match t {
+    TInt64 => "#i64"
+    TUInt => "#u32"
+    TUInt64 => "#u64"
+    TByte => "#u8"
+    _ => "#i32"
+  }
+}
+
+///|
+/// A Lean string literal (escapes `\\`, `"`, control characters; UTF-8 kept).
+pub fn lean_string_lit(s : String) -> String {
+  let sb = StringBuilder()
+  sb.write_string("\"")
+  let mut i = 0
+  while i < s.length() {
+    let c = str_code_at(s, i)
+    if c == 92 {
+      sb.write_string("\\\\")
+    } else if c == 34 {
+      sb.write_string("\\\"")
+    } else if c == 10 {
+      sb.write_string("\\n")
+    } else if c == 13 {
+      sb.write_string("\\r")
+    } else if c == 9 {
+      sb.write_string("\\t")
+    } else if c < 32 || c == 127 {
+      sb.write_string("\\x")
+      let hex = "0123456789abcdef"
+      sb.write_char(str_code_at(hex, c / 16).unsafe_to_char())
+      sb.write_char(str_code_at(hex, c % 16).unsafe_to_char())
+    } else {
+      sb.write_byte(c.to_byte())
+    }
+    i = i + 1
+  }
+  sb.write_string("\"")
+  sb.to_string()
+}
+
+///|
+fn ln_lit(kind : String, text : String, t : Ty) -> String {
+  if kind == "bool" || kind == "unit" {
+    return text
+  }
+  if kind == "string" {
+    return lean_string_lit(text)
+  }
+  if kind == "char" {
+    return "(Char.ofNat " + text + ")"
+  }
+  let suf = ln_scalar_suffix(t)
+  if text.length() > 0 && str_code_at(text, 0) == 45 {
+    "(" + text + ")" + suf
+  } else {
+    text + suf
+  }
+}
+
+///|
+/// Wrapping arithmetic / bitwise operator -> `Pion.<Scalar>` function.
+fn ln_arith_fn(op : String) -> String {
+  if op == "+" {
+    "add"
+  } else if op == "-" {
+    "sub"
+  } else if op == "*" {
+    "mul"
+  } else if op == "&" {
+    "band"
+  } else if op == "|" {
+    "bor"
+  } else if op == "^" {
+    "bxor"
+  } else {
+    ""
+  }
+}
+
+///|
+fn ln_is_cmp(op : String) -> Bool {
+  op == "<" || op == "<=" || op == ">" || op == ">="
+}
+
+///|
+fn ln_tuple_get(base : String, i : Int, n : Int) -> String {
+  let sb = StringBuilder()
+  sb.write_string(base)
+  let mut k = 0
+  while k < i {
+    sb.write_string(".2")
+    k = k + 1
+  }
+  if i < n - 1 {
+    sb.write_string(".1")
+  }
+  sb.to_string()
+}
+
+///|
+/// A field read `o.f` on a struct (accessor of a recursive struct, or the
+/// structure projection).
+fn ln_field(o : String, f : String) -> String {
+  o + "." + lean_ident(f)
+}
+
+// ---------------------------------------------------------------------------
+// Emission context.
+// ---------------------------------------------------------------------------
+
+///|
+struct LnItem {
+  pkg : String
+  lean_name : String
+  type_params : Array[String]
+}
+
+///|
+struct LnG {
+  items : Map[String, LnItem]
+  /// Items that (transitively) call an external axiom: `noncomputable`.
+  nc : Map[String, Bool]
+  /// Struct keys emitted as `inductive` (recursive): field updates use the
+  /// generated `Name.set_<f>` functions.
+  inductive_structs : Map[String, Bool]
+}
+
+///|
+/// LLBC variable -> current Lean (SSA) name; later bindings shadow earlier.
+struct LnEnv {
+  ks : Array[String]
+  vs : Array[String]
+}
+
+///|
+fn lne_new() -> LnEnv {
+  LnEnv::{ ks: [], vs: [] }
+}
+
+///|
+fn lne_copy(e : LnEnv) -> LnEnv {
+  let ks : Array[String] = []
+  let vs : Array[String] = []
+  let mut i = 0
+  while i < e.ks.length() {
+    ks.push(e.ks[i])
+    vs.push(e.vs[i])
+    i = i + 1
+  }
+  LnEnv::{ ks: ks, vs: vs }
+}
+
+///|
+fn lne_set(e : LnEnv, k : String, v : String) -> Unit {
+  e.ks.push(k)
+  e.vs.push(v)
+}
+
+///|
+fn lne_get(e : LnEnv, k : String) -> Option[String] {
+  let mut i = e.ks.length() - 1
+  while i >= 0 {
+    if e.ks[i] == k {
+      return Some(e.vs[i])
+    }
+    i = i - 1
+  }
+  None
+}
+
+///|
+struct EF {
+  g : LnG
+  cur : String
+  /// Lean name of the function inside the namespace (dotted, unescaped).
+  fname : String
+  binders : String
+  /// Explicit generic arguments for calling this function's loop definitions.
+  gen_args : String
+  mut_params : Array[String]
+  ret_ty : Ty
+  ret_text : String
+  var_tys : Map[String, Ty]
+  used : Map[String, Bool]
+  loop_defs : Array[String]
+  loop_n : Array[Int]
+  /// The function is part of a recursion cycle: loops become directly
+  /// recursive `partial_fixpoint` definitions inside its `mutual` block.
+  recursive : Bool
+  /// `noncomputable` (reaches an external axiom).
+  nc : Bool
+}
+
+///|
+fn ef_fresh(ef : EF, base0 : String) -> String {
+  let base = if base0.length() == 0 {
+    "x"
+  } else if ln_in(lean_reserved_items(), base0) {
+    base0 + "_"
+  } else {
+    base0
+  }
+  let mut name = base
+  let mut k = 1
+  while ef.used.contains(name) {
+    name = base + k.to_string()
+    k = k + 1
+  }
+  ef.used.set(name, true)
+  lean_ident(name)
+}
+
+///|
+fn ef_name(ef : EF, env : LnEnv, v : String) -> String {
+  match lne_get(env, v) {
+    Some(n) => n
+    None => {
+      let _ = ef
+      lean_ident(v)
+    }
+  }
+}
+
+///|
+fn ef_vty(ef : EF, v : String) -> Ty {
+  match ef.var_tys.get(v) {
+    Some(t) => t
+    None => TError
+  }
+}
+
+///|
+fn ln_ind(n : Int) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < n {
+    sb.write_string("  ")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_line(out : Array[String], ind : Int, s : String) -> Unit {
+  out.push(ln_ind(ind) + s)
+}
+
+///|
+fn ln_tuple(xs : Array[String]) -> String {
+  if xs.length() == 0 {
+    return "()"
+  }
+  if xs.length() == 1 {
+    return xs[0]
+  }
+  let sb = StringBuilder()
+  sb.write_string("(")
+  let mut i = 0
+  while i < xs.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(xs[i])
+    i = i + 1
+  }
+  sb.write_string(")")
+  sb.to_string()
+}
+
+///|
+/// Lean type of a function's result with its `mut` parameters packed after
+/// it: `R`, `R × B × C`, or `B × C` when `R = Unit`.
+pub fn lean_packed_ret(cur : String, ret : Ty, mut_tys : Array[Ty]) -> String {
+  if mut_tys.length() == 0 {
+    return lean_ty(cur, ret)
+  }
+  let es : Array[Ty] = []
+  match ret {
+    TUnit | TNever => ()
+    _ => es.push(ret)
+  }
+  let mut i = 0
+  while i < mut_tys.length() {
+    es.push(mut_tys[i])
+    i = i + 1
+  }
+  lean_tuple_ty(cur, es)
+}
+
+// ---------------------------------------------------------------------------
+// Expressions.
+// ---------------------------------------------------------------------------
+
+///|
+fn ln_paren(s : String) -> String {
+  // Atoms: identifiers, literals with suffix, already parenthesized forms.
+  let n = s.length()
+  if n == 0 {
+    return "()"
+  }
+  let mut simple = true
+  let mut depth = 0
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c == 40 || c == 91 || c == 123 {
+      depth = depth + 1
+    } else if c == 41 || c == 93 || c == 125 {
+      depth = depth - 1
+    } else if c == 32 && depth == 0 {
+      simple = false
+    }
+    i = i + 1
+  }
+  if simple && !(str_code_at(s, 0) == 34 && false) {
+    s
+  } else {
+    "(" + s + ")"
+  }
+}
+
+///|
+fn ln_needs_ascription(t : Ty) -> Bool {
+  match t {
+    TOption(_) | TResult(_, _) => true
+    TEnum(_, args) | TStruct(_, args) => args.length() > 0
+    _ => false
+  }
+}
+
+///|
+fn ex(ef : EF, env : LnEnv, e : LExpr) -> String {
+  let cur = ef.cur
+  match e {
+    LVar(n, _) => ef_name(ef, env, n)
+    LLit(kind, text, t) => ln_lit(kind, text, t)
+    LBin(op, a, b, t) => {
+      let x = ln_paren(ex(ef, env, a))
+      let y = ln_paren(ex(ef, env, b))
+      if op == "&&" || op == "||" {
+        return "(" + x + " " + op + " " + y + ")"
+      }
+      if op == "==" {
+        return "(" + x + " == " + y + ")"
+      }
+      if op == "!=" {
+        return "(" + x + " != " + y + ")"
+      }
+      if ln_is_cmp(op) {
+        return "(decide (" + x + " " + op + " " + y + "))"
+      }
+      match t {
+        TString => if op == "+" { return "(" + x + " ++ " + y + ")" }
+        _ => ()
+      }
+      let f = ln_arith_fn(op)
+      if f.length() > 0 && l_is_int_ty(t) {
+        return "(" + l_scalar_ns(t) + "." + f + " " + x + " " + y + ")"
+      }
+      "(" + x + " " + op + " " + y + ")"
+    }
+    LUn(op, a, t) => {
+      let x = ln_paren(ex(ef, env, a))
+      if op == "!" {
+        "(!" + x + ")"
+      } else if l_is_int_ty(t) {
+        "(" + l_scalar_ns(t) + ".neg " + x + ")"
+      } else {
+        "(-" + x + ")"
+      }
+    }
+    LField(o, f, _, _) => ln_field(ln_paren(ex(ef, env, o)), f)
+    LTupleGet(t, i, tt) => {
+      let n = match tt {
+        TTuple(es) => es.length()
+        _ => 2
+      }
+      ln_tuple_get(ln_paren(ex(ef, env, t)), i, n)
+    }
+    LCtor(ek, v, args, t) => {
+      let head = if ek == "Option" {
+        if v == "Some" { "some" } else { "none" }
+      } else if ek == "Result" {
+        "Pion.Res." + v
+      } else {
+        ln_type_ref(cur, ek) + "." + lean_ident(v)
+      }
+      let sb = StringBuilder()
+      sb.write_string(head)
+      let mut i = 0
+      while i < args.length() {
+        sb.write_string(" ")
+        sb.write_string(ln_paren(ex(ef, env, args[i])))
+        i = i + 1
+      }
+      let body = sb.to_string()
+      if ln_needs_ascription(t) {
+        "(" + body + " : " + lean_ty(cur, t) + ")"
+      } else if args.length() > 0 {
+        "(" + body + ")"
+      } else {
+        body
+      }
+    }
+    LStruct(key, vals, t) => {
+      let sb = StringBuilder()
+      sb.write_string(ln_type_ref(cur, key))
+      sb.write_string(".mk")
+      let mut i = 0
+      while i < vals.length() {
+        sb.write_string(" ")
+        sb.write_string(ln_paren(ex(ef, env, vals[i])))
+        i = i + 1
+      }
+      if ln_needs_ascription(t) {
+        "(" + sb.to_string() + " : " + lean_ty(cur, t) + ")"
+      } else {
+        "(" + sb.to_string() + ")"
+      }
+    }
+    LTuple(es, _) => {
+      let xs : Array[String] = []
+      let mut i = 0
+      while i < es.length() {
+        xs.push(ex(ef, env, es[i]))
+        i = i + 1
+      }
+      ln_tuple(xs)
+    }
+    LArrayLit(es, t) => {
+      let sb = StringBuilder()
+      sb.write_string("(")
+      sb.write_string(l_container_ns(t))
+      sb.write_string(".ofList [")
+      let mut i = 0
+      while i < es.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        sb.write_string(ex(ef, env, es[i]))
+        i = i + 1
+      }
+      sb.write_string("] : ")
+      sb.write_string(lean_ty(cur, t))
+      sb.write_string(")")
+      sb.to_string()
+    }
+    LPure(f, args, t) => {
+      let sb = StringBuilder()
+      sb.write_string(f)
+      let mut i = 0
+      while i < args.length() {
+        sb.write_string(" ")
+        sb.write_string(ln_paren(ex(ef, env, args[i])))
+        i = i + 1
+      }
+      if args.length() == 0 || f == "Pion.Array.make" || f == "Pion.FixedArray.make" {
+        "(" + sb.to_string() + " : " + lean_ty(cur, t) + ")"
+      } else {
+        "(" + sb.to_string() + ")"
+      }
+    }
+    LIte(c, a, b, _) =>
+      "(if " + ex_cond(ef, env, c) + " then " + ex(ef, env, a) + " else " + ex(ef, env, b) + ")"
+    LConstRef(key, _) =>
+      match ef.g.items.get(key) {
+        Some(it) => ln_qual_item(cur, it.pkg, it.lean_name)
+        None => "sorry"
+      }
+  }
+}
+
+///|
+/// An `if` condition: top-level comparisons are emitted as `Prop`s
+/// (`i < n`, `x = y` on scalars) for proof-friendly `ite`s.
+fn ex_cond(ef : EF, env : LnEnv, c : LExpr) -> String {
+  match c {
+    LBin(op, a, b, t) => {
+      if ln_is_cmp(op) {
+        return ln_paren(ex(ef, env, a)) + " " + op + " " + ln_paren(ex(ef, env, b))
+      }
+      let prop_eq = match t {
+        TInt | TInt64 | TUInt | TUInt64 | TByte | TBool | TChar | TString => true
+        _ => false
+      }
+      if op == "==" && prop_eq {
+        return ln_paren(ex(ef, env, a)) + " = " + ln_paren(ex(ef, env, b))
+      }
+      if op == "!=" && prop_eq {
+        return ln_paren(ex(ef, env, a)) + " ≠ " + ln_paren(ex(ef, env, b))
+      }
+      ex(ef, env, c)
+    }
+    LUn("!", LBin(op, a, b, t), _) =>
+      if op == "==" {
+        ex_cond(ef, env, LBin("!=", a, b, t))
+      } else if op == "!=" {
+        ex_cond(ef, env, LBin("==", a, b, t))
+      } else if ln_is_cmp(op) {
+        "¬ (" + ex_cond(ef, env, LBin(op, a, b, t)) + ")"
+      } else {
+        ex(ef, env, c)
+      }
+    _ => ex(ef, env, c)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Block analysis.
+// ---------------------------------------------------------------------------
+
+///|
+fn ln_stmt_diverges(s : LStmt) -> Bool {
+  match s {
+    LSReturn(_) | LSBreak | LSContinue | LSPanic => true
+    LSIf(_, t, e, _, _) => ln_block_diverges(t) && ln_block_diverges(e)
+    LSMatch(_, _, arms, _, _) => {
+      let mut i = 0
+      while i < arms.length() {
+        if !ln_block_diverges(arms[i].body) {
+          return false
+        }
+        i = i + 1
+      }
+      arms.length() > 0
+    }
+    LSLoop(body) => !ln_has_break(body)
+    _ => false
+  }
+}
+
+///|
+pub fn ln_block_diverges(b : LBlock) -> Bool {
+  let mut i = 0
+  while i < b.stmts.length() {
+    if ln_stmt_diverges(b.stmts[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// `break` targeting the enclosing loop (not one nested inside `b`).
+fn ln_has_break(b : LBlock) -> Bool {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSBreak => return true
+      LSIf(_, t, e, _, _) => if ln_has_break(t) || ln_has_break(e) { return true }
+      LSMatch(_, _, arms, _, _) => {
+        let mut j = 0
+        while j < arms.length() {
+          if ln_has_break(arms[j].body) {
+            return true
+          }
+          j = j + 1
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// `break` / `continue` of the enclosing loop.
+fn ln_has_bc(b : LBlock) -> Bool {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSBreak | LSContinue => return true
+      LSIf(_, t, e, _, _) => if ln_has_bc(t) || ln_has_bc(e) { return true }
+      LSMatch(_, _, arms, _, _) => {
+        let mut j = 0
+        while j < arms.length() {
+          if ln_has_bc(arms[j].body) {
+            return true
+          }
+          j = j + 1
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// `return` anywhere inside (nested loops included).
+fn ln_has_ret(b : LBlock) -> Bool {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSReturn(_) => return true
+      LSIf(_, t, e, _, _) => if ln_has_ret(t) || ln_has_ret(e) { return true }
+      LSMatch(_, _, arms, _, _) => {
+        let mut j = 0
+        while j < arms.length() {
+          if ln_has_ret(arms[j].body) {
+            return true
+          }
+          j = j + 1
+        }
+      }
+      LSLoop(body) => if ln_has_ret(body) { return true }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// Variables assigned (rebound) inside `b`, in first-assignment order.
+fn ln_assigned(b : LBlock, out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSAssign(n, _) => l_push_unique(out, n)
+      LSSetField(n, _, _, _, _) => l_push_unique(out, n)
+      LSCall(d, _, _, _, _, assign) => if assign { l_push_unique(out, d) }
+      LSIf(_, t, e, _, _) => {
+        ln_assigned(t, out)
+        ln_assigned(e, out)
+      }
+      LSMatch(_, _, arms, _, _) => {
+        let mut j = 0
+        while j < arms.length() {
+          ln_assigned(arms[j].body, out)
+          j = j + 1
+        }
+      }
+      LSLoop(body) => ln_assigned(body, out)
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn ln_pat_vars(p : LPat, out : Array[String]) -> Unit {
+  match p {
+    LPVar(n, _) => l_push_unique(out, n)
+    LPCtor(_, _, ps) | LPTuple(ps) => {
+      let mut i = 0
+      while i < ps.length() {
+        ln_pat_vars(ps[i], out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+/// Variables declared inside `b`.
+fn ln_declared(b : LBlock, out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSLet(n, _, _) => l_push_unique(out, n)
+      LSLetTuple(ns, _, _) => {
+        let mut j = 0
+        while j < ns.length() {
+          l_push_unique(out, ns[j])
+          j = j + 1
+        }
+      }
+      LSCall(d, _, _, _, outs, assign) => {
+        if !assign && d.length() > 0 {
+          l_push_unique(out, d)
+        }
+        let mut j = 0
+        while j < outs.length() {
+          l_push_unique(out, outs[j])
+          j = j + 1
+        }
+      }
+      LSIf(_, t, e, d, _) => {
+        if d.length() > 0 {
+          l_push_unique(out, d)
+        }
+        ln_declared(t, out)
+        ln_declared(e, out)
+      }
+      LSMatch(_, _, arms, d, _) => {
+        if d.length() > 0 {
+          l_push_unique(out, d)
+        }
+        let mut j = 0
+        while j < arms.length() {
+          ln_pat_vars(arms[j].pat, out)
+          ln_declared(arms[j].body, out)
+          j = j + 1
+        }
+      }
+      LSLoop(body) => ln_declared(body, out)
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn ln_expr_vars(e : LExpr, out : Array[String]) -> Unit {
+  match e {
+    LVar(n, _) => l_push_unique(out, n)
+    LBin(_, a, b, _) => {
+      ln_expr_vars(a, out)
+      ln_expr_vars(b, out)
+    }
+    LUn(_, a, _) | LField(a, _, _, _) | LTupleGet(a, _, _) => ln_expr_vars(a, out)
+    LCtor(_, _, es, _) | LStruct(_, es, _) | LTuple(es, _) | LArrayLit(es, _) | LPure(_, es, _) => {
+      let mut i = 0
+      while i < es.length() {
+        ln_expr_vars(es[i], out)
+        i = i + 1
+      }
+    }
+    LIte(c, a, b, _) => {
+      ln_expr_vars(c, out)
+      ln_expr_vars(a, out)
+      ln_expr_vars(b, out)
+    }
+    _ => ()
+  }
+}
+
+///|
+/// Variables read or written inside `b` (first-occurrence order).
+fn ln_used(b : LBlock, out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSLet(_, _, v) | LSLetTuple(_, _, v) | LSReturn(v) | LSAssert(v) => ln_expr_vars(v, out)
+      LSAssign(n, v) => {
+        ln_expr_vars(v, out)
+        l_push_unique(out, n)
+      }
+      LSSetField(n, _, _, _, v) => {
+        l_push_unique(out, n)
+        ln_expr_vars(v, out)
+      }
+      LSCall(d, _, c, args, _, assign) => {
+        match c {
+          CDictMethod(_, _) | CItem(_, _, _) | CBuiltin(_) | CConst(_) => ()
+        }
+        let mut j = 0
+        while j < args.length() {
+          match args[j] {
+            AVal(v) | AMut(v) => ln_expr_vars(v, out)
+          }
+          j = j + 1
+        }
+        if assign {
+          l_push_unique(out, d)
+        }
+      }
+      LSIf(c, t, e, _, _) => {
+        ln_expr_vars(c, out)
+        ln_used(t, out)
+        ln_used(e, out)
+      }
+      LSMatch(s, _, arms, _, _) => {
+        ln_expr_vars(s, out)
+        let mut j = 0
+        while j < arms.length() {
+          ln_used(arms[j].body, out)
+          j = j + 1
+        }
+      }
+      LSLoop(body) => ln_used(body, out)
+      _ => ()
+    }
+    match b.tail {
+      Some(_) => ()
+      None => ()
+    }
+    i = i + 1
+  }
+  match b.tail {
+    Some(v) => ln_expr_vars(v, out)
+    None => ()
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Statements: the functional lowering.
+// ---------------------------------------------------------------------------
+
+///|
+/// How a block ends.
+enum EK {
+  /// Function body: `ok (packed value)`.
+  KFn
+  /// Loop body over state `W`: fallthrough / `continue` -> `ok (cont W)`,
+  /// `break` -> `ok (done W)` (`ok (done (.inr W))` when the loop may
+  /// `return`), `return r` -> `ok (done (.inl r))`.
+  KLoop(Array[String], Bool)
+  /// A branch of an `if` / `match` updating `W` (and producing `dest`):
+  /// `ok (dest, W)`.
+  KTuple(Array[String], String)
+  /// Same with early `return`: `ok (.inr (dest, W))`, `return r` -> `ok (.inl r)`.
+  KSum(Array[String], String)
+  /// Loop of a recursive function, emitted as a directly recursive
+  /// `partial_fixpoint` definition: `continue` -> `<call> W`, `break` ->
+  /// `ok W` (`ok (.inr W)` when it may return), `return r` -> `ok (.inl r)`.
+  KLoopRec(Array[String], Bool, String)
+}
+
+///|
+fn ef_names(ef : EF, env : LnEnv, vs : Array[String]) -> Array[String] {
+  let out : Array[String] = []
+  let mut i = 0
+  while i < vs.length() {
+    out.push(ef_name(ef, env, vs[i]))
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// The packed return value: `v` with the current values of the `mut`
+/// parameters appended.
+fn ef_pack(ef : EF, env : LnEnv, v : String) -> String {
+  if ef.mut_params.length() == 0 {
+    return v
+  }
+  let xs : Array[String] = []
+  match ef.ret_ty {
+    TUnit | TNever => ()
+    _ => xs.push(v)
+  }
+  let ms = ef_names(ef, env, ef.mut_params)
+  let mut i = 0
+  while i < ms.length() {
+    xs.push(ms[i])
+    i = i + 1
+  }
+  ln_tuple(xs)
+}
+
+///|
+/// `return` of an already packed value through `k`.
+fn ef_ret_raw(k : EK, r : String) -> String {
+  match k {
+    KFn => "ok " + ln_paren(r)
+    KLoop(_, _) => "ok (done (.inl " + r + "))"
+    KSum(_, _) => "ok (.inl " + r + ")"
+    KLoopRec(_, _, _) => "ok (.inl " + r + ")"
+    KTuple(_, _) => "Pion.panic"
+  }
+}
+
+///|
+fn ef_end(ef : EF, env : LnEnv, k : EK, tail : Option[LExpr]) -> String {
+  match k {
+    KFn => {
+      let v = match tail {
+        Some(t) => ex(ef, env, t)
+        None => "()"
+      }
+      "ok " + ln_paren(ef_pack(ef, env, v))
+    }
+    KLoop(w, _) => "ok (cont " + ln_paren(ln_tuple(ef_names(ef, env, w))) + ")"
+    KLoopRec(w, _, call) => ln_rec_call(call, ef_names(ef, env, w))
+    KTuple(w, d) => {
+      let xs : Array[String] = []
+      if d.length() > 0 {
+        let tv = match tail {
+          Some(t) => ex(ef, env, t)
+          None => "()"
+        }
+        xs.push(tv)
+      }
+      let ws = ef_names(ef, env, w)
+      let mut i = 0
+      while i < ws.length() {
+        xs.push(ws[i])
+        i = i + 1
+      }
+      "ok " + ln_paren(ln_tuple(xs))
+    }
+    KSum(w, d) => {
+      let xs : Array[String] = []
+      if d.length() > 0 {
+        let tv = match tail {
+          Some(t) => ex(ef, env, t)
+          None => "()"
+        }
+        xs.push(tv)
+      }
+      let ws = ef_names(ef, env, w)
+      let mut i = 0
+      while i < ws.length() {
+        xs.push(ws[i])
+        i = i + 1
+      }
+      "ok (.inr " + ln_paren(ln_tuple(xs)) + ")"
+    }
+  }
+}
+
+///|
+fn ef_break(ef : EF, env : LnEnv, k : EK) -> String {
+  match k {
+    KLoop(w, has_ret) => {
+      let t = ln_paren(ln_tuple(ef_names(ef, env, w)))
+      if has_ret {
+        "ok (done (.inr " + t + "))"
+      } else {
+        "ok (done " + t + ")"
+      }
+    }
+    KLoopRec(w, has_ret, _) => {
+      let t = ln_paren(ln_tuple(ef_names(ef, env, w)))
+      if has_ret {
+        "ok (.inr " + t + ")"
+      } else {
+        "ok " + t
+      }
+    }
+    _ => "Pion.panic"
+  }
+}
+
+///|
+fn ln_nc(nc : Bool) -> String {
+  if nc {
+    "noncomputable "
+  } else {
+    ""
+  }
+}
+
+///|
+fn ln_rec_call(call : String, args : Array[String]) -> String {
+  let sb = StringBuilder()
+  sb.write_string(call)
+  let mut i = 0
+  while i < args.length() {
+    sb.write_string(" " + args[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ef_continue(ef : EF, env : LnEnv, k : EK) -> String {
+  match k {
+    KLoop(w, _) => "ok (cont " + ln_paren(ln_tuple(ef_names(ef, env, w))) + ")"
+    KLoopRec(w, _, call) => ln_rec_call(call, ef_names(ef, env, w))
+    _ => "Pion.panic"
+  }
+}
+
+///|
+/// Lean text of a callee applied to its generic / dictionary arguments.
+fn ef_callee(ef : EF, env : LnEnv, c : LCallee) -> String {
+  match c {
+    CBuiltin(f) => f
+    CConst(key) =>
+      match ef.g.items.get(key) {
+        Some(it) => ln_qual_item(ef.cur, it.pkg, it.lean_name)
+        None => "sorry"
+      }
+    CDictMethod(d, m) => ef_dict(ef, d) + "." + lean_ident(m)
+    CItem(key, targs, dicts) => {
+      let sb = StringBuilder()
+      match ef.g.items.get(key) {
+        Some(it) => {
+          sb.write_string(ln_qual_item(ef.cur, it.pkg, it.lean_name))
+          let mut i = 0
+          while i < it.type_params.length() && i < targs.length() {
+            sb.write_string(" (")
+            sb.write_string(lean_ident(it.type_params[i]))
+            sb.write_string(" := ")
+            sb.write_string(lean_ty(ef.cur, targs[i]))
+            sb.write_string(")")
+            i = i + 1
+          }
+        }
+        None => sb.write_string("sorry")
+      }
+      let mut i = 0
+      while i < dicts.length() {
+        sb.write_string(" ")
+        sb.write_string(ef_dict(ef, dicts[i]))
+        i = i + 1
+      }
+      let _ = env
+      sb.to_string()
+    }
+  }
+}
+
+///|
+pub fn ln_dict_param(tparam : String, trait_key : String) -> String {
+  "inst_" + tparam + "_" + l_last_seg(trait_key)
+}
+
+///|
+fn ef_dict(ef : EF, d : LDict) -> String {
+  match d {
+    LDParam(tp, tk) => ln_dict_param(tp, tk)
+    LDImpl(key, _) =>
+      match ef.g.items.get(key) {
+        Some(it) => ln_qual_item(ef.cur, it.pkg, it.lean_name)
+        None => "sorry"
+      }
+  }
+}
+
+///|
+/// `{ s with f := { s.f with g := v } }` (or `Name.set_f` for recursive
+/// structs emitted as `inductive`).
+fn ef_set_path(ef : EF, base : String, path : Array[String], tys : Array[Ty], k : Int, v : String) -> String {
+  let inner = if k + 1 < path.length() {
+    ef_set_path(ef, ln_field(ln_paren(base), path[k]), path, tys, k + 1, v)
+  } else {
+    v
+  }
+  let skey = match tys[k] {
+    TStruct(n, _) => n
+    _ => ""
+  }
+  if ef.g.inductive_structs.contains(skey) {
+    let qp = split_qual_name(skey)
+    let tref = if qp.prefix == ef.cur {
+      lean_ident(ln_item(qp.name))
+    } else {
+      lean_ident(qp.prefix) + "." + lean_ident(ln_item(qp.name))
+    }
+    "(" + tref + ".set_" + path[k] + " " + ln_paren(base) + " " + ln_paren(inner) + ")"
+  } else {
+    "{ " + base + " with " + lean_ident(path[k]) + " := " + inner + " }"
+  }
+}
+
+///|
+fn ef_block(ef : EF, env : LnEnv, stmts : Array[LStmt], from : Int, tail : Option[LExpr], k : EK, ind : Int, out : Array[String]) -> Unit {
+  let mut i = from
+  while i < stmts.length() {
+    match stmts[i] {
+      LSLet(n, _, v) => {
+        let t = ex(ef, env, v)
+        let nm = ef_fresh(ef, n)
+        ln_line(out, ind, "let " + nm + " := " + t)
+        lne_set(env, n, nm)
+      }
+      LSLetTuple(ns, _, v) => {
+        let t = ex(ef, env, v)
+        let names : Array[String] = []
+        let mut j = 0
+        while j < ns.length() {
+          let nm = ef_fresh(ef, ns[j])
+          names.push(nm)
+          j = j + 1
+        }
+        ln_line(out, ind, "let " + ln_tuple(names) + " := " + t)
+        j = 0
+        while j < ns.length() {
+          lne_set(env, ns[j], names[j])
+          j = j + 1
+        }
+      }
+      LSAssign(n, v) => {
+        let t = ex(ef, env, v)
+        let nm = ef_fresh(ef, n)
+        ln_line(out, ind, "let " + nm + " := " + t)
+        lne_set(env, n, nm)
+      }
+      LSSetField(n, _, path, tys, v) => {
+        let t = ef_set_path(ef, ef_name(ef, env, n), path, tys, 0, ex(ef, env, v))
+        let nm = ef_fresh(ef, n)
+        ln_line(out, ind, "let " + nm + " := " + t)
+        lne_set(env, n, nm)
+      }
+      LSCall(d, ty, c, args, outs, _) => {
+        let sb = StringBuilder()
+        sb.write_string(ef_callee(ef, env, c))
+        let mut j = 0
+        while j < args.length() {
+          sb.write_string(" ")
+          match args[j] {
+            AVal(v) | AMut(v) => sb.write_string(ln_paren(ex(ef, env, v)))
+          }
+          j = j + 1
+        }
+        let call = sb.to_string()
+        let binders : Array[String] = []
+        let keys : Array[String] = []
+        let has_val = l_wants_value(ty)
+        if has_val {
+          if d.length() > 0 {
+            let nm = ef_fresh(ef, d)
+            binders.push(nm)
+            keys.push(d)
+          } else {
+            binders.push(ef_fresh(ef, "__discard"))
+            keys.push("")
+          }
+        }
+        // `mut` results written straight back to a whole variable
+        // (`let (r, x1) ← f x` instead of `let (r, t) ← f x; let x1 := t`).
+        let wb_root : Array[String] = []
+        j = 0
+        while j < outs.length() {
+          wb_root.push("")
+          j = j + 1
+        }
+        let mut skip = 0
+        let mut q = i + 1
+        while q < stmts.length() {
+          let mut hit = false
+          match stmts[q] {
+            LSAssign(r, LVar(o, _)) => {
+              let mut m = 0
+              while m < outs.length() {
+                if outs[m] == o && wb_root[m].length() == 0 {
+                  wb_root[m] = r
+                  hit = true
+                  break
+                }
+                m = m + 1
+              }
+            }
+            _ => ()
+          }
+          if !hit {
+            break
+          }
+          skip = skip + 1
+          q = q + 1
+        }
+        j = 0
+        while j < outs.length() {
+          if wb_root[j].length() > 0 {
+            binders.push(ef_fresh(ef, wb_root[j]))
+            keys.push(outs[j] + "\u{0}" + wb_root[j])
+          } else {
+            binders.push(ef_fresh(ef, outs[j]))
+            keys.push(outs[j])
+          }
+          j = j + 1
+        }
+        if binders.length() == 0 {
+          ln_line(out, ind, call)
+        } else {
+          ln_line(out, ind, "let " + ln_tuple(binders) + " ← " + call)
+        }
+        j = 0
+        while j < keys.length() {
+          let kk = keys[j]
+          if kk.length() > 0 {
+            match l_index_of(kk, "\u{0}") {
+              Some(z) => {
+                lne_set(env, slice_str(kk, 0, z), binders[j])
+                lne_set(env, slice_str(kk, z + 1, kk.length()), binders[j])
+              }
+              None => lne_set(env, kk, binders[j])
+            }
+          }
+          j = j + 1
+        }
+        i = i + skip
+      }
+      LSAssert(c) => ln_line(out, ind, "Pion.debugAssert " + ln_paren(ex(ef, env, c)))
+      LSIf(_, _, _, _, _) | LSMatch(_, _, _, _, _) => {
+        ef_branch(ef, env, stmts, i, tail, k, ind, out)
+        return
+      }
+      LSLoop(body) => {
+        ef_loop(ef, env, body, stmts, i, tail, k, ind, out)
+        return
+      }
+      LSBreak => {
+        ln_line(out, ind, ef_break(ef, env, k))
+        return
+      }
+      LSContinue => {
+        ln_line(out, ind, ef_continue(ef, env, k))
+        return
+      }
+      LSReturn(v) => {
+        ln_line(out, ind, ef_ret_raw(k, ef_pack(ef, env, ex(ef, env, v))))
+        return
+      }
+      LSPanic => {
+        ln_line(out, ind, "Pion.panic")
+        return
+      }
+    }
+    i = i + 1
+  }
+  ln_line(out, ind, ef_end(ef, env, k, tail))
+}
+
+///|
+fn ln_concat(a : Array[LStmt], b : Array[LStmt], from : Int) -> Array[LStmt] {
+  let out : Array[LStmt] = []
+  let mut i = 0
+  while i < a.length() {
+    out.push(a[i])
+    i = i + 1
+  }
+  i = from
+  while i < b.length() {
+    out.push(b[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn ln_branch_blocks(s : LStmt) -> Array[LBlock] {
+  match s {
+    LSIf(_, t, e, _, _) => [t, e]
+    LSMatch(_, _, arms, _, _) => {
+      let out : Array[LBlock] = []
+      let mut i = 0
+      while i < arms.length() {
+        out.push(arms[i].body)
+        i = i + 1
+      }
+      out
+    }
+    _ => []
+  }
+}
+
+///|
+fn ln_with_blocks(s : LStmt, bs : Array[LBlock]) -> LStmt {
+  match s {
+    LSIf(c, _, _, d, t) => LSIf(c, bs[0], bs[1], d, t)
+    LSMatch(sv, st, arms, d, t) => {
+      let out : Array[LArm] = []
+      let mut i = 0
+      while i < arms.length() {
+        out.push(LArm::{ pat: arms[i].pat, body: bs[i] })
+        i = i + 1
+      }
+      LSMatch(sv, st, out, d, t)
+    }
+    _ => s
+  }
+}
+
+///|
+fn ln_pat_text(ef : EF, env : LnEnv, p : LPat) -> String {
+  match p {
+    LPWild => "_"
+    LPVar(n, _) => {
+      let nm = ef_fresh(ef, n)
+      lne_set(env, n, nm)
+      nm
+    }
+    LPBool(v) => if v { "true" } else { "false" }
+    LPTuple(ps) => {
+      let xs : Array[String] = []
+      let mut i = 0
+      while i < ps.length() {
+        xs.push(ln_pat_text(ef, env, ps[i]))
+        i = i + 1
+      }
+      ln_tuple(xs)
+    }
+    LPCtor(ek, v, ps) => {
+      let sb = StringBuilder()
+      if ek == "Option" {
+        sb.write_string(if v == "Some" { ".some" } else { ".none" })
+      } else {
+        sb.write_string(".")
+        sb.write_string(lean_ident(v))
+      }
+      let mut i = 0
+      while i < ps.length() {
+        sb.write_string(" ")
+        sb.write_string(ln_paren(ln_pat_text(ef, env, ps[i])))
+        i = i + 1
+      }
+      sb.to_string()
+    }
+  }
+}
+
+///|
+/// Emits an `if` / `match` whose branches each end through their own `ks[j]`.
+fn ef_emit_branching(ef : EF, env : LnEnv, s : LStmt, ks : Array[EK], ind : Int, out : Array[String]) -> Unit {
+  match s {
+    LSIf(c, t, e, _, _) => {
+      ln_line(out, ind, "if " + ex_cond(ef, env, c) + " then")
+      ef_block(ef, lne_copy(env), t.stmts, 0, t.tail, ks[0], ind + 1, out)
+      ln_line(out, ind, "else")
+      ef_block(ef, lne_copy(env), e.stmts, 0, e.tail, ks[1], ind + 1, out)
+    }
+    LSMatch(sv, _, arms, _, _) => {
+      ln_line(out, ind, "match " + ex(ef, env, sv) + " with")
+      let mut i = 0
+      while i < arms.length() {
+        let aenv = lne_copy(env)
+        let pt = ln_pat_text(ef, aenv, arms[i].pat)
+        ln_line(out, ind, "| " + pt + " =>")
+        ef_block(ef, aenv, arms[i].body.stmts, 0, arms[i].body.tail, ks[i], ind + 1, out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn ln_k_rep(k : EK, n : Int) -> Array[EK] {
+  let out : Array[EK] = []
+  let mut i = 0
+  while i < n {
+    out.push(k)
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn ef_branch(ef : EF, env : LnEnv, stmts : Array[LStmt], i : Int, tail : Option[LExpr], k : EK, ind : Int, out : Array[String]) -> Unit {
+  let s = stmts[i]
+  let (d, dty) = match s {
+    LSIf(_, _, _, dd, t) => (dd, t)
+    LSMatch(_, _, _, dd, t) => (dd, t)
+    _ => ("", TUnit)
+  }
+  let blocks = ln_branch_blocks(s)
+  let is_last = i + 1 == stmts.length()
+  let tail_is_dest = match tail {
+    Some(LVar(n, _)) => d.length() > 0 && n == d
+    None => true
+    _ => false
+  }
+  // 1. Tail position: every branch ends the enclosing block itself.
+  if is_last && tail_is_dest {
+    let nb : Array[LBlock] = []
+    let mut j = 0
+    while j < blocks.length() {
+      let bt = match tail {
+        Some(_) => blocks[j].tail
+        None => None
+      }
+      nb.push(LBlock::{ stmts: blocks[j].stmts, tail: bt })
+      j = j + 1
+    }
+    ef_emit_branching(ef, env, ln_with_blocks(s, nb), ln_k_rep(k, nb.length()), ind, out)
+    return
+  }
+  let mut nondiv = 0
+  let mut bc = false
+  let mut ret = false
+  let mut j = 0
+  while j < blocks.length() {
+    if !ln_block_diverges(blocks[j]) {
+      nondiv = nondiv + 1
+    }
+    if ln_has_bc(blocks[j]) {
+      bc = true
+    }
+    if ln_has_ret(blocks[j]) {
+      ret = true
+    }
+    j = j + 1
+  }
+  // 2. The rest of the block moves into the (single) non-diverging branch, or
+  //    is duplicated into each branch (`break` / `continue` inside, or only a
+  //    pure tail left).
+  if nondiv <= 1 || bc || is_last {
+    let nb : Array[LBlock] = []
+    j = 0
+    while j < blocks.length() {
+      if ln_block_diverges(blocks[j]) {
+        nb.push(blocks[j])
+      } else {
+        let pre : Array[LStmt] = []
+        let mut q = 0
+        while q < blocks[j].stmts.length() {
+          pre.push(blocks[j].stmts[q])
+          q = q + 1
+        }
+        if d.length() > 0 {
+          match blocks[j].tail {
+            Some(v) => pre.push(LSLet(d, dty, v))
+            None => ()
+          }
+        }
+        nb.push(LBlock::{ stmts: ln_concat(pre, stmts, i + 1), tail: tail })
+      }
+      j = j + 1
+    }
+    ef_emit_branching(ef, env, ln_with_blocks(s, nb), ln_k_rep(k, nb.length()), ind, out)
+    return
+  }
+  // 3. / 4. Join: the branches return the updated variables (and the value).
+  let assigned : Array[String] = []
+  j = 0
+  while j < blocks.length() {
+    ln_assigned(blocks[j], assigned)
+    j = j + 1
+  }
+  let w : Array[String] = []
+  j = 0
+  while j < assigned.length() {
+    match lne_get(env, assigned[j]) {
+      Some(_) => w.push(assigned[j])
+      None => ()
+    }
+    j = j + 1
+  }
+  let items : Array[String] = []
+  if d.length() > 0 {
+    items.push(d)
+  }
+  j = 0
+  while j < w.length() {
+    items.push(w[j])
+    j = j + 1
+  }
+  if ret {
+    let sname = ef_fresh(ef, "__s")
+    let itys : Array[Ty] = []
+    j = 0
+    while j < items.length() {
+      itys.push(if j == 0 && d.length() > 0 { dty } else { ef_vty(ef, items[j]) })
+      j = j + 1
+    }
+    let sty = "(Sum " + ln_paren(ef.ret_text) + " " + ln_paren(lean_tuple_ty(ef.cur, itys)) + ")"
+    ln_line(out, ind, "let " + sname + " : " + sty + " ← do")
+    ef_emit_branching(ef, env, s, ln_k_rep(KSum(w, d), blocks.length()), ind + 1, out)
+    ln_line(out, ind, "match " + sname + " with")
+    let rname = ef_fresh(ef, "__r")
+    ln_line(out, ind, "| .inl " + rname + " => " + ef_ret_raw(k, rname))
+    let env2 = lne_copy(env)
+    let names : Array[String] = []
+    j = 0
+    while j < items.length() {
+      let nm = ef_fresh(ef, items[j])
+      names.push(nm)
+      j = j + 1
+    }
+    ln_line(out, ind, "| .inr " + ln_paren(ln_tuple(names)) + " =>")
+    j = 0
+    while j < items.length() {
+      lne_set(env2, items[j], names[j])
+      j = j + 1
+    }
+    ef_block(ef, env2, stmts, i + 1, tail, k, ind + 1, out)
+    return
+  }
+  if items.length() == 0 {
+    ef_emit_branching(ef, env, s, ln_k_rep(KTuple([], ""), blocks.length()), ind, out)
+    ef_block(ef, env, stmts, i + 1, tail, k, ind, out)
+    return
+  }
+  let names : Array[String] = []
+  j = 0
+  while j < items.length() {
+    names.push(ef_fresh(ef, items[j]))
+    j = j + 1
+  }
+  ln_line(out, ind, "let " + ln_tuple(names) + " ← do")
+  ef_emit_branching(ef, env, s, ln_k_rep(KTuple(w, d), blocks.length()), ind + 1, out)
+  j = 0
+  while j < items.length() {
+    lne_set(env, items[j], names[j])
+    j = j + 1
+  }
+  ef_block(ef, env, stmts, i + 1, tail, k, ind, out)
+}
+
+// ---------------------------------------------------------------------------
+// Loops.
+// ---------------------------------------------------------------------------
+
+///|
+fn ln_join(lines : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < lines.length() {
+    sb.write_string(lines[i])
+    sb.write_string("\n")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ef_sub(ef : EF) -> EF {
+  EF::{
+    g: ef.g,
+    cur: ef.cur,
+    fname: ef.fname,
+    binders: ef.binders,
+    gen_args: ef.gen_args,
+    mut_params: ef.mut_params,
+    ret_ty: ef.ret_ty,
+    ret_text: ef.ret_text,
+    var_tys: ef.var_tys,
+    used: Map([]),
+    loop_defs: ef.loop_defs,
+    loop_n: ef.loop_n,
+    recursive: ef.recursive,
+    nc: ef.nc,
+  }
+}
+
+///|
+/// `loop { body }`: extracted into `<fn>_loop<N>.body` / `<fn>_loop<N>` over
+/// the loop-carried state `W` (variables assigned in the body), with the
+/// other free variables passed as parameters.
+fn ef_loop(ef : EF, env : LnEnv, body : LBlock, stmts : Array[LStmt], i : Int, tail : Option[LExpr], k : EK, ind : Int, out : Array[String]) -> Unit {
+  let declared : Array[String] = []
+  ln_declared(body, declared)
+  let used : Array[String] = []
+  ln_used(body, used)
+  let has_ret = ln_has_ret(body)
+  if has_ret {
+    let mut q = 0
+    while q < ef.mut_params.length() {
+      l_push_unique(used, ef.mut_params[q])
+      q = q + 1
+    }
+  }
+  let assigned : Array[String] = []
+  ln_assigned(body, assigned)
+  let w : Array[String] = []
+  let p : Array[String] = []
+  let mut j = 0
+  while j < used.length() {
+    let v = used[j]
+    if !l_str_contains(declared, v) {
+      match lne_get(env, v) {
+        Some(_) => if l_str_contains(assigned, v) { w.push(v) } else { p.push(v) }
+        None => ()
+      }
+    }
+    j = j + 1
+  }
+  let n = ef.loop_n[0]
+  ef.loop_n[0] = n + 1
+  let lname = lean_dotted(ef.fname + "_loop" + n.to_string())
+  let wtys : Array[Ty] = []
+  j = 0
+  while j < w.length() {
+    wtys.push(ef_vty(ef, w[j]))
+    j = j + 1
+  }
+  let sigma = lean_tuple_ty(ef.cur, wtys)
+  let x = if has_ret {
+    "(Sum " + ln_paren(ef.ret_text) + " " + ln_paren(sigma) + ")"
+  } else {
+    sigma
+  }
+  // `<fn>_loop<N>.body`
+  let sub = ef_sub(ef)
+  let senv = lne_new()
+  let pnames : Array[String] = []
+  let wnames : Array[String] = []
+  let ps = StringBuilder()
+  j = 0
+  while j < p.length() {
+    let nm = ef_fresh(sub, p[j])
+    lne_set(senv, p[j], nm)
+    pnames.push(nm)
+    ps.write_string(" (" + nm + " : " + lean_ty(ef.cur, ef_vty(ef, p[j])) + ")")
+    j = j + 1
+  }
+  j = 0
+  while j < w.length() {
+    let nm = ef_fresh(sub, w[j])
+    lne_set(senv, w[j], nm)
+    wnames.push(nm)
+    ps.write_string(" (" + nm + " : " + lean_ty(ef.cur, wtys[j]) + ")")
+    j = j + 1
+  }
+  let params = ps.to_string()
+  let lines : Array[String] = []
+  if ef.recursive {
+    let pcall = StringBuilder()
+    pcall.write_string(lname)
+    pcall.write_string(ef.gen_args)
+    j = 0
+    while j < pnames.length() {
+      pcall.write_string(" " + pnames[j])
+      j = j + 1
+    }
+    ln_line(lines, 0, ln_nc(ef.nc) + "def " + lname + ef.binders + params + " :")
+    ln_line(lines, 2, "Result " + ln_paren(x) + " := do")
+    ef_block(sub, senv, body.stmts, 0, None, KLoopRec(w, has_ret, pcall.to_string()), 1, lines)
+    ln_line(lines, 0, "partial_fixpoint")
+  } else {
+  ln_line(lines, 0, ln_nc(ef.nc) + "def " + lname + ".body" + ef.binders + params + " :")
+  ln_line(lines, 2, "Result (ControlFlow " + ln_paren(sigma) + " " + ln_paren(x) + ") := do")
+  ef_block(sub, senv, body.stmts, 0, None, KLoop(w, has_ret), 1, lines)
+  ln_line(lines, 0, "")
+  ln_line(lines, 0, ln_nc(ef.nc) + "def " + lname + ef.binders + params + " :")
+  ln_line(lines, 2, "Result " + ln_paren(x) + " :=")
+  let call_args = StringBuilder()
+  call_args.write_string(ef.gen_args)
+  j = 0
+  while j < pnames.length() {
+    call_args.write_string(" " + pnames[j])
+    j = j + 1
+  }
+  j = 0
+  while j < wnames.length() {
+    call_args.write_string(" " + wnames[j])
+    j = j + 1
+  }
+  let wpat = if wnames.length() == 0 { "_" } else { ln_tuple(wnames) }
+  ln_line(
+    lines,
+    1,
+    "loop (fun " + wpat + " => _root_." + lean_ident(ef.cur) + "." + lname + ".body" + call_args.to_string() + ") " + ln_tuple(wnames),
+  )
+  }
+  ef.loop_defs.push(ln_join(lines))
+  // Call site.
+  let cs = StringBuilder()
+  cs.write_string(lname)
+  cs.write_string(ef.gen_args)
+  j = 0
+  while j < p.length() {
+    cs.write_string(" " + ef_name(ef, env, p[j]))
+    j = j + 1
+  }
+  j = 0
+  while j < w.length() {
+    cs.write_string(" " + ef_name(ef, env, w[j]))
+    j = j + 1
+  }
+  let call = cs.to_string()
+  if !has_ret {
+    if w.length() == 0 {
+      ln_line(out, ind, call)
+    } else {
+      let names : Array[String] = []
+      j = 0
+      while j < w.length() {
+        names.push(ef_fresh(ef, w[j]))
+        j = j + 1
+      }
+      ln_line(out, ind, "let " + ln_tuple(names) + " ← " + call)
+      j = 0
+      while j < w.length() {
+        lne_set(env, w[j], names[j])
+        j = j + 1
+      }
+    }
+    ef_block(ef, env, stmts, i + 1, tail, k, ind, out)
+    return
+  }
+  let sname = ef_fresh(ef, "__s")
+  ln_line(out, ind, "let " + sname + " ← " + call)
+  ln_line(out, ind, "match " + sname + " with")
+  let rname = ef_fresh(ef, "__r")
+  ln_line(out, ind, "| .inl " + rname + " => " + ef_ret_raw(k, rname))
+  let names : Array[String] = []
+  j = 0
+  while j < w.length() {
+    names.push(ef_fresh(ef, w[j]))
+    j = j + 1
+  }
+  ln_line(out, ind, "| .inr " + ln_paren(if names.length() == 0 { "_" } else { ln_tuple(names) }) + " =>")
+  let env2 = lne_copy(env)
+  j = 0
+  while j < w.length() {
+    lne_set(env2, w[j], names[j])
+    j = j + 1
+  }
+  ef_block(ef, env2, stmts, i + 1, tail, k, ind + 1, out)
+}
+
+// ---------------------------------------------------------------------------
+// Definitions.
+// ---------------------------------------------------------------------------
+
+///|
+fn ln_binders(cur : String, tparams : Array[String], bounds : Array[LBound], eqs : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < tparams.length() {
+    sb.write_string(" {" + lean_ident(tparams[i]) + " : Type _}")
+    i = i + 1
+  }
+  i = 0
+  while i < bounds.length() {
+    let bd = bounds[i]
+    sb.write_string(" (" + ln_dict_param(bd.tparam, bd.trait_key) + " : " + ln_type_ref(cur, bd.trait_key) + " " + lean_ident(bd.tparam) + ")")
+    i = i + 1
+  }
+  i = 0
+  while i < eqs.length() {
+    sb.write_string(" [Pion.Eq " + lean_ident(eqs[i]) + "]")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_gen_args(tparams : Array[String], bounds : Array[LBound]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < tparams.length() {
+    sb.write_string(" (" + lean_ident(tparams[i]) + " := " + lean_ident(tparams[i]) + ")")
+    i = i + 1
+  }
+  i = 0
+  while i < bounds.length() {
+    sb.write_string(" " + ln_dict_param(bounds[i].tparam, bounds[i].trait_key))
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_raw_item(lean_name : String) -> String {
+  // Components with the reserved-name suffix, unescaped.
+  let sb = StringBuilder()
+  let mut start = 0
+  let mut i = 0
+  let mut first = true
+  while i <= lean_name.length() {
+    if i == lean_name.length() || str_code_at(lean_name, i) == 46 {
+      if !first {
+        sb.write_string(".")
+      }
+      sb.write_string(ln_item(slice_str(lean_name, start, i)))
+      first = false
+      start = i + 1
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// A function definition (preceded by its loop definitions).
+fn ln_fn_def(g : LnG, cur : String, f : LFnDef, recursive : Bool, loops_out : Array[String]) -> String {
+  let mut_tys : Array[Ty] = []
+  let mut_params : Array[String] = []
+  let mut i = 0
+  while i < f.params.length() {
+    if f.params[i].is_mut {
+      mut_tys.push(f.params[i].ty)
+      mut_params.push(f.params[i].name)
+    }
+    i = i + 1
+  }
+  let ret_text = lean_packed_ret(cur, f.ret_ty, mut_tys)
+  let binders = ln_binders(cur, f.type_params, f.bounds, f.eq_tparams)
+  let ef = EF::{
+    g: g,
+    cur: cur,
+    fname: ln_raw_item(f.lean_name),
+    binders: binders,
+    gen_args: ln_gen_args(f.type_params, f.bounds),
+    mut_params: mut_params,
+    ret_ty: f.ret_ty,
+    ret_text: ret_text,
+    var_tys: f.var_tys,
+    used: Map([]),
+    loop_defs: loops_out,
+    loop_n: [0],
+    recursive: recursive,
+    nc: g.nc.contains(f.key),
+  }
+  let env = lne_new()
+  let ps = StringBuilder()
+  i = 0
+  while i < f.params.length() {
+    let nm = ef_fresh(ef, f.params[i].name)
+    lne_set(env, f.params[i].name, nm)
+    ps.write_string(" (" + nm + " : " + lean_ty(cur, f.params[i].ty) + ")")
+    i = i + 1
+  }
+  let lines : Array[String] = []
+  ln_line(lines, 0, ln_nc(ef.nc) + "def " + ln_item_dotted(f.lean_name) + binders + ps.to_string() + " :")
+  ln_line(lines, 2, "Result " + ln_paren(ret_text) + " := do")
+  ef_block(ef, env, f.body.stmts, 0, f.body.tail, KFn, 1, lines)
+  if recursive {
+    ln_line(lines, 0, "partial_fixpoint")
+  }
+  ln_join(lines)
+}
+
+///|
+fn ln_const_def(g : LnG, cur : String, c : LConstDef, loops_out : Array[String]) -> String {
+  let ef = EF::{
+    g: g,
+    cur: cur,
+    fname: ln_raw_item(c.lean_name),
+    binders: "",
+    gen_args: "",
+    mut_params: [],
+    ret_ty: c.ty,
+    ret_text: lean_ty(cur, c.ty),
+    var_tys: c.var_tys,
+    used: Map([]),
+    loop_defs: loops_out,
+    loop_n: [0],
+    recursive: false,
+    nc: g.nc.contains(c.key),
+  }
+  let env = lne_new()
+  let lines : Array[String] = []
+  if c.is_pure {
+    let v = match c.body.tail {
+      Some(t) => ex(ef, env, t)
+      None => "()"
+    }
+    ln_line(lines, 0, "def " + ln_item_dotted(c.lean_name) + " : " + lean_ty(cur, c.ty) + " := " + v)
+  } else {
+    ln_line(lines, 0, ln_nc(ef.nc) + "def " + ln_item_dotted(c.lean_name) + " : Result " + lean_ty(cur, c.ty) + " := do")
+    ef_block(ef, env, c.body.stmts, 0, c.body.tail, KFn, 1, lines)
+  }
+  ln_join(lines)
+}
+
+///|
+fn ln_extern_decl(cur : String, x : LExternDef) -> String {
+  let mut_tys : Array[Ty] = []
+  let ps = StringBuilder()
+  let mut i = 0
+  while i < x.params.length() {
+    if x.params[i].is_mut {
+      mut_tys.push(x.params[i].ty)
+    }
+    ps.write_string(" (" + lean_ident(x.params[i].name) + " : " + lean_ty(cur, x.params[i].ty) + ")")
+    i = i + 1
+  }
+  let comment = if x.kind == "extern_c" {
+    "/-- `extern \"C\"` function `" + x.key + "`. -/"
+  } else {
+    "/-- `#verify_opaque` function `" + x.key + "` (trusted boundary). -/"
+  }
+  comment + "\naxiom " + ln_item_dotted(x.lean_name) + ln_binders(cur, x.type_params, x.bounds, x.eq_tparams) + ps.to_string() + " :\n    Result " + ln_paren(lean_packed_ret(cur, x.ret_ty, mut_tys)) + "\n"
+}
+
+///|
+fn ln_impl_def(g : LnG, cur : String, im : LImplDef) -> String {
+  let name = match g.items.get(im.key) {
+    Some(it) => ln_item_dotted(it.lean_name)
+    None => "sorry"
+  }
+  let sb = StringBuilder()
+  sb.write_string(ln_nc(g.nc.contains(im.key)) + "def " + name + " : " + ln_type_ref(cur, im.trait_key) + " " + lean_ty(cur, im.self_ty) + " := {")
+  let mut i = 0
+  while i < im.method_names.length() {
+    sb.write_string(if i == 0 { " " } else { ", " })
+    let mref = match g.items.get(im.method_keys[i]) {
+      Some(it) => ln_qual_item(cur, it.pkg, it.lean_name)
+      None => "sorry"
+    }
+    sb.write_string(lean_ident(im.method_names[i]) + " := " + mref)
+    i = i + 1
+  }
+  sb.write_string(" }\n")
+  sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Strongly connected components (Tarjan), dependencies first.
+// ---------------------------------------------------------------------------
+
+///|
+struct LnTarjan {
+  adj : Array[Array[Int]]
+  index : Array[Int]
+  low : Array[Int]
+  on_stack : Array[Bool]
+  stack : Array[Int]
+  sccs : Array[Array[Int]]
+  mut counter : Int
+}
+
+///|
+fn ln_tarjan_visit(t : LnTarjan, v : Int) -> Unit {
+  t.index[v] = t.counter
+  t.low[v] = t.counter
+  t.counter = t.counter + 1
+  t.stack.push(v)
+  t.on_stack[v] = true
+  let es = t.adj[v]
+  let mut i = 0
+  while i < es.length() {
+    let w = es[i]
+    if t.index[w] < 0 {
+      ln_tarjan_visit(t, w)
+      if t.low[w] < t.low[v] {
+        t.low[v] = t.low[w]
+      }
+    } else if t.on_stack[w] && t.index[w] < t.low[v] {
+      t.low[v] = t.index[w]
+    }
+    i = i + 1
+  }
+  if t.low[v] == t.index[v] {
+    let comp : Array[Int] = []
+    while true {
+      let w = match t.stack.pop() {
+        Some(x) => x
+        None => break
+      }
+      t.on_stack[w] = false
+      comp.push(w)
+      if w == v {
+        break
+      }
+    }
+    // Keep declaration order inside a component.
+    let sorted : Array[Int] = []
+    let mut k = 0
+    while k < t.adj.length() {
+      let mut q = 0
+      while q < comp.length() {
+        if comp[q] == k {
+          sorted.push(k)
+        }
+        q = q + 1
+      }
+      k = k + 1
+    }
+    t.sccs.push(sorted)
+  }
+}
+
+///|
+/// SCCs of a graph (edges point to dependencies), dependencies first; nodes
+/// are visited in index order so the output is deterministic.
+pub fn ln_sccs(adj : Array[Array[Int]]) -> Array[Array[Int]] {
+  let n = adj.length()
+  let t = LnTarjan::{
+    adj: adj,
+    index: [],
+    low: [],
+    on_stack: [],
+    stack: [],
+    sccs: [],
+    counter: 0,
+  }
+  let mut i = 0
+  while i < n {
+    t.index.push(-1)
+    t.low.push(-1)
+    t.on_stack.push(false)
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    if t.index[i] < 0 {
+      ln_tarjan_visit(t, i)
+    }
+    i = i + 1
+  }
+  t.sccs
+}
+
+///|
+fn ln_self_loop(adj : Array[Array[Int]], v : Int) -> Bool {
+  let mut i = 0
+  while i < adj[v].length() {
+    if adj[v][i] == v {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+// ---------------------------------------------------------------------------
+// Types.lean
+// ---------------------------------------------------------------------------
+
+///|
+fn ln_ty_refs(t : Ty, out : Array[String]) -> Unit {
+  match t {
+    TArray(e) | TFixedArray(e) | TOption(e) => ln_ty_refs(e, out)
+    TResult(a, b) => {
+      ln_ty_refs(a, out)
+      ln_ty_refs(b, out)
+    }
+    TStruct(n, args) | TEnum(n, args) => {
+      l_push_unique(out, n)
+      let mut i = 0
+      while i < args.length() {
+        ln_ty_refs(args[i], out)
+        i = i + 1
+      }
+    }
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        ln_ty_refs(es[i], out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn ln_tparams_decl(tps : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < tps.length() {
+    sb.write_string(" (" + lean_ident(tps[i]) + " : Type _)")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_tparams_implicit(tps : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < tps.length() {
+    sb.write_string(" {" + lean_ident(tps[i]) + " : Type _}")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_self_app(name : String, tps : Array[String]) -> String {
+  if tps.length() == 0 {
+    return name
+  }
+  let sb = StringBuilder()
+  sb.write_string("(")
+  sb.write_string(name)
+  let mut i = 0
+  while i < tps.length() {
+    sb.write_string(" " + lean_ident(tps[i]))
+    i = i + 1
+  }
+  sb.write_string(")")
+  sb.to_string()
+}
+
+///|
+fn ln_eq_instance(name : String, tps : Array[String]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("instance")
+  let mut i = 0
+  while i < tps.length() {
+    sb.write_string(" {" + lean_ident(tps[i]) + " : Type _} [BEq " + lean_ident(tps[i]) + "]")
+    i = i + 1
+  }
+  sb.write_string(" : Pion.Eq " + ln_self_app(name, tps) + " := { toBEq := inferInstance }\n")
+  sb.to_string()
+}
+
+///|
+fn ln_enum_is_plain(e : LEnumDef) -> Bool {
+  let mut i = 0
+  while i < e.variants.length() {
+    if e.variants[i].field_tys.length() > 0 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// The `| V (a0 : T0) ...` constructor lines of an enum, or `| mk ...` of a
+/// struct emitted as `inductive`.
+fn ln_ctor_line(cur : String, name : String, field_names : Array[String], tys : Array[Ty]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("  | " + lean_ident(name))
+  let mut i = 0
+  while i < tys.length() {
+    let fname = if i < field_names.length() { lean_ident(field_names[i]) } else { "a" + i.to_string() }
+    sb.write_string(" (" + fname + " : " + lean_ty(cur, tys[i]) + ")")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_inductive_struct_helpers(cur : String, s : LStructDef) -> String {
+  let name = lean_ident(ln_item(s.name))
+  let selft = ln_self_app(name, s.type_params)
+  let imp = ln_tparams_implicit(s.type_params)
+  let sb = StringBuilder()
+  let n = s.field_names.length()
+  let mut i = 0
+  while i < n {
+    let f = s.field_names[i]
+    let fty = lean_ty(cur, s.field_tys[i])
+    // Accessor.
+    sb.write_string("def " + name + "." + lean_ident(f) + imp + " : " + selft + " → " + fty + "\n")
+    sb.write_string("  | .mk")
+    let mut j = 0
+    while j < n {
+      sb.write_string(if j == i { " x" } else { " _" })
+      j = j + 1
+    }
+    sb.write_string(" => x\n\n")
+    // Functional update.
+    sb.write_string("def " + name + ".set_" + f + imp + " (s : " + selft + ") (v : " + fty + ") : " + selft + " :=\n")
+    sb.write_string("  match s with\n  | .mk")
+    j = 0
+    while j < n {
+      sb.write_string(" a" + j.to_string())
+      j = j + 1
+    }
+    sb.write_string(" => .mk")
+    j = 0
+    while j < n {
+      sb.write_string(if j == i { " v" } else { " a" + j.to_string() })
+      j = j + 1
+    }
+    sb.write_string("\n\n")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn ln_header(cur : String, imports : Array[String]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("-- THIS FILE WAS AUTOMATICALLY GENERATED BY pionc extract-lean\n")
+  sb.write_string("import Aeneas\n")
+  sb.write_string("import PionLean\n")
+  let mut i = 0
+  while i < imports.length() {
+    sb.write_string("import " + imports[i] + "\n")
+    i = i + 1
+  }
+  sb.write_string("open Aeneas Aeneas.Std Result ControlFlow Error Pion\n")
+  sb.write_string("set_option linter.dupNamespace false\n")
+  sb.write_string("set_option linter.unusedVariables false\n")
+  sb.write_string("set_option maxHeartbeats 1000000\n")
+  sb.write_string("set_option maxRecDepth 2048\n\n")
+  sb.write_string("namespace " + lean_ident(cur) + "\n\n")
+  sb.to_string()
+}
+
+///|
+fn ln_types_file(p : LlbcPkg, g : LnG) -> String {
+  let cur = p.name
+  let imports : Array[String] = []
+  let mut i = 0
+  while i < p.deps.length() {
+    imports.push(lean_module_name(p.deps[i]) + ".Types")
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  sb.write_string(ln_header(cur, imports))
+  // Nodes: structs then enums.
+  let keys : Array[String] = []
+  i = 0
+  while i < p.structs.length() {
+    keys.push(p.structs[i].key)
+    i = i + 1
+  }
+  i = 0
+  while i < p.enums.length() {
+    keys.push(p.enums[i].key)
+    i = i + 1
+  }
+  let adj : Array[Array[Int]] = []
+  let ns = p.structs.length()
+  i = 0
+  while i < keys.length() {
+    let refs : Array[String] = []
+    if i < ns {
+      let mut j = 0
+      while j < p.structs[i].field_tys.length() {
+        ln_ty_refs(p.structs[i].field_tys[j], refs)
+        j = j + 1
+      }
+    } else {
+      let e = p.enums[i - ns]
+      let mut j = 0
+      while j < e.variants.length() {
+        let mut q = 0
+        while q < e.variants[j].field_tys.length() {
+          ln_ty_refs(e.variants[j].field_tys[q], refs)
+          q = q + 1
+        }
+        j = j + 1
+      }
+    }
+    let es : Array[Int] = []
+    let mut j = 0
+    while j < refs.length() {
+      let mut q = 0
+      while q < keys.length() {
+        if keys[q] == refs[j] {
+          es.push(q)
+        }
+        q = q + 1
+      }
+      j = j + 1
+    }
+    adj.push(es)
+    i = i + 1
+  }
+  let sccs = ln_sccs(adj)
+  let mut si = 0
+  while si < sccs.length() {
+    let comp = sccs[si]
+    let recursive = comp.length() > 1 || ln_self_loop(adj, comp[0])
+    if recursive {
+      if comp.length() > 1 {
+        sb.write_string("mutual\n")
+      }
+      let derive_names : Array[String] = []
+      let mut ci = 0
+      while ci < comp.length() {
+        let v = comp[ci]
+        if v < ns {
+          let s = p.structs[v]
+          let name = lean_ident(ln_item(s.name))
+          sb.write_string("/-- Pion struct `" + s.key + "` (recursive: an `inductive` with accessors / `set_` updates). -/\n")
+          sb.write_string("inductive " + name + ln_tparams_decl(s.type_params) + " where\n")
+          sb.write_string(ln_ctor_line(cur, "mk", s.field_names, s.field_tys) + "\n")
+          if s.derive_eq {
+            derive_names.push(name)
+          }
+        } else {
+          let e = p.enums[v - ns]
+          let name = lean_ident(ln_item(e.name))
+          sb.write_string("/-- Pion enum `" + e.key + "`. -/\n")
+          sb.write_string("inductive " + name + ln_tparams_decl(e.type_params) + " where\n")
+          let mut q = 0
+          while q < e.variants.length() {
+            sb.write_string(ln_ctor_line(cur, e.variants[q].name, [], e.variants[q].field_tys) + "\n")
+            q = q + 1
+          }
+          if e.derive_eq || ln_enum_is_plain(e) {
+            derive_names.push(name)
+          }
+        }
+        ci = ci + 1
+      }
+      if comp.length() > 1 {
+        sb.write_string("end\n")
+      }
+      sb.write_string("\n")
+      if derive_names.length() > 0 {
+        sb.write_string("deriving instance BEq for ")
+        let mut q = 0
+        while q < derive_names.length() {
+          if q > 0 {
+            sb.write_string(", ")
+          }
+          sb.write_string(derive_names[q])
+          q = q + 1
+        }
+        sb.write_string("\n\n")
+      }
+      ci = 0
+      while ci < comp.length() {
+        let v = comp[ci]
+        if v < ns {
+          let s = p.structs[v]
+          sb.write_string(ln_inductive_struct_helpers(cur, s))
+          if s.derive_eq {
+            sb.write_string(ln_eq_instance(lean_ident(ln_item(s.name)), s.type_params) + "\n")
+          }
+        } else {
+          let e = p.enums[v - ns]
+          if e.derive_eq || ln_enum_is_plain(e) {
+            sb.write_string(ln_eq_instance(lean_ident(ln_item(e.name)), e.type_params) + "\n")
+          }
+        }
+        ci = ci + 1
+      }
+    } else {
+      let v = comp[0]
+      if v < ns {
+        let s = p.structs[v]
+        let name = lean_ident(ln_item(s.name))
+        sb.write_string("/-- Pion struct `" + s.key + "`. -/\n")
+        sb.write_string("structure " + name + ln_tparams_decl(s.type_params) + " where\n")
+        let mut q = 0
+        while q < s.field_names.length() {
+          sb.write_string("  " + lean_ident(s.field_names[q]) + " : " + lean_ty(cur, s.field_tys[q]) + "\n")
+          q = q + 1
+        }
+        if s.derive_eq {
+          sb.write_string("deriving BEq\n\n")
+          sb.write_string(ln_eq_instance(name, s.type_params))
+        }
+        sb.write_string("\n")
+      } else {
+        let e = p.enums[v - ns]
+        let name = lean_ident(ln_item(e.name))
+        sb.write_string("/-- Pion enum `" + e.key + "`. -/\n")
+        sb.write_string("inductive " + name + ln_tparams_decl(e.type_params) + " where\n")
+        let mut q = 0
+        while q < e.variants.length() {
+          sb.write_string(ln_ctor_line(cur, e.variants[q].name, [], e.variants[q].field_tys) + "\n")
+          q = q + 1
+        }
+        if e.derive_eq || ln_enum_is_plain(e) {
+          sb.write_string("deriving BEq\n\n")
+          sb.write_string(ln_eq_instance(name, e.type_params))
+        }
+        sb.write_string("\n")
+      }
+    }
+    si = si + 1
+  }
+  // Traits: dictionaries of methods.
+  i = 0
+  while i < p.traits.length() {
+    let t = p.traits[i]
+    sb.write_string("/-- Pion trait `" + t.key + "` (dictionary passed explicitly to generic functions). -/\n")
+    sb.write_string("structure " + lean_ident(ln_item(t.name)) + " (Self : Type _) where\n")
+    let mut j = 0
+    while j < t.methods.length() {
+      let m = t.methods[j]
+      let mut_tys : Array[Ty] = []
+      if m.self_mut {
+        mut_tys.push(TParam("Self"))
+      }
+      let fsb = StringBuilder()
+      fsb.write_string("Self")
+      let mut q = 0
+      while q < m.params.length() {
+        fsb.write_string(" → " + lean_ty(cur, m.params[q].ty))
+        if m.params[q].is_mut {
+          mut_tys.push(m.params[q].ty)
+        }
+        q = q + 1
+      }
+      fsb.write_string(" → Result " + ln_paren(lean_packed_ret(cur, m.ret_ty, mut_tys)))
+      sb.write_string("  " + lean_ident(m.name) + " : " + fsb.to_string() + "\n")
+      j = j + 1
+    }
+    sb.write_string("\n")
+    i = i + 1
+  }
+  let _ = g
+  sb.write_string("end " + lean_ident(cur) + "\n")
+  sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// Funs.lean / FunsExternal.lean
+// ---------------------------------------------------------------------------
+
+///|
+/// Item keys (`CItem` / `CConst` / `DImpl` / constants) referenced in a block.
+fn ln_block_refs(b : LBlock, out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < b.stmts.length() {
+    match b.stmts[i] {
+      LSCall(_, _, c, args, _, _) => {
+        match c {
+          CItem(k, _, ds) => {
+            l_push_unique(out, k)
+            let mut j = 0
+            while j < ds.length() {
+              match ds[j] {
+                LDImpl(ik, _) => l_push_unique(out, ik)
+                _ => ()
+              }
+              j = j + 1
+            }
+          }
+          CConst(k) => l_push_unique(out, k)
+          _ => ()
+        }
+        let mut j = 0
+        while j < args.length() {
+          match args[j] {
+            AVal(v) | AMut(v) => ln_expr_refs(v, out)
+          }
+          j = j + 1
+        }
+      }
+      LSLet(_, _, v) | LSLetTuple(_, _, v) | LSAssign(_, v) | LSSetField(_, _, _, _, v) | LSReturn(v) | LSAssert(v) => ln_expr_refs(v, out)
+      LSIf(c, t, e, _, _) => {
+        ln_expr_refs(c, out)
+        ln_block_refs(t, out)
+        ln_block_refs(e, out)
+      }
+      LSMatch(s, _, arms, _, _) => {
+        ln_expr_refs(s, out)
+        let mut j = 0
+        while j < arms.length() {
+          ln_block_refs(arms[j].body, out)
+          j = j + 1
+        }
+      }
+      LSLoop(body) => ln_block_refs(body, out)
+      _ => ()
+    }
+    i = i + 1
+  }
+  match b.tail {
+    Some(v) => ln_expr_refs(v, out)
+    None => ()
+  }
+}
+
+///|
+fn ln_expr_refs(e : LExpr, out : Array[String]) -> Unit {
+  match e {
+    LConstRef(k, _) => l_push_unique(out, k)
+    LBin(_, a, b, _) => {
+      ln_expr_refs(a, out)
+      ln_expr_refs(b, out)
+    }
+    LUn(_, a, _) | LField(a, _, _, _) | LTupleGet(a, _, _) => ln_expr_refs(a, out)
+    LCtor(_, _, es, _) | LStruct(_, es, _) | LTuple(es, _) | LArrayLit(es, _) | LPure(_, es, _) => {
+      let mut i = 0
+      while i < es.length() {
+        ln_expr_refs(es[i], out)
+        i = i + 1
+      }
+    }
+    LIte(c, a, b, _) => {
+      ln_expr_refs(c, out)
+      ln_expr_refs(a, out)
+      ln_expr_refs(b, out)
+    }
+    _ => ()
+  }
+}
+
+///|
+fn ln_ext_file(p : LlbcPkg, header_note : String) -> String {
+  let cur = p.name
+  let sb = StringBuilder()
+  sb.write_string("-- THIS FILE WAS AUTOMATICALLY GENERATED BY pionc extract-lean\n")
+  sb.write_string(header_note)
+  sb.write_string("import Aeneas\n")
+  sb.write_string("import PionLean\n")
+  sb.write_string("import " + lean_module_name(cur) + ".Types\n")
+  let mut i = 0
+  while i < p.deps.length() {
+    sb.write_string("import " + lean_module_name(p.deps[i]) + ".Types\n")
+    i = i + 1
+  }
+  sb.write_string("open Aeneas Aeneas.Std Result ControlFlow Error Pion\n")
+  sb.write_string("set_option linter.dupNamespace false\n")
+  sb.write_string("set_option linter.unusedVariables false\n\n")
+  sb.write_string("namespace " + lean_ident(cur) + "\n\n")
+  i = 0
+  while i < p.externs.length() {
+    sb.write_string(ln_extern_decl(cur, p.externs[i]))
+    sb.write_string("\n")
+    i = i + 1
+  }
+  sb.write_string("end " + lean_ident(cur) + "\n")
+  sb.to_string()
+}
+
+///|
+fn ln_funs_file(p : LlbcPkg, g : LnG, diags : Array[Diagnostic]) -> String {
+  let cur = p.name
+  let imports : Array[String] = [lean_module_name(cur) + ".Types", lean_module_name(cur) + ".FunsExternal"]
+  let mut i = 0
+  while i < p.deps.length() {
+    imports.push(lean_module_name(p.deps[i]) + ".Funs")
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  sb.write_string(ln_header(cur, imports))
+  // Nodes: constants, functions, impl dictionaries.
+  let keys : Array[String] = []
+  let kinds : Array[Int] = []
+  let idx : Array[Int] = []
+  i = 0
+  while i < p.consts.length() {
+    keys.push(p.consts[i].key)
+    kinds.push(0)
+    idx.push(i)
+    i = i + 1
+  }
+  i = 0
+  while i < p.fns.length() {
+    keys.push(p.fns[i].key)
+    kinds.push(1)
+    idx.push(i)
+    i = i + 1
+  }
+  i = 0
+  while i < p.impls.length() {
+    keys.push(p.impls[i].key)
+    kinds.push(2)
+    idx.push(i)
+    i = i + 1
+  }
+  let adj : Array[Array[Int]] = []
+  i = 0
+  while i < keys.length() {
+    let refs : Array[String] = []
+    if kinds[i] == 0 {
+      ln_block_refs(p.consts[idx[i]].body, refs)
+    } else if kinds[i] == 1 {
+      ln_block_refs(p.fns[idx[i]].body, refs)
+    } else {
+      let im = p.impls[idx[i]]
+      let mut j = 0
+      while j < im.method_keys.length() {
+        refs.push(im.method_keys[j])
+        j = j + 1
+      }
+    }
+    let es : Array[Int] = []
+    let mut j = 0
+    while j < refs.length() {
+      let mut q = 0
+      while q < keys.length() {
+        if keys[q] == refs[j] {
+          es.push(q)
+        }
+        q = q + 1
+      }
+      j = j + 1
+    }
+    adj.push(es)
+    i = i + 1
+  }
+  let sccs = ln_sccs(adj)
+  let mut si = 0
+  while si < sccs.length() {
+    let comp = sccs[si]
+    let recursive = comp.length() > 1 || ln_self_loop(adj, comp[0])
+    let loops : Array[String] = []
+    let defs : Array[String] = []
+    let mut ci = 0
+    while ci < comp.length() {
+      let v = comp[ci]
+      if kinds[v] == 0 {
+        defs.push(ln_const_def(g, cur, p.consts[idx[v]], loops))
+      } else if kinds[v] == 1 {
+        let f = p.fns[idx[v]]
+        defs.push("/-- `" + f.key + "` -/\n" + ln_fn_def(g, cur, f, recursive, loops))
+      } else {
+        defs.push(ln_impl_def(g, cur, p.impls[idx[v]]))
+        if recursive {
+          diags.push(diag_new(span_new(cur, 0, 0), "E_EXTRACT_UNSUPPORTED", "trait impl `" + keys[v] + "` is part of a recursion cycle", "a non-recursive trait dictionary", keys[v], "break the recursion through the trait method"))
+        }
+      }
+      ci = ci + 1
+    }
+    let use_mutual = recursive && (comp.length() > 1 || loops.length() > 0)
+    if use_mutual {
+      sb.write_string("mutual\n\n")
+    }
+    ci = 0
+    while ci < loops.length() {
+      sb.write_string(loops[ci])
+      sb.write_string("\n")
+      ci = ci + 1
+    }
+    ci = 0
+    while ci < defs.length() {
+      sb.write_string(defs[ci])
+      sb.write_string("\n")
+      ci = ci + 1
+    }
+    if use_mutual {
+      sb.write_string("end\n\n")
+    }
+    si = si + 1
+  }
+  sb.write_string("end " + lean_ident(cur) + "\n")
+  sb.to_string()
+}
+
+///|
+fn ln_build_items(res : LlbcResult) -> LnG {
+  let items : Map[String, LnItem] = Map([])
+  let inductive : Map[String, Bool] = Map([])
+  let mut pi = 0
+  while pi < res.pkgs.length() {
+    let p = res.pkgs[pi]
+    let mut i = 0
+    while i < p.fns.length() {
+      let f = p.fns[i]
+      items.set(f.key, LnItem::{ pkg: p.name, lean_name: f.lean_name, type_params: f.type_params })
+      i = i + 1
+    }
+    i = 0
+    while i < p.externs.length() {
+      let x = p.externs[i]
+      items.set(x.key, LnItem::{ pkg: p.name, lean_name: x.lean_name, type_params: x.type_params })
+      i = i + 1
+    }
+    i = 0
+    while i < p.consts.length() {
+      let c = p.consts[i]
+      items.set(c.key, LnItem::{ pkg: p.name, lean_name: c.lean_name, type_params: [] })
+      i = i + 1
+    }
+    i = 0
+    while i < p.impls.length() {
+      let im = p.impls[i]
+      let parts = l_split_bar(im.key)
+      let lean_name = if parts.length() >= 3 {
+        l_last_seg(parts[2]) + ".Insts." + l_last_seg(parts[1])
+      } else {
+        "Insts"
+      }
+      items.set(im.key, LnItem::{ pkg: p.name, lean_name: lean_name, type_params: [] })
+      i = i + 1
+    }
+    // Recursive structs (self or mutual through other local types).
+    let ns = p.structs.length()
+    let keys : Array[String] = []
+    i = 0
+    while i < ns {
+      keys.push(p.structs[i].key)
+      i = i + 1
+    }
+    i = 0
+    while i < p.enums.length() {
+      keys.push(p.enums[i].key)
+      i = i + 1
+    }
+    let adj : Array[Array[Int]] = []
+    i = 0
+    while i < keys.length() {
+      let refs : Array[String] = []
+      if i < ns {
+        let mut j = 0
+        while j < p.structs[i].field_tys.length() {
+          ln_ty_refs(p.structs[i].field_tys[j], refs)
+          j = j + 1
+        }
+      } else {
+        let e = p.enums[i - ns]
+        let mut j = 0
+        while j < e.variants.length() {
+          let mut q = 0
+          while q < e.variants[j].field_tys.length() {
+            ln_ty_refs(e.variants[j].field_tys[q], refs)
+            q = q + 1
+          }
+          j = j + 1
+        }
+      }
+      let es : Array[Int] = []
+      let mut j = 0
+      while j < refs.length() {
+        let mut q = 0
+        while q < keys.length() {
+          if keys[q] == refs[j] {
+            es.push(q)
+          }
+          q = q + 1
+        }
+        j = j + 1
+      }
+      adj.push(es)
+      i = i + 1
+    }
+    let sccs = ln_sccs(adj)
+    i = 0
+    while i < sccs.length() {
+      let comp = sccs[i]
+      if comp.length() > 1 || ln_self_loop(adj, comp[0]) {
+        let mut j = 0
+        while j < comp.length() {
+          if comp[j] < ns {
+            inductive.set(keys[comp[j]], true)
+          }
+          j = j + 1
+        }
+      }
+      i = i + 1
+    }
+    pi = pi + 1
+  }
+  // `noncomputable`: reaching an external axiom (fixpoint over all packages).
+  let nc : Map[String, Bool] = Map([])
+  let refs_of : Map[String, Array[String]] = Map([])
+  let keys : Array[String] = []
+  pi = 0
+  while pi < res.pkgs.length() {
+    let p = res.pkgs[pi]
+    let mut i = 0
+    while i < p.externs.length() {
+      nc.set(p.externs[i].key, true)
+      i = i + 1
+    }
+    i = 0
+    while i < p.fns.length() {
+      let r : Array[String] = []
+      ln_block_refs(p.fns[i].body, r)
+      refs_of.set(p.fns[i].key, r)
+      keys.push(p.fns[i].key)
+      i = i + 1
+    }
+    i = 0
+    while i < p.consts.length() {
+      let r : Array[String] = []
+      ln_block_refs(p.consts[i].body, r)
+      refs_of.set(p.consts[i].key, r)
+      keys.push(p.consts[i].key)
+      i = i + 1
+    }
+    i = 0
+    while i < p.impls.length() {
+      refs_of.set(p.impls[i].key, p.impls[i].method_keys)
+      keys.push(p.impls[i].key)
+      i = i + 1
+    }
+    pi = pi + 1
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut k = 0
+    while k < keys.length() {
+      if !nc.contains(keys[k]) {
+        match refs_of.get(keys[k]) {
+          Some(r) => {
+            let mut j = 0
+            while j < r.length() {
+              if nc.contains(r[j]) {
+                nc.set(keys[k], true)
+                changed = true
+                break
+              }
+              j = j + 1
+            }
+          }
+          None => ()
+        }
+      }
+      k = k + 1
+    }
+  }
+  LnG::{ items: items, nc: nc, inductive_structs: inductive }
+}
+
+///|
+/// Emits the Lean files of every extracted package (packages with nothing in
+/// the `#verify` closure are skipped).
+pub fn lean_emit(res : LlbcResult, diags : Array[Diagnostic]) -> Array[LeanPkgOut] {
+  let g = ln_build_items(res)
+  let outs : Array[LeanPkgOut] = []
+  let mut pi = 0
+  while pi < res.pkgs.length() {
+    let p = res.pkgs[pi]
+    let total = p.structs.length() + p.enums.length() + p.traits.length() + p.impls.length() + p.fns.length() + p.consts.length() + p.externs.length()
+    if total > 0 {
+      let m = lean_module_name(p.name)
+      let tmpl = ln_ext_file(p, "-- External declarations (`#verify_opaque`, `extern \"C\"`) of package `" + p.name + "`.\n-- `" + m + "/FunsExternal.lean` starts as a copy of this template (axioms); replace the\n-- axioms by definitions there if desired: once edited it is never overwritten.\n")
+      let files : Array[LeanFile] = [
+        LeanFile::{ path: m + "/Types.lean", content: ln_types_file(p, g), only_if_absent: false },
+        LeanFile::{ path: m + "/Funs.lean", content: ln_funs_file(p, g, diags), only_if_absent: false },
+        LeanFile::{ path: m + "/FunsExternal_Template.lean", content: tmpl, only_if_absent: false },
+        LeanFile::{ path: m + "/FunsExternal.lean", content: tmpl, only_if_absent: true },
+      ]
+      let ext_names : Array[String] = []
+      let mut i = 0
+      while i < p.externs.length() {
+        ext_names.push(p.externs[i].lean_name)
+        i = i + 1
+      }
+      outs.push(LeanPkgOut::{
+        name: p.name,
+        lean_mod: m,
+        files: files,
+        types: p.structs.length() + p.enums.length() + p.traits.length(),
+        funs: p.fns.length() + p.consts.length() + p.impls.length(),
+        externals: ext_names,
+      })
+    }
+    pi = pi + 1
+  }
+  outs
+}
+
+///|
+/// The `--json` report of `pionc extract-lean`.
+pub fn lean_extract_json(out_dir : String, outs : Array[LeanPkgOut]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("{\"ok\":true,\"out\":")
+  sb.write_string(json_quote(out_dir))
+  sb.write_string(",\"packages\":[")
+  let mut i = 0
+  while i < outs.length() {
+    let o = outs[i]
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("{\"name\":" + json_quote(o.name) + ",\"lean_mod\":" + json_quote(o.lean_mod) + ",\"files\":[")
+    let mut j = 0
+    while j < o.files.length() {
+      if j > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(json_quote(o.files[j].path))
+      j = j + 1
+    }
+    sb.write_string("],\"types\":" + o.types.to_string() + ",\"funs\":" + o.funs.to_string() + ",\"externals\":[")
+    j = 0
+    while j < o.externals.length() {
+      if j > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(json_quote(o.externals[j]))
+      j = j + 1
+    }
+    sb.write_string("]}")
+    i = i + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
+}
+
+///|
+/// Front door used by the CLI and the tests: LLBC + Lean files for checked
+/// packages (upstream first). Diagnostics (unsupported constructs) are
+/// appended to `diags`; nothing should be written when any is reported.
+pub fn lean_extract(inputs : Array[LlbcInput], diags : Array[Diagnostic]) -> Array[LeanPkgOut] {
+  let res = llbc_build(inputs)
+  let mut i = 0
+  while i < res.diagnostics.length() {
+    diags.push(res.diagnostics[i])
+    i = i + 1
+  }
+  lean_emit(res, diags)
+}

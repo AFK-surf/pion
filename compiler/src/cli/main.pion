@@ -8752,6 +8752,7 @@ fn drv_usage_text() -> String {
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
   "  pionc test [--json] [--package <name>|-p <name>] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
   "  pionc doc [--json] [input1 ...]\n" +
+  "  pionc extract-lean --out <dir> [--pkg <name>] [--json] [input]\n" +
   "  pionc init [--template cli|service|invar-app] [--json] <dir>\n" +
   "  pionc fetch [--json] [dir]\n" +
   "  pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]\n" +
@@ -8803,6 +8804,9 @@ pub fn main(world : World) -> Int {
   }
   if cmd == "doctor" {
     return drv_run_doctor_cmd(world, args)
+  }
+  if cmd == "extract-lean" {
+    return drv_run_extract_lean_cmd(world, args)
   }
   if cmd == "cache" {
     return drv_run_cache_cmd(world, args)
@@ -9431,5 +9435,213 @@ pub fn main(world : World) -> Int {
   } else {
     drv_usage(world)
     return 1
+  }
+}
+
+///|
+/// `pionc extract-lean --out <dir> [--pkg <name>] [--json] [path]` (SPEC §5.5):
+/// type-checks (including the `#verify` rules) a file, package directory or
+/// workspace, builds the Pion-LLBC of its `#verify` closure and writes one
+/// `<out>/<Pkg>/{Types,Funs,FunsExternal_Template}.lean` set per extracted
+/// package (and `FunsExternal.lean` when it does not exist yet). Nothing is
+/// written when any diagnostic is reported.
+fn drv_run_extract_lean_cmd(world : World, args : Array[String]) -> Int {
+  let mut as_json = false
+  let mut out_dir = ""
+  let mut only_pkg = ""
+  let targets : Array[String] = []
+  let mut i = 2
+  while i < args.length() {
+    let a = args[i]
+    if a == "--json" {
+      as_json = true
+    } else if a == "--out" && i + 1 < args.length() {
+      out_dir = args[i + 1]
+      i = i + 1
+    } else if drv_starts_with(a, "--out=") {
+      out_dir = slice_str(a, 6, a.length())
+    } else if (a == "--pkg" || a == "--package" || a == "-p") && i + 1 < args.length() {
+      only_pkg = args[i + 1]
+      i = i + 1
+    } else {
+      targets.push(a)
+    }
+    i = i + 1
+  }
+  if out_dir.length() == 0 {
+    return drv_cmd_fail(world, as_json, "extract-lean requires --out <dir>")
+  }
+  if targets.length() == 0 {
+    if drv_has_default_project(world) {
+      targets.push(".")
+    } else {
+      return drv_cmd_fail(world, as_json, "no target specified and no pion.toml in current directory")
+    }
+  }
+  let inputs : Array[LlbcInput] = []
+  let diags : Array[Diagnostic] = []
+  let mut handled = false
+  if targets.length() == 1 {
+    match drv_detect_manifest_dir(world, targets[0]) {
+      Some(root_dir) =>
+        match drv_load_workspace_nodes(world, root_dir) {
+          Err(msg) => return drv_cmd_fail(world, as_json, msg)
+          Ok(nodes) => {
+            handled = true
+            let names : Array[String] = []
+            let dep_lists : Array[Array[String]] = []
+            let mut ni = 0
+            while ni < nodes.length() {
+              names.push(nodes[ni].name)
+              dep_lists.push(nodes[ni].deps)
+              ni = ni + 1
+            }
+            let topo = topo_sort_packages(names, dep_lists)
+            if topo.diagnostics.length() > 0 {
+              io_println(world, check_result_to_json(topo.diagnostics))
+              return 1
+            }
+            // With `--pkg`, only that package and its transitive dependencies.
+            let keep : Map[String, Bool] = Map([])
+            if only_pkg.length() > 0 {
+              let stack : Array[String] = [only_pkg]
+              while stack.length() > 0 {
+                let n = match stack.pop() {
+                  Some(x) => x
+                  None => break
+                }
+                if keep.contains(n) {
+                  continue
+                }
+                keep.set(n, true)
+                let mut q = 0
+                while q < nodes.length() {
+                  if nodes[q].name == n {
+                    let mut di = 0
+                    while di < nodes[q].deps.length() {
+                      stack.push(nodes[q].deps[di])
+                      di = di + 1
+                    }
+                  }
+                  q = q + 1
+                }
+              }
+              if !l_name_in(names, only_pkg) {
+                return drv_cmd_fail(world, as_json, "unknown package `" + only_pkg + "`")
+              }
+            }
+            let imported : Array[ImportedPkg] = []
+            let mut k = 0
+            while k < topo.order.length() {
+              let node = nodes[topo.order[k]]
+              if only_pkg.length() == 0 || keep.contains(node.name) {
+                let cr = check_source_files_with_imports(node.name, node.paths, node.sources, imported, true)
+                let mut di = 0
+                while di < cr.diagnostics.length() {
+                  diags.push(cr.diagnostics[di])
+                  di = di + 1
+                }
+                imported.push(ImportedPkg::{ name: node.name, tc: cr.tc })
+                inputs.push(llbc_input_new(node.name, cr.pkg, cr.tc, only_pkg.length() == 0 || node.name == only_pkg))
+              }
+              k = k + 1
+            }
+          }
+        }
+      None => ()
+    }
+  }
+  if !handled {
+    match drv_load_targets(world, targets) {
+      Err(msg) => return drv_cmd_fail(world, as_json, msg)
+      Ok(loaded) => {
+        let cr = check_source_files_full(loaded.pkg_name, loaded.paths, loaded.sources)
+        let mut di = 0
+        while di < cr.diagnostics.length() {
+          diags.push(cr.diagnostics[di])
+          di = di + 1
+        }
+        inputs.push(llbc_input_new(loaded.pkg_name, cr.pkg, cr.tc, true))
+      }
+    }
+  }
+  if diags.length() > 0 {
+    drv_print_extract_diags(world, as_json, diags)
+    return 1
+  }
+  let outs = lean_extract(inputs, diags)
+  if diags.length() > 0 {
+    drv_print_extract_diags(world, as_json, diags)
+    return 1
+  }
+  let mut oi = 0
+  while oi < outs.length() {
+    let o = outs[oi]
+    let _ = fs_mkdir_p(world, drv_join_path(out_dir, o.lean_mod))
+    // `FunsExternal.lean` is the user's: it is (re)written only when absent or
+    // still identical to the previously generated template (never edited).
+    let old_tmpl = match fs_read(world, drv_join_path(out_dir, o.lean_mod + "/FunsExternal_Template.lean")) {
+      Ok(t) => t
+      Err(_) => ""
+    }
+    let mut fi = 0
+    while fi < o.files.length() {
+      let f = o.files[fi]
+      let path = drv_join_path(out_dir, f.path)
+      let mut write = !f.only_if_absent || !fs_exists(world, path)
+      if !write && old_tmpl.length() > 0 {
+        match fs_read(world, path) {
+          Ok(cur) => write = cur == old_tmpl
+          Err(_) => ()
+        }
+      }
+      if write {
+        if !drv_write_text_atomic(world, path, f.content) {
+          return drv_cmd_fail(world, as_json, "failed to write " + path)
+        }
+      }
+      fi = fi + 1
+    }
+    oi = oi + 1
+  }
+  if as_json {
+    io_println(world, lean_extract_json(out_dir, outs))
+  } else {
+    oi = 0
+    while oi < outs.length() {
+      let o = outs[oi]
+      io_println(
+        world,
+        "extracted " + o.name + " -> " + drv_join_path(out_dir, o.lean_mod) + " (types=" + o.types.to_string() + ", funs=" + o.funs.to_string() + ", externals=" + o.externals.length().to_string() + ")",
+      )
+      oi = oi + 1
+    }
+  }
+  0
+}
+
+///|
+fn l_name_in(names : Array[String], n : String) -> Bool {
+  let mut i = 0
+  while i < names.length() {
+    if names[i] == n {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn drv_print_extract_diags(world : World, as_json : Bool, diags : Array[Diagnostic]) -> Unit {
+  if as_json {
+    io_println(world, check_result_to_json(diags))
+  } else {
+    let mut i = 0
+    while i < diags.length() {
+      let d = diags[i]
+      io_eprintln(world, d.file + ":" + d.line.to_string() + ":" + d.col.to_string() + ": " + d.code + ": " + d.message)
+      i = i + 1
+    }
   }
 }
