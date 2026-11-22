@@ -11,6 +11,7 @@
 #define CPU_TYPE_ARM64         0x0100000cu
 #define CPU_SUBTYPE_ARM64_ALL  0x00000000u
 #define MH_OBJECT              0x00000001u
+#define MH_SUBSECTIONS_VIA_SYMBOLS 0x00002000u
 
 #define LC_SYMTAB              0x00000002u
 #define LC_DYSYMTAB            0x0000000bu
@@ -2105,7 +2106,7 @@ arm64_macho_finish(FILE *outf)
 	hdr.filetype = MH_OBJECT;
 	hdr.ncmds = 4;
 	hdr.sizeofcmds = sizeofcmds;
-	hdr.flags = 0;
+	hdr.flags = MH_SUBSECTIONS_VIA_SYMBOLS;
 	buf_put(&out, &hdr, sizeof hdr);
 
 	SegmentCmd64 seg;

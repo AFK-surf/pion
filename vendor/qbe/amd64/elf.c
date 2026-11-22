@@ -127,6 +127,7 @@ typedef struct {
 	uint64_t flags;
 	uint64_t align;
 	int is_nobits;
+	int has_sym;
 	Buf buf;
 	uint64_t nb_size;
 	Reloc *relocs;
@@ -177,6 +178,7 @@ typedef struct {
 	Sec *secs;
 	size_t nsecs;
 	size_t cap_secs;
+	int cur_text_sec;
 
 	SymEnt *syms;
 	size_t nsyms;
@@ -311,6 +313,28 @@ add_sec(const char *name, uint32_t type, uint64_t flags, uint64_t align, int is_
 	s->align = align ? align : 1;
 	s->is_nobits = is_nobits;
 	return (int)(E0.nsecs++);
+}
+
+static void
+make_subsec_name(char *dst, size_t cap, const char *prefix, const char *raw)
+{
+	size_t plen = strlen(prefix);
+	if (plen + 1 >= cap) {
+		dst[0] = '\0';
+		return;
+	}
+	memcpy(dst, prefix, plen);
+	const char *p = raw;
+	size_t rlen = strlen(raw);
+	if (rlen >= 2 && p[0] == '"' && p[rlen - 1] == '"') {
+		p++;
+		rlen -= 2;
+	}
+	size_t avail = cap - plen - 1;
+	if (rlen > avail)
+		rlen = avail;
+	memcpy(dst + plen, p, rlen);
+	dst[plen + rlen] = '\0';
 }
 
 static uint64_t
@@ -468,6 +492,8 @@ sym_define(const char *raw, int sec_idx, uint64_t offset, int is_export, uint8_t
 	e->sec_idx = sec_idx;
 	e->offset = offset;
 	e->st_type = st_type;
+	if (sec_idx >= 0)
+		E0.secs[sec_idx].has_sym = 1;
 	if (is_export)
 		e->is_export = 1;
 	return idx;
@@ -501,13 +527,13 @@ is_xmm(int r)
 static inline Buf *
 text_buf(void)
 {
-	return &E0.secs[SEC_TEXT].buf;
+	return &E0.secs[E0.cur_text_sec].buf;
 }
 
 static inline uint32_t
 text_pos(void)
 {
-	return (uint32_t)E0.secs[SEC_TEXT].buf.len;
+	return (uint32_t)E0.secs[E0.cur_text_sec].buf.len;
 }
 
 static inline void
@@ -862,7 +888,7 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 		emit_u8((uint8_t)((reg_lo << 3) | 5u));
 		uint32_t disp_off = text_pos();
 		if (rm.sym != SYM_NONE) {
-			sec_add_reloc(SEC_TEXT, disp_off, rm.sym, rm.rel_type,
+			sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type,
 				rm.disp - 4 - imm_bytes);
 			emit_u32(0);
 		} else {
@@ -874,7 +900,7 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 		emit_u8(0x25);
 		uint32_t disp_off = text_pos();
 		if (rm.sym != SYM_NONE) {
-			sec_add_reloc(SEC_TEXT, disp_off, rm.sym, rm.rel_type, rm.disp);
+			sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type, rm.disp);
 			emit_u32(0);
 		} else {
 			emit_u32((uint32_t)(int32_t)rm.disp);
@@ -886,7 +912,7 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 		emit_u8((uint8_t)((scale_bits(rm.scale) << 6) | ((rm.index & 7) << 3) | 5u));
 		uint32_t disp_off = text_pos();
 		if (rm.sym != SYM_NONE) {
-			sec_add_reloc(SEC_TEXT, disp_off, rm.sym, rm.rel_type, rm.disp);
+			sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type, rm.disp);
 			emit_u32(0);
 		} else {
 			emit_u32((uint32_t)(int32_t)rm.disp);
@@ -914,7 +940,7 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 		} else if (mod == 2) {
 			uint32_t disp_off = text_pos();
 			if (rm.sym != SYM_NONE) {
-				sec_add_reloc(SEC_TEXT, disp_off, rm.sym, rm.rel_type, rm.disp);
+				sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type, rm.disp);
 				emit_u32(0);
 			} else {
 				emit_u32((uint32_t)(int32_t)rm.disp);
@@ -1648,7 +1674,7 @@ emitins(Ins i, EF *e)
 			uint32_t sym = sym_ref_qbe(str(con->sym.id));
 			emit_u8(0xe8);
 			uint32_t disp_off = text_pos();
-			sec_add_reloc(SEC_TEXT, disp_off, sym, R_X86_64_PLT32, con->bits.i - 4);
+			sec_add_reloc(E0.cur_text_sec, disp_off, sym, R_X86_64_PLT32, con->bits.i - 4);
 			emit_u32(0);
 			break;
 		}
@@ -1763,7 +1789,7 @@ emitjtbl(Blk *b, EF *e)
 	emit_modrm(0, 0, 0, 0xff, -1, 4, rm_reg(r11), 0, 0);
 
 	/* Align inline 32-bit offset table to 4 bytes */
-	sec_align(SEC_TEXT, 4);
+	sec_align(E0.cur_text_sec, 4);
 	uint32_t tbl_base_off = text_pos();
 
 	/* Patch leaq disp32 */
@@ -1779,6 +1805,8 @@ emitjtbl(Blk *b, EF *e)
 
 /* ---- Function emission ---- */
 
+static int resolve_custom_sec(const char *sec_str, const char *secf_str);
+
 void
 amd64_elf_fn(Fn *fn)
 {
@@ -1789,10 +1817,19 @@ amd64_elf_fn(Fn *fn)
 	uint64_t al = fn->lnk.align > 0 ? (uint64_t)fn->lnk.align : 16ULL;
 	if (al < 16)
 		al = 16;
-	sec_align(SEC_TEXT, al);
+	int fn_sec = SEC_TEXT;
+	if (fn->lnk.sec) {
+		fn_sec = resolve_custom_sec(fn->lnk.sec, fn->lnk.secf);
+	} else if (E0.nsecs < 28000 && fn->name[0] != '\0') {
+		char sname[224];
+		make_subsec_name(sname, sizeof sname, ".text.", fn->name);
+		fn_sec = add_sec(sname, SHT_PROGBITS, SHF_ALLOC | SHF_EXECINSTR, al, 0);
+	}
+	E0.cur_text_sec = fn_sec;
+	sec_align(E0.cur_text_sec, al);
 
-	uint64_t fn_start = sec_size(&E0.secs[SEC_TEXT]);
-	uint32_t fn_sym = sym_define(fn->name, SEC_TEXT, fn_start, fn->lnk.export, STT_FUNC);
+	uint64_t fn_start = sec_size(&E0.secs[E0.cur_text_sec]);
+	uint32_t fn_sym = sym_define(fn->name, E0.cur_text_sec, fn_start, fn->lnk.export, STT_FUNC);
 
 	/* endbr64 */
 	emit_u8(0xf3);
@@ -1847,7 +1884,7 @@ amd64_elf_fn(Fn *fn)
 				if (b->pred[p]->id >= b->id)
 					break;
 			if (p != b->npred)
-				sec_align(SEC_TEXT, 16);
+				sec_align(E0.cur_text_sec, 16);
 		}
 		blk_off[b->id] = text_pos();
 
@@ -1953,7 +1990,7 @@ amd64_elf_fn(Fn *fn)
 		patch_u32(code + jf->entry_off, (uint32_t)(int32_t)diff);
 	}
 
-	E0.syms[fn_sym].size = sec_size(&E0.secs[SEC_TEXT]) - fn_start;
+	E0.syms[fn_sym].size = sec_size(&E0.secs[E0.cur_text_sec]) - fn_start;
 
 	free(blk_off);
 	free(e.fixups);
@@ -2058,11 +2095,26 @@ static int
 dat_open_sec(int default_sec)
 {
 	int sec_idx = default_sec;
-
-	if (E0.dat_sec_str)
-		sec_idx = resolve_custom_sec(E0.dat_sec_str, E0.dat_secf_str);
-
 	uint64_t al = E0.dat_lnk.align > 0 ? (uint64_t)E0.dat_lnk.align : 1ULL;
+
+	if (E0.dat_sec_str) {
+		sec_idx = resolve_custom_sec(E0.dat_sec_str, E0.dat_secf_str);
+	} else if (!E0.dat_lnk.thread && !E0.dat_lnk.common && E0.nsecs < 28000 &&
+	    E0.dat_name && E0.dat_name[0] != '\0' &&
+	    (default_sec == SEC_RODATA || default_sec == SEC_DATA || default_sec == SEC_BSS)) {
+		char sname[224];
+		if (default_sec == SEC_RODATA) {
+			make_subsec_name(sname, sizeof sname, ".rodata.", E0.dat_name);
+			sec_idx = add_sec(sname, SHT_PROGBITS, SHF_ALLOC, al, 0);
+		} else if (default_sec == SEC_DATA) {
+			make_subsec_name(sname, sizeof sname, ".data.", E0.dat_name);
+			sec_idx = add_sec(sname, SHT_PROGBITS, SHF_ALLOC | SHF_WRITE, al, 0);
+		} else {
+			make_subsec_name(sname, sizeof sname, ".bss.", E0.dat_name);
+			sec_idx = add_sec(sname, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, al, 1);
+		}
+	}
+
 	sec_align(sec_idx, al);
 	E0.dat_start_off = sec_size(&E0.secs[sec_idx]);
 	uint8_t st_type = E0.dat_lnk.thread ? STT_TLS : STT_OBJECT;
@@ -2202,6 +2254,7 @@ amd64_elf_begin(void)
 	add_sec(".bss",    SHT_NOBITS,   SHF_ALLOC | SHF_WRITE,      1, 1);
 	add_sec(".tdata",  SHT_PROGBITS, SHF_ALLOC | SHF_WRITE | SHF_TLS, 1, 0);
 	add_sec(".tbss",   SHT_NOBITS,   SHF_ALLOC | SHF_WRITE | SHF_TLS, 1, 1);
+	E0.cur_text_sec = SEC_TEXT;
 }
 
 static uint32_t
@@ -2231,7 +2284,7 @@ amd64_elf_finish(FILE *outf)
 	uint32_t shndx = 1;
 	for (size_t i = 0; i < E0.nsecs; i++) {
 		Sec *s = &E0.secs[i];
-		if (sec_size(s) > 0 || i == SEC_TEXT) {
+		if (sec_size(s) > 0 || s->has_sym || i == SEC_TEXT) {
 			s->out_shndx = shndx++;
 			s->sh_name_off = strtab_add(&shstrtab, s->name);
 		} else {
@@ -2246,7 +2299,7 @@ amd64_elf_finish(FILE *outf)
 	for (size_t i = 0; i < E0.nsecs; i++) {
 		Sec *s = &E0.secs[i];
 		if (s->out_shndx && s->nrelocs > 0) {
-			char rname[160];
+			char rname[256];
 			snprintf(rname, sizeof rname, ".rela%s", s->name);
 			s->rela_sh_name_off = strtab_add(&shstrtab, rname);
 			shndx++;

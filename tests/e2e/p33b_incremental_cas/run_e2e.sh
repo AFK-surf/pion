@@ -376,4 +376,63 @@ if [ "$UOUT3" != "u=123" ]; then
   exit 1
 fi
 
-echo "p33b_incremental_cas: ALL PASSED (check 6/6 cold->warm->body-edit->err-no-cache + wasm32 5-pkg .ssa/.wasm CAS + P34-B single-pkg unit CAS soundness)"
+# --- 7. Linker dead-code & dead-data section GC (P35-B) ---
+# Large unreferenced function + 64 KB dead string literal in a dependency package
+# must be stripped by `-Wl,--gc-sections` (Linux ELF64 per-fn/per-data sections)
+# and `-dead_strip` / `-Wl,-dead_strip` (macOS Mach-O).
+GC_WS="$TMP_DIR/gc_ws"
+mkdir -p "$GC_WS/deadlib/src" "$GC_WS/deadapp/src"
+cat > "$GC_WS/deadlib/pion.toml" <<'EOF'
+[package]
+name = "deadlib"
+version = "0.1.0"
+EOF
+python3 - "$GC_WS/deadlib/src/lib.pion" <<'PYEOF'
+import sys
+payload = "DEAD_SENTINEL_P35B_" + ("Z" * 65536)
+with open(sys.argv[1], "w") as f:
+    f.write('pub fn live_calc(x : Int) -> Int {\n  x * 3 + 1\n}\n\n')
+    f.write('pub fn dead_heavy_fn(x : Int) -> Int {\n')
+    f.write(f'  let big = "{payload}"\n')
+    f.write('  big.length() + x\n')
+    f.write('}\n')
+PYEOF
+cat > "$GC_WS/deadapp/pion.toml" <<'EOF'
+[package]
+name = "deadapp"
+version = "0.1.0"
+
+[dependencies]
+deadlib = { path = "../deadlib" }
+EOF
+cat > "$GC_WS/deadapp/src/main.pion" <<'EOF'
+import "deadlib" as deadlib
+
+pub fn main(world : World) -> Int {
+  io_println(world, "gc=" + deadlib::live_calc(14).to_string())
+  0
+}
+EOF
+
+GC_BIN="$TMP_DIR/gc_app"
+"$PIONC" build --release -o "$GC_BIN" "$GC_WS/deadapp"
+GC_OUT="$("$GC_BIN")"
+if [ "$GC_OUT" != "gc=43" ]; then
+  echo "FAIL: P35-B gc_app output mismatch: expected 'gc=43', got '$GC_OUT'" >&2
+  exit 1
+fi
+if grep -a -q "DEAD_SENTINEL_P35B_" "$GC_BIN"; then
+  echo "FAIL: P35-B dead 64 KB string literal was NOT stripped from $GC_BIN" >&2
+  exit 1
+fi
+if command -v nm >/dev/null 2>&1 && nm "$GC_BIN" 2>/dev/null | grep -q "dead_heavy_fn"; then
+  echo "FAIL: P35-B dead_heavy_fn symbol was NOT stripped from $GC_BIN" >&2
+  exit 1
+fi
+GC_SIZE="$(wc -c < "$GC_BIN" | tr -d ' ')"
+if [ "$GC_SIZE" -ge 131072 ]; then
+  echo "FAIL: P35-B gc_app size too large (${GC_SIZE} B >= 131072 B)" >&2
+  exit 1
+fi
+
+echo "p33b_incremental_cas: ALL PASSED (check 6/6 cold->warm->body-edit->err-no-cache + wasm32 5-pkg .ssa/.wasm CAS + P34-B single-pkg unit CAS soundness + P35-B section GC size=${GC_SIZE}B)"
