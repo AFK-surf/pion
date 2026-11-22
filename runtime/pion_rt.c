@@ -499,7 +499,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void *pion_slab_raw_alloc_slow(size_
     return p;
 }
 
-static void *pion_slab_raw_alloc(size_t bytes) {
+static PION_NOINLINE PION_MINSIZE void *pion_slab_raw_alloc(size_t bytes) {
 #if PION_USE_SLAB
     if (__builtin_expect(
             !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
@@ -540,7 +540,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_slab_raw_free_slow(void *p
     free(ptr);
 }
 
-static PION_NOINLINE void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
+static PION_NOINLINE PION_MINSIZE void pion_slab_raw_free(void *ptr, size_t bytes, int is_frozen) {
     if (!ptr) return;
 #if PION_USE_SLAB
     if (__builtin_expect(
@@ -699,7 +699,7 @@ void pion_destroy_obj(void *obj) {
     pion_destroy(pion_hdr(obj), obj);
 }
 
-PION_HOT void pion_rc_inc(void *obj) {
+PION_NOINLINE PION_HOT void pion_rc_inc(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
     if (hdr->flags & PION_FLAG_IMMORTAL) return;
@@ -715,7 +715,7 @@ PION_HOT void pion_rc_inc(void *obj) {
     atomic_fetch_add_explicit(&hdr->shared_rc, 1, memory_order_relaxed);
 }
 
-PION_HOT void pion_rc_dec(void *obj) {
+PION_NOINLINE PION_HOT void pion_rc_dec(void *obj) {
     if (!obj) return;
     PionHeader *hdr = pion_hdr(obj);
     if (hdr->flags & PION_FLAG_IMMORTAL) return;
@@ -877,7 +877,7 @@ static inline void pion_copy_short(char *dst, const char *src, size_t n) {
     memcpy(dst, src, n);
 }
 
-PION_HOT void *pion_str_from_cstr(const char *s, int64_t len) {
+PION_NOINLINE PION_HOT void *pion_str_from_cstr(const char *s, int64_t len) {
     if (!s) {
         len = 0;
     } else if (len < 0) {
@@ -986,7 +986,7 @@ static inline __attribute__((always_inline)) int32_t pion_str_eq_fast(const Pion
     return memcmp(a + 8, b + 8, n - 8) == 0 ? 1 : 0;
 }
 
-PION_HOT int32_t pion_str_eq(void *a, void *b) {
+PION_NOINLINE PION_HOT int32_t pion_str_eq(void *a, void *b) {
     return pion_str_eq_fast((const PionString *)a, (const PionString *)b);
 }
 
@@ -1209,6 +1209,9 @@ void *pion_str_split(void *s, void *sep) {
     while (pos <= sl) {
         const char *p = base + pos;
         const char *fast_lim = (lim - p > 16) ? p + 16 : lim;
+#if defined(__clang__)
+#pragma clang loop unroll(disable) vectorize(disable)
+#endif
         while (p < fast_lim && (unsigned char)*p != (unsigned char)sep_ch) {
             p++;
         }
@@ -1611,6 +1614,9 @@ static void pion_arr_drop(void *payload) {
         __builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
         int64_t *data = a->data;
         int64_t n = a->len;
+#if defined(__clang__)
+#pragma clang loop unroll(disable) vectorize(disable)
+#endif
         for (int64_t i = 0; i < n; i++) {
             void *e = (void *)(uintptr_t)data[i];
             if (!e) continue;
@@ -1929,7 +1935,7 @@ static inline uint64_t pion_str_hash(const PionString *s) {
     return h;
 }
 
-static inline uint64_t pion_map_key_hash(const PionMap *m, const void *k) {
+static PION_NOINLINE uint64_t pion_map_key_hash(const PionMap *m, const void *k) {
     if (m->key_is_int) {
         uint64_t x = (uint64_t)(uintptr_t)k;
         uint64_t h = (x * 0x9E3779B97F4A7C15ULL) ^ (x >> 32);
@@ -1938,9 +1944,9 @@ static inline uint64_t pion_map_key_hash(const PionMap *m, const void *k) {
     return pion_str_hash((const PionString *)k);
 }
 
-/* Shared inline linear-probe hot path: returns matching occupied slot or first empty slot.
+/* Shared linear-probe hot path: returns matching occupied slot or first empty slot.
  * Caller must ensure m->cap > 0, m->entries != NULL, and (m->key_is_int || k != NULL). */
-static inline PionMapEntry *pion_map_probe(const PionMap *m, const PionString *k, uint64_t h) {
+static PION_NOINLINE PionMapEntry *pion_map_probe(const PionMap *m, const PionString *k, uint64_t h) {
     uint64_t mask = (uint64_t)(m->cap - 1);
     uint64_t idx = h & mask;
     PionMapEntry *entries = m->entries;
