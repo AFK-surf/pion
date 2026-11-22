@@ -172,6 +172,12 @@ if [ "$OK_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
   echo "FAIL: ok_full.pion expected ok:true" >&2
   exit 1
 fi
+OKV_OUT=$("$PIONC2" check --json "$ROOT_DIR/tests/frontend/ok_verify_mut.pion")
+printf 'ok_verify_mut.pion -> %s\n' "$OKV_OUT"
+if [ "$OKV_OUT" != '{"ok":true,"diagnostics":[]}' ]; then
+  echo "FAIL: ok_verify_mut.pion expected ok:true" >&2
+  exit 1
+fi
 
 expect_err_code_pionc2() {
   fixture="$1"
@@ -198,6 +204,40 @@ expect_err_code_pionc2 "err_non_exhaustive.pion" "E_NON_EXHAUSTIVE"
 expect_err_code_pionc2 "err_not_send.pion" "E_NOT_SEND"
 expect_err_code_pionc2 "err_use_after_move.pion" "E_USE_AFTER_MOVE"
 expect_err_code_pionc2 "err_capability_missing.pion" "E_CAPABILITY_MISSING"
+expect_err_code_pionc2 "err_verify_unsupported.pion" "E_VERIFY_UNSUPPORTED"
+expect_err_code_pionc2 "err_verify_move.pion" "E_VERIFY_MOVE"
+expect_err_code_pionc2 "err_verify_borrow_escape.pion" "E_VERIFY_BORROW_ESCAPE"
+expect_err_code_pionc2 "err_verify_mut_escape.pion" "E_VERIFY_MUT_ESCAPE"
+expect_err_code_pionc2 "err_verify_aliasing.pion" "E_VERIFY_ALIASING"
+expect_err_code_pionc2 "err_verify_closure_capture.pion" "E_VERIFY_CLOSURE_CAPTURE"
+expect_err_code_pionc2 "err_verify_unverified_callee.pion" "E_VERIFY_UNVERIFIED_CALLEE"
+
+# `pionc extract-lean` CLI protocol (no Lean toolchain needed; the Lean side is scripts/test-lean.sh).
+LEAN_OUT_DIR="$TMP_DIR/lean_extract"
+EXTRACT_OUT=$("$PIONC2" extract-lean --json --out "$LEAN_OUT_DIR" "$ROOT_DIR/tests/lean/algos")
+printf 'extract-lean tests/lean/algos -> %s\n' "$EXTRACT_OUT"
+if ! printf '%s' "$EXTRACT_OUT" | grep -q '"ok":true' ||
+  ! printf '%s' "$EXTRACT_OUT" | grep -q '"lean_mod":"Algos"' ||
+  ! printf '%s' "$EXTRACT_OUT" | grep -q '"lean_mod":"Vlib"'; then
+  echo "FAIL: pionc2 extract-lean tests/lean/algos" >&2
+  exit 1
+fi
+for f in Algos/Types.lean Algos/Funs.lean Algos/FunsExternal.lean Algos/FunsExternal_Template.lean Vlib/Types.lean Vlib/Funs.lean; do
+  if [ ! -s "$LEAN_OUT_DIR/$f" ]; then
+    echo "FAIL: extract-lean did not write $f" >&2
+    exit 1
+  fi
+done
+if "$PIONC2" extract-lean --json "$ROOT_DIR/tests/lean/algos" > /dev/null 2>&1; then
+  echo "FAIL: extract-lean without --out must fail" >&2
+  exit 1
+fi
+EXTRACT_ERR=$("$PIONC2" extract-lean --json --out "$TMP_DIR/lean_err" "$ROOT_DIR/tests/frontend/err_verify_move.pion" || true)
+if ! printf '%s' "$EXTRACT_ERR" | grep -q 'E_VERIFY_MOVE' || [ -e "$TMP_DIR/lean_err" ]; then
+  echo "FAIL: extract-lean must report diagnostics and write nothing: $EXTRACT_ERR" >&2
+  exit 1
+fi
+echo "pionc2 extract-lean --json: PASS"
 
 DEFS_OUT=$("$PIONC2" query defs --json "$ROOT_DIR/tests/frontend/ok_full.pion")
 SIG_OUT=$("$PIONC2" query sig --json "$ROOT_DIR/tests/frontend/ok_full.pion")

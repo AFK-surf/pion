@@ -169,6 +169,8 @@ sh "$ROOT_DIR/tests/e2e/p32b_workspace/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p32c_abi_fp_stack/run_e2e.sh" "$PIONC2"
 # P33-B: multi-package incremental CAS for `pionc check` (.pionsig/.pionstub) & `pionc build --target wasm32` (.ssa/.wasm).
 sh "$ROOT_DIR/tests/e2e/p33b_incremental_cas/run_e2e.sh" "$PIONC2"
+# P35-A: second-class `mut` parameters, `mut self`, `#verify` rules and runtime checks (native + ASan/LSan + Wasm32, cross-package `[verify]`).
+sh "$ROOT_DIR/tests/e2e/p35a_verify_mut/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent

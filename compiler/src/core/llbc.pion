@@ -1,0 +1,3921 @@
+///| Pion-LLBC (SPEC §3.5): the structured, fully desugared verification IR
+///| built from the `#verify` closure of a checked workspace, consumed by the
+///| Lean 4 emitter (`lean.pion`). It only exists for `pionc extract-lean`;
+///| ordinary compilation never builds it.
+///|
+///| Shape:
+///|   - every expression is split into pure trees (`LExpr`: literals, variables,
+///|     wrapping arithmetic, comparisons, field / tuple reads, constructors) and
+///|     monadic steps (`LStmt`), in strict left-to-right evaluation order
+///|     (ANF on everything that may fail or write: calls, `/ % << >>`, indexing,
+///|     `?`, `mut` arguments);
+///|   - control flow is `LSIf` / `LSMatch` (optionally producing a value into a
+///|     destination variable), `LSLoop` (infinite loop left by `LSBreak` /
+///|     `LSReturn`), `LSBreak`, `LSContinue`, `LSReturn`;
+///|   - `for`, `while`, `guard`, `?`, compound assignment, named / default /
+///|     optional arguments, leading-dot variants, `..base`, tuple destructuring,
+///|     `is` in conditions, literal patterns and match guards are gone;
+///|   - every binding has a function-unique name and a type (`LFnDef.var_tys`);
+///|   - struct / enum / trait names are globally qualified (`pkg::Name`).
+
+///|
+pub enum LExpr {
+  /// A variable (function-unique name) and its type.
+  LVar(String, Ty)
+  /// A literal: kind (`int`, `int64`, `uint`, `uint64`, `byte`, `bool`, `char`,
+  /// `string`, `unit`), its canonical text (decimal value / decoded string /
+  /// code point) and type.
+  LLit(String, String, Ty)
+  /// Pure binary operator: op, lhs, rhs, operand type.
+  LBin(String, LExpr, LExpr, Ty)
+  /// Pure unary operator (`-`, `!`): op, operand, operand type.
+  LUn(String, LExpr, Ty)
+  /// Struct field read: object, field, struct type, field type.
+  LField(LExpr, String, Ty, Ty)
+  /// Tuple element read: tuple, index, tuple type.
+  LTupleGet(LExpr, Int, Ty)
+  /// Enum / `Option` / `Result` constructor: enum key (`pkg::E`, `Option`,
+  /// `Result`), variant, payload, constructed type.
+  LCtor(String, String, Array[LExpr], Ty)
+  /// Struct literal in declaration field order: struct key, fields, type.
+  LStruct(String, Array[LExpr], Ty)
+  /// Tuple literal.
+  LTuple(Array[LExpr], Ty)
+  /// Array / FixedArray literal.
+  LArrayLit(Array[LExpr], Ty)
+  /// Pure builtin call (`Pion.Array.push`, `Pion.I32.to_int64`, ...): Lean
+  /// function, arguments, result type.
+  LPure(String, Array[LExpr], Ty)
+  /// Pure conditional (both branches pure): cond, then, else, type.
+  LIte(LExpr, LExpr, LExpr, Ty)
+  /// Reference to a pure constant item (`pkg::NAME`).
+  LConstRef(String, Ty)
+}
+
+///|
+/// A call argument after `call_arg_order` resolution.
+pub enum LArg {
+  AVal(LExpr)
+  /// `mut <place>`: the place's value is read before the call into the
+  /// expression, and written back from the returned tuple afterwards.
+  AMut(LExpr)
+}
+
+///|
+/// The callee of an `LSCall`.
+pub enum LCallee {
+  /// A user function / method / impl method / opaque / extern item key, the
+  /// generic instantiation (callee type params, in order) and the trait
+  /// dictionaries to pass (`LDict`).
+  CItem(String, Array[Ty], Array[LDict])
+  /// A trait-bound method on a type parameter: dictionary, method name.
+  CDictMethod(LDict, String)
+  /// A monadic builtin (`Pion.Array.get`, `Pion.I32.div`, ...).
+  CBuiltin(String)
+  /// A non-pure constant item.
+  CConst(String)
+}
+
+///|
+/// A trait dictionary at a call site.
+pub enum LDict {
+  /// The enclosing function's dictionary parameter for `T : Trait`.
+  LDParam(String, String)
+  /// `impl Trait for Type`: impl key (`pkg::Trait::Type`), Self type.
+  LDImpl(String, Ty)
+}
+
+///|
+pub enum LPat {
+  LPWild
+  LPVar(String, Ty)
+  LPBool(Bool)
+  /// Constructor pattern: enum key (`pkg::E`, `Option`, `Result`), variant, payload.
+  LPCtor(String, String, Array[LPat])
+  LPTuple(Array[LPat])
+}
+
+///|
+pub struct LArm {
+  pat : LPat
+  body : LBlock
+}
+
+///|
+pub struct LBlock {
+  stmts : Array[LStmt]
+  /// The block's value (absent: `Unit`, or the block diverges).
+  tail : Option[LExpr]
+}
+
+///|
+pub enum LStmt {
+  /// `let x := e` (pure).
+  LSLet(String, Ty, LExpr)
+  /// `let (a, b, ...) := e` (pure tuple destructuring).
+  LSLetTuple(Array[String], Array[Ty], LExpr)
+  /// `x := e` for an existing mutable variable (pure).
+  LSAssign(String, LExpr)
+  /// `x.f1.f2... := e`: root variable, root type, field path, struct types
+  /// along the path (`types[k]` is the struct holding `path[k]`), value.
+  LSSetField(String, Ty, Array[String], Array[Ty], LExpr)
+  /// A monadic call: destination (`""`: discarded), result type, callee,
+  /// arguments, and the variables receiving the final value of each `mut`
+  /// argument (in argument order); `assign` = the destination is an existing
+  /// variable.
+  LSCall(String, Ty, LCallee, Array[LArg], Array[String], Bool)
+  /// `if cond { then } else { else }`; destination (`""`: none) and its type.
+  LSIf(LExpr, LBlock, LBlock, String, Ty)
+  /// `match scrut { arms }` (patterns are plain constructor / tuple / binder
+  /// patterns, exhaustive); destination and its type.
+  LSMatch(LExpr, Ty, Array[LArm], String, Ty)
+  /// `loop { body }`, left by `LSBreak` / `LSReturn`.
+  LSLoop(LBlock)
+  LSBreak
+  LSContinue
+  /// `return e` (the function's declared return value; `mut` parameters are
+  /// packed by the emitter).
+  LSReturn(LExpr)
+  /// `debug_assert(cond, ...)`.
+  LSAssert(LExpr)
+  /// `panic(...)` / unreachable.
+  LSPanic
+}
+
+///|
+pub struct LParam {
+  name : String
+  ty : Ty
+  is_mut : Bool
+}
+
+///|
+/// A trait bound `T : Trait` of a generic item (its dictionary parameter).
+pub struct LBound {
+  tparam : String
+  trait_key : String
+}
+
+///|
+pub struct LFnDef {
+  /// Global item key (`pkg::f`, `pkg::T::m`, `pkg::Trait::T::m`).
+  key : String
+  pkg : String
+  /// Lean name inside the package namespace (`f`, `T.m`, `T.Insts.Trait.m`).
+  lean_name : String
+  type_params : Array[String]
+  bounds : Array[LBound]
+  /// Type parameters compared with `==` / `!=` (`[Pion.Eq T]`).
+  eq_tparams : Array[String]
+  params : Array[LParam]
+  ret_ty : Ty
+  body : LBlock
+  var_tys : Map[String, Ty]
+  /// Item keys this function calls (user functions, constants).
+  callees : Array[String]
+}
+
+///|
+pub struct LExternDef {
+  key : String
+  pkg : String
+  lean_name : String
+  type_params : Array[String]
+  bounds : Array[LBound]
+  eq_tparams : Array[String]
+  params : Array[LParam]
+  ret_ty : Ty
+  /// `#verify_opaque` or `extern "C"`.
+  kind : String
+}
+
+///|
+pub struct LStructDef {
+  key : String
+  pkg : String
+  name : String
+  type_params : Array[String]
+  field_names : Array[String]
+  field_tys : Array[Ty]
+  derive_eq : Bool
+}
+
+///|
+pub struct LVariantDef {
+  name : String
+  field_tys : Array[Ty]
+}
+
+///|
+pub struct LEnumDef {
+  key : String
+  pkg : String
+  name : String
+  type_params : Array[String]
+  variants : Array[LVariantDef]
+  derive_eq : Bool
+}
+
+///|
+pub struct LTraitMethod {
+  name : String
+  /// Parameters after `self` (`Self` appears as `TParam("Self")`).
+  params : Array[LParam]
+  self_mut : Bool
+  ret_ty : Ty
+}
+
+///|
+pub struct LTraitDef {
+  key : String
+  pkg : String
+  name : String
+  methods : Array[LTraitMethod]
+}
+
+///|
+pub struct LImplDef {
+  /// `pkg::Trait::Type`.
+  key : String
+  pkg : String
+  trait_key : String
+  self_ty : Ty
+  type_params : Array[String]
+  /// Method name -> item key of its implementation.
+  method_names : Array[String]
+  method_keys : Array[String]
+}
+
+///|
+pub struct LConstDef {
+  key : String
+  pkg : String
+  lean_name : String
+  ty : Ty
+  /// Pure value (no statements) or a monadic body.
+  body : LBlock
+  is_pure : Bool
+  var_tys : Map[String, Ty]
+  callees : Array[String]
+}
+
+///|
+pub struct LlbcPkg {
+  name : String
+  structs : Array[LStructDef]
+  enums : Array[LEnumDef]
+  traits : Array[LTraitDef]
+  impls : Array[LImplDef]
+  fns : Array[LFnDef]
+  consts : Array[LConstDef]
+  externs : Array[LExternDef]
+  /// Other packages whose items this package's extracted code references.
+  deps : Array[String]
+}
+
+///|
+/// Input of the extractor: one checked package (topological order, upstream first).
+pub struct LlbcInput {
+  name : String
+  pkg : Package
+  tc : TypeChecker
+  /// Whether this package's `#verify` items seed the closure (`--pkg`
+  /// restricts the seeds; its dependencies still provide referenced items).
+  seed : Bool
+}
+
+///|
+pub fn llbc_input_new(name : String, pkg : Package, tc : TypeChecker, seed : Bool) -> LlbcInput {
+  LlbcInput::{ name: name, pkg: pkg, tc: tc, seed: seed }
+}
+
+///|
+pub struct LlbcResult {
+  pkgs : Array[LlbcPkg]
+  diagnostics : Array[Diagnostic]
+}
+
+// ---------------------------------------------------------------------------
+// Global extraction context: packages, the closure worklist and diagnostics.
+// ---------------------------------------------------------------------------
+
+///|
+struct LG {
+  inputs : Array[LlbcInput]
+  pkg_idx : Map[String, Int]
+  queued : Map[String, Bool]
+  work : Array[String]
+  pkgs : Array[LlbcPkg]
+  diags : Array[Diagnostic]
+}
+
+///|
+fn lg_new(inputs : Array[LlbcInput]) -> LG {
+  let g = LG::{
+    inputs: inputs,
+    pkg_idx: Map([]),
+    queued: Map([]),
+    work: [],
+    pkgs: [],
+    diags: [],
+  }
+  let mut i = 0
+  while i < inputs.length() {
+    g.pkg_idx.set(inputs[i].name, i)
+    g.pkgs.push(LlbcPkg::{
+      name: inputs[i].name,
+      structs: [],
+      enums: [],
+      traits: [],
+      impls: [],
+      fns: [],
+      consts: [],
+      externs: [],
+      deps: [],
+    })
+    i = i + 1
+  }
+  g
+}
+
+///|
+fn lg_err(g : LG, sp : Span, msg : String, found : String) -> Unit {
+  g.diags.push(
+    diag_new(
+      sp,
+      "E_EXTRACT_UNSUPPORTED",
+      msg,
+      "a construct supported by `pionc extract-lean` (SPEC §3.5)",
+      found,
+      "rewrite it with supported constructs or mark the function `#verify_opaque`",
+    ),
+  )
+}
+
+///|
+fn lg_enqueue(g : LG, key : String) -> Unit {
+  if !g.queued.contains(key) {
+    g.queued.set(key, true)
+    g.work.push(key)
+  }
+}
+
+///|
+fn lg_tc(g : LG, pkg : String) -> Option[TypeChecker] {
+  match g.pkg_idx.get(pkg) {
+    Some(i) => Some(g.inputs[i].tc)
+    None => None
+  }
+}
+
+///|
+fn lg_pkg_out(g : LG, pkg : String) -> Option[LlbcPkg] {
+  match g.pkg_idx.get(pkg) {
+    Some(i) => Some(g.pkgs[i])
+    None => None
+  }
+}
+
+///|
+fn l_str_contains(arr : Array[String], s : String) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == s {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn l_push_unique(arr : Array[String], s : String) -> Unit {
+  if !l_str_contains(arr, s) {
+    arr.push(s)
+  }
+}
+
+///|
+/// `pkg::Name` (globally qualified) for a struct / enum / trait name as seen
+/// from the checker of `pkg`.
+fn l_gq(pkg : String, name : String) -> String {
+  if has_qual_sep(name) {
+    name
+  } else {
+    pkg + "::" + name
+  }
+}
+
+///|
+/// Globally qualifies every struct / enum name inside `t` (as seen from `pkg`).
+pub fn l_gq_ty(pkg : String, t : Ty) -> Ty {
+  qualify_imported_ty(pkg, t)
+}
+
+///|
+/// Enqueues the struct / enum items a type mentions.
+fn lg_note_ty(g : LG, t : Ty) -> Unit {
+  match t {
+    TArray(e) => lg_note_ty(g, e)
+    TFixedArray(e) => lg_note_ty(g, e)
+    TOption(e) => lg_note_ty(g, e)
+    TResult(a, b) => {
+      lg_note_ty(g, a)
+      lg_note_ty(g, b)
+    }
+    TStruct(name, args) => {
+      lg_enqueue(g, "struct:" + name)
+      let mut i = 0
+      while i < args.length() {
+        lg_note_ty(g, args[i])
+        i = i + 1
+      }
+    }
+    TEnum(name, args) => {
+      lg_enqueue(g, "enum:" + name)
+      let mut i = 0
+      while i < args.length() {
+        lg_note_ty(g, args[i])
+        i = i + 1
+      }
+    }
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        lg_note_ty(g, es[i])
+        i = i + 1
+      }
+    }
+    TFn(ps, r) => {
+      let mut i = 0
+      while i < ps.length() {
+        lg_note_ty(g, ps[i])
+        i = i + 1
+      }
+      lg_note_ty(g, r)
+    }
+    _ => ()
+  }
+}
+
+///|
+/// Looks up a struct by its global name `pkg::Name`.
+fn lg_struct(g : LG, gname : String) -> Option[StructInfo] {
+  let qp = split_qual_name(gname)
+  match lg_tc(g, qp.prefix) {
+    Some(tc) => tc.structs.get(qp.name)
+    None => None
+  }
+}
+
+///|
+fn lg_enum(g : LG, gname : String) -> Option[EnumInfo] {
+  let qp = split_qual_name(gname)
+  match lg_tc(g, qp.prefix) {
+    Some(tc) => tc.enums.get(qp.name)
+    None => None
+  }
+}
+
+///|
+fn lg_trait(g : LG, gname : String) -> Option[TraitInfo] {
+  let qp = split_qual_name(gname)
+  match lg_tc(g, qp.prefix) {
+    Some(tc) => tc.traits.get(qp.name)
+    None => None
+  }
+}
+
+///|
+/// Index of field `f` in struct `si`, or -1.
+fn l_field_index(si : StructInfo, f : String) -> Int {
+  let mut i = 0
+  while i < si.field_names.length() {
+    if si.field_names[i] == f {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+/// Substitutes a generic struct's type arguments into one of its field types.
+fn l_inst(tparams : Array[String], args : Array[Ty], t : Ty) -> Ty {
+  if tparams.length() == 0 {
+    return t
+  }
+  let m : Map[String, Ty] = Map([])
+  let mut i = 0
+  while i < tparams.length() && i < args.length() {
+    m.set(tparams[i], args[i])
+    i = i + 1
+  }
+  subst_ty(t, m)
+}
+
+// ---------------------------------------------------------------------------
+// Per-function lowering context.
+// ---------------------------------------------------------------------------
+
+///|
+/// What a `continue` (and the normal end of a loop body) must run first.
+enum LPrelude {
+  PNone
+  /// `for init; cond; step`: the `step` statement.
+  PStep(Stmt)
+  /// `for i in a..b`: `i = i + 1`.
+  PIncr(String, Ty)
+  /// `for i in a..=b`: `if i == end { done = true } else { i = i + 1 }`.
+  PIncrIncl(String, LExpr, String, Ty)
+  /// `for [k,] x in arr`: `__i = __i + 1`.
+  PIdx(String)
+}
+
+///|
+struct LB {
+  g : LG
+  tc : TypeChecker
+  pkg : String
+  fn_name : String
+  scopes : Array[Map[String, String]]
+  used : Map[String, Bool]
+  var_tys : Map[String, Ty]
+  temps : Map[String, Bool]
+  blocks : Array[Array[LStmt]]
+  preludes : Array[LPrelude]
+  type_params : Array[String]
+  /// Type parameter -> globally qualified trait keys of its bounds.
+  bounds : Map[String, Array[String]]
+  callees : Array[String]
+  mut ret_ty : Ty
+}
+
+///|
+fn lb_new(g : LG, tc : TypeChecker, fn_name : String, type_params : Array[String]) -> LB {
+  let scopes : Array[Map[String, String]] = []
+  scopes.push(Map([]))
+  let blocks : Array[Array[LStmt]] = []
+  blocks.push([])
+  LB::{
+    g: g,
+    tc: tc,
+    pkg: tc.pkg_name,
+    fn_name: fn_name,
+    scopes: scopes,
+    used: Map([]),
+    var_tys: Map([]),
+    temps: Map([]),
+    blocks: blocks,
+    preludes: [],
+    type_params: type_params,
+    bounds: Map([]),
+    callees: [],
+    ret_ty: TUnit,
+  }
+}
+
+///|
+fn lb_err(b : LB, sp : Span, msg : String, found : String) -> Unit {
+  lg_err(b.g, sp, "`" + b.fn_name + "`: " + msg, found)
+}
+
+///|
+fn lb_ty_of(b : LB, t : Ty) -> Ty {
+  let q = l_gq_ty(b.pkg, t)
+  lg_note_ty(b.g, q)
+  q
+}
+
+///|
+/// Checked type of an expression (globally qualified).
+fn lb_expr_ty(b : LB, e : Expr) -> Ty {
+  match b.tc.expr_tys.get(span_key(expr_span(e))) {
+    Some(t) => lb_ty_of(b, t)
+    None => TError
+  }
+}
+
+///|
+fn lb_fresh(b : LB, base : String) -> String {
+  let mut name = base
+  let mut k = 1
+  while b.used.contains(name) {
+    name = base + "_" + k.to_string()
+    k = k + 1
+  }
+  b.used.set(name, true)
+  name
+}
+
+///|
+fn lb_temp(b : LB, ty : Ty) -> String {
+  let n = lb_fresh(b, "__t")
+  b.var_tys.set(n, ty)
+  b.temps.set(n, true)
+  n
+}
+
+///|
+fn lb_declare(b : LB, pion_name : String, ty : Ty) -> String {
+  let base = if pion_name == "_" || pion_name.length() == 0 {
+    "__u"
+  } else {
+    pion_name
+  }
+  let n = lb_fresh(b, base)
+  b.var_tys.set(n, ty)
+  if pion_name != "_" && pion_name.length() > 0 {
+    b.scopes[b.scopes.length() - 1].set(pion_name, n)
+  }
+  n
+}
+
+///|
+fn lb_lookup(b : LB, pion_name : String) -> Option[String] {
+  let mut i = b.scopes.length() - 1
+  while i >= 0 {
+    match b.scopes[i].get(pion_name) {
+      Some(n) => return Some(n)
+      None => ()
+    }
+    i = i - 1
+  }
+  None
+}
+
+///|
+fn lb_var_ty(b : LB, n : String) -> Ty {
+  match b.var_tys.get(n) {
+    Some(t) => t
+    None => TError
+  }
+}
+
+///|
+fn lb_push_scope(b : LB) -> Unit {
+  b.scopes.push(Map([]))
+}
+
+///|
+fn lb_pop_scope(b : LB) -> Unit {
+  let _ = b.scopes.pop()
+}
+
+///|
+fn lb_emit(b : LB, s : LStmt) -> Unit {
+  b.blocks[b.blocks.length() - 1].push(s)
+}
+
+///|
+fn lb_open(b : LB) -> Unit {
+  b.blocks.push([])
+}
+
+///|
+fn lb_close(b : LB, tail : Option[LExpr]) -> LBlock {
+  let stmts = match b.blocks.pop() {
+    Some(s) => s
+    None => []
+  }
+  LBlock::{ stmts: stmts, tail: tail }
+}
+
+///|
+fn lb_cur(b : LB) -> Array[LStmt] {
+  b.blocks[b.blocks.length() - 1]
+}
+
+///|
+/// Binds `v` to a fresh variable unless it is already a variable or literal.
+fn lb_atom(b : LB, v : LExpr) -> LExpr {
+  match v {
+    LVar(_, _) | LLit(_, _, _) | LConstRef(_, _) => v
+    _ => {
+      let t = l_expr_ty(v)
+      let n = lb_temp(b, t)
+      lb_emit(b, LSLet(n, t, v))
+      LVar(n, t)
+    }
+  }
+}
+
+///|
+pub fn l_expr_ty(e : LExpr) -> Ty {
+  match e {
+    LVar(_, t) => t
+    LLit(_, _, t) => t
+    LBin(op, _, _, t) =>
+      if op == "==" ||
+        op == "!=" ||
+        op == "<" ||
+        op == "<=" ||
+        op == ">" ||
+        op == ">=" ||
+        op == "&&" ||
+        op == "||" {
+        TBool
+      } else {
+        t
+      }
+    LUn(_, _, t) => t
+    LField(_, _, _, t) => t
+    LTupleGet(_, i, t) =>
+      match t {
+        TTuple(es) => if i < es.length() { es[i] } else { TError }
+        _ => TError
+      }
+    LCtor(_, _, _, t) => t
+    LStruct(_, _, t) => t
+    LTuple(_, t) => t
+    LArrayLit(_, t) => t
+    LPure(_, _, t) => t
+    LIte(_, _, _, t) => t
+    LConstRef(_, t) => t
+  }
+}
+
+///|
+/// Whether the block's last statement is a call / branch whose destination is
+/// the temporary `n`; if so it is retargeted to `dest` (`let x = f(a)` binds
+/// `x` directly instead of `let __t ← f a; let x := __t`).
+fn lb_retarget(b : LB, n : String, dest : String, assign : Bool) -> Bool {
+  if !b.temps.contains(n) {
+    return false
+  }
+  let cur = lb_cur(b)
+  if cur.length() == 0 {
+    return false
+  }
+  // The defining statement may be followed by the `mut` write-backs of the
+  // same call (assignments that never read `n`).
+  let mut at = cur.length() - 1
+  while at > 0 {
+    let skip = match cur[at] {
+      LSAssign(_, v) => !l_expr_mentions(v, n)
+      LSSetField(_, _, _, _, v) => !l_expr_mentions(v, n)
+      _ => false
+    }
+    if !skip {
+      break
+    }
+    at = at - 1
+  }
+  let last = cur[at]
+  let repl : Option[LStmt] = match last {
+    LSCall(d, t, c, args, outs, was_assign) =>
+      if d == n && !was_assign {
+        Some(LSCall(dest, t, c, args, outs, assign))
+      } else {
+        None
+      }
+    LSIf(c, t1, e1, d, t) =>
+      if d == n && !assign { Some(LSIf(c, t1, e1, dest, t)) } else { None }
+    LSMatch(s, st, arms, d, t) =>
+      if d == n && !assign { Some(LSMatch(s, st, arms, dest, t)) } else { None }
+    LSLet(d, t, v) =>
+      if d == n && !assign { Some(LSLet(dest, t, v)) } else { None }
+    _ => None
+  }
+  match repl {
+    Some(s) => {
+      cur[at] = s
+      true
+    }
+    None => false
+  }
+}
+
+///|
+fn l_expr_mentions(e : LExpr, n : String) -> Bool {
+  match e {
+    LVar(v, _) => v == n
+    LBin(_, a, c, _) => l_expr_mentions(a, n) || l_expr_mentions(c, n)
+    LUn(_, a, _) | LField(a, _, _, _) | LTupleGet(a, _, _) => l_expr_mentions(a, n)
+    LCtor(_, _, es, _) | LStruct(_, es, _) | LTuple(es, _) | LArrayLit(es, _) | LPure(_, es, _) => {
+      let mut i = 0
+      while i < es.length() {
+        if l_expr_mentions(es[i], n) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    LIte(c, a, d, _) => l_expr_mentions(c, n) || l_expr_mentions(a, n) || l_expr_mentions(d, n)
+    _ => false
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Literals.
+// ---------------------------------------------------------------------------
+
+///|
+fn l_lit_kind(t : Ty) -> String {
+  match t {
+    TInt64 => "int64"
+    TUInt => "uint"
+    TUInt64 => "uint64"
+    TByte => "byte"
+    _ => "int"
+  }
+}
+
+///|
+fn l_hex_digit(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    -1
+  }
+}
+
+///|
+/// Canonical decimal text of an integer literal (`42`, `0xFF`, `1_000L`,
+/// `0xFFFF_FFFFU`, `-1`) as a value of type `t` (two's complement wrap, as
+/// the native backend stores the constant).
+pub fn l_int_text(raw : String, t : Ty, negate : Bool) -> String {
+  let mut neg = negate
+  let mut i = 0
+  let n = raw.length()
+  if n > 0 && str_code_at(raw, 0) == 45 {
+    neg = !neg
+    i = 1
+  }
+  let mut hex = false
+  if i + 1 < n && str_code_at(raw, i) == 48 && (str_code_at(raw, i + 1) == 120 || str_code_at(raw, i + 1) == 88) {
+    hex = true
+    i = i + 2
+  }
+  // Two's complement accumulation in `Int64` (the bootstrap seed has no
+  // `UInt64` literals / methods).
+  let mut v = 0L
+  while i < n {
+    let c = str_code_at(raw, i)
+    if c == 95 {
+      i = i + 1
+      continue
+    }
+    let d = if hex { l_hex_digit(c) } else if c >= 48 && c <= 57 { c - 48 } else { -1 }
+    if d < 0 {
+      break
+    }
+    v = v * (if hex { 16L } else { 10L }) + d.to_int64()
+    i = i + 1
+  }
+  if neg {
+    v = 0L - v
+  }
+  match t {
+    TUInt64 => l_u64_text(v)
+    TInt64 => v.to_string()
+    TUInt => (v & 4294967295L).to_string()
+    TByte => (v & 255L).to_string()
+    _ => {
+      let low = v & 4294967295L
+      if low >= 2147483648L {
+        (low - 4294967296L).to_string()
+      } else {
+        low.to_string()
+      }
+    }
+  }
+}
+
+///|
+/// Unsigned decimal text of the 64 bits of `v`.
+fn l_u64_text(v : Int64) -> String {
+  if v >= 0L {
+    return v.to_string()
+  }
+  // floor(u / 10) = ((u >>> 1) / 5) for the unsigned value u of `v`.
+  let half = (v >> 1) & 9223372036854775807L
+  let q = half / 5L
+  let r = v - q * 10L
+  q.to_string() + r.to_string()
+}
+
+///|
+fn l_unit() -> LExpr {
+  LLit("unit", "()", TUnit)
+}
+
+///|
+fn l_bool(v : Bool) -> LExpr {
+  LLit("bool", if v { "true" } else { "false" }, TBool)
+}
+
+///|
+fn l_int_lit(v : Int, t : Ty) -> LExpr {
+  LLit(l_lit_kind(t), v.to_string(), t)
+}
+
+///|
+fn l_is_int_ty(t : Ty) -> Bool {
+  match t {
+    TInt | TInt64 | TUInt | TUInt64 | TByte => true
+    _ => false
+  }
+}
+
+///|
+/// The `Pion.<Scalar>` namespace of an integer type.
+pub fn l_scalar_ns(t : Ty) -> String {
+  match t {
+    TInt64 => "Pion.I64"
+    TUInt => "Pion.U32"
+    TUInt64 => "Pion.U64"
+    TByte => "Pion.U8"
+    _ => "Pion.I32"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Syntactic write analysis (for left-to-right snapshots).
+// ---------------------------------------------------------------------------
+
+///|
+fn l_is_mutating_builtin(m : String) -> Bool {
+  m == "push" ||
+  m == "pop" ||
+  m == "clear" ||
+  m == "reverse" ||
+  m == "swap" ||
+  m == "fill" ||
+  m == "sort" ||
+  m == "set"
+}
+
+///|
+/// Whether evaluating `e` may write a variable (a `mut` argument, a `mut self`
+/// call, a mutating builtin, or an assignment inside a nested block).
+fn l_expr_writes(tc : TypeChecker, e : Expr) -> Bool {
+  match e {
+    EMutArg(_, _) => true
+    EMethodCall(obj, m, args, sp) =>
+      tc.mut_recv_calls.contains(span_key(sp)) ||
+      l_is_mutating_builtin(m) ||
+      l_expr_writes(tc, obj) ||
+      l_exprs_write(tc, args)
+    ECall(callee, args, _) => l_expr_writes(tc, callee) || l_exprs_write(tc, args)
+    EUnary(_, x, _) => l_expr_writes(tc, x)
+    EBinary(_, x, y, _) => l_expr_writes(tc, x) || l_expr_writes(tc, y)
+    EField(x, _, _) => l_expr_writes(tc, x)
+    EIndex(x, y, _) => l_expr_writes(tc, x) || l_expr_writes(tc, y)
+    EArrayLit(es, _) => l_exprs_write(tc, es)
+    ETuple(es, _) => l_exprs_write(tc, es)
+    EStructLit(_, base, fs, _) => {
+      let bw = match base {
+        Some(x) => l_expr_writes(tc, x)
+        None => false
+      }
+      if bw {
+        return true
+      }
+      let mut i = 0
+      while i < fs.length() {
+        if l_expr_writes(tc, fs[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EDotVariant(_, es, _) => l_exprs_write(tc, es)
+    EBlock(_, _) | EIf(_, _, _, _) | EMatch(_, _, _) => true
+    EIs(x, _, _) => l_expr_writes(tc, x)
+    ETry(x, _) => l_expr_writes(tc, x)
+    EMove(x, _) => l_expr_writes(tc, x)
+    ENamedArg(_, _, x, _) => l_expr_writes(tc, x)
+    _ => false
+  }
+}
+
+///|
+fn l_exprs_write(tc : TypeChecker, es : Array[Expr]) -> Bool {
+  let mut i = 0
+  while i < es.length() {
+    if l_expr_writes(tc, es[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// Copies `v` into a fresh variable unless it is a literal (a later sibling
+/// may write the variables `v` reads).
+fn lb_snapshot(b : LB, v : LExpr) -> LExpr {
+  match v {
+    LLit(_, _, _) | LConstRef(_, _) => v
+    _ => {
+      let t = l_expr_ty(v)
+      let n = lb_temp(b, t)
+      lb_emit(b, LSLet(n, t, v))
+      LVar(n, t)
+    }
+  }
+}
+
+///|
+/// Lowers `es` left to right; an operand is snapshotted when a later operand
+/// may write variables.
+fn lb_exprs(b : LB, es : Array[Expr]) -> Array[LExpr] {
+  let out : Array[LExpr] = []
+  let mut i = 0
+  while i < es.length() {
+    let v = lb_expr(b, es[i])
+    let mut later_writes = false
+    let mut j = i + 1
+    while j < es.length() {
+      if l_expr_writes(b.tc, es[j]) {
+        later_writes = true
+        break
+      }
+      j = j + 1
+    }
+    out.push(if later_writes { lb_snapshot(b, v) } else { v })
+    i = i + 1
+  }
+  out
+}
+
+// ---------------------------------------------------------------------------
+// Expressions.
+// ---------------------------------------------------------------------------
+
+///|
+/// Enum key + variant of a constructor call / path, from the expression type.
+fn lb_ctor_of(b : LB, ty : Ty, vname : String) -> Option[String] {
+  match ty {
+    TOption(_) => if vname == "Some" || vname == "None" { Some("Option") } else { None }
+    TResult(_, _) => if vname == "Ok" || vname == "Err" { Some("Result") } else { None }
+    TEnum(gname, _) =>
+      match lg_enum(b.g, gname) {
+        Some(ei) => {
+          let mut i = 0
+          while i < ei.variants.length() {
+            if ei.variants[i].name == vname {
+              return Some(gname)
+            }
+            i = i + 1
+          }
+          None
+        }
+        None => None
+      }
+    _ => None
+  }
+}
+
+///|
+fn lb_expr(b : LB, e : Expr) -> LExpr {
+  match e {
+    EInt(s, _) | EInt64(s, _) | EUInt(s, _) | EUInt64(s, _) => {
+      let t0 = lb_expr_ty(b, e)
+      let t = if l_is_int_ty(t0) {
+        t0
+      } else {
+        match e {
+          EInt64(_, _) => TInt64
+          EUInt(_, _) => TUInt
+          EUInt64(_, _) => TUInt64
+          _ => TInt
+        }
+      }
+      LLit(l_lit_kind(t), l_int_text(s, t, false), t)
+    }
+    EDouble(_, sp) | EFloat(_, sp) => {
+      lb_err(b, sp, "floating-point values are not extractable", "floating-point literal")
+      l_unit()
+    }
+    EBool(v, _) => l_bool(v)
+    EByte(raw, _) => LLit("byte", qbe_parse_char_lit(raw).to_string(), TByte)
+    EChar(raw, _) => LLit("char", qbe_parse_char_lit(raw).to_string(), TChar)
+    EString(s, _) => LLit("string", s, TString)
+    EUnit(_) => l_unit()
+    EIdent(n, sp) => lb_ident(b, n, e, sp)
+    EPath(q, m, sp) => {
+      let ty = lb_expr_ty(b, e)
+      match lb_ctor_of(b, ty, m) {
+        Some(ek) => LCtor(ek, m, [], ty)
+        None =>
+          match lb_const_item(b, q, m) {
+            Some(r) => r
+            None => {
+              lb_err(b, sp, "unsupported path `" + q + "::" + m + "`", q + "::" + m)
+              l_unit()
+            }
+          }
+      }
+    }
+    EDotVariant(v, args, sp) => {
+      let ty = lb_expr_ty(b, e)
+      match lb_ctor_of(b, ty, v) {
+        Some(ek) => LCtor(ek, v, lb_exprs(b, args), ty)
+        None => {
+          lb_err(b, sp, "cannot resolve `." + v + "`", "." + v)
+          l_unit()
+        }
+      }
+    }
+    EUnary(op, x, _) => {
+      if op == "-" {
+        match x {
+          EInt(s, _) | EInt64(s, _) | EUInt(s, _) | EUInt64(s, _) => {
+            let t = lb_expr_ty(b, e)
+            let tt = if l_is_int_ty(t) { t } else { lb_expr_ty(b, x) }
+            return LLit(l_lit_kind(tt), l_int_text(s, tt, true), tt)
+          }
+          _ => ()
+        }
+      }
+      let v = lb_expr(b, x)
+      LUn(op, v, l_expr_ty(v))
+    }
+    EBinary(op, l, r, sp) => lb_binary(b, op, l, r, e, sp)
+    ECall(_, _, _) => lb_call(b, e)
+    EMethodCall(_, _, _, _) => lb_method(b, e)
+    EField(obj, f, sp) => {
+      let ot = lb_expr_ty(b, obj)
+      let ov = lb_expr(b, obj)
+      let oty = match ot {
+        TError => l_expr_ty(ov)
+        _ => ot
+      }
+      match oty {
+        TTuple(_) =>
+          match f.to_int() {
+            Some(k) => LTupleGet(ov, k, oty)
+            None => {
+              lb_err(b, sp, "bad tuple field `" + f + "`", f)
+              l_unit()
+            }
+          }
+        TStruct(_, _) => LField(ov, f, oty, lb_expr_ty(b, e))
+        _ => {
+          lb_err(b, sp, "field access `." + f + "` on " + ty_to_string(oty), ty_to_string(oty))
+          l_unit()
+        }
+      }
+    }
+    EIndex(obj, idx, _) => {
+      let ov = lb_expr(b, obj)
+      let ov2 = if l_expr_writes(b.tc, idx) { lb_snapshot(b, ov) } else { ov }
+      let iv = lb_expr(b, idx)
+      let ty = lb_expr_ty(b, e)
+      let n = lb_temp(b, ty)
+      lb_emit(b, LSCall(n, ty, CBuiltin(l_container_ns(l_expr_ty(ov2)) + ".get"), [AVal(ov2), AVal(iv)], [], false))
+      LVar(n, ty)
+    }
+    EArrayLit(es, _) => {
+      let ty = lb_expr_ty(b, e)
+      LArrayLit(lb_exprs(b, es), ty)
+    }
+    EStructLit(_, base, fields, sp) => lb_struct_lit(b, base, fields, e, sp)
+    ETuple(es, _) => {
+      let vs = lb_exprs(b, es)
+      let tys : Array[Ty] = []
+      let mut i = 0
+      while i < vs.length() {
+        tys.push(l_expr_ty(vs[i]))
+        i = i + 1
+      }
+      LTuple(vs, TTuple(tys))
+    }
+    EBlock(stmts, _) => {
+      let ty = lb_expr_ty(b, e)
+      lb_push_scope(b)
+      let tail = lb_stmts(b, stmts, 0, l_wants_value(ty))
+      lb_pop_scope(b)
+      match tail {
+        Some(v) => v
+        None => l_unit()
+      }
+    }
+    EIf(cond, then_s, els, _) => {
+      let ty = lb_expr_ty(b, e)
+      lb_if(b, cond, LCStmts(then_s), l_else_code(els), ty)
+    }
+    EMatch(scrut, arms, _) => {
+      let ty = lb_expr_ty(b, e)
+      lb_match(b, scrut, arms, ty)
+    }
+    EIs(_, _, _) => lb_if(b, e, LCValue(l_bool(true)), LCValue(l_bool(false)), TBool)
+    ETry(inner, sp) => lb_try(b, inner, sp)
+    EMove(x, _) => lb_expr(b, x)
+    EInterp(_, sp) => {
+      lb_err(b, sp, "string interpolation is not extractable", "\"...\\{...}\"")
+      l_unit()
+    }
+    EAs(_, _, sp) => {
+      lb_err(b, sp, "`as` conversions are not extractable", "as")
+      l_unit()
+    }
+    EClosure(_, _, _, sp) => {
+      lb_err(b, sp, "closures are not extractable", "fn(...) { ... }")
+      l_unit()
+    }
+    EScope(_, _, sp) | ESpawn(_, _, sp) => {
+      lb_err(b, sp, "concurrency is not extractable", "scope / spawn")
+      l_unit()
+    }
+    ENamedArg(_, _, _, sp) | EMutArg(_, sp) => {
+      lb_err(b, sp, "unexpected argument form", "argument")
+      l_unit()
+    }
+  }
+}
+
+///|
+fn l_wants_value(t : Ty) -> Bool {
+  match t {
+    TUnit | TNever | TError => false
+    _ => true
+  }
+}
+
+///|
+/// `Pion.Array` / `Pion.FixedArray` / `Pion.Bytes`.
+pub fn l_container_ns(t : Ty) -> String {
+  match t {
+    TFixedArray(_) => "Pion.FixedArray"
+    TBytes => "Pion.Bytes"
+    _ => "Pion.Array"
+  }
+}
+
+///|
+fn lb_ident(b : LB, n : String, e : Expr, sp : Span) -> LExpr {
+  match lb_lookup(b, n) {
+    Some(ln) => return LVar(ln, lb_var_ty(b, ln))
+    None => ()
+  }
+  let ty = lb_expr_ty(b, e)
+  match lb_ctor_of(b, ty, n) {
+    Some(ek) => return LCtor(ek, n, [], ty)
+    None => ()
+  }
+  match lb_const_item(b, "", n) {
+    Some(r) => r
+    None => {
+      lb_err(b, sp, "unsupported reference to `" + n + "`", n)
+      l_unit()
+    }
+  }
+}
+
+///|
+/// A reference to a top-level constant (`NAME` or `pkg::NAME`).
+fn lb_const_item(b : LB, q : String, n : String) -> Option[LExpr] {
+  let pkg = if q.length() == 0 {
+    b.pkg
+  } else {
+    match resolve_alias_pkg(b.tc, q) {
+      Some(ip) => ip.name
+      None => q
+    }
+  }
+  match lg_tc(b.g, pkg) {
+    Some(tc) =>
+      match tc.consts.get(n) {
+        Some(cty) => {
+          let key = "const:" + pkg + "::" + n
+          lg_enqueue(b.g, key)
+          l_push_unique(b.callees, key)
+          let ty = lb_ty_of(b, l_gq_ty(pkg, cty))
+          if lg_const_is_pure(b.g, pkg, n) {
+            Some(LConstRef(key, ty))
+          } else {
+            let t = lb_temp(b, ty)
+            lb_emit(b, LSCall(t, ty, CConst(key), [], [], false))
+            Some(LVar(t, ty))
+          }
+        }
+        None => None
+      }
+    None => None
+  }
+}
+
+///|
+/// A constant is pure when its initializer is a literal tree (no calls, no
+/// fallible operators).
+fn lg_const_is_pure(g : LG, pkg : String, n : String) -> Bool {
+  match g.pkg_idx.get(pkg) {
+    Some(pi) => {
+      let files = g.inputs[pi].pkg.files
+      let mut fi = 0
+      while fi < files.length() {
+        let decls = files[fi].decls
+        let mut di = 0
+        while di < decls.length() {
+          match decls[di] {
+            DConst(cd) => if cd.name == n { return l_pure_const_expr(cd.value) }
+            _ => ()
+          }
+          di = di + 1
+        }
+        fi = fi + 1
+      }
+      false
+    }
+    None => false
+  }
+}
+
+///|
+fn l_pure_const_expr(e : Expr) -> Bool {
+  match e {
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EBool(_, _) | EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) => true
+    EUnary(op, x, _) => (op == "-" || op == "!") && l_pure_const_expr(x)
+    EBinary(op, x, y, _) =>
+      op != "/" &&
+      op != "%" &&
+      op != "<<" &&
+      op != ">>" &&
+      l_pure_const_expr(x) &&
+      l_pure_const_expr(y)
+    ETuple(es, _) => {
+      let mut i = 0
+      while i < es.length() {
+        if !l_pure_const_expr(es[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn l_is_fallible_op(op : String) -> Bool {
+  op == "/" || op == "%" || op == "<<" || op == ">>"
+}
+
+///|
+/// The Lean function of a fallible integer operator (`Pion.I32.div`, ...).
+/// A shift whose count is `Int` on a non-`Int` left operand uses the mixed
+/// `shl_i32` / `shr_i32` (`T << Int`, §3.5).
+pub fn l_fallible_fn(op : String, t : Ty, rt : Ty) -> String {
+  let f = if op == "/" {
+    "div"
+  } else if op == "%" {
+    "rem"
+  } else if op == "<<" {
+    "shl"
+  } else {
+    "shr"
+  }
+  let mixed = (op == "<<" || op == ">>") &&
+    (match rt {
+      TInt => true
+      _ => false
+    }) &&
+    (match t {
+      TInt => false
+      _ => true
+    })
+  l_scalar_ns(t) + "." + f + (if mixed { "_i32" } else { "" })
+}
+
+///|
+/// `lhs op rhs` once both operands are lowered.
+fn lb_apply_binop(b : LB, op : String, lv : LExpr, rv : LExpr, rty : Ty, sp : Span) -> LExpr {
+  let t = l_expr_ty(lv)
+  match t {
+    TByte =>
+      // Native `#verify` has no range check for `Byte` shifts: refuse rather than model it.
+      if op == "<<" || op == ">>" {
+        lb_err(b, sp, "`Byte` shifts are not extractable", "Byte " + op)
+        return lv
+      }
+    _ => ()
+  }
+  if l_is_fallible_op(op) && l_is_int_ty(t) {
+    let n = lb_temp(b, t)
+    lb_emit(b, LSCall(n, t, CBuiltin(l_fallible_fn(op, t, l_expr_ty(rv))), [AVal(lv), AVal(rv)], [], false))
+    return LVar(n, t)
+  }
+  match rty {
+    TError => ()
+    _ => ()
+  }
+  LBin(op, lv, rv, t)
+}
+
+///|
+fn lb_binary(b : LB, op : String, l : Expr, r : Expr, e : Expr, sp : Span) -> LExpr {
+  if op == "&&" || op == "||" {
+    let lv = lb_expr(b, l)
+    lb_open(b)
+    let rv = lb_expr(b, r)
+    let rb = lb_close(b, Some(rv))
+    if rb.stmts.length() == 0 {
+      return LBin(op, lv, rv, TBool)
+    }
+    // Short-circuit: the right operand only runs when needed.
+    let n = lb_temp(b, TBool)
+    if op == "&&" {
+      lb_emit(b, LSIf(lv, rb, LBlock::{ stmts: [], tail: Some(l_bool(false)) }, n, TBool))
+    } else {
+      lb_emit(b, LSIf(lv, LBlock::{ stmts: [], tail: Some(l_bool(true)) }, rb, n, TBool))
+    }
+    return LVar(n, TBool)
+  }
+  let lv0 = lb_expr(b, l)
+  let lv = if l_expr_writes(b.tc, r) { lb_snapshot(b, lv0) } else { lv0 }
+  let rv = lb_expr(b, r)
+  lb_apply_binop(b, op, lv, rv, lb_expr_ty(b, e), sp)
+}
+
+///|
+fn lb_struct_lit(
+  b : LB,
+  base : Option[Expr],
+  fields : Array[FieldInit],
+  e : Expr,
+  sp : Span,
+) -> LExpr {
+  let ty = lb_expr_ty(b, e)
+  let (gname, targs) = match ty {
+    TStruct(n, a) => (n, a)
+    _ => {
+      lb_err(b, sp, "struct literal of unknown type", ty_to_string(ty))
+      return l_unit()
+    }
+  }
+  let si = match lg_struct(b.g, gname) {
+    Some(s) => s
+    None => {
+      lb_err(b, sp, "unknown struct `" + gname + "`", gname)
+      return l_unit()
+    }
+  }
+  let mut base_v : Option[LExpr] = None
+  match base {
+    Some(bx) => {
+      let v = lb_expr(b, bx)
+      base_v = Some(lb_atom(b, v))
+    }
+    None => ()
+  }
+  let fexprs : Array[Expr] = []
+  let mut i = 0
+  while i < fields.length() {
+    fexprs.push(fields[i].value)
+    i = i + 1
+  }
+  let fvals = lb_exprs(b, fexprs)
+  let out : Array[LExpr] = []
+  let qp = split_qual_name(gname)
+  i = 0
+  while i < si.field_names.length() {
+    let fname = si.field_names[i]
+    let mut found = -1
+    let mut j = 0
+    while j < fields.length() {
+      if fields[j].name == fname {
+        found = j
+      }
+      j = j + 1
+    }
+    if found >= 0 {
+      out.push(fvals[found])
+    } else {
+      match base_v {
+        Some(bv) => {
+          let fty = l_inst(si.decl.type_params, targs, l_gq_ty(qp.prefix, si.field_tys[i]))
+          out.push(LField(bv, fname, ty, fty))
+        }
+        None => {
+          lb_err(b, sp, "missing field `" + fname + "`", fname)
+          out.push(l_unit())
+        }
+      }
+    }
+    i = i + 1
+  }
+  LStruct(gname, out, ty)
+}
+
+// ---------------------------------------------------------------------------
+// Places (`x`, `x.f`, `a[i]`, combinations) for `mut` arguments, mutating
+// builtins and assignments.
+// ---------------------------------------------------------------------------
+
+///|
+struct LProj {
+  /// `field` or `index`.
+  kind : String
+  field : String
+  index : LExpr
+  /// Type of the value the projection is applied to.
+  base_ty : Ty
+  /// Type of the projected value.
+  ty : Ty
+}
+
+///|
+struct LPlace {
+  root : String
+  root_ty : Ty
+  projs : Array[LProj]
+}
+
+///|
+fn l_place_ty(pl : LPlace) -> Ty {
+  if pl.projs.length() == 0 {
+    pl.root_ty
+  } else {
+    pl.projs[pl.projs.length() - 1].ty
+  }
+}
+
+///|
+/// Lowers a place expression; indices are evaluated (and frozen) here, once.
+fn lb_place(b : LB, e : Expr) -> Option[LPlace] {
+  match e {
+    EIdent(n, _) =>
+      match lb_lookup(b, n) {
+        Some(ln) => Some(LPlace::{ root: ln, root_ty: lb_var_ty(b, ln), projs: [] })
+        None => None
+      }
+    EField(obj, f, _) =>
+      match lb_place(b, obj) {
+        Some(pl) => {
+          let bt = l_place_ty(pl)
+          match bt {
+            TStruct(_, _) => {
+              pl.projs.push(LProj::{ kind: "field", field: f, index: l_unit(), base_ty: bt, ty: lb_expr_ty(b, e) })
+              Some(pl)
+            }
+            _ => None
+          }
+        }
+        None => None
+      }
+    EIndex(obj, idx, _) =>
+      match lb_place(b, obj) {
+        Some(pl) => {
+          let bt = l_place_ty(pl)
+          let iv = lb_snapshot(b, lb_expr(b, idx))
+          pl.projs.push(LProj::{ kind: "index", field: "", index: iv, base_ty: bt, ty: lb_expr_ty(b, e) })
+          Some(pl)
+        }
+        None => None
+      }
+    EMove(x, _) => lb_place(b, x)
+    _ => None
+  }
+}
+
+///|
+fn l_sub_place(pl : LPlace, n : Int) -> LPlace {
+  let ps : Array[LProj] = []
+  let mut i = 0
+  while i < n && i < pl.projs.length() {
+    ps.push(pl.projs[i])
+    i = i + 1
+  }
+  LPlace::{ root: pl.root, root_ty: pl.root_ty, projs: ps }
+}
+
+///|
+/// The current value of a place (indexing is a monadic `get`).
+fn lb_place_read(b : LB, pl : LPlace) -> LExpr {
+  let mut cur = LVar(pl.root, pl.root_ty)
+  let mut i = 0
+  while i < pl.projs.length() {
+    let p = pl.projs[i]
+    if p.kind == "field" {
+      cur = LField(cur, p.field, p.base_ty, p.ty)
+    } else {
+      let c = cur
+      let n = lb_temp(b, p.ty)
+      lb_emit(b, LSCall(n, p.ty, CBuiltin(l_container_ns(p.base_ty) + ".get"), [AVal(c), AVal(p.index)], [], false))
+      cur = LVar(n, p.ty)
+    }
+    i = i + 1
+  }
+  cur
+}
+
+///|
+/// `place = v`: field paths are functional record updates; every index
+/// becomes `get` / `set` on the container, written back up to the root.
+fn lb_place_write(b : LB, pl : LPlace, v : LExpr) -> Unit {
+  let mut last_idx = -1
+  let mut i = 0
+  while i < pl.projs.length() {
+    if pl.projs[i].kind == "index" {
+      last_idx = i
+    }
+    i = i + 1
+  }
+  if last_idx < 0 {
+    if pl.projs.length() == 0 {
+      match v {
+        LVar(t, _) => if lb_retarget(b, t, pl.root, true) { return }
+        _ => ()
+      }
+      lb_emit(b, LSAssign(pl.root, v))
+    } else {
+      let names : Array[String] = []
+      let tys : Array[Ty] = []
+      i = 0
+      while i < pl.projs.length() {
+        names.push(pl.projs[i].field)
+        tys.push(pl.projs[i].base_ty)
+        i = i + 1
+      }
+      lb_emit(b, LSSetField(pl.root, pl.root_ty, names, tys, v))
+    }
+    return
+  }
+  let ip = pl.projs[last_idx]
+  let cont = l_sub_place(pl, last_idx)
+  let cval = lb_place_read(b, cont)
+  let mut elem = v
+  if last_idx + 1 < pl.projs.length() {
+    let cur = lb_temp(b, ip.ty)
+    lb_emit(b, LSCall(cur, ip.ty, CBuiltin(l_container_ns(ip.base_ty) + ".get"), [AVal(cval), AVal(ip.index)], [], false))
+    let names : Array[String] = []
+    let tys : Array[Ty] = []
+    i = last_idx + 1
+    while i < pl.projs.length() {
+      names.push(pl.projs[i].field)
+      tys.push(pl.projs[i].base_ty)
+      i = i + 1
+    }
+    lb_emit(b, LSSetField(cur, ip.ty, names, tys, v))
+    elem = LVar(cur, ip.ty)
+  }
+  let nc = lb_temp(b, ip.base_ty)
+  lb_emit(b, LSCall(nc, ip.base_ty, CBuiltin(l_container_ns(ip.base_ty) + ".set"), [AVal(cval), AVal(ip.index), AVal(elem)], [], false))
+  lb_place_write(b, cont, LVar(nc, ip.base_ty))
+}
+
+// ---------------------------------------------------------------------------
+// Calls.
+// ---------------------------------------------------------------------------
+
+///|
+fn lg_find_fn(g : LG, pkg : String, rest : String) -> Option[FnInfo] {
+  match lg_tc(g, pkg) {
+    Some(tc) =>
+      if has_qual_sep(rest) {
+        tc.methods.get(rest)
+      } else {
+        tc.fns.get(rest)
+      }
+    None => None
+  }
+}
+
+///|
+fn l_local_name(pkg : String, gname : String) -> String {
+  let qp = split_qual_name(gname)
+  if qp.prefix == pkg {
+    qp.name
+  } else {
+    gname
+  }
+}
+
+///|
+/// Global name of an impl target (`pkg::Name` for structs / enums, the plain
+/// name for builtin types).
+fn l_target_gname(t : Ty) -> String {
+  match t {
+    TStruct(n, _) | TEnum(n, _) => n
+    _ => ty_base_name(t)
+  }
+}
+
+///|
+/// The dictionary for `concrete : trait_key` at a call site.
+fn lb_dict(b : LB, trait_key : String, concrete : Ty, sp : Span) -> LDict {
+  match concrete {
+    TParam(u) => return LDParam(u, trait_key)
+    _ => ()
+  }
+  let local_trait = l_local_name(b.pkg, trait_key)
+  let local_target = l_local_name(b.pkg, l_target_gname(concrete))
+  match b.tc.impls.get(local_trait + "::" + local_target) {
+    Some(ii) => {
+      let key = "impl:" + ii.pkg_name + "|" + trait_key + "|" + l_target_gname(concrete)
+      lg_enqueue(b.g, key)
+      LDImpl(key, concrete)
+    }
+    None => {
+      lb_err(b, sp, "no `impl " + trait_key + " for " + ty_to_string(concrete) + "`", ty_to_string(concrete))
+      LDImpl("", concrete)
+    }
+  }
+}
+
+///|
+/// Lowers the arguments of a call into `args`, collecting `mut` places.
+/// `slots` are the resolved arguments in parameter order; `wrap_some` marks
+/// optional parameters given `name=value` (wrapped into `Some`).
+fn lb_call_args(
+  b : LB,
+  slots : Array[Expr],
+  slot_tys : Array[Ty],
+  slot_mut : Array[Bool],
+  wrap_some : Array[Bool],
+  args : Array[LArg],
+  places : Array[LPlace],
+) -> Unit {
+  let mut i = 0
+  while i < slots.length() {
+    let a = slots[i]
+    let mut later_writes = false
+    let mut j = i + 1
+    while j < slots.length() {
+      // A `mut` argument's place is only read here (the call writes it
+      // after every argument is evaluated, and `#verify` aliasing rules keep
+      // it disjoint from the other arguments): only nested writes count.
+      let w = match slots[j] {
+        EMutArg(p, _) => l_expr_writes(b.tc, p)
+        x => l_expr_writes(b.tc, x)
+      }
+      if w {
+        later_writes = true
+        break
+      }
+      j = j + 1
+    }
+    let inner = match a {
+      EMutArg(p, _) => p
+      _ => a
+    }
+    if slot_mut[i] {
+      match lb_place(b, inner) {
+        Some(pl) => {
+          let v = lb_place_read(b, pl)
+          args.push(AMut(if later_writes { lb_snapshot(b, v) } else { v }))
+          places.push(pl)
+        }
+        None => {
+          lb_err(b, expr_span(a), "`mut` argument is not a place", "expression")
+          args.push(AMut(l_unit()))
+        }
+      }
+    } else {
+      let implicit_none = match inner {
+        EIdent("None", _) =>
+          match lb_lookup(b, "None") {
+            Some(_) => false
+            None => true
+          }
+        _ => false
+      }
+      let v0 = if implicit_none {
+        LCtor("Option", "None", [], slot_tys[i])
+      } else {
+        lb_expr(b, inner)
+      }
+      let v1 = if wrap_some[i] {
+        LCtor("Option", "Some", [v0], slot_tys[i])
+      } else {
+        v0
+      }
+      args.push(AVal(if later_writes { lb_snapshot(b, v1) } else { v1 }))
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// Resolves a user call's written arguments into parameter slots
+/// (`call_arg_order`: named / defaulted / optional parameters).
+fn lb_resolve_slots(
+  b : LB,
+  params : Array[Param],
+  offset : Int,
+  raw_args : Array[Expr],
+  sp : Span,
+  slot_tys : Array[Ty],
+  slots : Array[Expr],
+  wrap_some : Array[Bool],
+) -> Unit {
+  let n = params.length() - offset
+  let order : Array[Int] = match b.tc.call_arg_order.get(span_key(sp)) {
+    Some(o) => o
+    None => {
+      let o : Array[Int] = []
+      let mut k = 0
+      while k < n {
+        o.push(if k < raw_args.length() { k } else { -1 })
+        k = k + 1
+      }
+      o
+    }
+  }
+  let mut k = 0
+  while k < n {
+    let p = params[offset + k]
+    let idx = if k < order.length() { order[k] } else { -1 }
+    if idx >= 0 && idx < raw_args.length() {
+      match raw_args[idx] {
+        ENamedArg(_, fwd, inner, _) => {
+          slots.push(inner)
+          wrap_some.push(p.label_kind == 2 && !fwd)
+        }
+        a => {
+          slots.push(a)
+          wrap_some.push(false)
+        }
+      }
+    } else {
+      match p.default_expr {
+        Some(d) => {
+          slots.push(d)
+          wrap_some.push(false)
+        }
+        None => {
+          slots.push(EIdent("None", sp))
+          wrap_some.push(false)
+        }
+      }
+    }
+    k = k + 1
+  }
+  let _ = slot_tys
+}
+
+///|
+/// Emits a monadic call with `mut` write-backs; returns its value.
+fn lb_emit_call(
+  b : LB,
+  ret_ty : Ty,
+  callee : LCallee,
+  args : Array[LArg],
+  places : Array[LPlace],
+) -> LExpr {
+  let outs : Array[String] = []
+  let mut i = 0
+  while i < places.length() {
+    outs.push(lb_temp(b, l_place_ty(places[i])))
+    i = i + 1
+  }
+  let has_val = l_wants_value(ret_ty)
+  let dest = if has_val { lb_temp(b, ret_ty) } else { "" }
+  lb_emit(b, LSCall(dest, ret_ty, callee, args, outs, false))
+  i = 0
+  while i < places.length() {
+    lb_place_write(b, places[i], LVar(outs[i], l_place_ty(places[i])))
+    i = i + 1
+  }
+  if has_val {
+    LVar(dest, ret_ty)
+  } else {
+    l_unit()
+  }
+}
+
+///|
+/// A call of a user function / method (`finfo` as seen from `fpkg`).
+fn lb_call_user(
+  b : LB,
+  key : String,
+  fpkg : String,
+  finfo : FnInfo,
+  raw_args : Array[Expr],
+  recv : Option[Expr],
+  recv_mut : Bool,
+  sp : Span,
+  ret_ty : Ty,
+) -> LExpr {
+  lg_enqueue(b.g, key)
+  l_push_unique(b.callees, key)
+  let tparams = finfo.decl.type_params
+  let targs : Array[Ty] = []
+  let subst : Map[String, Ty] = Map([])
+  match b.tc.call_type_args.get(span_key(sp)) {
+    Some(ts) => {
+      let mut i = 0
+      while i < ts.length() {
+        let t = lb_ty_of(b, ts[i])
+        targs.push(t)
+        if i < tparams.length() {
+          subst.set(tparams[i], t)
+        }
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  let params = finfo.decl.params
+  let offset = match recv {
+    Some(_) => 1
+    None => 0
+  }
+  let slot_tys : Array[Ty] = []
+  let slot_mut : Array[Bool] = []
+  let mut k = offset
+  while k < params.length() {
+    let pt = if k < finfo.param_tys.length() {
+      subst_ty(l_gq_ty(fpkg, finfo.param_tys[k]), subst)
+    } else {
+      TError
+    }
+    slot_tys.push(pt)
+    slot_mut.push(params[k].is_mut)
+    k = k + 1
+  }
+  let slots : Array[Expr] = []
+  let wrap_some : Array[Bool] = []
+  lb_resolve_slots(b, params, offset, raw_args, sp, slot_tys, slots, wrap_some)
+  let args : Array[LArg] = []
+  let places : Array[LPlace] = []
+  match recv {
+    Some(r) => {
+      let all_slots : Array[Expr] = [r]
+      let all_tys : Array[Ty] = [TError]
+      let all_mut : Array[Bool] = [recv_mut]
+      let all_wrap : Array[Bool] = [false]
+      let mut i = 0
+      while i < slots.length() {
+        all_slots.push(slots[i])
+        all_tys.push(slot_tys[i])
+        all_mut.push(slot_mut[i])
+        all_wrap.push(wrap_some[i])
+        i = i + 1
+      }
+      lb_call_args(b, all_slots, all_tys, all_mut, all_wrap, args, places)
+    }
+    None => lb_call_args(b, slots, slot_tys, slot_mut, wrap_some, args, places)
+  }
+  let dicts : Array[LDict] = []
+  match lg_tc(b.g, fpkg) {
+    Some(ftc) => {
+      let mut bi = 0
+      while bi < finfo.decl.type_bounds.length() {
+        let tb = finfo.decl.type_bounds[bi]
+        let concrete = match subst.get(tb.param) {
+          Some(t) => t
+          None => TParam(tb.param)
+        }
+        let mut ti = 0
+        while ti < tb.traits.length() {
+          let tk = l_gq(fpkg, canon_trait_name(ftc, tb.traits[ti]))
+          lg_enqueue(b.g, "trait:" + tk)
+          dicts.push(lb_dict(b, tk, concrete, sp))
+          ti = ti + 1
+        }
+        bi = bi + 1
+      }
+    }
+    None => ()
+  }
+  lb_emit_call(b, ret_ty, CItem(key, targs, dicts), args, places)
+}
+
+///|
+fn lb_call(b : LB, e : Expr) -> LExpr {
+  let (callee, raw_args, sp) = match e {
+    ECall(c, a, s) => (c, a, s)
+    _ => return l_unit()
+  }
+  let ty = lb_expr_ty(b, e)
+  let target = match b.tc.call_targets.get(span_key(sp)) {
+    Some(t) => t
+    None => ""
+  }
+  // Constructors.
+  let vname = match callee {
+    EIdent(n, _) => n
+    EPath(_, m, _) => m
+    _ => ""
+  }
+  let is_local = match callee {
+    EIdent(n, _) =>
+      match lb_lookup(b, n) {
+        Some(_) => true
+        None => false
+      }
+    _ => false
+  }
+  if !is_local && vname.length() > 0 {
+    match lb_ctor_of(b, ty, vname) {
+      Some(ek) => {
+        let is_fn = match callee {
+          EIdent(n, _) => b.tc.fns.contains(n)
+          _ => false
+        }
+        if !is_fn {
+          return LCtor(ek, vname, lb_exprs(b, raw_args), ty)
+        }
+      }
+      None => ()
+    }
+  }
+  if is_local {
+    lb_err(b, sp, "calling a closure is not extractable", vname)
+    return l_unit()
+  }
+  // Builtin statics and free builtins.
+  match callee {
+    EPath(q, m, _) =>
+      if q == "Array" || q == "FixedArray" || q == "Bytes" {
+        return lb_builtin_static(b, q, m, raw_args, ty, sp)
+      }
+    EIdent(n, _) =>
+      if !b.tc.fns.contains(n) && !b.tc.extern_fns.contains(n) {
+        if n == "debug_assert" {
+          let vs = lb_exprs(b, raw_args)
+          if vs.length() > 0 {
+            lb_emit(b, LSAssert(vs[0]))
+          }
+          return l_unit()
+        }
+        if n == "panic" || n == "abort" {
+          let _ = lb_exprs(b, raw_args)
+          lb_emit(b, LSPanic)
+          return l_unit()
+        }
+        if n == "ignore" {
+          let _ = lb_exprs(b, raw_args)
+          return l_unit()
+        }
+      }
+    _ => ()
+  }
+  // `extern "C"` functions.
+  let ext : Option[(String, ExternFnInfo)] = match callee {
+    EIdent(n, _) =>
+      match b.tc.extern_fns.get(n) {
+        Some(ei) => Some((b.pkg, ei))
+        None => None
+      }
+    EPath(q, m, _) =>
+      match resolve_alias_pkg(b.tc, q) {
+        Some(ip) =>
+          match ip.tc.extern_fns.get(m) {
+            Some(ei) => Some((ip.name, ei))
+            None => None
+          }
+        None => None
+      }
+    _ => None
+  }
+  match ext {
+    Some((epkg, ei)) => {
+      let key = "ext:" + epkg + "::" + ei.decl.name
+      lg_enqueue(b.g, key)
+      let vs = lb_exprs(b, raw_args)
+      let args : Array[LArg] = []
+      let mut i = 0
+      while i < vs.length() {
+        args.push(AVal(vs[i]))
+        i = i + 1
+      }
+      return lb_emit_call(b, ty, CItem(key, [], []), args, [])
+    }
+    None => ()
+  }
+  if target.length() == 0 || drv_l_starts_with(target, "builtin::") || drv_l_starts_with(target, "closure::") {
+    lb_err(b, sp, "unsupported call target `" + target + "`", target)
+    return l_unit()
+  }
+  let qp = split_qual_name(target)
+  match lg_find_fn(b.g, qp.prefix, qp.name) {
+    Some(fi) => lb_call_user(b, "fn:" + target, qp.prefix, fi, raw_args, None, false, sp, ty)
+    None => {
+      lb_err(b, sp, "unknown callee `" + target + "`", target)
+      l_unit()
+    }
+  }
+}
+
+///|
+fn drv_l_starts_with(s : String, p : String) -> Bool {
+  s.length() >= p.length() && slice_str(s, 0, p.length()) == p
+}
+
+///|
+fn lb_builtin_static(b : LB, q : String, m : String, raw_args : Array[Expr], ty : Ty, sp : Span) -> LExpr {
+  let vs = lb_exprs(b, raw_args)
+  let ns = if q == "Array" {
+    "Pion.Array"
+  } else if q == "FixedArray" {
+    "Pion.FixedArray"
+  } else {
+    "Pion.Bytes"
+  }
+  if q == "Array" && (m == "new" || m == "with_capacity") {
+    return LPure("Pion.Array.new", [], ty)
+  }
+  if (q == "Array" || q == "FixedArray") && m == "make" && vs.length() == 2 {
+    return LPure(ns + ".make", vs, ty)
+  }
+  if q == "FixedArray" && m == "from_array" && vs.length() == 1 {
+    return LPure(ns + ".from_array", vs, ty)
+  }
+  if q == "Bytes" && m == "new" {
+    if vs.length() == 0 {
+      return LPure("Pion.Bytes.new", [l_int_lit(0, TInt)], ty)
+    }
+    return LPure("Pion.Bytes.new", vs, ty)
+  }
+  lb_err(b, sp, "unsupported builtin `" + q + "::" + m + "`", q + "::" + m)
+  l_unit()
+}
+
+///|
+fn l_elem_ty(t : Ty) -> Ty {
+  match t {
+    TArray(e) | TFixedArray(e) => e
+    TBytes => TByte
+    _ => TError
+  }
+}
+
+///|
+/// `recv.m(args)` on a builtin type.
+fn lb_builtin_method(
+  b : LB,
+  obj : Expr,
+  m : String,
+  raw_args : Array[Expr],
+  ty : Ty,
+  sp : Span,
+) -> LExpr {
+  let rt = lb_expr_ty(b, obj)
+  match rt {
+    TArray(_) | TFixedArray(_) | TBytes => {
+      let ns = l_container_ns(rt)
+      let mutating = m == "push" ||
+        m == "pop" ||
+        m == "clear" ||
+        m == "reverse" ||
+        m == "fill" ||
+        m == "swap"
+      if mutating {
+        let pl = match lb_place(b, obj) {
+          Some(p) => p
+          None => {
+            lb_err(b, sp, "`." + m + "()` needs a mutable place receiver", "expression")
+            return l_unit()
+          }
+        }
+        let cur0 = lb_place_read(b, pl)
+        let cur = if l_exprs_write(b.tc, raw_args) { lb_snapshot(b, cur0) } else { cur0 }
+        let vs = lb_exprs(b, raw_args)
+        if m == "swap" {
+          let n = lb_temp(b, rt)
+          let args : Array[LArg] = [AVal(cur)]
+          let mut i = 0
+          while i < vs.length() {
+            args.push(AVal(vs[i]))
+            i = i + 1
+          }
+          lb_emit(b, LSCall(n, rt, CBuiltin(ns + ".swap"), args, [], false))
+          lb_place_write(b, pl, LVar(n, rt))
+          return l_unit()
+        }
+        if m == "pop" {
+          let et = l_elem_ty(rt)
+          let pt = TTuple([TOption(et), rt])
+          let n = lb_temp(b, pt)
+          lb_emit(b, LSLet(n, pt, LPure(ns + ".pop", [cur], pt)))
+          lb_place_write(b, pl, LTupleGet(LVar(n, pt), 1, pt))
+          return LTupleGet(LVar(n, pt), 0, pt)
+        }
+        let all : Array[LExpr] = [cur]
+        let mut i = 0
+        while i < vs.length() {
+          all.push(vs[i])
+          i = i + 1
+        }
+        lb_place_write(b, pl, LPure(ns + "." + m, all, rt))
+        return l_unit()
+      }
+      let ov = lb_expr(b, obj)
+      let ov2 = if l_exprs_write(b.tc, raw_args) { lb_snapshot(b, ov) } else { ov }
+      let vs = lb_exprs(b, raw_args)
+      let all : Array[LExpr] = [ov2]
+      let mut i = 0
+      while i < vs.length() {
+        all.push(vs[i])
+        i = i + 1
+      }
+      if m == "length" || m == "get" {
+        let n = lb_temp(b, ty)
+        let args : Array[LArg] = []
+        i = 0
+        while i < all.length() {
+          args.push(AVal(all[i]))
+          i = i + 1
+        }
+        lb_emit(b, LSCall(n, ty, CBuiltin(ns + "." + m), args, [], false))
+        return LVar(n, ty)
+      }
+      if m == "copy" || m == "contains" {
+        return LPure(ns + "." + m, all, ty)
+      }
+    }
+    TString => {
+      let ov = lb_expr(b, obj)
+      if m == "length" {
+        let n = lb_temp(b, TInt)
+        lb_emit(b, LSCall(n, TInt, CBuiltin("Pion.String.length"), [AVal(ov)], [], false))
+        return LVar(n, TInt)
+      }
+    }
+    TOption(_) | TResult(_, _) => {
+      let ns = match rt {
+        TOption(_) => "Pion.Option"
+        _ => "Pion.Res"
+      }
+      if m == "is_some" || m == "is_none" || m == "is_ok" || m == "is_err" || m == "unwrap_or" {
+        let ov = lb_expr(b, obj)
+        let ov2 = if l_exprs_write(b.tc, raw_args) { lb_snapshot(b, ov) } else { ov }
+        let vs = lb_exprs(b, raw_args)
+        let all : Array[LExpr] = [ov2]
+        let mut i = 0
+        while i < vs.length() {
+          all.push(vs[i])
+          i = i + 1
+        }
+        return LPure(ns + "." + m, all, ty)
+      }
+    }
+    TInt | TInt64 | TUInt | TUInt64 | TByte => {
+      let conv = m == "to_int" ||
+        m == "to_int64" ||
+        m == "to_uint" ||
+        m == "to_uint64" ||
+        m == "reinterpret_as_uint" ||
+        m == "reinterpret_as_int" ||
+        m == "reinterpret_as_uint64" ||
+        m == "reinterpret_as_int64" ||
+        m == "abs" ||
+        m == "to_byte"
+      if conv && raw_args.length() == 0 {
+        let ov = lb_expr(b, obj)
+        return LPure(l_scalar_ns(rt) + "." + m, [ov], ty)
+      }
+    }
+    _ => ()
+  }
+  lb_err(b, sp, "unsupported builtin method `" + ty_to_string(rt) + "::" + m + "`", ty_to_string(rt) + "::" + m)
+  l_unit()
+}
+
+///|
+/// The trait (of `tparam`'s bounds) that declares method `m`.
+fn lb_bound_trait_for(b : LB, tparam : String, m : String) -> Option[(String, TraitInfo)] {
+  match b.bounds.get(tparam) {
+    Some(trs) => {
+      let mut i = 0
+      while i < trs.length() {
+        match lg_trait(b.g, trs[i]) {
+          Some(ti) => {
+            let mut j = 0
+            while j < ti.methods.length() {
+              if ti.methods[j].name == m {
+                return Some((trs[i], ti))
+              }
+              j = j + 1
+            }
+          }
+          None => ()
+        }
+        i = i + 1
+      }
+      None
+    }
+    None => None
+  }
+}
+
+///|
+fn lb_method(b : LB, e : Expr) -> LExpr {
+  let (obj, m, raw_args, sp) = match e {
+    EMethodCall(o, mm, a, s) => (o, mm, a, s)
+    _ => return l_unit()
+  }
+  let ty = lb_expr_ty(b, e)
+  let recv_mut = b.tc.mut_recv_calls.contains(span_key(sp))
+  let raw_rt = match b.tc.expr_tys.get(span_key(expr_span(obj))) {
+    Some(t) => t
+    None => TError
+  }
+  match raw_rt {
+    TParam(tp) =>
+      match lb_bound_trait_for(b, tp, m) {
+        Some((tk, ti)) => {
+          let mut mi = 0
+          while mi < ti.methods.length() {
+            if ti.methods[mi].name == m {
+              break
+            }
+            mi = mi + 1
+          }
+          let tm = ti.methods[mi]
+          let tdecl = ti.decl.methods[mi]
+          let qp = split_qual_name(tk)
+          let self_sub : Map[String, Ty] = Map([])
+          self_sub.set("Self", TParam(tp))
+          let slots : Array[Expr] = [obj]
+          let tys : Array[Ty] = [TParam(tp)]
+          let muts : Array[Bool] = [recv_mut]
+          let wraps : Array[Bool] = [false]
+          let mut k = 1
+          while k < tdecl.params.length() {
+            if k - 1 < raw_args.length() {
+              slots.push(raw_args[k - 1])
+            }
+            tys.push(subst_ty(l_gq_ty(qp.prefix, tm.param_tys[k]), self_sub))
+            muts.push(tdecl.params[k].is_mut)
+            wraps.push(false)
+            k = k + 1
+          }
+          let args : Array[LArg] = []
+          let places : Array[LPlace] = []
+          lb_call_args(b, slots, tys, muts, wraps, args, places)
+          return lb_emit_call(b, ty, CDictMethod(LDParam(tp, tk), m), args, places)
+        }
+        None => {
+          lb_err(b, sp, "no trait bound of `" + tp + "` declares `" + m + "`", tp)
+          return l_unit()
+        }
+      }
+    TStruct(sname, _) | TEnum(sname, _) => {
+      let gname = l_gq(b.pkg, sname)
+      let qp = split_qual_name(gname)
+      match lg_find_fn(b.g, qp.prefix, qp.name + "::" + m) {
+        Some(fi) =>
+          return lb_call_user(b, "fn:" + gname + "::" + m, qp.prefix, fi, raw_args, Some(obj), recv_mut, sp, ty)
+        None => ()
+      }
+    }
+    _ => ()
+  }
+  // `impl Trait for Type` method called on a concrete type.
+  let tname = ty_base_name(raw_rt)
+  let mut i = 0
+  while i < b.tc.impl_keys.length() {
+    match b.tc.impls.get(b.tc.impl_keys[i]) {
+      Some(ii) =>
+        if ii.target_type == tname {
+          match ii.methods.get(m) {
+            Some(fi) => {
+              let gtrait = l_gq(b.pkg, ii.trait_name)
+              let gt = lb_ty_of(b, raw_rt)
+              let ikey = ii.pkg_name + "|" + gtrait + "|" + l_target_gname(gt)
+              lg_enqueue(b.g, "impl:" + ikey)
+              lg_enqueue(b.g, "trait:" + gtrait)
+              return lb_call_user(b, "implfn:" + ikey + "|" + m, b.pkg, fi, raw_args, Some(obj), recv_mut, sp, ty)
+            }
+            None => ()
+          }
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  lb_builtin_method(b, obj, m, raw_args, ty, sp)
+}
+
+// ---------------------------------------------------------------------------
+// Branch code: what a branch of a desugared condition / match runs.
+// ---------------------------------------------------------------------------
+
+///|
+enum LCode {
+  /// A block of statements (its tail is the value).
+  LCStmts(Array[Stmt])
+  /// An expression (a match arm body, an `else if`).
+  LCExpr(Expr)
+  /// A ready value.
+  LCValue(LExpr)
+  /// Nothing (`if` without `else`).
+  LCEmpty
+  /// The rest of the enclosing block from statement `i` (after a `guard ... is`).
+  LCRest(Array[Stmt], Int)
+  /// A nested condition `if c { then } else { else }`.
+  LCCond(Expr, LCode, LCode)
+  /// A statement list run for effect followed by `break` (`while` exit).
+  LCBreak
+  /// Diverging `guard` else-block.
+  LCDiverge(Array[Stmt])
+  /// A loop body: its statements, then the loop's `continue` prelude.
+  LCLoopBody(Array[Stmt])
+}
+
+///|
+fn l_else_code(els : Option[Expr]) -> LCode {
+  match els {
+    None => LCEmpty
+    Some(EBlock(ss, _)) => LCStmts(ss)
+    Some(x) => LCExpr(x)
+  }
+}
+
+///|
+/// Lowers a branch into a block producing a value of type `ty` (when wanted).
+fn lb_code_block(b : LB, code : LCode, ty : Ty) -> LBlock {
+  let want = l_wants_value(ty)
+  lb_open(b)
+  lb_push_scope(b)
+  let tail : Option[LExpr] = match code {
+    LCStmts(ss) => lb_stmts(b, ss, 0, want)
+    LCExpr(x) => {
+      let v = lb_expr(b, x)
+      if want {
+        Some(v)
+      } else {
+        None
+      }
+    }
+    LCValue(v) => if want { Some(v) } else { None }
+    LCEmpty => None
+    LCRest(ss, i) => lb_stmts(b, ss, i, want)
+    LCCond(c, t, f) => {
+      let v = lb_cond_branch(b, c, t, f, ty)
+      if want {
+        Some(v)
+      } else {
+        None
+      }
+    }
+    LCBreak => {
+      lb_emit(b, LSBreak)
+      None
+    }
+    LCDiverge(ss) => {
+      let _ = lb_stmts(b, ss, 0, false)
+      None
+    }
+    LCLoopBody(ss) => {
+      let _ = lb_stmts(b, ss, 0, false)
+      lb_emit_prelude(b)
+      None
+    }
+  }
+  lb_pop_scope(b)
+  lb_close(b, tail)
+}
+
+///|
+/// Whether `cond` needs structural desugaring (`is` patterns in an `&&` chain).
+fn l_cond_has_is(cond : Expr) -> Bool {
+  match cond {
+    EIs(_, _, _) => true
+    EBinary(op, l, r, _) => op == "&&" && (l_cond_has_is(l) || l_cond_has_is(r))
+    _ => false
+  }
+}
+
+///|
+/// `if cond { then } else { else }` where `cond` may chain `is` patterns with
+/// `&&`: `a && b` -> `if a { if b {T} else {E} } else {E}`, `e is P` ->
+/// `match e { P => T, _ => E }` (pattern bindings scope over the rest of the
+/// chain and the then-branch). Returns the value (unit when none).
+fn lb_cond_branch(b : LB, cond : Expr, then_c : LCode, else_c : LCode, ty : Ty) -> LExpr {
+  let want = l_wants_value(ty)
+  match cond {
+    EBinary("&&", l, r, _) =>
+      if l_cond_has_is(cond) {
+        return lb_cond_branch(b, l, LCCond(r, then_c, else_c), else_c, ty)
+      }
+    EIs(x, pat, _) => {
+      let sv0 = lb_expr(b, x)
+      let sv = lb_atom(b, sv0)
+      let st = l_expr_ty(sv)
+      let dest = if want { lb_temp(b, ty) } else { "" }
+      let arms : Array[LMArm] = [
+        LMArm::{ pat: pat, guard_e: None, code: then_c },
+        LMArm::{ pat: PWild(expr_span(x)), guard_e: None, code: else_c },
+      ]
+      lb_match_arms(b, sv, st, arms, 0, dest, ty)
+      return if want { LVar(dest, ty) } else { l_unit() }
+    }
+    _ => ()
+  }
+  let c = lb_expr(b, cond)
+  let tb = lb_code_block(b, then_c, ty)
+  let eb = lb_code_block(b, else_c, ty)
+  if want && tb.stmts.length() == 0 && eb.stmts.length() == 0 {
+    match (tb.tail, eb.tail) {
+      (Some(tv), Some(ev)) => return LIte(c, tv, ev, ty)
+      _ => ()
+    }
+  }
+  let dest = if want { lb_temp(b, ty) } else { "" }
+  lb_emit(b, LSIf(c, tb, eb, dest, ty))
+  if want {
+    LVar(dest, ty)
+  } else {
+    l_unit()
+  }
+}
+
+///|
+fn l_and_all(cs : Array[LExpr]) -> LExpr {
+  let mut acc = cs[0]
+  let mut i = 1
+  while i < cs.length() {
+    acc = LBin("&&", acc, cs[i], TBool)
+    i = i + 1
+  }
+  acc
+}
+
+///|
+fn lb_if(b : LB, cond : Expr, then_c : LCode, else_c : LCode, ty : Ty) -> LExpr {
+  lb_cond_branch(b, cond, then_c, else_c, ty)
+}
+
+// ---------------------------------------------------------------------------
+// Patterns and match compilation.
+// ---------------------------------------------------------------------------
+
+///|
+struct LMArm {
+  pat : Pattern
+  guard_e : Option[Expr]
+  code : LCode
+}
+
+///|
+/// Payload types of variant `v` of a scrutinee type, or None.
+fn lb_variant_tys(b : LB, st : Ty, v : String) -> Option[(String, Array[Ty])] {
+  match st {
+    TOption(e) =>
+      if v == "Some" {
+        Some(("Option", [e]))
+      } else if v == "None" {
+        Some(("Option", []))
+      } else {
+        None
+      }
+    TResult(o, er) =>
+      if v == "Ok" {
+        Some(("Result", [o]))
+      } else if v == "Err" {
+        Some(("Result", [er]))
+      } else {
+        None
+      }
+    TEnum(gname, args) =>
+      match lg_enum(b.g, gname) {
+        Some(ei) => {
+          let qp = split_qual_name(gname)
+          let mut i = 0
+          while i < ei.variants.length() {
+            if ei.variants[i].name == v {
+              let tys : Array[Ty] = []
+              let mut j = 0
+              while j < ei.variants[i].field_tys.length() {
+                tys.push(l_inst(ei.decl.type_params, args, l_gq_ty(qp.prefix, ei.variants[i].field_tys[j])))
+                j = j + 1
+              }
+              return Some((gname, tys))
+            }
+            i = i + 1
+          }
+          None
+        }
+        None => None
+      }
+    _ => None
+  }
+}
+
+///|
+/// Converts a pattern: binders are declared in the current scope; literal
+/// sub-patterns become fresh binders plus equality checks.
+fn lb_pat(b : LB, p : Pattern, st : Ty) -> (LPat, Array[LExpr]) {
+  let checks : Array[LExpr] = []
+  let lp = lb_pat_into(b, p, st, checks)
+  (lp, checks)
+}
+
+///|
+fn lb_pat_into(b : LB, p : Pattern, st : Ty, checks : Array[LExpr]) -> LPat {
+  match p {
+    PWild(_) => LPWild
+    PIdent(n, _) => {
+      let v = lb_declare(b, n, st)
+      LPVar(v, st)
+    }
+    PBool(v, _) => LPBool(v)
+    PInt(s, _) => {
+      let v = lb_temp(b, st)
+      checks.push(LBin("==", LVar(v, st), LLit(l_lit_kind(st), l_int_text(s, st, false), st), st))
+      LPVar(v, st)
+    }
+    PString(s, _) => {
+      let v = lb_temp(b, st)
+      checks.push(LBin("==", LVar(v, st), LLit("string", s, TString), st))
+      LPVar(v, st)
+    }
+    PChar(s, _) => {
+      let v = lb_temp(b, st)
+      let lit = match st {
+        TByte => LLit("byte", qbe_parse_char_lit(s).to_string(), TByte)
+        _ => LLit("char", qbe_parse_char_lit(s).to_string(), TChar)
+      }
+      checks.push(LBin("==", LVar(v, st), lit, st))
+      LPVar(v, st)
+    }
+    PVariant(_, vname, subs, sp) =>
+      match lb_variant_tys(b, st, vname) {
+        Some((ek, tys)) => {
+          let out : Array[LPat] = []
+          let mut i = 0
+          while i < subs.length() {
+            let t = if i < tys.length() { tys[i] } else { TError }
+            out.push(lb_pat_into(b, subs[i], t, checks))
+            i = i + 1
+          }
+          // `Some` written without its payload pattern (`Some(_)` is required
+          // by Pion; keep arity anyway).
+          while out.length() < tys.length() {
+            out.push(LPWild)
+          }
+          LPCtor(ek, vname, out)
+        }
+        None => {
+          lb_err(b, sp, "unknown variant `" + vname + "` for " + ty_to_string(st), vname)
+          LPWild
+        }
+      }
+    PTuple(subs, _) => {
+      let tys = match st {
+        TTuple(es) => es
+        _ => []
+      }
+      let out : Array[LPat] = []
+      let mut i = 0
+      while i < subs.length() {
+        let t = if i < tys.length() { tys[i] } else { TError }
+        out.push(lb_pat_into(b, subs[i], t, checks))
+        i = i + 1
+      }
+      LPTuple(out)
+    }
+  }
+}
+
+///|
+fn l_pat_simple(p : Pattern) -> Bool {
+  match p {
+    PInt(_, _) | PString(_, _) | PChar(_, _) => false
+    PVariant(_, _, subs, _) | PTuple(subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        if !l_pat_simple(subs[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => true
+  }
+}
+
+///|
+fn l_lpat_irrefutable(p : LPat) -> Bool {
+  match p {
+    LPWild | LPVar(_, _) => true
+    LPTuple(ps) => {
+      let mut i = 0
+      while i < ps.length() {
+        if !l_lpat_irrefutable(ps[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+/// Emits the match of `sv` against `arms[from..]`, delivering the value into
+/// `dest`. Arms without guards / literal sub-patterns become one native
+/// `match`; a guarded / literal arm `P if g => B` becomes
+/// `match sv { P => if checks && g { B } else { REST }, _ => REST }` where
+/// REST matches the remaining arms (failed guards fall through).
+fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, dest : String, ty : Ty) -> Unit {
+  if from >= arms.length() {
+    lb_emit(b, LSPanic)
+    return
+  }
+  let mut all_simple = true
+  let mut k = from
+  while k < arms.length() {
+    match arms[k].guard_e {
+      Some(_) => all_simple = false
+      None => ()
+    }
+    if !l_pat_simple(arms[k].pat) {
+      all_simple = false
+    }
+    k = k + 1
+  }
+  if all_simple {
+    // A leading `_` / `x` arm matches everything: no `match`.
+    let lead_irref = match arms[from].pat {
+      PWild(_) | PIdent(_, _) => true
+      _ => false
+    }
+    if lead_irref {
+      lb_push_scope(b)
+      let (lp, _) = lb_pat(b, arms[from].pat, st)
+      match lp {
+        LPVar(v, vt) => lb_emit(b, LSLet(v, vt, sv))
+        _ => ()
+      }
+      let body = lb_code_block(b, arms[from].code, ty)
+      lb_pop_scope(b)
+      l_inline_block(b, body, dest, ty)
+      return
+    }
+    let larms : Array[LArm] = []
+    k = from
+    while k < arms.length() {
+      lb_open(b)
+      lb_push_scope(b)
+      let (lp, _) = lb_pat(b, arms[k].pat, st)
+      let body = lb_code_block(b, arms[k].code, ty)
+      lb_pop_scope(b)
+      let pre = lb_close(b, None)
+      larms.push(LArm::{ pat: lp, body: l_concat_block(pre.stmts, body) })
+      k = k + 1
+    }
+    lb_emit(b, LSMatch(sv, st, larms, dest, ty))
+    return
+  }
+  let arm = arms[from]
+  let want = l_wants_value(ty)
+  // REST: the remaining arms, as a block.
+  lb_open(b)
+  let rest_dest = if want { lb_temp(b, ty) } else { "" }
+  lb_match_arms(b, sv, st, arms, from + 1, rest_dest, ty)
+  let rest = lb_close(b, if want { Some(LVar(rest_dest, ty)) } else { None })
+  // The arm itself.
+  lb_push_scope(b)
+  lb_open(b)
+  let (lp, checks) = lb_pat(b, arm.pat, st)
+  let irref = l_lpat_irrefutable(lp)
+  if irref {
+    match lp {
+      LPVar(v, vt) => lb_emit(b, LSLet(v, vt, sv))
+      LPTuple(_) => lb_emit_tuple_bind(b, lp, sv)
+      _ => ()
+    }
+  }
+  let conds : Array[LExpr] = []
+  let mut ci = 0
+  while ci < checks.length() {
+    conds.push(checks[ci])
+    ci = ci + 1
+  }
+  match arm.guard_e {
+    Some(gx) => conds.push(lb_expr(b, gx))
+    None => ()
+  }
+  let body = lb_code_block(b, arm.code, ty)
+  if irref {
+    // `x if g => B` / literal pattern: no `match`, just `if g { B } else { REST }`.
+    if conds.length() > 0 {
+      lb_emit(b, LSIf(l_and_all(conds), body, rest, dest, ty))
+    } else {
+      l_inline_block(b, body, dest, ty)
+    }
+    let pre = lb_close(b, None)
+    lb_pop_scope(b)
+    l_inline_block(b, pre, "", ty)
+    return
+  }
+  let inner_dest = if want { lb_temp(b, ty) } else { "" }
+  if conds.length() > 0 {
+    lb_emit(b, LSIf(l_and_all(conds), body, rest, inner_dest, ty))
+  }
+  let arm_block0 = lb_close(b, None)
+  lb_pop_scope(b)
+  let arm_block = if conds.length() > 0 {
+    LBlock::{ stmts: arm_block0.stmts, tail: if want { Some(LVar(inner_dest, ty)) } else { None } }
+  } else {
+    l_concat_block(arm_block0.stmts, body)
+  }
+  lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: rest }], dest, ty))
+}
+
+///|
+/// Binds an irrefutable tuple pattern (`LPTuple` of binders / wildcards).
+fn lb_emit_tuple_bind(b : LB, lp : LPat, sv : LExpr) -> Unit {
+  match lp {
+    LPTuple(ps) => {
+      let st = l_expr_ty(sv)
+      let tys = match st {
+        TTuple(es) => es
+        _ => []
+      }
+      let mut i = 0
+      while i < ps.length() {
+        let t = if i < tys.length() { tys[i] } else { TError }
+        match ps[i] {
+          LPVar(v, vt) => lb_emit(b, LSLet(v, vt, LTupleGet(sv, i, st)))
+          LPTuple(_) => lb_emit_tuple_bind(b, ps[i], LTupleGet(sv, i, st))
+          _ => ()
+        }
+        let _ = t
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn l_concat_block(pre : Array[LStmt], body : LBlock) -> LBlock {
+  if pre.length() == 0 {
+    return body
+  }
+  let out : Array[LStmt] = []
+  let mut i = 0
+  while i < pre.length() {
+    out.push(pre[i])
+    i = i + 1
+  }
+  i = 0
+  while i < body.stmts.length() {
+    out.push(body.stmts[i])
+    i = i + 1
+  }
+  LBlock::{ stmts: out, tail: body.tail }
+}
+
+///|
+/// Appends a block's statements to the current block and delivers its value
+/// into `dest`.
+fn l_inline_block(b : LB, blk : LBlock, dest : String, ty : Ty) -> Unit {
+  let mut i = 0
+  while i < blk.stmts.length() {
+    lb_emit(b, blk.stmts[i])
+    i = i + 1
+  }
+  if dest.length() > 0 {
+    match blk.tail {
+      Some(v) => {
+        match v {
+          LVar(t, _) => if lb_retarget(b, t, dest, false) { return }
+          _ => ()
+        }
+        lb_emit(b, LSLet(dest, ty, v))
+      }
+      None => ()
+    }
+  }
+}
+
+///|
+fn lb_match(b : LB, scrut : Expr, arms : Array[MatchArm], ty : Ty) -> LExpr {
+  let sv0 = lb_expr(b, scrut)
+  let sv = lb_atom(b, sv0)
+  let st = l_expr_ty(sv)
+  let marms : Array[LMArm] = []
+  let mut i = 0
+  while i < arms.length() {
+    marms.push(LMArm::{ pat: arms[i].pat, guard_e: arms[i].guard_expr, code: LCExpr(arms[i].body) })
+    i = i + 1
+  }
+  let want = l_wants_value(ty)
+  let dest = if want { lb_temp(b, ty) } else { "" }
+  lb_match_arms(b, sv, st, marms, 0, dest, ty)
+  if want {
+    LVar(dest, ty)
+  } else {
+    l_unit()
+  }
+}
+
+///|
+/// `e?` on `Option` / `Result`: `match e { Some(x) => x, None => return None }`
+/// / `match e { Ok(x) => x, Err(err) => return Err(err) }`.
+fn lb_try(b : LB, inner : Expr, sp : Span) -> LExpr {
+  let v = lb_atom(b, lb_expr(b, inner))
+  let it = l_expr_ty(v)
+  match it {
+    TOption(t) => {
+      let dest = lb_temp(b, t)
+      let x = lb_temp(b, t)
+      let some_arm = LArm::{ pat: LPCtor("Option", "Some", [LPVar(x, t)]), body: LBlock::{ stmts: [], tail: Some(LVar(x, t)) } }
+      let none_arm = LArm::{ pat: LPCtor("Option", "None", []), body: LBlock::{ stmts: [LSReturn(LCtor("Option", "None", [], b.ret_ty))], tail: None } }
+      lb_emit(b, LSMatch(v, it, [some_arm, none_arm], dest, t))
+      LVar(dest, t)
+    }
+    TResult(t, et) => {
+      let dest = lb_temp(b, t)
+      let x = lb_temp(b, t)
+      let er = lb_temp(b, et)
+      let ok_arm = LArm::{ pat: LPCtor("Result", "Ok", [LPVar(x, t)]), body: LBlock::{ stmts: [], tail: Some(LVar(x, t)) } }
+      let err_arm = LArm::{ pat: LPCtor("Result", "Err", [LPVar(er, et)]), body: LBlock::{ stmts: [LSReturn(LCtor("Result", "Err", [LVar(er, et)], b.ret_ty))], tail: None } }
+      lb_emit(b, LSMatch(v, it, [ok_arm, err_arm], dest, t))
+      LVar(dest, t)
+    }
+    _ => {
+      lb_err(b, sp, "`?` on " + ty_to_string(it), ty_to_string(it))
+      l_unit()
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Statements.
+// ---------------------------------------------------------------------------
+
+///|
+fn l_stmt_diverges(s : LStmt) -> Bool {
+  match s {
+    LSReturn(_) | LSBreak | LSContinue | LSPanic => true
+    _ => false
+  }
+}
+
+///|
+/// Whether the current block already ended in a diverging statement.
+fn lb_diverged(b : LB) -> Bool {
+  let cur = lb_cur(b)
+  cur.length() > 0 && l_stmt_diverges(cur[cur.length() - 1])
+}
+
+///|
+/// Binds `v` to the new variable `n` (retargeting a just-emitted temporary).
+fn lb_bind(b : LB, n : String, ty : Ty, v : LExpr) -> Unit {
+  match v {
+    LVar(t, _) => if lb_retarget(b, t, n, false) { return }
+    _ => ()
+  }
+  lb_emit(b, LSLet(n, ty, v))
+}
+
+///|
+/// Lowers `stmts[from..]`; returns the block's value when `want`.
+fn lb_stmts(b : LB, stmts : Array[Stmt], from : Int, want : Bool) -> Option[LExpr] {
+  let mut i = from
+  while i < stmts.length() {
+    if lb_diverged(b) {
+      return None
+    }
+    let is_last = i == stmts.length() - 1
+    match stmts[i] {
+      SExpr(e, _) =>
+        if is_last && want {
+          return Some(lb_expr(b, e))
+        } else {
+          let _ = lb_expr(b, e)
+        }
+      SGuard(cond, else_body, _) =>
+        if l_cond_has_is(cond) {
+          // `guard e is P else { ... }`: the rest of the block runs in the
+          // pattern's scope.
+          let ty = if want { b.ret_ty } else { TUnit }
+          let vt = if want { lb_block_value_ty(b, stmts) } else { TUnit }
+          let _ = ty
+          let v = lb_cond_branch(b, cond, LCRest(stmts, i + 1), LCDiverge(else_body), vt)
+          return if want { Some(v) } else { None }
+        } else {
+          let c = lb_expr(b, cond)
+          lb_open(b)
+          lb_push_scope(b)
+          let _ = lb_stmts(b, else_body, 0, false)
+          lb_pop_scope(b)
+          let eb = lb_close(b, None)
+          lb_emit(b, LSIf(LUn("!", c, TBool), eb, LBlock::{ stmts: [], tail: None }, "", TUnit))
+        }
+      s => lb_stmt(b, s)
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+/// Type of a block's tail value (its last expression statement).
+fn lb_block_value_ty(b : LB, stmts : Array[Stmt]) -> Ty {
+  if stmts.length() == 0 {
+    return TUnit
+  }
+  match stmts[stmts.length() - 1] {
+    SExpr(e, _) => lb_expr_ty(b, e)
+    _ => TUnit
+  }
+}
+
+///|
+fn lb_stmt(b : LB, s : Stmt) -> Unit {
+  match s {
+    SLet(name, _, _, init, sp) => {
+      let ty0 = match b.tc.let_infer.get(span_key(sp)) {
+        Some(t) => lb_ty_of(b, t)
+        None => lb_expr_ty(b, init)
+      }
+      let v = lb_expr(b, init)
+      let ty = match ty0 {
+        TError => l_expr_ty(v)
+        _ => ty0
+      }
+      let n = lb_declare(b, name, ty)
+      lb_bind(b, n, ty, v)
+    }
+    SLetTuple(names, _, init, sp) => {
+      let v = lb_expr(b, init)
+      let ty = match lb_expr_ty(b, init) {
+        TError => l_expr_ty(v)
+        t => t
+      }
+      let tys = match ty {
+        TTuple(es) => es
+        _ => {
+          lb_err(b, sp, "tuple destructuring of " + ty_to_string(ty), ty_to_string(ty))
+          []
+        }
+      }
+      let ns : Array[String] = []
+      let mut i = 0
+      while i < names.length() {
+        let t = if i < tys.length() { tys[i] } else { TError }
+        ns.push(lb_declare(b, names[i], t))
+        i = i + 1
+      }
+      lb_emit(b, LSLetTuple(ns, tys, v))
+    }
+    SAssign(lhs, rhs, sp) =>
+      match lhs {
+        EIdent(n, _) =>
+          match lb_lookup(b, n) {
+            Some(ln) => {
+              let v = lb_expr(b, rhs)
+              match v {
+                LVar(t, _) => if lb_retarget(b, t, ln, true) { return }
+                _ => ()
+              }
+              lb_emit(b, LSAssign(ln, v))
+            }
+            None => lb_err(b, sp, "assignment to unknown `" + n + "`", n)
+          }
+        _ =>
+          match lb_place(b, lhs) {
+            Some(pl) => {
+              let v = lb_expr(b, rhs)
+              lb_place_write(b, pl, v)
+            }
+            None => lb_err(b, sp, "unsupported assignment target", "expression")
+          }
+      }
+    SCompoundAssign(op, lhs, rhs, sp) =>
+      match lb_place(b, lhs) {
+        Some(pl) => {
+          let cur0 = lb_place_read(b, pl)
+          let cur = if l_expr_writes(b.tc, rhs) { lb_snapshot(b, cur0) } else { cur0 }
+          let rv = lb_expr(b, rhs)
+          let bop = if slice_str(op, op.length() - 1, op.length()) == "=" {
+            slice_str(op, 0, op.length() - 1)
+          } else {
+            op
+          }
+          let nv = lb_apply_binop(b, bop, cur, rv, l_place_ty(pl), sp)
+          lb_place_write(b, pl, nv)
+        }
+        None => lb_err(b, sp, "unsupported compound assignment target", "expression")
+      }
+    SWhile(cond, body, _) => {
+      lb_open(b)
+      b.preludes.push(PNone)
+      lb_push_scope(b)
+      let _ = lb_cond_branch(b, cond, LCLoopBody(body), LCBreak, TUnit)
+      lb_pop_scope(b)
+      let _ = b.preludes.pop()
+      let lbody = lb_close(b, None)
+      lb_emit(b, LSLoop(lbody))
+    }
+    SFor(init, cond, step, body, _) => {
+      lb_push_scope(b)
+      lb_stmt(b, init)
+      lb_open(b)
+      b.preludes.push(PStep(step))
+      lb_push_scope(b)
+      let _ = lb_cond_branch(b, cond, LCLoopBody(body), LCBreak, TUnit)
+      lb_pop_scope(b)
+      let _ = b.preludes.pop()
+      let lbody = lb_close(b, None)
+      lb_emit(b, LSLoop(lbody))
+      lb_pop_scope(b)
+    }
+    SForRange(var, start, end, inclusive, body, _) => {
+      let ty = match lb_expr_ty(b, start) {
+        TError => TInt
+        t => t
+      }
+      let sv = lb_expr(b, start)
+      let ev = lb_snapshot(b, lb_expr(b, end))
+      lb_push_scope(b)
+      let iv = lb_declare(b, var, ty)
+      lb_emit(b, LSLet(iv, ty, sv))
+      if inclusive {
+        // `a..=b` never computes `b + 1` (no overflow at `MAX`).
+        let done = lb_fresh(b, "__done")
+        b.var_tys.set(done, TBool)
+        lb_emit(b, LSLet(done, TBool, LBin(">", LVar(iv, ty), ev, ty)))
+        lb_open(b)
+        b.preludes.push(PIncrIncl(iv, ev, done, ty))
+        lb_push_scope(b)
+        lb_open(b)
+        lb_push_scope(b)
+        let _ = lb_stmts(b, body, 0, false)
+        lb_emit_prelude(b)
+        lb_pop_scope(b)
+        let tb = lb_close(b, None)
+        lb_emit(b, LSIf(LUn("!", LVar(done, TBool), TBool), tb, LBlock::{ stmts: [LSBreak], tail: None }, "", TUnit))
+        lb_pop_scope(b)
+        let _ = b.preludes.pop()
+        let lbody = lb_close(b, None)
+        lb_emit(b, LSLoop(lbody))
+      } else {
+        lb_open(b)
+        b.preludes.push(PIncr(iv, ty))
+        lb_push_scope(b)
+        lb_open(b)
+        lb_push_scope(b)
+        let _ = lb_stmts(b, body, 0, false)
+        lb_emit_prelude(b)
+        lb_pop_scope(b)
+        let tb = lb_close(b, None)
+        lb_emit(b, LSIf(LBin("<", LVar(iv, ty), ev, ty), tb, LBlock::{ stmts: [LSBreak], tail: None }, "", TUnit))
+        lb_pop_scope(b)
+        let _ = b.preludes.pop()
+        let lbody = lb_close(b, None)
+        lb_emit(b, LSLoop(lbody))
+      }
+      lb_pop_scope(b)
+    }
+    SForIn(idx_name, var_name, iter, body, sp) => {
+      let av0 = lb_expr(b, iter)
+      let av = lb_atom(b, av0)
+      let at = l_expr_ty(av)
+      let et = l_elem_ty(at)
+      match at {
+        TArray(_) | TFixedArray(_) => ()
+        _ => {
+          lb_err(b, sp, "`for ... in` over " + ty_to_string(at), ty_to_string(at))
+          return
+        }
+      }
+      let ns = l_container_ns(at)
+      let ii = lb_fresh(b, "__i")
+      b.var_tys.set(ii, TInt)
+      lb_emit(b, LSLet(ii, TInt, l_int_lit(0, TInt)))
+      lb_open(b)
+      b.preludes.push(PIdx(ii))
+      lb_push_scope(b)
+      let nn = lb_temp(b, TInt)
+      lb_emit(b, LSCall(nn, TInt, CBuiltin(ns + ".length"), [AVal(av)], [], false))
+      lb_open(b)
+      lb_push_scope(b)
+      let xv = lb_declare(b, var_name, et)
+      lb_emit(b, LSCall(xv, et, CBuiltin(ns + ".get"), [AVal(av), AVal(LVar(ii, TInt))], [], false))
+      if idx_name.length() > 0 {
+        let kv = lb_declare(b, idx_name, TInt)
+        lb_emit(b, LSLet(kv, TInt, LVar(ii, TInt)))
+      }
+      let _ = lb_stmts(b, body, 0, false)
+      lb_emit_prelude(b)
+      lb_pop_scope(b)
+      let tb = lb_close(b, None)
+      lb_emit(b, LSIf(LBin("<", LVar(ii, TInt), LVar(nn, TInt), TInt), tb, LBlock::{ stmts: [LSBreak], tail: None }, "", TUnit))
+      lb_pop_scope(b)
+      let _ = b.preludes.pop()
+      let lbody = lb_close(b, None)
+      lb_emit(b, LSLoop(lbody))
+    }
+    SReturn(e, _) => {
+      let v = match e {
+        Some(x) => lb_expr(b, x)
+        None => l_unit()
+      }
+      if !lb_diverged(b) {
+        lb_emit(b, LSReturn(v))
+      }
+    }
+    SBreak(_) => lb_emit(b, LSBreak)
+    SContinue(_) => {
+      lb_emit_prelude(b)
+      if !lb_diverged(b) {
+        lb_emit(b, LSContinue)
+      }
+    }
+    SDebugAssert(cond, _, _) => {
+      let c = lb_expr(b, cond)
+      lb_emit(b, LSAssert(c))
+    }
+    SExpr(e, _) => {
+      let _ = lb_expr(b, e)
+    }
+    SGuard(_, _, _) => ()
+  }
+}
+
+///|
+/// Runs the innermost loop's `continue` prelude (the `for` step / increment).
+fn lb_emit_prelude(b : LB) -> Unit {
+  if lb_diverged(b) || b.preludes.length() == 0 {
+    return
+  }
+  match b.preludes[b.preludes.length() - 1] {
+    PNone => ()
+    PStep(st) => {
+      // The step runs in the loop's scope, outside the body's own bindings.
+      lb_stmt(b, st)
+    }
+    PIncr(iv, ty) => lb_emit(b, LSAssign(iv, LBin("+", LVar(iv, ty), l_int_lit(1, ty), ty)))
+    PIncrIncl(iv, ev, done, ty) => {
+      let tb = LBlock::{ stmts: [LSAssign(done, l_bool(true))], tail: None }
+      let eb = LBlock::{ stmts: [LSAssign(iv, LBin("+", LVar(iv, ty), l_int_lit(1, ty), ty))], tail: None }
+      lb_emit(b, LSIf(LBin("==", LVar(iv, ty), ev, ty), tb, eb, "", TUnit))
+    }
+    PIdx(ii) => lb_emit(b, LSAssign(ii, LBin("+", LVar(ii, TInt), l_int_lit(1, TInt), TInt)))
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Items.
+// ---------------------------------------------------------------------------
+
+///|
+fn l_dots(s : String) -> String {
+  let sb = StringBuilder()
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    if i + 1 < n && str_code_at(s, i) == 58 && str_code_at(s, i + 1) == 58 {
+      sb.write_string(".")
+      i = i + 2
+    } else {
+      sb.write_char(str_code_at(s, i).unsafe_to_char())
+      i = i + 1
+    }
+  }
+  sb.to_string()
+}
+
+///|
+fn l_last_seg(s : String) -> String {
+  let mut q = split_qual_name(s)
+  while q.prefix.length() > 0 && has_qual_sep(q.name) {
+    q = split_qual_name(q.name)
+  }
+  q.name
+}
+
+///|
+fn l_split_bar(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut i = 0
+  while i < s.length() {
+    if str_code_at(s, i) == 124 {
+      out.push(slice_str(s, start, i))
+      start = i + 1
+    }
+    i = i + 1
+  }
+  out.push(slice_str(s, start, s.length()))
+  out
+}
+
+///|
+fn lg_bounds(g : LG, tc : TypeChecker, decl : FnDecl, bmap : Map[String, Array[String]]) -> Array[LBound] {
+  let out : Array[LBound] = []
+  let mut bi = 0
+  while bi < decl.type_bounds.length() {
+    let tb = decl.type_bounds[bi]
+    let mut ti = 0
+    while ti < tb.traits.length() {
+      let tk = l_gq(tc.pkg_name, canon_trait_name(tc, tb.traits[ti]))
+      lg_enqueue(g, "trait:" + tk)
+      out.push(LBound::{ tparam: tb.param, trait_key: tk })
+      match bmap.get(tb.param) {
+        Some(arr) => arr.push(tk)
+        None => bmap.set(tb.param, [tk])
+      }
+      ti = ti + 1
+    }
+    bi = bi + 1
+  }
+  out
+}
+
+///|
+fn lg_eq_tparams(tc : TypeChecker, decl : FnDecl) -> Array[String] {
+  match tc.eq_tparams.get(span_key(decl.span)) {
+    Some(tps) => tps
+    None => []
+  }
+}
+
+///|
+fn lg_lower_fn(g : LG, tc : TypeChecker, key : String, lean_name : String, fi : FnInfo) -> LFnDef {
+  let decl = fi.decl
+  let b = lb_new(g, tc, decl.name, decl.type_params)
+  let bounds = lg_bounds(g, tc, decl, b.bounds)
+  let params : Array[LParam] = []
+  let mut i = 0
+  while i < decl.params.length() {
+    let t = if i < fi.param_tys.length() {
+      lb_ty_of(b, fi.param_tys[i])
+    } else {
+      TError
+    }
+    let n = lb_declare(b, decl.params[i].name, t)
+    params.push(LParam::{ name: n, ty: t, is_mut: decl.params[i].is_mut })
+    i = i + 1
+  }
+  let ret = lb_ty_of(b, fi.ret_ty)
+  b.ret_ty = ret
+  let tail = lb_stmts(b, decl.body, 0, l_wants_value(ret))
+  let body = lb_close(b, tail)
+  LFnDef::{
+    key: key,
+    pkg: tc.pkg_name,
+    lean_name: lean_name,
+    type_params: decl.type_params,
+    bounds: bounds,
+    eq_tparams: lg_eq_tparams(tc, decl),
+    params: params,
+    ret_ty: ret,
+    body: body,
+    var_tys: b.var_tys,
+    callees: b.callees,
+  }
+}
+
+///|
+fn lg_extern_of_fn(g : LG, tc : TypeChecker, key : String, lean_name : String, fi : FnInfo) -> LExternDef {
+  let decl = fi.decl
+  let bmap : Map[String, Array[String]] = Map([])
+  let bounds = lg_bounds(g, tc, decl, bmap)
+  let params : Array[LParam] = []
+  let mut i = 0
+  while i < decl.params.length() {
+    let t = if i < fi.param_tys.length() {
+      l_gq_ty(tc.pkg_name, fi.param_tys[i])
+    } else {
+      TError
+    }
+    lg_note_ty(g, t)
+    params.push(LParam::{ name: decl.params[i].name, ty: t, is_mut: decl.params[i].is_mut })
+    i = i + 1
+  }
+  let ret = l_gq_ty(tc.pkg_name, fi.ret_ty)
+  lg_note_ty(g, ret)
+  LExternDef::{
+    key: key,
+    pkg: tc.pkg_name,
+    lean_name: lean_name,
+    type_params: decl.type_params,
+    bounds: bounds,
+    eq_tparams: lg_eq_tparams(tc, decl),
+    params: params,
+    ret_ty: ret,
+    kind: "verify_opaque",
+  }
+}
+
+///|
+fn lg_process(g : LG, key : String) -> Unit {
+  let colon = match l_index_of(key, ":") {
+    Some(c) => c
+    None => return
+  }
+  let kind = slice_str(key, 0, colon)
+  let rest = slice_str(key, colon + 1, key.length())
+  if kind == "fn" {
+    let qp = split_qual_name(rest)
+    match (lg_tc(g, qp.prefix), lg_pkg_out(g, qp.prefix), lg_find_fn(g, qp.prefix, qp.name)) {
+      (Some(tc), Some(out), Some(fi)) => {
+        let lean_name = l_dots(qp.name)
+        if fi.decl.is_verify && !fi.decl.is_verify_opaque {
+          out.fns.push(lg_lower_fn(g, tc, key, lean_name, fi))
+        } else {
+          out.externs.push(lg_extern_of_fn(g, tc, key, lean_name, fi))
+        }
+      }
+      _ => ()
+    }
+    return
+  }
+  if kind == "implfn" || kind == "impl" {
+    let parts = l_split_bar(rest)
+    if parts.length() < 3 {
+      return
+    }
+    let defpkg = parts[0]
+    let gtrait = parts[1]
+    let gtarget = parts[2]
+    match (lg_tc(g, defpkg), lg_pkg_out(g, defpkg)) {
+      (Some(tc), Some(out)) => {
+        let lkey = l_local_name(defpkg, gtrait) + "::" + l_local_name(defpkg, gtarget)
+        match tc.impls.get(lkey) {
+          Some(ii) => {
+            let base = l_last_seg(gtarget) + ".Insts." + l_last_seg(gtrait)
+            if kind == "impl" {
+              lg_enqueue(g, "trait:" + gtrait)
+              let mkeys : Array[String] = []
+              let mut self_ty = TError
+              let mut i = 0
+              while i < ii.method_names.length() {
+                let mk = "implfn:" + rest + "|" + ii.method_names[i]
+                mkeys.push(mk)
+                lg_enqueue(g, mk)
+                match ii.methods.get(ii.method_names[i]) {
+                  Some(fi) =>
+                    if fi.param_tys.length() > 0 {
+                      self_ty = l_gq_ty(defpkg, fi.param_tys[0])
+                    }
+                  None => ()
+                }
+                i = i + 1
+              }
+              lg_note_ty(g, self_ty)
+              out.impls.push(LImplDef::{
+                key: key,
+                pkg: defpkg,
+                trait_key: gtrait,
+                self_ty: self_ty,
+                type_params: [],
+                method_names: ii.method_names,
+                method_keys: mkeys,
+              })
+            } else {
+              let m = if parts.length() > 3 { parts[3] } else { "" }
+              match ii.methods.get(m) {
+                Some(fi) => {
+                  let lean_name = base + "." + m
+                  if fi.decl.is_verify && !fi.decl.is_verify_opaque {
+                    out.fns.push(lg_lower_fn(g, tc, key, lean_name, fi))
+                  } else {
+                    out.externs.push(lg_extern_of_fn(g, tc, key, lean_name, fi))
+                  }
+                }
+                None => ()
+              }
+            }
+          }
+          None => ()
+        }
+      }
+      _ => ()
+    }
+    return
+  }
+  let qp = split_qual_name(rest)
+  let tco = lg_tc(g, qp.prefix)
+  let outo = lg_pkg_out(g, qp.prefix)
+  match (tco, outo) {
+    (Some(tc), Some(out)) =>
+      if kind == "struct" {
+        match tc.structs.get(qp.name) {
+          Some(si) => {
+            let ftys : Array[Ty] = []
+            let mut i = 0
+            while i < si.field_tys.length() {
+              let t = l_gq_ty(qp.prefix, si.field_tys[i])
+              lg_note_ty(g, t)
+              ftys.push(t)
+              i = i + 1
+            }
+            out.structs.push(LStructDef::{
+              key: rest,
+              pkg: qp.prefix,
+              name: qp.name,
+              type_params: si.decl.type_params,
+              field_names: si.field_names,
+              field_tys: ftys,
+              derive_eq: si.decl.derive_eq,
+            })
+          }
+          None => ()
+        }
+      } else if kind == "enum" {
+        match tc.enums.get(qp.name) {
+          Some(ei) => {
+            let vs : Array[LVariantDef] = []
+            let mut i = 0
+            while i < ei.variants.length() {
+              let ftys : Array[Ty] = []
+              let mut j = 0
+              while j < ei.variants[i].field_tys.length() {
+                let t = l_gq_ty(qp.prefix, ei.variants[i].field_tys[j])
+                lg_note_ty(g, t)
+                ftys.push(t)
+                j = j + 1
+              }
+              vs.push(LVariantDef::{ name: ei.variants[i].name, field_tys: ftys })
+              i = i + 1
+            }
+            out.enums.push(LEnumDef::{
+              key: rest,
+              pkg: qp.prefix,
+              name: qp.name,
+              type_params: ei.decl.type_params,
+              variants: vs,
+              derive_eq: ei.decl.derive_eq,
+            })
+          }
+          None => ()
+        }
+      } else if kind == "trait" {
+        match tc.traits.get(qp.name) {
+          Some(ti) => {
+            let ms : Array[LTraitMethod] = []
+            let mut i = 0
+            while i < ti.methods.length() && i < ti.decl.methods.length() {
+              let tm = ti.methods[i]
+              let td = ti.decl.methods[i]
+              let ps : Array[LParam] = []
+              let mut j = 1
+              while j < td.params.length() && j < tm.param_tys.length() {
+                let t = l_gq_ty(qp.prefix, tm.param_tys[j])
+                lg_note_ty(g, t)
+                ps.push(LParam::{ name: td.params[j].name, ty: t, is_mut: td.params[j].is_mut })
+                j = j + 1
+              }
+              let rt = l_gq_ty(qp.prefix, tm.ret_ty)
+              lg_note_ty(g, rt)
+              ms.push(LTraitMethod::{
+                name: tm.name,
+                params: ps,
+                self_mut: td.params.length() > 0 && td.params[0].is_mut,
+                ret_ty: rt,
+              })
+              i = i + 1
+            }
+            out.traits.push(LTraitDef::{ key: rest, pkg: qp.prefix, name: qp.name, methods: ms })
+          }
+          None => ()
+        }
+      } else if kind == "const" {
+        let files = g.inputs[g.pkg_idx.get(qp.prefix).unwrap_or(0)].pkg.files
+        let mut fi = 0
+        while fi < files.length() {
+          let decls = files[fi].decls
+          let mut di = 0
+          while di < decls.length() {
+            match decls[di] {
+              DConst(cd) =>
+                if cd.name == qp.name {
+                  let cty = match tc.consts.get(qp.name) {
+                    Some(t) => l_gq_ty(qp.prefix, t)
+                    None => TError
+                  }
+                  lg_note_ty(g, cty)
+                  let b = lb_new(g, tc, cd.name, [])
+                  b.ret_ty = cty
+                  let v = lb_expr(b, cd.value)
+                  let body = lb_close(b, Some(v))
+                  out.consts.push(LConstDef::{
+                    key: key,
+                    pkg: qp.prefix,
+                    lean_name: cd.name,
+                    ty: cty,
+                    body: body,
+                    is_pure: l_pure_const_expr(cd.value),
+                    var_tys: b.var_tys,
+                    callees: b.callees,
+                  })
+                }
+              _ => ()
+            }
+            di = di + 1
+          }
+          fi = fi + 1
+        }
+      } else if kind == "ext" {
+        match tc.extern_fns.get(qp.name) {
+          Some(ei) => {
+            let ps : Array[LParam] = []
+            let mut i = 0
+            while i < ei.decl.params.length() && i < ei.param_tys.length() {
+              let t = l_gq_ty(qp.prefix, ei.param_tys[i])
+              lg_note_ty(g, t)
+              ps.push(LParam::{ name: ei.decl.params[i].name, ty: t, is_mut: false })
+              i = i + 1
+            }
+            let rt = l_gq_ty(qp.prefix, ei.ret_ty)
+            lg_note_ty(g, rt)
+            out.externs.push(LExternDef::{
+              key: key,
+              pkg: qp.prefix,
+              lean_name: qp.name,
+              type_params: [],
+              bounds: [],
+              eq_tparams: [],
+              params: ps,
+              ret_ty: rt,
+              kind: "extern_c",
+            })
+          }
+          None => ()
+        }
+      }
+    _ => ()
+  }
+}
+
+///|
+fn l_index_of(s : String, sub : String) -> Option[Int] {
+  let n = s.length()
+  let m = sub.length()
+  let mut i = 0
+  while i + m <= n {
+    if slice_str(s, i, i + m) == sub {
+      return Some(i)
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+/// Package of an item key (`fn:pkg::f`, `implfn:pkg|...`, `const:pkg::C`, ...).
+pub fn l_key_pkg(key : String) -> String {
+  let rest = match l_index_of(key, ":") {
+    Some(c) =>
+      if slice_str(key, c, c + 2) == "::" {
+        key
+      } else {
+        slice_str(key, c + 1, key.length())
+      }
+    None => key
+  }
+  match l_index_of(rest, "|") {
+    Some(bar) => slice_str(rest, 0, bar)
+    None => split_qual_name(rest).prefix
+  }
+}
+
+///|
+/// Packages a type mentions.
+fn l_ty_pkgs(t : Ty, out : Array[String]) -> Unit {
+  match t {
+    TArray(e) | TFixedArray(e) | TOption(e) => l_ty_pkgs(e, out)
+    TResult(a, c) => {
+      l_ty_pkgs(a, out)
+      l_ty_pkgs(c, out)
+    }
+    TStruct(n, args) | TEnum(n, args) => {
+      let p = split_qual_name(n).prefix
+      if p.length() > 0 {
+        l_push_unique(out, p)
+      }
+      let mut i = 0
+      while i < args.length() {
+        l_ty_pkgs(args[i], out)
+        i = i + 1
+      }
+    }
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        l_ty_pkgs(es[i], out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn l_dict_pkgs(d : LDict, out : Array[String]) -> Unit {
+  match d {
+    LDParam(_, tk) => l_push_unique(out, split_qual_name(tk).prefix)
+    LDImpl(k, t) => {
+      l_push_unique(out, l_key_pkg(k))
+      l_ty_pkgs(t, out)
+    }
+  }
+}
+
+///|
+fn l_block_pkgs(blk : LBlock, out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < blk.stmts.length() {
+    match blk.stmts[i] {
+      LSCall(_, _, c, _, _, _) =>
+        match c {
+          CItem(k, targs, ds) => {
+            l_push_unique(out, l_key_pkg(k))
+            let mut j = 0
+            while j < targs.length() {
+              l_ty_pkgs(targs[j], out)
+              j = j + 1
+            }
+            j = 0
+            while j < ds.length() {
+              l_dict_pkgs(ds[j], out)
+              j = j + 1
+            }
+          }
+          CDictMethod(d, _) => l_dict_pkgs(d, out)
+          CConst(k) => l_push_unique(out, l_key_pkg(k))
+          CBuiltin(_) => ()
+        }
+      LSIf(_, t, e, _, _) => {
+        l_block_pkgs(t, out)
+        l_block_pkgs(e, out)
+      }
+      LSMatch(_, _, arms, _, _) => {
+        let mut j = 0
+        while j < arms.length() {
+          l_block_pkgs(arms[j].body, out)
+          j = j + 1
+        }
+      }
+      LSLoop(body) => l_block_pkgs(body, out)
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// Builds the LLBC of the `#verify` closure of a checked workspace.
+pub fn llbc_build(inputs : Array[LlbcInput]) -> LlbcResult {
+  let g = lg_new(inputs)
+  let mut pi = 0
+  while pi < inputs.length() {
+    let inp = inputs[pi]
+    if !inp.seed {
+      pi = pi + 1
+      continue
+    }
+    let tc = inp.tc
+    let files = inp.pkg.files
+    let mut fi = 0
+    while fi < files.length() {
+      let decls = files[fi].decls
+      let mut di = 0
+      while di < decls.length() {
+        match decls[di] {
+          DFn(fd) =>
+            if fd.is_verify && !fd.is_verify_opaque {
+              let nm = if fd.receiver_type.length() > 0 {
+                fd.receiver_type + "::" + fd.name
+              } else {
+                fd.name
+              }
+              lg_enqueue(g, "fn:" + inp.name + "::" + nm)
+            }
+          DImpl(id) => {
+            let mut any = id.is_verify
+            let mut mi = 0
+            while mi < id.methods.length() {
+              if id.methods[mi].is_verify {
+                any = true
+              }
+              mi = mi + 1
+            }
+            if any {
+              let gtrait = l_gq(inp.name, canon_trait_name(tc, id.trait_name))
+              let ct = canon_target_type_name(tc, id.target_type)
+              let gtarget = if tc.structs.contains(ct) || tc.enums.contains(ct) {
+                inp.name + "::" + ct
+              } else {
+                ct
+              }
+              lg_enqueue(g, "impl:" + inp.name + "|" + gtrait + "|" + gtarget)
+            }
+          }
+          _ => ()
+        }
+        di = di + 1
+      }
+      fi = fi + 1
+    }
+    pi = pi + 1
+  }
+  let mut wi = 0
+  while wi < g.work.length() {
+    lg_process(g, g.work[wi])
+    wi = wi + 1
+  }
+  // Cross-package dependencies.
+  let result : Array[LlbcPkg] = []
+  pi = 0
+  while pi < g.pkgs.length() {
+    let p = g.pkgs[pi]
+    let deps : Array[String] = []
+    let mut i = 0
+    while i < p.structs.length() {
+      let mut j = 0
+      while j < p.structs[i].field_tys.length() {
+        l_ty_pkgs(p.structs[i].field_tys[j], deps)
+        j = j + 1
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < p.enums.length() {
+      let mut j = 0
+      while j < p.enums[i].variants.length() {
+        let mut k = 0
+        while k < p.enums[i].variants[j].field_tys.length() {
+          l_ty_pkgs(p.enums[i].variants[j].field_tys[k], deps)
+          k = k + 1
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < p.traits.length() {
+      let mut j = 0
+      while j < p.traits[i].methods.length() {
+        let tm = p.traits[i].methods[j]
+        l_ty_pkgs(tm.ret_ty, deps)
+        let mut k = 0
+        while k < tm.params.length() {
+          l_ty_pkgs(tm.params[k].ty, deps)
+          k = k + 1
+        }
+        j = j + 1
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < p.impls.length() {
+      l_push_unique(deps, split_qual_name(p.impls[i].trait_key).prefix)
+      l_ty_pkgs(p.impls[i].self_ty, deps)
+      i = i + 1
+    }
+    i = 0
+    while i < p.fns.length() {
+      let f = p.fns[i]
+      let mut j = 0
+      while j < f.params.length() {
+        l_ty_pkgs(f.params[j].ty, deps)
+        j = j + 1
+      }
+      l_ty_pkgs(f.ret_ty, deps)
+      j = 0
+      while j < f.bounds.length() {
+        l_push_unique(deps, split_qual_name(f.bounds[j].trait_key).prefix)
+        j = j + 1
+      }
+      l_block_pkgs(f.body, deps)
+      j = 0
+      while j < f.callees.length() {
+        l_push_unique(deps, l_key_pkg(f.callees[j]))
+        j = j + 1
+      }
+      i = i + 1
+    }
+    i = 0
+    while i < p.externs.length() {
+      let x = p.externs[i]
+      let mut j = 0
+      while j < x.params.length() {
+        l_ty_pkgs(x.params[j].ty, deps)
+        j = j + 1
+      }
+      l_ty_pkgs(x.ret_ty, deps)
+      i = i + 1
+    }
+    i = 0
+    while i < p.consts.length() {
+      l_ty_pkgs(p.consts[i].ty, deps)
+      l_block_pkgs(p.consts[i].body, deps)
+      i = i + 1
+    }
+    i = 0
+    while i < deps.length() {
+      if deps[i] != p.name && deps[i].length() > 0 && g.pkg_idx.contains(deps[i]) {
+        p.deps.push(deps[i])
+      }
+      i = i + 1
+    }
+    result.push(p)
+    pi = pi + 1
+  }
+  LlbcResult::{ pkgs: result, diagnostics: g.diags }
+}

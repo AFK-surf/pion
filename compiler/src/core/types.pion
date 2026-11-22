@@ -213,6 +213,11 @@ pub struct Env {
   /// True while checking a `#no_io` / `#render_thread` function (or any closure inside it).
   mut in_no_io : Bool
   mut no_io_fn_name : String
+  /// True while checking a `#verify` function (or any closure inside it).
+  mut in_verify : Bool
+  mut verify_fn_name : String
+  /// Names of the enclosing function's `mut` parameters.
+  mut_params : Map[String, Bool]
 }
 
 ///|
@@ -282,6 +287,21 @@ pub struct TypeChecker {
   /// Argument types of the `push` / `set` just checked on a collection with an
   /// unknown element type (consumed by the enclosing method call).
   infer_hit : Array[Ty]
+  /// ResolvedInfo side tables, recorded for every expression / call inside a
+  /// `#verify` function (consumed by the Lean extractor):
+  /// `span_key(expr_span(e))` -> the expression's final type.
+  expr_tys : Map[String, Ty]
+  /// `span_key(call span)` -> canonical callee (`pkg::fn`, `pkg::Type::method`,
+  /// `Trait::Type::method`, `builtin::...`, `closure::name`).
+  call_targets : Map[String, String]
+  /// `span_key(call span)` -> instantiated type arguments of a generic callee.
+  call_type_args : Map[String, Array[Ty]]
+  /// `span_key(call span)` -> for each resolved parameter slot, the index of
+  /// the written argument that fills it (-1: default value / implicit `None`).
+  call_arg_order : Map[String, Array[Int]]
+  /// `span_key(method-call span)` of every `recv.m(...)` whose method takes
+  /// `mut self` (codegen passes `recv` as an in-out place).
+  mut_recv_calls : Map[String, Bool]
 }
 
 ///|
@@ -320,6 +340,9 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     in_default_arg: false,
     in_no_io: false,
     no_io_fn_name: "",
+    in_verify: false,
+    verify_fn_name: "",
+    mut_params: Map([]),
   }
 }
 
@@ -746,6 +769,7 @@ fn qualify_imported_expr(ipkg : ImportedPkg, e : Expr, bound : Array[String]) ->
     ETry(inner, sp) => ETry(qualify_imported_expr(ipkg, inner, bound), sp)
     ENamedArg(n, pun, inner, sp) =>
       ENamedArg(n, pun, qualify_imported_expr(ipkg, inner, bound), sp)
+    EMutArg(inner, sp) => EMutArg(qualify_imported_expr(ipkg, inner, bound), sp)
     _ => e
   }
 }
@@ -891,6 +915,7 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
       }
       qparams.push(Param::{
         name: p.name,
+        is_mut: p.is_mut,
         ty: p.ty,
         label_kind: p.label_kind,
         default_expr: qdef,
@@ -901,6 +926,8 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
     FnDecl::{
       is_pub: d.is_pub,
       no_io: d.no_io,
+      is_verify: d.is_verify,
+      is_verify_opaque: d.is_verify_opaque,
       receiver_type: d.receiver_type,
       name: d.name,
       type_params: d.type_params,
@@ -1181,6 +1208,8 @@ fn qualify_fn_bounds(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
     decl: FnDecl::{
       is_pub: d.is_pub,
       no_io: false,
+      is_verify: d.is_verify,
+      is_verify_opaque: d.is_verify_opaque,
       receiver_type: d.receiver_type,
       name: d.name,
       type_params: d.type_params,
@@ -1764,6 +1793,18 @@ fn check_trait_object_safe(
         return false
       }
       pi = pi + 1
+    }
+    if mi < tinfo.decl.methods.length() && params_have_mut(tinfo.decl.methods[mi].params) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "trait `" + tname + "` is not object-safe for `dyn " + tname + "`: method `" + tm.name + "` has `mut` parameters",
+        "object-safe trait",
+        "dyn " + tname,
+        "call `" + tm.name + "` through a generic bound (`T : " + tname + "`) instead of `dyn " + tname + "`",
+      )
+      return false
     }
     if ty_mentions_self(tm.ret_ty) {
       tc_err(
@@ -3343,7 +3384,7 @@ fn collect_expr_captures(
       collect_expr_captures(s, locals, out)
       collect_expr_captures(f, locals, out)
     }
-    EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) =>
+    EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) | EMutArg(inner, _) =>
       collect_expr_captures(inner, locals, out)
     EInterp(parts, _) | EDotVariant(_, parts, _) => {
       let mut i = 0
@@ -3585,7 +3626,12 @@ fn bind_pattern(
 ) -> Unit {
   match pat {
     PWild(_) => ()
-    PIdent(name, _) => env_define(env, name, scrut_ty, false)
+    PIdent(name, psp) => {
+      env_define(env, name, scrut_ty, false)
+      if env.in_verify {
+        tc.expr_tys.set(span_key(psp), scrut_ty)
+      }
+    }
     PBool(_, sp) =>
       if !ty_compat(TBool, scrut_ty) {
         tc_err(
@@ -5108,6 +5154,652 @@ fn check_extern_fn_call(
 }
 
 ///|
+fn tc_record_ty(tc : TypeChecker, env : Env, e : Expr, ty : Ty) -> Unit {
+  if env.in_verify {
+    tc.expr_tys.set(span_key(expr_span(e)), ty)
+  }
+}
+
+///|
+pub fn params_have_mut(params : Array[Param]) -> Bool {
+  let mut i = 0
+  while i < params.length() {
+    if params[i].is_mut {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn param_at(params : Array[Param], i : Int) -> Option[Param] {
+  if i >= 0 && i < params.length() {
+    Some(params[i])
+  } else {
+    None
+  }
+}
+
+///|
+fn param_is_mut_at(params : Array[Param], i : Int) -> Bool {
+  i >= 0 && i < params.length() && params[i].is_mut
+}
+
+///|
+/// Path of a place expression for `mut` aliasing checks: `x` -> ["x"],
+/// `x.f` -> ["x", "f"], `a[i]` -> ["a", "[*]"]; [] when it is not a place.
+pub fn mut_place_path(e : Expr) -> Array[String] {
+  match e {
+    EIdent(n, _) => [n]
+    EField(o, f, _) => {
+      let p = mut_place_path(o)
+      if p.length() > 0 {
+        p.push(f)
+      }
+      p
+    }
+    EIndex(o, _, _) => {
+      let p = mut_place_path(o)
+      if p.length() > 0 {
+        p.push("[*]")
+      }
+      p
+    }
+    EMutArg(inner, _) => mut_place_path(inner)
+    _ => []
+  }
+}
+
+///|
+fn mut_path_to_string(p : Array[String]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < p.length() {
+    if i > 0 && p[i] != "[*]" {
+      sb.write_string(".")
+    }
+    sb.write_string(p[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Two place paths alias when one is a prefix of the other (`s` / `s.x`,
+/// `a` / `a[*]`, `a[*]` / `a[*]`); distinct fields (`s.x` / `s.y`) do not.
+pub fn mut_paths_overlap(a : Array[String], b : Array[String]) -> Bool {
+  let n = if a.length() < b.length() { a.length() } else { b.length() }
+  let mut i = 0
+  while i < n {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Locals read by the index expressions of a place (`a[i].x[j + 1]` -> i, j).
+fn mut_place_index_idents(e : Expr, out : Array[String]) -> Unit {
+  match e {
+    EField(o, _, _) => mut_place_index_idents(o, out)
+    EIndex(o, idx, _) => {
+      mut_place_index_idents(o, out)
+      let caps : Array[CaptureInfo] = []
+      collect_expr_captures(idx, Map([]), caps)
+      let mut i = 0
+      while i < caps.length() {
+        out.push(caps[i].name)
+        i = i + 1
+      }
+    }
+    EMutArg(inner, _) => mut_place_index_idents(inner, out)
+    _ => ()
+  }
+}
+
+///|
+/// `E_VERIFY_ALIASING`: within one call (receiver included), a `mut`
+/// argument's place must not equal, contain or be contained in any other
+/// argument's place, and must not be rooted at a local that another `mut`
+/// argument's index reads. Enforced in all code (in-out arguments are
+/// copied in and written back, so overlapping places would alias).
+fn check_mut_call_aliasing(
+  tc : TypeChecker,
+  args : Array[Expr],
+  muts : Array[Bool],
+  fn_name : String,
+) -> Unit {
+  let mut any_mut = false
+  let mut k = 0
+  while k < muts.length() {
+    if muts[k] {
+      any_mut = true
+    }
+    k = k + 1
+  }
+  if !any_mut {
+    return
+  }
+  let paths : Array[Array[String]] = []
+  let mut i = 0
+  while i < args.length() {
+    paths.push(mut_place_path(args[i]))
+    i = i + 1
+  }
+  let mut j = 1
+  while j < args.length() {
+    let mut i2 = 0
+    while i2 < j {
+      let mi = i2 < muts.length() && muts[i2]
+      let mj = j < muts.length() && muts[j]
+      if (mi || mj) &&
+        paths[i2].length() > 0 &&
+        paths[j].length() > 0 &&
+        mut_paths_overlap(paths[i2], paths[j]) {
+        let a = mut_path_to_string(paths[i2])
+        let b = mut_path_to_string(paths[j])
+        tc_err(
+          tc,
+          expr_span(args[j]),
+          "E_VERIFY_ALIASING",
+          "arguments `" + a + "` and `" + b + "` of call to `" + fn_name + "` overlap: a `mut` argument must not alias another argument of the same call",
+          "disjoint argument places",
+          a + " / " + b,
+          "pass disjoint places (distinct fields are fine), or copy one side into a local first",
+        )
+        break
+      }
+      i2 = i2 + 1
+    }
+    j = j + 1
+  }
+  i = 0
+  while i < args.length() {
+    if i < muts.length() && muts[i] {
+      let idents : Array[String] = []
+      mut_place_index_idents(args[i], idents)
+      if idents.length() > 0 {
+        let mut j2 = 0
+        while j2 < args.length() {
+          if j2 != i && j2 < muts.length() && muts[j2] && paths[j2].length() > 0 {
+            if str_arr_contains(idents, paths[j2][0]) {
+              tc_err(
+                tc,
+                expr_span(args[j2]),
+                "E_VERIFY_ALIASING",
+                "`mut` argument `" + mut_path_to_string(paths[j2]) + "` of call to `" + fn_name + "` overlaps the index of `mut` argument `" + mut_path_to_string(paths[i]) + "`",
+                "disjoint argument places",
+                mut_path_to_string(paths[j2]),
+                "copy the index into a separate local first",
+              )
+            }
+          }
+          j2 = j2 + 1
+        }
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn mut_index_is_simple(e : Expr) -> Bool {
+  match e {
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EIdent(_, _) | EPath(_, _, _) =>
+      true
+    EUnary(_, inner, _) => mut_index_is_simple(inner)
+    EBinary(_, l, r, _) => mut_index_is_simple(l) && mut_index_is_simple(r)
+    EField(o, _, _) => mut_index_is_simple(o)
+    _ => false
+  }
+}
+
+///|
+/// Type-checks a `mut <place>` argument (or a `mut self` receiver when
+/// `check_index` is false, its index expressions being checked already): `x`,
+/// `x.f`, `a[i]` and their combinations, rooted at a mutable binding (`let mut`
+/// or a `mut` parameter); fields written through it must be `mut` fields.
+fn check_mut_place(tc : TypeChecker, env : Env, e : Expr, check_index : Bool) -> Ty {
+  let ty = match e {
+    EIdent(name, sp) => {
+      if env.moved.contains(name) {
+        tc_err(
+          tc,
+          sp,
+          "E_USE_AFTER_MOVE",
+          "use of moved value `" + name + "`",
+          "live binding",
+          "moved variable `" + name + "`",
+          "do not use `" + name + "` after `move`, or pass a separate value",
+        )
+      }
+      match env_lookup(env, name) {
+        Some(b) => {
+          if !b.is_mut {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "cannot pass immutable `" + name + "` as a `mut` argument",
+              "mutable binding (`let mut` or `mut` parameter)",
+              "immutable `" + name + "`",
+              "declare `" + name + "` with `let mut " + name + "`",
+            )
+            if b.decl_span.line > 0 {
+              tc_add_edit(tc, text_edit_insert(b.decl_span, 4, "mut "))
+            }
+          }
+          b.ty
+        }
+        None => {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "undefined variable `" + name + "` in `mut` argument",
+            "local variable",
+            name,
+            "declare `let mut " + name + "` before passing it as `mut`",
+          )
+          TError
+        }
+      }
+    }
+    EField(obj, fname, sp) => {
+      let oty = check_mut_place(tc, env, obj, check_index)
+      match oty {
+        TError => TError
+        TStruct(sname, sargs) =>
+          match tc.structs.get(sname) {
+            None => TError
+            Some(sinfo) => {
+              let subst = make_subst(sinfo.decl.type_params, sargs)
+              let mut fi = 0
+              let mut fty = TError
+              let mut found = false
+              while fi < sinfo.field_names.length() {
+                if sinfo.field_names[fi] == fname {
+                  found = true
+                  fty = subst_ty(sinfo.field_tys[fi], subst)
+                  if !sinfo.field_muts[fi] {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_TYPE_MISMATCH",
+                      "field `" + fname + "` of `" + sname + "` is not `mut` and cannot be passed as a `mut` argument",
+                      "`mut` field",
+                      "immutable field `" + fname + "`",
+                      "declare the field as `mut " + fname + " : ...` or pass a local copy",
+                    )
+                  }
+                  break
+                }
+                fi = fi + 1
+              }
+              if !found {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "struct `" + sname + "` has no field `" + fname + "`",
+                  "valid field of `" + sname + "`",
+                  fname,
+                  "check field name on `" + sname + "`",
+                )
+              }
+              fty
+            }
+          }
+        _ => {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "`mut` place `." + fname + "` requires a struct, found `" + ty_to_string(oty) + "`",
+            "struct",
+            ty_to_string(oty),
+            "pass a struct field path as `mut` argument",
+          )
+          TError
+        }
+      }
+    }
+    EIndex(obj, idx, sp) => {
+      let oty = check_mut_place(tc, env, obj, check_index)
+      if check_index {
+        let ity = check_expr(tc, env, idx, Some(TInt))
+        if !ty_compat(TInt, ity) {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "array index must be `Int`",
+            "Int",
+            ty_to_string(ity),
+            "use an `Int` index",
+          )
+        }
+      }
+      if !mut_index_is_simple(idx) {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "the index of a `mut` place must be a simple expression (locals, literals, fields, arithmetic)",
+          "simple index expression",
+          "call or assignment in index",
+          "bind the index to a local first: `let k = ...; f(mut a[k])`",
+        )
+      }
+      match oty {
+        TArray(elem) | TFixedArray(elem) => elem
+        TBytes => TByte
+        TError => TError
+        _ => {
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "`mut` place `[...]` requires an `Array`, `FixedArray` or `Bytes`, found `" + ty_to_string(oty) + "`",
+            "Array, FixedArray or Bytes",
+            ty_to_string(oty),
+            "pass an array element as `mut` argument",
+          )
+          TError
+        }
+      }
+    }
+    _ => {
+      tc_err(
+        tc,
+        expr_span(e),
+        "E_TYPE_MISMATCH",
+        "a `mut` argument must be a place (`x`, `x.field`, `a[i]`)",
+        "place expression",
+        "temporary value",
+        "bind the value to `let mut tmp = ...` and pass `mut tmp`",
+      )
+      check_expr(tc, env, e, None)
+    }
+  }
+  tc_record_ty(tc, env, e, ty)
+  ty
+}
+
+///|
+/// Checks one call argument against its parameter, handling `mut <place>`.
+fn check_call_arg(
+  tc : TypeChecker,
+  env : Env,
+  p_opt : Option[Param],
+  arg : Expr,
+  exp : Option[Ty],
+  fn_name : String,
+) -> Ty {
+  let p_is_mut = match p_opt {
+    Some(p) => p.is_mut
+    None => false
+  }
+  let pname = match p_opt {
+    Some(p) => p.name
+    None => "_"
+  }
+  match arg {
+    EMutArg(inner, msp) =>
+      if p_is_mut {
+        let ty = check_mut_place(tc, env, inner, true)
+        tc_record_ty(tc, env, arg, ty)
+        ty
+      } else {
+        tc_err(
+          tc,
+          msp,
+          "E_TYPE_MISMATCH",
+          "parameter `" + pname + "` of `" + fn_name + "` is not `mut`",
+          "plain argument",
+          "`mut` argument",
+          "remove `mut` before this argument",
+        )
+        check_expr(tc, env, inner, exp)
+      }
+    _ => {
+      if p_is_mut {
+        tc_err(
+          tc,
+          expr_span(arg),
+          "E_TYPE_MISMATCH",
+          "argument for `mut` parameter `" + pname + "` of `" + fn_name + "` must be written `mut <place>`",
+          "`mut <place>`",
+          "plain argument",
+          "write `mut ` before the argument (it must be a mutable place)",
+        )
+        match arg {
+          EIdent(_, isp) => tc_add_edit(tc, text_edit_insert(isp, 0, "mut "))
+          _ => ()
+        }
+      }
+      check_expr(tc, env, arg, exp)
+    }
+  }
+}
+
+///|
+/// Records `call_arg_order` for a resolved call (inside `#verify` code only).
+fn tc_record_arg_order(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  raw_args : Array[Expr],
+  resolved : Array[Expr],
+) -> Unit {
+  if !env.in_verify {
+    return
+  }
+  let order : Array[Int] = []
+  let mut i = 0
+  while i < resolved.length() {
+    let rk = span_key(expr_span(resolved[i]))
+    let mut found = -1
+    let mut j = 0
+    while j < raw_args.length() {
+      match raw_args[j] {
+        ENamedArg(_, _, inner, asp) =>
+          if span_key(expr_span(inner)) == rk || span_key(asp) == rk {
+            found = j
+          }
+        _ => if span_key(expr_span(raw_args[j])) == rk { found = j }
+      }
+      if found >= 0 {
+        break
+      }
+      j = j + 1
+    }
+    order.push(found)
+    i = i + 1
+  }
+  tc.call_arg_order.set(span_key(sp), order)
+}
+
+///|
+/// `E_VERIFY_UNVERIFIED_CALLEE`: `#verify` code may only call `#verify` /
+/// `#verify_opaque` functions and methods (plus extern "C" functions,
+/// builtins, closures and trait-bound methods).
+fn tc_check_verify_callee(tc : TypeChecker, env : Env, fd : FnDecl, target : String, sp : Span) -> Unit {
+  if env.in_verify && !fd.is_verify && !fd.is_verify_opaque {
+    tc_err(
+      tc,
+      sp,
+      "E_VERIFY_UNVERIFIED_CALLEE",
+      "`#verify` function `" + env.verify_fn_name + "` calls unverified function `" + target + "`",
+      "`#verify` or `#verify_opaque` callee",
+      target,
+      "mark `" + target + "` with `#verify` (checked) or `#verify_opaque` (trusted boundary)",
+    )
+  }
+}
+
+///|
+/// `E_VERIFY_UNVERIFIED_CALLEE` through a trait bound: `#verify` code that
+/// instantiates `T : Trait` with a concrete type reaches every method of
+/// that `impl`, so each one must be `#verify` / `#verify_opaque`.
+fn tc_check_verify_impl(
+  tc : TypeChecker,
+  env : Env,
+  ii : ImplInfo,
+  trait_name : String,
+  type_name : String,
+  callee : String,
+  sp : Span,
+) -> Unit {
+  let mut i = 0
+  while i < ii.method_names.length() {
+    match ii.methods.get(ii.method_names[i]) {
+      Some(mi) =>
+        if !mi.decl.is_verify && !mi.decl.is_verify_opaque {
+          let target = trait_name + "::" + type_name + "::" + ii.method_names[i]
+          tc_err(
+            tc,
+            sp,
+            "E_VERIFY_UNVERIFIED_CALLEE",
+            "`#verify` function `" + env.verify_fn_name + "` instantiates `" + callee + "` with `" + type_name + "`, whose trait method `" + target + "` is unverified",
+            "`#verify` or `#verify_opaque` impl method",
+            target,
+            "mark `impl " + trait_name + " for " + type_name + "` with `#verify` (or the method with `#verify_opaque`)",
+          )
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn tc_record_call(
+  tc : TypeChecker,
+  env : Env,
+  sp : Span,
+  target : String,
+  tparams : Array[String],
+  subst : Map[String, Ty],
+) -> Unit {
+  if !env.in_verify {
+    return
+  }
+  tc.call_targets.set(span_key(sp), target)
+  if tparams.length() > 0 {
+    let targs : Array[Ty] = []
+    let mut i = 0
+    while i < tparams.length() {
+      match subst.get(tparams[i]) {
+        Some(t) => targs.push(t)
+        None => targs.push(TError)
+      }
+      i = i + 1
+    }
+    tc.call_type_args.set(span_key(sp), targs)
+  }
+}
+
+///|
+fn tc_qualify_local_name(tc : TypeChecker, name : String) -> String {
+  if has_qual_sep(name) {
+    name
+  } else {
+    tc.pkg_name + "::" + name
+  }
+}
+
+///|
+/// Parameters of the method `recv.m(...)` resolves to (inherent, trait impl,
+/// or trait bound of a type parameter), receiver included.
+fn method_params_for(tc : TypeChecker, env : Env, recv_ty : Ty, m : String) -> Option[Array[Param]] {
+  match recv_ty {
+    TStruct(sname, _) => {
+      match tc.methods.get(sname + "::" + m) {
+        Some(mi) => return Some(mi.decl.params)
+        None => ()
+      }
+      let qp = split_qual_name(sname)
+      if qp.prefix.length() > 0 {
+        match lookup_imported_pkg_transitive(tc, qp.prefix) {
+          Some(ipkg) =>
+            match ipkg.tc.methods.get(qp.name + "::" + m) {
+              Some(mi) => return Some(mi.decl.params)
+              None => ()
+            }
+          None => ()
+        }
+      }
+    }
+    TParam(tp) =>
+      match env.type_bounds.get(tp) {
+        Some(trs) => {
+          let mut bi = 0
+          while bi < trs.length() {
+            match lookup_trait(tc, trs[bi]) {
+              Some(tinfo) => {
+                let mut mi = 0
+                while mi < tinfo.decl.methods.length() {
+                  if tinfo.decl.methods[mi].name == m {
+                    return Some(tinfo.decl.methods[mi].params)
+                  }
+                  mi = mi + 1
+                }
+              }
+              None => ()
+            }
+            bi = bi + 1
+          }
+          return None
+        }
+        None => ()
+      }
+    _ => ()
+  }
+  match find_impl_method(tc, recv_ty, m) {
+    Some(fi) => Some(fi.decl.params)
+    None => None
+  }
+}
+
+///|
+/// A function with `mut` parameters takes in-out pointers: it cannot become a
+/// first-class `(...) -> R` value.
+fn tc_check_fn_value_no_mut(tc : TypeChecker, fd : FnDecl, name : String, sp : Span) -> Unit {
+  if params_have_mut(fd.params) {
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "function `" + name + "` has `mut` parameters and cannot be used as a value",
+      "function without `mut` parameters",
+      name,
+      "call `" + name + "(...)` directly, or wrap it in a closure that calls it",
+    )
+  }
+}
+
+///|
+fn find_impl_trait_name(tc : TypeChecker, recv_ty : Ty, method_name : String) -> String {
+  let tname = ty_base_name(recv_ty)
+  let mut i = 0
+  while i < tc.impl_keys.length() {
+    match tc.impls.get(tc.impl_keys[i]) {
+      Some(ii) =>
+        if ii.target_type == tname && ii.methods.contains(method_name) {
+          return ii.trait_name
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  ""
+}
+
+///|
 pub struct ResolvedCallArgs {
   args : Array[Expr]
   missing : Array[Bool]
@@ -5379,6 +6071,7 @@ fn check_fn_call(
   args : Array[Expr],
   expected : Option[Ty],
   sp : Span,
+  target : String,
 ) -> Ty {
   let subst : Map[String, Ty] = Map([])
   match expected {
@@ -5433,12 +6126,20 @@ fn check_fn_call(
     if i < default_flags.length() && default_flags[i] {
       env.in_default_arg = true
     }
-    let aty = check_expr(tc, env, resolved_args[i], exp_p)
+    let aty = check_call_arg(
+      tc,
+      env,
+      param_at(finfo.decl.params, i),
+      resolved_args[i],
+      exp_p,
+      finfo.decl.name,
+    )
     env.in_default_arg = saved_in_def
     if i < finfo.param_tys.length() {
       unify_tparams(finfo.param_tys[i], aty, subst)
       let pty = subst_ty(finfo.param_tys[i], subst)
-      if !ty_compat(pty, aty) {
+      if !ty_compat(pty, aty) ||
+        (param_is_mut_at(finfo.decl.params, i) && !ty_compat(aty, pty)) {
         tc_err(
           tc,
           expr_span(resolved_args[i]),
@@ -5511,6 +6212,11 @@ fn check_fn_call(
                   "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
                 )
                 add_missing_impl_edit(tc, req_tr, concrete_ty)
+              } else if env.in_verify {
+                match tc.impls.get(impl_key) {
+                  Some(ii) => tc_check_verify_impl(tc, env, ii, req_tr, tname, finfo.decl.name, sp)
+                  None => ()
+                }
               }
               ti = ti + 1
             }
@@ -5520,6 +6226,18 @@ fn check_fn_call(
     }
     bi = bi + 1
   }
+  if params_have_mut(finfo.decl.params) {
+    let muts : Array[Bool] = []
+    let mut mi = 0
+    while mi < resolved_args.length() {
+      muts.push(param_is_mut_at(finfo.decl.params, mi))
+      mi = mi + 1
+    }
+    check_mut_call_aliasing(tc, resolved_args, muts, finfo.decl.name)
+  }
+  tc_check_verify_callee(tc, env, finfo.decl, target, sp)
+  tc_record_call(tc, env, sp, target, finfo.decl.type_params, subst)
+  tc_record_arg_order(tc, env, sp, args, resolved_args)
   // Record instantiations; `resolve_eq_uses` rejects non-comparable ones once
   // every generic body (and its `==` uses) has been checked.
   let mut ti = 0
@@ -5540,6 +6258,38 @@ fn check_fn_call(
     ti = ti + 1
   }
   subst_ty(finfo.ret_ty, subst)
+}
+
+///|
+/// `arr.swap(i : Int, j : Int) -> Unit` on `Array[T]` / `FixedArray[T]`.
+fn check_swap_args(tc : TypeChecker, env : Env, args : Array[Expr], sp : Span) -> Unit {
+  if args.length() != 2 {
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "`swap` expects 2 arguments (i : Int, j : Int), found " + args.length().to_string(),
+      "2 args",
+      args.length().to_string() + " args",
+      "call `.swap(i, j)`",
+    )
+  }
+  let mut i = 0
+  while i < args.length() {
+    let aty = check_expr(tc, env, args[i], Some(TInt))
+    if !ty_compat(TInt, aty) {
+      tc_err(
+        tc,
+        expr_span(args[i]),
+        "E_TYPE_MISMATCH",
+        "`swap` index must be `Int`",
+        "Int",
+        ty_to_string(aty),
+        "pass `Int` indices",
+      )
+    }
+    i = i + 1
+  }
 }
 
 ///|
@@ -6108,6 +6858,10 @@ fn check_method_call(
       if method_name == "clear" || method_name == "reverse" {
         return TUnit
       }
+      if method_name == "swap" {
+        check_swap_args(tc, env, args, sp)
+        return TUnit
+      }
       if method_name == "join" {
         if !ty_compat(TString, elem) {
           tc_err(
@@ -6161,6 +6915,10 @@ fn check_method_call(
       }
       if method_name == "copy" {
         return TFixedArray(elem)
+      }
+      if method_name == "swap" {
+        check_swap_args(tc, env, args, sp)
+        return TUnit
       }
       if method_name == "contains" {
         match elem {
@@ -6479,12 +7237,20 @@ fn check_method_call(
             if i < default_flags.length() && default_flags[i] {
               env.in_default_arg = true
             }
-            let aty = check_expr(tc, env, resolved_args[i], exp_p)
+            let aty = check_call_arg(
+              tc,
+              env,
+              param_at(minfo.decl.params, p_idx),
+              resolved_args[i],
+              exp_p,
+              key,
+            )
             env.in_default_arg = saved_in_def
             if p_idx < minfo.param_tys.length() {
               unify_tparams(minfo.param_tys[p_idx], aty, subst)
               let pty = subst_ty(minfo.param_tys[p_idx], subst)
-              if !ty_compat(pty, aty) {
+              if !ty_compat(pty, aty) ||
+                (param_is_mut_at(minfo.decl.params, p_idx) && !ty_compat(aty, pty)) {
                 tc_err(
                   tc,
                   expr_span(resolved_args[i]),
@@ -6498,6 +7264,10 @@ fn check_method_call(
             }
             i = i + 1
           }
+          let mtarget = tc_qualify_local_name(tc, sname) + "::" + method_name
+          tc_check_verify_callee(tc, env, minfo.decl, mtarget, sp)
+          tc_record_call(tc, env, sp, mtarget, minfo.decl.type_params, subst)
+          tc_record_arg_order(tc, env, sp, args, resolved_args)
           return subst_ty(minfo.ret_ty, subst)
         }
         None => {
@@ -6680,6 +7450,11 @@ fn check_method_call(
                 while mi < tinfo.methods.length() {
                   let tm = tinfo.methods[mi]
                   if tm.name == method_name {
+                    let tm_params = if mi < tinfo.decl.methods.length() {
+                      tinfo.decl.methods[mi].params
+                    } else {
+                      []
+                    }
                     let mut ai = 0
                     while ai < args.length() {
                       let p_idx = ai + 1
@@ -6688,7 +7463,14 @@ fn check_method_call(
                       } else {
                         None
                       }
-                      let aty = check_expr(tc, env, args[ai], exp_p)
+                      let aty = check_call_arg(
+                        tc,
+                        env,
+                        param_at(tm_params, p_idx),
+                        args[ai],
+                        exp_p,
+                        bound_traits[bi] + "::" + method_name,
+                      )
                       if p_idx < tm.param_tys.length() {
                         let pty = subst_ty(tm.param_tys[p_idx], self_subst)
                         if !ty_compat(pty, aty) {
@@ -6709,6 +7491,12 @@ fn check_method_call(
                       }
                       ai = ai + 1
                     }
+                    if env.in_verify {
+                      tc.call_targets.set(
+                        span_key(sp),
+                        bound_traits[bi] + "::" + tp_name + "::" + method_name,
+                      )
+                    }
                     return subst_ty(tm.ret_ty, self_subst)
                   }
                   mi = mi + 1
@@ -6726,6 +7514,11 @@ fn check_method_call(
   }
   match find_impl_method(tc, recv_ty, method_name) {
     Some(minfo) => {
+      let itarget = find_impl_trait_name(tc, recv_ty, method_name) +
+        "::" +
+        ty_base_name(recv_ty) +
+        "::" +
+        method_name
       let mut i = 0
       while i < args.length() {
         let p_idx = i + 1
@@ -6734,8 +7527,19 @@ fn check_method_call(
         } else {
           None
         }
-        let aty = check_expr(tc, env, args[i], exp_p)
-        if p_idx < minfo.param_tys.length() && !ty_compat(minfo.param_tys[p_idx], aty) {
+        let aty = check_call_arg(
+          tc,
+          env,
+          param_at(minfo.decl.params, p_idx),
+          args[i],
+          exp_p,
+          itarget,
+        )
+        if p_idx < minfo.param_tys.length() &&
+          (
+            !ty_compat(minfo.param_tys[p_idx], aty) ||
+            (param_is_mut_at(minfo.decl.params, p_idx) && !ty_compat(aty, minfo.param_tys[p_idx]))
+          ) {
           tc_err(
             tc,
             expr_span(args[i]),
@@ -6747,6 +7551,10 @@ fn check_method_call(
           )
         }
         i = i + 1
+      }
+      tc_check_verify_callee(tc, env, minfo.decl, itarget, sp)
+      if env.in_verify {
+        tc.call_targets.set(span_key(sp), itarget)
       }
       return minfo.ret_ty
     }
@@ -6771,7 +7579,57 @@ fn check_expr(
   expr : Expr,
   expected : Option[Ty],
 ) -> Ty {
-  let ty = check_expr_inner(tc, env, expr, expected)
+  let ty0 = check_expr_inner(tc, env, expr, expected)
+  let ty = check_expr_dyn_coerce(tc, env, expr, expected, ty0)
+  if env.in_verify {
+    tc.expr_tys.set(span_key(expr_span(expr)), ty)
+    tc_record_fallback_target(tc, env, expr)
+  }
+  ty
+}
+
+///|
+/// Inside `#verify` code, calls not resolved to a user function / method get
+/// a `builtin::...` / `closure::...` target.
+fn tc_record_fallback_target(tc : TypeChecker, env : Env, expr : Expr) -> Unit {
+  match expr {
+    ECall(callee, _, sp) => {
+      let k = span_key(sp)
+      if !tc.call_targets.contains(k) {
+        match callee {
+          EIdent(n, _) =>
+            match env_lookup(env, n) {
+              Some(_) => tc.call_targets.set(k, "closure::" + n)
+              None => tc.call_targets.set(k, "builtin::" + n)
+            }
+          EPath(q, m, _) => tc.call_targets.set(k, "builtin::" + q + "::" + m)
+          _ => tc.call_targets.set(k, "closure::<expr>")
+        }
+      }
+    }
+    EMethodCall(obj, m, _, sp) => {
+      let k = span_key(sp)
+      if !tc.call_targets.contains(k) {
+        let base = match tc.expr_tys.get(span_key(expr_span(obj))) {
+          Some(t) => ty_base_name(t)
+          None => "?"
+        }
+        tc.call_targets.set(k, "builtin::" + base + "::" + m)
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn check_expr_dyn_coerce(
+  tc : TypeChecker,
+  env : Env,
+  expr : Expr,
+  expected : Option[Ty],
+  ty : Ty,
+) -> Ty {
+  let _ = env
   match expected {
     Some(TDynTrait(tname)) =>
       match ty {
@@ -6833,6 +7691,18 @@ fn check_expr_inner(
     EChar(_, _) => TChar
     EString(_, _) => TString
     EUnit(_) => TUnit
+    EMutArg(inner, sp) => {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "`mut <place>` is only allowed as the argument of a `mut` parameter in a function or method call",
+        "expression",
+        "`mut` argument",
+        "remove `mut`, or pass it to a parameter declared `mut name : T`",
+      )
+      check_expr(tc, env, inner, expected)
+    }
     ENamedArg(label, _, inner, sp) => {
       tc_err(
         tc,
@@ -6897,7 +7767,10 @@ fn check_expr_inner(
         None => ()
       }
       match tc.fns.get(name) {
-        Some(finfo) => return TFn(finfo.param_tys, finfo.ret_ty)
+        Some(finfo) => {
+          tc_check_fn_value_no_mut(tc, finfo.decl, name, sp)
+          return TFn(finfo.param_tys, finfo.ret_ty)
+        }
         None => ()
       }
       match tc.extern_fns.get(name) {
@@ -6957,6 +7830,7 @@ fn check_expr_inner(
                   emit_private_err(tc, sp, "fn", ipkg.name, q_sub + "::" + mem)
                 }
                 let qmi = qualify_fn_info(ipkg, mi)
+                tc_check_fn_value_no_mut(tc, mi.decl, q_sub + "::" + mem, sp)
                 return TFn(qmi.param_tys, qmi.ret_ty)
               }
               None => ()
@@ -6986,6 +7860,7 @@ fn check_expr_inner(
                 emit_private_err_at(tc, sp, "fn", ipkg.name, mem, fi.decl.span)
               }
               let qfi = qualify_fn_info(ipkg, fi)
+              tc_check_fn_value_no_mut(tc, fi.decl, mem, sp)
               return TFn(qfi.param_tys, qfi.ret_ty)
             }
             None => ()
@@ -7016,7 +7891,10 @@ fn check_expr_inner(
       }
       let key = qual + "::" + mem
       match tc.methods.get(key) {
-        Some(minfo) => return TFn(minfo.param_tys, minfo.ret_ty)
+        Some(minfo) => {
+          tc_check_fn_value_no_mut(tc, minfo.decl, key, sp)
+          return TFn(minfo.param_tys, minfo.ret_ty)
+        }
         None => ()
       }
       tc_err(
@@ -7895,7 +8773,16 @@ fn check_expr_inner(
             return check_variant_ctor(tc, env, "", name, args, expected, sp)
           }
           match tc.fns.get(name) {
-            Some(finfo) => return check_fn_call(tc, env, finfo, args, expected, sp)
+            Some(finfo) =>
+              return check_fn_call(
+                tc,
+                env,
+                finfo,
+                args,
+                expected,
+                sp,
+                tc_qualify_local_name(tc, name),
+              )
             None => ()
           }
           match tc.extern_fns.get(name) {
@@ -8287,6 +9174,7 @@ fn check_expr_inner(
                       args,
                       expected,
                       sp,
+                      ipkg.name + "::" + q_sub + "::" + mem,
                     )
                   }
                   None => ()
@@ -8309,6 +9197,7 @@ fn check_expr_inner(
                     args,
                     expected,
                     sp,
+                    ipkg.name + "::" + mem,
                   )
                 }
                 None => ()
@@ -8348,7 +9237,16 @@ fn check_expr_inner(
           }
           let key = qual + "::" + mem
           match tc.methods.get(key) {
-            Some(minfo) => return check_fn_call(tc, env, minfo, args, expected, sp)
+            Some(minfo) =>
+              return check_fn_call(
+                tc,
+                env,
+                minfo,
+                args,
+                expected,
+                sp,
+                tc_qualify_local_name(tc, qual) + "::" + mem,
+              )
             None => ()
           }
           tc_err(
@@ -8462,6 +9360,43 @@ fn check_expr_inner(
       tc.infer_hit.clear()
       let rty = check_method_call(tc, env, oty, method_name, args, expected, sp)
       infer_refine_call(tc, env, obj, oty, method_name)
+      let mut recv_mut = false
+      match oty {
+        TError => ()
+        _ =>
+          match method_params_for(tc, env, oty, method_name) {
+            Some(mps) =>
+              if mps.length() > 0 && mps[0].is_mut {
+                recv_mut = true
+                let _ = check_mut_place(tc, env, obj, false)
+                tc.mut_recv_calls.set(span_key(sp), true)
+              }
+            None => ()
+          }
+      }
+      let mut has_mut_arg = recv_mut
+      let mut ai = 0
+      while ai < args.length() {
+        match args[ai] {
+          EMutArg(_, _) => has_mut_arg = true
+          _ => ()
+        }
+        ai = ai + 1
+      }
+      if has_mut_arg {
+        let all_args : Array[Expr] = [obj]
+        let muts : Array[Bool] = [recv_mut]
+        ai = 0
+        while ai < args.length() {
+          all_args.push(args[ai])
+          match args[ai] {
+            EMutArg(_, _) => muts.push(true)
+            _ => muts.push(false)
+          }
+          ai = ai + 1
+        }
+        check_mut_call_aliasing(tc, all_args, muts, method_name)
+      }
       rty
     }
     EIndex(obj, idx, sp) => {
@@ -8964,6 +9899,40 @@ fn check_expr_inner(
       let body_ty = check_stmts(tc, env, body, ret_opt)
       let clo_inferred_ret = env.inferred_ret
       env_pop(env)
+      if env.mut_params.length() > 0 {
+        let cl_locals : Map[String, Bool] = Map([])
+        let mut cj = 0
+        while cj < params.length() {
+          cl_locals.set(params[cj].name, true)
+          cj = cj + 1
+        }
+        let caps : Array[CaptureInfo] = []
+        collect_stmts_captures(body, cl_locals, caps)
+        let seen_caps : Map[String, Bool] = Map([])
+        let mut ck = 0
+        while ck < caps.length() {
+          let cn = caps[ck].name
+          if env.mut_params.contains(cn) && !seen_caps.contains(cn) {
+            seen_caps.set(cn, true)
+            match env_lookup(env, cn) {
+              Some(b) =>
+                if b.is_mut && b.decl_span.line == 0 && env_lookup_depth(env, cn) == 0 {
+                  tc_err(
+                    tc,
+                    caps[ck].span,
+                    if env.in_verify { "E_VERIFY_CLOSURE_CAPTURE" } else { "E_TYPE_MISMATCH" },
+                    "closure cannot capture `mut` parameter `" + cn + "`",
+                    "local copy",
+                    "mut parameter `" + cn + "`",
+                    "copy it first: `let " + cn + "_v = " + cn + "` and capture `" + cn + "_v`",
+                  )
+                }
+              None => ()
+            }
+          }
+          ck = ck + 1
+        }
+      }
       env.closure_scope_floor = saved_closure_floor
       env.ret_ty = saved_ret_ty
       env.inferred_ret = saved_inferred_ret
@@ -9298,6 +10267,11 @@ pub fn check_package_with_imports(
     dot_variant_resolve: Map([]),
     infer_pending: Map([]),
     infer_hit: [],
+    expr_tys: Map([]),
+    call_targets: Map([]),
+    call_type_args: Map([]),
+    call_arg_order: Map([]),
+    mut_recv_calls: Map([]),
   }
 
   let mut ipi = 0
@@ -9722,6 +10696,26 @@ pub fn check_package_with_imports(
                       "add `" + exp_sig + " { ... }` to `impl " + id.trait_name + " for " + id.target_type + "`",
                     )
                   Some(impl_fi) => {
+                    let tm_decl_params = if tmi < tinfo.decl.methods.length() {
+                      tinfo.decl.methods[tmi].params
+                    } else {
+                      []
+                    }
+                    let mut mq = 0
+                    while mq < impl_fi.decl.params.length() && mq < tm_decl_params.length() {
+                      if impl_fi.decl.params[mq].is_mut != tm_decl_params[mq].is_mut {
+                        tc_err(
+                          tc,
+                          impl_fi.decl.params[mq].span,
+                          "E_TRAIT_METHOD_SIGNATURE",
+                          "parameter `" + impl_fi.decl.params[mq].name + "` of `" + tm.name + "` in `impl " + id.trait_name + " for " + id.target_type + "` must " + (if tm_decl_params[mq].is_mut { "" } else { "not " }) + "be `mut` to match the trait",
+                          if tm_decl_params[mq].is_mut { "mut parameter" } else { "plain parameter" },
+                          if impl_fi.decl.params[mq].is_mut { "mut parameter" } else { "plain parameter" },
+                          "make the `mut` markers of `" + tm.name + "` match the trait declaration",
+                        )
+                      }
+                      mq = mq + 1
+                    }
                     let mut sig_ok = impl_fi.param_tys.length() == exp_ptys.length() &&
                       ty_compat(exp_rty, impl_fi.ret_ty)
                     if sig_ok {
@@ -9926,6 +10920,8 @@ pub fn check_package_with_imports(
               } else {
                 fd.name
               }
+              env.in_verify = fd.is_verify
+              env.verify_fn_name = env.no_io_fn_name
               if fd.type_params.length() > 0 {
                 env.fn_key = span_key(fd.span)
               }
@@ -9984,10 +10980,16 @@ pub fn check_package_with_imports(
                     _ => ()
                   }
                 }
-                env_define(env, fd.params[pi].name, pty_def, false)
+                env_define(env, fd.params[pi].name, pty_def, fd.params[pi].is_mut)
+                if fd.params[pi].is_mut {
+                  env.mut_params.set(fd.params[pi].name, true)
+                }
                 pi = pi + 1
               }
               let body_ty = check_stmts(tc, env, fd.body, Some(finfo.ret_ty))
+              if fd.is_verify {
+                verify_check_fn(tc, fd, finfo, env.verify_fn_name)
+              }
               match fd.ret_ty {
                 // Missing `-> T`: patch in the type the body actually produces.
                 TyMissing(rsp) =>
@@ -10089,6 +11091,8 @@ pub fn check_package_with_imports(
                     } else {
                       md.name
                     }
+                    env.in_verify = md.is_verify
+                    env.verify_fn_name = id.trait_name + "::" + id.target_type + "::" + md.name
                     let mut pi = 0
                     while pi < md.params.length() && pi < finfo.param_tys.length() {
                       let mut pty_def = finfo.param_tys[pi]
@@ -10109,10 +11113,16 @@ pub fn check_package_with_imports(
                           _ => ()
                         }
                       }
-                      env_define(env, md.params[pi].name, pty_def, false)
+                      env_define(env, md.params[pi].name, pty_def, md.params[pi].is_mut)
+                      if md.params[pi].is_mut {
+                        env.mut_params.set(md.params[pi].name, true)
+                      }
                       pi = pi + 1
                     }
                     let body_ty = check_stmts(tc, env, md.body, Some(finfo.ret_ty))
+                    if md.is_verify {
+                      verify_check_fn(tc, md, finfo, env.verify_fn_name)
+                    }
                     if !ty_compat(finfo.ret_ty, body_ty) {
                       tc_err(
                         tc,
