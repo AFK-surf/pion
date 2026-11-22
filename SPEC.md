@@ -154,7 +154,7 @@ test "test name" {
 - `pub` marks items exported in `.pionsig` and accessible from downstream packages via `alias::symbol`. Referencing a non-`pub` symbol from an imported package is a compile-time error (`E_PRIVATE_SYMBOL`).
 - `val struct` asserts at compile time that the struct has zero `mut` fields and every field is `Send`.
 - `test "name" { ... }` blocks are type-checked by `pionc check`, omitted (0 bytes) by `pionc build`, and compiled with active `debug_assert` by `pionc test [--json] [--filter <substr>] <path>`.
-- Files named `*_test.pion` belong to their package only under `pionc test` (the root package of a workspace, or a directory target); `check`, `build` and `run` skip them.
+- Files named `*_test.pion` (in the package root, `src/`, or `tests/` when `tests/` does not contain its own `pion.toml`) belong to their package only under `pionc test` (the root package of a workspace, or a directory target); `check`, `build` and `run` skip them.
 - A struct field may be written `pub name : Type` (MoonBit compatibility); the fields of a `pub struct` are always visible to importers.
 - **Trait objects (`dyn Trait`)**: `dyn Trait` / `dyn pkg::Trait` is a type usable anywhere a type is (parameters, returns, locals, struct fields, `Array[dyn T]`, `Option[dyn T]`). A value of any type with an `impl Trait for Type` (structs, enums, `Int`, `String`, ...) converts to `dyn Trait` implicitly where that type is expected (`let d : dyn Describe = Dog::{ ... }`, arguments, returns, array literal elements, `push`, `Some(...)`) or explicitly with `expr as dyn Trait`; a type without the impl is `E_TRAIT_NOT_IMPLEMENTED` (with an `impl` skeleton edit). Method calls on a `dyn Trait` value dispatch dynamically and are type-checked against the trait's signatures.
   - **Object safety**: every method of the trait must take `self : Self` as its first parameter, must not mention `Self` in any other parameter and must not return `Self`; otherwise `dyn Trait` is `E_TYPE_MISMATCH` ("trait `T` is not object-safe ..."). An unknown trait name is `E_UNKNOWN_TRAIT`; a private trait of an imported package is `E_PRIVATE_SYMBOL`.
@@ -340,8 +340,9 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void*   pion_bytes_to_str(void *b);` (`b.to_string() -> String`)
 
 **StringBuilder (`PionStrBuf`):**
-- `void* pion_strbuf_new(int64_t cap);`
-- `void  pion_strbuf_push_str(void *sb, void *s);`
+- `void* pion_strbuf_new(int64_t cap);` (`StringBuilder()` / `StringBuilder::new()` uses `cap = 32`; `StringBuilder::with_capacity(cap : Int) -> StringBuilder` passes `cap`, clamped to at least 32)
+- `void  pion_strbuf_push_str(void *sb, void *s);` (`StringBuilder::write_string(self, s : String) -> Unit`)
+- `void  pion_strbuf_push_slice(void *sb, void *s, int64_t start, int64_t end);` (`StringBuilder::write_substring(self, s : String, start : Int, end : Int) -> Unit`; clamps `start` and `end` to `[0, s.length()]` and is a no-op when `start >= end`)
 - `void  pion_strbuf_push_byte(void *sb, int32_t b);`
 - `void  pion_strbuf_push_char(void *sb, int32_t cp);`
 - `void  pion_strbuf_push_int(void *sb, int64_t v);`
