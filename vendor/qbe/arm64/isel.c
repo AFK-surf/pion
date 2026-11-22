@@ -527,7 +527,12 @@ sel(Ins i, Blk *b, Ins *cur, Fn *fn)
 	if (isstore(i.op)) {
 		emiti(i);
 		iarg = curi->arg;
-		fixarg(&iarg[0], argcls(&i, 0), 0, fn);
+		if (!((i.op == Ostoreb || i.op == Ostoreh
+		    || i.op == Ostorew || i.op == Ostorel)
+		   && rtype(iarg[0]) == RCon
+		   && fn->con[iarg[0].val].type == CBits
+		   && fn->con[iarg[0].val].bits.i == 0))
+			fixarg(&iarg[0], argcls(&i, 0), 0, fn);
 		if (!seladdr(&iarg[1], storesz(&i), b, cur, fn))
 			fixarg(&iarg[1], argcls(&i, 1), 0, fn);
 		return;

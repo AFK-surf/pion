@@ -1239,10 +1239,10 @@ me_emitins(Ins *i, ME *e)
 		}
 		break;
 
-	case Ostoreb: me_emit_mem(0x39000000u, 0x38206800u, greg(i->arg[0].val), 1, i->arg[1], e); break;
-	case Ostoreh: me_emit_mem(0x79000000u, 0x78206800u, greg(i->arg[0].val), 2, i->arg[1], e); break;
-	case Ostorew: me_emit_mem(0xb9000000u, 0xb8206800u, greg(i->arg[0].val), 4, i->arg[1], e); break;
-	case Ostorel: me_emit_mem(0xf9000000u, 0xf8206800u, greg(i->arg[0].val), 8, i->arg[1], e); break;
+	case Ostoreb: me_emit_mem(0x39000000u, 0x38206800u, rtype(i->arg[0]) == RCon ? 31u : greg(i->arg[0].val), 1, i->arg[1], e); break;
+	case Ostoreh: me_emit_mem(0x79000000u, 0x78206800u, rtype(i->arg[0]) == RCon ? 31u : greg(i->arg[0].val), 2, i->arg[1], e); break;
+	case Ostorew: me_emit_mem(0xb9000000u, 0xb8206800u, rtype(i->arg[0]) == RCon ? 31u : greg(i->arg[0].val), 4, i->arg[1], e); break;
+	case Ostorel: me_emit_mem(0xf9000000u, 0xf8206800u, rtype(i->arg[0]) == RCon ? 31u : greg(i->arg[0].val), 8, i->arg[1], e); break;
 	case Ostores: me_emit_mem(0xbd000000u, 0xbc206800u, freg(i->arg[0].val), 4, i->arg[1], e); break;
 	case Ostored: me_emit_mem(0xfd000000u, 0xfc206800u, freg(i->arg[0].val), 8, i->arg[1], e); break;
 
@@ -1506,8 +1506,85 @@ me_w32_def_reg(const Ins *i, int cur_reg)
 	}
 }
 
+static uint64_t *
+me_compute_gpr_out(Fn *fn)
+{
+	uint64_t *in = alloc(fn->nblk * sizeof *in);
+	uint64_t *out = alloc(fn->nblk * sizeof *out);
+	uint64_t call_pres = 0, all_gpr = 0;
+	for (int r = R19; r <= LR; r++)
+		call_pres |= BIT(r);
+	call_pres |= BIT(SP);
+	for (int r = R0; r <= LR; r++)
+		all_gpr |= BIT(r);
+	all_gpr |= BIT(SP);
+
+	int changed;
+	do {
+		changed = 0;
+		for (Blk *b = fn->start; b; b = b->link) {
+			uint64_t live = 0;
+			if (b->jmp.type == Jret0) {
+				live = call_pres;
+				if (rtype(b->jmp.arg) == RCall)
+					live |= arm64_retregs(b->jmp.arg, 0) & all_gpr;
+				else
+					live |= BIT(R0) | BIT(R1);
+			} else if (b->jmp.type == Jhlt) {
+				live = 0;
+			} else if (b->jmp.type == Jjtbl) {
+				if (b->s1)
+					live |= in[b->s1->id];
+				for (uint32_t j = 0; j < b->njtbl; j++)
+					live |= in[b->jtbl[j]->id];
+			} else {
+				if (b->s1)
+					live |= in[b->s1->id];
+				if (b->s2)
+					live |= in[b->s2->id];
+			}
+			if (isreg(b->jmp.arg) && (all_gpr & BIT(b->jmp.arg.val)))
+				live |= BIT(b->jmp.arg.val);
+			out[b->id] = live;
+			for (Ins *ins = &b->ins[b->nins]; ins > b->ins;) {
+				--ins;
+				if (ins->op == Ocall) {
+					live &= call_pres;
+					if (rtype(ins->arg[1]) == RCall)
+						live |= arm64_argregs(ins->arg[1], 0) & all_gpr;
+					else
+						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8);
+					if (isreg(ins->arg[0]) && (all_gpr & BIT(ins->arg[0].val)))
+						live |= BIT(ins->arg[0].val);
+					continue;
+				}
+				if (isreg(ins->to) && (all_gpr & BIT(ins->to.val))
+				&& ins->op != Osel0 && !isxsel(ins->op))
+					live &= ~BIT(ins->to.val);
+				for (int j = 0; j < 2; j++) {
+					Ref a = ins->arg[j];
+					if (isreg(a) && (all_gpr & BIT(a.val)))
+						live |= BIT(a.val);
+					else if (rtype(a) == RMem) {
+						Mem *m = &fn->mem[a.val];
+						if (isreg(m->base) && (all_gpr & BIT(m->base.val)))
+							live |= BIT(m->base.val);
+						if (isreg(m->index) && (all_gpr & BIT(m->index.val)))
+							live |= BIT(m->index.val);
+					}
+				}
+			}
+			if (live != in[b->id]) {
+				in[b->id] = live;
+				changed = 1;
+			}
+		}
+	} while (changed);
+	return out;
+}
+
 static int
-me_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg)
+me_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg, uint64_t live_out)
 {
 	for (Ins *ins = start; ins < end; ins++) {
 		if (ins->op == Ocall)
@@ -1525,7 +1602,7 @@ me_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg)
 		if (req(ins->to, reg) && ins->op != Osel0 && !isxsel(ins->op))
 			return 1;
 	}
-	return 0;
+	return (live_out & BIT(reg.val)) == 0;
 }
 
 void
@@ -1570,9 +1647,11 @@ arm64_macho_fn(Fn *fn)
 
 	uint32_t *blk_off = emalloc((size_t)(fn->nblk + 1) * sizeof *blk_off);
 
+	uint64_t *gpr_out = me_compute_gpr_out(fn);
 	for (Blk *b = fn->start; b; b = b->link) {
 		Ins *cbz_ins = me_can_fuse_cbz(b, fn);
 		int last_w32 = -1;
+		uint64_t live_out = gpr_out[b->id];
 		blk_off[b->id] = text_pos();
 		for (Ins *i = b->ins; i != &b->ins[b->nins]; i++) {
 			if (i == cbz_ins) {
@@ -1587,7 +1666,7 @@ arm64_macho_fn(Fn *fn)
 			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
 				Ins *i1 = i + 1;
 				if (i1->cls == i->cls && isreg(i1->to)
-				&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to))) {
+				&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to, live_out))) {
 					uint32_t sf = (i->cls == Kl) ? 1u : 0u;
 					if (i1->op == Osub && isreg(i1->arg[0])
 					&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
@@ -1631,7 +1710,7 @@ arm64_macho_fn(Fn *fn)
 					uint32_t sh = (uint32_t)sc->bits.i & maxsh;
 					Ins *i1 = i + 1;
 					if (sh >= 1 && i1->cls == i->cls && isreg(i1->to) && i1->to.val != SP
-					&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to))) {
+					&& (req(i1->to, i->to) || me_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to, live_out))) {
 						uint32_t sf = (i->cls == Kl) ? 1u : 0u;
 						if (i1->op == Oadd
 						&& ((isreg(i1->arg[0]) && i1->arg[0].val != SP && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
@@ -1661,6 +1740,55 @@ arm64_macho_fn(Fn *fn)
 								last_w32 = -1;
 							last_w32 = me_w32_def_reg(i1, last_w32);
 							i++;
+							continue;
+						}
+					}
+				}
+			}
+			if (i + 2 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 2 != cbz_ins
+			&& i->op == Oadd && KBASE(i->cls) == 0
+			&& isreg(i->to) && i->to.val != SP) {
+				Ref ra = R;
+				int is_inc1 = 0;
+				if (isreg(i->arg[0]) && i->arg[0].val != SP && !req(i->arg[0], i->to)
+				&& rtype(i->arg[1]) == RCon) {
+					Con *ac = &fn->con[i->arg[1].val];
+					if (ac->type == CBits && ac->bits.i == 1) {
+						ra = i->arg[0];
+						is_inc1 = 1;
+					}
+				} else if (isreg(i->arg[1]) && i->arg[1].val != SP && !req(i->arg[1], i->to)
+				&& rtype(i->arg[0]) == RCon) {
+					Con *ac = &fn->con[i->arg[0].val];
+					if (ac->type == CBits && ac->bits.i == 1) {
+						ra = i->arg[1];
+						is_inc1 = 1;
+					}
+				}
+				if (is_inc1) {
+					Ins *i1 = i + 1;
+					Ins *i2 = i + 2;
+					if ((i1->op == Oacmp || i1->op == Oacmn || i1->op == Oatst || i1->op == Oafcmp)
+					&& !req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)
+					&& isxsel(i2->op) && i2->cls == i->cls && req(i2->to, ra)
+					&& me_reg_dead_after(fn, i2 + 1, &b->ins[b->nins], i->to, live_out)) {
+						int inv = -1;
+						if (req(i2->arg[0], i->to) && req(i2->arg[1], ra))
+							inv = 0;
+						else if (req(i2->arg[0], ra) && req(i2->arg[1], i->to))
+							inv = 1;
+						if (inv >= 0) {
+							uint32_t sf = (i2->cls == Kl) ? 1u : 0u;
+							uint32_t r = greg(ra.val);
+							uint32_t cc = cmp_cc[(int)i2->op - Oxsel][0];
+							uint32_t cond = inv == 0 ? ((cc ^ 1u) & 0xfu) : (cc & 0xfu);
+							me_emitins(i1, &e);
+							/* csinc rd, ra, ra, cond (alias: cinc rd, ra, inv(cond)) */
+							emit_u32(0x1a800400u | (sf << 31) | (r << 16) | (cond << 12) | (r << 5) | r);
+							if (last_w32 == i->to.val)
+								last_w32 = -1;
+							last_w32 = me_w32_def_reg(i2, last_w32);
+							i += 2;
 							continue;
 						}
 					}

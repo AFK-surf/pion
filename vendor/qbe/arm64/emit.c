@@ -219,6 +219,12 @@ emitf(char *s, Ins *i, E *e)
 		case '=':
 		case '0':
 			r = c == '=' ? i->to : i->arg[0];
+			if (c == '0' && rtype(r) == RCon) {
+				pc = &e->fn->con[r.val];
+				assert(KBASE(k) == 0 && pc->type == CBits && pc->bits.i == 0);
+				fputs(k == Kl ? "xzr" : "wzr", e->f);
+				break;
+			}
 			assert(isreg(r) || req(r, TMP(V31)));
 			fputs(rname(r.val, k), e->f);
 			break;
@@ -688,8 +694,91 @@ w32_def_reg(const Ins *i, int cur_reg)
 	}
 }
 
+static uint64_t *
+arm64_compute_gpr_out(Fn *fn)
+{
+	uint64_t *in, *out;
+	uint64_t call_pres = 0, all_gpr = 0;
+	int r, changed;
+	Blk *b;
+	Ins *ins;
+
+	in = alloc(fn->nblk * sizeof *in);
+	out = alloc(fn->nblk * sizeof *out);
+	for (r = R19; r <= LR; r++)
+		call_pres |= BIT(r);
+	call_pres |= BIT(SP);
+	for (r = R0; r <= LR; r++)
+		all_gpr |= BIT(r);
+	all_gpr |= BIT(SP);
+
+	do {
+		changed = 0;
+		for (b = fn->start; b; b = b->link) {
+			uint64_t live = 0;
+			if (b->jmp.type == Jret0) {
+				live = call_pres;
+				if (rtype(b->jmp.arg) == RCall)
+					live |= arm64_retregs(b->jmp.arg, 0) & all_gpr;
+				else
+					live |= BIT(R0) | BIT(R1);
+			} else if (b->jmp.type == Jhlt) {
+				live = 0;
+			} else if (b->jmp.type == Jjtbl) {
+				uint32_t j;
+				if (b->s1)
+					live |= in[b->s1->id];
+				for (j = 0; j < b->njtbl; j++)
+					live |= in[b->jtbl[j]->id];
+			} else {
+				if (b->s1)
+					live |= in[b->s1->id];
+				if (b->s2)
+					live |= in[b->s2->id];
+			}
+			if (isreg(b->jmp.arg) && (all_gpr & BIT(b->jmp.arg.val)))
+				live |= BIT(b->jmp.arg.val);
+			out[b->id] = live;
+			for (ins = &b->ins[b->nins]; ins > b->ins;) {
+				int j;
+				--ins;
+				if (ins->op == Ocall) {
+					live &= call_pres;
+					if (rtype(ins->arg[1]) == RCall)
+						live |= arm64_argregs(ins->arg[1], 0) & all_gpr;
+					else
+						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8);
+					if (isreg(ins->arg[0]) && (all_gpr & BIT(ins->arg[0].val)))
+						live |= BIT(ins->arg[0].val);
+					continue;
+				}
+				if (isreg(ins->to) && (all_gpr & BIT(ins->to.val))
+				&& ins->op != Osel0 && !isxsel(ins->op))
+					live &= ~BIT(ins->to.val);
+				for (j = 0; j < 2; j++) {
+					Ref a = ins->arg[j];
+					if (isreg(a) && (all_gpr & BIT(a.val)))
+						live |= BIT(a.val);
+					else if (rtype(a) == RMem) {
+						Mem *m = &fn->mem[a.val];
+						if (isreg(m->base) && (all_gpr & BIT(m->base.val)))
+							live |= BIT(m->base.val);
+						if (isreg(m->index) && (all_gpr & BIT(m->index.val)))
+							live |= BIT(m->index.val);
+					}
+				}
+			}
+			if (live != in[b->id]) {
+				in[b->id] = live;
+				changed = 1;
+			}
+		}
+	} while (changed);
+	return out;
+}
+
 static int
-arm64_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg)
+arm64_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg, uint64_t live_out)
 {
 	Ins *ins;
 	int j;
@@ -710,7 +799,7 @@ arm64_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg)
 		if (req(ins->to, reg) && ins->op != Osel0 && !isxsel(ins->op))
 			return 1;
 	}
-	return 0;
+	return (live_out & BIT(reg.val)) == 0;
 }
 
 void
@@ -778,9 +867,11 @@ arm64_emitfn(Fn *fn, FILE *out)
 			emitins(i, e);
 		}
 
+	uint64_t *gpr_out = arm64_compute_gpr_out(e->fn);
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
 		Ins *cbz_ins = can_fuse_cbz(b, e->fn);
 		int last_w32 = -1;
+		uint64_t live_out = gpr_out[b->id];
 		if (lbl || b->npred > 1)
 			fprintf(e->f, "%s%d:\n", T.asloc, id0+b->id);
 		for (i=b->ins; i!=&b->ins[b->nins]; i++) {
@@ -796,7 +887,7 @@ arm64_emitfn(Fn *fn, FILE *out)
 			&& isreg(i->to) && isreg(i->arg[0]) && isreg(i->arg[1])) {
 				Ins *i1 = i + 1;
 				if (i1->cls == i->cls && isreg(i1->to)
-				&& (req(i1->to, i->to) || arm64_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to))) {
+				&& (req(i1->to, i->to) || arm64_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to, live_out))) {
 					if (i1->op == Osub && isreg(i1->arg[0])
 					&& req(i1->arg[1], i->to) && !req(i1->arg[0], i->to)) {
 						char rd[4], rn[4], rm[4], ra[4];
@@ -839,7 +930,7 @@ arm64_emitfn(Fn *fn, FILE *out)
 					uint sh = (uint)sc->bits.i & maxsh;
 					Ins *i1 = i + 1;
 					if (sh >= 1 && i1->cls == i->cls && isreg(i1->to) && i1->to.val != SP
-					&& (req(i1->to, i->to) || arm64_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to))) {
+					&& (req(i1->to, i->to) || arm64_reg_dead_after(fn, i1 + 1, &b->ins[b->nins], i->to, live_out))) {
 						if (i1->op == Oadd
 						&& ((isreg(i1->arg[0]) && i1->arg[0].val != SP && req(i1->arg[1], i->to) && !req(i1->arg[0], i->to))
 						 || (isreg(i1->arg[1]) && i1->arg[1].val != SP && req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)))) {
@@ -866,6 +957,53 @@ arm64_emitfn(Fn *fn, FILE *out)
 								last_w32 = -1;
 							last_w32 = w32_def_reg(i1, last_w32);
 							i++;
+							continue;
+						}
+					}
+				}
+			}
+			if (i + 2 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 2 != cbz_ins
+			&& i->op == Oadd && KBASE(i->cls) == 0
+			&& isreg(i->to) && i->to.val != SP) {
+				Ref ra = R;
+				int is_inc1 = 0;
+				if (isreg(i->arg[0]) && i->arg[0].val != SP && !req(i->arg[0], i->to)
+				&& rtype(i->arg[1]) == RCon) {
+					Con *ac = &fn->con[i->arg[1].val];
+					if (ac->type == CBits && ac->bits.i == 1) {
+						ra = i->arg[0];
+						is_inc1 = 1;
+					}
+				} else if (isreg(i->arg[1]) && i->arg[1].val != SP && !req(i->arg[1], i->to)
+				&& rtype(i->arg[0]) == RCon) {
+					Con *ac = &fn->con[i->arg[0].val];
+					if (ac->type == CBits && ac->bits.i == 1) {
+						ra = i->arg[1];
+						is_inc1 = 1;
+					}
+				}
+				if (is_inc1) {
+					Ins *i1 = i + 1;
+					Ins *i2 = i + 2;
+					if ((i1->op == Oacmp || i1->op == Oacmn || i1->op == Oatst || i1->op == Oafcmp)
+					&& !req(i1->arg[0], i->to) && !req(i1->arg[1], i->to)
+					&& isxsel(i2->op) && i2->cls == i->cls && req(i2->to, ra)
+					&& arm64_reg_dead_after(fn, i2 + 1, &b->ins[b->nins], i->to, live_out)) {
+						int inv = -1;
+						if (req(i2->arg[0], i->to) && req(i2->arg[1], ra))
+							inv = 0;
+						else if (req(i2->arg[0], ra) && req(i2->arg[1], i->to))
+							inv = 1;
+						if (inv >= 0) {
+							char rbuf[4];
+							int cc_idx = (int)i2->op - Oxsel;
+							emitins(i1, e);
+							strcpy(rbuf, rname(ra.val, i2->cls));
+							fprintf(e->f, "\tcinc\t%s, %s, %s\n", rbuf, rbuf, ctoa[cc_idx][inv]);
+							if (last_w32 == i->to.val)
+								last_w32 = -1;
+							last_w32 = w32_def_reg(i2, last_w32);
+							i += 2;
 							continue;
 						}
 					}
