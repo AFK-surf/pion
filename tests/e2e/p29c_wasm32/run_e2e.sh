@@ -4109,4 +4109,174 @@ console.log("  p56a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P57-A Regression: Exponential memory.grow (<=12 grows for 24MB) + drop_s2 Homo/Hetero/100k-Chains + Sparse Flat-Struct Array ctz Drop ==="
+cat > "$TMP_DIR/p57a_regression.pion" <<'EOF'
+struct P57Node {
+  left : Option[P57Node]
+  right : Option[P57Node]
+}
+
+struct P57Hetero {
+  label : String
+  sub : Option[P57Node]
+}
+
+struct P57Sparse {
+  id : Int64
+  name : String
+  score : Int64
+  flags : Int64
+  tags : Array[String]
+}
+
+fn make_p57_tree(d : Int) -> P57Node {
+  if d == 0 {
+    P57Node::{ left: None, right: None }
+  } else {
+    P57Node::{ left: Some(make_p57_tree(d - 1)), right: Some(make_p57_tree(d - 1)) }
+  }
+}
+
+fn count_p57_tree(t : P57Node) -> Int64 {
+  match t.left {
+    None =>
+      match t.right {
+        None => 1L
+        Some(r) => 1L + count_p57_tree(r)
+      }
+    Some(l) =>
+      match t.right {
+        None => 1L + count_p57_tree(l)
+        Some(r) => 1L + count_p57_tree(l) + count_p57_tree(r)
+      }
+  }
+}
+
+fn make_p57_chain(n : Int, is_left : Bool) -> P57Node {
+  let mut cur = P57Node::{ left: None, right: None }
+  let mut i = 0
+  while i < n {
+    if is_left {
+      cur = P57Node::{ left: Some(cur), right: None }
+    } else {
+      cur = P57Node::{ left: None, right: Some(cur) }
+    }
+    i = i + 1
+  }
+  cur
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Multi-MB live allocation (~24MB) to verify exponential memory.grow (<= 12 grows instead of ~24)
+  let big : Array[Int64] = Array::with_capacity(3000000)
+  let mut bi = 0
+  while bi < 1000 {
+    big.push(bi.to_int64())
+    bi = bi + 1
+  }
+  let big_chk = big[0] + big[999]
+
+  // 2. pion_drop_s2 homomorphic + heteromorphic mixed tree + 100k left & right chains
+  let t13 = count_p57_tree(make_p57_tree(13))
+  let h = P57Hetero::{ label: "p57_" + (42).to_string(), sub: Some(make_p57_tree(6)) }
+  if h.label != "p57_42" {
+    panic("hetero mismatch")
+  }
+  let lc = make_p57_chain(100000, true)
+  let rc = make_p57_chain(100000, false)
+  let ch_ok = match lc.left { Some(_) => 1; None => 0 } + (match rc.right { Some(_) => 1; None => 0 })
+
+  // 3. Sparse RC-bitmap flat struct array (5 fields, only slots 1 & 4 are RC: mask = 0b10010)
+  let recs : Array[P57Sparse] = []
+  let mut i = 0
+  while i < 500 {
+    let ts : Array[String] = ["t" + (i % 7).to_string(), "g" + (i % 5).to_string()]
+    recs.push(P57Sparse::{ id: i.to_int64(), name: "u" + i.to_string(), score: (i * 3).to_int64(), flags: 7L, tags: ts })
+    i = i + 1
+  }
+  let r_chk = recs[499].id + recs[499].name.length().to_int64() + recs[499].tags.length().to_int64()
+
+  io_println(world, "p57a_ok:" + big_chk.to_string() + ":" + t13.to_string() + ":" + ch_ok.to_string() + ":" + r_chk.to_string())
+  0
+}
+EOF
+P57A_REL_WASM="$TMP_DIR/p57a_rel.wasm"
+P57A_DEV_WASM="$TMP_DIR/p57a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P57A_REL_WASM" "$TMP_DIR/p57a_regression.pion"
+"$PIONC" build --target wasm32 -o "$P57A_DEV_WASM" "$TMP_DIR/p57a_regression.pion"
+for mode_wasm in "release:$P57A_REL_WASM" "dev:$P57A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p57a failed WebAssembly.validate()");
+  process.exit(1);
+}
+let growCount = 0;
+const origGrow = WebAssembly.Memory.prototype.grow;
+WebAssembly.Memory.prototype.grow = function(delta) {
+  growCount++;
+  return origGrow.call(this, delta);
+};
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+WebAssembly.Memory.prototype.grow = origGrow;
+const out = lines.join("").trim();
+// big_chk=999, t13=16383, ch_ok=2, r_chk=499+len("u499")(=4)+2=505
+if ((rc | 0) !== 0 || out !== "p57a_ok:999:16383:2:505") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p57a bad output: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+if (rtLabel === "pion_wasm_rt.mjs" && growCount > 12) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p57a expected <=12 memory.grow calls, got " + growCount);
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p57a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p57a (" + mode + "/" + rtLabel + "): " + out + " grows=" + growCount + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"

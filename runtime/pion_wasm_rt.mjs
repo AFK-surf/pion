@@ -295,7 +295,12 @@ export function createPionRuntime(options = {}) {
     const hp = getHeapPtr();
     if (hp + allocSz > heapEnd) {
       const missing = hp + allocSz - heapEnd;
-      const growPages = Math.max(16, Math.ceil(missing / PAGE_SIZE));
+      const curPages = heapEnd >>> 16;
+      const minGrow = Math.ceil(missing / PAGE_SIZE);
+      const expGrow = Math.min(curPages, 2048);
+      const maxAllowed = Math.max(0, 65535 - curPages);
+      const targetGrow = Math.max(16, minGrow, expGrow);
+      const growPages = minGrow > maxAllowed ? minGrow : Math.min(maxAllowed, targetGrow);
       memory.grow(growPages);
       syncViews();
     }
