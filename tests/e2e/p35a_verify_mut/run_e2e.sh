@@ -60,6 +60,14 @@ expect_panic zero "division by zero"
 expect_panic ovf "integer overflow in division"
 expect_panic removf "integer overflow in division"
 expect_panic shift "shift amount out of range"
+expect_panic shift64 "shift amount out of range"
+expect_panic shiftu64 "shift amount out of range"
+expect_panic shiftu64int "shift amount out of range"
+SHIFT_OK=$("$TMP_DIR/p35a" shiftok)
+if [ "$SHIFT_OK" != "1099511627776 9223372036854775808 25769803776" ]; then
+  echo "FAIL: p35a shiftok: '$SHIFT_OK'" >&2
+  exit 1
+fi
 
 # 4. ASan/LSan: the same program flattened into one file (no pion.toml).
 sed -e '/^import "vlib"/d' -e 's/vlib:://g' "$APP_DIR/src/main.pion" > "$TMP_DIR/main_body.pion"

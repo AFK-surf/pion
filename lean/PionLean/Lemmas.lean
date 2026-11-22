@@ -56,6 +56,76 @@ namespace Pion
   unfold I32.shr
   simp [h0, h1]
 
+@[step] theorem I64.shl_i32_spec (x : Std.I64) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 64) :
+    I64.shl_i32 x y ⦃ z => z.bv = x.bv <<< y.val.toNat ⦄ := by
+  unfold I64.shl_i32
+  simp [h0, h1]
+
+@[step] theorem I64.shr_i32_spec (x : Std.I64) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 64) :
+    I64.shr_i32 x y ⦃ z => z.bv = x.bv.sshiftRight y.val.toNat ⦄ := by
+  unfold I64.shr_i32
+  simp [h0, h1]
+
+@[step] theorem U32.shl_i32_spec (x : Std.U32) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 32) :
+    U32.shl_i32 x y ⦃ z => z.bv = x.bv <<< y.val.toNat ⦄ := by
+  unfold U32.shl_i32
+  simp [h0, h1]
+
+@[step] theorem U32.shr_i32_spec (x : Std.U32) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 32) :
+    U32.shr_i32 x y ⦃ z => z.bv = x.bv >>> y.val.toNat ⦄ := by
+  unfold U32.shr_i32
+  simp [h0, h1]
+
+@[step] theorem U64.shl_i32_spec (x : Std.U64) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 64) :
+    U64.shl_i32 x y ⦃ z => z.bv = x.bv <<< y.val.toNat ⦄ := by
+  unfold U64.shl_i32
+  simp [h0, h1]
+
+@[step] theorem U64.shr_i32_spec (x : Std.U64) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 64) :
+    U64.shr_i32 x y ⦃ z => z.bv = x.bv >>> y.val.toNat ⦄ := by
+  unfold U64.shr_i32
+  simp [h0, h1]
+
+@[step] theorem I64.shl_spec (x : Std.I64) {y : Std.I64} (h0 : 0 ≤ y.val) (h1 : y.val < 64) :
+    I64.shl x y ⦃ z => z.bv = x.bv <<< y.val.toNat ⦄ := by
+  unfold I64.shl
+  simp [h0, h1]
+
+@[step] theorem I64.shr_spec (x : Std.I64) {y : Std.I64} (h0 : 0 ≤ y.val) (h1 : y.val < 64) :
+    I64.shr x y ⦃ z => z.bv = x.bv.sshiftRight y.val.toNat ⦄ := by
+  unfold I64.shr
+  simp [h0, h1]
+
+@[step] theorem U32.shl_spec (x : Std.U32) {y : Std.U32} (h : y.val < 32) :
+    U32.shl x y ⦃ z => z.bv = x.bv <<< y.val ⦄ := by
+  unfold U32.shl
+  simp [h]
+
+@[step] theorem U32.shr_spec (x : Std.U32) {y : Std.U32} (h : y.val < 32) :
+    U32.shr x y ⦃ z => z.bv = x.bv >>> y.val ⦄ := by
+  unfold U32.shr
+  simp [h]
+
+@[step] theorem U64.shl_spec (x : Std.U64) {y : Std.U64} (h : y.val < 64) :
+    U64.shl x y ⦃ z => z.bv = x.bv <<< y.val ⦄ := by
+  unfold U64.shl
+  simp [h]
+
+@[step] theorem U64.shr_spec (x : Std.U64) {y : Std.U64} (h : y.val < 64) :
+    U64.shr x y ⦃ z => z.bv = x.bv >>> y.val ⦄ := by
+  unfold U64.shr
+  simp [h]
+
+@[step] theorem U64.div_spec (x : Std.U64) {y : Std.U64} (hnz : y.val ≠ 0) :
+    U64.div x y ⦃ z => z.val = x.val / y.val ⦄ := by
+  unfold U64.div
+  exact Std.U64.div_spec x hnz
+
+@[step] theorem U64.rem_spec (x : Std.U64) {y : Std.U64} (hnz : y.val ≠ 0) :
+    U64.rem x y ⦃ z => z.val = x.val % y.val ⦄ := by
+  unfold U64.rem
+  exact Std.U64.rem_spec x hnz
+
 /-! ## Containers -/
 
 @[step] theorem lengthOf_spec (n : Nat) (h : n ≤ 2147483647) :

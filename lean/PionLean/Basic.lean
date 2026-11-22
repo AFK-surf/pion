@@ -9,7 +9,8 @@ Semantics follow the native backend (`qbe.pion`) of `#verify` code exactly:
 - `/ %` fail with `divisionByZero` on a zero divisor and, for signed types,
   with `integerOverflow` on `MIN / -1` and `MIN % -1`;
 - `<< >>` fail with `integerOverflow` unless `0 <= rhs < bits`; signed `>>` is
-  arithmetic, unsigned `>>` is logical;
+  arithmetic, unsigned `>>` is logical; `shl_i32` / `shr_i32` are the mixed
+  `T << Int` forms (the count is compared at its own width, never truncated);
 - conversions are the backend's bit casts / truncations / extensions;
 - arrays index with `Std.I32` and fail with `arrayOutOfBounds` outside
   `[0, length)`.
@@ -134,6 +135,10 @@ def shl (x y : Std.I64) : Result Std.I64 :=
   if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv <<< y.val.toNat⟩ else fail integerOverflow
 def shr (x y : Std.I64) : Result Std.I64 :=
   if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv.sshiftRight y.val.toNat⟩ else fail integerOverflow
+def shl_i32 (x : Std.I64) (y : Std.I32) : Result Std.I64 :=
+  if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv <<< y.val.toNat⟩ else fail integerOverflow
+def shr_i32 (x : Std.I64) (y : Std.I32) : Result Std.I64 :=
+  if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv.sshiftRight y.val.toNat⟩ else fail integerOverflow
 @[simp] def abs (x : Std.I64) : Std.I64 := if x.val < 0 then neg x else x
 @[simp] def to_int (x : Std.I64) : Std.I32 := IScalar.cast .I32 x
 @[simp] def to_int64 (x : Std.I64) : Std.I64 := x
@@ -155,6 +160,10 @@ def shl (x y : Std.U32) : Result Std.U32 :=
   if y.val < 32 then ok ⟨x.bv <<< y.val⟩ else fail integerOverflow
 def shr (x y : Std.U32) : Result Std.U32 :=
   if y.val < 32 then ok ⟨x.bv >>> y.val⟩ else fail integerOverflow
+def shl_i32 (x : Std.U32) (y : Std.I32) : Result Std.U32 :=
+  if 0 ≤ y.val ∧ y.val < 32 then ok ⟨x.bv <<< y.val.toNat⟩ else fail integerOverflow
+def shr_i32 (x : Std.U32) (y : Std.I32) : Result Std.U32 :=
+  if 0 ≤ y.val ∧ y.val < 32 then ok ⟨x.bv >>> y.val.toNat⟩ else fail integerOverflow
 @[simp] def to_int (x : Std.U32) : Std.I32 := UScalar.hcast .I32 x
 @[simp] def reinterpret_as_int (x : Std.U32) : Std.I32 := UScalar.hcast .I32 x
 @[simp] def to_uint (x : Std.U32) : Std.U32 := x
@@ -176,6 +185,10 @@ def shl (x y : Std.U64) : Result Std.U64 :=
   if y.val < 64 then ok ⟨x.bv <<< y.val⟩ else fail integerOverflow
 def shr (x y : Std.U64) : Result Std.U64 :=
   if y.val < 64 then ok ⟨x.bv >>> y.val⟩ else fail integerOverflow
+def shl_i32 (x : Std.U64) (y : Std.I32) : Result Std.U64 :=
+  if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv <<< y.val.toNat⟩ else fail integerOverflow
+def shr_i32 (x : Std.U64) (y : Std.I32) : Result Std.U64 :=
+  if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv >>> y.val.toNat⟩ else fail integerOverflow
 @[simp] def to_int (x : Std.U64) : Std.I32 := UScalar.hcast .I32 x
 @[simp] def to_uint (x : Std.U64) : Std.U32 := UScalar.cast .U32 x
 @[simp] def to_int64 (x : Std.U64) : Std.I64 := UScalar.hcast .I64 x
