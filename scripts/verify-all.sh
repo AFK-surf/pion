@@ -165,6 +165,8 @@ sh "$ROOT_DIR/tests/e2e/p31c_jsx_dot/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p32a_toolchain/run_e2e.sh" "$PIONC2"
 # P32-B: multi-package virtual [workspace], [workspace.dependencies], { workspace = true }, shared pion.lock, CLI --package/-p.
 sh "$ROOT_DIR/tests/e2e/p32b_workspace/run_e2e.sh" "$PIONC2"
+# P32-C: amd64_sysv direct ELF64 XMM stack-arg encoding (>8 Double/Float + mixed GPR/XMM).
+sh "$ROOT_DIR/tests/e2e/p32c_abi_fp_stack/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent

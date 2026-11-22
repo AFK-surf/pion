@@ -492,6 +492,12 @@ hw_reg(int r)
 	die("elf: invalid register %d", r);
 }
 
+static inline int
+is_xmm(int r)
+{
+	return r >= XMM0 && r <= XMM15;
+}
+
 static inline Buf *
 text_buf(void)
 {
@@ -1246,11 +1252,19 @@ emitins(Ins i, EF *e)
 		} else {
 			assert(isreg(i.arg[0]));
 			uint8_t r = hw_reg(i.arg[0].val);
-			switch (i.op) {
-			case Ostorel: emit_modrm(0, 1, 0, 0x89, -1, r, m, 0, 0); break;
-			case Ostorew: emit_modrm(0, 0, 0, 0x89, -1, r, m, 0, 0); break;
-			case Ostoreh: emit_modrm(0x66, 0, 0, 0x89, -1, r, m, 0, 0); break;
-			case Ostoreb: emit_modrm(0, 0, needs_byte_rex(r), 0x88, -1, r, m, 0, 0); break;
+			if (is_xmm(i.arg[0].val)) {
+				switch (i.op) {
+				case Ostorel: emit_modrm(0x66, 0, 0, 0x0f, 0xd6, r, m, 0, 0); break; /* movq %xmm, m64 */
+				case Ostorew: emit_modrm(0x66, 0, 0, 0x0f, 0x7e, r, m, 0, 0); break; /* movd %xmm, m32 */
+				default: die("elf: invalid xmm store op %s", optab[i.op].name);
+				}
+			} else {
+				switch (i.op) {
+				case Ostorel: emit_modrm(0, 1, 0, 0x89, -1, r, m, 0, 0); break;
+				case Ostorew: emit_modrm(0, 0, 0, 0x89, -1, r, m, 0, 0); break;
+				case Ostoreh: emit_modrm(0x66, 0, 0, 0x89, -1, r, m, 0, 0); break;
+				case Ostoreb: emit_modrm(0, 0, needs_byte_rex(r), 0x88, -1, r, m, 0, 0); break;
+				}
 			}
 		}
 		break;
@@ -1260,6 +1274,7 @@ emitins(Ins i, EF *e)
 	case Ostored: {
 		RmOp m = ref_to_rm(i.arg[1], 1, e);
 		assert(isreg(i.arg[0]));
+		assert(is_xmm(i.arg[0].val));
 		uint8_t r = hw_reg(i.arg[0].val);
 		uint8_t pfx = (i.op == Ostored) ? 0xf2 : 0xf3;
 		emit_modrm(pfx, 0, 0, 0x0f, 0x11, r, m, 0, 0);
@@ -1271,9 +1286,11 @@ emitins(Ins i, EF *e)
 		assert(isreg(i.to));
 		uint8_t d = hw_reg(i.to.val);
 		if (isfp) {
+			assert(is_xmm(i.to.val));
 			uint8_t pfx = (i.cls == Kd) ? 0xf2 : 0xf3;
 			emit_modrm(pfx, 0, 0, 0x0f, 0x10, d, m, 0, 0);
 		} else {
+			assert(!is_xmm(i.to.val));
 			emit_modrm(0, is64, 0, 0x8b, -1, d, m, 0, 0);
 		}
 		break;
@@ -1471,11 +1488,15 @@ emitins(Ins i, EF *e)
 		if (isfp) {
 			uint8_t pfx = (i.cls == Kd) ? 0xf2 : 0xf3;
 			if (isreg(i.to)) {
+				assert(is_xmm(i.to.val));
+				if (isreg(i.arg[0]))
+					assert(is_xmm(i.arg[0].val));
 				RmOp s = ref_to_rm(i.arg[0], 0, e);
 				emit_modrm(pfx, 0, 0, 0x0f, 0x10, hw_reg(i.to.val), s, 0, 0);
 			} else {
 				RmOp d = ref_to_rm(i.to, 0, e);
 				assert(isreg(i.arg[0]));
+				assert(is_xmm(i.arg[0].val));
 				emit_modrm(pfx, 0, 0, 0x0f, 0x11, hw_reg(i.arg[0].val), d, 0, 0);
 			}
 		} else {
@@ -1483,17 +1504,22 @@ emitins(Ins i, EF *e)
 				Con *c = &e->fn->con[i.arg[0].val];
 				assert(c->type == CBits);
 				if (isreg(i.to)) {
+					assert(!is_xmm(i.to.val));
 					enc_mov_imm_reg(is64, hw_reg(i.to.val), c->bits.i);
 				} else {
 					RmOp d = ref_to_rm(i.to, 0, e);
 					emit_modrm(0, is64, 0, 0xc7, -1, 0, d, 4, (uint64_t)c->bits.i);
 				}
 			} else if (isreg(i.arg[0])) {
+				assert(!is_xmm(i.arg[0].val));
+				if (isreg(i.to))
+					assert(!is_xmm(i.to.val));
 				RmOp d = ref_to_rm(i.to, 0, e);
 				emit_modrm(0, is64, 0, 0x89, -1, hw_reg(i.arg[0].val), d, 0, 0);
 			} else {
 				RmOp s = ref_to_rm(i.arg[0], 0, e);
 				assert(isreg(i.to));
+				assert(!is_xmm(i.to.val));
 				emit_modrm(0, is64, 0, 0x8b, -1, hw_reg(i.to.val), s, 0, 0);
 			}
 		}
