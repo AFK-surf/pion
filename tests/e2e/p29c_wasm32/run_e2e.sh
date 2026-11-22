@@ -2877,4 +2877,140 @@ console.log("  p47a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P48-A Outlined Nested Loop with hlt Trap Block (Normal + OOB Trap) ==="
+cat > "$TMP_DIR/p48a_outline_hlt_ok.pion" <<'EOF'
+fn run_nested(limit : Int) -> Int {
+  let a = Array::make(16, 0)
+  let mut k = 0
+  while k < 16 {
+    a[k] = k + 1
+    k = k + 1
+  }
+  let mut total = 0
+  let mut outer = 0
+  while outer < 6 {
+    let mut mid = 0
+    while mid < limit {
+      let mut inner = 0
+      let mut acc = 0
+      while inner < 4 {
+        let idx = (mid + inner) % 16
+        acc = acc + a[idx]
+        inner = inner + 1
+      }
+      // Dynamic index that passes when limit <= 16 and traps when limit > 16
+      total = total + a[mid] + acc
+      mid = mid + 1
+    }
+    outer = outer + 1
+  }
+  total
+}
+
+pub fn main(world : World) -> Int {
+  let r = run_nested(12)
+  io_println(world, "p48a_ok:" + r.to_string())
+  0
+}
+EOF
+cat > "$TMP_DIR/p48a_outline_hlt_trap.pion" <<'EOF'
+fn run_nested(limit : Int) -> Int {
+  let a = Array::make(16, 0)
+  let mut k = 0
+  while k < 16 {
+    a[k] = k + 1
+    k = k + 1
+  }
+  let mut total = 0
+  let mut outer = 0
+  while outer < 6 {
+    let mut mid = 0
+    while mid < limit {
+      let mut inner = 0
+      let mut acc = 0
+      while inner < 4 {
+        let idx = (mid + inner) % 16
+        acc = acc + a[idx]
+        inner = inner + 1
+      }
+      // Dynamic index that traps when mid == 16
+      total = total + a[mid] + acc
+      mid = mid + 1
+    }
+    outer = outer + 1
+  }
+  total
+}
+
+pub fn main(world : World) -> Int {
+  let r = run_nested(20)
+  io_println(world, "p48a_should_not_reach:" + r.to_string())
+  0
+}
+EOF
+P48A_OK_WASM="$TMP_DIR/p48a_ok.wasm"
+P48A_TRAP_WASM="$TMP_DIR/p48a_trap.wasm"
+"$PIONC" build --release --target wasm32 -o "$P48A_OK_WASM" "$TMP_DIR/p48a_outline_hlt_ok.pion"
+"$PIONC" build --release --target wasm32 -o "$P48A_TRAP_WASM" "$TMP_DIR/p48a_outline_hlt_trap.pion"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const okPath = process.argv[1];
+const trapPath = process.argv[2];
+const rtPath = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+// 1. Normal path
+const okBytes = fs.readFileSync(okPath);
+if (!WebAssembly.validate(okBytes)) {
+  console.error("FAIL (" + rtLabel + "): p48a_ok failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt1 = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance: inst1 } = await WebAssembly.instantiate(okBytes, rt1.imports);
+rt1.bindExports(inst1.exports);
+const rc1 = inst1.exports.main(0, 0n);
+const out1 = lines.join("").trim();
+// Expected: mid in 0..11, a[mid]=mid+1 (sum=78); acc(mid)=sum_{j=0..3} ((mid+j)%16 + 1) => total_acc=384 => (78+384)*6 = 2772
+if ((rc1 | 0) !== 0 || out1 !== "p48a_ok:2772") {
+  console.error("FAIL (" + rtLabel + "): p48a_ok bad output: rc=" + rc1 + " out=" + JSON.stringify(out1));
+  process.exit(1);
+}
+
+// 2. OOB trap path inside outlined loop
+const trapBytes = fs.readFileSync(trapPath);
+if (!WebAssembly.validate(trapBytes)) {
+  console.error("FAIL (" + rtLabel + "): p48a_trap failed WebAssembly.validate()");
+  process.exit(1);
+}
+let trapped = false;
+let trapMsg = "";
+const rt2 = createPionRuntime({
+  print: () => {},
+  println: () => {},
+});
+const { instance: inst2 } = await WebAssembly.instantiate(trapBytes, rt2.imports);
+rt2.bindExports(inst2.exports);
+try {
+  inst2.exports.main(0, 0n);
+} catch (e) {
+  trapped = true;
+  trapMsg = String(e && e.message ? e.message : e);
+}
+if (!trapped) {
+  console.error("FAIL (" + rtLabel + "): p48a_trap did NOT trap on OOB inside outlined loop!");
+  process.exit(1);
+}
+console.log("  p48a (" + rtLabel + "): " + out1 + " + OOB trap OK (" + trapMsg.slice(0, 60) + ")");
+' "$P48A_OK_WASM" "$P48A_TRAP_WASM" "$rt_path"
+done
+
 echo "p29c_wasm32 E2E: OK"
