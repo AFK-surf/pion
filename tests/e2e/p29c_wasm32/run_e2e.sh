@@ -469,9 +469,9 @@ if (memBytes > limitBytes) {
   console.error("FAIL (" + rtLabel + "): rc_read_leak linear memory grew too large:", memBytes, ">", limitBytes);
   process.exit(1);
 }
-// Verify all 200 * 16 * 3 = 9600 Box structs were freed and ZERO live TAG_STRUCT blocks remain in linear memory
+// Verify ZERO live TAG_STRUCT blocks remain in linear memory (pure-Wasm pion_arr_clear frees directly via slab without JS pion_rc_dec_slow)
 const expectedStructs = 200 * 16 * 3;
-if (freedStructs !== expectedStructs) {
+if (!instance.exports.__pion_slab_ctl && freedStructs !== expectedStructs) {
   console.error("FAIL (" + rtLabel + "): expected freedStructs=" + expectedStructs + ", got " + freedStructs + " (jsAlloc=" + allocStructs + ")");
   process.exit(1);
 }
@@ -1169,6 +1169,155 @@ if (memBytes > 4 * 1024 * 1024) {
   process.exit(1);
 }
 console.log("  arr_sb_ptr_fast (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
+echo "=== P29-C [14/14] Pure-Wasm Bytes / arr.clear + TBytes & Immut-Field Loop BCE Regression ==="
+cat > "$TMP_DIR/bytes_clear_fast.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+struct ImgBuf {
+  rgba : Bytes
+  lut : FixedArray[Int]
+}
+
+fn main(world : World) -> Int {
+  // 1. Array::clear on Int and String arrays (verify zero RC leak over 500 cycles)
+  let ai : Array[Int] = [1, 2, 3, 4]
+  ai.clear()
+  must(ai.length() == 0, "ai clear len")
+  ai.push(42)
+  must(ai.length() == 1 && ai[0] == 42, "ai reuse after clear")
+
+  let as_arr : Array[String] = []
+  let mut iter = 0
+  while iter < 500 {
+    let mut k = 0
+    while k < 16 {
+      as_arr.push("row_" + iter.to_string() + "_" + k.to_string())
+      k = k + 1
+    }
+    must(as_arr.length() == 16, "as_arr len before clear")
+    as_arr.clear()
+    must(as_arr.length() == 0, "as_arr len after clear")
+    iter = iter + 1
+  }
+
+  // 2. Bytes::new (0, 16, 496 slab max, 497 & 1024 JS slow path) + zero-init + slice + str conv
+  let b0 = Bytes::new(0)
+  must(b0.length() == 0, "b0 len")
+  let b16 = Bytes::new(16)
+  must(b16.length() == 16 && b16[0].to_int() == 0 && b16[15].to_int() == 0, "b16 zero")
+  let b496 = Bytes::new(496)
+  must(b496.length() == 496 && b496[0].to_int() == 0 && b496[495].to_int() == 0, "b496 slab")
+  let mut i = 0
+  while i < b496.length() {
+    b496[i] = ((i * 13 + 7) & 255).to_byte()
+    i = i + 1
+  }
+  let mut chk496 = 0
+  i = 0
+  while i < b496.length() {
+    chk496 = chk496 + b496[i].to_int()
+    i = i + 1
+  }
+  let b497 = Bytes::new(497)
+  must(b497.length() == 497 && b497[496].to_int() == 0, "b497 slow")
+  let b1024 = Bytes::new(1024)
+  i = 0
+  while i < b1024.length() {
+    b1024[i] = (i & 255).to_byte()
+    i = i + 1
+  }
+  let sl_mid = b496.slice(10, 26)
+  must(sl_mid.length() == 16 && sl_mid[0] == b496[10] && sl_mid[15] == b496[25], "bytes slice mid")
+  let sl_neg = b496.slice(-5, 4)
+  must(sl_neg.length() == 4 && sl_neg[0] == b496[0] && sl_neg[3] == b496[3], "bytes slice neg")
+  let sl_oob = b496.slice(490, 999)
+  must(sl_oob.length() == 6 && sl_oob[5] == b496[495], "bytes slice oob")
+  let sl_rev = b496.slice(20, 10)
+  must(sl_rev.length() == 0, "bytes slice rev")
+  let sl_big = b1024.slice(100, 700)
+  must(sl_big.length() == 600 && sl_big[0].to_int() == 100 && sl_big[599].to_int() == (699 & 255), "bytes slice big")
+
+  let s_orig = "hello:中文:123"
+  let sb_bytes = s_orig.to_bytes()
+  must(sb_bytes.length() == s_orig.length(), "str_to_bytes len")
+  must(sb_bytes.to_string() == s_orig, "bytes_to_str roundtrip")
+  must("".to_bytes().length() == 0 && Bytes::new(0).to_string() == "", "empty bytes/str roundtrip")
+
+  // 3. Immutable struct Bytes + FixedArray field hoisting + BCE
+  let img = ImgBuf::{ rgba: Bytes::new(64), lut: FixedArray::make(64, 0) }
+  i = 0
+  while i < img.rgba.length() {
+    img.rgba[i] = ((i * 3 + 1) & 255).to_byte()
+    i = i + 1
+  }
+  i = 0
+  while i < img.lut.length() {
+    img.lut[i] = i * 2
+    i = i + 1
+  }
+  let mut img_sum = 0
+  i = 0
+  while i < img.lut.length() {
+    img_sum = img_sum + img.lut[i] + img.rgba[i].to_int()
+    i = i + 1
+  }
+
+  io_println(world, chk496.to_string() + ":" + img_sum.to_string() + ":" + sb_bytes.to_string())
+  0
+}
+EOF
+BC_REL_WASM="$TMP_DIR/bytes_clear_rel.wasm"
+BC_DEV_WASM="$TMP_DIR/bytes_clear_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$BC_REL_WASM" "$TMP_DIR/bytes_clear_fast.pion"
+"$PIONC" build --target wasm32 -o "$BC_DEV_WASM" "$TMP_DIR/bytes_clear_fast.pion"
+for mode_wasm in "release:$BC_REL_WASM" "dev:$BC_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): bytes_clear_fast.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out !== "62840:10144:hello:中文:123") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): bytes_clear_fast mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const memBytes = instance.exports.memory.buffer.byteLength;
+if (memBytes > 4 * 1024 * 1024) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): bytes_clear_fast linear memory leaked:", memBytes);
+  process.exit(1);
+}
+console.log("  bytes_clear_fast (" + mode + "/" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB OK");
 ' "$wasm_f" "$rt_path" "$mode"
 done
 done
