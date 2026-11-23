@@ -38,7 +38,7 @@ fn scalar_dot_i8(a : Array[Int8], a_off : Int, b : Array[Int8], b_off : Int, len
 }
 
 fn test_dot_i8() -> Unit {
-  let n = 160
+  let n = 272
   let a : Array[Int8] = Array::make(n, 0)
   let b : Array[Int8] = Array::make(n, 0)
   let ab = Bytes::new(n)
@@ -51,7 +51,7 @@ fn test_dot_i8() -> Unit {
     ab[i] = va.to_byte()
     i += 1
   }
-  let lens : Array[Int] = [0, 1, 3, 4, 7, 15, 16, 17, 31, 32, 33, 63, 64, 129]
+  let lens : Array[Int] = [0, 1, 3, 4, 7, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 129, 256]
   let offs : Array[Int] = [0, 1, 3, 5, 7]
   let mut li = 0
   while li < lens.length() {
@@ -93,9 +93,9 @@ fn test_dot_i8() -> Unit {
 
 fn test_matvec_i8() -> Unit {
   let row_cases : Array[Int] = [0, 1, 2, 3, 4, 5, 7, 8, 13]
-  let col_cases : Array[Int] = [0, 1, 15, 16, 17, 64, 131]
+  let col_cases : Array[Int] = [0, 1, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 131, 256]
   let max_r = 16
-  let max_c = 140
+  let max_c = 264
   let w_arr : Array[Int8] = Array::make(max_r * max_c + 16, 0)
   let w_bs = Bytes::new(max_r * max_c + 16)
   let x_arr : Array[Int8] = Array::make(max_c + 16, 0)
@@ -150,7 +150,7 @@ fn test_matvec_i8() -> Unit {
 }
 
 fn test_f32_ops() -> Unit {
-  let lens : Array[Int] = [0, 1, 3, 4, 7, 15, 16, 17, 33]
+  let lens : Array[Int] = [0, 1, 3, 4, 7, 15, 16, 17, 31, 32, 33, 47, 48, 49, 63, 64, 65, 256]
   let mut li = 0
   while li < lens.length() {
     let len = lens[li]
@@ -254,10 +254,29 @@ fn test_f32_ops() -> Unit {
   }
 }
 
+fn test_med_cache_f32_copy() -> Unit {
+  // P80-B: 128 KB (32768 * 4B) and 256 KB (65536 * 4B) Array[Float] copy() x 200
+  let a128 : Array[Float] = Array::make(32768, 0.0f)
+  let a256 : Array[Float] = Array::make(65536, 0.0f)
+  a128[0] = 1.25f
+  a128[32767] = -3.5f
+  a256[0] = 2.5f
+  a256[65535] = 7.75f
+  let mut iter = 0
+  while iter < 200 {
+    let c128 = a128.copy()
+    let c256 = a256.copy()
+    assert_near(c128[0] + c128[32767], -2.25f, 1e-5f, "copy_128k")
+    assert_near(c256[0] + c256[65535], 10.25f, 1e-5f, "copy_256k")
+    iter += 1
+  }
+}
+
 pub fn main(world : World) -> Int {
   test_dot_i8()
   test_matvec_i8()
   test_f32_ops()
+  test_med_cache_f32_copy()
   io_println(world, "p75b_simd ok")
   0
 }

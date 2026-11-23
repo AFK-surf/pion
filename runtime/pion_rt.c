@@ -217,14 +217,14 @@ PION_MINSIZE double pion_math_pow(double x, double y) {
 #define PION_SLAB_CHUNK_BYTES  262144u
 #define PION_SLAB_REMOTE_BATCH 32u
 
-/* 6-tier per-thread medium-block cache (2K / 4K / 8K / 16K / 32K / 64K).
- * Tiers 0..3 (2K..16K) cache up to 16 blocks each; tiers 4..5 (32K/64K) cache up to 4 blocks each.
- * Uses unused high bits of PionHeader.flags (bit 8 = flag, bits 9..11 = tier 0..5). */
+/* 8-tier per-thread medium-block cache (2K / 4K / 8K / 16K / 32K / 64K / 128K / 256K).
+ * Tiers 0..3 (2K..16K) cache up to 16 blocks each; tiers 4..6 (32K..128K) cache up to 4; tier 7 (256K) caches up to 2.
+ * Uses unused high bits of PionHeader.flags (bit 8 = flag, bits 9..11 = tier 0..7). */
 #define PION_FLAG_MED_CACHE     ((uint16_t)256u)
 #define PION_FLAG_MED_CLS_SHIFT 9u
 #define PION_FLAG_MED_CLS_MASK  ((uint16_t)7u)
-#define PION_MED_CLASSES        6u
-#define PION_MED_MAX_BYTES      65536u
+#define PION_MED_CLASSES        8u
+#define PION_MED_MAX_BYTES      262144u
 #define PION_MED_MAX_PAYLOAD    (PION_MED_MAX_BYTES - (uint32_t)sizeof(PionHeader))
 
 static inline uint32_t pion_med_cls_for(size_t total) {
@@ -237,7 +237,9 @@ static inline uint32_t pion_med_cls_for(size_t total) {
     if (total <= 8192u) return 2u;
     if (total <= 16384u) return 3u;
     if (total <= 32768u) return 4u;
-    return 5u;
+    if (total <= 65536u) return 5u;
+    if (total <= 131072u) return 6u;
+    return 7u;
 #endif
 }
 
@@ -451,7 +453,7 @@ static PION_NOINLINE PION_COLD PION_MINSIZE void pion_med_free(void *ptr, uint32
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
     if (__builtin_expect(!mt || !is_frozen, 1)) {
         PionSlabTLS *s = mt ? pion_slab_cur_mt() : &g_main_slab;
-        uint8_t max_c = (mcls < 4u) ? 16u : 4u;
+        uint8_t max_c = (mcls < 4u) ? 16u : ((mcls < 7u) ? 4u : 2u);
         if (__builtin_expect(s != NULL && s->med_count[mcls] < max_c, 1)) {
             pion_slab_set_next(ptr, s->med_free[mcls]);
             s->med_free[mcls] = ptr;
@@ -1832,7 +1834,7 @@ PION_MINSIZE int64_t pion_arr_pop(void *a_ptr) {
     return a->data[--a->len];
 }
 
-PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
+void *pion_arr_copy(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a) return pion_arr_new(0, 0);
     int32_t flags = (a->elem_stride > 1) ? (a->elem_stride | (a->elem_is_obj << 8))
@@ -1841,7 +1843,9 @@ PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
     if (a->len > 0) {
         memcpy(cp->data, a->data, (size_t)a->len * pion_arr_stride(a));
         cp->len = a->len;
-        pion_arr_foreach_obj(cp, pion_rc_inc);
+        if (cp->elem_is_obj) {
+            pion_arr_foreach_obj(cp, pion_rc_inc);
+        }
     }
     return cp;
 }
@@ -4535,22 +4539,31 @@ static PION_NOINLINE PION_MINSIZE int pion_arm64_has_dotprod(void) {
 #endif
 
 PION_SDOT_ATTR
-static PION_NOINLINE int32_t pion_dot_i8_sdot(const int8_t *a, const int8_t *b, int32_t n) {
-    int32x4_t acc = vdupq_n_s32(0);
-    int32_t n16 = n & ~15;
-    for (int32_t k = 0; k < n16; k += 16) {
-        acc = vdotq_s32(acc, vld1q_s8(a + k), vld1q_s8(b + k));
+static PION_NOINLINE int32_t pion_dot_i8_sdot(
+    const int8_t * __restrict__ a, const int8_t * __restrict__ b, int32_t n) {
+    int32x4_t acc0 = vdupq_n_s32(0), acc1 = vdupq_n_s32(0);
+    int32_t n32 = n & ~31;
+    int32_t k = 0;
+    for (; k < n32; k += 32) {
+        acc0 = vdotq_s32(acc0, vld1q_s8(a + k), vld1q_s8(b + k));
+        acc1 = vdotq_s32(acc1, vld1q_s8(a + k + 16), vld1q_s8(b + k + 16));
     }
-    int32_t sum = vaddvq_s32(acc);
-    if (n16 < n) sum += pion_dot_i8_scalar(a + n16, b + n16, n - n16);
+    if (k + 16 <= n) {
+        acc0 = vdotq_s32(acc0, vld1q_s8(a + k), vld1q_s8(b + k));
+        k += 16;
+    }
+    int32_t sum = vaddvq_s32(vaddq_s32(acc0, acc1));
+    if (k < n) sum += pion_dot_i8_scalar(a + k, b + k, n - k);
     return sum;
 }
 
 PION_SDOT_ATTR
 static PION_NOINLINE void pion_matvec_i8_sdot(
-    float *out, const int8_t *w, const int8_t *x, const float *sc,
+    float * __restrict__ out, const int8_t * __restrict__ w,
+    const int8_t * __restrict__ x, const float * __restrict__ sc,
     float x_scale, int32_t rows, int32_t cols) {
     float32x4_t vxs = vdupq_n_f32(x_scale);
+    int32_t c32 = cols & ~31;
     int32_t c16 = cols & ~15;
     int32_t r = 0;
     const int8_t *w0 = w;
@@ -4558,15 +4571,34 @@ static PION_NOINLINE void pion_matvec_i8_sdot(
         const int8_t *w1 = w0 + cols;
         const int8_t *w2 = w1 + cols;
         const int8_t *w3 = w2 + cols;
-        int32x4_t a0 = vdupq_n_s32(0), a1 = vdupq_n_s32(0);
-        int32x4_t a2 = vdupq_n_s32(0), a3 = vdupq_n_s32(0);
-        for (int32_t k = 0; k < c16; k += 16) {
-            int8x16_t vx = vld1q_s8(x + k);
-            a0 = vdotq_s32(a0, vld1q_s8(w0 + k), vx);
-            a1 = vdotq_s32(a1, vld1q_s8(w1 + k), vx);
-            a2 = vdotq_s32(a2, vld1q_s8(w2 + k), vx);
-            a3 = vdotq_s32(a3, vld1q_s8(w3 + k), vx);
+        int32x4_t a0a = vdupq_n_s32(0), a0b = vdupq_n_s32(0);
+        int32x4_t a1a = vdupq_n_s32(0), a1b = vdupq_n_s32(0);
+        int32x4_t a2a = vdupq_n_s32(0), a2b = vdupq_n_s32(0);
+        int32x4_t a3a = vdupq_n_s32(0), a3b = vdupq_n_s32(0);
+        int32_t k = 0;
+        for (; k < c32; k += 32) {
+            int8x16_t vx0 = vld1q_s8(x + k);
+            int8x16_t vx1 = vld1q_s8(x + k + 16);
+            a0a = vdotq_s32(a0a, vld1q_s8(w0 + k), vx0);
+            a1a = vdotq_s32(a1a, vld1q_s8(w1 + k), vx0);
+            a2a = vdotq_s32(a2a, vld1q_s8(w2 + k), vx0);
+            a3a = vdotq_s32(a3a, vld1q_s8(w3 + k), vx0);
+            a0b = vdotq_s32(a0b, vld1q_s8(w0 + k + 16), vx1);
+            a1b = vdotq_s32(a1b, vld1q_s8(w1 + k + 16), vx1);
+            a2b = vdotq_s32(a2b, vld1q_s8(w2 + k + 16), vx1);
+            a3b = vdotq_s32(a3b, vld1q_s8(w3 + k + 16), vx1);
         }
+        if (k + 16 <= cols) {
+            int8x16_t vx = vld1q_s8(x + k);
+            a0a = vdotq_s32(a0a, vld1q_s8(w0 + k), vx);
+            a1a = vdotq_s32(a1a, vld1q_s8(w1 + k), vx);
+            a2a = vdotq_s32(a2a, vld1q_s8(w2 + k), vx);
+            a3a = vdotq_s32(a3a, vld1q_s8(w3 + k), vx);
+        }
+        int32x4_t a0 = vaddq_s32(a0a, a0b);
+        int32x4_t a1 = vaddq_s32(a1a, a1b);
+        int32x4_t a2 = vaddq_s32(a2a, a2b);
+        int32x4_t a3 = vaddq_s32(a3a, a3b);
         int32x4_t sum4 = vpaddq_s32(vpaddq_s32(a0, a1), vpaddq_s32(a2, a3));
         vst1q_f32(out + r, vmulq_f32(vcvtq_f32_s32(sum4), vmulq_f32(vld1q_f32(sc + r), vxs)));
         if (c16 < cols) pion_matvec_i8_tail4(out + r, w0, x, sc + r, x_scale, cols, c16);
@@ -4626,7 +4658,8 @@ static void pion_matvec_i8_raw(
 #elif (defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER)
 
 __attribute__((target("avx2")))
-static PION_NOINLINE int32_t pion_dot_i8_avx2(const int8_t *a, const int8_t *b, int32_t n) {
+static PION_NOINLINE int32_t pion_dot_i8_avx2(
+    const int8_t * __restrict__ a, const int8_t * __restrict__ b, int32_t n) {
     __m256i acc = _mm256_setzero_si256();
     int32_t n16 = n & ~15;
     for (int32_t k = 0; k < n16; k += 16) {
@@ -4644,9 +4677,11 @@ static PION_NOINLINE int32_t pion_dot_i8_avx2(const int8_t *a, const int8_t *b, 
 
 __attribute__((target("avx2")))
 static PION_NOINLINE void pion_matvec_i8_avx2(
-    float *out, const int8_t *w, const int8_t *x, const float *sc,
+    float * __restrict__ out, const int8_t * __restrict__ w,
+    const int8_t * __restrict__ x, const float * __restrict__ sc,
     float x_scale, int32_t rows, int32_t cols) {
     __m128 vxs = _mm_set1_ps(x_scale);
+    int32_t c32 = cols & ~31;
     int32_t c16 = cols & ~15;
     int32_t r = 0;
     const int8_t *w0 = w;
@@ -4656,7 +4691,20 @@ static PION_NOINLINE void pion_matvec_i8_avx2(
         const int8_t *w3 = w2 + cols;
         __m256i a0 = _mm256_setzero_si256(), a1 = _mm256_setzero_si256();
         __m256i a2 = _mm256_setzero_si256(), a3 = _mm256_setzero_si256();
-        for (int32_t k = 0; k < c16; k += 16) {
+        int32_t k = 0;
+        for (; k < c32; k += 32) {
+            __m256i vx0 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x + k)));
+            __m256i vx1 = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x + k + 16)));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w0 + k))), vx0));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w1 + k))), vx0));
+            a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w2 + k))), vx0));
+            a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w3 + k))), vx0));
+            a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w0 + k + 16))), vx1));
+            a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w1 + k + 16))), vx1));
+            a2 = _mm256_add_epi32(a2, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w2 + k + 16))), vx1));
+            a3 = _mm256_add_epi32(a3, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w3 + k + 16))), vx1));
+        }
+        if (k + 16 <= cols) {
             __m256i vx = _mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(x + k)));
             a0 = _mm256_add_epi32(a0, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w0 + k))), vx));
             a1 = _mm256_add_epi32(a1, _mm256_madd_epi16(_mm256_cvtepi8_epi16(_mm_loadu_si128((const __m128i *)(w1 + k))), vx));
@@ -4748,22 +4796,60 @@ static PION_NOINLINE PION_MINSIZE float pion_simd_f32_tail(
 }
 
 static float pion_simd_f32_kernel(
-    float *pd, const float *pa, const float *pb, int32_t len, float s, int32_t op) {
+    float * __restrict__ pd, const float * __restrict__ pa, const float * __restrict__ pb,
+    int32_t len, float s, int32_t op) {
     int32_t i = 0;
     float sum = 0.0f;
 #if defined(__aarch64__) || ((defined(__x86_64__) || defined(_M_X64)) && !defined(_MSC_VER))
     int32_t n4 = len & ~3;
 #if defined(__aarch64__)
+    int32_t n8 = len & ~7;
     float32x4_t vs = vdupq_n_f32(s);
-    float32x4_t acc = vdupq_n_f32(0.0f);
-    if (op == 0) { for (; i < n4; i += 4) acc = vfmaq_f32(acc, vld1q_f32(pd + i), vld1q_f32(pa + i)); }
+    float32x4_t acc0 = vdupq_n_f32(0.0f), acc1 = vdupq_n_f32(0.0f);
+    if (op == 0) {
+        for (; i < n8; i += 8) {
+            acc0 = vfmaq_f32(acc0, vld1q_f32(pd + i), vld1q_f32(pa + i));
+            acc1 = vfmaq_f32(acc1, vld1q_f32(pd + i + 4), vld1q_f32(pa + i + 4));
+        }
+        if (i < n4) { acc0 = vfmaq_f32(acc0, vld1q_f32(pd + i), vld1q_f32(pa + i)); i += 4; }
+    }
     else if (op == 1) { for (; i < n4; i += 4) vst1q_f32(pd + i, vfmaq_f32(vld1q_f32(pd + i), vs, vld1q_f32(pa + i))); }
     else if (op == 2) { for (; i < n4; i += 4) vst1q_f32(pd + i, vmulq_f32(vld1q_f32(pa + i), vld1q_f32(pb + i))); }
     else if (op == 3) { for (; i < n4; i += 4) vst1q_f32(pd + i, vaddq_f32(vld1q_f32(pa + i), vld1q_f32(pb + i))); }
     else if (op == 4) { for (; i < n4; i += 4) vst1q_f32(pd + i, vmulq_f32(vld1q_f32(pa + i), vs)); }
-    else if (op == 5) { for (; i < n4; i += 4) { float32x4_t v = vmulq_f32(vld1q_f32(pd + i), vld1q_f32(pa + i)); vst1q_f32(pd + i, v); acc = vfmaq_f32(acc, v, vld1q_f32(pb + i)); } }
-    else { for (; i < n4; i += 4) { float32x4_t v = vfmaq_f32(vld1q_f32(pd + i), vs, vld1q_f32(pa + i)); vst1q_f32(pd + i, v); acc = vfmaq_f32(acc, v, vld1q_f32(pb + i)); } }
-    sum = vaddvq_f32(acc);
+    else if (op == 5) {
+        for (; i < n8; i += 8) {
+            float32x4_t v0 = vmulq_f32(vld1q_f32(pd + i), vld1q_f32(pa + i));
+            float32x4_t v1 = vmulq_f32(vld1q_f32(pd + i + 4), vld1q_f32(pa + i + 4));
+            vst1q_f32(pd + i, v0);
+            vst1q_f32(pd + i + 4, v1);
+            acc0 = vfmaq_f32(acc0, v0, vld1q_f32(pb + i));
+            acc1 = vfmaq_f32(acc1, v1, vld1q_f32(pb + i + 4));
+        }
+        if (i < n4) {
+            float32x4_t v = vmulq_f32(vld1q_f32(pd + i), vld1q_f32(pa + i));
+            vst1q_f32(pd + i, v);
+            acc0 = vfmaq_f32(acc0, v, vld1q_f32(pb + i));
+            i += 4;
+        }
+    }
+    else {
+        for (; i < n8; i += 8) {
+            float32x4_t v0 = vfmaq_f32(vld1q_f32(pd + i), vs, vld1q_f32(pa + i));
+            float32x4_t v1 = vfmaq_f32(vld1q_f32(pd + i + 4), vs, vld1q_f32(pa + i + 4));
+            vst1q_f32(pd + i, v0);
+            vst1q_f32(pd + i + 4, v1);
+            acc0 = vfmaq_f32(acc0, v0, vld1q_f32(pb + i));
+            acc1 = vfmaq_f32(acc1, v1, vld1q_f32(pb + i + 4));
+        }
+        if (i < n4) {
+            float32x4_t v = vfmaq_f32(vld1q_f32(pd + i), vs, vld1q_f32(pa + i));
+            vst1q_f32(pd + i, v);
+            acc0 = vfmaq_f32(acc0, v, vld1q_f32(pb + i));
+            i += 4;
+        }
+    }
+    sum = vaddvq_f32(vaddq_f32(acc0, acc1));
 #else
     __m128 vs = _mm_set1_ps(s);
     __m128 acc = _mm_setzero_ps();
