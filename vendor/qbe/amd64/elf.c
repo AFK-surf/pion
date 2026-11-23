@@ -1164,8 +1164,9 @@ emitins(Ins i, EF *e)
 
 	case Oshl:
 	case Oshr:
-	case Osar: {
-		uint8_t ext = (i.op == Oshl) ? 4 : (i.op == Oshr ? 5 : 7);
+	case Osar:
+	case Oror: {
+		uint8_t ext = (i.op == Oshl) ? 4 : (i.op == Oshr ? 5 : (i.op == Oror ? 1 : 7));
 		enc_two_addr(0, &i, e);
 		RmOp d = ref_to_rm(i.to, 0, e);
 		if (rtype(i.arg[1]) == RCon) {

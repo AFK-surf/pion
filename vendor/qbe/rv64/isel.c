@@ -188,6 +188,45 @@ sel(Ins i, Fn *fn)
 		selcmp(i, ck, cc, fn);
 		return;
 	}
+	if (i.op == Oror) {
+		int k = i.cls;
+		int W = KWIDE(k) ? 64 : 32;
+		if (rtype(i.arg[1]) == RCon && fn->con[i.arg[1].val].type == CBits) {
+			int sh = (int)(fn->con[i.arg[1].val].bits.i & (W - 1));
+			if (sh == 0) {
+				emit(Ocopy, k, i.to, i.arg[0], R);
+				i0 = curi;
+				fixarg(&i0->arg[0], k, i0, fn);
+				return;
+			}
+			Ref r0 = newtmp("ror", k, fn);
+			Ref r1 = newtmp("ror", k, fn);
+			emit(Oor, k, i.to, r0, r1);
+			emit(Oshl, k, r1, i.arg[0], getcon(W - sh, fn));
+			i0 = curi;
+			fixarg(&i0->arg[0], k, i0, fn);
+			emit(Oshr, k, r0, i.arg[0], getcon(sh, fn));
+			i0 = curi;
+			fixarg(&i0->arg[0], k, i0, fn);
+			return;
+		}
+		Ref r0 = newtmp("ror", k, fn);
+		Ref r1 = newtmp("ror", k, fn);
+		Ref nk = newtmp("ror", Kw, fn);
+		emit(Oor, k, i.to, r0, r1);
+		emit(Oshl, k, r1, i.arg[0], nk);
+		i0 = curi;
+		fixarg(&i0->arg[0], k, i0, fn);
+		emit(Oshr, k, r0, i.arg[0], i.arg[1]);
+		i0 = curi;
+		fixarg(&i0->arg[0], k, i0, fn);
+		fixarg(&i0->arg[1], Kw, i0, fn);
+		emit(Osub, Kw, nk, CON_Z, i.arg[1]);
+		i0 = curi;
+		fixarg(&i0->arg[0], Kw, i0, fn);
+		fixarg(&i0->arg[1], Kw, i0, fn);
+		return;
+	}
 	if (i.op != Onop) {
 		emiti(i);
 		i0 = curi; /* fixarg() can change curi */

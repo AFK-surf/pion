@@ -80,6 +80,16 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	case Osar:  x = (w ? l.s : (int32_t)l.s) >> (r.u & (31|w<<5)); break;
 	case Oshr:  x = (w ? l.u : (uint32_t)l.u) >> (r.u & (31|w<<5)); break;
 	case Oshl:  x = l.u << (r.u & (31|w<<5)); break;
+	case Oror: {
+		uint s = (uint)(r.u & (31|w<<5));
+		if (w)
+			x = s == 0 ? l.u : (l.u >> s) | (l.u << (64 - s));
+		else {
+			uint32_t u = (uint32_t)l.u;
+			x = s == 0 ? u : (u >> s) | (u << (32 - s));
+		}
+		break;
+	}
 	case Oextsb: x = (int8_t)l.u;   break;
 	case Oextub: x = (uint8_t)l.u;  break;
 	case Oextsh: x = (int16_t)l.u;  break;

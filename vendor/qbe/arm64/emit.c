@@ -53,6 +53,7 @@ static struct {
 	{ Osar,    Ki, "asr %=, %0, %1" },
 	{ Oshr,    Ki, "lsr %=, %0, %1" },
 	{ Oshl,    Ki, "lsl %=, %0, %1" },
+	{ Oror,    Ki, "ror %=, %0, %1" },
 	{ Omul,    Ki, "mul %=, %0, %1" },
 	{ Omul,    Ka, "fmul %=, %0, %1" },
 	{ Osmulh,  Kl, "smulh %=, %0, %1" },
@@ -720,6 +721,7 @@ w32_def_reg(const Ins *i, int cur_reg)
 	case Oshl:
 	case Oshr:
 	case Osar:
+	case Oror:
 	case Omul:
 	case Odiv:
 	case Oudiv:

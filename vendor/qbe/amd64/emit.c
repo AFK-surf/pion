@@ -78,6 +78,7 @@ static struct {
 	{ Osar,     Ki, "-sar%k %B1, %=" },
 	{ Oshr,     Ki, "-shr%k %B1, %=" },
 	{ Oshl,     Ki, "-shl%k %B1, %=" },
+	{ Oror,     Ki, "-ror%k %B1, %=" },
 	{ Omul,     Ki, "+imul%k %1, %=" },
 	{ Omul,     Ks, "+mulss %1, %=" },
 	{ Omul,     Kd, "+mulsd %1, %=" },

@@ -603,6 +603,16 @@ sel(Ins i, Blk *b, Ins *cur, Fn *fn)
 				}
 			}
 			break;
+		case Oror:
+			if (rtype(i.arg[1]) == RCon) {
+				c = &fn->con[i.arg[1].val];
+				if (c->type == CBits) {
+					n = c->bits.i & (KWIDE(i.cls) ? 63 : 31);
+					i.arg[1] = getcon(n, fn);
+					fix1 = 0;
+				}
+			}
+			break;
 		case Oand:
 		case Oor:
 		case Oxor:

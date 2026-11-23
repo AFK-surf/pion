@@ -277,6 +277,7 @@ theorem fits_bits_sound (vg : ValGraph) (hd : ValGraphDAG vg) :
     | Sub => simp only at h; rw [← ok_inj' h] at hr; cases hr
     | Mul => simp only at h; rw [← ok_inj' h] at hr; cases hr
     | Shl => simp only at h; rw [← ok_inj' h] at hr; cases hr
+    | Ror => simp only at h; rw [← ok_inj' h] at hr; cases hr
     | Div => simp only at h; rw [← ok_inj' h] at hr; cases hr
     | UDiv => simp only at h; rw [← ok_inj' h] at hr; cases hr
     | Rem => simp only at h; rw [← ok_inj' h] at hr; cases hr
@@ -1028,7 +1029,7 @@ theorem binop_is_cmp_spec (op : BinOp) : binop_is_cmp op = ok (isCmp op) := by
   cases op <;> rfl
 
 def isShift : BinOp → Bool
-  | .Shl | .Shr | .Sar => true
+  | .Shl | .Shr | .Sar | .Ror => true
   | _ => false
 
 def swapCmp : BinOp → Option BinOp
@@ -1061,7 +1062,7 @@ def argCls1 (op : BinOp) (cls : Cls) : Cls :=
   match op with
   | .CEq c | .CNe c | .CSlt c | .CSle c | .CSgt c | .CSge c | .CUlt c | .CUle c | .CUgt c
   | .CUge c => c
-  | .Shl | .Shr | .Sar => .W
+  | .Shl | .Shr | .Sar | .Ror => .W
   | _ => cls
 
 theorem binop_arg_cls_spec (op : BinOp) (cls : Cls) :
@@ -1343,6 +1344,10 @@ theorem rc_sar0 {cls : Cls} {x y : BitVec 64} (hy : shAmt cls y = 0) (hx : maskC
   cases cls
   · rw [asS, maskW_extS32, hx]
   · rfl
+
+theorem rc_ror0 {cls : Cls} {x y : BitVec 64} (hy : shAmt cls y = 0) (hx : maskC cls x = x) :
+    evalBin cls .Ror x y = some x := by
+  simp [evalBin, hy, hx]
 
 theorem extS32_one : extS 32 1#64 = 1#64 := by decide
 
@@ -1971,6 +1976,18 @@ theorem vg_canon_bin_motive (cls : Cls) : BinMotive1 cls (fun vg => vg_canon_bin
             omega
           refine Or.inr ⟨_, (ok_inj' hs).symm, hrefl hca (fun env => ?_)⟩
           rw [hevb]; exact rc_sar0 h0' (hxm rfl env)
+        · exact Or.inl (ok_inj' hs).symm
+      case Ror =>
+        simp only [argCls1, shift_amount_spec, bind_ok] at hs
+        have hca : clsOf vg a = cls := by simpa [BinArgOK, isCmp, isShift] using hok
+        split at hs
+        · rename_i h0
+          have h0' : shAmt cls y0.bv = 0 := by
+            have := congrArg (fun z : Std.I32 => z.val) h0
+            simp only [saI_val, u64_mk_bv, shAmt_maskW, i32_zero_val] at this
+            omega
+          refine Or.inr ⟨_, (ok_inj' hs).symm, hrefl hca (fun env => ?_)⟩
+          rw [hevb]; exact rc_ror0 h0' (hxm rfl env)
         · exact Or.inl (ok_inj' hs).symm
       case Div =>
         simp only [argCls1] at hs

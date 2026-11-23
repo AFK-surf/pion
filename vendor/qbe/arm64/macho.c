@@ -1154,6 +1154,22 @@ me_emitins(Ins *i, ME *e)
 		break;
 	}
 
+	case Oror: {
+		uint32_t rd = greg(i->to.val);
+		uint32_t rn = greg(i->arg[0].val);
+		if (rtype(i->arg[1]) == RCon) {
+			uint32_t width = is64 ? 64u : 32u;
+			uint32_t sh = (uint32_t)e->fn->con[i->arg[1].val].bits.i & (width - 1u);
+			/* EXTR rd, rn, rn, #sh (alias: ror rd, rn, #sh) */
+			emit_u32(0x13800000u | (sf << 31) | (sf << 22) | (rn << 16) | (sh << 10) | (rn << 5) | rd);
+		} else {
+			uint32_t rm = greg(i->arg[1].val);
+			/* RORV rd, rn, rm (alias: ror rd, rn, rm) */
+			emit_u32(0x1ac02c00u | (sf << 31) | (rm << 16) | (rn << 5) | rd);
+		}
+		break;
+	}
+
 	case Omul:
 		if (KBASE(k) == 1) {
 			emit_u32(0x1e200800u | (ftype << 22) | (freg(i->arg[1].val) << 16)
@@ -1533,6 +1549,7 @@ me_w32_def_reg(const Ins *i, int cur_reg)
 	case Oshl:
 	case Oshr:
 	case Osar:
+	case Oror:
 	case Omul:
 	case Odiv:
 	case Oudiv:

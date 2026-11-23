@@ -388,6 +388,7 @@ sel(Ins i, Num *tn, Fn *fn)
 	case Osar:
 	case Oshr:
 	case Oshl:
+	case Oror:
 		r0 = i.arg[1];
 		if (rtype(r0) == RCon)
 			goto Emit;

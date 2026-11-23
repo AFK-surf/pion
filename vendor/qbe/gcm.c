@@ -369,6 +369,7 @@ cheap(Ins *i)
 	case Osar:
 	case Oshr:
 	case Oshl:
+	case Oror:
 		return 1;
 	default:
 		return iscmp(i->op, &x, &x);

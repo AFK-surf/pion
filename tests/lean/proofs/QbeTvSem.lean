@@ -116,6 +116,12 @@ def evalBin (cls : Cls) (op : BinOp) (a0 b0 : BitVec 64) : Option (BitVec 64) :=
   | .Shl => some (maskC cls (a <<< shAmt cls b0))
   | .Shr => some (a >>> shAmt cls b0)
   | .Sar => some (maskC cls ((asS cls a).sshiftRight (shAmt cls b0)))
+  | .Ror =>
+    let s := shAmt cls b0
+    if s = 0 then some a
+    else
+      let w := match cls with | .W => 32 | .L => 64
+      some (maskC cls ((a >>> s) ||| (a <<< (w - s))))
   | .Div => if safeDiv cls .Div a b then some (maskC cls ((asS cls a).sdiv (asS cls b))) else none
   | .Rem => if safeDiv cls .Rem a b then some (maskC cls ((asS cls a).srem (asS cls b))) else none
   | .UDiv => if safeDiv cls .UDiv a b then some (a / b) else none
@@ -555,6 +561,11 @@ theorem eval_bin_const_sound (cls : Cls) (op : BinOp) (a b : Std.U64) :
   case Shl => rw [shl_sa]; simp
   case Shr => rw [shr_sa]; simp
   case Sar => rw [sar_sa]; simp [i64_reinterpret]
+  case Ror =>
+    by_cases hs : shAmt cls b.bv = 0
+    · simp [hs]
+    · simp only [hs, ↓reduceIte]
+      cases cls <;> simp_all [shl_sa, shr_sa]
   case Div =>
     by_cases hs : safeDiv cls .Div (maskC cls a.bv) (maskC cls b.bv)
     · simp only [hs, decide_true, ↓reduceIte]
@@ -1672,7 +1683,7 @@ def binArgCls (op : BinOp) (cls : Cls) (n : Nat) : Cls :=
   match op with
   | .CEq c | .CNe c | .CSlt c | .CSle c | .CSgt c | .CSge c | .CUlt c | .CUle c | .CUgt c
   | .CUge c => c
-  | .Shl | .Shr | .Sar => if n = 1 then .W else cls
+  | .Shl | .Shr | .Sar | .Ror => if n = 1 then .W else cls
   | _ => cls
 
 /-- Class at which the operand of `cls op a` is read (`unop_arg_cls`). -/
