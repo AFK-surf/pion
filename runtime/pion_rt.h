@@ -76,7 +76,7 @@ typedef struct PionArray {
     int64_t len;
     int64_t cap;
     int32_t elem_is_obj;
-    int32_t elem_stride; /* 0/8 = 8B slots; 1 = 1B Bool/Byte; 16/24/32 = flat POD struct */
+    int32_t elem_stride; /* 0/8 = 8B slots; 1 = 1B Bool/Byte/Int8; 4 = 4B Int/UInt/Char/Float; 16/24/32+ = flat POD struct */
     int64_t *data;
 } PionArray;
 

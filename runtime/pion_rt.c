@@ -1922,11 +1922,21 @@ static PION_MINSIZE int pion_cmp_u8_qsort(const void *pa, const void *pb) {
     return (int)a - (int)b;
 }
 
+static PION_MINSIZE int pion_cmp_i32_qsort(const void *pa, const void *pb) {
+    int32_t a = *(const int32_t *)pa;
+    int32_t b = *(const int32_t *)pb;
+    return (a > b) - (a < b);
+}
+
 PION_MINSIZE void pion_arr_sort_int(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a || a->len <= 1) return;
     if (a->elem_stride == 1) {
         qsort(a->data, (size_t)a->len, 1, pion_cmp_u8_qsort);
+        return;
+    }
+    if (a->elem_stride == 4) {
+        qsort(a->data, (size_t)a->len, sizeof(int32_t), pion_cmp_i32_qsort);
         return;
     }
     qsort(a->data, (size_t)a->len, sizeof(int64_t), pion_cmp_i64_qsort);

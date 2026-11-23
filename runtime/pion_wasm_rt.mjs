@@ -1436,8 +1436,13 @@ export function createPionRuntime(options = {}) {
     const len = Number(dv.getBigInt64(p, true));
     if (len <= 1) return;
     const dp = Number(dv.getBigInt64(p + 24, true));
-    if (dv.getInt32(p + 20, true) === 1) {
+    const stride = dv.getInt32(p + 20, true);
+    if (stride === 1) {
       u8.subarray(dp, dp + len).sort();
+      return;
+    }
+    if (stride === 4) {
+      new Int32Array(u8.buffer, dp, len).sort();
       return;
     }
     const vals = new Array(len);

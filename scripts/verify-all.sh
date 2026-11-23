@@ -184,6 +184,8 @@ sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
 sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC2"
+# Wave G2: compact 4-byte Array/FixedArray of Int/UInt/Char (Native + ASan + Wasm32).
+sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC2"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv): every function of
 # the real `qbe -d MG` traces validated by the strict checker, tampered traces and
 # adversarial miscompilations rejected.

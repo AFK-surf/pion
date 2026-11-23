@@ -315,14 +315,14 @@ test "qbe_p4d_array_int_loadl_and_block_immut_field_cse" {
     }
     None => ""
   }
-  // Array[Int] element load uses 64-bit `=l loadl` + `=w copy` for ARM64 [xBase, xIdx, lsl #3]
+  // Compact 4-byte Array[Int] element load uses `=l shl ..., 2` + `=w loadsw` (never 8-byte `=l loadl`)
   let after_shl = match t_str_find(fn_arr, "=l shl ") {
     Some(idx) => t_str_from(fn_arr, idx)
     None => ""
   }
-  assert_eq(after_shl.contains("=l loadl "), true)
-  assert_eq(after_shl.contains("=w copy "), true)
-  assert_eq(after_shl.contains("=w loadsw "), false)
+  assert_eq(after_shl.contains(", 2\n"), true)
+  assert_eq(after_shl.contains("=w loadsw "), true)
+  assert_eq(after_shl.contains("=l loadl "), false)
   // Immutable primitive struct field `b.mass` loaded once across 3 reads in same basic block
   let fn_mass = match t_str_find(res.ssa, "$pion_fn_triple_mass") {
     Some(idx) => {
@@ -433,11 +433,11 @@ test "qbe_p5b_preloop_bce_versioning_and_extsw_reuse" {
         let fast_region = t_str_to(after_fast, slow_off)
         // Fast region must have zero pion_panic_oob
         assert_eq(fast_region.contains("pion_panic_oob"), false)
-        // First loop (`perm[ci] = perm1[ci]`): zero redundant extsw for copied value
+        // First loop (`perm[ci] = perm1[ci]`): compact 4-byte loadsw + storew, zero redundant value extsw
         if fast_count == 0 {
-          assert_eq(fast_region.contains("=l loadl "), true)
-          assert_eq(fast_region.contains("storel "), true)
-          // Only index ci needs 1 extsw (for perm1[ci] / perm[ci] index); value copy reuses rl
+          assert_eq(fast_region.contains("=w loadsw "), true)
+          assert_eq(fast_region.contains("storew "), true)
+          // Only index ci needs 2 extsw (for perm1[ci] / perm[ci] index); value stays in w (0 value extsw)
           let mut ext_cnt = 0
           let mut ep = 0
           while ep < fast_region.length() {
@@ -10794,4 +10794,90 @@ test "p85 (G3-A + G4): fresh writable Bytes elides bytes_ro/bytes_oob and sound 
   assert_true(f_char.contains("arr_oob"), f_char)
   assert_true(f_eqlen.contains("arr_oob"), f_eqlen)
   assert_true(f_alias.contains("arr_oob"), f_alias)
+}
+
+///|
+test "p85: compact 4-byte Array/FixedArray of Int, UInt, Char SSA audit" {
+  let src =
+    #|fn sum_i32(a : Array[Int]) -> Int {
+    #|  let mut acc = 0
+    #|  let mut i = 0
+    #|  while i < a.length() {
+    #|    a[i] = a[i] + 1
+    #|    acc += a[i]
+    #|    i += 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|fn sum_u32(a : FixedArray[UInt]) -> UInt {
+    #|  let mut acc = 0U
+    #|  let mut i = 0
+    #|  while i < a.length() {
+    #|    a[i] = a[i] + 1U
+    #|    acc = acc + a[i]
+    #|    i += 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|fn sum_char(a : Array[Char]) -> Int {
+    #|  let mut acc = 0
+    #|  let mut i = 0
+    #|  while i < a.length() {
+    #|    a[i] = 'Z'
+    #|    acc += a[i].to_int()
+    #|    i += 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|pub fn main() -> Int {
+    #|  let ai : Array[Int] = [-1, 0, 42]
+    #|  let au : FixedArray[UInt] = FixedArray::make(4, 1U)
+    #|  let ac : Array[Char] = ['a', 'b']
+    #|  sum_i32(ai) + sum_u32(au).to_int() + sum_char(ac)
+    #|}
+  let cr = check_source_files_with_imports("p85_4b", ["p85.pion"], [src], [], true)
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  let funcs = ssa.split("function ")
+  let mut f_i32 = ""
+  let mut f_u32 = ""
+  let mut f_chr = ""
+  let mut f_main = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("fn_sum_i32(") {
+      f_i32 = funcs[fi]
+    } else if funcs[fi].contains("fn_sum_u32(") {
+      f_u32 = funcs[fi]
+    } else if funcs[fi].contains("fn_sum_char(") {
+      f_chr = funcs[fi]
+    } else if funcs[fi].contains("fn_main(") {
+      f_main = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  assert_true(f_i32 != "" && f_u32 != "" && f_chr != "" && f_main != "", ssa)
+  // elem_flags = 4 on allocation
+  assert_true(f_main.contains(", w 4)"), f_main)
+  // sum_i32: shl 2, loadsw, storew; no shl 3, no stores
+  assert_true(f_i32.contains(", 2\n") && f_i32.contains("shl "), f_i32)
+  assert_true(f_i32.contains("loadsw "), f_i32)
+  assert_true(f_i32.contains("storew "), f_i32)
+  assert_true(!f_i32.contains(", 3\n"), f_i32)
+  assert_true(!f_i32.contains("stores "), f_i32)
+  // sum_u32: shl 2, loaduw, storew; no shl 3, no stores
+  assert_true(f_u32.contains(", 2\n") && f_u32.contains("shl "), f_u32)
+  assert_true(f_u32.contains("loaduw "), f_u32)
+  assert_true(f_u32.contains("storew "), f_u32)
+  assert_true(!f_u32.contains(", 3\n"), f_u32)
+  assert_true(!f_u32.contains("stores "), f_u32)
+  // sum_char: shl 2, loaduw, storew; no shl 3, no stores
+  assert_true(f_chr.contains(", 2\n") && f_chr.contains("shl "), f_chr)
+  assert_true(f_chr.contains("loaduw "), f_chr)
+  assert_true(f_chr.contains("storew "), f_chr)
+  assert_true(!f_chr.contains(", 3\n"), f_chr)
+  assert_true(!f_chr.contains("stores "), f_chr)
 }

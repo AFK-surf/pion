@@ -1750,6 +1750,21 @@ static void test_arr_ergonomics_and_double_to_str(void) {
     pion_arr_sort_int(ai);
     pion_rc_dec(ai);
 
+    /* pion_arr_sort_int on compact 4B int32 array (incl. INT32_MIN / INT32_MAX overflow safety) */
+    void *ai4 = pion_arr_new(8, 4);
+    pion_arr_push(ai4, (int64_t)(uint32_t)2147483647);
+    pion_arr_push(ai4, (int64_t)(uint32_t)(-1));
+    pion_arr_push(ai4, (int64_t)(uint32_t)(-2147483647 - 1));
+    pion_arr_push(ai4, 0);
+    pion_arr_push(ai4, 42);
+    pion_arr_sort_int(ai4);
+    assert((int32_t)pion_arr_get(ai4, 0) == (-2147483647 - 1));
+    assert((int32_t)pion_arr_get(ai4, 1) == -1);
+    assert((int32_t)pion_arr_get(ai4, 2) == 0);
+    assert((int32_t)pion_arr_get(ai4, 3) == 42);
+    assert((int32_t)pion_arr_get(ai4, 4) == 2147483647);
+    pion_rc_dec(ai4);
+
     /* pion_arr_sort_str + pion_arr_join + pion_arr_reverse + pion_arr_clear (obj RC safety) */
     void *as = pion_arr_new(4, 1);
     void *s_c = pion_str_from_cstr("cherry", -1);

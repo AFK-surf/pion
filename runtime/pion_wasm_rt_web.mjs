@@ -631,7 +631,9 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_arr_sort_int = (a) => {
     const p = pNum(a); sync(); const l = Number(g64(p)); if (l <= 1) return;
-    if (g32(p + 20) === 1) { const dp = Number(g64(p + 24)); u8.subarray(dp, dp + l).sort(); return; }
+    const st = g32(p + 20);
+    if (st === 1) { const dp = Number(g64(p + 24)); u8.subarray(dp, dp + l).sort(); return; }
+    if (st === 4) { const dp = Number(g64(p + 24)); new Int32Array(u8.buffer, dp, l).sort(); return; }
     arrSort(a, (x, y) => (x < y ? -1 : x > y ? 1 : 0));
   };
   const pion_arr_sort_str = (a) => arrSort(a, pion_str_cmp);
