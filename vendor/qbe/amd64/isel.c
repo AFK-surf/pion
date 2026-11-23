@@ -597,7 +597,7 @@ static Ins*
 selsel(Fn *fn, Blk *b, Ins *i, Num *tn)
 {
 	Ref r, cr[2];
-	int c, k, swap, gencmp, gencpy;
+	int c, k, dk, dc, swap, gencmp, gencpy;
 	Ins *isel0, *isel1, *fi;
 	Tmp *t;
 
@@ -616,7 +616,8 @@ selsel(Fn *fn, Blk *b, Ins *i, Num *tn)
 	gencmp = gencpy = swap = 0;
 	k = Kw;
 	c = Cine;
-	if (!fi || !req(fi->to, r)) {
+	if (!fi || !req(fi->to, r)
+	|| (fi->cls != Kw && !iscmp(fi->op, &dk, &dc))) {
 		gencmp = 1;
 		cr[0] = r;
 		cr[1] = CON_Z;
@@ -679,7 +680,7 @@ static void
 seljmp(Blk *b, Fn *fn)
 {
 	Ref r;
-	int c, k, swap;
+	int c, k, dk, dc, swap;
 	Ins *fi;
 	Tmp *t;
 
@@ -707,7 +708,8 @@ seljmp(Blk *b, Fn *fn)
 		return;
 	}
 	fi = flagi(b->ins, &b->ins[b->nins]);
-	if (!fi || !req(fi->to, r)) {
+	if (!fi || !req(fi->to, r)
+	|| (fi->cls != Kw && !iscmp(fi->op, &dk, &dc))) {
 		selcmp((Ref[2]){r, CON_Z}, Kw, 0, fn);
 		b->jmp.type = Jjf + Cine;
 	}

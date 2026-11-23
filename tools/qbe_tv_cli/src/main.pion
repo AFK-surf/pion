@@ -1,0 +1,332 @@
+///| `qbe-tv`: translation validation of QBE's SSA optimisations.
+///|
+///|   qbe-tv --trace <dump> [--strict]
+///|       `<dump>` is the stderr of `qbe -d MG`. For every function the
+///|       snapshot `After load elimination` is validated directly against
+///|       `After GCM` with the strict checker `validate_fn` (the whole GVN +
+///|       `simplcfg` + GCM pipeline in one step). When slot coalescing killed
+///|       or fused slots, `Slot coalescing` -> `After GCM` is validated
+///|       instead and the function counts as skipped.
+///|   qbe-tv --pair <before.ssa> <after.ssa> [--strict]
+///|       Every function of `<before.ssa>` against the function of the same
+///|       name in `<after.ssa>`.
+///|
+///| Prints one line per function and `validated=N skipped=M rejected=K`;
+///| exits 1 when something is rejected, 2 under `--strict` when something is
+///| skipped, 0 otherwise.
+
+import "qbe_tv" as tv
+
+pub fn fail_str(e : tv::TvFail) -> String {
+  match e {
+    .BadSrc(c) => "malformed source (code " + c.to_string() + ")"
+    .BadTgt(c) => "malformed target (code " + c.to_string() + ")"
+    .SrcAvail(b) => "source initialisation certificate fails at block " + b.to_string()
+    .TgtAvail(b) => "target initialisation certificate fails at block " + b.to_string()
+    .SrcFacts(b) => "source branch facts fail at block " + b.to_string()
+    .EffectMismatch(s, t) => "side effects differ (src block " + s.to_string() + ", tgt block " + t.to_string() + ")"
+    .EffectConflict(t) => "target effect matched twice (tgt block " + t.to_string() + ")"
+    .TermMismatch(s, t) => "terminators differ (src block " + s.to_string() + ", tgt block " + t.to_string() + ")"
+    .CondMismatch(s, t) => "branch conditions differ (src block " + s.to_string() + ", tgt block " + t.to_string() + ")"
+    .RetMismatch(s, t) => "return values differ (src block " + s.to_string() + ", tgt block " + t.to_string() + ")"
+    .PhiUnmapped(b, d) => "target phi without source counterpart (tgt block " + b.to_string() + ", temp " + d.to_string() + ")"
+    .PhiConflict(d) => "target temp " + d.to_string() + " gets two values"
+    .PhiArmMismatch(b, d) => "phi argument differs (tgt block " + b.to_string() + ", temp " + d.to_string() + ")"
+    .PhiScope(b, d) => "phi value not stable over its block (tgt block " + b.to_string() + ", temp " + d.to_string() + ")"
+    .UnknownValue(d) => "no symbolic value for target temp " + d.to_string()
+    .WorkLimit(n) => "exploration limit reached (" + n.to_string() + ")"
+    .CertRejected(n) => "certificate rejected by verify_cert (check " + n.to_string() + ")"
+  }
+}
+
+///| Outcome of one pair: 0 validated, 1 skipped, 2 rejected, with a reason.
+pub struct PairResult {
+  status : Int
+  msg : String
+}
+
+fn temp_name(nm : Names, t : Int) -> String {
+  if t >= 0 && t < nm.temp_names.length() {
+    "%" + nm.temp_names[t]
+  } else {
+    "#" + t.to_string()
+  }
+}
+
+pub fn run_pair(
+  world : World,
+  sl : Array[String],
+  s0 : Int,
+  s1 : Int,
+  tl : Array[String],
+  t0 : Int,
+  t1 : Int,
+) -> PairResult {
+  let nm = names_new()
+  let ps = match parse_fn(nm, sl, s0, s1) {
+    Ok(p) => p
+    Err(e) =>
+    return PairResult::{ status: if is_unsupported(e) { 1 } else { 2 }, msg: "source: " + e }
+  }
+  let pt = match parse_fn(nm, tl, t0, t1) {
+    Ok(p) => p
+    Err(e) =>
+    return PairResult::{ status: if is_unsupported(e) { 1 } else { 2 }, msg: "target: " + e }
+  }
+  let src = finish(nm, ps.func)
+  let tgt = finish(nm, pt.func)
+  match env_get(world, "QBE_TV_DEBUG") {
+    Some(v) =>
+    if v == ps.name {
+      let tr = tv::debug_walk_trace(src, tgt)
+      let sb = StringBuilder()
+      for x in tr {
+        sb.write_string(" " + x.to_string())
+      }
+      io_eprintln(world, "trace " + ps.name + ":" + sb.to_string())
+    }
+    None => ()
+  }
+  match tv::validate_fn_diag(src, tgt) {
+    .Valid => PairResult::{ status: 0, msg: "ok" }
+    .Rejected(e) => {
+      let extra = match e {
+        .PhiUnmapped(_, d) => " " + temp_name(nm, d)
+        .PhiConflict(d) => " " + temp_name(nm, d)
+        .PhiArmMismatch(_, d) => " " + temp_name(nm, d)
+        .PhiScope(_, d) => " " + temp_name(nm, d)
+        .UnknownValue(d) => " " + temp_name(nm, d)
+        _ => ""
+      }
+      PairResult::{ status: 2, msg: fail_str(e) + extra }
+    }
+  }
+}
+
+///| One `function ... { ... }` snapshot of a `qbe -d MG` dump.
+struct Snap {
+  fname : String
+  title : String
+  start : Int
+  end : Int
+}
+
+fn find_snap(snaps : Array[Snap], fname : String, title : String) -> Int {
+  let mut i = 0
+  while i < snaps.length() {
+    if snaps[i].fname == fname && snaps[i].title == title {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///| `sums K/F/T`: slots killed or fused by coalescing.
+fn coalesce_changed(line : String) -> Bool {
+  let t = line.trim()
+  if !t.starts_with("sums ") {
+    return false
+  }
+  let body = t.slice(5, t.length())
+  let sp = body.index_of(" ")
+  let nums = if sp >= 0 { body.slice(0, sp) } else { body }
+  let parts = nums.split("/")
+  if parts.length() < 2 {
+    return true
+  }
+  parts[0] != "0" || parts[1] != "0"
+}
+
+struct Tally {
+  counts : Array[Int]
+}
+
+fn report(world : World, ty : Tally, name : String, status : Int, detail : String) -> Unit {
+  ty.counts[status] = ty.counts[status] + 1
+  let tag = if status == 0 {
+    "VALIDATED"
+  } else if status == 1 {
+    "SKIPPED"
+  } else {
+    "REJECTED"
+  }
+  io_println(world, tag + " " + name + (if detail.length() > 0 { ": " + detail } else { "" }))
+}
+
+fn run_trace(world : World, path : String, ty : Tally) -> Bool {
+  let text = match fs_read(world, path) {
+    Ok(t) => t
+    Err(e) => {
+      io_eprintln(world, "qbe-tv: cannot read " + path + ": " + e)
+      return false
+    }
+  }
+  let lines = text.split("\n")
+  let mut snaps : Array[Snap] = []
+  let mut fnames : Array[String] = []
+  let mut changed : Array[String] = []
+  let mut cur_fn = ""
+  let mut cur_title = ""
+  let mut i = 0
+  while i < lines.length() {
+    let l = lines[i]
+    if l.starts_with("**** Function ") && l.ends_with(" ****") {
+      cur_fn = l.slice(14, l.length() - 5)
+      fnames.push(cur_fn)
+      cur_title = ""
+    } else if l.starts_with("> ") {
+      cur_title = l.trim()
+    } else if cur_title == "> Slot coalescing:" && l.trim().starts_with("sums ") {
+      if coalesce_changed(l) {
+        changed.push(cur_fn)
+      }
+    } else if l.starts_with("function ") {
+      let e = find_fn_end(lines, i)
+      if e < 0 {
+        io_eprintln(world, "qbe-tv: unterminated function in " + cur_fn)
+        return false
+      }
+      snaps.push(Snap::{ fname: cur_fn, title: cur_title, start: i, end: e })
+      i = e
+    }
+    i = i + 1
+  }
+  for f in fnames {
+    let le = find_snap(snaps, f, "> After load elimination:")
+    let sc = find_snap(snaps, f, "> Slot coalescing:")
+    let gc = find_snap(snaps, f, "> After GCM:")
+    if le < 0 || gc < 0 {
+      report(world, ty, f, 1, "missing snapshots (run qbe -d MG)")
+      continue
+    }
+    let mut changed_slots = false
+    for c in changed {
+      if c == f {
+        changed_slots = true
+      }
+    }
+    let mut worst = 0
+    let mut detail = ""
+    let mut src = le
+    if sc >= 0 && changed_slots {
+      // Slot coalescing is outside the validated subset: start after it.
+      src = sc
+      worst = 1
+      detail = "load->coalesce: skipped (slot coalescing killed or fused slots); "
+    }
+    let r = run_pair(world, lines, snaps[src].start, snaps[src].end, lines, snaps[gc].start, snaps[gc].end)
+    if r.status > worst {
+      worst = r.status
+    }
+    detail = detail + "->gcm: " + r.msg
+    report(world, ty, f, worst, if worst == 0 { "" } else { detail })
+  }
+  true
+}
+
+///| (name, start, end) of every function of a `.ssa` file.
+fn ssa_functions(lines : Array[String]) -> Array[Snap] {
+  let mut out : Array[Snap] = []
+  let mut i = 0
+  while i < lines.length() {
+    let t = lines[i].trim()
+    let k = t.index_of("function ")
+    if k >= 0 && (k == 0 || t.starts_with("export ")) && t.ends_with("{") {
+      let e = find_fn_end(lines, i)
+      if e < 0 {
+        return out
+      }
+      let d = t.index_of("$")
+      let lp = t.index_of("(")
+      let name = if d >= 0 && lp > d { t.slice(d + 1, lp) } else { "?" }
+      out.push(Snap::{ fname: name, title: "", start: i, end: e })
+      i = e
+    }
+    i = i + 1
+  }
+  out
+}
+
+fn run_pairs(world : World, before : String, after : String, ty : Tally) -> Bool {
+  let bt = match fs_read(world, before) {
+    Ok(t) => t
+    Err(e) => {
+      io_eprintln(world, "qbe-tv: cannot read " + before + ": " + e)
+      return false
+    }
+  }
+  let at = match fs_read(world, after) {
+    Ok(t) => t
+    Err(e) => {
+      io_eprintln(world, "qbe-tv: cannot read " + after + ": " + e)
+      return false
+    }
+  }
+  let bl = bt.split("\n")
+  let al = at.split("\n")
+  let bf = ssa_functions(bl)
+  let af = ssa_functions(al)
+  for f in bf {
+    let mut j = -1
+    let mut k = 0
+    while k < af.length() {
+      if af[k].fname == f.fname {
+        j = k
+      }
+      k = k + 1
+    }
+    if j < 0 {
+      report(world, ty, f.fname, 2, "missing in " + after)
+      continue
+    }
+    let r = run_pair(world, bl, f.start, f.end, al, af[j].start, af[j].end)
+    report(world, ty, f.fname, r.status, if r.status == 0 { "" } else { r.msg })
+  }
+  true
+}
+
+fn usage(world : World) -> Int {
+  io_eprintln(world, "usage: qbe-tv --trace <qbe -d MG dump> [--strict]\n       qbe-tv --pair <before.ssa> <after.ssa> [--strict]")
+  64
+}
+
+pub fn main(world : World) -> Int {
+  let args = world_args(world)
+  let mut strict = false
+  let mut pos : Array[String] = []
+  let mut i = 1
+  while i < args.length() {
+    if args[i] == "--strict" {
+      strict = true
+    } else {
+      pos.push(args[i])
+    }
+    i = i + 1
+  }
+  if pos.length() < 2 {
+    return usage(world)
+  }
+  let ty = Tally::{ counts: [0, 0, 0] }
+  let ok = if pos[0] == "--trace" && pos.length() == 2 {
+    run_trace(world, pos[1], ty)
+  } else if pos[0] == "--pair" && pos.length() == 3 {
+    run_pairs(world, pos[1], pos[2], ty)
+  } else {
+    return usage(world)
+  }
+  if !ok {
+    return 3
+  }
+  io_println(
+    world,
+    "validated=" + ty.counts[0].to_string() + " skipped=" + ty.counts[1].to_string() + " rejected=" + ty.counts[2].to_string(),
+  )
+  if ty.counts[2] > 0 {
+    return 1
+  }
+  if strict && ty.counts[1] > 0 {
+    return 2
+  }
+  0
+}

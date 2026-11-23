@@ -6,7 +6,8 @@ set -eu
 # Aeneas Lean backend (AeneasVerif/aeneas @ 1dc8ad31b1, `backends/lean`) and
 # its mathlib build.
 #
-#   1. extract vlib, tests/lean/{algos,codec,captable} and tests/lean/diff/diff_cases
+#   1. extract vlib, tests/lean/{algos,codec,captable}, tests/lean/diff/diff_cases and
+#      tools/qbe_tv (the QBE translation validator)
 #      into a throw-away Lake project next to a copy of lean/;
 #   2. `lake build PionLean` and the extracted libraries (0 errors);
 #   3. `lake build PionProofs`: tests/lean/proofs (`sorry`, `admit`, `bv_decide`
@@ -65,7 +66,7 @@ fi
 
 echo "=== [2/7] pionc extract-lean ==="
 cd "$PROJ"
-for pkg in tests/e2e/p35a_verify_mut/vlib tests/lean/algos tests/lean/codec tests/lean/captable tests/lean/diff/diff_cases; do
+for pkg in tests/e2e/p35a_verify_mut/vlib tests/lean/algos tests/lean/codec tests/lean/captable tests/lean/diff/diff_cases tools/qbe_tv; do
   set +e
   EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$ROOT_DIR/$pkg" 2>&1)
   RC=$?
@@ -76,7 +77,7 @@ for pkg in tests/e2e/p35a_verify_mut/vlib tests/lean/algos tests/lean/codec test
     exit 1
   fi
 done
-for m in Vlib Algos Codec Captable DiffCases; do
+for m in Vlib Algos Codec Captable DiffCases QbeTv; do
   for f in Types Funs FunsExternal FunsExternal_Template; do
     if [ ! -f "$PROJ/$m/$f.lean" ]; then
       echo "FAIL: missing $m/$f.lean" >&2
@@ -88,7 +89,7 @@ mkdir -p "$PROJ/PionProofs"
 cp "$ROOT_DIR"/tests/lean/proofs/*.lean "$PROJ/PionProofs/"
 cp "$ROOT_DIR/tests/lean/Eval.lean" "$PROJ/Eval.lean"
 cp "$ROOT_DIR/tests/lean/diff/DiffEval.lean" "$PROJ/DiffEval.lean"
-for lib in Vlib Algos Codec Captable DiffCases PionProofs; do
+for lib in Vlib Algos Codec Captable DiffCases QbeTv PionProofs; do
   printf '\nlean_lib %s where\n  globs := #[.submodules `%s]\n' "$lib" "$lib" >> "$PROJ/lakefile.lean"
 done
 if grep -rnwE "sorry|admit|bv_decide|native_decide" "$PROJ/PionProofs" >/dev/null; then
@@ -102,7 +103,7 @@ lake build PionLean >/dev/null
 
 echo "=== [4/7] lake build extracted libraries and PionProofs ==="
 set +e
-lake build Vlib Algos Codec Captable DiffCases PionProofs > "$WORK/build.log" 2>&1
+lake build Vlib Algos Codec Captable DiffCases QbeTv PionProofs > "$WORK/build.log" 2>&1
 RC=$?
 set -e
 grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80

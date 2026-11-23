@@ -172,7 +172,7 @@ dwl(Fn *fn, Ref r, int w)
                 return dwl(fn, i->arg[0], w);
 	if (i->op == Oshr || i->op == Osar) {
 		if (isconbits(fn, i->arg[1], &v))
-		if (0 < v && v <= 32) {
+		if (0 < v && v < 32) {
 			if (i->op == Oshr && w+v >= 32)
 				return 1;
 			if (w < 32) {
@@ -406,7 +406,8 @@ phicopyref(Fn *fn, Blk *b, Phi *p)
 	/* same as a previous phi */
 	for (p1=b->phi; p1!=p; p1=p1->link) {
 		assert(p1);
-		if (phieq(p1, p))
+		if ((p1->cls == p->cls || (p1->cls == Kl && p->cls == Kw))
+		&& phieq(p1, p))
 			return p1->to;
 	}
 

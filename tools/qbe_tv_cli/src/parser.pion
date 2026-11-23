@@ -1,0 +1,704 @@
+///| Untrusted QBE text front end for the translation validator.
+///|
+///| Parses one QBE function — `printfn()` dumps of `qbe -d MG` (`par` / `arg`
+///| instructions, implicit fall-through `jmp`, `vendor/qbe/parse.c`) as well
+///| as `.ssa` source (parameters in the header, `call $f(w %a)`, `ret %x`) —
+///| into the dense `qbe_tv::Func` IR. Temporary and symbol names are interned
+///| in a `Names` table shared by the two functions of a pair, so a temporary
+///| keeps its id across passes (a hint the kernel re-checks). Anything outside
+///| the integer subset is `Err("unsupported: ...")`, never a guess.
+
+import "qbe_tv" as tv
+
+pub struct Names {
+  temp_ids : Map[String, Int]
+  temp_names : Array[String]
+  sym_ids : Map[String, Int]
+  sym_names : Array[String]
+}
+
+pub fn names_new() -> Names {
+  let ti : Map[String, Int] = Map::new()
+  let tn : Array[String] = []
+  let si : Map[String, Int] = Map::new()
+  let sn : Array[String] = []
+  Names::{ temp_ids: ti, temp_names: tn, sym_ids: si, sym_names: sn }
+}
+
+fn temp_id(nm : Names, s : String) -> Int {
+  match nm.temp_ids.get(s) {
+    Some(v) => v
+    None => {
+      let id = nm.temp_names.length()
+      nm.temp_names.push(s)
+      nm.temp_ids.set(s, id)
+      id
+    }
+  }
+}
+
+fn sym_id(nm : Names, s : String) -> Int {
+  match nm.sym_ids.get(s) {
+    Some(v) => v
+    None => {
+      let id = nm.sym_names.length()
+      nm.sym_names.push(s)
+      nm.sym_ids.set(s, id)
+      id
+    }
+  }
+}
+
+pub fn unsupported(what : String) -> String {
+  "unsupported: " + what
+}
+
+pub fn is_unsupported(msg : String) -> Bool {
+  msg.starts_with("unsupported: ")
+}
+
+fn strip_prefix(s : String, p : String) -> String {
+  if s.starts_with(p) {
+    s.slice(p.length(), s.length())
+  } else {
+    s
+  }
+}
+
+fn parse_cls(c : String) -> Result[tv::Cls, String] {
+  if c == "w" {
+    return Ok(.W)
+  }
+  if c == "l" {
+    return Ok(.L)
+  }
+  Err(unsupported("class " + c))
+}
+
+fn find_sign(s : String) -> Int {
+  let n = s.length()
+  let mut i = 1
+  while i < n {
+    let ch = s.code_unit_at(i)
+    if ch == 43 || ch == 45 {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+pub fn parse_atom(nm : Names, s0 : String) -> Result[tv::Atom, String] {
+  let s = strip_prefix(strip_prefix(s0.trim(), "extern "), "thread ")
+  if s.length() == 0 {
+    return Err("empty operand")
+  }
+  if s.starts_with("%") {
+    return Ok(.Temp(temp_id(nm, s.slice(1, s.length()))))
+  }
+  if s.starts_with("$") {
+    let k = find_sign(s)
+    if k < 0 {
+      return Ok(.Sym(sym_id(nm, s.slice(1, s.length())), 0UL))
+    }
+    let name = s.slice(1, k)
+    let off_s = if s.code_unit_at(k) == 43 { s.slice(k + 1, s.length()) } else { s.slice(k, s.length()) }
+    match off_s.to_int64() {
+      Some(v) => return Ok(.Sym(sym_id(nm, name), v.reinterpret_as_uint64()))
+      None => return Err("bad symbol offset: " + s)
+    }
+  }
+  if s.starts_with("s_") || s.starts_with("d_") {
+    return Err(unsupported("floating-point constant " + s))
+  }
+  match s.to_int64() {
+    Some(v) => Ok(.Const(v.reinterpret_as_uint64()))
+    None => Err(unsupported("operand " + s))
+  }
+}
+
+fn split_args(s : String) -> Array[String] {
+  let mut out : Array[String] = []
+  let t = s.trim()
+  if t.length() == 0 {
+    return out
+  }
+  for p in t.split(",") {
+    out.push(p.trim())
+  }
+  out
+}
+
+fn cmp_op(base : String, c : tv::Cls) -> Option[tv::BinOp] {
+  if base == "ceq" {
+    return Some(.CEq(c))
+  }
+  if base == "cne" {
+    return Some(.CNe(c))
+  }
+  if base == "cslt" {
+    return Some(.CSlt(c))
+  }
+  if base == "csle" {
+    return Some(.CSle(c))
+  }
+  if base == "csgt" {
+    return Some(.CSgt(c))
+  }
+  if base == "csge" {
+    return Some(.CSge(c))
+  }
+  if base == "cult" {
+    return Some(.CUlt(c))
+  }
+  if base == "cule" {
+    return Some(.CUle(c))
+  }
+  if base == "cugt" {
+    return Some(.CUgt(c))
+  }
+  if base == "cuge" {
+    return Some(.CUge(c))
+  }
+  None
+}
+
+fn bin_op(op : String) -> Option[tv::BinOp] {
+  if op == "add" {
+    return Some(.Add)
+  }
+  if op == "sub" {
+    return Some(.Sub)
+  }
+  if op == "mul" {
+    return Some(.Mul)
+  }
+  if op == "and" {
+    return Some(.And)
+  }
+  if op == "or" {
+    return Some(.Or)
+  }
+  if op == "xor" {
+    return Some(.Xor)
+  }
+  if op == "shl" {
+    return Some(.Shl)
+  }
+  if op == "shr" {
+    return Some(.Shr)
+  }
+  if op == "sar" {
+    return Some(.Sar)
+  }
+  if op == "div" {
+    return Some(.Div)
+  }
+  if op == "udiv" {
+    return Some(.UDiv)
+  }
+  if op == "rem" {
+    return Some(.Rem)
+  }
+  if op == "urem" {
+    return Some(.URem)
+  }
+  let n = op.length()
+  if n >= 4 && op.starts_with("c") {
+    let last = op.slice(n - 1, n)
+    let base = op.slice(0, n - 1)
+    if last == "w" {
+      return cmp_op(base, .W)
+    }
+    if last == "l" {
+      return cmp_op(base, .L)
+    }
+  }
+  None
+}
+
+fn un_op(op : String) -> Option[tv::UnOp] {
+  if op == "copy" {
+    return Some(.Copy)
+  }
+  if op == "neg" {
+    return Some(.Neg)
+  }
+  if op == "extsb" {
+    return Some(.ExtSB)
+  }
+  if op == "extub" {
+    return Some(.ExtUB)
+  }
+  if op == "extsh" {
+    return Some(.ExtSH)
+  }
+  if op == "extuh" {
+    return Some(.ExtUH)
+  }
+  if op == "extsw" {
+    return Some(.ExtSW)
+  }
+  if op == "extuw" {
+    return Some(.ExtUW)
+  }
+  None
+}
+
+///| (width, signed) of a load mnemonic (`load` / `loadw` / `loadl` take the
+///| destination width).
+fn load_kind(op : String, c : tv::Cls) -> Option[(tv::MemWidth, Bool)] {
+  if op == "loadsb" {
+    return Some((.B1, true))
+  }
+  if op == "loadub" {
+    return Some((.B1, false))
+  }
+  if op == "loadsh" {
+    return Some((.B2, true))
+  }
+  if op == "loaduh" {
+    return Some((.B2, false))
+  }
+  if op == "loadsw" {
+    return Some((.B4, true))
+  }
+  if op == "loaduw" {
+    return Some((.B4, false))
+  }
+  if op == "loadw" {
+    return Some((.B4, false))
+  }
+  if op == "loadl" {
+    return Some((.B8, false))
+  }
+  if op == "load" {
+    match c {
+      .W => return Some((.B4, false))
+      .L => return Some((.B8, false))
+    }
+  }
+  None
+}
+
+fn store_width(op : String) -> Option[tv::MemWidth] {
+  if op == "storeb" {
+    return Some(.B1)
+  }
+  if op == "storeh" {
+    return Some(.B2)
+  }
+  if op == "storew" {
+    return Some(.B4)
+  }
+  if op == "storel" {
+    return Some(.B8)
+  }
+  None
+}
+
+fn word_split(s : String) -> (String, String) {
+  let t = s.trim()
+  let k = t.index_of(" ")
+  if k < 0 {
+    (t, "")
+  } else {
+    (t.slice(0, k), t.slice(k + 1, t.length()).trim())
+  }
+}
+
+///| `cls %x` / `cls value` pairs of a header or an inline call.
+fn parse_typed_list(nm : Names, s : String) -> Result[Array[tv::CallArg], String] {
+  let mut out : Array[tv::CallArg] = []
+  for p in split_args(s) {
+    if p == "..." {
+      return Err(unsupported("variadic call"))
+    }
+    let (c, v) = word_split(p)
+    if c == "env" {
+      return Err(unsupported("env argument"))
+    }
+    if c.starts_with(":") {
+      return Err(unsupported("aggregate argument"))
+    }
+    let cls = parse_cls(c)?
+    let a = parse_atom(nm, v)?
+    out.push(tv::CallArg::{ cls: cls, arg: a })
+  }
+  Ok(out)
+}
+
+///| Mutable state of one function being parsed.
+struct FnBuild {
+  labels : Map[String, Int]
+  phis : Array[Array[tv::Phi]]
+  insts : Array[Array[tv::Inst]]
+  terms : Array[tv::Term]
+  has_term : Array[Bool]
+  args : Array[tv::CallArg]
+  ret_cls : Array[tv::Cls]
+  nparams : Array[Int]
+}
+
+fn label_id(fb : FnBuild, s : String) -> Result[Int, String] {
+  let t = s.trim()
+  if !t.starts_with("@") {
+    return Err("bad label " + t)
+  }
+  match fb.labels.get(t.slice(1, t.length())) {
+    Some(v) => Ok(v)
+    None => Err("unknown label " + t)
+  }
+}
+
+fn parse_inst(nm : Names, fb : FnBuild, blk : Int, dst_s : String, cls_s : String, op : String, rest : String) -> Result[Unit, String] {
+  let has_dst = dst_s.length() > 0
+  if op == "nop" || op == "dbgloc" {
+    return Ok(())
+  }
+  if op == "phi" {
+    if !has_dst {
+      return Err("phi without destination")
+    }
+    let cls = parse_cls(cls_s)?
+    let mut arms : Array[tv::PhiArm] = []
+    for p in split_args(rest) {
+      let (lab, v) = word_split(p)
+      let pid = label_id(fb, lab)?
+      let a = parse_atom(nm, v)?
+      arms.push(tv::PhiArm::{ pred: pid, value: a })
+    }
+    fb.phis[blk].push(tv::Phi::{ dst: temp_id(nm, dst_s), cls: cls, arms: arms })
+    return Ok(())
+  }
+  if op.starts_with("arg") {
+    let c = op.slice(3, op.length())
+    if c == "w" || c == "l" {
+      let cls = parse_cls(c)?
+      let a = parse_atom(nm, rest)?
+      fb.args.push(tv::CallArg::{ cls: cls, arg: a })
+      return Ok(())
+    }
+    return Err(unsupported("argument " + op))
+  }
+  if op == "call" {
+    let mut callee_s = rest
+    let mut args : Array[tv::CallArg] = []
+    let lp = rest.index_of("(")
+    if lp >= 0 {
+      let rp = rest.index_of(")")
+      if rp < lp {
+        return Err("bad call " + rest)
+      }
+      callee_s = rest.slice(0, lp)
+      args = parse_typed_list(nm, rest.slice(lp + 1, rp))?
+      if rest.slice(rp + 1, rest.length()).trim().length() > 0 {
+        return Err(unsupported("call suffix " + rest))
+      }
+    } else {
+      let parts = split_args(rest)
+      if parts.length() == 0 {
+        return Err("call without callee")
+      }
+      if parts.length() > 1 {
+        return Err(unsupported("call with type " + rest))
+      }
+      callee_s = parts[0]
+      for x in fb.args {
+        args.push(x)
+      }
+    }
+    fb.args.clear()
+    let callee = parse_atom(nm, callee_s)?
+    let mut cls : tv::Cls = .L
+    let mut d = -1
+    if has_dst {
+      cls = parse_cls(cls_s)?
+      d = temp_id(nm, dst_s)
+    }
+    fb.insts[blk].push(.Call(d, cls, has_dst, callee, args))
+    return Ok(())
+  }
+  if fb.args.length() > 0 {
+    return Err("argument not followed by call")
+  }
+  match store_width(op) {
+    Some(w) => {
+      let xs = split_args(rest)
+      if xs.length() != 2 {
+        return Err("bad store " + rest)
+      }
+      let v = parse_atom(nm, xs[0])?
+      let a = parse_atom(nm, xs[1])?
+      fb.insts[blk].push(.Store(w, v, a))
+      return Ok(())
+    }
+    None => ()
+  }
+  if op.starts_with("store") || op.starts_with("blit") || op.starts_with("va") {
+    return Err(unsupported("instruction " + op))
+  }
+  if !has_dst {
+    return Err(unsupported("instruction " + op))
+  }
+  let cls = parse_cls(cls_s)?
+  let d = temp_id(nm, dst_s)
+  if op == "par" {
+    let k = fb.nparams[0]
+    fb.nparams[0] = k + 1
+    fb.insts[blk].push(.Par(d, cls, k))
+    return Ok(())
+  }
+  if op == "alloc4" || op == "alloc8" || op == "alloc16" {
+    let al = op.slice(5, op.length()).to_int().unwrap_or(0)
+    match rest.trim().to_int() {
+      Some(sz) => {
+        fb.insts[blk].push(.Alloc(d, al, sz))
+        return Ok(())
+      }
+      None => return Err(unsupported("dynamic alloc " + rest))
+    }
+  }
+  match load_kind(op, cls) {
+    Some(wk) => {
+      let (w, sg) = wk
+      let a = parse_atom(nm, rest)?
+      fb.insts[blk].push(.Load(d, cls, w, sg, a))
+      return Ok(())
+    }
+    None => ()
+  }
+  match un_op(op) {
+    Some(u) => {
+      let a = parse_atom(nm, rest)?
+      fb.insts[blk].push(.Un(d, cls, u, a))
+      return Ok(())
+    }
+    None => ()
+  }
+  match bin_op(op) {
+    Some(b) => {
+      let xs = split_args(rest)
+      if xs.length() != 2 {
+        return Err("bad operands of " + op + ": " + rest)
+      }
+      let a = parse_atom(nm, xs[0])?
+      let c = parse_atom(nm, xs[1])?
+      fb.insts[blk].push(.Bin(d, cls, b, a, c))
+      return Ok(())
+    }
+    None => ()
+  }
+  Err(unsupported("instruction " + op))
+}
+
+fn set_term(fb : FnBuild, blk : Int, t : tv::Term) -> Unit {
+  fb.terms[blk] = t
+  fb.has_term[blk] = true
+}
+
+fn parse_term(nm : Names, fb : FnBuild, blk : Int, op : String, rest : String) -> Result[Bool, String] {
+  if op == "jmp" {
+    let s = label_id(fb, rest)?
+    set_term(fb, blk, .Jmp(s))
+    return Ok(true)
+  }
+  if op == "jnz" {
+    let xs = split_args(rest)
+    if xs.length() != 3 {
+      return Err("bad jnz " + rest)
+    }
+    let c = parse_atom(nm, xs[0])?
+    let s1 = label_id(fb, xs[1])?
+    let s2 = label_id(fb, xs[2])?
+    set_term(fb, blk, .Jnz(c, s1, s2))
+    return Ok(true)
+  }
+  if op == "hlt" {
+    set_term(fb, blk, .Hlt)
+    return Ok(true)
+  }
+  if op == "ret0" || (op == "ret" && rest.trim().length() == 0) {
+    set_term(fb, blk, .Ret(false, .L, .Const(0UL)))
+    return Ok(true)
+  }
+  if op == "retw" || op == "retl" || op == "ret" {
+    let mut cls : tv::Cls = .L
+    if op == "retw" {
+      cls = .W
+    } else if op == "ret" {
+      if fb.ret_cls.length() == 0 {
+        return Err(unsupported("ret without a w/l function class"))
+      }
+      cls = fb.ret_cls[0]
+    }
+    let a = parse_atom(nm, rest)?
+    set_term(fb, blk, .Ret(true, cls, a))
+    return Ok(true)
+  }
+  if op.starts_with("ret") || op == "jtbl" || op.starts_with("jf") {
+    return Err(unsupported("jump " + op))
+  }
+  Ok(false)
+}
+
+///| A parsed function: its name and IR.
+pub struct ParsedFn {
+  name : String
+  func : tv::Func
+}
+
+///| Parses the function whose header is `lines[start]` and whose closing
+///| `}` is `lines[end]`.
+pub fn parse_fn(nm : Names, lines : Array[String], start : Int, end : Int) -> Result[ParsedFn, String] {
+  let header = lines[start].trim()
+  let fk = header.index_of("function ")
+  if fk < 0 {
+    return Err("not a function header: " + header)
+  }
+  let mut h = header.slice(fk + 9, header.length()).trim()
+  let mut ret_cls : Array[tv::Cls] = []
+  if !h.starts_with("$") {
+    let (c, r) = word_split(h)
+    if c == "w" {
+      ret_cls.push(.W)
+    } else if c == "l" {
+      ret_cls.push(.L)
+    } else {
+      return Err(unsupported("function return class " + c))
+    }
+    h = r
+  }
+  let lp = h.index_of("(")
+  let rp = h.index_of(")")
+  if !h.starts_with("$") || lp < 0 || rp < lp {
+    return Err("bad function header: " + header)
+  }
+  let name = h.slice(1, lp)
+  // Pass 1: block labels.
+  let labels : Map[String, Int] = Map::new()
+  let mut nblk = 0
+  let mut i = start + 1
+  while i < end {
+    let t = lines[i].trim()
+    if t.starts_with("@") {
+      labels.set(t.slice(1, t.length()), nblk)
+      nblk = nblk + 1
+    }
+    i = i + 1
+  }
+  if nblk == 0 {
+    return Err("function without blocks: " + name)
+  }
+  let mut phis : Array[Array[tv::Phi]] = []
+  let mut insts : Array[Array[tv::Inst]] = []
+  let mut terms : Array[tv::Term] = []
+  let mut has_term : Array[Bool] = []
+  let mut b = 0
+  while b < nblk {
+    let ps : Array[tv::Phi] = []
+    let ins : Array[tv::Inst] = []
+    phis.push(ps)
+    insts.push(ins)
+    terms.push(.Hlt)
+    has_term.push(false)
+    b = b + 1
+  }
+  let fargs : Array[tv::CallArg] = []
+  let fb = FnBuild::{ labels: labels, phis: phis, insts: insts, terms: terms, has_term: has_term, args: fargs, ret_cls: ret_cls, nparams: [0] }
+  // Header parameters become `par` instructions of the entry block.
+  let params = parse_typed_list(nm, h.slice(lp + 1, rp))?
+  for p in params {
+    match p.arg {
+      .Temp(t) => {
+        let k = fb.nparams[0]
+        fb.nparams[0] = k + 1
+        fb.insts[0].push(.Par(t, p.cls, k))
+      }
+      _ => return Err("bad parameter")
+    }
+  }
+  let mut cur = -1
+  i = start + 1
+  while i < end {
+    let t = lines[i].trim()
+    if t.length() == 0 {
+      i = i + 1
+      continue
+    }
+    if t.starts_with("@") {
+      let id = match fb.labels.get(t.slice(1, t.length())) {
+        Some(v) => v
+        None => -1
+      }
+      // `parse.c:1479`: a `jmp` to the next block is not printed.
+      if cur >= 0 && !fb.has_term[cur] {
+        set_term(fb, cur, .Jmp(id))
+      }
+      cur = id
+      i = i + 1
+      continue
+    }
+    if cur < 0 {
+      return Err("instruction before the first block: " + t)
+    }
+    if fb.has_term[cur] {
+      return Err("instruction after a terminator: " + t)
+    }
+    let mut dst_s = ""
+    let mut cls_s = ""
+    let mut body = t
+    if t.starts_with("%") {
+      let eq = t.index_of(" =")
+      if eq < 0 {
+        return Err("bad instruction " + t)
+      }
+      dst_s = t.slice(1, eq)
+      let after = t.slice(eq + 2, t.length())
+      let (c, r) = word_split(after)
+      cls_s = c
+      body = r
+    }
+    let (op, rest) = word_split(body)
+    if dst_s.length() == 0 {
+      let done = parse_term(nm, fb, cur, op, rest)?
+      if done {
+        i = i + 1
+        continue
+      }
+    }
+    parse_inst(nm, fb, cur, dst_s, cls_s, op, rest)?
+    i = i + 1
+  }
+  if cur >= 0 && !fb.has_term[cur] {
+    return Err("last block without terminator")
+  }
+  if fb.args.length() > 0 {
+    return Err("argument not followed by call")
+  }
+  let mut blocks : Array[tv::Block] = []
+  let mut k = 0
+  while k < nblk {
+    blocks.push(tv::Block::{ id: k, phis: fb.phis[k], insts: fb.insts[k], term: fb.terms[k] })
+    k = k + 1
+  }
+  Ok(ParsedFn::{ name: name, func: tv::Func::{ nparams: fb.nparams[0], ntemps: 0, blocks: blocks } })
+}
+
+///| The same function with `ntemps` set to the size of the shared table
+///| (call once both functions of a pair are parsed).
+pub fn finish(nm : Names, f : tv::Func) -> tv::Func {
+  tv::Func::{ nparams: f.nparams, ntemps: nm.temp_names.length(), blocks: f.blocks }
+}
+
+///| Index of the closing `}` of the function starting at `start`, or -1.
+pub fn find_fn_end(lines : Array[String], start : Int) -> Int {
+  let mut i = start + 1
+  while i < lines.length() {
+    if lines[i].trim() == "}" {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
