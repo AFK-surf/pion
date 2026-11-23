@@ -337,7 +337,7 @@ if [ "$HTTP_OUT" != "$(printf 'http in-process ok\nhttp_request ok: 200 text/pla
 fi
 
 FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
-  "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" \
+  "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/proc" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" \
   "$ROOT_DIR/examples/https_server" "$ROOT_DIR/tests/e2e/dyn_trait.pion" \
   "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/examples/pion_station")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
@@ -403,6 +403,13 @@ if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
   echo "FAIL: p17a_ergonomics_mt output mismatch" >&2
   exit 1
 fi
+
+# std/proc: streaming subprocess + cross-platform PTY (c_sources needs real `as` via ORIG_PATH).
+PROC_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/proc")"
+echo "pionc_linux test --json std/proc -> $PROC_JSON"
+printf '%s' "$PROC_JSON" | grep -q '"ok":true'
+printf '%s' "$PROC_JSON" | grep -q '"failed":0'
+PATH="$ORIG_PATH" sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC"
 
 # std/tls: zero-C-glue OpenSSL FFI. Unit tests plus real TLS 1.3/1.2 loopback
 # handshakes (and a refused wrong host) whenever libssl/libcrypto can be linked.

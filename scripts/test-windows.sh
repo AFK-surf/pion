@@ -133,7 +133,7 @@ echo "pionc_win test --json compiler/src/core -> $CORE_TEST_SUMMARY"
 printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'
 printf '%s' "$CORE_TEST_JSON" | grep -q '"failed":0'
 
-for TPKG in examples/text_stats std/json std/http std/regex; do
+for TPKG in examples/text_stats std/json std/http std/regex std/proc; do
   PKG_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_win test --json $TPKG -> $PKG_JSON"
   printf '%s' "$PKG_JSON" | grep -q '"ok":true'

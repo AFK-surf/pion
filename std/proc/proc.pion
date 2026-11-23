@@ -1,0 +1,527 @@
+///| std/proc: streaming subprocess management (`Child`) and cross-platform PTY (`PtyChild`).
+///| POSIX (macOS + Linux) uses `fork` + `execve` + `posix_openpt` + process-group tree kill;
+///| Windows uses `CreateProcessW` + overlapped named pipes + Job Objects + dynamic ConPTY.
+
+extern "C" fn c_proc_spawn(
+  argv : Ptr,
+  argc : Int,
+  cwd : Ptr,
+  env_set_keys : Ptr,
+  env_set_vals : Ptr,
+  env_set_count : Int,
+  env_unset_keys : Ptr,
+  env_unset_count : Int,
+  clear_env : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Ptr = "pion_proc_spawn"
+
+extern "C" fn c_proc_pty_spawn(
+  argv : Ptr,
+  argc : Int,
+  cols : Int,
+  rows : Int,
+  cwd : Ptr,
+  env_set_keys : Ptr,
+  env_set_vals : Ptr,
+  env_set_count : Int,
+  env_unset_keys : Ptr,
+  env_unset_count : Int,
+  clear_env : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Ptr = "pion_proc_pty_spawn"
+
+extern "C" fn c_proc_pid(h : Ptr) -> Int = "pion_proc_pid"
+
+extern "C" fn c_proc_read(
+  h : Ptr,
+  stream : Int,
+  buf : Ptr,
+  max_bytes : Int,
+  timeout_ms : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Int = "pion_proc_read"
+
+extern "C" fn c_proc_write(
+  h : Ptr,
+  buf : Ptr,
+  len : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Int = "pion_proc_write"
+
+extern "C" fn c_proc_close_stdin(h : Ptr) -> Unit = "pion_proc_close_stdin"
+
+extern "C" fn c_proc_pty_resize(
+  h : Ptr,
+  cols : Int,
+  rows : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Int = "pion_proc_pty_resize"
+
+extern "C" fn c_proc_wait(
+  h : Ptr,
+  block : Int,
+  out_kind : Ptr,
+  out_code : Ptr,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Int = "pion_proc_wait"
+
+extern "C" fn c_proc_signal_tree(
+  h : Ptr,
+  force : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Int = "pion_proc_signal_tree"
+
+extern "C" fn c_proc_close(h : Ptr) -> Unit = "pion_proc_close"
+
+extern "C" fn c_proc_is_windows() -> Int = "pion_proc_is_windows"
+
+let ERR_BUF_CAP : Int = 512
+
+pub struct SpawnOptions {
+  pub cwd : String
+  pub env_set : Map[String, String]
+  pub env_unset : Array[String]
+  pub clear_env : Bool
+}
+
+pub fn spawn_options() -> SpawnOptions {
+  SpawnOptions::{ cwd: "", env_set: Map::new(), env_unset: [], clear_env: false }
+}
+
+pub enum ReadChunk {
+  Data(Bytes)
+  Timeout
+  Eof
+}
+
+pub enum ExitStatus {
+  Exited(Int)
+  Signaled(Int)
+}
+
+pub struct Child {
+  handle : Ptr
+  pub pid : Int
+}
+
+pub struct PtyChild {
+  handle : Ptr
+  pub pid : Int
+}
+
+fn alloc_cstr_array(items : Array[String]) -> Ptr {
+  let n = items.length()
+  if n == 0 {
+    return ptr_null()
+  }
+  let arr = ptr_alloc(n.to_int64() * 8L)
+  let mut i = 0
+  while i < n {
+    ptr_write_ptr(arr, i.to_int64() * 8L, items[i].as_cstr())
+    i = i + 1
+  }
+  arr
+}
+
+fn free_if_nonnull(p : Ptr) -> Unit {
+  if !ptr_is_null(p) {
+    ptr_free(p)
+  }
+}
+
+fn read_stream_impl(
+  handle : Ptr,
+  stream : Int,
+  max_bytes : Int,
+  timeout_ms : Int,
+) -> Result[ReadChunk, String] {
+  if max_bytes <= 0 {
+    return Err("max_bytes must be > 0")
+  }
+  let buf = ptr_alloc(max_bytes.to_int64())
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let n = c_proc_read(handle, stream, buf, max_bytes, timeout_ms, err_buf, ERR_BUF_CAP)
+  if n > 0 {
+    let chunk = bytes_from_ptr(buf, n)
+    ptr_free(buf)
+    ptr_free(err_buf)
+    Ok(ReadChunk::Data(chunk))
+  } else if n == 0 {
+    ptr_free(buf)
+    ptr_free(err_buf)
+    Ok(ReadChunk::Eof)
+  } else if n == -1 {
+    ptr_free(buf)
+    ptr_free(err_buf)
+    Ok(ReadChunk::Timeout)
+  } else {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(buf)
+    ptr_free(err_buf)
+    Err(msg)
+  }
+}
+
+fn write_stream_impl(handle : Ptr, data : Bytes) -> Result[Int, String] {
+  let len = data.length()
+  if len == 0 {
+    return Ok(0)
+  }
+  let buf = ptr_alloc(len.to_int64())
+  bytes_copy_to_ptr(data, 0, buf, len)
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let n = c_proc_write(handle, buf, len, err_buf, ERR_BUF_CAP)
+  if n >= 0 {
+    ptr_free(buf)
+    ptr_free(err_buf)
+    Ok(n)
+  } else {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(buf)
+    ptr_free(err_buf)
+    Err(msg)
+  }
+}
+
+fn wait_impl(handle : Ptr, block : Int) -> Result[Option[ExitStatus], String] {
+  let out_kind = ptr_alloc(4L)
+  let out_code = ptr_alloc(4L)
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let rc = c_proc_wait(handle, block, out_kind, out_code, err_buf, ERR_BUF_CAP)
+  if rc == 1 {
+    let kind = ptr_read_i32(out_kind, 0L)
+    let code = ptr_read_i32(out_code, 0L)
+    ptr_free(out_kind)
+    ptr_free(out_code)
+    ptr_free(err_buf)
+    if kind == 1 {
+      Ok(Some(ExitStatus::Signaled(code)))
+    } else {
+      Ok(Some(ExitStatus::Exited(code)))
+    }
+  } else if rc == 0 {
+    ptr_free(out_kind)
+    ptr_free(out_code)
+    ptr_free(err_buf)
+    Ok(None)
+  } else {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(out_kind)
+    ptr_free(out_code)
+    ptr_free(err_buf)
+    Err(msg)
+  }
+}
+
+fn signal_tree_impl(handle : Ptr, force : Int) -> Result[Unit, String] {
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let rc = c_proc_signal_tree(handle, force, err_buf, ERR_BUF_CAP)
+  if rc == 0 {
+    ptr_free(err_buf)
+    Ok(())
+  } else {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    Err(msg)
+  }
+}
+
+fn child_spawn_impl(argv : Array[String], opts : SpawnOptions) -> Result[Child, String] {
+  if argv.length() == 0 {
+    return Err("argv must not be empty")
+  }
+  let set_keys = opts.env_set.keys()
+  let set_vals : Array[String] = []
+  let mut i = 0
+  while i < set_keys.length() {
+    let k = set_keys[i]
+    let v = match opts.env_set.get(k) {
+      Some(s) => s
+      None => ""
+    }
+    set_vals.push(v)
+    i = i + 1
+  }
+  let argv_ptr = alloc_cstr_array(argv)
+  let set_k_ptr = alloc_cstr_array(set_keys)
+  let set_v_ptr = alloc_cstr_array(set_vals)
+  let unset_ptr = alloc_cstr_array(opts.env_unset)
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let clear_flag = if opts.clear_env { 1 } else { 0 }
+  let h = c_proc_spawn(
+    argv_ptr,
+    argv.length(),
+    opts.cwd.as_cstr(),
+    set_k_ptr,
+    set_v_ptr,
+    set_keys.length(),
+    unset_ptr,
+    opts.env_unset.length(),
+    clear_flag,
+    err_buf,
+    ERR_BUF_CAP,
+  )
+  free_if_nonnull(argv_ptr)
+  free_if_nonnull(set_k_ptr)
+  free_if_nonnull(set_v_ptr)
+  free_if_nonnull(unset_ptr)
+  if ptr_is_null(h) {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(msg)
+  }
+  ptr_free(err_buf)
+  let pid = c_proc_pid(h)
+  Ok(Child::{ handle: h, pid: pid })
+}
+
+/// Spawns a child process with independent piped `stdin`, `stdout`, and `stderr`.
+pub fn child_spawn(
+  w : World,
+  argv : Array[String],
+  opts : SpawnOptions,
+) -> Result[Child, String] {
+  let _ = w
+  child_spawn_impl(argv, opts)
+}
+
+pub fn child_pid(child : Child) -> Int {
+  child.pid
+}
+
+pub fn child_read_stdout(
+  w : World,
+  child : Child,
+  max_bytes : Int,
+) -> Result[ReadChunk, String] {
+  let _ = w
+  read_stream_impl(child.handle, 0, max_bytes, -1)
+}
+
+pub fn child_read_stdout_timeout(
+  w : World,
+  child : Child,
+  max_bytes : Int,
+  timeout_ms : Int,
+) -> Result[ReadChunk, String] {
+  let _ = w
+  read_stream_impl(child.handle, 0, max_bytes, timeout_ms)
+}
+
+pub fn child_read_stderr(
+  w : World,
+  child : Child,
+  max_bytes : Int,
+) -> Result[ReadChunk, String] {
+  let _ = w
+  read_stream_impl(child.handle, 1, max_bytes, -1)
+}
+
+pub fn child_read_stderr_timeout(
+  w : World,
+  child : Child,
+  max_bytes : Int,
+  timeout_ms : Int,
+) -> Result[ReadChunk, String] {
+  let _ = w
+  read_stream_impl(child.handle, 1, max_bytes, timeout_ms)
+}
+
+pub fn child_write_stdin(w : World, child : Child, data : Bytes) -> Result[Int, String] {
+  let _ = w
+  write_stream_impl(child.handle, data)
+}
+
+pub fn child_write_stdin_str(w : World, child : Child, data : String) -> Result[Int, String] {
+  child_write_stdin(w, child, data.to_bytes())
+}
+
+pub fn child_close_stdin(w : World, child : Child) -> Unit {
+  let _ = w
+  c_proc_close_stdin(child.handle)
+}
+
+pub fn child_try_wait(w : World, child : Child) -> Result[Option[ExitStatus], String] {
+  let _ = w
+  wait_impl(child.handle, 0)
+}
+
+pub fn child_wait(w : World, child : Child) -> Result[ExitStatus, String] {
+  let _ = w
+  match wait_impl(child.handle, 1) {
+    Ok(Some(st)) => Ok(st)
+    Ok(None) => Err("blocking wait returned no exit status")
+    Err(e) => Err(e)
+  }
+}
+
+pub fn child_terminate_tree(w : World, child : Child) -> Result[Unit, String] {
+  let _ = w
+  signal_tree_impl(child.handle, 0)
+}
+
+pub fn child_kill_tree(w : World, child : Child) -> Result[Unit, String] {
+  let _ = w
+  signal_tree_impl(child.handle, 1)
+}
+
+pub fn child_close(w : World, child : Child) -> Unit {
+  let _ = w
+  c_proc_close(child.handle)
+}
+
+fn pty_spawn_impl(
+  argv : Array[String],
+  cols : Int,
+  rows : Int,
+  opts : SpawnOptions,
+) -> Result[PtyChild, String] {
+  if argv.length() == 0 {
+    return Err("argv must not be empty")
+  }
+  if cols <= 0 || rows <= 0 {
+    return Err("pty cols and rows must be > 0")
+  }
+  let set_keys = opts.env_set.keys()
+  let set_vals : Array[String] = []
+  let mut i = 0
+  while i < set_keys.length() {
+    let k = set_keys[i]
+    let v = match opts.env_set.get(k) {
+      Some(s) => s
+      None => ""
+    }
+    set_vals.push(v)
+    i = i + 1
+  }
+  let argv_ptr = alloc_cstr_array(argv)
+  let set_k_ptr = alloc_cstr_array(set_keys)
+  let set_v_ptr = alloc_cstr_array(set_vals)
+  let unset_ptr = alloc_cstr_array(opts.env_unset)
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let clear_flag = if opts.clear_env { 1 } else { 0 }
+  let h = c_proc_pty_spawn(
+    argv_ptr,
+    argv.length(),
+    cols,
+    rows,
+    opts.cwd.as_cstr(),
+    set_k_ptr,
+    set_v_ptr,
+    set_keys.length(),
+    unset_ptr,
+    opts.env_unset.length(),
+    clear_flag,
+    err_buf,
+    ERR_BUF_CAP,
+  )
+  free_if_nonnull(argv_ptr)
+  free_if_nonnull(set_k_ptr)
+  free_if_nonnull(set_v_ptr)
+  free_if_nonnull(unset_ptr)
+  if ptr_is_null(h) {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(msg)
+  }
+  ptr_free(err_buf)
+  let pid = c_proc_pid(h)
+  Ok(PtyChild::{ handle: h, pid: pid })
+}
+
+/// Spawns a child process attached to a new pseudo-terminal (PTY / ConPTY).
+pub fn pty_spawn(
+  w : World,
+  argv : Array[String],
+  cols : Int,
+  rows : Int,
+  opts : SpawnOptions,
+) -> Result[PtyChild, String] {
+  let _ = w
+  pty_spawn_impl(argv, cols, rows, opts)
+}
+
+pub fn pty_pid(pty : PtyChild) -> Int {
+  pty.pid
+}
+
+pub fn pty_read(w : World, pty : PtyChild, max_bytes : Int) -> Result[ReadChunk, String] {
+  let _ = w
+  read_stream_impl(pty.handle, 0, max_bytes, -1)
+}
+
+pub fn pty_read_timeout(
+  w : World,
+  pty : PtyChild,
+  max_bytes : Int,
+  timeout_ms : Int,
+) -> Result[ReadChunk, String] {
+  let _ = w
+  read_stream_impl(pty.handle, 0, max_bytes, timeout_ms)
+}
+
+pub fn pty_write(w : World, pty : PtyChild, data : Bytes) -> Result[Int, String] {
+  let _ = w
+  write_stream_impl(pty.handle, data)
+}
+
+pub fn pty_write_str(w : World, pty : PtyChild, data : String) -> Result[Int, String] {
+  pty_write(w, pty, data.to_bytes())
+}
+
+fn pty_resize_impl(handle : Ptr, cols : Int, rows : Int) -> Result[Unit, String] {
+  if cols <= 0 || rows <= 0 {
+    return Err("pty cols and rows must be > 0")
+  }
+  let err_buf = ptr_alloc(ERR_BUF_CAP.to_int64())
+  let rc = c_proc_pty_resize(handle, cols, rows, err_buf, ERR_BUF_CAP)
+  if rc == 0 {
+    ptr_free(err_buf)
+    Ok(())
+  } else {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    Err(msg)
+  }
+}
+
+pub fn pty_resize(w : World, pty : PtyChild, cols : Int, rows : Int) -> Result[Unit, String] {
+  let _ = w
+  pty_resize_impl(pty.handle, cols, rows)
+}
+
+pub fn pty_try_wait(w : World, pty : PtyChild) -> Result[Option[ExitStatus], String] {
+  let _ = w
+  wait_impl(pty.handle, 0)
+}
+
+pub fn pty_wait(w : World, pty : PtyChild) -> Result[ExitStatus, String] {
+  let _ = w
+  match wait_impl(pty.handle, 1) {
+    Ok(Some(st)) => Ok(st)
+    Ok(None) => Err("blocking pty wait returned no exit status")
+    Err(e) => Err(e)
+  }
+}
+
+pub fn pty_terminate_tree(w : World, pty : PtyChild) -> Result[Unit, String] {
+  let _ = w
+  signal_tree_impl(pty.handle, 0)
+}
+
+pub fn pty_kill_tree(w : World, pty : PtyChild) -> Result[Unit, String] {
+  let _ = w
+  signal_tree_impl(pty.handle, 1)
+}
+
+pub fn pty_close(w : World, pty : PtyChild) -> Unit {
+  let _ = w
+  c_proc_close(pty.handle)
+}

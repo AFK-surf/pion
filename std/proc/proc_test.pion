@@ -1,0 +1,421 @@
+///| std/proc unit & integration tests (POSIX + Windows).
+///| Multithreaded `scope` + `Channel` + `World` + ASan/LSan + fd-conservation tests
+///| run in `std/proc/e2e/run_e2e.sh`.
+
+fn is_windows() -> Bool {
+  c_proc_is_windows() != 0
+}
+
+fn drain_stdout_str(child : Child) -> String {
+  let sb = StringBuilder()
+  while true {
+    match read_stream_impl(child.handle, 0, 4096, -1) {
+      Ok(ReadChunk::Data(b)) => sb.write_string(b.to_string())
+      Ok(ReadChunk::Eof) => break
+      Ok(ReadChunk::Timeout) => ()
+      Err(e) => debug_assert(false, "child_read_stdout failed: " + e)
+    }
+  }
+  sb.to_string()
+}
+
+fn drain_stderr_str(child : Child) -> String {
+  let sb = StringBuilder()
+  while true {
+    match read_stream_impl(child.handle, 1, 4096, -1) {
+      Ok(ReadChunk::Data(b)) => sb.write_string(b.to_string())
+      Ok(ReadChunk::Eof) => break
+      Ok(ReadChunk::Timeout) => ()
+      Err(e) => debug_assert(false, "child_read_stderr failed: " + e)
+    }
+  }
+  sb.to_string()
+}
+
+fn drain_pty_str(pty : PtyChild) -> String {
+  let sb = StringBuilder()
+  while true {
+    match read_stream_impl(pty.handle, 0, 4096, -1) {
+      Ok(ReadChunk::Data(b)) => sb.write_string(b.to_string())
+      Ok(ReadChunk::Eof) => break
+      Ok(ReadChunk::Timeout) => ()
+      Err(e) => debug_assert(false, "pty_read failed: " + e)
+    }
+  }
+  sb.to_string()
+}
+
+test "spawn_options defaults and invalid argument validation" {
+  let opts = spawn_options()
+  debug_assert(opts.cwd == "", "default cwd empty")
+  debug_assert(!opts.clear_env, "default clear_env false")
+  debug_assert(opts.env_unset.length() == 0, "default env_unset empty")
+
+  match child_spawn_impl([], opts) {
+    Ok(_) => debug_assert(false, "empty argv must fail")
+    Err(e) => debug_assert(e.length() > 0, "empty argv error")
+  }
+  match child_spawn_impl(["/nonexistent/pion-proc-missing-bin-xyz"], opts) {
+    Ok(_) => debug_assert(false, "missing executable must fail")
+    Err(e) => debug_assert(e.length() > 0, "missing executable error")
+  }
+  let bad_cwd = SpawnOptions::{
+    cwd: "/nonexistent/pion-proc-missing-dir-xyz",
+    env_set: Map::new(),
+    env_unset: [],
+    clear_env: false,
+  }
+  let cmd = if is_windows() { ["cmd.exe", "/c", "echo", "hi"] } else { ["/bin/sh", "-c", "echo hi"] }
+  match child_spawn_impl(cmd, bad_cwd) {
+    Ok(_) => debug_assert(false, "missing cwd must fail")
+    Err(e) => debug_assert(e.length() > 0, "missing cwd error")
+  }
+  match pty_spawn_impl(cmd, 0, 24, opts) {
+    Ok(_) => debug_assert(false, "cols=0 must fail")
+    Err(e) => debug_assert(e.length() > 0, "cols=0 error")
+  }
+  match pty_spawn_impl(cmd, 80, -1, opts) {
+    Ok(_) => debug_assert(false, "rows=-1 must fail")
+    Err(e) => debug_assert(e.length() > 0, "rows=-1 error")
+  }
+}
+
+test "child_spawn separates stdout/stderr, pipes stdin/EOF, honors env/cwd, and try_wait/wait" {
+  let win = is_windows()
+
+  // 1. Separate stdout & stderr + non-zero exit code
+  let cmd1 = if win {
+    ["cmd.exe", "/c", "echo out_line & echo err_line 1>&2 & exit /b 7"]
+  } else {
+    ["/bin/sh", "-c", "printf 'out_line\n'; printf 'err_line\n' >&2; exit 7"]
+  }
+  let c1 = match child_spawn_impl(cmd1, spawn_options()) {
+    Ok(c) => c
+    Err(e) => {
+      debug_assert(false, "child_spawn cmd1 failed: " + e)
+      return
+    }
+  }
+  debug_assert(child_pid(c1) > 0, "pid > 0")
+  let out1 = drain_stdout_str(c1)
+  let err1 = drain_stderr_str(c1)
+  debug_assert(out1.contains("out_line"), "stdout: " + out1)
+  debug_assert(err1.contains("err_line"), "stderr: " + err1)
+  match wait_impl(c1.handle, 1) {
+    Ok(Some(ExitStatus::Exited(code))) => debug_assert(code == 7, "exit code 7")
+    Ok(Some(ExitStatus::Signaled(s))) => debug_assert(false, "unexpected signal: " + s.to_string())
+    Ok(None) => debug_assert(false, "blocking wait returned None")
+    Err(e) => debug_assert(false, "wait failed: " + e)
+  }
+  // Idempotent try_wait & double close
+  match wait_impl(c1.handle, 0) {
+    Ok(Some(ExitStatus::Exited(code))) => debug_assert(code == 7, "cached exit code 7")
+    _ => debug_assert(false, "expected cached Exited(7)")
+  }
+  c_proc_close(c1.handle)
+  c_proc_close(c1.handle)
+
+  // 2. Stdin write + close_stdin -> EOF
+  let cmd2 = if win {
+    ["cmd.exe", "/c", "findstr .*"]
+  } else {
+    ["/bin/sh", "-c", "cat"]
+  }
+  let c2 = match child_spawn_impl(cmd2, spawn_options()) {
+    Ok(c) => c
+    Err(e) => {
+      debug_assert(false, "child_spawn cat failed: " + e)
+      return
+    }
+  }
+  match write_stream_impl(c2.handle, "hello_stdin\n".to_bytes()) {
+    Ok(n) => debug_assert(n == 12, "wrote 12 bytes")
+    Err(e) => debug_assert(false, "write_stdin failed: " + e)
+  }
+  c_proc_close_stdin(c2.handle)
+  let out2 = drain_stdout_str(c2)
+  debug_assert(out2.contains("hello_stdin"), "echoed stdin: " + out2)
+  match wait_impl(c2.handle, 1) {
+    Ok(Some(ExitStatus::Exited(code))) => debug_assert(code == 0, "cat exit 0")
+    _ => debug_assert(false, "cat wait failed")
+  }
+  c_proc_close(c2.handle)
+
+  // 3. env_set / env_unset / clear_env / cwd
+  if !win {
+    let env_map : Map[String, String] = Map::new()
+    env_map.set("PION_PROC_TEST_A", "alpha_val")
+    let opts3 = SpawnOptions::{
+      cwd: "/tmp",
+      env_set: env_map,
+      env_unset: ["HOME"],
+      clear_env: false,
+    }
+    let c3 = match child_spawn_impl(["/bin/sh", "-c", "pwd; printf '%s|%s\n' \"$PION_PROC_TEST_A\" \"${HOME:-UNSET}\""], opts3) {
+      Ok(c) => c
+      Err(e) => {
+        debug_assert(false, "child_spawn env/cwd failed: " + e)
+        return
+      }
+    }
+    let out3 = drain_stdout_str(c3)
+    debug_assert(out3.contains("tmp"), "cwd /tmp: " + out3)
+    debug_assert(out3.contains("alpha_val|UNSET"), "env set/unset: " + out3)
+    let _ = wait_impl(c3.handle, 1)
+    c_proc_close(c3.handle)
+
+    let clean_map : Map[String, String] = Map::new()
+    clean_map.set("ONLY_ONE", "yes42")
+    let opts4 = SpawnOptions::{
+      cwd: "",
+      env_set: clean_map,
+      env_unset: [],
+      clear_env: true,
+    }
+    let c4 = match child_spawn_impl(["/bin/sh", "-c", "printf '%s|%s\n' \"$ONLY_ONE\" \"${HOME:-NOHOME}\""], opts4) {
+      Ok(c) => c
+      Err(e) => {
+        debug_assert(false, "child_spawn clear_env failed: " + e)
+        return
+      }
+    }
+    let out4 = drain_stdout_str(c4)
+    debug_assert(out4.contains("yes42|NOHOME"), "clear_env: " + out4)
+    let _ = wait_impl(c4.handle, 1)
+    c_proc_close(c4.handle)
+  } else {
+    let env_map : Map[String, String] = Map::new()
+    env_map.set("PION_PROC_TEST_A", "win_alpha_val")
+    let opts3 = SpawnOptions::{
+      cwd: "",
+      env_set: env_map,
+      env_unset: [],
+      clear_env: false,
+    }
+    let c3 = match child_spawn_impl(["cmd.exe", "/c", "echo %PION_PROC_TEST_A%"], opts3) {
+      Ok(c) => c
+      Err(e) => {
+        debug_assert(false, "win child_spawn env failed: " + e)
+        return
+      }
+    }
+    let out3 = drain_stdout_str(c3)
+    debug_assert(out3.contains("win_alpha_val"), "win env_set: " + out3)
+    let _ = wait_impl(c3.handle, 1)
+    c_proc_close(c3.handle)
+  }
+}
+
+test "read_stdout_timeout and kill_tree cleans up grandchild process group" {
+  if is_windows() {
+    let c = match child_spawn_impl(["cmd.exe", "/c", "ping -n 5 127.0.0.1 >nul"], spawn_options()) {
+      Ok(ch) => ch
+      Err(e) => {
+        debug_assert(false, "win child_spawn timeout failed: " + e)
+        return
+      }
+    }
+    match read_stream_impl(c.handle, 0, 4096, 80) {
+      Ok(ReadChunk::Timeout) => ()
+      Ok(ReadChunk::Data(_)) => ()
+      Ok(ReadChunk::Eof) => debug_assert(false, "win unexpected eof before kill")
+      Err(e) => debug_assert(false, "win timeout read error: " + e)
+    }
+    match signal_tree_impl(c.handle, 1) {
+      Ok(_) => ()
+      Err(e) => debug_assert(false, "win kill_tree failed: " + e)
+    }
+    let _ = wait_impl(c.handle, 1)
+    c_proc_close(c.handle)
+    return
+  }
+  // Spawn a shell that forks a 30s grandchild, prints "ready", then waits.
+  let c = match child_spawn_impl(["/bin/sh", "-c", "sleep 30 & echo ready; wait"], spawn_options()) {
+    Ok(ch) => ch
+    Err(e) => {
+      debug_assert(false, "child_spawn tree failed: " + e)
+      return
+    }
+  }
+  let mut got_ready = false
+  let mut tries = 0
+  while !got_ready && tries < 40 {
+    match read_stream_impl(c.handle, 0, 4096, 100) {
+      Ok(ReadChunk::Data(b)) => {
+        if b.to_string().contains("ready") {
+          got_ready = true
+        }
+      }
+      Ok(ReadChunk::Timeout) => ()
+      _ => break
+    }
+    tries = tries + 1
+  }
+  debug_assert(got_ready, "expected ready line")
+
+  match wait_impl(c.handle, 0) {
+    Ok(None) => ()
+    _ => debug_assert(false, "child should still be running")
+  }
+  match read_stream_impl(c.handle, 0, 4096, 80) {
+    Ok(ReadChunk::Timeout) => ()
+    Ok(ReadChunk::Data(b)) => debug_assert(false, "unexpected data: " + b.to_string())
+    Ok(ReadChunk::Eof) => debug_assert(false, "unexpected eof before kill")
+    Err(e) => debug_assert(false, "timeout read error: " + e)
+  }
+
+  match signal_tree_impl(c.handle, 1) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "kill_tree failed: " + e)
+  }
+  match wait_impl(c.handle, 1) {
+    Ok(Some(ExitStatus::Signaled(sig))) => debug_assert(sig == 9, "expected SIGKILL(9), got " + sig.to_string())
+    Ok(Some(ExitStatus::Exited(code))) => debug_assert(false, "expected Signaled(9), got Exited(" + code.to_string() + ")")
+    Ok(None) => debug_assert(false, "blocking wait returned None")
+    Err(e) => debug_assert(false, "wait after kill_tree failed: " + e)
+  }
+  // Grandchild also died -> stdout pipe has no writers left -> immediate EOF
+  match read_stream_impl(c.handle, 0, 4096, 200) {
+    Ok(ReadChunk::Eof) => ()
+    Ok(ReadChunk::Timeout) => debug_assert(false, "grandchild kept stdout pipe open!")
+    Ok(ReadChunk::Data(_)) => ()
+    Err(e) => debug_assert(false, "post-kill read error: " + e)
+  }
+  c_proc_close(c.handle)
+}
+
+test "real PTY: tty check, stty size + pty_resize, interactive echo, clean EOF, pty_kill_tree" {
+  if is_windows() {
+    let p = match pty_spawn_impl(["cmd.exe", "/c", "echo", "conpty_ok"], 80, 24, spawn_options()) {
+      Ok(pc) => pc
+      Err(e) => {
+        debug_assert(false, "conpty spawn failed: " + e)
+        return
+      }
+    }
+    let sb = StringBuilder()
+    let mut saw_ok = false
+    let mut tries = 0
+    while !saw_ok && tries < 50 {
+      match read_stream_impl(p.handle, 0, 4096, 100) {
+        Ok(ReadChunk::Data(b)) => {
+          sb.write_string(b.to_string())
+          if sb.to_string().contains("conpty_ok") {
+            saw_ok = true
+          }
+        }
+        Ok(ReadChunk::Eof) => break
+        Ok(ReadChunk::Timeout) => {
+          match wait_impl(p.handle, 0) {
+            Ok(Some(_)) => {
+              match read_stream_impl(p.handle, 0, 4096, 50) {
+                Ok(ReadChunk::Data(b)) => {
+                  sb.write_string(b.to_string())
+                  if sb.to_string().contains("conpty_ok") {
+                    saw_ok = true
+                  }
+                }
+                _ => break
+              }
+            }
+            _ => ()
+          }
+        }
+        Err(e) => {
+          debug_assert(false, "conpty read failed: " + e)
+          break
+        }
+      }
+      tries = tries + 1
+    }
+    debug_assert(saw_ok, "conpty out: " + sb.to_string())
+    let _ = pty_resize_impl(p.handle, 100, 30)
+    let _ = wait_impl(p.handle, 1)
+    c_proc_close(p.handle)
+    return
+  }
+
+  let script = "tty; stty size; read line; echo \"GOT:$line\"; stty size"
+  let p = match pty_spawn_impl(["/bin/sh", "-c", script], 100, 30, spawn_options()) {
+    Ok(pc) => pc
+    Err(e) => {
+      debug_assert(false, "pty_spawn failed: " + e)
+      return
+    }
+  }
+  debug_assert(pty_pid(p) > 0, "pty pid > 0")
+
+  let sb = StringBuilder()
+  let mut saw_init = false
+  let mut tries = 0
+  while !saw_init && tries < 40 {
+    match read_stream_impl(p.handle, 0, 4096, 100) {
+      Ok(ReadChunk::Data(b)) => {
+        sb.write_string(b.to_string())
+        if sb.to_string().contains("30 100") {
+          saw_init = true
+        }
+      }
+      Ok(ReadChunk::Timeout) => ()
+      _ => break
+    }
+    tries = tries + 1
+  }
+  debug_assert(saw_init, "expected initial stty size 30 100, got: " + sb.to_string())
+
+  match pty_resize_impl(p.handle, 120, 40) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "pty_resize failed: " + e)
+  }
+  match write_stream_impl(p.handle, "hello_pty\n".to_bytes()) {
+    Ok(n) => debug_assert(n == 10, "pty_write_str 10 bytes")
+    Err(e) => debug_assert(false, "pty_write_str failed: " + e)
+  }
+
+  // Drain until clean EOF (Linux EIO must be mapped to Eof, not Err)
+  sb.write_string(drain_pty_str(p))
+  let full = sb.to_string()
+  debug_assert(full.contains("/dev/"), "tty device: " + full)
+  debug_assert(full.contains("GOT:hello_pty"), "pty echo: " + full)
+  debug_assert(full.contains("40 120"), "resized stty size 40 120: " + full)
+
+  match wait_impl(p.handle, 1) {
+    Ok(Some(ExitStatus::Exited(code))) => debug_assert(code == 0, "pty exit 0")
+    _ => debug_assert(false, "pty wait failed")
+  }
+  c_proc_close(p.handle)
+  c_proc_close(p.handle)
+
+  // pty_kill_tree on interactive sleeping shell
+  let p2 = match pty_spawn_impl(["/bin/sh", "-c", "sleep 30 & echo pty_ready; wait"], 80, 24, spawn_options()) {
+    Ok(pc) => pc
+    Err(e) => {
+      debug_assert(false, "pty_spawn p2 failed: " + e)
+      return
+    }
+  }
+  let mut ready2 = false
+  let mut t2 = 0
+  while !ready2 && t2 < 40 {
+    match read_stream_impl(p2.handle, 0, 4096, 100) {
+      Ok(ReadChunk::Data(b)) => {
+        if b.to_string().contains("pty_ready") {
+          ready2 = true
+        }
+      }
+      Ok(ReadChunk::Timeout) => ()
+      _ => break
+    }
+    t2 = t2 + 1
+  }
+  debug_assert(ready2, "expected pty_ready")
+  match signal_tree_impl(p2.handle, 1) {
+    Ok(_) => ()
+    Err(e) => debug_assert(false, "pty_kill_tree failed: " + e)
+  }
+  match wait_impl(p2.handle, 1) {
+    Ok(Some(ExitStatus::Signaled(sig))) => debug_assert(sig == 9, "pty SIGKILL(9)")
+    _ => debug_assert(false, "pty expected Signaled(9)")
+  }
+  c_proc_close(p2.handle)
+}
