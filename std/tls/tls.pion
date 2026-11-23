@@ -1,93 +1,91 @@
-///| std/tls: TLS 1.2 / 1.3 client and server in pure Pion, `extern "C"` straight into the
-///| system OpenSSL (libssl + libcrypto, stable 1.1.x / 3.x C ABI), zero C glue.
+///| std/tls: system-native TLS 1.2 / 1.3 client and server across Linux, macOS
+///| and Windows, with zero OpenSSL dependency on macOS and Windows.
 ///|
-///| System libraries (linked with `-lssl -lcrypto` from `pion.toml`):
-///|   - Linux: OpenSSL 3 runtime `libssl.so.3` / `libcrypto.so.3` plus the
-///|     `libssl.so` / `libcrypto.so` link names (Debian/Ubuntu `libssl-dev`;
-///|     headers are not needed). Verified on Debian x86_64 with OpenSSL 3.5.
-///|   - macOS: the SDK ships no linkable libssl (the system LibreSSL is
-///|     private); install Homebrew `openssl@3` and build with
-///|     `CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib` (`CC` makes pionc
-///|     link through `cc`, which honours `LIBRARY_PATH`; its default direct
-///|     `ld` call does not).
-///| Certificate verification uses OpenSSL's default CA store
-///| (`SSL_CTX_set_default_verify_paths`, which honours `SSL_CERT_FILE` /
-///| `SSL_CERT_DIR`) and checks the host name (or IP address) against the
-///| certificate. TLS 1.2 is the minimum protocol version.
+///| Platform backends (selected via `[link.linux]` / `[link.macos]` /
+///| `[link.windows]` in `std/tls/pion.toml`, zero bytes added to `libpionrt.a`):
+///|   - macOS: Apple `Network.framework` + `Security.framework` +
+///|     `CoreFoundation` (TLS 1.2/1.3, system Keychain trust store, in-memory
+///|     `SecIdentityCreate` for server mode with zero Keychain writes).
+///|   - Windows: Windows `Schannel` (`secur32` + `crypt32` + `ws2_32`, TLS
+///|     1.2/1.3, Windows root certificate store, `SSL_CERT_FILE` exclusive root
+///|     engine for tests/custom CAs).
+///|   - Linux: system OpenSSL (`libssl` + `libcrypto`, TLS 1.2/1.3, default
+///|     verify paths honouring `SSL_CERT_FILE` / `SSL_CERT_DIR`).
 ///|
-///| Server side: `tls_listen` loads a PEM certificate chain and private key into
-///| one shared `SSL_CTX` (`TLS_server_method`), `tls_accept` completes the
-///| handshake of each accepted TCP connection on it, and the returned `TlsConn`
-///| speaks through the same `tls_read` / `tls_write` / `tls_close` as a client
-///| connection. Server connections borrow the listener's context (they never
-///| free it); `tls_listener_close` frees it once.
+///| Certificate verification checks the host name (or IP address) against the
+///| certificate and enforces TLS 1.2 minimum. `tls_connect` supports full DNS
+///| resolution (IPv4/IPv6); `tls_wrap_fd` upgrades an already-connected TCP
+///| socket (e.g. after HTTP CONNECT or SOCKS5 proxy negotiation) in place.
 
 import "http"
 
-extern "C" fn ossl_version_text(t : Int) -> Ptr = "OpenSSL_version"
-extern "C" fn ossl_tls_client_method() -> Ptr = "TLS_client_method"
-extern "C" fn ossl_ctx_new(method : Ptr) -> Ptr = "SSL_CTX_new"
-extern "C" fn ossl_ctx_free(ctx : Ptr) -> Unit = "SSL_CTX_free"
-extern "C" fn ossl_ctx_set_default_verify_paths(ctx : Ptr) -> Int = "SSL_CTX_set_default_verify_paths"
-extern "C" fn ossl_ctx_set_verify(ctx : Ptr, mode : Int, callback : Ptr) -> Unit = "SSL_CTX_set_verify"
-extern "C" fn ossl_ctx_ctrl(ctx : Ptr, cmd : Int, larg : Int64, parg : Ptr) -> Int64 = "SSL_CTX_ctrl"
-extern "C" fn ossl_new(ctx : Ptr) -> Ptr = "SSL_new"
-extern "C" fn ossl_free(ssl : Ptr) -> Unit = "SSL_free"
-extern "C" fn ossl_set_fd(ssl : Ptr, fd : Int) -> Int = "SSL_set_fd"
-extern "C" fn ossl_ctrl(ssl : Ptr, cmd : Int, larg : Int64, parg : Ptr) -> Int64 = "SSL_ctrl"
-extern "C" fn ossl_set1_host(ssl : Ptr, host : Ptr) -> Int = "SSL_set1_host"
-extern "C" fn ossl_get0_param(ssl : Ptr) -> Ptr = "SSL_get0_param"
-extern "C" fn ossl_param_set1_ip_asc(param : Ptr, ip : Ptr) -> Int = "X509_VERIFY_PARAM_set1_ip_asc"
-extern "C" fn ossl_connect(ssl : Ptr) -> Int = "SSL_connect"
-extern "C" fn ossl_read(ssl : Ptr, buf : Ptr, num : Int) -> Int = "SSL_read"
-extern "C" fn ossl_write(ssl : Ptr, buf : Ptr, num : Int) -> Int = "SSL_write"
-extern "C" fn ossl_shutdown(ssl : Ptr) -> Int = "SSL_shutdown"
-extern "C" fn ossl_get_error(ssl : Ptr, ret : Int) -> Int = "SSL_get_error"
-extern "C" fn ossl_get_version(ssl : Ptr) -> Ptr = "SSL_get_version"
-extern "C" fn ossl_get_current_cipher(ssl : Ptr) -> Ptr = "SSL_get_current_cipher"
-extern "C" fn ossl_cipher_get_name(cipher : Ptr) -> Ptr = "SSL_CIPHER_get_name"
-extern "C" fn ossl_get_verify_result(ssl : Ptr) -> Int64 = "SSL_get_verify_result"
-extern "C" fn ossl_verify_error_text(n : Int64) -> Ptr = "X509_verify_cert_error_string"
-extern "C" fn ossl_err_get_error() -> Int64 = "ERR_get_error"
-extern "C" fn ossl_err_error_string_n(e : Int64, buf : Ptr, len : Int64) -> Unit = "ERR_error_string_n"
-extern "C" fn ossl_tls_server_method() -> Ptr = "TLS_server_method"
-extern "C" fn ossl_ctx_use_certificate_chain_file(ctx : Ptr, file : Ptr) -> Int = "SSL_CTX_use_certificate_chain_file"
-extern "C" fn ossl_ctx_use_private_key_file(ctx : Ptr, file : Ptr, kind : Int) -> Int = "SSL_CTX_use_PrivateKey_file"
-extern "C" fn ossl_ctx_check_private_key(ctx : Ptr) -> Int = "SSL_CTX_check_private_key"
-extern "C" fn ossl_accept(ssl : Ptr) -> Int = "SSL_accept"
-extern "C" fn ossl_get_servername(ssl : Ptr, kind : Int) -> Ptr = "SSL_get_servername"
-
-let SSL_VERIFY_NONE : Int = 0
-let SSL_VERIFY_PEER : Int = 1
-let SSL_CTRL_SET_TLSEXT_HOSTNAME : Int = 55
-let TLSEXT_NAMETYPE_HOST_NAME : Int64 = 0L
-let SSL_CTRL_SET_MIN_PROTO_VERSION : Int = 123
-let TLS1_2_VERSION : Int64 = 771L
-let SSL_FILETYPE_PEM : Int = 1
+extern "C" fn c_tls_version() -> Ptr = "pion_tls_version"
+extern "C" fn c_tls_connect(
+  host : Ptr,
+  port : Int,
+  verify_cert : Int,
+  out_fd : Ptr,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Ptr = "pion_tls_connect"
+extern "C" fn c_tls_wrap_fd(
+  fd : Int,
+  host : Ptr,
+  verify_cert : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Ptr = "pion_tls_wrap_fd"
+extern "C" fn c_tls_protocol(h : Ptr, buf : Ptr, cap : Int) -> Int = "pion_tls_protocol"
+extern "C" fn c_tls_cipher(h : Ptr, buf : Ptr, cap : Int) -> Int = "pion_tls_cipher"
+extern "C" fn c_tls_write(
+  h : Ptr,
+  data : Ptr,
+  len : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Int = "pion_tls_write"
+extern "C" fn c_tls_read(h : Ptr, buf : Ptr, max_bytes : Int) -> Int = "pion_tls_read"
+extern "C" fn c_tls_close(h : Ptr) -> Unit = "pion_tls_close"
+extern "C" fn c_tls_listen(
+  host : Ptr,
+  port : Int,
+  cert_pem : Ptr,
+  key_pem : Ptr,
+  out_fd : Ptr,
+  out_port : Ptr,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Ptr = "pion_tls_listen"
+extern "C" fn c_tls_accept(
+  lh : Ptr,
+  out_fd : Ptr,
+  sni_buf : Ptr,
+  sni_cap : Int,
+  err_buf : Ptr,
+  err_cap : Int,
+) -> Ptr = "pion_tls_accept"
+extern "C" fn c_tls_listener_close(lh : Ptr) -> Unit = "pion_tls_listener_close"
 
 /// An established TLS session over a TCP socket. `host` is the name a client
 /// connected to, or on the server side the SNI name the client sent (`""` when
 /// it sent none, e.g. for an IP literal).
 pub struct TlsConn {
-  ssl : Ptr
-  ctx : Ptr
+  handle : Ptr
   pub fd : Int
   pub host : String
-  owns_ctx : Bool
 }
 
-/// A listening TLS server socket: one `SSL_CTX` holding the certificate chain
-/// and private key, shared by every connection `tls_accept` returns. `port` is
-/// the bound port (the ephemeral one when `tls_listen` was given 0).
+/// A listening TLS server socket. `port` is the bound port (the ephemeral one
+/// when `tls_listen` was given 0).
 pub struct TlsListener {
-  ctx : Ptr
+  handle : Ptr
   pub fd : Int
   pub port : Int
 }
 
-/// Version text of the linked library, e.g. `OpenSSL 3.5.7 9 Jun 2026`.
+/// Version text of the active platform TLS backend.
 pub fn tls_version() -> String {
-  cstr_to_str(ossl_version_text(0))
+  cstr_to_str(c_tls_version())
 }
 
 /// True for a dotted IPv4 literal such as `127.0.0.1` (no SNI is sent for it,
@@ -124,159 +122,181 @@ pub fn is_ipv4_literal(host : String) -> Bool {
   true
 }
 
-/// Drains OpenSSL's thread-local error queue into one `; `-separated line.
-fn openssl_errors() -> String {
-  let buf = ptr_alloc(256L)
-  let parts : Array[String] = []
-  while true {
-    let e = ossl_err_get_error()
-    if e == 0L {
-      break
-    }
-    ossl_err_error_string_n(e, buf, 256L)
-    parts.push(cstr_to_str(buf))
+/// Connects to `host:port` over TCP (full DNS + IPv4/IPv6 resolution) and
+/// completes a TLS 1.2/1.3 handshake with SNI. With `verify_cert` the peer
+/// chain must verify against the system CA store (or `SSL_CERT_FILE`) and match
+/// `host`; without it any certificate is accepted.
+pub fn tls_connect(
+  w : World,
+  host : String,
+  port : Int,
+  verify_cert : Bool,
+) -> Result[TlsConn, String] {
+  let _ = w
+  let out_fd = ptr_alloc(8L)
+  ptr_write_i32(out_fd, 0L, -1)
+  let err_buf = ptr_alloc(512L)
+  ptr_write_i32(err_buf, 0L, 0)
+  let vflag = if verify_cert { 1 } else { 0 }
+  let h = c_tls_connect(host.as_cstr(), port, vflag, out_fd, err_buf, 512)
+  let fd = ptr_read_i32(out_fd, 0L)
+  ptr_free(out_fd)
+  if ptr_is_null(h) {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(
+      if msg.length() > 0 {
+        msg
+      } else {
+        "TLS handshake with " + host + ":" + port.to_string() + " failed"
+      },
+    )
   }
-  ptr_free(buf)
-  parts.join("; ")
+  ptr_free(err_buf)
+  Ok(TlsConn::{ handle: h, fd: fd, host: host })
 }
 
-fn fail_text(what : String, ssl : Ptr, rc : Int) -> String {
-  let code = ossl_get_error(ssl, rc)
-  let errs = openssl_errors()
-  let mut msg = what + " failed (rc=" + rc.to_string() + ", ssl_error=" + code.to_string() + ")"
-  if errs.length() > 0 {
-    msg = msg + ": " + errs
+/// Upgrades an already-connected TCP socket `fd` (for example after an HTTP
+/// `CONNECT` or `SOCKS5` proxy handshake) to client-side TLS 1.2/1.3 with SNI
+/// set to `host` and optional certificate/hostname verification.
+///
+/// Ownership contract:
+/// - On `Ok(conn)`, `TlsConn` takes ownership of `fd` and closes it in
+///   `tls_close(w, conn)`.
+/// - On `Err(msg)`, `fd` is NOT closed; the caller retains ownership and is
+///   responsible for closing it.
+pub fn tls_wrap_fd(
+  w : World,
+  fd : Int,
+  host : String,
+  verify_cert : Bool,
+) -> Result[TlsConn, String] {
+  let _ = w
+  let err_buf = ptr_alloc(512L)
+  ptr_write_i32(err_buf, 0L, 0)
+  let vflag = if verify_cert { 1 } else { 0 }
+  let h = c_tls_wrap_fd(fd, host.as_cstr(), vflag, err_buf, 512)
+  if ptr_is_null(h) {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(
+      if msg.length() > 0 {
+        msg
+      } else {
+        "TLS handshake with " + host + " failed"
+      },
+    )
   }
-  msg
-}
-
-/// Connects to `host:port` over TCP (`tcp_connect`) and completes a TLS 1.2+
-/// handshake with SNI. With `verify_cert` the peer chain must verify against the
-/// default CA store and match `host`; without it any certificate is accepted.
-pub fn tls_connect(w : World, host : String, port : Int, verify_cert : Bool) -> Result[TlsConn, String] {
-  let fd = tcp_connect(w, host, port)
-  if fd < 0 {
-    return Err("connect to " + host + ":" + port.to_string() + " failed")
-  }
-  let ctx = ossl_ctx_new(ossl_tls_client_method())
-  if ptr_is_null(ctx) {
-    tcp_close(w, fd)
-    return Err("SSL_CTX_new failed: " + openssl_errors())
-  }
-  let _ = ossl_ctx_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, ptr_null())
-  if verify_cert {
-    if ossl_ctx_set_default_verify_paths(ctx) != 1 {
-      ossl_ctx_free(ctx)
-      tcp_close(w, fd)
-      return Err("loading the default CA store failed: " + openssl_errors())
-    }
-    ossl_ctx_set_verify(ctx, SSL_VERIFY_PEER, ptr_null())
-  } else {
-    ossl_ctx_set_verify(ctx, SSL_VERIFY_NONE, ptr_null())
-  }
-  let ssl = ossl_new(ctx)
-  if ptr_is_null(ssl) {
-    ossl_ctx_free(ctx)
-    tcp_close(w, fd)
-    return Err("SSL_new failed: " + openssl_errors())
-  }
-  let ip = is_ipv4_literal(host)
-  let mut setup = ossl_set_fd(ssl, fd) == 1
-  if setup && !ip {
-    setup = ossl_ctrl(ssl, SSL_CTRL_SET_TLSEXT_HOSTNAME, TLSEXT_NAMETYPE_HOST_NAME, host.as_cstr()) == 1L
-  }
-  if setup && verify_cert {
-    setup = if ip {
-      ossl_param_set1_ip_asc(ossl_get0_param(ssl), host.as_cstr()) == 1
-    } else {
-      ossl_set1_host(ssl, host.as_cstr()) == 1
-    }
-  }
-  if !setup {
-    let msg = "TLS session setup for " + host + " failed: " + openssl_errors()
-    ossl_free(ssl)
-    ossl_ctx_free(ctx)
-    tcp_close(w, fd)
-    return Err(msg)
-  }
-  let rc = ossl_connect(ssl)
-  if rc != 1 {
-    let mut msg = fail_text("TLS handshake with " + host + ":" + port.to_string(), ssl, rc)
-    let vr = ossl_get_verify_result(ssl)
-    if verify_cert && vr != 0L {
-      msg = msg + " (certificate verify error " + vr.to_string() + ": " +
-      cstr_to_str(ossl_verify_error_text(vr)) + ")"
-    }
-    ossl_free(ssl)
-    ossl_ctx_free(ctx)
-    tcp_close(w, fd)
-    return Err(msg)
-  }
-  Ok(TlsConn::{ ssl: ssl, ctx: ctx, fd: fd, host: host, owns_ctx: true })
+  ptr_free(err_buf)
+  Ok(TlsConn::{ handle: h, fd: fd, host: host })
 }
 
 /// Negotiated protocol, e.g. `TLSv1.3` or `TLSv1.2`.
 pub fn tls_protocol(conn : TlsConn) -> String {
-  cstr_to_str(ossl_get_version(conn.ssl))
+  if ptr_is_null(conn.handle) {
+    return ""
+  }
+  let buf = ptr_alloc(64L)
+  ptr_write_i32(buf, 0L, 0)
+  let n = c_tls_protocol(conn.handle, buf, 64)
+  let s = if n > 0 { cstr_to_str(buf) } else { "" }
+  ptr_free(buf)
+  s
 }
 
 /// Negotiated cipher suite, e.g. `TLS_AES_256_GCM_SHA384`.
 pub fn tls_cipher(conn : TlsConn) -> String {
-  let c = ossl_get_current_cipher(conn.ssl)
-  if ptr_is_null(c) {
-    ""
-  } else {
-    cstr_to_str(ossl_cipher_get_name(c))
+  if ptr_is_null(conn.handle) {
+    return ""
   }
+  let buf = ptr_alloc(128L)
+  ptr_write_i32(buf, 0L, 0)
+  let n = c_tls_cipher(conn.handle, buf, 128)
+  let s = if n > 0 { cstr_to_str(buf) } else { "" }
+  ptr_free(buf)
+  s
 }
 
-/// Sends every byte of `data`; the number of bytes written.
+/// Sends every byte of `data`; returns the number of bytes written.
 pub fn tls_write(w : World, conn : TlsConn, data : String) -> Result[Int, String] {
   let _ = w
   let n = data.length()
   if n == 0 {
     return Ok(0)
   }
-  let rc = ossl_write(conn.ssl, data.as_cstr(), n)
-  if rc != n {
-    return Err(fail_text("SSL_write", conn.ssl, rc))
+  if ptr_is_null(conn.handle) {
+    return Err("TLS write on closed connection")
   }
+  let err_buf = ptr_alloc(512L)
+  ptr_write_i32(err_buf, 0L, 0)
+  let rc = c_tls_write(conn.handle, data.as_cstr(), n, err_buf, 512)
+  if rc != n {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(if msg.length() > 0 { msg } else { "TLS write failed" })
+  }
+  ptr_free(err_buf)
   Ok(n)
 }
 
-/// Reads up to `max_bytes` decrypted bytes; `""` at end of stream or on error.
-pub fn tls_read(w : World, conn : TlsConn, max_bytes : Int) -> String {
+/// Sends every byte of `data` (binary-safe); returns the number of bytes written.
+pub fn tls_write_bytes(w : World, conn : TlsConn, data : Bytes) -> Result[Int, String] {
   let _ = w
-  if max_bytes <= 0 {
-    return ""
+  let n = data.length()
+  if n == 0 {
+    return Ok(0)
   }
-  let buf = ptr_alloc((max_bytes + 8).to_int64())
-  let n = ossl_read(conn.ssl, buf, max_bytes)
-  if n <= 0 {
-    ptr_free(buf)
-    let _ = openssl_errors()
-    return ""
+  if ptr_is_null(conn.handle) {
+    return Err("TLS write on closed connection")
   }
-  let out = Bytes::new(n)
-  let mut i = 0
-  while i < n {
-    out[i] = (ptr_read_i32(buf, i.to_int64()) & 255).to_byte()
-    i = i + 1
-  }
+  let buf = ptr_alloc(n.to_int64())
+  bytes_copy_to_ptr(data, 0, buf, n)
+  let err_buf = ptr_alloc(512L)
+  ptr_write_i32(err_buf, 0L, 0)
+  let rc = c_tls_write(conn.handle, buf, n, err_buf, 512)
   ptr_free(buf)
-  out.to_string()
+  if rc != n {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(if msg.length() > 0 { msg } else { "TLS write failed" })
+  }
+  ptr_free(err_buf)
+  Ok(n)
 }
 
-/// Sends `close_notify`, frees the session and closes the socket. A client
-/// connection frees its own context; a server connection leaves the listener's.
-pub fn tls_close(w : World, conn : TlsConn) -> Unit {
-  let _ = ossl_shutdown(conn.ssl)
-  ossl_free(conn.ssl)
-  if conn.owns_ctx {
-    ossl_ctx_free(conn.ctx)
+/// Reads up to `max_bytes` decrypted bytes; returns an empty `Bytes` on EOF or error.
+pub fn tls_read_bytes(w : World, conn : TlsConn, max_bytes : Int) -> Bytes {
+  let _ = w
+  if max_bytes <= 0 || ptr_is_null(conn.handle) {
+    return Bytes::new(0)
   }
-  let _ = openssl_errors()
-  tcp_close(w, conn.fd)
+  let buf = ptr_alloc((max_bytes + 8).to_int64())
+  let n = c_tls_read(conn.handle, buf, max_bytes)
+  if n <= 0 {
+    ptr_free(buf)
+    return Bytes::new(0)
+  }
+  let out = bytes_from_ptr(buf, n)
+  ptr_free(buf)
+  out
+}
+
+/// Reads up to `max_bytes` decrypted bytes as a `String`; `""` at end of stream or on error.
+pub fn tls_read(w : World, conn : TlsConn, max_bytes : Int) -> String {
+  let b = tls_read_bytes(w, conn, max_bytes)
+  if b.length() == 0 {
+    ""
+  } else {
+    b.to_string()
+  }
+}
+
+/// Closes the TLS session and underlying socket.
+pub fn tls_close(w : World, conn : TlsConn) -> Unit {
+  let _ = w
+  if !ptr_is_null(conn.handle) {
+    c_tls_close(conn.handle)
+  }
 }
 
 /// Blocking HTTPS/1.1 call (`std/http` framing over `tls_connect`): send one
@@ -339,36 +359,9 @@ fn check_listen_args(port : Int, cert_pem : String, key_pem : String) -> Result[
   Ok(())
 }
 
-/// A TLS 1.2+ server context holding the PEM certificate chain (leaf first)
-/// and the matching PEM private key; on failure nothing is left allocated.
-fn server_ctx_new(cert_pem : String, key_pem : String) -> Result[Ptr, String] {
-  let _ = openssl_errors()
-  let ctx = ossl_ctx_new(ossl_tls_server_method())
-  if ptr_is_null(ctx) {
-    return Err("SSL_CTX_new failed: " + openssl_errors())
-  }
-  let _ = ossl_ctx_ctrl(ctx, SSL_CTRL_SET_MIN_PROTO_VERSION, TLS1_2_VERSION, ptr_null())
-  if ossl_ctx_use_certificate_chain_file(ctx, cert_pem.as_cstr()) != 1 {
-    let msg = "loading certificate chain `" + cert_pem + "` failed: " + openssl_errors()
-    ossl_ctx_free(ctx)
-    return Err(msg)
-  }
-  if ossl_ctx_use_private_key_file(ctx, key_pem.as_cstr(), SSL_FILETYPE_PEM) != 1 {
-    let msg = "loading private key `" + key_pem + "` failed: " + openssl_errors()
-    ossl_ctx_free(ctx)
-    return Err(msg)
-  }
-  if ossl_ctx_check_private_key(ctx) != 1 {
-    let msg = "private key `" + key_pem + "` does not match certificate `" + cert_pem + "`: " + openssl_errors()
-    ossl_ctx_free(ctx)
-    return Err(msg)
-  }
-  Ok(ctx)
-}
-
-/// Listens on `host:port` (`tcp_listen`: `""` = any address, port 0 =
-/// ephemeral) as a TLS 1.2+ server presenting the PEM certificate chain
-/// `cert_pem` with the PEM private key `key_pem`.
+/// Listens on `host:port` (`""` = any address, port 0 = ephemeral) as a TLS
+/// 1.2/1.3 server presenting the PEM certificate chain `cert_pem` with the PEM
+/// private key `key_pem`.
 pub fn tls_listen(
   w : World,
   host : String,
@@ -376,14 +369,41 @@ pub fn tls_listen(
   cert_pem : String,
   key_pem : String,
 ) -> Result[TlsListener, String] {
+  let _ = w
   check_listen_args(port, cert_pem, key_pem)?
-  let ctx = server_ctx_new(cert_pem, key_pem)?
-  let fd = tcp_listen(w, host, port)
-  if fd < 0 {
-    ossl_ctx_free(ctx)
-    return Err("listen on " + host + ":" + port.to_string() + " failed")
+  let out_fd = ptr_alloc(8L)
+  let out_port = ptr_alloc(8L)
+  ptr_write_i32(out_fd, 0L, -1)
+  ptr_write_i32(out_port, 0L, 0)
+  let err_buf = ptr_alloc(512L)
+  ptr_write_i32(err_buf, 0L, 0)
+  let lh = c_tls_listen(
+    host.as_cstr(),
+    port,
+    cert_pem.as_cstr(),
+    key_pem.as_cstr(),
+    out_fd,
+    out_port,
+    err_buf,
+    512,
+  )
+  let fd = ptr_read_i32(out_fd, 0L)
+  let bound_port = ptr_read_i32(out_port, 0L)
+  ptr_free(out_fd)
+  ptr_free(out_port)
+  if ptr_is_null(lh) {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(err_buf)
+    return Err(
+      if msg.length() > 0 {
+        msg
+      } else {
+        "listen on " + host + ":" + port.to_string() + " failed"
+      },
+    )
   }
-  Ok(TlsListener::{ ctx: ctx, fd: fd, port: tcp_local_port(w, fd) })
+  ptr_free(err_buf)
+  Ok(TlsListener::{ handle: lh, fd: fd, port: bound_port })
 }
 
 /// Accepts the next TCP connection and completes its server-side TLS
@@ -391,39 +411,37 @@ pub fn tls_listen(
 /// non-TLS peer) closes that connection and returns `Err`; the listener stays
 /// usable. Only a failing `accept` itself starts its message with `accept`.
 pub fn tls_accept(w : World, listener : TlsListener) -> Result[TlsConn, String] {
-  let fd = tcp_accept(w, listener.fd)
-  if fd < 0 {
-    return Err("accept on listener fd " + listener.fd.to_string() + " failed")
+  let _ = w
+  if ptr_is_null(listener.handle) {
+    return Err("accept on closed listener")
   }
-  let ssl = ossl_new(listener.ctx)
-  if ptr_is_null(ssl) {
-    tcp_close(w, fd)
-    return Err("SSL_new failed: " + openssl_errors())
+  let out_fd = ptr_alloc(8L)
+  ptr_write_i32(out_fd, 0L, -1)
+  let sni_buf = ptr_alloc(256L)
+  ptr_write_i32(sni_buf, 0L, 0)
+  let err_buf = ptr_alloc(512L)
+  ptr_write_i32(err_buf, 0L, 0)
+  let h = c_tls_accept(listener.handle, out_fd, sni_buf, 256, err_buf, 512)
+  let fd = ptr_read_i32(out_fd, 0L)
+  ptr_free(out_fd)
+  if ptr_is_null(h) {
+    let msg = cstr_to_str(err_buf)
+    ptr_free(sni_buf)
+    ptr_free(err_buf)
+    return Err(if msg.length() > 0 { msg } else { "TLS server handshake failed" })
   }
-  if ossl_set_fd(ssl, fd) != 1 {
-    let msg = "SSL_set_fd failed: " + openssl_errors()
-    ossl_free(ssl)
-    tcp_close(w, fd)
-    return Err(msg)
-  }
-  let rc = ossl_accept(ssl)
-  if rc != 1 {
-    let msg = fail_text("TLS server handshake", ssl, rc)
-    ossl_free(ssl)
-    tcp_close(w, fd)
-    return Err(msg)
-  }
-  let sni = ossl_get_servername(ssl, 0)
-  let host = if ptr_is_null(sni) { "" } else { cstr_to_str(sni) }
-  Ok(TlsConn::{ ssl: ssl, ctx: listener.ctx, fd: fd, host: host, owns_ctx: false })
+  let host = cstr_to_str(sni_buf)
+  ptr_free(sni_buf)
+  ptr_free(err_buf)
+  Ok(TlsConn::{ handle: h, fd: fd, host: host })
 }
 
-/// Frees the listener's context and closes its socket. Connections accepted
-/// from it may outlive it: each session holds its own reference.
+/// Closes the TLS listener and releases its resources.
 pub fn tls_listener_close(w : World, listener : TlsListener) -> Unit {
-  ossl_ctx_free(listener.ctx)
-  let _ = openssl_errors()
-  tcp_close(w, listener.fd)
+  let _ = w
+  if !ptr_is_null(listener.handle) {
+    c_tls_listener_close(listener.handle)
+  }
 }
 
 /// Reads one HTTP/1.x request (head plus `content-length` or chunked body, at
@@ -452,8 +470,8 @@ pub fn tls_read_http_request(w : World, conn : TlsConn) -> Result[http::HttpRequ
   http::parse_request(buf)
 }
 
-/// Writes one response with `Content-Length` and `Connection: close`; the
-/// number of bytes written.
+/// Writes one response with `Content-Length` and `Connection: close`; returns
+/// the number of bytes written.
 pub fn tls_write_http_response(
   w : World,
   conn : TlsConn,

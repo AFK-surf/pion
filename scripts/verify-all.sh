@@ -46,7 +46,7 @@ rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
 echo "=== [4/6] Standalone pionc2 Test Runner (examples/text_stats, std/*, dogfood apps, init, doc) ==="
-for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
+for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc std/tls examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
   TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
   printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
   if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
@@ -228,24 +228,22 @@ rm -f "$IDX_DB" "$OUT_DIR/http_kv_service" "$OUT_DIR/http_event_server" "$OUT_DI
 # its real-TCP run is part of scripts/test-linux.sh.
 "$PIONC2" build -o "$OUT_DIR/http_loopback" "$ROOT_DIR/examples/http_loopback"
 rm -f "$OUT_DIR/http_loopback"
-# examples/https_server and examples/pion_station link the system OpenSSL; GitHub's macos-15 runner has no
-# Homebrew openssl@3, so this runs only where it is installed.
-if [ -d /opt/homebrew/opt/openssl@3/lib ]; then
-  HTTPS_OUT=$(CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib "$PIONC2" test --json "$ROOT_DIR/examples/https_server")
-  printf 'pionc2 test --json examples/https_server -> %s\n' "$HTTPS_OUT"
-  if ! printf '%s' "$HTTPS_OUT" | grep -q '"ok":true' || ! printf '%s' "$HTTPS_OUT" | grep -q '"failed":0'; then
-    echo "FAIL: pionc2 test --json examples/https_server failed" >&2
-    exit 1
-  fi
-  # Flagship: HTTPS + SSE + SQLite WAL + dyn Handler + std/regex + worker pool.
-  STATION_OUT=$(CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib "$PIONC2" test --json "$ROOT_DIR/examples/pion_station")
-  printf 'pionc2 test --json examples/pion_station -> %s\n' "$STATION_OUT"
-  if ! printf '%s' "$STATION_OUT" | grep -q '"ok":true' || ! printf '%s' "$STATION_OUT" | grep -q '"failed":0'; then
-    echo "FAIL: pionc2 test --json examples/pion_station failed" >&2
-    exit 1
-  fi
-else
-  echo "NOTE: /opt/homebrew/opt/openssl@3/lib not found; skipping examples/https_server + examples/pion_station tests"
+# std/tls (macOS native Network.framework + Security.framework, zero OpenSSL),
+# examples/https_server and examples/pion_station run unconditionally with zero LIBRARY_PATH.
+sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC2"
+HTTPS_OUT=$("$PIONC2" test --json "$ROOT_DIR/examples/https_server")
+printf 'pionc2 test --json examples/https_server -> %s\n' "$HTTPS_OUT"
+if ! printf '%s' "$HTTPS_OUT" | grep -q '"ok":true' || ! printf '%s' "$HTTPS_OUT" | grep -q '"failed":0'; then
+  echo "FAIL: pionc2 test --json examples/https_server failed" >&2
+  exit 1
+fi
+# Flagship: HTTPS + SSE + SQLite WAL + dyn Handler + std/regex + worker pool.
+STATION_OUT=$("$PIONC2" test --json "$ROOT_DIR/examples/pion_station")
+printf 'pionc2 test --json examples/pion_station -> %s\n' "$STATION_OUT"
+if ! printf '%s' "$STATION_OUT" | grep -q '"ok":true' || ! printf '%s' "$STATION_OUT" | grep -q '"failed":0'; then
+  echo "FAIL: pionc2 test --json examples/pion_station failed" >&2
+  exit 1
 fi
 
 echo "=== ALL 6 VERIFY-ALL GATES PASSED ==="

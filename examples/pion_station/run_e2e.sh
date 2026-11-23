@@ -91,7 +91,7 @@ printf '%s' "$INC_OUT" | grep -q '"failed":0'
 
 echo "=== [3/5] Self-Signed Cert & --self-test (4 TLS Clients + 40 Jobs + SSE) ==="
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
-  -addext subjectAltName=DNS:localhost \
+  -addext subjectAltName=DNS:localhost -addext extendedKeyUsage=serverAuth \
   -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null
 SSL_CERT_FILE="$TMP/cert.pem" "$TMP/pion_station" --self-test \
   --cert "$TMP/cert.pem" --key "$TMP/key.pem" --db "$TMP/selftest.db" --expect-proto TLSv1.3

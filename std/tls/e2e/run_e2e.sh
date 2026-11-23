@@ -7,20 +7,24 @@
 #
 #   [PYTHON=python3] [TLS_VERSIONS="1.3 1.2"] sh std/tls/e2e/run_e2e.sh <pionc>
 #
-# TLS_VERSIONS lists the server's maximum protocol per round; a server Python
-# whose ssl module lacks TLS 1.3 (macOS /usr/bin/python3 uses LibreSSL 2.8)
-# can only run the 1.2 round.
-# macOS: export CC=cc LIBRARY_PATH=/opt/homebrew/opt/openssl@3/lib first (see std/tls).
+# TLS_VERSIONS lists the server's maximum protocol per round; when unset, it
+# auto-detects Python `ssl.HAS_TLSv1_3` ("1.3 1.2" if supported, else "1.2").
 set -eu
 PIONC="$1"
 PYTHON="${PYTHON:-python3}"
-TLS_VERSIONS="${TLS_VERSIONS:-1.3 1.2}"
+if [ -z "${TLS_VERSIONS:-}" ]; then
+  if "$PYTHON" -c 'import ssl, sys; sys.exit(0 if ssl.HAS_TLSv1_3 else 1)' 2>/dev/null; then
+    TLS_VERSIONS="1.3 1.2"
+  else
+    TLS_VERSIONS="1.2"
+  fi
+fi
 HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
-  -subj /CN=localhost -addext subjectAltName=DNS:localhost \
+  -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext extendedKeyUsage=serverAuth \
   -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null
 "$PIONC" build -o "$TMP/tls_e2e" "$HERE"
 
@@ -61,11 +65,19 @@ for _ in range(count):
         raw.close()
         continue
     data = b""
-    while b"\r\n\r\n" not in data:
-        chunk = s.recv(65536)
-        if not chunk:
-            break
-        data += chunk
+    try:
+        while b"\r\n\r\n" not in data:
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+    except (ssl.SSLError, OSError):
+        pass
+    if not data:
+        handshake_failures += 1
+        print("server: client closed before request (post-handshake verify refusal)", flush=True)
+        s.close()
+        continue
     head, _, body = data.partition(b"\r\n\r\n")
     lines = head.decode().split("\r\n")
     method, path, _ = lines[0].split(" ")
@@ -87,17 +99,23 @@ for _ in range(count):
         pass
     s.close()
 print("server: done, handshake_failures=%d" % handshake_failures, flush=True)
-sys.exit(0 if handshake_failures == 1 else 1)
+sys.exit(0 if handshake_failures == 2 else 1)
 PYEOF
 
 echo "server: $("$PYTHON" -c 'import ssl; print(ssl.OPENSSL_VERSION)')"
 for VER in $TLS_VERSIONS; do
   echo "=== std/tls e2e: server max TLS $VER ==="
   rm -f "$TMP/server.rc" "$TMP/client.rc"
-  { "$PYTHON" "$TMP/server.py" "$TMP/cert.pem" "$TMP/key.pem" "$VER" 4; echo $? > "$TMP/server.rc"; } | {
+  { "$PYTHON" "$TMP/server.py" "$TMP/cert.pem" "$TMP/key.pem" "$VER" 6; echo $? > "$TMP/server.rc"; } | {
     if read PORT && [ -n "$PORT" ]; then
+      PORT="$(printf '%s' "$PORT" | tr -d '\r')"
+      if command -v cygpath >/dev/null 2>&1; then
+        CERT_ENV="$(cygpath -w "$TMP/cert.pem")"
+      else
+        CERT_ENV="$TMP/cert.pem"
+      fi
       set +e
-      SSL_CERT_FILE="$TMP/cert.pem" "$TMP/tls_e2e" "$PORT" "TLSv$VER"
+      SSL_CERT_FILE="$CERT_ENV" "$TMP/tls_e2e" "$PORT" "TLSv$VER"
       echo $? > "$TMP/client.rc"
       set -e
     else

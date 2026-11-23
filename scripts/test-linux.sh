@@ -411,20 +411,21 @@ printf '%s' "$PROC_JSON" | grep -q '"ok":true'
 printf '%s' "$PROC_JSON" | grep -q '"failed":0'
 PATH="$ORIG_PATH" sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC"
 
-# std/tls: zero-C-glue OpenSSL FFI. Unit tests plus real TLS 1.3/1.2 loopback
-# handshakes (and a refused wrong host) whenever libssl/libcrypto can be linked.
+# std/tls: platform C shim (`csrc/tls_openssl.c` invokes system cc which needs real `as`).
+# Unit tests plus real TLS 1.3/1.2 loopback handshakes (incl. `tls_wrap_fd` and refused wrong host)
+# whenever libssl/libcrypto can be linked.
 if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null; then
-  TLS_JSON="$("$PIONC" test --json "$ROOT_DIR/std/tls")"
+  TLS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/tls")"
   echo "pionc_linux test --json std/tls -> $TLS_JSON"
   printf '%s' "$TLS_JSON" | grep -q '"ok":true'
   printf '%s' "$TLS_JSON" | grep -q '"failed":0'
-  sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
-  HTTPS_JSON="$("$PIONC" test --json "$ROOT_DIR/examples/https_server")"
+  PATH="$ORIG_PATH" sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
+  HTTPS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/examples/https_server")"
   echo "pionc_linux test --json examples/https_server -> $HTTPS_JSON"
   printf '%s' "$HTTPS_JSON" | grep -q '"ok":true'
   printf '%s' "$HTTPS_JSON" | grep -q '"failed":0'
   # Server side: pure-Pion HTTPS service vs Python ssl / curl, TLS 1.3 and 1.2.
-  sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
+  PATH="$ORIG_PATH" sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
   # Flagship examples/pion_station also links the system libsqlite3 and checks
   # restart recovery with the sqlite3 CLI.
   if { [ -f /usr/include/sqlite3.h ] || pkg-config --exists sqlite3 2>/dev/null || [ -f "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" ]; } \
@@ -435,11 +436,11 @@ if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null;
       ln -sf "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" "$OUT_DIR/libsqlite3.so"
       STATION_LIB_PATH="$OUT_DIR${STATION_LIB_PATH:+:$STATION_LIB_PATH}"
     fi
-    STATION_JSON="$(LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --json "$ROOT_DIR/examples/pion_station")"
+    STATION_JSON="$(PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --json "$ROOT_DIR/examples/pion_station")"
     echo "pionc_linux test --json examples/pion_station -> $STATION_JSON"
     printf '%s' "$STATION_JSON" | grep -q '"ok":true'
     printf '%s' "$STATION_JSON" | grep -q '"failed":0'
-    LIBRARY_PATH="$STATION_LIB_PATH" sh "$ROOT_DIR/examples/pion_station/run_e2e.sh" "$PIONC"
+    PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" sh "$ROOT_DIR/examples/pion_station/run_e2e.sh" "$PIONC"
   else
     echo "NOTE: libsqlite3 or the sqlite3 CLI not found; skipping examples/pion_station tests and e2e"
   fi

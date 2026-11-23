@@ -38,7 +38,7 @@ cleanup() {
 trap cleanup EXIT
 
 openssl req -x509 -newkey rsa:2048 -nodes -days 1 -subj /CN=localhost \
-  -addext subjectAltName=DNS:localhost \
+  -addext subjectAltName=DNS:localhost -addext extendedKeyUsage=serverAuth \
   -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$TMP/other_key.pem" 2>/dev/null
 "$PIONC" build -o "$TMP/https_server" "$ROOT/examples/https_server"

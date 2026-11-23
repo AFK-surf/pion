@@ -133,12 +133,15 @@ echo "pionc_win test --json compiler/src/core -> $CORE_TEST_SUMMARY"
 printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'
 printf '%s' "$CORE_TEST_JSON" | grep -q '"failed":0'
 
-for TPKG in examples/text_stats std/json std/http std/regex std/proc; do
+for TPKG in examples/text_stats std/json std/http std/regex std/proc std/tls; do
   PKG_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_win test --json $TPKG -> $PKG_JSON"
   printf '%s' "$PKG_JSON" | grep -q '"ok":true'
   printf '%s' "$PKG_JSON" | grep -q '"failed":0'
 done
+if command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
+fi
 
 P27A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion" | tr -d '\r')"
 echo "pionc_win run p27a_ergonomics_bug4 -> $P27A_OUT"

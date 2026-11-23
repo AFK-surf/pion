@@ -4,12 +4,16 @@
 ///|
 ///|   tls_e2e <port> <expected protocol, e.g. TLSv1.3>
 ///|
-///| Exactly four connections, in order:
+///| Exactly six connections, in order:
 ///|   1. https_request POST /echo (verified, SNI `localhost`): 200, same JSON body
 ///|   2. tls_connect + tls_write/tls_read GET /info (verified): protocol, SNI
 ///|   3. tls_connect to `127.0.0.1` with verification: must fail (the
 ///|      certificate names only `localhost`)
 ///|   4. https_request GET /info to `127.0.0.1` without verification: 200
+///|   5. tcp_connect + tls_wrap_fd (proxy tunnel upgrade) + tls_write_bytes /
+///|      tls_read_bytes POST /echo + protocol/SNI verification
+///|   6. tcp_connect + tls_wrap_fd to `127.0.0.1` with verification: must fail
+///|      and leave `fd` open for caller to close cleanly
 
 import "tls"
 import "http"
@@ -96,6 +100,55 @@ fn run(world : World, port : Int, want_proto : String) -> Result[Unit, String] {
     return Err("unverified request mismatch: " + r4.body)
   }
   io_println(world, "https_request 127.0.0.1 (verify off): 200 " + r4.body)
+
+  // 5. Proxy-upgrade scenario: pre-connected TCP fd upgraded in place via tls_wrap_fd + Bytes I/O.
+  let raw_fd = tcp_connect(world, "127.0.0.1", port)
+  if raw_fd < 0 {
+    return Err("tcp_connect failed before tls_wrap_fd")
+  }
+  let wconn = match tls::tls_wrap_fd(world, raw_fd, "localhost", true) {
+    Ok(c) => c
+    Err(e) => {
+      tcp_close(world, raw_fd)
+      return Err("tls_wrap_fd failed: " + e)
+    }
+  }
+  let wproto = tls::tls_protocol(wconn)
+  let wreq = http::format_request("GET", "localhost", port, "/info", "")
+  let wreq_bytes = wreq.to_bytes()
+  let wwrote = tls::tls_write_bytes(world, wconn, wreq_bytes)?
+  let wsb = StringBuilder()
+  while true {
+    let chunk = tls::tls_read_bytes(world, wconn, 32)
+    if chunk.length() == 0 {
+      break
+    }
+    wsb.write_string(chunk.to_string())
+  }
+  tls::tls_close(world, wconn)
+  let winfo = http::parse_response(wsb.to_string())?
+  let wserver_proto = str_field(winfo.body, "version")
+  let wsni = str_field(winfo.body, "sni")
+  if wproto != want_proto || wserver_proto != want_proto || wsni != "localhost" || wwrote != wreq_bytes.length() {
+    return Err("tls_wrap_fd mismatch: client=" + wproto + " server=" + wserver_proto + " sni=" + wsni)
+  }
+  io_println(world, "tls_wrap_fd: " + wproto + ", server saw " + wserver_proto + " sni=" + wsni)
+
+  // 6. tls_wrap_fd verification failure must leave fd open for caller to close cleanly.
+  let bad_fd = tcp_connect(world, "127.0.0.1", port)
+  if bad_fd < 0 {
+    return Err("tcp_connect failed before failing tls_wrap_fd")
+  }
+  match tls::tls_wrap_fd(world, bad_fd, "127.0.0.1", true) {
+    Ok(c) => {
+      tls::tls_close(world, c)
+      return Err("tls_wrap_fd verification accepted 127.0.0.1 for a localhost-only certificate")
+    }
+    Err(e) => {
+      tcp_close(world, bad_fd)
+      io_println(world, "tls_wrap_fd rejects 127.0.0.1 (caller closed fd): " + e)
+    }
+  }
   Ok(())
 }
 
