@@ -4369,4 +4369,172 @@ console.log("  p58a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P59-FIX Regression: Cross-Package Release Inline Enum/Struct Shadowing (4 modes) + Symlink CLI Entrypoint ==="
+P59_DIR="$TMP_DIR/p59fix_ws"
+mkdir -p "$P59_DIR/xlib/src" "$P59_DIR/xapp/src"
+cat > "$P59_DIR/xlib/pion.toml" <<'EOF'
+[package]
+name = "xlib"
+version = "0.1.0"
+EOF
+cat > "$P59_DIR/xlib/src/lib.pion" <<'EOF'
+pub enum Op {
+  A
+  B
+  C
+}
+
+pub enum Flag {
+  Unset
+  Set(Bool)
+}
+
+pub enum Payload {
+  Empty
+  Text(String)
+}
+
+pub struct Frame {
+  op : Op
+  tag : Int
+}
+
+pub struct Header {
+  magic : Int
+  ver : Int
+}
+
+pub fn mk_op() -> Op {
+  Op::C
+}
+
+pub fn mk_frame(t : Int) -> Frame {
+  Frame::{ op: Op::C, tag: t }
+}
+
+pub fn mk_flag_true() -> Flag {
+  Flag::Set(true)
+}
+
+pub fn mk_flag(b : Bool) -> Flag {
+  Flag::Set(b)
+}
+
+pub fn mk_payload(s : String) -> Payload {
+  Payload::Text(s)
+}
+
+pub fn mk_header(m : Int) -> Header {
+  Header::{ magic: m, ver: 7 }
+}
+EOF
+cat > "$P59_DIR/xapp/pion.toml" <<'EOF'
+[package]
+name = "xapp"
+version = "0.1.0"
+
+[dependencies]
+xlib = { path = "../xlib" }
+EOF
+cat > "$P59_DIR/xapp/src/main.pion" <<'EOF'
+import "xlib" as xlib
+
+enum Op {
+  C
+  B
+  A
+}
+
+struct Header {
+  label : String
+  magic : Int
+  ver : Int
+}
+
+fn op_to_int(o : xlib::Op) -> Int {
+  match o {
+    xlib::Op::A => 1
+    xlib::Op::B => 2
+    xlib::Op::C => 3
+  }
+}
+
+fn local_op_to_int(o : Op) -> Int {
+  match o {
+    Op::C => 10
+    Op::B => 20
+    Op::A => 30
+  }
+}
+
+pub fn main(world : World) -> Int {
+  let o = xlib::mk_op()
+  let fr = xlib::mk_frame(42)
+  let fl1 = xlib::mk_flag_true()
+  let dyn_b = (fr.tag == 99)
+  let fl2 = xlib::mk_flag(dyn_b)
+  let pl = xlib::mk_payload("hi_" + (9).to_string())
+  let h = xlib::mk_header(99)
+  let lo = Op::C
+  let lh = Header::{ label: "app", magic: 1, ver: 2 }
+  let b1 = match fl1 {
+    xlib::Flag::Set(v) => if v { 1 } else { 0 }
+    xlib::Flag::Unset => -1
+  }
+  let b2 = match fl2 {
+    xlib::Flag::Set(v) => if v { 1 } else { 0 }
+    xlib::Flag::Unset => -1
+  }
+  let txt = match pl {
+    xlib::Payload::Text(s) => s
+    xlib::Payload::Empty => ""
+  }
+  let res = op_to_int(o).to_string() + ":" + op_to_int(fr.op).to_string() + ":" + fr.tag.to_string() + ":" + b1.to_string() + ":" + b2.to_string() + ":" + txt + ":" + h.magic.to_string() + ":" + h.ver.to_string() + ":" + local_op_to_int(lo).to_string() + ":" + lh.ver.to_string()
+  io_println(world, res)
+  0
+}
+EOF
+P59_EXPECTED="3:3:42:1:0:hi_9:99:7:10:2"
+P59_NAT_DEV="$TMP_DIR/p59_nat_dev"
+P59_NAT_REL="$TMP_DIR/p59_nat_rel"
+P59_WASM_DEV="$TMP_DIR/p59_wasm_dev.wasm"
+P59_WASM_REL="$TMP_DIR/p59_wasm_rel.wasm"
+"$PIONC" build -o "$P59_NAT_DEV" "$P59_DIR/xapp"
+"$PIONC" build --release -o "$P59_NAT_REL" "$P59_DIR/xapp"
+"$PIONC" build --target wasm32 -o "$P59_WASM_DEV" "$P59_DIR/xapp"
+"$PIONC" build --release --target wasm32 -o "$P59_WASM_REL" "$P59_DIR/xapp"
+
+for bin_spec in "native-dev:$P59_NAT_DEV" "native-rel:$P59_NAT_REL"; do
+  label="${bin_spec%%:*}"
+  bin_p="${bin_spec#*:}"
+  got=$("$bin_p")
+  if [ "$got" != "$P59_EXPECTED" ]; then
+    echo "FAIL ($label): expected '$P59_EXPECTED', got '$got'"
+    exit 1
+  fi
+  echo "  p59fix ($label): $got OK"
+done
+
+for wasm_spec in "wasm32-dev:$P59_WASM_DEV" "wasm32-rel:$P59_WASM_REL"; do
+  label="${wasm_spec%%:*}"
+  wasm_p="${wasm_spec#*:}"
+  got=$(node "$PION_WASM_RT" "$wasm_p")
+  if [ "$got" != "$P59_EXPECTED" ]; then
+    echo "FAIL ($label): expected '$P59_EXPECTED', got '$got'"
+    exit 1
+  fi
+  echo "  p59fix ($label): $got OK"
+done
+
+# Symlink CLI entrypoint regression (simulates macOS /tmp -> /private/tmp)
+P59_SYMLINK="/tmp/p59_wasm_rt_link_$$.mjs"
+ln -sf "$PION_WASM_RT" "$P59_SYMLINK"
+got_sym=$(node "$P59_SYMLINK" "$P59_WASM_REL")
+rm -f "$P59_SYMLINK"
+if [ "$got_sym" != "$P59_EXPECTED" ]; then
+  echo "FAIL (wasm32-symlink-cli): expected '$P59_EXPECTED', got '$got_sym'"
+  exit 1
+fi
+echo "  p59fix (wasm32-symlink-cli): $got_sym OK"
+
 echo "p29c_wasm32 E2E: OK"

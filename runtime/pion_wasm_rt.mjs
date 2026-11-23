@@ -2025,8 +2025,16 @@ export async function runWasmFile(wasmPath, args = [], options = {}) {
 if (IS_NODE_ENV && process.argv[1]) {
   const urlMod = getBuiltin("node:url");
   const pathMod = getBuiltin("node:path");
+  const fsMod = getBuiltin("node:fs");
+  const safeRealpath = (fsObj, pathObj, p) => {
+    try {
+      return fsObj ? fsObj.realpathSync(p) : pathObj.resolve(p);
+    } catch {
+      return pathObj.resolve(p);
+    }
+  };
   if (urlMod && pathMod) {
-    if (pathMod.resolve(urlMod.fileURLToPath(import.meta.url)) === pathMod.resolve(process.argv[1])) {
+    if (safeRealpath(fsMod, pathMod, urlMod.fileURLToPath(import.meta.url)) === safeRealpath(fsMod, pathMod, process.argv[1])) {
       const wasmPath = process.argv[2];
       if (!wasmPath) {
         process.stderr.write("usage: node pion_wasm_rt.mjs <module.wasm> [args...]\n");
@@ -2034,7 +2042,7 @@ if (IS_NODE_ENV && process.argv[1]) {
       }
       const progArgs = process.argv.slice(2);
       try {
-        const fs = getBuiltin("node:fs");
+        const fs = fsMod || getBuiltin("node:fs");
         const wasmBytes = fs.readFileSync(wasmPath);
         if (wasmBytes.byteLength <= SYNC_INSTANTIATE_LIMIT) {
           const { exitCode } = runWasmBytesSync(wasmBytes, progArgs, { fs });
@@ -2056,8 +2064,9 @@ if (IS_NODE_ENV && process.argv[1]) {
   } else {
     (async () => {
       const { fileURLToPath } = await import("node:url");
-      const { resolve } = await import("node:path");
-      if (resolve(fileURLToPath(import.meta.url)) !== resolve(process.argv[1])) return;
+      const pathAsync = await import("node:path");
+      const fsAsync = await import("node:fs");
+      if (safeRealpath(fsAsync, pathAsync, fileURLToPath(import.meta.url)) !== safeRealpath(fsAsync, pathAsync, process.argv[1])) return;
       const wasmPath = process.argv[2];
       if (!wasmPath) {
         process.stderr.write("usage: node pion_wasm_rt.mjs <module.wasm> [args...]\n");
