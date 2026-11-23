@@ -67,7 +67,14 @@ fn check_i64(x : Int64, n : Int) -> String {
   "\{rl}:\{rr}:\{lz}:\{tz}:\{co}"
 }
 
+fn sh_u(x : UInt, k : UInt) -> UInt { x >> (1 + k) }
+fn sh_i(x : UInt, n : Int) -> UInt { x << (32 - n) }
+
 pub fn main(w : World) -> Int {
+  if sh_u(0x80U, 2U) != 0x10U || sh_i(1U, 24) != 256U {
+    io_println(w, "FAIL: shift rhs typing")
+    return 1
+  }
   let shifts : Array[Int] = [0, 1, 7, 31, 32, 33, 63, 64, -1]
   let u32s : Array[UInt] = [0U, 1U, 2147483648U, 4294967295U, 305419896U]
   let i32s : Array[Int] = [0, 1, -1, -2147483648, 305419896]
@@ -130,10 +137,17 @@ echo "  1. Native dev: OK"
 diff -u "$TMP_DIR/out_dev.txt" "$TMP_DIR/out_rel.txt"
 echo "  2. Native --release matches dev byte-for-byte: OK"
 
-# 3. Verify hardware `ror` instruction appears in emitted assembly
-"$PIONC" build --release --emit-asm "$TMP_DIR/p85_rel.s" -o "$TMP_DIR/p85_rel_asm" "$TMP_DIR/main.pion"
-grep -Eq '\bror[lq]?\b' "$TMP_DIR/p85_rel.s" || { echo "FAIL: no ror instruction in emitted asm" >&2; exit 1; }
-echo "  3. Emitted assembly contains hardware ror: OK"
+# 3. Verify hardware `ror` instruction appears in emitted assembly (x86_64 / arm64)
+case "$(uname -m)" in
+  x86_64|amd64|arm64|aarch64)
+    "$PIONC" build --release --emit-asm "$TMP_DIR/p85_rel.s" -o "$TMP_DIR/p85_rel_asm" "$TMP_DIR/main.pion"
+    grep -Eq '\bror[lq]?\b' "$TMP_DIR/p85_rel.s" || { echo "FAIL: no ror instruction in emitted asm" >&2; exit 1; }
+    echo "  3. Emitted assembly contains hardware ror: OK"
+    ;;
+  *)
+    echo "  3. Emitted assembly ror check skipped on $(uname -m)"
+    ;;
+esac
 
 # 4. Wasm32 parity (if node is available)
 if command -v node >/dev/null 2>&1; then
@@ -160,5 +174,36 @@ printf '%s' "$BAD_JSON" | grep -q 'E_TYPE_MISMATCH' || {
   exit 1
 }
 echo "  5. Method call arity check (E_TYPE_MISMATCH): OK"
+
+# 6. User-defined Probe::count_ones() MUST NOT be treated as pure_no_trap (R2 P1-4)
+cat > "$TMP_DIR/probe_pure.pion" <<'EOF'
+struct Probe { id : Int }
+fn Probe::count_ones(self : Probe) -> Int {
+  let _ = self.id
+  panic("method")
+}
+fn rec(n : Int, p : Probe) -> Int {
+  if n <= 0 {
+    panic("leaf")
+  } else {
+    rec(n - 1, p) + p.count_ones()
+  }
+}
+pub fn main() -> Int {
+  let p = Probe::{ id: 1 }
+  rec(3, p)
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/probe_pure" "$TMP_DIR/probe_pure.pion"
+set +e
+PP_ERR=$("$TMP_DIR/probe_pure" 2>&1)
+PP_RC=$?
+set -e
+test "$PP_RC" -ne 0 || { echo "FAIL: probe_pure did not trap" >&2; exit 1; }
+printf '%s' "$PP_ERR" | grep -q "leaf" || {
+  echo "FAIL: probe_pure expected 'leaf' panic first, got: $PP_ERR" >&2
+  exit 1
+}
+echo "  6. User Probe::count_ones() preserves evaluation order (leaf before method): OK"
 
 echo "PASS: p85_ror_bitops"

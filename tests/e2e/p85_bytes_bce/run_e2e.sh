@@ -18,7 +18,7 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
-printf 'ABCD1234' > "$TMP_DIR/ro.bin"
+printf 'ABCD1234EFGH5678' > "$TMP_DIR/ro.bin"
 
 cat <<EOF > "$TMP_DIR/p85_ok.pion"
 fn ro_path() -> String {
@@ -163,6 +163,99 @@ set -e
 echo "p85 alias_oob rc=$OOB_RC -> $OOB_ERR"
 test "$OOB_RC" -ne 0
 printf '%s' "$OOB_ERR" | grep -q "out of bounds"
+
+# Negative trap 4 (R2 P1-1): for-range shadows outer u8_range_vars `i` -> must trap OOB
+cat <<'EOF' > "$TMP_DIR/p85_shadow_for_oob.pion"
+pub fn main(world : World) -> Int {
+  let _ = world
+  let x = 3
+  let t : FixedArray[Int] = FixedArray::make(8, 0)
+  let i = x & 7
+  let _ = i
+  for i in 0..100 {
+    t[i] = 1
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_shadow_for_oob" "$TMP_DIR/p85_shadow_for_oob.pion"
+set +e
+SF_ERR=$("$TMP_DIR/p85_shadow_for_oob" 2>&1)
+SF_RC=$?
+set -e
+echo "p85 shadow_for_oob rc=$SF_RC -> $SF_ERR"
+test "$SF_RC" -ne 0
+printf '%s' "$SF_ERR" | grep -q "out of bounds"
+
+# Negative trap 5 (R2 P1-1): match arm shadows outer known_writable_bytes `b` -> must trap RO
+cat <<EOF > "$TMP_DIR/p85_shadow_match_ro.pion"
+pub fn main(world : World) -> Int {
+  let _ = world
+  let b = Bytes::new(64)
+  let _ = b
+  match fs_mmap_ro("$TMP_DIR/ro.bin") {
+    Ok(b) => { b[10] = (7).to_byte() }
+    Err(e) => panic("unexpected mmap err: " + e)
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_shadow_match_ro" "$TMP_DIR/p85_shadow_match_ro.pion"
+set +e
+SM_ERR=$("$TMP_DIR/p85_shadow_match_ro" 2>&1)
+SM_RC=$?
+set -e
+echo "p85 shadow_match_ro rc=$SM_RC -> $SM_ERR"
+test "$SM_RC" -ne 0
+printf '%s' "$SM_ERR" | grep -q "cannot mutate read-only mmap Bytes"
+
+# Negative trap 6 (R2 P1-2): local `let M = 15` shadows top-level `let M : Int = 7` -> must trap OOB
+cat <<'EOF' > "$TMP_DIR/p85_shadow_const_oob.pion"
+let M : Int = 7
+pub fn main(world : World) -> Int {
+  let t : FixedArray[Int] = FixedArray::make(8, 0)
+  let M = 15
+  let x = 15
+  let v = t[x & M]
+  io_println(world, v.to_string())
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_shadow_const_oob" "$TMP_DIR/p85_shadow_const_oob.pion"
+set +e
+SC_ERR=$("$TMP_DIR/p85_shadow_const_oob" 2>&1)
+SC_RC=$?
+set -e
+echo "p85 shadow_const_oob rc=$SC_RC -> $SC_ERR"
+test "$SC_RC" -ne 0
+printf '%s' "$SC_ERR" | grep -q "out of bounds"
+
+# Negative trap 7 (R2 P1-3): user-defined `bytes_from_ptr` wrapping mmap_ro -> must trap RO
+cat <<EOF > "$TMP_DIR/p85_shadow_bfp_ro.pion"
+fn bytes_from_ptr(b : Bytes, n : Int) -> Bytes {
+  let _ = n
+  b
+}
+pub fn main(world : World) -> Int {
+  let _ = world
+  match fs_mmap_ro("$TMP_DIR/ro.bin") {
+    Ok(mb) => {
+      let w = bytes_from_ptr(mb, 8)
+      w[0] = b'Z'
+    }
+    Err(e) => panic("unexpected mmap err: " + e)
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_shadow_bfp_ro" "$TMP_DIR/p85_shadow_bfp_ro.pion"
+set +e
+SB_ERR=$("$TMP_DIR/p85_shadow_bfp_ro" 2>&1)
+SB_RC=$?
+set -e
+echo "p85 shadow_bfp_ro rc=$SB_RC -> $SB_ERR"
+test "$SB_RC" -ne 0
+printf '%s' "$SB_ERR" | grep -q "cannot mutate read-only mmap Bytes"
 
 # Wasm32 Node + Web parity
 if command -v node >/dev/null 2>&1; then
