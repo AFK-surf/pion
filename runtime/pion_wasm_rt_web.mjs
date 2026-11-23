@@ -30,13 +30,26 @@ function fmtG(v, d) {
   return s.includes(".") ? s.replace(/\.?0+$/, "") : s;
 }
 
-function hashBytes(u8, dv, off, len, seed) {
+function splitmix64(x) {
+  let z = BigInt.asUintN(64, x + 0x9e3779b97f4a7c15n);
+  z = BigInt.asUintN(64, (z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n);
+  z = BigInt.asUintN(64, (z ^ (z >> 27n)) * 0x94d049bb133111ebn);
+  return BigInt.asUintN(64, z ^ (z >> 31n));
+}
+function wymix64(a, b) {
+  const r = BigInt.asUintN(64, a) * BigInt.asUintN(64, b);
+  return BigInt.asUintN(64, r ^ (r >> 64n));
+}
+function hashBytes(u8, dv, off, len, seed1, seed2) {
   const K = 0x9e3779b97f4a7c15n;
-  let h = BigInt.asUintN(64, (0x517cc1b727220a95n ^ seed) ^ BigInt.asUintN(64, BigInt(len) * K));
+  const s1 = BigInt.asUintN(64, seed1 ^ 0x517cc1b727220a95n);
+  const s2 = BigInt.asUintN(64, seed2 ^ K);
+  const origLen = BigInt(len);
+  let h = BigInt.asUintN(64, s1 ^ BigInt.asUintN(64, origLen * K));
   let p = off, rem = len;
-  while (rem >= 8) {
-    h = BigInt.asUintN(64, (h ^ dv.getBigUint64(p, true)) * K);
-    h ^= h >> 32n; p += 8; rem -= 8;
+  while (rem > 8) {
+    h = wymix64(dv.getBigUint64(p, true) ^ s1, h ^ s2);
+    p += 8; rem -= 8;
   }
   let tail = 0n;
   if (rem >= 4) {
@@ -46,23 +59,21 @@ function hashBytes(u8, dv, off, len, seed) {
   } else if (rem === 1) {
     tail = BigInt(u8[p]);
   }
-  h ^= tail;
-  h = BigInt.asUintN(64, h * 0xbf58476d1ce4e5b9n); h ^= h >> 27n;
-  h = BigInt.asUintN(64, h * 0x94d049bb133111ebn); h ^= h >> 31n;
+  h = wymix64(tail ^ s1, h ^ s2);
+  h = wymix64(h ^ origLen, s2 ^ 0x94d049bb133111ebn);
   return h === 0n ? 1n : h;
 }
 
-function hashI64(k) {
-  let x = BigInt.asUintN(64, k);
-  x ^= x >> 30n; x = BigInt.asUintN(64, x * 0xbf58476d1ce4e5b9n);
-  x ^= x >> 27n; x = BigInt.asUintN(64, x * 0x94d049bb133111ebn);
-  x ^= x >> 31n;
-  return x === 0n ? 1n : x;
+function hashI64(k, seed1, seed2) {
+  const s1 = BigInt.asUintN(64, seed1 ^ 0x517cc1b727220a95n);
+  const s2 = BigInt.asUintN(64, seed2 ^ 0x9e3779b97f4a7c15n);
+  const h = wymix64(BigInt.asUintN(64, k) ^ s1, s2);
+  return h === 0n ? 1n : h;
 }
 
 export function createPionRuntime(opts = {}) {
   let memory = opts.memory || null, exp = opts.exports || null, buf = null, dv = null, u8 = null;
-  let heapBase = 0, heapPtr = 0, heapEnd = 0, slabCtl = 0, hashSeed = 0n;
+  let heapBase = 0, heapPtr = 0, heapEnd = 0, slabCtl = 0, hashSeed = 0n, hashSeed2 = 0n;
   const free = FREE_CLASSES.map(() => []);
   const largeFree = new Map();
   const channels = new Map();
@@ -96,14 +107,16 @@ export function createPionRuntime(opts = {}) {
     const sc = e.__pion_slab_ctl;
     slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
     if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
-      const sb = new BigUint64Array(1); globalThis.crypto.getRandomValues(sb); hashSeed = sb[0];
+      const sb = new BigUint64Array(2); globalThis.crypto.getRandomValues(sb); hashSeed = sb[0]; hashSeed2 = sb[1];
     } else {
       hashSeed = BigInt.asUintN(64, (BigInt(Math.floor(Math.random() * 0xffffffff)) << 32n) ^ BigInt(Date.now()));
+      hashSeed2 = splitmix64(hashSeed ^ 0x9e3779b97f4a7c15n);
     }
     if (slabCtl > 0) {
       u8.fill(0, slabCtl, slabCtl + 80);
       su32(slabCtl + 36, heapPtr); su32(slabCtl + 40, heapEnd); su32(slabCtl + 44, heapBase);
       dv.setBigUint64(slabCtl + 64, hashSeed, true);
+      dv.setBigUint64(slabCtl + 72, hashSeed2, true);
     }
     for (let i = 0; i < free.length; i++) free[i].length = 0;
     largeFree.clear();
@@ -373,8 +386,12 @@ export function createPionRuntime(opts = {}) {
     s64(d, n); if (n && dp) u8.copyWithin(d + 8, dp, dp + n); u8[d + 8 + n] = 0; return o;
   }
 
+  const pionDie = (msg) => { const err = `pion panic: ${msg}`; eprintlnFn(err); throw new Error(err); };
   function pion_bytes_new(len) {
-    const n = Math.max(0, Number(len)), cap = Math.max(n, 16), o = pion_alloc_uninit(24, TAG_BYTES, 0n);
+    const lb = BigInt(len);
+    if (lb < 0n) pionDie("negative bytes length");
+    if (lb > 0x7FFFFFEFn) pionDie("container length exceeds maximum");
+    const n = Number(lb), cap = Math.max(n, 16), o = pion_alloc_uninit(24, TAG_BYTES, 0n);
     const dp = rawZero(cap), p = pNum(o); sync(); s64(p, n); s64(p + 8, cap); s64(p + 16, pBig(dp)); return o;
   }
   const pion_bytes_len = (b) => { sync(); return g64(pNum(b)); };
@@ -393,7 +410,10 @@ export function createPionRuntime(opts = {}) {
     if (lb) u8.copyWithin(dst + la, Number(g64(pb + 16)), Number(g64(pb + 16)) + lb); return o;
   }
   function pion_bytes_from_ptr(ptr, len) {
-    const n = Math.max(0, Number(len)), o = pion_bytes_new(BigInt(n)), src = pNum(ptr); sync();
+    const lb = BigInt(len);
+    if (lb < 0n) pionDie("negative bytes length");
+    if (lb > 0x7FFFFFEFn) pionDie("container length exceeds maximum");
+    const n = Number(lb), o = pion_bytes_new(lb), src = pNum(ptr); sync();
     if (n && src) u8.copyWithin(Number(g64(pNum(o) + 16)), src, src + n); return o;
   }
   function pion_bytes_copy_to_ptr(b, off, dp0, len) {
@@ -458,7 +478,9 @@ export function createPionRuntime(opts = {}) {
     }
   }
   function pion_arr_new(cap, flags) {
-    const c = Math.max(Number(cap), 0), f = flags | 0;
+    const cb = BigInt(cap);
+    if (cb > 0x7FFFFFEFn) pionDie("container length exceeds maximum");
+    const c = Math.max(Number(cb), 0), f = flags | 0;
     const isObj = f > 2 ? (f >>> 8) : (f === 1 ? 1 : 0), st = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0), esz = st || 8;
     const o = pion_alloc_uninit(32, TAG_ARRAY, 0n);
     const dp = c ? rawAlloc(c * esz) : 0, p = pNum(o); sync();
@@ -555,7 +577,7 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_map_new = (v) => mapNew(v, 0), pion_map_new_int = (v) => mapNew(v, 1);
   const pion_map_len = (m) => { sync(); return g64(pNum(m)); };
-  const mHash = (k, kInt) => (kInt ? hashI64(k) : (sync(), hashBytes(u8, dv, pNum(k) + 8, Number(g64(pNum(k))), hashSeed)));
+  const mHash = (k, kInt) => (kInt ? hashI64(k, hashSeed, hashSeed2) : (sync(), hashBytes(u8, dv, pNum(k) + 8, Number(g64(pNum(k))), hashSeed, hashSeed2)));
   const mEq = (a, b, kInt) => (kInt ? a === b : pion_str_eq(a, b) !== 0);
   function mapGrow(p) {
     sync(); const oc = Number(g64(p + 8)), oe = Number(g64(p + 24)), nc = oc < 16 ? 16 : oc * 2;

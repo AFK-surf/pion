@@ -3033,6 +3033,56 @@ static void test_p61b_map_hint_hit_miss_aba(void) {
     printf("[PASS] p61b_map_hint_hit_miss_aba\n");
 }
 
+static void test_p71c_hashdos_bit63_noncollision(void) {
+    /* Construct 4096 bit-63 multi-collision keys (k=12 pairs of 16-byte blocks = 192B each).
+     * Under the old `h ^= w; h *= K; h ^= h >> 32`, all 4096 keys had the exact same hash
+     * regardless of random seed. With 128-bit dual-secret wymix, they distribute uniformly. */
+    void *m = pion_map_new(0);
+    const int k = 12;
+    const int n = 1 << k;
+    char buf[12 * 16 + 1];
+    buf[k * 16] = '\0';
+    double t0 = monotonic_sec();
+    for (int idx = 0; idx < n; idx++) {
+        for (int i = 0; i < k; i++) {
+            int base = i * 16;
+            for (int j = 0; j < 16; j++) {
+                buf[base + j] = (char)('A' + ((i + j) % 26));
+            }
+            if ((idx >> i) & 1) {
+                buf[base + 7] = (char)((unsigned char)buf[base + 7] ^ 0x80u);
+                buf[base + 11] = (char)((unsigned char)buf[base + 11] ^ 0x80u);
+                buf[base + 15] = (char)((unsigned char)buf[base + 15] ^ 0x80u);
+            }
+        }
+        void *ks = pion_str_from_cstr(buf, (int64_t)(k * 16));
+        pion_map_set(m, ks, (int64_t)(idx * 7 + 3));
+        pion_rc_dec(ks);
+    }
+    assert(pion_map_len(m) == n);
+    for (int idx = 0; idx < n; idx++) {
+        for (int i = 0; i < k; i++) {
+            int base = i * 16;
+            for (int j = 0; j < 16; j++) {
+                buf[base + j] = (char)('A' + ((i + j) % 26));
+            }
+            if ((idx >> i) & 1) {
+                buf[base + 7] = (char)((unsigned char)buf[base + 7] ^ 0x80u);
+                buf[base + 11] = (char)((unsigned char)buf[base + 11] ^ 0x80u);
+                buf[base + 15] = (char)((unsigned char)buf[base + 15] ^ 0x80u);
+            }
+        }
+        void *ks = pion_str_from_cstr(buf, (int64_t)(k * 16));
+        int64_t out = 0;
+        assert(pion_map_try_get(m, ks, &out) == 1);
+        assert(out == (int64_t)(idx * 7 + 3));
+        pion_rc_dec(ks);
+    }
+    double dt = (monotonic_sec() - t0) * 1000.0;
+    pion_rc_dec(m);
+    printf("[PASS] p71c_hashdos_bit63_noncollision (%d bit-63 attack keys insert+lookup: %.2f ms)\n", n, dt);
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -3057,6 +3107,7 @@ int main(int argc, char **argv) {
     test_str_to_double();
     test_p57b_hot_str_and_split();
     test_p61b_map_hint_hit_miss_aba();
+    test_p71c_hashdos_bit63_noncollision();
 
     test_st_frozen_slab_recycle();
     test_mt_shared_rc();

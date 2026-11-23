@@ -1954,40 +1954,66 @@ PION_MINSIZE void pion_arr_sort_str(void *a_ptr) {
  * ============================================================================ */
 
 static uint64_t g_pion_hash_seed = 0;
+static uint64_t g_pion_hash_seed2 = 0;
+
+static inline uint64_t pion_splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ULL;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebULL;
+    return x ^ (x >> 31);
+}
+
+static inline uint64_t pion_wymix(uint64_t a, uint64_t b) {
+#if defined(_MSC_VER) && !defined(__clang__)
+    uint64_t hi;
+    uint64_t lo = _umul128(a, b, &hi);
+    return lo ^ hi;
+#else
+    __uint128_t r = (__uint128_t)a * (__uint128_t)b;
+    return (uint64_t)r ^ (uint64_t)(r >> 64);
+#endif
+}
 
 #if defined(__GNUC__) || defined(__clang__)
 static PION_MINSIZE __attribute__((constructor)) void pion_rt_init_hash_seed(void) {
     const char *env = getenv("PION_HASH_SEED");
     if (env && env[0] != '\0') {
-        g_pion_hash_seed = (uint64_t)strtoull(env, NULL, 0);
+        uint64_t s1 = (uint64_t)strtoull(env, NULL, 0);
+        g_pion_hash_seed = s1;
+        g_pion_hash_seed2 = pion_splitmix64(s1 ^ 0x9e3779b97f4a7c15ULL);
         return;
     }
-    uint64_t seed = 0;
+    uint64_t seeds[2] = {0, 0};
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__ANDROID__)
-    arc4random_buf(&seed, sizeof(seed));
+    arc4random_buf(seeds, sizeof(seeds));
 #elif defined(__linux__)
-    if (getrandom(&seed, sizeof(seed), 0) != (ssize_t)sizeof(seed)) {
-        seed = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+    if (getrandom(seeds, sizeof(seeds), 0) != (ssize_t)sizeof(seeds)) {
+        seeds[0] = (uint64_t)time(NULL) ^ ((uint64_t)getpid() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+        seeds[1] = pion_splitmix64(seeds[0] ^ (uint64_t)(uintptr_t)&g_pion_hash_seed2);
     }
 #elif defined(_WIN32)
-    seed = (uint64_t)GetTickCount64() ^ ((uint64_t)GetCurrentProcessId() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+    seeds[0] = (uint64_t)GetTickCount64() ^ ((uint64_t)GetCurrentProcessId() << 32) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+    seeds[1] = pion_splitmix64(seeds[0] ^ (uint64_t)(uintptr_t)&g_pion_hash_seed2);
 #else
-    seed = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+    seeds[0] = (uint64_t)time(NULL) ^ (uint64_t)(uintptr_t)&g_pion_hash_seed;
+    seeds[1] = pion_splitmix64(seeds[0] ^ (uint64_t)(uintptr_t)&g_pion_hash_seed2);
 #endif
-    g_pion_hash_seed = seed;
+    g_pion_hash_seed = seeds[0];
+    g_pion_hash_seed2 = seeds[1];
 }
 #endif
 
 static inline uint64_t pion_str_hash(const PionString *s) {
     const unsigned char *p = (const unsigned char *)s->data;
     size_t len = (size_t)s->len;
-    uint64_t h = (0x517cc1b727220a95ULL ^ g_pion_hash_seed) ^ ((uint64_t)len * 0x9e3779b97f4a7c15ULL);
+    size_t orig_len = len;
+    uint64_t s1 = g_pion_hash_seed ^ 0x517cc1b727220a95ULL;
+    uint64_t s2 = g_pion_hash_seed2 ^ 0x9e3779b97f4a7c15ULL;
+    uint64_t h = s1 ^ ((uint64_t)orig_len * 0x9e3779b97f4a7c15ULL);
     while (__builtin_expect(len > 8, 0)) {
         uint64_t w;
         memcpy(&w, p, 8);
-        h ^= w;
-        h *= 0x9e3779b97f4a7c15ULL;
-        h ^= h >> 32;
+        h = pion_wymix(w ^ s1, h ^ s2);
         p += 8;
         len -= 8;
     }
@@ -2004,11 +2030,9 @@ static inline uint64_t pion_str_hash(const PionString *s) {
     } else if (len == 1) {
         tail = (uint64_t)p[0];
     }
-    h ^= tail;
-    h *= 0xbf58476d1ce4e5b9ULL;
-    h ^= h >> 27;
-    h *= 0x94d049bb133111ebULL;
-    h ^= h >> 31;
+    h = pion_wymix(tail ^ s1, h ^ s2);
+    h = pion_wymix(h ^ (uint64_t)orig_len, s2 ^ 0x94d049bb133111ebULL);
+    if (!h) h = 1;
     return h;
 }
 
@@ -2019,7 +2043,9 @@ static PION_NOINLINE PION_HOT PionMapEntry *pion_map_find(
     uint64_t h;
     if (m->key_is_int) {
         uint64_t x = (uint64_t)(uintptr_t)k;
-        h = (x * 0x9E3779B97F4A7C15ULL) ^ (x >> 32);
+        uint64_t s1 = g_pion_hash_seed ^ 0x517cc1b727220a95ULL;
+        uint64_t s2 = g_pion_hash_seed2 ^ 0x9e3779b97f4a7c15ULL;
+        h = pion_wymix(x ^ s1, s2);
         if (!h) h = 1;
     } else {
         h = pion_str_hash((const PionString *)k);
