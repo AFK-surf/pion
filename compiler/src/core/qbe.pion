@@ -165,6 +165,7 @@ pub struct QbeGen {
   const_bool_vals : Map[String, Bool]
   global_min_len_arrs : Map[String, Int]
   freeze_fn_seen : Map[String, Bool]
+  vmap_seen : Map[String, Bool]
   eq_fn_seen : Map[String, Bool]
   strings : Array[String]
   string_ids : Map[String, Int]
@@ -1587,9 +1588,822 @@ fn qbe_lookup_const_ty(g : QbeGen, name : String) -> Option[Ty] {
 ///|
 fn qbe_map_key_is_int(kty : Ty) -> Bool {
   match kty {
-    TInt | TInt64 => true
+    TInt | TInt64 | TUInt | TUInt64 | TBool | TByte | TInt8 | TChar => true
     _ => false
   }
+}
+
+///|
+pub struct QbeVMapLayout {
+  kfields : Array[Ty]
+  k_offs : Array[Int]
+  v_off : Int
+  slot_bytes : Int
+}
+
+///|
+pub struct QbeVMapKeyArgs {
+  regs : Array[String]
+  abis : Array[String]
+}
+
+///|
+fn qbe_vmap_key_fields(g : QbeGen, kty : Ty) -> Array[Ty] {
+  match kty {
+    TTuple(elems) => {
+      if elems.length() < 2 || elems.length() > 6 {
+        return []
+      }
+      let mut i = 0
+      while i < elems.length() {
+        if !is_hashable_scalar_ty(elems[i]) {
+          return []
+        }
+        i = i + 1
+      }
+      elems
+    }
+    TStruct(sname, sargs) =>
+      match qbe_lookup_struct_info(g, sname) {
+        Some(si) => {
+          let n = si.field_tys.length()
+          if n < 1 || n > 6 {
+            return []
+          }
+          let subst = make_subst(si.decl.type_params, sargs)
+          let out : Array[Ty] = []
+          let mut i = 0
+          while i < n {
+            if si.field_muts[i] {
+              return []
+            }
+            let fty = subst_ty(si.field_tys[i], subst)
+            if !is_hashable_scalar_ty(fty) {
+              return []
+            }
+            out.push(fty)
+            i = i + 1
+          }
+          out
+        }
+        None => []
+      }
+    _ => []
+  }
+}
+
+///|
+fn qbe_is_vmap_key_ty(g : QbeGen, kty : Ty) -> Bool {
+  qbe_vmap_key_fields(g, kty).length() > 0
+}
+
+///|
+fn qbe_ty_has_vmap(g : QbeGen, ty : Ty, depth : Int) -> Bool {
+  if depth > 4 {
+    return false
+  }
+  if qbe_is_vmap_key_ty(g, ty) {
+    return true
+  }
+  match ty {
+    TMap(k, v) =>
+      qbe_is_vmap_key_ty(g, k) ||
+      qbe_ty_has_vmap(g, v, depth + 1)
+    TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      qbe_ty_has_vmap(g, e, depth + 1)
+    TResult(a, b) =>
+      qbe_ty_has_vmap(g, a, depth + 1) || qbe_ty_has_vmap(g, b, depth + 1)
+    _ => false
+  }
+}
+
+///|
+fn qbe_vmap_field_size(t : Ty) -> Int {
+  match t {
+    TBool | TByte | TInt8 => 1
+    TInt | TUInt | TFloat | TChar => 4
+    _ => 8
+  }
+}
+
+///|
+fn qbe_vmap_align_up(off : Int, align : Int) -> Int {
+  if align <= 1 {
+    off
+  } else {
+    ((off + align - 1) / align) * align
+  }
+}
+
+///|
+fn qbe_vmap_layout(kfields : Array[Ty], vty : Ty) -> QbeVMapLayout {
+  let k_offs : Array[Int] = []
+  let mut off = 0
+  let mut max_align = 1
+  let mut i = 0
+  while i < kfields.length() {
+    let sz = qbe_vmap_field_size(kfields[i])
+    if sz > max_align {
+      max_align = sz
+    }
+    off = qbe_vmap_align_up(off, sz)
+    k_offs.push(off)
+    off = off + sz
+    i = i + 1
+  }
+  let vsz = qbe_vmap_field_size(vty)
+  if vsz > max_align {
+    max_align = vsz
+  }
+  off = qbe_vmap_align_up(off, vsz)
+  let v_off = off
+  off = off + vsz
+  let slot_bytes = qbe_vmap_align_up(off, max_align)
+  QbeVMapLayout::{ kfields, k_offs, v_off, slot_bytes }
+}
+
+///|
+fn qbe_vmap_idx_mul(sb : StringBuilder, dst : String, idx : String, stride : Int) -> Unit {
+  if stride == 1 {
+    sb.write_string("    " + dst + " =l copy " + idx + "\n")
+  } else if stride == 2 {
+    sb.write_string("    " + dst + " =l shl " + idx + ", 1\n")
+  } else if stride == 4 {
+    sb.write_string("    " + dst + " =l shl " + idx + ", 2\n")
+  } else if stride == 8 {
+    sb.write_string("    " + dst + " =l shl " + idx + ", 3\n")
+  } else if stride == 16 {
+    sb.write_string("    " + dst + " =l shl " + idx + ", 4\n")
+  } else if stride == 32 {
+    sb.write_string("    " + dst + " =l shl " + idx + ", 5\n")
+  } else if stride == 64 {
+    sb.write_string("    " + dst + " =l shl " + idx + ", 6\n")
+  } else {
+    sb.write_string("    " + dst + " =l mul " + idx + ", " + stride.to_string() + "\n")
+  }
+}
+
+///|
+fn qbe_vmap_emit_hash(
+  sb : StringBuilder,
+  kfields : Array[Ty],
+  fregs : Array[String],
+  pfx : String,
+) -> Unit {
+  sb.write_string("    %h_" + pfx + "_0 =l copy 5871781006564002453\n")
+  let mut i = 0
+  while i < kfields.length() {
+    let prev = "%h_" + pfx + "_" + i.to_string()
+    let next = "%h_" + pfx + "_" + (i + 1).to_string()
+    let fl = match kfields[i] {
+      TInt => {
+        let t = "%hf_" + pfx + "_" + i.to_string()
+        sb.write_string("    " + t + " =l extsw " + fregs[i] + "\n")
+        t
+      }
+      TUInt => {
+        let t = "%hf_" + pfx + "_" + i.to_string()
+        sb.write_string("    " + t + " =l extuw " + fregs[i] + "\n")
+        t
+      }
+      _ => fregs[i]
+    }
+    let hx = "%hx_" + pfx + "_" + i.to_string()
+    sb.write_string("    " + hx + " =l xor " + prev + ", " + fl + "\n")
+    sb.write_string("    " + next + " =l mul " + hx + ", -7046029254386353131\n")
+    i = i + 1
+  }
+  let hlast = "%h_" + pfx + "_" + kfields.length().to_string()
+  sb.write_string("    %hs1_" + pfx + " =l shr " + hlast + ", 30\n")
+  sb.write_string("    %hm1_" + pfx + " =l xor " + hlast + ", %hs1_" + pfx + "\n")
+  sb.write_string("    %hm2_" + pfx + " =l mul %hm1_" + pfx + ", -4658895280553007687\n")
+  sb.write_string("    %hs2_" + pfx + " =l shr %hm2_" + pfx + ", 27\n")
+  sb.write_string("    %hfin_" + pfx + " =l xor %hm2_" + pfx + ", %hs2_" + pfx + "\n")
+  sb.write_string("    %ht1_" + pfx + " =l shr %hfin_" + pfx + ", 57\n")
+  sb.write_string("    %ht2_" + pfx + " =w copy %ht1_" + pfx + "\n")
+  sb.write_string("    %tag_" + pfx + " =w or %ht2_" + pfx + ", 128\n")
+}
+
+///|
+fn qbe_vmap_emit_load_field(
+  sb : StringBuilder,
+  dst : String,
+  ptr : String,
+  fty : Ty,
+  pfx : String,
+) -> Unit {
+  match fty {
+    TInt => sb.write_string("    " + dst + " =w loadsw " + ptr + "\n")
+    TUInt => sb.write_string("    " + dst + " =w loaduw " + ptr + "\n")
+    TFloat => sb.write_string("    " + dst + " =s loads " + ptr + "\n")
+    TDouble => sb.write_string("    " + dst + " =d loadd " + ptr + "\n")
+    TChar => {
+      sb.write_string("    %lw_" + pfx + " =w loaduw " + ptr + "\n")
+      sb.write_string("    " + dst + " =l extuw %lw_" + pfx + "\n")
+    }
+    TBool | TByte => {
+      sb.write_string("    %lw_" + pfx + " =w loadub " + ptr + "\n")
+      sb.write_string("    " + dst + " =l extuw %lw_" + pfx + "\n")
+    }
+    TInt8 => {
+      sb.write_string("    %lw_" + pfx + " =w loadsb " + ptr + "\n")
+      sb.write_string("    " + dst + " =l extsw %lw_" + pfx + "\n")
+    }
+    _ => sb.write_string("    " + dst + " =l loadl " + ptr + "\n")
+  }
+}
+
+///|
+fn qbe_vmap_emit_store_field(
+  sb : StringBuilder,
+  vreg : String,
+  ptr : String,
+  fty : Ty,
+  pfx : String,
+) -> Unit {
+  match fty {
+    TInt | TUInt => sb.write_string("    storew " + vreg + ", " + ptr + "\n")
+    TFloat => sb.write_string("    stores " + vreg + ", " + ptr + "\n")
+    TDouble => sb.write_string("    stored " + vreg + ", " + ptr + "\n")
+    TChar => {
+      sb.write_string("    %sw_" + pfx + " =w copy " + vreg + "\n")
+      sb.write_string("    storew %sw_" + pfx + ", " + ptr + "\n")
+    }
+    TBool | TByte | TInt8 => {
+      sb.write_string("    %sw_" + pfx + " =w copy " + vreg + "\n")
+      sb.write_string("    storeb %sw_" + pfx + ", " + ptr + "\n")
+    }
+    _ => sb.write_string("    storel " + vreg + ", " + ptr + "\n")
+  }
+}
+
+///|
+fn qbe_vmap_emit_val_to_l(
+  sb : StringBuilder,
+  dst : String,
+  vreg : String,
+  vty : Ty,
+  pfx : String,
+) -> Unit {
+  match vty {
+    TInt => sb.write_string("    " + dst + " =l extsw " + vreg + "\n")
+    TUInt => sb.write_string("    " + dst + " =l extuw " + vreg + "\n")
+    TFloat => {
+      sb.write_string("    %fw_" + pfx + " =w cast " + vreg + "\n")
+      sb.write_string("    " + dst + " =l extuw %fw_" + pfx + "\n")
+    }
+    TDouble => sb.write_string("    " + dst + " =l cast " + vreg + "\n")
+    _ => sb.write_string("    " + dst + " =l copy " + vreg + "\n")
+  }
+}
+
+///|
+fn qbe_vmap_emit_key_cmp(
+  sb : StringBuilder,
+  lay : QbeVMapLayout,
+  slot_ptr : String,
+  fregs : Array[String],
+  lbl_hit : String,
+  lbl_miss : String,
+  pfx : String,
+) -> Unit {
+  let n = lay.kfields.length()
+  let mut i = 0
+  while i < n {
+    let fp = if lay.k_offs[i] == 0 {
+      slot_ptr
+    } else {
+      let t = "%kp_" + pfx + "_" + i.to_string()
+      sb.write_string("    " + t + " =l add " + slot_ptr + ", " + lay.k_offs[i].to_string() + "\n")
+      t
+    }
+    let sf = "%kf_" + pfx + "_" + i.to_string()
+    qbe_vmap_emit_load_field(sb, sf, fp, lay.kfields[i], pfx + "_" + i.to_string())
+    let eq = "%keq_" + pfx + "_" + i.to_string()
+    match lay.kfields[i] {
+      TInt | TUInt => sb.write_string("    " + eq + " =w ceqw " + fregs[i] + ", " + sf + "\n")
+      _ => sb.write_string("    " + eq + " =w ceql " + fregs[i] + ", " + sf + "\n")
+    }
+    let next_lbl = if i + 1 == n {
+      lbl_hit
+    } else {
+      "@cmp_" + pfx + "_" + (i + 1).to_string()
+    }
+    sb.write_string("    jnz " + eq + ", " + next_lbl + ", " + lbl_miss + "\n")
+    if i + 1 < n {
+      sb.write_string(next_lbl + "\n")
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn qbe_vmap_sym_base(g : QbeGen, kty : Ty, vty : Ty) -> String {
+  g.pkg_prefix + "vm_" + qbe_mangle_ty(kty) + "_" + qbe_mangle_ty(vty)
+}
+
+///|
+fn qbe_vmap_param_sig(kfields : Array[Ty]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < kfields.length() {
+    sb.write_string(", ")
+    sb.write_string(qbe_abi_ty(kfields[i]))
+    sb.write_string(" %k")
+    sb.write_string(i.to_string())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn qbe_ensure_vmap_fns(g : QbeGen, kty : Ty, vty : Ty) -> String {
+  let m = qbe_vmap_sym_base(g, kty, vty)
+  if g.vmap_seen.contains(m) {
+    return m
+  }
+  g.vmap_seen.set(m, true)
+  let kfields = qbe_vmap_key_fields(g, kty)
+  let lay = qbe_vmap_layout(kfields, vty)
+  let n = kfields.length()
+  let kregs : Array[String] = []
+  let mut ki = 0
+  while ki < n {
+    kregs.push("%k" + ki.to_string())
+    ki = ki + 1
+  }
+  let ksig = qbe_vmap_param_sig(kfields)
+  let vabi = qbe_abi_ty(vty)
+  let v_is_obj = qbe_is_obj_ty(vty)
+  let per_slot = 1 + lay.slot_bytes
+  let msg_id = qbe_intern_cstring(g, "key not found in Map")
+  let file_id = qbe_intern_cstring(g, "<vmap>")
+  let sb = StringBuilder()
+
+  // 1. drop
+  sb.write_string("function $pion_vmap_drop_" + m + "(l %m) {\n@start\n")
+  sb.write_string("    %bp =l add %m, 16\n    %buf =l loadl %bp\n    jnz %buf, @has_buf, @done\n@has_buf\n")
+  if v_is_obj {
+    sb.write_string("    %cp =l add %m, 8\n    %cap =l loadl %cp\n    %slots =l add %buf, %cap\n    %i_sl =l alloc8 8\n    storel 0, %i_sl\n    jmp @loop\n@loop\n")
+    sb.write_string("    %i =l loadl %i_sl\n    %lt =w csltl %i, %cap\n    jnz %lt, @step, @free_buf\n@step\n")
+    sb.write_string("    %ctp =l add %buf, %i\n    %ct =w loadub %ctp\n    jnz %ct, @decv, @next\n@decv\n")
+    qbe_vmap_idx_mul(sb, "%soff", "%i", lay.slot_bytes)
+    sb.write_string("    %sp =l add %slots, %soff\n    %vp =l add %sp, " + lay.v_off.to_string() + "\n    %vv =l loadl %vp\n    call $pion_rc_dec(l %vv)\n@next\n")
+    sb.write_string("    %ni =l add %i, 1\n    storel %ni, %i_sl\n    jmp @loop\n@free_buf\n")
+  }
+  sb.write_string("    call $pion_ptr_free(l %buf)\n@done\n    ret\n}\n\n")
+
+  // 2. new(init_cap)
+  sb.write_string("function l $pion_vmap_new_" + m + "(l %init_cap) {\n@start\n")
+  sb.write_string("    %m =l call $pion_alloc_uninit(w 24, w 4, l $pion_vmap_drop_" + m + ")\n")
+  sb.write_string("    storel 0, %m\n    %p8 =l add %m, 8\n    storel 0, %p8\n    %p16 =l add %m, 16\n    storel 0, %p16\n")
+  sb.write_string("    %pos =w csgtl %init_cap, 0\n    jnz %pos, @prealloc, @done\n@prealloc\n")
+  sb.write_string("    %t4 =l shl %init_cap, 2\n    %t3 =l div %t4, 3\n    %need =l add %t3, 1\n    %c_sl =l alloc8 8\n    storel 16, %c_sl\n    jmp @cloop\n@cloop\n")
+  sb.write_string("    %c =l loadl %c_sl\n    %clt =w csltl %c, %need\n    jnz %clt, @cdbl, @calloc\n@cdbl\n")
+  sb.write_string("    %c2 =l shl %c, 1\n    storel %c2, %c_sl\n    jmp @cloop\n@calloc\n")
+  sb.write_string("    %tot =l mul %c, " + per_slot.to_string() + "\n    %buf =l call $pion_ptr_alloc(l %tot)\n")
+  sb.write_string("    storel %c, %p8\n    storel %buf, %p16\n@done\n    ret %m\n}\n\n")
+
+  // 3. grow(m, new_cap)
+  sb.write_string("function $pion_vmap_grow_" + m + "(l %m, l %ncap) {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %ocap =l loadl %p8\n    %p16 =l add %m, 16\n    %obuf =l loadl %p16\n")
+  sb.write_string("    %tot =l mul %ncap, " + per_slot.to_string() + "\n    %nbuf =l call $pion_ptr_alloc(l %tot)\n")
+  sb.write_string("    storel %ncap, %p8\n    storel %nbuf, %p16\n    jnz %obuf, @rehash, @done\n@rehash\n")
+  sb.write_string("    %oslots =l add %obuf, %ocap\n    %nslots =l add %nbuf, %ncap\n    %nmask =l sub %ncap, 1\n")
+  sb.write_string("    %i_sl =l alloc8 8\n    %d_sl =l alloc8 8\n    storel 0, %i_sl\n    jmp @loop\n@loop\n")
+  sb.write_string("    %i =l loadl %i_sl\n    %lt =w csltl %i, %ocap\n    jnz %lt, @step, @free_old\n@step\n")
+  sb.write_string("    %ocp =l add %obuf, %i\n    %oc =w loadub %ocp\n    jnz %oc, @move, @next\n@move\n")
+  qbe_vmap_idx_mul(sb, "%osoff", "%i", lay.slot_bytes)
+  sb.write_string("    %osp =l add %oslots, %osoff\n")
+  let g_fregs : Array[String] = []
+  ki = 0
+  while ki < n {
+    let fp = if lay.k_offs[ki] == 0 {
+      "%osp"
+    } else {
+      let t = "%okp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %osp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    let fr = "%okf_" + ki.to_string()
+    qbe_vmap_emit_load_field(sb, fr, fp, kfields[ki], "gr_" + ki.to_string())
+    g_fregs.push(fr)
+    ki = ki + 1
+  }
+  sb.write_string("    %ovp =l add %osp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_load_field(sb, "%ov", "%ovp", vty, "gr_v")
+  qbe_vmap_emit_hash(sb, kfields, g_fregs, "gr")
+  sb.write_string("    %d0 =l and %hfin_gr, %nmask\n    storel %d0, %d_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %d =l loadl %d_sl\n    %ncp =l add %nbuf, %d\n    %nc =w loadub %ncp\n    jnz %nc, @pnext, @put\n@pnext\n")
+  sb.write_string("    %d1 =l add %d, 1\n    %d2 =l and %d1, %nmask\n    storel %d2, %d_sl\n    jmp @probe\n@put\n")
+  sb.write_string("    storeb %oc, %ncp\n")
+  qbe_vmap_idx_mul(sb, "%nsoff", "%d", lay.slot_bytes)
+  sb.write_string("    %nsp =l add %nslots, %nsoff\n")
+  ki = 0
+  while ki < n {
+    let fp = if lay.k_offs[ki] == 0 {
+      "%nsp"
+    } else {
+      let t = "%nkp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %nsp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    qbe_vmap_emit_store_field(sb, g_fregs[ki], fp, kfields[ki], "gw_" + ki.to_string())
+    ki = ki + 1
+  }
+  sb.write_string("    %nvp =l add %nsp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_store_field(sb, "%ov", "%nvp", vty, "gw_v")
+  sb.write_string("@next\n    %ni =l add %i, 1\n    storel %ni, %i_sl\n    jmp @loop\n@free_old\n    call $pion_ptr_free(l %obuf)\n@done\n    ret\n}\n\n")
+
+  // 4. set(m, k0.., val)
+  sb.write_string("function $pion_vmap_set_" + m + "(l %m" + ksig + ", " + vabi + " %val) {\n@start\n")
+  sb.write_string("    %len =l loadl %m\n    %p8 =l add %m, 8\n    %cap0 =l loadl %p8\n    jnz %cap0, @chk_load, @grow_init\n@grow_init\n")
+  sb.write_string("    call $pion_vmap_grow_" + m + "(l %m, l 16)\n    jmp @ready\n@chk_load\n")
+  sb.write_string("    %lp1 =l add %len, 1\n    %lhs =l shl %lp1, 2\n    %rhs =l mul %cap0, 3\n    %needg =w csgtl %lhs, %rhs\n    %eqg =w ceql %lhs, %rhs\n    %dog =w or %needg, %eqg\n    jnz %dog, @grow_dbl, @ready\n@grow_dbl\n")
+  sb.write_string("    %ncap =l shl %cap0, 1\n    call $pion_vmap_grow_" + m + "(l %m, l %ncap)\n@ready\n")
+  sb.write_string("    %cap =l loadl %p8\n    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n    %mask =l sub %cap, 1\n")
+  qbe_vmap_emit_hash(sb, kfields, kregs, "set")
+  sb.write_string("    %idx_sl =l alloc8 8\n    %i0 =l and %hfin_set, %mask\n    storel %i0, %idx_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %idx =l loadl %idx_sl\n    %cp =l add %buf, %idx\n    %c =w loadub %cp\n    jnz %c, @chk, @ins\n@chk\n")
+  sb.write_string("    %teq =w ceqw %c, %tag_set\n    jnz %teq, @cmp, @next\n@cmp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%idx", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n")
+  qbe_vmap_emit_key_cmp(sb, lay, "%sp", kregs, "@hit", "@next", "set")
+  sb.write_string("@next\n    %n1 =l add %idx, 1\n    %n2 =l and %n1, %mask\n    storel %n2, %idx_sl\n    jmp @probe\n@hit\n")
+  sb.write_string("    %hvp =l add %sp, " + lay.v_off.to_string() + "\n")
+  if v_is_obj {
+    sb.write_string("    call $pion_rc_inc(l %val)\n    %oldv =l loadl %hvp\n    storel %val, %hvp\n    call $pion_rc_dec(l %oldv)\n")
+  } else {
+    qbe_vmap_emit_store_field(sb, "%val", "%hvp", vty, "shv")
+  }
+  sb.write_string("    ret\n@ins\n    storeb %tag_set, %cp\n")
+  qbe_vmap_idx_mul(sb, "%isoff", "%idx", lay.slot_bytes)
+  sb.write_string("    %isp =l add %slots, %isoff\n")
+  ki = 0
+  while ki < n {
+    let fp = if lay.k_offs[ki] == 0 {
+      "%isp"
+    } else {
+      let t = "%ikp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %isp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    qbe_vmap_emit_store_field(sb, kregs[ki], fp, kfields[ki], "si_" + ki.to_string())
+    ki = ki + 1
+  }
+  sb.write_string("    %ivp =l add %isp, " + lay.v_off.to_string() + "\n")
+  if v_is_obj {
+    sb.write_string("    call $pion_rc_inc(l %val)\n")
+  }
+  qbe_vmap_emit_store_field(sb, "%val", "%ivp", vty, "siv")
+  sb.write_string("    %nlen =l add %len, 1\n    storel %nlen, %m\n    ret\n}\n\n")
+
+  // 5. try_get(m, k0.., out_slot) -> w (stores 64-bit l repr into out_slot)
+  sb.write_string("function w $pion_vmap_try_get_" + m + "(l %m" + ksig + ", l %out_slot) {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @miss\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n    %mask =l sub %cap, 1\n")
+  qbe_vmap_emit_hash(sb, kfields, kregs, "tg")
+  sb.write_string("    %idx_sl =l alloc8 8\n    %i0 =l and %hfin_tg, %mask\n    storel %i0, %idx_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %idx =l loadl %idx_sl\n    %cp =l add %buf, %idx\n    %c =w loadub %cp\n    jnz %c, @chk, @miss\n@chk\n")
+  sb.write_string("    %teq =w ceqw %c, %tag_tg\n    jnz %teq, @cmp, @next\n@cmp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%idx", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n")
+  qbe_vmap_emit_key_cmp(sb, lay, "%sp", kregs, "@hit", "@next", "tg")
+  sb.write_string("@next\n    %n1 =l add %idx, 1\n    %n2 =l and %n1, %mask\n    storel %n2, %idx_sl\n    jmp @probe\n@hit\n")
+  sb.write_string("    %vp =l add %sp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_load_field(sb, "%vv", "%vp", vty, "tgv")
+  qbe_vmap_emit_val_to_l(sb, "%vl", "%vv", vty, "tgvl")
+  sb.write_string("    storel %vl, %out_slot\n    ret 1\n@miss\n    ret 0\n}\n\n")
+
+  // 6. get(m, k0..) -> vabi
+  sb.write_string("function " + vabi + " $pion_vmap_get_" + m + "(l %m" + ksig + ") {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @miss\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n    %mask =l sub %cap, 1\n")
+  qbe_vmap_emit_hash(sb, kfields, kregs, "gt")
+  sb.write_string("    %idx_sl =l alloc8 8\n    %i0 =l and %hfin_gt, %mask\n    storel %i0, %idx_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %idx =l loadl %idx_sl\n    %cp =l add %buf, %idx\n    %c =w loadub %cp\n    jnz %c, @chk, @miss\n@chk\n")
+  sb.write_string("    %teq =w ceqw %c, %tag_gt\n    jnz %teq, @cmp, @next\n@cmp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%idx", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n")
+  qbe_vmap_emit_key_cmp(sb, lay, "%sp", kregs, "@hit", "@next", "gt")
+  sb.write_string("@next\n    %n1 =l add %idx, 1\n    %n2 =l and %n1, %mask\n    storel %n2, %idx_sl\n    jmp @probe\n@hit\n")
+  sb.write_string("    %vp =l add %sp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_load_field(sb, "%vv", "%vp", vty, "gtv")
+  sb.write_string("    ret %vv\n@miss\n    call $pion_panic(l $pion_cstr_" + msg_id.to_string() + ", l $pion_cstr_" + file_id.to_string() + ", w 0)\n    hlt\n}\n\n")
+
+  // 7. has(m, k0..) -> w
+  sb.write_string("function w $pion_vmap_has_" + m + "(l %m" + ksig + ") {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @miss\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n    %mask =l sub %cap, 1\n")
+  qbe_vmap_emit_hash(sb, kfields, kregs, "hs")
+  sb.write_string("    %idx_sl =l alloc8 8\n    %i0 =l and %hfin_hs, %mask\n    storel %i0, %idx_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %idx =l loadl %idx_sl\n    %cp =l add %buf, %idx\n    %c =w loadub %cp\n    jnz %c, @chk, @miss\n@chk\n")
+  sb.write_string("    %teq =w ceqw %c, %tag_hs\n    jnz %teq, @cmp, @next\n@cmp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%idx", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n")
+  qbe_vmap_emit_key_cmp(sb, lay, "%sp", kregs, "@hit", "@next", "hs")
+  sb.write_string("@next\n    %n1 =l add %idx, 1\n    %n2 =l and %n1, %mask\n    storel %n2, %idx_sl\n    jmp @probe\n@hit\n    ret 1\n@miss\n    ret 0\n}\n\n")
+
+  // 8. remove(m, k0..) with backward-shift deletion
+  sb.write_string("function $pion_vmap_remove_" + m + "(l %m" + ksig + ") {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @done\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n    %mask =l sub %cap, 1\n")
+  qbe_vmap_emit_hash(sb, kfields, kregs, "rm")
+  sb.write_string("    %idx_sl =l alloc8 8\n    %hole_sl =l alloc8 8\n    %cur_sl =l alloc8 8\n")
+  sb.write_string("    %i0 =l and %hfin_rm, %mask\n    storel %i0, %idx_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %idx =l loadl %idx_sl\n    %cp =l add %buf, %idx\n    %c =w loadub %cp\n    jnz %c, @chk, @done\n@chk\n")
+  sb.write_string("    %teq =w ceqw %c, %tag_rm\n    jnz %teq, @cmp, @next\n@cmp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%idx", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n")
+  qbe_vmap_emit_key_cmp(sb, lay, "%sp", kregs, "@hit", "@next", "rm")
+  sb.write_string("@next\n    %n1 =l add %idx, 1\n    %n2 =l and %n1, %mask\n    storel %n2, %idx_sl\n    jmp @probe\n@hit\n")
+  sb.write_string("    storeb 0, %cp\n")
+  if v_is_obj {
+    sb.write_string("    %rvp =l add %sp, " + lay.v_off.to_string() + "\n    %rv =l loadl %rvp\n    call $pion_rc_dec(l %rv)\n")
+  }
+  sb.write_string("    %olen =l loadl %m\n    %nlen =l sub %olen, 1\n    storel %nlen, %m\n")
+  sb.write_string("    storel %idx, %hole_sl\n    %c0a =l add %idx, 1\n    %c0 =l and %c0a, %mask\n    storel %c0, %cur_sl\n    jmp @shift\n@shift\n")
+  sb.write_string("    %cur =l loadl %cur_sl\n    %ccp =l add %buf, %cur\n    %cc =w loadub %ccp\n    jnz %cc, @s_chk, @done\n@s_chk\n")
+  qbe_vmap_idx_mul(sb, "%csoff", "%cur", lay.slot_bytes)
+  sb.write_string("    %csp =l add %slots, %csoff\n")
+  let rm_fregs : Array[String] = []
+  ki = 0
+  while ki < n {
+    let fp = if lay.k_offs[ki] == 0 {
+      "%csp"
+    } else {
+      let t = "%rkp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %csp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    let fr = "%rkf_" + ki.to_string()
+    qbe_vmap_emit_load_field(sb, fr, fp, kfields[ki], "rmr_" + ki.to_string())
+    rm_fregs.push(fr)
+    ki = ki + 1
+  }
+  qbe_vmap_emit_hash(sb, kfields, rm_fregs, "rms")
+  sb.write_string("    %nat =l and %hfin_rms, %mask\n    %hole =l loadl %hole_sl\n")
+  sb.write_string("    %dh0 =l sub %hole, %nat\n    %dh =l and %dh0, %mask\n")
+  sb.write_string("    %dc0 =l sub %cur, %nat\n    %dc =l and %dc0, %mask\n")
+  sb.write_string("    %domv =w cultl %dh, %dc\n    jnz %domv, @s_mv, @s_adv\n@s_mv\n")
+  sb.write_string("    %hcp =l add %buf, %hole\n    storeb %cc, %hcp\n    storeb 0, %ccp\n")
+  qbe_vmap_idx_mul(sb, "%hsoff", "%hole", lay.slot_bytes)
+  sb.write_string("    %hsp =l add %slots, %hsoff\n")
+  ki = 0
+  while ki < n {
+    let fp = if lay.k_offs[ki] == 0 {
+      "%hsp"
+    } else {
+      let t = "%hkp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %hsp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    qbe_vmap_emit_store_field(sb, rm_fregs[ki], fp, kfields[ki], "rmw_" + ki.to_string())
+    ki = ki + 1
+  }
+  sb.write_string("    %cvp =l add %csp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_load_field(sb, "%cv", "%cvp", vty, "rmv_r")
+  sb.write_string("    %hvp =l add %hsp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_store_field(sb, "%cv", "%hvp", vty, "rmv_w")
+  sb.write_string("    storel %cur, %hole_sl\n@s_adv\n")
+  sb.write_string("    %c1 =l add %cur, 1\n    %c2 =l and %c1, %mask\n    storel %c2, %cur_sl\n    jmp @shift\n@done\n    ret\n}\n\n")
+
+  // 9. clear(m)
+  sb.write_string("function $pion_vmap_clear_" + m + "(l %m) {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @done\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    jnz %buf, @has_buf, @done\n@has_buf\n")
+  sb.write_string("    %i_sl =l alloc8 8\n")
+  if v_is_obj {
+    sb.write_string("    %slots =l add %buf, %cap\n    storel 0, %i_sl\n    jmp @dloop\n@dloop\n")
+    sb.write_string("    %di =l loadl %i_sl\n    %dlt =w csltl %di, %cap\n    jnz %dlt, @dstep, @zstart\n@dstep\n")
+    sb.write_string("    %dcp =l add %buf, %di\n    %dc =w loadub %dcp\n    jnz %dc, @decv, @dnext\n@decv\n")
+    qbe_vmap_idx_mul(sb, "%dsoff", "%di", lay.slot_bytes)
+    sb.write_string("    %dsp =l add %slots, %dsoff\n    %dvp =l add %dsp, " + lay.v_off.to_string() + "\n    %dv =l loadl %dvp\n    call $pion_rc_dec(l %dv)\n@dnext\n")
+    sb.write_string("    %dni =l add %di, 1\n    storel %dni, %i_sl\n    jmp @dloop\n@zstart\n")
+  }
+  sb.write_string("    storel 0, %i_sl\n    jmp @zloop\n@zloop\n")
+  sb.write_string("    %zi =l loadl %i_sl\n    %zlt =w csltl %zi, %cap\n    jnz %zlt, @zstep, @zdone\n@zstep\n")
+  sb.write_string("    %zp =l add %buf, %zi\n    storel 0, %zp\n    %zni =l add %zi, 8\n    storel %zni, %i_sl\n    jmp @zloop\n@zdone\n    storel 0, %m\n@done\n    ret\n}\n\n")
+
+  // 10. copy(m) -> l
+  sb.write_string("function l $pion_vmap_copy_" + m + "(l %m) {\n@start\n")
+  sb.write_string("    %nm =l call $pion_vmap_new_" + m + "(l 0)\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @done\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    jnz %buf, @has_buf, @done\n@has_buf\n")
+  sb.write_string("    %tot =l mul %cap, " + per_slot.to_string() + "\n    %nbuf =l call $pion_ptr_alloc(l %tot)\n")
+  sb.write_string("    %len =l loadl %m\n    storel %len, %nm\n    %np8 =l add %nm, 8\n    storel %cap, %np8\n    %np16 =l add %nm, 16\n    storel %nbuf, %np16\n")
+  sb.write_string("    %oslots =l add %buf, %cap\n    %nslots =l add %nbuf, %cap\n    %i_sl =l alloc8 8\n    storel 0, %i_sl\n    jmp @loop\n@loop\n")
+  sb.write_string("    %i =l loadl %i_sl\n    %lt =w csltl %i, %cap\n    jnz %lt, @step, @done\n@step\n")
+  sb.write_string("    %ocp =l add %buf, %i\n    %oc =w loadub %ocp\n    jnz %oc, @cp_slot, @next\n@cp_slot\n")
+  sb.write_string("    %ncp =l add %nbuf, %i\n    storeb %oc, %ncp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%i", lay.slot_bytes)
+  sb.write_string("    %osp =l add %oslots, %soff\n    %nsp =l add %nslots, %soff\n")
+  ki = 0
+  while ki < n {
+    let ofp = if lay.k_offs[ki] == 0 {
+      "%osp"
+    } else {
+      let t = "%cokp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %osp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    let nfp = if lay.k_offs[ki] == 0 {
+      "%nsp"
+    } else {
+      let t = "%cnkp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %nsp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    let fr = "%ckf_" + ki.to_string()
+    qbe_vmap_emit_load_field(sb, fr, ofp, kfields[ki], "cpr_" + ki.to_string())
+    qbe_vmap_emit_store_field(sb, fr, nfp, kfields[ki], "cpw_" + ki.to_string())
+    ki = ki + 1
+  }
+  sb.write_string("    %ovp =l add %osp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_load_field(sb, "%cv", "%ovp", vty, "cpvr")
+  if v_is_obj {
+    sb.write_string("    call $pion_rc_inc(l %cv)\n")
+  }
+  sb.write_string("    %nvp =l add %nsp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_store_field(sb, "%cv", "%nvp", vty, "cpvw")
+  sb.write_string("@next\n    %ni =l add %i, 1\n    storel %ni, %i_sl\n    jmp @loop\n@done\n    ret %nm\n}\n\n")
+
+  // 11. keys(m) -> l (Array[K])
+  let arr_flags = qbe_arr_new_flags_w(g, kty)
+  let flat_stride = qbe_flat_pod_stride(g, kty)
+  sb.write_string("function l $pion_vmap_keys_" + m + "(l %m) {\n@start\n")
+  sb.write_string("    %len =l loadl %m\n    %arr =l call $pion_arr_new(l %len, w " + arr_flags + ")\n")
+  sb.write_string("    jnz %len, @has_len, @done\n@has_len\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n")
+  sb.write_string("    %adp_p =l add %arr, 24\n    %adp =l loadl %adp_p\n")
+  sb.write_string("    %i_sl =l alloc8 8\n    %o_sl =l alloc8 8\n    storel 0, %i_sl\n    storel 0, %o_sl\n    jmp @loop\n@loop\n")
+  sb.write_string("    %i =l loadl %i_sl\n    %lt =w csltl %i, %cap\n    jnz %lt, @step, @fin\n@step\n")
+  sb.write_string("    %cp =l add %buf, %i\n    %c =w loadub %cp\n    jnz %c, @emit_k, @next\n@emit_k\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%i", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n    %oi =l loadl %o_sl\n")
+  if flat_stride > 0 {
+    qbe_vmap_idx_mul(sb, "%eoff", "%oi", flat_stride)
+    sb.write_string("    %dst =l add %adp, %eoff\n")
+  } else {
+    let kbytes = n * 8
+    sb.write_string("    %dst =l call $pion_alloc_uninit(w " + kbytes.to_string() + ", w 4, l 0)\n")
+    sb.write_string("    %eoff =l shl %oi, 3\n    %aep =l add %adp, %eoff\n    storel %dst, %aep\n")
+  }
+  ki = 0
+  while ki < n {
+    let sfp = if lay.k_offs[ki] == 0 {
+      "%sp"
+    } else {
+      let t = "%ksfp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %sp, " + lay.k_offs[ki].to_string() + "\n")
+      t
+    }
+    let fr = "%ksf_" + ki.to_string()
+    qbe_vmap_emit_load_field(sb, fr, sfp, kfields[ki], "ksr_" + ki.to_string())
+    let fl = "%ksfl_" + ki.to_string()
+    qbe_vmap_emit_val_to_l(sb, fl, fr, kfields[ki], "ksl_" + ki.to_string())
+    let dfp = if ki == 0 {
+      "%dst"
+    } else {
+      let t = "%kdfp_" + ki.to_string()
+      sb.write_string("    " + t + " =l add %dst, " + (ki * 8).to_string() + "\n")
+      t
+    }
+    sb.write_string("    storel " + fl + ", " + dfp + "\n")
+    ki = ki + 1
+  }
+  sb.write_string("    %noi =l add %oi, 1\n    storel %noi, %o_sl\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_sl\n    jmp @loop\n@fin\n")
+  sb.write_string("    %flen =l loadl %o_sl\n    storel %flen, %arr\n@done\n    ret %arr\n}\n\n")
+
+  g.extra_fns.push(sb.to_string())
+  m
+}
+
+///|
+fn qbe_emit_vmap_key_args(
+  g : QbeGen,
+  key_expr : Expr,
+  kty : Ty,
+  args_pure : Bool,
+) -> QbeVMapKeyArgs {
+  let kfields = qbe_vmap_key_fields(g, kty)
+  let n = kfields.length()
+  let regs : Array[String] = []
+  let abis : Array[String] = []
+  // Zero-alloc destructuring for tuple literals `(a, b, c)` and struct literals `Tri::{ ... }`
+  match kty {
+    TTuple(_) =>
+      match key_expr {
+        ETuple(elems, _) =>
+          if elems.length() == n {
+            let mut i = 0
+            while i < n {
+              let ev = qbe_emit_expr(g, elems[i], Some(kfields[i]))
+              let cv = qbe_coerce_val(g, ev, kfields[i])
+              regs.push(cv)
+              abis.push(qbe_abi_ty(kfields[i]))
+              i = i + 1
+            }
+            return QbeVMapKeyArgs::{ regs, abis }
+          }
+        _ => ()
+      }
+    TStruct(sname, _) =>
+      match key_expr {
+        EStructLit(_, None, lit_fields, _) =>
+          match qbe_lookup_struct_info(g, sname) {
+            Some(si) =>
+              if si.field_names.length() == n {
+                let slot_regs : Array[String] = []
+                let mut si_i = 0
+                while si_i < n {
+                  slot_regs.push("")
+                  si_i = si_i + 1
+                }
+                let mut fi = 0
+                while fi < lit_fields.length() {
+                  let lf = lit_fields[fi]
+                  let mut pos = -1
+                  let mut j = 0
+                  while j < n {
+                    if si.field_names[j] == lf.name {
+                      pos = j
+                    }
+                    j = j + 1
+                  }
+                  if pos >= 0 {
+                    let ev = qbe_emit_expr(g, lf.value, Some(kfields[pos]))
+                    slot_regs[pos] = qbe_coerce_val(g, ev, kfields[pos])
+                  }
+                  fi = fi + 1
+                }
+                let mut all_ok = true
+                let mut j = 0
+                while j < n {
+                  if slot_regs[j] == "" {
+                    all_ok = false
+                  }
+                  j = j + 1
+                }
+                if all_ok {
+                  let mut k = 0
+                  while k < n {
+                    regs.push(slot_regs[k])
+                    abis.push(qbe_abi_ty(kfields[k]))
+                    k = k + 1
+                  }
+                  return QbeVMapKeyArgs::{ regs, abis }
+                }
+              }
+            None => ()
+          }
+        _ => ()
+      }
+    _ => ()
+  }
+  // Fallback: evaluate key expression (borrowing if pure) and load fields from heap object
+  let ka = qbe_emit_arg_maybe_borrow_ext(
+    g,
+    key_expr,
+    Some(kty),
+    args_pure,
+    args_pure && qbe_loop_has_no_calls_expr(g, key_expr),
+  )
+  let kv = ka.qv
+  let mut i = 0
+  while i < n {
+    let fp = if i == 0 {
+      kv.reg
+    } else {
+      let t = qbe_tmp(g)
+      qbe_emit(g, t + " =l add " + kv.reg + ", " + (i * 8).to_string())
+      t
+    }
+    let rl = qbe_tmp(g)
+    qbe_emit(g, rl + " =l loadl " + fp)
+    let fv = qbe_from_l(g, rl, kfields[i])
+    regs.push(fv)
+    abis.push(qbe_abi_ty(kfields[i]))
+    i = i + 1
+  }
+  if !ka.borrowed {
+    qbe_rc_dec(g, kv.reg, kv.ty)
+  }
+  QbeVMapKeyArgs::{ regs, abis }
+}
+
+///|
+fn qbe_vmap_key_call_args(ka : QbeVMapKeyArgs) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < ka.regs.length() {
+    sb.write_string(", ")
+    sb.write_string(ka.abis[i])
+    sb.write_string(" ")
+    sb.write_string(ka.regs[i])
+    i = i + 1
+  }
+  sb.to_string()
 }
 
 ///|
@@ -2637,7 +3451,10 @@ fn qbe_call_needs_mono(
   while i < fd.type_params.length() {
     match subst.get(fd.type_params[i]) {
       Some(t) => {
-        if qbe_is_u8_array_elem(g, t) || qbe_is_f32_array_elem(g, t) || qbe_flat_pod_stride(g, t) > 0 {
+        if qbe_is_u8_array_elem(g, t) ||
+          qbe_is_f32_array_elem(g, t) ||
+          qbe_flat_pod_stride(g, t) > 0 ||
+          qbe_ty_has_vmap(g, t, 0) {
           return true
         }
         if qbe_ty_needs_deep_freeze(g, t, 0) {
@@ -13786,6 +14603,72 @@ fn qbe_try_emit_scalar_opt_res_method(
   } else {
     return None
   }
+  // P76: Zero-alloc scalarization for `vmap.get(k).unwrap_or(dflt) | is_some() | is_none()`.
+  match obj_expr {
+    EMethodCall(map_expr, gm, gargs, _) =>
+      if gm == "get" && gargs.length() == 1 {
+        match qbe_peek_expr_ty(g, map_expr) {
+          Some(TMap(kty, vty)) =>
+            if qbe_is_vmap_key_ty(g, kty) {
+              let args_pure = !qbe_expr_has_assign(gargs[0]) &&
+                (args.length() == 0 || !qbe_expr_has_assign(args[0]))
+              let obj_av = qbe_emit_arg_maybe_borrow(g, map_expr, None, args_pure)
+              let m = qbe_ensure_vmap_fns(g, kty, vty)
+              let vka = qbe_emit_vmap_key_args(g, gargs[0], kty, args_pure)
+              let kstr = qbe_vmap_key_call_args(vka)
+              if method_name == "is_some" || method_name == "is_none" {
+                let hw = qbe_tmp(g)
+                qbe_emit(
+                  g,
+                  hw + " =w call $pion_vmap_has_" + m + "(l " + obj_av.qv.reg + kstr + ")",
+                )
+                if !obj_av.borrowed {
+                  qbe_emit(g, "call $pion_rc_dec(l " + obj_av.qv.reg + ")")
+                }
+                let r = qbe_tmp(g)
+                if method_name == "is_none" {
+                  let nw = qbe_tmp(g)
+                  qbe_emit(g, nw + " =w ceqw " + hw + ", 0")
+                  qbe_emit(g, r + " =l extuw " + nw)
+                } else {
+                  qbe_emit(g, r + " =l extuw " + hw)
+                }
+                return Some(qval(r, TBool))
+              }
+              let out_slot = qbe_alloc_slot(g)
+              let hw = qbe_tmp(g)
+              qbe_emit(
+                g,
+                hw + " =w call $pion_vmap_try_get_" + m + "(l " + obj_av.qv.reg + kstr + ", l " + out_slot + ")",
+              )
+              if !obj_av.borrowed {
+                qbe_emit(g, "call $pion_rc_dec(l " + obj_av.qv.reg + ")")
+              }
+              let res_slot = qbe_alloc_slot_for(g, vty)
+              let l_hit = qbe_lbl(g, "vmu_hit")
+              let l_def = qbe_lbl(g, "vmu_def")
+              let l_end = qbe_lbl(g, "vmu_end")
+              qbe_emit_term(g, "jnz " + hw + ", " + l_hit + ", " + l_def)
+              qbe_emit_lbl(g, l_hit)
+              let raw_l = qbe_tmp(g)
+              qbe_emit(g, raw_l + " =l loadl " + out_slot)
+              qbe_rc_inc(g, raw_l, vty)
+              let vv = qbe_from_l(g, raw_l, vty)
+              qbe_store_local_slot(g, vv, res_slot, vty)
+              qbe_emit_term(g, "jmp " + l_end)
+              qbe_emit_lbl(g, l_def)
+              let dv = qbe_emit_expr(g, args[0], Some(vty))
+              let dc = qbe_coerce_val(g, dv, vty)
+              qbe_store_local_slot(g, dc, res_slot, vty)
+              qbe_emit_term(g, "jmp " + l_end)
+              qbe_emit_lbl(g, l_end)
+              return Some(qval(qbe_load_local_slot(g, res_slot, vty), vty))
+            }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
   let allow_pod_ok = method_name != "unwrap_or"
   let sc = match qbe_try_emit_opt_res_scalarized(g, obj_expr, want_kind, allow_pod_ok) {
     Some(s) => s
@@ -14288,6 +15171,7 @@ fn qbe_new_for_target_name(
     const_bool_vals: Map([]),
     global_min_len_arrs: Map([]),
     freeze_fn_seen: Map([]),
+    vmap_seen: Map([]),
     eq_fn_seen: Map([]),
     strings: [],
     string_ids: Map([]),
@@ -17584,7 +18468,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
-    TMap(_, vty) => {
+    TMap(kty, vty) => {
       if !qbe_is_obj_ty(vty) {
         return "$pion_rc_freeze"
       }
@@ -17597,9 +18481,20 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       let sb = StringBuilder()
       sb.write_string("function ")
       sb.write_string(fn_sym)
-      sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %cap_p =l add %obj, 8\n    %cap =l loadl %cap_p\n    %ep_p =l add %obj, 24\n    %ep =l loadl %ep_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %cap\n    jnz %c, @step, @done\n@step\n    %off =l shl %i, 5\n    %ent =l add %ep, %off\n    %st_p =l add %ent, 24\n    %st =w loadub %st_p\n    %occ =w ceqw %st, 1\n    jnz %occ, @fval, @next\n@fval\n    %vp =l add %ent, 16\n    %ev =l loadl %vp\n    call ")
-      sb.write_string(child_sym)
-      sb.write_string("(l %ev)\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
+      if qbe_is_vmap_key_ty(g, kty) {
+        let lay = qbe_vmap_layout(qbe_vmap_key_fields(g, kty), vty)
+        sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %cap_p =l add %obj, 8\n    %cap =l loadl %cap_p\n    %bp_p =l add %obj, 16\n    %buf =l loadl %bp_p\n    jnz %buf, @has_buf, @done\n@has_buf\n    %slots =l add %buf, %cap\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %cap\n    jnz %c, @step, @done\n@step\n    %cp =l add %buf, %i\n    %st =w loadub %cp\n    jnz %st, @fval, @next\n@fval\n")
+        qbe_vmap_idx_mul(sb, "%off", "%i", lay.slot_bytes)
+        sb.write_string("    %sp =l add %slots, %off\n    %vp =l add %sp, ")
+        sb.write_string(lay.v_off.to_string())
+        sb.write_string("\n    %ev =l loadl %vp\n    call ")
+        sb.write_string(child_sym)
+        sb.write_string("(l %ev)\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
+      } else {
+        sb.write_string("(l %obj) {\n@start\n    %i_slot =l alloc8 8\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %cap_p =l add %obj, 8\n    %cap =l loadl %cap_p\n    %ep_p =l add %obj, 24\n    %ep =l loadl %ep_p\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %c =w csltl %i, %cap\n    jnz %c, @step, @done\n@step\n    %off =l shl %i, 5\n    %ent =l add %ep, %off\n    %st_p =l add %ent, 24\n    %st =w loadub %st_p\n    %occ =w ceqw %st, 1\n    jnz %occ, @fval, @next\n@fval\n    %vp =l add %ent, 16\n    %ev =l loadl %vp\n    call ")
+        sb.write_string(child_sym)
+        sb.write_string("(l %ev)\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@done\n    ret\n}\n\n")
+      }
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
@@ -22558,6 +23453,131 @@ fn qbe_emit_method_call(
         qbe_emit(g, rw + " =w copy " + r64)
         return qval(rw, TInt)
       }
+      if qbe_is_vmap_key_ty(g, kty) {
+        let m = qbe_ensure_vmap_fns(g, kty, vty)
+        if method_name == "set" {
+          let vka = qbe_emit_vmap_key_args(g, args[0], kty, args_pure)
+          let va = qbe_emit_arg_maybe_borrow_ext(
+            g,
+            args[1],
+            Some(vty),
+            args_pure,
+            args_pure && qbe_loop_has_no_calls_expr(g, args[1]),
+          )
+          let vv = va.qv
+          let vc = qbe_coerce_val(g, vv, vty)
+          let vl = qbe_as_l(g, qval(vc, vty))
+          qbe_emit_adopt_if_frozen(g, obj_val, vl, vty, false)
+          qbe_emit(
+            g,
+            "call $pion_vmap_set_" +
+            m +
+            "(l " +
+            obj_val +
+            qbe_vmap_key_call_args(vka) +
+            ", " +
+            qbe_abi_ty(vty) +
+            " " +
+            vc +
+            ")",
+          )
+          if !va.borrowed {
+            qbe_rc_dec(g, vv.reg, vv.ty)
+          }
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          return qval("0", TUnit)
+        }
+        if method_name == "contains" {
+          let vka = qbe_emit_vmap_key_args(g, args[0], kty, args_pure)
+          let hw = qbe_tmp(g)
+          let r = qbe_tmp(g)
+          qbe_emit(
+            g,
+            hw + " =w call $pion_vmap_has_" + m + "(l " + obj_val + qbe_vmap_key_call_args(vka) + ")",
+          )
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          qbe_emit(g, r + " =l extuw " + hw)
+          return qval(r, TBool)
+        }
+        if method_name == "remove" {
+          let vka = qbe_emit_vmap_key_args(g, args[0], kty, args_pure)
+          qbe_emit(
+            g,
+            "call $pion_vmap_remove_" + m + "(l " + obj_val + qbe_vmap_key_call_args(vka) + ")",
+          )
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          return qval("0", TUnit)
+        }
+        if method_name == "get" {
+          let vka = qbe_emit_vmap_key_args(g, args[0], kty, args_pure)
+          let out_slot = qbe_alloc_slot(g)
+          let hw = qbe_tmp(g)
+          qbe_emit(
+            g,
+            hw +
+            " =w call $pion_vmap_try_get_" +
+            m +
+            "(l " +
+            obj_val +
+            qbe_vmap_key_call_args(vka) +
+            ", l " +
+            out_slot +
+            ")",
+          )
+          let res_slot = qbe_alloc_slot(g)
+          let l_hit = qbe_lbl(g, "mget_hit")
+          let l_miss = qbe_lbl(g, "mget_miss")
+          let l_end = qbe_lbl(g, "mget_end")
+          qbe_emit_term(g, "jnz " + hw + ", " + l_hit + ", " + l_miss)
+          qbe_emit_lbl(g, l_hit)
+          let mv = qbe_tmp(g)
+          qbe_emit(g, mv + " =l loadl " + out_slot)
+          qbe_rc_inc(g, mv, vty)
+          let some_obj = qbe_emit_some(g, mv, vty)
+          qbe_emit(g, "storel " + some_obj + ", " + res_slot)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_miss)
+          let none_obj = qbe_emit_none(g, vty)
+          qbe_emit(g, "storel " + none_obj + ", " + res_slot)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_end)
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          let r = qbe_tmp(g)
+          qbe_emit(g, r + " =l loadl " + res_slot)
+          return qval(r, TOption(vty))
+        }
+        if method_name == "copy" {
+          let r = qbe_tmp(g)
+          qbe_emit(g, r + " =l call $pion_vmap_copy_" + m + "(l " + obj_val + ")")
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          return qval(r, TMap(kty, vty))
+        }
+        if method_name == "keys" {
+          let r = qbe_tmp(g)
+          qbe_emit(g, r + " =l call $pion_vmap_keys_" + m + "(l " + obj_val + ")")
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          return qval(r, TArray(kty))
+        }
+        if method_name == "clear" {
+          qbe_emit(g, "call $pion_vmap_clear_" + m + "(l " + obj_val + ")")
+          if !obj_borrowed {
+            qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+          }
+          return qval("0", TUnit)
+        }
+      }
       if method_name == "set" {
         let ka = qbe_emit_arg_maybe_borrow_ext(
           g,
@@ -25339,29 +26359,46 @@ fn qbe_try_emit_map_get_match(
       let key_expr = margs[0]
       let args_pure = !qbe_expr_has_assign(key_expr)
       let obj_av = qbe_emit_arg_maybe_borrow(g, map_expr, None, args_pure)
-      let ka = qbe_emit_arg_maybe_borrow_ext(
-        g,
-        key_expr,
-        Some(kty),
-        args_pure,
-        args_pure && qbe_loop_has_no_calls_expr(g, key_expr),
-      )
-      let kl = qbe_as_l(g, ka.qv)
       let out_slot = qbe_alloc_slot(g)
       let hw = qbe_tmp(g)
-      qbe_emit(
-        g,
-        hw +
-        " =w call $pion_map_try_get(l " +
-        obj_av.qv.reg +
-        ", l " +
-        kl +
-        ", l " +
-        out_slot +
-        ")",
-      )
-      if !ka.borrowed {
-        qbe_rc_dec(g, ka.qv.reg, ka.qv.ty)
+      if qbe_is_vmap_key_ty(g, kty) {
+        let m = qbe_ensure_vmap_fns(g, kty, vty)
+        let vka = qbe_emit_vmap_key_args(g, key_expr, kty, args_pure)
+        qbe_emit(
+          g,
+          hw +
+          " =w call $pion_vmap_try_get_" +
+          m +
+          "(l " +
+          obj_av.qv.reg +
+          qbe_vmap_key_call_args(vka) +
+          ", l " +
+          out_slot +
+          ")",
+        )
+      } else {
+        let ka = qbe_emit_arg_maybe_borrow_ext(
+          g,
+          key_expr,
+          Some(kty),
+          args_pure,
+          args_pure && qbe_loop_has_no_calls_expr(g, key_expr),
+        )
+        let kl = qbe_as_l(g, ka.qv)
+        qbe_emit(
+          g,
+          hw +
+          " =w call $pion_map_try_get(l " +
+          obj_av.qv.reg +
+          ", l " +
+          kl +
+          ", l " +
+          out_slot +
+          ")",
+        )
+        if !ka.borrowed {
+          qbe_rc_dec(g, ka.qv.reg, ka.qv.ty)
+        }
       }
       if !obj_av.borrowed {
         let mloc = qbe_define_local(g, "__mget_map", obj_av.qv.ty, true)
@@ -27531,6 +28568,12 @@ fn qbe_emit_expr_inner(
               }
               _ => ()
             }
+            if qbe_is_vmap_key_ty(g, kty) {
+              let m = qbe_ensure_vmap_fns(g, kty, vty)
+              let r = qbe_tmp(g)
+              qbe_emit(g, r + " =l call $pion_vmap_new_" + m + "(l 0)")
+              return qval(r, TMap(kty, vty))
+            }
             let vo = qbe_is_obj_flag_w(g, vty)
             let new_fn = if qbe_map_key_is_int(kty) {
               "$pion_map_new_int"
@@ -28092,8 +29135,10 @@ fn qbe_emit_expr_inner(
             return qval(r, TBytes)
           }
           if qual == "Map" && (mem == "new" || mem == "with_capacity") {
+            let mut cap_l = "0"
             if mem == "with_capacity" && args.length() >= 1 {
-              let _ = qbe_emit_expr(g, args[0], Some(TInt))
+              let cv = qbe_emit_expr(g, args[0], Some(TInt))
+              cap_l = qbe_as_l(g, cv)
             }
             let mut kty = TString
             let mut vty = TError
@@ -28103,6 +29148,12 @@ fn qbe_emit_expr_inner(
                 vty = v
               }
               _ => ()
+            }
+            if qbe_is_vmap_key_ty(g, kty) {
+              let m = qbe_ensure_vmap_fns(g, kty, vty)
+              let r = qbe_tmp(g)
+              qbe_emit(g, r + " =l call $pion_vmap_new_" + m + "(l " + cap_l + ")")
+              return qval(r, TMap(kty, vty))
             }
             let vo = qbe_is_obj_flag_w(g, vty)
             let new_fn = if qbe_map_key_is_int(kty) {
@@ -29240,13 +30291,37 @@ fn qbe_emit_expr_inner(
           qval(r, elem)
         }
         TMap(kty, vty) => {
+          if qbe_is_vmap_key_ty(g, kty) {
+            let m = qbe_ensure_vmap_fns(g, kty, vty)
+            let vka = qbe_emit_vmap_key_args(g, idx, kty, !qbe_expr_has_assign(idx))
+            let r = qbe_tmp(g)
+            qbe_emit(
+              g,
+              r +
+              " =" +
+              qbe_abi_ty(vty) +
+              " call $pion_vmap_get_" +
+              m +
+              "(l " +
+              ov.reg +
+              qbe_vmap_key_call_args(vka) +
+              ")",
+            )
+            qbe_rc_inc(g, r, vty)
+            if !borrowed {
+              qbe_rc_dec(g, ov.reg, ov.ty)
+            }
+            return qval(r, vty)
+          }
           let kv = qbe_emit_expr(g, idx, Some(kty))
           let kl = qbe_as_l(g, kv)
           let r = qbe_tmp(g)
           qbe_emit(g, r + " =l call $pion_map_get(l " + ov.reg + ", l " + kl + ")")
           qbe_rc_inc(g, r, vty)
           qbe_rc_dec(g, kv.reg, kv.ty)
-          qbe_rc_dec(g, ov.reg, ov.ty)
+          if !borrowed {
+            qbe_rc_dec(g, ov.reg, ov.ty)
+          }
           qval(qbe_from_l(g, r, vty), vty)
         }
         TString => {
@@ -37915,17 +38990,40 @@ fn qbe_emit_stmt(
               }
             }
             TMap(kty, vty) => {
-              let kv = qbe_emit_expr(g, idx, Some(kty))
-              let kl = qbe_as_l(g, kv)
-              let rv = qbe_emit_expr(g, rhs, Some(vty))
-              let vl = qbe_as_l(g, rv)
-              qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
-              qbe_emit(
-                g,
-                "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
-              )
-              qbe_rc_dec(g, kv.reg, kv.ty)
-              qbe_rc_dec(g, rv.reg, rv.ty)
+              if qbe_is_vmap_key_ty(g, kty) {
+                let m = qbe_ensure_vmap_fns(g, kty, vty)
+                let vka = qbe_emit_vmap_key_args(g, idx, kty, !qbe_expr_has_assign(idx))
+                let rv = qbe_emit_expr(g, rhs, Some(vty))
+                let vc = qbe_coerce_val(g, rv, vty)
+                let vl = qbe_as_l(g, qval(vc, vty))
+                qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, false)
+                qbe_emit(
+                  g,
+                  "call $pion_vmap_set_" +
+                  m +
+                  "(l " +
+                  ov.reg +
+                  qbe_vmap_key_call_args(vka) +
+                  ", " +
+                  qbe_abi_ty(vty) +
+                  " " +
+                  vc +
+                  ")",
+                )
+                qbe_rc_dec(g, rv.reg, rv.ty)
+              } else {
+                let kv = qbe_emit_expr(g, idx, Some(kty))
+                let kl = qbe_as_l(g, kv)
+                let rv = qbe_emit_expr(g, rhs, Some(vty))
+                let vl = qbe_as_l(g, rv)
+                qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
+                qbe_emit(
+                  g,
+                  "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
+                )
+                qbe_rc_dec(g, kv.reg, kv.ty)
+                qbe_rc_dec(g, rv.reg, rv.ty)
+              }
             }
             TBytes => {
               let iv = qbe_emit_expr(g, idx, Some(TInt))
@@ -38289,38 +39387,70 @@ fn qbe_emit_stmt(
               qbe_emit(g, "storeb " + vw + ", " + ep)
             }
             TMap(kty, vty) => {
-              let kv = qbe_emit_expr(g, idx, Some(kty))
-              let kl = qbe_as_l(g, kv)
-              let old_l = qbe_tmp(g)
-              qbe_emit(
-                g,
-                old_l + " =l call $pion_map_get(l " + ov.reg + ", l " + kl + ")",
-              )
-              let old_v = match vty {
-                TInt | TUInt => {
-                  let w = qbe_tmp(g)
-                  qbe_emit(g, w + " =w copy " + old_l)
-                  w
+              if qbe_is_vmap_key_ty(g, kty) {
+                let m = qbe_ensure_vmap_fns(g, kty, vty)
+                let vka = qbe_emit_vmap_key_args(g, idx, kty, !qbe_expr_has_assign(idx))
+                let kstr = qbe_vmap_key_call_args(vka)
+                let old_v = qbe_tmp(g)
+                qbe_emit(
+                  g,
+                  old_v + " =" + qbe_abi_ty(vty) + " call $pion_vmap_get_" + m + "(l " + ov.reg + kstr + ")",
+                )
+                let rv = qbe_emit_expr(g, rhs, Some(vty))
+                let new_v = qbe_emit_compound_binop(g, op, old_v, rv, vty)
+                let vc = qbe_coerce_val(g, qval(new_v, vty), vty)
+                let vl = qbe_as_l(g, qval(vc, vty))
+                qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, false)
+                qbe_emit(
+                  g,
+                  "call $pion_vmap_set_" +
+                  m +
+                  "(l " +
+                  ov.reg +
+                  kstr +
+                  ", " +
+                  qbe_abi_ty(vty) +
+                  " " +
+                  vc +
+                  ")",
+                )
+                if qbe_is_obj_ty(vty) {
+                  qbe_rc_dec(g, new_v, vty)
                 }
-                TDouble => {
-                  let d = qbe_tmp(g)
-                  qbe_emit(g, d + " =d cast " + old_l)
-                  d
+              } else {
+                let kv = qbe_emit_expr(g, idx, Some(kty))
+                let kl = qbe_as_l(g, kv)
+                let old_l = qbe_tmp(g)
+                qbe_emit(
+                  g,
+                  old_l + " =l call $pion_map_get(l " + ov.reg + ", l " + kl + ")",
+                )
+                let old_v = match vty {
+                  TInt | TUInt => {
+                    let w = qbe_tmp(g)
+                    qbe_emit(g, w + " =w copy " + old_l)
+                    w
+                  }
+                  TDouble => {
+                    let d = qbe_tmp(g)
+                    qbe_emit(g, d + " =d cast " + old_l)
+                    d
+                  }
+                  TFloat => qbe_from_l(g, old_l, TFloat)
+                  _ => old_l
                 }
-                TFloat => qbe_from_l(g, old_l, TFloat)
-                _ => old_l
-              }
-              let rv = qbe_emit_expr(g, rhs, Some(vty))
-              let new_v = qbe_emit_compound_binop(g, op, old_v, rv, vty)
-              let vl = qbe_as_l(g, qval(new_v, vty))
-              qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
-              qbe_emit(
-                g,
-                "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
-              )
-              qbe_rc_dec(g, kv.reg, kv.ty)
-              if qbe_is_obj_ty(vty) {
-                qbe_rc_dec(g, new_v, vty)
+                let rv = qbe_emit_expr(g, rhs, Some(vty))
+                let new_v = qbe_emit_compound_binop(g, op, old_v, rv, vty)
+                let vl = qbe_as_l(g, qval(new_v, vty))
+                qbe_emit_adopt_if_frozen(g, ov.reg, vl, vty, true)
+                qbe_emit(
+                  g,
+                  "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
+                )
+                qbe_rc_dec(g, kv.reg, kv.ty)
+                if qbe_is_obj_ty(vty) {
+                  qbe_rc_dec(g, new_v, vty)
+                }
               }
             }
             _ => ()

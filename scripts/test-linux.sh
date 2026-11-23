@@ -493,6 +493,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74a_topo_init_and_variant/run_e2e.sh"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p75a_compact_i8_f32/run_e2e.sh" "$PIONC"
 # P75-B: Portable SIMD vector primitives + 4-row tiled INT8 matvec (native + ASan + Wasm32 + OOB + speedup).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p75b_simd_primitives/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p76_value_key_map/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p72a_flat_pod_opt/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74c_licm_alias_soundness/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74d_float_to_int_sat/run_e2e.sh" "$PIONC"
