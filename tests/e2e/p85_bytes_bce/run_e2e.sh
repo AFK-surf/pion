@@ -390,6 +390,10 @@ fn replace_slot(a : Array[String]) -> String {
   a[0] = "replaced_longer_string_payload"
   " world"
 }
+fn append_opt(a : Array[String], suffix : Option[String]) -> Option[Int] {
+  a[0] += suffix?
+  Some(a[0].length())
+}
 pub fn main(world : World) -> Int {
   let ab : Array[Byte] = [(10).to_byte()]
   ab[0] += grow_b(ab)
@@ -400,18 +404,31 @@ pub fn main(world : World) -> Int {
   ab2[0] += g.to_byte()
   let as_arr : Array[String] = ["hello" + "_heap"]
   as_arr[0] += replace_slot(as_arr)
+  let a_opt : Array[String] = ["base" + "_heap"]
+  let mut r = 0
+  while r < 8 {
+    let none_res = append_opt(a_opt, None)
+    debug_assert(none_res is None && a_opt[0] == "base_heap", "append_opt None")
+    r = r + 1
+  }
+  let some_res = append_opt(a_opt, Some("_ok" + "_tail"))
+  let some_len = match some_res {
+    Some(n) => n
+    None => -1
+  }
+  debug_assert(some_len == 17 && a_opt[0] == "base_heap_ok_tail", "append_opt Some")
   debug_assert(ab[0].to_int() == 15 && ab.length() == 129, "grow_b")
   debug_assert(ai[0] == 107 && ai.length() == 129, "grow_i")
   debug_assert(ab2[0].to_int() == 25 && ab2.length() == 129, "grower_to_byte")
   debug_assert(as_arr[0] == "hello_heap world" && as_arr.length() == 1, "replace_slot")
-  io_println(world, "grow_ok=" + ab[0].to_int().to_string() + ":" + ai[0].to_string() + ":" + ab2[0].to_int().to_string() + ":" + as_arr[0])
+  io_println(world, "grow_ok=" + ab[0].to_int().to_string() + ":" + ai[0].to_string() + ":" + ab2[0].to_int().to_string() + ":" + as_arr[0] + ":" + a_opt[0])
   0
 }
 EOF
 "$PIONC" build --release -o "$TMP_DIR/p85_compound_grow" "$TMP_DIR/p85_compound_grow.pion"
 GROW_OUT=$("$TMP_DIR/p85_compound_grow")
 echo "p85 compound_grow -> $GROW_OUT"
-test "$GROW_OUT" = "grow_ok=15:107:25:hello_heap world"
+test "$GROW_OUT" = "grow_ok=15:107:25:hello_heap world:base_heap_ok_tail"
 CC_BIN="${CC:-cc}"
 ASAN_RT="$TMP_DIR/libpionrt_asan.a"
 "$CC_BIN" -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
@@ -427,7 +444,7 @@ else
   GROW_ASAN=$(ASAN_OPTIONS=halt_on_error=1 "$TMP_DIR/p85_compound_grow_asan")
 fi
 echo "p85 compound_grow ASan/LSan -> $GROW_ASAN"
-test "$GROW_ASAN" = "grow_ok=15:107:25:hello_heap world"
+test "$GROW_ASAN" = "grow_ok=15:107:25:hello_heap world:base_heap_ok_tail"
 
 # R4 P1-1b: `a[0] += shrink(a)` clears Array[Byte] inside RHS -> must trap OOB on writeback
 cat <<'EOF' > "$TMP_DIR/p85_compound_shrink_oob.pion"
