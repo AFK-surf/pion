@@ -480,7 +480,15 @@ pub fn main(world : World) -> Int {
 PION
 
 "$CC_BIN" -std=c11 -O2 -Wall -Wextra -Werror -c "$TMP_DIR/guard_helper.c" -o "$TMP_DIR/guard_helper.o"
-printf '#!/bin/sh\nexec %s "$@" %s\n' "$CC_BIN" "$TMP_DIR/guard_helper.o" > "$TMP_DIR/cc-guard"
+cat > "$TMP_DIR/cc-guard" <<WRAP
+#!/bin/sh
+for arg in "\$@"; do
+  case "\$arg" in
+    -c|-S|-E) exec "$CC_BIN" "\$@" ;;
+  esac
+done
+exec "$CC_BIN" "\$@" "$TMP_DIR/guard_helper.o"
+WRAP
 chmod +x "$TMP_DIR/cc-guard"
 CC="$TMP_DIR/cc-guard" PION_CACHE_DIR="$TMP_DIR/cas_guard" \
   "$PIONC" build --release --emit-ssa "$TMP_DIR/p85_guard.ssa" -o "$TMP_DIR/p85_guard" "$TMP_DIR/p85_guard.pion"
