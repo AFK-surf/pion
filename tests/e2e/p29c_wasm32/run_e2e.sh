@@ -5489,4 +5489,177 @@ console.log("  p66a (" + rtLabel + "): out=" + out + " leaked=0 OK");
 ' "$P66A_WASM" "$rt_path"
 done
 
+# ── P69-A: 8B SWAR str_split1_emit + hoisted Slab bump & Map try_get/set + ABA safety ──
+echo "=== P69-A: SWAR str_split1_emit (>9000B multi-chunk, 0..16B, edges) + Map try_get/set & ABA (Node + Web leaked=0) ==="
+P69A_SRC="$TMP_DIR/p69a_regression.pion"
+P69A_WASM="$TMP_DIR/p69a_regression.wasm"
+cat > "$P69A_SRC" << 'P69A_EOF'
+fn make_key(a : String, b : String) -> String {
+  a + b
+}
+
+fn trigger_aba_probe(m : Map[String, Int64]) -> Int64 {
+  let s1 = make_key("k0", "01")
+  match m.get(s1) {
+    Some(v) => v
+    None => -1L
+  }
+}
+
+pub fn main(world : World) -> Int {
+  // 1. Edge cases: consecutive delims, leading/trailing delims, lengths 0..16
+  let edge = ",a,,bc,def,ghij,klmno,pqrstu,vwxyz01,23456789,abcdefghi,0123456789,abcdefghijk,0123456789ab,abcdefghijklm,0123456789abcd,abcdefghijklmno,0123456789abcdef,"
+  let eparts = edge.split(",")
+  let mut elen_sum = 0
+  let mut ei = 0
+  while ei < eparts.length() {
+    elen_sum = elen_sum + eparts[ei].length()
+    ei = ei + 1
+  }
+
+  // 2. Multi-chunk (>9000B, crosses 4096B chunk boundary twice) with 0..16B segments
+  let sb = StringBuilder::new()
+  let mut r = 0
+  while r < 60 {
+    sb.write_string(edge)
+    r = r + 1
+  }
+  let big = sb.to_string()
+  let bparts = big.split(",")
+  let mut blen_sum = 0
+  let mut bi = 0
+  while bi < bparts.length() {
+    blen_sum = blen_sum + bparts[bi].length()
+    bi = bi + 1
+  }
+
+  // 3. Map[String, Int64] try_get -> set hint hit, first-time insert, and ABA key reuse
+  let m : Map[String, Int64] = Map::new()
+  m.set("k001", 100L)
+  let probed = trigger_aba_probe(m)
+  // s1 ("k001") was just freed to cls=1 freelist; allocate same-size s2 ("k999")
+  let s2 = make_key("k9", "99")
+  m.set(s2, 200L)
+  let v1 = match m.get("k001") { Some(v) => v; None => -1L }
+  let v2 = match m.get("k999") { Some(v) => v; None => -1L }
+  let mlen_aba = m.length()
+
+  // Word-count style try_get -> set loop (short + long keys)
+  let wc : Map[String, Int64] = Map::new()
+  let mut wi = 0
+  while wi < bparts.length() {
+    let w = bparts[wi]
+    let cur = match wc.get(w) { Some(v) => v; None => 0L }
+    wc.set(w, cur + 1L)
+    wi = wi + 1
+  }
+  let mut wc_sum = 0L
+  let wkeys = wc.keys()
+  let mut ki = 0
+  while ki < wkeys.length() {
+    wc_sum = wc_sum + match wc.get(wkeys[ki]) { Some(v) => v; None => 0L }
+    ki = ki + 1
+  }
+
+  // 4. Map[String, String] object value update via hint + non-hint
+  let ms : Map[String, String] = Map::new()
+  let mut si = 0
+  while si < 32 {
+    let k = "key_" + si.to_string()
+    ms.set(k, "v0_" + si.to_string())
+    si = si + 1
+  }
+  let mut slen_sum = 0
+  si = 0
+  while si < 32 {
+    let k = "key_" + si.to_string()
+    match ms.get(k) {
+      Some(old_v) => {
+        slen_sum = slen_sum + old_v.length()
+        ms.set(k, "v1_" + si.to_string())
+      }
+      None => ()
+    }
+    si = si + 1
+  }
+  si = 0
+  while si < 32 {
+    let k = "key_" + si.to_string()
+    match ms.get(k) {
+      Some(v) => slen_sum = slen_sum + v.length()
+      None => ()
+    }
+    si = si + 1
+  }
+
+  io_println(
+    world,
+    eparts.length().to_string() + ":" + elen_sum.to_string() + ":" +
+    bparts.length().to_string() + ":" + blen_sum.to_string() + ":" +
+    probed.to_string() + ":" + v1.to_string() + ":" + v2.to_string() + ":" +
+    mlen_aba.to_string() + ":" + wc.length().to_string() + ":" +
+    wc_sum.to_string() + ":" + slen_sum.to_string(),
+  )
+  0
+}
+P69A_EOF
+"$PIONC" build --release --target wasm32 -o "$P69A_WASM" "$P69A_SRC"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+  node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+const [wasmPath, rtPath] = process.argv.slice(1);
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + rtLabel + "): p69a_regression.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+// edge: 18 commas => 19 parts, sum(1..16)=136
+// big = 60 * edge: 60*18=1080 commas => 1081 parts, sum = 60*136 = 8160
+// ABA: probed=100, v1=100, v2=200, mlen_aba=2
+// wc: 17 distinct keys (empty + 16 non-empty), wc_sum = 1081
+// ms: 32 keys ("v0_0".."v0_31" + "v1_0".."v1_31"): 2 * (10*4 + 22*5) = 2 * 150 = 300
+const expected = "19:136:1081:8160:100:100:200:2:17:1081:300";
+if ((rc | 0) !== 0 || out !== expected) {
+  console.error("FAIL (" + rtLabel + "): p69a mismatch: expected=" + expected + " got=" + JSON.stringify(out) + " rc=" + rc);
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + rtLabel + "): p69a corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + rtLabel + "): p69a leaked=" + leaked);
+  process.exit(1);
+}
+console.log("  p69a (" + rtLabel + "): out=" + out + " leaked=0 OK");
+' "$P69A_WASM" "$rt_path"
+done
+
 echo "p29c_wasm32 E2E: OK"
