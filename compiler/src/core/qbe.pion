@@ -7372,19 +7372,53 @@ fn qbe_expr_inline_cost_in(e : Expr, self_name : String, in_loop : Bool) -> Int 
 }
 
 ///|
-fn qbe_stmts_inline_cost_in(
+fn qbe_expr_inline_cost_in_loops(
+  e : Expr,
+  self_name : String,
+  in_loop : Bool,
+  loops_left : Array[Int],
+) -> Int {
+  match e {
+    EBlock(stmts, _) =>
+      qbe_stmts_inline_cost_in_loops(stmts, self_name, in_loop, loops_left)
+    EIf(cond, then_stmts, else_opt, _) => {
+      let cc = qbe_expr_inline_cost_in(cond, self_name, in_loop)
+      if cc < 0 {
+        return -1
+      }
+      let ct = qbe_stmts_inline_cost_in_loops(
+        then_stmts,
+        self_name,
+        in_loop,
+        loops_left,
+      )
+      if ct < 0 {
+        return -1
+      }
+      let ce = match else_opt {
+        None => 0
+        Some(el) =>
+          qbe_expr_inline_cost_in_loops(el, self_name, in_loop, loops_left)
+      }
+      if ce < 0 { -1 } else { cc + ct + ce + 2 }
+    }
+    _ => qbe_expr_inline_cost_in(e, self_name, in_loop)
+  }
+}
+
+///|
+fn qbe_stmts_inline_cost_in_loops(
   stmts : Array[Stmt],
   self_name : String,
   in_loop : Bool,
-  allow_loops : Int,
+  loops_left : Array[Int],
 ) -> Int {
   let mut tot = 0
-  let mut loops_left = allow_loops
   let mut i = 0
   while i < stmts.length() {
     match stmts[i] {
       SLet(_, _, _, init, _) => {
-        let c = qbe_expr_inline_cost_in(init, self_name, in_loop)
+        let c = qbe_expr_inline_cost_in_loops(init, self_name, in_loop, loops_left)
         if c < 0 {
           return -1
         }
@@ -7402,7 +7436,7 @@ fn qbe_stmts_inline_cost_in(
         tot = tot + cl + cr + 1
       }
       SExpr(e, _) => {
-        let c = qbe_expr_inline_cost_in(e, self_name, in_loop)
+        let c = qbe_expr_inline_cost_in_loops(e, self_name, in_loop, loops_left)
         if c < 0 {
           return -1
         }
@@ -7410,17 +7444,17 @@ fn qbe_stmts_inline_cost_in(
       }
       SWhile(wcond, wbody, _) =>
         if !in_loop &&
-          loops_left > 0 &&
+          loops_left[0] > 0 &&
           !qbe_stmts_has_nested_loop(wbody) &&
           !qbe_stmts_has_cf(wbody, false, false, true) &&
           qbe_expr_is_leaf_loop_pure(wcond) &&
           qbe_stmts_is_leaf_loop_pure(wbody) {
-          loops_left = loops_left - 1
+          loops_left[0] = loops_left[0] - 1
           let cc = qbe_expr_inline_cost_in(wcond, self_name, true)
           if cc < 0 {
             return -1
           }
-          let cb = qbe_stmts_inline_cost_in(wbody, self_name, true, 0)
+          let cb = qbe_stmts_inline_cost_in_loops(wbody, self_name, true, [0])
           if cb < 0 {
             return -1
           }
@@ -7455,7 +7489,7 @@ fn qbe_stmts_inline_cost_in(
           if cc < 0 {
             return -1
           }
-          let cb = qbe_stmts_inline_cost_in(body, self_name, in_loop, 0)
+          let cb = qbe_stmts_inline_cost_in_loops(body, self_name, in_loop, [0])
           if cb < 0 {
             return -1
           }
@@ -7466,12 +7500,22 @@ fn qbe_stmts_inline_cost_in(
       SLetTuple(_, _, _, _) | SFor(_, _, _, _, _) | SForRange(_, _, _, _, _, _) | SForIn(_, _, _, _, _) | SDebugAssert(_, _, _) =>
         return -1
     }
-    if tot > 128 {
+    if tot > 256 {
       return -1
     }
     i = i + 1
   }
   tot
+}
+
+///|
+fn qbe_stmts_inline_cost_in(
+  stmts : Array[Stmt],
+  self_name : String,
+  in_loop : Bool,
+  allow_loops : Int,
+) -> Int {
+  qbe_stmts_inline_cost_in_loops(stmts, self_name, in_loop, [allow_loops])
 }
 
 ///|
@@ -9278,7 +9322,16 @@ fn qbe_try_inline_xpkg_fn_call(
     } else {
       inl_fd.name
     }
-    let fn_cost = qbe_stmts_inline_cost_in(inl_fd.body, self_key, false, 0)
+    let is_opt_res = match inl_fd.ret_ty {
+      TyName("Option", _, _) | TyName("Result", _, _) => true
+      _ => false
+    }
+    let fn_cost = qbe_stmts_inline_cost_in(
+      inl_fd.body,
+      self_key,
+      false,
+      if is_opt_res { 1 } else { 0 },
+    )
     if fn_cost < 0 || qbe_wasm_caller_over_inline_budget(g, fn_cost) {
       return None
     }
@@ -9564,6 +9617,157 @@ fn qbe_emit_struct_lit_into_buf(
 }
 
 ///|
+fn qbe_copy_pod_buf(
+  g : QbeGen,
+  sinfo : StructInfo,
+  struct_ty : Ty,
+  src : String,
+  dst : String,
+) -> Unit {
+  let subst = match struct_ty {
+    TStruct(_, sargs) => make_subst(sinfo.decl.type_params, sargs)
+    _ => Map([])
+  }
+  let n = sinfo.field_names.length()
+  let mut j = 0
+  while j < n {
+    let fty = subst_ty(sinfo.field_tys[j], subst)
+    let saddr = if j == 0 {
+      src
+    } else {
+      let a = qbe_tmp(g)
+      qbe_emit(g, a + " =l add " + src + ", " + (j * 8).to_string())
+      a
+    }
+    let daddr = if j == 0 {
+      dst
+    } else {
+      let a = qbe_tmp(g)
+      qbe_emit(g, a + " =l add " + dst + ", " + (j * 8).to_string())
+      a
+    }
+    let fv = qbe_load_heap_slot(g, saddr, fty)
+    qbe_store_heap_slot(g, fv, daddr, fty)
+    j = j + 1
+  }
+}
+
+///|
+fn qbe_match_opt_res_pod_unwrap_shape(
+  arms : Array[MatchArm],
+) -> (Int, Int, Int, String) {
+  if arms.length() != 2 {
+    return (0, -1, -1, "")
+  }
+  match (arms[0].guard_expr, arms[1].guard_expr) {
+    (None, None) => ()
+    _ => return (0, -1, -1, "")
+  }
+  let mut want_kind = 0
+  let mut ok_idx = -1
+  let mut err_idx = -1
+  let mut ok_bind = ""
+  match (arms[0].pat, arms[1].pat) {
+    (PVariant(eq0, "Ok", s0, _), PVariant(eq1, "Err", s1, _)) =>
+      if (eq0 == "" || eq0 == "Result") &&
+        (eq1 == "" || eq1 == "Result") &&
+        s0.length() == 1 &&
+        s1.length() == 1 {
+        match (s0[0], s1[0]) {
+          (PIdent(b, _), PWild(_)) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = b
+          }
+          _ => ()
+        }
+      }
+    (PVariant(eq0, "Ok", s0, _), PWild(_)) =>
+      if (eq0 == "" || eq0 == "Result") && s0.length() == 1 {
+        match s0[0] {
+          PIdent(b, _) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = b
+          }
+          _ => ()
+        }
+      }
+    (PVariant(eq0, "Err", s0, _), PVariant(eq1, "Ok", s1, _)) =>
+      if (eq0 == "" || eq0 == "Result") &&
+        (eq1 == "" || eq1 == "Result") &&
+        s0.length() == 1 &&
+        s1.length() == 1 {
+        match (s0[0], s1[0]) {
+          (PWild(_), PIdent(b, _)) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+            ok_bind = b
+          }
+          _ => ()
+        }
+      }
+    (PVariant(eq0, "Some", s0, _), PVariant(eq1, "None", s1, _)) =>
+      if (eq0 == "" || eq0 == "Option") &&
+        (eq1 == "" || eq1 == "Option") &&
+        s0.length() == 1 &&
+        s1.length() == 0 {
+        match s0[0] {
+          PIdent(b, _) => {
+            want_kind = 1
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = b
+          }
+          _ => ()
+        }
+      }
+    (PVariant(eq0, "Some", s0, _), PWild(_)) =>
+      if (eq0 == "" || eq0 == "Option") && s0.length() == 1 {
+        match s0[0] {
+          PIdent(b, _) => {
+            want_kind = 1
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = b
+          }
+          _ => ()
+        }
+      }
+    (PVariant(eq0, "None", s0, _), PVariant(eq1, "Some", s1, _)) =>
+      if (eq0 == "" || eq0 == "Option") &&
+        (eq1 == "" || eq1 == "Option") &&
+        s0.length() == 0 &&
+        s1.length() == 1 {
+        match s1[0] {
+          PIdent(b, _) => {
+            want_kind = 1
+            ok_idx = 1
+            err_idx = 0
+            ok_bind = b
+          }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  if want_kind == 0 {
+    return (0, -1, -1, "")
+  }
+  let ok_is_id = match arms[ok_idx].body {
+    EIdent(bn, _) => bn == ok_bind
+    _ => false
+  }
+  if !ok_is_id {
+    return (0, -1, -1, "")
+  }
+  (want_kind, ok_idx, err_idx, ok_bind)
+}
+
+///|
 fn qbe_expr_all_tails_are_pod_struct_lits(e : Expr) -> Bool {
   match e {
     EStructLit(_, None, _, _) => true
@@ -9571,6 +9775,10 @@ fn qbe_expr_all_tails_are_pod_struct_lits(e : Expr) -> Bool {
     EIf(_, then_s, Some(else_e), _) =>
       qbe_stmts_all_tails_are_pod_struct_lits(then_s) &&
       qbe_expr_all_tails_are_pod_struct_lits(else_e)
+    EMatch(_, arms, _) => {
+      let (wk, _, _, _) = qbe_match_opt_res_pod_unwrap_shape(arms)
+      wk > 0
+    }
     _ => false
   }
 }
@@ -9810,6 +10018,76 @@ fn qbe_emit_tail_pod_struct_into_buf(
     }
     EStructLit(_, None, fields, _) =>
       qbe_emit_struct_lit_into_buf(g, sinfo, struct_ty, fields, buf)
+    EMatch(scrut, arms, _) => {
+      let (want_kind, _ok_idx, err_idx, _ok_bind) = qbe_match_opt_res_pod_unwrap_shape(
+        arms,
+      )
+      if want_kind > 0 {
+        match qbe_try_emit_opt_res_scalarized(g, scrut, want_kind, true) {
+          Some(sc) => {
+            if g.block_term {
+              return
+            }
+            let tag_w = qbe_tmp(g)
+            let l_ok = qbe_lbl(g, "spod_mok")
+            let l_err = qbe_lbl(g, "spod_merr")
+            let l_end = qbe_lbl(g, "spod_mend")
+            qbe_emit(g, tag_w + " =w loadw " + sc.tag_slot)
+            qbe_emit_term(g, "jnz " + tag_w + ", " + l_ok + ", " + l_err)
+            qbe_emit_lbl(g, l_ok)
+            g.block_immut_fields = Map([])
+            if sc.val_is_pod_buf {
+              qbe_copy_pod_buf(g, sinfo, struct_ty, sc.val_slot, buf)
+            } else {
+              let ptr = qbe_load_heap_slot(g, sc.val_slot, struct_ty)
+              qbe_copy_pod_buf(g, sinfo, struct_ty, ptr, buf)
+              qbe_rc_dec(g, ptr, struct_ty)
+            }
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_err)
+            g.block_immut_fields = Map([])
+            match sc.ret_ty {
+              TResult(_, err_ty) => {
+                let ev = qbe_load_heap_slot(g, sc.err_slot, err_ty)
+                qbe_rc_dec(g, ev, err_ty)
+              }
+              _ => ()
+            }
+            qbe_scope_push(g)
+            if qbe_expr_all_tails_are_pod_struct_lits(arms[err_idx].body) {
+              qbe_emit_tail_pod_struct_into_buf(
+                g,
+                arms[err_idx].body,
+                sinfo,
+                struct_ty,
+                buf,
+              )
+            } else {
+              let ev = qbe_emit_expr(g, arms[err_idx].body, Some(struct_ty))
+              if !g.block_term {
+                let er = qbe_coerce_val(g, ev, struct_ty)
+                qbe_copy_pod_buf(g, sinfo, struct_ty, er, buf)
+                qbe_rc_dec(g, er, struct_ty)
+              }
+            }
+            qbe_scope_pop(g)
+            if !g.block_term {
+              qbe_emit_term(g, "jmp " + l_end)
+            }
+            qbe_emit_lbl(g, l_end)
+            g.block_immut_fields = Map([])
+          }
+          None => {
+            let mv = qbe_emit_expr(g, e, Some(struct_ty))
+            if !g.block_term {
+              let mr = qbe_coerce_val(g, mv, struct_ty)
+              qbe_copy_pod_buf(g, sinfo, struct_ty, mr, buf)
+              qbe_rc_dec(g, mr, struct_ty)
+            }
+          }
+        }
+      }
+    }
     _ => ()
   }
 }
@@ -11678,7 +11956,16 @@ fn qbe_xpkg_fn_can_scalar_inline(
           } else {
             finfo.decl.name
           }
-          let fn_cost = qbe_stmts_inline_cost_in(finfo.decl.body, self_key, false, 0)
+          let is_opt_res = match finfo.decl.ret_ty {
+            TyName("Option", _, _) | TyName("Result", _, _) => true
+            _ => false
+          }
+          let fn_cost = qbe_stmts_inline_cost_in(
+            finfo.decl.body,
+            self_key,
+            false,
+            if is_opt_res { 1 } else { 0 },
+          )
           if fn_cost < 0 || qbe_wasm_caller_over_inline_budget(g, fn_cost) {
             return None
           }
