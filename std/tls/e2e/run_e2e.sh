@@ -23,8 +23,22 @@ HERE="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
+cat > "$TMP/req.cnf" <<'CNFEOF'
+[req]
+distinguished_name = dn
+x509_extensions = v3_ext
+prompt = no
+
+[dn]
+CN = localhost
+
+[v3_ext]
+subjectAltName = DNS:localhost
+extendedKeyUsage = serverAuth
+CNFEOF
+
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 1 \
-  -subj /CN=localhost -addext subjectAltName=DNS:localhost -addext extendedKeyUsage=serverAuth \
+  -config "$TMP/req.cnf" \
   -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null
 "$PIONC" build -o "$TMP/tls_e2e" "$HERE"
 

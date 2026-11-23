@@ -806,9 +806,8 @@ void *pion_proc_pty_spawn(
     size.Y = (SHORT)rows;
     PionHPCON hpc = NULL;
     HRESULT hr = g_create_conpty(size, pty_in_rd, pty_out_wr, 0, &hpc);
-    CloseHandle(pty_in_rd);
-    CloseHandle(pty_out_wr);
     if (FAILED(hr) || !hpc) {
+        CloseHandle(pty_in_rd); CloseHandle(pty_out_wr);
         CloseHandle(pty_in_wr); CloseHandle(pty_out_rd);
         free(wcwd); free(app_name); free(cmd_line); free(env_block);
         snprintf(err_buf, (size_t)err_cap, "CreatePseudoConsole failed (hr=0x%08lx)", (unsigned long)hr);
@@ -823,16 +822,24 @@ void *pion_proc_pty_spawn(
                                    hpc, sizeof(hpc), NULL, NULL)) {
         DWORD e = GetLastError();
         if (attr_list) { DeleteProcThreadAttributeList(attr_list); free(attr_list); }
-        g_close_conpty(hpc);
+        CloseHandle(pty_in_rd); CloseHandle(pty_out_wr);
         CloseHandle(pty_in_wr); CloseHandle(pty_out_rd);
+        g_close_conpty(hpc);
         free(wcwd); free(app_name); free(cmd_line); free(env_block);
         set_win_err(err_buf, err_cap, "ConPTY attribute list failed", e);
         return NULL;
     }
 
+    /* Explicitly clear inherited std handles when spawning under ConPTY so a
+     * parent with redirected pipes (e.g., CI runners / daemons) cannot leak
+     * non-console stdio handles into the child and bypass the pseudo-console. */
     STARTUPINFOEXW siex;
     memset(&siex, 0, sizeof(siex));
     siex.StartupInfo.cb = sizeof(siex);
+    siex.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+    siex.StartupInfo.hStdInput = NULL;
+    siex.StartupInfo.hStdOutput = NULL;
+    siex.StartupInfo.hStdError = NULL;
     siex.lpAttributeList = attr_list;
 
     PROCESS_INFORMATION pi;
@@ -843,13 +850,15 @@ void *pion_proc_pty_spawn(
                              env_block, wcwd, &siex.StartupInfo, &pi);
     DWORD ce = ok ? 0 : GetLastError();
 
+    CloseHandle(pty_in_rd);
+    CloseHandle(pty_out_wr);
     DeleteProcThreadAttributeList(attr_list);
     free(attr_list);
     free(wcwd); free(app_name); free(cmd_line); free(env_block);
 
     if (!ok) {
-        g_close_conpty(hpc);
         CloseHandle(pty_in_wr); CloseHandle(pty_out_rd);
+        g_close_conpty(hpc);
         set_win_err(err_buf, err_cap, "CreateProcessW (ConPTY) failed", ce);
         return NULL;
     }
@@ -869,8 +878,8 @@ void *pion_proc_pty_spawn(
         if (job) { TerminateJobObject(job, 137); CloseHandle(job); }
         else TerminateProcess(pi.hProcess, 137);
         CloseHandle(pi.hProcess);
-        g_close_conpty(hpc);
         CloseHandle(pty_in_wr); CloseHandle(pty_out_rd);
+        g_close_conpty(hpc);
         set_err(err_buf, err_cap, "out of memory");
         return NULL;
     }
@@ -890,8 +899,8 @@ void *pion_proc_pty_spawn(
         if (job) { TerminateJobObject(job, 137); CloseHandle(job); }
         else TerminateProcess(pi.hProcess, 137);
         CloseHandle(pi.hProcess);
-        g_close_conpty(hpc);
         CloseHandle(pty_in_wr); CloseHandle(pty_out_rd);
+        g_close_conpty(hpc);
         DeleteCriticalSection(&p->cs);
         free(p);
         set_err(err_buf, err_cap, "too many active child processes");
@@ -1159,10 +1168,12 @@ void pion_proc_close(void *h) {
     PionHPCON h_pty = p->h_pty; p->h_pty = NULL;
     LeaveCriticalSection(&p->cs);
 
-    if (h_pty && g_close_conpty) g_close_conpty(h_pty);
+    /* Close host pipe ends before ClosePseudoConsole so conhost.exe cannot
+     * deadlock trying to flush an unread output buffer on Windows < 11 26100. */
     if (h_in) CloseHandle(h_in);
     if (h_out) CloseHandle(h_out);
     if (h_err) CloseHandle(h_err);
+    if (h_pty && g_close_conpty) g_close_conpty(h_pty);
     if (h_job) CloseHandle(h_job);
     if (h_proc) CloseHandle(h_proc);
 
