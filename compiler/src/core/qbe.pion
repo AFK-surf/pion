@@ -1610,6 +1610,9 @@ pub struct QbeVMapKeyArgs {
 
 ///|
 fn qbe_vmap_key_fields(g : QbeGen, kty : Ty) -> Array[Ty] {
+  if is_hashable_scalar_ty(kty) {
+    return [kty]
+  }
   match kty {
     TTuple(elems) => {
       if elems.length() < 2 || elems.length() > 6 {
@@ -1663,13 +1666,12 @@ fn qbe_ty_has_vmap(g : QbeGen, ty : Ty, depth : Int) -> Bool {
   if depth > 4 {
     return false
   }
-  if qbe_is_vmap_key_ty(g, ty) {
-    return true
-  }
   match ty {
     TMap(k, v) =>
       qbe_is_vmap_key_ty(g, k) ||
       qbe_ty_has_vmap(g, v, depth + 1)
+    TTuple(_) | TStruct(_, _) =>
+      qbe_is_vmap_key_ty(g, ty)
     TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
       qbe_ty_has_vmap(g, e, depth + 1)
     TResult(a, b) =>
@@ -2242,36 +2244,51 @@ fn qbe_ensure_vmap_fns(g : QbeGen, kty : Ty, vty : Ty) -> String {
   sb.write_string("    %cp =l add %buf, %i\n    %c =w loadub %cp\n    jnz %c, @emit_k, @next\n@emit_k\n")
   qbe_vmap_idx_mul(sb, "%soff", "%i", lay.slot_bytes)
   sb.write_string("    %sp =l add %slots, %soff\n    %oi =l loadl %o_sl\n")
-  if flat_stride > 0 {
-    qbe_vmap_idx_mul(sb, "%eoff", "%oi", flat_stride)
-    sb.write_string("    %dst =l add %adp, %eoff\n")
+  if is_hashable_scalar_ty(kty) {
+    match kty {
+      TBool | TByte | TInt8 => {
+        sb.write_string("    %kb =w loadub %sp\n")
+        sb.write_string("    %aep =l add %adp, %oi\n")
+        sb.write_string("    storeb %kb, %aep\n")
+      }
+      _ => {
+        qbe_vmap_emit_load_field(sb, "%ksf_0", "%sp", kty, "ksr_0")
+        qbe_vmap_emit_val_to_l(sb, "%ksfl_0", "%ksf_0", kty, "ksl_0")
+        sb.write_string("    %eoff =l shl %oi, 3\n    %aep =l add %adp, %eoff\n    storel %ksfl_0, %aep\n")
+      }
+    }
   } else {
-    let kbytes = n * 8
-    sb.write_string("    %dst =l call $pion_alloc_uninit(w " + kbytes.to_string() + ", w 4, l 0)\n")
-    sb.write_string("    %eoff =l shl %oi, 3\n    %aep =l add %adp, %eoff\n    storel %dst, %aep\n")
-  }
-  ki = 0
-  while ki < n {
-    let sfp = if lay.k_offs[ki] == 0 {
-      "%sp"
+    if flat_stride > 0 {
+      qbe_vmap_idx_mul(sb, "%eoff", "%oi", flat_stride)
+      sb.write_string("    %dst =l add %adp, %eoff\n")
     } else {
-      let t = "%ksfp_" + ki.to_string()
-      sb.write_string("    " + t + " =l add %sp, " + lay.k_offs[ki].to_string() + "\n")
-      t
+      let kbytes = n * 8
+      sb.write_string("    %dst =l call $pion_alloc_uninit(w " + kbytes.to_string() + ", w 4, l 0)\n")
+      sb.write_string("    %eoff =l shl %oi, 3\n    %aep =l add %adp, %eoff\n    storel %dst, %aep\n")
     }
-    let fr = "%ksf_" + ki.to_string()
-    qbe_vmap_emit_load_field(sb, fr, sfp, kfields[ki], "ksr_" + ki.to_string())
-    let fl = "%ksfl_" + ki.to_string()
-    qbe_vmap_emit_val_to_l(sb, fl, fr, kfields[ki], "ksl_" + ki.to_string())
-    let dfp = if ki == 0 {
-      "%dst"
-    } else {
-      let t = "%kdfp_" + ki.to_string()
-      sb.write_string("    " + t + " =l add %dst, " + (ki * 8).to_string() + "\n")
-      t
+    ki = 0
+    while ki < n {
+      let sfp = if lay.k_offs[ki] == 0 {
+        "%sp"
+      } else {
+        let t = "%ksfp_" + ki.to_string()
+        sb.write_string("    " + t + " =l add %sp, " + lay.k_offs[ki].to_string() + "\n")
+        t
+      }
+      let fr = "%ksf_" + ki.to_string()
+      qbe_vmap_emit_load_field(sb, fr, sfp, kfields[ki], "ksr_" + ki.to_string())
+      let fl = "%ksfl_" + ki.to_string()
+      qbe_vmap_emit_val_to_l(sb, fl, fr, kfields[ki], "ksl_" + ki.to_string())
+      let dfp = if ki == 0 {
+        "%dst"
+      } else {
+        let t = "%kdfp_" + ki.to_string()
+        sb.write_string("    " + t + " =l add %dst, " + (ki * 8).to_string() + "\n")
+        t
+      }
+      sb.write_string("    storel " + fl + ", " + dfp + "\n")
+      ki = ki + 1
     }
-    sb.write_string("    storel " + fl + ", " + dfp + "\n")
-    ki = ki + 1
   }
   sb.write_string("    %noi =l add %oi, 1\n    storel %noi, %o_sl\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_sl\n    jmp @loop\n@fin\n")
   sb.write_string("    %flen =l loadl %o_sl\n    storel %flen, %arr\n@done\n    ret %arr\n}\n\n")
@@ -2291,6 +2308,13 @@ fn qbe_emit_vmap_key_args(
   let n = kfields.length()
   let regs : Array[String] = []
   let abis : Array[String] = []
+  if is_hashable_scalar_ty(kty) {
+    let kv = qbe_emit_expr(g, key_expr, Some(kty))
+    let cv = qbe_coerce_val(g, kv, kty)
+    regs.push(cv)
+    abis.push(qbe_abi_ty(kty))
+    return QbeVMapKeyArgs::{ regs, abis }
+  }
   // Zero-alloc destructuring for tuple literals `(a, b, c)` and struct literals `Tri::{ ... }`
   match kty {
     TTuple(_) =>

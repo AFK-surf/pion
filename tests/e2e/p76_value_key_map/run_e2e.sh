@@ -28,6 +28,75 @@ fn assert_str(got : String, want : String, label : String) -> Unit {
 }
 
 fn test_scalar_keys() -> Unit {
+  let mi : Map[Int, Int] = Map::with_capacity(64)
+  let mut idx = 0
+  while idx < 100 {
+    mi.set(idx * 3 - 50, idx * 7)
+    idx += 1
+  }
+  assert_eq(mi.length(), 100, "mi_len")
+  let mi_copy = mi.copy()
+  idx = 0
+  while idx < 50 {
+    mi.remove(idx * 3 - 50)
+    idx += 1
+  }
+  assert_eq(mi.length(), 50, "mi_after_rm")
+  assert_eq(mi_copy.length(), 100, "mi_copy_unchanged")
+  let mi_ks = mi.keys()
+  assert_eq(mi_ks.length(), 50, "mi_ks_len")
+  let mut mi_ksum = 0
+  idx = 0
+  while idx < mi_ks.length() {
+    mi_ksum += mi_ks[idx]
+    idx += 1
+  }
+  // Sum of (idx*3 - 50) for idx=50..99 = 3*(50*149/2) - 50*50 = 11175 - 2500 = 8675
+  assert_eq(mi_ksum, 8675, "mi_ksum")
+  mi.clear()
+  assert_eq(mi.length(), 0, "mi_cleared")
+
+  let mi64 : Map[Int64, String] = Map::with_capacity(32)
+  mi64.set(-9000000000000L, "neg")
+  mi64.set(0L, "zero")
+  mi64.set(9000000000000L, "pos")
+  assert_str(mi64[-9000000000000L], "neg", "i64_neg")
+  assert_str(mi64[9000000000000L], "pos", "i64_pos")
+  let i64_ks = mi64.keys()
+  assert_eq(i64_ks.length(), 3, "i64_ks_len")
+  let mut i64_sum = 0L
+  idx = 0
+  while idx < i64_ks.length() {
+    i64_sum += i64_ks[idx]
+    idx += 1
+  }
+  if i64_sum != 0L {
+    panic("i64_ks_sum mismatch")
+  }
+  mi64.remove(0L)
+  assert_eq(mi64.length(), 2, "i64_after_rm")
+
+  // Bit-63 HashDoS anti-collision check on Map[Int64, Int]
+  let mdos : Map[Int64, Int] = Map::with_capacity(4096)
+  let bit63 = 1L << 63
+  idx = 0
+  while idx < 2048 {
+    let k0 = idx.to_int64()
+    let k1 = k0 | bit63
+    mdos.set(k0, idx)
+    mdos.set(k1, idx + 10000)
+    idx += 1
+  }
+  assert_eq(mdos.length(), 4096, "mdos_len")
+  idx = 0
+  while idx < 2048 {
+    let k0 = idx.to_int64()
+    let k1 = k0 | bit63
+    assert_eq(mdos[k0], idx, "mdos_k0")
+    assert_eq(mdos[k1], idx + 10000, "mdos_k1")
+    idx += 1
+  }
+
   let mu : Map[UInt, Int] = Map([])
   mu.set(1U, 10)
   mu.set(4000000000U, 20)
@@ -45,24 +114,38 @@ fn test_scalar_keys() -> Unit {
   mb.set((255).to_byte(), 99)
   assert_eq(mb[(0).to_byte()], 1, "byte0")
   assert_eq(mb[(255).to_byte()], 99, "byte255")
+  let mb_ks = mb.keys()
+  assert_eq(mb_ks.length(), 2, "mb_ks_len")
+  assert_eq(mb_ks[0].to_int() + mb_ks[1].to_int(), 255, "mb_ks_sum")
 
   let mi8 : Map[Int8, Int] = Map([])
   mi8.set((-128).to_int8(), 128)
   mi8.set((127).to_int8(), 127)
   assert_eq(mi8[(-128).to_int8()], 128, "i8_min")
   assert_eq(mi8[(127).to_int8()], 127, "i8_max")
+  let mi8_ks = mi8.keys()
+  assert_eq(mi8_ks.length(), 2, "mi8_ks_len")
+  assert_eq(mi8_ks[0].to_int() + mi8_ks[1].to_int(), -1, "mi8_ks_sum")
 
   let mc : Map[Char, Int] = Map([])
   mc.set('a', 97)
   mc.set('中', 20013)
   assert_eq(mc['a'], 97, "char_a")
   assert_eq(mc['中'], 20013, "char_zh")
+  let mc_ks = mc.keys()
+  assert_eq(mc_ks.length(), 2, "mc_ks_len")
+  assert_eq(mc_ks[0].to_int() + mc_ks[1].to_int(), 20110, "mc_ks_sum")
 
   let mbool : Map[Bool, String] = Map([])
   mbool.set(true, "T")
   mbool.set(false, "F")
   assert_str(mbool[true], "T", "bool_t")
   assert_str(mbool[false], "F", "bool_f")
+  let mbool_ks = mbool.keys()
+  assert_eq(mbool_ks.length(), 2, "mbool_ks_len")
+  if mbool_ks[0] == mbool_ks[1] {
+    panic("mbool_ks duplicate")
+  }
 }
 
 fn test_tuple_keys() -> Unit {
@@ -191,6 +274,32 @@ fn test_mutex_mt(world : World) -> Unit {
   assert_str(m[Tri::{ w0: 0, w1: 0, w2: 0 }], "t0_0", "mt_overwritten")
   assert_str(m[Tri::{ w0: 3, w1: 49, w2: 52 }], "t3_49", "mt_last")
   mtx.unlock()
+
+  // Also test Mutex[Map[Int, String]] scalar-key vmap MT stress
+  let init_i : Map[Int, String] = Map::with_capacity(64)
+  init_i.set(0, "seed_i")
+  let mtx_i = Mutex::new(init_i)
+  scope(world, fn(s : Scope) -> Unit {
+    let mut t = 0
+    while t < 4 {
+      let tid = t
+      spawn(s, fn() -> Unit {
+        let mut i = 0
+        while i < 50 {
+          let mi = mtx_i.lock()
+          mi.set(tid * 100 + i, "s" + tid.to_string() + "_" + i.to_string())
+          mtx_i.unlock()
+          i += 1
+        }
+      })
+      t += 1
+    }
+  })
+  let mi = mtx_i.lock()
+  assert_eq(mi.length(), 200, "mt_i_len")
+  assert_str(mi[0], "s0_0", "mt_i_0")
+  assert_str(mi[349], "s3_49", "mt_i_last")
+  mtx_i.unlock()
 }
 
 pub fn main(world : World) -> Int {
@@ -403,6 +512,55 @@ fi
 echo "6. 200K trigram: $VMAP_OUT rss_kb=$RSS_KB | $STR_OUT rss_kb=$STR_RSS_KB"
 if [ "$RSS_KB" -gt 0 ] && [ "$RSS_KB" -gt 16384 ]; then
   echo "FAIL: 200K trigram vmap RSS ${RSS_KB} KB > 16384 KB (16 MB)" >&2
+  exit 1
+fi
+
+# 7. P76-B: Map[Int64, Int64] 100K write + 500K lookup RSS gate (<= 12288 KB / 12 MB)
+cat > "$TMP_DIR/bench_i64.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  let n = 100000
+  let t0 = clock_now_ms(world)
+  let m : Map[Int64, Int64] = Map::with_capacity(n)
+  let mut i = 0
+  while i < n {
+    let k = i.to_int64() * 6364136223846793005L + 1L
+    m.set(k, i.to_int64() + 1L)
+    i += 1
+  }
+  let mut sum = 0L
+  let mut round = 0
+  while round < 5 {
+    i = 0
+    while i < n {
+      let k = i.to_int64() * 6364136223846793005L + 1L
+      sum += m.get(k).unwrap_or(0L)
+      i += 1
+    }
+    round += 1
+  }
+  let t1 = clock_now_ms(world)
+  // sum = 5 * (100000 * 100001 / 2) = 25000250000
+  if sum != 25000250000L {
+    panic("i64 map sum mismatch")
+  }
+  io_println(world, "i64map_100k_w_500k_r_ms=" + (t1 - t0).to_string() + " len=" + m.length().to_string())
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/bench_i64" "$TMP_DIR/bench_i64.pion"
+I64_RSS_KB=0
+I64_OUT="$("$TMP_DIR/bench_i64")"
+if command -v python3 >/dev/null 2>&1; then
+  I64_RSS_KB="$(python3 -c '
+import resource, subprocess, sys
+subprocess.run([sys.argv[1]], stdout=subprocess.DEVNULL, check=True)
+r = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+print(r // 1024 if sys.platform == "darwin" else r)
+' "$TMP_DIR/bench_i64")"
+fi
+echo "7. 100K Map[Int64, Int64] (100K w + 500K r): $I64_OUT rss_kb=$I64_RSS_KB"
+if [ "$I64_RSS_KB" -gt 0 ] && [ "$I64_RSS_KB" -gt 12288 ]; then
+  echo "FAIL: 100K Map[Int64, Int64] RSS ${I64_RSS_KB} KB > 12288 KB (12 MB)" >&2
   exit 1
 fi
 
