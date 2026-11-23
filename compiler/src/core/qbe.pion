@@ -16023,14 +16023,46 @@ fn qbe_mut_recv_keys(g : QbeGen) -> Array[Map[String, Bool]] {
 }
 
 ///|
-/// A function body with `mut self` receivers lowered to `EMutArg` (identity
-/// when no package involved has `mut self` calls).
+fn qbe_call_into_maps(g : QbeGen) -> Array[Map[String, IntoConv]] {
+  let out : Array[Map[String, IntoConv]] = []
+  if g.tc.call_into_convs.length() > 0 {
+    out.push(g.tc.call_into_convs)
+  }
+  let mut ii = 0
+  while ii < g.tc.all_imported_pkg_names.length() {
+    match g.tc.all_imported_pkgs.get(g.tc.all_imported_pkg_names[ii]) {
+      Some(ip) =>
+        if ip.tc.call_into_convs.length() > 0 {
+          out.push(ip.tc.call_into_convs)
+        }
+      None => ()
+    }
+    ii = ii + 1
+  }
+  out
+}
+
+///|
+/// A function body with `mut self` receivers lowered to `EMutArg` and `into`
+/// call-site conversions desugared to explicit calls (identity when neither is present).
 fn qbe_fn_body(g : QbeGen, body : Array[Stmt]) -> Array[Stmt] {
   let keys = qbe_mut_recv_keys(g)
-  if keys.length() == 0 {
+  let into_maps = qbe_call_into_maps(g)
+  if keys.length() == 0 && into_maps.length() == 0 {
     body
   } else {
-    rewrite_mut_recv_stmts(body, keys)
+    rewrite_mut_recv_stmts_ex(body, keys, into_maps)
+  }
+}
+
+///|
+fn qbe_fn_expr(g : QbeGen, e : Expr) -> Expr {
+  let keys = qbe_mut_recv_keys(g)
+  let into_maps = qbe_call_into_maps(g)
+  if keys.length() == 0 && into_maps.length() == 0 {
+    e
+  } else {
+    rewrite_mut_recv_expr_ex(e, keys, into_maps)
   }
 }
 
@@ -29642,7 +29674,7 @@ fn qbe_emit_expr_inner(
       qbe_emit_variant_ctor(g, ename, vname, args, expected)
     }
     EMove(inner, _) => qbe_emit_expr(g, inner, expected)
-    ETry(inner, _) => {
+    ETry(inner, try_sp) => {
       match qbe_try_emit_opt_res_scalarized(g, inner, 0, false) {
         Some(sc) => {
           if g.block_term {
@@ -29657,7 +29689,7 @@ fn qbe_emit_expr_inner(
               qbe_emit_term(g, "jnz " + tag_w + ", " + l_ok + ", " + l_err)
               qbe_emit_lbl(g, l_err)
               let err_v = qbe_load_heap_slot(g, sc.err_slot, err_ty)
-              qbe_emit_try_err_exit(g, err_v, err_ty, ok_ty, "")
+              qbe_emit_try_err_exit(g, err_v, err_ty, ok_ty, "", try_sp)
               qbe_emit_lbl(g, l_ok)
               let payload = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
               return qval(payload, ok_ty)
@@ -29690,7 +29722,7 @@ fn qbe_emit_expr_inner(
           qbe_emit(g, is_ok + " =w ceql " + tag + ", 0")
           qbe_emit_term(g, "jnz " + is_ok + ", " + l_ok + ", " + l_err)
           qbe_emit_lbl(g, l_err)
-          qbe_emit_try_err_exit(g, "", err_ty, ok_ty, iv.reg)
+          qbe_emit_try_err_exit(g, "", err_ty, ok_ty, iv.reg, try_sp)
           qbe_emit_lbl(g, l_ok)
           let p1 = qbe_tmp(g)
           qbe_emit(g, p1 + " =l add " + iv.reg + ", 8")
@@ -35188,15 +35220,86 @@ fn qbe_field_base_is_stable_stmts(
 }
 
 ///|
+fn qbe_lookup_try_into_conv(g : QbeGen, sp : Span) -> Option[IntoConv] {
+  let k = span_key(sp)
+  match g.tc.try_into_convs.get(k) {
+    Some(c) => return Some(c)
+    None => ()
+  }
+  let mut ii = 0
+  while ii < g.tc.all_imported_pkg_names.length() {
+    match g.tc.all_imported_pkgs.get(g.tc.all_imported_pkg_names[ii]) {
+      Some(ip) =>
+        match ip.tc.try_into_convs.get(k) {
+          Some(c) => return Some(c)
+          None => ()
+        }
+      None => ()
+    }
+    ii = ii + 1
+  }
+  None
+}
+
+///|
+fn qbe_apply_into_conv(
+  g : QbeGen,
+  err_v : String,
+  err_ty : Ty,
+  conv : IntoConv,
+  sp : Span,
+) -> QbeVal {
+  qbe_scope_push(g)
+  let tmp_name = "__into_try_err_" + g.next_tmp.to_string()
+  g.next_tmp = g.next_tmp + 1
+  let loc = qbe_define_local(g, tmp_name, err_ty, true)
+  qbe_store_local_slot(g, err_v, loc.slot, err_ty)
+  let ident = EIdent(tmp_name, sp)
+  let conv_expr = if conv.kind == 0 {
+    EMethodCall(ident, conv.name, [], sp)
+  } else if conv.kind == 1 {
+    ECall(EPath(conv.qual, conv.name, sp), [ident], sp)
+  } else {
+    EMethodCall(ident, conv.name, [], sp)
+  }
+  let res = qbe_emit_expr(g, conv_expr, Some(conv.target_ty))
+  qbe_scope_pop(g)
+  res
+}
+
+///|
 /// P55-C: Unified `ETry` (`?`) error-path exit for top-level functions, normal inlines,
 /// and scalarized `Option`/`Result` inlines.
 fn qbe_emit_try_err_exit(
   g : QbeGen,
-  err_v : String,
-  err_ty : Ty,
+  err_v_in : String,
+  err_ty_in : Ty,
   ok_ty : Ty,
-  from_boxed_reg : String,
+  from_boxed_reg_in : String,
+  try_sp : Span,
 ) -> Unit {
+  let mut err_v = err_v_in
+  let mut err_ty = err_ty_in
+  let mut from_boxed_reg = from_boxed_reg_in
+  match qbe_lookup_try_into_conv(g, try_sp) {
+    Some(conv) => {
+      let raw_ev = if from_boxed_reg != "" {
+        let p1 = qbe_tmp(g)
+        qbe_emit(g, p1 + " =l add " + from_boxed_reg + ", 8")
+        let v = qbe_load_heap_slot(g, p1, err_ty)
+        qbe_rc_inc(g, v, err_ty)
+        qbe_emit(g, "call $pion_rc_dec(l " + from_boxed_reg + ")")
+        v
+      } else {
+        err_v
+      }
+      let cv = qbe_apply_into_conv(g, raw_ev, err_ty, conv, try_sp)
+      err_v = cv.reg
+      err_ty = conv.target_ty
+      from_boxed_reg = ""
+    }
+    None => ()
+  }
   if g.inline_ret_lbl != "" {
     if g.inline_ret_tag_slot != "" {
       let ret_err_ty = match g.inline_ret_ty {
@@ -35682,7 +35785,7 @@ fn qbe_try_emit_stack_pod_let(
   }
   // Case B3: `let ts = expr?`
   match init {
-    ETry(inner, _) =>
+    ETry(inner, try_sp) =>
       match qbe_try_emit_opt_res_scalarized(g, inner, 0, true) {
         Some(sc) => {
           if g.block_term {
@@ -35697,7 +35800,7 @@ fn qbe_try_emit_stack_pod_let(
               qbe_emit_term(g, "jnz " + tag_w + ", " + l_ok + ", " + l_err)
               qbe_emit_lbl(g, l_err)
               let err_v = qbe_load_heap_slot(g, sc.err_slot, err_ty)
-              qbe_emit_try_err_exit(g, err_v, err_ty, ok_ty, "")
+              qbe_emit_try_err_exit(g, err_v, err_ty, ok_ty, "", try_sp)
               qbe_emit_lbl(g, l_ok)
               qbe_clear_shadowed_local_meta(g, bname)
               if sc.val_is_pod_buf {
@@ -45579,6 +45682,10 @@ fn build_typechecker_for_codegen(pkg : Package) -> TypeChecker {
     call_type_args: Map([]),
     call_arg_order: Map([]),
     mut_recv_calls: Map([]),
+    record_analyze: false,
+    analyze_closure_captures: Map([]),
+    call_into_convs: Map([]),
+    try_into_convs: Map([]),
   }
   let mut fi = 0
   while fi < pkg.files.length() {
@@ -45907,7 +46014,7 @@ pub fn emit_qbe_package_multi_entry_target(
         Some(t) => t
         None => TError
       }
-      let cv = qbe_emit_expr(g, cd.value, Some(cty))
+      let cv = qbe_emit_expr(g, qbe_fn_expr(g, cd.value), Some(cty))
       let cv_reg = qbe_coerce_val(g, cv, cty)
       if qbe_is_obj_ty(cty) {
         qbe_emit(g, "call $pion_rc_immortalize(l " + cv_reg + ")")
@@ -46329,7 +46436,7 @@ pub fn emit_qbe_unit_entry_target(
         Some(t) => t
         None => TError
       }
-      let cv = qbe_emit_expr(g, cd.value, Some(cty))
+      let cv = qbe_emit_expr(g, qbe_fn_expr(g, cd.value), Some(cty))
       let cv_reg = qbe_coerce_val(g, cv, cty)
       if qbe_is_obj_ty(cty) {
         qbe_emit(g, "call $pion_rc_immortalize(l " + cv_reg + ")")
@@ -46658,7 +46765,7 @@ pub fn emit_qbe_test_package_target(
         Some(t) => t
         None => TError
       }
-      let cv = qbe_emit_expr(g, cd.value, Some(cty))
+      let cv = qbe_emit_expr(g, qbe_fn_expr(g, cd.value), Some(cty))
       let cv_reg = qbe_coerce_val(g, cv, cty)
       if qbe_is_obj_ty(cty) {
         qbe_emit(g, "call $pion_rc_immortalize(l " + cv_reg + ")")

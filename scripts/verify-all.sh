@@ -179,6 +179,8 @@ sh "$ROOT_DIR/tests/e2e/p78_qbe_arm64_bigframe_spill/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p79_qbe_fcsel/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p82a_wasm_arr_clear_f32_push/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC2"
+# Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
+sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv): every function of
 # the real `qbe -d MG` traces validated by the strict checker, tampered traces and
 # adversarial miscompilations rejected.
