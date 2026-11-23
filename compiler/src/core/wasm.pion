@@ -2950,7 +2950,7 @@ fn wasm_emit_inst(
         None => ()
       }
     }
-    // P52-A/P53-A: Inline `len < cap && stride != 1` fast path for `pion_arr_push_owned(arr, val)` at hot sites only
+    // P52-A/P53-A/P82-A: Inline `len < cap && stride == 0` fast path for `pion_arr_push_owned(arr, val)` at hot sites only
     if is_hot_site && callee == "$pion_arr_push_owned" && inst.args.length() >= 3 && inst.dst.length() == 0 {
       match ctx.internal_map.get("pion_arr_push_owned") {
         Some(arr_po_fidx) => {
@@ -2979,9 +2979,9 @@ fn wasm_emit_inst(
           code.push(0x53) // i64.lt_s(len, cap)
           code.push(0x20); wasm_push_u32(code, p_lidx)
           code.push(0x28); wasm_push_u32(code, 2); wasm_push_u32(code, 20) // stride
-          code.push(0x41); wasm_push_s32(code, 1); code.push(0x47) // stride != 1
+          code.push(0x45) // stride == 0 (8B standard array; 1/4/>=16 go to pion_arr_push_owned)
           code.push(0x71) // i32.and
-          code.push(0x04); code.push(0x40) // if (len < cap && stride != 1)
+          code.push(0x04); code.push(0x40) // if (len < cap && stride == 0)
           // dp = i32.wrap_i64(i64.load(p + 24)); i64.store(dp + (i32(len) << 3), val)
           code.push(0x20); wasm_push_u32(code, p_lidx)
           code.push(0x29); wasm_push_u32(code, 2); wasm_push_u32(code, 24); code.push(0xA7)
@@ -10882,39 +10882,100 @@ fn wasm_build_str_affix_body(is_suffix : Bool) -> Array[Int] {
 }
 
 ///|
-/// Pure-Wasm internal `pion_arr_clear(a: i64) -> void`.
+/// Pure-Wasm internal `pion_arr_clear(a: i64) -> void` (P82-A: supports both standard 8B
+/// arrays and flat inline RC struct arrays with `stride > 8` + `i32.ctz(mask)`).
 fn wasm_build_arr_clear_body(rc_dec_idx : Int) -> Array[Int] {
-  // 4 i32 locals (1=p, 2=dp, 3=i, 4=n) + 1 i64 local (5=ev)
-  let body : Array[Int] = [0x02, 0x04, 0x7F, 0x01, 0x7E]
-  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 1) // p
-  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 16) // elem_is_obj
+  // 8 i32 locals (1=p, 2=dp, 3=i/elem_ptr, 4=n/end_ptr, 5=mask, 6=stride, 7=m, 8=bit) + 1 i64 local (9=ev)
+  let body : Array[Int] = [0x02, 0x08, 0x7F, 0x01, 0x7E]
+  // p = i32.wrap_i64(param 0); n = i32.wrap_i64(i64.load(p + 0)); i64.store(p + 0, 0L)
+  body.push(0x20); wasm_push_u32(body, 0); body.push(0xA7); body.push(0x22); wasm_push_u32(body, 1)
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 4) // n
+  body.push(0x20); wasm_push_u32(body, 1); body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
+  // mask = i32.load(p + 16); if (mask != 0 && n > 0)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 16)
+  body.push(0x22); wasm_push_u32(body, 5) // mask
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x47) // mask != 0
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x4A) // n >_s 0
+  body.push(0x71) // i32.and
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 1); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
+  // dp = i32.wrap_i64(i64.load(p + 24)); if (dp != 0)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 24)
   body.push(0xA7); body.push(0x22); wasm_push_u32(body, 2) // dp
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 1); body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0xA7); body.push(0x21); wasm_push_u32(body, 4) // n
+  // stride = i32.load(p + 20); if (stride <= 8)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 20)
+  body.push(0x22); wasm_push_u32(body, 6) // stride
+  body.push(0x41); wasm_push_s32(body, 8); body.push(0x4C) // stride <=_s 8
+  body.push(0x04); body.push(0x40)
+  // Standard 8B object array: i = 0; while (i < n) { ev = i64.load(dp + (i << 3)); if (ev != 0) rc_dec(ev); i++ }
+  body.push(0x41); wasm_push_s32(body, 0); body.push(0x21); wasm_push_u32(body, 3)
   body.push(0x02); body.push(0x40)
   body.push(0x03); body.push(0x40)
   body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 4); body.push(0x4F) // i >=_u n
   body.push(0x0D); wasm_push_u32(body, 1)
   body.push(0x20); wasm_push_u32(body, 2)
   body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74); body.push(0x6A)
-  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0); body.push(0x22); wasm_push_u32(body, 5) // ev
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0); body.push(0x22); wasm_push_u32(body, 9) // ev
   body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52) // ev != 0
   body.push(0x04); body.push(0x40)
-  body.push(0x20); wasm_push_u32(body, 5); body.push(0x10); wasm_push_u32(body, rc_dec_idx)
+  body.push(0x20); wasm_push_u32(body, 9); body.push(0x10); wasm_push_u32(body, rc_dec_idx)
   body.push(0x0B)
   body.push(0x20); wasm_push_u32(body, 3); body.push(0x41); wasm_push_s32(body, 1); body.push(0x6A)
   body.push(0x21); wasm_push_u32(body, 3)
   body.push(0x0C); wasm_push_u32(body, 0)
+  body.push(0x0B) // end loop
+  body.push(0x0B) // end block
+  // Flat inline RC struct array (stride > 8): pointer-increment outer loop + i32.ctz(mask) inner loop
+  body.push(0x05)
+  // end_ptr (4) = dp (2) + n (4) * stride (6); elem_ptr (3) = dp (2)
+  body.push(0x20); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 4)
+  body.push(0x20); wasm_push_u32(body, 6)
+  body.push(0x6C) // i32.mul
+  body.push(0x6A) // i32.add
+  body.push(0x21); wasm_push_u32(body, 4) // end_ptr
+  body.push(0x20); wasm_push_u32(body, 2); body.push(0x21); wasm_push_u32(body, 3) // elem_ptr
+  body.push(0x02); body.push(0x40) // outer block
+  body.push(0x03); body.push(0x40) // outer loop
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 4); body.push(0x4F) // elem_ptr >=_u end_ptr
+  body.push(0x0D); wasm_push_u32(body, 1)
+  body.push(0x20); wasm_push_u32(body, 5); body.push(0x21); wasm_push_u32(body, 7) // m = mask
+  body.push(0x02); body.push(0x40) // inner block
+  body.push(0x03); body.push(0x40) // inner loop
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x45) // m == 0
+  body.push(0x0D); wasm_push_u32(body, 1)
+  // bit (8) = i32.ctz(m); m &= m - 1
+  body.push(0x20); wasm_push_u32(body, 7); body.push(0x68); body.push(0x21); wasm_push_u32(body, 8)
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x20); wasm_push_u32(body, 7)
+  body.push(0x41); wasm_push_s32(body, 1); body.push(0x6B); body.push(0x71)
+  body.push(0x21); wasm_push_u32(body, 7)
+  // ev (9) = i64.load(elem_ptr + (bit << 3)); if (ev != 0L) call rc_dec_idx(ev)
+  body.push(0x20); wasm_push_u32(body, 3)
+  body.push(0x20); wasm_push_u32(body, 8); body.push(0x41); wasm_push_s32(body, 3); body.push(0x74); body.push(0x6A)
+  body.push(0x29); wasm_push_u32(body, 2); wasm_push_u32(body, 0); body.push(0x22); wasm_push_u32(body, 9)
+  body.push(0x42); wasm_push_s64(body, 0L); body.push(0x52)
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 9); body.push(0x10); wasm_push_u32(body, rc_dec_idx)
   body.push(0x0B)
-  body.push(0x0B)
-  body.push(0x0B)
-  body.push(0x0B)
-  body.push(0x20); wasm_push_u32(body, 1); body.push(0x42); wasm_push_s64(body, 0L)
-  body.push(0x37); wasm_push_u32(body, 2); wasm_push_u32(body, 0)
-  body.push(0x0B)
+  body.push(0x0C); wasm_push_u32(body, 0)
+  body.push(0x0B) // end inner loop
+  body.push(0x0B) // end inner block
+  body.push(0x20); wasm_push_u32(body, 3); body.push(0x20); wasm_push_u32(body, 6); body.push(0x6A)
+  body.push(0x21); wasm_push_u32(body, 3) // elem_ptr += stride
+  body.push(0x0C); wasm_push_u32(body, 0)
+  body.push(0x0B) // end outer loop
+  body.push(0x0B) // end outer block
+  body.push(0x0B) // end if (stride <= 8)
+  body.push(0x0B) // end if (dp != 0)
+  body.push(0x0B) // end if (mask != 0 && n > 0)
+  body.push(0x0B) // end fn
   body
 }
 
