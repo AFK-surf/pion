@@ -77,6 +77,8 @@ export function createPionRuntime(opts = {}) {
   const free = FREE_CLASSES.map(() => []);
   const largeFree = new Map();
   const channels = new Map();
+  const rcDeferQueue = [];
+  let jsDropDepth = 0;
   const out = [], err = [];
   const printFn = opts.print || ((s) => out.push(s));
   const printlnFn = opts.println || ((s) => out.push(s + "\n"));
@@ -113,7 +115,7 @@ export function createPionRuntime(opts = {}) {
       hashSeed2 = splitmix64(hashSeed ^ 0x9e3779b97f4a7c15n);
     }
     if (slabCtl > 0) {
-      u8.fill(0, slabCtl, slabCtl + 80);
+      u8.fill(0, slabCtl, slabCtl + 96);
       su32(slabCtl + 36, heapPtr); su32(slabCtl + 40, heapEnd); su32(slabCtl + 44, heapBase);
       dv.setBigUint64(slabCtl + 64, hashSeed, true);
       dv.setBigUint64(slabCtl + 72, hashSeed2, true);
@@ -121,6 +123,8 @@ export function createPionRuntime(opts = {}) {
     for (let i = 0; i < free.length; i++) free[i].length = 0;
     largeFree.clear();
     channels.clear();
+    rcDeferQueue.length = 0;
+    jsDropDepth = 0;
   }
 
   function clsIdx(n) {
@@ -199,7 +203,10 @@ export function createPionRuntime(opts = {}) {
     const off = gu32(h) === 0 ? 8 : 4; su32(h + off, gu32(h + off) + 1);
   }
 
-  function pion_rc_dec_slow(obj) {
+  const getDropDepth = () => (slabCtl > 0 ? gu32(slabCtl + 80) : jsDropDepth);
+  const setDropDepth = (d) => { jsDropDepth = d >>> 0; if (slabCtl > 0) su32(slabCtl + 80, jsDropDepth); };
+
+  function pion_rc_dec_slow_one(obj) {
     const p = pNum(obj); if (!p) return; sync();
     const h = p - HDR;
     const dropIdx = Number(g64(h + 16)), tag = dv.getUint16(h + 12, true);
@@ -244,6 +251,48 @@ export function createPionRuntime(opts = {}) {
       }
     }
     rawFree(h);
+  }
+
+  function pion_rc_dec_drain() {
+    const prev = getDropDepth();
+    setDropDepth(prev + 1);
+    try {
+      while (rcDeferQueue.length > 0) {
+        if (slabCtl > 0) su32(slabCtl + 84, 0);
+        const next = rcDeferQueue.pop();
+        pion_rc_dec_slow_one(next);
+        sync();
+      }
+      if (slabCtl > 0) su32(slabCtl + 84, 0);
+    } finally {
+      sync();
+      setDropDepth(prev);
+    }
+  }
+
+  function pion_rc_dec_slow(obj) {
+    sync();
+    const p = pNum(obj);
+    if (!p) {
+      if (rcDeferQueue.length > 0) pion_rc_dec_drain();
+      return;
+    }
+    const curDepth = getDropDepth();
+    if (curDepth >= 64) {
+      rcDeferQueue.push(obj);
+      if (slabCtl > 0) su32(slabCtl + 84, 1);
+      return;
+    }
+    setDropDepth(curDepth + 1);
+    try {
+      pion_rc_dec_slow_one(obj);
+    } finally {
+      sync();
+      setDropDepth(curDepth);
+    }
+    if (curDepth === 0 && rcDeferQueue.length > 0) {
+      pion_rc_dec_drain();
+    }
   }
 
   function pion_rc_dec(obj) {

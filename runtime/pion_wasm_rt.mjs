@@ -150,6 +150,8 @@ export function createPionRuntime(options = {}) {
   let hashSeed2 = 0n;
   let freeLists = null;
   const largeFree = new Map();
+  const rcDeferQueue = [];
+  let jsDropDepth = 0;
 
   const stdoutChunks = [];
   const stderrChunks = [];
@@ -217,7 +219,7 @@ export function createPionRuntime(options = {}) {
       hashSeed2 = splitmix64(hashSeed ^ 0x9e3779b97f4a7c15n);
     }
     if (slabCtl > 0) {
-      u8.fill(0, slabCtl, slabCtl + 80);
+      u8.fill(0, slabCtl, slabCtl + 96);
       dv.setUint32(slabCtl + 36, heapPtr >>> 0, true);
       dv.setUint32(slabCtl + 40, heapEnd >>> 0, true);
       dv.setUint32(slabCtl + 44, heapBase >>> 0, true);
@@ -230,6 +232,8 @@ export function createPionRuntime(options = {}) {
       }
     }
     largeFree.clear();
+    rcDeferQueue.length = 0;
+    jsDropDepth = 0;
   }
 
   function sizeClassIndex(totalSize) {
@@ -406,7 +410,16 @@ export function createPionRuntime(options = {}) {
     }
   }
 
-  function pion_rc_dec_slow(obj) {
+  function getDropDepth() {
+    return slabCtl > 0 ? dv.getUint32(slabCtl + 80, true) : jsDropDepth;
+  }
+
+  function setDropDepth(d) {
+    jsDropDepth = d >>> 0;
+    if (slabCtl > 0) dv.setUint32(slabCtl + 80, jsDropDepth, true);
+  }
+
+  function pion_rc_dec_slow_one(obj) {
     const p = pNum(obj);
     if (p === 0) return;
     syncViews();
@@ -482,6 +495,48 @@ export function createPionRuntime(options = {}) {
       }
     }
     rawFree(hdr);
+  }
+
+  function pion_rc_dec_drain() {
+    const prev = getDropDepth();
+    setDropDepth(prev + 1);
+    try {
+      while (rcDeferQueue.length > 0) {
+        if (slabCtl > 0) dv.setUint32(slabCtl + 84, 0, true);
+        const next = rcDeferQueue.pop();
+        pion_rc_dec_slow_one(next);
+        syncViews();
+      }
+      if (slabCtl > 0) dv.setUint32(slabCtl + 84, 0, true);
+    } finally {
+      syncViews();
+      setDropDepth(prev);
+    }
+  }
+
+  function pion_rc_dec_slow(obj) {
+    syncViews();
+    const p = pNum(obj);
+    if (p === 0) {
+      if (rcDeferQueue.length > 0) pion_rc_dec_drain();
+      return;
+    }
+    const curDepth = getDropDepth();
+    if (curDepth >= 64) {
+      rcDeferQueue.push(obj);
+      if (slabCtl > 0) dv.setUint32(slabCtl + 84, 1, true);
+      return;
+    }
+    setDropDepth(curDepth + 1);
+    try {
+      pion_rc_dec_slow_one(obj);
+    } finally {
+      syncViews();
+      setDropDepth(curDepth);
+    }
+    if (curDepth === 0 && rcDeferQueue.length > 0) {
+      pion_rc_dec_drain();
+    }
   }
 
   function pion_rc_dec(obj) {

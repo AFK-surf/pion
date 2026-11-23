@@ -6818,6 +6818,63 @@ fn wasm_build_drop_s2_body(self_idx : Int, rc_dec_idx : Int) -> Array[Int] {
 /// runs drop_fn via `call_indirect`, recursively rc_dec's Array/Map elements in Wasm,
 /// and recycles buffers & headers via `__pion_raw_free_slab` with zero JS boundary crossings
 /// (falling back to JS `pion_rc_dec_slow` only once for >512B non-top backing buffers).
+///|
+/// P73: Thin depth-bounded wrapper around `__pion_rc_dec_slow_inner`.
+/// Shares `drop_depth` (`slab_ctl + 80`) and `defer_pending` (`slab_ctl + 84`) with JS runtime:
+/// when `d >= 64`, defers `obj` to JS `pion_rc_dec_slow(obj)` and unwinds immediately;
+/// when outermost `d == 0` finishes with `defer_pending != 0`, triggers JS `pion_rc_dec_slow(0L)` drain.
+fn wasm_build_rc_dec_slow_entry_body(
+  slow_imp_idx : Int,
+  inner_idx : Int,
+) -> Array[Int] {
+  let body : Array[Int] = [0x01, 0x01, 0x7F] // 1 local: d (i32)
+  // if (obj == 0L) return
+  body.push(0x20); wasm_push_u32(body, 0)
+  body.push(0x50) // i64.eqz
+  body.push(0x04); body.push(0x40)
+  body.push(0x0F)
+  body.push(0x0B)
+  // d = i32.load(slab_ctl + 80)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 80)
+  body.push(0x22); wasm_push_u32(body, 1) // local.tee 1 (d)
+  // if (d >=u 64) { call slow_imp_idx(obj); return }
+  body.push(0x41); wasm_push_s32(body, 64)
+  body.push(0x4F) // i32.ge_u
+  body.push(0x04); body.push(0x40)
+  body.push(0x20); wasm_push_u32(body, 0)
+  body.push(0x10); wasm_push_u32(body, slow_imp_idx)
+  body.push(0x0F)
+  body.push(0x0B)
+  // i32.store(slab_ctl + 80, d + 1)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x41); wasm_push_s32(body, 1)
+  body.push(0x6A) // i32.add
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 80)
+  // call inner_idx(obj)
+  body.push(0x20); wasm_push_u32(body, 0)
+  body.push(0x10); wasm_push_u32(body, inner_idx)
+  // i32.store(slab_ctl + 80, d)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x36); wasm_push_u32(body, 2); wasm_push_u32(body, 80)
+  // if (d == 0 && i32.load(slab_ctl + 84) != 0) { call slow_imp_idx(0L) }
+  body.push(0x20); wasm_push_u32(body, 1)
+  body.push(0x45) // i32.eqz
+  body.push(0x04); body.push(0x40)
+  body.push(0x23); wasm_push_u32(body, 2)
+  body.push(0x28); wasm_push_u32(body, 2); wasm_push_u32(body, 84)
+  body.push(0x04); body.push(0x40)
+  body.push(0x42); wasm_push_s64(body, 0L)
+  body.push(0x10); wasm_push_u32(body, slow_imp_idx)
+  body.push(0x0B)
+  body.push(0x0B)
+  body.push(0x0B) // end func
+  body
+}
+
+///|
 fn wasm_build_rc_dec_slow_body(
   slow_imp_idx : Int,
   drop_sig_idx : Int,
@@ -12160,7 +12217,7 @@ pub fn emit_wasm_from_ssa_units_opts(
   }
   let static_end = cur_addr
   let slab_ctl_addr = wasm_align_up(static_end, 16)
-  let heap_base = slab_ctl_addr + 80
+  let heap_base = slab_ctl_addr + 96
 
   // 2. Register internal function names (indices will be shifted after imports are known)
   let internal_def_set : Map[String, Int] = Map([])
@@ -12510,6 +12567,7 @@ pub fn emit_wasm_from_ssa_units_opts(
   }
   let mut raw_free_slab_internal_idx = -1
   let mut drop_s2_internal_idx = -1
+  let mut rc_dec_slow_inner_idx = -1
   let mut rc_dec_slow_internal_idx = -1
   let mut rc_dec_internal_idx = -1
   let mut drop_sig_idx = -1
@@ -12526,6 +12584,10 @@ pub fn emit_wasm_from_ssa_units_opts(
       wasm_intern_sig(ctx, [WASM_TY_I32, WASM_TY_I32, WASM_TY_I32], WASM_TY_VOID),
     )
     def_func_names.push("__pion_drop_s2")
+    let slow_inner_idx = num_imports + internal_sig_idxs.length()
+    rc_dec_slow_inner_idx = slow_inner_idx
+    internal_sig_idxs.push(void_i64_sig)
+    def_func_names.push("__pion_rc_dec_slow_inner")
     let slow_int_idx = num_imports + internal_sig_idxs.length()
     rc_dec_slow_internal_idx = slow_int_idx
     ctx.internal_map.set("pion_rc_dec_slow", slow_int_idx)
@@ -13056,6 +13118,9 @@ pub fn emit_wasm_from_ssa_units_opts(
         rc_dec_slow_internal_idx,
         drop_s2_internal_idx,
       ),
+    )
+    code_bodies.push(
+      wasm_build_rc_dec_slow_entry_body(slow_imp_idx, rc_dec_slow_inner_idx),
     )
     code_bodies.push(wasm_build_rc_dec_body(rc_dec_slow_internal_idx))
   }

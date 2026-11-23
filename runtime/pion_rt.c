@@ -656,31 +656,39 @@ void *pion_alloc(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
     return payload;
 }
 
-static PION_NOINLINE PION_MINSIZE void pion_destroy_slow(PionHeader *hdr, void *obj) {
-    if (hdr->drop_fn) {
-        hdr->drop_fn(obj);
-    }
-#if PION_USE_SLAB
-    uint16_t flags = hdr->flags;
-    if (__builtin_expect((flags & PION_FLAG_SLAB) != 0, 1)) {
-        uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
-        int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
-        PionSlabTLS *s = mt ? pion_slab_cur_mt() : &g_main_slab;
-        if (__builtin_expect((!mt || (flags & PION_FLAG_FROZEN) == 0) && s != NULL, 1)) {
-            pion_slab_set_next(hdr, s->local_free[cls]);
-            s->local_free[cls] = hdr;
-            return;
+typedef struct {
+    void **q;
+    uint32_t depth;
+    uint32_t len;
+    uint32_t cap;
+} PionDropTLS;
+
+static PionDropTLS g_main_drop;
+static _Thread_local PionDropTLS tls_drop;
+
+static PION_NOINLINE PION_MINSIZE void pion_destroy(PionHeader *hdr, void *obj);
+
+static PION_COLD PION_NOINLINE PION_MINSIZE void pion_drop_worklist(PionDropTLS *td, void *obj) {
+    if (obj) {
+        if (td->len == td->cap) {
+            uint32_t ncap = td->cap ? td->cap * 2u : 256u;
+            void **nq = (void **)realloc(td->q, (size_t)ncap * sizeof(void *));
+            if (!nq) pion_die("out of memory");
+            td->q = nq;
+            td->cap = ncap;
         }
-        pion_slab_free_remote(hdr, cls);
+        td->q[td->len++] = obj;
         return;
     }
-    if (__builtin_expect((flags & PION_FLAG_MED_CACHE) != 0, 0)) {
-        uint32_t mcls = (uint32_t)((flags >> PION_FLAG_MED_CLS_SHIFT) & PION_FLAG_MED_CLS_MASK);
-        pion_med_free(hdr, mcls, (flags & PION_FLAG_FROZEN) != 0);
-        return;
+    td->depth = 1u;
+    while (td->len > 0u) {
+        void *x = td->q[--td->len];
+        pion_destroy(pion_hdr(x), x);
     }
-#endif
-    free(hdr);
+    td->depth = 0u;
+    free(td->q);
+    td->q = NULL;
+    td->cap = 0u;
 }
 
 static struct {
@@ -690,24 +698,52 @@ static struct {
     uint64_t hash;
 } g_map_hint;
 
-static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
+static PION_NOINLINE PION_MINSIZE void pion_destroy(PionHeader *hdr, void *obj) {
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
     if (__builtin_expect(!mt && obj == g_map_hint.key, 0)) {
         g_map_hint.map = NULL;
     }
+    PionDropFn drop = hdr->drop_fn;
+    PionDropTLS *td = NULL;
+    uint32_t d = 0u;
+    if (drop) {
+        td = __builtin_expect(!mt, 1) ? &g_main_drop : &tls_drop;
+        d = td->depth;
+        if (__builtin_expect(d >= 64u, 0)) {
+            pion_drop_worklist(td, obj);
+            return;
+        }
+        td->depth = d + 1u;
+        drop(obj);
+        td->depth = d;
+    }
 #if PION_USE_SLAB
     uint16_t flags = hdr->flags;
-    if (__builtin_expect(!mt && (flags & PION_FLAG_SLAB) != 0, 1)) {
-        if (hdr->drop_fn) {
-            hdr->drop_fn(obj);
-        }
+    if (__builtin_expect((flags & PION_FLAG_SLAB) != 0, 1)) {
         uint32_t cls = (uint32_t)((flags >> PION_FLAG_SLAB_CLS_SHIFT) & PION_FLAG_SLAB_CLS_MASK);
-        pion_slab_set_next(hdr, g_main_slab.local_free[cls]);
-        g_main_slab.local_free[cls] = hdr;
-        return;
-    }
+        if (__builtin_expect(!mt, 1)) {
+            pion_slab_set_next(hdr, g_main_slab.local_free[cls]);
+            g_main_slab.local_free[cls] = hdr;
+        } else {
+            PionSlabTLS *s = pion_slab_cur_mt();
+            if (__builtin_expect((flags & PION_FLAG_FROZEN) == 0 && s != NULL, 1)) {
+                pion_slab_set_next(hdr, s->local_free[cls]);
+                s->local_free[cls] = hdr;
+            } else {
+                pion_slab_free_remote(hdr, cls);
+            }
+        }
+    } else if (__builtin_expect((flags & PION_FLAG_MED_CACHE) != 0, 0)) {
+        uint32_t mcls = (uint32_t)((flags >> PION_FLAG_MED_CLS_SHIFT) & PION_FLAG_MED_CLS_MASK);
+        pion_med_free(hdr, mcls, (flags & PION_FLAG_FROZEN) != 0);
+    } else
 #endif
-    pion_destroy_slow(hdr, obj);
+    {
+        free(hdr);
+    }
+    if (__builtin_expect(td != NULL && d == 0u && td->len != 0u, 0)) {
+        pion_drop_worklist(td, NULL);
+    }
 }
 
 PION_MINSIZE void pion_destroy_obj(void *obj) {
