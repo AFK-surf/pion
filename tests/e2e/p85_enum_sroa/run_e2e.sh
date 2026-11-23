@@ -123,6 +123,118 @@ fn escape_cases(tag : Int, ok : Bool, n : Int) -> Int {
   s1 + s2
 }
 
+// Regression 1: closure returning Double / Unit / Int via `let r = decode(...); return match r`
+fn regression_closures(tag : Int) -> Int {
+  let mut side = 0
+  let f_dbl : (Int) -> Double = fn(t : Int) -> Double {
+    let r = decode(t, true, 5)
+    return match r {
+      Ok(_) => 1.5
+      Err(_) => 2.5
+    }
+  }
+  let f_unit : (Int) -> Unit = fn(t : Int) -> Unit {
+    let r = decode(t, false, 3)
+    return match r {
+      Ok(_) => ()
+      Err(_) => ()
+    }
+  }
+  let f_int : (Int) -> Int = fn(t : Int) -> Int {
+    let r = decode(t, true, 12)
+    return match r {
+      Ok(DecodeStatus::Complete(_, k)) => k
+      Ok(_) => 1
+      Err(_) => -1
+    }
+  }
+  f_unit(tag)
+  f_unit(-1)
+  let d1 = f_dbl(tag)
+  let d2 = f_dbl(-1)
+  side = (d1 * 10.0).to_int() + (d2 * 10.0).to_int() + f_int(tag) + f_int(-1)
+  side
+}
+
+// Regression 2: TCO deep recursion with `let r = step(n); return match r`
+fn step_down(n : Int) -> Option[Int] {
+  if n > 0 { Some(n - 1) } else { None }
+}
+
+fn countdown(n : Int, acc : Int) -> Int {
+  let r = step_down(n)
+  return match r {
+    Some(m) => countdown(m, acc + 1)
+    None => acc
+  }
+}
+
+// Regression 3: `if opt is Some(n)` shadowing outer `let n = 91` inside POD enum SROA
+pub enum BindEnum {
+  Empty
+  Val(Int)
+}
+
+fn mk_bind_enum(opt : Option[Int]) -> Result[BindEnum, String] {
+  let n = 91
+  let e = if opt is Some(n) { BindEnum::Val(n) } else { BindEnum::Empty }
+  Ok(e)
+}
+
+fn mk_bind_enum_direct(opt : Option[Int]) -> Result[BindEnum, String] {
+  let n = 91
+  Ok(if opt is Some(n) { BindEnum::Val(n) } else { BindEnum::Empty })
+}
+
+fn mk_bind_enum_outer_if(opt : Option[Int]) -> Result[BindEnum, String] {
+  let n = 91
+  if opt is Some(n) {
+    Ok(BindEnum::Val(n))
+  } else {
+    Ok(BindEnum::Empty)
+  }
+}
+
+fn regression_is_bind() -> Int {
+  let r1 = match mk_bind_enum(Some(7)) {
+    Ok(BindEnum::Val(v)) => v
+    Ok(BindEnum::Empty) => -100
+    Err(_) => -200
+  }
+  let r2 = match mk_bind_enum_direct(Some(7)) {
+    Ok(BindEnum::Val(v)) => v
+    Ok(BindEnum::Empty) => -100
+    Err(_) => -200
+  }
+  let r3 = match mk_bind_enum_direct(None) {
+    Ok(BindEnum::Val(v)) => v
+    Ok(BindEnum::Empty) => 13
+    Err(_) => -200
+  }
+  let r4 = match mk_bind_enum_outer_if(Some(8)) {
+    Ok(BindEnum::Val(v)) => v
+    Ok(BindEnum::Empty) => -100
+    Err(_) => -200
+  }
+  r1 * 10000 + r2 * 100 + r3 + r4 * 1000000
+}
+
+// Regression 4: user local named `__scmn_ok` / `__scmn_err` must not be shadowed
+fn regression_scmn_shadow(tag : Int) -> Int {
+  let __scmn_ok = 42
+  let __scmn_err = 99
+  let v1 = match decode(tag, true, 5) {
+    Ok(DecodeStatus::Complete(_, _)) => __scmn_ok
+    Ok(_) => -1
+    Err(_) => __scmn_err
+  }
+  let v2 = match decode(-2, true, 5) {
+    Ok(_) => -1
+    Err(_) => __scmn_err
+  }
+  v1 * 1000 + v2
+}
+
 pub fn main(world : World) -> Int {
   let mut acc = 0
   let mut err_cnt = 0
@@ -141,7 +253,27 @@ pub fn main(world : World) -> Int {
     }
     i = i + 1
   }
-  io_println(world, "p85 ok acc=" + acc.to_string() + " err=" + err_cnt.to_string())
+  let r_cls = regression_closures(1)
+  let r_tco = countdown(200000, 0)
+  let r_is = regression_is_bind()
+  let r_sh = regression_scmn_shadow(1)
+  if r_cls != 51 {
+    io_println(world, "FAIL r_cls=" + r_cls.to_string())
+    return 1
+  }
+  if r_tco != 200000 {
+    io_println(world, "FAIL r_tco=" + r_tco.to_string())
+    return 1
+  }
+  if r_is != 8070713 {
+    io_println(world, "FAIL r_is=" + r_is.to_string())
+    return 1
+  }
+  if r_sh != 42099 {
+    io_println(world, "FAIL r_sh=" + r_sh.to_string())
+    return 1
+  }
+  io_println(world, "p85 ok acc=" + acc.to_string() + " err=" + err_cnt.to_string() + " r2=" + r_cls.to_string() + "/" + r_tco.to_string() + "/" + r_is.to_string() + "/" + r_sh.to_string())
   0
 }
 PION
