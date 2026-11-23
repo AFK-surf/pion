@@ -477,12 +477,17 @@ emitins(Ins *i, E *e)
 			t = T.apple ? -1 : R18;
 			if (fixarg(&i->arg[1], storesz(i), t, e)) {
 				if (req(i->arg[0], TMP(IP1))) {
-					fprintf(e->f,
-						"\tfmov\t%c31, %c17\n",
-						"ds"[i->cls == Kw],
-						"xw"[i->cls == Kw]);
+					/* decide width by the store op: Ocopy to
+					 * RSlot resets i->cls to Kw before we get
+					 * here, so i->cls would truncate storel */
+					if (i->op == Ostorel) {
+						fprintf(e->f, "\tfmov\td31, x17\n");
+						i->op = Ostored;
+					} else {
+						fprintf(e->f, "\tfmov\ts31, w17\n");
+						i->op = Ostores;
+					}
 					i->arg[0] = TMP(V31);
-					i->op = Ostores + (i->cls-Kw);
 				}
 				fixarg(&i->arg[1], storesz(i), IP1, e);
 			}
