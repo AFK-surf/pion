@@ -40,12 +40,11 @@ function hashBytes(u8, dv, off, len, seed) {
   }
   let tail = 0n;
   if (rem >= 4) {
-    tail = BigInt(dv.getUint32(p, true)); p += 4; rem -= 4;
-    if (rem >= 2) { tail |= BigInt(dv.getUint16(p, true)) << 32n; p += 2; rem -= 2; }
-    if (rem === 1) tail |= BigInt(u8[p]) << 48n;
-  } else {
-    if (rem >= 2) { tail = BigInt(dv.getUint16(p, true)); p += 2; rem -= 2; }
-    if (rem === 1) tail |= BigInt(u8[p]) << 16n;
+    tail = BigInt(dv.getUint32(p, true)) | (BigInt(dv.getUint32(p + rem - 4, true)) << 32n);
+  } else if (rem >= 2) {
+    tail = BigInt(dv.getUint16(p, true)) | (BigInt(u8[p + rem - 1]) << 16n);
+  } else if (rem === 1) {
+    tail = BigInt(u8[p]);
   }
   h ^= tail;
   h = BigInt.asUintN(64, h * 0xbf58476d1ce4e5b9n); h ^= h >> 27n;
@@ -564,9 +563,11 @@ export function createPionRuntime(opts = {}) {
     for (let i = 0; i < oc; i++) {
       const s = oe + i * 32;
       if (u8[s + 24] === 1) {
-        const h = dv.getBigUint64(s + 8, true); let idx = Number(h & BigInt(mask));
+        const hLo = gu32(s + 8); let idx = (hLo & mask) >>> 0;
         while (u8[ne + idx * 32 + 24] === 1) idx = (idx + 1) & mask;
-        u8.copyWithin(ne + idx * 32, s, s + 32);
+        const d = ne + idx * 32;
+        su32(d, gu32(s)); su32(d + 4, gu32(s + 4)); su32(d + 8, hLo); su32(d + 12, gu32(s + 12));
+        su32(d + 16, gu32(s + 16)); su32(d + 20, gu32(s + 20)); u8[d + 24] = 1;
       }
     }
     if (oe) rawFree(oe); if (slabCtl > 0) su32(slabCtl + 48, 0); s64(p + 8, nc); s64(p + 24, pBig(ne));

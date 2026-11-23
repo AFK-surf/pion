@@ -4856,4 +4856,253 @@ console.log("  p61a (" + mode + "/" + rtLabel + "): " + out + " no-import(pion_m
 done
 done
 
+echo "=== P62-A Regression: SWAR/ctz str_split1_emit + ABA-safe Zero-str_eq map_hint + No-BigInt mapGrow ==="
+cat > "$TMP_DIR/p62a_regression.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn join_sep(xs : Array[String], sep : String) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < xs.length() {
+    if i > 0 {
+      sb.write_string(sep)
+    }
+    sb.write_string(xs[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn check_split_roundtrip(s : String, expected_count : Int) -> Unit {
+  let parts = s.split(" ")
+  must(parts.length() == expected_count, "split count mismatch for len=" + s.length().to_string())
+  must(join_sep(parts, " ") == s, "split roundtrip mismatch for len=" + s.length().to_string())
+}
+
+fn make_probe_key(prefix : String, n : Int) -> String {
+  // Forces fresh heap allocation of identical-size short string
+  let sb = StringBuilder()
+  sb.write_string(prefix)
+  sb.write_string(n.to_string())
+  sb.to_string()
+}
+
+fn run_p62a() -> String {
+  // 1. split single-byte delimiter all boundaries: empty, no delim, 16 spaces, len 0..33,
+  //    8B boundaries (0/7/8/15/16), multiple delims inside one 8B word, >4096B chunk boundary
+  check_split_roundtrip("", 1)
+  check_split_roundtrip("nodelim", 1)
+  check_split_roundtrip("nodelim_longer_than_16_bytes", 1)
+  check_split_roundtrip("                ", 17) // 16 consecutive spaces
+  check_split_roundtrip("a b c d e f g h ", 9)  // multiple delims inside each 8B word
+  check_split_roundtrip(" 1234567 1234567 1234567", 4) // delims at 0, 8, 16
+  check_split_roundtrip("0123456 89abcde fghijkl", 3)   // delims at 7, 15
+
+  // Length 0..33 with delimiters at every position mod 4
+  let mut ln = 0
+  while ln <= 33 {
+    let sb = StringBuilder()
+    let mut delims = 0
+    let mut j = 0
+    while j < ln {
+      if j % 4 == 0 {
+        sb.write_string(" ")
+        delims = delims + 1
+      } else {
+        sb.write_string("x")
+      }
+      j = j + 1
+    }
+    check_split_roundtrip(sb.to_string(), delims + 1)
+    ln = ln + 1
+  }
+
+  // > 4096B chunk boundary split (crosses 4096B and 8192B chunk boundaries)
+  let big_sb = StringBuilder()
+  let mut bi = 0
+  while bi < 1200 {
+    if bi > 0 {
+      big_sb.write_string(" ")
+    }
+    big_sb.write_string("tok_")
+    big_sb.write_string(bi.to_string())
+    bi = bi + 1
+  }
+  let big_str = big_sb.to_string()
+  must(big_str.length() > 9000, "big_str > 9000B")
+  let big_parts = big_str.split(" ")
+  must(big_parts.length() == 1200, "big_parts len == 1200")
+  must(big_parts[0] == "tok_0" && big_parts[511] == "tok_511" && big_parts[1199] == "tok_1199", "big_parts ends")
+
+  // 2. Map hint ABA stress: 64 rounds of try_get hit -> drop old key -> same-size new key reuses slab -> set/get
+  let m : Map[String, Int64] = Map([])
+  let mut r = 0
+  while r < 64 {
+    let ka = make_probe_key("ab_", 100 + r)
+    let kb = make_probe_key("cd_", 100 + r)
+    m.set(ka, r.to_int64() * 10L + 1L)
+    m.set(kb, r.to_int64() * 10L + 2L)
+    // Populate map_hint with a temporary key that is immediately dropped before allocating a same-size different key
+    let mut got_a : Int64 = -1L
+    {
+      let tmp_a = make_probe_key("ab_", 100 + r)
+      got_a = match m.get(tmp_a) {
+        Some(v) => v
+        None => -1L
+      }
+    }
+    must(got_a == r.to_int64() * 10L + 1L, "aba got_a")
+    // Now tmp_a is freed back to slab; allocate same-size tmp_b ("cd_...") which reuses tmp_a's slab address!
+    {
+      let tmp_b = make_probe_key("cd_", 100 + r)
+      m.set(tmp_b, r.to_int64() * 10L + 9L)
+    }
+    // Verify ka was NOT overwritten by stale map_hint!
+    let check_a = match m.get(ka) {
+      Some(v) => v
+      None => -1L
+    }
+    let check_b = match m.get(kb) {
+      Some(v) => v
+      None => -1L
+    }
+    must(check_a == r.to_int64() * 10L + 1L, "aba ka corrupted!")
+    must(check_b == r.to_int64() * 10L + 9L, "aba kb wrong!")
+    r = r + 1
+  }
+
+  // remove + re-set + clear + re-set
+  let kr = make_probe_key("ab_", 105)
+  let _ = m.get(kr)
+  m.remove(kr)
+  must(match m.get(kr) { Some(_) => false; None => true }, "removed key must miss")
+  m.set(kr, 777L)
+  must(match m.get(kr) { Some(v) => v == 777L; None => false }, "re-set after remove")
+  let _ = m.get(kr)
+  m.clear()
+  must(m.length() == 0, "map len 0 after clear")
+  m.set(kr, 888L)
+  must(match m.get(kr) { Some(v) => v == 888L; None => false }, "re-set after clear")
+
+  // 3. Multi-grow (0 -> 16 -> 32 -> ... -> 4096) for both Map[String, Int64] and Map[Int, String]
+  let ms : Map[String, Int64] = Map([])
+  let mut i = 0
+  while i < 2048 {
+    // Test short keys of lengths 1..10 (overlapping 4B/2B/1B hash + 8B loop)
+    let ks = "k" + i.to_string()
+    ms.set(ks, i.to_int64() * 5L)
+    i = i + 1
+  }
+  let mut sum_s : Int64 = 0L
+  i = 0
+  while i < 2048 {
+    let ks = "k" + i.to_string()
+    let v = match ms.get(ks) {
+      Some(x) => x
+      None => -1L
+    }
+    must(v == i.to_int64() * 5L, "ms grow lookup mismatch")
+    sum_s = sum_s + v
+    i = i + 1
+  }
+
+  let mi : Map[Int, String] = Map([])
+  i = 0
+  while i < 2048 {
+    mi.set(i * 17, "v" + i.to_string())
+    i = i + 1
+  }
+  let mut ok_i = 0
+  i = 0
+  while i < 2048 {
+    let hit = match mi.get(i * 17) {
+      Some(s) => s == "v" + i.to_string()
+      None => false
+    }
+    must(hit, "mi grow lookup mismatch")
+    ok_i = ok_i + 1
+    i = i + 1
+  }
+
+  sum_s.to_string() + ":" + ok_i.to_string() + ":" + big_parts.length().to_string()
+}
+
+pub fn main(world : World) -> Int {
+  let res = run_p62a()
+  io_println(world, res)
+  0
+}
+EOF
+P62A_REL_WASM="$TMP_DIR/p62a_rel.wasm"
+P62A_DEV_WASM="$TMP_DIR/p62a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P62A_REL_WASM" "$TMP_DIR/p62a_regression.pion"
+"$PIONC" build --target wasm32 -o "$P62A_DEV_WASM" "$TMP_DIR/p62a_regression.pion"
+for mode_wasm in "release:$P62A_REL_WASM" "dev:$P62A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p62a_regression.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+// sum_s: 5 * (2047 * 2048 / 2) = 10480640
+if ((rc | 0) !== 0 || out !== "10480640:2048:1200") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p62a mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): p62a corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p62a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p62a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
