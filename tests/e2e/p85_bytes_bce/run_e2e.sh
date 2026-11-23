@@ -394,6 +394,22 @@ fn append_opt(a : Array[String], suffix : Option[String]) -> Option[Int] {
   a[0] += suffix?
   Some(a[0].length())
 }
+fn replace_map_slot(m : Map[String, String]) -> String {
+  m["k"] = "other" + "_heap"
+  "_suffix"
+}
+fn replace_vmap_slot(vm : Map[Int, String]) -> String {
+  vm[1] = "other" + "_vheap"
+  "_vsuf"
+}
+fn append_map_opt(m : Map[String, String], suffix : Option[String]) -> Option[Int] {
+  m["k"] += suffix?
+  Some(m["k"].length())
+}
+fn append_vmap_opt(vm : Map[Int, String], suffix : Option[String]) -> Option[Int] {
+  vm[1] += suffix?
+  Some(vm[1].length())
+}
 pub fn main(world : World) -> Int {
   let ab : Array[Byte] = [(10).to_byte()]
   ab[0] += grow_b(ab)
@@ -417,18 +433,35 @@ pub fn main(world : World) -> Int {
     None => -1
   }
   debug_assert(some_len == 17 && a_opt[0] == "base_heap_ok_tail", "append_opt Some")
+  // R7 P1: Map[String, String] & vmap Map[Int, String] compound assign with RHS slot overwrite + `?` early return
+  let sm : Map[String, String] = Map([])
+  sm.set("k", "orig" + "_s")
+  sm["k"] += replace_map_slot(sm)
+  debug_assert(sm["k"] == "orig_s_suffix", "map replace_slot: " + sm["k"])
+  let vm : Map[Int, String] = Map([])
+  vm.set(1, "orig" + "_v")
+  vm[1] += replace_vmap_slot(vm)
+  debug_assert(vm[1] == "orig_v_vsuf", "vmap replace_slot: " + vm[1])
+  let mut mr = 0
+  while mr < 8 {
+    let mn = append_map_opt(sm, None)
+    let vn = append_vmap_opt(vm, None)
+    debug_assert(mn is None && sm["k"] == "orig_s_suffix", "map opt None")
+    debug_assert(vn is None && vm[1] == "orig_v_vsuf", "vmap opt None")
+    mr = mr + 1
+  }
   debug_assert(ab[0].to_int() == 15 && ab.length() == 129, "grow_b")
   debug_assert(ai[0] == 107 && ai.length() == 129, "grow_i")
   debug_assert(ab2[0].to_int() == 25 && ab2.length() == 129, "grower_to_byte")
   debug_assert(as_arr[0] == "hello_heap world" && as_arr.length() == 1, "replace_slot")
-  io_println(world, "grow_ok=" + ab[0].to_int().to_string() + ":" + ai[0].to_string() + ":" + ab2[0].to_int().to_string() + ":" + as_arr[0] + ":" + a_opt[0])
+  io_println(world, "grow_ok=" + ab[0].to_int().to_string() + ":" + ai[0].to_string() + ":" + ab2[0].to_int().to_string() + ":" + as_arr[0] + ":" + a_opt[0] + ":" + sm["k"] + ":" + vm[1])
   0
 }
 EOF
 "$PIONC" build --release -o "$TMP_DIR/p85_compound_grow" "$TMP_DIR/p85_compound_grow.pion"
 GROW_OUT=$("$TMP_DIR/p85_compound_grow")
 echo "p85 compound_grow -> $GROW_OUT"
-test "$GROW_OUT" = "grow_ok=15:107:25:hello_heap world:base_heap_ok_tail"
+test "$GROW_OUT" = "grow_ok=15:107:25:hello_heap world:base_heap_ok_tail:orig_s_suffix:orig_v_vsuf"
 CC_BIN="${CC:-cc}"
 ASAN_RT="$TMP_DIR/libpionrt_asan.a"
 "$CC_BIN" -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
@@ -444,7 +477,7 @@ else
   GROW_ASAN=$(ASAN_OPTIONS=halt_on_error=1 "$TMP_DIR/p85_compound_grow_asan")
 fi
 echo "p85 compound_grow ASan/LSan -> $GROW_ASAN"
-test "$GROW_ASAN" = "grow_ok=15:107:25:hello_heap world:base_heap_ok_tail"
+test "$GROW_ASAN" = "grow_ok=15:107:25:hello_heap world:base_heap_ok_tail:orig_s_suffix:orig_v_vsuf"
 
 # R4 P1-1b: `a[0] += shrink(a)` clears Array[Byte] inside RHS -> must trap OOB on writeback
 cat <<'EOF' > "$TMP_DIR/p85_compound_shrink_oob.pion"
