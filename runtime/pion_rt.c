@@ -681,12 +681,21 @@ static PION_NOINLINE PION_MINSIZE void pion_destroy_slow(PionHeader *hdr, void *
     free(hdr);
 }
 
+static struct {
+    const PionMap *map;
+    const void *key;
+    PionMapEntry *entry;
+    uint64_t hash;
+} g_map_hint;
+
 static PION_NOINLINE void pion_destroy(PionHeader *hdr, void *obj) {
+    int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+    if (__builtin_expect(!mt && obj == g_map_hint.key, 0)) {
+        g_map_hint.map = NULL;
+    }
 #if PION_USE_SLAB
     uint16_t flags = hdr->flags;
-    if (__builtin_expect(
-            !atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
-            (flags & PION_FLAG_SLAB) != 0, 1)) {
+    if (__builtin_expect(!mt && (flags & PION_FLAG_SLAB) != 0, 1)) {
         if (hdr->drop_fn) {
             hdr->drop_fn(obj);
         }
@@ -1651,6 +1660,7 @@ static void pion_arr_drop(void *payload) {
     PionArray *a = (PionArray *)payload;
     if (a->elem_is_obj == 1 && a->elem_stride <= 8 && a->len > 0 &&
         __builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
+        g_map_hint.map = NULL;
         int64_t *data = a->data;
         int64_t n = a->len;
 #if defined(__clang__)
@@ -1970,7 +1980,7 @@ static inline uint64_t pion_str_hash(const PionString *s) {
     const unsigned char *p = (const unsigned char *)s->data;
     size_t len = (size_t)s->len;
     uint64_t h = (0x517cc1b727220a95ULL ^ g_pion_hash_seed) ^ ((uint64_t)len * 0x9e3779b97f4a7c15ULL);
-    while (len >= 8) {
+    while (__builtin_expect(len > 8, 0)) {
         uint64_t w;
         memcpy(&w, p, 8);
         h ^= w;
@@ -1980,33 +1990,17 @@ static inline uint64_t pion_str_hash(const PionString *s) {
         len -= 8;
     }
     uint64_t tail = 0;
-    if (len >= 4) {
-        uint32_t w4;
-        memcpy(&w4, p, 4);
-        tail = (uint64_t)w4;
-        p += 4;
-        len -= 4;
-        if (len >= 2) {
-            uint16_t w2;
-            memcpy(&w2, p, 2);
-            tail |= ((uint64_t)w2) << 32;
-            p += 2;
-            len -= 2;
-        }
-        if (len == 1) {
-            tail |= ((uint64_t)p[0]) << 48;
-        }
-    } else {
-        if (len >= 2) {
-            uint16_t w2;
-            memcpy(&w2, p, 2);
-            tail = (uint64_t)w2;
-            p += 2;
-            len -= 2;
-        }
-        if (len == 1) {
-            tail |= ((uint64_t)p[0]) << 16;
-        }
+    if (__builtin_expect(len >= 4, 1)) {
+        uint32_t lo, hi;
+        memcpy(&lo, p, 4);
+        memcpy(&hi, p + len - 4, 4);
+        tail = (uint64_t)lo | ((uint64_t)hi << 32);
+    } else if (len >= 2) {
+        uint16_t w2;
+        memcpy(&w2, p, 2);
+        tail = (uint64_t)w2 | ((uint64_t)p[len - 1] << 16);
+    } else if (len == 1) {
+        tail = (uint64_t)p[0];
     }
     h ^= tail;
     h *= 0xbf58476d1ce4e5b9ULL;
@@ -2016,18 +2010,19 @@ static inline uint64_t pion_str_hash(const PionString *s) {
     return h;
 }
 
-static PION_NOINLINE uint64_t pion_map_key_hash(const PionMap *m, const void *k) {
+/* Merged key-hash + linear-probe hot path: returns matching occupied slot or first empty slot.
+ * Caller must ensure m->cap > 0, m->entries != NULL, and (m->key_is_int || k != NULL). */
+static PION_NOINLINE PION_HOT PionMapEntry *pion_map_find(
+    const PionMap *m, const void *k, uint64_t *out_h) {
+    uint64_t h;
     if (m->key_is_int) {
         uint64_t x = (uint64_t)(uintptr_t)k;
-        uint64_t h = (x * 0x9E3779B97F4A7C15ULL) ^ (x >> 32);
-        return h ? h : 1;
+        h = (x * 0x9E3779B97F4A7C15ULL) ^ (x >> 32);
+        if (!h) h = 1;
+    } else {
+        h = pion_str_hash((const PionString *)k);
     }
-    return pion_str_hash((const PionString *)k);
-}
-
-/* Shared linear-probe hot path: returns matching occupied slot or first empty slot.
- * Caller must ensure m->cap > 0, m->entries != NULL, and (m->key_is_int || k != NULL). */
-static PION_NOINLINE PionMapEntry *pion_map_probe(const PionMap *m, const PionString *k, uint64_t h) {
+    if (out_h) *out_h = h;
     uint64_t mask = (uint64_t)(m->cap - 1);
     uint64_t idx = h & mask;
     PionMapEntry *entries = m->entries;
@@ -2037,40 +2032,20 @@ static PION_NOINLINE PionMapEntry *pion_map_probe(const PionMap *m, const PionSt
             return e;
         }
         if (m->key_is_int) {
-            if (e->key == k) {
+            if (e->key == (const PionString *)k) {
                 return e;
             }
-        } else if (e->hash == h && pion_str_eq_fast(e->key, k)) {
+        } else if (e->hash == h && pion_str_eq_fast(e->key, (const PionString *)k)) {
             return e;
         }
         idx = (idx + 1) & mask;
     }
 }
 
-static struct {
-    const PionMap *map;
-    const void *key;
-    PionMapEntry *entry;
-} g_map_hint;
-
 static PION_NOINLINE PION_MINSIZE void pion_map_hint_invalidate(const PionMap *m) {
     if (!atomic_load_explicit(&g_pion_mt, memory_order_relaxed) && g_map_hint.map == m) {
         g_map_hint.map = NULL;
     }
-}
-
-static inline PionMapEntry *pion_map_hint_hit(const PionMap *m, const PionString *k, int inline_eq) {
-    if (!atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
-        g_map_hint.map == m && g_map_hint.key == k) {
-        PionMapEntry *e = g_map_hint.entry;
-        int eq = e->key == k ||
-            (!m->key_is_int && (inline_eq ? pion_str_eq_fast(e->key, k)
-                                          : pion_str_eq((void *)e->key, (void *)k)));
-        if (__builtin_expect(eq, 1)) {
-            return e;
-        }
-    }
-    return NULL;
 }
 
 PION_MINSIZE static void pion_map_drop(void *payload) {
@@ -2141,17 +2116,25 @@ PION_HOT void pion_map_set(void *m_ptr, void *key_str, int64_t val) {
     PionMap *m = (PionMap *)m_ptr;
     PionString *k = (PionString *)key_str;
     if (__builtin_expect(!m || (!m->key_is_int && !k), 0)) pion_die("null map or key");
-    PionMapEntry *e = pion_map_hint_hit(m, k, 1);
-    if (e != NULL) {
-        goto update_existing;
+    int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+    PionMapEntry *e;
+    uint64_t h;
+    if (__builtin_expect(!mt && g_map_hint.map == m && g_map_hint.key == k, 1)) {
+        e = g_map_hint.entry;
+        if (__builtin_expect(e->state == 1, 1)) {
+            goto update_existing;
+        }
+        if (__builtin_expect(m->cap > 0 && (m->len + 1) * 10 < m->cap * 7, 1)) {
+            h = g_map_hint.hash;
+            goto insert_new;
+        }
     }
     if (__builtin_expect(m->cap == 0, 0)) {
         pion_map_grow(m, 16);
     } else if (__builtin_expect((m->len + 1) * 10 >= m->cap * 7, 0)) {
         pion_map_grow(m, m->cap * 2);
     }
-    uint64_t h = pion_map_key_hash(m, k);
-    e = pion_map_probe(m, k, h);
+    e = pion_map_find(m, k, &h);
     if (e->state == 1) {
     update_existing:
         if (m->val_is_obj) {
@@ -2164,6 +2147,10 @@ PION_HOT void pion_map_set(void *m_ptr, void *key_str, int64_t val) {
             e->val = val;
         }
         return;
+    }
+insert_new:
+    if (!mt && g_map_hint.map == m) {
+        g_map_hint.map = NULL;
     }
     if (!m->key_is_int) {
         pion_adopt(m, (int64_t)(uintptr_t)k);
@@ -2184,14 +2171,15 @@ PION_HOT int32_t pion_map_try_get(void *m_ptr, void *key_str, int64_t *out_val) 
     PionMap *m = (PionMap *)m_ptr;
     PionString *k = (PionString *)key_str;
     if (__builtin_expect(!m || (!m->key_is_int && !k) || m->len == 0, 0)) return 0;
-    uint64_t h = pion_map_key_hash(m, k);
-    PionMapEntry *e = pion_map_probe(m, k, h);
+    uint64_t h;
+    PionMapEntry *e = pion_map_find(m, k, &h);
+    if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
+        g_map_hint.map = m;
+        g_map_hint.key = k;
+        g_map_hint.entry = e;
+        g_map_hint.hash = h;
+    }
     if (e->state == 1) {
-        if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed), 1)) {
-            g_map_hint.map = m;
-            g_map_hint.key = k;
-            g_map_hint.entry = e;
-        }
         if (out_val) *out_val = e->val;
         return 1;
     }
@@ -2208,12 +2196,12 @@ PION_HOT int64_t pion_map_get(void *m_ptr, void *key_str) {
     if (__builtin_expect(!m || (!m->key_is_int && !k) || m->len == 0, 0)) {
         pion_die("map key not found");
     }
-    PionMapEntry *he = pion_map_hint_hit(m, k, 0);
-    if (__builtin_expect(he != NULL, 0)) {
-        return he->val;
+    if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_relaxed) &&
+                         g_map_hint.map == m && g_map_hint.key == k &&
+                         g_map_hint.entry->state == 1, 0)) {
+        return g_map_hint.entry->val;
     }
-    uint64_t h = pion_map_key_hash(m, k);
-    PionMapEntry *e = pion_map_probe(m, k, h);
+    PionMapEntry *e = pion_map_find(m, k, NULL);
     if (__builtin_expect(e->state == 1, 1)) {
         return e->val;
     }
@@ -2224,8 +2212,7 @@ PION_MINSIZE void pion_map_remove(void *m_ptr, void *key_str) {
     PionMap *m = (PionMap *)m_ptr;
     PionString *k = (PionString *)key_str;
     if (!m || (!m->key_is_int && !k) || m->len == 0 || m->cap == 0) return;
-    uint64_t h = pion_map_key_hash(m, k);
-    PionMapEntry *e = pion_map_probe(m, k, h);
+    PionMapEntry *e = pion_map_find(m, k, NULL);
     if (e->state == 0) return;
     pion_map_hint_invalidate(m);
     uint64_t mask = (uint64_t)(m->cap - 1);

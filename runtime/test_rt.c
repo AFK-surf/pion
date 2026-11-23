@@ -2952,6 +2952,87 @@ static void test_p57b_hot_str_and_split(void) {
     printf("[PASS] p57b_hot_str_and_split\n");
 }
 
+static void test_p61b_map_hint_hit_miss_aba(void) {
+    /* 1. try_get hit -> set in-place update (Int and String obj RC) */
+    void *mi = pion_map_new(0);
+    void *k1 = pion_str_from_cstr("w12345", 6);
+    pion_map_set(mi, k1, 10);
+    int64_t v = 0;
+    assert(pion_map_try_get(mi, k1, &v) == 1 && v == 10);
+    pion_map_set(mi, k1, 42);
+    assert(pion_map_get(mi, k1) == 42);
+    assert(pion_map_len(mi) == 1);
+
+    void *ms = pion_map_new(1);
+    void *v1 = pion_str_from_cstr("val_one", 7);
+    void *v2 = pion_str_from_cstr("val_two", 7);
+    pion_map_set(ms, k1, (int64_t)(uintptr_t)v1);
+    assert(pion_map_try_get(ms, k1, &v) == 1 && (void *)(uintptr_t)v == v1);
+    pion_map_set(ms, k1, (int64_t)(uintptr_t)v2);
+    assert((void *)(uintptr_t)pion_map_get(ms, k1) == v2);
+    pion_rc_dec(v1);
+    pion_rc_dec(v2);
+    pion_rc_dec(ms);
+
+    /* 2. try_get miss -> immediate set insert across grow boundary (cap=16 -> 32 -> 64) */
+    char kbuf[32];
+    for (int i = 0; i < 40; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "k_%02d", i);
+        void *ki = pion_str_from_cstr(kbuf, n);
+        assert(pion_map_try_get(mi, ki, &v) == 0);
+        pion_map_set(mi, ki, (int64_t)(i * 7 + 1));
+        assert(pion_map_get(mi, ki) == (int64_t)(i * 7 + 1));
+        pion_rc_dec(ki);
+    }
+    assert(pion_map_len(mi) == 41);
+
+    /* 3. ABA stress: try_get(m, s1), destroy s1, reallocate same-size s2 (reusing slab addr) */
+    void *s1_orig = pion_str_from_cstr("alpha7", 6);
+    pion_map_set(mi, s1_orig, 111);
+    pion_rc_dec(s1_orig);
+
+    int reused_addr = 0;
+    for (int iter = 0; iter < 64; iter++) {
+        void *s1 = pion_str_from_cstr("alpha7", 6);
+        uintptr_t addr1 = (uintptr_t)s1;
+        assert(pion_map_try_get(mi, s1, &v) == 1 && v == 111);
+        pion_rc_dec(s1); /* triggers pion_destroy -> must invalidate g_map_hint */
+
+        int n = snprintf(kbuf, sizeof(kbuf), "beta%02d", iter);
+        void *s2 = pion_str_from_cstr(kbuf, n);
+        if ((uintptr_t)s2 == addr1) reused_addr++;
+        pion_map_set(mi, s2, 999 + iter);
+        assert(pion_map_get(mi, s2) == 999 + iter);
+
+        void *s1_copy = pion_str_from_cstr("alpha7", 6);
+        assert(pion_map_get(mi, s1_copy) == 111);
+        pion_rc_dec(s1_copy);
+        pion_rc_dec(s2);
+    }
+    (void)reused_addr;
+
+    /* 4. remove / clear followed immediately by set / get must not use stale hint */
+    void *kr = pion_str_from_cstr("rmkey", 5);
+    pion_map_set(mi, kr, 77);
+    assert(pion_map_try_get(mi, kr, &v) == 1 && v == 77);
+    pion_map_remove(mi, kr);
+    assert(pion_map_try_get(mi, kr, &v) == 0);
+    pion_map_set(mi, kr, 88);
+    assert(pion_map_get(mi, kr) == 88);
+
+    assert(pion_map_try_get(mi, kr, &v) == 1 && v == 88);
+    pion_map_clear(mi);
+    assert(pion_map_len(mi) == 0);
+    assert(pion_map_try_get(mi, kr, &v) == 0);
+    pion_map_set(mi, kr, 99);
+    assert(pion_map_get(mi, kr) == 99);
+
+    pion_rc_dec(kr);
+    pion_rc_dec(k1);
+    pion_rc_dec(mi);
+    printf("[PASS] p61b_map_hint_hit_miss_aba\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -2975,6 +3056,7 @@ int main(int argc, char **argv) {
     test_ffi_ptr_and_cstr();
     test_str_to_double();
     test_p57b_hot_str_and_split();
+    test_p61b_map_hint_hit_miss_aba();
 
     test_st_frozen_slab_recycle();
     test_mt_shared_rc();
