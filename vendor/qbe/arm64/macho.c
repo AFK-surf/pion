@@ -1037,12 +1037,21 @@ me_emitins(Ins *i, ME *e)
 		}
 		if (i->op >= Oxsel && i->op <= Oxsel1) {
 			int c = (int)i->op - Oxsel;
-			uint32_t rd = greg(i->to.val);
-			uint32_t rn = greg(i->arg[0].val);
-			uint32_t rm = greg(i->arg[1].val);
 			uint32_t cc = cmp_cc[c][0];
-			/* csel rd, rn, rm, cc */
-			emit_u32(0x1a800000u | (sf << 31) | (rm << 16) | (cc << 12) | (rn << 5) | rd);
+			if (KBASE(k) == 1) {
+				/* fcsel rd, rn, rm, cc */
+				emit_u32(0x1e200c00u | (ftype << 22)
+					| (freg(i->arg[1].val) << 16)
+					| (cc << 12)
+					| (freg(i->arg[0].val) << 5)
+					| freg(i->to.val));
+			} else {
+				uint32_t rd = greg(i->to.val);
+				uint32_t rn = greg(i->arg[0].val);
+				uint32_t rm = greg(i->arg[1].val);
+				/* csel rd, rn, rm, cc */
+				emit_u32(0x1a800000u | (sf << 31) | (rm << 16) | (cc << 12) | (rn << 5) | rd);
+			}
 			break;
 		}
 		die("macho: unhandled op %s(%c)", optab[i->op].name, "wlsd"[k]);
@@ -1550,13 +1559,17 @@ me_compute_gpr_out(Fn *fn)
 {
 	uint64_t *in = alloc(fn->nblk * sizeof *in);
 	uint64_t *out = alloc(fn->nblk * sizeof *out);
-	uint64_t call_pres = 0, all_gpr = 0;
+	uint64_t call_pres = 0, all_reg = 0;
 	for (int r = R19; r <= LR; r++)
 		call_pres |= BIT(r);
 	call_pres |= BIT(SP);
+	for (int r = V8; r <= V15; r++)
+		call_pres |= BIT(r);
 	for (int r = R0; r <= LR; r++)
-		all_gpr |= BIT(r);
-	all_gpr |= BIT(SP);
+		all_reg |= BIT(r);
+	all_reg |= BIT(SP);
+	for (int r = V0; r <= V30; r++)
+		all_reg |= BIT(r);
 
 	int changed;
 	do {
@@ -1566,9 +1579,9 @@ me_compute_gpr_out(Fn *fn)
 			if (b->jmp.type == Jret0) {
 				live = call_pres;
 				if (rtype(b->jmp.arg) == RCall)
-					live |= arm64_retregs(b->jmp.arg, 0) & all_gpr;
+					live |= arm64_retregs(b->jmp.arg, 0) & all_reg;
 				else
-					live |= BIT(R0) | BIT(R1);
+					live |= BIT(R0) | BIT(R1) | BIT(V0) | BIT(V1) | BIT(V2) | BIT(V3);
 			} else if (b->jmp.type == Jhlt) {
 				live = 0;
 			} else if (b->jmp.type == Jjtbl) {
@@ -1582,7 +1595,7 @@ me_compute_gpr_out(Fn *fn)
 				if (b->s2)
 					live |= in[b->s2->id];
 			}
-			if (isreg(b->jmp.arg) && (all_gpr & BIT(b->jmp.arg.val)))
+			if (isreg(b->jmp.arg) && (all_reg & BIT(b->jmp.arg.val)))
 				live |= BIT(b->jmp.arg.val);
 			out[b->id] = live;
 			for (Ins *ins = &b->ins[b->nins]; ins > b->ins;) {
@@ -1590,25 +1603,26 @@ me_compute_gpr_out(Fn *fn)
 				if (ins->op == Ocall) {
 					live &= call_pres;
 					if (rtype(ins->arg[1]) == RCall)
-						live |= arm64_argregs(ins->arg[1], 0) & all_gpr;
+						live |= arm64_argregs(ins->arg[1], 0) & all_reg;
 					else
-						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8);
-					if (isreg(ins->arg[0]) && (all_gpr & BIT(ins->arg[0].val)))
+						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8)
+							| BIT(V0) | BIT(V1) | BIT(V2) | BIT(V3) | BIT(V4) | BIT(V5) | BIT(V6) | BIT(V7);
+					if (isreg(ins->arg[0]) && (all_reg & BIT(ins->arg[0].val)))
 						live |= BIT(ins->arg[0].val);
 					continue;
 				}
-				if (isreg(ins->to) && (all_gpr & BIT(ins->to.val))
+				if (isreg(ins->to) && (all_reg & BIT(ins->to.val))
 				&& ins->op != Osel0 && !isxsel(ins->op))
 					live &= ~BIT(ins->to.val);
 				for (int j = 0; j < 2; j++) {
 					Ref a = ins->arg[j];
-					if (isreg(a) && (all_gpr & BIT(a.val)))
+					if (isreg(a) && (all_reg & BIT(a.val)))
 						live |= BIT(a.val);
 					else if (rtype(a) == RMem) {
 						Mem *m = &fn->mem[a.val];
-						if (isreg(m->base) && (all_gpr & BIT(m->base.val)))
+						if (isreg(m->base) && (all_reg & BIT(m->base.val)))
 							live |= BIT(m->base.val);
-						if (isreg(m->index) && (all_gpr & BIT(m->index.val)))
+						if (isreg(m->index) && (all_reg & BIT(m->index.val)))
 							live |= BIT(m->index.val);
 					}
 				}

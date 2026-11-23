@@ -41,6 +41,7 @@ arm64_memargs(int op)
 	.abi1 = arm64_abi, \
 	.emitfn = arm64_emitfn, \
 	.cansel = 1, \
+	.canfsel = 1, \
 	.jtblclob = BIT(IP0), \
 	.njtblclob = 1, \
 

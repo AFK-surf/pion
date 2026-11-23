@@ -32,6 +32,7 @@ struct E {
 enum {
 	Ki = -1, /* matches Kw and Kl */
 	Ka = -2, /* matches all classes */
+	Kf = -3, /* matches Ks and Kd */
 };
 
 static struct {
@@ -110,7 +111,8 @@ static struct {
 	CMP(X)
 #undef X
 #define X(c, str, _) \
-	{ Oxsel+c, Ki, "csel %=, %0, %1, " str },
+	{ Oxsel+c, Ki, "csel %=, %0, %1, " str }, \
+	{ Oxsel+c, Kf, "fcsel %=, %0, %1, " str },
 	CMP(X)
 #undef X
 	{ NOp, 0, 0 }
@@ -504,7 +506,8 @@ emitins(Ins *i, E *e)
 					optab[i->op].name, "wlsd"[i->cls]);
 			if (omap[o].op == i->op)
 			if (omap[o].cls == i->cls || omap[o].cls == Ka
-			|| (omap[o].cls == Ki && KBASE(i->cls) == 0))
+			|| (omap[o].cls == Ki && KBASE(i->cls) == 0)
+			|| (omap[o].cls == Kf && KBASE(i->cls) == 1))
 				break;
 		}
 		emitf(omap[o].fmt, i, e);
@@ -742,7 +745,7 @@ static uint64_t *
 arm64_compute_gpr_out(Fn *fn)
 {
 	uint64_t *in, *out;
-	uint64_t call_pres = 0, all_gpr = 0;
+	uint64_t call_pres = 0, all_reg = 0;
 	int r, changed;
 	Blk *b;
 	Ins *ins;
@@ -752,9 +755,13 @@ arm64_compute_gpr_out(Fn *fn)
 	for (r = R19; r <= LR; r++)
 		call_pres |= BIT(r);
 	call_pres |= BIT(SP);
+	for (r = V8; r <= V15; r++)
+		call_pres |= BIT(r);
 	for (r = R0; r <= LR; r++)
-		all_gpr |= BIT(r);
-	all_gpr |= BIT(SP);
+		all_reg |= BIT(r);
+	all_reg |= BIT(SP);
+	for (r = V0; r <= V30; r++)
+		all_reg |= BIT(r);
 
 	do {
 		changed = 0;
@@ -763,9 +770,9 @@ arm64_compute_gpr_out(Fn *fn)
 			if (b->jmp.type == Jret0) {
 				live = call_pres;
 				if (rtype(b->jmp.arg) == RCall)
-					live |= arm64_retregs(b->jmp.arg, 0) & all_gpr;
+					live |= arm64_retregs(b->jmp.arg, 0) & all_reg;
 				else
-					live |= BIT(R0) | BIT(R1);
+					live |= BIT(R0) | BIT(R1) | BIT(V0) | BIT(V1) | BIT(V2) | BIT(V3);
 			} else if (b->jmp.type == Jhlt) {
 				live = 0;
 			} else if (b->jmp.type == Jjtbl) {
@@ -780,7 +787,7 @@ arm64_compute_gpr_out(Fn *fn)
 				if (b->s2)
 					live |= in[b->s2->id];
 			}
-			if (isreg(b->jmp.arg) && (all_gpr & BIT(b->jmp.arg.val)))
+			if (isreg(b->jmp.arg) && (all_reg & BIT(b->jmp.arg.val)))
 				live |= BIT(b->jmp.arg.val);
 			out[b->id] = live;
 			for (ins = &b->ins[b->nins]; ins > b->ins;) {
@@ -789,25 +796,26 @@ arm64_compute_gpr_out(Fn *fn)
 				if (ins->op == Ocall) {
 					live &= call_pres;
 					if (rtype(ins->arg[1]) == RCall)
-						live |= arm64_argregs(ins->arg[1], 0) & all_gpr;
+						live |= arm64_argregs(ins->arg[1], 0) & all_reg;
 					else
-						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8);
-					if (isreg(ins->arg[0]) && (all_gpr & BIT(ins->arg[0].val)))
+						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8)
+							| BIT(V0) | BIT(V1) | BIT(V2) | BIT(V3) | BIT(V4) | BIT(V5) | BIT(V6) | BIT(V7);
+					if (isreg(ins->arg[0]) && (all_reg & BIT(ins->arg[0].val)))
 						live |= BIT(ins->arg[0].val);
 					continue;
 				}
-				if (isreg(ins->to) && (all_gpr & BIT(ins->to.val))
+				if (isreg(ins->to) && (all_reg & BIT(ins->to.val))
 				&& ins->op != Osel0 && !isxsel(ins->op))
 					live &= ~BIT(ins->to.val);
 				for (j = 0; j < 2; j++) {
 					Ref a = ins->arg[j];
-					if (isreg(a) && (all_gpr & BIT(a.val)))
+					if (isreg(a) && (all_reg & BIT(a.val)))
 						live |= BIT(a.val);
 					else if (rtype(a) == RMem) {
 						Mem *m = &fn->mem[a.val];
-						if (isreg(m->base) && (all_gpr & BIT(m->base.val)))
+						if (isreg(m->base) && (all_reg & BIT(m->base.val)))
 							live |= BIT(m->base.val);
-						if (isreg(m->index) && (all_gpr & BIT(m->index.val)))
+						if (isreg(m->index) && (all_reg & BIT(m->index.val)))
 							live |= BIT(m->index.val);
 					}
 				}

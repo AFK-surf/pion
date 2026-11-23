@@ -1,8 +1,8 @@
 #include "all.h"
 
 enum {
-	MaxIns = 2,
-	MaxPhis = 2,
+	MaxIns = 3,
+	MaxPhis = 3,
 };
 
 static int
@@ -30,7 +30,7 @@ okjoin(Blk *b)
 
 	n = 0;
 	for (p=b->phi; p; p=p->link) {
-		if (KBASE(p->cls) != 0)
+		if (KBASE(p->cls) != 0 && !T.canfsel)
 			return 0;
 		n++;
 	}

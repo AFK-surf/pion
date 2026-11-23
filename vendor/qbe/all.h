@@ -63,6 +63,7 @@ struct Target {
 	char asloc[4];
 	char assym[4];
 	uint cansel:1;
+	uint canfsel:1;
 	bits jtblclob; /* scratch regs clobbered by jtbl */
 	int njtblclob;
 };
