@@ -594,7 +594,105 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
 }
 
 ///|
+fn drv_ensure_cross_rt_lib(
+  world : World,
+  qbe_target : String,
+  sysroot : String,
+) -> Option[String] {
+  let rt_c = drv_find_pion_rt_c(world)
+  if rt_c.length() == 0 {
+    return None
+  }
+  let c_txt = match fs_read(world, rt_c) {
+    Ok(t) => t
+    Err(_) => return None
+  }
+  let c_hash = sha256_hex(c_txt)
+  let rt_h = drv_join_path(drv_parent_dir(rt_c), "pion_rt.h")
+  let h_hash = if fs_exists(world, rt_h) {
+    match fs_read(world, rt_h) {
+      Ok(t) => sha256_hex(t)
+      Err(_) => ""
+    }
+  } else {
+    ""
+  }
+  let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
+  let tflags = drv_target_cc_flags(world, qbe_target, sysroot)
+  let tflags_str = drv_join_char(tflags, "\n")
+  let key = sha256_hex(
+    "pion-rt-cross-v1|" +
+    qbe_target +
+    "|" +
+    cc_bin +
+    "|" +
+    tflags_str +
+    "|" +
+    c_hash +
+    "|" +
+    h_hash,
+  )
+  let cache_dir = drv_resolve_cache_dir(world)
+  let _ = fs_mkdir_p(world, cache_dir + "/obj")
+  let ar_path = cache_dir + "/obj/pion_rt_" + qbe_target + "_" + key + ".a"
+  if fs_exists(world, ar_path) {
+    return Some(ar_path)
+  }
+  let stamp = clock_now_ms(world).to_string()
+  let obj_tmp = ar_path + ".o.tmp." + stamp
+  let ar_tmp = ar_path + ".a.tmp." + stamp
+  let argv : Array[String] = [cc_bin]
+  let mut fi = 0
+  while fi < tflags.length() {
+    argv.push(tflags[fi])
+    fi = fi + 1
+  }
+  argv.push("-std=c11")
+  argv.push("-O2")
+  if !drv_target_is_windows(qbe_target) {
+    argv.push("-fPIC")
+  }
+  argv.push("-fno-asynchronous-unwind-tables")
+  argv.push("-c")
+  argv.push(rt_c)
+  argv.push("-o")
+  argv.push(obj_tmp)
+  let rc = proc_exec(world, argv)
+  if rc != 0 {
+    let _ = fs_remove(world, obj_tmp)
+    return None
+  }
+  match drv_archive_static_lib(world, qbe_target, [obj_tmp], ar_tmp) {
+    Err(_) => {
+      let _ = fs_remove(world, obj_tmp)
+      let _ = fs_remove(world, ar_tmp)
+      return None
+    }
+    Ok(_) => ()
+  }
+  let _ = fs_remove(world, obj_tmp)
+  let _ = fs_rename(world, ar_tmp, ar_path)
+  let sz = fs_size(world, ar_path)
+  drv_cas_record_and_evict(
+    world,
+    cache_dir,
+    "pion_rt_" + qbe_target + "_" + key,
+    if sz > 0L { sz } else { 0L },
+  )
+  Some(ar_path)
+}
+
+///|
 fn drv_resolve_rt_lib(world : World, qbe_target : String) -> String {
+  drv_resolve_rt_lib_for(world, qbe_target, "")
+}
+
+///|
+fn drv_resolve_rt_lib_for(
+  world : World,
+  qbe_target : String,
+  sysroot : String,
+) -> String {
   let env_rt = drv_env_str(world, "PION_RT_LIB")
   if env_rt.length() > 0 {
     return env_rt
@@ -606,6 +704,12 @@ fn drv_resolve_rt_lib(world : World, qbe_target : String) -> String {
         Some(obj_path) => return obj_path
         None => ()
       }
+    }
+  }
+  if qbe_target != drv_resolve_qbe_target(world) && !drv_target_is_wasm(qbe_target) {
+    match drv_ensure_cross_rt_lib(world, qbe_target, sysroot) {
+      Some(ar_path) => return ar_path
+      None => ()
     }
   }
   let exe_dir = drv_self_exe_dir(world)
@@ -756,13 +860,91 @@ fn drv_resolve_ios_sdk(
 }
 
 ///|
+fn drv_probe_ndk_root_bin(world : World, ndk_root : String) -> String {
+  if ndk_root.length() == 0 {
+    return ""
+  }
+  let hosts : Array[String] = ["darwin-x86_64", "linux-x86_64", "darwin-arm64"]
+  let mut i = 0
+  while i < hosts.length() {
+    let bin_dir = ndk_root + "/toolchains/llvm/prebuilt/" + hosts[i] + "/bin"
+    if fs_exists(world, bin_dir) {
+      return bin_dir
+    }
+    i = i + 1
+  }
+  ""
+}
+
+///|
+fn drv_probe_ndk_parent_bin(world : World, ndk_parent : String) -> String {
+  if ndk_parent.length() == 0 || !fs_exists(world, ndk_parent) {
+    return ""
+  }
+  let entries = fs_list_dir(world, ndk_parent)
+  let mut best_ver = ""
+  let mut best_bin = ""
+  let mut i = 0
+  while i < entries.length() {
+    let ver = entries[i]
+    if ver.length() > 0 && !drv_starts_with(ver, ".") {
+      let b = drv_probe_ndk_root_bin(world, drv_join_path(ndk_parent, ver))
+      if b.length() > 0 && (best_ver.length() == 0 || ver > best_ver) {
+        best_ver = ver
+        best_bin = b
+      }
+    }
+    i = i + 1
+  }
+  best_bin
+}
+
+///|
+fn drv_find_android_ndk_bin_dir(world : World) -> String {
+  let b1 = drv_probe_ndk_root_bin(world, drv_env_str(world, "ANDROID_NDK_HOME"))
+  if b1.length() > 0 {
+    return b1
+  }
+  let b2 = drv_probe_ndk_root_bin(world, drv_env_str(world, "ANDROID_NDK_ROOT"))
+  if b2.length() > 0 {
+    return b2
+  }
+  let ah = drv_env_str(world, "ANDROID_HOME")
+  if ah.length() > 0 {
+    let b3 = drv_probe_ndk_parent_bin(world, ah + "/ndk")
+    if b3.length() > 0 {
+      return b3
+    }
+  }
+  let asr = drv_env_str(world, "ANDROID_SDK_ROOT")
+  if asr.length() > 0 {
+    let b4 = drv_probe_ndk_parent_bin(world, asr + "/ndk")
+    if b4.length() > 0 {
+      return b4
+    }
+  }
+  let home = drv_env_str(world, "HOME")
+  if home.length() > 0 {
+    let b5 = drv_probe_ndk_parent_bin(world, home + "/Library/Android/sdk/ndk")
+    if b5.length() > 0 {
+      return b5
+    }
+    let b6 = drv_probe_ndk_parent_bin(world, home + "/Android/Sdk/ndk")
+    if b6.length() > 0 {
+      return b6
+    }
+  }
+  ""
+}
+
+///|
 fn drv_resolve_android_ndk_tool(
   world : World,
   qbe_target : String,
   is_cxx : Bool,
 ) -> String {
-  let ndk = drv_env_str(world, "ANDROID_NDK_HOME")
-  if ndk.length() == 0 {
+  let bin_dir = drv_find_android_ndk_bin_dir(world)
+  if bin_dir.length() == 0 {
     return ""
   }
   let triple = if qbe_target == "android_x64" {
@@ -771,16 +953,32 @@ fn drv_resolve_android_ndk_tool(
     "aarch64-linux-android24"
   }
   let tool = if is_cxx { triple + "-clang++" } else { triple + "-clang" }
-  let hosts : Array[String] = ["darwin-x86_64", "linux-x86_64", "darwin-arm64"]
-  let mut i = 0
-  while i < hosts.length() {
-    let cand = ndk + "/toolchains/llvm/prebuilt/" + hosts[i] + "/bin/" + tool
-    if fs_exists(world, cand) {
-      return cand
-    }
-    i = i + 1
+  let cand = bin_dir + "/" + tool
+  if fs_exists(world, cand) {
+    cand
+  } else {
+    ""
   }
-  ""
+}
+
+///|
+fn drv_check_android_toolchain(
+  world : World,
+  qbe_target : String,
+) -> Result[Unit, String] {
+  if !drv_target_is_android(qbe_target) {
+    return Ok(())
+  }
+  if drv_env_str(world, "PION_ANDROID_CC").length() > 0 ||
+    drv_env_str(world, "CC").length() > 0 ||
+    drv_find_android_ndk_bin_dir(world).length() > 0 {
+    return Ok(())
+  }
+  Err(
+    "Android target '" +
+    qbe_target +
+    "' requires Android NDK: set ANDROID_NDK_HOME / ANDROID_NDK_ROOT / PION_ANDROID_CC / CC (or install NDK under ANDROID_HOME/ndk)",
+  )
 }
 
 ///|
@@ -883,18 +1081,32 @@ fn drv_target_cc_flags(
       flags.push(sysroot)
     }
   } else if qbe_target == "ios_arm64" {
+    let ios_min_env = drv_env_str(world, "PION_IOS_DEPLOYMENT_TARGET")
+    let ios_min = if ios_min_env.length() > 0 {
+      ios_min_env
+    } else {
+      let iph_env = drv_env_str(world, "IPHONEOS_DEPLOYMENT_TARGET")
+      if iph_env.length() > 0 { iph_env } else { "16.0" }
+    }
     flags.push("-arch")
     flags.push("arm64")
-    flags.push("-miphoneos-version-min=15.0")
+    flags.push("-miphoneos-version-min=" + ios_min)
     let sdk = drv_resolve_ios_sdk(world, qbe_target, sysroot)
     if sdk.length() > 0 {
       flags.push("-isysroot")
       flags.push(sdk)
     }
   } else if qbe_target == "ios_sim_arm64" {
+    let ios_min_env = drv_env_str(world, "PION_IOS_DEPLOYMENT_TARGET")
+    let ios_min = if ios_min_env.length() > 0 {
+      ios_min_env
+    } else {
+      let iph_env = drv_env_str(world, "IPHONEOS_DEPLOYMENT_TARGET")
+      if iph_env.length() > 0 { iph_env } else { "16.0" }
+    }
     flags.push("-arch")
     flags.push("arm64")
-    flags.push("-mios-simulator-version-min=15.0")
+    flags.push("-mios-simulator-version-min=" + ios_min)
     let sdk = drv_resolve_ios_sdk(world, qbe_target, sysroot)
     if sdk.length() > 0 {
       flags.push("-isysroot")
@@ -2580,6 +2792,7 @@ fn drv_compile_pkg_c_sources(
   qbe_target : String,
   sysroot : String,
   need_pic : Bool,
+  release : Bool,
   rt_lib : String,
   cache_dir : String,
   trace_cas : Bool,
@@ -2619,18 +2832,36 @@ fn drv_compile_pkg_c_sources(
   if c_sources.length() == 0 {
     return Ok(false)
   }
-  let cc_flags : Array[String] = drv_target_cc_flags(world, qbe_target, sysroot)
-  if need_pic && !drv_target_is_windows(qbe_target) {
-    cc_flags.push("-fPIC")
-  }
+  let user_cc_flags : Array[String] = []
+  let mut user_has_opt = false
   i = 0
   while i < node.link_common.cc_flags.length() {
-    cc_flags.push(drv_resolve_cc_flag(node.dir, node.link_common.cc_flags[i]))
+    let fl = drv_resolve_cc_flag(node.dir, node.link_common.cc_flags[i])
+    if fl == "-O" || drv_starts_with(fl, "-O") || drv_starts_with(fl, "/O") {
+      user_has_opt = true
+    }
+    user_cc_flags.push(fl)
     i = i + 1
   }
   i = 0
   while i < plat.cc_flags.length() {
-    cc_flags.push(drv_resolve_cc_flag(node.dir, plat.cc_flags[i]))
+    let fl = drv_resolve_cc_flag(node.dir, plat.cc_flags[i])
+    if fl == "-O" || drv_starts_with(fl, "-O") || drv_starts_with(fl, "/O") {
+      user_has_opt = true
+    }
+    user_cc_flags.push(fl)
+    i = i + 1
+  }
+  let cc_flags : Array[String] = drv_target_cc_flags(world, qbe_target, sysroot)
+  if need_pic && !drv_target_is_windows(qbe_target) {
+    cc_flags.push("-fPIC")
+  }
+  if release && !user_has_opt {
+    cc_flags.push("-O3")
+  }
+  i = 0
+  while i < user_cc_flags.length() {
+    cc_flags.push(user_cc_flags[i])
     i = i + 1
   }
   let rt_dir_raw = drv_parent_dir(rt_lib)
@@ -3170,8 +3401,58 @@ fn drv_compile_ssa_to_obj(
 }
 
 ///|
+fn drv_resolve_ar_tool(world : World, qbe_target : String) -> String {
+  let env_ar = drv_env_str(world, "AR")
+  if env_ar.length() > 0 {
+    return env_ar
+  }
+  let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
+  if drv_find_substr(cc_bin, "/", 0) >= 0 {
+    let dir = drv_parent_dir(cc_bin)
+    if dir.length() > 0 {
+      let llvm_ar = drv_join_path(dir, "llvm-ar")
+      if fs_exists(world, llvm_ar) {
+        return llvm_ar
+      }
+      if drv_ends_with(cc_bin, "-gcc") {
+        let cand = slice_str(cc_bin, 0, cc_bin.length() - 3) + "ar"
+        if fs_exists(world, cand) {
+          return cand
+        }
+      } else if drv_ends_with(cc_bin, "-clang") {
+        let cand = slice_str(cc_bin, 0, cc_bin.length() - 5) + "ar"
+        if fs_exists(world, cand) {
+          return cand
+        }
+      }
+    }
+  }
+  if drv_target_is_android(qbe_target) {
+    let ndk_bin = drv_find_android_ndk_bin_dir(world)
+    if ndk_bin.length() > 0 {
+      let cand = ndk_bin + "/llvm-ar"
+      if fs_exists(world, cand) {
+        return cand
+      }
+    }
+  }
+  if !drv_target_is_apple(qbe_target) &&
+    !drv_target_is_windows(qbe_target) &&
+    drv_target_is_apple(drv_resolve_qbe_target(world)) {
+    if fs_exists(world, "/opt/homebrew/opt/llvm/bin/llvm-ar") {
+      return "/opt/homebrew/opt/llvm/bin/llvm-ar"
+    }
+    if fs_exists(world, "/usr/local/opt/llvm/bin/llvm-ar") {
+      return "/usr/local/opt/llvm/bin/llvm-ar"
+    }
+  }
+  "ar"
+}
+
+///|
 fn drv_archive_static_lib(
   world : World,
+  qbe_target : String,
   obj_paths : Array[String],
   out_path : String,
 ) -> Result[String, String] {
@@ -3179,7 +3460,8 @@ fn drv_archive_static_lib(
   if fs_exists(world, out_path) {
     let _ = fs_remove(world, out_path)
   }
-  let argv : Array[String] = ["ar", "rcs", out_path]
+  let ar_bin = drv_resolve_ar_tool(world, qbe_target)
+  let argv : Array[String] = [ar_bin, "rcs", out_path]
   let mut i = 0
   while i < obj_paths.length() {
     argv.push(obj_paths[i])
@@ -3187,7 +3469,7 @@ fn drv_archive_static_lib(
   }
   let rc = proc_exec(world, argv)
   if rc != 0 {
-    Err("ar failed with exit code " + rc.to_string())
+    Err(ar_bin + " failed with exit code " + rc.to_string())
   } else {
     Ok(out_path)
   }
@@ -3509,11 +3791,40 @@ fn drv_build_workspace_objects(
   need_pic : Bool,
   root_tests : Bool,
 ) -> Result[DrvWsBuilt, String] {
+  drv_build_workspace_objects_entry(
+    world,
+    root_dir,
+    release,
+    include_entry,
+    jobs,
+    target_override,
+    sysroot,
+    need_pic,
+    root_tests,
+    "main",
+    false,
+  )
+}
+
+///|
+fn drv_build_workspace_objects_entry(
+  world : World,
+  root_dir : String,
+  release : Bool,
+  include_entry : Bool,
+  jobs : Int,
+  target_override : String,
+  sysroot : String,
+  need_pic : Bool,
+  root_tests : Bool,
+  entry_symbol : String,
+  no_main : Bool,
+) -> Result[DrvWsBuilt, String] {
   let nodes = match drv_load_workspace_nodes(world, root_dir) {
     Err(e) => return Err(e)
     Ok(v) => v
   }
-  drv_build_nodes_objects(
+  drv_build_nodes_objects_entry(
     world,
     nodes,
     release,
@@ -3523,6 +3834,8 @@ fn drv_build_workspace_objects(
     sysroot,
     need_pic,
     root_tests,
+    entry_symbol,
+    no_main,
   )
 }
 
@@ -3790,6 +4103,35 @@ fn drv_build_nodes_objects(
   need_pic : Bool,
   root_tests : Bool,
 ) -> Result[DrvWsBuilt, String] {
+  drv_build_nodes_objects_entry(
+    world,
+    nodes,
+    release,
+    include_entry,
+    jobs,
+    target_override,
+    sysroot,
+    need_pic,
+    root_tests,
+    "main",
+    false,
+  )
+}
+
+///|
+fn drv_build_nodes_objects_entry(
+  world : World,
+  nodes : Array[PkgNodeInput],
+  release : Bool,
+  include_entry : Bool,
+  jobs : Int,
+  target_override : String,
+  sysroot : String,
+  need_pic : Bool,
+  root_tests : Bool,
+  entry_symbol : String,
+  no_main : Bool,
+) -> Result[DrvWsBuilt, String] {
   if root_tests && nodes.length() > 0 {
     // The root package is pushed last by the DFS; it is never CAS-cached here.
     let rn = nodes[nodes.length() - 1]
@@ -3818,8 +4160,12 @@ fn drv_build_nodes_objects(
   let _ = fs_mkdir_p(world, cache_dir + "/bin")
 
   let qbe_target = drv_pick_target(world, target_override)
+  match drv_check_android_toolchain(world, qbe_target) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   let qbe_bin = drv_resolve_qbe_bin(world)
-  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+  let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
   let compiler_fp = drv_compute_compiler_fp(world, qbe_bin, rt_lib)
   let apple_tools = drv_probe_apple_tools(world, qbe_target)
   let direct_obj = drv_direct_obj_target(world, qbe_target)
@@ -3902,6 +4248,13 @@ fn drv_build_nodes_objects(
       upstream_sigs.push(un + ":" + sh + ":" + stub_h)
       u = u + 1
     }
+    if is_entry {
+      if no_main {
+        upstream_sigs.push("__pion_entry__:no_main")
+      } else if entry_symbol.length() > 0 && entry_symbol != "main" {
+        upstream_sigs.push("__pion_entry__:" + entry_symbol)
+      }
+    }
     let key = cas_compute_key(
       node.name,
       node.paths,
@@ -3966,12 +4319,15 @@ fn drv_build_nodes_objects(
       sig_hashes.set(node.name, sha256_hex(pionsig))
       let pionstub = emit_pion_stub(cr.pkg)
       stub_hashes.set(node.name, drv_stub_hash(pionstub, node.sources))
-      let res = emit_qbe_package_multi(
+      let res = emit_qbe_package_multi_entry(
         cr.pkg,
         cr.tc,
         release,
         is_entry,
-        dep_pkg_names,
+        t_names,
+        false,
+        entry_symbol,
+        no_main,
       )
       let final_ssa = if release { inline_native_rc_ssa(res.ssa) } else { res.ssa }
       let _ = drv_write_text_atomic(world, sig_path, pionsig)
@@ -4041,6 +4397,7 @@ fn drv_build_nodes_objects(
       qbe_target,
       sysroot,
       need_pic,
+      release,
       rt_lib,
       cache_dir,
       trace_cas,
@@ -4545,8 +4902,11 @@ fn drv_build_targets(
   sysroot : String,
   cli_libs : Array[String],
   wasm_names : Bool,
+  entry_symbol : String,
+  no_main : Bool,
 ) -> Result[String, String] {
-  if drv_target_is_wasm(drv_pick_target(world, target_override)) {
+  let picked_target = drv_pick_target(world, target_override)
+  if drv_target_is_wasm(picked_target) {
     return drv_build_wasm_targets(
       world,
       targets,
@@ -4556,10 +4916,14 @@ fn drv_build_targets(
       wasm_names,
     )
   }
+  match drv_check_android_toolchain(world, picked_target) {
+    Err(e) => return Err(e)
+    Ok(_) => ()
+  }
   if targets.length() == 1 {
     match drv_detect_manifest_dir(world, targets[0]) {
       Some(root_dir) => {
-        let built = match drv_build_workspace_objects(
+        let built = match drv_build_workspace_objects_entry(
           world,
           root_dir,
           release,
@@ -4567,8 +4931,10 @@ fn drv_build_targets(
           jobs,
           target_override,
           sysroot,
-          emit_cdylib_path != "",
+          emit_cdylib_path != "" || emit_staticlib_path != "",
           false,
+          entry_symbol,
+          no_main,
         ) {
           Err(e) => return Err(e)
           Ok(v) => v
@@ -4583,8 +4949,9 @@ fn drv_build_targets(
           }
           return drv_copy_file(world, built.obj_paths[0], emit_obj_path)
         }
+        let qbe_target = picked_target
         if emit_staticlib_path != "" {
-          return drv_archive_static_lib(world, built.obj_paths, emit_staticlib_path)
+          return drv_archive_static_lib(world, qbe_target, built.obj_paths, emit_staticlib_path)
         }
         let link_opts = built.link_opts
         let mut li = 0
@@ -4595,8 +4962,7 @@ fn drv_build_targets(
           }
           li = li + 1
         }
-        let qbe_target = drv_pick_target(world, target_override)
-        let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+        let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
         if emit_cdylib_path != "" {
           return drv_link_shared_lib(
             world,
@@ -4771,6 +5137,18 @@ fn drv_build_targets(
       }
     }
 
+    let entry_tag = if no_main {
+      ":no_main"
+    } else if entry_symbol.length() > 0 && entry_symbol != "main" {
+      ":entry:" + entry_symbol
+    } else {
+      ""
+    }
+    let unit_sigs_hash = if entry_tag.length() > 0 {
+      sha256_hex(sigs_hash + entry_tag)
+    } else {
+      sigs_hash
+    }
     let unit_keys : Array[String] = []
     let obj_paths : Array[String] = []
     let miss_indices : Array[Int] = []
@@ -4778,7 +5156,7 @@ fn drv_build_targets(
     let pkg_key_sb = StringBuilder()
     pkg_key_sb.write_string(compiler_fp)
     pkg_key_sb.write_string(":")
-    pkg_key_sb.write_string(sigs_hash)
+    pkg_key_sb.write_string(unit_sigs_hash)
     ui = 0
     while ui < n_units {
       let ukey = cas_compute_unit_key(
@@ -4786,7 +5164,7 @@ fn drv_build_targets(
         ui,
         paths[ui],
         src_hashes[ui],
-        sigs_hash,
+        unit_sigs_hash,
         qbe_target,
         release,
         compiler_fp,
@@ -4912,7 +5290,7 @@ fn drv_build_targets(
         let idx = miss_indices[mi]
         let ukey = unit_keys[idx]
         let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
-        let raw_ssa = emit_qbe_unit(prep, idx, release)
+        let raw_ssa = emit_qbe_unit_entry(prep, idx, release, entry_symbol, no_main)
         let ssa_text = if release { inline_native_rc_ssa(raw_ssa) } else { raw_ssa }
         if !drv_write_text_atomic(world, u_ssa, ssa_text) {
           return Err("failed to write CAS unit ssa: " + u_ssa)
@@ -5169,18 +5547,24 @@ fn drv_build_targets(
     if out_bin_arg != "" {
       drv_ensure_parent_dir(world, out_bin_arg)
     }
-    let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+    let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
     match drv_link_objects(world, qbe_target, apple_tools, ld_ver, sysroot, obj_paths, rt_lib, link_opts, final_bin) {
       Err(e) => return Err(e)
       Ok(_) => ()
     }
     return Ok(final_bin)
   }
+  let single_upstream : Array[String] = []
+  if no_main {
+    single_upstream.push("__pion_entry__:no_main")
+  } else if entry_symbol.length() > 0 && entry_symbol != "main" {
+    single_upstream.push("__pion_entry__:" + entry_symbol)
+  }
   let key = cas_compute_key(
     pkg_name,
     paths,
     sources,
-    [],
+    single_upstream,
     qbe_target,
     release,
     compiler_fp,
@@ -5274,7 +5658,15 @@ fn drv_build_targets(
       return Ok(obj_path)
     }
   } else {
-    let compiled = match cli_compile_qbe(pkg_name, paths, sources, release) {
+    let compiled = match cli_compile_qbe_entry(
+      pkg_name,
+      paths,
+      sources,
+      release,
+      false,
+      entry_symbol,
+      no_main,
+    ) {
       Err(diag_json) => return Err(diag_json)
       Ok(c) => c
     }
@@ -5377,9 +5769,9 @@ fn drv_build_targets(
     return drv_copy_file(world, obj_path, emit_obj_path)
   }
   if emit_staticlib_path != "" {
-    return drv_archive_static_lib(world, [obj_path], emit_staticlib_path)
+    return drv_archive_static_lib(world, qbe_target, [obj_path], emit_staticlib_path)
   }
-  let rt_lib = drv_resolve_rt_lib(world, qbe_target)
+  let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
   if emit_cdylib_path != "" {
     return drv_link_shared_lib(
       world,
@@ -6370,6 +6762,7 @@ fn drv_run_ws_tests(
         nodes[topo.order[k]],
         qbe_target,
         "",
+        false,
         false,
         rt_lib,
         cache_dir,
@@ -8809,12 +9202,35 @@ fn drv_run_remove_cmd(world : World, args : Array[String]) -> Int {
 }
 
 ///|
+fn drv_is_valid_c_ident(s : String) -> Bool {
+  let n = s.length()
+  if n == 0 {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    let is_alpha = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 95
+    let is_digit = c >= 48 && c <= 57
+    if i == 0 {
+      if !is_alpha {
+        return false
+      }
+    } else if !is_alpha && !is_digit {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 fn drv_usage_text() -> String {
   "usage:\n" +
   "  pionc check [--fix] [--json] [input1 ...]\n" +
   "  pionc query defs|sig|callers|deps [--json] [input1 ...]\n" +
   "  pionc emit-sig <input1> [input2 ...]\n" +
-  "  pionc build [--package <name>|-p <name>] [--release] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--sysroot <dir>] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
+  "  pionc build [--package <name>|-p <name>] [--release] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
   "  pionc run [--package <name>|-p <name>] [--release] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
   "  pionc test [--json] [--package <name>|-p <name>] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
@@ -9178,6 +9594,8 @@ pub fn main(world : World) -> Int {
     let mut sysroot = ""
     let mut only_pkg = ""
     let mut wasm_names = false
+    let mut entry_symbol = ""
+    let mut no_main = false
     let libs : Array[String] = []
     let targets : Array[String] = []
     let mut i = 2
@@ -9192,6 +9610,13 @@ pub fn main(world : World) -> Int {
         release = true
       } else if a == "--wasm-names" {
         wasm_names = true
+      } else if a == "--no-main" {
+        no_main = true
+      } else if a == "--entry-symbol" && i + 1 < args.length() {
+        entry_symbol = args[i + 1]
+        i = i + 1
+      } else if drv_starts_with(a, "--entry-symbol=") {
+        entry_symbol = slice_str(a, 15, a.length())
       } else if (a == "--package" || a == "-p") && i + 1 < args.length() {
         only_pkg = args[i + 1]
         i = i + 1
@@ -9269,6 +9694,22 @@ pub fn main(world : World) -> Int {
       )
       return 1
     }
+    if no_main && entry_symbol != "" {
+      io_eprintln(
+        world,
+        "error: --entry-symbol and --no-main are mutually exclusive",
+      )
+      return 1
+    }
+    if entry_symbol != "" && !drv_is_valid_c_ident(entry_symbol) {
+      io_eprintln(
+        world,
+        "error: invalid --entry-symbol `" +
+        entry_symbol +
+        "` (must be a valid C identifier [A-Za-z_][A-Za-z0-9_]*)",
+      )
+      return 1
+    }
     match drv_build_targets(
       world,
       targets,
@@ -9284,6 +9725,8 @@ pub fn main(world : World) -> Int {
       sysroot,
       libs,
       wasm_names,
+      entry_symbol,
+      no_main,
     ) {
       Ok(_) => return 0
       Err(msg) => {
@@ -9385,6 +9828,8 @@ pub fn main(world : World) -> Int {
       "",
       libs,
       wasm_names,
+      "",
+      false,
     ) {
       Err(msg) => {
         io_eprintln(world, msg)

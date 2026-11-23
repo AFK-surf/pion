@@ -60,7 +60,9 @@
 #include <sys/event.h>
 #elif defined(__linux__)
 #include <sys/epoll.h>
+#if !defined(__ANDROID__)
 #include <sys/random.h>
+#endif
 /* glibc hides SO_REUSEPORT under _POSIX_C_SOURCE; 15 is the asm-generic value. */
 #if !defined(SO_REUSEPORT) && (defined(__x86_64__) || defined(__aarch64__) || defined(__riscv) || \
                                defined(__i386__) || defined(__arm__) || defined(__powerpc__))
@@ -104,7 +106,7 @@ extern char **environ;
  * 1. Memory & Biased RC
  * ============================================================================ */
 
-uint32_t pion_mt_flag = 0;
+PION_HIDDEN uint32_t pion_mt_flag = 0;
 static _Atomic uint32_t g_pion_mt = 0;
 static _Atomic uint32_t g_next_tid = 2;
 static _Thread_local uint32_t tls_tid = 0;
@@ -1961,7 +1963,7 @@ static PION_MINSIZE __attribute__((constructor)) void pion_rt_init_hash_seed(voi
         return;
     }
     uint64_t seed = 0;
-#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
+#if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__ANDROID__)
     arc4random_buf(&seed, sizeof(seed));
 #elif defined(__linux__)
     if (getrandom(&seed, sizeof(seed), 0) != (ssize_t)sizeof(seed)) {

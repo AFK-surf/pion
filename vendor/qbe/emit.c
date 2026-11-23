@@ -6,6 +6,20 @@ enum {
 	SecBss,
 };
 
+static int
+is_pion_internal_sym(const char *n)
+{
+	return strncmp(n, "pion_pkg_", 9) == 0 ||
+		strncmp(n, "pion_const_", 11) == 0 ||
+		strncmp(n, "pion_init_consts_", 17) == 0 ||
+		strncmp(n, "pion_fn_", 8) == 0 ||
+		strncmp(n, "pion_drop_", 10) == 0 ||
+		strncmp(n, "pion_wrap_", 10) == 0 ||
+		strncmp(n, "pion_vtable_", 12) == 0 ||
+		strncmp(n, "pion_eq_", 8) == 0 ||
+		strncmp(n, "pion_freeze_", 12) == 0;
+}
+
 void
 emitlnk(char *n, Lnk *l, int s, FILE *f)
 {
@@ -54,8 +68,11 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 	fputc('\n', f);
 	if (l->align)
 		fprintf(f, ".balign %d\n", l->align);
-	if (l->export)
+	if (l->export) {
 		fprintf(f, ".globl %s%s\n", pfx, n);
+		if (!T.apple && !T.windows && is_pion_internal_sym(n))
+			fprintf(f, ".hidden %s%s\n", pfx, n);
+	}
 	fprintf(f, "%s%s%s:\n", pfx, n, sfx);
 }
 

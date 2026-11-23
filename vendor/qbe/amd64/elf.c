@@ -2271,6 +2271,20 @@ strtab_add(Buf *st, const char *s)
 	return off;
 }
 
+static int
+is_pion_internal_sym(const char *n)
+{
+	return strncmp(n, "pion_pkg_", 9) == 0 ||
+		strncmp(n, "pion_const_", 11) == 0 ||
+		strncmp(n, "pion_init_consts_", 17) == 0 ||
+		strncmp(n, "pion_fn_", 8) == 0 ||
+		strncmp(n, "pion_drop_", 10) == 0 ||
+		strncmp(n, "pion_wrap_", 10) == 0 ||
+		strncmp(n, "pion_vtable_", 12) == 0 ||
+		strncmp(n, "pion_eq_", 8) == 0 ||
+		strncmp(n, "pion_freeze_", 12) == 0;
+}
+
 void
 amd64_elf_finish(FILE *outf)
 {
@@ -2366,6 +2380,8 @@ amd64_elf_finish(FILE *outf)
 			Sec *s = &E0.secs[e->sec_idx];
 			uint8_t bind = e->is_export ? STB_GLOBAL : STB_LOCAL;
 			es->st_info = ELF64_ST_INFO(bind, e->st_type);
+			if (e->is_export && is_pion_internal_sym(e->name))
+				es->st_other = 2; /* STV_HIDDEN */
 			es->st_shndx = (uint16_t)s->out_shndx;
 			es->st_value = e->offset;
 			es->st_size = e->size;

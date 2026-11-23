@@ -110,7 +110,12 @@ typedef struct PionMap {
     static void *const sym = (void *)&sym##_storage.len
 
 /* Memory & Biased RC */
-extern uint32_t pion_mt_flag;
+#if (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+#define PION_HIDDEN __attribute__((visibility("hidden")))
+#else
+#define PION_HIDDEN
+#endif
+extern PION_HIDDEN uint32_t pion_mt_flag;
 uint64_t pion_cur_tid(void);
 void*    pion_alloc(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn);
 void*    pion_alloc_uninit(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn);

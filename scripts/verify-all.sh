@@ -177,6 +177,8 @@ sh "$ROOT_DIR/tests/e2e/p68b_qbe_caddr_cast/run_e2e.sh" "$PIONC2"
 # the real `qbe -d MG` traces validated by the strict checker, tampered traces and
 # adversarial miscompilations rejected.
 sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC2" "$OUT_DIR/qbe"
+sh "$ROOT_DIR/tests/e2e/p71a_staticlib_android/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p71b_invar_fixes/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent
