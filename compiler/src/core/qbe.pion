@@ -221,8 +221,9 @@ pub struct QbeGen {
   mut len_aliases : Map[String, String]
   mut len_alias_keys : Array[String]
   mut nonneg_vars : Map[String, Bool]
-  mut u8_range_vars : Map[String, Bool]
+  mut u8_range_vars : Map[String, Int64]
   mut known_min_len_arrs : Map[String, Int]
+  mut known_writable_bytes : Map[String, Bool]
   mut bce_safe_indices : Map[String, String]
   mut bce_safe_exprs : Map[String, Bool]
   mut bce_safe_push_arrs : Map[String, Bool]
@@ -8874,30 +8875,81 @@ fn qbe_collect_pos_window_bce(
 }
 
 ///|
-fn qbe_expr_is_u8_range(g : QbeGen, e : Expr) -> Bool {
+fn qbe_const_nonneg_i64(g : QbeGen, e : Expr) -> Option[Int64] {
   match e {
-    EByte(_, _) => true
+    EInt(raw, _) => {
+      let v = qbe_parse_int64_lit(raw)
+      if v >= 0L && v <= 2147483647L {
+        Some(v)
+      } else {
+        None
+      }
+    }
+    EUInt(raw, _) => {
+      let v = qbe_parse_int64_lit(raw)
+      if v >= 0L && v <= 4294967295L {
+        Some(v)
+      } else {
+        None
+      }
+    }
+    EInt64(raw, _) => {
+      let v = qbe_parse_int64_lit(raw)
+      if v >= 0L {
+        Some(v)
+      } else {
+        None
+      }
+    }
+    EUInt64(raw, _) => {
+      let v = qbe_parse_int64_lit(raw)
+      if v >= 0L {
+        Some(v)
+      } else {
+        None
+      }
+    }
+    EIdent(cn, _) =>
+      match g.const_int_vals.get(cn) {
+        Some(cv) =>
+          if cv >= 0 {
+            Some(cv.to_int64())
+          } else {
+            None
+          }
+        None => None
+      }
+    _ => None
+  }
+}
+
+///|
+/// Soundly proves `0 <= final_val <= upper` for unsigned/non-negative index expressions (Wave G4).
+fn qbe_expr_max_u_bound(g : QbeGen, e : Expr) -> Option[Int64] {
+  match e {
+    EByte(_, _) => Some(255L)
     EIdent(vname, _) => {
-      if g.u8_range_vars.contains(vname) {
-        return true
+      match g.u8_range_vars.get(vname) {
+        Some(u) => return Some(u)
+        None => ()
       }
       match qbe_lookup_local(g, vname) {
         Some(vloc) =>
           match vloc.ty {
-            TByte => true
-            _ => false
+            TByte => Some(255L)
+            _ => None
           }
-        None => false
+        None => None
       }
     }
     EMethodCall(obj, mname, margs, _) =>
       if mname == "code_unit_at" && margs.length() == 1 {
         match qbe_peek_expr_ty(g, obj) {
-          Some(TString) => true
-          _ => false
+          Some(TString) => Some(255L)
+          _ => None
         }
       } else if mname == "to_int" && margs.length() == 0 {
-        match qbe_peek_expr_ty(g, obj) {
+        let direct_byte = match qbe_peek_expr_ty(g, obj) {
           Some(TByte) => true
           _ =>
             match obj {
@@ -8909,32 +8961,135 @@ fn qbe_expr_is_u8_range(g : QbeGen, e : Expr) -> Bool {
               _ => false
             }
         }
+        if direct_byte {
+          Some(255L)
+        } else {
+          // Only propagate `.to_int()` when the inner value is proven to fit in signed non-negative Int32.
+          // Never grants bounds to `Char.to_int()` or `Int8.to_int()`.
+          match qbe_expr_max_u_bound(g, obj) {
+            Some(u) =>
+              if u >= 0L && u <= 2147483647L {
+                Some(u)
+              } else {
+                None
+              }
+            None => None
+          }
+        }
       } else {
-        false
+        None
       }
     EIndex(obj, _, _) =>
       match qbe_peek_expr_ty(g, obj) {
-        Some(TString) | Some(TBytes) => true
-        _ => false
+        Some(TString) | Some(TBytes) => Some(255L)
+        _ => None
       }
     EBinary("&", l, r, _) => {
-      let l_ok = match l {
-        EInt(raw, _) => {
-          let v = qbe_parse_int64_lit(raw)
-          v >= 0L && v <= 255L
-        }
-        _ => false
+      let lb = qbe_const_nonneg_i64(g, l)
+      let rb = qbe_const_nonneg_i64(g, r)
+      match lb {
+        Some(lv) =>
+          match rb {
+            Some(rv) => Some(if lv < rv { lv } else { rv })
+            None => Some(lv)
+          }
+        None => rb
       }
-      let r_ok = match r {
-        EInt(raw, _) => {
-          let v = qbe_parse_int64_lit(raw)
-          v >= 0L && v <= 255L
-        }
-        _ => false
-      }
-      l_ok || r_ok
     }
-    _ => false
+    EBinary(">>", l, r, _) => {
+      // Strictly unsigned logical right shift (`TUInt` or `TUInt64`) only; never signed `Int`/`Int64`.
+      let width = match qbe_peek_expr_ty(g, l) {
+        Some(TUInt) => 32
+        Some(TUInt64) => 64
+        _ => 0
+      }
+      if width == 0 {
+        None
+      } else {
+        match qbe_const_nonneg_i64(g, r) {
+          Some(k) => {
+            let s = (k & (width - 1).to_int64()).to_int()
+            let rem_bits = width - s
+            if s > 0 && s < width && rem_bits <= 30 {
+              Some((1L << rem_bits) - 1L)
+            } else {
+              None
+            }
+          }
+          None => None
+        }
+      }
+    }
+    EBinary("%", l, r, _) => {
+      // Strictly unsigned modulo (`TUInt` or `TUInt64`) only; never signed `%`.
+      let is_unsigned = match qbe_peek_expr_ty(g, l) {
+        Some(TUInt) | Some(TUInt64) => true
+        _ => false
+      }
+      if !is_unsigned {
+        None
+      } else {
+        match qbe_const_nonneg_i64(g, r) {
+          Some(m) =>
+            if m > 0L && (m - 1L) <= 2147483647L {
+              Some(m - 1L)
+            } else {
+              None
+            }
+          None => None
+        }
+      }
+    }
+    _ => None
+  }
+}
+
+///|
+fn qbe_emit_bytes_writable_check(
+  g : QbeGen,
+  bytes_obj_reg : String,
+  arr_local_name : String,
+) -> Unit {
+  if arr_local_name != "" && g.known_writable_bytes.contains(arr_local_name) {
+    return
+  }
+  let obj_reg = if bytes_obj_reg != "0" {
+    bytes_obj_reg
+  } else if arr_local_name != "" {
+    match qbe_lookup_local(g, arr_local_name) {
+      Some(bloc) => {
+        let t = qbe_tmp(g)
+        qbe_emit(g, t + " =l loadl " + bloc.slot)
+        t
+      }
+      None => "0"
+    }
+  } else {
+    "0"
+  }
+  if obj_reg != "0" {
+    let cap_p = qbe_tmp(g)
+    let cap_v = qbe_tmp(g)
+    let is_ro = qbe_tmp(g)
+    let l_ro = qbe_lbl(g, "bytes_ro")
+    let l_rw = qbe_lbl(g, "bytes_rw")
+    qbe_emit(g, cap_p + " =l add " + obj_reg + ", 8")
+    qbe_emit(g, cap_v + " =l loadl " + cap_p)
+    qbe_emit(g, is_ro + " =w csltl " + cap_v + ", 0")
+    qbe_emit_term(g, "jnz " + is_ro + ", " + l_ro + ", " + l_rw)
+    qbe_emit_lbl(g, l_ro)
+    let ro_mid = qbe_intern_cstring(g, "cannot mutate read-only mmap Bytes")
+    let ro_fid = qbe_intern_cstring(g, "bytes")
+    qbe_emit(
+      g,
+      "call $pion_panic(l $pion_cstr_" +
+      ro_mid.to_string() +
+      ", l $pion_cstr_" +
+      ro_fid.to_string() +
+      ", w 0)",
+    )
+    qbe_emit_term(g, "hlt")
+    qbe_emit_lbl(g, l_rw)
   }
 }
 
@@ -8980,11 +9135,12 @@ fn qbe_bce_expr_is_safe(g : QbeGen, arr : String, idx : Expr) -> Bool {
   }
   match min_len_opt {
     Some(min_len) => {
-      if min_len >= 256 && qbe_expr_is_u8_range(g, idx) {
-        return true
-      }
-      if min_len >= 128 && qbe_expr_is_u7_range(g, idx) {
-        return true
+      match qbe_expr_max_u_bound(g, idx) {
+        Some(upper) =>
+          if upper >= 0L && upper < min_len.to_int64() {
+            return true
+          }
+        None => ()
       }
       match idx {
         EInt(raw, _) => {
@@ -11061,6 +11217,7 @@ fn qbe_try_inline_hof_call(
       let inl_nonneg = g.nonneg_vars
       let inl_u8r = g.u8_range_vars
       let inl_kml = g.known_min_len_arrs
+      let inl_kwb = g.known_writable_bytes
       let inl_bce = g.bce_safe_indices
       let inl_bce_exprs = g.bce_safe_exprs
       let inl_bce_push = g.bce_safe_push_arrs
@@ -11106,6 +11263,7 @@ fn qbe_try_inline_hof_call(
       g.nonneg_vars = Map([])
       g.u8_range_vars = Map([])
       g.known_min_len_arrs = Map([])
+      g.known_writable_bytes = Map([])
       g.bce_safe_indices = Map([])
       g.bce_safe_exprs = Map([])
       g.bce_safe_push_arrs = Map([])
@@ -11161,6 +11319,7 @@ fn qbe_try_inline_hof_call(
       g.nonneg_vars = inl_nonneg
       g.u8_range_vars = inl_u8r
       g.known_min_len_arrs = inl_kml
+      g.known_writable_bytes = inl_kwb
       g.bce_safe_indices = inl_bce
       g.bce_safe_exprs = inl_bce_exprs
       g.bce_safe_push_arrs = inl_bce_push
@@ -11272,6 +11431,7 @@ fn qbe_emit_inline_closure_call(
   let saved_nonneg = g.nonneg_vars
   let saved_u8r = g.u8_range_vars
   let saved_kml = g.known_min_len_arrs
+  let saved_kwb = g.known_writable_bytes
   let saved_bce = g.bce_safe_indices
   let saved_bce_exprs = g.bce_safe_exprs
   let saved_bce_push = g.bce_safe_push_arrs
@@ -11322,6 +11482,7 @@ fn qbe_emit_inline_closure_call(
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -11407,6 +11568,7 @@ fn qbe_emit_inline_closure_call(
   g.nonneg_vars = saved_nonneg
   g.u8_range_vars = saved_u8r
   g.known_min_len_arrs = saved_kml
+  g.known_writable_bytes = saved_kwb
   g.bce_safe_indices = saved_bce
   g.bce_safe_exprs = saved_bce_exprs
   g.bce_safe_push_arrs = saved_bce_push
@@ -11507,6 +11669,7 @@ fn qbe_emit_inline_closure_flat_struct_lit(
   let saved_nonneg = g.nonneg_vars
   let saved_u8r = g.u8_range_vars
   let saved_kml = g.known_min_len_arrs
+  let saved_kwb = g.known_writable_bytes
   let saved_bce = g.bce_safe_indices
   let saved_bce_exprs = g.bce_safe_exprs
   let saved_bce_push = g.bce_safe_push_arrs
@@ -11560,6 +11723,7 @@ fn qbe_emit_inline_closure_flat_struct_lit(
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -11611,6 +11775,7 @@ fn qbe_emit_inline_closure_flat_struct_lit(
   g.nonneg_vars = saved_nonneg
   g.u8_range_vars = saved_u8r
   g.known_min_len_arrs = saved_kml
+  g.known_writable_bytes = saved_kwb
   g.bce_safe_indices = saved_bce
   g.bce_safe_exprs = saved_bce_exprs
   g.bce_safe_push_arrs = saved_bce_push
@@ -11700,6 +11865,7 @@ fn qbe_try_inline_fn_call(
         let inl_nonneg = g.nonneg_vars
         let inl_u8r = g.u8_range_vars
         let inl_kml = g.known_min_len_arrs
+        let inl_kwb = g.known_writable_bytes
         let inl_bce = g.bce_safe_indices
         let inl_bce_exprs = g.bce_safe_exprs
         let inl_bce_push = g.bce_safe_push_arrs
@@ -11741,6 +11907,7 @@ fn qbe_try_inline_fn_call(
         g.nonneg_vars = Map([])
         g.u8_range_vars = Map([])
         g.known_min_len_arrs = Map([])
+        g.known_writable_bytes = Map([])
         g.bce_safe_indices = Map([])
         g.bce_safe_exprs = Map([])
         g.bce_safe_push_arrs = Map([])
@@ -11834,6 +12001,7 @@ fn qbe_try_inline_fn_call(
         g.nonneg_vars = inl_nonneg
         g.u8_range_vars = inl_u8r
         g.known_min_len_arrs = inl_kml
+        g.known_writable_bytes = inl_kwb
         g.bce_safe_indices = inl_bce
         g.bce_safe_exprs = inl_bce_exprs
         g.bce_safe_push_arrs = inl_bce_push
@@ -11948,6 +12116,7 @@ fn qbe_try_inline_xpkg_fn_call(
   let inl_nonneg = g.nonneg_vars
   let inl_u8r = g.u8_range_vars
   let inl_kml = g.known_min_len_arrs
+  let inl_kwb = g.known_writable_bytes
   let inl_bce = g.bce_safe_indices
   let inl_bce_exprs = g.bce_safe_exprs
   let inl_bce_push = g.bce_safe_push_arrs
@@ -11989,6 +12158,7 @@ fn qbe_try_inline_xpkg_fn_call(
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -12082,6 +12252,7 @@ fn qbe_try_inline_xpkg_fn_call(
   g.nonneg_vars = inl_nonneg
   g.u8_range_vars = inl_u8r
   g.known_min_len_arrs = inl_kml
+  g.known_writable_bytes = inl_kwb
   g.bce_safe_indices = inl_bce
   g.bce_safe_exprs = inl_bce_exprs
   g.bce_safe_push_arrs = inl_bce_push
@@ -12756,6 +12927,7 @@ fn qbe_inline_body_into_pod_buf(
   let inl_nonneg = g.nonneg_vars
   let inl_u8r = g.u8_range_vars
   let inl_kml = g.known_min_len_arrs
+  let inl_kwb = g.known_writable_bytes
   let inl_bce = g.bce_safe_indices
   let inl_bce_exprs = g.bce_safe_exprs
   let inl_bce_push = g.bce_safe_push_arrs
@@ -12797,6 +12969,7 @@ fn qbe_inline_body_into_pod_buf(
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -12875,6 +13048,7 @@ fn qbe_inline_body_into_pod_buf(
   g.nonneg_vars = inl_nonneg
   g.u8_range_vars = inl_u8r
   g.known_min_len_arrs = inl_kml
+  g.known_writable_bytes = inl_kwb
   g.bce_safe_indices = inl_bce
   g.bce_safe_exprs = inl_bce_exprs
   g.bce_safe_push_arrs = inl_bce_push
@@ -14950,6 +15124,7 @@ fn qbe_inline_body_into_opt_res_slots(
   let inl_nonneg = g.nonneg_vars
   let inl_u8r = g.u8_range_vars
   let inl_kml = g.known_min_len_arrs
+  let inl_kwb = g.known_writable_bytes
   let inl_bce = g.bce_safe_indices
   let inl_bce_exprs = g.bce_safe_exprs
   let inl_bce_push = g.bce_safe_push_arrs
@@ -14991,6 +15166,7 @@ fn qbe_inline_body_into_opt_res_slots(
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -15085,6 +15261,7 @@ fn qbe_inline_body_into_opt_res_slots(
   g.nonneg_vars = inl_nonneg
   g.u8_range_vars = inl_u8r
   g.known_min_len_arrs = inl_kml
+  g.known_writable_bytes = inl_kwb
   g.bce_safe_indices = inl_bce
   g.bce_safe_exprs = inl_bce_exprs
   g.bce_safe_push_arrs = inl_bce_push
@@ -16894,6 +17071,7 @@ fn qbe_new_for_target_name(
     nonneg_vars: Map([]),
     u8_range_vars: Map([]),
     known_min_len_arrs: Map([]),
+    known_writable_bytes: Map([]),
     bce_safe_indices: Map([]),
     bce_safe_exprs: Map([]),
     bce_safe_push_arrs: Map([]),
@@ -17259,6 +17437,7 @@ fn qbe_scope_pop(g : QbeGen) -> Unit {
       g.unfrozen_local_arrs.remove(sc.locals[zi].name)
       g.u8_range_vars.remove(sc.locals[zi].name)
       g.known_min_len_arrs.remove(sc.locals[zi].name)
+      g.known_writable_bytes.remove(sc.locals[zi].name)
       zi = zi + 1
     }
     let _ = g.scopes.pop()
@@ -23857,6 +24036,7 @@ fn qbe_emit_closure_obj(
   let saved_nonneg = g.nonneg_vars
   let saved_u8r = g.u8_range_vars
   let saved_kml = g.known_min_len_arrs
+  let saved_kwb = g.known_writable_bytes
   let saved_bce = g.bce_safe_indices
   let saved_bce_exprs = g.bce_safe_exprs
   let saved_bce_push = g.bce_safe_push_arrs
@@ -23917,6 +24097,7 @@ fn qbe_emit_closure_obj(
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -24055,6 +24236,7 @@ fn qbe_emit_closure_obj(
   g.nonneg_vars = saved_nonneg
   g.u8_range_vars = saved_u8r
   g.known_min_len_arrs = saved_kml
+  g.known_writable_bytes = saved_kwb
   g.bce_safe_indices = saved_bce
   g.bce_safe_exprs = saved_bce_exprs
   g.bce_safe_push_arrs = saved_bce_push
@@ -37357,6 +37539,7 @@ fn qbe_clear_shadowed_local_meta(g : QbeGen, name : String) -> Unit {
   g.nonneg_vars.remove(name)
   g.u8_range_vars.remove(name)
   g.known_min_len_arrs.remove(name)
+  g.known_writable_bytes.remove(name)
 }
 
 ///|
@@ -42860,6 +43043,7 @@ fn qbe_emit_stmt(
         g.nonneg_vars.remove(name)
         g.u8_range_vars.remove(name)
         g.known_min_len_arrs.remove(name)
+        g.known_writable_bytes.remove(name)
       } else {
         let iv_ext : Option[String] = if !is_mut &&
           qbe_is_int32_ty(final_ty) &&
@@ -42879,6 +43063,7 @@ fn qbe_emit_stmt(
         g.unfrozen_local_arrs.remove(name)
         g.u8_range_vars.remove(name)
         g.known_min_len_arrs.remove(name)
+        g.known_writable_bytes.remove(name)
         match init {
           EArrayLit(lit_elems, _) =>
             match final_ty {
@@ -42921,11 +43106,74 @@ fn qbe_emit_stmt(
                 }
               }
             }
+            if !is_mut && q == "Bytes" {
+              match final_ty {
+                TBytes =>
+                  if m == "new" && margs.length() == 1 {
+                    g.known_writable_bytes.set(name, true)
+                    let c_len = match margs[0] {
+                      EInt(raw, _) => qbe_parse_int64_lit(raw).to_int()
+                      EIdent(cn, _) =>
+                        match g.const_int_vals.get(cn) {
+                          Some(cv) => cv
+                          None => -1
+                        }
+                      _ => -1
+                    }
+                    if c_len >= 1 {
+                      g.known_min_len_arrs.set(name, c_len)
+                    }
+                  } else if m == "from_ptr" && margs.length() == 2 {
+                    g.known_writable_bytes.set(name, true)
+                  }
+                _ => ()
+              }
+            }
           }
+          ECall(EIdent(fnm, _), margs, _) =>
+            if !is_mut && fnm == "bytes_from_ptr" && margs.length() == 2 {
+              match final_ty {
+                TBytes => g.known_writable_bytes.set(name, true)
+                _ => ()
+              }
+            }
+          EMethodCall(recv, m, margs, _) =>
+            if !is_mut {
+              match final_ty {
+                TBytes =>
+                  if m == "to_bytes" && margs.length() == 0 {
+                    match qbe_peek_expr_ty(g, recv) {
+                      Some(TString) => g.known_writable_bytes.set(name, true)
+                      _ => ()
+                    }
+                  } else if (m == "slice" && margs.length() == 2) ||
+                    (m == "concat" && margs.length() == 1) {
+                    match qbe_peek_expr_ty(g, recv) {
+                      Some(TBytes) => g.known_writable_bytes.set(name, true)
+                      _ => ()
+                    }
+                  }
+                _ => ()
+              }
+            }
           _ => ()
         }
-        if !is_mut && qbe_is_int32_ty(final_ty) && qbe_expr_is_u8_range(g, init) {
-          g.u8_range_vars.set(name, true)
+        if !is_mut {
+          match qbe_expr_max_u_bound(g, init) {
+            Some(u) => {
+              let fits = match final_ty {
+                TInt => u >= 0L && u <= 2147483647L
+                TByte => u >= 0L && u <= 255L
+                TUInt => u >= 0L && u <= 4294967295L
+                TInt64 | TUInt64 => u >= 0L
+                _ => false
+              }
+              if fits {
+                g.u8_range_vars.set(name, u)
+              }
+            }
+            None => ()
+          }
         }
         if !is_mut {
           match init {
@@ -43073,6 +43321,7 @@ fn qbe_emit_stmt(
           g.unfrozen_local_arrs.remove(name)
           g.u8_range_vars.remove(name)
           g.known_min_len_arrs.remove(name)
+          g.known_writable_bytes.remove(name)
           match rhs {
             EInt(raw, _) =>
               if qbe_parse_int64_lit(raw).to_int() >= 0 {
@@ -43875,42 +44124,7 @@ fn qbe_emit_stmt(
                 qbe_emit_term(g, "hlt")
                 qbe_emit_lbl(g, l_ok)
               }
-              let bytes_obj_reg = if ov.reg != "0" {
-                ov.reg
-              } else {
-                match qbe_lookup_local(g, arr_local_name) {
-                  Some(bloc) => {
-                    let t = qbe_tmp(g)
-                    qbe_emit(g, t + " =l loadl " + bloc.slot)
-                    t
-                  }
-                  None => "0"
-                }
-              }
-              if bytes_obj_reg != "0" {
-                let cap_p = qbe_tmp(g)
-                let cap_v = qbe_tmp(g)
-                let is_ro = qbe_tmp(g)
-                let l_ro = qbe_lbl(g, "bytes_ro")
-                let l_rw = qbe_lbl(g, "bytes_rw")
-                qbe_emit(g, cap_p + " =l add " + bytes_obj_reg + ", 8")
-                qbe_emit(g, cap_v + " =l loadl " + cap_p)
-                qbe_emit(g, is_ro + " =w csltl " + cap_v + ", 0")
-                qbe_emit_term(g, "jnz " + is_ro + ", " + l_ro + ", " + l_rw)
-                qbe_emit_lbl(g, l_ro)
-                let ro_mid = qbe_intern_cstring(g, "cannot mutate read-only mmap Bytes")
-                let ro_fid = qbe_intern_cstring(g, "bytes")
-                qbe_emit(
-                  g,
-                  "call $pion_panic(l $pion_cstr_" +
-                  ro_mid.to_string() +
-                  ", l $pion_cstr_" +
-                  ro_fid.to_string() +
-                  ", w 0)",
-                )
-                qbe_emit_term(g, "hlt")
-                qbe_emit_lbl(g, l_rw)
-              }
+              qbe_emit_bytes_writable_check(g, ov.reg, arr_local_name)
               let dp = match g.hoisted_bytes_dp.get(arr_local_name) {
                 Some(hdp) => hdp
                 None => {
@@ -44222,6 +44436,7 @@ fn qbe_emit_stmt(
                 qbe_emit_term(g, "hlt")
                 qbe_emit_lbl(g, l_ok)
               }
+              qbe_emit_bytes_writable_check(g, ov.reg, arr_local_name)
               let dp = match g.hoisted_bytes_dp.get(arr_local_name) {
                 Some(hdp) => hdp
                 None => {
@@ -47050,6 +47265,7 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
       g.nonneg_vars = Map([])
       g.u8_range_vars = Map([])
       g.known_min_len_arrs = Map([])
+      g.known_writable_bytes = Map([])
       g.bce_safe_indices = Map([])
       g.bce_safe_exprs = Map([])
       g.bce_safe_push_arrs = Map([])
@@ -47225,6 +47441,7 @@ fn qbe_emit_extern_fn_decl(
       g.nonneg_vars = Map([])
       g.u8_range_vars = Map([])
       g.known_min_len_arrs = Map([])
+      g.known_writable_bytes = Map([])
       g.bce_safe_indices = Map([])
       g.bce_safe_exprs = Map([])
       g.bce_safe_push_arrs = Map([])
@@ -47387,6 +47604,7 @@ fn qbe_emit_impl_method(g : QbeGen, id : ImplDecl, md : FnDecl) -> String {
           g.nonneg_vars = Map([])
           g.u8_range_vars = Map([])
           g.known_min_len_arrs = Map([])
+          g.known_writable_bytes = Map([])
           g.bce_safe_indices = Map([])
           g.bce_safe_exprs = Map([])
           g.bce_safe_push_arrs = Map([])
@@ -47500,6 +47718,7 @@ fn qbe_emit_mono_fn(g : QbeGen, req : QbeMonoReq) -> String {
   g.nonneg_vars = Map([])
   g.u8_range_vars = Map([])
   g.known_min_len_arrs = Map([])
+  g.known_writable_bytes = Map([])
   g.bce_safe_indices = Map([])
   g.bce_safe_exprs = Map([])
   g.bce_safe_push_arrs = Map([])
@@ -49065,6 +49284,7 @@ pub fn emit_qbe_test_package_target(
     g.nonneg_vars = Map([])
     g.u8_range_vars = Map([])
     g.known_min_len_arrs = Map([])
+    g.known_writable_bytes = Map([])
     g.bce_safe_indices = Map([])
     g.bce_safe_exprs = Map([])
     g.bce_safe_push_arrs = Map([])

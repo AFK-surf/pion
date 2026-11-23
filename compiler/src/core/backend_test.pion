@@ -738,6 +738,7 @@ test "p6c_stdlib_qbe_codegen_symbols" {
     #|  let buf = Bytes::new(2)
     #|  buf[0] = b'x'
     #|  let _c = buf[0]
+    #|  let _c2 = bs[0]
     #|  let _n = buf.length()
     #|  let j = buf.slice(0, 1).concat(bs)
     #|  let _t = j.to_string()
@@ -10675,4 +10676,122 @@ test "p85: pure-scalar small enum SROA in Result[Enum, String] + let r = call();
   assert_true(!fn_try.contains("(w 24, w 5,"), fn_try)
   // Escape case must NOT use immortal stack enum header — must fall back to heap allocation safely!
   assert_true(!fn_esc_arr.contains("storeh 11,"), fn_esc_arr)
+test "p85 (G3-A + G4): fresh writable Bytes elides bytes_ro/bytes_oob and sound unsigned BCE" {
+  let src =
+    #|pub fn fresh_bytes_write() -> Bytes {
+    #|  let out = Bytes::new(2)
+    #|  out[0] = (1).to_byte()
+    #|  out[1] = (0).to_byte()
+    #|  out
+    #|}
+    #|pub fn param_bytes_write(b : Bytes) -> Unit {
+    #|  b[0] = (1).to_byte()
+    #|}
+    #|fn bump_byte(mut x : Byte) -> Unit {
+    #|  x = (x.to_int() + 1).to_byte()
+    #|}
+    #|pub fn param_bytes_mut_wb(b : Bytes) -> Unit {
+    #|  let mut b2 = b
+    #|  bump_byte(mut b2[0])
+    #|}
+    #|pub fn bce_positive(x : Int, u : UInt) -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(256, 7)
+    #|  let k = x & 15
+    #|  lut[x & 63] + lut[(u >> 24U).to_int()] + lut[(u % 16U).to_int()] + lut[k]
+    #|}
+    #|pub fn bce_neg_signed_shr(si : Int) -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(256, 7)
+    #|  lut[si >> 24]
+    #|}
+    #|pub fn bce_neg_signed_mod(si : Int) -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(256, 7)
+    #|  lut[si % 16]
+    #|}
+    #|pub fn bce_neg_hi_bit_to_int(u : UInt) -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(256, 7)
+    #|  lut[(u & 0x80000000U).to_int()]
+    #|}
+    #|pub fn bce_neg_shr32(u : UInt) -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(256, 7)
+    #|  lut[(u >> 32U).to_int()]
+    #|}
+    #|pub fn bce_neg_char(c : Char) -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(256, 7)
+    #|  lut[c.to_int()]
+    #|}
+    #|pub fn bce_neg_eq_len() -> Int {
+    #|  let lut : FixedArray[Int] = FixedArray::make(64, 7)
+    #|  lut[64]
+    #|}
+    #|fn shrink_arr(a : Array[Int]) -> Int {
+    #|  let _ = a.pop()
+    #|  63
+    #|}
+    #|pub fn bce_neg_alias_shrink() -> Int {
+    #|  let arr : Array[Int] = Array::make(64, 1)
+    #|  arr[shrink_arr(arr) & 63]
+    #|}
+  let cr = check_source_files_full("p85", ["p85.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    check_result_to_json(cr.diagnostics),
+  )
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let funcs = ssa.split("export function ")
+  let mut f_fresh = ""
+  let mut f_param_w = ""
+  let mut f_param_cw = ""
+  let mut f_pos = ""
+  let mut f_sshr = ""
+  let mut f_smod = ""
+  let mut f_hibit = ""
+  let mut f_shr32 = ""
+  let mut f_char = ""
+  let mut f_eqlen = ""
+  let mut f_alias = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    let s = funcs[fi]
+    if s.contains("$pion_fn_fresh_bytes_write(") {
+      f_fresh = s
+    } else if s.contains("$pion_fn_param_bytes_write(") {
+      f_param_w = s
+    } else if s.contains("$pion_fn_param_bytes_mut_wb(") {
+      f_param_cw = s
+    } else if s.contains("$pion_fn_bce_positive(") {
+      f_pos = s
+    } else if s.contains("$pion_fn_bce_neg_signed_shr(") {
+      f_sshr = s
+    } else if s.contains("$pion_fn_bce_neg_signed_mod(") {
+      f_smod = s
+    } else if s.contains("$pion_fn_bce_neg_hi_bit_to_int(") {
+      f_hibit = s
+    } else if s.contains("$pion_fn_bce_neg_shr32(") {
+      f_shr32 = s
+    } else if s.contains("$pion_fn_bce_neg_char(") {
+      f_char = s
+    } else if s.contains("$pion_fn_bce_neg_eq_len(") {
+      f_eqlen = s
+    } else if s.contains("$pion_fn_bce_neg_alias_shrink(") {
+      f_alias = s
+    }
+    fi = fi + 1
+  }
+  // Positive checks: 0 OOB / 0 RO / 0 panic
+  assert_true(f_fresh != "", ssa)
+  assert_true(!f_fresh.contains("bytes_oob"), f_fresh)
+  assert_true(!f_fresh.contains("bytes_ro"), f_fresh)
+  assert_true(!f_fresh.contains("pion_panic"), f_fresh)
+  assert_true(f_pos != "", ssa)
+  assert_true(!f_pos.contains("arr_oob"), f_pos)
+  // Negative checks: MUST retain bytes_ro / arr_oob
+  assert_true(f_param_w.contains("bytes_ro"), f_param_w)
+  assert_true(f_param_cw.contains("bytes_ro"), f_param_cw)
+  assert_true(f_sshr.contains("arr_oob"), f_sshr)
+  assert_true(f_smod.contains("arr_oob"), f_smod)
+  assert_true(f_hibit.contains("arr_oob"), f_hibit)
+  assert_true(f_shr32.contains("arr_oob"), f_shr32)
+  assert_true(f_char.contains("arr_oob"), f_char)
+  assert_true(f_eqlen.contains("arr_oob"), f_eqlen)
+  assert_true(f_alias.contains("arr_oob"), f_alias)
 }
