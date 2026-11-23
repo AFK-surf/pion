@@ -81,6 +81,21 @@ iins(int cls, int op, Ref a0, Ref a1, Loc *l)
 	return ist->new.ins.to = newtmp("ld", cls, curf);
 }
 
+static int
+iscaddr(Ref r)
+{
+	Ins *d;
+
+	if (rtype(r) == RCon)
+		return curf->con[r.val].type == CAddr;
+	if (rtype(r) == RTmp) {
+		d = curf->tmp[r.val].def;
+		if (d && d->op == Ocopy && rtype(d->arg[0]) == RCon)
+			return curf->con[d->arg[0].val].type == CAddr;
+	}
+	return 0;
+}
+
 static void
 cast(Ref *r, int cls, Loc *l)
 {
@@ -305,6 +320,12 @@ def(Slice sl, bits msk, Blk *b, Ins *i, Loc *il)
 				if (req(r, R))
 					goto Load;
 			}
+			if (iscaddr(r) &&
+			    (off != 0 ||
+			     (msk1 & msk) != msk1 || off + sz < sl.sz ||
+			     (msk & ~msk1) != 0 ||
+			     (msk == msks && KBASE(sl.cls) != 0)))
+				goto Load;
 			if (off) {
 				cls1 = cls;
 				if (op == Oshr && off + sl.sz > 4)

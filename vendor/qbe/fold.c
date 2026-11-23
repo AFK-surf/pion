@@ -151,14 +151,19 @@ foldint(Con *res, int op, int w, Con *cl, Con *cr)
 	return 0;
 }
 
-static void
+static int
 foldflt(Con *res, int op, int w, Con *cl, Con *cr)
 {
 	float xs, ls, rs;
 	double xd, ld, rd;
 
-	if (cl->type != CBits || cr->type != CBits)
+	if (cl->type != CBits || cr->type != CBits) {
+		if (cr->type == CBits &&
+		    (op == Ocast || op == Oswtof || op == Ouwtof ||
+		     op == Osltof || op == Oultof))
+			return 1;
 		err("invalid address operand for '%s'", optab[op].name);
+	}
 	*res = (Con){.type = CBits};
 	memset(&res->bits, 0, sizeof(res->bits));
 	if (w)  {
@@ -200,6 +205,7 @@ foldflt(Con *res, int op, int w, Con *cl, Con *cr)
 		res->bits.s = xs;
 		res->flt = 1;
 	}
+	return 0;
 }
 
 static Ref
@@ -211,8 +217,10 @@ opfold(int op, int cls, Con *cl, Con *cr, Fn *fn)
 	if (cls == Kw || cls == Kl) {
 		if (foldint(&c, op, cls == Kl, cl, cr))
 			return R;
-	} else
-		foldflt(&c, op, cls == Kd, cl, cr);
+	} else {
+		if (foldflt(&c, op, cls == Kd, cl, cr))
+			return R;
+	}
 	if (!KWIDE(cls))
 		c.bits.i &= 0xffffffff;
 	r = newcon(&c, fn);

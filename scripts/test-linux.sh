@@ -478,6 +478,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p32c_abi_fp_stack/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p33b_incremental_cas/run_e2e.sh" "$PIONC"
 # P35-A: second-class `mut` parameters, `mut self`, `#verify` rules and runtime checks (native + ASan/LSan + Wasm32, cross-package `[verify]`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p35a_verify_mut/run_e2e.sh" "$PIONC"
+# P68-B: QBE load.c/fold.c CAddr cross-type cast regression (enum String vs Double dead branch + direct cast).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p68b_qbe_caddr_cast/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"
