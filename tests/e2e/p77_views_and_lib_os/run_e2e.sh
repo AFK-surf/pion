@@ -347,4 +347,298 @@ EOF
   test "$WASM_WEB" = "p77_web:wasm_web_view:BC"
 fi
 
-echo "PASS: p77_views_and_lib_os (Native rel+dev + ASan/LSan + staticlib no-main + OOB/RO-mmap traps + Wasm32 Node+Web)"
+# --- 6. P77-B: Zero-RC / Zero-Heap-Alloc StrView & BytesView hot-path + SSA audit + ASan safety ---
+cat <<'EOF' > "$TMP_DIR/p77b_main.pion"
+fn cmp_view(a : StrView, b : StrView) -> Int {
+  let la = a.length()
+  let lb = b.length()
+  let n = if la < lb { la } else { lb }
+  let mut i = 0
+  while i < n {
+    let ca = a[i]
+    let cb = b[i]
+    if ca != cb {
+      return ca - cb
+    }
+    i = i + 1
+  }
+  la - lb
+}
+
+fn cmp_bview(a : BytesView, b : BytesView) -> Int {
+  let la = a.length()
+  let lb = b.length()
+  let n = if la < lb { la } else { lb }
+  let mut i = 0
+  while i < n {
+    let ca = a[i].to_int()
+    let cb = b[i].to_int()
+    if ca != cb {
+      return ca - cb
+    }
+    i = i + 1
+  }
+  la - lb
+}
+
+fn find_line(buf : String, offs : Array[Int], lens : Array[Int], key : StrView) -> Int {
+  let mut lo = 0
+  let mut hi = offs.length() - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let s = offs[mid]
+    let line = buf.view(s, s + lens[mid])
+    let c = cmp_view(line, key)
+    if c == 0 {
+      return mid
+    } else if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  -1
+}
+
+fn find_line_direct_arg(buf : String, offs : Array[Int], lens : Array[Int], key : StrView) -> Int {
+  let mut lo = 0
+  let mut hi = offs.length() - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let s = offs[mid]
+    let c = cmp_view(buf.view(s, s + lens[mid]), key)
+    if c == 0 {
+      return mid
+    } else if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  -1
+}
+
+fn find_line_bytes(buf : Bytes, offs : Array[Int], lens : Array[Int], key : BytesView) -> Int {
+  let mut lo = 0
+  let mut hi = offs.length() - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let s = offs[mid]
+    let line = buf.view(s, s + lens[mid])
+    let c = cmp_bview(line, key)
+    if c == 0 {
+      return mid
+    } else if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  -1
+}
+
+fn cmp_str(a : String, b : String) -> Int {
+  let la = a.length()
+  let lb = b.length()
+  let n = if la < lb { la } else { lb }
+  let mut i = 0
+  while i < n {
+    let ca = a[i]
+    let cb = b[i]
+    if ca != cb {
+      return ca - cb
+    }
+    i = i + 1
+  }
+  la - lb
+}
+
+fn find_line_str(buf : String, offs : Array[Int], lens : Array[Int], key : String) -> Int {
+  let mut lo = 0
+  let mut hi = offs.length() - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let s = offs[mid]
+    let line = buf.slice(s, s + lens[mid])
+    let c = cmp_str(line, key)
+    if c == 0 {
+      return mid
+    } else if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  -1
+}
+
+// Negative safety tests (must NOT stack-allocate):
+fn make_escaped_view() -> StrView {
+  let s = "esc_" + "ok"
+  s.view(0, 6)
+}
+
+fn push_view(arr : Array[StrView], v : StrView) -> Unit {
+  arr.push(v)
+}
+
+fn test_p77b_safety() -> Unit {
+  // (a) Source local mutated after view creation
+  let mut s = "aaa" + "bbb"
+  let v = s.as_view()
+  s = "ccc" + "ddd"
+  if !v.eq_str("aaabbb") || s != "cccddd" {
+    panic("p77b safety (a) mutated source failed")
+  }
+  // (b) Cross-function return escape
+  let ev = make_escaped_view()
+  if !ev.eq_str("esc_ok") {
+    panic("p77b safety (b) return escape failed")
+  }
+  // (c) Storing StrView into Array[StrView] via non-borrowing callee
+  let arr : Array[StrView] = []
+  let tmp = "stored_" + "view"
+  let sv = tmp.view(0, tmp.length())
+  push_view(arr, sv)
+  if arr.length() != 1 || !arr[0].eq_str("stored_view") {
+    panic("p77b safety (c) array store failed")
+  }
+}
+
+fn pad4(n : Int) -> String {
+  let s = n.to_string()
+  if s.length() == 1 {
+    "000" + s
+  } else if s.length() == 2 {
+    "00" + s
+  } else if s.length() == 3 {
+    "0" + s
+  } else {
+    s
+  }
+}
+
+fn main(world : World) -> Unit {
+  test_p77b_safety()
+  // Build 4096-line sorted TSV buffer
+  let sb = StringBuilder()
+  let offs : Array[Int] = []
+  let lens : Array[Int] = []
+  let keys : Array[String] = []
+  let mut i = 0
+  while i < 4096 {
+    let k = "key_" + pad4(i) + "\tval_" + pad4(i)
+    offs.push(sb.length())
+    lens.push(k.length())
+    sb.write_string(k)
+    sb.write_byte(b'\n')
+    keys.push(k)
+    i = i + 1
+  }
+  let buf = sb.to_string()
+  let bbuf = buf.to_bytes()
+  let bkeys : Array[Bytes] = []
+  i = 0
+  while i < 4096 {
+    bkeys.push(keys[i].to_bytes())
+    i = i + 1
+  }
+
+  let iters = 200000
+  let t0 = clock_monotonic_us()
+  let mut sum_sv = 0
+  i = 0
+  while i < iters {
+    let idx = (i * 17) & 4095
+    let k = keys[idx]
+    let kv = k.as_view()
+    sum_sv = sum_sv + find_line(buf, offs, lens, kv)
+    i = i + 1
+  }
+  let t1 = clock_monotonic_us()
+
+  let mut sum_sv2 = 0
+  i = 0
+  while i < iters {
+    let idx = (i * 17) & 4095
+    let k = keys[idx]
+    sum_sv2 = sum_sv2 + find_line_direct_arg(buf, offs, lens, k.as_view())
+    i = i + 1
+  }
+  let t2 = clock_monotonic_us()
+
+  let mut sum_bv = 0
+  i = 0
+  while i < iters {
+    let idx = (i * 17) & 4095
+    let bk = bkeys[idx]
+    let bkv = bk.as_view()
+    sum_bv = sum_bv + find_line_bytes(bbuf, offs, lens, bkv)
+    i = i + 1
+  }
+  let t3 = clock_monotonic_us()
+
+  let mut sum_str = 0
+  i = 0
+  while i < iters {
+    let idx = (i * 17) & 4095
+    sum_str = sum_str + find_line_str(buf, offs, lens, keys[idx])
+    i = i + 1
+  }
+  let t4 = clock_monotonic_us()
+
+  if sum_sv != sum_sv2 || sum_sv != sum_bv || sum_sv != sum_str {
+    panic("p77b bsearch sum mismatch")
+  }
+  io_eprintln(
+    world,
+    "p77b bench 200k bsearch: StrView=" +
+    ((t1 - t0) / 1000L).to_string() +
+    "ms StrViewDirect=" +
+    ((t2 - t1) / 1000L).to_string() +
+    "ms BytesView=" +
+    ((t3 - t2) / 1000L).to_string() +
+    "ms StringSlice=" +
+    ((t4 - t3) / 1000L).to_string() +
+    "ms",
+  )
+  io_println(world, "p77b ok sum=" + sum_sv.to_string())
+}
+EOF
+
+# 6a. SSA hard audit for P77-B
+"$PIONC" build --release --emit-ssa "$TMP_DIR/p77b.ssa" "$TMP_DIR/p77b_main.pion"
+audit_fn_ssa() {
+  fn_sym="$1"
+  pat="$2"
+  body=$(awk -v f="$fn_sym" '$0 ~ ("function .* \\$" f "\\(") { p=1 } p { print } p && /^}/ { p=0 }' "$TMP_DIR/p77b.ssa")
+  test -n "$body" || { echo "FAIL: missing $fn_sym in p77b.ssa"; exit 1; }
+  if printf '%s\n' "$body" | grep -Eq "$pat"; then
+    echo "FAIL: $fn_sym unexpectedly matched $pat:"
+    printf '%s\n' "$body" | grep -E "$pat"
+    exit 1
+  fi
+}
+audit_fn_ssa "pion_fn_cmp_view" "pion_rc_inc|pion_rc_dec|pion_mt_flag|pion_alloc_uninit"
+audit_fn_ssa "pion_fn_cmp_bview" "pion_rc_inc|pion_rc_dec|pion_mt_flag|pion_alloc_uninit"
+audit_fn_ssa "pion_fn_find_line" "pion_alloc_uninit|pion_rc_inc|pion_rc_dec"
+audit_fn_ssa "pion_fn_find_line_direct_arg" "pion_alloc_uninit|pion_rc_inc|pion_rc_dec"
+audit_fn_ssa "pion_fn_find_line_bytes" "pion_alloc_uninit|pion_rc_inc|pion_rc_dec"
+echo "p77b SSA audit: PASS (0 alloc / 0 RC in cmp_view, cmp_bview, find_line, find_line_direct_arg, find_line_bytes)"
+
+# 6b. Native --release + benchmark
+"$PIONC" build --release -o "$TMP_DIR/p77b_rel" "$TMP_DIR/p77b_main.pion"
+P77B_REL=$("$TMP_DIR/p77b_rel")
+echo "p77b native release -> $P77B_REL"
+echo "$P77B_REL" | grep -q "^p77b ok sum="
+
+# 6c. ASan/LSan on p77b (verifies stack views + mutated-source/return/array negative regressions: 0 leaks, 0 UAF)
+if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
+  "$PIONC" build --release --emit-obj "$TMP_DIR/p77b_main.o" "$TMP_DIR/p77b_main.pion"
+  "$CC_BIN" -fsanitize=address "$TMP_DIR/p77b_main.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p77b_asan"
+  P77B_ASAN=$("$TMP_DIR/p77b_asan")
+  echo "p77b ASan/LSan -> $P77B_ASAN"
+  test "$P77B_ASAN" = "$P77B_REL"
+fi
+
+echo "PASS: p77_views_and_lib_os (Native rel+dev + ASan/LSan + staticlib no-main + OOB/RO-mmap traps + Wasm32 Node+Web + P77-B SSA/bsearch)"
