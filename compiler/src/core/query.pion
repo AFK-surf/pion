@@ -551,8 +551,18 @@ pub fn cli_query_json(
     Ok(query_callers_json(pkg))
   } else if kind == "deps" {
     Ok(query_deps_json(pkg))
+  } else if kind == "analyze" {
+    let cr = check_source_files_with_imports_ex(
+      pkg_name,
+      paths,
+      sources,
+      [],
+      false,
+      true,
+    )
+    Ok(query_analyze_packages_json([cr], cr.diagnostics))
   } else {
-    Err("unknown query kind `" + kind + "` (expected defs|sig|callers|deps)")
+    Err("unknown query kind `" + kind + "` (expected defs|sig|callers|deps|analyze)")
   }
 }
 
@@ -763,4 +773,820 @@ pub fn parse_package_diagnostics(
     i = i + 1
   }
   out
+}
+
+///|
+struct AnalyzeCallSite {
+  target : String
+  line : Int
+  col : Int
+}
+
+///|
+struct AnalyzeClosureRec {
+  pkg : String
+  enclosing_fn : String
+  file : String
+  line : Int
+  col : Int
+  context_callee : String
+  context_arg : String
+  captures : Array[AnalyzeCapture]
+  calls : Array[AnalyzeCallSite]
+}
+
+///|
+fn analyze_format_named_ty(
+  tc : TypeChecker,
+  name : String,
+  args : Array[Ty],
+) -> String {
+  let qname = tc_qualify_local_name(tc, name)
+  if args.length() == 0 {
+    return qname
+  }
+  let sb = StringBuilder()
+  sb.write_string(qname)
+  sb.write_string("[")
+  let mut i = 0
+  while i < args.length() {
+    if i > 0 {
+      sb.write_string(", ")
+    }
+    sb.write_string(analyze_ty_to_string(tc, args[i]))
+    i = i + 1
+  }
+  sb.write_string("]")
+  sb.to_string()
+}
+
+///|
+fn analyze_ty_to_string(tc : TypeChecker, t : Ty) -> String {
+  match t {
+    TInt => "Int"
+    TInt64 => "Int64"
+    TUInt => "UInt"
+    TUInt64 => "UInt64"
+    TDouble => "Double"
+    TFloat => "Float"
+    TBool => "Bool"
+    TByte => "Byte"
+    TInt8 => "Int8"
+    TChar => "Char"
+    TString => "String"
+    TUnit => "Unit"
+    TPtr => "Ptr"
+    TStringBuilder => "StringBuilder"
+    TBytes => "Bytes"
+    TStrView => "StrView"
+    TBytesView => "BytesView"
+    TWorld => "World"
+    TScope => "Scope"
+    TAtomicInt => "AtomicInt"
+    TArray(e) => "Array[" + analyze_ty_to_string(tc, e) + "]"
+    TFixedArray(e) => "FixedArray[" + analyze_ty_to_string(tc, e) + "]"
+    TOption(e) => "Option[" + analyze_ty_to_string(tc, e) + "]"
+    TResult(ok, err) =>
+      "Result[" +
+      analyze_ty_to_string(tc, ok) +
+      ", " +
+      analyze_ty_to_string(tc, err) +
+      "]"
+    TMap(k, v) =>
+      "Map[" +
+      analyze_ty_to_string(tc, k) +
+      ", " +
+      analyze_ty_to_string(tc, v) +
+      "]"
+    TChannel(e) => "Channel[" + analyze_ty_to_string(tc, e) + "]"
+    TMutex(e) => "Mutex[" + analyze_ty_to_string(tc, e) + "]"
+    TStruct(name, args) => analyze_format_named_ty(tc, name, args)
+    TEnum(name, args) => analyze_format_named_ty(tc, name, args)
+    TFn(params, ret) => {
+      let sb = StringBuilder()
+      sb.write_string("(")
+      let mut i = 0
+      while i < params.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        sb.write_string(analyze_ty_to_string(tc, params[i]))
+        i = i + 1
+      }
+      sb.write_string(") -> ")
+      sb.write_string(analyze_ty_to_string(tc, ret))
+      sb.to_string()
+    }
+    TTuple(elems) => {
+      let sb = StringBuilder()
+      sb.write_string("(")
+      let mut i = 0
+      while i < elems.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        sb.write_string(analyze_ty_to_string(tc, elems[i]))
+        i = i + 1
+      }
+      sb.write_string(")")
+      sb.to_string()
+    }
+    TDynTrait(n) => "dyn " + tc_qualify_local_name(tc, n)
+    TParam(n) => n
+    TNever => "Never"
+    TError => "<error>"
+  }
+}
+
+///|
+fn analyze_lookup_enum_info(tc : TypeChecker, ename : String) -> Option[EnumInfo] {
+  match tc.enums.get(ename) {
+    Some(ei) => Some(ei)
+    None => {
+      let qp = split_qual_name(ename)
+      if qp.prefix.length() > 0 {
+        match lookup_imported_pkg_transitive(tc, qp.prefix) {
+          Some(ipkg) =>
+            match ipkg.tc.enums.get(qp.name) {
+              Some(ei) => {
+                let qvs : Array[VariantInfo] = []
+                let mut vi = 0
+                while vi < ei.variants.length() {
+                  let v = ei.variants[vi]
+                  let qftys : Array[Ty] = []
+                  let mut fi = 0
+                  while fi < v.field_tys.length() {
+                    qftys.push(qualify_imported_ty(ipkg.name, v.field_tys[fi]))
+                    fi = fi + 1
+                  }
+                  qvs.push(VariantInfo::{ name: v.name, field_tys: qftys })
+                  vi = vi + 1
+                }
+                Some(EnumInfo::{ decl: ei.decl, variants: qvs })
+              }
+              None => None
+            }
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
+fn analyze_struct_has_mut_fields(
+  tc : TypeChecker,
+  sname : String,
+  sargs : Array[Ty],
+  visited : Map[String, Bool],
+) -> Bool {
+  let key = "struct:" + tc_qualify_local_name(tc, sname)
+  if visited.contains(key) {
+    return false
+  }
+  visited.set(key, true)
+  match tc_lookup_struct_info(tc, sname) {
+    None => false
+    Some(si) => {
+      let subst = make_subst(si.decl.type_params, sargs)
+      let mut i = 0
+      while i < si.field_tys.length() {
+        if i < si.field_muts.length() && si.field_muts[i] {
+          return true
+        }
+        let fty = subst_ty(si.field_tys[i], subst)
+        if analyze_ty_is_mutable(tc, fty, visited) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+  }
+}
+
+///|
+fn analyze_enum_has_mut_fields(
+  tc : TypeChecker,
+  ename : String,
+  eargs : Array[Ty],
+  visited : Map[String, Bool],
+) -> Bool {
+  let key = "enum:" + tc_qualify_local_name(tc, ename)
+  if visited.contains(key) {
+    return false
+  }
+  visited.set(key, true)
+  match analyze_lookup_enum_info(tc, ename) {
+    None => false
+    Some(ei) => {
+      let subst = make_subst(ei.decl.type_params, eargs)
+      let mut vi = 0
+      while vi < ei.variants.length() {
+        let v = ei.variants[vi]
+        let mut fi = 0
+        while fi < v.field_tys.length() {
+          let fty = subst_ty(v.field_tys[fi], subst)
+          if analyze_ty_is_mutable(tc, fty, visited) {
+            return true
+          }
+          fi = fi + 1
+        }
+        vi = vi + 1
+      }
+      false
+    }
+  }
+}
+
+///|
+fn analyze_ty_is_mutable(
+  tc : TypeChecker,
+  t : Ty,
+  visited : Map[String, Bool],
+) -> Bool {
+  match t {
+    TArray(_) | TFixedArray(_) | TMap(_, _) | TBytes | TStringBuilder => true
+    TOption(inner) => analyze_ty_is_mutable(tc, inner, visited)
+    TResult(ok, err) =>
+      analyze_ty_is_mutable(tc, ok, visited) ||
+      analyze_ty_is_mutable(tc, err, visited)
+    TTuple(elems) => {
+      let mut i = 0
+      while i < elems.length() {
+        if analyze_ty_is_mutable(tc, elems[i], visited) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TStruct(sname, sargs) =>
+      analyze_struct_has_mut_fields(tc, sname, sargs, visited)
+    TEnum(ename, eargs) =>
+      analyze_enum_has_mut_fields(tc, ename, eargs, visited)
+    _ => false
+  }
+}
+
+///|
+fn analyze_is_val_struct(tc : TypeChecker, t : Ty) -> Bool {
+  match t {
+    TStruct(sname, _) =>
+      match tc_lookup_struct_info(tc, sname) {
+        Some(si) => si.decl.is_val
+        None => false
+      }
+    _ => false
+  }
+}
+
+///|
+fn analyze_ty_struct_has_mut_fields(tc : TypeChecker, t : Ty) -> Bool {
+  match t {
+    TStruct(sname, sargs) =>
+      analyze_struct_has_mut_fields(tc, sname, sargs, Map([]))
+    _ => false
+  }
+}
+
+///|
+fn analyze_emit_closure(
+  tc : TypeChecker,
+  enclosing_fn : String,
+  cbody : Array[Stmt],
+  csp : Span,
+  context_callee : String,
+  context_arg : String,
+  closures : Array[AnalyzeClosureRec],
+) -> Unit {
+  let caps = match tc.analyze_closure_captures.get(span_key(csp)) {
+    Some(cs) => cs
+    None => []
+  }
+  let clo_calls : Array[AnalyzeCallSite] = []
+  closures.push(AnalyzeClosureRec::{
+    pkg: tc.pkg_name,
+    enclosing_fn: enclosing_fn,
+    file: csp.file,
+    line: csp.line,
+    col: csp.col,
+    context_callee: context_callee,
+    context_arg: context_arg,
+    captures: caps,
+    calls: clo_calls,
+  })
+  analyze_walk_stmts(tc, enclosing_fn, cbody, clo_calls, closures)
+}
+
+///|
+fn analyze_walk_call_args(
+  tc : TypeChecker,
+  enclosing_fn : String,
+  args : Array[Expr],
+  callee_target : String,
+  calls : Array[AnalyzeCallSite],
+  closures : Array[AnalyzeClosureRec],
+) -> Unit {
+  let mut i = 0
+  while i < args.length() {
+    match args[i] {
+      ENamedArg(label, _, inner, _) =>
+        match inner {
+          EClosure(_, _, cbody, csp) =>
+            analyze_emit_closure(
+              tc,
+              enclosing_fn,
+              cbody,
+              csp,
+              callee_target,
+              label,
+              closures,
+            )
+          _ => analyze_walk_expr(tc, enclosing_fn, inner, calls, closures)
+        }
+      EClosure(_, _, cbody, csp) =>
+        analyze_emit_closure(
+          tc,
+          enclosing_fn,
+          cbody,
+          csp,
+          callee_target,
+          i.to_string(),
+          closures,
+        )
+      _ => analyze_walk_expr(tc, enclosing_fn, args[i], calls, closures)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn analyze_walk_stmts(
+  tc : TypeChecker,
+  enclosing_fn : String,
+  stmts : Array[Stmt],
+  calls : Array[AnalyzeCallSite],
+  closures : Array[AnalyzeClosureRec],
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(_, _, _, init, _) =>
+        analyze_walk_expr(tc, enclosing_fn, init, calls, closures)
+      SLetTuple(_, _, init, _) =>
+        analyze_walk_expr(tc, enclosing_fn, init, calls, closures)
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        analyze_walk_expr(tc, enclosing_fn, lhs, calls, closures)
+        analyze_walk_expr(tc, enclosing_fn, rhs, calls, closures)
+      }
+      SGuard(cond, else_body, _) => {
+        analyze_walk_expr(tc, enclosing_fn, cond, calls, closures)
+        analyze_walk_stmts(tc, enclosing_fn, else_body, calls, closures)
+      }
+      SWhile(cond, body, _) => {
+        analyze_walk_expr(tc, enclosing_fn, cond, calls, closures)
+        analyze_walk_stmts(tc, enclosing_fn, body, calls, closures)
+      }
+      SFor(init_s, cond, step_s, body, _) => {
+        analyze_walk_stmts(tc, enclosing_fn, [init_s], calls, closures)
+        analyze_walk_expr(tc, enclosing_fn, cond, calls, closures)
+        analyze_walk_stmts(tc, enclosing_fn, [step_s], calls, closures)
+        analyze_walk_stmts(tc, enclosing_fn, body, calls, closures)
+      }
+      SForRange(_, start_e, end_e, _, body, _) => {
+        analyze_walk_expr(tc, enclosing_fn, start_e, calls, closures)
+        analyze_walk_expr(tc, enclosing_fn, end_e, calls, closures)
+        analyze_walk_stmts(tc, enclosing_fn, body, calls, closures)
+      }
+      SForIn(_, _, iter_e, body, _) => {
+        analyze_walk_expr(tc, enclosing_fn, iter_e, calls, closures)
+        analyze_walk_stmts(tc, enclosing_fn, body, calls, closures)
+      }
+      SReturn(opt, _) =>
+        match opt {
+          Some(e) => analyze_walk_expr(tc, enclosing_fn, e, calls, closures)
+          None => ()
+        }
+      SBreak(_) | SContinue(_) => ()
+      SDebugAssert(c, m, _) => {
+        analyze_walk_expr(tc, enclosing_fn, c, calls, closures)
+        analyze_walk_expr(tc, enclosing_fn, m, calls, closures)
+      }
+      SExpr(e, _) => analyze_walk_expr(tc, enclosing_fn, e, calls, closures)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn analyze_walk_expr(
+  tc : TypeChecker,
+  enclosing_fn : String,
+  e : Expr,
+  calls : Array[AnalyzeCallSite],
+  closures : Array[AnalyzeClosureRec],
+) -> Unit {
+  match e {
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EDouble(_, _) | EFloat(_, _) | EBool(_, _) => ()
+    EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) => ()
+    EIdent(_, _) | EPath(_, _, _) => ()
+    EUnary(_, inner, _) | EMove(inner, _) | EAs(inner, _, _) | ETry(inner, _) | ENamedArg(_, _, inner, _) | EMutArg(inner, _) =>
+      analyze_walk_expr(tc, enclosing_fn, inner, calls, closures)
+    EInterp(parts, _) => {
+      let mut i = 0
+      while i < parts.length() {
+        analyze_walk_expr(tc, enclosing_fn, parts[i], calls, closures)
+        i = i + 1
+      }
+    }
+    EDotVariant(_, args, sp) => {
+      let target = match tc.call_targets.get(span_key(sp)) {
+        Some(t) => t
+        None => ""
+      }
+      if target != "" && args.length() > 0 {
+        calls.push(AnalyzeCallSite::{ target: target, line: sp.line, col: sp.col })
+      }
+      analyze_walk_call_args(tc, enclosing_fn, args, target, calls, closures)
+    }
+    EBinary(_, l, r, _) => {
+      analyze_walk_expr(tc, enclosing_fn, l, calls, closures)
+      analyze_walk_expr(tc, enclosing_fn, r, calls, closures)
+    }
+    ECall(callee, args, sp) => {
+      let target = match tc.call_targets.get(span_key(sp)) {
+        Some(t) => t
+        None => ""
+      }
+      match callee {
+        EIdent(_, _) | EPath(_, _, _) => ()
+        _ => analyze_walk_expr(tc, enclosing_fn, callee, calls, closures)
+      }
+      if target != "" {
+        calls.push(AnalyzeCallSite::{ target: target, line: sp.line, col: sp.col })
+      }
+      analyze_walk_call_args(tc, enclosing_fn, args, target, calls, closures)
+    }
+    EField(obj, _, _) =>
+      analyze_walk_expr(tc, enclosing_fn, obj, calls, closures)
+    EMethodCall(obj, _, args, sp) => {
+      analyze_walk_expr(tc, enclosing_fn, obj, calls, closures)
+      let target = match tc.call_targets.get(span_key(sp)) {
+        Some(t) => t
+        None => ""
+      }
+      if target != "" {
+        calls.push(AnalyzeCallSite::{ target: target, line: sp.line, col: sp.col })
+      }
+      analyze_walk_call_args(tc, enclosing_fn, args, target, calls, closures)
+    }
+    EIndex(obj, idx, _) => {
+      analyze_walk_expr(tc, enclosing_fn, obj, calls, closures)
+      analyze_walk_expr(tc, enclosing_fn, idx, calls, closures)
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        analyze_walk_expr(tc, enclosing_fn, elems[i], calls, closures)
+        i = i + 1
+      }
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(base) => analyze_walk_expr(tc, enclosing_fn, base, calls, closures)
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        analyze_walk_expr(tc, enclosing_fn, fields[i].value, calls, closures)
+        i = i + 1
+      }
+    }
+    EBlock(stmts, _) =>
+      analyze_walk_stmts(tc, enclosing_fn, stmts, calls, closures)
+    EIf(cond, then_s, else_opt, _) => {
+      analyze_walk_expr(tc, enclosing_fn, cond, calls, closures)
+      analyze_walk_stmts(tc, enclosing_fn, then_s, calls, closures)
+      match else_opt {
+        Some(el) => analyze_walk_expr(tc, enclosing_fn, el, calls, closures)
+        None => ()
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      analyze_walk_expr(tc, enclosing_fn, scrut, calls, closures)
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => analyze_walk_expr(tc, enclosing_fn, ge, calls, closures)
+          None => ()
+        }
+        analyze_walk_expr(tc, enclosing_fn, arms[i].body, calls, closures)
+        i = i + 1
+      }
+    }
+    EIs(scrut, _, _) =>
+      analyze_walk_expr(tc, enclosing_fn, scrut, calls, closures)
+    EClosure(_, _, cbody, csp) =>
+      analyze_emit_closure(tc, enclosing_fn, cbody, csp, "", "", closures)
+    EScope(w, f, sp) => {
+      calls.push(AnalyzeCallSite::{ target: "builtin::scope", line: sp.line, col: sp.col })
+      analyze_walk_expr(tc, enclosing_fn, w, calls, closures)
+      match f {
+        EClosure(_, _, cbody, csp) =>
+          analyze_emit_closure(tc, enclosing_fn, cbody, csp, "builtin::scope", "1", closures)
+        _ => analyze_walk_expr(tc, enclosing_fn, f, calls, closures)
+      }
+    }
+    ESpawn(s, f, sp) => {
+      calls.push(AnalyzeCallSite::{ target: "builtin::spawn", line: sp.line, col: sp.col })
+      analyze_walk_expr(tc, enclosing_fn, s, calls, closures)
+      match f {
+        EClosure(_, _, cbody, csp) =>
+          analyze_emit_closure(tc, enclosing_fn, cbody, csp, "builtin::spawn", "1", closures)
+        _ => analyze_walk_expr(tc, enclosing_fn, f, calls, closures)
+      }
+    }
+  }
+}
+
+///|
+fn analyze_write_calls_json(sb : StringBuilder, calls : Array[AnalyzeCallSite]) -> Unit {
+  sb.write_string("[")
+  let mut i = 0
+  while i < calls.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string("{\"target\":")
+    sb.write_string(json_quote(calls[i].target))
+    sb.write_string(",\"line\":")
+    sb.write_string(calls[i].line.to_string())
+    sb.write_string(",\"col\":")
+    sb.write_string(calls[i].col.to_string())
+    sb.write_string("}")
+    i = i + 1
+  }
+  sb.write_string("]")
+}
+
+///|
+pub fn query_analyze_packages_json(
+  checked_pkgs : Array[CheckedPackage],
+  diags : Array[Diagnostic],
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string("{\"ok\":")
+  sb.write_string(if diags.length() == 0 { "true" } else { "false" })
+  if diags.length() > 0 {
+    sb.write_string(",\"diagnostics\":[")
+    let mut di = 0
+    while di < diags.length() {
+      if di > 0 {
+        sb.write_string(",")
+      }
+      sb.write_string(diagnostic_to_json(diags[di]))
+      di = di + 1
+    }
+    sb.write_string("]")
+  }
+  // 1. types
+  sb.write_string(",\"types\":[")
+  let mut tcount = 0
+  let mut pi = 0
+  while pi < checked_pkgs.length() {
+    let cp = checked_pkgs[pi]
+    let pkg = cp.pkg
+    let tc = cp.tc
+    let mut fi = 0
+    while fi < pkg.files.length() {
+      let f = pkg.files[fi]
+      let mut di = 0
+      while di < f.decls.length() {
+        match f.decls[di] {
+          DStruct(sd) => {
+            if tcount > 0 {
+              sb.write_string(",")
+            }
+            tcount = tcount + 1
+            let has_mut = analyze_struct_has_mut_fields(tc, sd.name, [], Map([]))
+            sb.write_string("{\"pkg\":")
+            sb.write_string(json_quote(pkg.name))
+            sb.write_string(",\"name\":")
+            sb.write_string(json_quote(sd.name))
+            sb.write_string(",\"kind\":\"struct\",\"is_val\":")
+            sb.write_string(if sd.is_val { "true" } else { "false" })
+            sb.write_string(",\"has_mut_fields\":")
+            sb.write_string(if has_mut { "true" } else { "false" })
+            sb.write_string(",\"file\":")
+            sb.write_string(json_quote(sd.span.file))
+            sb.write_string(",\"line\":")
+            sb.write_string(sd.span.line.to_string())
+            sb.write_string("}")
+          }
+          DEnum(ed) => {
+            if tcount > 0 {
+              sb.write_string(",")
+            }
+            tcount = tcount + 1
+            let has_mut = analyze_enum_has_mut_fields(tc, ed.name, [], Map([]))
+            sb.write_string("{\"pkg\":")
+            sb.write_string(json_quote(pkg.name))
+            sb.write_string(",\"name\":")
+            sb.write_string(json_quote(ed.name))
+            sb.write_string(",\"kind\":\"enum\",\"is_val\":false,\"has_mut_fields\":")
+            sb.write_string(if has_mut { "true" } else { "false" })
+            sb.write_string(",\"file\":")
+            sb.write_string(json_quote(ed.span.file))
+            sb.write_string(",\"line\":")
+            sb.write_string(ed.span.line.to_string())
+            sb.write_string("}")
+          }
+          _ => ()
+        }
+        di = di + 1
+      }
+      fi = fi + 1
+    }
+    pi = pi + 1
+  }
+  sb.write_string("]")
+
+  // 2. fns (and collect closures in deterministic order)
+  let all_closures : Array[AnalyzeClosureRec] = []
+  let closure_tcs : Array[TypeChecker] = []
+  sb.write_string(",\"fns\":[")
+  let mut fcount = 0
+  pi = 0
+  while pi < checked_pkgs.length() {
+    let cp = checked_pkgs[pi]
+    let pkg = cp.pkg
+    let tc = cp.tc
+    let mut fi = 0
+    while fi < pkg.files.length() {
+      let f = pkg.files[fi]
+      let mut di = 0
+      while di < f.decls.length() {
+        let before_cl = all_closures.length()
+        match f.decls[di] {
+          DFn(fd) => {
+            let short_name = if fd.receiver_type != "" {
+              fd.receiver_type + "::" + fd.name
+            } else {
+              fd.name
+            }
+            let enc = pkg.name + "::" + short_name
+            let calls : Array[AnalyzeCallSite] = []
+            analyze_walk_stmts(tc, enc, fd.body, calls, all_closures)
+            if fcount > 0 {
+              sb.write_string(",")
+            }
+            fcount = fcount + 1
+            sb.write_string("{\"pkg\":")
+            sb.write_string(json_quote(pkg.name))
+            sb.write_string(",\"name\":")
+            sb.write_string(json_quote(short_name))
+            sb.write_string(",\"file\":")
+            sb.write_string(json_quote(fd.span.file))
+            sb.write_string(",\"line\":")
+            sb.write_string(fd.span.line.to_string())
+            sb.write_string(",\"no_io\":")
+            sb.write_string(if fd.no_io { "true" } else { "false" })
+            sb.write_string(",\"calls\":")
+            analyze_write_calls_json(sb, calls)
+            sb.write_string("}")
+          }
+          DImpl(id) => {
+            let mut mi = 0
+            while mi < id.methods.length() {
+              let md = id.methods[mi]
+              let short_name = id.trait_name + "::" + id.target_type + "::" + md.name
+              let enc = pkg.name + "::" + short_name
+              let calls : Array[AnalyzeCallSite] = []
+              analyze_walk_stmts(tc, enc, md.body, calls, all_closures)
+              if fcount > 0 {
+                sb.write_string(",")
+              }
+              fcount = fcount + 1
+              sb.write_string("{\"pkg\":")
+              sb.write_string(json_quote(pkg.name))
+              sb.write_string(",\"name\":")
+              sb.write_string(json_quote(short_name))
+              sb.write_string(",\"file\":")
+              sb.write_string(json_quote(md.span.file))
+              sb.write_string(",\"line\":")
+              sb.write_string(md.span.line.to_string())
+              sb.write_string(",\"no_io\":")
+              sb.write_string(if md.no_io { "true" } else { "false" })
+              sb.write_string(",\"calls\":")
+              analyze_write_calls_json(sb, calls)
+              sb.write_string("}")
+              mi = mi + 1
+            }
+          }
+          DExternFn(ed) =>
+            if ed.has_body {
+              let enc = pkg.name + "::" + ed.name
+              let calls : Array[AnalyzeCallSite] = []
+              analyze_walk_stmts(tc, enc, ed.body, calls, all_closures)
+              if fcount > 0 {
+                sb.write_string(",")
+              }
+              fcount = fcount + 1
+              sb.write_string("{\"pkg\":")
+              sb.write_string(json_quote(pkg.name))
+              sb.write_string(",\"name\":")
+              sb.write_string(json_quote(ed.name))
+              sb.write_string(",\"file\":")
+              sb.write_string(json_quote(ed.span.file))
+              sb.write_string(",\"line\":")
+              sb.write_string(ed.span.line.to_string())
+              sb.write_string(",\"no_io\":false,\"calls\":")
+              analyze_write_calls_json(sb, calls)
+              sb.write_string("}")
+            }
+          DConst(cd) => {
+            let enc = pkg.name + "::" + cd.name
+            let dummy : Array[AnalyzeCallSite] = []
+            analyze_walk_expr(tc, enc, cd.value, dummy, all_closures)
+          }
+          DTest(td) => {
+            let enc = pkg.name + "::test::" + td.name
+            let dummy : Array[AnalyzeCallSite] = []
+            analyze_walk_stmts(tc, enc, td.body, dummy, all_closures)
+          }
+          _ => ()
+        }
+        let mut ci = before_cl
+        while ci < all_closures.length() {
+          closure_tcs.push(tc)
+          ci = ci + 1
+        }
+        di = di + 1
+      }
+      fi = fi + 1
+    }
+    pi = pi + 1
+  }
+  sb.write_string("]")
+
+  // 3. closures
+  sb.write_string(",\"closures\":[")
+  let mut ci = 0
+  while ci < all_closures.length() {
+    if ci > 0 {
+      sb.write_string(",")
+    }
+    let cl = all_closures[ci]
+    let tc = closure_tcs[ci]
+    sb.write_string("{\"pkg\":")
+    sb.write_string(json_quote(cl.pkg))
+    sb.write_string(",\"enclosing_fn\":")
+    sb.write_string(json_quote(cl.enclosing_fn))
+    sb.write_string(",\"file\":")
+    sb.write_string(json_quote(cl.file))
+    sb.write_string(",\"line\":")
+    sb.write_string(cl.line.to_string())
+    sb.write_string(",\"col\":")
+    sb.write_string(cl.col.to_string())
+    sb.write_string(",\"context_callee\":")
+    sb.write_string(json_quote(cl.context_callee))
+    sb.write_string(",\"context_arg\":")
+    sb.write_string(json_quote(cl.context_arg))
+    sb.write_string(",\"captures\":[")
+    let mut k = 0
+    while k < cl.captures.length() {
+      if k > 0 {
+        sb.write_string(",")
+      }
+      let cap = cl.captures[k]
+      let is_val = analyze_is_val_struct(tc, cap.ty)
+      let has_mut = analyze_ty_struct_has_mut_fields(tc, cap.ty)
+      let is_mut_ty = analyze_ty_is_mutable(tc, cap.ty, Map([]))
+      sb.write_string("{\"name\":")
+      sb.write_string(json_quote(cap.name))
+      sb.write_string(",\"is_mut\":")
+      sb.write_string(if cap.is_mut { "true" } else { "false" })
+      sb.write_string(",\"ty\":")
+      sb.write_string(json_quote(analyze_ty_to_string(tc, cap.ty)))
+      sb.write_string(",\"is_val_struct\":")
+      sb.write_string(if is_val { "true" } else { "false" })
+      sb.write_string(",\"has_mut_fields\":")
+      sb.write_string(if has_mut { "true" } else { "false" })
+      sb.write_string(",\"is_mutable_ty\":")
+      sb.write_string(if is_mut_ty { "true" } else { "false" })
+      sb.write_string(",\"decl_line\":")
+      sb.write_string(cap.decl_line.to_string())
+      sb.write_string("}")
+      k = k + 1
+    }
+    sb.write_string("],\"calls\":")
+    analyze_write_calls_json(sb, cl.calls)
+    sb.write_string("}")
+    ci = ci + 1
+  }
+  sb.write_string("]}")
+  sb.to_string()
 }

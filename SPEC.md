@@ -27,7 +27,7 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
    - Function/method attributes `#no_io` / `#[no_io]` and their alias `#render_thread` / `#[render_thread]` enforce a compile-time zero-`World` boundary (intended for GUI render threads and non-blocking callbacks): annotated functions, `impl` methods, and any nested closures inside them cannot accept a `World` parameter, reference a `World` binding, or call `World` IO builtins / runtime primitives / `scope` (`E_NO_IO_VIOLATION`, with no `world : World` insertion edit). Non-`World` `extern "C"` FFI, `Channel`, `Mutex`, `AtomicInt`, and pure computation remain allowed.
 5. **Agent-First Compiler Interface**:
    - `pionc check --json <path>` — compact JSON diagnostics (`file`, `line`, `col`, `code`, `message`, `expected`, `found`, `fixit`, plus machine-applicable `edits` when an exact patch is known), one object per diagnostic inside `{"ok":bool,"diagnostics":[...]}` (§5.1).
-   - `pionc query defs|sig|callers|deps --json <path>` — structured symbol table, exported signatures, call graph, and package dependency graph; `<path>` may be a file, a package directory, or a whole `pion.toml` workspace (§5.2).
+   - `pionc query defs|sig|callers|deps|analyze --json <path>` — structured symbol table, exported signatures, call graph, package dependency graph, and typed analysis export (`types`, `fns`, `closures`); `<path>` may be a file, a package directory, or a whole `pion.toml` workspace (§5.2).
    - `pionc test --json <workspace>` runs every local package's tests in one report (§5.3); `pionc init <dir>` scaffolds a package that is check/test/run/fmt-clean; `pionc fetch [dir]` resolves git dependencies and writes `pion.lock`; `pionc add` / `pionc update` edit `pion.toml` and re-resolve from paths, git URLs or a git-index registry (§6).
    - `pionc doc [--json] <path>` — the public API (every `pub` struct/enum/trait/extern fn/fn/const and every `impl`) of a file, directory or whole `pion.toml` workspace in one call (§5.4).
    - Contracts: `debug_assert(cond, msg)` — active in dev/test builds, stripped to 0 bytes in `--release`; it is an expression of type `Unit` and may stand in expression position (e.g. a `match` arm body).
@@ -556,7 +556,31 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `sig`: compact `.pionsig` export table in JSON
 - `callers`: `{"callers":[{"fn":"...","calls":["..."]}]}` (workspace targets add `"pkg"` to every entry)
 - `deps`: `{"packages":[{"name":"...","deps":["..."],"sig_hash":"..."}]}`
-- `<path>` may be a file, a package directory (its `src/` included) or a `pion.toml` workspace root: `defs`/`sig`/`callers` then cover every package in one call.
+- `analyze`: runs the real `TypeChecker` (in analysis mode, zero overhead on normal `check`/`build`) and exports a typed call graph, struct/enum mutability metadata, and closure capture/call records in deterministic declaration order for external static auditors (such as `invar audit`):
+  ```json
+  {
+    "ok": true,
+    "types": [
+      {"pkg":"app","name":"State","kind":"struct","is_val":false,"has_mut_fields":true,"file":"src/main.pion","line":3}
+    ],
+    "fns": [
+      {"pkg":"app","name":"build_view","file":"src/main.pion","line":10,"no_io":true,"calls":[{"target":"signals::Signal::set","line":14,"col":5}]}
+    ],
+    "closures": [
+      {
+        "pkg":"app","enclosing_fn":"app::build_view","file":"src/main.pion","line":18,"col":22,
+        "context_callee":"view::Live::By","context_arg":"0",
+        "captures":[{"name":"count","is_mut":true,"ty":"Int","is_val_struct":false,"has_mut_fields":false,"is_mutable_ty":false,"decl_line":11}],
+        "calls":[{"target":"signals::Signal::get","line":18,"col":30}]
+      }
+    ]
+  }
+  ```
+  - `has_mut_fields` is true when a `struct`/`enum` directly or transitively contains a `mut` field or mutable container (`Array`, `FixedArray`, `Map`, `Bytes`, `StringBuilder`), with cycle protection for self-referential types.
+  - `captures` lists outer lexical variables referenced inside a closure (penetrating nested blocks and nested closures); `calls` on a function or closure records only direct canonical calls (`pkg::fn`, `pkg::Type::method`, `Trait::Type::method`, `pkg::Enum::Variant`, `builtin::...`, `closure::name`) without mixing nested closure calls into outer scopes.
+  - `context_callee` and `context_arg` (named argument label such as `"text_by"`/`"children"`, or positional index `"0"`, else `""`) record when a closure is passed directly to a function, method, variant constructor, or Pion-JSX component call.
+  - When parse or type diagnostics exist, `"ok": false` and `"diagnostics": [...]` are included alongside any partial analysis results collected (exit code `1`; exit code `0` when `"ok": true`).
+- `<path>` may be a file, a package directory (its `src/` included) or a `pion.toml` workspace root: `defs`/`sig`/`callers`/`analyze` then cover every package in one call.
 
 ### 5.3 `pionc test [--json] [--package <name>] [--filter <substr>] [--jobs <n>] <path>`
 - Runs all `test "name" { ... }` blocks in isolated child processes (active `debug_assert`).
@@ -641,7 +665,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
     - A root `pion.toml` may declare `[workspace]` with `members = ["packages/*", "cmd/*"]` (exact paths or single-segment wildcards, multiline arrays and singular `member` supported; unknown keys rejected with line number) and `[workspace.dependencies]` (same `path` / `git`+`tag|rev|branch|subdir` / `registry` syntax; `workspace = true` forbidden inside `[workspace.dependencies]`).
     - Both **virtual roots** (`[workspace]` without `[package]`) and **hybrid roots** (`[package]` + `[workspace]`) are supported; hybrid roots include themselves as a member.
     - Member packages inherit dependencies via `foo = { workspace = true }` in `[dependencies]` (combining `workspace = true` with `path`/`git`/`registry` is an error with line number). `pionc` walks up to 16 parent directories from any member package to discover its enclosing `[workspace]`, rewrites inherited `path` dependencies relative to the workspace root, and shares a single `<ws_root>/pion.lock`.
-    - From a workspace root (explicit path or default `"."`), `check [--fix]`, `test [--package|-p <name>]`, `fmt [--check]`, `doc`, `query defs|sig|callers|deps`, and `fetch` operate across all workspace members; `build` and `run` accept `--package <name>` / `-p <name>` (and on a virtual root without `--package`, auto-select the unique member defining `fn main` or report available members).
+    - From a workspace root (explicit path or default `"."`), `check [--fix]`, `test [--package|-p <name>]`, `fmt [--check]`, `doc`, `query defs|sig|callers|deps|analyze`, and `fetch` operate across all workspace members; `build` and `run` accept `--package <name>` / `-p <name>` (and on a virtual root without `--package`, auto-select the unique member defining `fn main` or report available members).
   - **Multiline arrays**: any `key = [ ... ]` value in `pion.toml` may span multiple lines (with `#` comments and optional trailing commas). Unknown keys in `[link]` / `[link.macos]` / `[link.linux]` / `[link.ios]` / `[link.android]` / `[link.windows]` are rejected with the line number.
   - **C/C++/ObjC stub compilation (`c_sources`)**: each package's active `c_sources` are compiled in topological order (`.cc`/`.cpp`/`.mm` with `$CXX` or `c++`, `.c`/`.m` with `$CC` or `cc`), automatically passing `-I<runtime_dir>` (and `<runtime_dir>/../runtime` when `pion_rt.h` resides there) so stubs can `#include "pion_rt.h"`. Objects are written atomically to `$PION_CACHE_DIR/obj/cstub_<key>.o` (LRU-tracked, zero source-tree pollution) keyed by `sha256("cstub-v1|" + target + "|" + compiler + "|" + cc_flags + "|" + src_path + "|" + sha256(src) + "|" + local_headers_fp)`, where `local_headers_fp` hashes sorted `(path, size, mtime_ms)` of all `.h`/`.hpp` files in the package dir and `src_path`'s dir.
   - **Linker & binary cache key**: when all packages have no `frameworks`, `search_paths`, `rpaths`, `objects`, `flags`, or C++ sources/libs (`has_cxx`), macOS keeps its direct `ld` fast path. Otherwise both macOS and Linux link through `$CXX`/`c++` (when `has_cxx`) or `$CC`/`cc` with argument order `obj_paths` (including `cstub_*.o`) → `libpionrt.a` → `objects` → `-L<search_paths>` → `-Wl,-rpath,<rpaths>` → (macOS: `-framework <fw>`) → `-l<libs>` → `flags` → (Linux: `-lm -lpthread`). Both `pionc build`/`run` and `pionc test` include all resolved link options plus each `objects` file's `(path, size, mtime_ms)` in the binary cache key.
