@@ -378,6 +378,15 @@ pub struct EqUse {
 }
 
 ///|
+pub struct IntoConv {
+  /// 0 = builtin `.as_view()`, 1 = static `Target::fn(x)`, 2 = instance `x.method()`
+  kind : Int
+  qual : String
+  name : String
+  target_ty : Ty
+}
+
+///|
 pub struct ImportedPkg {
   name : String
   tc : TypeChecker
@@ -448,6 +457,10 @@ pub struct TypeChecker {
   /// `span_key(method-call span)` of every `recv.m(...)` whose method takes
   /// `mut self` (codegen passes `recv` as an in-out place).
   mut_recv_calls : Map[String, Bool]
+  /// `span_key(call span) + "#" + raw_arg_index` -> `#into` conversion for that argument.
+  call_into_convs : Map[String, IntoConv]
+  /// `span_key(ETry span)` -> `#into` error conversion for `?`.
+  try_into_convs : Map[String, IntoConv]
 }
 
 ///|
@@ -1062,6 +1075,7 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
       qparams.push(Param::{
         name: p.name,
         is_mut: p.is_mut,
+        is_into: p.is_into,
         ty: p.ty,
         label_kind: p.label_kind,
         default_expr: qdef,
@@ -1072,6 +1086,7 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
     FnDecl::{
       is_pub: d.is_pub,
       no_io: d.no_io,
+      is_into: d.is_into,
       is_verify: d.is_verify,
       is_verify_opaque: d.is_verify_opaque,
       receiver_type: d.receiver_type,
@@ -1355,6 +1370,7 @@ fn qualify_fn_bounds(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
     decl: FnDecl::{
       is_pub: d.is_pub,
       no_io: false,
+      is_into: d.is_into,
       is_verify: d.is_verify,
       is_verify_opaque: d.is_verify_opaque,
       receiver_type: d.receiver_type,
@@ -6276,6 +6292,8 @@ pub struct ResolvedCallArgs {
   args : Array[Expr]
   missing : Array[Bool]
   from_default : Array[Bool]
+  raw_idx : Array[Int]
+  opt_wrapped : Array[Bool]
 }
 
 ///|
@@ -6322,11 +6340,15 @@ fn resolve_call_args_impl(
     0
   }
   let slots : Array[Option[Expr]] = []
+  let slot_raw_idx : Array[Int] = []
+  let slot_opt_wrapped : Array[Bool] = []
   let pos_slots : Array[Int] = []
   let named_candidates : Array[String] = []
   let mut k = 0
   while k < n {
     slots.push(None)
+    slot_raw_idx.push(-1)
+    slot_opt_wrapped.push(false)
     let p = params[param_offset + k]
     if p.label_kind == 0 {
       pos_slots.push(k)
@@ -6414,10 +6436,14 @@ fn resolve_call_args_impl(
                   }
                 }
                 slots[found] = Some(expr)
+                slot_raw_idx[found] = ai
               } else if pf.label_kind == 2 {
                 slots[found] = Some(ECall(EIdent("Some", asp), [expr], asp))
+                slot_raw_idx[found] = ai
+                slot_opt_wrapped[found] = true
               } else {
                 slots[found] = Some(expr)
+                slot_raw_idx[found] = ai
               }
             }
           }
@@ -6446,7 +6472,10 @@ fn resolve_call_args_impl(
                   )
                 None => ()
               }
-            None => slots[slot_idx] = Some(arg)
+            None => {
+              slots[slot_idx] = Some(arg)
+              slot_raw_idx[slot_idx] = ai
+            }
           }
         } else {
           match tc_opt {
@@ -6469,6 +6498,8 @@ fn resolve_call_args_impl(
   let out : Array[Expr] = []
   let missing : Array[Bool] = []
   let from_default : Array[Bool] = []
+  let raw_idx : Array[Int] = []
+  let opt_wrapped : Array[Bool] = []
   k = 0
   while k < n {
     match slots[k] {
@@ -6476,6 +6507,8 @@ fn resolve_call_args_impl(
         out.push(e)
         missing.push(false)
         from_default.push(false)
+        raw_idx.push(slot_raw_idx[k])
+        opt_wrapped.push(slot_opt_wrapped[k])
       }
       None => {
         let pk = params[param_offset + k]
@@ -6484,12 +6517,16 @@ fn resolve_call_args_impl(
             out.push(def)
             missing.push(false)
             from_default.push(true)
+            raw_idx.push(-1)
+            opt_wrapped.push(false)
           }
           None =>
             if pk.label_kind == 2 {
               out.push(EIdent("None", sp))
               missing.push(false)
               from_default.push(false)
+              raw_idx.push(-1)
+              opt_wrapped.push(false)
             } else {
               match tc_opt {
                 Some(tc) => {
@@ -6513,13 +6550,21 @@ fn resolve_call_args_impl(
               out.push(EUnit(sp))
               missing.push(true)
               from_default.push(false)
+              raw_idx.push(-1)
+              opt_wrapped.push(false)
             }
         }
       }
     }
     k = k + 1
   }
-  ResolvedCallArgs::{ args: out, missing: missing, from_default: from_default }
+  ResolvedCallArgs::{
+    args: out,
+    missing: missing,
+    from_default: from_default,
+    raw_idx: raw_idx,
+    opt_wrapped: opt_wrapped,
+  }
 }
 
 ///|
@@ -6533,6 +6578,604 @@ pub fn resolve_call_args_qbe(
     return raw_args
   }
   resolve_call_args_impl(None, params, param_offset, raw_args, "", sp).args
+}
+
+///|
+fn param_is_into_at(params : Array[Param], idx : Int) -> Bool {
+  idx >= 0 && idx < params.length() && params[idx].is_into
+}
+
+///|
+fn ty_contains_world_rec(tc : TypeChecker, t : Ty, visited : Array[String]) -> Bool {
+  match t {
+    TWorld => true
+    TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      ty_contains_world_rec(tc, e, visited)
+    TResult(a, b) | TMap(a, b) =>
+      ty_contains_world_rec(tc, a, visited) || ty_contains_world_rec(tc, b, visited)
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        if ty_contains_world_rec(tc, es[i], visited) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, r) => {
+      let mut i = 0
+      while i < ps.length() {
+        if ty_contains_world_rec(tc, ps[i], visited) {
+          return true
+        }
+        i = i + 1
+      }
+      ty_contains_world_rec(tc, r, visited)
+    }
+    TStruct(sname, sargs) => {
+      let mut i = 0
+      while i < sargs.length() {
+        if ty_contains_world_rec(tc, sargs[i], visited) {
+          return true
+        }
+        i = i + 1
+      }
+      if str_arr_contains(visited, sname) {
+        return false
+      }
+      visited.push(sname)
+      match tc_lookup_struct_info(tc, sname) {
+        Some(si) => {
+          let mut fi = 0
+          while fi < si.field_tys.length() {
+            if ty_contains_world_rec(tc, si.field_tys[fi], visited) {
+              return true
+            }
+            fi = fi + 1
+          }
+          false
+        }
+        None => false
+      }
+    }
+    TEnum(ename, eargs) => {
+      let mut i = 0
+      while i < eargs.length() {
+        if ty_contains_world_rec(tc, eargs[i], visited) {
+          return true
+        }
+        i = i + 1
+      }
+      if str_arr_contains(visited, ename) {
+        return false
+      }
+      visited.push(ename)
+      match tc.enums.get(ename) {
+        Some(ei) => {
+          let mut vi = 0
+          while vi < ei.variants.length() {
+            let v = ei.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              if ty_contains_world_rec(tc, v.field_tys[fi], visited) {
+                return true
+              }
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          false
+        }
+        None => false
+      }
+    }
+    _ => false
+  }
+}
+
+///|
+fn validate_into_fn_decl(tc : TypeChecker, fd : FnDecl, finfo : FnInfo) -> Unit {
+  if !fd.is_into {
+    return
+  }
+  let full_name = if fd.receiver_type != "" {
+    fd.receiver_type + "::" + fd.name
+  } else {
+    fd.name
+  }
+  if fd.receiver_type == "" {
+    tc_err(
+      tc,
+      fd.span,
+      "E_INVALID_INTO",
+      "`#into` converter `" + full_name + "` must be an associated function on the target type (`Target::from_...`) or a method on the source type (`Src::to_...`)",
+      "associated function `Target::fn` or method `Src::method`",
+      "free function `" + full_name + "`",
+      "define `" + full_name + "` as `Target::" + fd.name + "` or `Src::" + fd.name + "`",
+    )
+    return
+  }
+  if !tc.structs.contains(fd.receiver_type) && !tc.enums.contains(fd.receiver_type) {
+    tc_err(
+      tc,
+      fd.span,
+      "E_INVALID_INTO",
+      "`#into` converter `" + full_name + "` must be defined on a struct or enum declared in the same package",
+      "local struct or enum receiver type",
+      fd.receiver_type,
+      "define `#into` converters in the defining package of the target or source type",
+    )
+    return
+  }
+  if fd.params.length() != 1 {
+    tc_err(
+      tc,
+      fd.span,
+      "E_INVALID_INTO",
+      "`#into` converter `" + full_name + "` must take exactly 1 parameter, found " + fd.params.length().to_string(),
+      "1 parameter",
+      fd.params.length().to_string() + " parameters",
+      "a `#into` converter takes exactly one source value (or `self`)",
+    )
+    return
+  }
+  let p0 = fd.params[0]
+  if p0.is_mut {
+    tc_err(
+      tc,
+      p0.span,
+      "E_INVALID_INTO",
+      "`#into` converter `" + full_name + "` cannot have a `mut` parameter",
+      "immutable parameter",
+      "`mut " + p0.name + "`",
+      "remove `mut` from `" + p0.name + "`",
+    )
+    return
+  }
+  let has_def = match p0.default_expr {
+    Some(_) => true
+    None => false
+  }
+  if p0.is_into || p0.label_kind != 0 || has_def {
+    tc_err(
+      tc,
+      p0.span,
+      "E_INVALID_INTO",
+      "`#into` converter `" + full_name + "` parameter must be a plain positional parameter",
+      "plain positional parameter",
+      p0.name,
+      "remove `into` / `~` / `?` / default value from `" + p0.name + "`",
+    )
+    return
+  }
+  if finfo.param_tys.length() > 0 && ty_contains_world_rec(tc, finfo.param_tys[0], []) {
+    tc_err(
+      tc,
+      p0.span,
+      "E_INVALID_INTO",
+      "`#into` converter `" + full_name + "` cannot depend on `World` (converters must be pure value conversions)",
+      "pure value parameter without `World`",
+      ty_to_string(finfo.param_tys[0]),
+      "remove `World` from `#into` converter `" + full_name + "`",
+    )
+    return
+  }
+  if p0.name == "self" {
+    if finfo.param_tys.length() > 0 {
+      match finfo.param_tys[0] {
+        TError => ()
+        _ =>
+          if ty_base_name(finfo.param_tys[0]) != fd.receiver_type {
+            tc_err(
+              tc,
+              p0.span,
+              "E_INVALID_INTO",
+              "`#into` method `" + full_name + "` `self` parameter must have type `" + fd.receiver_type + "`",
+              fd.receiver_type,
+              ty_to_string(finfo.param_tys[0]),
+              "change `self` type to `" + fd.receiver_type + "`",
+            )
+          }
+      }
+    }
+  } else {
+    match finfo.ret_ty {
+      TError => ()
+      _ =>
+        if ty_base_name(finfo.ret_ty) != fd.receiver_type {
+          tc_err(
+            tc,
+            fd.span,
+            "E_INVALID_INTO",
+            "`#into` static function `" + full_name + "` must return `" + fd.receiver_type + "`",
+            fd.receiver_type,
+            ty_to_string(finfo.ret_ty),
+            "return `" + fd.receiver_type + "` from `" + full_name + "` or declare it as a `self` method on the source type",
+          )
+        }
+    }
+  }
+}
+
+///|
+fn into_check_type_bounds(
+  tc : TypeChecker,
+  env : Env,
+  bounds : Array[TypeBound],
+  subst : Map[String, Ty],
+) -> Bool {
+  let mut bi = 0
+  while bi < bounds.length() {
+    let tb = bounds[bi]
+    match subst.get(tb.param) {
+      Some(concrete_ty) =>
+        match concrete_ty {
+          TError | TNever => ()
+          TParam(other_tp) => {
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let has_bound = match env.type_bounds.get(other_tp) {
+                Some(btrs) => str_arr_contains(btrs, req_tr)
+                None => false
+              }
+              if !has_bound {
+                return false
+              }
+              ti = ti + 1
+            }
+          }
+          _ => {
+            let tname = ty_base_name(concrete_ty)
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              if !tc.impls.contains(req_tr + "::" + tname) {
+                return false
+              }
+              ti = ti + 1
+            }
+          }
+        }
+      None => return false
+    }
+    bi = bi + 1
+  }
+  true
+}
+
+///|
+/// When passing an unannotated closure (e.g. JSX `prop=>{ ... }`) to an `into`
+/// parameter of type `target_ty`, check if `target_ty` has a unique static `#into`
+/// converter taking a `TFn` of `arity` params; if so, return that expected `TFn`
+/// so `.Variant` / literal inference works inside the closure body.
+fn into_expected_fn_ty(tc : TypeChecker, target_ty : Ty, arity : Int) -> Option[Ty] {
+  let target_base = match target_ty {
+    TStruct(name, _) | TEnum(name, _) => name
+    _ => return None
+  }
+  let is_xpkg = has_qual_sep(target_base)
+  let pfx = target_base + "::"
+  let mut found : Option[Ty] = None
+  let mut count = 0
+  let mut i = 0
+  while i < tc.method_names.length() {
+    let mk = tc.method_names[i]
+    if starts_with_str(mk, pfx) {
+      let mname = slice_str(mk, pfx.length(), mk.length())
+      if !has_qual_sep(mname) {
+        match tc.methods.get(mk) {
+          Some(fi) =>
+            if fi.decl.is_into &&
+              (!is_xpkg || fi.decl.is_pub) &&
+              fi.decl.params.length() == 1 &&
+              fi.decl.params[0].name != "self" &&
+              !fi.decl.params[0].is_mut &&
+              fi.param_tys.length() == 1 {
+              match fi.param_tys[0] {
+                TFn(fptys, _) =>
+                  if fptys.length() == arity {
+                    let subst : Map[String, Ty] = Map([])
+                    unify_tparams(fi.ret_ty, target_ty, subst)
+                    if ty_compat(target_ty, subst_ty(fi.ret_ty, subst)) {
+                      let cand_fn_ty = subst_ty_mask_unbound(
+                        fi.param_tys[0],
+                        fi.decl.type_params,
+                        subst,
+                      )
+                      found = Some(cand_fn_ty)
+                      count = count + 1
+                    }
+                  }
+                _ => ()
+              }
+            }
+          None => ()
+        }
+      }
+    }
+    i = i + 1
+  }
+  if count == 1 { found } else { None }
+}
+
+///|
+struct IntoCandidate {
+  conv : IntoConv
+  display_name : String
+  finfo : Option[FnInfo]
+}
+
+///|
+struct IntoResolveResult {
+  conv : Option[IntoConv]
+  errored : Bool
+  available_hint : String
+}
+
+///|
+fn resolve_into_conversion(
+  tc : TypeChecker,
+  env : Env,
+  src_ty : Ty,
+  target_ty : Ty,
+  sp : Span,
+) -> IntoResolveResult {
+  let tier1 : Array[IntoCandidate] = []
+  let tier2 : Array[IntoCandidate] = []
+  let seen : Map[String, Bool] = Map([])
+  let avail_names : Array[String] = []
+
+  // Scope 1: Target type's defining package (`Target::*` static `#into` fns)
+  match target_ty {
+    TStruct(target_base, _) | TEnum(target_base, _) => {
+      let is_xpkg = has_qual_sep(target_base)
+      let pfx = target_base + "::"
+      let mut i = 0
+      while i < tc.method_names.length() {
+        let mk = tc.method_names[i]
+        if starts_with_str(mk, pfx) {
+          let mname = slice_str(mk, pfx.length(), mk.length())
+          if !has_qual_sep(mname) {
+            match tc.methods.get(mk) {
+              Some(fi) =>
+                if fi.decl.is_into &&
+                  (!is_xpkg || fi.decl.is_pub) &&
+                  fi.decl.params.length() == 1 &&
+                  fi.decl.params[0].name != "self" &&
+                  !fi.decl.params[0].is_mut &&
+                  fi.param_tys.length() == 1 {
+                  if avail_names.length() < 4 {
+                    avail_names.push(mk)
+                  }
+                  let subst : Map[String, Ty] = Map([])
+                  unify_tparams(fi.ret_ty, target_ty, subst)
+                  unify_tparams(fi.param_tys[0], src_ty, subst)
+                  let mut all_bound = true
+                  let mut tpi = 0
+                  while tpi < fi.decl.type_params.length() {
+                    if !subst.contains(fi.decl.type_params[tpi]) {
+                      all_bound = false
+                      break
+                    }
+                    tpi = tpi + 1
+                  }
+                  if all_bound &&
+                    ty_compat(target_ty, subst_ty(fi.ret_ty, subst)) &&
+                    ty_compat(subst_ty(fi.param_tys[0], subst), src_ty) &&
+                    into_check_type_bounds(tc, env, fi.decl.type_bounds, subst) {
+                    if !seen.contains(mk) {
+                      seen.set(mk, true)
+                      let is_bare_tparam = match fi.param_tys[0] {
+                        TParam(_) => true
+                        _ => false
+                      }
+                      let cand = IntoCandidate::{
+                        conv: IntoConv::{
+                          kind: 1,
+                          qual: target_base,
+                          name: mname,
+                          target_ty: target_ty,
+                        },
+                        display_name: mk,
+                        finfo: Some(fi),
+                      }
+                      if is_bare_tparam {
+                        tier2.push(cand)
+                      } else {
+                        tier1.push(cand)
+                      }
+                    }
+                  }
+                }
+              None => ()
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+
+  // Scope 2: Source type's defining package (`Src::*` instance `#into` methods)
+  match src_ty {
+    TStruct(src_base, _) | TEnum(src_base, _) => {
+      let is_xpkg = has_qual_sep(src_base)
+      let pfx = src_base + "::"
+      let mut i = 0
+      while i < tc.method_names.length() {
+        let mk = tc.method_names[i]
+        if starts_with_str(mk, pfx) {
+          let mname = slice_str(mk, pfx.length(), mk.length())
+          if !has_qual_sep(mname) {
+            match tc.methods.get(mk) {
+              Some(fi) =>
+                if fi.decl.is_into &&
+                  (!is_xpkg || fi.decl.is_pub) &&
+                  fi.decl.params.length() == 1 &&
+                  fi.decl.params[0].name == "self" &&
+                  !fi.decl.params[0].is_mut &&
+                  fi.param_tys.length() == 1 {
+                  let subst : Map[String, Ty] = Map([])
+                  unify_tparams(fi.param_tys[0], src_ty, subst)
+                  unify_tparams(fi.ret_ty, target_ty, subst)
+                  let mut all_bound = true
+                  let mut tpi = 0
+                  while tpi < fi.decl.type_params.length() {
+                    if !subst.contains(fi.decl.type_params[tpi]) {
+                      all_bound = false
+                      break
+                    }
+                    tpi = tpi + 1
+                  }
+                  if all_bound &&
+                    ty_compat(subst_ty(fi.param_tys[0], subst), src_ty) &&
+                    ty_compat(target_ty, subst_ty(fi.ret_ty, subst)) &&
+                    into_check_type_bounds(tc, env, fi.decl.type_bounds, subst) {
+                    if !seen.contains(mk) {
+                      seen.set(mk, true)
+                      tier1.push(IntoCandidate::{
+                        conv: IntoConv::{
+                          kind: 2,
+                          qual: "",
+                          name: mname,
+                          target_ty: target_ty,
+                        },
+                        display_name: mk,
+                        finfo: Some(fi),
+                      })
+                    }
+                  }
+                }
+              None => ()
+            }
+          }
+        }
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+
+  // Scope 3: Builtin zero-overhead table (`String -> StrView`, `Bytes -> BytesView`)
+  match src_ty {
+    TString =>
+      match target_ty {
+        TStrView =>
+          tier1.push(IntoCandidate::{
+            conv: IntoConv::{
+              kind: 0,
+              qual: "",
+              name: "as_view",
+              target_ty: TStrView,
+            },
+            display_name: "String::as_view",
+            finfo: None,
+          })
+        _ => ()
+      }
+    TBytes =>
+      match target_ty {
+        TBytesView =>
+          tier1.push(IntoCandidate::{
+            conv: IntoConv::{
+              kind: 0,
+              qual: "",
+              name: "as_view",
+              target_ty: TBytesView,
+            },
+            display_name: "Bytes::as_view",
+            finfo: None,
+          })
+        _ => ()
+      }
+    _ => ()
+  }
+
+  // Two-tier deterministic selection
+  let chosen_tier = if tier1.length() > 0 { tier1 } else { tier2 }
+  if chosen_tier.length() == 1 {
+    let c = chosen_tier[0]
+    match c.finfo {
+      Some(fi) => tc_check_verify_callee(tc, env, fi.decl, c.display_name, sp)
+      None => ()
+    }
+    return IntoResolveResult::{ conv: Some(c.conv), errored: false, available_hint: "" }
+  }
+  if chosen_tier.length() >= 2 {
+    let sb = StringBuilder()
+    let mut ci = 0
+    while ci < chosen_tier.length() {
+      if ci > 0 {
+        sb.write_string(", ")
+      }
+      sb.write_string("`")
+      sb.write_string(chosen_tier[ci].display_name)
+      sb.write_string("`")
+      ci = ci + 1
+    }
+    let cands_str = sb.to_string()
+    tc_err(
+      tc,
+      sp,
+      "E_AMBIGUOUS_INTO",
+      "ambiguous `#into` conversion from `" +
+      ty_to_string(src_ty) +
+      "` to `" +
+      ty_to_string(target_ty) +
+      "`: conflicting candidates " +
+      cands_str,
+      "single `#into` converter",
+      cands_str,
+      "call one of " + cands_str + " explicitly",
+    )
+    return IntoResolveResult::{ conv: None, errored: true, available_hint: "" }
+  }
+  let hint = if avail_names.length() > 0 {
+    let sb = StringBuilder()
+    sb.write_string("; available `#into` converters: ")
+    let mut ai = 0
+    while ai < avail_names.length() {
+      if ai > 0 {
+        sb.write_string(", ")
+      }
+      sb.write_string("`")
+      sb.write_string(avail_names[ai])
+      sb.write_string("`")
+      ai = ai + 1
+    }
+    sb.to_string()
+  } else {
+    ""
+  }
+  IntoResolveResult::{ conv: None, errored: false, available_hint: hint }
+}
+
+///|
+fn into_adjust_arg_expected(
+  tc : TypeChecker,
+  arg : Expr,
+  exp_p : Option[Ty],
+  is_into : Bool,
+) -> Option[Ty] {
+  if !is_into {
+    return exp_p
+  }
+  match arg {
+    EClosure(cparams, TyMissing(_), _, _) =>
+      match exp_p {
+        Some(TFn(_, _)) => exp_p
+        Some(target_ty) =>
+          match into_expected_fn_ty(tc, target_ty, cparams.length()) {
+            Some(ft) => Some(ft)
+            None => exp_p
+          }
+        None => None
+      }
+    _ => exp_p
+  }
 }
 
 ///|
@@ -6554,6 +7197,8 @@ fn check_fn_call(
   let mut resolved_args = args
   let mut missing_flags : Array[Bool] = []
   let mut default_flags : Array[Bool] = []
+  let mut raw_indices : Array[Int] = []
+  let mut opt_wrapped_flags : Array[Bool] = []
   if use_named {
     let res = resolve_call_args_impl(
       Some(tc),
@@ -6566,6 +7211,8 @@ fn check_fn_call(
     resolved_args = res.args
     missing_flags = res.missing
     default_flags = res.from_default
+    raw_indices = res.raw_idx
+    opt_wrapped_flags = res.opt_wrapped
   } else if args.length() != finfo.param_tys.length() {
     tc_err(
       tc,
@@ -6589,38 +7236,108 @@ fn check_fn_call(
       i = i + 1
       continue
     }
+    let is_def = i < default_flags.length() && default_flags[i]
+    let p_is_into = !is_def && param_is_into_at(finfo.decl.params, i)
+    let raw_i = if use_named {
+      if i < raw_indices.length() { raw_indices[i] } else { -1 }
+    } else {
+      i
+    }
+    let is_opt_wrap = use_named && i < opt_wrapped_flags.length() && opt_wrapped_flags[i]
     let exp_p : Option[Ty] = if i < finfo.param_tys.length() {
       Some(subst_ty_mask_unbound(finfo.param_tys[i], finfo.decl.type_params, subst))
     } else {
       None
     }
     let saved_in_def = env.in_default_arg
-    if i < default_flags.length() && default_flags[i] {
+    if is_def {
       env.in_default_arg = true
     }
-    let aty = check_call_arg(
-      tc,
-      env,
-      param_at(finfo.decl.params, i),
-      resolved_args[i],
-      exp_p,
-      finfo.decl.name,
-    )
-    env.in_default_arg = saved_in_def
-    if i < finfo.param_tys.length() {
-      unify_tparams(finfo.param_tys[i], aty, subst)
-      let pty = subst_ty(finfo.param_tys[i], subst)
-      if !ty_compat(pty, aty) ||
-        (param_is_mut_at(finfo.decl.params, i) && !ty_compat(aty, pty)) {
-        tc_err(
-          tc,
-          expr_span(resolved_args[i]),
-          "E_TYPE_MISMATCH",
-          "argument " + (i + 1).to_string() + " type mismatch in call to `" + finfo.decl.name + "`",
-          ty_to_string(pty),
-          ty_to_string(aty),
-          "pass a value of type `" + ty_to_string(pty) + "`",
-        )
+    let mut handled_opt_into = false
+    if p_is_into && is_opt_wrap && raw_i >= 0 {
+      match resolved_args[i] {
+        ECall(_, some_args, _) =>
+          if some_args.length() == 1 {
+            match exp_p {
+              Some(TOption(inner_target)) => {
+                handled_opt_into = true
+                let inner_arg = some_args[0]
+                let inner_exp = into_adjust_arg_expected(tc, inner_arg, Some(inner_target), true)
+                let inner_aty = check_expr(tc, env, inner_arg, inner_exp)
+                env.in_default_arg = saved_in_def
+                if !ty_compat(inner_target, inner_aty) {
+                  let ir = resolve_into_conversion(tc, env, inner_aty, inner_target, expr_span(inner_arg))
+                  match ir.conv {
+                    Some(conv) =>
+                      tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
+                    None =>
+                      if !ir.errored {
+                        tc_err(
+                          tc,
+                          expr_span(inner_arg),
+                          "E_TYPE_MISMATCH",
+                          "argument " + (i + 1).to_string() + " type mismatch in call to `" + finfo.decl.name + "`",
+                          ty_to_string(inner_target),
+                          ty_to_string(inner_aty),
+                          "pass a value of type `" + ty_to_string(inner_target) + "`" + ir.available_hint,
+                        )
+                      }
+                  }
+                }
+                if i < finfo.param_tys.length() {
+                  unify_tparams(finfo.param_tys[i], TOption(inner_target), subst)
+                }
+              }
+              _ => ()
+            }
+          }
+        _ => ()
+      }
+    }
+    if !handled_opt_into {
+      let arg_exp = into_adjust_arg_expected(tc, resolved_args[i], exp_p, p_is_into)
+      let aty = check_call_arg(
+        tc,
+        env,
+        param_at(finfo.decl.params, i),
+        resolved_args[i],
+        arg_exp,
+        finfo.decl.name,
+      )
+      env.in_default_arg = saved_in_def
+      if i < finfo.param_tys.length() {
+        let mut eff_aty = aty
+        let pre_pty = subst_ty(finfo.param_tys[i], subst)
+        let mut into_errored = false
+        let mut into_hint = ""
+        if p_is_into && raw_i >= 0 && !ty_compat(pre_pty, aty) && !ty_has_unresolved(pre_pty) {
+          let ir = resolve_into_conversion(tc, env, aty, pre_pty, expr_span(resolved_args[i]))
+          match ir.conv {
+            Some(conv) => {
+              tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
+              eff_aty = pre_pty
+            }
+            None => {
+              into_errored = ir.errored
+              into_hint = ir.available_hint
+            }
+          }
+        }
+        unify_tparams(finfo.param_tys[i], eff_aty, subst)
+        let pty = subst_ty(finfo.param_tys[i], subst)
+        if !into_errored &&
+          (!ty_compat(pty, eff_aty) ||
+          (param_is_mut_at(finfo.decl.params, i) && !ty_compat(eff_aty, pty))) {
+          tc_err(
+            tc,
+            expr_span(resolved_args[i]),
+            "E_TYPE_MISMATCH",
+            "argument " + (i + 1).to_string() + " type mismatch in call to `" + finfo.decl.name + "`",
+            ty_to_string(pty),
+            ty_to_string(eff_aty),
+            "pass a value of type `" + ty_to_string(pty) + "`" + into_hint,
+          )
+        }
       }
     }
     i = i + 1
@@ -8024,6 +8741,8 @@ fn check_method_call(
           let mut resolved_args = args
           let mut missing_flags : Array[Bool] = []
           let mut default_flags : Array[Bool] = []
+          let mut raw_indices : Array[Int] = []
+          let mut opt_wrapped_flags : Array[Bool] = []
           if use_named {
             let res = resolve_call_args_impl(
               Some(tc),
@@ -8036,6 +8755,8 @@ fn check_method_call(
             resolved_args = res.args
             missing_flags = res.missing
             default_flags = res.from_default
+            raw_indices = res.raw_idx
+            opt_wrapped_flags = res.opt_wrapped
           }
           let mut i = 0
           while i < resolved_args.length() {
@@ -8044,38 +8765,108 @@ fn check_method_call(
               continue
             }
             let p_idx = i + 1
+            let is_def = i < default_flags.length() && default_flags[i]
+            let p_is_into = !is_def && param_is_into_at(minfo.decl.params, p_idx)
+            let raw_i = if use_named {
+              if i < raw_indices.length() { raw_indices[i] } else { -1 }
+            } else {
+              i
+            }
+            let is_opt_wrap = use_named && i < opt_wrapped_flags.length() && opt_wrapped_flags[i]
             let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
               Some(subst_ty_mask_unbound(minfo.param_tys[p_idx], minfo.decl.type_params, subst))
             } else {
               None
             }
             let saved_in_def = env.in_default_arg
-            if i < default_flags.length() && default_flags[i] {
+            if is_def {
               env.in_default_arg = true
             }
-            let aty = check_call_arg(
-              tc,
-              env,
-              param_at(minfo.decl.params, p_idx),
-              resolved_args[i],
-              exp_p,
-              key,
-            )
-            env.in_default_arg = saved_in_def
-            if p_idx < minfo.param_tys.length() {
-              unify_tparams(minfo.param_tys[p_idx], aty, subst)
-              let pty = subst_ty(minfo.param_tys[p_idx], subst)
-              if !ty_compat(pty, aty) ||
-                (param_is_mut_at(minfo.decl.params, p_idx) && !ty_compat(aty, pty)) {
-                tc_err(
-                  tc,
-                  expr_span(resolved_args[i]),
-                  "E_TYPE_MISMATCH",
-                  "argument type mismatch in method `" + key + "`",
-                  ty_to_string(pty),
-                  ty_to_string(aty),
-                  "pass a value of type `" + ty_to_string(pty) + "`",
-                )
+            let mut handled_opt_into = false
+            if p_is_into && is_opt_wrap && raw_i >= 0 {
+              match resolved_args[i] {
+                ECall(_, some_args, _) =>
+                  if some_args.length() == 1 {
+                    match exp_p {
+                      Some(TOption(inner_target)) => {
+                        handled_opt_into = true
+                        let inner_arg = some_args[0]
+                        let inner_exp = into_adjust_arg_expected(tc, inner_arg, Some(inner_target), true)
+                        let inner_aty = check_expr(tc, env, inner_arg, inner_exp)
+                        env.in_default_arg = saved_in_def
+                        if !ty_compat(inner_target, inner_aty) {
+                          let ir = resolve_into_conversion(tc, env, inner_aty, inner_target, expr_span(inner_arg))
+                          match ir.conv {
+                            Some(conv) =>
+                              tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
+                            None =>
+                              if !ir.errored {
+                                tc_err(
+                                  tc,
+                                  expr_span(inner_arg),
+                                  "E_TYPE_MISMATCH",
+                                  "argument type mismatch in method `" + key + "`",
+                                  ty_to_string(inner_target),
+                                  ty_to_string(inner_aty),
+                                  "pass a value of type `" + ty_to_string(inner_target) + "`" + ir.available_hint,
+                                )
+                              }
+                          }
+                        }
+                        if p_idx < minfo.param_tys.length() {
+                          unify_tparams(minfo.param_tys[p_idx], TOption(inner_target), subst)
+                        }
+                      }
+                      _ => ()
+                    }
+                  }
+                _ => ()
+              }
+            }
+            if !handled_opt_into {
+              let arg_exp = into_adjust_arg_expected(tc, resolved_args[i], exp_p, p_is_into)
+              let aty = check_call_arg(
+                tc,
+                env,
+                param_at(minfo.decl.params, p_idx),
+                resolved_args[i],
+                arg_exp,
+                key,
+              )
+              env.in_default_arg = saved_in_def
+              if p_idx < minfo.param_tys.length() {
+                let mut eff_aty = aty
+                let pre_pty = subst_ty(minfo.param_tys[p_idx], subst)
+                let mut into_errored = false
+                let mut into_hint = ""
+                if p_is_into && raw_i >= 0 && !ty_compat(pre_pty, aty) && !ty_has_unresolved(pre_pty) {
+                  let ir = resolve_into_conversion(tc, env, aty, pre_pty, expr_span(resolved_args[i]))
+                  match ir.conv {
+                    Some(conv) => {
+                      tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
+                      eff_aty = pre_pty
+                    }
+                    None => {
+                      into_errored = ir.errored
+                      into_hint = ir.available_hint
+                    }
+                  }
+                }
+                unify_tparams(minfo.param_tys[p_idx], eff_aty, subst)
+                let pty = subst_ty(minfo.param_tys[p_idx], subst)
+                if !into_errored &&
+                  (!ty_compat(pty, eff_aty) ||
+                  (param_is_mut_at(minfo.decl.params, p_idx) && !ty_compat(eff_aty, pty))) {
+                  tc_err(
+                    tc,
+                    expr_span(resolved_args[i]),
+                    "E_TYPE_MISMATCH",
+                    "argument type mismatch in method `" + key + "`",
+                    ty_to_string(pty),
+                    ty_to_string(eff_aty),
+                    "pass a value of type `" + ty_to_string(pty) + "`" + into_hint,
+                  )
+                }
               }
             }
             i = i + 1
@@ -11088,19 +11879,26 @@ fn check_expr_inner(
           match env.ret_ty {
             TResult(_, fn_err_ty) => {
               if !ty_compat(fn_err_ty, err_ty) {
-                tc_err(
-                  tc,
-                  sp,
-                  "E_TYPE_MISMATCH",
-                  "`?` error type `" +
-                  ty_to_string(err_ty) +
-                  "` does not match enclosing function error type `" +
-                  ty_to_string(fn_err_ty) +
-                  "`",
-                  ty_to_string(fn_err_ty),
-                  ty_to_string(err_ty),
-                  "return a matching error type `" + ty_to_string(fn_err_ty) + "`",
-                )
+                let ir = resolve_into_conversion(tc, env, err_ty, fn_err_ty, sp)
+                match ir.conv {
+                  Some(conv) => tc.try_into_convs.set(span_key(sp), conv)
+                  None =>
+                    if !ir.errored {
+                      tc_err(
+                        tc,
+                        sp,
+                        "E_TYPE_MISMATCH",
+                        "`?` error type `" +
+                        ty_to_string(err_ty) +
+                        "` does not match enclosing function error type `" +
+                        ty_to_string(fn_err_ty) +
+                        "`",
+                        ty_to_string(fn_err_ty),
+                        ty_to_string(err_ty),
+                        "return a matching error type `" + ty_to_string(fn_err_ty) + "`" + ir.available_hint,
+                      )
+                    }
+                }
               }
               ok_ty
             }
@@ -11235,6 +12033,8 @@ pub fn check_package_with_imports(
     call_type_args: Map([]),
     call_arg_order: Map([]),
     mut_recv_calls: Map([]),
+    call_into_convs: Map([]),
+    try_into_convs: Map([]),
   }
 
   let mut ipi = 0
@@ -11408,6 +12208,7 @@ pub fn check_package_with_imports(
             _ => resolve_type_expr(tc, fd.ret_ty, fd.type_params)
           }
           let finfo = FnInfo::{ decl: fd, param_tys: ptys, ret_ty: rty }
+          validate_into_fn_decl(tc, fd, finfo)
           let mut bi = 0
           while bi < fd.type_bounds.length() {
             let tb = fd.type_bounds[bi]
@@ -11690,6 +12491,22 @@ pub fn check_package_with_imports(
     while di < f.decls.length() {
       match f.decls[di] {
         DImpl(id) => {
+          let mut imi = 0
+          while imi < id.methods.length() {
+            let imd = id.methods[imi]
+            if imd.is_into {
+              tc_err(
+                tc,
+                imd.span,
+                "E_INVALID_INTO",
+                "`#into` cannot be used on trait `impl` method `" + id.trait_name + "::" + imd.name + "`",
+                "inherent `Target::from_...` or `Src::to_...`",
+                "`#into` on trait `impl` method",
+                "move the `#into` converter to an inherent function/method on the target or source type",
+              )
+            }
+            imi = imi + 1
+          }
           let c_trait = canon_trait_name(tc, id.trait_name)
           let c_target = canon_target_type_name(tc, id.target_type)
           let target_ty = resolve_type_expr(

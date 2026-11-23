@@ -124,14 +124,18 @@ import "pkg_name" [as alias]
   Variant1(Type1, Type2)
 }
 
-[pub] fn name[T1](p1 : Type1, w~ : Type2 = default_expr, opt? : Type3) -> RetType {
+[pub] fn name[T1](p1 : Type1, w~ : Type2 = default_expr, opt? : Type3, into s : StrView) -> RetType {
   ...
 }
-// Named & optional default parameters (zero-ABI-overhead, resolved at call sites):
+// Named, optional default & `into` parameters (zero-ABI-overhead, resolved at call sites):
 // - `w~ : T` or `w~ : T = def` (labeled parameter, optional default)
 // - `opt? : T` (optional parameter, bound as `Option[T]` inside body, defaults to `None`)
 // - `p : T = def` (positional parameter with default, also passable by name)
-// - Call sites: `f(w=10.0)` / `f(w~)` (punned) / `f(opt=val)` (auto-wrapped in `Some`) / `f(opt?=opt_val)` (Option forwarding) / `x |> f(w=10.0)`
+// - `into p : T` / `into w~ : T = def` / `into opt? : T` (contextual keyword: opt-in single-hop `#into` conversion at call sites; cannot combine with `mut`, forbidden on `extern "C" fn` and closures)
+// - Call sites: `f(w=10.0)` / `f(w~)` (punned) / `f(opt=val)` (auto-wrapped in `Some`, converting `val` first when `into opt?`) / `f(opt?=opt_val)` (Option forwarding) / `x |> f(w=10.0)`
+
+#into [pub] fn Target::from_xxx[T...](v : Src) -> Target { ... }
+#into [pub] fn Src::to_xxx[T...](self : Src) -> Target { ... }
 
 [pub] fn TypeName::method(self : TypeName, p1 : Type1) -> RetType {
   ...
@@ -183,7 +187,7 @@ test "test name" {
   - `guard cond else { diverge_block }` and `guard expr is Pattern else { diverge_block }` (early exit on mismatch; binds pattern variables into the enclosing block for subsequent statements)
   - `while cond { ... }` (including `while expr is Pattern { ... }`)
   - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` / `for i in start..<end { ... }` (half-open `[start, end)`), `for i in start..=end { ... }` (closed `[start, end]`, overflow-safe), `for x in arr { ... }` and `for i, x in arr { ... }` (`Array[T]` and `FixedArray[T]`)
-  - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E]`) and `Option[T]` (enclosing function returns `Option[_]`)
+  - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E2]`, applying a single-hop `#into` conversion when `E != E2`) and `Option[T]` (enclosing function returns `Option[_]`)
   - `match scrutinee { Pat [if guard_cond] => expr, ... }` (exhaustive checking required on `enum`, `Bool`, `Option`, `Result`; wildcard `_` allowed; guarded arms do not satisfy exhaustiveness on their own, and failed guards release arm pattern bindings and fall through to subsequent arms)
   - `return [expr]`, `break`, `continue`
 - Closures: `fn(x : T) -> R { ... }` (captures immutable variables by value / biased RC; outer `let mut` variables captured by a local non-`spawn` closure are automatically promoted to a shared 1-slot RC heap cell so outer and inner scopes—including nested closures—share live reads and writes with zero manual boxing, while uncaptured `let mut` variables remain zero-overhead stack locals. Inside `spawn(...)`, capturing any outer `let mut` variable—directly or via a nested closure—remains a compile-time error `E_NOT_SEND`, and only `Send` or `move` captures are allowed.)
@@ -224,7 +228,17 @@ test "test name" {
 - Equality: `==` / `!=` compare by value and are defined only on `Int`, `Int64`, `UInt`, `UInt64`, `Double`, `Float`, `Bool`, `Byte`, `Char`, `String` (content), `Ptr` (address), `Unit`, generic `T` (checked at every instantiation: a type parameter compared with `==`/`!=` in a generic body, directly or through generic callers, must be instantiated with one of these types, else `E_TYPE_MISMATCH` at the call site; such generics are monomorphized so `String` compares bytes and payload-less enums compare tags), `#derive(Eq)` structs/enums, and payload-less `enum`s (every variant has no fields; compared by variant tag, also across packages). On `Option`, `Result`, non-`#derive(Eq)` `struct`, `Array`, `FixedArray`, `Map`, `Bytes`, tuples and non-`#derive(Eq)` payload-carrying `enum`s they are a compile-time error (`E_TYPE_MISMATCH`, "operator `==` is not supported on `<Ty>` (no implicit pointer-identity comparison)", fix-it "use `match` to inspect `<Ty>` values") — there is no implicit pointer-identity comparison.
 - Must-use `Result` & `-> Unit` implicit tail discard: when a function, closure, block, `if`, or `match` arm expects `Unit`, a non-`Result` tail expression is implicitly discarded (with RC release for heap values) so builder chains and side-effect calls do not require `let _ = ...`. An expression statement whose type is `Result[T, E]` and whose value is discarded — any non-tail statement of a block, or the tail statement of a `-> Unit` body, loop, or `test` body — is still a compile-time error (`E_UNHANDLED_RESULT`, fix-it "handle the Result with `match`, `?`, or explicitly discard with `let _ = ...`"). `let _ = expr` discards explicitly; a block's tail value returned to a non-`Unit` function or branch is not discarded.
 
-### 3.4 Second-Class `mut` Parameters & `#verify`
+### 3.4 Second-Class `mut` Parameters, `#into` Call-Site Conversions & `#verify`
+
+**Opt-in single-hop `#into` conversions (`into` parameters & `?`).**
+- **Contextual `into` parameter modifier**: `into p : T`, `into w~ : T = def`, and `into opt? : T` opt that parameter into single-hop call-site conversion. `into` is a contextual keyword only in parameter position (`let into = 42` and `fn f(into : Int)` remain valid). Combining `into` with `mut` (`into mut` / `mut into`) or using `into` on `extern "C" fn` or closure parameters is `E_PARSE`. Callees keep concrete non-generic ABIs (zero monomorphization bloat); function pointer types `(Target) -> R` and `dyn Trait` are unaffected.
+- **`#into` / `#[into]` converters**: placed on an inherent static function on the target type (`#into [pub] fn Target::from_xxx[T...](v : Src) -> Target`) or an inherent instance method on the source type (`#into [pub] fn Src::to_xxx[T...](self : Src) -> Target`). Violations report `E_INVALID_INTO`: must be defined on a local `struct`/`enum` (not a free `fn` or `impl` method), must take exactly 1 plain positional non-`mut` non-`World` parameter, and must either have `self : Src` (instance method) or return `Target` / `Target[...]` (static function). `#into` and `into` propagate across packages via `.pionsig v1` and `.pionstub`.
+- **Strict 3-source lookup scope** (never scans unrelated imported packages):
+  1. Target type `Target`'s defining package (`Target::*` static `#into` functions; cross-package requires `pub`);
+  2. Source type `Src`'s defining package (`Src::*` instance `#into` methods; cross-package requires `pub`);
+  3. Compiler built-in zero-overhead table: `String -> StrView` (`.as_view()`) and `Bytes -> BytesView` (`.as_view()`).
+- **Trigger sites, strict 1-hop & two-tier deterministic priority**: triggers only when `Src != Target` (`Src == Target` passes through with zero conversion) at (1) direct function/method/Pion-JSX calls on parameters marked `into` (including `into opt? : Target` called as `opt=src`, which converts `src` to `Target` before wrapping in `Some(...)`), and (2) `expr?` (`ETry`) on `Result[A, E1]` inside a function returning `Result[B, E2]`. Never chains `A -> B -> C`. Matching candidates are partitioned into **Tier 1** (source parameter type is not a bare type parameter `T`, plus built-ins and `self` methods) and **Tier 2** (source parameter type is a bare type parameter `T`, e.g. `Live::of_value[T](v : T) -> Live[T]`). A unique Tier 1 match wins over Tier 2; if Tier 1 is empty, a unique Tier 2 match is chosen; `>= 2` matches in the winning tier report `E_AMBIGUOUS_INTO` listing all conflicting candidates; 0 matches report `E_TYPE_MISMATCH`.
+- **Pion-JSX synergy**: `prop=>{ expr }` remains lexically explicit (`prop=fn() { expr }`); when passed to an `into` parameter (e.g. `into text~ : Live[String] = .Is("")`), unannotated closures infer their return type (using a unique `#into` `TFn` target hint when available) and match `#into` converters such as `Live::of_fn`.
 
 **`mut` parameters (all code).** A parameter written `mut p : T` (top-level `fn`s, methods, trait methods and `impl` methods; `mut self` included) is an in-out parameter:
 - It must be a plain positional parameter: `mut p~`, `mut p?`, `mut p : T = d`, `mut` on `extern "C" fn` parameters and on closure parameters are `E_PARSE`.
