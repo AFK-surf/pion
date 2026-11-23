@@ -79,6 +79,24 @@ pub fn main(world : World) -> Int {
   // sum = 172 + 667 + 46 + 28 = 913
   debug_assert(sum == 913, "bce sum mismatch: " + sum.to_string())
 
+  // 3b. R3-A TByte 8-bit unsigned wrapping (+, -, +=, -=) + safe Bytes::new(256) indexing
+  let bp = (255).to_byte()
+  let bq = (1).to_byte()
+  let b_wrap_add = bp + bq
+  let b_wrap_sub = (0).to_byte() - (1).to_byte()
+  debug_assert(b_wrap_add.to_int() == 0, "byte add wrap: " + b_wrap_add.to_int().to_string())
+  debug_assert(b_wrap_sub.to_int() == 255, "byte sub wrap: " + b_wrap_sub.to_int().to_string())
+  let mut bc = (255).to_byte()
+  bc += (1).to_byte()
+  debug_assert(bc.to_int() == 0, "byte += wrap: " + bc.to_int().to_string())
+  bc -= (1).to_byte()
+  debug_assert(bc.to_int() == 255, "byte -= wrap: " + bc.to_int().to_string())
+  let btab = Bytes::new(256)
+  btab[b_wrap_add.to_int()] = (11).to_byte()
+  btab[b_wrap_sub.to_int()] = (22).to_byte()
+  btab[bc.to_int()] = (33).to_byte()
+  debug_assert(btab[0].to_int() == 11 && btab[255].to_int() == 33, "byte wrap index")
+
   io_println(world, "p85 ok sum=" + sum.to_string() + " mmap_slice=" + mmap_slice_ok.to_string())
   0
 }
@@ -256,6 +274,88 @@ set -e
 echo "p85 shadow_bfp_ro rc=$SB_RC -> $SB_ERR"
 test "$SB_RC" -ne 0
 printf '%s' "$SB_ERR" | grep -q "cannot mutate read-only mmap Bytes"
+
+# Negative trap 8 (R3-A P1-2a): extern "C" fn bytes_from_ptr wrapping mmap_ro -> must trap RO
+cat <<EOF > "$TMP_DIR/p85_extern_bfp_ro.pion"
+extern "C" fn bytes_from_ptr(b : Bytes, n : Int) -> Bytes {
+  let _ = n
+  b
+}
+pub fn main(world : World) -> Int {
+  let _ = world
+  match fs_mmap_ro("$TMP_DIR/ro.bin") {
+    Ok(mb) => {
+      let out = bytes_from_ptr(mb, 8)
+      out[0] = b'Z'
+    }
+    Err(e) => panic("unexpected mmap err: " + e)
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_extern_bfp_ro" "$TMP_DIR/p85_extern_bfp_ro.pion"
+set +e
+EB_ERR=$("$TMP_DIR/p85_extern_bfp_ro" 2>&1)
+EB_RC=$?
+set -e
+echo "p85 extern_bfp_ro rc=$EB_RC -> $EB_ERR"
+test "$EB_RC" -ne 0
+printf '%s' "$EB_ERR" | grep -q "cannot mutate read-only mmap Bytes"
+
+# Negative trap 9 (R3-A P1-2b): `let src = src.slice(0, 1)` where outer `src : Wrapper` returns mmap_ro -> must trap RO
+cat <<EOF > "$TMP_DIR/p85_shadow_slice_ro.pion"
+struct Wrapper {
+  b : Bytes
+}
+fn Wrapper::slice(self : Wrapper, i : Int, j : Int) -> Bytes {
+  let _ = i
+  let _ = j
+  self.b
+}
+pub fn main(world : World) -> Int {
+  let _ = world
+  match fs_mmap_ro("$TMP_DIR/ro.bin") {
+    Ok(mb) => {
+      let src = Wrapper::{ b: mb }
+      let src = src.slice(0, 1)
+      src[0] = (1).to_byte()
+    }
+    Err(e) => panic("unexpected mmap err: " + e)
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_shadow_slice_ro" "$TMP_DIR/p85_shadow_slice_ro.pion"
+set +e
+SS_ERR=$("$TMP_DIR/p85_shadow_slice_ro" 2>&1)
+SS_RC=$?
+set -e
+echo "p85 shadow_slice_ro rc=$SS_RC -> $SS_ERR"
+test "$SS_RC" -ne 0
+printf '%s' "$SS_ERR" | grep -q "cannot mutate read-only mmap Bytes"
+
+# Negative trap 10 (R3-A P1-3): `if a.length() >= 8 && opt is Some(a)` shadows outer `a` -> must trap OOB
+cat <<'EOF' > "$TMP_DIR/p85_is_shadow_oob.pion"
+pub fn main(world : World) -> Int {
+  let a : FixedArray[Int] = FixedArray::make(8, 1)
+  let small : FixedArray[Int] = FixedArray::make(1, 2)
+  let opt : Option[FixedArray[Int]] = Some(small)
+  let x = 7
+  if a.length() >= 8 && opt is Some(a) {
+    let v = a[x & 7]
+    io_println(world, v.to_string())
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_is_shadow_oob" "$TMP_DIR/p85_is_shadow_oob.pion"
+set +e
+IS_ERR=$("$TMP_DIR/p85_is_shadow_oob" 2>&1)
+IS_RC=$?
+set -e
+echo "p85 is_shadow_oob rc=$IS_RC -> $IS_ERR"
+test "$IS_RC" -ne 0
+printf '%s' "$IS_ERR" | grep -q "out of bounds"
 
 # Wasm32 Node + Web parity
 if command -v node >/dev/null 2>&1; then
