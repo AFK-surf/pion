@@ -235,6 +235,37 @@ fn regression_scmn_shadow(tag : Int) -> Int {
   v1 * 1000 + v2
 }
 
+// Regression 5 (Astra P1-5): shadowing unit variant ctor name inside POD enum SROA branch
+fn regression_shadow_ctor(flag : Bool) -> Int {
+  let e : BindEnum = if flag {
+    let Empty = BindEnum::Val(7)
+    Empty
+  } else {
+    BindEnum::Empty
+  }
+  match e {
+    BindEnum::Val(v) => v
+    BindEnum::Empty => -1
+  }
+}
+
+fn mk_shadow_ctor_res(flag : Bool) -> Result[BindEnum, String] {
+  Ok(if flag {
+    let Empty = BindEnum::Val(7)
+    Empty
+  } else {
+    BindEnum::Empty
+  })
+}
+
+fn regression_shadow_ctor_nested(flag : Bool) -> Int {
+  match mk_shadow_ctor_res(flag) {
+    Ok(BindEnum::Val(v)) => v
+    Ok(BindEnum::Empty) => -1
+    Err(_) => -99
+  }
+}
+
 pub fn main(world : World) -> Int {
   let mut acc = 0
   let mut err_cnt = 0
@@ -257,6 +288,10 @@ pub fn main(world : World) -> Int {
   let r_tco = countdown(200000, 0)
   let r_is = regression_is_bind()
   let r_sh = regression_scmn_shadow(1)
+  let r_sc1 = regression_shadow_ctor(true)
+  let r_sc2 = regression_shadow_ctor(false)
+  let r_sc3 = regression_shadow_ctor_nested(true)
+  let r_sc4 = regression_shadow_ctor_nested(false)
   if r_cls != 51 {
     io_println(world, "FAIL r_cls=" + r_cls.to_string())
     return 1
@@ -273,7 +308,11 @@ pub fn main(world : World) -> Int {
     io_println(world, "FAIL r_sh=" + r_sh.to_string())
     return 1
   }
-  io_println(world, "p85 ok acc=" + acc.to_string() + " err=" + err_cnt.to_string() + " r2=" + r_cls.to_string() + "/" + r_tco.to_string() + "/" + r_is.to_string() + "/" + r_sh.to_string())
+  if r_sc1 != 7 || r_sc2 != -1 || r_sc3 != 7 || r_sc4 != -1 {
+    io_println(world, "FAIL r_sc=" + r_sc1.to_string() + "/" + r_sc2.to_string() + "/" + r_sc3.to_string() + "/" + r_sc4.to_string())
+    return 1
+  }
+  io_println(world, "p85 ok acc=" + acc.to_string() + " err=" + err_cnt.to_string() + " r2=" + r_cls.to_string() + "/" + r_tco.to_string() + "/" + r_is.to_string() + "/" + r_sh.to_string() + "/" + r_sc1.to_string() + "/" + r_sc2.to_string() + "/" + r_sc3.to_string() + "/" + r_sc4.to_string())
   0
 }
 PION
@@ -341,4 +380,170 @@ if command -v node >/dev/null 2>&1; then
   fi
 fi
 
-echo "PASS: p85_enum_sroa (Native rel+dev + SSA 0 alloc + ASan/LSan + Wasm32)"
+# Astra P2-3: Guard-page negative control (mmap + mprotect PROT_NONE) + SSA structural check
+# Proves qbe_emit_copy_pod_enum_slots never reads +8/+16 past an 8-byte unit variant.
+cat > "$TMP_DIR/guard_helper.c" <<'CEOF'
+#define _DEFAULT_SOURCE
+#include <stdint.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#ifndef MAP_ANON
+#define MAP_ANON MAP_ANONYMOUS
+#endif
+
+typedef struct {
+    uint32_t owner_tid;
+    uint32_t local_rc;
+    uint32_t shared_rc;
+    uint16_t type_tag;
+    uint16_t flags;
+    void *drop_fn;
+} GuardPionHeader;
+
+static void *g_guard_base = NULL;
+static size_t g_guard_size = 0;
+static void *g_saved_slot = NULL;
+
+void p85_install_guarded_incomplete(void *arr_data) {
+    long pg_l = sysconf(_SC_PAGESIZE);
+    size_t pg = (pg_l > 0) ? (size_t)pg_l : 4096u;
+    void *base = mmap(NULL, 2u * pg, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
+    if (base == MAP_FAILED) abort();
+    if (mprotect((char *)base + pg, pg, PROT_NONE) != 0) abort();
+    g_guard_base = base;
+    g_guard_size = 2u * pg;
+    GuardPionHeader *hdr = (GuardPionHeader *)((char *)base + pg - 32u);
+    hdr->owner_tid = 0u;
+    hdr->local_rc = 0u;
+    hdr->shared_rc = 1u;
+    hdr->type_tag = 5u;   /* PION_TAG_ENUM */
+    hdr->flags = 11u;     /* FROZEN | IMMORTAL | DEEP_FROZEN */
+    hdr->drop_fn = NULL;
+    int64_t *payload = (int64_t *)((char *)base + pg - 8u);
+    *payload = 0;         /* DecodeStatus::Incomplete tag = 0 */
+    void **slots = (void **)arr_data;
+    g_saved_slot = slots[0];
+    slots[0] = (void *)payload;
+}
+
+void p85_free_guarded_incomplete(void *arr_data) {
+    if (arr_data && g_saved_slot) {
+        ((void **)arr_data)[0] = g_saved_slot;
+        g_saved_slot = NULL;
+    }
+    if (g_guard_base) {
+        munmap(g_guard_base, g_guard_size);
+        g_guard_base = NULL;
+        g_guard_size = 0;
+    }
+}
+CEOF
+
+cat > "$TMP_DIR/p85_guard.pion" <<'PION'
+pub enum DecodeStatus {
+  Incomplete
+  Complete(Bool, Int)
+  TagOnly(Int64)
+}
+
+extern "C" fn p85_install_guarded_incomplete(arr_data : Ptr) -> Unit
+extern "C" fn p85_free_guarded_incomplete(arr_data : Ptr) -> Unit
+
+fn trigger_guarded_sroa_copy(arr : Array[DecodeStatus], flag : Bool) -> Int {
+  let e : DecodeStatus = if flag {
+    let Incomplete = arr[0]
+    Incomplete
+  } else {
+    DecodeStatus::Complete(true, 9)
+  }
+  match e {
+    DecodeStatus::Incomplete => 42
+    DecodeStatus::Complete(ok, n) => if ok { n } else { -n }
+    DecodeStatus::TagOnly(v) => v.to_int()
+  }
+}
+
+pub fn main(world : World) -> Int {
+  let arr : Array[DecodeStatus] = [DecodeStatus::Incomplete]
+  p85_install_guarded_incomplete(array_data_ptr(arr))
+  let r1 = trigger_guarded_sroa_copy(arr, true)
+  let r2 = trigger_guarded_sroa_copy(arr, false)
+  p85_free_guarded_incomplete(array_data_ptr(arr))
+  if r1 != 42 || r2 != 9 {
+    io_println(world, "FAIL guard r1=" + r1.to_string() + " r2=" + r2.to_string())
+    return 1
+  }
+  io_println(world, "p85 guard ok r1=42 r2=9")
+  0
+}
+PION
+
+"$CC_BIN" -std=c11 -O2 -Wall -Wextra -Werror -c "$TMP_DIR/guard_helper.c" -o "$TMP_DIR/guard_helper.o"
+printf '#!/bin/sh\nexec %s "$@" %s\n' "$CC_BIN" "$TMP_DIR/guard_helper.o" > "$TMP_DIR/cc-guard"
+chmod +x "$TMP_DIR/cc-guard"
+CC="$TMP_DIR/cc-guard" PION_CACHE_DIR="$TMP_DIR/cas_guard" \
+  "$PIONC" build --release --emit-ssa "$TMP_DIR/p85_guard.ssa" -o "$TMP_DIR/p85_guard" "$TMP_DIR/p85_guard.pion"
+GUARD_OUT="$("$TMP_DIR/p85_guard")"
+echo "p85 guard-page -> $GUARD_OUT"
+if [ "$GUARD_OUT" != "p85 guard ok r1=42 r2=9" ]; then
+  echo "FAIL: p85 guard-page output mismatch: '$GUARD_OUT'" >&2
+  exit 1
+fi
+
+# SSA structural negative control: in trigger_guarded_sroa_copy, payload +8/+16 loads from
+# the copied enum source pointer MUST only appear inside @cpe_hit_ blocks after ceql + jnz.
+python3 - "$TMP_DIR/p85_guard.ssa" <<'PYEOF'
+import re, sys
+ssa = open(sys.argv[1]).read()
+funcs = ssa.split("function ")
+matched = [f for f in funcs if "trigger_guarded_sroa_copy(" in f.splitlines()[0]]
+assert matched, "missing trigger_guarded_sroa_copy in p85_guard.ssa"
+body = matched[0]
+assert "@cpe_hit_" in body and "@cpe_next_" in body and "@cpe_done_" in body, \
+    f"trigger_guarded_sroa_copy did not emit qbe_emit_copy_pod_enum_slots:\n{body}"
+
+blocks = []
+cur_lbl = "@entry"
+cur_lines = []
+for ln in body.splitlines()[1:]:
+    s = ln.strip()
+    if s.startswith("@"):
+        blocks.append((cur_lbl, cur_lines))
+        cur_lbl = s
+        cur_lines = []
+    elif s and s != "}":
+        cur_lines.append(s)
+blocks.append((cur_lbl, cur_lines))
+
+# Locate the `cpe` source pointer: the register whose tag is loaded right before `ceql` + `jnz ..., @cpe_hit_`.
+cpe_src_ptrs = set()
+for lbl, lines in blocks:
+    last_load_src = {}
+    for idx, s in enumerate(lines):
+        m = re.match(r"(%\w+)\s*=l\s+loadl\s+(%\w+)$", s)
+        if m:
+            last_load_src[m.group(1)] = m.group(2)
+        m = re.match(r"(%\w+)\s*=w\s+ceql\s+(%\w+),\s+[12]$", s)
+        if m and m.group(2) in last_load_src and idx + 1 < len(lines) and "@cpe_hit_" in lines[idx + 1]:
+            cpe_src_ptrs.add(last_load_src[m.group(2)])
+
+assert cpe_src_ptrs, f"failed to locate cpe source pointer register in:\n{body}"
+
+# Verify that any `+ 8` or `+ 16` address computation on the copied source pointer ONLY occurs in @cpe_hit_ blocks!
+cpe_hit_payload_reads = 0
+for lbl, lines in blocks:
+    for s in lines:
+        m = re.match(r"(%\w+)\s*=l\s+add\s+(%\w+),\s+(8|16)$", s)
+        if m and m.group(2) in cpe_src_ptrs:
+            assert lbl.startswith("@cpe_hit_"), \
+                f"unconditional payload +{m.group(3)} read on cpe src ptr {m.group(2)} in {lbl}:\n{body}"
+            cpe_hit_payload_reads += 1
+
+assert cpe_hit_payload_reads >= 2, \
+    f"expected guarded +8/+16 reads inside @cpe_hit_ blocks, got {cpe_hit_payload_reads}:\n{body}"
+assert re.search(r"=w ceql %\w+, [12]\b", body), f"missing variant tag ceql guard:\n{body}"
+print(f"p85 guard-page SSA audit: PASS ({cpe_hit_payload_reads} payload reads strictly gated in @cpe_hit_ blocks)")
+PYEOF
+
+echo "PASS: p85_enum_sroa (Native rel+dev + SSA 0 alloc + ASan/LSan + Wasm32 + Guard-page & SSA negative control)"
