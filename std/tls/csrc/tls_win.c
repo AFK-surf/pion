@@ -6,6 +6,10 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#ifndef SCHANNEL_USE_BLACKLISTS
+#define SCHANNEL_USE_BLACKLISTS
+#endif
+#include <subauth.h>
 #include <security.h>
 #include <schannel.h>
 #include <wincrypt.h>
