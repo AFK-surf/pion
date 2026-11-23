@@ -776,4 +776,216 @@ if command -v node >/dev/null 2>&1; then
   test "$P81_WASM" = "$P81_REL"
 fi
 
-echo "PASS: p77_views_and_lib_os (Native rel+dev + ASan/LSan + staticlib no-main + OOB/RO-mmap traps + Wasm32 Node+Web + P77-B/P81 SSA/bsearch)"
+# --- 8. P83: PionBytes/PionStrBuf TLS Slab + Bytes::slice(a, c).to_string() Fusion ---
+printf '0123456789abcdef' > "$TMP_DIR/p83_mmap.bin"
+cat <<EOF > "$TMP_DIR/p83_slab_bytes.pion"
+fn p83_mmap_path() -> String {
+  "$TMP_DIR/p83_mmap.bin"
+}
+EOF
+cat <<'EOF' >> "$TMP_DIR/p83_slab_bytes.pion"
+fn check_slice_pair(b : Bytes, a : Int, c : Int, label : String) -> Unit {
+  let fused = b.slice(a, c).to_string()
+  let tmp = b.slice(a, c)
+  let two_step = tmp.to_string()
+  if fused != two_step {
+    panic("p83 slice.to_string mismatch on " + label + ": fused='" + fused + "' two_step='" + two_step + "'")
+  }
+}
+
+fn verify_all_edges(b : Bytes, tag : String) -> Unit {
+  let n = b.length()
+  check_slice_pair(b, 0, n, tag + ":full")
+  check_slice_pair(b, 2, 7, tag + ":mid")
+  check_slice_pair(b, 3, 3, tag + ":empty_mid")
+  check_slice_pair(b, -5, 4, tag + ":neg_a")
+  check_slice_pair(b, -10, -2, tag + ":both_neg")
+  check_slice_pair(b, 5, n + 100, tag + ":c_gt_len")
+  check_slice_pair(b, 8, 3, tag + ":a_gt_c")
+  check_slice_pair(b, n + 10, n + 20, tag + ":a_gt_len")
+}
+
+fn main(world : World) -> Unit {
+  // 1. Bytes::slice(a, c).to_string() fusion edge cases
+  let b = "0123456789abcdef".to_bytes()
+  verify_all_edges(b, "heap")
+  if b.slice(2, 6).to_string() != "2345" {
+    panic("p83 expected 2345")
+  }
+  let empty_b = Bytes::new(0)
+  verify_all_edges(empty_b, "empty")
+  if empty_b.slice(0, 0).to_string() != "" {
+    panic("p83 empty slice failed")
+  }
+
+  // Optional native-only mmap_ro test (returns Err on Wasm32 Node/Web)
+  let mut mmap_ok = 0
+  match fs_mmap_ro(p83_mmap_path()) {
+    Ok(mb) => {
+      verify_all_edges(mb, "mmap")
+      if mb.slice(10, 16).to_string() != "abcdef" {
+        panic("p83 mmap slice mismatch")
+      }
+      mmap_ok = 1
+    }
+    Err(_) => ()
+  }
+
+  // 2. 10,000 short Bytes (1..64B), medium Bytes (4KB / 64KB), large Bytes (300KB)
+  let mut checksum = 0
+  let mut i = 0
+  while i < 10000 {
+    let sz = (i & 63) + 1
+    let sb = Bytes::new(sz)
+    sb[0] = ((i & 127) + 1).to_byte()
+    sb[sz - 1] = (((i * 3) & 127) + 1).to_byte()
+    checksum = checksum + sb[0].to_int() + sb[sz - 1].to_int()
+    i = i + 1
+  }
+  i = 0
+  while i < 64 {
+    let m4 = Bytes::new(4096)
+    m4[0] = b'A'
+    m4[4095] = b'Z'
+    let m64 = Bytes::new(65536)
+    m64[0] = b'B'
+    m64[65535] = b'Y'
+    checksum = checksum + m4[0].to_int() + m4[4095].to_int() + m64[0].to_int() + m64[65535].to_int()
+    i = i + 1
+  }
+  i = 0
+  while i < 8 {
+    let lg = Bytes::new(307200)
+    lg[0] = b'L'
+    lg[307199] = b'G'
+    checksum = checksum + lg[0].to_int() + lg[307199].to_int()
+    i = i + 1
+  }
+
+  // 3. 10,000 StringBuilders (32B -> 128B / 4KB / 300KB growth)
+  i = 0
+  while i < 10000 {
+    let sb = StringBuilder()
+    sb.write_string("hi_")
+    sb.write_string(i.to_string())
+    if (i & 15) == 0 {
+      let mut k = 0
+      while k < 16 {
+        sb.write_string("01234567")
+        k = k + 1
+      }
+    }
+    let s = sb.to_string()
+    checksum = checksum + s.length()
+    i = i + 1
+  }
+  let sb_med = StringBuilder()
+  i = 0
+  while i < 512 {
+    sb_med.write_string("abcdefgh")
+    i = i + 1
+  }
+  checksum = checksum + sb_med.to_string().length()
+
+  let sb_lg = StringBuilder()
+  i = 0
+  while i < 10000 {
+    sb_lg.write_string("01234567890123456789012345678901")
+    i = i + 1
+  }
+  checksum = checksum + sb_lg.to_string().length()
+
+  // 4. Cross-thread frozen Bytes & StringBuilder handoff + MT drop
+  let mx : Mutex[Array[String]] = Mutex::new([])
+  scope(world, fn(sc : Scope) -> Unit {
+    let mut t = 0
+    while t < 4 {
+      let tid = t
+      let moved_b = ("frozen_shared_payload_" + tid.to_string()).to_bytes()
+      let moved_sb = StringBuilder()
+      moved_sb.write_string("sb_handoff_")
+      moved_sb.write_string(tid.to_string())
+      spawn(sc, fn() -> Unit {
+        let fb = move moved_b
+        let fsb = move moved_sb
+        let head = fb.slice(0, 6).to_string()
+        if head != "frozen" {
+          panic("p83 mt frozen slice mismatch")
+        }
+        fsb.write_string("_grown_past_32_bytes_0123456789abcdef")
+        let mut r = 0
+        while r < 200 {
+          let local_b = ("thr_" + tid.to_string() + "_" + r.to_string()).to_bytes()
+          let _ = local_b.slice(0, 4).to_string()
+          r = r + 1
+        }
+        let acc = mx.lock()
+        acc.push(fsb.to_string())
+        mx.unlock(acc)
+      })
+      t = t + 1
+    }
+  })
+  let final_acc = mx.lock()
+  let final_len = final_acc.length()
+  mx.unlock(final_acc)
+  if final_len != 4 {
+    panic("p83 mt final_len != 4")
+  }
+
+  io_println(world, "p83 ok checksum=" + checksum.to_string() + " mmap=" + mmap_ok.to_string())
+}
+EOF
+
+"$PIONC" build --release --emit-ssa "$TMP_DIR/p83_slab_bytes.ssa" "$TMP_DIR/p83_slab_bytes.pion"
+P83_CHK_BODY=$(awk '/function .* \$pion_fn_check_slice_pair\(/ { p=1 } p { print } p && /^}/ { p=0 }' "$TMP_DIR/p83_slab_bytes.ssa")
+test -n "$P83_CHK_BODY" || { echo "FAIL: missing pion_fn_check_slice_pair in p83_slab_bytes.ssa"; exit 1; }
+# check_slice_pair has 1 fused `b.slice(a, c).to_string()` (no pion_bytes_slice) and 1 two-step `let tmp = b.slice(a, c); tmp.to_string()` (1 pion_bytes_slice)
+P83_SLICE_CNT=$(printf '%s\n' "$P83_CHK_BODY" | grep -c 'call \$pion_bytes_slice(' || true)
+P83_FROM_CSTR_CNT=$(printf '%s\n' "$P83_CHK_BODY" | grep -c 'call \$pion_str_from_cstr(' || true)
+if [ "$P83_SLICE_CNT" -ne 1 ] || [ "$P83_FROM_CSTR_CNT" -lt 1 ]; then
+  echo "FAIL: p83 fusion SSA audit expected 1 pion_bytes_slice and >=1 pion_str_from_cstr, got slice=$P83_SLICE_CNT cstr=$P83_FROM_CSTR_CNT" >&2
+  exit 1
+fi
+echo "p83 SSA audit: PASS (Bytes::slice(a,c).to_string() fused to pion_str_from_cstr)"
+
+"$PIONC" build --release -o "$TMP_DIR/p83_rel" "$TMP_DIR/p83_slab_bytes.pion"
+P83_REL=$("$TMP_DIR/p83_rel")
+echo "p83 native release -> $P83_REL"
+echo "$P83_REL" | grep -q "mmap=1$"
+
+"$PIONC" build -o "$TMP_DIR/p83_dev" "$TMP_DIR/p83_slab_bytes.pion"
+P83_DEV=$("$TMP_DIR/p83_dev")
+echo "p83 native dev -> $P83_DEV"
+test "$P83_DEV" = "$P83_REL"
+
+if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
+  "$PIONC" build --release --emit-obj "$TMP_DIR/p83_slab_bytes.o" "$TMP_DIR/p83_slab_bytes.pion"
+  "$CC_BIN" -fsanitize=address "$TMP_DIR/p83_slab_bytes.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p83_asan"
+  P83_ASAN=$("$TMP_DIR/p83_asan")
+  echo "p83 ASan/LSan -> $P83_ASAN"
+  test "$P83_ASAN" = "$P83_REL"
+fi
+
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/p83_slab_bytes.wasm" "$TMP_DIR/p83_slab_bytes.pion"
+  P83_WASM_NODE=$(node "$WASM_RT" "$TMP_DIR/p83_slab_bytes.wasm")
+  echo "p83 wasm32 node -> $P83_WASM_NODE"
+  test "$P83_WASM_NODE" = "$P83_REL"
+  P83_EXP_WASM=$(printf '%s' "$P83_REL" | sed 's/mmap=1$/mmap=0/')
+  P83_WASM_WEB=$(node --input-type=module -e '
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+const { runWasmBytes } = await import(pathToFileURL(process.argv[1]).href);
+const out = [];
+await runWasmBytes(fs.readFileSync(process.argv[2]), {
+  print: (s) => out.push(s),
+  println: (s) => out.push(s + "\n"),
+});
+process.stdout.write(out.join("").trim());
+' "$ROOT_DIR/runtime/pion_wasm_rt_web.mjs" "$TMP_DIR/p83_slab_bytes.wasm")
+  echo "p83 wasm32 web -> $P83_WASM_WEB"
+  test "$P83_WASM_WEB" = "$P83_EXP_WASM"
+fi
+
+echo "PASS: p77_views_and_lib_os (Native rel+dev + ASan/LSan + staticlib no-main + OOB/RO-mmap traps + Wasm32 Node+Web + P77-B/P81/P83)"

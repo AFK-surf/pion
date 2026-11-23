@@ -1371,20 +1371,23 @@ PION_MINSIZE void *pion_str_replace(void *s, void *from, void *to) {
 
 PION_MINSIZE static void pion_bytes_drop(void *payload) {
     PionBytes *b = (PionBytes *)payload;
-    free(b->data);
-    b->data = NULL;
+    if (b->data) {
+        size_t bytes = (size_t)(b->cap > 0 ? b->cap : b->len);
+        pion_slab_raw_free(b->data, bytes,
+                           (pion_hdr(b)->flags & PION_FLAG_FROZEN) != 0);
+        b->data = NULL;
+    }
 }
 
 static __attribute__((noinline)) PION_MINSIZE PionBytes *pion_bytes_alloc_uninit(int64_t len) {
     if (__builtin_expect((uint64_t)len > (uint64_t)PION_MAX_CONTAINER_LEN, 0)) {
         pion_die_len();
     }
-    PionBytes *b = (PionBytes *)pion_alloc_raw((uint32_t)sizeof(PionBytes), PION_TAG_BYTES, pion_bytes_drop);
+    PionBytes *b = (PionBytes *)pion_alloc_uninit((uint32_t)sizeof(PionBytes), PION_TAG_BYTES, pion_bytes_drop);
     b->len = len;
     b->cap = len;
     if (len > 0) {
-        b->data = (uint8_t *)malloc((size_t)len);
-        if (!b->data) pion_oom();
+        b->data = (uint8_t *)pion_slab_raw_alloc((size_t)len);
     } else {
         b->data = NULL;
     }
@@ -1428,7 +1431,7 @@ PION_MINSIZE void pion_bytes_set(void *b_ptr, int64_t idx, int32_t val) {
 PION_MINSIZE void *pion_bytes_from_ptr(void *p, int64_t len) {
     if (len <= 0 || !p) return pion_bytes_alloc_uninit(0);
     PionBytes *out = pion_bytes_alloc_uninit(len);
-    memcpy(out->data, p, (size_t)len);
+    pion_copy_short((char *)out->data, (const char *)p, (size_t)len);
     return out;
 }
 
@@ -1482,8 +1485,11 @@ PION_MINSIZE void pion_bytes_copy_to_ptr(void *b_ptr, int64_t src_off, void *dst
 
 static PION_MINSIZE void pion_strbuf_drop(void *payload) {
     PionStrBuf *sb = (PionStrBuf *)payload;
-    free(sb->data);
-    sb->data = NULL;
+    if (sb->data) {
+        pion_slab_raw_free(sb->data, (size_t)sb->cap,
+                           (pion_hdr(sb)->flags & PION_FLAG_FROZEN) != 0);
+        sb->data = NULL;
+    }
 }
 
 static __attribute__((noinline)) PION_MINSIZE void pion_strbuf_grow(PionStrBuf *sb, int64_t need) {
@@ -1499,8 +1505,23 @@ static __attribute__((noinline)) PION_MINSIZE void pion_strbuf_grow(PionStrBuf *
         }
         ncap *= 2;
     }
-    char *nd = (char *)realloc(sb->data, (size_t)ncap);
+    char *nd;
+#if PION_USE_SLAB
+    if ((size_t)sb->cap > PION_MED_MAX_BYTES && (size_t)ncap > PION_MED_MAX_BYTES) {
+        nd = (char *)realloc(sb->data, (size_t)ncap);
+        if (!nd) pion_oom();
+    } else {
+        nd = (char *)pion_slab_raw_alloc((size_t)ncap);
+        if (sb->data) {
+            memcpy(nd, sb->data, (size_t)sb->len + 1u);
+            pion_slab_raw_free(sb->data, (size_t)sb->cap,
+                               (pion_hdr(sb)->flags & PION_FLAG_FROZEN) != 0);
+        }
+    }
+#else
+    nd = (char *)realloc(sb->data, (size_t)ncap);
     if (!nd) pion_oom();
+#endif
     sb->data = nd;
     sb->cap = ncap;
 }
@@ -1518,8 +1539,7 @@ PION_MINSIZE void *pion_strbuf_new(int64_t cap) {
     }
     PionStrBuf *sb = (PionStrBuf *)pion_alloc_uninit((uint32_t)sizeof(PionStrBuf), PION_TAG_STRBUF, pion_strbuf_drop);
     int64_t init_cap = cap > 32 ? cap : 32;
-    sb->data = (char *)malloc((size_t)init_cap);
-    if (!sb->data) pion_oom();
+    sb->data = (char *)pion_slab_raw_alloc((size_t)init_cap);
     sb->data[0] = '\0';
     sb->len = 0;
     sb->cap = init_cap;
