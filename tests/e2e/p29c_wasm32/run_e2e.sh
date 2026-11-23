@@ -5662,4 +5662,99 @@ console.log("  p69a (" + rtLabel + "): out=" + out + " leaked=0 OK");
 ' "$P69A_WASM" "$rt_path"
 done
 
+echo "=== P82-C: Wasm32 Bidirectional Runtime ABI Handshake (PION_WASM_RT_ABI = 2, dev + --release) ==="
+FULL_REL_WASM="$TMP_DIR/full_features_rel.wasm"
+"$PIONC" build --release --target wasm32 -o "$FULL_REL_WASM" "$TMP_DIR/full_features.pion"
+for mode_wasm in "dev:$FULL_WASM" "release:$FULL_REL_WASM"; do
+  mode_label="${mode_wasm%%:*}"
+  wasm_file="${mode_wasm#*:}"
+  for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+    node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+const [wasmPath, rtPath, modeLabel] = process.argv.slice(1);
+const rtLabel = path.basename(rtPath) + "/" + modeLabel;
+const mod = await import(pathToFileURL(rtPath).href);
+const { createPionRuntime, PION_WASM_RT_ABI } = mod;
+if (PION_WASM_RT_ABI !== 2) {
+  console.error("FAIL (" + rtLabel + "): expected PION_WASM_RT_ABI === 2, got", PION_WASM_RT_ABI);
+  process.exit(1);
+}
+const bytes = fs.readFileSync(wasmPath);
+
+// 1. Normal instantiation & ABI export check
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+const abiExp = instance.exports.__pion_wasm_rt_abi;
+if (!abiExp || abiExp.value !== 2) {
+  console.error("FAIL (" + rtLabel + "): expected __pion_wasm_rt_abi.value === 2, got", abiExp);
+  process.exit(1);
+}
+rt.bindExports(instance.exports);
+const rc = instance.exports.main(0, 0n);
+if ((rc | 0) !== 0 || lines.join("").trim() !== "p29c_full_features ok") {
+  console.error("FAIL (" + rtLabel + "): normal run failed: rc=" + rc + " out=" + JSON.stringify(lines.join("")));
+  process.exit(1);
+}
+
+// 2a. Forward guard: forged mismatched ABI version (v1) must throw in bindExports
+{
+  const rtBad = createPionRuntime();
+  const forged = { ...instance.exports, __pion_wasm_rt_abi: { value: 1 } };
+  let threw = false;
+  try {
+    rtBad.bindExports(forged);
+  } catch (err) {
+    threw = String(err && err.message ? err.message : err).includes("Pion Wasm runtime ABI mismatch");
+  }
+  if (!threw) {
+    console.error("FAIL (" + rtLabel + "): bindExports did not throw ABI mismatch for forged v1");
+    process.exit(1);
+  }
+}
+
+// 2b. Forward guard: missing __pion_wasm_rt_abi (legacy .wasm) must throw in bindExports
+{
+  const rtLegacy = createPionRuntime();
+  const legacyExp = { ...instance.exports };
+  delete legacyExp.__pion_wasm_rt_abi;
+  let threw = false;
+  try {
+    rtLegacy.bindExports(legacyExp);
+  } catch (err) {
+    threw = String(err && err.message ? err.message : err).includes("Pion Wasm runtime ABI mismatch");
+  }
+  if (!threw) {
+    console.error("FAIL (" + rtLabel + "): bindExports did not throw ABI mismatch for missing __pion_wasm_rt_abi");
+    process.exit(1);
+  }
+}
+
+// 3. Reverse guard: stale runtime missing __pion_rt_abi_v2 must fail instantiate with WebAssembly.LinkError
+{
+  const rtStale = createPionRuntime();
+  const staleImports = { ...rtStale.imports, pion_rt: { ...rtStale.imports.pion_rt } };
+  delete staleImports.pion_rt.__pion_rt_abi_v2;
+  let okLinkErr = false;
+  try {
+    await WebAssembly.instantiate(bytes, staleImports);
+  } catch (err) {
+    okLinkErr = (err instanceof WebAssembly.LinkError) && String(err.message || err).includes("__pion_rt_abi_v2");
+  }
+  if (!okLinkErr) {
+    console.error("FAIL (" + rtLabel + "): stale runtime did not throw WebAssembly.LinkError mentioning __pion_rt_abi_v2");
+    process.exit(1);
+  }
+}
+
+console.log("  p82c ABI handshake (" + rtLabel + "): v2 ok + forward v1/missing guard + reverse LinkError OK");
+' "$wasm_file" "$rt_path" "$mode_label"
+  done
+done
+
 echo "p29c_wasm32 E2E: OK"

@@ -1,4 +1,5 @@
 // Pion WebAssembly (wasm32) Minimal Browser Runtime (Zero Node.js Dependencies)
+export const PION_WASM_RT_ABI = 2;
 const TAG_STRING = 1, TAG_BYTES = 2, TAG_ARRAY = 3, TAG_MAP = 7, TAG_CHANNEL = 8, TAG_MUTEX = 9, TAG_ATOMIC = 10, TAG_STRBUF = 11, TAG_SCOPE = 12, TAG_WORLD = 13;
 const FLAG_FROZEN = 1, FLAG_IMMORTAL = 2, HDR = 24, PAGE = 65536;
 const FREE_CLASSES = (() => {
@@ -108,6 +109,14 @@ export function createPionRuntime(opts = {}) {
     heapBase = (base + 15) & ~15; heapPtr = heapBase; heapEnd = memory.buffer.byteLength;
     const sc = e.__pion_slab_ctl;
     slabCtl = typeof sc === "number" ? sc : (sc && typeof sc.value === "number" ? sc.value : 0);
+    const ra = e.__pion_wasm_rt_abi;
+    const modAbi = typeof ra === "number" ? ra : (ra && typeof ra.value === "number" ? ra.value : 0);
+    if ((slabCtl > 0 || ra !== undefined) && modAbi !== PION_WASM_RT_ABI) {
+      throw new Error(
+        `Pion Wasm runtime ABI mismatch: runtime expects v${PION_WASM_RT_ABI}, module exports v${modAbi}. ` +
+        `Sync runtime/pion_wasm_rt*.mjs with the pionc version that built this .wasm.`
+      );
+    }
     if (typeof globalThis.crypto !== "undefined" && typeof globalThis.crypto.getRandomValues === "function") {
       const sb = new BigUint64Array(2); globalThis.crypto.getRandomValues(sb); hashSeed = sb[0]; hashSeed2 = sb[1];
     } else {
@@ -841,6 +850,7 @@ export function createPionRuntime(opts = {}) {
 
   const imports = {
     pion_rt: {
+      __pion_rt_abi_v2: () => {},
       pion_cur_tid: () => 1n, pion_alloc, pion_alloc_uninit,
       pion_rc_inc, pion_rc_dec, pion_rc_dec_slow, pion_rc_freeze, pion_rc_immortalize,
       pion_panic, pion_panic_oob, pion_debug_assert,
@@ -879,7 +889,7 @@ export function createPionRuntime(opts = {}) {
       pion_world_eprintln: (_w, s) => eprintlnFn(readStr(s)),
       pion_world_clock_ms: () => BigInt(Math.floor(performance.now())),
       pion_clock_monotonic_us: () => BigInt(Math.round(performance.now() * 1000)),
-      pion_fs_mmap_ro: (_p, okOut) => { const op = pNum(okOut); if (op) { sync(); dv.setInt32(op, 0, true); } return makeStr("fs_mmap_ro unavailable in web runtime"); },
+      pion_fs_mmap_ro: (_p, okOut) => { const op = pNum(okOut); if (op) { sync(); dv.setInt32(op, 0, true); } return mkStr("fs_mmap_ro unavailable in web runtime"); },
       pion_fs_write_atomic_bytes: () => 0,
       pion_ptr_alloc: (b) => pBig(rawZero(Number(b))),
       pion_ptr_free: (p) => rawFree(pNum(p)),
