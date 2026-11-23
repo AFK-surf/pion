@@ -997,6 +997,27 @@ arm64_subst_tmp(Fn *fn, Ref oldr, Ref newr)
 	}
 }
 
+static int
+arm64_only_used_by_mul(Blk *b, Fn *fn, Ref r)
+{
+	uint m, nuse = 0;
+
+	if (fn->tmp[r.val].nuse <= 0)
+		return 0;
+	for (m = 0; m < b->nins; m++) {
+		Ins *u = &b->ins[m];
+		if (req(u->arg[0], r) || req(u->arg[1], r)) {
+			if (u->op != Omul || KBASE(u->cls) != 0)
+				return 0;
+			if (req(u->arg[0], r))
+				nuse++;
+			if (req(u->arg[1], r))
+				nuse++;
+		}
+	}
+	return nuse == (uint)fn->tmp[r.val].nuse;
+}
+
 void
 arm64_hoist_consts(Fn *fn)
 {
@@ -1032,14 +1053,19 @@ arm64_hoist_consts(Fn *fn)
 		}
 		order[j] = key;
 	}
+	for (int pass = 0; pass < 2; pass++)
 	for (j = 0; j < n; j++) {
 		b = order[j];
+		if (pass == 1 && (b->hascall || b->loop < 10))
+			continue;
 		for (k = 0; k < b->nins; k++) {
 			int is_int;
 			i = &b->ins[k];
 			if (i->op != Ocopy)
 				continue;
 			is_int = (KBASE(i->cls) == 0);
+			if (pass == 1 && !is_int)
+				continue;
 			if (!is_int && KBASE(i->cls) != 1)
 				continue;
 			if (rtype(i->arg[0]) != RCon)
@@ -1050,7 +1076,7 @@ arm64_hoist_consts(Fn *fn)
 				continue;
 			c = &fn->con[i->arg[0].val];
 			/* Hoist read-only FP constant-pool loads: Ocopy addr, CAddr(".LfpN") + Oload dst, addr */
-			if (is_int && i->cls == Kl && c->type == CAddr && c->bits.i == 0
+			if (pass == 0 && is_int && i->cls == Kl && c->type == CAddr && c->bits.i == 0
 			&& k + 1 < b->nins && b->ins[k + 1].op == Oload
 			&& KBASE(b->ins[k + 1].cls) == 1
 			&& req(b->ins[k + 1].arg[0], i->to)
@@ -1153,8 +1179,13 @@ arm64_hoist_consts(Fn *fn)
 						|| (nv | 0xffff) == -1
 						|| arm64_logimm(u, Kl));
 				}
-				if (single_insn)
-					continue;
+				if (pass == 0) {
+					if (single_insn)
+						continue;
+				} else {
+					if (!single_insn || !arm64_only_used_by_mul(b, fn, i->to))
+						continue;
+				}
 			}
 
 			d = 0;
@@ -1193,7 +1224,7 @@ arm64_hoist_consts(Fn *fn)
 					continue;
 				}
 			}
-			if (is_int ? (nhoist_int[d->id] >= 4) : (nhoist_fp[d->id] >= 8))
+			if (is_int ? (nhoist_int[d->id] >= (pass == 0 ? 4 : 5)) : (nhoist_fp[d->id] >= 8))
 				continue;
 
 			ins = *i;
