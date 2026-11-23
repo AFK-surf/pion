@@ -168,6 +168,14 @@ env -u AR CC="$TMP_DIR/fake_tc/fake-clang" "$PIONC" build --release --emit-stati
 echo "T3 sibling llvm-ar -> OK"
 
 mkdir -p "$TMP_DIR/empty_home"
+env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_HOME -u ANDROID_SDK_ROOT -u PION_ANDROID_CC -u CC HOME="$TMP_DIR/empty_home" \
+  "$PIONC" build --target android_arm64 --emit-asm "$TMP_DIR/android_ok.s" "$TMP_DIR/t1_single/lib.pion"
+[ -s "$TMP_DIR/android_ok.s" ]
+env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_HOME -u ANDROID_SDK_ROOT -u PION_ANDROID_CC -u CC HOME="$TMP_DIR/empty_home" \
+  "$PIONC" build --target android_arm64 --emit-ssa "$TMP_DIR/android_ok.ssa" "$TMP_DIR/t1_single/lib.pion"
+[ -s "$TMP_DIR/android_ok.ssa" ]
+echo "T3 Android --emit-asm / --emit-ssa without NDK/CC -> OK"
+
 if env -u ANDROID_NDK_HOME -u ANDROID_NDK_ROOT -u ANDROID_HOME -u ANDROID_SDK_ROOT -u PION_ANDROID_CC -u CC HOME="$TMP_DIR/empty_home" \
   "$PIONC" build --target android_arm64 --emit-staticlib "$TMP_DIR/android_fail.a" "$TMP_DIR/t1_single/lib.pion" \
   > "$TMP_DIR/android.out" 2> "$TMP_DIR/android.err"; then
