@@ -5121,4 +5121,227 @@ console.log("  p62a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 done
 done
 
+echo "=== P65-A: --wasm-names Custom Section (Function Names) & CAS Isolation ==="
+P65A_DIR="$TMP_DIR/p65a_ws"
+mkdir -p "$P65A_DIR/p65a_lib/src" "$P65A_DIR/p65a_app/src"
+cat > "$P65A_DIR/p65a_lib/pion.toml" <<'EOF'
+[package]
+name = "p65a_lib"
+version = "0.1.0"
+EOF
+cat > "$P65A_DIR/p65a_lib/src/lib.pion" <<'EOF'
+pub fn compute_mix(n : Int) -> String {
+  let m : Map[String, Int] = Map([])
+  let mut acc = 0
+  let mut i = 0
+  while i < n {
+    let k = "k" + i.to_string()
+    m.set(k, i * 3 + 1)
+    acc = acc + match m.get(k) {
+      Some(v) => v
+      None => 0
+    }
+    i = i + 1
+  }
+  "mix:" + acc.to_string() + ":" + m.length().to_string()
+}
+EOF
+cat > "$P65A_DIR/p65a_app/pion.toml" <<'EOF'
+[package]
+name = "p65a_app"
+version = "0.1.0"
+
+[dependencies]
+p65a_lib = { path = "../p65a_lib" }
+EOF
+cat > "$P65A_DIR/p65a_app/src/main.pion" <<'EOF'
+import "p65a_lib"
+
+pub fn main(world : World) -> Int {
+  let s = p65a_lib::compute_mix(32)
+  io_println(world, s)
+  0
+}
+EOF
+
+P65A_NONAMES_1="$TMP_DIR/p65a_nonames_1.wasm"
+P65A_NAMES_1="$TMP_DIR/p65a_names_1.wasm"
+P65A_NONAMES_2="$TMP_DIR/p65a_nonames_2.wasm"
+P65A_NAMES_2="$TMP_DIR/p65a_names_2.wasm"
+"$PIONC" build --release --target wasm32 -o "$P65A_NONAMES_1" "$P65A_DIR/p65a_app"
+"$PIONC" build --release --target wasm32 --wasm-names -o "$P65A_NAMES_1" "$P65A_DIR/p65a_app"
+"$PIONC" build --release --target wasm32 -o "$P65A_NONAMES_2" "$P65A_DIR/p65a_app"
+"$PIONC" build --release --target wasm32 --wasm-names -o "$P65A_NAMES_2" "$P65A_DIR/p65a_app"
+
+P65A_RUN_OUT=$("$PIONC" run --release --target wasm32 --wasm-names "$P65A_DIR/p65a_app")
+if [ "$P65A_RUN_OUT" != "mix:1520:32" ]; then
+  echo "FAIL: pionc run --wasm-names output mismatch: '$P65A_RUN_OUT'" >&2
+  exit 1
+fi
+
+node --input-type=module -e '
+import fs from "node:fs";
+import { pathToFileURL } from "node:url";
+
+const [nonames1Path, names1Path, nonames2Path, names2Path, rtPath] = process.argv.slice(1);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bNo1 = fs.readFileSync(nonames1Path);
+const bYes1 = fs.readFileSync(names1Path);
+const bNo2 = fs.readFileSync(nonames2Path);
+const bYes2 = fs.readFileSync(names2Path);
+
+for (const [label, b] of [["nonames1", bNo1], ["names1", bYes1], ["nonames2", bNo2], ["names2", bYes2]]) {
+  if (!WebAssembly.validate(b)) {
+    console.error("FAIL: WebAssembly.validate() failed for " + label);
+    process.exit(1);
+  }
+}
+
+// CAS isolation checks
+if (!bNo1.equals(bNo2)) {
+  console.error("FAIL: nonames1 and nonames2 differ (CAS pollution)");
+  process.exit(1);
+}
+if (!bYes1.equals(bYes2)) {
+  console.error("FAIL: names1 and names2 differ (CAS pollution)");
+  process.exit(1);
+}
+
+const modNo = new WebAssembly.Module(bNo1);
+const modYes = new WebAssembly.Module(bYes1);
+const secsNo = WebAssembly.Module.customSections(modNo, "name");
+const secsYes = WebAssembly.Module.customSections(modYes, "name");
+if (secsNo.length !== 0) {
+  console.error("FAIL: expected 0 name sections without --wasm-names, got " + secsNo.length);
+  process.exit(1);
+}
+if (secsYes.length !== 1) {
+  console.error("FAIL: expected 1 name section with --wasm-names, got " + secsYes.length);
+  process.exit(1);
+}
+
+// Count total functions (imports + defined) from binary to verify bounds
+function readU32(u8, st) {
+  let res = 0, shift = 0;
+  while (true) {
+    const byte = u8[st.off++];
+    res |= (byte & 0x7f) << shift;
+    if ((byte & 0x80) === 0) break;
+    shift += 7;
+  }
+  return res >>> 0;
+}
+
+let definedFuncCount = 0;
+{
+  const st = { off: 8 };
+  while (st.off < bYes1.length) {
+    const id = bYes1[st.off++];
+    const sz = readU32(bYes1, st);
+    const end = st.off + sz;
+    if (id === 3) {
+      definedFuncCount = readU32(bYes1, st);
+    }
+    st.off = end;
+  }
+}
+const importFuncCount = WebAssembly.Module.imports(modYes).filter(i => i.kind === "function").length;
+const totalFuncs = importFuncCount + definedFuncCount;
+
+// Parse name custom section subsection 1 (Function Names)
+const nameBytes = new Uint8Array(secsYes[0]);
+const st = { off: 0 };
+let foundSub1 = false;
+const fnNames = [];
+while (st.off < nameBytes.length) {
+  const subId = nameBytes[st.off++];
+  const subLen = readU32(nameBytes, st);
+  const subEnd = st.off + subLen;
+  if (subId === 1) {
+    foundSub1 = true;
+    const cnt = readU32(nameBytes, st);
+    if (cnt === 0) {
+      console.error("FAIL: name subsection 1 has 0 entries");
+      process.exit(1);
+    }
+    let prevIdx = -1;
+    for (let k = 0; k < cnt; k++) {
+      const idx = readU32(nameBytes, st);
+      if (idx <= prevIdx || idx >= totalFuncs) {
+        console.error("FAIL: invalid func_idx in name section: idx=" + idx + " prev=" + prevIdx + " total=" + totalFuncs);
+        process.exit(1);
+      }
+      prevIdx = idx;
+      const nlen = readU32(nameBytes, st);
+      const name = Buffer.from(nameBytes.subarray(st.off, st.off + nlen)).toString("utf8");
+      st.off += nlen;
+      if (name.length === 0) {
+        console.error("FAIL: empty function name at idx=" + idx);
+        process.exit(1);
+      }
+      fnNames.push({ idx, name });
+    }
+    if (st.off !== subEnd) {
+      console.error("FAIL: trailing bytes in name subsection 1:", st.off, "!==", subEnd);
+      process.exit(1);
+    }
+  }
+  st.off = subEnd;
+}
+if (!foundSub1) {
+  console.error("FAIL: name custom section missing subsection 1 (Function Names)");
+  process.exit(1);
+}
+const hasUserFn = fnNames.some(e => e.name.includes("compute_mix") || e.name === "main");
+const hasRtFn = fnNames.some(e => e.name.startsWith("pion_") || e.name.startsWith("__pion_"));
+if (!hasUserFn || !hasRtFn) {
+  console.error("FAIL: expected user and runtime names in name section, got:", fnNames.slice(0, 20));
+  process.exit(1);
+}
+
+// Run both modules and verify identical output and zero RC leak
+async function runAndCheck(bytes, label) {
+  const lines = [];
+  const rt = createPionRuntime({
+    print: (s) => lines.push(s),
+    println: (s) => lines.push(s + "\n"),
+  });
+  const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+  rt.bindExports(instance.exports);
+  const rc = instance.exports.main(0, 0n);
+  const out = lines.join("").trim();
+  if ((rc | 0) !== 0 || out !== "mix:1520:32") {
+    console.error("FAIL (" + label + "): mismatch rc=" + rc + " out=" + JSON.stringify(out));
+    process.exit(1);
+  }
+  const dv = new DataView(instance.exports.memory.buffer);
+  const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+  const hp = dv.getUint32(ctl + 36, true);
+  const hb = dv.getUint32(ctl + 44, true);
+  let cur = hb, leaked = 0;
+  while (cur + 8 <= hp) {
+    const sz = dv.getUint32(cur, true);
+    const magic = dv.getUint32(cur + 4, true);
+    if (sz < 16 || cur + sz > hp) {
+      console.error("FAIL (" + label + "): corrupt heap block at", cur, "sz=", sz);
+      process.exit(1);
+    }
+    if (magic === 0x50494f4e) {
+      const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+      if ((flags & 2) === 0) leaked++;
+    }
+    cur += sz;
+  }
+  if (leaked !== 0) {
+    console.error("FAIL (" + label + "): leaked=" + leaked);
+    process.exit(1);
+  }
+  return out;
+}
+await runAndCheck(bNo1, "nonames");
+await runAndCheck(bYes1, "names");
+console.log("  p65a_wasm_names: OK (nonames=" + bNo1.length + "B, names=" + bYes1.length + "B, entries=" + fnNames.length + "/" + totalFuncs + ", leaked=0)");
+' "$P65A_NONAMES_1" "$P65A_NAMES_1" "$P65A_NONAMES_2" "$P65A_NAMES_2" "$PION_WASM_RT"
+
 echo "p29c_wasm32 E2E: OK"
