@@ -551,31 +551,35 @@ export function createPionRuntime(opts = {}) {
     const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20);
     arrEnsure(p, l + 1);
     if (st === 1) { sync(); u8[Number(g64(p + 24)) + l] = Number(v) & 0xff; s64(p, l + 1); return; }
+    if (st === 4) { sync(); dv.setUint32(Number(g64(p + 24)) + l * 4, Number(BigInt(v) & 0xffffffffn), true); s64(p, l + 1); return; }
     if (isObj && v) pion_rc_inc(v); sync();
     s64(Number(g64(p + 24)) + l * 8, v); s64(p, l + 1);
   }
   function pion_arr_push_owned(a, v) {
     const p = pNum(a); sync(); const l = Number(g64(p)), st = g32(p + 20); arrEnsure(p, l + 1); sync();
     const dp = Number(g64(p + 24));
-    if (st === 1) u8[dp + l] = Number(v) & 0xff; else s64(dp + l * 8, v);
+    if (st === 1) u8[dp + l] = Number(v) & 0xff;
+    else if (st === 4) dv.setUint32(dp + l * 4, Number(BigInt(v) & 0xffffffffn), true);
+    else s64(dp + l * 8, v);
     s64(p, l + 1);
   }
   function pion_arr_get(a, i) {
     const p = pNum(a); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n);
-    const dp = Number(g64(p + 24));
-    return g32(p + 20) === 1 ? BigInt(u8[dp + Number(i)]) : g64(dp + Number(i) * 8);
+    const dp = Number(g64(p + 24)), st = g32(p + 20);
+    return st === 1 ? BigInt(u8[dp + Number(i)]) : st === 4 ? BigInt(dv.getUint32(dp + Number(i) * 4, true)) : g64(dp + Number(i) * 8);
   }
   function pion_arr_set(a, i, v) {
     const p = pNum(a); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n);
-    const dp = Number(g64(p + 24));
-    if (g32(p + 20) === 1) { u8[dp + Number(i)] = Number(v) & 0xff; return; }
+    const dp = Number(g64(p + 24)), st = g32(p + 20);
+    if (st === 1) { u8[dp + Number(i)] = Number(v) & 0xff; return; }
+    if (st === 4) { dv.setUint32(dp + Number(i) * 4, Number(BigInt(v) & 0xffffffffn), true); return; }
     const isObj = g32(p + 16), off = dp + Number(i) * 8, old = g64(off);
     if (isObj && v) pion_rc_inc(v); sync(); s64(off, v); if (isObj && old) pion_rc_dec(old);
   }
   function pion_arr_pop(a) {
     const p = pNum(a); sync(); const l = Number(g64(p)); if (l <= 0) pion_panic_oob(-1n, 0n);
-    const dp = Number(g64(p + 24));
-    const v = g32(p + 20) === 1 ? BigInt(u8[dp + (l - 1)]) : g64(dp + (l - 1) * 8);
+    const dp = Number(g64(p + 24)), st = g32(p + 20);
+    const v = st === 1 ? BigInt(u8[dp + (l - 1)]) : st === 4 ? BigInt(dv.getUint32(dp + (l - 1) * 4, true)) : g64(dp + (l - 1) * 8);
     s64(p, l - 1); return v;
   }
   function pion_arr_copy(a) {

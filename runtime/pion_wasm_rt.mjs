@@ -1257,6 +1257,12 @@ export function createPionRuntime(options = {}) {
       dv.setBigInt64(p, BigInt(len + 1), true);
       return;
     }
+    if (stride === 4) {
+      const dp = Number(dv.getBigInt64(p + 24, true));
+      dv.setUint32(dp + len * 4, Number(BigInt(val) & 0xffffffffn), true);
+      dv.setBigInt64(p, BigInt(len + 1), true);
+      return;
+    }
     if (elemIsObj && val !== 0n) pion_rc_inc(val);
     syncViews();
     const dp = Number(dv.getBigInt64(p + 24, true));
@@ -1274,6 +1280,8 @@ export function createPionRuntime(options = {}) {
     const dp = Number(dv.getBigInt64(p + 24, true));
     if (stride === 1) {
       u8[dp + len] = Number(val) & 0xff;
+    } else if (stride === 4) {
+      dv.setUint32(dp + len * 4, Number(BigInt(val) & 0xffffffffn), true);
     } else {
       dv.setBigInt64(dp + len * 8, BigInt(val), true);
     }
@@ -1286,8 +1294,12 @@ export function createPionRuntime(options = {}) {
     const len = dv.getBigInt64(p, true);
     if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
     const dp = Number(dv.getBigInt64(p + 24, true));
-    if (dv.getInt32(p + 20, true) === 1) {
+    const stride = dv.getInt32(p + 20, true);
+    if (stride === 1) {
       return BigInt(u8[dp + Number(idx)]);
+    }
+    if (stride === 4) {
+      return BigInt(dv.getUint32(dp + Number(idx) * 4, true));
     }
     return dv.getBigInt64(dp + Number(idx) * 8, true);
   }
@@ -1298,8 +1310,13 @@ export function createPionRuntime(options = {}) {
     const len = dv.getBigInt64(p, true);
     if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
     const dp = Number(dv.getBigInt64(p + 24, true));
-    if (dv.getInt32(p + 20, true) === 1) {
+    const stride = dv.getInt32(p + 20, true);
+    if (stride === 1) {
       u8[dp + Number(idx)] = Number(val) & 0xff;
+      return;
+    }
+    if (stride === 4) {
+      dv.setUint32(dp + Number(idx) * 4, Number(BigInt(val) & 0xffffffffn), true);
       return;
     }
     const elemIsObj = dv.getInt32(p + 16, true);
@@ -1317,8 +1334,11 @@ export function createPionRuntime(options = {}) {
     const len = Number(dv.getBigInt64(p, true));
     if (len <= 0) pion_panic_oob(-1n, 0n);
     const dp = Number(dv.getBigInt64(p + 24, true));
-    const val = dv.getInt32(p + 20, true) === 1
+    const stride = dv.getInt32(p + 20, true);
+    const val = stride === 1
       ? BigInt(u8[dp + (len - 1)])
+      : stride === 4
+      ? BigInt(dv.getUint32(dp + (len - 1) * 4, true))
       : dv.getBigInt64(dp + (len - 1) * 8, true);
     dv.setBigInt64(p, BigInt(len - 1), true);
     return val;

@@ -1748,6 +1748,10 @@ PION_HOT void pion_arr_push(void *a_ptr, int64_t val) {
         ((uint8_t *)a->data)[a->len++] = (uint8_t)val;
         return;
     }
+    if (__builtin_expect(a->elem_stride == 4, 0)) {
+        ((uint32_t *)a->data)[a->len++] = (uint32_t)val;
+        return;
+    }
     if (a->elem_is_obj) {
         pion_adopt(a, val);
         pion_rc_inc((void *)(uintptr_t)val);
@@ -1764,6 +1768,10 @@ void pion_arr_push_owned(void *a_ptr, int64_t val) {
         ((uint8_t *)a->data)[a->len++] = (uint8_t)val;
         return;
     }
+    if (__builtin_expect(a->elem_stride == 4, 0)) {
+        ((uint32_t *)a->data)[a->len++] = (uint32_t)val;
+        return;
+    }
     if (a->elem_is_obj) {
         pion_adopt(a, val);
     }
@@ -1778,6 +1786,9 @@ PION_MINSIZE int64_t pion_arr_get(void *a_ptr, int64_t idx) {
     if (a->elem_stride == 1) {
         return (int64_t)((uint8_t *)a->data)[idx];
     }
+    if (a->elem_stride == 4) {
+        return (int64_t)((uint32_t *)a->data)[idx];
+    }
     return a->data[idx];
 }
 
@@ -1788,6 +1799,10 @@ PION_MINSIZE void pion_arr_set(void *a_ptr, int64_t idx, int64_t val) {
     }
     if (a->elem_stride == 1) {
         ((uint8_t *)a->data)[idx] = (uint8_t)val;
+        return;
+    }
+    if (a->elem_stride == 4) {
+        ((uint32_t *)a->data)[idx] = (uint32_t)val;
         return;
     }
     if (a->elem_is_obj) {
@@ -1805,6 +1820,9 @@ PION_MINSIZE int64_t pion_arr_pop(void *a_ptr) {
     }
     if (__builtin_expect(a->elem_stride == 1, 0)) {
         return (int64_t)((uint8_t *)a->data)[--a->len];
+    }
+    if (__builtin_expect(a->elem_stride == 4, 0)) {
+        return (int64_t)((uint32_t *)a->data)[--a->len];
     }
     /* Transfers slot ownership to caller (no RC dec) */
     return a->data[--a->len];

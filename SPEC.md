@@ -17,7 +17,7 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
 3. **Compile-Time Data-Race-Free Multithreading**:
    - Native OS threads via structured concurrency (`scope` + `spawn`), `Channel[T]`, `Mutex[T]`, `AtomicInt`.
    - Every type is statically classified as `Send` or `!Send`:
-     - Primitives (`Int`, `Int64`, `Double`, `Bool`, `Byte`, `Unit`), `String`, the `World` capability (a frozen handle; spawned workers capture it explicitly to do IO/TCP), `Channel[T]` (where `T: Send`), `Mutex[T]` (where `T: Send`, or `T` is a *shareable container*: `Array[E]` or `Map[K, E]` with `K ∈ {String, Int, Int64}` whose `E` is `Send` or itself a shareable container, e.g. `Mutex[Array[Rec]]`, `Mutex[Map[String, Array[String]]]`, `Mutex[Map[Int, String]]`), `AtomicInt`, and immutable `struct`/`enum` (no `mut` fields, all fields `Send`) are `Send`.
+     - Primitives (`Int`, `Int64`, `UInt`, `UInt64`, `Double`, `Float`/`Float32`, `Bool`, `Byte`, `Int8`, `Char`, `Unit`), `String`, the `World` capability (a frozen handle; spawned workers capture it explicitly to do IO/TCP), `Channel[T]` (where `T: Send`), `Mutex[T]` (where `T: Send`, or `T` is a *shareable container*: `Array[E]` or `Map[K, E]` with `K ∈ {String, Int, Int64}` whose `E` is `Send` or itself a shareable container, e.g. `Mutex[Array[Rec]]`, `Mutex[Map[String, Array[String]]]`, `Mutex[Map[Int, String]]`), `AtomicInt`, and immutable `struct`/`enum` (no `mut` fields, all fields `Send`) are `Send`.
      - Any `struct` with `mut` fields, `Array[T]`, `Bytes`, `Map[K, V]` are `!Send` by default (must be wrapped in `Mutex[T]` or explicitly transferred via `move` with single-function linear check). A container placed in a `Mutex` (`Mutex::new` / `set`) is frozen recursively together with its elements, and every object later stored into a frozen container (`pion_map_set`, array push/store, including the inline push fast path) is frozen on insertion, so elements released on any thread keep an atomic RC. Bare `Array` / `Map` outside a `Mutex`, `Ptr` and closures stay `!Send`.
      - Capturing a non-`Send` variable in `spawn` or sending a non-`Send` value over `Channel[T]` is a compile-time error (`E_NOT_SEND`).
 4. **Explicit Capability (`World`, Vercel Zero rule)**:
@@ -97,11 +97,12 @@ compiler/
   - `UInt`: unsigned 32-bit `42U`, `0xFFFF_FFFFU` (and unsuffixed integer literals when expected type is `UInt`)
   - `UInt64`: unsigned 64-bit `42UL`, `0xFFFF_FFFF_FFFF_FFFFUL` (and unsuffixed integer literals when expected type is `UInt64`)
   - `Double`: `3.14`, scientific notation `1e-9`, `1.5E+3`
-  - `Float`: IEEE-754 32-bit single-precision `1.5f`, `0.0f` (unsuffixed floating literals such as `1.0` or `-2.5` infer `Float` directly in `Float` expected-type contexts—`let : Float`, `Float` parameters/fields/returns—emitting 32-bit `s_<lit>` directly; non-literal `Double` values never implicitly convert to `Float` and require explicit `.to_float()`; QBE `s`, C ABI `float`)
+  - `Float` (alias `Float32`): IEEE-754 32-bit single-precision `1.5f`, `0.0f` (unsuffixed floating literals such as `1.0` or `-2.5` infer `Float` directly in `Float` expected-type contexts—`let : Float`, `Float` parameters/fields/returns—emitting 32-bit `s_<lit>` directly; non-literal `Double` values never implicitly convert to `Float` and require explicit `.to_float()`; QBE `s`, C ABI `float`)
   - `Bool`: `true`, `false`
-  - `Byte`: `b'a'`, `b'\n'`, `b'\x00'`
+  - `Byte`: `b'a'`, `b'\n'`, `b'\x00'` (unsigned 8-bit `0..255`)
+ - `Int8`: signed 8-bit integer `-128..127` (contextual inference from integer literals such as `-128`, `0`, `127`; sign-extended in QBE `l`, C ABI `w`; two's-complement wrapping arithmetic, signed comparisons, arithmetic `>>`, methods `to_int`/`to_int64`/`to_uint`/`to_uint64`/`to_byte`/`to_float`/`to_double`/`to_string`/`abs`/`min`/`max`/`clamp`; inverse `.to_int8()` on all numeric types and `Byte`)
   - `Char`: `'a'`, `'\n'`, `'\x41'`, `'\u{0C}'`, `'\u{4E2D}'` (`\u{H...}`: 1–6 hex digits, Unicode scalar `0x0..=0x10FFFF` excluding surrogates `0xD800..=0xDFFF`)
-  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text kept byte-for-byte, with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`, `\xHH`, and `\u{H...}` (1–6 hex digits encoded as standard UTF-8 for Unicode scalars `0x0..=0x10FFFF` excluding surrogates); string interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `UInt`, `UInt64`, `Double`, `Float`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings).
+  - `String`: UTF-8 bytes (`length()` / `code_unit_at` count bytes); `"..."` holds any UTF-8 text kept byte-for-byte, with escapes `\n`, `\r`, `\t`, `\\`, `\"`, `\0`, `\xHH`, and `\u{H...}` (1–6 hex digits encoded as standard UTF-8 for Unicode scalars `0x0..=0x10FFFF` excluding surrogates); string interpolation `"...\{expr}..."` supporting `String`, `Int`, `Int64`, `UInt`, `UInt64`, `Int8`, `Double`, `Float`, `Bool`, `Char` (plain strings without `\{` remain zero-allocation `.rodata` immortal strings).
   - Multi-line raw string literals: `#|...` — consecutive lines prefixed with `#|` (separated by `\n` and optional leading spaces/tabs, stripping `\r` in `\r\n`) are joined with `\n` verbatim without escape or interpolation processing (UTF-8 preserved byte-for-byte; `#derive(...)` attributes remain unaffected).
 - Keywords: `fn`, `pub`, `struct`, `enum`, `let`, `mut`, `if`, `else`, `match`, `while`, `for`, `in`, `break`, `continue`, `return`, `true`, `false`, `as`, `val`, `move`, `scope`, `spawn`, `debug_assert`, `type`, `import` (and contextual top-level `test`).
 
@@ -276,7 +277,7 @@ test "test name" {
 - `Int` (`i32`): sign-extended in 64-bit register (or `w` locally, `l` across generic boundaries).
 - `Int64`: `int64_t` (`l`).
 - `Double`: IEEE-754 bit-cast (`double` / `d`, boxed to `int64_t` bits in generic slots).
-- `Bool` / `Byte` / `Char`: zero-extended in 64-bit slot (`0`/`1`, `0..255`, Unicode scalar).
+- `Bool` / `Byte` / `Char`: zero-extended in 64-bit slot (`0`/`1`, `0..255`, Unicode scalar); `Int8`: sign-extended in 64-bit slot (`-128..127`).
 - `Unit`: `0`.
 - All heap objects (`String`, `Bytes`, `Array`, `Map`, `struct`, `enum`, `Closure`, `Channel`, `Mutex`, `AtomicInt`): `PionObj*` (64-bit pointer, `l` in QBE).
 
@@ -356,6 +357,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void*   pion_bytes_concat(void *a, void *b);` (`b.concat(other) -> Bytes`)
 - `void*   pion_bytes_from_ptr(void *p, int64_t len);` (`bytes_from_ptr(p : Ptr, len : Int) -> Bytes`, allocates `len` bytes and copies from `p`; `len <= 0` returns empty `Bytes`)
 - `void    pion_bytes_copy_to_ptr(void *b, int64_t src_off, void *dst, int64_t len);` (`bytes_copy_to_ptr(b : Bytes, src_off : Int, dst : Ptr, len : Int) -> Unit`, bounds-checked `memcpy` from `b[src_off .. src_off + len)` to `dst`)
+- Inline zero-runtime-byte readers: `b.read_i8(off : Int) -> Int8` (bounds-checked `loadsb`) and `b.read_f32_le(off : Int) -> Float` (overflow-safe `len >= 4 && off <=u len - 4` bounds-checked little-endian IEEE-754 `loads`)
 - `void*   pion_bytes_to_str(void *b);` (`b.to_string() -> String`)
 
 **StringBuilder (`PionStrBuf`):**
@@ -369,8 +371,8 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void* pion_strbuf_to_str(void *sb);`
 - `StringBuilder::length() -> Int` (reads `PionStrBuf.len` at offset 0)
 
-**Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int32_t elem_stride; int64_t *data; }` — `elem_stride` at `+20`: `0`/`8` = 8-byte slots, `1` = compact 1-byte `Bool`/`Byte` slots with `elem_is_obj = 0`, `16`/`24`/`32`/`40`/`48` = flat inline 2..6-field immutable structs with `elem_is_obj` storing the RC object field bitmask where bit `k` is 1 iff slot `k` is an RC object pointer):**
-- `void*   pion_arr_new(int64_t cap, int32_t elem_flags);` (`0` = 8B scalar, `1` = 8B RC object, `2` = 1B compact `Bool`/`Byte`, `> 2` = flat inline struct with `elem_stride = elem_flags & 0xFF` in `{16, 24, 32, 40, 48}` and `elem_is_obj = elem_flags >> 8` RC field bitmask)
+**Array (`PionArray`: `{ int64_t len; int64_t cap; int32_t elem_is_obj; int32_t elem_stride; int64_t *data; }` — `elem_stride` at `+20`: `0`/`8` = 8-byte slots, `1` = compact 1-byte `Bool`/`Byte`/`Int8` slots with `elem_is_obj = 0`, `4` = compact 4-byte `Float`/`Float32` slots with `elem_is_obj = 0`, `16`/`24`/`32`/`40`/`48` = flat inline 2..6-field immutable structs with `elem_is_obj` storing the RC object field bitmask where bit `k` is 1 iff slot `k` is an RC object pointer):**
+- `void*   pion_arr_new(int64_t cap, int32_t elem_flags);` (`0` = 8B scalar, `1` = 8B RC object, `2` = 1B compact `Bool`/`Byte`/`Int8`, `4` = 4B compact `Float`/`Float32`, `> 2` = flat inline struct with `elem_stride = elem_flags & 0xFF` in `{4, 16, 24, 32, 40, 48}` and `elem_is_obj = elem_flags >> 8` RC field bitmask)
 - `int64_t pion_arr_len(void *a);`
 - `void    pion_arr_push(void *a, int64_t val);` (retains if `elem_is_obj`)
 - `void*   pion_arr_push_flat_grow(void *a);` (slow-path grow for flat-stride arrays, returning `&data[len * stride]`)
