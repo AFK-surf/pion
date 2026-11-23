@@ -142,7 +142,7 @@ export PION_CACHE_DIR="$TMP_DIR/cas_pionc2"
 mkdir -p "$PION_CACHE_DIR"
 
 echo "=== [6/9] Standalone pionc2 Gate: Compiler Core Unit Tests (pionc2 test compiler/src/core) ==="
-CORE_TEST_OUT=$("$PIONC2" test --json "$COMPILER_DIR/src/core")
+CORE_TEST_OUT=$(cd "$ROOT_DIR" && "$PIONC2" test --json "$COMPILER_DIR/src/core")
 CORE_TEST_SUMMARY=$(printf '%s' "$CORE_TEST_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')
 echo "pionc2 test --json compiler/src/core -> $CORE_TEST_SUMMARY"
 if ! printf '%s' "$CORE_TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$CORE_TEST_OUT" | grep -q '"failed":0'; then
