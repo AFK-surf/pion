@@ -66,6 +66,9 @@ if ! PIONC_BIN=$(find_pionc); then
     CC_BIN="${CC:-cc}"
     "$CC_BIN" -std=c11 -O2 -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
       -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
+    if command -v strip >/dev/null 2>&1; then
+      strip --strip-unneeded "$OUT_DIR/pion_rt.o"
+    fi
     rm -f "$OUT_DIR/libpionrt.a"
     ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
     PION_SKIP_RT_TEST=1 CC="$CC_BIN" sh "$ROOT_DIR/scripts/bootstrap.sh"

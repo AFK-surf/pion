@@ -768,6 +768,77 @@ export function createPionRuntime(opts = {}) {
     s64(p, BigInt.asIntN(64, old + BigInt(d))); return old;
   }
 
+
+  // Portable SIMD Vector & INT8 Matvec Primitives (P75-B)
+  function simdSlice(obj, isBytes, stride, off, need) {
+    sync();
+    const p = pNum(obj);
+    if (!p) pion_panic_oob(BigInt(off) + BigInt(need), 0n);
+    const len = dv.getBigInt64(p, true);
+    let dp;
+    if (isBytes) {
+      dp = Number(dv.getBigInt64(p + 16, true));
+    } else {
+      if (dv.getInt32(p + 20, true) !== stride) pion_panic_oob(-1n, len);
+      dp = Number(dv.getBigInt64(p + 24, true));
+    }
+    const offB = BigInt(off), needB = BigInt(need);
+    if (offB < 0n || needB < 0n || offB > len || needB > len - offB) {
+      pion_panic_oob(offB + needB, len);
+    }
+    return needB === 0n ? 0 : dp + off * stride;
+  }
+  function pion_simd_i8_dot(a, isBytes, aOff, b, bOff, len) {
+    const pa = simdSlice(a, isBytes, 1, aOff, len);
+    const pb = simdSlice(b, 0, 1, bOff, len);
+    let sum = 0;
+    for (let k = 0; k < len; k++) {
+      const va = (u8[pa + k] << 24) >> 24;
+      const vb = (u8[pb + k] << 24) >> 24;
+      sum = (sum + Math.imul(va, vb)) | 0;
+    }
+    return sum;
+  }
+  function pion_simd_i8_mv(out, outOff, w, isBytes, wOff, x, xOff, sc, sOff, xScale, rows, cols) {
+    const po = simdSlice(out, 0, 4, outOff, rows);
+    const px = simdSlice(x, 0, 1, xOff, cols);
+    const pw = simdSlice(w, isBytes, 1, wOff, BigInt(rows) * BigInt(cols));
+    const ps = simdSlice(sc, 0, 4, sOff, rows);
+    for (let r = 0; r < rows; r++) {
+      let sum = 0;
+      const wr = pw + r * cols;
+      for (let k = 0; k < cols; k++) {
+        const vw = (u8[wr + k] << 24) >> 24;
+        const vx = (u8[px + k] << 24) >> 24;
+        sum = (sum + Math.imul(vw, vx)) | 0;
+      }
+      const s = Math.fround(dv.getFloat32(ps + r * 4, true) * xScale);
+      dv.setFloat32(po + r * 4, Math.fround(Math.fround(sum) * s), true);
+    }
+  }
+  function pion_simd_f32(op, dst, dOff, a, aOff, b, bOff, alpha, len) {
+    const pd = simdSlice(dst, 0, 4, dOff, len);
+    const pa = simdSlice(a, 0, 4, aOff, len);
+    const pb = (op === 2 || op === 3 || op >= 5) ? simdSlice(b, 0, 4, bOff, len) : 0;
+    let sum = 0;
+    for (let i = 0; i < len; i++) {
+      const o = pd + i * 4, oa = pa + i * 4, ob = pb + i * 4;
+      if (op === 0) sum = Math.fround(sum + Math.fround(dv.getFloat32(o, true) * dv.getFloat32(oa, true)));
+      else if (op === 1) dv.setFloat32(o, Math.fround(dv.getFloat32(o, true) + Math.fround(alpha * dv.getFloat32(oa, true))), true);
+      else if (op === 2) dv.setFloat32(o, Math.fround(dv.getFloat32(oa, true) * dv.getFloat32(ob, true)), true);
+      else if (op === 3) dv.setFloat32(o, Math.fround(dv.getFloat32(oa, true) + dv.getFloat32(ob, true)), true);
+      else if (op === 4) dv.setFloat32(o, Math.fround(dv.getFloat32(oa, true) * alpha), true);
+      else {
+        const v = op === 5
+          ? Math.fround(dv.getFloat32(o, true) * dv.getFloat32(oa, true))
+          : Math.fround(dv.getFloat32(o, true) + Math.fround(alpha * dv.getFloat32(oa, true)));
+        dv.setFloat32(o, v, true);
+        sum = Math.fround(sum + Math.fround(v * dv.getFloat32(ob, true)));
+      }
+    }
+    return Math.fround(sum);
+  }
+
   const imports = {
     pion_rt: {
       pion_cur_tid: () => 1n, pion_alloc, pion_alloc_uninit,
@@ -795,6 +866,7 @@ export function createPionRuntime(opts = {}) {
       pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_push_flat_grow, pion_arr_get,
       pion_arr_set, pion_arr_pop, pion_arr_copy, pion_arr_clear, pion_arr_reverse,
       pion_arr_join, pion_arr_sort_int, pion_arr_sort_str,
+      pion_simd_i8_dot, pion_simd_i8_mv, pion_simd_f32,
       pion_map_new, pion_map_new_int, pion_map_len, pion_map_set, pion_map_has,
       pion_map_get, pion_map_try_get, pion_map_remove, pion_map_clear, pion_map_copy, pion_map_keys,
       pion_scope_begin, pion_scope_spawn, pion_scope_end,

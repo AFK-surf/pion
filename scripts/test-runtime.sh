@@ -10,6 +10,13 @@ mkdir -p "$OUT_DIR"
 
 echo "=== 1. Build libpionrt.a (-O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror) ==="
 "$CC" -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
+if command -v strip >/dev/null 2>&1; then
+    if [ "$(uname -s)" = "Darwin" ]; then
+        strip -x "$OUT_DIR/pion_rt.o"
+    else
+        strip --strip-unneeded "$OUT_DIR/pion_rt.o"
+    fi
+fi
 rm -f "$OUT_DIR/libpionrt.a"
 ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
 LIB_SIZE="$(wc -c < "$OUT_DIR/libpionrt.a" | tr -d ' ')"

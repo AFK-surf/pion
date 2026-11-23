@@ -299,6 +299,14 @@ int32_t  pion_poll_wait(void *w_ptr, int32_t pfd, void *out_fds, void *out_event
                         int32_t max_events, int32_t timeout_ms);
 void     pion_poll_close(void *w_ptr, int32_t pfd);
 
+/* Portable SIMD Vector & Quantized INT8 Matvec Primitives (P75-B, 3-entrypoint ABI) */
+int32_t  pion_simd_i8_dot(void *a, int32_t a_is_bytes, int32_t a_off, void *b, int32_t b_off, int32_t len);
+void     pion_simd_i8_mv(void *out, int32_t out_off, void *w, int32_t w_is_bytes, int32_t w_off,
+                         void *x, int32_t x_off, void *sc, int32_t s_off,
+                         float x_scale, int32_t rows, int32_t cols);
+float    pion_simd_f32(int32_t op, void *dst, int32_t d_off, void *a, int32_t a_off,
+                       void *b, int32_t b_off, float alpha, int32_t len);
+
 #ifdef __cplusplus
 }
 #endif

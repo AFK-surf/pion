@@ -357,6 +357,19 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `void*   pion_bytes_concat(void *a, void *b);` (`b.concat(other) -> Bytes`)
 - `void*   pion_bytes_from_ptr(void *p, int64_t len);` (`bytes_from_ptr(p : Ptr, len : Int) -> Bytes`, allocates `len` bytes and copies from `p`; `len <= 0` returns empty `Bytes`)
 - `void    pion_bytes_copy_to_ptr(void *b, int64_t src_off, void *dst, int64_t len);` (`bytes_copy_to_ptr(b : Bytes, src_off : Int, dst : Ptr, len : Int) -> Unit`, bounds-checked `memcpy` from `b[src_off .. src_off + len)` to `dst`)
+
+**Portable SIMD Vector & Quantized INT8 Matvec Primitives (P75-B; bounds-checked via `pion_panic_oob`, ARM64 NEON/SDOT + x86_64 AVX2/SSE2 + Wasm32 parity; lowered to 3 C/Wasm ABI entrypoints `pion_simd_i8_dot`, `pion_simd_i8_mv`, `pion_simd_f32`):**
+- `simd_dot_i8(a : Array[Int8], a_off : Int, b : Array[Int8], b_off : Int, len : Int) -> Int` (`pion_simd_i8_dot(..., a_is_bytes=0, ...)`)
+- `simd_dot_i8_bytes(a : Bytes, a_off : Int, b : Array[Int8], b_off : Int, len : Int) -> Int` (`pion_simd_i8_dot(..., a_is_bytes=1, ...)`)
+- `simd_matvec_i8_f32(out : Array[Float], out_off : Int, w : Array[Int8], w_off : Int, x : Array[Int8], x_off : Int, scales : Array[Float], s_off : Int, x_scale : Float, rows : Int, cols : Int) -> Unit` (`pion_simd_i8_mv(..., w_is_bytes=0, ...)`; 4-row tiled, `out[out_off + r] = (float)dot_i8(&w[w_off + r*cols], &x[x_off], cols) * (scales[s_off + r] * x_scale)`)
+- `simd_matvec_i8_bytes_f32(out : Array[Float], out_off : Int, w : Bytes, w_off : Int, x : Array[Int8], x_off : Int, scales : Array[Float], s_off : Int, x_scale : Float, rows : Int, cols : Int) -> Unit` (`pion_simd_i8_mv(..., w_is_bytes=1, ...)`)
+- `simd_dot_f32(a : Array[Float], a_off : Int, b : Array[Float], b_off : Int, len : Int) -> Float` (`pion_simd_f32(op=0, ...)`)
+- `simd_axpy_f32(dst : Array[Float], d_off : Int, x : Array[Float], x_off : Int, alpha : Float, len : Int) -> Unit` (`pion_simd_f32(op=1, ...)`; in-place aliasing safe)
+- `simd_mul_f32(dst : Array[Float], d_off : Int, a : Array[Float], a_off : Int, b : Array[Float], b_off : Int, len : Int) -> Unit` (`pion_simd_f32(op=2, ...)`)
+- `simd_add_f32(dst : Array[Float], d_off : Int, a : Array[Float], a_off : Int, b : Array[Float], b_off : Int, len : Int) -> Unit` (`pion_simd_f32(op=3, ...)`)
+- `simd_scale_f32(dst : Array[Float], d_off : Int, x : Array[Float], x_off : Int, scale : Float, len : Int) -> Unit` (`pion_simd_f32(op=4, ...)`)
+- `simd_mul_dot_f32(dst : Array[Float], d_off : Int, a : Array[Float], a_off : Int, b : Array[Float], b_off : Int, len : Int) -> Float` (`pion_simd_f32(op=5, ...)`; fused `v = dst[i]*a[i]; dst[i] = v; sum += v*b[i]`)
+- `simd_axpy_dot_f32(dst : Array[Float], d_off : Int, a : Array[Float], a_off : Int, alpha : Float, b : Array[Float], b_off : Int, len : Int) -> Float` (`pion_simd_f32(op=6, ...)`; fused `v = dst[i]+alpha*a[i]; dst[i] = v; sum += v*b[i]`)
 - Inline zero-runtime-byte readers: `b.read_i8(off : Int) -> Int8` (bounds-checked `loadsb`) and `b.read_f32_le(off : Int) -> Float` (overflow-safe `len >= 4 && off <=u len - 4` bounds-checked little-endian IEEE-754 `loads`)
 - `void*   pion_bytes_to_str(void *b);` (`b.to_string() -> String`)
 
