@@ -6368,6 +6368,10 @@ fn qbe_bce_expr_is_safe(g : QbeGen, arr : String, idx : Expr) -> Bool {
       let c = qbe_parse_int64_lit(raw)
       g.bce_safe_exprs.contains(arr + ":iv+:" + iname + ":" + c.to_string())
     }
+    EBinary("-", EIdent(iname, _), EInt(raw, _), _) => {
+      let c = qbe_parse_int64_lit(raw)
+      g.bce_safe_exprs.contains(arr + ":iv+:" + iname + ":" + (0L - c).to_string())
+    }
     EBinary("-", EIdent(vname, _), EIdent(iname, _), _) =>
       g.bce_safe_exprs.contains(arr + ":v-iv:" + vname + ":" + iname)
     _ => false
@@ -18819,21 +18823,57 @@ fn qbe_emit_method_call(
                 qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
                 qbe_emit(g, dp + " =l loadl " + dp_p)
                 qbe_emit(g, ep + " =l add " + dp + ", " + slen)
-                si = 0
-                while si < slen_lit {
-                  let ch = str_code_at(s, si).to_string()
-                  if si == 0 {
-                    qbe_emit(g, "storeb " + ch + ", " + ep)
+                let total_b = slen_lit + 1
+                let mut off_b = 0
+                while off_b < total_b {
+                  let rem = total_b - off_b
+                  let dst = if off_b == 0 {
+                    ep
                   } else {
                     let pk = qbe_tmp(g)
-                    qbe_emit(g, pk + " =l add " + ep + ", " + si.to_string())
-                    qbe_emit(g, "storeb " + ch + ", " + pk)
+                    qbe_emit(g, pk + " =l add " + ep + ", " + off_b.to_string())
+                    pk
                   }
-                  si = si + 1
+                  if rem >= 8 {
+                    let mut v : Int64 = 0L
+                    let mut k = 0
+                    while k < 8 {
+                      let b = if off_b + k < slen_lit {
+                        str_code_at(s, off_b + k).to_int64()
+                      } else {
+                        0L
+                      }
+                      v = v | (b << (k * 8))
+                      k = k + 1
+                    }
+                    qbe_emit(g, "storel " + v.to_string() + ", " + dst)
+                    off_b = off_b + 8
+                  } else if rem >= 4 {
+                    let mut v = 0
+                    let mut k = 0
+                    while k < 4 {
+                      let b = if off_b + k < slen_lit {
+                        str_code_at(s, off_b + k)
+                      } else {
+                        0
+                      }
+                      v = v | (b << (k * 8))
+                      k = k + 1
+                    }
+                    qbe_emit(g, "storew " + v.to_string() + ", " + dst)
+                    off_b = off_b + 4
+                  } else if rem >= 2 {
+                    let b0 = if off_b < slen_lit { str_code_at(s, off_b) } else { 0 }
+                    let b1 = if off_b + 1 < slen_lit { str_code_at(s, off_b + 1) } else { 0 }
+                    let v = b0 | (b1 << 8)
+                    qbe_emit(g, "storeh " + v.to_string() + ", " + dst)
+                    off_b = off_b + 2
+                  } else {
+                    let b0 = if off_b < slen_lit { str_code_at(s, off_b) } else { 0 }
+                    qbe_emit(g, "storeb " + b0.to_string() + ", " + dst)
+                    off_b = off_b + 1
+                  }
                 }
-                let pz = qbe_tmp(g)
-                qbe_emit(g, pz + " =l add " + ep + ", " + slen_lit.to_string())
-                qbe_emit(g, "storeb 0, " + pz)
                 qbe_emit(g, "storel " + nlen + ", " + obj_val)
                 qbe_emit_term(g, "jmp " + l_end)
                 qbe_emit_lbl(g, l_slow)
@@ -29756,14 +29796,93 @@ fn qbe_try_emit_while_bce_versioned(
       pgi = pgi + 1
     }
   }
-  let do_unroll4 = qbe_can_unroll4_fast_while(g, body, step_slot, extra_cond)
+  // P69-B Opt 1: compact Array[Bool] 8-byte SWAR counting loop detection
+  let mut swar_dp = ""
+  let mut swar_cnt_slot = ""
+  let mut swar_cnt_is_i64 = false
+  if g.release &&
+    step_slot == "" &&
+    body.length() == 2 &&
+    !qbe_stmts_has_cf(body, true, true, true) {
+    match extra_cond {
+      None =>
+        match body[0] {
+          SExpr(EIf(EIndex(EIdent(arr_n, _), EIdent(idx_n, _), _), then_s, else_opt, _), _) => {
+            let no_else = match else_opt {
+              None => true
+              Some(EBlock(es, _)) => es.length() == 0
+              Some(_) => false
+            }
+            if idx_n == iv && no_else && then_s.length() == 1 {
+              let cnt_n = match then_s[0] {
+                SAssign(EIdent(ln, _), EBinary("+", EIdent(rn, _), EInt(raw, _), _), _) =>
+                  if ln == rn && qbe_parse_int64_lit(raw) == 1L { ln } else { "" }
+                SAssign(EIdent(ln, _), EBinary("+", EIdent(rn, _), EInt64(raw, _), _), _) =>
+                  if ln == rn && qbe_parse_int64_lit(raw) == 1L { ln } else { "" }
+                SCompoundAssign("+", EIdent(ln, _), EInt(raw, _), _) =>
+                  if qbe_parse_int64_lit(raw) == 1L { ln } else { "" }
+                SCompoundAssign("+", EIdent(ln, _), EInt64(raw, _), _) =>
+                  if qbe_parse_int64_lit(raw) == 1L { ln } else { "" }
+                _ => ""
+              }
+              if cnt_n != "" && cnt_n != iv && cnt_n != arr_n && seen.contains(arr_n + ":iv:" + iv) {
+                let is_bool_arr = match qbe_lookup_local(g, arr_n) {
+                  Some(aloc) =>
+                    match aloc.ty {
+                      TArray(TBool) | TFixedArray(TBool) => true
+                      _ => false
+                    }
+                  None => false
+                }
+                if is_bool_arr {
+                  match g.hoisted_arr_dp.get(arr_n) {
+                    Some(hdp) =>
+                      match qbe_lookup_local(g, cnt_n) {
+                        Some(cloc) =>
+                          if !cloc.is_cell {
+                            if qbe_is_int32_ty(cloc.ty) {
+                              swar_dp = hdp
+                              swar_cnt_slot = cloc.slot
+                              swar_cnt_is_i64 = false
+                            } else {
+                              match cloc.ty {
+                                TInt64 => {
+                                  swar_dp = hdp
+                                  swar_cnt_slot = cloc.slot
+                                  swar_cnt_is_i64 = true
+                                }
+                                _ => ()
+                              }
+                            }
+                          }
+                        None => ()
+                      }
+                    None => ()
+                  }
+                }
+              }
+            }
+          }
+          _ => ()
+        }
+      Some(_) => ()
+    }
+  }
+  let do_swar = swar_dp != ""
+  let do_unroll4 = if do_swar { false } else { qbe_can_unroll4_fast_while(g, body, step_slot, extra_cond) }
+  let l_swar_chk = if do_swar { qbe_lbl(g, "wh_swc") } else { "" }
+  let l_swar_pre = if do_swar { qbe_lbl(g, "wh_swp") } else { "" }
+  let l_swar = if do_swar { qbe_lbl(g, "wh_sw") } else { "" }
+  let l_swar_tail = if do_swar { qbe_lbl(g, "wh_swt") } else { "" }
   let l_u4_chk = if do_unroll4 { qbe_lbl(g, "wh_u4c") } else { "" }
   let l_u4 = if do_unroll4 { qbe_lbl(g, "wh_u4") } else { "" }
   let l_u4_tail = if do_unroll4 { qbe_lbl(g, "wh_u4t") } else { "" }
   match extra_cond {
     Some(_) => qbe_emit_term(g, "jnz " + all_ok + ", " + l_fentry + ", " + l_sentry)
     None =>
-      if do_unroll4 {
+      if do_swar {
+        qbe_emit_term(g, "jnz " + all_ok + ", " + l_swar_chk + ", " + l_slow)
+      } else if do_unroll4 {
         qbe_emit_term(g, "jnz " + all_ok + ", " + l_u4_chk + ", " + l_slow)
       } else {
         qbe_emit_term(g, "jnz " + all_ok + ", " + l_fast + ", " + l_slow)
@@ -29798,7 +29917,131 @@ fn qbe_try_emit_while_bce_versioned(
     }
     None => ()
   }
+  if do_swar {
+    qbe_emit_lbl(g, l_swar_chk)
+    let sw_lim_l = qbe_tmp(g)
+    let sw_ok = qbe_tmp(g)
+    qbe_emit(g, sw_lim_l + " =l sub " + bnd_l + ", 7")
+    qbe_emit(g, sw_ok + " =w csltl " + iv0_l + ", " + sw_lim_l)
+    qbe_emit_term(g, "jnz " + sw_ok + ", " + l_swar_pre + ", " + l_fast)
+    qbe_emit_lbl(g, l_swar_pre)
+    let sw_p_slot = qbe_alloc_slot(g)
+    let sw_c_slot = qbe_alloc_slot(g)
+    let sw_p0 = qbe_tmp(g)
+    let sw_plim = qbe_tmp(g)
+    qbe_emit(g, sw_p0 + " =l add " + swar_dp + ", " + iv0_l)
+    qbe_emit(g, sw_plim + " =l add " + swar_dp + ", " + sw_lim_l)
+    qbe_emit(g, "storel " + sw_p0 + ", " + sw_p_slot)
+    if swar_cnt_is_i64 {
+      let c0_l = qbe_tmp(g)
+      qbe_emit(g, c0_l + " =l loadl " + swar_cnt_slot)
+      qbe_emit(g, "storel " + c0_l + ", " + sw_c_slot)
+    } else {
+      let c0_w = qbe_tmp(g)
+      let c0_l = qbe_tmp(g)
+      qbe_emit(g, c0_w + " =w loadsw " + swar_cnt_slot)
+      qbe_emit(g, c0_l + " =l extsw " + c0_w)
+      qbe_emit(g, "storel " + c0_l + ", " + sw_c_slot)
+    }
+    qbe_emit_term(g, "jmp " + l_swar)
+    qbe_emit_lbl(g, l_swar)
+    let sw_p = qbe_tmp(g)
+    let sw_w = qbe_tmp(g)
+    let sw_prod = qbe_tmp(g)
+    let sw_c8 = qbe_tmp(g)
+    let sw_ccur = qbe_tmp(g)
+    let sw_cnxt = qbe_tmp(g)
+    let sw_pnxt = qbe_tmp(g)
+    let sw_more = qbe_tmp(g)
+    qbe_emit(g, sw_p + " =l loadl " + sw_p_slot)
+    qbe_emit(g, sw_w + " =l loadl " + sw_p)
+    qbe_emit(g, sw_prod + " =l mul " + sw_w + ", 72340172838076673")
+    qbe_emit(g, sw_c8 + " =l shr " + sw_prod + ", 56")
+    qbe_emit(g, sw_ccur + " =l loadl " + sw_c_slot)
+    qbe_emit(g, sw_cnxt + " =l add " + sw_ccur + ", " + sw_c8)
+    qbe_emit(g, "storel " + sw_cnxt + ", " + sw_c_slot)
+    qbe_emit(g, sw_pnxt + " =l add " + sw_p + ", 8")
+    qbe_emit(g, "storel " + sw_pnxt + ", " + sw_p_slot)
+    qbe_emit(g, sw_more + " =w cultl " + sw_pnxt + ", " + sw_plim)
+    qbe_emit_term(g, "jnz " + sw_more + ", " + l_swar + ", " + l_swar_tail)
+    qbe_emit_lbl(g, l_swar_tail)
+    let sw_cfin = qbe_tmp(g)
+    qbe_emit(g, sw_cfin + " =l loadl " + sw_c_slot)
+    if swar_cnt_is_i64 {
+      qbe_emit(g, "storel " + sw_cfin + ", " + swar_cnt_slot)
+    } else {
+      qbe_emit(g, "storew " + sw_cfin + ", " + swar_cnt_slot)
+    }
+    let sw_pfin = qbe_tmp(g)
+    let sw_ivfin = qbe_tmp(g)
+    qbe_emit(g, sw_pfin + " =l loadl " + sw_p_slot)
+    qbe_emit(g, sw_ivfin + " =l sub " + sw_pfin + ", " + swar_dp)
+    qbe_emit(g, "storew " + sw_ivfin + ", " + iv_slot)
+    qbe_emit_cond_branch(g, cond, l_fast, l_end)
+  }
   if do_unroll4 {
+    // P69-B Opt 2: var-step 4x unroll with independent pointer stores (eliminates serial add chain + sxtw)
+    let mut ptr_u4_dp = ""
+    let mut ptr_u4_stride = 0
+    let mut ptr_u4_elem : Ty = TUnit
+    let mut ptr_u4_rhs : Option[Expr] = None
+    if step_slot != "" && body.length() == 2 {
+      match body[0] {
+        SAssign(EIndex(EIdent(arr_n, _), EIdent(idx_n, _), _), rhs_e, _) =>
+          if idx_n == iv && seen.contains(arr_n + ":iv:" + iv) {
+            let rhs_inv = match rhs_e {
+              EBool(_, _) | EInt(_, _) | EInt64(_, _) | EByte(_, _) | EDouble(_, _) => true
+              EIdent(rn, _) =>
+                if rn != iv && !qbe_stmts_assigns_ident(body, rn) && !qbe_stmts_rebinds_ident(body, rn) {
+                  match qbe_lookup_local(g, rn) {
+                    Some(rloc) => !rloc.is_cell && qbe_is_prim_array_elem(rloc.ty)
+                    None => false
+                  }
+                } else {
+                  false
+                }
+              _ => false
+            }
+            if rhs_inv {
+              match qbe_lookup_local(g, arr_n) {
+                Some(aloc) => {
+                  let elem_opt : Option[Ty] = match aloc.ty {
+                    TArray(e) => Some(e)
+                    TFixedArray(e) => Some(e)
+                    _ => None
+                  }
+                  match elem_opt {
+                    Some(e) => {
+                      let st = if qbe_is_u8_array_elem(g, e) {
+                        1
+                      } else {
+                        match e {
+                          TInt | TInt64 | TUInt | TUInt64 | TDouble => 8
+                          _ => 0
+                        }
+                      }
+                      if st > 0 {
+                        match g.hoisted_arr_dp.get(arr_n) {
+                          Some(hdp) => {
+                            ptr_u4_dp = hdp
+                            ptr_u4_stride = st
+                            ptr_u4_elem = e
+                            ptr_u4_rhs = Some(rhs_e)
+                          }
+                          None => ()
+                        }
+                      }
+                    }
+                    None => ()
+                  }
+                }
+                None => ()
+              }
+            }
+          }
+        _ => ()
+      }
+    }
     qbe_emit_lbl(g, l_u4_chk)
     let u4_lim_l = qbe_tmp(g)
     let u4_ok = qbe_tmp(g)
@@ -29810,28 +30053,123 @@ fn qbe_try_emit_while_bce_versioned(
       qbe_emit(g, u4_lim_l + " =l sub " + bnd_l + ", " + st3_l)
     }
     qbe_emit(g, u4_ok + " =w csltl " + iv0_l + ", " + u4_lim_l)
-    qbe_emit_term(g, "jnz " + u4_ok + ", " + l_u4 + ", " + l_fast)
-    qbe_emit_lbl(g, l_u4)
-    let mut ui = 0
-    while ui < 4 {
-      g.block_immut_fields = Map([])
-      qbe_scope_push(g)
-      let ubv = qbe_emit_stmts(g, body, None)
-      if !g.block_term {
-        qbe_rc_dec(g, ubv.reg, ubv.ty)
+    if ptr_u4_dp != "" {
+      let l_u4_pre = qbe_lbl(g, "wh_u4p")
+      qbe_emit_term(g, "jnz " + u4_ok + ", " + l_u4_pre + ", " + l_fast)
+      qbe_emit_lbl(g, l_u4_pre)
+      let rhs_val = match ptr_u4_rhs {
+        Some(re) => qbe_emit_expr(g, re, Some(ptr_u4_elem))
+        None => qval("0", ptr_u4_elem)
       }
-      qbe_scope_pop(g)
-      ui = ui + 1
+      let coerced_rhs = qbe_coerce_val(g, rhs_val, ptr_u4_elem)
+      let ptr_u4_is_dbl = match ptr_u4_elem {
+        TDouble => true
+        _ => false
+      }
+      let store_val = if ptr_u4_stride == 1 {
+        coerced_rhs
+      } else if ptr_u4_is_dbl {
+        coerced_rhs
+      } else {
+        qbe_as_l(g, qval(coerced_rhs, ptr_u4_elem))
+      }
+      let st1 = if ptr_u4_stride == 1 {
+        step_l_reg
+      } else {
+        let s1 = qbe_tmp(g)
+        qbe_emit(g, s1 + " =l shl " + step_l_reg + ", 3")
+        s1
+      }
+      let st2 = qbe_tmp(g)
+      let st3 = qbe_tmp(g)
+      let st4 = qbe_tmp(g)
+      qbe_emit(g, st2 + " =l add " + st1 + ", " + st1)
+      qbe_emit(g, st3 + " =l add " + st2 + ", " + st1)
+      qbe_emit(g, st4 + " =l add " + st2 + ", " + st2)
+      let iv0_off = if ptr_u4_stride == 1 {
+        iv0_l
+      } else {
+        let o0 = qbe_tmp(g)
+        qbe_emit(g, o0 + " =l shl " + iv0_l + ", 3")
+        o0
+      }
+      let lim_off = if ptr_u4_stride == 1 {
+        u4_lim_l
+      } else {
+        let ol = qbe_tmp(g)
+        qbe_emit(g, ol + " =l shl " + u4_lim_l + ", 3")
+        ol
+      }
+      let p_slot = qbe_alloc_slot(g)
+      let p0 = qbe_tmp(g)
+      let p_lim = qbe_tmp(g)
+      qbe_emit(g, p0 + " =l add " + ptr_u4_dp + ", " + iv0_off)
+      qbe_emit(g, p_lim + " =l add " + ptr_u4_dp + ", " + lim_off)
+      qbe_emit(g, "storel " + p0 + ", " + p_slot)
+      qbe_emit_term(g, "jmp " + l_u4)
+      qbe_emit_lbl(g, l_u4)
+      let p_cur = qbe_tmp(g)
+      let p1 = qbe_tmp(g)
+      let p2 = qbe_tmp(g)
+      let p3 = qbe_tmp(g)
+      let p_nxt = qbe_tmp(g)
+      let c_u4 = qbe_tmp(g)
+      qbe_emit(g, p_cur + " =l loadl " + p_slot)
+      qbe_emit(g, p1 + " =l add " + p_cur + ", " + st1)
+      qbe_emit(g, p2 + " =l add " + p_cur + ", " + st2)
+      qbe_emit(g, p3 + " =l add " + p_cur + ", " + st3)
+      let sop = if ptr_u4_stride == 1 {
+        "storeb "
+      } else if ptr_u4_is_dbl {
+        "stored "
+      } else {
+        "storel "
+      }
+      qbe_emit(g, sop + store_val + ", " + p_cur)
+      qbe_emit(g, sop + store_val + ", " + p1)
+      qbe_emit(g, sop + store_val + ", " + p2)
+      qbe_emit(g, sop + store_val + ", " + p3)
+      qbe_emit(g, p_nxt + " =l add " + p_cur + ", " + st4)
+      qbe_emit(g, "storel " + p_nxt + ", " + p_slot)
+      qbe_emit(g, c_u4 + " =w cultl " + p_nxt + ", " + p_lim)
+      qbe_emit_term(g, "jnz " + c_u4 + ", " + l_u4 + ", " + l_u4_tail)
+      qbe_emit_lbl(g, l_u4_tail)
+      let p_fin = qbe_tmp(g)
+      let diff = qbe_tmp(g)
+      qbe_emit(g, p_fin + " =l loadl " + p_slot)
+      qbe_emit(g, diff + " =l sub " + p_fin + ", " + ptr_u4_dp)
+      if ptr_u4_stride == 1 {
+        qbe_emit(g, "storew " + diff + ", " + iv_slot)
+      } else {
+        let iv_fin = qbe_tmp(g)
+        qbe_emit(g, iv_fin + " =l shr " + diff + ", 3")
+        qbe_emit(g, "storew " + iv_fin + ", " + iv_slot)
+      }
+      qbe_emit_cond_branch(g, cond, l_fast, l_end)
+    } else {
+      qbe_emit_term(g, "jnz " + u4_ok + ", " + l_u4 + ", " + l_fast)
+      qbe_emit_lbl(g, l_u4)
+      let mut ui = 0
+      while ui < 4 {
+        g.block_immut_fields = Map([])
+        qbe_scope_push(g)
+        let ubv = qbe_emit_stmts(g, body, None)
+        if !g.block_term {
+          qbe_rc_dec(g, ubv.reg, ubv.ty)
+        }
+        qbe_scope_pop(g)
+        ui = ui + 1
+      }
+      let iv_u4_w = qbe_tmp(g)
+      let iv_u4_l = qbe_tmp(g)
+      let c_u4 = qbe_tmp(g)
+      qbe_emit(g, iv_u4_w + " =w loadsw " + iv_slot)
+      qbe_emit(g, iv_u4_l + " =l extsw " + iv_u4_w)
+      qbe_emit(g, c_u4 + " =w csltl " + iv_u4_l + ", " + u4_lim_l)
+      qbe_emit_term(g, "jnz " + c_u4 + ", " + l_u4 + ", " + l_u4_tail)
+      qbe_emit_lbl(g, l_u4_tail)
+      qbe_emit_cond_branch(g, cond, l_fast, l_end)
     }
-    let iv_u4_w = qbe_tmp(g)
-    let iv_u4_l = qbe_tmp(g)
-    let c_u4 = qbe_tmp(g)
-    qbe_emit(g, iv_u4_w + " =w loadsw " + iv_slot)
-    qbe_emit(g, iv_u4_l + " =l extsw " + iv_u4_w)
-    qbe_emit(g, c_u4 + " =w csltl " + iv_u4_l + ", " + u4_lim_l)
-    qbe_emit_term(g, "jnz " + c_u4 + ", " + l_u4 + ", " + l_u4_tail)
-    qbe_emit_lbl(g, l_u4_tail)
-    qbe_emit_cond_branch(g, cond, l_fast, l_end)
   }
   qbe_emit_lbl(g, l_fast)
   let loop_depth = g.scopes.length()
@@ -29891,6 +30229,278 @@ fn qbe_try_emit_while_bce_versioned(
   qbe_emit_lbl(g, l_end)
   true
 }
+///|
+fn qbe_bce_collect_dec_arrs_expr(
+  g : QbeGen,
+  body : Array[Stmt],
+  iv : String,
+  e : Expr,
+  out : Array[String],
+  seen : Map[String, Bool],
+) -> Unit {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => ()
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | EField(inner, _, _)
+    | ETry(inner, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _) =>
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, inner, out, seen)
+    EBinary(_, l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) => {
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, l, out, seen)
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, r, out, seen)
+    }
+    EIndex(obj, idx, _) => {
+      let arr_name = match obj {
+        EIdent(an, _) => an
+        EField(EIdent(vn, _), fnm, _) => vn + "." + fnm
+        _ => ""
+      }
+      if arr_name != "" &&
+        (g.hoisted_arr_len.contains(arr_name) ||
+          g.hoisted_str_len.contains(arr_name) ||
+          g.hoisted_bytes_len.contains(arr_name)) &&
+        !qbe_stmts_rebinds_ident(body, arr_name) {
+        match idx {
+          EBinary("-", EIdent(iname, _), EInt(raw, _), _) =>
+            if iname == iv && qbe_parse_int64_lit(raw) == 1L && !seen.contains(arr_name) {
+              seen.set(arr_name, true)
+              out.push(arr_name)
+            }
+          _ => ()
+        }
+      }
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, obj, out, seen)
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, idx, out, seen)
+    }
+    ECall(callee, args, _) => {
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, callee, out, seen)
+      let mut i = 0
+      while i < args.length() {
+        qbe_bce_collect_dec_arrs_expr(g, body, iv, args[i], out, seen)
+        i = i + 1
+      }
+    }
+    EMethodCall(obj, _, args, _) => {
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, obj, out, seen)
+      let mut i = 0
+      while i < args.length() {
+        qbe_bce_collect_dec_arrs_expr(g, body, iv, args[i], out, seen)
+        i = i + 1
+      }
+    }
+    EIf(c, ts, eo, _) => {
+      qbe_bce_collect_dec_arrs_expr(g, body, iv, c, out, seen)
+      qbe_bce_collect_dec_arrs_stmts(g, body, iv, ts, out, seen)
+      match eo {
+        Some(ee) => qbe_bce_collect_dec_arrs_expr(g, body, iv, ee, out, seen)
+        None => ()
+      }
+    }
+    EBlock(ss, _) => qbe_bce_collect_dec_arrs_stmts(g, body, iv, ss, out, seen)
+    _ => ()
+  }
+}
+
+///|
+fn qbe_bce_collect_dec_arrs_stmts(
+  g : QbeGen,
+  body : Array[Stmt],
+  iv : String,
+  stmts : Array[Stmt],
+  out : Array[String],
+  seen : Map[String, Bool],
+) -> Unit {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(_, _, _, init, _) => qbe_bce_collect_dec_arrs_expr(g, body, iv, init, out, seen)
+      SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) => {
+        qbe_bce_collect_dec_arrs_expr(g, body, iv, lhs, out, seen)
+        qbe_bce_collect_dec_arrs_expr(g, body, iv, rhs, out, seen)
+      }
+      SExpr(e, _) => qbe_bce_collect_dec_arrs_expr(g, body, iv, e, out, seen)
+      _ => ()
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn qbe_try_emit_while_dec_bce_versioned(
+  g : QbeGen,
+  cond : Expr,
+  body : Array[Stmt],
+) -> Bool {
+  if body.length() == 0 ||
+    body.length() > 16 ||
+    qbe_stmts_has_nested_loop(body) ||
+    qbe_stmts_has_cf(body, true, true, true) {
+    return false
+  }
+  let mut iv = ""
+  let mut stop_lit = 0L
+  let mut matched_cond = false
+  match cond {
+    EBinary("!=", EIdent(iv_n, _), EInt(raw, _), _) => {
+      let c = qbe_parse_int64_lit(raw).to_int().to_int64()
+      if c >= 1L {
+        iv = iv_n
+        stop_lit = c
+        matched_cond = true
+      }
+    }
+    EBinary(">", EIdent(iv_n, _), EInt(raw, _), _) => {
+      let c = qbe_parse_int64_lit(raw).to_int().to_int64()
+      if c >= 0L {
+        iv = iv_n
+        stop_lit = c
+        matched_cond = true
+      }
+    }
+    _ => ()
+  }
+  if !matched_cond {
+    return false
+  }
+  let iv_slot = match qbe_lookup_local(g, iv) {
+    Some(iloc) =>
+      if !iloc.is_cell && qbe_is_int32_ty(iloc.ty) {
+        iloc.slot
+      } else {
+        return false
+      }
+    None => return false
+  }
+  if !qbe_stmt_is_dec_by_one(body[body.length() - 1], iv) {
+    return false
+  }
+  let mut bi = 0
+  while bi < body.length() - 1 {
+    if qbe_stmt_assigns_ident(body[bi], iv) || qbe_stmt_rebinds_ident(body[bi], iv) {
+      return false
+    }
+    bi = bi + 1
+  }
+  let arrs : Array[String] = []
+  let seen : Map[String, Bool] = Map([])
+  qbe_bce_collect_dec_arrs_stmts(g, body, iv, body, arrs, seen)
+  if arrs.length() == 0 {
+    return false
+  }
+
+  let l_vchk = qbe_lbl(g, "wh_vchk")
+  let l_fast = qbe_lbl(g, "wh_fast")
+  let l_fcond = qbe_lbl(g, "wh_fc")
+  let l_slow = qbe_lbl(g, "wh_slow")
+  let l_scond = qbe_lbl(g, "wh_sc")
+  let l_end = qbe_lbl(g, "wh_e")
+
+  qbe_emit_cond_branch(g, cond, l_vchk, l_end)
+
+  // Pre-loop guard: iv0 > stop_lit (ensures no underflow on !=) AND iv0 <= alen for every arr
+  qbe_emit_lbl(g, l_vchk)
+  let iv0_w = qbe_tmp(g)
+  let iv0_l = qbe_tmp(g)
+  let mut all_ok = qbe_tmp(g)
+  qbe_emit(g, iv0_w + " =w loadsw " + iv_slot)
+  qbe_emit(g, iv0_l + " =l extsw " + iv0_w)
+  qbe_emit(g, all_ok + " =w csgtl " + iv0_l + ", " + stop_lit.to_string())
+  let mut ai = 0
+  while ai < arrs.length() {
+    let aname = arrs[ai]
+    let alen = match g.hoisted_arr_len.get(aname) {
+      Some(hl) => hl
+      None =>
+        match g.hoisted_str_len.get(aname) {
+          Some(hsl) => hsl
+          None =>
+            match g.hoisted_bytes_len.get(aname) {
+              Some(hbl) => hbl
+              None => "0"
+            }
+        }
+    }
+    let c_len = qbe_tmp(g)
+    let nxt = qbe_tmp(g)
+    qbe_emit(g, c_len + " =w cslel " + iv0_l + ", " + alen)
+    qbe_emit(g, nxt + " =w and " + all_ok + ", " + c_len)
+    all_ok = nxt
+    ai = ai + 1
+  }
+  qbe_emit_term(g, "jnz " + all_ok + ", " + l_fast + ", " + l_slow)
+
+  // Fast bottom-tested decrementing loop (zero OOB checks on arr[iv - 1])
+  let added_keys : Array[String] = []
+  ai = 0
+  while ai < arrs.length() {
+    let k = arrs[ai] + ":iv+:" + iv + ":-1"
+    if !g.bce_safe_exprs.contains(k) {
+      g.bce_safe_exprs.set(k, true)
+      added_keys.push(k)
+    }
+    ai = ai + 1
+  }
+  qbe_emit_lbl(g, l_fast)
+  let loop_depth = g.scopes.length()
+  g.loop_breaks.push(l_end)
+  g.loop_conts.push(l_fcond)
+  g.loop_depths.push(loop_depth)
+  qbe_scope_push(g)
+  let fbv = qbe_emit_stmts(g, body, None)
+  if !g.block_term {
+    qbe_rc_dec(g, fbv.reg, fbv.ty)
+  }
+  qbe_scope_pop(g)
+  let _ = g.loop_breaks.pop()
+  let _ = g.loop_conts.pop()
+  let _ = g.loop_depths.pop()
+  qbe_emit_term(g, "jmp " + l_fcond)
+  qbe_emit_lbl(g, l_fcond)
+  qbe_emit_cond_branch(g, cond, l_fast, l_end)
+
+  let mut ki = 0
+  while ki < added_keys.length() {
+    g.bce_safe_exprs.remove(added_keys[ki])
+    ki = ki + 1
+  }
+
+  // Slow fallback loop with full OOB checks
+  qbe_emit_lbl(g, l_slow)
+  g.loop_breaks.push(l_end)
+  g.loop_conts.push(l_scond)
+  g.loop_depths.push(loop_depth)
+  qbe_scope_push(g)
+  let sbv = qbe_emit_stmts(g, body, None)
+  if !g.block_term {
+    qbe_rc_dec(g, sbv.reg, sbv.ty)
+  }
+  qbe_scope_pop(g)
+  let _ = g.loop_breaks.pop()
+  let _ = g.loop_conts.pop()
+  let _ = g.loop_depths.pop()
+  qbe_emit_term(g, "jmp " + l_scond)
+  qbe_emit_lbl(g, l_scond)
+  qbe_emit_cond_branch(g, cond, l_slow, l_end)
+
+  qbe_emit_lbl(g, l_end)
+  true
+}
+
 
 ///|
 fn qbe_emit_strbuf_push_byte_inline(
@@ -30205,6 +30815,7 @@ fn qbe_try_emit_while_two_ptr_bce(
   qbe_emit_lbl(g, l_end)
   true
 }
+
 
 ///|
 fn qbe_is_scalar_cmp_ty(ty : Ty) -> Bool {
@@ -31814,6 +32425,7 @@ fn qbe_try_emit_while_field_promoted(
   qbe_emit_lbl(g, l_end)
   true
 }
+
 
 ///|
 fn qbe_pure_int_expr_eq(a : Expr, b : Expr) -> Bool {
@@ -34649,6 +35261,9 @@ fn qbe_emit_stmt(
       let mut emitted_loop = false
       if !emitted_loop {
         emitted_loop = qbe_try_emit_while_bce_versioned(g, cond, body)
+      }
+      if !emitted_loop {
+        emitted_loop = qbe_try_emit_while_dec_bce_versioned(g, cond, body)
       }
       if !emitted_loop {
         emitted_loop = qbe_try_emit_while_two_ptr_bce(g, cond, body)
