@@ -125,7 +125,146 @@ pub struct StructInfo {
   decl : StructDecl
   field_names : Array[String]
   field_muts : Array[Bool]
+  field_privs : Array[Bool]
   field_tys : Array[Ty]
+}
+
+///|
+fn tc_lookup_struct_info(tc : TypeChecker, sname : String) -> Option[StructInfo] {
+  match tc.structs.get(sname) {
+    Some(si) => Some(si)
+    None => {
+      let qp = split_qual_name(sname)
+      if qp.prefix.length() > 0 {
+        match lookup_imported_pkg_transitive(tc, qp.prefix) {
+          Some(ipkg) =>
+            match ipkg.tc.structs.get(qp.name) {
+              Some(si) => {
+                let qftys : Array[Ty] = []
+                let mut j = 0
+                while j < si.field_tys.length() {
+                  qftys.push(qualify_imported_ty(ipkg.name, si.field_tys[j]))
+                  j = j + 1
+                }
+                Some(StructInfo::{
+                  decl: si.decl,
+                  field_names: si.field_names,
+                  field_muts: si.field_muts,
+                  field_privs: si.field_privs,
+                  field_tys: qftys,
+                })
+              }
+              None => None
+            }
+          None => None
+        }
+      } else {
+        None
+      }
+    }
+  }
+}
+
+///|
+fn enum_info_has_variant(ei : EnumInfo, mem : String) -> Bool {
+  let mut i = 0
+  while i < ei.variants.length() {
+    if ei.variants[i].name == mem {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn tc_enum_has_variant(tc : TypeChecker, ename : String, mem : String) -> Bool {
+  match tc.enums.get(ename) {
+    Some(ei) => enum_info_has_variant(ei, mem)
+    None => false
+  }
+}
+
+///|
+fn check_field_assign_target(
+  tc : TypeChecker,
+  env : Env,
+  obj : Expr,
+  fname : String,
+  lsp : Span,
+) -> Ty {
+  let oty = check_expr(tc, env, obj, None)
+  match oty {
+    TError => TError
+    TStruct(sname, sargs) =>
+      match tc_lookup_struct_info(tc, sname) {
+        None => TError
+        Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let mut fi = 0
+          while fi < sinfo.field_names.length() {
+            if sinfo.field_names[fi] == fname {
+              if has_qual_sep(sname) &&
+                !env.in_default_arg &&
+                fi < sinfo.field_privs.length() &&
+                sinfo.field_privs[fi] {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_PRIVATE_FIELD",
+                  "cannot access private field `" +
+                  fname +
+                  "` of `" +
+                  sname +
+                  "` outside its defining package",
+                  "public field",
+                  "private field `" + fname + "`",
+                  "use a public method on `" + sname + "` instead",
+                )
+              } else if !sinfo.field_muts[fi] {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_TYPE_MISMATCH",
+                  "cannot assign to immutable field `" +
+                  fname +
+                  "` of struct `" +
+                  sname +
+                  "`",
+                  "`mut` field",
+                  "immutable field `" + fname + "`",
+                  "declare the field as `mut " + fname + " : ...`",
+                )
+              }
+              return subst_ty(sinfo.field_tys[fi], subst)
+            }
+            fi = fi + 1
+          }
+          tc_err(
+            tc,
+            lsp,
+            "E_TYPE_MISMATCH",
+            "struct `" + sname + "` has no field `" + fname + "`",
+            "valid field of `" + sname + "`",
+            fname,
+            "check field name on `" + sname + "`",
+          )
+          TError
+        }
+      }
+    _ => {
+      tc_err(
+        tc,
+        lsp,
+        "E_TYPE_MISMATCH",
+        "cannot assign to field `" + fname + "` on `" + ty_to_string(oty) + "`",
+        "struct",
+        ty_to_string(oty),
+        "assign fields only on struct values",
+      )
+      TError
+    }
+  }
 }
 
 ///|
@@ -1009,6 +1148,7 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
                 decl: si.decl,
                 field_names: si.field_names,
                 field_muts: si.field_muts,
+                field_privs: si.field_privs,
                 field_tys: qftys,
               },
             )
@@ -4614,6 +4754,21 @@ fn check_stmt(
           let rty = check_expr(tc, env, rhs, None)
           infer_refine_binding(tc, env, mname, TMap(kty, rty))
         }
+        EField(obj, fname, lsp) => {
+          let lty = check_field_assign_target(tc, env, obj, fname, lsp)
+          let rty = check_expr(tc, env, rhs, Some(lty))
+          if !ty_compat(lty, rty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "type mismatch in assignment",
+              ty_to_string(lty),
+              ty_to_string(rty),
+              "assign a value of type `" + ty_to_string(lty) + "`",
+            )
+          }
+        }
         _ => {
           let lty = check_expr(tc, env, lhs, None)
           let rty = check_expr(tc, env, rhs, Some(lty))
@@ -4652,6 +4807,7 @@ fn check_stmt(
             }
             None => check_expr(tc, env, lhs, None)
           }
+        EField(obj, fname, lsp) => check_field_assign_target(tc, env, obj, fname, lsp)
         _ => check_expr(tc, env, lhs, None)
       }
       let rty = check_expr(tc, env, rhs, Some(lty))
@@ -5486,7 +5642,7 @@ fn check_mut_place(tc : TypeChecker, env : Env, e : Expr, check_index : Bool) ->
       match oty {
         TError => TError
         TStruct(sname, sargs) =>
-          match tc.structs.get(sname) {
+          match tc_lookup_struct_info(tc, sname) {
             None => TError
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, sargs)
@@ -5497,7 +5653,24 @@ fn check_mut_place(tc : TypeChecker, env : Env, e : Expr, check_index : Bool) ->
                 if sinfo.field_names[fi] == fname {
                   found = true
                   fty = subst_ty(sinfo.field_tys[fi], subst)
-                  if !sinfo.field_muts[fi] {
+                  if has_qual_sep(sname) &&
+                    !env.in_default_arg &&
+                    fi < sinfo.field_privs.length() &&
+                    sinfo.field_privs[fi] {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_PRIVATE_FIELD",
+                      "cannot access private field `" +
+                      fname +
+                      "` of `" +
+                      sname +
+                      "` outside its defining package",
+                      "public field",
+                      "private field `" + fname + "`",
+                      "use a public method on `" + sname + "` instead",
+                    )
+                  } else if !sinfo.field_muts[fi] {
                     tc_err(
                       tc,
                       sp,
@@ -5790,7 +5963,7 @@ fn tc_qualify_local_name(tc : TypeChecker, name : String) -> String {
 /// or trait bound of a type parameter), receiver included.
 fn method_params_for(tc : TypeChecker, env : Env, recv_ty : Ty, m : String) -> Option[Array[Param]] {
   match recv_ty {
-    TStruct(sname, _) => {
+    TStruct(sname, _) | TEnum(sname, _) => {
       match tc.methods.get(sname + "::" + m) {
         Some(mi) => return Some(mi.decl.params)
         None => ()
@@ -7315,7 +7488,7 @@ fn check_method_call(
         return TInt
       }
     }
-    TStruct(sname, sargs) => {
+    TStruct(sname, sargs) | TEnum(sname, sargs) => {
       let key = sname + "::" + method_name
       match tc.methods.get(key) {
         Some(minfo) => {
@@ -9295,7 +9468,11 @@ fn check_expr_inner(
             }
             return TAtomicInt
           }
-          if qual == "Option" || qual == "Result" || tc.enums.contains(qual) {
+          if qual == "Option" ||
+            qual == "Result" ||
+            (tc.enums.contains(qual) &&
+              (tc_enum_has_variant(tc, qual, mem) ||
+                !tc.methods.contains(qual + "::" + mem))) {
             return check_variant_ctor(tc, env, qual, mem, args, expected, sp)
           }
           let qp = split_qual_name(qual)
@@ -9305,20 +9482,22 @@ fn check_expr_inner(
             match resolve_pkg_for_lookup(tc, q_alias, env.in_default_arg) {
               Some(ipkg) => {
                 match ipkg.tc.enums.get(q_sub) {
-                  Some(ei) => {
-                    if !ei.decl.is_pub && !env.in_default_arg {
-                      emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                  Some(ei) =>
+                    if enum_info_has_variant(ei, mem) ||
+                      !ipkg.tc.methods.contains(q_sub + "::" + mem) {
+                      if !ei.decl.is_pub && !env.in_default_arg {
+                        emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                      }
+                      return check_variant_ctor(
+                        tc,
+                        env,
+                        ipkg.name + "::" + q_sub,
+                        mem,
+                        args,
+                        expected,
+                        sp,
+                      )
                     }
-                    return check_variant_ctor(
-                      tc,
-                      env,
-                      ipkg.name + "::" + q_sub,
-                      mem,
-                      args,
-                      expected,
-                      sp,
-                    )
-                  }
                   None => ()
                 }
                 match ipkg.tc.methods.get(q_sub + "::" + mem) {
@@ -9467,13 +9646,31 @@ fn check_expr_inner(
           }
         }
         TStruct(sname, sargs) =>
-          match tc.structs.get(sname) {
+          match tc_lookup_struct_info(tc, sname) {
             None => TError
             Some(sinfo) => {
               let subst = make_subst(sinfo.decl.type_params, sargs)
               let mut i = 0
               while i < sinfo.field_names.length() {
                 if sinfo.field_names[i] == field_name {
+                  if has_qual_sep(sname) &&
+                    !env.in_default_arg &&
+                    i < sinfo.field_privs.length() &&
+                    sinfo.field_privs[i] {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_PRIVATE_FIELD",
+                      "cannot access private field `" +
+                      field_name +
+                      "` of `" +
+                      sname +
+                      "` outside its defining package",
+                      "public field",
+                      "private field `" + field_name + "`",
+                      "use a public method on `" + sname + "` instead",
+                    )
+                  }
                   return subst_ty(sinfo.field_tys[i], subst)
                 }
                 i = i + 1
@@ -9722,6 +9919,30 @@ fn check_expr_inner(
           TError
         }
         Some(sinfo) => {
+          if has_qual_sep(resolved_name) && !env.in_default_arg {
+            let mut has_priv = false
+            let mut pi = 0
+            while pi < sinfo.field_privs.length() {
+              if sinfo.field_privs[pi] {
+                has_priv = true
+                break
+              }
+              pi = pi + 1
+            }
+            if has_priv {
+              tc_err(
+                tc,
+                sp,
+                "E_PRIVATE_FIELD",
+                "cannot construct `" +
+                resolved_name +
+                "` directly outside its defining package because it has private field(s); use a public constructor function",
+                "public constructor call",
+                "direct struct literal of `" + resolved_name + "`",
+                "call a public constructor function for `" + resolved_name + "`",
+              )
+            }
+          }
           let subst : Map[String, Ty] = Map([])
           match expected {
             Some(TStruct(en, eargs)) =>
@@ -10488,6 +10709,7 @@ pub fn check_package_with_imports(
               decl: sd,
               field_names: [],
               field_muts: [],
+              field_privs: [],
               field_tys: [],
             },
           )
@@ -10527,12 +10749,14 @@ pub fn check_package_with_imports(
         DStruct(sd) => {
           let fnames : Array[String] = []
           let fmuts : Array[Bool] = []
+          let fprivs : Array[Bool] = []
           let ftys : Array[Ty] = []
           let mut j = 0
           while j < sd.fields.length() {
             let fld = sd.fields[j]
             fnames.push(fld.name)
             fmuts.push(fld.is_mut)
+            fprivs.push(fld.is_priv)
             ftys.push(resolve_type_expr(tc, fld.ty, sd.type_params))
             j = j + 1
           }
@@ -10542,6 +10766,7 @@ pub fn check_package_with_imports(
               decl: sd,
               field_names: fnames,
               field_muts: fmuts,
+              field_privs: fprivs,
               field_tys: ftys,
             },
           )

@@ -43,6 +43,11 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
      - Entry point overrides (`pionc build`): `--entry-symbol <name>` renames the generated `$main` wrapper symbol to `$<name>` (retaining `$pion_world_init`, transitive `init_consts`, user `main`, and `$pion_rc_dec`); `--no-main` omits the `$main` wrapper entirely (mutually exclusive with `--entry-symbol`). Both are part of the package/unit CAS key.
    - **Native libraries**: `-l <lib>` / `-l<lib>` / `--link <lib>` on `build`/`run`/`test`, plus `[link] libs = [...]` in `pion.toml` (dependencies first, de-duplicated) add `-l<lib>` to the link; the list is part of the binary's cache key. In `--release` mode, `[link] c_sources` automatically receive `-O3` unless `cc_flags` already specifies an `-O*` / `/O*` optimization flag.
    - **Release backend** (`--release`): the same embedded QBE pipeline (no LLVM, no separate optimizing toolchain) with release-mode IL, stripping `debug_assert`.
+   - **Encapsulation, field mutability, enum methods & scoped testing**:
+     - Struct fields are immutable by default unless declared `mut`; assigning (`=` / `+=` / etc.) or taking a `mut` argument of a non-`mut` struct field is a type error (`E_TYPE_MISMATCH`).
+     - Fields of a `pub struct` remain readable across packages by default; prefixing a field with `priv` (e.g. `priv scalar : Bytes`, `priv mut state : Int`) restricts cross-package reads, writes, and direct struct literal construction (`E_PRIVATE_FIELD`) while permitting access inside the defining package.
+     - Inherent methods (`pub fn EnumName::method(self : EnumName, ...) -> R`) and trait impl methods are supported on `enum` types via both dot-call (`e.method(...)`) and path-call (`EnumName::method(e, ...)`, whenever the member is not a variant name).
+     - `pionc test [--no-deps | --only-pkg]` runs tests only for the target root package (or direct workspace members for a virtual workspace), skipping dependency package tests while still compiling and linking dependencies.
 
 ---
 
