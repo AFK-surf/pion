@@ -226,9 +226,115 @@ pub fn main(world : World) -> Int {
   let _ = world
   0
 }
+
+struct Counter {
+  mut n : Int
+}
+
+fn Counter::bump(mut self : Counter, delta : Int) -> Int {
+  self.n = self.n + delta
+  self.n
+}
+
+test "p82b: #into and mut self work inside pionc test across packages" {
+  let status = a::ReadSignal::new("ready")
+  let n = a::ReadSignal::new(7)
+  let log = b::OutLog::new()
+
+  let _ = <b::Text in={log} text="hi" bg={255L} />
+  let _ = <b::Text in={log} text={status} />
+  let _ = <b::Text in={log} text=>{ "Done: \{n.get()}" } bg=>{ 99L } />
+  let _ = <b::Text in={log} text={.Is("raw")} />
+  let _ = <b::Text in={log} />
+  log.push_live("method")
+
+  debug_assert(log.lines.length() == 6, "len")
+  debug_assert(log.lines[0] == "hi|255", "line0")
+  debug_assert(log.lines[1] == "ready|none", "line1")
+  debug_assert(log.lines[2] == "Done: 7|99", "line2")
+  debug_assert(log.lines[3] == "raw|none", "line3")
+  debug_assert(log.lines[4] == "|none", "line4")
+  debug_assert(log.lines[5] == "m:method", "line5")
+
+  let s = "hello"
+  let bs = "abc".to_bytes()
+  debug_assert(b::view_lens(s, bs) == 503, "view_lens")
+
+  let mut c = Counter::{ n: 10 }
+  debug_assert(c.bump(5) == 15, "bump")
+  debug_assert(c.n == 15, "c.n")
+}
 EOF
 
-FMT_JSON=$("$PIONC" fmt --check --json "$PROJ/pkg_a" "$PROJ/pkg_b" "$PROJ/pkg_c")
+mkdir -p "$PROJ/pkg_single/src"
+
+cat > "$PROJ/pkg_single/pion.toml" <<'EOF'
+[package]
+name = "pkg_single"
+version = "0.1.0"
+EOF
+
+cat > "$PROJ/pkg_single/src/lib.pion" <<'EOF'
+pub struct Sig[T] {
+  pub mut v : T
+}
+
+pub enum Live[T] {
+  Is(T)
+  Fn(() -> T)
+}
+
+#into
+pub fn Live::of_value[T](v : T) -> Live[T] {
+  Live::Is(v)
+}
+
+#into
+pub fn Live::of_fn[T](f : () -> T) -> Live[T] {
+  Live::Fn(f)
+}
+
+#into
+pub fn Live::of_sig[T](s : Sig[T]) -> Live[T] {
+  Live::Fn(fn() -> T { s.v })
+}
+
+pub fn Live::eval[T](self : Live[T]) -> T {
+  match self {
+    .Is(v) => v
+    .Fn(f) => f()
+  }
+}
+
+pub fn render_opt(into p? : Live[String]) -> String {
+  match p {
+    .Some(lv) => lv.eval()
+    .None => "none"
+  }
+}
+
+struct Acc {
+  mut total : Int
+}
+
+fn Acc::add(mut self : Acc, x : Int) -> Int {
+  self.total = self.total + x
+  self.total
+}
+
+test "p82b: single-package #into optional named + closure + signal + mut self" {
+  let sig = Sig::{ v: "sig" }
+  debug_assert(render_opt(p="hi") == "hi", "opt_lit")
+  debug_assert(render_opt(p=fn() -> String { "dyn" }) == "dyn", "opt_fn")
+  debug_assert(render_opt(p=sig) == "sig", "opt_sig")
+  debug_assert(render_opt() == "none", "opt_none")
+  let mut acc = Acc::{ total: 1 }
+  debug_assert(acc.add(41) == 42, "acc_add")
+  debug_assert(acc.total == 42, "acc_total")
+}
+EOF
+
+FMT_JSON=$("$PIONC" fmt --check --json "$PROJ/pkg_a" "$PROJ/pkg_b" "$PROJ/pkg_c" "$PROJ/pkg_single")
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: p_into_callsite fmt --check failed: $FMT_JSON" >&2
   exit 1
@@ -243,6 +349,26 @@ if [ "$NATIVE_OUT" != "$EXPECTED" ]; then
   exit 1
 fi
 
+TEST_SINGLE_JSON=$("$PIONC" test --json "$PROJ/pkg_single")
+echo "p_into_callsite test single -> $TEST_SINGLE_JSON"
+case "$TEST_SINGLE_JSON" in
+  *'"ok":true'*'"failed":0'*|*'"failed":0'*'"ok":true'*) ;;
+  *)
+    echo "FAIL: p_into_callsite single-pkg pionc test --json failed: $TEST_SINGLE_JSON" >&2
+    exit 1
+    ;;
+esac
+
+TEST_MULTI_JSON=$("$PIONC" test --json "$PROJ/pkg_c")
+echo "p_into_callsite test multi -> $TEST_MULTI_JSON"
+case "$TEST_MULTI_JSON" in
+  *'"ok":true'*'"failed":0'*|*'"failed":0'*'"ok":true'*) ;;
+  *)
+    echo "FAIL: p_into_callsite multi-pkg pionc test --json failed: $TEST_MULTI_JSON" >&2
+    exit 1
+    ;;
+esac
+
 if command -v node >/dev/null 2>&1; then
   WASM_OUT=$(PION_WASM_RT="$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$PIONC" run --target wasm32 "$PROJ/pkg_c")
   echo "p_into_callsite wasm32 -> $WASM_OUT"
@@ -254,4 +380,4 @@ else
   echo "NOTE: node not found; skipping p_into_callsite wasm32 run"
 fi
 
-echo "[PASS] p_into_callsite (Native + Wasm32 + 3-pkg .pionsig + JSX + ETry + fmt)"
+echo "[PASS] p_into_callsite (Native + Wasm32 + pionc test + 3-pkg .pionsig + JSX + ETry + fmt)"
