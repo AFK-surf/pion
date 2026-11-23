@@ -50,6 +50,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -1415,6 +1416,9 @@ PION_MINSIZE void pion_bytes_set(void *b_ptr, int64_t idx, int32_t val) {
     PionBytes *b = (PionBytes *)b_ptr;
     if (__builtin_expect(!b || idx < 0 || idx >= b->len, 0)) {
         pion_panic_oob(idx, b ? b->len : 0);
+    }
+    if (__builtin_expect(b->cap < 0, 0)) {
+        pion_die("cannot mutate read-only mmap Bytes");
     }
     b->data[idx] = (uint8_t)(val & 0xFF);
 }
@@ -3209,6 +3213,110 @@ PION_MINSIZE int64_t pion_world_clock_ms(void *w_ptr) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return (int64_t)ts.tv_sec * 1000 + (int64_t)(ts.tv_nsec / 1000000);
+#endif
+}
+
+#ifndef _WIN32
+PION_MINSIZE static void pion_bytes_mmap_drop(void *payload) {
+    PionBytes *b = (PionBytes *)payload;
+    if (b->data && b->len > 0) {
+        munmap(b->data, (size_t)b->len);
+    }
+    b->data = NULL;
+}
+#endif
+
+PION_MINSIZE void *pion_fs_mmap_ro(void *path_str, int32_t *ok_out) {
+    if (ok_out) *ok_out = 0;
+#ifdef _WIN32
+    void *res = pion_read_file_obj(path_str, 1, ok_out);
+    if (ok_out && *ok_out) {
+        ((PionBytes *)res)->cap = -1;
+        return res;
+    }
+    pion_rc_dec(res);
+    return pion_str_from_cstr("fs_mmap_ro failed", 17);
+#else
+    PionString *path = (PionString *)path_str;
+    const char *err = "fs_mmap_ro failed";
+    int fd = (path && path->len > 0) ? open(path->data, O_RDONLY) : -1;
+    if (fd < 0) goto fail;
+    struct stat st;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); goto fail; }
+    int64_t sz = (int64_t)st.st_size;
+    if (sz == 0) {
+        close(fd);
+        if (ok_out) *ok_out = 1;
+        return pion_bytes_alloc_uninit(0);
+    }
+    void *addr = mmap(NULL, (size_t)sz, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (addr == MAP_FAILED) goto fail;
+    PionBytes *b = (PionBytes *)pion_alloc_raw((uint32_t)sizeof(PionBytes), PION_TAG_BYTES, pion_bytes_mmap_drop);
+    b->len = sz;
+    b->cap = -1;
+    b->data = (uint8_t *)addr;
+    if (ok_out) *ok_out = 1;
+    return b;
+fail:
+    return pion_str_from_cstr(err, (int64_t)strlen(err));
+#endif
+}
+
+PION_MINSIZE int64_t pion_clock_monotonic_us(void) {
+#ifdef _WIN32
+    LARGE_INTEGER qpc, freq;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&qpc);
+    return (qpc.QuadPart / freq.QuadPart) * 1000000LL +
+           ((qpc.QuadPart % freq.QuadPart) * 1000000LL) / freq.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (int64_t)ts.tv_sec * 1000000LL + (int64_t)(ts.tv_nsec / 1000L);
+#endif
+}
+
+PION_MINSIZE int32_t pion_fs_write_atomic_bytes(void *path_str, void *bytes_obj) {
+    static _Atomic uint64_t pion_atomic_tmp_seq = 0;
+    PionString *path = (PionString *)path_str;
+    PionBytes *b = (PionBytes *)bytes_obj;
+    if (!path || path->len == 0 || !b) return 0;
+    uint64_t seq = atomic_fetch_add_explicit(&pion_atomic_tmp_seq, 1, memory_order_relaxed);
+    size_t tcap = (size_t)path->len + 48;
+    char *tmp = (char *)malloc(tcap);
+    if (!tmp) return 0;
+#ifdef _WIN32
+    snprintf(tmp, tcap, "%s.piontmp.%lu.%llu", path->data, (unsigned long)_getpid(), (unsigned long long)seq);
+    FILE *f = fopen(tmp, "wb");
+    if (!f) { free(tmp); return 0; }
+    size_t written = b->len > 0 ? fwrite(b->data, 1, (size_t)b->len, f) : 0;
+    int ok = (fclose(f) == 0 && written == (size_t)b->len);
+    if (ok && !MoveFileExA(tmp, path->data, MOVEFILE_REPLACE_EXISTING)) ok = 0;
+    if (!ok) DeleteFileA(tmp);
+    free(tmp);
+    return ok ? 1 : 0;
+#else
+    snprintf(tmp, tcap, "%s.piontmp.%ld.%llu", path->data, (long)getpid(), (unsigned long long)seq);
+    int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if (fd < 0) { free(tmp); return 0; }
+    int ok = 1;
+    int64_t off = 0;
+    while (off < b->len) {
+        ssize_t n = write(fd, b->data + off, (size_t)(b->len - off));
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            ok = 0;
+            break;
+        }
+        off += (int64_t)n;
+    }
+    if (ok && fsync(fd) != 0) ok = 0;
+    if (close(fd) != 0) ok = 0;
+    if (ok && rename(tmp, path->data) != 0) ok = 0;
+    if (!ok) unlink(tmp);
+    free(tmp);
+    return ok ? 1 : 0;
 #endif
 }
 

@@ -976,6 +976,7 @@ export function createPionRuntime(options = {}) {
     syncViews();
     const len = dv.getBigInt64(pb, true);
     if (idx < 0n || idx >= len) pion_panic_oob(idx, len);
+    if (dv.getBigInt64(pb + 8, true) < 0n) pionDie("cannot mutate read-only mmap Bytes");
     const dp = Number(dv.getBigInt64(pb + 16, true));
     u8[dp + Number(idx)] = val & 0xff;
   }
@@ -1818,6 +1819,56 @@ export function createPionRuntime(options = {}) {
   function pion_world_clock_ms(_w) {
     return BigInt(Math.floor(typeof performance !== "undefined" ? performance.now() : Date.now()));
   }
+  function pion_clock_monotonic_us() {
+    return BigInt(Math.round((typeof performance !== "undefined" ? performance.now() : Date.now()) * 1000));
+  }
+  let atomicTmpSeq = 0;
+  function pion_fs_mmap_ro(pathStr, okOut) {
+    const op = pNum(okOut);
+    if (!nodeFs) {
+      if (op) { syncViews(); dv.setInt32(op, 0, true); }
+      return makePionStr("fs_mmap_ro unavailable");
+    }
+    try {
+      const p = readPionStr(pathStr);
+      const st = nodeFs.statSync(p);
+      if (!st.isFile()) {
+        if (op) { syncViews(); dv.setInt32(op, 0, true); }
+        return makePionStr("fs_mmap_ro: not a regular file");
+      }
+      const data = nodeFs.readFileSync(p);
+      const b = pion_bytes_new(BigInt(data.length));
+      const pb = pNum(b);
+      syncViews();
+      if (data.length > 0) {
+        const dp = Number(dv.getBigInt64(pb + 16, true));
+        u8.set(data, dp);
+        dv.setBigInt64(pb + 8, -1n, true);
+      }
+      if (op) dv.setInt32(op, 1, true);
+      return b;
+    } catch (e) {
+      if (op) { syncViews(); dv.setInt32(op, 0, true); }
+      return makePionStr(String(e && e.message ? e.message : e));
+    }
+  }
+  function pion_fs_write_atomic_bytes(pathStr, bytesObj) {
+    if (!nodeFs) return 0;
+    const p = readPionStr(pathStr);
+    const tmp = `${p}.piontmp.${process.pid}.${++atomicTmpSeq}`;
+    try {
+      const pb = pNum(bytesObj);
+      syncViews();
+      const len = Number(dv.getBigInt64(pb, true));
+      const dp = Number(dv.getBigInt64(pb + 16, true));
+      nodeFs.writeFileSync(tmp, len > 0 ? u8.subarray(dp, dp + len) : new Uint8Array(0));
+      nodeFs.renameSync(tmp, p);
+      return 1;
+    } catch {
+      try { nodeFs.unlinkSync(tmp); } catch {}
+      return 0;
+    }
+  }
   function pion_world_env_get(_w, nameStr, okOut) {
     const name = readPionStr(nameStr);
     const op = pNum(okOut);
@@ -2112,6 +2163,7 @@ export function createPionRuntime(options = {}) {
       pion_world_init, pion_world_argc, pion_world_argv, pion_world_args,
       pion_world_print, pion_world_println, pion_world_eprintln,
       pion_world_read_line, pion_world_clock_ms, pion_world_env_get,
+      pion_clock_monotonic_us, pion_fs_mmap_ro, pion_fs_write_atomic_bytes,
       pion_world_fs_read, pion_world_fs_write, pion_world_fs_read_bytes,
       pion_world_fs_write_bytes, pion_world_fs_append, pion_world_fs_mtime_ms,
       pion_world_fs_exists, pion_world_fs_is_dir, pion_world_fs_mkdir_p,

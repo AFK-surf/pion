@@ -261,6 +261,11 @@ void*    pion_world_exec_capture(void *w, void *argv_arr, int32_t *exit_code_out
 void*    pion_world_exec_capture_bytes(void *w, void *argv_arr, int32_t *exit_code_out);
 void*    pion_sha256_hex(void *s);
 
+/* Library-Mode Fine-Grained OS Primitives (No World Required) */
+void*    pion_fs_mmap_ro(void *path_str, int32_t *ok_out);
+int64_t  pion_clock_monotonic_us(void);
+int32_t  pion_fs_write_atomic_bytes(void *path_str, void *bytes_obj);
+
 /* FFI Raw Pointers & CStr */
 void*    pion_ptr_alloc(int64_t bytes);
 void     pion_ptr_free(void *p);

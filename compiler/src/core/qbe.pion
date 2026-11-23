@@ -298,6 +298,8 @@ fn qbe_is_niche_opt_inner(t : Ty) -> Bool {
     | TStruct(_, _)
     | TEnum(_, _)
     | TBytes
+    | TStrView
+    | TBytesView
     | TStringBuilder
     | TChannel(_)
     | TMutex(_)
@@ -6788,6 +6790,12 @@ fn qbe_is_pure_builtin_method(recv_ty : Ty, mname : String, nargs : Int) -> Bool
       (mname == "code_unit_at" && nargs == 1)
     TBytes =>
       (mname == "length" && nargs == 0) ||
+      ((mname == "read_i8" || mname == "read_f32_le") && nargs == 1)
+    TStrView =>
+      ((mname == "length" || mname == "is_empty") && nargs == 0) ||
+      ((mname == "code_unit_at" || mname == "index_of_byte") && nargs == 1)
+    TBytesView =>
+      ((mname == "length" || mname == "is_empty") && nargs == 0) ||
       ((mname == "read_i8" || mname == "read_f32_le") && nargs == 1)
     TArray(_) | TFixedArray(_) | TMap(_, _) =>
       mname == "length" && nargs == 0
@@ -18077,6 +18085,8 @@ fn qbe_freeze_ty_key(ty : Ty) -> String {
     TChar => "ch"
     TString => "str"
     TBytes => "bytes"
+    TStrView => "strview"
+    TBytesView => "bytesview"
     TStringBuilder => "sb"
     TUnit => "u"
     TStruct(sname, sargs) => {
@@ -18498,6 +18508,17 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
+    TStrView => {
+      let fn_sym = "$pion_freeze_strview"
+      if g.freeze_fn_seen.contains(fn_sym) {
+        return fn_sym
+      }
+      g.freeze_fn_seen.set(fn_sym, true)
+      g.extra_fns.push(
+        "function $pion_freeze_strview(l %obj) {\n@start\n    jnz %obj, @body, @done\n@body\n    %fp =l sub %obj, 10\n    %fl =w loaduh %fp\n    %df =w and %fl, 10\n    jnz %df, @done, @do_freeze\n@do_freeze\n    %nfl =w or %fl, 8\n    storeh %nfl, %fp\n    call $pion_rc_freeze(l %obj)\n    %o =l loadl %obj\n    jnz %o, @fo, @done\n@fo\n    call $pion_rc_freeze(l %o)\n@done\n    ret\n}\n\n",
+      )
+      fn_sym
+    }
     TDynTrait(_) => {
       let fn_sym = "$pion_freeze_dyn"
       if g.freeze_fn_seen.contains(fn_sym) {
@@ -18511,6 +18532,137 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
     }
     _ => "$pion_rc_freeze"
   }
+}
+
+///|
+/// P77: Zero-copy StrView / BytesView helpers (pure QBE SSA, +0 B in libpionrt.a).
+/// Layout (24 B payload, PION_TAG_STRUCT = 4):
+///   +0:  owner : l (underlying PionString or PionBytes, RC-retained)
+///   +8:  ptr   : l (direct byte pointer = owner_data + start, or 0 when len == 0)
+///   +16: len   : l (byte length = end - start)
+fn qbe_ensure_view_drop_fn(g : QbeGen) -> String {
+  let fn_sym = "$pion_" + g.pkg_prefix + "view_drop"
+  if g.eq_fn_seen.contains(fn_sym) {
+    return fn_sym
+  }
+  g.eq_fn_seen.set(fn_sym, true)
+  g.extra_fns.push(
+    "function " +
+    fn_sym +
+    "(l %v) {\n@start\n    %o =l loadl %v\n    jnz %o, @dec, @done\n@dec\n    call $pion_rc_dec(l %o)\n@done\n    ret\n}\n\n",
+  )
+  fn_sym
+}
+
+///|
+fn qbe_ensure_view_eq_bytes_fn(g : QbeGen) -> String {
+  let fn_sym = "$pion_" + g.pkg_prefix + "view_eq_bytes"
+  if g.eq_fn_seen.contains(fn_sym) {
+    return fn_sym
+  }
+  g.eq_fn_seen.set(fn_sym, true)
+  g.extra_fns.push(
+    "function w " +
+    fn_sym +
+    "(l %p1, l %p2, l %n) {\n@start\n    %i_slot =l alloc8 8\n    %is0 =w ceql %n, 0\n    jnz %is0, @ret1, @chk_same\n@chk_same\n    %same =w ceql %p1, %p2\n    jnz %same, @ret1, @init\n@init\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %done =w cugel %i, %n\n    jnz %done, @ret1, @body\n@body\n    %a1 =l add %p1, %i\n    %a2 =l add %p2, %i\n    %b1 =w loadub %a1\n    %b2 =w loadub %a2\n    %eq =w ceqw %b1, %b2\n    jnz %eq, @next, @ret0\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@ret1\n    ret 1\n@ret0\n    ret 0\n}\n\n",
+  )
+  fn_sym
+}
+
+///|
+fn qbe_emit_view_alloc(
+  g : QbeGen,
+  owner_reg : String,
+  ptr_reg : String,
+  len_reg : String,
+) -> String {
+  let drop_sym = qbe_ensure_view_drop_fn(g)
+  let v = qbe_tmp(g)
+  let p_off = qbe_tmp(g)
+  let l_off = qbe_tmp(g)
+  qbe_emit(g, v + " =l call $pion_alloc_uninit(w 24, w 4, l " + drop_sym + ")")
+  qbe_emit(g, "call $pion_rc_inc(l " + owner_reg + ")")
+  qbe_emit(g, "storel " + owner_reg + ", " + v)
+  qbe_emit(g, p_off + " =l add " + v + ", 8")
+  qbe_emit(g, "storel " + ptr_reg + ", " + p_off)
+  qbe_emit(g, l_off + " =l add " + v + ", 16")
+  qbe_emit(g, "storel " + len_reg + ", " + l_off)
+  v
+}
+
+///|
+fn qbe_emit_view_slice(
+  g : QbeGen,
+  owner_reg : String,
+  base_ptr : String,
+  base_len : String,
+  start_l : String,
+  end_l : String,
+) -> String {
+  let l_oob = qbe_lbl(g, "view_oob")
+  let l_chk2 = qbe_lbl(g, "view_chk2")
+  let l_chk3 = qbe_lbl(g, "view_chk3")
+  let l_ok = qbe_lbl(g, "view_ok")
+  let l_empty = qbe_lbl(g, "view_empty")
+  let l_nonempty = qbe_lbl(g, "view_ne")
+  let l_done = qbe_lbl(g, "view_done")
+  let bad1 = qbe_tmp(g)
+  qbe_emit(g, bad1 + " =w csltl " + start_l + ", 0")
+  qbe_emit_term(g, "jnz " + bad1 + ", " + l_oob + ", " + l_chk2)
+  qbe_emit_lbl(g, l_chk2)
+  let bad2 = qbe_tmp(g)
+  qbe_emit(g, bad2 + " =w csltl " + end_l + ", " + start_l)
+  qbe_emit_term(g, "jnz " + bad2 + ", " + l_oob + ", " + l_chk3)
+  qbe_emit_lbl(g, l_chk3)
+  let bad3 = qbe_tmp(g)
+  qbe_emit(g, bad3 + " =w csgtl " + end_l + ", " + base_len)
+  qbe_emit_term(g, "jnz " + bad3 + ", " + l_oob + ", " + l_ok)
+  qbe_emit_lbl(g, l_oob)
+  qbe_emit(g, "call $pion_panic_oob(l " + end_l + ", l " + base_len + ")")
+  qbe_emit_term(g, "hlt")
+  qbe_emit_lbl(g, l_ok)
+  let new_len = qbe_tmp(g)
+  let is_z = qbe_tmp(g)
+  qbe_emit(g, new_len + " =l sub " + end_l + ", " + start_l)
+  qbe_emit(g, is_z + " =w ceql " + new_len + ", 0")
+  qbe_emit_term(g, "jnz " + is_z + ", " + l_empty + ", " + l_nonempty)
+  qbe_emit_lbl(g, l_empty)
+  qbe_emit_term(g, "jmp " + l_done)
+  qbe_emit_lbl(g, l_nonempty)
+  let ne_ptr = qbe_tmp(g)
+  qbe_emit(g, ne_ptr + " =l add " + base_ptr + ", " + start_l)
+  qbe_emit_term(g, "jmp " + l_done)
+  qbe_emit_lbl(g, l_done)
+  let final_ptr = qbe_tmp(g)
+  qbe_emit(g, final_ptr + " =l phi " + l_empty + " 0, " + l_nonempty + " " + ne_ptr)
+  qbe_emit_view_alloc(g, owner_reg, final_ptr, new_len)
+}
+
+///|
+fn qbe_emit_strview_eq_raw(
+  g : QbeGen,
+  p1 : String,
+  l1 : String,
+  p2 : String,
+  l2 : String,
+) -> String {
+  let eq_sym = qbe_ensure_view_eq_bytes_fn(g)
+  let same_len = qbe_tmp(g)
+  let l_cmp = qbe_lbl(g, "sveq_cmp")
+  let l_ne = qbe_lbl(g, "sveq_ne")
+  let l_end = qbe_lbl(g, "sveq_end")
+  qbe_emit(g, same_len + " =w ceql " + l1 + ", " + l2)
+  qbe_emit_term(g, "jnz " + same_len + ", " + l_cmp + ", " + l_ne)
+  qbe_emit_lbl(g, l_cmp)
+  let eq_w = qbe_tmp(g)
+  qbe_emit(g, eq_w + " =w call " + eq_sym + "(l " + p1 + ", l " + p2 + ", l " + l1 + ")")
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_ne)
+  qbe_emit_term(g, "jmp " + l_end)
+  qbe_emit_lbl(g, l_end)
+  let res_w = qbe_tmp(g)
+  qbe_emit(g, res_w + " =w phi " + l_cmp + " " + eq_w + ", " + l_ne + " 0")
+  res_w
 }
 
 ///|
@@ -22050,6 +22202,32 @@ fn qbe_emit_method_call(
         }
         return qval(r, TPtr)
       }
+      if method_name == "as_view" {
+        let blen = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        qbe_emit(g, blen + " =l loadl " + obj_val)
+        qbe_emit(g, bptr + " =l add " + obj_val + ", 8")
+        let v = qbe_emit_view_alloc(g, obj_val, bptr, blen)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TStrView)
+      }
+      if method_name == "view" {
+        let a = qbe_emit_expr(g, args[0], Some(TInt))
+        let b = qbe_emit_expr(g, args[1], Some(TInt))
+        let al = qbe_as_l(g, a)
+        let bl = qbe_as_l(g, b)
+        let blen = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        qbe_emit(g, blen + " =l loadl " + obj_val)
+        qbe_emit(g, bptr + " =l add " + obj_val + ", 8")
+        let v = qbe_emit_view_slice(g, obj_val, bptr, blen, al, bl)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TStrView)
+      }
     }
     TBytes => {
       if method_name == "length" {
@@ -22160,6 +22338,506 @@ fn qbe_emit_method_call(
           qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
         }
         return qval(fv, TFloat)
+      }
+      if method_name == "as_view" {
+        let blen = qbe_tmp(g)
+        let dp_p = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        qbe_emit(g, blen + " =l loadl " + obj_val)
+        qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
+        qbe_emit(g, bptr + " =l loadl " + dp_p)
+        let v = qbe_emit_view_alloc(g, obj_val, bptr, blen)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TBytesView)
+      }
+      if method_name == "view" {
+        let a = qbe_emit_expr(g, args[0], Some(TInt))
+        let b = qbe_emit_expr(g, args[1], Some(TInt))
+        let al = qbe_as_l(g, a)
+        let bl = qbe_as_l(g, b)
+        let blen = qbe_tmp(g)
+        let dp_p = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        qbe_emit(g, blen + " =l loadl " + obj_val)
+        qbe_emit(g, dp_p + " =l add " + obj_val + ", 16")
+        qbe_emit(g, bptr + " =l loadl " + dp_p)
+        let v = qbe_emit_view_slice(g, obj_val, bptr, blen, al, bl)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TBytesView)
+      }
+    }
+    TStrView => {
+      if method_name == "length" {
+        let lp = qbe_tmp(g)
+        let r64 = qbe_tmp(g)
+        let rw = qbe_tmp(g)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, r64 + " =l loadl " + lp)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        qbe_emit(g, rw + " =w copy " + r64)
+        return qval(rw, TInt)
+      }
+      if method_name == "is_empty" {
+        let lp = qbe_tmp(g)
+        let r64 = qbe_tmp(g)
+        let eq = qbe_tmp(g)
+        let rl = qbe_tmp(g)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, r64 + " =l loadl " + lp)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        qbe_emit(g, eq + " =w ceql " + r64 + ", 0")
+        qbe_emit(g, rl + " =l extuw " + eq)
+        return qval(rl, TBool)
+      }
+      if method_name == "code_unit_at" {
+        let iv = qbe_emit_expr(g, args[0], Some(TInt))
+        let il = qbe_as_l(g, iv)
+        let lp = qbe_tmp(g)
+        let vlen = qbe_tmp(g)
+        let oob = qbe_tmp(g)
+        let l_oob = qbe_lbl(g, "sv_oob")
+        let l_ok = qbe_lbl(g, "sv_ok")
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, vlen + " =l loadl " + lp)
+        qbe_emit(g, oob + " =w cugel " + il + ", " + vlen)
+        qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+        qbe_emit_lbl(g, l_oob)
+        qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + vlen + ")")
+        qbe_emit_term(g, "hlt")
+        qbe_emit_lbl(g, l_ok)
+        let pp = qbe_tmp(g)
+        let vp = qbe_tmp(g)
+        let ep = qbe_tmp(g)
+        let bw = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, vp + " =l loadl " + pp)
+        qbe_emit(g, ep + " =l add " + vp + ", " + il)
+        qbe_emit(g, bw + " =w loadub " + ep)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(bw, TInt)
+      }
+      if method_name == "subview" {
+        let a = qbe_emit_expr(g, args[0], Some(TInt))
+        let b = qbe_emit_expr(g, args[1], Some(TInt))
+        let al = qbe_as_l(g, a)
+        let bl = qbe_as_l(g, b)
+        let owner = qbe_tmp(g)
+        let pp = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let blen = qbe_tmp(g)
+        qbe_emit(g, owner + " =l loadl " + obj_val)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, bptr + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, blen + " =l loadl " + lp)
+        let v = qbe_emit_view_slice(g, owner, bptr, blen, al, bl)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TStrView)
+      }
+      if method_name == "trim" {
+        let owner = qbe_tmp(g)
+        let pp = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let blen = qbe_tmp(g)
+        qbe_emit(g, owner + " =l loadl " + obj_val)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, bptr + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, blen + " =l loadl " + lp)
+        let lo_slot = qbe_alloc_slot(g)
+        let hi_slot = qbe_alloc_slot(g)
+        qbe_emit(g, "storel 0, " + lo_slot)
+        qbe_emit(g, "storel " + blen + ", " + hi_slot)
+        let l_l1 = qbe_lbl(g, "svtr_l1")
+        let l_l1b = qbe_lbl(g, "svtr_l1b")
+        let l_l1i = qbe_lbl(g, "svtr_l1i")
+        let l_l2 = qbe_lbl(g, "svtr_l2")
+        let l_l2b = qbe_lbl(g, "svtr_l2b")
+        let l_l2d = qbe_lbl(g, "svtr_l2d")
+        let l_done = qbe_lbl(g, "svtr_done")
+        let l_em = qbe_lbl(g, "svtr_em")
+        let l_ne = qbe_lbl(g, "svtr_ne")
+        let l_fin = qbe_lbl(g, "svtr_fin")
+        qbe_emit_term(g, "jmp " + l_l1)
+        qbe_emit_lbl(g, l_l1)
+        let lo1 = qbe_tmp(g)
+        let hi1 = qbe_tmp(g)
+        let c1 = qbe_tmp(g)
+        qbe_emit(g, lo1 + " =l loadl " + lo_slot)
+        qbe_emit(g, hi1 + " =l loadl " + hi_slot)
+        qbe_emit(g, c1 + " =w csltl " + lo1 + ", " + hi1)
+        qbe_emit_term(g, "jnz " + c1 + ", " + l_l1b + ", " + l_l2)
+        qbe_emit_lbl(g, l_l1b)
+        let p1 = qbe_tmp(g)
+        let ch1 = qbe_tmp(g)
+        let w1a = qbe_tmp(g)
+        let w1b = qbe_tmp(g)
+        let w1c = qbe_tmp(g)
+        let w1d = qbe_tmp(g)
+        let w1ab = qbe_tmp(g)
+        let w1cd = qbe_tmp(g)
+        let w1 = qbe_tmp(g)
+        qbe_emit(g, p1 + " =l add " + bptr + ", " + lo1)
+        qbe_emit(g, ch1 + " =w loadub " + p1)
+        qbe_emit(g, w1a + " =w ceqw " + ch1 + ", 32")
+        qbe_emit(g, w1b + " =w ceqw " + ch1 + ", 9")
+        qbe_emit(g, w1c + " =w ceqw " + ch1 + ", 10")
+        qbe_emit(g, w1d + " =w ceqw " + ch1 + ", 13")
+        qbe_emit(g, w1ab + " =w or " + w1a + ", " + w1b)
+        qbe_emit(g, w1cd + " =w or " + w1c + ", " + w1d)
+        qbe_emit(g, w1 + " =w or " + w1ab + ", " + w1cd)
+        qbe_emit_term(g, "jnz " + w1 + ", " + l_l1i + ", " + l_l2)
+        qbe_emit_lbl(g, l_l1i)
+        let nlo1 = qbe_tmp(g)
+        qbe_emit(g, nlo1 + " =l add " + lo1 + ", 1")
+        qbe_emit(g, "storel " + nlo1 + ", " + lo_slot)
+        qbe_emit_term(g, "jmp " + l_l1)
+        qbe_emit_lbl(g, l_l2)
+        let lo2 = qbe_tmp(g)
+        let hi2 = qbe_tmp(g)
+        let c2 = qbe_tmp(g)
+        qbe_emit(g, lo2 + " =l loadl " + lo_slot)
+        qbe_emit(g, hi2 + " =l loadl " + hi_slot)
+        qbe_emit(g, c2 + " =w csgtl " + hi2 + ", " + lo2)
+        qbe_emit_term(g, "jnz " + c2 + ", " + l_l2b + ", " + l_done)
+        qbe_emit_lbl(g, l_l2b)
+        let hi_m1 = qbe_tmp(g)
+        let p2 = qbe_tmp(g)
+        let ch2 = qbe_tmp(g)
+        let w2a = qbe_tmp(g)
+        let w2b = qbe_tmp(g)
+        let w2c = qbe_tmp(g)
+        let w2d = qbe_tmp(g)
+        let w2ab = qbe_tmp(g)
+        let w2cd = qbe_tmp(g)
+        let w2 = qbe_tmp(g)
+        qbe_emit(g, hi_m1 + " =l sub " + hi2 + ", 1")
+        qbe_emit(g, p2 + " =l add " + bptr + ", " + hi_m1)
+        qbe_emit(g, ch2 + " =w loadub " + p2)
+        qbe_emit(g, w2a + " =w ceqw " + ch2 + ", 32")
+        qbe_emit(g, w2b + " =w ceqw " + ch2 + ", 9")
+        qbe_emit(g, w2c + " =w ceqw " + ch2 + ", 10")
+        qbe_emit(g, w2d + " =w ceqw " + ch2 + ", 13")
+        qbe_emit(g, w2ab + " =w or " + w2a + ", " + w2b)
+        qbe_emit(g, w2cd + " =w or " + w2c + ", " + w2d)
+        qbe_emit(g, w2 + " =w or " + w2ab + ", " + w2cd)
+        qbe_emit_term(g, "jnz " + w2 + ", " + l_l2d + ", " + l_done)
+        qbe_emit_lbl(g, l_l2d)
+        qbe_emit(g, "storel " + hi_m1 + ", " + hi_slot)
+        qbe_emit_term(g, "jmp " + l_l2)
+        qbe_emit_lbl(g, l_done)
+        let flo = qbe_tmp(g)
+        let fhi = qbe_tmp(g)
+        let nlen = qbe_tmp(g)
+        let isz = qbe_tmp(g)
+        qbe_emit(g, flo + " =l loadl " + lo_slot)
+        qbe_emit(g, fhi + " =l loadl " + hi_slot)
+        qbe_emit(g, nlen + " =l sub " + fhi + ", " + flo)
+        qbe_emit(g, isz + " =w ceql " + nlen + ", 0")
+        qbe_emit_term(g, "jnz " + isz + ", " + l_em + ", " + l_ne)
+        qbe_emit_lbl(g, l_em)
+        qbe_emit_term(g, "jmp " + l_fin)
+        qbe_emit_lbl(g, l_ne)
+        let np = qbe_tmp(g)
+        qbe_emit(g, np + " =l add " + bptr + ", " + flo)
+        qbe_emit_term(g, "jmp " + l_fin)
+        qbe_emit_lbl(g, l_fin)
+        let fptr = qbe_tmp(g)
+        qbe_emit(g, fptr + " =l phi " + l_em + " 0, " + l_ne + " " + np)
+        let v = qbe_emit_view_alloc(g, owner, fptr, nlen)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TStrView)
+      }
+      if method_name == "starts_with" || method_name == "ends_with" || method_name == "eq_str" {
+        let sa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), args_pure)
+        let sv = sa.qv
+        let pp = qbe_tmp(g)
+        let vp = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let vl = qbe_tmp(g)
+        let sl = qbe_tmp(g)
+        let sp = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, vp + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, vl + " =l loadl " + lp)
+        qbe_emit(g, sl + " =l loadl " + sv.reg)
+        qbe_emit(g, sp + " =l add " + sv.reg + ", 8")
+        let res_w = if method_name == "eq_str" {
+          qbe_emit_strview_eq_raw(g, vp, vl, sp, sl)
+        } else {
+          let eq_sym = qbe_ensure_view_eq_bytes_fn(g)
+          let l_cmp = qbe_lbl(g, "svaf_cmp")
+          let l_no = qbe_lbl(g, "svaf_no")
+          let l_end = qbe_lbl(g, "svaf_end")
+          let ok_len = qbe_tmp(g)
+          qbe_emit(g, ok_len + " =w csgel " + vl + ", " + sl)
+          qbe_emit_term(g, "jnz " + ok_len + ", " + l_cmp + ", " + l_no)
+          qbe_emit_lbl(g, l_cmp)
+          let cmp_p = if method_name == "starts_with" {
+            vp
+          } else {
+            let off = qbe_tmp(g)
+            let ep = qbe_tmp(g)
+            qbe_emit(g, off + " =l sub " + vl + ", " + sl)
+            qbe_emit(g, ep + " =l add " + vp + ", " + off)
+            ep
+          }
+          let eq_w = qbe_tmp(g)
+          qbe_emit(g, eq_w + " =w call " + eq_sym + "(l " + cmp_p + ", l " + sp + ", l " + sl + ")")
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_no)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_end)
+          let pw = qbe_tmp(g)
+          qbe_emit(g, pw + " =w phi " + l_cmp + " " + eq_w + ", " + l_no + " 0")
+          pw
+        }
+        let rl = qbe_tmp(g)
+        qbe_emit(g, rl + " =l extuw " + res_w)
+        if !sa.borrowed {
+          qbe_rc_dec(g, sv.reg, sv.ty)
+        }
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(rl, TBool)
+      }
+      if method_name == "index_of_byte" {
+        let bv = qbe_emit_expr(g, args[0], Some(TByte))
+        let bw = qbe_tmp(g)
+        let bmask = qbe_tmp(g)
+        qbe_emit(g, bw + " =w copy " + bv.reg)
+        qbe_emit(g, bmask + " =w and " + bw + ", 255")
+        let pp = qbe_tmp(g)
+        let vp = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let vl = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, vp + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, vl + " =l loadl " + lp)
+        let i_slot = qbe_alloc_slot(g)
+        qbe_emit(g, "storel 0, " + i_slot)
+        let l_loop = qbe_lbl(g, "svib_loop")
+        let l_body = qbe_lbl(g, "svib_body")
+        let l_next = qbe_lbl(g, "svib_next")
+        let l_hit = qbe_lbl(g, "svib_hit")
+        let l_miss = qbe_lbl(g, "svib_miss")
+        let l_end = qbe_lbl(g, "svib_end")
+        qbe_emit_term(g, "jmp " + l_loop)
+        qbe_emit_lbl(g, l_loop)
+        let ii = qbe_tmp(g)
+        let done = qbe_tmp(g)
+        qbe_emit(g, ii + " =l loadl " + i_slot)
+        qbe_emit(g, done + " =w cugel " + ii + ", " + vl)
+        qbe_emit_term(g, "jnz " + done + ", " + l_miss + ", " + l_body)
+        qbe_emit_lbl(g, l_body)
+        let ap = qbe_tmp(g)
+        let ch = qbe_tmp(g)
+        let eq = qbe_tmp(g)
+        qbe_emit(g, ap + " =l add " + vp + ", " + ii)
+        qbe_emit(g, ch + " =w loadub " + ap)
+        qbe_emit(g, eq + " =w ceqw " + ch + ", " + bmask)
+        qbe_emit_term(g, "jnz " + eq + ", " + l_hit + ", " + l_next)
+        qbe_emit_lbl(g, l_next)
+        let ni = qbe_tmp(g)
+        qbe_emit(g, ni + " =l add " + ii + ", 1")
+        qbe_emit(g, "storel " + ni + ", " + i_slot)
+        qbe_emit_term(g, "jmp " + l_loop)
+        qbe_emit_lbl(g, l_hit)
+        let hit_w = qbe_tmp(g)
+        qbe_emit(g, hit_w + " =w copy " + ii)
+        qbe_emit_term(g, "jmp " + l_end)
+        qbe_emit_lbl(g, l_miss)
+        qbe_emit_term(g, "jmp " + l_end)
+        qbe_emit_lbl(g, l_end)
+        let res_w = qbe_tmp(g)
+        qbe_emit(g, res_w + " =w phi " + l_hit + " " + hit_w + ", " + l_miss + " -1")
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(res_w, TInt)
+      }
+      if method_name == "to_string" {
+        let pp = qbe_tmp(g)
+        let vp = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let vl = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, vp + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, vl + " =l loadl " + lp)
+        qbe_emit(g, r + " =l call $pion_str_from_cstr(l " + vp + ", l " + vl + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TString)
+      }
+    }
+    TBytesView => {
+      if method_name == "length" {
+        let lp = qbe_tmp(g)
+        let r64 = qbe_tmp(g)
+        let rw = qbe_tmp(g)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, r64 + " =l loadl " + lp)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        qbe_emit(g, rw + " =w copy " + r64)
+        return qval(rw, TInt)
+      }
+      if method_name == "is_empty" {
+        let lp = qbe_tmp(g)
+        let r64 = qbe_tmp(g)
+        let eq = qbe_tmp(g)
+        let rl = qbe_tmp(g)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, r64 + " =l loadl " + lp)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        qbe_emit(g, eq + " =w ceql " + r64 + ", 0")
+        qbe_emit(g, rl + " =l extuw " + eq)
+        return qval(rl, TBool)
+      }
+      if method_name == "read_i8" {
+        let iv = qbe_emit_expr(g, args[0], Some(TInt))
+        let il = qbe_as_l(g, iv)
+        let lp = qbe_tmp(g)
+        let blen = qbe_tmp(g)
+        let oob = qbe_tmp(g)
+        let l_oob = qbe_lbl(g, "bvri8_oob")
+        let l_ok = qbe_lbl(g, "bvri8_ok")
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, blen + " =l loadl " + lp)
+        qbe_emit(g, oob + " =w cugel " + il + ", " + blen)
+        qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+        qbe_emit_lbl(g, l_oob)
+        qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
+        qbe_emit_term(g, "hlt")
+        qbe_emit_lbl(g, l_ok)
+        let pp = qbe_tmp(g)
+        let dp = qbe_tmp(g)
+        let ep = qbe_tmp(g)
+        let bw = qbe_tmp(g)
+        let bl = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, dp + " =l loadl " + pp)
+        qbe_emit(g, ep + " =l add " + dp + ", " + il)
+        qbe_emit(g, bw + " =w loadsb " + ep)
+        qbe_emit(g, bl + " =l extsw " + bw)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(bl, TInt8)
+      }
+      if method_name == "read_f32_le" {
+        let iv = qbe_emit_expr(g, args[0], Some(TInt))
+        let il = qbe_as_l(g, iv)
+        let lp = qbe_tmp(g)
+        let blen = qbe_tmp(g)
+        let too_short = qbe_tmp(g)
+        let l_oob = qbe_lbl(g, "bvrf32_oob")
+        let l_chk = qbe_lbl(g, "bvrf32_chk")
+        let l_ok = qbe_lbl(g, "bvrf32_ok")
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, blen + " =l loadl " + lp)
+        qbe_emit(g, too_short + " =w csltl " + blen + ", 4")
+        qbe_emit_term(g, "jnz " + too_short + ", " + l_oob + ", " + l_chk)
+        qbe_emit_lbl(g, l_chk)
+        let max_off = qbe_tmp(g)
+        let oob = qbe_tmp(g)
+        qbe_emit(g, max_off + " =l sub " + blen + ", 4")
+        qbe_emit(g, oob + " =w cugtl " + il + ", " + max_off)
+        qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+        qbe_emit_lbl(g, l_oob)
+        qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
+        qbe_emit_term(g, "hlt")
+        qbe_emit_lbl(g, l_ok)
+        let pp = qbe_tmp(g)
+        let dp = qbe_tmp(g)
+        let ep = qbe_tmp(g)
+        let fv = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, dp + " =l loadl " + pp)
+        qbe_emit(g, ep + " =l add " + dp + ", " + il)
+        qbe_emit(g, fv + " =s loads " + ep)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(fv, TFloat)
+      }
+      if method_name == "subview" {
+        let a = qbe_emit_expr(g, args[0], Some(TInt))
+        let b = qbe_emit_expr(g, args[1], Some(TInt))
+        let al = qbe_as_l(g, a)
+        let bl = qbe_as_l(g, b)
+        let owner = qbe_tmp(g)
+        let pp = qbe_tmp(g)
+        let bptr = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let blen = qbe_tmp(g)
+        qbe_emit(g, owner + " =l loadl " + obj_val)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, bptr + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, blen + " =l loadl " + lp)
+        let v = qbe_emit_view_slice(g, owner, bptr, blen, al, bl)
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(v, TBytesView)
+      }
+      if method_name == "to_bytes" {
+        let pp = qbe_tmp(g)
+        let vp = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let vl = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, vp + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, vl + " =l loadl " + lp)
+        qbe_emit(g, r + " =l call $pion_bytes_from_ptr(l " + vp + ", l " + vl + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TBytes)
+      }
+      if method_name == "to_string" {
+        let pp = qbe_tmp(g)
+        let vp = qbe_tmp(g)
+        let lp = qbe_tmp(g)
+        let vl = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+        qbe_emit(g, vp + " =l loadl " + pp)
+        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+        qbe_emit(g, vl + " =l loadl " + lp)
+        qbe_emit(g, r + " =l call $pion_str_from_cstr(l " + vp + ", l " + vl + ")")
+        if !obj_borrowed {
+          qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
+        }
+        return qval(r, TString)
       }
     }
     TStringBuilder => {
@@ -25348,6 +26026,37 @@ fn qbe_emit_cond_branch(
             qbe_emit_term(g, "jnz " + cw + ", " + l_true + ", " + l_false)
             return
           }
+          TStrView => {
+            let p1a = qbe_tmp(g)
+            let p1 = qbe_tmp(g)
+            let l1a = qbe_tmp(g)
+            let l1 = qbe_tmp(g)
+            let p2a = qbe_tmp(g)
+            let p2 = qbe_tmp(g)
+            let l2a = qbe_tmp(g)
+            let l2 = qbe_tmp(g)
+            qbe_emit(g, p1a + " =l add " + lv.reg + ", 8")
+            qbe_emit(g, p1 + " =l loadl " + p1a)
+            qbe_emit(g, l1a + " =l add " + lv.reg + ", 16")
+            qbe_emit(g, l1 + " =l loadl " + l1a)
+            qbe_emit(g, p2a + " =l add " + rv.reg + ", 8")
+            qbe_emit(g, p2 + " =l loadl " + p2a)
+            qbe_emit(g, l2a + " =l add " + rv.reg + ", 16")
+            qbe_emit(g, l2 + " =l loadl " + l2a)
+            let eq = qbe_emit_strview_eq_raw(g, p1, l1, p2, l2)
+            if !la.borrowed {
+              qbe_rc_dec(g, lv.reg, lv.ty)
+            }
+            if !ra.borrowed {
+              qbe_rc_dec(g, rv.reg, rv.ty)
+            }
+            if op == "==" {
+              qbe_emit_term(g, "jnz " + eq + ", " + l_true + ", " + l_false)
+            } else {
+              qbe_emit_term(g, "jnz " + eq + ", " + l_false + ", " + l_true)
+            }
+            return
+          }
           TString => {
             if op == "==" || op == "!=" {
               let eq = qbe_tmp(g)
@@ -27492,6 +28201,21 @@ fn qbe_emit_expr_inner(
                 qbe_emit(g, "call $pion_strbuf_push_str(l " + sb + ", l " + pv.reg + ")")
                 qbe_rc_dec(g, pv.reg, TString)
               }
+              TStrView => {
+                let pp = qbe_tmp(g)
+                let vp = qbe_tmp(g)
+                let lp = qbe_tmp(g)
+                let vl = qbe_tmp(g)
+                let tmp_s = qbe_tmp(g)
+                qbe_emit(g, pp + " =l add " + pv.reg + ", 8")
+                qbe_emit(g, vp + " =l loadl " + pp)
+                qbe_emit(g, lp + " =l add " + pv.reg + ", 16")
+                qbe_emit(g, vl + " =l loadl " + lp)
+                qbe_emit(g, tmp_s + " =l call $pion_str_from_cstr(l " + vp + ", l " + vl + ")")
+                qbe_emit(g, "call $pion_strbuf_push_str(l " + sb + ", l " + tmp_s + ")")
+                qbe_rc_dec(g, tmp_s, TString)
+                qbe_rc_dec(g, pv.reg, TStrView)
+              }
               TInt => {
                 let v64 = qbe_as_l(g, pv)
                 qbe_emit(g, "call $pion_strbuf_push_int(l " + sb + ", l " + v64 + ")")
@@ -28116,6 +28840,42 @@ fn qbe_emit_expr_inner(
         qbe_emit_verify_arith_check(g, op, lv, rv, bin_sp)
       }
       match lv.ty {
+        TStrView => {
+          let p1a = qbe_tmp(g)
+          let p1 = qbe_tmp(g)
+          let l1a = qbe_tmp(g)
+          let l1 = qbe_tmp(g)
+          let p2a = qbe_tmp(g)
+          let p2 = qbe_tmp(g)
+          let l2a = qbe_tmp(g)
+          let l2 = qbe_tmp(g)
+          qbe_emit(g, p1a + " =l add " + lv.reg + ", 8")
+          qbe_emit(g, p1 + " =l loadl " + p1a)
+          qbe_emit(g, l1a + " =l add " + lv.reg + ", 16")
+          qbe_emit(g, l1 + " =l loadl " + l1a)
+          qbe_emit(g, p2a + " =l add " + rv.reg + ", 8")
+          qbe_emit(g, p2 + " =l loadl " + p2a)
+          qbe_emit(g, l2a + " =l add " + rv.reg + ", 16")
+          qbe_emit(g, l2 + " =l loadl " + l2a)
+          let eq = qbe_emit_strview_eq_raw(g, p1, l1, p2, l2)
+          if !la.borrowed {
+            qbe_rc_dec(g, lv.reg, lv.ty)
+          }
+          if !ra.borrowed {
+            qbe_rc_dec(g, rv.reg, rv.ty)
+          }
+          if op == "==" {
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =l extuw " + eq)
+            return qval(r, TBool)
+          } else {
+            let ne = qbe_tmp(g)
+            let r = qbe_tmp(g)
+            qbe_emit(g, ne + " =w ceqw " + eq + ", 0")
+            qbe_emit(g, r + " =l extuw " + ne)
+            return qval(r, TBool)
+          }
+        }
         TString => {
           if op == "+" {
             let r = qbe_tmp(g)
@@ -28595,6 +29355,75 @@ fn qbe_emit_expr_inner(
               qbe_rc_dec(g, sv.reg, sv.ty)
             }
             return qval(r, TString)
+          }
+          if name == "fs_mmap_ro" {
+            let can_b = !qbe_args_have_assign(args)
+            let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), can_b)
+            let pv = pa.qv
+            let ok_slot = qbe_alloc_slot4(g)
+            let raw = qbe_tmp(g)
+            qbe_emit(
+              g,
+              raw + " =l call $pion_fs_mmap_ro(l " + pv.reg + ", l " + ok_slot + ")",
+            )
+            if !pa.borrowed {
+              qbe_rc_dec(g, pv.reg, pv.ty)
+            }
+            let ok_w = qbe_tmp(g)
+            qbe_emit(g, ok_w + " =w loadw " + ok_slot)
+            let res_slot = qbe_alloc_slot(g)
+            let l_ok = qbe_lbl(g, "mmap_ok")
+            let l_err = qbe_lbl(g, "mmap_err")
+            let l_end = qbe_lbl(g, "mmap_end")
+            qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+            qbe_emit_lbl(g, l_ok)
+            let ok_obj = qbe_emit_result(g, 0, raw, TBytes, TString)
+            qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_err)
+            let err_obj = qbe_emit_result(g, 1, raw, TBytes, TString)
+            qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_end)
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =l loadl " + res_slot)
+            return qval(r, TResult(TBytes, TString))
+          }
+          if name == "fs_write_atomic_bytes" {
+            let can_b = !qbe_args_have_assign(args)
+            let pa = qbe_emit_arg_maybe_borrow(g, args[0], Some(TString), can_b)
+            let da = qbe_emit_arg_maybe_borrow(g, args[1], Some(TBytes), can_b)
+            let pv = pa.qv
+            let dv = da.qv
+            let ok_w = qbe_tmp(g)
+            qbe_emit(
+              g,
+              ok_w + " =w call $pion_fs_write_atomic_bytes(l " + pv.reg + ", l " + dv.reg + ")",
+            )
+            if !da.borrowed {
+              qbe_rc_dec(g, dv.reg, dv.ty)
+            }
+            if !pa.borrowed {
+              qbe_rc_dec(g, pv.reg, pv.ty)
+            }
+            let res_slot = qbe_alloc_slot(g)
+            let l_ok = qbe_lbl(g, "fwa_ok")
+            let l_err = qbe_lbl(g, "fwa_err")
+            let l_end = qbe_lbl(g, "fwa_end")
+            qbe_emit_term(g, "jnz " + ok_w + ", " + l_ok + ", " + l_err)
+            qbe_emit_lbl(g, l_ok)
+            let ok_obj = qbe_emit_result(g, 0, "0", TUnit, TString)
+            qbe_emit(g, "storel " + ok_obj + ", " + res_slot)
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_err)
+            let err_s = qbe_emit_string_lit(g, "fs_write_atomic_bytes failed")
+            let err_obj = qbe_emit_result(g, 1, err_s, TUnit, TString)
+            qbe_emit(g, "storel " + err_obj + ", " + res_slot)
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_end)
+            let r = qbe_tmp(g)
+            qbe_emit(g, r + " =l loadl " + res_slot)
+            return qval(r, TResult(TUnit, TString))
           }
           match rt_prim_info(name) {
             Some(pr) => return qbe_emit_rt_prim_call(g, pr, args)
@@ -30330,6 +31159,66 @@ fn qbe_emit_expr_inner(
             qbe_rc_dec(g, ov.reg, ov.ty)
           }
           qval(bw, TInt)
+        }
+        TStrView => {
+          let iv = qbe_emit_expr(g, idx, Some(TInt))
+          let il = qbe_as_l(g, iv)
+          let lp = qbe_tmp(g)
+          let vlen = qbe_tmp(g)
+          let oob = qbe_tmp(g)
+          let l_oob = qbe_lbl(g, "sv_oob")
+          let l_ok = qbe_lbl(g, "sv_ok")
+          qbe_emit(g, lp + " =l add " + ov.reg + ", 16")
+          qbe_emit(g, vlen + " =l loadl " + lp)
+          qbe_emit(g, oob + " =w cugel " + il + ", " + vlen)
+          qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+          qbe_emit_lbl(g, l_oob)
+          qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + vlen + ")")
+          qbe_emit_term(g, "hlt")
+          qbe_emit_lbl(g, l_ok)
+          let pp = qbe_tmp(g)
+          let vp = qbe_tmp(g)
+          let ep = qbe_tmp(g)
+          let bw = qbe_tmp(g)
+          qbe_emit(g, pp + " =l add " + ov.reg + ", 8")
+          qbe_emit(g, vp + " =l loadl " + pp)
+          qbe_emit(g, ep + " =l add " + vp + ", " + il)
+          qbe_emit(g, bw + " =w loadub " + ep)
+          if !borrowed {
+            qbe_rc_dec(g, ov.reg, ov.ty)
+          }
+          qval(bw, TInt)
+        }
+        TBytesView => {
+          let iv = qbe_emit_expr(g, idx, Some(TInt))
+          let il = qbe_as_l(g, iv)
+          let lp = qbe_tmp(g)
+          let vlen = qbe_tmp(g)
+          let oob = qbe_tmp(g)
+          let l_oob = qbe_lbl(g, "bv_oob")
+          let l_ok = qbe_lbl(g, "bv_ok")
+          qbe_emit(g, lp + " =l add " + ov.reg + ", 16")
+          qbe_emit(g, vlen + " =l loadl " + lp)
+          qbe_emit(g, oob + " =w cugel " + il + ", " + vlen)
+          qbe_emit_term(g, "jnz " + oob + ", " + l_oob + ", " + l_ok)
+          qbe_emit_lbl(g, l_oob)
+          qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + vlen + ")")
+          qbe_emit_term(g, "hlt")
+          qbe_emit_lbl(g, l_ok)
+          let pp = qbe_tmp(g)
+          let vp = qbe_tmp(g)
+          let ep = qbe_tmp(g)
+          let bw = qbe_tmp(g)
+          let bl = qbe_tmp(g)
+          qbe_emit(g, pp + " =l add " + ov.reg + ", 8")
+          qbe_emit(g, vp + " =l loadl " + pp)
+          qbe_emit(g, ep + " =l add " + vp + ", " + il)
+          qbe_emit(g, bw + " =w loadub " + ep)
+          qbe_emit(g, bl + " =l extuw " + bw)
+          if !borrowed {
+            qbe_rc_dec(g, ov.reg, ov.ty)
+          }
+          qval(bl, TByte)
         }
         TBytes => {
           let iv = qbe_emit_expr(g, idx, Some(TInt))
@@ -39052,6 +39941,42 @@ fn qbe_emit_stmt(
                 qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + blen + ")")
                 qbe_emit_term(g, "hlt")
                 qbe_emit_lbl(g, l_ok)
+              }
+              let bytes_obj_reg = if ov.reg != "0" {
+                ov.reg
+              } else {
+                match qbe_lookup_local(g, arr_local_name) {
+                  Some(bloc) => {
+                    let t = qbe_tmp(g)
+                    qbe_emit(g, t + " =l loadl " + bloc.slot)
+                    t
+                  }
+                  None => "0"
+                }
+              }
+              if bytes_obj_reg != "0" {
+                let cap_p = qbe_tmp(g)
+                let cap_v = qbe_tmp(g)
+                let is_ro = qbe_tmp(g)
+                let l_ro = qbe_lbl(g, "bytes_ro")
+                let l_rw = qbe_lbl(g, "bytes_rw")
+                qbe_emit(g, cap_p + " =l add " + bytes_obj_reg + ", 8")
+                qbe_emit(g, cap_v + " =l loadl " + cap_p)
+                qbe_emit(g, is_ro + " =w csltl " + cap_v + ", 0")
+                qbe_emit_term(g, "jnz " + is_ro + ", " + l_ro + ", " + l_rw)
+                qbe_emit_lbl(g, l_ro)
+                let ro_mid = qbe_intern_cstring(g, "cannot mutate read-only mmap Bytes")
+                let ro_fid = qbe_intern_cstring(g, "bytes")
+                qbe_emit(
+                  g,
+                  "call $pion_panic(l $pion_cstr_" +
+                  ro_mid.to_string() +
+                  ", l $pion_cstr_" +
+                  ro_fid.to_string() +
+                  ", w 0)",
+                )
+                qbe_emit_term(g, "hlt")
+                qbe_emit_lbl(g, l_rw)
               }
               let dp = match g.hoisted_bytes_dp.get(arr_local_name) {
                 Some(hdp) => hdp

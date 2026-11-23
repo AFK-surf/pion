@@ -445,7 +445,7 @@ export function createPionRuntime(opts = {}) {
   }
   const pion_bytes_len = (b) => { sync(); return g64(pNum(b)); };
   function pion_bytes_get(b, i) { const p = pNum(b); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n); return u8[Number(g64(p + 16)) + Number(i)]; }
-  function pion_bytes_set(b, i, v) { const p = pNum(b); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n); u8[Number(g64(p + 16)) + Number(i)] = v & 0xff; }
+  function pion_bytes_set(b, i, v) { const p = pNum(b); sync(); const n = g64(p); if (i < 0n || i >= n) pion_panic_oob(i, n); if (g64(p + 8) < 0n) pionDie("cannot mutate read-only mmap Bytes"); u8[Number(g64(p + 16)) + Number(i)] = v & 0xff; }
   function pion_bytes_slice(b, st, en) {
     const pb = pNum(b); sync(); const len = Number(g64(pb));
     let a = Math.max(0, Number(st)), e = Math.min(len, Number(en)); if (e < a) e = a;
@@ -878,6 +878,9 @@ export function createPionRuntime(opts = {}) {
       pion_world_println: (_w, s) => printlnFn(readStr(s)),
       pion_world_eprintln: (_w, s) => eprintlnFn(readStr(s)),
       pion_world_clock_ms: () => BigInt(Math.floor(performance.now())),
+      pion_clock_monotonic_us: () => BigInt(Math.round(performance.now() * 1000)),
+      pion_fs_mmap_ro: (_p, okOut) => { const op = pNum(okOut); if (op) { sync(); dv.setInt32(op, 0, true); } return makeStr("fs_mmap_ro unavailable in web runtime"); },
+      pion_fs_write_atomic_bytes: () => 0,
       pion_ptr_alloc: (b) => pBig(rawZero(Number(b))),
       pion_ptr_free: (p) => rawFree(pNum(p)),
       pion_ptr_offset: (p, o) => BigInt.asIntN(64, BigInt(p) + BigInt(o)),
