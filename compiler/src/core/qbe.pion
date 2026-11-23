@@ -9004,6 +9004,11 @@ fn qbe_emit_inline_closure_flat_struct_lit(
 }
 
 ///|
+fn qbe_wasm_caller_over_inline_budget(g : QbeGen, callee_cost : Int) -> Bool {
+  g.target_wasm && g.fn_body.length() > 24576 && callee_cost > 12
+}
+
+///|
 fn qbe_try_inline_fn_call(
   g : QbeGen,
   key : String,
@@ -9039,7 +9044,7 @@ fn qbe_try_inline_fn_call(
         Some(c) => c
         None => 0
       }
-      if fn_cost > max_cost {
+      if fn_cost > max_cost || qbe_wasm_caller_over_inline_budget(g, fn_cost) {
         return None
       }
       if arg_vals.length() == inl_fd.params.length() &&
@@ -9266,6 +9271,17 @@ fn qbe_try_inline_xpkg_fn_call(
   }
   if !can_inl {
     return None
+  }
+  if g.target_wasm && g.fn_body.length() > 24576 {
+    let self_key = if inl_fd.receiver_type != "" {
+      inl_fd.receiver_type + "::" + inl_fd.name
+    } else {
+      inl_fd.name
+    }
+    let fn_cost = qbe_stmts_inline_cost_in(inl_fd.body, self_key, false, 0)
+    if fn_cost < 0 || qbe_wasm_caller_over_inline_budget(g, fn_cost) {
+      return None
+    }
   }
   g.inline_depth = g.inline_depth + 1
   g.inline_stack.push(stack_key)
@@ -10092,16 +10108,264 @@ fn qbe_ty_is_scalarizable_opt_res(
 }
 
 ///|
+fn qbe_fn_body_can_scalar_opt_res(
+  g : QbeGen,
+  target_pkg : String,
+  stack_key : String,
+  inl_body : Array[Stmt],
+  ret_ty : Ty,
+  val_is_pod_buf : Bool,
+) -> Bool {
+  let saved_mono = g.mono_pkg
+  if target_pkg != "" {
+    g.mono_pkg = target_pkg
+  }
+  g.inline_depth = g.inline_depth + 1
+  g.inline_stack.push(stack_key)
+  let ok = qbe_fn_body_all_returns_are_opt_res_ctors(
+    g,
+    inl_body,
+    ret_ty,
+    val_is_pod_buf,
+  )
+  let _ = g.inline_stack.pop()
+  g.inline_depth = g.inline_depth - 1
+  g.mono_pkg = saved_mono
+  ok
+}
+
+///|
+fn qbe_tail_call_can_scalar_opt_res(
+  g : QbeGen,
+  e : Expr,
+  ret_ty : Ty,
+  val_is_pod_buf : Bool,
+) -> Bool {
+  if !g.release || g.inline_depth >= 3 {
+    return false
+  }
+  let want_ret_str = ty_to_string(subst_ty(ret_ty, g.cur_type_subst))
+  match e {
+    ECall(EIdent(name, _), _, _) => {
+      match qbe_lookup_local(g, name) {
+        Some(_) => return false
+        None => ()
+      }
+      let target_pkg = g.mono_pkg
+      let finfo_opt : Option[FnInfo] = if target_pkg == "" {
+        g.tc.fns.get(name)
+      } else {
+        match g.tc.imported_pkgs.get(target_pkg) {
+          Some(ipkg) =>
+            match ipkg.tc.fns.get(name) {
+              Some(fi) => Some(qualify_fn_info(ipkg, fi))
+              None => None
+            }
+          None => None
+        }
+      }
+      match finfo_opt {
+        Some(finfo) => {
+          if ty_to_string(subst_ty(finfo.ret_ty, g.cur_type_subst)) != want_ret_str {
+            return false
+          }
+          let inl_fd_opt = if target_pkg == "" {
+            qbe_local_fn_can_scalar_inline(g, name, finfo)
+          } else {
+            qbe_xpkg_fn_can_scalar_inline(g, target_pkg, name, finfo)
+          }
+          match inl_fd_opt {
+            Some(inl_fd) => {
+              let stack_key = if target_pkg != "" {
+                target_pkg + "::" + name
+              } else {
+                name
+              }
+              qbe_fn_body_can_scalar_opt_res(
+                g,
+                target_pkg,
+                stack_key,
+                qbe_fn_body(g, inl_fd.body),
+                ret_ty,
+                val_is_pod_buf,
+              )
+            }
+            None => false
+          }
+        }
+        None => false
+      }
+    }
+    ECall(EPath(qual, mem, _), _, _) => {
+      let mut target_finfo : Option[FnInfo] = None
+      let mut target_pkg = ""
+      let mut key = qual + "::" + mem
+      if has_qual_sep(qual) {
+        let qp = split_qual_name(qual)
+        match resolve_pkg_for_lookup(g.tc, qp.prefix, true) {
+          Some(ipkg) =>
+            match ipkg.tc.methods.get(qp.name + "::" + mem) {
+              Some(mi) => {
+                target_finfo = Some(qualify_fn_info(ipkg, mi))
+                target_pkg = ipkg.name
+                key = qp.name + "::" + mem
+              }
+              None => ()
+            }
+          None => ()
+        }
+      }
+      match target_finfo {
+        None =>
+          match resolve_pkg_for_lookup(g.tc, qual, true) {
+            Some(ipkg) =>
+              match ipkg.tc.fns.get(mem) {
+                Some(fi) => {
+                  target_finfo = Some(qualify_fn_info(ipkg, fi))
+                  target_pkg = ipkg.name
+                  key = mem
+                }
+                None => ()
+              }
+            None => ()
+          }
+        Some(_) => ()
+      }
+      match target_finfo {
+        None =>
+          if g.mono_pkg != "" {
+            match g.tc.imported_pkgs.get(g.mono_pkg) {
+              Some(ipkg) =>
+                match ipkg.tc.methods.get(qual + "::" + mem) {
+                  Some(mi) => {
+                    target_finfo = Some(qualify_fn_info(ipkg, mi))
+                    target_pkg = ipkg.name
+                  }
+                  None => ()
+                }
+              None => ()
+            }
+          }
+        Some(_) => ()
+      }
+      match target_finfo {
+        None =>
+          match qbe_lookup_method_info(g, qual, mem) {
+            Some(minfo) => {
+              target_finfo = Some(minfo)
+              let qpm = split_qual_name(qual)
+              if qpm.prefix != "" {
+                target_pkg = qpm.prefix
+              } else if g.mono_pkg != "" {
+                target_pkg = g.mono_pkg
+              }
+            }
+            None => ()
+          }
+        Some(_) => ()
+      }
+      match target_finfo {
+        Some(minfo) => {
+          if ty_to_string(subst_ty(minfo.ret_ty, g.cur_type_subst)) != want_ret_str {
+            return false
+          }
+          let inl_fd_opt = if target_pkg == "" &&
+            g.mono_pkg == "" &&
+            !has_qual_sep(qual) {
+            qbe_local_fn_can_scalar_inline(g, key, minfo)
+          } else if target_pkg != "" {
+            qbe_xpkg_fn_can_scalar_inline(g, target_pkg, key, minfo)
+          } else {
+            None
+          }
+          match inl_fd_opt {
+            Some(inl_fd) => {
+              let stack_key = if target_pkg != "" {
+                target_pkg + "::" + key
+              } else {
+                key
+              }
+              qbe_fn_body_can_scalar_opt_res(
+                g,
+                target_pkg,
+                stack_key,
+                qbe_fn_body(g, inl_fd.body),
+                ret_ty,
+                val_is_pod_buf,
+              )
+            }
+            None => false
+          }
+        }
+        None => false
+      }
+    }
+    EMethodCall(recv, method_name, _, _) => {
+      let sname_opt : Option[String] = match qbe_probe_expr_ty(g, recv) {
+        Some(TStruct(sn, _)) => Some(sn)
+        _ =>
+          match recv {
+            EIdent("self", _) =>
+              match ret_ty {
+                TOption(TStruct(sn, _)) | TResult(TStruct(sn, _), _) => Some(sn)
+                _ => None
+              }
+            _ => None
+          }
+      }
+      match sname_opt {
+        Some(sname) =>
+          match qbe_lookup_method_info(g, sname, method_name) {
+            Some(minfo) => {
+              if ty_to_string(subst_ty(minfo.ret_ty, g.cur_type_subst)) != want_ret_str {
+                return false
+              }
+              let qp_m = split_qual_name(sname)
+              let mpkg = if qp_m.prefix != "" { qp_m.prefix } else { g.mono_pkg }
+              let key = sname + "::" + method_name
+              let inl_fd_opt = if mpkg == "" && !has_qual_sep(sname) {
+                qbe_local_fn_can_scalar_inline(g, key, minfo)
+              } else if mpkg != "" {
+                qbe_xpkg_fn_can_scalar_inline(g, mpkg, key, minfo)
+              } else {
+                None
+              }
+              match inl_fd_opt {
+                Some(inl_fd) => {
+                  let stack_key = if mpkg != "" { mpkg + "::" + key } else { key }
+                  qbe_fn_body_can_scalar_opt_res(
+                    g,
+                    mpkg,
+                    stack_key,
+                    qbe_fn_body(g, inl_fd.body),
+                    ret_ty,
+                    val_is_pod_buf,
+                  )
+                }
+                None => false
+              }
+            }
+            None => false
+          }
+        None => false
+      }
+    }
+    _ => false
+  }
+}
+
+///|
 fn qbe_expr_all_tails_are_opt_res_ctors(
+  g : QbeGen,
   e : Expr,
   ret_ty : Ty,
   val_is_pod_buf : Bool,
 ) -> Bool {
   match e {
-    EBlock(bs, _) => qbe_stmts_all_tails_are_opt_res_ctors(bs, ret_ty, val_is_pod_buf)
+    EBlock(bs, _) => qbe_stmts_all_tails_are_opt_res_ctors(g, bs, ret_ty, val_is_pod_buf)
     EIf(_, then_s, Some(else_e), _) =>
-      qbe_stmts_all_tails_are_opt_res_ctors(then_s, ret_ty, val_is_pod_buf) &&
-      qbe_expr_all_tails_are_opt_res_ctors(else_e, ret_ty, val_is_pod_buf)
+      qbe_stmts_all_tails_are_opt_res_ctors(g, then_s, ret_ty, val_is_pod_buf) &&
+      qbe_expr_all_tails_are_opt_res_ctors(g, else_e, ret_ty, val_is_pod_buf)
     EMatch(_, arms, _) => {
       if arms.length() == 0 {
         return false
@@ -10112,7 +10376,7 @@ fn qbe_expr_all_tails_are_opt_res_ctors(
           Some(_) => return false
           None => ()
         }
-        if !qbe_expr_all_tails_are_opt_res_ctors(arms[i].body, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_all_tails_are_opt_res_ctors(g, arms[i].body, ret_ty, val_is_pod_buf) {
           return false
         }
         i = i + 1
@@ -10125,18 +10389,16 @@ fn qbe_expr_all_tails_are_opt_res_ctors(
           match e {
             EIdent("None", _) | EPath("Option", "None", _) => true
             ECall(EIdent("Some", _), args, _) | ECall(EPath("Option", "Some", _), args, _) =>
-              args.length() == 1 &&
-              (!val_is_pod_buf || qbe_expr_all_tails_are_pod_struct_lits(args[0]))
-            _ => false
+              args.length() == 1
+            _ => qbe_tail_call_can_scalar_opt_res(g, e, ret_ty, val_is_pod_buf)
           }
         TResult(_, _) =>
           match e {
             ECall(EIdent("Ok", _), args, _) | ECall(EPath("Result", "Ok", _), args, _) =>
-              args.length() == 1 &&
-              (!val_is_pod_buf || qbe_expr_all_tails_are_pod_struct_lits(args[0]))
+              args.length() == 1
             ECall(EIdent("Err", _), args, _) | ECall(EPath("Result", "Err", _), args, _) =>
               args.length() == 1
-            _ => false
+            _ => qbe_tail_call_can_scalar_opt_res(g, e, ret_ty, val_is_pod_buf)
           }
         _ => false
       }
@@ -10145,6 +10407,7 @@ fn qbe_expr_all_tails_are_opt_res_ctors(
 
 ///|
 fn qbe_stmts_all_tails_are_opt_res_ctors(
+  g : QbeGen,
   stmts : Array[Stmt],
   ret_ty : Ty,
   val_is_pod_buf : Bool,
@@ -10156,45 +10419,46 @@ fn qbe_stmts_all_tails_are_opt_res_ctors(
     return false
   }
   match stmts[stmts.length() - 1] {
-    SExpr(tail_e, _) => qbe_expr_all_tails_are_opt_res_ctors(tail_e, ret_ty, val_is_pod_buf)
+    SExpr(tail_e, _) => qbe_expr_all_tails_are_opt_res_ctors(g, tail_e, ret_ty, val_is_pod_buf)
     _ => false
   }
 }
 
 ///|
 fn qbe_expr_returns_are_opt_res_ctors(
+  g : QbeGen,
   e : Expr,
   ret_ty : Ty,
   val_is_pod_buf : Bool,
 ) -> Bool {
   match e {
-    ETry(inner, _) => qbe_expr_returns_are_opt_res_ctors(inner, ret_ty, val_is_pod_buf)
+    ETry(inner, _) => qbe_expr_returns_are_opt_res_ctors(g, inner, ret_ty, val_is_pod_buf)
     EClosure(_, _, _, _) => true
-    EBlock(bs, _) => qbe_stmts_returns_are_opt_res_ctors(bs, ret_ty, val_is_pod_buf)
+    EBlock(bs, _) => qbe_stmts_returns_are_opt_res_ctors(g, bs, ret_ty, val_is_pod_buf)
     EIf(cond, then_s, else_opt, _) => {
-      if !qbe_expr_returns_are_opt_res_ctors(cond, ret_ty, val_is_pod_buf) ||
-        !qbe_stmts_returns_are_opt_res_ctors(then_s, ret_ty, val_is_pod_buf) {
+      if !qbe_expr_returns_are_opt_res_ctors(g, cond, ret_ty, val_is_pod_buf) ||
+        !qbe_stmts_returns_are_opt_res_ctors(g, then_s, ret_ty, val_is_pod_buf) {
         return false
       }
       match else_opt {
         None => true
-        Some(el) => qbe_expr_returns_are_opt_res_ctors(el, ret_ty, val_is_pod_buf)
+        Some(el) => qbe_expr_returns_are_opt_res_ctors(g, el, ret_ty, val_is_pod_buf)
       }
     }
     EMatch(s, arms, _) => {
-      if !qbe_expr_returns_are_opt_res_ctors(s, ret_ty, val_is_pod_buf) {
+      if !qbe_expr_returns_are_opt_res_ctors(g, s, ret_ty, val_is_pod_buf) {
         return false
       }
       let mut i = 0
       while i < arms.length() {
         match arms[i].guard_expr {
           Some(ge) =>
-            if !qbe_expr_returns_are_opt_res_ctors(ge, ret_ty, val_is_pod_buf) {
+            if !qbe_expr_returns_are_opt_res_ctors(g, ge, ret_ty, val_is_pod_buf) {
               return false
             }
           None => ()
         }
-        if !qbe_expr_returns_are_opt_res_ctors(arms[i].body, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, arms[i].body, ret_ty, val_is_pod_buf) {
           return false
         }
         i = i + 1
@@ -10207,17 +10471,17 @@ fn qbe_expr_returns_are_opt_res_ctors(
     | EMove(inner, _)
     | ENamedArg(_, _, inner, _)
     | EMutArg(inner, _)
-    | EIs(inner, _, _) => qbe_expr_returns_are_opt_res_ctors(inner, ret_ty, val_is_pod_buf)
+    | EIs(inner, _, _) => qbe_expr_returns_are_opt_res_ctors(g, inner, ret_ty, val_is_pod_buf)
     EBinary(_, l, r, _) | EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
-      qbe_expr_returns_are_opt_res_ctors(l, ret_ty, val_is_pod_buf) &&
-      qbe_expr_returns_are_opt_res_ctors(r, ret_ty, val_is_pod_buf)
+      qbe_expr_returns_are_opt_res_ctors(g, l, ret_ty, val_is_pod_buf) &&
+      qbe_expr_returns_are_opt_res_ctors(g, r, ret_ty, val_is_pod_buf)
     ECall(callee, args, _) => {
-      if !qbe_expr_returns_are_opt_res_ctors(callee, ret_ty, val_is_pod_buf) {
+      if !qbe_expr_returns_are_opt_res_ctors(g, callee, ret_ty, val_is_pod_buf) {
         return false
       }
       let mut i = 0
       while i < args.length() {
-        if !qbe_expr_returns_are_opt_res_ctors(args[i], ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, args[i], ret_ty, val_is_pod_buf) {
           return false
         }
         i = i + 1
@@ -10225,12 +10489,12 @@ fn qbe_expr_returns_are_opt_res_ctors(
       true
     }
     EMethodCall(recv, _, args, _) => {
-      if !qbe_expr_returns_are_opt_res_ctors(recv, ret_ty, val_is_pod_buf) {
+      if !qbe_expr_returns_are_opt_res_ctors(g, recv, ret_ty, val_is_pod_buf) {
         return false
       }
       let mut i = 0
       while i < args.length() {
-        if !qbe_expr_returns_are_opt_res_ctors(args[i], ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, args[i], ret_ty, val_is_pod_buf) {
           return false
         }
         i = i + 1
@@ -10240,7 +10504,7 @@ fn qbe_expr_returns_are_opt_res_ctors(
     EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) | EDotVariant(_, elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        if !qbe_expr_returns_are_opt_res_ctors(elems[i], ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, elems[i], ret_ty, val_is_pod_buf) {
           return false
         }
         i = i + 1
@@ -10250,14 +10514,14 @@ fn qbe_expr_returns_are_opt_res_ctors(
     EStructLit(_, spread_opt, fields, _) => {
       match spread_opt {
         Some(sp_e) =>
-          if !qbe_expr_returns_are_opt_res_ctors(sp_e, ret_ty, val_is_pod_buf) {
+          if !qbe_expr_returns_are_opt_res_ctors(g, sp_e, ret_ty, val_is_pod_buf) {
             return false
           }
         None => ()
       }
       let mut i = 0
       while i < fields.length() {
-        if !qbe_expr_returns_are_opt_res_ctors(fields[i].value, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, fields[i].value, ret_ty, val_is_pod_buf) {
           return false
         }
         i = i + 1
@@ -10270,6 +10534,7 @@ fn qbe_expr_returns_are_opt_res_ctors(
 
 ///|
 fn qbe_stmts_returns_are_opt_res_ctors(
+  g : QbeGen,
   stmts : Array[Stmt],
   ret_ty : Ty,
   val_is_pod_buf : Bool,
@@ -10279,40 +10544,40 @@ fn qbe_stmts_returns_are_opt_res_ctors(
     match stmts[i] {
       SReturn(None, _) => return false
       SReturn(Some(e), _) =>
-        if !qbe_expr_returns_are_opt_res_ctors(e, ret_ty, val_is_pod_buf) ||
-          !qbe_expr_all_tails_are_opt_res_ctors(e, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, e, ret_ty, val_is_pod_buf) ||
+          !qbe_expr_all_tails_are_opt_res_ctors(g, e, ret_ty, val_is_pod_buf) {
           return false
         }
       SLet(_, _, _, init, _) | SLetTuple(_, _, init, _) | SExpr(init, _) =>
-        if !qbe_expr_returns_are_opt_res_ctors(init, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, init, ret_ty, val_is_pod_buf) {
           return false
         }
       SAssign(l, r, _) | SCompoundAssign(_, l, r, _) | SDebugAssert(l, r, _) =>
-        if !qbe_expr_returns_are_opt_res_ctors(l, ret_ty, val_is_pod_buf) ||
-          !qbe_expr_returns_are_opt_res_ctors(r, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, l, ret_ty, val_is_pod_buf) ||
+          !qbe_expr_returns_are_opt_res_ctors(g, r, ret_ty, val_is_pod_buf) {
           return false
         }
       SGuard(c, b, _) | SWhile(c, b, _) =>
-        if !qbe_expr_returns_are_opt_res_ctors(c, ret_ty, val_is_pod_buf) ||
-          !qbe_stmts_returns_are_opt_res_ctors(b, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, c, ret_ty, val_is_pod_buf) ||
+          !qbe_stmts_returns_are_opt_res_ctors(g, b, ret_ty, val_is_pod_buf) {
           return false
         }
       SFor(init_s, cond, step_s, b, _) =>
-        if !qbe_stmts_returns_are_opt_res_ctors([init_s], ret_ty, val_is_pod_buf) ||
-          !qbe_expr_returns_are_opt_res_ctors(cond, ret_ty, val_is_pod_buf) ||
-          !qbe_stmts_returns_are_opt_res_ctors([step_s], ret_ty, val_is_pod_buf) ||
-          !qbe_stmts_returns_are_opt_res_ctors(b, ret_ty, val_is_pod_buf) {
+        if !qbe_stmts_returns_are_opt_res_ctors(g, [init_s], ret_ty, val_is_pod_buf) ||
+          !qbe_expr_returns_are_opt_res_ctors(g, cond, ret_ty, val_is_pod_buf) ||
+          !qbe_stmts_returns_are_opt_res_ctors(g, [step_s], ret_ty, val_is_pod_buf) ||
+          !qbe_stmts_returns_are_opt_res_ctors(g, b, ret_ty, val_is_pod_buf) {
           return false
         }
       SForRange(_, s, e, _, b, _) =>
-        if !qbe_expr_returns_are_opt_res_ctors(s, ret_ty, val_is_pod_buf) ||
-          !qbe_expr_returns_are_opt_res_ctors(e, ret_ty, val_is_pod_buf) ||
-          !qbe_stmts_returns_are_opt_res_ctors(b, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, s, ret_ty, val_is_pod_buf) ||
+          !qbe_expr_returns_are_opt_res_ctors(g, e, ret_ty, val_is_pod_buf) ||
+          !qbe_stmts_returns_are_opt_res_ctors(g, b, ret_ty, val_is_pod_buf) {
           return false
         }
       SForIn(_, _, iter, b, _) =>
-        if !qbe_expr_returns_are_opt_res_ctors(iter, ret_ty, val_is_pod_buf) ||
-          !qbe_stmts_returns_are_opt_res_ctors(b, ret_ty, val_is_pod_buf) {
+        if !qbe_expr_returns_are_opt_res_ctors(g, iter, ret_ty, val_is_pod_buf) ||
+          !qbe_stmts_returns_are_opt_res_ctors(g, b, ret_ty, val_is_pod_buf) {
           return false
         }
       SBreak(_) | SContinue(_) => ()
@@ -10326,6 +10591,7 @@ fn qbe_stmts_returns_are_opt_res_ctors(
 /// Verify an inlined function/method body produces every exit (both early `return`
 /// and final tail expression) via explicit `Some`/`None`/`Ok`/`Err` constructors.
 fn qbe_fn_body_all_returns_are_opt_res_ctors(
+  g : QbeGen,
   stmts : Array[Stmt],
   ret_ty : Ty,
   val_is_pod_buf : Bool,
@@ -10333,13 +10599,394 @@ fn qbe_fn_body_all_returns_are_opt_res_ctors(
   if stmts.length() == 0 {
     return false
   }
-  if !qbe_stmts_returns_are_opt_res_ctors(stmts, ret_ty, val_is_pod_buf) {
+  if !qbe_stmts_returns_are_opt_res_ctors(g, stmts, ret_ty, val_is_pod_buf) {
     return false
   }
   match stmts[stmts.length() - 1] {
     SReturn(Some(_), _) => true
-    SExpr(tail_e, _) => qbe_expr_all_tails_are_opt_res_ctors(tail_e, ret_ty, val_is_pod_buf)
+    SExpr(tail_e, _) => qbe_expr_all_tails_are_opt_res_ctors(g, tail_e, ret_ty, val_is_pod_buf)
     _ => false
+  }
+}
+
+///|
+fn qbe_match_2arm_opt_res(
+  arms : Array[MatchArm],
+) -> Option[(Int, Int, Int, String, String)] {
+  if arms.length() != 2 {
+    return None
+  }
+  match (arms[0].guard_expr, arms[1].guard_expr) {
+    (None, None) => ()
+    _ => return None
+  }
+  let mut want_kind = 0
+  let mut ok_idx = -1
+  let mut err_idx = -1
+  let mut ok_bind = ""
+  let mut err_bind = ""
+  match (arms[0].pat, arms[1].pat) {
+    (PVariant(_, "Some", s0, _), PVariant(_, "None", s1, _)) =>
+      if s0.length() == 1 && s1.length() == 0 {
+        match s0[0] {
+          PIdent(b, _) => {
+            want_kind = 1
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = b
+          }
+          PWild(_) => {
+            want_kind = 1
+            ok_idx = 0
+            err_idx = 1
+          }
+          _ => ()
+        }
+      }
+    (PVariant(_, "Some", s0, _), PWild(_)) =>
+      if s0.length() == 1 {
+        match s0[0] {
+          PIdent(b, _) => {
+            want_kind = 1
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = b
+          }
+          PWild(_) => {
+            want_kind = 1
+            ok_idx = 0
+            err_idx = 1
+          }
+          _ => ()
+        }
+      }
+    (PVariant(_, "None", s0, _), PVariant(_, "Some", s1, _)) =>
+      if s0.length() == 0 && s1.length() == 1 {
+        match s1[0] {
+          PIdent(b, _) => {
+            want_kind = 1
+            ok_idx = 1
+            err_idx = 0
+            ok_bind = b
+          }
+          PWild(_) => {
+            want_kind = 1
+            ok_idx = 1
+            err_idx = 0
+          }
+          _ => ()
+        }
+      }
+    (PVariant(_, "None", s0, _), PWild(_)) =>
+      if s0.length() == 0 {
+        want_kind = 1
+        ok_idx = 1
+        err_idx = 0
+      }
+    (PVariant(_, "Ok", s0, _), PVariant(_, "Err", s1, _)) =>
+      if s0.length() == 1 && s1.length() == 1 {
+        match (s0[0], s1[0]) {
+          (PIdent(ob, _), PIdent(eb, _)) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = ob
+            err_bind = eb
+          }
+          (PIdent(ob, _), PWild(_)) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = ob
+          }
+          (PWild(_), PIdent(eb, _)) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+            err_bind = eb
+          }
+          (PWild(_), PWild(_)) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+          }
+          _ => ()
+        }
+      }
+    (PVariant(_, "Err", s0, _), PVariant(_, "Ok", s1, _)) =>
+      if s0.length() == 1 && s1.length() == 1 {
+        match (s0[0], s1[0]) {
+          (PIdent(eb, _), PIdent(ob, _)) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+            ok_bind = ob
+            err_bind = eb
+          }
+          (PIdent(eb, _), PWild(_)) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+            err_bind = eb
+          }
+          (PWild(_), PIdent(ob, _)) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+            ok_bind = ob
+          }
+          (PWild(_), PWild(_)) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+          }
+          _ => ()
+        }
+      }
+    (PVariant(_, "Ok", s0, _), PWild(_)) =>
+      if s0.length() == 1 {
+        match s0[0] {
+          PIdent(ob, _) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+            ok_bind = ob
+          }
+          PWild(_) => {
+            want_kind = 2
+            ok_idx = 0
+            err_idx = 1
+          }
+          _ => ()
+        }
+      }
+    (PVariant(_, "Err", s0, _), PWild(_)) =>
+      if s0.length() == 1 {
+        match s0[0] {
+          PIdent(eb, _) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+            err_bind = eb
+          }
+          PWild(_) => {
+            want_kind = 2
+            ok_idx = 1
+            err_idx = 0
+          }
+          _ => ()
+        }
+      }
+    _ => ()
+  }
+  if want_kind == 0 {
+    None
+  } else {
+    Some((want_kind, ok_idx, err_idx, ok_bind, err_bind))
+  }
+}
+
+///|
+fn qbe_emit_copy_pod_slots(
+  g : QbeGen,
+  src_p : String,
+  dst_p : String,
+  nfields : Int,
+) -> Unit {
+  let mut fi = 0
+  while fi < nfields {
+    let off = fi * 8
+    let sp_i = if off == 0 {
+      src_p
+    } else {
+      let t = qbe_tmp(g)
+      qbe_emit(g, t + " =l add " + src_p + ", " + off.to_string())
+      t
+    }
+    let dp_i = if off == 0 {
+      dst_p
+    } else {
+      let t = qbe_tmp(g)
+      qbe_emit(g, t + " =l add " + dst_p + ", " + off.to_string())
+      t
+    }
+    let fv = qbe_tmp(g)
+    qbe_emit(g, fv + " =l loadl " + sp_i)
+    qbe_emit(g, "storel " + fv + ", " + dp_i)
+    fi = fi + 1
+  }
+}
+
+///|
+fn qbe_emit_tail_opt_res_forward_call(
+  g : QbeGen,
+  e : Expr,
+  ret_ty : Ty,
+  want_kind : Int,
+  tag_slot : String,
+  val_slot : String,
+  err_slot : String,
+  val_is_pod_buf : Bool,
+) -> Unit {
+  match qbe_try_emit_opt_res_scalarized(g, e, want_kind, val_is_pod_buf) {
+    Some(inner) => {
+      if g.block_term {
+        return
+      }
+      let tw = qbe_tmp(g)
+      qbe_emit(g, tw + " =w loadw " + inner.tag_slot)
+      qbe_emit(g, "storew " + tw + ", " + tag_slot)
+      let l_ok = qbe_lbl(g, "scf_ok")
+      let l_err = qbe_lbl(g, "scf_err")
+      let l_end = qbe_lbl(g, "scf_end")
+      qbe_emit_term(g, "jnz " + tw + ", " + l_ok + ", " + l_err)
+      qbe_emit_lbl(g, l_ok)
+      g.block_immut_fields = Map([])
+      let ok_ty = match ret_ty {
+        TOption(it) => it
+        TResult(ot, _) => ot
+        _ => TUnit
+      }
+      if val_is_pod_buf {
+        match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
+          Some(sinfo) =>
+            if inner.val_is_pod_buf {
+              qbe_emit_copy_pod_slots(g, inner.val_slot, val_slot, sinfo.field_names.length())
+            } else {
+              let src_p = qbe_tmp(g)
+              qbe_emit(g, src_p + " =l loadl " + inner.val_slot)
+              qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+              qbe_rc_dec(g, src_p, ok_ty)
+            }
+          None => ()
+        }
+      } else {
+        let v_ok = qbe_load_heap_slot(g, inner.val_slot, ok_ty)
+        qbe_store_heap_slot(g, v_ok, val_slot, ok_ty)
+      }
+      qbe_emit_term(g, "jmp " + l_end)
+      qbe_emit_lbl(g, l_err)
+      g.block_immut_fields = Map([])
+      match ret_ty {
+        TResult(_, err_ty) => {
+          let v_err = qbe_load_heap_slot(g, inner.err_slot, err_ty)
+          qbe_store_heap_slot(g, v_err, err_slot, err_ty)
+        }
+        _ => ()
+      }
+      qbe_emit_term(g, "jmp " + l_end)
+      qbe_emit_lbl(g, l_end)
+      g.block_immut_fields = Map([])
+    }
+    None => {
+      let rv = qbe_emit_expr(g, e, Some(ret_ty))
+      if g.block_term {
+        return
+      }
+      let rv_reg = qbe_coerce_val(g, rv, ret_ty)
+      match ret_ty {
+        TOption(raw_inner) => {
+          let inner_ty = subst_ty(raw_inner, g.cur_type_subst)
+          let l_ok = qbe_lbl(g, "scfb_ok")
+          let l_end = qbe_lbl(g, "scfb_end")
+          if qbe_is_niche_opt_inner(inner_ty) {
+            let c_ok = qbe_tmp(g)
+            qbe_emit(g, c_ok + " =w cnel " + rv_reg + ", 0")
+            qbe_emit(g, "storew " + c_ok + ", " + tag_slot)
+            qbe_emit_term(g, "jnz " + c_ok + ", " + l_ok + ", " + l_end)
+            qbe_emit_lbl(g, l_ok)
+            g.block_immut_fields = Map([])
+            if val_is_pod_buf {
+              match qbe_pure_scalar_pod_struct_info(g, inner_ty) {
+                Some(sinfo) => {
+                  qbe_emit_copy_pod_slots(g, rv_reg, val_slot, sinfo.field_names.length())
+                  qbe_rc_dec(g, rv_reg, inner_ty)
+                }
+                None => qbe_rc_dec(g, rv_reg, inner_ty)
+              }
+            } else {
+              qbe_store_heap_slot(g, rv_reg, val_slot, inner_ty)
+            }
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_end)
+            g.block_immut_fields = Map([])
+          } else {
+            let tag_l = qbe_tmp(g)
+            let c_ok = qbe_tmp(g)
+            qbe_emit(g, tag_l + " =l loadl " + rv_reg)
+            qbe_emit(g, c_ok + " =w cnel " + tag_l + ", 0")
+            qbe_emit(g, "storew " + c_ok + ", " + tag_slot)
+            qbe_emit_term(g, "jnz " + c_ok + ", " + l_ok + ", " + l_end)
+            qbe_emit_lbl(g, l_ok)
+            g.block_immut_fields = Map([])
+            let vp = qbe_tmp(g)
+            qbe_emit(g, vp + " =l add " + rv_reg + ", 8")
+            if val_is_pod_buf {
+              match qbe_pure_scalar_pod_struct_info(g, inner_ty) {
+                Some(sinfo) => {
+                  let src_p = qbe_tmp(g)
+                  qbe_emit(g, src_p + " =l loadl " + vp)
+                  qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                }
+                None => ()
+              }
+            } else {
+              let v_ok = qbe_load_heap_slot(g, vp, inner_ty)
+              qbe_rc_inc(g, v_ok, inner_ty)
+              qbe_store_heap_slot(g, v_ok, val_slot, inner_ty)
+            }
+            qbe_emit_term(g, "jmp " + l_end)
+            qbe_emit_lbl(g, l_end)
+            g.block_immut_fields = Map([])
+            qbe_rc_dec(g, rv_reg, ret_ty)
+          }
+        }
+        TResult(raw_ok, raw_err) => {
+          let ok_ty = subst_ty(raw_ok, g.cur_type_subst)
+          let err_ty = subst_ty(raw_err, g.cur_type_subst)
+          let tag_l = qbe_tmp(g)
+          let c_ok = qbe_tmp(g)
+          let l_ok = qbe_lbl(g, "scfb_ok")
+          let l_err = qbe_lbl(g, "scfb_err")
+          let l_end = qbe_lbl(g, "scfb_end")
+          qbe_emit(g, tag_l + " =l loadl " + rv_reg)
+          qbe_emit(g, c_ok + " =w ceql " + tag_l + ", 0")
+          qbe_emit(g, "storew " + c_ok + ", " + tag_slot)
+          qbe_emit_term(g, "jnz " + c_ok + ", " + l_ok + ", " + l_err)
+          qbe_emit_lbl(g, l_ok)
+          g.block_immut_fields = Map([])
+          let vp = qbe_tmp(g)
+          qbe_emit(g, vp + " =l add " + rv_reg + ", 8")
+          if val_is_pod_buf {
+            match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
+              Some(sinfo) => {
+                let src_p = qbe_tmp(g)
+                qbe_emit(g, src_p + " =l loadl " + vp)
+                qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+              }
+              None => ()
+            }
+          } else {
+            let v_ok = qbe_load_heap_slot(g, vp, ok_ty)
+            qbe_rc_inc(g, v_ok, ok_ty)
+            qbe_store_heap_slot(g, v_ok, val_slot, ok_ty)
+          }
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_err)
+          g.block_immut_fields = Map([])
+          let ep = qbe_tmp(g)
+          qbe_emit(g, ep + " =l add " + rv_reg + ", 8")
+          let v_err = qbe_load_heap_slot(g, ep, err_ty)
+          qbe_rc_inc(g, v_err, err_ty)
+          qbe_store_heap_slot(g, v_err, err_slot, err_ty)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_end)
+          g.block_immut_fields = Map([])
+          qbe_rc_dec(g, rv_reg, ret_ty)
+        }
+        _ => ()
+      }
+    }
   }
 }
 
@@ -10421,6 +11068,103 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
       }
     }
     EMatch(scrut, arms, sp) => {
+      match qbe_match_2arm_opt_res(arms) {
+        Some((want_kind, ok_idx, err_idx, ok_bind, err_bind)) => {
+          let allow_pod_ok = ok_bind == "" ||
+            qbe_ident_is_flat_field_only_expr(arms[ok_idx].body, ok_bind)
+          match qbe_try_emit_opt_res_scalarized(g, scrut, want_kind, allow_pod_ok) {
+            Some(sc) => {
+              if g.block_term {
+                return
+              }
+              let ok_ty = match sc.ret_ty {
+                TOption(inner) => inner
+                TResult(ot, _) => ot
+                _ => TUnit
+              }
+              let err_ty_opt : Option[Ty] = match sc.ret_ty {
+                TResult(_, et) => Some(et)
+                _ => None
+              }
+              let tag_w = qbe_tmp(g)
+              qbe_emit(g, tag_w + " =w loadw " + sc.tag_slot)
+              let l_ok = qbe_lbl(g, "scnm_ok")
+              let l_err = qbe_lbl(g, "scnm_err")
+              let l_end = qbe_lbl(g, "scnm_end")
+              qbe_emit_term(g, "jnz " + tag_w + ", " + l_ok + ", " + l_err)
+              qbe_emit_lbl(g, l_ok)
+              g.block_immut_fields = Map([])
+              qbe_scope_push(g)
+              if sc.val_is_pod_buf {
+                if ok_bind != "" {
+                  let vloc = qbe_define_local(g, ok_bind, ok_ty, false)
+                  qbe_emit(g, "storel " + sc.val_slot + ", " + vloc.slot)
+                }
+              } else {
+                let v_ok = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
+                if ok_bind != "" {
+                  let vloc = qbe_define_local(g, ok_bind, ok_ty, true)
+                  qbe_store_local_slot(g, v_ok, vloc.slot, ok_ty)
+                } else {
+                  qbe_rc_dec(g, v_ok, ok_ty)
+                }
+              }
+              qbe_emit_tail_opt_res_expr_into_slots(
+                g,
+                arms[ok_idx].body,
+                ret_ty,
+                tag_slot,
+                val_slot,
+                err_slot,
+                val_is_pod_buf,
+              )
+              qbe_scope_pop(g)
+              let ok_term = g.block_term
+              if !ok_term {
+                qbe_emit_term(g, "jmp " + l_end)
+              }
+              qbe_emit_lbl(g, l_err)
+              g.block_immut_fields = Map([])
+              qbe_scope_push(g)
+              match err_ty_opt {
+                Some(err_ty) => {
+                  let v_err = qbe_load_heap_slot(g, sc.err_slot, err_ty)
+                  if err_bind != "" {
+                    let eloc = qbe_define_local(g, err_bind, err_ty, true)
+                    qbe_store_local_slot(g, v_err, eloc.slot, err_ty)
+                  } else {
+                    qbe_rc_dec(g, v_err, err_ty)
+                  }
+                }
+                None => ()
+              }
+              qbe_emit_tail_opt_res_expr_into_slots(
+                g,
+                arms[err_idx].body,
+                ret_ty,
+                tag_slot,
+                val_slot,
+                err_slot,
+                val_is_pod_buf,
+              )
+              qbe_scope_pop(g)
+              let err_term = g.block_term
+              if !err_term {
+                qbe_emit_term(g, "jmp " + l_end)
+              }
+              if ok_term && err_term {
+                g.block_term = true
+              } else {
+                qbe_emit_lbl(g, l_end)
+                g.block_immut_fields = Map([])
+              }
+              return
+            }
+            None => ()
+          }
+        }
+        None => ()
+      }
       qbe_scope_push(g)
       let sv = qbe_emit_expr(g, scrut, None)
       if g.block_term {
@@ -10489,13 +11233,29 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
               if val_is_pod_buf {
                 match qbe_pure_scalar_pod_struct_info(g, inner_ty) {
                   Some(sinfo) => {
-                    qbe_emit_tail_pod_struct_into_buf(
-                      g,
-                      args[0],
-                      sinfo,
-                      subst_ty(inner_ty, g.cur_type_subst),
-                      val_slot,
-                    )
+                    if qbe_expr_all_tails_are_pod_struct_lits(args[0]) {
+                      qbe_emit_tail_pod_struct_into_buf(
+                        g,
+                        args[0],
+                        sinfo,
+                        subst_ty(inner_ty, g.cur_type_subst),
+                        val_slot,
+                      )
+                    } else {
+                      let aa = qbe_emit_arg_maybe_borrow(
+                        g,
+                        args[0],
+                        Some(inner_ty),
+                        !qbe_expr_has_assign(args[0]),
+                      )
+                      if !g.block_term {
+                        let src_p = qbe_as_l(g, aa.qv)
+                        qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                        if !aa.borrowed {
+                          qbe_rc_dec(g, aa.qv.reg, aa.qv.ty)
+                        }
+                      }
+                    }
                     if !g.block_term {
                       qbe_emit(g, "storew 1, " + tag_slot)
                     }
@@ -10510,7 +11270,17 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                   qbe_emit(g, "storew 1, " + tag_slot)
                 }
               }
-            _ => ()
+            _ =>
+              qbe_emit_tail_opt_res_forward_call(
+                g,
+                e,
+                ret_ty,
+                1,
+                tag_slot,
+                val_slot,
+                err_slot,
+                val_is_pod_buf,
+              )
           }
         TResult(ok_ty, err_ty) =>
           match e {
@@ -10518,13 +11288,29 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
               if val_is_pod_buf {
                 match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
                   Some(sinfo) => {
-                    qbe_emit_tail_pod_struct_into_buf(
-                      g,
-                      args[0],
-                      sinfo,
-                      subst_ty(ok_ty, g.cur_type_subst),
-                      val_slot,
-                    )
+                    if qbe_expr_all_tails_are_pod_struct_lits(args[0]) {
+                      qbe_emit_tail_pod_struct_into_buf(
+                        g,
+                        args[0],
+                        sinfo,
+                        subst_ty(ok_ty, g.cur_type_subst),
+                        val_slot,
+                      )
+                    } else {
+                      let aa = qbe_emit_arg_maybe_borrow(
+                        g,
+                        args[0],
+                        Some(ok_ty),
+                        !qbe_expr_has_assign(args[0]),
+                      )
+                      if !g.block_term {
+                        let src_p = qbe_as_l(g, aa.qv)
+                        qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                        if !aa.borrowed {
+                          qbe_rc_dec(g, aa.qv.reg, aa.qv.ty)
+                        }
+                      }
+                    }
                     if !g.block_term {
                       qbe_emit(g, "storew 1, " + tag_slot)
                     }
@@ -10547,7 +11333,17 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                 qbe_emit(g, "storew 0, " + tag_slot)
               }
             }
-            _ => ()
+            _ =>
+              qbe_emit_tail_opt_res_forward_call(
+                g,
+                e,
+                ret_ty,
+                2,
+                tag_slot,
+                val_slot,
+                err_slot,
+                val_is_pod_buf,
+              )
           }
         _ => ()
       }
@@ -10841,7 +11637,7 @@ fn qbe_local_fn_can_scalar_inline(g : QbeGen, key : String, finfo : FnInfo) -> O
         Some(c) => c
         None => 0
       }
-      if fn_cost <= max_cost {
+      if fn_cost <= max_cost && !qbe_wasm_caller_over_inline_budget(g, fn_cost) {
         Some(inl_fd)
       } else {
         None
@@ -10876,6 +11672,17 @@ fn qbe_xpkg_fn_can_scalar_inline(
         xpkg_fn_is_inlinable_priv_leaf_tc(ipkg.tc, finfo.decl)
       }
       if can_inl {
+        if g.target_wasm && g.fn_body.length() > 24576 {
+          let self_key = if finfo.decl.receiver_type != "" {
+            finfo.decl.receiver_type + "::" + finfo.decl.name
+          } else {
+            finfo.decl.name
+          }
+          let fn_cost = qbe_stmts_inline_cost_in(finfo.decl.body, self_key, false, 0)
+          if fn_cost < 0 || qbe_wasm_caller_over_inline_budget(g, fn_cost) {
+            return None
+          }
+        }
         Some(finfo.decl)
       } else {
         None
@@ -10897,7 +11704,7 @@ fn qbe_try_emit_opt_res_scalarized(
   allow_pod_ok : Bool,
 ) -> Option[QbeScalarOptRes] {
   match expr {
-    EIf(_, _, Some(_), _) | EBlock(_, _) =>
+    EIf(_, _, Some(_), _) | EBlock(_, _) | EMatch(_, _, _) =>
       match qbe_probe_expr_ty(g, expr) {
         Some(raw_ty) =>
           match qbe_ty_is_scalarizable_opt_res(g, raw_ty, want_kind, allow_pod_ok) {
@@ -10906,7 +11713,7 @@ fn qbe_try_emit_opt_res_scalarized(
               let mut pod_bytes = 0
               match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
                 Some((sinfo, _)) =>
-                  if qbe_expr_all_tails_are_opt_res_ctors(expr, ret_ty, true) {
+                  if qbe_expr_all_tails_are_opt_res_ctors(g, expr, ret_ty, true) {
                     val_is_pod_buf = true
                     pod_bytes = sinfo.field_names.length() * 8
                   }
@@ -10917,7 +11724,7 @@ fn qbe_try_emit_opt_res_scalarized(
                 _ => true
               }
               if val_is_pod_buf ||
-                (can_non_pod && qbe_expr_all_tails_are_opt_res_ctors(expr, ret_ty, false)) {
+                (can_non_pod && qbe_expr_all_tails_are_opt_res_ctors(g, expr, ret_ty, false)) {
                 let tag_slot = qbe_alloc_slot4(g)
                 let val_slot = if val_is_pod_buf {
                   qbe_alloc_stack_buf(g, pod_bytes)
@@ -10983,11 +11790,16 @@ fn qbe_try_emit_opt_res_scalarized(
               match inl_fd_opt {
                 Some(inl_fd) => {
                   let inl_body = qbe_fn_body(g, inl_fd.body)
+                  let stack_key = if target_pkg != "" {
+                    target_pkg + "::" + name
+                  } else {
+                    name
+                  }
                   let mut val_is_pod_buf = false
                   let mut pod_bytes = 0
                   match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
                     Some((sinfo, _)) =>
-                      if qbe_fn_body_all_returns_are_opt_res_ctors(inl_body, ret_ty, true) {
+                      if qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, true) {
                         val_is_pod_buf = true
                         pod_bytes = sinfo.field_names.length() * 8
                       }
@@ -10998,7 +11810,7 @@ fn qbe_try_emit_opt_res_scalarized(
                     _ => true
                   }
                   if !val_is_pod_buf &&
-                    (!can_non_pod || !qbe_fn_body_all_returns_are_opt_res_ctors(inl_body, ret_ty, false)) {
+                    (!can_non_pod || !qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, false)) {
                     return None
                   }
                   let norm_args = resolve_call_args_qbe(finfo.decl.params, 0, args, sp)
@@ -11144,11 +11956,16 @@ fn qbe_try_emit_opt_res_scalarized(
               match inl_fd_opt {
                 Some(inl_fd) => {
                   let inl_body = qbe_fn_body(g, inl_fd.body)
+                  let stack_key = if target_pkg != "" {
+                    target_pkg + "::" + key
+                  } else {
+                    key
+                  }
                   let mut val_is_pod_buf = false
                   let mut pod_bytes = 0
                   match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
                     Some((sinfo, _)) =>
-                      if qbe_fn_body_all_returns_are_opt_res_ctors(inl_body, ret_ty, true) {
+                      if qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, true) {
                         val_is_pod_buf = true
                         pod_bytes = sinfo.field_names.length() * 8
                       }
@@ -11159,7 +11976,7 @@ fn qbe_try_emit_opt_res_scalarized(
                     _ => true
                   }
                   if !val_is_pod_buf &&
-                    (!can_non_pod || !qbe_fn_body_all_returns_are_opt_res_ctors(inl_body, ret_ty, false)) {
+                    (!can_non_pod || !qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, false)) {
                     return None
                   }
                   let norm_args = resolve_call_args_qbe(minfo.decl.params, 0, args, sp)
@@ -11241,11 +12058,12 @@ fn qbe_try_emit_opt_res_scalarized(
                   match inl_fd_opt {
                     Some(inl_fd) => {
                       let inl_body = qbe_fn_body(g, inl_fd.body)
+                      let stack_key = if mpkg != "" { mpkg + "::" + key } else { key }
                       let mut val_is_pod_buf = false
                       let mut pod_bytes = 0
                       match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
                         Some((sinfo, _)) =>
-                          if qbe_fn_body_all_returns_are_opt_res_ctors(inl_body, ret_ty, true) {
+                          if qbe_fn_body_can_scalar_opt_res(g, mpkg, stack_key, inl_body, ret_ty, true) {
                             val_is_pod_buf = true
                             pod_bytes = sinfo.field_names.length() * 8
                           }
@@ -11256,7 +12074,7 @@ fn qbe_try_emit_opt_res_scalarized(
                         _ => true
                       }
                       if !val_is_pod_buf &&
-                        (!can_non_pod || !qbe_fn_body_all_returns_are_opt_res_ctors(inl_body, ret_ty, false)) {
+                        (!can_non_pod || !qbe_fn_body_can_scalar_opt_res(g, mpkg, stack_key, inl_body, ret_ty, false)) {
                         return None
                       }
                       let norm_args = resolve_call_args_qbe(minfo.decl.params, 1, args, sp)
@@ -11325,174 +12143,9 @@ fn qbe_try_emit_scalar_opt_res_match(
   arms : Array[MatchArm],
   expected : Option[Ty],
 ) -> Option[QbeVal] {
-  if arms.length() != 2 {
-    return None
-  }
-  match (arms[0].guard_expr, arms[1].guard_expr) {
-    (None, None) => ()
-    _ => return None
-  }
-  let mut want_kind = 0
-  let mut ok_idx = -1
-  let mut err_idx = -1
-  let mut ok_bind = ""
-  let mut err_bind = ""
-  match (arms[0].pat, arms[1].pat) {
-    (PVariant(_, "Some", s0, _), PVariant(_, "None", s1, _)) =>
-      if s0.length() == 1 && s1.length() == 0 {
-        match s0[0] {
-          PIdent(b, _) => {
-            want_kind = 1
-            ok_idx = 0
-            err_idx = 1
-            ok_bind = b
-          }
-          PWild(_) => {
-            want_kind = 1
-            ok_idx = 0
-            err_idx = 1
-          }
-          _ => ()
-        }
-      }
-    (PVariant(_, "Some", s0, _), PWild(_)) =>
-      if s0.length() == 1 {
-        match s0[0] {
-          PIdent(b, _) => {
-            want_kind = 1
-            ok_idx = 0
-            err_idx = 1
-            ok_bind = b
-          }
-          PWild(_) => {
-            want_kind = 1
-            ok_idx = 0
-            err_idx = 1
-          }
-          _ => ()
-        }
-      }
-    (PVariant(_, "None", s0, _), PVariant(_, "Some", s1, _)) =>
-      if s0.length() == 0 && s1.length() == 1 {
-        match s1[0] {
-          PIdent(b, _) => {
-            want_kind = 1
-            ok_idx = 1
-            err_idx = 0
-            ok_bind = b
-          }
-          PWild(_) => {
-            want_kind = 1
-            ok_idx = 1
-            err_idx = 0
-          }
-          _ => ()
-        }
-      }
-    (PVariant(_, "None", s0, _), PWild(_)) =>
-      if s0.length() == 0 {
-        want_kind = 1
-        ok_idx = 1
-        err_idx = 0
-      }
-    (PVariant(_, "Ok", s0, _), PVariant(_, "Err", s1, _)) =>
-      if s0.length() == 1 && s1.length() == 1 {
-        match (s0[0], s1[0]) {
-          (PIdent(ob, _), PIdent(eb, _)) => {
-            want_kind = 2
-            ok_idx = 0
-            err_idx = 1
-            ok_bind = ob
-            err_bind = eb
-          }
-          (PIdent(ob, _), PWild(_)) => {
-            want_kind = 2
-            ok_idx = 0
-            err_idx = 1
-            ok_bind = ob
-          }
-          (PWild(_), PIdent(eb, _)) => {
-            want_kind = 2
-            ok_idx = 0
-            err_idx = 1
-            err_bind = eb
-          }
-          (PWild(_), PWild(_)) => {
-            want_kind = 2
-            ok_idx = 0
-            err_idx = 1
-          }
-          _ => ()
-        }
-      }
-    (PVariant(_, "Err", s0, _), PVariant(_, "Ok", s1, _)) =>
-      if s0.length() == 1 && s1.length() == 1 {
-        match (s0[0], s1[0]) {
-          (PIdent(eb, _), PIdent(ob, _)) => {
-            want_kind = 2
-            ok_idx = 1
-            err_idx = 0
-            ok_bind = ob
-            err_bind = eb
-          }
-          (PIdent(eb, _), PWild(_)) => {
-            want_kind = 2
-            ok_idx = 1
-            err_idx = 0
-            err_bind = eb
-          }
-          (PWild(_), PIdent(ob, _)) => {
-            want_kind = 2
-            ok_idx = 1
-            err_idx = 0
-            ok_bind = ob
-          }
-          (PWild(_), PWild(_)) => {
-            want_kind = 2
-            ok_idx = 1
-            err_idx = 0
-          }
-          _ => ()
-        }
-      }
-    (PVariant(_, "Ok", s0, _), PWild(_)) =>
-      if s0.length() == 1 {
-        match s0[0] {
-          PIdent(ob, _) => {
-            want_kind = 2
-            ok_idx = 0
-            err_idx = 1
-            ok_bind = ob
-          }
-          PWild(_) => {
-            want_kind = 2
-            ok_idx = 0
-            err_idx = 1
-          }
-          _ => ()
-        }
-      }
-    (PVariant(_, "Err", s0, _), PWild(_)) =>
-      if s0.length() == 1 {
-        match s0[0] {
-          PIdent(eb, _) => {
-            want_kind = 2
-            ok_idx = 1
-            err_idx = 0
-            err_bind = eb
-          }
-          PWild(_) => {
-            want_kind = 2
-            ok_idx = 1
-            err_idx = 0
-          }
-          _ => ()
-        }
-      }
-    _ => ()
-  }
-  if want_kind == 0 {
-    return None
+  let (want_kind, ok_idx, err_idx, ok_bind, err_bind) = match qbe_match_2arm_opt_res(arms) {
+    Some(t) => t
+    None => return None
   }
   let allow_pod_ok = ok_bind == "" || qbe_ident_is_flat_field_only_expr(arms[ok_idx].body, ok_bind)
   let sc = match qbe_try_emit_opt_res_scalarized(g, scrut, want_kind, allow_pod_ok) {
@@ -15069,11 +15722,17 @@ fn qbe_parse_int64_lit(raw : String) -> Int64 {
     (str_code_at(raw, len - 1) == 76 || str_code_at(raw, len - 1) == 85) {
     len = len - 1
   }
-  if len >= 2 &&
-    str_code_at(raw, 0) == 48 &&
-    (str_code_at(raw, 1) == 120 || str_code_at(raw, 1) == 88) {
-    let mut acc = 0L
-    let mut i = 2
+  let mut start = 0
+  let mut neg = false
+  if len > 0 && str_code_at(raw, 0) == 45 {
+    neg = true
+    start = 1
+  }
+  let acc = if len - start >= 2 &&
+    str_code_at(raw, start) == 48 &&
+    (str_code_at(raw, start + 1) == 120 || str_code_at(raw, start + 1) == 88) {
+    let mut a = 0L
+    let mut i = start + 2
     while i < len {
       let c = str_code_at(raw, i)
       if c == 95 {
@@ -15089,20 +15748,25 @@ fn qbe_parse_int64_lit(raw : String) -> Int64 {
       } else {
         0
       }
-      acc = (acc << 4) | d.to_int64()
+      a = (a << 4) | d.to_int64()
       i = i + 1
     }
-    acc
+    a
   } else {
-    let mut acc = 0L
-    let mut i = 0
+    let mut a = 0L
+    let mut i = start
     while i < len {
       let c = str_code_at(raw, i)
       if c >= 48 && c <= 57 {
-        acc = acc * 10L + (c - 48).to_int64()
+        a = a * 10L + (c - 48).to_int64()
       }
       i = i + 1
     }
+    a
+  }
+  if neg {
+    0L - acc
+  } else {
     acc
   }
 }

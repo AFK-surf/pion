@@ -8702,3 +8702,351 @@ test "p62c_counting_loop_push_cap_versioned" {
     i64_fast,
   )
 }
+
+test "p63d_wasm_caller_inline_budget_cap" {
+  let sb = StringBuilder()
+  sb.write_string(
+    #|fn med_helper(x : Int) -> Int {
+    #|  let a = x * 3 + 7
+    #|  let b = if a > 50 { a - 13 } else { a + 19 }
+    #|  (a ^ b) + b * 2
+    #|}
+    #|
+    #|fn tiny_helper(x : Int) -> Int {
+    #|  x + 1
+    #|}
+    #|
+    #|pub fn small_caller(n : Int) -> Int {
+    #|  med_helper(n) + tiny_helper(n)
+    #|}
+    #|
+    #|pub fn big_caller(n : Int) -> Int {
+    #|  let mut acc = 0
+    #|  let mut i = 0
+    #|  while i < n {
+    #|
+  )
+  let mut k = 0
+  while k < 90 {
+    sb.write_string("    acc = acc + med_helper(i + " + k.to_string() + ") + tiny_helper(i)\n")
+    k = k + 1
+  }
+  sb.write_string(
+    #|    i = i + 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+  )
+  let cr = check_source_files_with_imports("p63d_wasm", ["main.pion"], [sb.to_string()], [], true)
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_multi_for_target(cr.pkg, cr.tc, true, false, [], true).ssa
+  let funcs = ssa.split("function ")
+  let mut small_ssa = ""
+  let mut big_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("$pion_pkg_p63d_wasm_fn_small_caller(") {
+      small_ssa = funcs[fi]
+    } else if funcs[fi].contains("$pion_pkg_p63d_wasm_fn_big_caller(") {
+      big_ssa = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  // Small caller still inlines med_helper; big caller caps med_helper (>24KB IR) while still inlining tiny_helper (cost <= 12)
+  assert_true(
+    small_ssa != "" &&
+    !small_ssa.contains("call $pion_pkg_p63d_wasm_fn_med_helper(") &&
+    !small_ssa.contains("call $pion_pkg_p63d_wasm_fn_tiny_helper("),
+    small_ssa,
+  )
+  assert_true(
+    big_ssa != "" &&
+    big_ssa.contains("call $pion_pkg_p63d_wasm_fn_med_helper(") &&
+    !big_ssa.contains("call $pion_pkg_p63d_wasm_fn_tiny_helper("),
+    big_ssa,
+  )
+}
+
+test "p63d_xpkg_result_pod_nested_match_and_tail_call_zero_alloc" {
+  let lib_src =
+    #|let i64_max : Int64 = 9223372036854775807L
+    #|let i64_min : Int64 = -9223372036854775807L - 1L
+    #|let nanos_per_sec : Int = 1000000000
+    #|
+    #|fn checked_add_i64(a : Int64, b : Int64) -> Option[Int64] {
+    #|  if b > 0L && a > i64_max - b {
+    #|    None
+    #|  } else if b < 0L && a < i64_min - b {
+    #|    None
+    #|  } else {
+    #|    Some(a + b)
+    #|  }
+    #|}
+    #|
+    #|fn checked_mul_i64(a : Int64, b : Int64) -> Option[Int64] {
+    #|  if a == 0L || b == 0L {
+    #|    return Some(0L)
+    #|  }
+    #|  let r = a * b
+    #|  if r / a != b {
+    #|    None
+    #|  } else {
+    #|    Some(r)
+    #|  }
+    #|}
+    #|
+    #|fn clamp_nanos(n : Int) -> Int {
+    #|  if n >= nanos_per_sec {
+    #|    n - nanos_per_sec
+    #|  } else if n <= -nanos_per_sec {
+    #|    n + nanos_per_sec
+    #|  } else {
+    #|    n
+    #|  }
+    #|}
+    #|
+    #|pub enum TimeError {
+    #|  Overflow
+    #|}
+    #|
+    #|pub struct SignedDuration {
+    #|  secs : Int64
+    #|  nanos : Int
+    #|}
+    #|
+    #|pub fn SignedDuration::new(secs : Int64, nanos : Int) -> Result[SignedDuration, TimeError] {
+    #|  let adj = if nanos >= nanos_per_sec {
+    #|    1L
+    #|  } else if nanos <= -nanos_per_sec {
+    #|    -1L
+    #|  } else {
+    #|    0L
+    #|  }
+    #|  let nn = clamp_nanos(nanos)
+    #|  match checked_add_i64(secs, adj) {
+    #|    Some(s) => Ok(SignedDuration::{ secs: s, nanos: nn })
+    #|    None => Err(TimeError::Overflow)
+    #|  }
+    #|}
+    #|
+    #|pub fn SignedDuration::checked_add(
+    #|  self : SignedDuration,
+    #|  other : SignedDuration,
+    #|) -> Result[SignedDuration, TimeError] {
+    #|  match checked_add_i64(self.secs, other.secs) {
+    #|    Some(s) => SignedDuration::new(s, self.nanos + other.nanos)
+    #|    None => Err(TimeError::Overflow)
+    #|  }
+    #|}
+    #|
+    #|pub fn SignedDuration::checked_sub(
+    #|  self : SignedDuration,
+    #|  other : SignedDuration,
+    #|) -> Result[SignedDuration, TimeError] {
+    #|  match checked_mul_i64(other.secs, -1L) {
+    #|    Some(ns) =>
+    #|      match checked_add_i64(self.secs, ns) {
+    #|        Some(s) => SignedDuration::new(s, self.nanos - other.nanos)
+    #|        None => Err(TimeError::Overflow)
+    #|      }
+    #|    None => Err(TimeError::Overflow)
+    #|  }
+    #|}
+  let app_src =
+    #|import "tlib" as tlib
+    #|
+    #|pub fn run_w5(n : Int) -> Int64 {
+    #|  let base = tlib::SignedDuration::{ secs: 100L, nanos: 500000000 }
+    #|  let step = tlib::SignedDuration::{ secs: 1L, nanos: 600000000 }
+    #|  let mut acc = 0L
+    #|  let mut i = 0
+    #|  while i < n {
+    #|    let a = match base.checked_add(step) {
+    #|      Ok(d) => d.secs + d.nanos.to_int64()
+    #|      Err(_) => -1L
+    #|    }
+    #|    let b = match base.checked_sub(step) {
+    #|      Ok(d) => d.secs + d.nanos.to_int64()
+    #|      Err(_) => -1L
+    #|    }
+    #|    acc = acc + a + b
+    #|    i = i + 1
+    #|  }
+    #|  acc
+    #|}
+  let lcr = check_source_files_with_imports("tlib", ["tlib.pion"], [lib_src], [], true)
+  assert_true(lcr.diagnostics.length() == 0, check_result_to_json(lcr.diagnostics))
+  let stub = emit_pion_stub(lcr.pkg)
+  assert_true(stub.contains("fn checked_add_i64("), stub)
+  assert_true(stub.contains("fn checked_mul_i64("), stub)
+  assert_true(stub.contains("fn clamp_nanos("), stub)
+  let lstub_cr = check_source_files_with_imports("tlib", ["tlib.pionstub"], [stub], [], true)
+  assert_true(lstub_cr.diagnostics.length() == 0, check_result_to_json(lstub_cr.diagnostics))
+  let imp_list = [ImportedPkg::{ name: "tlib", tc: lstub_cr.tc }]
+  let acr = check_source_files_with_imports("tapp", ["tapp.pion"], [app_src], imp_list, true)
+  assert_true(acr.diagnostics.length() == 0, check_result_to_json(acr.diagnostics))
+  let ssa = emit_qbe_package_multi(acr.pkg, acr.tc, true, false, ["tlib"]).ssa
+  let funcs = ssa.split("function ")
+  let mut w5_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("$pion_pkg_tapp_fn_run_w5(") {
+      w5_ssa = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  assert_true(
+    w5_ssa != "" &&
+    w5_ssa.contains("\n@wh_b_") &&
+    w5_ssa.contains("\n@wh_e_") &&
+    !w5_ssa.contains("call $pion_pkg_tlib_"),
+    w5_ssa,
+  )
+  let w5_loop = w5_ssa.split("\n@wh_b_")[1].split("\n@wh_e_")[0]
+  assert_true(!w5_loop.contains("pion_alloc_uninit"), w5_loop)
+}
+
+test "p63d_result_pod_ok_local_var_zero_alloc" {
+  let lib_src =
+    #|pub struct Pair {
+    #|  a : Int64
+    #|  b : Int64
+    #|}
+    #|
+    #|pub fn mk_pair(x : Int64) -> Result[Pair, Int] {
+    #|  if x < 0L {
+    #|    return Err(-1)
+    #|  }
+    #|  let p = Pair::{ a: x, b: x + 1L }
+    #|  Ok(p)
+    #|}
+  let app_src =
+    #|import "plib" as plib
+    #|
+    #|pub fn use_pair(x : Int64) -> Int64 {
+    #|  match plib::mk_pair(x) {
+    #|    Ok(p) => p.a + p.b
+    #|    Err(e) => e.to_int64()
+    #|  }
+    #|}
+  let lcr = check_source_files_with_imports("plib", ["plib.pion"], [lib_src], [], true)
+  assert_true(lcr.diagnostics.length() == 0, check_result_to_json(lcr.diagnostics))
+  let stub = emit_pion_stub(lcr.pkg)
+  let lstub_cr = check_source_files_with_imports("plib", ["plib.pionstub"], [stub], [], true)
+  assert_true(lstub_cr.diagnostics.length() == 0, check_result_to_json(lstub_cr.diagnostics))
+  let imp_list = [ImportedPkg::{ name: "plib", tc: lstub_cr.tc }]
+  let acr = check_source_files_with_imports("papp", ["papp.pion"], [app_src], imp_list, true)
+  assert_true(acr.diagnostics.length() == 0, check_result_to_json(acr.diagnostics))
+  let ssa = emit_qbe_package_multi(acr.pkg, acr.tc, true, false, ["plib"]).ssa
+  let funcs = ssa.split("function ")
+  let mut up_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("$pion_pkg_papp_fn_use_pair(") {
+      up_ssa = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  assert_true(
+    up_ssa != "" &&
+    !up_ssa.contains("call $pion_pkg_plib_") &&
+    !up_ssa.contains("pion_alloc_uninit(w 24") &&
+    !up_ssa.contains("pion_alloc(w 24"),
+    up_ssa,
+  )
+}
+
+enum P63dExtErr {
+  InvalidExtType(Int)
+  InvalidExtType64(Int64)
+}
+
+test "p63d_negative_int_pattern_match" {
+  // 1. Direct literal parser checks (dec, hex, INT64_MIN)
+  assert_eq(qbe_parse_int64_lit("-129"), -129L)
+  assert_eq(qbe_parse_int64_lit("-0x81"), -129L)
+  assert_eq(qbe_parse_int64_lit("-0X81L"), -129L)
+  assert_eq(qbe_parse_int64_lit("129"), 129L)
+  assert_eq(qbe_parse_int64_lit("-9223372036854775808L"), -9223372036854775807L - 1L)
+
+  // 2. Runtime top-level & nested negative int / int64 pattern match
+  let x = -129
+  let hit_top = match x {
+    -129 => 1
+    129 => 2
+    _ => 0
+  }
+  assert_eq(hit_top, 1)
+  let hit_hex = match x {
+    -0x81 => 10
+    0x81 => 20
+    _ => 0
+  }
+  assert_eq(hit_hex, 10)
+  let r1 : Result[Int, P63dExtErr] = Err(P63dExtErr::InvalidExtType(-129))
+  let hit_nested = match r1 {
+    Err(P63dExtErr::InvalidExtType(-129)) => 3
+    Err(P63dExtErr::InvalidExtType(129)) => 4
+    _ => 0
+  }
+  assert_eq(hit_nested, 3)
+  let r2 : Result[Int, P63dExtErr] = Err(P63dExtErr::InvalidExtType64(-129L))
+  let hit_nested64 = match r2 {
+    Err(P63dExtErr::InvalidExtType64(-129)) => 5
+    Err(P63dExtErr::InvalidExtType64(129)) => 6
+    _ => 0
+  }
+  assert_eq(hit_nested64, 5)
+
+  // 3. SSA verification: negative pattern compiles to comparison against -129 (never +129)
+  let src =
+    #|pub enum ExtErr {
+    #|  InvalidExtType(Int)
+    #|  InvalidExtType64(Int64)
+    #|}
+    #|
+    #|pub fn match_top_neg(x : Int) -> Int {
+    #|  match x {
+    #|    -129 => 1
+    #|    -0x82 => 2
+    #|    _ => 0
+    #|  }
+    #|}
+    #|
+    #|pub fn match_nested_neg(r : Result[Int, ExtErr]) -> Int {
+    #|  match r {
+    #|    Err(ExtErr::InvalidExtType(-129)) => 1
+    #|    Err(ExtErr::InvalidExtType64(-129)) => 2
+    #|    _ => 0
+    #|  }
+    #|}
+  let cr = check_source_files_with_imports("p63d_negpat", ["main.pion"], [src], [], true)
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
+  let funcs = ssa.split("function ")
+  let mut top_ssa = ""
+  let mut nest_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("$pion_pkg_p63d_negpat_fn_match_top_neg(") {
+      top_ssa = funcs[fi]
+    } else if funcs[fi].contains("$pion_pkg_p63d_negpat_fn_match_nested_neg(") {
+      nest_ssa = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  assert_true(
+    top_ssa != "" &&
+    top_ssa.contains(", -129") &&
+    top_ssa.contains(", -130") &&
+    !top_ssa.contains(", 129"),
+    top_ssa,
+  )
+  assert_true(
+    nest_ssa != "" &&
+    nest_ssa.contains(", -129") &&
+    !nest_ssa.contains(", 129"),
+    nest_ssa,
+  )
+}
