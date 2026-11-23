@@ -4655,4 +4655,205 @@ for wasm_spec in "wasm32-dev:$P61_WASM_DEV" "wasm32-rel:$P61_WASM_REL"; do
   echo "  p61fix ($label): $got OK"
 done
 
+cat > "$TMP_DIR/p61a_regression.pion" <<'EOF'
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic(msg)
+  }
+}
+
+fn run_p61a() -> String {
+  // 1. strbuf_push_int all boundary values (hot 0..99999 fast path + 32-bit 2-digit loop + >32-bit + negative + INT64_MIN/MAX)
+  let sb = StringBuilder()
+  let min64 : Int64 = -9223372036854775807L - 1L
+  let vals : Array[Int64] = [
+    0L, 1L, 9L, 10L, 11L, 99L, 100L, 101L,
+    999L, 1000L, 9999L, 10000L, 50020L, 99999L, 100000L,
+    2147483647L, 4294967295L,
+    -1L, -9L, -10L, -99L, -100L, -99999L,
+    min64, 9223372036854775807L,
+  ]
+  let mut i = 0
+  while i < vals.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(vals[i].to_string())
+    i = i + 1
+  }
+  let got_nums = sb.to_string()
+  let exp_nums = "0,1,9,10,11,99,100,101,999,1000,9999,10000,50020,99999,100000,2147483647,4294967295,-1,-9,-10,-99,-100,-99999,-9223372036854775808,9223372036854775807"
+  must(got_nums == exp_nums, "strbuf_push_int mismatch: " + got_nums)
+
+  // Also test exact capacity boundary (initial cap=32, push 5-digit across boundary)
+  let sb2 = StringBuilder()
+  let mut j = 0
+  while j < 40 {
+    sb2.write_string((j * 2501).to_string())
+    sb2.write_string(";")
+    j = j + 1
+  }
+  let s2 = sb2.to_string()
+  must(s2.starts_with("0;2501;5002;7503;10004;"), "sb2 prefix")
+  must(s2.ends_with("95038;97539;"), "sb2 suffix")
+
+  // 2. Empty Map[String, Int64] & Map[Int, String] keys()
+  let em_s : Map[String, Int64] = Map([])
+  must(em_s.keys().length() == 0, "empty str map keys")
+  let em_i : Map[Int, String] = Map([])
+  must(em_i.keys().length() == 0, "empty int map keys")
+
+  // 3. Map[String, Int64] with deletes (tombstones) + 5000-entry grow + keys() + try_get
+  let ms : Map[String, Int64] = Map([])
+  let mut k = 0
+  while k < 5000 {
+    ms.set("k" + k.to_string(), k.to_int64() * 3L)
+    k = k + 1
+  }
+  // Delete every 5th key (1000 tombstones, 4000 live)
+  k = 0
+  while k < 5000 {
+    if k % 5 == 0 {
+      ms.remove("k" + k.to_string())
+    }
+    k = k + 1
+  }
+  let ks_s = ms.keys()
+  must(ks_s.length() == 4000, "str map keys len after remove")
+  let mut sum_s : Int64 = 0L
+  k = 0
+  while k < ks_s.length() {
+    let v = match ms.get(ks_s[k]) {
+      Some(x) => x
+      None => -1L
+    }
+    must(v >= 0L, "str map key must exist")
+    sum_s = sum_s + v
+    k = k + 1
+  }
+  // Verify deleted key returns None via inline map_try_get
+  let miss = match ms.get("k0") {
+    Some(_) => 1
+    None => 0
+  }
+  must(miss == 0, "deleted key k0 must miss")
+
+  // 4. Map[Int, String] with deletes + 5000-entry grow + keys() + try_get
+  let mi : Map[Int, String] = Map([])
+  k = 0
+  while k < 5000 {
+    mi.set(k, "v" + k.to_string())
+    k = k + 1
+  }
+  k = 0
+  while k < 5000 {
+    if k % 4 == 0 {
+      mi.remove(k)
+    }
+    k = k + 1
+  }
+  let ks_i = mi.keys()
+  must(ks_i.length() == 3750, "int map keys len after remove")
+  let mut sum_i : Int64 = 0L
+  k = 0
+  while k < ks_i.length() {
+    let key = ks_i[k]
+    let ok = match mi.get(key) {
+      Some(sv) => sv == "v" + key.to_string()
+      None => false
+    }
+    must(ok, "int map key mismatch")
+    sum_i = sum_i + key.to_int64()
+    k = k + 1
+  }
+  let miss_i = match mi.get(0) {
+    Some(_) => 1
+    None => 0
+  }
+  must(miss_i == 0, "deleted int key 0 must miss")
+
+  sum_s.to_string() + ":" + sum_i.to_string()
+}
+
+pub fn main(world : World) -> Int {
+  let res = run_p61a()
+  io_println(world, res)
+  0
+}
+EOF
+P61A_REL_WASM="$TMP_DIR/p61a_rel.wasm"
+P61A_DEV_WASM="$TMP_DIR/p61a_dev.wasm"
+"$PIONC" build --release --target wasm32 -o "$P61A_REL_WASM" "$TMP_DIR/p61a_regression.pion"
+"$PIONC" build --target wasm32 -o "$P61A_DEV_WASM" "$TMP_DIR/p61a_regression.pion"
+for mode_wasm in "release:$P61A_REL_WASM" "dev:$P61A_DEV_WASM"; do
+mode="${mode_wasm%%:*}"
+wasm_f="${mode_wasm#*:}"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const wasmPath = process.argv[1];
+const rtPath = process.argv[2];
+const mode = process.argv[3];
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p61a_regression.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const mod = new WebAssembly.Module(bytes);
+const imps = WebAssembly.Module.imports(mod).map((x) => x.name);
+if (imps.includes("pion_map_keys")) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): pion_map_keys must be pure-Wasm, not imported! imports=" + JSON.stringify(imps));
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const instance = await WebAssembly.instantiate(mod, rt.imports);
+rt.bindExports(instance.exports);
+
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+// sum_s: 3 * (sum(0..4999) - sum(0,5,..,4995)) = 3 * (12497500 - 2497500) = 30000000
+// sum_i: sum(0..4999) - sum(0,4,..,4996) = 12497500 - 3122500 = 9375000
+if ((rc | 0) !== 0 || out !== "30000000:9375000") {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p61a mismatch: rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0, freed = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + mode + "/" + rtLabel + "): p61a corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  } else if (magic === 0x46524545) {
+    freed++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p61a leaked=" + leaked + " (freed=" + freed + ")");
+  process.exit(1);
+}
+console.log("  p61a (" + mode + "/" + rtLabel + "): " + out + " no-import(pion_map_keys) freed=" + freed + " leaked=0 OK");
+' "$wasm_f" "$rt_path" "$mode"
+done
+done
+
 echo "p29c_wasm32 E2E: OK"
