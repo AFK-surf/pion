@@ -4537,4 +4537,122 @@ if [ "$got_sym" != "$P59_EXPECTED" ]; then
 fi
 echo "  p59fix (wasm32-symlink-cli): $got_sym OK"
 
+# P61-FIX: Cross-package inlining must not shadow bare Option/Result constructors
+# (None/Some/Ok/Err) with imported package custom enum variants of the same name.
+P61_DIR="$TMP_DIR/p61_xpkg_enum_shadow"
+mkdir -p "$P61_DIR/minilib/src" "$P61_DIR/app/src"
+cat > "$P61_DIR/minilib/pion.toml" <<'EOF'
+[package]
+name = "minilib"
+version = "0.1.0"
+EOF
+cat > "$P61_DIR/minilib/src/lib.pion" <<'EOF'
+pub struct Caps {
+  hay : String
+  slots : Array[Int]
+}
+
+pub enum Pf {
+  None
+  Lit(Array[Int])
+}
+
+pub enum MyWrap {
+  Some(Int)
+  Ok(Int)
+  Err(String)
+}
+
+pub fn mk_none(text : String) -> Option[Caps] {
+  if text.length() == 999 {
+    return Some(Caps::{ hay: text, slots: [1] })
+  }
+  None
+}
+
+pub fn mk_none2() -> Option[Caps] {
+  None
+}
+
+pub fn mk_some(text : String) -> Option[Caps] {
+  Some(Caps::{ hay: text, slots: [2] })
+}
+
+pub fn mk_ok(x : Int) -> Result[Int, String] {
+  Ok(x)
+}
+
+pub fn mk_err(s : String) -> Result[Int, String] {
+  Err(s)
+}
+
+pub fn mk_pf() -> Pf {
+  Pf::None
+}
+EOF
+cat > "$P61_DIR/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+minilib = { path = "../minilib" }
+EOF
+cat > "$P61_DIR/app/src/main.pion" <<'EOF'
+import "minilib" as minilib
+
+pub fn main(world : World) -> Int {
+  let n1 = minilib::mk_none("abc").is_some()
+  let n2 = minilib::mk_none2().is_some()
+  let s1 = minilib::mk_some("hi").is_some()
+  let okv = match minilib::mk_ok(7) {
+    Ok(v) => v
+    Err(_) => -1
+  }
+  let errv = match minilib::mk_err("e") {
+    Ok(_) => ""
+    Err(msg) => msg
+  }
+  let pfv = match minilib::mk_pf() {
+    minilib::Pf::None => 1
+    minilib::Pf::Lit(_) => 2
+  }
+  let b_str = fn(b : Bool) -> String { if b { "true" } else { "false" } }
+  let res = b_str(n1) + ":" + b_str(n2) + ":" + b_str(s1) + ":" + okv.to_string() + ":" + errv + ":" + pfv.to_string()
+  io_println(world, res)
+  0
+}
+EOF
+P61_EXPECTED="false:false:true:7:e:1"
+P61_NAT_DEV="$TMP_DIR/p61_nat_dev"
+P61_NAT_REL="$TMP_DIR/p61_nat_rel"
+P61_WASM_DEV="$TMP_DIR/p61_wasm_dev.wasm"
+P61_WASM_REL="$TMP_DIR/p61_wasm_rel.wasm"
+"$PIONC" build -o "$P61_NAT_DEV" "$P61_DIR/app"
+"$PIONC" build --release -o "$P61_NAT_REL" "$P61_DIR/app"
+"$PIONC" build --target wasm32 -o "$P61_WASM_DEV" "$P61_DIR/app"
+"$PIONC" build --release --target wasm32 -o "$P61_WASM_REL" "$P61_DIR/app"
+
+for bin_spec in "native-dev:$P61_NAT_DEV" "native-rel:$P61_NAT_REL"; do
+  label="${bin_spec%%:*}"
+  bin_p="${bin_spec#*:}"
+  got=$("$bin_p")
+  if [ "$got" != "$P61_EXPECTED" ]; then
+    echo "FAIL p61fix ($label): expected '$P61_EXPECTED', got '$got'"
+    exit 1
+  fi
+  echo "  p61fix ($label): $got OK"
+done
+
+for wasm_spec in "wasm32-dev:$P61_WASM_DEV" "wasm32-rel:$P61_WASM_REL"; do
+  label="${wasm_spec%%:*}"
+  wasm_p="${wasm_spec#*:}"
+  got=$(node "$PION_WASM_RT" "$wasm_p")
+  if [ "$got" != "$P61_EXPECTED" ]; then
+    echo "FAIL p61fix ($label): expected '$P61_EXPECTED', got '$got'"
+    exit 1
+  fi
+  echo "  p61fix ($label): $got OK"
+done
+
 echo "p29c_wasm32 E2E: OK"
