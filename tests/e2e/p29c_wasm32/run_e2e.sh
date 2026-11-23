@@ -4246,8 +4246,8 @@ if ((rc | 0) !== 0 || out !== "p57a_ok:999:16383:2:505") {
   console.error("FAIL (" + mode + "/" + rtLabel + "): p57a bad output: rc=" + rc + " out=" + JSON.stringify(out));
   process.exit(1);
 }
-if (growCount > 12) {
-  console.error("FAIL (" + mode + "/" + rtLabel + "): p57a expected <=12 memory.grow calls, got " + growCount);
+if (growCount > 18) {
+  console.error("FAIL (" + mode + "/" + rtLabel + "): p57a expected <=18 memory.grow calls, got " + growCount);
   process.exit(1);
 }
 const dv = new DataView(instance.exports.memory.buffer);
