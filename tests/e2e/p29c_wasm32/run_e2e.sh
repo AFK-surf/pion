@@ -4663,12 +4663,15 @@ fn must(cond : Bool, msg : String) -> Unit {
 }
 
 fn run_p61a() -> String {
-  // 1. strbuf_push_int all boundary values (hot 0..99999 fast path + 32-bit 2-digit loop + >32-bit + negative + INT64_MIN/MAX)
+  // 1. strbuf_push_int all boundary values (P63-A unified 0..99,999,999 fast path + 32-bit 2-digit loop + >32-bit + negative + INT64_MIN/MAX)
   let sb = StringBuilder()
   let min64 : Int64 = -9223372036854775807L - 1L
   let vals : Array[Int64] = [
     0L, 1L, 9L, 10L, 11L, 99L, 100L, 101L,
-    999L, 1000L, 9999L, 10000L, 50020L, 99999L, 100000L,
+    999L, 1000L, 9999L, 10000L, 50020L, 99999L,
+    100000L, 100001L, 100010L, 100100L, 999999L,
+    1000000L, 1000009L, 6999999L, 9999999L,
+    10000000L, 99999999L, 100000000L,
     2147483647L, 4294967295L,
     -1L, -9L, -10L, -99L, -100L, -99999L,
     min64, 9223372036854775807L,
@@ -4682,10 +4685,23 @@ fn run_p61a() -> String {
     i = i + 1
   }
   let got_nums = sb.to_string()
-  let exp_nums = "0,1,9,10,11,99,100,101,999,1000,9999,10000,50020,99999,100000,2147483647,4294967295,-1,-9,-10,-99,-100,-99999,-9223372036854775808,9223372036854775807"
+  let exp_nums = "0,1,9,10,11,99,100,101,999,1000,9999,10000,50020,99999,100000,100001,100010,100100,999999,1000000,1000009,6999999,9999999,10000000,99999999,100000000,2147483647,4294967295,-1,-9,-10,-99,-100,-99999,-9223372036854775808,9223372036854775807"
   must(got_nums == exp_nums, "strbuf_push_int mismatch: " + got_nums)
 
-  // Also test exact capacity boundary (initial cap=32, push 5-digit across boundary)
+  // Also test exact capacity boundaries (initial cap=32; test remaining 5/6/7/8 bytes triggering slow/fast path)
+  let mut pad = 24
+  while pad <= 27 {
+    let sbc = StringBuilder()
+    let mut k_pad = 0
+    while k_pad < pad {
+      sbc.write_string("a")
+      k_pad = k_pad + 1
+    }
+    sbc.write_string((1000009L).to_string())
+    let sc = sbc.to_string()
+    must(sc.length() == pad + 7 && sc.ends_with("1000009"), "cap boundary pad=" + pad.to_string())
+    pad = pad + 1
+  }
   let sb2 = StringBuilder()
   let mut j = 0
   while j < 40 {
