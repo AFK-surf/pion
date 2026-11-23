@@ -271,8 +271,11 @@ export function createPionRuntime(options = {}) {
 
   // Raw allocation: stores 8-byte block header (size:u32 @ base, magic:u32 @ base+4) at ptr - 8.
   function rawAlloc(size) {
+    if (!Number.isFinite(size) || size < 0 || size > 0x7FFFFFE8) {
+      pionDie("allocation size exceeds wasm32 limit");
+    }
     syncViews();
-    const need = ((size + 7) & ~7) + 8;
+    const need = Math.ceil(size / 8) * 8 + 8;
     const cls = sizeClassIndex(need);
     if (cls >= 0) {
       if (slabCtl > 0 && cls < 9) {
@@ -305,6 +308,7 @@ export function createPionRuntime(options = {}) {
       }
     }
     const hp = getHeapPtr();
+    if (hp + allocSz > 0xFFFF0000) pionDie("wasm32 out of memory");
     if (hp + allocSz > heapEnd) {
       const missing = hp + allocSz - heapEnd;
       const curPages = heapEnd >>> 16;
@@ -1209,6 +1213,7 @@ export function createPionRuntime(options = {}) {
     const elemIsObj = f > 2 ? (f >>> 8) : (f === 1 ? 1 : 0);
     const elemStride = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0);
     const esz = elemStride || 8;
+    if (cb * BigInt(esz) > 0x7FFFFFE8n) pionDie("container byte size exceeds wasm32 limit");
     const obj = pion_alloc_uninit(32, TAG_ARRAY, 0n);
     const dp = c > 0 ? rawAlloc(c * esz) : 0;
     const p = pNum(obj);

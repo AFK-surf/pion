@@ -636,4 +636,253 @@ fi
 PAIR_OUT="$("$TMP_DIR/bench_pair_i64")"
 echo "8. P81 Map[(Int, Int), Int64] (100K w + 500K r, 64-bit packed hash+cmp+get_or): $PAIR_OUT"
 
+# 9. P82-E: Cross-package generic wrapper IntMap[V] { inner: Map[Int, V] } + generic map_put[K, V]
+mkdir -p "$TMP_DIR/p82e_ws/intmap/src" "$TMP_DIR/p82e_ws/app/src"
+cat > "$TMP_DIR/p82e_ws/intmap/pion.toml" <<'EOF'
+[package]
+name = "intmap"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/p82e_ws/intmap/src/lib.pion" <<'EOF'
+pub struct IntMap[V] {
+  inner : Map[Int, V],
+}
+
+pub fn IntMap::new[V]() -> IntMap[V] {
+  IntMap::{ inner: Map::new() }
+}
+
+pub fn IntMap::with_capacity[V](min_cap : Int) -> IntMap[V] {
+  IntMap::{ inner: Map::with_capacity(min_cap) }
+}
+
+pub fn IntMap::set[V](self : IntMap[V], key : Int, value : V) -> Unit {
+  self.inner.set(key, value)
+}
+
+pub fn IntMap::length[V](self : IntMap[V]) -> Int {
+  self.inner.length()
+}
+
+pub fn IntMap::contains[V](self : IntMap[V], key : Int) -> Bool {
+  self.inner.contains(key)
+}
+
+pub fn IntMap::clear[V](self : IntMap[V]) -> Unit {
+  self.inner.clear()
+}
+
+pub fn IntMap::keys[V](self : IntMap[V]) -> Array[Int] {
+  self.inner.keys()
+}
+
+pub fn IntMap::delete[V](self : IntMap[V], key : Int) -> Unit {
+  self.inner.remove(key)
+}
+
+pub fn IntMap::erase[V](self : IntMap[V], key : Int) -> Unit {
+  self.inner.remove(key)
+}
+
+pub fn get[V](m : IntMap[V], key : Int) -> Option[V] {
+  m.inner.get(key)
+}
+
+pub fn remove[V](m : IntMap[V], key : Int) -> Option[V] {
+  let prev = m.inner.get(key)
+  m.inner.remove(key)
+  prev
+}
+
+pub fn each[V](m : IntMap[V], f : (Int, V) -> Unit) -> Unit {
+  let ks = m.inner.keys()
+  let mut i = 0
+  while i < ks.length() {
+    let k = ks[i]
+    match m.inner.get(k) {
+      Some(v) => f(k, v)
+      None => ()
+    }
+    i += 1
+  }
+}
+
+pub fn map_put[K, V](m : Map[K, V], k : K, v : V) -> Unit {
+  m.set(k, v)
+}
+EOF
+
+cat > "$TMP_DIR/p82e_ws/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+intmap = { path = "../intmap" }
+EOF
+
+cat > "$TMP_DIR/p82e_ws/app/src/main.pion" <<'EOF'
+import "intmap"
+
+fn must(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic("p82e fail: " + msg)
+  }
+}
+
+fn test_intmap_int() -> Unit {
+  // 2000 keys insert + growth + collisions + delete evens + 50x10 tombstone churn
+  let m : intmap::IntMap[Int] = intmap::IntMap::new()
+  let mut i = 0
+  while i < 2000 {
+    m.set(i * 17 - 500, i * 3 + 1)
+    i += 1
+  }
+  must(m.length() == 2000, "len 2000")
+  i = 0
+  while i < 2000 {
+    let k = i * 17 - 500
+    must(m.contains(k), "contains before rm")
+    must(intmap::get(m, k).unwrap_or(-1) == i * 3 + 1, "get before rm")
+    i += 1
+  }
+  // Delete even indices (half via delete, half via erase/remove)
+  i = 0
+  while i < 2000 {
+    let k = i * 17 - 500
+    if i % 4 == 0 {
+      m.delete(k)
+    } else if i % 4 == 2 {
+      let prev = intmap::remove(m, k)
+      must(prev.unwrap_or(-1) == i * 3 + 1, "remove prev")
+    }
+    i += 2
+  }
+  must(m.length() == 1000, "len 1000 after even rm")
+  let ks = m.keys()
+  must(ks.length() == 1000, "keys len 1000")
+  let sum_box = [0]
+  intmap::each(m, fn(_k : Int, v : Int) -> Unit {
+    sum_box[0] = sum_box[0] + v
+  })
+  // Odd i in 0..1999: 1000 items, sum(i) = 1000^2 = 1000000, sum(3*i + 1) = 3001000
+  must(sum_box[0] == 3001000, "each sum")
+
+  // 50x10 tombstone churn
+  let churn : intmap::IntMap[Int] = intmap::IntMap::with_capacity(16)
+  let mut r = 0
+  while r < 50 {
+    let mut j = 0
+    while j < 10 {
+      churn.set(r * 100 + j, r + j)
+      j += 1
+    }
+    j = 0
+    while j < 10 {
+      if j % 2 == 0 {
+        churn.erase(r * 100 + j)
+      } else {
+        let _ = intmap::remove(churn, r * 100 + j)
+      }
+      j += 1
+    }
+    must(churn.length() == 0, "churn empty")
+    r += 1
+  }
+  m.clear()
+  must(m.length() == 0, "cleared")
+  must(!m.contains(17 - 500), "contains after clear")
+}
+
+fn test_intmap_bool() -> Unit {
+  let mb : intmap::IntMap[Bool] = intmap::IntMap::with_capacity(32)
+  let mut i = 0
+  while i < 200 {
+    mb.set(i, i % 3 == 0)
+    i += 1
+  }
+  must(mb.length() == 200, "bool len")
+  i = 0
+  while i < 200 {
+    let want = i % 3 == 0
+    let got = intmap::get(mb, i).unwrap_or(!want)
+    must(got == want, "bool get")
+    i += 1
+  }
+  mb.delete(0)
+  must(mb.length() == 199, "bool after del")
+  mb.clear()
+  must(mb.length() == 0, "bool clear")
+}
+
+fn test_intmap_string_rc() -> Unit {
+  let ms : intmap::IntMap[String] = intmap::IntMap::new()
+  let mut i = 0
+  while i < 300 {
+    ms.set(i, "val_" + i.to_string() + "_rc")
+    i += 1
+  }
+  // Overwrite to stress RC dec on old value
+  i = 0
+  while i < 150 {
+    ms.set(i, "new_" + i.to_string() + "_rc")
+    i += 1
+  }
+  must(intmap::get(ms, 10).unwrap_or("") == "new_10_rc", "str overwrite")
+  must(intmap::get(ms, 200).unwrap_or("") == "val_200_rc", "str keep")
+  let rm = intmap::remove(ms, 10)
+  must(rm.unwrap_or("") == "new_10_rc", "str remove")
+  ms.delete(11)
+  must(ms.length() == 298, "str len")
+  // Drop remaining 298 RC String values on scope exit (LSan checks 0 leaks)
+}
+
+fn test_generic_map_put() -> Unit {
+  let mi : Map[Int, Int] = Map::new()
+  let ms : Map[String, String] = Map::new()
+  let mut i = 0
+  while i < 100 {
+    intmap::map_put(mi, i, i * 11)
+    intmap::map_put(ms, "k_" + i.to_string(), "v_" + i.to_string())
+    i += 1
+  }
+  must(mi.length() == 100 && mi.get(42).unwrap_or(-1) == 462, "map_put int")
+  must(ms.length() == 100 && ms.get("k_42").unwrap_or("") == "v_42", "map_put str")
+}
+
+pub fn main(world : World) -> Int {
+  test_intmap_int()
+  test_intmap_bool()
+  test_intmap_string_rc()
+  test_generic_map_put()
+  io_println(world, "p82e_intmap ok")
+  0
+}
+EOF
+
+"$PIONC" build --release -o "$TMP_DIR/p82e_rel" "$TMP_DIR/p82e_ws/app"
+[ "$("$TMP_DIR/p82e_rel")" = "p82e_intmap ok" ]
+"$PIONC" build -o "$TMP_DIR/p82e_dev" "$TMP_DIR/p82e_ws/app"
+[ "$("$TMP_DIR/p82e_dev")" = "p82e_intmap ok" ]
+if "$CC_BIN" -fsanitize=address -x c - -o "$TMP_DIR/asan_probe2" <<'EOF' >/dev/null 2>&1
+int main(void) { return 0; }
+EOF
+then
+  "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_p82e_asan.o"
+  ar rcs "$TMP_DIR/libpionrt_p82e_asan.a" "$TMP_DIR/pion_rt_p82e_asan.o"
+  "$PIONC" build --release --emit-staticlib "$TMP_DIR/libp82e.a" "$TMP_DIR/p82e_ws/app"
+  "$CC_BIN" -fsanitize=address -Wl,--whole-archive "$TMP_DIR/libp82e.a" -Wl,--no-whole-archive "$TMP_DIR/libpionrt_p82e_asan.a" -lm -lpthread -o "$TMP_DIR/p82e_asan" 2>/dev/null \
+    || "$CC_BIN" -fsanitize=address -Wl,-force_load,"$TMP_DIR/libp82e.a" "$TMP_DIR/libpionrt_p82e_asan.a" -lm -lpthread -o "$TMP_DIR/p82e_asan"
+  if [ "$(uname -s)" = "Linux" ]; then
+    [ "$(ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/p82e_asan")" = "p82e_intmap ok" ]
+  else
+    [ "$("$TMP_DIR/p82e_asan")" = "p82e_intmap ok" ]
+  fi
+fi
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/p82e.wasm" "$TMP_DIR/p82e_ws/app"
+  [ "$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/p82e.wasm")" = "p82e_intmap ok" ]
+fi
+echo "9. P82-E cross-pkg generic IntMap[Int|Bool|String] + map_put[K,V] (rel+dev+ASan/LSan+Wasm32) -> OK"
+
 echo "PASS: p76_value_key_map"

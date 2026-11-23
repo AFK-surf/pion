@@ -5752,7 +5752,21 @@ if ((rc | 0) !== 0 || lines.join("").trim() !== "p29c_full_features ok") {
   }
 }
 
-console.log("  p82c ABI handshake (" + rtLabel + "): v2 ok + forward v1/missing guard + reverse LinkError OK");
+// 4. P82-E rawAlloc / pion_arr_new int32 overflow guard: 1n << 28n elements x 8B must throw exceeds wasm32 limit
+{
+  let threwOverflow = false;
+  try {
+    rt.imports.pion_rt.pion_arr_new(1n << 28n, 0);
+  } catch (err) {
+    threwOverflow = String(err && err.message ? err.message : err).includes("exceeds wasm32 limit");
+  }
+  if (!threwOverflow) {
+    console.error("FAIL (" + rtLabel + "): pion_arr_new(1n << 28n, 0) did not throw exceeds wasm32 limit");
+    process.exit(1);
+  }
+}
+
+console.log("  p82c ABI handshake (" + rtLabel + "): v2 ok + forward v1/missing guard + reverse LinkError + P82-E overflow guard OK");
 ' "$wasm_file" "$rt_path" "$mode_label"
   done
 done
