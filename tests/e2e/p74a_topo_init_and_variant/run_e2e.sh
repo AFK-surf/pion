@@ -222,4 +222,123 @@ check_unknown_variant "is_bogus" 'import "rlib"
 pub fn main() -> Int { if rlib::Kind::A is Bogus { 1 } else { 0 } }'
 
 echo "2b. E_UNKNOWN_VARIANT 8 negative cases -> OK"
+
+# ---------------------------------------------------------------------------
+# 3. P74-B: Wasm32 multi-package shared-CAS sibling isolation regression
+#    combo -> {sib_a, sib_b}, solo_b -> {sib_b}.
+#    sib_b's cached CAS .ssa must NOT call sib_a's init_consts.
+# ---------------------------------------------------------------------------
+if command -v node >/dev/null 2>&1; then
+  mkdir -p "$TMP_DIR/wcas/sib_a/src" "$TMP_DIR/wcas/sib_b/src" \
+           "$TMP_DIR/wcas/combo/src" "$TMP_DIR/wcas/solo_b/src"
+
+  cat > "$TMP_DIR/wcas/sib_a/pion.toml" <<'EOF'
+[package]
+name = "sib_a"
+version = "0.1.0"
+EOF
+  cat > "$TMP_DIR/wcas/sib_a/src/lib.pion" <<'EOF'
+let A_STORE : Array[Int] = [10]
+
+pub fn val_a() -> Int {
+  A_STORE[0]
+}
+EOF
+
+  cat > "$TMP_DIR/wcas/sib_b/pion.toml" <<'EOF'
+[package]
+name = "sib_b"
+version = "0.1.0"
+EOF
+  cat > "$TMP_DIR/wcas/sib_b/src/lib.pion" <<'EOF'
+let B_STORE : Array[Int] = [20]
+
+pub fn val_b() -> Int {
+  B_STORE[0]
+}
+EOF
+
+  cat > "$TMP_DIR/wcas/combo/pion.toml" <<'EOF'
+[package]
+name = "combo"
+version = "0.1.0"
+
+[dependencies]
+sib_a = { path = "../sib_a" }
+sib_b = { path = "../sib_b" }
+EOF
+  cat > "$TMP_DIR/wcas/combo/src/main.pion" <<'EOF'
+import "sib_a"
+import "sib_b"
+
+pub fn main(world : World) -> Int {
+  io_println(world, (sib_a::val_a() + sib_b::val_b()).to_string())
+  0
+}
+EOF
+
+  cat > "$TMP_DIR/wcas/solo_b/pion.toml" <<'EOF'
+[package]
+name = "solo_b"
+version = "0.1.0"
+
+[dependencies]
+sib_b = { path = "../sib_b" }
+EOF
+  cat > "$TMP_DIR/wcas/solo_b/src/main.pion" <<'EOF'
+import "sib_b"
+
+pub fn main(world : World) -> Int {
+  io_println(world, sib_b::val_b().to_string())
+  0
+}
+EOF
+
+  SHARED_CAS="$TMP_DIR/wcas_shared_cas"
+  mkdir -p "$SHARED_CAS"
+
+  for mode in release dev; do
+    if [ "$mode" = "release" ]; then
+      combo_out="$(PION_CACHE_DIR="$SHARED_CAS" "$PIONC" run --release --target wasm32 "$TMP_DIR/wcas/combo")"
+      solo_out="$(PION_CACHE_DIR="$SHARED_CAS" PION_TRACE_CAS=1 "$PIONC" run --release --target wasm32 "$TMP_DIR/wcas/solo_b" 2>"$TMP_DIR/wcas/solo_${mode}.err")"
+    else
+      combo_out="$(PION_CACHE_DIR="$SHARED_CAS" "$PIONC" run --target wasm32 "$TMP_DIR/wcas/combo")"
+      solo_out="$(PION_CACHE_DIR="$SHARED_CAS" PION_TRACE_CAS=1 "$PIONC" run --target wasm32 "$TMP_DIR/wcas/solo_b" 2>"$TMP_DIR/wcas/solo_${mode}.err")"
+    fi
+    if [ "$combo_out" != "30" ]; then
+      echo "FAIL: wasm32 shared-CAS combo ($mode) expected 30, got '$combo_out'" >&2
+      exit 1
+    fi
+    if [ "$solo_out" != "20" ]; then
+      echo "FAIL: wasm32 shared-CAS solo_b ($mode) expected 20, got '$solo_out'" >&2
+      exit 1
+    fi
+    if ! grep -q "\[cas-wasm\] pkg=sib_b HIT" "$TMP_DIR/wcas/solo_${mode}.err"; then
+      echo "FAIL: wasm32 shared-CAS solo_b ($mode) expected sib_b CAS HIT, stderr:" >&2
+      cat "$TMP_DIR/wcas/solo_${mode}.err" >&2
+      exit 1
+    fi
+  done
+
+  sib_b_ssa_count=0
+  for f in "$SHARED_CAS"/ssa/*.ssa; do
+    if grep -q "pion_pkg_sib_b_init_consts" "$f" && \
+       ! grep -q "pion_pkg_combo_init_consts" "$f" && \
+       ! grep -q "pion_pkg_solo_b_init_consts" "$f"; then
+      sib_b_ssa_count=$((sib_b_ssa_count + 1))
+      if grep -q "pion_pkg_sib_a_init_consts" "$f"; then
+        echo "FAIL: sib_b cached CAS .ssa ($f) is polluted by sibling sib_a init_consts" >&2
+        exit 1
+      fi
+    fi
+  done
+  if [ "$sib_b_ssa_count" -lt 2 ]; then
+    echo "FAIL: expected >=2 sib_b cached CAS .ssa files (release + dev), found $sib_b_ssa_count" >&2
+    exit 1
+  fi
+  echo "3. Wasm32 shared-CAS sibling isolation (release + dev, $sib_b_ssa_count sib_b .ssa clean) -> OK"
+else
+  echo "3. Wasm32 shared-CAS sibling isolation -> SKIP (no node)"
+fi
+
 echo "PASS: p74a_topo_init_and_variant"
