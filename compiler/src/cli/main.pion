@@ -564,7 +564,7 @@ fn drv_ensure_msvc_rt_obj(world : World, cc_bin : String) -> Option[String] {
   if fs_exists(world, obj_path) {
     return Some(obj_path)
   }
-  let stamp = clock_now_ms(world).to_string()
+  let stamp = drv_tmp_tag(world, obj_path)
   let obj_tmp = obj_path + ".tmp." + stamp
   let argv : Array[String] = [
     cc_bin,
@@ -638,7 +638,7 @@ fn drv_ensure_cross_rt_lib(
   if fs_exists(world, ar_path) {
     return Some(ar_path)
   }
-  let stamp = clock_now_ms(world).to_string()
+  let stamp = drv_tmp_tag(world, ar_path)
   let obj_tmp = ar_path + ".o.tmp." + stamp
   let ar_tmp = ar_path + ".a.tmp." + stamp
   let argv : Array[String] = [cc_bin]
@@ -1215,13 +1215,46 @@ fn drv_resolve_qbe_target(world : World) -> String {
 }
 
 ///|
+/// Builds a process-unique temporary suffix so concurrent `pionc` processes
+/// running in the same millisecond never collide on shared CAS `.tmp.*` files.
+fn drv_tmp_tag(world : World, salt : String) -> String {
+  let ms = clock_now_ms(world).to_string()
+  let pid_hint = match fs_read(world, "/proc/self/stat") {
+    Ok(s) => s
+    Err(_) => drv_env_str(world, "PWD") + "|" + drv_env_str(world, "SHLVL") + "|" + drv_env_str(world, "_")
+  }
+  let args_sb = StringBuilder()
+  let argv = world_args(world)
+  let mut i = 0
+  while i < argv.length() {
+    if i > 0 {
+      args_sb.write_char('\n')
+    }
+    args_sb.write_string(argv[i])
+    i = i + 1
+  }
+  let h = sha256_hex(ms + "|" + pid_hint + "|" + args_sb.to_string() + "|" + salt)
+  ms + "_" + slice_str(h, 0, 12)
+}
+
+///|
+fn drv_finish_tmp_rename(world : World, tmp : String, dst : String) -> Bool {
+  if fs_rename(world, tmp, dst) {
+    true
+  } else {
+    let _ = fs_remove(world, tmp)
+    fs_exists(world, dst)
+  }
+}
+
+///|
 fn drv_write_text_atomic(world : World, path : String, content : String) -> Bool {
-  let tmp = path + ".tmp." + clock_now_ms(world).to_string()
+  let tmp = path + ".tmp." + drv_tmp_tag(world, path)
   match fs_write(world, tmp, content) {
     Err(_) => return false
     Ok(_) => ()
   }
-  fs_rename(world, tmp, path)
+  drv_finish_tmp_rename(world, tmp, path)
 }
 
 ///|
@@ -1744,6 +1777,7 @@ struct DrvGitCtx {
   new_lock : Array[LockEntry]
   fetched : Map[String, Bool]
   ws_root : Option[DrvEnclosingWs]
+  root_pins : Map[String, String]
 }
 
 ///|
@@ -2142,7 +2176,7 @@ fn drv_git_fetch_once(
   ctx.fetched.set(repo, true)
   if !fs_is_dir(world, repo) {
     let _ = fs_mkdir_p(world, ctx.git_root + "/repos")
-    let tmp = repo + ".tmp." + clock_now_ms(world).to_string()
+    let tmp = repo + ".tmp." + drv_tmp_tag(world, repo)
     match drv_git(world, ["clone", "--quiet", "--mirror", url, tmp]) {
       Err(e) => {
         drv_rm_rf(world, tmp)
@@ -2178,7 +2212,7 @@ fn drv_git_checkout(
     return Ok(co)
   }
   let _ = fs_mkdir_p(world, ctx.git_root + "/checkouts")
-  let tmp = co + ".tmp." + clock_now_ms(world).to_string()
+  let tmp = co + ".tmp." + drv_tmp_tag(world, co)
   match drv_git(world, ["clone", "--quiet", "--shared", "--no-checkout", repo, tmp]) {
     Err(e) => {
       drv_rm_rf(world, tmp)
@@ -2359,7 +2393,21 @@ fn drv_load_workspace_dfs(
       raw_dep
     }
     dep_names.push(dep.name)
-    let dep_dir = if manifest_dep_is_git(dep) {
+    let dep_dir = if drv_is_external_pkg(ctx.git_root, norm_dir) &&
+      ctx.root_pins.contains(dep.name) {
+      match ctx.root_pins.get(dep.name) {
+        Some(pinned) => pinned
+        None =>
+          if manifest_dep_is_git(dep) {
+            match drv_git_dep_dir(world, ctx, dep) {
+              Err(e) => return Err(e)
+              Ok(d) => d
+            }
+          } else {
+            drv_resolve_rel_path(norm_dir, dep.path)
+          }
+      }
+    } else if manifest_dep_is_git(dep) {
       match drv_git_dep_dir(world, ctx, dep) {
         Err(e) => return Err(e)
         Ok(d) => d
@@ -2480,6 +2528,105 @@ fn drv_load_workspace_ex(
     new_lock: [],
     fetched: Map([]),
     ws_root: enclosing_ws,
+    root_pins: Map([]),
+  }
+  // Collect explicit root/workspace package pins before DFS so external
+  // git-cached packages unify onto the root's chosen version instead of
+  // pulling a duplicate copy via relative `../<dep>` paths.
+  match enclosing_ws {
+    Some(ws) => {
+      match drv_expand_workspace_members(world, ws.root_dir, ws.manifest) {
+        Ok(ws_members) => {
+          let mut wmi = 0
+          while wmi < ws_members.length() {
+            let mdir = drv_normalize_path(ws_members[wmi])
+            let mmf_path = drv_join_path(mdir, "pion.toml")
+            if fs_exists(world, mmf_path) {
+              match fs_read(world, mmf_path) {
+                Ok(mtxt) =>
+                  match parse_pion_toml(mtxt) {
+                    Ok(mmf) =>
+                      if mmf.name.length() > 0 && !ctx.root_pins.contains(mmf.name) {
+                        ctx.root_pins.set(mmf.name, mdir)
+                      }
+                    Err(_) => ()
+                  }
+                Err(_) => ()
+              }
+            }
+            wmi = wmi + 1
+          }
+        }
+        Err(_) => ()
+      }
+      let mut wdi = 0
+      while wdi < ws.manifest.workspace_deps.length() {
+        let wdep = ws.manifest.workspace_deps[wdi]
+        if !ctx.root_pins.contains(wdep.name) {
+          if manifest_dep_is_git(wdep) {
+            match drv_git_dep_dir(world, ctx, wdep) {
+              Err(e) => return Err(e)
+              Ok(d) => ctx.root_pins.set(wdep.name, drv_normalize_path(d))
+            }
+          } else {
+            ctx.root_pins.set(
+              wdep.name,
+              drv_normalize_path(drv_resolve_rel_path(ws.root_dir, wdep.path)),
+            )
+          }
+        }
+        wdi = wdi + 1
+      }
+    }
+    None => ()
+  }
+  if !root_mf.is_workspace {
+    let pin_root_dir = match enclosing_ws {
+      Some(_) => drv_abs_path(world, root_dir)
+      None => drv_normalize_path(root_dir)
+    }
+    if root_mf.name.length() > 0 {
+      ctx.root_pins.set(root_mf.name, pin_root_dir)
+    }
+    let mut rdi = 0
+    while rdi < root_mf.deps.length() {
+      let raw_dep = root_mf.deps[rdi]
+      let rdep = if raw_dep.workspace {
+        match ctx.ws_root {
+          Some(ws) =>
+            match manifest_resolve_ws_dep(
+              raw_dep,
+              ws.root_dir,
+              pin_root_dir,
+              ws.manifest.workspace_deps,
+            ) {
+              Ok(d) => d
+              Err(e) => return Err(e)
+            }
+          None =>
+            return Err(
+              "dependency '" +
+              raw_dep.name +
+              "' marked workspace = true but no enclosing [workspace] pion.toml found for " +
+              pin_root_dir,
+            )
+        }
+      } else {
+        raw_dep
+      }
+      if manifest_dep_is_git(rdep) {
+        match drv_git_dep_dir(world, ctx, rdep) {
+          Err(e) => return Err(e)
+          Ok(d) => ctx.root_pins.set(rdep.name, drv_normalize_path(d))
+        }
+      } else {
+        ctx.root_pins.set(
+          rdep.name,
+          drv_normalize_path(drv_resolve_rel_path(pin_root_dir, rdep.path)),
+        )
+      }
+      rdi = rdi + 1
+    }
   }
   let visited : Map[String, Bool] = Map([])
   let out : Array[PkgNodeInput] = []
@@ -2517,6 +2664,31 @@ fn drv_load_workspace_ex(
       Err(e) => return Err(e)
       Ok(_) => ()
     }
+  }
+  // Hard guard: fail fast before compilation/linking if two distinct paths
+  // resolved to the same package name.
+  let seen_pkg_dir : Map[String, String] = Map([])
+  let mut dup_i = 0
+  while dup_i < out.length() {
+    let node = out[dup_i]
+    match seen_pkg_dir.get(node.name) {
+      Some(prev_dir) =>
+        if prev_dir != node.dir {
+          return Err(
+            "duplicate package '" +
+            node.name +
+            "' resolved from multiple paths:\n  1) " +
+            prev_dir +
+            "\n  2) " +
+            node.dir +
+            "\nhint: pin '" +
+            node.name +
+            "' in pion.toml or [workspace.dependencies]",
+          )
+        }
+      None => seen_pkg_dir.set(node.name, node.dir)
+    }
+    dup_i = dup_i + 1
   }
   let final_lock : Array[LockEntry] = []
   let mut nl_i = 0
@@ -2937,7 +3109,7 @@ fn drv_compile_pkg_c_sources(
           "[cas] cstub=" + src_path + " MISS key=" + drv_prefix16(key),
         )
       }
-      let stamp = clock_now_ms(world).to_string()
+      let stamp = drv_tmp_tag(world, obj_path + ":" + si.to_string())
       let obj_tmp = obj_path + ".tmp." + stamp + "_" + si.to_string()
       let argv : Array[String] = [compiler]
       let mut fi = 0
@@ -3170,7 +3342,7 @@ fn drv_compile_pkg_rc_sources(
           "[cas] rc=" + rc_path + " MISS key=" + drv_prefix16(key),
         )
       }
-      let stamp = clock_now_ms(world).to_string()
+      let stamp = drv_tmp_tag(world, res_path + ":" + ri.to_string())
       let res_tmp = res_path + ".tmp." + stamp + "_" + ri.to_string()
       let argv : Array[String] = if is_msvc {
         [rc_bin, "-I", rc_dir, "-fo", res_tmp, rc_path]
@@ -3858,7 +4030,7 @@ fn drv_compile_missed(
   let n_miss = miss_obj_paths.length()
   let eff_jobs = if jobs > 0 { jobs } else { drv_default_jobs(world) }
   if n_miss == 1 || (n_miss > 1 && !direct_obj && eff_jobs <= 1) {
-    let stamp = clock_now_ms(world).to_string()
+    let stamp = drv_tmp_tag(world, "qbe_miss_seq")
     let mut mi = 0
     while mi < n_miss {
       match drv_compile_ssa_to_obj(
@@ -3887,7 +4059,7 @@ fn drv_compile_missed(
     } else {
       eff_jobs
     }
-    let stamp_base = clock_now_ms(world).to_string()
+    let stamp_base = drv_tmp_tag(world, "qbe_miss_batch")
     if nw == 1 {
       let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, true)
       let tmps : Array[String] = []
@@ -3996,7 +4168,7 @@ fn drv_compile_missed(
         batch = eff_jobs
       }
       let err_ch : Channel[String] = Channel::new(batch + 1)
-      let stamp_base = clock_now_ms(world).to_string()
+      let stamp_base = drv_tmp_tag(world, "qbe_miss_asm_" + base.to_string())
       scope(world, fn(s : Scope) -> Unit {
         let mut off = 0
         while off < batch {
@@ -4760,9 +4932,10 @@ fn drv_build_wasm_targets(
         } else {
           emit_wasm_from_ssa_units_opts(pkg_ssas, wasm_names, fn(_s : String) -> Unit { () })
         }
-        let tmp_bin = cached_wasm + ".tmp." + clock_now_ms(world).to_string()
+        let wasm_tag = drv_tmp_tag(world, cached_wasm)
+        let tmp_bin = cached_wasm + ".tmp." + wasm_tag
         if wopt_bin != "" {
-          let tmp_raw = cached_wasm + ".raw." + clock_now_ms(world).to_string()
+          let tmp_raw = cached_wasm + ".raw." + wasm_tag
           match fs_write_bytes(world, tmp_raw, wasm_bytes) {
             Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
             Ok(_) => ()
@@ -4855,7 +5028,7 @@ fn drv_build_wasm_targets(
     drv_ensure_parent_dir(world, out_bin_arg)
   }
   if wopt_bin != "" {
-    let tmp_raw = final_wasm + ".raw.wasm"
+    let tmp_raw = final_wasm + ".raw." + drv_tmp_tag(world, final_wasm) + ".wasm"
     match fs_write_bytes(world, tmp_raw, wasm_bytes) {
       Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
       Ok(_) => ()
@@ -5309,7 +5482,7 @@ fn drv_build_targets(
     // Compile missed units (qbe --obj / --obj-batch or qbe + cc1as/as) in parallel across up to `jobs` OS threads
     let n_miss = miss_indices.length()
     if n_miss == 1 || (n_miss > 1 && !direct_obj && jobs <= 1) {
-      let stamp = clock_now_ms(world).to_string()
+      let stamp = drv_tmp_tag(world, "unit_qbe_seq")
       let mut mi = 0
       while mi < n_miss {
         let idx = miss_indices[mi]
@@ -5361,7 +5534,7 @@ fn drv_build_targets(
       } else {
         jobs
       }
-      let stamp_base = clock_now_ms(world).to_string()
+      let stamp_base = drv_tmp_tag(world, "unit_qbe_batch")
       if nw == 1 {
         let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, true)
         let tmps : Array[String] = []
@@ -5471,7 +5644,7 @@ fn drv_build_targets(
           batch = jobs
         }
         let err_ch : Channel[String] = Channel::new(batch + 1)
-        let stamp_base = clock_now_ms(world).to_string()
+        let stamp_base = drv_tmp_tag(world, "unit_qbe_par_" + base.to_string())
         let use_direct = direct_obj
         let qmv = qbe_macos_ver
         scope(world, fn(s : Scope) -> Unit {
@@ -5721,7 +5894,7 @@ fn drv_build_targets(
       return Ok(emit_asm_path)
     }
 
-    let stamp = clock_now_ms(world).to_string()
+    let stamp = drv_tmp_tag(world, obj_path)
     let obj_tmp = obj_path + ".tmp." + stamp
     if direct_obj {
       let argv = drv_qbe_obj_argv(qbe_bin, qbe_target, qbe_macos_ver, false)
@@ -6102,7 +6275,7 @@ fn drv_exec_test_jobs(
       }
     } else {
       let need_qbe = !fs_exists(world, obj_path)
-      let ssa_path = tb_dir + "/" + okey + ".ssa." + clock_now_ms(world).to_string() + "_" + j.to_string()
+      let ssa_path = tb_dir + "/" + okey + ".ssa." + drv_tmp_tag(world, okey + "_" + j.to_string())
       if need_qbe {
         if !drv_write_text_atomic(world, ssa_path, job.ssa) {
           return Err("failed to write test ssa: " + ssa_path)
@@ -6164,7 +6337,7 @@ fn drv_exec_test_jobs(
     let cursor = AtomicInt::new(0)
     let err_ch : Channel[String] = Channel::new(nb + 1)
     let first_ch : Channel[String] = Channel::new(nb + 1)
-    let stamp = clock_now_ms(world).to_string()
+    let stamp = drv_tmp_tag(world, "test_bins")
     let tools = apple_tools
     let qb = qbe_bin
     let qt = qbe_target
@@ -7063,6 +7236,54 @@ fn drv_run_tests_cmd(
         )
       None => ()
     }
+  } else if targets.length() > 1 {
+    let manifest_dirs : Array[String] = []
+    let seen_dirs : Map[String, Bool] = Map([])
+    let mut n_manifest = 0
+    let mut n_plain = 0
+    let mut ti = 0
+    while ti < targets.length() {
+      match drv_detect_manifest_dir(world, targets[ti]) {
+        Some(root_dir) => {
+          n_manifest = n_manifest + 1
+          let norm = drv_normalize_path(root_dir)
+          if !seen_dirs.contains(norm) {
+            seen_dirs.set(norm, true)
+            manifest_dirs.push(root_dir)
+          }
+        }
+        None => n_plain = n_plain + 1
+      }
+      ti = ti + 1
+    }
+    if n_manifest > 0 && n_plain > 0 {
+      io_eprintln(
+        world,
+        "error: cannot mix pion.toml package directories with bare .pion files in `pionc test`",
+      )
+      return 1
+    }
+    if n_manifest == targets.length() {
+      let mut overall_rc = 0
+      let mut mi = 0
+      while mi < manifest_dirs.length() {
+        let rc = drv_run_ws_tests(
+          world,
+          manifest_dirs[mi],
+          as_json,
+          filter,
+          cli_libs,
+          only_pkg,
+          no_deps,
+          jobs,
+        )
+        if rc != 0 {
+          overall_rc = rc
+        }
+        mi = mi + 1
+      }
+      return overall_rc
+    }
   }
   if only_pkg.length() > 0 {
     io_eprintln(world, "error: --package needs a pion.toml workspace")
@@ -7582,7 +7803,7 @@ fn drv_registry_sync(
   fetched.set(repo, true)
   if !fs_is_dir(world, repo) {
     let _ = fs_mkdir_p(world, root)
-    let tmp = repo + ".tmp." + clock_now_ms(world).to_string()
+    let tmp = repo + ".tmp." + drv_tmp_tag(world, repo)
     match drv_git(world, ["clone", "--quiet", "--mirror", url, tmp]) {
       Err(e) => {
         drv_rm_rf(world, tmp)
