@@ -4483,7 +4483,7 @@ PION_MINSIZE void pion_sleep_ms(void *w_ptr, int32_t ms) {
 #include <immintrin.h>
 #endif
 
-static PION_NOINLINE PION_MINSIZE void *pion_simd_slice(
+static PION_NOINLINE void *pion_simd_slice(
     void *obj, int32_t is_bytes, int32_t elem_stride, int32_t off, int64_t need) {
     int64_t len;
     uint8_t *data;
@@ -4594,7 +4594,7 @@ static PION_NOINLINE int32_t pion_dot_i8_neon(const int8_t *a, const int8_t *b, 
 }
 #endif
 
-static PION_MINSIZE int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, int32_t n) {
+static int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, int32_t n) {
 #if defined(__ARM_FEATURE_DOTPROD)
     return pion_dot_i8_sdot(a, b, n);
 #else
@@ -4605,7 +4605,7 @@ static PION_MINSIZE int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, in
 #endif
 }
 
-static PION_MINSIZE void pion_matvec_i8_raw(
+static void pion_matvec_i8_raw(
     float *out, const int8_t *w, const int8_t *x, const float *sc,
     float x_scale, int32_t rows, int32_t cols) {
 #if defined(__ARM_FEATURE_DOTPROD)
@@ -4673,12 +4673,12 @@ static PION_NOINLINE void pion_matvec_i8_avx2(
     }
 }
 
-static PION_MINSIZE int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, int32_t n) {
+static int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, int32_t n) {
     if (__builtin_cpu_supports("avx2")) return pion_dot_i8_avx2(a, b, n);
     return pion_dot_i8_scalar(a, b, n);
 }
 
-static PION_MINSIZE void pion_matvec_i8_raw(
+static void pion_matvec_i8_raw(
     float *out, const int8_t *w, const int8_t *x, const float *sc,
     float x_scale, int32_t rows, int32_t cols) {
     if (__builtin_cpu_supports("avx2")) {
@@ -4692,11 +4692,11 @@ static PION_MINSIZE void pion_matvec_i8_raw(
 
 #else
 
-static PION_MINSIZE int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, int32_t n) {
+static int32_t pion_dot_i8_raw(const int8_t *a, const int8_t *b, int32_t n) {
     return pion_dot_i8_scalar(a, b, n);
 }
 
-static PION_MINSIZE void pion_matvec_i8_raw(
+static void pion_matvec_i8_raw(
     float *out, const int8_t *w, const int8_t *x, const float *sc,
     float x_scale, int32_t rows, int32_t cols) {
     for (int32_t r = 0; r < rows; r++) {
@@ -4706,14 +4706,14 @@ static PION_MINSIZE void pion_matvec_i8_raw(
 
 #endif
 
-PION_MINSIZE int32_t pion_simd_i8_dot(
+int32_t pion_simd_i8_dot(
     void *a, int32_t a_is_bytes, int32_t a_off, void *b, int32_t b_off, int32_t len) {
     const int8_t *pa = (const int8_t *)pion_simd_slice(a, a_is_bytes, 1, a_off, (int64_t)len);
     const int8_t *pb = (const int8_t *)pion_simd_slice(b, 0, 1, b_off, (int64_t)len);
     return len > 0 ? pion_dot_i8_raw(pa, pb, len) : 0;
 }
 
-PION_MINSIZE void pion_simd_i8_mv(
+void pion_simd_i8_mv(
     void *out, int32_t out_off, void *w, int32_t w_is_bytes, int32_t w_off,
     void *x, int32_t x_off, void *sc, int32_t s_off,
     float x_scale, int32_t rows, int32_t cols) {
@@ -4747,7 +4747,7 @@ static PION_NOINLINE PION_MINSIZE float pion_simd_f32_tail(
     return sum;
 }
 
-static PION_NOINLINE float pion_simd_f32_kernel(
+static float pion_simd_f32_kernel(
     float *pd, const float *pa, const float *pb, int32_t len, float s, int32_t op) {
     int32_t i = 0;
     float sum = 0.0f;
@@ -4783,7 +4783,7 @@ static PION_NOINLINE float pion_simd_f32_kernel(
     return sum;
 }
 
-PION_MINSIZE float pion_simd_f32(
+float pion_simd_f32(
     int32_t op, void *dst, int32_t d_off, void *a, int32_t a_off,
     void *b, int32_t b_off, float alpha, int32_t len) {
     float *pd = (float *)pion_simd_slice(dst, 0, 4, d_off, (int64_t)len);
