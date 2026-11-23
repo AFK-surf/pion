@@ -641,4 +641,139 @@ if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
   test "$P77B_ASAN" = "$P77B_REL"
 fi
 
-echo "PASS: p77_views_and_lib_os (Native rel+dev + ASan/LSan + staticlib no-main + OOB/RO-mmap traps + Wasm32 Node+Web + P77-B SSA/bsearch)"
+# --- 7. P81 (Part A + Part B): Cold-return on-demand boxing (P77-C) + Native memcmp/memchr ---
+cat <<'EOF' > "$TMP_DIR/p81_views.pion"
+fn cmp_view(a : StrView, b : StrView) -> Int {
+  let la = a.length()
+  let lb = b.length()
+  let n = if la < lb { la } else { lb }
+  let mut i = 0
+  while i < n {
+    let ca = a[i]
+    let cb = b[i]
+    if ca != cb {
+      return ca - cb
+    }
+    i = i + 1
+  }
+  la - lb
+}
+
+fn find_line_opt(buf : String, offs : Array[Int], lens : Array[Int], target : StrView) -> Option[StrView] {
+  let mut lo = 0
+  let mut hi = offs.length() - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let s = offs[mid]
+    let line = buf.view(s, s + lens[mid])
+    let tab = line.index_of_byte(b'\t')
+    let key = line.subview(0, tab)
+    let c = cmp_view(key, target)
+    if c == 0 {
+      return Some(line)
+    } else if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  None
+}
+
+fn find_line_ret_direct(buf : String, offs : Array[Int], lens : Array[Int], target : StrView) -> StrView {
+  let mut lo = 0
+  let mut hi = offs.length() - 1
+  while lo <= hi {
+    let mid = lo + (hi - lo) / 2
+    let s = offs[mid]
+    let line = buf.view(s, s + lens[mid])
+    let tab = line.index_of_byte(b'\t')
+    let key = line.subview(0, tab)
+    let c = cmp_view(key, target)
+    if c == 0 {
+      return line
+    } else if c < 0 {
+      lo = mid + 1
+    } else {
+      hi = mid - 1
+    }
+  }
+  "".as_view()
+}
+
+fn make_temp_buf_and_find(target : StrView) -> Option[StrView] {
+  // Local `buf` is dropped when this function returns; returned StrView MUST keep owner alive!
+  let buf = "k0\tv0\nk1\tv1\nk2\tv2\n"
+  let offs : Array[Int] = [0, 6, 12]
+  let lens : Array[Int] = [5, 5, 5]
+  find_line_opt(buf, offs, lens, target)
+}
+
+fn main(world : World) -> Unit {
+  let k1 = "k1".as_view()
+  let km = "k9".as_view()
+  match make_temp_buf_and_find(k1) {
+    Some(v) => {
+      if !v.eq_str("k1\tv1") || v != "k1\tv1".as_view() {
+        panic("p81 find_line_opt hit mismatch")
+      }
+    }
+    None => panic("p81 find_line_opt expected Some")
+  }
+  match make_temp_buf_and_find(km) {
+    Some(_) => panic("p81 find_line_opt expected None")
+    None => ()
+  }
+  let buf = "a\t1\nb\t2\nc\t3\n"
+  let offs : Array[Int] = [0, 4, 8]
+  let lens : Array[Int] = [3, 3, 3]
+  let d = find_line_ret_direct(buf, offs, lens, "b".as_view())
+  if !d.eq_str("b\t2") {
+    panic("p81 find_line_ret_direct mismatch")
+  }
+  io_println(world, "p81_views ok " + d.to_string())
+}
+EOF
+
+"$PIONC" build --release --emit-ssa "$TMP_DIR/p81_views.ssa" "$TMP_DIR/p81_views.pion"
+OPT_BODY=$(awk '/function .* \$pion_fn_find_line_opt\(/ { p=1 } p { print } p && /^}/ { p=0 }' "$TMP_DIR/p81_views.ssa")
+test -n "$OPT_BODY" || { echo "FAIL: missing pion_fn_find_line_opt in p81_views.ssa"; exit 1; }
+# Only 1 view alloc (24B, tag 4) on the cold `return Some(line)` edge, 0 in the loop for `line` or `key`
+VIEW_ALLOCS=$(printf '%s\n' "$OPT_BODY" | grep -c 'pion_alloc_uninit(w 24, w 4' || true)
+RC_INCS=$(printf '%s\n' "$OPT_BODY" | grep -c 'pion_rc_inc' || true)
+if [ "$VIEW_ALLOCS" -ne 1 ] || [ "$RC_INCS" -ne 1 ]; then
+  echo "FAIL: find_line_opt expected 1 cold view alloc & 1 owner rc_inc, got allocs=$VIEW_ALLOCS rc_incs=$RC_INCS" >&2
+  printf '%s\n' "$OPT_BODY" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$OPT_BODY" | grep -q 'call \$memchr('; then
+  echo "FAIL: find_line_opt did not lower index_of_byte to Native memchr" >&2
+  exit 1
+fi
+if ! grep -q 'call \$memcmp(' "$TMP_DIR/p81_views.ssa"; then
+  echo "FAIL: p81_views.ssa did not lower view_eq_bytes to Native memcmp" >&2
+  exit 1
+fi
+echo "p81 SSA audit: PASS (find_line_opt: 0 loop view allocs, 1 cold return materialize + Native memcmp/memchr)"
+
+"$PIONC" build --release -o "$TMP_DIR/p81_views_rel" "$TMP_DIR/p81_views.pion"
+P81_REL=$("$TMP_DIR/p81_views_rel")
+echo "p81 native release -> $P81_REL"
+test "$P81_REL" = "p81_views ok b	2"
+
+if [ -f "$TMP_DIR/libpionrt_asan.a" ]; then
+  "$PIONC" build --release --emit-obj "$TMP_DIR/p81_views.o" "$TMP_DIR/p81_views.pion"
+  "$CC_BIN" -fsanitize=address "$TMP_DIR/p81_views.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p81_views_asan"
+  P81_ASAN=$("$TMP_DIR/p81_views_asan")
+  echo "p81 ASan/LSan -> $P81_ASAN"
+  test "$P81_ASAN" = "$P81_REL"
+fi
+
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/p81_views.wasm" "$TMP_DIR/p81_views.pion"
+  P81_WASM=$(node "$WASM_RT" "$TMP_DIR/p81_views.wasm")
+  echo "p81 wasm32 node -> $P81_WASM"
+  test "$P81_WASM" = "$P81_REL"
+fi
+
+echo "PASS: p77_views_and_lib_os (Native rel+dev + ASan/LSan + staticlib no-main + OOB/RO-mmap traps + Wasm32 Node+Web + P77-B/P81 SSA/bsearch)"

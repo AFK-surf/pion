@@ -195,6 +195,26 @@ fn test_tuple_keys() -> Unit {
   if ms.contains((60.to_int64() * 1000000007L, 60)) {
     panic("ms_cleared_miss")
   }
+
+  // P81 (P76-C): Packed 64-bit hash edge check with signed Int8 (-128/-1) + Byte/Bool
+  let m_i8b : Map[(Int8, Byte), Int] = Map([])
+  m_i8b.set(((-128).to_int8(), (0).to_byte()), 101)
+  m_i8b.set(((-1).to_int8(), (255).to_byte()), 202)
+  m_i8b.set(((0).to_int8(), (128).to_byte()), 303)
+  m_i8b.set(((127).to_int8(), (1).to_byte()), 404)
+  assert_eq(m_i8b.get(((-128).to_int8(), (0).to_byte())).unwrap_or(-1), 101, "i8b_min")
+  assert_eq(m_i8b.get(((-1).to_int8(), (255).to_byte())).unwrap_or(-1), 202, "i8b_neg1")
+  assert_eq(m_i8b.get(((0).to_int8(), (128).to_byte())).unwrap_or(-1), 303, "i8b_zero")
+  assert_eq(m_i8b.get(((127).to_int8(), (1).to_byte())).unwrap_or(-1), 404, "i8b_max")
+  assert_eq(m_i8b.get(((-1).to_int8(), (0).to_byte())).unwrap_or(-9), -9, "i8b_miss")
+
+  let m_bi8 : Map[(Bool, Int8), Int] = Map([])
+  m_bi8.set((true, (-1).to_int8()), 11)
+  m_bi8.set((false, (-1).to_int8()), 22)
+  m_bi8.set((true, (-128).to_int8()), 33)
+  assert_eq(m_bi8.get((true, (-1).to_int8())).unwrap_or(-1), 11, "bi8_t_neg1")
+  assert_eq(m_bi8.get((false, (-1).to_int8())).unwrap_or(-1), 22, "bi8_f_neg1")
+  assert_eq(m_bi8.get((true, (-128).to_int8())).unwrap_or(-1), 33, "bi8_t_min")
 }
 
 fn test_struct_pod_keys() -> Unit {
@@ -364,11 +384,11 @@ if printf '%s' "$HOT_BODY" | grep -q 'pion_alloc_uninit'; then
   printf '%s\n' "$HOT_BODY" >&2
   exit 1
 fi
-if ! printf '%s' "$HOT_BODY" | grep -q 'pion_vmap_try_get_'; then
-  echo "FAIL: hot_vmap SSA did not lower m.get().unwrap_or() to pion_vmap_try_get_" >&2
-  exit 1
-fi
-echo "3. SSA audit (0 pion_alloc_uninit in hot_vmap + scalarized try_get) -> OK"
+  if ! printf '%s' "$HOT_BODY" | grep -q 'pion_vmap_get_or_'; then
+    echo "FAIL: hot_vmap SSA did not lower m.get().unwrap_or() to pion_vmap_get_or_" >&2
+    exit 1
+  fi
+  echo "3. SSA audit (0 pion_alloc_uninit in hot_vmap + register-return pion_vmap_get_or_) -> OK"
 
 # 4. Native ASan/LSan (0 leaks)
 CC_BIN="${CC:-cc}"
@@ -552,9 +572,12 @@ I64_RSS_KB=0
 I64_OUT="$("$TMP_DIR/bench_i64")"
 if command -v python3 >/dev/null 2>&1; then
   I64_RSS_KB="$(python3 -c '
-import resource, subprocess, sys
-subprocess.run([sys.argv[1]], stdout=subprocess.DEVNULL, check=True)
-r = resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss
+import os, sys
+pid = os.posix_spawn(sys.argv[1], [sys.argv[1]], os.environ, file_actions=[(os.POSIX_SPAWN_OPEN, 1, os.devnull, os.O_WRONLY, 0)])
+_, st, ru = os.wait4(pid, 0)
+if st != 0:
+    sys.exit(1)
+r = ru.ru_maxrss
 print(r // 1024 if sys.platform == "darwin" else r)
 ' "$TMP_DIR/bench_i64")"
 fi
@@ -563,5 +586,54 @@ if [ "$I64_RSS_KB" -gt 0 ] && [ "$I64_RSS_KB" -gt 12288 ]; then
   echo "FAIL: 100K Map[Int64, Int64] RSS ${I64_RSS_KB} KB > 12288 KB (12 MB)" >&2
   exit 1
 fi
+
+# 8. P81 (P76-C): Map[(Int, Int), Int64] 100K write + 500K get().unwrap_or(0L) + SSA audit
+cat > "$TMP_DIR/bench_pair_i64.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  let n = 100000
+  let t0 = clock_now_ms(world)
+  let m : Map[(Int, Int), Int64] = Map::with_capacity(n)
+  let mut i = 0
+  while i < n {
+    let a = i % 1000
+    let b = i / 1000
+    m.set((a, b), i.to_int64() + 1L)
+    i += 1
+  }
+  let mut sum = 0L
+  let mut round = 0
+  while round < 5 {
+    i = 0
+    while i < n {
+      let a = i % 1000
+      let b = i / 1000
+      sum += m.get((a, b)).unwrap_or(0L)
+      i += 1
+    }
+    round += 1
+  }
+  let t1 = clock_now_ms(world)
+  if sum != 25000250000L {
+    panic("pair_i64 map sum mismatch")
+  }
+  io_println(world, "pair_i64_100k_w_500k_r_ms=" + (t1 - t0).to_string() + " len=" + m.length().to_string())
+  0
+}
+EOF
+"$PIONC" build --release --emit-ssa "$TMP_DIR/bench_pair_i64.ssa" "$TMP_DIR/bench_pair_i64.pion"
+PAIR_GET_OR="$(awk '/function .* \$pion_vmap_get_or_/,/^}/' "$TMP_DIR/bench_pair_i64.ssa")"
+if ! printf '%s' "$PAIR_GET_OR" | grep -q '%sk_go =l loadl %sp'; then
+  echo "FAIL: Map[(Int, Int), Int64] get_or did not emit single 64-bit loadl key_cmp" >&2
+  printf '%s\n' "$PAIR_GET_OR" >&2
+  exit 1
+fi
+if ! printf '%s' "$PAIR_GET_OR" | grep -q '%keq_go =w ceql %kpk_go, %sk_go'; then
+  echo "FAIL: Map[(Int, Int), Int64] get_or did not emit single 64-bit ceql key_cmp" >&2
+  printf '%s\n' "$PAIR_GET_OR" >&2
+  exit 1
+fi
+"$PIONC" build --release -o "$TMP_DIR/bench_pair_i64" "$TMP_DIR/bench_pair_i64.pion"
+PAIR_OUT="$("$TMP_DIR/bench_pair_i64")"
+echo "8. P81 Map[(Int, Int), Int64] (100K w + 500K r, 64-bit packed hash+cmp+get_or): $PAIR_OUT"
 
 echo "PASS: p76_value_key_map"

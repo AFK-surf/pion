@@ -166,6 +166,7 @@ pub struct QbeGen {
   global_min_len_arrs : Map[String, Int]
   freeze_fn_seen : Map[String, Bool]
   vmap_seen : Map[String, Bool]
+  vmap_get_or_seen : Map[String, Bool]
   eq_fn_seen : Map[String, Bool]
   strings : Array[String]
   string_ids : Map[String, Int]
@@ -238,6 +239,7 @@ pub struct QbeGen {
   mut w_to_l_ext : Map[String, String]
   mut local_w_to_l_ext : Map[String, String]
   mut unfrozen_local_arrs : Map[String, Bool]
+  mut stack_view_slots : Map[String, Bool]
   pod_borrow_cache : Map[String, Bool]
   mut assign_idx_arr : String
   mut assign_idx_key : String
@@ -1747,36 +1749,64 @@ fn qbe_vmap_idx_mul(sb : StringBuilder, dst : String, idx : String, stride : Int
 }
 
 ///|
+fn qbe_vmap_emit_zext32_to_l(
+  sb : StringBuilder,
+  dst : String,
+  reg : String,
+  fty : Ty,
+) -> Unit {
+  match fty {
+    TInt | TUInt => sb.write_string("    " + dst + " =l extuw " + reg + "\n")
+    TBool | TByte | TInt8 =>
+      sb.write_string("    " + dst + " =l and " + reg + ", 255\n")
+    _ => sb.write_string("    " + dst + " =l and " + reg + ", 4294967295\n")
+  }
+}
+
+///|
 fn qbe_vmap_emit_hash(
   sb : StringBuilder,
   kfields : Array[Ty],
   fregs : Array[String],
   pfx : String,
 ) -> Unit {
-  sb.write_string("    %h_" + pfx + "_0 =l copy 5871781006564002453\n")
-  let mut i = 0
-  while i < kfields.length() {
-    let prev = "%h_" + pfx + "_" + i.to_string()
-    let next = "%h_" + pfx + "_" + (i + 1).to_string()
-    let fl = match kfields[i] {
-      TInt => {
-        let t = "%hf_" + pfx + "_" + i.to_string()
-        sb.write_string("    " + t + " =l extsw " + fregs[i] + "\n")
-        t
+  let hlast = if kfields.length() == 2 &&
+    qbe_vmap_field_size(kfields[0]) <= 4 &&
+    qbe_vmap_field_size(kfields[1]) <= 4 {
+    // P81 (P76-C): Pack two <=32-bit fields into one 64-bit word and hash once.
+    qbe_vmap_emit_zext32_to_l(sb, "%hpk0_" + pfx, fregs[0], kfields[0])
+    qbe_vmap_emit_zext32_to_l(sb, "%hpk1_" + pfx, fregs[1], kfields[1])
+    sb.write_string("    %hpk1s_" + pfx + " =l shl %hpk1_" + pfx + ", 32\n")
+    sb.write_string("    %hpk_" + pfx + " =l or %hpk0_" + pfx + ", %hpk1s_" + pfx + "\n")
+    sb.write_string("    %hx_" + pfx + "_0 =l xor 5871781006564002453, %hpk_" + pfx + "\n")
+    sb.write_string("    %h_" + pfx + "_1 =l mul %hx_" + pfx + "_0, -7046029254386353131\n")
+    "%h_" + pfx + "_1"
+  } else {
+    sb.write_string("    %h_" + pfx + "_0 =l copy 5871781006564002453\n")
+    let mut i = 0
+    while i < kfields.length() {
+      let prev = "%h_" + pfx + "_" + i.to_string()
+      let next = "%h_" + pfx + "_" + (i + 1).to_string()
+      let fl = match kfields[i] {
+        TInt => {
+          let t = "%hf_" + pfx + "_" + i.to_string()
+          sb.write_string("    " + t + " =l extsw " + fregs[i] + "\n")
+          t
+        }
+        TUInt => {
+          let t = "%hf_" + pfx + "_" + i.to_string()
+          sb.write_string("    " + t + " =l extuw " + fregs[i] + "\n")
+          t
+        }
+        _ => fregs[i]
       }
-      TUInt => {
-        let t = "%hf_" + pfx + "_" + i.to_string()
-        sb.write_string("    " + t + " =l extuw " + fregs[i] + "\n")
-        t
-      }
-      _ => fregs[i]
+      let hx = "%hx_" + pfx + "_" + i.to_string()
+      sb.write_string("    " + hx + " =l xor " + prev + ", " + fl + "\n")
+      sb.write_string("    " + next + " =l mul " + hx + ", -7046029254386353131\n")
+      i = i + 1
     }
-    let hx = "%hx_" + pfx + "_" + i.to_string()
-    sb.write_string("    " + hx + " =l xor " + prev + ", " + fl + "\n")
-    sb.write_string("    " + next + " =l mul " + hx + ", -7046029254386353131\n")
-    i = i + 1
+    "%h_" + pfx + "_" + kfields.length().to_string()
   }
-  let hlast = "%h_" + pfx + "_" + kfields.length().to_string()
   sb.write_string("    %hs1_" + pfx + " =l shr " + hlast + ", 30\n")
   sb.write_string("    %hm1_" + pfx + " =l xor " + hlast + ", %hs1_" + pfx + "\n")
   sb.write_string("    %hm2_" + pfx + " =l mul %hm1_" + pfx + ", -4658895280553007687\n")
@@ -1871,6 +1901,21 @@ fn qbe_vmap_emit_key_cmp(
   pfx : String,
 ) -> Unit {
   let n = lay.kfields.length()
+  if n == 2 &&
+    lay.k_offs[0] == 0 &&
+    lay.k_offs[1] == 4 &&
+    qbe_vmap_field_size(lay.kfields[0]) == 4 &&
+    qbe_vmap_field_size(lay.kfields[1]) == 4 {
+    // P81 (P76-C): Single 64-bit little-endian key compare for 2x4B keys.
+    qbe_vmap_emit_zext32_to_l(sb, "%kpk0_" + pfx, fregs[0], lay.kfields[0])
+    qbe_vmap_emit_zext32_to_l(sb, "%kpk1_" + pfx, fregs[1], lay.kfields[1])
+    sb.write_string("    %kpk1s_" + pfx + " =l shl %kpk1_" + pfx + ", 32\n")
+    sb.write_string("    %kpk_" + pfx + " =l or %kpk0_" + pfx + ", %kpk1s_" + pfx + "\n")
+    sb.write_string("    %sk_" + pfx + " =l loadl " + slot_ptr + "\n")
+    sb.write_string("    %keq_" + pfx + " =w ceql %kpk_" + pfx + ", %sk_" + pfx + "\n")
+    sb.write_string("    jnz %keq_" + pfx + ", " + lbl_hit + ", " + lbl_miss + "\n")
+    return
+  }
   let mut i = 0
   while i < n {
     let fp = if lay.k_offs[i] == 0 {
@@ -1898,6 +1943,44 @@ fn qbe_vmap_emit_key_cmp(
     }
     i = i + 1
   }
+}
+
+///|
+/// P81 (P76-C): Lazily emit register-returning `$pion_vmap_get_or_<m>` for scalar-value vmaps.
+fn qbe_ensure_vmap_get_or_fn(g : QbeGen, kty : Ty, vty : Ty) -> String {
+  let m = qbe_ensure_vmap_fns(g, kty, vty)
+  if g.vmap_get_or_seen.contains(m) {
+    return m
+  }
+  g.vmap_get_or_seen.set(m, true)
+  let kfields = qbe_vmap_key_fields(g, kty)
+  let lay = qbe_vmap_layout(kfields, vty)
+  let n = kfields.length()
+  let kregs : Array[String] = []
+  let mut ki = 0
+  while ki < n {
+    kregs.push("%k" + ki.to_string())
+    ki = ki + 1
+  }
+  let ksig = qbe_vmap_param_sig(kfields)
+  let vabi = qbe_abi_ty(vty)
+  let sb = StringBuilder()
+  sb.write_string("function " + vabi + " $pion_vmap_get_or_" + m + "(l %m" + ksig + ", " + vabi + " %def) {\n@start\n")
+  sb.write_string("    %p8 =l add %m, 8\n    %cap =l loadl %p8\n    jnz %cap, @has_cap, @miss\n@has_cap\n")
+  sb.write_string("    %p16 =l add %m, 16\n    %buf =l loadl %p16\n    %slots =l add %buf, %cap\n    %mask =l sub %cap, 1\n")
+  qbe_vmap_emit_hash(sb, kfields, kregs, "go")
+  sb.write_string("    %idx_sl =l alloc8 8\n    %i0 =l and %hfin_go, %mask\n    storel %i0, %idx_sl\n    jmp @probe\n@probe\n")
+  sb.write_string("    %idx =l loadl %idx_sl\n    %cp =l add %buf, %idx\n    %c =w loadub %cp\n    jnz %c, @chk, @miss\n@chk\n")
+  sb.write_string("    %teq =w ceqw %c, %tag_go\n    jnz %teq, @cmp, @next\n@cmp\n")
+  qbe_vmap_idx_mul(sb, "%soff", "%idx", lay.slot_bytes)
+  sb.write_string("    %sp =l add %slots, %soff\n")
+  qbe_vmap_emit_key_cmp(sb, lay, "%sp", kregs, "@hit", "@next", "go")
+  sb.write_string("@next\n    %n1 =l add %idx, 1\n    %n2 =l and %n1, %mask\n    storel %n2, %idx_sl\n    jmp @probe\n@hit\n")
+  sb.write_string("    %vp =l add %sp, " + lay.v_off.to_string() + "\n")
+  qbe_vmap_emit_load_field(sb, "%vv", "%vp", vty, "gov")
+  sb.write_string("    ret %vv\n@miss\n    ret %def\n}\n\n")
+  g.extra_fns.push(sb.to_string())
+  m
 }
 
 ///|
@@ -10794,6 +10877,7 @@ fn qbe_emit_inline_closure_call(
   g.w_to_l_ext = Map([])
   g.local_w_to_l_ext = Map([])
   g.unfrozen_local_arrs = Map([])
+  g.stack_view_slots = Map([])
   g.movable_locals = Map([])
   g.moved_slots = Map([])
   g.inline_closures = Map([])
@@ -11031,6 +11115,7 @@ fn qbe_emit_inline_closure_flat_struct_lit(
   g.w_to_l_ext = Map([])
   g.local_w_to_l_ext = Map([])
   g.unfrozen_local_arrs = Map([])
+  g.stack_view_slots = Map([])
   g.movable_locals = Map([])
   g.moved_slots = Map([])
 
@@ -11170,6 +11255,7 @@ fn qbe_try_inline_fn_call(
         let inl_w2l = g.w_to_l_ext
         let inl_lw2l = g.local_w_to_l_ext
         let inl_unfrozen = g.unfrozen_local_arrs
+        let inl_stk_views = g.stack_view_slots
         let inl_mov = g.movable_locals
         let inl_moved = g.moved_slots
         let inl_clos = g.inline_closures
@@ -11210,6 +11296,7 @@ fn qbe_try_inline_fn_call(
         g.w_to_l_ext = Map([])
         g.local_w_to_l_ext = Map([])
         g.unfrozen_local_arrs = Map([])
+        g.stack_view_slots = Map([])
         g.movable_locals = Map([])
         g.moved_slots = Map([])
         g.inline_closures = Map([])
@@ -11302,6 +11389,7 @@ fn qbe_try_inline_fn_call(
         g.w_to_l_ext = inl_w2l
         g.local_w_to_l_ext = inl_lw2l
         g.unfrozen_local_arrs = inl_unfrozen
+        g.stack_view_slots = inl_stk_views
         g.movable_locals = inl_mov
         g.moved_slots = inl_moved
         g.inline_closures = inl_clos
@@ -11415,6 +11503,7 @@ fn qbe_try_inline_xpkg_fn_call(
   let inl_w2l = g.w_to_l_ext
   let inl_lw2l = g.local_w_to_l_ext
   let inl_unfrozen = g.unfrozen_local_arrs
+  let inl_stk_views = g.stack_view_slots
   let inl_mov = g.movable_locals
   let inl_moved = g.moved_slots
   let inl_clos = g.inline_closures
@@ -11455,6 +11544,7 @@ fn qbe_try_inline_xpkg_fn_call(
   g.w_to_l_ext = Map([])
   g.local_w_to_l_ext = Map([])
   g.unfrozen_local_arrs = Map([])
+  g.stack_view_slots = Map([])
   g.movable_locals = Map([])
   g.moved_slots = Map([])
   g.inline_closures = Map([])
@@ -11547,6 +11637,7 @@ fn qbe_try_inline_xpkg_fn_call(
   g.w_to_l_ext = inl_w2l
   g.local_w_to_l_ext = inl_lw2l
   g.unfrozen_local_arrs = inl_unfrozen
+  g.stack_view_slots = inl_stk_views
   g.movable_locals = inl_mov
   g.moved_slots = inl_moved
   g.inline_closures = inl_clos
@@ -12220,6 +12311,7 @@ fn qbe_inline_body_into_pod_buf(
   let inl_w2l = g.w_to_l_ext
   let inl_lw2l = g.local_w_to_l_ext
   let inl_unfrozen = g.unfrozen_local_arrs
+  let inl_stk_views = g.stack_view_slots
   let inl_mov = g.movable_locals
   let inl_moved = g.moved_slots
   let inl_clos = g.inline_closures
@@ -12260,6 +12352,7 @@ fn qbe_inline_body_into_pod_buf(
   g.w_to_l_ext = Map([])
   g.local_w_to_l_ext = Map([])
   g.unfrozen_local_arrs = Map([])
+  g.stack_view_slots = Map([])
   g.movable_locals = Map([])
   g.moved_slots = Map([])
   g.inline_closures = Map([])
@@ -12337,6 +12430,7 @@ fn qbe_inline_body_into_pod_buf(
   g.w_to_l_ext = inl_w2l
   g.local_w_to_l_ext = inl_lw2l
   g.unfrozen_local_arrs = inl_unfrozen
+  g.stack_view_slots = inl_stk_views
   g.movable_locals = inl_mov
   g.moved_slots = inl_moved
   g.inline_closures = inl_clos
@@ -13777,6 +13871,7 @@ fn qbe_inline_body_into_opt_res_slots(
   let inl_w2l = g.w_to_l_ext
   let inl_lw2l = g.local_w_to_l_ext
   let inl_unfrozen = g.unfrozen_local_arrs
+  let inl_stk_views = g.stack_view_slots
   let inl_mov = g.movable_locals
   let inl_moved = g.moved_slots
   let inl_clos = g.inline_closures
@@ -13817,6 +13912,7 @@ fn qbe_inline_body_into_opt_res_slots(
   g.w_to_l_ext = Map([])
   g.local_w_to_l_ext = Map([])
   g.unfrozen_local_arrs = Map([])
+  g.stack_view_slots = Map([])
   g.movable_locals = Map([])
   g.moved_slots = Map([])
   g.inline_closures = Map([])
@@ -13910,6 +14006,7 @@ fn qbe_inline_body_into_opt_res_slots(
   g.w_to_l_ext = inl_w2l
   g.local_w_to_l_ext = inl_lw2l
   g.unfrozen_local_arrs = inl_unfrozen
+  g.stack_view_slots = inl_stk_views
   g.movable_locals = inl_mov
   g.moved_slots = inl_moved
   g.inline_closures = inl_clos
@@ -14689,6 +14786,51 @@ fn qbe_try_emit_scalar_opt_res_method(
                 }
                 return Some(qval(r, TBool))
               }
+              let def_is_pure = match args[0] {
+                EInt(_, _)
+                | EInt64(_, _)
+                | EUInt(_, _)
+                | EUInt64(_, _)
+                | EDouble(_, _)
+                | EFloat(_, _)
+                | EBool(_, _)
+                | EByte(_, _)
+                | EChar(_, _)
+                | EIdent(_, _) => true
+                EUnary("-", inner, _) =>
+                  match inner {
+                    EInt(_, _) | EInt64(_, _) | EDouble(_, _) | EFloat(_, _) => true
+                    _ => false
+                  }
+                _ => false
+              }
+              if !qbe_is_obj_ty(vty) && def_is_pure {
+                let _ = qbe_ensure_vmap_get_or_fn(g, kty, vty)
+                let dv = qbe_emit_expr(g, args[0], Some(vty))
+                let dc = qbe_coerce_val(g, dv, vty)
+                let vabi = qbe_abi_ty(vty)
+                let res = qbe_tmp(g)
+                qbe_emit(
+                  g,
+                  res +
+                  " =" +
+                  vabi +
+                  " call $pion_vmap_get_or_" +
+                  m +
+                  "(l " +
+                  obj_av.qv.reg +
+                  kstr +
+                  ", " +
+                  vabi +
+                  " " +
+                  dc +
+                  ")",
+                )
+                if !obj_av.borrowed {
+                  qbe_emit(g, "call $pion_rc_dec(l " + obj_av.qv.reg + ")")
+                }
+                return Some(qval(res, vty))
+              }
               let out_slot = qbe_alloc_slot(g)
               let hw = qbe_tmp(g)
               qbe_emit(
@@ -15226,6 +15368,7 @@ fn qbe_new_for_target_name(
     global_min_len_arrs: Map([]),
     freeze_fn_seen: Map([]),
     vmap_seen: Map([]),
+    vmap_get_or_seen: Map([]),
     eq_fn_seen: Map([]),
     strings: [],
     string_ids: Map([]),
@@ -15298,6 +15441,7 @@ fn qbe_new_for_target_name(
     w_to_l_ext: Map([]),
     local_w_to_l_ext: Map([]),
     unfrozen_local_arrs: Map([]),
+    stack_view_slots: Map([]),
     pod_borrow_cache: Map([]),
     assign_idx_arr: "",
     assign_idx_key: "",
@@ -15642,6 +15786,7 @@ fn qbe_scope_pop(g : QbeGen) -> Unit {
     let mut zi = 0
     while zi < sc.locals.length() {
       g.zeroed_slots.remove(sc.locals[zi].slot)
+      g.stack_view_slots.remove(sc.locals[zi].slot)
       g.unfrozen_local_arrs.remove(sc.locals[zi].name)
       g.u8_range_vars.remove(sc.locals[zi].name)
       g.known_min_len_arrs.remove(sc.locals[zi].name)
@@ -18507,7 +18652,29 @@ fn qbe_ident_is_view_consumer_stmt(
     SReturn(opt, _) =>
       match opt {
         None => true
-        Some(e) => qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, depth)
+        Some(e) => {
+          if depth == 0 {
+            match e {
+              EIdent(n, _) => if n == name { return true }
+              ECall(EIdent(cn, _), cargs, _) =>
+                if (cn == "Some" || cn == "Ok") && cargs.length() == 1 {
+                  match cargs[0] {
+                    EIdent(n, _) => if n == name { return true }
+                    _ => ()
+                  }
+                }
+              EDotVariant(vn, vargs, _) =>
+                if (vn == "Some" || vn == "Ok") && vargs.length() == 1 {
+                  match vargs[0] {
+                    EIdent(n, _) => if n == name { return true }
+                    _ => ()
+                  }
+                }
+              _ => ()
+            }
+          }
+          qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, depth)
+        }
       }
     SExpr(e, _) =>
       qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, depth)
@@ -19192,11 +19359,19 @@ fn qbe_ensure_view_eq_bytes_fn(g : QbeGen) -> String {
     return fn_sym
   }
   g.eq_fn_seen.set(fn_sym, true)
-  g.extra_fns.push(
-    "function w " +
-    fn_sym +
-    "(l %p1, l %p2, l %n) {\n@start\n    %i_slot =l alloc8 8\n    %is0 =w ceql %n, 0\n    jnz %is0, @ret1, @chk_same\n@chk_same\n    %same =w ceql %p1, %p2\n    jnz %same, @ret1, @init\n@init\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %done =w cugel %i, %n\n    jnz %done, @ret1, @body\n@body\n    %a1 =l add %p1, %i\n    %a2 =l add %p2, %i\n    %b1 =w loadub %a1\n    %b2 =w loadub %a2\n    %eq =w ceqw %b1, %b2\n    jnz %eq, @next, @ret0\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@ret1\n    ret 1\n@ret0\n    ret 0\n}\n\n",
-  )
+  if !g.target_wasm {
+    g.extra_fns.push(
+      "function w " +
+      fn_sym +
+      "(l %p1, l %p2, l %n) {\n@start\n    %is0 =w ceql %n, 0\n    jnz %is0, @ret1, @chk_same\n@chk_same\n    %same =w ceql %p1, %p2\n    jnz %same, @ret1, @do_cmp\n@do_cmp\n    %mc =w call $memcmp(l %p1, l %p2, l %n)\n    %eq =w ceqw %mc, 0\n    ret %eq\n@ret1\n    ret 1\n}\n\n",
+    )
+  } else {
+    g.extra_fns.push(
+      "function w " +
+      fn_sym +
+      "(l %p1, l %p2, l %n) {\n@start\n    %i_slot =l alloc8 8\n    %is0 =w ceql %n, 0\n    jnz %is0, @ret1, @chk_same\n@chk_same\n    %same =w ceql %p1, %p2\n    jnz %same, @ret1, @init\n@init\n    storel 0, %i_slot\n    jmp @loop\n@loop\n    %i =l loadl %i_slot\n    %done =w cugel %i, %n\n    jnz %done, @ret1, @body\n@body\n    %a1 =l add %p1, %i\n    %a2 =l add %p2, %i\n    %b1 =w loadub %a1\n    %b2 =w loadub %a2\n    %eq =w ceqw %b1, %b2\n    jnz %eq, @next, @ret0\n@next\n    %ni =l add %i, 1\n    storel %ni, %i_slot\n    jmp @loop\n@ret1\n    ret 1\n@ret0\n    ret 0\n}\n\n",
+    )
+  }
   fn_sym
 }
 
@@ -19237,6 +19412,23 @@ fn qbe_emit_view_alloc(
   qbe_emit(g, l_off + " =l add " + v + ", 16")
   qbe_emit(g, "storel " + len_reg + ", " + l_off)
   v
+}
+
+///|
+/// P81 (P77-C): On-demand heap materialization of a stack-allocated StrView/BytesView
+/// on a cold escaping return edge (`return v` / `return Some(v)` / `return Ok(v)`).
+fn qbe_emit_view_materialize(g : QbeGen, stk_reg : String) -> String {
+  let owner = qbe_tmp(g)
+  let pp = qbe_tmp(g)
+  let ptr = qbe_tmp(g)
+  let lp = qbe_tmp(g)
+  let len = qbe_tmp(g)
+  qbe_emit(g, owner + " =l loadl " + stk_reg)
+  qbe_emit(g, pp + " =l add " + stk_reg + ", 8")
+  qbe_emit(g, ptr + " =l loadl " + pp)
+  qbe_emit(g, lp + " =l add " + stk_reg + ", 16")
+  qbe_emit(g, len + " =l loadl " + lp)
+  qbe_emit_view_alloc(g, owner, ptr, len)
 }
 
 ///|
@@ -19799,6 +19991,7 @@ fn qbe_try_emit_stack_view_let(
   let stk = qbe_emit_stack_view_expr(g, init)
   qbe_clear_shadowed_local_meta(g, bname)
   let loc = qbe_define_local(g, bname, view_ty, false)
+  g.stack_view_slots.set(loc.slot, true)
   qbe_emit(g, "storel " + stk + ", " + loc.slot)
   root_name
 }
@@ -23898,51 +24091,90 @@ fn qbe_emit_method_call(
         let bmask = qbe_tmp(g)
         qbe_emit(g, bw + " =w copy " + bv.reg)
         qbe_emit(g, bmask + " =w and " + bw + ", 255")
-        let pp = qbe_tmp(g)
-        let vp = qbe_tmp(g)
-        let lp = qbe_tmp(g)
-        let vl = qbe_tmp(g)
-        qbe_emit(g, pp + " =l add " + obj_val + ", 8")
-        qbe_emit(g, vp + " =l loadl " + pp)
-        qbe_emit(g, lp + " =l add " + obj_val + ", 16")
-        qbe_emit(g, vl + " =l loadl " + lp)
-        let i_slot = qbe_alloc_slot(g)
-        qbe_emit(g, "storel 0, " + i_slot)
-        let l_loop = qbe_lbl(g, "svib_loop")
-        let l_body = qbe_lbl(g, "svib_body")
-        let l_next = qbe_lbl(g, "svib_next")
-        let l_hit = qbe_lbl(g, "svib_hit")
-        let l_miss = qbe_lbl(g, "svib_miss")
-        let l_end = qbe_lbl(g, "svib_end")
-        qbe_emit_term(g, "jmp " + l_loop)
-        qbe_emit_lbl(g, l_loop)
-        let ii = qbe_tmp(g)
-        let done = qbe_tmp(g)
-        qbe_emit(g, ii + " =l loadl " + i_slot)
-        qbe_emit(g, done + " =w cugel " + ii + ", " + vl)
-        qbe_emit_term(g, "jnz " + done + ", " + l_miss + ", " + l_body)
-        qbe_emit_lbl(g, l_body)
-        let ap = qbe_tmp(g)
-        let ch = qbe_tmp(g)
-        let eq = qbe_tmp(g)
-        qbe_emit(g, ap + " =l add " + vp + ", " + ii)
-        qbe_emit(g, ch + " =w loadub " + ap)
-        qbe_emit(g, eq + " =w ceqw " + ch + ", " + bmask)
-        qbe_emit_term(g, "jnz " + eq + ", " + l_hit + ", " + l_next)
-        qbe_emit_lbl(g, l_next)
-        let ni = qbe_tmp(g)
-        qbe_emit(g, ni + " =l add " + ii + ", 1")
-        qbe_emit(g, "storel " + ni + ", " + i_slot)
-        qbe_emit_term(g, "jmp " + l_loop)
-        qbe_emit_lbl(g, l_hit)
-        let hit_w = qbe_tmp(g)
-        qbe_emit(g, hit_w + " =w copy " + ii)
-        qbe_emit_term(g, "jmp " + l_end)
-        qbe_emit_lbl(g, l_miss)
-        qbe_emit_term(g, "jmp " + l_end)
-        qbe_emit_lbl(g, l_end)
-        let res_w = qbe_tmp(g)
-        qbe_emit(g, res_w + " =w phi " + l_hit + " " + hit_w + ", " + l_miss + " -1")
+        let vp = match g.hoisted_str_dp.get(obj_local_name) {
+          Some(hd) => hd
+          None => {
+            let pp = qbe_tmp(g)
+            let t = qbe_tmp(g)
+            qbe_emit(g, pp + " =l add " + obj_val + ", 8")
+            qbe_emit(g, t + " =l loadl " + pp)
+            t
+          }
+        }
+        let vl = match g.hoisted_str_len.get(obj_local_name) {
+          Some(hl) => hl
+          None => {
+            let lp = qbe_tmp(g)
+            let t = qbe_tmp(g)
+            qbe_emit(g, lp + " =l add " + obj_val + ", 16")
+            qbe_emit(g, t + " =l loadl " + lp)
+            t
+          }
+        }
+        let res_w = if !g.target_wasm {
+          let is0 = qbe_tmp(g)
+          let l_call = qbe_lbl(g, "svmc_call")
+          let l_hit = qbe_lbl(g, "svmc_hit")
+          let l_miss = qbe_lbl(g, "svmc_miss")
+          let l_end = qbe_lbl(g, "svmc_end")
+          qbe_emit(g, is0 + " =w ceql " + vl + ", 0")
+          qbe_emit_term(g, "jnz " + is0 + ", " + l_miss + ", " + l_call)
+          qbe_emit_lbl(g, l_call)
+          let hit_p = qbe_tmp(g)
+          qbe_emit(g, hit_p + " =l call $memchr(l " + vp + ", w " + bmask + ", l " + vl + ")")
+          qbe_emit_term(g, "jnz " + hit_p + ", " + l_hit + ", " + l_miss)
+          qbe_emit_lbl(g, l_hit)
+          let diff = qbe_tmp(g)
+          let hit_w = qbe_tmp(g)
+          qbe_emit(g, diff + " =l sub " + hit_p + ", " + vp)
+          qbe_emit(g, hit_w + " =w copy " + diff)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_miss)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_end)
+          let rw = qbe_tmp(g)
+          qbe_emit(g, rw + " =w phi " + l_hit + " " + hit_w + ", " + l_miss + " -1")
+          rw
+        } else {
+          let i_slot = qbe_alloc_slot(g)
+          qbe_emit(g, "storel 0, " + i_slot)
+          let l_loop = qbe_lbl(g, "svib_loop")
+          let l_body = qbe_lbl(g, "svib_body")
+          let l_next = qbe_lbl(g, "svib_next")
+          let l_hit = qbe_lbl(g, "svib_hit")
+          let l_miss = qbe_lbl(g, "svib_miss")
+          let l_end = qbe_lbl(g, "svib_end")
+          qbe_emit_term(g, "jmp " + l_loop)
+          qbe_emit_lbl(g, l_loop)
+          let ii = qbe_tmp(g)
+          let done = qbe_tmp(g)
+          qbe_emit(g, ii + " =l loadl " + i_slot)
+          qbe_emit(g, done + " =w cugel " + ii + ", " + vl)
+          qbe_emit_term(g, "jnz " + done + ", " + l_miss + ", " + l_body)
+          qbe_emit_lbl(g, l_body)
+          let ap = qbe_tmp(g)
+          let ch = qbe_tmp(g)
+          let eq = qbe_tmp(g)
+          qbe_emit(g, ap + " =l add " + vp + ", " + ii)
+          qbe_emit(g, ch + " =w loadub " + ap)
+          qbe_emit(g, eq + " =w ceqw " + ch + ", " + bmask)
+          qbe_emit_term(g, "jnz " + eq + ", " + l_hit + ", " + l_next)
+          qbe_emit_lbl(g, l_next)
+          let ni = qbe_tmp(g)
+          qbe_emit(g, ni + " =l add " + ii + ", 1")
+          qbe_emit(g, "storel " + ni + ", " + i_slot)
+          qbe_emit_term(g, "jmp " + l_loop)
+          qbe_emit_lbl(g, l_hit)
+          let hit_w = qbe_tmp(g)
+          qbe_emit(g, hit_w + " =w copy " + ii)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_miss)
+          qbe_emit_term(g, "jmp " + l_end)
+          qbe_emit_lbl(g, l_end)
+          let rw = qbe_tmp(g)
+          qbe_emit(g, rw + " =w phi " + l_hit + " " + hit_w + ", " + l_miss + " -1")
+          rw
+        }
         if !obj_borrowed {
           qbe_emit(g, "call $pion_rc_dec(l " + obj_val + ")")
         }
@@ -29054,6 +29286,11 @@ fn qbe_emit_expr_inner(
             let t = qbe_load_heap_slot(g, cell_p, loc.ty)
             qbe_rc_inc(g, t, loc.ty)
             return qval(t, loc.ty)
+          }
+          if g.stack_view_slots.contains(loc.slot) {
+            let stk = qbe_load_local_slot(g, loc.slot, loc.ty)
+            let hv = qbe_emit_view_materialize(g, stk)
+            return qval(hv, loc.ty)
           }
           let moved = if loc.owned && qbe_is_early_drop_ty(loc.ty) {
             match g.movable_locals.get(name) {
