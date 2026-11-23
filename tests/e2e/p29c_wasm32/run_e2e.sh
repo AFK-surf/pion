@@ -5344,4 +5344,149 @@ await runAndCheck(bYes1, "names");
 console.log("  p65a_wasm_names: OK (nonames=" + bNo1.length + "B, names=" + bYes1.length + "B, entries=" + fnNames.length + "/" + totalFuncs + ", leaked=0)");
 ' "$P65A_NONAMES_1" "$P65A_NAMES_1" "$P65A_NONAMES_2" "$P65A_NAMES_2" "$PION_WASM_RT"
 
+echo "=== P66-A: Array with_capacity(>480B) rawAlloc + Map Hint Single-Branch Fast-Path ==="
+cat > "$TMP_DIR/p66a_regression.pion" <<'EOF'
+struct Point {
+  x : Double
+  y : Double
+}
+
+fn test_large_arrays() -> Int64 {
+  // > 480 B capacity forces JS pion_arr_new path (rawAlloc without zero-fill)
+  let ai : Array[Int] = Array::with_capacity(2000)
+  let as_ : Array[String] = Array::with_capacity(2000)
+  let ap : Array[Point] = Array::with_capacity(2000)
+  let mut i = 0
+  while i < 2000 {
+    ai.push(i * 3 + 1)
+    as_.push("s" + i.to_string())
+    ap.push(Point::{ x: i.to_double() * 0.5, y: i.to_double() * 1.5 })
+    i = i + 1
+  }
+  let mut sum : Int64 = 0L
+  i = 0
+  while i < 2000 {
+    sum = sum + ai[i].to_int64() + as_[i].length().to_int64() + (ap[i].x + ap[i].y).to_int().to_int64()
+    i = i + 1
+  }
+  sum
+}
+
+fn run_map_hint_round(ms : Map[String, Int64], mo : Map[String, String], r : Int) -> Int64 {
+  let mut acc : Int64 = 0L
+  let mut i = 0
+  while i < 128 {
+    let k = "key_" + i.to_string()
+    // get populates map_hint; immediate set hits map_hint fast path
+    let cur = match ms.get(k) { Some(v) => v; None => 0L }
+    ms.set(k, cur + 10L)
+    let old_s = match mo.get(k) { Some(s) => s; None => "" }
+    mo.set(k, "v" + r.to_string() + "_" + i.to_string())
+    acc = acc + cur + old_s.length().to_int64()
+    i = i + 1
+  }
+  acc
+}
+
+fn test_map_hint_paths() -> Int64 {
+  // Scalar value Map (val_is_obj == 0) + Object value Map (val_is_obj == 1)
+  let ms : Map[String, Int64] = Map([])
+  let mo : Map[String, String] = Map([])
+  let mut i = 0
+  while i < 128 {
+    let k = "key_" + i.to_string()
+    ms.set(k, i.to_int64())
+    mo.set(k, "val_" + i.to_string())
+    i = i + 1
+  }
+  let mut acc : Int64 = 0L
+  acc = acc + run_map_hint_round(ms, mo, 0)
+  acc = acc + run_map_hint_round(ms, mo, 1)
+  acc = acc + run_map_hint_round(ms, mo, 2)
+  acc = acc + run_map_hint_round(ms, mo, 3)
+  i = 0
+  while i < 128 {
+    let k = "key_" + i.to_string()
+    acc = acc + match ms.get(k) { Some(v) => v; None => 0L }
+    acc = acc + match mo.get(k) { Some(s) => s.length().to_int64(); None => 0L }
+    i = i + 1
+  }
+  acc
+}
+
+pub fn main(world : World) -> Int {
+  let arr_sum = test_large_arrays()
+  let map_sum = test_map_hint_paths()
+  io_println(world, arr_sum.to_string() + ":" + map_sum.to_string())
+  0
+}
+EOF
+P66A_WASM="$TMP_DIR/p66a_regression.wasm"
+"$PIONC" build --release --target wasm32 -o "$P66A_WASM" "$TMP_DIR/p66a_regression.pion"
+for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
+node --input-type=module -e '
+import fs from "node:fs";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
+
+const [wasmPath, rtPath] = process.argv.slice(1);
+const rtLabel = path.basename(rtPath);
+const { createPionRuntime } = await import(pathToFileURL(rtPath).href);
+const bytes = fs.readFileSync(wasmPath);
+if (!WebAssembly.validate(bytes)) {
+  console.error("FAIL (" + rtLabel + "): p66a_regression.wasm failed WebAssembly.validate()");
+  process.exit(1);
+}
+const lines = [];
+const rt = createPionRuntime({
+  print: (s) => lines.push(s),
+  println: (s) => lines.push(s + "\n"),
+});
+const { instance } = await WebAssembly.instantiate(bytes, rt.imports);
+rt.bindExports(instance.exports);
+const rc = instance.exports.main(0, 0n);
+const out = lines.join("").trim();
+if ((rc | 0) !== 0 || out.split(":").length !== 2) {
+  console.error("FAIL (" + rtLabel + "): p66a unexpected output rc=" + rc + " out=" + JSON.stringify(out));
+  process.exit(1);
+}
+const [arrSum, mapSum] = out.split(":");
+// arrSum: sum_{i=0..1999} (3i+1 + len("s"+i) + 2i) = 10005890
+if (arrSum !== "10005890") {
+  console.error("FAIL (" + rtLabel + "): p66a arrSum mismatch: expected 10005890, got " + arrSum);
+  process.exit(1);
+}
+// mapSum: 5 * sum(0..127) + (0+10+20+30+40)*128 + len_sum
+// sum(0..127)=8128; 5*8128 + 100*128 = 40640 + 12800 = 53440
+// old_s lengths: r=0 ("val_i": 10*5+90*6+28*7=786), r=1..3 + final (4 * "vR_i": 4*(10*4+90*5+28*6)=4*658=2632) => 53440+786+2632 = 56858
+if (mapSum !== "56858") {
+  console.error("FAIL (" + rtLabel + "): p66a mapSum mismatch: expected 56858, got " + mapSum);
+  process.exit(1);
+}
+const dv = new DataView(instance.exports.memory.buffer);
+const ctl = instance.exports.__pion_slab_ctl.value >>> 0;
+const hp = dv.getUint32(ctl + 36, true);
+const hb = dv.getUint32(ctl + 44, true);
+let cur = hb, leaked = 0;
+while (cur + 8 <= hp) {
+  const sz = dv.getUint32(cur, true);
+  const magic = dv.getUint32(cur + 4, true);
+  if (sz < 16 || cur + sz > hp) {
+    console.error("FAIL (" + rtLabel + "): p66a corrupt heap block at", cur, "sz=", sz);
+    process.exit(1);
+  }
+  if (magic === 0x50494f4e) {
+    const flags = cur + 24 <= hp ? dv.getUint16(cur + 22, true) : 0;
+    if ((flags & 2) === 0) leaked++;
+  }
+  cur += sz;
+}
+if (leaked !== 0) {
+  console.error("FAIL (" + rtLabel + "): p66a leaked=" + leaked);
+  process.exit(1);
+}
+console.log("  p66a (" + rtLabel + "): out=" + out + " leaked=0 OK");
+' "$P66A_WASM" "$rt_path"
+done
+
 echo "p29c_wasm32 E2E: OK"

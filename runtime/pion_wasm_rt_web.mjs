@@ -461,7 +461,7 @@ export function createPionRuntime(opts = {}) {
     const c = Math.max(Number(cap), 0), f = flags | 0;
     const isObj = f > 2 ? (f >>> 8) : (f === 1 ? 1 : 0), st = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0), esz = st || 8;
     const o = pion_alloc_uninit(32, TAG_ARRAY, 0n);
-    const dp = c ? rawZero(c * esz) : 0, p = pNum(o); sync();
+    const dp = c ? rawAlloc(c * esz) : 0, p = pNum(o); sync();
     s64(p, 0); s64(p + 8, c); s32(p + 16, isObj); s32(p + 20, st); s64(p + 24, pBig(dp)); return o;
   }
   const pion_arr_len = (a) => { sync(); return g64(pNum(a)); };

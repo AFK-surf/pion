@@ -1117,7 +1117,7 @@ export function createPionRuntime(options = {}) {
     const elemStride = f === 2 ? 1 : (f > 2 ? (f & 0xFF) : 0);
     const esz = elemStride || 8;
     const obj = pion_alloc_uninit(32, TAG_ARRAY, 0n);
-    const dp = c > 0 ? rawAllocZero(c * esz) : 0;
+    const dp = c > 0 ? rawAlloc(c * esz) : 0;
     const p = pNum(obj);
     syncViews();
     dv.setBigInt64(p + 0, 0n, true);
