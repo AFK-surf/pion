@@ -11,6 +11,9 @@ pub struct Parser {
   diagnostics : Array[Diagnostic]
   jsx_parent_stack : Array[String]
   mut jsx_next_id : Int
+  mut in_match_guard : Bool
+  mut pending_gt : Bool
+  mut pending_gt_span : Span
 }
 
 ///|
@@ -21,6 +24,9 @@ fn parser_new(tokens : Array[Token], diags : Array[Diagnostic]) -> Parser {
     diagnostics: diags,
     jsx_parent_stack: [],
     jsx_next_id: 0,
+    in_match_guard: false,
+    pending_gt: false,
+    pending_gt_span: span_empty(),
   }
 }
 
@@ -70,6 +76,26 @@ fn p_err(
   fixit : String,
 ) -> Unit {
   p.diagnostics.push(diag_new(span, "E_PARSE", msg, expected, found, fixit))
+}
+
+///|
+fn p_err_code(
+  p : Parser,
+  span : Span,
+  code : String,
+  msg : String,
+  expected : String,
+  found : String,
+  fixit : String,
+) -> Unit {
+  p.diagnostics.push(diag_new(span, code, msg, expected, found, fixit))
+}
+
+///|
+fn p_add_edit(p : Parser, edit : TextEdit) -> Unit {
+  if p.diagnostics.length() > 0 && edit.line > 0 && edit.col > 0 {
+    p.diagnostics[p.diagnostics.length() - 1].edits.push(edit)
+  }
 }
 
 ///|
@@ -328,9 +354,152 @@ fn p_expect_rparen(p : Parser) -> Unit {
 }
 
 ///|
+fn p_match_angle_close(p : Parser) -> Option[Span] {
+  if p.pending_gt {
+    p.pending_gt = false
+    return Some(p.pending_gt_span)
+  }
+  match p_peek(p).kind {
+    Gt => Some(p_advance(p).span)
+    GtGt => {
+      let sp = p_advance(p).span
+      p.pending_gt = true
+      p.pending_gt_span = span_new(sp.file, sp.line, sp.col + 1)
+      Some(sp)
+    }
+    _ => None
+  }
+}
+
+///|
+fn p_looks_like_angle_type_args(p : Parser) -> Bool {
+  let lt_tok = p_peek(p)
+  if lt_tok.newline_before {
+    return false
+  }
+  match lt_tok.kind {
+    Lt => ()
+    _ => return false
+  }
+  // Require the first token inside `<...>` to be a type-like start (uppercase
+  // ident, pkg::Type, or `(`) so `x as Int < y` never triggers a false positive.
+  let first = p_peek_at(p, 1)
+  if first.newline_before {
+    return false
+  }
+  let valid_first = match first.kind {
+    Ident(s) =>
+      if is_upper_start(s) {
+        true
+      } else {
+        match p_peek_at(p, 2).kind {
+          ColonColon => true
+          _ => false
+        }
+      }
+    LParen => true
+    _ => false
+  }
+  if !valid_first {
+    return false
+  }
+  let mut off = 1
+  let mut depth = 1
+  let mut saw_token = false
+  while depth > 0 && off < 64 {
+    let t = p_peek_at(p, off)
+    if t.newline_before {
+      return false
+    }
+    match t.kind {
+      Lt => {
+        depth = depth + 1
+        if depth > 8 {
+          return false
+        }
+      }
+      Gt => depth = depth - 1
+      GtGt => {
+        if depth >= 2 {
+          depth = depth - 2
+        } else {
+          depth = 0
+        }
+      }
+      Ident(_) | ColonColon | Comma | LBracket | RBracket | LParen | RParen | Arrow =>
+        saw_token = true
+      _ => return false
+    }
+    off = off + 1
+  }
+  depth == 0 && saw_token
+}
+
+///|
 fn p_parse_type_params(p : Parser) -> Array[String] {
   let params : Array[String] = []
   if !p_match_kind_lbracket(p) {
+    match p_peek(p).kind {
+      Lt => {
+        let lt_sp = p_advance(p).span
+        let mut gt_sp = span_empty()
+        while !p_is_eof(p) {
+          match p_peek(p).kind {
+            Gt => {
+              gt_sp = p_advance(p).span
+              break
+            }
+            _ => {
+              let name = p_expect_ident(p, "type parameter")
+              params.push(name)
+              if !p_match_kind_comma(p) {
+                match p_peek(p).kind {
+                  Gt => gt_sp = p_advance(p).span
+                  _ => ()
+                }
+                break
+              }
+            }
+          }
+        }
+        p_err_code(
+          p,
+          lt_sp,
+          "E_HABIT_ANGLE_GENERICS",
+          "Pion uses square brackets `[T]` for generic type parameters, not angle brackets `<T>`",
+          "`[T]`",
+          "`<...>`",
+          "replace `<...>` with `[...]`",
+        )
+        if gt_sp.line > 0 && lt_sp.line == gt_sp.line {
+          p_add_edit(
+            p,
+            text_edit_replace(
+              lt_sp.file,
+              lt_sp.line,
+              lt_sp.col,
+              lt_sp.line,
+              lt_sp.col + 1,
+              "[",
+              "machine",
+            ),
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              gt_sp.file,
+              gt_sp.line,
+              gt_sp.col,
+              gt_sp.line,
+              gt_sp.col + 1,
+              "]",
+              "machine",
+            ),
+          )
+        }
+      }
+      _ => ()
+    }
     return params
   }
   while !p_is_eof(p) {
@@ -442,8 +611,90 @@ fn p_parse_type_expr(p : Parser) -> TypeExpr {
             }
           }
         }
+      } else if p_looks_like_angle_type_args(p) {
+        let lt_sp = p_advance(p).span
+        let mut gt_sp = span_empty()
+        while !p_is_eof(p) {
+          match p_match_angle_close(p) {
+            Some(sp) => {
+              gt_sp = sp
+              break
+            }
+            None => {
+              args.push(p_parse_type_expr(p))
+              if !p_match_kind_comma(p) {
+                match p_match_angle_close(p) {
+                  Some(sp) => gt_sp = sp
+                  None => ()
+                }
+                break
+              }
+            }
+          }
+        }
+        p_err_code(
+          p,
+          lt_sp,
+          "E_HABIT_ANGLE_GENERICS",
+          "Pion uses square brackets `" +
+          full_name +
+          "[...]` for generic type arguments, not angle brackets `<...>`",
+          "`" + full_name + "[...]`",
+          "`" + full_name + "<...>`",
+          "replace `<...>` with `[...]`",
+        )
+        if gt_sp.line > 0 && lt_sp.line == gt_sp.line {
+          p_add_edit(
+            p,
+            text_edit_replace(
+              lt_sp.file,
+              lt_sp.line,
+              lt_sp.col,
+              lt_sp.line,
+              lt_sp.col + 1,
+              "[",
+              "machine",
+            ),
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              gt_sp.file,
+              gt_sp.line,
+              gt_sp.col,
+              gt_sp.line,
+              gt_sp.col + 1,
+              "]",
+              "machine",
+            ),
+          )
+        }
       }
       TyName(full_name, args, tok.span)
+    }
+    Amp => {
+      let _ = p_advance(p)
+      let is_mut = match p_peek(p).kind {
+        KwMut => {
+          let _ = p_advance(p)
+          true
+        }
+        _ => false
+      }
+      p_err_code(
+        p,
+        tok.span,
+        "E_HABIT_RUST_REF",
+        "Pion has no Rust-style reference types (`&T` / `&mut T`); pass values directly or use `mut param : T` for in-out parameters",
+        "type expression (or `mut param : T`)",
+        if is_mut { "`&mut`" } else { "`&`" },
+        if is_mut {
+          "remove `&mut` and mark the parameter `mut name : T` instead"
+        } else {
+          "remove `&`; Pion passes values without borrow references"
+        },
+      )
+      p_parse_type_expr(p)
     }
     _ => {
       p_err(
@@ -724,6 +975,87 @@ fn p_parse_fn_type_params(p : Parser) -> ParsedTypeParams {
   let names : Array[String] = []
   let bounds : Array[TypeBound] = []
   if !p_match_kind_lbracket(p) {
+    match p_peek(p).kind {
+      Lt => {
+        let lt_sp = p_advance(p).span
+        let mut gt_sp = span_empty()
+        while !p_is_eof(p) {
+          match p_peek(p).kind {
+            Gt => {
+              gt_sp = p_advance(p).span
+              break
+            }
+            _ => {
+              let name = p_expect_ident(p, "type parameter")
+              names.push(name)
+              if p_match_kind_colon(p) {
+                let trs : Array[String] = []
+                while !p_is_eof(p) {
+                  let mut tname = p_expect_ident(p, "trait bound")
+                  if p_match_kind_coloncolon(p) {
+                    let mem = p_expect_ident(p, "trait name after `::`")
+                    tname = tname + "::" + mem
+                  }
+                  trs.push(tname)
+                  match p_peek(p).kind {
+                    Plus => {
+                      let _ = p_advance(p)
+                    }
+                    _ => break
+                  }
+                }
+                if trs.length() > 0 {
+                  bounds.push(TypeBound::{ param: name, traits: trs })
+                }
+              }
+              if !p_match_kind_comma(p) {
+                match p_peek(p).kind {
+                  Gt => gt_sp = p_advance(p).span
+                  _ => ()
+                }
+                break
+              }
+            }
+          }
+        }
+        p_err_code(
+          p,
+          lt_sp,
+          "E_HABIT_ANGLE_GENERICS",
+          "Pion uses square brackets `[T]` for generic type parameters, not angle brackets `<T>`",
+          "`[T]`",
+          "`<...>`",
+          "replace `<...>` with `[...]`",
+        )
+        if gt_sp.line > 0 && lt_sp.line == gt_sp.line {
+          p_add_edit(
+            p,
+            text_edit_replace(
+              lt_sp.file,
+              lt_sp.line,
+              lt_sp.col,
+              lt_sp.line,
+              lt_sp.col + 1,
+              "[",
+              "machine",
+            ),
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              gt_sp.file,
+              gt_sp.line,
+              gt_sp.col,
+              gt_sp.line,
+              gt_sp.col + 1,
+              "]",
+              "machine",
+            ),
+          )
+        }
+      }
+      _ => ()
+    }
     return ParsedTypeParams::{ names: names, bounds: bounds }
   }
   while !p_is_eof(p) {
@@ -1436,6 +1768,78 @@ fn p_parse_stmt(p : Parser) -> Stmt {
       SDebugAssert(cond, msg, tok.span)
     }
     _ => {
+      match tok.kind {
+        Ident(kw) => {
+          let next1 = p_peek_at(p, 1)
+          let next1_is_ident = match next1.kind {
+            Ident(_) => !next1.newline_before
+            _ => false
+          }
+          if kw == "const" && next1_is_ident {
+            let _ = p_advance(p)
+            p_err_code(
+              p,
+              tok.span,
+              "E_HABIT_JS_CONST",
+              "Pion uses `let` (not `const`) for immutable bindings",
+              "`let`",
+              "`const`",
+              "replace `const` with `let`",
+            )
+            p_add_edit(
+              p,
+              text_edit_replace(
+                tok.span.file,
+                tok.span.line,
+                tok.span.col,
+                tok.span.line,
+                tok.span.col + 5,
+                "let",
+                "machine",
+              ),
+            )
+            let name = p_expect_ident(p, "variable name")
+            let vty = if p_match_kind_colon(p) {
+              p_parse_type_expr(p)
+            } else {
+              TyMissing(tok.span)
+            }
+            if !p_match_kind_eq(p) {
+              p_sync_stmt(p)
+              return SLet(name, false, vty, EUnit(tok.span), tok.span)
+            }
+            let init = p_parse_expr(p)
+            return SLet(name, false, vty, init, tok.span)
+          }
+          if kw == "function" && next1_is_ident {
+            let _ = p_advance(p)
+            p_err_code(
+              p,
+              tok.span,
+              "E_HABIT_JS_FUNCTION",
+              "Pion uses `fn` (not `function`) to declare functions",
+              "`fn`",
+              "`function`",
+              "replace `function` with `fn`",
+            )
+            p_add_edit(
+              p,
+              text_edit_replace(
+                tok.span.file,
+                tok.span.line,
+                tok.span.col,
+                tok.span.line,
+                tok.span.col + 8,
+                "fn",
+                "machine",
+              ),
+            )
+            p_sync_stmt(p)
+            return SExpr(EUnit(tok.span), tok.span)
+          }
+        }
+        _ => ()
+      }
       let lhs = p_parse_expr(p)
       if p_match_kind_eq(p) {
         let rhs = p_parse_expr(p)
@@ -1606,6 +2010,61 @@ fn p_parse_unary_expr(p : Parser) -> Expr {
       } else {
         let inner = p_parse_unary_expr(p)
         EMove(inner, tok.span)
+      }
+    }
+    Amp => {
+      let _ = p_advance(p)
+      match p_peek(p).kind {
+        KwMut => {
+          let _ = p_advance(p)
+          p_err_code(
+            p,
+            tok.span,
+            "E_HABIT_RUST_REF",
+            "Pion has no `&mut` borrow expression; pass in-out arguments as `mut x`",
+            "`mut <place>`",
+            "`&mut`",
+            "replace `&mut x` with `mut x`",
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              tok.span.file,
+              tok.span.line,
+              tok.span.col,
+              tok.span.line,
+              tok.span.col + 1,
+              "",
+              "machine",
+            ),
+          )
+          let inner = p_parse_unary_expr(p)
+          EMutArg(inner, tok.span)
+        }
+        _ => {
+          p_err_code(
+            p,
+            tok.span,
+            "E_HABIT_RUST_REF",
+            "Pion has no `&` borrow expression; pass values directly or use `mut x` for in-out parameters",
+            "plain expression or `mut <place>`",
+            "`&`",
+            "remove `&` (or write `mut x` for a `mut` parameter)",
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              tok.span.file,
+              tok.span.line,
+              tok.span.col,
+              tok.span.line,
+              tok.span.col + 1,
+              "",
+              "maybe",
+            ),
+          )
+          p_parse_unary_expr(p)
+        }
       }
     }
     _ => p_parse_postfix_expr(p)
@@ -2018,7 +2477,11 @@ fn p_parse_match_expr(p : Parser) -> Expr {
         let guard_expr : Option[Expr] = match p_peek(p).kind {
           KwIf => {
             let _ = p_advance(p)
-            Some(p_parse_expr(p))
+            let prev_guard = p.in_match_guard
+            p.in_match_guard = true
+            let ge = p_parse_expr(p)
+            p.in_match_guard = prev_guard
+            Some(ge)
           }
           _ => None
         }
@@ -2453,6 +2916,69 @@ fn p_parse_jsx_element(p : Parser, start_span : Span) -> Expr {
 }
 
 ///|
+fn p_looks_like_arrow_fn(p : Parser) -> Bool {
+  if p.in_match_guard {
+    return false
+  }
+  match p_peek(p).kind {
+    LParen => ()
+    _ => return false
+  }
+  let mut off = 1
+  let mut depth = 1
+  let mut brk = 0
+  while depth > 0 && off < 128 {
+    let t = p_peek_at(p, off)
+    match t.kind {
+      Eof => return false
+      LParen => depth = depth + 1
+      RParen => depth = depth - 1
+      LBracket => brk = brk + 1
+      RBracket => if brk > 0 { brk = brk - 1 }
+      Ident(_) | Colon | ColonColon | Comma | Arrow | KwMut => ()
+      _ =>
+        if depth == 1 && brk == 0 {
+          return false
+        }
+    }
+    off = off + 1
+  }
+  if depth != 0 {
+    return false
+  }
+  match p_peek_at(p, off).kind {
+    FatArrow => true
+    _ => false
+  }
+}
+
+///|
+fn p_looks_like_js_fn_expr(p : Parser) -> Bool {
+  match p_peek_at(p, 1).kind {
+    LParen => ()
+    _ => return false
+  }
+  let mut off = 2
+  let mut depth = 1
+  while depth > 0 && off < 128 {
+    match p_peek_at(p, off).kind {
+      Eof => return false
+      LParen => depth = depth + 1
+      RParen => depth = depth - 1
+      _ => ()
+    }
+    off = off + 1
+  }
+  if depth != 0 {
+    return false
+  }
+  match p_peek_at(p, off).kind {
+    LBrace | Arrow => true
+    _ => false
+  }
+}
+
+///|
 fn p_parse_primary_expr(p : Parser) -> Expr {
   let tok = p_peek(p)
   match tok.kind {
@@ -2585,6 +3111,47 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
       ESpawn(s, f, tok.span)
     }
     LParen => {
+      if p_looks_like_arrow_fn(p) {
+        let params = p_parse_params(p)
+        let arrow_tok = p_advance(p) // consume '=>'
+        p_err_code(
+          p,
+          tok.span,
+          "E_HABIT_ARROW_FN",
+          "Pion uses `fn(...) { ... }` for closures, not arrow syntax `(...) => ...`",
+          "`fn(...) { ... }`",
+          "`(...) => ...`",
+          "replace `(...) => { ... }` with `fn(...) { ... }`",
+        )
+        match p_peek(p).kind {
+          LBrace => {
+            p_add_edit(p, text_edit_insert(tok.span, 0, "fn"))
+            p_add_edit(
+              p,
+              text_edit_replace(
+                arrow_tok.span.file,
+                arrow_tok.span.line,
+                arrow_tok.span.col,
+                arrow_tok.span.line,
+                arrow_tok.span.col + 2,
+                "",
+                "machine",
+              ),
+            )
+            let body = p_parse_block_stmts(p)
+            return EClosure(params, TyMissing(tok.span), body, tok.span)
+          }
+          _ => {
+            let body_e = p_parse_expr(p)
+            return EClosure(
+              params,
+              TyMissing(tok.span),
+              [SExpr(body_e, arrow_tok.span)],
+              tok.span,
+            )
+          }
+        }
+      }
       let _ = p_advance(p)
       if p_match_kind_rparen(p) {
         return EUnit(tok.span)
@@ -2696,6 +3263,81 @@ fn p_parse_primary_expr(p : Parser) -> Expr {
         }
       }
     Ident(name) => {
+      if name == "function" && p_looks_like_js_fn_expr(p) {
+        let _ = p_advance(p)
+        p_err_code(
+          p,
+          tok.span,
+          "E_HABIT_JS_FUNCTION",
+          "Pion uses `fn` (not `function`) for closures",
+          "`fn(...) { ... }`",
+          "`function(...) { ... }`",
+          "replace `function` with `fn`",
+        )
+        p_add_edit(
+          p,
+          text_edit_replace(
+            tok.span.file,
+            tok.span.line,
+            tok.span.col,
+            tok.span.line,
+            tok.span.col + 8,
+            "fn",
+            "machine",
+          ),
+        )
+        let params = p_parse_params(p)
+        let ret_ty = if p_match_kind_arrow(p) {
+          p_parse_type_expr(p)
+        } else {
+          TyMissing(p_peek(p).span)
+        }
+        let body = p_parse_block_stmts(p)
+        return EClosure(params, ret_ty, body, tok.span)
+      }
+      if !p.in_match_guard {
+        match p_peek_at(p, 1).kind {
+          FatArrow => {
+            let _ = p_advance(p)
+            let arrow_tok = p_advance(p)
+            p_err_code(
+              p,
+              tok.span,
+              "E_HABIT_ARROW_FN",
+              "Pion uses `fn(" + name + ") { ... }` for closures, not arrow syntax `" + name + " => ...`",
+              "`fn(" + name + ") { ... }`",
+              "`" + name + " => ...`",
+              "replace `" + name + " => ...` with `fn(" + name + ") { ... }`",
+            )
+            let ps = [
+              Param::{
+                name: name,
+                is_mut: false,
+                ty: TyMissing(tok.span),
+                label_kind: 0,
+                default_expr: None,
+                span: tok.span,
+              },
+            ]
+            match p_peek(p).kind {
+              LBrace => {
+                let body = p_parse_block_stmts(p)
+                return EClosure(ps, TyMissing(tok.span), body, tok.span)
+              }
+              _ => {
+                let body_e = p_parse_expr(p)
+                return EClosure(
+                  ps,
+                  TyMissing(tok.span),
+                  [SExpr(body_e, arrow_tok.span)],
+                  tok.span,
+                )
+              }
+            }
+          }
+          _ => ()
+        }
+      }
       let _ = p_advance(p)
       if p_match_kind_coloncolon(p) {
         match p_peek(p).kind {
@@ -2837,7 +3479,7 @@ fn p_parse_decl_attrs(p : Parser) -> DeclAttrs {
   while !p_is_eof(p) {
     match p_peek(p).kind {
       Hash => {
-        let _ = p_advance(p)
+        let hash_sp = p_advance(p).span
         let is_inner = match p_peek(p).kind {
           Bang => {
             let _ = p_advance(p)
@@ -2853,17 +3495,27 @@ fn p_parse_decl_attrs(p : Parser) -> DeclAttrs {
           }
           _ => ""
         }
+        let is_known_attr = attr_name == "derive" ||
+          attr_name == "no_io" ||
+          attr_name == "render_thread" ||
+          attr_name == "verify" ||
+          attr_name == "verify_opaque"
         if p_match_kind_lparen(p) {
-          while !p_is_eof(p) {
+          let mut pdepth = 1
+          while !p_is_eof(p) && pdepth > 0 {
             let before = p.pos
             match p_peek(p).kind {
+              LParen => {
+                let _ = p_advance(p)
+                pdepth = pdepth + 1
+              }
               RParen => {
                 let _ = p_advance(p)
-                break
+                pdepth = pdepth - 1
               }
               Ident(tr) => {
                 let _ = p_advance(p)
-                if attr_name == "derive" && tr == "Eq" {
+                if pdepth == 1 && attr_name == "derive" && tr == "Eq" {
                   derive_eq = true
                 }
                 let _ = p_match_kind_comma(p)
@@ -2888,7 +3540,34 @@ fn p_parse_decl_attrs(p : Parser) -> DeclAttrs {
           verify_opaque = true
         }
         if has_bracket {
-          let _ = p_match_kind_rbracket(p)
+          if !is_known_attr {
+            p_err_code(
+              p,
+              hash_sp,
+              "E_HABIT_RUST_ATTR",
+              "unsupported Rust-style attribute `#[" +
+              attr_name +
+              "]`; Pion supports `#derive(Eq)`, `#no_io`, `#render_thread`, `#verify`, `#verify_opaque`",
+              "supported Pion `#attr`",
+              "`#[" + attr_name + "]`",
+              if attr_name == "test" {
+                "use `test \"name\" { ... }` instead of `#[test] fn ...`"
+              } else {
+                "remove `#[" + attr_name + "]` or use a supported Pion `#attr`"
+              },
+            )
+          }
+          while !p_is_eof(p) {
+            match p_peek(p).kind {
+              RBracket => {
+                let _ = p_advance(p)
+                break
+              }
+              _ => {
+                let _ = p_advance(p)
+              }
+            }
+          }
         }
         p_skip_semis(p)
       }
@@ -3003,6 +3682,52 @@ pub fn parse_source(path : String, source : String) -> ParseResult {
         }
         if !is_pub && !is_val && kw == "test" && next_is_str {
           decls.push(p_parse_test_decl(p, start_span))
+        } else if !is_val && kw == "const" {
+          p_err_code(
+            p,
+            tok.span,
+            "E_HABIT_JS_CONST",
+            "Pion uses `let` (not `const`) for immutable bindings and top-level constants",
+            "`let`",
+            "`const`",
+            "replace `const` with `let`",
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              tok.span.file,
+              tok.span.line,
+              tok.span.col,
+              tok.span.line,
+              tok.span.col + 5,
+              "let",
+              "machine",
+            ),
+          )
+          decls.push(p_parse_const_decl(p, is_pub, start_span))
+        } else if !is_val && kw == "function" {
+          p_err_code(
+            p,
+            tok.span,
+            "E_HABIT_JS_FUNCTION",
+            "Pion uses `fn` (not `function`) to declare functions",
+            "`fn`",
+            "`function`",
+            "replace `function` with `fn`",
+          )
+          p_add_edit(
+            p,
+            text_edit_replace(
+              tok.span.file,
+              tok.span.line,
+              tok.span.col,
+              tok.span.line,
+              tok.span.col + 8,
+              "fn",
+              "machine",
+            ),
+          )
+          decls.push(p_parse_fn_decl(p, is_pub, attrs, start_span))
         } else {
           p_err(
             p,

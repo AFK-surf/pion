@@ -280,7 +280,7 @@ cp "$TMP_DIR/pionc_linux_s4" "$OUT_DIR/pionc_linux"
 PIONC="$OUT_DIR/pionc_linux"
 
 echo "=== [6/6] Native Linux ${LINUX_ARCH_LABEL} pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
-CORE_TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/compiler/src/core")"
+CORE_TEST_JSON="$(cd "$ROOT_DIR" && "$PIONC" test --json "$ROOT_DIR/compiler/src/core")"
 CORE_TEST_SUMMARY="$(printf '%s' "$CORE_TEST_JSON" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')"
 echo "pionc_linux test --json compiler/src/core -> $CORE_TEST_SUMMARY"
 printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'

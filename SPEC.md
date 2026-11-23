@@ -525,21 +525,31 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   ]
 }
 ```
-- `edits` (optional, emitted only when non-empty): machine-applicable patches `[{"file","line","col","end_line","end_col","replacement"}]` replacing the 1-based range `[line:col, end_line:end_col)` (end exclusive, columns in bytes; an empty range is an insertion). Edits of one diagnostic never overlap: apply them from the last offset to the first. Each distinct edit is attached once. All 12 agent error classes of `benchmarks/agent_eval` carry one:
-  - `E_TYPE_MISMATCH` (return type) — a function body whose type contradicts the declared return type: rewrites the declared return type to the body's type.
-  - `E_TYPE_MISMATCH` (arity) — too many arguments: deletes the extra ones; too few: appends a type-default placeholder for each missing parameter (`0`, `""`, `false`, ...).
-  - `E_TYPE_MISMATCH` (unknown field) — replaces a misspelt field with the closest declared field when it is unique and within Levenshtein distance 2.
-  - `E_NON_EXHAUSTIVE` — inserts the missing `match` arms (`panic`-bodied) before the first arm.
-  - `E_PRIVATE_SYMBOL` — inserts `pub ` at the target declaration.
-  - `E_TRAIT_NOT_IMPLEMENTED` — appends an `impl Trait for Type { ... }` skeleton (every trait method with its signature, `panic("todo")` bodies) after the type's declaration (generic bounds and `dyn Trait` conversions).
-  - `E_TRAIT_METHOD_SIGNATURE` — rewrites the impl method's return type to the trait's.
-  - `E_NOT_SEND` — a captured non-`Send` local: wraps its declaration in `Mutex::new(...)` (and its type annotation in `Mutex[...]`), or prefixes the capture with `move` where ownership transfer fits. Uses of the binding inside the closure are left as they are and may need a second step (e.g. `with_lock`).
-  - `E_UNHANDLED_RESULT` — prefixes the discarded statement with `let _ = `.
-  - `E_CAPABILITY_MISSING` — inserts `world : World` as the first parameter of the enclosing function; its call sites then report the arity and need a second step passing `world`.
+- `edits` (optional, emitted only when non-empty): source patches `[{"file","line","col","end_line","end_col","replacement","applicability"}]` replacing the 1-based range `[line:col, end_line:end_col)` (end exclusive, columns in bytes; an empty range is an insertion). `applicability` is `"machine"` (deterministic, safe to apply blindly without placeholders or follow-up edits) or `"maybe"` (inserts placeholders such as `panic("todo")`/`0`, wraps a binding in `Mutex::new(...)`, or requires follow-up edits at other sites). Edits of one diagnostic never overlap: apply them from the last offset to the first. Each distinct edit is attached once. All 12 agent error classes of `benchmarks/agent_eval` carry one:
+  - `E_TYPE_MISMATCH` (return type, `"machine"`) — a function body whose type contradicts the declared return type: rewrites the declared return type to the body's type.
+  - `E_TYPE_MISMATCH` (arity, `"maybe"`) — too many arguments: deletes the extra ones; too few: appends a type-default placeholder for each missing parameter (`0`, `""`, `false`, ...).
+  - `E_TYPE_MISMATCH` (unknown field, `"machine"`) — replaces a misspelt field with the closest declared field when it is unique and within Levenshtein distance 2.
+  - `E_NON_EXHAUSTIVE` (`"maybe"`) — inserts the missing `match` arms (`panic`-bodied) before the first arm.
+  - `E_PRIVATE_SYMBOL` (`"machine"`) — inserts `pub ` at the target declaration.
+  - `E_TRAIT_NOT_IMPLEMENTED` (`"maybe"`) — appends an `impl Trait for Type { ... }` skeleton (every trait method with its signature, `panic("todo")` bodies) after the type's declaration (generic bounds and `dyn Trait` conversions).
+  - `E_TRAIT_METHOD_SIGNATURE` (`"machine"`) — rewrites the impl method's return type to the trait's.
+  - `E_NOT_SEND` (`"maybe"`) — a captured non-`Send` local: wraps its declaration in `Mutex::new(...)` (and its type annotation in `Mutex[...]`), or prefixes the capture with `move` where ownership transfer fits. Uses of the binding inside the closure are left as they are and may need a second step (e.g. `with_lock`).
+  - `E_UNHANDLED_RESULT` (`"machine"`) — prefixes the discarded statement with `let _ = `.
+  - `E_CAPABILITY_MISSING` (`"maybe"`) — inserts `world : World` as the first parameter of the enclosing function; its call sites then report the arity and need a second step passing `world`.
   - `E_NO_IO_VIOLATION` — emitted (with no `edits`) when a `#no_io` / `#render_thread` function, `impl` method, or nested closure accepts/references `World` or calls any `World`-gated IO builtin, runtime primitive, or `scope`.
-  - `E_MISSING_TYPE` — inserts the inferred return type (`-> T`) (no edit for an uninferable empty `let` collection: the fix-it names the annotation to add).
-  - `E_TYPE_MISMATCH` "cannot assign to immutable variable" — `let x` → `let mut x` at the declaration (also for an immutable root passed as `mut <place>`); a plain identifier passed to a `mut` parameter gets a `mut ` insertion.
+  - `E_MISSING_TYPE` (`"machine"`) — inserts the inferred return type (`-> T`) (no edit for an uninferable empty `let` collection: the fix-it names the annotation to add).
+  - `E_TYPE_MISMATCH` "cannot assign to immutable variable" (`"machine"`) — `let x` → `let mut x` at the declaration (also for an immutable root passed as `mut <place>`); a plain identifier passed to a `mut` parameter gets a `mut ` insertion (`"machine"`).
   - `E_VERIFY_UNSUPPORTED`, `E_VERIFY_MOVE`, `E_VERIFY_BORROW_ESCAPE`, `E_VERIFY_MUT_ESCAPE`, `E_VERIFY_ALIASING`, `E_VERIFY_CLOSURE_CAPTURE`, `E_VERIFY_UNVERIFIED_CALLEE` — `mut` / `#verify` rules of §3.4 (fix-its, no `edits`).
+  - Cross-language agent habit diagnostics (zero false positives on valid Pion, Pion-JSX, `<`/`>` comparisons, bitwise `&`, `match` `=>`, and supported `#[...]` attributes):
+    - `E_HABIT_ANGLE_GENERICS` — `<T>` generics in `fn`/`struct`/`enum` type parameter lists or type arguments (`Vec<Int>`, `Option<Int>`); attaches `"machine"` edits replacing `<...>` with `[...]` on clear single-line forms.
+    - `E_HABIT_RUST_REF` — Rust-style `&mut x` (`"machine"` edit → `mut x`), `&x` (`"maybe"` edit → `x`), or `&T`/`&mut T` in type position.
+    - `E_HABIT_RUST_ATTR` — unsupported Rust-style `#[...]` attributes (while keeping `#derive(Eq)`/`#[derive(...)]`, `#no_io`/`#[no_io]`, `#render_thread`/`#[render_thread]`, `#verify`/`#[verify]`/`#![verify]`, `#verify_opaque`/`#[verify_opaque]`).
+    - `E_HABIT_JS_CONST` — `const x = ...` at top level or statement position (`"machine"` edit `const` → `let`).
+    - `E_HABIT_JS_FUNCTION` — `function foo(...)` or `function(...) { ... }` (`"machine"` edit `function` → `fn`).
+    - `E_HABIT_STRICT_EQ` — `===` / `!==` (`"machine"` edit → `==` / `!=`).
+    - `E_HABIT_ARROW_FN` — `(...) => { ... }` / `(...) => expr` / `x => { ... }` outside `match` and JSX (`"machine"` edits on `(...) => { ... }`).
+    - `E_HABIT_MOONBIT_PKG` — MoonBit `@pkg.name` (`"machine"` edit → `pkg::name`).
+  - See `docs/diagnostics.md` for executable `before`/`after` examples of every core and `E_HABIT_*` diagnostic code (automatically verified by `compiler/src/core/diagnostics_doc_test.pion`).
 
 ### 5.2 `pionc query <kind> --json <path>`
 - `defs`: `{"defs":[{"pkg":"...","name":"...","kind":"fn|struct|enum","pub":true,"file":"...","line":10,"sig":"..."}]}`
