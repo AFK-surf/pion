@@ -1891,7 +1891,7 @@ export function createPionRuntime(options = {}) {
       sqrt: Math.sqrt, fabs: Math.abs, floor: Math.floor, ceil: Math.ceil,
       round: (x) => (x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
       trunc: Math.trunc, sin: Math.sin, cos: Math.cos, pow: Math.pow,
-      atan2: Math.atan2, log: Math.log, exp: Math.exp, fmod: (a, b) => a % b,
+      atan2: Math.atan2, log: Math.log, log1p: Math.log1p, exp: Math.exp, fmod: (a, b) => a % b,
       roundf: (x) => Math.fround(x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
       truncf: (x) => Math.fround(Math.trunc(x)),
       floorf: (x) => Math.fround(Math.floor(x)),
