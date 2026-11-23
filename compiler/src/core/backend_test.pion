@@ -10530,6 +10530,74 @@ test "p85_ror_bitops_ssa_and_idiom_audit" {
     #|#verify
     #|pub fn rot_verify_no_idiom(x : UInt) -> UInt { (x << 7) | (x >> 25) }
     #|pub fn main() -> Int { 0 }
+test "p85: pure-scalar small enum SROA in Result[Enum, String] + let r = call(); match r" {
+  let src =
+    #|pub enum DecodeStatus {
+    #|  Incomplete
+    #|  Complete(Bool, Int)
+    #|}
+    #|
+    #|fn decode(tag : Int, ok : Bool, n : Int) -> Result[DecodeStatus, String] {
+    #|  if tag < 0 {
+    #|    return Err("bad_tag_" + tag.to_string())
+    #|  }
+    #|  if tag == 0 {
+    #|    return Ok(DecodeStatus::Incomplete)
+    #|  }
+    #|  Ok(DecodeStatus::Complete(ok, n))
+    #|}
+    #|
+    #|pub fn hot_nested_match(tag : Int, ok : Bool, n : Int) -> Int {
+    #|  match decode(tag, ok, n) {
+    #|    Ok(DecodeStatus::Complete(flag, k)) => if flag { k + 1 } else { k }
+    #|    Ok(DecodeStatus::Incomplete) => -1
+    #|    Err(_) => -2
+    #|  }
+    #|}
+    #|
+    #|pub fn hot_two_step_match(tag : Int, ok : Bool, n : Int) -> Int {
+    #|  match decode(tag, ok, n) {
+    #|    Ok(st) =>
+    #|      match st {
+    #|        DecodeStatus::Complete(flag, k) => if flag { k + 10 } else { k }
+    #|        DecodeStatus::Incomplete => -1
+    #|      }
+    #|    Err(_) => -2
+    #|  }
+    #|}
+    #|
+    #|pub fn hot_try_let_match(tag : Int, ok : Bool, n : Int) -> Result[Int, String] {
+    #|  let st = decode(tag, ok, n)?
+    #|  match st {
+    #|    DecodeStatus::Complete(flag, k) => Ok(if flag { k + 2 } else { k })
+    #|    DecodeStatus::Incomplete => Ok(0)
+    #|  }
+    #|}
+    #|
+    #|pub fn hot_let_r_match(tag : Int, ok : Bool, n : Int) -> Int {
+    #|  let r = decode(tag, ok, n)
+    #|  match r {
+    #|    Ok(DecodeStatus::Complete(flag, k)) => if flag { k + 3 } else { k }
+    #|    Ok(DecodeStatus::Incomplete) => -1
+    #|    Err(_) => -2
+    #|  }
+    #|}
+    #|
+    #|pub fn escape_return_enum(tag : Int, ok : Bool, n : Int) -> Result[DecodeStatus, String] {
+    #|  let st = decode(tag, ok, n)?
+    #|  Ok(st)
+    #|}
+    #|
+    #|pub fn escape_array_enum(tag : Int, ok : Bool, n : Int) -> Int {
+    #|  let arr : Array[DecodeStatus] = []
+    #|  match decode(tag, ok, n) {
+    #|    Ok(st) => {
+    #|      arr.push(st)
+    #|      arr.length()
+    #|    }
+    #|    Err(_) => 0
+    #|  }
+    #|}
   let cr = check_source_files_with_imports("p85", ["p85.pion"], [src], [], true)
   assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
   let ssa = emit_qbe_package_multi(cr.pkg, cr.tc, true, false, []).ssa
@@ -10567,4 +10635,44 @@ test "p85_ror_bitops_ssa_and_idiom_audit" {
   assert_true(!fn_const.contains(", 0\n") && !fn_const.contains(", 32\n") && !fn_const.contains(", 40\n") && !fn_const.contains(", -1\n"), fn_const)
   // #verify must NOT fold the rotate idiom into ror
   assert_true(!fn_verify.contains(" ror "), fn_verify)
+  let mut fn_nested = ""
+  let mut fn_two = ""
+  let mut fn_try = ""
+  let mut fn_let_r = ""
+  let mut fn_esc_arr = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    let f = funcs[fi]
+    if f.contains("$pion_pkg_p85_fn_hot_nested_match(") {
+      fn_nested = f
+    } else if f.contains("$pion_pkg_p85_fn_hot_two_step_match(") {
+      fn_two = f
+    } else if f.contains("$pion_pkg_p85_fn_hot_try_let_match(") {
+      fn_try = f
+    } else if f.contains("$pion_pkg_p85_fn_hot_let_r_match(") {
+      fn_let_r = f
+    } else if f.contains("$pion_pkg_p85_fn_escape_array_enum(") {
+      fn_esc_arr = f
+    }
+    fi = fi + 1
+  }
+  assert_true(fn_nested != "", ssa)
+  assert_true(fn_two != "", ssa)
+  assert_true(fn_try != "", ssa)
+  assert_true(fn_let_r != "", ssa)
+  assert_true(fn_esc_arr != "", ssa)
+  // Zero heap allocation (no $pion_alloc_uninit) in all 3 non-Result-returning hot paths!
+  assert_true(!fn_nested.contains("$pion_alloc_uninit"), fn_nested)
+  assert_true(!fn_two.contains("$pion_alloc_uninit"), fn_two)
+  assert_true(!fn_let_r.contains("$pion_alloc_uninit"), fn_let_r)
+  // `hot_try_let_match` returns `Result[Int, String]` itself, so it allocates only for its own return Result (16B),
+  // NOT for `DecodeStatus` (24B / $pion_drop_enum_) — verify immortal stack enum header (`storeh 5,` / `storeh 11,`) is emitted!
+  assert_true(fn_nested.contains("storeh 5,"), fn_nested)
+  assert_true(fn_nested.contains("storeh 11,"), fn_nested)
+  assert_true(fn_try.contains("storeh 5,"), fn_try)
+  assert_true(fn_try.contains("storeh 11,"), fn_try)
+  assert_true(!fn_try.contains("$pion_drop_enum_"), fn_try)
+  assert_true(!fn_try.contains("(w 24, w 5,"), fn_try)
+  // Escape case must NOT use immortal stack enum header — must fall back to heap allocation safely!
+  assert_true(!fn_esc_arr.contains("storeh 11,"), fn_esc_arr)
 }

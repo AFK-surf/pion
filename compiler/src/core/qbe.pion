@@ -12930,11 +12930,575 @@ fn qbe_ty_is_unresolved_scalar(t : Ty) -> Bool {
 }
 
 ///|
+enum QbeOptResPodKind {
+  PodStruct(StructInfo, Ty, Int)
+  PodEnum(EnumInfo, Ty, Int)
+}
+
+///|
+fn qbe_pure_scalar_pod_enum_info(g : QbeGen, raw_ty : Ty) -> Option[(EnumInfo, Int)] {
+  let ty = subst_ty(raw_ty, g.cur_type_subst)
+  match ty {
+    TEnum(ename, eargs) =>
+      match qbe_lookup_enum_info(g, ename) {
+        Some(einfo) => {
+          if einfo.variants.length() == 0 ||
+            einfo.decl.type_params.length() != eargs.length() {
+            return None
+          }
+          let mut ai = 0
+          while ai < eargs.length() {
+            if qbe_ty_is_unresolved_scalar(eargs[ai]) {
+              return None
+            }
+            ai = ai + 1
+          }
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let mut max_payload = 0
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            if v.field_tys.length() > 4 {
+              return None
+            }
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              let fty = subst_ty(v.field_tys[fi], subst)
+              if !qbe_is_prim_array_elem(fty) {
+                return None
+              }
+              fi = fi + 1
+            }
+            if v.field_tys.length() > max_payload {
+              max_payload = v.field_tys.length()
+            }
+            vi = vi + 1
+          }
+          Some((einfo, 1 + max_payload))
+        }
+        None => None
+      }
+    _ => None
+  }
+}
+
+///|
+/// Allocates `24 + payload_bytes` on the function entry stack, writes a valid
+/// immortal+frozen `PionHeader` (matching `runtime/pion_rt.h`: owner_tid=0,
+/// local_rc=0, shared_rc=1, type_tag=PION_TAG_ENUM(5), flags=FROZEN|IMMORTAL|DEEP_FROZEN(11),
+/// drop_fn=NULL), and returns the object body pointer (`raw + 24`).
+fn qbe_alloc_immortal_enum_stack_buf(g : QbeGen, payload_bytes : Int) -> String {
+  let raw = qbe_tmp(g)
+  let total = 24 + payload_bytes
+  g.fn_allocs.write_string("    " + raw + " =l alloc8 " + total.to_string() + "\n")
+  g.fn_allocs.write_string("    storel 0, " + raw + "\n")
+  let p8 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p8 + " =l add " + raw + ", 8\n")
+  g.fn_allocs.write_string("    storew 1, " + p8 + "\n")
+  let p12 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p12 + " =l add " + raw + ", 12\n")
+  g.fn_allocs.write_string("    storeh 5, " + p12 + "\n")
+  let p14 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p14 + " =l add " + raw + ", 14\n")
+  g.fn_allocs.write_string("    storeh 11, " + p14 + "\n")
+  let p16 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p16 + " =l add " + raw + ", 16\n")
+  g.fn_allocs.write_string("    storel 0, " + p16 + "\n")
+  let body = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + body + " =l add " + raw + ", 24\n")
+  body
+}
+
+///|
+/// Safely copies a pure-scalar enum from an arbitrary runtime object `src_p`
+/// into a stack buffer `dst_p` without reading past smaller variants' allocations.
+fn qbe_emit_copy_pod_enum_slots(
+  g : QbeGen,
+  src_p : String,
+  dst_p : String,
+  einfo : EnumInfo,
+) -> Unit {
+  let tag_l = qbe_tmp(g)
+  qbe_emit(g, tag_l + " =l loadl " + src_p)
+  qbe_emit(g, "storel " + tag_l + ", " + dst_p)
+  let mut has_payload_variant = false
+  let mut vi = 0
+  while vi < einfo.variants.length() {
+    if einfo.variants[vi].field_tys.length() > 0 {
+      has_payload_variant = true
+      break
+    }
+    vi = vi + 1
+  }
+  if !has_payload_variant {
+    return
+  }
+  let l_done = qbe_lbl(g, "cpe_done")
+  vi = 0
+  while vi < einfo.variants.length() {
+    let nf = einfo.variants[vi].field_tys.length()
+    if nf > 0 {
+      let l_hit = qbe_lbl(g, "cpe_hit")
+      let l_next = qbe_lbl(g, "cpe_next")
+      let cmp = qbe_tmp(g)
+      qbe_emit(g, cmp + " =w ceql " + tag_l + ", " + vi.to_string())
+      qbe_emit_term(g, "jnz " + cmp + ", " + l_hit + ", " + l_next)
+      qbe_emit_lbl(g, l_hit)
+      let mut fi = 0
+      while fi < nf {
+        let off = (fi + 1) * 8
+        let sp_i = qbe_tmp(g)
+        let dp_i = qbe_tmp(g)
+        let fv = qbe_tmp(g)
+        qbe_emit(g, sp_i + " =l add " + src_p + ", " + off.to_string())
+        qbe_emit(g, dp_i + " =l add " + dst_p + ", " + off.to_string())
+        qbe_emit(g, fv + " =l loadl " + sp_i)
+        qbe_emit(g, "storel " + fv + ", " + dp_i)
+        fi = fi + 1
+      }
+      qbe_emit_term(g, "jmp " + l_done)
+      qbe_emit_lbl(g, l_next)
+    }
+    vi = vi + 1
+  }
+  qbe_emit_term(g, "jmp " + l_done)
+  qbe_emit_lbl(g, l_done)
+  g.block_immut_fields = Map([])
+}
+
+///|
+fn qbe_resolve_pod_enum_ctor(
+  g : QbeGen,
+  e : Expr,
+  einfo : EnumInfo,
+  enum_ty : Ty,
+) -> Option[(Int, Array[Expr], Array[Ty])] {
+  let (enum_name, eargs) = match enum_ty {
+    TEnum(en, ea) => (en, ea)
+    _ => return None
+  }
+  let subst = make_subst(einfo.decl.type_params, eargs)
+  let (cand_en, vname, args) : (String, String, Array[Expr]) = match e {
+    EIdent(vn, _) => ("", vn, [])
+    EPath(en, vn, _) => (en, vn, [])
+    EDotVariant(vn, a, _) => ("", vn, a)
+    ECall(EIdent(vn, _), a, _) => ("", vn, a)
+    ECall(EPath(en, vn, _), a, _) => (en, vn, a)
+    _ => return None
+  }
+  if cand_en != "" {
+    let matches_en = cand_en == enum_name ||
+      (g.mono_pkg != "" && g.mono_pkg + "::" + cand_en == enum_name) ||
+      (g.mono_pkg != "" && cand_en == g.mono_pkg + "::" + enum_name)
+    if !matches_en {
+      let qp = split_qual_name(enum_name)
+      if qp.name != cand_en {
+        return None
+      }
+    }
+  } else {
+    match e {
+      EIdent(vn, _) | ECall(EIdent(vn, _), _, _) =>
+        match qbe_lookup_local(g, vn) {
+          Some(_) => return None
+          None => ()
+        }
+      _ => ()
+    }
+  }
+  let mut vi = 0
+  while vi < einfo.variants.length() {
+    let v = einfo.variants[vi]
+    if v.name == vname && v.field_tys.length() == args.length() {
+      let ftys : Array[Ty] = []
+      let mut fi = 0
+      while fi < v.field_tys.length() {
+        ftys.push(subst_ty(v.field_tys[fi], subst))
+        fi = fi + 1
+      }
+      return Some((vi, args, ftys))
+    }
+    vi = vi + 1
+  }
+  None
+}
+
+///|
+fn qbe_expr_all_tails_are_pod_enum_ctors(
+  g : QbeGen,
+  e : Expr,
+  einfo : EnumInfo,
+  enum_ty : Ty,
+) -> Bool {
+  match e {
+    EBlock(bs, _) => {
+      if bs.length() == 0 || qbe_stmts_has_cf(bs, false, false, true) {
+        return false
+      }
+      match bs[bs.length() - 1] {
+        SExpr(te, _) => qbe_expr_all_tails_are_pod_enum_ctors(g, te, einfo, enum_ty)
+        _ => false
+      }
+    }
+    EIf(_, then_s, Some(else_e), _) => {
+      if then_s.length() == 0 || qbe_stmts_has_cf(then_s, false, false, true) {
+        return false
+      }
+      let then_ok = match then_s[then_s.length() - 1] {
+        SExpr(te, _) => qbe_expr_all_tails_are_pod_enum_ctors(g, te, einfo, enum_ty)
+        _ => false
+      }
+      then_ok && qbe_expr_all_tails_are_pod_enum_ctors(g, else_e, einfo, enum_ty)
+    }
+    _ =>
+      match qbe_resolve_pod_enum_ctor(g, e, einfo, enum_ty) {
+        Some(_) => true
+        None => false
+      }
+  }
+}
+
+///|
+fn qbe_emit_tail_pod_enum_into_buf(
+  g : QbeGen,
+  e : Expr,
+  einfo : EnumInfo,
+  enum_ty : Ty,
+  buf : String,
+) -> Unit {
+  if g.block_term {
+    return
+  }
+  match e {
+    EBlock(bs, _) => {
+      qbe_scope_push(g)
+      let n = bs.length()
+      let mut i = 0
+      while i < n - 1 {
+        if g.block_term {
+          break
+        }
+        let _ = qbe_emit_stmt(g, bs[i], None, false)
+        i = i + 1
+      }
+      if !g.block_term && n > 0 {
+        match bs[n - 1] {
+          SExpr(te, _) => qbe_emit_tail_pod_enum_into_buf(g, te, einfo, enum_ty, buf)
+          _ => ()
+        }
+      }
+      qbe_scope_pop(g)
+    }
+    EIf(cond, then_s, Some(else_e), _) => {
+      let cv = qbe_emit_expr(g, cond, Some(TBool))
+      if g.block_term {
+        return
+      }
+      let l_then = qbe_lbl(g, "pe_then")
+      let l_else = qbe_lbl(g, "pe_else")
+      let l_end = qbe_lbl(g, "pe_end")
+      qbe_emit_term(g, "jnz " + cv.reg + ", " + l_then + ", " + l_else)
+      qbe_emit_lbl(g, l_then)
+      g.block_immut_fields = Map([])
+      qbe_scope_push(g)
+      let tn = then_s.length()
+      let mut ti = 0
+      while ti < tn - 1 {
+        if g.block_term {
+          break
+        }
+        let _ = qbe_emit_stmt(g, then_s[ti], None, false)
+        ti = ti + 1
+      }
+      if !g.block_term && tn > 0 {
+        match then_s[tn - 1] {
+          SExpr(te, _) => qbe_emit_tail_pod_enum_into_buf(g, te, einfo, enum_ty, buf)
+          _ => ()
+        }
+      }
+      qbe_scope_pop(g)
+      let then_term = g.block_term
+      if !then_term {
+        qbe_emit_term(g, "jmp " + l_end)
+      }
+      qbe_emit_lbl(g, l_else)
+      g.block_immut_fields = Map([])
+      qbe_scope_push(g)
+      qbe_emit_tail_pod_enum_into_buf(g, else_e, einfo, enum_ty, buf)
+      qbe_scope_pop(g)
+      let else_term = g.block_term
+      if !else_term {
+        qbe_emit_term(g, "jmp " + l_end)
+      }
+      if then_term && else_term {
+        g.block_term = true
+      } else {
+        qbe_emit_lbl(g, l_end)
+        g.block_immut_fields = Map([])
+      }
+    }
+    _ =>
+      match qbe_resolve_pod_enum_ctor(g, e, einfo, enum_ty) {
+        Some((tag, args, ftys)) => {
+          let arg_regs : Array[String] = []
+          let mut fi = 0
+          while fi < args.length() {
+            let av = qbe_emit_expr(g, args[fi], Some(ftys[fi]))
+            if g.block_term {
+              return
+            }
+            arg_regs.push(qbe_coerce_val(g, av, ftys[fi]))
+            fi = fi + 1
+          }
+          qbe_emit(g, "storel " + tag.to_string() + ", " + buf)
+          fi = 0
+          while fi < arg_regs.length() {
+            let off = (fi + 1) * 8
+            let addr = qbe_tmp(g)
+            qbe_emit(g, addr + " =l add " + buf + ", " + off.to_string())
+            qbe_store_heap_slot(g, arg_regs[fi], addr, ftys[fi])
+            fi = fi + 1
+          }
+        }
+        None => ()
+      }
+  }
+}
+
+///|
+/// True iff `pat` destructures a pure-scalar enum without binding the enum pointer itself.
+fn qbe_pat_is_safe_enum_destructure(pat : Pattern) -> Bool {
+  match pat {
+    PWild(_) => true
+    PVariant(_, _, subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        match subs[i] {
+          PWild(_) | PIdent(_, _) | PBool(_, _) | PInt(_, _) | PChar(_, _) => ()
+          _ => return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+/// Strict consumer check for stack-allocated pure-scalar enums:
+/// returns true iff `name` is ONLY ever used as the scrutinee of `match name { ... }`
+/// or `name is Pat` with safe scalar destructuring patterns (never returned, never
+/// passed to any call/method, never stored in any container/struct, never captured).
+fn qbe_ident_is_match_only_enum_expr(e : Expr, name : String) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => true
+    EIdent(n, _) => n != name
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | EField(inner, _, _)
+    | ENamedArg(_, _, inner, _)
+    | ETry(inner, _) => qbe_ident_is_match_only_enum_expr(inner, name)
+    EMutArg(inner, _) =>
+      if qbe_mut_place_root(inner) == name {
+        false
+      } else {
+        qbe_ident_is_match_only_enum_expr(inner, name)
+      }
+    EBinary(_, l, r, _) | EIndex(l, r, _) =>
+      qbe_ident_is_match_only_enum_expr(l, name) &&
+      qbe_ident_is_match_only_enum_expr(r, name)
+    ECall(callee, args, _) => {
+      if !qbe_ident_is_match_only_enum_expr(callee, name) {
+        return false
+      }
+      let mut i = 0
+      while i < args.length() {
+        if !qbe_ident_is_match_only_enum_expr(args[i], name) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EMethodCall(obj, _, args, _) => {
+      if !qbe_ident_is_match_only_enum_expr(obj, name) {
+        return false
+      }
+      let mut i = 0
+      while i < args.length() {
+        if !qbe_ident_is_match_only_enum_expr(args[i], name) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if !qbe_ident_is_match_only_enum_expr(elems[i], name) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(b) => if !qbe_ident_is_match_only_enum_expr(b, name) { return false }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if !qbe_ident_is_match_only_enum_expr(fields[i].value, name) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EBlock(stmts, _) => qbe_ident_is_match_only_enum_stmts(stmts, 0, name)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if !qbe_ident_is_match_only_enum_expr(cond, name) ||
+        !qbe_ident_is_match_only_enum_stmts(then_stmts, 0, name) {
+        return false
+      }
+      match else_opt {
+        None => true
+        Some(el) => qbe_ident_is_match_only_enum_expr(el, name)
+      }
+    }
+    EIs(scrut, pat, _) =>
+      match scrut {
+        EIdent(n, _) =>
+          if n == name {
+            qbe_pat_is_safe_enum_destructure(pat)
+          } else {
+            true
+          }
+        _ => qbe_ident_is_match_only_enum_expr(scrut, name)
+      }
+    EMatch(scrut, arms, _) => {
+      let scrut_is_self = match scrut {
+        EIdent(n, _) => n == name
+        _ => false
+      }
+      if !scrut_is_self && !qbe_ident_is_match_only_enum_expr(scrut, name) {
+        return false
+      }
+      let mut i = 0
+      while i < arms.length() {
+        if scrut_is_self && !qbe_pat_is_safe_enum_destructure(arms[i].pat) {
+          return false
+        }
+        if !qbe_pat_binds_name(arms[i].pat, name) {
+          match arms[i].guard_expr {
+            Some(ge) =>
+              if !qbe_ident_is_match_only_enum_expr(ge, name) {
+                return false
+              }
+            None => ()
+          }
+          if !qbe_ident_is_match_only_enum_expr(arms[i].body, name) {
+            return false
+          }
+        }
+        i = i + 1
+      }
+      true
+    }
+    EClosure(_, _, _, _)
+    | EScope(_, _, _)
+    | ESpawn(_, _, _)
+    | EInterp(_, _)
+    | EDotVariant(_, _, _) => !qbe_expr_mentions_ident(e, name)
+  }
+}
+
+///|
+fn qbe_ident_is_match_only_enum_stmt(s : Stmt, name : String) -> Bool {
+  match s {
+    SLet(_, _, _, init, _) => qbe_ident_is_match_only_enum_expr(init, name)
+    SLetTuple(_, _, init, _) => qbe_ident_is_match_only_enum_expr(init, name)
+    SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+      qbe_ident_is_match_only_enum_expr(lhs, name) &&
+      qbe_ident_is_match_only_enum_expr(rhs, name)
+    SWhile(cond, body, _) | SGuard(cond, body, _) =>
+      qbe_ident_is_match_only_enum_expr(cond, name) &&
+      qbe_ident_is_match_only_enum_stmts(body, 0, name)
+    SFor(init_s, cond, step_s, body, _) =>
+      qbe_ident_is_match_only_enum_stmt(init_s, name) &&
+      qbe_ident_is_match_only_enum_expr(cond, name) &&
+      qbe_ident_is_match_only_enum_stmt(step_s, name) &&
+      qbe_ident_is_match_only_enum_stmts(body, 0, name)
+    SForRange(vname, start_e, end_e, _, body, _) =>
+      qbe_ident_is_match_only_enum_expr(start_e, name) &&
+      qbe_ident_is_match_only_enum_expr(end_e, name) &&
+      (vname == name || qbe_ident_is_match_only_enum_stmts(body, 0, name))
+    SForIn(_, vname, iter_e, body, _) =>
+      qbe_ident_is_match_only_enum_expr(iter_e, name) &&
+      (vname == name || qbe_ident_is_match_only_enum_stmts(body, 0, name))
+    SReturn(opt, _) =>
+      match opt {
+        None => true
+        Some(e) => qbe_ident_is_match_only_enum_expr(e, name)
+      }
+    SExpr(e, _) => qbe_ident_is_match_only_enum_expr(e, name)
+    SDebugAssert(cond, msg, _) =>
+      qbe_ident_is_match_only_enum_expr(cond, name) &&
+      qbe_ident_is_match_only_enum_expr(msg, name)
+    SBreak(_) | SContinue(_) => true
+  }
+}
+
+///|
+fn qbe_ident_is_match_only_enum_stmts(
+  stmts : Array[Stmt],
+  start : Int,
+  name : String,
+) -> Bool {
+  let mut i = start
+  while i < stmts.length() {
+    if !qbe_ident_is_match_only_enum_stmt(stmts[i], name) {
+      return false
+    }
+    match stmts[i] {
+      SLet(bname, _, _, _, _) => if bname == name { return true }
+      SLetTuple(bnames, _, _, _) => {
+        let mut bi = 0
+        while bi < bnames.length() {
+          if bnames[bi] == name {
+            return true
+          }
+          bi = bi + 1
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
 fn qbe_opt_res_pod_info(
   g : QbeGen,
   ret_ty : Ty,
   allow_pod_ok : Bool,
-) -> Option[(StructInfo, Ty)] {
+) -> Option[QbeOptResPodKind] {
   if !allow_pod_ok {
     return None
   }
@@ -12943,9 +13507,14 @@ fn qbe_opt_res_pod_info(
     TResult(ot, _) => ot
     _ => return None
   }
+  let sub_ok = subst_ty(ok_ty, g.cur_type_subst)
   match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
-    Some(sinfo) => Some((sinfo, subst_ty(ok_ty, g.cur_type_subst)))
-    None => None
+    Some(sinfo) => Some(PodStruct(sinfo, sub_ok, sinfo.field_names.length()))
+    None =>
+      match qbe_pure_scalar_pod_enum_info(g, ok_ty) {
+        Some((einfo, nslots)) => Some(PodEnum(einfo, sub_ok, nslots))
+        None => None
+      }
   }
 }
 
@@ -12966,7 +13535,11 @@ fn qbe_ty_is_scalarizable_opt_res(
         } else if allow_pod_ok {
           match qbe_pure_scalar_pod_struct_info(g, inner) {
             Some(_) => Some(ty)
-            None => None
+            None =>
+              match qbe_pure_scalar_pod_enum_info(g, inner) {
+                Some(_) => Some(ty)
+                None => None
+              }
           }
         } else {
           None
@@ -13727,14 +14300,23 @@ fn qbe_emit_tail_opt_res_forward_call(
         _ => TUnit
       }
       if val_is_pod_buf {
-        match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
-          Some(sinfo) =>
+        match qbe_opt_res_pod_info(g, ret_ty, true) {
+          Some(PodStruct(_, _, nslots)) =>
             if inner.val_is_pod_buf {
-              qbe_emit_copy_pod_slots(g, inner.val_slot, val_slot, sinfo.field_names.length())
+              qbe_emit_copy_pod_slots(g, inner.val_slot, val_slot, nslots)
             } else {
               let src_p = qbe_tmp(g)
               qbe_emit(g, src_p + " =l loadl " + inner.val_slot)
-              qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+              qbe_emit_copy_pod_slots(g, src_p, val_slot, nslots)
+              qbe_rc_dec(g, src_p, ok_ty)
+            }
+          Some(PodEnum(einfo, _, nslots)) =>
+            if inner.val_is_pod_buf {
+              qbe_emit_copy_pod_slots(g, inner.val_slot, val_slot, nslots)
+            } else {
+              let src_p = qbe_tmp(g)
+              qbe_emit(g, src_p + " =l loadl " + inner.val_slot)
+              qbe_emit_copy_pod_enum_slots(g, src_p, val_slot, einfo)
               qbe_rc_dec(g, src_p, ok_ty)
             }
           None => ()
@@ -13776,9 +14358,13 @@ fn qbe_emit_tail_opt_res_forward_call(
             qbe_emit_lbl(g, l_ok)
             g.block_immut_fields = Map([])
             if val_is_pod_buf {
-              match qbe_pure_scalar_pod_struct_info(g, inner_ty) {
-                Some(sinfo) => {
-                  qbe_emit_copy_pod_slots(g, rv_reg, val_slot, sinfo.field_names.length())
+              match qbe_opt_res_pod_info(g, ret_ty, true) {
+                Some(PodStruct(_, _, nslots)) => {
+                  qbe_emit_copy_pod_slots(g, rv_reg, val_slot, nslots)
+                  qbe_rc_dec(g, rv_reg, inner_ty)
+                }
+                Some(PodEnum(einfo, _, _)) => {
+                  qbe_emit_copy_pod_enum_slots(g, rv_reg, val_slot, einfo)
                   qbe_rc_dec(g, rv_reg, inner_ty)
                 }
                 None => qbe_rc_dec(g, rv_reg, inner_ty)
@@ -13801,11 +14387,16 @@ fn qbe_emit_tail_opt_res_forward_call(
             let vp = qbe_tmp(g)
             qbe_emit(g, vp + " =l add " + rv_reg + ", 8")
             if val_is_pod_buf {
-              match qbe_pure_scalar_pod_struct_info(g, inner_ty) {
-                Some(sinfo) => {
+              match qbe_opt_res_pod_info(g, ret_ty, true) {
+                Some(PodStruct(_, _, nslots)) => {
                   let src_p = qbe_tmp(g)
                   qbe_emit(g, src_p + " =l loadl " + vp)
-                  qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                  qbe_emit_copy_pod_slots(g, src_p, val_slot, nslots)
+                }
+                Some(PodEnum(einfo, _, _)) => {
+                  let src_p = qbe_tmp(g)
+                  qbe_emit(g, src_p + " =l loadl " + vp)
+                  qbe_emit_copy_pod_enum_slots(g, src_p, val_slot, einfo)
                 }
                 None => ()
               }
@@ -13837,11 +14428,16 @@ fn qbe_emit_tail_opt_res_forward_call(
           let vp = qbe_tmp(g)
           qbe_emit(g, vp + " =l add " + rv_reg + ", 8")
           if val_is_pod_buf {
-            match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
-              Some(sinfo) => {
+            match qbe_opt_res_pod_info(g, ret_ty, true) {
+              Some(PodStruct(_, _, nslots)) => {
                 let src_p = qbe_tmp(g)
                 qbe_emit(g, src_p + " =l loadl " + vp)
-                qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                qbe_emit_copy_pod_slots(g, src_p, val_slot, nslots)
+              }
+              Some(PodEnum(einfo, _, _)) => {
+                let src_p = qbe_tmp(g)
+                qbe_emit(g, src_p + " =l loadl " + vp)
+                qbe_emit_copy_pod_enum_slots(g, src_p, val_slot, einfo)
               }
               None => ()
             }
@@ -13950,7 +14546,8 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
       match qbe_match_2arm_opt_res(arms) {
         Some((want_kind, ok_idx, err_idx, ok_bind, err_bind)) => {
           let allow_pod_ok = ok_bind == "" ||
-            qbe_ident_is_flat_field_only_expr(arms[ok_idx].body, ok_bind)
+            qbe_ident_is_flat_field_only_expr(arms[ok_idx].body, ok_bind) ||
+            qbe_ident_is_match_only_enum_expr(arms[ok_idx].body, ok_bind)
           match qbe_try_emit_opt_res_scalarized(g, scrut, want_kind, allow_pod_ok) {
             Some(sc) => {
               if g.block_term {
@@ -14110,16 +14707,10 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
               qbe_emit(g, "storew 0, " + tag_slot)
             ECall(EIdent("Some", _), args, _) | ECall(EPath("Option", "Some", _), args, _) =>
               if val_is_pod_buf {
-                match qbe_pure_scalar_pod_struct_info(g, inner_ty) {
-                  Some(sinfo) => {
+                match qbe_opt_res_pod_info(g, ret_ty, true) {
+                  Some(PodStruct(sinfo, sub_ty, nslots)) => {
                     if qbe_expr_all_tails_are_pod_struct_lits(args[0]) {
-                      qbe_emit_tail_pod_struct_into_buf(
-                        g,
-                        args[0],
-                        sinfo,
-                        subst_ty(inner_ty, g.cur_type_subst),
-                        val_slot,
-                      )
+                      qbe_emit_tail_pod_struct_into_buf(g, args[0], sinfo, sub_ty, val_slot)
                     } else {
                       let aa = qbe_emit_arg_maybe_borrow(
                         g,
@@ -14129,7 +14720,29 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                       )
                       if !g.block_term {
                         let src_p = qbe_as_l(g, aa.qv)
-                        qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                        qbe_emit_copy_pod_slots(g, src_p, val_slot, nslots)
+                        if !aa.borrowed {
+                          qbe_rc_dec(g, aa.qv.reg, aa.qv.ty)
+                        }
+                      }
+                    }
+                    if !g.block_term {
+                      qbe_emit(g, "storew 1, " + tag_slot)
+                    }
+                  }
+                  Some(PodEnum(einfo, sub_ty, _)) => {
+                    if qbe_expr_all_tails_are_pod_enum_ctors(g, args[0], einfo, sub_ty) {
+                      qbe_emit_tail_pod_enum_into_buf(g, args[0], einfo, sub_ty, val_slot)
+                    } else {
+                      let aa = qbe_emit_arg_maybe_borrow(
+                        g,
+                        args[0],
+                        Some(inner_ty),
+                        !qbe_expr_has_assign(args[0]),
+                      )
+                      if !g.block_term {
+                        let src_p = qbe_as_l(g, aa.qv)
+                        qbe_emit_copy_pod_enum_slots(g, src_p, val_slot, einfo)
                         if !aa.borrowed {
                           qbe_rc_dec(g, aa.qv.reg, aa.qv.ty)
                         }
@@ -14165,16 +14778,10 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
           match e {
             ECall(EIdent("Ok", _), args, _) | ECall(EPath("Result", "Ok", _), args, _) =>
               if val_is_pod_buf {
-                match qbe_pure_scalar_pod_struct_info(g, ok_ty) {
-                  Some(sinfo) => {
+                match qbe_opt_res_pod_info(g, ret_ty, true) {
+                  Some(PodStruct(sinfo, sub_ty, nslots)) => {
                     if qbe_expr_all_tails_are_pod_struct_lits(args[0]) {
-                      qbe_emit_tail_pod_struct_into_buf(
-                        g,
-                        args[0],
-                        sinfo,
-                        subst_ty(ok_ty, g.cur_type_subst),
-                        val_slot,
-                      )
+                      qbe_emit_tail_pod_struct_into_buf(g, args[0], sinfo, sub_ty, val_slot)
                     } else {
                       let aa = qbe_emit_arg_maybe_borrow(
                         g,
@@ -14184,7 +14791,29 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                       )
                       if !g.block_term {
                         let src_p = qbe_as_l(g, aa.qv)
-                        qbe_emit_copy_pod_slots(g, src_p, val_slot, sinfo.field_names.length())
+                        qbe_emit_copy_pod_slots(g, src_p, val_slot, nslots)
+                        if !aa.borrowed {
+                          qbe_rc_dec(g, aa.qv.reg, aa.qv.ty)
+                        }
+                      }
+                    }
+                    if !g.block_term {
+                      qbe_emit(g, "storew 1, " + tag_slot)
+                    }
+                  }
+                  Some(PodEnum(einfo, sub_ty, _)) => {
+                    if qbe_expr_all_tails_are_pod_enum_ctors(g, args[0], einfo, sub_ty) {
+                      qbe_emit_tail_pod_enum_into_buf(g, args[0], einfo, sub_ty, val_slot)
+                    } else {
+                      let aa = qbe_emit_arg_maybe_borrow(
+                        g,
+                        args[0],
+                        Some(ok_ty),
+                        !qbe_expr_has_assign(args[0]),
+                      )
+                      if !g.block_term {
+                        let src_p = qbe_as_l(g, aa.qv)
+                        qbe_emit_copy_pod_enum_slots(g, src_p, val_slot, einfo)
                         if !aa.borrowed {
                           qbe_rc_dec(g, aa.qv.reg, aa.qv.ty)
                         }
@@ -14284,11 +14913,16 @@ fn qbe_inline_body_into_opt_res_slots(
   arg_tys : Array[Ty],
   arg_borrowed : Array[Bool],
   val_is_pod_buf : Bool,
+  val_is_pod_enum : Bool,
   pod_bytes : Int,
 ) -> QbeScalarOptRes {
   let tag_slot = qbe_alloc_slot4(g)
   let val_slot = if val_is_pod_buf {
-    qbe_alloc_stack_buf(g, pod_bytes)
+    if val_is_pod_enum {
+      qbe_alloc_immortal_enum_stack_buf(g, pod_bytes)
+    } else {
+      qbe_alloc_stack_buf(g, pod_bytes)
+    }
   } else {
     qbe_alloc_slot(g)
   }
@@ -14601,12 +15235,19 @@ fn qbe_try_emit_opt_res_scalarized(
           match qbe_ty_is_scalarizable_opt_res(g, raw_ty, want_kind, allow_pod_ok) {
             Some(ret_ty) => {
               let mut val_is_pod_buf = false
+              let mut val_is_pod_enum = false
               let mut pod_bytes = 0
               match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
-                Some((sinfo, _)) =>
+                Some(PodStruct(_, _, nslots)) =>
                   if qbe_expr_all_tails_are_opt_res_ctors(g, expr, ret_ty, true) {
                     val_is_pod_buf = true
-                    pod_bytes = sinfo.field_names.length() * 8
+                    pod_bytes = nslots * 8
+                  }
+                Some(PodEnum(_, _, nslots)) =>
+                  if qbe_expr_all_tails_are_opt_res_ctors(g, expr, ret_ty, true) {
+                    val_is_pod_buf = true
+                    val_is_pod_enum = true
+                    pod_bytes = nslots * 8
                   }
                 None => ()
               }
@@ -14618,7 +15259,11 @@ fn qbe_try_emit_opt_res_scalarized(
                 (can_non_pod && qbe_expr_all_tails_are_opt_res_ctors(g, expr, ret_ty, false)) {
                 let tag_slot = qbe_alloc_slot4(g)
                 let val_slot = if val_is_pod_buf {
-                  qbe_alloc_stack_buf(g, pod_bytes)
+                  if val_is_pod_enum {
+                    qbe_alloc_immortal_enum_stack_buf(g, pod_bytes)
+                  } else {
+                    qbe_alloc_stack_buf(g, pod_bytes)
+                  }
                 } else {
                   qbe_alloc_slot(g)
                 }
@@ -14687,12 +15332,19 @@ fn qbe_try_emit_opt_res_scalarized(
                     name
                   }
                   let mut val_is_pod_buf = false
+                  let mut val_is_pod_enum = false
                   let mut pod_bytes = 0
                   match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
-                    Some((sinfo, _)) =>
+                    Some(PodStruct(_, _, nslots)) =>
                       if qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, true) {
                         val_is_pod_buf = true
-                        pod_bytes = sinfo.field_names.length() * 8
+                        pod_bytes = nslots * 8
+                      }
+                    Some(PodEnum(_, _, nslots)) =>
+                      if qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, true) {
+                        val_is_pod_buf = true
+                        val_is_pod_enum = true
+                        pod_bytes = nslots * 8
                       }
                     None => ()
                   }
@@ -14751,6 +15403,7 @@ fn qbe_try_emit_opt_res_scalarized(
                       arg_tys,
                       arg_borrowed,
                       val_is_pod_buf,
+                      val_is_pod_enum,
                       pod_bytes,
                     ),
                   )
@@ -14853,12 +15506,19 @@ fn qbe_try_emit_opt_res_scalarized(
                     key
                   }
                   let mut val_is_pod_buf = false
+                  let mut val_is_pod_enum = false
                   let mut pod_bytes = 0
                   match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
-                    Some((sinfo, _)) =>
+                    Some(PodStruct(_, _, nslots)) =>
                       if qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, true) {
                         val_is_pod_buf = true
-                        pod_bytes = sinfo.field_names.length() * 8
+                        pod_bytes = nslots * 8
+                      }
+                    Some(PodEnum(_, _, nslots)) =>
+                      if qbe_fn_body_can_scalar_opt_res(g, target_pkg, stack_key, inl_body, ret_ty, true) {
+                        val_is_pod_buf = true
+                        val_is_pod_enum = true
+                        pod_bytes = nslots * 8
                       }
                     None => ()
                   }
@@ -14917,6 +15577,7 @@ fn qbe_try_emit_opt_res_scalarized(
                       arg_tys,
                       arg_borrowed,
                       val_is_pod_buf,
+                      val_is_pod_enum,
                       pod_bytes,
                     ),
                   )
@@ -14951,12 +15612,19 @@ fn qbe_try_emit_opt_res_scalarized(
                       let inl_body = qbe_fn_body(g, inl_fd.body)
                       let stack_key = if mpkg != "" { mpkg + "::" + key } else { key }
                       let mut val_is_pod_buf = false
+                      let mut val_is_pod_enum = false
                       let mut pod_bytes = 0
                       match qbe_opt_res_pod_info(g, ret_ty, allow_pod_ok) {
-                        Some((sinfo, _)) =>
+                        Some(PodStruct(_, _, nslots)) =>
                           if qbe_fn_body_can_scalar_opt_res(g, mpkg, stack_key, inl_body, ret_ty, true) {
                             val_is_pod_buf = true
-                            pod_bytes = sinfo.field_names.length() * 8
+                            pod_bytes = nslots * 8
+                          }
+                        Some(PodEnum(_, _, nslots)) =>
+                          if qbe_fn_body_can_scalar_opt_res(g, mpkg, stack_key, inl_body, ret_ty, true) {
+                            val_is_pod_buf = true
+                            val_is_pod_enum = true
+                            pod_bytes = nslots * 8
                           }
                         None => ()
                       }
@@ -15009,6 +15677,7 @@ fn qbe_try_emit_opt_res_scalarized(
                           arg_tys,
                           arg_borrowed,
                           val_is_pod_buf,
+                          val_is_pod_enum,
                           pod_bytes,
                         ),
                       )
@@ -15027,6 +15696,348 @@ fn qbe_try_emit_opt_res_scalarized(
 }
 
 ///|
+/// Multi-arm / nested-pattern scalarized `match` over a short-lived `Option[T]` / `Result[T, E]`,
+/// e.g. `match decode(...) { Ok(DecodeStatus::Complete(ok, n)) => ..., Ok(DecodeStatus::Incomplete) => ..., Err(e) => ... }`.
+fn qbe_try_emit_scalar_opt_res_nested_match(
+  g : QbeGen,
+  scrut : Expr,
+  arms : Array[MatchArm],
+  expected : Option[Ty],
+) -> Option[QbeVal] {
+  if arms.length() < 2 {
+    return None
+  }
+  let mut want_kind = 0
+  let ok_arm_idxs : Array[Int] = []
+  let ok_subpats : Array[Pattern] = []
+  let err_arm_idxs : Array[Int] = []
+  let err_subpats : Array[Pattern] = []
+  let mut allow_pod_ok = true
+  let mut i = 0
+  while i < arms.length() {
+    let arm = arms[i]
+    match arm.guard_expr {
+      Some(_) => return None
+      None => ()
+    }
+    match arm.pat {
+      PVariant(eq, "Ok", subs, _) => {
+        if (eq != "" && eq != "Result") || subs.length() != 1 || want_kind == 1 {
+          return None
+        }
+        want_kind = 2
+        let sp = subs[0]
+        let ok_safe = match sp {
+          PWild(_) => true
+          PIdent(b, _) =>
+            qbe_ident_is_flat_field_only_expr(arm.body, b) ||
+            qbe_ident_is_match_only_enum_expr(arm.body, b)
+          PVariant(_, _, _, _) => qbe_pat_is_safe_enum_destructure(sp)
+          _ => false
+        }
+        if !ok_safe {
+          allow_pod_ok = false
+        }
+        ok_arm_idxs.push(i)
+        ok_subpats.push(sp)
+      }
+      PVariant(eq, "Err", subs, _) => {
+        if (eq != "" && eq != "Result") || subs.length() != 1 || want_kind == 1 {
+          return None
+        }
+        want_kind = 2
+        err_arm_idxs.push(i)
+        err_subpats.push(subs[0])
+      }
+      PVariant(eq, "Some", subs, _) => {
+        if (eq != "" && eq != "Option") || subs.length() != 1 || want_kind == 2 {
+          return None
+        }
+        want_kind = 1
+        let sp = subs[0]
+        let ok_safe = match sp {
+          PWild(_) => true
+          PIdent(b, _) =>
+            qbe_ident_is_flat_field_only_expr(arm.body, b) ||
+            qbe_ident_is_match_only_enum_expr(arm.body, b)
+          PVariant(_, _, _, _) => qbe_pat_is_safe_enum_destructure(sp)
+          _ => false
+        }
+        if !ok_safe {
+          allow_pod_ok = false
+        }
+        ok_arm_idxs.push(i)
+        ok_subpats.push(sp)
+      }
+      PVariant(eq, "None", subs, sp) => {
+        if (eq != "" && eq != "Option") || subs.length() != 0 || want_kind == 2 {
+          return None
+        }
+        want_kind = 1
+        err_arm_idxs.push(i)
+        err_subpats.push(PWild(sp))
+      }
+      PWild(sp) => {
+        if i != arms.length() - 1 {
+          return None
+        }
+        ok_arm_idxs.push(i)
+        ok_subpats.push(PWild(sp))
+        err_arm_idxs.push(i)
+        err_subpats.push(PWild(sp))
+      }
+      _ => return None
+    }
+    i = i + 1
+  }
+  if want_kind == 0 || ok_arm_idxs.length() == 0 || err_arm_idxs.length() == 0 {
+    return None
+  }
+  let sc = match qbe_try_emit_opt_res_scalarized(g, scrut, want_kind, allow_pod_ok) {
+    Some(s) => s
+    None => return None
+  }
+  if g.block_term {
+    return Some(qval("0", TNever))
+  }
+  let ok_ty = match sc.ret_ty {
+    TOption(inner) => inner
+    TResult(ot, _) => ot
+    _ => return None
+  }
+  let err_ty_opt : Option[Ty] = match sc.ret_ty {
+    TResult(_, et) => Some(et)
+    _ => None
+  }
+  let tag_w = qbe_tmp(g)
+  qbe_emit(g, tag_w + " =w loadw " + sc.tag_slot)
+  let l_ok = qbe_lbl(g, "scmn_ok")
+  let l_err = qbe_lbl(g, "scmn_err")
+  let l_end = qbe_lbl(g, "scmn_end")
+  qbe_emit_term(g, "jnz " + tag_w + ", " + l_ok + ", " + l_err)
+  let mut res_slot = ""
+  let mut res_ty : Option[Ty] = qbe_probe_arms_ty(g, arms, Some(sc.ret_ty), expected)
+  let mut saw_untyped_none = false
+  let mut all_term = true
+  // Ok / Some branch
+  qbe_emit_lbl(g, l_ok)
+  g.block_immut_fields = Map([])
+  qbe_scope_push(g)
+  let mut ok_loc_slot = ""
+  if !sc.val_is_pod_buf {
+    let v_ok = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
+    let oloc = qbe_define_local(g, "__scmn_ok", ok_ty, true)
+    qbe_store_local_slot(g, v_ok, oloc.slot, ok_ty)
+    ok_loc_slot = oloc.slot
+  }
+  let l_ok_done = qbe_lbl(g, "scmn_ok_done")
+  let mut ok_all_term = true
+  let mut oi = 0
+  while oi < ok_arm_idxs.length() {
+    let arm = arms[ok_arm_idxs[oi]]
+    let subpat = ok_subpats[oi]
+    let l_next = qbe_lbl(g, "scmn_onext")
+    let cur_ok = if sc.val_is_pod_buf {
+      sc.val_slot
+    } else {
+      qbe_load_local_slot(g, ok_loc_slot, ok_ty)
+    }
+    qbe_emit_pat_test(g, subpat, cur_ok, ok_ty, l_next)
+    qbe_scope_push(g)
+    let bind_ok = if sc.val_is_pod_buf {
+      sc.val_slot
+    } else {
+      qbe_load_local_slot(g, ok_loc_slot, ok_ty)
+    }
+    if sc.val_is_pod_buf {
+      match subpat {
+        PIdent(b, _) => {
+          let vloc = qbe_define_local(g, b, ok_ty, false)
+          qbe_emit(g, "storel " + sc.val_slot + ", " + vloc.slot)
+        }
+        _ => qbe_emit_pat_bind(g, subpat, bind_ok, ok_ty, false, arm.body)
+      }
+    } else {
+      qbe_emit_pat_bind(g, subpat, bind_ok, ok_ty, false, arm.body)
+    }
+    let sv = qbe_emit_expr(g, arm.body, res_ty)
+    match res_ty {
+      None =>
+        match sv.ty {
+          TNever => ()
+          _ => {
+            if qbe_ty_has_untyped_option(sv.ty) {
+              saw_untyped_none = true
+            }
+            res_ty = Some(sv.ty)
+          }
+        }
+      Some(rt) => {
+        if qbe_ty_has_untyped_option(sv.ty) {
+          saw_untyped_none = true
+        }
+        res_ty = Some(ty_prefer_concrete(rt, sv.ty))
+      }
+    }
+    let arm_term = g.block_term
+    if !arm_term {
+      ok_all_term = false
+      all_term = false
+      let store_ty = match res_ty {
+        Some(t) => t
+        None => sv.ty
+      }
+      if res_slot == "" {
+        res_slot = qbe_alloc_slot_for(g, store_ty)
+      }
+      qbe_store_local_slot(g, qbe_coerce_val(g, sv, store_ty), res_slot, store_ty)
+    }
+    qbe_scope_pop(g)
+    if !arm_term {
+      qbe_emit_term(g, "jmp " + l_ok_done)
+    }
+    qbe_emit_lbl(g, l_next)
+    g.block_immut_fields = Map([])
+    oi = oi + 1
+  }
+  let f_id = qbe_intern_cstring(g, arms[0].span.file)
+  let m_id = qbe_intern_cstring(g, "non-exhaustive match")
+  qbe_emit(
+    g,
+    "call $pion_panic(l $pion_cstr_" +
+    m_id.to_string() +
+    ", l $pion_cstr_" +
+    f_id.to_string() +
+    ", w " +
+    arms[0].span.line.to_string() +
+    ")",
+  )
+  qbe_emit_term(g, "hlt")
+  if ok_all_term {
+    let _ = g.scopes.pop()
+  } else {
+    qbe_emit_lbl(g, l_ok_done)
+    g.block_immut_fields = Map([])
+    qbe_scope_pop(g)
+    qbe_emit_term(g, "jmp " + l_end)
+  }
+  // Err / None branch
+  qbe_emit_lbl(g, l_err)
+  g.block_immut_fields = Map([])
+  qbe_scope_push(g)
+  let mut err_loc_slot = ""
+  match err_ty_opt {
+    Some(err_ty) => {
+      let v_err = qbe_load_heap_slot(g, sc.err_slot, err_ty)
+      let eloc = qbe_define_local(g, "__scmn_err", err_ty, true)
+      qbe_store_local_slot(g, v_err, eloc.slot, err_ty)
+      err_loc_slot = eloc.slot
+    }
+    None => ()
+  }
+  let l_err_done = qbe_lbl(g, "scmn_err_done")
+  let mut err_all_term = true
+  let mut ei = 0
+  while ei < err_arm_idxs.length() {
+    let arm = arms[err_arm_idxs[ei]]
+    let subpat = err_subpats[ei]
+    let l_next = qbe_lbl(g, "scmn_enext")
+    match err_ty_opt {
+      Some(err_ty) => {
+        let cur_err = qbe_load_local_slot(g, err_loc_slot, err_ty)
+        qbe_emit_pat_test(g, subpat, cur_err, err_ty, l_next)
+      }
+      None => ()
+    }
+    qbe_scope_push(g)
+    match err_ty_opt {
+      Some(err_ty) => {
+        let bind_err = qbe_load_local_slot(g, err_loc_slot, err_ty)
+        qbe_emit_pat_bind(g, subpat, bind_err, err_ty, false, arm.body)
+      }
+      None => ()
+    }
+    let nv = qbe_emit_expr(g, arm.body, res_ty)
+    match res_ty {
+      None =>
+        match nv.ty {
+          TNever => ()
+          _ => {
+            if qbe_ty_has_untyped_option(nv.ty) {
+              saw_untyped_none = true
+            }
+            res_ty = Some(nv.ty)
+          }
+        }
+      Some(rt) => {
+        if qbe_ty_has_untyped_option(nv.ty) {
+          saw_untyped_none = true
+        }
+        res_ty = Some(ty_prefer_concrete(rt, nv.ty))
+      }
+    }
+    let arm_term = g.block_term
+    if !arm_term {
+      err_all_term = false
+      all_term = false
+      let store_ty = match res_ty {
+        Some(t) => t
+        None => nv.ty
+      }
+      if res_slot == "" {
+        res_slot = qbe_alloc_slot_for(g, store_ty)
+      }
+      qbe_store_local_slot(g, qbe_coerce_val(g, nv, store_ty), res_slot, store_ty)
+    }
+    qbe_scope_pop(g)
+    if !arm_term {
+      qbe_emit_term(g, "jmp " + l_err_done)
+    }
+    qbe_emit_lbl(g, l_next)
+    g.block_immut_fields = Map([])
+    ei = ei + 1
+  }
+  qbe_emit(
+    g,
+    "call $pion_panic(l $pion_cstr_" +
+    m_id.to_string() +
+    ", l $pion_cstr_" +
+    f_id.to_string() +
+    ", w " +
+    arms[0].span.line.to_string() +
+    ")",
+  )
+  qbe_emit_term(g, "hlt")
+  if err_all_term {
+    let _ = g.scopes.pop()
+  } else {
+    qbe_emit_lbl(g, l_err_done)
+    g.block_immut_fields = Map([])
+    qbe_scope_pop(g)
+    qbe_emit_term(g, "jmp " + l_end)
+  }
+  if all_term {
+    g.block_term = true
+    return Some(qval("0", TNever))
+  }
+  qbe_emit_lbl(g, l_end)
+  g.block_immut_fields = Map([])
+  let final_ty = match res_ty {
+    Some(t) => t
+    None => TUnit
+  }
+  if res_slot == "" {
+    Some(qval(qbe_zero_reg(final_ty), final_ty))
+  } else {
+    let mut r = qbe_load_local_slot(g, res_slot, final_ty)
+    if saw_untyped_none {
+      r = qbe_normalize_untyped_none_in_val(g, r, final_ty)
+    }
+    Some(qval(r, final_ty))
+  }
+}
+
+///|
 /// Zero-alloc scalarized `match` over a short-lived boxed `Option[T]` / `Result[T, E]`.
 fn qbe_try_emit_scalar_opt_res_match(
   g : QbeGen,
@@ -15036,9 +16047,11 @@ fn qbe_try_emit_scalar_opt_res_match(
 ) -> Option[QbeVal] {
   let (want_kind, ok_idx, err_idx, ok_bind, err_bind) = match qbe_match_2arm_opt_res(arms) {
     Some(t) => t
-    None => return None
+    None => return qbe_try_emit_scalar_opt_res_nested_match(g, scrut, arms, expected)
   }
-  let allow_pod_ok = ok_bind == "" || qbe_ident_is_flat_field_only_expr(arms[ok_idx].body, ok_bind)
+  let allow_pod_ok = ok_bind == "" ||
+    qbe_ident_is_flat_field_only_expr(arms[ok_idx].body, ok_bind) ||
+    qbe_ident_is_match_only_enum_expr(arms[ok_idx].body, ok_bind)
   let sc = match qbe_try_emit_opt_res_scalarized(g, scrut, want_kind, allow_pod_ok) {
     Some(s) => s
     None => return None
@@ -36377,7 +37390,95 @@ fn qbe_try_emit_stack_pod_let(
   }
   let sinfo = match qbe_pure_scalar_pod_struct_info(g, final_ty) {
     Some(si) => si
-    None => return false
+    None =>
+      match qbe_pure_scalar_pod_enum_info(g, final_ty) {
+        Some((einfo, nslots)) => {
+          if !qbe_ident_is_match_only_enum_stmts(stmts, idx + 1, bname) {
+            return false
+          }
+          let pod_bytes = nslots * 8
+          // Case E1: `let st = expr?` (e.g. `let st = decode(...)?`)
+          match init {
+            ETry(inner, try_sp) =>
+              match qbe_try_emit_opt_res_scalarized(g, inner, 0, true) {
+                Some(sc) => {
+                  if g.block_term {
+                    return true
+                  }
+                  match sc.ret_ty {
+                    TResult(ok_ty, err_ty) => {
+                      let tag_w = qbe_tmp(g)
+                      let l_ok = qbe_lbl(g, "try_ok")
+                      let l_err = qbe_lbl(g, "try_err")
+                      qbe_emit(g, tag_w + " =w loadw " + sc.tag_slot)
+                      qbe_emit_term(g, "jnz " + tag_w + ", " + l_ok + ", " + l_err)
+                      qbe_emit_lbl(g, l_err)
+                      let err_v = qbe_load_heap_slot(g, sc.err_slot, err_ty)
+                      qbe_emit_try_err_exit(g, err_v, err_ty, ok_ty, "", try_sp)
+                      qbe_emit_lbl(g, l_ok)
+                      qbe_clear_shadowed_local_meta(g, bname)
+                      if sc.val_is_pod_buf {
+                        let loc = qbe_define_local(g, bname, final_ty, false)
+                        qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+                      } else {
+                        let payload = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
+                        let loc = qbe_define_local(g, bname, final_ty, true)
+                        qbe_store_local_slot(
+                          g,
+                          qbe_coerce_val(g, qval(payload, ok_ty), final_ty),
+                          loc.slot,
+                          final_ty,
+                        )
+                      }
+                      return true
+                    }
+                    TOption(inner_ty) => {
+                      let tag_w = qbe_tmp(g)
+                      let l_some = qbe_lbl(g, "try_some")
+                      let l_none = qbe_lbl(g, "try_none")
+                      qbe_emit(g, tag_w + " =w loadw " + sc.tag_slot)
+                      qbe_emit_term(g, "jnz " + tag_w + ", " + l_some + ", " + l_none)
+                      qbe_emit_lbl(g, l_none)
+                      qbe_emit_try_none_exit(g)
+                      qbe_emit_lbl(g, l_some)
+                      qbe_clear_shadowed_local_meta(g, bname)
+                      if sc.val_is_pod_buf {
+                        let loc = qbe_define_local(g, bname, final_ty, false)
+                        qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+                      } else {
+                        let payload = qbe_load_heap_slot(g, sc.val_slot, inner_ty)
+                        let loc = qbe_define_local(g, bname, final_ty, true)
+                        qbe_store_local_slot(
+                          g,
+                          qbe_coerce_val(g, qval(payload, inner_ty), final_ty),
+                          loc.slot,
+                          final_ty,
+                        )
+                      }
+                      return true
+                    }
+                    _ => ()
+                  }
+                }
+                None => ()
+              }
+            _ => ()
+          }
+          // Case E2: direct pure-scalar enum ctor tails (`let st = if c { Complete(true, 2) } else { Incomplete }`)
+          if qbe_expr_all_tails_are_pod_enum_ctors(g, init, einfo, final_ty) {
+            let stk = qbe_alloc_immortal_enum_stack_buf(g, pod_bytes)
+            qbe_emit_tail_pod_enum_into_buf(g, init, einfo, final_ty, stk)
+            if !g.block_term {
+              qbe_clear_shadowed_local_meta(g, bname)
+              let loc = qbe_define_local(g, bname, final_ty, false)
+              qbe_emit(g, "storel " + stk + ", " + loc.slot)
+            }
+            return true
+          }
+          return false
+        }
+        None => return false
+      }
   }
   if !qbe_ident_is_flat_pod_consumer_stmts(
     g,
@@ -41126,6 +42227,136 @@ fn qbe_is_early_drop_ty(t : Ty) -> Bool {
 }
 
 ///|
+/// Fuse adjacent single-use `let r = call(...); match r { ... }` into scalarized
+/// `Option`/`Result` matching without boxing `r`, preserving evaluation order.
+fn qbe_try_emit_let_match_opt_res(
+  g : QbeGen,
+  stmts : Array[Stmt],
+  idx : Int,
+  expected : Option[Ty],
+) -> Option[QbeVal] {
+  if !g.release || idx + 1 >= stmts.length() {
+    return None
+  }
+  let (rname, is_mut, init) = match stmts[idx] {
+    SLet(n, m, _, ini, _) => (n, m, ini)
+    _ => return None
+  }
+  if is_mut || rname == "_" || g.boxed_mut_vars.contains(rname) {
+    return None
+  }
+  // `rname` must not be referenced in any statement after `idx + 1`.
+  let mut k = idx + 2
+  while k < stmts.length() {
+    match stmts[k] {
+      SLet(n2, _, _, init2, _) => {
+        if qbe_expr_mentions_ident(init2, rname) {
+          return None
+        }
+        if n2 == rname {
+          break
+        }
+      }
+      SLetTuple(ns2, _, init2, _) => {
+        if qbe_expr_mentions_ident(init2, rname) {
+          return None
+        }
+        if str_arr_contains(ns2, rname) {
+          break
+        }
+      }
+      _ =>
+        if qbe_stmt_mentions_ident(stmts[k], rname) {
+          return None
+        }
+    }
+    k = k + 1
+  }
+  let is_last_pair = idx + 1 == stmts.length() - 1
+  let (kind, dst_name, dst_ty_opt, arms) : (Int, String, Option[Ty], Array[MatchArm]) = match stmts[idx + 1] {
+    SExpr(EMatch(EIdent(mn, _), a, _), _) =>
+      if mn == rname {
+        (0, "", None, a)
+      } else {
+        return None
+      }
+    SLet(dn, dmut, dte, EMatch(EIdent(mn, _), a, _), _) =>
+      if mn == rname && !dmut && !g.boxed_mut_vars.contains(dn) {
+        let dty : Option[Ty] = match dte {
+          TyMissing(_) => None
+          _ => Some(qbe_resolve_type(g, dte))
+        }
+        (1, dn, dty, a)
+      } else {
+        return None
+      }
+    SReturn(Some(EMatch(EIdent(mn, _), a, _)), _) =>
+      if mn == rname && g.inline_ret_lbl == "" {
+        (2, "", Some(g.cur_ret_ty), a)
+      } else {
+        return None
+      }
+    _ => return None
+  }
+  // Ensure `rname` is not referenced inside any arm body or guard (unless shadowed).
+  let mut ai = 0
+  while ai < arms.length() {
+    if !qbe_pat_binds_name(arms[ai].pat, rname) {
+      match arms[ai].guard_expr {
+        Some(ge) => if qbe_expr_mentions_ident(ge, rname) { return None }
+        None => ()
+      }
+      if qbe_expr_mentions_ident(arms[ai].body, rname) {
+        return None
+      }
+    }
+    ai = ai + 1
+  }
+  let exp : Option[Ty] = if kind == 0 {
+    if is_last_pair { expected } else { None }
+  } else {
+    dst_ty_opt
+  }
+  let mv = match qbe_try_emit_scalar_opt_res_match(g, init, arms, exp) {
+    Some(v) => v
+    None => return None
+  }
+  if g.block_term {
+    return Some(qval("0", TNever))
+  }
+  if kind == 0 {
+    if !is_last_pair {
+      qbe_rc_dec(g, mv.reg, mv.ty)
+      return Some(qval("0", TUnit))
+    }
+    Some(mv)
+  } else if kind == 1 {
+    let final_ty = match dst_ty_opt {
+      Some(t) => subst_ty(t, g.cur_type_subst)
+      None => mv.ty
+    }
+    let cv = qbe_coerce_val(g, mv, final_ty)
+    if dst_name == "_" {
+      qbe_rc_dec(g, cv, final_ty)
+    } else {
+      qbe_clear_shadowed_local_meta(g, dst_name)
+      let loc = qbe_define_local(g, dst_name, final_ty, true)
+      qbe_store_local_slot(g, cv, loc.slot, final_ty)
+    }
+    Some(qval("0", TUnit))
+  } else {
+    let ret_ty = g.cur_ret_ty
+    let cv = qbe_coerce_val(g, mv, ret_ty)
+    qbe_release_scopes_down_to(g, 0)
+    match ret_ty {
+      TUnit | TNever => qbe_emit_term(g, "ret")
+      _ => qbe_emit_term(g, "ret " + cv)
+    }
+    Some(qval("0", TNever))
+  }
+}
+
+///|
 fn qbe_emit_stmts(
   g : QbeGen,
   stmts : Array[Stmt],
@@ -41222,6 +42453,18 @@ fn qbe_emit_stmts(
         _ => ()
       }
       last = qval("0", TUnit)
+    } else if !is_last &&
+      {
+        match qbe_try_emit_let_match_opt_res(g, stmts, i, expected) {
+          Some(mv) => {
+            last = mv
+            i = i + 2
+            true
+          }
+          None => false
+        }
+      } {
+      continue
     } else if !is_last && qbe_try_emit_stack_pod_let(g, stmts, i) {
       last = qval("0", TUnit)
     } else if !is_last &&
