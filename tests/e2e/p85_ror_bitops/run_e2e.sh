@@ -70,6 +70,10 @@ fn check_i64(x : Int64, n : Int) -> String {
 fn sh_u(x : UInt, k : UInt) -> UInt { x >> (1 + k) }
 fn sh_i(x : UInt, n : Int) -> UInt { x << (32 - n) }
 
+fn amount() -> Int {
+  1
+}
+
 fn sh_signed_div(x : UInt, n : Int) -> UInt {
   x << (1 + (1 / n))
 }
@@ -78,14 +82,22 @@ fn sh_nested_uint(x : UInt, k : UInt, n : Int) -> UInt {
   x >> (1 + (k << n))
 }
 
+fn sh_shadow_closure(x : UInt, amount : () -> UInt) -> UInt {
+  x >> (1 + amount())
+}
+
 pub fn main(w : World) -> Int {
-  // R3-A shift RHS signed div & nested UInt shift parity (Native dev/rel == Wasm32)
+  // R3-A + R4 shift RHS signed div, nested UInt shift & local closure shadowing (Native dev/rel == Wasm32)
   if sh_signed_div(1U, -1) != 1U {
     io_println(w, "FAIL: sh_signed_div")
     return 1
   }
   if sh_nested_uint(0xF000U, 1U, 2) != (0xF000U >> 5U) {
     io_println(w, "FAIL: sh_nested_uint")
+    return 1
+  }
+  if sh_shadow_closure(0xF000U, fn() { 2U }) != (0xF000U >> 3U) {
+    io_println(w, "FAIL: sh_shadow_closure")
     return 1
   }
   if sh_u(0x80U, 2U) != 0x10U || sh_i(1U, 24) != 256U {

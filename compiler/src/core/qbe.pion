@@ -792,6 +792,80 @@ fn qbe_shift_rhs_infer(g : QbeGen, sp : Span) -> Option[Ty] {
 }
 
 ///|
+/// Fallback shift-count type hint when `g.tc.shift_rhs_infer` has no entry
+/// (e.g. `emit_qbe_package(pkg, true)` invoked without a populated TypeChecker).
+fn qbe_shift_rhs_ty_hint(g : QbeGen, e : Expr) -> Option[Ty] {
+  match e {
+    EInt(_, _) => None
+    EInt64(_, _) => Some(TInt64)
+    EUInt(_, _) => Some(TUInt)
+    EUInt64(_, _) => Some(TUInt64)
+    EByte(_, _) => Some(TByte)
+    EIdent(v, _) =>
+      match qbe_lookup_local(g, v) {
+        Some(loc) => Some(loc.ty)
+        None =>
+          if g.mono_pkg != "" {
+            match g.tc.imported_pkgs.get(g.mono_pkg) {
+              Some(ipkg) =>
+                match ipkg.tc.consts.get(v) {
+                  Some(t) => Some(subst_ty(qualify_imported_ty(ipkg.name, t), g.cur_type_subst))
+                  None => None
+                }
+              None => g.tc.consts.get(v)
+            }
+          } else {
+            g.tc.consts.get(v)
+          }
+      }
+    EUnary(_, x, _) => qbe_shift_rhs_ty_hint(g, x)
+    EAs(_, ty_e, _) => Some(qbe_resolve_type(g, ty_e))
+    ECall(EIdent(fnm, _), _, _) =>
+      match qbe_lookup_local(g, fnm) {
+        Some(loc) =>
+          match loc.ty {
+            TFn(_, rty) => Some(subst_ty(rty, g.cur_type_subst))
+            _ => None
+          }
+        None => {
+          let cur_tc = if g.mono_pkg != "" {
+            match g.tc.imported_pkgs.get(g.mono_pkg) {
+              Some(ipkg) => ipkg.tc
+              None => g.tc
+            }
+          } else {
+            g.tc
+          }
+          match cur_tc.fns.get(fnm) {
+            Some(fi) =>
+              if fi.decl.type_params.length() == 0 {
+                let rt = if g.mono_pkg != "" {
+                  qualify_imported_ty(g.mono_pkg, fi.ret_ty)
+                } else {
+                  fi.ret_ty
+                }
+                Some(subst_ty(rt, g.cur_type_subst))
+              } else {
+                None
+              }
+            None => None
+          }
+        }
+      }
+    EBinary(bop, l, r, _) =>
+      if bop == "<<" || bop == ">>" {
+        qbe_shift_rhs_ty_hint(g, l)
+      } else {
+        match qbe_shift_rhs_ty_hint(g, l) {
+          Some(t) => Some(t)
+          None => qbe_shift_rhs_ty_hint(g, r)
+        }
+      }
+    _ => None
+  }
+}
+
+///|
 /// Type the checker inferred for a closure expression (including unannotated
 /// parameter and return types from expected `TFn(...)` context).
 fn qbe_closure_infer(g : QbeGen, sp : Span) -> Option[Ty] {
@@ -4297,11 +4371,119 @@ fn qbe_type_expr_has_array(g : QbeGen, te : TypeExpr, depth : Int) -> Bool {
 }
 
 ///|
+fn qbe_is_prim_scalar_ty(ty : Ty) -> Bool {
+  match ty {
+    TInt | TUInt | TInt64 | TUInt64 | TByte | TInt8 | TChar | TBool | TFloat | TDouble =>
+      true
+    _ => false
+  }
+}
+
+///|
+fn qbe_is_builtin_scalar_method(mname : String) -> Bool {
+  mname == "count_ones" ||
+  mname == "leading_zeros" ||
+  mname == "trailing_zeros" ||
+  mname == "rotate_left" ||
+  mname == "rotate_right" ||
+  mname == "to_int" ||
+  mname == "to_uint" ||
+  mname == "to_int64" ||
+  mname == "to_uint64" ||
+  mname == "to_byte" ||
+  mname == "to_int8" ||
+  mname == "to_double" ||
+  mname == "to_float" ||
+  mname == "abs" ||
+  mname == "min" ||
+  mname == "max" ||
+  mname == "sqrt" ||
+  mname == "floor" ||
+  mname == "ceil" ||
+  mname == "round" ||
+  mname == "trunc" ||
+  mname == "reinterpret_as_int" ||
+  mname == "reinterpret_as_uint" ||
+  mname == "reinterpret_as_int64" ||
+  mname == "reinterpret_as_uint64" ||
+  mname == "reinterpret_as_float" ||
+  mname == "reinterpret_as_double"
+}
+
+///|
+fn qbe_stmts_rebind_name(stmts : Array[Stmt], name : String) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    match stmts[i] {
+      SLet(n, _, _, init, _) =>
+        if n == name || qbe_expr_rebinds_ident(init, name) {
+          return true
+        }
+      SLetTuple(ns, _, init, _) => {
+        let mut ni = 0
+        while ni < ns.length() {
+          if ns[ni] == name {
+            return true
+          }
+          ni = ni + 1
+        }
+        if qbe_expr_rebinds_ident(init, name) {
+          return true
+        }
+      }
+      SAssign(l, r, _) | SCompoundAssign(_, l, r, _) =>
+        if qbe_expr_rebinds_ident(l, name) || qbe_expr_rebinds_ident(r, name) {
+          return true
+        }
+      SWhile(c, body, _) | SGuard(c, body, _) =>
+        if qbe_expr_rebinds_ident(c, name) || qbe_stmts_rebind_name(body, name) {
+          return true
+        }
+      SFor(init, c, step, body, _) =>
+        if qbe_stmts_rebind_name([init], name) ||
+          qbe_expr_rebinds_ident(c, name) ||
+          qbe_stmts_rebind_name([step], name) ||
+          qbe_stmts_rebind_name(body, name) {
+          return true
+        }
+      SForRange(v, a, b, _, body, _) =>
+        if v == name ||
+          qbe_expr_rebinds_ident(a, name) ||
+          qbe_expr_rebinds_ident(b, name) ||
+          qbe_stmts_rebind_name(body, name) {
+          return true
+        }
+      SForIn(v1, v2, it, body, _) =>
+        if v1 == name ||
+          v2 == name ||
+          qbe_expr_rebinds_ident(it, name) ||
+          qbe_stmts_rebind_name(body, name) {
+          return true
+        }
+      SReturn(ro, _) =>
+        match ro {
+          Some(re) => if qbe_expr_rebinds_ident(re, name) { return true }
+          None => ()
+        }
+      SDebugAssert(c, m, _) =>
+        if qbe_expr_rebinds_ident(c, name) || qbe_expr_rebinds_ident(m, name) {
+          return true
+        }
+      SExpr(e, _) => if qbe_expr_rebinds_ident(e, name) { return true }
+      SBreak(_) | SContinue(_) => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
 fn qbe_expr_has_array_layout(
   g : QbeGen,
   depth : Int,
   call_depth : Int,
   visited : Map[String, Bool],
+  scalar_params : Map[String, Bool],
   e : Expr,
 ) -> Bool {
   if depth > 16 {
@@ -4310,7 +4492,36 @@ fn qbe_expr_has_array_layout(
   match e {
     EArrayLit(_, _) | EIndex(_, _, _) => true
     EPath(qual, _, _) => qual == "Array" || qual == "FixedArray"
-    EMethodCall(_, _, _, _) => true
+    EMethodCall(recv, mname, args, _) => {
+      let is_known_scalar_recv = match recv {
+        EInt(_, _)
+        | EInt64(_, _)
+        | EUInt(_, _)
+        | EUInt64(_, _)
+        | EDouble(_, _)
+        | EFloat(_, _)
+        | EBool(_, _)
+        | EByte(_, _)
+        | EChar(_, _) => true
+        EIdent(vn, _) => scalar_params.contains(vn)
+        _ => false
+      }
+      if is_known_scalar_recv && qbe_is_builtin_scalar_method(mname) {
+        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, recv) {
+          return true
+        }
+        let mut i = 0
+        while i < args.length() {
+          if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, args[i]) {
+            return true
+          }
+          i = i + 1
+        }
+        false
+      } else {
+        true
+      }
+    }
     EInt(_, _)
     | EInt64(_, _)
     | EUInt(_, _)
@@ -4329,17 +4540,17 @@ fn qbe_expr_has_array_layout(
     | EField(inner, _, _)
     | ENamedArg(_, _, inner, _)
     | EMutArg(inner, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, inner)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, inner)
     EAs(inner, ty, _) =>
       qbe_type_expr_has_array(g, ty, 0) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, inner)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, inner)
     EBinary(_, l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, l) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, r)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, l) ||
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, r)
     ECall(callee, args, _) => {
       let mut i = 0
       while i < args.length() {
-        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, args[i]) {
+        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, args[i]) {
           return true
         }
         i = i + 1
@@ -4409,7 +4620,7 @@ fn qbe_expr_has_array_layout(
     ETuple(elems, _) | EInterp(elems, _) | EDotVariant(_, elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, elems[i]) {
+        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, elems[i]) {
           return true
         }
         i = i + 1
@@ -4419,14 +4630,14 @@ fn qbe_expr_has_array_layout(
     EStructLit(_, spread_opt, fields, _) => {
       match spread_opt {
         Some(b) =>
-          if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, b) {
+          if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, b) {
             return true
           }
         None => ()
       }
       let mut i = 0
       while i < fields.length() {
-        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, fields[i].value) {
+        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, fields[i].value) {
           return true
         }
         i = i + 1
@@ -4434,33 +4645,33 @@ fn qbe_expr_has_array_layout(
       false
     }
     EBlock(stmts, _) =>
-      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, stmts)
+      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, scalar_params, stmts)
     EIf(cond, then_s, else_opt, _) => {
-      if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, cond) ||
-        qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, then_s) {
+      if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, cond) ||
+        qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, scalar_params, then_s) {
         return true
       }
       match else_opt {
-        Some(ee) => qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, ee)
+        Some(ee) => qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, ee)
         None => false
       }
     }
     EIs(scrut, _, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scrut)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, scrut)
     EMatch(scrut, arms, _) => {
-      if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scrut) {
+      if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, scrut) {
         return true
       }
       let mut i = 0
       while i < arms.length() {
         match arms[i].guard_expr {
           Some(ge) =>
-            if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, ge) {
+            if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, ge) {
               return true
             }
           None => ()
         }
-        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, arms[i].body) {
+        if qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, arms[i].body) {
           return true
         }
         i = i + 1
@@ -4478,7 +4689,7 @@ fn qbe_expr_has_array_layout(
         }
         i = i + 1
       }
-      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, body)
+      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, Map([]), body)
     }
   }
 }
@@ -4489,6 +4700,7 @@ fn qbe_stmt_has_array_layout(
   depth : Int,
   call_depth : Int,
   visited : Map[String, Bool],
+  scalar_params : Map[String, Bool],
   st : Stmt,
 ) -> Bool {
   if depth > 16 {
@@ -4497,36 +4709,36 @@ fn qbe_stmt_has_array_layout(
   match st {
     SLet(_, _, ty, init, _) | SLetTuple(_, ty, init, _) =>
       qbe_type_expr_has_array(g, ty, 0) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, init)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, init)
     SAssign(l, r, _) | SCompoundAssign(_, l, r, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, l) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, r)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, l) ||
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, r)
     SWhile(c, body, _) | SGuard(c, body, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, c) ||
-      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, body)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, c) ||
+      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, scalar_params, body)
     SFor(init, c, step, body, _) =>
-      qbe_stmt_has_array_layout(g, depth + 1, call_depth, visited, init) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, c) ||
-      qbe_stmt_has_array_layout(g, depth + 1, call_depth, visited, step) ||
-      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, body)
+      qbe_stmt_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, init) ||
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, c) ||
+      qbe_stmt_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, step) ||
+      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, scalar_params, body)
     SForRange(_, a, b, _, body, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, a) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, b) ||
-      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, body)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, a) ||
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, b) ||
+      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, scalar_params, body)
     SForIn(_, _, it, body, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, it) ||
-      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, body)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, it) ||
+      qbe_stmts_have_array_layout(g, depth + 1, call_depth, visited, scalar_params, body)
     SReturn(ro, _) =>
       match ro {
-        Some(re) => qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, re)
+        Some(re) => qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, re)
         None => false
       }
     SBreak(_) | SContinue(_) => false
     SDebugAssert(c, m, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, c) ||
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, m)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, c) ||
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, m)
     SExpr(e, _) =>
-      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, e)
+      qbe_expr_has_array_layout(g, depth + 1, call_depth, visited, scalar_params, e)
   }
 }
 
@@ -4536,11 +4748,12 @@ fn qbe_stmts_have_array_layout(
   depth : Int,
   call_depth : Int,
   visited : Map[String, Bool],
+  scalar_params : Map[String, Bool],
   stmts : Array[Stmt],
 ) -> Bool {
   let mut i = 0
   while i < stmts.length() {
-    if qbe_stmt_has_array_layout(g, depth, call_depth, visited, stmts[i]) {
+    if qbe_stmt_has_array_layout(g, depth, call_depth, visited, scalar_params, stmts[i]) {
       return true
     }
     i = i + 1
@@ -4574,11 +4787,17 @@ fn qbe_fn_uses_array_layout_inner(
     g.mono_pkg = saved_pkg
     return true
   }
+  let scalar_params : Map[String, Bool] = Map([])
   let mut i = 0
   while i < finfo.param_tys.length() {
     if qbe_ty_has_array(g, finfo.param_tys[i], 0) {
       g.mono_pkg = saved_pkg
       return true
+    }
+    if i < fd.params.length() &&
+      qbe_is_prim_scalar_ty(finfo.param_tys[i]) &&
+      !qbe_stmts_rebind_name(fd.body, fd.params[i].name) {
+      scalar_params.set(fd.params[i].name, true)
     }
     i = i + 1
   }
@@ -4590,7 +4809,7 @@ fn qbe_fn_uses_array_layout_inner(
     }
     i = i + 1
   }
-  let body_has = qbe_stmts_have_array_layout(g, 0, call_depth, visited, fd.body)
+  let body_has = qbe_stmts_have_array_layout(g, 0, call_depth, visited, scalar_params, fd.body)
   g.mono_pkg = saved_pkg
   body_has
 }
@@ -18088,10 +18307,7 @@ fn qbe_scope_pop(g : QbeGen) -> Unit {
     while zi < sc.locals.length() {
       g.zeroed_slots.remove(sc.locals[zi].slot)
       g.stack_view_slots.remove(sc.locals[zi].slot)
-      g.unfrozen_local_arrs.remove(sc.locals[zi].name)
-      g.u8_range_vars.remove(sc.locals[zi].name)
-      g.known_min_len_arrs.remove(sc.locals[zi].name)
-      g.known_writable_bytes.remove(sc.locals[zi].name)
+      qbe_clear_shadowed_local_meta(g, sc.locals[zi].name)
       zi = zi + 1
     }
     let _ = g.scopes.pop()
@@ -18399,19 +18615,23 @@ fn qbe_emit_verify_arith_check(
     TInt | TUInt => true
     _ => false
   }
+  let is_b = match ty {
+    TByte | TInt8 => true
+    _ => false
+  }
   let is_int = match ty {
-    TInt | TUInt | TInt64 | TUInt64 => true
+    TInt | TUInt | TInt64 | TUInt64 | TByte | TInt8 => true
     _ => false
   }
   if !is_int {
     return
   }
   let signed = match ty {
-    TInt | TInt64 => true
+    TInt | TInt64 | TInt8 => true
     _ => false
   }
   if op == "<<" || op == ">>" {
-    let limit = if is_w { 32L } else { 64L }
+    let limit = if is_b { 8L } else if is_w { 32L } else { 64L }
     match rhs_const {
       Some(sh) => if sh >= 0L && sh < limit { return }
       None => ()
@@ -18428,7 +18648,7 @@ fn qbe_emit_verify_arith_check(
       None => ()
     }
     let file_id = qbe_intern_cstring(g, sp.file)
-    let bits = if is_w { "32" } else { "64" }
+    let bits = if is_b { "8" } else if is_w { "32" } else { "64" }
     let bad = qbe_tmp(g)
     let l_bad = qbe_lbl(g, "vsh_bad")
     let l_ok = qbe_lbl(g, "vsh_ok")
@@ -18445,25 +18665,39 @@ fn qbe_emit_verify_arith_check(
     return
   }
   match rhs_const {
-    Some(d) =>
-      if (d > 0L && (!is_w || d < 2147483648L)) ||
-        (signed && d <= -2L && (!is_w || d >= -2147483648L)) {
+    Some(d) => {
+      let pos_ok = if is_b {
+        if signed { d > 0L && d < 128L } else { d > 0L && d < 256L }
+      } else {
+        d > 0L && (!is_w || d < 2147483648L)
+      }
+      let neg_ok = signed &&
+        d <= -2L &&
+        (if is_b { d >= -128L } else { !is_w || d >= -2147483648L })
+      if pos_ok || neg_ok {
         return
       }
+    }
     None => ()
   }
   let k = if is_w { "w" } else { "l" }
   let rr = qbe_coerce_val(g, rv, ty)
   match qbe_try_parse_pos_i64_reg(rr) {
-    Some(d) =>
-      if d > 0L && (!is_w || d < 2147483648L) {
+    Some(d) => {
+      let pos_ok = if is_b {
+        if signed { d > 0L && d < 128L } else { d > 0L && d < 256L }
+      } else {
+        d > 0L && (!is_w || d < 2147483648L)
+      }
+      if pos_ok {
         return
       }
+    }
     None =>
       if signed && starts_with_str(rr, "-") {
         match qbe_try_parse_pos_i64_reg(rr.slice(1, rr.length())) {
           Some(d) =>
-            if d >= 2L && (!is_w || d <= 2147483648L) {
+            if d >= 2L && (if is_b { d <= 128L } else { !is_w || d <= 2147483648L }) {
               return
             }
           None => ()
@@ -18486,7 +18720,7 @@ fn qbe_emit_verify_arith_check(
   qbe_emit_term(g, "hlt")
   qbe_emit_lbl(g, l_nz)
   if signed {
-    let minv = if is_w { "-2147483648" } else { "-9223372036854775808" }
+    let minv = if is_b { "-128" } else if is_w { "-2147483648" } else { "-9223372036854775808" }
     let a = qbe_tmp(g)
     let b = qbe_tmp(g)
     let c = qbe_tmp(g)
@@ -21202,9 +21436,13 @@ fn qbe_try_const_int(g : QbeGen, e : Expr) -> Option[Int] {
     EInt(raw, _) => Some(qbe_parse_int64_lit(raw).to_int())
     EUnary("-", EInt(raw, _), _) => Some(0 - qbe_parse_int64_lit(raw).to_int())
     EIdent(name, _) =>
-      match qbe_lookup_local(g, name) {
-        Some(_) => None
-        None => g.const_int_vals.get(name)
+      if g.mono_pkg == "" {
+        match qbe_lookup_local(g, name) {
+          Some(_) => None
+          None => g.const_int_vals.get(name)
+        }
+      } else {
+        None
       }
     _ => None
   }
@@ -33224,7 +33462,19 @@ fn qbe_emit_expr_inner(
       let rhs_exp_opt : Option[Ty] = if op == "<<" || op == ">>" {
         match qbe_shift_rhs_infer(g, bin_sp) {
           Some(st) => Some(st)
-          None => Some(lv.ty)
+          None =>
+            match lv.ty {
+              TUInt | TUInt64 | TInt64 =>
+                match qbe_shift_rhs_ty_hint(g, rhs) {
+                  Some(ht) =>
+                    match ht {
+                      TInt | TUInt | TUInt64 | TInt64 => Some(ht)
+                      _ => Some(lv.ty)
+                    }
+                  None => Some(lv.ty)
+                }
+              _ => Some(lv.ty)
+            }
         }
       } else {
         Some(lv.ty)
@@ -38272,6 +38522,7 @@ fn qbe_emit_try_none_exit(g : QbeGen) -> Unit {
 ///|
 fn qbe_clear_shadowed_local_meta(g : QbeGen, name : String) -> Unit {
   g.len_aliases.remove(name)
+  qbe_invalidate_len_aliases_for(g, name)
   g.unfrozen_local_arrs.remove(name)
   g.nonneg_vars.remove(name)
   g.u8_range_vars.remove(name)
@@ -39710,12 +39961,16 @@ fn qbe_try_emit_while_bce_versioned(
           return false
         }
       None =>
-        match g.const_int_vals.get(bound_name) {
-          Some(cv) => {
-            bound_is_lit = true
-            bound_lit = cv.to_int64()
+        if g.mono_pkg == "" {
+          match g.const_int_vals.get(bound_name) {
+            Some(cv) => {
+              bound_is_lit = true
+              bound_lit = cv.to_int64()
+            }
+            None => return false
           }
-          None => return false
+        } else {
+          return false
         }
     }
   }
@@ -45033,10 +45288,11 @@ fn qbe_emit_stmt(
           qval("0", TUnit)
         }
         EIndex(obj, idx, _) => {
+          let rhs_pure = qbe_expr_is_pure_no_trap(g, rhs, false)
           let mut borrowed = false
           let mut ov = qval("0", TError)
           let mut arr_local_name = ""
-          if !qbe_expr_has_assign(idx) && !qbe_expr_has_assign(rhs) {
+          if rhs_pure && !qbe_expr_has_assign(idx) && !qbe_expr_has_assign(rhs) {
             match obj {
               EIdent(lname, _) =>
                 if !qbe_expr_assigns_ident(idx, lname) &&
@@ -45198,10 +45454,35 @@ fn qbe_emit_stmt(
               let old_v = qbe_load_arr_elem(g, ep, elem)
               let rv = qbe_emit_expr(g, rhs, Some(elem))
               let new_v = qbe_emit_compound_binop(g, op, old_v, rv, elem)
+              let is_dyn_arr = match ov.ty {
+                TArray(_) => true
+                _ => false
+              }
+              let store_ep = if is_dyn_arr && !rhs_pure {
+                // Impure RHS may push/realloc (moving data ptr) or pop/clear (shrinking len).
+                let alen2 = qbe_tmp(g)
+                qbe_emit(g, alen2 + " =l loadl " + ov.reg)
+                let oob2 = qbe_tmp(g)
+                let l_oob2 = qbe_lbl(g, "arr_oob2")
+                let l_ok2 = qbe_lbl(g, "arr_ok2")
+                qbe_emit(g, oob2 + " =w cugel " + il + ", " + alen2)
+                qbe_emit_term(g, "jnz " + oob2 + ", " + l_oob2 + ", " + l_ok2)
+                qbe_emit_lbl(g, l_oob2)
+                qbe_emit(g, "call $pion_panic_oob(l " + il + ", l " + alen2 + ")")
+                qbe_emit_term(g, "hlt")
+                qbe_emit_lbl(g, l_ok2)
+                let dp2_p = qbe_tmp(g)
+                let dp2 = qbe_tmp(g)
+                qbe_emit(g, dp2_p + " =l add " + ov.reg + ", 24")
+                qbe_emit(g, dp2 + " =l loadl " + dp2_p)
+                qbe_emit_arr_ep_ty(g, dp2, il, elem)
+              } else {
+                ep
+              }
               if qbe_is_u8_array_elem(g, elem) ||
                 qbe_is_4b_array_elem(g, elem) ||
                 qbe_is_prim_array_elem(elem) {
-                qbe_store_arr_elem(g, new_v, ep, elem)
+                qbe_store_arr_elem(g, new_v, store_ep, elem)
               } else {
                 let vl = qbe_as_l(g, qval(new_v, elem))
                 qbe_emit_adopt_if_frozen(g, ov.reg, vl, elem, true)

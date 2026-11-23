@@ -357,6 +357,224 @@ echo "p85 is_shadow_oob rc=$IS_RC -> $IS_ERR"
 test "$IS_RC" -ne 0
 printf '%s' "$IS_ERR" | grep -q "out of bounds"
 
+# R4 P1-1a: `a[0] += grow(a)` reallocates Array[Byte] & Array[Int] inside RHS -> exact value + ASan/LSan 0 UAF/leak
+cat <<'EOF' > "$TMP_DIR/p85_compound_grow.pion"
+fn grow_b(a : Array[Byte]) -> Byte {
+  let mut k = 0
+  while k < 128 {
+    a.push((k & 255).to_byte())
+    k = k + 1
+  }
+  (5).to_byte()
+}
+fn grow_i(a : Array[Int]) -> Int {
+  let mut k = 0
+  while k < 128 {
+    a.push(k)
+    k = k + 1
+  }
+  7
+}
+pub fn main(world : World) -> Int {
+  let ab : Array[Byte] = [(10).to_byte()]
+  ab[0] += grow_b(ab)
+  let ai : Array[Int] = [100]
+  ai[0] += grow_i(ai)
+  debug_assert(ab[0].to_int() == 15 && ab.length() == 129, "grow_b")
+  debug_assert(ai[0] == 107 && ai.length() == 129, "grow_i")
+  io_println(world, "grow_ok=" + ab[0].to_int().to_string() + ":" + ai[0].to_string())
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_compound_grow" "$TMP_DIR/p85_compound_grow.pion"
+GROW_OUT=$("$TMP_DIR/p85_compound_grow")
+echo "p85 compound_grow -> $GROW_OUT"
+test "$GROW_OUT" = "grow_ok=15:107"
+CC_BIN="${CC:-cc}"
+ASAN_RT="$TMP_DIR/libpionrt_asan.a"
+"$CC_BIN" -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+  -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
+ar rcs "$ASAN_RT" "$TMP_DIR/pion_rt_asan.o"
+printf '#!/bin/sh\nexec %s -fsanitize=address -fno-omit-frame-pointer "$@"\n' "$CC_BIN" > "$TMP_DIR/cc-asan"
+chmod +x "$TMP_DIR/cc-asan"
+CC="$TMP_DIR/cc-asan" PION_RT_LIB="$ASAN_RT" PION_CACHE_DIR="$TMP_DIR/cas_asan" \
+  "$PIONC" build --release -o "$TMP_DIR/p85_compound_grow_asan" "$TMP_DIR/p85_compound_grow.pion"
+if [ "$(uname -s)" = "Linux" ]; then
+  GROW_ASAN=$(ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 "$TMP_DIR/p85_compound_grow_asan")
+else
+  GROW_ASAN=$(ASAN_OPTIONS=halt_on_error=1 "$TMP_DIR/p85_compound_grow_asan")
+fi
+echo "p85 compound_grow ASan/LSan -> $GROW_ASAN"
+test "$GROW_ASAN" = "grow_ok=15:107"
+
+# R4 P1-1b: `a[0] += shrink(a)` clears Array[Byte] inside RHS -> must trap OOB on writeback
+cat <<'EOF' > "$TMP_DIR/p85_compound_shrink_oob.pion"
+fn shrink_b(a : Array[Byte]) -> Byte {
+  a.clear()
+  (1).to_byte()
+}
+pub fn main(world : World) -> Int {
+  let _ = world
+  let ab : Array[Byte] = [(10).to_byte()]
+  ab[0] += shrink_b(ab)
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_compound_shrink_oob" "$TMP_DIR/p85_compound_shrink_oob.pion"
+set +e
+SH_ERR=$("$TMP_DIR/p85_compound_shrink_oob" 2>&1)
+SH_RC=$?
+set -e
+echo "p85 compound_shrink_oob rc=$SH_RC -> $SH_ERR"
+test "$SH_RC" -ne 0
+printf '%s' "$SH_ERR" | grep -q "out of bounds"
+
+# R4 P1-2: outer `let n = a.length()`, inner `let a = short`, then `if n >= 8 { a[x & 7] }` -> must trap OOB
+cat <<'EOF' > "$TMP_DIR/p85_len_alias_shadow_oob.pion"
+pub fn main(world : World) -> Int {
+  let a : FixedArray[Int] = FixedArray::make(8, 1)
+  let short : FixedArray[Int] = FixedArray::make(1, 2)
+  let n = a.length()
+  let x = 7
+  {
+    let a = short
+    if n >= 8 {
+      let v = a[x & 7]
+      io_println(world, v.to_string())
+    }
+  }
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_len_alias_shadow_oob" "$TMP_DIR/p85_len_alias_shadow_oob.pion"
+set +e
+LA_ERR=$("$TMP_DIR/p85_len_alias_shadow_oob" 2>&1)
+LA_RC=$?
+set -e
+echo "p85 len_alias_shadow_oob rc=$LA_RC -> $LA_ERR"
+test "$LA_RC" -ne 0
+printf '%s' "$LA_ERR" | grep -q "out of bounds"
+
+# R4 P1-4 runtime: cross-pkg K=1 (lib) vs K=8 (app) switch & loop versioning must use lib's K=1
+mkdir -p "$TMP_DIR/r4xpkg/r4lib/src" "$TMP_DIR/r4xpkg/r4app/src"
+cat <<'EOF' > "$TMP_DIR/r4xpkg/r4lib/pion.toml"
+[package]
+name = "r4lib"
+version = "0.1.0"
+EOF
+cat <<'EOF' > "$TMP_DIR/r4xpkg/r4lib/src/lib.pion"
+let K : Int = 1
+pub fn sw6[T](a : FixedArray[T], idx : Int) -> Int {
+  let _ = a[0]
+  if idx == K { 101 }
+  else if idx == 2 { 102 }
+  else if idx == 3 { 103 }
+  else if idx == 4 { 104 }
+  else if idx == 5 { 105 }
+  else if idx == 6 { 106 }
+  else { 0 }
+}
+pub fn loop_k[T](a : FixedArray[T]) -> Int {
+  let mut s = 0
+  let mut j = 0
+  while j < K {
+    let _ = a[j]
+    s = s + 1
+    j = j + 1
+  }
+  s
+}
+EOF
+cat <<'EOF' > "$TMP_DIR/r4xpkg/r4app/pion.toml"
+[package]
+name = "r4app"
+version = "0.1.0"
+
+[dependencies]
+r4lib = { path = "../r4lib" }
+EOF
+cat <<'EOF' > "$TMP_DIR/r4xpkg/r4app/src/main.pion"
+import "r4lib"
+let K : Int = 8
+pub fn main(world : World) -> Int {
+  let a : FixedArray[Int] = FixedArray::make(1, 9)
+  let r_sw = r4lib::sw6(a, 1)
+  let r_lp = r4lib::loop_k(a)
+  let _ = K
+  io_println(world, "xpkg=" + r_sw.to_string() + ":" + r_lp.to_string())
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_r4xpkg" "$TMP_DIR/r4xpkg/r4app"
+XPKG_OUT=$("$TMP_DIR/p85_r4xpkg")
+echo "p85 r4xpkg -> $XPKG_OUT"
+test "$XPKG_OUT" = "xpkg=101:1"
+
+# R4 P1-5: #verify TByte `/=` and `%=` dynamic division by zero must panic on BOTH Native and Wasm32
+cat <<'EOF' > "$TMP_DIR/p85_verify_byte_div0.pion"
+#verify
+fn div_byte(mut buf : Array[Byte], d : Byte) -> Unit {
+  buf[0] /= d
+}
+#verify
+fn rem_byte(mut buf : Array[Byte], d : Byte) -> Unit {
+  buf[0] %= d
+}
+pub fn main(world : World) -> Int {
+  let d = if world_args(world).length() >= 0 { (0).to_byte() } else { (1).to_byte() }
+  let mut buf : Array[Byte] = [(10).to_byte()]
+  div_byte(mut buf, d)
+  rem_byte(mut buf, d)
+  0
+}
+EOF
+cat <<'EOF' > "$TMP_DIR/p85_verify_byte_rem0.pion"
+#verify
+fn rem_byte(mut buf : Array[Byte], d : Byte) -> Unit {
+  buf[0] %= d
+}
+pub fn main(world : World) -> Int {
+  let d = if world_args(world).length() >= 0 { (0).to_byte() } else { (1).to_byte() }
+  let mut buf : Array[Byte] = [(10).to_byte()]
+  rem_byte(mut buf, d)
+  0
+}
+EOF
+"$PIONC" build --release -o "$TMP_DIR/p85_verify_byte_div0" "$TMP_DIR/p85_verify_byte_div0.pion"
+set +e
+VD_ERR=$("$TMP_DIR/p85_verify_byte_div0" 2>&1)
+VD_RC=$?
+set -e
+echo "p85 verify_byte_div0 native rc=$VD_RC -> $VD_ERR"
+test "$VD_RC" -ne 0
+printf '%s' "$VD_ERR" | grep -q "division by zero"
+"$PIONC" build --release -o "$TMP_DIR/p85_verify_byte_rem0" "$TMP_DIR/p85_verify_byte_rem0.pion"
+set +e
+VR_ERR=$("$TMP_DIR/p85_verify_byte_rem0" 2>&1)
+VR_RC=$?
+set -e
+echo "p85 verify_byte_rem0 native rc=$VR_RC -> $VR_ERR"
+test "$VR_RC" -ne 0
+printf '%s' "$VR_ERR" | grep -q "division by zero"
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/p85_verify_byte_div0.wasm" "$TMP_DIR/p85_verify_byte_div0.pion"
+  set +e
+  VDW_ERR=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/p85_verify_byte_div0.wasm" 2>&1)
+  VDW_RC=$?
+  set -e
+  echo "p85 verify_byte_div0 wasm32 rc=$VDW_RC -> $VDW_ERR"
+  test "$VDW_RC" -ne 0
+  printf '%s' "$VDW_ERR" | grep -q "division by zero"
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/p85_verify_byte_rem0.wasm" "$TMP_DIR/p85_verify_byte_rem0.pion"
+  set +e
+  VRW_ERR=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/p85_verify_byte_rem0.wasm" 2>&1)
+  VRW_RC=$?
+  set -e
+  echo "p85 verify_byte_rem0 wasm32 rc=$VRW_RC -> $VRW_ERR"
+  test "$VRW_RC" -ne 0
+  printf '%s' "$VRW_ERR" | grep -q "division by zero"
+fi
+
 # Wasm32 Node + Web parity
 if command -v node >/dev/null 2>&1; then
   "$PIONC" build --release --target wasm32 -o "$TMP_DIR/p85_ok.wasm" "$TMP_DIR/p85_ok.pion"
