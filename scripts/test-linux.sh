@@ -489,6 +489,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74a_topo_init_and_variant/run_e2e.sh"
 # P75-A: Signed Int8 + compact 1B/4B arrays + Float32 alias + Bytes::read_i8/read_f32_le (native + ASan + Wasm32 + SSA + RSS).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p75a_compact_i8_f32/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p72a_flat_pod_opt/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74c_licm_alias_soundness/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

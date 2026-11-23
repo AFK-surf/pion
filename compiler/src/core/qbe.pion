@@ -4245,6 +4245,19 @@ fn qbe_invalidate_escaping_unfrozen_arrs(
             if !unstable && !qbe_arr_is_stable_stmts(body, 0, aname, true) {
               unstable = true
             }
+            if !unstable && !g.unfrozen_local_arrs.contains(aname) {
+              let cond_no_calls = match cond_opt {
+                Some(c) => qbe_loop_has_no_calls_expr(g, c)
+                None => true
+              }
+              let step_no_calls = match step_opt {
+                Some(st) => qbe_loop_has_no_calls_stmts(g, [st])
+                None => true
+              }
+              if !cond_no_calls || !step_no_calls || !qbe_loop_has_no_calls_stmts(g, body) {
+                unstable = true
+              }
+            }
             if unstable {
               g.known_min_len_arrs.remove(aname)
             }
@@ -4256,6 +4269,474 @@ fn qbe_invalidate_escaping_unfrozen_arrs(
     }
     si = si + 1
   }
+}
+
+///|
+/// P74-C: Invalidate `known_min_len_arrs` for all potentially-aliased dynamic `TArray` locals
+/// across any non-pure call/method (which may `.pop()`/`.clear()` via an alias).
+fn qbe_invalidate_aliased_min_lens(g : QbeGen) -> Unit {
+  if g.known_min_len_arrs.length() == 0 {
+    return
+  }
+  let keys = g.known_min_len_arrs.keys()
+  let mut i = 0
+  while i < keys.length() {
+    let k = keys[i]
+    if !g.unfrozen_local_arrs.contains(k) {
+      match qbe_lookup_local(g, k) {
+        Some(loc) =>
+          match loc.ty {
+            TArray(_) => g.known_min_len_arrs.remove(k)
+            _ => ()
+          }
+        None => g.known_min_len_arrs.remove(k)
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// P74-C: Conservative check whether statement `s` contains any array element assignment
+/// (`SAssign(EIndex(...))` or `SCompoundAssign(_, EIndex(...))`), which could overwrite
+/// an aliased array slot and `rc_dec` a borrowed element pointer.
+fn qbe_expr_has_other_arr_elem_assign(e : Expr) -> Bool {
+  match e {
+    EBlock(bs, _) => qbe_stmts_has_other_arr_elem_assign(bs)
+    EIf(c, ts, eo, _) => {
+      if qbe_expr_has_other_arr_elem_assign(c) || qbe_stmts_has_other_arr_elem_assign(ts) {
+        return true
+      }
+      match eo {
+        Some(el) => qbe_expr_has_other_arr_elem_assign(el)
+        None => false
+      }
+    }
+    EMatch(s, arms, _) => {
+      if qbe_expr_has_other_arr_elem_assign(s) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => if qbe_expr_has_other_arr_elem_assign(ge) { return true }
+          None => ()
+        }
+        if qbe_expr_has_other_arr_elem_assign(arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _)
+    | EField(inner, _, _)
+    | EIs(inner, _, _)
+    | ETry(inner, _) => qbe_expr_has_other_arr_elem_assign(inner)
+    EBinary(_, l, r, _) | EIndex(l, r, _) =>
+      qbe_expr_has_other_arr_elem_assign(l) || qbe_expr_has_other_arr_elem_assign(r)
+    ECall(callee, args, _) => {
+      if qbe_expr_has_other_arr_elem_assign(callee) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_other_arr_elem_assign(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EMethodCall(obj, _, args, _) => {
+      if qbe_expr_has_other_arr_elem_assign(obj) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_other_arr_elem_assign(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_expr_has_other_arr_elem_assign(elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(b) => if qbe_expr_has_other_arr_elem_assign(b) { return true }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_expr_has_other_arr_elem_assign(fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn qbe_stmt_has_other_arr_elem_assign(s : Stmt) -> Bool {
+  match s {
+    SAssign(EIndex(_, _, _), _, _) | SCompoundAssign(_, EIndex(_, _, _), _, _) => true
+    SAssign(l, r, _) | SCompoundAssign(_, l, r, _) | SDebugAssert(l, r, _) =>
+      qbe_expr_has_other_arr_elem_assign(l) || qbe_expr_has_other_arr_elem_assign(r)
+    SLet(_, _, _, ini, _) | SLetTuple(_, _, ini, _) | SExpr(ini, _) =>
+      qbe_expr_has_other_arr_elem_assign(ini)
+    SWhile(c, b, _) | SGuard(c, b, _) =>
+      qbe_expr_has_other_arr_elem_assign(c) || qbe_stmts_has_other_arr_elem_assign(b)
+    SFor(is_, c, ss, b, _) =>
+      qbe_stmt_has_other_arr_elem_assign(is_) ||
+      qbe_expr_has_other_arr_elem_assign(c) ||
+      qbe_stmt_has_other_arr_elem_assign(ss) ||
+      qbe_stmts_has_other_arr_elem_assign(b)
+    SForRange(_, se, ee, _, b, _) =>
+      qbe_expr_has_other_arr_elem_assign(se) ||
+      qbe_expr_has_other_arr_elem_assign(ee) ||
+      qbe_stmts_has_other_arr_elem_assign(b)
+    SForIn(_, _, ie, b, _) =>
+      qbe_expr_has_other_arr_elem_assign(ie) || qbe_stmts_has_other_arr_elem_assign(b)
+    SReturn(opt, _) =>
+      match opt {
+        Some(e) => qbe_expr_has_other_arr_elem_assign(e)
+        None => false
+      }
+    SBreak(_) | SContinue(_) => false
+  }
+}
+
+///|
+fn qbe_stmts_has_other_arr_elem_assign(stmts : Array[Stmt]) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if qbe_stmt_has_other_arr_elem_assign(stmts[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// P74-C: Returns true when `fname` is a static non-generic top-level function taking ONLY
+/// immutable primitive scalar parameters (no refs/structs/arrays/World/Ptr/closures). Because
+/// Pion has no mutable globals, such a call cannot reach or mutate any caller array.
+fn qbe_callee_cannot_mutate_arrays(g : QbeGen, fname : String) -> Bool {
+  match qbe_lookup_local(g, fname) {
+    Some(_) => return false
+    None => ()
+  }
+  if g.inline_closures.contains(fname) {
+    return false
+  }
+  let finfo_opt : Option[FnInfo] = if g.mono_pkg == "" {
+    if g.tc.extern_fns.contains(fname) {
+      return false
+    }
+    g.tc.fns.get(fname)
+  } else {
+    match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        if ipkg.tc.extern_fns.contains(fname) {
+          return false
+        } else {
+          match ipkg.tc.fns.get(fname) {
+            Some(fi) => Some(qualify_fn_info(ipkg, fi))
+            None => None
+          }
+        }
+      None => None
+    }
+  }
+  match finfo_opt {
+    Some(finfo) => {
+      if finfo.decl.type_params.length() != 0 || finfo.decl.body.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < finfo.param_tys.length() && i < finfo.decl.params.length() {
+        if finfo.decl.params[i].is_mut {
+          return false
+        }
+        match finfo.param_tys[i] {
+          TInt | TInt64 | TUInt | TUInt64 | TDouble | TFloat | TBool | TByte | TChar => ()
+          _ => return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    None => false
+  }
+}
+
+///|
+/// P74-C: Like `qbe_loop_has_no_calls_stmt_with`, but also permits mutating methods
+/// (`push`/`pop`/`clear`/`reserve`) on a provably-unaliased local array `tname != aname`
+/// in `g.unfrozen_local_arrs`, and calls to static pure-scalar-param functions that cannot
+/// reach or mutate any caller array.
+fn qbe_no_aliasing_calls_expr(
+  g : QbeGen,
+  e : Expr,
+  aname : String,
+  hints : QbeProbeHints,
+) -> Bool {
+  if qbe_loop_has_no_calls_expr_with(g, e, hints) {
+    return true
+  }
+  match e {
+    ECall(EIdent(fname, _), args, _) => {
+      let is_pure_ctor = fname == "panic" ||
+        fname == "Some" ||
+        fname == "Ok" ||
+        fname == "Err" ||
+        (match qbe_lookup_variant_enum(g, fname) {
+          Some(_) => true
+          None => false
+        })
+      if is_pure_ctor || qbe_callee_cannot_mutate_arrays(g, fname) {
+        let mut i = 0
+        while i < args.length() {
+          if !qbe_no_aliasing_calls_expr(g, args[i], aname, hints) {
+            return false
+          }
+          i = i + 1
+        }
+        true
+      } else {
+        false
+      }
+    }
+    ECall(EPath(qual, mem, _), args, _) => {
+      let is_pure_path = (qual == "Array" &&
+          (mem == "with_capacity" || mem == "make" || mem == "new")) ||
+        (qual == "FixedArray" && (mem == "make" || mem == "new")) ||
+        (qual == "StringBuilder" && (mem == "new" || mem == "with_capacity")) ||
+        (qual == "Map" && (mem == "new" || mem == "with_capacity")) ||
+        tc_enum_has_variant(g.tc, qual, mem)
+      if is_pure_path {
+        let mut i = 0
+        while i < args.length() {
+          if !qbe_no_aliasing_calls_expr(g, args[i], aname, hints) {
+            return false
+          }
+          i = i + 1
+        }
+        true
+      } else {
+        false
+      }
+    }
+    EMethodCall(obj, mname, args, _) => {
+      if !qbe_no_aliasing_calls_expr(g, obj, aname, hints) {
+        return false
+      }
+      let mut i = 0
+      while i < args.length() {
+        if !qbe_no_aliasing_calls_expr(g, args[i], aname, hints) {
+          return false
+        }
+        i = i + 1
+      }
+      match obj {
+        EIdent(tname, _) =>
+          if tname != aname &&
+            g.unfrozen_local_arrs.contains(tname) &&
+            (mname == "push" || mname == "pop" || mname == "clear" || mname == "reserve") {
+            return true
+          }
+        _ => ()
+      }
+      match qbe_probe_expr_ty_with(g, obj, hints) {
+        Some(raw_ty) =>
+          qbe_is_pure_builtin_method(
+            subst_ty(raw_ty, g.cur_type_subst),
+            mname,
+            args.length(),
+          )
+        None => false
+      }
+    }
+    EBlock(bs, _) => qbe_no_aliasing_calls_stmts(g, bs, aname, hints)
+    EIf(c, ts, eo, _) => {
+      if !qbe_no_aliasing_calls_expr(g, c, aname, hints) ||
+        !qbe_no_aliasing_calls_stmts(g, ts, aname, hints) {
+        return false
+      }
+      match eo {
+        Some(el) => qbe_no_aliasing_calls_expr(g, el, aname, hints)
+        None => true
+      }
+    }
+    EMatch(s, arms, _) => {
+      if !qbe_no_aliasing_calls_expr(g, s, aname, hints) {
+        return false
+      }
+      let scrut_ty_opt = qbe_probe_expr_ty_with(g, s, hints)
+      let mut i = 0
+      while i < arms.length() {
+        let mut arm_hints = hints
+        match (scrut_ty_opt, arms[i].pat) {
+          (Some(raw_st), PVariant(_, vname, subs, _)) => {
+            let st = subst_ty(raw_st, g.cur_type_subst)
+            match st {
+              TEnum(ename, eargs) =>
+                match qbe_lookup_enum_info(g, ename) {
+                  Some(einfo) => {
+                    let esubst = make_subst(einfo.decl.type_params, eargs)
+                    let mut vi = 0
+                    while vi < einfo.variants.length() {
+                      if einfo.variants[vi].name == vname {
+                        let ptys = einfo.variants[vi].field_tys
+                        let mut pi = 0
+                        while pi < subs.length() && pi < ptys.length() {
+                          match subs[pi] {
+                            PIdent(pn, _) =>
+                              if pn != "_" {
+                                let ns = arm_hints.names.copy()
+                                let ts = arm_hints.tys.copy()
+                                ns.push(pn)
+                                ts.push(subst_ty(ptys[pi], esubst))
+                                arm_hints = QbeProbeHints::{ names: ns, tys: ts }
+                              }
+                            _ => ()
+                          }
+                          pi = pi + 1
+                        }
+                        break
+                      }
+                      vi = vi + 1
+                    }
+                  }
+                  None => ()
+                }
+              _ => ()
+            }
+          }
+          _ => ()
+        }
+        match arms[i].guard_expr {
+          Some(ge) => if !qbe_no_aliasing_calls_expr(g, ge, aname, arm_hints) { return false }
+          None => ()
+        }
+        if !qbe_no_aliasing_calls_expr(g, arms[i].body, aname, arm_hints) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | ENamedArg(_, _, inner, _)
+    | EField(inner, _, _)
+    | EIs(inner, _, _)
+    | ETry(inner, _) => qbe_no_aliasing_calls_expr(g, inner, aname, hints)
+    EBinary(_, l, r, _) | EIndex(l, r, _) =>
+      qbe_no_aliasing_calls_expr(g, l, aname, hints) &&
+      qbe_no_aliasing_calls_expr(g, r, aname, hints)
+    EArrayLit(elems, _) | ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if !qbe_no_aliasing_calls_expr(g, elems[i], aname, hints) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(b) => if !qbe_no_aliasing_calls_expr(g, b, aname, hints) { return false }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if !qbe_no_aliasing_calls_expr(g, fields[i].value, aname, hints) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn qbe_no_aliasing_calls_stmt(
+  g : QbeGen,
+  s : Stmt,
+  aname : String,
+  hints : QbeProbeHints,
+) -> Bool {
+  if qbe_loop_has_no_calls_stmt_with(g, s, hints) {
+    return true
+  }
+  match s {
+    SLet(_, _, _, ini, _) | SLetTuple(_, _, ini, _) | SExpr(ini, _) =>
+      qbe_no_aliasing_calls_expr(g, ini, aname, hints)
+    SAssign(l, r, _) | SCompoundAssign(_, l, r, _) | SDebugAssert(l, r, _) =>
+      qbe_no_aliasing_calls_expr(g, l, aname, hints) &&
+      qbe_no_aliasing_calls_expr(g, r, aname, hints)
+    SWhile(c, b, _) | SGuard(c, b, _) =>
+      qbe_no_aliasing_calls_expr(g, c, aname, hints) &&
+      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
+    SFor(is_, c, ss, b, _) =>
+      qbe_no_aliasing_calls_stmt(g, is_, aname, hints) &&
+      qbe_no_aliasing_calls_expr(g, c, aname, hints) &&
+      qbe_no_aliasing_calls_stmt(g, ss, aname, hints) &&
+      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
+    SForRange(_, se, ee, _, b, _) =>
+      qbe_no_aliasing_calls_expr(g, se, aname, hints) &&
+      qbe_no_aliasing_calls_expr(g, ee, aname, hints) &&
+      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
+    SForIn(_, _, ie, b, _) =>
+      qbe_no_aliasing_calls_expr(g, ie, aname, hints) &&
+      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
+    SReturn(opt, _) =>
+      match opt {
+        Some(e) => qbe_no_aliasing_calls_expr(g, e, aname, hints)
+        None => true
+      }
+    SBreak(_) | SContinue(_) => true
+  }
+}
+
+///|
+fn qbe_no_aliasing_calls_stmts(
+  g : QbeGen,
+  stmts : Array[Stmt],
+  aname : String,
+  hints : QbeProbeHints,
+) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if !qbe_no_aliasing_calls_stmt(g, stmts[i], aname, hints) {
+      return false
+    }
+    i = i + 1
+  }
+  true
 }
 
 ///|
@@ -25138,6 +25619,15 @@ fn qbe_emit_expr(
   expected : Option[Ty],
 ) -> QbeVal {
   let res = qbe_emit_expr_inner(g, expr, expected)
+  if g.known_min_len_arrs.length() > 0 {
+    match expr {
+      ECall(_, _, _) | EMethodCall(_, _, _, _) =>
+        if !qbe_loop_has_no_calls_expr(g, expr) {
+          qbe_invalidate_aliased_min_lens(g)
+        }
+      _ => ()
+    }
+  }
   match expected {
     Some(TDynTrait(tname)) =>
       match res.ty {
@@ -31828,6 +32318,64 @@ fn qbe_try_emit_borrowed_arr_elem_let(
               if !qbe_arr_is_stable_stmts(stmts, idx + 1, aname, false) {
                 return false
               }
+              if !g.unfrozen_local_arrs.contains(aname) {
+                // P74-C: `aname` may be aliased; while `bname` is live (up to `last_use`),
+                // reject any call (could realloc/shrink/overwrite via alias) or any other
+                // array element assignment before `last_use` (could overwrite & rc_dec slot).
+                let mut last_use = idx
+                let mut uj = idx + 1
+                while uj < stmts.length() {
+                  if qbe_stmt_mentions_ident(stmts[uj], bname) {
+                    last_use = uj
+                  }
+                  match stmts[uj] {
+                    SLet(rn, _, _, _, _) => if rn == bname { break }
+                    SLetTuple(rns, _, _, _) => {
+                      let mut rbi = 0
+                      let mut shadowed = false
+                      while rbi < rns.length() {
+                        if rns[rbi] == bname {
+                          shadowed = true
+                        }
+                        rbi = rbi + 1
+                      }
+                      if shadowed {
+                        break
+                      }
+                    }
+                    _ => ()
+                  }
+                  uj = uj + 1
+                }
+                let init_hints = QbeProbeHints::{ names: [bname], tys: [elem] }
+                let mut cj = idx + 1
+                while cj <= last_use {
+                  if !qbe_no_aliasing_calls_stmt(g, stmts[cj], aname, init_hints) {
+                    return false
+                  }
+                  if cj < last_use {
+                    if qbe_stmt_has_other_arr_elem_assign(stmts[cj]) {
+                      return false
+                    }
+                  } else {
+                    let last_assign_ok = match stmts[cj] {
+                      SAssign(EIndex(arr_e, idx_e, _), rhs_e, _) =>
+                        !qbe_expr_has_other_arr_elem_assign(arr_e) &&
+                        !qbe_expr_has_other_arr_elem_assign(idx_e) &&
+                        !qbe_expr_has_other_arr_elem_assign(rhs_e)
+                      SCompoundAssign(_, EIndex(arr_e, idx_e, _), rhs_e, _) =>
+                        !qbe_expr_has_other_arr_elem_assign(arr_e) &&
+                        !qbe_expr_has_other_arr_elem_assign(idx_e) &&
+                        !qbe_expr_has_other_arr_elem_assign(rhs_e)
+                      _ => !qbe_stmt_has_other_arr_elem_assign(stmts[cj])
+                    }
+                    if !last_assign_ok {
+                      return false
+                    }
+                  }
+                  cj = cj + 1
+                }
+              }
               if flat_stride > 0 {
                 if !qbe_ident_is_flat_field_only_stmts(stmts, idx + 1, bname) {
                   return false
@@ -36259,7 +36807,7 @@ fn qbe_emit_stmt(
               _ => ()
             }
           ECall(EPath(q, m, _), margs, _) => {
-            if q == "Array" && (m == "new" || m == "with_capacity") {
+            if q == "Array" && (m == "new" || m == "with_capacity" || m == "make") {
               match final_ty {
                 TArray(_) => g.unfrozen_local_arrs.set(name, true)
                 _ => ()
@@ -37696,8 +38244,18 @@ fn qbe_emit_stmt(
           Some(aloc) =>
             if !aloc.is_cell {
             match aloc.ty {
-              TArray(_) | TFixedArray(_) =>
+              TFixedArray(_) =>
                 if !g.hoisted_arr_len.contains(aname) &&
+                  qbe_arr_is_stable_expr(cond, aname, true) &&
+                  qbe_arr_is_stable_stmts(body, 0, aname, true) {
+                  stable_arrs.push(aname)
+                }
+              TArray(_) =>
+                if !g.hoisted_arr_len.contains(aname) &&
+                  (loop_no_calls ||
+                    g.unfrozen_local_arrs.contains(aname) ||
+                    (qbe_no_aliasing_calls_expr(g, cond, aname, qbe_hints_new()) &&
+                      qbe_no_aliasing_calls_stmts(g, body, aname, qbe_hints_new()))) &&
                   qbe_arr_is_stable_expr(cond, aname, true) &&
                   qbe_arr_is_stable_stmts(body, 0, aname, true) {
                   stable_arrs.push(aname)
@@ -38026,6 +38584,16 @@ fn qbe_emit_stmt(
                             !qbe_stmts_assigns_ident(body, bound_arr) &&
                             !qbe_expr_rebinds_ident(cond, bound_arr) &&
                             !qbe_stmts_rebinds_ident(body, bound_arr)
+                          TFixedArray(_) =>
+                            qbe_arr_is_stable_expr(cond, bound_arr, true) &&
+                            qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
+                          TArray(_) =>
+                            (loop_no_calls ||
+                              g.unfrozen_local_arrs.contains(bound_arr) ||
+                              (qbe_no_aliasing_calls_expr(g, cond, bound_arr, qbe_hints_new()) &&
+                                qbe_no_aliasing_calls_stmts(g, body, bound_arr, qbe_hints_new()))) &&
+                            qbe_arr_is_stable_expr(cond, bound_arr, true) &&
+                            qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
                           _ =>
                             qbe_arr_is_stable_expr(cond, bound_arr, true) &&
                             qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
@@ -38120,6 +38688,16 @@ fn qbe_emit_stmt(
                         !qbe_stmts_assigns_ident(body, bound_arr) &&
                         !qbe_expr_rebinds_ident(cond, bound_arr) &&
                         !qbe_stmts_rebinds_ident(body, bound_arr)
+                      TFixedArray(_) =>
+                        qbe_arr_is_stable_expr(cond, bound_arr, true) &&
+                        qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
+                      TArray(_) =>
+                        (loop_no_calls ||
+                          g.unfrozen_local_arrs.contains(bound_arr) ||
+                          (qbe_no_aliasing_calls_expr(g, cond, bound_arr, qbe_hints_new()) &&
+                            qbe_no_aliasing_calls_stmts(g, body, bound_arr, qbe_hints_new()))) &&
+                        qbe_arr_is_stable_expr(cond, bound_arr, true) &&
+                        qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
                       _ =>
                         qbe_arr_is_stable_expr(cond, bound_arr, true) &&
                         qbe_arr_is_stable_stmts(body, 0, bound_arr, true)
