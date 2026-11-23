@@ -154,6 +154,7 @@ pub struct QbeGen {
   release : Bool
   unit_mode : Bool
   target_wasm : Bool
+  target_name : String
   mut export_internals : Bool
   pkg_prefix : String
   struct_order : Array[String]
@@ -14094,8 +14095,157 @@ fn qbe_try_emit_scalar_is_expr(
 }
 
 ///|
+/// P74-D: Returns true when the target backend natively implements IEEE-754
+/// saturating float-to-int conversion (ARM64 `fcvtzs`/`fcvtzu`, Wasm32 `trunc_sat`).
+fn qbe_target_has_hw_sat_ftoi(g : QbeGen) -> Bool {
+  g.target_wasm ||
+  g.target_name == "wasm32" ||
+  g.target_name == "arm64_apple" ||
+  g.target_name == "arm64" ||
+  g.target_name == "ios_arm64" ||
+  g.target_name == "ios_sim_arm64" ||
+  g.target_name == "android_arm64"
+}
+
+///|
+/// P74-D: Emit cross-platform IEEE-754 saturating float-to-int conversion.
+/// On ARM64 and Wasm32 this is a single `dtosi`/`dtoui`/`stosi`/`stoui` instruction;
+/// on x86_64 (and unspecified native targets) an inline NaN/range clamp precedes it.
+fn qbe_emit_flt_to_int_sat(
+  g : QbeGen,
+  reg : String,
+  from_f64 : Bool,
+  to_i64 : Bool,
+  is_unsigned : Bool,
+) -> String {
+  let dst_abi = if to_i64 { "l" } else { "w" }
+  let op = if from_f64 {
+    if is_unsigned { "dtoui" } else { "dtosi" }
+  } else if is_unsigned {
+    "stoui"
+  } else {
+    "stosi"
+  }
+  if qbe_target_has_hw_sat_ftoi(g) {
+    let res = qbe_tmp(g)
+    qbe_emit(g, res + " =" + dst_abi + " " + op + " " + reg)
+    return res
+  }
+  let f_abi = if from_f64 { "d" } else { "s" }
+  let b_abi = if from_f64 { "l" } else { "w" }
+  let cgt = if from_f64 { "cgtd" } else { "cgts" }
+  let cge = if from_f64 { "cged" } else { "cges" }
+  let cle = if from_f64 { "cled" } else { "cles" }
+  let ceq = if from_f64 { "ceqd" } else { "ceqs" }
+  if is_unsigned {
+    let zero_bits = qbe_tmp(g)
+    let zero_flt = qbe_tmp(g)
+    let is_pos = qbe_tmp(g)
+    let l_pos = qbe_lbl(g, "ftoi_pos")
+    let l_zero = qbe_lbl(g, "ftoi_zero")
+    let l_hi = qbe_lbl(g, "ftoi_hi")
+    let l_conv = qbe_lbl(g, "ftoi_conv")
+    let l_end = qbe_lbl(g, "ftoi_end")
+    qbe_emit(g, zero_bits + " =" + b_abi + " copy 0")
+    qbe_emit(g, zero_flt + " =" + f_abi + " cast " + zero_bits)
+    qbe_emit(g, is_pos + " =w " + cgt + " " + reg + ", " + zero_flt)
+    qbe_emit(g, "jnz " + is_pos + ", " + l_pos + ", " + l_zero)
+    qbe_emit_lbl(g, l_pos)
+    let hi_bits_lit = if from_f64 {
+      if to_i64 { "4895412794951729152" } else { "4751297606875873280" }
+    } else if to_i64 {
+      "1602224128"
+    } else {
+      "1333788672"
+    }
+    let hi_bits = qbe_tmp(g)
+    let hi_flt = qbe_tmp(g)
+    let is_hi = qbe_tmp(g)
+    qbe_emit(g, hi_bits + " =" + b_abi + " copy " + hi_bits_lit)
+    qbe_emit(g, hi_flt + " =" + f_abi + " cast " + hi_bits)
+    qbe_emit(g, is_hi + " =w " + cge + " " + reg + ", " + hi_flt)
+    qbe_emit(g, "jnz " + is_hi + ", " + l_hi + ", " + l_conv)
+    qbe_emit_lbl(g, l_conv)
+    let cv = qbe_tmp(g)
+    qbe_emit(g, cv + " =" + dst_abi + " " + op + " " + reg)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_zero)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_hi)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    let res = qbe_tmp(g)
+    qbe_emit(
+      g,
+      res + " =" + dst_abi + " phi " + l_zero + " 0, " + l_hi + " -1, " + l_conv + " " + cv,
+    )
+    res
+  } else {
+    let is_ord = qbe_tmp(g)
+    let l_ord = qbe_lbl(g, "ftoi_ord")
+    let l_nan = qbe_lbl(g, "ftoi_nan")
+    let l_chk_hi = qbe_lbl(g, "ftoi_hi_chk")
+    let l_lo = qbe_lbl(g, "ftoi_lo")
+    let l_hi = qbe_lbl(g, "ftoi_hi")
+    let l_conv = qbe_lbl(g, "ftoi_conv")
+    let l_end = qbe_lbl(g, "ftoi_end")
+    qbe_emit(g, is_ord + " =w " + ceq + " " + reg + ", " + reg)
+    qbe_emit(g, "jnz " + is_ord + ", " + l_ord + ", " + l_nan)
+    qbe_emit_lbl(g, l_ord)
+    let lo_bits_lit = if from_f64 {
+      if to_i64 { "-4332462841530417152" } else { "-4476578029606273024" }
+    } else if to_i64 {
+      "-553648128"
+    } else {
+      "-822083584"
+    }
+    let lo_bits = qbe_tmp(g)
+    let lo_flt = qbe_tmp(g)
+    let is_lo = qbe_tmp(g)
+    qbe_emit(g, lo_bits + " =" + b_abi + " copy " + lo_bits_lit)
+    qbe_emit(g, lo_flt + " =" + f_abi + " cast " + lo_bits)
+    qbe_emit(g, is_lo + " =w " + cle + " " + reg + ", " + lo_flt)
+    qbe_emit(g, "jnz " + is_lo + ", " + l_lo + ", " + l_chk_hi)
+    qbe_emit_lbl(g, l_chk_hi)
+    let hi_bits_lit = if from_f64 {
+      if to_i64 { "4890909195324358656" } else { "4746794007248502784" }
+    } else if to_i64 {
+      "1593835520"
+    } else {
+      "1325400064"
+    }
+    let hi_bits = qbe_tmp(g)
+    let hi_flt = qbe_tmp(g)
+    let is_hi = qbe_tmp(g)
+    qbe_emit(g, hi_bits + " =" + b_abi + " copy " + hi_bits_lit)
+    qbe_emit(g, hi_flt + " =" + f_abi + " cast " + hi_bits)
+    qbe_emit(g, is_hi + " =w " + cge + " " + reg + ", " + hi_flt)
+    qbe_emit(g, "jnz " + is_hi + ", " + l_hi + ", " + l_conv)
+    qbe_emit_lbl(g, l_conv)
+    let cv = qbe_tmp(g)
+    qbe_emit(g, cv + " =" + dst_abi + " " + op + " " + reg)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_nan)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_lo)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_hi)
+    qbe_emit(g, "jmp " + l_end)
+    qbe_emit_lbl(g, l_end)
+    let lo_int = if to_i64 { "-9223372036854775808" } else { "-2147483648" }
+    let hi_int = if to_i64 { "9223372036854775807" } else { "2147483647" }
+    let res = qbe_tmp(g)
+    qbe_emit(
+      g,
+      res + " =" + dst_abi + " phi " + l_nan + " 0, " + l_lo + " " + lo_int + ", " + l_hi + " " + hi_int + ", " + l_conv + " " + cv,
+    )
+    res
+  }
+}
+
+///|
 fn qbe_new(tc : TypeChecker, release : Bool, unit_mode : Bool) -> QbeGen {
-  qbe_new_for_target(tc, release, unit_mode, false)
+  qbe_new_for_target_name(tc, release, unit_mode, false, "")
 }
 
 ///|
@@ -14105,11 +14255,29 @@ fn qbe_new_for_target(
   unit_mode : Bool,
   target_wasm : Bool,
 ) -> QbeGen {
+  qbe_new_for_target_name(
+    tc,
+    release,
+    unit_mode,
+    target_wasm,
+    if target_wasm { "wasm32" } else { "" },
+  )
+}
+
+///|
+fn qbe_new_for_target_name(
+  tc : TypeChecker,
+  release : Bool,
+  unit_mode : Bool,
+  target_wasm : Bool,
+  target_name : String,
+) -> QbeGen {
   QbeGen::{
     tc: tc,
     release: release,
     unit_mode: unit_mode,
     target_wasm: target_wasm,
+    target_name: target_name,
     export_internals: false,
     pkg_prefix: qbe_pkg_prefix_for(tc.pkg_name, tc.multi_pkg),
     struct_order: [],
@@ -20499,13 +20667,11 @@ fn qbe_emit_method_call(
         return qval(r, TString)
       }
       if method_name == "to_int" {
-        let w = qbe_tmp(g)
-        qbe_emit(g, w + " =w dtosi " + obj_val)
+        let w = qbe_emit_flt_to_int_sat(g, obj_val, true, false, false)
         return qval(w, TInt)
       }
       if method_name == "to_int64" {
-        let r = qbe_tmp(g)
-        qbe_emit(g, r + " =l dtosi " + obj_val)
+        let r = qbe_emit_flt_to_int_sat(g, obj_val, true, true, false)
         return qval(r, TInt64)
       }
       if method_name == "to_float" {
@@ -20514,9 +20680,8 @@ fn qbe_emit_method_call(
         return qval(r, TFloat)
       }
       if method_name == "to_int8" {
-        let w = qbe_tmp(g)
+        let w = qbe_emit_flt_to_int_sat(g, obj_val, true, false, false)
         let r = qbe_tmp(g)
-        qbe_emit(g, w + " =w dtosi " + obj_val)
         qbe_emit(g, r + " =l extsb " + w)
         return qval(r, TInt8)
       }
@@ -20560,19 +20725,16 @@ fn qbe_emit_method_call(
         return qval(r, TDouble)
       }
       if method_name == "to_int" {
-        let w = qbe_tmp(g)
-        qbe_emit(g, w + " =w stosi " + obj_val)
+        let w = qbe_emit_flt_to_int_sat(g, obj_val, false, false, false)
         return qval(w, TInt)
       }
       if method_name == "to_int64" {
-        let r = qbe_tmp(g)
-        qbe_emit(g, r + " =l stosi " + obj_val)
+        let r = qbe_emit_flt_to_int_sat(g, obj_val, false, true, false)
         return qval(r, TInt64)
       }
       if method_name == "to_int8" {
-        let w = qbe_tmp(g)
+        let w = qbe_emit_flt_to_int_sat(g, obj_val, false, false, false)
         let r = qbe_tmp(g)
-        qbe_emit(g, w + " =w stosi " + obj_val)
         qbe_emit(g, r + " =l extsb " + w)
         return qval(r, TInt8)
       }
@@ -26438,46 +26600,22 @@ fn qbe_emit_expr_inner(
           }
         TInt =>
           match v.ty {
-            TDouble => {
-              let w = qbe_tmp(g)
-              qbe_emit(g, w + " =w dtosi " + v.reg)
-              qval(w, TInt)
-            }
-            TFloat => {
-              let w = qbe_tmp(g)
-              qbe_emit(g, w + " =w stosi " + v.reg)
-              qval(w, TInt)
-            }
+            TDouble => qval(qbe_emit_flt_to_int_sat(g, v.reg, true, false, false), TInt)
+            TFloat => qval(qbe_emit_flt_to_int_sat(g, v.reg, false, false, false), TInt)
             TInt | TUInt => qval(v.reg, TInt)
             _ => qval(qbe_coerce_val(g, v, TInt), TInt)
           }
         TUInt =>
           match v.ty {
-            TDouble => {
-              let w = qbe_tmp(g)
-              qbe_emit(g, w + " =w dtoui " + v.reg)
-              qval(w, TUInt)
-            }
-            TFloat => {
-              let w = qbe_tmp(g)
-              qbe_emit(g, w + " =w stoui " + v.reg)
-              qval(w, TUInt)
-            }
+            TDouble => qval(qbe_emit_flt_to_int_sat(g, v.reg, true, false, true), TUInt)
+            TFloat => qval(qbe_emit_flt_to_int_sat(g, v.reg, false, false, true), TUInt)
             TInt | TUInt => qval(v.reg, TUInt)
             _ => qval(qbe_coerce_val(g, v, TUInt), TUInt)
           }
         TInt64 =>
           match v.ty {
-            TDouble => {
-              let r = qbe_tmp(g)
-              qbe_emit(g, r + " =l dtosi " + v.reg)
-              qval(r, TInt64)
-            }
-            TFloat => {
-              let r = qbe_tmp(g)
-              qbe_emit(g, r + " =l stosi " + v.reg)
-              qval(r, TInt64)
-            }
+            TDouble => qval(qbe_emit_flt_to_int_sat(g, v.reg, true, true, false), TInt64)
+            TFloat => qval(qbe_emit_flt_to_int_sat(g, v.reg, false, true, false), TInt64)
             TInt => {
               let r = qbe_tmp(g)
               qbe_emit(g, r + " =l extsw " + v.reg)
@@ -26492,16 +26630,8 @@ fn qbe_emit_expr_inner(
           }
         TUInt64 =>
           match v.ty {
-            TDouble => {
-              let r = qbe_tmp(g)
-              qbe_emit(g, r + " =l dtoui " + v.reg)
-              qval(r, TUInt64)
-            }
-            TFloat => {
-              let r = qbe_tmp(g)
-              qbe_emit(g, r + " =l stoui " + v.reg)
-              qval(r, TUInt64)
-            }
+            TDouble => qval(qbe_emit_flt_to_int_sat(g, v.reg, true, true, true), TUInt64)
+            TFloat => qval(qbe_emit_flt_to_int_sat(g, v.reg, false, true, true), TUInt64)
             TInt => {
               let r = qbe_tmp(g)
               qbe_emit(g, r + " =l extsw " + v.reg)
@@ -26517,10 +26647,17 @@ fn qbe_emit_expr_inner(
         TByte =>
           match v.ty {
             TDouble => {
-              let w = qbe_tmp(g)
+              let w = qbe_emit_flt_to_int_sat(g, v.reg, true, false, false)
               let u = qbe_tmp(g)
               let r = qbe_tmp(g)
-              qbe_emit(g, w + " =w dtosi " + v.reg)
+              qbe_emit(g, u + " =l extuw " + w)
+              qbe_emit(g, r + " =l and " + u + ", 255")
+              qval(r, TByte)
+            }
+            TFloat => {
+              let w = qbe_emit_flt_to_int_sat(g, v.reg, false, false, false)
+              let u = qbe_tmp(g)
+              let r = qbe_tmp(g)
               qbe_emit(g, u + " =l extuw " + w)
               qbe_emit(g, r + " =l and " + u + ", 255")
               qval(r, TByte)
@@ -26535,16 +26672,14 @@ fn qbe_emit_expr_inner(
         TInt8 =>
           match v.ty {
             TDouble => {
-              let w = qbe_tmp(g)
+              let w = qbe_emit_flt_to_int_sat(g, v.reg, true, false, false)
               let r = qbe_tmp(g)
-              qbe_emit(g, w + " =w dtosi " + v.reg)
               qbe_emit(g, r + " =l extsb " + w)
               qval(r, TInt8)
             }
             TFloat => {
-              let w = qbe_tmp(g)
+              let w = qbe_emit_flt_to_int_sat(g, v.reg, false, false, false)
               let r = qbe_tmp(g)
-              qbe_emit(g, w + " =w stosi " + v.reg)
               qbe_emit(g, r + " =l extsb " + w)
               qval(r, TInt8)
             }
@@ -41890,7 +42025,32 @@ pub fn emit_qbe_package_multi_entry(
   entry_symbol : String,
   no_main : Bool,
 ) -> QbeEmitResult {
-  let g = qbe_new_for_target(tc, release, false, target_wasm)
+  emit_qbe_package_multi_entry_target(
+    pkg,
+    tc,
+    release,
+    is_entry,
+    dep_pkg_names,
+    target_wasm,
+    if target_wasm { "wasm32" } else { "" },
+    entry_symbol,
+    no_main,
+  )
+}
+
+///|
+pub fn emit_qbe_package_multi_entry_target(
+  pkg : Package,
+  tc : TypeChecker,
+  release : Bool,
+  is_entry : Bool,
+  dep_pkg_names : Array[String],
+  target_wasm : Bool,
+  target_name : String,
+  entry_symbol : String,
+  no_main : Bool,
+) -> QbeEmitResult {
+  let g = qbe_new_for_target_name(tc, release, false, target_wasm, target_name)
   let export_internals = tc.multi_pkg &&
     (pkg_has_pub_generic_fn(pkg) || pkg_has_complex_pub_default(pkg))
   g.export_internals = export_internals
@@ -42167,6 +42327,26 @@ pub fn emit_qbe_package_with_tc(
 }
 
 ///|
+pub fn emit_qbe_package_with_tc_target(
+  pkg : Package,
+  tc : TypeChecker,
+  release : Bool,
+  target_name : String,
+) -> QbeEmitResult {
+  emit_qbe_package_multi_entry_target(
+    pkg,
+    tc,
+    release,
+    true,
+    [],
+    target_name == "wasm32",
+    target_name,
+    "main",
+    false,
+  )
+}
+
+///|
 pub fn emit_qbe_package(pkg : Package, release : Bool) -> QbeEmitResult {
   let tc = build_typechecker_for_codegen(pkg)
   emit_qbe_package_with_tc(pkg, tc, release)
@@ -42286,8 +42466,20 @@ pub fn emit_qbe_unit_entry(
   entry_symbol : String,
   no_main : Bool,
 ) -> String {
+  emit_qbe_unit_entry_target(prep, unit_idx, release, "", entry_symbol, no_main)
+}
+
+///|
+pub fn emit_qbe_unit_entry_target(
+  prep : PreparedPackage,
+  unit_idx : Int,
+  release : Bool,
+  target_name : String,
+  entry_symbol : String,
+  no_main : Bool,
+) -> String {
   let tc = prep.tc
-  let g = qbe_new(tc, release, true)
+  let g = qbe_new_for_target_name(tc, release, true, target_name == "wasm32", target_name)
   let f = prep.pkg.files[unit_idx]
   let const_decls : Array[ConstDecl] = []
   let mut unit_has_main = false
@@ -42596,7 +42788,17 @@ pub fn emit_qbe_test_package(
   tc : TypeChecker,
   dep_pkg_names : Array[String],
 ) -> QbeTestEmitResult {
-  let g = qbe_new(tc, false, false)
+  emit_qbe_test_package_target(pkg, tc, dep_pkg_names, "")
+}
+
+///|
+pub fn emit_qbe_test_package_target(
+  pkg : Package,
+  tc : TypeChecker,
+  dep_pkg_names : Array[String],
+  target_name : String,
+) -> QbeTestEmitResult {
+  let g = qbe_new_for_target_name(tc, false, false, target_name == "wasm32", target_name)
   let const_decls : Array[ConstDecl] = []
   let test_decls : Array[TestDecl] = []
   let test_names : Array[String] = []
