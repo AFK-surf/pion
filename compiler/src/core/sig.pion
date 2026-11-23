@@ -586,6 +586,28 @@ pub fn emit_file_sig_entries(f : SourceFile) -> String {
 }
 
 ///|
+pub fn xpkg_is_const_scalar_expr(e : Expr) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _) => true
+    EUnary(op, inner, _) =>
+      (op == "-" || op == "~" || op == "!") && xpkg_is_const_scalar_expr(inner)
+    EBinary(op, l, r, _) =>
+      (op == "+" || op == "-" || op == "*") &&
+      xpkg_is_const_scalar_expr(l) &&
+      xpkg_is_const_scalar_expr(r)
+    _ => false
+  }
+}
+
+///|
 /// Public symbol summary for cross-package small-function inlining soundness.
 /// Shared by `.pionstub` emission (`sig.pion`) and QBE cross-package inlining (`qbe.pion`).
 pub struct XpkgPubSyms {
@@ -596,6 +618,8 @@ pub struct XpkgPubSyms {
   pub_fns : Map[String, Bool]
   pub_methods : Map[String, Bool]
   priv_methods : Map[String, Bool]
+  scalar_consts : Map[String, Bool]
+  inline_priv_fns : Map[String, Bool]
 }
 
 ///|
@@ -613,6 +637,8 @@ pub fn xpkg_pub_syms_from_pkg(pkg : Package) -> XpkgPubSyms {
   let pub_fns : Map[String, Bool] = Map([])
   let pub_methods : Map[String, Bool] = Map([])
   let priv_methods : Map[String, Bool] = Map([])
+  let scalar_consts : Map[String, Bool] = Map([])
+  let inline_priv_fns : Map[String, Bool] = Map([])
   let mut fi = 0
   while fi < pkg.files.length() {
     let f = pkg.files[fi]
@@ -652,13 +678,17 @@ pub fn xpkg_pub_syms_from_pkg(pkg : Package) -> XpkgPubSyms {
             mi = mi + 1
           }
         }
+        DConst(cd) =>
+          if !cd.is_pub && xpkg_is_const_scalar_expr(cd.value) {
+            scalar_consts.set(cd.name, true)
+          }
         _ => ()
       }
       di = di + 1
     }
     fi = fi + 1
   }
-  XpkgPubSyms::{
+  let syms = XpkgPubSyms::{
     pub_structs: pub_structs,
     pub_enums: pub_enums,
     pub_variants: pub_variants,
@@ -666,7 +696,29 @@ pub fn xpkg_pub_syms_from_pkg(pkg : Package) -> XpkgPubSyms {
     pub_fns: pub_fns,
     pub_methods: pub_methods,
     priv_methods: priv_methods,
+    scalar_consts: scalar_consts,
+    inline_priv_fns: inline_priv_fns,
   }
+  let view = XpkgSymView::{ pkg_syms: Some(syms), tc: None }
+  fi = 0
+  while fi < pkg.files.length() {
+    let f = pkg.files[fi]
+    let mut di = 0
+    while di < f.decls.length() {
+      match f.decls[di] {
+        DFn(fd) =>
+          if !fd.is_pub &&
+            fd.receiver_type == "" &&
+            xpkg_fn_is_inlinable_priv_leaf_view(view, fd) {
+            syms.inline_priv_fns.set(fd.name, true)
+          }
+        _ => ()
+      }
+      di = di + 1
+    }
+    fi = fi + 1
+  }
+  syms
 }
 
 ///|
@@ -887,10 +939,88 @@ fn xpkg_locals_pop_to(locals : Array[String], n : Int) -> Unit {
 }
 
 ///|
-fn xpkg_expr_link_safe(
+fn xpkg_sym_is_scalar_const(view : XpkgSymView, name : String) -> Bool {
+  match view.pkg_syms {
+    Some(s) => s.scalar_consts.contains(name)
+    None =>
+      match view.tc {
+        Some(tc) => tc.scalar_const_exprs.contains(name)
+        None => false
+      }
+  }
+}
+
+///|
+fn xpkg_sym_is_inline_priv_fn(view : XpkgSymView, name : String) -> Bool {
+  match view.pkg_syms {
+    Some(s) => s.inline_priv_fns.contains(name)
+    None =>
+      match view.tc {
+        Some(tc) =>
+          match tc.fns.get(name) {
+            Some(fi) => xpkg_fn_is_inlinable_priv_leaf_tc(tc, fi.decl)
+            None => false
+          }
+        None => false
+      }
+  }
+}
+
+///|
+fn xpkg_pat_link_safe(
+  view : XpkgSymView,
+  pat : Pattern,
+  bound_out : Array[String],
+) -> Bool {
+  match pat {
+    PWild(_) | PBool(_, _) | PInt(_, _) | PString(_, _) | PChar(_, _) => true
+    PIdent(name, _) => {
+      if name != "_" {
+        bound_out.push(name)
+      }
+      true
+    }
+    PTuple(subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        if !xpkg_pat_link_safe(view, subs[i], bound_out) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    PVariant(en, vn, subs, _) => {
+      let en_ok = en == "Option" ||
+        en == "Result" ||
+        (en == "" &&
+        (vn == "Some" ||
+        vn == "None" ||
+        vn == "Ok" ||
+        vn == "Err" ||
+        xpkg_sym_is_pub_variant(view, vn))) ||
+        (en != "" && xpkg_sym_is_pub_qual_variant(view, en, vn))
+      if !en_ok {
+        return false
+      }
+      let mut i = 0
+      while i < subs.length() {
+        if !xpkg_pat_link_safe(view, subs[i], bound_out) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+  }
+}
+
+///|
+fn xpkg_expr_link_safe_ex(
   view : XpkgSymView,
   e : Expr,
   locals : Array[String],
+  allow_priv_fns : Bool,
 ) -> Bool {
   match e {
     EInt(_, _)
@@ -907,22 +1037,26 @@ fn xpkg_expr_link_safe(
     EIdent(name, _) =>
       str_arr_contains(locals, name) ||
       name == "None" ||
-      xpkg_sym_is_pub_variant(view, name)
+      xpkg_sym_is_pub_variant(view, name) ||
+      xpkg_sym_is_scalar_const(view, name)
     EPath(q, m, _) => xpkg_sym_is_pub_qual_variant(view, q, m)
-    EUnary(_, inner, _) | ETry(inner, _) => xpkg_expr_link_safe(view, inner, locals)
+    EUnary(_, inner, _) | ETry(inner, _) =>
+      xpkg_expr_link_safe_ex(view, inner, locals, allow_priv_fns)
     EBinary(_, lhs, rhs, _) =>
-      xpkg_expr_link_safe(view, lhs, locals) &&
-      xpkg_expr_link_safe(view, rhs, locals)
+      xpkg_expr_link_safe_ex(view, lhs, locals, allow_priv_fns) &&
+      xpkg_expr_link_safe_ex(view, rhs, locals, allow_priv_fns)
     EAs(inner, ty, _) =>
-      !xpkg_ty_has_qual(ty) && xpkg_expr_link_safe(view, inner, locals)
-    EField(obj, _, _) => xpkg_expr_link_safe(view, obj, locals)
+      !xpkg_ty_has_qual(ty) &&
+      xpkg_expr_link_safe_ex(view, inner, locals, allow_priv_fns)
+    EField(obj, _, _) =>
+      xpkg_expr_link_safe_ex(view, obj, locals, allow_priv_fns)
     EIndex(obj, idx, _) =>
-      xpkg_expr_link_safe(view, obj, locals) &&
-      xpkg_expr_link_safe(view, idx, locals)
+      xpkg_expr_link_safe_ex(view, obj, locals, allow_priv_fns) &&
+      xpkg_expr_link_safe_ex(view, idx, locals, allow_priv_fns)
     EArrayLit(elems, _) | ETuple(elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        if !xpkg_expr_link_safe(view, elems[i], locals) {
+        if !xpkg_expr_link_safe_ex(view, elems[i], locals, allow_priv_fns) {
           return false
         }
         i = i + 1
@@ -939,7 +1073,7 @@ fn xpkg_expr_link_safe(
       }
       let mut i = 0
       while i < fields.length() {
-        if !xpkg_expr_link_safe(view, fields[i].value, locals) {
+        if !xpkg_expr_link_safe_ex(view, fields[i].value, locals, allow_priv_fns) {
           return false
         }
         i = i + 1
@@ -951,7 +1085,8 @@ fn xpkg_expr_link_safe(
         EIdent(cn, _) =>
           xpkg_is_builtin_fn(cn) ||
           xpkg_sym_is_pub_fn(view, cn) ||
-          xpkg_sym_is_pub_variant(view, cn)
+          xpkg_sym_is_pub_variant(view, cn) ||
+          (allow_priv_fns && xpkg_sym_is_inline_priv_fn(view, cn))
         EPath(q, m, _) =>
           xpkg_is_builtin_type_qual(q) ||
           xpkg_sym_is_pub_method(view, q + "::" + m) ||
@@ -963,7 +1098,7 @@ fn xpkg_expr_link_safe(
       }
       let mut i = 0
       while i < args.length() {
-        if !xpkg_expr_link_safe(view, args[i], locals) {
+        if !xpkg_expr_link_safe_ex(view, args[i], locals, allow_priv_fns) {
           return false
         }
         i = i + 1
@@ -974,12 +1109,12 @@ fn xpkg_expr_link_safe(
       if xpkg_sym_has_priv_method(view, mname) {
         return false
       }
-      if !xpkg_expr_link_safe(view, recv, locals) {
+      if !xpkg_expr_link_safe_ex(view, recv, locals, allow_priv_fns) {
         return false
       }
       let mut i = 0
       while i < args.length() {
-        if !xpkg_expr_link_safe(view, args[i], locals) {
+        if !xpkg_expr_link_safe_ex(view, args[i], locals, allow_priv_fns) {
           return false
         }
         i = i + 1
@@ -988,60 +1123,95 @@ fn xpkg_expr_link_safe(
     }
     EBlock(stmts, _) => {
       let saved = locals.length()
-      let ok = xpkg_stmts_link_safe(view, stmts, locals)
+      let ok = xpkg_stmts_link_safe_ex(view, stmts, locals, allow_priv_fns)
       xpkg_locals_pop_to(locals, saved)
       ok
     }
     EIf(cond, then_stmts, else_opt, _) => {
-      if !xpkg_expr_link_safe(view, cond, locals) {
+      if !xpkg_expr_link_safe_ex(view, cond, locals, allow_priv_fns) {
         return false
       }
       let saved = locals.length()
-      let then_ok = xpkg_stmts_link_safe(view, then_stmts, locals)
+      let then_ok = xpkg_stmts_link_safe_ex(view, then_stmts, locals, allow_priv_fns)
       xpkg_locals_pop_to(locals, saved)
       if !then_ok {
         return false
       }
       match else_opt {
         None => true
-        Some(el) => xpkg_expr_link_safe(view, el, locals)
+        Some(el) => xpkg_expr_link_safe_ex(view, el, locals, allow_priv_fns)
       }
     }
-    ENamedArg(_, _, inner, _) => xpkg_expr_link_safe(view, inner, locals)
+    EMatch(scrut, arms, _) => {
+      if arms.length() > 6 ||
+        !xpkg_expr_link_safe_ex(view, scrut, locals, allow_priv_fns) {
+        return false
+      }
+      let mut ai = 0
+      while ai < arms.length() {
+        let arm = arms[ai]
+        let saved = locals.length()
+        let bound : Array[String] = []
+        if !xpkg_pat_link_safe(view, arm.pat, bound) {
+          return false
+        }
+        let mut bi = 0
+        while bi < bound.length() {
+          locals.push(bound[bi])
+          bi = bi + 1
+        }
+        let guard_ok = match arm.guard_expr {
+          None => true
+          Some(ge) => xpkg_expr_link_safe_ex(view, ge, locals, allow_priv_fns)
+        }
+        let body_ok = guard_ok &&
+          xpkg_expr_link_safe_ex(view, arm.body, locals, allow_priv_fns)
+        xpkg_locals_pop_to(locals, saved)
+        if !body_ok {
+          return false
+        }
+        ai = ai + 1
+      }
+      true
+    }
+    ENamedArg(_, _, inner, _) =>
+      xpkg_expr_link_safe_ex(view, inner, locals, allow_priv_fns)
     _ => false
   }
 }
 
 ///|
-fn xpkg_stmts_link_safe(
+fn xpkg_stmts_link_safe_ex(
   view : XpkgSymView,
   stmts : Array[Stmt],
   locals : Array[String],
+  allow_priv_fns : Bool,
 ) -> Bool {
   let mut i = 0
   while i < stmts.length() {
     match stmts[i] {
       SLet(name, _, ty, init, _) => {
-        if xpkg_ty_has_qual(ty) || !xpkg_expr_link_safe(view, init, locals) {
+        if xpkg_ty_has_qual(ty) ||
+          !xpkg_expr_link_safe_ex(view, init, locals, allow_priv_fns) {
           return false
         }
         locals.push(name)
       }
       SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
-        if !xpkg_expr_link_safe(view, lhs, locals) ||
-          !xpkg_expr_link_safe(view, rhs, locals) {
+        if !xpkg_expr_link_safe_ex(view, lhs, locals, allow_priv_fns) ||
+          !xpkg_expr_link_safe_ex(view, rhs, locals, allow_priv_fns) {
           return false
         }
       SExpr(e, _) =>
-        if !xpkg_expr_link_safe(view, e, locals) {
+        if !xpkg_expr_link_safe_ex(view, e, locals, allow_priv_fns) {
           return false
         }
       SGuard(cond, body, _) => {
-        if !xpkg_expr_link_safe(view, cond, locals) {
+        if !xpkg_expr_link_safe_ex(view, cond, locals, allow_priv_fns) {
           return false
         }
         let saved = locals.length()
-        let ok = xpkg_stmts_link_safe(view, body, locals)
+        let ok = xpkg_stmts_link_safe_ex(view, body, locals, allow_priv_fns)
         xpkg_locals_pop_to(locals, saved)
         if !ok {
           return false
@@ -1051,7 +1221,7 @@ fn xpkg_stmts_link_safe(
         match opt {
           None => ()
           Some(e) =>
-            if !xpkg_expr_link_safe(view, e, locals) {
+            if !xpkg_expr_link_safe_ex(view, e, locals, allow_priv_fns) {
               return false
             }
         }
@@ -1060,6 +1230,54 @@ fn xpkg_stmts_link_safe(
     i = i + 1
   }
   true
+}
+
+///|
+fn xpkg_fn_is_inlinable_priv_leaf_view(view : XpkgSymView, fd : FnDecl) -> Bool {
+  if fd.is_pub ||
+    fd.receiver_type != "" ||
+    fd.type_params.length() != 0 ||
+    params_have_mut(fd.params) ||
+    fd.body.length() == 0 {
+    return false
+  }
+  let is_opt_res = match fd.ret_ty {
+    TyName("Option", _, _) | TyName("Result", _, _) => true
+    _ => false
+  }
+  if !is_opt_res || xpkg_ty_has_qual(fd.ret_ty) {
+    return false
+  }
+  let locals : Array[String] = []
+  let mut pi = 0
+  while pi < fd.params.length() {
+    if xpkg_ty_has_qual(fd.params[pi].ty) {
+      return false
+    }
+    locals.push(fd.params[pi].name)
+    pi = pi + 1
+  }
+  let cost = qbe_stmts_inline_cost_in(fd.body, fd.name, false, 0)
+  if cost < 0 || cost > 48 {
+    return false
+  }
+  xpkg_stmts_link_safe_ex(view, fd.body, locals, false)
+}
+
+///|
+pub fn xpkg_fn_is_inlinable_priv_leaf(syms : XpkgPubSyms, fd : FnDecl) -> Bool {
+  xpkg_fn_is_inlinable_priv_leaf_view(
+    XpkgSymView::{ pkg_syms: Some(syms), tc: None },
+    fd,
+  )
+}
+
+///|
+pub fn xpkg_fn_is_inlinable_priv_leaf_tc(tc : TypeChecker, fd : FnDecl) -> Bool {
+  xpkg_fn_is_inlinable_priv_leaf_view(
+    XpkgSymView::{ pkg_syms: None, tc: Some(tc) },
+    fd,
+  )
 }
 
 ///|
@@ -1088,14 +1306,14 @@ fn xpkg_fn_is_inlinable_view(view : XpkgSymView, fd : FnDecl) -> Bool {
     fd.name
   }
   let max_cost = match fd.ret_ty {
-    TyNamed("Option", _, _) | TyNamed("Result", _, _) => 38
+    TyName("Option", _, _) | TyName("Result", _, _) => 120
     _ => 22
   }
   let cost = qbe_stmts_inline_cost_in(fd.body, self_key, false, 0)
   if cost < 0 || cost > max_cost {
     return false
   }
-  xpkg_stmts_link_safe(view, fd.body, locals)
+  xpkg_stmts_link_safe_ex(view, fd.body, locals, true)
 }
 
 ///|
@@ -1142,6 +1360,49 @@ fn stub_write_char_lit(sb : StringBuilder, prefix : String, s : String) -> Unit 
     i = i + 1
   }
   sb.write_string("'")
+}
+
+///|
+fn stub_write_pat(sb : StringBuilder, pat : Pattern) -> Unit {
+  match pat {
+    PWild(_) => sb.write_string("_")
+    PIdent(name, _) => sb.write_string(name)
+    PBool(b, _) => sb.write_string(if b { "true" } else { "false" })
+    PInt(s, _) => sb.write_string(s)
+    PString(s, _) => sb.write_string(json_quote(s))
+    PChar(s, _) => stub_write_char_lit(sb, "'", s)
+    PTuple(subs, _) => {
+      sb.write_string("(")
+      let mut i = 0
+      while i < subs.length() {
+        if i > 0 {
+          sb.write_string(", ")
+        }
+        stub_write_pat(sb, subs[i])
+        i = i + 1
+      }
+      sb.write_string(")")
+    }
+    PVariant(en, vn, subs, _) => {
+      if en != "" {
+        sb.write_string(en)
+        sb.write_string("::")
+      }
+      sb.write_string(vn)
+      if subs.length() > 0 {
+        sb.write_string("(")
+        let mut i = 0
+        while i < subs.length() {
+          if i > 0 {
+            sb.write_string(", ")
+          }
+          stub_write_pat(sb, subs[i])
+          i = i + 1
+        }
+        sb.write_string(")")
+      }
+    }
+  }
 }
 
 ///|
@@ -1307,6 +1568,29 @@ fn stub_write_expr(sb : StringBuilder, e : Expr) -> Unit {
       sb.write_string("(")
       stub_write_expr(sb, inner)
       sb.write_string(")?")
+    }
+    EMatch(scrut, arms, _) => {
+      sb.write_string("match ")
+      stub_write_expr(sb, scrut)
+      sb.write_string(" {\n")
+      let mut i = 0
+      while i < arms.length() {
+        let arm = arms[i]
+        sb.write_string("  ")
+        stub_write_pat(sb, arm.pat)
+        match arm.guard_expr {
+          Some(ge) => {
+            sb.write_string(" if ")
+            stub_write_expr(sb, ge)
+          }
+          None => ()
+        }
+        sb.write_string(" => ")
+        stub_write_expr(sb, arm.body)
+        sb.write_string("\n")
+        i = i + 1
+      }
+      sb.write_string("}")
     }
     ENamedArg(name, is_opt, inner, _) => {
       sb.write_string(name)
@@ -1484,7 +1768,9 @@ fn emit_file_stub_with_syms(
         sb.write_string(") -> ")
         sb.write_string(type_expr_to_string(fd.ret_ty))
         let emit_body = match xpkg_syms {
-          Some(syms) => xpkg_fn_is_inlinable(syms, fd)
+          Some(syms) =>
+            xpkg_fn_is_inlinable(syms, fd) ||
+            xpkg_fn_is_inlinable_priv_leaf(syms, fd)
           None => false
         }
         if emit_body {
@@ -1614,7 +1900,17 @@ fn emit_file_stub_with_syms(
         sb.write_string(cd.name)
         sb.write_string(" : ")
         sb.write_string(type_expr_to_string(cd.ty))
-        sb.write_string(" = panic()\n")
+        let emit_const_val = match xpkg_syms {
+          Some(_) => !cd.is_pub && xpkg_is_const_scalar_expr(cd.value)
+          None => false
+        }
+        if emit_const_val {
+          sb.write_string(" = ")
+          stub_write_expr(sb, cd.value)
+          sb.write_string("\n")
+        } else {
+          sb.write_string(" = panic()\n")
+        }
       }
       DTest(_) => ()
     }
