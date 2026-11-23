@@ -33,4 +33,22 @@ theorem move_rect_spec (r : algos.Rect) (dx : Std.I32) :
   unfold algos.move_rect algos.swap
   simp
 
+/-- `StringBuilder` write_string roundtrips through `to_string`. -/
+theorem sb_write_string_roundtrip (s : String) :
+    (Pion.StringBuilder.new.write_string s).to_string = s :=
+  Pion.StringBuilder.to_string_write_string s
+
+/-- `Map` set/get/remove laws compose cleanly. -/
+theorem map_set_remove_law (m : Pion.Map String Std.I32) (v1 v2 : Std.I32) :
+    (((m.set "a" v1).set "b" v2).remove "a").get "b" = some v2 ∧
+    (((m.set "a" v1).set "b" v2).remove "a").get "a" = none := by
+  constructor
+  · rw [Pion.Map.get_remove_ne _ (by decide), Pion.Map.get_set_eq]
+  · exact Pion.Map.get_remove_eq _ _
+
+/-- `Double` bit-pattern roundtrip preserves all 64 bits. -/
+theorem double_bits_roundtrip (b : Std.I64) :
+    (Pion.Double.from_bits b).to_bits = b :=
+  Pion.Double.to_bits_from_bits b
+
 end PionProofs

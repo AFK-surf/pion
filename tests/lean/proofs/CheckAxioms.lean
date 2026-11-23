@@ -29,3 +29,6 @@ import PionProofs.CapTableProofs
 #print axioms PionProofs.avg2_spec
 #print axioms PionProofs.safe_div_spec
 #print axioms PionProofs.move_rect_spec
+#print axioms PionProofs.sb_write_string_roundtrip
+#print axioms PionProofs.map_set_remove_law
+#print axioms PionProofs.double_bits_roundtrip

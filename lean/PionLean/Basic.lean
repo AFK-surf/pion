@@ -309,6 +309,86 @@ def set (b : Pion.Bytes) (i : Std.I32) (x : Std.U8) : Result Pion.Bytes := do
 @[simp] def copy (b : Pion.Bytes) : Pion.Bytes := b
 end Bytes
 
+/-! ## Double (bit-pattern representation) -/
+
+structure Double where
+  bits : Std.U64
+deriving Repr, BEq, DecidableEq
+
+instance : Pion.Eq Pion.Double := { toBEq := inferInstance }
+
+namespace Double
+@[simp] def to_bits (d : Pion.Double) : Std.I64 := ⟨d.bits.bv⟩
+@[simp] def reinterpret_as_uint64 (d : Pion.Double) : Std.U64 := d.bits
+@[simp] def from_bits (b : Std.I64) : Pion.Double := ⟨⟨b.bv⟩⟩
+end Double
+
+@[simp] def I64.reinterpret_as_double (b : Std.I64) : Pion.Double := ⟨⟨b.bv⟩⟩
+@[simp] def U64.reinterpret_as_double (b : Std.U64) : Pion.Double := ⟨b⟩
+
+/-! ## StringBuilder -/
+
+structure StringBuilder where
+  val : List Std.U8
+deriving Repr, BEq, DecidableEq
+
+namespace StringBuilder
+@[simp] def u8OfByte (b : UInt8) : Std.U8 := ⟨b.toBitVec⟩
+@[simp] def byteOfU8 (b : Std.U8) : UInt8 := UInt8.ofBitVec b.bv
+
+def bytesOfString (s : _root_.String) : List Std.U8 :=
+  s.toUTF8.data.toList.map u8OfByte
+
+@[simp] def new : Pion.StringBuilder := ⟨[]⟩
+@[simp] def write_byte (sb : Pion.StringBuilder) (b : Std.U8) : Pion.StringBuilder :=
+  ⟨sb.val ++ [b]⟩
+@[simp] def write_string (sb : Pion.StringBuilder) (s : _root_.String) : Pion.StringBuilder :=
+  ⟨sb.val ++ bytesOfString s⟩
+@[simp] def write_substring (sb : Pion.StringBuilder) (s : _root_.String)
+    (start end_ : Std.I32) : Pion.StringBuilder :=
+  let bs := bytesOfString s
+  let s0 : Nat := if start.val < 0 then 0 else start.val.toNat
+  let e0 : Nat := if end_.val < 0 then 0 else min end_.val.toNat bs.length
+  if s0 < e0 then ⟨sb.val ++ (bs.drop s0).take (e0 - s0)⟩ else sb
+@[simp] def clear (_ : Pion.StringBuilder) : Pion.StringBuilder := ⟨[]⟩
+def length (sb : Pion.StringBuilder) : Result Std.I32 := lengthOf sb.val.length
+def to_string (sb : Pion.StringBuilder) : _root_.String :=
+  _root_.String.fromUTF8! ⟨(sb.val.map byteOfU8).toArray⟩
+end StringBuilder
+
+/-! ## Map -/
+
+structure Map (κ : Type u) (ν : Type v) where
+  entries : List (κ × ν)
+deriving Repr, BEq, DecidableEq
+
+namespace Map
+variable {κ : Type u} {ν : Type v}
+
+def listGet [BEq κ] : List (κ × ν) → κ → _root_.Option ν
+  | [], _ => none
+  | (k', v') :: rest, k => if k' == k then some v' else listGet rest k
+
+def listSet [BEq κ] : List (κ × ν) → κ → ν → List (κ × ν)
+  | [], k, v => [(k, v)]
+  | (k', v') :: rest, k, v =>
+    if k' == k then (k, v) :: rest else (k', v') :: listSet rest k v
+
+def listRemove [BEq κ] : List (κ × ν) → κ → List (κ × ν)
+  | [], _ => []
+  | (k', v') :: rest, k =>
+    if k' == k then listRemove rest k else (k', v') :: listRemove rest k
+
+@[simp] def new : Pion.Map κ ν := ⟨[]⟩
+@[simp] def get [BEq κ] (m : Pion.Map κ ν) (k : κ) : _root_.Option ν := listGet m.entries k
+@[simp] def set [BEq κ] (m : Pion.Map κ ν) (k : κ) (v : ν) : Pion.Map κ ν := ⟨listSet m.entries k v⟩
+@[simp] def remove [BEq κ] (m : Pion.Map κ ν) (k : κ) : Pion.Map κ ν := ⟨listRemove m.entries k⟩
+@[simp] def clear (_ : Pion.Map κ ν) : Pion.Map κ ν := ⟨[]⟩
+@[simp] def contains [BEq κ] (m : Pion.Map κ ν) (k : κ) : Bool := (m.get k).isSome
+def length (m : Pion.Map κ ν) : Result Std.I32 := lengthOf m.entries.length
+@[simp] def copy (m : Pion.Map κ ν) : Pion.Map κ ν := m
+end Map
+
 /-! ## String -/
 
 namespace String

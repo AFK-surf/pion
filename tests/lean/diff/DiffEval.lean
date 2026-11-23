@@ -153,6 +153,10 @@ def main : IO Unit := do
   report "cap_delete" diff_cases.c_cap_delete
   report "cap_delete_empty" diff_cases.c_cap_delete_empty
   report "cap_revoke" diff_cases.c_cap_revoke
+  report "sb_basic" diff_cases.c_sb_basic
+  report "map_str" diff_cases.c_map_str
+  report "map_int" diff_cases.c_map_int
+  report "double_bits" diff_cases.c_double_bits
 
 end PionDiff
 

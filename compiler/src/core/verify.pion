@@ -188,14 +188,13 @@ fn v_lookup_enum(tc : TypeChecker, name : String) -> Option[EnumInfo] {
 /// Name of the forbidden component of `t` inside `#verify` code, or "".
 fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String {
   match t {
-    TWorld | TPtr | TScope | TAtomicInt | TStringBuilder | TDouble | TFloat =>
+    TWorld | TPtr | TScope | TAtomicInt | TFloat =>
       ty_to_string(t)
     TChannel(_) => "Channel"
     TMutex(_) => "Mutex"
-    TMap(_, _) => "Map"
     TDynTrait(n) => "dyn " + n
     TArray(e) | TFixedArray(e) | TOption(e) => v_forbidden_in(tc, e, visiting)
-    TResult(a, b) => {
+    TResult(a, b) | TMap(a, b) => {
       let fa = v_forbidden_in(tc, a, visiting)
       if fa != "" {
         fa
@@ -285,7 +284,7 @@ fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String 
 ///|
 fn v_unique_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
   match t {
-    TArray(_) | TFixedArray(_) | TBytes => true
+    TArray(_) | TFixedArray(_) | TBytes | TStringBuilder | TMap(_, _) => true
     // Generic parameters may be instantiated with `Unique` types.
     TParam(_) => true
     TOption(e) => v_unique_in(tc, e, visiting)
@@ -568,12 +567,19 @@ fn v_is_mutating_builtin(m : String) -> Bool {
   m == "set" ||
   m == "swap" ||
   m == "clear" ||
+  m == "reset" ||
   m == "reverse" ||
   m == "sort" ||
   m == "fill" ||
   m == "remove" ||
   m == "insert" ||
-  m == "truncate"
+  m == "truncate" ||
+  m == "write_byte" ||
+  m == "write_string" ||
+  m == "write_substring" ||
+  m == "write_char" ||
+  m == "write_int" ||
+  m == "write_bytes"
 }
 
 ///|
@@ -739,7 +745,17 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     None => ()
   }
   match e {
-    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EDouble(_, _) | EFloat(_, _) => ()
+    EInt(_, _) | EInt64(_, _) | EUInt(_, _) | EUInt64(_, _) | EFloat(_, _) => ()
+    EDouble(_, sp) =>
+      v_err(
+        ctx,
+        sp,
+        "E_VERIFY_UNSUPPORTED",
+        "`Double` literal is not supported in `#verify` function `" + ctx.fn_name + "`",
+        "bit-pattern primitive (`Double::from_bits` / `reinterpret_as_double`)",
+        "Double literal",
+        "construct `Double` from its IEEE-754 bit pattern with `Double::from_bits(...)`",
+      )
     EBool(_, _) | EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) | EPath(_, _, _) => ()
     EIdent(n, sp) => {
       if vm_contains(ctx.moved, n) {
@@ -777,10 +793,40 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     ENamedArg(_, _, inner, _) => v_expr(ctx, inner, consume)
     EMove(inner, _) => v_expr(ctx, inner, true)
     EDotVariant(_, args, _) => v_args(ctx, args, true)
-    EUnary(_, inner, _) => v_expr(ctx, inner, false)
-    EBinary(_, l, r, _) => {
+    EUnary(op, inner, sp) => {
+      v_expr(ctx, inner, false)
+      match v_expr_ty(ctx, inner) {
+        TDouble =>
+          v_err(
+            ctx,
+            sp,
+            "E_VERIFY_UNSUPPORTED",
+            "operator `" + op + "` on `Double` is not supported in `#verify` function `" + ctx.fn_name + "`",
+            "bit-pattern primitive (`Double::from_bits`, `.to_bits()`, `.reinterpret_as_uint64()`)",
+            "Double " + op,
+            "operate on `d.to_bits()` / `d.reinterpret_as_uint64()`, or move floating-point arithmetic into a `#verify_opaque` helper",
+          )
+        _ => ()
+      }
+    }
+    EBinary(op, l, r, sp) => {
       v_expr(ctx, l, false)
       v_expr(ctx, r, false)
+      let is_dbl = match (v_expr_ty(ctx, l), v_expr_ty(ctx, r)) {
+        (TDouble, _) | (_, TDouble) => true
+        _ => false
+      }
+      if is_dbl {
+        v_err(
+          ctx,
+          sp,
+          "E_VERIFY_UNSUPPORTED",
+          "operator `" + op + "` on `Double` is not supported in `#verify` function `" + ctx.fn_name + "`",
+          "bit-pattern primitive (`Double::from_bits`, `.to_bits()`, `.reinterpret_as_uint64()`)",
+          "Double " + op,
+          "operate on `d.to_bits()` / `d.reinterpret_as_uint64()`, or move floating-point arithmetic into a `#verify_opaque` helper",
+        )
+      }
     }
     ECall(callee, args, sp) => {
       match callee {
@@ -794,6 +840,35 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     EMethodCall(obj, m, args, sp) => {
       v_expr(ctx, obj, false)
       let builtin = v_is_builtin_call(ctx, sp)
+      if builtin {
+        match v_expr_ty(ctx, obj) {
+          TDouble =>
+            if m != "to_bits" && m != "reinterpret_as_uint64" {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `Double::" + m + "` is not supported in `#verify` function `" + ctx.fn_name + "`",
+                "`to_bits` or `reinterpret_as_uint64`",
+                "Double::" + m,
+                "use `to_bits()` / `reinterpret_as_uint64()`, or move floating-point operations into a `#verify_opaque` helper",
+              )
+            }
+          TInt | TInt64 | TUInt | TUInt64 | TByte =>
+            if m == "to_double" {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `" + ty_to_string(v_expr_ty(ctx, obj)) + "::to_double` is not supported in `#verify` function `" + ctx.fn_name + "`",
+                "`reinterpret_as_double` or `Double::from_bits`",
+                "to_double",
+                "use `reinterpret_as_double()` / `Double::from_bits()`, or move floating-point conversions into a `#verify_opaque` helper",
+              )
+            }
+          _ => ()
+        }
+      }
       if builtin && v_is_mutating_builtin(m) {
         v_check_write(ctx, obj)
       }
