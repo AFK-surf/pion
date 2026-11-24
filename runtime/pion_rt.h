@@ -258,12 +258,14 @@ const char* pion_fs_cpath(const char *data, int64_t len);
 /* CLI-only host helpers: defined in runtime/pion_cli.c and archived only into
  * libpionrt_cli.a (pionc + test_rt), never into libpionrt.a. */
 int32_t  pion_fs_mkdir_excl(const char *path);
+int32_t  pion_fs_mkdir_excl_status(const char *path);
 int32_t  pion_fs_rmdir(const char *path);
 int64_t  pion_fs_trylock(const char *path);
 int64_t  pion_fs_lock(const char *path);
 void     pion_fs_unlock(int64_t handle);
 char*    pion_fs_canon_path(const char *path);
 int64_t  pion_cli_getpid(void);
+int64_t  pion_cli_next_seq(void);
 int32_t  pion_cli_is_windows(void);
 int32_t  pion_fs_lstat_kind(const char *path);
 void*    pion_world_fs_list_dir(void *w, void *path_str);

@@ -1549,6 +1549,10 @@ fn drv_resolve_qbe_target(world : World) -> String {
 extern "C" fn c_cli_getpid() -> Int64 = "pion_cli_getpid"
 
 ///|
+/// Process-wide, thread-safe, strictly increasing sequence (from 0).
+extern "C" fn c_cli_next_seq() -> Int64 = "pion_cli_next_seq"
+
+///|
 /// 1 when this `pionc` was built for a Windows host (`libpionrt_cli.a`); a
 /// compile-time fact, unlike the `OS` environment variable.
 extern "C" fn c_cli_is_windows() -> Int = "pion_cli_is_windows"
@@ -4757,22 +4761,28 @@ fn drv_split_dir_base(_world : World, path : String) -> (String, String) {
 /// `wasm-opt`) or a copy writes before `drv_publish_tmp` renames it into
 /// place: the same filesystem keeps the rename atomic, and the staged file
 /// keeps the output's own basename (no longer than the final name).
-/// Only a name already taken moves on to the next `seq`; any other failure
-/// (no permission, missing directory) is an immediate error.
-fn drv_make_out_stage(world : World, dir : String) -> Result[String, String] {
+/// `seq` comes from the process-wide `c_cli_next_seq` counter on every
+/// attempt, so two threads of one `pionc` (`test --jobs N`) never try the
+/// same name and a name is never reused after its owner removed it. Only a
+/// name already taken (`1`: a leftover of an older process with the same
+/// pid, a foreign directory) moves on to the next `seq`, up to 4096 tries;
+/// any other failure (`-1`: no permission, missing directory) is an
+/// immediate error, decided by the `mkdir` itself (no racy re-probe).
+fn drv_make_out_stage(_world : World, dir : String) -> Result[String, String] {
   let base = dir + "/.pion_ld." + c_cli_getpid().to_string() + "."
   let mut k = 0
   while k < 4096 {
-    let cand = base + k.to_string()
-    if c_fs_mkdir_excl(drv_cpath(cand)) == 0 {
+    let cand = base + c_cli_next_seq().to_string()
+    let st = c_fs_mkdir_excl_status(drv_cpath(cand))
+    if st == 0 {
       return Ok(cand)
     }
-    if !fs_exists(world, cand) {
-      break
+    if st != 1 {
+      return Err("cannot create a staging directory in " + dir + " (" + cand + ")")
     }
     k = k + 1
   }
-  Err("cannot create a staging directory in " + dir)
+  Err("cannot create a staging directory in " + dir + ": 4096 names taken")
 }
 
 ///|
@@ -10346,6 +10356,10 @@ fn drv_registry_sync_head(
 extern "C" fn c_fs_mkdir_excl(path : Ptr) -> Int = "pion_fs_mkdir_excl"
 
 ///|
+/// `0` created, `1` the name is taken (`EEXIST`), `-1` any other failure.
+extern "C" fn c_fs_mkdir_excl_status(path : Ptr) -> Int = "pion_fs_mkdir_excl_status"
+
+///|
 extern "C" fn c_fs_trylock(path : Ptr) -> Int64 = "pion_fs_trylock"
 
 ///|
@@ -10365,17 +10379,23 @@ fn drv_cpath(s : String) -> Ptr {
 ///|
 /// Creates a fresh, exclusively owned temporary directory next to `path`
 /// with the runtime's native exclusive `mkdir` (no subprocess, no shell):
-/// up to 32 process-unique candidate names, else an error.
+/// each try takes a fresh process-wide `c_cli_next_seq`; only a taken name
+/// moves on (up to 32 names), any other failure is an immediate error.
 fn drv_mktemp_dir_near(world : World, path : String) -> Result[String, String] {
   let mut k = 0
   while k < 32 {
-    let cand = path + ".tmp." + drv_tmp_tag(world, path + "#" + k.to_string()) + "." + k.to_string()
-    if c_fs_mkdir_excl(drv_cpath(cand)) == 0 {
+    let seq = c_cli_next_seq().to_string()
+    let cand = path + ".tmp." + drv_tmp_tag(world, path + "#" + seq) + "." + seq
+    let st = c_fs_mkdir_excl_status(drv_cpath(cand))
+    if st == 0 {
       return Ok(cand)
+    }
+    if st != 1 {
+      return Err("cannot create a temporary directory next to " + path + " (" + cand + ")")
     }
     k = k + 1
   }
-  Err("cannot create a temporary directory next to " + path)
+  Err("cannot create a temporary directory next to " + path + ": 32 names taken")
 }
 
 ///|
