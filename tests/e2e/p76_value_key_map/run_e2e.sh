@@ -354,8 +354,8 @@ EOF
     exit 1
   fi
 }
-check_bad_key "float" 'pub fn main() -> Int { let _m : Map[Float, Int] = Map([]); 0 }'
-check_bad_key "tuple_double" 'pub fn main() -> Int { let _m : Map[(Int, Double), Int] = Map([]); 0 }'
+check_bad_key "array" 'pub fn main() -> Int { let _m : Map[Array[Int], Int] = Map([]); 0 }'
+check_bad_key "tuple_str" 'pub fn main() -> Int { let _m : Map[(Int, String), Int] = Map([]); 0 }'
 check_bad_key "mut_struct" 'struct Bad { mut a : Int, b : Int } pub fn main() -> Int { let _m : Map[Bad, Int] = Map([]); 0 }'
 echo "2. Negative E_MAP_KEY_TYPE checks (3 cases) -> OK"
 

@@ -1427,15 +1427,25 @@ export function createPionRuntime(options = {}) {
     return out;
   }
 
-  function pion_arr_clear(a) {
+  function pion_arr_truncate(a, newLen) {
     const p = pNum(a);
     syncViews();
     const len = Number(dv.getBigInt64(p, true));
+    let n = Number(newLen);
+    if (n < 0) n = 0;
+    if (n >= len) return;
     const elemIsObj = dv.getInt32(p + 16, true);
     const stride = dv.getInt32(p + 20, true);
     const dp = Number(dv.getBigInt64(p + 24, true));
-    arrRcAll(dp, len, elemIsObj, stride, false);
-    dv.setBigInt64(p, 0n, true);
+    if (elemIsObj) {
+      const esz = arrStride(p);
+      arrRcAll(dp + n * esz, len - n, elemIsObj, stride, false);
+    }
+    dv.setBigInt64(p, BigInt(n), true);
+  }
+
+  function pion_arr_clear(a) {
+    pion_arr_truncate(a, 0n);
   }
 
   function pion_arr_reverse(a) {
@@ -2223,7 +2233,7 @@ export function createPionRuntime(options = {}) {
       // Array
       pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_push_flat_grow,
       pion_arr_get, pion_arr_set, pion_arr_pop, pion_arr_copy,
-      pion_arr_clear, pion_arr_reverse, pion_arr_join,
+      pion_arr_clear, pion_arr_truncate, pion_arr_reverse, pion_arr_join,
       pion_arr_sort_int, pion_arr_sort_str,
       pion_simd_i8_dot, pion_simd_i8_mv, pion_simd_f32,
 

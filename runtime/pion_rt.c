@@ -847,7 +847,8 @@ PION_MINSIZE void pion_once_call(uint32_t *guard, void (*init_fn)(void)) {
     }
 }
 
-static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj(PionArray *a, void (*fn)(void *));
+static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj_from(PionArray *a, int64_t start, void (*fn)(void *));
+#define pion_arr_foreach_obj(a, fn) pion_arr_foreach_obj_from((a), 0, (fn))
 
 static PION_NOINLINE PION_MINSIZE void pion_map_foreach_obj(PionMap *m, void (*fn)(void *)) {
     for (int64_t i = 0; i < m->cap; i++) {
@@ -1694,12 +1695,12 @@ static inline size_t pion_arr_stride(const PionArray *a) {
     return a->elem_stride ? (size_t)a->elem_stride : sizeof(int64_t);
 }
 
-static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj(PionArray *a, void (*fn)(void *)) {
-    if (!a->elem_is_obj || a->len <= 0) return;
+static PION_NOINLINE PION_MINSIZE void pion_arr_foreach_obj_from(PionArray *a, int64_t start, void (*fn)(void *)) {
+    if (!a->elem_is_obj || start >= a->len) return;
     size_t words = a->elem_stride > 8 ? ((size_t)a->elem_stride >> 3) : 1;
     uint32_t mask = (uint32_t)a->elem_is_obj;
-    int64_t *slot = a->data;
-    for (int64_t i = 0; i < a->len; i++, slot += words) {
+    int64_t *slot = a->data + (size_t)start * words;
+    for (int64_t i = start; i < a->len; i++, slot += words) {
         for (uint32_t m = mask, k = 0; m; m >>= 1, k++) {
             if (m & 1u) fn((void *)(uintptr_t)slot[k]);
         }
@@ -1920,11 +1921,17 @@ PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
     return cp;
 }
 
-PION_MINSIZE void pion_arr_clear(void *a_ptr) {
+PION_MINSIZE void pion_arr_truncate(void *a_ptr, int64_t new_len) {
     PionArray *a = (PionArray *)a_ptr;
-    if (!a || a->len <= 0) return;
-    pion_arr_foreach_obj(a, pion_rc_dec);
-    a->len = 0;
+    if (!a) return;
+    if (new_len < 0) new_len = 0;
+    if (new_len >= a->len) return;
+    pion_arr_foreach_obj_from(a, new_len, pion_rc_dec);
+    a->len = new_len;
+}
+
+PION_MINSIZE void pion_arr_clear(void *a_ptr) {
+    pion_arr_truncate(a_ptr, 0);
 }
 
 PION_MINSIZE void pion_arr_reverse(void *a_ptr) {

@@ -3730,7 +3730,7 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
 ///|
 fn is_hashable_scalar_ty(t : Ty) -> Bool {
   match t {
-    TInt | TInt64 | TUInt | TUInt64 | TBool | TByte | TInt8 | TChar => true
+    TInt | TInt64 | TUInt | TUInt64 | TDouble | TFloat | TBool | TByte | TInt8 | TChar => true
     _ => false
   }
 }
@@ -4573,14 +4573,292 @@ fn add_missing_arms_edit(
 }
 
 ///|
+fn pat_is_irrefutable(pat : Pattern) -> Bool {
+  match pat {
+    PWild(_) | PIdent(_, _) => true
+    PTuple(subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        if !pat_is_irrefutable(subs[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn lookup_enum_info_for_match(tc : TypeChecker, ename : String) -> Option[EnumInfo] {
+  match tc.enums.get(ename) {
+    Some(ei) => Some(ei)
+    None =>
+      if has_qual_sep(ename) {
+        let qpe = split_qual_name(ename)
+        match lookup_imported_pkg_transitive(tc, qpe.prefix) {
+          Some(ipkg) => ipkg.tc.enums.get(qpe.name)
+          None => None
+        }
+      } else {
+        None
+      }
+  }
+}
+
+///|
+fn pat_matrix_splice_tys(col_tys : Array[Ty], c : Int, extra : Array[Ty]) -> Array[Ty] {
+  let out : Array[Ty] = []
+  let mut i = 0
+  while i < c {
+    out.push(col_tys[i])
+    i = i + 1
+  }
+  i = 0
+  while i < extra.length() {
+    out.push(extra[i])
+    i = i + 1
+  }
+  i = c + 1
+  while i < col_tys.length() {
+    out.push(col_tys[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn pat_matrix_splice_row(row : Array[Pattern], c : Int, extra : Array[Pattern]) -> Array[Pattern] {
+  let out : Array[Pattern] = []
+  let mut i = 0
+  while i < c {
+    out.push(row[i])
+    i = i + 1
+  }
+  i = 0
+  while i < extra.length() {
+    out.push(extra[i])
+    i = i + 1
+  }
+  i = c + 1
+  while i < row.length() {
+    out.push(row[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn pat_wilds(n : Int) -> Array[Pattern] {
+  let out : Array[Pattern] = []
+  let sp = span_new("", 0, 0)
+  let mut i = 0
+  while i < n {
+    out.push(PWild(sp))
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Specialize pattern matrix `rows` on column `c`:
+/// - `kind == 0`: tuple of length `arity`
+/// - `kind == 1`: `Bool` (`ctor_name == "true"` or `"false"`)
+/// - `kind == 2`: `PVariant` named `ctor_name` with `arity` payload patterns
+/// - `kind == 3`: default (infinite type): keep only rows irrefutable at `c`
+fn pat_matrix_specialize(
+  rows : Array[Array[Pattern]],
+  c : Int,
+  kind : Int,
+  ctor_name : String,
+  arity : Int,
+) -> Array[Array[Pattern]] {
+  let out : Array[Array[Pattern]] = []
+  let mut r = 0
+  while r < rows.length() {
+    let row = rows[r]
+    let cell = row[c]
+    if kind == 0 {
+      match cell {
+        PTuple(sub, _) =>
+          if sub.length() == arity {
+            out.push(pat_matrix_splice_row(row, c, sub))
+          }
+        _ =>
+          if pat_is_irrefutable(cell) {
+            out.push(pat_matrix_splice_row(row, c, pat_wilds(arity)))
+          }
+      }
+    } else if kind == 1 {
+      let want_b = ctor_name == "true"
+      match cell {
+        PBool(b, _) =>
+          if b == want_b {
+            out.push(pat_matrix_splice_row(row, c, []))
+          }
+        _ =>
+          if pat_is_irrefutable(cell) {
+            out.push(pat_matrix_splice_row(row, c, []))
+          }
+      }
+    } else if kind == 2 {
+      match cell {
+        PVariant(_, vn, sub, _) =>
+          if vn == ctor_name && sub.length() == arity {
+            out.push(pat_matrix_splice_row(row, c, sub))
+          }
+        _ =>
+          if pat_is_irrefutable(cell) {
+            out.push(pat_matrix_splice_row(row, c, pat_wilds(arity)))
+          }
+      }
+    } else if pat_is_irrefutable(cell) {
+      out.push(pat_matrix_splice_row(row, c, []))
+    }
+    r = r + 1
+  }
+  out
+}
+
+///|
+/// Full Maranget-style recursive pattern matrix exhaustiveness check.
+fn check_pat_matrix_covers(
+  tc : TypeChecker,
+  col_tys : Array[Ty],
+  rows : Array[Array[Pattern]],
+) -> Bool {
+  if rows.length() == 0 {
+    return false
+  }
+  let ncols = col_tys.length()
+  if ncols == 0 {
+    return true
+  }
+  // If any row is wholly irrefutable, the matrix covers every value.
+  let mut r = 0
+  while r < rows.length() {
+    let mut all_irref = true
+    let mut j = 0
+    while j < ncols {
+      if !pat_is_irrefutable(rows[r][j]) {
+        all_irref = false
+        break
+      }
+      j = j + 1
+    }
+    if all_irref {
+      return true
+    }
+    r = r + 1
+  }
+  // Maranget heuristic: pick the column with the most refutable patterns (ties -> leftmost).
+  let mut c = -1
+  let mut best_ref = 0
+  let mut ci = 0
+  while ci < ncols {
+    let mut ref_cnt = 0
+    r = 0
+    while r < rows.length() {
+      if !pat_is_irrefutable(rows[r][ci]) {
+        ref_cnt = ref_cnt + 1
+      }
+      r = r + 1
+    }
+    if ref_cnt > best_ref {
+      best_ref = ref_cnt
+      c = ci
+    }
+    ci = ci + 1
+  }
+  if c < 0 {
+    return true
+  }
+  match col_tys[c] {
+    TError | TNever => true
+    TTuple(sub_tys) => {
+      let n_tys = pat_matrix_splice_tys(col_tys, c, sub_tys)
+      let n_rows = pat_matrix_specialize(rows, c, 0, "", sub_tys.length())
+      check_pat_matrix_covers(tc, n_tys, n_rows)
+    }
+    TBool => {
+      let n_tys = pat_matrix_splice_tys(col_tys, c, [])
+      let t_rows = pat_matrix_specialize(rows, c, 1, "true", 0)
+      let f_rows = pat_matrix_specialize(rows, c, 1, "false", 0)
+      check_pat_matrix_covers(tc, n_tys, t_rows) &&
+      check_pat_matrix_covers(tc, n_tys, f_rows)
+    }
+    TOption(inner) => {
+      let none_tys = pat_matrix_splice_tys(col_tys, c, [])
+      let some_tys = pat_matrix_splice_tys(col_tys, c, [inner])
+      let none_rows = pat_matrix_specialize(rows, c, 2, "None", 0)
+      let some_rows = pat_matrix_specialize(rows, c, 2, "Some", 1)
+      check_pat_matrix_covers(tc, none_tys, none_rows) &&
+      check_pat_matrix_covers(tc, some_tys, some_rows)
+    }
+    TResult(ok, err) => {
+      let ok_tys = pat_matrix_splice_tys(col_tys, c, [ok])
+      let err_tys = pat_matrix_splice_tys(col_tys, c, [err])
+      let ok_rows = pat_matrix_specialize(rows, c, 2, "Ok", 1)
+      let err_rows = pat_matrix_specialize(rows, c, 2, "Err", 1)
+      check_pat_matrix_covers(tc, ok_tys, ok_rows) &&
+      check_pat_matrix_covers(tc, err_tys, err_rows)
+    }
+    TEnum(ename, eargs) =>
+      match lookup_enum_info_for_match(tc, ename) {
+        None => true
+        Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let ftys : Array[Ty] = []
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              ftys.push(subst_ty(v.field_tys[fi], subst))
+              fi = fi + 1
+            }
+            let v_tys = pat_matrix_splice_tys(col_tys, c, ftys)
+            let v_rows = pat_matrix_specialize(rows, c, 2, v.name, ftys.length())
+            if !check_pat_matrix_covers(tc, v_tys, v_rows) {
+              return false
+            }
+            vi = vi + 1
+          }
+          true
+        }
+      }
+    _ => {
+      let n_tys = pat_matrix_splice_tys(col_tys, c, [])
+      let d_rows = pat_matrix_specialize(rows, c, 3, "", 0)
+      check_pat_matrix_covers(tc, n_tys, d_rows)
+    }
+  }
+}
+
+///|
+fn check_pats_cover_ty(
+  tc : TypeChecker,
+  scrut_ty : Ty,
+  pats : Array[Pattern],
+) -> Bool {
+  let rows : Array[Array[Pattern]] = []
+  let mut i = 0
+  while i < pats.length() {
+    rows.push([pats[i]])
+    i = i + 1
+  }
+  check_pat_matrix_covers(tc, [scrut_ty], rows)
+}
+
+///|
 fn check_match_exhaustiveness(
   tc : TypeChecker,
   scrut_ty : Ty,
   arms : Array[MatchArm],
   sp : Span,
 ) -> Unit {
-  let mut has_wild = false
-  let covered : Array[String] = []
+  let unguarded : Array[Pattern] = []
   let mut i = 0
   while i < arms.length() {
     let has_guard = match arms[i].guard_expr {
@@ -4588,26 +4866,32 @@ fn check_match_exhaustiveness(
       None => false
     }
     if !has_guard {
-      match arms[i].pat {
-        PWild(_) | PIdent(_, _) => has_wild = true
-        PBool(b, _) => covered.push(if b { "true" } else { "false" })
-        PVariant(_, vname, _, _) => covered.push(vname)
-        _ => ()
+      if pat_is_irrefutable(arms[i].pat) {
+        return
       }
+      unguarded.push(arms[i].pat)
     }
     i = i + 1
-  }
-  if has_wild {
-    return
   }
   match scrut_ty {
     TError | TNever => ()
     TBool => {
+      let mut has_t = false
+      let mut has_f = false
+      i = 0
+      while i < unguarded.length() {
+        match unguarded[i] {
+          PBool(true, _) => has_t = true
+          PBool(false, _) => has_f = true
+          _ => ()
+        }
+        i = i + 1
+      }
       let missing : Array[String] = []
-      if !str_arr_contains(covered, "true") {
+      if !has_t {
         missing.push("true")
       }
-      if !str_arr_contains(covered, "false") {
+      if !has_f {
         missing.push("false")
       }
       if missing.length() > 0 {
@@ -4624,12 +4908,27 @@ fn check_match_exhaustiveness(
         add_missing_arms_edit(tc, arms, missing)
       }
     }
-    TOption(_) => {
+    TOption(inner) => {
+      let mut has_none = false
+      let some_subs : Array[Pattern] = []
+      i = 0
+      while i < unguarded.length() {
+        match unguarded[i] {
+          PVariant(_, vname, sub, _) =>
+            if vname == "None" && sub.length() == 0 {
+              has_none = true
+            } else if vname == "Some" && sub.length() == 1 {
+              some_subs.push(sub[0])
+            }
+          _ => ()
+        }
+        i = i + 1
+      }
       let missing : Array[String] = []
-      if !str_arr_contains(covered, "Some") {
+      if !check_pats_cover_ty(tc, inner, some_subs) {
         missing.push("Some(_)")
       }
-      if !str_arr_contains(covered, "None") {
+      if !has_none {
         missing.push("None")
       }
       if missing.length() > 0 {
@@ -4646,12 +4945,27 @@ fn check_match_exhaustiveness(
         add_missing_arms_edit(tc, arms, missing)
       }
     }
-    TResult(_, _) => {
+    TResult(ok, err) => {
+      let ok_subs : Array[Pattern] = []
+      let err_subs : Array[Pattern] = []
+      i = 0
+      while i < unguarded.length() {
+        match unguarded[i] {
+          PVariant(_, vname, sub, _) =>
+            if vname == "Ok" && sub.length() == 1 {
+              ok_subs.push(sub[0])
+            } else if vname == "Err" && sub.length() == 1 {
+              err_subs.push(sub[0])
+            }
+          _ => ()
+        }
+        i = i + 1
+      }
       let missing : Array[String] = []
-      if !str_arr_contains(covered, "Ok") {
+      if !check_pats_cover_ty(tc, ok, ok_subs) {
         missing.push("Ok(_)")
       }
-      if !str_arr_contains(covered, "Err") {
+      if !check_pats_cover_ty(tc, err, err_subs) {
         missing.push("Err(_)")
       }
       if missing.length() > 0 {
@@ -4668,18 +4982,69 @@ fn check_match_exhaustiveness(
         add_missing_arms_edit(tc, arms, missing)
       }
     }
-    TEnum(ename, _) =>
-      match tc.enums.get(ename) {
+    TEnum(ename, eargs) =>
+      match lookup_enum_info_for_match(tc, ename) {
         None => ()
         Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, eargs)
           let missing : Array[String] = []
           let missing_pats : Array[String] = []
           let mut vi = 0
           while vi < einfo.variants.length() {
             let v = einfo.variants[vi]
-            if !str_arr_contains(covered, v.name) {
+            let nf = v.field_tys.length()
+            let covered_v = if nf == 0 {
+              let mut hit = false
+              i = 0
+              while i < unguarded.length() {
+                match unguarded[i] {
+                  PVariant(_, vn, sub, _) =>
+                    if vn == v.name && sub.length() == 0 {
+                      hit = true
+                      break
+                    }
+                  _ => ()
+                }
+                i = i + 1
+              }
+              hit
+            } else if nf == 1 {
+              let subs : Array[Pattern] = []
+              i = 0
+              while i < unguarded.length() {
+                match unguarded[i] {
+                  PVariant(_, vn, sub, _) =>
+                    if vn == v.name && sub.length() == 1 {
+                      subs.push(sub[0])
+                    }
+                  _ => ()
+                }
+                i = i + 1
+              }
+              check_pats_cover_ty(tc, subst_ty(v.field_tys[0], subst), subs)
+            } else {
+              let ftys : Array[Ty] = []
+              let mut fi = 0
+              while fi < nf {
+                ftys.push(subst_ty(v.field_tys[fi], subst))
+                fi = fi + 1
+              }
+              let subs : Array[Pattern] = []
+              i = 0
+              while i < unguarded.length() {
+                match unguarded[i] {
+                  PVariant(_, vn, sub, sp2) =>
+                    if vn == v.name && sub.length() == nf {
+                      subs.push(PTuple(sub, sp2))
+                    }
+                  _ => ()
+                }
+                i = i + 1
+              }
+              check_pats_cover_ty(tc, TTuple(ftys), subs)
+            }
+            if !covered_v {
               missing.push(v.name)
-              let nf = v.field_tys.length()
               if nf == 0 {
                 missing_pats.push(v.name)
               } else {
@@ -4714,6 +5079,18 @@ fn check_match_exhaustiveness(
             add_missing_arms_edit(tc, arms, missing_pats)
           }
         }
+      }
+    TTuple(_) =>
+      if !check_pats_cover_ty(tc, scrut_ty, unguarded) {
+        tc_err(
+          tc,
+          sp,
+          "E_NON_EXHAUSTIVE",
+          "non-exhaustive `match` on `" + ty_to_string(scrut_ty) + "`",
+          "exhaustive match",
+          "missing wildcard `_`",
+          "add a wildcard arm `_ => ...`",
+        )
       }
     _ =>
       tc_err(
@@ -4827,25 +5204,74 @@ fn bind_pattern(
           "use a pattern matching `" + ty_to_string(scrut_ty) + "`",
         )
       }
-    PTuple(sub, _) =>
+    PTuple(sub, sp) =>
       match scrut_ty {
         TTuple(elems) => {
+          if sub.length() != elems.length() {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "tuple pattern has " +
+              sub.length().to_string() +
+              " element(s), but scrutinee `" +
+              ty_to_string(scrut_ty) +
+              "` has " +
+              elems.length().to_string(),
+              elems.length().to_string() + " tuple elements",
+              sub.length().to_string() + " tuple elements",
+              "match the tuple pattern length to `" + ty_to_string(scrut_ty) + "`",
+            )
+          }
           let mut i = 0
           while i < sub.length() && i < elems.length() {
             bind_pattern(tc, env, sub[i], elems[i])
             i = i + 1
           }
         }
-        _ => ()
+        TError => ()
+        _ =>
+          tc_err(
+            tc,
+            sp,
+            "E_TYPE_MISMATCH",
+            "tuple pattern cannot match `" + ty_to_string(scrut_ty) + "`",
+            "tuple",
+            ty_to_string(scrut_ty),
+            "use a pattern matching `" + ty_to_string(scrut_ty) + "`",
+          )
       }
     PVariant(_, vname, sub, sp) =>
       match scrut_ty {
         TOption(inner) =>
           if vname == "Some" {
+            if sub.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `Some` expects 1 pattern argument(s), found " + sub.length().to_string(),
+                "1 pattern argument",
+                sub.length().to_string() + " pattern arguments",
+                "write `Some(pat)` with 1 pattern",
+              )
+            }
             if sub.length() >= 1 {
               bind_pattern(tc, env, sub[0], inner)
             }
-          } else if vname != "None" {
+          } else if vname == "None" {
+            if sub.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `None` expects 0 pattern argument(s), found " + sub.length().to_string(),
+                "0 pattern arguments",
+                sub.length().to_string() + " pattern arguments",
+                "write `None` with no arguments",
+              )
+            }
+          } else {
             tc_err(
               tc,
               sp,
@@ -4858,10 +5284,32 @@ fn bind_pattern(
           }
         TResult(ok, err) =>
           if vname == "Ok" {
+            if sub.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `Ok` expects 1 pattern argument(s), found " + sub.length().to_string(),
+                "1 pattern argument",
+                sub.length().to_string() + " pattern arguments",
+                "write `Ok(pat)` with 1 pattern",
+              )
+            }
             if sub.length() >= 1 {
               bind_pattern(tc, env, sub[0], ok)
             }
           } else if vname == "Err" {
+            if sub.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "variant `Err` expects 1 pattern argument(s), found " + sub.length().to_string(),
+                "1 pattern argument",
+                sub.length().to_string() + " pattern arguments",
+                "write `Err(pat)` with 1 pattern",
+              )
+            }
             if sub.length() >= 1 {
               bind_pattern(tc, env, sub[0], err)
             }
@@ -4877,19 +5325,7 @@ fn bind_pattern(
             )
           }
         TEnum(ename, args) => {
-          let einfo_opt : Option[EnumInfo] = match tc.enums.get(ename) {
-            Some(ei) => Some(ei)
-            None =>
-              if has_qual_sep(ename) {
-                let qpe = split_qual_name(ename)
-                match lookup_imported_pkg_transitive(tc, qpe.prefix) {
-                  Some(ipkg) => ipkg.tc.enums.get(qpe.name)
-                  None => None
-                }
-              } else {
-                None
-              }
-          }
+          let einfo_opt = lookup_enum_info_for_match(tc, ename)
           match einfo_opt {
             None => ()
             Some(einfo) => {
@@ -4900,6 +5336,22 @@ fn bind_pattern(
                 let v = einfo.variants[vi]
                 if v.name == vname {
                   found = true
+                  if sub.length() != v.field_tys.length() {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_TYPE_MISMATCH",
+                      "variant `" +
+                      vname +
+                      "` expects " +
+                      v.field_tys.length().to_string() +
+                      " pattern argument(s), found " +
+                      sub.length().to_string(),
+                      v.field_tys.length().to_string() + " pattern arguments",
+                      sub.length().to_string() + " pattern arguments",
+                      "match the pattern count to variant `" + vname + "`",
+                    )
+                  }
                   let mut fi = 0
                   while fi < sub.length() && fi < v.field_tys.length() {
                     let fty = subst_ty(v.field_tys[fi], subst)
@@ -8725,6 +9177,20 @@ fn check_int_bitop_method(
     }
     return Some(recv_ty)
   }
+  if method_name == "lnot" {
+    if args.length() != 0 {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "method `lnot` expects 0 argument(s), found " + args.length().to_string(),
+        "0 args",
+        args.length().to_string() + " args",
+        "remove extra arguments",
+      )
+    }
+    return Some(recv_ty)
+  }
   if method_name == "leading_zeros" ||
     method_name == "trailing_zeros" ||
     method_name == "count_ones" {
@@ -8903,11 +9369,63 @@ fn check_method_call(
       if method_name == "to_int8" {
         return TInt8
       }
-      if method_name == "to_bits" {
+      if method_name == "to_bits" || method_name == "reinterpret_as_int64" {
+        if args.length() != 0 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`Double::" + method_name + "` expects 0 arguments",
+            "0 arguments",
+            args.length().to_string() + " arguments",
+            "call `." + method_name + "()` with no arguments",
+          )
+        }
         return TInt64
       }
       if method_name == "reinterpret_as_uint64" {
         return TUInt64
+      }
+      if method_name == "is_nan" {
+        if args.length() != 0 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`Double::is_nan` expects 0 arguments",
+            "0 arguments",
+            args.length().to_string() + " arguments",
+            "call `.is_nan()` with no arguments",
+          )
+        }
+        return TBool
+      }
+      if method_name == "compare" {
+        if args.length() != 1 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`Double::compare` expects 1 argument",
+            "1 argument",
+            args.length().to_string() + " arguments",
+            "pass 1 `Double` argument",
+          )
+        } else {
+          let aty = check_expr(tc, env, args[0], Some(TDouble))
+          if !ty_compat(TDouble, aty) {
+            tc_err(
+              tc,
+              expr_span(args[0]),
+              "E_TYPE_MISMATCH",
+              "`Double::compare` expects `Double`",
+              "Double",
+              ty_to_string(aty),
+              "pass a `Double` value",
+            )
+          }
+        }
+        return TInt
       }
       if method_name == "abs" ||
         method_name == "floor" ||
@@ -9659,6 +10177,47 @@ fn check_method_call(
     TArray(elem) => {
       if method_name == "length" {
         return TInt
+      }
+      if method_name == "is_empty" {
+        if args.length() != 0 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`Array::is_empty` expects 0 arguments, found " + args.length().to_string(),
+            "0 args",
+            args.length().to_string() + " args",
+            "call `.is_empty()` with no arguments",
+          )
+        }
+        return TBool
+      }
+      if method_name == "truncate" {
+        if args.length() != 1 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`Array::truncate` expects 1 argument, found " + args.length().to_string(),
+            "1 arg",
+            args.length().to_string() + " args",
+            "pass 1 `Int` length argument",
+          )
+        } else {
+          let aty = check_expr(tc, env, args[0], Some(TInt))
+          if !ty_compat(TInt, aty) {
+            tc_err(
+              tc,
+              expr_span(args[0]),
+              "E_TYPE_MISMATCH",
+              "`Array::truncate` expects `Int`",
+              "Int",
+              ty_to_string(aty),
+              "pass an `Int` length",
+            )
+          }
+        }
+        return TUnit
       }
       if method_name == "push" {
         if args.length() >= 1 {
@@ -14792,7 +15351,7 @@ pub fn check_package_with_imports_mapped(
               }
               let body_ty = check_stmts(tc, env, fd.body, Some(finfo.ret_ty))
               if fd.is_verify {
-                verify_check_fn(tc, fd, finfo, env.verify_fn_name)
+                verify_check_fn(tc, fd, finfo, env.verify_fn_name, env.fn_key)
               }
               match fd.ret_ty {
                 // Missing `-> T`: patch in the type the body actually produces.
@@ -14926,7 +15485,7 @@ pub fn check_package_with_imports_mapped(
                     }
                     let body_ty = check_stmts(tc, env, md.body, Some(finfo.ret_ty))
                     if md.is_verify {
-                      verify_check_fn(tc, md, finfo, env.verify_fn_name)
+                      verify_check_fn(tc, md, finfo, env.verify_fn_name, env.fn_key)
                     }
                     if !ty_compat(finfo.ret_ty, body_ty) {
                       tc_err(

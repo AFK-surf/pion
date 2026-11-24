@@ -114,6 +114,7 @@ def shl (x y : Std.I32) : Result Std.I32 :=
 def shr (x y : Std.I32) : Result Std.I32 :=
   if 0 ≤ y.val ∧ y.val < 32 then ok ⟨x.bv.sshiftRight y.val.toNat⟩ else fail integerOverflow
 @[simp] def abs (x : Std.I32) : Std.I32 := if x.val < 0 then neg x else x
+@[simp] def lnot (x : Std.I32) : Std.I32 := ⟨~~~x.bv⟩
 @[simp] def to_int (x : Std.I32) : Std.I32 := x
 @[simp] def to_int64 (x : Std.I32) : Std.I64 := IScalar.cast .I64 x
 @[simp] def to_uint (x : Std.I32) : Std.U32 := IScalar.hcast .U32 x
@@ -141,6 +142,7 @@ def shl_i32 (x : Std.I64) (y : Std.I32) : Result Std.I64 :=
 def shr_i32 (x : Std.I64) (y : Std.I32) : Result Std.I64 :=
   if 0 ≤ y.val ∧ y.val < 64 then ok ⟨x.bv.sshiftRight y.val.toNat⟩ else fail integerOverflow
 @[simp] def abs (x : Std.I64) : Std.I64 := if x.val < 0 then neg x else x
+@[simp] def lnot (x : Std.I64) : Std.I64 := ⟨~~~x.bv⟩
 @[simp] def to_int (x : Std.I64) : Std.I32 := IScalar.cast .I32 x
 @[simp] def to_int64 (x : Std.I64) : Std.I64 := x
 @[simp] def to_uint64 (x : Std.I64) : Std.U64 := IScalar.hcast .U64 x
@@ -170,6 +172,7 @@ def shr_i32 (x : Std.U32) (y : Std.I32) : Result Std.U32 :=
 @[simp] def to_uint (x : Std.U32) : Std.U32 := x
 @[simp] def to_int64 (x : Std.U32) : Std.I64 := UScalar.hcast .I64 x
 @[simp] def to_uint64 (x : Std.U32) : Std.U64 := UScalar.cast .U64 x
+@[simp] def lnot (x : Std.U32) : Std.U32 := ⟨~~~x.bv⟩
 end U32
 
 namespace U64
@@ -195,6 +198,7 @@ def shr_i32 (x : Std.U64) (y : Std.I32) : Result Std.U64 :=
 @[simp] def to_int64 (x : Std.U64) : Std.I64 := UScalar.hcast .I64 x
 @[simp] def reinterpret_as_int64 (x : Std.U64) : Std.I64 := UScalar.hcast .I64 x
 @[simp] def to_uint64 (x : Std.U64) : Std.U64 := x
+@[simp] def lnot (x : Std.U64) : Std.U64 := ⟨~~~x.bv⟩
 end U64
 
 namespace U8
@@ -313,6 +317,8 @@ def swap (a : Pion.Array α) (i j : Std.I32) : Result (Pion.Array α) := do
   ok ⟨l⟩
 @[simp] def copy (a : Pion.Array α) : Pion.Array α := a
 @[simp] def clear (_ : Pion.Array α) : Pion.Array α := ⟨[]⟩
+@[simp] def is_empty (a : Pion.Array α) : Bool := a.val.isEmpty
+@[simp] def truncate (a : Pion.Array α) (n : Std.I32) : Pion.Array α := ⟨a.val.take n.val.toNat⟩
 @[simp] def reverse (a : Pion.Array α) : Pion.Array α := ⟨a.val.reverse⟩
 @[simp] def fill (a : Pion.Array α) (x : α) : Pion.Array α := ⟨a.val.map (fun _ => x)⟩
 @[simp] def contains [BEq α] (a : Pion.Array α) (x : α) : Bool := a.val.contains x
@@ -374,8 +380,34 @@ instance : Pion.Eq Pion.Double := { toBEq := inferInstance }
 
 namespace Double
 @[simp] def to_bits (d : Pion.Double) : Std.I64 := ⟨d.bits.bv⟩
+@[simp] def reinterpret_as_int64 (d : Pion.Double) : Std.I64 := ⟨d.bits.bv⟩
 @[simp] def reinterpret_as_uint64 (d : Pion.Double) : Std.U64 := d.bits
 @[simp] def from_bits (b : Std.I64) : Pion.Double := ⟨⟨b.bv⟩⟩
+@[simp] def is_nan (d : Pion.Double) : Bool :=
+  let exp := (d.bits.bv >>> 52) &&& 0x7ff#64
+  let frac := d.bits.bv &&& 0x000fffffffffffff#64
+  exp == 0x7ff#64 && frac != 0#64
+def compare (a b : Pion.Double) : Std.I32 :=
+  let an := is_nan a
+  let bn := is_nan b
+  let neg1 : Std.I32 := I32.neg 1#i32
+  if an && bn then 0#i32
+  else if an then 1#i32
+  else if bn then neg1
+  else
+    let az := (a.bits.bv &&& 0x7fffffffffffffff#64) == 0#64
+    let bz := (b.bits.bv &&& 0x7fffffffffffffff#64) == 0#64
+    if az && bz then 0#i32
+    else if a.bits.bv == b.bits.bv then 0#i32
+    else
+      let a_neg := (a.bits.bv >>> 63) != 0#64
+      let b_neg := (b.bits.bv >>> 63) != 0#64
+      if a_neg != b_neg then (if a_neg then neg1 else 1#i32)
+      else
+        let a_mag := a.bits.bv.toNat
+        let b_mag := b.bits.bv.toNat
+        if a_neg then (if a_mag > b_mag then neg1 else 1#i32)
+        else (if a_mag < b_mag then neg1 else 1#i32)
 end Double
 
 @[simp] def I64.reinterpret_as_double (b : Std.I64) : Pion.Double := ⟨⟨b.bv⟩⟩

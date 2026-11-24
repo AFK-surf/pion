@@ -662,10 +662,16 @@ export function createPionRuntime(opts = {}) {
     if (l) { u8.copyWithin(dst, src, src + l * esz); arrRcAll(dst, l, isObj, st, true); }
     s64(po, l); return o;
   }
+  function pion_arr_truncate(a, newLen) {
+    const p = pNum(a); sync(); const l = Number(g64(p));
+    let n = Number(newLen); if (n < 0) n = 0;
+    if (n >= l) return;
+    const isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
+    if (isObj) arrRcAll(dp + n * arrStride(p), l - n, isObj, st, false);
+    s64(p, n);
+  }
   function pion_arr_clear(a) {
-    const p = pNum(a); sync(); const l = Number(g64(p)), isObj = g32(p + 16), st = g32(p + 20), dp = Number(g64(p + 24));
-    arrRcAll(dp, l, isObj, st, false);
-    s64(p, 0);
+    pion_arr_truncate(a, 0);
   }
   function pion_arr_reverse(a) {
     const p = pNum(a); sync(); const l = Number(g64(p)), dp = Number(g64(p + 24)), st = arrStride(p);
@@ -946,7 +952,7 @@ export function createPionRuntime(opts = {}) {
       pion_strbuf_new, pion_strbuf_push_str, pion_strbuf_push_slice, pion_strbuf_push_byte, pion_strbuf_push_char,
       pion_strbuf_push_int, pion_strbuf_reset, pion_strbuf_to_str,
       pion_arr_new, pion_arr_len, pion_arr_push, pion_arr_push_owned, pion_arr_push_flat_grow, pion_arr_get,
-      pion_arr_set, pion_arr_pop, pion_arr_copy, pion_arr_clear, pion_arr_reverse,
+      pion_arr_set, pion_arr_pop, pion_arr_copy, pion_arr_clear, pion_arr_truncate, pion_arr_reverse,
       pion_arr_join, pion_arr_sort_int, pion_arr_sort_str,
       pion_simd_i8_dot, pion_simd_i8_mv, pion_simd_f32,
       pion_map_new, pion_map_new_int, pion_map_len, pion_map_set, pion_map_has,

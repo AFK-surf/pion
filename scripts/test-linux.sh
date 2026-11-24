@@ -609,6 +609,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p79_qbe_fcsel/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p100_qbe_soundness/run_e2e.sh" "$PIONC"
 # P102: QBE codegen optimizations (test %r,%r, SIB shl folding + disp32/CAddr guards, short rel8, multi-byte NOP, acc imm32, arm64 stp/ldp).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p102_qbe_codegen_opts/run_e2e.sh" "$PIONC"
+# P103: Wave L0 — nested tuple patterns, Array::is_empty/truncate, Double::is_nan/compare/reinterpret_as_int64 + Hash -0.0, Int::lnot.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p103_wave_l0_stdlib_tuple/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p82a_wasm_arr_clear_f32_push/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_enum_sroa/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC"

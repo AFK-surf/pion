@@ -14260,3 +14260,95 @@ test "ssa_slim: match or-arm sharing, loop-gated fast paths, immortal RC skip, a
   assert_eq(ssa_slim_inner_while_cond_cf(6, false), 3)
   assert_eq(ssa_slim_inner_while_cond_cf(6, true), 0)
 }
+
+///|
+test "wave_l0: QBE lowering for nested tuple patterns, Array truncate/is_empty, Double methods/hash, Int lnot" {
+  let src =
+    #|pub fn f_pat(o : Option[(Int, String)]) -> Int {
+    #|  let a = match o {
+    #|    Some((1, s)) => s.length()
+    #|    Some((k, s)) => k + s.length()
+    #|    None => 0
+    #|  }
+    #|  let b = if let Some((x, _)) = o { x } else { -1 }
+    #|  a + b
+    #|}
+    #|pub fn f_arr(xs : Array[String], n : Int) -> Bool {
+    #|  xs.truncate(n)
+    #|  xs.is_empty()
+    #|}
+    #|pub fn f_dbl(a : Double, b : Double) -> Int {
+    #|  let n = if a.is_nan() { 1 } else { 0 }
+    #|  let c = a.compare(b)
+    #|  let bits = a.reinterpret_as_int64()
+    #|  let m : Map[Double, Int] = Map([])
+    #|  m.set(-0.0, 42)
+    #|  n + c + bits.to_int() + m.get(0.0).unwrap_or(0)
+    #|}
+    #|pub fn f_lnot(a : Int, b : Int64, c : UInt, d : UInt64) -> Int64 {
+    #|  a.lnot().to_int64() + b.lnot() + c.lnot().to_int64() + d.lnot().to_int64()
+    #|}
+  let cr = check_source_files_full("wave_l0_be", ["main.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  assert_true(ssa.contains("call $pion_arr_truncate("), ssa)
+  assert_true(ssa.contains("cned "), ssa)
+  assert_true(ssa.contains("cltd "), ssa)
+  assert_true(ssa.contains("cgtd "), ssa)
+  assert_true(ssa.contains("xor "), ssa)
+  assert_true(ssa.contains("-9223372036854775808"), ssa)
+  assert_true(ssa.contains("ceqd "), ssa)
+
+  // Wave L0 R4 (Astra #1): generic trait dispatch `x.to_int()` in `match xs[0]` guard must NOT
+  // borrow `xs[0]` even when T is instantiated as `Byte`, whereas concrete `Byte.to_int()` may borrow.
+  let guard_src =
+    #|let G_XS : Array[String] = ["alpha_heap_string_1234567890", "beta"]
+    #|trait BadToInt {
+    #|  fn to_int(self : Self) -> Int
+    #|}
+    #|impl BadToInt for Byte {
+    #|  fn to_int(self : Byte) -> Int {
+    #|    G_XS.truncate(0)
+    #|    self.to_int()
+    #|  }
+    #|}
+    #|pub fn f_gen[T : BadToInt](x : T, xs : Array[String]) -> Int {
+    #|  match xs[0] {
+    #|    s if x.to_int() >= 0 => s.length()
+    #|    _ => -1
+    #|  }
+    #|}
+    #|pub fn f_concrete(x : Byte, xs : Array[String]) -> Int {
+    #|  match xs[0] {
+    #|    s if x.to_int() >= 0 => s.length()
+    #|    _ => -1
+    #|  }
+    #|}
+    #|pub fn run_guard_check() -> Int {
+    #|  let a = f_concrete((1).to_byte(), G_XS)
+    #|  let b = f_gen((1).to_byte(), G_XS)
+    #|  a + b
+    #|}
+  let cr2 = check_source_files_full("wave_l0_guard", ["main.pion"], [guard_src])
+  assert_true(cr2.diagnostics.length() == 0, check_result_to_json(cr2.diagnostics))
+  let ssa2 = emit_qbe_package_with_tc(cr2.pkg, cr2.tc, false).ssa
+  let gen_s = p18_find_from(ssa2, "function w $pion_fn_f_gen__mono_Byte(", 0)
+  assert_true(gen_s >= 0, ssa2)
+  let gen_e = p18_find_from(ssa2, "\n}\n", gen_s)
+  assert_true(gen_e > gen_s, ssa2)
+  // Generic trait guard must retain scrutinee xs[0] AND binding s -> >= 2 rc_inc calls.
+  let gen_inc1 = p18_find_from(ssa2, "call $pion_rc_inc(", gen_s)
+  let gen_inc2 = p18_find_from(ssa2, "call $pion_rc_inc(", gen_inc1 + 1)
+  assert_true(gen_inc1 > gen_s && gen_inc2 > gen_inc1 && gen_inc2 < gen_e, "generic trait guard must retain xs[0]: " + ssa2)
+  let con_s = p18_find_from(ssa2, "function w $pion_fn_f_concrete(", 0)
+  assert_true(con_s >= 0, ssa2)
+  let con_e = p18_find_from(ssa2, "\n}\n", con_s)
+  assert_true(con_e > con_s, ssa2)
+  // Concrete Byte.to_int guard borrows scrutinee xs[0] -> exactly 1 rc_inc (for binding s), no second rc_inc.
+  let con_inc1 = p18_find_from(ssa2, "call $pion_rc_inc(", con_s)
+  let con_inc2 = if con_inc1 >= 0 && con_inc1 < con_e { p18_find_from(ssa2, "call $pion_rc_inc(", con_inc1 + 1) } else { -1 }
+  assert_true(
+    con_inc1 > con_s && con_inc1 < con_e && (con_inc2 < 0 || con_inc2 > con_e),
+    "concrete Byte.to_int guard must have exactly 1 rc_inc (for binding s, not scrutinee): " + ssa2,
+  )
+}

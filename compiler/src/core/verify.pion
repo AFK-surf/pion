@@ -94,6 +94,7 @@ fn vm_remove(m : VMoved, id : Int) -> Unit {
 struct VCtx {
   tc : TypeChecker
   fn_name : String
+  fn_key : String
   scopes : Array[Map[String, VBind]]
   mut next_bind_id : Int
   mut moved : VMoved
@@ -205,7 +206,7 @@ fn v_lookup_enum(tc : TypeChecker, name : String) -> Option[EnumInfo] {
 
 ///|
 /// Name of the forbidden component of `t` inside `#verify` code, or "".
-fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String {
+fn v_forbidden_in(tc : TypeChecker, fn_key : String, t : Ty, visiting : Array[String]) -> String {
   if visiting.length() > 32 {
     return ty_to_string(t)
   }
@@ -215,9 +216,9 @@ fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String 
     TChannel(_) => "Channel"
     TMutex(_) => "Mutex"
     TDynTrait(n) => "dyn " + n
-    TArray(e) | TFixedArray(e) | TOption(e) => v_forbidden_in(tc, e, visiting)
+    TArray(e) | TFixedArray(e) | TOption(e) => v_forbidden_in(tc, fn_key, e, visiting)
     TImmArray(e) => {
-      let f = v_forbidden_in(tc, e, visiting)
+      let f = v_forbidden_in(tc, fn_key, e, visiting)
       if f != "" {
         f
       } else if v_unique_in(tc, e, visiting) {
@@ -226,18 +227,36 @@ fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String 
         ""
       }
     }
-    TResult(a, b) | TMap(a, b) => {
-      let fa = v_forbidden_in(tc, a, visiting)
+    TResult(a, b) => {
+      let fa = v_forbidden_in(tc, fn_key, a, visiting)
       if fa != "" {
         fa
       } else {
-        v_forbidden_in(tc, b, visiting)
+        v_forbidden_in(tc, fn_key, b, visiting)
+      }
+    }
+    TMap(k, v) => {
+      if v_has_float_in(tc, k, []) {
+        return "Map[" + ty_to_string(k) + ", " + ty_to_string(v) + "] (float key)"
+      }
+      if fn_key != "" {
+        let tps : Array[String] = []
+        collect_eq_tparams_in_ty(tc, k, tps, [])
+        if tps.length() > 0 {
+          verify_eq_tparams_add_all(tc, fn_key, tps)
+        }
+      }
+      let fk = v_forbidden_in(tc, fn_key, k, visiting)
+      if fk != "" {
+        fk
+      } else {
+        v_forbidden_in(tc, fn_key, v, visiting)
       }
     }
     TTuple(es) => {
       let mut i = 0
       while i < es.length() {
-        let f = v_forbidden_in(tc, es[i], visiting)
+        let f = v_forbidden_in(tc, fn_key, es[i], visiting)
         if f != "" {
           return f
         }
@@ -248,13 +267,13 @@ fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String 
     TFn(ps, r) => {
       let mut i = 0
       while i < ps.length() {
-        let f = v_forbidden_in(tc, ps[i], visiting)
+        let f = v_forbidden_in(tc, fn_key, ps[i], visiting)
         if f != "" {
           return f
         }
         i = i + 1
       }
-      v_forbidden_in(tc, r, visiting)
+      v_forbidden_in(tc, fn_key, r, visiting)
     }
     TStruct(name, args) => {
       let key = ty_to_string(t)
@@ -268,7 +287,7 @@ fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String 
           let subst = make_subst(si.decl.type_params, args)
           let mut i = 0
           while i < si.field_tys.length() {
-            let f = v_forbidden_in(tc, subst_ty(si.field_tys[i], subst), visiting)
+            let f = v_forbidden_in(tc, fn_key, subst_ty(si.field_tys[i], subst), visiting)
             if f != "" {
               res = f
               break
@@ -296,7 +315,7 @@ fn v_forbidden_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> String 
             let v = ei.variants[i]
             let mut j = 0
             while j < v.field_tys.length() {
-              let f = v_forbidden_in(tc, subst_ty(v.field_tys[j], subst), visiting)
+              let f = v_forbidden_in(tc, fn_key, subst_ty(v.field_tys[j], subst), visiting)
               if f != "" {
                 res = f
                 break
@@ -396,7 +415,7 @@ fn v_unique_in(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
 ///|
 /// `#verify` type classes: `Forbidden` (rejected with `E_VERIFY_UNSUPPORTED`).
 pub fn is_verify_forbidden_ty(tc : TypeChecker, t : Ty) -> Bool {
-  v_forbidden_in(tc, t, []) != ""
+  v_forbidden_in(tc, "", t, []) != ""
 }
 
 ///|
@@ -497,7 +516,7 @@ fn v_is_unique(ctx : VCtx, t : Ty) -> Bool {
 
 ///|
 fn v_check_forbidden(ctx : VCtx, t : Ty, sp : Span) -> Unit {
-  let f = v_forbidden_in(ctx.tc, t, [])
+  let f = v_forbidden_in(ctx.tc, ctx.fn_key, t, [])
   if f != "" && !ctx.forbidden_seen.contains(f) {
     ctx.forbidden_seen.set(f, true)
     v_err(
@@ -707,6 +726,7 @@ fn v_is_mutating_builtin(m : String) -> Bool {
   m == "set" ||
   m == "swap" ||
   m == "clear" ||
+  m == "truncate" ||
   m == "reset" ||
   m == "reverse" ||
   m == "sort" ||
@@ -1037,15 +1057,19 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
       if builtin {
         match obj_ty {
           TDouble =>
-            if m != "to_bits" && m != "reinterpret_as_uint64" {
+            if m != "to_bits" &&
+              m != "reinterpret_as_uint64" &&
+              m != "reinterpret_as_int64" &&
+              m != "is_nan" &&
+              m != "compare" {
               v_err(
                 ctx,
                 sp,
                 "E_VERIFY_UNSUPPORTED",
                 "method `Double::" + m + "` is not supported in `#verify` function `" + ctx.fn_name + "`",
-                "`to_bits` or `reinterpret_as_uint64`",
+                "`to_bits`, `reinterpret_as_int64`, `reinterpret_as_uint64`, `is_nan`, or `compare`",
                 "Double::" + m,
-                "use `to_bits()` / `reinterpret_as_uint64()`, or move floating-point operations into a `#verify_opaque` helper",
+                "use `to_bits()` / `reinterpret_as_int64()` / `reinterpret_as_uint64()` / `is_nan()` / `compare()`, or move floating-point operations into a `#verify_opaque` helper",
               )
             }
           TInt | TInt64 | TUInt | TUInt64 | TByte | TInt8 =>
@@ -1638,10 +1662,17 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
 
 ///|
 /// Entry point: run the `#verify` rules over one checked function body.
-pub fn verify_check_fn(tc : TypeChecker, fd : FnDecl, finfo : FnInfo, fn_name : String) -> Unit {
+pub fn verify_check_fn(
+  tc : TypeChecker,
+  fd : FnDecl,
+  finfo : FnInfo,
+  fn_name : String,
+  fn_key : String,
+) -> Unit {
   let ctx = VCtx::{
     tc: tc,
     fn_name: fn_name,
+    fn_key: fn_key,
     scopes: [Map([])],
     next_bind_id: 0,
     moved: vm_new(),

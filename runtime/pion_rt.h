@@ -193,6 +193,7 @@ void     pion_arr_set(void *a, int64_t idx, int64_t val);
 int64_t  pion_arr_pop(void *a);
 void*    pion_arr_copy(void *a);
 void     pion_arr_clear(void *a);
+void     pion_arr_truncate(void *a, int64_t new_len);
 void     pion_arr_reverse(void *a);
 void*    pion_arr_join(void *a, void *sep);
 void     pion_arr_sort_int(void *a);
