@@ -520,13 +520,79 @@ fn collect_package_value_and_type_names(files : Array[GeneratedFile]) -> (Map[St
   (declared_values, declared_types)
 }
 
-///| Distinguish generic type parameter brackets (`Array[T]`, `Option[Int]`, `fn id[T]`)
-///| from value indexing brackets (`CAP[1]`, `xs[0]`, `"中A"[1]`) using symbol categories (Astra Round 6 P0-1).
+///| Collect cross-package qualified value vs type names from `api_map` (Astra Round 7 P0):
+///| ensures `acme::CAP[1]` is classified by `acme::CAP` and NEVER shadowed by a local `struct CAP`.
+fn collect_qualified_api_names(api_map : ApiMap) -> (Map[String, Bool], Map[String, Bool]) {
+  let qual_values : Map[String, Bool] = Map()
+  let qual_types : Map[String, Bool] = Map()
+  for sym in api_map.symbols {
+    if sym.target_pkg.length() > 0 && sym.target_name.length() > 0 {
+      let qname = sym.target_pkg + "::" + sym.target_name
+      if sym.kind == "const" || sym.kind == "val" || sym.kind == "let" {
+        qual_values[qname] = true
+      } else if sym.kind == "type" || sym.kind == "struct" || sym.kind == "enum" || sym.kind == "trait" {
+        qual_types[qname] = true
+      }
+    }
+  }
+  (qual_values, qual_types)
+}
+
+///| Check whether the tokens inside `[lbr_idx + 1 .. close_br - 1]` look strictly like type arguments
+///| (no numeric/string literals or arithmetic operators).
+fn bracket_looks_like_type_args(tokens : Array[Token], lbr_idx : Int, close_br : Int) -> Bool {
+  if close_br <= lbr_idx + 1 {
+    return false
+  }
+  let first = tokens[lbr_idx + 1]
+  let valid_start = first.kind == TokenKind::UpperIdent ||
+  (first.kind == TokenKind::Ident && lbr_idx + 2 < close_br && tokens[lbr_idx + 2].kind == TokenKind::ColonColon)
+  if !valid_start {
+    return false
+  }
+  let mut k = lbr_idx + 1
+  while k < close_br {
+    let kk = tokens[k].kind
+    if kk == TokenKind::IntLit || kk == TokenKind::FloatLit || kk == TokenKind::StringLit ||
+    kk == TokenKind::Plus || kk == TokenKind::Minus || kk == TokenKind::Star || kk == TokenKind::Slash || kk == TokenKind::Percent {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Find the enclosing unmatched `[` token index before `pos`, or -1 if none.
+fn find_enclosing_lbracket(tokens : Array[Token], pos : Int) -> Int {
+  let mut depth = 0
+  let mut k = pos - 1
+  while k >= 0 {
+    let kk = tokens[k].kind
+    if kk == TokenKind::RBracket {
+      depth = depth + 1
+    } else if kk == TokenKind::LBracket {
+      if depth == 0 {
+        return k
+      }
+      depth = depth - 1
+    } else if kk == TokenKind::LBrace || kk == TokenKind::RBrace || kk == TokenKind::Semi {
+      return -1
+    }
+    k = k - 1
+  }
+  -1
+}
+
+///| Distinguish generic type parameter brackets (`Array[T]`, `Option[acme::Wrap[Int]]`, `fn id[T]`)
+///| from value indexing brackets (`CAP[1]`, `acme::CAP[1]`, `xs[0]`, `"中A"[1]`) using symbol categories
+///| and qualified `pkg::Name` isolation (Astra Round 6 P0-1 + Round 7 P0).
 fn is_type_arg_brackets(
   tokens : Array[Token],
   lbr_idx : Int,
   declared_values : Map[String, Bool],
   declared_types : Map[String, Bool],
+  qual_values : Map[String, Bool],
+  qual_types : Map[String, Bool],
 ) -> Bool {
   if lbr_idx <= 0 {
     return false
@@ -540,13 +606,27 @@ fn is_type_arg_brackets(
     return false
   }
   let nm = prev.raw
-  // 1. Explicitly declared `const`/`let` value binding -> ALWAYS value indexing!
-  if declared_values.contains(nm) {
-    return false
-  }
-  // 2. Explicitly declared type or builtin generic type -> ALWAYS type argument!
-  if declared_types.contains(nm) {
-    return true
+  let is_qualified = lbr_idx >= 3 &&
+  tokens[lbr_idx - 2].kind == TokenKind::ColonColon &&
+  (tokens[lbr_idx - 3].kind == TokenKind::Ident || tokens[lbr_idx - 3].kind == TokenKind::UpperIdent)
+  if is_qualified {
+    // Cross-package qualified symbol `pkg::Name`: classify ONLY by `qual_values`/`qual_types`
+    // and syntactic type position — NEVER let local package `declared_types` shadow it!
+    let qname = tokens[lbr_idx - 3].raw + "::" + nm
+    if qual_values.contains(qname) {
+      return false
+    }
+    if qual_types.contains(qname) {
+      return true
+    }
+  } else {
+    // Unqualified local symbol: check current package `declared_values` / `declared_types`
+    if declared_values.contains(nm) {
+      return false
+    }
+    if declared_types.contains(nm) {
+      return true
+    }
   }
   // 3. Immediately preceded by declaration keyword (`fn`/`struct`/`enum`/`type`/`trait`/`impl`) -> type parameter
   let recv_start = find_receiver_start(tokens, lbr_idx - 1)
@@ -556,31 +636,22 @@ fn is_type_arg_brackets(
     if pk == TokenKind::Keyword && (pr == "fn" || pr == "struct" || pr == "enum" || pr == "type" || pr == "trait" || pr == "impl") {
       return true
     }
-    // 4. Obvious type annotation position (`-> T[U]` or `x : T[U]` where bracket content starts with UpperIdent and has no nums/ops)
+    // 4. Obvious type annotation position (`-> T[U]`, `x : T[U]`, or nested inside an outer type arg `[..., pkg::T[U]]`)
     if pk == TokenKind::Arrow {
       return true
     }
-    if pk == TokenKind::Colon {
-      let close_br = find_matching_delim(tokens, lbr_idx)
-      if close_br > lbr_idx + 1 && tokens[lbr_idx + 1].kind == TokenKind::UpperIdent {
-        let mut all_type_toks = true
-        let mut k = lbr_idx + 1
-        while k < close_br {
-          let kk = tokens[k].kind
-          if kk == TokenKind::IntLit || kk == TokenKind::FloatLit || kk == TokenKind::StringLit ||
-          kk == TokenKind::Plus || kk == TokenKind::Minus || kk == TokenKind::Star || kk == TokenKind::Slash || kk == TokenKind::Percent {
-            all_type_toks = false
-            break
-          }
-          k = k + 1
-        }
-        if all_type_toks {
-          return true
-        }
+    let close_br = find_matching_delim(tokens, lbr_idx)
+    if pk == TokenKind::Colon && bracket_looks_like_type_args(tokens, lbr_idx, close_br) {
+      return true
+    }
+    if (pk == TokenKind::LBracket || pk == TokenKind::Comma) && bracket_looks_like_type_args(tokens, lbr_idx, close_br) {
+      let outer_lbr = find_enclosing_lbracket(tokens, recv_start)
+      if outer_lbr >= 0 && is_type_arg_brackets(tokens, outer_lbr, declared_values, declared_types, qual_values, qual_types) {
+        return true
       }
     }
   }
-  // 5. Unknown uppercase identifier (e.g. cross-package constant `ext::CAP[1]`): treat as value index (fail-closed!)
+  // 5. Unknown uppercase identifier (including unknown qualified `ext::CAP[1]`): treat as value index (fail-closed!)
   false
 }
 
@@ -588,11 +659,20 @@ fn is_type_arg_brackets(
 ///| Supports chained/complex receivers (`self.text.length()`, `f().length()`, `arr[i].length()`,
 ///| `(a + b) / n`, `self.r.val`, `"{d}"`, and slice placeholders) while skipping already-proven safe offsets.
 pub fn instrument_probes_for_file(file : String, content : String) -> (String, Array[ProbeSite]) {
+  instrument_probes_for_file_with_api_map(file, content, empty_api_map())
+}
+
+pub fn instrument_probes_for_file_with_api_map(
+  file : String,
+  content : String,
+  api_map : ApiMap,
+) -> (String, Array[ProbeSite]) {
   let empty_safe : Map[Int, Bool] = Map()
   let (dvals, dtypes) = collect_package_value_and_type_names([
     GeneratedFile::{ rel_path: file, content: content, source_file: file, anchors: [] },
   ])
-  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes)
+  let (qvals, qtypes) = collect_qualified_api_names(api_map)
+  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes)
 }
 
 fn instrument_probes_for_file_with_safe(
@@ -602,6 +682,8 @@ fn instrument_probes_for_file_with_safe(
   base_offset : Int,
   declared_values : Map[String, Bool],
   declared_types : Map[String, Bool],
+  qual_values : Map[String, Bool],
+  qual_types : Map[String, Bool],
 ) -> (String, Array[ProbeSite]) {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
@@ -713,6 +795,8 @@ fn instrument_probes_for_file_with_safe(
             base_offset + expr_start_byte,
             declared_values,
             declared_types,
+            qual_values,
+            qual_types,
           )
           if inner_sites.length() > 0 {
             any_interp_probe = true
@@ -891,7 +975,7 @@ fn instrument_probes_for_file_with_safe(
       let recv_start = find_receiver_start(tokens, i - 1)
       if !safe_offsets.contains(op_b) && !next_is_eq && recv_start >= 0 && close_br > i + 1 &&
       tokens[recv_start].start_byte >= covered_end &&
-      !is_type_arg_brackets(tokens, i, declared_values, declared_types) &&
+      !is_type_arg_brackets(tokens, i, declared_values, declared_types, qual_values, qual_types) &&
       !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
         let end_b = tokens[close_br].end_byte
@@ -1352,6 +1436,8 @@ fn audit_undisposed_raw_tokens(
   line_offset : Int,
   declared_values : Map[String, Bool],
   declared_types : Map[String, Bool],
+  qual_values : Map[String, Bool],
+  qual_types : Map[String, Bool],
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> Unit {
@@ -1376,6 +1462,8 @@ fn audit_undisposed_raw_tokens(
             if line_offset > 0 { line_offset } else { t.line },
             declared_values,
             declared_types,
+            qual_values,
+            qual_types,
             diags,
             drift_ledger,
           )
@@ -1436,7 +1524,7 @@ fn audit_undisposed_raw_tokens(
       let close_br = find_matching_delim(toks, i)
       let next_is_eq = close_br + 1 < n && toks[close_br + 1].kind == TokenKind::Eq
       let op_b = base_offset + t.start_byte
-      if is_expr_prev && !is_type_arg_brackets(toks, i, declared_values, declared_types) && !next_is_eq && close_br > i + 1 && !safe_offsets.contains(op_b) {
+      if is_expr_prev && !is_type_arg_brackets(toks, i, declared_values, declared_types, qual_values, qual_types) && !next_is_eq && close_br > i + 1 && !safe_offsets.contains(op_b) {
         let ln = if line_offset > 0 { line_offset } else { t.line }
         diags.push(diag_error(
           "MBT2PION_UNDISPOSED_PROBE_SITE",
@@ -1570,12 +1658,35 @@ pub fn run_stage_a5(
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> (Array[GeneratedFile], Int, Int, Int) {
-  run_stage_a5_with_max_rounds(files, recipes, check_fn, diags, drift_ledger, 64)
+  run_stage_a5_full(files, recipes, empty_api_map(), check_fn, diags, drift_ledger, 64)
+}
+
+pub fn run_stage_a5_with_api_map(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_full(files, recipes, api_map, check_fn, diags, drift_ledger, 64)
 }
 
 pub fn run_stage_a5_with_max_rounds(
   files : Array[GeneratedFile],
   recipes : Recipes,
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_full(files, recipes, empty_api_map(), check_fn, diags, drift_ledger, max_rounds)
+}
+
+pub fn run_stage_a5_full(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
   check_fn : (Array[(String, String)]) -> String,
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
@@ -1590,6 +1701,7 @@ pub fn run_stage_a5_with_max_rounds(
     safe_map_by_file[f.rel_path] = Map()
   }
   let (declared_values, declared_types) = collect_package_value_and_type_names(cur_files)
+  let (qual_values, qual_types) = collect_qualified_api_names(api_map)
   let mut total_rounds = 0
   let mut total_instrumented = 0
   let mut total_resolved = 0
@@ -1612,6 +1724,8 @@ pub fn run_stage_a5_with_max_rounds(
         0,
         declared_values,
         declared_types,
+        qual_values,
+        qual_types,
       )
       instrumented_batch.push((f.rel_path, inst_src))
       sites_by_file[f.rel_path] = sites
@@ -1757,7 +1871,19 @@ pub fn run_stage_a5_with_max_rounds(
     audit_undisposed_div_mod(f.rel_path, f.content, smap, 0, 0, diags, drift_ledger)
     // Astra Round 5 P0-1: independent raw-token audit covering `.length()`, `.to_string()`,
     // `.val`, and `[i]` without sharing `find_receiver_start` / `is_non_expr_receiver`!
-    audit_undisposed_raw_tokens(f.rel_path, f.content, smap, 0, 0, declared_values, declared_types, diags, drift_ledger)
+    audit_undisposed_raw_tokens(
+      f.rel_path,
+      f.content,
+      smap,
+      0,
+      0,
+      declared_values,
+      declared_types,
+      qual_values,
+      qual_types,
+      diags,
+      drift_ledger,
+    )
   }
 
   (cur_files, total_rounds, total_instrumented, total_resolved)

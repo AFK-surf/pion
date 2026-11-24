@@ -980,6 +980,58 @@ assert after_9b == snap_9b, f"9b OUT mutated on external run-report failure! bef
 assert not os.path.exists(os.path.join(o9b, "rep.json")), "9b in-out rep.json leaked on external run-report failure!"
 
 print("[e2e] PASS: Round 5+6 Astra P0-2/P0-3 suite (relative+absolute+external symlinks, 228-byte short-temp run-report, pre-swap failure leaves OUT untouched)")
+
+# -----------------------------------------------------------------------------
+# 10. Round 7 Astra P1: Case-folded report path collision check (cross-platform)
+# -----------------------------------------------------------------------------
+s10 = os.path.join(root, "s10")
+o10 = os.path.join(root, "o10")
+os.makedirs(s10, exist_ok=True)
+with open(os.path.join(s10, "a.mbt"), "w") as f:
+    f.write("pub fn v10() -> Int { 10 }\n")
+r10_init = run_cli(["--src", s10, "--out", o10, "--target", "native", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10_init.returncode == 0, f"10 init publish failed: {r10_init.stderr}"
+snap_10 = {p: open(os.path.join(o10, p), "rb").read() for p in sorted(os.listdir(o10))}
+
+with open(os.path.join(s10, "a.mbt"), "w") as f:
+    f.write("pub fn v10_new() -> Int { 20 }\n")
+
+# 10a. Case-colliding in-out reports: --report OUT/Migration.json --drift-ledger OUT/migration.json
+r10_in = run_cli(["--src", s10, "--out", o10, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--report", os.path.join(o10, "Migration.json"),
+                  "--drift-ledger", os.path.join(o10, "migration.json")])
+assert r10_in.returncode == 1, f"10a case-colliding in-out reports must fail (rc=1), got {r10_in.returncode}"
+assert "MBT2PION_REPORT_PATH_COLLISION" in (r10_in.stdout + r10_in.stderr), "10a missing MBT2PION_REPORT_PATH_COLLISION"
+assert {p: open(os.path.join(o10, p), "rb").read() for p in sorted(os.listdir(o10))} == snap_10, "10a OUT modified on collision!"
+
+# 10b. Case-colliding external reports: --report <tmp>/Migration.json --drift-ledger <tmp>/migration.json
+ext_dir10 = os.path.join(root, "ext10")
+os.makedirs(ext_dir10, exist_ok=True)
+r10_ext = run_cli(["--src", s10, "--out", o10, "--target", "native", "--mode", "publish",
+                   "--mbt-compat", compat_dir, "--pionc", pionc,
+                   "--report", os.path.join(ext_dir10, "Migration.json"),
+                   "--drift-ledger", os.path.join(ext_dir10, "migration.json")])
+assert r10_ext.returncode == 1, f"10b case-colliding external reports must fail (rc=1), got {r10_ext.returncode}"
+assert "MBT2PION_REPORT_PATH_COLLISION" in (r10_ext.stdout + r10_ext.stderr), "10b missing MBT2PION_REPORT_PATH_COLLISION"
+assert os.listdir(ext_dir10) == [], f"10b wrote colliding external report: {os.listdir(ext_dir10)}"
+assert {p: open(os.path.join(o10, p), "rb").read() for p in sorted(os.listdir(o10))} == snap_10, "10b OUT modified on collision!"
+
+# 10c. Distinct filenames in --out succeed and actually produce 2 distinct JSON files with respective schemas
+r10_ok = run_cli(["--src", s10, "--out", o10, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--report", os.path.join(o10, "migration.json"),
+                  "--drift-ledger", os.path.join(o10, "drift.json")])
+assert r10_ok.returncode == 0, f"10c distinct report filenames failed: {r10_ok.stderr}"
+entries10 = sorted(os.listdir(o10))
+assert "migration.json" in entries10 and "drift.json" in entries10, f"10c missing distinct JSON files: {entries10}"
+mig_obj = json.load(open(os.path.join(o10, "migration.json")))
+drift_obj = json.load(open(os.path.join(o10, "drift.json")))
+assert "files_generated" in mig_obj, f"10c migration.json missing files_generated: {list(mig_obj.keys())}"
+assert "unresolved_entries" in drift_obj, f"10c drift.json missing unresolved_entries: {list(drift_obj.keys())}"
+
+print("[e2e] PASS: Round 7 Astra P1 suite (case-folded report collision in-out & external blocked + distinct reports verified)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"

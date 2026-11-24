@@ -92,6 +92,8 @@ CASES = {
     "utf16_lit_struct_interp": ("ok", 5),
     "mbt_compat_chain_len": ("ok", 3),
     "const_upper_idx_and_generic": ("ok", 3),
+    "cross_pkg_cap_noshadow": ("ok", 2),
+    "cross_pkg_cap_shadow": ("ok", 3),
 }
 
 MOON_TRAPS = {
@@ -426,6 +428,80 @@ const CAP : String = "中A"
 pub fn cap_idx_1() -> Int { CAP[1].to_int() }
 pub fn cap_in_box() -> Int { LenBox::{ n: CAP[1].to_int() }.n }
 pub fn[T] id_arr(xs : Array[T]) -> Option[Array[T]] { Some(xs) }
+
+// Round 7 Astra P0: cross-package qualified `@acme.CAP[1]` & `@acme.Wrap[Int]` (no local `struct CAP`)
+pub fn noshadow_acme_cap_idx() -> Int { @acme.CAP[1].to_int() }
+pub fn noshadow_wrap_roundtrip(v : Int) -> Int {
+  let opt : Option[@acme.Wrap[Int]] = Some(@acme.wrap_new(v))
+  match opt {
+    Some(w) => @acme.wrap_get(w)
+    None => 0
+  }
+}
+'''
+
+ACME_MOON_MBT = r'''
+pub const CAP : String = "中A"
+
+pub struct Wrap[T] {
+  v : T
+}
+
+pub fn[T] wrap_new(v : T) -> Wrap[T] {
+  Wrap::{ v: v }
+}
+
+pub fn[T] wrap_get(w : Wrap[T]) -> T {
+  w.v
+}
+'''
+
+ACME_PION_SRC = r'''
+pub let CAP : String = "中A"
+
+pub struct Wrap[T] {
+  v : T
+}
+
+pub fn wrap_new[T](v : T) -> Wrap[T] {
+  Wrap::{ v: v }
+}
+
+pub fn wrap_get[T](w : Wrap[T]) -> T {
+  w.v
+}
+'''
+
+SHADOW_LIB_MBT = r'''
+pub struct CAP {
+  n : Int
+}
+
+pub fn shadow_acme_cap_idx() -> Int {
+  @acme.CAP[1].to_int()
+}
+
+pub fn shadow_cap_box() -> Int {
+  CAP::{ n: @acme.CAP[1].to_int() }.n
+}
+
+pub fn shadow_wrap_roundtrip(v : Int) -> Int {
+  let opt : Option[@acme.Wrap[Int]] = Some(@acme.wrap_new(v))
+  match opt {
+    Some(w) => @acme.wrap_get(w)
+    None => 0
+  }
+}
+'''
+
+ACME_API_MAP_JSON = '''{
+  "symbols": [
+    {"src_pkg": "acme", "src_name": "CAP", "kind": "const", "target_pkg": "acme", "target_name": "CAP"},
+    {"src_pkg": "acme", "src_name": "Wrap", "kind": "struct", "target_pkg": "acme", "target_name": "Wrap"},
+    {"src_pkg": "acme", "src_name": "wrap_new", "kind": "fn", "target_pkg": "acme", "target_name": "wrap_new"},
+    {"src_pkg": "acme", "src_name": "wrap_get", "kind": "fn", "target_pkg": "acme", "target_name": "wrap_get"}
+  ]
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -788,6 +864,20 @@ fn main {
     check("r6.cap_idx", a == 65)
     check("r6.cap_box", b == 65)
     check("r6.id_arr", c == 3)
+  } else if kase == "cross_pkg_cap_noshadow" {
+    let a = noshadow_acme_cap_idx()
+    let b = noshadow_wrap_roundtrip(42)
+    trace("r", "\{a},\{b}")
+    check("r7.noshadow_cap", a == 65)
+    check("r7.noshadow_wrap", b == 42)
+  } else if kase == "cross_pkg_cap_shadow" {
+    let a = @shadow.shadow_acme_cap_idx()
+    let b = @shadow.shadow_cap_box()
+    let c = @shadow.shadow_wrap_roundtrip(42)
+    trace("r", "\{a},\{b},\{c}")
+    check("r7.shadow_cap", a == 65)
+    check("r7.shadow_box", b == 65)
+    check("r7.shadow_wrap", c == 42)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -796,6 +886,7 @@ fn main {
 
 PION_DRIVER_PION = r'''
 import "mbt_compat" as mbt_compat
+import "shadow" as shadow
 
 fn trace(w : World, k : String, v : String) -> Unit {
   io_println(w, "T " + k + "=" + v)
@@ -1164,6 +1255,20 @@ pub fn main(w : World) -> Int {
     check(w, "r6.cap_idx", a == 65)
     check(w, "r6.cap_box", b == 65)
     check(w, "r6.id_arr", c == 3)
+  } else if kase == "cross_pkg_cap_noshadow" {
+    let a = noshadow_acme_cap_idx()
+    let b = noshadow_wrap_roundtrip(42)
+    trace(w, "r", a.to_string() + "," + b.to_string())
+    check(w, "r7.noshadow_cap", a == 65)
+    check(w, "r7.noshadow_wrap", b == 42)
+  } else if kase == "cross_pkg_cap_shadow" {
+    let a = shadow::shadow_acme_cap_idx()
+    let b = shadow::shadow_cap_box()
+    let c = shadow::shadow_wrap_roundtrip(42)
+    trace(w, "r", a.to_string() + "," + b.to_string() + "," + c.to_string())
+    check(w, "r7.shadow_cap", a == 65)
+    check(w, "r7.shadow_box", b == 65)
+    check(w, "r7.shadow_wrap", c == 42)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -1311,17 +1416,39 @@ class Env:
 
 
 def prepare(env):
-    # 1. Write the single shared MoonBit source file
+    # 1. Write shared MoonBit sources (main oracle_lib + cross-package acme + shadow pkg with local `struct CAP`)
     write_file(os.path.join(env.mbt_src_dir, "oracle_lib.mbt"), ORACLE_LIB_MBT)
+    shadow_mbt_dir = os.path.join(env.workdir, "shadow_mbt_src")
+    write_file(os.path.join(shadow_mbt_dir, "shadow_lib.mbt"), SHADOW_LIB_MBT)
+    api_map_path = os.path.join(env.workdir, "acme_api_map.json")
+    write_file(api_map_path, ACME_API_MAP_JSON)
 
-    # 2. Build MoonBit package around the exact same `oracle_lib.mbt`
+    # 1b. Write real Pion `acme` dependency package
+    pion_acme_dir = os.path.join(env.workdir, "pion_acme")
+    write_file(
+        os.path.join(pion_acme_dir, "pion.toml"),
+        '[package]\nname = "acme"\nversion = "0.1.0"\n',
+    )
+    write_file(os.path.join(pion_acme_dir, "src", "lib.pion"), ACME_PION_SRC)
+
+    # 2. Build MoonBit packages (`acme`, `shadow`, `main`) around the exact same `.mbt` files
     write_file(
         os.path.join(env.moon_dir, "moon.mod"),
         'name = "oracle/transpile"\n',
     )
+    write_file(os.path.join(env.moon_dir, "acme", "moon.pkg"), "\n")
+    write_file(os.path.join(env.moon_dir, "acme", "lib.mbt"), ACME_MOON_MBT)
+    write_file(
+        os.path.join(env.moon_dir, "shadow", "moon.pkg"),
+        'import {\n  "oracle/transpile/acme",\n}\n',
+    )
+    shutil.copyfile(
+        os.path.join(shadow_mbt_dir, "shadow_lib.mbt"),
+        os.path.join(env.moon_dir, "shadow", "shadow_lib.mbt"),
+    )
     write_file(
         os.path.join(env.moon_dir, "main", "moon.pkg"),
-        'import {\n  "moonbitlang/core/env",\n}\n\npkgtype(kind: "executable")\n',
+        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n}\n\npkgtype(kind: "executable")\n',
     )
     shutil.copyfile(
         os.path.join(env.mbt_src_dir, "oracle_lib.mbt"),
@@ -1336,7 +1463,32 @@ def prepare(env):
         return False
     print("setup ok   %-44s %.1fs" % ("pionc build tools/mbt2pion_cli", secs))
 
-    # 4. Run `mbt2pion --mode publish` on `oracle_lib.mbt` with real `tools/mbt_compat`
+    # 4. Run `mbt2pion --mode publish` on `oracle_lib.mbt` and `shadow_lib.mbt` with real `tools/mbt_compat` + `acme`
+    pion_shadow_dir = os.path.join(env.workdir, "pion_shadow")
+    pion_shadow_src = os.path.join(pion_shadow_dir, "src")
+    os.makedirs(pion_shadow_src, exist_ok=True)
+    rc, out, err, to, secs = run_cmd([
+        env.mbt2pion_bin,
+        "--src", shadow_mbt_dir,
+        "--out", pion_shadow_src,
+        "--target", "native",
+        "--mode", "publish",
+        "--api-map", api_map_path,
+        "--dep", "acme=" + pion_acme_dir,
+        "--mbt-compat", COMPAT_DIR,
+        "--pionc", env.pionc,
+        "--mbt2pion-commit", "oracle-test",
+        "--toolchain-lock", "oracle-lock",
+        "--source-commit", "oracle-src",
+    ])
+    if rc != 0:
+        print("SETUP FAILED: mbt2pion --mode publish shadow_lib.mbt (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
+        return False
+    write_file(
+        os.path.join(pion_shadow_dir, "pion.toml"),
+        '[package]\nname = "shadow"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir),
+    )
+
     pion_src = os.path.join(env.pion_dir, "src")
     os.makedirs(pion_src, exist_ok=True)
     rc, out, err, to, secs = run_cmd([
@@ -1345,6 +1497,8 @@ def prepare(env):
         "--out", pion_src,
         "--target", "native",
         "--mode", "publish",
+        "--api-map", api_map_path,
+        "--dep", "acme=" + pion_acme_dir,
         "--mbt-compat", COMPAT_DIR,
         "--pionc", env.pionc,
         "--mbt2pion-commit", "oracle-test",
@@ -1358,10 +1512,10 @@ def prepare(env):
         return False
     print("setup ok   %-44s %.1fs" % ("mbt2pion --mode publish oracle_lib.mbt", secs))
 
-    # 5. Wire generated `.pion` files with real `tools/mbt_compat` + thin driver
+    # 5. Wire generated `.pion` files with real `tools/mbt_compat` + `acme` + `shadow` + thin driver
     write_file(
         os.path.join(env.pion_dir, "pion.toml"),
-        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\n' % COMPAT_DIR,
+        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir),
     )
     write_file(os.path.join(pion_src, "main.pion"), PION_DRIVER_PION)
 
