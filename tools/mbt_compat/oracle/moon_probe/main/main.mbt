@@ -61,6 +61,22 @@ fn utf8_off_of(s : String, u : Int32) -> Int32 {
 }
 
 ///|
+/// Scalar index of UTF-16 offset `u`, flooring inside a pair.
+fn scalar_off_of(s : String, u : Int32) -> Int32 {
+  let mut units = 0
+  let mut k = 0
+  for c in s {
+    let w = if c.to_int() >= 0x10000 { 2 } else { 1 }
+    if units + w > u {
+      break
+    }
+    units += w
+    k += 1
+  }
+  k
+}
+
+///|
 fn case_utf16_basic() -> Unit {
   let s = "A中😀B"
   trace("len", s.length().to_string())
@@ -88,6 +104,14 @@ fn case_utf16_basic() -> Unit {
   trace("suffix", s.has_suffix("😀B").to_string())
   check("utf16.prefix", s.has_prefix("A中") && !s.has_prefix("中"))
   check("utf16.suffix", s.has_suffix("😀B"))
+  let cs = [
+    "😀", "\u{FF01}\u{FF01}", "中", "k9", "alpha", "beta", "zeta", "", "a😀",
+  ]
+  for x in cs {
+    for y in cs {
+      trace("cmp<\{x}><\{y}>", x.compare(y).to_string())
+    }
+  }
   trace("lower", "Hello WORLD Ä 😀X".to_lower())
   check("utf16.lower", "Hello WORLD Ä".to_lower() == "hello world Ä")
 }
@@ -125,6 +149,16 @@ fn case_utf16_boundary() -> Unit {
   for u = 0; u <= s.length(); u = u + 1 {
     trace("u2b\{u}", utf8_off_of(s, u).to_string())
   }
+  for u = 0; u <= s.length(); u = u + 1 {
+    trace("u2s\{u}", scalar_off_of(s, u).to_string())
+  }
+  let mut acc = 0
+  for k, c in s {
+    trace("s2u\{k}", acc.to_string())
+    acc += if c.to_int() >= 0x10000 { 2 } else { 1 }
+  }
+  trace("s2u_end", acc.to_string())
+  check("boundary.scalar_pair_floor", scalar_off_of(s, 4) == 3)
   check("boundary.end", utf8_off_of(s, s.length()) == 11)
   check("boundary.pair_floor", utf8_off_of(s, 4) == 6)
 }
@@ -210,6 +244,13 @@ fn case_arrayview_ops() -> Unit {
   let bv = b[1:4]
   trace("sub[1:10]", bv[1:10].to_owned().map(x => x.to_string()).join(","))
   trace("sub[3:1]", bv[3:1].length().to_string())
+  for p in [(3, 10), (-2, 2), (4, 1), (0, 5), (5, 5), (2, 2), (1, 3)] {
+    trace(
+      "slice_copy[\{p.0}:\{p.1}]",
+      b[p.0:p.1].to_owned().map(x => x.to_string()).join(","),
+    )
+  }
+  check("av.slice_copy", b[1:3].to_owned() == [2, 3])
   check("av.clamp_end", b[3:10].length() == 2)
   let o = b[0:3].to_owned()
   b[1] = 20
@@ -278,6 +319,10 @@ fn case_map_order() -> Unit {
   let lp = []
   lit.each((k, v) => lp.push("\{k}=\{v}"))
   trace("literal_dup", lp.join(" "))
+  let entries = m.to_array().map(p => "\{p.0}=\{p.1}")
+  entries.sort()
+  trace("boundary.sorted", entries.join(","))
+  check("map.boundary_size", entries.length() == 5)
   m.clear()
   trace("cleared", m.is_empty().to_string())
 }
