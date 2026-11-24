@@ -1408,6 +1408,56 @@ for tag_mp, rules_str, expected_out in [
     assert r_mp_run.stdout.strip() == expected_out, f"10m-2 {tag_mp} expected {expected_out!r}, got {r_mp_run.stdout!r}"
 
 print("[e2e] PASS: Final Astra moon.pkg+#cfg alignment suite (10m-2: [\"wasm\"] -> 21, [\"not\", \"wasm\"] -> 22 on live wasm32)")
+
+# 10n. Red-team P0 live native acceptance:
+#      extern "C" fn c_abs(x : Int) -> Int = "abs" + #cfg(target="js") js_only + #cfg(target="native") native_only + kept()
+#      -> publish --target native rc=0, 0 js_only, 4 exact dispositions, live `pionc run` prints `2`!
+s10n = os.path.join(root, "s10n")
+o10n = os.path.join(root, "o10n")
+rep10n = os.path.join(root, "rep10n.json")
+os.makedirs(s10n, exist_ok=True)
+with open(os.path.join(s10n, "ffi_cfg.mbt"), "w") as f:
+    f.write(
+        'extern "C" fn c_abs(x : Int) -> Int = "abs"\n'
+        '#cfg(target="js")\n'
+        'pub fn js_only() -> Int { 1 }\n'
+        '#cfg(target="native")\n'
+        'pub fn native_only() -> Int { c_abs(-2) }\n'
+        'pub fn kept() -> Int { native_only() }\n'
+    )
+r10n_pub = run_cli(["--src", s10n, "--out", o10n, "--target", "native", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc, "--report", rep10n])
+assert r10n_pub.returncode == 0, f"10n native publish failed: {r10n_pub.returncode} {r10n_pub.stdout} {r10n_pub.stderr}"
+gen10n = open(os.path.join(o10n, "ffi_cfg.pion")).read()
+assert "js_only" not in gen10n, f"10n leaked js_only into output:\n{gen10n}"
+rep10n_obj = json.load(open(rep10n))
+disps10n = [(d["decl"], d["disposition"]) for d in rep10n_obj["dispositions"]]
+assert disps10n == [
+    ("fn:c_abs", "transpiled"),
+    ("fn:js_only", "excluded_by_cfg"),
+    ("fn:native_only", "transpiled"),
+    ("fn:kept", "transpiled"),
+], f"10n unexpected dispositions: {disps10n}"
+
+pkg10n = os.path.join(root, "pkg10n")
+os.makedirs(os.path.join(pkg10n, "src"), exist_ok=True)
+for fn in sorted(os.listdir(o10n)):
+    if fn.endswith(".pion"):
+        shutil.copyfile(os.path.join(o10n, fn), os.path.join(pkg10n, "src", fn))
+with open(os.path.join(pkg10n, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "e2e_10n"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+with open(os.path.join(pkg10n, "src", "main.pion"), "w") as f:
+    f.write(
+        'pub fn main(world : World) -> Int {\n'
+        '  io_println(world, kept().to_string())\n'
+        '  0\n'
+        '}\n'
+    )
+r10n_run = subprocess.run([pionc, "run", pkg10n], capture_output=True, text=True)
+assert r10n_run.returncode == 0, f"10n pionc run failed: {r10n_run.stdout} {r10n_run.stderr}"
+assert r10n_run.stdout.strip() == "2", f"10n expected '2', got {r10n_run.stdout!r}"
+
+print("[e2e] PASS: Red-team P0 suite (10n: extern \"C\" fn c_abs = \"abs\" + #cfg(target=\"js\") excluded + live native run == 2)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
