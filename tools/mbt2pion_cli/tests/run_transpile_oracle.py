@@ -99,6 +99,8 @@ CASES = {
     "m12_recursive_local_fn": ("ok", 5),
     "m12_per_site_enum": ("ok", 4),
     "m12_pipe_loops_compat": ("ok", 10),
+    "q2_semantics_p0": ("ok", 10),
+    "q2_mechanical_compat": ("ok", 10),
 }
 
 MOON_TRAPS = {
@@ -774,6 +776,166 @@ pub fn m12_compat_helpers_demo() -> (Int, String, Int, Bool, Bool, String, Bool)
   let lex = "alpha".lexical_compare("k9") < 0 && "abc".lexical_compare("abcd") < 0 && "abc".lexical_compare("abc") == 0
   (rf, lo, idx, has, dig, built, lex)
 }
+
+// Quadrant 2 P0 semantics:
+// 1. Anon struct literal `arr.push({ start: 0, count: 1 })` & `let s = { start: 0, count: 1 }`
+//    + single-field `struct BoxVal { val: Int }; let b = { val: 3 }` (not misclassified as Ref!)
+pub struct SpanRec {
+  start : Int
+  count : Int
+}
+
+pub struct BoxVal {
+  val : Int
+}
+
+pub fn q2_anon_struct_and_boxval() -> (Int, Int, Int) {
+  let arr : Array[SpanRec] = []
+  arr.push({ start: 4, count: 9 })
+  let s = { start: 2, count: 5 }
+  let b : BoxVal = { val: 3 }
+  (arr[0].start + arr[0].count, s.start * 10 + s.count, b.val)
+}
+
+// 2. Type ascriptions `(e : T)` never silently stripped
+pub fn q2_type_ascriptions() -> (Int64, Double, Int64, Double, Bool) {
+  let a = (3 : Int64) * 1000000000L
+  let b = (7 : Double) / 2.0
+  let c = (-3 : Int64)
+  let d = (1.5 : Float).to_double()
+  let e = match (None : Option[Int]) {
+    Some(_) => false
+    None => true
+  }
+  (a, b, c, d, e)
+}
+
+// 3. Constructor struct patterns `Ctor({ ... })`: non-binding guards, swapped order, dual binders, guard fallthrough
+pub(all) struct NodeRec {
+  ok : Bool
+  tag : Int
+  x : Option[Int]
+  y : Option[Int]
+}
+
+pub(all) enum TreeRec {
+  Leaf(NodeRec)
+  EmptyTree
+}
+
+pub fn q2_ctor_struct_pat(t : TreeRec) -> Int {
+  match t {
+    Leaf({ ok: true, x: Some(a), y: Some(b), .. }) if a > 0 => a * 10 + b
+    Leaf({ x: Some(v), ok: true, .. }) => v + 100
+    Leaf({ ok: false, tag: 7, .. }) => 700
+    Leaf({ tag: 1, .. }) => 111
+    _ => -1
+  }
+}
+
+// 4. Local fn declaration-order visibility + param shadowing outer `let` and `let mut`
+fn outer_helper(x : Int) -> Int {
+  x + 1000
+}
+
+pub fn q2_local_fn_order_and_shadow() -> (Int, Int) {
+  let mut acc : Int = 5
+  fn first_fn(n : Int) -> Int {
+    outer_helper(n)
+  }
+  fn outer_helper(n : Int) -> Int {
+    n + 1
+  }
+  fn shadow_rec(acc : Int) -> Int {
+    if acc <= 0 { 0 } else { acc + shadow_rec(acc - 1) }
+  }
+  let r1 = first_fn(7) + outer_helper(7)
+  let r2 = shadow_rec(3) + acc
+  acc = acc + 1
+  (r1, r2 + acc)
+}
+
+// 5. Placeholder pipe temp-name collision + named args `lbl=rhs`
+fn sub_named(x : Int, scale~ : Int) -> Int {
+  x * scale - 1
+}
+
+pub fn q2_pipe_collision_and_named() -> (Int, Int) {
+  let __mbt_p_1 = 2
+  let r1 = 5 |> take2(__mbt_p_1, _)
+  let r2 = 6 |> sub_named(scale=3, _)
+  (r1, r2)
+}
+
+// 6. Same-line two-type division + cascading probe + `for ch in s` with `'}'` char literal
+pub fn q2_sameline_div_cascade_and_brace(a : Int, b : Int, x : Double, y : Double, n : Int) -> (Int, String, Int) {
+  let s1 = (a / b) + (x / y).to_int()
+  let part = n % 10
+  let p_str = part.to_string()
+  let mut braces = 0
+  for ch in "a}b}c" {
+    if ch == '}' {
+      braces = braces + 1
+    }
+  }
+  (s1, p_str, braces)
+}
+
+// 7. Quadrant 2 mechanical & compat:
+//    Double +0.0/-0.0 hash, is_nan/compare/reinterpret_as_int64, Int::lnot,
+//    Array unsafe_get/unsafe_set/is_empty/truncate, Map::new, self.arr[a:b],
+//    trailing tuple newline, `(Double, (Double) -> Double)?`, fixed-length array patterns, `type Alias = T`
+type NumPair = (Int, Int)
+
+pub struct HolderArr {
+  arr : Array[Int]
+}
+
+fn HolderArr::mid(self : HolderArr) -> Array[Int] {
+  self.arr[1:3].to_owned()
+}
+
+pub fn q2_trailing_tuple_newline(x : Int) -> NumPair {
+  let pieces = x + 1
+  let _ = pieces
+  (pieces, pieces * 2)
+}
+
+pub fn q2_tuple_opt_fn(opt : (Double, (Double) -> Double)?) -> Double {
+  match opt {
+    Some((v, f)) => f(v)
+    None => 0.0
+  }
+}
+
+pub fn q2_fixed_arr_match(xs : Array[Int]) -> Int {
+  match xs {
+    [] => 0
+    [one] => one * 10
+    [first, _] => first + 100
+    _ => -1
+  }
+}
+
+pub fn q2_double_and_collections() -> (Int, Bool, Int, Int, Int, Int) {
+  let m : Map[Double, Int] = Map::new()
+  m.set(0.0, 11)
+  m.set(-0.0, 22)
+  let mv = match m.get(0.0) {
+    Some(v) => v
+    None => -1
+  }
+  let nan_ok = (0.0 / 0.0).is_nan() && (1.0).compare(2.0) < 0 && (0.0).reinterpret_as_int64() == 0L
+  let ln = (0).lnot()
+  let xs = [10, 20, 30, 40]
+  xs.unsafe_set(1, 25)
+  let g = xs.unsafe_get(1)
+  let h = HolderArr::{ arr: xs }
+  let mid = h.mid()
+  xs.truncate(2)
+  let empty_ok = if xs.is_empty() { 0 } else { xs.length() }
+  (mv, nan_ok, ln, g, mid[0] + mid[1], empty_ok)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1204,6 +1366,47 @@ fn main {
     check("m12.rev_find_3", rf == 3)
     check("m12.arr_search_contains", idx == 1 && has)
     check("m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B" && lex)
+  } else if kase == "q2_semantics_p0" {
+    let (a1, a2, a3) = @m12.q2_anon_struct_and_boxval()
+    let (t1, t2, t3, t4, t5) = @m12.q2_type_ascriptions()
+    let p1 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: true, tag: 1, x: Some(3), y: Some(4) }))
+    let p2 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: true, tag: 1, x: Some(-2), y: Some(4) }))
+    let p3 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: false, tag: 7, x: Some(3), y: Some(4) }))
+    let p4 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: false, tag: 1, x: None, y: None }))
+    let (l1, l2) = @m12.q2_local_fn_order_and_shadow()
+    let (pp1, pp2) = @m12.q2_pipe_collision_and_named()
+    let (sd1, sd2, sd3) = @m12.q2_sameline_div_cascade_and_brace(-7, 2, 7.0, 2.0, -23)
+    trace("r", "\{a1},\{a2},\{a3},\{t1},\{t2},\{t3},\{t4},\{t5},\{p1},\{p2},\{p3},\{p4},\{l1},\{l2},\{pp1},\{pp2},\{sd1},\{sd2},\{sd3}")
+    check("q2.anon_struct", a1 == 13 && a2 == 25)
+    check("q2.boxval_3", a3 == 3)
+    check("q2.ascribe_i64_dbl", t1 == 3000000000L && t2 == 3.5 && t3 == -3L && t4 == 1.5 && t5)
+    check("q2.ctor_pat_dual", p1 == 34)
+    check("q2.ctor_pat_fallthrough", p2 == 98)
+    check("q2.ctor_pat_guard_and_tag", p3 == 700 && p4 == 111)
+    check("q2.local_fn_order", l1 == 1015)
+    check("q2.local_fn_shadow", l2 == 17)
+    check("q2.pipe_collision_named", pp1 == 25 && pp2 == 17)
+    check("q2.sameline_div_cascade_brace", sd1 == 0 && sd2 == "-3" && sd3 == 2)
+  } else if kase == "q2_mechanical_compat" {
+    let (nt1, nt2) = @m12.q2_trailing_tuple_newline(9)
+    let tf1 = @m12.q2_tuple_opt_fn(Some((3.0, fn(v) { v * 2.0 })))
+    let tf2 = @m12.q2_tuple_opt_fn(None)
+    let fm0 = @m12.q2_fixed_arr_match([])
+    let fm1 = @m12.q2_fixed_arr_match([7])
+    let fm2 = @m12.q2_fixed_arr_match([5, 9])
+    let fm3 = @m12.q2_fixed_arr_match([1, 2, 3])
+    let (mv, nan_ok, ln, g, mid_s, emp) = @m12.q2_double_and_collections()
+    trace("r", "\{nt1},\{nt2},\{tf1},\{tf2},\{fm0},\{fm1},\{fm2},\{fm3},\{mv},\{nan_ok},\{ln},\{g},\{mid_s},\{emp}")
+    check("q2.trailing_tuple", nt1 == 10 && nt2 == 20)
+    check("q2.tuple_opt_fn", tf1 == 6.0 && tf2 == 0.0)
+    check("q2.arr_pat_0", fm0 == 0)
+    check("q2.arr_pat_1", fm1 == 70)
+    check("q2.arr_pat_2_3", fm2 == 105 && fm3 == -1)
+    check("q2.dbl_zero_hash", mv == 22)
+    check("q2.dbl_nan_cmp", nan_ok)
+    check("q2.int_lnot", ln == -1)
+    check("q2.unsafe_get_set", g == 25)
+    check("q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1651,6 +1854,47 @@ pub fn main(w : World) -> Int {
     check(w, "m12.rev_find_3", rf == 3)
     check(w, "m12.arr_search_contains", idx == 1 && has)
     check(w, "m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B" && lex)
+  } else if kase == "q2_semantics_p0" {
+    let (a1, a2, a3) = m12::q2_anon_struct_and_boxval()
+    let (t1, t2, t3, t4, t5) = m12::q2_type_ascriptions()
+    let p1 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: true, tag: 1, x: Some(3), y: Some(4) }))
+    let p2 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: true, tag: 1, x: Some(-2), y: Some(4) }))
+    let p3 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: false, tag: 7, x: Some(3), y: Some(4) }))
+    let p4 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: false, tag: 1, x: None, y: None }))
+    let (l1, l2) = m12::q2_local_fn_order_and_shadow()
+    let (pp1, pp2) = m12::q2_pipe_collision_and_named()
+    let (sd1, sd2, sd3) = m12::q2_sameline_div_cascade_and_brace(-7, 2, 7.0, 2.0, -23)
+    trace(w, "r", a1.to_string() + "," + a2.to_string() + "," + a3.to_string() + "," + t1.to_string() + "," + mbt_compat::double_to_string(t2) + "," + t3.to_string() + "," + mbt_compat::double_to_string(t4) + "," + t5.to_string() + "," + p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + p4.to_string() + "," + l1.to_string() + "," + l2.to_string() + "," + pp1.to_string() + "," + pp2.to_string() + "," + sd1.to_string() + "," + sd2 + "," + sd3.to_string())
+    check(w, "q2.anon_struct", a1 == 13 && a2 == 25)
+    check(w, "q2.boxval_3", a3 == 3)
+    check(w, "q2.ascribe_i64_dbl", t1 == 3000000000L && t2 == 3.5 && t3 == -3L && t4 == 1.5 && t5)
+    check(w, "q2.ctor_pat_dual", p1 == 34)
+    check(w, "q2.ctor_pat_fallthrough", p2 == 98)
+    check(w, "q2.ctor_pat_guard_and_tag", p3 == 700 && p4 == 111)
+    check(w, "q2.local_fn_order", l1 == 1015)
+    check(w, "q2.local_fn_shadow", l2 == 17)
+    check(w, "q2.pipe_collision_named", pp1 == 25 && pp2 == 17)
+    check(w, "q2.sameline_div_cascade_brace", sd1 == 0 && sd2 == "-3" && sd3 == 2)
+  } else if kase == "q2_mechanical_compat" {
+    let (nt1, nt2) = m12::q2_trailing_tuple_newline(9)
+    let tf1 = m12::q2_tuple_opt_fn(Some((3.0, fn(v) { v * 2.0 })))
+    let tf2 = m12::q2_tuple_opt_fn(None)
+    let fm0 = m12::q2_fixed_arr_match([])
+    let fm1 = m12::q2_fixed_arr_match([7])
+    let fm2 = m12::q2_fixed_arr_match([5, 9])
+    let fm3 = m12::q2_fixed_arr_match([1, 2, 3])
+    let (mv, nan_ok, ln, g, mid_s, emp) = m12::q2_double_and_collections()
+    trace(w, "r", nt1.to_string() + "," + nt2.to_string() + "," + mbt_compat::double_to_string(tf1) + "," + mbt_compat::double_to_string(tf2) + "," + fm0.to_string() + "," + fm1.to_string() + "," + fm2.to_string() + "," + fm3.to_string() + "," + mv.to_string() + "," + nan_ok.to_string() + "," + ln.to_string() + "," + g.to_string() + "," + mid_s.to_string() + "," + emp.to_string())
+    check(w, "q2.trailing_tuple", nt1 == 10 && nt2 == 20)
+    check(w, "q2.tuple_opt_fn", tf1 == 6.0 && tf2 == 0.0)
+    check(w, "q2.arr_pat_0", fm0 == 0)
+    check(w, "q2.arr_pat_1", fm1 == 70)
+    check(w, "q2.arr_pat_2_3", fm2 == 105 && fm3 == -1)
+    check(w, "q2.dbl_zero_hash", mv == 22)
+    check(w, "q2.dbl_nan_cmp", nan_ok)
+    check(w, "q2.int_lnot", ln == -1)
+    check(w, "q2.unsafe_get_set", g == 25)
+    check(w, "q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
   } else {
     panic("abort: unknown case " + kase)
   }

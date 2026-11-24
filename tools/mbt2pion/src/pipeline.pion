@@ -692,6 +692,56 @@ fn sort_source_files(files : Array[SourceFile]) -> Array[SourceFile] {
   out
 }
 
+fn is_valid_sha256_hex(s : String) -> Bool {
+  if s.length() != 64 {
+    return false
+  }
+  let mut i = 0
+  while i < 64 {
+    let c = s.code_unit_at(i)
+    let is_hex = (c >= 48 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102)
+    if !is_hex {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn is_valid_asset_rel_path(p : String) -> Bool {
+  if p.length() == 0 || p.starts_with("/") || p.starts_with("\\") {
+    return false
+  }
+  let segs = p.split("/")
+  for seg in segs {
+    if seg == ".." || seg == "." || seg.length() == 0 {
+      return false
+    }
+  }
+  true
+}
+
+fn is_valid_decl_ident(s : String) -> Bool {
+  if s.length() == 0 {
+    return false
+  }
+  let c0 = s.code_unit_at(0)
+  let ok0 = (c0 >= 65 && c0 <= 90) || (c0 >= 97 && c0 <= 122) || c0 == 95
+  if !ok0 {
+    return false
+  }
+  let mut i = 1
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    let ok = (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95
+    if !ok {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
 ///| Run the full 3-stage deterministic `mbt2pion` pipeline.
 ///| `check_fn` invokes `pionc check --json` on a batch of `(rel_path, content)` files.
 ///| Pass a no-op callback `fn(_) { "{\"ok\":true,\"diagnostics\":[]}" }` when running Stage A standalone in unit tests.
@@ -733,6 +783,21 @@ pub fn transpile_package_ex(
   }
 
   let ctx = stage_a_context_new(symtab, recipes, opts)
+  // Derive self package name for stripping `@<self_pkg>.` in black-box `*_test.mbt` files
+  match api_map.pkg_aliases.get("__mbt_self_pkg__") {
+    Some(sp) => ctx.self_pkg_name = sp
+    None =>
+    if opts.src_prefix.length() > 0 {
+      let sp = if opts.src_prefix.ends_with("/") { opts.src_prefix.slice(0, opts.src_prefix.length() - 1) } else { opts.src_prefix }
+      let mut ls = -1
+      let mut si = 0
+      while si < sp.length() {
+        if sp.code_unit_at(si) == 47 { ls = si }
+        si = si + 1
+      }
+      ctx.self_pkg_name = if ls >= 0 { sp.slice(ls + 1, sp.length()) } else { sp }
+    }
+  }
   for d in pre_diags {
     ctx.diags.push(d)
   }
@@ -745,6 +810,46 @@ pub fn transpile_package_ex(
   let asset_rule_by_path : Map[String, AssetBypassRule] = Map()
   let asset_rule_matched : Map[String, Bool] = Map()
   for rule in all_asset_rules {
+    if !is_valid_asset_rel_path(rule.path) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_ASSET_MANIFEST_INVALID",
+        rule.path,
+        1,
+        1,
+        "invalid asset-bypass manifest path `" + rule.path + "` (must be a normalized relative path without leading `/` or `..`)",
+      ))
+      continue
+    }
+    if !is_valid_sha256_hex(rule.sha256) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_ASSET_MANIFEST_INVALID",
+        rule.path,
+        1,
+        1,
+        "asset-bypass manifest entry `" + rule.path + "` requires a 64-character hex `sha256`",
+      ))
+    }
+    if rule.allowed_decls.length() == 0 {
+      ctx.diags.push(diag_error(
+        "MBT2PION_ASSET_MANIFEST_INVALID",
+        rule.path,
+        1,
+        1,
+        "asset-bypass manifest entry `" + rule.path + "` requires a non-empty `allowed_decls` list",
+      ))
+    } else {
+      for ad in rule.allowed_decls {
+        if !is_valid_decl_ident(ad) {
+          ctx.diags.push(diag_error(
+            "MBT2PION_ASSET_MANIFEST_INVALID",
+            rule.path,
+            1,
+            1,
+            "invalid identifier `" + ad + "` in `allowed_decls` for `" + rule.path + "`",
+          ))
+        }
+      }
+    }
     if asset_rule_by_path.contains(rule.path) {
       ctx.diags.push(diag_error(
         "MBT2PION_ASSET_MANIFEST_ERROR",
@@ -933,22 +1038,42 @@ pub fn transpile_package_ex(
   }
 
   // Stage A: topological declaration reordering into single `00_init_order.pion`
+  // Test files' top-level `let`/`fn init` are strictly isolated into `00_init_order_test.pion`
+  // so `--with-tests` NEVER pollutes production `00_init_order.pion`.
+  let init_files : Array[GeneratedFile] = []
   if ctx.init_items.length() > 0 {
     let sorted_inits = topo_sort_init_items(ctx.init_items, ctx.fn_bodies, ctx.diags)
     if sorted_inits.length() > 0 {
       let init_body = render_init_order_file(sorted_inits)
-      let with_init : Array[GeneratedFile] = []
-      with_init.push(GeneratedFile::{
+      init_files.push(GeneratedFile::{
         rel_path: "00_init_order.pion",
         content: init_body,
         source_file: "<package-init-order>",
         anchors: [],
       })
-      for gf in gen_files {
-        with_init.push(gf)
-      }
-      gen_files = with_init
     }
+  }
+  if ctx.test_init_items.length() > 0 {
+    let sorted_test_inits = topo_sort_init_items(ctx.test_init_items, ctx.fn_bodies, ctx.diags)
+    if sorted_test_inits.length() > 0 {
+      let test_init_body = render_init_order_file(sorted_test_inits)
+      init_files.push(GeneratedFile::{
+        rel_path: "00_init_order_test.pion",
+        content: test_init_body,
+        source_file: "<package-init-order>",
+        anchors: [],
+      })
+    }
+  }
+  if init_files.length() > 0 {
+    let with_init : Array[GeneratedFile] = []
+    for inf in init_files {
+      with_init.push(inf)
+    }
+    for gf in gen_files {
+      with_init.push(gf)
+    }
+    gen_files = with_init
   }
 
   // Declaration-granularity double-hash-anchored Overlays

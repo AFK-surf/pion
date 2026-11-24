@@ -680,7 +680,49 @@ fn collect_file_defined_symbols(content : String) -> Array[String] {
   out
 }
 
+fn closure_is_shadowed(scopes : Array[Map[String, Bool]], name : String) -> Bool {
+  let mut k = scopes.length() - 1
+  while k >= 0 {
+    if scopes[k].contains(name) {
+      return true
+    }
+    k = k - 1
+  }
+  false
+}
+
+///| Extract parameter names from a `(...)` parameter list into `target_scope`.
+fn closure_collect_params(toks : Array[Token], open_p : Int, close_p : Int, target : Map[String, Bool]) -> Unit {
+  let mut i = open_p + 1
+  let mut d = 0
+  let mut at_param_start = true
+  while i < close_p {
+    let k = toks[i].kind
+    if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace {
+      d = d + 1
+      at_param_start = false
+    } else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && k == TokenKind::Comma {
+      at_param_start = true
+    } else if d == 0 && at_param_start {
+      if k == TokenKind::Ident {
+        target[toks[i].raw] = true
+        at_param_start = false
+      } else if k == TokenKind::Keyword && (toks[i].raw == "mut") {
+        // skip `mut`
+        let _ = 0
+      } else {
+        at_param_start = false
+      }
+    }
+    i = i + 1
+  }
+}
+
 ///| Compute deterministic per-file symbol-graph dependency closures and render JSON (`--closure-report`, Wave M1.2 A.4).
+///| Lexically scope-aware: skips function parameters, `let`/`for` locals, and closure bindings so shadowed names
+///| never create false cross-file dependency edges!
 pub fn render_closure_report_json(sources : Array[SourceFile]) -> String {
   let sorted = sort_source_files(sources)
   let sym_owners : Map[String, Array[String]] = Map()
@@ -699,12 +741,70 @@ pub fn render_closure_report_json(sources : Array[SourceFile]) -> String {
     let toks = lex_moonbit(sf.content)
     let n = toks.length() - 1
     let dep_set : Map[String, Bool] = Map()
+    let scopes : Array[Map[String, Bool]] = []
+    let mut pending_scope : Map[String, Bool] = Map()
     let mut i = 0
     while i < n {
       let t = toks[i]
+      if t.kind == TokenKind::LBrace {
+        scopes.push(pending_scope)
+        pending_scope = Map()
+        i = i + 1
+        continue
+      }
+      if t.kind == TokenKind::RBrace {
+        if scopes.length() > 0 {
+          let _ = scopes.pop()
+        }
+        i = i + 1
+        continue
+      }
+      // `fn [name](params)` -> bind params in the upcoming `{` scope
+      if t.kind == TokenKind::Keyword && t.raw == "fn" {
+        let mut p = i + 1
+        if p < n && toks[p].kind == TokenKind::LBracket {
+          p = init_find_matching(toks, p, n) + 1
+        }
+        // Skip optional `Type::` or method/fn name
+        while p < n && (toks[p].kind == TokenKind::Ident || toks[p].kind == TokenKind::UpperIdent || toks[p].kind == TokenKind::ColonColon) {
+          p = p + 1
+        }
+        if p < n && toks[p].kind == TokenKind::LParen {
+          let cp = init_find_matching(toks, p, n)
+          closure_collect_params(toks, p, cp, pending_scope)
+          // Advance past `fn ... (` params only for parameter names (still scan parameter type annotations!)
+          i = p + 1
+          continue
+        }
+      }
+      // Local `let [mut] x =` inside a block -> bind `x` in current scope
+      if scopes.length() > 0 && t.kind == TokenKind::Keyword && t.raw == "let" {
+        let mut p = i + 1
+        if p < n && toks[p].kind == TokenKind::Keyword && toks[p].raw == "mut" {
+          p = p + 1
+        }
+        if p < n && toks[p].kind == TokenKind::Ident {
+          scopes[scopes.length() - 1][toks[p].raw] = true
+          i = p + 1
+          continue
+        }
+      }
+      // `for x [, y] in` -> bind loop vars in upcoming `{` scope
+      if t.kind == TokenKind::Keyword && t.raw == "for" {
+        let mut p = i + 1
+        while p < n && !(toks[p].kind == TokenKind::Keyword && toks[p].raw == "in") && toks[p].kind != TokenKind::Eq && toks[p].kind != TokenKind::LBrace {
+          if toks[p].kind == TokenKind::Ident {
+            pending_scope[toks[p].raw] = true
+          }
+          p = p + 1
+        }
+        i = p + 1
+        continue
+      }
       if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent {
         let prev_dot_cc = i > 0 && (toks[i - 1].kind == TokenKind::Dot || toks[i - 1].kind == TokenKind::ColonColon)
-        if !prev_dot_cc {
+        let is_param_decl = i + 1 < n && toks[i + 1].kind == TokenKind::Colon && scopes.length() == 0
+        if !prev_dot_cc && !is_param_decl && !closure_is_shadowed(scopes, t.raw) {
           match sym_owners.get(t.raw) {
             Some(owners) => {
               for ow in owners {

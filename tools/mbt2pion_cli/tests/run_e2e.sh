@@ -1625,6 +1625,103 @@ disps10n2 = [(d["decl"], d["disposition"]) for d in json.load(open(rep10n2))["di
 assert disps10n2 == [("fn:first", "unsupported")], f"10n-2 unexpected dispositions: {disps10n2}"
 
 print("[e2e] PASS: Final Astra P1 suite (10n-2: #borrow(s) String extern \"C\" fn -> rc=1 MBT2PION_UNSUPPORTED_FFI_SIGNATURE + unsupported)")
+
+# 10o. Quadrant 2: CLI negative tests for P0-5 (5 malformed asset manifests) & P0-6 (--closure-report path collision)
+s10o = os.path.join(root, "s10o")
+o10o = os.path.join(root, "o10o")
+os.makedirs(s10o, exist_ok=True)
+with open(os.path.join(s10o, "ok.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10o, "data.mbt"), "w") as f:
+    f.write("pub let d : Array[Int] = [1, 2]\n")
+import hashlib
+d_sha = hashlib.sha256(open(os.path.join(s10o, "data.mbt"), "rb").read()).hexdigest()
+bad_manifests = [
+    ("missing_sha", [{"path": "data.mbt", "sha256": "", "allowed_decls": ["d"]}]),
+    ("empty_decls", [{"path": "data.mbt", "sha256": d_sha, "allowed_decls": []}]),
+    ("abs_path", [{"path": "/etc/passwd", "sha256": d_sha, "allowed_decls": ["d"]}]),
+    ("parent_ref", [{"path": "../data.mbt", "sha256": d_sha, "allowed_decls": ["d"]}]),
+    ("bad_ident", [{"path": "data.mbt", "sha256": d_sha, "allowed_decls": ["9bad"]}]),
+]
+for mtag, mlist in bad_manifests:
+    mf = os.path.join(root, f"bad_manifest_{mtag}.json")
+    with open(mf, "w") as f:
+        json.dump({"assets": mlist}, f)
+    rm = run_cli(["--src", s10o, "--out", o10o, "--target", "native", "--mode", "publish",
+                  "--asset-manifest", mf, "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert rm.returncode == 1, f"10o {mtag} must fail (rc=1), got {rm.returncode}"
+    assert "MBT2PION_ASSET_MANIFEST_INVALID" in (rm.stdout + rm.stderr), f"10o {mtag} missing MBT2PION_ASSET_MANIFEST_INVALID"
+
+# P0-6: --closure-report inside --out must fail before publish!
+r_cc = run_cli(["--src", s10o, "--out", o10o, "--target", "native", "--mode", "publish",
+                "--closure-report", os.path.join(o10o, "ok.pion"), "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r_cc.returncode == 1, f"10o --closure-report inside --out must fail (rc=1), got {r_cc.returncode}"
+assert "--closure-report" in (r_cc.stdout + r_cc.stderr), f"10o missing --closure-report error: {r_cc.stdout} {r_cc.stderr}"
+
+print("[e2e] PASS: Quadrant 2 P0-5 & P0-6 CLI negative tests (5 malformed manifests + --closure-report collision)")
+
+# 10p. Quadrant 2 Item 10: --with-tests end-to-end (`*_wbtest.mbt` -> `*_wb_test.pion`, `*_test.mbt` -> `*_test.pion`,
+#      isolation from `00_init_order.pion`, assertions + `raise` stripping -> `pionc check` + `pionc test` PASS,
+#      and mutated assertion FAILS `pionc test`!)
+s10p = os.path.join(root, "s10p_pkg")
+o10p = os.path.join(root, "o10p")
+os.makedirs(s10p, exist_ok=True)
+with open(os.path.join(s10p, "math.mbt"), "w") as f:
+    f.write("pub let base_val = 40\npub fn add2(x : Int) -> Int { x + 2 }\nfn internal_mul(x : Int) -> Int { x * 3 }\n")
+with open(os.path.join(s10p, "math_wbtest.mbt"), "w") as f:
+    f.write(
+        'let wb_k = 7\n'
+        'fn check_pair(a : Int, b : Int) raise {\n'
+        '  assert_eq(a, b)\n'
+        '  assert_not_eq(a, b + 1)\n'
+        '}\n'
+        'test {\n'
+        '  check_pair(internal_mul(wb_k), 21)\n'
+        '  assert_true(add2(base_val) == 42)\n'
+        '  assert_false(add2(base_val) == 0)\n'
+        '  inspect(add2(base_val), content="42")\n'
+        '}\n'
+    )
+with open(os.path.join(s10p, "math_test.mbt"), "w") as f:
+    f.write(
+        'test "blackbox_add2" {\n'
+        '  assert_eq(@s10p_pkg.add2(@s10p_pkg.base_val), 42)\n'
+        '  inspect(@s10p_pkg.add2(10), content="12")\n'
+        '}\n'
+    )
+r10p = run_cli(["--src", s10p, "--out", o10p, "--target", "native", "--mode", "publish", "--with-tests",
+                "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10p.returncode == 0, f"10p --with-tests publish failed: {r10p.returncode}\n{r10p.stdout}\n{r10p.stderr}"
+assert os.path.exists(os.path.join(o10p, "math_wb_test.pion")), "10p missing math_wb_test.pion"
+assert os.path.exists(os.path.join(o10p, "math_test.pion")), "10p missing math_test.pion"
+assert os.path.exists(os.path.join(o10p, "00_init_order.pion")), "10p missing 00_init_order.pion"
+assert os.path.exists(os.path.join(o10p, "00_init_order_test.pion")), "10p missing 00_init_order_test.pion"
+prod_init_10p = open(os.path.join(o10p, "00_init_order.pion")).read()
+assert "wb_k" not in prod_init_10p, f"10p test let leaked into production 00_init_order.pion:\n{prod_init_10p}"
+
+pkg10p = os.path.join(root, "pkg10p")
+os.makedirs(os.path.join(pkg10p, "src"), exist_ok=True)
+for fn in sorted(os.listdir(o10p)):
+    if fn.endswith(".pion"):
+        shutil.copyfile(os.path.join(o10p, fn), os.path.join(pkg10p, "src", fn))
+with open(os.path.join(pkg10p, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10p_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10p_chk = subprocess.run([pionc, "check", pkg10p], capture_output=True, text=True)
+assert r10p_chk.returncode == 0, f"10p pionc check failed:\n{r10p_chk.stdout}\n{r10p_chk.stderr}"
+r10p_tst = subprocess.run([pionc, "test", pkg10p], capture_output=True, text=True)
+assert r10p_tst.returncode == 0, f"10p pionc test failed:\n{r10p_tst.stdout}\n{r10p_tst.stderr}"
+assert "2 passed; 0 failed" in r10p_tst.stdout, f"10p expected 2 passed tests, got:\n{r10p_tst.stdout}"
+
+# Mutate one assertion and verify `pionc test` genuinely FAILS!
+mut_path = os.path.join(pkg10p, "src", "math_test.pion")
+mut_orig = open(mut_path).read()
+assert "42" in mut_orig, f"10p expected 42 in math_test.pion:\n{mut_orig}"
+with open(mut_path, "w") as f:
+    f.write(mut_orig.replace("42", "999", 1))
+r10p_fail = subprocess.run([pionc, "test", pkg10p], capture_output=True, text=True)
+assert r10p_fail.returncode != 0, f"10p mutated assertion MUST fail pionc test!\n{r10p_fail.stdout}"
+
+print("[e2e] PASS: Quadrant 2 --with-tests E2E (math_wb_test.pion + math_test.pion + isolated init -> pionc check & test 2/2 PASS, mutant FAIL)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"

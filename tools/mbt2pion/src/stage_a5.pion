@@ -44,6 +44,7 @@ pub struct ProbeResult {
   line : Int
   col : Int
   probe_kind : String
+  probe_id : String
   resolved_type : String
 }
 
@@ -116,9 +117,9 @@ pub fn parse_pionc_diagnostics(json_text : String) -> Array[PioncDiag] {
   out
 }
 
-///| Extract `(probe_kind, resolved_type)` from a `pionc` diagnostic message of the form:
-///| `unknown method `mbt_*_probe` on type `<T>``
-pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
+///| Extract `(probe_kind, probe_id, resolved_type)` from a `pionc` diagnostic message of the form:
+///| `unknown method `mbt_*_probe[__p<id>]` on type `<T>``
+pub fn extract_probe_with_id_from_diag(d : PioncDiag) -> Option[(String, String, String)] {
   let prefix = "unknown method `mbt_"
   let p_idx = d.message.index_of(prefix)
   if p_idx < 0 {
@@ -129,8 +130,15 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
   if tick_end < 0 {
     return None
   }
-  let probe_name = after_m.slice(0, tick_end)
-  if !probe_name.ends_with("_probe") {
+  let raw_name = after_m.slice(0, tick_end)
+  let mut probe_kind = raw_name
+  let mut probe_id = ""
+  let tag_idx = raw_name.index_of("__p")
+  if tag_idx > 0 {
+    probe_kind = raw_name.slice(0, tag_idx)
+    probe_id = raw_name.slice(tag_idx + 2, raw_name.length())
+  }
+  if !probe_kind.ends_with("_probe") {
     return None
   }
   let on_ty = " on type `"
@@ -144,7 +152,15 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
     return None
   }
   let resolved_ty = after_ty.slice(0, ty_end)
-  Some((probe_name, resolved_ty))
+  Some((probe_kind, probe_id, resolved_ty))
+}
+
+///| Backwards-compatible wrapper returning `(probe_kind, resolved_type)`.
+pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
+  match extract_probe_with_id_from_diag(d) {
+    Some((k, _, t)) => Some((k, t))
+    None => None
+  }
 }
 
 ///| Parse an integer literal token (`0`, `1`, `0x1`, `0xffffffff`, `0xffffffffffffffffL`,
@@ -1952,6 +1968,88 @@ pub fn run_stage_a5_full(
   run_stage_a5_ex(files, recipes, api_map, Map(), check_fn, diags, drift_ledger, dummy_disps, max_rounds)
 }
 
+///| Tag each top-level `.<probe_kind>(` in `inst_src` with a unique `__<probe_id>` suffix
+///| matching `numbered_sites` in order so same-line same-kind probes have 1-to-1 collision-free IDs!
+fn tag_instrumented_probes_unique(inst_src : String, sites : Array[ProbeSite]) -> String {
+  if sites.length() == 0 {
+    return inst_src
+  }
+  let sb = StringBuilder()
+  let mut cursor = 0
+  let n = inst_src.length()
+  for site in sites {
+    let needle = "." + site.probe_kind + "("
+    let nl = needle.length()
+    let mut found = -1
+    let mut pos = cursor
+    while pos + nl <= n {
+      if inst_src.slice(pos, pos + nl) == needle {
+        found = pos
+        break
+      }
+      pos = pos + 1
+    }
+    if found >= 0 {
+      sb.write_string(inst_src.slice(cursor, found))
+      sb.write_string("." + site.probe_kind + "__" + site.probe_id + "(")
+      cursor = found + nl
+    }
+  }
+  if cursor < n {
+    sb.write_string(inst_src.slice(cursor, n))
+  }
+  sb.to_string()
+}
+
+///| Resolve original MoonBit `(file, line, col)` from nearest `// origin: <file>:<line>:<col>`
+///| comment above `line_1based` in `00_init_order.pion`.
+fn resolve_init_order_origin(content : String, file : String, line_1based : Int, col_1based : Int) -> (String, Int, Int) {
+  if file != "00_init_order.pion" {
+    return (file, line_1based, col_1based)
+  }
+  let lines = content.split("\n")
+  let mut li = if line_1based - 1 < lines.length() { line_1based - 1 } else { lines.length() - 1 }
+  while li >= 0 {
+    let t = lines[li].trim()
+    if t.starts_with("// origin: ") {
+      let rest = t.slice(11, t.length()).trim()
+      let c1 = rest.index_of(":")
+      if c1 > 0 {
+        let orig_f = rest.slice(0, c1)
+        let after1 = rest.slice(c1 + 1, rest.length())
+        let c2 = after1.index_of(":")
+        let orig_l_str = if c2 > 0 { after1.slice(0, c2) } else { after1 }
+        let orig_c_str = if c2 > 0 { after1.slice(c2 + 1, after1.length()) } else { "1" }
+        let orig_l = parse_simple_pos_int(orig_l_str, line_1based)
+        let orig_c = parse_simple_pos_int(orig_c_str, col_1based)
+        return (orig_f, orig_l, orig_c)
+      }
+      break
+    }
+    li = li - 1
+  }
+  (file, line_1based, col_1based)
+}
+
+fn parse_simple_pos_int(s : String, fallback : Int) -> Int {
+  let t = s.trim()
+  if t.length() == 0 {
+    return fallback
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < t.length() {
+    let c = t.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      acc = acc * 10 + (c - 48)
+    } else {
+      return fallback
+    }
+    i = i + 1
+  }
+  acc
+}
+
 pub fn run_stage_a5_ex(
   files : Array[GeneratedFile],
   recipes : Recipes,
@@ -2034,7 +2132,8 @@ pub fn run_stage_a5_ex(
           rhs_overflow: rs.rhs_overflow,
         })
       }
-      instrumented_batch.push((f.rel_path, inst_src))
+      let tagged_src = tag_instrumented_probes_unique(inst_src, numbered_sites)
+      instrumented_batch.push((f.rel_path, tagged_src))
       sites_by_file[f.rel_path] = numbered_sites
       round_probes = round_probes + numbered_sites.length()
     }
@@ -2051,22 +2150,28 @@ pub fn run_stage_a5_ex(
 
     let raw_results : Array[ProbeResult] = []
     for pd in pionc_diags {
-      match extract_probe_from_diag(pd) {
-        Some((pkind, rty)) =>
+      match extract_probe_with_id_from_diag(pd) {
+        Some((pkind, pid, rty)) =>
         raw_results.push(ProbeResult::{
           file: pd.file,
           line: pd.line,
           col: pd.col,
           probe_kind: pkind,
+          probe_id: pid,
           resolved_type: rty,
         })
         None => ()
       }
     }
 
-    // Per-probe-ID disposal (Wave M1.2 A.1):
-    // Dispose EVERY probe whose concrete type is resolved, and report each unresolved probe
-    // individually as `MBT2PION_UNDISPOSED_PROBE_SITE` (still strictly fail-closed for publish!).
+    // Per-probe-ID 1-to-1 disposal with multi-round fixpoint retry for cascading probes:
+    // 1. Match by unique `probe_id` first (zero same-line collision); fall back to (file, line, col, kind)
+    //    only when a mock check_fn returns untagged probe names.
+    // 2. Defer reporting unresolved probes until fixpoint (`!any_changed && !newly_marked_safe`) so
+    //    cascading probes (e.g. `let part = n % 10; part.to_string()`) are retried and resolved once
+    //    upstream probes rewrite!
+    // 3. Zero silent fallback guessing on unresolved probes; map `00_init_order.pion` locations back
+    //    to their `// origin: <file>:<line>:<col>` comment.
     let probe_results = sort_probe_results(raw_results)
     let consumed : Array[Bool] = []
     let mut ci = 0
@@ -2076,6 +2181,7 @@ pub fn run_stage_a5_ex(
     }
 
     let next_files : Array[GeneratedFile] = []
+    let round_unresolved : Array[(String, String, ProbeSite)] = []
     let mut any_changed = false
     let mut newly_marked_safe = false
     for f in cur_files {
@@ -2103,20 +2209,33 @@ pub fn run_stage_a5_ex(
       let remap_edits : Array[(Int, Int, String, String, String)] = []
       for site in sites {
         let mut matched_idx = -1
-        let mut best_col_dist = 1000000
+        // Pass 1: exact 1-to-1 match by globally unique `probe_id`
         let mut pi = 0
         while pi < probe_results.length() {
           let pr = probe_results[pi]
-          if !consumed[pi] &&
-          (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
-          pr.line == site.line && pr.probe_kind == site.probe_kind {
-            let dist = if pr.col >= site.col { pr.col - site.col } else { site.col - pr.col }
-            if matched_idx < 0 || dist < best_col_dist {
-              matched_idx = pi
-              best_col_dist = dist
-            }
+          if !consumed[pi] && pr.probe_id.length() > 0 && pr.probe_id == site.probe_id && pr.probe_kind == site.probe_kind {
+            matched_idx = pi
+            break
           }
           pi = pi + 1
+        }
+        // Pass 2: fallback for untagged diagnostics (e.g. unit-test mocks)
+        if matched_idx < 0 {
+          let mut best_col_dist = 1000000
+          let mut pi2 = 0
+          while pi2 < probe_results.length() {
+            let pr = probe_results[pi2]
+            if !consumed[pi2] && pr.probe_id.length() == 0 &&
+            (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
+            pr.line == site.line && pr.probe_kind == site.probe_kind {
+              let dist = if pr.col >= site.col { pr.col - site.col } else { site.col - pr.col }
+              if matched_idx < 0 || dist < best_col_dist {
+                matched_idx = pi2
+                best_col_dist = dist
+              }
+            }
+            pi2 = pi2 + 1
+          }
         }
         if matched_idx >= 0 {
           consumed[matched_idx] = true
@@ -2154,59 +2273,8 @@ pub fn run_stage_a5_ex(
             }
           }
         } else {
-          // Unresolved probe site: report individually and record in failed_map so other sites still converge
-          diags.push(diag_error(
-            "MBT2PION_UNDISPOSED_PROBE_SITE",
-            site.file,
-            site.line,
-            site.col,
-            "unresolved Stage A.5 probe `" + site.probe_id + "` (" + site.probe_kind + ") at " + site.file + ":" + site.line.to_string() + ":" + site.col.to_string(),
-          ))
-          drift_ledger.push(DriftEntry::{
-            category: site.probe_kind,
-            file: site.file,
-            line: site.line,
-            col: site.col,
-            expr: site.lhs_expr,
-            resolution: "blocked",
-            status: "unresolved",
-            detail: "probe " + site.probe_id + " received no type diagnostic from pionc",
-          })
-          probe_dispositions.push(ProbeDisposition::{
-            probe_id: site.probe_id,
-            probe_kind: site.probe_kind,
-            file: site.file,
-            line: site.line,
-            col: site.col,
-            resolved_type: "",
-            disposition: "unresolved",
-          })
-          if !fmap.contains(site.op_byte) {
-            fmap[site.op_byte] = true
-            flist.push(site.op_byte)
-          }
-          // Emit syntax-safe fallback for unresolved `.val` (reserved keyword in Pion) and `__mbt_slice_*`
-          // placeholders so audit passes never cascade into `E_PARSE` or residual placeholders;
-          // `MBT2PION_UNDISPOSED_PROBE_SITE` above still strictly blocks `--mode publish`!
-          if site.probe_kind == "mbt_val_probe" && recipes.ref_recipe.enabled {
-            let rf = if recipes.ref_recipe.field_name.length() > 0 { recipes.ref_recipe.field_name } else { "v" }
-            let repl = site.lhs_expr + "." + rf
-            edits.push((site.start_byte, site.end_byte, repl))
-            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, ""))
-          } else if site.probe_kind == "mbt_val_set_probe" && recipes.ref_recipe.enabled {
-            let rf = if recipes.ref_recipe.field_name.length() > 0 { recipes.ref_recipe.field_name } else { "v" }
-            let repl = if site.assign_op == "=" || site.assign_op.length() == 0 {
-              site.lhs_expr + "." + rf + " = " + site.rhs_expr
-            } else {
-              "{ let __mbt_r = " + site.lhs_expr + "; __mbt_r." + rf + " = __mbt_r." + rf + " " + site.assign_op + " (" + site.rhs_expr + ") }"
-            }
-            edits.push((site.start_byte, site.end_byte, repl))
-            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
-          } else if site.probe_kind == "mbt_slice_owned_probe" || site.probe_kind == "mbt_slice_borrow_probe" {
-            let repl = "mbt_compat::array_slice_clamp(" + site.lhs_expr + ", " + site.rhs_expr + ", " + site.slice_hi + ")"
-            edits.push((site.start_byte, site.end_byte, repl))
-            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
-          }
+          // Defer unresolved probe reporting until fixpoint so cascading probes can resolve in the next round.
+          round_unresolved.push((f.rel_path, f.content, site))
         }
       }
       if edits.length() > 0 {
@@ -2233,7 +2301,50 @@ pub fn run_stage_a5_ex(
       }
     }
     cur_files = next_files
-    if !any_changed && !newly_marked_safe {
+    let will_continue = (any_changed || newly_marked_safe) && (round + 1 < max_rounds)
+    if !will_continue {
+      // Fixpoint reached: report every remaining unresolved probe fail-closed (zero silent fallback).
+      for entry in round_unresolved {
+        let (rel_p, fcontent, site) = entry
+        let (rep_file, rep_line, rep_col) = resolve_init_order_origin(fcontent, rel_p, site.line, site.col)
+        diags.push(diag_error(
+          "MBT2PION_UNDISPOSED_PROBE_SITE",
+          rep_file,
+          rep_line,
+          rep_col,
+          "unresolved Stage A.5 probe `" + site.probe_id + "` (" + site.probe_kind + ") at " + rep_file + ":" + rep_line.to_string() + ":" + rep_col.to_string(),
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: site.probe_kind,
+          file: rep_file,
+          line: rep_line,
+          col: rep_col,
+          expr: site.lhs_expr,
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "probe " + site.probe_id + " received no type diagnostic from pionc",
+        })
+        probe_dispositions.push(ProbeDisposition::{
+          probe_id: site.probe_id,
+          probe_kind: site.probe_kind,
+          file: rep_file,
+          line: rep_line,
+          col: rep_col,
+          resolved_type: "",
+          disposition: "unresolved",
+        })
+        match failed_map_by_file.get(rel_p) {
+          Some(fmap) =>
+          if !fmap.contains(site.op_byte) {
+            fmap[site.op_byte] = true
+            match failed_list_by_file.get(rel_p) {
+              Some(flist) => flist.push(site.op_byte)
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
       break
     }
     round = round + 1
