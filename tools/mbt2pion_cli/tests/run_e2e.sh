@@ -1975,6 +1975,35 @@ for k_cnt, body_lit, exp_cols in [
         r10q6d_run = subprocess.run([pionc, "run", pkg10q6d], capture_output=True, text=True)
         assert r10q6d_run.returncode == 0, f"10q-6d pionc run failed: {r10q6d_run.stderr}"
 
+# 10q-6e (Astra Final 3-line P1): simple-ident `mbt_show_probe` in `"a\{  s  }b\{ s }"` reports [28, 36]
+# and `"a\{s}b\{s}"` reports [26, 31], AND `pionc run == "ahibhi"`!
+for tag, body_lit, exp_cols in [
+    ("padded", '"a\\{  s  }b\\{ s }"', [28, 36]),
+    ("tight", '"a\\{s}b\\{s}"', [26, 31]),
+]:
+    s10q6e = os.path.join(root, f"s10q6e_{tag}")
+    o10q6e = os.path.join(root, f"o10q6e_{tag}")
+    rep10q6e = os.path.join(root, f"rep10q6e_{tag}.json")
+    os.makedirs(s10q6e, exist_ok=True)
+    with open(os.path.join(s10q6e, "vs_show.mbt"), "w") as f:
+        f.write(f'pub let s : String = "hi"\npub let n : String = {body_lit}\n')
+    r10q6e = run_cli(["--src", s10q6e, "--out", o10q6e, "--target", "native", "--mode", "publish",
+                      "--report", rep10q6e, "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r10q6e.returncode == 0, f"10q-6e({tag}) publish failed: {r10q6e.returncode}\n{r10q6e.stdout}\n{r10q6e.stderr}"
+    rep6e_j = json.load(open(rep10q6e))
+    got_cols = [p["col"] for p in rep6e_j["probe_dispositions"] if p["file"] == "vs_show.mbt" and p["line"] == 2 and p["probe_kind"] == "mbt_show_probe"]
+    assert got_cols == exp_cols, f"10q-6e({tag}) expected cols {exp_cols}, got {got_cols}"
+    pkg10q6e = os.path.join(root, f"pkg10q6e_{tag}")
+    os.makedirs(os.path.join(pkg10q6e, "src"), exist_ok=True)
+    for fn in os.listdir(o10q6e):
+        if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q6e, fn), os.path.join(pkg10q6e, "src", fn))
+    with open(os.path.join(pkg10q6e, "pion.toml"), "w") as f:
+        f.write(f'[package]\nname = "s10q6e_{tag}"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+    with open(os.path.join(pkg10q6e, "src", "main.pion"), "w") as f:
+        f.write('pub fn main(_w : World) -> Int { if n != "ahibhi" { panic("bad: " + n) }; 0 }\n')
+    r10q6e_run = subprocess.run([pionc, "run", pkg10q6e], capture_output=True, text=True)
+    assert r10q6e_run.returncode == 0, f"10q-6e({tag}) pionc run failed: {r10q6e_run.stderr}"
+
 # 10q-3 (P0-3): `assert_true(true, msg={ n = n + 1; "expected" })` evaluates side effects AND `msg=abort("boom")` fails!
 s10q3 = os.path.join(root, "s10q3")
 o10q3 = os.path.join(root, "o10q3")
