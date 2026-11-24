@@ -266,6 +266,7 @@ struct Blk {
 
 	uint id;
 	uint visit;
+	uint reachgen;
 
 	Blk *idom;
 	Blk *dom, *dlink;
@@ -413,6 +414,7 @@ struct Fn {
 	int ncon;
 	int nmem;
 	uint nblk;
+	uint reachgen;
 	int retty; /* index in typ[], -1 if no aggregate return */
 	Ref retr;
 	Blk **rpo;

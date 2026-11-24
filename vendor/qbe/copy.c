@@ -249,8 +249,13 @@ dwl(Fn *fn, Ref r, int w)
 static int
 defwidthle(Fn *fn, Ref r, int w)
 {
-	ndwltrail = 0;
-	return visit(fn, r, w, dwl);
+	int ret;
+
+	assert(ndwltrail == 0);
+	ret = dwl(fn, r, w);
+	/* Restore just the marks written by this query. */
+	dwlundo(0);
+	return ret;
 }
 
 static int
