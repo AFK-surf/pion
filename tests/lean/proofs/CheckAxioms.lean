@@ -12,6 +12,7 @@ import PionProofs.Pr2Checks
 import PionProofs.QbeCodegenOpts
 import PionProofs.QbeGvnSpeedup
 import PionProofs.QbeBackendOpts2
+import PionProofs.QbeLoopArrayOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -518,3 +519,10 @@ import PionProofs.QbeBackendOpts2
 #print axioms PionQbeBackendOpts2.relocation
 #print axioms PionQbeBackendOpts2.cmp_mem
 #print axioms PionQbeBackendOpts2.cmp_mem_imm
+#print axioms PionQbeLoopArrayOpts.ReadPair.step
+#print axioms PionQbeLoopArrayOpts.ReadPair.resize_allowed
+#print axioms PionQbeLoopArrayOpts.ReadPair.preserve
+#print axioms PionQbeLoopArrayOpts.ReadPair.trace
+#print axioms PionQbeLoopArrayOpts.ByteScan.bounded
+#print axioms PionQbeLoopArrayOpts.ByteScan.equivalent
+#print axioms PionQbeLoopArrayOpts.ByteScan.no_increment_overflow
