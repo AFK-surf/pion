@@ -216,17 +216,29 @@ test "app_ok" {
 }
 EOF
 
-# Default runs dep_fail and fails
-if "$PIONC" test --json "$TMP_DIR/tnd/app" > "$TMP_DIR/tnd/default.json" 2>&1; then
-  echo "FAIL: default pionc test should run dep_fail and fail" >&2
+# Default single-package `pionc test` skips local path deps -> runs ONLY app_ok and succeeds
+"$PIONC" test --json "$TMP_DIR/tnd/app" > "$TMP_DIR/tnd/default.json"
+grep -q '"ok":true' "$TMP_DIR/tnd/default.json"
+grep -q '"app_ok"' "$TMP_DIR/tnd/default.json"
+grep -q '"deps_skipped":1' "$TMP_DIR/tnd/default.json"
+if grep -q '"dep_fail"' "$TMP_DIR/tnd/default.json"; then
+  echo "FAIL: default single-package pionc test ran dep_fail!" >&2
   exit 1
 fi
-grep -q "dep_fail" "$TMP_DIR/tnd/default.json"
 
-# --no-deps runs ONLY app_ok and succeeds
+# Explicit --deps runs dep_fail and fails
+if "$PIONC" test --deps --json "$TMP_DIR/tnd/app" > "$TMP_DIR/tnd/deps.json" 2>&1; then
+  echo "FAIL: pionc test --deps should run dep_fail and fail" >&2
+  exit 1
+fi
+grep -q '"dep_fail"' "$TMP_DIR/tnd/deps.json"
+grep -q '"deps_skipped":0' "$TMP_DIR/tnd/deps.json"
+
+# --no-deps compatibility alias runs ONLY app_ok and succeeds
 "$PIONC" test --no-deps --json "$TMP_DIR/tnd/app" > "$TMP_DIR/tnd/nodeps.json"
 grep -q '"ok":true' "$TMP_DIR/tnd/nodeps.json"
 grep -q '"app_ok"' "$TMP_DIR/tnd/nodeps.json"
+grep -q '"deps_skipped":1' "$TMP_DIR/tnd/nodeps.json"
 if grep -q '"dep_fail"' "$TMP_DIR/tnd/nodeps.json"; then
   echo "FAIL: --no-deps ran dep_fail!" >&2
   exit 1
@@ -243,6 +255,6 @@ if "$PIONC" test --no-deps -p app --json "$TMP_DIR/tnd/app" > "$TMP_DIR/tnd/mute
   exit 1
 fi
 grep -q "mutually exclusive" "$TMP_DIR/tnd/mutex.json"
-echo "3. pionc test --no-deps / --only-pkg -> OK"
+echo "3. pionc test default / --deps / --no-deps / --only-pkg -> OK"
 
 echo "PASS: p72b_lang_cli"

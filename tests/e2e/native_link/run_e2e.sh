@@ -240,8 +240,8 @@ if grep -q '\[cas\] cstub=.*MISS' "$TMP_DIR/trace2.log"; then
   exit 1
 fi
 
-# pionc test --json on multi-package workspace (both native_lib and native_app tests must pass)
-TEST_OUT=$(PION_CACHE_DIR="$CAS_DIR" "$PIONC" test --json "$APP_DIR")
+# pionc test --deps --json on multi-package graph (both native_lib and native_app tests must pass)
+TEST_OUT=$(PION_CACHE_DIR="$CAS_DIR" "$PIONC" test --deps --json "$APP_DIR")
 echo "native_link test -> $TEST_OUT"
 printf '%s' "$TEST_OUT" | grep -q '"ok":true'
 printf '%s' "$TEST_OUT" | grep -q '"total":2'

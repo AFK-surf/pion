@@ -248,6 +248,7 @@ int32_t  pion_world_fs_exists(void *w, void *path_str);
 int32_t  pion_world_fs_is_dir(void *w, void *path_str);
 int32_t  pion_world_fs_mkdir_p(void *w, void *path_str);
 int32_t  pion_fs_mkdir_excl(const char *path);
+int32_t  pion_fs_rmdir(const char *path);
 int64_t  pion_fs_trylock(const char *path);
 void     pion_fs_unlock(int64_t handle);
 void*    pion_world_fs_list_dir(void *w, void *path_str);

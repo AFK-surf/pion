@@ -47,7 +47,11 @@ echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
 echo "=== [4/6] Standalone pionc2 Test Runner (examples/text_stats, std/*, dogfood apps, init, doc) ==="
 for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc std/tls examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
-  TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
+  if [ "$TPKG" = "examples/text_stats" ]; then
+    TEST_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/$TPKG")
+  else
+    TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
+  fi
   printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
   if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
     echo "FAIL: pionc2 test --json $TPKG failed" >&2
@@ -216,6 +220,8 @@ sh "$ROOT_DIR/tests/e2e/p89_unit_enum/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC2"
 # Wave I2: *_data_ptr static E_TEMP_DATA_PTR guard + slot pinning (dev + release + ASan/LSan).
 sh "$ROOT_DIR/tests/e2e/p91_data_ptr_safety/run_e2e.sh" "$PIONC2"
+# Wave I1: pionc test single-pkg default + deps_skipped + parallel check+emit & c_sources + --version abi_rev.
+sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
@@ -255,7 +261,7 @@ if ! printf '%s' "$HTTPS_OUT" | grep -q '"ok":true' || ! printf '%s' "$HTTPS_OUT
   exit 1
 fi
 # Flagship: HTTPS + SSE + SQLite WAL + dyn Handler + std/regex + worker pool.
-STATION_OUT=$("$PIONC2" test --json "$ROOT_DIR/examples/pion_station")
+STATION_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/examples/pion_station")
 printf 'pionc2 test --json examples/pion_station -> %s\n' "$STATION_OUT"
 if ! printf '%s' "$STATION_OUT" | grep -q '"ok":true' || ! printf '%s' "$STATION_OUT" | grep -q '"failed":0'; then
   echo "FAIL: pionc2 test --json examples/pion_station failed" >&2

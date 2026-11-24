@@ -116,8 +116,8 @@ OUT_SLIB="$("$TMP_DIR/ws/harness")"
 echo "1c. staticlib --no-main -> $OUT_SLIB"
 [ "$OUT_SLIB" = "43" ]
 
-# 1d. pionc test (runs both alpha_test and app_test)
-TEST_JSON="$("$PIONC" test --json "$TMP_DIR/ws/app")"
+# 1d. pionc test --deps (runs both alpha_test and app_test)
+TEST_JSON="$("$PIONC" test --deps --json "$TMP_DIR/ws/app")"
 echo "1d. pionc test -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"ok":true'
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'

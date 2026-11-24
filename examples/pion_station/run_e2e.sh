@@ -54,7 +54,7 @@ ln -s "$ROOT/std/regex" "$INC_ROOT/std/regex"
 INC_CAS="$TMP/cas_inc"
 mkdir -p "$INC_CAS"
 # Warm the incremental cache first
-WARM_OUT="$(PION_CACHE_DIR="$INC_CAS" "$PIONC" test --json "$INC_ROOT/examples/pion_station")"
+WARM_OUT="$(PION_CACHE_DIR="$INC_CAS" "$PIONC" test --deps --json "$INC_ROOT/examples/pion_station")"
 printf '%s' "$WARM_OUT" | grep -q '"ok":true'
 printf '%s' "$WARM_OUT" | grep -q '"failed":0'
 # Edit one Handler function body (HealthHandler::name in router) -> targeted package incremental test
@@ -82,7 +82,7 @@ assert '    "station_info"\n' in s
 open(p, "w").write(s.replace('    "station_info"\n', '    "station_info_v2"\n', 1))
 PYEOF
 TI0="$(now_ms)"
-INC_OUT="$(PION_CACHE_DIR="$INC_CAS" "$PIONC" test --json "$INC_ROOT/examples/pion_station")"
+INC_OUT="$(PION_CACHE_DIR="$INC_CAS" "$PIONC" test --deps --json "$INC_ROOT/examples/pion_station")"
 TI1="$(now_ms)"
 INC_MS=$((TI1 - TI0))
 echo "incremental handler-edit test (all 7 workspace pkgs): ${INC_MS} ms -> $INC_OUT"

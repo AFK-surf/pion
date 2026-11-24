@@ -286,8 +286,8 @@ echo "pionc_linux test --json compiler/src/core -> $CORE_TEST_SUMMARY"
 printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'
 printf '%s' "$CORE_TEST_JSON" | grep -q '"failed":0'
 
-TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/examples/text_stats")"
-echo "pionc_linux test --json examples/text_stats -> $TEST_JSON"
+TEST_JSON="$("$PIONC" test --deps --json "$ROOT_DIR/examples/text_stats")"
+echo "pionc_linux test --deps --json examples/text_stats -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'
 
 for TPKG in std/json std/http std/net std/regex examples/http_event_server; do
@@ -436,8 +436,8 @@ if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null;
       ln -sf "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" "$OUT_DIR/libsqlite3.so"
       STATION_LIB_PATH="$OUT_DIR${STATION_LIB_PATH:+:$STATION_LIB_PATH}"
     fi
-    STATION_JSON="$(PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --json "$ROOT_DIR/examples/pion_station")"
-    echo "pionc_linux test --json examples/pion_station -> $STATION_JSON"
+    STATION_JSON="$(PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --deps --json "$ROOT_DIR/examples/pion_station")"
+    echo "pionc_linux test --deps --json examples/pion_station -> $STATION_JSON"
     printf '%s' "$STATION_JSON" | grep -q '"ok":true'
     printf '%s' "$STATION_JSON" | grep -q '"failed":0'
     PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" sh "$ROOT_DIR/examples/pion_station/run_e2e.sh" "$PIONC"
@@ -522,6 +522,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p88_borrow_moveout/run_e2e.sh" "$PIONC
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p89_unit_enum/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_data_ptr_safety/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

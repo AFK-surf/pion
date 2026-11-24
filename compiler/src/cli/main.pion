@@ -3188,15 +3188,18 @@ fn drv_compile_pkg_c_sources(
       node.dir,
       drv_parent_dir(src_path),
     )
+    let norm_src = drv_normalize_path(drv_abs_path(world, src_path))
     let key = sha256_hex(
       "cstub-v1|" +
       qbe_target +
+      "|" +
+      node.name +
       "|" +
       compiler +
       "|" +
       cc_flags_joined +
       "|" +
-      src_path +
+      norm_src +
       "|" +
       src_hash +
       "|" +
@@ -6412,6 +6415,8 @@ fn drv_exec_test_jobs(
           job.label +
           " MISS bin=" +
           drv_prefix16(bkey) +
+          " okey=" +
+          drv_prefix16(okey) +
           (if need_qbe { " obj=MISS" } else { " obj=HIT" }),
         )
       }
@@ -6975,11 +6980,538 @@ fn drv_print_test_summary(world : World, oks : Array[Bool]) -> Int {
 }
 
 ///|
-/// `pionc test <workspace>`: runs the tests of every local package (dependencies
-/// first, git-cache packages excluded), or only `only_pkg`, in one merged report.
+/// Length-prefixed string array serialization (`Send`-safe framing across `spawn`).
+fn drv_pack_str_list(items : Array[String]) -> String {
+  let sb = StringBuilder()
+  sb.write_string(items.length().to_string())
+  sb.write_string(":")
+  let mut i = 0
+  while i < items.length() {
+    sb.write_string(items[i].length().to_string())
+    sb.write_string(":")
+    sb.write_string(items[i])
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// Internal decoder for strings produced by `drv_pack_str_list` only;
+/// not intended for untrusted external input.
+fn drv_unpack_str_list(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let slen = s.length()
+  let mut pos = 0
+  let mut count = 0
+  while pos < slen {
+    let ch = str_code_at(s, pos)
+    if ch == 58 {
+      pos = pos + 1
+      break
+    }
+    if ch >= 48 && ch <= 57 {
+      count = count * 10 + (ch - 48)
+    }
+    pos = pos + 1
+  }
+  let mut i = 0
+  while i < count && pos <= slen {
+    let mut item_len = 0
+    while pos < slen {
+      let ch = str_code_at(s, pos)
+      if ch == 58 {
+        pos = pos + 1
+        break
+      }
+      if ch >= 48 && ch <= 57 {
+        item_len = item_len * 10 + (ch - 48)
+      }
+      pos = pos + 1
+    }
+    let end = if pos + item_len <= slen { pos + item_len } else { slen }
+    out.push(slice_str(s, pos, end))
+    pos = end
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn drv_pack_int_list(items : Array[Int]) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < items.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    sb.write_string(items[i].to_string())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+fn drv_unpack_int_list(s : String) -> Array[Int] {
+  let out : Array[Int] = []
+  if s.length() == 0 {
+    return out
+  }
+  let parts = drv_split_char(s, 44)
+  let mut i = 0
+  while i < parts.length() {
+    if parts[i].length() > 0 {
+      let mut acc = 0
+      let mut j = 0
+      while j < parts[i].length() {
+        let ch = str_code_at(parts[i], j)
+        if ch >= 48 && ch <= 57 {
+          acc = acc * 10 + (ch - 48)
+        }
+        j = j + 1
+      }
+      out.push(acc)
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Internal decoder for non-negative decimal index strings produced by the
+/// driver itself; not intended for untrusted external input.
+fn drv_parse_nonneg_decimal(s : String) -> Int {
+  let mut acc = 0
+  let mut i = 0
+  while i < s.length() {
+    let ch = str_code_at(s, i)
+    if ch >= 48 && ch <= 57 {
+      acc = acc * 10 + (ch - 48)
+    }
+    i = i + 1
+  }
+  acc
+}
+
+///|
+extern "C" fn c_fs_rmdir(path : Ptr) -> Int = "pion_fs_rmdir"
+
+///|
+/// Single `lstat` (never follows symlinks): returns `Some(size)` iff `path` is
+/// a regular file (`kind == "file"`) with positive byte size (`size > 0L`).
+fn drv_lstat_regular_size(world : World, path : String) -> Option[Int64] {
+  match fs_lstat(world, path) {
+    Ok(info) => {
+      let parts = drv_split_char(info, 124)
+      if parts.length() >= 2 && parts[0] == "file" {
+        let sz = drv_parse_pos_int64(parts[1], 0L)
+        if sz > 0L {
+          Some(sz)
+        } else {
+          None
+        }
+      } else {
+        None
+      }
+    }
+    Err(_) => None
+  }
+}
+
+///|
+/// Removes every file inside `stage_dir` and then removes `stage_dir` itself
+/// using cross-platform runtime file APIs (zero `rm`/`chmod` subprocesses).
+fn drv_clean_cstub_stage_dir(
+  world : World,
+  stage_dir : String,
+) -> Result[Unit, String] {
+  let entries = fs_list_dir(world, stage_dir)
+  let mut i = 0
+  while i < entries.length() {
+    let full = stage_dir + "/" + entries[i]
+    if !fs_remove(world, full) {
+      return Err("failed to remove c_source staging dir " + stage_dir)
+    }
+    i = i + 1
+  }
+  let dir_local = stage_dir
+  if c_fs_rmdir(str_data_ptr(dir_local)) != 0 {
+    return Err("failed to remove c_source staging dir " + stage_dir)
+  }
+  Ok(())
+}
+
+///|
+fn drv_cstub_fail_with_cleanup(
+  world : World,
+  stage_dir : String,
+  msg : String,
+) -> Result[Unit, String] {
+  match drv_clean_cstub_stage_dir(world, stage_dir) {
+    Ok(_) => Err(msg)
+    Err(_) => Err(msg + "; cleanup failed for " + stage_dir)
+  }
+}
+
+///|
+/// Compiles all needed packages' `c_sources` for `pionc test` in parallel
+/// (bounded by `jobs`), while populating `pkg_cstub_objs[k]` and `pkg_cstub_cxx[k]`
+/// in deterministic `(k, si)` order so final link order never depends on thread
+/// completion order. Any C stub compilation failure is propagated deterministically.
+fn drv_compile_ws_c_sources_parallel(
+  world : World,
+  nodes : Array[PkgNodeInput],
+  topo_order : Array[Int],
+  need_cstub : Array[Bool],
+  qbe_target : String,
+  rt_lib : String,
+  cache_dir : String,
+  trace_cas : Bool,
+  jobs : Int,
+  pkg_cstub_objs : Array[Array[String]],
+  pkg_cstub_cxx : Array[Bool],
+  cstub_new_keys : Array[String],
+  cstub_new_sizes : Array[Int64],
+) -> Result[Unit, String] {
+  let os = drv_target_os(qbe_target)
+  let rt_dir_raw = drv_parent_dir(rt_lib)
+  let rt_dir = if rt_dir_raw.length() > 0 { rt_dir_raw } else { "." }
+  let rt_inc_dirs : Array[String] = [rt_dir]
+  let alt_rt_dir = drv_resolve_rel_path(rt_dir, "../runtime")
+  if alt_rt_dir != rt_dir &&
+    fs_exists(world, drv_join_path(alt_rt_dir, "pion_rt.h")) {
+    rt_inc_dirs.push(alt_rt_dir)
+  } else if !fs_exists(world, drv_join_path(rt_dir, "pion_rt.h")) {
+    let rt_c = drv_find_pion_rt_c(world)
+    if rt_c.length() > 0 {
+      let src_rt_dir = drv_parent_dir(rt_c)
+      if src_rt_dir.length() > 0 &&
+        src_rt_dir != rt_dir &&
+        fs_exists(world, drv_join_path(src_rt_dir, "pion_rt.h")) {
+        rt_inc_dirs.push(src_rt_dir)
+      }
+    }
+  }
+  let cc_bin = drv_resolve_cc_driver(world, qbe_target, false)
+  let cxx_bin = drv_resolve_cc_driver(world, qbe_target, true)
+  let base_cc_flags = drv_target_cc_flags(world, qbe_target, "")
+  let miss_specs : Array[String] = []
+  let miss_keys : Array[String] = []
+  let miss_obj_paths : Array[String] = []
+  let seen_miss_obj : Map[String, Bool] = Map([])
+  let mut made_obj_dir = false
+  let n = topo_order.length()
+  let mut k = 0
+  while k < n {
+    if need_cstub[k] {
+      let node = nodes[topo_order[k]]
+      let plat = if os == "macos" {
+        node.link_macos
+      } else if os == "ios" {
+        node.link_ios
+      } else if os == "android" {
+        node.link_android
+      } else if os == "windows" {
+        node.link_windows
+      } else if os == "wasm" {
+        node.link_wasm
+      } else {
+        node.link_linux
+      }
+      let c_sources : Array[String] = []
+      let mut i = 0
+      while i < node.link_common.c_sources.length() {
+        push_unique_lib(
+          c_sources,
+          drv_resolve_pkg_path(node.dir, node.link_common.c_sources[i]),
+        )
+        i = i + 1
+      }
+      i = 0
+      while i < plat.c_sources.length() {
+        push_unique_lib(
+          c_sources,
+          drv_resolve_pkg_path(node.dir, plat.c_sources[i]),
+        )
+        i = i + 1
+      }
+      if c_sources.length() > 0 {
+        if !made_obj_dir {
+          let _ = fs_mkdir_p(world, cache_dir + "/obj")
+          made_obj_dir = true
+        }
+        let cc_flags : Array[String] = []
+        i = 0
+        while i < base_cc_flags.length() {
+          cc_flags.push(base_cc_flags[i])
+          i = i + 1
+        }
+        i = 0
+        while i < node.link_common.cc_flags.length() {
+          cc_flags.push(drv_resolve_cc_flag(node.dir, node.link_common.cc_flags[i]))
+          i = i + 1
+        }
+        i = 0
+        while i < plat.cc_flags.length() {
+          cc_flags.push(drv_resolve_cc_flag(node.dir, plat.cc_flags[i]))
+          i = i + 1
+        }
+        let cc_flags_joined = drv_join_char(cc_flags, "\n")
+        let cstub_objs : Array[String] = []
+        let mut any_cxx = false
+        let mut si = 0
+        while si < c_sources.length() {
+          let src_path = c_sources[si]
+          if !fs_exists(world, src_path) {
+            return Err("c_source does not exist: " + src_path)
+          }
+          let is_cxx = drv_is_cxx_source(src_path)
+          if is_cxx {
+            any_cxx = true
+          }
+          let compiler = if is_cxx { cxx_bin } else { cc_bin }
+          let src_txt = match fs_read(world, src_path) {
+            Ok(t) => t
+            Err(e) => return Err("failed to read c_source " + src_path + ": " + e)
+          }
+          let src_hash = sha256_hex(src_txt)
+          let headers_fp = drv_local_headers_fp(
+            world,
+            node.dir,
+            drv_parent_dir(src_path),
+          )
+          let norm_src = drv_normalize_path(drv_abs_path(world, src_path))
+          let key = sha256_hex(
+            "cstub-v1|" +
+            qbe_target +
+            "|" +
+            node.name +
+            "|" +
+            compiler +
+            "|" +
+            cc_flags_joined +
+            "|" +
+            norm_src +
+            "|" +
+            src_hash +
+            "|" +
+            headers_fp,
+          )
+          let obj_path = cache_dir + "/obj/cstub_" + key + ".o"
+          let is_hit = match drv_lstat_regular_size(world, obj_path) {
+            Some(_) => true
+            None => false
+          }
+          if is_hit {
+            if trace_cas {
+              io_eprintln(
+                world,
+                "[cas] cstub=" + src_path + " HIT key=" + drv_prefix16(key),
+              )
+            }
+          } else {
+            if trace_cas {
+              io_eprintln(
+                world,
+                "[cas] cstub=" + src_path + " MISS key=" + drv_prefix16(key),
+              )
+            }
+            if !seen_miss_obj.contains(obj_path) {
+              seen_miss_obj.set(obj_path, true)
+              let argv : Array[String] = [compiler]
+              let mut fi = 0
+              while fi < cc_flags.length() {
+                argv.push(cc_flags[fi])
+                fi = fi + 1
+              }
+              let mut ri = 0
+              while ri < rt_inc_dirs.length() {
+                argv.push("-I" + rt_inc_dirs[ri])
+                ri = ri + 1
+              }
+              argv.push("-c")
+              argv.push(src_path)
+              miss_specs.push(
+                drv_pack_str_list([
+                  src_path,
+                  compiler,
+                  obj_path,
+                  drv_pack_str_list(argv),
+                ]),
+              )
+              miss_keys.push("cstub_" + key)
+              miss_obj_paths.push(obj_path)
+            }
+          }
+          cstub_objs.push(obj_path)
+          si = si + 1
+        }
+        pkg_cstub_objs[k] = cstub_objs
+        pkg_cstub_cxx[k] = any_cxx
+      }
+    }
+    k = k + 1
+  }
+  let nm = miss_specs.length()
+  if nm == 0 {
+    return Ok(())
+  }
+  let nw_max = if jobs > 0 { jobs } else { drv_default_jobs(world) }
+  let stage_dir = match drv_mktemp_dir_near(world, cache_dir + "/obj/cstub_stage") {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let miss_tmp_paths : Array[String] = []
+  let mut ti = 0
+  while ti < nm {
+    miss_tmp_paths.push(stage_dir + "/obj_" + ti.to_string() + ".o")
+    ti = ti + 1
+  }
+  // Phase 1: compile all missed C stubs into this process's exclusive staging
+  // directory only (never publish inside compile loops or worker threads so a
+  // partial failure leaves zero orphan `.o` files and never touches another
+  // concurrent process's staging files).
+  if nm == 1 || nw_max <= 1 {
+    let mut ji = 0
+    while ji < nm {
+      let fields = drv_unpack_str_list(miss_specs[ji])
+      let src_path = fields[0]
+      let compiler = fields[1]
+      let argv = drv_unpack_str_list(fields[3])
+      let obj_tmp = miss_tmp_paths[ji]
+      argv.push("-o")
+      argv.push(obj_tmp)
+      let rc = proc_exec(world, argv)
+      if rc != 0 {
+        return drv_cstub_fail_with_cleanup(
+          world,
+          stage_dir,
+          "failed to compile c_source " +
+          src_path +
+          " with " +
+          compiler +
+          " (exit code " +
+          rc.to_string() +
+          ")",
+        )
+      }
+      ji = ji + 1
+    }
+  } else {
+    let nw = if nm < nw_max { nm } else { nw_max }
+    let packed_all = drv_pack_str_list(miss_specs)
+    let cursor = AtomicInt::new(0)
+    let err_ch : Channel[String] = Channel::new(nm + 1)
+    let sdir = stage_dir
+    scope(world, fn(s : Scope) -> Unit {
+      let mut wi = 0
+      while wi < nw {
+        spawn(s, fn() -> Unit {
+          let items = drv_unpack_str_list(packed_all)
+          while true {
+            let ji = cursor.fetch_add(1)
+            if ji >= items.length() {
+              break
+            }
+            let fields = drv_unpack_str_list(items[ji])
+            let src_path = fields[0]
+            let compiler = fields[1]
+            let argv = drv_unpack_str_list(fields[3])
+            let obj_tmp = sdir + "/obj_" + ji.to_string() + ".o"
+            argv.push("-o")
+            argv.push(obj_tmp)
+            let rc = proc_exec(world, argv)
+            if rc != 0 {
+              let _ = err_ch.send(
+                ji.to_string() +
+                "\tfailed to compile c_source " +
+                src_path +
+                " with " +
+                compiler +
+                " (exit code " +
+                rc.to_string() +
+                ")",
+              )
+            }
+          }
+        })
+        wi = wi + 1
+      }
+    })
+    err_ch.close()
+    let mut has_err = false
+    let mut first_idx = 0
+    let mut first_msg = ""
+    while true {
+      match err_ch.recv() {
+        Some(msg) => {
+          let ei = drv_msg_idx(msg)
+          if !has_err || ei < first_idx {
+            has_err = true
+            first_idx = ei
+            first_msg = drv_msg_payload(msg)
+          }
+        }
+        None => break
+      }
+    }
+    if has_err {
+      return drv_cstub_fail_with_cleanup(world, stage_dir, first_msg)
+    }
+  }
+  // Phase 2: all compiles succeeded; verify each staged object via `lstat`
+  // (non-empty regular file, no symlinks), publish sequentially on the main
+  // thread checking `fs_rename`, and record only verified positive sizes.
+  let mut mi = 0
+  while mi < nm {
+    let tmp_p = miss_tmp_paths[mi]
+    let dst_p = miss_obj_paths[mi]
+    match drv_lstat_regular_size(world, tmp_p) {
+      Some(_) => ()
+      None =>
+        return drv_cstub_fail_with_cleanup(
+          world,
+          stage_dir,
+          "empty or invalid c_source object " + tmp_p,
+        )
+    }
+    let pub_sz : Int64 = if !fs_rename(world, tmp_p, dst_p) {
+      match drv_lstat_regular_size(world, dst_p) {
+        Some(win_sz) => {
+          let _ = fs_remove(world, tmp_p)
+          win_sz
+        }
+        None =>
+          return drv_cstub_fail_with_cleanup(
+            world,
+            stage_dir,
+            "failed to publish c_source object " + dst_p,
+          )
+      }
+    } else {
+      match drv_lstat_regular_size(world, dst_p) {
+        Some(sz) => sz
+        None =>
+          return drv_cstub_fail_with_cleanup(
+            world,
+            stage_dir,
+            "empty or invalid c_source object " + dst_p,
+          )
+      }
+    }
+    cstub_new_keys.push(miss_keys[mi])
+    cstub_new_sizes.push(pub_sz)
+    mi = mi + 1
+  }
+  drv_clean_cstub_stage_dir(world, stage_dir)
+}
+
+///|
+/// `pionc test <workspace>`: runs the tests of the selected local package(s),
+/// or only `only_pkg`, in one merged report.
 /// The workspace graph is loaded, CAS-built and interface-checked once; packages
-/// without (matching) tests stop after their type check; test binaries come
-/// from the CAS and build and run in parallel (`drv_exec_test_jobs`).
+/// without (matching) tests stop after their type check; C stubs, multi-package
+/// `check+emit`, test binaries, and isolated test processes run in parallel
+/// bounded by `jobs`.
 fn drv_run_ws_tests(
   world : World,
   root_dir : String,
@@ -7049,6 +7581,7 @@ fn drv_run_ws_tests(
     }
   }
   let selected : Array[Int] = []
+  let mut deps_skipped = 0
   ni = 0
   while ni < nodes.length() {
     let local = !drv_is_external_pkg(ws.git_root, nodes[ni].dir)
@@ -7060,6 +7593,8 @@ fn drv_run_ws_tests(
       let node_abs = drv_normalize_path(drv_abs_path(world, nodes[ni].dir))
       if no_deps_dirs.contains(node_abs) {
         selected.push(ni)
+      } else if local {
+        deps_skipped = deps_skipped + 1
       }
     } else if local {
       selected.push(ni)
@@ -7131,35 +7666,33 @@ fn drv_run_ws_tests(
   }
   let cstub_new_keys : Array[String] = []
   let cstub_new_sizes : Array[Int64] = []
+  match drv_compile_ws_c_sources_parallel(
+    world,
+    nodes,
+    topo.order,
+    need_cstub,
+    qbe_target,
+    rt_lib,
+    cache_dir,
+    trace,
+    jobs,
+    pkg_cstub_objs,
+    pkg_cstub_cxx,
+    cstub_new_keys,
+    cstub_new_sizes,
+  ) {
+    Err(msg) => {
+      if cstub_new_keys.length() > 0 {
+        drv_cas_record_batch_and_evict(world, cache_dir, cstub_new_keys, cstub_new_sizes)
+      }
+      io_eprintln(world, "error: " + msg)
+      return 1
+    }
+    Ok(_) => ()
+  }
   k = 0
   while k < n {
     if need_cstub[k] {
-      let cstub_objs : Array[String] = []
-      let cstub_keys : Array[String] = []
-      match drv_compile_pkg_c_sources(
-        world,
-        nodes[topo.order[k]],
-        qbe_target,
-        "",
-        false,
-        false,
-        rt_lib,
-        cache_dir,
-        trace,
-        cstub_objs,
-        cstub_keys,
-        cstub_new_keys,
-        cstub_new_sizes,
-      ) {
-        Err(msg) => {
-          io_eprintln(world, "error: " + msg)
-          return 1
-        }
-        Ok(has_cxx) => {
-          pkg_cstub_objs[k] = cstub_objs
-          pkg_cstub_cxx[k] = has_cxx
-        }
-      }
       let rc_objs : Array[String] = []
       let rc_keys : Array[String] = []
       match drv_compile_pkg_rc_sources(
@@ -7174,6 +7707,9 @@ fn drv_run_ws_tests(
         cstub_new_sizes,
       ) {
         Err(msg) => {
+          if cstub_new_keys.length() > 0 {
+            drv_cas_record_batch_and_evict(world, cache_dir, cstub_new_keys, cstub_new_sizes)
+          }
           io_eprintln(world, "error: " + msg)
           return 1
         }
@@ -7187,106 +7723,394 @@ fn drv_run_ws_tests(
   }
   let tested : Array[String] = []
   let test_jobs : Array[DrvTestJob] = []
-  si = 0
-  while si < selected.length() {
-    let node = nodes[selected[si]]
-    let tk = node_to_topo[selected[si]]
-    let tpaths : Array[String] = []
-    let tsources : Array[String] = []
-    let mut pi = 0
-    while pi < node.paths.length() {
-      tpaths.push(node.paths[pi])
-      tsources.push(node.sources[pi])
-      pi = pi + 1
+  let nw_max = if jobs > 0 { jobs } else { drv_default_jobs(world) }
+  if selected.length() <= 1 || nw_max <= 1 {
+    // Use a fresh empty cache so serial and parallel branches share identical
+    // stub-first dependency loading and produce identical test SSA / testobj keys.
+    let serial_loaded : Array[Option[ImportedPkg]] = []
+    k = 0
+    while k < n {
+      serial_loaded.push(None)
+      k = k + 1
     }
-    match drv_append_test_sources(world, node.dir, tpaths, tsources) {
-      Err(msg) => {
-        io_eprintln(world, msg)
+    si = 0
+    while si < selected.length() {
+      let node = nodes[selected[si]]
+      let tk = node_to_topo[selected[si]]
+      let tpaths : Array[String] = []
+      let tsources : Array[String] = []
+      let mut pi = 0
+      while pi < node.paths.length() {
+        tpaths.push(node.paths[pi])
+        tsources.push(node.sources[pi])
+        pi = pi + 1
+      }
+      match drv_append_test_sources(world, node.dir, tpaths, tsources) {
+        Err(msg) => {
+          io_eprintln(world, msg)
+          return 1
+        }
+        Ok(_) => ()
+      }
+      let imports = drv_ensure_ws_imports(
+        world,
+        nodes,
+        topo.order,
+        trans.topo,
+        built.stub_paths,
+        serial_loaded,
+        tk,
+      )
+      let cr = check_source_files_with_imports(node.name, tpaths, tsources, imports, true)
+      if cr.diagnostics.length() > 0 {
+        io_eprintln(world, check_result_to_json(cr.diagnostics))
         return 1
       }
-      Ok(_) => ()
-    }
-    let imports = drv_ensure_ws_imports(
-      world,
-      nodes,
-      topo.order,
-      trans.topo,
-      built.stub_paths,
-      built.loaded_imported,
-      tk,
-    )
-    let cr = check_source_files_with_imports(node.name, tpaths, tsources, imports, true)
-    if cr.diagnostics.length() > 0 {
-      io_eprintln(world, check_result_to_json(cr.diagnostics))
-      return 1
-    }
-    tested.push(node.name)
-    let tnames = drv_test_names(cr.pkg)
-    let run_idx = drv_filter_tests(tnames, filter)
-    if run_idx.length() > 0 {
-      let td = trans.topo[tk]
-      let dep_names : Array[String] = []
-      let dep_objs : Array[String] = []
-      let job_opts = drv_link_opts_empty()
-      let mut u = 0
-      while u < td.length() {
-        let tu = td[u]
-        let dn = nodes[topo.order[tu]]
-        dep_names.push(dn.name)
-        dep_objs.push(built.obj_paths[tu])
-        let dcstubs = pkg_cstub_objs[tu]
+      tested.push(node.name)
+      let tnames = drv_test_names(cr.pkg)
+      let run_idx = drv_filter_tests(tnames, filter)
+      if run_idx.length() > 0 {
+        let td = trans.topo[tk]
+        let dep_names : Array[String] = []
+        let dep_objs : Array[String] = []
+        let job_opts = drv_link_opts_empty()
+        let mut u = 0
+        while u < td.length() {
+          let tu = td[u]
+          let dn = nodes[topo.order[tu]]
+          dep_names.push(dn.name)
+          dep_objs.push(built.obj_paths[tu])
+          let dcstubs = pkg_cstub_objs[tu]
+          let mut ci = 0
+          while ci < dcstubs.length() {
+            dep_objs.push(dcstubs[ci])
+            ci = ci + 1
+          }
+          if pkg_cstub_cxx[tu] {
+            job_opts.has_cxx = true
+          }
+          drv_collect_node_link_opts(dn, qbe_target, job_opts)
+          let drcs = pkg_rc_objs[tu]
+          let mut rci = 0
+          while rci < drcs.length() {
+            push_unique_lib(job_opts.objects, drcs[rci])
+            rci = rci + 1
+          }
+          u = u + 1
+        }
+        let self_cstubs = pkg_cstub_objs[tk]
         let mut ci = 0
-        while ci < dcstubs.length() {
-          dep_objs.push(dcstubs[ci])
+        while ci < self_cstubs.length() {
+          dep_objs.push(self_cstubs[ci])
           ci = ci + 1
         }
-        if pkg_cstub_cxx[tu] {
+        if pkg_cstub_cxx[tk] {
           job_opts.has_cxx = true
         }
-        drv_collect_node_link_opts(dn, qbe_target, job_opts)
-        let drcs = pkg_rc_objs[tu]
+        drv_collect_node_link_opts(node, qbe_target, job_opts)
+        let self_rcs = pkg_rc_objs[tk]
         let mut rci = 0
-        while rci < drcs.length() {
-          push_unique_lib(job_opts.objects, drcs[rci])
+        while rci < self_rcs.length() {
+          push_unique_lib(job_opts.objects, self_rcs[rci])
           rci = rci + 1
         }
-        u = u + 1
+        let mut li = 0
+        while li < cli_libs.length() {
+          push_unique_lib(job_opts.libs, cli_libs[li])
+          if drv_is_cxx_lib(cli_libs[li]) {
+            job_opts.has_cxx = true
+          }
+          li = li + 1
+        }
+        let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, dep_names, qbe_target)
+        test_jobs.push(DrvTestJob::{
+          label: node.name,
+          ssa: cleanup_native_rc_ssa(test_res.ssa),
+          names: tnames,
+          run_idx: run_idx,
+          dep_objs: dep_objs,
+          link_opts: job_opts,
+        })
       }
-      let self_cstubs = pkg_cstub_objs[tk]
-      let mut ci = 0
-      while ci < self_cstubs.length() {
-        dep_objs.push(self_cstubs[ci])
-        ci = ci + 1
+      si = si + 1
+    }
+  } else {
+    // Parallel multi-package frontend `check+emit` bounded by `nw_max`.
+    let topo_entries : Array[String] = []
+    k = 0
+    while k < n {
+      let unode = nodes[topo.order[k]]
+      let sp = built.stub_paths[k]
+      let fb_paths = if need[k] { drv_pack_str_list(unode.paths) } else { "" }
+      let fb_sources = if need[k] { drv_pack_str_list(unode.sources) } else { "" }
+      topo_entries.push(
+        drv_pack_str_list([
+          unode.name,
+          sp,
+          drv_pack_int_list(trans.topo[k]),
+          fb_paths,
+          fb_sources,
+        ]),
+      )
+      k = k + 1
+    }
+    let topo_spec = drv_pack_str_list(topo_entries)
+    let work_items : Array[String] = []
+    si = 0
+    while si < selected.length() {
+      let node = nodes[selected[si]]
+      let tk = node_to_topo[selected[si]]
+      let tpaths : Array[String] = []
+      let tsources : Array[String] = []
+      let mut pi = 0
+      while pi < node.paths.length() {
+        tpaths.push(node.paths[pi])
+        tsources.push(node.sources[pi])
+        pi = pi + 1
       }
-      if pkg_cstub_cxx[tk] {
-        job_opts.has_cxx = true
+      match drv_append_test_sources(world, node.dir, tpaths, tsources) {
+        Err(msg) => {
+          io_eprintln(world, msg)
+          return 1
+        }
+        Ok(_) => ()
       }
-      drv_collect_node_link_opts(node, qbe_target, job_opts)
-      let self_rcs = pkg_rc_objs[tk]
-      let mut rci = 0
-      while rci < self_rcs.length() {
-        push_unique_lib(job_opts.objects, self_rcs[rci])
-        rci = rci + 1
+      work_items.push(
+        drv_pack_str_list([
+          si.to_string(),
+          tk.to_string(),
+          node.name,
+          drv_pack_str_list(tpaths),
+          drv_pack_str_list(tsources),
+          drv_pack_str_list(trans.topo_names[tk]),
+        ]),
+      )
+      si = si + 1
+    }
+    let work_spec = drv_pack_str_list(work_items)
+    let nsel = selected.length()
+    let nw = if nsel < nw_max { nsel } else { nw_max }
+    let cursor = AtomicInt::new(0)
+    let res_ch : Channel[String] = Channel::new(nsel + 1)
+    let flt = filter
+    let qt = qbe_target
+    scope(world, fn(s : Scope) -> Unit {
+      let mut wi = 0
+      while wi < nw {
+        spawn(s, fn() -> Unit {
+          let t_raw = drv_unpack_str_list(topo_spec)
+          let tn = t_raw.length()
+          let t_names : Array[String] = []
+          let t_stubs : Array[String] = []
+          let t_deps : Array[Array[Int]] = []
+          let t_fb_paths : Array[String] = []
+          let t_fb_srcs : Array[String] = []
+          let local_loaded : Array[Option[ImportedPkg]] = []
+          let mut ti = 0
+          while ti < tn {
+            let tf = drv_unpack_str_list(t_raw[ti])
+            t_names.push(tf[0])
+            t_stubs.push(tf[1])
+            t_deps.push(drv_unpack_int_list(tf[2]))
+            t_fb_paths.push(tf[3])
+            t_fb_srcs.push(tf[4])
+            local_loaded.push(None)
+            ti = ti + 1
+          }
+          let items = drv_unpack_str_list(work_spec)
+          while true {
+            let idx = cursor.fetch_add(1)
+            if idx >= items.length() {
+              break
+            }
+            let wf = drv_unpack_str_list(items[idx])
+            let cur_si = wf[0]
+            let cur_tk = drv_parse_nonneg_decimal(wf[1])
+            let pkg_name = wf[2]
+            let tpaths = drv_unpack_str_list(wf[3])
+            let tsources = drv_unpack_str_list(wf[4])
+            let dep_names = drv_unpack_str_list(wf[5])
+            let deps_topo = t_deps[cur_tk]
+            let imports : Array[ImportedPkg] = []
+            let mut di = 0
+            while di < deps_topo.length() {
+              let u = deps_topo[di]
+              match local_loaded[u] {
+                Some(ipkg) => imports.push(ipkg)
+                None => {
+                  let u_deps = t_deps[u]
+                  let u_imports : Array[ImportedPkg] = []
+                  let mut ui = 0
+                  while ui < u_deps.length() {
+                    match local_loaded[u_deps[ui]] {
+                      Some(dep_imp) => u_imports.push(dep_imp)
+                      None => ()
+                    }
+                    ui = ui + 1
+                  }
+                  let mut loaded_opt : Option[ImportedPkg] = None
+                  let sp = t_stubs[u]
+                  if sp.length() > 0 {
+                    match fs_read(world, sp) {
+                      Ok(stub_txt) =>
+                        if stub_txt.length() > 0 {
+                          let scr = check_source_files_with_imports(
+                            t_names[u],
+                            [t_names[u] + ".pionstub"],
+                            [stub_txt],
+                            u_imports,
+                            true,
+                          )
+                          if scr.diagnostics.length() == 0 {
+                            loaded_opt = Some(ImportedPkg::{ name: t_names[u], tc: scr.tc })
+                          }
+                        }
+                      Err(_) => ()
+                    }
+                  }
+                  let ipkg = match loaded_opt {
+                    Some(v) => v
+                    None => {
+                      let fcr = check_source_files_with_imports(
+                        t_names[u],
+                        drv_unpack_str_list(t_fb_paths[u]),
+                        drv_unpack_str_list(t_fb_srcs[u]),
+                        u_imports,
+                        true,
+                      )
+                      ImportedPkg::{ name: t_names[u], tc: fcr.tc }
+                    }
+                  }
+                  local_loaded[u] = Some(ipkg)
+                  imports.push(ipkg)
+                }
+              }
+              di = di + 1
+            }
+            let cr = check_source_files_with_imports(pkg_name, tpaths, tsources, imports, true)
+            if cr.diagnostics.length() > 0 {
+              let _ = res_ch.send(
+                drv_pack_str_list([cur_si, "E", check_result_to_json(cr.diagnostics)]),
+              )
+            } else {
+              let tnames = drv_test_names(cr.pkg)
+              let run_idx = drv_filter_tests(tnames, flt)
+              if run_idx.length() > 0 {
+                let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, dep_names, qt)
+                let _ = res_ch.send(
+                  drv_pack_str_list([
+                    cur_si,
+                    "O",
+                    drv_pack_str_list(tnames),
+                    drv_pack_int_list(run_idx),
+                    cleanup_native_rc_ssa(test_res.ssa),
+                  ]),
+                )
+              } else {
+                let _ = res_ch.send(drv_pack_str_list([cur_si, "N"]))
+              }
+            }
+          }
+        })
+        wi = wi + 1
       }
-      let mut li = 0
-      while li < cli_libs.length() {
-        push_unique_lib(job_opts.libs, cli_libs[li])
-        if drv_is_cxx_lib(cli_libs[li]) {
+    })
+    res_ch.close()
+    let results : Array[String] = []
+    si = 0
+    while si < nsel {
+      results.push("")
+      si = si + 1
+    }
+    while true {
+      match res_ch.recv() {
+        Some(msg) => {
+          let rf = drv_unpack_str_list(msg)
+          if rf.length() >= 2 {
+            let rsi = drv_parse_nonneg_decimal(rf[0])
+            if rsi >= 0 && rsi < nsel {
+              results[rsi] = msg
+            }
+          }
+        }
+        None => break
+      }
+    }
+    si = 0
+    while si < nsel {
+      let rf = drv_unpack_str_list(results[si])
+      if rf.length() >= 3 && rf[1] == "E" {
+        io_eprintln(world, rf[2])
+        return 1
+      }
+      let node = nodes[selected[si]]
+      let tk = node_to_topo[selected[si]]
+      tested.push(node.name)
+      if rf.length() >= 5 && rf[1] == "O" {
+        let tnames = drv_unpack_str_list(rf[2])
+        let run_idx = drv_unpack_int_list(rf[3])
+        let ssa = rf[4]
+        let td = trans.topo[tk]
+        let dep_objs : Array[String] = []
+        let job_opts = drv_link_opts_empty()
+        let mut u = 0
+        while u < td.length() {
+          let tu = td[u]
+          let dn = nodes[topo.order[tu]]
+          dep_objs.push(built.obj_paths[tu])
+          let dcstubs = pkg_cstub_objs[tu]
+          let mut ci = 0
+          while ci < dcstubs.length() {
+            dep_objs.push(dcstubs[ci])
+            ci = ci + 1
+          }
+          if pkg_cstub_cxx[tu] {
+            job_opts.has_cxx = true
+          }
+          drv_collect_node_link_opts(dn, qbe_target, job_opts)
+          let drcs = pkg_rc_objs[tu]
+          let mut rci = 0
+          while rci < drcs.length() {
+            push_unique_lib(job_opts.objects, drcs[rci])
+            rci = rci + 1
+          }
+          u = u + 1
+        }
+        let self_cstubs = pkg_cstub_objs[tk]
+        let mut ci = 0
+        while ci < self_cstubs.length() {
+          dep_objs.push(self_cstubs[ci])
+          ci = ci + 1
+        }
+        if pkg_cstub_cxx[tk] {
           job_opts.has_cxx = true
         }
-        li = li + 1
+        drv_collect_node_link_opts(node, qbe_target, job_opts)
+        let self_rcs = pkg_rc_objs[tk]
+        let mut rci = 0
+        while rci < self_rcs.length() {
+          push_unique_lib(job_opts.objects, self_rcs[rci])
+          rci = rci + 1
+        }
+        let mut li = 0
+        while li < cli_libs.length() {
+          push_unique_lib(job_opts.libs, cli_libs[li])
+          if drv_is_cxx_lib(cli_libs[li]) {
+            job_opts.has_cxx = true
+          }
+          li = li + 1
+        }
+        test_jobs.push(DrvTestJob::{
+          label: node.name,
+          ssa: ssa,
+          names: tnames,
+          run_idx: run_idx,
+          dep_objs: dep_objs,
+          link_opts: job_opts,
+        })
       }
-      let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, dep_names, qbe_target)
-      test_jobs.push(DrvTestJob::{
-        label: node.name,
-        ssa: cleanup_native_rc_ssa(test_res.ssa),
-        names: tnames,
-        run_idx: run_idx,
-        dep_objs: dep_objs,
-        link_opts: job_opts,
-      })
+      si = si + 1
     }
-    si = si + 1
   }
   let out_pkgs : Array[String] = []
   let out_names : Array[String] = []
@@ -7317,7 +8141,7 @@ fn drv_run_ws_tests(
   if as_json {
     io_println(
       world,
-      format_workspace_test_report_json(tested, out_pkgs, out_names, out_oks),
+      format_workspace_test_report_json(tested, out_pkgs, out_names, out_oks, deps_skipped),
     )
     let mut fi = 0
     while fi < out_oks.length() {
@@ -7328,7 +8152,16 @@ fn drv_run_ws_tests(
     }
     0
   } else {
-    drv_print_test_summary(world, out_oks)
+    let rc = drv_print_test_summary(world, out_oks)
+    if deps_skipped > 0 {
+      io_println(
+        world,
+        "note: skipped " +
+        deps_skipped.to_string() +
+        " local path dependency package(s); pass --deps to also test them",
+      )
+    }
+    rc
   }
 }
 
@@ -11417,7 +12250,7 @@ fn drv_usage_text() -> String {
   "  pionc build [--package <name>|-p <name>] [--release] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
   "  pionc run [--package <name>|-p <name>] [--release] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
-  "  pionc test [--json] [--package <name>|-p <name>] [--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
+  "  pionc test [--json] [--package <name>|-p <name>] [--deps|--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
   "  pionc doc [--json] [input1 ...]\n" +
   "  pionc extract-lean --out <dir> [--pkg <name>] [--json] [input]\n" +
   "  pionc init [--template cli|service|invar-app] [--json] <dir>\n" +
@@ -11460,13 +12293,21 @@ pub fn main(world : World) -> Int {
       vi = vi + 1
     }
     let host_target = drv_resolve_qbe_target(world)
+    let abi_rev = pion_compiler_abi_rev()
     if as_json {
       io_println(
         world,
-        "{\"version\":\"0.1.0\",\"target\":" + json_quote(host_target) + "}",
+        "{\"version\":\"0.1.0\",\"target\":" +
+        json_quote(host_target) +
+        ",\"abi_rev\":" +
+        json_quote(abi_rev) +
+        "}",
       )
     } else {
-      io_println(world, "pionc 0.1.0 (" + host_target + ", self-hosted)")
+      io_println(
+        world,
+        "pionc 0.1.0 (" + host_target + ", abi " + abi_rev + ", self-hosted)",
+      )
     }
     return 0
   }
@@ -12168,7 +13009,8 @@ pub fn main(world : World) -> Int {
     let mut as_json = false
     let mut filter = ""
     let mut only_pkg = ""
-    let mut no_deps = false
+    let mut explicit_no_deps = false
+    let mut explicit_deps = false
     let mut jobs = drv_default_jobs(world)
     let libs : Array[String] = []
     let targets : Array[String] = []
@@ -12182,8 +13024,10 @@ pub fn main(world : World) -> Int {
       }
       if a == "--json" {
         as_json = true
+      } else if a == "--deps" {
+        explicit_deps = true
       } else if a == "--no-deps" || a == "--only-pkg" {
-        no_deps = true
+        explicit_no_deps = true
       } else if a == "--filter" && i + 1 < args.length() {
         filter = args[i + 1]
         i = i + 1
@@ -12200,11 +13044,25 @@ pub fn main(world : World) -> Int {
       }
       i = i + 1
     }
-    if no_deps && only_pkg.length() > 0 {
+    if explicit_deps && explicit_no_deps {
+      return drv_cmd_fail(
+        world,
+        as_json,
+        "--deps and --no-deps are mutually exclusive",
+      )
+    }
+    if explicit_no_deps && only_pkg.length() > 0 {
       return drv_cmd_fail(
         world,
         as_json,
         "--no-deps and --package are mutually exclusive",
+      )
+    }
+    if explicit_deps && only_pkg.length() > 0 {
+      return drv_cmd_fail(
+        world,
+        as_json,
+        "--deps and --package are mutually exclusive",
       )
     }
     if targets.length() == 0 {
@@ -12218,6 +13076,7 @@ pub fn main(world : World) -> Int {
         )
       }
     }
+    let no_deps = !explicit_deps
     return drv_run_tests_cmd(world, targets, as_json, filter, libs, only_pkg, no_deps, jobs)
   } else if cmd == "doc" {
     let mut as_json = false

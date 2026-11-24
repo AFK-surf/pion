@@ -3005,6 +3005,16 @@ PION_MINSIZE int32_t pion_fs_mkdir_excl(const char *path) {
 #endif
 }
 
+/* Single empty-directory remove (no shell): 0 on success, -1 on error. */
+PION_MINSIZE int32_t pion_fs_rmdir(const char *path) {
+    if (!path || !*path) return -1;
+#ifdef _WIN32
+    return _rmdir(path) == 0 ? 0 : -1;
+#else
+    return rmdir(path) == 0 ? 0 : -1;
+#endif
+}
+
 /* Non-blocking exclusive lock on `path` (created if missing, never removed):
  * a handle >= 0, or -1 when another process holds it. The lock lives on the
  * open file description (close-on-exec, not inherited), so the kernel drops
