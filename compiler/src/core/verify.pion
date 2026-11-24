@@ -30,49 +30,62 @@ let vk_mut_view : Int = 4
 
 ///|
 struct VBind {
+  id : Int
   ty : Ty
   kind : Int
   is_mut : Bool
 }
 
 ///|
-/// Set of moved bindings (insertion-ordered, so copies and unions are
+fn v_int_arr_contains(arr : Array[Int], v : Int) -> Bool {
+  let mut i = 0
+  while i < arr.length() {
+    if arr[i] == v {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// Set of moved binding IDs (insertion-ordered, so copies and unions are
 /// deterministic).
 struct VMoved {
-  names : Array[String]
+  ids : Array[Int]
 }
 
 ///|
 fn vm_new() -> VMoved {
-  VMoved::{ names: [] }
+  VMoved::{ ids: [] }
 }
 
 ///|
-fn vm_contains(m : VMoved, n : String) -> Bool {
-  str_arr_contains(m.names, n)
+fn vm_contains(m : VMoved, id : Int) -> Bool {
+  v_int_arr_contains(m.ids, id)
 }
 
 ///|
-fn vm_add(m : VMoved, n : String) -> Unit {
-  if !str_arr_contains(m.names, n) {
-    m.names.push(n)
+fn vm_add(m : VMoved, id : Int) -> Unit {
+  if !v_int_arr_contains(m.ids, id) {
+    m.ids.push(id)
   }
 }
 
 ///|
-fn vm_remove(m : VMoved, n : String) -> Unit {
-  let keep : Array[String] = []
+fn vm_remove(m : VMoved, id : Int) -> Unit {
+  let keep : Array[Int] = []
   let mut i = 0
-  while i < m.names.length() {
-    if m.names[i] != n {
-      keep.push(m.names[i])
+  while i < m.ids.length() {
+    if m.ids[i] != id {
+      keep.push(m.ids[i])
     }
     i = i + 1
   }
-  m.names.clear()
+  m.ids.clear()
   i = 0
   while i < keep.length() {
-    m.names.push(keep[i])
+    m.ids.push(keep[i])
     i = i + 1
   }
 }
@@ -82,14 +95,19 @@ struct VCtx {
   tc : TypeChecker
   fn_name : String
   scopes : Array[Map[String, VBind]]
+  mut next_bind_id : Int
   mut moved : VMoved
   mut diverged : Bool
+  loop_cont_moved : Array[VMoved]
+  loop_had_cont : Array[Bool]
+  loop_break_moved : Array[VMoved]
+  loop_exit_moved : Array[VMoved]
   reported : Map[String, Bool]
   forbidden_seen : Map[String, Bool]
-  /// Roots of live borrowed views (`for x in r`, a pattern binding a
-  /// `Unique` part of `r`): `r` cannot be written, rebound, passed `mut` or
-  /// moved while the view is alive (stack, nested scopes push / pop).
-  pinned : Array[String]
+  /// Binding IDs of roots of live borrowed views (`for x in r`, a pattern
+  /// binding a `Unique` part of `r`): `r` cannot be written, rebound, passed
+  /// `mut` or moved while the view is alive (stack, nested scopes push / pop).
+  pinned : Array[Int]
 }
 
 ///|
@@ -516,12 +534,14 @@ fn v_pop(ctx : VCtx) -> Unit {
 
 ///|
 fn v_define(ctx : VCtx, name : String, ty : Ty, kind : Int, is_mut : Bool) -> Unit {
+  let id = ctx.next_bind_id
+  ctx.next_bind_id = id + 1
   ctx.scopes[ctx.scopes.length() - 1].set(name, VBind::{
+    id: id,
     ty: ty,
     kind: kind,
     is_mut: is_mut,
   })
-  vm_remove(ctx.moved, name)
 }
 
 ///|
@@ -541,8 +561,8 @@ fn v_lookup(ctx : VCtx, name : String) -> Option[VBind] {
 fn v_copy_moved(m : VMoved) -> VMoved {
   let out = vm_new()
   let mut i = 0
-  while i < m.names.length() {
-    out.names.push(m.names[i])
+  while i < m.ids.length() {
+    out.ids.push(m.ids[i])
     i = i + 1
   }
   out
@@ -551,8 +571,8 @@ fn v_copy_moved(m : VMoved) -> VMoved {
 ///|
 fn v_union_into(dst : VMoved, src : VMoved) -> Unit {
   let mut i = 0
-  while i < src.names.length() {
-    vm_add(dst, src.names[i])
+  while i < src.ids.length() {
+    vm_add(dst, src.ids[i])
     i = i + 1
   }
 }
@@ -564,6 +584,8 @@ fn v_place_root(e : Expr) -> String {
     EField(o, _, _) => v_place_root(o)
     EIndex(o, _, _) => v_place_root(o)
     EMutArg(inner, _) => v_place_root(inner)
+    ENamedArg(_, _, inner, _) => v_place_root(inner)
+    EMove(inner, _) => v_place_root(inner)
     _ => ""
   }
 }
@@ -604,8 +626,8 @@ fn v_consume(ctx : VCtx, e : Expr) -> Unit {
           "use `" + root + ".copy()` to take an owned copy",
         )
       } else if b.kind == vk_local {
-        v_pin_check(ctx, root, sp, "move")
-        vm_add(ctx.moved, root)
+        v_pin_check(ctx, b.id, root, sp, "move")
+        vm_add(ctx.moved, b.id)
       }
     }
   }
@@ -621,8 +643,8 @@ fn v_unpin_to(ctx : VCtx, n : Int) -> Unit {
 ///|
 /// `E_VERIFY_ALIASING`: `root` is pinned by a live `for` iteration or
 /// pattern-binding view and must not be modified, rebound or moved.
-fn v_pin_check(ctx : VCtx, root : String, sp : Span, what : String) -> Unit {
-  if root != "" && str_arr_contains(ctx.pinned, root) {
+fn v_pin_check(ctx : VCtx, id : Int, root : String, sp : Span, what : String) -> Unit {
+  if id >= 0 && v_int_arr_contains(ctx.pinned, id) {
     v_err(
       ctx,
       sp,
@@ -639,11 +661,20 @@ fn v_pin_check(ctx : VCtx, root : String, sp : Span, what : String) -> Unit {
 fn v_check_write(ctx : VCtx, lhs : Expr) -> Unit {
   let root = v_place_root(lhs)
   if root == "" {
+    v_err(
+      ctx,
+      expr_span(lhs),
+      "E_VERIFY_BORROW_ESCAPE",
+      "cannot write through non-place expression in `#verify` function `" + ctx.fn_name + "`",
+      "owned local or `mut` parameter place",
+      "non-place expression",
+      "bind the value to a `let mut` local before mutating it",
+    )
     return
   }
-  v_pin_check(ctx, root, expr_span(lhs), "modify")
   match v_lookup(ctx, root) {
-    Some(b) =>
+    Some(b) => {
+      v_pin_check(ctx, b.id, root, expr_span(lhs), "modify")
       if b.kind == vk_borrowed {
         v_err(
           ctx,
@@ -655,7 +686,17 @@ fn v_check_write(ctx : VCtx, lhs : Expr) -> Unit {
           "declare the parameter `mut " + root + " : ...` and pass `mut` at call sites",
         )
       }
-    None => ()
+    }
+    None =>
+      v_err(
+        ctx,
+        expr_span(lhs),
+        "E_VERIFY_BORROW_ESCAPE",
+        "cannot write through non-place expression in `#verify` function `" + ctx.fn_name + "`",
+        "owned local or `mut` parameter place",
+        "non-place expression",
+        "bind the value to a `let mut` local before mutating it",
+      )
   }
 }
 
@@ -696,20 +737,16 @@ fn v_is_builtin_call(ctx : VCtx, sp : Span) -> Bool {
 
 ///|
 /// Binding kind of a pattern / loop variable projected out of `scrut`.
+/// Every place scrutinee (including `mut` parameters) projects read-only
+/// views (`vk_borrowed`, SPEC §3.4), since pattern bindings cannot write back
+/// into the enclosing container/enum.
 fn v_projected_kind(ctx : VCtx, scrut : Expr) -> Int {
   let root = v_place_root(scrut)
   if root == "" {
     return vk_local
   }
   match v_lookup(ctx, root) {
-    Some(b) =>
-      if b.kind == vk_borrowed {
-        vk_borrowed
-      } else if b.kind == vk_mut_param || b.kind == vk_mut_view {
-        vk_mut_view
-      } else {
-        vk_borrowed
-      }
+    Some(_) => vk_borrowed
     None => vk_local
   }
 }
@@ -745,21 +782,24 @@ fn v_bind_pattern(ctx : VCtx, pat : Pattern, kind : Int) -> Bool {
 }
 
 ///|
-/// Pins the scrutinee's root while `Unique` pattern bindings view it.
-fn v_pin_scrutinee(ctx : VCtx, scrut : Expr, bound_unique : Bool) -> Unit {
-  let r = v_place_root(scrut)
-  if bound_unique && r != "" {
-    ctx.pinned.push(r)
+/// Scrutinee of a `match` / `is`: a non-place `Unique` expression is consumed
+/// (owned by the pattern bindings, rejecting borrowed escapes); a place is
+/// viewed read-only and its outer binding ID is returned before pattern
+/// bindings can shadow its name.
+fn v_scrutinee(ctx : VCtx, scrut : Expr) -> (Int, Int) {
+  let root = v_place_root(scrut)
+  if root == "" {
+    v_expr(ctx, scrut, v_is_unique(ctx, v_expr_ty(ctx, scrut)))
+    (vk_local, -1)
+  } else {
+    v_expr(ctx, scrut, false)
+    let k = v_projected_kind(ctx, scrut)
+    let id = match v_lookup(ctx, root) {
+      Some(b) => b.id
+      None => -1
+    }
+    (k, id)
   }
-}
-
-///|
-/// Scrutinee of a `match` / `is`: a temporary is owned by the pattern
-/// bindings; a place is viewed read-only (its `Unique` parts cannot be moved
-/// out without `.copy()`).
-fn v_scrutinee(ctx : VCtx, scrut : Expr) -> Int {
-  v_expr(ctx, scrut, false)
-  v_projected_kind(ctx, scrut)
 }
 
 ///|
@@ -828,7 +868,11 @@ fn v_args(ctx : VCtx, args : Array[Expr], consume : Bool) -> Unit {
     }
     match a {
       EMutArg(inner, _) => {
-        v_pin_check(ctx, v_place_root(inner), expr_span(inner), "pass as `mut`")
+        let r = v_place_root(inner)
+        match v_lookup(ctx, r) {
+          Some(b) => v_pin_check(ctx, b.id, r, expr_span(inner), "pass as `mut`")
+          None => ()
+        }
         v_expr(ctx, inner, false)
       }
       _ => v_expr(ctx, a, consume)
@@ -857,36 +901,46 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
       )
     EBool(_, _) | EByte(_, _) | EChar(_, _) | EString(_, _) | EUnit(_) | EPath(_, _, _) => ()
     EIdent(n, sp) => {
-      if vm_contains(ctx.moved, n) {
-        v_err(
-          ctx,
-          sp,
-          "E_VERIFY_MOVE",
-          "use of moved `Unique` value `" + n + "` in `#verify` function `" + ctx.fn_name + "`",
-          "live binding",
-          "moved `" + n + "`",
-          "use `" + n + ".copy()` where it was moved, or reassign `" + n + "` before this use",
-        )
+      match v_lookup(ctx, n) {
+        Some(b) =>
+          if vm_contains(ctx.moved, b.id) {
+            v_err(
+              ctx,
+              sp,
+              "E_VERIFY_MOVE",
+              "use of moved `Unique` value `" + n + "` in `#verify` function `" + ctx.fn_name + "`",
+              "live binding",
+              "moved `" + n + "`",
+              "use `" + n + ".copy()` where it was moved, or reassign `" + n + "` before this use",
+            )
+          }
+        None => ()
       }
       if consume {
         v_consume(ctx, e)
       }
     }
     EField(obj, _, _) => {
-      v_expr(ctx, obj, false)
-      if consume {
+      let obj_consume = consume && v_is_unique(ctx, v_expr_ty(ctx, e)) && v_place_root(e) == ""
+      v_expr(ctx, obj, obj_consume)
+      if consume && !obj_consume {
         v_consume(ctx, e)
       }
     }
     EIndex(obj, idx, _) => {
-      v_expr(ctx, obj, false)
+      let obj_consume = consume && v_is_unique(ctx, v_expr_ty(ctx, e)) && v_place_root(e) == ""
+      v_expr(ctx, obj, obj_consume)
       v_expr(ctx, idx, false)
-      if consume {
+      if consume && !obj_consume {
         v_consume(ctx, e)
       }
     }
     EMutArg(inner, _) => {
-      v_pin_check(ctx, v_place_root(inner), expr_span(inner), "pass as `mut`")
+      let r = v_place_root(inner)
+      match v_lookup(ctx, r) {
+        Some(b) => v_pin_check(ctx, b.id, r, expr_span(inner), "pass as `mut`")
+        None => ()
+      }
       v_expr(ctx, inner, false)
     }
     ENamedArg(_, _, inner, _) => v_expr(ctx, inner, consume)
@@ -910,7 +964,15 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     }
     EBinary(op, l, r, sp) => {
       v_expr(ctx, l, false)
-      v_expr(ctx, r, false)
+      if op == "&&" || op == "||" {
+        let m_before = v_copy_moved(ctx.moved)
+        let d_before = ctx.diverged
+        v_expr(ctx, r, false)
+        v_union_into(ctx.moved, m_before)
+        ctx.diverged = d_before
+      } else {
+        v_expr(ctx, r, false)
+      }
       let lt = v_expr_ty(ctx, l)
       let rt = v_expr_ty(ctx, r)
       let is_dbl = match (lt, rt) {
@@ -936,15 +998,44 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
         EIdent(_, _) | EPath(_, _, _) => v_expr(ctx, callee, false)
         _ => v_expr(ctx, callee, false)
       }
-      // Builtins and variant constructors store their arguments; user
-      // functions borrow non-`mut` arguments.
-      v_args(ctx, args, v_is_builtin_call(ctx, sp))
-    }
-    EMethodCall(obj, m, args, sp) => {
-      v_expr(ctx, obj, false)
       let builtin = v_is_builtin_call(ctx, sp)
       if builtin {
-        match v_expr_ty(ctx, obj) {
+        match callee {
+          EPath(q, m, _) =>
+            if (q == "Array" || q == "FixedArray") && m == "make" {
+              match v_expr_ty(ctx, e) {
+                TArray(el) | TFixedArray(el) =>
+                  if v_is_unique(ctx, el) {
+                    v_err(
+                      ctx,
+                      sp,
+                      "E_VERIFY_UNSUPPORTED",
+                      "`" + q + "::make` requires a `Copy` element type in `#verify` function `" + ctx.fn_name + "` (got `Unique` type `" + ty_to_string(el) + "`)",
+                      "`Copy` element type",
+                      ty_to_string(el),
+                      "build the array in a loop pushing fresh values, or use a `Copy` element type",
+                    )
+                  }
+                _ => ()
+              }
+            }
+          _ => ()
+        }
+      }
+      // Builtins and variant constructors store their arguments; user
+      // functions borrow non-`mut` arguments.
+      v_args(ctx, args, builtin)
+    }
+    EMethodCall(obj, m, args, sp) => {
+      let builtin = v_is_builtin_call(ctx, sp)
+      let obj_ty = v_expr_ty(ctx, obj)
+      let consume_obj = builtin && m == "unwrap_or" && match obj_ty {
+        TOption(el) | TResult(el, _) => v_is_unique(ctx, el)
+        _ => false
+      }
+      v_expr(ctx, obj, consume_obj)
+      if builtin {
+        match obj_ty {
           TDouble =>
             if m != "to_bits" && m != "reinterpret_as_uint64" {
               v_err(
@@ -963,24 +1054,103 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
                 ctx,
                 sp,
                 "E_VERIFY_UNSUPPORTED",
-                "method `" + ty_to_string(v_expr_ty(ctx, obj)) + "::to_double` is not supported in `#verify` function `" + ctx.fn_name + "`",
+                "method `" + ty_to_string(obj_ty) + "::to_double` is not supported in `#verify` function `" + ctx.fn_name + "`",
                 "`reinterpret_as_double` or `Double::from_bits`",
                 "to_double",
                 "use `reinterpret_as_double()` / `Double::from_bits()`, or move floating-point conversions into a `#verify_opaque` helper",
               )
             }
-          TArray(el) | TFixedArray(el) | TImmArray(el) =>
+          TArray(el) => {
+            if m == "copy" && v_is_unique(ctx, el) {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `copy` on `" + ty_to_string(obj_ty) + "` requires a `Copy` element type in `#verify` function `" + ctx.fn_name + "` (got `Unique` type `" + ty_to_string(el) + "`)",
+                "`Copy` element type",
+                ty_to_string(el),
+                "move the array directly, or clone each element in a loop",
+              )
+            }
             if m == "contains" && v_has_float_in(ctx.tc, el, []) {
               v_err(
                 ctx,
                 sp,
                 "E_VERIFY_UNSUPPORTED",
-                "method `contains` on `" + ty_to_string(v_expr_ty(ctx, obj)) + "` uses floating-point equality, which is not supported in `#verify` function `" + ctx.fn_name + "`",
+                "method `contains` on `" + ty_to_string(obj_ty) + "` uses floating-point equality, which is not supported in `#verify` function `" + ctx.fn_name + "`",
                 "non-float element type",
                 ty_to_string(el),
                 "compare bit patterns (`to_bits()`) or move floating-point equality into a `#verify_opaque` helper",
               )
             }
+          }
+          TFixedArray(el) => {
+            if (m == "copy" || m == "fill" || m == "blit_to") && v_is_unique(ctx, el) {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `" + m + "` on `" + ty_to_string(obj_ty) + "` requires a `Copy` element type in `#verify` function `" + ctx.fn_name + "` (got `Unique` type `" + ty_to_string(el) + "`)",
+                "`Copy` element type",
+                ty_to_string(el),
+                if m == "copy" {
+                  "move the array directly, or clone each element in a loop"
+                } else if m == "fill" {
+                  "assign fresh elements in a loop instead of `.fill()`"
+                } else {
+                  "copy elements in a loop instead of `.blit_to()`"
+                },
+              )
+            }
+            if m == "contains" && v_has_float_in(ctx.tc, el, []) {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `contains` on `" + ty_to_string(obj_ty) + "` uses floating-point equality, which is not supported in `#verify` function `" + ctx.fn_name + "`",
+                "non-float element type",
+                ty_to_string(el),
+                "compare bit patterns (`to_bits()`) or move floating-point equality into a `#verify_opaque` helper",
+              )
+            }
+          }
+          TImmArray(el) =>
+            if m == "contains" && v_has_float_in(ctx.tc, el, []) {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `contains` on `" + ty_to_string(obj_ty) + "` uses floating-point equality, which is not supported in `#verify` function `" + ctx.fn_name + "`",
+                "non-float element type",
+                ty_to_string(el),
+                "compare bit patterns (`to_bits()`) or move floating-point equality into a `#verify_opaque` helper",
+              )
+            }
+          TMap(k, v) => {
+            if m == "copy" && (v_is_unique(ctx, k) || v_is_unique(ctx, v)) {
+              let bad_ty = if v_is_unique(ctx, v) { v } else { k }
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `copy` on `" + ty_to_string(obj_ty) + "` requires `Copy` key and value types in `#verify` function `" + ctx.fn_name + "` (got `Unique` type `" + ty_to_string(bad_ty) + "`)",
+                "`Copy` key and value types",
+                ty_to_string(bad_ty),
+                "move the map directly, or store `Copy` values",
+              )
+            }
+            if m == "get" && v_is_unique(ctx, v) {
+              v_err(
+                ctx,
+                sp,
+                "E_VERIFY_UNSUPPORTED",
+                "method `get` on `" + ty_to_string(obj_ty) + "` requires a `Copy` value type in `#verify` function `" + ctx.fn_name + "` (got `Unique` type `" + ty_to_string(v) + "`)",
+                "`Copy` value type",
+                ty_to_string(v),
+                "store `Copy` values in `Map` inside `#verify` code",
+              )
+            }
+          }
           _ => ()
         }
       }
@@ -1016,16 +1186,14 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
     EIf(cond, then_stmts, else_opt, _) => {
       let pin_base = ctx.pinned.length()
       v_push(ctx)
-      v_cond(ctx, cond)
-      let m0 = v_copy_moved(ctx.moved)
-      let d0 = ctx.diverged
+      let (m_false, d_false) = v_cond(ctx, cond, true)
       v_stmts(ctx, then_stmts, consume)
       v_pop(ctx)
       v_unpin_to(ctx, pin_base)
       let m1 = ctx.moved
       let d1 = ctx.diverged
-      ctx.moved = v_copy_moved(m0)
-      ctx.diverged = d0
+      ctx.moved = m_false
+      ctx.diverged = d_false
       match else_opt {
         Some(el) => v_expr(ctx, el, consume)
         None => ()
@@ -1038,29 +1206,43 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
       } else {
         v_union_into(ctx.moved, m1)
       }
-      ctx.diverged = d0 || (d1 && d2)
+      ctx.diverged = d1 && d2
     }
     EIs(scrut, pat, _) => {
-      let k = v_scrutinee(ctx, scrut)
+      let (k, scrut_id) = v_scrutinee(ctx, scrut)
+      let pin_base = ctx.pinned.length()
+      v_push(ctx)
       let bu = v_bind_pattern(ctx, pat, k)
-      v_pin_scrutinee(ctx, scrut, bu)
+      if bu && scrut_id >= 0 {
+        ctx.pinned.push(scrut_id)
+      }
+      v_pop(ctx)
+      v_unpin_to(ctx, pin_base)
     }
     EMatch(scrut, arms, _) => {
-      let k = v_scrutinee(ctx, scrut)
-      let m0 = v_copy_moved(ctx.moved)
+      let (k, scrut_id) = v_scrutinee(ctx, scrut)
+      let m_fall = v_copy_moved(ctx.moved)
       let d0 = ctx.diverged
       let merged = vm_new()
       let mut all_div = arms.length() > 0
       let mut i = 0
       while i < arms.length() {
-        ctx.moved = v_copy_moved(m0)
+        ctx.moved = v_copy_moved(m_fall)
         ctx.diverged = d0
         v_push(ctx)
         let pin_base = ctx.pinned.length()
         let bu = v_bind_pattern(ctx, arms[i].pat, k)
-        v_pin_scrutinee(ctx, scrut, bu)
+        if bu && scrut_id >= 0 {
+          ctx.pinned.push(scrut_id)
+        }
         match arms[i].guard_expr {
-          Some(g) => v_expr(ctx, g, false)
+          Some(g) => {
+            v_expr(ctx, g, false)
+            // A false guard falls through to later arms with its moves intact.
+            if !ctx.diverged {
+              v_union_into(m_fall, ctx.moved)
+            }
+          }
           None => ()
         }
         v_expr(ctx, arms[i].body, consume)
@@ -1073,7 +1255,7 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
         i = i + 1
       }
       if all_div {
-        ctx.moved = m0
+        ctx.moved = m_fall
       } else {
         ctx.moved = merged
       }
@@ -1091,26 +1273,128 @@ fn v_expr(ctx : VCtx, e : Expr, consume : Bool) -> Unit {
 }
 
 ///|
-/// Condition of `if` / `while` / `guard`: `is` patterns bind into the
-/// current scope (the branch scope pushed by the caller).
-fn v_cond(ctx : VCtx, cond : Expr) -> Unit {
+/// Condition of `if` / `while` / `guard` / C-style `for`: `is` patterns bind
+/// into the current scope (the branch scope pushed by the caller).
+/// Leaves `ctx.moved`/`ctx.diverged` at the true-branch state (all `&&`
+/// operands ran) and returns `(m_false, d_false)` for the false branch.
+fn v_cond(ctx : VCtx, cond : Expr, bind_is : Bool) -> (VMoved, Bool) {
   match cond {
     EBinary("&&", l, r, _) => {
-      v_cond(ctx, l)
-      v_cond(ctx, r)
+      let (mf_l, df_l) = v_cond(ctx, l, bind_is)
+      if ctx.diverged {
+        return (mf_l, df_l)
+      }
+      let (mf_r, df_r) = v_cond(ctx, r, bind_is)
+      let mf = if !df_l && !df_r {
+        v_union_into(mf_l, mf_r)
+        mf_l
+      } else if df_l {
+        mf_r
+      } else {
+        mf_l
+      }
+      (mf, df_l && df_r)
     }
-    _ => v_expr(ctx, cond, false)
+    EIs(scrut, pat, _) if bind_is => {
+      let (k, scrut_id) = v_scrutinee(ctx, scrut)
+      let bu = v_bind_pattern(ctx, pat, k)
+      if bu && scrut_id >= 0 {
+        ctx.pinned.push(scrut_id)
+      }
+      (v_copy_moved(ctx.moved), ctx.diverged)
+    }
+    _ => {
+      v_expr(ctx, cond, false)
+      (v_copy_moved(ctx.moved), ctx.diverged)
+    }
   }
 }
 
 ///|
-fn v_loop_body(ctx : VCtx, run : (Int) -> Unit) -> Unit {
+fn v_loop_body(ctx : VCtx, has_cond : Bool, run : (Int) -> Unit) -> Unit {
   let d0 = ctx.diverged
-  // Twice: a `Unique` value moved in one iteration is caught when the next
-  // iteration reads it.
+  let m_entry = v_copy_moved(ctx.moved)
+  ctx.loop_cont_moved.push(vm_new())
+  ctx.loop_had_cont.push(false)
+  ctx.loop_break_moved.push(vm_new())
+  ctx.loop_exit_moved.push(vm_new())
+  let idx = ctx.loop_cont_moved.length() - 1
+  // Pass 0: first iteration from `m_entry`.
   run(0)
-  ctx.diverged = d0
-  run(1)
+  let end0_div = ctx.diverged
+  let had_cont0 = ctx.loop_had_cont[idx]
+  if !end0_div || had_cont0 {
+    let back0 = if !end0_div && had_cont0 {
+      let u = v_copy_moved(ctx.moved)
+      v_union_into(u, ctx.loop_cont_moved[idx])
+      u
+    } else if !end0_div {
+      v_copy_moved(ctx.moved)
+    } else {
+      v_copy_moved(ctx.loop_cont_moved[idx])
+    }
+    // Pass 1: next iteration with entry + reachable back-edge moves.
+    ctx.loop_cont_moved[idx] = vm_new()
+    ctx.loop_had_cont[idx] = false
+    ctx.moved = v_copy_moved(m_entry)
+    v_union_into(ctx.moved, back0)
+    ctx.diverged = d0
+    run(1)
+    let end1_div = ctx.diverged
+    let had_cont1 = ctx.loop_had_cont[idx]
+    if has_cond {
+      // Condition-tested loop (`while` / C-style `for`): every non-`break` exit
+      // evaluates `cond` to false. Run a final condition-only pass (`pass == 2`)
+      // on any reachable Pass-1 back-edge so delayed moves are captured in
+      // `loop_exit_moved` without falsely unioning pre-condition body moves.
+      if !end1_div || had_cont1 {
+        let back1 = if !end1_div && had_cont1 {
+          let u = v_copy_moved(ctx.moved)
+          v_union_into(u, ctx.loop_cont_moved[idx])
+          u
+        } else if !end1_div {
+          v_copy_moved(ctx.moved)
+        } else {
+          v_copy_moved(ctx.loop_cont_moved[idx])
+        }
+        ctx.moved = v_copy_moved(m_entry)
+        v_union_into(ctx.moved, back0)
+        v_union_into(ctx.moved, back1)
+        ctx.diverged = d0
+        run(2)
+      }
+      let post = v_copy_moved(ctx.loop_exit_moved[idx])
+      v_union_into(post, ctx.loop_break_moved[idx])
+      ctx.moved = post
+    } else {
+      let post = v_copy_moved(m_entry)
+      v_union_into(post, ctx.loop_exit_moved[idx])
+      v_union_into(post, back0)
+      if !end1_div {
+        v_union_into(post, ctx.moved)
+      }
+      if had_cont1 {
+        v_union_into(post, ctx.loop_cont_moved[idx])
+      }
+      v_union_into(post, ctx.loop_break_moved[idx])
+      ctx.moved = post
+    }
+  } else {
+    // Unconditional return/break without `continue`: Pass 1 is unreachable.
+    let post = if has_cond {
+      v_copy_moved(ctx.loop_exit_moved[idx])
+    } else {
+      let p = v_copy_moved(m_entry)
+      v_union_into(p, ctx.loop_exit_moved[idx])
+      p
+    }
+    v_union_into(post, ctx.loop_break_moved[idx])
+    ctx.moved = post
+  }
+  let _ = ctx.loop_cont_moved.pop()
+  let _ = ctx.loop_had_cont.pop()
+  let _ = ctx.loop_break_moved.pop()
+  let _ = ctx.loop_exit_moved.pop()
   ctx.diverged = d0
 }
 
@@ -1152,10 +1436,14 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
     SAssign(lhs, rhs, _) => {
       v_expr(ctx, rhs, true)
       match lhs {
-        EIdent(n, nsp) => {
-          v_pin_check(ctx, n, nsp, "rebind")
-          vm_remove(ctx.moved, n)
-        }
+        EIdent(n, nsp) =>
+          match v_lookup(ctx, n) {
+            Some(b) => {
+              v_pin_check(ctx, b.id, n, nsp, "rebind")
+              vm_remove(ctx.moved, b.id)
+            }
+            None => v_define(ctx, n, v_expr_ty(ctx, rhs), vk_local, true)
+          }
         EField(o, _, _) => {
           v_expr(ctx, o, false)
           v_check_write(ctx, lhs)
@@ -1165,7 +1453,10 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
           v_expr(ctx, idx, false)
           v_check_write(ctx, lhs)
         }
-        _ => v_expr(ctx, lhs, false)
+        _ => {
+          v_expr(ctx, lhs, false)
+          v_check_write(ctx, lhs)
+        }
       }
     }
     SCompoundAssign(_, lhs, rhs, _) => {
@@ -1174,40 +1465,107 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
       v_check_write(ctx, lhs)
     }
     SGuard(cond, else_body, _) => {
-      v_cond(ctx, cond)
-      let m0 = v_copy_moved(ctx.moved)
-      let d0 = ctx.diverged
+      let pin_base = ctx.pinned.length()
+      v_push(ctx)
+      let (m_false, d_false) = v_cond(ctx, cond, true)
+      let m_true = v_copy_moved(ctx.moved)
+      let d_true = ctx.diverged
+      // Pop guard bindings & pins while checking `else_body` so the false
+      // branch sees only the outer scope (matching `types.pion:5992`).
+      let guard_scope = match ctx.scopes.pop() {
+        Some(sc) => sc
+        None => Map([])
+      }
+      let guard_pins : Array[Int] = []
+      while ctx.pinned.length() > pin_base {
+        match ctx.pinned.pop() {
+          Some(pid) => guard_pins.push(pid)
+          None => ()
+        }
+      }
+      ctx.moved = m_false
+      ctx.diverged = d_false
       v_push(ctx)
       v_stmts(ctx, else_body, false)
       v_pop(ctx)
-      ctx.moved = m0
-      ctx.diverged = d0
+      // Restore guard bindings & pins into the enclosing block for the
+      // fallthrough (true) path.
+      let gkeys = guard_scope.keys()
+      let dst = ctx.scopes[ctx.scopes.length() - 1]
+      let mut gi = 0
+      while gi < gkeys.length() {
+        let gk = gkeys[gi]
+        match guard_scope.get(gk) {
+          Some(gv) => dst.set(gk, gv)
+          None => ()
+        }
+        gi = gi + 1
+      }
+      let mut pi = guard_pins.length() - 1
+      while pi >= 0 {
+        ctx.pinned.push(guard_pins[pi])
+        pi = pi - 1
+      }
+      ctx.moved = m_true
+      ctx.diverged = d_true
     }
     SWhile(cond, body, _) =>
-      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+      v_loop_body(ctx, true, fn(pass : Int) -> Unit {
         let pin_base = ctx.pinned.length()
         v_push(ctx)
-        v_cond(ctx, cond)
-        v_stmts(ctx, body, false)
+        let (m_false, d_false) = v_cond(ctx, cond, true)
+        let top = ctx.loop_exit_moved.length() - 1
+        if !d_false {
+          v_union_into(ctx.loop_exit_moved[top], m_false)
+        }
+        if pass < 2 {
+          v_stmts(ctx, body, false)
+        }
         v_pop(ctx)
         v_unpin_to(ctx, pin_base)
       })
     SFor(init_s, cond, step_s, body, _) => {
       v_push(ctx)
       v_stmt(ctx, init_s, false)
-      v_loop_body(ctx, fn(_pass : Int) -> Unit {
-        v_expr(ctx, cond, false)
+      v_loop_body(ctx, true, fn(pass : Int) -> Unit {
+        let pin_base = ctx.pinned.length()
         v_push(ctx)
-        v_stmts(ctx, body, false)
+        let (m_false, d_false) = v_cond(ctx, cond, false)
         v_pop(ctx)
-        v_stmt(ctx, step_s, false)
+        v_unpin_to(ctx, pin_base)
+        let top = ctx.loop_exit_moved.length() - 1
+        if !d_false {
+          v_union_into(ctx.loop_exit_moved[top], m_false)
+        }
+        if pass < 2 {
+          v_push(ctx)
+          v_stmts(ctx, body, false)
+          v_pop(ctx)
+          let had_cont = ctx.loop_had_cont[top]
+          if !ctx.diverged || had_cont {
+            let pre_step = if !ctx.diverged && had_cont {
+              let u = v_copy_moved(ctx.moved)
+              v_union_into(u, ctx.loop_cont_moved[top])
+              u
+            } else if had_cont {
+              v_copy_moved(ctx.loop_cont_moved[top])
+            } else {
+              ctx.moved
+            }
+            ctx.moved = pre_step
+            ctx.loop_cont_moved[top] = vm_new()
+            ctx.loop_had_cont[top] = false
+            ctx.diverged = false
+            v_stmt(ctx, step_s, false)
+          }
+        }
       })
       v_pop(ctx)
     }
     SForRange(vname, start_e, end_e, _, body, _) => {
       v_expr(ctx, start_e, false)
       v_expr(ctx, end_e, false)
-      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+      v_loop_body(ctx, false, fn(_pass : Int) -> Unit {
         v_push(ctx)
         v_define(ctx, vname, TInt, vk_local, false)
         v_stmts(ctx, body, false)
@@ -1215,16 +1573,28 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
       })
     }
     SForIn(idx_name, vname, iter_e, body, _) => {
-      v_expr(ctx, iter_e, false)
+      let iter_root = v_place_root(iter_e)
+      if iter_root == "" {
+        v_expr(ctx, iter_e, v_is_unique(ctx, v_expr_ty(ctx, iter_e)))
+      } else {
+        v_expr(ctx, iter_e, false)
+      }
       let elem = match v_expr_ty(ctx, iter_e) {
         TArray(el) | TFixedArray(el) | TImmArray(el) => el
         _ => TError
       }
-      let iter_root = v_place_root(iter_e)
-      v_loop_body(ctx, fn(_pass : Int) -> Unit {
+      let iter_id = if iter_root != "" {
+        match v_lookup(ctx, iter_root) {
+          Some(b) => b.id
+          None => -1
+        }
+      } else {
+        -1
+      }
+      v_loop_body(ctx, false, fn(_pass : Int) -> Unit {
         let pin_base = ctx.pinned.length()
-        if iter_root != "" {
-          ctx.pinned.push(iter_root)
+        if iter_id >= 0 {
+          ctx.pinned.push(iter_id)
         }
         v_push(ctx)
         if idx_name != "" {
@@ -1244,7 +1614,20 @@ fn v_stmt(ctx : VCtx, st : Stmt, consume : Bool) -> Unit {
       }
       ctx.diverged = true
     }
-    SBreak(_) | SContinue(_) => ctx.diverged = true
+    SBreak(_) => {
+      if !ctx.diverged && ctx.loop_break_moved.length() > 0 {
+        v_union_into(ctx.loop_break_moved[ctx.loop_break_moved.length() - 1], ctx.moved)
+      }
+      ctx.diverged = true
+    }
+    SContinue(_) => {
+      if !ctx.diverged && ctx.loop_cont_moved.length() > 0 {
+        let top = ctx.loop_cont_moved.length() - 1
+        v_union_into(ctx.loop_cont_moved[top], ctx.moved)
+        ctx.loop_had_cont[top] = true
+      }
+      ctx.diverged = true
+    }
     SDebugAssert(c, m, _) => {
       v_expr(ctx, c, false)
       v_expr(ctx, m, false)
@@ -1260,8 +1643,13 @@ pub fn verify_check_fn(tc : TypeChecker, fd : FnDecl, finfo : FnInfo, fn_name : 
     tc: tc,
     fn_name: fn_name,
     scopes: [Map([])],
+    next_bind_id: 0,
     moved: vm_new(),
     diverged: false,
+    loop_cont_moved: [],
+    loop_had_cont: [],
+    loop_break_moved: [],
+    loop_exit_moved: [],
     reported: Map([]),
     forbidden_seen: Map([]),
     pinned: [],
