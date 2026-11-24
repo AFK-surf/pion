@@ -152,136 +152,205 @@ fn split_bracket_items(inner : String) -> Array[String] {
   out
 }
 
-///| Parse targets map from BOTH `moon.pkg.json` (`"targets": { ... }`) AND
-///| real MoonBit `moon.pkg` DSL (`options(targets: { "file.mbt": ..., ... })`),
-///| preserving each file's full raw value expression (string literal or nested `[...]` array).
-pub fn parse_moon_pkg_targets(content : String) -> Map[String, String] {
+///| Reconstruct a canonical target-rule expression string from `lex_moonbit` tokens
+///| (automatically strips all comments/whitespace and rejects malformed syntax).
+fn parse_target_rule_expr_tokens(tokens : Array[Token], val_i : Int, limit : Int) -> Result[(String, Int), String] {
+  if val_i >= limit {
+    return Err("malformed moon.pkg target rule: unexpected end of expression")
+  }
+  let tok = tokens[val_i]
+  if tok.kind == TokenKind::StringLit {
+    return Ok((tok.raw, val_i + 1))
+  }
+  if tok.kind == TokenKind::LBracket {
+    let rb = find_matching_delim(tokens, val_i)
+    if rb >= limit || tokens[rb].kind != TokenKind::RBracket {
+      return Err("malformed moon.pkg target rule: unclosed `[`")
+    }
+    let items : Array[String] = []
+    let mut k = val_i + 1
+    while k < rb {
+      if tokens[k].kind == TokenKind::Comma {
+        return Err("malformed moon.pkg target rule: empty array item")
+      }
+      match parse_target_rule_expr_tokens(tokens, k, rb) {
+        Err(e) => return Err(e)
+        Ok((item_str, next_k)) => {
+          items.push(item_str)
+          k = next_k
+        }
+      }
+      if k < rb {
+        if tokens[k].kind == TokenKind::Comma {
+          k = k + 1
+        } else {
+          return Err("malformed moon.pkg target rule: expected `,` in array near `" + tokens[k].raw + "`")
+        }
+      }
+    }
+    return Ok(("[" + join_comma(items) + "]", rb + 1))
+  }
+  Err("invalid moon.pkg target rule expression near `" + tok.raw + "`")
+}
+
+///| Strictly parse a `{ "file.mbt": <rule_expr>, ... }` targets table from `lex_moonbit` tokens.
+fn parse_targets_table_tokens(
+  tokens : Array[Token],
+  start : Int,
+  limit : Int,
+  out : Map[String, String],
+) -> Result[Int, String] {
+  if start >= limit || tokens[start].kind != TokenKind::LBrace {
+    return Err("malformed moon.pkg targets table: expected `{ ... }`")
+  }
+  let rb = find_matching_delim(tokens, start)
+  if rb >= limit || tokens[rb].kind != TokenKind::RBrace {
+    return Err("malformed moon.pkg targets table: unclosed `{`")
+  }
+  let mut k = start + 1
+  while k < rb {
+    if tokens[k].kind != TokenKind::StringLit {
+      return Err("malformed moon.pkg targets table: expected quoted filename key near `" + tokens[k].raw + "`")
+    }
+    let raw_key = tokens[k].raw
+    let fname = if raw_key.length() >= 2 { raw_key.slice(1, raw_key.length() - 1) } else { "" }
+    if fname.length() == 0 {
+      return Err("malformed moon.pkg targets table: empty filename key")
+    }
+    k = k + 1
+    if k >= rb || tokens[k].kind != TokenKind::Colon {
+      return Err("malformed moon.pkg targets table: expected `:` after `" + fname + "`")
+    }
+    k = k + 1
+    match parse_target_rule_expr_tokens(tokens, k, rb) {
+      Err(e) => return Err(e)
+      Ok((expr_str, next_k)) => {
+        if out.contains(fname) {
+          return Err("duplicate moon.pkg target rule for `" + fname + "`")
+        }
+        out[fname] = expr_str
+        k = next_k
+      }
+    }
+    if k < rb {
+      if tokens[k].kind == TokenKind::Comma {
+        k = k + 1
+      } else {
+        return Err("malformed moon.pkg targets table: expected `,` or `}` after rule for `" + fname + "`")
+      }
+    }
+  }
+  Ok(rb + 1)
+}
+
+///| Lexer-backed strict parser for BOTH `moon.pkg.json` (`"targets": { ... }`) AND
+///| real MoonBit `moon.pkg` DSL (`options(targets: { ... })`).
+///| Immune to `//` comments, whitespace/newlines, and string literals containing `targets:` or `}`.
+pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, String], String] {
   let out : Map[String, String] = Map()
-  let q_idx = content.index_of("\"targets\"")
-  let dsl_idx = content.index_of("targets:")
-  let start_after = if q_idx >= 0 {
-    q_idx + 9
-  } else if dsl_idx >= 0 {
-    dsl_idx + 8
-  } else {
-    return out
+  let tokens = lex_moonbit(content)
+  let n = tokens.length() - 1
+  if n <= 0 {
+    return Ok(out)
   }
-  let after_t = content.slice(start_after, content.length())
-  let lb = after_t.index_of("{")
-  if lb < 0 {
-    return out
-  }
-  let mut depth = 0
-  let mut in_str = false
-  let mut esc = false
-  let mut rb = lb
-  while rb < after_t.length() {
-    let c = after_t.code_unit_at(rb)
-    if in_str {
-      if esc {
-        esc = false
-      } else if c == 92 {
-        esc = true
-      } else if c == 34 {
-        in_str = false
+  // 1. JSON manifest (`moon.pkg.json`): root `{ ... }` top-level `"targets": { ... }`
+  if tokens[0].kind == TokenKind::LBrace {
+    let rb = find_matching_delim(tokens, 0)
+    if rb >= n || tokens[rb].kind != TokenKind::RBrace {
+      return Err("malformed moon.pkg.json: unclosed top-level `{`")
+    }
+    let mut k = 1
+    while k < rb {
+      if tokens[k].kind == TokenKind::Comma {
+        k = k + 1
+        continue
       }
-    } else if c == 34 {
-      in_str = true
-    } else if c == 123 {
-      depth = depth + 1
-    } else if c == 125 {
-      depth = depth - 1
-      if depth == 0 {
-        break
+      if tokens[k].kind == TokenKind::StringLit && k + 1 < rb && tokens[k + 1].kind == TokenKind::Colon {
+        let key_raw = tokens[k].raw
+        let val_i = k + 2
+        if key_raw == "\"targets\"" {
+          match parse_targets_table_tokens(tokens, val_i, rb, out) {
+            Err(e) => return Err(e)
+            Ok(next_k) => {
+              k = next_k
+              continue
+            }
+          }
+        }
+        // Skip non-targets JSON value at top level
+        if val_i < rb && (tokens[val_i].kind == TokenKind::LBrace || tokens[val_i].kind == TokenKind::LBracket || tokens[val_i].kind == TokenKind::LParen) {
+          k = find_matching_delim(tokens, val_i) + 1
+        } else {
+          k = val_i
+          while k < rb && tokens[k].kind != TokenKind::Comma {
+            if tokens[k].kind == TokenKind::LBrace || tokens[k].kind == TokenKind::LBracket || tokens[k].kind == TokenKind::LParen {
+              k = find_matching_delim(tokens, k) + 1
+            } else {
+              k = k + 1
+            }
+          }
+        }
+        continue
+      }
+      if tokens[k].kind == TokenKind::LBrace || tokens[k].kind == TokenKind::LBracket || tokens[k].kind == TokenKind::LParen {
+        k = find_matching_delim(tokens, k) + 1
+      } else {
+        k = k + 1
       }
     }
-    rb = rb + 1
+    return Ok(out)
   }
-  let body = after_t.slice(lb + 1, rb)
-  let blen = body.length()
-  let mut pos = 0
-  while pos < blen {
-    let q1 = body.slice(pos, blen).index_of("\"")
-    if q1 < 0 { break }
-    let key_s = pos + q1 + 1
-    let q2 = body.slice(key_s, blen).index_of("\"")
-    if q2 < 0 { break }
-    let fname = body.slice(key_s, key_s + q2)
-    let mut p = key_s + q2 + 1
-    while p < blen && (body.code_unit_at(p) == 32 || body.code_unit_at(p) == 9 || body.code_unit_at(p) == 10 || body.code_unit_at(p) == 13) {
-      p = p + 1
-    }
-    if p >= blen || body.code_unit_at(p) != 58 {
-      pos = p
+  // 2. DSL manifest (`moon.pkg`): top-level `options( ... targets: { ... } ... )`
+  let mut k = 0
+  while k < n {
+    if (tokens[k].kind == TokenKind::Ident || tokens[k].kind == TokenKind::Keyword) &&
+    tokens[k].raw == "options" && k + 1 < n && tokens[k + 1].kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, k + 1)
+      if rp >= n || tokens[rp].kind != TokenKind::RParen {
+        return Err("malformed moon.pkg: unclosed `options(...)`")
+      }
+      let mut j = k + 2
+      while j < rp {
+        if tokens[j].kind == TokenKind::Comma {
+          j = j + 1
+          continue
+        }
+        let is_targets_key = ((tokens[j].kind == TokenKind::Ident || tokens[j].kind == TokenKind::Keyword) && tokens[j].raw == "targets") ||
+        (tokens[j].kind == TokenKind::StringLit && tokens[j].raw == "\"targets\"")
+        if is_targets_key && j + 1 < rp && tokens[j + 1].kind == TokenKind::Colon {
+          match parse_targets_table_tokens(tokens, j + 2, rp, out) {
+            Err(e) => return Err(e)
+            Ok(next_j) => {
+              j = next_j
+              continue
+            }
+          }
+        }
+        // Skip non-targets field inside `options(...)`
+        if tokens[j].kind == TokenKind::LBrace || tokens[j].kind == TokenKind::LBracket || tokens[j].kind == TokenKind::LParen {
+          j = find_matching_delim(tokens, j) + 1
+        } else {
+          j = j + 1
+        }
+      }
+      k = rp + 1
       continue
     }
-    p = p + 1
-    while p < blen && (body.code_unit_at(p) == 32 || body.code_unit_at(p) == 9 || body.code_unit_at(p) == 10 || body.code_unit_at(p) == 13) {
-      p = p + 1
-    }
-    if p >= blen { break }
-    let val_start = p
-    let mut val_end = p
-    let ch = body.code_unit_at(p)
-    if ch == 34 {
-      let mut j = p + 1
-      let mut vesc = false
-      while j < blen {
-        let jc = body.code_unit_at(j)
-        if vesc {
-          vesc = false
-        } else if jc == 92 {
-          vesc = true
-        } else if jc == 34 {
-          j = j + 1
-          break
-        }
-        j = j + 1
-      }
-      val_end = j
-    } else if ch == 91 {
-      let mut j = p
-      let mut bd = 0
-      let mut vstr = false
-      let mut vesc = false
-      while j < blen {
-        let jc = body.code_unit_at(j)
-        if vstr {
-          if vesc {
-            vesc = false
-          } else if jc == 92 {
-            vesc = true
-          } else if jc == 34 {
-            vstr = false
-          }
-        } else if jc == 34 {
-          vstr = true
-        } else if jc == 91 {
-          bd = bd + 1
-        } else if jc == 93 {
-          bd = bd - 1
-          if bd == 0 {
-            j = j + 1
-            break
-          }
-        }
-        j = j + 1
-      }
-      val_end = j
+    if tokens[k].kind == TokenKind::LBrace || tokens[k].kind == TokenKind::LBracket || tokens[k].kind == TokenKind::LParen {
+      k = find_matching_delim(tokens, k) + 1
     } else {
-      let mut j = p
-      while j < blen && body.code_unit_at(j) != 44 && body.code_unit_at(j) != 125 {
-        j = j + 1
-      }
-      val_end = j
+      k = k + 1
     }
-    let raw_val = body.slice(val_start, val_end).trim()
-    if fname.length() > 0 && raw_val.length() > 0 {
-      out[fname] = raw_val
-    }
-    pos = val_end
   }
-  out
+  Ok(out)
+}
+
+///| Compatibility wrapper returning `Map[String, String]` (empty map on parse error).
+pub fn parse_moon_pkg_targets(content : String) -> Map[String, String] {
+  match parse_moon_pkg_targets_strict(content) {
+    Ok(m) => m
+    Err(_) => Map()
+  }
 }
 
 ///| Recursively evaluate a `moon.pkg` file-target expression for `pion_target` (fail-closed:
@@ -583,7 +652,21 @@ pub fn transpile_package(
 
   // Filter test files unless `--with-tests` is enabled, AND apply `moon.pkg` / `moon.pkg.json` target rules (P1-3)
   let pkg_targets = if opts.moon_pkg_content.length() > 0 {
-    parse_moon_pkg_targets(opts.moon_pkg_content)
+    match parse_moon_pkg_targets_strict(opts.moon_pkg_content) {
+      Ok(m) => m
+      Err(reason) => {
+        ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_TARGET_RULE", "moon.pkg", 1, 1, reason))
+        ctx.dispositions.push(DispositionEntry::{
+          file: "moon.pkg",
+          decl: "file:moon.pkg",
+          line: 1,
+          col: 1,
+          disposition: "unsupported",
+          detail: reason,
+        })
+        Map()
+      }
+    }
   } else {
     Map()
   }

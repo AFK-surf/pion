@@ -1428,6 +1428,65 @@ for tag_bad, bad_rule in [("debug", '["debug"]'), ("not_debug", '["not", "debug"
 
 print("[e2e] PASS: Final Astra P0 fail-closed unknown moon.pkg rules (10m-3: [\"debug\"] & [\"not\", \"debug\"] -> rc=1 MBT2PION_UNSUPPORTED_TARGET_RULE)")
 
+# 10m-4. Final Astra P0 lexer-backed moon.pkg whitespace & comment immunity + malformed fail-closed:
+#        (a) `targets :` with space -> extra.pion absent & live wasm32 run == 21
+#        (b) `// "extra.mbt": "wasm",` commented out -> extra.pion present & live wasm32 run == 22
+#        (c) `// }` inside targets table -> extra.pion absent & live wasm32 run == 21
+#        (d) malformed `options(targets: 123)` -> rc=1 + MBT2PION_UNSUPPORTED_TARGET_RULE
+for tag_lx, pkg_txt, expect_extra, expected_out in [
+    ("space_colon", 'options(targets : {"extra.mbt": "wasm"})\n', False, "21"),
+    ("commented_out", 'options(targets: {\n // "extra.mbt": "wasm",\n})\n', True, "22"),
+    ("comment_brace", 'options(targets: {\n // }\n "extra.mbt": "wasm",\n})\n', False, "21"),
+]:
+    s_lx = os.path.join(root, f"s10m4_{tag_lx}")
+    o_lx = os.path.join(root, f"o10m4_{tag_lx}")
+    os.makedirs(s_lx, exist_ok=True)
+    with open(os.path.join(s_lx, "moon.pkg"), "w") as f:
+        f.write(pkg_txt)
+    with open(os.path.join(s_lx, "extra.mbt"), "w") as f:
+        f.write("fn init {\n  xs.push(9)\n}\n")
+    with open(os.path.join(s_lx, "common.mbt"), "w") as f:
+        f.write(
+            'let xs : Array[Int] = [0]\n'
+            '#cfg(target="wasm-gc")\n'
+            'fn bit() -> Int { 20 }\n'
+            '#cfg(not(target="wasm-gc"))\n'
+            'fn bit() -> Int { 10 }\n'
+            'pub fn sample() -> Int { xs.length() + bit() }\n'
+        )
+    r_lx_pub = run_cli(["--src", s_lx, "--out", o_lx, "--target", "wasm32", "--mode", "publish",
+                        "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_lx_pub.returncode == 0, f"10m-4 {tag_lx} publish failed: {r_lx_pub.returncode} {r_lx_pub.stdout} {r_lx_pub.stderr}"
+    has_extra = os.path.isfile(os.path.join(o_lx, "extra.pion"))
+    assert has_extra == expect_extra, f"10m-4 {tag_lx} extra.pion exists={has_extra}, expected {expect_extra}"
+    pkg_lx = os.path.join(root, f"pkg10m4_{tag_lx}")
+    os.makedirs(os.path.join(pkg_lx, "src"), exist_ok=True)
+    for fn in sorted(os.listdir(o_lx)):
+        if fn.endswith(".pion"):
+            shutil.copyfile(os.path.join(o_lx, fn), os.path.join(pkg_lx, "src", fn))
+    with open(os.path.join(pkg_lx, "pion.toml"), "w") as f:
+        f.write(f'[package]\nname = "e2e_10m4_{tag_lx}"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+    with open(os.path.join(pkg_lx, "src", "main.pion"), "w") as f:
+        f.write('pub fn main(world : World) -> Int {\n  io_println(world, sample().to_string())\n  0\n}\n')
+    run_cmd = [pionc, "run", "--target", "wasm32", pkg_lx] if shutil.which("node") else [pionc, "run", pkg_lx]
+    r_lx_run = subprocess.run(run_cmd, capture_output=True, text=True)
+    assert r_lx_run.returncode == 0, f"10m-4 {tag_lx} run failed: {r_lx_run.stdout} {r_lx_run.stderr}"
+    assert r_lx_run.stdout.strip() == expected_out, f"10m-4 {tag_lx} expected {expected_out!r}, got {r_lx_run.stdout!r}"
+
+s_lx_bad = os.path.join(root, "s10m4_bad")
+o_lx_bad = os.path.join(root, "o10m4_bad")
+os.makedirs(s_lx_bad, exist_ok=True)
+with open(os.path.join(s_lx_bad, "moon.pkg"), "w") as f:
+    f.write("options(targets: 123)\n")
+with open(os.path.join(s_lx_bad, "a.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+r_lx_bad = run_cli(["--src", s_lx_bad, "--out", o_lx_bad, "--target", "wasm32", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r_lx_bad.returncode == 1, f"10m-4 malformed targets must exit 1, got {r_lx_bad.returncode}"
+assert "MBT2PION_UNSUPPORTED_TARGET_RULE" in (r_lx_bad.stdout + r_lx_bad.stderr), "10m-4 missing MBT2PION_UNSUPPORTED_TARGET_RULE"
+
+print("[e2e] PASS: Final Astra P0 lexer-backed moon.pkg suite (10m-4: targets : / // comment / // } -> 21/22/21 + malformed 123 -> rc=1)")
+
 # 10n. Red-team P0 live native acceptance:
 #      extern "C" fn c_abs(x : Int) -> Int = "abs" + #cfg(target="js") js_only + #cfg(target="native") native_only + kept()
 #      -> publish --target native rc=0, 0 js_only, 4 exact dispositions, live `pionc run` prints `2`!
