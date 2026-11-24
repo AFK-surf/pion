@@ -81,6 +81,7 @@ instance : Pion.Eq Std.I64 := { toBEq := inferInstance }
 instance : Pion.Eq Std.U32 := { toBEq := inferInstance }
 instance : Pion.Eq Std.U64 := { toBEq := inferInstance }
 instance : Pion.Eq Std.U8 := { toBEq := inferInstance }
+instance : Pion.Eq Std.I8 := { toBEq := inferInstance }
 instance : Pion.Eq Bool := { toBEq := inferInstance }
 instance : Pion.Eq Char := { toBEq := inferInstance }
 instance : Pion.Eq String := { toBEq := inferInstance }
@@ -209,6 +210,34 @@ def rem (x y : Std.U8) : Result Std.U8 := x % y
 @[simp] def to_int64 (x : Std.U8) : Std.I64 := UScalar.hcast .I64 x
 end U8
 
+namespace I8
+@[simp] def add (x y : Std.I8) : Std.I8 := Std.I8.wrapping_add x y
+@[simp] def sub (x y : Std.I8) : Std.I8 := Std.I8.wrapping_sub x y
+@[simp] def mul (x y : Std.I8) : Std.I8 := Std.I8.wrapping_mul x y
+@[simp] def neg (x : Std.I8) : Std.I8 := ⟨-x.bv⟩
+@[simp] def band (x y : Std.I8) : Std.I8 := ⟨x.bv &&& y.bv⟩
+@[simp] def bor (x y : Std.I8) : Std.I8 := ⟨x.bv ||| y.bv⟩
+@[simp] def bxor (x y : Std.I8) : Std.I8 := ⟨x.bv ^^^ y.bv⟩
+def div (x y : Std.I8) : Result Std.I8 := x / y
+def rem (x y : Std.I8) : Result Std.I8 :=
+  if x.val = -128 ∧ y.val = -1 then fail integerOverflow else x % y
+def shl (x y : Std.I8) : Result Std.I8 :=
+  if 0 ≤ y.val ∧ y.val < 8 then ok ⟨x.bv <<< y.val.toNat⟩ else fail integerOverflow
+def shr (x y : Std.I8) : Result Std.I8 :=
+  if 0 ≤ y.val ∧ y.val < 8 then ok ⟨x.bv.sshiftRight y.val.toNat⟩ else fail integerOverflow
+def shl_i32 (x : Std.I8) (y : Std.I32) : Result Std.I8 :=
+  if 0 ≤ y.val ∧ y.val < 8 then ok ⟨x.bv <<< y.val.toNat⟩ else fail integerOverflow
+def shr_i32 (x : Std.I8) (y : Std.I32) : Result Std.I8 :=
+  if 0 ≤ y.val ∧ y.val < 8 then ok ⟨x.bv.sshiftRight y.val.toNat⟩ else fail integerOverflow
+@[simp] def abs (x : Std.I8) : Std.I8 := if x.val < 0 then neg x else x
+@[simp] def to_int8 (x : Std.I8) : Std.I8 := x
+@[simp] def to_int (x : Std.I8) : Std.I32 := IScalar.cast .I32 x
+@[simp] def to_int64 (x : Std.I8) : Std.I64 := IScalar.cast .I64 x
+@[simp] def to_uint (x : Std.I8) : Std.U32 := IScalar.hcast .U32 x
+@[simp] def to_uint64 (x : Std.I8) : Std.U64 := IScalar.hcast .U64 x
+@[simp] def to_byte (x : Std.I8) : Std.U8 := IScalar.hcast .U8 x
+end I8
+
 /-! ## Arrays
 
 `Array[T]`, `FixedArray[T]` and `Bytes` are values (Pion's `#verify` move /
@@ -317,8 +346,11 @@ def get (a : Pion.ImmArray α) (i : Std.I32) : Result α := listGet a.val i
 end ImmArray
 
 namespace Bytes
-/-- `Bytes::new(n)`: `n` zero bytes. -/
+/-- `Bytes::new(n)`: `n` zero bytes (pure form kept while `llbc.pion` emits `LPure`). -/
 @[simp] def new (n : Std.I32) : Pion.Bytes := ⟨listMake n (0#u8)⟩
+/-- Checked `Bytes::new(n)`: fails with `Error.panic` on `n < 0`, matching `pion_bytes_new`. -/
+def newChecked (n : Std.I32) : Result Pion.Bytes :=
+  if n.val < 0 then fail Error.panic else ok ⟨listMake n (0#u8)⟩
 def length (b : Pion.Bytes) : Result Std.I32 := lengthOf b.val.length
 def get (b : Pion.Bytes) (i : Std.I32) : Result Std.U8 := listGet b.val i
 def set (b : Pion.Bytes) (i : Std.I32) (x : Std.U8) : Result Pion.Bytes := do
@@ -371,7 +403,9 @@ def bytesOfString (s : _root_.String) : List Std.U8 :=
 @[simp] def clear (_ : Pion.StringBuilder) : Pion.StringBuilder := ⟨[]⟩
 def length (sb : Pion.StringBuilder) : Result Std.I32 := lengthOf sb.val.length
 def to_string (sb : Pion.StringBuilder) : _root_.String :=
-  _root_.String.fromUTF8! ⟨(sb.val.map byteOfU8).toArray⟩
+  match _root_.String.fromUTF8? ⟨(sb.val.map byteOfU8).toArray⟩ with
+  | some s => s
+  | none => ""
 end StringBuilder
 
 /-! ## Map -/

@@ -550,6 +550,65 @@ theorem u64_rem_ok (x y : BitVec 64) (h0 : y ≠ 0) :
 theorem i64_reinterpret (p : BitVec 64) : Pion.I64.reinterpret_as_uint64 ⟨p⟩ = ⟨p⟩ := by
   simp [Pion.I64.reinterpret_as_uint64, IScalar.hcast]
 
+private def clsBitsI : Cls → Std.I32
+  | .W => 32#i32
+  | .L => 64#i32
+
+private def clsBitsN : Cls → Nat
+  | .W => 32
+  | .L => 64
+
+private theorem cls_bits_spec (c : Cls) : cls_bits c = ok (clsBitsI c) := by
+  cases c <;> rfl
+
+private theorem saI_eq_zero_iff (c : Cls) (b : Std.U64) :
+    saI c b = 0#i32 ↔ shAmt c b.bv = 0 := by
+  constructor
+  · intro h
+    have hv := congrArg (·.val) h
+    rw [saI_val] at hv
+    change (shAmt c b.bv : Int) = 0 at hv
+    omega
+  · intro h
+    cases hs : saI c b with
+    | mk bv =>
+      have hv : bv.toInt = 0 := by
+        have h1 := saI_val c b
+        rw [hs] at h1
+        simpa [IScalar.val, h] using h1
+      congr 1
+      apply BitVec.eq_of_toInt_eq
+      exact hv
+
+private theorem shl_wsub_sa (c : Cls) (a b : Std.U64) (hs : shAmt c b.bv ≠ 0) :
+    Pion.U64.shl_i32 a (Pion.I32.sub (clsBitsI c) (saI c b)) =
+      ok ⟨a.bv <<< (clsBitsN c - shAmt c b.bv)⟩ := by
+  have hval : (Pion.I32.sub (clsBitsI c) (saI c b)).val =
+      (clsBitsN c - shAmt c b.bv : Nat) := by
+    cases c
+    · have hlt : shAmt .W b.bv < 32 := Nat.mod_lt _ (by norm_num)
+      have hv := saI_val .W b
+      simp only [clsBitsI, clsBitsN, Pion.I32.sub, IScalar.val, Std.I32.wrapping_sub_bv_eq]
+      rw [BitVec.toInt_sub]
+      have h32 : (32#i32 : Std.I32).bv.toInt = 32 := rfl
+      have hsb : (saI .W b).bv.toInt = (shAmt .W b.bv : Int) := hv
+      rw [h32, hsb, Int.bmod_eq_of_le (by simp [IScalarTy.numBits]; omega) (by simp [IScalarTy.numBits]; omega)]
+      omega
+    · have hlt : shAmt .L b.bv < 64 := Nat.mod_lt _ (by norm_num)
+      have hv := saI_val .L b
+      simp only [clsBitsI, clsBitsN, Pion.I32.sub, IScalar.val, Std.I32.wrapping_sub_bv_eq]
+      rw [BitVec.toInt_sub]
+      have h64 : (64#i32 : Std.I32).bv.toInt = 64 := rfl
+      have hsb : (saI .L b).bv.toInt = (shAmt .L b.bv : Int) := hv
+      rw [h64, hsb, Int.bmod_eq_of_le (by simp [IScalarTy.numBits]; omega) (by simp [IScalarTy.numBits]; omega)]
+      omega
+  simp only [Pion.U64.shl_i32, hval]
+  have hlt : clsBitsN c - shAmt c b.bv < 64 := by
+    cases c <;> simp only [clsBitsN, shAmt] at hs ⊢ <;> omega
+  have hc : (0 : Int) ≤ ((clsBitsN c - shAmt c b.bv : Nat) : Int) ∧
+      ((clsBitsN c - shAmt c b.bv : Nat) : Int) < 64 := by omega
+  simp only [hc.1, hc.2, and_self, ↓reduceIte, Int.toNat_natCast]
+
 /-- `eval_bin_const` computes `evalBin` (`none` exactly on a trapping division). -/
 theorem eval_bin_const_sound (cls : Cls) (op : BinOp) (a b : Std.U64) :
     eval_bin_const cls op a b = ok ((evalBin cls op a.bv b.bv).map (fun x => (⟨x⟩ : Std.U64))) := by
@@ -563,9 +622,12 @@ theorem eval_bin_const_sound (cls : Cls) (op : BinOp) (a b : Std.U64) :
   case Sar => rw [sar_sa]; simp [i64_reinterpret]
   case Ror =>
     by_cases hs : shAmt cls b.bv = 0
-    · simp [hs]
-    · simp only [hs, ↓reduceIte]
-      cases cls <;> simp_all [shl_sa, shr_sa]
+    · have h0 : saI cls b = 0#i32 := (saI_eq_zero_iff cls b).2 hs
+      simp only [hs, h0, ↓reduceIte, Option.map_some]
+    · have h0 : saI cls b ≠ 0#i32 := fun h => hs ((saI_eq_zero_iff cls b).1 h)
+      simp only [hs, h0, ↓reduceIte, shr_sa, cls_bits_spec, bind_ok]
+      rw [shl_wsub_sa cls ⟨maskC cls a.bv⟩ b hs]
+      cases cls <;> simp only [clsBitsN, bind_ok, Pion.U64.bor, u64_mk_bv, Option.map_some]
   case Div =>
     by_cases hs : safeDiv cls .Div (maskC cls a.bv) (maskC cls b.bv)
     · simp only [hs, decide_true, ↓reduceIte]

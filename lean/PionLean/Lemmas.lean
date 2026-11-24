@@ -126,6 +126,39 @@ namespace Pion
   unfold U64.rem
   exact Std.U64.rem_spec x hnz
 
+@[step] theorem I8.div_spec {x y : Std.I8} (hnz : y.val ≠ 0)
+    (hNoOverflow : ¬ (x.val = -128 ∧ y.val = -1)) :
+    I8.div x y ⦃ z => z.val = Int.tdiv x.val y.val ⦄ := by
+  unfold I8.div
+  exact Std.I8.div_spec hnz (by simpa [Std.I8.min_eq] using hNoOverflow)
+
+@[step] theorem I8.rem_spec {x y : Std.I8} (hnz : y.val ≠ 0)
+    (hNoOverflow : ¬ (x.val = -128 ∧ y.val = -1)) :
+    I8.rem x y ⦃ z => z.val = Int.tmod x.val y.val ⦄ := by
+  unfold I8.rem
+  simp only [hNoOverflow, ite_false]
+  exact Std.I8.rem_spec x hnz
+
+@[step] theorem I8.shl_spec (x : Std.I8) {y : Std.I8} (h0 : 0 ≤ y.val) (h1 : y.val < 8) :
+    I8.shl x y ⦃ z => z.bv = x.bv <<< y.val.toNat ⦄ := by
+  unfold I8.shl
+  simp [h0, h1]
+
+@[step] theorem I8.shr_spec (x : Std.I8) {y : Std.I8} (h0 : 0 ≤ y.val) (h1 : y.val < 8) :
+    I8.shr x y ⦃ z => z.bv = x.bv.sshiftRight y.val.toNat ⦄ := by
+  unfold I8.shr
+  simp [h0, h1]
+
+@[step] theorem I8.shl_i32_spec (x : Std.I8) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 8) :
+    I8.shl_i32 x y ⦃ z => z.bv = x.bv <<< y.val.toNat ⦄ := by
+  unfold I8.shl_i32
+  simp [h0, h1]
+
+@[step] theorem I8.shr_i32_spec (x : Std.I8) {y : Std.I32} (h0 : 0 ≤ y.val) (h1 : y.val < 8) :
+    I8.shr_i32 x y ⦃ z => z.bv = x.bv.sshiftRight y.val.toNat ⦄ := by
+  unfold I8.shr_i32
+  simp [h0, h1]
+
 /-! ## Containers -/
 
 @[step] theorem lengthOf_spec (n : Nat) (h : n ≤ 2147483647) :
@@ -201,6 +234,17 @@ namespace Pion
   unfold ImmArray.get
   exact listGet_spec _ _ h0 h1
 
+@[step] theorem Bytes.newChecked_spec (n : Std.I32) (h0 : 0 ≤ n.val) :
+    Bytes.newChecked n ⦃ b => b.val = List.replicate n.val.toNat (0#u8) ⦄ := by
+  unfold Bytes.newChecked listMake
+  have hnot : ¬ n.val < 0 := by omega
+  simp [hnot]
+
+theorem Bytes.newChecked_neg (n : Std.I32) (hneg : n.val < 0) :
+    Bytes.newChecked n = fail Error.panic := by
+  unfold Bytes.newChecked
+  simp [hneg]
+
 @[step] theorem debugAssert_spec (b : Bool) (h : b = true) :
     debugAssert b ⦃ _ => True ⦄ := by
   unfold debugAssert
@@ -266,7 +310,7 @@ theorem StringBuilder.to_string_write_string (s : _root_.String) :
     cases h : s.toUTF8 with
     | mk data => simp
   rw [hba]
-  unfold _root_.String.fromUTF8! _root_.String.fromUTF8 _root_.String.toUTF8
+  unfold _root_.String.fromUTF8? _root_.String.fromUTF8 _root_.String.toUTF8
   simp [s.isValidUTF8]
 
 /-! ## Map lemmas -/
