@@ -14,7 +14,7 @@ set -eu
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-PIONC="${PIONC:-$HOME/.pion/bin/pionc}"
+PIONC="${1:-${PIONC:-$HOME/.pion/bin/pionc}}"
 if [ ! -x "$PIONC" ]; then
   PIONC="$(command -v pionc)"
 fi
@@ -26,32 +26,8 @@ BIN="$WORK/mbt2pion"
 echo "[e2e] building mbt2pion CLI with $PIONC..."
 "$PIONC" build "$REPO_ROOT/tools/mbt2pion_cli" -o "$BIN"
 
-# Minimal public-safe `mbt_compat` stub package matching M1.1-Compat canonical symbol names 1:1
-COMPAT_DIR="$WORK/mbt_compat"
-mkdir -p "$COMPAT_DIR/src"
-cat > "$COMPAT_DIR/pion.toml" << 'EOF'
-[package]
-name = "mbt_compat"
-version = "0.1.0"
-EOF
-cat > "$COMPAT_DIR/src/compat.pion" << 'EOF'
-pub fn utf16_len(s : String) -> Int { s.length() }
-pub fn utf16_code_unit_at(s : String, i : Int) -> Int { s.code_unit_at(i) }
-pub fn utf16_to_utf8_off(_s : String, n : Int) -> Int { n }
-pub fn utf8_to_utf16_off(_s : String, n : Int) -> Int { n }
-pub fn utf16_to_scalar_off(_s : String, n : Int) -> Int { n }
-pub fn scalar_to_utf16_off(_s : String, n : Int) -> Int { n }
-pub fn double_to_string(d : Double) -> String { d.to_string() }
-pub fn div_checked_i32(a : Int, b : Int) -> Int { if b == 0 { panic("div0") }; a / b }
-pub fn mod_checked_i32(a : Int, b : Int) -> Int { if b == 0 { panic("mod0") }; a % b }
-pub fn div_checked_i64(a : Int64, b : Int64) -> Int64 { if b == 0L { panic("div0") }; a / b }
-pub fn mod_checked_i64(a : Int64, b : Int64) -> Int64 { if b == 0L { panic("mod0") }; a % b }
-pub fn trap_div_zero() -> Int { panic("integer division by zero") }
-pub fn trap_rem_zero() -> Int { panic("integer remainder by zero") }
-pub fn array_slice_clamp[T](xs : Array[T], _lo : Int, _hi : Int) -> Array[T] { xs }
-pub struct OrderedMap[K, V] { entries : Array[(K, V)] }
-pub fn ordered_map_from_array[K, V](entries : Array[(K, V)]) -> OrderedMap[K, V] { OrderedMap::{ entries: entries } }
-EOF
+# Link directly against the real repository `tools/mbt_compat` package (no stub!).
+COMPAT_DIR="$REPO_ROOT/tools/mbt_compat"
 
 # -----------------------------------------------------------------------------
 # Test 1 + 2 + 3: Golden, pionc check, pionc run, idempotency, dual clean paths
@@ -134,6 +110,18 @@ pub fn probe_demo(h : Holder, s : String, arr : Array[Int], a : Int, b : Int, d 
   same_line + chained + q + fast
 }
 
+pub fn fmt_double_demo(d : Double) -> String {
+  d.to_string()
+}
+
+pub fn utf16_len_demo(s : String) -> Int {
+  s.length()
+}
+
+pub fn str_cmp_demo(a : String, b : String) -> Int {
+  a.compare(b)
+}
+
 let first_val : Int = read_second() + 1
 
 fn read_second() -> Int {
@@ -213,12 +201,21 @@ pub fn main(_w : World) -> Int {
   let out_items = cascade_demo(h, 5)
   if out_items.length() != 3 { panic("chained cascade") }
   if probe_demo(h, "hi", [1, 2, 3], 10, 2, 1.5) != 19 { panic("probe_demo runtime") }
+  // Real mbt_compat behavioral assertions (cannot be satisfied by a trivial stub!):
+  if utf16_len_demo("A中😀B") != 5 { panic("real mbt_compat utf16_len") }
+  if fmt_double_demo(0.00000015) != "1.5e-7" { panic("real mbt_compat double_to_string") }
+  if str_cmp_demo("k9", "alpha") >= 0 { panic("real mbt_compat str_compare") }
   0
 }
 EOF
 "$PIONC" check --json "$PKG_CHK"
 "$PIONC" run "$PKG_CHK"
-echo "[e2e] PASS: generated golden package passes pionc check --json AND live pionc run behavioral assertions"
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" run --target wasm32 "$PKG_CHK"
+  echo "[e2e] PASS: generated golden package passes pionc check --json, native pionc run, AND wasm32 pionc run against real tools/mbt_compat"
+else
+  echo "[e2e] PASS: generated golden package passes pionc check --json AND live pionc run against real tools/mbt_compat"
+fi
 
 # -----------------------------------------------------------------------------
 # Test 4: Project-agnostic proof (no-map AND alternate-namespace `acme` fixture)

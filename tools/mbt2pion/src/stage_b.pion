@@ -4,8 +4,7 @@
 ///| aligned 1:1 with `tools/mbt_compat` canonical symbol names:
 ///| 1. Missing builtin methods -> `mbt_compat::arr_*` / `opt_*` / `str_*` / `ordered_map_*`
 ///| 2. Token-precise numeric literal coercions using `d.col` + lexer tokens (never appends to EOL!)
-///| 3. `for k, v in map` -> `.to_array()`, `for c in s` -> `mbt_compat::str_scalars(s)`,
-///|    `for i, c in s` -> `mbt_compat::str_iter_scalar_indexed(s)`
+///| 3. `for k, v in map` -> `.to_array()`, `for c in s` / `for i, c in s` -> `mbt_compat::str_scalars(s)`
 ///| 4. `api_map.json` 2-argument unit-annotated boundary conversions (`mbt_compat::utf16_to_utf8_off(s, off)`,
 ///|    `mbt_compat::utf16_to_scalar_off(s, off)`, hard-failing if `str_param` is missing!) &
 ///|    `OrderedMap` <-> `Map` boundary conversions (`ordered_map_to_map` / `ordered_map_from_map`).
@@ -24,6 +23,7 @@ pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) 
     if method_name == "remove" { return Some("mbt_compat::arr_remove") }
     if method_name == "sort_by" { return Some("mbt_compat::arr_sort_by") }
     if method_name == "append" { return Some("mbt_compat::arr_append") }
+    if method_name == "to_array" { return Some("mbt_compat::arr_to_array") }
   }
   if receiver_ty.starts_with("Option[") {
     if method_name == "map" { return Some("mbt_compat::opt_map") }
@@ -35,9 +35,12 @@ pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) 
     if method_name == "has_prefix" { return Some("mbt_compat::str_has_prefix") }
     if method_name == "has_suffix" { return Some("mbt_compat::str_has_suffix") }
     if method_name == "to_lower" { return Some("mbt_compat::str_to_lower") }
+    if method_name == "to_upper" { return Some("mbt_compat::str_to_upper") }
+    if method_name == "compare" { return Some("mbt_compat::str_compare") }
+    if method_name == "to_owned" { return Some("mbt_compat::str_to_owned") }
     if method_name == "iter" { return Some("mbt_compat::str_scalars") }
   }
-  if receiver_ty.starts_with("Map[") || receiver_ty.starts_with("mbt_compat::OrderedMap[") {
+  if receiver_ty.starts_with("OrderedMap[") || receiver_ty.starts_with("mbt_compat::OrderedMap[") {
     if method_name == "size" { return Some("mbt_compat::ordered_map_size") }
     if method_name == "each" { return Some("mbt_compat::ordered_map_each") }
     if method_name == "iter" { return Some("mbt_compat::ordered_map_iter") }
@@ -72,6 +75,7 @@ fn parse_unknown_method_msg(msg : String) -> Option[(String, String)] {
 }
 
 ///| Rewrite a single line for a missing method `recv.m(args)` -> `helper(recv, args)`.
+///| Supports both simple identifiers and complex/chained receivers like `pkg::fn(a, b).m()` or `arr[i].m()`.
 fn rewrite_method_call_on_line(line_text : String, method_name : String, helper : String) -> Option[String] {
   let needle = "." + method_name + "("
   let dot_idx = line_text.index_of(needle)
@@ -79,9 +83,31 @@ fn rewrite_method_call_on_line(line_text : String, method_name : String, helper 
     return None
   }
   let mut recv_start = dot_idx - 1
+  let mut paren_d = 0
+  let mut brack_d = 0
   while recv_start >= 0 {
     let c = line_text.code_unit_at(recv_start)
-    if is_alnum(c) || c == 95 || c == 46 {
+    if c == 41 {
+      paren_d = paren_d + 1
+      recv_start = recv_start - 1
+    } else if c == 40 {
+      if paren_d == 0 {
+        break
+      }
+      paren_d = paren_d - 1
+      recv_start = recv_start - 1
+    } else if c == 93 {
+      brack_d = brack_d + 1
+      recv_start = recv_start - 1
+    } else if c == 91 {
+      if brack_d == 0 {
+        break
+      }
+      brack_d = brack_d - 1
+      recv_start = recv_start - 1
+    } else if paren_d > 0 || brack_d > 0 {
+      recv_start = recv_start - 1
+    } else if is_alnum(c) || c == 95 || c == 46 || c == 58 {
       recv_start = recv_start - 1
     } else {
       break
@@ -361,6 +387,18 @@ pub fn run_stage_b(
                 Some(new_ln) => {
                   lines[lidx] = new_ln
                   file_changed = true
+                  if helper == "mbt_compat::str_compare" {
+                    drift_ledger.push(DriftEntry::{
+                      category: "string_compare",
+                      file: f.rel_path,
+                      line: d.line,
+                      col: d.col,
+                      expr: mname,
+                      resolution: helper,
+                      status: "resolved",
+                      detail: "String::compare routed to MoonBit UTF-16 length-first comparison",
+                    })
+                  }
                 }
                 None => ()
               }
@@ -394,22 +432,47 @@ pub fn run_stage_b(
               None => ()
             }
           }
-          // 3. `for ... in` on `OrderedMap` -> `.to_array()`, or `String` -> `str_scalars` / `str_iter_scalar_indexed`
+          // 4. Stage A lowered `s[a:b]` to `mbt_compat::array_slice_clamp(s, a, b)`; when `s` is `String`, route to `mbt_compat::utf16_slice`.
+          if d.found == "String" && str_has(ln, "mbt_compat::array_slice_clamp(") {
+            lines[lidx] = str_replace_all(ln, "mbt_compat::array_slice_clamp(", "mbt_compat::utf16_slice(")
+            file_changed = true
+            drift_ledger.push(DriftEntry::{
+              category: "string_utf16_slice",
+              file: f.rel_path,
+              line: d.line,
+              col: d.col,
+              expr: "s[a:b]",
+              resolution: "mbt_compat::utf16_slice",
+              status: "resolved",
+              detail: "String slice routed to UTF-16 clamped slice",
+            })
+          }
+          // 3. `for ... in` on `OrderedMap` -> `.to_array()`, or `String` -> `str_scalars`
           if str_has(d.message, "`for ... in` requires an `Array[T]`") {
             let in_idx = ln.index_of(" in ")
             let lb_idx = ln.index_of(" {")
             if in_idx > 0 && lb_idx > in_idx {
               let iter_expr = ln.slice(in_idx + 4, lb_idx).trim()
               let binders = ln.slice(0, in_idx)
-              if d.found.starts_with("Map[") || d.found.starts_with("mbt_compat::OrderedMap[") {
-                lines[lidx] = ln.slice(0, in_idx + 4) + iter_expr + ".to_array()" + ln.slice(lb_idx, ln.length())
+              if d.found.starts_with("Map[") || d.found.starts_with("OrderedMap[") || d.found.starts_with("mbt_compat::OrderedMap[") {
+                let for_idx = binders.index_of("for ")
+                if for_idx >= 0 {
+                  let prefix = binders.slice(0, for_idx)
+                  let vars_str = binders.slice(for_idx + 4, binders.length()).trim()
+                  let comma_idx = vars_str.index_of(",")
+                  if comma_idx >= 0 {
+                    let k_var = vars_str.slice(0, comma_idx).trim()
+                    let v_var = vars_str.slice(comma_idx + 1, vars_str.length()).trim()
+                    lines[lidx] = prefix + "for __mbt_kv in " + iter_expr + ".to_array() { let " + k_var + " = __mbt_kv.0; let " + v_var + " = __mbt_kv.1" + ln.slice(lb_idx + 2, ln.length())
+                  } else {
+                    lines[lidx] = prefix + "for __mbt_kv in " + iter_expr + ".to_array() { let " + vars_str + " = __mbt_kv.0" + ln.slice(lb_idx + 2, ln.length())
+                  }
+                } else {
+                  lines[lidx] = ln.slice(0, in_idx + 4) + iter_expr + ".to_array()" + ln.slice(lb_idx, ln.length())
+                }
                 file_changed = true
               } else if d.found == "String" {
-                let helper = if str_has(binders, ",") {
-                  "mbt_compat::str_iter_scalar_indexed"
-                } else {
-                  "mbt_compat::str_scalars"
-                }
+                let helper = "mbt_compat::str_scalars"
                 lines[lidx] = ln.slice(0, in_idx + 4) + helper + "(" + iter_expr + ")" + ln.slice(lb_idx, ln.length())
                 file_changed = true
               }
