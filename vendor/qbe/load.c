@@ -38,7 +38,6 @@ struct Insert {
 };
 
 static Fn *curf;
-static uint inum;    /* current insertion number */
 static Insert *ilog; /* global insertion log */
 static uint nlog;    /* number of entries in the log */
 
@@ -74,7 +73,7 @@ iins(int cls, int op, Ref a0, Ref a1, Loc *l)
 	vgrow(&ilog, ++nlog);
 	ist = &ilog[nlog-1];
 	ist->isphi = 0;
-	ist->num = inum++;
+	ist->num = nlog - 1;
 	ist->bid = l->blk->id;
 	ist->off = l->off;
 	ist->new.ins = (Ins){op, cls, R, {a0, a1}};
@@ -395,6 +394,7 @@ def(Slice sl, bits msk, Blk *b, Ins *i, Loc *il)
 	vgrow(&ilog, ++nlog);
 	ist = &ilog[nlog-1];
 	ist->isphi = 1;
+	ist->num = nlog - 1;
 	ist->bid = b->id;
 	ist->new.phi.m = sl;
 	ist->new.phi.p = p;
@@ -429,21 +429,16 @@ static int
 icmp(const void *pa, const void *pb)
 {
 	Insert *a, *b;
-	int c;
 
 	a = (Insert *)pa;
 	b = (Insert *)pb;
-	if ((c = a->bid - b->bid))
-		return c;
-	if (a->isphi && b->isphi)
-		return 0;
-	if (a->isphi)
-		return -1;
-	if (b->isphi)
-		return +1;
-	if ((c = a->off - b->off))
-		return c;
-	return a->num - b->num;
+	if (a->bid != b->bid)
+		return (a->bid > b->bid) - (a->bid < b->bid);
+	if (a->isphi != b->isphi)
+		return a->isphi ? -1 : +1;
+	if (!a->isphi && a->off != b->off)
+		return (a->off > b->off) - (a->off < b->off);
+	return (a->num > b->num) - (a->num < b->num);
 }
 
 /* require rpo ssa alias */
@@ -461,7 +456,6 @@ loadopt(Fn *fn)
 	curf = fn;
 	ilog = vnew(0, sizeof ilog[0], PHeap);
 	nlog = 0;
-	inum = 0;
 	for (b=fn->start; b; b=b->link)
 		for (i=b->ins; i<&b->ins[b->nins]; ++i) {
 			if (!isload(i->op))

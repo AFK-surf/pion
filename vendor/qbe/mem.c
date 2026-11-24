@@ -192,7 +192,9 @@ scmp(const void *pa, const void *pb)
 	a = (Slot *)pa, b = (Slot *)pb;
 	if (a->sz != b->sz)
 		return b->sz - a->sz;
-	return a->r.a - b->r.a;
+	if (a->r.a != b->r.a)
+		return a->r.a - b->r.a;
+	return (a->t > b->t) - (a->t < b->t);
 }
 
 static void

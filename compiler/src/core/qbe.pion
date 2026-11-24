@@ -6417,6 +6417,576 @@ fn qbe_stmts_mentions_ident(stmts : Array[Stmt], name : String) -> Bool {
 }
 
 ///|
+fn qbe_is_data_ptr_builtin(name : String) -> Bool {
+  name == "str_data_ptr" ||
+  name == "bytes_data_ptr" ||
+  name == "array_data_ptr" ||
+  name == "fixed_array_data_ptr"
+}
+
+///|
+fn qbe_data_ptr_root_ident(e : Expr) -> String {
+  match e {
+    EIdent(n, _) => n
+    EField(base, _, _) => qbe_data_ptr_root_ident(base)
+    _ => ""
+  }
+}
+
+///|
+fn qbe_expr_is_binds_name(e : Expr, name : String) -> Bool {
+  match e {
+    EIs(_, pat, _) => qbe_pat_binds_name(pat, name)
+    EBinary(op, l, r, _) =>
+      if op == "&&" {
+        qbe_expr_is_binds_name(l, name) || qbe_expr_is_binds_name(r, name)
+      } else {
+        false
+      }
+    _ => false
+  }
+}
+
+///|
+/// Shadowing-aware static prescan: returns true if `e` (at any nesting depth)
+/// contains `*_data_ptr(<root>)` referring to the outer binding `name`
+/// (without being shadowed by an inner binding of the same name).
+fn qbe_expr_takes_data_ptr(e : Expr, name : String) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => false
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | EField(inner, _, _)
+    | ETry(inner, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _)
+    | EIs(inner, _, _) => qbe_expr_takes_data_ptr(inner, name)
+    EBinary(op, l, r, _) =>
+      if op == "&&" {
+        qbe_expr_takes_data_ptr(l, name) ||
+        (!qbe_expr_is_binds_name(l, name) && qbe_expr_takes_data_ptr(r, name))
+      } else {
+        qbe_expr_takes_data_ptr(l, name) || qbe_expr_takes_data_ptr(r, name)
+      }
+    EIndex(l, r, _) | EScope(l, r, _) | ESpawn(l, r, _) =>
+      qbe_expr_takes_data_ptr(l, name) || qbe_expr_takes_data_ptr(r, name)
+    ECall(callee, args, _) => {
+      match callee {
+        EIdent(fname, _) =>
+          if qbe_is_data_ptr_builtin(fname) && args.length() >= 1 {
+            if qbe_data_ptr_root_ident(args[0]) == name {
+              return true
+            }
+          }
+        _ => ()
+      }
+      if qbe_expr_takes_data_ptr(callee, name) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_takes_data_ptr(args[i], name) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EMethodCall(obj, _, args, _) => {
+      if qbe_expr_takes_data_ptr(obj, name) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_takes_data_ptr(args[i], name) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) | EDotVariant(_, elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_expr_takes_data_ptr(elems[i], name) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(b) => if qbe_expr_takes_data_ptr(b, name) { return true }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_expr_takes_data_ptr(fields[i].value, name) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) => qbe_stmts_tail_takes_data_ptr(stmts, 0, name)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if qbe_expr_takes_data_ptr(cond, name) {
+        return true
+      }
+      if !qbe_expr_is_binds_name(cond, name) &&
+        qbe_stmts_tail_takes_data_ptr(then_stmts, 0, name) {
+        return true
+      }
+      match else_opt {
+        None => false
+        Some(el) => qbe_expr_takes_data_ptr(el, name)
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      if qbe_expr_takes_data_ptr(scrut, name) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        if !qbe_pat_binds_name(arms[i].pat, name) {
+          match arms[i].guard_expr {
+            Some(ge) =>
+              if qbe_expr_takes_data_ptr(ge, name) {
+                return true
+              }
+            None => ()
+          }
+          if qbe_expr_takes_data_ptr(arms[i].body, name) {
+            return true
+          }
+        }
+        i = i + 1
+      }
+      false
+    }
+    EClosure(params, _, body, _) => {
+      let mut pi = 0
+      while pi < params.length() {
+        if params[pi].name == name {
+          return false
+        }
+        pi = pi + 1
+      }
+      qbe_stmts_tail_takes_data_ptr(body, 0, name)
+    }
+  }
+}
+
+///|
+fn qbe_stmt_takes_data_ptr(s : Stmt, name : String) -> Bool {
+  match s {
+    SLet(_, _, _, init, _) => qbe_expr_takes_data_ptr(init, name)
+    SLetTuple(_, _, init, _) => qbe_expr_takes_data_ptr(init, name)
+    SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+      qbe_expr_takes_data_ptr(lhs, name) || qbe_expr_takes_data_ptr(rhs, name)
+    SGuard(cond, body, _) =>
+      qbe_expr_takes_data_ptr(cond, name) ||
+      qbe_stmts_tail_takes_data_ptr(body, 0, name)
+    SWhile(cond, body, _) =>
+      qbe_expr_takes_data_ptr(cond, name) ||
+      (!qbe_expr_is_binds_name(cond, name) &&
+        qbe_stmts_tail_takes_data_ptr(body, 0, name))
+    SFor(init_s, cond, step_s, body, _) => {
+      if qbe_stmt_takes_data_ptr(init_s, name) {
+        return true
+      }
+      let shadowed = match init_s {
+        SLet(n2, _, _, _, _) => n2 == name
+        SLetTuple(ns2, _, _, _) => str_arr_contains(ns2, name)
+        _ => false
+      }
+      if shadowed {
+        return false
+      }
+      qbe_expr_takes_data_ptr(cond, name) ||
+      qbe_stmt_takes_data_ptr(step_s, name) ||
+      qbe_stmts_tail_takes_data_ptr(body, 0, name)
+    }
+    SForRange(ivar, start_e, end_e, _, body, _) =>
+      qbe_expr_takes_data_ptr(start_e, name) ||
+      qbe_expr_takes_data_ptr(end_e, name) ||
+      (ivar != name && qbe_stmts_tail_takes_data_ptr(body, 0, name))
+    SForIn(iv, ev, iter_e, body, _) =>
+      qbe_expr_takes_data_ptr(iter_e, name) ||
+      (iv != name && ev != name && qbe_stmts_tail_takes_data_ptr(body, 0, name))
+    SReturn(opt, _) =>
+      match opt {
+        None => false
+        Some(e) => qbe_expr_takes_data_ptr(e, name)
+      }
+    SBreak(_) | SContinue(_) => false
+    SDebugAssert(c, m, _) =>
+      qbe_expr_takes_data_ptr(c, name) || qbe_expr_takes_data_ptr(m, name)
+    SExpr(e, _) => qbe_expr_takes_data_ptr(e, name)
+  }
+}
+
+///|
+fn qbe_stmts_tail_takes_data_ptr(
+  stmts : Array[Stmt],
+  start_idx : Int,
+  name : String,
+) -> Bool {
+  let mut i = start_idx
+  while i < stmts.length() {
+    let s = stmts[i]
+    if qbe_stmt_takes_data_ptr(s, name) {
+      return true
+    }
+    match s {
+      SLet(n2, _, _, _, _) => if n2 == name { return false }
+      SLetTuple(ns2, _, _, _) => if str_arr_contains(ns2, name) { return false }
+      SGuard(cond, _, _) => if qbe_expr_is_binds_name(cond, name) { return false }
+      _ => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// Fast O(N) block-level pre-check: returns true only if `e` contains any
+/// `*_data_ptr(...)` call at any nesting depth. Lets `qbe_emit_stmts` skip
+/// per-binding `qbe_stmts_tail_takes_data_ptr` scans in 99.9% of blocks.
+fn qbe_expr_has_any_data_ptr(e : Expr) -> Bool {
+  match e {
+    EInt(_, _)
+    | EInt64(_, _)
+    | EUInt(_, _)
+    | EUInt64(_, _)
+    | EDouble(_, _)
+    | EFloat(_, _)
+    | EBool(_, _)
+    | EByte(_, _)
+    | EChar(_, _)
+    | EString(_, _)
+    | EIdent(_, _)
+    | EPath(_, _, _)
+    | EUnit(_) => false
+    EUnary(_, inner, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | EField(inner, _, _)
+    | ETry(inner, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _)
+    | EIs(inner, _, _) => qbe_expr_has_any_data_ptr(inner)
+    EBinary(_, l, r, _)
+    | EIndex(l, r, _)
+    | EScope(l, r, _)
+    | ESpawn(l, r, _) =>
+      qbe_expr_has_any_data_ptr(l) || qbe_expr_has_any_data_ptr(r)
+    ECall(callee, args, _) => {
+      match callee {
+        EIdent(fname, _) =>
+          if qbe_is_data_ptr_builtin(fname) {
+            return true
+          }
+        _ => ()
+      }
+      if qbe_expr_has_any_data_ptr(callee) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_any_data_ptr(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EMethodCall(obj, _, args, _) => {
+      if qbe_expr_has_any_data_ptr(obj) {
+        return true
+      }
+      let mut i = 0
+      while i < args.length() {
+        if qbe_expr_has_any_data_ptr(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) | EDotVariant(_, elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_expr_has_any_data_ptr(elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(b) => if qbe_expr_has_any_data_ptr(b) { return true }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_expr_has_any_data_ptr(fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) => qbe_stmts_has_any_data_ptr(stmts)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if qbe_expr_has_any_data_ptr(cond) || qbe_stmts_has_any_data_ptr(then_stmts) {
+        return true
+      }
+      match else_opt {
+        None => false
+        Some(el) => qbe_expr_has_any_data_ptr(el)
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      if qbe_expr_has_any_data_ptr(scrut) {
+        return true
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) => if qbe_expr_has_any_data_ptr(ge) { return true }
+          None => ()
+        }
+        if qbe_expr_has_any_data_ptr(arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EClosure(_, _, body, _) => qbe_stmts_has_any_data_ptr(body)
+  }
+}
+
+///|
+fn qbe_stmt_has_any_data_ptr(s : Stmt) -> Bool {
+  match s {
+    SLet(_, _, _, init, _) => qbe_expr_has_any_data_ptr(init)
+    SLetTuple(_, _, init, _) => qbe_expr_has_any_data_ptr(init)
+    SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+      qbe_expr_has_any_data_ptr(lhs) || qbe_expr_has_any_data_ptr(rhs)
+    SGuard(cond, body, _) | SWhile(cond, body, _) =>
+      qbe_expr_has_any_data_ptr(cond) || qbe_stmts_has_any_data_ptr(body)
+    SFor(init_s, cond, step_s, body, _) =>
+      qbe_stmt_has_any_data_ptr(init_s) ||
+      qbe_expr_has_any_data_ptr(cond) ||
+      qbe_stmt_has_any_data_ptr(step_s) ||
+      qbe_stmts_has_any_data_ptr(body)
+    SForRange(_, start_e, end_e, _, body, _) =>
+      qbe_expr_has_any_data_ptr(start_e) ||
+      qbe_expr_has_any_data_ptr(end_e) ||
+      qbe_stmts_has_any_data_ptr(body)
+    SForIn(_, _, iter_e, body, _) =>
+      qbe_expr_has_any_data_ptr(iter_e) || qbe_stmts_has_any_data_ptr(body)
+    SReturn(opt, _) =>
+      match opt {
+        None => false
+        Some(e) => qbe_expr_has_any_data_ptr(e)
+      }
+    SBreak(_) | SContinue(_) => false
+    SDebugAssert(c, m, _) =>
+      qbe_expr_has_any_data_ptr(c) || qbe_expr_has_any_data_ptr(m)
+    SExpr(e, _) => qbe_expr_has_any_data_ptr(e)
+  }
+}
+
+///|
+fn qbe_stmts_has_any_data_ptr(stmts : Array[Stmt]) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if qbe_stmt_has_any_data_ptr(stmts[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn qbe_collect_pat_bindings(pat : Pattern, out : Array[String]) -> Unit {
+  match pat {
+    PIdent(name, _) => if name != "_" { out.push(name) }
+    PTuple(subs, _) | PVariant(_, _, subs, _) => {
+      let mut i = 0
+      while i < subs.length() {
+        qbe_collect_pat_bindings(subs[i], out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
+fn qbe_collect_expr_is_bindings(e : Expr, out : Array[String]) -> Unit {
+  match e {
+    EIs(_, pat, _) => qbe_collect_pat_bindings(pat, out)
+    EBinary(op, l, r, _) =>
+      if op == "&&" {
+        qbe_collect_expr_is_bindings(l, out)
+        qbe_collect_expr_is_bindings(r, out)
+      }
+    _ => ()
+  }
+}
+
+///|
+fn qbe_pin_slot(g : QbeGen, slot : String, pinned_slot_list : Array[String]) -> Unit {
+  let prev = match g.pinned_slots.get(slot) {
+    Some(c) => c
+    None => 0
+  }
+  g.pinned_slots.set(slot, prev + 1)
+  pinned_slot_list.push(slot)
+}
+
+///|
+fn qbe_pin_local_slot(
+  g : QbeGen,
+  name : String,
+  pinned_slot_list : Array[String],
+) -> Unit {
+  match qbe_lookup_local(g, name) {
+    Some(loc) => qbe_pin_slot(g, loc.slot, pinned_slot_list)
+    None => ()
+  }
+}
+
+///|
+fn qbe_unpin_slot_list(g : QbeGen, pinned_slot_list : Array[String]) -> Unit {
+  let mut pi = 0
+  while pi < pinned_slot_list.length() {
+    let pslot = pinned_slot_list[pi]
+    match g.pinned_slots.get(pslot) {
+      Some(c) =>
+        if c <= 1 {
+          g.pinned_slots.remove(pslot)
+        } else {
+          g.pinned_slots.set(pslot, c - 1)
+        }
+      None => ()
+    }
+    pi = pi + 1
+  }
+}
+
+///|
+fn qbe_cond_rhs_takes_data_ptr(cond : Expr, name : String) -> Bool {
+  match cond {
+    EBinary(op, l, r, _) =>
+      if op == "&&" {
+        qbe_cond_rhs_takes_data_ptr(l, name) ||
+        (qbe_expr_is_binds_name(l, name) && qbe_expr_takes_data_ptr(r, name)) ||
+        (!qbe_expr_is_binds_name(l, name) && qbe_cond_rhs_takes_data_ptr(r, name))
+      } else {
+        false
+      }
+    _ => false
+  }
+}
+
+///|
+fn qbe_pin_top_scope_for_cond_stmts(
+  g : QbeGen,
+  cond : Expr,
+  stmts : Array[Stmt],
+  pinned_slot_list : Array[String],
+) -> Unit {
+  if !qbe_expr_has_any_data_ptr(cond) && !qbe_stmts_has_any_data_ptr(stmts) {
+    return
+  }
+  let top_sc = g.scopes[g.scopes.length() - 1]
+  let mut li = 0
+  while li < top_sc.locals.length() {
+    let loc = top_sc.locals[li]
+    if loc.owned &&
+      (qbe_cond_rhs_takes_data_ptr(cond, loc.name) ||
+        qbe_stmts_tail_takes_data_ptr(stmts, 0, loc.name)) {
+      qbe_pin_slot(g, loc.slot, pinned_slot_list)
+    }
+    li = li + 1
+  }
+}
+
+///|
+fn qbe_pin_top_scope_for_stmts(
+  g : QbeGen,
+  stmts : Array[Stmt],
+  pinned_slot_list : Array[String],
+) -> Unit {
+  if !qbe_stmts_has_any_data_ptr(stmts) {
+    return
+  }
+  let top_sc = g.scopes[g.scopes.length() - 1]
+  let mut li = 0
+  while li < top_sc.locals.length() {
+    let loc = top_sc.locals[li]
+    if loc.owned && qbe_stmts_tail_takes_data_ptr(stmts, 0, loc.name) {
+      qbe_pin_slot(g, loc.slot, pinned_slot_list)
+    }
+    li = li + 1
+  }
+}
+
+///|
+fn qbe_pin_top_scope_for_arm(
+  g : QbeGen,
+  guard_opt : Option[Expr],
+  body : Expr,
+  pinned_slot_list : Array[String],
+) -> Unit {
+  let has_dp = qbe_expr_has_any_data_ptr(body) ||
+    match guard_opt {
+      Some(ge) => qbe_expr_has_any_data_ptr(ge)
+      None => false
+    }
+  if !has_dp {
+    return
+  }
+  let top_sc = g.scopes[g.scopes.length() - 1]
+  let mut li = 0
+  while li < top_sc.locals.length() {
+    let loc = top_sc.locals[li]
+    if loc.owned {
+      let takes = qbe_expr_takes_data_ptr(body, loc.name) ||
+        match guard_opt {
+          Some(ge) => qbe_expr_takes_data_ptr(ge, loc.name)
+          None => false
+        }
+      if takes {
+        qbe_pin_slot(g, loc.slot, pinned_slot_list)
+      }
+    }
+    li = li + 1
+  }
+}
+
+///|
 /// Conservative static check: returns true only when `name` never escapes
 /// (never returned, never reassigned, never stored in any container/struct/enum/tuple/closure)
 /// and only appears in borrow-safe positions (direct call args, field/index receiver, match scrutinee).
@@ -8985,6 +9555,7 @@ fn qbe_loop_has_no_calls_expr_with(
             fname == "str_data_ptr" ||
             fname == "bytes_data_ptr" ||
             fname == "array_data_ptr" ||
+            fname == "fixed_array_data_ptr" ||
             fname == "ptr_read_f64" ||
             fname == "ptr_read_f32") {
             let mut i = 0
@@ -13341,6 +13912,7 @@ fn qbe_emit_inline_closure_call(
   g.inline_closures = Map([])
 
   qbe_scope_push(g)
+  let iclo_has_dp = qbe_stmts_has_any_data_ptr(iclo.body)
   let mut pi = 0
   while pi < iclo.params.length() && pi < iclo.param_tys.length() {
     let pty = iclo.param_tys[pi]
@@ -13353,6 +13925,13 @@ fn qbe_emit_inline_closure_call(
     }
     let loc = qbe_define_local(g, pname, pty, p_owned)
     qbe_store_local_slot(g, pv, loc.slot, pty)
+    if iclo_has_dp && p_owned && qbe_stmts_tail_takes_data_ptr(iclo.body, 0, pname) {
+      let prev = match g.pinned_slots.get(loc.slot) {
+        Some(c) => c
+        None => 0
+      }
+      g.pinned_slots.set(loc.slot, prev + 1)
+    }
     pi = pi + 1
   }
 
@@ -13584,6 +14163,7 @@ fn qbe_emit_inline_closure_flat_struct_lit(
   g.moved_slots = Map([])
 
   qbe_scope_push(g)
+  let iclo_has_dp = qbe_stmts_has_any_data_ptr(iclo.body)
   let mut pi = 0
   while pi < iclo.params.length() && pi < iclo.param_tys.length() {
     let pty = iclo.param_tys[pi]
@@ -13596,6 +14176,13 @@ fn qbe_emit_inline_closure_flat_struct_lit(
     }
     let loc = qbe_define_local(g, pname, pty, p_owned)
     qbe_store_local_slot(g, pv, loc.slot, pty)
+    if iclo_has_dp && p_owned && qbe_stmts_tail_takes_data_ptr(iclo.body, 0, pname) {
+      let prev = match g.pinned_slots.get(loc.slot) {
+        Some(c) => c
+        None => 0
+      }
+      g.pinned_slots.set(loc.slot, prev + 1)
+    }
     pi = pi + 1
   }
 
@@ -13830,6 +14417,7 @@ fn qbe_try_inline_fn_call(
         g.in_verify = inl_fd.is_verify
         let inl_scope_base = g.scopes.length()
         qbe_scope_push(g)
+        let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
         let mut pi = 0
         while pi < inl_fd.params.length() {
           let pty = finfo.param_tys[pi]
@@ -13842,6 +14430,13 @@ fn qbe_try_inline_fn_call(
           }
           let loc = qbe_define_local(g, pname, pty, p_owned)
           qbe_store_local_slot(g, pv, loc.slot, pty)
+          if inl_has_dp && p_owned && qbe_stmts_tail_takes_data_ptr(inl_body, 0, pname) {
+            let prev = match g.pinned_slots.get(loc.slot) {
+              Some(c) => c
+              None => 0
+            }
+            g.pinned_slots.set(loc.slot, prev + 1)
+          }
           pi = pi + 1
         }
         let has_ret = qbe_stmts_has_cf(inl_body, false, false, true)
@@ -14083,6 +14678,7 @@ fn qbe_try_inline_xpkg_fn_call(
   g.in_verify = inl_fd.is_verify
   let inl_scope_base = g.scopes.length()
   qbe_scope_push(g)
+  let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
   let mut pi = 0
   while pi < inl_fd.params.length() {
     let pty = finfo.param_tys[pi]
@@ -14095,6 +14691,13 @@ fn qbe_try_inline_xpkg_fn_call(
     }
     let loc = qbe_define_local(g, pname, pty, p_owned)
     qbe_store_local_slot(g, pv, loc.slot, pty)
+    if inl_has_dp && p_owned && qbe_stmts_tail_takes_data_ptr(inl_body, 0, pname) {
+      let prev = match g.pinned_slots.get(loc.slot) {
+        Some(c) => c
+        None => 0
+      }
+      g.pinned_slots.set(loc.slot, prev + 1)
+    }
     pi = pi + 1
   }
   let has_ret = qbe_stmts_has_cf(inl_body, false, false, true)
@@ -14908,6 +15511,7 @@ fn qbe_inline_body_into_pod_buf(
   g.in_verify = inl_fd.is_verify
   let inl_scope_base = g.scopes.length()
   qbe_scope_push(g)
+  let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
   let mut pi = 0
   while pi < inl_fd.params.length() {
     let pty = finfo.param_tys[pi]
@@ -14920,6 +15524,13 @@ fn qbe_inline_body_into_pod_buf(
     }
     let loc = qbe_define_local(g, pname, pty, p_owned)
     qbe_store_local_slot(g, pv, loc.slot, pty)
+    if inl_has_dp && p_owned && qbe_stmts_tail_takes_data_ptr(inl_body, 0, pname) {
+      let prev = match g.pinned_slots.get(loc.slot) {
+        Some(c) => c
+        None => 0
+      }
+      g.pinned_slots.set(loc.slot, prev + 1)
+    }
     pi = pi + 1
   }
   let has_ret = qbe_stmts_has_cf(inl_body, false, false, true)
@@ -16685,6 +17296,8 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                   qbe_rc_dec(g, v_ok, ok_ty)
                 }
               }
+              let ok_dp_pinned : Array[String] = []
+              qbe_pin_top_scope_for_arm(g, None, arms[ok_idx].body, ok_dp_pinned)
               qbe_emit_tail_opt_res_expr_into_slots(
                 g,
                 arms[ok_idx].body,
@@ -16694,6 +17307,7 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                 err_slot,
                 val_is_pod_buf,
               )
+              qbe_unpin_slot_list(g, ok_dp_pinned)
               qbe_scope_pop(g)
               let ok_term = g.block_term
               if !ok_term {
@@ -16714,6 +17328,8 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                 }
                 None => ()
               }
+              let err_dp_pinned : Array[String] = []
+              qbe_pin_top_scope_for_arm(g, None, arms[err_idx].body, err_dp_pinned)
               qbe_emit_tail_opt_res_expr_into_slots(
                 g,
                 arms[err_idx].body,
@@ -16723,6 +17339,7 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
                 err_slot,
                 val_is_pod_buf,
               )
+              qbe_unpin_slot_list(g, err_dp_pinned)
               qbe_scope_pop(g)
               let err_term = g.block_term
               if !err_term {
@@ -16760,6 +17377,8 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
         qbe_scope_push(g)
         let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
         qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, false, arm.body)
+        let sc_arm_dp_pinned : Array[String] = []
+        qbe_pin_top_scope_for_arm(g, None, arm.body, sc_arm_dp_pinned)
         qbe_emit_tail_opt_res_expr_into_slots(
           g,
           arm.body,
@@ -16769,6 +17388,7 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
           err_slot,
           val_is_pod_buf,
         )
+        qbe_unpin_slot_list(g, sc_arm_dp_pinned)
         qbe_scope_pop(g)
         if !g.block_term {
           all_term = false
@@ -17124,6 +17744,7 @@ fn qbe_inline_body_into_opt_res_slots(
   g.in_verify = inl_fd.is_verify
   let inl_scope_base = g.scopes.length()
   qbe_scope_push(g)
+  let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
   let mut pi = 0
   while pi < inl_fd.params.length() {
     let pty = finfo.param_tys[pi]
@@ -17136,6 +17757,13 @@ fn qbe_inline_body_into_opt_res_slots(
     }
     let loc = qbe_define_local(g, pname, pty, p_owned)
     qbe_store_local_slot(g, pv, loc.slot, pty)
+    if inl_has_dp && p_owned && qbe_stmts_tail_takes_data_ptr(inl_body, 0, pname) {
+      let prev = match g.pinned_slots.get(loc.slot) {
+        Some(c) => c
+        None => 0
+      }
+      g.pinned_slots.set(loc.slot, prev + 1)
+    }
     pi = pi + 1
   }
   let has_ret = qbe_stmts_has_cf(inl_body, false, false, true)
@@ -17968,7 +18596,10 @@ fn qbe_try_emit_scalar_opt_res_nested_match(
     } else {
       qbe_emit_pat_bind(g, subpat, bind_ok, ok_ty, false, arm.body)
     }
+    let ok_dp_pinned : Array[String] = []
+    qbe_pin_top_scope_for_arm(g, None, arm.body, ok_dp_pinned)
     let sv = qbe_emit_expr(g, arm.body, res_ty)
+    qbe_unpin_slot_list(g, ok_dp_pinned)
     match res_ty {
       None =>
         match sv.ty {
@@ -18067,7 +18698,10 @@ fn qbe_try_emit_scalar_opt_res_nested_match(
       }
       None => ()
     }
+    let err_dp_pinned : Array[String] = []
+    qbe_pin_top_scope_for_arm(g, None, arm.body, err_dp_pinned)
     let nv = qbe_emit_expr(g, arm.body, res_ty)
+    qbe_unpin_slot_list(g, err_dp_pinned)
     match res_ty {
       None =>
         match nv.ty {
@@ -18209,7 +18843,10 @@ fn qbe_try_emit_scalar_opt_res_match(
       qbe_rc_dec(g, v_ok, ok_ty)
     }
   }
+  let ok2_dp_pinned : Array[String] = []
+  qbe_pin_top_scope_for_arm(g, None, arms[ok_idx].body, ok2_dp_pinned)
   let sv = qbe_emit_expr(g, arms[ok_idx].body, res_ty)
+  qbe_unpin_slot_list(g, ok2_dp_pinned)
   match res_ty {
     None =>
       match sv.ty {
@@ -18258,7 +18895,10 @@ fn qbe_try_emit_scalar_opt_res_match(
     }
     None => ()
   }
+  let err2_dp_pinned : Array[String] = []
+  qbe_pin_top_scope_for_arm(g, None, arms[err_idx].body, err2_dp_pinned)
   let nv = qbe_emit_expr(g, arms[err_idx].body, res_ty)
+  qbe_unpin_slot_list(g, err2_dp_pinned)
   match res_ty {
     None =>
       match nv.ty {
@@ -30839,8 +31479,22 @@ fn qbe_emit_cond_branch_bind(
       qbe_emit_lbl(g, l_rhs)
       let after_lhs = sc.locals.length()
       if after_lhs > before_lhs {
+        let and_dp_pinned : Array[String] = []
+        if qbe_expr_has_any_data_ptr(lhs) || qbe_expr_has_any_data_ptr(rhs) {
+          let mut ai = before_lhs
+          while ai < after_lhs {
+            let aloc = sc.locals[ai]
+            if aloc.owned &&
+              (qbe_cond_rhs_takes_data_ptr(lhs, aloc.name) ||
+                qbe_expr_takes_data_ptr(rhs, aloc.name)) {
+              qbe_pin_slot(g, aloc.slot, and_dp_pinned)
+            }
+            ai = ai + 1
+          }
+        }
         let l_rhs_fail = qbe_lbl(g, "and_f")
         qbe_emit_cond_branch_bind(g, rhs, l_true, l_rhs_fail, then_stmts_opt)
+        qbe_unpin_slot_list(g, and_dp_pinned)
         qbe_emit_lbl(g, l_rhs_fail)
         qbe_release_scope_locals_from(g, before_lhs)
         qbe_emit_term(g, "jmp " + l_false)
@@ -33030,6 +33684,7 @@ fn qbe_try_emit_map_get_match(
       let mut saw_untyped_none = false
       qbe_emit_lbl(g, l_hit)
       qbe_scope_push(g)
+      let mget_dp_pinned : Array[String] = []
       if some_bind != "" {
         let raw_l = qbe_tmp(g)
         qbe_emit(g, raw_l + " =l loadl " + out_slot)
@@ -33037,8 +33692,13 @@ fn qbe_try_emit_map_get_match(
         qbe_rc_inc(g, v_val, vty)
         let vloc = qbe_define_local(g, some_bind, vty, true)
         qbe_store_local_slot(g, v_val, vloc.slot, vty)
+        if qbe_expr_has_any_data_ptr(arms[some_idx].body) &&
+          qbe_expr_takes_data_ptr(arms[some_idx].body, some_bind) {
+          qbe_pin_slot(g, vloc.slot, mget_dp_pinned)
+        }
       }
       let sv = qbe_emit_expr(g, arms[some_idx].body, res_ty)
+      qbe_unpin_slot_list(g, mget_dp_pinned)
       match res_ty {
         None =>
           match sv.ty {
@@ -35496,7 +36156,7 @@ fn qbe_emit_expr_inner(
             }
             return qval(r, TPtr)
           }
-          if name == "array_data_ptr" {
+          if name == "array_data_ptr" || name == "fixed_array_data_ptr" {
             let can_b = !qbe_args_have_assign(args)
             let aa = qbe_emit_arg_maybe_borrow(g, args[0], None, can_b)
             let av = aa.qv
@@ -37888,7 +38548,12 @@ fn qbe_emit_expr_inner(
             }
             wki = wki + 1
           }
+          let if_dp_pinned : Array[String] = []
+          if has_is {
+            qbe_pin_top_scope_for_cond_stmts(g, cond, then_stmts, if_dp_pinned)
+          }
           let tv = qbe_emit_stmts(g, then_stmts, None)
+          qbe_unpin_slot_list(g, if_dp_pinned)
           let then_term = g.block_term
           wki = 0
           while wki < added_win.length() {
@@ -38004,7 +38669,12 @@ fn qbe_emit_expr_inner(
             }
             wki = wki + 1
           }
+          let if_dp_pinned : Array[String] = []
+          if has_is {
+            qbe_pin_top_scope_for_cond_stmts(g, cond, then_stmts, if_dp_pinned)
+          }
           let tv = qbe_emit_stmts(g, then_stmts, branch_exp)
+          qbe_unpin_slot_list(g, if_dp_pinned)
           let then_term = g.block_term
           wki = 0
           while wki < added_win.length() {
@@ -38354,6 +39024,8 @@ fn qbe_emit_expr_inner(
                 }
                 _ => ()
               }
+              let tarm_dp_pinned : Array[String] = []
+              qbe_pin_top_scope_for_arm(g, arm.guard_expr, arm.body, tarm_dp_pinned)
               match arm.guard_expr {
                 Some(ge) => {
                   let l_body = qbe_lbl(g, "match_guard_ok")
@@ -38368,6 +39040,7 @@ fn qbe_emit_expr_inner(
                 None => ()
               }
               let bv = qbe_emit_expr(g, arm.body, res_ty)
+              qbe_unpin_slot_list(g, tarm_dp_pinned)
               match res_ty {
                 None =>
                   match bv.ty {
@@ -38926,7 +39599,10 @@ fn qbe_emit_expr_inner(
                     qbe_scope_push(g)
                     let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
                     qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, true, arm.body)
+                    let jtbl_dp_pinned : Array[String] = []
+                    qbe_pin_top_scope_for_arm(g, None, arm.body, jtbl_dp_pinned)
                     let bv = qbe_emit_expr(g, arm.body, res_ty)
+                    qbe_unpin_slot_list(g, jtbl_dp_pinned)
                     match res_ty {
                       None =>
                         match bv.ty {
@@ -38970,7 +39646,10 @@ fn qbe_emit_expr_inner(
                     qbe_scope_push(g)
                     let bind_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
                     qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, true, arm.body)
+                    let jtbl_dp_pinned : Array[String] = []
+                    qbe_pin_top_scope_for_arm(g, None, arm.body, jtbl_dp_pinned)
                     let bv = qbe_emit_expr(g, arm.body, res_ty)
+                    qbe_unpin_slot_list(g, jtbl_dp_pinned)
                     match res_ty {
                       None =>
                         match bv.ty {
@@ -39065,6 +39744,8 @@ fn qbe_emit_expr_inner(
           None => true
         }
         qbe_emit_pat_bind(g, arm.pat, bind_sv, sv.ty, arm_allow_borrow, arm.body)
+        let arm_dp_pinned : Array[String] = []
+        qbe_pin_top_scope_for_arm(g, arm.guard_expr, arm.body, arm_dp_pinned)
         match arm.guard_expr {
           Some(ge) => {
             let l_body = qbe_lbl(g, "match_guard_ok")
@@ -39079,6 +39760,7 @@ fn qbe_emit_expr_inner(
           None => ()
         }
         let bv = qbe_emit_expr(g, arm.body, res_ty)
+        qbe_unpin_slot_list(g, arm_dp_pinned)
         match res_ty {
           None =>
             match bv.ty {
@@ -44872,55 +45554,75 @@ fn qbe_emit_stmts(
   // When `last_use < n - 1` and the binding is an owned heap object not shadowed or
   // pinned by a borrowed array-element view, drop it immediately after `stmts[last_use]`
   // and zero its stack slot so scope-exit / early-return release is a 1-branch NULL no-op.
+  let block_has_dp = qbe_stmts_has_any_data_ptr(stmts)
   let def_last_use : Array[Int] = []
   let def_names : Array[String] = []
+  let def_dp_pinned : Array[Bool] = []
   let mut di = 0
   while di < n {
     let mut lu = -1
     let mut dname = ""
+    let mut dp_pin = false
     if di < n - 1 {
       match stmts[di] {
         SLet(name, is_mut, _, _, _) =>
           if name != "_" {
-            let mut cur_lu = di
-            let mut shadowed_use = false
-            let mut j = di + 1
-            while j < n {
-              match stmts[j] {
-                SLet(n2, _, _, init2, _) =>
-                  if n2 == name {
-                    if qbe_expr_mentions_ident(init2, name) {
-                      shadowed_use = true
+            if block_has_dp && qbe_stmts_tail_takes_data_ptr(stmts, di + 1, name) {
+              dp_pin = true
+              dname = name
+            } else {
+              let mut cur_lu = di
+              let mut shadowed_use = false
+              let mut j = di + 1
+              while j < n {
+                match stmts[j] {
+                  SLet(n2, _, _, init2, _) =>
+                    if n2 == name {
+                      if qbe_expr_mentions_ident(init2, name) {
+                        shadowed_use = true
+                      }
+                      break
                     }
-                    break
-                  }
-                SLetTuple(ns2, _, init2, _) =>
-                  if str_arr_contains(ns2, name) {
-                    if qbe_expr_mentions_ident(init2, name) {
-                      shadowed_use = true
+                  SLetTuple(ns2, _, init2, _) =>
+                    if str_arr_contains(ns2, name) {
+                      if qbe_expr_mentions_ident(init2, name) {
+                        shadowed_use = true
+                      }
+                      break
                     }
-                    break
-                  }
-                _ => ()
-              }
-              if qbe_stmt_mentions_ident(stmts[j], name) {
-                cur_lu = j
-              }
-              j = j + 1
-            }
-            if !shadowed_use && cur_lu <= n - 1 {
-              if !is_mut && cur_lu < n - 1 {
-                lu = cur_lu
-                dname = name
-              } else if cur_lu == n - 1 {
-                match stmts[n - 1] {
-                  SExpr(_, _) => {
-                    lu = cur_lu
-                    dname = name
-                  }
                   _ => ()
                 }
+                if qbe_stmt_mentions_ident(stmts[j], name) {
+                  cur_lu = j
+                }
+                j = j + 1
               }
+              if !shadowed_use && cur_lu <= n - 1 {
+                if !is_mut && cur_lu < n - 1 {
+                  lu = cur_lu
+                  dname = name
+                } else if cur_lu == n - 1 {
+                  match stmts[n - 1] {
+                    SExpr(_, _) => {
+                      lu = cur_lu
+                      dname = name
+                    }
+                    _ => ()
+                  }
+                }
+              }
+            }
+          }
+        SLetTuple(ns, _, _, _) =>
+          if block_has_dp {
+            let mut ti = 0
+            while ti < ns.length() {
+              let tn = ns[ti]
+              if tn != "_" && qbe_stmts_tail_takes_data_ptr(stmts, di + 1, tn) {
+                dp_pin = true
+                break
+              }
+              ti = ti + 1
             }
           }
         _ => ()
@@ -44928,6 +45630,7 @@ fn qbe_emit_stmts(
     }
     def_last_use.push(lu)
     def_names.push(dname)
+    def_dp_pinned.push(dp_pin)
     di = di + 1
   }
   let ed_names : Array[String] = []
@@ -44969,6 +45672,16 @@ fn qbe_emit_stmts(
       {
         match qbe_try_emit_let_match_opt_res(g, stmts, i, expected) {
           Some(mv) => {
+            if block_has_dp {
+              match stmts[i + 1] {
+                SLet(dst_name, _, _, _, _) =>
+                  if dst_name != "_" &&
+                    qbe_stmts_tail_takes_data_ptr(stmts, i + 2, dst_name) {
+                    qbe_pin_local_slot(g, dst_name, pinned_slot_list)
+                  }
+                _ => ()
+              }
+            }
             last = mv
             i = i + 2
             true
@@ -45040,6 +45753,41 @@ fn qbe_emit_stmts(
         g.movable_locals = old_mov
         g.moved_slots = old_moved
       }
+      if def_dp_pinned[i] {
+        match stmts[i] {
+          SLet(dname, _, _, _, _) =>
+            qbe_pin_local_slot(g, dname, pinned_slot_list)
+          SLetTuple(ns, _, _, _) => {
+            let mut ti = 0
+            while ti < ns.length() {
+              let tn = ns[ti]
+              if tn != "_" && qbe_stmts_tail_takes_data_ptr(stmts, i + 1, tn) {
+                qbe_pin_local_slot(g, tn, pinned_slot_list)
+              }
+              ti = ti + 1
+            }
+          }
+          _ => ()
+        }
+      } else if block_has_dp {
+        match stmts[i] {
+          SGuard(gcond, _, _) =>
+            if qbe_expr_has_is(gcond) {
+              let gnames : Array[String] = []
+              qbe_collect_expr_is_bindings(gcond, gnames)
+              let mut gi = 0
+              while gi < gnames.length() {
+                let bn = gnames[gi]
+                if qbe_cond_rhs_takes_data_ptr(gcond, bn) ||
+                  qbe_stmts_tail_takes_data_ptr(stmts, i + 1, bn) {
+                  qbe_pin_local_slot(g, bn, pinned_slot_list)
+                }
+                gi = gi + 1
+              }
+            }
+          _ => ()
+        }
+      }
       if def_last_use[i] >= 0 {
         let dname = def_names[i]
         match qbe_lookup_local(g, dname) {
@@ -45078,20 +45826,7 @@ fn qbe_emit_stmts(
     }
     i = i + 1
   }
-  let mut pi = 0
-  while pi < pinned_slot_list.length() {
-    let pslot = pinned_slot_list[pi]
-    match g.pinned_slots.get(pslot) {
-      Some(c) =>
-        if c <= 1 {
-          g.pinned_slots.remove(pslot)
-        } else {
-          g.pinned_slots.set(pslot, c - 1)
-        }
-      None => ()
-    }
-    pi = pi + 1
-  }
+  qbe_unpin_slot_list(g, pinned_slot_list)
   last
 }
 
@@ -47122,7 +47857,10 @@ fn qbe_emit_stmt(
         g.loop_breaks.push(l_end)
         g.loop_conts.push(l_cond)
         g.loop_depths.push(loop_depth)
+        let wh_dp_pinned : Array[String] = []
+        qbe_pin_top_scope_for_cond_stmts(g, cond, body, wh_dp_pinned)
         let bv = qbe_emit_stmts(g, body, None)
+        qbe_unpin_slot_list(g, wh_dp_pinned)
         if !g.block_term {
           qbe_rc_dec(g, bv.reg, bv.ty)
         }
@@ -47914,6 +48652,23 @@ fn qbe_emit_stmt(
     SFor(init_s, cond, step_s, body, _) => {
       qbe_scope_push(g)
       let _ = qbe_emit_stmt(g, init_s, None, false)
+      let for_dp_pinned : Array[String] = []
+      if qbe_expr_has_any_data_ptr(cond) ||
+        qbe_stmt_has_any_data_ptr(step_s) ||
+        qbe_stmts_has_any_data_ptr(body) {
+        let for_sc = g.scopes[g.scopes.length() - 1]
+        let mut fli = 0
+        while fli < for_sc.locals.length() {
+          let floc = for_sc.locals[fli]
+          if floc.owned &&
+            (qbe_expr_takes_data_ptr(cond, floc.name) ||
+              qbe_stmt_takes_data_ptr(step_s, floc.name) ||
+              qbe_stmts_tail_takes_data_ptr(body, 0, floc.name)) {
+            qbe_pin_slot(g, floc.slot, for_dp_pinned)
+          }
+          fli = fli + 1
+        }
+      }
       qbe_invalidate_escaping_unfrozen_arrs(g, Some(cond), Some(step_s), body)
       let l_cond = qbe_lbl(g, "for_c")
       let l_body = qbe_lbl(g, "for_b")
@@ -47941,6 +48696,7 @@ fn qbe_emit_stmt(
       let _ = qbe_emit_stmt(g, step_s, None, false)
       qbe_emit_term(g, "jmp " + l_cond)
       qbe_emit_lbl(g, l_end)
+      qbe_unpin_slot_list(g, for_dp_pinned)
       qbe_scope_pop(g)
       qval("0", TUnit)
     }
