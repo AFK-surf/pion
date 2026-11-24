@@ -1,3 +1,6 @@
+#if defined(__linux__) && !defined(_POSIX_C_SOURCE)
+#define _POSIX_C_SOURCE 200809L /* getc_unlocked under -std=c99 */
+#endif
 #include "all.h"
 #include <ctype.h>
 #include <stdarg.h>
@@ -210,6 +213,19 @@ lexinit()
 	done = 1;
 }
 
+/* parse() owns its input stream until the end of this unit. */
+static inline int
+nextbyte(void)
+{
+/* POSIX.1c introduced getc_unlocked; an explicit lower level hides it. */
+#if (defined(__linux__) || defined(__APPLE__)) && \
+	(!defined(_POSIX_C_SOURCE) || (_POSIX_C_SOURCE + 0) >= 199506L)
+	return getc_unlocked(inf);
+#else
+	return fgetc(inf);
+#endif
+}
+
 static int64_t
 getint()
 {
@@ -217,16 +233,16 @@ getint()
 	int c, m;
 
 	n = 0;
-	c = fgetc(inf);
+	c = nextbyte();
 	m = (c == '-');
 	if (m) {
-		c = fgetc(inf);
+		c = nextbyte();
 		if (!isdigit(c))
 			err("integer expected");
 	}
 	do {
 		n = 10*n + (c - '0');
-		c = fgetc(inf);
+		c = nextbyte();
 	} while (isdigit(c));
 	ungetc(c, inf);
 	if (m)
@@ -241,7 +257,7 @@ lex()
 	int t;
 
 	do
-		c = fgetc(inf);
+		c = nextbyte();
 	while (isblank(c));
 	t = Txxx;
 	tokval.chr = c;
@@ -272,23 +288,23 @@ lex()
 		return Tfltd;
 	case '%':
 		t = Ttmp;
-		c = fgetc(inf);
+		c = nextbyte();
 		goto Alpha;
 	case '@':
 		t = Tlbl;
-		c = fgetc(inf);
+		c = nextbyte();
 		goto Alpha;
 	case '$':
 		t = Tglo;
-		if ((c = fgetc(inf)) == '"')
+		if ((c = nextbyte()) == '"')
 			goto Quoted;
 		goto Alpha;
 	case ':':
 		t = Ttyp;
-		c = fgetc(inf);
+		c = nextbyte();
 		goto Alpha;
 	case '#':
-		while ((c=fgetc(inf)) != '\n' && c != EOF)
+		while ((c=nextbyte()) != '\n' && c != EOF)
 			;
 		/* fall through */
 	case '\n':
@@ -306,7 +322,7 @@ lex()
 		tokval.str[0] = c;
 		esc = 0;
 		for (i=1;; i++) {
-			c = fgetc(inf);
+			c = nextbyte();
 			if (c == EOF)
 				err("unterminated string");
 			vgrow(&tokval.str, i+2);
@@ -325,7 +341,7 @@ Alpha:
 	do {
 		vgrow(&tokval.str, i+2);
 		tokval.str[i++] = c;
-		c = fgetc(inf);
+		c = nextbyte();
 	} while (isalpha(c) || c == '$' || c == '.' || c == '_' || isdigit(c));
 	tokval.str[i] = 0;
 	ungetc(c, inf);

@@ -379,7 +379,7 @@ copyref(Fn *fn, Blk *b, Ins *i)
 	/* redundant and mask */
 	if (i->op == Oand
 	&& isconbits(fn, i->arg[1], &v)
-	&& (v > 0 && ((v+1) & v) == 0)
+	&& (v > 0 && (((uint64_t)v + 1) & (uint64_t)v) == 0)
 	&& (rtype(i->arg[0]) != RTmp
 	    || KWIDE(i->cls) <= KWIDE(fn->tmp[i->arg[0].val].cls))
 	&& defwidthle(fn, i->arg[0], bitwidth(v)))
