@@ -523,8 +523,8 @@ fn l_inst(tparams : Array[String], args : Array[Ty], t : Ty) -> Ty {
 /// What a `continue` (and the normal end of a loop body) must run first.
 enum LPrelude {
   PNone
-  /// `for init; cond; step`: the `step` statement.
-  PStep(Stmt)
+  /// `for init; cond; step`: the `step` statement and the loop-header scope depth.
+  PStep(Stmt, Int)
   /// `for i in a..b`: `i = i + 1`.
   PIncr(String, Ty)
   /// `for i in a..=b`: `if i == end { done = true } else { i = i + 1 }`.
@@ -536,10 +536,10 @@ enum LPrelude {
 ///|
 struct LB {
   g : LG
-  tc : TypeChecker
-  pkg : String
+  mut tc : TypeChecker
+  mut pkg : String
   fn_name : String
-  scopes : Array[Map[String, String]]
+  mut scopes : Array[Map[String, String]]
   used : Map[String, Bool]
   var_tys : Map[String, Ty]
   temps : Map[String, Bool]
@@ -548,6 +548,8 @@ struct LB {
   type_params : Array[String]
   /// Type parameter -> globally qualified trait keys of its bounds.
   bounds : Map[String, Array[String]]
+  /// Active type substitution while lowering a generic callee's default argument.
+  mut type_subst : Map[String, Ty]
   callees : Array[String]
   mut ret_ty : Ty
 }
@@ -571,6 +573,7 @@ fn lb_new(g : LG, tc : TypeChecker, fn_name : String, type_params : Array[String
     preludes: [],
     type_params: type_params,
     bounds: Map([]),
+    type_subst: Map([]),
     callees: [],
     ret_ty: TUnit,
   }
@@ -583,7 +586,8 @@ fn lb_err(b : LB, sp : Span, msg : String, found : String) -> Unit {
 
 ///|
 fn lb_ty_of(b : LB, t : Ty) -> Ty {
-  let q = l_gq_ty(b.pkg, t)
+  let q0 = l_gq_ty(b.pkg, t)
+  let q = if b.type_subst.length() > 0 { subst_ty(q0, b.type_subst) } else { q0 }
   lg_note_ty(b.g, q)
   q
 }
@@ -749,12 +753,12 @@ fn lb_retarget(b : LB, n : String, dest : String, assign : Bool) -> Bool {
     return false
   }
   // The defining statement may be followed by the `mut` write-backs of the
-  // same call (assignments that never read `n`).
+  // same call (assignments that never read `n` and do not overwrite `dest`).
   let mut at = cur.length() - 1
   while at > 0 {
     let skip = match cur[at] {
-      LSAssign(_, v) => !l_expr_mentions(v, n)
-      LSSetField(_, _, _, _, v) => !l_expr_mentions(v, n)
+      LSAssign(d, v) => d != dest && !l_expr_mentions(v, n)
+      LSSetField(d, _, _, _, v) => d != dest && !l_expr_mentions(v, n)
       _ => false
     }
     if !skip {
@@ -947,15 +951,49 @@ pub fn l_scalar_ns(t : Ty) -> String {
 // ---------------------------------------------------------------------------
 
 ///|
-fn l_is_mutating_builtin(m : String) -> Bool {
+fn l_is_arr_mutating(m : String) -> Bool {
   m == "push" ||
   m == "pop" ||
   m == "clear" ||
   m == "reverse" ||
-  m == "swap" ||
   m == "fill" ||
-  m == "sort" ||
-  m == "set"
+  m == "swap"
+}
+
+///|
+/// All mutating `StringBuilder` methods (used by `l_expr_writes` for ANF snapshots).
+fn l_is_sb_mutating(m : String) -> Bool {
+  m == "write_byte" ||
+  m == "write_string" ||
+  m == "write_substring" ||
+  m == "write_char" ||
+  m == "write_int" ||
+  m == "write_bytes" ||
+  m == "clear" ||
+  m == "reset"
+}
+
+///|
+/// `StringBuilder` mutating methods modelled in `PionLean/Basic.lean`.
+fn l_is_sb_lowerable_mutating(m : String) -> Bool {
+  m == "write_byte" ||
+  m == "write_string" ||
+  m == "write_substring" ||
+  m == "clear" ||
+  m == "reset"
+}
+
+///|
+fn l_is_map_mutating(m : String) -> Bool {
+  m == "set" || m == "remove" || m == "clear"
+}
+
+///|
+fn l_is_mutating_builtin(m : String) -> Bool {
+  l_is_arr_mutating(m) ||
+  l_is_sb_mutating(m) ||
+  l_is_map_mutating(m) ||
+  m == "sort"
 }
 
 ///|
@@ -1082,6 +1120,26 @@ fn lb_ctor_of(b : LB, ty : Ty, vname : String) -> Option[String] {
 }
 
 ///|
+/// Detects lexer raw-byte escape PUA codepoints `U+E080..U+E0FF` (UTF-8
+/// `0xEE 0x82 0x80`..`0xEE 0x83 0xBF`), which cannot be faithfully represented
+/// as a Lean `String`.
+fn l_str_has_raw_byte_pua(s : String) -> Bool {
+  let n = s.length()
+  let mut i = 0
+  while i + 2 < n {
+    if str_code_at(s, i) == 238 {
+      let b1 = str_code_at(s, i + 1)
+      let b2 = str_code_at(s, i + 2)
+      if (b1 == 130 || b1 == 131) && b2 >= 128 && b2 <= 191 {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
 fn lb_expr(b : LB, e : Expr) -> LExpr {
   match e {
     EInt(s, _) | EInt64(s, _) | EUInt(s, _) | EUInt64(s, _) => {
@@ -1105,7 +1163,13 @@ fn lb_expr(b : LB, e : Expr) -> LExpr {
     EBool(v, _) => l_bool(v)
     EByte(raw, _) => LLit("byte", qbe_parse_char_lit(raw).to_string(), TByte)
     EChar(raw, _) => LLit("char", qbe_parse_char_lit(raw).to_string(), TChar)
-    EString(s, _) => LLit("string", s, TString)
+    EString(s, sp) => {
+      if l_str_has_raw_byte_pua(s) {
+        lb_err(b, sp, "non-UTF-8 raw byte escape (`\\x80`..`\\xFF`) in string literal is not extractable", "string literal")
+        return LLit("string", "", TString)
+      }
+      LLit("string", s, TString)
+    }
     EUnit(_) => l_unit()
     EIdent(n, sp) => lb_ident(b, n, e, sp)
     EPath(q, m, sp) => {
@@ -1165,7 +1229,14 @@ fn lb_expr(b : LB, e : Expr) -> LExpr {
               l_unit()
             }
           }
-        TStruct(_, _) => LField(ov, f, oty, lb_expr_ty(b, e))
+        TStruct(_, _) => {
+          let fty0 = lb_expr_ty(b, e)
+          let fty = match fty0 {
+            TError => lb_field_ty(b, oty, f)
+            _ => fty0
+          }
+          LField(ov, f, oty, fty)
+        }
         _ => {
           lb_err(b, sp, "field access `." + f + "` on " + ty_to_string(oty), ty_to_string(oty))
           l_unit()
@@ -1255,6 +1326,7 @@ pub fn l_container_ns(t : Ty) -> String {
     TFixedArray(_) => "Pion.FixedArray"
     TImmArray(_) => "Pion.ImmArray"
     TBytes => "Pion.Bytes"
+    TString => "Pion.String"
     TStrView => "Pion.StrView"
     TBytesView => "Pion.BytesView"
     _ => "Pion.Array"
@@ -1470,19 +1542,19 @@ fn lb_struct_lit(
       return l_unit()
     }
   }
-  let mut base_v : Option[LExpr] = None
-  match base {
-    Some(bx) => {
-      let v = lb_expr(b, bx)
-      base_v = Some(lb_atom(b, v))
-    }
-    None => ()
-  }
   let fexprs : Array[Expr] = []
   let mut i = 0
   while i < fields.length() {
     fexprs.push(fields[i].value)
     i = i + 1
+  }
+  let mut base_v : Option[LExpr] = None
+  match base {
+    Some(bx) => {
+      let v = lb_expr(b, bx)
+      base_v = Some(if l_exprs_write(b.tc, fexprs) { lb_snapshot(b, v) } else { lb_atom(b, v) })
+    }
+    None => ()
   }
   let fvals = lb_exprs(b, fexprs)
   let out : Array[LExpr] = []
@@ -1551,6 +1623,31 @@ fn l_place_ty(pl : LPlace) -> Ty {
 }
 
 ///|
+/// Looks up a struct field's instantiated type from `struct_ty` (`TStruct`),
+/// used when `tc.expr_tys` does not record a place expression's span (e.g.
+/// compound assignments `r.hi.x += dx`).
+fn lb_field_ty(b : LB, struct_ty : Ty, f : String) -> Ty {
+  match struct_ty {
+    TStruct(gname, targs) =>
+      match lg_struct(b.g, gname) {
+        Some(si) => {
+          let qp = split_qual_name(gname)
+          let mut i = 0
+          while i < si.field_names.length() {
+            if si.field_names[i] == f {
+              return lb_ty_of(b, l_inst(si.decl.type_params, targs, l_gq_ty(qp.prefix, si.field_tys[i])))
+            }
+            i = i + 1
+          }
+          TError
+        }
+        None => TError
+      }
+    _ => TError
+  }
+}
+
+///|
 /// Lowers a place expression; indices are evaluated (and frozen) here, once.
 fn lb_place(b : LB, e : Expr) -> Option[LPlace] {
   match e {
@@ -1565,7 +1662,12 @@ fn lb_place(b : LB, e : Expr) -> Option[LPlace] {
           let bt = l_place_ty(pl)
           match bt {
             TStruct(_, _) => {
-              pl.projs.push(LProj::{ kind: "field", field: f, index: l_unit(), base_ty: bt, ty: lb_expr_ty(b, e) })
+              let fty0 = lb_expr_ty(b, e)
+              let fty = match fty0 {
+                TError => lb_field_ty(b, bt, f)
+                _ => fty0
+              }
+              pl.projs.push(LProj::{ kind: "field", field: f, index: l_unit(), base_ty: bt, ty: fty })
               Some(pl)
             }
             _ => None
@@ -1578,7 +1680,12 @@ fn lb_place(b : LB, e : Expr) -> Option[LPlace] {
         Some(pl) => {
           let bt = l_place_ty(pl)
           let iv = lb_snapshot(b, lb_expr(b, idx))
-          pl.projs.push(LProj::{ kind: "index", field: "", index: iv, base_ty: bt, ty: lb_expr_ty(b, e) })
+          let ety0 = lb_expr_ty(b, e)
+          let ety = match ety0 {
+            TError => l_elem_ty(bt)
+            _ => ety0
+          }
+          pl.projs.push(LProj::{ kind: "index", field: "", index: iv, base_ty: bt, ty: ety })
           Some(pl)
         }
         None => None
@@ -1807,64 +1914,6 @@ fn lb_call_args(
 }
 
 ///|
-/// Resolves a user call's written arguments into parameter slots
-/// (`call_arg_order`: named / defaulted / optional parameters).
-fn lb_resolve_slots(
-  b : LB,
-  params : Array[Param],
-  offset : Int,
-  raw_args : Array[Expr],
-  sp : Span,
-  slot_tys : Array[Ty],
-  slots : Array[Expr],
-  wrap_some : Array[Bool],
-) -> Unit {
-  let n = params.length() - offset
-  let order : Array[Int] = match b.tc.call_arg_order.get(span_key(sp)) {
-    Some(o) => o
-    None => {
-      let o : Array[Int] = []
-      let mut k = 0
-      while k < n {
-        o.push(if k < raw_args.length() { k } else { -1 })
-        k = k + 1
-      }
-      o
-    }
-  }
-  let mut k = 0
-  while k < n {
-    let p = params[offset + k]
-    let idx = if k < order.length() { order[k] } else { -1 }
-    if idx >= 0 && idx < raw_args.length() {
-      match raw_args[idx] {
-        ENamedArg(_, fwd, inner, _) => {
-          slots.push(inner)
-          wrap_some.push(p.label_kind == 2 && !fwd)
-        }
-        a => {
-          slots.push(a)
-          wrap_some.push(false)
-        }
-      }
-    } else {
-      match p.default_expr {
-        Some(d) => {
-          slots.push(d)
-          wrap_some.push(false)
-        }
-        None => {
-          slots.push(EIdent("None", sp))
-          wrap_some.push(false)
-        }
-      }
-    }
-    k = k + 1
-  }
-  let _ = slot_tys
-}
-
-///|
 /// Emits a monadic call with `mut` write-backs; returns its value.
 fn lb_emit_call(
   b : LB,
@@ -1895,7 +1944,199 @@ fn lb_emit_call(
 }
 
 ///|
+/// Matches type parameters in `pat` against `conc`, filling `subst`.
+fn l_match_ty_params(pat : Ty, conc : Ty, subst : Map[String, Ty]) -> Unit {
+  match pat {
+    TParam(n) => if !subst.contains(n) { subst.set(n, conc) }
+    TArray(a) =>
+      match conc {
+        TArray(c) => l_match_ty_params(a, c, subst)
+        _ => ()
+      }
+    TFixedArray(a) =>
+      match conc {
+        TFixedArray(c) => l_match_ty_params(a, c, subst)
+        _ => ()
+      }
+    TImmArray(a) =>
+      match conc {
+        TImmArray(c) => l_match_ty_params(a, c, subst)
+        _ => ()
+      }
+    TOption(a) =>
+      match conc {
+        TOption(c) => l_match_ty_params(a, c, subst)
+        _ => ()
+      }
+    TResult(a1, a2) =>
+      match conc {
+        TResult(c1, c2) => {
+          l_match_ty_params(a1, c1, subst)
+          l_match_ty_params(a2, c2, subst)
+        }
+        _ => ()
+      }
+    TMap(a1, a2) =>
+      match conc {
+        TMap(c1, c2) => {
+          l_match_ty_params(a1, c1, subst)
+          l_match_ty_params(a2, c2, subst)
+        }
+        _ => ()
+      }
+    TStruct(_, as1) =>
+      match conc {
+        TStruct(_, cs1) => {
+          let mut i = 0
+          while i < as1.length() && i < cs1.length() {
+            l_match_ty_params(as1[i], cs1[i], subst)
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    TEnum(_, as1) =>
+      match conc {
+        TEnum(_, cs1) => {
+          let mut i = 0
+          while i < as1.length() && i < cs1.length() {
+            l_match_ty_params(as1[i], cs1[i], subst)
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    TTuple(as1) =>
+      match conc {
+        TTuple(cs1) => {
+          let mut i = 0
+          while i < as1.length() && i < cs1.length() {
+            l_match_ty_params(as1[i], cs1[i], subst)
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    _ => ()
+  }
+}
+
+///|
+/// Lowers an implicit `#into` conversion on an already-evaluated value `v`.
+fn lb_apply_into_conv(b : LB, v : LExpr, conv : IntoConv, sp : Span) -> LExpr {
+  let rty = lb_ty_of(b, conv.target_ty)
+  let src_ty = l_expr_ty(v)
+  let (key, fpkg, fi_opt) : (String, String, Option[FnInfo]) = if conv.kind == 1 {
+    let gqual = l_gq(b.pkg, conv.qual)
+    let qp = split_qual_name(gqual)
+    ("fn:" + gqual + "::" + conv.name, qp.prefix, lg_find_fn(b.g, qp.prefix, qp.name + "::" + conv.name))
+  } else if conv.kind == 2 {
+    match src_ty {
+      TStruct(gname, _) | TEnum(gname, _) => {
+        let qp = split_qual_name(gname)
+        ("fn:" + gname + "::" + conv.name, qp.prefix, lg_find_fn(b.g, qp.prefix, qp.name + "::" + conv.name))
+      }
+      _ => ("", "", None)
+    }
+  } else {
+    lb_err(b, sp, "unsupported `#into` builtin conversion `" + conv.name + "`", conv.name)
+    return v
+  }
+  match fi_opt {
+    Some(fi) => {
+      lg_enqueue(b.g, key)
+      l_push_unique(b.callees, key)
+      let subst : Map[String, Ty] = Map([])
+      if fi.param_tys.length() > 0 {
+        l_match_ty_params(l_gq_ty(fpkg, fi.param_tys[0]), src_ty, subst)
+      }
+      l_match_ty_params(l_gq_ty(fpkg, fi.ret_ty), rty, subst)
+      let targs : Array[Ty] = []
+      let mut i = 0
+      while i < fi.decl.type_params.length() {
+        let tp = fi.decl.type_params[i]
+        match subst.get(tp) {
+          Some(t) => targs.push(t)
+          None => targs.push(TParam(tp))
+        }
+        i = i + 1
+      }
+      let dicts : Array[LDict] = []
+      match lg_tc(b.g, fpkg) {
+        Some(ftc) => {
+          let mut bi = 0
+          while bi < fi.decl.type_bounds.length() {
+            let tb = fi.decl.type_bounds[bi]
+            let concrete = match subst.get(tb.param) {
+              Some(t) => t
+              None => TParam(tb.param)
+            }
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let tk = l_gq(fpkg, canon_trait_name(ftc, tb.traits[ti]))
+              lg_enqueue(b.g, "trait:" + tk)
+              dicts.push(lb_dict(b, tk, concrete, sp))
+              ti = ti + 1
+            }
+            bi = bi + 1
+          }
+        }
+        None => ()
+      }
+      lb_emit_call(b, rty, CItem(key, targs, dicts), [AVal(v)], [])
+    }
+    None => {
+      lb_err(b, sp, "unknown `#into` conversion `" + conv.name + "`", conv.name)
+      v
+    }
+  }
+}
+
+///|
+/// Lowers `es` left to right, applying any `#into` conversions recorded for `sp`.
+fn lb_exprs_into(b : LB, es : Array[Expr], sp : Span) -> Array[LExpr] {
+  let prefix = span_key(sp) + "#"
+  let out : Array[LExpr] = []
+  let mut i = 0
+  while i < es.length() {
+    let v0 = lb_expr(b, es[i])
+    let v = match b.tc.call_into_convs.get(prefix + i.to_string()) {
+      Some(conv) => lb_apply_into_conv(b, v0, conv, sp)
+      None => v0
+    }
+    let mut later_writes = false
+    let mut j = i + 1
+    while j < es.length() {
+      if l_expr_writes(b.tc, es[j]) {
+        later_writes = true
+        break
+      }
+      j = j + 1
+    }
+    out.push(if later_writes { lb_snapshot(b, v) } else { v })
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// Whether an argument expression (unwrapping `ENamedArg` / `EMutArg`) writes variables.
+fn l_arg_writes(tc : TypeChecker, a : Expr) -> Bool {
+  let inner = match a {
+    ENamedArg(_, _, x, _) => x
+    x => x
+  }
+  match inner {
+    EMutArg(p, _) => l_expr_writes(tc, p)
+    x => l_expr_writes(tc, x)
+  }
+}
+
+///|
 /// A call of a user function / method (`finfo` as seen from `fpkg`).
+/// Evaluates arguments in source-written order (SPEC §3.4/§3.5), applies
+/// `#into` conversions by written argument index before `Some(...)` wrapping,
+/// and packs `args` / `places` in parameter order.
 fn lb_call_user(
   b : LB,
   key : String,
@@ -1931,6 +2172,7 @@ fn lb_call_user(
     Some(_) => 1
     None => 0
   }
+  let n = params.length() - offset
   let slot_tys : Array[Ty] = []
   let slot_mut : Array[Bool] = []
   let mut k = offset
@@ -1944,28 +2186,295 @@ fn lb_call_user(
     slot_mut.push(params[k].is_mut)
     k = k + 1
   }
-  let slots : Array[Expr] = []
-  let wrap_some : Array[Bool] = []
-  lb_resolve_slots(b, params, offset, raw_args, sp, slot_tys, slots, wrap_some)
-  let args : Array[LArg] = []
-  let places : Array[LPlace] = []
+  let order : Array[Int] = match b.tc.call_arg_order.get(span_key(sp)) {
+    Some(o) => o
+    None => {
+      let o : Array[Int] = []
+      let mut j = 0
+      while j < n {
+        o.push(if j < raw_args.length() { j } else { -1 })
+        j = j + 1
+      }
+      o
+    }
+  }
+  let raw_to_slot : Array[Int] = []
+  let mut ri = 0
+  while ri < raw_args.length() {
+    raw_to_slot.push(-1)
+    ri = ri + 1
+  }
+  let def_tc = match lg_tc(b.g, fpkg) {
+    Some(ftc) => ftc
+    None => b.tc
+  }
+  let mut has_default_writes = false
+  k = 0
+  while k < n {
+    let idx = if k < order.length() { order[k] } else { -1 }
+    if idx >= 0 && idx < raw_args.length() {
+      raw_to_slot[idx] = k
+    } else {
+      match params[offset + k].default_expr {
+        Some(d) => if l_expr_writes(def_tc, d) { has_default_writes = true }
+        None => ()
+      }
+    }
+    k = k + 1
+  }
+  // 1. Evaluate receiver first (when present).
+  let mut recv_val : Option[LExpr] = None
+  let mut recv_place : Option[LPlace] = None
   match recv {
     Some(r) => {
-      let all_slots : Array[Expr] = [r]
-      let all_tys : Array[Ty] = [TError]
-      let all_mut : Array[Bool] = [recv_mut]
-      let all_wrap : Array[Bool] = [false]
-      let mut i = 0
-      while i < slots.length() {
-        all_slots.push(slots[i])
-        all_tys.push(slot_tys[i])
-        all_mut.push(slot_mut[i])
-        all_wrap.push(wrap_some[i])
-        i = i + 1
+      let mut recv_later_writes = has_default_writes
+      let mut rj = 0
+      while rj < raw_args.length() {
+        if l_arg_writes(b.tc, raw_args[rj]) {
+          recv_later_writes = true
+          break
+        }
+        rj = rj + 1
       }
-      lb_call_args(b, all_slots, all_tys, all_mut, all_wrap, args, places)
+      if recv_mut {
+        match lb_place(b, r) {
+          Some(pl) => {
+            let v = lb_place_read(b, pl)
+            recv_val = Some(if recv_later_writes { lb_snapshot(b, v) } else { v })
+            recv_place = Some(pl)
+          }
+          None => {
+            lb_err(b, expr_span(r), "`mut` argument is not a place", "expression")
+            recv_val = Some(l_unit())
+          }
+        }
+      } else {
+        let v = lb_expr(b, r)
+        recv_val = Some(if recv_later_writes { lb_snapshot(b, v) } else { v })
+      }
     }
-    None => lb_call_args(b, slots, slot_tys, slot_mut, wrap_some, args, places)
+    None => ()
+  }
+  // 2. Evaluate written arguments strictly left-to-right (source order).
+  let into_prefix = span_key(sp) + "#"
+  let raw_vals : Array[LExpr] = []
+  let raw_places : Array[Option[LPlace]] = []
+  ri = 0
+  while ri < raw_args.length() {
+    let mut later_writes = has_default_writes
+    let mut rj = ri + 1
+    while rj < raw_args.length() {
+      if l_arg_writes(b.tc, raw_args[rj]) {
+        later_writes = true
+        break
+      }
+      rj = rj + 1
+    }
+    let a = raw_args[ri]
+    let (inner0, is_named, fwd) = match a {
+      ENamedArg(_, f, x, _) => (x, true, f)
+      x => (x, false, false)
+    }
+    let inner = match inner0 {
+      EMutArg(p, _) => p
+      _ => inner0
+    }
+    let sk = raw_to_slot[ri]
+    let is_mut = sk >= 0 && sk < slot_mut.length() && slot_mut[sk]
+    if is_mut {
+      match lb_place(b, inner) {
+        Some(pl) => {
+          let v = lb_place_read(b, pl)
+          raw_vals.push(if later_writes { lb_snapshot(b, v) } else { v })
+          raw_places.push(Some(pl))
+        }
+        None => {
+          lb_err(b, expr_span(a), "`mut` argument is not a place", "expression")
+          raw_vals.push(l_unit())
+          raw_places.push(None)
+        }
+      }
+    } else {
+      let v0 = lb_expr(b, inner)
+      let v1 = match b.tc.call_into_convs.get(into_prefix + ri.to_string()) {
+        Some(conv) => lb_apply_into_conv(b, v0, conv, sp)
+        None => v0
+      }
+      let do_wrap = sk >= 0 && is_named && params[offset + sk].label_kind == 2 && !fwd
+      let v2 = if do_wrap {
+        LCtor("Option", "Some", [v1], slot_tys[sk])
+      } else {
+        v1
+      }
+      raw_vals.push(if later_writes { lb_snapshot(b, v2) } else { v2 })
+      raw_places.push(None)
+    }
+    ri = ri + 1
+  }
+  // 3. Assemble `args` and `places` in parameter order (evaluating omitted defaults).
+  let mut has_any_default = false
+  k = 0
+  while k < n {
+    let idx = if k < order.length() { order[k] } else { -1 }
+    if !(idx >= 0 && idx < raw_vals.length()) {
+      match params[offset + k].default_expr {
+        Some(_) => {
+          has_any_default = true
+          break
+        }
+        None => ()
+      }
+    }
+    k = k + 1
+  }
+  let param_bindings : Map[String, String] = Map([])
+  let args : Array[LArg] = []
+  let places : Array[LPlace] = []
+  match recv_val {
+    Some(rv) => {
+      let rv_use = if has_any_default && params.length() > 0 {
+        let a = match rv {
+          LVar(_, _) => rv
+          _ => {
+            let t = l_expr_ty(rv)
+            let tn = lb_temp(b, t)
+            lb_emit(b, LSLet(tn, t, rv))
+            LVar(tn, t)
+          }
+        }
+        match a {
+          LVar(vn, _) => param_bindings.set(params[0].name, vn)
+          _ => ()
+        }
+        a
+      } else {
+        rv
+      }
+      if recv_mut {
+        args.push(AMut(rv_use))
+        match recv_place {
+          Some(pl) => places.push(pl)
+          None => ()
+        }
+      } else {
+        args.push(AVal(rv_use))
+      }
+    }
+    None => ()
+  }
+  k = 0
+  while k < n {
+    let idx = if k < order.length() { order[k] } else { -1 }
+    let arg_expr = if idx >= 0 && idx < raw_vals.length() {
+      let rv = raw_vals[idx]
+      let rv_use = if has_any_default {
+        match rv {
+          LVar(vn, _) => {
+            param_bindings.set(params[offset + k].name, vn)
+            rv
+          }
+          _ => {
+            let t = l_expr_ty(rv)
+            let tn = lb_temp(b, t)
+            lb_emit(b, LSLet(tn, t, rv))
+            param_bindings.set(params[offset + k].name, tn)
+            LVar(tn, t)
+          }
+        }
+      } else {
+        rv
+      }
+      if slot_mut[k] {
+        args.push(AMut(rv_use))
+        match raw_places[idx] {
+          Some(pl) => places.push(pl)
+          None => ()
+        }
+      } else {
+        args.push(AVal(rv_use))
+      }
+      rv_use
+    } else {
+      match params[offset + k].default_expr {
+        Some(d) => {
+          let mut def_later_writes = false
+          let mut k2 = k + 1
+          while k2 < n {
+            let idx2 = if k2 < order.length() { order[k2] } else { -1 }
+            if idx2 < 0 {
+              match params[offset + k2].default_expr {
+                Some(d2) =>
+                  if l_expr_writes(def_tc, d2) {
+                    def_later_writes = true
+                    break
+                  }
+                None => ()
+              }
+            }
+            k2 = k2 + 1
+          }
+          // Default argument expressions are evaluated in the callee's package
+          // with prior parameters (j < k) in scope, no caller-local bindings,
+          // and the call's generic type substitution active.
+          let saved_scopes = b.scopes
+          let saved_pkg = b.pkg
+          let saved_tc = b.tc
+          let saved_subst = b.type_subst
+          b.scopes = [param_bindings.copy()]
+          b.pkg = fpkg
+          b.tc = def_tc
+          b.type_subst = subst
+          let dv0 = match d {
+            EIdent("None", _) =>
+              if param_bindings.contains("None") {
+                lb_expr(b, d)
+              } else {
+                LCtor("Option", "None", [], slot_tys[k])
+              }
+            _ => lb_expr(b, d)
+          }
+          b.scopes = saved_scopes
+          b.pkg = saved_pkg
+          b.tc = saved_tc
+          b.type_subst = saved_subst
+          let dv = if def_later_writes { lb_snapshot(b, dv0) } else { dv0 }
+          let dv_use = if has_any_default {
+            match dv {
+              LVar(vn, _) => {
+                param_bindings.set(params[offset + k].name, vn)
+                dv
+              }
+              _ => {
+                let t = l_expr_ty(dv)
+                let tn = lb_temp(b, t)
+                lb_emit(b, LSLet(tn, t, dv))
+                param_bindings.set(params[offset + k].name, tn)
+                LVar(tn, t)
+              }
+            }
+          } else {
+            dv
+          }
+          args.push(AVal(dv_use))
+          dv_use
+        }
+        None => {
+          let nv = LCtor("Option", "None", [], slot_tys[k])
+          let nv_use = if has_any_default {
+            let tn = lb_temp(b, slot_tys[k])
+            lb_emit(b, LSLet(tn, slot_tys[k], nv))
+            param_bindings.set(params[offset + k].name, tn)
+            LVar(tn, slot_tys[k])
+          } else {
+            nv
+          }
+          args.push(AVal(nv_use))
+          nv_use
+        }
+      }
+    }
+    let _ = arg_expr
+    k = k + 1
   }
   let dicts : Array[LDict] = []
   match lg_tc(b.g, fpkg) {
@@ -2025,7 +2534,7 @@ fn lb_call(b : LB, e : Expr) -> LExpr {
           _ => false
         }
         if !is_fn {
-          return LCtor(ek, vname, lb_exprs(b, raw_args), ty)
+          return LCtor(ek, vname, lb_exprs_into(b, raw_args, sp), ty)
         }
       }
       None => ()
@@ -2059,19 +2568,74 @@ fn lb_call(b : LB, e : Expr) -> LExpr {
               EArrayLit(elems, _) => {
                 let mut ei = 0
                 while ei < elems.length() {
+                  let mut later_w = false
+                  let mut ej = ei + 1
+                  while ej < elems.length() {
+                    if l_expr_writes(b.tc, elems[ej]) {
+                      later_w = true
+                      break
+                    }
+                    ej = ej + 1
+                  }
                   match elems[ei] {
-                    ETuple(ps, _) =>
-                      if ps.length() == 2 {
-                        let kv = lb_expr(b, ps[0])
-                        let vv = lb_expr(b, ps[1])
-                        acc = LPure("Pion.Map.set", [acc, kv, vv], ty)
+                    ETuple(ps, _) if ps.length() == 2 => {
+                      let kv0 = lb_expr(b, ps[0])
+                      let kv = if l_expr_writes(b.tc, ps[1]) || later_w {
+                        lb_snapshot(b, kv0)
+                      } else {
+                        kv0
                       }
-                    _ => ()
+                      let vv0 = lb_expr(b, ps[1])
+                      let vv = if later_w { lb_snapshot(b, vv0) } else { vv0 }
+                      acc = LPure("Pion.Map.set", [acc, kv, vv], ty)
+                    }
+                    elem => {
+                      let pv0 = lb_atom(b, lb_expr(b, elem))
+                      let pv = if later_w { lb_snapshot(b, pv0) } else { pv0 }
+                      let pt = l_expr_ty(pv)
+                      acc = LPure("Pion.Map.set", [acc, LTupleGet(pv, 0, pt), LTupleGet(pv, 1, pt)], ty)
+                    }
                   }
                   ei = ei + 1
                 }
               }
-              _ => ()
+              pairs_expr => {
+                let av = lb_atom(b, lb_expr(b, pairs_expr))
+                let at = l_expr_ty(av)
+                let et = l_elem_ty(at)
+                let ns = l_container_ns(at)
+                let mvar = lb_fresh(b, "__map")
+                b.var_tys.set(mvar, ty)
+                lb_emit(b, LSLet(mvar, ty, acc))
+                let ii = lb_fresh(b, "__i")
+                b.var_tys.set(ii, TInt)
+                lb_emit(b, LSLet(ii, TInt, l_int_lit(0, TInt)))
+                let nn = lb_temp(b, TInt)
+                lb_emit(b, LSCall(nn, TInt, CBuiltin(ns + ".length"), [AVal(av)], [], false))
+                let pv = lb_temp(b, et)
+                let step_stmts : Array[LStmt] = [
+                  LSCall(pv, et, CBuiltin(ns + ".get"), [AVal(av), AVal(LVar(ii, TInt))], [], false),
+                  LSAssign(
+                    mvar,
+                    LPure("Pion.Map.set", [LVar(mvar, ty), LTupleGet(LVar(pv, et), 0, et), LTupleGet(LVar(pv, et), 1, et)], ty),
+                  ),
+                  LSAssign(ii, LBin("+", LVar(ii, TInt), l_int_lit(1, TInt), TInt)),
+                ]
+                let lbody = LBlock::{
+                  stmts: [
+                    LSIf(
+                      LBin("<", LVar(ii, TInt), LVar(nn, TInt), TInt),
+                      LBlock::{ stmts: step_stmts, tail: None },
+                      LBlock::{ stmts: [LSBreak], tail: None },
+                      "",
+                      TUnit,
+                    ),
+                  ],
+                  tail: None,
+                }
+                lb_emit(b, LSLoop(lbody))
+                return LVar(mvar, ty)
+              }
             }
           }
           return acc
@@ -2195,7 +2759,7 @@ fn l_elem_ty(t : Ty) -> Ty {
   match t {
     TArray(e) | TFixedArray(e) | TImmArray(e) => e
     TBytes | TBytesView => TByte
-    TStrView => TInt
+    TString | TStrView => TInt
     _ => TError
   }
 }
@@ -2210,16 +2774,27 @@ fn lb_builtin_method(
   ty : Ty,
   sp : Span,
 ) -> LExpr {
-  let rt = lb_expr_ty(b, obj)
+  let rt0 = lb_expr_ty(b, obj)
+  let rt = match rt0 {
+    TError =>
+      match obj {
+        EIdent(nm, _) =>
+          match lb_lookup(b, nm) {
+            Some(ln) => lb_var_ty(b, ln)
+            None => TError
+          }
+        _ => TError
+      }
+    _ => rt0
+  }
+  let res_ty = match ty {
+    TError => if m == "copy" { rt } else { TError }
+    _ => ty
+  }
   match rt {
     TArray(_) | TFixedArray(_) | TImmArray(_) | TBytes => {
       let ns = l_container_ns(rt)
-      let mutating = m == "push" ||
-        m == "pop" ||
-        m == "clear" ||
-        m == "reverse" ||
-        m == "fill" ||
-        m == "swap"
+      let mutating = l_is_arr_mutating(m)
       if mutating {
         let pl = match lb_place(b, obj) {
           Some(p) => p
@@ -2281,7 +2856,7 @@ fn lb_builtin_method(
         return LVar(n, ty)
       }
       if m == "copy" || m == "contains" {
-        return LPure(ns + "." + m, all, ty)
+        return LPure(ns + "." + m, all, res_ty)
       }
       match rt {
         TImmArray(_) =>
@@ -2304,11 +2879,7 @@ fn lb_builtin_method(
       }
     }
     TStringBuilder => {
-      let mutating = m == "write_byte" ||
-        m == "write_string" ||
-        m == "write_substring" ||
-        m == "clear" ||
-        m == "reset"
+      let mutating = l_is_sb_lowerable_mutating(m)
       if mutating {
         let pl = match lb_place(b, obj) {
           Some(p) => p
@@ -2345,7 +2916,7 @@ fn lb_builtin_method(
       }
     }
     TMap(_, _) => {
-      let mutating = m == "set" || m == "remove" || m == "clear"
+      let mutating = l_is_map_mutating(m)
       if mutating {
         let pl = match lb_place(b, obj) {
           Some(p) => p
@@ -2776,7 +3347,10 @@ fn lb_pat_into(b : LB, p : Pattern, st : Ty, checks : Array[LExpr]) -> LPat {
       checks.push(LBin("==", LVar(v, st), LLit(l_lit_kind(st), l_int_text(s, st, false), st), st))
       LPVar(v, st)
     }
-    PString(s, _) => {
+    PString(s, sp) => {
+      if l_str_has_raw_byte_pua(s) {
+        lb_err(b, sp, "non-UTF-8 raw byte escape (`\\x80`..`\\xFF`) in string pattern is not extractable", "string pattern")
+      }
       let v = lb_temp(b, st)
       checks.push(LBin("==", LVar(v, st), LLit("string", s, TString), st))
       LPVar(v, st)
@@ -2940,41 +3514,88 @@ fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, d
       _ => ()
     }
   }
-  let conds : Array[LExpr] = []
-  let mut ci = 0
-  while ci < checks.length() {
-    conds.push(checks[ci])
-    ci = ci + 1
-  }
-  match arm.guard_e {
-    Some(gx) => conds.push(lb_expr(b, gx))
-    None => ()
-  }
   let body = lb_code_block(b, arm.code, ty)
+  let has_cond = checks.length() > 0 || (match arm.guard_e { Some(_) => true; None => false })
   if irref {
-    // `x if g => B` / literal pattern: no `match`, just `if g { B } else { REST }`.
-    if conds.length() > 0 {
-      lb_emit(b, LSIf(l_and_all(conds), body, rest, dest, ty))
-    } else {
-      l_inline_block(b, body, dest, ty)
+    match arm.guard_e {
+      Some(gx) =>
+        if checks.length() > 0 {
+          // Compute `gcond = if checks { gx } else { false }` so `rest` is emitted
+          // once (no exponential blowup) and `gx` never runs when `checks` fail.
+          let gcond = lb_temp(b, TBool)
+          lb_open(b)
+          let gv = lb_expr(b, gx)
+          let gblk = lb_close(b, Some(gv))
+          lb_emit(b, LSIf(l_and_all(checks), gblk, LBlock::{ stmts: [], tail: Some(l_bool(false)) }, gcond, TBool))
+          lb_emit(b, LSIf(LVar(gcond, TBool), body, rest, dest, ty))
+        } else {
+          let gv = lb_expr(b, gx)
+          lb_emit(b, LSIf(gv, body, rest, dest, ty))
+        }
+      None =>
+        if checks.length() > 0 {
+          lb_emit(b, LSIf(l_and_all(checks), body, rest, dest, ty))
+        } else {
+          l_inline_block(b, body, dest, ty)
+        }
     }
     let pre = lb_close(b, None)
     lb_pop_scope(b)
     l_inline_block(b, pre, "", ty)
     return
   }
-  let inner_dest = if want { lb_temp(b, ty) } else { "" }
-  if conds.length() > 0 {
-    lb_emit(b, LSIf(l_and_all(conds), body, rest, inner_dest, ty))
+  if !has_cond {
+    let arm_block0 = lb_close(b, None)
+    lb_pop_scope(b)
+    let arm_block = l_concat_block(arm_block0.stmts, body)
+    lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: rest }], dest, ty))
+    return
+  }
+  // Refutable pattern + checks/guard: evaluate arm to `Option[ty]` (or `Bool`
+  // when `Unit`), then dispatch to `rest` exactly once (no exponential blowup).
+  let res_ty = if want { TOption(ty) } else { TBool }
+  let inner_dest = lb_temp(b, res_ty)
+  let matched_tail : Option[LExpr] = if want {
+    match body.tail {
+      Some(v) => Some(LCtor("Option", "Some", [v], res_ty))
+      None => None
+    }
+  } else if body.stmts.length() > 0 && l_stmt_diverges(body.stmts[body.stmts.length() - 1]) {
+    None
+  } else {
+    Some(l_bool(true))
+  }
+  let matched_blk = LBlock::{ stmts: body.stmts, tail: matched_tail }
+  let miss_val = if want { LCtor("Option", "None", [], res_ty) } else { l_bool(false) }
+  let miss_blk = LBlock::{ stmts: [], tail: Some(miss_val) }
+  match arm.guard_e {
+    Some(gx) =>
+      if checks.length() > 0 {
+        let gcond = lb_temp(b, TBool)
+        lb_open(b)
+        let gv = lb_expr(b, gx)
+        let gblk = lb_close(b, Some(gv))
+        lb_emit(b, LSIf(l_and_all(checks), gblk, LBlock::{ stmts: [], tail: Some(l_bool(false)) }, gcond, TBool))
+        lb_emit(b, LSIf(LVar(gcond, TBool), matched_blk, miss_blk, inner_dest, res_ty))
+      } else {
+        let gv = lb_expr(b, gx)
+        lb_emit(b, LSIf(gv, matched_blk, miss_blk, inner_dest, res_ty))
+      }
+    None => lb_emit(b, LSIf(l_and_all(checks), matched_blk, miss_blk, inner_dest, res_ty))
   }
   let arm_block0 = lb_close(b, None)
   lb_pop_scope(b)
-  let arm_block = if conds.length() > 0 {
-    LBlock::{ stmts: arm_block0.stmts, tail: if want { Some(LVar(inner_dest, ty)) } else { None } }
+  let arm_block = LBlock::{ stmts: arm_block0.stmts, tail: Some(LVar(inner_dest, res_ty)) }
+  let mres = lb_temp(b, res_ty)
+  lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: miss_blk }], mres, res_ty))
+  if want {
+    let mv = lb_temp(b, ty)
+    let some_arm = LArm::{ pat: LPCtor("Option", "Some", [LPVar(mv, ty)]), body: LBlock::{ stmts: [], tail: Some(LVar(mv, ty)) } }
+    let none_arm = LArm::{ pat: LPCtor("Option", "None", []), body: rest }
+    lb_emit(b, LSMatch(LVar(mres, res_ty), res_ty, [some_arm, none_arm], dest, ty))
   } else {
-    l_concat_block(arm_block0.stmts, body)
+    lb_emit(b, LSIf(LVar(mres, TBool), LBlock::{ stmts: [], tail: None }, rest, "", TUnit))
   }
-  lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: rest }], dest, ty))
 }
 
 ///|
@@ -3047,8 +3668,17 @@ fn l_inline_block(b : LB, blk : LBlock, dest : String, ty : Ty) -> Unit {
 
 ///|
 fn lb_match(b : LB, scrut : Expr, arms : Array[MatchArm], ty : Ty) -> LExpr {
+  let mut has_guard = false
+  let mut gi = 0
+  while gi < arms.length() {
+    match arms[gi].guard_expr {
+      Some(_) => has_guard = true
+      None => ()
+    }
+    gi = gi + 1
+  }
   let sv0 = lb_expr(b, scrut)
-  let sv = lb_atom(b, sv0)
+  let sv = if has_guard { lb_snapshot(b, sv0) } else { lb_atom(b, sv0) }
   let st = l_expr_ty(sv)
   let marms : Array[LMArm] = []
   let mut i = 0
@@ -3086,7 +3716,16 @@ fn lb_try(b : LB, inner : Expr, sp : Span) -> LExpr {
       let x = lb_temp(b, t)
       let er = lb_temp(b, et)
       let ok_arm = LArm::{ pat: LPCtor("Result", "Ok", [LPVar(x, t)]), body: LBlock::{ stmts: [], tail: Some(LVar(x, t)) } }
-      let err_arm = LArm::{ pat: LPCtor("Result", "Err", [LPVar(er, et)]), body: LBlock::{ stmts: [LSReturn(LCtor("Result", "Err", [LVar(er, et)], b.ret_ty))], tail: None } }
+      let err_body = match b.tc.try_into_convs.get(span_key(sp)) {
+        Some(conv) => {
+          lb_open(b)
+          let ev = lb_apply_into_conv(b, LVar(er, et), conv, sp)
+          lb_emit(b, LSReturn(LCtor("Result", "Err", [ev], b.ret_ty)))
+          lb_close(b, None)
+        }
+        None => LBlock::{ stmts: [LSReturn(LCtor("Result", "Err", [LVar(er, et)], b.ret_ty))], tail: None }
+      }
+      let err_arm = LArm::{ pat: LPCtor("Result", "Err", [LPVar(er, et)]), body: err_body }
       lb_emit(b, LSMatch(v, it, [ok_arm, err_arm], dest, t))
       LVar(dest, t)
     }
@@ -3270,9 +3909,13 @@ fn lb_stmt(b : LB, s : Stmt) -> Unit {
       lb_push_scope(b)
       lb_stmt(b, init)
       lb_open(b)
-      b.preludes.push(PStep(step))
+      b.preludes.push(PStep(step, b.scopes.length()))
       lb_push_scope(b)
-      let _ = lb_cond_branch(b, cond, LCLoopBody(body), LCBreak, TUnit)
+      // C-style `for` conditions are checked as plain expressions: `is` pattern
+      // bindings inside `cond` do not extend into the loop body.
+      let cv = lb_expr(b, cond)
+      let tb = lb_code_block(b, LCLoopBody(body), TUnit)
+      lb_emit(b, LSIf(cv, tb, LBlock::{ stmts: [LSBreak], tail: None }, "", TUnit))
       lb_pop_scope(b)
       let _ = b.preludes.pop()
       let lbody = lb_close(b, None)
@@ -3284,7 +3927,8 @@ fn lb_stmt(b : LB, s : Stmt) -> Unit {
         TError => TInt
         t => t
       }
-      let sv = lb_expr(b, start)
+      let sv0 = lb_expr(b, start)
+      let sv = if l_expr_writes(b.tc, end) { lb_snapshot(b, sv0) } else { sv0 }
       let ev = lb_snapshot(b, lb_expr(b, end))
       lb_push_scope(b)
       let iv = lb_declare(b, var, ty)
@@ -3400,9 +4044,21 @@ fn lb_emit_prelude(b : LB) -> Unit {
   }
   match b.preludes[b.preludes.length() - 1] {
     PNone => ()
-    PStep(st) => {
-      // The step runs in the loop's scope, outside the body's own bindings.
+    PStep(st, scope_len) => {
+      // The step runs in the loop header's scope, outside any body-local shadowing.
+      let saved : Array[Map[String, String]] = []
+      while b.scopes.length() > scope_len {
+        match b.scopes.pop() {
+          Some(sc) => saved.push(sc)
+          None => break
+        }
+      }
       lb_stmt(b, st)
+      let mut si = saved.length() - 1
+      while si >= 0 {
+        b.scopes.push(saved[si])
+        si = si - 1
+      }
     }
     PIncr(iv, ty) => lb_emit(b, LSAssign(iv, LBin("+", LVar(iv, ty), l_int_lit(1, ty), ty)))
     PIncrIncl(iv, ev, done, ty) => {
@@ -3513,7 +4169,100 @@ fn lg_collect_map_key_tparams(t : Ty, tps : Array[String], out : Array[String]) 
 }
 
 ///|
-fn lg_eq_tparams(tc : TypeChecker, decl : FnDecl, fi : FnInfo) -> Array[String] {
+fn lg_collect_expr_map_key_tparams(e : LExpr, tps : Array[String], out : Array[String]) -> Unit {
+  lg_collect_map_key_tparams(l_expr_ty(e), tps, out)
+  match e {
+    LBin(_, a, b, t) => {
+      lg_collect_map_key_tparams(t, tps, out)
+      lg_collect_expr_map_key_tparams(a, tps, out)
+      lg_collect_expr_map_key_tparams(b, tps, out)
+    }
+    LUn(_, a, t) | LField(a, _, t, _) | LTupleGet(a, _, t) => {
+      lg_collect_map_key_tparams(t, tps, out)
+      lg_collect_expr_map_key_tparams(a, tps, out)
+    }
+    LCtor(_, _, es, _) | LStruct(_, es, _) | LTuple(es, _) | LArrayLit(es, _) | LPure(_, es, _) => {
+      let mut i = 0
+      while i < es.length() {
+        lg_collect_expr_map_key_tparams(es[i], tps, out)
+        i = i + 1
+      }
+    }
+    LIte(c, a, b, _) => {
+      lg_collect_expr_map_key_tparams(c, tps, out)
+      lg_collect_expr_map_key_tparams(a, tps, out)
+      lg_collect_expr_map_key_tparams(b, tps, out)
+    }
+    _ => ()
+  }
+}
+
+///|
+fn lg_collect_block_map_key_tparams(blk : LBlock, tps : Array[String], out : Array[String]) -> Unit {
+  let mut i = 0
+  while i < blk.stmts.length() {
+    match blk.stmts[i] {
+      LSLet(_, t, v) => {
+        lg_collect_map_key_tparams(t, tps, out)
+        lg_collect_expr_map_key_tparams(v, tps, out)
+      }
+      LSLetTuple(_, ts, v) => {
+        let mut j = 0
+        while j < ts.length() {
+          lg_collect_map_key_tparams(ts[j], tps, out)
+          j = j + 1
+        }
+        lg_collect_expr_map_key_tparams(v, tps, out)
+      }
+      LSAssign(_, v) | LSReturn(v) | LSAssert(v) => lg_collect_expr_map_key_tparams(v, tps, out)
+      LSSetField(_, t, _, tys, v) => {
+        lg_collect_map_key_tparams(t, tps, out)
+        let mut j = 0
+        while j < tys.length() {
+          lg_collect_map_key_tparams(tys[j], tps, out)
+          j = j + 1
+        }
+        lg_collect_expr_map_key_tparams(v, tps, out)
+      }
+      LSCall(_, t, _, args, _, _) => {
+        lg_collect_map_key_tparams(t, tps, out)
+        let mut j = 0
+        while j < args.length() {
+          match args[j] {
+            AVal(v) | AMut(v) => lg_collect_expr_map_key_tparams(v, tps, out)
+          }
+          j = j + 1
+        }
+      }
+      LSIf(c, tb, eb, _, t) => {
+        lg_collect_map_key_tparams(t, tps, out)
+        lg_collect_expr_map_key_tparams(c, tps, out)
+        lg_collect_block_map_key_tparams(tb, tps, out)
+        lg_collect_block_map_key_tparams(eb, tps, out)
+      }
+      LSMatch(s, st, arms, _, t) => {
+        lg_collect_map_key_tparams(st, tps, out)
+        lg_collect_map_key_tparams(t, tps, out)
+        lg_collect_expr_map_key_tparams(s, tps, out)
+        let mut j = 0
+        while j < arms.length() {
+          lg_collect_block_map_key_tparams(arms[j].body, tps, out)
+          j = j + 1
+        }
+      }
+      LSLoop(body) => lg_collect_block_map_key_tparams(body, tps, out)
+      _ => ()
+    }
+    i = i + 1
+  }
+  match blk.tail {
+    Some(v) => lg_collect_expr_map_key_tparams(v, tps, out)
+    None => ()
+  }
+}
+
+///|
+fn lg_eq_tparams(tc : TypeChecker, decl : FnDecl, fi : FnInfo, body : Option[LBlock]) -> Array[String] {
   let out : Array[String] = []
   match tc.eq_tparams.get(span_key(decl.span)) {
     Some(tps) => {
@@ -3532,6 +4281,10 @@ fn lg_eq_tparams(tc : TypeChecker, decl : FnDecl, fi : FnInfo) -> Array[String] 
       i = i + 1
     }
     lg_collect_map_key_tparams(fi.ret_ty, decl.type_params, out)
+    match body {
+      Some(blk) => lg_collect_block_map_key_tparams(blk, decl.type_params, out)
+      None => ()
+    }
   }
   out
 }
@@ -3563,7 +4316,7 @@ fn lg_lower_fn(g : LG, tc : TypeChecker, key : String, lean_name : String, fi : 
     lean_name: lean_name,
     type_params: decl.type_params,
     bounds: bounds,
-    eq_tparams: lg_eq_tparams(tc, decl, fi),
+    eq_tparams: lg_eq_tparams(tc, decl, fi, Some(body)),
     params: params,
     ret_ty: ret,
     body: body,
@@ -3597,7 +4350,7 @@ fn lg_extern_of_fn(g : LG, tc : TypeChecker, key : String, lean_name : String, f
     lean_name: lean_name,
     type_params: decl.type_params,
     bounds: bounds,
-    eq_tparams: lg_eq_tparams(tc, decl, fi),
+    eq_tparams: lg_eq_tparams(tc, decl, fi, None),
     params: params,
     ret_ty: ret,
     kind: "verify_opaque",
@@ -4022,6 +4775,7 @@ pub fn llbc_build(inputs : Array[LlbcInput]) -> LlbcResult {
     lg_process(g, g.work[wi])
     wi = wi + 1
   }
+  lg_propagate_all_eq_tparams(g.pkgs)
   // Cross-package dependencies.
   let result : Array[LlbcPkg] = []
   pi = 0
@@ -4121,4 +4875,143 @@ pub fn llbc_build(inputs : Array[LlbcInput]) -> LlbcResult {
     pi = pi + 1
   }
   LlbcResult::{ pkgs: result, diagnostics: g.diags }
+}
+
+///|
+fn lg_collect_ty_tparams(t : Ty, allowed : Array[String], out : Array[String]) -> Bool {
+  match t {
+    TParam(tp) =>
+      if str_arr_contains(allowed, tp) && !str_arr_contains(out, tp) {
+        out.push(tp)
+        true
+      } else {
+        false
+      }
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) =>
+      lg_collect_ty_tparams(e, allowed, out)
+    TResult(a, b) | TMap(a, b) => {
+      let c1 = lg_collect_ty_tparams(a, allowed, out)
+      let c2 = lg_collect_ty_tparams(b, allowed, out)
+      c1 || c2
+    }
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut changed = false
+      let mut i = 0
+      while i < args.length() {
+        if lg_collect_ty_tparams(args[i], allowed, out) {
+          changed = true
+        }
+        i = i + 1
+      }
+      changed
+    }
+    _ => false
+  }
+}
+
+///|
+fn lg_propagate_block_eq_tparams(
+  blk : LBlock,
+  caller_tps : Array[String],
+  caller_eq : Array[String],
+  fn_map : Map[String, LFnDef],
+  ext_map : Map[String, LExternDef],
+) -> Bool {
+  let mut changed = false
+  let mut i = 0
+  while i < blk.stmts.length() {
+    match blk.stmts[i] {
+      LSCall(_, _, CItem(gkey, targs, _), _, _, _) => {
+        let mut callee_tps : Array[String] = []
+        let mut callee_eq : Array[String] = []
+        match fn_map.get(gkey) {
+          Some(gf) => {
+            callee_tps = gf.type_params
+            callee_eq = gf.eq_tparams
+          }
+          None =>
+            match ext_map.get(gkey) {
+              Some(gx) => {
+                callee_tps = gx.type_params
+                callee_eq = gx.eq_tparams
+              }
+              None => ()
+            }
+        }
+        let mut m = 0
+        while m < callee_tps.length() && m < targs.length() {
+          if str_arr_contains(callee_eq, callee_tps[m]) {
+            if lg_collect_ty_tparams(targs[m], caller_tps, caller_eq) {
+              changed = true
+            }
+          }
+          m = m + 1
+        }
+      }
+      LSIf(_, tb, eb, _, _) => {
+        if lg_propagate_block_eq_tparams(tb, caller_tps, caller_eq, fn_map, ext_map) {
+          changed = true
+        }
+        if lg_propagate_block_eq_tparams(eb, caller_tps, caller_eq, fn_map, ext_map) {
+          changed = true
+        }
+      }
+      LSMatch(_, _, arms, _, _) => {
+        let mut j = 0
+        while j < arms.length() {
+          if lg_propagate_block_eq_tparams(arms[j].body, caller_tps, caller_eq, fn_map, ext_map) {
+            changed = true
+          }
+          j = j + 1
+        }
+      }
+      LSLoop(body) =>
+        if lg_propagate_block_eq_tparams(body, caller_tps, caller_eq, fn_map, ext_map) {
+          changed = true
+        }
+      _ => ()
+    }
+    i = i + 1
+  }
+  changed
+}
+
+///|
+fn lg_propagate_all_eq_tparams(pkgs : Array[LlbcPkg]) -> Unit {
+  let fn_map : Map[String, LFnDef] = Map([])
+  let ext_map : Map[String, LExternDef] = Map([])
+  let mut pi = 0
+  while pi < pkgs.length() {
+    let p = pkgs[pi]
+    let mut i = 0
+    while i < p.fns.length() {
+      fn_map.set(p.fns[i].key, p.fns[i])
+      i = i + 1
+    }
+    i = 0
+    while i < p.externs.length() {
+      ext_map.set(p.externs[i].key, p.externs[i])
+      i = i + 1
+    }
+    pi = pi + 1
+  }
+  let mut changed = true
+  while changed {
+    changed = false
+    pi = 0
+    while pi < pkgs.length() {
+      let p = pkgs[pi]
+      let mut i = 0
+      while i < p.fns.length() {
+        let f = p.fns[i]
+        if f.type_params.length() > 0 {
+          if lg_propagate_block_eq_tparams(f.body, f.type_params, f.eq_tparams, fn_map, ext_map) {
+            changed = true
+          }
+        }
+        i = i + 1
+      }
+      pi = pi + 1
+    }
+  }
 }

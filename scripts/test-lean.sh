@@ -66,7 +66,7 @@ fi
 
 echo "=== [2/7] pionc extract-lean ==="
 cd "$PROJ"
-for pkg in tests/e2e/p35a_verify_mut/vlib tests/lean/algos tests/lean/codec tests/lean/captable tests/lean/diff/diff_cases tools/qbe_tv; do
+for pkg in tests/e2e/p35a_verify_mut/vlib tests/lean/algos tests/lean/codec tests/lean/captable tests/lean/diff/diff_cases tools/qbe_tv tests/lean/pr3_soundness; do
   set +e
   EXTRACT_JSON=$("$PIONC" extract-lean --json --out "$PROJ" "$ROOT_DIR/$pkg" 2>&1)
   RC=$?
@@ -77,7 +77,7 @@ for pkg in tests/e2e/p35a_verify_mut/vlib tests/lean/algos tests/lean/codec test
     exit 1
   fi
 done
-for m in Vlib Algos Codec Captable DiffCases QbeTv; do
+for m in Vlib Algos Codec Captable DiffCases QbeTv Pr3Dep Pr3Soundness; do
   for f in Types Funs FunsExternal FunsExternal_Template; do
     if [ ! -f "$PROJ/$m/$f.lean" ]; then
       echo "FAIL: missing $m/$f.lean" >&2
@@ -89,7 +89,8 @@ mkdir -p "$PROJ/PionProofs"
 cp "$ROOT_DIR"/tests/lean/proofs/*.lean "$PROJ/PionProofs/"
 cp "$ROOT_DIR/tests/lean/Eval.lean" "$PROJ/Eval.lean"
 cp "$ROOT_DIR/tests/lean/diff/DiffEval.lean" "$PROJ/DiffEval.lean"
-for lib in Vlib Algos Codec Captable DiffCases QbeTv PionProofs; do
+cp "$ROOT_DIR/tests/lean/pr3_soundness/Eval.lean" "$PROJ/Pr3Eval.lean"
+for lib in Vlib Algos Codec Captable DiffCases QbeTv Pr3Dep Pr3Soundness PionProofs; do
   printf '\nlean_lib %s where\n  globs := #[.submodules `%s]\n' "$lib" "$lib" >> "$PROJ/lakefile.lean"
 done
 if grep -rnwE "sorry|admit|bv_decide|native_decide" "$PROJ/PionProofs" >/dev/null; then
@@ -103,7 +104,7 @@ lake build PionLean >/dev/null
 
 echo "=== [4/7] lake build extracted libraries and PionProofs ==="
 set +e
-lake build Vlib Algos Codec Captable DiffCases QbeTv PionProofs > "$WORK/build.log" 2>&1
+lake build Vlib Algos Codec Captable DiffCases QbeTv Pr3Dep Pr3Soundness PionProofs > "$WORK/build.log" 2>&1
 RC=$?
 set -e
 grep -v '^✔\|^trace\|^info' "$WORK/build.log" | tail -80
@@ -200,4 +201,69 @@ if ! diff -u "$DIFF_OUT/native.out" "$DIFF_OUT/lean.out"; then
 fi
 TRAPS=$(grep -c ': TRAP$' "$DIFF_OUT/native.out")
 echo "differential: $CASES cases ($TRAPS traps), diff -u exit 0"
+
+echo "=== [7b/7] PR-3 soundness differential & negative extraction checks ==="
+PR3_DIR="$ROOT_DIR/tests/lean/pr3_soundness"
+PR3_OUT="$WORK/pr3"
+rm -rf "$PR3_OUT"
+mkdir -p "$PR3_OUT"
+sed -n 's/^pub fn \(c_[a-z0-9_]*\)().*/\1/p' "$PR3_DIR/src/lib.pion" > "$PR3_OUT/cases"
+PION_CACHE_DIR="$PR3_OUT/cas" "$PIONC" build --release -o "$PR3_OUT/runner" "$PR3_DIR/native_runner"
+: > "$PR3_OUT/native.out"
+while IFS= read -r c; do
+  set +e
+  V=$("$PR3_OUT/runner" "$c" 2>/dev/null)
+  RC=$?
+  set -e
+  case "$RC" in
+    0) printf '%s\n' "$V" >> "$PR3_OUT/native.out" ;;
+    134) printf '%s: TRAP\n' "$c" >> "$PR3_OUT/native.out" ;;
+    *)
+      echo "FAIL: pr3 native case $c exited with $RC" >&2
+      exit 1
+      ;;
+  esac
+done < "$PR3_OUT/cases"
+set +e
+lake env lean Pr3Eval.lean > "$PR3_OUT/lean.out" 2>&1
+RC=$?
+set -e
+if [ "$RC" -ne 0 ]; then
+  head -40 "$PR3_OUT/lean.out" >&2
+  echo "FAIL: Pr3Eval.lean (rc=$RC)" >&2
+  exit 1
+fi
+# NOTE: c_20_default_ref_prior_param (Lean = 10) awaits native qbe.pion fix for
+# default parameter caller-local capture; l_25..l_29 are Lean-only extraction/eval
+# regressions; all other 24 `c_*` cases (incl. c_13=21, c_18=1241, c_22=1) are
+# directly diffed Native == Lean.
+grep -v '^c_20_' "$PR3_OUT/native.out" > "$PR3_OUT/native_cmp.out"
+grep -vE '^(c_20_|l_)' "$PR3_OUT/lean.out" > "$PR3_OUT/lean_cmp.out"
+if ! diff -u "$PR3_OUT/native_cmp.out" "$PR3_OUT/lean_cmp.out"; then
+  echo "FAIL: pr3_soundness native and Lean disagree" >&2
+  exit 1
+fi
+for expect in \
+  'c_20_default_ref_prior_param: OK 10' \
+  'l_25_opt_param_default_ref: OK 7' \
+  'l_26_generic_map_eq_transitive: OK 1' \
+  'l_27_loop_helper_tparam_shadow: OK 15' \
+  'l_28_nested_loop_helper_tparam_shadow: OK 4' \
+  'l_29_generic_map_product_key_eq: OK 1'; do
+  if ! grep -qx "$expect" "$PR3_OUT/lean.out"; then
+    echo "FAIL: missing expected Lean eval line: $expect" >&2
+    exit 1
+  fi
+done
+for neg in neg_sb_write_char neg_raw_byte; do
+  set +e
+  NEG_OUT=$("$PIONC" extract-lean --json --out "$PR3_OUT/$neg" "$PR3_DIR/$neg" 2>&1)
+  NEG_RC=$?
+  set -e
+  if [ "$NEG_RC" -eq 0 ] || ! printf '%s' "$NEG_OUT" | grep -q 'E_EXTRACT_UNSUPPORTED'; then
+    echo "FAIL: expected E_EXTRACT_UNSUPPORTED for $neg (rc=$NEG_RC): $NEG_OUT" >&2
+    exit 1
+  fi
+done
+echo "pr3_soundness: $(wc -l < "$PR3_OUT/cases" | tr -d ' ') cases + 2 negative checks passed"
 echo "PASS: test-lean"
