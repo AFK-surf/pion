@@ -356,3 +356,131 @@ test "double-hash overlay exact match and stale source rejection" {
   assert_true(stale.blockers > 0, "mutated upstream source must reject stale overlay")
   assert_true(stale.diagnostics[0].code == "MBT2PION_OVERLAY_STALE_SOURCE", "must emit MBT2PION_OVERLAY_STALE_SOURCE")
 }
+
+test "BUG-1: extract_mbti_pkg_name handles package header, pkg.generated.mbti, and foo.mbti" {
+  assert_true(
+    extract_mbti_pkg_name("foo/pkg.generated.mbti", "package \"org/repo/ui/layout\"\n\npub enum Mode {\n  Auto\n}\n") == "layout",
+    "package header takes precedence",
+  )
+  assert_true(
+    extract_mbti_pkg_name("libs/theme/pkg.generated.mbti", "pub enum Tone {\n  Warm\n}\n") == "theme",
+    "pkg.generated.mbti falls back to parent dir",
+  )
+  assert_true(
+    extract_mbti_pkg_name("deps/canvas.mbti", "pub enum Brush {\n  Flat\n}\n") == "canvas",
+    "foo.mbti strips dir and .mbti suffix",
+  )
+  let src = SourceFile::{
+    rel_path: "use.mbt",
+    content: "pub fn f() -> Int { let _ = Auto; 1 }\n",
+    is_test: false,
+  }
+  let res = transpile_package(
+    [src],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [("layout.mbti", "package \"org/repo/layout\"\npub enum Mode {\n  Auto\n}\n")],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_eq(res.blockers, 0)
+  assert_true(str_has(res.files[0].content, "layout::Mode::Auto"), "clean package name without .mbti suffix")
+  assert_true(!str_has(res.files[0].content, ".mbti::"), "must never emit .mbti::")
+  assert_true(str_has(res.files[0].content, "import \"layout\""), "BUG-2 auto-emits import for referenced pkg")
+}
+
+test "BUG-2 & BUG-3 & BUG-4: auto-imports, nested generic T?, and direct Ref(expr) lowering" {
+  let diags : Array[Diag] = []
+  let recipes = parse_recipes_toml(
+    "[ref]\nenabled = true\nctor_call = \"acme_ns::make_ref\"\nfield_name = \"v\"\ntype_name = \"acme_ns::Cell\"\n",
+    "recipes.toml",
+    diags,
+  )
+  assert_eq(diags.length(), 0)
+  let src = SourceFile::{
+    rel_path: "types_ref.mbt",
+    content: "pub struct Box[T] { pub item : T }\npub fn f(a : Box[Int?], b : Box[acme_ns::Item?], c : Array[(Int?, String?)]) -> Ref[Int] {\n  let x : Array[(Int?, String?)] = c\n  let _ = (a, b, x)\n  Ref(42)\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), recipes, [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "import \"acme_ns\""), "auto-emits import \"acme_ns\"")
+  assert_true(str_has(out, "Box[Option[Int]]"), "Box[Int?] -> Box[Option[Int]]")
+  assert_true(str_has(out, "Box[Option[acme_ns::Item]]"), "Box[acme_ns::Item?] -> Box[Option[acme_ns::Item]]")
+  assert_true(str_has(out, "Array[(Option[Int], Option[String])]"), "Array[(Int?, String?)] lowered in params and local let")
+  assert_true(str_has(out, "acme_ns::make_ref(42)"), "Ref(42) directly lowered by [ref] recipe in Stage A")
+}
+
+test "BUG-5: init_order skips closures and uncalled fn values without false cycles, keeps real cycles" {
+  let ok_src = SourceFile::{
+    rel_path: "closures.mbt",
+    content: "let a : () -> Int = fn() { b }\nlet b : Int = 1\nlet cb : () -> Int = read_cb\nfn read_cb() -> Int { let _ = cb; b }\nlet arrow_cb : (Int) -> Int = (x) => x + b\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package([ok_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(ok_res.blockers, 0)
+  assert_true(ok_res.files[0].rel_path == "00_init_order.pion", "00_init_order.pion emitted without false cycle")
+
+  let cyc_src = SourceFile::{
+    rel_path: "real_cyc.mbt",
+    content: "let x : Int = y + 1\nlet y : Int = x + 1\n",
+    is_test: false,
+  }
+  let cyc_res = transpile_package([cyc_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(cyc_res.blockers > 0, "real immediate cycle must still block")
+  assert_true(cyc_res.diagnostics[0].code == "MBT2PION_INIT_CYCLE", "real cycle emits MBT2PION_INIT_CYCLE")
+}
+
+test "BUG-6: ambiguous cross-package ctor uses leading-dot .Case in exprs, blocks in patterns" {
+  let mbti1 = ("p1/pkg.generated.mbti", "package \"org/p1\"\npub enum AlignA {\n  Top\n  Middle\n  Bottom\n}\n")
+  let mbti2 = ("p2/pkg.generated.mbti", "package \"org/p2\"\npub enum AlignB {\n  Left\n  Middle\n  Right\n}\n")
+  let expr_src = SourceFile::{
+    rel_path: "expr.mbt",
+    content: "pub fn use_expr() -> Int { let _ = @p1.take_a(Middle); let _ = @p2.take_b(Middle); 1 }\n",
+    is_test: false,
+  }
+  let expr_res = transpile_package([expr_src], empty_api_map(), default_recipes(), [], [mbti1, mbti2], default_options(), [], false, noop_check)
+  assert_eq(expr_res.blockers, 0)
+  let out = expr_res.files[0].content
+  assert_true(str_has(out, "p1::take_a(.Middle)"), "ambiguous expr ctor lowered to .Middle")
+  assert_true(str_has(out, "p2::take_b(.Middle)"), "second ambiguous expr ctor lowered to .Middle")
+  assert_true(str_has(out, "import \"p1\"") && str_has(out, "import \"p2\""), "auto-emits sorted imports for p1 and p2")
+
+  let pat_src = SourceFile::{
+    rel_path: "pat.mbt",
+    content: "pub fn use_pat(x : Int) -> Int { match x { Middle => 1, _ => 0 } }\n",
+    is_test: false,
+  }
+  let pat_res = transpile_package([pat_src], empty_api_map(), default_recipes(), [], [mbti1, mbti2], default_options(), [], false, noop_check)
+  assert_true(pat_res.blockers > 0, "ambiguous ctor in pattern must still error")
+  assert_true(pat_res.diagnostics[0].code == "MBT2PION_AMBIGUOUS_CTOR", "pattern ambiguity emits MBT2PION_AMBIGUOUS_CTOR")
+}
+
+test "BUG-7: recipes [derives] ignore and Ctor(..)/Ctor(.., ..) rest patterns with mbti/api_map arity" {
+  let diags : Array[Diag] = []
+  let recipes = parse_recipes_toml("[derives]\nignore = [\"Debug\"]\n", "recipes.toml", diags)
+  assert_eq(diags.length(), 0)
+  let am = parse_api_map("{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"Quad\",\"kind\":\"ctor\",\"target_pkg\":\"ext\",\"target_name\":\"Quad\",\"target_enum\":\"Shape\",\"arity\":4}]}", "api_map.json", diags)
+  assert_eq(diags.length(), 0)
+  let src = SourceFile::{
+    rel_path: "rest.mbt",
+    content: "#derive(Debug, Eq)\npub struct Pt { x : Int }\npub enum Tri { Tri(Int, Int, Int) }\npub fn m1(t : Tri) -> Int { match t { Tri(..) => 1 } }\npub fn m2(t : Tri) -> Int { match t { Tri(.., ..) => 2 } }\npub fn m3(q : Int) -> Int { match q { Quad(a, ..) => a, _ => 0 } }\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], am, recipes, [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "#derive(Eq)"), "Eq kept while Debug ignored via recipe")
+  assert_true(!str_has(out, "Debug"), "ignored Debug stripped")
+  assert_true(str_has(out, "Tri(_, _, _)"), "Ctor(..) and Ctor(.., ..) expanded to 3 wildcards")
+  assert_true(str_has(out, ".Quad(a, _, _, _)"), "cross-pkg Quad(a, ..) expanded using api_map arity=4")
+
+  // Without recipe ignore, #derive(Debug) must still hard-fail!
+  let no_rec = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(no_rec.blockers > 0, "Debug without ignore recipe must still hard-fail")
+  assert_true(no_rec.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "emits MBT2PION_UNKNOWN_DERIVE")
+}

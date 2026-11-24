@@ -167,12 +167,30 @@ pub fn lower_type_tokens(
         None => raw_pkg
       }
       if i + 2 < end && tokens[i + 1].kind == TokenKind::Dot {
-        piece = mapped + "::" + tokens[i + 2].raw
+        let mut qname = mapped + "::" + tokens[i + 2].raw
         i = i + 3
+        if i < end && tokens[i].kind == TokenKind::LBracket {
+          let close_b = find_matching_delim(tokens, i)
+          let inner = lower_type_tokens(tokens, i + 1, close_b, symtab, recipes)
+          qname = qname + "[" + inner + "]"
+          i = close_b + 1
+        }
+        piece = qname
       } else {
         piece = mapped
         i = i + 1
       }
+    } else if t.kind == TokenKind::Ident && i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::UpperIdent {
+      // Qualified type `pkg::Type[...]` parsed as a single atom so `pkg::Item?` -> `Option[pkg::Item]`!
+      let mut qname = t.raw + "::" + tokens[i + 2].raw
+      i = i + 3
+      if i < end && tokens[i].kind == TokenKind::LBracket {
+        let close_b = find_matching_delim(tokens, i)
+        let inner = lower_type_tokens(tokens, i + 1, close_b, symtab, recipes)
+        qname = qname + "[" + inner + "]"
+        i = close_b + 1
+      }
+      piece = qname
     } else if t.kind == TokenKind::UpperIdent {
       let mut name = t.raw
       if name == "SourceLoc" {
@@ -985,6 +1003,39 @@ fn lower_one_token_or_form(
     return (trivia + lower_byte_char(t.raw), i + 1)
   }
 
+  // 1b. Local `let [mut] <name> : <Type> =` — lower `<Type>` through `lower_type_tokens`
+  //     so `Foo[T?]`, `Box[pkg::Item?]`, `Array[(Int?, String?)]`, `Map[K, V]` all lower accurately!
+  if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "let" {
+    let mut name_i = i + 1
+    let mut is_mut = false
+    if name_i < end && tokens[name_i].kind == TokenKind::Keyword && tokens[name_i].raw == "mut" {
+      is_mut = true
+      name_i = name_i + 1
+    }
+    if name_i + 2 < end && (tokens[name_i].kind == TokenKind::Ident || tokens[name_i].raw == "_") &&
+    tokens[name_i + 1].kind == TokenKind::Colon {
+      let mut eq_i = name_i + 2
+      let mut td = 0
+      while eq_i < end {
+        let tk = tokens[eq_i].kind
+        if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+          td = td + 1
+        } else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+          td = td - 1
+        } else if td == 0 && tk == TokenKind::Eq {
+          break
+        }
+        eq_i = eq_i + 1
+      }
+      if eq_i < end && tokens[eq_i].kind == TokenKind::Eq {
+        let lname = if tokens[name_i].raw == "_" { "_" } else { rename_keyword_ident(tokens[name_i].raw) }
+        let lty = lower_type_tokens(tokens, name_i + 2, eq_i, ctx.symtab, ctx.recipes).trim()
+        let mut_kw = if is_mut { "mut " } else { "" }
+        return (trivia + "let " + mut_kw + lname + " : " + lty + " =", eq_i + 1)
+      }
+    }
+  }
+
   // 2. Arrow function `(a, b) => expr` (strictly distinguished from match arms)
   if !in_pattern && t.kind == TokenKind::LParen {
     let close_p = is_arrow_fn_at(tokens, i, end)
@@ -1081,9 +1132,19 @@ fn lower_one_token_or_form(
   if t.kind == TokenKind::UpperIdent {
     let prev_colon2 = i > 0 && tokens[i - 1].kind == TokenKind::ColonColon
     let prev_dot = i > 0 && tokens[i - 1].kind == TokenKind::Dot
+    // Direct `Ref(expr)` lowering when `[ref]` recipe is enabled
+    if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Ref" &&
+    ctx.recipes.ref_recipe.enabled && ctx.recipes.ref_recipe.ctor_call.length() > 0 &&
+    i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 1)
+      let inner = lower_expr_range(ctx, tokens, i + 2, close_p, file, false).trim()
+      return (trivia + ctx.recipes.ref_recipe.ctor_call + "(" + inner + ")", close_p + 1)
+    }
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Map" &&
     i + 1 < end && tokens[i + 1].kind == TokenKind::LBracket {
-      return (trivia + "mbt_compat::OrderedMap", i + 1)
+      let close_b = find_matching_delim(tokens, i + 1)
+      let inner = lower_type_tokens(tokens, i + 2, close_b, ctx.symtab, ctx.recipes)
+      return (trivia + "mbt_compat::OrderedMap[" + inner + "]", close_b + 1)
     }
     let head_name = if !prev_colon2 && !prev_dot {
       match resolve_ctor(ctx.symtab, t.raw, in_pattern, file, t.line, t.col, ctx.diags) {
@@ -1094,11 +1155,12 @@ fn lower_one_token_or_form(
       t.raw
     }
 
-    // In pattern context: check `Ctor(..., ..)` rest pattern expansion!
+    // In pattern context: check `Ctor(..., ..)` / `Ctor(..)` / `Ctor(.., ..)` rest pattern expansion!
     if in_pattern && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 1)
       let raw_pats : Array[(Int, Int)] = []
       let mut has_rest = false
+      let mut rest_pos = -1
       let mut pi = i + 2
       while pi < close_p {
         if tokens[pi].kind == TokenKind::Comma {
@@ -1120,6 +1182,9 @@ fn lower_one_token_or_form(
         }
         if pe == pi + 1 && tokens[pi].kind == TokenKind::DotDot {
           has_rest = true
+          if rest_pos < 0 {
+            rest_pos = raw_pats.length()
+          }
         } else {
           raw_pats.push((pi, pe))
         }
@@ -1139,23 +1204,40 @@ fn lower_one_token_or_form(
         }
         let psb = StringBuilder()
         psb.write_string(trivia + head_name + "(")
+        let missing = arity - raw_pats.length()
+        let insert_at = if rest_pos >= 0 { rest_pos } else { raw_pats.length() }
+        let mut emitted = 0
         let mut idx = 0
         while idx < raw_pats.length() {
-          if idx > 0 {
+          if idx == insert_at {
+            let mut m = 0
+            while m < missing {
+              if emitted > 0 {
+                psb.write_string(", ")
+              }
+              psb.write_string("_")
+              emitted = emitted + 1
+              m = m + 1
+            }
+          }
+          if emitted > 0 {
             psb.write_string(", ")
           }
           let (s, e) = raw_pats[idx]
           psb.write_string(lower_expr_range(ctx, tokens, s, e, file, true).trim())
+          emitted = emitted + 1
           idx = idx + 1
         }
-        let missing = arity - raw_pats.length()
-        let mut m = 0
-        while m < missing {
-          if raw_pats.length() + m > 0 {
-            psb.write_string(", ")
+        if insert_at == raw_pats.length() {
+          let mut m = 0
+          while m < missing {
+            if emitted > 0 {
+              psb.write_string(", ")
+            }
+            psb.write_string("_")
+            emitted = emitted + 1
+            m = m + 1
           }
-          psb.write_string("_")
-          m = m + 1
         }
         psb.write_string(")")
         return (psb.to_string(), close_p + 1)
@@ -1543,7 +1625,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         ctx.init_order_seq = ctx.init_order_seq + 1
         let init_name = "__mbt_init_" + file_id + "_" + init_seq_in_file.to_string()
         let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
-        let refs = collect_ident_refs(tokens, lb, rb + 1)
+        let (refs, calls) = collect_init_refs(tokens, lb, rb + 1)
         ctx.init_items.push(InitItem::{
           id: init_name,
           name: init_name,
@@ -1554,6 +1636,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           col: decl_col,
           code: "let " + init_name + " : Unit = " + body,
           referenced_idents: refs,
+          called_fns: calls,
         })
         out_sb.write_string(attrs_trivia.to_string() + vis_trivia)
         out_sb.write_string("// moved to 00_init_order.pion: " + init_name + "\n")
@@ -1597,7 +1680,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           ""
         }
         let val_str = lower_expr_range(ctx, tokens, eq_i + 1, expr_end, sf.rel_path, false).trim()
-        let refs = collect_ident_refs(tokens, eq_i + 1, expr_end)
+        let (refs, calls) = collect_init_refs(tokens, eq_i + 1, expr_end)
         ctx.init_order_seq = ctx.init_order_seq + 1
         let mut_kw = if is_mut { "mut " } else { "" }
         let code = vis + "let " + mut_kw + pion_name + ty_str + " = " + val_str
@@ -1611,6 +1694,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           col: decl_col,
           code: code,
           referenced_idents: refs,
+          called_fns: calls,
         })
         out_sb.write_string(attrs_trivia.to_string() + vis_trivia)
         out_sb.write_string("// moved to 00_init_order.pion: " + pion_name + "\n")
@@ -1784,6 +1868,15 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         }
 
         for d in pending_derives {
+          let mut ignored = false
+          for ider in ctx.recipes.ignored_derives {
+            if ider == d {
+              ignored = true
+            }
+          }
+          if ignored {
+            continue
+          }
           let mut allowed = false
           for ad in ctx.recipes.allowed_derives {
             if ad == d {
@@ -2001,8 +2094,8 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         }
         if lb < n {
           let rb = find_matching_delim(tokens, lb)
-          let refs = collect_ident_refs(tokens, lb, rb + 1)
-          ctx.fn_bodies.push(FnBodyRefs::{ name: fn_name, referenced_idents: refs })
+          let (refs, calls) = collect_init_refs(tokens, lb, rb + 1)
+          ctx.fn_bodies.push(FnBodyRefs::{ name: fn_name, referenced_idents: refs, called_fns: calls })
           let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, p_pre)
           let decl_code = vis + "fn " + fn_name + "(" + p_str + ")" + ret_str + " " + body
           let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[rb].end_byte)

@@ -168,6 +168,8 @@ if grep -q "mbt_.*_probe" "$OUT_A/demo.pion"; then
 fi
 echo "[e2e] PASS: Stage A.5 same-line multi-probe + complex receivers + 0 residuals"
 
+# Verify auto-emitted `import "mbt_compat"` below platform-neutral header (BUG-2: zero manual import hack!)
+grep -q '^import "mbt_compat"$' "$OUT_A/demo.pion"
 # Verify generated golden output passes `pionc check --json` AND real `pionc run` runtime behavior!
 PKG_CHK="$WORK/chk_pkg"
 mkdir -p "$PKG_CHK/src"
@@ -179,7 +181,7 @@ version = "0.1.0"
 [dependencies]
 mbt_compat = { path = "$COMPAT_DIR" }
 EOF
-{ echo 'import "mbt_compat" as mbt_compat'; cat "$OUT_A/demo.pion"; } > "$PKG_CHK/src/demo.pion"
+cp "$OUT_A/demo.pion" "$PKG_CHK/src/demo.pion"
 cp "$OUT_A/00_init_order.pion" "$PKG_CHK/src/00_init_order.pion"
 cat > "$PKG_CHK/src/main.pion" << 'EOF'
 pub fn main(_w : World) -> Int {
@@ -351,5 +353,153 @@ if "$BIN" --src "$NEG_OV_SRC" --out "$NEG_OUT" --target native --mode publish --
 fi
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 echo "[e2e] PASS: all 4 negative tests rejected & publish left --out untouched"
+
+# -----------------------------------------------------------------------------
+# Test 6: Cross-package live pionc check + run covering BUG-1..BUG-7
+#   (.mbti pkg extraction, auto-imports, nested generic T?, Ref(expr),
+#    closure init order, ambiguous cross-pkg .Middle, [derives] ignore, Ctor(..))
+# -----------------------------------------------------------------------------
+XPKG_P1="$WORK/xpkg_p1"
+XPKG_P2="$WORK/xpkg_p2"
+XPKG_SRC="$WORK/xpkg_src"
+XPKG_APP="$WORK/xpkg_app"
+mkdir -p "$XPKG_P1/src" "$XPKG_P2/src" "$XPKG_SRC/deps" "$XPKG_APP/src"
+
+cat > "$XPKG_P1/pion.toml" << 'EOF'
+[package]
+name = "p1"
+version = "0.1.0"
+EOF
+cat > "$XPKG_P1/src/lib.pion" << 'EOF'
+pub enum AlignA {
+  Top
+  Middle
+  Bottom
+}
+pub struct Cell[T] {
+  pub mut v : T
+}
+pub fn make_cell[T](x : T) -> Cell[T] {
+  Cell::{ v: x }
+}
+pub fn read_cell[T](c : Cell[T]) -> T {
+  c.v
+}
+pub fn take_a(a : AlignA) -> Int {
+  match a {
+    Top => 1
+    Middle => 2
+    Bottom => 3
+  }
+}
+EOF
+
+cat > "$XPKG_P2/pion.toml" << 'EOF'
+[package]
+name = "p2"
+version = "0.1.0"
+EOF
+cat > "$XPKG_P2/src/lib.pion" << 'EOF'
+pub enum AlignB {
+  Left
+  Middle
+  Right
+}
+pub fn take_b(b : AlignB) -> Int {
+  match b {
+    Left => 10
+    Middle => 20
+    Right => 30
+  }
+}
+EOF
+
+cat > "$XPKG_SRC/deps/p1.mbti" << 'EOF'
+package "org/repo/p1"
+
+pub enum AlignA {
+  Top
+  Middle
+  Bottom
+}
+EOF
+cat > "$XPKG_SRC/deps/p2.mbti" << 'EOF'
+package "org/repo/p2"
+
+pub enum AlignB {
+  Left
+  Middle
+  Right
+}
+EOF
+
+cat > "$WORK/xpkg_recipes.toml" << 'EOF'
+[ref]
+enabled = true
+ctor_call = "p1::make_cell"
+field_name = "v"
+type_name = "p1::Cell"
+
+[derives]
+ignore = ["Debug"]
+EOF
+
+cat > "$XPKG_SRC/app_lib.mbt" << 'EOF'
+#derive(Debug, Eq)
+pub(all) struct Wrap {
+  x : Int
+}
+
+pub enum Trio {
+  Trio(Int, Int, Int)
+  Nil
+}
+
+let deferred_fn : () -> Int = fn() { base_num }
+let base_num : Int = 20
+
+pub fn xpkg_smoke(xs : Array[(Int?, String?)]) -> Int {
+  let local_xs : Array[(Int?, String?)] = xs
+  let c = Ref(base_num)
+  let a = @p1.take_a(Middle)
+  let b = @p2.take_b(Middle)
+  let t = match Trio(1, 2, 3) {
+    Trio(..) => 100
+    Nil => 0
+  }
+  let call_def = deferred_fn
+  @p1.read_cell(c) + call_def() + a + b + t + local_xs.length()
+}
+EOF
+
+"$BIN" --src "$XPKG_SRC" --out "$XPKG_APP/src" --target native --mode publish \
+  --recipes "$WORK/xpkg_recipes.toml" --no-probes --pionc "$PIONC"
+
+grep -q '^import "p1"$' "$XPKG_APP/src/app_lib.pion"
+grep -q '^import "p2"$' "$XPKG_APP/src/app_lib.pion"
+grep -q 'p1::take_a(.Middle)' "$XPKG_APP/src/app_lib.pion"
+grep -q 'p2::take_b(.Middle)' "$XPKG_APP/src/app_lib.pion"
+grep -q 'p1::make_cell(base_num)' "$XPKG_APP/src/app_lib.pion"
+grep -q 'Array\[(Option\[Int\], Option\[String\])\]' "$XPKG_APP/src/app_lib.pion"
+
+cat > "$XPKG_APP/pion.toml" << EOF
+[package]
+name = "xpkg_app"
+version = "0.1.0"
+
+[dependencies]
+p1 = { path = "$XPKG_P1" }
+p2 = { path = "$XPKG_P2" }
+EOF
+cat > "$XPKG_APP/src/main.pion" << 'EOF'
+pub fn main(_w : World) -> Int {
+  let got = xpkg_smoke([(Some(1), None)])
+  if got != 163 { panic("xpkg_smoke mismatch") }
+  0
+}
+EOF
+"$PIONC" check --json "$XPKG_APP"
+"$PIONC" run "$XPKG_APP"
+echo "[e2e] PASS: cross-package BUG-1..BUG-7 live pionc check + run (auto-imports, .Middle, nested T?, Ref(expr), closure init, derive ignore, Ctor(..))"
 
 echo "[e2e] ALL E2E TESTS PASSED!"

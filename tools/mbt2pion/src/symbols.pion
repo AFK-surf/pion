@@ -61,6 +61,17 @@ fn j_bool(v : json::JsonValue, key : String, def : Bool) -> Bool {
   }
 }
 
+fn j_int(v : json::JsonValue, key : String, def : Int) -> Int {
+  match json::obj_get(v, key) {
+    Some(x) =>
+    match json::as_int(x) {
+      Some(n) => n.to_int()
+      None => def
+    }
+    None => def
+  }
+}
+
 ///| Parse `api_map.json` and validate all string-offset unit annotations.
 ///| Hard-fails (emits error diagnostics) if any offset-like `Int` param/return lacks a valid `unit`.
 pub fn parse_api_map(content : String, path : String, diags : Array[Diag]) -> ApiMap {
@@ -97,6 +108,7 @@ pub fn parse_api_map(content : String, path : String, diags : Array[Diag]) -> Ap
           let target_pkg = j_str(item, "target_pkg", src_pkg)
           let target_name = j_str(item, "target_name", src_name)
           let target_enum = j_str(item, "target_enum", "")
+          let explicit_arity = j_int(item, "arity", -1)
           let ret_ty = j_str(item, "ret_ty", "")
           let ret_unit = j_str(item, "ret_unit", "")
           let ret_map_boundary = j_str(item, "ret_map_boundary", "none")
@@ -165,6 +177,7 @@ pub fn parse_api_map(content : String, path : String, diags : Array[Diag]) -> Ap
             target_pkg: target_pkg,
             target_name: target_name,
             target_enum: target_enum,
+            arity: explicit_arity,
             params: params,
             ret_ty: ret_ty,
             ret_unit: if ret_unit.length() == 0 { "none" } else { ret_unit },
@@ -199,6 +212,7 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
   let mut eq_wrapper = ""
   let mut eq_prefix = "__mbt_eq_"
   let allowed_derives : Array[String] = ["Eq"]
+  let ignored_derives : Array[String] = []
   let trait_recipes : Array[TraitRecipe] = []
 
   let mut section = ""
@@ -273,20 +287,21 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
         eq_prefix = unquote_toml(val_s)
       }
     } else if section == "derives" {
-      if key == "allow" && val_s.starts_with("[") && val_s.ends_with("]") {
+      if (key == "allow" || key == "ignore") && val_s.starts_with("[") && val_s.ends_with("]") {
+        let target_list = if key == "ignore" { ignored_derives } else { allowed_derives }
         let inner = val_s.slice(1, val_s.length() - 1)
         let items = inner.split(",")
         for it in items {
           let d = unquote_toml(it)
           if d.length() > 0 {
             let mut found = false
-            for e in allowed_derives {
+            for e in target_list {
               if e == d {
                 found = true
               }
             }
             if !found {
-              allowed_derives.push(d)
+              target_list.push(d)
             }
           }
         }
@@ -316,6 +331,7 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
     trait_recipes: trait_recipes,
     eq_recipe: EqRecipe::{ wrapper_call: eq_wrapper, helper_prefix: eq_prefix },
     allowed_derives: allowed_derives,
+    ignored_derives: ignored_derives,
   }
 }
 
@@ -420,19 +436,98 @@ pub fn symtab_load_api_map(st : SymbolTable, am : ApiMap) -> Unit {
       st.external_tilde_fns[key] = true
     }
     if sym.kind == "ctor" {
+      let ctor_arity = if sym.arity >= 0 { sym.arity } else { sym.params.length() }
       symtab_add_ctor(st, sym.src_name, CtorTarget::{
         pkg: sym.target_pkg,
         enum_name: sym.target_enum,
         ctor_name: sym.target_name,
         is_local: false,
-        arity: sym.params.length(),
+        arity: ctor_arity,
       })
     }
   }
 }
 
+///| Extract the clean Pion package name from a `.mbti` file's `package "a/b/pkg"` header
+///| or from its relative path (`<dir>/pkg.generated.mbti` -> `<dir>`, `foo/bar.mbti` -> `bar`).
+pub fn extract_mbti_pkg_name(rel_path : String, content : String) -> String {
+  let lines = content.split("\n")
+  for raw in lines {
+    let line = raw.trim()
+    if line.length() == 0 || line.starts_with("//") {
+      continue
+    }
+    if line.starts_with("package ") {
+      let q1 = line.index_of("\"")
+      if q1 >= 0 {
+        let rest = line.slice(q1 + 1, line.length())
+        let q2 = rest.index_of("\"")
+        if q2 > 0 {
+          let pkg_path = rest.slice(0, q2)
+          let mut last_slash = -1
+          let mut k = 0
+          while k < pkg_path.length() {
+            if pkg_path.code_unit_at(k) == 47 {
+              last_slash = k
+            }
+            k = k + 1
+          }
+          if last_slash >= 0 {
+            return pkg_path.slice(last_slash + 1, pkg_path.length())
+          }
+          return pkg_path
+        }
+      }
+    }
+    break
+  }
+  // Fallback: derive package name from rel_path
+  let mut p = rel_path.trim()
+  if p.ends_with("/pkg.generated.mbti") {
+    p = p.slice(0, p.length() - 19)
+  } else if p == "pkg.generated.mbti" {
+    return ""
+  } else {
+    let mut last_slash = -1
+    let mut k = 0
+    while k < p.length() {
+      if p.code_unit_at(k) == 47 {
+        last_slash = k
+      }
+      k = k + 1
+    }
+    if last_slash >= 0 {
+      p = p.slice(last_slash + 1, p.length())
+    }
+    if p.ends_with(".generated.mbti") {
+      p = p.slice(0, p.length() - 15)
+    } else if p.ends_with(".mbti") {
+      p = p.slice(0, p.length() - 5)
+    }
+    return p
+  }
+  let mut last_slash = -1
+  let mut k = 0
+  while k < p.length() {
+    if p.code_unit_at(k) == 47 {
+      last_slash = k
+    }
+    k = k + 1
+  }
+  if last_slash >= 0 {
+    p.slice(last_slash + 1, p.length())
+  } else {
+    p
+  }
+}
+
 ///| Load enum constructors and `#callsite(autofill(loc))` signatures from a `.mbti` file.
-pub fn symtab_load_mbti(st : SymbolTable, pkg_name : String, content : String) -> Unit {
+pub fn symtab_load_mbti(st : SymbolTable, pkg_hint : String, content : String) -> Unit {
+  let raw_pkg = extract_mbti_pkg_name(pkg_hint, content)
+  let pkg_name = match st.pkg_aliases.get(raw_pkg) {
+    Some(aliased) => aliased
+    None => raw_pkg
+  }
   let lines = content.split("\n")
   let mut in_enum = ""
   let mut next_autofill = false
@@ -592,12 +687,14 @@ pub fn lookup_ctor_arity(st : SymbolTable, ctor_name : String) -> Int {
 
 ///| Resolve an unqualified enum constructor name:
 ///| - Local enum constructors remain unqualified (Pion-native)
-///| - Single cross-package match -> `pkg::Enum::Case` (or `.Case` when `allow_leading_dot`)
-///| - Multiple cross-package matches -> ambiguity error with source span
+///| - Single cross-package match -> `pkg::Enum::Case` (or `.Case` when `in_pattern`)
+///| - Multiple cross-package matches:
+///|   * outside patterns (`!in_pattern`): Pion native leading-dot `.Case` (expected-type inferred)
+///|   * inside patterns (`in_pattern`): `MBT2PION_AMBIGUOUS_CTOR` error with source span
 pub fn resolve_ctor(
   st : SymbolTable,
   name : String,
-  allow_leading_dot : Bool,
+  in_pattern : Bool,
   file : String,
   line : Int,
   col : Int,
@@ -613,7 +710,7 @@ pub fn resolve_ctor(
       }
       if targets.length() == 1 {
         let t = targets[0]
-        if allow_leading_dot {
+        if in_pattern {
           return Some("." + t.ctor_name)
         }
         if t.pkg.length() > 0 && t.enum_name.length() > 0 {
@@ -625,6 +722,9 @@ pub fn resolve_ctor(
         return Some("." + t.ctor_name)
       }
       if targets.length() > 1 {
+        if !in_pattern {
+          return Some("." + name)
+        }
         diags.push(diag_error(
           "MBT2PION_AMBIGUOUS_CTOR",
           file,
