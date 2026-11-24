@@ -4869,6 +4869,187 @@ fn peek_decl_label(tokens : Array[Token], start_i : Int, n : Int) -> String {
   }
 }
 
+///| Stateless check whether a top-level declaration keyword at `kw_idx` is immediately
+///| preceded by a `pub` / `pub(...)` visibility modifier (never leaks across declarations).
+fn is_decl_pub(tokens : Array[Token], kw_idx : Int) -> Bool {
+  let mut j = kw_idx - 1
+  while j >= 0 {
+    let tk = tokens[j]
+    if tk.kind == TokenKind::Keyword && tk.raw == "pub" {
+      return true
+    }
+    if tk.kind == TokenKind::Keyword && (tk.raw == "async" || tk.raw == "extern") {
+      j = j - 1
+      continue
+    }
+    if tk.kind == TokenKind::StringLit && j > 0 && tokens[j - 1].kind == TokenKind::Keyword && tokens[j - 1].raw == "extern" {
+      j = j - 2
+      continue
+    }
+    if tk.kind == TokenKind::RParen {
+      let mut d = 1
+      let mut p = j - 1
+      while p >= 0 && d > 0 {
+        if tokens[p].kind == TokenKind::RParen { d = d + 1 }
+        else if tokens[p].kind == TokenKind::LParen { d = d - 1 }
+        p = p - 1
+      }
+      if p >= 0 && tokens[p].kind == TokenKind::Keyword && tokens[p].raw == "pub" {
+        return true
+      }
+      return false
+    }
+    return false
+  }
+  false
+}
+
+///| Extract exact original MoonBit `(line, col)` coordinates for every Stage A.5 probe candidate
+///| in `[start, end)` (recursing into `InterpString`/`InterpMultiline` `\{...}` holes) in exact
+///| left-to-right token order, grouped by probe kind: `kind=l1:c1,l2:c2;...`.
+fn collect_init_probe_origins_into(
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  line_base : Int,
+  col_base : Int,
+  by_kind : Map[String, Array[String]],
+) -> Unit {
+  let lim = if end < tokens.length() { end } else { tokens.length() }
+  let push_coord = fn(kind : String, ln : Int, cl : Int) -> Unit {
+    let real_ln = if line_base > 0 { line_base + ln - 1 } else { ln }
+    let real_cl = if line_base > 0 && ln == 1 { col_base + cl - 1 } else { cl }
+    let pair = real_ln.to_string() + ":" + real_cl.to_string()
+    match by_kind.get(kind) {
+      Some(xs) => xs.push(pair)
+      None => by_kind[kind] = [pair]
+    }
+  }
+  let mut i = start
+  while i < lim {
+    let t = tokens[i]
+    if t.kind == TokenKind::Dot && i + 1 < lim {
+      if i + 3 < lim && tokens[i + 1].raw == "length" && tokens[i + 2].kind == TokenKind::LParen && tokens[i + 3].kind == TokenKind::RParen {
+        push_coord("mbt_len_probe", tokens[i + 1].line, tokens[i + 1].col)
+        i = i + 4
+        continue
+      }
+      if i + 3 < lim && tokens[i + 1].raw == "to_string" && tokens[i + 2].kind == TokenKind::LParen && tokens[i + 3].kind == TokenKind::RParen {
+        push_coord("mbt_show_probe", tokens[i + 1].line, tokens[i + 1].col)
+        i = i + 4
+        continue
+      }
+      if tokens[i + 1].raw == "val" {
+        let is_set = i + 2 < lim && (tokens[i + 2].kind == TokenKind::Eq || tokens[i + 2].kind == TokenKind::AssignOp)
+        push_coord(if is_set { "mbt_val_set_probe" } else { "mbt_val_probe" }, tokens[i + 1].line, tokens[i + 1].col)
+        i = i + 2
+        continue
+      }
+    } else if t.kind == TokenKind::LBracket && i > start && !t.newline_before {
+      let pk = tokens[i - 1].kind
+      if pk == TokenKind::Ident || pk == TokenKind::RParen || pk == TokenKind::RBracket ||
+      pk == TokenKind::StringLit || pk == TokenKind::InterpString ||
+      pk == TokenKind::RawMultiline || pk == TokenKind::InterpMultiline || pk == TokenKind::RBrace {
+        let cb = find_matching_delim(tokens, i)
+        if cb < lim {
+          let mut has_colon = false
+          let mut d = 0
+          let mut k = i + 1
+          while k < cb {
+            let kk = tokens[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+            else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+            else if d == 0 && kk == TokenKind::Colon { has_colon = true; break }
+            k = k + 1
+          }
+          if has_colon {
+            let is_owned = cb + 4 < lim && tokens[cb + 1].kind == TokenKind::Dot && tokens[cb + 2].raw == "to_owned" &&
+            tokens[cb + 3].kind == TokenKind::LParen && tokens[cb + 4].kind == TokenKind::RParen
+            push_coord(if is_owned { "mbt_slice_owned_probe" } else { "mbt_slice_borrow_probe" }, t.line, t.col)
+          } else {
+            push_coord("mbt_idx_probe", t.line, t.col)
+          }
+        }
+      }
+    } else if t.kind == TokenKind::Slash {
+      push_coord("mbt_div_probe", t.line, t.col)
+    } else if t.kind == TokenKind::Percent {
+      push_coord("mbt_mod_probe", t.line, t.col)
+    } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let raw = t.raw
+      let rlen = raw.length()
+      let mut p = 0
+      let mut cur_ln = t.line
+      let mut cur_cl = t.col
+      while p < rlen {
+        let ch = raw.code_unit_at(p)
+        if ch == 92 && p + 1 < rlen && raw.code_unit_at(p + 1) == 123 {
+          let h_start = p + 2
+          let h_ln = cur_ln
+          let h_cl = cur_cl + 2
+          let mut hd = 1
+          let mut hp = h_start
+          let mut h_end = rlen
+          while hp < rlen {
+            let hc = raw.code_unit_at(hp)
+            if hc == 123 { hd = hd + 1 }
+            else if hc == 125 {
+              hd = hd - 1
+              if hd == 0 { h_end = hp; break }
+            }
+            if hc == 10 { cur_ln = cur_ln + 1; cur_cl = 1 } else { cur_cl = cur_cl + 1 }
+            hp = hp + 1
+          }
+          if h_end > h_start {
+            let h_toks = lex_moonbit(raw.slice(h_start, h_end))
+            collect_init_probe_origins_into(h_toks, 0, h_toks.length() - 1, h_ln, h_cl, by_kind)
+          }
+          p = if h_end < rlen { h_end + 1 } else { rlen }
+          cur_cl = cur_cl + 1
+          continue
+        }
+        if ch == 10 { cur_ln = cur_ln + 1; cur_cl = 1 } else { cur_cl = cur_cl + 1 }
+        p = p + 1
+      }
+    }
+    i = i + 1
+  }
+}
+
+fn collect_init_probe_origins(tokens : Array[Token], start : Int, end : Int) -> String {
+  let by_kind : Map[String, Array[String]] = Map()
+  collect_init_probe_origins_into(tokens, start, end, 0, 0, by_kind)
+  let keys = sorted_map_keys(by_kind)
+  if keys.length() == 0 {
+    return ""
+  }
+  let parts : Array[String] = []
+  for k in keys {
+    match by_kind.get(k) {
+      Some(coords) => {
+        let sb = StringBuilder()
+        sb.write_string(k + "=")
+        let mut ci = 0
+        while ci < coords.length() {
+          if ci > 0 { sb.write_string(",") }
+          sb.write_string(coords[ci])
+          ci = ci + 1
+        }
+        parts.push(sb.to_string())
+      }
+      None => ()
+    }
+  }
+  let out = StringBuilder()
+  let mut pi = 0
+  while pi < parts.length() {
+    if pi > 0 { out.write_string(";") }
+    out.write_string(parts[pi])
+    pi = pi + 1
+  }
+  out.to_string()
+}
+
 ///| Pre-scan all source files to register intra-package enums, `#callsite(autofill(loc))`,
 ///| and migrated functions with optional defaults into `ctx.symtab`.
 ///| Skips declarations excluded by `#cfg(...)` for `ctx.opts.target` (#12a P1-1).
@@ -4881,7 +5062,6 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
     let mut i = 0
     let mut next_autofill = false
     let mut next_cfg_excluded = false
-    let mut next_is_pub = false
     while i < n {
       let t = tokens[i]
       if t.kind == TokenKind::Attr {
@@ -4900,25 +5080,11 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if next_cfg_excluded {
         next_cfg_excluded = false
         next_autofill = false
-        next_is_pub = false
         i = skip_top_level_decl(tokens, i, n)
         continue
       }
-      if t.kind == TokenKind::Keyword && t.raw == "pub" {
-        next_is_pub = true
-        if i + 1 < n && tokens[i + 1].kind == TokenKind::LParen {
-          i = find_matching_delim(tokens, i + 1) + 1
-        } else {
-          i = i + 1
-        }
-        continue
-      }
-      if t.kind == TokenKind::LBrace || t.kind == TokenKind::RBrace ||
-      (t.kind == TokenKind::Keyword && (t.raw == "priv" || t.raw == "trait" || t.raw == "impl")) {
-        next_is_pub = false
-      }
       if t.kind == TokenKind::Keyword && t.raw == "struct" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
-        next_is_pub = false
+        next_autofill = false
         let sname = tokens[i + 1].raw
         let mut lb = i + 2
         if lb < n && tokens[lb].kind == TokenKind::LBracket {
@@ -4999,6 +5165,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         }
       }
       if t.kind == TokenKind::Keyword && t.raw == "enum" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        next_autofill = false
         let ename = tokens[i + 1].raw
         let mut lb = i + 2
         if lb < n && tokens[lb].kind == TokenKind::LBracket {
@@ -5059,7 +5226,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
       if t.kind == TokenKind::Keyword && t.raw == "type" && i + 3 < n &&
       tokens[i + 1].kind == TokenKind::UpperIdent && tokens[i + 2].kind == TokenKind::Eq {
-        next_is_pub = false
+        next_autofill = false
         let aname = tokens[i + 1].raw
         let rhs_end = find_top_level_let_expr_end(tokens, i + 3, n)
         let rty = lower_type_tokens(tokens, i + 3, rhs_end, ctx.symtab, ctx.recipes).trim()
@@ -5070,8 +5237,8 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         continue
       }
       if t.kind == TokenKind::Keyword && (t.raw == "const" || t.raw == "let") && i + 1 < n {
-        let decl_pub = next_is_pub
-        next_is_pub = false
+        let decl_pub = is_decl_pub(tokens, i)
+        next_autofill = false
         let mut ni = i + 1
         if tokens[ni].kind == TokenKind::Keyword && tokens[ni].raw == "mut" && ni + 1 < n {
           ni = ni + 1
@@ -5088,8 +5255,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         }
       }
       if t.kind == TokenKind::Keyword && t.raw == "fn" && i + 1 < n {
-        let decl_pub = next_is_pub
-        next_is_pub = false
+        let decl_pub = is_decl_pub(tokens, i)
         let mut name_i = i + 1
         if tokens[name_i].kind == TokenKind::LBracket {
           name_i = find_matching_delim(tokens, name_i) + 1
@@ -5147,6 +5313,14 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           }
         }
         next_autofill = false
+      }
+      if t.kind == TokenKind::Keyword && (t.raw == "test" || t.raw == "trait" || t.raw == "impl") {
+        next_autofill = false
+      }
+      if t.kind == TokenKind::LBrace {
+        next_autofill = false
+        i = find_matching_delim(tokens, i) + 1
+        continue
       }
       i = i + 1
     }
@@ -5399,6 +5573,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           col: decl_col,
           rhs_orig_col: tokens[lb].col,
           rhs_gen_col: init_prefix.length() + 1,
+          probe_origins: collect_init_probe_origins(tokens, lb, rb + 1),
           code: init_prefix + body,
           referenced_idents: refs,
           called_fns: calls,
@@ -5484,6 +5659,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           col: decl_col,
           rhs_orig_col: rhs_orig_col,
           rhs_gen_col: rhs_gen_col,
+          probe_origins: collect_init_probe_origins(tokens, eq_i + 1, expr_end),
           code: code,
           referenced_idents: refs,
           called_fns: calls,

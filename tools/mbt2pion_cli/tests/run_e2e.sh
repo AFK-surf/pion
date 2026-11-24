@@ -1897,6 +1897,53 @@ rep6b_j = json.load(open(rep10q6b))
 pds6b = [(p["file"], p["line"], p["col"]) for p in rep6b_j["probe_dispositions"] if p["disposition"] == "rewritten"]
 assert ("vs.mbt", 1, 19) in pds6b and ("vs.mbt", 1, 35) in pds6b, f"10q-6b expected vs.mbt:1:19 and vs.mbt:1:35, got {pds6b}"
 
+# 10q-2e (Astra Structural P0): `pub enum Mode { Ready }\nfn assert_true` MUST NOT leak pub to `assert_true`,
+# AND fn-body local `let assert_true = ...` MUST NOT pollute package-level symtab!
+s10q2e = os.path.join(root, "s10q2e")
+o10q2e = os.path.join(root, "o10q2e")
+os.makedirs(s10q2e, exist_ok=True)
+with open(os.path.join(s10q2e, "main.mbt"), "w") as f:
+    f.write(
+        'pub enum Mode { Ready }\n'
+        'fn assert_true(_v : Bool) -> Unit { () }\n'
+        'pub fn helper() -> Int {\n'
+        '  let assert_false = 1\n'
+        '  assert_false\n'
+        '}\n'
+    )
+with open(os.path.join(s10q2e, "b_test.mbt"), "w") as f:
+    f.write('test "bb_enum_no_pub_leak" { assert_true(false) }\n')
+with open(os.path.join(s10q2e, "w_wbtest.mbt"), "w") as f:
+    f.write('test "wb_local_let_no_symtab_leak" { assert_false(true) }\n')
+r10q2e = run_cli(["--src", s10q2e, "--out", o10q2e, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2e.returncode == 0, f"10q-2e publish failed: {r10q2e.returncode}\n{r10q2e.stdout}\n{r10q2e.stderr}"
+assert "mbt_compat::assert_true" in open(os.path.join(o10q2e, "b_test.pion")).read(), "10q-2e b_test.pion must call builtin assert_true"
+assert "mbt_compat::assert_false" in open(os.path.join(o10q2e, "w_wbtest_test.pion")).read(), "10q-2e w_wbtest_test.pion must call builtin assert_false"
+pkg10q2e = os.path.join(root, "pkg10q2e")
+os.makedirs(os.path.join(pkg10q2e, "src"), exist_ok=True)
+for fn in os.listdir(o10q2e):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2e, fn), os.path.join(pkg10q2e, "src", fn))
+with open(os.path.join(pkg10q2e, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2e"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2e_t = subprocess.run([pionc, "test", pkg10q2e], capture_output=True, text=True)
+assert r10q2e_t.returncode != 0 and "0 passed; 2 failed" in r10q2e_t.stdout, f"10q-2e expected 0 passed + 2 failed, got:\n{r10q2e_t.stdout}\n{r10q2e_t.stderr}"
+
+# 10q-6c (Astra Structural P1): single-line `pub let n:Int={ let _v : Int? = Some(1); "ab".length() }`
+# reports exact source column 1:47 despite `Int?` -> `Option[Int]` Stage A expansion!
+s10q6c = os.path.join(root, "s10q6c")
+o10q6c = os.path.join(root, "o10q6c")
+rep10q6c = os.path.join(root, "rep10q6c.json")
+os.makedirs(s10q6c, exist_ok=True)
+with open(os.path.join(s10q6c, "v.mbt"), "w") as f:
+    f.write('pub let n:Int={ let _v : Int? = Some(1); "ab".length() }\n')
+r10q6c = run_cli(["--src", s10q6c, "--out", o10q6c, "--target", "native", "--mode", "publish",
+                  "--report", rep10q6c, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q6c.returncode == 0, f"10q-6c publish failed: {r10q6c.returncode}\n{r10q6c.stdout}\n{r10q6c.stderr}"
+rep6c_j = json.load(open(rep10q6c))
+pds6c = [(p["file"], p["line"], p["col"]) for p in rep6c_j["probe_dispositions"] if p["disposition"] == "rewritten"]
+assert ("v.mbt", 1, 47) in pds6c, f"10q-6c expected v.mbt:1:47, got {pds6c}"
+
 # 10q-3 (P0-3): `assert_true(true, msg={ n = n + 1; "expected" })` evaluates side effects AND `msg=abort("boom")` fails!
 s10q3 = os.path.join(root, "s10q3")
 o10q3 = os.path.join(root, "o10q3")
