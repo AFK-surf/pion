@@ -1,4 +1,5 @@
 #include "all.h"
+#include <stddef.h>
 #include <stdarg.h>
 
 typedef struct Bitset Bitset;
@@ -25,7 +26,7 @@ struct Bucket {
 enum {
 	VMin = 2,
 	VMag = 0xcabba9e,
-	NPtr = 256,
+	ChunkBytes = 32 * 1024,
 	IBits = 12,
 	IMask = (1<<IBits) - 1,
 };
@@ -33,9 +34,17 @@ enum {
 Typ *typ;
 Ins insb[NIns], *curi;
 
-static void *ptr[NPtr];
-static void **pool = ptr;
-static int nptr = 1;
+/* PFn objects are zeroed and share a lifetime.  Align each slice for
+ * every scalar type used by QBE, including on C99 hosts. */
+typedef union { long double ld; bits u; void *p; } Align;
+typedef struct Chunk Chunk;
+struct Chunk {
+	Chunk *next;
+	Align data[];
+};
+static Chunk *chunks;
+static Align *cursor;
+static size_t left;
 
 static Bucket itbl[IMask+1]; /* string interning table */
 static int newtmp_n;
@@ -95,35 +104,45 @@ emalloc(size_t n)
 void *
 alloc(size_t n)
 {
-	void **pp;
+	Chunk *c;
+	size_t units, cap;
+	Align *p;
 
 	if (n == 0)
 		return 0;
-	if (nptr >= NPtr) {
-		pp = emalloc(NPtr * sizeof(void *));
-		pp[0] = pool;
-		pool = pp;
-		nptr = 1;
+	units = 1 + (n-1) / sizeof(Align);
+	if (units > left) {
+		cap = ChunkBytes / sizeof(Align);
+		if (units > cap)
+			cap = units;
+		if (cap > (SIZE_MAX - sizeof *c) / sizeof(Align))
+			die("alloc, size overflow");
+		c = emalloc(sizeof *c + cap * sizeof(Align));
+		c->next = chunks;
+		chunks = c;
+		if (units == cap)
+			return c->data;
+		cursor = c->data;
+		left = cap;
 	}
-	return pool[nptr++] = emalloc(n);
+	p = cursor;
+	cursor += units;
+	left -= units;
+	return p;
 }
 
 void
 freeall()
 {
-	void **pp;
+	Chunk *next;
 
-	for (;;) {
-		for (pp = &pool[1]; pp < &pool[nptr]; pp++)
-			free(*pp);
-		pp = pool[0];
-		if (!pp)
-			break;
-		free(pool);
-		pool = pp;
-		nptr = NPtr;
+	while (chunks) {
+		next = chunks->next;
+		free(chunks);
+		chunks = next;
 	}
-	nptr = 1;
+	cursor = 0;
+	left = 0;
 }
 
 void *

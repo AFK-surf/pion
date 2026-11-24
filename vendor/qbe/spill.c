@@ -227,6 +227,42 @@ limit2(BSet *b1, int k1, int k2, BSet *f)
 	bsunion(b1, l2b);
 }
 
+/* Portable 64-bit population count (same SWAR form as util.c popcnt);
+ * avoids compiler builtins so every gated host C compiler accepts it. */
+static uint
+fitcount(bits b)
+{
+	b = (b & 0x5555555555555555) + ((b>>1) & 0x5555555555555555);
+	b = (b & 0x3333333333333333) + ((b>>2) & 0x3333333333333333);
+	b = (b & 0x0f0f0f0f0f0f0f0f) + ((b>>4) & 0x0f0f0f0f0f0f0f0f);
+	b += (b>>8);
+	b += (b>>16);
+	b += (b>>32);
+	return b & 0xff;
+}
+
+/* limit2 leaves the live set intact when both classes fit. The masks
+ * partition all temporaries, so count only occupied words in each class. */
+static int
+fitsregs(BSet *v)
+{
+	uint i;
+	int gpr = 0, fpr = 0;
+	bits word, fp;
+
+	for (i=0; i<v->nt; i++) {
+		word = v->t[i];
+		if (!word)
+			continue;
+		fp = word & mask[1]->t[i];
+		gpr += fitcount(word ^ fp);
+		fpr += fitcount(fp);
+		if (gpr > T.ngpr || fpr > T.nfpr)
+			return 0;
+	}
+	return 1;
+}
+
 static void
 sethint(BSet *u, bits r)
 {
@@ -512,21 +548,23 @@ spill(Fn *fn)
 						bsset(w, t);
 					break;
 				}
-			bscopy(u, v);
-			limit2(v, 0, 0, w);
-			for (n=0; n<2; n++)
-				if (rtype(i->arg[n]) == RTmp) {
-					t = i->arg[n].val;
-					if (!bshas(v, t)) {
-						/* do not reload if the
-						 * argument is dead
-						 */
-						if (!lvarg[n])
-							bsclr(u, t);
-						i->arg[n] = slot(t);
+			if (!fitsregs(v)) {
+				bscopy(u, v);
+				limit2(v, 0, 0, w);
+				for (n=0; n<2; n++)
+					if (rtype(i->arg[n]) == RTmp) {
+						t = i->arg[n].val;
+						if (!bshas(v, t)) {
+							/* do not reload if the
+							 * argument is dead
+							 */
+							if (!lvarg[n])
+								bsclr(u, t);
+							i->arg[n] = slot(t);
+						}
 					}
-				}
-			reloads(u, v);
+				reloads(u, v);
+			}
 			if (!req(i->to, R)) {
 				t = i->to.val;
 				store(i->to, tmp[t].slot);
