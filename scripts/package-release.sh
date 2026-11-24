@@ -148,6 +148,36 @@ for lic in \
   fi
 done
 
+# Windows: the shipped executables may import only Windows system DLLs (no
+# libgcc_s_seh-1.dll / libwinpthread-1.dll / libstdc++-6.dll from MinGW).
+if [ "$IS_WIN" -eq 1 ]; then
+  if command -v objdump >/dev/null 2>&1; then
+    for exe in pionc.exe qbe.exe; do
+      DLLS=$(objdump -p "$EXTRACTED/bin/$exe" | tr -d '\r' | sed -n 's/^[[:space:]]*DLL Name:[[:space:]]*//p')
+      if [ -z "$DLLS" ]; then
+        echo "FAIL: objdump found no DLL imports in $exe" >&2
+        exit 1
+      fi
+      for dll in $DLLS; do
+        case "$(printf '%s' "$dll" | tr 'A-Z' 'a-z')" in
+          kernel32.dll|ws2_32.dll|advapi32.dll|ntdll.dll|msvcrt.dll|ucrtbase.dll|api-ms-win-*.dll|\
+          crypt32.dll|secur32.dll|bcrypt.dll|user32.dll|shell32.dll|ole32.dll|shlwapi.dll|userenv.dll) ;;
+          *)
+            echo "FAIL: $exe imports non-system DLL $dll (all imports: $(echo $DLLS))" >&2
+            exit 1
+            ;;
+        esac
+      done
+      echo "$exe imports only system DLLs: $(echo $DLLS)"
+    done
+  elif [ "${PION_REQUIRE_DLL_CHECK:-0}" = "1" ]; then
+    echo "FAIL: PION_REQUIRE_DLL_CHECK=1 but objdump not found" >&2
+    exit 1
+  else
+    echo "NOTE: objdump not found; skipped the Windows system-DLL import check" >&2
+  fi
+fi
+
 WORK="$VERIFY_DIR/work"
 mkdir -p "$WORK"
 
@@ -156,6 +186,16 @@ mkdir -p "$WORK"
   export PION_CACHE_DIR="$VERIFY_DIR/cas"
   export PATH="$EXTRACTED/bin:$PATH"
   cd "$WORK"
+
+  # The archive name must not claim a release the packaged compiler does not
+  # report: X.Y.Z of PION_VERSION (any -pre suffix aside) == `pionc --version`.
+  VER_JSON=$(pionc --version --json | tr -d '\r')
+  PIONC_VER=$(printf '%s' "$VER_JSON" | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')
+  CORE_VER=$(printf '%s\n' "$VERSION" | grep -Eo '^[0-9]+\.[0-9]+\.[0-9]+')
+  if [ "$PIONC_VER" != "$CORE_VER" ]; then
+    echo "FAIL: PION_VERSION=$VERSION but the packaged pionc reports version '$PIONC_VER' ($VER_JSON); bump the compiler version first" >&2
+    exit 1
+  fi
 
   DOC_JSON=$(pionc doctor --json)
   printf '%s' "$DOC_JSON" | grep -q '"ok":true' || {

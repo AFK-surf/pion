@@ -283,6 +283,12 @@ pionc init demo && cd demo && pionc check && pionc test --json && pionc run
 
 # Build a relocatable release archive (tar.gz / zip + .sha256, with zero-env self-check):
 sh scripts/package-release.sh dist
+# Exactly what .github/workflows/release.yml does per platform on a `vX.Y.Z` tag
+# (seed -> stage 1 -> `--release` pionc, rebuilt by itself to a bit-identical fixed point;
+# PION_VERSION's X.Y.Z must equal `pionc --version`):
+sh scripts/build-release.sh
+PION_VERSION=0.1.0 PIONC="$PWD/out/pionc_release" PION_QBE="$PWD/out/qbe" PION_RT_LIB="$PWD/out/libpionrt.a" \
+  sh scripts/package-release.sh dist
 
 # Or bootstrap directly in-tree from bootstrap/pionc-seed.ssa.gz (pure C + QBE, fixed-point verified):
 sh scripts/bootstrap.sh
