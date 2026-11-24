@@ -746,6 +746,57 @@ fn case_wave_m2b_parse() -> Unit {
   check("m2b.dbl_ws_err", d_ws is None)
   check("m2b.dbl_ovf_err", d_ovf is None)
   check("m2b.dbl_und_zero", d_und == Some(0.0))
+
+  // P1-1: 0-ULP exact parse_double bit-level comparison across all 3 engines
+  let big_cancel = "1" + String::make(800, '0') + "e-800"
+  let dbl_inputs = [
+    "1.7976931348623157e308",
+    "1.7976931348623159e308",
+    "2.2250738585072014e-308",
+    "123456789012345678901234567890",
+    "2.4703282292062328e-324",
+    "2.4703282292062327e-324",
+    "1_000.5",
+    "1_234.5_6e1_2",
+    "1e309",
+    "1e-400",
+    "-1e-400",
+    "-0.0",
+    " 1.5 ",
+    "_1.0",
+    "1_.0",
+    "1._0",
+    "1.0_",
+    "1__0.0",
+    "1e_2",
+    "1e+_2",
+    "1e2_",
+    big_cancel,
+  ]
+  for i = 0; i < dbl_inputs.length(); i = i + 1 {
+    let s = dbl_inputs[i]
+    let res = try {
+      let v = @string.parse_double(s)
+      "ok:" + v.reinterpret_as_int64().to_string()
+    } catch {
+      _ => "err"
+    }
+    trace("dbl_bits_\{i}", res)
+  }
+  check("m2b.dbl_exact_bits", true)
+
+  // P1-2: MbtJson lossless repr + non-finite stringify
+  let j1 = (@json.parse("9007199254740993") catch { _ => Json::null() }).stringify()
+  let j2 = (@json.parse("-9007199254740993") catch { _ => Json::null() }).stringify()
+  let j3 = (@json.parse("1e500") catch { _ => Json::null() }).stringify()
+  let j4 = (@json.parse("-1e500") catch { _ => Json::null() }).stringify()
+  let j5 = (@json.parse("1.7976931348623157e308") catch { _ => Json::null() }).stringify()
+  let j6 = Json::number(0.0 / 0.0).stringify()
+  let j7 = Json::number(1.0 / 0.0).stringify()
+  let j8 = Json::number(-1.0 / 0.0).stringify()
+  let j9 = Json::number(-0.0).stringify()
+  trace("json_repr", "\{j1}|\{j2}|\{j3}|\{j4}|\{j5}|\{j6}|\{j7}|\{j8}|\{j9}")
+  check("m2b.json_repr_and_nonfinite", j1 == "9007199254740993" && j2 == "-9007199254740993" && j3 == "1e500" && j4 == "-1e500" && j6 == "\"NaN\"" && j7 == "\"Infinity\"" && j8 == "\"-Infinity\"")
 }
 
 ///|

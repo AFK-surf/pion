@@ -2168,9 +2168,30 @@ with open(os.path.join(m2b_dep, "src", "dep.pion"), "w") as f:
 with open(os.path.join(m2b_pkg, "pion.toml"), "w") as f:
     f.write('[package]\nname = "pkg"\nversion = "0.1.0"\n\n[dependencies]\ndep = { path = "../dep" }\n')
 with open(os.path.join(m2b_pkg, "mbt_src", "lib.mbt"), "w") as f:
-    f.write("fn dmax(a : Int, b : Int) -> Int { if a > b { a } else { b } }\npub fn use_dep(x : Int) -> Int { @dep.dep_add(dmax(x, 1)) }\n")
+    f.write("let limit : Int = 100\nfn dmax(a : Int, b : Int) -> Int { if a > b { a } else { b } }\npub fn use_dep(x : Int) -> Int { @dep.dep_add(dmax(x, 1)) + limit }\n")
 with open(os.path.join(m2b_pkg, "mbt_src", "lib_test.mbt"), "w") as f:
-    f.write('fn dmax(a : Int, b : Int) -> Int { a + b }\ntest "bb_priv_iso" {\n  assert_eq(dmax(2, 3), 5)\n  assert_eq(use_dep(4), 14)\n}\n')
+    f.write(
+        'let limit : Int = 5\n'
+        'fn dmax(a : Int, b : Int) -> Int { a + b }\n'
+        'fn sh_match(o : Int?) -> Int { match o { Some(limit) => limit * 2; None => limit } }\n'
+        'fn sh_let() -> Int { let limit = limit + 1; limit }\n'
+        'fn sh_tup() -> Int { let (limit, _) = (10, 20); limit }\n'
+        'fn sh_fn() -> Int { let f = fn(limit : Int) -> Int { limit }; let g = (limit) => limit; let h = limit => limit; f(1) + g(2) + h(3) }\n'
+        'fn sh_for() -> Int { let mut s = 0; for limit in [1, 2] { s = s + limit }; s + limit }\n'
+        'fn sh_if(o : Int?) -> Int { if o is Some(limit) && limit > 0 { limit } else { limit } }\n'
+        'test "bb_priv_iso" {\n'
+        '  assert_eq(dmax(2, 3), 5)\n'
+        '  assert_eq(use_dep(4), 114)\n'
+        '  assert_eq(sh_match(Some(3)), 6)\n'
+        '  assert_eq(sh_match(None), 5)\n'
+        '  assert_eq(sh_let(), 6)\n'
+        '  assert_eq(sh_tup(), 10)\n'
+        '  assert_eq(sh_fn(), 6)\n'
+        '  assert_eq(sh_for(), 8)\n'
+        '  assert_eq(sh_if(Some(7)), 7)\n'
+        '  assert_eq(sh_if(None), 5)\n'
+        '}\n'
+    )
 m2b_pub = subprocess.run(
     [bin_path, "--src", "../pkg/mbt_src", "--out", "../pkg/src", "--package-manifest", "../pkg/pion.toml",
      "--mbt-compat", os.path.relpath(os.path.realpath(compat_dir), os.path.realpath(m2b_sub)), "--target", "native", "--mode", "publish",

@@ -1324,6 +1324,169 @@ fn restore_scope_vars(ctx : StageAContext, saved_len : Int) -> Unit {
   }
 }
 
+///| Recursively collect all lowercase pattern-bound identifiers in `[s, e)` (normalized via `rename_keyword_ident`).
+fn collect_pat_binders_rec(tokens : Array[Token], s : Int, e : Int, out : Array[String]) -> Unit {
+  let mut i = s
+  while i < e {
+    let t = tokens[i]
+    if t.kind == TokenKind::LBrace {
+      let cb = find_matching_delim(tokens, i)
+      let mut fi = i + 1
+      while fi < cb {
+        if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot {
+          fi = fi + 1
+          continue
+        }
+        let mut fe = fi
+        let mut fd = 0
+        while fe < cb {
+          let fk = tokens[fe].kind
+          if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+          else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+          else if fd == 0 && fk == TokenKind::Comma { break }
+          fe = fe + 1
+        }
+        if fi + 1 < fe && (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
+        tokens[fi + 1].kind == TokenKind::Colon {
+          collect_pat_binders_rec(tokens, fi + 2, fe, out)
+        } else if fi < fe && tokens[fi].kind == TokenKind::Ident {
+          if tokens[fi].raw != "_" {
+            out.push(rename_keyword_ident(tokens[fi].raw))
+          }
+          if fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Keyword && tokens[fi + 1].raw == "as" &&
+          tokens[fi + 2].kind == TokenKind::Ident && tokens[fi + 2].raw != "_" {
+            out.push(rename_keyword_ident(tokens[fi + 2].raw))
+          }
+        }
+        fi = fe + 1
+      }
+      i = cb + 1
+      continue
+    }
+    if t.kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, i)
+      let mut ai = i + 1
+      while ai < cp {
+        if tokens[ai].kind == TokenKind::Comma || tokens[ai].kind == TokenKind::DotDot {
+          ai = ai + 1
+          continue
+        }
+        let mut ae = ai
+        let mut ad = 0
+        while ae < cp {
+          let ak = tokens[ae].kind
+          if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+          else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+          else if ad == 0 && ak == TokenKind::Comma { break }
+          ae = ae + 1
+        }
+        if ai + 1 < ae && tokens[ai].kind == TokenKind::Ident && tokens[ai + 1].kind == TokenKind::Eq {
+          collect_pat_binders_rec(tokens, ai + 2, ae, out)
+        } else if ai + 1 < ae && tokens[ai].kind == TokenKind::Ident && tokens[ai + 1].kind == TokenKind::Tilde {
+          if tokens[ai].raw != "_" {
+            out.push(rename_keyword_ident(tokens[ai].raw))
+          }
+        } else {
+          collect_pat_binders_rec(tokens, ai, ae, out)
+        }
+        ai = ae + 1
+      }
+      i = cp + 1
+      continue
+    }
+    if t.kind == TokenKind::LBracket {
+      let cbr = find_matching_delim(tokens, i)
+      collect_pat_binders_rec(tokens, i + 1, cbr, out)
+      i = cbr + 1
+      continue
+    }
+    if t.kind == TokenKind::Ident && t.raw != "_" {
+      let prev_qual = i > s && (tokens[i - 1].kind == TokenKind::ColonColon || tokens[i - 1].kind == TokenKind::Dot)
+      if !prev_qual {
+        out.push(rename_keyword_ident(t.raw))
+      }
+    }
+    i = i + 1
+  }
+}
+
+///| Collect all pattern-bound lowercase variable names in `[start, end)`.
+fn collect_pattern_binders(tokens : Array[Token], start : Int, end : Int) -> Array[String] {
+  let out : Array[String] = []
+  collect_pat_binders_rec(tokens, start, end, out)
+  out
+}
+
+///| Push a list of lexical binder names onto `ctx.scope_vars`.
+fn push_scope_binders(ctx : StageAContext, names : Array[String]) -> Unit {
+  for nm in names {
+    if nm.length() > 0 && nm != "_" {
+      ctx.scope_vars.push(ScopeVar::{ name: nm, ty: "", is_mut: false, is_boxed: false })
+    }
+  }
+}
+
+///| Lower a boolean condition `[start, end)` segment-by-segment across depth-0 `&&`,
+///| pushing any `is <Pat>` binders onto `ctx.scope_vars` so subsequent `&&` segments
+///| and the guarded body observe lexical shadowing.
+fn lower_cond_with_is_binders(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> String {
+  let sb = StringBuilder()
+  let mut seg_s = start
+  while seg_s < end {
+    let mut seg_e = seg_s
+    let mut d = 0
+    while seg_e < end {
+      let k = tokens[seg_e].kind
+      if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d = d + 1 }
+      else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      else if d == 0 && k == TokenKind::AmpAmp { break }
+      seg_e = seg_e + 1
+    }
+    sb.write_string(lower_expr_range(ctx, tokens, seg_s, seg_e, file, false))
+    // Scan this segment for depth-0 `is <Pat>` and push its binders for subsequent `&&` and body
+    let mut k = seg_s
+    let mut kd = 0
+    while k < seg_e {
+      let kk = tokens[k].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { kd = kd + 1 }
+      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if kd > 0 { kd = kd - 1 } }
+      else if kd == 0 && kk == TokenKind::Keyword && tokens[k].raw == "is" && k + 1 < seg_e {
+        let mut pe = k + 1
+        let mut pd = 0
+        while pe < seg_e {
+          let pk = tokens[pe].kind
+          if pd == 0 && pe > k + 1 && tokens[pe].newline_before { break }
+          if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+          else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace {
+            if pd == 0 { break }
+            pd = pd - 1
+          } else if pd == 0 && (pk == TokenKind::PipePipe || pk == TokenKind::EqEq || pk == TokenKind::BangEq) {
+            break
+          }
+          pe = pe + 1
+        }
+        push_scope_binders(ctx, collect_pattern_binders(tokens, k + 1, pe))
+        k = pe
+        continue
+      }
+      k = k + 1
+    }
+    if seg_e < end && tokens[seg_e].kind == TokenKind::AmpAmp {
+      sb.write_string(tokens[seg_e].leading_trivia + "&&")
+      seg_s = seg_e + 1
+    } else {
+      break
+    }
+  }
+  sb.to_string()
+}
+
 ///| Best-effort static type inference for an unannotated `let [mut] x = <rhs>` initializer
 ///| (literals, bools, struct literals, and outer scope variables). Returns `""` if unknown.
 fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : Int, end : Int) -> String {
@@ -1836,7 +1999,6 @@ fn lower_stmts_range(
             after_else = after_else + 1
           }
           let else_body = lower_block_range(ctx, tokens, else_open, else_close, file, "")
-          let rest_body = lower_stmts_range(ctx, tokens, after_else, end, file)
           // Check if condition is `<scrut> is <Pat>` (without top-level `&&`) -> lower to `match <scrut> { <Pat> => { <rest> }, _ => <else> }`
           let mut is_idx = -1
           let mut has_ampamp = false
@@ -1858,7 +2020,10 @@ fn lower_stmts_range(
             ci = ci + 1
           }
           sb.write_string(t.leading_trivia)
-          let cond_str = lower_expr_range(ctx, tokens, i + 1, else_idx, file, false).trim()
+          let saved_g_sc = ctx.scope_vars.length()
+          let cond_str = lower_cond_with_is_binders(ctx, tokens, i + 1, else_idx, file).trim()
+          let rest_body = lower_stmts_range(ctx, tokens, after_else, end, file)
+          restore_scope_vars(ctx, saved_g_sc)
           if is_idx > i + 1 && !has_ampamp {
             let scrut_str = lower_expr_range(ctx, tokens, i + 1, is_idx, file, false).trim()
             let pat_str = lower_expr_range(ctx, tokens, is_idx + 1, else_idx, file, true).trim()
@@ -1878,9 +2043,9 @@ fn lower_stmts_range(
           })
           return sb.to_string()
         }
-        // Diverging `guard`: keep Pion-native `guard ... else { ... }` untouched (only lower inner exprs)!
-        let cond_str = lower_expr_range(ctx, tokens, i + 1, else_idx, file, false)
+        // Diverging `guard`: lower `else` first (without `is` binders), then lower cond pushing `is` binders for remainder of block!
         let else_body = lower_block_range(ctx, tokens, else_open, else_close, file, "")
+        let cond_str = lower_cond_with_is_binders(ctx, tokens, i + 1, else_idx, file)
         sb.write_string(t.leading_trivia)
         sb.write_string("guard" + cond_str + tokens[else_idx].leading_trivia + "else" + tokens[else_open].leading_trivia + else_body)
         i = else_close + 1
@@ -3298,7 +3463,15 @@ fn lower_one_token_or_form(
         for il in inner_lets {
           sb.write_string("; " + il)
         }
+        push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, cp + 1))
         return (sb.to_string(), rhs_end)
+      } else {
+        // Single-level tuple destructuring `let (a, b) = rhs`: lower RHS first, then register binders!
+        let rhs_end = find_expr_end(tokens, cp + 2, end)
+        let rhs_s = lower_expr_range(ctx, tokens, cp + 2, rhs_end, file, false)
+        let pat_s = lower_expr_range(ctx, tokens, i + 1, cp + 1, file, true)
+        push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, cp + 1))
+        return (trivia + "let" + pat_s + tokens[cp + 1].leading_trivia + "=" + rhs_s, rhs_end)
       }
     }
   }
@@ -3340,6 +3513,7 @@ fn lower_one_token_or_form(
         }
         fi = fe + 1
       }
+      push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, cb + 1))
       return (sb.to_string(), rhs_end)
     }
   }
@@ -3381,13 +3555,15 @@ fn lower_one_token_or_form(
         fidx = fidx + 1
         pi = pe + 1
       }
+      push_scope_binders(ctx, collect_pattern_binders(tokens, i + 2, cp + 1))
       return (sb.to_string(), rhs_end)
     }
   }
 
   // 1b2. Local `let [mut] <name> [: <Type>] =` — lower `<Type>` through `lower_type_tokens`,
   //     box `let mut` locals captured by lifted recursive local `fn`s into `mbt_compat::MbtCell`,
-  //     track `ScopeVar` for inner closures, and wrap `ArrayBuf`-promoted array literals!
+  //     track `ScopeVar` for inner closures (pushed AFTER lowering RHS so `let x = x + 1` sees outer `x`!),
+  //     and wrap `ArrayBuf`-promoted array literals!
   if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "let" {
     let mut name_i = i + 1
     let mut is_mut = false
@@ -3415,40 +3591,49 @@ fn lower_one_token_or_form(
         }
         if eq_i < end && tokens[eq_i].kind == TokenKind::Eq {
           let lty = lower_type_tokens_checked(ctx, tokens, name_i + 2, eq_i, file).trim()
-          if lname != "_" {
-            ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
-          }
           if is_boxed {
             let rhs_end = find_expr_end(tokens, eq_i + 1, end)
             let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false).trim()
+            if lname != "_" {
+              ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
+            }
             return (trivia + "let " + lname + " : mbt_compat::MbtCell[" + lty + "] = mbt_compat::MbtCell::{ v: " + rhs_s + " }", rhs_end)
           }
           if ctx.borrowed_bufs.contains(lname) && eq_i + 1 < end && tokens[eq_i + 1].kind == TokenKind::LBracket {
             let close_arr = find_matching_delim(tokens, eq_i + 1)
             let arr_lit = lower_expr_range(ctx, tokens, eq_i + 1, close_arr + 1, file, false).trim()
+            if lname != "_" {
+              ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
+            }
             return (trivia + "let " + mut_kw + lname + " = mbt_compat::ArrayBuf::from_array(" + arr_lit + ")", close_arr + 1)
           }
           let rhs_end = find_expr_end(tokens, eq_i + 1, end)
           push_expected_type(ctx, lty)
           let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false)
           pop_expected_type(ctx)
+          if lname != "_" {
+            ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
+          }
           return (trivia + "let " + mut_kw + lname + " : " + lty + " =" + rhs_s, rhs_end)
         }
       } else if name_i + 1 < end && tokens[name_i + 1].kind == TokenKind::Eq {
         let eq_i = name_i + 1
         let rhs_end = find_expr_end(tokens, eq_i + 1, end)
         let inf_ty = infer_simple_expr_type(ctx, tokens, eq_i + 1, rhs_end)
-        if lname != "_" {
-          ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
-        }
         if is_boxed {
           let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false).trim()
           let ty_ann = if inf_ty.length() > 0 { " : mbt_compat::MbtCell[" + inf_ty + "]" } else { "" }
+          if lname != "_" {
+            ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
+          }
           return (trivia + "let " + lname + ty_ann + " = mbt_compat::MbtCell::{ v: " + rhs_s + " }", rhs_end)
         }
         if ctx.borrowed_bufs.contains(lname) && eq_i + 1 < end && tokens[eq_i + 1].kind == TokenKind::LBracket {
           let close_arr = find_matching_delim(tokens, eq_i + 1)
           let arr_lit = lower_expr_range(ctx, tokens, eq_i + 1, close_arr + 1, file, false).trim()
+          if lname != "_" {
+            ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
+          }
           return (trivia + "let " + mut_kw + lname + " = mbt_compat::ArrayBuf::from_array(" + arr_lit + ")", close_arr + 1)
         }
         let rhs_s = {
@@ -3456,6 +3641,9 @@ fn lower_one_token_or_form(
           let r = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false)
           pop_expected_type(ctx)
           r
+        }
+        if lname != "_" {
+          ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
         }
         return (trivia + "let " + mut_kw + lname + " =" + rhs_s, rhs_end)
       }
@@ -3478,7 +3666,8 @@ fn lower_one_token_or_form(
     }
   }
 
-  // 1b4. `if <cond> { ... }`: isolate condition expected type as `Bool` while preserving outer expected type for branches
+  // 1b4. `if <cond> { ... }`: isolate condition expected type as `Bool`, scope `is <Pat>` binders into
+  //      subsequent `&&` and the `then` block only (restored before `else`), while preserving outer expected type for branches!
   if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "if" {
     let mut lb = i + 1
     let mut pd = 0
@@ -3494,10 +3683,97 @@ fn lower_one_token_or_form(
       lb = lb + 1
     }
     if lb < end && tokens[lb].kind == TokenKind::LBrace && lb > i + 1 {
+      let close_b = find_matching_delim(tokens, lb)
+      let saved_if_sc = ctx.scope_vars.length()
       push_expected_type(ctx, "Bool")
-      let cond_s = lower_expr_range(ctx, tokens, i + 1, lb, file, false)
+      let cond_s = lower_cond_with_is_binders(ctx, tokens, i + 1, lb, file)
       pop_expected_type(ctx)
-      return (trivia + "if" + cond_s, lb)
+      let then_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+      restore_scope_vars(ctx, saved_if_sc)
+      return (trivia + "if" + cond_s + tokens[lb].leading_trivia + then_s, close_b + 1)
+    }
+  }
+
+  // 1b5. `for` loop (`for x in iter { ... }`, `for i, x in iter { ... }`, `for i = 0; cond; step { ... }`):
+  //      push loop binders onto `ctx.scope_vars` so they shadow any colliding black-box private top-levels!
+  if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "for" {
+    let mut lb = i + 1
+    let mut pd = 0
+    while lb < end {
+      let lk = tokens[lb].kind
+      if pd == 0 && lk == TokenKind::LBrace {
+        if !(lb > i + 1 && tokens[lb - 1].kind == TokenKind::ColonColon) {
+          break
+        }
+      }
+      if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace { pd = pd + 1 }
+      else if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+      lb = lb + 1
+    }
+    if lb < end && tokens[lb].kind == TokenKind::LBrace && lb > i + 1 {
+      let close_b = find_matching_delim(tokens, lb)
+      // Check for depth-0 `in` vs depth-0 `;` in `[i + 1, lb)`
+      let mut in_idx = -1
+      let mut semi1 = -1
+      let mut k = i + 1
+      let mut kd = 0
+      while k < lb {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { kd = kd + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { if kd > 0 { kd = kd - 1 } }
+        else if kd == 0 {
+          if kk == TokenKind::Keyword && tokens[k].raw == "in" && in_idx < 0 { in_idx = k }
+          else if kk == TokenKind::Semi && semi1 < 0 { semi1 = k }
+        }
+        k = k + 1
+      }
+      if in_idx > i + 1 {
+        let vars_s = lower_expr_range(ctx, tokens, i + 1, in_idx, file, true)
+        let iter_s = lower_expr_range(ctx, tokens, in_idx + 1, lb, file, false)
+        let saved_for_sc = ctx.scope_vars.length()
+        push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, in_idx))
+        let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+        restore_scope_vars(ctx, saved_for_sc)
+        return (trivia + "for" + vars_s + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + body_s, close_b + 1)
+      } else if semi1 > i + 1 {
+        // C-style `for v1 = init1, v2 = init2; cond; step { body }`
+        let loop_vars : Array[String] = []
+        let init_sb = StringBuilder()
+        let mut vi = i + 1
+        while vi < semi1 {
+          if tokens[vi].kind == TokenKind::Ident && vi + 1 < semi1 && tokens[vi + 1].kind == TokenKind::Eq {
+            let vname = rename_keyword_ident(tokens[vi].raw)
+            loop_vars.push(vname)
+            init_sb.write_string(tokens[vi].leading_trivia + vname + tokens[vi + 1].leading_trivia + "=")
+            let mut ve = vi + 2
+            let mut vd = 0
+            while ve < semi1 {
+              let vk = tokens[ve].kind
+              if vk == TokenKind::LParen || vk == TokenKind::LBracket || vk == TokenKind::LBrace { vd = vd + 1 }
+              else if vk == TokenKind::RParen || vk == TokenKind::RBracket || vk == TokenKind::RBrace { if vd > 0 { vd = vd - 1 } }
+              else if vd == 0 && vk == TokenKind::Comma { break }
+              ve = ve + 1
+            }
+            init_sb.write_string(lower_expr_range(ctx, tokens, vi + 2, ve, file, false))
+            if ve < semi1 && tokens[ve].kind == TokenKind::Comma {
+              init_sb.write_string(tokens[ve].leading_trivia + ",")
+              vi = ve + 1
+            } else {
+              vi = ve
+            }
+          } else {
+            let (p, ni) = lower_one_token_or_form(ctx, tokens, vi, semi1, file, false)
+            init_sb.write_string(p)
+            vi = ni
+          }
+        }
+        let saved_for_sc = ctx.scope_vars.length()
+        push_scope_binders(ctx, loop_vars)
+        let rest_hdr = lower_expr_range(ctx, tokens, semi1, lb, file, false)
+        let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+        restore_scope_vars(ctx, saved_for_sc)
+        return (trivia + "for" + init_sb.to_string() + rest_hdr + tokens[lb].leading_trivia + body_s, close_b + 1)
+      }
     }
   }
 
@@ -3506,6 +3782,7 @@ fn lower_one_token_or_form(
     let open_p = i + 1
     let close_p = find_matching_delim(tokens, open_p)
     let (p_str, p_pre, _) = lower_param_list(ctx, tokens, open_p, close_p, file, false)
+    let (p_names, p_tys, _) = extract_param_info(ctx, tokens, open_p, close_p, file)
     let mut cur = close_p + 1
     let mut ret_str = ""
     if cur < end && tokens[cur].kind == TokenKind::Arrow {
@@ -3525,7 +3802,17 @@ fn lower_one_token_or_form(
     }
     if cur < end && tokens[cur].kind == TokenKind::LBrace {
       let close_b = find_matching_delim(tokens, cur)
+      let saved_fn_sc = ctx.scope_vars.length()
+      let mut pi = 0
+      while pi < p_names.length() {
+        if p_names[pi] != "_" {
+          let pty = if pi < p_tys.length() { p_tys[pi] } else { "" }
+          ctx.scope_vars.push(ScopeVar::{ name: p_names[pi], ty: pty, is_mut: false, is_boxed: false })
+        }
+        pi = pi + 1
+      }
       let body = lower_block_range(ctx, tokens, cur, close_b, file, p_pre)
+      restore_scope_vars(ctx, saved_fn_sc)
       return (trivia + "fn(" + p_str + ")" + ret_str + " " + body, close_b + 1)
     }
   }
@@ -3566,14 +3853,26 @@ fn lower_one_token_or_form(
     let close_p = is_arrow_fn_at(tokens, i, end)
     if close_p >= 0 {
       let (p_str, _, _) = lower_param_list(ctx, tokens, i, close_p, file, false)
+      let (p_names, p_tys, _) = extract_param_info(ctx, tokens, i, close_p, file)
+      let saved_arr_sc = ctx.scope_vars.length()
+      let mut pi = 0
+      while pi < p_names.length() {
+        if p_names[pi] != "_" {
+          let pty = if pi < p_tys.length() { p_tys[pi] } else { "" }
+          ctx.scope_vars.push(ScopeVar::{ name: p_names[pi], ty: pty, is_mut: false, is_boxed: false })
+        }
+        pi = pi + 1
+      }
       let body_start = close_p + 2
       if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
         let body_close = find_matching_delim(tokens, body_start)
         let body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
+        restore_scope_vars(ctx, saved_arr_sc)
         return (trivia + "fn(" + p_str + ") " + body, body_close + 1)
       }
       let body_end = find_expr_end(tokens, body_start, end)
       let body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
+      restore_scope_vars(ctx, saved_arr_sc)
       return (trivia + "fn(" + p_str + ") { " + body_expr + " }", body_end)
     }
     // Check type ascription `(expr : Type)` (single top-level `:`, no top-level `,`, RHS starts with type token)
@@ -3653,14 +3952,20 @@ fn lower_one_token_or_form(
   i + 1 < end && tokens[i + 1].kind == TokenKind::FatArrow &&
   !(i > 0 && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
     let pname = if t.kind == TokenKind::Underscore { "_" } else { rename_keyword_ident(t.raw) }
+    let saved_arr_sc = ctx.scope_vars.length()
+    if pname != "_" {
+      ctx.scope_vars.push(ScopeVar::{ name: pname, ty: "", is_mut: false, is_boxed: false })
+    }
     let body_start = i + 2
     if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
       let body_close = find_matching_delim(tokens, body_start)
       let body = lower_block_range(ctx, tokens, body_start, body_close, file, "")
+      restore_scope_vars(ctx, saved_arr_sc)
       return (trivia + "fn(" + pname + ") " + body, body_close + 1)
     }
     let body_end = find_expr_end(tokens, body_start, end)
     let body_expr = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
+    restore_scope_vars(ctx, saved_arr_sc)
     return (trivia + "fn(" + pname + ") { " + body_expr + " }", body_end)
   }
 
@@ -3967,10 +4272,10 @@ fn lower_one_token_or_form(
     if !prev_colon2 && !prev_dot && t.raw == "Json" &&
     i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon {
       let member = tokens[i + 2].raw
-      if in_pattern && member == "Number" && i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
+      if member == "Number" && i + 3 < end && tokens[i + 3].kind == TokenKind::LParen {
         let close_p = find_matching_delim(tokens, i + 3)
         let mut pat_v = ""
-        let mut has_repr_bind = false
+        let mut repr_arg = ""
         let mut pi = i + 4
         while pi < close_p {
           if tokens[pi].kind == TokenKind::Comma || tokens[pi].kind == TokenKind::DotDot {
@@ -3988,23 +4293,18 @@ fn lower_one_token_or_form(
           }
           if tokens[pi].kind == TokenKind::Ident && tokens[pi].raw == "repr" &&
           pi + 1 < pe && tokens[pi + 1].kind == TokenKind::Eq {
-            has_repr_bind = true
+            repr_arg = lower_expr_range(ctx, tokens, pi + 2, pe, file, in_pattern).trim()
+          } else if tokens[pi].kind == TokenKind::Ident && tokens[pi].raw == "repr" &&
+          pi + 1 < pe && tokens[pi + 1].kind == TokenKind::Tilde {
+            repr_arg = "repr"
           } else if pe > pi && pat_v.length() == 0 {
-            pat_v = lower_expr_range(ctx, tokens, pi, pe, file, true).trim()
+            pat_v = lower_expr_range(ctx, tokens, pi, pe, file, in_pattern).trim()
           }
           pi = pe + 1
         }
-        if has_repr_bind {
-          ctx.diags.push(diag_error(
-            "MBT2PION_UNSUPPORTED_SYNTAX",
-            file,
-            t.line,
-            t.col,
-            "Json::Number pattern binding `repr=` is not supported by mbt_compat::MbtJson",
-          ))
-        }
-        let inner_v = if pat_v.length() > 0 { pat_v } else { "_" }
-        return (trivia + "mbt_compat::MbtJson::Number(" + inner_v + ")", close_p + 1)
+        let inner_v = if pat_v.length() > 0 { pat_v } else if in_pattern { "_" } else { "0.0" }
+        let inner_r = if repr_arg.length() > 0 { repr_arg } else if in_pattern { "_" } else { "Option::None" }
+        return (trivia + "mbt_compat::MbtJson::Number(" + inner_v + ", " + inner_r + ")", close_p + 1)
       }
       if member == "Null" || member == "True" || member == "False" || member == "Number" ||
       member == "String" || member == "Array" || member == "Object" ||
@@ -4012,6 +4312,44 @@ fn lower_one_token_or_form(
       member == "string" || member == "array" || member == "object" {
         return (trivia + "mbt_compat::MbtJson::" + member, i + 3)
       }
+    }
+    // Unqualified `Number(...)` when expected type is `mbt_compat::MbtJson`
+    if !prev_colon2 && !prev_dot && t.raw == "Number" &&
+    !has_local_ctor(ctx.symtab, "Number") &&
+    current_expected_type(ctx).trim() == "mbt_compat::MbtJson" &&
+    i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 1)
+      let mut pat_v = ""
+      let mut repr_arg = ""
+      let mut pi = i + 2
+      while pi < close_p {
+        if tokens[pi].kind == TokenKind::Comma || tokens[pi].kind == TokenKind::DotDot {
+          pi = pi + 1
+          continue
+        }
+        let mut pe = pi
+        let mut pd = 0
+        while pe < close_p {
+          let pk = tokens[pe].kind
+          if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+          else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+          else if pd == 0 && pk == TokenKind::Comma { break }
+          pe = pe + 1
+        }
+        if tokens[pi].kind == TokenKind::Ident && tokens[pi].raw == "repr" &&
+        pi + 1 < pe && tokens[pi + 1].kind == TokenKind::Eq {
+          repr_arg = lower_expr_range(ctx, tokens, pi + 2, pe, file, in_pattern).trim()
+        } else if tokens[pi].kind == TokenKind::Ident && tokens[pi].raw == "repr" &&
+        pi + 1 < pe && tokens[pi + 1].kind == TokenKind::Tilde {
+          repr_arg = "repr"
+        } else if pe > pi && pat_v.length() == 0 {
+          pat_v = lower_expr_range(ctx, tokens, pi, pe, file, in_pattern).trim()
+        }
+        pi = pe + 1
+      }
+      let inner_v = if pat_v.length() > 0 { pat_v } else if in_pattern { "_" } else { "0.0" }
+      let inner_r = if repr_arg.length() > 0 { repr_arg } else if in_pattern { "_" } else { "Option::None" }
+      return (trivia + "mbt_compat::MbtJson::Number(" + inner_v + ", " + inner_r + ")", close_p + 1)
     }
     // `String::from_array(chars)` -> `mbt_compat::str_from_char_array(chars)`
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "String" &&
@@ -5214,6 +5552,8 @@ fn lower_match_arms_with_ty(
       break
     }
     let pat_end = if if_idx >= 0 { if_idx } else { fa }
+    let saved_arm_sc = ctx.scope_vars.length()
+    push_scope_binders(ctx, collect_pattern_binders(tokens, i, pat_end))
     let guard_str = if if_idx >= 0 {
       lower_expr_range(ctx, tokens, if_idx + 1, fa, file, false).trim()
     } else {
@@ -5239,6 +5579,7 @@ fn lower_match_arms_with_ty(
       body_raw = lower_expr_range(ctx, tokens, body_start, body_end, file, false)
       next_i = body_end
     }
+    restore_scope_vars(ctx, saved_arm_sc)
     let mut trail_sep = ""
     if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
       trail_sep = tokens[next_i].leading_trivia + tokens[next_i].raw

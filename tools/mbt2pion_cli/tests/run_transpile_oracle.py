@@ -103,7 +103,7 @@ CASES = {
     "q2_mechanical_compat": ("ok", 10),
     "wave_m2_core": ("ok", 7),
     "wave_m2_round2": ("ok", 8),
-    "wave_m2b_mid_tier": ("ok", 9),
+    "wave_m2b_mid_tier": ("ok", 10),
 }
 
 MOON_TRAPS = {
@@ -1254,6 +1254,21 @@ pub fn m2b_hash_consistency() -> Bool {
   let k2 = M2bKey::{ a: 7, b: 1.5, c: "abc" }
   k1 == k2
 }
+
+pub fn m2b_p1_json_repr_and_double() -> (String, String, String, Int64, Int64, Bool) {
+  let j_big = @json.parse("9007199254740993") catch { _ => Json::null() }
+  let r_big = match j_big {
+    Json::Number(_, repr=Some(r)) => r
+    _ => "none"
+  }
+  let j_ovf = @json.parse("1e500") catch { _ => Json::null() }
+  let j_nan = Json::number(0.0 / 0.0).stringify()
+  let j_inf = Json::number(1.0 / 0.0).stringify()
+  let d_max = @string.parse_double("1.7976931348623157e308") catch { _ => 0.0 }
+  let d_sub = @string.parse_double("2.4703282292062328e-324") catch { _ => -1.0 }
+  let d_und = @string.parse_double("1_000.5") catch { _ => 0.0 }
+  (r_big, j_ovf.stringify(), j_nan + "|" + j_inf, d_max.reinterpret_as_int64(), d_sub.reinterpret_as_int64(), d_und == 1000.5)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1769,7 +1784,8 @@ fn main {
     let (sb_ok, w01, mk) = @m12.m2b_expected_auto_and_stage_b()
     let (vc, vf, vn) = @m12.m2b_val_contexts_and_noraise(3.5)
     let hk = @m12.m2b_hash_consistency()
-    trace("m2b", "\{sc},\{ss},\{ssum},\{ar1}:\{ar2}:\{ar3},\{bs1}:\{bs2},\{js},\{jn},\{ji},\{ju},\{sb_ok}:\{w01}:\{mk},\{vc}:\{vf}:\{vn},\{hk}")
+    let (p1r, p1o, p1nf, p1max, p1sub, p1u) = @m12.m2b_p1_json_repr_and_double()
+    trace("m2b", "\{sc},\{ss},\{ssum},\{ar1}:\{ar2}:\{ar3},\{bs1}:\{bs2},\{js},\{jn},\{ji},\{ju},\{sb_ok}:\{w01}:\{mk},\{vc}:\{vf}:\{vn},\{hk},\{p1r}:\{p1o}:\{p1nf}:\{p1max}:\{p1sub}:\{p1u}")
     check("m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
     check("m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 510)
     check("m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
@@ -1779,6 +1795,7 @@ fn main {
     check("m2b.val_nested_none", vc)
     check("m2b.val_match_neg", vf == 42 && vn == -7.0)
     check("m2b.derive_debug_hash", hk)
+    check("m2b.p1_json_repr_double", p1r == "9007199254740993" && p1o == "1e500" && p1nf == "\"NaN\"|\"Infinity\"" && p1max == 9218868437227405311L && p1sub == 1L && p1u)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2311,7 +2328,8 @@ pub fn main(w : World) -> Int {
     let (sb_ok, w01, mk) = m12::m2b_expected_auto_and_stage_b()
     let (vc, vf, vn) = m12::m2b_val_contexts_and_noraise(3.5)
     let hk = m12::m2b_hash_consistency()
-    trace(w, "m2b", sc.to_string() + "," + ss + "," + ssum.to_string() + "," + ar1.to_string() + ":" + ar2.to_string() + ":" + ar3.to_string() + "," + bs1.to_string() + ":" + bs2.to_string() + "," + js + "," + jn.to_string() + "," + ji.to_string() + "," + ju.to_string() + "," + sb_ok.to_string() + ":" + w01.to_string() + ":" + mk.to_string() + "," + vc.to_string() + ":" + vf.to_string() + ":" + mbt_compat::double_to_string(vn) + "," + hk.to_string())
+    let (p1r, p1o, p1nf, p1max, p1sub, p1u) = m12::m2b_p1_json_repr_and_double()
+    trace(w, "m2b", sc.to_string() + "," + ss + "," + ssum.to_string() + "," + ar1.to_string() + ":" + ar2.to_string() + ":" + ar3.to_string() + "," + bs1.to_string() + ":" + bs2.to_string() + "," + js + "," + jn.to_string() + "," + ji.to_string() + "," + ju.to_string() + "," + sb_ok.to_string() + ":" + w01.to_string() + ":" + mk.to_string() + "," + vc.to_string() + ":" + vf.to_string() + ":" + mbt_compat::double_to_string(vn) + "," + hk.to_string() + "," + p1r + ":" + p1o + ":" + p1nf + ":" + p1max.to_string() + ":" + p1sub.to_string() + ":" + p1u.to_string())
     check(w, "m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
     check(w, "m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 510)
     check(w, "m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
@@ -2321,6 +2339,7 @@ pub fn main(w : World) -> Int {
     check(w, "m2b.val_nested_none", vc)
     check(w, "m2b.val_match_neg", vf == 42 && vn == -7.0)
     check(w, "m2b.derive_debug_hash", hk)
+    check(w, "m2b.p1_json_repr_double", p1r == "9007199254740993" && p1o == "1e500" && p1nf == "\"NaN\"|\"Infinity\"" && p1max == 9218868437227405311L && p1sub == 1L && p1u)
   } else {
     panic("abort: unknown case " + kase)
   }
