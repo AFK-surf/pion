@@ -4,7 +4,8 @@
  * Modes:
  *   bench_measure exec <warmup> <runs> -- <cmd> [args...]
  *     Runs <warmup> unmeasured iterations, then <runs> measured iterations
- *     via `/usr/bin/time -l`, capturing CLOCK_MONOTONIC wall ms, Peak RSS (bytes -> MB),
+ *     via `/usr/bin/time -l` on macOS (elsewhere: `wait4` rusage; instructions
+ *     retired reads 0), capturing CLOCK_MONOTONIC wall ms, Peak RSS (bytes -> MB),
  *     instructions retired, and stdout checksum. Verifies stdout is identical across runs.
  *     Outputs one tab-separated line:
  *       <median_ms>\t<min_ms>\t<max_ms>\t<peak_rss_mb>\t<instructions_retired>\t<stdout_trimmed>
@@ -13,12 +14,16 @@
  *     Runs <cmd> once with CLOCK_MONOTONIC and prints:
  *       <wall_ms>
  */
+#if !defined(__APPLE__)
+#define _DEFAULT_SOURCE /* wait4 */
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
@@ -45,6 +50,11 @@ static void trim_trailing(char *s) {
 
 static int run_one(char **cmd_argv, int cmd_argc, int use_time_l, RunResult *res) {
     memset(res, 0, sizeof(*res));
+#if !defined(__APPLE__)
+    /* GNU time has no `-l`: take the peak RSS from wait4's rusage instead. */
+    int want_rusage = use_time_l;
+    use_time_l = 0;
+#endif
 
     int out_pipe[2], err_pipe[2];
     if (pipe(out_pipe) != 0 || pipe(err_pipe) != 0) {
@@ -113,7 +123,14 @@ static int run_one(char **cmd_argv, int cmd_argc, int use_time_l, RunResult *res
     err_buf[err_len] = '\0';
 
     int status = 0;
+#if defined(__APPLE__)
     waitpid(pid, &status, 0);
+#else
+    struct rusage ru;
+    memset(&ru, 0, sizeof ru);
+    wait4(pid, &status, 0, &ru);
+    if (want_rusage) res->max_rss_bytes = (long long)ru.ru_maxrss * 1024LL; /* KiB on Linux/BSD */
+#endif
     double t1 = now_ms();
     res->wall_ms = t1 - t0;
 

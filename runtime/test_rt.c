@@ -57,6 +57,8 @@ static const char *pion_test_tmpdir(void) {
 #include <sys/stat.h>
 #endif
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
 #include <math.h>
 #include <stdatomic.h>
 #include <stdio.h>
@@ -1311,6 +1313,38 @@ static void test_mt_nested_scope(void) {
 
     pion_rc_dec(atom);
     printf("[PASS] mt_nested_scope (4x2 nested + 4x3 parent-scope spawn)\n");
+}
+
+/* A 3 MiB stack frame, every page written then read back: needs spawn
+ * threads' 8 MiB stacks (macOS secondary pthreads default to 512 KiB and
+ * would hit the guard page with SIGBUS). */
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((noinline))
+#endif
+static int64_t deep_stack_frame(int64_t seed) {
+    volatile unsigned char buf[3u * 1024u * 1024u];
+    for (size_t i = 0; i < sizeof(buf); i += 4096) buf[i] = (unsigned char)(seed + (int64_t)(i >> 12));
+    buf[sizeof(buf) - 1] = (unsigned char)seed;
+    int64_t sum = 0;
+    for (size_t i = 0; i < sizeof(buf); i += 4096) sum += buf[i];
+    return sum + buf[sizeof(buf) - 1];
+}
+
+static void deep_stack_worker(void *arg) {
+    pion_atomic_fetch_add(arg, deep_stack_frame(7));
+}
+
+static void test_mt_spawn_stack_8mib(void) {
+    int64_t want = 0;
+    for (size_t i = 0; i < 3u * 1024u * 1024u; i += 4096) want += (unsigned char)(7 + (int64_t)(i >> 12));
+    want += 7;
+    void *atom = pion_atomic_new(0);
+    void *sc = pion_scope_begin();
+    for (int i = 0; i < 4; i++) pion_scope_spawn(sc, deep_stack_worker, atom);
+    pion_scope_end(sc);
+    assert(pion_atomic_load(atom) == 4 * want);
+    pion_rc_dec(atom);
+    printf("[PASS] mt_spawn_stack_8mib (4 spawn threads x 3 MiB stack frame)\n");
 }
 
 typedef struct SlabStressEnv {
@@ -3421,6 +3455,108 @@ static int u8_str_is(void *s, const char *want) {
     return eq;
 }
 
+/* pion_fs_lstat_kind: 0 missing, 1 file, 2 dir, 3 symlink, -1 query error
+ * (never "missing"): NULL/empty paths, and on POSIX a path below a 0000
+ * directory (EACCES; as root, checked in a child running as nobody). */
+static void test_fs_lstat_kind(void) {
+    char base[600], missing[700], file[700], below[700];
+    snprintf(base, sizeof(base), "%s/pion_lk_%d", pion_test_tmpdir(), pion_test_getpid());
+    snprintf(missing, sizeof(missing), "%s/missing", base);
+    snprintf(file, sizeof(file), "%s/file", base);
+    snprintf(below, sizeof(below), "%s/file/below", base);
+    assert(pion_fs_lstat_kind(NULL) == -1 && pion_fs_lstat_kind("") == -1);
+    assert(pion_fs_mkdir_excl(base) == 0);
+    assert(pion_fs_lstat_kind(base) == 2);
+    assert(pion_fs_lstat_kind(missing) == 0);
+    FILE *f = fopen(file, "w");
+    assert(f);
+    fputs("x", f);
+    fclose(f);
+    assert(pion_fs_lstat_kind(file) == 1);
+#ifndef _WIN32
+    char link[700], locked[700], hidden[700];
+    snprintf(link, sizeof(link), "%s/link", base);
+    snprintf(locked, sizeof(locked), "%s/locked", base);
+    snprintf(hidden, sizeof(hidden), "%s/locked/hidden", base);
+    assert(pion_fs_lstat_kind(below) == -1); /* ENOTDIR, not "missing" */
+    assert(symlink("missing", link) == 0);
+    assert(pion_fs_lstat_kind(link) == 3); /* dangling: the link itself */
+    assert(chmod(base, 0755) == 0);
+    assert(mkdir(locked, 0700) == 0);
+    f = fopen(hidden, "w");
+    assert(f);
+    fclose(f);
+    assert(chmod(locked, 0000) == 0);
+    if (geteuid() != 0) {
+        assert(pion_fs_lstat_kind(hidden) == -1); /* EACCES */
+    } else {
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            if (setgid(65534) != 0 || setuid(65534) != 0) _exit(2);
+            _exit(pion_fs_lstat_kind(hidden) == -1 ? 0 : 1);
+        }
+        int st = 0;
+        assert(waitpid(pid, &st, 0) == pid);
+        assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    assert(chmod(locked, 0700) == 0);
+    assert(unlink(hidden) == 0 && rmdir(locked) == 0 && unlink(link) == 0);
+#else
+    (void)below;
+#endif
+    assert(remove(file) == 0);
+    assert(pion_fs_rmdir(base) == 0);
+    assert(pion_fs_lstat_kind(base) == 0);
+    printf("[PASS] fs_lstat_kind (missing / file / dir / symlink / query errors)\n");
+}
+
+static const char *g_lock_path;
+static atomic_int g_lock_started;
+static atomic_int g_lock_released;
+static atomic_int g_lock_saw_released;
+
+static void lock_waiter(void *env) {
+    (void)env;
+    atomic_store(&g_lock_started, 1);
+    int64_t h = pion_fs_lock(g_lock_path);
+    assert(h >= 0);
+    /* Only granted once the main thread has released its lock. */
+    atomic_store(&g_lock_saw_released, atomic_load(&g_lock_released));
+    pion_fs_unlock(h);
+}
+
+/* The blocking lock excludes trylock and a second blocking locker until it
+ * is released (a spawn worker takes it after the main thread). This checks
+ * mutual exclusion and acquisition after release deterministically; with no
+ * sleep it does not force the worker to be blocked inside flock first, so it
+ * does not measure blocking timing. Runs with the MT tests: spawning
+ * switches the runtime to multi-threaded mode. */
+static void test_fs_lock_blocking(void) {
+    char path[700];
+    snprintf(path, sizeof(path), "%s/pion_lock_%d.flock", pion_test_tmpdir(), pion_test_getpid());
+    g_lock_path = path;
+    atomic_store(&g_lock_started, 0);
+    atomic_store(&g_lock_released, 0);
+    atomic_store(&g_lock_saw_released, 0);
+    int64_t h = pion_fs_lock(path);
+    assert(h >= 0);
+    assert(pion_fs_trylock(path) == -1);
+    void *sc = pion_scope_begin();
+    pion_scope_spawn(sc, lock_waiter, NULL);
+    while (!atomic_load(&g_lock_started)) {
+    }
+    atomic_store(&g_lock_released, 1);
+    pion_fs_unlock(h);
+    pion_scope_end(sc);
+    assert(atomic_load(&g_lock_saw_released) == 1);
+    int64_t t = pion_fs_trylock(path);
+    assert(t >= 0);
+    pion_fs_unlock(t);
+    remove(path);
+    printf("[PASS] fs_lock_blocking (pion_fs_lock excludes trylock and a waiting locker)\n");
+}
+
 static void test_utf8_paths_and_embedded_nul(int argc, char **argv) {
     void *w = pion_world_init(argc, argv);
     int32_t ok = 0;
@@ -3542,6 +3678,18 @@ static void test_utf8_paths_and_embedded_nul(int argc, char **argv) {
     pion_fs_unlock(lk);
     void *lock_s = pion_str_from_cstr(lockp, -1);
     assert(pion_world_fs_exists(w, lock_s) == 1);
+    /* NULL / empty paths never reach the OS; the pid names pionc temp files. */
+    assert(pion_fs_mkdir_excl(NULL) == -1 && pion_fs_mkdir_excl("") == -1);
+    assert(pion_fs_rmdir(NULL) == -1 && pion_fs_rmdir("") == -1);
+    assert(pion_fs_trylock(NULL) == -1 && pion_fs_trylock("") == -1);
+    pion_fs_unlock(-1);
+    assert(pion_fs_lock(NULL) == -1 && pion_fs_lock("") == -1);
+    assert(pion_cli_getpid() > 0);
+#ifdef _WIN32
+    assert(pion_cli_is_windows() == 1);
+#else
+    assert(pion_cli_is_windows() == 0);
+#endif
 
     /* Rename between UTF-8 names (replacing an existing target), then delete. */
     void *moved_s = u8s(dir, "/移动 \xF0\x9F\x9A\x80.bin");
@@ -3844,6 +3992,11 @@ int main(int argc, char **argv) {
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--bench") == 0) {
             run_bench = 1;
+        } else if (strcmp(argv[i], "--spawn-stack") == 0) {
+            /* Run under a small RLIMIT_STACK (`ulimit -s 1024`): spawn
+             * workers must still get their explicit 8 MiB stacks. */
+            test_mt_spawn_stack_8mib();
+            return 0;
         }
     }
 
@@ -3860,6 +4013,7 @@ int main(int argc, char **argv) {
     test_world(argc, argv);
     test_p22a_systems_io(argc, argv);
     test_utf8_paths_and_embedded_nul(argc, argv);
+    test_fs_lstat_kind();
     test_ffi_ptr_and_cstr();
     test_str_to_double();
     test_p57b_hot_str_and_split();
@@ -3872,6 +4026,8 @@ int main(int argc, char **argv) {
     test_mt_mutex_and_atomic();
     test_mt_mutex_deep_containers();
     test_mt_nested_scope();
+    test_mt_spawn_stack_8mib();
+    test_fs_lock_blocking();
     test_mt_slab_stress();
     test_med_cache_and_mt_frozen();
     test_mt_world_exec(argc, argv);

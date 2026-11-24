@@ -51,7 +51,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -150,12 +149,16 @@ PION_MINSIZE void pion_panic(const char *msg, const char *file, int32_t line) {
     abort();
 }
 
+/* A fixed name, not __FILE__: the absolute build path would make
+ * libpionrt.a's size (and bytes) depend on where the tree is checked out. */
+#define PION_RT_FILE "pion_rt.c"
+
 static _Noreturn PION_NOINLINE PION_MINSIZE void pion_oom(void) {
-    pion_panic("out of memory", __FILE__, __LINE__);
+    pion_panic("out of memory", PION_RT_FILE, __LINE__);
 }
 
 static _Noreturn PION_NOINLINE PION_MINSIZE void pion_die(const char *msg) {
-    pion_panic(msg, __FILE__, __LINE__);
+    pion_panic(msg, PION_RT_FILE, __LINE__);
 }
 
 PION_MINSIZE void pion_panic_oob(int64_t idx, int64_t len) {
@@ -2441,11 +2444,25 @@ PION_MINSIZE void pion_scope_spawn(void *scope_ptr, void (*fn)(void *env), void 
 
     pion_thread_t th;
 #ifdef _WIN32
-    uintptr_t h = _beginthreadex(NULL, 8u * 1024u * 1024u, pion_spawn_trampoline, task, 0, NULL);
+    /* Reserve (not commit) 8 MiB, like the main thread. */
+    uintptr_t h = _beginthreadex(NULL, 8u * 1024u * 1024u, pion_spawn_trampoline, task,
+                                 STACK_SIZE_PARAM_IS_A_RESERVATION, NULL);
     if (h == 0) pion_die("_beginthreadex failed");
     th = (HANDLE)h;
 #else
-    if (pthread_create(&th, NULL, pion_spawn_trampoline, task) != 0) pion_die("pthread_create failed");
+    /* Always an explicit 8 MiB, like the main thread and Windows (SPEC
+     * contract): macOS gives secondary pthreads only 512 KiB, glibc
+     * RLIMIT_STACK (2 MiB when unlimited), so deep recursion such as
+     * pionc's parallel check+emit hit the guard page. Never fall back to a
+     * smaller default stack: any attribute failure is fatal. */
+    pthread_attr_t attr;
+    int rc = pthread_attr_init(&attr);
+    if (rc == 0) {
+        rc = pthread_attr_setstacksize(&attr, 8u * 1024u * 1024u);
+        if (rc == 0) rc = pthread_create(&th, &attr, pion_spawn_trampoline, task);
+        pthread_attr_destroy(&attr);
+    }
+    if (rc != 0) pion_die("pthread_create failed (8 MiB stack)");
 #endif
 
     pion_mu_lock(&s->mu);
@@ -2807,9 +2824,10 @@ PION_MINSIZE void *pion_world_read_line(void *w_ptr, int32_t *ok_out) {
 #endif
 }
 
-/* The same gate for Pion code feeding the `const char *` entries
- * (`pion_fs_mkdir_excl`, `pion_fs_trylock`, which refuse NULL): `data` while
- * its `len` bytes are non-empty and NUL-free, else NULL. */
+/* The same gate for Pion code feeding `const char *` entries (the
+ * `runtime/pion_cli.c` helpers `pion_fs_mkdir_excl` / `pion_fs_trylock`,
+ * which refuse NULL): `data` while its `len` bytes are non-empty and
+ * NUL-free, else NULL. Stays here: `pion_path_cstr` below is built on it. */
 PION_MINSIZE const char *pion_fs_cpath(const char *data, int64_t len) {
     return (data && len > 0 && !memchr(data, 0, (size_t)len)) ? data : NULL;
 }
@@ -3092,81 +3110,6 @@ PION_MINSIZE int32_t pion_world_fs_mkdir_p(void *w_ptr, void *path_str) {
     }
     free(tmp);
     return ok;
-#endif
-}
-
-/* Exclusive single-directory create (no shell, no parents): 0 if this call
- * created `path`, -1 if it already exists or cannot be created. */
-PION_MINSIZE int32_t pion_fs_mkdir_excl(const char *path) {
-    if (!path || !*path) return -1;
-#ifdef _WIN32
-    wchar_t wb[PION_WBUF];
-    wchar_t *wp = pion_utf8_to_wide(path, strlen(path), wb);
-    int rc = (wp && _wmkdir(wp) == 0) ? 0 : -1;
-    pion_wfree(wp, wb);
-    return rc;
-#else
-    return mkdir(path, 0700) == 0 ? 0 : -1;
-#endif
-}
-
-/* Single empty-directory remove (no shell): 0 on success, -1 on error. */
-PION_MINSIZE int32_t pion_fs_rmdir(const char *path) {
-    if (!path || !*path) return -1;
-#ifdef _WIN32
-    wchar_t wb[PION_WBUF];
-    wchar_t *wp = pion_utf8_to_wide(path, strlen(path), wb);
-    int rc = (wp && _wrmdir(wp) == 0) ? 0 : -1;
-    pion_wfree(wp, wb);
-    return rc;
-#else
-    return rmdir(path) == 0 ? 0 : -1;
-#endif
-}
-
-/* Non-blocking exclusive lock on `path` (created if missing, never removed):
- * a handle >= 0, or -1 when another process holds it. The lock lives on the
- * open file description (close-on-exec, not inherited), so the kernel drops
- * it when the holder exits or is killed. */
-PION_MINSIZE int64_t pion_fs_trylock(const char *path) {
-    if (!path || !*path) return -1;
-#ifdef _WIN32
-    wchar_t wb[PION_WBUF];
-    wchar_t *wp = pion_utf8_to_wide(path, strlen(path), wb);
-    HANDLE h = wp ? CreateFileW(wp, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
-                  : INVALID_HANDLE_VALUE;
-    pion_wfree(wp, wb);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    OVERLAPPED ov;
-    memset(&ov, 0, sizeof ov);
-    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
-        CloseHandle(h);
-        return -1;
-    }
-    return (int64_t)(uintptr_t)h & INT64_MAX;
-#else
-    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
-    if (fd < 0) return -1;
-    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
-        close(fd);
-        return -1;
-    }
-    return (int64_t)fd;
-#endif
-}
-
-/* Releases a `pion_fs_trylock` handle (the lock file stays). */
-PION_MINSIZE void pion_fs_unlock(int64_t handle) {
-    if (handle < 0) return;
-#ifdef _WIN32
-    HANDLE h = (HANDLE)(uintptr_t)handle;
-    OVERLAPPED ov;
-    memset(&ov, 0, sizeof ov);
-    UnlockFileEx(h, 0, 1, 0, &ov);
-    CloseHandle(h);
-#else
-    close((int)handle);
 #endif
 }
 
@@ -4824,7 +4767,11 @@ PION_MINSIZE void pion_sleep_ms(void *w_ptr, int32_t ms) {
 #include <immintrin.h>
 #endif
 
-static PION_NOINLINE PION_MINSIZE void *pion_simd_slice(
+/* Bounds-checked slice for the SIMD entry points. Deliberately not
+ * PION_MINSIZE: it runs 2-4 times per call, and -Os here made short
+ * simd_dot_f32 / simd_axpy_f32 calls (len 4) ~2x slower for +8 B on Linux
+ * ARM64 (Wave J0 microbenchmark). */
+static PION_NOINLINE void *pion_simd_slice(
     void *obj, int32_t is_bytes, int32_t elem_stride, int32_t off, int64_t need) {
     int64_t len;
     uint8_t *data;

@@ -21,13 +21,25 @@ PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
 
 echo "=== [1/9] Build QBE + Runtime ==="
 sh "$ROOT_DIR/scripts/build-qbe.sh" "$PION_QBE"
-if [ "${PION_SKIP_RT_TEST:-0}" = "1" ] && [ -f "$PION_RT_LIB" ]; then
+RT_SRC="$ROOT_DIR/runtime/pion_rt.c"
+RT_HDR="$ROOT_DIR/runtime/pion_rt.h"
+# PION_SKIP_RT_TEST=1 reuses a libpionrt.a that test-runtime.sh already built
+# and size-gated, but only while it is newer than the runtime sources;
+# otherwise the full test-runtime.sh (flags, strip, < 64 KB gate) runs.
+if [ "${PION_SKIP_RT_TEST:-0}" = "1" ] && [ -f "$PION_RT_LIB" ] &&
+  [ ! "$RT_SRC" -nt "$PION_RT_LIB" ] && [ ! "$RT_HDR" -nt "$PION_RT_LIB" ]; then
   echo "Using pre-verified $PION_RT_LIB (PION_SKIP_RT_TEST=1)"
-  if [ ! -f "$PION_RT_CLI_LIB" ]; then
-    "${CC:-cc}" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
-    rm -f "$PION_RT_CLI_LIB"
-    ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+  # libpionrt_cli.a = the verified pion_rt.o + a fresh pion_cli.o. A missing
+  # or older out/pion_rt.o is taken from the archive itself (never rebuilt
+  # here, and $PION_RT_LIB is never rewritten).
+  RT_OBJ="$OUT_DIR/pion_rt.o"
+  if [ ! -f "$RT_OBJ" ] || [ "$PION_RT_LIB" -nt "$RT_OBJ" ]; then
+    (cd "$TMP_DIR" && ar x "$PION_RT_LIB" pion_rt.o)
+    RT_OBJ="$TMP_DIR/pion_rt.o"
   fi
+  "${CC:-cc}" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
+  rm -f "$PION_RT_CLI_LIB"
+  ar rcs "$PION_RT_CLI_LIB" "$RT_OBJ" "$OUT_DIR/pion_cli.o"
 else
   sh "$ROOT_DIR/scripts/test-runtime.sh"
 fi

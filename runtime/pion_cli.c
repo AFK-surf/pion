@@ -7,6 +7,7 @@
 #endif
 #include "pion_rt.h"
 #include <windows.h>
+#include <direct.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdlib.h>
@@ -159,15 +160,111 @@ char *pion_fs_canon_path(const char *path) {
     return out;
 }
 
+/* Exclusive single-directory create (no shell, no parents): 0 if this call
+ * created `path`, -1 if it already exists or cannot be created. */
+int32_t pion_fs_mkdir_excl(const char *path) {
+    wchar_t *wp = path ? pion_cli_utf8_to_wide(path, strlen(path)) : NULL;
+    int32_t rc = (wp && _wmkdir(wp) == 0) ? 0 : -1;
+    free(wp);
+    return rc;
+}
+
+/* Single empty-directory remove (no shell): 0 on success, -1 on error. */
+int32_t pion_fs_rmdir(const char *path) {
+    wchar_t *wp = path ? pion_cli_utf8_to_wide(path, strlen(path)) : NULL;
+    int32_t rc = (wp && _wrmdir(wp) == 0) ? 0 : -1;
+    free(wp);
+    return rc;
+}
+
+/* Non-blocking exclusive lock on `path` (created if missing, never removed):
+ * a handle >= 0, or -1 when another process holds it. The kernel drops the
+ * lock when the holder exits or is killed. */
+int64_t pion_fs_trylock(const char *path) {
+    wchar_t *wp = path ? pion_cli_utf8_to_wide(path, strlen(path)) : NULL;
+    HANDLE h = wp ? CreateFileW(wp, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                  : INVALID_HANDLE_VALUE;
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
+        CloseHandle(h);
+        return -1;
+    }
+    return (int64_t)(uintptr_t)h & INT64_MAX;
+}
+
+/* Blocking exclusive lock on `path` (created if missing, never removed):
+ * waits until no other holder remains; a handle >= 0, or -1 on error.
+ * Released with pion_fs_unlock. */
+int64_t pion_fs_lock(const char *path) {
+    wchar_t *wp = path ? pion_cli_utf8_to_wide(path, strlen(path)) : NULL;
+    HANDLE h = wp ? CreateFileW(wp, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                  : INVALID_HANDLE_VALUE;
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK, 0, 1, 0, &ov)) {
+        CloseHandle(h);
+        return -1;
+    }
+    return (int64_t)(uintptr_t)h & INT64_MAX;
+}
+
+/* Releases a `pion_fs_trylock` / `pion_fs_lock` handle (the lock file stays). */
+void pion_fs_unlock(int64_t handle) {
+    if (handle < 0) return;
+    HANDLE h = (HANDLE)(uintptr_t)handle;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    UnlockFileEx(h, 0, 1, 0, &ov);
+    CloseHandle(h);
+}
+
+/* This process's id (unique among live processes; `pionc` temp-file names). */
+int64_t pion_cli_getpid(void) {
+    return (int64_t)GetCurrentProcessId();
+}
+
+/* 1 on a Windows host build of pionc (host path rules), else 0. */
+int32_t pion_cli_is_windows(void) {
+    return 1;
+}
+
+/* lstat kind without following links: 0 confirmed missing, 1 regular file,
+ * 2 directory, 3 symlink / reparse point (junction), 4 other, -1 when the
+ * query itself fails (access denied, I/O, invalid path) — never "missing". */
+int32_t pion_fs_lstat_kind(const char *path) {
+    wchar_t *wp = path ? pion_cli_utf8_to_wide(path, strlen(path)) : NULL;
+    if (!wp) return -1;
+    DWORD a = GetFileAttributesW(wp);
+    DWORD err = a == INVALID_FILE_ATTRIBUTES ? GetLastError() : 0;
+    free(wp);
+    if (a == INVALID_FILE_ATTRIBUTES) {
+        return (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) ? 0 : -1;
+    }
+    if (a & FILE_ATTRIBUTE_REPARSE_POINT) return 3;
+    if (a & FILE_ATTRIBUTE_DIRECTORY) return 2;
+    return 1;
+}
+
 #else /* POSIX */
 
 #define _POSIX_C_SOURCE 200809L
 #define _XOPEN_SOURCE 700
+#define _DARWIN_C_SOURCE /* flock() in <sys/file.h> */
+#define _DEFAULT_SOURCE  /* flock() on glibc / musl */
 
 #include "pion_rt.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -400,6 +497,78 @@ char *pion_fs_canon_path(const char *path) {
         free(cur);
         return collapsed;
     }
+}
+
+/* Exclusive single-directory create (no shell, no parents): 0 if this call
+ * created `path`, -1 if it already exists or cannot be created. */
+int32_t pion_fs_mkdir_excl(const char *path) {
+    return (path && *path && mkdir(path, 0700) == 0) ? 0 : -1;
+}
+
+/* Single empty-directory remove (no shell): 0 on success, -1 on error. */
+int32_t pion_fs_rmdir(const char *path) {
+    return (path && *path && rmdir(path) == 0) ? 0 : -1;
+}
+
+/* Non-blocking exclusive lock on `path` (created if missing, never removed):
+ * a handle >= 0, or -1 when another process holds it. The lock lives on the
+ * open file description (close-on-exec, not inherited), so the kernel drops
+ * it when the holder exits or is killed. */
+int64_t pion_fs_trylock(const char *path) {
+    if (!path || !*path) return -1;
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}
+
+/* Blocking exclusive lock on `path` (created if missing, never removed):
+ * waits until no other holder remains; a handle >= 0, or -1 on error.
+ * Released with pion_fs_unlock; the kernel drops it if the holder dies. */
+int64_t pion_fs_lock(const char *path) {
+    if (!path || !*path) return -1;
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    int rc;
+    do {
+        rc = flock(fd, LOCK_EX);
+    } while (rc != 0 && errno == EINTR);
+    if (rc != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+}
+
+/* Releases a `pion_fs_trylock` / `pion_fs_lock` handle (the lock file stays). */
+void pion_fs_unlock(int64_t handle) {
+    if (handle >= 0) close((int)handle);
+}
+
+/* This process's id (unique among live processes; `pionc` temp-file names). */
+int64_t pion_cli_getpid(void) {
+    return (int64_t)getpid();
+}
+
+/* 1 on a Windows host build of pionc (host path rules), else 0. */
+int32_t pion_cli_is_windows(void) {
+    return 0;
+}
+
+/* lstat kind without following links: 0 confirmed missing (ENOENT), 1
+ * regular file, 2 directory, 3 symlink, 4 other (FIFO, socket, device), -1
+ * when the query itself fails (EACCES, ENOTDIR, EIO, ...) — never "missing". */
+int32_t pion_fs_lstat_kind(const char *path) {
+    if (!path || !*path) return -1;
+    struct stat st;
+    if (lstat(path, &st) != 0) return errno == ENOENT ? 0 : -1;
+    if (S_ISREG(st.st_mode)) return 1;
+    if (S_ISDIR(st.st_mode)) return 2;
+    if (S_ISLNK(st.st_mode)) return 3;
+    return 4;
 }
 
 #endif /* _WIN32 */

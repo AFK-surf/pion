@@ -81,6 +81,9 @@ grep -q 'tcp_loopback_mt (4 concurrent TCP clients on 127.0.0.1' "$TMP_DIR/test_
   echo "FAIL: tcp_loopback_mt did not run the real 127.0.0.1 TCP loopback on Linux" >&2
   exit 1
 }
+# spawn workers keep their explicit 8 MiB stacks under a 1 MiB RLIMIT_STACK
+# (glibc would otherwise size thread stacks from it).
+(ulimit -s 1024 && "$OUT_DIR/test_rt_linux" --spawn-stack)
 set +e
 stdbuf -oL "$OUT_DIR/test_rt_linux" --bench
 BENCH_RC=$?
@@ -527,6 +530,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_data_ptr_safety/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC"
+# P93: symlinked pionc self-location + atomic (temp + rename) native/Wasm32 link publishing.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

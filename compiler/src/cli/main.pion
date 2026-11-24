@@ -276,8 +276,8 @@ fn drv_parent_dir(path : String) -> String {
 
 ///|
 fn drv_ensure_parent_dir(world : World, path : String) -> Unit {
-  let dir = drv_parent_dir(path)
-  if dir.length() > 0 {
+  let (dir, _) = drv_split_dir_base(world, path)
+  if dir.length() > 0 && dir != "." && dir != "/" {
     let _ = fs_mkdir_p(world, dir)
   }
 }
@@ -438,12 +438,21 @@ fn drv_self_exe_path(world : World) -> String {
 }
 
 ///|
+/// The directory of the real `pionc` executable: `drv_self_exe_path` with
+/// every symlink resolved (`pion_fs_canon_path`, falling back to the path as
+/// found), so a `pionc` symlinked from another directory (`~/.local/bin`,
+/// multi-hop or relative links) still finds its sibling `qbe`, `libpionrt.a`
+/// and `share/pion`. Explicit `PION_*` overrides are checked before this.
 fn drv_self_exe_dir(world : World) -> String {
   let p = drv_self_exe_path(world)
   if p.length() == 0 || !drv_has_path_sep(p) {
     return ""
   }
-  drv_parent_dir(p)
+  let real = match drv_canon_out_path(world, p) {
+    Ok(v) => v
+    Err(_) => p
+  }
+  drv_parent_dir(real)
 }
 
 ///|
@@ -1496,14 +1505,32 @@ fn drv_resolve_qbe_target(world : World) -> String {
 }
 
 ///|
+/// This process's id (`libpionrt_cli.a`), unique among live processes.
+extern "C" fn c_cli_getpid() -> Int64 = "pion_cli_getpid"
+
+///|
+/// 1 when this `pionc` was built for a Windows host (`libpionrt_cli.a`); a
+/// compile-time fact, unlike the `OS` environment variable.
+extern "C" fn c_cli_is_windows() -> Int = "pion_cli_is_windows"
+
+///|
+/// `lstat` kind of a path (`libpionrt_cli.a`): 0 confirmed missing, 1 regular
+/// file, 2 directory, 3 symlink / reparse point, 4 other, -1 query error
+/// (permissions, I/O, a bad path) — never mistaken for "missing".
+extern "C" fn c_fs_lstat_kind(path : Ptr) -> Int = "pion_fs_lstat_kind"
+
+///|
+fn drv_lstat_kind(path : String) -> Int {
+  let p = path
+  c_fs_lstat_kind(drv_cpath(p))
+}
+
+///|
 /// Builds a process-unique temporary suffix so concurrent `pionc` processes
 /// running in the same millisecond never collide on shared CAS `.tmp.*` files.
 fn drv_tmp_tag(world : World, salt : String) -> String {
   let ms = clock_now_ms(world).to_string()
-  let pid_hint = match fs_read(world, "/proc/self/stat") {
-    Ok(s) => s
-    Err(_) => drv_env_str(world, "PWD") + "|" + drv_env_str(world, "SHLVL") + "|" + drv_env_str(world, "_")
-  }
+  let pid_hint = c_cli_getpid().to_string()
   let args_sb = StringBuilder()
   let argv = world_args(world)
   let mut i = 0
@@ -1519,23 +1546,70 @@ fn drv_tmp_tag(world : World, salt : String) -> String {
 }
 
 ///|
-fn drv_finish_tmp_rename(world : World, tmp : String, dst : String) -> Bool {
+/// Atomically publishes the finished `tmp` as `dst` (rename), removing `tmp`
+/// when that fails. `shared` is only for content-addressed CAS paths that
+/// concurrent `pionc` processes publish with identical bytes: there a failed
+/// rename (e.g. Windows refusing to replace a file another process has open)
+/// still succeeds when the winner's complete `dst` exists (a non-empty regular
+/// file, never a directory, symlink or 0-byte file). Paths the user named
+/// (`-o`, `--emit-*`, sources, manifests, the CAS `index.tsv`) are never
+/// `shared`: a stale `dst` left from before must not pass for this run's
+/// output.
+fn drv_publish_tmp(world : World, tmp : String, dst : String, shared : Bool) -> Bool {
   if fs_rename(world, tmp, dst) {
     true
   } else {
     let _ = fs_remove(world, tmp)
-    fs_exists(world, dst)
+    shared && drv_is_nonempty_regular_file(world, dst)
   }
 }
 
 ///|
+/// A CAS entry counts as present (a hit, or a lost publish race's winner)
+/// only as a non-empty regular file: a directory, symlink or 0-byte file
+/// left at its path is never mistaken for a finished output.
+fn drv_is_nonempty_regular_file(world : World, path : String) -> Bool {
+  match drv_lstat_regular_size(world, path) {
+    Some(_) => true
+    None => false
+  }
+}
+
+///|
+/// Writes `content` to the user-named `path` atomically (temp + rename); false
+/// when it could not be replaced, even if an older `path` exists.
 fn drv_write_text_atomic(world : World, path : String, content : String) -> Bool {
   let tmp = path + ".tmp." + drv_tmp_tag(world, path)
   match fs_write(world, tmp, content) {
-    Err(_) => return false
+    Err(_) => {
+      let _ = fs_remove(world, tmp)
+      return false
+    }
     Ok(_) => ()
   }
-  drv_finish_tmp_rename(world, tmp, path)
+  drv_publish_tmp(world, tmp, path, false)
+}
+
+///|
+/// `drv_write_text_atomic` for a content-addressed CAS path (see
+/// `drv_publish_tmp`): losing the publish race to an identical file succeeds.
+fn drv_write_cas_text_atomic(world : World, path : String, content : String) -> Bool {
+  let tmp = path + ".tmp." + drv_tmp_tag(world, path)
+  match fs_write(world, tmp, content) {
+    Err(_) => {
+      let _ = fs_remove(world, tmp)
+      return false
+    }
+    Ok(_) => ()
+  }
+  drv_publish_tmp(world, tmp, path, true)
+}
+
+///|
+/// The file a link to `final_bin` produces: GCC/Clang drivers targeting
+/// Windows append `.exe` when the `-o` basename has no extension.
+fn drv_linked_exe_path(qbe_target : String, final_bin : String) -> String {
+  cas_linked_exe_name(drv_target_is_windows(qbe_target), final_bin)
 }
 
 ///|
@@ -1698,6 +1772,44 @@ fn drv_sort_strings(arr : Array[String]) -> Unit {
 }
 
 ///|
+extern "C" fn c_fs_lock(path : Ptr) -> Int64 = "pion_fs_lock"
+
+///|
+/// Serializes every read-modify-write of `<cache_dir>/index.tsv` across
+/// `pionc` processes: a blocking exclusive lock (`flock` / `LockFileEx`) on
+/// `index.tsv.lock`, released with `c_fs_unlock` (the kernel drops it if the
+/// holder dies). -1 when the lock file cannot be opened (an unwritable
+/// cache), in which case the caller proceeds unlocked.
+fn drv_cas_index_lock(world : World, cache_dir : String) -> Int64 {
+  let _ = fs_mkdir_p(world, cache_dir)
+  let lock_path = cache_dir + "/index.tsv.lock"
+  c_fs_lock(drv_cpath(lock_path))
+}
+
+///|
+/// The CAS index entries, `Some([])` when `index_path` is confirmed missing,
+/// or `None` when something is there that is not a readable regular file (a
+/// directory, a symlink — dangling ones included — or a read error) or its
+/// `lstat` itself fails: callers must then leave it alone rather than
+/// overwrite it with an empty index.
+fn drv_cas_read_index(world : World, index_path : String) -> Option[Array[CasEntry]] {
+  let kind = drv_lstat_kind(index_path)
+  if kind == 0 {
+    Some([])
+  } else if kind == 1 {
+    match fs_read(world, index_path) {
+      Ok(txt) => Some(cas_parse_index(txt))
+      Err(_) => None
+    }
+  } else {
+    None
+  }
+}
+
+///|
+/// Records `key` in the CAS index and evicts down to the size budget. Only
+/// under the index lock and from a readable index: when either is missing
+/// the index (and every cached file) is left untouched.
 fn drv_cas_record_and_evict(
   world : World,
   cache_dir : String,
@@ -1705,13 +1817,16 @@ fn drv_cas_record_and_evict(
   entry_bytes : Int64,
 ) -> Unit {
   let index_path = cache_dir + "/index.tsv"
-  let entries : Array[CasEntry] = if fs_exists(world, index_path) {
-    match fs_read(world, index_path) {
-      Ok(txt) => cas_parse_index(txt)
-      Err(_) => []
+  let lk = drv_cas_index_lock(world, cache_dir)
+  if lk < 0L {
+    return
+  }
+  let entries = match drv_cas_read_index(world, index_path) {
+    Some(v) => v
+    None => {
+      c_fs_unlock(lk)
+      return
     }
-  } else {
-    []
   }
   let now = clock_now_ms(world)
   let max_bytes = drv_resolve_cache_max_bytes(world)
@@ -1731,6 +1846,7 @@ fn drv_cas_record_and_evict(
     i = i + 1
   }
   let _ = drv_write_text_atomic(world, index_path, cas_format_index(ev.kept))
+  c_fs_unlock(lk)
 }
 
 ///|
@@ -1744,13 +1860,16 @@ fn drv_cas_record_batch_and_evict(
     return
   }
   let index_path = cache_dir + "/index.tsv"
-  let mut entries : Array[CasEntry] = if fs_exists(world, index_path) {
-    match fs_read(world, index_path) {
-      Ok(txt) => cas_parse_index(txt)
-      Err(_) => []
+  let lk = drv_cas_index_lock(world, cache_dir)
+  if lk < 0L {
+    return
+  }
+  let mut entries : Array[CasEntry] = match drv_cas_read_index(world, index_path) {
+    Some(v) => v
+    None => {
+      c_fs_unlock(lk)
+      return
     }
-  } else {
-    []
   }
   let now = clock_now_ms(world)
   let max_bytes = drv_resolve_cache_max_bytes(world)
@@ -1781,6 +1900,7 @@ fn drv_cas_record_batch_and_evict(
     i = i + 1
   }
   let _ = drv_write_text_atomic(world, index_path, cas_format_index(entries))
+  c_fs_unlock(lk)
 }
 
 ///|
@@ -3939,14 +4059,26 @@ fn drv_bin_key(world : World, key : String, opts : DrvLinkOpts) -> String {
 ///|
 fn drv_copy_file(world : World, src : String, dst : String) -> Result[String, String] {
   drv_ensure_parent_dir(world, dst)
-  match fs_read_bytes(world, src) {
-    Err(e) => Err("failed to read " + src + ": " + e)
-    Ok(b) =>
-      match fs_write_bytes(world, dst, b) {
-        Err(e) => Err("failed to write " + dst + ": " + e)
-        Ok(_) => Ok(dst)
+  let b = match fs_read_bytes(world, src) {
+    Err(e) => return Err("failed to read " + src + ": " + e)
+    Ok(v) => v
+  }
+  let (dst_dir, dst_base) = drv_split_dir_base(world, dst)
+  let stage = match drv_make_out_stage(world, dst_dir) {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let tmp = stage + "/" + dst_base
+  let res : Result[String, String] = match fs_write_bytes(world, tmp, b) {
+    Err(e) => Err("failed to write " + dst + ": " + e)
+    Ok(_) =>
+      if drv_publish_tmp(world, tmp, dst, false) {
+        Ok(dst)
+      } else {
+        Err("failed to replace " + dst)
       }
   }
+  drv_staged_result(res, drv_drop_out_stage(world, stage))
 }
 
 ///|
@@ -4195,7 +4327,190 @@ fn drv_link_shared_lib(
 }
 
 ///|
+/// Splits `path` at its last separator into (directory, basename); the
+/// directory is `"."` without a separator and `"/"` for a root-level path.
+/// Separators are the host's: `/` and backslash on Windows, only `/`
+/// elsewhere (where a backslash is an ordinary file-name character).
+fn drv_split_dir_base(_world : World, path : String) -> (String, String) {
+  let win = c_cli_is_windows() != 0
+  let mut i = path.length() - 1
+  while i >= 0 {
+    let ch = str_code_at(path, i)
+    if ch == 47 || (win && ch == 92) {
+      break
+    }
+    i = i - 1
+  }
+  if i < 0 {
+    (".", path)
+  } else if i == 0 {
+    (slice_str(path, 0, 1), slice_str(path, 1, path.length()))
+  } else {
+    (slice_str(path, 0, i), slice_str(path, i + 1, path.length()))
+  }
+}
+
+///|
+/// Exclusively creates a short private staging directory
+/// `<dir>/.pion_ld.<pid>.<seq>` next to an output that a tool (linker,
+/// `wasm-opt`) or a copy writes before `drv_publish_tmp` renames it into
+/// place: the same filesystem keeps the rename atomic, and the staged file
+/// keeps the output's own basename (no longer than the final name).
+/// Only a name already taken moves on to the next `seq`; any other failure
+/// (no permission, missing directory) is an immediate error.
+fn drv_make_out_stage(world : World, dir : String) -> Result[String, String] {
+  let base = dir + "/.pion_ld." + c_cli_getpid().to_string() + "."
+  let mut k = 0
+  while k < 4096 {
+    let cand = base + k.to_string()
+    if c_fs_mkdir_excl(drv_cpath(cand)) == 0 {
+      return Ok(cand)
+    }
+    if !fs_exists(world, cand) {
+      break
+    }
+    k = k + 1
+  }
+  Err("cannot create a staging directory in " + dir)
+}
+
+///|
+/// Removes whatever is left in a `drv_make_out_stage` directory (the output
+/// after a failed publish, tool side files such as a `.dSYM` tree) and then
+/// the directory itself, recursively but never through a symlink (`lstat`:
+/// links and files are unlinked, only real directories are descended).
+fn drv_drop_out_stage(world : World, stage : String) -> Result[Unit, String] {
+  let removed = drv_remove_tree_nofollow(world, stage)
+  if removed && drv_lstat_kind(stage) == 0 {
+    Ok(())
+  } else {
+    Err("failed to remove staging directory " + stage)
+  }
+}
+
+///|
+/// Removes `path` without following symlinks: its kind is checked with
+/// `lstat` before anything else; only a real directory is listed and
+/// descended, a symlink (or a Windows junction, which `fs_remove` cannot
+/// delete and `rmdir` can) is removed itself, a confirmed-missing path is
+/// done, and a failed `lstat` is a failure (never "already removed").
+fn drv_remove_tree_nofollow(world : World, path : String) -> Bool {
+  let kind = drv_lstat_kind(path)
+  let p = path
+  if kind == 0 {
+    true
+  } else if kind < 0 {
+    false
+  } else if kind == 2 {
+    let entries = fs_list_dir(world, path)
+    let mut ok = true
+    let mut i = 0
+    while i < entries.length() {
+      if !drv_remove_tree_nofollow(world, path + "/" + entries[i]) {
+        ok = false
+      }
+      i = i + 1
+    }
+    c_fs_rmdir(drv_cpath(p)) == 0 && ok
+  } else if kind == 3 {
+    fs_remove(world, path) || c_fs_rmdir(drv_cpath(p)) == 0
+  } else {
+    fs_remove(world, path)
+  }
+}
+
+///|
+/// The result of a staged write once its staging directory is gone: a
+/// cleanup failure after a successful publish fails the command but names
+/// the published output and the leftover directory; after a failure it is
+/// appended to (never replaces) the original error.
+fn drv_staged_result(
+  res : Result[String, String],
+  drop : Result[Unit, String],
+) -> Result[String, String] {
+  match drop {
+    Ok(_) => res
+    Err(d) =>
+      match res {
+        Ok(published) => Err("published " + published + ", but " + d)
+        Err(e) => Err(e + "; " + d)
+      }
+  }
+}
+
+///|
+/// Publishes a tool's staged output `tmp` as `dst` only when the tool really
+/// produced one (a non-empty regular file): a tool that exits 0 but leaves
+/// nothing, an empty file or a symlink never replaces `dst`.
+fn drv_publish_tool_output(
+  world : World,
+  tmp : String,
+  dst : String,
+  shared : Bool,
+  what : String,
+) -> Result[String, String] {
+  if !drv_is_nonempty_regular_file(world, tmp) {
+    let _ = fs_remove(world, tmp)
+    return Err(what + " produced no output for " + dst)
+  }
+  if drv_publish_tmp(world, tmp, dst, shared) {
+    Ok(dst)
+  } else {
+    Err("failed to move " + what + " output into " + dst)
+  }
+}
+
+///|
+/// Links `obj_paths` into the executable `final_bin` atomically: the linker
+/// writes `<dir>/.pion_ld.<pid>.<seq>/<basename>` (a private staging
+/// directory, so `-o` carries the final basename: Apple ld64 records it as
+/// the ad-hoc code-signature identifier, and the name is no longer than the
+/// final one), which is renamed into place only after a successful link; the
+/// staging directory is removed on every path, so a concurrent
+/// `pionc run`/`build` never sees a half-written binary. `shared` marks a
+/// content-addressed CAS `final_bin` (see `drv_publish_tmp`); an explicit
+/// `-o` path is never `shared`. Returns the published path
+/// (`drv_linked_exe_path`).
 fn drv_link_objects(
+  world : World,
+  qbe_target : String,
+  apple_tools : AppleTools,
+  ld_ver : String,
+  sysroot : String,
+  obj_paths : Array[String],
+  rt_lib : String,
+  opts : DrvLinkOpts,
+  final_bin : String,
+  shared : Bool,
+) -> Result[String, String] {
+  let out_bin = drv_linked_exe_path(qbe_target, final_bin)
+  let (out_dir, out_base) = drv_split_dir_base(world, out_bin)
+  let stage = match drv_make_out_stage(world, out_dir) {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let tmp = stage + "/" + out_base
+  let linked = drv_link_objects_to(
+    world,
+    qbe_target,
+    apple_tools,
+    ld_ver,
+    sysroot,
+    obj_paths,
+    rt_lib,
+    opts,
+    tmp,
+  )
+  let res : Result[String, String] = match linked {
+    Err(e) => Err(e)
+    Ok(_) => drv_publish_tool_output(world, tmp, out_bin, shared, "linker")
+  }
+  drv_staged_result(res, drv_drop_out_stage(world, stage))
+}
+
+///|
+/// Runs the linker with `-o final_bin` (no publishing; see `drv_link_objects`).
+fn drv_link_objects_to(
   world : World,
   qbe_target : String,
   apple_tools : AppleTools,
@@ -4966,10 +5281,10 @@ fn drv_build_nodes_objects_entry(
       } else {
         cleanup_native_rc_ssa(res.ssa)
       }
-      let _ = drv_write_text_atomic(world, sig_path, pionsig)
-      let _ = drv_write_text_atomic(world, stub_path, pionstub)
+      let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
+      let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
       stub_paths[k] = stub_path
-      if !drv_write_text_atomic(world, ssa_path, final_ssa) {
+      if !drv_write_cas_text_atomic(world, ssa_path, final_ssa) {
         return Err("failed to write CAS ssa: " + ssa_path)
       }
       miss_ssa_paths.push(ssa_path)
@@ -5303,9 +5618,9 @@ fn drv_build_wasm_targets(
             )
             let ns_prefix = "p_" + drv_wasm_ns_ident(node.name) + "__"
             let ns_ssa = wasm_namespace_local_ssa(res.ssa, ns_prefix)
-            let _ = drv_write_text_atomic(world, sig_path, pionsig)
-            let _ = drv_write_text_atomic(world, stub_path, pionstub)
-            if !drv_write_text_atomic(world, ssa_path, ns_ssa) {
+            let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
+            let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
+            if !drv_write_cas_text_atomic(world, ssa_path, ns_ssa) {
               return Err("failed to write CAS wasm ssa: " + ssa_path)
             }
             stub_paths[k] = stub_path
@@ -5336,7 +5651,7 @@ fn drv_build_wasm_targets(
           link_key_sb.to_string(),
         )
         let cached_wasm = cache_dir + "/bin/wasm_" + wasm_bin_key + ".wasm"
-        if emit_ssa_path == "" && fs_exists(world, cached_wasm) {
+        if emit_ssa_path == "" && drv_is_nonempty_regular_file(world, cached_wasm) {
           if trace_cas {
             io_eprintln(
               world,
@@ -5413,7 +5728,10 @@ fn drv_build_wasm_targets(
         if wopt_bin != "" {
           let tmp_raw = cached_wasm + ".raw." + wasm_tag
           match fs_write_bytes(world, tmp_raw, wasm_bytes) {
-            Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
+            Err(e) => {
+              let _ = fs_remove(world, tmp_raw)
+              return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
+            }
             Ok(_) => ()
           }
           let wopt_args : Array[String] = [
@@ -5441,15 +5759,16 @@ fn drv_build_wasm_targets(
           }
         } else {
           match fs_write_bytes(world, tmp_bin, wasm_bytes) {
-            Err(e) => return Err("failed to write wasm file " + tmp_bin + ": " + e)
+            Err(e) => {
+              let _ = fs_remove(world, tmp_bin)
+              return Err("failed to write wasm file " + tmp_bin + ": " + e)
+            }
             Ok(_) => ()
           }
         }
-        if !fs_rename(world, tmp_bin, cached_wasm) {
-          let _ = fs_remove(world, tmp_bin)
-          if !fs_exists(world, cached_wasm) {
-            return Err("failed to commit CAS wasm binary: " + cached_wasm)
-          }
+        match drv_publish_tool_output(world, tmp_bin, cached_wasm, true, "wasm emit") {
+          Err(e) => return Err("failed to commit CAS wasm binary: " + e)
+          Ok(_) => ()
         }
         let bsz = fs_size(world, cached_wasm)
         drv_cas_record_batch_and_evict(
@@ -5499,8 +5818,12 @@ fn drv_build_wasm_targets(
   }
 
   let wasm_bytes = emit_wasm_from_ssa_opts(all_ssa, wasm_names)
+  // `wopt_tag` (wasm-opt on/off and which binary) is part of the key, as in
+  // the workspace path: an optimized and a raw module never share a CAS file.
   let ssa_key = drv_prefix16(
-    sha256_hex((if wasm_names { "names|" } else { "" }) + all_ssa),
+    sha256_hex(
+      (if wasm_names { "names|" } else { "" }) + wopt_tag + "|" + all_ssa,
+    ),
   )
   let final_wasm = if out_bin_arg != "" {
     out_bin_arg
@@ -5510,36 +5833,98 @@ fn drv_build_wasm_targets(
   if out_bin_arg != "" {
     drv_ensure_parent_dir(world, out_bin_arg)
   }
-  if wopt_bin != "" {
-    let tmp_raw = final_wasm + ".raw." + drv_tmp_tag(world, final_wasm) + ".wasm"
-    match fs_write_bytes(world, tmp_raw, wasm_bytes) {
-      Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
-      Ok(_) => ()
+  drv_write_wasm_out(
+    world,
+    final_wasm,
+    wasm_bytes,
+    wopt_bin,
+    wasm_names,
+    out_bin_arg == "",
+  )
+}
+
+///|
+/// Writes a single-package Wasm module to `final_wasm` (through `wasm-opt`
+/// when `wopt_bin` is set) inside a `drv_make_out_stage` directory and
+/// publishes it with `drv_publish_tmp` (`shared` for a CAS path), so a
+/// concurrent build never reads a half-written `.wasm` and a failure leaves
+/// no `.raw`/temp file and the old output untouched.
+fn drv_write_wasm_out(
+  world : World,
+  final_wasm : String,
+  wasm_bytes : Bytes,
+  wopt_bin : String,
+  wasm_names : Bool,
+  shared : Bool,
+) -> Result[String, String] {
+  let (out_dir, out_base) = drv_split_dir_base(world, final_wasm)
+  let stage = match drv_make_out_stage(world, out_dir) {
+    Ok(d) => d
+    Err(e) => return Err(e)
+  }
+  let tmp_wasm = stage + "/" + out_base
+  let out : Result[String, String] = if wopt_bin == "" {
+    match fs_write_bytes(world, tmp_wasm, wasm_bytes) {
+      Err(e) => Err("failed to write wasm file " + tmp_wasm + ": " + e)
+      Ok(_) => drv_publish_tool_output(world, tmp_wasm, final_wasm, shared, "wasm emit")
     }
-    let wopt_args : Array[String] = [
-      wopt_bin,
-      "-Oz",
-      "--enable-bulk-memory",
-      "--enable-sign-ext",
-      "--enable-mutable-globals",
-      "--enable-nontrapping-float-to-int",
-    ]
-    if wasm_names {
-      wopt_args.push("-g")
-    }
-    wopt_args.push(tmp_raw)
-    wopt_args.push("-o")
-    wopt_args.push(final_wasm)
-    let opt_res = proc_exec_capture(world, wopt_args)
-    let _ = fs_remove(world, tmp_raw)
-    match opt_res {
-      Ok(_) => return Ok(final_wasm)
-      Err(e) => return Err("wasm-opt failed on " + final_wasm + ": " + e)
+  } else {
+    // wasm-opt's input lives in a second private directory, so it can never
+    // be the output file (e.g. `-o RAW.WASM` on a case-insensitive volume).
+    match drv_make_out_stage(world, out_dir) {
+      Err(e) => Err(e)
+      Ok(raw_stage) => {
+        let opt = drv_run_wasm_opt(
+          world,
+          raw_stage + "/raw.wasm",
+          tmp_wasm,
+          wasm_bytes,
+          wopt_bin,
+          wasm_names,
+        )
+        let published : Result[String, String] = match opt {
+          Err(e) => Err(e)
+          Ok(_) => drv_publish_tool_output(world, tmp_wasm, final_wasm, shared, "wasm-opt")
+        }
+        drv_staged_result(published, drv_drop_out_stage(world, raw_stage))
+      }
     }
   }
-  match fs_write_bytes(world, final_wasm, wasm_bytes) {
-    Err(e) => return Err("failed to write wasm file " + final_wasm + ": " + e)
-    Ok(_) => Ok(final_wasm)
+  drv_staged_result(out, drv_drop_out_stage(world, stage))
+}
+
+///|
+/// Writes `wasm_bytes` to `tmp_raw` and runs `wasm-opt -Oz` from it into
+/// `tmp_wasm` (both inside private staging directories).
+fn drv_run_wasm_opt(
+  world : World,
+  tmp_raw : String,
+  tmp_wasm : String,
+  wasm_bytes : Bytes,
+  wopt_bin : String,
+  wasm_names : Bool,
+) -> Result[Unit, String] {
+  match fs_write_bytes(world, tmp_raw, wasm_bytes) {
+    Err(e) => return Err("failed to write raw wasm file " + tmp_raw + ": " + e)
+    Ok(_) => ()
+  }
+  let wopt_args : Array[String] = [
+    wopt_bin,
+    "-Oz",
+    "--enable-bulk-memory",
+    "--enable-sign-ext",
+    "--enable-mutable-globals",
+    "--enable-nontrapping-float-to-int",
+  ]
+  if wasm_names {
+    wopt_args.push("-g")
+  }
+  wopt_args.push(tmp_raw)
+  wopt_args.push("-o")
+  wopt_args.push(tmp_wasm)
+  match proc_exec_capture(world, wopt_args) {
+    Ok(_) => Ok(())
+    Err(e) => Err("wasm-opt failed on " + tmp_wasm + ": " + e)
   }
 }
 
@@ -5648,8 +6033,9 @@ fn drv_build_targets(
           "_" +
           drv_prefix16(drv_bin_key(world, built.link_key, link_opts))
         let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
-        if out_bin_arg == "" && fs_exists(world, final_bin) {
-          return Ok(final_bin)
+        let linked_bin = drv_linked_exe_path(qbe_target, final_bin)
+        if out_bin_arg == "" && drv_is_nonempty_regular_file(world, linked_bin) {
+          return Ok(linked_bin)
         }
         if out_bin_arg != "" {
           drv_ensure_parent_dir(world, out_bin_arg)
@@ -5671,9 +6057,10 @@ fn drv_build_targets(
           rt_lib,
           link_opts,
           final_bin,
+          out_bin_arg == "",
         ) {
           Err(e) => return Err(e)
-          Ok(_) => return Ok(final_bin)
+          Ok(p) => return Ok(p)
         }
       }
       None => ()
@@ -5794,10 +6181,10 @@ fn drv_build_targets(
         let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
         let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
         if !fs_exists(world, usig_p) {
-          let _ = drv_write_text_atomic(world, usig_p, emit_file_sig_entries(prep.pkg.files[ui]))
+          let _ = drv_write_cas_text_atomic(world, usig_p, emit_file_sig_entries(prep.pkg.files[ui]))
         }
         if !fs_exists(world, ustub_p) {
-          let _ = drv_write_text_atomic(world, ustub_p, emit_file_stub(prep.pkg.files[ui]))
+          let _ = drv_write_cas_text_atomic(world, ustub_p, emit_file_stub(prep.pkg.files[ui]))
         }
         ui = ui + 1
       }
@@ -5856,8 +6243,11 @@ fn drv_build_targets(
       drv_prefix16(drv_bin_key(world, pkg_key, link_opts))
     let final_bin = if out_bin_arg != "" { out_bin_arg } else { default_bin }
 
-    if miss_indices.length() == 0 && out_bin_arg == "" && fs_exists(world, final_bin) {
-      return Ok(final_bin)
+    let linked_bin = drv_linked_exe_path(qbe_target, final_bin)
+    if miss_indices.length() == 0 &&
+      out_bin_arg == "" &&
+      drv_is_nonempty_regular_file(world, linked_bin) {
+      return Ok(linked_bin)
     }
 
     if miss_indices.length() > 0 {
@@ -5938,10 +6328,10 @@ fn drv_build_targets(
               let usig_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".sig"
               let ustub_p = cache_dir + "/usig/" + fp_pre + "_" + src_hashes[ui] + ".stub"
               if !fs_exists(world, usig_p) {
-                let _ = drv_write_text_atomic(world, usig_p, file_sigs[ui])
+                let _ = drv_write_cas_text_atomic(world, usig_p, file_sigs[ui])
               }
               if !fs_exists(world, ustub_p) {
-                let _ = drv_write_text_atomic(world, ustub_p, emit_file_stub(sel.pkg.files[ui]))
+                let _ = drv_write_cas_text_atomic(world, ustub_p, emit_file_stub(sel.pkg.files[ui]))
               }
             }
             ui = ui + 1
@@ -5962,7 +6352,7 @@ fn drv_build_targets(
         } else {
           cleanup_native_rc_ssa(raw_ssa)
         }
-        if !drv_write_text_atomic(world, u_ssa, ssa_text) {
+        if !drv_write_cas_text_atomic(world, u_ssa, ssa_text) {
           return Err("failed to write CAS unit ssa: " + u_ssa)
         }
         mi = mi + 1
@@ -6218,11 +6608,18 @@ fn drv_build_targets(
       drv_ensure_parent_dir(world, out_bin_arg)
     }
     let rt_lib = drv_resolve_rt_lib_for(world, qbe_target, sysroot)
-    match drv_link_objects(world, qbe_target, apple_tools, ld_ver, sysroot, obj_paths, rt_lib, link_opts, final_bin) {
-      Err(e) => return Err(e)
-      Ok(_) => ()
-    }
-    return Ok(final_bin)
+    return drv_link_objects(
+      world,
+      qbe_target,
+      apple_tools,
+      ld_ver,
+      sysroot,
+      obj_paths,
+      rt_lib,
+      link_opts,
+      final_bin,
+      out_bin_arg == "",
+    )
   }
   let single_upstream : Array[String] = []
   if no_main {
@@ -6330,8 +6727,8 @@ fn drv_build_targets(
       emit_staticlib_path == "" &&
       emit_cdylib_path == "" &&
       out_bin_arg == "" &&
-      fs_exists(world, final_bin) {
-      return Ok(final_bin)
+      drv_is_nonempty_regular_file(world, drv_linked_exe_path(qbe_target, final_bin)) {
+      return Ok(drv_linked_exe_path(qbe_target, final_bin))
     }
     if emit_obj_path == "" &&
       emit_staticlib_path == "" &&
@@ -6359,10 +6756,10 @@ fn drv_build_targets(
       cleanup_native_rc_ssa(compiled.ssa)
     }
     has_main = compiled.has_main
-    if !drv_write_text_atomic(world, sig_path, compiled.sig) {
+    if !drv_write_cas_text_atomic(world, sig_path, compiled.sig) {
       return Err("failed to write CAS sig: " + sig_path)
     }
-    if !drv_write_text_atomic(world, ssa_path, final_ssa) {
+    if !drv_write_cas_text_atomic(world, ssa_path, final_ssa) {
       return Err("failed to write CAS ssa: " + ssa_path)
     }
     if emit_ssa_path != "" {
@@ -6481,10 +6878,18 @@ fn drv_build_targets(
   if out_bin_arg != "" {
     drv_ensure_parent_dir(world, out_bin_arg)
   }
-  match drv_link_objects(world, qbe_target, apple_tools, ld_ver, sysroot, [obj_path], rt_lib, link_opts, final_bin) {
-    Err(e) => Err(e)
-    Ok(_) => Ok(final_bin)
-  }
+  drv_link_objects(
+    world,
+    qbe_target,
+    apple_tools,
+    ld_ver,
+    sysroot,
+    [obj_path],
+    rt_lib,
+    link_opts,
+    final_bin,
+    out_bin_arg == "",
+  )
 }
 
 ///|
@@ -6611,21 +7016,22 @@ fn drv_build_test_bin(
     i = i + 1
   }
   objs.push(obj_path)
-  let tmp = bin_path + ".tmp." + stamp
-  match drv_link_objects(world, qbe_target, apple_tools, qbe_macos_ver + ".0", "", objs, rt_lib, link_opts, tmp) {
-    Err(e) => {
-      let _ = fs_remove(world, tmp)
-      return Err(e)
-    }
-    Ok(_) => ()
+  let linked = drv_link_objects(
+    world,
+    qbe_target,
+    apple_tools,
+    qbe_macos_ver + ".0",
+    "",
+    objs,
+    rt_lib,
+    link_opts,
+    bin_path,
+    true,
+  )
+  match linked {
+    Err(e) => Err(e)
+    Ok(_) => Ok(())
   }
-  if !fs_rename(world, tmp, bin_path) {
-    let _ = fs_remove(world, tmp)
-    if !fs_exists(world, bin_path) {
-      return Err("failed to move test binary into " + bin_path)
-    }
-  }
-  Ok(())
 }
 
 ///|
@@ -6761,9 +7167,9 @@ fn drv_exec_test_jobs(
     dsb.write_string(drv_link_opts_key(world, job.link_opts))
     let bkey = sha256_hex(dsb.to_string())
     let obj_path = tb_dir + "/" + okey + ".o"
-    let bin_path = tb_dir + "/" + bkey
+    let bin_path = drv_linked_exe_path(qbe_target, tb_dir + "/" + bkey)
     bins.push(bin_path)
-    if fs_exists(world, bin_path) {
+    if drv_is_nonempty_regular_file(world, bin_path) {
       if trace_cas {
         io_eprintln(world, "[cas] test=" + job.label + " HIT bin=" + drv_prefix16(bkey))
       }
@@ -6771,7 +7177,7 @@ fn drv_exec_test_jobs(
       let need_qbe = !fs_exists(world, obj_path)
       let ssa_path = tb_dir + "/" + okey + ".ssa." + drv_tmp_tag(world, okey + "_" + j.to_string())
       if need_qbe {
-        if !drv_write_text_atomic(world, ssa_path, job.ssa) {
+        if !drv_write_cas_text_atomic(world, ssa_path, job.ssa) {
           return Err("failed to write test ssa: " + ssa_path)
         }
         new_ssa.push(ssa_path)
@@ -6789,7 +7195,9 @@ fn drv_exec_test_jobs(
           (if need_qbe { " obj=MISS" } else { " obj=HIT" }),
         )
       }
-      new_keys.push(bkey)
+      // The real file name (`.exe` on Windows), so size accounting and
+      // `testbin:` eviction hit the binary the link produced.
+      new_keys.push(drv_linked_exe_path(qbe_target, bkey))
       build_lines.push(
         ssa_path +
         "\t" +
@@ -7278,10 +7686,10 @@ fn drv_build_needed_objects(
         "main",
         false,
       )
-      let _ = drv_write_text_atomic(world, sig_path, pionsig)
-      let _ = drv_write_text_atomic(world, stub_path, pionstub)
+      let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
+      let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
       stub_paths[k] = stub_path
-      if !drv_write_text_atomic(world, ssa_path, res.ssa) {
+      if !drv_write_cas_text_atomic(world, ssa_path, res.ssa) {
         return Err("failed to write CAS ssa: " + ssa_path)
       }
       miss_ssa_paths.push(ssa_path)
@@ -11139,8 +11547,8 @@ fn drv_ws_diagnostics_cached(
         sig_hashes.set(node.name, sha256_hex(pionsig))
         if !any_dep_err {
           let pionstub = emit_pion_stub(cr.pkg)
-          let _ = drv_write_text_atomic(world, sig_path, pionsig)
-          let _ = drv_write_text_atomic(world, stub_path, pionstub)
+          let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
+          let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
           stub_paths[k] = stub_path
           new_keys.push(key)
           new_sizes.push((pionsig.length() + pionstub.length()).to_int64())
@@ -11914,6 +12322,26 @@ fn drv_cache_clear_impl(
   as_json : Bool,
 ) -> Int {
   let cache_dir = drv_resolve_cache_dir(world)
+  // Under the index lock, so a concurrent build cannot publish an index
+  // that still lists the files being removed (`index.tsv.lock` itself stays).
+  let lk = drv_cas_index_lock(world, cache_dir)
+  if lk < 0L {
+    return drv_cmd_fail(
+      world,
+      as_json,
+      "cannot lock CAS index " + drv_join_path(cache_dir, "index.tsv.lock"),
+    )
+  }
+  // An index that exists but is not a readable regular file is left alone,
+  // and so is every bucket: nothing is removed.
+  let index_path = drv_join_path(cache_dir, "index.tsv")
+  match drv_cas_read_index(world, index_path) {
+    Some(_) => ()
+    None => {
+      c_fs_unlock(lk)
+      return drv_cmd_fail(world, as_json, "cannot read CAS index " + index_path)
+    }
+  }
   let s_obj = drv_clear_dir_files(world, drv_join_path(cache_dir, "obj"))
   let s_bin = drv_clear_dir_files(world, drv_join_path(cache_dir, "bin"))
   let s_tbin = drv_clear_dir_files(world, drv_join_path(cache_dir, "testbin"))
@@ -11932,16 +12360,23 @@ fn drv_cache_clear_impl(
     s_sig.bytes +
     s_ssa.bytes +
     s_usig.bytes
-  let index_path = drv_join_path(cache_dir, "index.tsv")
-  if fs_exists(world, index_path) {
+  let index_kind = drv_lstat_kind(index_path)
+  if index_kind != 0 && index_kind != 1 {
+    c_fs_unlock(lk)
+    return drv_cmd_fail(world, as_json, "cannot remove CAS index " + index_path)
+  }
+  if index_kind == 1 {
     let isz = fs_size(world, index_path)
-    if fs_remove(world, index_path) {
-      removed_files = removed_files + 1
-      if isz > 0L {
-        removed_bytes = removed_bytes + isz
-      }
+    if !fs_remove(world, index_path) {
+      c_fs_unlock(lk)
+      return drv_cmd_fail(world, as_json, "failed to remove CAS index " + index_path)
+    }
+    removed_files = removed_files + 1
+    if isz > 0L {
+      removed_bytes = removed_bytes + isz
     }
   }
+  c_fs_unlock(lk)
   if clear_all {
     let git_root = drv_git_cache_root(world)
     let sg = drv_dir_stats(world, git_root)
@@ -12098,13 +12533,16 @@ fn drv_run_cache_cmd(world : World, args : Array[String]) -> Int {
     return 0
   } else if sub == "prune" {
     let index_path = drv_join_path(cache_dir, "index.tsv")
-    let entries : Array[CasEntry] = if fs_exists(world, index_path) {
-      match fs_read(world, index_path) {
-        Ok(txt) => cas_parse_index(txt)
-        Err(_) => []
+    let lk = drv_cas_index_lock(world, cache_dir)
+    if lk < 0L {
+      return drv_cmd_fail(world, as_json, "cannot lock CAS index " + index_path + ".lock")
+    }
+    let entries = match drv_cas_read_index(world, index_path) {
+      Some(v) => v
+      None => {
+        c_fs_unlock(lk)
+        return drv_cmd_fail(world, as_json, "cannot read CAS index " + index_path)
       }
-    } else {
-      []
     }
     let mut before_bytes = 0L
     let mut ei = 0
@@ -12146,9 +12584,12 @@ fn drv_run_cache_cmd(world : World, args : Array[String]) -> Int {
       }
       evi = evi + 1
     }
-    if fs_exists(world, index_path) || kept.length() > 0 {
-      let _ = drv_write_text_atomic(world, index_path, cas_format_index(kept))
+    if (fs_exists(world, index_path) || kept.length() > 0) &&
+      !drv_write_text_atomic(world, index_path, cas_format_index(kept)) {
+      c_fs_unlock(lk)
+      return drv_cmd_fail(world, as_json, "failed to write CAS index " + index_path)
     }
+    c_fs_unlock(lk)
     if as_json {
       let sb = StringBuilder()
       sb.write_string("{\"ok\":true,\"action\":\"prune\",\"cache_dir\":")

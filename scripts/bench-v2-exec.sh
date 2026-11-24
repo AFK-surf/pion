@@ -64,7 +64,7 @@ if [ -n "${PIONC:-}" ] && [ -x "${PIONC:-}" ]; then
 fi
 
 CPU_BRAND=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || uname -m)
-CPU_CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo 1)
+CPU_CORES=$(sysctl -n hw.ncpu 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)
 OS_VER=$(uname -srm)
 CLANG_VER=$( [ "$HAS_C" -eq 1 ] && clang --version 2>&1 | head -n 1 || echo "N/A" )
 MOON_VER=$( [ "$HAS_MOON" -eq 1 ] && moon --version 2>&1 | head -n 1 || echo "N/A" )

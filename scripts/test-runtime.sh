@@ -33,6 +33,8 @@ echo "=== 2. Run unit + MT + 4-core speedup benchmark (-O2) ==="
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
     "$RT_DIR/test_rt.c" "$RT_DIR/pion_cli.c" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$OUT_DIR/test_rt_o2"
 "$OUT_DIR/test_rt_o2" --bench
+# spawn workers keep their explicit 8 MiB stacks under a 1 MiB RLIMIT_STACK.
+(ulimit -s 1024 && "$OUT_DIR/test_rt_o2" --spawn-stack)
 
 echo "=== 3. Run ThreadSanitizer (-fsanitize=thread) ==="
 "$CC" -std=c11 -O1 -g -fsanitize=thread -Wall -Wextra -Werror -I"$RT_DIR" \
