@@ -107,7 +107,7 @@ def tool_versions():
     out["pionc2_bytes"] = os.path.getsize(PIONC2) if os.path.exists(PIONC2) else None
     rc, so, _, _ = run(["git", "rev-parse", "--short", "HEAD"], ROOT)
     out["repo_commit"] = so.strip() or os.environ.get("AE_REPO_COMMIT", "unknown (run directory has no .git)")
-    out["host"] = platform.node()
+    out["host"] = os.environ.get("PION_BENCH_HOST", "unknown")
     out["machine"] = platform.machine()
     rc, so, _, _ = run(["sysctl", "-n", "machdep.cpu.brand_string"], ROOT)
     out["cpu"] = so.strip()
