@@ -420,6 +420,7 @@ struct Fn {
 	Blk **rpo;
 	bits reg;
 	int slot;
+	int firstspill; /* first compiler-private spill slot */
 	int salign;
 	char vararg;
 	char dynalloc;

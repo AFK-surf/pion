@@ -1079,6 +1079,19 @@ arm64_emitfn(Fn *fn, FILE *out)
 					}
 				}
 			}
+			ArmSlotPair pair;
+			if (i+1 < b->ins+b->nins && i+1 != cbz_ins && i+1 != flag_ins
+			&& arm64_slotpair(i, e->padding, fn->firstspill, &pair)) {
+				char lo[8], hi[8];
+				assert(pair.offset == slot(pair.slot, e));
+				strcpy(lo, rname(pair.lo, pair.cls));
+				strcpy(hi, rname(pair.hi, pair.cls));
+				fprintf(e->f, "\t%s\t%s, %s, [x29, #%u]\n",
+					pair.load ? "ldp" : "stp", lo, hi, pair.offset);
+				last_w32 = -1;
+				i++;
+				continue;
+			}
 			/* Pair adjacent 64-bit or 32-bit loads/stores into ldp/stp */
 			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins) {
 				Ins *i1 = i + 1;

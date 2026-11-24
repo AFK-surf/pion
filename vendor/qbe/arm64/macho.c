@@ -1853,6 +1853,18 @@ arm64_macho_fn1(Fn *fn, int far, uint64_t *gpr_out)
 					}
 				}
 			}
+			ArmSlotPair pair;
+			if (i+1 < b->ins+b->nins && i+1 != cbz_ins && i+1 != flag_ins
+			&& arm64_slotpair(i, e.padding, fn->firstspill, &pair)) {
+				uint32_t w = pair.cls == Kl ? 8 : 4;
+				assert(pair.offset == me_slot(pair.slot, &e));
+				uint32_t op = pair.cls == Kl ? 0xa9000000u : 0x29000000u;
+				emit_u32(op | ((uint32_t)pair.load << 22) | ((pair.offset/w) << 15)
+					| (greg(pair.hi) << 10) | (29u << 5) | greg(pair.lo));
+				last_w32 = -1;
+				i++;
+				continue;
+			}
 			/* Pair adjacent 64-bit or 32-bit loads/stores into ldp/stp */
 			if (i + 1 < &b->ins[b->nins] && i + 1 != cbz_ins && i + 1 != flag_ins) {
 				Ins *i1 = i + 1;
