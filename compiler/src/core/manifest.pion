@@ -8,6 +8,7 @@
 /// `registry` and the index entry's `version`, so `pionc update` can re-read it.
 pub struct ManifestDep {
   name : String
+  package : String
   path : String
   git : String
   tag : String
@@ -17,6 +18,17 @@ pub struct ManifestDep {
   registry : String
   version : String
   workspace : Bool
+}
+
+///|
+/// The target package's declared `[package].name`: explicit `package = "..."`
+/// when aliased, otherwise the dependency key `dep.name`.
+pub fn manifest_dep_pkg_name(dep : ManifestDep) -> String {
+  if dep.package.length() > 0 {
+    dep.package
+  } else {
+    dep.name
+  }
 }
 
 ///|
@@ -31,6 +43,7 @@ pub fn manifest_dep_new(
 ) -> ManifestDep {
   ManifestDep::{
     name: name,
+    package: "",
     path: path,
     git: git,
     tag: tag,
@@ -118,8 +131,11 @@ pub struct PackageManifest {
 ///|
 pub struct PkgNodeInput {
   name : String
+  declared_name : String
+  source_id : String
   dir : String
   deps : Array[String]
+  dep_aliases : Array[String]
   paths : Array[String]
   sources : Array[String]
   link_libs : Array[String]
@@ -143,8 +159,11 @@ pub fn pkg_node_input_new(
 ) -> PkgNodeInput {
   PkgNodeInput::{
     name: name,
+    declared_name: name,
+    source_id: "",
     dir: dir,
     deps: deps,
+    dep_aliases: deps,
     paths: paths,
     sources: sources,
     link_libs: [],
@@ -157,6 +176,89 @@ pub fn pkg_node_input_new(
     link_wasm: link_spec_empty(),
     verify_enabled: false,
   }
+}
+
+///|
+/// Normalizes a git URL for canonical source identity (trims trailing `/`).
+pub fn pkg_normalize_git_url(url : String) -> String {
+  let mut end = url.length()
+  while end > 1 && str_code_at(url, end - 1) == 47 {
+    end = end - 1
+  }
+  slice_str(url, 0, end)
+}
+
+///|
+/// Normalizes a git `subdir` for canonical source identity (`""` or `"."` -> `""`).
+pub fn pkg_normalize_subdir(subdir : String) -> String {
+  if subdir.length() == 0 {
+    return ""
+  }
+  let n = mf_normalize_path(subdir)
+  if n == "." {
+    ""
+  } else {
+    n
+  }
+}
+
+///|
+/// Canonical source identity for a git-backed package (including relative path
+/// dependencies inside the same git checkout): never embeds host paths or aliases.
+pub fn pkg_source_id_git(
+  git_url : String,
+  rev : String,
+  subdir : String,
+  declared_name : String,
+) -> String {
+  "git|" +
+  pkg_normalize_git_url(git_url) +
+  "|" +
+  rev +
+  "|" +
+  pkg_normalize_subdir(subdir) +
+  "|" +
+  declared_name
+}
+
+///|
+/// Canonical source identity for a local path package using its locator
+/// relative to the workspace/root anchor (never host absolute prefixes).
+pub fn pkg_source_id_path(
+  rel_locator : String,
+  declared_name : String,
+) -> String {
+  let norm_loc = mf_normalize_path(rel_locator)
+  "path|" + norm_loc + "|" + declared_name
+}
+
+///|
+/// Computes the deterministic canonical package ID (`canon_id`) for a package
+/// node purely from its own `(declared_name, source_id, is_root_anchor)`:
+/// - The standalone/hybrid root package (`is_root_anchor == true`) keeps
+///   `declared_name` directly.
+/// - Every other package (local path dep, workspace member, or git dep) gets
+///   `declared_name + "__" + sha256(source_id)[0..8]`, independent of aliases,
+///   traversal order, or whether another same-named package exists in the graph.
+pub fn pkg_canon_id(
+  declared_name : String,
+  source_id : String,
+  is_root_anchor : Bool,
+) -> String {
+  if is_root_anchor {
+    declared_name
+  } else {
+    let h = cas_sha256_hex(source_id)
+    let h8 = if h.length() >= 8 { slice_str(h, 0, 8) } else { h }
+    declared_name + "__" + h8
+  }
+}
+
+///|
+/// Computes a normalized relative locator from `anchor_dir` to `target_dir`
+/// (both normalized POSIX paths), never leaking host prefix segments.
+pub fn pkg_rebase_rel_path(anchor_dir : String, target_dir : String) -> String {
+  mf_rebase_rel_path(mf_normalize_path(anchor_dir), mf_normalize_path(target_dir))
 }
 
 ///|
@@ -325,6 +427,7 @@ fn toml_parse_dep(
       "`",
     )
   }
+  let mut pkg_alias = ""
   let mut path = ""
   let mut git = ""
   let mut tag = ""
@@ -360,7 +463,8 @@ fn toml_parse_dep(
               "`",
             )
           }
-        } else if k == "path" ||
+        } else if k == "package" ||
+          k == "path" ||
           k == "git" ||
           k == "tag" ||
           k == "rev" ||
@@ -372,7 +476,18 @@ fn toml_parse_dep(
             Ok(x) => x
             Err(e) => return Err("dependency `" + name + "` key `" + k + "`: " + e)
           }
-          if k == "path" {
+          if k == "package" {
+            if !manifest_valid_dep_name(uv) {
+              return Err(
+                "dependency `" +
+                name +
+                "` key `package`: invalid package name `" +
+                uv +
+                "`",
+              )
+            }
+            pkg_alias = uv
+          } else if k == "path" {
             path = uv
           } else if k == "git" {
             git = uv
@@ -421,6 +536,7 @@ fn toml_parse_dep(
     }
     return Ok(ManifestDep::{
       name: name,
+      package: pkg_alias,
       path: "",
       git: "",
       tag: "",
@@ -471,6 +587,7 @@ fn toml_parse_dep(
   }
   Ok(ManifestDep::{
     name: name,
+    package: pkg_alias,
     path: path,
     git: git,
     tag: tag,
@@ -1051,6 +1168,18 @@ pub struct LockEntry {
   reference : String
   rev : String
   subdir : String
+  package : String
+}
+
+///|
+/// The real declared package name of a lock entry: `package` when explicitly
+/// recorded, otherwise `name` (100% backward compatible with v1 `pion.lock`).
+pub fn lock_entry_pkg_name(e : LockEntry) -> String {
+  if e.package.length() > 0 {
+    e.package
+  } else {
+    e.name
+  }
 }
 
 ///|
@@ -1067,12 +1196,42 @@ pub fn lock_entry_new(
     reference: reference,
     rev: rev,
     subdir: subdir,
+    package: "",
+  }
+}
+
+///|
+pub fn lock_entry_new_pkg(
+  name : String,
+  package : String,
+  git : String,
+  reference : String,
+  rev : String,
+  subdir : String,
+) -> LockEntry {
+  LockEntry::{
+    name: name,
+    git: git,
+    reference: reference,
+    rev: rev,
+    subdir: subdir,
+    package: package,
   }
 }
 
 ///|
 fn lock_entry_sort_key(e : LockEntry) -> String {
-  e.name + "\n" + e.git + "\n" + e.subdir + "\n" + e.reference + "\n" + e.rev
+  e.name +
+  "\n" +
+  e.package +
+  "\n" +
+  e.git +
+  "\n" +
+  e.subdir +
+  "\n" +
+  e.reference +
+  "\n" +
+  e.rev
 }
 
 ///|
@@ -1098,6 +1257,7 @@ pub fn parse_pion_lock(text : String) -> Result[Array[LockEntry], String] {
   let out : Array[LockEntry] = []
   let mut in_pkg = false
   let mut name = ""
+  let mut pkg_orig = ""
   let mut git = ""
   let mut reference = ""
   let mut rev = ""
@@ -1124,11 +1284,12 @@ pub fn parse_pion_lock(text : String) -> Result[Array[LockEntry], String] {
             ": `rev` must be a full lowercase hex commit id (40 or 64 digits)",
           )
         }
-        out.push(lock_entry_new(name, git, reference, rev, subdir))
+        out.push(lock_entry_new_pkg(name, pkg_orig, git, reference, rev, subdir))
       }
       if is_header {
         in_pkg = true
         name = ""
+        pkg_orig = ""
         git = ""
         reference = ""
         rev = ""
@@ -1160,6 +1321,8 @@ pub fn parse_pion_lock(text : String) -> Result[Array[LockEntry], String] {
       }
       if key == "name" {
         name = v
+      } else if key == "package" {
+        pkg_orig = v
       } else if key == "git" {
         git = v
       } else if key == "ref" {
@@ -1176,8 +1339,9 @@ pub fn parse_pion_lock(text : String) -> Result[Array[LockEntry], String] {
 }
 
 ///|
-/// Deterministic `pion.lock` text: entries sorted by name/git/subdir, one
-/// `[[package]]` table each, with every key always written.
+/// Deterministic `pion.lock` text: entries sorted by name/package/git/subdir/ref,
+/// one `[[package]]` table each, with every core key always written (`package`
+/// written only when distinct from `name`).
 pub fn format_pion_lock(entries : Array[LockEntry]) -> String {
   let sorted : Array[LockEntry] = []
   let mut i = 0
@@ -1205,6 +1369,10 @@ pub fn format_pion_lock(entries : Array[LockEntry]) -> String {
     let e = sorted[i]
     sb.write_string("\n[[package]]\nname = ")
     sb.write_string(json_quote(e.name))
+    if e.package.length() > 0 && e.package != e.name {
+      sb.write_string("\npackage = ")
+      sb.write_string(json_quote(e.package))
+    }
     sb.write_string("\ngit = ")
     sb.write_string(json_quote(e.git))
     sb.write_string("\nref = ")
@@ -1220,36 +1388,80 @@ pub fn format_pion_lock(entries : Array[LockEntry]) -> String {
 }
 
 ///|
-/// The locked entry for `dep`, if `pion.lock` pins the same name, URL, subdir
-/// and requested ref.
-pub fn lock_find(entries : Array[LockEntry], dep : ManifestDep) -> Option[LockEntry] {
+/// Checked lock lookup for `dep`: matches by real package name (compatible with
+/// legacy v1 lockfiles lacking `package`), normalized git URL, normalized subdir
+/// and requested ref. Fails if multiple entries match with conflicting `rev`s.
+pub fn lock_find_checked(
+  entries : Array[LockEntry],
+  dep : ManifestDep,
+) -> Result[Option[LockEntry], String] {
+  let want_pkg = manifest_dep_pkg_name(dep)
+  let want_git = pkg_normalize_git_url(dep.git)
+  let want_sub = pkg_normalize_subdir(dep.subdir)
   let want_ref = manifest_dep_ref(dep)
+  let mut found : Option[LockEntry] = None
   let mut i = 0
   while i < entries.length() {
     let e = entries[i]
-    if e.name == dep.name &&
-      e.git == dep.git &&
-      e.subdir == dep.subdir &&
+    let e_pkg = lock_entry_pkg_name(e)
+    if e_pkg == want_pkg &&
+      pkg_normalize_git_url(e.git) == want_git &&
+      pkg_normalize_subdir(e.subdir) == want_sub &&
       e.reference == want_ref {
-      return Some(e)
+      match found {
+        None => found = Some(e)
+        Some(prev) =>
+          if prev.rev != e.rev {
+            return Err(
+              "ambiguous pion.lock entries for dependency `" +
+              dep.name +
+              "` (package `" +
+              want_pkg +
+              "`, " +
+              want_ref +
+              "): both `" +
+              prev.rev +
+              "` and `" +
+              e.rev +
+              "`",
+            )
+          }
+      }
     }
     i = i + 1
   }
-  None
+  Ok(found)
 }
 
 ///|
-/// Adds `e` to `entries` (keyed by name/git/subdir). Fails when the same
-/// dependency was already resolved to a different revision.
+/// The locked entry for `dep`, if `pion.lock` pins the same package, URL, subdir
+/// and requested ref.
+pub fn lock_find(entries : Array[LockEntry], dep : ManifestDep) -> Option[LockEntry] {
+  match lock_find_checked(entries, dep) {
+    Ok(v) => v
+    Err(_) => None
+  }
+}
+
+///|
+/// Adds `e` to `entries` (keyed by real package name / git / subdir / ref).
+/// Fails when the same dependency source+ref was already resolved to a different
+/// revision. Distinct refs (e.g. `tag:v1` and `tag:v2`) coexist cleanly.
 pub fn lock_add(entries : Array[LockEntry], e : LockEntry) -> Result[Unit, String] {
+  let e_pkg = lock_entry_pkg_name(e)
+  let e_git = pkg_normalize_git_url(e.git)
+  let e_sub = pkg_normalize_subdir(e.subdir)
   let mut i = 0
   while i < entries.length() {
     let o = entries[i]
-    if o.name == e.name && o.git == e.git && o.subdir == e.subdir {
-      if o.rev != e.rev || o.reference != e.reference {
+    if lock_entry_pkg_name(o) == e_pkg &&
+      pkg_normalize_git_url(o.git) == e_git &&
+      pkg_normalize_subdir(o.subdir) == e_sub &&
+      o.reference == e.reference {
+      if o.rev != e.rev {
         return Err(
           "git dependency `" +
-          e.name +
+          e_pkg +
           "` is required as both " +
           o.reference +
           " (" +
@@ -1630,6 +1842,7 @@ pub fn parse_registry_entry(
 pub fn registry_entry_dep(e : RegistryEntry, registry : String) -> ManifestDep {
   ManifestDep::{
     name: e.name,
+    package: "",
     path: "",
     git: e.git,
     tag: e.tag,
@@ -1644,17 +1857,25 @@ pub fn registry_entry_dep(e : RegistryEntry, registry : String) -> ManifestDep {
 
 ///|
 /// Inline-table form of a dependency, with keys in a fixed order:
-/// `{ workspace = true }`, `{ path = "..." }` or `{ git = "...", tag = "...",
-/// subdir = "...", version = "...", registry = "..." }` (empty keys left out).
+/// `{ [package = "...", ]workspace = true }`, `{ [package = "...", ]path = "..." }`
+/// or `{ [package = "...", ]git = "...", tag = "...", subdir = "...", version = "...",
+/// registry = "..." }` (empty keys left out).
 pub fn format_dep_inline(dep : ManifestDep) -> String {
+  let pkg_prefix = if dep.package.length() > 0 {
+    "package = " + json_quote(dep.package) + ", "
+  } else {
+    ""
+  }
   if dep.workspace {
-    return "{ workspace = true }"
+    return "{ " + pkg_prefix + "workspace = true }"
   }
   if dep.git.length() == 0 {
-    return "{ path = " + json_quote(dep.path) + " }"
+    return "{ " + pkg_prefix + "path = " + json_quote(dep.path) + " }"
   }
   let sb = StringBuilder()
-  sb.write_string("{ git = ")
+  sb.write_string("{ ")
+  sb.write_string(pkg_prefix)
+  sb.write_string("git = ")
   sb.write_string(json_quote(dep.git))
   if dep.tag.length() > 0 {
     sb.write_string(", tag = ")
@@ -1702,12 +1923,15 @@ fn toml_split_keep(text : String) -> Array[String] {
 }
 
 ///|
-/// Sets `dep` in the `[dependencies]` table of a `pion.toml` text: replaces
-/// the line of an existing entry with the same name in place, else appends it
-/// after the table's last entry (creating the table at the end when missing).
-/// Every other line is kept byte for byte, and setting the same dependency
-/// again returns the text unchanged.
-pub fn manifest_set_dependency(text : String, dep : ManifestDep) -> String {
+/// Sets `dep` in the named table (`dependencies` or `workspace.dependencies`) of
+/// a `pion.toml` text: replaces the line of an existing entry with the same name
+/// in place, else appends it after the table's last entry (creating the table at
+/// the end when missing). Every other line is kept byte for byte.
+fn manifest_set_dependency_in_section(
+  text : String,
+  target_section : String,
+  dep : ManifestDep,
+) -> String {
   let line = dep.name + " = " + format_dep_inline(dep)
   let lines = toml_split_keep(text)
   let mut section = ""
@@ -1720,10 +1944,10 @@ pub fn manifest_set_dependency(text : String, dep : ManifestDep) -> String {
       if str_code_at(clean, 0) == 91 &&
         str_code_at(clean, clean.length() - 1) == 93 {
         section = toml_trim(slice_str(clean, 1, clean.length() - 1))
-        if section == "dependencies" && dep_header < 0 {
+        if section == target_section && dep_header < 0 {
           dep_header = i
         }
-      } else if section == "dependencies" {
+      } else if section == target_section {
         let eq = toml_find_char(clean, 61, 0)
         if eq > 0 && toml_trim(slice_str(clean, 0, eq)) == dep.name {
           lines[i] = line
@@ -1758,10 +1982,28 @@ pub fn manifest_set_dependency(text : String, dep : ManifestDep) -> String {
   if text.length() > 0 {
     sb.write_string("\n")
   }
-  sb.write_string("[dependencies]\n")
+  sb.write_string("[")
+  sb.write_string(target_section)
+  sb.write_string("]\n")
   sb.write_string(line)
   sb.write_string("\n")
   sb.to_string()
+}
+
+///|
+/// Sets `dep` in the `[dependencies]` table of a `pion.toml` text: replaces
+/// the line of an existing entry with the same name in place, else appends it
+/// after the table's last entry (creating the table at the end when missing).
+/// Every other line is kept byte for byte, and setting the same dependency
+/// again returns the text unchanged.
+pub fn manifest_set_dependency(text : String, dep : ManifestDep) -> String {
+  manifest_set_dependency_in_section(text, "dependencies", dep)
+}
+
+///|
+/// Sets `dep` in the `[workspace.dependencies]` table of a workspace `pion.toml`.
+pub fn manifest_set_workspace_dependency(text : String, dep : ManifestDep) -> String {
+  manifest_set_dependency_in_section(text, "workspace.dependencies", dep)
 }
 
 ///|
@@ -1776,6 +2018,89 @@ fn join_lines_nl(lines : Array[String]) -> String {
     i = i + 1
   }
   sb.to_string()
+}
+
+///|
+/// Semantic lock entry key: `(real_pkg_name, norm_git, norm_subdir, ref, rev)`.
+fn lock_entry_sem_key(e : LockEntry) -> String {
+  lock_entry_pkg_name(e) +
+  "\n" +
+  pkg_normalize_git_url(e.git) +
+  "\n" +
+  pkg_normalize_subdir(e.subdir) +
+  "\n" +
+  e.reference +
+  "\n" +
+  e.rev
+}
+
+///|
+/// Semantic equivalence between two `pion.lock` entry sets, normalizing URL
+/// trailing slashes and `subdir` forms (e.g. `./packages/json/` == `packages/json`).
+pub fn lock_entries_equiv(a : Array[LockEntry], b : Array[LockEntry]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let ka : Array[String] = []
+  let kb : Array[String] = []
+  let mut i = 0
+  while i < a.length() {
+    ka.push(lock_entry_sem_key(a[i]))
+    kb.push(lock_entry_sem_key(b[i]))
+    i = i + 1
+  }
+  // Insertion sort both key arrays lexicographically.
+  i = 1
+  while i < ka.length() {
+    let cur = ka[i]
+    let mut j = i - 1
+    while j >= 0 && lock_str_less(cur, ka[j]) {
+      ka[j + 1] = ka[j]
+      j = j - 1
+    }
+    ka[j + 1] = cur
+    i = i + 1
+  }
+  i = 1
+  while i < kb.length() {
+    let cur = kb[i]
+    let mut j = i - 1
+    while j >= 0 && lock_str_less(cur, kb[j]) {
+      kb[j + 1] = kb[j]
+      j = j - 1
+    }
+    kb[j + 1] = cur
+    i = i + 1
+  }
+  i = 0
+  while i < ka.length() {
+    if ka[i] != kb[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// Returns the locked `rev` matching `target`'s exact `(real_pkg, norm_git, norm_subdir, ref)`,
+/// or `""` when not present.
+pub fn lock_rev_for_entry(entries : Array[LockEntry], target : LockEntry) -> String {
+  let t_pkg = lock_entry_pkg_name(target)
+  let t_git = pkg_normalize_git_url(target.git)
+  let t_sub = pkg_normalize_subdir(target.subdir)
+  let mut i = 0
+  while i < entries.length() {
+    let o = entries[i]
+    if lock_entry_pkg_name(o) == t_pkg &&
+      pkg_normalize_git_url(o.git) == t_git &&
+      pkg_normalize_subdir(o.subdir) == t_sub &&
+      o.reference == target.reference {
+      return o.rev
+    }
+    i = i + 1
+  }
+  ""
 }
 
 ///|
@@ -1950,13 +2275,54 @@ pub fn manifest_resolve_ws_dep(
   if !dep.workspace {
     return Ok(dep)
   }
+  // 1. Direct match by dependency key (`wdep.name == dep.name`), inheriting
+  //    `wdep.package` (and checking consistency if `dep.package` is also set).
+  // 2. Fallback when member writes `alias = { package = "orig", workspace = true }`:
+  //    look up `wdep.name == dep.package` in `[workspace.dependencies]`.
+  let mut matched : Option[ManifestDep] = None
   let mut i = 0
   while i < ws_deps.length() {
-    let wdep = ws_deps[i]
-    if wdep.name == dep.name {
+    if ws_deps[i].name == dep.name {
+      matched = Some(ws_deps[i])
+      break
+    }
+    i = i + 1
+  }
+  if matched is None && dep.package.length() > 0 {
+    i = 0
+    while i < ws_deps.length() {
+      if ws_deps[i].name == dep.package {
+        matched = Some(ws_deps[i])
+        break
+      }
+      i = i + 1
+    }
+  }
+  match matched {
+    Some(wdep) => {
+      let eff_pkg = if dep.package.length() > 0 {
+        let wp = manifest_dep_pkg_name(wdep)
+        if wp != dep.package {
+          return Err(
+            "dependency `" +
+            dep.name +
+            "` requests `package = \"" +
+            dep.package +
+            "\"`, but [workspace.dependencies] entry `" +
+            wdep.name +
+            "` targets package `" +
+            wp +
+            "`",
+          )
+        }
+        dep.package
+      } else {
+        wdep.package
+      }
       if manifest_dep_is_git(wdep) {
         return Ok(ManifestDep::{
           name: dep.name,
+          package: eff_pkg,
           path: "",
           git: wdep.git,
           tag: wdep.tag,
@@ -1982,6 +2348,7 @@ pub fn manifest_resolve_ws_dep(
       }
       return Ok(ManifestDep::{
         name: dep.name,
+        package: eff_pkg,
         path: resolved_path,
         git: "",
         tag: "",
@@ -1993,13 +2360,13 @@ pub fn manifest_resolve_ws_dep(
         workspace: false,
       })
     }
-    i = i + 1
+    None =>
+      Err(
+        "dependency '" +
+        dep.name +
+        "' marked workspace = true but not found in [workspace.dependencies]",
+      )
   }
-  Err(
-    "dependency '" +
-    dep.name +
-    "' marked workspace = true but not found in [workspace.dependencies]",
-  )
 }
 
 ///|

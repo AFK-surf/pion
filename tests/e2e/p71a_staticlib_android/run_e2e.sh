@@ -233,11 +233,11 @@ if [ "$UNAME_S" = "Linux" ]; then
   if command -v readelf >/dev/null 2>&1; then
     OBJ_SYMS="$(readelf -Ws "$TMP_DIR/t4_shared/pion_rt.o" "$TMP_DIR/t4_shared/libapp.a")"
     echo "$OBJ_SYMS" | grep -E "HIDDEN[[:space:]]+[0-9]+[[:space:]]+pion_mt_flag$" >/dev/null
-    echo "$OBJ_SYMS" | grep -E "HIDDEN[[:space:]]+[0-9]+[[:space:]]+pion_pkg_dep_const_base_items$" >/dev/null
+    echo "$OBJ_SYMS" | grep -E "HIDDEN[[:space:]]+[0-9]+[[:space:]]+pion_pkg_dep(__[0-9a-f]{8})?_const_base_items$" >/dev/null
     echo "$OBJ_SYMS" | grep -E "DEFAULT[[:space:]]+[0-9]+[[:space:]]+push_and_count$" >/dev/null
     DYN_SYMS="$(readelf --dyn-syms -W "$TMP_DIR/t4_shared/libp71a.so")"
     echo "$DYN_SYMS" | grep -E "DEFAULT[[:space:]]+[0-9]+[[:space:]]+push_and_count$" >/dev/null
-    if echo "$DYN_SYMS" | grep -E "pion_mt_flag$|pion_pkg_dep_const_base_items$" >/dev/null; then
+    if echo "$DYN_SYMS" | grep -E "pion_mt_flag$|pion_pkg_dep(__[0-9a-f]{8})?_const_base_items$" >/dev/null; then
       echo "FAIL: internal hidden symbols leaked into .dynsym" >&2
       exit 1
     fi

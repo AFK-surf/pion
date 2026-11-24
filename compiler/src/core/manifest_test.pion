@@ -817,3 +817,185 @@ test "p32b: manifest_resolve_ws_dep and manifest_match_member_pattern" {
   mf_check(manifest_match_member_pattern(".", "."), "dot matches dot")
   mf_check(!manifest_match_member_pattern(".", "cmd"), "dot rejects non-dot")
 }
+
+///|
+test "wave_j4b: package alias parsing, workspace inheritance, canon_id & lockfile compat" {
+  let toml =
+    "[package]\nname = \"app\"\nversion = \"0.1.0\"\n\n" +
+    "[dependencies]\n" +
+    "j1 = { package = \"json\", path = \"../vendor/json\" }\n" +
+    "j2 = { package = \"json\", git = \"https://example.com/pkgs.git\", tag = \"v1\", subdir = \"packages/json\" }\n" +
+    "ws_j = { package = \"json\", workspace = true }\n"
+  match parse_pion_toml(toml) {
+    Ok(m) => {
+      mf_check(m.deps.length() == 3, "3 deps")
+      mf_check(m.deps[0].name == "j1" && m.deps[0].package == "json" && manifest_dep_pkg_name(m.deps[0]) == "json", "path alias")
+      mf_check(m.deps[1].name == "j2" && m.deps[1].package == "json" && m.deps[1].subdir == "packages/json", "git alias")
+      mf_check(m.deps[2].name == "ws_j" && m.deps[2].package == "json" && m.deps[2].workspace, "ws alias")
+      mf_check(
+        format_dep_inline(m.deps[0]) == "{ package = \"json\", path = \"../vendor/json\" }",
+        "format path alias: " + format_dep_inline(m.deps[0]),
+      )
+    }
+    Err(e) => abort("parse alias toml failed: " + e)
+  }
+
+  // Workspace alias inheritance: both `[workspace.dependencies] ws_j = { package = "json", ... }`
+  // and member `ws_j = { package = "json", workspace = true }` targeting `json` in workspace.
+  let ws_toml =
+    "[workspace]\nmembers = [\"app\"]\n\n" +
+    "[workspace.dependencies]\n" +
+    "json = { path = \"vendor/json\" }\n" +
+    "aliased_ws = { package = \"json\", git = \"https://example.com/pkgs.git\", tag = \"v2\" }\n"
+  let ws_mf = match parse_pion_toml(ws_toml) {
+    Ok(m) => m
+    Err(e) => abort("parse ws alias toml failed: " + e)
+  }
+  let m_dep1 = ManifestDep::{
+    name: "ws_j",
+    package: "json",
+    path: "",
+    git: "",
+    tag: "",
+    rev: "",
+    branch: "",
+    subdir: "",
+    registry: "",
+    version: "",
+    workspace: true,
+  }
+  match manifest_resolve_ws_dep(m_dep1, "/ws", "/ws/app", ws_mf.workspace_deps) {
+    Ok(r) =>
+      mf_check(
+        r.name == "ws_j" && r.package == "json" && r.path == "/ws/vendor/json",
+        "member alias -> ws dep",
+      )
+    Err(e) => abort("ws resolve m_dep1 failed: " + e)
+  }
+  let m_dep2 = ManifestDep::{
+    name: "aliased_ws",
+    package: "",
+    path: "",
+    git: "",
+    tag: "",
+    rev: "",
+    branch: "",
+    subdir: "",
+    registry: "",
+    version: "",
+    workspace: true,
+  }
+  match manifest_resolve_ws_dep(m_dep2, "/ws", "/ws/app", ws_mf.workspace_deps) {
+    Ok(r) =>
+      mf_check(
+        r.name == "aliased_ws" && r.package == "json" && r.tag == "v2",
+        "inherit ws package alias",
+      )
+    Err(e) => abort("ws resolve m_dep2 failed: " + e)
+  }
+
+  // source_id & canon_id determinism (alias-free, host-path-free).
+  let rev1 = "0123456789abcdef0123456789abcdef01234567"
+  let rev2 = "fedcba9876543210fedcba9876543210fedcba98"
+  let sg1 = pkg_source_id_git("https://example.com/r.git/", rev1, "./packages/json/", "json")
+  let sg1b = pkg_source_id_git("https://example.com/r.git", rev1, "packages/json", "json")
+  let sg2 = pkg_source_id_git("https://example.com/r.git", rev2, "packages/json", "json")
+  mf_check(sg1 == sg1b, "normalized git source_id matches")
+  mf_check(sg1 != sg2, "different revs get different source_ids")
+  mf_check(pkg_canon_id("json", sg1, false) == pkg_canon_id("json", sg1b, false), "same git source -> same canon_id")
+  mf_check(pkg_canon_id("json", sg1, false) != pkg_canon_id("json", sg2, false), "different git rev -> different canon_id")
+  mf_check(pkg_canon_id("app", pkg_source_id_path(".", "app"), true) == "app", "root anchor keeps declared name")
+  let rel_wt1 = pkg_rebase_rel_path("/tmp/wt1/proj", "/tmp/wt1/vendor/json")
+  let rel_wt2 = pkg_rebase_rel_path("/tmp/wt2/proj", "/tmp/wt2/vendor/json")
+  mf_check(rel_wt1 == "../vendor/json" && rel_wt1 == rel_wt2, "worktree-independent rel locator")
+
+  // Legacy v1 pion.lock compatibility + multi-ref coexistence + ambiguity rejection.
+  let v1_lock =
+    "version = 1\n\n[[package]]\nname = \"json\"\ngit = \"file:///r.git\"\nref = \"tag:v1\"\nrev = \"" +
+    rev1 +
+    "\"\nsubdir = \"packages/json\"\n"
+  let parsed = match parse_pion_lock(v1_lock) {
+    Ok(es) => es
+    Err(e) => abort("parse v1 lock failed: " + e)
+  }
+  let alias_dep = ManifestDep::{
+    name: "my_json",
+    package: "json",
+    path: "",
+    git: "file:///r.git",
+    tag: "v1",
+    rev: "",
+    branch: "",
+    subdir: "packages/json",
+    registry: "",
+    version: "",
+    workspace: false,
+  }
+  match lock_find_checked(parsed, alias_dep) {
+    Ok(Some(e)) => mf_check(e.rev == rev1, "legacy v1 lock matches aliased dep")
+    _ => abort("expected legacy v1 lock hit")
+  }
+  // Ambiguous lock entries for same (pkg, git, subdir, ref) with different revs -> error.
+  let ambig = [
+    lock_entry_new("json", "file:///r.git", "tag:v1", rev1, "packages/json"),
+    lock_entry_new_pkg("my_json", "json", "file:///r.git", "tag:v1", rev2, "packages/json"),
+  ]
+  match lock_find_checked(ambig, alias_dep) {
+    Err(e) => mf_check(mf_has(e, "ambiguous"), "ambiguous lock error: " + e)
+    Ok(_) => abort("ambiguous lock entries must fail")
+  }
+  // Distinct refs (tag:v1 and tag:v2) coexist cleanly in lock_add.
+  let multi_entries : Array[LockEntry] = []
+  match lock_add(multi_entries, lock_entry_new("json", "file:///r.git", "tag:v1", rev1, "")) {
+    Ok(_) => ()
+    Err(e) => abort(e)
+  }
+  match lock_add(multi_entries, lock_entry_new("json", "file:///r.git", "tag:v2", rev2, "")) {
+    Ok(_) => mf_check(multi_entries.length() == 2, "distinct refs coexist")
+    Err(e) => abort("distinct refs must coexist: " + e)
+  }
+
+  // Semantic lockfile equivalence (normalizes trailing slash & ./subdir/) and exact rev lookup.
+  let legacy_norm = [
+    lock_entry_new("json", "file:///r.git/", "tag:v1", rev1, "./packages/json/"),
+    lock_entry_new("json", "file:///r.git", "tag:v2", rev2, "packages/json"),
+  ]
+  let canon_norm = [
+    lock_entry_new("json", "file:///r.git", "tag:v1", rev1, "packages/json"),
+    lock_entry_new("json", "file:///r.git", "tag:v2", rev2, "packages/json"),
+  ]
+  mf_check(lock_entries_equiv(legacy_norm, canon_norm), "normalized lock entries are semantically equivalent")
+  mf_check(
+    lock_rev_for_entry(legacy_norm, canon_norm[0]) == rev1 &&
+    lock_rev_for_entry(legacy_norm, canon_norm[1]) == rev2,
+    "exact rev lookup distinguishes refs of same package",
+  )
+  let diff_rev = [
+    lock_entry_new("json", "file:///r.git", "tag:v1", rev2, "packages/json"),
+    lock_entry_new("json", "file:///r.git", "tag:v2", rev2, "packages/json"),
+  ]
+  mf_check(!lock_entries_equiv(legacy_norm, diff_rev), "different rev breaks lock equivalence")
+
+  // manifest_set_workspace_dependency updates [workspace.dependencies] in place preserving alias.
+  let ws_reg_toml =
+    "[workspace]\nmembers = [\"app\"]\n\n[workspace.dependencies]\nmy_reg = { package = \"json\", git = \"file:///r.git\", tag = \"v1\", version = \"0.1.0\", registry = \"file:///idx\" }\n"
+  let ws_reg_v2 = ManifestDep::{
+    name: "my_reg",
+    package: "json",
+    path: "",
+    git: "file:///r.git",
+    tag: "v2",
+    rev: "",
+    branch: "",
+    subdir: "",
+    registry: "file:///idx",
+    version: "0.2.0",
+    workspace: false,
+  }
+  let ws_reg_updated = manifest_set_workspace_dependency(ws_reg_toml, ws_reg_v2)
+  mf_check(
+    mf_has(ws_reg_updated, "[workspace.dependencies]") &&
+    mf_has(ws_reg_updated, "my_reg = { package = \"json\", git = \"file:///r.git\", tag = \"v2\", version = \"0.2.0\", registry = \"file:///idx\" }"),
+    "manifest_set_workspace_dependency preserves alias: " + ws_reg_updated,
+  )
+}

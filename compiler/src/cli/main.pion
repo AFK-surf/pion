@@ -2194,15 +2194,17 @@ fn drv_load_pkg_dir_sources(
 /// read-only source trees every worktree builds from.
 fn drv_git_cache_root(world : World) -> String {
   let custom = drv_env_str(world, "PION_CACHE_DIR")
-  if custom.length() > 0 {
-    return drv_normalize_path(custom + "/git")
-  }
-  let home = drv_env_str(world, "HOME")
-  if home.length() > 0 {
-    drv_normalize_path(drv_join_path(home, ".cache/pion/git"))
+  let raw = if custom.length() > 0 {
+    drv_normalize_path(custom + "/git")
   } else {
-    drv_join_path(drv_temp_dir(world), "pion-git")
+    let home = drv_env_str(world, "HOME")
+    if home.length() > 0 {
+      drv_normalize_path(drv_join_path(home, ".cache/pion/git"))
+    } else {
+      drv_join_path(drv_temp_dir(world), "pion-git")
+    }
   }
+  drv_canon_dir(world, raw)
 }
 
 ///|
@@ -2328,7 +2330,58 @@ struct DrvGitCtx {
   new_lock : Array[LockEntry]
   fetched : Map[String, Bool]
   ws_root : Option[DrvEnclosingWs]
+  anchor_root : String
   root_pins : Map[String, String]
+  root_pin_origins : Map[String, DrvGitOrigin]
+  root_pin_ambiguous : Map[String, Bool]
+  locked : Bool
+  offline : Bool
+}
+
+///|
+struct DrvGitOrigin {
+  git_url : String
+  rev : String
+  checkout_root : String
+}
+
+///|
+struct DrvGitResolved {
+  dir : String
+  origin : DrvGitOrigin
+}
+
+///|
+fn drv_record_root_pin(
+  ctx : DrvGitCtx,
+  pkg_name : String,
+  dir : String,
+  origin : Option[DrvGitOrigin],
+) -> Unit {
+  if pkg_name.length() == 0 || ctx.root_pin_ambiguous.contains(pkg_name) {
+    return
+  }
+  match ctx.root_pins.get(pkg_name) {
+    Some(prev) =>
+      if prev != dir {
+        ctx.root_pin_ambiguous.set(pkg_name, true)
+      } else {
+        match origin {
+          Some(o) =>
+            if !ctx.root_pin_origins.contains(pkg_name) {
+              ctx.root_pin_origins.set(pkg_name, o)
+            }
+          None => ()
+        }
+      }
+    None => {
+      ctx.root_pins.set(pkg_name, dir)
+      match origin {
+        Some(o) => ctx.root_pin_origins.set(pkg_name, o)
+        None => ()
+      }
+    }
+  }
 }
 
 ///|
@@ -2356,13 +2409,58 @@ fn drv_abs_path(world : World, path : String) -> String {
 }
 
 ///|
-/// Walks upward from `start_dir` (up to 16 parent levels) to find the nearest
-/// enclosing directory whose `pion.toml` declares `[workspace]`.
-fn drv_find_enclosing_workspace(
+fn drv_ws_declares_member(
   world : World,
-  start_dir : String,
+  ws_root : String,
+  ws_mf : PackageManifest,
+  target_canon : String,
+) -> Bool {
+  let norm_root = drv_normalize_path(ws_root)
+  if drv_canon_dir(world, norm_root) == target_canon {
+    return true
+  }
+  let mut i = 0
+  while i < ws_mf.workspace_members.length() {
+    let norm_pat = drv_normalize_path(ws_mf.workspace_members[i])
+    if drv_str_has_star(norm_pat) {
+      let seen : Map[String, Bool] = Map([])
+      let matched : Array[String] = []
+      let pat_segs = drv_split_rel_segs(norm_pat)
+      drv_glob_member_dirs(
+        world,
+        norm_root,
+        "",
+        0,
+        pat_segs,
+        norm_pat,
+        seen,
+        matched,
+      )
+      let mut mi = 0
+      while mi < matched.length() {
+        if drv_canon_dir(world, matched[mi]) == target_canon {
+          return true
+        }
+        mi = mi + 1
+      }
+    } else {
+      let cand = drv_resolve_rel_path(norm_root, norm_pat)
+      if drv_canon_dir(world, cand) == target_canon {
+        return true
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn drv_walk_enclosing_workspace(
+  world : World,
+  start_cur : String,
+  target_canon : String,
 ) -> Option[DrvEnclosingWs] {
-  let mut cur = drv_abs_path(world, start_dir)
+  let mut cur = start_cur
   let mut depth = 0
   while depth < 16 {
     let mf_path = drv_join_path(cur, "pion.toml")
@@ -2371,7 +2469,8 @@ fn drv_find_enclosing_workspace(
         Ok(txt) =>
           match parse_pion_toml(txt) {
             Ok(mf) =>
-              if mf.is_workspace {
+              if mf.is_workspace &&
+                drv_ws_declares_member(world, cur, mf, target_canon) {
                 return Some(DrvEnclosingWs::{ root_dir: cur, manifest: mf })
               }
             Err(_) => ()
@@ -2390,6 +2489,30 @@ fn drv_find_enclosing_workspace(
     depth = depth + 1
   }
   None
+}
+
+///|
+/// Walks upward from `start_dir` (up to 16 parent levels) to find the nearest
+/// enclosing directory whose `pion.toml` declares `[workspace]` and explicitly
+/// includes `start_dir` (matched by canonical physical directory). Checks
+/// literal ancestors first (preserving caller path spelling and supporting
+/// outward member symlinks like `ws/ma -> /external/ma`), then falls back to
+/// physical ancestors (supporting inward symlinks like `view/ma -> ws/ma`).
+fn drv_find_enclosing_workspace(
+  world : World,
+  start_dir : String,
+) -> Option[DrvEnclosingWs] {
+  let target_canon = drv_canon_dir(world, start_dir)
+  let literal_abs = drv_abs_path(world, start_dir)
+  match drv_walk_enclosing_workspace(world, literal_abs, target_canon) {
+    Some(ws) => Some(ws)
+    None =>
+      if target_canon != literal_abs {
+        drv_walk_enclosing_workspace(world, target_canon, target_canon)
+      } else {
+        None
+      }
+  }
 }
 
 ///|
@@ -2727,6 +2850,9 @@ fn drv_git_fetch_once(
   if ctx.fetched.contains(repo) {
     return Ok(())
   }
+  if ctx.offline {
+    return Err("cannot fetch git dependency `" + url + "` in --offline mode")
+  }
   ctx.fetched.set(repo, true)
   if drv_starts_with(url, "-") {
     return Err("refusing git URL `" + url + "`: it must not start with `-`")
@@ -2810,22 +2936,39 @@ fn drv_git_dep_dir(
   world : World,
   ctx : DrvGitCtx,
   dep : ManifestDep,
-) -> Result[String, String] {
+) -> Result[DrvGitResolved, String] {
   let url = dep.git
+  let pkg_name = manifest_dep_pkg_name(dep)
   if drv_starts_with(url, "-") {
     return Err(
       "git dependency `" + dep.name + "`: refusing git URL `" + url + "`: it must not start with `-`",
     )
   }
-  let repo = ctx.git_root + "/repos/" + sha256_hex(url) + ".git"
+  let repo = ctx.git_root + "/repos/" + sha256_hex(pkg_normalize_git_url(url)) + ".git"
   let reference = manifest_dep_ref(dep)
-  let mut rev = match lock_find(ctx.new_lock, dep) {
-    Some(e) => e.rev
-    None =>
-      match lock_find(ctx.old_lock, dep) {
-        Some(e) => e.rev
-        None => ""
+  let mut rev = match lock_find_checked(ctx.new_lock, dep) {
+    Err(e) => return Err(e)
+    Ok(Some(e)) => e.rev
+    Ok(None) =>
+      match lock_find_checked(ctx.old_lock, dep) {
+        Err(e) => return Err(e)
+        Ok(Some(e)) => e.rev
+        Ok(None) => ""
       }
+  }
+  if rev.length() == 0 && ctx.locked {
+    return Err(
+      "git dependency `" +
+      dep.name +
+      "` is not locked in pion.lock (re-run without --locked to update pion.lock)",
+    )
+  }
+  if rev.length() == 0 && ctx.offline {
+    return Err(
+      "git dependency `" +
+      dep.name +
+      "` is not locked in pion.lock and --offline prevents fetching",
+    )
   }
   if rev.length() > 0 && !lock_is_hex_oid(rev) {
     return Err(
@@ -2885,16 +3028,18 @@ fn drv_git_dep_dir(
       Ok(_) => ()
     }
   }
-  match lock_add(ctx.new_lock, lock_entry_new(dep.name, url, reference, rev, dep.subdir)) {
+  let norm_sub = pkg_normalize_subdir(dep.subdir)
+  match lock_add(ctx.new_lock, lock_entry_new_pkg(pkg_name, "", url, reference, rev, norm_sub)) {
     Err(e) => return Err(e)
     Ok(_) => ()
   }
-  let co = ctx.git_root + "/checkouts/" + rev
-  let dir = if dep.subdir.length() > 0 {
-    drv_resolve_rel_path(co, dep.subdir)
+  let co = drv_canon_dir(world, ctx.git_root + "/checkouts/" + rev)
+  let dir_raw = if norm_sub.length() > 0 {
+    drv_resolve_rel_path(co, norm_sub)
   } else {
     co
   }
+  let dir = drv_canon_dir(world, dir_raw)
   if !drv_starts_with(dir + "/", co + "/") {
     return Err("git dependency `" + dep.name + "`: subdir escapes the repository")
   }
@@ -2903,14 +3048,25 @@ fn drv_git_dep_dir(
       "git dependency `" +
       dep.name +
       "`: no pion.toml at " +
-      (if dep.subdir.length() > 0 { "subdir `" + dep.subdir + "` of " } else { "" }) +
+      (if norm_sub.length() > 0 { "subdir `" + norm_sub + "` of " } else { "" }) +
       url +
       " (" +
       rev +
       ")",
     )
   }
-  Ok(dir)
+  Ok(DrvGitResolved::{
+    dir: dir,
+    origin: DrvGitOrigin::{ git_url: url, rev: rev, checkout_root: co },
+  })
+}
+
+///|
+fn drv_canon_dir(world : World, p : String) -> String {
+  match drv_canon_out_path(world, p) {
+    Ok(c) => drv_normalize_path(c)
+    Err(_) => drv_normalize_path(drv_abs_path(world, p))
+  }
 }
 
 ///|
@@ -2918,20 +3074,20 @@ fn drv_load_workspace_dfs(
   world : World,
   ctx : DrvGitCtx,
   pkg_dir : String,
-  visited : Map[String, Bool],
+  expected_pkg_name : String,
+  dep_alias : String,
+  git_origin : Option[DrvGitOrigin],
+  visited_canon : Map[String, String],
+  visited_declared : Map[String, String],
   out : Array[PkgNodeInput],
   manifest_paths : Array[String],
-) -> Result[Unit, String] {
-  let norm_dir = drv_normalize_path(pkg_dir)
-  if visited.contains(norm_dir) {
-    return Ok(())
-  }
-  visited.set(norm_dir, true)
-  let mf_path = drv_join_path(norm_dir, "pion.toml")
+) -> Result[String, String] {
+  let display_dir = drv_normalize_path(drv_abs_path(world, pkg_dir))
+  let norm_dir = drv_canon_dir(world, pkg_dir)
+  let mf_path = drv_join_path(display_dir, "pion.toml")
   if !fs_exists(world, mf_path) {
-    return Err("missing pion.toml in " + norm_dir)
+    return Err("missing pion.toml in " + display_dir)
   }
-  manifest_paths.push(mf_path)
   let mf_txt = match fs_read(world, mf_path) {
     Err(e) => return Err("failed to read " + mf_path + ": " + e)
     Ok(t) => t
@@ -2940,7 +3096,62 @@ fn drv_load_workspace_dfs(
     Err(e) => return Err(e)
     Ok(m) => m
   }
-  let dep_names : Array[String] = []
+  if expected_pkg_name.length() > 0 && mf.name != expected_pkg_name {
+    return Err(
+      "dependency `" +
+      dep_alias +
+      "` (" +
+      mf_path +
+      ") does not declare package `" +
+      expected_pkg_name +
+      "` (found `[package].name = \"" +
+      mf.name +
+      "\"`)",
+    )
+  }
+  let (source_id, is_root_anchor) = match git_origin {
+    Some(go) => {
+      let co_canon = drv_canon_dir(world, go.checkout_root)
+      let co_rel = pkg_rebase_rel_path(co_canon, norm_dir)
+      let sub = if co_rel == "." { "" } else { co_rel }
+      (pkg_source_id_git(go.git_url, go.rev, sub, mf.name), false)
+    }
+    None => {
+      let rel_loc = pkg_rebase_rel_path(ctx.anchor_root, norm_dir)
+      (pkg_source_id_path(rel_loc, mf.name), rel_loc == ".")
+    }
+  }
+  match visited_canon.get(source_id) {
+    Some(existing_canon) => {
+      if expected_pkg_name.length() > 0 {
+        match visited_declared.get(source_id) {
+          Some(decl_name) =>
+            if decl_name != expected_pkg_name {
+              return Err(
+                "dependency `" +
+                dep_alias +
+                "` (" +
+                mf_path +
+                ") does not declare package `" +
+                expected_pkg_name +
+                "` (found `[package].name = \"" +
+                decl_name +
+                "\"`)",
+              )
+            }
+          None => ()
+        }
+      }
+      return Ok(existing_canon)
+    }
+    None => ()
+  }
+  manifest_paths.push(mf_path)
+  let canon_id = pkg_canon_id(mf.name, source_id, is_root_anchor)
+  visited_canon.set(source_id, canon_id)
+  visited_declared.set(source_id, mf.name)
+  let dep_targets : Array[String] = []
+  let dep_aliases : Array[String] = []
   let mut i = 0
   while i < mf.deps.length() {
     let raw_dep = mf.deps[i]
@@ -2967,43 +3178,90 @@ fn drv_load_workspace_dfs(
     } else {
       raw_dep
     }
-    dep_names.push(dep.name)
-    let dep_dir = if drv_is_external_pkg(ctx.git_root, norm_dir) &&
-      ctx.root_pins.contains(dep.name) {
+    let want_pkg = manifest_dep_pkg_name(dep)
+    let mut dep_dir = ""
+    let mut child_git_origin : Option[DrvGitOrigin] = None
+    let can_use_root_pin = drv_is_external_pkg(ctx.git_root, norm_dir) &&
+      !manifest_dep_is_git(dep) &&
+      dep.package.length() == 0 &&
+      !ctx.root_pin_ambiguous.contains(dep.name) &&
+      ctx.root_pins.contains(dep.name)
+    if can_use_root_pin {
       match ctx.root_pins.get(dep.name) {
-        Some(pinned) => pinned
-        None =>
-          if manifest_dep_is_git(dep) {
-            match drv_git_dep_dir(world, ctx, dep) {
-              Err(e) => return Err(e)
-              Ok(d) => d
-            }
-          } else {
-            drv_resolve_rel_path(norm_dir, dep.path)
+        Some(pinned) => {
+          dep_dir = pinned
+          match ctx.root_pin_origins.get(dep.name) {
+            Some(o) => child_git_origin = Some(o)
+            None => ()
           }
+        }
+        None => {
+          let phys_dep = drv_resolve_rel_path(norm_dir, dep.path)
+          let disp_dep = drv_resolve_rel_path(display_dir, dep.path)
+          dep_dir = if drv_canon_dir(world, disp_dep) == drv_canon_dir(world, phys_dep) {
+            disp_dep
+          } else {
+            phys_dep
+          }
+        }
       }
     } else if manifest_dep_is_git(dep) {
       match drv_git_dep_dir(world, ctx, dep) {
         Err(e) => return Err(e)
-        Ok(d) => d
+        Ok(gr) => {
+          dep_dir = gr.dir
+          child_git_origin = Some(gr.origin)
+        }
       }
     } else {
-      drv_resolve_rel_path(norm_dir, dep.path)
+      let phys_dep = drv_resolve_rel_path(norm_dir, dep.path)
+      let disp_dep = drv_resolve_rel_path(display_dir, dep.path)
+      dep_dir = if drv_canon_dir(world, disp_dep) == drv_canon_dir(world, phys_dep) {
+        disp_dep
+      } else {
+        phys_dep
+      }
+      match git_origin {
+        Some(go) => {
+          let dep_canon = drv_canon_dir(world, dep_dir)
+          let co_canon = drv_canon_dir(world, go.checkout_root)
+          if drv_starts_with(dep_canon + "/", co_canon + "/") {
+            child_git_origin = Some(go)
+          }
+        }
+        None => ()
+      }
     }
-    match drv_load_workspace_dfs(world, ctx, dep_dir, visited, out, manifest_paths) {
+    let child_canon = match drv_load_workspace_dfs(
+      world,
+      ctx,
+      dep_dir,
+      want_pkg,
+      dep.name,
+      child_git_origin,
+      visited_canon,
+      visited_declared,
+      out,
+      manifest_paths,
+    ) {
       Err(e) => return Err(e)
-      Ok(_) => ()
+      Ok(cid) => cid
     }
+    dep_targets.push(child_canon)
+    dep_aliases.push(dep.name)
     i = i + 1
   }
-  let loaded_src = match drv_load_pkg_dir_sources(world, norm_dir) {
+  let loaded_src = match drv_load_pkg_dir_sources(world, display_dir) {
     Err(e) => return Err(e)
     Ok(v) => v
   }
   out.push(PkgNodeInput::{
-    name: mf.name,
-    dir: norm_dir,
-    deps: dep_names,
+    name: canon_id,
+    declared_name: mf.name,
+    source_id: source_id,
+    dir: display_dir,
+    deps: dep_targets,
+    dep_aliases: dep_aliases,
     paths: loaded_src.paths,
     sources: manifest_apply_verify(loaded_src.sources, mf.verify_enabled),
     link_libs: mf.link_libs,
@@ -3016,7 +3274,7 @@ fn drv_load_workspace_dfs(
     link_wasm: mf.link_wasm,
     verify_enabled: mf.verify_enabled,
   })
-  Ok(())
+  Ok(canon_id)
 }
 
 ///|
@@ -3033,7 +3291,18 @@ struct DrvWsLoad {
 /// first, root last), fetching git dependencies into the shared cache and
 /// rewriting `<root>/pion.lock` only when its content changes.
 fn drv_load_workspace(world : World, root_dir : String) -> Result[DrvWsLoad, String] {
-  drv_load_workspace_core(world, root_dir, false, "", "")
+  drv_load_workspace_core(world, root_dir, false, "", None, "", false, false)
+}
+
+///|
+fn drv_load_workspace_opts(
+  world : World,
+  root_dir : String,
+  locked : Bool,
+  offline : Bool,
+  web_rt_dst : String,
+) -> Result[DrvWsLoad, String] {
+  drv_load_workspace_core(world, root_dir, false, "", None, web_rt_dst, locked, offline)
 }
 
 ///|
@@ -3042,7 +3311,7 @@ fn drv_load_workspace_with_guard(
   root_dir : String,
   web_rt_dst : String,
 ) -> Result[DrvWsLoad, String] {
-  drv_load_workspace_core(world, root_dir, false, "", web_rt_dst)
+  drv_load_workspace_core(world, root_dir, false, "", None, web_rt_dst, false, false)
 }
 
 ///|
@@ -3055,7 +3324,17 @@ fn drv_load_workspace_ex(
   unlock_all : Bool,
   unlock_name : String,
 ) -> Result[DrvWsLoad, String] {
-  drv_load_workspace_core(world, root_dir, unlock_all, unlock_name, "")
+  drv_load_workspace_core(world, root_dir, unlock_all, unlock_name, None, "", false, false)
+}
+
+///|
+fn drv_load_workspace_unlock_dep(
+  world : World,
+  root_dir : String,
+  unlock_all : Bool,
+  unlock_dep : Option[ManifestDep],
+) -> Result[DrvWsLoad, String] {
+  drv_load_workspace_core(world, root_dir, unlock_all, "", unlock_dep, "", false, false)
 }
 
 ///|
@@ -3064,7 +3343,10 @@ fn drv_load_workspace_core(
   root_dir : String,
   unlock_all : Bool,
   unlock_name : String,
+  unlock_dep : Option[ManifestDep],
   web_rt_dst : String,
+  locked : Bool,
+  offline : Bool,
 ) -> Result[DrvWsLoad, String] {
   let root_mf_path = drv_join_path(drv_normalize_path(root_dir), "pion.toml")
   if !fs_exists(world, root_mf_path) {
@@ -3122,11 +3404,24 @@ fn drv_load_workspace_core(
   if !unlock_all {
     let mut li = 0
     while li < parsed_lock.length() {
-      if unlock_name.length() == 0 || parsed_lock[li].name != unlock_name {
-        old_lock.push(parsed_lock[li])
+      let le = parsed_lock[li]
+      let drop_it = match unlock_dep {
+        Some(ud) =>
+          lock_entry_pkg_name(le) == manifest_dep_pkg_name(ud) &&
+          pkg_normalize_git_url(le.git) == pkg_normalize_git_url(ud.git) &&
+          pkg_normalize_subdir(le.subdir) == pkg_normalize_subdir(ud.subdir) &&
+          le.reference == manifest_dep_ref(ud)
+        None => unlock_name.length() > 0 && lock_entry_pkg_name(le) == unlock_name
+      }
+      if !drop_it {
+        old_lock.push(le)
       }
       li = li + 1
     }
+  }
+  let anchor_root = match enclosing_ws {
+    Some(ws) => drv_canon_dir(world, ws.root_dir)
+    None => drv_canon_dir(world, root_dir)
   }
   let ctx = DrvGitCtx::{
     git_root: drv_git_cache_root(world),
@@ -3134,18 +3429,23 @@ fn drv_load_workspace_core(
     new_lock: [],
     fetched: Map([]),
     ws_root: enclosing_ws,
+    anchor_root: anchor_root,
     root_pins: Map([]),
+    root_pin_origins: Map([]),
+    root_pin_ambiguous: Map([]),
+    locked: locked,
+    offline: offline,
   }
-  // Collect explicit root/workspace package pins before DFS so external
-  // git-cached packages unify onto the root's chosen version instead of
-  // pulling a duplicate copy via relative `../<dep>` paths.
+  // Collect explicit unaliased root/workspace package pins before DFS so external
+  // git-cached packages unify unaliased relative `../<dep>` paths onto the root's
+  // unique chosen version without folding explicitly aliased or multi-source deps.
   match enclosing_ws {
     Some(ws) => {
       match drv_expand_workspace_members(world, ws.root_dir, ws.manifest) {
         Ok(ws_members) => {
           let mut wmi = 0
           while wmi < ws_members.length() {
-            let mdir = drv_normalize_path(ws_members[wmi])
+            let mdir = drv_canon_dir(world, ws_members[wmi])
             let mmf_path = drv_join_path(mdir, "pion.toml")
             if fs_exists(world, mmf_path) {
               manifest_paths.push(mmf_path)
@@ -3153,8 +3453,8 @@ fn drv_load_workspace_core(
                 Ok(mtxt) =>
                   match parse_pion_toml(mtxt) {
                     Ok(mmf) =>
-                      if mmf.name.length() > 0 && !ctx.root_pins.contains(mmf.name) {
-                        ctx.root_pins.set(mmf.name, mdir)
+                      if mmf.name.length() > 0 {
+                        drv_record_root_pin(ctx, mmf.name, mdir, None)
                       }
                     Err(_) => ()
                   }
@@ -3169,16 +3469,24 @@ fn drv_load_workspace_core(
       let mut wdi = 0
       while wdi < ws.manifest.workspace_deps.length() {
         let wdep = ws.manifest.workspace_deps[wdi]
-        if !ctx.root_pins.contains(wdep.name) {
+        if wdep.package.length() == 0 {
           if manifest_dep_is_git(wdep) {
             match drv_git_dep_dir(world, ctx, wdep) {
               Err(e) => return Err(e)
-              Ok(d) => ctx.root_pins.set(wdep.name, drv_normalize_path(d))
+              Ok(gr) =>
+                drv_record_root_pin(
+                  ctx,
+                  wdep.name,
+                  drv_canon_dir(world, gr.dir),
+                  Some(gr.origin),
+                )
             }
           } else {
-            ctx.root_pins.set(
+            drv_record_root_pin(
+              ctx,
               wdep.name,
-              drv_normalize_path(drv_resolve_rel_path(ws.root_dir, wdep.path)),
+              drv_canon_dir(world, drv_resolve_rel_path(ws.root_dir, wdep.path)),
+              None,
             )
           }
         }
@@ -3188,12 +3496,9 @@ fn drv_load_workspace_core(
     None => ()
   }
   if !root_mf.is_workspace {
-    let pin_root_dir = match enclosing_ws {
-      Some(_) => drv_abs_path(world, root_dir)
-      None => drv_normalize_path(root_dir)
-    }
+    let pin_root_dir = drv_canon_dir(world, root_dir)
     if root_mf.name.length() > 0 {
-      ctx.root_pins.set(root_mf.name, pin_root_dir)
+      drv_record_root_pin(ctx, root_mf.name, pin_root_dir, None)
     }
     let mut rdi = 0
     while rdi < root_mf.deps.length() {
@@ -3221,21 +3526,32 @@ fn drv_load_workspace_core(
       } else {
         raw_dep
       }
-      if manifest_dep_is_git(rdep) {
-        match drv_git_dep_dir(world, ctx, rdep) {
-          Err(e) => return Err(e)
-          Ok(d) => ctx.root_pins.set(rdep.name, drv_normalize_path(d))
+      if rdep.package.length() == 0 {
+        if manifest_dep_is_git(rdep) {
+          match drv_git_dep_dir(world, ctx, rdep) {
+            Err(e) => return Err(e)
+            Ok(gr) =>
+              drv_record_root_pin(
+                ctx,
+                rdep.name,
+                drv_canon_dir(world, gr.dir),
+                Some(gr.origin),
+              )
+          }
+        } else {
+          drv_record_root_pin(
+            ctx,
+            rdep.name,
+            drv_canon_dir(world, drv_resolve_rel_path(pin_root_dir, rdep.path)),
+            None,
+          )
         }
-      } else {
-        ctx.root_pins.set(
-          rdep.name,
-          drv_normalize_path(drv_resolve_rel_path(pin_root_dir, rdep.path)),
-        )
       }
       rdi = rdi + 1
     }
   }
-  let visited : Map[String, Bool] = Map([])
+  let visited_canon : Map[String, String] = Map([])
+  let visited_declared : Map[String, String] = Map([])
   let out : Array[PkgNodeInput] = []
   if root_mf.is_workspace {
     let ws_abs = drv_abs_path(world, root_dir)
@@ -3245,7 +3561,18 @@ fn drv_load_workspace_core(
     }
     let mut mi = 0
     while mi < members.length() {
-      match drv_load_workspace_dfs(world, ctx, members[mi], visited, out, manifest_paths) {
+      match drv_load_workspace_dfs(
+        world,
+        ctx,
+        members[mi],
+        "",
+        "",
+        None,
+        visited_canon,
+        visited_declared,
+        out,
+        manifest_paths,
+      ) {
         Err(e) => return Err(e)
         Ok(_) => ()
       }
@@ -3263,37 +3590,41 @@ fn drv_load_workspace_core(
       wi = wi + 1
     }
   } else {
-    let start_dir = match enclosing_ws {
-      Some(_) => drv_abs_path(world, root_dir)
-      None => root_dir
-    }
-    match drv_load_workspace_dfs(world, ctx, start_dir, visited, out, manifest_paths) {
+    let start_dir = drv_abs_path(world, root_dir)
+    match drv_load_workspace_dfs(
+      world,
+      ctx,
+      start_dir,
+      "",
+      "",
+      None,
+      visited_canon,
+      visited_declared,
+      out,
+      manifest_paths,
+    ) {
       Err(e) => return Err(e)
       Ok(_) => ()
     }
   }
-  // Hard guard: fail fast before compilation/linking if two distinct paths
-  // resolved to the same package name.
-  let seen_pkg_dir : Map[String, String] = Map([])
+  // Guard against canonical ID collisions across distinct source identities.
+  let seen_canon_src : Map[String, String] = Map([])
   let mut dup_i = 0
   while dup_i < out.length() {
     let node = out[dup_i]
-    match seen_pkg_dir.get(node.name) {
-      Some(prev_dir) =>
-        if prev_dir != node.dir {
+    match seen_canon_src.get(node.name) {
+      Some(prev_src) =>
+        if prev_src != node.source_id {
           return Err(
-            "duplicate package '" +
+            "duplicate canonical package id '" +
             node.name +
-            "' resolved from multiple paths:\n  1) " +
-            prev_dir +
+            "' resolved from multiple sources:\n  1) " +
+            prev_src +
             "\n  2) " +
-            node.dir +
-            "\nhint: pin '" +
-            node.name +
-            "' in pion.toml or [workspace.dependencies]",
+            node.source_id,
           )
         }
-      None => seen_pkg_dir.set(node.name, node.dir)
+      None => seen_canon_src.set(node.name, node.source_id)
     }
     dup_i = dup_i + 1
   }
@@ -3315,7 +3646,11 @@ fn drv_load_workspace_core(
       let mut present = false
       let mut fl_i = 0
       while fl_i < final_lock.length() {
-        if final_lock[fl_i].name == oe.name {
+        let fe = final_lock[fl_i]
+        if lock_entry_pkg_name(fe) == lock_entry_pkg_name(oe) &&
+          pkg_normalize_git_url(fe.git) == pkg_normalize_git_url(oe.git) &&
+          pkg_normalize_subdir(fe.subdir) == pkg_normalize_subdir(oe.subdir) &&
+          fe.reference == oe.reference {
           present = true
           break
         }
@@ -3340,8 +3675,22 @@ fn drv_load_workspace_core(
     }
   }
   if has_lock || final_lock.length() > 0 {
+    let sem_same = has_lock && lock_entries_equiv(parsed_lock, final_lock)
     let new_text = format_pion_lock(final_lock)
-    if new_text != old_text {
+    if locked || offline {
+      if !sem_same {
+        if locked {
+          return Err(
+            "pion.lock is out of date (run without --locked to update " +
+            lock_path +
+            ")",
+          )
+        }
+        return Err(
+          "pion.lock would be modified in --offline mode (" + lock_path + ")",
+        )
+      }
+    } else if new_text != old_text && !sem_same {
       if !drv_write_text_atomic(world, lock_path, new_text) {
         return Err("failed to write " + lock_path)
       }
@@ -4699,6 +5048,66 @@ fn drv_link_objects_to(
 }
 
 ///|
+fn drv_effective_sig_hash(
+  sig_text : String,
+  node : PkgNodeInput,
+  sig_hashes : Map[String, String],
+) -> String {
+  let sb = StringBuilder()
+  sb.write_string("esig-v1|")
+  sb.write_string(sha256_hex(sig_text))
+  let pairs : Array[String] = []
+  let mut i = 0
+  while i < node.dep_aliases.length() && i < node.deps.length() {
+    let target = node.deps[i]
+    let dep_h = match sig_hashes.get(target) {
+      Some(h) => h
+      None => ""
+    }
+    pairs.push(node.dep_aliases[i] + "=" + target + ":" + dep_h)
+    i = i + 1
+  }
+  drv_sort_strings(pairs)
+  i = 0
+  while i < pairs.length() {
+    sb.write_string("|")
+    sb.write_string(pairs[i])
+    i = i + 1
+  }
+  sha256_hex(sb.to_string())
+}
+
+///|
+fn drv_cas_rel_paths(node : PkgNodeInput) -> Array[String] {
+  let out : Array[String] = []
+  let mut i = 0
+  while i < node.paths.length() {
+    out.push(pkg_rebase_rel_path(node.dir, node.paths[i]))
+    i = i + 1
+  }
+  out
+}
+
+///|
+fn drv_append_dep_alias_sigs(
+  upstream_sigs : Array[String],
+  node : PkgNodeInput,
+) -> Unit {
+  let pairs : Array[String] = []
+  let mut i = 0
+  while i < node.dep_aliases.length() && i < node.deps.length() {
+    pairs.push("alias:" + node.dep_aliases[i] + "=" + node.deps[i])
+    i = i + 1
+  }
+  drv_sort_strings(pairs)
+  i = 0
+  while i < pairs.length() {
+    upstream_sigs.push(pairs[i])
+    i = i + 1
+  }
+}
+
+///|
 fn drv_ensure_ws_imports(
   world : World,
   nodes : Array[PkgNodeInput],
@@ -4733,12 +5142,15 @@ fn drv_ensure_ws_imports(
           match fs_read(world, sp) {
             Ok(stub_txt) =>
               if stub_txt.length() > 0 {
-                let scr = check_source_files_with_imports(
+                let scr = check_source_files_with_imports_mapped(
                   unode.name,
                   [unode.name + ".pionstub"],
                   [stub_txt],
                   u_imports,
+                  unode.dep_aliases,
+                  unode.deps,
                   true,
+                  false,
                 )
                 if scr.diagnostics.length() == 0 {
                   scr.tc.pkg_root = drv_normalize_path(drv_abs_path(world, unode.dir))
@@ -4752,12 +5164,15 @@ fn drv_ensure_ws_imports(
         let ipkg = match loaded_opt {
           Some(v) => v
           None => {
-            let fcr = check_source_files_with_imports(
+            let fcr = check_source_files_with_imports_mapped(
               unode.name,
               unode.paths,
               unode.sources,
               u_imports,
+              unode.dep_aliases,
+              unode.deps,
               true,
+              false,
             )
             fcr.tc.pkg_root = drv_normalize_path(drv_abs_path(world, unode.dir))
             fcr.tc.pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
@@ -4797,6 +5212,8 @@ fn drv_build_workspace_objects(
     root_tests,
     "main",
     false,
+    false,
+    false,
   )
 }
 
@@ -4813,14 +5230,16 @@ fn drv_build_workspace_objects_entry(
   root_tests : Bool,
   entry_symbol : String,
   no_main : Bool,
+  locked : Bool,
+  offline : Bool,
 ) -> Result[DrvWsBuilt, String] {
-  let nodes = match drv_load_workspace_nodes(world, root_dir) {
+  let ws = match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
     Err(e) => return Err(e)
     Ok(v) => v
   }
   drv_build_nodes_objects_entry(
     world,
-    nodes,
+    ws.nodes,
     release,
     include_entry,
     jobs,
@@ -5211,12 +5630,15 @@ fn drv_build_nodes_objects_entry(
         loaded_imported,
         k,
       )
-      let cr = check_source_files_with_imports(
+      let cr = check_source_files_with_imports_mapped(
         node.name,
         node.paths,
         node.sources,
         k_imports,
+        node.dep_aliases,
+        node.deps,
         true,
+        false,
       )
       if cr.diagnostics.length() > 0 {
         return Err(check_result_to_json(cr.diagnostics))
@@ -5244,6 +5666,7 @@ fn drv_build_nodes_objects_entry(
       upstream_sigs.push(un + ":" + sh + ":" + stub_h)
       u = u + 1
     }
+    drv_append_dep_alias_sigs(upstream_sigs, node)
     if is_entry {
       if no_main {
         upstream_sigs.push("__pion_entry__:no_main")
@@ -5253,7 +5676,7 @@ fn drv_build_nodes_objects_entry(
     }
     let key = cas_compute_key(
       node.name,
-      node.paths,
+      drv_cas_rel_paths(node),
       node.sources,
       upstream_sigs,
       qbe_target,
@@ -5269,14 +5692,14 @@ fn drv_build_nodes_objects_entry(
     if fs_exists(world, obj_path) && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
       match (fs_read(world, sig_path), fs_read(world, stub_path)) {
         (Ok(sig_text), Ok(stub_text)) => {
-          sig_hashes.set(node.name, sha256_hex(sig_text))
+          sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
           stub_hashes.set(node.name, drv_stub_hash(stub_text, node.sources))
           stub_paths[k] = stub_path
           cas_hit = true
           if trace_cas {
             io_eprintln(
               world,
-              "[cas] pkg=" + node.name + " HIT key=" + drv_prefix16(key),
+              "[cas] pkg=" + node.declared_name + " HIT key=" + drv_prefix16(key),
             )
           }
         }
@@ -5288,7 +5711,7 @@ fn drv_build_nodes_objects_entry(
       if trace_cas {
         io_eprintln(
           world,
-          "[cas] pkg=" + node.name + " MISS key=" + drv_prefix16(key),
+          "[cas] pkg=" + node.declared_name + " MISS key=" + drv_prefix16(key),
         )
       }
       let k_imports = drv_ensure_ws_imports(
@@ -5300,12 +5723,15 @@ fn drv_build_nodes_objects_entry(
         loaded_imported,
         k,
       )
-      let cr = check_source_files_with_imports(
+      let cr = check_source_files_with_imports_mapped(
         node.name,
         node.paths,
         node.sources,
         k_imports,
+        node.dep_aliases,
+        node.deps,
         true,
+        false,
       )
       if cr.diagnostics.length() > 0 {
         return Err(check_result_to_json(cr.diagnostics))
@@ -5314,7 +5740,7 @@ fn drv_build_nodes_objects_entry(
       cr.tc.pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
       loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
       let pionsig = emit_pionsig(cr.pkg)
-      sig_hashes.set(node.name, sha256_hex(pionsig))
+      sig_hashes.set(node.name, drv_effective_sig_hash(pionsig, node, sig_hashes))
       let pionstub = emit_pion_stub(cr.pkg)
       stub_hashes.set(node.name, drv_stub_hash(pionstub, node.sources))
       let j2_mask = drv_j2_disable_mask(world)
@@ -5487,6 +5913,8 @@ fn drv_build_wasm_targets(
   out_bin_arg : String,
   wasm_names : Bool,
   web_rt_dst : String,
+  locked : Bool,
+  offline : Bool,
 ) -> Result[String, String] {
   let cache_dir = drv_resolve_cache_dir(world)
   let _ = fs_mkdir_p(world, cache_dir + "/sig")
@@ -5520,7 +5948,7 @@ fn drv_build_wasm_targets(
     match drv_detect_manifest_dir(world, targets[0]) {
       Some(root_dir) => {
         handled_ws = true
-        let ws = match drv_load_workspace_with_guard(world, root_dir, web_rt_dst) {
+        let ws = match drv_load_workspace_opts(world, root_dir, locked, offline, web_rt_dst) {
           Err(e) => return Err(e)
           Ok(v) => v
         }
@@ -5587,6 +6015,7 @@ fn drv_build_wasm_targets(
             upstream_sigs.push(un + ":" + sh + ":" + stub_h)
             u = u + 1
           }
+          drv_append_dep_alias_sigs(upstream_sigs, node)
           let t_topo_names = trans.topo_names[k]
           let target_key = if is_entry {
             "wasm32_entry:" + drv_join_comma(t_topo_names)
@@ -5597,7 +6026,7 @@ fn drv_build_wasm_targets(
           }
           let key = cas_compute_key(
             node.name,
-            node.paths,
+            drv_cas_rel_paths(node),
             node.sources,
             upstream_sigs,
             target_key,
@@ -5613,7 +6042,7 @@ fn drv_build_wasm_targets(
             fs_exists(world, ssa_path) {
             match (fs_read(world, sig_path), fs_read(world, stub_path)) {
               (Ok(sig_text), Ok(stub_text)) => {
-                sig_hashes.set(node.name, sha256_hex(sig_text))
+                sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
                 stub_hashes.set(node.name, drv_stub_hash(stub_text, node.sources))
                 stub_paths[k] = stub_path
                 pkg_ssa_paths.push(ssa_path)
@@ -5622,7 +6051,7 @@ fn drv_build_wasm_targets(
                 if trace_cas {
                   io_eprintln(
                     world,
-                    "[cas-wasm] pkg=" + node.name + " HIT key=" + drv_prefix16(key),
+                    "[cas-wasm] pkg=" + node.declared_name + " HIT key=" + drv_prefix16(key),
                   )
                 }
               }
@@ -5633,7 +6062,7 @@ fn drv_build_wasm_targets(
             if trace_cas {
               io_eprintln(
                 world,
-                "[cas-wasm] pkg=" + node.name + " MISS key=" + drv_prefix16(key),
+                "[cas-wasm] pkg=" + node.declared_name + " MISS key=" + drv_prefix16(key),
               )
             }
             let k_imports = drv_ensure_ws_imports(
@@ -5645,12 +6074,15 @@ fn drv_build_wasm_targets(
               loaded_imported,
               k,
             )
-            let cr = check_source_files_with_imports(
+            let cr = check_source_files_with_imports_mapped(
               node.name,
               node.paths,
               node.sources,
               k_imports,
+              node.dep_aliases,
+              node.deps,
               true,
+              false,
             )
             if cr.diagnostics.length() > 0 {
               return Err(check_result_to_json(cr.diagnostics))
@@ -5659,7 +6091,7 @@ fn drv_build_wasm_targets(
       cr.tc.pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
             loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
             let pionsig = emit_pionsig(cr.pkg)
-            sig_hashes.set(node.name, sha256_hex(pionsig))
+            sig_hashes.set(node.name, drv_effective_sig_hash(pionsig, node, sig_hashes))
             let pionstub = emit_pion_stub(cr.pkg)
             stub_hashes.set(node.name, drv_stub_hash(pionstub, node.sources))
             let res = emit_qbe_package_multi_for_target(
@@ -6001,6 +6433,8 @@ fn drv_build_targets(
   entry_symbol : String,
   no_main : Bool,
   web_rt_dst : String,
+  locked : Bool,
+  offline : Bool,
 ) -> Result[String, String] {
   let picked_target = drv_pick_target(world, target_override)
   if drv_target_is_wasm(picked_target) {
@@ -6012,6 +6446,8 @@ fn drv_build_targets(
       out_bin_arg,
       wasm_names,
       web_rt_dst,
+      locked,
+      offline,
     )
   }
   let only_text_emit = (emit_ssa_path != "" || emit_asm_path != "") &&
@@ -6040,6 +6476,8 @@ fn drv_build_targets(
           false,
           entry_symbol,
           no_main,
+          locked,
+          offline,
         ) {
           Err(e) => return Err(e)
           Ok(v) => v
@@ -7682,9 +8120,10 @@ fn drv_build_needed_objects(
       upstream_sigs.push(un + ":" + sh + ":" + stub_h)
       u = u + 1
     }
+    drv_append_dep_alias_sigs(upstream_sigs, node)
     let key = cas_compute_key(
       node.name,
-      node.paths,
+      drv_cas_rel_paths(node),
       node.sources,
       upstream_sigs,
       qbe_target,
@@ -7699,12 +8138,12 @@ fn drv_build_needed_objects(
     if fs_exists(world, obj_path) && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
       match (fs_read(world, sig_path), fs_read(world, stub_path)) {
         (Ok(sig_text), Ok(stub_text)) => {
-          sig_hashes.set(node.name, sha256_hex(sig_text))
+          sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
           stub_hashes.set(node.name, drv_stub_hash(stub_text, node.sources))
           stub_paths[k] = stub_path
           cas_hit = true
           if trace_cas {
-            io_eprintln(world, "[cas] pkg=" + node.name + " HIT key=" + drv_prefix16(key))
+            io_eprintln(world, "[cas] pkg=" + node.declared_name + " HIT key=" + drv_prefix16(key))
           }
         }
         _ => ()
@@ -7712,7 +8151,7 @@ fn drv_build_needed_objects(
     }
     if !cas_hit {
       if trace_cas {
-        io_eprintln(world, "[cas] pkg=" + node.name + " MISS key=" + drv_prefix16(key))
+        io_eprintln(world, "[cas] pkg=" + node.declared_name + " MISS key=" + drv_prefix16(key))
       }
       let k_imports = drv_ensure_ws_imports(
         world,
@@ -7723,12 +8162,15 @@ fn drv_build_needed_objects(
         loaded_imported,
         k,
       )
-      let cr = check_source_files_with_imports(
+      let cr = check_source_files_with_imports_mapped(
         node.name,
         node.paths,
         node.sources,
         k_imports,
+        node.dep_aliases,
+        node.deps,
         true,
+        false,
       )
       if cr.diagnostics.length() > 0 {
         return Err(check_result_to_json(cr.diagnostics))
@@ -7737,7 +8179,7 @@ fn drv_build_needed_objects(
       cr.tc.pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
       loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
       let pionsig = emit_pionsig(cr.pkg)
-      sig_hashes.set(node.name, sha256_hex(pionsig))
+      sig_hashes.set(node.name, drv_effective_sig_hash(pionsig, node, sig_hashes))
       let pionstub = emit_pion_stub(cr.pkg)
       stub_hashes.set(node.name, drv_stub_hash(pionstub, node.sources))
       let res = emit_qbe_package_multi_entry_target(
@@ -8365,10 +8807,12 @@ fn drv_run_ws_tests(
   only_pkg : String,
   no_deps : Bool,
   jobs : Int,
+  locked : Bool,
+  offline : Bool,
 ) -> Int {
   let trace = drv_env_str(world, "PION_CAS_TRACE") == "1"
   let t_start = clock_now_ms(world)
-  let ws = match drv_load_workspace(world, root_dir) {
+  let ws = match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
     Err(msg) => {
       io_eprintln(world, "error: " + msg)
       return 1
@@ -8391,7 +8835,7 @@ fn drv_run_ws_tests(
   }
   let no_deps_dirs : Map[String, Bool] = Map([])
   if no_deps {
-    let root_abs = drv_normalize_path(drv_abs_path(world, root_dir))
+    let root_abs = drv_canon_dir(world, root_dir)
     let root_mf_path = drv_join_path(root_abs, "pion.toml")
     let mut is_virtual_ws = false
     if fs_exists(world, root_mf_path) {
@@ -8406,7 +8850,7 @@ fn drv_run_ws_tests(
                     let mut mi = 0
                     while mi < ms.length() {
                       no_deps_dirs.set(
-                        drv_normalize_path(drv_abs_path(world, ms[mi])),
+                        drv_canon_dir(world, ms[mi]),
                         true,
                       )
                       mi = mi + 1
@@ -8430,11 +8874,11 @@ fn drv_run_ws_tests(
   while ni < nodes.length() {
     let local = !drv_is_external_pkg(ws.git_root, nodes[ni].dir)
     if only_pkg.length() > 0 {
-      if nodes[ni].name == only_pkg {
+      if nodes[ni].declared_name == only_pkg || nodes[ni].name == only_pkg {
         selected.push(ni)
       }
     } else if no_deps {
-      let node_abs = drv_normalize_path(drv_abs_path(world, nodes[ni].dir))
+      let node_abs = drv_canon_dir(world, nodes[ni].dir)
       if no_deps_dirs.contains(node_abs) {
         selected.push(ni)
       } else if local {
@@ -8605,14 +9049,23 @@ fn drv_run_ws_tests(
         serial_loaded,
         tk,
       )
-      let cr = check_source_files_with_imports(node.name, tpaths, tsources, imports, true)
+      let cr = check_source_files_with_imports_mapped(
+        node.name,
+        tpaths,
+        tsources,
+        imports,
+        node.dep_aliases,
+        node.deps,
+        true,
+        false,
+      )
       if cr.diagnostics.length() > 0 {
         io_eprintln(world, check_result_to_json(cr.diagnostics))
         return 1
       }
       cr.tc.pkg_root = drv_normalize_path(drv_abs_path(world, node.dir))
       cr.tc.pkg_cwd = drv_normalize_path(drv_abs_path(world, "."))
-      tested.push(node.name)
+      tested.push(node.declared_name)
       let tnames = drv_test_names(cr.pkg)
       let run_idx = drv_filter_tests(tnames, filter)
       if run_idx.length() > 0 {
@@ -8670,7 +9123,7 @@ fn drv_run_ws_tests(
         }
         let test_res = emit_qbe_test_package_target(cr.pkg, cr.tc, dep_names, qbe_target)
         test_jobs.push(DrvTestJob::{
-          label: node.name,
+          label: node.declared_name,
           ssa: cleanup_native_rc_ssa(test_res.ssa),
           names: tnames,
           run_idx: run_idx,
@@ -8697,6 +9150,8 @@ fn drv_run_ws_tests(
           fb_paths,
           fb_sources,
           drv_normalize_path(drv_abs_path(world, unode.dir)),
+          drv_pack_str_list(unode.dep_aliases),
+          drv_pack_str_list(unode.deps),
         ]),
       )
       k = k + 1
@@ -8732,6 +9187,8 @@ fn drv_run_ws_tests(
           drv_pack_str_list(tsources),
           drv_pack_str_list(trans.topo_names[tk]),
           drv_normalize_path(drv_abs_path(world, node.dir)),
+          drv_pack_str_list(node.dep_aliases),
+          drv_pack_str_list(node.deps),
         ]),
       )
       si = si + 1
@@ -8755,6 +9212,8 @@ fn drv_run_ws_tests(
           let t_fb_paths : Array[String] = []
           let t_fb_srcs : Array[String] = []
           let t_dirs : Array[String] = []
+          let t_dep_aliases : Array[String] = []
+          let t_dep_targets : Array[String] = []
           let local_loaded : Array[Option[ImportedPkg]] = []
           let mut ti = 0
           while ti < tn {
@@ -8765,6 +9224,8 @@ fn drv_run_ws_tests(
             t_fb_paths.push(tf[3])
             t_fb_srcs.push(tf[4])
             t_dirs.push(tf[5])
+            t_dep_aliases.push(tf[6])
+            t_dep_targets.push(tf[7])
             local_loaded.push(None)
             ti = ti + 1
           }
@@ -8782,6 +9243,8 @@ fn drv_run_ws_tests(
             let tsources = drv_unpack_str_list(wf[4])
             let dep_names = drv_unpack_str_list(wf[5])
             let pkg_root = wf[6]
+            let w_dep_aliases = drv_unpack_str_list(wf[7])
+            let w_dep_targets = drv_unpack_str_list(wf[8])
             let deps_topo = t_deps[cur_tk]
             let imports : Array[ImportedPkg] = []
             let mut di = 0
@@ -8800,18 +9263,23 @@ fn drv_run_ws_tests(
                     }
                     ui = ui + 1
                   }
+                  let u_da = drv_unpack_str_list(t_dep_aliases[u])
+                  let u_dt = drv_unpack_str_list(t_dep_targets[u])
                   let mut loaded_opt : Option[ImportedPkg] = None
                   let sp = t_stubs[u]
                   if sp.length() > 0 {
                     match fs_read(world, sp) {
                       Ok(stub_txt) =>
                         if stub_txt.length() > 0 {
-                          let scr = check_source_files_with_imports(
+                          let scr = check_source_files_with_imports_mapped(
                             t_names[u],
                             [t_names[u] + ".pionstub"],
                             [stub_txt],
                             u_imports,
+                            u_da,
+                            u_dt,
                             true,
+                            false,
                           )
                           if scr.diagnostics.length() == 0 {
                             loaded_opt = Some(ImportedPkg::{ name: t_names[u], tc: scr.tc })
@@ -8823,12 +9291,15 @@ fn drv_run_ws_tests(
                   let ipkg = match loaded_opt {
                     Some(v) => v
                     None => {
-                      let fcr = check_source_files_with_imports(
+                      let fcr = check_source_files_with_imports_mapped(
                         t_names[u],
                         drv_unpack_str_list(t_fb_paths[u]),
                         drv_unpack_str_list(t_fb_srcs[u]),
                         u_imports,
+                        u_da,
+                        u_dt,
                         true,
+                        false,
                       )
                       fcr.tc.pkg_root = t_dirs[u]
                       fcr.tc.pkg_cwd = ws_pkg_cwd
@@ -8841,7 +9312,16 @@ fn drv_run_ws_tests(
               }
               di = di + 1
             }
-            let cr = check_source_files_with_imports(pkg_name, tpaths, tsources, imports, true)
+            let cr = check_source_files_with_imports_mapped(
+              pkg_name,
+              tpaths,
+              tsources,
+              imports,
+              w_dep_aliases,
+              w_dep_targets,
+              true,
+              false,
+            )
             if cr.diagnostics.length() > 0 {
               let _ = res_ch.send(
                 drv_pack_str_list([cur_si, "E", check_result_to_json(cr.diagnostics)]),
@@ -8901,7 +9381,7 @@ fn drv_run_ws_tests(
       }
       let node = nodes[selected[si]]
       let tk = node_to_topo[selected[si]]
-      tested.push(node.name)
+      tested.push(node.declared_name)
       if rf.length() >= 5 && rf[1] == "O" {
         let tnames = drv_unpack_str_list(rf[2])
         let run_idx = drv_unpack_int_list(rf[3])
@@ -8957,7 +9437,7 @@ fn drv_run_ws_tests(
           li = li + 1
         }
         test_jobs.push(DrvTestJob::{
-          label: node.name,
+          label: node.declared_name,
           ssa: ssa,
           names: tnames,
           run_idx: run_idx,
@@ -9031,6 +9511,8 @@ fn drv_run_tests_cmd(
   only_pkg : String,
   no_deps : Bool,
   jobs : Int,
+  locked : Bool,
+  offline : Bool,
 ) -> Int {
   if targets.length() == 1 {
     match drv_detect_manifest_dir(world, targets[0]) {
@@ -9044,6 +9526,8 @@ fn drv_run_tests_cmd(
           only_pkg,
           no_deps,
           jobs,
+          locked,
+          offline,
         )
       None => ()
     }
@@ -9087,6 +9571,8 @@ fn drv_run_tests_cmd(
           only_pkg,
           no_deps,
           jobs,
+          locked,
+          offline,
         )
         if rc != 0 {
           overall_rc = rc
@@ -9359,7 +9845,7 @@ fn drv_run_doc_cmd(world : World, targets : Array[String], as_json : Bool) -> In
             diags.push(pd[di])
             di = di + 1
           }
-          pkgs.push(parse_package(node.name, node.paths, node.sources))
+          pkgs.push(parse_package(node.declared_name, node.paths, node.sources))
           ni = ni + 1
         }
       }
@@ -9398,7 +9884,12 @@ fn drv_run_doc_cmd(world : World, targets : Array[String], as_json : Bool) -> In
 ///|
 /// `pionc fetch [dir]`: resolves every git dependency of the workspace into the
 /// shared git cache and writes/verifies `pion.lock`; prints a JSON summary.
-fn drv_run_fetch_cmd(world : World, dir : String) -> Int {
+fn drv_run_fetch_cmd(
+  world : World,
+  dir : String,
+  locked : Bool,
+  offline : Bool,
+) -> Int {
   let root_dir = match drv_detect_manifest_dir(world, dir) {
     Some(d) => d
     None => {
@@ -9406,7 +9897,7 @@ fn drv_run_fetch_cmd(world : World, dir : String) -> Int {
       return 1
     }
   }
-  let ws = match drv_load_workspace(world, root_dir) {
+  let ws = match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
     Err(msg) => {
       io_eprintln(world, "error: " + msg)
       return 1
@@ -9426,6 +9917,8 @@ fn drv_run_fetch_cmd(world : World, dir : String) -> Int {
       sb.write_string(",")
     }
     sb.write_string("{\"name\":")
+    sb.write_string(json_quote(node.declared_name))
+    sb.write_string(",\"canon_id\":")
     sb.write_string(json_quote(node.name))
     sb.write_string(",\"dir\":")
     sb.write_string(json_quote(node.dir))
@@ -10059,12 +10552,19 @@ fn drv_registry_lookup(
 
 ///|
 /// Puts a file back as it was before a failed `add`/`update` (removes it when
-/// it did not exist).
-fn drv_restore_file(world : World, path : String, existed : Bool, text : String) -> Unit {
+/// it did not exist). Returns `true` when restoration succeeded.
+fn drv_restore_file(world : World, path : String, existed : Bool, text : String) -> Bool {
   if existed {
-    let _ = drv_write_text_atomic(world, path, text)
+    match fs_read(world, path) {
+      Ok(cur) =>
+        if cur == text {
+          return true
+        }
+      Err(_) => ()
+    }
+    drv_write_text_atomic(world, path, text)
   } else {
-    let _ = fs_remove(world, path)
+    !fs_exists(world, path) || fs_remove(world, path)
   }
 }
 
@@ -11459,12 +11959,15 @@ fn drv_ws_diagnostics(nodes : Array[PkgNodeInput]) -> Array[Diagnostic] {
   let mut k = 0
   while k < topo.order.length() {
     let node = nodes[topo.order[k]]
-    let cr = check_source_files_with_imports(
+    let cr = check_source_files_with_imports_mapped(
       node.name,
       node.paths,
       node.sources,
       imported,
+      node.dep_aliases,
+      node.deps,
       true,
+      false,
     )
     let mut di = 0
     while di < cr.diagnostics.length() {
@@ -11548,9 +12051,10 @@ fn drv_ws_diagnostics_cached(
       upstream_sigs.push(un + ":" + sh)
       u = u + 1
     }
+    drv_append_dep_alias_sigs(upstream_sigs, node)
     let key = cas_compute_key(
       node.name,
-      node.paths,
+      drv_cas_rel_paths(node),
       node.sources,
       upstream_sigs,
       "check",
@@ -11563,13 +12067,13 @@ fn drv_ws_diagnostics_cached(
     if !any_dep_err && fs_exists(world, sig_path) && fs_exists(world, stub_path) {
       match fs_read(world, sig_path) {
         Ok(sig_text) => {
-          sig_hashes.set(node.name, sha256_hex(sig_text))
+          sig_hashes.set(node.name, drv_effective_sig_hash(sig_text, node, sig_hashes))
           stub_paths[k] = stub_path
           cas_hit = true
           if trace_cas {
             io_eprintln(
               world,
-              "[cas-check] pkg=" + node.name + " HIT key=" + drv_prefix16(key),
+              "[cas-check] pkg=" + node.declared_name + " HIT key=" + drv_prefix16(key),
             )
           }
         }
@@ -11580,7 +12084,7 @@ fn drv_ws_diagnostics_cached(
       if trace_cas {
         io_eprintln(
           world,
-          "[cas-check] pkg=" + node.name + " MISS key=" + drv_prefix16(key),
+          "[cas-check] pkg=" + node.declared_name + " MISS key=" + drv_prefix16(key),
         )
       }
       let k_imports = drv_ensure_ws_imports(
@@ -11592,12 +12096,15 @@ fn drv_ws_diagnostics_cached(
         loaded_imported,
         k,
       )
-      let cr = check_source_files_with_imports(
+      let cr = check_source_files_with_imports_mapped(
         node.name,
         node.paths,
         node.sources,
         k_imports,
+        node.dep_aliases,
+        node.deps,
         true,
+        false,
       )
       loaded_imported[k] = Some(ImportedPkg::{ name: node.name, tc: cr.tc })
       if cr.diagnostics.length() > 0 {
@@ -11609,7 +12116,7 @@ fn drv_ws_diagnostics_cached(
         pkg_has_err[k] = true
       } else {
         let pionsig = emit_pionsig(cr.pkg)
-        sig_hashes.set(node.name, sha256_hex(pionsig))
+        sig_hashes.set(node.name, drv_effective_sig_hash(pionsig, node, sig_hashes))
         if !any_dep_err {
           let pionstub = emit_pion_stub(cr.pkg)
           let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
@@ -11729,6 +12236,13 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
     Err(e) => return drv_cmd_fail(world, as_json, e)
     Ok(m) => m
   }
+  if mf.is_workspace && mf.name.length() == 0 {
+    return drv_cmd_fail(
+      world,
+      as_json,
+      "cannot run `pionc add` on a virtual workspace root; pass a member package directory",
+    )
+  }
   if mf.name == name {
     return drv_cmd_fail(world, as_json, "package `" + name + "` cannot depend on itself")
   }
@@ -11736,7 +12250,7 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
   let mut source = ""
   let mut location = ""
   let dep = if path.length() > 0 {
-    let dep_dir = drv_resolve_rel_path(root_dir, path)
+    let dep_dir = drv_resolve_rel_path(drv_canon_dir(world, root_dir), path)
     if !fs_exists(world, drv_join_path(dep_dir, "pion.toml")) {
       return drv_cmd_fail(world, as_json, "no pion.toml in " + dep_dir)
     }
@@ -11770,12 +12284,24 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
     Err(e) => return drv_cmd_fail(world, as_json, "rewritten pion.toml does not parse: " + e)
     Ok(_) => ()
   }
-  let lock_path = drv_join_path(drv_normalize_path(root_dir), "pion.lock")
+  let enclosing_ws = if mf.is_workspace {
+    Some(DrvEnclosingWs::{
+      root_dir: drv_abs_path(world, root_dir),
+      manifest: mf,
+    })
+  } else {
+    drv_find_enclosing_workspace(world, root_dir)
+  }
+  let lock_base = match enclosing_ws {
+    Some(ws) => ws.root_dir
+    None => drv_normalize_path(root_dir)
+  }
+  let lock_path = drv_join_path(lock_base, "pion.lock")
   let lock_existed = fs_exists(world, lock_path)
   let lock_text = if lock_existed {
     match fs_read(world, lock_path) {
       Ok(t) => t
-      Err(_) => ""
+      Err(e) => return drv_cmd_fail(world, as_json, "failed to read " + lock_path + ": " + e)
     }
   } else {
     ""
@@ -11784,32 +12310,62 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
   if changed && !drv_write_text_atomic(world, mf_path, new_text) {
     return drv_cmd_fail(world, as_json, "failed to write " + mf_path)
   }
-  let ws = match drv_load_workspace_ex(world, root_dir, false, name) {
+  let unlock_dep : Option[ManifestDep] = if manifest_dep_is_git(dep) {
+    Some(dep)
+  } else {
+    None
+  }
+  let ws = match drv_load_workspace_unlock_dep(world, lock_base, false, unlock_dep) {
     Err(e) => {
-      drv_restore_file(world, mf_path, true, text)
-      drv_restore_file(world, lock_path, lock_existed, lock_text)
-      return drv_cmd_fail(world, as_json, e)
+      let mut msg = e
+      if changed && !drv_restore_file(world, mf_path, true, text) {
+        msg = msg + "; failed to restore " + mf_path
+      }
+      if !drv_restore_file(world, lock_path, lock_existed, lock_text) {
+        msg = msg + "; failed to restore " + lock_path
+      }
+      return drv_cmd_fail(world, as_json, msg)
     }
     Ok(v) => v
   }
+  let root_canon = drv_canon_dir(world, root_dir)
   let mut found = false
   let mut ni = 0
   while ni < ws.nodes.length() {
-    if ws.nodes[ni].name == name {
-      found = true
+    if drv_canon_dir(world, ws.nodes[ni].dir) == root_canon {
+      let mut ai = 0
+      while ai < ws.nodes[ni].dep_aliases.length() {
+        if ws.nodes[ni].dep_aliases[ai] == name {
+          found = true
+          break
+        }
+        ai = ai + 1
+      }
     }
     ni = ni + 1
   }
   if !found {
-    drv_restore_file(world, mf_path, true, text)
-    drv_restore_file(world, lock_path, lock_existed, lock_text)
-    return drv_cmd_fail(
-      world,
-      as_json,
-      "the pion.toml at " + location + " does not declare package `" + name + "`",
-    )
+    let mut msg = "the pion.toml at " + location + " does not declare package `" + name + "`"
+    if changed && !drv_restore_file(world, mf_path, true, text) {
+      msg = msg + "; failed to restore " + mf_path
+    }
+    if !drv_restore_file(world, lock_path, lock_existed, lock_text) {
+      msg = msg + "; failed to restore " + lock_path
+    }
+    return drv_cmd_fail(world, as_json, msg)
   }
-  let locked = lock_rev_of(ws.lock, name)
+  let locked = if manifest_dep_is_git(dep) {
+    let probe = lock_entry_new(
+      manifest_dep_pkg_name(dep),
+      dep.git,
+      manifest_dep_ref(dep),
+      "",
+      dep.subdir,
+    )
+    lock_rev_for_entry(ws.lock, probe)
+  } else {
+    ""
+  }
   if as_json {
     let sb = StringBuilder()
     sb.write_string("{\"ok\":true,\"action\":\"add\",\"package\":")
@@ -11895,6 +12451,8 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
   } else {
     drv_find_enclosing_workspace(world, root_dir)
   }
+  let mut target_dep_before : Option[ManifestDep] = None
+  let mut target_ws_dep_name = ""
   if pkg.length() > 0 {
     let mut known = false
     let mut di = 0
@@ -11903,7 +12461,25 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
         known = true
         let resolved_d = if mf.deps[di].workspace {
           match enclosing_ws {
-            Some(ws) =>
+            Some(ws) => {
+              let mut wdi = 0
+              while wdi < ws.manifest.workspace_deps.length() {
+                if ws.manifest.workspace_deps[wdi].name == mf.deps[di].name {
+                  target_ws_dep_name = ws.manifest.workspace_deps[wdi].name
+                  break
+                }
+                wdi = wdi + 1
+              }
+              if target_ws_dep_name.length() == 0 && mf.deps[di].package.length() > 0 {
+                wdi = 0
+                while wdi < ws.manifest.workspace_deps.length() {
+                  if ws.manifest.workspace_deps[wdi].name == mf.deps[di].package {
+                    target_ws_dep_name = ws.manifest.workspace_deps[wdi].name
+                    break
+                  }
+                  wdi = wdi + 1
+                }
+              }
               match manifest_resolve_ws_dep(
                 mf.deps[di],
                 ws.root_dir,
@@ -11913,6 +12489,7 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
                 Ok(rd) => rd
                 Err(e) => return drv_cmd_fail(world, as_json, e)
               }
+            }
             None =>
               return drv_cmd_fail(
                 world,
@@ -11928,6 +12505,7 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
         if !manifest_dep_is_git(resolved_d) {
           return drv_cmd_fail(world, as_json, "`" + pkg + "` is a path dependency; nothing to update")
         }
+        target_dep_before = Some(resolved_d)
       }
       di = di + 1
     }
@@ -11939,6 +12517,8 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
           if !manifest_dep_is_git(mf.workspace_deps[wi]) {
             return drv_cmd_fail(world, as_json, "`" + pkg + "` is a path dependency; nothing to update")
           }
+          target_dep_before = Some(mf.workspace_deps[wi])
+          target_ws_dep_name = mf.workspace_deps[wi].name
         }
         wi = wi + 1
       }
@@ -11947,18 +12527,101 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
       return drv_cmd_fail(world, as_json, "no dependency `" + pkg + "` in " + mf_path)
     }
   }
+  let mut ws_mf_path = ""
+  let mut ws_text = ""
+  if !mf.is_workspace {
+    match enclosing_ws {
+      Some(ws) => {
+        ws_mf_path = drv_join_path(ws.root_dir, "pion.toml")
+        ws_text = match fs_read(world, ws_mf_path) {
+          Err(e) => return drv_cmd_fail(world, as_json, "failed to read " + ws_mf_path + ": " + e)
+          Ok(t) => t
+        }
+      }
+      None => ()
+    }
+  }
   let fetched : Map[String, Bool] = Map([])
   let mut new_text = text
+  let mut new_ws_text = ws_text
+  let mut target_dep_after : Option[ManifestDep] = target_dep_before
+  let reg_old_deps : Array[ManifestDep] = []
+  let reg_new_deps : Array[ManifestDep] = []
   let mut di = 0
   while di < mf.deps.length() {
     let d = mf.deps[di]
-    if d.registry.length() > 0 && (pkg.length() == 0 || d.name == pkg) {
-      match drv_registry_lookup(world, d.registry, d.name, fetched) {
+    if !d.workspace && d.registry.length() > 0 && (pkg.length() == 0 || d.name == pkg) {
+      let real_pkg = manifest_dep_pkg_name(d)
+      match drv_registry_lookup(world, d.registry, real_pkg, fetched) {
         Err(e) => return drv_cmd_fail(world, as_json, e)
-        Ok(nd) => new_text = manifest_set_dependency(new_text, nd)
+        Ok(nd) => {
+          let kept_nd = ManifestDep::{
+            name: d.name,
+            package: d.package,
+            path: nd.path,
+            git: nd.git,
+            tag: nd.tag,
+            rev: nd.rev,
+            branch: nd.branch,
+            subdir: nd.subdir,
+            registry: nd.registry,
+            version: nd.version,
+            workspace: false,
+          }
+          new_text = manifest_set_dependency(new_text, kept_nd)
+          reg_old_deps.push(d)
+          reg_new_deps.push(kept_nd)
+          if pkg.length() > 0 && d.name == pkg {
+            target_dep_after = Some(kept_nd)
+          }
+        }
       }
     }
     di = di + 1
+  }
+  match enclosing_ws {
+    Some(ws) => {
+      let mut wi = 0
+      while wi < ws.manifest.workspace_deps.length() {
+        let wd = ws.manifest.workspace_deps[wi]
+        let want_wd = wd.registry.length() > 0 &&
+          (pkg.length() == 0 ||
+          (target_ws_dep_name.length() > 0 && wd.name == target_ws_dep_name))
+        if want_wd {
+          let real_pkg = manifest_dep_pkg_name(wd)
+          match drv_registry_lookup(world, wd.registry, real_pkg, fetched) {
+            Err(e) => return drv_cmd_fail(world, as_json, e)
+            Ok(nd) => {
+              let kept_wd = ManifestDep::{
+                name: wd.name,
+                package: wd.package,
+                path: nd.path,
+                git: nd.git,
+                tag: nd.tag,
+                rev: nd.rev,
+                branch: nd.branch,
+                subdir: nd.subdir,
+                registry: nd.registry,
+                version: nd.version,
+                workspace: false,
+              }
+              if mf.is_workspace {
+                new_text = manifest_set_workspace_dependency(new_text, kept_wd)
+              } else {
+                new_ws_text = manifest_set_workspace_dependency(new_ws_text, kept_wd)
+              }
+              reg_old_deps.push(wd)
+              reg_new_deps.push(kept_wd)
+              if pkg.length() > 0 {
+                target_dep_after = Some(kept_wd)
+              }
+            }
+          }
+        }
+        wi = wi + 1
+      }
+    }
+    None => ()
   }
   let lock_base = match enclosing_ws {
     Some(ws) => ws.root_dir
@@ -11969,7 +12632,7 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
   let lock_text = if lock_existed {
     match fs_read(world, lock_path) {
       Ok(t) => t
-      Err(_) => ""
+      Err(e) => return drv_cmd_fail(world, as_json, "failed to read " + lock_path + ": " + e)
     }
   } else {
     ""
@@ -11982,30 +12645,70 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
   } else {
     []
   }
-  if new_text != text && !drv_write_text_atomic(world, mf_path, new_text) {
+  let mf_changed = new_text != text
+  if mf_changed && !drv_write_text_atomic(world, mf_path, new_text) {
     return drv_cmd_fail(world, as_json, "failed to write " + mf_path)
   }
-  let ws = match drv_load_workspace_ex(world, root_dir, pkg.length() == 0, pkg) {
+  let ws_mf_changed = !mf.is_workspace && ws_mf_path.length() > 0 && new_ws_text != ws_text
+  if ws_mf_changed && !drv_write_text_atomic(world, ws_mf_path, new_ws_text) {
+    let mut msg = "failed to write " + ws_mf_path
+    if mf_changed && !drv_restore_file(world, mf_path, true, text) {
+      msg = msg + "; failed to restore " + mf_path
+    }
+    return drv_cmd_fail(world, as_json, msg)
+  }
+  let load_dir = match enclosing_ws {
+    Some(ws) => ws.root_dir
+    None => root_dir
+  }
+  let unlock_target = match target_dep_after {
+    Some(_) => target_dep_after
+    None => target_dep_before
+  }
+  let ws = match drv_load_workspace_unlock_dep(
+    world,
+    load_dir,
+    pkg.length() == 0,
+    unlock_target,
+  ) {
     Err(e) => {
-      drv_restore_file(world, mf_path, true, text)
-      drv_restore_file(world, lock_path, lock_existed, lock_text)
-      return drv_cmd_fail(world, as_json, e)
+      let mut msg = e
+      if mf_changed && !drv_restore_file(world, mf_path, true, text) {
+        msg = msg + "; failed to restore " + mf_path
+      }
+      if ws_mf_changed && !drv_restore_file(world, ws_mf_path, true, ws_text) {
+        msg = msg + "; failed to restore " + ws_mf_path
+      }
+      if !drv_restore_file(world, lock_path, lock_existed, lock_text) {
+        msg = msg + "; failed to restore " + lock_path
+      }
+      return drv_cmd_fail(world, as_json, msg)
     }
     Ok(v) => v
   }
   let diags = drv_ws_diagnostics_cached(world, ws.nodes)
   if diags.length() > 0 {
-    drv_restore_file(world, mf_path, true, text)
-    drv_restore_file(world, lock_path, lock_existed, lock_text)
+    let mut err_msg = "workspace does not check after update; pion.toml and pion.lock restored"
+    if mf_changed && !drv_restore_file(world, mf_path, true, text) {
+      err_msg = err_msg + "; failed to restore " + mf_path
+    }
+    if ws_mf_changed && !drv_restore_file(world, ws_mf_path, true, ws_text) {
+      err_msg = err_msg + "; failed to restore " + ws_mf_path
+    }
+    if !drv_restore_file(world, lock_path, lock_existed, lock_text) {
+      err_msg = err_msg + "; failed to restore " + lock_path
+    }
     if as_json {
       io_println(
         world,
-        "{\"ok\":false,\"error\":\"workspace does not check after update; pion.toml and pion.lock restored\",\"check\":" +
+        "{\"ok\":false,\"error\":" +
+        json_quote(err_msg) +
+        ",\"check\":" +
         check_result_to_json(diags) +
         "}",
       )
     } else {
-      io_eprintln(world, "error: workspace does not check after update; pion.toml and pion.lock restored")
+      io_eprintln(world, "error: " + err_msg)
       io_eprintln(world, check_result_to_json(diags))
     }
     return 1
@@ -12016,16 +12719,47 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
   let mut li = 0
   while li < ws.lock.length() {
     let e = ws.lock[li]
-    if pkg.length() == 0 || e.name == pkg {
-      let from = lock_rev_of(old_lock, e.name)
+    let matched_target = match target_dep_after {
+      None => true
+      Some(td) =>
+        lock_entry_pkg_name(e) == manifest_dep_pkg_name(td) &&
+        pkg_normalize_git_url(e.git) == pkg_normalize_git_url(td.git) &&
+        pkg_normalize_subdir(e.subdir) == pkg_normalize_subdir(td.subdir) &&
+        e.reference == manifest_dep_ref(td)
+    }
+    if matched_target {
+      let mut from = lock_rev_for_entry(old_lock, e)
+      if from.length() == 0 {
+        let mut rui = 0
+        while rui < reg_new_deps.length() {
+          let rnd = reg_new_deps[rui]
+          if manifest_dep_pkg_name(rnd) == lock_entry_pkg_name(e) &&
+            pkg_normalize_git_url(rnd.git) == pkg_normalize_git_url(e.git) &&
+            pkg_normalize_subdir(rnd.subdir) == pkg_normalize_subdir(e.subdir) &&
+            manifest_dep_ref(rnd) == e.reference {
+            let rod = reg_old_deps[rui]
+            let probe = lock_entry_new(
+              manifest_dep_pkg_name(rod),
+              rod.git,
+              manifest_dep_ref(rod),
+              "",
+              rod.subdir,
+            )
+            from = lock_rev_for_entry(old_lock, probe)
+            break
+          }
+          rui = rui + 1
+        }
+      }
       let upd = from != e.rev
+      let report_name = if pkg.length() > 0 { pkg } else { e.name }
       if as_json {
         if !first {
           sb.write_string(",")
         }
         first = false
         sb.write_string("{\"name\":")
-        sb.write_string(json_quote(e.name))
+        sb.write_string(json_quote(report_name))
         sb.write_string(",\"ref\":")
         sb.write_string(json_quote(e.reference))
         sb.write_string(",\"from\":")
@@ -12039,7 +12773,7 @@ fn drv_run_update_cmd(world : World, args : Array[String]) -> Int {
         io_println(
           world,
           (if upd { "updated " } else { "unchanged " }) +
-          e.name +
+          report_name +
           " " +
           e.reference +
           " " +
@@ -12122,13 +12856,15 @@ fn drv_sort_byte_edits_desc(edits : Array[DrvByteEdit]) -> Unit {
 fn drv_collect_check_diags(
   world : World,
   targets : Array[String],
+  locked : Bool,
+  offline : Bool,
 ) -> Result[Array[Diagnostic], String] {
   if targets.length() == 1 {
     match drv_detect_manifest_dir(world, targets[0]) {
       Some(root_dir) =>
-        match drv_load_workspace_nodes(world, root_dir) {
+        match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
           Err(msg) => return Err(msg)
-          Ok(nodes) => return Ok(drv_ws_diagnostics_cached(world, nodes))
+          Ok(ws) => return Ok(drv_ws_diagnostics_cached(world, ws.nodes))
         }
       None => ()
     }
@@ -12159,12 +12895,14 @@ fn drv_run_check_fix_cmd(
   world : World,
   targets : Array[String],
   as_json : Bool,
+  locked : Bool,
+  offline : Bool,
 ) -> Int {
   let modified_files : Array[String] = []
   let mut total_applied = 0
   let mut round = 0
   while round < 3 {
-    let diags = match drv_collect_check_diags(world, targets) {
+    let diags = match drv_collect_check_diags(world, targets, locked, offline) {
       Err(msg) => return drv_cmd_fail(world, as_json, msg)
       Ok(ds) => ds
     }
@@ -12273,7 +13011,7 @@ fn drv_run_check_fix_cmd(
     }
     round = round + 1
   }
-  let remaining = match drv_collect_check_diags(world, targets) {
+  let remaining = match drv_collect_check_diags(world, targets, locked, offline) {
     Err(msg) => return drv_cmd_fail(world, as_json, msg)
     Ok(ds) => ds
   }
@@ -13061,6 +13799,14 @@ fn drv_run_remove_cmd(world : World, args : Array[String]) -> Int {
       "no dependency `" + name + "` in " + mf_path,
     )
   }
+  let enclosing_ws = if mf.is_workspace {
+    Some(DrvEnclosingWs::{
+      root_dir: drv_abs_path(world, root_dir),
+      manifest: mf,
+    })
+  } else {
+    drv_find_enclosing_workspace(world, root_dir)
+  }
   let new_text = drv_manifest_remove_dependency(text, name)
   match parse_pion_toml(new_text) {
     Err(e) =>
@@ -13074,33 +13820,24 @@ fn drv_run_remove_cmd(world : World, args : Array[String]) -> Int {
   if !drv_write_text_atomic(world, mf_path, new_text) {
     return drv_cmd_fail(world, as_json, "failed to write " + mf_path)
   }
-  let lock_path = drv_join_path(drv_normalize_path(root_dir), "pion.lock")
+  let lock_base = match enclosing_ws {
+    Some(ws) => ws.root_dir
+    None => drv_normalize_path(root_dir)
+  }
+  let lock_path = drv_join_path(lock_base, "pion.lock")
   if fs_exists(world, lock_path) {
-    match drv_load_workspace_ex(world, root_dir, false, "") {
+    // Only prune pion.lock when the remaining dependency graph loads cleanly;
+    // when the graph is incomplete/broken, keep all existing lock entries intact.
+    // However, if writing pion.lock itself fails, roll back pion.toml and fail.
+    match drv_load_workspace_ex(world, lock_base, false, "") {
       Ok(_) => ()
-      Err(_) =>
-        // Fallback: filter out the removed package from pion.lock directly.
-        match fs_read(world, lock_path) {
-          Ok(ltxt) =>
-            match parse_pion_lock(ltxt) {
-              Ok(entries) => {
-                let kept : Array[LockEntry] = []
-                let mut li = 0
-                while li < entries.length() {
-                  if entries[li].name != name {
-                    kept.push(entries[li])
-                  }
-                  li = li + 1
-                }
-                let _ = drv_write_text_atomic(
-                  world,
-                  lock_path,
-                  format_pion_lock(kept),
-                )
-              }
-              Err(_) => ()
-            }
-          Err(_) => ()
+      Err(e) =>
+        if e == "failed to write " + lock_path || drv_starts_with(e, "failed to write ") {
+          let mut msg = e
+          if !drv_restore_file(world, mf_path, true, text) {
+            msg = msg + "; failed to restore " + mf_path
+          }
+          return drv_cmd_fail(world, as_json, msg)
         }
     }
   }
@@ -13144,17 +13881,17 @@ fn drv_is_valid_c_ident(s : String) -> Bool {
 ///|
 fn drv_usage_text() -> String {
   "usage:\n" +
-  "  pionc check [--fix] [--json] [input1 ...]\n" +
-  "  pionc query defs|sig|callers|deps|analyze [--json] [input1 ...]\n" +
+  "  pionc check [--fix] [--locked] [--offline] [--json] [input1 ...]\n" +
+  "  pionc query defs|sig|callers|deps|analyze [--locked] [--offline] [--json] [input1 ...]\n" +
   "  pionc emit-sig <input1> [input2 ...]\n" +
-  "  pionc build [--package <name>|-p <name>] [--release] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--emit-web-rt [path]] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
-  "  pionc run [--package <name>|-p <name>] [--release] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
+  "  pionc build [--package <name>|-p <name>] [--release] [--locked] [--offline] [--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32] [--wasm-names] [--emit-web-rt [path]] [--sysroot <dir>] [--entry-symbol <name>] [--no-main] [--emit-ssa <path>] [--emit-asm <path>] [--emit-obj <path>] [--emit-staticlib <path.a>] [--emit-cdylib <path.so|.dylib>] [--jobs <n>] [-l <lib>|--link <lib>] [-o <out>] [input1 ...]\n" +
+  "  pionc run [--package <name>|-p <name>] [--release] [--locked] [--offline] [--target <target>] [--wasm-names] [-l <lib>|--link <lib>] [input] [-- args...]\n" +
   "  pionc fmt [--check] [--json] [input1 ...]\n" +
-  "  pionc test [--json] [--package <name>|-p <name>] [--deps|--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
+  "  pionc test [--json] [--locked] [--offline] [--package <name>|-p <name>] [--deps|--no-deps|--only-pkg] [--filter <name>] [--jobs <n>] [-l <lib>|--link <lib>] [input]\n" +
   "  pionc doc [--json] [input1 ...]\n" +
   "  pionc extract-lean --out <dir> [--pkg <name>] [--json] [input]\n" +
   "  pionc init [--template cli|service|invar-app] [--json] <dir>\n" +
-  "  pionc fetch [--json] [dir]\n" +
+  "  pionc fetch [--locked] [--offline] [--json] [dir]\n" +
   "  pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]\n" +
   "  pionc remove [--json] <name> [dir]\n" +
   "  pionc update [--json] [pkg] [dir]\n" +
@@ -13237,14 +13974,20 @@ pub fn main(world : World) -> Int {
   }
   if cmd == "fetch" {
     let mut dir = ""
+    let mut locked = false
+    let mut offline = false
     let mut i = 2
     while i < args.length() {
-      if args[i] != "--json" {
+      if args[i] == "--locked" {
+        locked = true
+      } else if args[i] == "--offline" {
+        offline = true
+      } else if args[i] != "--json" {
         dir = args[i]
       }
       i = i + 1
     }
-    return drv_run_fetch_cmd(world, if dir.length() > 0 { dir } else { "." })
+    return drv_run_fetch_cmd(world, if dir.length() > 0 { dir } else { "." }, locked, offline)
   }
   if cmd == "init" {
     let mut as_json = false
@@ -13278,6 +14021,8 @@ pub fn main(world : World) -> Int {
   if cmd == "check" {
     let mut as_json = false
     let mut do_fix = false
+    let mut locked = false
+    let mut offline = false
     let targets : Array[String] = []
     let mut i = 2
     while i < args.length() {
@@ -13285,6 +14030,10 @@ pub fn main(world : World) -> Int {
         as_json = true
       } else if args[i] == "--fix" {
         do_fix = true
+      } else if args[i] == "--locked" {
+        locked = true
+      } else if args[i] == "--offline" {
+        offline = true
       } else {
         targets.push(args[i])
       }
@@ -13302,18 +14051,18 @@ pub fn main(world : World) -> Int {
       }
     }
     if do_fix {
-      return drv_run_check_fix_cmd(world, targets, as_json)
+      return drv_run_check_fix_cmd(world, targets, as_json, locked, offline)
     }
     if targets.length() == 1 {
       match drv_detect_manifest_dir(world, targets[0]) {
         Some(root_dir) =>
-          match drv_load_workspace_nodes(world, root_dir) {
+          match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
             Err(msg) => {
               io_eprintln(world, "error: " + msg)
               return 1
             }
-            Ok(nodes) => {
-              let all_diags = drv_ws_diagnostics_cached(world, nodes)
+            Ok(ws) => {
+              let all_diags = drv_ws_diagnostics_cached(world, ws.nodes)
               io_println(world, check_result_to_json(all_diags))
               if all_diags.length() > 0 {
                 return 1
@@ -13349,10 +14098,16 @@ pub fn main(world : World) -> Int {
       return 1
     }
     let kind = args[2]
+    let mut locked = false
+    let mut offline = false
     let targets : Array[String] = []
     let mut i = 3
     while i < args.length() {
-      if args[i] != "--json" {
+      if args[i] == "--locked" {
+        locked = true
+      } else if args[i] == "--offline" {
+        offline = true
+      } else if args[i] != "--json" {
         targets.push(args[i])
       }
       i = i + 1
@@ -13372,12 +14127,13 @@ pub fn main(world : World) -> Int {
       if targets.length() == 1 {
         match drv_detect_manifest_dir(world, targets[0]) {
           Some(root_dir) =>
-            match drv_load_workspace_nodes(world, root_dir) {
+            match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
               Err(msg) => {
                 io_eprintln(world, "error: " + msg)
                 return 1
               }
-              Ok(nodes) => {
+              Ok(ws) => {
+                let nodes = ws.nodes
                 let names : Array[String] = []
                 let dep_lists : Array[Array[String]] = []
                 let mut ni = 0
@@ -13391,17 +14147,55 @@ pub fn main(world : World) -> Int {
                   io_println(world, query_analyze_packages_json([], topo.diagnostics))
                   return 1
                 }
+                let decl_counts : Map[String, Int] = Map([])
+                let mut dci = 0
+                while dci < nodes.length() {
+                  let dn = nodes[dci].declared_name
+                  let prev = match decl_counts.get(dn) {
+                    Some(c) => c
+                    None => 0
+                  }
+                  decl_counts.set(dn, prev + 1)
+                  dci = dci + 1
+                }
+                let canon_to_aname : Map[String, String] = Map([])
+                dci = 0
+                while dci < nodes.length() {
+                  let nd = nodes[dci]
+                  let aname = match decl_counts.get(nd.declared_name) {
+                    Some(c) => if c == 1 { nd.declared_name } else { nd.name }
+                    None => nd.name
+                  }
+                  canon_to_aname.set(nd.name, aname)
+                  dci = dci + 1
+                }
                 let imported : Array[ImportedPkg] = []
                 let checked_pkgs : Array[CheckedPackage] = []
                 let all_diags : Array[Diagnostic] = []
                 let mut k = 0
                 while k < topo.order.length() {
                   let node = nodes[topo.order[k]]
-                  let cr = check_source_files_with_imports_ex(
-                    node.name,
+                  let aname = match canon_to_aname.get(node.name) {
+                    Some(v) => v
+                    None => node.name
+                  }
+                  let a_dep_targets : Array[String] = []
+                  let mut adi = 0
+                  while adi < node.deps.length() {
+                    let dt = match canon_to_aname.get(node.deps[adi]) {
+                      Some(v) => v
+                      None => node.deps[adi]
+                    }
+                    a_dep_targets.push(dt)
+                    adi = adi + 1
+                  }
+                  let cr = check_source_files_with_imports_mapped(
+                    aname,
                     node.paths,
                     node.sources,
                     imported,
+                    node.dep_aliases,
+                    a_dep_targets,
                     true,
                     true,
                   )
@@ -13410,7 +14204,7 @@ pub fn main(world : World) -> Int {
                     all_diags.push(cr.diagnostics[di])
                     di = di + 1
                   }
-                  imported.push(ImportedPkg::{ name: node.name, tc: cr.tc })
+                  imported.push(ImportedPkg::{ name: aname, tc: cr.tc })
                   checked_pkgs.push(cr)
                   k = k + 1
                 }
@@ -13464,17 +14258,18 @@ pub fn main(world : World) -> Int {
     if kind != "deps" && targets.length() == 1 {
       match drv_detect_manifest_dir(world, targets[0]) {
         Some(root_dir) =>
-          match drv_load_workspace_nodes(world, root_dir) {
+          match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
             Err(msg) => {
               io_eprintln(world, "error: " + msg)
               return 1
             }
-            Ok(nodes) => {
+            Ok(ws) => {
+              let nodes = ws.nodes
               let pkgs : Array[Package] = []
               let mut ni = 0
               while ni < nodes.length() {
                 let node = nodes[ni]
-                pkgs.push(parse_package(node.name, node.paths, node.sources))
+                pkgs.push(parse_package(node.declared_name, node.paths, node.sources))
                 ni = ni + 1
               }
               match query_workspace_json(kind, pkgs) {
@@ -13523,12 +14318,13 @@ pub fn main(world : World) -> Int {
     if kind == "deps" && targets.length() == 1 {
       match drv_detect_manifest_dir(world, targets[0]) {
         Some(root_dir) =>
-          match drv_load_workspace_nodes(world, root_dir) {
+          match drv_load_workspace_opts(world, root_dir, locked, offline, "") {
             Err(msg) => {
               io_eprintln(world, "error: " + msg)
               return 1
             }
-            Ok(nodes) => {
+            Ok(ws) => {
+              let nodes = ws.nodes
               let names : Array[String] = []
               let dep_lists : Array[Array[String]] = []
               let mut ni = 0
@@ -13548,9 +14344,9 @@ pub fn main(world : World) -> Int {
               let mut k = 0
               while k < topo.order.length() {
                 let node = nodes[topo.order[k]]
-                let pkg = parse_package(node.name, node.paths, node.sources)
-                ord_names.push(node.name)
-                ord_deps.push(node.deps)
+                let pkg = parse_package(node.declared_name, node.paths, node.sources)
+                ord_names.push(node.declared_name)
+                ord_deps.push(node.dep_aliases)
                 ord_hashes.push(sig_hash_hex(emit_pionsig(pkg)))
                 k = k + 1
               }
@@ -13620,6 +14416,8 @@ pub fn main(world : World) -> Int {
     let mut emit_web_rt_path = ""
     let mut entry_symbol = ""
     let mut no_main = false
+    let mut locked = false
+    let mut offline = false
     let libs : Array[String] = []
     let targets : Array[String] = []
     let mut i = 2
@@ -13632,6 +14430,10 @@ pub fn main(world : World) -> Int {
       }
       if a == "--release" {
         release = true
+      } else if a == "--locked" {
+        locked = true
+      } else if a == "--offline" {
+        offline = true
       } else if a == "--wasm-names" {
         wasm_names = true
       } else if a == "--emit-web-rt" {
@@ -13795,6 +14597,8 @@ pub fn main(world : World) -> Int {
       entry_symbol,
       no_main,
       web_rt_dst,
+      locked,
+      offline,
     ) {
       Ok(_) => {
         if emit_web_rt {
@@ -13816,6 +14620,8 @@ pub fn main(world : World) -> Int {
   } else if cmd == "run" {
     let mut release = false
     let mut wasm_names = false
+    let mut locked = false
+    let mut offline = false
     let mut target_override = ""
     let mut only_pkg = ""
     let mut target = ""
@@ -13838,6 +14644,10 @@ pub fn main(world : World) -> Int {
         after_sep = true
       } else if a == "--release" && target == "" {
         release = true
+      } else if a == "--locked" && target == "" {
+        locked = true
+      } else if a == "--offline" && target == "" {
+        offline = true
       } else if a == "--wasm-names" && target == "" {
         wasm_names = true
       } else if (a == "--package" || a == "-p") &&
@@ -13910,6 +14720,8 @@ pub fn main(world : World) -> Int {
       "",
       false,
       "",
+      locked,
+      offline,
     ) {
       Err(msg) => {
         io_eprintln(world, msg)
@@ -13969,6 +14781,8 @@ pub fn main(world : World) -> Int {
     let mut only_pkg = ""
     let mut explicit_no_deps = false
     let mut explicit_deps = false
+    let mut locked = false
+    let mut offline = false
     let mut jobs = drv_default_jobs(world)
     let libs : Array[String] = []
     let targets : Array[String] = []
@@ -13982,6 +14796,10 @@ pub fn main(world : World) -> Int {
       }
       if a == "--json" {
         as_json = true
+      } else if a == "--locked" {
+        locked = true
+      } else if a == "--offline" {
+        offline = true
       } else if a == "--deps" {
         explicit_deps = true
       } else if a == "--no-deps" || a == "--only-pkg" {
@@ -14035,7 +14853,7 @@ pub fn main(world : World) -> Int {
       }
     }
     let no_deps = !explicit_deps
-    return drv_run_tests_cmd(world, targets, as_json, filter, libs, only_pkg, no_deps, jobs)
+    return drv_run_tests_cmd(world, targets, as_json, filter, libs, only_pkg, no_deps, jobs, locked, offline)
   } else if cmd == "doc" {
     let mut as_json = false
     let targets : Array[String] = []
@@ -14129,10 +14947,42 @@ fn drv_run_extract_lean_cmd(world : World, args : Array[String]) -> Int {
               io_println(world, check_result_to_json(topo.diagnostics))
               return 1
             }
-            // With `--pkg`, only that package and its transitive dependencies.
+            // With `--pkg`, resolve by exact canon_id or unique declared_name,
+            // then keep only that package and its transitive dependencies.
             let keep : Map[String, Bool] = Map([])
+            let mut target_canon = ""
             if only_pkg.length() > 0 {
-              let stack : Array[String] = [only_pkg]
+              let mut exact = ""
+              let decl_matches : Array[String] = []
+              let mut qi = 0
+              while qi < nodes.length() {
+                if nodes[qi].name == only_pkg {
+                  exact = nodes[qi].name
+                  break
+                }
+                if nodes[qi].declared_name == only_pkg {
+                  decl_matches.push(nodes[qi].name)
+                }
+                qi = qi + 1
+              }
+              if exact.length() > 0 {
+                target_canon = exact
+              } else if decl_matches.length() == 1 {
+                target_canon = decl_matches[0]
+              } else if decl_matches.length() > 1 {
+                return drv_cmd_fail(
+                  world,
+                  as_json,
+                  "ambiguous package `" +
+                  only_pkg +
+                  "` (matches: " +
+                  drv_join_comma(decl_matches) +
+                  "); pass one of the canonical ids to --pkg",
+                )
+              } else {
+                return drv_cmd_fail(world, as_json, "unknown package `" + only_pkg + "`")
+              }
+              let stack : Array[String] = [target_canon]
               while stack.length() > 0 {
                 let n = match stack.pop() {
                   Some(x) => x
@@ -14154,23 +15004,98 @@ fn drv_run_extract_lean_cmd(world : World, args : Array[String]) -> Int {
                   q = q + 1
                 }
               }
-              if !l_name_in(names, only_pkg) {
-                return drv_cmd_fail(world, as_json, "unknown package `" + only_pkg + "`")
+            }
+            // Pass 1: count ASCII-lowercased Lean module name occurrences across the extracted subgraph
+            // so case-insensitive filesystems (macOS/Windows) never collide on directory names.
+            let mod_counts : Map[String, Int] = Map([])
+            let mut ci = 0
+            while ci < topo.order.length() {
+              let node = nodes[topo.order[ci]]
+              if only_pkg.length() == 0 || keep.contains(node.name) {
+                let mkey = drv_ascii_lower(lean_module_name(node.declared_name))
+                let prev = match mod_counts.get(mkey) {
+                  Some(n) => n
+                  None => 0
+                }
+                mod_counts.set(mkey, prev + 1)
               }
+              ci = ci + 1
+            }
+            // Pass 2: reserve clean declared names for all case-insensitively unique Lean module names.
+            let lean_pkg_names : Map[String, String] = Map([])
+            let used_lean_mods : Map[String, Bool] = Map([])
+            ci = 0
+            while ci < topo.order.length() {
+              let node = nodes[topo.order[ci]]
+              if only_pkg.length() == 0 || keep.contains(node.name) {
+                let mkey = drv_ascii_lower(lean_module_name(node.declared_name))
+                let cnt = match mod_counts.get(mkey) {
+                  Some(n) => n
+                  None => 0
+                }
+                if cnt == 1 {
+                  lean_pkg_names.set(node.name, node.declared_name)
+                  used_lean_mods.set(mkey, true)
+                }
+              }
+              ci = ci + 1
+            }
+            // Pass 3: deterministically assign remaining colliding nodes without colliding
+            // (even case-insensitively) with any reserved or previously assigned module name.
+            ci = 0
+            while ci < topo.order.length() {
+              let node = nodes[topo.order[ci]]
+              if (only_pkg.length() == 0 || keep.contains(node.name)) &&
+                !lean_pkg_names.contains(node.name) {
+                let mut cand = node.name
+                let mut suffix = 2
+                while used_lean_mods.contains(drv_ascii_lower(lean_module_name(cand))) {
+                  cand = node.name + "__" + suffix.to_string()
+                  suffix = suffix + 1
+                }
+                used_lean_mods.set(drv_ascii_lower(lean_module_name(cand)), true)
+                lean_pkg_names.set(node.name, cand)
+              }
+              ci = ci + 1
             }
             let imported : Array[ImportedPkg] = []
             let mut k = 0
             while k < topo.order.length() {
               let node = nodes[topo.order[k]]
               if only_pkg.length() == 0 || keep.contains(node.name) {
-                let cr = check_source_files_with_imports(node.name, node.paths, node.sources, imported, true)
+                let lean_name = match lean_pkg_names.get(node.name) {
+                  Some(n) => n
+                  None => node.name
+                }
+                let mapped_deps : Array[String] = []
+                let mut mdi = 0
+                while mdi < node.deps.length() {
+                  let dn = node.deps[mdi]
+                  mapped_deps.push(
+                    match lean_pkg_names.get(dn) {
+                      Some(ln) => ln
+                      None => dn
+                    },
+                  )
+                  mdi = mdi + 1
+                }
+                let cr = check_source_files_with_imports_mapped(
+                  lean_name,
+                  node.paths,
+                  node.sources,
+                  imported,
+                  node.dep_aliases,
+                  mapped_deps,
+                  true,
+                  false,
+                )
                 let mut di = 0
                 while di < cr.diagnostics.length() {
                   diags.push(cr.diagnostics[di])
                   di = di + 1
                 }
-                imported.push(ImportedPkg::{ name: node.name, tc: cr.tc })
-                inputs.push(llbc_input_new(node.name, cr.pkg, cr.tc, only_pkg.length() == 0 || node.name == only_pkg))
+                imported.push(ImportedPkg::{ name: lean_name, tc: cr.tc })
+                inputs.push(llbc_input_new(lean_name, cr.pkg, cr.tc, only_pkg.length() == 0 || node.name == target_canon))
               }
               k = k + 1
             }

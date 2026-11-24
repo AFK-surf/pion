@@ -260,15 +260,17 @@ import "dep_b"
 pub fn main() -> Int { dep_a::a() + dep_b::b() }
 EOF
 
+# 2b. Distinct same-named transitive dependencies now coexist cleanly via canon_id isolation
+"$PIONC" build -o "$TMP_DIR/dup_err/app_bin" "$TMP_DIR/dup_err/app"
 set +e
-DUP_ERR_OUT="$("$PIONC" build -o "$TMP_DIR/dup_err/app_bin" "$TMP_DIR/dup_err/app" 2>&1)"
-DUP_ERR_RC=$?
+"$TMP_DIR/dup_err/app_bin"
+COEXIST_RC=$?
 set -e
-if [ "$DUP_ERR_RC" -eq 0 ] || ! printf '%s' "$DUP_ERR_OUT" | grep -q "duplicate package 'time'"; then
-  echo "FAIL: expected duplicate package error, rc=$DUP_ERR_RC out=$DUP_ERR_OUT" >&2
+if [ "$COEXIST_RC" -ne 3 ]; then
+  echo "FAIL: expected same-name multi-source coexistence exit code 3 (1+2), got rc=$COEXIST_RC" >&2
   exit 1
 fi
-echo "2. Duplicate package unification (root pin -> unified=2,20) + conflict guard -> OK"
+echo "2. Duplicate package unification (root pin -> unified=2,20) + multi-source canon_id coexistence (rc=3) -> OK"
 
 # ----------------------------------------------------------------------------
 # 3. `pionc test dir1 dir2` multi-package directories + mixed-target guard

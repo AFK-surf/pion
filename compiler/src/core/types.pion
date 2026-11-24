@@ -490,6 +490,9 @@ pub struct TypeChecker {
   const_pub : Map[String, Bool]
   scalar_const_exprs : Map[String, Expr]
   import_aliases : Map[String, String]
+  dep_map : Map[String, String]
+  exported_c_syms : Map[String, String]
+  exported_c_sym_names : Array[String]
   imported_pkgs : Map[String, ImportedPkg]
   imported_pkg_names : Array[String]
   all_imported_pkgs : Map[String, ImportedPkg]
@@ -1325,6 +1328,39 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
       }
     }
     ai = ai + 1
+  }
+  let mut ci_sym = 0
+  while ci_sym < ipkg.tc.exported_c_sym_names.length() {
+    let csym = ipkg.tc.exported_c_sym_names[ci_sym]
+    match ipkg.tc.exported_c_syms.get(csym) {
+      Some(def_pkg) =>
+        match tc.exported_c_syms.get(csym) {
+          Some(prev_pkg) =>
+            if prev_pkg != def_pkg {
+              tc_err(
+                tc,
+                span_new(tc.pkg_name + "/pion.toml", 1, 1),
+                "E_DUPLICATE_C_SYMBOL",
+                "duplicate C export symbol `" +
+                csym +
+                "` defined in both `" +
+                prev_pkg +
+                "` and `" +
+                def_pkg +
+                "`",
+                "unique C export symbol across packages",
+                csym,
+                "rename one `extern \"C\" fn ... = \"...\"` symbol to avoid linker collision",
+              )
+            }
+          None => {
+            tc.exported_c_syms.set(csym, def_pkg)
+            tc.exported_c_sym_names.push(csym)
+          }
+        }
+      None => ()
+    }
+    ci_sym = ci_sym + 1
   }
   let mut ei = 0
   while ei < ipkg.tc.eq_keys.length() {
@@ -12669,6 +12705,33 @@ pub fn check_package_with_imports_ex(
   multi_pkg : Bool,
   record_analyze : Bool,
 ) -> CheckedPackage {
+  check_package_with_imports_mapped(
+    pkg,
+    check_file,
+    imported,
+    [],
+    [],
+    multi_pkg,
+    record_analyze,
+  )
+}
+
+///|
+pub fn check_package_with_imports_mapped(
+  pkg : Package,
+  check_file : Array[Bool],
+  imported : Array[ImportedPkg],
+  dep_aliases : Array[String],
+  dep_targets : Array[String],
+  multi_pkg : Bool,
+  record_analyze : Bool,
+) -> CheckedPackage {
+  let dep_map : Map[String, String] = Map([])
+  let mut dmi = 0
+  while dmi < dep_aliases.length() && dmi < dep_targets.length() {
+    dep_map.set(dep_aliases[dmi], dep_targets[dmi])
+    dmi = dmi + 1
+  }
   let tc = TypeChecker::{
     pkg_name: pkg.name,
     pkg_root: "",
@@ -12692,6 +12755,9 @@ pub fn check_package_with_imports_ex(
     const_pub: Map([]),
     scalar_const_exprs: Map([]),
     import_aliases: Map([]),
+    dep_map: dep_map,
+    exported_c_syms: Map([]),
+    exported_c_sym_names: [],
     imported_pkgs: Map([]),
     imported_pkg_names: [],
     all_imported_pkgs: Map([]),
@@ -12725,24 +12791,65 @@ pub fn check_package_with_imports_ex(
   }
 
   // Register file-level imports and validate package existence
+  let has_dep_map = dep_aliases.length() > 0
+  let direct_targets : Map[String, Bool] = Map([])
+  let mut dti = 0
+  while dti < dep_targets.length() {
+    direct_targets.set(dep_targets[dti], true)
+    dti = dti + 1
+  }
   let mut fi_imp = 0
   while fi_imp < pkg.files.length() {
     let f = pkg.files[fi_imp]
     let mut ii = 0
     while ii < f.imports.length() {
       let imp = f.imports[ii]
-      if tc.imported_pkgs.contains(imp.path) {
-        tc.import_aliases.set(imp.alias_name, imp.path)
-      } else {
-        tc_err(
-          tc,
-          imp.span,
-          "E_UNKNOWN_PACKAGE",
-          "unknown imported package `" + imp.path + "`",
-          "declared dependency in pion.toml",
-          imp.path,
-          "add `" + imp.path + " = { path = \"...\" }` to `[dependencies]` in `pion.toml`",
-        )
+      let resolved_canon = match tc.dep_map.get(imp.path) {
+        Some(canon) =>
+          if tc.imported_pkgs.contains(canon) {
+            Some(canon)
+          } else {
+            None
+          }
+        None =>
+          if !has_dep_map && tc.imported_pkgs.contains(imp.path) {
+            Some(imp.path)
+          } else {
+            // Backward-compatible transitive import: if a unique non-directly-aliased
+            // transitive package has declared base name `imp.path` (i.e. `imp.path`
+            // or `imp.path + "__<8hex>"`), allow importing it unambiguously.
+            let prefix = imp.path + "__"
+            let mut match_canon = ""
+            let mut match_count = 0
+            let mut ti = 0
+            while ti < tc.imported_pkg_names.length() {
+              let cand = tc.imported_pkg_names[ti]
+              if !direct_targets.contains(cand) &&
+                (cand == imp.path || (cand.length() == prefix.length() + 8 && starts_with_str(cand, prefix))) {
+                match_canon = cand
+                match_count = match_count + 1
+              }
+              ti = ti + 1
+            }
+            if match_count == 1 {
+              Some(match_canon)
+            } else {
+              None
+            }
+          }
+      }
+      match resolved_canon {
+        Some(canon) => tc.import_aliases.set(imp.alias_name, canon)
+        None =>
+          tc_err(
+            tc,
+            imp.span,
+            "E_UNKNOWN_PACKAGE",
+            "unknown imported package `" + imp.path + "`",
+            "declared dependency in pion.toml",
+            imp.path,
+            "add `" + imp.path + " = { path = \"...\" }` to `[dependencies]` in `pion.toml`",
+          )
       }
       ii = ii + 1
     }
@@ -13091,6 +13198,28 @@ pub fn check_package_with_imports_ex(
             ed.name,
             ExternFnInfo::{ decl: ed, param_tys: ptys, ret_ty: rty },
           )
+          if ed.has_body {
+            match tc.exported_c_syms.get(ed.c_symbol) {
+              Some(prev_pkg) =>
+                tc_err(
+                  tc,
+                  ed.span,
+                  "E_DUPLICATE_C_SYMBOL",
+                  "duplicate C export symbol `" +
+                  ed.c_symbol +
+                  "` already defined in package `" +
+                  prev_pkg +
+                  "`",
+                  "unique C export symbol across packages",
+                  ed.c_symbol,
+                  "change the C export symbol with `= \"<unique_name>\"`",
+                )
+              None => {
+                tc.exported_c_syms.set(ed.c_symbol, tc.pkg_name)
+                tc.exported_c_sym_names.push(ed.c_symbol)
+              }
+            }
+          }
         }
         DTrait(td) => {
           let tmethods : Array[TraitMethodInfo] = []
@@ -13808,6 +13937,29 @@ pub fn check_source_files_with_imports_ex(
   multi_pkg : Bool,
   record_analyze : Bool,
 ) -> CheckedPackage {
+  check_source_files_with_imports_mapped(
+    pkg_name,
+    paths,
+    sources,
+    imported,
+    [],
+    [],
+    multi_pkg,
+    record_analyze,
+  )
+}
+
+///|
+pub fn check_source_files_with_imports_mapped(
+  pkg_name : String,
+  paths : Array[String],
+  sources : Array[String],
+  imported : Array[ImportedPkg],
+  dep_aliases : Array[String],
+  dep_targets : Array[String],
+  multi_pkg : Bool,
+  record_analyze : Bool,
+) -> CheckedPackage {
   let all_diags : Array[Diagnostic] = []
   let files : Array[SourceFile] = []
   let mut i = 0
@@ -13822,7 +13974,15 @@ pub fn check_source_files_with_imports_ex(
     i = i + 1
   }
   let pkg = Package::{ name: pkg_name, files: files }
-  let cr = check_package_with_imports_ex(pkg, [], imported, multi_pkg, record_analyze)
+  let cr = check_package_with_imports_mapped(
+    pkg,
+    [],
+    imported,
+    dep_aliases,
+    dep_targets,
+    multi_pkg,
+    record_analyze,
+  )
   let mut k = 0
   while k < cr.diagnostics.length() {
     all_diags.push(cr.diagnostics[k])
