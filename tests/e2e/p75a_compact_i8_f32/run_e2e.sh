@@ -332,7 +332,8 @@ int main(void) { return 0; }
 EOF
 then
   "$PIONC" build --release --emit-asm "$TMP_DIR/p75a.s" "$TMP_DIR/main.pion"
-  "$CC_BIN" -fsanitize=address -g -O1 "$TMP_DIR/p75a.s" "$ROOT_DIR/runtime/pion_rt.c" -lm -lpthread -o "$TMP_DIR/p75a_asan"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
+  "$CC_BIN" -fsanitize=address -g -O1 "$TMP_DIR/p75a.s" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p75a_asan"
   OUT_ASAN="$("$TMP_DIR/p75a_asan")"
   if [ "$OUT_ASAN" != "$EXPECTED" ]; then
     echo "FAIL: ASan output mismatch" >&2

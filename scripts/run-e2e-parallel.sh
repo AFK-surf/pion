@@ -8,7 +8,8 @@
 #
 # Each line runs in its own `sh -c` (so `$VAR` expands there: export what the
 # lines use) and its own process group, with stdout+stderr captured to a
-# private file. A finished command prints `[PASS] <name> (<s>s)`; a failed one
+# private file. A finished command prints `[PASS] <name> (<s>s)` plus the
+# `[SUMMARY] ...` lines of its log; a failed one
 # prints `[FAIL] <name> (exit <rc>, <s>s)` followed by its full log. Every line
 # runs even after a failure; the exit status is 1 if any failed. Blank lines and
 # `#` comments are skipped. Put the slowest commands first (better packing).
@@ -93,6 +94,10 @@ def run(idx_cmd):
             print("[PASS] %s (%.1fs)" % (name_of(cmd), dt), flush=True)
             if verbose:
                 sys.stdout.write(text)
+            else:
+                for line in text.splitlines():
+                    if line.startswith("[SUMMARY] "):
+                        print("  " + line, flush=True)
         else:
             print("[FAIL] %s (exit %d, %.1fs)\n--- command: %s\n--- log:" % (name_of(cmd), rc, dt, cmd), flush=True)
             sys.stdout.write(text)

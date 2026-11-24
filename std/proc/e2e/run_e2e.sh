@@ -209,9 +209,7 @@ if "$CC_BIN" -fsanitize=address -x c - -o "$TMP_DIR/asan_probe" >/dev/null 2>&1 
 int main(void) { return 0; }
 CEOF
 then
-  "$CC_BIN" -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer -Wall -Wextra -Werror \
-    -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
   cat > "$TMP_DIR/asan-cc" <<CEOF
 #!/bin/sh
 exec "$CC_BIN" -fsanitize=address -fno-omit-frame-pointer "\$@"

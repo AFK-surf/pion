@@ -13,13 +13,12 @@ now_ms() {
 }
 
 TMP_DIR="$(mktemp -d)"
+. "$ROOT_DIR/scripts/bg-lib.sh"
 P98_PID=""
+FP_ASM_PID=""
+CORE_PID=""
 cleanup() {
-  if [ -n "${P98_PID:-}" ]; then
-    # p98 runs in its own process group (setsid) when available: stop all of it.
-    kill -TERM -- -"$P98_PID" 2>/dev/null || kill "$P98_PID" 2>/dev/null || true
-    wait "$P98_PID" 2>/dev/null || true
-  fi
+  bg_kill "$P98_PID" "$FP_ASM_PID" "$CORE_PID"
   rm -rf "$TMP_DIR"
 }
 trap cleanup EXIT
@@ -102,6 +101,10 @@ set -e
 if [ "$BENCH_RC" -ne 0 ]; then
   echo "NOTE: test_rt --bench returned $BENCH_RC (paravirtualized vCPU jitter); continuing functional & MT checks"
 fi
+
+# One ASan/TSan build of the runtime for all E2E suites (see scripts/san-rt.sh),
+# while `as` is still reachable.
+. "$ROOT_DIR/scripts/san-rt-env.sh"
 
 # The KV load client is plain C: build it while `as` is still reachable.
 "$CC" -O2 -pthread -o "$OUT_DIR/bench_load" "$ROOT_DIR/examples/http_kv_service/bench_load.c"
@@ -234,13 +237,13 @@ unset PION_TARGET || true
 # runs with PION_TARGET unset to prove pionc_linux_s3 auto-detects its own host arch!
 T_S3_0="$(now_ms)"
 if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
-  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" "$PIONC" build \
+  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_CACHE_DIR="$TMP_DIR/cas_linux_s3" "$PIONC" build \
     --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
     -o "$TMP_DIR/pionc_linux_s3" \
     compiler/src/core \
     compiler/src/cli/main.pion)
 else
-  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_TARGET="$LINUX_TARGET" "$PIONC" build \
+  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_CACHE_DIR="$TMP_DIR/cas_linux_s3" PION_TARGET="$LINUX_TARGET" "$PIONC" build \
     --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
     -o "$TMP_DIR/pionc_linux_s3" \
     compiler/src/core \
@@ -279,30 +282,32 @@ if ! cmp -s "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"; then
 fi
 sha256sum "$TMP_DIR/linux_stage${FP_A}.ssa" "$TMP_DIR/linux_stage${FP_B}.ssa"
 cmp "$TMP_DIR/linux_stage${FP_A}.ssa" "$TMP_DIR/linux_stage${FP_B}.ssa"
-# The four independent QBE (+ cc) runs go in parallel; each `wait` fails the gate on error.
-FP_PIDS=""
-for S in "$FP_A" "$FP_B"; do
-  "$OUT_DIR/qbe" -t "$LINUX_TARGET" -o "$TMP_DIR/linux_stage$S.s" "$TMP_DIR/linux_stage$S.ssa" &
-  FP_PIDS="$FP_PIDS $!"
-  if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
-    "$OUT_DIR/qbe" -t "$LINUX_TARGET" --obj -o "$TMP_DIR/linux_stage$S.o" "$TMP_DIR/linux_stage$S.ssa" &
-    FP_PIDS="$FP_PIDS $!"
-  fi
-done
-for P in $FP_PIDS; do wait "$P"; done
-if [ "$USE_DIRECT_OBJ" -ne 1 ]; then
-  FP_PIDS=""
-  for S in "$FP_A" "$FP_B"; do
-    "$CC" -c "$TMP_DIR/linux_stage$S.s" -o "$TMP_DIR/linux_stage$S.o" &
-    FP_PIDS="$FP_PIDS $!"
-  done
-  for P in $FP_PIDS; do wait "$P"; done
+# The objects the two stages really compiled and linked (each in its own fresh CAS).
+stage_obj_sha() {
+  (cd "$TMP_DIR/cas_linux_s$1/obj" && for O in *.o; do sha256sum < "$O"; done | sort)
+}
+FP_OBJ_A="$(stage_obj_sha "$FP_A")"
+FP_OBJ_B="$(stage_obj_sha "$FP_B")"
+echo "Stage ${FP_A} / Stage ${FP_B} .o: $(printf '%s' "$FP_OBJ_A" | tr -s ' \n-' ' ') / $(printf '%s' "$FP_OBJ_B" | tr -s ' \n-' ' ')"
+if [ -z "$FP_OBJ_A" ] || [ "$FP_OBJ_A" != "$FP_OBJ_B" ]; then
+  echo "FAIL: Stage ${FP_A} and Stage ${FP_B} object files differ" >&2
+  exit 1
 fi
-sha256sum "$TMP_DIR/linux_stage${FP_A}.s" "$TMP_DIR/linux_stage${FP_B}.s"
-cmp "$TMP_DIR/linux_stage${FP_A}.s" "$TMP_DIR/linux_stage${FP_B}.s"
-sha256sum "$TMP_DIR/linux_stage${FP_A}.o" "$TMP_DIR/linux_stage${FP_B}.o"
-cmp "$TMP_DIR/linux_stage${FP_A}.o" "$TMP_DIR/linux_stage${FP_B}.o"
-echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Native Self-Hosting Fixed-Point (Stage ${FP_A} == Stage ${FP_B} SSA, ASM & ELF64 .o BIT-FOR-BIT IDENTICAL)!"
+echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Native Self-Hosting Fixed-Point (Stage ${FP_A} == Stage ${FP_B} SSA & ELF64 .o BIT-FOR-BIT IDENTICAL)!"
+# The text assembly of both stages must be identical too: two more QBE runs over
+# the whole compiler, overlapped with [6/6] and joined after the E2E pool.
+bg_start "$TMP_DIR/fp_asm.log" sh -euc '
+  "$1" -t "$2" -o "$3.s" "$3.ssa" &
+  PA=$!
+  "$1" -t "$2" -o "$4.s" "$4.ssa" &
+  PB=$!
+  wait "$PA"
+  wait "$PB"
+  sha256sum "$3.s" "$4.s"
+  test -s "$3.s"
+  cmp "$3.s" "$4.s"
+' fp_asm "$OUT_DIR/qbe" "$LINUX_TARGET" "$TMP_DIR/linux_stage${FP_A}" "$TMP_DIR/linux_stage${FP_B}"
+FP_ASM_PID="$BG_PID"
 # Keep the fixed-point SSA: CI compares it byte-for-byte with the macOS ARM64 out/stage2.ssa.
 cp "$TMP_DIR/linux_stage${FP_B}.ssa" "$OUT_DIR/linux_stage.ssa"
 # [6/6] must test the compiler built from this tree, not the (possibly older) seed.
@@ -312,20 +317,15 @@ PIONC="$OUT_DIR/pionc_linux"
 # assemblies when mingw-w64 is installed). It is independent of everything below
 # (own mktemp -d + CAS, nothing written to the tree), so it starts now, overlaps
 # [6/6], and is joined right after the E2E pool, before any wall-clock check.
-if command -v setsid >/dev/null 2>&1; then
-  setsid env PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC" > "$TMP_DIR/p98.log" 2>&1 &
-else
-  PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC" > "$TMP_DIR/p98.log" 2>&1 &
-fi
-P98_PID=$!
+bg_start "$TMP_DIR/p98.log" env PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
+P98_PID="$BG_PID"
 T_P98_0="$(now_ms)"
 
 echo "=== [6/6] Native Linux ${LINUX_ARCH_LABEL} pionc: test / fmt / run / Multi-Benchmark Checksum Verification ==="
-CORE_TEST_JSON="$(cd "$ROOT_DIR" && "$PIONC" test --json "$ROOT_DIR/compiler/src/core")"
-CORE_TEST_SUMMARY="$(printf '%s' "$CORE_TEST_JSON" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')"
-echo "pionc_linux test --json compiler/src/core -> $CORE_TEST_SUMMARY"
-printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'
-printf '%s' "$CORE_TEST_JSON" | grep -q '"failed":0'
+# One long single-threaded build: overlapped, joined after the E2E pool.
+bg_start "$TMP_DIR/core_test.log" env PION_CACHE_DIR="$TMP_DIR/cas_core" \
+  sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC"
+CORE_PID="$BG_PID"
 
 TEST_JSON="$("$PIONC" test --deps --json "$ROOT_DIR/examples/text_stats")"
 echo "pionc_linux test --deps --json examples/text_stats -> $TEST_JSON"
@@ -436,13 +436,6 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
   exit 1
 fi
 
-# P27-B: Bug #5 cyclic graph deep freeze (PION_FLAG_DEEP_FROZEN) + named & optional default parameters (same-pkg & cross-pkg).
-sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC"
-# P27-C1: Bug #6 cross-pkg mono private lookups + Bug #7 generic closure %tp_T capture + native Map[Int/Int64, V] + #derive(Eq) + ASan/LSan.
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC"
-# P27-C2: Float (IEEE-754 f32), UInt/UInt64 (unsigned 32/64-bit), FixedArray[T] + Array::make + C FFI + ASan/LSan (0 runtime bytes).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
-
 # P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
 P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
 echo "pionc_linux run p17a_ergonomics_mt -> $P17A_OUT"
@@ -456,7 +449,6 @@ PROC_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/proc")"
 echo "pionc_linux test --json std/proc -> $PROC_JSON"
 printf '%s' "$PROC_JSON" | grep -q '"ok":true'
 printf '%s' "$PROC_JSON" | grep -q '"failed":0'
-PATH="$ORIG_PATH" sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC"
 
 # std/tls: platform C shim (`csrc/tls_openssl.c` invokes system cc which needs real `as`).
 # Unit tests plus real TLS 1.3/1.2 loopback handshakes (incl. `tls_wrap_fd` and refused wrong host)
@@ -560,6 +552,14 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_bytes_bce/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p97_stage_dir_race/run_e2e.sh" "$PIONC"
 # P99: anonymous struct literals without a struct context fail closed in check (no NULL-struct SIGSEGV); legal contexts Native == Wasm32.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p99_anon_struct_lit/run_e2e.sh" "$PIONC"
+# P27-B: Bug #5 cyclic graph deep freeze (PION_FLAG_DEEP_FROZEN) + named & optional default parameters (same-pkg & cross-pkg).
+sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC"
+# P27-C1: Bug #6 cross-pkg mono private lookups + Bug #7 generic closure %tp_T capture + native Map[Int/Int64, V] + #derive(Eq) + ASan/LSan.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC"
+# P27-C2: Float (IEEE-754 f32), UInt/UInt64 (unsigned 32/64-bit), FixedArray[T] + Array::make + C FFI + ASan/LSan (0 runtime bytes).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
+# std/proc: streaming subprocess + cross-platform PTY (native + ASan).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC"
 # P26-A: native link (c_sources .c/.cc invoke system cc/c++ which need real `as`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC"
 # P26-B: C callbacks, zero-copy FFI/math/StringBuilder, cross-pkg generic Option mono & private exports.
@@ -633,6 +633,20 @@ else
   P98_PID=""
   cat "$TMP_DIR/p98.log"
   echo "FAIL: tests/e2e/p98_section_gc/run_e2e.sh" >&2
+  exit 1
+fi
+if bg_join "$CORE_PID" "$TMP_DIR/core_test.log"; then
+  CORE_PID=""
+else
+  CORE_PID=""
+  exit 1
+fi
+if bg_join "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"; then
+  FP_ASM_PID=""
+  echo "[PASS] Linux ${LINUX_ARCH_LABEL} (${LINUX_TARGET}) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+else
+  FP_ASM_PID=""
+  echo "FAIL: Stage ${FP_A} and Stage ${FP_B} assembly differ (or QBE failed)" >&2
   exit 1
 fi
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.

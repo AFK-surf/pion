@@ -13,7 +13,27 @@ now_ms() {
 }
 
 TMP_DIR="$(mktemp -d)"
-trap 'rm -rf "$TMP_DIR"' EXIT
+. "$ROOT_DIR/scripts/bg-lib.sh"
+RT_PID=""
+P98_PID=""
+FP_ASM_PID=""
+CORE_PID=""
+TLS_PID=""
+cleanup() {
+  bg_kill "$RT_PID" "$P98_PID" "$FP_ASM_PID" "$CORE_PID" "$TLS_PID"
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# bg_finish <name> <pid> <log>: join a background step and fail the gate if it failed.
+bg_finish() {
+  if ! bg_join "$2" "$3"; then
+    echo "FAIL: $1" >&2
+    exit 1
+  fi
+}
 
 echo "=== [1/5] Windows x86_64 Environment & QBE (T_amd64_win) Build ==="
 uname -a
@@ -36,17 +56,25 @@ fi
 rm -f "$OUT_DIR/libpionrt_cli.a"
 ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
 
-"$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
-  "$RT_DIR/test_rt.c" "$RT_DIR/pion_cli.c" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -o "$OUT_DIR/test_rt_win.exe"
-if ! "$OUT_DIR/test_rt_win.exe" > "$TMP_DIR/test_rt.out" 2>&1; then
+# test_rt only depends on libpionrt.a: overlap it with the Stage 0 bootstrap below.
+bg_start "$TMP_DIR/test_rt.log" sh -euc '
+  CC="$1"
+  RT_DIR="$2"
+  OUT_DIR="$3"
+  TMP_DIR="$4"
+  "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
+    "$RT_DIR/test_rt.c" "$RT_DIR/pion_cli.c" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -o "$OUT_DIR/test_rt_win.exe"
+  if ! "$OUT_DIR/test_rt_win.exe" > "$TMP_DIR/test_rt.out" 2>&1; then
+    cat "$TMP_DIR/test_rt.out"
+    exit 1
+  fi
   cat "$TMP_DIR/test_rt.out"
-  exit 1
-fi
-cat "$TMP_DIR/test_rt.out"
-grep -q 'tcp_loopback_mt (4 concurrent TCP clients on 127.0.0.1' "$TMP_DIR/test_rt.out" || {
-  echo "FAIL: tcp_loopback_mt did not run the real 127.0.0.1 TCP loopback on Windows" >&2
-  exit 1
-}
+  grep -q "tcp_loopback_mt (4 concurrent TCP clients on 127.0.0.1" "$TMP_DIR/test_rt.out" || {
+    echo "FAIL: tcp_loopback_mt did not run the real 127.0.0.1 TCP loopback on Windows" >&2
+    exit 1
+  }
+' test_rt "$CC" "$RT_DIR" "$OUT_DIR" "$TMP_DIR"
+RT_PID="$BG_PID"
 
 echo "=== [3/5] Native Windows x86_64 pionc Bootstrap from bootstrap/pionc-seed.ssa.gz ==="
 SEED_SSA="$TMP_DIR/pionc-seed.ssa"
@@ -60,6 +88,8 @@ T_B1="$(now_ms)"
 PIONC_SIZE="$(wc -c < "$OUT_DIR/pionc_win.exe" | tr -d ' ')"
 echo "Native Windows x86_64 pionc_win.exe: assemble+link=$((T_B1 - T_B0))ms, size=${PIONC_SIZE} bytes"
 "$OUT_DIR/pionc_win.exe" --version
+bg_finish "test_rt (runtime unit + MT + TCP loopback)" "$RT_PID" "$TMP_DIR/test_rt.log"
+RT_PID=""
 
 export PION_QBE="$OUT_DIR/qbe.exe"
 export PION_RT_LIB="$OUT_DIR/libpionrt.a"
@@ -122,20 +152,38 @@ if ! cmp -s "$TMP_DIR/win_stage3.ssa" "$TMP_DIR/win_stage4.ssa"; then
   FP_B=5
 fi
 cmp "$TMP_DIR/win_stage${FP_A}.ssa" "$TMP_DIR/win_stage${FP_B}.ssa"
-"$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/win_stage${FP_A}.s" "$TMP_DIR/win_stage${FP_A}.ssa"
-"$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/win_stage${FP_B}.s" "$TMP_DIR/win_stage${FP_B}.ssa"
-cmp "$TMP_DIR/win_stage${FP_A}.s" "$TMP_DIR/win_stage${FP_B}.s"
-echo "[PASS] Windows x86_64 (amd64_win) Native Self-Hosting Fixed-Point (Stage ${FP_A} == Stage ${FP_B} SSA & ASM BIT-FOR-BIT IDENTICAL)!"
+echo "[PASS] Windows x86_64 (amd64_win) Native Self-Hosting Fixed-Point (Stage ${FP_A} == Stage ${FP_B} SSA BIT-FOR-BIT IDENTICAL)!"
+# The text assembly of both stages must be identical too: two more QBE runs over
+# the whole compiler, overlapped with [5/5] and joined at its end.
+bg_start "$TMP_DIR/fp_asm.log" sh -euc '
+  "$1" -t amd64_win -o "$2.s" "$2.ssa" &
+  PA=$!
+  "$1" -t amd64_win -o "$3.s" "$3.ssa" &
+  PB=$!
+  wait "$PA"
+  wait "$PB"
+  test -s "$2.s"
+  cmp "$2.s" "$3.s"
+' fp_asm "$OUT_DIR/qbe.exe" "$TMP_DIR/win_stage${FP_A}" "$TMP_DIR/win_stage${FP_B}"
+FP_ASM_PID="$BG_PID"
 
 cp "$TMP_DIR/pionc_win_s4.exe" "$OUT_DIR/pionc_win.exe"
 PIONC="$OUT_DIR/pionc_win.exe"
 
 echo "=== [5/5] Native Windows x86_64 pionc: core / std / e2e / V1 Benchmark Checksums ==="
-CORE_TEST_JSON="$("$PIONC" test --json "$ROOT_DIR/compiler/src/core")"
-CORE_TEST_SUMMARY="$(printf '%s' "$CORE_TEST_JSON" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')"
-echo "pionc_win test --json compiler/src/core -> $CORE_TEST_SUMMARY"
-printf '%s' "$CORE_TEST_JSON" | grep -q '"ok":true'
-printf '%s' "$CORE_TEST_JSON" | grep -q '"failed":0'
+# The long, independent steps (each with its own CAS) overlap the rest of [5/5]:
+# p98 (two >65,279-section COFF big-obj assemblies), the core unit tests and the
+# std/tls handshakes; all are joined before the benchmarks.
+bg_start "$TMP_DIR/p98.log" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
+P98_PID="$BG_PID"
+bg_start "$TMP_DIR/core_test.log" env PION_CACHE_DIR="$TMP_DIR/cas_core" \
+  sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC"
+CORE_PID="$BG_PID"
+if command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
+  bg_start "$TMP_DIR/tls.log" env PION_CACHE_DIR="$TMP_DIR/cas_tls" \
+    sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
+  TLS_PID="$BG_PID"
+fi
 
 for TPKG in examples/text_stats std/json std/http std/regex std/proc std/tls; do
   PKG_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
@@ -143,9 +191,6 @@ for TPKG in examples/text_stats std/json std/http std/regex std/proc std/tls; do
   printf '%s' "$PKG_JSON" | grep -q '"ok":true'
   printf '%s' "$PKG_JSON" | grep -q '"failed":0'
 done
-if command -v openssl >/dev/null 2>&1 && command -v python3 >/dev/null 2>&1; then
-  sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
-fi
 
 P27A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion" | tr -d '\r')"
 echo "pionc_win run p27a_ergonomics_bug4 -> $P27A_OUT"
@@ -155,7 +200,6 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
 fi
 
 sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
-sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
 
 # Windows directory junction collision regression for --emit-web-rt
 JUNC_BASE="$TMP_DIR/junc_web_rt"
@@ -236,6 +280,19 @@ verify_bench() {
     exit 1
   fi
 }
+
+# Join the overlapped steps before the timed benchmarks.
+if [ -n "$TLS_PID" ]; then
+  bg_finish "std/tls e2e" "$TLS_PID" "$TMP_DIR/tls.log"
+  TLS_PID=""
+fi
+bg_finish "compiler core unit tests" "$CORE_PID" "$TMP_DIR/core_test.log"
+CORE_PID=""
+bg_finish "Stage ${FP_A} == Stage ${FP_B} assembly" "$FP_ASM_PID" "$TMP_DIR/fp_asm.log"
+FP_ASM_PID=""
+echo "[PASS] Windows x86_64 (amd64_win) Stage ${FP_A} == Stage ${FP_B} ASM BIT-FOR-BIT IDENTICAL"
+bg_finish "tests/e2e/p98_section_gc/run_e2e.sh" "$P98_PID" "$TMP_DIR/p98.log"
+P98_PID=""
 
 verify_bench nbody "-0.169075164 -0.169083134"
 verify_bench binarytrees "stretch=262143 long=131071 total=14592688"

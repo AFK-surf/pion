@@ -124,12 +124,14 @@ int main(void) {
 }
 EOF
 
+CC="$CC" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
 "$CC" -std=c11 -O1 -g -fsanitize=address -Wall -Wextra -Werror -I"$ROOT_DIR/runtime" \
-    "$ROOT_DIR/runtime/pion_rt.c" "$TMP_DIR/mt_hash_test.c" -lm -lpthread -o "$TMP_DIR/mt_hash_asan"
+    "$TMP_DIR/mt_hash_test.c" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/mt_hash_asan"
 "$TMP_DIR/mt_hash_asan"
 
+CC="$CC" sh "$ROOT_DIR/scripts/san-rt.sh" thread "$TMP_DIR/libpionrt_tsan.a"
 "$CC" -std=c11 -O1 -g -fsanitize=thread -Wall -Wextra -Werror -I"$ROOT_DIR/runtime" \
-    "$ROOT_DIR/runtime/pion_rt.c" "$TMP_DIR/mt_hash_test.c" -lm -lpthread -o "$TMP_DIR/mt_hash_tsan"
+    "$TMP_DIR/mt_hash_test.c" "$TMP_DIR/libpionrt_tsan.a" -lm -lpthread -o "$TMP_DIR/mt_hash_tsan"
 "$TMP_DIR/mt_hash_tsan"
 
 echo "PASS: p49b_hash_seed"

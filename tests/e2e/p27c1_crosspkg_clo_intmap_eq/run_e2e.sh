@@ -337,9 +337,7 @@ fi
 # ASan/LSan 0-leak check on the compiled E2E binary (links ASan runtime against emitted object)
 CC_BIN="${CC:-cc}"
 # Probe an ASan link first: MSYS2 UCRT64 GCC compiles -fsanitize=address but ships no -lasan.
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
   PION_CACHE_DIR="$CAS_DIR/asan" PION_RT_LIB="$TMP_DIR/libpionrt_asan.a" \
     "$PIONC" build --emit-obj "$TMP_DIR/app_asan.o" "$APP_DIR" 2>/dev/null || true
   if [ -f "$TMP_DIR/app_asan.o" ]; then

@@ -10,7 +10,7 @@ echo "=== [1/6] Runtime Gate (libpionrt.a + MT bench + TSan + ASan + QBE smoke) 
 sh "$ROOT_DIR/scripts/test-runtime.sh"
 
 echo "=== [2/6] 9/9 Pure-Pion Fixed-Point Self-Hosting Bootstrap (seed -> pionc0 -> pionc1 -> pionc2 + compiler/src/core tests) ==="
-PION_SKIP_RT_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
+PION_SKIP_RT_TEST=1 PION_DEFER_CORE_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
 
 PIONC2="$OUT_DIR/pionc2"
 export PION_QBE="$OUT_DIR/qbe"
@@ -178,8 +178,12 @@ fi
 # Independent E2E suites (each in its own mktemp -d + CAS, ephemeral ports, nothing
 # written to the source tree or out/) run concurrently; see scripts/run-e2e-parallel.sh.
 export ROOT_DIR OUT_DIR PIONC2
+# One ASan/TSan build of the runtime for all suites (see scripts/san-rt.sh).
+. "$ROOT_DIR/scripts/san-rt-env.sh"
 sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" <<'E2E'
 # Slowest suites first so the pool packs well.
+# Gate [2/6] step [6/9], deferred by PION_DEFER_CORE_TEST=1: one long single-threaded build.
+PION_CACHE_DIR="$OUT_DIR/cas_core_test" sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2"; RC=$?; rm -rf "$OUT_DIR/cas_core_test"; exit $RC
 # Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.
 sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC2"
 # Wave H-2 Track H5: ARM64 far conditional branches (> +-1MB) + QBE rega cold-call seeding + cold-block layout.

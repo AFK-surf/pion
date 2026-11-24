@@ -45,18 +45,19 @@ out_dir = sys.argv[1]
 # the C stack: N_REAL_BLKS real compute blocks of 209 ops, split across 16
 # independent lanes with 10 parallel 20-op subchains per block (checked exactly
 # by the C driver), then N_PAD_BLKS size-only blocks of PAD_STORES
-# `storel lane, %state` each. A store through the %state pointer argument is
-# never promoted or dead-store eliminated (QBE only kills dead stores to its
-# own stack slots; the loop also calls $ext_helper before %state is rewritten)
-# and costs exactly one machine store, so the padding grows __text past 1 MB
-# without hundreds of thousands of SSA temporaries for QBE to allocate (that
-# made this script take ~50 s). The stores land in st[0] (the accumulator),
-# which @loop_back overwrites before anything reads it, so the checked result
-# only depends on the real blocks. Storing through the plain argument (not a
-# derived `add %state, 16` address) keeps each QBE run ~2.5x faster.
+# `storel <64-bit constant>, %state` each. A store through the %state pointer
+# argument is never promoted or dead-store eliminated (QBE only kills dead stores
+# to its own stack slots; the loop also calls $ext_helper before %state is
+# rewritten), and PAD_CONST has four non-zero 16-bit halves, so each one is five
+# ARM64 instructions (movz + 3 movk + str; the > 1 MB assertion below fails if
+# QBE ever materializes it once for the whole loop): __text grows past 1 MB with
+# a fifth of the IR, which is what QBE's time depends on. The stores land in
+# st[0] (the accumulator), which @loop_back overwrites before anything reads it,
+# so the checked result only depends on the real blocks.
 N_REAL_BLKS = 160
-N_PAD_BLKS = 1440
-PAD_STORES = 180
+N_PAD_BLKS = 352
+PAD_STORES = 160
+PAD_CONST = 0x123456789abcdef1
 N_LANES = 16
 SUBCHAINS = 10
 SUB_LEN = 20
@@ -122,9 +123,8 @@ for bi in range(N_REAL_BLKS):
 
 for pi in range(N_PAD_BLKS):
     lines.append(f"@pad_{N_REAL_BLKS + pi}")
-    v = lanes[pi % N_LANES]
     for _ in range(PAD_STORES):
-        lines.append(f"    storel {v}, %state")
+        lines.append(f"    storel {PAD_CONST}, %state")
 
 lines.append("@loop_back")
 final_v = lanes[0]
@@ -649,9 +649,7 @@ if [ "$OUT_DEV" != "$OUT_REL" ]; then
 fi
 
 # ASan/LSan check (0 UAF / 0 leaks)
-if printf 'int main(void){return 0;}\n' | "$CC" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
   "$PIONC" build --release --emit-obj "$TMP_DIR/a2_asan.o" "$TMP_DIR/a2_rc_layout.pion"
   "$CC" -fsanitize=address "$TMP_DIR/a2_asan.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/a2_asan"
   OUT_ASAN="$("$TMP_DIR/a2_asan")"

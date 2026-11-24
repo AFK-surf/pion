@@ -351,9 +351,7 @@ PYEOF
 # ASan/LSan check (0 leaks, 0 UAF, 0 OOB read on unit variant).
 CC_BIN="${CC:-cc}"
 ASAN_RT="$TMP_DIR/libpionrt_asan.a"
-"$CC_BIN" -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer \
-  -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
-ar rcs "$ASAN_RT" "$TMP_DIR/pion_rt_asan.o"
+CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$ASAN_RT"
 printf '#!/bin/sh\nexec %s -fsanitize=address -fno-omit-frame-pointer "$@"\n' "$CC_BIN" > "$TMP_DIR/cc-asan"
 chmod +x "$TMP_DIR/cc-asan"
 CC="$TMP_DIR/cc-asan" PION_RT_LIB="$ASAN_RT" PION_CACHE_DIR="$TMP_DIR/cas_asan" \

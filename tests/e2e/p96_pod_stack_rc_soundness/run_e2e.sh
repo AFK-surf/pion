@@ -441,9 +441,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 # 4. Native ASan/LSan (dev + --release)
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
 
   "$PIONC" build --emit-staticlib "$TMP_DIR/libp96_dev.a" "$TMP_DIR/p96_repro.pion"
   "$CC_BIN" -fsanitize=address -Wl,--whole-archive "$TMP_DIR/libp96_dev.a" -Wl,--no-whole-archive "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p96_asan_dev" 2>/dev/null \

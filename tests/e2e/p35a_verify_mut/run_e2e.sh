@@ -72,9 +72,7 @@ fi
 # 4. ASan/LSan: the same program flattened into one file (no pion.toml).
 sed -e '/^import "vlib"/d' -e 's/vlib:://g' "$APP_DIR/src/main.pion" > "$TMP_DIR/main_body.pion"
 cat "$TEST_DIR/vlib/src/lib.pion" "$TMP_DIR/main_body.pion" > "$TMP_DIR/flat.pion"
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
   PION_CACHE_DIR="$CAS_DIR/asan" "$PIONC" build --emit-obj "$TMP_DIR/flat.o" "$TMP_DIR/flat.pion"
   "$CC_BIN" -fsanitize=address "$TMP_DIR/flat.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/flat_asan"
   ASAN_OUT=$("$TMP_DIR/flat_asan")

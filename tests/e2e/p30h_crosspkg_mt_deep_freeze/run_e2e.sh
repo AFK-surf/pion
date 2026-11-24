@@ -220,9 +220,7 @@ fi
 CC_BIN="${CC:-cc}"
 
 # 2. ASan build & run
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -g -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
   cat > "$TMP_DIR/cc_asan.sh" <<WRAP
 #!/bin/sh
 exec "$CC_BIN" -fsanitize=address "\$@"
@@ -241,9 +239,7 @@ else
 fi
 
 # 3. TSan build & run
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=thread -o "$TMP_DIR/tsan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -g -fsanitize=thread -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_tsan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_tsan.a" "$TMP_DIR/pion_rt_tsan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" thread "$TMP_DIR/libpionrt_tsan.a"; then
   cat > "$TMP_DIR/cc_tsan.sh" <<WRAP
 #!/bin/sh
 exec "$CC_BIN" -fsanitize=thread "\$@"

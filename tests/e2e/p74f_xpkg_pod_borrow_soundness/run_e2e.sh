@@ -234,9 +234,7 @@ if command -v node >/dev/null 2>&1; then
 fi
 
 # 5. Native ASan/LSan on both Case 1 (via staticlib + ASan rt) and Case 2
-if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o "$TMP_DIR/asan_probe" 2>/dev/null \
-  && "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o" 2>/dev/null; then
-  ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"; then
   PION_CACHE_DIR="$CAS_DIR" "$PIONC" build --release --emit-staticlib "$TMP_DIR/libxpkg.a" "$TMP_DIR/ws/app_pkg"
   "$CC_BIN" -fsanitize=address -Wl,--whole-archive "$TMP_DIR/libxpkg.a" -Wl,--no-whole-archive "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/xpkg_asan" 2>/dev/null \
     || "$CC_BIN" -fsanitize=address -Wl,-force_load,"$TMP_DIR/libxpkg.a" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/xpkg_asan"

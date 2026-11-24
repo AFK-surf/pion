@@ -20,6 +20,23 @@ mkdir -p "$CAS_DIR"
 export PION_CACHE_DIR="$CAS_DIR"
 export PION_WASM_RT="$ROOT_DIR/runtime/pion_wasm_rt.mjs"
 
+PION_WASM_RT_WEB="$ROOT_DIR/runtime/pion_wasm_rt_web.mjs"
+
+# The sections are independent (own files in $TMP_DIR, shared CAS): run them as
+# four concurrent groups; a failing group prints its log and fails the suite.
+SEG_PIDS=""
+cleanup() {
+  for P in $SEG_PIDS; do
+    kill "$P" 2>/dev/null || true
+    wait "$P" 2>/dev/null || true
+  done
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+(
 echo "=== P29-C [1/5] pionc build --target wasm32 + WebAssembly.validate() ==="
 HELLO_WASM="$TMP_DIR/hello.wasm"
 T0=$(now_ms)
@@ -285,7 +302,6 @@ pub fn main(world : World) -> Int {
 EOF
 LARGE_WASM="$TMP_DIR/large_recycle.wasm"
 "$PIONC" build --release --target wasm32 -o "$LARGE_WASM" "$TMP_DIR/large_recycle.pion"
-PION_WASM_RT_WEB="$ROOT_DIR/runtime/pion_wasm_rt_web.mjs"
 for rt_path in "$PION_WASM_RT" "$PION_WASM_RT_WEB"; do
 node --input-type=module -e '
 import fs from "node:fs";
@@ -881,7 +897,10 @@ pion_rc_dec(p2);
 console.log("  slab_mix (" + rtLabel + "): out=" + out + " mem=" + (memBytes / (1024 * 1024)).toFixed(2) + "MiB (<=4MiB) slab_reuse=OK");
 ' "$SLAB_WASM" "$rt_path"
 done
+) > "$TMP_DIR/seg1.log" 2>&1 &
+SEG_PIDS="$SEG_PIDS $!"
 
+(
 echo "=== P29-C [12/12] Pure-Wasm String & HashMap Hot Paths (INT64_MIN, str_eq, concat_n, Map grow + RC) ==="
 cat > "$TMP_DIR/str_map_fast.pion" <<'EOF'
 fn must(cond : Bool, msg : String) -> Unit {
@@ -2014,7 +2033,10 @@ console.log("  flat_rc_arr (" + mode + "/" + rtLabel + "): out=" + out + " mem="
 ' "$wasm_f" "$rt_path" "$mode"
 done
 done
+) > "$TMP_DIR/seg2.log" 2>&1 &
+SEG_PIDS="$SEG_PIDS $!"
 
+(
 echo "[21/21] P42-C Wasm32 memarg.offset + jnz NaN/int cmp + const div/rem strength reduction (release+dev x Node+Web)"
 cat > "$TMP_DIR/p42c_wasm_opts.pion" <<'EOF'
 struct Box4 {
@@ -3749,7 +3771,10 @@ console.log("  p52a (" + mode + "/" + rtLabel + "): " + out + " freed=" + freed 
 ' "$wasm_f" "$rt_path" "$mode"
 done
 done
+) > "$TMP_DIR/seg3.log" 2>&1 &
+SEG_PIDS="$SEG_PIDS $!"
 
+(
 echo "=== P53-A Regression: Selective Hot-Site Inlining (80 Cold Branches Size Cap + Hot Loop & Self-Rec Correctness) ==="
 {
   cat <<'EOF'
@@ -5661,6 +5686,21 @@ if (leaked !== 0) {
 console.log("  p69a (" + rtLabel + "): out=" + out + " leaked=0 OK");
 ' "$P69A_WASM" "$rt_path"
 done
+) > "$TMP_DIR/seg4.log" 2>&1 &
+SEG_PIDS="$SEG_PIDS $!"
+
+SEG_N=0
+SEG_RC=0
+for P in $SEG_PIDS; do
+  SEG_N=$((SEG_N + 1))
+  wait "$P" || { SEG_RC=1; echo "FAIL: P29-C section group $SEG_N" >&2; }
+  cat "$TMP_DIR/seg$SEG_N.log"
+done
+SEG_PIDS=""
+[ "$SEG_RC" = 0 ]
+
+# Reuses the full_features program built by section [4/5].
+FULL_WASM="$TMP_DIR/full_features.wasm"
 
 echo "=== P82-C: Wasm32 Bidirectional Runtime ABI Handshake (PION_WASM_RT_ABI = 2, dev + --release) ==="
 FULL_REL_WASM="$TMP_DIR/full_features_rel.wasm"

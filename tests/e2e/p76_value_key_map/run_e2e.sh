@@ -417,7 +417,8 @@ int main(void) { return 0; }
 EOF
 then
   "$PIONC" build --release --emit-asm "$TMP_DIR/p76.s" "$TMP_DIR/main.pion"
-  "$CC_BIN" -fsanitize=address -g -O1 "$TMP_DIR/p76.s" "$ROOT_DIR/runtime/pion_rt.c" -lm -lpthread -o "$TMP_DIR/p76_asan"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
+  "$CC_BIN" -fsanitize=address -g -O1 "$TMP_DIR/p76.s" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p76_asan"
   [ "$("$TMP_DIR/p76_asan")" = "p76_vmap ok" ]
   echo "4. Native ASan/LSan (0 leaks) -> OK"
 else
@@ -888,8 +889,7 @@ if "$CC_BIN" -fsanitize=address -x c - -o "$TMP_DIR/asan_probe2" <<'EOF' >/dev/n
 int main(void) { return 0; }
 EOF
 then
-  "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_p82e_asan.o"
-  ar rcs "$TMP_DIR/libpionrt_p82e_asan.a" "$TMP_DIR/pion_rt_p82e_asan.o"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_p82e_asan.a"
   "$PIONC" build --release --emit-staticlib "$TMP_DIR/libp82e.a" "$TMP_DIR/p82e_ws/app"
   "$CC_BIN" -fsanitize=address -Wl,--whole-archive "$TMP_DIR/libp82e.a" -Wl,--no-whole-archive "$TMP_DIR/libpionrt_p82e_asan.a" -lm -lpthread -o "$TMP_DIR/p82e_asan" 2>/dev/null \
     || "$CC_BIN" -fsanitize=address -Wl,-force_load,"$TMP_DIR/libp82e.a" "$TMP_DIR/libpionrt_p82e_asan.a" -lm -lpthread -o "$TMP_DIR/p82e_asan"

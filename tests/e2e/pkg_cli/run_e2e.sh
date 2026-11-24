@@ -21,7 +21,18 @@ else # a synced copy without .git: compare a listing of every file instead
 fi
 TREE_BEFORE=$(tree_state)
 W=$(mktemp -d)
-trap 'chmod -R u+w "$W" 2>/dev/null || true; rm -rf "$W"' EXIT
+GROUP_PIDS=""
+cleanup() {
+  for P in $GROUP_PIDS; do
+    kill "$P" 2>/dev/null || true
+    wait "$P" 2>/dev/null || true
+  done
+  chmod -R u+w "$W" 2>/dev/null || true
+  rm -rf "$W"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 export PION_CACHE_DIR="$W/cache"
 export PION_REGISTRY=off
 G="git -c user.name=pion-e2e -c user.email=e2e@pion.invalid -c init.defaultBranch=main -c commit.gpgsign=false -c tag.gpgsign=false"
@@ -80,6 +91,10 @@ printf 'name = "mylib"\nversion = "1.0.0"\ngit = "%s"\ntag = "v1"\n' "$LIB_URL" 
 git clone -q --bare "$W/src/index" "$W/index.git"
 REG_URL="file://$W/index.git"
 
+# The scenarios below form three independent groups (own registries, packages and
+# cache each); they run concurrently, and every group must pass.
+(
+export PION_CACHE_DIR="$W/cache_g1"
 # --- pionc init + add from the registry ---------------------------------------
 "$PIONC" init --json "$W/app" > /dev/null
 printf 'import "mylib"\n\n///|\ntest "mylib answer" {\n  debug_assert(mylib::answer() == 1, "v1 answer")\n}\n' > "$W/app/dep_test.pion"
@@ -165,6 +180,20 @@ expect "$OUT" '"code":"E_INVALID_ARGS"' "add refuses a registry starting with -"
 OUT=$(run_fail "$PIONC" update --json util "$W/app")
 expect "$OUT" 'path dependency' "update of a path dependency"
 
+# --- pion.lock revs and direct git URLs are validated before any cache path ---
+cp -R "$W/util" "$W/badlock"
+sed 's/^rev = ".*"/rev = "..\/..\/x"/' "$W/util/pion.lock" > "$W/badlock/pion.lock"
+OUT=$(run_fail sh -c '"$0" fetch --json "$1" 2>&1' "$PIONC" "$W/badlock")
+expect "$OUT" 'full lowercase hex commit id' "a non-hex locked rev is rejected"
+cp "$W/util/pion.toml" "$W/toml.util"
+OUT=$(run_fail "$PIONC" add --json bad --git -bad "$W/util")
+expect "$OUT" 'must not start with' "a direct git URL starting with - is refused"
+cmp -s "$W/util/pion.toml" "$W/toml.util" || fail "refused add left pion.toml modified"
+) > "$W/group1.log" 2>&1 &
+GROUP_PIDS="$GROUP_PIDS $!"
+
+(
+export PION_CACHE_DIR="$W/cache_g2"
 # --- pionc search over a catalog.json registry --------------------------------
 mkdir -p "$W/src/cat/index"
 : > "$W/src/cat/index/.gitkeep"
@@ -417,6 +446,93 @@ git clone -q --mirror "$W/cat.git" "$C6/registry/$DEF_KEY.git"
 OUT=$(cd "$W/src" && PION_CACHE_DIR="$C6" PION_REGISTRY= "$PIONC" search --json --offline json5)
 jcheck "$OUT" 'd["source"] == "default" and d["registry"] == "https://github.com/AFK-surf/pion-packages.git" and names == ["json5"]' "PION_REGISTRY=\"\" falls through to the default registry"
 
+# --- source priority, relative paths and the shared mirror cache key ----------
+C4="$W/cache4"
+mkdir -p "$W/proj/sub"
+printf '[package]\nname = "proj"\nversion = "0.1.0"\n\n[registry]\nurl = "../cat.git"\n' > "$W/proj/pion.toml"
+R1=$(cd "$W/proj" && PION_CACHE_DIR="$C4" "$PIONC" search --json json)
+jcheck "$R1" 'd["source"] == "manifest" and d["registry"].startswith("/") and d["registry"].endswith("/cat.git") and "/../" not in d["registry"]' "[registry] url relative to pion.toml beats PION_REGISTRY=off"
+R2=$(cd "$W/proj/sub" && PION_CACHE_DIR="$C4" "$PIONC" search --json --registry ../../cat.git json)
+jcheck "$R2" 'd["source"] == "flag"' "--registry relative to PWD"
+[ "$(printf '%s' "$R1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["registry"])')" = "$(printf '%s' "$R2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["registry"])')" ] || fail "manifest-relative and PWD-relative paths normalize to the same registry"
+[ "$(ls -d "$C4"/registry/*.git | wc -l | tr -d ' ')" = 1 ] || fail "both share one mirror: $(ls "$C4/registry")"
+mkdir -p "$W/broken"
+printf '[package]\nname = "broken"\n\n[registry]\nurl = "unterminated\n' > "$W/broken/pion.toml"
+OUT=$(cd "$W/broken" && run_fail "$PIONC" search --json)
+expect "$OUT" '"code":"E_INVALID_MANIFEST"' "a broken pion.toml is an error, not skipped"
+OUT=$(cd "$W/broken" && run_fail "$PIONC" search --json --registry "$CAT_URL")
+expect "$OUT" '"code":"E_INVALID_MANIFEST"' "a broken pion.toml is an error even with --registry"
+
+# --- UTF-8 paths: --registry, [registry] url and PION_REGISTRY share one mirror
+mkdir -p "$W/中文" "$W/项目"
+git clone -q --bare "$W/src/cat" "$W/中文/包索引.git"
+printf '[package]\nname = "proj"\nversion = "0.1.0"\n\n[registry]\nurl = "../中文/包索引.git"\n' > "$W/项目/pion.toml"
+C5="$W/cache5"
+U1=$(cd "$W/项目" && PION_CACHE_DIR="$C5" "$PIONC" search --json json5)
+U2=$(cd "$W/中文" && PION_CACHE_DIR="$C5" "$PIONC" search --json --registry 包索引.git json5)
+U3=$(cd "$W" && PION_CACHE_DIR="$C5" PION_REGISTRY=中文/包索引.git "$PIONC" search --json json5)
+echo "search (UTF-8 path) -> $U1"
+for U in "$U1" "$U2" "$U3"; do
+  jcheck "$U" 'd["registry"].endswith("/中文/包索引.git") and d["registry"].startswith("/") and names == ["json5"]' "a UTF-8 registry path survives normalization byte for byte"
+done
+jcheck "$U1" 'd["source"] == "manifest"' "UTF-8 [registry] url"
+jcheck "$U2" 'd["source"] == "flag"' "UTF-8 --registry"
+jcheck "$U3" 'd["source"] == "env"' "UTF-8 PION_REGISTRY"
+[ "$(printf '%s\n%s\n%s\n' "$U1" "$U2" "$U3" | python3 -c 'import json,sys; print(len({json.loads(l)["registry"] for l in sys.stdin}))')" = 1 ] || fail "the three UTF-8 sources normalize to one registry"
+[ "$(ls -d "$C5"/registry/*.git | wc -l | tr -d ' ')" = 1 ] || fail "the three UTF-8 sources share one mirror: $(ls "$C5/registry")"
+"$PIONC" init --json "$W/app5" > /dev/null
+OUT=$(cd "$W" && "$PIONC" add --json mylib --registry 中文/包索引.git "$W/app5")
+jcheck "$OUT" 'd["ok"] and d["location"].endswith("/中文/包索引.git")' "add --json keeps a UTF-8 location intact"
+grep -q 'registry = "/.*/中文/包索引.git" }' "$W/app5/pion.toml" || fail "pion.toml keeps the UTF-8 registry path: $(cat "$W/app5/pion.toml")"
+OUT=$("$PIONC" update --json mylib "$W/app5")
+expect "$OUT" '"ok":true' "update re-reads the UTF-8 registry path from pion.toml"
+
+# --- legacy index/ registry (no catalog.json) ---------------------------------
+mkdir -p "$W/src/legacy/index/nested"
+printf 'name = "alpha"\nversion = "1.2.0"\ngit = "%s"\ntag = "v1"\n\n\n' "$LIB_URL" > "$W/src/legacy/index/alpha.toml"
+printf 'version = "0.3.0"\ngit = "%s"\nbranch = "main"\nsubdir = "pkgs/beta"\n' "$LIB_URL" > "$W/src/legacy/index/beta.toml"
+printf 'version = "9.9.9"\ngit = "x"\n' > "$W/src/legacy/index/9bad.toml"
+printf 'version = "9.9.9"\ngit = "x"\n' > "$W/src/legacy/index/nested/gamma.toml"
+: > "$W/src/legacy/index/.gitkeep"
+(cd "$W/src/legacy" && $G init -q && $G add -A && $G commit -q -m legacy)
+git clone -q --bare "$W/src/legacy" "$W/legacy.git"
+CATF=
+OUT=$("$PIONC" search --json --registry "$W/legacy.git")
+echo "search (index) -> $OUT"
+jcheck "$OUT" 'd["format"] == "index" and names == ["alpha", "beta"]' "index/ fallback lists regular, validly named .toml entries only"
+jcheck "$OUT" 'd["packages"][0]["version"] == "1.2.0" and d["packages"][0]["tag"] == "v1" and d["packages"][1]["subdir"] == "pkgs/beta" and d["packages"][1]["category"] == "" and d["packages"][1]["keywords"] == [] and d["packages"][1]["wasm32"] is None' "index entries fill defaults"
+OUT=$("$PIONC" search --json --registry "$W/legacy.git" --category core alpha)
+jcheck "$OUT" 'd["count"] == 0' "an empty category never matches --category"
+
+# --- invalid catalogs never fall back to index/ -------------------------------
+for CASE in broken schema2 nullsum nullwasm badname; do
+  mkdir -p "$W/src/$CASE/index"
+  printf 'version = "1.0.0"\ngit = "x"\n' > "$W/src/$CASE/index/fallback.toml"
+  case "$CASE" in
+    broken) printf '{"schema_version": 1, "packages": [' ;;
+    schema2) printf '{"schema_version": 2, "packages": []}\n' ;;
+    nullsum) printf '{"schema_version": 1, "packages": [{"name": "a", "summary": null}]}\n' ;;
+    nullwasm) printf '{"schema_version": 1, "packages": [{"name": "a", "wasm32": null}]}\n' ;;
+    badname) printf '{"schema_version": 1, "packages": [{"name": "bad name"}]}\n' ;;
+  esac > "$W/src/$CASE/catalog.json"
+  (cd "$W/src/$CASE" && $G init -q && $G add -A && $G commit -q -m "$CASE")
+  git clone -q --bare "$W/src/$CASE" "$W/$CASE.git"
+  OUT=$(run_fail "$PIONC" search --json --registry "$W/$CASE.git")
+  echo "search ($CASE catalog) -> $OUT"
+  expect "$OUT" '"code":"E_REGISTRY_INVALID_CATALOG"' "$CASE catalog.json is reported"
+  expect "$OUT" '"ok":false' "$CASE catalog.json fails"
+  case "$CASE" in
+    schema2) expect "$OUT" 'unsupported schema_version 2' "schema_version message" ;;
+    nullsum) expect "$OUT" '`summary` must be a string' "explicit null summary" ;;
+    nullwasm) expect "$OUT" '`wasm32` must be a boolean' "explicit null wasm32" ;;
+    badname) expect "$OUT" 'invalid package name' "invalid catalog package name" ;;
+  esac
+done
+) > "$W/group2.log" 2>&1 &
+GROUP_PIDS="$GROUP_PIDS $!"
+
+(
+export PION_CACHE_DIR="$W/cache_g3"
 # --- the upstream default branch moves ----------------------------------------
 mkdir -p "$W/src/br"
 printf '{"schema_version": 1, "packages": [{"name": "first"}]}\n' > "$W/src/br/catalog.json"
@@ -532,99 +648,18 @@ OUT=$(cd "$W/drivep" && run_fail "$PIONC" search --json --offline)
 expect "$OUT" 'registry C:/ has no usable cached mirror' "[registry] url = \"C:\" is the drive root, not <manifest_dir>/C:"
 OUT=$(run_fail "$PIONC" search --json --offline --registry g:repo.git)
 expect "$OUT" 'registry g:repo.git has no usable cached mirror' "g:repo.git stays an scp-style remote"
+) > "$W/group3.log" 2>&1 &
+GROUP_PIDS="$GROUP_PIDS $!"
 
-# --- pion.lock revs and direct git URLs are validated before any cache path ---
-cp -R "$W/util" "$W/badlock"
-sed 's/^rev = ".*"/rev = "..\/..\/x"/' "$W/util/pion.lock" > "$W/badlock/pion.lock"
-OUT=$(run_fail sh -c '"$0" fetch --json "$1" 2>&1' "$PIONC" "$W/badlock")
-expect "$OUT" 'full lowercase hex commit id' "a non-hex locked rev is rejected"
-cp "$W/util/pion.toml" "$W/toml.util"
-OUT=$(run_fail "$PIONC" add --json bad --git -bad "$W/util")
-expect "$OUT" 'must not start with' "a direct git URL starting with - is refused"
-cmp -s "$W/util/pion.toml" "$W/toml.util" || fail "refused add left pion.toml modified"
-
-# --- source priority, relative paths and the shared mirror cache key ----------
-C4="$W/cache4"
-mkdir -p "$W/proj/sub"
-printf '[package]\nname = "proj"\nversion = "0.1.0"\n\n[registry]\nurl = "../cat.git"\n' > "$W/proj/pion.toml"
-R1=$(cd "$W/proj" && PION_CACHE_DIR="$C4" "$PIONC" search --json json)
-jcheck "$R1" 'd["source"] == "manifest" and d["registry"].startswith("/") and d["registry"].endswith("/cat.git") and "/../" not in d["registry"]' "[registry] url relative to pion.toml beats PION_REGISTRY=off"
-R2=$(cd "$W/proj/sub" && PION_CACHE_DIR="$C4" "$PIONC" search --json --registry ../../cat.git json)
-jcheck "$R2" 'd["source"] == "flag"' "--registry relative to PWD"
-[ "$(printf '%s' "$R1" | python3 -c 'import json,sys; print(json.load(sys.stdin)["registry"])')" = "$(printf '%s' "$R2" | python3 -c 'import json,sys; print(json.load(sys.stdin)["registry"])')" ] || fail "manifest-relative and PWD-relative paths normalize to the same registry"
-[ "$(ls -d "$C4"/registry/*.git | wc -l | tr -d ' ')" = 1 ] || fail "both share one mirror: $(ls "$C4/registry")"
-mkdir -p "$W/broken"
-printf '[package]\nname = "broken"\n\n[registry]\nurl = "unterminated\n' > "$W/broken/pion.toml"
-OUT=$(cd "$W/broken" && run_fail "$PIONC" search --json)
-expect "$OUT" '"code":"E_INVALID_MANIFEST"' "a broken pion.toml is an error, not skipped"
-OUT=$(cd "$W/broken" && run_fail "$PIONC" search --json --registry "$CAT_URL")
-expect "$OUT" '"code":"E_INVALID_MANIFEST"' "a broken pion.toml is an error even with --registry"
-
-# --- UTF-8 paths: --registry, [registry] url and PION_REGISTRY share one mirror
-mkdir -p "$W/中文" "$W/项目"
-git clone -q --bare "$W/src/cat" "$W/中文/包索引.git"
-printf '[package]\nname = "proj"\nversion = "0.1.0"\n\n[registry]\nurl = "../中文/包索引.git"\n' > "$W/项目/pion.toml"
-C5="$W/cache5"
-U1=$(cd "$W/项目" && PION_CACHE_DIR="$C5" "$PIONC" search --json json5)
-U2=$(cd "$W/中文" && PION_CACHE_DIR="$C5" "$PIONC" search --json --registry 包索引.git json5)
-U3=$(cd "$W" && PION_CACHE_DIR="$C5" PION_REGISTRY=中文/包索引.git "$PIONC" search --json json5)
-echo "search (UTF-8 path) -> $U1"
-for U in "$U1" "$U2" "$U3"; do
-  jcheck "$U" 'd["registry"].endswith("/中文/包索引.git") and d["registry"].startswith("/") and names == ["json5"]' "a UTF-8 registry path survives normalization byte for byte"
+GROUP_N=0
+GROUP_RC=0
+for P in $GROUP_PIDS; do
+  GROUP_N=$((GROUP_N + 1))
+  wait "$P" || { GROUP_RC=1; echo "FAIL: pkg_cli group $GROUP_N" >&2; }
+  cat "$W/group$GROUP_N.log"
 done
-jcheck "$U1" 'd["source"] == "manifest"' "UTF-8 [registry] url"
-jcheck "$U2" 'd["source"] == "flag"' "UTF-8 --registry"
-jcheck "$U3" 'd["source"] == "env"' "UTF-8 PION_REGISTRY"
-[ "$(printf '%s\n%s\n%s\n' "$U1" "$U2" "$U3" | python3 -c 'import json,sys; print(len({json.loads(l)["registry"] for l in sys.stdin}))')" = 1 ] || fail "the three UTF-8 sources normalize to one registry"
-[ "$(ls -d "$C5"/registry/*.git | wc -l | tr -d ' ')" = 1 ] || fail "the three UTF-8 sources share one mirror: $(ls "$C5/registry")"
-"$PIONC" init --json "$W/app5" > /dev/null
-OUT=$(cd "$W" && "$PIONC" add --json mylib --registry 中文/包索引.git "$W/app5")
-jcheck "$OUT" 'd["ok"] and d["location"].endswith("/中文/包索引.git")' "add --json keeps a UTF-8 location intact"
-grep -q 'registry = "/.*/中文/包索引.git" }' "$W/app5/pion.toml" || fail "pion.toml keeps the UTF-8 registry path: $(cat "$W/app5/pion.toml")"
-OUT=$("$PIONC" update --json mylib "$W/app5")
-expect "$OUT" '"ok":true' "update re-reads the UTF-8 registry path from pion.toml"
-
-# --- legacy index/ registry (no catalog.json) ---------------------------------
-mkdir -p "$W/src/legacy/index/nested"
-printf 'name = "alpha"\nversion = "1.2.0"\ngit = "%s"\ntag = "v1"\n\n\n' "$LIB_URL" > "$W/src/legacy/index/alpha.toml"
-printf 'version = "0.3.0"\ngit = "%s"\nbranch = "main"\nsubdir = "pkgs/beta"\n' "$LIB_URL" > "$W/src/legacy/index/beta.toml"
-printf 'version = "9.9.9"\ngit = "x"\n' > "$W/src/legacy/index/9bad.toml"
-printf 'version = "9.9.9"\ngit = "x"\n' > "$W/src/legacy/index/nested/gamma.toml"
-: > "$W/src/legacy/index/.gitkeep"
-(cd "$W/src/legacy" && $G init -q && $G add -A && $G commit -q -m legacy)
-git clone -q --bare "$W/src/legacy" "$W/legacy.git"
-CATF=
-OUT=$("$PIONC" search --json --registry "$W/legacy.git")
-echo "search (index) -> $OUT"
-jcheck "$OUT" 'd["format"] == "index" and names == ["alpha", "beta"]' "index/ fallback lists regular, validly named .toml entries only"
-jcheck "$OUT" 'd["packages"][0]["version"] == "1.2.0" and d["packages"][0]["tag"] == "v1" and d["packages"][1]["subdir"] == "pkgs/beta" and d["packages"][1]["category"] == "" and d["packages"][1]["keywords"] == [] and d["packages"][1]["wasm32"] is None' "index entries fill defaults"
-OUT=$("$PIONC" search --json --registry "$W/legacy.git" --category core alpha)
-jcheck "$OUT" 'd["count"] == 0' "an empty category never matches --category"
-
-# --- invalid catalogs never fall back to index/ -------------------------------
-for CASE in broken schema2 nullsum nullwasm badname; do
-  mkdir -p "$W/src/$CASE/index"
-  printf 'version = "1.0.0"\ngit = "x"\n' > "$W/src/$CASE/index/fallback.toml"
-  case "$CASE" in
-    broken) printf '{"schema_version": 1, "packages": [' ;;
-    schema2) printf '{"schema_version": 2, "packages": []}\n' ;;
-    nullsum) printf '{"schema_version": 1, "packages": [{"name": "a", "summary": null}]}\n' ;;
-    nullwasm) printf '{"schema_version": 1, "packages": [{"name": "a", "wasm32": null}]}\n' ;;
-    badname) printf '{"schema_version": 1, "packages": [{"name": "bad name"}]}\n' ;;
-  esac > "$W/src/$CASE/catalog.json"
-  (cd "$W/src/$CASE" && $G init -q && $G add -A && $G commit -q -m "$CASE")
-  git clone -q --bare "$W/src/$CASE" "$W/$CASE.git"
-  OUT=$(run_fail "$PIONC" search --json --registry "$W/$CASE.git")
-  echo "search ($CASE catalog) -> $OUT"
-  expect "$OUT" '"code":"E_REGISTRY_INVALID_CATALOG"' "$CASE catalog.json is reported"
-  expect "$OUT" '"ok":false' "$CASE catalog.json fails"
-  case "$CASE" in
-    schema2) expect "$OUT" 'unsupported schema_version 2' "schema_version message" ;;
-    nullsum) expect "$OUT" '`summary` must be a string' "explicit null summary" ;;
-    nullwasm) expect "$OUT" '`wasm32` must be a boolean' "explicit null wasm32" ;;
-    badname) expect "$OUT" 'invalid package name' "invalid catalog package name" ;;
-  esac
-done
+GROUP_PIDS=""
+[ "$GROUP_RC" = 0 ]
 
 # --- zero bytes in the source tree --------------------------------------------
 TREE_AFTER=$(tree_state)

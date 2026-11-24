@@ -26,6 +26,14 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 CAS_DIR="$TMP_DIR/cas"
 mkdir -p "$CAS_DIR"
 CC_BIN="${CC:-cc}"
+# Native runtime for the C hosts below: the gate's archive, or the source itself.
+RT_NATIVE="${PION_RT_LIB:-$ROOT_DIR/runtime/pion_rt.c}"
+ASAN_RT="$TMP_DIR/libpionrt_asan.a"
+TSAN_RT="$TMP_DIR/libpionrt_tsan.a"
+HAVE_ASAN=0
+HAVE_TSAN=0
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$ASAN_RT"; then HAVE_ASAN=1; fi
+if CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" thread "$TSAN_RT"; then HAVE_TSAN=1; fi
 
 echo "=== P87 [1/3] Single-threaded frozen object RC + disassembly + ASan ==="
 cat > "$TMP_DIR/st_frozen.pion" <<'PION'
@@ -123,8 +131,8 @@ fi
 # ASan + LSan check on single-threaded frozen object lifecycle
 ASAN_OBJ="$TMP_DIR/st_frozen_asan.o"
 PION_CACHE_DIR="$CAS_DIR/asan" "$PIONC" build --release --emit-obj "$ASAN_OBJ" "$TMP_DIR/st_frozen.pion"
-if "$CC_BIN" -O1 -g -fsanitize=address -fno-omit-frame-pointer \
-    -I"$ROOT_DIR/runtime" "$ASAN_OBJ" "$ROOT_DIR/runtime/pion_rt.c" -lm -lpthread \
+if [ "$HAVE_ASAN" = 1 ] && "$CC_BIN" -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+    -I"$ROOT_DIR/runtime" "$ASAN_OBJ" "$ASAN_RT" -lm -lpthread \
     -o "$TMP_DIR/st_frozen_asan" 2>/dev/null; then
   ASAN_OUT="$("$TMP_DIR/st_frozen_asan")"
   if [ "$ASAN_OUT" != "$REL_OUT" ]; then
@@ -311,13 +319,13 @@ int main(int argc, char **argv) {
 }
 EOF
 
-"$CC_BIN" -O2 -I"$ROOT_DIR/runtime" "$TMP_DIR/handoff_host.c" "$HANDOFF_OBJ" "$ROOT_DIR/runtime/pion_rt.c" \
+"$CC_BIN" -O2 -I"$ROOT_DIR/runtime" "$TMP_DIR/handoff_host.c" "$HANDOFF_OBJ" "$RT_NATIVE" \
     -lm -lpthread -o "$TMP_DIR/handoff_host"
 HANDOFF_OUT="$("$TMP_DIR/handoff_host")"
 echo "  native: $HANDOFF_OUT"
 
-if "$CC_BIN" -O1 -g -fsanitize=address -fno-omit-frame-pointer \
-    -I"$ROOT_DIR/runtime" "$TMP_DIR/handoff_host.c" "$HANDOFF_OBJ" "$ROOT_DIR/runtime/pion_rt.c" \
+if [ "$HAVE_ASAN" = 1 ] && "$CC_BIN" -O1 -g -fsanitize=address -fno-omit-frame-pointer \
+    -I"$ROOT_DIR/runtime" "$TMP_DIR/handoff_host.c" "$HANDOFF_OBJ" "$ASAN_RT" \
     -lm -lpthread -o "$TMP_DIR/handoff_host_asan" 2>/dev/null; then
   HANDOFF_ASAN_OUT="$("$TMP_DIR/handoff_host_asan")"
   if [ "$HANDOFF_ASAN_OUT" != "$HANDOFF_OUT" ]; then
@@ -494,14 +502,14 @@ int main(void) {
 }
 EOF
 
-"$CC_BIN" -O2 -I"$ROOT_DIR/runtime" "$TMP_DIR/mt_stress_host.c" "$MT_OBJ" "$ROOT_DIR/runtime/pion_rt.c" \
+"$CC_BIN" -O2 -I"$ROOT_DIR/runtime" "$TMP_DIR/mt_stress_host.c" "$MT_OBJ" "$RT_NATIVE" \
     -lm -lpthread -o "$TMP_DIR/mt_stress_host"
 STRESS_OUT="$("$TMP_DIR/mt_stress_host")"
 echo "  native: $STRESS_OUT"
 
 # TSan check if supported
-if "$CC_BIN" -O1 -g -fsanitize=thread -I"$ROOT_DIR/runtime" \
-    "$TMP_DIR/mt_stress_host.c" "$MT_OBJ" "$ROOT_DIR/runtime/pion_rt.c" \
+if [ "$HAVE_TSAN" = 1 ] && "$CC_BIN" -O1 -g -fsanitize=thread -I"$ROOT_DIR/runtime" \
+    "$TMP_DIR/mt_stress_host.c" "$MT_OBJ" "$TSAN_RT" \
     -lm -lpthread -o "$TMP_DIR/mt_stress_tsan" 2>/dev/null; then
   TSAN_OUT="$("$TMP_DIR/mt_stress_tsan")"
   if [ "$TSAN_OUT" != "$STRESS_OUT" ]; then
@@ -593,7 +601,7 @@ int main(void) {
 }
 EOF
 
-"$CC_BIN" -O2 "$TMP_DIR/reent_host.c" "$REENT_CAS/obj/"*.o "$ROOT_DIR/runtime/pion_rt.c" \
+"$CC_BIN" -O2 "$TMP_DIR/reent_host.c" "$REENT_CAS/obj/"*.o "$RT_NATIVE" \
     -lm -lpthread -o "$TMP_DIR/reent_host"
 REENT_OUT="$("$TMP_DIR/reent_host")"
 echo "  unit_reent: $REENT_OUT (units=2, wrap_defs=$WRAP_DEF_COUNT)"

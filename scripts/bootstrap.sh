@@ -150,13 +150,13 @@ export PION_CACHE_DIR="$TMP_DIR/cas_pionc2"
 mkdir -p "$PION_CACHE_DIR"
 
 echo "=== [6/9] Standalone pionc2 Gate: Compiler Core Unit Tests (pionc2 test compiler/src/core) ==="
-CORE_TEST_OUT=$(cd "$ROOT_DIR" && "$PIONC2" test --json "$COMPILER_DIR/src/core")
-CORE_TEST_SUMMARY=$(printf '%s' "$CORE_TEST_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("ok=%s passed=%d failed=%d total=%d" % (d.get("ok"), d.get("passed", 0), d.get("failed", 0), len(d.get("tests", []))))')
-echo "pionc2 test --json compiler/src/core -> $CORE_TEST_SUMMARY"
-if ! printf '%s' "$CORE_TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$CORE_TEST_OUT" | grep -q '"failed":0'; then
-  echo "FAIL: pionc2 test --json compiler/src/core failed:" >&2
-  printf '%s\n' "$CORE_TEST_OUT" >&2
-  exit 1
+if [ "${PION_DEFER_CORE_TEST:-0}" = "1" ]; then
+  # verify-all.sh runs scripts/core-test.sh in its parallel pool instead.
+  CORE_TEST_SUMMARY="deferred to the caller (PION_DEFER_CORE_TEST=1)"
+  echo "Core unit tests: $CORE_TEST_SUMMARY"
+else
+  CORE_TEST_SUMMARY=$(sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC2")
+  echo "$CORE_TEST_SUMMARY"
 fi
 
 echo "=== [7/9] Standalone pionc2 Gate: Self-check + All Frontend Fixtures ==="

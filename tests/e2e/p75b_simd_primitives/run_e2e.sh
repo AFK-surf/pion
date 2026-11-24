@@ -327,7 +327,8 @@ int main(void) { return 0; }
 EOF
 then
   "$PIONC" build --release --emit-asm "$TMP_DIR/p75b.s" "$TMP_DIR/main.pion"
-  "$CC_BIN" -fsanitize=address -g -O1 "$TMP_DIR/p75b.s" "$ROOT_DIR/runtime/pion_rt.c" -lm -lpthread -o "$TMP_DIR/p75b_asan"
+  CC="$CC_BIN" sh "$ROOT_DIR/scripts/san-rt.sh" address "$TMP_DIR/libpionrt_asan.a"
+  "$CC_BIN" -fsanitize=address -g -O1 "$TMP_DIR/p75b.s" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p75b_asan"
   [ "$("$TMP_DIR/p75b_asan")" = "p75b_simd ok" ]
   echo "3. Native ASan/LSan (0 leaks) -> OK"
 else

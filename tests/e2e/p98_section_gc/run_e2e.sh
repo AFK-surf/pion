@@ -8,11 +8,12 @@ PIONC="${1:?usage: run_e2e.sh <pionc>}"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 TMP="$(mktemp -d)"
 BIGOBJ_PID=""
+CBIG_PID=""
 cleanup() {
-  if [ -n "${BIGOBJ_PID:-}" ]; then
-    kill "$BIGOBJ_PID" 2>/dev/null || true
-    wait "$BIGOBJ_PID" 2>/dev/null || true
-  fi
+  for P in $BIGOBJ_PID $CBIG_PID; do
+    kill "$P" 2>/dev/null || true
+    wait "$P" 2>/dev/null || true
+  done
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -619,8 +620,8 @@ with open(sys.argv[1], "w") as f:
         f.write(f'.section .text$f_{i},"xr"\n.linkonce one_only\n.globl f_{i}\nf_{i}:\n\tret\n')
     f.write('.section .text$main,"xr"\n.linkonce one_only\n.globl main\nmain:\n\tcall f_0\n\txorl %eax,%eax\n\tret\n')
 PYEOF
-  # GNU as takes ~20 s on each >65,279-section object: assemble this one in the
-  # background while the c_sources big-obj below builds, then join on it.
+  # GNU as takes ~20-35 s on each >65,279-section object: this one and the
+  # c_sources one below are built in the background and joined at the end.
   (
     set -e
     x86_64-w64-mingw32-gcc -Wa,-mbig-obj -c "$TMP/bigobj.s" -o "$TMP/bigobj.o"
@@ -656,17 +657,9 @@ with open(sys.argv[1], "w") as f:
         f.write(f"int cbig_d_{i} = {i + 1};\n")
         f.write(f"int cbig_f_{i}(void) {{ return cbig_d_{i}; }}\n")
 PYEOF
-  env -u PION_RT_LIB CC=x86_64-w64-mingw32-gcc "$PIONC" build --release --target amd64_win -o "$TMP/c_bigobj.exe" "$CBIG"
-  echo "[PASS] p98: real manifest c_sources >68,000-section COFF big-obj compiled & linked via pionc"
-  if ! wait "$BIGOBJ_PID"; then
-    BIGOBJ_PID=""
-    cat "$TMP/bigobj.log" >&2
-    echo "FAIL: p98: 66,000-section COFF big-obj assemble/archive/GC-link failed" >&2
-    exit 1
-  fi
-  BIGOBJ_PID=""
-  cat "$TMP/bigobj.log"
-  echo "[PASS] p98: 66,000-section COFF big-obj assembled, archived, and GC-linked"
+  env -u PION_RT_LIB CC=x86_64-w64-mingw32-gcc PION_CACHE_DIR="$TMP/cas_cbig" \
+    "$PIONC" build --release --target amd64_win -o "$TMP/c_bigobj.exe" "$CBIG" > "$TMP/cbig.log" 2>&1 &
+  CBIG_PID=$!
 fi
 
 # 4. MSVC lld-link & link.exe verification (runs whenever clang + lld-link / link.exe are available).
@@ -964,6 +957,30 @@ else:
 PYEOF
   done
   echo "[PASS] p98: pion.toml -> pionc -> clang-cl /link forwarding verified via clang --driver-mode=cl -### (5 cases incl. /STACK:reserve,commit & trailing /MAP)"
+fi
+
+# Join the two big-obj builds of section 3.
+if [ -n "$CBIG_PID" ]; then
+  if ! wait "$CBIG_PID"; then
+    CBIG_PID=""
+    cat "$TMP/cbig.log" >&2
+    echo "FAIL: p98: c_sources >68,000-section COFF big-obj build failed" >&2
+    exit 1
+  fi
+  CBIG_PID=""
+  cat "$TMP/cbig.log"
+  echo "[PASS] p98: real manifest c_sources >68,000-section COFF big-obj compiled & linked via pionc"
+fi
+if [ -n "$BIGOBJ_PID" ]; then
+  if ! wait "$BIGOBJ_PID"; then
+    BIGOBJ_PID=""
+    cat "$TMP/bigobj.log" >&2
+    echo "FAIL: p98: 66,000-section COFF big-obj assemble/archive/GC-link failed" >&2
+    exit 1
+  fi
+  BIGOBJ_PID=""
+  cat "$TMP/bigobj.log"
+  echo "[PASS] p98: 66,000-section COFF big-obj assembled, archived, and GC-linked"
 fi
 
 echo "ALL p98_section_gc CHECKS PASSED!"
