@@ -1093,6 +1093,69 @@ for tag, n1, n2 in [
         assert "unresolved_entries" in json.load(open(os.path.join(ext_u, n2)))
 
 print("[e2e] PASS: Round 7+8 Astra P1 suite (ASCII + inode-aliased --out + Unicode État/état + NFC/NFD café volume-truth collision & delivery)")
+
+# 10e. Round 9 Astra P0: unmanaged hardlink backup `OUT/retained.json` linked to `OUT/migration.json`
+#      MUST be preserved byte-for-byte with old content when `OUT/migration.json` is regenerated!
+s10e = os.path.join(root, "s10e")
+o10e = os.path.join(root, "o10e")
+os.makedirs(s10e, exist_ok=True)
+with open(os.path.join(s10e, "a.mbt"), "w") as f:
+    f.write("pub fn old_hl() -> Int { 1 }\n")
+rep10e = os.path.join(o10e, "migration.json")
+r10e_1 = run_cli(["--src", s10e, "--out", o10e, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--report", rep10e])
+assert r10e_1.returncode == 0, f"10e v1 publish failed: {r10e_1.stderr}"
+old_mig_bytes = open(rep10e, "rb").read()
+retained_path = os.path.join(o10e, "retained.json")
+os.link(rep10e, retained_path)
+with open(os.path.join(s10e, "a.mbt"), "w") as f:
+    f.write("pub fn new_hl_one() -> Int { 2 }\npub fn new_hl_two() -> Int { 3 }\n")
+r10e_2 = run_cli(["--src", s10e, "--out", o10e, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--report", rep10e])
+assert r10e_2.returncode == 0, f"10e v2 publish failed: {r10e_2.stderr}"
+new_mig_bytes = open(rep10e, "rb").read()
+assert new_mig_bytes != old_mig_bytes, "10e migration.json was not updated!"
+assert os.path.isfile(retained_path), "10e unmanaged hardlink retained.json was deleted!"
+assert open(retained_path, "rb").read() == old_mig_bytes, "10e unmanaged hardlink retained.json bytes changed!"
+
+# 10f. Round 9 Astra P1a: non-existent Unicode subdirs `OUT/Équipe/info.json` vs `OUT/équipe/info.json`
+folds_eq = volume_folds(root, "\u00c9quipe", "\u00e9quipe")
+o10f = os.path.join(root, "o10f")
+r10f_init = run_cli(["--src", s10, "--out", o10f, "--target", "native", "--mode", "publish",
+                     "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10f_init.returncode == 0
+snap_10f = {p: open(os.path.join(o10f, p), "rb").read() for p in sorted(os.listdir(o10f))}
+r10f = run_cli(["--src", s10, "--out", o10f, "--target", "native", "--mode", "publish",
+                "--mbt-compat", compat_dir, "--pionc", pionc,
+                "--report", os.path.join(o10f, "\u00c9quipe", "info.json"),
+                "--drift-ledger", os.path.join(o10f, "\u00e9quipe", "info.json")])
+if folds_eq:
+    assert r10f.returncode == 1, f"10f non-existent Équipe/équipe must block on folding volume, got {r10f.returncode}"
+    assert "MBT2PION_REPORT_PATH_COLLISION" in (r10f.stdout + r10f.stderr), "10f missing collision code"
+    assert {p: open(os.path.join(o10f, p), "rb").read() for p in sorted(os.listdir(o10f))} == snap_10f, "10f OUT mutated!"
+else:
+    assert r10f.returncode == 0, f"10f non-existent Équipe/équipe must succeed on case-sensitive volume, got {r10f.returncode} {r10f.stderr}"
+    assert "files_generated" in json.load(open(os.path.join(o10f, "\u00c9quipe", "info.json")))
+    assert "unresolved_entries" in json.load(open(os.path.join(o10f, "\u00e9quipe", "info.json")))
+
+# 10g. Round 9 Astra P1b: brand-new non-existent `--out fresh_output` with `--report FRESH_OUTPUT/report.json`
+fresh_out = os.path.join(root, "fresh_output")
+fresh_upper = os.path.join(root, "FRESH_OUTPUT")
+assert not os.path.exists(fresh_out) and not os.path.exists(fresh_upper)
+r10g = run_cli(["--src", s10, "--out", fresh_out, "--target", "native", "--mode", "publish",
+                "--mbt-compat", compat_dir, "--pionc", pionc,
+                "--report", os.path.join(fresh_upper, "report.json"),
+                "--drift-ledger", os.path.join(fresh_out, "ledger.json")])
+assert r10g.returncode == 0, f"10g brand-new fresh_output/FRESH_OUTPUT publish failed: {r10g.returncode} {r10g.stderr}"
+assert "files_generated" in json.load(open(os.path.join(fresh_upper, "report.json")))
+assert "unresolved_entries" in json.load(open(os.path.join(fresh_out, "ledger.json")))
+if os.path.exists(fresh_upper) and os.path.samefile(fresh_out, fresh_upper):
+    entries10g = sorted(os.listdir(fresh_out))
+    assert "a.pion" in entries10g and "report.json" in entries10g and "ledger.json" in entries10g, f"10g missing files in fresh_output: {entries10g}"
+
+print("[e2e] PASS: Round 9 Astra P0/P1 suite (hardlink backup retained.json preserved, non-existent Équipe/équipe subdir collision, brand-new fresh_output/FRESH_OUTPUT atomic delivery)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
