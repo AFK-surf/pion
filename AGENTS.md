@@ -28,8 +28,3 @@ sh scripts/bench-v2-compile.sh                    # cross-language cold/incremen
 sh scripts/bench.sh                               # archived P8 suite
 sh benchmarks/agent_eval/run.sh                   # agent-in-the-loop eval vs MoonBit / Rust / Go
 ```
-
-## 4. Station notes (internal cluster)
-
-- **Never run heavy builds or tests on `Office-Host-2`.** Run all `cc`, `qbe`, `pionc` and test binaries via `station_task` on `tokyo-mac-studio-0` (macOS ARM64) and `pvg-office-1`/`pvg-office-2` (Linux x86_64; never `gt1`).
-- **Fail fast.** If a remote command fails unexpectedly or a single step exceeds 10 minutes, stop immediately and return the raw log; never blindly retry or patch around it.

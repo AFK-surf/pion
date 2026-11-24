@@ -1,6 +1,6 @@
 #!/bin/sh
 # Assemble, package, and self-test a relocatable Pion toolchain archive:
-#   pion-<version>-<os>-<arch>/{bin/{pionc,qbe},lib/libpionrt.a,share/pion/{pion_wasm_rt.mjs,runtime/pion_rt.{c,h}},README.md[,LICENSE]}
+#   pion-<version>-<os>-<arch>/{bin/{pionc,qbe},lib/libpionrt.a,share/pion/{pion_wasm_rt.mjs,runtime/pion_rt.{c,h},licenses/QBE-LICENSE},README.md,LICENSE,THIRD_PARTY_NOTICES.md}
 # Usage: sh scripts/package-release.sh [out_dir]
 set -eu
 
@@ -8,6 +8,17 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR="$ROOT_DIR/out"
 DIST_DIR="${1:-$ROOT_DIR/dist}"
 VERSION="${PION_VERSION:-0.1.0}"
+
+case "$VERSION" in
+  ""|*[!0-9A-Za-z.-]*)
+    echo "error: invalid PION_VERSION (must be single-line ASCII semver): $VERSION" >&2
+    exit 1
+    ;;
+esac
+if ! printf '%s\n' "$VERSION" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$'; then
+  echo "error: invalid PION_VERSION (expected X.Y.Z or X.Y.Z-pre): $VERSION" >&2
+  exit 1
+fi
 
 UNAME_S=$(uname -s)
 UNAME_M=$(uname -m)
@@ -53,10 +64,13 @@ RT_LIB="${PION_RT_LIB:-$OUT_DIR/libpionrt.a}"
 WASM_RT="$ROOT_DIR/runtime/pion_wasm_rt.mjs"
 RT_C="$ROOT_DIR/runtime/pion_rt.c"
 RT_H="$ROOT_DIR/runtime/pion_rt.h"
+LICENSE_FILE="$ROOT_DIR/LICENSE"
+NOTICES_FILE="$ROOT_DIR/THIRD_PARTY_NOTICES.md"
+QBE_LICENSE="$ROOT_DIR/vendor/qbe/LICENSE"
 
-for req in "$QBE_BIN" "$RT_LIB" "$WASM_RT" "$RT_C" "$RT_H"; do
-  if [ ! -f "$req" ]; then
-    echo "FAIL: missing required release file: $req" >&2
+for req in "$QBE_BIN" "$RT_LIB" "$WASM_RT" "$RT_C" "$RT_H" "$LICENSE_FILE" "$NOTICES_FILE" "$QBE_LICENSE"; do
+  if [ ! -s "$req" ]; then
+    echo "FAIL: missing or empty required release file: $req" >&2
     exit 1
   fi
 done
@@ -66,7 +80,7 @@ TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 
 STAGE="$TMP_DIR/$PKG_NAME"
-mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share/pion/runtime"
+mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/share/pion/runtime" "$STAGE/share/pion/licenses"
 cp "$PIONC_BIN" "$STAGE/bin/pionc${EXE_EXT}"
 cp "$QBE_BIN" "$STAGE/bin/qbe${EXE_EXT}"
 chmod +x "$STAGE/bin/pionc${EXE_EXT}" "$STAGE/bin/qbe${EXE_EXT}"
@@ -74,8 +88,10 @@ cp "$RT_LIB" "$STAGE/lib/libpionrt.a"
 cp "$WASM_RT" "$STAGE/share/pion/pion_wasm_rt.mjs"
 cp "$RT_C" "$STAGE/share/pion/runtime/pion_rt.c"
 cp "$RT_H" "$STAGE/share/pion/runtime/pion_rt.h"
+cp "$QBE_LICENSE" "$STAGE/share/pion/licenses/QBE-LICENSE"
 [ -f "$ROOT_DIR/README.md" ] && cp "$ROOT_DIR/README.md" "$STAGE/README.md"
-[ -f "$ROOT_DIR/LICENSE" ] && cp "$ROOT_DIR/LICENSE" "$STAGE/LICENSE"
+cp "$LICENSE_FILE" "$STAGE/LICENSE"
+cp "$NOTICES_FILE" "$STAGE/THIRD_PARTY_NOTICES.md"
 
 mkdir -p "$DIST_DIR"
 DIST_ABS=$(CDPATH= cd -- "$DIST_DIR" && pwd)
@@ -120,6 +136,16 @@ else
 fi
 
 EXTRACTED="$VERIFY_DIR/$PKG_NAME"
+for lic in \
+  "$EXTRACTED/LICENSE" \
+  "$EXTRACTED/THIRD_PARTY_NOTICES.md" \
+  "$EXTRACTED/share/pion/licenses/QBE-LICENSE"; do
+  if [ ! -s "$lic" ]; then
+    echo "FAIL: missing or empty license file in archive: $lic" >&2
+    exit 1
+  fi
+done
+
 WORK="$VERIFY_DIR/work"
 mkdir -p "$WORK"
 

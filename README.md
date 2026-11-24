@@ -98,7 +98,7 @@ members = ["packages/*", "cmd/*"]
 
 [workspace.dependencies]
 core = { path = "packages/core" }
-invar = { git = "https://github.com/AFK-surf/invar.git", branch = "main" }
+json = { git = "https://github.com/AFK-surf/pion-packages.git", tag = "json-v0.1.0", subdir = "packages/json" }
 
 # Sub-package cmd/app/pion.toml
 [package]
@@ -107,7 +107,7 @@ version = "0.1.0"
 
 [dependencies]
 core = { workspace = true }
-invar = { workspace = true }
+json = { workspace = true }
 ```
 
 See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package project.
@@ -139,7 +139,7 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 
 ## Measured Results
 
-Every number below is copied from the combined P20 run of the scripts named in each section (main `a8e1019` + `feat/p20-final`: P20-A `dyn Trait` and 12/12 `edits`, P20-B one-pass parallel CAS `pionc test` and `pionc add`/`update`, P20-C `std/tls` server, P20-D QBE ARM64 peepholes and short-string fast paths), on **Apple M5 Max (18 cores), Darwin 27.0.0 arm64** (`tokyo` station) and an x86_64 Linux station (`gt2`). Rerun the scripts to reproduce: checksums are fixed, absolute milliseconds vary with machine load. The macOS station is shared; the 1-minute load average was 34–43 during §1, §2 and §5 and 76 when §4's report was written. Peak RSS and instructions retired (`/usr/bin/time -l`) do not depend on load and are listed next to the wall times.
+Every number below is copied from the combined P20 run of the scripts named in each section (main `a8e1019` + `feat/p20-final`: P20-A `dyn Trait` and 12/12 `edits`, P20-B one-pass parallel CAS `pionc test` and `pionc add`/`update`, P20-C `std/tls` server, P20-D QBE ARM64 peepholes and short-string fast paths), on **Apple M5 Max (18 cores), Darwin 27.0.0 arm64** and an **x86_64 Linux** host. Rerun the scripts to reproduce: checksums are fixed, absolute milliseconds vary with machine load. The macOS host is shared; the 1-minute load average was 34–43 during §1, §2 and §5 and 76 when §4's report was written. Peak RSS and instructions retired (`/usr/bin/time -l`) do not depend on load and are listed next to the wall times.
 
 Toolchains: C Apple clang 21.0.0 `-O2`, MoonBit `0.1.20261117` `--target native --release`, Zig `0.17.1` `-OReleaseFast`, Rust `1.100.0` `-O` / `--release`, Go `1.27.3` `go build`, Pion `pionc2 0.1.0 build --release` (self-hosted, embedded QBE).
 
@@ -177,7 +177,7 @@ This run was on a loaded host: the cold builds of Rust, Go, Zig and Pion took 1.
 | | `examples/http_event_server` | `examples/http_kv_service` | `examples/sqlite_indexer` | `examples/https_server` |
 |---|---|---|---|---|
 | What | `std/net` event-loop HTTP/1.1 key-value server: 4 `kqueue`/`epoll` workers sharing the port through `SO_REUSEPORT` | multithreaded HTTP + JSON key-value service on `std/http` / `std/json` | pure-`Pion` indexer calling the system `libsqlite3` through `extern "C"` (zero C glue) | HTTPS/1.1 + JSON service on the `std/tls` server API (`tls_listen` / `tls_accept`, system OpenSSL, no C glue): `GET /health`, `POST /echo`, `GET /stats` (`AtomicInt` counters), `POST /quit` |
-| Load / work | Linux x86_64 (`gt2`): **C1000** — 1,000 concurrently open keep-alive connections × 40 = 40,000 requests from 4 client threads, 0 errors, exact `/stats` check; per-worker requests 10,361 / 10,400 / 8,800 / 10,440 | Linux x86_64 (`gt2`): 8 clients × 500 = 4,000 requests, 0 errors, exact `/stats`, with and without Keep-Alive | indexes `compiler/src/core` (15 files / 35,397 lines), cross-checked 100% by the `sqlite3` CLI | Linux x86_64 (`gt2`, OpenSSL 3.5.7): self-test with 4 concurrent verified pure-Pion clients (TLS 1.3), Python `ssl` and curl at TLS 1.3 and 1.2, wrong host refused, mismatched key / missing certificate refused, exact final `/stats` |
+| Load / work | x86_64 Linux: **C1000** — 1,000 concurrently open keep-alive connections × 40 = 40,000 requests from 4 client threads, 0 errors, exact `/stats` check; per-worker requests 10,361 / 10,400 / 8,800 / 10,440 | x86_64 Linux: 8 clients × 500 = 4,000 requests, 0 errors, exact `/stats`, with and without Keep-Alive | indexes `compiler/src/core` (15 files / 35,397 lines), cross-checked 100% by the `sqlite3` CLI | x86_64 Linux (OpenSSL 3.5.7): self-test with 4 concurrent verified pure-Pion clients (TLS 1.3), Python `ssl` and curl at TLS 1.3 and 1.2, wrong host refused, mismatched key / missing certificate refused, exact final `/stats` |
 | Speed | **121,028 QPS**, P50 6.82 ms, P99 18.28 ms (max 26.5 ms), peak RSS 14.83 MB | Keep-Alive **92,452 QPS**, P50 0.061 ms, P99 0.215 ms; connection per request 31,676 QPS, P50 0.193 ms, P99 1.106 ms; peak RSS 14.5 MB | — | functional gate (not benchmarked) |
 | Binary | 118,144 B stripped (build 108 ms) | 105,392 B stripped (build 66–94 ms) | 123 KB | 155,136 B (unstripped, Linux) |
 | Memory safety | `ASAN=1` mode of `run_bench.sh` (not part of this run) | ASan + LSan: 0 errors, 0 leaks (archived P13 run) | ASan + LSan: 0 errors, 0 leaks (archived P13 run) | optional ASan + LSan self-test (`PION_ASAN_RT`, not part of this run) |
@@ -186,7 +186,7 @@ The `http_event_server` C1000 numbers are from the archived P19 run (not rerun h
 
 **Flagship: `examples/pion_station`.** Three packages (`store`, `router`, the app) in pure `Pion`, zero C glue: HTTPS/1.1 on `std/tls`, Server-Sent Events, a SQLite WAL store through `extern "C"` to the system `libsqlite3`, `dyn Handler` routing with `std/regex` path patterns, and a 4-thread `Channel` job pool. SSE subscribers are closed on disconnect or `limit` and pruned from the broadcast list, so long runs keep no per-connection backlog.
 
-| `examples/pion_station` | Linux x86_64 (`gt2`) | macOS ARM64 (`tokyo-mac-studio-0`) |
+| `examples/pion_station` | x86_64 Linux | Apple M5 Max, macOS arm64 |
 |---|---|---|
 | Tests | 39/39 (`pionc test --json`) | 39/39 |
 | Functional e2e | 4 concurrent pure-Pion TLS clients, 40 jobs, SSE stream, wrong host refused; restart recovery cross-checked 100% by the `sqlite3` CLI | same self-test |
@@ -196,7 +196,7 @@ The `http_event_server` C1000 numbers are from the archived P19 run (not rerun h
 | Incremental: one Handler body edit → `pionc test --json --package router` | 77–101 ms | — |
 | Memory / thread safety | ASan + LSan 0 errors, 0 leaks; TSan 0 warnings | — |
 
-Linux numbers span the P21 runs and the v1.0.0 gate run (`scripts/test-linux.sh` on `gt2`); macOS numbers are from the P21 runs (`verify-all.sh` runs the 39 tests, not `run_e2e.sh`). Reproduce: `sh examples/pion_station/run_e2e.sh <pionc>` (cold build, incremental test, self-test, restart + `sqlite3` cross-check, load and peak RSS; run by `scripts/test-linux.sh` where `libsqlite3` and the `sqlite3` CLI exist). QPS here is a full TLS handshake per request plus SQLite writes, not comparable to the plain-TCP services above.
+Linux numbers span the P21 runs and the v1.0.0 gate run (`scripts/test-linux.sh` on x86_64 Linux); macOS numbers are from the P21 runs (`verify-all.sh` runs the 39 tests, not `run_e2e.sh`). Reproduce: `sh examples/pion_station/run_e2e.sh <pionc>` (cold build, incremental test, self-test, restart + `sqlite3` cross-check, load and peak RSS; run by `scripts/test-linux.sh` where `libsqlite3` and the `sqlite3` CLI exist). QPS here is a full TLS handshake per request plus SQLite writes, not comparable to the plain-TCP services above.
 
 ### 4. Agent-in-the-loop evaluation, 4 languages (`sh benchmarks/agent_eval/run.sh`)
 
@@ -325,3 +325,17 @@ CI (`.github/workflows/ci.yml`) runs `verify-all.sh` on `macos-15` (zero MoonBit
 - `examples/` — `text_stats` (multi-package), `http_loopback`, `http_kv_service`, `http_event_server` (C1000 keep-alive event-loop server), `sqlite_indexer`, `https_server` (pure-Pion HTTPS service on `std/tls`), `pion_station` (flagship: HTTPS + SSE + SQLite WAL + `dyn Handler` + worker pool, 3 packages)
 - `benchmarks/` — V1 (`c`, `moonbit`, `zig`, `rust`, `pion`), V2 (`v2/`, + Go) and `agent_eval/`
 - `scripts/` — bootstrap, verification, Linux and benchmark scripts
+
+## Bootstrap Seed Provenance
+
+`bootstrap/pionc-seed.ssa.gz` is a compressed, architecture-independent QBE SSA IR snapshot emitted by the pure-Pion compiler itself from `compiler/src/core/` and `compiler/src/cli/`, allowing anyone to bootstrap `pionc` standalone from scratch with only a C11 compiler (`cc`) and `python3`.
+
+Every bootstrap script verifies that adjacent self-hosting stages converge to a bit-for-bit fixed point (identical SSA and assembly/object hashes):
+- **macOS ARM64 (`sh scripts/bootstrap.sh` / `sh scripts/verify-all.sh`)**: compiles `bootstrap/pionc-seed.ssa.gz` through vendored QBE + C runtime into `pionc0`, then builds `pionc1` and `pionc2`, verifying `Stage 1 == Stage 2` (or advancing to `pionc3` to verify `Stage 2 == Stage 3` when codegen has changed since the seed).
+- **Linux x86_64 / ARM64 (`sh scripts/test-linux.sh`) & Windows x86_64 (`sh scripts/test-windows.sh`)**: standalone runs bootstrap directly from `bootstrap/pionc-seed.ssa.gz` and verify adjacent stages converge bit-for-bit (`Stage 3 == Stage 4`, extending up to `Stage 4 == Stage 5` when codegen differs from the seed). In PR CI (`.github/workflows/ci.yml`), the `linux-x86_64` job reproduces from the `stage2.ssa` artifact emitted by the `macos-arm64` job via `PION_LINUX_SSA`.
+
+## License
+
+`Pion` is licensed under the [MIT License](LICENSE).
+
+Third-party attributions and licenses — including the vendored QBE 1.3 backend (`vendor/qbe/LICENSE`, MIT License) — are documented in [`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md) and included in release archives.
