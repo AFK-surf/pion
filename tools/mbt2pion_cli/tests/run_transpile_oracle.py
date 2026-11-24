@@ -101,6 +101,7 @@ CASES = {
     "m12_pipe_loops_compat": ("ok", 10),
     "q2_semantics_p0": ("ok", 13),
     "q2_mechanical_compat": ("ok", 10),
+    "wave_m2_core": ("ok", 7),
 }
 
 MOON_TRAPS = {
@@ -957,6 +958,44 @@ pub fn q2_double_and_collections() -> (Int, Bool, Int, Int, Int, Int) {
   let empty_ok = if xs.is_empty() { 0 } else { xs.length() }
   (mv, nan_ok, ln, g, mid[0] + mid[1], empty_ok)
 }
+
+///| Wave M2-A: Tuple Structs, default visibility, SourceLoc positional, OrderedMap m[k]=v, hex floats, debug_inspect
+struct M2Pair[T](Int, T)
+
+pub fn m2_tuple_struct_roundtrip(a : Int, b : String) -> (Int, String, Int) {
+  let p = M2Pair(a, b)
+  let M2Pair(k, v) = p
+  let idx_sum = p.0 + k
+  (idx_sum, v, p.1.length())
+}
+
+pub fn m2_pos_loc(msg : String, loc : SourceLoc) -> String {
+  msg + ":" + loc.to_string()
+}
+
+pub fn m2_map_index_set() -> (Int, Int) {
+  let m : Map[String, Int] = {}
+  m["a"] = 10
+  m["b"] = 20
+  m["a"] = 35
+  let a = match m.get("a") { Some(v) => v; None => 0 }
+  let b = match m.get("b") { Some(v) => v; None => 0 }
+  (a, b)
+}
+
+pub fn m2_hex_floats() -> (Int64, Int64, Int64, Bool) {
+  let h1 : Double = 0x1.0p1023
+  let h2 : Double = 0x1.fp-1022
+  let h3 : Double = 0x1.0p-54
+  let inf_ok = (1.0 / 0.0).is_inf() && !(h1.is_inf())
+  (h1.reinterpret_as_int64(), h2.reinterpret_as_int64(), h3.reinterpret_as_int64(), inf_ok)
+}
+
+pub fn m2_ref_default_check() -> Int {
+  let r : Ref[Int] = { val: 40 }
+  r.val = r.val + 2
+  r.val
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1432,6 +1471,19 @@ fn main {
     check("q2.int_lnot", ln == -1)
     check("q2.unsafe_get_set", g == 25)
     check("q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
+  } else if kase == "wave_m2_core" {
+    let (ts1, ts2, ts3) = @m12.m2_tuple_struct_roundtrip(7, "hi")
+    let (ma, mb) = @m12.m2_map_index_set()
+    let (b1, b2, b3, inf_ok) = @m12.m2_hex_floats()
+    let rv = @m12.m2_ref_default_check()
+    trace("m2", "\{ts1},\{ts2},\{ts3},\{ma},\{mb},\{b1},\{b2},\{b3},\{inf_ok},\{rv}")
+    check("m2.tuple_struct_idx", ts1 == 14 && ts2 == "hi" && ts3 == 2)
+    check("m2.map_idx_set", ma == 35 && mb == 20)
+    check("m2.hex_1p1023", b1 == 9214364837600034816L)
+    check("m2.hex_1fp_1022", b2 == 8725724278030336L)
+    check("m2.hex_1p_54", b3 == 4363988038922010624L)
+    check("m2.double_is_inf", inf_ok)
+    check("m2.ref_default", rv == 42)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1924,6 +1976,19 @@ pub fn main(w : World) -> Int {
     check(w, "q2.int_lnot", ln == -1)
     check(w, "q2.unsafe_get_set", g == 25)
     check(w, "q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
+  } else if kase == "wave_m2_core" {
+    let (ts1, ts2, ts3) = m12::m2_tuple_struct_roundtrip(7, "hi")
+    let (ma, mb) = m12::m2_map_index_set()
+    let (b1, b2, b3, inf_ok) = m12::m2_hex_floats()
+    let rv = m12::m2_ref_default_check()
+    trace(w, "m2", ts1.to_string() + "," + ts2 + "," + ts3.to_string() + "," + ma.to_string() + "," + mb.to_string() + "," + b1.to_string() + "," + b2.to_string() + "," + b3.to_string() + "," + inf_ok.to_string() + "," + rv.to_string())
+    check(w, "m2.tuple_struct_idx", ts1 == 14 && ts2 == "hi" && ts3 == 2)
+    check(w, "m2.map_idx_set", ma == 35 && mb == 20)
+    check(w, "m2.hex_1p1023", b1 == 9214364837600034816L)
+    check(w, "m2.hex_1fp_1022", b2 == 8725724278030336L)
+    check(w, "m2.hex_1p_54", b3 == 4363988038922010624L)
+    check(w, "m2.double_is_inf", inf_ok)
+    check(w, "m2.ref_default", rv == 42)
   } else {
     panic("abort: unknown case " + kase)
   }

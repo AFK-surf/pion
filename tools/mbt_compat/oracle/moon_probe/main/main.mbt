@@ -627,6 +627,33 @@ fn case_double_compare_nan() -> Unit {
 }
 
 ///|
+fn case_wave_m2_compat() -> Unit {
+  let inf = 1.0 / 0.0
+  let ninf = -1.0 / 0.0
+  let nan = 0.0 / 0.0
+  check("m2.is_inf_pos", inf.is_inf())
+  check("m2.is_inf_neg", ninf.is_inf())
+  check("m2.is_inf_nan", !nan.is_inf())
+  check("m2.is_inf_fin", !(42.5).is_inf())
+  let h1 : Double = 0x1.0p1023
+  let h2 : Double = 0x1.fp-1022
+  let h3 : Double = 0x1.0p-54
+  let h4 : Double = 0x1.0p-1074
+  trace("hex_bits", "\{h1.reinterpret_as_int64()},\{h2.reinterpret_as_int64()},\{h3.reinterpret_as_int64()},\{h4.reinterpret_as_int64()}")
+  let r1 : Ref[Int] = { val: 10 }
+  let r2 : Ref[Int] = { val: 10 }
+  r1.val = r1.val + 5
+  check("m2.ref_mut", r1.val == 15 && r2.val == 10)
+  check("m2.ref_phys", physical_equal(r1, r1) && !physical_equal(r1, r2))
+  let bs = Bytes::makei(4, fn(i) { (65 + i).to_byte() })
+  let sub = bs[1:3]
+  trace("bytes", "\{bs.length()},\{sub.length()},\{sub[0].to_int()},\{sub[1].to_int()}")
+  check("m2.bytes_makei", bs.length() == 4 && sub.length() == 2 && sub[0] == b'B' && sub[1] == b'C')
+  let fa = FixedArray::makei(3, fn(i) { i * 10 })
+  check("m2.fa_makei", fa.length() == 3 && fa[0] == 0 && fa[1] == 10 && fa[2] == 20)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -651,6 +678,7 @@ fn main {
     "collections" => case_collections()
     "opt.unwrap_none" => case_opt_unwrap_none()
     "arr.remove_oob" => case_arr_remove_oob()
+    "wave_m2.compat" => case_wave_m2_compat()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)
