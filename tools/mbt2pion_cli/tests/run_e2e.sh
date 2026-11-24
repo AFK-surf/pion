@@ -1627,4 +1627,6 @@ assert disps10n2 == [("fn:first", "unsupported")], f"10n-2 unexpected dispositio
 print("[e2e] PASS: Final Astra P1 suite (10n-2: #borrow(s) String extern \"C\" fn -> rc=1 MBT2PION_UNSUPPORTED_FFI_SIGNATURE + unsupported)")
 PY
 
+PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"
+
 echo "[e2e] ALL E2E TESTS PASSED!"

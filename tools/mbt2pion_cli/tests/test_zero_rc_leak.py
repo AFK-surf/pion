@@ -62,19 +62,15 @@ pub fn main(world : World) -> Int {
 
 
 def measure_peak_rss_kb(cmd):
-    if sys.platform == "darwin":
-        p = subprocess.run(["/usr/bin/time", "-l"] + cmd, capture_output=True, text=True, check=True)
-        m = re.search(r"(\d+)\s+maximum resident set size", p.stderr)
-        if not m:
-            raise RuntimeError("could not parse macOS peak RSS from stderr:\n" + p.stderr)
-        # macOS reports bytes
-        return int(m.group(1)) // 1024, p.stdout.strip()
-    else:
-        p = subprocess.run(["/usr/bin/time", "-v"] + cmd, capture_output=True, text=True, check=True)
-        m = re.search(r"Maximum resident set size \(kbytes\):\s*(\d+)", p.stderr)
-        if not m:
-            raise RuntimeError("could not parse Linux peak RSS from stderr:\n" + p.stderr)
-        return int(m.group(1)), p.stdout.strip()
+    p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    _, status, rusage = os.wait4(p.pid, 0)
+    out = p.stdout.read().decode("utf-8", "replace").strip()
+    err = p.stderr.read().decode("utf-8", "replace").strip()
+    if status != 0:
+        raise RuntimeError("child exited with status=%d stderr=%s" % (status, err))
+    # macOS reports ru_maxrss in bytes; Linux reports ru_maxrss in KB.
+    rss_kb = rusage.ru_maxrss // 1024 if sys.platform == "darwin" else rusage.ru_maxrss
+    return rss_kb, out
 
 
 def main():

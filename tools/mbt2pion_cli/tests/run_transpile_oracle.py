@@ -758,7 +758,7 @@ pub fn m12_map_and_str_control_flow() -> (Int, Int) {
   (msum, scount)
 }
 
-pub fn m12_compat_helpers_demo() -> (Int, String, Int, Bool, Bool, String) {
+pub fn m12_compat_helpers_demo() -> (Int, String, Int, Bool, Bool, String, Bool) {
   let rf = match "a/b/c".rev_find("/") {
     Some(i) => i
     None => -1
@@ -771,7 +771,8 @@ pub fn m12_compat_helpers_demo() -> (Int, String, Int, Bool, Bool, String) {
   let has = [10, 20, 30].contains(30)
   let dig = '7'.is_ascii_digit() && 'Z'.to_ascii_lowercase() == 'z'
   let built = String::from_array(['A', (0x1F600).unsafe_to_char(), 'B'])
-  (rf, lo, idx, has, dig, built)
+  let lex = "alpha".lexical_compare("k9") < 0 && "abc".lexical_compare("abcd") < 0 && "abc".lexical_compare("abc") == 0
+  (rf, lo, idx, has, dig, built, lex)
 }
 '''
 
@@ -1191,8 +1192,8 @@ fn main {
     let (p1, p2, p3, tr) = @m12.m12_pipe_and_arrow_demo()
     let lm = @m12.m12_live_map_update()
     let (ms, sc) = @m12.m12_map_and_str_control_flow()
-    let (rf, lo, idx, has, dig, built) = @m12.m12_compat_helpers_demo()
-    trace("r", "\{p1},\{p2},\{p3},\{tr},\{lm},\{ms},\{sc},\{rf},\{lo},\{idx},\{has},\{dig},\{built}")
+    let (rf, lo, idx, has, dig, built, lex) = @m12.m12_compat_helpers_demo()
+    trace("r", "\{p1},\{p2},\{p3},\{tr},\{lm},\{ms},\{sc},\{rf},\{lo},\{idx},\{has},\{dig},\{built},\{lex}")
     check("m12.pipe_25", p1 == 25)
     check("m12.pipe_ignore_7", p2 == 7)
     check("m12.pipe_order_213", p3 == 213)
@@ -1202,7 +1203,7 @@ fn main {
     check("m12.str_ctrl_2", sc == 2)
     check("m12.rev_find_3", rf == 3)
     check("m12.arr_search_contains", idx == 1 && has)
-    check("m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B")
+    check("m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B" && lex)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1638,8 +1639,8 @@ pub fn main(w : World) -> Int {
     let (p1, p2, p3, tr) = m12::m12_pipe_and_arrow_demo()
     let lm = m12::m12_live_map_update()
     let (ms, sc) = m12::m12_map_and_str_control_flow()
-    let (rf, lo, idx, has, dig, built) = m12::m12_compat_helpers_demo()
-    trace(w, "r", p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + tr.to_string() + "," + lm.to_string() + "," + ms.to_string() + "," + sc.to_string() + "," + rf.to_string() + "," + lo + "," + idx.to_string() + "," + has.to_string() + "," + dig.to_string() + "," + built)
+    let (rf, lo, idx, has, dig, built, lex) = m12::m12_compat_helpers_demo()
+    trace(w, "r", p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + tr.to_string() + "," + lm.to_string() + "," + ms.to_string() + "," + sc.to_string() + "," + rf.to_string() + "," + lo + "," + idx.to_string() + "," + has.to_string() + "," + dig.to_string() + "," + built + "," + lex.to_string())
     check(w, "m12.pipe_25", p1 == 25)
     check(w, "m12.pipe_ignore_7", p2 == 7)
     check(w, "m12.pipe_order_213", p3 == 213)
@@ -1649,7 +1650,7 @@ pub fn main(w : World) -> Int {
     check(w, "m12.str_ctrl_2", sc == 2)
     check(w, "m12.rev_find_3", rf == 3)
     check(w, "m12.arr_search_contains", idx == 1 && has)
-    check(w, "m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B")
+    check(w, "m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B" && lex)
   } else {
     panic("abort: unknown case " + kase)
   }
