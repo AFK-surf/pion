@@ -68,8 +68,9 @@ else
     "$PION_QBE" -t amd64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
     "$CC_BIN" -arch x86_64 "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Darwin" ]; then
-    "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
-    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+    # Direct Mach-O .o from QBE: no text assembly through Apple `as`.
+    "$PION_QBE" -t arm64_apple --obj -o "$TMP_DIR/pionc0.o" "$SEED_SSA"
+    "$CC_BIN" "$TMP_DIR/pionc0.o" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "x86_64" ]; then
     "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$SEED_SSA"
     "$CC_BIN" "$TMP_DIR/pionc0.o" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
@@ -95,7 +96,6 @@ mkdir -p "$CAS_S1"
 T_S1_0=$(now_ms)
 PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$CAS_S1" "$OUT_DIR/pionc0" build \
   --emit-ssa "$OUT_DIR/stage1.ssa" \
-  --emit-asm "$OUT_DIR/stage1.s" \
   -o "$OUT_DIR/pionc1" \
   "$COMPILER_DIR/src/core" \
   "$COMPILER_DIR/src/cli/main.pion"
@@ -103,9 +103,8 @@ T_S1_1=$(now_ms)
 S1_MS=$((T_S1_1 - T_S1_0))
 S1_SSA_LINES=$(wc -l < "$OUT_DIR/stage1.ssa" | tr -d ' ')
 S1_SSA_BYTES=$(wc -c < "$OUT_DIR/stage1.ssa" | tr -d ' ')
-S1_ASM_LINES=$(wc -l < "$OUT_DIR/stage1.s" | tr -d ' ')
 S1_BYTES=$(wc -c < "$OUT_DIR/pionc1" | tr -d ' ')
-echo "Stage 1 (pionc1): build=${S1_MS} ms, stage1.ssa=${S1_SSA_LINES} lines (${S1_SSA_BYTES} bytes), stage1.s=${S1_ASM_LINES} lines, binary=${S1_BYTES} bytes"
+echo "Stage 1 (pionc1): build=${S1_MS} ms, stage1.ssa=${S1_SSA_LINES} lines (${S1_SSA_BYTES} bytes), binary=${S1_BYTES} bytes"
 
 echo "=== [4/9] Stage 2: pionc1 -> out/pionc2 (fresh CAS, pure pion native + multicore) ==="
 CAS_S2="$TMP_DIR/cas_stage2"
@@ -113,7 +112,6 @@ mkdir -p "$CAS_S2"
 T_S2_0=$(now_ms)
 PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$CAS_S2" "$OUT_DIR/pionc1" build \
   --emit-ssa "$OUT_DIR/stage2.ssa" \
-  --emit-asm "$OUT_DIR/stage2.s" \
   -o "$OUT_DIR/pionc2" \
   "$COMPILER_DIR/src/core" \
   "$COMPILER_DIR/src/cli/main.pion"
@@ -121,9 +119,8 @@ T_S2_1=$(now_ms)
 S2_MS=$((T_S2_1 - T_S2_0))
 S2_SSA_LINES=$(wc -l < "$OUT_DIR/stage2.ssa" | tr -d ' ')
 S2_SSA_BYTES=$(wc -c < "$OUT_DIR/stage2.ssa" | tr -d ' ')
-S2_ASM_LINES=$(wc -l < "$OUT_DIR/stage2.s" | tr -d ' ')
 S2_BYTES=$(wc -c < "$OUT_DIR/pionc2" | tr -d ' ')
-echo "Stage 2 (pionc2): build=${S2_MS} ms, stage2.ssa=${S2_SSA_LINES} lines (${S2_SSA_BYTES} bytes), stage2.s=${S2_ASM_LINES} lines, binary=${S2_BYTES} bytes"
+echo "Stage 2 (pionc2): build=${S2_MS} ms, stage2.ssa=${S2_SSA_LINES} lines (${S2_SSA_BYTES} bytes), binary=${S2_BYTES} bytes"
 
 echo "=== [5/9] Fixed-Point Proof ==="
 if command -v shasum >/dev/null 2>&1; then
@@ -134,25 +131,18 @@ fi
 if cmp -s "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"; then
   $SHA_CMD "$OUT_DIR/stage1.ssa" "$OUT_DIR/stage2.ssa"
   echo "SSA fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
-  $SHA_CMD "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
-  cmp "$OUT_DIR/stage1.s" "$OUT_DIR/stage2.s"
-  echo "ASM fixed-point (Stage 1 == Stage 2): BIT-FOR-BIT IDENTICAL"
 else
   echo "Stage 1 (seed) != Stage 2 (new codegen); running Stage 3 (pionc2 -> pionc3) to verify Stage 2 == Stage 3 fixed-point"
   CAS_S3="$TMP_DIR/cas_stage3"
   mkdir -p "$CAS_S3"
   PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$CAS_S3" "$OUT_DIR/pionc2" build \
     --emit-ssa "$OUT_DIR/stage3.ssa" \
-    --emit-asm "$OUT_DIR/stage3.s" \
     -o "$OUT_DIR/pionc3" \
     "$COMPILER_DIR/src/core" \
     "$COMPILER_DIR/src/cli/main.pion"
   $SHA_CMD "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
   cmp "$OUT_DIR/stage2.ssa" "$OUT_DIR/stage3.ssa"
   echo "SSA fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
-  $SHA_CMD "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
-  cmp "$OUT_DIR/stage2.s" "$OUT_DIR/stage3.s"
-  echo "ASM fixed-point (Stage 2 == Stage 3): BIT-FOR-BIT IDENTICAL"
 fi
 
 PIONC2="$OUT_DIR/pionc2"

@@ -107,9 +107,6 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
   echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2
   exit 1
 fi
-sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC2"
 P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
 echo "p17a_ergonomics_mt -> $P17A_OUT"
 if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
@@ -177,24 +174,54 @@ if command -v node >/dev/null 2>&1; then
     exit 1
   fi
 fi
+
+# Independent E2E suites (each in its own mktemp -d + CAS, ephemeral ports, nothing
+# written to the source tree or out/) run concurrently; see scripts/run-e2e-parallel.sh.
+export ROOT_DIR OUT_DIR PIONC2
+sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" <<'E2E'
+# Slowest suites first so the pool packs well.
+# Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.
+sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC2"
+# Wave H-2 Track H5: ARM64 far conditional branches (> +-1MB) + QBE rega cold-call seeding + cold-block layout.
+sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC2"
+# P29-C: zero-toolchain WebAssembly (--target wasm32 + runtime/pion_wasm_rt.mjs + 4 V1 benchmarks in Node.js).
+sh "$ROOT_DIR/tests/e2e/p29c_wasm32/run_e2e.sh" "$PIONC2"
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+# Wave J4b: Cargo-style package aliases, canonical package IDs, lockfile compat & C-export collision guard.
+sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC2"
+# Wave J3: first-class immutable Send sequence type ImmArray[T].
+sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p76_value_key_map/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p77_views_and_lib_os/run_e2e.sh" "$PIONC2"
+# P30-H: cross-pkg generic Mutex[Array[Ev]] / Channel[Cmd] deep-freeze under real OS threads (release + ASan + TSan).
+sh "$ROOT_DIR/tests/e2e/p30h_crosspkg_mt_deep_freeze/run_e2e.sh" "$PIONC2"
+# Wave I1: pionc test single-pkg default + deps_skipped + parallel check+emit & c_sources + --version abi_rev.
+sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC2"
+# P96: stack-promoted POD structs & StrView/BytesView carry 24B immortal PionHeader across multi-hop RC calls.
+sh "$ROOT_DIR/tests/e2e/p96_pod_stack_rc_soundness/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p85_bytes_bce/run_e2e.sh" "$PIONC2"
+# P97: per-process unique output staging directories (`test --jobs 4` race, same-pid leftovers, fail-fast mkdir errors).
+sh "$ROOT_DIR/tests/e2e/p97_stage_dir_race/run_e2e.sh" "$PIONC2"
+# P99: anonymous struct literals without a struct context fail closed in check (no NULL-struct SIGSEGV); legal contexts Native == Wasm32.
+sh "$ROOT_DIR/tests/e2e/p99_anon_struct_lit/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p27b_freeze_named_args/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC2"
 # P26-A: native link ([link]/[link.macos]/[link.linux], c_sources .c/.cc, objects .a, search_paths, rpaths, frameworks, pionc test).
 sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC2"
 # P26-B: C callbacks (extern "C" fn body + c_fn_ptr), zero-copy FFI/math/StringBuilder, cross-pkg generic Option mono & private exports.
 sh "$ROOT_DIR/tests/e2e/p26b_ffi_generics/run_e2e.sh" "$PIONC2"
 # P29-A: multi-target (--target all 9 POSIX/mobile targets, --emit-asm, --emit-staticlib, --emit-cdylib, amd64_apple & ios_sim_arm64 cross checks).
 sh "$ROOT_DIR/tests/e2e/p29a_multi_target/run_e2e.sh" "$PIONC2"
-# P29-C: zero-toolchain WebAssembly (--target wasm32 + runtime/pion_wasm_rt.mjs + 4 V1 benchmarks in Node.js).
-sh "$ROOT_DIR/tests/e2e/p29c_wasm32/run_e2e.sh" "$PIONC2"
 # P30-A: Bugs #9-#13 (Array/FixedArray::contains, tuple-Option-if match, E_CAPTURE_MUT_ASSIGN, Float bare lits, \u{...} escapes; native + ASan + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p30a_bugs9_to_13/run_e2e.sh" "$PIONC2"
 # P30-B: single-thread RC fast path, borrow RC elision + adversarial ASan/LSan, Bug #15 unannotated closure param infer.
 sh "$ROOT_DIR/tests/e2e/p30b_rc_borrow_perf/run_e2e.sh" "$PIONC2"
 # P30-C: Bugs #16a & #16b (generic higher-order closure return infer + struct method own tparam unification; native + ASan + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p30c_generic_infer/run_e2e.sh" "$PIONC2"
-# P30-H: cross-pkg generic Mutex[Array[Ev]] / Channel[Cmd] deep-freeze under real OS threads (release + ASan + TSan).
-sh "$ROOT_DIR/tests/e2e/p30h_crosspkg_mt_deep_freeze/run_e2e.sh" "$PIONC2"
 # P31-A: -> Unit tail discard, struct TFn field direct call, local closure let mut auto-boxing, Array/Map::with_capacity (native + ASan/LSan + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p31a_ergonomics/run_e2e.sh" "$PIONC2"
 # P31-C: leading-dot .Variant inference + pure compile-time desugared Pion-JSX + pionc fmt (native + ASan/LSan + Wasm32).
@@ -230,52 +257,33 @@ sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC2" "$OUT_DIR/qbe"
 sh "$ROOT_DIR/tests/e2e/p71a_staticlib_android/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p71b_invar_fixes/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p72b_lang_cli/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p73_deep_rc_drop/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p74a_topo_init_and_variant/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p75a_compact_i8_f32/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p75b_simd_primitives/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p76_value_key_map/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p72a_flat_pod_opt/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p74c_licm_alias_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p74d_float_to_int_sat/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p77_views_and_lib_os/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p74f_xpkg_pod_borrow_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p74e_cli_cas_hygiene/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p85_bytes_bce/run_e2e.sh" "$PIONC2"
 # Wave H-1: QBE spill/rega RSS + caller inline budget, ST frozen shared_rc + inline_rc upgrade, mut/chained borrow + scoped move-out.
 sh "$ROOT_DIR/tests/e2e/p86_qbe_rss_budget/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p88_borrow_moveout/run_e2e.sh" "$PIONC2"
 # Wave H-2 Track H4: unboxed 1-based C-style unit enums + Option[UnitEnum] null niche (dev + release + ASan/LSan + Wasm32 + xpkg).
 sh "$ROOT_DIR/tests/e2e/p89_unit_enum/run_e2e.sh" "$PIONC2"
-# Wave H-2 Track H5: ARM64 far conditional branches (> +-1MB) + QBE rega cold-call seeding + cold-block layout.
-sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC2"
 # Wave I2: *_data_ptr static E_TEMP_DATA_PTR guard + slot pinning (dev + release + ASan/LSan).
 sh "$ROOT_DIR/tests/e2e/p91_data_ptr_safety/run_e2e.sh" "$PIONC2"
-# Wave I1: pionc test single-pkg default + deps_skipped + parallel check+emit & c_sources + --version abi_rev.
-sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC2"
 # Wave I3: zero-byte math primitives, exact Double::to_string, panic path sanitization & Web Wasm host bridge.
 sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC2"
 # Wave J0: symlinked pionc self-location + atomic (temp + rename) native/Wasm32 link publishing.
 sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC2"
 # P95: Wasm32 nested-loop outlining writes back inner-loop-only read+write slots (Native == Wasm32, Debug + --release).
 sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.sh" "$PIONC2"
-# P96: stack-promoted POD structs & StrView/BytesView carry 24B immortal PionHeader across multi-hop RC calls.
-sh "$ROOT_DIR/tests/e2e/p96_pod_stack_rc_soundness/run_e2e.sh" "$PIONC2"
-# P97: per-process unique output staging directories (`test --jobs 4` race, same-pid leftovers, fail-fast mkdir errors).
-sh "$ROOT_DIR/tests/e2e/p97_stage_dir_race/run_e2e.sh" "$PIONC2"
-# Wave J4b: Cargo-style package aliases, canonical package IDs, lockfile compat & C-export collision guard.
-sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC2"
-# Wave J3: first-class immutable Send sequence type ImmArray[T].
-sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC2"
-# Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.
-sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC2"
-# P99: anonymous struct literals without a struct context fail closed in check (no NULL-struct SIGSEGV); legal contexts Native == Wasm32.
-sh "$ROOT_DIR/tests/e2e/p99_anon_struct_lit/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
+E2E
+# P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.
+sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent

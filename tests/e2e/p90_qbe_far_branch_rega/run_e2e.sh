@@ -42,9 +42,21 @@ out_dir = sys.argv[1]
 #    - backward conditional branch (< -1MB)
 #    - external call relocations (ext_helper)
 # Keep max SSA def-use chain depth shallow (< 2000) so QBE GCM never overflows
-# the C stack: 1450 blocks x 200 ops, split across 16 independent lanes (91
-# blocks/lane) with 10 parallel 20-op subchains per block.
-N_BLKS = 1600
+# the C stack: N_REAL_BLKS real compute blocks of 209 ops, split across 16
+# independent lanes with 10 parallel 20-op subchains per block (checked exactly
+# by the C driver), then N_PAD_BLKS size-only blocks of PAD_STORES
+# `storel lane, %state` each. A store through the %state pointer argument is
+# never promoted or dead-store eliminated (QBE only kills dead stores to its
+# own stack slots; the loop also calls $ext_helper before %state is rewritten)
+# and costs exactly one machine store, so the padding grows __text past 1 MB
+# without hundreds of thousands of SSA temporaries for QBE to allocate (that
+# made this script take ~50 s). The stores land in st[0] (the accumulator),
+# which @loop_back overwrites before anything reads it, so the checked result
+# only depends on the real blocks. Storing through the plain argument (not a
+# derived `add %state, 16` address) keeps each QBE run ~2.5x faster.
+N_REAL_BLKS = 160
+N_PAD_BLKS = 1440
+PAD_STORES = 180
 N_LANES = 16
 SUBCHAINS = 10
 SUB_LEN = 20
@@ -85,7 +97,7 @@ for li in range(N_LANES):
     lines.append(f"    {v} =l add %acc, {li + 1}")
     lanes.append(v)
 
-for bi in range(N_BLKS):
+for bi in range(N_REAL_BLKS):
     lines.append(f"@pad_{bi}")
     li = bi % N_LANES
     base = lanes[li]
@@ -107,6 +119,12 @@ for bi in range(N_BLKS):
         lines.append(f"    {nxt} =l xor {red}, {ends[sc]}")
         red = nxt
     lanes[li] = red
+
+for pi in range(N_PAD_BLKS):
+    lines.append(f"@pad_{N_REAL_BLKS + pi}")
+    v = lanes[pi % N_LANES]
+    for _ in range(PAD_STORES):
+        lines.append(f"    storel {v}, %state")
 
 lines.append("@loop_back")
 final_v = lanes[0]
@@ -179,7 +197,7 @@ static int64_t expected_pad(int64_t acc) {
     int64_t lanes[16];
     for (int li = 0; li < 16; li++)
         lanes[li] = acc + (li + 1);
-    for (int bi = 0; bi < 1600; bi++) {
+    for (int bi = 0; bi < 160; bi++) {
         int li = bi % 16;
         int64_t base = lanes[li];
         int64_t red = 0;
@@ -232,8 +250,21 @@ with open(os.path.join(out_dir, "far_driver.c"), "w") as f:
 PYEOF
 
 # A1.1: arm64_apple direct Mach-O .o verification (works on both Linux and macOS!)
-"$QBE" -t arm64_apple --obj -o "$TMP_DIR/far_branch_arm64.o" "$TMP_DIR/far_branch.ssa"
-"$QBE" -t arm64_apple --obj -o "$TMP_DIR/small_branch_arm64.o" "$TMP_DIR/small_branch.ssa"
+# The > 1 MB far_branch.ssa takes QBE a few seconds per target: emit every
+# object/assembly file used below in parallel up front (each `wait` fails the
+# script on error).
+QBE_PIDS=""
+qbe_bg() { "$QBE" "$@" & QBE_PIDS="$QBE_PIDS $!"; }
+qbe_bg -t arm64_apple --obj -o "$TMP_DIR/far_branch_arm64.o" "$TMP_DIR/far_branch.ssa"
+qbe_bg -t arm64_apple --obj -o "$TMP_DIR/small_branch_arm64.o" "$TMP_DIR/small_branch.ssa"
+qbe_bg -t arm64 -o "$TMP_DIR/far_branch_arm64.s" "$TMP_DIR/far_branch.ssa"
+qbe_bg -t arm64 -o "$TMP_DIR/small_branch_arm64.s" "$TMP_DIR/small_branch.ssa"
+if [ "$(uname -s)" = "Linux" ] && [ "$(uname -m)" = "x86_64" ]; then
+  qbe_bg -t amd64_sysv --obj -o "$TMP_DIR/far_branch_host.o" "$TMP_DIR/far_branch.ssa"
+elif [ "$(uname -s)" = "Darwin" ] && command -v clang >/dev/null 2>&1; then
+  qbe_bg -t arm64_apple -o "$TMP_DIR/far_branch_apple.s" "$TMP_DIR/far_branch.ssa"
+fi
+for P in $QBE_PIDS; do wait "$P"; done
 
 python3 - "$TMP_DIR/far_branch_arm64.o" "$TMP_DIR/small_branch_arm64.o" "$QBE" "$TMP_DIR" <<'PYEOF'
 import os, struct, subprocess, sys
@@ -342,31 +373,12 @@ print(f"[PASS] Mach-O far_branch: size={far_sz}B thunks={far_thunks} (fwd={fwd_f
 qbe_bin, tmp_dir = sys.argv[3], sys.argv[4]
 
 def emit_pad_chunks(lines, total_ops, prefix, val_ref, ptr_ref):
-    # Each chunk of up to 100 ops has shallow SSA depth (<= 100), starts with a
-    # unique imm12 (cid + 1 <= 4095, single ARM64 ADD imm instruction) so GVN
-    # cannot deduplicate chunks, and ends with storel to ptr_ref so nothing is DCE'd.
-    done = 0
-    cid = 0
-    while done < total_ops:
-        rem = total_ops - done
-        if rem == 1:
-            lines.append(f"    storel {val_ref}, {ptr_ref}")
-            done += 1
-            break
-        n_add = min(99, rem - 1)
-        cur = val_ref
-        for k in range(n_add):
-            nxt = f"%{prefix}_{cid}_{k}"
-            if k == 0:
-                lines.append(f"    {nxt} =l add {cur}, {cid + 1}")
-            elif (k & 1) == 1:
-                lines.append(f"    {nxt} =l xor {cur}, 3")
-            else:
-                lines.append(f"    {nxt} =l add {cur}, 1")
-            cur = nxt
-        lines.append(f"    storel {cur}, {ptr_ref}")
-        done += n_add + 1
-        cid += 1
+    # Exactly total_ops machine instructions of padding: each `storel` through
+    # the pointer argument is one ARM64 `str` with zero new SSA temporaries
+    # (stores through an argument are never promoted or dead-store eliminated;
+    # only QBE stack slots are). The probes below calibrate the fixed overhead.
+    for _ in range(total_ops):
+        lines.append(f"    storel {val_ref}, {ptr_ref}")
 
 def build_and_inspect_edge(tag, ssa_text):
     ssa_p = os.path.join(tmp_dir, f"edge_{tag}.ssa")
@@ -418,33 +430,45 @@ def make_bwd_ssa(n_ops):
     ])
     return "\n".join(lines) + "\n"
 
-# Self-calibrate exact instruction overhead using a small probe (n_ops = 500)
-_, probe_fwd = build_and_inspect_edge("probe_fwd", make_fwd_ssa(500))
+from concurrent.futures import ThreadPoolExecutor
+
+# Self-calibrate exact instruction overhead using small probes (n_ops = 500 and
+# 501: one more padding op must move the branch by exactly one instruction).
+with ThreadPoolExecutor(max_workers=4) as pool:
+    probes = list(pool.map(lambda a: build_and_inspect_edge(*a), [
+        ("probe_fwd", make_fwd_ssa(500)),
+        ("probe_fwd1", make_fwd_ssa(501)),
+        ("probe_bwd", make_bwd_ssa(500)),
+        ("probe_bwd1", make_bwd_ssa(501)),
+    ]))
+(_, probe_fwd), (_, probe_fwd1), (_, probe_bwd), (_, probe_bwd1) = probes
 assert len(probe_fwd) == 1 and probe_fwd[0] >= 500, f"bad fwd probe: {probe_fwd}"
+assert probe_fwd1 == [probe_fwd[0] + 1], f"fwd padding is not 1 insn/op: {probe_fwd} -> {probe_fwd1}"
 fwd_overhead = probe_fwd[0] - 500
 n_fwd_max = 262143 - fwd_overhead
-
-th_fmax, sh_fmax = build_and_inspect_edge("fwd_262143", make_fwd_ssa(n_fwd_max))
-assert len(th_fmax) == 0 and 262143 in sh_fmax, f"fwd +262143 failed: thunks={th_fmax} short={sh_fmax}"
-th_fover, _ = build_and_inspect_edge("fwd_262144", make_fwd_ssa(n_fwd_max + 1))
-assert th_fover == [262144], f"fwd +262144 failed: thunks={th_fover}"
-
-_, probe_bwd = build_and_inspect_edge("probe_bwd", make_bwd_ssa(500))
 assert len(probe_bwd) == 1 and (-probe_bwd[0]) >= 500, f"bad bwd probe: {probe_bwd}"
+assert probe_bwd1 == [probe_bwd[0] - 1], f"bwd padding is not 1 insn/op: {probe_bwd} -> {probe_bwd1}"
 bwd_overhead = (-probe_bwd[0]) - 500
 n_bwd_min = 262144 - bwd_overhead
 
-th_bmin, sh_bmin = build_and_inspect_edge("bwd_262144", make_bwd_ssa(n_bwd_min))
+# The four exact boundary builds are independent QBE runs: run them in parallel.
+with ThreadPoolExecutor(max_workers=4) as pool:
+    edges = list(pool.map(lambda a: build_and_inspect_edge(*a), [
+        ("fwd_262143", make_fwd_ssa(n_fwd_max)),
+        ("fwd_262144", make_fwd_ssa(n_fwd_max + 1)),
+        ("bwd_262144", make_bwd_ssa(n_bwd_min)),
+        ("bwd_262145", make_bwd_ssa(n_bwd_min + 1)),
+    ]))
+(th_fmax, sh_fmax), (th_fover, _), (th_bmin, sh_bmin), (th_bover, _) = edges
+assert len(th_fmax) == 0 and 262143 in sh_fmax, f"fwd +262143 failed: thunks={th_fmax} short={sh_fmax}"
+assert th_fover == [262144], f"fwd +262144 failed: thunks={th_fover}"
 assert len(th_bmin) == 0 and -262144 in sh_bmin, f"bwd -262144 failed: thunks={th_bmin} short={sh_bmin}"
-th_bover, _ = build_and_inspect_edge("bwd_262145", make_bwd_ssa(n_bwd_min + 1))
 assert th_bover == [-262146], f"bwd -262145 failed: thunks={th_bover}"
 
 print(f"[PASS] Mach-O exact imm19 boundaries: +262143(short) / +262144(far={th_fover[0]}), -262144(short) / -262145(far={th_bover[0]})")
 PYEOF
 
-# A1.2: arm64 ELF text assembly verification
-"$QBE" -t arm64 -o "$TMP_DIR/far_branch_arm64.s" "$TMP_DIR/far_branch.ssa"
-"$QBE" -t arm64 -o "$TMP_DIR/small_branch_arm64.s" "$TMP_DIR/small_branch.ssa"
+# A1.2: arm64 ELF text assembly verification (emitted above)
 
 python3 - "$TMP_DIR/far_branch_arm64.s" "$TMP_DIR/small_branch_arm64.s" <<'PYEOF'
 import re, sys
@@ -472,7 +496,6 @@ if command -v aarch64-linux-gnu-as >/dev/null 2>&1; then
   aarch64-linux-gnu-as -o "$TMP_DIR/far_branch_arm64_as.o" "$TMP_DIR/far_branch_arm64.s"
   echo "[PASS] aarch64-linux-gnu-as assembled far_branch_arm64.s cleanly"
 elif [ "$(uname -s)" = "Darwin" ] && command -v clang >/dev/null 2>&1; then
-  "$QBE" -t arm64_apple -o "$TMP_DIR/far_branch_apple.s" "$TMP_DIR/far_branch.ssa"
   clang -arch arm64 -c "$TMP_DIR/far_branch_apple.s" -o "$TMP_DIR/far_branch_apple_as.o"
   echo "[PASS] clang -arch arm64 assembled far_branch_apple.s cleanly"
 fi
@@ -483,7 +506,6 @@ UNAME_M="$(uname -m)"
 if [ "$UNAME_S" = "Darwin" ] && [ "$UNAME_M" = "arm64" ]; then
   "$CC" "$TMP_DIR/far_branch_arm64.o" "$TMP_DIR/far_driver.c" -o "$TMP_DIR/far_driver"
 elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "x86_64" ]; then
-  "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/far_branch_host.o" "$TMP_DIR/far_branch.ssa"
   "$CC" "$TMP_DIR/far_branch_host.o" "$TMP_DIR/far_driver.c" -o "$TMP_DIR/far_driver"
 elif [ "$UNAME_S" = "Linux" ] && { [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; }; then
   "$CC" "$TMP_DIR/far_branch_arm64.s" "$TMP_DIR/far_driver.c" -o "$TMP_DIR/far_driver"

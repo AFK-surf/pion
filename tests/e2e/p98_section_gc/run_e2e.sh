@@ -7,7 +7,17 @@ set -eu
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+BIGOBJ_PID=""
+cleanup() {
+  if [ -n "${BIGOBJ_PID:-}" ]; then
+    kill "$BIGOBJ_PID" 2>/dev/null || true
+    wait "$BIGOBJ_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 export PION_CACHE_DIR="$TMP/cas"
 
 WS="$TMP/ws"
@@ -609,10 +619,15 @@ with open(sys.argv[1], "w") as f:
         f.write(f'.section .text$f_{i},"xr"\n.linkonce one_only\n.globl f_{i}\nf_{i}:\n\tret\n')
     f.write('.section .text$main,"xr"\n.linkonce one_only\n.globl main\nmain:\n\tcall f_0\n\txorl %eax,%eax\n\tret\n')
 PYEOF
-  x86_64-w64-mingw32-gcc -Wa,-mbig-obj -c "$TMP/bigobj.s" -o "$TMP/bigobj.o"
-  "$MINGW_AR" rcs "$TMP/libbigobj.a" "$TMP/bigobj.o"
-  x86_64-w64-mingw32-gcc -Wl,--gc-sections "$TMP/bigobj.o" -o "$TMP/bigobj.exe"
-  echo "[PASS] p98: 66,000-section COFF big-obj assembled, archived, and GC-linked"
+  # GNU as takes ~20 s on each >65,279-section object: assemble this one in the
+  # background while the c_sources big-obj below builds, then join on it.
+  (
+    set -e
+    x86_64-w64-mingw32-gcc -Wa,-mbig-obj -c "$TMP/bigobj.s" -o "$TMP/bigobj.o"
+    "$MINGW_AR" rcs "$TMP/libbigobj.a" "$TMP/bigobj.o"
+    x86_64-w64-mingw32-gcc -Wl,--gc-sections "$TMP/bigobj.o" -o "$TMP/bigobj.exe"
+  ) > "$TMP/bigobj.log" 2>&1 &
+  BIGOBJ_PID=$!
 
   # Real manifest `c_sources` >66,000-section COFF big-obj via `pionc build --target amd64_win`.
   CBIG="$TMP/c_bigobj_pkg"
@@ -643,6 +658,15 @@ with open(sys.argv[1], "w") as f:
 PYEOF
   env -u PION_RT_LIB CC=x86_64-w64-mingw32-gcc "$PIONC" build --release --target amd64_win -o "$TMP/c_bigobj.exe" "$CBIG"
   echo "[PASS] p98: real manifest c_sources >68,000-section COFF big-obj compiled & linked via pionc"
+  if ! wait "$BIGOBJ_PID"; then
+    BIGOBJ_PID=""
+    cat "$TMP/bigobj.log" >&2
+    echo "FAIL: p98: 66,000-section COFF big-obj assemble/archive/GC-link failed" >&2
+    exit 1
+  fi
+  BIGOBJ_PID=""
+  cat "$TMP/bigobj.log"
+  echo "[PASS] p98: 66,000-section COFF big-obj assembled, archived, and GC-linked"
 fi
 
 # 4. MSVC lld-link & link.exe verification (runs whenever clang + lld-link / link.exe are available).

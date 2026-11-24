@@ -449,7 +449,11 @@ if [ "$IS_COMPILE" = "1" ] && [ -n "$TAG" ]; then
   exit "$RC"
 else
   if [ -n "${P91_CC_LOG:-}" ]; then
-    printf 'LINK %s\n' "$*" >> "$P91_CC_LOG"
+    # One file per link: `--jobs 4` links lib_a, lib_b and app concurrently and
+    # a LINK line is > 1 KiB, which a shell's `printf >>` need not write in one
+    # write(2), so lines appended to one shared log may interleave.
+    LINK_F=$(mktemp "$P91_CC_LOG.link.XXXXXX")
+    printf 'LINK %s\n' "$*" > "$LINK_F"
   fi
   exec "$REAL" "$@"
 fi
@@ -589,7 +593,7 @@ if [ "$TO_RC" -ne 124 ] || [ -f "$BARRIER_TO/overlap_ok" ] || [ "$(cat "$BARRIER
 fi
 
 python3 - "$TMP_DIR/cs_j4.json" "$TMP_DIR/cc_j1.log" "$TMP_DIR/cc_j4.log" "$TMP_DIR/cs_j1.trace" "$TMP_DIR/cs_j4.trace" <<'PYEOF'
-import json, re, sys
+import glob, json, re, sys
 
 d = json.load(open(sys.argv[1]))
 assert d["ok"] is True and d["total"] == 3 and d["passed"] == 3 and d["failed"] == 0, d
@@ -613,8 +617,12 @@ def map_cstub_keys(trace_path):
     assert set(m.values()) == {"lib_a", "lib_b"}, f"missing cstub trace map: {m}"
     return m
 
+def link_lines(cc_log):
+    for path in sorted(glob.glob(cc_log + ".link.*")):
+        yield from open(path)
+
 def extract_app_cstub_order(cc_log, key_map):
-    for line in open(cc_log):
+    for line in link_lines(cc_log):
         if not line.startswith("LINK "):
             continue
         objs = re.findall(r"cstub_([0-9a-f]+)\.o", line)

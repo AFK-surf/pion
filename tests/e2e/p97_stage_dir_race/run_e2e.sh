@@ -411,7 +411,7 @@ finally:
     # The whole group: pionc and every linker / fake CC it started.
     try:
         os.killpg(proc.pid, signal.SIGTERM)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     try:
         proc.wait(timeout=2)
@@ -419,7 +419,7 @@ finally:
         pass
     try:
         os.killpg(proc.pid, signal.SIGKILL)
-    except ProcessLookupError:
+    except (ProcessLookupError, PermissionError):
         pass
     proc.wait()
     for fd in fds.values():
