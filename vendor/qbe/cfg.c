@@ -407,48 +407,59 @@ simpljmp(Fn *fn)
 }
 
 static int
-reachrec(Blk *b, Blk *to)
+reachrec(Blk *b, Blk *to, uint gen)
 {
 	if (b == to)
 		return 1;
-	if (!b || b->visit)
+	if (!b || b->reachgen == gen)
 		return 0;
 
-	b->visit = 1;
-	if (reachrec(b->s1, to))
+	b->reachgen = gen;
+	if (reachrec(b->s1, to, gen))
 		return 1;
-	if (reachrec(b->s2, to))
+	if (reachrec(b->s2, to, gen))
 		return 1;
 	if (b->jmp.type == Jjtbl) {
 		uint32_t k;
 		for (k = 0; k < b->njtbl; k++)
-			if (reachrec(b->jtbl[k], to))
+			if (reachrec(b->jtbl[k], to, gen))
 				return 1;
 	}
 
 	return 0;
 }
 
-/* Blk.visit needs to be clear at entry */
+/* A block belongs to this search iff its stamp matches the new
+ * generation. On unsigned wrap discard every old stamp before reuse. */
+static uint
+reachgen(Fn *fn)
+{
+	Blk *b;
+
+	if (++fn->reachgen == 0) {
+		for (b=fn->start; b; b=b->link)
+			b->reachgen = 0;
+		fn->reachgen = 1;
+	}
+	return fn->reachgen;
+}
+
 int
 reaches(Fn *fn, Blk *b, Blk *to)
 {
-	int r;
-
 	assert(to);
-	r = reachrec(b, to);
-	for (b=fn->start; b; b=b->link)
-		b->visit = 0;
-	return r;
+	return reachrec(b, to, reachgen(fn));
 }
 
-/* can b reach 'to' not through excl
- * Blk.visit needs to be clear at entry */
 int
 reachesnotvia(Fn *fn, Blk *b, Blk *to, Blk *excl)
 {
-	excl->visit = 1;
-	return reaches(fn, b, to);
+	uint gen;
+
+	assert(to);
+	gen = reachgen(fn);
+	excl->reachgen = gen;
+	return reachrec(b, to, gen);
 }
 
 int
