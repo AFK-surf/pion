@@ -1055,6 +1055,153 @@ amatch(Addr *a, Num *tn, Ref r, Fn *fn)
 /* instruction selection
  * requires use counts (as given by parsing)
  */
+typedef struct {
+	Ins *shift;
+	uint defs, uses, owner;
+	int rewritten;
+} IndexInfo;
+
+static void
+indexuse(Ref r, Fn *fn, IndexInfo *info)
+{
+	if (rtype(r) == RTmp)
+		info[r.val].uses++;
+	else if (rtype(r) == RMem) {
+		Addr *a = &fn->mem[r.val];
+		if (rtype(a->base) == RTmp)
+			info[a->base.val].uses++;
+		if (rtype(a->index) == RTmp)
+			info[a->index.val].uses++;
+	}
+}
+
+/* After local address matching, a scaled temporary may still be carried
+ * over a block edge only to serve as a scale-one SIB operand. Keep the
+ * unscaled SSA value live instead, with no arithmetic at the use. */
+static void
+rematindex(Fn *fn)
+{
+	IndexInfo *info = alloc(fn->ntmp * sizeof *info);
+	for (Blk *b=fn->start; b; b=b->link) {
+		for (Phi *p=b->phi; p; p=p->link)
+			info[p->to.val].defs++;
+		for (uint n=0; n<b->nins; n++) {
+			Ins *i = b->ins+n;
+			if (rtype(i->to) != RTmp || i->to.val < Tmp0)
+				continue;
+			IndexInfo *t = &info[i->to.val];
+			t->defs++;
+			if (i->op == Oshl && i->cls == Kl && rtype(i->arg[0]) == RTmp
+			&& i->arg[0].val >= Tmp0 && rtype(i->arg[1]) == RCon) {
+				Con *c = &fn->con[i->arg[1].val];
+				if (c->type == CBits && c->bits.i >= 1 && c->bits.i <= 3) {
+					t->shift = i;
+					t->owner = b->id;
+				}
+			}
+		}
+	}
+	for (Blk *b=fn->start; b; b=b->link) {
+		for (uint n=0; n<b->nins; n++)
+		for (int k=0; k<2; k++) {
+			Ref r = b->ins[n].arg[k];
+			if (rtype(r) != RMem)
+				continue;
+			Addr *a = &fn->mem[r.val];
+			if (a->scale != 1 || rtype(a->base) != RTmp || rtype(a->index) != RTmp
+			|| a->base.val < Tmp0 || a->index.val < Tmp0)
+				continue;
+			for (int swap=0; swap<2; swap++) {
+				Ref scaled = swap ? a->base : a->index;
+				IndexInfo *t = info+scaled.val;
+				if (!t->shift || t->owner == b->id || t->defs != 1)
+					continue;
+				Ref src = t->shift->arg[0];
+				if (info[src.val].defs != 1 || fn->tmp[src.val].slot != -1)
+					continue;
+				if (swap)
+					a->base = a->index;
+				a->index = src;
+				a->scale = 1 << fn->con[t->shift->arg[1].val].bits.i;
+				t->rewritten = 1;
+				break;
+			}
+		}
+	}
+	for (Blk *b=fn->start; b; b=b->link) {
+		for (Phi *p=b->phi; p; p=p->link)
+			for (uint j=0; j<p->narg; j++)
+				indexuse(p->arg[j], fn, info);
+		indexuse(b->jmp.arg, fn, info);
+		for (uint j=0; j<b->nins; j++) {
+			indexuse(b->ins[j].arg[0], fn, info);
+			indexuse(b->ins[j].arg[1], fn, info);
+		}
+	}
+	for (int t=Tmp0; t<fn->ntmp; t++)
+		if (info[t].rewritten && info[t].uses == 0)
+			*info[t].shift = (Ins){.op=Onop};
+}
+
+/* Count uses in the selected IR, including address components and edges. */
+static void
+countselected(Ref r, Fn *fn, uint *uses)
+{
+	if (rtype(r) == RTmp)
+		uses[r.val]++;
+	else if (rtype(r) == RMem) {
+		Addr *a = &fn->mem[r.val];
+		if (rtype(a->base) == RTmp)
+			uses[a->base.val]++;
+		if (rtype(a->index) == RTmp)
+			uses[a->index.val]++;
+	}
+}
+
+/* Fold an adjacent single-use integer Oload directly into Oxcmp as its
+ * sole memory operand. Adjacent ordering guarantees no intervening store,
+ * call, or alias write; equal class prevents width/sign mismatches. */
+static void
+foldcompareloads(Fn *fn)
+{
+	uint *uses = alloc(fn->ntmp * sizeof *uses);
+	for (Blk *b = fn->start; b; b = b->link) {
+		for (Phi *p = b->phi; p; p = p->link)
+			for (uint j = 0; j < p->narg; j++)
+				countselected(p->arg[j], fn, uses);
+		countselected(b->jmp.arg, fn, uses);
+		for (uint j = 0; j < b->nins; j++) {
+			countselected(b->ins[j].arg[0], fn, uses);
+			countselected(b->ins[j].arg[1], fn, uses);
+		}
+	}
+	for (Blk *b = fn->start; b; b = b->link) {
+		for (uint j = 1; j < b->nins; j++) {
+			Ins *cmp = &b->ins[j], *ld = cmp - 1;
+			if (cmp->op != Oxcmp || KBASE(cmp->cls) || ld->op != Oload
+			|| ld->cls != cmp->cls || rtype(ld->to) != RTmp
+			|| ld->to.val < Tmp0 || uses[ld->to.val] != 1)
+				continue;
+			int side = req(cmp->arg[0], ld->to) ? 0 : 1;
+			if (!req(cmp->arg[side], ld->to))
+				continue;
+			Ref other = cmp->arg[1 - side];
+			if (rtype(other) != RTmp && !(side == 1 && rtype(other) == RCon))
+				continue;
+			Ref m = ld->arg[0];
+			if (rtype(m) == RTmp) {
+				Addr a = {.base = m, .scale = 1};
+				vgrow(&fn->mem, ++fn->nmem);
+				fn->mem[fn->nmem-1] = a;
+				m = MEM(fn->nmem-1);
+			}
+			if (rtype(m) != RMem)
+				continue;
+			cmp->arg[side] = m;
+			*ld = (Ins){.op=Onop};
+		}
+	}
+}
 void
 amd64_isel(Fn *fn)
 {
@@ -1136,6 +1283,8 @@ amd64_isel(Fn *fn)
 		idup(b, curi, &insb[NIns]-curi);
 	}
 	free(num);
+	rematindex(fn);
+	foldcompareloads(fn);
 
 	if (debug['I']) {
 		fprintf(stderr, "\n> After instruction selection:\n");
