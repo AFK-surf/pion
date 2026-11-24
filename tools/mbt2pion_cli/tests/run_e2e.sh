@@ -1362,6 +1362,52 @@ else:
     assert r10m_run.stdout.strip() == "41:2", f"10m expected '41:2', got {r10m_run.stdout!r}"
 
 print("[e2e] PASS: Final Astra P0-1+P0-2 suite (10m: #cfg brace-less decls + exclusive wasm-gc live wasm32 run == 41:2)")
+
+# 10m-2. Astra single-source-of-truth moon.pkg + #cfg wasm32->wasm-gc alignment:
+#        extra.mbt (`fn init { xs.push(9) }`) under `["wasm"]` -> 21; under `["not", "wasm"]` -> 22!
+for tag_mp, rules_str, expected_out in [
+    ("wasm_only", '["wasm"]', "21"),
+    ("not_wasm", '["not", "wasm"]', "22"),
+]:
+    s_mp = os.path.join(root, f"s10m_{tag_mp}")
+    o_mp = os.path.join(root, f"o10m_{tag_mp}")
+    os.makedirs(s_mp, exist_ok=True)
+    with open(os.path.join(s_mp, "moon.pkg"), "w") as f:
+        f.write(f'options(targets: {{"extra.mbt": {rules_str}}})\n')
+    with open(os.path.join(s_mp, "extra.mbt"), "w") as f:
+        f.write("fn init {\n  xs.push(9)\n}\n")
+    with open(os.path.join(s_mp, "common.mbt"), "w") as f:
+        f.write(
+            'let xs : Array[Int] = [0]\n'
+            '#cfg(target="wasm-gc")\n'
+            'fn bit() -> Int { 20 }\n'
+            '#cfg(not(target="wasm-gc"))\n'
+            'fn bit() -> Int { 10 }\n'
+            'pub fn sample() -> Int { xs.length() + bit() }\n'
+        )
+    r_mp_pub = run_cli(["--src", s_mp, "--out", o_mp, "--target", "wasm32", "--mode", "publish",
+                        "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_mp_pub.returncode == 0, f"10m-2 {tag_mp} publish failed: {r_mp_pub.returncode} {r_mp_pub.stdout} {r_mp_pub.stderr}"
+    pkg_mp = os.path.join(root, f"pkg10m_{tag_mp}")
+    os.makedirs(os.path.join(pkg_mp, "src"), exist_ok=True)
+    for fn in sorted(os.listdir(o_mp)):
+        if fn.endswith(".pion"):
+            shutil.copyfile(os.path.join(o_mp, fn), os.path.join(pkg_mp, "src", fn))
+    with open(os.path.join(pkg_mp, "pion.toml"), "w") as f:
+        f.write(f'[package]\nname = "e2e_10m_{tag_mp}"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+    with open(os.path.join(pkg_mp, "src", "main.pion"), "w") as f:
+        f.write(
+            'pub fn main(world : World) -> Int {\n'
+            '  io_println(world, sample().to_string())\n'
+            '  0\n'
+            '}\n'
+        )
+    run_cmd = [pionc, "run", "--target", "wasm32", pkg_mp] if shutil.which("node") else [pionc, "run", pkg_mp]
+    r_mp_run = subprocess.run(run_cmd, capture_output=True, text=True)
+    assert r_mp_run.returncode == 0, f"10m-2 {tag_mp} run failed: {r_mp_run.stdout} {r_mp_run.stderr}"
+    assert r_mp_run.stdout.strip() == expected_out, f"10m-2 {tag_mp} expected {expected_out!r}, got {r_mp_run.stdout!r}"
+
+print("[e2e] PASS: Final Astra moon.pkg+#cfg alignment suite (10m-2: [\"wasm\"] -> 21, [\"not\", \"wasm\"] -> 22 on live wasm32)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
