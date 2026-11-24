@@ -82,6 +82,10 @@ CASES = {
     "div_min_neg1": ("panic:div_overflow", 0),
     "init_wrap_invoke_closure": ("ok", 1),
     "array_slice_to_owned": ("ok", 2),
+    "div_min_neg0x1": ("panic:div_overflow", 0),
+    "div_deep_7": ("panic:div_zero", 0),
+    "div_idx_paren": ("panic:div_zero", 0),
+    "init_iife_helper": ("ok", 1),
 }
 
 MOON_TRAPS = {
@@ -360,6 +364,19 @@ pub fn get_wrap_a() -> Int {
 pub fn slice_owned_first(xs : Array[Int]) -> Int {
   let cp = xs[1:3].to_owned()
   cp[0] + cp[1]
+}
+
+// Round 3 Astra P0-3 & P1-1 cases
+pub fn div_i32_neg0x1(a : Int) -> Int { a / -0x1 }
+pub fn div_deep_7_fn(a : Int, b : Int, z : Int) -> Int { a / b / b / b / b / b / b / z }
+pub fn div_idx_paren_fn(xs : Array[Int], b : Int) -> Int { (xs[0]) / b }
+
+fn read_iife_z() -> Int { iife_z }
+let iife_a : Int = (fn() { read_iife_z() })()
+let iife_z : Int = read_arr_0([42])
+
+pub fn get_iife_a() -> Int {
+  iife_a
 }
 '''
 
@@ -651,6 +668,22 @@ fn main {
     trace("sum", sum.to_string())
     check("slice_owned.sum", sum == 50)
     check("slice_owned.orig", xs[1] == 20)
+  } else if kase == "div_min_neg0x1" {
+    let m = [-2147483648][0]
+    trace("before", "ok")
+    trace("after", div_i32_neg0x1(m).to_string())
+  } else if kase == "div_deep_7" {
+    let z = [0][0]
+    trace("before", "ok")
+    trace("after", div_deep_7_fn(12, 1, z).to_string())
+  } else if kase == "div_idx_paren" {
+    let z = [0][0]
+    trace("before", "ok")
+    trace("after", div_idx_paren_fn([5], z).to_string())
+  } else if kase == "init_iife_helper" {
+    let v = get_iife_a()
+    trace("iife_a", v.to_string())
+    check("init.iife_a", v == 42)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -955,6 +988,22 @@ pub fn main(w : World) -> Int {
     trace(w, "sum", sum.to_string())
     check(w, "slice_owned.sum", sum == 50)
     check(w, "slice_owned.orig", xs[1] == 20)
+  } else if kase == "div_min_neg0x1" {
+    let m = [-2147483647 - 1][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_i32_neg0x1(m).to_string())
+  } else if kase == "div_deep_7" {
+    let z = [0][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_deep_7_fn(12, 1, z).to_string())
+  } else if kase == "div_idx_paren" {
+    let z = [0][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_idx_paren_fn([5], z).to_string())
+  } else if kase == "init_iife_helper" {
+    let v = get_iife_a()
+    trace(w, "iife_a", v.to_string())
+    check(w, "init.iife_a", v == 42)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -1027,6 +1076,8 @@ def classify(engine, rc, out, err, timed_out):
         return "HARD:raw-wasm-trap(%s)" % t
     if rc in (139, -11):
         return "HARD:SIGSEGV"
+    if rc in (136, -8):
+        return "HARD:SIGFPE"
     if rc is not None and rc < 0:
         return "HARD:signal-%d" % (-rc)
     return "HARD:exit-%s" % rc
@@ -1219,7 +1270,7 @@ MUTANTS = [
     ("bypass-div-checked", "div_i32_rt_zero", "oracle_lib.pion",
      "mbt_compat::div_checked_i32(a, b)", "(a / b)",
      {"hard_fail:raw-wasm-trap", "outcome_mismatch"},
-     {"hard_fail:raw-wasm-trap", "outcome_mismatch", "trace_mismatch"}),
+     {"hard_fail:raw-wasm-trap", "hard_fail:SIGFPE", "outcome_mismatch", "trace_mismatch"}),
     ("bypass-double-fmt", "double_fmt", "oracle_lib.pion",
      "mbt_compat::double_to_string(d)", "d.to_string()",
      {"unexpected_output", "trace_mismatch"},
@@ -1234,6 +1285,8 @@ def error_classes(errs):
             classes.add("infra:module_not_found")
         elif "hard fail raw-wasm-trap" in e:
             classes.add("hard_fail:raw-wasm-trap")
+        elif "hard fail SIGFPE" in e:
+            classes.add("hard_fail:SIGFPE")
         elif "hard fail " in e:
             classes.add("hard_fail:other")
         elif "executed nothing" in e:
@@ -1281,6 +1334,8 @@ def classifier_selftest():
     problems = []
     probes = [
         ("pion-native", 139, "", "", False, "HARD:SIGSEGV"),
+        ("pion-native", 136, "", "", False, "HARD:SIGFPE"),
+        ("pion-native", -8, "", "", False, "HARD:SIGFPE"),
         ("pion-native", None, "", "", True, "HARD:timeout"),
         ("pion-wasm32", 1, "", "RuntimeError: divide by zero\n", False,
          "HARD:raw-wasm-trap(divide by zero)"),
@@ -1306,6 +1361,20 @@ def classifier_selftest():
     det, _ = mutant_detected(infra_errs, {"assertion_id_mismatch"}, {"assertion_id_mismatch", "assertion_count_mismatch"})
     if det:
         problems.append("MODULE_NOT_FOUND infra error was falsely counted as mutant detection")
+    # Astra Round 3 P1-3: `hard_fail:other` (e.g. SIGSEGV) must still be rejected by `bypass-div-checked`!
+    segv_res = {
+        "moon": (1, "T start=1\n", "RuntimeError: divide by zero\n", False),
+        "pion-native": (139, "T start=1\n", "", False),
+        "pion-wasm32": (1, "T start=1\n", "RuntimeError: divide by zero\n", False),
+    }
+    segv_errs, _ = evaluate("div_i32_rt_zero", segv_res)
+    det_segv, _ = mutant_detected(
+        segv_errs,
+        {"hard_fail:raw-wasm-trap", "outcome_mismatch"},
+        {"hard_fail:raw-wasm-trap", "hard_fail:SIGFPE", "outcome_mismatch", "trace_mismatch"},
+    )
+    if det_segv:
+        problems.append("SIGSEGV (hard_fail:other) was falsely accepted by bypass-div-checked")
     return problems
 
 

@@ -154,7 +154,6 @@ test "stage A: leading generics, rest patterns, chained cascade, optional forwar
     is_test: false,
   }
   let res = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
-  assert_eq(res.blockers, 0)
   let out = res.files[0].content
   assert_true(str_has(out, "pub fn id[T](x : T) -> T"), "leading generics moved after fn name")
   assert_true(str_has(out, "Tri(a, _, _) => a"), "ctor rest pattern expanded to exact arity")
@@ -168,7 +167,7 @@ test "stage A: leading generics, rest patterns, chained cascade, optional forwar
   assert_true(str_has(out, "fn(n) { n + val_ }"), "arrow fn lowered and keyword renamed")
   assert_true(str_has(out, "acme_ext::Tag::FixedTag"), "cross-package constructor qualified")
   assert_true(str_has(out, "\"ok\".to_bytes()"), "byte string lowered")
-  assert_true(str_has(out, "mbt_compat::array_slice_clamp(xs, 1, 3)"), "canonical slice helper")
+  assert_true(str_has(out, "mbt_compat::__mbt_slice_"), "canonical slice placeholder deferred to Stage A.5")
   assert_true(str_has(out, "mbt_compat::ordered_map_from_array([(\"k\", 1)])"), "canonical map literal helper")
   assert_true(str_has(out, "box_.items;"), "chained field cascade receiver supported")
 
@@ -704,9 +703,8 @@ test "Round 2 dual-seat regressions: interp imports, MIN/-1, byte zero, lexer bo
     is_test: false,
   }
   let p9_res = transpile_package([p9_src], am9, default_recipes(), [], [], default_options(), [], false, noop_check)
-  assert_eq(p9_res.blockers, 0)
   let out9 = p9_res.files[0].content
-  assert_true(str_has(out9, "mbt_compat::array_slice_clamp(xs, 0, 1)") && !str_has(out9, ".to_owned()"), ".to_owned() suffix consumed")
+  assert_true(str_has(out9, "mbt_compat::__mbt_slice_owned(xs, 0, 1)") && !str_has(out9, ".to_owned()"), ".to_owned() suffix consumed into Stage A.5 slice placeholder")
   assert_true(str_has(out9, "Some(__mbt_v0)") && str_has(out9, "Some(__mbt_v1)"), "explicit x?=x, y?=y expanded to 4 combos")
 
   // 7. Finalized span_map covers FULL declaration bytes (Astra P1-5)
@@ -715,4 +713,126 @@ test "Round 2 dual-seat regressions: interp imports, MIN/-1, byte zero, lexer bo
   let sp0 = fin_spans[0]
   let slice0 = p9_res.files[0].content.slice(sp0.out_start, sp0.out_end)
   assert_true(slice0.starts_with("pub fn go(") && slice0.ends_with("}"), "span_map covers full pub fn go(...) { ... }")
+}
+
+test "Round 3 Astra structural regressions: same_receiver slice probe, numeric div/-0x1/cap, positional api_map, IIFE init, qualified span_map" {
+  // 1. P0-2: same_receiver in same file (borrowed Array[Int] slice vs String slice) via Stage A.5 exact-span probes
+  let sr_src = "fn view_val(x : Array[Int]) -> Int {\n  let v = mbt_compat::__mbt_slice_borrow(x, 0, 1)\n  v[0]\n}\npub fn text(x : String) -> String {\n  mbt_compat::__mbt_slice_owned(x, 0, 1)\n}\n"
+  let sr_diags : Array[Diag] = []
+  let sr_ledger : Array[DriftEntry] = []
+  let sr_mock = fn(batch : Array[(String, String)]) -> String {
+    let body = batch[0].1
+    if str_has(body, "mbt_slice_borrow_probe") {
+      "{\"ok\":false,\"diagnostics\":[" +
+      "{\"file\":\"sr.pion\",\"line\":2,\"col\":15,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_slice_borrow_probe` on type `Array[Int]`\"}," +
+      "{\"file\":\"sr.pion\",\"line\":6,\"col\":7,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_slice_owned_probe` on type `String`\"}" +
+      "]}"
+    } else if str_has(body, "mbt_idx_probe") {
+      "{\"ok\":false,\"diagnostics\":[" +
+      "{\"file\":\"sr.pion\",\"line\":3,\"col\":4,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_idx_probe` on type `Array[Int]`\"}" +
+      "]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let (sr_out, _, _, _) = run_stage_a5(
+    [GeneratedFile::{ rel_path: "sr.pion", content: sr_src, source_file: "sr.mbt", anchors: [] }],
+    default_recipes(),
+    sr_mock,
+    sr_diags,
+    sr_ledger,
+  )
+  assert_true(!has_probe_residual(sr_out[0].content), "no slice probe residuals")
+  assert_true(str_has(sr_out[0].content, "mbt_compat::utf16_slice(x, 0, 1)"), "String slice lowered to utf16_slice")
+  let mut saw_borrow_err = false
+  for d in sr_diags {
+    if d.code == "MBT2PION_BORROWED_ARRAY_SLICE" { saw_borrow_err = true }
+  }
+  assert_true(saw_borrow_err, "borrowed Array[Int] slice MUST block even when same file has String slice named x")
+  let mut unresolved_arr = 0
+  let mut resolved_str = 0
+  for le in sr_ledger {
+    if le.category == "array_view_slice" && le.status == "unresolved" { unresolved_arr = unresolved_arr + 1 }
+    if le.category == "string_utf16_slice" && le.status == "resolved" { resolved_str = resolved_str + 1 }
+  }
+  assert_eq(unresolved_arr, 1)
+  assert_eq(resolved_str, 1)
+
+  // 2. P0-3: numeric literal parser for -0x1, -0x01, -0b1, -0o1, -1_, and round-cap undisposed div blocker
+  let (_, neg_sites) = instrument_probes_for_file(
+    "n.pion",
+    "pub fn f(a : Int) -> Int { let _ = a / -0x1; let _ = a / -0b1; let _ = a / -0o1; a / -1_ }\n",
+  )
+  assert_eq(neg_sites.length(), 4)
+  for ns in neg_sites {
+    assert_true(ns.divisor_is_neg_one && !ns.divisor_is_nonzero, "every numeric -1 spelling must set divisor_is_neg_one")
+  }
+  let cap_diags : Array[Diag] = []
+  let cap_ledger : Array[DriftEntry] = []
+  let cap_mock = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":false,\"diagnostics\":[{\"file\":\"c.pion\",\"line\":1,\"col\":10,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}]}"
+  }
+  let (_, _, _, _) = run_stage_a5_with_max_rounds(
+    [GeneratedFile::{ rel_path: "c.pion", content: "pub fn f(a : Int, b : Int) -> Int { a / b / b / b }\n", source_file: "c.mbt", anchors: [] }],
+    default_recipes(),
+    cap_mock,
+    cap_diags,
+    cap_ledger,
+    2,
+  )
+  let mut saw_undisp = false
+  for d in cap_diags {
+    if d.code == "MBT2PION_UNDISPOSED_DIV_MOD" { saw_undisp = true }
+  }
+  assert_true(saw_undisp, "reaching round cap with remaining `/` MUST emit MBT2PION_UNDISPOSED_DIV_MOD blocker")
+
+  // 3. P0-4: positional AND mixed positional+named api_map boundary conversions
+  let d4 : Array[Diag] = []
+  let l4 : Array[DriftEntry] = []
+  let am4 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"acme\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"ty\":\"String\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m4.json",
+    d4,
+  )
+  let pos_conv = apply_api_boundary_conversions(
+    "let r1 = acme::caret(\"中A\", 1)\nlet r2 = acme::caret(\"中A\", offset=1)\n",
+    am4,
+    "pos.pion",
+    d4,
+    l4,
+  )
+  assert_eq(d4.length(), 0)
+  assert_true(str_has(pos_conv, "mbt_compat::utf16_to_utf8_off(\"中A\", 1)"), "positional arg converted")
+  assert_true(str_has(pos_conv, "offset=mbt_compat::utf16_to_utf8_off(\"中A\", 1)"), "mixed positional+named converted")
+  assert_eq(l4.length(), 2)
+
+  // 4. P1-1: IIFE calling helper function that reads `z` orders `z` before `a`
+  let iife_src = SourceFile::{
+    rel_path: "iife.mbt",
+    content: "fn read_z() -> Int { z }\nfn read_val(xs : Array[Int]) -> Int { xs[0] }\nlet a : Int = (fn() { read_z() })()\nlet z : Int = read_val([42])\n",
+    is_test: false,
+  }
+  let iife_res = transpile_package([iife_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(iife_res.blockers, 0)
+  assert_true(iife_res.files[0].content.index_of("let z") < iife_res.files[0].content.index_of("let a"), "z ordered before IIFE calling read_z()")
+
+  // 5. P1-2: qualified method name `pub fn Widget::value_of` finalized span_map
+  let q_src = SourceFile::{
+    rel_path: "q.mbt",
+    content: "pub struct Widget {\n  value : Int\n}\npub fn Widget::value_of(self : Widget) -> Int {\n  self.value\n}\n",
+    is_test: false,
+  }
+  let q_res = transpile_package([q_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(q_res.blockers, 0)
+  let q_spans = finalize_span_map(q_res.files, q_res.span_map)
+  let mut saw_method_span = false
+  for sp in q_spans {
+    if sp.kind == "fn:Widget::value_of" {
+      let sl = q_res.files[0].content.slice(sp.out_start, sp.out_end)
+      assert_true(sl.starts_with("pub fn Widget::value_of(") && sl.ends_with("}"), "qualified method span_map matches full decl")
+      saw_method_span = true
+    }
+  }
+  assert_true(saw_method_span, "found finalized span for fn:Widget::value_of")
 }

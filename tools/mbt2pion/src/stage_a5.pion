@@ -24,10 +24,12 @@ pub struct ProbeSite {
   probe_kind : String
   start_byte : Int
   end_byte : Int
+  op_byte : Int
   line : Int
   col : Int
   lhs_expr : String
   rhs_expr : String
+  slice_hi : String
   divisor_is_zero : Bool
   divisor_is_nonzero : Bool
   divisor_is_neg_one : Bool
@@ -141,37 +143,96 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
   Some((probe_name, resolved_ty))
 }
 
+///| Parse an integer literal token (`0`, `1`, `0x1`, `0x01`, `0b1`, `0o1`, `1_`, `1L`, `0UL`, etc.)
+///| into its exact numeric value (capped at 1_000_000_000_000L so huge literals never wrap to 0 or 1).
+pub fn parse_int_literal_value(tok : Token) -> Option[Int64] {
+  if tok.kind != TokenKind::IntLit {
+    return None
+  }
+  let s = tok.raw
+  let mut end = s.length()
+  while end > 0 {
+    let lc = s.code_unit_at(end - 1)
+    if lc == 76 || lc == 108 || lc == 85 || lc == 117 {
+      // L, l, U, u
+      end = end - 1
+    } else {
+      break
+    }
+  }
+  if end <= 0 {
+    return None
+  }
+  let mut i = 0
+  let mut base : Int64 = 10L
+  if end >= 2 && s.code_unit_at(0) == 48 {
+    let p1 = s.code_unit_at(1)
+    if p1 == 120 || p1 == 88 {
+      base = 16L
+      i = 2
+    } else if p1 == 98 || p1 == 66 {
+      base = 2L
+      i = 2
+    } else if p1 == 111 || p1 == 79 {
+      base = 8L
+      i = 2
+    }
+  }
+  let mut acc : Int64 = 0L
+  let mut saw_digit = false
+  let cap : Int64 = 1000000000000L
+  while i < end {
+    let c = s.code_unit_at(i)
+    if c == 95 {
+      // '_'
+      i = i + 1
+      continue
+    }
+    let d : Int64 = if c >= 48 && c <= 57 {
+      (c - 48).to_int64()
+    } else if c >= 97 && c <= 102 {
+      (c - 97 + 10).to_int64()
+    } else if c >= 65 && c <= 70 {
+      (c - 65 + 10).to_int64()
+    } else {
+      -1L
+    }
+    if d < 0L || d >= base {
+      return None
+    }
+    saw_digit = true
+    if acc < cap {
+      acc = acc * base + d
+      if acc > cap {
+        acc = cap
+      }
+    }
+    i = i + 1
+  }
+  if saw_digit { Some(acc) } else { None }
+}
+
 ///| Check whether a numeric literal token is statically known to be non-zero.
-///| Only treats `A-F`/`a-f` as digits in hexadecimal (`0x`/`0X`) literals, and stops
-///| before decimal exponent `e`/`E` or float suffix `f`/`F` so `0.0e5`, `0.0f`, `0L`, `0U`
-///| are all recognized as zero!
+///| Uses numeric value parsing for integer literals and stops before exponent/suffix for floats.
 pub fn is_statically_nonzero_literal(tok : Token) -> Bool {
-  if tok.kind != TokenKind::IntLit && tok.kind != TokenKind::FloatLit {
+  if tok.kind == TokenKind::IntLit {
+    return match parse_int_literal_value(tok) {
+      Some(v) => v != 0L
+      None => false
+    }
+  }
+  if tok.kind != TokenKind::FloatLit {
     return false
   }
   let s = tok.raw
   let n = s.length()
   let mut i = 0
-  let mut is_hex_lit = false
-  if n >= 2 && s.code_unit_at(0) == 48 {
-    let p1 = s.code_unit_at(1)
-    if p1 == 120 || p1 == 88 {
-      is_hex_lit = true
-      i = 2
-    } else if p1 == 98 || p1 == 66 || p1 == 111 || p1 == 79 {
-      i = 2
-    }
-  }
   while i < n {
     let c = s.code_unit_at(i)
-    if !is_hex_lit && (c == 101 || c == 69 || c == 102 || c == 70 || c == 76 || c == 108 || c == 85 || c == 117) {
-      // Exponent (`e`/`E`) or suffix (`f`/`L`/`U`): mantissa ended with no non-zero digit
+    if c == 101 || c == 69 || c == 102 || c == 70 {
       return false
     }
     if c >= 49 && c <= 57 {
-      return true
-    }
-    if is_hex_lit && ((c >= 65 && c <= 70) || (c >= 97 && c <= 102)) {
       return true
     }
     i = i + 1
@@ -372,17 +433,24 @@ fn is_non_expr_receiver(tokens : Array[Token], recv_start : Int) -> Bool {
 
 ///| Instrument a single Pion file with `mbt_*_probe` calls for one pass.
 ///| Supports chained/complex receivers (`self.text.length()`, `f().length()`, `arr[i].length()`,
-///| `(a + b) / n`, `self.r.val`, `"{d}"`) while skipping already-rewritten `mbt_compat::*` calls.
+///| `(a + b) / n`, `self.r.val`, `"{d}"`, and slice placeholders) while skipping already-proven safe offsets.
 pub fn instrument_probes_for_file(file : String, content : String) -> (String, Array[ProbeSite]) {
-  instrument_probes_for_file_opts(file, content, true)
+  let empty_safe : Map[Int, Bool] = Map()
+  instrument_probes_for_file_with_safe(file, content, empty_safe, 0)
 }
 
-fn instrument_probes_for_file_opts(file : String, content : String, verify_const_nonzero : Bool) -> (String, Array[ProbeSite]) {
+fn instrument_probes_for_file_with_safe(
+  file : String,
+  content : String,
+  safe_offsets : Map[Int, Bool],
+  base_offset : Int,
+) -> (String, Array[ProbeSite]) {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
   let sites : Array[ProbeSite] = []
   let edits : Array[(Int, Int, String)] = []
   let mut covered_end = 0
+  let slice_only_pass = str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow")
   let mut i = 0
 
   while i < n {
@@ -392,8 +460,79 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
       continue
     }
 
-    // 0. Interpolated string `"...\{expr}..."` — recursively instrument ANY inner expression
-    //    (e.g. `"r=\{a / b} len=\{s.length()}"`) AND probe simple idents for `Double` formatting!
+    // 0a. Astra Round 3 P0-2: Stage A slice placeholders `mbt_compat::__mbt_slice_{owned,borrow}(recv, lo, hi)`
+    //     Resolved in a dedicated slice-first pass so downstream uses (`let v = x[0:1]; v[0]`, `v.length()`)
+    //     see the real resolved `Array[T]` / `String` / `ArrayView[T]` type in the next round!
+    if t.kind == TokenKind::Ident && t.raw == "mbt_compat" && i + 3 < n &&
+    tokens[i + 1].kind == TokenKind::ColonColon &&
+    (tokens[i + 2].raw == "__mbt_slice_owned" || tokens[i + 2].raw == "__mbt_slice_borrow") &&
+    tokens[i + 3].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 3)
+      if close_p > i + 3 {
+        // Split depth-0 comma-separated arguments `(recv, lo, hi)`
+        let s_args : Array[String] = []
+        let mut ai = i + 4
+        while ai < close_p {
+          if tokens[ai].kind == TokenKind::Comma {
+            ai = ai + 1
+            continue
+          }
+          let mut ae = ai
+          let mut ad = 0
+          while ae < close_p {
+            let ak = tokens[ae].kind
+            if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace {
+              ad = ad + 1
+            } else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace {
+              ad = ad - 1
+            } else if ad == 0 && ak == TokenKind::Comma {
+              break
+            }
+            ae = ae + 1
+          }
+          if ae > ai {
+            s_args.push(content.slice(tokens[ai].start_byte, tokens[ae - 1].end_byte).trim())
+          }
+          ai = ae + 1
+        }
+        if s_args.length() == 3 {
+          let pkind = if tokens[i + 2].raw == "__mbt_slice_owned" {
+            "mbt_slice_owned_probe"
+          } else {
+            "mbt_slice_borrow_probe"
+          }
+          let start_b = t.start_byte
+          let end_b = tokens[close_p].end_byte
+          sites.push(ProbeSite::{
+            file: file,
+            probe_kind: pkind,
+            start_byte: start_b,
+            end_byte: end_b,
+            op_byte: base_offset + tokens[i + 2].start_byte,
+            line: t.line,
+            col: t.col,
+            lhs_expr: s_args[0],
+            rhs_expr: s_args[1],
+            slice_hi: s_args[2],
+            divisor_is_zero: false,
+            divisor_is_nonzero: false,
+            divisor_is_neg_one: false,
+          })
+          edits.push((start_b, end_b, "(" + s_args[0] + ")." + pkind + "(" + s_args[1] + ", " + s_args[2] + ")"))
+          covered_end = end_b
+          i = close_p + 1
+          continue
+        }
+      }
+    }
+
+    if slice_only_pass {
+      i = i + 1
+      continue
+    }
+
+    // 0b. Interpolated string `"...\{expr}..."` — recursively instrument ANY inner expression
+    //     (e.g. `"r=\{a / b} len=\{s.length()}"`) AND probe simple idents for `Double` formatting!
     if t.kind == TokenKind::InterpString {
       let parts = split_interp_string(t.raw, false)
       let mut any_interp_probe = false
@@ -407,7 +546,12 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
         } else {
           // `p.text` sits inside `\{` ... `}`
           let expr_start_byte = part_off + 2
-          let (inner_inst, inner_sites) = instrument_probes_for_file(file, p.text)
+          let (inner_inst, inner_sites) = instrument_probes_for_file_with_safe(
+            file,
+            p.text,
+            safe_offsets,
+            base_offset + expr_start_byte,
+          )
           if inner_sites.length() > 0 {
             any_interp_probe = true
             for isite in inner_sites {
@@ -416,10 +560,12 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
                 probe_kind: isite.probe_kind,
                 start_byte: expr_start_byte + isite.start_byte,
                 end_byte: expr_start_byte + isite.end_byte,
+                op_byte: isite.op_byte,
                 line: t.line,
                 col: t.col,
                 lhs_expr: isite.lhs_expr,
                 rhs_expr: isite.rhs_expr,
+                slice_hi: isite.slice_hi,
                 divisor_is_zero: isite.divisor_is_zero,
                 divisor_is_nonzero: isite.divisor_is_nonzero,
                 divisor_is_neg_one: isite.divisor_is_neg_one,
@@ -428,17 +574,21 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
             rebuilt.write_string("\\{" + inner_inst + "}")
           } else {
             let et = p.text.trim()
-            if et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
+            let show_op_byte = base_offset + expr_start_byte
+            if !safe_offsets.contains(show_op_byte) &&
+            et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
               any_interp_probe = true
               sites.push(ProbeSite::{
                 file: file,
                 probe_kind: "mbt_show_probe",
                 start_byte: expr_start_byte,
                 end_byte: expr_start_byte + p.text.length(),
+                op_byte: show_op_byte,
                 line: t.line,
                 col: t.col,
                 lhs_expr: et,
                 rhs_expr: "__INTERP_SHOW__",
+                slice_hi: "",
                 divisor_is_zero: false,
                 divisor_is_nonzero: false,
                 divisor_is_neg_one: false,
@@ -466,10 +616,11 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
     tokens[i + 1].raw == "length" &&
     tokens[i + 2].kind == TokenKind::LParen &&
     tokens[i + 3].kind == TokenKind::RParen {
+      let op_b = base_offset + tokens[i + 1].start_byte
       let len_next_mul_div = i + 4 < n &&
       (tokens[i + 4].kind == TokenKind::Star || tokens[i + 4].kind == TokenKind::Slash || tokens[i + 4].kind == TokenKind::Percent)
       let recv_start = find_receiver_start(tokens, i - 1)
-      if !len_next_mul_div && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+      if !safe_offsets.contains(op_b) && !len_next_mul_div && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
@@ -479,10 +630,12 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
             probe_kind: "mbt_len_probe",
             start_byte: start_b,
             end_byte: end_b,
+            op_byte: op_b,
             line: tokens[i + 1].line,
             col: tokens[i + 1].col,
             lhs_expr: recv_expr,
             rhs_expr: "",
+            slice_hi: "",
             divisor_is_zero: false,
             divisor_is_nonzero: false,
             divisor_is_neg_one: false,
@@ -500,8 +653,9 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
     tokens[i + 1].raw == "to_string" &&
     tokens[i + 2].kind == TokenKind::LParen &&
     tokens[i + 3].kind == TokenKind::RParen {
+      let op_b = base_offset + tokens[i + 1].start_byte
       let recv_start = find_receiver_start(tokens, i - 1)
-      if recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+      if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
@@ -511,10 +665,12 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
             probe_kind: "mbt_show_probe",
             start_byte: start_b,
             end_byte: end_b,
+            op_byte: op_b,
             line: tokens[i + 1].line,
             col: tokens[i + 1].col,
             lhs_expr: recv_expr,
             rhs_expr: "",
+            slice_hi: "",
             divisor_is_zero: false,
             divisor_is_nonzero: false,
             divisor_is_neg_one: false,
@@ -529,8 +685,9 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
 
     // 3. `<recv>.val` -> `<recv>.mbt_val_probe()`
     if t.kind == TokenKind::Dot && i + 1 < n && tokens[i + 1].raw == "val" {
+      let op_b = base_offset + tokens[i + 1].start_byte
       let recv_start = find_receiver_start(tokens, i - 1)
-      if recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+      if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
         let end_b = tokens[i + 1].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
@@ -539,10 +696,12 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
           probe_kind: "mbt_val_probe",
           start_byte: start_b,
           end_byte: end_b,
+          op_byte: op_b,
           line: tokens[i + 1].line,
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          slice_hi: "",
           divisor_is_zero: false,
           divisor_is_nonzero: false,
           divisor_is_neg_one: false,
@@ -557,6 +716,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
     // 4. `<recv>[<idx>]` -> `<recv>.mbt_idx_probe(<idx>)` (skipping `.length()` chains on index so outer probe runs first or next round;
     //    NEVER treat a newline-leading `[a, b]` array literal after a previous statement as indexing!)
     if t.kind == TokenKind::LBracket && i > 0 && !t.newline_before {
+      let op_b = base_offset + t.start_byte
       let close_br = find_matching_delim(tokens, i)
       let next_is_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
       let next_is_probe_dot = close_br + 2 < n && tokens[close_br + 1].kind == TokenKind::Dot &&
@@ -564,7 +724,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
       let next_is_mul_div = close_br + 1 < n &&
       (tokens[close_br + 1].kind == TokenKind::Star || tokens[close_br + 1].kind == TokenKind::Slash || tokens[close_br + 1].kind == TokenKind::Percent)
       let recv_start = find_receiver_start(tokens, i - 1)
-      if !next_is_eq && !next_is_probe_dot && !next_is_mul_div && recv_start >= 0 && close_br > i + 1 &&
+      if !safe_offsets.contains(op_b) && !next_is_eq && !next_is_probe_dot && !next_is_mul_div && recv_start >= 0 && close_br > i + 1 &&
       tokens[recv_start].start_byte >= covered_end &&
       tokens[i - 1].kind != TokenKind::UpperIdent &&
       !is_non_expr_receiver(tokens, recv_start) {
@@ -577,10 +737,12 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
           probe_kind: "mbt_idx_probe",
           start_byte: start_b,
           end_byte: end_b,
+          op_byte: op_b,
           line: t.line,
           col: t.col,
           lhs_expr: recv_expr,
           rhs_expr: idx_expr,
+          slice_hi: "",
           divisor_is_zero: false,
           divisor_is_nonzero: false,
           divisor_is_neg_one: false,
@@ -594,16 +756,19 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
 
     // 5. `<lhs> / <rhs>` or `<lhs> % <rhs>`:
     //    - Parses full left-associative `*` LHS chain (e.g. `a * b / c` -> `(a * b) / c`)
-    //    - Parses unary/postfix RHS (e.g. `a / -b`, `a / (b - c)`)
-    //    - ALWAYS probes first so unsupported integer types (e.g. `Int16 / 2`) are caught
-    //      BEFORE applying the constant non-zero divisor omission optimization!
+    //    - Parses unary/postfix RHS (e.g. `a / -b`, `a / (b - c)`, `a / -0x1`)
+    //    - ALWAYS probes until proven safe (`safe_offsets`) or rewritten!
     if (t.kind == TokenKind::Slash || t.kind == TokenKind::Percent) && i > 0 && i + 1 < n {
+      let op_b = base_offset + t.start_byte
+      if safe_offsets.contains(op_b) {
+        i = i + 1
+        continue
+      }
       let lhs_start = find_mul_lhs_start(tokens, i - 1)
       let rhs_end = find_rhs_end(tokens, i + 1, n)
       if lhs_start >= 0 && rhs_end >= i + 1 && tokens[lhs_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, lhs_start) {
         let is_mod = t.kind == TokenKind::Percent
         let pkind = if is_mod { "mbt_mod_probe" } else { "mbt_div_probe" }
-        // Check if RHS is a static zero or static non-zero literal (incl. unary `-2` -> nonzero, `-0` -> zero)
         let rhs_lit_idx = if rhs_end == i + 1 && (tokens[i + 1].kind == TokenKind::IntLit || tokens[i + 1].kind == TokenKind::FloatLit) {
           i + 1
         } else if rhs_end == i + 2 && (tokens[i + 1].kind == TokenKind::Minus || tokens[i + 1].kind == TokenKind::Plus) &&
@@ -618,21 +783,22 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
         let rhs_expr = content.slice(tokens[i + 1].start_byte, end_b).trim()
         let is_zero = (rhs_lit_idx >= 0 && is_statically_zero_literal(tokens[rhs_lit_idx])) || is_byte_zero_expr(rhs_expr)
         let is_neg_one = rhs_end == i + 2 && tokens[i + 1].kind == TokenKind::Minus &&
-        tokens[i + 2].kind == TokenKind::IntLit && (tokens[i + 2].raw == "1" || tokens[i + 2].raw == "1L")
-        let is_nonzero = rhs_lit_idx >= 0 && is_statically_nonzero_literal(tokens[rhs_lit_idx]) && !is_neg_one
-        if is_nonzero && !verify_const_nonzero {
-          i = i + 1
-          continue
+        match parse_int_literal_value(tokens[i + 2]) {
+          Some(v) => v == 1L
+          None => false
         }
+        let is_nonzero = rhs_lit_idx >= 0 && is_statically_nonzero_literal(tokens[rhs_lit_idx]) && !is_neg_one
         sites.push(ProbeSite::{
           file: file,
           probe_kind: pkind,
           start_byte: start_b,
           end_byte: end_b,
+          op_byte: op_b,
           line: t.line,
           col: t.col,
           lhs_expr: lhs_expr,
           rhs_expr: rhs_expr,
+          slice_hi: "",
           divisor_is_zero: is_zero,
           divisor_is_nonzero: is_nonzero,
           divisor_is_neg_one: is_neg_one,
@@ -786,6 +952,93 @@ pub fn rewrite_for_probe(
     return Some(site.lhs_expr + ".val_")
   }
 
+  // Astra Round 3 P0-2: exact per-node slice type classification (zero receiver-name heuristics!)
+  if site.probe_kind == "mbt_slice_owned_probe" || site.probe_kind == "mbt_slice_borrow_probe" {
+    let is_owned = site.probe_kind == "mbt_slice_owned_probe"
+    let expr_desc = site.lhs_expr + "[" + site.rhs_expr + ":" + site.slice_hi + "]"
+    if resolved_type == "String" {
+      drift_ledger.push(DriftEntry::{
+        category: "string_utf16_slice",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: expr_desc,
+        resolution: "mbt_compat::utf16_slice",
+        status: "resolved",
+        detail: "String slice routed to UTF-16 clamped slice",
+      })
+      return Some("mbt_compat::utf16_slice(" + site.lhs_expr + ", " + site.rhs_expr + ", " + site.slice_hi + ")")
+    }
+    if resolved_type.starts_with("Array[") {
+      if is_owned {
+        drift_ledger.push(DriftEntry::{
+          category: "array_view_slice",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: expr_desc,
+          resolution: "mbt_compat::array_slice_clamp",
+          status: "resolved",
+          detail: "immediate owned slice copy lowered to array_slice_clamp",
+        })
+      } else {
+        diags.push(diag_error(
+          "MBT2PION_BORROWED_ARRAY_SLICE",
+          site.file,
+          site.line,
+          site.col,
+          "borrowed slice `" + expr_desc + "` on non-local Array cannot guarantee shared backing ownership without ArrayBuf owner or .to_owned()/.to_array()",
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: "array_view_slice",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: expr_desc,
+          resolution: "mbt_compat::array_slice_clamp",
+          status: "unresolved",
+          detail: "borrowed slice on non-local Array cannot guarantee shared backing ownership without ArrayBuf owner or .to_owned()/.to_array()",
+        })
+      }
+      return Some("mbt_compat::array_slice_clamp(" + site.lhs_expr + ", " + site.rhs_expr + ", " + site.slice_hi + ")")
+    }
+    if resolved_type.starts_with("ArrayView[") || resolved_type.starts_with("mbt_compat::ArrayView[") ||
+    resolved_type.starts_with("ArrayBuf[") || resolved_type.starts_with("mbt_compat::ArrayBuf[") {
+      drift_ledger.push(DriftEntry::{
+        category: "array_view_slice",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: expr_desc,
+        resolution: if is_owned { "mbt_compat::ArrayView::to_array" } else { "mbt_compat::ArrayView::view" },
+        status: "resolved",
+        detail: "backing-stable ArrayBuf/ArrayView slice",
+      })
+      if is_owned {
+        return Some("(" + site.lhs_expr + ").view(" + site.rhs_expr + ", " + site.slice_hi + ").to_array()")
+      }
+      return Some("(" + site.lhs_expr + ").view(" + site.rhs_expr + ", " + site.slice_hi + ")")
+    }
+    diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SLICE",
+      site.file,
+      site.line,
+      site.col,
+      "unsupported slice receiver type `" + resolved_type + "` for `" + expr_desc + "`",
+    ))
+    drift_ledger.push(DriftEntry::{
+      category: "array_view_slice",
+      file: site.file,
+      line: site.line,
+      col: site.col,
+      expr: expr_desc,
+      resolution: "blocked",
+      status: "unresolved",
+      detail: "unsupported slice receiver type " + resolved_type,
+    })
+    return Some("mbt_compat::array_slice_clamp(" + site.lhs_expr + ", " + site.rhs_expr + ", " + site.slice_hi + ")")
+  }
+
   None
 }
 
@@ -824,14 +1077,153 @@ pub fn apply_byte_edits(src : String, edits : Array[(Int, Int, String)]) -> Stri
   sb.to_string()
 }
 
-///| Check whether a file still contains any `mbt_*_probe` residual (hard merge gate!).
+///| Check whether a file still contains any `mbt_*_probe` or slice placeholder residual (hard merge gate!).
 pub fn has_probe_residual(content : String) -> Bool {
   str_has(content, "mbt_len_probe") ||
   str_has(content, "mbt_idx_probe") ||
   str_has(content, "mbt_div_probe") ||
   str_has(content, "mbt_mod_probe") ||
   str_has(content, "mbt_show_probe") ||
-  str_has(content, "mbt_val_probe")
+  str_has(content, "mbt_val_probe") ||
+  str_has(content, "mbt_slice_owned_probe") ||
+  str_has(content, "mbt_slice_borrow_probe") ||
+  str_has(content, "__mbt_slice_owned") ||
+  str_has(content, "__mbt_slice_borrow")
+}
+
+///| Remap a set of proven-safe byte offsets through a list of non-overlapping byte edits,
+///| including offsets nested inside preserved `lhs_expr`/`rhs_expr` sub-expressions!
+fn remap_safe_offsets(
+  src : String,
+  old_safe : Array[Int],
+  edits : Array[(Int, Int, String, String, String)],
+) -> (Array[Int], Map[Int, Bool]) {
+  let sorted : Array[(Int, Int, String, String, String)] = []
+  for e in edits {
+    sorted.push(e)
+  }
+  let mut i = 1
+  while i < sorted.length() {
+    let key = sorted[i]
+    let mut j = i - 1
+    while j >= 0 && sorted[j].0 > key.0 {
+      sorted[j + 1] = sorted[j]
+      j = j - 1
+    }
+    sorted[j + 1] = key
+    i = i + 1
+  }
+  let new_list : Array[Int] = []
+  let new_map : Map[Int, Bool] = Map()
+  for pos in old_safe {
+    let mut delta = 0
+    let mut mapped = -1
+    let mut inside = false
+    for e in sorted {
+      let s = e.0
+      let en = e.1
+      let repl = e.2
+      let lhs_e = e.3
+      let rhs_e = e.4
+      if pos < s {
+        mapped = pos + delta
+        inside = true
+        break
+      }
+      if pos >= s && pos < en {
+        inside = true
+        let orig_slice = src.slice(s, en)
+        let new_edit_start = s + delta
+        if lhs_e.length() > 0 {
+          let l_old = orig_slice.index_of(lhs_e)
+          let l_new = repl.index_of(lhs_e)
+          if l_old >= 0 && l_new >= 0 && pos >= s + l_old && pos < s + l_old + lhs_e.length() {
+            mapped = new_edit_start + l_new + (pos - (s + l_old))
+          }
+        }
+        if mapped < 0 && rhs_e.length() > 0 {
+          let r_old = orig_slice.index_of(rhs_e)
+          let r_new = repl.index_of(rhs_e)
+          if r_old >= 0 && r_new >= 0 && pos >= s + r_old && pos < s + r_old + rhs_e.length() {
+            mapped = new_edit_start + r_new + (pos - (s + r_old))
+          }
+        }
+        break
+      }
+      delta = delta + repl.length() - (en - s)
+    }
+    if !inside {
+      mapped = pos + delta
+    }
+    if mapped >= 0 && !new_map.contains(mapped) {
+      new_map[mapped] = true
+      new_list.push(mapped)
+    }
+  }
+  (new_list, new_map)
+}
+
+///| Post-Stage-A.5 audit (Astra Round 3 P0-3): any `/` or `%` remaining in the final output
+///| (including inside `InterpString` `\{...}`) that was NOT proven safe in `safe_offsets` MUST block publish!
+fn audit_undisposed_div_mod(
+  file : String,
+  content : String,
+  safe_offsets : Map[Int, Bool],
+  base_offset : Int,
+  line_offset : Int,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Unit {
+  let toks = lex_moonbit(content)
+  let n = toks.length() - 1
+  let mut i = 0
+  while i < n {
+    let t = toks[i]
+    if t.kind == TokenKind::InterpString {
+      let parts = split_interp_string(t.raw, false)
+      let mut part_off = t.start_byte + 1
+      for p in parts {
+        if !p.is_expr {
+          part_off = part_off + p.text.length()
+        } else {
+          let expr_start = part_off + 2
+          audit_undisposed_div_mod(
+            file,
+            p.text,
+            safe_offsets,
+            base_offset + expr_start,
+            if line_offset > 0 { line_offset } else { t.line },
+            diags,
+            drift_ledger,
+          )
+          part_off = part_off + 2 + p.text.length() + 1
+        }
+      }
+    } else if t.kind == TokenKind::Slash || t.kind == TokenKind::Percent {
+      let op_b = base_offset + t.start_byte
+      if !safe_offsets.contains(op_b) {
+        let ln = if line_offset > 0 { line_offset } else { t.line }
+        diags.push(diag_error(
+          "MBT2PION_UNDISPOSED_DIV_MOD",
+          file,
+          ln,
+          t.col,
+          "undisposed `" + t.raw + "` operator remained after Stage A.5 (round cap reached or unrecognized operand boundary)",
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: "int_div_zero",
+          file: file,
+          line: ln,
+          col: t.col,
+          expr: t.raw,
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "undisposed division/modulo operator after Stage A.5",
+        })
+      }
+    }
+    i = i + 1
+  }
 }
 
 ///| Sort `ProbeResult`s deterministically by `(file, line, col)` so same-line multi-probes
@@ -869,8 +1261,10 @@ fn sort_probe_results(xs : Array[ProbeResult]) -> Array[ProbeResult] {
 
 ///| Execute Stage A.5 on a set of generated files using a `check_fn` callback that runs
 ///| `pionc check --json` on the instrumented file map and returns the raw JSON output.
-///| Enforces the mandatory coverage guard (`probe_diagnostics_received == probes_instrumented`)
-///| and consumes each `ProbeResult` at most once in `(file, line, col)` order!
+///| Enforces the mandatory coverage guard (`probe_diagnostics_received == probes_instrumented`),
+///| tracks proven-safe operator offsets across up to `max_rounds` (default 64) iterations,
+///| consumes each `ProbeResult` at most once in `(file, line, col)` order, and blocks on any
+///| undisposed `/` or `%` operator remaining after convergence!
 pub fn run_stage_a5(
   files : Array[GeneratedFile],
   recipes : Recipes,
@@ -878,22 +1272,41 @@ pub fn run_stage_a5(
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_with_max_rounds(files, recipes, check_fn, diags, drift_ledger, 64)
+}
+
+pub fn run_stage_a5_with_max_rounds(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
   let mut cur_files : Array[GeneratedFile] = []
+  let safe_list_by_file : Map[String, Array[Int]] = Map()
+  let safe_map_by_file : Map[String, Map[Int, Bool]] = Map()
   for f in files {
     cur_files.push(f)
+    safe_list_by_file[f.rel_path] = []
+    safe_map_by_file[f.rel_path] = Map()
   }
   let mut total_rounds = 0
   let mut total_instrumented = 0
   let mut total_resolved = 0
 
   let mut round = 0
-  while round < 6 {
+  while round < max_rounds {
     let instrumented_batch : Array[(String, String)] = []
     let sites_by_file : Map[String, Array[ProbeSite]] = Map()
     let mut round_probes = 0
 
     for f in cur_files {
-      let (inst_src, sites) = instrument_probes_for_file_opts(f.rel_path, f.content, round == 0)
+      let smap = match safe_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let (inst_src, sites) = instrument_probes_for_file_with_safe(f.rel_path, f.content, smap, 0)
       instrumented_batch.push((f.rel_path, inst_src))
       sites_by_file[f.rel_path] = sites
       round_probes = round_probes + sites.length()
@@ -950,17 +1363,23 @@ pub fn run_stage_a5(
     // Apply rewrites to each file, consuming each ProbeResult at most once in `(file, line, col)` order!
     let next_files : Array[GeneratedFile] = []
     let mut any_changed = false
-    let mut saw_verified_nonzero = false
+    let mut newly_marked_safe = false
     for f in cur_files {
       let sites = match sites_by_file.get(f.rel_path) {
         Some(xs) => xs
         None => []
       }
+      let slist = match safe_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let smap = match safe_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
       let edits : Array[(Int, Int, String)] = []
+      let remap_edits : Array[(Int, Int, String, String, String)] = []
       for site in sites {
-        if site.divisor_is_nonzero {
-          saw_verified_nonzero = true
-        }
         let mut matched_idx = -1
         let mut pi = 0
         while pi < probe_results.length() {
@@ -977,14 +1396,25 @@ pub fn run_stage_a5(
           consumed[matched_idx] = true
           let matched_ty = probe_results[matched_idx].resolved_type
           match rewrite_for_probe(site, matched_ty, recipes, diags, drift_ledger) {
-            Some(repl) => edits.push((site.start_byte, site.end_byte, repl))
-            None => ()
+            Some(repl) => {
+              edits.push((site.start_byte, site.end_byte, repl))
+              remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+            }
+            None =>
+            if !smap.contains(site.op_byte) {
+              smap[site.op_byte] = true
+              slist.push(site.op_byte)
+              newly_marked_safe = true
+            }
           }
         }
       }
       if edits.length() > 0 {
         any_changed = true
         let updated = apply_byte_edits(f.content, edits)
+        let (nl, nm) = remap_safe_offsets(f.content, slist, remap_edits)
+        safe_list_by_file[f.rel_path] = nl
+        safe_map_by_file[f.rel_path] = nm
         next_files.push(GeneratedFile::{
           rel_path: f.rel_path,
           content: updated,
@@ -992,11 +1422,13 @@ pub fn run_stage_a5(
           anchors: f.anchors,
         })
       } else {
+        safe_list_by_file[f.rel_path] = slist
+        safe_map_by_file[f.rel_path] = smap
         next_files.push(f)
       }
     }
     cur_files = next_files
-    if !any_changed && !(round == 0 && saw_verified_nonzero) {
+    if !any_changed && !newly_marked_safe {
       break
     }
     round = round + 1
@@ -1012,6 +1444,11 @@ pub fn run_stage_a5(
         "Stage A.5 residual probe identifier found in final output of " + f.rel_path,
       ))
     }
+    let smap = match safe_map_by_file.get(f.rel_path) {
+      Some(m) => m
+      None => Map()
+    }
+    audit_undisposed_div_mod(f.rel_path, f.content, smap, 0, 0, diags, drift_ledger)
   }
 
   (cur_files, total_rounds, total_instrumented, total_resolved)

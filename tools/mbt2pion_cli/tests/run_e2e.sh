@@ -614,4 +614,183 @@ EOF
 "$PIONC" run "$XPKG_APP"
 echo "[e2e] PASS: cross-package BUG-1..BUG-7 live pionc check + run (auto-imports, .Middle, nested T?, Ref(expr), closure init, derive ignore, Ctor(..))"
 
+# -----------------------------------------------------------------------------
+# Test 7: Round 3 Astra structural acceptance tests (P0-1, P0-2, P0-4, P1-2)
+# -----------------------------------------------------------------------------
+python3 - "$BIN" "$PIONC" "$COMPAT_DIR" "$WORK/r3_tests" << 'PY'
+import json, os, stat, subprocess, sys, threading
+
+bin_path, pionc, compat_dir, root = sys.argv[1:5]
+os.makedirs(root, exist_ok=True)
+
+def run_cli(args):
+    return subprocess.run([bin_path] + args, capture_output=True, text=True)
+
+# 7a. P0-1: preserve mode 0000 file, mode 0751 binary file, symlink, empty dir + reports inside --out
+s1 = os.path.join(root, "s1")
+o1 = os.path.join(root, "o1")
+os.makedirs(s1, exist_ok=True)
+os.makedirs(o1, exist_ok=True)
+with open(os.path.join(s1, "a.mbt"), "w") as f:
+    f.write("pub fn f() -> Int { 1 }\n")
+readme = os.path.join(o1, "readme")
+with open(readme, "wb") as f: f.write(b"persist")
+os.chmod(readme, 0o000)
+orig = os.path.join(o1, "original")
+with open(orig, "wb") as f: f.write(b"ab\x00\xffc")
+os.chmod(orig, 0o751)
+alias = os.path.join(o1, "alias")
+os.symlink("original", alias)
+empty_d = os.path.join(o1, "empty")
+os.makedirs(empty_d, exist_ok=True)
+
+rep_in = os.path.join(o1, "migration_report.json")
+drf_in = os.path.join(o1, "drift_ledger.json")
+r = run_cli(["--src", s1, "--out", o1, "--target", "native", "--mode", "publish",
+             "--mbt-compat", compat_dir, "--pionc", pionc,
+             "--report", rep_in, "--drift-ledger", drf_in])
+assert r.returncode == 0, f"7a publish failed: {r.returncode} {r.stderr}"
+assert os.path.isfile(os.path.join(o1, "a.pion")), "7a missing a.pion"
+assert os.path.exists(readme) and (os.lstat(readme).st_mode & 0o777) == 0o000, "7a mode 0000 lost"
+assert os.path.exists(orig) and (os.lstat(orig).st_mode & 0o777) == 0o751, "7a mode 0751 lost"
+with open(orig, "rb") as f: assert f.read() == b"ab\x00\xffc", "7a binary bytes corrupted"
+assert os.path.islink(alias) and os.readlink(alias) == "original", "7a symlink corrupted"
+assert os.path.isdir(empty_d) and not os.path.islink(empty_d), "7a empty dir lost"
+assert os.path.isfile(rep_in) and json.load(open(rep_in))["blockers"] == 0, "7a in-out report missing"
+assert os.path.isfile(drf_in) and json.load(open(drf_in))["unresolved_entries"] == 0, "7a in-out drift missing"
+# restore readme mode so trap rm -rf succeeds cleanly
+os.chmod(readme, 0o644)
+
+# 7b. P0-1: zero ENOENT under concurrent reader across 10 consecutive publishes
+enoent_count = [0]
+stop_flag = [False]
+def reader():
+    while not stop_flag[0]:
+        try:
+            os.stat(o1)
+        except FileNotFoundError:
+            enoent_count[0] += 1
+th = threading.Thread(target=reader)
+th.start()
+try:
+    for idx in range(10):
+        with open(os.path.join(s1, "a.mbt"), "w") as f:
+            f.write(f"pub fn f() -> Int {{ {idx + 1} }}\n")
+        rr = run_cli(["--src", s1, "--out", o1, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+        assert rr.returncode == 0, f"7b publish #{idx} failed: {rr.stderr}"
+finally:
+    stop_flag[0] = True
+    th.join()
+assert enoent_count[0] == 0, f"7b observed {enoent_count[0]} ENOENT during atomic swaps!"
+
+# 7c. P0-1: unsafely-preservable objects (FIFO special file, non-dir --out, and for non-root: mode 0000 subdir)
+#     refuse publish (exit 3) & leave --out untouched
+fifo_path = os.path.join(o1, "pipe_special")
+os.mkfifo(fifo_path)
+try:
+    with open(os.path.join(s1, "a.mbt"), "w") as f: f.write("pub fn f() -> Int { 998 }\n")
+    r_fifo = run_cli(["--src", s1, "--out", o1, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_fifo.returncode == 3, f"7c FIFO special file should exit 3, got {r_fifo.returncode}"
+    assert "998" not in open(os.path.join(o1, "a.pion")).read(), "7c --out was modified on FIFO failure"
+finally:
+    os.unlink(fifo_path)
+
+nondir_out = os.path.join(root, "file_not_dir")
+with open(nondir_out, "w") as f: f.write("keep-file")
+r_nd = run_cli(["--src", s1, "--out", nondir_out, "--target", "native", "--mode", "publish",
+                "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r_nd.returncode == 3, f"7c non-dir --out should exit 3, got {r_nd.returncode}"
+assert open(nondir_out).read() == "keep-file", "7c non-dir --out was modified"
+
+if os.geteuid() != 0:
+    unr_dir = os.path.join(o1, "secret_dir")
+    os.makedirs(unr_dir, exist_ok=True)
+    with open(os.path.join(unr_dir, "x"), "w") as f: f.write("keep")
+    os.chmod(unr_dir, 0o000)
+    try:
+        with open(os.path.join(s1, "a.mbt"), "w") as f: f.write("pub fn f() -> Int { 999 }\n")
+        r_unr = run_cli(["--src", s1, "--out", o1, "--target", "native", "--mode", "publish",
+                         "--mbt-compat", compat_dir, "--pionc", pionc])
+        assert r_unr.returncode == 3, f"7c unreadable dir should exit 3, got {r_unr.returncode}"
+        assert "999" not in open(os.path.join(o1, "a.pion")).read(), "7c --out was modified on failure"
+    finally:
+        os.chmod(unr_dir, 0o755)
+
+# 7d. P0-2: same_receiver (borrowed Array[Int] slice + String slice named `x` in same file) MUST block
+s2 = os.path.join(root, "s2")
+o2 = os.path.join(root, "o2")
+os.makedirs(s2, exist_ok=True)
+with open(os.path.join(s2, "a.mbt"), "w") as f:
+    f.write(
+        "fn view_val(x : Array[Int]) -> Int {\n"
+        "  let v = x[0:1]\n"
+        "  x[0] = 2\n"
+        "  v[0]\n"
+        "}\n"
+        "pub fn text(x : String) -> String { x[0:1].to_owned() }\n"
+    )
+drf2 = os.path.join(root, "drf2.json")
+r2 = run_cli(["--src", s2, "--out", o2, "--target", "native", "--mode", "publish",
+              "--mbt-compat", compat_dir, "--pionc", pionc, "--drift-ledger", drf2])
+assert r2.returncode == 1, f"7d same_receiver must block publish (rc=1), got {r2.returncode}"
+dl2 = json.load(open(drf2))
+unres = [e for e in dl2["entries"] if e["category"] == "array_view_slice" and e["status"] == "unresolved"]
+res_s = [e for e in dl2["entries"] if e["category"] == "string_utf16_slice" and e["status"] == "resolved"]
+assert len(unres) == 1 and len(res_s) == 1, f"7d unexpected ledger: {dl2}"
+
+# 7e. P0-4: positional `@ext.caret("中A", 1)` live pionc run returns 65 ('A'), not 184
+dep_dir = os.path.join(root, "acme_dep")
+os.makedirs(os.path.join(dep_dir, "src"), exist_ok=True)
+with open(os.path.join(dep_dir, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "acme"\nversion = "0.1.0"\n')
+with open(os.path.join(dep_dir, "src", "main.pion"), "w") as f:
+    f.write('pub fn caret(text : String, offset : Int) -> Int { text.code_unit_at(offset) }\n')
+am_path = os.path.join(root, "pos_map.json")
+with open(am_path, "w") as f:
+    json.dump({"symbols": [{"src_pkg": "ext", "src_name": "caret", "kind": "fn",
+                            "target_pkg": "acme", "target_name": "caret",
+                            "params": [{"name": "text", "ty": "String", "unit": "none"},
+                                       {"name": "offset", "ty": "Int", "unit": "utf8", "str_param": "text"}]}]}, f)
+s3 = os.path.join(root, "s3")
+pkg3 = os.path.join(root, "pkg3")
+os.makedirs(s3, exist_ok=True)
+os.makedirs(os.path.join(pkg3, "src"), exist_ok=True)
+with open(os.path.join(s3, "a.mbt"), "w") as f:
+    f.write('pub fn sample() -> Int { @ext.caret("中A", 1) }\n')
+drf3 = os.path.join(root, "drf3.json")
+r3 = run_cli(["--src", s3, "--out", os.path.join(pkg3, "src"), "--target", "native", "--mode", "publish",
+              "--api-map", am_path, "--dep", "acme=" + dep_dir,
+              "--mbt-compat", compat_dir, "--pionc", pionc, "--drift-ledger", drf3])
+assert r3.returncode == 0, f"7e publish failed: {r3.stderr}"
+dl3 = json.load(open(drf3))
+assert any(e["category"] == "string_unit_boundary" for e in dl3["entries"]), f"7e missing drift entry: {dl3}"
+with open(os.path.join(pkg3, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "pos_chk"\nversion = "0.1.0"\n[dependencies]\nacme = {{ path = "{dep_dir}" }}\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+with open(os.path.join(pkg3, "src", "main.pion"), "w") as f:
+    f.write('pub fn main(_w : World) -> Int { if sample() != 65 { panic("expected 65") }; 0 }\n')
+rr3 = subprocess.run([pionc, "run", pkg3], capture_output=True, text=True)
+assert rr3.returncode == 0, f"7e pionc run failed: {rr3.stderr}"
+
+# 7f. P1-2: qualified method `pub fn Widget::value_of` span_map points to exact published bytes
+s4 = os.path.join(root, "s4")
+o4 = os.path.join(root, "o4")
+os.makedirs(s4, exist_ok=True)
+with open(os.path.join(s4, "w.mbt"), "w") as f:
+    f.write("pub struct Widget {\n  value : Int\n}\npub fn Widget::value_of(self : Widget) -> Int {\n  self.value\n}\n")
+rep4 = os.path.join(root, "rep4.json")
+r4 = run_cli(["--src", s4, "--out", o4, "--target", "native", "--mode", "publish",
+              "--mbt-compat", compat_dir, "--pionc", pionc, "--report", rep4])
+assert r4.returncode == 0, f"7f publish failed: {r4.stderr}"
+raw_bytes = open(os.path.join(o4, "w.pion"), "rb").read()
+spans = json.load(open(rep4))["span_map"]
+m_spans = [sp for sp in spans if sp["kind"] == "fn:Widget::value_of"]
+assert len(m_spans) == 1, f"7f missing fn:Widget::value_of span: {spans}"
+sl = raw_bytes[m_spans[0]["out_start"]:m_spans[0]["out_end"]]
+assert sl.startswith(b"pub fn Widget::value_of") and sl.endswith(b"}"), f"7f bad span bytes: {sl!r}"
+
+print("[e2e] PASS: Round 3 Astra structural suite (0-ENOENT atomic swap, modes/symlinks/empty-dir, in-out reports, same_receiver, positional api_map, qualified span_map)")
+PY
+
 echo "[e2e] ALL E2E TESTS PASSED!"
