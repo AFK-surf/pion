@@ -197,8 +197,9 @@ end = ssa.find("\n}\n", idx)
 body = ssa[idx:end]
 assert "call $pion_alloc_uninit(w 24," in body, "expected heap alloc for lim in run_once:\n" + body
 assert "alloc8 24" not in body, "FORBIDDEN stack alloc8 24 for lim in run_once:\n" + body
+assert "alloc8 48" not in body, "FORBIDDEN stack alloc8 48 for lim in run_once:\n" + body
 ' "$APP_SSA"
-echo "p74f Case 1 SSA check OK (heap pion_alloc_uninit, no stack alloc8 24)"
+echo "p74f Case 1 SSA check OK (heap pion_alloc_uninit, no stack alloc8 24/48)"
 
 # 2. Case 1: Native dev
 PION_CACHE_DIR="$CAS_DIR" "$PIONC" build -o "$TMP_DIR/xpkg_dev" "$TMP_DIR/ws/app_pkg"

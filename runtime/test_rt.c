@@ -3557,6 +3557,102 @@ static void test_fs_lock_blocking(void) {
     printf("[PASS] fs_lock_blocking (pion_fs_lock excludes trylock and a waiting locker)\n");
 }
 
+/* pion_fs_mkdir_excl_status: 0 created, 1 the name is taken (EEXIST /
+ * ERROR_ALREADY_EXISTS, a directory or a file), -1 any other failure — so
+ * pionc's staging-directory loops retry only a taken name and fail at once on
+ * a real error (missing parent, no permission) without probing again. */
+static void test_fs_mkdir_excl_status(void) {
+    char base[600], sub[700], file[700], orphan[700];
+    snprintf(base, sizeof(base), "%s/pion_mks_%d", pion_test_tmpdir(), pion_test_getpid());
+    snprintf(sub, sizeof(sub), "%s/sub", base);
+    snprintf(file, sizeof(file), "%s/file", base);
+    snprintf(orphan, sizeof(orphan), "%s/missing/child", base);
+    assert(pion_fs_mkdir_excl_status(NULL) == -1);
+    assert(pion_fs_mkdir_excl_status("") == -1);
+    assert(pion_fs_mkdir_excl_status(base) == 0);
+    assert(pion_fs_mkdir_excl_status(base) == 1);
+    assert(pion_fs_mkdir_excl(base) == -1); /* the 0 / -1 contract is unchanged */
+    assert(pion_fs_mkdir_excl_status(sub) == 0);
+    assert(pion_fs_mkdir_excl_status(sub) == 1);
+    FILE *f = fopen(file, "w");
+    assert(f);
+    fclose(f);
+    assert(pion_fs_mkdir_excl_status(file) == 1);
+    assert(pion_fs_mkdir_excl_status(orphan) == -1); /* missing parent */
+    assert(pion_fs_lstat_kind(orphan) == 0);
+#ifndef _WIN32
+    char ro[700], ro_child[700];
+    snprintf(ro, sizeof(ro), "%s/ro", base);
+    snprintf(ro_child, sizeof(ro_child), "%s/ro/child", base);
+    assert(chmod(base, 0755) == 0); /* only `ro` itself refuses the create */
+    assert(mkdir(ro, 0555) == 0);
+    if (geteuid() != 0) {
+        assert(pion_fs_mkdir_excl_status(ro_child) == -1); /* EACCES */
+    } else {
+        pid_t pid = fork();
+        assert(pid >= 0);
+        if (pid == 0) {
+            if (setgid(65534) != 0 || setuid(65534) != 0) _exit(2);
+            _exit(pion_fs_mkdir_excl_status(ro_child) == -1 ? 0 : 1);
+        }
+        int st = 0;
+        assert(waitpid(pid, &st, 0) == pid);
+        assert(WIFEXITED(st) && WEXITSTATUS(st) == 0);
+    }
+    assert(pion_fs_lstat_kind(ro_child) == 0);
+    assert(rmdir(ro) == 0);
+#endif
+    assert(remove(file) == 0);
+    assert(pion_fs_rmdir(sub) == 0);
+    assert(pion_fs_rmdir(base) == 0);
+    printf("[PASS] fs_mkdir_excl_status (created 0 / taken 1 / error -1)\n");
+}
+
+/* pion_cli_next_seq: strictly increasing on one thread, and 8 threads taking
+ * 4096 values each get 32768 distinct values (pionc names a staging
+ * directory per call, so two threads of one process never share one). */
+#define SEQ_THREADS 8
+#define SEQ_PER_THREAD 4096
+static int64_t g_seq_vals[SEQ_THREADS * SEQ_PER_THREAD];
+static atomic_int g_seq_slot;
+
+static void seq_worker(void *env) {
+    (void)env;
+    int slot = atomic_fetch_add(&g_seq_slot, 1);
+    assert(slot >= 0 && slot < SEQ_THREADS);
+    int64_t *out = g_seq_vals + (size_t)slot * SEQ_PER_THREAD;
+    for (int i = 0; i < SEQ_PER_THREAD; i++) {
+        out[i] = pion_cli_next_seq();
+        if (i > 0) assert(out[i] > out[i - 1]);
+    }
+}
+
+static int cmp_i64(const void *a, const void *b) {
+    int64_t x = *(const int64_t *)a, y = *(const int64_t *)b;
+    return (x > y) - (x < y);
+}
+
+static void test_mt_cli_next_seq(void) {
+    int64_t a = pion_cli_next_seq();
+    int64_t b = pion_cli_next_seq();
+    assert(a >= 0 && b == a + 1);
+    atomic_store(&g_seq_slot, 0);
+    void *sc = pion_scope_begin();
+    for (int i = 0; i < SEQ_THREADS; i++) {
+        pion_scope_spawn(sc, seq_worker, NULL);
+    }
+    pion_scope_end(sc);
+    assert(atomic_load(&g_seq_slot) == SEQ_THREADS);
+    size_t n = (size_t)SEQ_THREADS * SEQ_PER_THREAD;
+    qsort(g_seq_vals, n, sizeof(int64_t), cmp_i64);
+    /* No duplicate and no gap: exactly b+1 .. b+n were handed out. */
+    for (size_t i = 0; i < n; i++) {
+        assert(g_seq_vals[i] == b + 1 + (int64_t)i);
+    }
+    assert(pion_cli_next_seq() == b + 1 + (int64_t)n);
+    printf("[PASS] mt_cli_next_seq (%d threads x %d, all distinct)\n", SEQ_THREADS, SEQ_PER_THREAD);
+}
+
 static void test_utf8_paths_and_embedded_nul(int argc, char **argv) {
     void *w = pion_world_init(argc, argv);
     int32_t ok = 0;
@@ -4014,6 +4110,7 @@ int main(int argc, char **argv) {
     test_p22a_systems_io(argc, argv);
     test_utf8_paths_and_embedded_nul(argc, argv);
     test_fs_lstat_kind();
+    test_fs_mkdir_excl_status();
     test_ffi_ptr_and_cstr();
     test_str_to_double();
     test_p57b_hot_str_and_split();
@@ -4028,6 +4125,7 @@ int main(int argc, char **argv) {
     test_mt_nested_scope();
     test_mt_spawn_stack_8mib();
     test_fs_lock_blocking();
+    test_mt_cli_next_seq();
     test_mt_slab_stress();
     test_med_cache_and_mt_frozen();
     test_mt_world_exec(argc, argv);

@@ -169,6 +169,22 @@ int32_t pion_fs_mkdir_excl(const char *path) {
     return rc;
 }
 
+/* Like pion_fs_mkdir_excl, but tells a taken name apart: 0 if this call
+ * created `path`, 1 if something already exists there
+ * (ERROR_ALREADY_EXISTS), -1 on any other failure (NULL / empty / invalid
+ * UTF-8 path, missing parent, access denied, ...). */
+int32_t pion_fs_mkdir_excl_status(const char *path) {
+    if (!path || !*path) return -1;
+    wchar_t *wp = pion_cli_utf8_to_wide(path, strlen(path));
+    if (!wp) return -1;
+    int32_t rc = 0;
+    if (!CreateDirectoryW(wp, NULL)) {
+        rc = GetLastError() == ERROR_ALREADY_EXISTS ? 1 : -1;
+    }
+    free(wp);
+    return rc;
+}
+
 /* Single empty-directory remove (no shell): 0 on success, -1 on error. */
 int32_t pion_fs_rmdir(const char *path) {
     wchar_t *wp = path ? pion_cli_utf8_to_wide(path, strlen(path)) : NULL;
@@ -230,6 +246,13 @@ int64_t pion_cli_getpid(void) {
     return (int64_t)GetCurrentProcessId();
 }
 
+/* Process-wide monotonically increasing sequence (0, 1, 2, ...), safe across
+ * threads: every call returns a value no other call in this process got. */
+int64_t pion_cli_next_seq(void) {
+    static volatile LONG64 s_seq = 0;
+    return (int64_t)(InterlockedIncrement64(&s_seq) - 1);
+}
+
 /* 1 on a Windows host build of pionc (host path rules), else 0. */
 int32_t pion_cli_is_windows(void) {
     return 1;
@@ -262,6 +285,8 @@ int32_t pion_fs_lstat_kind(const char *path) {
 #include "pion_rt.h"
 #include <errno.h>
 #include <fcntl.h>
+#include <stdatomic.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
@@ -505,6 +530,15 @@ int32_t pion_fs_mkdir_excl(const char *path) {
     return (path && *path && mkdir(path, 0700) == 0) ? 0 : -1;
 }
 
+/* Like pion_fs_mkdir_excl, but tells a taken name apart: 0 if this call
+ * created `path`, 1 if something already exists there (EEXIST), -1 on any
+ * other failure (NULL / empty path, missing parent, EACCES, ENOSPC, ...). */
+int32_t pion_fs_mkdir_excl_status(const char *path) {
+    if (!path || !*path) return -1;
+    if (mkdir(path, 0700) == 0) return 0;
+    return errno == EEXIST ? 1 : -1;
+}
+
 /* Single empty-directory remove (no shell): 0 on success, -1 on error. */
 int32_t pion_fs_rmdir(const char *path) {
     return (path && *path && rmdir(path) == 0) ? 0 : -1;
@@ -551,6 +585,13 @@ void pion_fs_unlock(int64_t handle) {
 /* This process's id (unique among live processes; `pionc` temp-file names). */
 int64_t pion_cli_getpid(void) {
     return (int64_t)getpid();
+}
+
+/* Process-wide monotonically increasing sequence (0, 1, 2, ...), safe across
+ * threads: every call returns a value no other call in this process got. */
+int64_t pion_cli_next_seq(void) {
+    static _Atomic uint64_t s_seq = 0;
+    return (int64_t)atomic_fetch_add_explicit(&s_seq, 1, memory_order_relaxed);
 }
 
 /* 1 on a Windows host build of pionc (host path rules), else 0. */

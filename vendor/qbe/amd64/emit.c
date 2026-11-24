@@ -673,18 +673,19 @@ emitjtbl(Blk *b, int id0, E *e)
 	fprintf(f, "\tmovslq (%%r11,%%r10,4), %%r10\n");
 	fprintf(f, "\taddq %%r10, %%r11\n");
 	fprintf(f, "\tjmpq *%%r11\n");
-	if (T.apple)
-		fprintf(f, ".section __TEXT,__const\n");
-	else if (T.windows)
-		fprintf(f, ".section .rdata,\"dr\"\n");
-	else
-		fprintf(f, ".section .rodata\n");
+	if (!T.windows) {
+		if (T.apple)
+			fprintf(f, ".section __TEXT,__const\n");
+		else
+			fprintf(f, ".section .rodata\n");
+	}
 	fprintf(f, ".p2align 2\n");
 	fprintf(f, "%sjt%d:\n", T.asloc, jtid);
 	for (jk = 0; jk < b->njtbl; jk++)
 		fprintf(f, "\t.long %sbb%d - %sjt%d\n",
 			T.asloc, id0 + b->jtbl[jk]->id, T.asloc, jtid);
-	fprintf(f, (!T.apple && !T.windows) ? ".previous\n" : ".text\n");
+	if (!T.windows)
+		fprintf(f, T.apple ? ".text\n" : ".previous\n");
 }
 
 static void
