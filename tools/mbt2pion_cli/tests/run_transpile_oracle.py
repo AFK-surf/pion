@@ -1153,11 +1153,28 @@ pub fn m2b_array_rest_pat(flag : Bool) -> (Int, Int, Int) {
     Some([a, b, ..]) if !flag => a + b
     _ => 99
   }
+  // Guard mutation single-binding + exhaustive None / fallback check (review item #2)
+  let eval_guarded = fn(opt : Array[Int]?) -> Int {
+    match opt {
+      Option::Some([a, ..]) if {
+        match opt {
+          Option::Some(arr) => arr[0] = 9
+          Option::None => ()
+        }
+        a > 0
+      } => a
+      Option::None => 0
+      _ => -1
+    }
+  }
+  let g1 = eval_guarded(Option::Some([1]))
+  let g2 = eval_guarded(Option::Some([0]))
+  let g3 = eval_guarded(Option::None)
   let r3 = match [5, 6, 7] {
     [h, ..] => h
     _ => 0
   }
-  (r1, r2, r3)
+  (r1, r2, r3 * 100 + g1 * 10 + (g2 + 1) + g3)
 }
 
 pub fn m2b_bytes_for_loop() -> (Int, Int) {
@@ -1754,7 +1771,7 @@ fn main {
     let hk = @m12.m2b_hash_consistency()
     trace("m2b", "\{sc},\{ss},\{ssum},\{ar1}:\{ar2}:\{ar3},\{bs1}:\{bs2},\{js},\{jn},\{ji},\{ju},\{sb_ok}:\{w01}:\{mk},\{vc}:\{vf}:\{vn},\{hk}")
     check("m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
-    check("m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 5)
+    check("m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 510)
     check("m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
     check("m2b.json_parse_stringify", js == "\"fallback\"" && jn == 42)
     check("m2b.catch_int_utf8", ji == 116 && ju)
@@ -2296,7 +2313,7 @@ pub fn main(w : World) -> Int {
     let hk = m12::m2b_hash_consistency()
     trace(w, "m2b", sc.to_string() + "," + ss + "," + ssum.to_string() + "," + ar1.to_string() + ":" + ar2.to_string() + ":" + ar3.to_string() + "," + bs1.to_string() + ":" + bs2.to_string() + "," + js + "," + jn.to_string() + "," + ji.to_string() + "," + ju.to_string() + "," + sb_ok.to_string() + ":" + w01.to_string() + ":" + mk.to_string() + "," + vc.to_string() + ":" + vf.to_string() + ":" + mbt_compat::double_to_string(vn) + "," + hk.to_string())
     check(w, "m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
-    check(w, "m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 5)
+    check(w, "m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 510)
     check(w, "m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
     check(w, "m2b.json_parse_stringify", js == "\"fallback\"" && jn == 42)
     check(w, "m2b.catch_int_utf8", ji == 116 && ju)

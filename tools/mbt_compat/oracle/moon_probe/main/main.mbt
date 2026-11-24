@@ -732,6 +732,23 @@ fn case_wave_m2_round2() -> Unit {
 }
 
 ///|
+fn case_wave_m2b_parse() -> Unit {
+  let i_ws = try { Some(@string.parse_int(" 42 ")) } catch { _ => None }
+  let i_hex0 = try { Some(@string.parse_int("0xff")) } catch { _ => None }
+  let i_hex16 = try { Some(@string.parse_int("0xFF", base=16)) } catch { _ => None }
+  let d_ws = try { Some(@string.parse_double(" 1.5 ")) } catch { _ => None }
+  let d_ovf = try { Some(@string.parse_double("1e309")) } catch { _ => None }
+  let d_und = try { Some(@string.parse_double("1e-400")) } catch { _ => None }
+  trace("parse", "\{i_ws is None},\{i_hex0.unwrap_or(-1)},\{i_hex16.unwrap_or(-1)},\{d_ws is None},\{d_ovf is None},\{d_und.unwrap_or(-1.0)}")
+  check("m2b.int_ws_err", i_ws is None)
+  check("m2b.int_hex0", i_hex0 == Some(255))
+  check("m2b.int_hex16", i_hex16 == Some(255))
+  check("m2b.dbl_ws_err", d_ws is None)
+  check("m2b.dbl_ovf_err", d_ovf is None)
+  check("m2b.dbl_und_zero", d_und == Some(0.0))
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -758,6 +775,7 @@ fn main {
     "arr.remove_oob" => case_arr_remove_oob()
     "wave_m2.compat" => case_wave_m2_compat()
     "wave_m2.round2" => case_wave_m2_round2()
+    "wave_m2b.parse" => case_wave_m2b_parse()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)
