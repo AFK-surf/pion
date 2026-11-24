@@ -11,6 +11,7 @@ import PionProofs.QbeArm64SlotPairs
 import PionProofs.Pr2Checks
 import PionProofs.QbeCodegenOpts
 import PionProofs.QbeGvnSpeedup
+import PionProofs.QbeBackendOpts2
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -509,3 +510,11 @@ import PionProofs.QbeGvnSpeedup
 #print axioms PionQbeGvnSpeedup.Trail.undo_append
 #print axioms PionQbeGvnSpeedup.Trail.restore
 #print axioms PionQbeGvnSpeedup.Trail.equivalent
+#print axioms PionQbeBackendOpts2.rematIndex
+#print axioms PionQbeBackendOpts2.rematIndexSwap
+#print axioms PionQbeBackendOpts2.align16_exact
+#print axioms PionQbeBackendOpts2.layout_bound
+#print axioms PionQbeBackendOpts2.taken_fallthrough
+#print axioms PionQbeBackendOpts2.relocation
+#print axioms PionQbeBackendOpts2.cmp_mem
+#print axioms PionQbeBackendOpts2.cmp_mem_imm
