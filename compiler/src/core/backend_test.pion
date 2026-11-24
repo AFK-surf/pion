@@ -12163,3 +12163,210 @@ test "i3: qbe_sanitize_source_path normalizes Windows slashes, dotdot & bare fil
     "pkg_r/src/lib.pion",
   )
 }
+
+///|
+/// Wasm32 nested-loop outlining (`wasm_outline_nested_loops`) live-out regression: a promoted
+/// slot read+written only inside an outlined depth-2 loop (`pos`, declared before the outer
+/// `while`) must be written back to the caller's slot, otherwise each outer iteration re-enters
+/// the outlined loop with a stale value. Inner counters re-stored on every entry (`i = 0`) stay
+/// out of the live-out set, and > 8 live-outs back off from outlining entirely.
+fn p95_ol_writebacks(funcs : Array[WasmFunc], fn_suffix : String) -> (Int, Int) {
+  let mut n_calls = 0
+  let mut n_wb = 0
+  let mut fi = 0
+  while fi < funcs.length() {
+    let f = funcs[fi]
+    if f.name.ends_with(fn_suffix) {
+      let mut bi = 0
+      while bi < f.blocks.length() {
+        let insts = f.blocks[bi].insts
+        let mut after_call = false
+        let mut ii = 0
+        while ii < insts.length() {
+          let inst = insts[ii]
+          if inst.op == "call" && inst.args.length() > 0 && inst.args[0].starts_with("$__pion_ol_") {
+            n_calls = n_calls + 1
+            after_call = true
+          } else if after_call &&
+            (inst.op == "storel" || inst.op == "storew" || inst.op == "stores" || inst.op == "stored") &&
+            inst.args.length() >= 2 &&
+            (inst.args[0].starts_with("%__ol_res_") || inst.args[0].starts_with("%__ol_cr_")) {
+            n_wb = n_wb + 1
+          }
+          ii = ii + 1
+        }
+        bi = bi + 1
+      }
+    }
+    fi = fi + 1
+  }
+  (n_calls, n_wb)
+}
+
+///|
+test "p95_wasm_outline_nested_loop_inner_rw_slot_liveout" {
+  let src =
+    #|fn probe_if(xs : Array[Int]) -> Int {
+    #|  let n = xs.length()
+    #|  let mut pos = 0
+    #|  let mut acc = 0
+    #|  let mut o = 0
+    #|  while o < n {
+    #|    let p = xs[o]
+    #|    if p > 0 {
+    #|      let mut i = 0
+    #|      while i < p {
+    #|        pos = (pos * 31 + i + 7) % 1000003
+    #|        acc = (acc * 3 + pos) % 1000000007
+    #|        i = i + 1
+    #|      }
+    #|    }
+    #|    o = o + 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|fn probe_wide(xs : Array[Int]) -> Int {
+    #|  let n = xs.length()
+    #|  let mut a0 = 1
+    #|  let mut a1 = 2
+    #|  let mut a2 = 3
+    #|  let mut a3 = 4
+    #|  let mut a4 = 5
+    #|  let mut a5 = 6
+    #|  let mut a6 = 7
+    #|  let mut a7 = 8
+    #|  let mut a8 = 9
+    #|  let mut acc = 0
+    #|  let mut o = 0
+    #|  while o < n {
+    #|    let p = xs[o]
+    #|    if p > 0 {
+    #|      let mut i = 0
+    #|      while i < p {
+    #|        a0 = (a0 * 3 + i) % 10007
+    #|        a1 = (a1 * 5 + a0) % 10009
+    #|        a2 = (a2 * 7 + a1) % 10037
+    #|        a3 = (a3 * 11 + a2) % 10039
+    #|        a4 = (a4 * 13 + a3) % 10061
+    #|        a5 = (a5 * 17 + a4) % 10067
+    #|        a6 = (a6 * 19 + a5) % 10069
+    #|        a7 = (a7 * 23 + a6) % 10079
+    #|        a8 = (a8 * 29 + a7) % 10091
+    #|        acc = (acc * 3 + a8) % 1000000007
+    #|        i = i + 1
+    #|      }
+    #|    }
+    #|    o = o + 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|pub fn main() -> Int {
+    #|  let xs = [3, 0, 5, 2]
+    #|  probe_if(xs) + probe_wide(xs)
+    #|}
+  let cr = check_source_files_full("p95", ["p95.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    check_result_to_json(cr.diagnostics),
+  )
+  let mut ri = 0
+  while ri < 2 {
+    let ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, ri == 1, "wasm32").ssa
+    let funcs = wasm_outline_nested_loops(wasm_dedup_module(wasm_parse_ssa(ssa)).funcs)
+    // probe_if: the inner `while` is outlined and writes back `pos`, `acc` and `i` (the rotated
+    // loop's guard block reloads `i`, so it is an outside read); pre-fix `pos` was dropped (2).
+    let (if_calls, if_wb) = p95_ol_writebacks(funcs, "fn_probe_if")
+    assert_true(if_calls == 1 && if_wb == 3, "release=" + (ri == 1).to_string() + " probe_if calls=" + if_calls.to_string() + " writebacks=" + if_wb.to_string())
+    // probe_wide: 10 inner read+write slots (a0..a8, acc) > 8 live-outs => not outlined.
+    let (wide_calls, _) = p95_ol_writebacks(funcs, "fn_probe_wide")
+    assert_true(wide_calls == 0, "release=" + (ri == 1).to_string() + " probe_wide calls=" + wide_calls.to_string())
+    ri = ri + 1
+  }
+}
+
+
+///|
+test "p95_wasm_ol_slot_killed_on_entry" {
+  let src =
+    #|fn probe_if(xs : Array[Int]) -> Int {
+    #|  let n = xs.length()
+    #|  let mut pos = 0
+    #|  let mut acc = 0
+    #|  let mut o = 0
+    #|  while o < n {
+    #|    let p = xs[o]
+    #|    if p > 0 {
+    #|      let mut i = 0
+    #|      while i < p {
+    #|        pos = (pos * 31 + i + 7) % 1000003
+    #|        acc = (acc * 3 + pos) % 1000000007
+    #|        i = i + 1
+    #|      }
+    #|    }
+    #|    o = o + 1
+    #|  }
+    #|  acc
+    #|}
+    #|
+    #|pub fn main() -> Int {
+    #|  probe_if([3, 0, 5, 2])
+    #|}
+  let cr = check_source_files_full("p95k", ["p95k.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    check_result_to_json(cr.diagnostics),
+  )
+  let ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, false, "wasm32").ssa
+  let funcs = wasm_dedup_module(wasm_parse_ssa(ssa)).funcs
+  let mut checked = 0
+  let mut fi = 0
+  while fi < funcs.length() {
+    let f = funcs[fi]
+    if f.name.ends_with("fn_probe_if") {
+      let block_idx : Map[String, Int] = Map([])
+      let mut bi = 0
+      while bi < f.blocks.length() {
+        block_idx.set(f.blocks[bi].label, bi)
+        bi = bi + 1
+      }
+      let le = wasm_analyze_structured_cfg(f, block_idx)
+      // Inner loop header: the second loop header in block order (the first is the outer `while`).
+      let mut outer = -1
+      let mut hdr = -1
+      bi = 0
+      while bi < f.blocks.length() {
+        if le[bi] >= 0 {
+          if outer < 0 { outer = bi } else if hdr < 0 { hdr = bi }
+        }
+        bi = bi + 1
+      }
+      assert_true(outer >= 0 && hdr > outer && le[hdr] <= le[outer], "outer=" + outer.to_string() + " hdr=" + hdr.to_string())
+      // The guard block entering the inner loop stores `i = 0`; the loop body's other slot
+      // stores (`pos`, `acc`) are never re-stored on entry.
+      let pre = f.blocks[hdr - 1].insts
+      let mut i_slot = ""
+      let mut ii = 0
+      while ii < pre.length() {
+        if pre[ii].op == "storew" || pre[ii].op == "storel" {
+          i_slot = pre[ii].args[1]
+        }
+        ii = ii + 1
+      }
+      assert_true(i_slot.length() > 0, "no store in guard block")
+      assert_true(wasm_ol_slot_killed_on_entry(f, le, hdr, le[hdr], i_slot), "i slot " + i_slot)
+      let body = f.blocks[hdr].insts
+      ii = 0
+      while ii < body.length() {
+        if (body[ii].op == "storew" || body[ii].op == "storel") && body[ii].args[1] != i_slot {
+          assert_true(!wasm_ol_slot_killed_on_entry(f, le, hdr, le[hdr], body[ii].args[1]), "slot " + body[ii].args[1])
+          checked = checked + 1
+        }
+        ii = ii + 1
+      }
+    }
+    fi = fi + 1
+  }
+  assert_true(checked == 2, "checked=" + checked.to_string())
+}
