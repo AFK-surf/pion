@@ -256,6 +256,8 @@ sh "$ROOT_DIR/tests/e2e/p103_wave_l0_stdlib_tuple/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p82a_wasm_arr_clear_f32_push/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p85_enum_sroa/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC2"
+# P108: QbeReadPair hoisted pair headers/bounds & bounded memchr byte scan.
+sh "$ROOT_DIR/tests/e2e/p108_read_pair_and_byte_scan/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
