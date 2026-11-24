@@ -18,7 +18,13 @@
  *            dce should be moved out...
  */
 
-static int amatch(Addr *, Num *, Ref, Fn *);
+typedef struct {
+	Num *v;
+	int *touched;
+	int count;
+} AddrNums;
+
+static int amatch(Addr *, AddrNums *, Ref, Fn *);
 
 static int
 noimm(Ref r, Fn *fn)
@@ -181,7 +187,7 @@ fixarg(Ref *r, int k, Ins *i, Fn *fn)
 }
 
 static void
-seladdr(Ref *r, Num *tn, Fn *fn)
+seladdr(Ref *r, AddrNums *tn, Fn *fn)
 {
 	Addr a;
 	Ref r0;
@@ -253,7 +259,7 @@ selcmp(Ref arg[2], int k, int swap, Fn *fn)
 }
 
 static void
-sel(Ins i, Num *tn, Fn *fn)
+sel(Ins i, AddrNums *tn, Fn *fn)
 {
 	Ref r0, r1, tmp[7];
 	int x, j, k, kc, sh, swap;
@@ -595,7 +601,7 @@ flagi(Ins *i0, Ins *i)
 }
 
 static Ins*
-selsel(Fn *fn, Blk *b, Ins *i, Num *tn)
+selsel(Fn *fn, Blk *b, Ins *i, AddrNums *tn)
 {
 	Ref r, cr[2];
 	int c, k, dk, dc, swap, gencmp, gencpy;
@@ -807,16 +813,30 @@ opn(int op, int l, int r)
 	}
 }
 
+/* Every write to the numbering table first enters here.  Nonzero
+ * states distinguish touched slots; state 2 is the default temporary.
+ * opn() never returns 0, so a slot is recorded at most once per block
+ * and touched[] needs one entry per temporary. */
+static Num *
+touch(AddrNums *tn, int t)
+{
+	Num *v = &tn->v[t];
+
+	if (!v->n) {
+		tn->touched[tn->count++] = t;
+		v->n = 2;
+	}
+	return v;
+}
+
 static int
-refn(Ref r, Num *tn, Con *con)
+refn(Ref r, AddrNums *tn, Con *con)
 {
 	int64_t n;
 
 	switch (rtype(r)) {
 	case RTmp:
-		if (!tn[r.val].n)
-			tn[r.val].n = 2;
-		return tn[r.val].n;
+		return touch(tn, r.val)->n;
 	case RCon:
 		if (con[r.val].type != CBits)
 			return 1;
@@ -871,7 +891,7 @@ static uchar *matcher[] = {
 /* end of generated code */
 
 static void
-anumber(Num *tn, Blk *b, Fn *fn)
+anumber(AddrNums *tn, Blk *b, Fn *fn)
 {
 	Ins *i;
 	Num *n;
@@ -879,7 +899,7 @@ anumber(Num *tn, Blk *b, Fn *fn)
 	for (i=b->ins; i<&b->ins[b->nins]; i++) {
 		if (rtype(i->to) != RTmp)
 			continue;
-		n = &tn[i->to.val];
+		n = touch(tn, i->to.val);
 		if (i->op == Oshl && i->cls == Kl
 		&& rtype(i->arg[0]) == RTmp && rtype(i->arg[1]) == RCon) {
 			Con *sc = &fn->con[i->arg[1].val];
@@ -962,7 +982,7 @@ slot_disp32_ok(const Con *off, int s, const Fn *fn)
 }
 
 static Ref
-adisp(Con *c, Num *tn, Ref r, Fn *fn, int s)
+adisp(Con *c, AddrNums *tn, Ref r, Fn *fn, int s)
 {
 	Ref v[2];
 	int n;
@@ -972,7 +992,7 @@ adisp(Con *c, Num *tn, Ref r, Fn *fn, int s)
 		n = refn(r, tn, fn->con);
 		if (!(match[n] & BIT(Pob)))
 			break;
-		runmatch(matcher[Pob], tn, r, v);
+		runmatch(matcher[Pob], tn->v, r, v);
 		assert(rtype(v[0]) == RCon);
 		if (!addcon_disp32(c, &fn->con[v[0].val], s))
 			break;
@@ -982,7 +1002,7 @@ adisp(Con *c, Num *tn, Ref r, Fn *fn, int s)
 }
 
 static int
-amatch(Addr *a, Num *tn, Ref r, Fn *fn)
+amatch(Addr *a, AddrNums *tn, Ref r, Fn *fn)
 {
 	static int pat[] = {Pobis, Pobi1, Pbis, Pois, Pbi1, -1};
 	Ref ro, rb, ri, rs, v[4];
@@ -996,7 +1016,7 @@ amatch(Addr *a, Num *tn, Ref r, Fn *fn)
 	memset(v, 0, sizeof v);
 	for (p=pat; *p>=0; p++)
 		if (match[n] & BIT(*p)) {
-			runmatch(matcher[*p], tn, r, v);
+			runmatch(matcher[*p], tn->v, r, v);
 			break;
 		}
 	if (*p < 0)
@@ -1205,13 +1225,14 @@ foldcompareloads(Fn *fn)
 void
 amd64_isel(Fn *fn)
 {
+	static const Num znum;
 	Blk *b, **sb;
 	Ins *i;
 	Phi *p;
 	uint a;
 	int n, al;
 	int64_t sz;
-	Num *num;
+	AddrNums num;
 
 	/* assign slots to fast allocs */
 	b = fn->start;
@@ -1242,7 +1263,9 @@ amd64_isel(Fn *fn)
 			isel_total_nins += p->narg;
 	}
 	n = fn->ntmp;
-	num = emalloc(n * sizeof num[0]);
+	num.v = emalloc(n * sizeof num.v[0]);
+	num.touched = emalloc(n * sizeof num.touched[0]);
+	num.count = 0;
 	for (b=fn->start; b; b=b->link) {
 		curi = &insb[NIns];
 		for (sb=(Blk*[3]){b->s1, b->s2, 0}; *sb; sb++)
@@ -1269,20 +1292,22 @@ amd64_isel(Fn *fn)
 				}
 			}
 		}
-		memset(num, 0, n * sizeof num[0]);
-		anumber(num, b, fn);
+		while (num.count)
+			num.v[num.touched[--num.count]] = znum;
+		anumber(&num, b, fn);
 		seljmp(b, fn);
 		for (i=&b->ins[b->nins]; i!=b->ins;) {
 			--i;
 			assert(i->op != Osel0);
 			if (i->op == Osel1)
-				i = selsel(fn, b, i, num);
+				i = selsel(fn, b, i, &num);
 			else
-				sel(*i, num, fn);
+				sel(*i, &num, fn);
 		}
 		idup(b, curi, &insb[NIns]-curi);
 	}
-	free(num);
+	free(num.touched);
+	free(num.v);
 	rematindex(fn);
 	foldcompareloads(fn);
 

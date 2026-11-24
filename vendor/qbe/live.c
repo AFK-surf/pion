@@ -40,7 +40,7 @@ filllive(Fn *f)
 {
 	Blk *b;
 	Ins *i;
-	int k, t, m[2], n, chg, nlv[2];
+	int k, t, m[2], n, first, chg, nlv[2];
 	BSet u[1], v[1];
 	Mem *ma;
 
@@ -51,6 +51,7 @@ filllive(Fn *f)
 		bsinit(b->out, f->ntmp);
 		bsinit(b->gen, f->ntmp);
 	}
+	first = 1;
 	chg = 1;
 Again:
 	for (n=f->nblk-1; n>=0; n--) {
@@ -72,7 +73,11 @@ Again:
 				bsunion(b->out, v);
 			}
 		}
-		chg |= !bsequal(b->out, u);
+		/* liveon has already recorded phi edge uses in gen. The
+		 * local transfer and register pressure depend only on out. */
+		if (!first && bsequal(b->out, u))
+			continue;
+		chg |= !first;
 
 		memset(nlv, 0, sizeof nlv);
 		b->out->t[0] |= T.rglob;
@@ -131,6 +136,7 @@ Again:
 		}
 	}
 	if (chg) {
+		first = 0;
 		chg = 0;
 		goto Again;
 	}
