@@ -296,12 +296,17 @@ TEST_JSON="$("$PIONC" test --deps --json "$ROOT_DIR/examples/text_stats")"
 echo "pionc_linux test --deps --json examples/text_stats -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'
 
-for TPKG in std/json std/http std/net std/regex examples/http_event_server tools/mbt_compat tools/mbt2pion tools/mbt2pion_cli; do
+for TPKG in std/json std/http std/net std/regex examples/http_event_server tools/mbt_compat tools/mbt2pion; do
   STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_linux test --json $TPKG -> $STD_JSON"
   printf '%s' "$STD_JSON" | grep -q '"ok":true'
   printf '%s' "$STD_JSON" | grep -q '"failed":0'
 done
+# tools/mbt2pion_cli compiles c_sources (csrc/atomic_fs.c), which needs real `as` via ORIG_PATH under GCC.
+MBT2PION_CLI_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/tools/mbt2pion_cli")"
+echo "pionc_linux test --json tools/mbt2pion_cli -> $MBT2PION_CLI_JSON"
+printf '%s' "$MBT2PION_CLI_JSON" | grep -q '"ok":true'
+printf '%s' "$MBT2PION_CLI_JSON" | grep -q '"failed":0'
 
 # POSIX TCP + FFI runtime primitives from Pion, over real 127.0.0.1 TCP
 NET_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/net_ffi.pion" --loopback)"
@@ -461,6 +466,35 @@ echo "pionc_linux run dyn_trait -> $DYN_OUT"
 if [ "$DYN_OUT" != "dyn_trait ok" ]; then
   echo "FAIL: dyn_trait output mismatch" >&2
   exit 1
+fi
+
+# Wave J2: hot-path RC elision soundness (dev & --release + Wasm32 parity on single-threaded subset).
+J2_DEV_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion")"
+"$PIONC" build --release -o "$TMP_DIR/wave_j2_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
+J2_REL_OUT="$("$TMP_DIR/wave_j2_rel")"
+echo "pionc_linux run wave_j2_rc_elision -> dev=$J2_DEV_OUT release=$J2_REL_OUT"
+case "$J2_DEV_OUT" in
+  wave_j2_ok:*) ;;
+  *) echo "FAIL: wave_j2_rc_elision bad dev output ($J2_DEV_OUT)" >&2; exit 1 ;;
+esac
+if [ "$J2_DEV_OUT" != "$J2_REL_OUT" ]; then
+  echo "FAIL: wave_j2_rc_elision dev/release mismatch (dev=$J2_DEV_OUT release=$J2_REL_OUT)" >&2
+  exit 1
+fi
+"$PIONC" build --release -o "$TMP_DIR/wave_j2_st_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+J2_ST_NAT="$("$TMP_DIR/wave_j2_st_rel")"
+case "$J2_ST_NAT" in
+  wave_j2_st_ok:*) ;;
+  *) echo "FAIL: wave_j2_rc_elision_st bad native output ($J2_ST_NAT)" >&2; exit 1 ;;
+esac
+if command -v node >/dev/null 2>&1; then
+  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/wave_j2_st.wasm" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+  J2_ST_WASM="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/wave_j2_st.wasm")"
+  echo "wave_j2_rc_elision_st -> native=$J2_ST_NAT wasm32=$J2_ST_WASM"
+  if [ "$J2_ST_NAT" != "$J2_ST_WASM" ]; then
+    echo "FAIL: wave_j2_rc_elision_st native/wasm32 mismatch (native=$J2_ST_NAT wasm32=$J2_ST_WASM)" >&2
+    exit 1
+  fi
 fi
 
 # pionc add / update against an offline git-index registry.

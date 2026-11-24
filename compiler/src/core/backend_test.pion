@@ -3089,13 +3089,13 @@ test "p87_cleanup_rc_cancel_immortal_and_budget" {
   while bi < 894 {
     over_sb.write_string("@b")
     over_sb.write_string(bi.to_string())
-    over_sb.write_string("\n    call $pion_rc_inc(l %x)\n    storel %x, %p\n    call $pion_rc_dec(l %x)\n")
+    over_sb.write_string("\n    call $pion_rc_inc(l %x) # retain\n    storel %x, %p\n    call $pion_rc_dec(l %x) # release\n")
     bi = bi + 1
   }
   over_sb.write_string("    ret 0\n}\n")
   let over_out = inline_native_rc_ssa(over_sb.to_string())
   assert_eq(over_out.contains("@_rci_fast_"), false)
-  assert_true(over_out.contains("call $pion_rc_inc(l %x)"), "K=894 must skip under 12L budget")
+  assert_true(over_out.contains("call $pion_rc_inc(l %x) # retain"), "K=894 must skip under 12L budget")
 
   // 5. Mixed-function module: pure compute (fast path 1), RC-only without _hdr (fast path 2),
   //    and immortal _hdr + dynamic RC with phi remap.
@@ -12369,4 +12369,1028 @@ test "p95_wasm_ol_slot_killed_on_entry" {
     fi = fi + 1
   }
   assert_true(checked == 2, "checked=" + checked.to_string())
+}
+
+///|
+fn j2_extract_fn(ssa : String, hdr : String) -> String {
+  let i = ssa.index_of(hdr)
+  if i < 0 {
+    return ""
+  }
+  let tail = slice_str(ssa, i, ssa.length())
+  let e = tail.index_of("\n}")
+  if e < 0 {
+    tail
+  } else {
+    slice_str(tail, 0, e)
+  }
+}
+
+///|
+test "j2: layer1 borrowed immutable field chain let positive & negative SSA" {
+  let src =
+    #|struct Leaf { name : String, tag : String }
+    #|struct Mid { leaf : Leaf }
+    #|struct MidMut { mut leaf : Leaf }
+    #|struct Top { mid : Mid, mid_mut : MidMut }
+    #|
+    #|fn use_s(s : String) -> Int { s.length() }
+    #|
+    #|pub fn pos_deep_chain(t : Top) -> Int {
+    #|  let m = t.mid
+    #|  let l = m.leaf
+    #|  let a = l.name
+    #|  let b = t.mid.leaf.tag
+    #|  a.length() + b.length()
+    #|}
+    #|
+    #|pub fn neg_mut_field(t : Top) -> Int {
+    #|  let a = t.mid_mut.leaf.name
+    #|  use_s(a)
+    #|}
+    #|
+    #|pub fn neg_mut_root(t1 : Top, t2 : Top) -> Int {
+    #|  let mut r = t1
+    #|  let a = r.mid.leaf.name
+    #|  r = t2
+    #|  use_s(a)
+    #|}
+    #|
+    #|fn swap_top(mut r : Top, other : Top) -> Int {
+    #|  r = other
+    #|  1
+    #|}
+    #|
+    #|pub fn neg_mut_arg(t1 : Top, t2 : Top) -> Int {
+    #|  let mut r = t1
+    #|  let a = r.mid.leaf.name
+    #|  let _ = swap_top(mut r, t2)
+    #|  use_s(a)
+    #|}
+    #|
+    #|pub fn pos_escape_return(t : Top) -> String {
+    #|  let a = t.mid.leaf.name
+    #|  return a
+    #|}
+  let cr = check_source_files_full("j2_l1", ["j2_l1.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = cleanup_native_rc_ssa(emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa)
+  // pos_deep_chain must have zero RC ops.
+  let pos_end = j2_extract_fn(ssa, "export function w $pion_fn_pos_deep_chain(")
+  assert_true(pos_end.length() > 0, "pos_deep_chain not found")
+  assert_true(!pos_end.contains("$pion_rc_inc"), "pos_deep_chain should have 0 rc_inc:\n" + pos_end)
+  assert_true(!pos_end.contains("$pion_rc_dec"), "pos_deep_chain should have 0 rc_dec:\n" + pos_end)
+  // neg_mut_field must retain (mut field in chain).
+  let neg_mf_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_mut_field(")
+  assert_true(neg_mf_end.contains("$pion_rc_inc"), "neg_mut_field must retain:\n" + neg_mf_end)
+  // neg_mut_root must retain (mutable root local).
+  let neg_mr_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_mut_root(")
+  assert_true(neg_mr_end.contains("$pion_rc_inc"), "neg_mut_root must retain:\n" + neg_mr_end)
+  // neg_mut_arg must retain (EMutArg mutates root).
+  let neg_ma_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_mut_arg(")
+  assert_true(neg_ma_end.contains("$pion_rc_inc"), "neg_mut_arg must retain:\n" + neg_ma_end)
+  // pos_escape_return must retain on return escape.
+  let esc_end = j2_extract_fn(ssa, "export function l $pion_fn_pos_escape_return(")
+  assert_true(esc_end.contains("$pion_rc_inc"), "pos_escape_return must retain on return:\n" + esc_end)
+}
+
+///|
+test "j2: layer2 multi-level field chain args positive & call-window mutation negative SSA" {
+  let src =
+    #|struct Leaf { name : String, tag : String }
+    #|struct Mid { leaf : Leaf }
+    #|struct Top { mid : Mid }
+    #|
+    #|fn take_two(a : String, b : String) -> Int {
+    #|  a.length() + b.length()
+    #|}
+    #|
+    #|fn take_with_int(a : String, x : Int) -> Int {
+    #|  a.length() + x
+    #|}
+    #|
+    #|fn swap_top(mut r : Top, other : Top) -> Int {
+    #|  r = other
+    #|  1
+    #|}
+    #|
+    #|pub fn pos_args(t : Top) -> Int {
+    #|  take_two(t.mid.leaf.name, t.mid.leaf.tag)
+    #|}
+    #|
+    #|pub fn neg_arg_assign(t1 : Top, t2 : Top) -> Int {
+    #|  let mut r = t1
+    #|  take_with_int(r.mid.leaf.name, { r = t2; 1 })
+    #|}
+    #|
+    #|fn Top::replace_self(mut self : Top, other : Top) -> Int {
+    #|  self = other
+    #|  1
+    #|}
+    #|
+    #|pub fn neg_arg_mut(t1 : Top, t2 : Top) -> Int {
+    #|  let mut r = t1
+    #|  take_with_int(r.mid.leaf.name, swap_top(mut r, t2))
+    #|}
+    #|
+    #|pub fn neg_arg_mut_self(t1 : Top, t2 : Top) -> Int {
+    #|  let mut r3 = t1
+    #|  take_with_int(r3.mid.leaf.name, r3.replace_self(t2))
+    #|}
+    #|
+    #|pub fn neg_arg_if_mut_self(c : Bool, t1 : Top, t2 : Top) -> Int {
+    #|  let mut r4 = t1
+    #|  take_with_int(r4.mid.leaf.name, if c { r4.replace_self(t2) } else { 0 })
+    #|}
+    #|
+    #|pub fn neg_arg_after_closure(t1 : Top, t2 : Top) -> Int {
+    #|  let mut r = t1
+    #|  let fns : Array[() -> Int] = [fn() -> Int { 7 }]
+    #|  let _ = fns[0]()
+    #|  take_with_int(r.mid.leaf.name, { r = t2; 1 })
+    #|}
+  let cr = check_source_files_full("j2_l2", ["j2_l2.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = cleanup_native_rc_ssa(emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa)
+  let pos_end = j2_extract_fn(ssa, "export function w $pion_fn_pos_args(")
+  assert_true(!pos_end.contains("$pion_rc_inc"), "pos_args should have 0 rc_inc:\n" + pos_end)
+  assert_true(!pos_end.contains("$pion_rc_dec"), "pos_args should have 0 rc_dec:\n" + pos_end)
+  let neg1_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_arg_assign(")
+  assert_true(neg1_end.contains("$pion_rc_inc"), "neg_arg_assign must retain arg0:\n" + neg1_end)
+  let neg2_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_arg_mut(")
+  assert_true(neg2_end.contains("$pion_rc_inc"), "neg_arg_mut must retain arg0:\n" + neg2_end)
+  let neg3_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_arg_mut_self(")
+  assert_true(neg3_end.contains("$pion_rc_inc"), "neg_arg_mut_self must retain arg0:\n" + neg3_end)
+  let neg4_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_arg_if_mut_self(")
+  assert_true(neg4_end.contains("$pion_rc_inc"), "neg_arg_if_mut_self must retain arg0:\n" + neg4_end)
+  let neg5_end = j2_extract_fn(ssa, "export function w $pion_fn_neg_arg_after_closure(")
+  assert_true(neg5_end.contains("$pion_rc_inc"), "neg_arg_after_closure must retain arg0:\n" + neg5_end)
+}
+
+///|
+test "j2: layer3 inline_rc safe load whitelist & CFG trap-branch penetration" {
+  // 1. Safe payload/length load on rc_inc'd object cancels.
+  let ssa_safe_load =
+    #|export function w $f_safe(l %p0) {
+    #|@start
+    #|    call $pion_rc_inc(l %p0)
+    #|    %len =l loadl %p0
+    #|    %w =w copy %len
+    #|    call $pion_rc_dec(l %p0)
+    #|    ret %w
+    #|}
+    #|
+  let out_safe = cleanup_native_rc_ssa(ssa_safe_load)
+  assert_true(!out_safe.contains("$pion_rc_inc"), out_safe)
+  assert_true(!out_safe.contains("$pion_rc_dec"), out_safe)
+
+  // 2. Global load ($pion_mt_flag) must NOT cancel.
+  let ssa_glob =
+    #|export function w $f_glob(l %p0) {
+    #|@start
+    #|    call $pion_rc_inc(l %p0)
+    #|    %mt =w loaduw $pion_mt_flag
+    #|    call $pion_rc_dec(l %p0)
+    #|    ret %mt
+    #|}
+    #|
+  let out_glob = cleanup_native_rc_ssa(ssa_glob)
+  assert_true(out_glob.contains("$pion_rc_inc"), out_glob)
+  assert_true(out_glob.contains("$pion_rc_dec"), out_glob)
+
+  // 3. Negative RC header offset load (sub %p0, 20) must NOT cancel.
+  let ssa_neg =
+    #|export function w $f_neg(l %p0) {
+    #|@start
+    #|    call $pion_rc_inc(l %p0)
+    #|    %la =l sub %p0, 20
+    #|    %rc =w loaduw %la
+    #|    call $pion_rc_dec(l %p0)
+    #|    ret %rc
+    #|}
+    #|
+  let out_neg = cleanup_native_rc_ssa(ssa_neg)
+  assert_true(out_neg.contains("$pion_rc_inc"), out_neg)
+  assert_true(out_neg.contains("$pion_rc_dec"), out_neg)
+
+  // 4. Unknown raw TPtr parameter load must NOT cancel.
+  let ssa_raw =
+    #|export function w $f_raw(l %p0, l %p_raw) {
+    #|@start
+    #|    call $pion_rc_inc(l %p0)
+    #|    %v =w loaduw %p_raw
+    #|    call $pion_rc_dec(l %p0)
+    #|    ret %v
+    #|}
+    #|
+  let out_raw = cleanup_native_rc_ssa(ssa_raw)
+  assert_true(out_raw.contains("$pion_rc_inc"), out_raw)
+  assert_true(out_raw.contains("$pion_rc_dec"), out_raw)
+
+  // 5. Single-predecessor forward trap-branch (Array 8B bounds check) penetration cancels.
+  let ssa_trap =
+    #|export function l $f_trap(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @arr_ok0
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_trap = cleanup_native_rc_ssa(ssa_trap)
+  assert_true(!out_trap.contains("$pion_rc_inc"), out_trap)
+  assert_true(!out_trap.contains("$pion_rc_dec"), out_trap)
+
+  // 5b. PionBytes bounds check (+16, stride 1, loadub) cancels.
+  let ssa_bytes_trap =
+    #|export function w $f_bytes_trap(l %bs, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %bs)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %bs
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @bytes_oob0, @bytes_ok0
+    #|@bytes_oob0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@bytes_ok0
+    #|    %dp_p =l add %bs, 16
+    #|    %dp =l loadl %dp_p
+    #|    %ep =l add %dp, %il
+    #|    %bv =w loadub %ep
+    #|    call $pion_rc_dec(l %bs)
+    #|    ret %bv
+    #|}
+    #|
+  let out_bytes_trap = cleanup_native_rc_ssa(ssa_bytes_trap)
+  assert_true(!out_bytes_trap.contains("$pion_rc_inc"), out_bytes_trap)
+  assert_true(!out_bytes_trap.contains("$pion_rc_dec"), out_bytes_trap)
+
+  // 6. Multi-predecessor @ok (pred_count == 2) must NOT penetrate.
+  let ssa_mpred =
+    #|export function w $f_mpred(l %arr, w %c, w %idx) {
+    #|@start
+    #|    jnz %c, @chk, @ok
+    #|@chk
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @oob, @ok
+    #|@oob
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_mpred = cleanup_native_rc_ssa(ssa_mpred)
+  assert_true(out_mpred.contains("$pion_rc_inc"), out_mpred)
+  assert_true(out_mpred.contains("$pion_rc_dec"), out_mpred)
+
+  // 7. Non-trap side branch (does not end with hlt) must NOT penetrate.
+  let ssa_nontrap =
+    #|export function w $f_nontrap(l %arr, w %c) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    jnz %c, @other, @ok
+    #|@other
+    #|    ret 1
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_nontrap = cleanup_native_rc_ssa(ssa_nontrap)
+  assert_true(out_nontrap.contains("$pion_rc_inc"), out_nontrap)
+  assert_true(out_nontrap.contains("$pion_rc_dec"), out_nontrap)
+
+  // 8. Unchecked `extsw` negative offset + struct offset-8 raw TPtr load MUST NOT cancel.
+  let ssa_unchecked_tptr =
+    #|export function w $f_tptr_off8(l %s, w %neg_i) {
+    #|@start
+    #|    call $pion_rc_inc(l %s)
+    #|    %fp =l add %s, 8
+    #|    %raw_ptr =l loadl %fp
+    #|    %off =l extsw %neg_i
+    #|    %ea =l add %raw_ptr, %off
+    #|    %v =w loaduw %ea
+    #|    call $pion_rc_dec(l %s)
+    #|    ret %v
+    #|}
+    #|
+  let out_tptr = cleanup_native_rc_ssa(ssa_unchecked_tptr)
+  assert_true(out_tptr.contains("$pion_rc_inc"), out_tptr)
+  assert_true(out_tptr.contains("$pion_rc_dec"), out_tptr)
+
+  // 9. Unchecked `shl` on `extsw` without a dominating `cugel` bounds check MUST NOT cancel.
+  let ssa_unchecked_shl =
+    #|export function l $f_unchecked_shl(l %arr, w %neg_i) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %neg_i
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_shl = cleanup_native_rc_ssa(ssa_unchecked_shl)
+  assert_true(out_shl.contains("$pion_rc_inc"), out_shl)
+  assert_true(out_shl.contains("$pion_rc_dec"), out_shl)
+
+  // 10. Cross-array mismatch `(arr1, idx2)` in chained bounds checks MUST NOT cancel.
+  let ssa_cross_arr =
+    #|export function l $f_cross_arr(l %arr1, l %arr2, w %i1, w %i2) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr1)
+    #|    call $pion_rc_inc(l %arr2)
+    #|    %il1 =l extsw %i1
+    #|    %len1 =l loadl %arr1
+    #|    %oob1 =w cugel %il1, %len1
+    #|    jnz %oob1, @oob1, @ok1
+    #|@oob1
+    #|    call $pion_panic_oob(l %il1, l %len1)
+    #|    hlt
+    #|@ok1
+    #|    %il2 =l extsw %i2
+    #|    %len2 =l loadl %arr2
+    #|    %oob2 =w cugel %il2, %len2
+    #|    jnz %oob2, @oob2, @ok2
+    #|@oob2
+    #|    call $pion_panic_oob(l %il2, l %len2)
+    #|    hlt
+    #|@ok2
+    #|    %dp1_p =l add %arr1, 24
+    #|    %dp1 =l loadl %dp1_p
+    #|    %off2 =l shl %il2, 3
+    #|    %ep_bad =l add %dp1, %off2
+    #|    %el =l loadl %ep_bad
+    #|    call $pion_rc_dec(l %arr2)
+    #|    call $pion_rc_dec(l %arr1)
+    #|    ret %el
+    #|}
+    #|
+  let out_cross = cleanup_native_rc_ssa(ssa_cross_arr)
+  assert_true(out_cross.contains("$pion_rc_inc"), out_cross)
+  assert_true(out_cross.contains("$pion_rc_dec"), out_cross)
+
+  // 11. Offset +8 (`cap`, not a data pointer) MUST NOT be treated as data_ptr even inside `@ok`.
+  let ssa_off8_cap =
+    #|export function l $f_off8_cap(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @oob, @ok
+    #|@oob
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    %cap_p =l add %arr, 8
+    #|    %cap_v =l loadl %cap_p
+    #|    %off =l shl %il, 3
+    #|    %bad_p =l add %cap_v, %off
+    #|    %v =l loadl %bad_p
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %v
+    #|}
+    #|
+  let out_off8 = cleanup_native_rc_ssa(ssa_off8_cap)
+  assert_true(out_off8.contains("$pion_rc_inc"), out_off8)
+  assert_true(out_off8.contains("$pion_rc_dec"), out_off8)
+
+  // 12. jtbl non-adjacent table entry jumping directly into no-phi @ok MUST NOT penetrate.
+  let ssa_jtbl =
+    #|export function w $f_jtbl(l %arr, w %tag, w %idx) {
+    #|@start
+    #|    jtbl %tag, @def, @arm0, @ok
+    #|@def
+    #|    ret 1
+    #|@arm0
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob0, @ok
+    #|@arr_oob0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_jtbl = cleanup_native_rc_ssa(ssa_jtbl)
+  assert_true(out_jtbl.contains("$pion_rc_inc"), out_jtbl)
+  assert_true(out_jtbl.contains("$pion_rc_dec"), out_jtbl)
+
+  // 13. Stride mismatch: (a) mul with arbitrary multiplier, (b) Bytes +16 with shl 3,
+  //     (c) Array +24 shl 3 with loadub — ALL must preserve RC pair.
+  let ssa_stride_mul =
+    #|export function l $f_stride_mul(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob0, @arr_ok0
+    #|@arr_oob0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l mul %il, 16
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_stride_mul = cleanup_native_rc_ssa(ssa_stride_mul)
+  assert_true(out_stride_mul.contains("$pion_rc_inc"), out_stride_mul)
+  assert_true(out_stride_mul.contains("$pion_rc_dec"), out_stride_mul)
+
+  let ssa_bytes_bad_stride =
+    #|export function l $f_bytes_bad_stride(l %bs, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %bs)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %bs
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @bytes_oob0, @bytes_ok0
+    #|@bytes_oob0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@bytes_ok0
+    #|    %dp_p =l add %bs, 16
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %bs)
+    #|    ret %el
+    #|}
+    #|
+  let out_bytes_bad = cleanup_native_rc_ssa(ssa_bytes_bad_stride)
+  assert_true(out_bytes_bad.contains("$pion_rc_inc"), out_bytes_bad)
+  assert_true(out_bytes_bad.contains("$pion_rc_dec"), out_bytes_bad)
+
+  // 14. Plain struct with +16/+24 pointer field (not a proven Array/Bytes bounds check)
+  //     MUST NOT unlock data-pointer load.
+  let ssa_plain_struct =
+    #|export function l $f_plain_struct(l %s, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %s)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %s
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @struct_oob, @struct_ok
+    #|@struct_oob
+    #|    call $pion_panic(l $msg, l $file, w 1)
+    #|    hlt
+    #|@struct_ok
+    #|    %dp_p =l add %s, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %s)
+    #|    ret %el
+    #|}
+    #|
+  let out_plain = cleanup_native_rc_ssa(ssa_plain_struct)
+  assert_true(out_plain.contains("$pion_rc_inc"), out_plain)
+  assert_true(out_plain.contains("$pion_rc_dec"), out_plain)
+
+  // 15. Side effect (`call $pion_arr_clear`) inside @arr_ok MUST invalidate checked_pairs
+  //     even after the first RC window closed, so a subsequent RC window CANNOT reuse
+  //     the stale bounds check.
+  let ssa_clear_inval =
+    #|export function l $f_clear_inval(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob0, @arr_ok0
+    #|@arr_oob0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    call $pion_rc_dec(l %arr)
+    #|    call $pion_arr_clear(l %arr)
+    #|    call $pion_rc_inc(l %arr)
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_clear = cleanup_native_rc_ssa(ssa_clear_inval)
+  assert_true(out_clear.contains("$pion_rc_inc"), out_clear)
+  assert_true(out_clear.contains("$pion_rc_dec"), out_clear)
+
+  // 16. Trap block calling user extern `$pion_panic_probe` before `$pion_panic` + `hlt`
+  //     MUST NOT be treated as a pure abort trap block (must retain RC pair).
+  let ssa_panic_probe =
+    #|export function w $f_panic_probe(l %arr, w %c) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    jnz %c, @trap, @ok
+    #|@trap
+    #|    call $pion_panic_probe(l %arr)
+    #|    call $pion_panic(l $msg, l $file, w 1)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_probe = cleanup_native_rc_ssa(ssa_panic_probe)
+  assert_true(out_probe.contains("$pion_rc_inc"), out_probe)
+  assert_true(out_probe.contains("$pion_rc_dec"), out_probe)
+
+  // 17. QBE `# comment` line between `jtbl` and `@def` MUST still count all `jtbl` targets.
+  let ssa_jtbl_comment =
+    #|export function w $f_jtbl_comment(l %arr, w %tag, w %idx) {
+    #|@start
+    #|    jtbl %tag, @def, @arm0, @ok # jump table
+    #|    # trailing block comment
+    #|@def
+    #|    ret 1
+    #|@arm0
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @ok
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_jtbl_c = cleanup_native_rc_ssa(ssa_jtbl_comment)
+  assert_true(out_jtbl_c.contains("$pion_rc_inc"), out_jtbl_c)
+  assert_true(out_jtbl_c.contains("$pion_rc_dec"), out_jtbl_c)
+
+  // 18. Side effect (`call $pion_arr_clear`) AFTER `cugel` and BEFORE `jnz` MUST invalidate
+  //     the live intra-block bounds check so `@arr_ok0` cannot elide RC on data-ptr load.
+  let ssa_clear_before_jnz =
+    #|export function l $f_clear_before_jnz(l %arr, w %idx) {
+    #|@start
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    call $pion_arr_clear(l %arr)
+    #|    call $pion_rc_inc(l %arr)
+    #|    jnz %oob, @arr_oob_w8_0, @arr_ok0
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_cbj = cleanup_native_rc_ssa(ssa_clear_before_jnz)
+  assert_true(out_cbj.contains("$pion_rc_inc"), out_cbj)
+  assert_true(out_cbj.contains("$pion_rc_dec"), out_cbj)
+
+  // 19. Proven 4B array (`@arr_oob_w4_0`): `shl 2` + `loadw` cancels, while `shl 3` + `loadl`
+  //     and unqualified `@arr_oob0` MUST preserve RC.
+  let ssa_arr4_ok =
+    #|export function w $f_arr4_ok(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w4_0, @arr_ok0
+    #|@arr_oob_w4_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 2
+    #|    %ep =l add %dp, %off
+    #|    %el =w loadw %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_arr4_ok = cleanup_native_rc_ssa(ssa_arr4_ok)
+  assert_true(!out_arr4_ok.contains("$pion_rc_inc"), out_arr4_ok)
+  assert_true(!out_arr4_ok.contains("$pion_rc_dec"), out_arr4_ok)
+
+  let ssa_arr4_bad_stride =
+    #|export function l $f_arr4_bad(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w4_0, @arr_ok0
+    #|@arr_oob_w4_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_arr4_bad = cleanup_native_rc_ssa(ssa_arr4_bad_stride)
+  assert_true(out_arr4_bad.contains("$pion_rc_inc"), out_arr4_bad)
+  assert_true(out_arr4_bad.contains("$pion_rc_dec"), out_arr4_bad)
+
+  let ssa_arr_unknown_w =
+    #|export function l $f_arr_unk(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob0, @arr_ok0
+    #|@arr_oob0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_arr_unk = cleanup_native_rc_ssa(ssa_arr_unknown_w)
+  assert_true(out_arr_unk.contains("$pion_rc_inc"), out_arr_unk)
+  assert_true(out_arr_unk.contains("$pion_rc_dec"), out_arr_unk)
+
+  // 20. Quoted global symbol containing `#` in `jtbl` (`$"dispatch#tag"`) AND unresolvable
+  //     `jtbl` targets MUST preserve cross-block RC pairs.
+  let ssa_jtbl_quoted_hash =
+    #|export function w $f_jtbl_quoted(l %arr, w %idx) {
+    #|@start
+    #|    jtbl $"dispatch#tag", @ok, @arm0
+    #|@arm0
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @ok
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_jtbl_q = cleanup_native_rc_ssa(ssa_jtbl_quoted_hash)
+  assert_true(out_jtbl_q.contains("$pion_rc_inc"), out_jtbl_q)
+  assert_true(out_jtbl_q.contains("$pion_rc_dec"), out_jtbl_q)
+
+  let ssa_jtbl_unresolvable =
+    #|export function w $f_jtbl_unres(l %arr, w %tag, w %idx) {
+    #|@start
+    #|    jtbl %tag, @missing_lbl, @arm0
+    #|@arm0
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @ok
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_jtbl_u = cleanup_native_rc_ssa(ssa_jtbl_unresolvable)
+  assert_true(out_jtbl_u.contains("$pion_rc_inc"), out_jtbl_u)
+  assert_true(out_jtbl_u.contains("$pion_rc_dec"), out_jtbl_u)
+
+  // 21. Multi-space / tab before `=` (`%il  =l ...`) redefined inside `@arr_ok0` MUST be
+  //     counted in `def_count` (>= 2), rejecting the bounds proof and preserving RC.
+  let ssa_multispace_redef =
+    #|export function l $f_multispace_redef(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il  =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @arr_ok0
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %il =l add %il, 100
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =l loadl %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_ms_redef = cleanup_native_rc_ssa(ssa_multispace_redef)
+  assert_true(out_ms_redef.contains("$pion_rc_inc"), out_ms_redef)
+  assert_true(out_ms_redef.contains("$pion_rc_dec"), out_ms_redef)
+
+  // 22. Real `Array[Int]` `loadsw` under `@arr_oob_w4_0` + `shl 2` cancels RC;
+  //     under `@arr_oob_w8_0` + `shl 3` with `loadsw` preserves RC.
+  let ssa_arr4_loadsw_ok =
+    #|export function w $f_arr4_loadsw_ok(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w4_0, @arr_ok0
+    #|@arr_oob_w4_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 2
+    #|    %ep =l add %dp, %off
+    #|    %el =w loadsw %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_loadsw_ok = cleanup_native_rc_ssa(ssa_arr4_loadsw_ok)
+  assert_true(!out_loadsw_ok.contains("$pion_rc_inc"), out_loadsw_ok)
+  assert_true(!out_loadsw_ok.contains("$pion_rc_dec"), out_loadsw_ok)
+
+  let ssa_arr8_loadsw_bad =
+    #|export function w $f_arr8_loadsw_bad(l %arr, w %idx) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @arr_ok0
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@arr_ok0
+    #|    %dp_p =l add %arr, 24
+    #|    %dp =l loadl %dp_p
+    #|    %off =l shl %il, 3
+    #|    %ep =l add %dp, %off
+    #|    %el =w loadsw %ep
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret %el
+    #|}
+    #|
+  let out_loadsw_bad = cleanup_native_rc_ssa(ssa_arr8_loadsw_bad)
+  assert_true(out_loadsw_bad.contains("$pion_rc_inc"), out_loadsw_bad)
+  assert_true(out_loadsw_bad.contains("$pion_rc_dec"), out_loadsw_bad)
+
+  // 23. Labels containing `$` (`@side$a` vs `@side$b`) MUST stay distinct in `label_to_blk`
+  //     so `@side$a` (normal return after rc_dec) is never conflated with `@side$b` (hlt).
+  let ssa_dollar_lbls =
+    #|export function w $f_dollar_lbls(l %arr, w %c) {
+    #|@start
+    #|    call $pion_rc_inc(l %arr)
+    #|    jnz %c, @side$a, @ok
+    #|@side$a
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 1
+    #|@side$b
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_dollar = cleanup_native_rc_ssa(ssa_dollar_lbls)
+  assert_true(out_dollar.contains("$pion_rc_inc"), out_dollar)
+  assert_true(out_dollar.contains("$pion_rc_dec"), out_dollar)
+
+  // 24. No-space `jmp@ok` from a non-adjacent block MUST be counted as a predecessor of `@ok`,
+  //     preventing cross-block RC cancellation across `@arm0 -> @ok`.
+  let ssa_nospace_jmp =
+    #|export function w $f_nospace_jmp(l %arr, w %c, w %idx) {
+    #|@start
+    #|    jnz %c, @arm0, @other
+    #|@other
+    #|    jmp@ok
+    #|@arm0
+    #|    call $pion_rc_inc(l %arr)
+    #|    %il =l extsw %idx
+    #|    %len =l loadl %arr
+    #|    %oob =w cugel %il, %len
+    #|    jnz %oob, @arr_oob_w8_0, @ok
+    #|@arr_oob_w8_0
+    #|    call $pion_panic_oob(l %il, l %len)
+    #|    hlt
+    #|@ok
+    #|    call $pion_rc_dec(l %arr)
+    #|    ret 0
+    #|}
+    #|
+  let out_ns_jmp = cleanup_native_rc_ssa(ssa_nospace_jmp)
+  assert_true(out_ns_jmp.contains("$pion_rc_inc"), out_ns_jmp)
+  assert_true(out_ns_jmp.contains("$pion_rc_dec"), out_ns_jmp)
+
+  // 25. Quoted function name containing parens `function l $"f()"(l %x) {` MUST still count
+  //     parameter `%x` in `def_count`, so redefining `%x` as immortal later does NOT delete
+  //     the earlier `$pion_rc_dec(l %x)` on the incoming parameter.
+  let ssa_quoted_fn_hdr =
+    #|export function l $"f()"(l %x) {
+    #|@start
+    #|    call $pion_rc_dec(l %x)
+    #|    %x =l add $pion_str_0_hdr, 24
+    #|    ret %x
+    #|}
+    #|
+  let out_qhdr = cleanup_native_rc_ssa(ssa_quoted_fn_hdr)
+  assert_true(out_qhdr.contains("call $pion_rc_dec(l %x)"), out_qhdr)
+
+  // 26. Function closing brace with trailing comment `} # end f1` MUST close `f1` so
+  //     immortal `%x` in `f1` never leaks into `f2`'s parameter `%x`.
+  let ssa_close_comment =
+    #|export function l $f1() {
+    #|@start
+    #|    %x =l add $pion_str_0_hdr, 24
+    #|    call $pion_rc_inc(l %x)
+    #|    ret %x
+    #|} # end f1
+    #|export function w $f2(l %x) {
+    #|@start
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|
+  let out_cc = cleanup_native_rc_ssa(ssa_close_comment)
+  let f2_part = j2_extract_fn(out_cc, "export function w $f2(")
+  assert_true(f2_part.contains("call $pion_rc_dec(l %x)"), out_cc)
+
+  // 27. `inline_native_rc_ssa` phi rewriting:
+  //     (a) no-space `phi@left %x, @right %y` rewrites `@left` to expanded tail `@_rcd_end_0`;
+  //     (b) `phi @left $"sym@left", @right %y` rewrites predecessor `@left` while keeping
+  //         the quoted value `$"sym@left"` byte-for-byte intact.
+  let ssa_phi_nospace =
+    #|export function l $f_phi_ns(w %c, l %x, l %y) {
+    #|@start
+    #|    jnz %c, @left, @right
+    #|@left
+    #|    call $pion_rc_dec(l %x)
+    #|    jmp @join
+    #|@right
+    #|    jmp @join
+    #|@join
+    #|    %v =l phi@left %x, @right %y
+    #|    ret %v
+    #|}
+    #|
+  let out_phi_ns = inline_native_rc_ssa(ssa_phi_nospace)
+  assert_true(out_phi_ns.contains("phi@_rcd_end_0 %x, @right %y"), out_phi_ns)
+
+  let ssa_phi_quoted =
+    #|export function l $f_phi_q(w %c, l %x, l %y) {
+    #|@start
+    #|    jnz %c, @left, @right
+    #|@left
+    #|    call $pion_rc_dec(l %x)
+    #|    jmp @join
+    #|@right
+    #|    jmp @join
+    #|@join
+    #|    %v =l phi @left $"sym@left", @right %y
+    #|    ret %v
+    #|}
+    #|
+  let out_phi_q = inline_native_rc_ssa(ssa_phi_quoted)
+  assert_true(out_phi_q.contains("phi @_rcd_end_0 $\"sym@left\", @right %y"), out_phi_q)
+
+  // 27c. Destination temp named `%phi` + negative int literal directly after `@left-1`.
+  let ssa_phi_dest_neg =
+    #|export function l $f_phi_dn(w %c, l %x, l %y) {
+    #|@start
+    #|    jnz %c, @left, @right
+    #|@left
+    #|    call $pion_rc_dec(l %x)
+    #|    jmp @join
+    #|@right
+    #|    jmp @join
+    #|@join
+    #|    %phi =l phi @left %x, @right %y
+    #|    %v =l phi @left-1, @right 0
+    #|    %r =l add %phi, %v
+    #|    ret %r
+    #|}
+    #|
+  let out_phi_dn = inline_native_rc_ssa(ssa_phi_dest_neg)
+  assert_true(out_phi_dn.contains("%phi =l phi @_rcd_end_0 %x, @right %y"), out_phi_dn)
+  assert_true(out_phi_dn.contains("%v =l phi @_rcd_end_0-1, @right 0"), out_phi_dn)
+
+  // 28. Multi-line quoted global symbol `$"..."` containing embedded RC call text (and a
+  //     trailing backslash before `\n`, which in QBE parse.c escapes `\n` rather than the
+  //     closing `"` on the next line) MUST pass the entire first function through verbatim,
+  //     while the following function still optimizes.
+  let ssa_multiline_quote =
+    #|export function l $f_mlq(l %x) {
+    #|@start
+    #|    %s =l copy $"line1
+    #|    call $pion_rc_inc(l %x)
+    #|    call $pion_rc_dec(l %x)\
+    #|"
+    #|    ret %s
+    #|}
+    #|export function w $f_after_mlq(l %p0) {
+    #|@start
+    #|    call $pion_rc_inc(l %p0)
+    #|    %len =l loadl %p0
+    #|    %w =w copy %len
+    #|    call $pion_rc_dec(l %p0)
+    #|    ret %w
+    #|}
+    #|
+  let out_mlq = cleanup_native_rc_ssa(ssa_multiline_quote)
+  let mlq_marker = "export function w $f_after_mlq("
+  let idx_in = ssa_multiline_quote.index_of(mlq_marker)
+  let idx_out = out_mlq.index_of(mlq_marker)
+  assert_true(idx_in > 0, ssa_multiline_quote)
+  assert_true(idx_out > 0, out_mlq)
+  assert_eq(slice_str(out_mlq, 0, idx_out), slice_str(ssa_multiline_quote, 0, idx_in))
+  let f2_mlq = j2_extract_fn(out_mlq, mlq_marker)
+  assert_true(f2_mlq.contains("%len =l loadl %p0"), f2_mlq)
+  assert_true(f2_mlq.contains("ret %w"), f2_mlq)
+  assert_true(!f2_mlq.contains("$pion_rc_inc"), f2_mlq)
+  assert_true(!f2_mlq.contains("$pion_rc_dec"), f2_mlq)
+
+  // 29. Same-line `} export function ... {` boundary MUST NOT merge `$f1` and `$f2`
+  //     into a single analysis pass (so `$f1`'s immortal `%x` cannot elide `$f2`'s dec),
+  //     while a subsequent cleanly delimited `$f3` still optimizes.
+  let ssa_same_line_fn_boundary =
+    #|export function w $f_sl1(l %p0) {
+    #|@start
+    #|    %x =l add $pion_str_0_hdr, 24
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|} export function w $f_sl2(l %x) {
+    #|@start
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|export function w $f_sl3(l %p0) {
+    #|@start
+    #|    call $pion_rc_inc(l %p0)
+    #|    %len =l loadl %p0
+    #|    %w =w copy %len
+    #|    call $pion_rc_dec(l %p0)
+    #|    ret %w
+    #|}
+    #|
+  let out_sl = cleanup_native_rc_ssa(ssa_same_line_fn_boundary)
+  assert_true(out_sl.contains("} export function w $f_sl2(l %x) {\n@start\n    call $pion_rc_dec(l %x)\n    ret 0\n}\n"), out_sl)
+  let f3_sl = j2_extract_fn(out_sl, "export function w $f_sl3(")
+  assert_true(f3_sl.contains("%len =l loadl %p0"), f3_sl)
+  assert_true(f3_sl.contains("ret %w"), f3_sl)
+  assert_true(!f3_sl.contains("$pion_rc_inc"), f3_sl)
+  assert_true(!f3_sl.contains("$pion_rc_dec"), f3_sl)
 }

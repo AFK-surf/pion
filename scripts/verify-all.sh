@@ -144,6 +144,39 @@ if [ "$DYN_OUT" != "dyn_trait ok" ]; then
   echo "FAIL: dyn_trait output mismatch" >&2
   exit 1
 fi
+# Wave J2: hot-path RC elision soundness (dev & --release + Wasm32 parity on single-threaded subset).
+"$PIONC2" build -o "$OUT_DIR/wave_j2_dev" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
+J2_DEV_OUT=$("$OUT_DIR/wave_j2_dev")
+rm -f "$OUT_DIR/wave_j2_dev"
+"$PIONC2" build --release -o "$OUT_DIR/wave_j2_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
+J2_REL_OUT=$("$OUT_DIR/wave_j2_rel")
+rm -f "$OUT_DIR/wave_j2_rel"
+echo "wave_j2_rc_elision -> dev=$J2_DEV_OUT release=$J2_REL_OUT"
+case "$J2_DEV_OUT" in
+  wave_j2_ok:*) ;;
+  *) echo "FAIL: wave_j2_rc_elision bad dev output ($J2_DEV_OUT)" >&2; exit 1 ;;
+esac
+if [ "$J2_DEV_OUT" != "$J2_REL_OUT" ]; then
+  echo "FAIL: wave_j2_rc_elision dev/release mismatch (dev=$J2_DEV_OUT release=$J2_REL_OUT)" >&2
+  exit 1
+fi
+"$PIONC2" build --release -o "$OUT_DIR/wave_j2_st_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+J2_ST_NAT=$("$OUT_DIR/wave_j2_st_rel")
+rm -f "$OUT_DIR/wave_j2_st_rel"
+case "$J2_ST_NAT" in
+  wave_j2_st_ok:*) ;;
+  *) echo "FAIL: wave_j2_rc_elision_st bad native output ($J2_ST_NAT)" >&2; exit 1 ;;
+esac
+if command -v node >/dev/null 2>&1; then
+  "$PIONC2" build --release --target wasm32 -o "$OUT_DIR/wave_j2_st.wasm" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+  J2_ST_WASM=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$OUT_DIR/wave_j2_st.wasm")
+  rm -f "$OUT_DIR/wave_j2_st.wasm"
+  echo "wave_j2_rc_elision_st -> native=$J2_ST_NAT wasm32=$J2_ST_WASM"
+  if [ "$J2_ST_NAT" != "$J2_ST_WASM" ]; then
+    echo "FAIL: wave_j2_rc_elision_st native/wasm32 mismatch (native=$J2_ST_NAT wasm32=$J2_ST_WASM)" >&2
+    exit 1
+  fi
+fi
 # pionc add / update against an offline git-index registry.
 sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
 # P26-A: native link ([link]/[link.macos]/[link.linux], c_sources .c/.cc, objects .a, search_paths, rpaths, frameworks, pionc test).

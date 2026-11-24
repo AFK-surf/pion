@@ -17,13 +17,19 @@ fn irc_is_ws(c : Int) -> Bool {
 }
 
 ///|
-fn irc_is_label_char(c : Int) -> Bool {
+/// QBE identifier continuation characters (`vendor/qbe/parse.c:329`): `[A-Za-z0-9._$]`.
+fn irc_is_qbe_ident_char(c : Int) -> Bool {
   (c >= 97 && c <= 122) ||
   (c >= 65 && c <= 90) ||
   (c >= 48 && c <= 57) ||
   c == 95 ||
   c == 46 ||
-  c == 45
+  c == 36
+}
+
+///|
+fn irc_is_label_char(c : Int) -> Bool {
+  irc_is_qbe_ident_char(c)
 }
 
 ///|
@@ -213,10 +219,82 @@ fn irc_is_pure_reg_op(op : String) -> Bool {
 }
 
 ///|
-/// If `t` is a whitelisted pure-register SSA instruction or a verified read-only
-/// string comparison call (`$pion_str_eq` / `$pion_str_cmp`), returns `Some(lhs)`.
-/// Otherwise returns `None` (which terminates all open `rc_inc` windows).
-fn irc_whitelist_def_lhs(t : String) -> Option[String] {
+fn irc_is_load_op(op : String) -> Bool {
+  op == "loadl" ||
+  op == "loadw" ||
+  op == "loadsw" ||
+  op == "loaduw" ||
+  op == "loadsh" ||
+  op == "loaduh" ||
+  op == "loadsb" ||
+  op == "loadub" ||
+  op == "loads" ||
+  op == "loadd"
+}
+
+///|
+fn irc_is_alloc_op(op : String) -> Bool {
+  op == "alloc4" || op == "alloc8" || op == "alloc16"
+}
+
+///|
+fn irc_is_nonneg_int_lit(s : String) -> Bool {
+  let n = s.length()
+  if n == 0 {
+    return false
+  }
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c < 48 || c > 57 {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn irc_find_char(s : String, start : Int, target : Int) -> Int {
+  let n = s.length()
+  let mut i = start
+  while i < n {
+    if str_code_at(s, i) == target {
+      return i
+    }
+    i = i + 1
+  }
+  -1
+}
+
+///|
+/// Exact match on runtime non-returning abort primitives (`runtime/pion_rt.h`).
+/// Never prefix-match `$pion_panic` (which could match user `extern "C"` symbols
+/// like `$pion_panic_probe`).
+fn irc_is_panic_call(t : String) -> Bool {
+  irc_ends_with(t, ")") &&
+  (irc_starts_with(t, "call $pion_panic(") ||
+    irc_starts_with(t, "call $pion_panic_oob("))
+}
+
+///|
+fn irc_load_op_width(op : String) -> Int {
+  if op == "loadub" || op == "loadsb" {
+    1
+  } else if op == "loaduh" || op == "loadsh" {
+    2
+  } else if op == "loadw" || op == "loadsw" || op == "loaduw" || op == "loads" {
+    4
+  } else if op == "loadl" || op == "loadd" {
+    8
+  } else {
+    0
+  }
+}
+
+///|
+/// If `t` is `%lhs =<w|l|s|d> <rhs>`, returns `Some((lhs, ty_c, rhs))`.
+fn irc_parse_typed_def(t : String) -> Option[(String, Int, String)] {
   let n = t.length()
   if n < 7 || str_code_at(t, 0) != 37 {
     return None
@@ -245,28 +323,339 @@ fn irc_whitelist_def_lhs(t : String) -> Option[String] {
   let lhs = slice_str(t, 0, eq_pos)
   let ty_c = str_code_at(t, eq_pos + 2)
   let rhs = irc_trim(slice_str(t, eq_pos + 4, n))
-  let rn = rhs.length()
-  if rn == 0 {
+  if rhs.length() == 0 {
     return None
   }
-  let mut op_end = 0
-  while op_end < rn && !irc_is_ws(str_code_at(rhs, op_end)) {
-    op_end = op_end + 1
-  }
-  let op = slice_str(rhs, 0, op_end)
-  if op == "call" {
-    if ty_c == 119 &&
-      irc_ends_with(rhs, ")") &&
-      (irc_starts_with(rhs, "call $pion_str_eq(") ||
-        irc_starts_with(rhs, "call $pion_str_cmp(")) {
-      return Some(lhs)
+  Some((lhs, ty_c, rhs))
+}
+
+///|
+/// Strip QBE `# ...` comment (quote-aware for `"..."` globals/strings) and
+/// surrounding whitespace.
+fn irc_strip_comment(raw : String) -> String {
+  let n = raw.length()
+  let mut in_quote = false
+  let mut escaped = false
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(raw, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 35 {
+      return irc_trim(slice_str(raw, 0, i))
     }
-    return None
+    i = i + 1
   }
-  if irc_is_pure_reg_op(op) {
-    return Some(lhs)
+  irc_trim(raw)
+}
+
+///|
+/// Find `target` character outside double-quoted QBE strings/symbols.
+fn irc_find_char_unquoted(s : String, start : Int, target : Int) -> Int {
+  let n = s.length()
+  let mut in_quote = false
+  let mut escaped = false
+  let mut i = start
+  while i < n {
+    let c = str_code_at(s, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == target {
+      return i
+    }
+    i = i + 1
   }
-  None
+  -1
+}
+
+///|
+/// True if `t` starts with QBE keyword `kw` followed by any non-identifier
+/// token separator (whitespace, `@`, `%`, `$`, `"`, `-`, etc., matching
+/// `vendor/qbe/parse.c`).
+fn irc_has_kw_sep(t : String, kw : String) -> Bool {
+  irc_starts_with(t, kw) &&
+  t.length() > kw.length() &&
+  !irc_is_qbe_ident_char(str_code_at(t, kw.length()))
+}
+
+///|
+/// Locate the index right after the `phi` opcode in `line[0..code_end)` by
+/// scanning past the unquoted `=`, type specifier (`w`/`l`/`s`/`d` or `:T`),
+/// and whitespace. Never mistakes a destination temp named `%phi` for a `phi`
+/// instruction. Returns `-1` if `line` is not a `phi` instruction.
+fn irc_find_phi_opcode_end(line : String, code_end : Int) -> Int {
+  let mut eq = -1
+  let mut in_quote = false
+  let mut escaped = false
+  let mut i = 0
+  while i < code_end {
+    let c = str_code_at(line, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 61 {
+      eq = i
+      break
+    }
+    i = i + 1
+  }
+  if eq < 0 {
+    return -1
+  }
+  let mut p = eq + 1
+  while p < code_end && irc_is_ws(str_code_at(line, p)) {
+    p = p + 1
+  }
+  if p >= code_end {
+    return -1
+  }
+  let tc = str_code_at(line, p)
+  if tc == 58 {
+    p = p + 1
+    let ts = p
+    while p < code_end && irc_is_qbe_ident_char(str_code_at(line, p)) {
+      p = p + 1
+    }
+    if p == ts {
+      return -1
+    }
+  } else if irc_is_qbe_ident_char(tc) {
+    while p < code_end && irc_is_qbe_ident_char(str_code_at(line, p)) {
+      p = p + 1
+    }
+  } else {
+    return -1
+  }
+  while p < code_end && irc_is_ws(str_code_at(line, p)) {
+    p = p + 1
+  }
+  if p + 3 <= code_end &&
+    str_code_at(line, p) == 112 &&
+    str_code_at(line, p + 1) == 104 &&
+    str_code_at(line, p + 2) == 105 &&
+    (p + 3 == code_end || !irc_is_qbe_ident_char(str_code_at(line, p + 3))) {
+    p + 3
+  } else {
+    -1
+  }
+}
+
+///|
+/// True if a QBE instruction line is a `phi` instruction (`=... <ty> phi...`).
+fn irc_line_has_phi(raw : String) -> Bool {
+  let code_end = irc_strip_comment_end(raw, 0, raw.length())
+  irc_find_phi_opcode_end(raw, code_end) >= 0
+}
+
+///|
+struct IrcSafeInfo {
+  def_count : Map[String, Int]
+  valid_rc_objs : Map[String, Bool]
+  safe_addrs : Map[String, Bool]
+  dp_addr_of : Map[String, String]
+}
+
+///|
+/// Collect uniquely-defined SSA temporaries proven to be unconditionally safe
+/// load addresses:
+/// - local stack slots (`alloc4`/`alloc8`/`alloc16`),
+/// - proven RC heap object pointers (arguments to `$pion_rc_inc` and copies),
+/// - non-negative literal offsets (`add %rc_obj, K`, `K >= 0`).
+/// Also records `len_load_of`, `dp_addr_of` (only +8/+24 on `valid_rc_objs`),
+/// and `cugel` bounds-check comparisons so `irc_cancel_same_block_rc` can allow
+/// data-buffer element loads ONLY inside a trap-penetrated `@ok` block dominated
+/// by a verified `cugel %idx, (loadl %arr)` bounds check.
+/// Global symbols (e.g. `$pion_mt_flag`), negative offsets (`sub`, `-N`),
+/// unchecked `extsw`/`shl`, arbitrary struct `TPtr` fields, and `phi`s are
+/// NEVER included.
+fn irc_collect_safe_load_info(
+  fn_hdr : String,
+  fn_lines : Array[String],
+) -> IrcSafeInfo {
+  let def_count : Map[String, Int] = Map::new()
+  if irc_scan_fn_params(fn_hdr, def_count) < 0 {
+    return IrcSafeInfo::{
+      def_count: def_count,
+      valid_rc_objs: Map::new(),
+      safe_addrs: Map::new(),
+      dp_addr_of: Map::new(),
+    }
+  }
+  let mut i = 0
+  while i < fn_lines.length() {
+    let raw = fn_lines[i]
+    let ws = irc_first_non_ws(raw)
+    if ws < raw.length() && str_code_at(raw, ws) == 37 {
+      let t = irc_strip_comment(raw)
+      match irc_extract_def_lhs(t) {
+        Some(lhs) => irc_bump_def(def_count, lhs)
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+
+  let safe_addrs : Map[String, Bool] = Map::new()
+  let valid_rc_objs : Map[String, Bool] = Map::new()
+  let dp_addr_of : Map[String, String] = Map::new()
+
+  i = 0
+  while i < fn_lines.length() {
+    let raw = fn_lines[i]
+    let ws = irc_first_non_ws(raw)
+    if ws < raw.length() && str_code_at(raw, ws) == 99 {
+      let t = irc_strip_comment(raw)
+      if irc_match_rc_call(t) == 1 {
+        let arg = irc_extract_rc_arg(t)
+        if irc_is_valid_qbe_tmp(arg) {
+          let is_u = match def_count.get(arg) {
+            Some(c) => c == 1
+            None => false
+          }
+          if is_u {
+            valid_rc_objs.set(arg, true)
+            safe_addrs.set(arg, true)
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  i = 0
+  while i < fn_lines.length() {
+    let raw = fn_lines[i]
+    let ws = irc_first_non_ws(raw)
+    if ws < raw.length() && str_code_at(raw, ws) == 37 {
+      let t = irc_strip_comment(raw)
+      match irc_parse_typed_def(t) {
+        Some((lhs, ty_c, rhs)) => {
+          let is_u = match def_count.get(lhs) {
+            Some(c) => c == 1
+            None => false
+          }
+          if is_u && ty_c == 108 {
+            let rn = rhs.length()
+            let mut op_end = 0
+            while op_end < rn && !irc_is_ws(str_code_at(rhs, op_end)) {
+              op_end = op_end + 1
+            }
+            let op = slice_str(rhs, 0, op_end)
+            let rest = irc_trim(slice_str(rhs, op_end, rn))
+            if irc_is_alloc_op(op) {
+              safe_addrs.set(lhs, true)
+            } else if op == "copy" {
+              if valid_rc_objs.contains(rest) {
+                valid_rc_objs.set(lhs, true)
+                safe_addrs.set(lhs, true)
+              }
+            } else if op == "add" {
+              let comma = irc_find_char(rest, 0, 44)
+              if comma > 0 {
+                let a = irc_trim(slice_str(rest, 0, comma))
+                let b = irc_trim(slice_str(rest, comma + 1, rest.length()))
+                if valid_rc_objs.contains(a) && irc_is_nonneg_int_lit(b) {
+                  safe_addrs.set(lhs, true)
+                  // Only true heap data-pointer offsets: PionBytes.data (+16, kind 1)
+                  // and PionArray.data (+24, kind 2). Never +8 (`cap`).
+                  if b == "16" {
+                    dp_addr_of.set(lhs, a + "|1")
+                  } else if b == "24" {
+                    dp_addr_of.set(lhs, a + "|2")
+                  }
+                }
+              }
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+  IrcSafeInfo::{
+    def_count: def_count,
+    valid_rc_objs: valid_rc_objs,
+    safe_addrs: safe_addrs,
+    dp_addr_of: dp_addr_of,
+  }
+}
+
+///|
+/// If `t` is a whitelisted pure-register SSA instruction, a verified read-only
+/// string comparison call (`$pion_str_eq` / `$pion_str_cmp`), or (when
+/// `allow_safe_load` is true) a load from a proven-safe non-RC-header address
+/// (unconditionally safe or dominated by a verified bounds check in this block),
+/// returns `Some(lhs)`. Otherwise returns `None` (which terminates all open
+/// `rc_inc` windows).
+fn irc_whitelist_def_lhs_ex(
+  t : String,
+  safe_load_addrs : Map[String, Bool],
+  blk_safe_loads : Map[String, Int],
+  allow_safe_load : Bool,
+) -> Option[String] {
+  match irc_parse_typed_def(t) {
+    None => None
+    Some((lhs, ty_c, rhs)) => {
+      let rn = rhs.length()
+      let mut op_end = 0
+      while op_end < rn && !irc_is_ws(str_code_at(rhs, op_end)) {
+        op_end = op_end + 1
+      }
+      let op = slice_str(rhs, 0, op_end)
+      if op == "call" {
+        if ty_c == 119 &&
+          irc_ends_with(rhs, ")") &&
+          (irc_starts_with(rhs, "call $pion_str_eq(") ||
+            irc_starts_with(rhs, "call $pion_str_cmp(")) {
+          return Some(lhs)
+        }
+        return None
+      }
+      if irc_is_pure_reg_op(op) {
+        return Some(lhs)
+      }
+      if allow_safe_load && irc_is_load_op(op) {
+        let addr = irc_trim(slice_str(rhs, op_end, rn))
+        if irc_is_valid_qbe_tmp(addr) {
+          if safe_load_addrs.contains(addr) {
+            return Some(lhs)
+          }
+          match blk_safe_loads.get(addr) {
+            Some(req_w) =>
+              if irc_load_op_width(op) == req_w {
+                return Some(lhs)
+              }
+            None => ()
+          }
+        }
+      }
+      None
+    }
+  }
 }
 
 ///|
@@ -315,28 +704,113 @@ fn irc_slice_starts_with(s : String, start : Int, end : Int, pre : String) -> Bo
 }
 
 ///|
+/// Advance QBE double-quote/escape state and top-level brace depth across
+/// `s[start..end)` (stopping at an unquoted `#` comment).
+/// Returns `(in_quote, escaped, brace_depth, brace_count)` where `brace_count`
+/// is the number of unquoted, uncommented `{` or `}` characters seen.
+fn irc_scan_line_lex(
+  s : String,
+  start : Int,
+  end : Int,
+  in_quote_in : Bool,
+  escaped_in : Bool,
+  depth_in : Int,
+) -> (Bool, Bool, Int, Int) {
+  let mut in_quote = in_quote_in
+  let mut escaped = escaped_in
+  let mut depth = depth_in
+  let mut braces = 0
+  let mut i = start
+  while i < end {
+    let c = str_code_at(s, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 35 {
+      break
+    } else if c == 123 {
+      depth = depth + 1
+      braces = braces + 1
+    } else if c == 125 {
+      if depth > 0 {
+        depth = depth - 1
+      }
+      braces = braces + 1
+    }
+    i = i + 1
+  }
+  (in_quote, escaped, depth, braces)
+}
+
+///|
+/// Return the index of the first unquoted `#` in `s[start..end)`, or `end`.
+fn irc_strip_comment_end(s : String, start : Int, end : Int) -> Int {
+  let mut in_quote = false
+  let mut escaped = false
+  let mut i = start
+  while i < end {
+    let c = str_code_at(s, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 35 {
+      return i
+    }
+    i = i + 1
+  }
+  end
+}
+
+///|
 fn irc_is_fn_hdr_range(s : String, line_start : Int, line_end : Int) -> Bool {
+  let cend = irc_strip_comment_end(s, line_start, line_end)
   let mut ts = line_start
-  while ts < line_end && irc_is_ws(str_code_at(s, ts)) {
+  while ts < cend && irc_is_ws(str_code_at(s, ts)) {
     ts = ts + 1
   }
-  let mut te = line_end
+  let mut te = cend
   while te > ts && irc_is_ws(str_code_at(s, te - 1)) {
     te = te - 1
   }
-  te > ts &&
-  str_code_at(s, te - 1) == 123 &&
-  (irc_slice_starts_with(s, ts, te, "export function ") ||
-    irc_slice_starts_with(s, ts, te, "function "))
+  if te <= ts || str_code_at(s, te - 1) != 123 {
+    return false
+  }
+  if irc_slice_starts_with(s, ts, te, "export") &&
+    te > ts + 6 &&
+    irc_is_ws(str_code_at(s, ts + 6)) {
+    let mut k = ts + 6
+    while k < te && irc_is_ws(str_code_at(s, k)) {
+      k = k + 1
+    }
+    ts = k
+  }
+  irc_slice_starts_with(s, ts, te, "function") &&
+  te > ts + 8 &&
+  !irc_is_qbe_ident_char(str_code_at(s, ts + 8))
 }
 
 ///|
 fn irc_is_close_brace_range(s : String, line_start : Int, line_end : Int) -> Bool {
+  let cend = irc_strip_comment_end(s, line_start, line_end)
   let mut ts = line_start
-  while ts < line_end && irc_is_ws(str_code_at(s, ts)) {
+  while ts < cend && irc_is_ws(str_code_at(s, ts)) {
     ts = ts + 1
   }
-  let mut te = line_end
+  let mut te = cend
   while te > ts && irc_is_ws(str_code_at(s, te - 1)) {
     te = te - 1
   }
@@ -405,78 +879,806 @@ fn irc_split_lines_range(s : String, start : Int, end : Int) -> Array[String] {
 }
 
 ///|
-/// Step 1: O(N) same-block strict-whitelist `pion_rc_inc(%x) ... pion_rc_dec(%x)` cancellation
-/// using per-temp index stacks (`Map[String, Array[Int]]`).
-fn irc_cancel_same_block_rc(fn_lines : Array[String]) -> Array[String] {
-  let n = fn_lines.length()
-  let deleted_idxs : Array[Int] = []
-  let mut open_stacks : Map[String, Array[Int]] = Map::new()
+fn irc_parse_jmp_target(t : String) -> String {
+  if irc_has_kw_sep(t, "jmp") {
+    let rest = irc_trim(slice_str(t, 3, t.length()))
+    if rest.length() > 1 && str_code_at(rest, 0) == 64 {
+      let lbl = irc_extract_label_tok(rest)
+      if lbl == rest {
+        return lbl
+      }
+    }
+  }
+  ""
+}
 
+///|
+fn irc_parse_jnz_full(t : String) -> (String, String, String) {
+  if !irc_has_kw_sep(t, "jnz") {
+    return ("", "", "")
+  }
+  let c1 = irc_find_char_unquoted(t, 3, 44)
+  if c1 < 0 {
+    return ("", "", "")
+  }
+  let c2 = irc_find_char_unquoted(t, c1 + 1, 44)
+  if c2 < 0 {
+    return ("", "", "")
+  }
+  let cond = irc_trim(slice_str(t, 3, c1))
+  let a1 = irc_trim(slice_str(t, c1 + 1, c2))
+  let a2 = irc_trim(slice_str(t, c2 + 1, t.length()))
+  if a1.length() > 1 &&
+    str_code_at(a1, 0) == 64 &&
+    a2.length() > 1 &&
+    str_code_at(a2, 0) == 64 {
+    let l1 = irc_extract_label_tok(a1)
+    let l2 = irc_extract_label_tok(a2)
+    if l1 == a1 && l2 == a2 {
+      return (cond, l1, l2)
+    }
+  }
+  ("", "", "")
+}
+
+///|
+/// Parse all target labels (`@default`, `@t0`, ...) from `jtbl %idx, @default, @t0, ...`
+/// (or no-space `jtbl%idx,@default,@t0`). Quote-aware so commas inside `$"a,b"`
+/// never split operands; returns empty array if any target operand is malformed.
+fn irc_parse_jtbl_targets(t : String) -> Array[String] {
+  let out : Array[String] = []
+  if !irc_has_kw_sep(t, "jtbl") {
+    return out
+  }
+  let n = t.length()
+  let mut pos = irc_find_char_unquoted(t, 4, 44)
+  if pos < 0 {
+    return out
+  }
+  pos = pos + 1
+  while pos < n {
+    let next_c = irc_find_char_unquoted(t, pos, 44)
+    let end = if next_c >= 0 { next_c } else { n }
+    let tok = irc_trim(slice_str(t, pos, end))
+    if tok.length() > 1 && str_code_at(tok, 0) == 64 {
+      let lbl = irc_extract_label_tok(tok)
+      if lbl == tok {
+        out.push(lbl)
+      } else {
+        return []
+      }
+    } else {
+      return []
+    }
+    if next_c < 0 {
+      break
+    }
+    pos = next_c + 1
+  }
+  out
+}
+
+///|
+/// Conservatively scan any unquoted `@label` tokens on an unknown terminator line.
+fn irc_collect_at_labels(t : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = t.length()
+  let mut in_quote = false
+  let mut escaped = false
   let mut i = 0
   while i < n {
-    let raw = fn_lines[i]
-    let ws = irc_first_non_ws(raw)
-    if ws == raw.length() {
-      i = i + 1
-      continue
-    }
-    let has_open = open_stacks.length() > 0
-    let c0 = str_code_at(raw, ws)
-    if !has_open && c0 != 99 {
-      i = i + 1
-      continue
-    }
-    let t = irc_trim(raw)
-    let kind = if c0 == 99 { irc_match_rc_call(t) } else { 0 }
-    if kind == 1 {
-      let arg = irc_extract_rc_arg(t)
-      if irc_is_valid_qbe_tmp(arg) {
-        match open_stacks.get(arg) {
-          Some(stk) => stk.push(i)
-          None => {
-            let stk : Array[Int] = [i]
-            open_stacks.set(arg, stk)
-          }
-        }
-      } else {
-        open_stacks = Map::new()
+    let c = str_code_at(t, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
       }
-    } else if kind == 2 {
-      let arg = irc_extract_rc_arg(t)
-      let mut matched = false
-      match open_stacks.get(arg) {
-        Some(stk) =>
-          if stk.length() > 0 {
-            match stk.pop() {
-              Some(inc_idx) => {
-                deleted_idxs.push(inc_idx)
-                deleted_idxs.push(i)
-                matched = true
-              }
-              None => ()
-            }
-          }
-        None => ()
-      }
-      if !matched {
-        // Unmatched rc_dec may trigger a destructor; terminate all open windows.
-        open_stacks = Map::new()
-      }
-    } else if has_open {
-      match irc_whitelist_def_lhs(t) {
-        Some(lhs) =>
-          match open_stacks.get(lhs) {
-            Some(stk) => {
-              while stk.length() > 0 {
-                let _ = stk.pop()
-              }
-            }
-            None => ()
-          }
-        None => open_stacks = Map::new()
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 64 {
+      let lbl = irc_extract_label_tok(slice_str(t, i, n))
+      if lbl.length() > 1 {
+        out.push(lbl)
+        i = i + lbl.length()
+        continue
       }
     }
     i = i + 1
+  }
+  out
+}
+
+///|
+/// Classify a proven compiler-emitted bounds-check trap block into a packed
+/// `(kind << 4) | width` value:
+/// - `PionBytes` (`@bytes_oob*` or `@bri8_oob*`): `(1 << 4) | 1 = 17`
+/// - `PionArray` with exact proven element width:
+///   - `@arr_oob_w1*`: `(2 << 4) | 1 = 33`
+///   - `@arr_oob_w2*`: `(2 << 4) | 2 = 34`
+///   - `@arr_oob_w4*`: `(2 << 4) | 4 = 36`
+///   - `@arr_oob_w8*`: `(2 << 4) | 8 = 40`
+/// - Any other label (including unqualified `@arr_oob_<id>` / `@swp_oob*` or plain
+///   struct traps) or missing exact `call $pion_panic_oob(l <idx_reg>, l <len_reg>)`: `0`.
+fn irc_trap_oob_kind(
+  fn_lines : Array[String],
+  b_start : Int,
+  b_end : Int,
+  idx_reg : String,
+  len_reg : String,
+) -> Int {
+  let mut packed = 0
+  let mut saw_lbl = false
+  let want_call = "call $pion_panic_oob(l " + idx_reg + ", l " + len_reg + ")"
+  let mut saw_call = false
+  let mut i = b_start
+  while i < b_end {
+    let t = irc_strip_comment(fn_lines[i])
+    if t.length() > 0 {
+      if !saw_lbl && str_code_at(t, 0) == 64 {
+        saw_lbl = true
+        let lbl = irc_extract_label_tok(t)
+        if irc_starts_with(lbl, "@bytes_oob") || irc_starts_with(lbl, "@bri8_oob") {
+          packed = 17
+        } else if irc_starts_with(lbl, "@arr_oob_w1") {
+          packed = 33
+        } else if irc_starts_with(lbl, "@arr_oob_w2") {
+          packed = 34
+        } else if irc_starts_with(lbl, "@arr_oob_w4") {
+          packed = 36
+        } else if irc_starts_with(lbl, "@arr_oob_w8") {
+          packed = 40
+        } else {
+          return 0
+        }
+      } else if t == want_call {
+        saw_call = true
+      }
+    }
+    i = i + 1
+  }
+  if saw_call { packed } else { 0 }
+}
+
+///|
+fn irc_is_trap_block(
+  fn_lines : Array[String],
+  b_start : Int,
+  b_end : Int,
+  safe_load_addrs : Map[String, Bool],
+  allow_safe_load : Bool,
+) -> Bool {
+  let empty_blk : Map[String, Int] = Map::new()
+  let mut last_idx = -1
+  let mut i = b_end - 1
+  while i >= b_start {
+    let t = irc_strip_comment(fn_lines[i])
+    if t.length() > 0 && str_code_at(t, 0) != 64 {
+      last_idx = i
+      break
+    }
+    i = i - 1
+  }
+  if last_idx < 0 || irc_strip_comment(fn_lines[last_idx]) != "hlt" {
+    return false
+  }
+  i = b_start
+  while i < last_idx {
+    let t = irc_strip_comment(fn_lines[i])
+    if t.length() == 0 || str_code_at(t, 0) == 64 {
+      i = i + 1
+      continue
+    }
+    if irc_is_panic_call(t) {
+      i = i + 1
+      continue
+    }
+    match irc_whitelist_def_lhs_ex(t, safe_load_addrs, empty_blk, allow_safe_load) {
+      Some(_) => {
+        i = i + 1
+        continue
+      }
+      None => return false
+    }
+  }
+  true
+}
+
+///|
+/// Step 1: O(N) RC pair cancellation with:
+/// - strict pure-register + verified read-only call + safe non-RC-header load whitelist,
+/// - CFG single-predecessor trap-branch penetration across abort-only `$pion_panic*` + `hlt`
+///   blocks (e.g. bounds checks), with bounds-checked container data-pointer element loads
+///   enabled strictly inside the dominated `@ok` block.
+fn irc_cancel_same_block_rc(
+  fn_hdr : String,
+  fn_lines : Array[String],
+  disable_mask : Int,
+) -> Array[String] {
+  let n = fn_lines.length()
+  let allow_safe_load = (disable_mask & 4) == 0
+  let allow_trap_pen = (disable_mask & 8) == 0
+  let safe_info = if allow_safe_load {
+    irc_collect_safe_load_info(fn_hdr, fn_lines)
+  } else {
+    IrcSafeInfo::{
+      def_count: Map::new(),
+      valid_rc_objs: Map::new(),
+      safe_addrs: Map::new(),
+      dp_addr_of: Map::new(),
+    }
+  }
+  let safe_load_addrs = safe_info.safe_addrs
+
+  // Build basic block table & CFG predecessor counts in O(N).
+  let blk_starts : Array[Int] = []
+  let blk_ends : Array[Int] = []
+  let label_to_blk : Map[String, Int] = Map::new()
+  let has_phi : Array[Bool] = []
+  let mut disable_xblock = false
+  let mut cur_start = -1
+  let mut cur_has_phi = false
+  let mut li = 0
+  while li < n {
+    let raw = fn_lines[li]
+    let ws = irc_first_non_ws(raw)
+    if ws < raw.length() && str_code_at(raw, ws) == 64 {
+      if cur_start >= 0 {
+        blk_starts.push(cur_start)
+        blk_ends.push(li)
+        has_phi.push(cur_has_phi)
+      }
+      let line_t = irc_strip_comment(raw)
+      let lbl = irc_extract_label_tok(line_t)
+      if lbl.length() < 2 || lbl != line_t || label_to_blk.contains(lbl) {
+        disable_xblock = true
+      }
+      label_to_blk.set(lbl, blk_starts.length())
+      cur_start = li
+      cur_has_phi = false
+    } else {
+      if cur_start < 0 {
+        cur_start = li
+        cur_has_phi = false
+      }
+      if ws < raw.length() && irc_line_has_phi(raw) {
+        cur_has_phi = true
+      }
+    }
+    li = li + 1
+  }
+  if cur_start >= 0 {
+    blk_starts.push(cur_start)
+    blk_ends.push(n)
+    has_phi.push(cur_has_phi)
+  }
+  let nblk = blk_starts.length()
+  let pred_count : Array[Int] = []
+  let term_idx : Array[Int] = []
+  let term_kind : Array[Int] = []
+  let term_cond : Array[String] = []
+  let term_b1 : Array[Int] = []
+  let term_b2 : Array[Int] = []
+  let mut bi = 0
+  while bi < nblk {
+    pred_count.push(0)
+    term_idx.push(-1)
+    term_kind.push(0)
+    term_cond.push("")
+    term_b1.push(-1)
+    term_b2.push(-1)
+    bi = bi + 1
+  }
+  bi = 0
+  while bi < nblk {
+    let bs = blk_starts[bi]
+    let be = blk_ends[bi]
+    let mut last_i = -1
+    let mut k = be - 1
+    while k >= bs {
+      let t = irc_strip_comment(fn_lines[k])
+      if t.length() > 0 && str_code_at(t, 0) != 64 {
+        last_i = k
+        break
+      }
+      k = k - 1
+    }
+    term_idx[bi] = last_i
+    if last_i >= 0 {
+      let lt = irc_strip_comment(fn_lines[last_i])
+      if lt == "hlt" || lt == "ret" || irc_has_kw_sep(lt, "ret") {
+        term_kind[bi] = 0
+      } else {
+        let jtgt = irc_parse_jmp_target(lt)
+        if jtgt.length() > 0 {
+          term_kind[bi] = 1
+          match label_to_blk.get(jtgt) {
+            Some(tb) => {
+              term_b1[bi] = tb
+              pred_count[tb] = pred_count[tb] + 1
+            }
+            None => disable_xblock = true
+          }
+        } else {
+          let (jcond, t1, t2) = irc_parse_jnz_full(lt)
+          if t1.length() > 0 && t2.length() > 0 {
+            term_kind[bi] = 2
+            term_cond[bi] = jcond
+            match label_to_blk.get(t1) {
+              Some(tb1) => {
+                term_b1[bi] = tb1
+                pred_count[tb1] = pred_count[tb1] + 1
+              }
+              None => disable_xblock = true
+            }
+            match label_to_blk.get(t2) {
+              Some(tb2) => {
+                term_b2[bi] = tb2
+                pred_count[tb2] = pred_count[tb2] + 1
+              }
+              None => disable_xblock = true
+            }
+          } else if irc_has_kw_sep(lt, "jtbl") {
+            term_kind[bi] = 3
+            let jtgts = irc_parse_jtbl_targets(lt)
+            if jtgts.length() == 0 {
+              disable_xblock = true
+            }
+            let mut ji = 0
+            while ji < jtgts.length() {
+              match label_to_blk.get(jtgts[ji]) {
+                Some(tb) => pred_count[tb] = pred_count[tb] + 1
+                None => disable_xblock = true
+              }
+              ji = ji + 1
+            }
+          } else {
+            // Fallthrough or unknown terminator: conservatively record any `@label`
+            // targets plus fallthrough to `bi + 1`, and disable cross-block elision
+            // whenever unparsed labels or jump keywords appear.
+            term_kind[bi] = 4
+            let unk_lbls = irc_collect_at_labels(lt)
+            if unk_lbls.length() > 0 ||
+              irc_has_kw_sep(lt, "jmp") ||
+              irc_has_kw_sep(lt, "jnz") ||
+              irc_has_kw_sep(lt, "jtbl") {
+              disable_xblock = true
+            }
+            let mut ui = 0
+            while ui < unk_lbls.length() {
+              match label_to_blk.get(unk_lbls[ui]) {
+                Some(tb) => pred_count[tb] = pred_count[tb] + 1
+                None => ()
+              }
+              ui = ui + 1
+            }
+            if bi + 1 < nblk {
+              pred_count[bi + 1] = pred_count[bi + 1] + 1
+            }
+          }
+        }
+      }
+    } else if bi + 1 < nblk {
+      pred_count[bi + 1] = pred_count[bi + 1] + 1
+    }
+    bi = bi + 1
+  }
+
+  let deleted_idxs : Array[Int] = []
+  let entry_open : Map[Int, Map[String, Array[Int]]] = Map::new()
+  let entry_checked_pairs : Map[Int, Array[String]] = Map::new()
+
+  bi = 0
+  while bi < nblk {
+    let mut open_stacks : Map[String, Array[Int]] = match entry_open.get(bi) {
+      Some(m) => m
+      None => Map::new()
+    }
+    let mut live_checked_pairs : Array[String] = []
+    let mut checked_pairs : Map[String, Int] = Map::new()
+    let mut checked_arr_kind : Map[String, Int] = Map::new()
+    let mut checked_idxs : Map[String, Bool] = Map::new()
+    let mut blk_dp_arr : Map[String, String] = Map::new()
+    let mut blk_dp_kind : Map[String, Int] = Map::new()
+    let mut blk_off_idx : Map[String, String] = Map::new()
+    let mut blk_off_stride : Map[String, Int] = Map::new()
+    let mut blk_safe_loads : Map[String, Int] = Map::new()
+    let mut blk_len_of : Map[String, String] = Map::new()
+    let mut blk_cugel_idx : Map[String, String] = Map::new()
+    let mut blk_cugel_len : Map[String, String] = Map::new()
+    match entry_checked_pairs.get(bi) {
+      Some(pairs) => {
+        let mut pi = 0
+        while pi < pairs.length() {
+          let entry = pairs[pi]
+          let sep1 = irc_find_char(entry, 0, 124)
+          if sep1 > 0 && sep1 + 1 < entry.length() {
+            let sep2 = irc_find_char(entry, sep1 + 1, 124)
+            if sep2 > sep1 + 1 && sep2 + 1 < entry.length() {
+              let ar = slice_str(entry, 0, sep1)
+              let ir = slice_str(entry, sep1 + 1, sep2)
+              let ks = slice_str(entry, sep2 + 1, entry.length())
+              let packed = if ks == "17" {
+                17
+              } else if ks == "33" {
+                33
+              } else if ks == "34" {
+                34
+              } else if ks == "36" {
+                36
+              } else if ks == "40" {
+                40
+              } else {
+                0
+              }
+              if packed > 0 {
+                let kind = packed >> 4
+                live_checked_pairs.push(entry)
+                checked_pairs.set(ar + "|" + ir, packed)
+                checked_arr_kind.set(ar, kind)
+                checked_idxs.set(ir, true)
+                blk_off_idx.set(ir, ir)
+                blk_off_stride.set(ir, 1)
+              }
+            }
+          }
+          pi = pi + 1
+        }
+      }
+      None => ()
+    }
+    let mut has_checked = live_checked_pairs.length() > 0
+
+    let bs = blk_starts[bi]
+    let be = blk_ends[bi]
+    let ti = term_idx[bi]
+    let mut i = bs
+    while i < be {
+      let raw = fn_lines[i]
+      let ws = irc_first_non_ws(raw)
+      if ws == raw.length() || str_code_at(raw, ws) == 64 || str_code_at(raw, ws) == 35 {
+        i = i + 1
+        continue
+      }
+      if i == ti && term_kind[bi] == 2 {
+        // jnz terminator: check single-pred forward trap-branch penetration.
+        if allow_trap_pen && !disable_xblock && open_stacks.length() > 0 {
+          let b1 = term_b1[bi]
+          let b2 = term_b2[bi]
+          if b1 >= 0 && b2 >= 0 {
+            let mut next_blk = -1
+            let mut trap_blk = -1
+            let mut trap_is_true_branch = false
+            if b2 > bi &&
+              pred_count[b2] == 1 &&
+              !has_phi[b2] &&
+              irc_is_trap_block(fn_lines, blk_starts[b1], blk_ends[b1], safe_load_addrs, allow_safe_load) {
+              next_blk = b2
+              trap_blk = b1
+              trap_is_true_branch = true
+            } else if b1 > bi &&
+              pred_count[b1] == 1 &&
+              !has_phi[b1] &&
+              irc_is_trap_block(fn_lines, blk_starts[b2], blk_ends[b2], safe_load_addrs, allow_safe_load) {
+              next_blk = b1
+              trap_blk = b2
+              trap_is_true_branch = false
+            }
+            if next_blk >= 0 {
+              entry_open.set(next_blk, open_stacks)
+              // Propagate ONLY surviving `live_checked_pairs` plus a live
+              // intra-block bounds check proven in THIS block with no intervening
+              // side effect (`blk_cugel_*` + `blk_len_of`) and exact container
+              // width tag (`@bytes_oob*` / `@arr_oob_w{1,2,4,8}_<id>`).
+              let next_pairs : Array[String] = []
+              let mut pi = 0
+              while pi < live_checked_pairs.length() {
+                next_pairs.push(live_checked_pairs[pi])
+                pi = pi + 1
+              }
+              if allow_safe_load && trap_is_true_branch && trap_blk >= 0 {
+                let cond = term_cond[bi]
+                match (blk_cugel_idx.get(cond), blk_cugel_len.get(cond)) {
+                  (Some(idx_reg), Some(len_reg)) =>
+                    match blk_len_of.get(len_reg) {
+                      Some(arr_reg) => {
+                        let packed = irc_trap_oob_kind(
+                          fn_lines,
+                          blk_starts[trap_blk],
+                          blk_ends[trap_blk],
+                          idx_reg,
+                          len_reg,
+                        )
+                        if packed > 0 {
+                          next_pairs.push(arr_reg + "|" + idx_reg + "|" + packed.to_string())
+                        }
+                      }
+                      None => ()
+                    }
+                  _ => ()
+                }
+              }
+              if next_pairs.length() > 0 {
+                entry_checked_pairs.set(next_blk, next_pairs)
+              }
+            }
+          }
+        }
+        open_stacks = Map::new()
+        i = i + 1
+        continue
+      }
+      let has_open = open_stacks.length() > 0
+      let has_live_bounds = blk_len_of.length() > 0 || blk_cugel_idx.length() > 0
+      let c0 = str_code_at(raw, ws)
+      if !has_open && !has_checked && !has_live_bounds && c0 != 99 && !(allow_safe_load && c0 == 37) {
+        i = i + 1
+        continue
+      }
+      let t = irc_strip_comment(raw)
+      if t.length() == 0 {
+        i = i + 1
+        continue
+      }
+      // Track live intra-block `loadl %rc_obj` (container len) and `cugel %idx, %len`,
+      // plus safe data-buffer element addresses inside a bounds-checked `@ok` block.
+      if allow_safe_load && c0 == 37 {
+        match irc_parse_typed_def(t) {
+          Some((lhs, ty_c, rhs)) => {
+            let is_u = match safe_info.def_count.get(lhs) {
+              Some(c) => c == 1
+              None => false
+            }
+            if !is_u {
+              // Redefinition invalidates any stale intra-block fact on `lhs`.
+              blk_len_of.remove(lhs)
+              blk_cugel_idx.remove(lhs)
+              blk_cugel_len.remove(lhs)
+            } else {
+              let rn = rhs.length()
+              let mut op_end = 0
+              while op_end < rn && !irc_is_ws(str_code_at(rhs, op_end)) {
+                op_end = op_end + 1
+              }
+              let op = slice_str(rhs, 0, op_end)
+              let rest = irc_trim(slice_str(rhs, op_end, rn))
+              if ty_c == 108 {
+                if op == "loadl" {
+                  if safe_info.valid_rc_objs.contains(rest) {
+                    blk_len_of.set(lhs, rest)
+                  }
+                  if has_checked {
+                    match safe_info.dp_addr_of.get(rest) {
+                      Some(dp_val) => {
+                        let sep = irc_find_char(dp_val, 0, 124)
+                        if sep > 0 && sep + 1 < dp_val.length() {
+                          let arr_reg = slice_str(dp_val, 0, sep)
+                          let ks = slice_str(dp_val, sep + 1, dp_val.length())
+                          let dp_kind = if ks == "2" { 2 } else if ks == "1" { 1 } else { 0 }
+                          if dp_kind > 0 {
+                            match checked_arr_kind.get(arr_reg) {
+                              Some(ck) =>
+                                if ck == dp_kind {
+                                  blk_dp_arr.set(lhs, arr_reg)
+                                  blk_dp_kind.set(lhs, dp_kind)
+                                }
+                              None => ()
+                            }
+                          }
+                        }
+                      }
+                      None => ()
+                    }
+                  }
+                } else if has_checked && op == "shl" {
+                  let comma = irc_find_char(rest, 0, 44)
+                  if comma > 0 {
+                    let a = irc_trim(slice_str(rest, 0, comma))
+                    let b = irc_trim(slice_str(rest, comma + 1, rest.length()))
+                    if checked_idxs.contains(a) {
+                      let stride = if b == "1" {
+                        2
+                      } else if b == "2" {
+                        4
+                      } else if b == "3" {
+                        8
+                      } else {
+                        0
+                      }
+                      if stride > 0 {
+                        blk_off_idx.set(lhs, a)
+                        blk_off_stride.set(lhs, stride)
+                      }
+                    }
+                  }
+                } else if has_checked && op == "add" {
+                  let comma = irc_find_char(rest, 0, 44)
+                  if comma > 0 {
+                    let a = irc_trim(slice_str(rest, 0, comma))
+                    let b = irc_trim(slice_str(rest, comma + 1, rest.length()))
+                    match (blk_dp_arr.get(a), blk_dp_kind.get(a)) {
+                      (Some(arr_reg), Some(dp_kind)) =>
+                        if b == "0" {
+                          blk_safe_loads.set(lhs, 1)
+                        } else {
+                          match (blk_off_idx.get(b), blk_off_stride.get(b)) {
+                            (Some(idx_reg), Some(stride)) =>
+                              match checked_pairs.get(arr_reg + "|" + idx_reg) {
+                                Some(packed) => {
+                                  let pk = packed >> 4
+                                  let pw = packed & 15
+                                  if pk == dp_kind && stride == pw {
+                                    blk_safe_loads.set(lhs, pw)
+                                  }
+                                }
+                                None => ()
+                              }
+                            _ => ()
+                          }
+                        }
+                      _ =>
+                        match (blk_dp_arr.get(b), blk_dp_kind.get(b)) {
+                          (Some(arr_reg), Some(dp_kind)) =>
+                            if a == "0" {
+                              blk_safe_loads.set(lhs, 1)
+                            } else {
+                              match (blk_off_idx.get(a), blk_off_stride.get(a)) {
+                                (Some(idx_reg), Some(stride)) =>
+                                  match checked_pairs.get(arr_reg + "|" + idx_reg) {
+                                    Some(packed) => {
+                                      let pk = packed >> 4
+                                      let pw = packed & 15
+                                      if pk == dp_kind && stride == pw {
+                                        blk_safe_loads.set(lhs, pw)
+                                      }
+                                    }
+                                    None => ()
+                                  }
+                                _ => ()
+                              }
+                            }
+                          _ => ()
+                        }
+                    }
+                  }
+                }
+              } else if ty_c == 119 && op == "cugel" {
+                let comma = irc_find_char(rest, 0, 44)
+                if comma > 0 {
+                  let a = irc_trim(slice_str(rest, 0, comma))
+                  let b = irc_trim(slice_str(rest, comma + 1, rest.length()))
+                  if irc_is_valid_qbe_tmp(a) && blk_len_of.contains(b) {
+                    let a_u = match safe_info.def_count.get(a) {
+                      Some(c) => c == 1
+                      None => false
+                    }
+                    if a_u {
+                      blk_cugel_idx.set(lhs, a)
+                      blk_cugel_len.set(lhs, b)
+                    }
+                  }
+                }
+              }
+            }
+          }
+          None =>
+            match irc_extract_def_lhs(t) {
+              Some(lhs) => {
+                blk_len_of.remove(lhs)
+                blk_cugel_idx.remove(lhs)
+                blk_cugel_len.remove(lhs)
+              }
+              None => ()
+            }
+        }
+      }
+      let kind = if c0 == 99 { irc_match_rc_call(t) } else { 0 }
+      if kind == 1 {
+        let arg = irc_extract_rc_arg(t)
+        if irc_is_valid_qbe_tmp(arg) {
+          match open_stacks.get(arg) {
+            Some(stk) => stk.push(i)
+            None => {
+              let stk : Array[Int] = [i]
+              open_stacks.set(arg, stk)
+            }
+          }
+        } else {
+          open_stacks = Map::new()
+          blk_len_of = Map::new()
+          blk_cugel_idx = Map::new()
+          blk_cugel_len = Map::new()
+          if has_checked {
+            live_checked_pairs = []
+            checked_pairs = Map::new()
+            checked_arr_kind = Map::new()
+            checked_idxs = Map::new()
+            blk_dp_arr = Map::new()
+            blk_dp_kind = Map::new()
+            blk_off_idx = Map::new()
+            blk_off_stride = Map::new()
+            blk_safe_loads = Map::new()
+            has_checked = false
+          }
+        }
+      } else if kind == 2 {
+        let arg = irc_extract_rc_arg(t)
+        let mut matched = false
+        match open_stacks.get(arg) {
+          Some(stk) =>
+            if stk.length() > 0 {
+              match stk.pop() {
+                Some(inc_idx) => {
+                  deleted_idxs.push(inc_idx)
+                  deleted_idxs.push(i)
+                  matched = true
+                }
+                None => ()
+              }
+            }
+          None => ()
+        }
+        if !matched {
+          // Unmatched rc_dec may trigger a destructor; terminate all open windows
+          // and invalidate all bounds-checked / live intra-block container facts.
+          open_stacks = Map::new()
+          blk_len_of = Map::new()
+          blk_cugel_idx = Map::new()
+          blk_cugel_len = Map::new()
+          if has_checked {
+            live_checked_pairs = []
+            checked_pairs = Map::new()
+            checked_arr_kind = Map::new()
+            checked_idxs = Map::new()
+            blk_dp_arr = Map::new()
+            blk_dp_kind = Map::new()
+            blk_off_idx = Map::new()
+            blk_off_stride = Map::new()
+            blk_safe_loads = Map::new()
+            has_checked = false
+          }
+        }
+      } else if has_open || has_checked || has_live_bounds {
+        match irc_whitelist_def_lhs_ex(t, safe_load_addrs, blk_safe_loads, allow_safe_load) {
+          Some(lhs) =>
+            if has_open {
+              match open_stacks.get(lhs) {
+                Some(stk) => {
+                  while stk.length() > 0 {
+                    let _ = stk.pop()
+                  }
+                }
+                None => ()
+              }
+            }
+          None => {
+            // Side effect (call, store, etc.): close open RC windows AND
+            // invalidate all bounds-checked container pairs, derived data
+            // pointers, and live intra-block len/cugel facts.
+            open_stacks = Map::new()
+            blk_len_of = Map::new()
+            blk_cugel_idx = Map::new()
+            blk_cugel_len = Map::new()
+            if has_checked {
+              live_checked_pairs = []
+              checked_pairs = Map::new()
+              checked_arr_kind = Map::new()
+              checked_idxs = Map::new()
+              blk_dp_arr = Map::new()
+              blk_dp_kind = Map::new()
+              blk_off_idx = Map::new()
+              blk_off_stride = Map::new()
+              blk_safe_loads = Map::new()
+              has_checked = false
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+    bi = bi + 1
   }
 
   if deleted_idxs.length() == 0 {
@@ -514,39 +1716,65 @@ fn irc_bump_def(def_count : Map[String, Int], name : String) -> Unit {
 }
 
 ///|
-/// Scan function signature `...(...) {` and count parameter `%name` definitions.
+/// Scan function signature `...(...) {` (quote- and comment-aware) and count
+/// parameter `%name` definitions. Returns `-1` if the header is malformed or has
+/// an unclosed quote / missing unquoted `(...)`.
 fn irc_scan_fn_params(fn_hdr : String, def_count : Map[String, Int]) -> Int {
-  let n = fn_hdr.length()
+  let hdr = irc_strip_comment(fn_hdr)
+  let n = hdr.length()
   let mut lp = -1
   let mut rp = -1
+  let mut in_quote = false
+  let mut escaped = false
   let mut i = 0
   while i < n {
-    let c = str_code_at(fn_hdr, i)
-    if c == 40 && lp < 0 {
+    let c = str_code_at(hdr, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 40 && lp < 0 {
       lp = i
-    } else if c == 41 {
+    } else if c == 41 && lp >= 0 {
       rp = i
       break
     }
     i = i + 1
   }
-  if lp < 0 || rp <= lp {
-    return 0
+  if in_quote || lp < 0 || rp <= lp {
+    return -1
   }
   let mut count = 0
   let mut p = lp + 1
+  let mut p_in_quote = false
+  let mut p_escaped = false
   while p < rp {
-    if str_code_at(fn_hdr, p) == 37 {
+    let c = str_code_at(hdr, p)
+    if p_in_quote {
+      if p_escaped {
+        p_escaped = false
+      } else if c == 92 {
+        p_escaped = true
+      } else if c == 34 {
+        p_in_quote = false
+      }
+      p = p + 1
+    } else if c == 34 {
+      p_in_quote = true
+      p = p + 1
+    } else if c == 37 {
       let mut q = p + 1
-      while q < rp {
-        let c = str_code_at(fn_hdr, q)
-        if irc_is_ws(c) || c == 44 || c == 41 || c == 40 {
-          break
-        }
+      while q < rp && irc_is_qbe_ident_char(str_code_at(hdr, q)) {
         q = q + 1
       }
       if q > p + 1 {
-        irc_bump_def(def_count, slice_str(fn_hdr, p, q))
+        irc_bump_def(def_count, slice_str(hdr, p, q))
         count = count + 1
       }
       p = q
@@ -554,31 +1782,37 @@ fn irc_scan_fn_params(fn_hdr : String, def_count : Map[String, Int]) -> Int {
       p = p + 1
     }
   }
-  count
+  if p_in_quote { -1 } else { count }
 }
 
 ///|
-/// Extract `%lhs` if trimmed line `t` is any SSA definition (`%lhs =...`).
+/// Extract `%lhs` if trimmed line `t` is any SSA definition (`%lhs =...`,
+/// `%lhs=...`, `%lhs  =...`, `%lhs\t=...`).
 fn irc_extract_def_lhs(t : String) -> Option[String] {
   let n = t.length()
-  if n < 4 || str_code_at(t, 0) != 37 {
+  if n < 3 || str_code_at(t, 0) != 37 {
     return None
   }
   let mut j = 1
-  while j + 1 < n {
+  while j < n {
     let c = str_code_at(t, j)
-    if c == 32 {
-      if str_code_at(t, j + 1) == 61 {
-        return Some(slice_str(t, 0, j))
-      }
-      return None
-    }
-    if irc_is_ws(c) {
-      return None
+    if irc_is_ws(c) || c == 61 {
+      break
     }
     j = j + 1
   }
-  None
+  if j < 2 {
+    return None
+  }
+  let mut k = j
+  while k < n && irc_is_ws(str_code_at(t, k)) {
+    k = k + 1
+  }
+  if k < n && str_code_at(t, k) == 61 {
+    Some(slice_str(t, 0, j))
+  } else {
+    None
+  }
 }
 
 ///|
@@ -590,13 +1824,15 @@ fn irc_collect_immortal_regs(
   fn_lines : Array[String],
 ) -> Map[String, Bool] {
   let def_count : Map[String, Int] = Map::new()
-  let _ = irc_scan_fn_params(fn_hdr, def_count)
+  if irc_scan_fn_params(fn_hdr, def_count) < 0 {
+    return Map::new()
+  }
   let mut i = 0
   while i < fn_lines.length() {
     let raw = fn_lines[i]
     let ws = irc_first_non_ws(raw)
     if ws < raw.length() && str_code_at(raw, ws) == 37 {
-      let t = irc_trim(raw)
+      let t = irc_strip_comment(raw)
       match irc_extract_def_lhs(t) {
         Some(lhs) => irc_bump_def(def_count, lhs)
         None => ()
@@ -614,7 +1850,7 @@ fn irc_collect_immortal_regs(
     let raw = fn_lines[i]
     let ws = irc_first_non_ws(raw)
     if ws + 10 < raw.length() && str_code_at(raw, ws) == 37 {
-      let t = irc_trim(raw)
+      let t = irc_strip_comment(raw)
       if t.length() > 10 && str_code_at(t, 0) == 37 {
         let mut eq_pos = -1
         let mut j = 1
@@ -696,8 +1932,9 @@ fn irc_cleanup_fn_body_fast(
   fn_hdr : String,
   fn_lines : Array[String],
   has_hdr : Bool,
+  disable_mask : Int,
 ) -> Array[String] {
-  let after_cancel = irc_cancel_same_block_rc(fn_lines)
+  let after_cancel = irc_cancel_same_block_rc(fn_hdr, fn_lines, disable_mask)
   if !has_hdr {
     return after_cancel
   }
@@ -732,6 +1969,9 @@ fn irc_cleanup_fn_body_fast(
 fn irc_within_inline_budget(fn_hdr : String, fn_lines : Array[String]) -> Bool {
   let dummy_defs : Map[String, Int] = Map::new()
   let nparams = irc_scan_fn_params(fn_hdr, dummy_defs)
+  if nparams < 0 {
+    return false
+  }
   let mut nblk = 0L
   let mut ntmp = nparams.to_int64()
   let mut ninc = 0L
@@ -739,7 +1979,7 @@ fn irc_within_inline_budget(fn_hdr : String, fn_lines : Array[String]) -> Bool {
 
   let mut i = 0
   while i < fn_lines.length() {
-    let t = irc_trim(fn_lines[i])
+    let t = irc_strip_comment(fn_lines[i])
     if t.length() > 1 && str_code_at(t, 0) == 64 {
       nblk = nblk + 1L
     } else {
@@ -781,37 +2021,69 @@ fn irc_extract_label_tok(t : String) -> String {
 }
 
 ///|
+/// Token-level, quote- and comment-aware `phi` predecessor label rewriter.
+/// Parses `phi <@pred> <val>, <@pred> <val>, ...` (including no-space `phi@pred`)
+/// and ONLY rewrites the predecessor `@label` token of each pair, never touching
+/// value operands (e.g. `$"sym@left"`) or trailing `#` comments.
 fn irc_rewrite_phi_line(
   line : String,
   tail_map : Map[String, String],
   out : StringBuilder,
 ) -> Unit {
   let n = line.length()
-  let mut i = 0
+  let code_end = irc_strip_comment_end(line, 0, n)
+  let phi_end = irc_find_phi_opcode_end(line, code_end)
+  if phi_end < 0 {
+    out.write_string(line)
+    return
+  }
+  let mut p = phi_end
   let mut last = 0
-  while i < n {
-    if str_code_at(line, i) == 64 {
-      let mut j = i + 1
-      while j < n && irc_is_label_char(str_code_at(line, j)) {
+  while p < code_end {
+    while p < code_end && irc_is_ws(str_code_at(line, p)) {
+      p = p + 1
+    }
+    if p < code_end && str_code_at(line, p) == 64 {
+      let mut j = p + 1
+      while j < code_end && irc_is_label_char(str_code_at(line, j)) {
         j = j + 1
       }
-      if j > i + 1 {
-        let lbl = slice_str(line, i, j)
+      if j > p + 1 {
+        let lbl = slice_str(line, p, j)
         match tail_map.get(lbl) {
           Some(new_lbl) => {
-            if i > last {
-              out.write_string(slice_str(line, last, i))
+            if p > last {
+              out.write_string(slice_str(line, last, p))
             }
             out.write_string(new_lbl)
             last = j
           }
           None => ()
         }
-        i = j
-        continue
+        p = j
       }
     }
-    i = i + 1
+    // Skip `<val>` operand (quote-aware) up to the next unquoted `,`.
+    let mut v_in_quote = false
+    let mut v_escaped = false
+    while p < code_end {
+      let c = str_code_at(line, p)
+      if v_in_quote {
+        if v_escaped {
+          v_escaped = false
+        } else if c == 92 {
+          v_escaped = true
+        } else if c == 34 {
+          v_in_quote = false
+        }
+      } else if c == 34 {
+        v_in_quote = true
+      } else if c == 44 {
+        p = p + 1
+        break
+      }
+      p = p + 1
+    }
   }
   if last == 0 {
     out.write_string(line)
@@ -844,7 +2116,7 @@ fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
   let mut i = 0
   while i < fn_lines.length() {
     let line = fn_lines[i]
-    let t = irc_trim(line)
+    let t = irc_strip_comment(line)
     if t.length() > 1 && str_code_at(t, 0) == 64 {
       if cur_orig.length() > 0 && cur_tail != cur_orig {
         tail_map.set(cur_orig, cur_tail)
@@ -975,7 +2247,7 @@ fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
   let mut k = 0
   while k < out_lines.length() {
     let ln = out_lines[k]
-    if has_remap && ln.contains(" phi ") {
+    if has_remap && irc_line_has_phi(ln) {
       irc_rewrite_phi_line(ln, tail_map, out)
     } else {
       out.write_string(ln)
@@ -991,7 +2263,7 @@ fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
 ///    without line splitting or Map allocation.
 /// 2. Functions with `$pion_rc_` but without `_hdr` still run same-block pair
 ///    cancellation and release inline expansion, skipping only `irc_collect_immortal_regs`.
-fn irc_process_ssa(ssa : String, do_inline : Bool) -> String {
+fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String {
   if !ssa.contains("$pion_rc_inc") && !ssa.contains("$pion_rc_dec") {
     return ssa
   }
@@ -999,6 +2271,9 @@ fn irc_process_ssa(ssa : String, do_inline : Bool) -> String {
   let out = StringBuilder()
   let mut raw_start = 0
   let mut pos = 0
+  let mut in_quote = false
+  let mut escaped = false
+  let mut brace_depth = 0
 
   while pos < n {
     let line_start = pos
@@ -1007,12 +2282,32 @@ fn irc_process_ssa(ssa : String, do_inline : Bool) -> String {
       line_end = line_end + 1
     }
     let next_pos = if line_end < n { line_end + 1 } else { n }
-    if irc_is_fn_hdr_range(ssa, line_start, line_end) {
+    let is_hdr = !in_quote &&
+      brace_depth == 0 &&
+      irc_is_fn_hdr_range(ssa, line_start, line_end)
+    let (nq, ne, nd, n_braces) = irc_scan_line_lex(
+      ssa,
+      line_start,
+      next_pos,
+      in_quote,
+      escaped,
+      brace_depth,
+    )
+    in_quote = nq
+    escaped = ne
+    brace_depth = nd
+    if is_hdr {
+      if brace_depth == 0 {
+        // Single-line function definition (closed on header line): pass through verbatim.
+        pos = next_pos
+        continue
+      }
       let body_start = next_pos
       let mut cur = body_start
       let mut body_end = n
       let mut close_end = n
       let mut fn_end = n
+      let mut has_unclean = in_quote || brace_depth != 1 || n_braces != 1
       while cur < n {
         let ls = cur
         let mut le = cur
@@ -1020,13 +2315,38 @@ fn irc_process_ssa(ssa : String, do_inline : Bool) -> String {
           le = le + 1
         }
         let np = if le < n { le + 1 } else { n }
-        if irc_is_close_brace_range(ssa, ls, le) {
+        if !in_quote && brace_depth == 1 && irc_is_close_brace_range(ssa, ls, le) {
+          brace_depth = 0
           body_end = ls
           close_end = le
           fn_end = np
           break
         }
+        let (bq, be, bd, b_braces) = irc_scan_line_lex(
+          ssa,
+          ls,
+          np,
+          in_quote,
+          escaped,
+          brace_depth,
+        )
+        in_quote = bq
+        escaped = be
+        brace_depth = bd
+        if in_quote || b_braces > 0 {
+          has_unclean = true
+        }
+        if !in_quote && brace_depth == 0 {
+          fn_end = np
+          break
+        }
         cur = np
+      }
+      if has_unclean || brace_depth != 0 {
+        // Function contains a multi-line quoted token or non-standalone brace boundary
+        // (e.g. `} export function ... {`): pass the entire span through verbatim.
+        pos = fn_end
+        continue
       }
       let flags = irc_scan_body_flags(ssa, body_start, body_end)
       if (flags & 1) == 0 {
@@ -1042,7 +2362,7 @@ fn irc_process_ssa(ssa : String, do_inline : Bool) -> String {
       out.write_char('\n')
       let body = irc_split_lines_range(ssa, body_start, body_end)
       let has_hdr = (flags & 2) != 0
-      let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, has_hdr)
+      let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, has_hdr, disable_mask)
       if do_inline && irc_within_inline_budget(fn_hdr, cleaned) {
         irc_expand_fn_body(cleaned, out)
       } else {
@@ -1076,7 +2396,12 @@ fn irc_process_ssa(ssa : String, do_inline : Bool) -> String {
 /// static immortal RC elimination) with zero new basic blocks. Runs in both dev and
 /// release native builds; never called for wasm32.
 pub fn cleanup_native_rc_ssa(ssa : String) -> String {
-  irc_process_ssa(ssa, false)
+  irc_process_ssa(ssa, false, 0)
+}
+
+///|
+pub fn cleanup_native_rc_ssa_opts(ssa : String, disable_mask : Int) -> String {
+  irc_process_ssa(ssa, false, disable_mask)
 }
 
 ///|
@@ -1084,5 +2409,10 @@ pub fn cleanup_native_rc_ssa(ssa : String) -> String {
 /// Biased RC fast paths (including single-threaded frozen `shared_rc` via `phi`)
 /// in native QBE SSA (for release builds; never called for wasm32).
 pub fn inline_native_rc_ssa(ssa : String) -> String {
-  irc_process_ssa(ssa, true)
+  irc_process_ssa(ssa, true, 0)
+}
+
+///|
+pub fn inline_native_rc_ssa_opts(ssa : String, disable_mask : Int) -> String {
+  irc_process_ssa(ssa, true, disable_mask)
 }

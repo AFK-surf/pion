@@ -1,0 +1,240 @@
+// Wave J2 RC elision E2E + ASan/LSan soundness & multithreading test suite.
+// Covers:
+// - Layer 1: deep immutable struct field chains, chained borrows, Perceus last-use
+//   early-drop pinning, shadowing, loop rebinding, match early return, closure capture,
+//   container/struct/return escape, and negative cases (mut root, mut field, EMutArg,
+//   mut self, boxed cell) with full string content assertions.
+// - Layer 2: multi-level immutable field-chain args & receivers, closure materialization
+//   preserving outer mut_local_slots/borrow_owner_*, plus call-window mutation negative
+//   cases (block assign / EMutArg / mut self / EIf then_stmts) with full content assertions.
+// - Layer 3: safe load whitelist & CFG trap-branch penetration + multithreaded scope/spawn.
+
+struct Leaf {
+  name : String
+  tag : String
+}
+
+struct Mid {
+  leaf : Leaf
+  items : Array[String]
+}
+
+struct MidMut {
+  mut leaf : Leaf
+}
+
+struct Top {
+  mid : Mid
+  mid_mut : MidMut
+}
+
+fn assert_str_eq(got : String, want : String) -> Int {
+  if got != want {
+    panic("string mismatch: got=" + got + " want=" + want)
+  }
+  got.length()
+}
+
+fn make_top(tag_idx : Int) -> Top {
+  let n = "node-" + tag_idx.to_string() + "-payload"
+  let t = "tag-" + tag_idx.to_string() + "-extra"
+  let leaf = Leaf::{ name: n, tag: t }
+  let items = [n + ":0", t + ":1", "item-" + tag_idx.to_string()]
+  let mid = Mid::{ leaf: leaf, items: items }
+  let mid_mut = MidMut::{ leaf: Leaf::{ name: "m-" + tag_idx.to_string(), tag: "mt" } }
+  Top::{ mid: mid, mid_mut: mid_mut }
+}
+
+fn make_top_named(name : String, tag : String) -> Top {
+  let leaf = Leaf::{ name: name, tag: tag }
+  let items = [name + ":0", tag + ":1", "item-custom"]
+  let mid = Mid::{ leaf: leaf, items: items }
+  let mid_mut = MidMut::{ leaf: Leaf::{ name: "mut-" + name, tag: "mt" } }
+  Top::{ mid: mid, mid_mut: mid_mut }
+}
+
+fn Top::replace_self(mut self : Top, other : Top) -> Int {
+  self = other
+  1
+}
+
+fn swap_top(mut r : Top, other : Top) -> Int {
+  r = other
+  1
+}
+
+fn take_two(a : String, b : String) -> Int {
+  a.length() + b.length()
+}
+
+fn take_with_int_check(a : String, want : String, x : Int) -> Int {
+  assert_str_eq(a, want) + x
+}
+
+fn test_layer1_perceus_pinning() -> Int {
+  let t = make_top(1)
+  let m = t.mid
+  let l = m.leaf
+  let n = l.name
+  let tag = t.mid.leaf.tag
+  let _noise = make_top(999)
+  assert_str_eq(n, "node-1-payload") + assert_str_eq(tag, "tag-1-extra")
+}
+
+fn test_layer1_shadowing_and_loop() -> Int {
+  let mut total = 0
+  let mut i = 0
+  while i < 20 {
+    let a = make_top(i)
+    let b = a.mid
+    let a = make_top(i + 100)
+    let c = b.leaf.name
+    let d = a.mid.leaf.tag
+    total = total + c.length() + d.length()
+    i = i + 1
+  }
+  total
+}
+
+fn test_layer1_match_early_ret(k : Int) -> String {
+  let t = make_top(k)
+  let nm = t.mid.leaf.name
+  match k {
+    0 => return nm
+    1 => return t.mid.leaf.tag
+    _ => nm + ":" + t.mid.leaf.tag
+  }
+}
+
+fn test_layer1_escapes() -> Int {
+  let t = make_top(7)
+  let nm = t.mid.leaf.name
+  let arr = [nm]
+  let mp : Map[String, String] = Map::new()
+  mp.set("k", nm)
+  let f = fn() -> Int { assert_str_eq(nm, "node-7-payload") }
+  let r1 = assert_str_eq(arr[0], "node-7-payload")
+  let r2 = match mp.get("k") {
+    Some(v) => assert_str_eq(v, "node-7-payload")
+    None => panic("missing map key")
+  }
+  r1 + r2 + f()
+}
+
+fn test_layer1_negatives() -> Int {
+  // 1. Mutable root reassigned after let borrow attempt (distinct pre/post strings)
+  let mut r = make_top_named("old-root-10-orig", "t10")
+  let a = r.mid.leaf.name
+  r = make_top_named("REPLACED-11", "t11")
+  let s1 = assert_str_eq(a, "old-root-10-orig")
+
+  // 2. EMutArg mutating root
+  let mut r2 = make_top_named("old-mutarg-12-orig", "t12")
+  let a2 = r2.mid.leaf.name
+  let _ = swap_top(mut r2, make_top_named("REPLACED-13", "t13"))
+  let s2 = assert_str_eq(a2, "old-mutarg-12-orig")
+
+  // 3. mut self method mutating root
+  let mut r3 = make_top_named("old-mutself-14-orig", "t14")
+  let a3 = r3.mid.leaf.name
+  let _ = r3.replace_self(make_top_named("REPLACED-15", "t15"))
+  let s3 = assert_str_eq(a3, "old-mutself-14-orig")
+
+  // 4. mut field in chain mutated
+  let r4 = make_top_named("field-16", "t16")
+  let a4 = r4.mid_mut.leaf.name
+  r4.mid_mut.leaf = Leaf::{ name: "REPLACED-MUTFIELD", tag: "rt" }
+  let s4 = assert_str_eq(a4, "mut-field-16")
+
+  // 5. Boxed cell (mut local captured by closure)
+  let mut r5 = make_top_named("old-cell-17-orig", "t17")
+  let reset_r5 = fn() -> Unit { r5 = make_top_named("REPLACED-CELL-18", "t18") }
+  let a5 = r5.mid.leaf.name
+  reset_r5()
+  let s5 = assert_str_eq(a5, "old-cell-17-orig")
+
+  s1 + s2 + s3 + s4 + s5
+}
+
+fn test_layer2_call_window_negatives() -> Int {
+  // 1. Arg 2 reassigns owner of arg 0 via block expression
+  let mut r1 = make_top_named("arg-block-20-orig", "t20")
+  let x1 = take_with_int_check(r1.mid.leaf.name, "arg-block-20-orig", {
+    r1 = make_top_named("REPLACED-21", "t21")
+    1
+  })
+
+  // 2. Arg 2 mutates owner of arg 0 via nested EMutArg call
+  let mut r2 = make_top_named("arg-mutarg-22-orig", "t22")
+  let x2 = take_with_int_check(
+    r2.mid.leaf.name,
+    "arg-mutarg-22-orig",
+    swap_top(mut r2, make_top_named("REPLACED-23", "t23")),
+  )
+
+  // 3. Arg 2 mutates owner of arg 0 via mut self method
+  let mut r3 = make_top_named("arg-mutself-24-orig", "t24")
+  let x3 = take_with_int_check(
+    r3.mid.leaf.name,
+    "arg-mutself-24-orig",
+    r3.replace_self(make_top_named("REPLACED-25", "t25")),
+  )
+
+  // 4. Arg 2 mutates owner of arg 0 via mut self inside EIf then_stmts
+  let mut r4 = make_top_named("arg-if-26-orig", "t26")
+  let x4 = take_with_int_check(
+    r4.mid.leaf.name,
+    "arg-if-26-orig",
+    if x3 > 0 { r4.replace_self(make_top_named("REPLACED-27", "t27")) } else { 0 },
+  )
+
+  // 5. Materialized non-capturing closure stored in container MUST NOT wipe outer mut_local_slots
+  let mut r5 = make_top_named("arg-after-closure-28-orig", "t28")
+  let fns : Array[() -> Int] = [fn() -> Int { 7 }]
+  let fv = fns[0]()
+  let a5 = r5.mid.leaf.name
+  let x5 = take_with_int_check(r5.mid.leaf.name, "arg-after-closure-28-orig", {
+    r5 = make_top_named("REPLACED-AFTER-CLOSURE-29", "t29")
+    fv
+  })
+  let x5b = assert_str_eq(a5, "arg-after-closure-28-orig")
+
+  x1 + x2 + x3 + x4 + x5 + x5b
+}
+
+fn test_layer3_trap_and_mt(world : World) -> Int {
+  let t = make_top(30)
+  let mut acc = 0
+  let mut i = 0
+  while i < 3 {
+    acc = acc + t.mid.items[i].length()
+    i = i + 1
+  }
+  // Multithreaded Send check with frozen immutable struct + string
+  let leaf = Leaf::{ name: "shared-leaf", tag: "mt-tag" }
+  let ch : Channel[Int] = Channel::new(4)
+  scope(world, fn(s) {
+    spawn(s, fn() {
+      let n = leaf.name
+      ch.send(assert_str_eq(n, "shared-leaf") + assert_str_eq(leaf.tag, "mt-tag"))
+    })
+    spawn(s, fn() {
+      ch.send(take_two(leaf.name, leaf.tag))
+    })
+  })
+  acc + ch.recv().unwrap_or(0) + ch.recv().unwrap_or(0)
+}
+
+pub fn main(world : World) -> Int {
+  let r1 = test_layer1_perceus_pinning()
+  let r2 = test_layer1_shadowing_and_loop()
+  let r3 = assert_str_eq(test_layer1_match_early_ret(0), "node-0-payload") +
+    assert_str_eq(test_layer1_match_early_ret(1), "tag-1-extra") +
+    assert_str_eq(test_layer1_match_early_ret(2), "node-2-payload:tag-2-extra")
+  let r4 = test_layer1_escapes()
+  let r5 = test_layer1_negatives()
+  let r6 = test_layer2_call_window_negatives()
+  let r7 = test_layer3_trap_and_mt(world)
+  io_println("wave_j2_ok:" + (r1 + r2 + r3 + r4 + r5 + r6 + r7).to_string())
+  0
+}

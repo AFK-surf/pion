@@ -357,6 +357,46 @@ fn drv_env_str(world : World, name : String) -> String {
 }
 
 ///|
+/// Parse `PION_J2_DISABLE` into a bitmask for per-layer Wave J2 RC elision
+/// benchmarks (default 0 = all layers enabled):
+/// - bit 0 (1): disable Layer 1 (borrowed immutable struct field-chain `let`)
+/// - bit 1 (2): disable Layer 2 (borrowed multi-level immutable field-chain args)
+/// - bit 2 (4): disable Layer 3a (`inline_rc` safe load whitelist)
+/// - bit 3 (8): disable Layer 3b (`inline_rc` CFG trap-branch penetration)
+/// Accepts comma-separated tokens: `1`, `2`, `3`, `3a`, `3b`, `all`.
+fn drv_j2_disable_mask(world : World) -> Int {
+  let raw = drv_env_str(world, "PION_J2_DISABLE")
+  if raw.length() == 0 {
+    return 0
+  }
+  let mut mask = 0
+  let n = raw.length()
+  let mut i = 0
+  while i < n {
+    let mut j = i
+    while j < n && str_code_at(raw, j) != 44 {
+      j = j + 1
+    }
+    let tok = slice_str(raw, i, j)
+    if tok == "all" {
+      mask = mask | 15
+    } else if tok == "1" {
+      mask = mask | 1
+    } else if tok == "2" {
+      mask = mask | 2
+    } else if tok == "3" {
+      mask = mask | 12
+    } else if tok == "3a" {
+      mask = mask | 4
+    } else if tok == "3b" {
+      mask = mask | 8
+    }
+    i = j + 1
+  }
+  mask
+}
+
+///|
 fn drv_temp_dir(world : World) -> String {
   let t1 = drv_env_str(world, "TEMP")
   if t1.length() > 0 {
@@ -1929,7 +1969,13 @@ fn drv_compute_compiler_fp(
 ) -> String {
   let qsz = fs_size(world, qbe_bin)
   let rsz = fs_size(world, rt_lib)
-  let env_salt = drv_env_str(world, "PION_CACHE_SALT")
+  let env_salt_raw = drv_env_str(world, "PION_CACHE_SALT")
+  let j2_dis = drv_env_str(world, "PION_J2_DISABLE")
+  let env_salt = if j2_dis.length() > 0 {
+    env_salt_raw + "|j2dis=" + j2_dis
+  } else {
+    env_salt_raw
+  }
   let self_bin = drv_self_exe_path(world)
   let salt = if self_bin.length() > 0 && fs_exists(world, self_bin) {
     "self:" +
@@ -1961,7 +2007,13 @@ fn drv_compute_self_fp(world : World, tag : String) -> String {
   } else {
     0L
   }
-  let env_salt = drv_env_str(world, "PION_CACHE_SALT")
+  let env_salt_raw = drv_env_str(world, "PION_CACHE_SALT")
+  let j2_dis = drv_env_str(world, "PION_J2_DISABLE")
+  let env_salt = if j2_dis.length() > 0 {
+    env_salt_raw + "|j2dis=" + j2_dis
+  } else {
+    env_salt_raw
+  }
   cas_compiler_fp(
     self_sz,
     0L,
@@ -5265,7 +5317,8 @@ fn drv_build_nodes_objects_entry(
       sig_hashes.set(node.name, sha256_hex(pionsig))
       let pionstub = emit_pion_stub(cr.pkg)
       stub_hashes.set(node.name, drv_stub_hash(pionstub, node.sources))
-      let res = emit_qbe_package_multi_entry_target(
+      let j2_mask = drv_j2_disable_mask(world)
+      let res = emit_qbe_package_multi_entry_target_opts(
         cr.pkg,
         cr.tc,
         release,
@@ -5275,11 +5328,12 @@ fn drv_build_nodes_objects_entry(
         qbe_target,
         entry_symbol,
         no_main,
+        j2_mask,
       )
       let final_ssa = if release {
-        inline_native_rc_ssa(res.ssa)
+        inline_native_rc_ssa_opts(res.ssa, j2_mask)
       } else {
-        cleanup_native_rc_ssa(res.ssa)
+        cleanup_native_rc_ssa_opts(res.ssa, j2_mask)
       }
       let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
       let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
@@ -6346,11 +6400,20 @@ fn drv_build_targets(
         let idx = miss_indices[mi]
         let ukey = unit_keys[idx]
         let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
-        let raw_ssa = emit_qbe_unit_entry_target(prep, idx, release, qbe_target, entry_symbol, no_main)
+        let j2_mask = drv_j2_disable_mask(world)
+        let raw_ssa = emit_qbe_unit_entry_target_opts(
+          prep,
+          idx,
+          release,
+          qbe_target,
+          entry_symbol,
+          no_main,
+          j2_mask,
+        )
         let ssa_text = if release {
-          inline_native_rc_ssa(raw_ssa)
+          inline_native_rc_ssa_opts(raw_ssa, j2_mask)
         } else {
-          cleanup_native_rc_ssa(raw_ssa)
+          cleanup_native_rc_ssa_opts(raw_ssa, j2_mask)
         }
         if !drv_write_cas_text_atomic(world, u_ssa, ssa_text) {
           return Err("failed to write CAS unit ssa: " + u_ssa)
@@ -6738,7 +6801,8 @@ fn drv_build_targets(
       return Ok(obj_path)
     }
   } else {
-    let compiled = match cli_compile_qbe_entry(
+    let j2_mask = drv_j2_disable_mask(world)
+    let compiled = match cli_compile_qbe_entry_opts(
       pkg_name,
       paths,
       sources,
@@ -6746,14 +6810,15 @@ fn drv_build_targets(
       false,
       entry_symbol,
       no_main,
+      j2_mask,
     ) {
       Err(diag_json) => return Err(diag_json)
       Ok(c) => c
     }
     let final_ssa = if release {
-      inline_native_rc_ssa(compiled.ssa)
+      inline_native_rc_ssa_opts(compiled.ssa, j2_mask)
     } else {
-      cleanup_native_rc_ssa(compiled.ssa)
+      cleanup_native_rc_ssa_opts(compiled.ssa, j2_mask)
     }
     has_main = compiled.has_main
     if !drv_write_cas_text_atomic(world, sig_path, compiled.sig) {
