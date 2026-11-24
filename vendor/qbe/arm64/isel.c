@@ -1273,3 +1273,61 @@ arm64_hoist_consts(Fn *fn)
 		}
 	}
 }
+
+/* Pair two adjacent spill/reload instructions on compiler-private
+ * spill slots into one stp/ldp [x29, #off].
+ *
+ * Only slots allocated by spill() (rsval >= firstspill) qualify: user
+ * allocs, whose address may escape, and incoming stack arguments
+ * (negative slots) are never paired.  Both instructions must be of the
+ * same kind (two stores or two loads) and the same integer class, so
+ * they touch two disjoint, adjacent w-byte cells and read/write only
+ * registers (the base x29 is never a transfer register).  Two loads
+ * must target distinct registers (ldp Rt1 == Rt2 is CONSTRAINED
+ * UNPREDICTABLE).  The low-address cell is always Rt, independent of
+ * instruction order.  The offset formula is the s >= 0 case of
+ * slot()/me_slot(); it must be w-aligned and fit the scaled imm7
+ * (off/w <= 63, positive only), otherwise the caller falls back to
+ * two single ldr/str. */
+int
+arm64_slotpair(Ins *i, uint padding, int firstspill, ArmSlotPair *p)
+{
+	int kind[2], cls[2], reg[2];
+	uint64_t off[2];
+	Ref sl[2];
+	int j, lo, hi;
+	uint w;
+
+	for (j = 0; j < 2; j++) {
+		Ins *x = i+j;
+		Ref r, s;
+		if ((x->op == Oload || x->op == Ocopy) && rtype(x->arg[0]) == RSlot) {
+			kind[j] = 1; cls[j] = x->cls; s = x->arg[0]; r = x->to;
+		} else if ((x->op == Ostorew || x->op == Ostorel) && rtype(x->arg[1]) == RSlot) {
+			kind[j] = 0; cls[j] = x->op == Ostorew ? Kw : Kl; s = x->arg[1]; r = x->arg[0];
+		} else if (x->op == Ocopy && rtype(x->to) == RSlot) {
+			kind[j] = 0; cls[j] = x->cls; s = x->to; r = x->arg[0];
+		} else
+			return 0;
+		if ((cls[j] != Kw && cls[j] != Kl) || rsval(s) < firstspill
+		|| !isreg(r) || r.val < R0 || r.val >= FP)
+			return 0;
+		reg[j] = r.val;
+		sl[j] = s;
+		off[j] = 16ULL + padding + 4ULL * (uint64_t)rsval(s);
+	}
+	if (kind[0] != kind[1] || cls[0] != cls[1])
+		return 0;
+	if (kind[0] && reg[0] == reg[1])
+		return 0;
+	lo = off[1] < off[0];
+	hi = 1-lo;
+	w = cls[0] == Kw ? 4 : 8;
+	if (off[hi] != off[lo] + w || off[lo] % w || off[lo] / w > 63)
+		return 0;
+	*p = (ArmSlotPair){
+		.load = kind[0], .cls = cls[0], .lo = reg[lo], .hi = reg[hi],
+		.offset = (uint)off[lo], .slot = sl[lo],
+	};
+	return 1;
+}

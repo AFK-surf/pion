@@ -34,6 +34,8 @@ void apple_extsb(Fn *);
 int arm64_logimm(uint64_t, int);
 int arm64_fpimm(Con *, int);
 void arm64_isel(Fn *);
+typedef struct { int load, cls, lo, hi; uint offset; Ref slot; } ArmSlotPair;
+int arm64_slotpair(Ins *, uint padding, int firstspill, ArmSlotPair *);
 
 /* emit.c */
 void arm64_emitfn(Fn *, FILE *);

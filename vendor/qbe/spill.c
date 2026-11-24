@@ -355,7 +355,7 @@ spill(Fn *fn)
 	bsinit(mask[1], ntmp);
 	bsinit(l2b, ntmp);
 	bsinit(pmu, ntmp);
-	locs = fn->slot;
+	locs = fn->firstspill = fn->slot;
 	slot4 = 0;
 	slot8 = 0;
 	for (t=0; t<ntmp; t++) {

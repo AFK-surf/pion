@@ -253,6 +253,8 @@ sh "$ROOT_DIR/tests/e2e/p100_qbe_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p102_qbe_codegen_opts/run_e2e.sh" "$PIONC2"
 # P103: Wave L0 — nested tuple patterns, Array::is_empty/truncate, Double::is_nan/compare/reinterpret_as_int64 + Hash -0.0, Int::lnot.
 sh "$ROOT_DIR/tests/e2e/p103_wave_l0_stdlib_tuple/run_e2e.sh" "$PIONC2"
+# P105: AArch64 private spill-slot stp/ldp pairing (arm64_slotpair unit test, text asm, qemu / native Mach-O --obj).
+sh "$ROOT_DIR/tests/e2e/p105_arm64_spill_pairs/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p82a_wasm_arr_clear_f32_push/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p85_enum_sroa/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC2"
