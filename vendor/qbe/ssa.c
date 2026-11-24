@@ -112,6 +112,15 @@ refindex(int t, Fn *fn)
 	return newtmp(fn->tmp[t].name, fn->tmp[t].cls, fn);
 }
 
+/* A temp can affect the local rewrite only in blocks defining it.  Index
+ * multi-definition temps in link order to preserve renaming and worklist order.
+ * A single instruction definition already has its block in filluse's table. */
+typedef struct DefBlocks DefBlocks;
+struct DefBlocks {
+	Blk **blocks;
+	uint count;
+};
+
 static void
 phiins(Fn *fn)
 {
@@ -124,15 +133,38 @@ phiins(Fn *fn)
 	int t, nt, ok;
 	uint n, defb;
 	short k;
+	DefBlocks *index;
+	Blk **storage, *single;
+	uint *seen, j, count;
+	size_t cap;
 
 	bsinit(u, fn->nblk);
 	bsinit(defs, fn->nblk);
 	blist = emalloc(fn->nblk * sizeof blist[0]);
 	be = &blist[fn->nblk];
 	nt = fn->ntmp;
+	index = alloc(nt * sizeof *index);
+	seen = alloc(fn->nblk * sizeof *seen);
+	cap = 0;
+	for (t=Tmp0; t<nt; t++)
+		if (fn->tmp[t].ndef > 1)
+			cap += fn->tmp[t].ndef;
+	storage = alloc(cap * sizeof *storage);
+	for (t=Tmp0; t<nt; t++)
+		if (fn->tmp[t].ndef > 1) {
+			index[t].blocks = storage;
+			storage += fn->tmp[t].ndef;
+		}
+	for (b=fn->start; b; b=b->link)
+		for (i=b->ins; i<&b->ins[b->nins]; i++)
+			if (rtype(i->to) == RTmp && i->to.val >= Tmp0) {
+				DefBlocks *d = &index[i->to.val];
+				if (d->blocks && (!d->count || d->blocks[d->count-1] != b))
+					d->blocks[d->count++] = b;
+			}
 	for (t=Tmp0; t<nt; t++) {
 		fn->tmp[t].visit = 0;
-		if (fn->tmp[t].phi != 0)
+		if (fn->tmp[t].phi != 0 || !fn->tmp[t].ndef)
 			continue;
 		if (fn->tmp[t].ndef == 1) {
 			ok = 1;
@@ -140,14 +172,19 @@ phiins(Fn *fn)
 			use = fn->tmp[t].use;
 			for (n=fn->tmp[t].nuse; n--; use++)
 				ok &= use->bid == defb;
-			if (ok || defb == fn->start->id)
+			if (ok || defb == fn->start->id || !fn->tmp[t].def)
 				continue;
+			single = fn->rpo[defb];
+			count = 1;
+		} else {
+			single = 0;
+			count = index[t].count;
 		}
 		bszero(u);
 		k = Kx;
 		bp = be;
-		for (b=fn->start; b; b=b->link) {
-			b->visit = 0;
+		for (j=0; j<count; j++) {
+			b = single ? single : index[t].blocks[j];
 			r = R;
 			for (i=b->ins; i<&b->ins[b->nins]; i++) {
 				if (!req(r, R)) {
@@ -180,7 +217,9 @@ phiins(Fn *fn)
 			bsclr(u, b->id);
 			for (n=0; n<b->nfron; n++) {
 				a = b->fron[n];
-				if (a->visit++ == 0)
+				if (seen[a->id] == (uint)t)
+					continue;
+				seen[a->id] = t;
 				if (bshas(a->in, t)) {
 					p = alloc(sizeof *p);
 					p->cls = k;
