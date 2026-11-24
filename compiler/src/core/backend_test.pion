@@ -10507,9 +10507,172 @@ test "p74f_stub_body_disables_pod_borrow" {
   }
   assert_true(call_ssa != "", ssa)
   // `lim` passed to a `.pionstub` `{ panic() }` placeholder MUST be heap-allocated
-  // via `$pion_alloc_uninit(w 24, ...)` (never stack-allocated `alloc8 24`).
+  // via `$pion_alloc_uninit(w 24, ...)` (never stack-allocated `alloc8 24` or `alloc8 48`).
   assert_true(call_ssa.contains("call $pion_alloc_uninit(w 24,"), call_ssa)
   assert_true(!call_ssa.contains("alloc8 24"), call_ssa)
+  assert_true(!call_ssa.contains("alloc8 48"), call_ssa)
+}
+
+///|
+test "p96_pod_stack_immortal_header_ssa" {
+  let src =
+    #|pub struct Cfg {
+    #|  pub a : Int
+    #|  pub b : UInt64
+    #|  pub c : Bool
+    #|}
+    #|struct Budget {
+    #|  mut total : UInt64
+    #|}
+    #|fn Budget::consume(self : Budget, n : Int, cfg : Cfg) -> Result[Unit, Int] {
+    #|  let next = self.total + n.to_int64().to_uint64()
+    #|  if next > cfg.b { return Err(1) }
+    #|  self.total = next
+    #|  Ok(())
+    #|}
+    #|pub fn leaf(data : Bytes, b : Budget, cfg : Cfg) -> Result[Bytes, Int] {
+    #|  let mut x = data
+    #|  if x.length() > 1000000 { return Err(2) }
+    #|  match b.consume(x.length(), cfg) {
+    #|    Err(e) => return Err(e)
+    #|    Ok(_) => ()
+    #|  }
+    #|  Ok(x)
+    #|}
+    #|pub fn mid(data : Bytes, cfg : Cfg, b : Budget) -> Result[Bytes, Int] {
+    #|  let mut i = 0
+    #|  while i < 1 {
+    #|    i += 1
+    #|    let r = match leaf(data, Budget::{ total: 0UL }, cfg) {
+    #|      Ok(v) => v
+    #|      Err(e) => return Err(e)
+    #|    }
+    #|    match b.consume(r.length(), cfg) {
+    #|      Err(e) => return Err(e)
+    #|      Ok(_) => ()
+    #|    }
+    #|  }
+    #|  Ok(data)
+    #|}
+    #|pub fn outer(data : Bytes) -> Int {
+    #|  let dec_cfg = Cfg::{ a: 4, b: 4294967296UL, c: false }
+    #|  match mid(data, dec_cfg, Budget::{ total: 0UL }) {
+    #|    Ok(v) => v.length()
+    #|    Err(e) => e
+    #|  }
+    #|}
+    #|pub fn view_leaf(s : StrView, n : Int) -> Int {
+    #|  s.length() + n
+    #|}
+    #|pub fn view_outer(s : String) -> Int {
+    #|  let v = s.as_view()
+    #|  view_leaf(v, s.length())
+    #|}
+  let cr = check_source_files_full("p96", ["p96.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    check_result_to_json(cr.diagnostics),
+  )
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let funcs = ssa.split("export function ")
+  let mut outer_ssa = ""
+  let mut view_outer_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("$pion_fn_outer(") {
+      outer_ssa = funcs[fi]
+    }
+    if funcs[fi].contains("$pion_fn_view_outer(") {
+      view_outer_ssa = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  assert_true(outer_ssa != "", ssa)
+  assert_true(view_outer_ssa != "", ssa)
+  // Both stack-promoted POD struct (24B) and stack-promoted StrView (24B) MUST allocate
+  // 24 + 24 = 48 bytes and initialize the 24B immortal PionHeader (type_tag=4, flags=11).
+  assert_true(outer_ssa.contains("alloc8 48"), outer_ssa)
+  assert_true(outer_ssa.contains("storeh 4, "), outer_ssa)
+  assert_true(outer_ssa.contains("storeh 11, "), outer_ssa)
+  assert_true(!outer_ssa.contains("alloc8 24"), outer_ssa)
+  assert_true(view_outer_ssa.contains("alloc8 48"), view_outer_ssa)
+  assert_true(view_outer_ssa.contains("storeh 4, "), view_outer_ssa)
+  assert_true(view_outer_ssa.contains("storeh 11, "), view_outer_ssa)
+  assert_true(!view_outer_ssa.contains("alloc8 24"), view_outer_ssa)
+}
+
+///|
+test "p96_pod_stack_escape_soundness_ssa" {
+  let src =
+    #|pub struct One { pub n : Int }
+    #|pub struct Two { pub a : Int; pub b : Int }
+    #|fn save(p : Two) -> Int { p.a + p.b }
+    #|pub fn push_one(xs : Array[One], i : Int) -> Unit {
+    #|  let p = One::{ n: i }
+    #|  xs.push(p)
+    #|}
+    #|pub fn assign_one(xs : Array[One], i : Int) -> Unit {
+    #|  let p = One::{ n: i }
+    #|  xs[0] = p
+    #|}
+    #|pub fn push_two(xs : Array[Two], i : Int) -> Unit {
+    #|  let p = Two::{ a: i, b: i + 1 }
+    #|  xs.push(p)
+    #|}
+    #|pub fn shadow_save(holder : Array[Two], i : Int) -> Unit {
+    #|  let p = Two::{ a: i, b: i + 10 }
+    #|  let save = fn(x : Two) -> Unit { holder.push(x) }
+    #|  save(p)
+    #|}
+    #|pub fn shadow_save_is(opt : Option[(Two) -> Unit], i : Int) -> Unit {
+    #|  let p = Two::{ a: i, b: i + 20 }
+    #|  if opt is Some(save) {
+    #|    save(p)
+    #|  }
+    #|}
+  let cr = check_source_files_full("p96_esc", ["p96_esc.pion"], [src])
+  assert_true(
+    cr.diagnostics.length() == 0,
+    check_result_to_json(cr.diagnostics),
+  )
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let funcs = ssa.split("export function ")
+  let mut push_one_ssa = ""
+  let mut assign_one_ssa = ""
+  let mut push_two_ssa = ""
+  let mut shadow_save_ssa = ""
+  let mut shadow_save_is_ssa = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    if funcs[fi].contains("$pion_fn_push_one(") {
+      push_one_ssa = funcs[fi]
+    } else if funcs[fi].contains("$pion_fn_assign_one(") {
+      assign_one_ssa = funcs[fi]
+    } else if funcs[fi].contains("$pion_fn_push_two(") {
+      push_two_ssa = funcs[fi]
+    } else if funcs[fi].contains("$pion_fn_shadow_save(") {
+      shadow_save_ssa = funcs[fi]
+    } else if funcs[fi].contains("$pion_fn_shadow_save_is(") {
+      shadow_save_is_ssa = funcs[fi]
+    }
+    fi = fi + 1
+  }
+  assert_true(push_one_ssa != "" && assign_one_ssa != "" && push_two_ssa != "", ssa)
+  assert_true(shadow_save_ssa != "" && shadow_save_is_ssa != "", ssa)
+  // 1-field POD struct is pointer-stored in Array[One] -> MUST heap-allocate (8B), never stack-promote (32B).
+  assert_true(push_one_ssa.contains("call $pion_alloc_uninit(w 8,"), push_one_ssa)
+  assert_true(!push_one_ssa.contains("alloc8 32"), push_one_ssa)
+  assert_true(assign_one_ssa.contains("call $pion_alloc_uninit(w 8,"), assign_one_ssa)
+  assert_true(!assign_one_ssa.contains("alloc8 32"), assign_one_ssa)
+  // 2-field flat-POD struct IS stored inline in Array[Two] -> stays stack-promoted with 24B immortal header (40B).
+  assert_true(push_two_ssa.contains("alloc8 40"), push_two_ssa)
+  assert_true(push_two_ssa.contains("storeh 11, "), push_two_ssa)
+  assert_true(!push_two_ssa.contains("call $pion_alloc_uninit(w 16,"), push_two_ssa)
+  // Subsequent local `save` (let / is-pattern) shadowing top-level `fn save` -> MUST heap-allocate (16B).
+  assert_true(shadow_save_ssa.contains("call $pion_alloc_uninit(w 16,"), shadow_save_ssa)
+  assert_true(!shadow_save_ssa.contains("alloc8 40"), shadow_save_ssa)
+  assert_true(shadow_save_is_ssa.contains("call $pion_alloc_uninit(w 16,"), shadow_save_is_ssa)
+  assert_true(!shadow_save_is_ssa.contains("alloc8 40"), shadow_save_is_ssa)
 }
 
 ///|

@@ -16001,9 +16001,18 @@ fn qbe_pure_scalar_pod_enum_info(g : QbeGen, raw_ty : Ty) -> Option[(EnumInfo, I
 ///|
 /// Allocates `24 + payload_bytes` on the function entry stack, writes a valid
 /// immortal+frozen `PionHeader` (matching `runtime/pion_rt.h`: owner_tid=0,
-/// local_rc=0, shared_rc=1, type_tag=PION_TAG_ENUM(5), flags=FROZEN|IMMORTAL|DEEP_FROZEN(11),
+/// local_rc=0, shared_rc=1, `type_tag`, flags=FROZEN|IMMORTAL|DEEP_FROZEN(11),
 /// drop_fn=NULL), and returns the object body pointer (`raw + 24`).
-fn qbe_alloc_immortal_enum_stack_buf(g : QbeGen, payload_bytes : Int) -> String {
+/// Every stack-promoted Pion object (POD structs, POD enums, StrView/BytesView)
+/// MUST carry this immortal header so that any conservative `pion_rc_inc` /
+/// `pion_rc_dec` / `pion_rc_freeze` / inline-RC fast path emitted along a
+/// borrowed call chain is a guaranteed read-only no-op and never underflows
+/// or corrupts the caller's stack frame.
+fn qbe_alloc_immortal_stack_buf(
+  g : QbeGen,
+  payload_bytes : Int,
+  type_tag : Int,
+) -> String {
   let raw = qbe_tmp(g)
   let total = 24 + payload_bytes
   g.fn_allocs.write_string("    " + raw + " =l alloc8 " + total.to_string() + "\n")
@@ -16013,7 +16022,7 @@ fn qbe_alloc_immortal_enum_stack_buf(g : QbeGen, payload_bytes : Int) -> String 
   g.fn_allocs.write_string("    storew 1, " + p8 + "\n")
   let p12 = qbe_tmp(g)
   g.fn_allocs.write_string("    " + p12 + " =l add " + raw + ", 12\n")
-  g.fn_allocs.write_string("    storeh 5, " + p12 + "\n")
+  g.fn_allocs.write_string("    storeh " + type_tag.to_string() + ", " + p12 + "\n")
   let p14 = qbe_tmp(g)
   g.fn_allocs.write_string("    " + p14 + " =l add " + raw + ", 14\n")
   g.fn_allocs.write_string("    storeh 11, " + p14 + "\n")
@@ -16023,6 +16032,11 @@ fn qbe_alloc_immortal_enum_stack_buf(g : QbeGen, payload_bytes : Int) -> String 
   let body = qbe_tmp(g)
   g.fn_allocs.write_string("    " + body + " =l add " + raw + ", 24\n")
   body
+}
+
+///|
+fn qbe_alloc_immortal_enum_stack_buf(g : QbeGen, payload_bytes : Int) -> String {
+  qbe_alloc_immortal_stack_buf(g, payload_bytes, 5)
 }
 
 ///|
@@ -20144,13 +20158,7 @@ fn qbe_alloc_slot4(g : QbeGen) -> String {
 
 ///|
 fn qbe_alloc_stack_buf(g : QbeGen, bytes : Int) -> String {
-  let s = qbe_tmp(g)
-  g.fn_allocs.write_string("    ")
-  g.fn_allocs.write_string(s)
-  g.fn_allocs.write_string(" =l alloc8 ")
-  g.fn_allocs.write_string(bytes.to_string())
-  g.fn_allocs.write_string("\n")
-  s
+  qbe_alloc_immortal_stack_buf(g, bytes, 4)
 }
 
 ///|
@@ -22065,6 +22073,22 @@ fn qbe_ty_matches_pure_pod_struct(
 }
 
 ///|
+/// P96: True only when `raw_ty` is both a pure-scalar POD struct matching `pod_ty`
+/// AND stored flat inline by value in `Array`/`FixedArray` (`2..=6` fields via
+/// `qbe_flat_pod_struct_info`). Single-field structs are pointer-stored in arrays,
+/// so stack-promoted pointers MUST NOT be pushed or index-assigned into them.
+fn qbe_ty_matches_flat_pure_pod_struct(
+  g : QbeGen,
+  raw_ty : Ty,
+  pod_ty : Ty,
+) -> Bool {
+  match qbe_flat_pod_struct_info(g, raw_ty) {
+    Some(_) => qbe_ty_matches_pure_pod_struct(g, raw_ty, pod_ty)
+    None => false
+  }
+}
+
+///|
 /// P72-A: Load all fields of a flat-POD struct from `src_p` (heap object, stack POD buffer,
 /// or borrowed flat array element pointer — never touching `src_p - 24`) into typed `QbeVal`s,
 /// optionally incrementing RC on any object-typed fields.
@@ -22104,28 +22128,36 @@ fn qbe_emit_flat_load_slots_rc(
 }
 
 ///|
-/// P72-A: Probe expression type, consulting `env` (callee parameter types) before `g.locals`.
+/// P72-A/P96: Probe expression type, consulting `shadowed` (later local bindings in the same
+/// block that may shadow an outer local/function) and `env` (callee parameter types) before `g.locals`.
 fn qbe_probe_ty_with_env(
   g : QbeGen,
   e : Expr,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
 ) -> Option[Ty] {
-  if env.length() == 0 {
+  if env.length() == 0 && shadowed.length() == 0 {
     return qbe_probe_expr_ty(g, e)
   }
   match e {
     EIdent(n, _) =>
-      match env.get(n) {
-        Some(t) => Some(t)
-        None => None
+      if shadowed.contains(n) {
+        None
+      } else if env.length() > 0 {
+        match env.get(n) {
+          Some(t) => Some(t)
+          None => None
+        }
+      } else {
+        qbe_probe_expr_ty(g, e)
       }
     EIndex(base, _, _) =>
-      match qbe_probe_ty_with_env(g, base, env) {
+      match qbe_probe_ty_with_env(g, base, env, shadowed) {
         Some(TArray(elem)) | Some(TFixedArray(elem)) => Some(elem)
         _ => None
       }
     EField(base, fname, _) =>
-      match qbe_probe_ty_with_env(g, base, env) {
+      match qbe_probe_ty_with_env(g, base, env, shadowed) {
         Some(TStruct(sname, sargs)) =>
           match qbe_lookup_struct_info(g, sname) {
             Some(sinfo) => {
@@ -22341,8 +22373,11 @@ fn qbe_collect_local_bind_names_expr(e : Expr, out : Map[String, Bool]) -> Unit 
     | ENamedArg(_, _, inner, _)
     | EMutArg(inner, _)
     | EField(inner, _, _)
-    | EIs(inner, _, _)
     | ETry(inner, _) => qbe_collect_local_bind_names_expr(inner, out)
+    EIs(inner, pat, _) => {
+      qbe_collect_local_bind_names_expr(inner, out)
+      qbe_collect_pat_bind_names(pat, out)
+    }
     EBinary(_, l, r, _) | EIndex(l, r, _) => {
       qbe_collect_local_bind_names_expr(l, out)
       qbe_collect_local_bind_names_expr(r, out)
@@ -22453,12 +22488,194 @@ fn qbe_collect_local_bind_names_stmts(stmts : Array[Stmt], out : Map[String, Boo
 }
 
 ///|
+/// P96: Collect all local binding names introduced in `stmts[start ..]` before `stop_name`
+/// is shadowed at the top level of `stmts`, so pre-scans for stack promotion never resolve
+/// a call to a top-level function that is shadowed by a later local binding (e.g. `let save = fn(...)`).
+fn qbe_collect_future_local_bind_names(
+  stmts : Array[Stmt],
+  start : Int,
+  stop_name : String,
+) -> Map[String, Bool] {
+  let out : Map[String, Bool] = Map([])
+  let mut i = start
+  while i < stmts.length() {
+    let s = stmts[i]
+    qbe_collect_local_bind_names_stmt(s, out)
+    match s {
+      SLet(bname, _, _, _, _) => if bname == stop_name { break }
+      SLetTuple(bnames, _, _, _) => {
+        let mut bi = 0
+        let mut hit = false
+        while bi < bnames.length() {
+          if bnames[bi] == stop_name {
+            hit = true
+            break
+          }
+          bi = bi + 1
+        }
+        if hit {
+          break
+        }
+      }
+      _ => ()
+    }
+    i = i + 1
+  }
+  out
+}
+
+///|
+/// P96: Canonical cache key for `pod_borrow_cache`, derived strictly from the resolved
+/// target declaration's package, receiver type (distinguishing free functions from
+/// `Type::method` across distinct types in the same package), member name, and param index.
+fn qbe_borrow_cache_key(
+  prefix : String,
+  target_pkg : String,
+  finfo : FnInfo,
+  param_idx : Int,
+) -> String {
+  let decl_id = if finfo.decl.receiver_type != "" {
+    "m:" + finfo.decl.receiver_type + "::" + finfo.decl.name
+  } else {
+    "fn:" + finfo.decl.name
+  }
+  prefix + "::" + target_pkg + "::" + decl_id + "#" + param_idx.to_string()
+}
+
+///|
+/// P96: Resolve a package qualifier `qual` strictly in the CURRENT defining package context
+/// (`g.tc` when `g.mono_pkg == ""`, or the defining package's own `cur_pkg.tc` when
+/// `g.mono_pkg != ""`). Never consults the calling package's `import_aliases` while
+/// recursively inspecting an imported function body; returns `None` if unavailable.
+fn qbe_resolve_pkg_in_borrow_ctx(g : QbeGen, qual : String) -> Option[ImportedPkg] {
+  if g.mono_pkg == "" {
+    resolve_pkg_for_lookup(g.tc, qual, true)
+  } else {
+    match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+      Some(cur_pkg) =>
+        match cur_pkg.tc.import_aliases.get(qual) {
+          Some(canon) => lookup_imported_pkg_transitive(g.tc, canon)
+          None =>
+            match cur_pkg.tc.imported_pkgs.get(qual) {
+              Some(p) => Some(p)
+              None =>
+                if qual == cur_pkg.name {
+                  Some(cur_pkg)
+                } else {
+                  None
+                }
+            }
+        }
+      None => None
+    }
+  }
+}
+
+///|
+/// P96: True when `EPath(qual, mem)` resolves to an enum variant constructor in the
+/// CURRENT defining package context (`g.tc` when `g.mono_pkg == ""`, or `cur_pkg.tc`
+/// when `g.mono_pkg != ""`). Matches `types.pion:11692-11724` and `qbe.pion:37755-37788`,
+/// where enum variant constructors take precedence over same-name static methods (`E::Var`).
+fn qbe_epath_is_variant_ctor_in_borrow_ctx(
+  g : QbeGen,
+  qual : String,
+  mem : String,
+) -> Bool {
+  if qual == "Option" || qual == "Result" {
+    return true
+  }
+  if has_qual_sep(qual) {
+    let qp = split_qual_name(qual)
+    match qbe_resolve_pkg_in_borrow_ctx(g, qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.enums.get(qp.name) {
+          Some(ei) => enum_info_has_variant(ei, mem)
+          None => false
+        }
+      None => false
+    }
+  } else if g.mono_pkg == "" {
+    match g.tc.enums.get(qual) {
+      Some(ei) => enum_info_has_variant(ei, mem)
+      None => false
+    }
+  } else {
+    match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+      Some(cur_pkg) =>
+        match cur_pkg.tc.enums.get(qual) {
+          Some(ei) => enum_info_has_variant(ei, mem)
+          None => false
+        }
+      None => false
+    }
+  }
+}
+
+///|
+/// P96: Resolve a method `sname::mname` strictly in the CURRENT defining package context
+/// without falling back to the caller's `g.tc.import_aliases` or `g.tc.methods`.
+/// Returns `Some((target_pkg, qualified_fn_info))` on exact resolution, else `None`.
+fn qbe_lookup_method_in_borrow_ctx(
+  g : QbeGen,
+  sname : String,
+  mname : String,
+) -> Option[(String, FnInfo)] {
+  if has_qual_sep(sname) {
+    let qp = split_qual_name(sname)
+    if g.mono_pkg == "" && g.tc.pkg_name != "" && qp.prefix == g.tc.pkg_name {
+      match g.tc.methods.get(qp.name + "::" + mname) {
+        Some(mi) => return Some(("", qbe_qualify_fn_info_sig(g.tc.pkg_name, mi)))
+        None => ()
+      }
+    }
+    match qbe_resolve_pkg_in_borrow_ctx(g, qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.methods.get(qp.name + "::" + mname) {
+          Some(mi) => return Some((ipkg.name, qualify_fn_info(ipkg, mi)))
+          None => ()
+        }
+      None => ()
+    }
+    // Also accept an already canon-qualified type name from `qualify_fn_info` (never alias).
+    if g.mono_pkg != "" {
+      match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+        Some(cur_pkg) =>
+          match cur_pkg.tc.all_imported_pkgs.get(qp.prefix) {
+            Some(ipkg) =>
+              match ipkg.tc.methods.get(qp.name + "::" + mname) {
+                Some(mi) => return Some((ipkg.name, qualify_fn_info(ipkg, mi)))
+                None => ()
+              }
+            None => ()
+          }
+        None => ()
+      }
+    }
+    None
+  } else if g.mono_pkg == "" {
+    match g.tc.methods.get(sname + "::" + mname) {
+      Some(mi) => Some(("", mi))
+      None => None
+    }
+  } else {
+    match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+      Some(cur_pkg) =>
+        match cur_pkg.tc.methods.get(sname + "::" + mname) {
+          Some(mi) => Some((cur_pkg.name, qualify_fn_info(cur_pkg, mi)))
+          None => None
+        }
+      None => None
+    }
+  }
+}
+
+///|
 /// P72-A: Pure static check whether parameter `param_idx` of `finfo` only borrows a pure-scalar
 /// POD struct pointer without ever touching its RC header (`p - 24`) or letting it escape.
 fn qbe_fn_param_is_pod_borrow(
   g : QbeGen,
   target_pkg : String,
-  fn_key : String,
+  _fn_key : String,
   finfo : FnInfo,
   param_idx : Int,
   depth : Int,
@@ -22466,7 +22683,7 @@ fn qbe_fn_param_is_pod_borrow(
   if depth > 2 {
     return false
   }
-  let ckey = target_pkg + "::" + fn_key + "#" + param_idx.to_string()
+  let ckey = qbe_borrow_cache_key("pb", target_pkg, finfo, param_idx)
   match g.pod_borrow_cache.get(ckey) {
     Some(v) => return v
     None => ()
@@ -22562,6 +22779,7 @@ fn qbe_fn_param_is_pod_borrow(
     param_name,
     param_ty,
     penv,
+    body_locals,
     depth + 1,
   )
   g.mono_pkg = saved_mono_pkg
@@ -22581,6 +22799,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
   name : String,
   pod_ty : Ty,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
   depth : Int,
 ) -> Bool {
   match e {
@@ -22600,24 +22819,24 @@ fn qbe_ident_is_flat_pod_consumer_expr(
     EField(obj, _, _) =>
       match obj {
         EIdent(n, _) => if n == name { true } else { true }
-        _ => qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, depth)
+        _ => qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, shadowed, depth)
       }
     EUnary(_, inner, _)
     | EMove(inner, _)
     | EAs(inner, _, _)
     | ENamedArg(_, _, inner, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, inner, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, inner, name, pod_ty, env, shadowed, depth)
     EMutArg(inner, _) =>
       if qbe_mut_place_root(inner) == name {
         false
       } else {
-        qbe_ident_is_flat_pod_consumer_expr(g, inner, name, pod_ty, env, depth)
+        qbe_ident_is_flat_pod_consumer_expr(g, inner, name, pod_ty, env, shadowed, depth)
       }
     EBinary(_, l, r, _) | EIndex(l, r, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, l, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_expr(g, r, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, l, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, r, name, pod_ty, env, shadowed, depth)
     ECall(callee, args, sp) => {
-      if !qbe_ident_is_flat_pod_consumer_expr(g, callee, name, pod_ty, env, depth) {
+      if !qbe_ident_is_flat_pod_consumer_expr(g, callee, name, pod_ty, env, shadowed, depth) {
         return false
       }
       let mut has_direct = false
@@ -22633,7 +22852,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
       if !has_direct {
         i = 0
         while i < args.length() {
-          if !qbe_ident_is_flat_pod_consumer_expr(g, args[i], name, pod_ty, env, depth) {
+          if !qbe_ident_is_flat_pod_consumer_expr(g, args[i], name, pod_ty, env, shadowed, depth) {
             return false
           }
           i = i + 1
@@ -22649,21 +22868,25 @@ fn qbe_ident_is_flat_pod_consumer_expr(
       let mut fn_key = ""
       match callee {
         EIdent(fname, _) => {
-          let is_local_var = if env.length() > 0 {
-            env.contains(fname)
-          } else {
-            match qbe_lookup_local(g, fname) {
-              Some(_) => true
-              None => false
-            }
+          if fname == "Some" || fname == "Ok" || fname == "Err" {
+            return false
           }
+          let is_local_var = shadowed.contains(fname) ||
+            (if env.length() > 0 {
+              env.contains(fname)
+            } else {
+              match qbe_lookup_local(g, fname) {
+                Some(_) => true
+                None => false
+              }
+            })
           if !is_local_var && !g.inline_closures.contains(fname) {
             target_pkg = g.mono_pkg
             fn_key = fname
             target_finfo = if target_pkg == "" {
               g.tc.fns.get(fname)
             } else {
-              match g.tc.imported_pkgs.get(target_pkg) {
+              match lookup_imported_pkg_transitive(g.tc, target_pkg) {
                 Some(ipkg) =>
                   match ipkg.tc.fns.get(fname) {
                     Some(fi) => Some(qualify_fn_info(ipkg, fi))
@@ -22676,9 +22899,12 @@ fn qbe_ident_is_flat_pod_consumer_expr(
         }
         EPath(qual, mem, _) => {
           fn_key = qual + "::" + mem
+          if qbe_epath_is_variant_ctor_in_borrow_ctx(g, qual, mem) {
+            return false
+          }
           if has_qual_sep(qual) {
             let qp = split_qual_name(qual)
-            match resolve_pkg_for_lookup(g.tc, qp.prefix, true) {
+            match qbe_resolve_pkg_in_borrow_ctx(g, qp.prefix) {
               Some(ipkg) =>
                 match ipkg.tc.methods.get(qp.name + "::" + mem) {
                   Some(mi) => {
@@ -22690,38 +22916,26 @@ fn qbe_ident_is_flat_pod_consumer_expr(
                 }
               None => ()
             }
-          }
-          match target_finfo {
-            None =>
-              match resolve_pkg_for_lookup(g.tc, qual, true) {
-                Some(ipkg) =>
-                  match ipkg.tc.fns.get(mem) {
-                    Some(fi) => {
-                      target_finfo = Some(qualify_fn_info(ipkg, fi))
-                      target_pkg = ipkg.name
-                      fn_key = mem
-                    }
-                    None => ()
+          } else {
+            match qbe_resolve_pkg_in_borrow_ctx(g, qual) {
+              Some(ipkg) =>
+                match ipkg.tc.fns.get(mem) {
+                  Some(fi) => {
+                    target_finfo = Some(qualify_fn_info(ipkg, fi))
+                    target_pkg = ipkg.name
+                    fn_key = mem
                   }
-                None => ()
-              }
-            Some(_) => ()
-          }
-          match target_finfo {
-            None =>
-              match qbe_lookup_method_info(g, qual, mem) {
-                Some(minfo) => {
-                  target_finfo = Some(minfo)
-                  let qpm = split_qual_name(qual)
-                  if qpm.prefix != "" {
-                    target_pkg = qpm.prefix
-                  } else if g.mono_pkg != "" {
-                    target_pkg = g.mono_pkg
-                  }
+                  None => ()
                 }
-                None => ()
-              }
-            Some(_) => ()
+              None =>
+                match qbe_lookup_method_in_borrow_ctx(g, qual, mem) {
+                  Some((mpkg, minfo)) => {
+                    target_finfo = Some(minfo)
+                    target_pkg = mpkg
+                  }
+                  None => ()
+                }
+            }
           }
         }
         _ => ()
@@ -22746,7 +22960,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
                   }
                 }
               _ =>
-                if !qbe_ident_is_flat_pod_consumer_expr(g, norm_args[ai], name, pod_ty, env, depth) {
+                if !qbe_ident_is_flat_pod_consumer_expr(g, norm_args[ai], name, pod_ty, env, shadowed, depth) {
                   return false
                 }
             }
@@ -22758,16 +22972,16 @@ fn qbe_ident_is_flat_pod_consumer_expr(
       }
     }
     EMethodCall(obj, mname, args, sp) => {
-      // Special case 1: `arr.push(name)` where `arr` is flat-POD `TArray` of `pod_ty`
+      // Special case 1: `arr.push(name)` where `arr` is flat-POD `TArray` of `pod_ty` (2..=6 fields)
       if mname == "push" && args.length() == 1 {
         match args[0] {
           EIdent(n, _) =>
             if n == name {
-              if !qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, depth) {
+              if !qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, shadowed, depth) {
                 return false
               }
-              return match qbe_probe_ty_with_env(g, obj, env) {
-                Some(TArray(elem)) => qbe_ty_matches_pure_pod_struct(g, elem, pod_ty)
+              return match qbe_probe_ty_with_env(g, obj, env, shadowed) {
+                Some(TArray(elem)) => qbe_ty_matches_flat_pure_pod_struct(g, elem, pod_ty)
                 _ => false
               }
             }
@@ -22789,12 +23003,12 @@ fn qbe_ident_is_flat_pod_consumer_expr(
         i = i + 1
       }
       if !recv_is_name && !arg_has_direct {
-        if !qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, depth) {
+        if !qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, shadowed, depth) {
           return false
         }
         i = 0
         while i < args.length() {
-          if !qbe_ident_is_flat_pod_consumer_expr(g, args[i], name, pod_ty, env, depth) {
+          if !qbe_ident_is_flat_pod_consumer_expr(g, args[i], name, pod_ty, env, shadowed, depth) {
             return false
           }
           i = i + 1
@@ -22805,7 +23019,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
       if mname == "to_string" || qbe_expr_has_assign(obj) || qbe_args_have_assign(args) {
         return false
       }
-      let recv_ty = match qbe_probe_ty_with_env(g, obj, env) {
+      let recv_ty = match qbe_probe_ty_with_env(g, obj, env, shadowed) {
         Some(rt) => subst_ty(rt, g.cur_type_subst)
         None => return false
       }
@@ -22818,8 +23032,8 @@ fn qbe_ident_is_flat_pod_consumer_expr(
           }
         _ => return false
       }
-      match qbe_lookup_method_info(g, sname, mname) {
-        Some(minfo) => {
+      match qbe_lookup_method_in_borrow_ctx(g, sname, mname) {
+        Some((mpkg, minfo)) => {
           if minfo.decl.type_params.length() != 0 {
             return false
           }
@@ -22828,14 +23042,12 @@ fn qbe_ident_is_flat_pod_consumer_expr(
             qbe_args_have_assign(norm_args) {
             return false
           }
-          let qpm = split_qual_name(sname)
-          let mpkg = if qpm.prefix != "" { qpm.prefix } else { g.mono_pkg }
           let mkey = sname + "::" + mname
           if recv_is_name {
             if !qbe_fn_param_is_pod_borrow(g, mpkg, mkey, minfo, 0, depth) {
               return false
             }
-          } else if !qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, depth) {
+          } else if !qbe_ident_is_flat_pod_consumer_expr(g, obj, name, pod_ty, env, shadowed, depth) {
             return false
           }
           let mut ai = 0
@@ -22848,7 +23060,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
                   }
                 }
               _ =>
-                if !qbe_ident_is_flat_pod_consumer_expr(g, norm_args[ai], name, pod_ty, env, depth) {
+                if !qbe_ident_is_flat_pod_consumer_expr(g, norm_args[ai], name, pod_ty, env, shadowed, depth) {
                   return false
                 }
             }
@@ -22862,7 +23074,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
     EArrayLit(elems, _) | ETuple(elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        if !qbe_ident_is_flat_pod_consumer_expr(g, elems[i], name, pod_ty, env, depth) {
+        if !qbe_ident_is_flat_pod_consumer_expr(g, elems[i], name, pod_ty, env, shadowed, depth) {
           return false
         }
         i = i + 1
@@ -22872,14 +23084,14 @@ fn qbe_ident_is_flat_pod_consumer_expr(
     EStructLit(_, spread_opt, fields, _) => {
       match spread_opt {
         Some(b) =>
-          if !qbe_ident_is_flat_pod_consumer_expr(g, b, name, pod_ty, env, depth) {
+          if !qbe_ident_is_flat_pod_consumer_expr(g, b, name, pod_ty, env, shadowed, depth) {
             return false
           }
         None => ()
       }
       let mut i = 0
       while i < fields.length() {
-        if !qbe_ident_is_flat_pod_consumer_expr(g, fields[i].value, name, pod_ty, env, depth) {
+        if !qbe_ident_is_flat_pod_consumer_expr(g, fields[i].value, name, pod_ty, env, shadowed, depth) {
           return false
         }
         i = i + 1
@@ -22887,21 +23099,21 @@ fn qbe_ident_is_flat_pod_consumer_expr(
       true
     }
     EBlock(stmts, _) =>
-      qbe_ident_is_flat_pod_consumer_stmts(g, stmts, 0, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_stmts(g, stmts, 0, name, pod_ty, env, shadowed, depth)
     EIf(cond, then_stmts, else_opt, _) => {
-      if !qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, depth) ||
-        !qbe_ident_is_flat_pod_consumer_stmts(g, then_stmts, 0, name, pod_ty, env, depth) {
+      if !qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, shadowed, depth) ||
+        !qbe_ident_is_flat_pod_consumer_stmts(g, then_stmts, 0, name, pod_ty, env, shadowed, depth) {
         return false
       }
       match else_opt {
         None => true
-        Some(el) => qbe_ident_is_flat_pod_consumer_expr(g, el, name, pod_ty, env, depth)
+        Some(el) => qbe_ident_is_flat_pod_consumer_expr(g, el, name, pod_ty, env, shadowed, depth)
       }
     }
     EIs(scrut, _, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, scrut, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, scrut, name, pod_ty, env, shadowed, depth)
     EMatch(scrut, arms, _) => {
-      if !qbe_ident_is_flat_pod_consumer_expr(g, scrut, name, pod_ty, env, depth) {
+      if !qbe_ident_is_flat_pod_consumer_expr(g, scrut, name, pod_ty, env, shadowed, depth) {
         return false
       }
       let mut i = 0
@@ -22909,12 +23121,12 @@ fn qbe_ident_is_flat_pod_consumer_expr(
         if !qbe_pat_binds_name(arms[i].pat, name) {
           match arms[i].guard_expr {
             Some(ge) =>
-              if !qbe_ident_is_flat_pod_consumer_expr(g, ge, name, pod_ty, env, depth) {
+              if !qbe_ident_is_flat_pod_consumer_expr(g, ge, name, pod_ty, env, shadowed, depth) {
                 return false
               }
             None => ()
           }
-          if !qbe_ident_is_flat_pod_consumer_expr(g, arms[i].body, name, pod_ty, env, depth) {
+          if !qbe_ident_is_flat_pod_consumer_expr(g, arms[i].body, name, pod_ty, env, shadowed, depth) {
             return false
           }
         }
@@ -22923,7 +23135,7 @@ fn qbe_ident_is_flat_pod_consumer_expr(
       true
     }
     ETry(inner, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, inner, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, inner, name, pod_ty, env, shadowed, depth)
     EClosure(_, _, _, _)
     | EScope(_, _, _)
     | ESpawn(_, _, _)
@@ -22939,58 +23151,59 @@ fn qbe_ident_is_flat_pod_consumer_stmt(
   name : String,
   pod_ty : Ty,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
   depth : Int,
 ) -> Bool {
   match s {
     SLet(_, _, _, init, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, init, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, init, name, pod_ty, env, shadowed, depth)
     SLetTuple(_, _, init, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, init, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, init, name, pod_ty, env, shadowed, depth)
     SAssign(EIndex(arr_obj, idx_e, _), EIdent(n, _), _) =>
       if n == name {
-        if !qbe_ident_is_flat_pod_consumer_expr(g, arr_obj, name, pod_ty, env, depth) ||
-          !qbe_ident_is_flat_pod_consumer_expr(g, idx_e, name, pod_ty, env, depth) {
+        if !qbe_ident_is_flat_pod_consumer_expr(g, arr_obj, name, pod_ty, env, shadowed, depth) ||
+          !qbe_ident_is_flat_pod_consumer_expr(g, idx_e, name, pod_ty, env, shadowed, depth) {
           return false
         }
-        match qbe_probe_ty_with_env(g, arr_obj, env) {
+        match qbe_probe_ty_with_env(g, arr_obj, env, shadowed) {
           Some(TArray(elem)) | Some(TFixedArray(elem)) =>
-            qbe_ty_matches_pure_pod_struct(g, elem, pod_ty)
+            qbe_ty_matches_flat_pure_pod_struct(g, elem, pod_ty)
           _ => false
         }
       } else {
-        qbe_ident_is_flat_pod_consumer_expr(g, arr_obj, name, pod_ty, env, depth) &&
-        qbe_ident_is_flat_pod_consumer_expr(g, idx_e, name, pod_ty, env, depth)
+        qbe_ident_is_flat_pod_consumer_expr(g, arr_obj, name, pod_ty, env, shadowed, depth) &&
+        qbe_ident_is_flat_pod_consumer_expr(g, idx_e, name, pod_ty, env, shadowed, depth)
       }
     SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, lhs, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_expr(g, rhs, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, lhs, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, rhs, name, pod_ty, env, shadowed, depth)
     SWhile(cond, body, _) | SGuard(cond, body, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, shadowed, depth)
     SFor(init_s, cond, step_s, body, _) =>
-      qbe_ident_is_flat_pod_consumer_stmt(g, init_s, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_stmt(g, step_s, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_stmt(g, init_s, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_stmt(g, step_s, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, shadowed, depth)
     SForRange(vname, start_e, end_e, _, body, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, start_e, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_expr(g, end_e, name, pod_ty, env, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, start_e, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, end_e, name, pod_ty, env, shadowed, depth) &&
       (vname == name ||
-        qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, depth))
+        qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, shadowed, depth))
     SForIn(_, vname, iter_e, body, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, iter_e, name, pod_ty, env, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, iter_e, name, pod_ty, env, shadowed, depth) &&
       (vname == name ||
-        qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, depth))
+        qbe_ident_is_flat_pod_consumer_stmts(g, body, 0, name, pod_ty, env, shadowed, depth))
     SReturn(opt, _) =>
       match opt {
         None => true
-        Some(e) => qbe_ident_is_flat_pod_consumer_expr(g, e, name, pod_ty, env, depth)
+        Some(e) => qbe_ident_is_flat_pod_consumer_expr(g, e, name, pod_ty, env, shadowed, depth)
       }
     SExpr(e, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, e, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, e, name, pod_ty, env, shadowed, depth)
     SDebugAssert(cond, msg, _) =>
-      qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, depth) &&
-      qbe_ident_is_flat_pod_consumer_expr(g, msg, name, pod_ty, env, depth)
+      qbe_ident_is_flat_pod_consumer_expr(g, cond, name, pod_ty, env, shadowed, depth) &&
+      qbe_ident_is_flat_pod_consumer_expr(g, msg, name, pod_ty, env, shadowed, depth)
     SBreak(_) | SContinue(_) => true
   }
 }
@@ -23003,11 +23216,12 @@ fn qbe_ident_is_flat_pod_consumer_stmts(
   name : String,
   pod_ty : Ty,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
   depth : Int,
 ) -> Bool {
   let mut i = start
   while i < stmts.length() {
-    if !qbe_ident_is_flat_pod_consumer_stmt(g, stmts[i], name, pod_ty, env, depth) {
+    if !qbe_ident_is_flat_pod_consumer_stmt(g, stmts[i], name, pod_ty, env, shadowed, depth) {
       return false
     }
     match stmts[i] {
@@ -23034,7 +23248,7 @@ fn qbe_ident_is_flat_pod_consumer_stmts(
 fn qbe_fn_param_is_view_borrow(
   g : QbeGen,
   target_pkg : String,
-  fn_key : String,
+  _fn_key : String,
   finfo : FnInfo,
   param_idx : Int,
   depth : Int,
@@ -23042,7 +23256,7 @@ fn qbe_fn_param_is_view_borrow(
   if depth > 2 {
     return false
   }
-  let ckey = "vb::" + target_pkg + "::" + fn_key + "#" + param_idx.to_string()
+  let ckey = qbe_borrow_cache_key("vb", target_pkg, finfo, param_idx)
   match g.pod_borrow_cache.get(ckey) {
     Some(v) => return v
     None => ()
@@ -23133,6 +23347,7 @@ fn qbe_fn_param_is_view_borrow(
     param_name,
     param_ty,
     penv,
+    body_locals,
     depth + 1,
   )
   g.mono_pkg = saved_mono_pkg
@@ -23150,6 +23365,7 @@ fn qbe_ident_is_view_consumer_expr(
   name : String,
   view_ty : Ty,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
   depth : Int,
 ) -> Bool {
   match e {
@@ -23167,17 +23383,17 @@ fn qbe_ident_is_view_consumer_expr(
     | EUnit(_) => true
     EIdent(n, _) => n != name
     EField(obj, _, _) =>
-      qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, shadowed, depth)
     EUnary(_, inner, _)
     | EMove(inner, _)
     | EAs(inner, _, _)
     | ENamedArg(_, _, inner, _) =>
-      qbe_ident_is_view_consumer_expr(g, inner, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, inner, name, view_ty, env, shadowed, depth)
     EMutArg(inner, _) =>
       if qbe_mut_place_root(inner) == name {
         false
       } else {
-        qbe_ident_is_view_consumer_expr(g, inner, name, view_ty, env, depth)
+        qbe_ident_is_view_consumer_expr(g, inner, name, view_ty, env, shadowed, depth)
       }
     EIndex(obj, idx, _) => {
       let obj_ok = match obj {
@@ -23187,27 +23403,27 @@ fn qbe_ident_is_view_consumer_expr(
           } else {
             true
           }
-        _ => qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, depth)
+        _ => qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, shadowed, depth)
       }
-      obj_ok && qbe_ident_is_view_consumer_expr(g, idx, name, view_ty, env, depth)
+      obj_ok && qbe_ident_is_view_consumer_expr(g, idx, name, view_ty, env, shadowed, depth)
     }
     EBinary(op, l, r, _) => {
       if (op == "==" || op == "!=") && !qbe_expr_has_assign(l) && !qbe_expr_has_assign(r) {
         let l_ok = match l {
           EIdent(n, _) => if n == name { true } else { true }
-          _ => qbe_ident_is_view_consumer_expr(g, l, name, view_ty, env, depth)
+          _ => qbe_ident_is_view_consumer_expr(g, l, name, view_ty, env, shadowed, depth)
         }
         let r_ok = match r {
           EIdent(n, _) => if n == name { true } else { true }
-          _ => qbe_ident_is_view_consumer_expr(g, r, name, view_ty, env, depth)
+          _ => qbe_ident_is_view_consumer_expr(g, r, name, view_ty, env, shadowed, depth)
         }
         return l_ok && r_ok
       }
-      qbe_ident_is_view_consumer_expr(g, l, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_expr(g, r, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, l, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_expr(g, r, name, view_ty, env, shadowed, depth)
     }
     ECall(callee, args, sp) => {
-      if !qbe_ident_is_view_consumer_expr(g, callee, name, view_ty, env, depth) {
+      if !qbe_ident_is_view_consumer_expr(g, callee, name, view_ty, env, shadowed, depth) {
         return false
       }
       let mut has_direct = false
@@ -23223,7 +23439,7 @@ fn qbe_ident_is_view_consumer_expr(
       if !has_direct {
         i = 0
         while i < args.length() {
-          if !qbe_ident_is_view_consumer_expr(g, args[i], name, view_ty, env, depth) {
+          if !qbe_ident_is_view_consumer_expr(g, args[i], name, view_ty, env, shadowed, depth) {
             return false
           }
           i = i + 1
@@ -23238,21 +23454,25 @@ fn qbe_ident_is_view_consumer_expr(
       let mut fn_key = ""
       match callee {
         EIdent(fname, _) => {
-          let is_local_var = if env.length() > 0 {
-            env.contains(fname)
-          } else {
-            match qbe_lookup_local(g, fname) {
-              Some(_) => true
-              None => false
-            }
+          if fname == "Some" || fname == "Ok" || fname == "Err" {
+            return false
           }
+          let is_local_var = shadowed.contains(fname) ||
+            (if env.length() > 0 {
+              env.contains(fname)
+            } else {
+              match qbe_lookup_local(g, fname) {
+                Some(_) => true
+                None => false
+              }
+            })
           if !is_local_var && !g.inline_closures.contains(fname) {
             target_pkg = g.mono_pkg
             fn_key = fname
             target_finfo = if target_pkg == "" {
               g.tc.fns.get(fname)
             } else {
-              match g.tc.imported_pkgs.get(target_pkg) {
+              match lookup_imported_pkg_transitive(g.tc, target_pkg) {
                 Some(ipkg) =>
                   match ipkg.tc.fns.get(fname) {
                     Some(fi) => Some(qualify_fn_info(ipkg, fi))
@@ -23265,9 +23485,12 @@ fn qbe_ident_is_view_consumer_expr(
         }
         EPath(qual, mem, _) => {
           fn_key = qual + "::" + mem
+          if qbe_epath_is_variant_ctor_in_borrow_ctx(g, qual, mem) {
+            return false
+          }
           if has_qual_sep(qual) {
             let qp = split_qual_name(qual)
-            match resolve_pkg_for_lookup(g.tc, qp.prefix, true) {
+            match qbe_resolve_pkg_in_borrow_ctx(g, qp.prefix) {
               Some(ipkg) =>
                 match ipkg.tc.methods.get(qp.name + "::" + mem) {
                   Some(mi) => {
@@ -23279,38 +23502,26 @@ fn qbe_ident_is_view_consumer_expr(
                 }
               None => ()
             }
-          }
-          match target_finfo {
-            None =>
-              match resolve_pkg_for_lookup(g.tc, qual, true) {
-                Some(ipkg) =>
-                  match ipkg.tc.fns.get(mem) {
-                    Some(fi) => {
-                      target_finfo = Some(qualify_fn_info(ipkg, fi))
-                      target_pkg = ipkg.name
-                      fn_key = mem
-                    }
-                    None => ()
+          } else {
+            match qbe_resolve_pkg_in_borrow_ctx(g, qual) {
+              Some(ipkg) =>
+                match ipkg.tc.fns.get(mem) {
+                  Some(fi) => {
+                    target_finfo = Some(qualify_fn_info(ipkg, fi))
+                    target_pkg = ipkg.name
+                    fn_key = mem
                   }
-                None => ()
-              }
-            Some(_) => ()
-          }
-          match target_finfo {
-            None =>
-              match qbe_lookup_method_info(g, qual, mem) {
-                Some(minfo) => {
-                  target_finfo = Some(minfo)
-                  let qpm = split_qual_name(qual)
-                  if qpm.prefix != "" {
-                    target_pkg = qpm.prefix
-                  } else if g.mono_pkg != "" {
-                    target_pkg = g.mono_pkg
-                  }
+                  None => ()
                 }
-                None => ()
-              }
-            Some(_) => ()
+              None =>
+                match qbe_lookup_method_in_borrow_ctx(g, qual, mem) {
+                  Some((mpkg, minfo)) => {
+                    target_finfo = Some(minfo)
+                    target_pkg = mpkg
+                  }
+                  None => ()
+                }
+            }
           }
         }
         _ => ()
@@ -23335,7 +23546,7 @@ fn qbe_ident_is_view_consumer_expr(
                   }
                 }
               _ =>
-                if !qbe_ident_is_view_consumer_expr(g, norm_args[ai], name, view_ty, env, depth) {
+                if !qbe_ident_is_view_consumer_expr(g, norm_args[ai], name, view_ty, env, shadowed, depth) {
                   return false
                 }
             }
@@ -23370,7 +23581,7 @@ fn qbe_ident_is_view_consumer_expr(
         }
         let mut i = 0
         while i < args.length() {
-          if !qbe_ident_is_view_consumer_expr(g, args[i], name, view_ty, env, depth) {
+          if !qbe_ident_is_view_consumer_expr(g, args[i], name, view_ty, env, shadowed, depth) {
             return false
           }
           i = i + 1
@@ -23388,12 +23599,12 @@ fn qbe_ident_is_view_consumer_expr(
         i = i + 1
       }
       if !arg_has_direct {
-        if !qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, depth) {
+        if !qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, shadowed, depth) {
           return false
         }
         i = 0
         while i < args.length() {
-          if !qbe_ident_is_view_consumer_expr(g, args[i], name, view_ty, env, depth) {
+          if !qbe_ident_is_view_consumer_expr(g, args[i], name, view_ty, env, shadowed, depth) {
             return false
           }
           i = i + 1
@@ -23403,7 +23614,7 @@ fn qbe_ident_is_view_consumer_expr(
       if mname == "to_string" || qbe_expr_has_assign(obj) || qbe_args_have_assign(args) {
         return false
       }
-      let recv_ty = match qbe_probe_ty_with_env(g, obj, env) {
+      let recv_ty = match qbe_probe_ty_with_env(g, obj, env, shadowed) {
         Some(rt) => subst_ty(rt, g.cur_type_subst)
         None => return false
       }
@@ -23416,8 +23627,8 @@ fn qbe_ident_is_view_consumer_expr(
           }
         _ => return false
       }
-      match qbe_lookup_method_info(g, sname, mname) {
-        Some(minfo) => {
+      match qbe_lookup_method_in_borrow_ctx(g, sname, mname) {
+        Some((mpkg, minfo)) => {
           if minfo.decl.type_params.length() != 0 {
             return false
           }
@@ -23426,11 +23637,9 @@ fn qbe_ident_is_view_consumer_expr(
             qbe_args_have_assign(norm_args) {
             return false
           }
-          if !qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, depth) {
+          if !qbe_ident_is_view_consumer_expr(g, obj, name, view_ty, env, shadowed, depth) {
             return false
           }
-          let qpm = split_qual_name(sname)
-          let mpkg = if qpm.prefix != "" { qpm.prefix } else { g.mono_pkg }
           let mkey = sname + "::" + mname
           let mut ai = 0
           while ai < norm_args.length() {
@@ -23442,7 +23651,7 @@ fn qbe_ident_is_view_consumer_expr(
                   }
                 }
               _ =>
-                if !qbe_ident_is_view_consumer_expr(g, norm_args[ai], name, view_ty, env, depth) {
+                if !qbe_ident_is_view_consumer_expr(g, norm_args[ai], name, view_ty, env, shadowed, depth) {
                   return false
                 }
             }
@@ -23456,7 +23665,7 @@ fn qbe_ident_is_view_consumer_expr(
     EArrayLit(elems, _) | ETuple(elems, _) => {
       let mut i = 0
       while i < elems.length() {
-        if !qbe_ident_is_view_consumer_expr(g, elems[i], name, view_ty, env, depth) {
+        if !qbe_ident_is_view_consumer_expr(g, elems[i], name, view_ty, env, shadowed, depth) {
           return false
         }
         i = i + 1
@@ -23466,14 +23675,14 @@ fn qbe_ident_is_view_consumer_expr(
     EStructLit(_, spread_opt, fields, _) => {
       match spread_opt {
         Some(b) =>
-          if !qbe_ident_is_view_consumer_expr(g, b, name, view_ty, env, depth) {
+          if !qbe_ident_is_view_consumer_expr(g, b, name, view_ty, env, shadowed, depth) {
             return false
           }
         None => ()
       }
       let mut i = 0
       while i < fields.length() {
-        if !qbe_ident_is_view_consumer_expr(g, fields[i].value, name, view_ty, env, depth) {
+        if !qbe_ident_is_view_consumer_expr(g, fields[i].value, name, view_ty, env, shadowed, depth) {
           return false
         }
         i = i + 1
@@ -23481,21 +23690,21 @@ fn qbe_ident_is_view_consumer_expr(
       true
     }
     EBlock(stmts, _) =>
-      qbe_ident_is_view_consumer_stmts(g, stmts, 0, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_stmts(g, stmts, 0, name, view_ty, env, shadowed, depth)
     EIf(cond, then_stmts, else_opt, _) => {
-      if !qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, depth) ||
-        !qbe_ident_is_view_consumer_stmts(g, then_stmts, 0, name, view_ty, env, depth) {
+      if !qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, shadowed, depth) ||
+        !qbe_ident_is_view_consumer_stmts(g, then_stmts, 0, name, view_ty, env, shadowed, depth) {
         return false
       }
       match else_opt {
         None => true
-        Some(el) => qbe_ident_is_view_consumer_expr(g, el, name, view_ty, env, depth)
+        Some(el) => qbe_ident_is_view_consumer_expr(g, el, name, view_ty, env, shadowed, depth)
       }
     }
     EIs(scrut, _, _) =>
-      qbe_ident_is_view_consumer_expr(g, scrut, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, scrut, name, view_ty, env, shadowed, depth)
     EMatch(scrut, arms, _) => {
-      if !qbe_ident_is_view_consumer_expr(g, scrut, name, view_ty, env, depth) {
+      if !qbe_ident_is_view_consumer_expr(g, scrut, name, view_ty, env, shadowed, depth) {
         return false
       }
       let mut i = 0
@@ -23503,12 +23712,12 @@ fn qbe_ident_is_view_consumer_expr(
         if !qbe_pat_binds_name(arms[i].pat, name) {
           match arms[i].guard_expr {
             Some(ge) =>
-              if !qbe_ident_is_view_consumer_expr(g, ge, name, view_ty, env, depth) {
+              if !qbe_ident_is_view_consumer_expr(g, ge, name, view_ty, env, shadowed, depth) {
                 return false
               }
             None => ()
           }
-          if !qbe_ident_is_view_consumer_expr(g, arms[i].body, name, view_ty, env, depth) {
+          if !qbe_ident_is_view_consumer_expr(g, arms[i].body, name, view_ty, env, shadowed, depth) {
             return false
           }
         }
@@ -23517,7 +23726,7 @@ fn qbe_ident_is_view_consumer_expr(
       true
     }
     ETry(inner, _) =>
-      qbe_ident_is_view_consumer_expr(g, inner, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, inner, name, view_ty, env, shadowed, depth)
     EClosure(_, _, _, _)
     | EScope(_, _, _)
     | ESpawn(_, _, _)
@@ -23533,33 +23742,34 @@ fn qbe_ident_is_view_consumer_stmt(
   name : String,
   view_ty : Ty,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
   depth : Int,
 ) -> Bool {
   match s {
     SLet(_, _, _, init, _) =>
-      qbe_ident_is_view_consumer_expr(g, init, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, init, name, view_ty, env, shadowed, depth)
     SLetTuple(_, _, init, _) =>
-      qbe_ident_is_view_consumer_expr(g, init, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, init, name, view_ty, env, shadowed, depth)
     SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
-      qbe_ident_is_view_consumer_expr(g, lhs, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_expr(g, rhs, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, lhs, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_expr(g, rhs, name, view_ty, env, shadowed, depth)
     SWhile(cond, body, _) | SGuard(cond, body, _) =>
-      qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, shadowed, depth)
     SFor(init_s, cond, step_s, body, _) =>
-      qbe_ident_is_view_consumer_stmt(g, init_s, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_stmt(g, step_s, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_stmt(g, init_s, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_stmt(g, step_s, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, shadowed, depth)
     SForRange(vname, start_e, end_e, _, body, _) =>
-      qbe_ident_is_view_consumer_expr(g, start_e, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_expr(g, end_e, name, view_ty, env, depth) &&
+      qbe_ident_is_view_consumer_expr(g, start_e, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_expr(g, end_e, name, view_ty, env, shadowed, depth) &&
       (vname == name ||
-        qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, depth))
+        qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, shadowed, depth))
     SForIn(_, vname, iter_e, body, _) =>
-      qbe_ident_is_view_consumer_expr(g, iter_e, name, view_ty, env, depth) &&
+      qbe_ident_is_view_consumer_expr(g, iter_e, name, view_ty, env, shadowed, depth) &&
       (vname == name ||
-        qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, depth))
+        qbe_ident_is_view_consumer_stmts(g, body, 0, name, view_ty, env, shadowed, depth))
     SReturn(opt, _) =>
       match opt {
         None => true
@@ -23584,14 +23794,14 @@ fn qbe_ident_is_view_consumer_stmt(
               _ => ()
             }
           }
-          qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, depth)
+          qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, shadowed, depth)
         }
       }
     SExpr(e, _) =>
-      qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, e, name, view_ty, env, shadowed, depth)
     SDebugAssert(cond, msg, _) =>
-      qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, depth) &&
-      qbe_ident_is_view_consumer_expr(g, msg, name, view_ty, env, depth)
+      qbe_ident_is_view_consumer_expr(g, cond, name, view_ty, env, shadowed, depth) &&
+      qbe_ident_is_view_consumer_expr(g, msg, name, view_ty, env, shadowed, depth)
     SBreak(_) | SContinue(_) => true
   }
 }
@@ -23604,11 +23814,12 @@ fn qbe_ident_is_view_consumer_stmts(
   name : String,
   view_ty : Ty,
   env : Map[String, Ty],
+  shadowed : Map[String, Bool],
   depth : Int,
 ) -> Bool {
   let mut i = start
   while i < stmts.length() {
-    if !qbe_ident_is_view_consumer_stmt(g, stmts[i], name, view_ty, env, depth) {
+    if !qbe_ident_is_view_consumer_stmt(g, stmts[i], name, view_ty, env, shadowed, depth) {
       return false
     }
     match stmts[i] {
@@ -24900,7 +25111,8 @@ fn qbe_try_emit_stack_view_let(
     }
     sj = sj + 1
   }
-  if !qbe_ident_is_view_consumer_stmts(g, stmts, idx + 1, bname, view_ty, Map([]), 0) {
+  let future_locals = qbe_collect_future_local_bind_names(stmts, idx + 1, bname)
+  if !qbe_ident_is_view_consumer_stmts(g, stmts, idx + 1, bname, view_ty, Map([]), future_locals, 0) {
     return ""
   }
   let stk = qbe_emit_stack_view_expr(g, init)
@@ -37761,7 +37973,11 @@ fn qbe_emit_expr_inner(
                 if can_borrow && minfo.decl.type_params.length() == 0 {
                   match qbe_view_expr_root_info(g, norm_args[i]) {
                     Some((_, vty)) => {
-                      let vkey = if target_pkg != "" { mem } else { qual + "::" + mem }
+                      let vkey = if minfo.decl.receiver_type != "" {
+                        minfo.decl.receiver_type + "::" + minfo.decl.name
+                      } else {
+                        minfo.decl.name
+                      }
                       if qbe_fn_param_is_view_borrow(g, target_pkg, vkey, minfo, i, 0) {
                         let stk = qbe_emit_stack_view_expr(g, norm_args[i])
                         aa = QbeArgVal::{ qv: qval(stk, vty), borrowed: true }
@@ -41245,6 +41461,7 @@ fn qbe_try_emit_stack_pod_let(
         None => return false
       }
   }
+  let future_locals = qbe_collect_future_local_bind_names(stmts, idx + 1, bname)
   if !qbe_ident_is_flat_pod_consumer_stmts(
     g,
     stmts,
@@ -41252,6 +41469,7 @@ fn qbe_try_emit_stack_pod_let(
     bname,
     final_ty,
     Map([]),
+    future_locals,
     0,
   ) {
     return false
