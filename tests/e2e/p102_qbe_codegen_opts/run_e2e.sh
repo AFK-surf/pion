@@ -1,5 +1,5 @@
 #!/bin/sh
-# P102: Regression test for the 9 Lean-verified QBE backend codegen optimizations:
+# P102: Regression test for the 11 Lean-verified QBE backend codegen optimizations:
 #   1. x86-64 cmp $0, %r -> test %r, %r
 #   2. x86-64 Kl shl $1/$2/$3 folded into SIB scale 2/4/8 (+ disp32 overflow & CAddr guards)
 #   3. x86-64 intra-function short branch rel8 relaxation + reloc shift + >127B long fallback
@@ -9,6 +9,8 @@
 #   7. x86-64 cross-BB SIB index reconstruction (rematindex) + dead shift elimination
 #   8. x86-64 short-branch rel8 layout solver with 16-byte loop alignment (relaxloops)
 #   9. x86-64 adjacent single-use integer load folding into cmp (foldcompareloads) + safety guards
+#  10. x86-64 `copy 0` -> xor %r32, %r32 when intrablock FLAGS are dead (kept as mov $0 when live)
+#  11. x86-64 three-address integer add -> lea (reg+reg, reg+disp32, Kw, %r12/%r13) when FLAGS are dead
 set -eu
 
 PIONC="${1:-}"
@@ -346,6 +348,141 @@ export function l $opt9_memcmp_guards(l %p64, l %p32) {
   %out =l add %sl, %m
   ret %out
 }
+
+# Opt 10A: zero arguments (incl. %r8/%r9, Kl and Kw) become xor %r32, %r32: the call kills FLAGS
+export function l $mix6(l %a, l %b, l %c, l %d, l %e, l %f) {
+@start
+  %b1 =l mul %b, 10
+  %c1 =l mul %c, 100
+  %d1 =l mul %d, 1000
+  %e1 =l mul %e, 10000
+  %f1 =l mul %f, 100000
+  %s1 =l add %a, %b1
+  %s2 =l add %s1, %c1
+  %s3 =l add %s2, %d1
+  %s4 =l add %s3, %e1
+  %s5 =l add %s4, %f1
+  ret %s5
+}
+
+export function l $mix6w(w %a, w %b, w %c, w %d, w %e, w %f) {
+@start
+  %al =l extuw %a
+  %bl =l extuw %b
+  %cl =l extuw %c
+  %dl =l extuw %d
+  %el =l extuw %e
+  %fl =l extuw %f
+  %r =l call $mix6(l %al, l %bl, l %cl, l %dl, l %el, l %fl)
+  ret %r
+}
+
+export function l $opt10_zero_args(l %a, l %b, l %c, l %d, l %e, l %f) {
+@start
+  %r =l call $mix6(l 0, l %a, l 0, l %b, l 0, l 0)
+  ret %r
+}
+
+export function l $opt10_zero_args_w(l %a, l %b, l %c, l %d, l %e, l %f) {
+@start
+  %r =l call $mix6w(w %f, w 0, w %e, w 0, w 0, w 0)
+  ret %r
+}
+
+# Opt 10B: FLAGS live between the compare and cmov: the materialised 0 must stay mov $0
+export function l $opt10_zero_flags(l %a, l %b, l %x) {
+@start
+  %c =w csltl %a, %b
+  jnz %c, @t, @f
+@t
+  jmp @j
+@f
+  jmp @j
+@j
+  %r =l phi @t %x, @f 0
+  ret %r
+}
+
+# Opt 11A: Kl reg+reg and reg+imm32 three-address adds (operands stay live) -> lea
+export function l $opt11_lea(l %a, l %b) {
+@start
+  %s =l add %a, %b
+  %t =l add %a, 100000
+  %u =l xor %s, %t
+  %v =l sub %u, %a
+  %w =l sub %v, %b
+  ret %w
+}
+
+# Opt 11B: Kw adds -> 32-bit lea (low 32 bits only, upper input garbage ignored;
+# imm 4294967295 is -1 in 32 bits)
+export function w $opt11_lea_w(l %x, l %y) {
+@start
+  %s =w add %x, %y
+  %t =w add %x, 4294967295
+  %u =w xor %s, %t
+  %v =w sub %u, %y
+  %w =w sub %v, %x
+  ret %w
+}
+
+# Opt 11C: values living across a call sit in %rbx/%r12..%r15: lea with %r12 (SIB base)
+# and %r13 (mod=01 disp8 base) must encode exactly
+export function l $opt11_lea_callee(l %p) {
+@start
+  %p1 =l add %p, 8
+  %p2 =l add %p, 16
+  %p3 =l add %p, 24
+  %p4 =l add %p, 32
+  %a =l loadl %p
+  %b =l loadl %p1
+  %c =l loadl %p2
+  %d =l loadl %p3
+  %e =l loadl %p4
+  %h =l call $helper(l %a)
+  %s1 =l add %a, %b
+  %s2 =l add %b, %c
+  %s3 =l add %c, %d
+  %s4 =l add %d, %e
+  %s5 =l add %e, %a
+  %s6 =l add %b, %d
+  %s7 =l add %c, %e
+  %s8 =l add %a, %c
+  %s9 =l add %d, 1000
+  %s10 =l add %e, -77
+  %x1 =l xor %s1, %s2
+  %x2 =l xor %x1, %s3
+  %x3 =l xor %x2, %s4
+  %x4 =l xor %x3, %s5
+  %x5 =l xor %x4, %s6
+  %x6 =l xor %x5, %s7
+  %x7 =l xor %x6, %s8
+  %x8 =l xor %x7, %s9
+  %x9 =l xor %x8, %s10
+  %y1 =l sub %x9, %a
+  %y2 =l sub %y1, %b
+  %y3 =l sub %y2, %c
+  %y4 =l sub %y3, %d
+  %y5 =l sub %y4, %e
+  %y6 =l sub %y5, %h
+  ret %y6
+}
+
+# Opt 11D: Kw add whose ZF feeds jnz directly (no test): FLAGS live -> must stay add
+export function l $opt11_lea_flags(w %x, w %y) {
+@start
+  %s =w add %x, %y
+  jnz %s, @nz, @z
+@nz
+  %q =w sub %x, %y
+  %ql =l extuw %q
+  ret %ql
+@z
+  %p =w xor %x, %y
+  %pl =l extuw %p
+  %r =l add %pl, 1000000
+  ret %r
+}
 EOF
 
 # Opt 2 regression C: 300 live cross-call values pushing stack frame past 1024B
@@ -410,6 +547,13 @@ extern int32_t opt9_memcmp_sib(const int64_t *p64, int64_t idx, int64_t key64);
 extern int32_t opt9_memcmp_zero(const int64_t *p64);
 extern int32_t opt9_memcmp_imm(const int64_t *p64);
 extern int64_t opt9_memcmp_guards(int64_t *p64, const int32_t *p32);
+extern int64_t opt10_zero_args(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f);
+extern int64_t opt10_zero_args_w(int64_t a, int64_t b, int64_t c, int64_t d, int64_t e, int64_t f);
+extern int64_t opt10_zero_flags(int64_t a, int64_t b, int64_t x);
+extern int64_t opt11_lea(int64_t a, int64_t b);
+extern uint32_t opt11_lea_w(uint64_t x, uint64_t y);
+extern int64_t opt11_lea_callee(const int64_t *p);
+extern int64_t opt11_lea_flags(uint32_t x, uint32_t y);
 
 int main(void) {
     /* Opt 1: test zero, positive, negative, INT64_MIN, INT32_MIN */
@@ -519,6 +663,50 @@ int main(void) {
     if (r9g != 3 + 9999 || g64 != 9999) {
         fprintf(stderr, "opt9_guards got %lld (g64=%lld)\n", (long long)r9g, (long long)g64);
         return 1;
+    }
+
+    /* Opt 10: zero idiom (incoming argument registers hold garbage that must be zeroed) */
+    if (opt10_zero_args(3, 4, 91, 92, 93, 94) != 3 * 10 + 4 * 1000) {
+        fprintf(stderr, "opt10_zero_args got %lld\n", (long long)opt10_zero_args(3, 4, 91, 92, 93, 94)); return 1;
+    }
+    if (opt10_zero_args_w(91, 92, 93, 94, 5, 6) != 6 + 5 * 100) {
+        fprintf(stderr, "opt10_zero_args_w got %lld\n", (long long)opt10_zero_args_w(91, 92, 93, 94, 5, 6)); return 1;
+    }
+    if (opt10_zero_flags(1, 2, 77) != 77 || opt10_zero_flags(2, 1, 77) != 0
+    || opt10_zero_flags(-5, -5, 77) != 0 || opt10_zero_flags(INT64_MIN, 0, 9) != 9) {
+        fprintf(stderr, "opt10_zero_flags failed\n"); return 1;
+    }
+
+    /* Opt 11: three-address lea */
+    {
+        int64_t la[4] = {0, 123456789, -987654321, INT64_MAX};
+        int64_t lb[4] = {0, -42, 5, 1};
+        for (int k = 0; k < 4; k++) {
+            uint64_t a = (uint64_t)la[k], b = (uint64_t)lb[k];
+            int64_t exp = (int64_t)((((a + b) ^ (a + 100000u)) - a) - b);
+            if (opt11_lea(la[k], lb[k]) != exp) { fprintf(stderr, "opt11_lea(%d) failed\n", k); return 1; }
+        }
+        uint64_t wx[3] = {0x180000000ULL, 0xdeadbeef00000005ULL, 0xffffffffffffffffULL};
+        uint64_t wy[3] = {0x380000000ULL, 0x12345678fffffffbULL, 0x0000000100000002ULL};
+        for (int k = 0; k < 3; k++) {
+            uint32_t x = (uint32_t)wx[k], y = (uint32_t)wy[k];
+            uint32_t exp = (((x + y) ^ (x - 1u)) - y) - x;
+            if (opt11_lea_w(wx[k], wy[k]) != exp) { fprintf(stderr, "opt11_lea_w(%d) failed\n", k); return 1; }
+        }
+        int64_t ca = 11, cb = -22, cc = 333, cd = 4444, ce = -55555;
+        uint64_t A = (uint64_t)ca, B = (uint64_t)cb, C = (uint64_t)cc, D = (uint64_t)cd, E = (uint64_t)ce;
+        uint64_t cx = (A + B) ^ (B + C) ^ (C + D) ^ (D + E) ^ (E + A) ^ (B + D) ^ (C + E) ^ (A + C)
+            ^ (D + 1000u) ^ (E - 77u);
+        int64_t cexp = (int64_t)(cx - A - B - C - D - E - (A + 7u));
+        int64_t cv[5] = {ca, cb, cc, cd, ce};
+        if (opt11_lea_callee(cv) != cexp) {
+            fprintf(stderr, "opt11_lea_callee got %lld exp %lld\n", (long long)opt11_lea_callee(cv), (long long)cexp);
+            return 1;
+        }
+        if (opt11_lea_flags(5, (uint32_t)-5) != (int64_t)(5u ^ (uint32_t)-5) + 1000000
+        || opt11_lea_flags(9, 4) != 5 || opt11_lea_flags(0, 0) != 1000000) {
+            fprintf(stderr, "opt11_lea_flags failed\n"); return 1;
+        }
     }
 
     printf("ALL_OPTS_OK %lld %lld %lld\n", (long long)opt3_short_br(-10), (long long)opt4_loop(100), (long long)r6);
@@ -682,6 +870,65 @@ if [ "$UNAME_M" = "x86_64" ]; then
       awk '/<opt9_memcmp_imm>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
       exit 1
     }
+    # Opt 10A: copy 0 -> xor %r32,%r32, including REX.RB forms 45 31 c0 (%r8d) and 45 31 c9 (%r9d)
+    for fn10 in opt10_zero_args opt10_zero_args_w; do
+      for enc in '45 31 c0' '45 31 c9'; do
+        awk "/<$fn10>:/,/^\$/" "$TMP_DIR/opts_x64.dis" | grep -F ":	$enc " >/dev/null || {
+          echo "FAIL: $fn10 did not zero an %r8/%r9 argument with xor ($enc)" >&2
+          awk "/<$fn10>:/,/^\$/" "$TMP_DIR/opts_x64.dis" >&2
+          exit 1
+        }
+      done
+      if awk "/<$fn10>:/,/^\$/" "$TMP_DIR/opts_x64.dis" | grep -E 'mov[lq]?[[:space:]]+\$0x0,' >/dev/null; then
+        echo "FAIL: $fn10 kept a mov \$0 although FLAGS are dead before the call" >&2
+        awk "/<$fn10>:/,/^\$/" "$TMP_DIR/opts_x64.dis" >&2
+        exit 1
+      fi
+    done
+    # Opt 10B: FLAGS live between cmp and cmov -> the 0 must stay mov $0 (xor would clobber them)
+    OPT10B="$(awk '/<opt10_zero_flags>:/,/^$/' "$TMP_DIR/opts_x64.dis")"
+    if ! printf '%s\n' "$OPT10B" | grep -E 'cmov' >/dev/null \
+    || ! printf '%s\n' "$OPT10B" | grep -E 'mov[lq]?[[:space:]]+\$0x0,' >/dev/null \
+    || printf '%s\n' "$OPT10B" | grep -E '[[:space:]]xor' >/dev/null; then
+      echo "FAIL: opt10_zero_flags must keep mov \$0 between cmp and cmov (no xor)" >&2
+      printf '%s\n' "$OPT10B" >&2
+      exit 1
+    fi
+    # Opt 11A: Kl lea reg+reg and reg+disp32 (100000 = 0x186a0), no add left
+    OPT11A="$(awk '/<opt11_lea>:/,/^$/' "$TMP_DIR/opts_x64.dis")"
+    if ! printf '%s\n' "$OPT11A" | grep -E 'lea[[:space:]]+\(%r[a-z0-9]+,%r[a-z0-9]+,1\),%r' >/dev/null \
+    || ! printf '%s\n' "$OPT11A" | grep -E 'lea[[:space:]]+0x186a0\(%r[a-z0-9]+\),%r' >/dev/null \
+    || printf '%s\n' "$OPT11A" | grep -E '[[:space:]]add[[:space:]]' >/dev/null; then
+      echo "FAIL: opt11_lea did not emit 64-bit three-address lea" >&2
+      printf '%s\n' "$OPT11A" >&2
+      exit 1
+    fi
+    # Opt 11B: Kw lea writes a 32-bit register; 4294967295 becomes disp8 -1
+    OPT11B="$(awk '/<opt11_lea_w>:/,/^$/' "$TMP_DIR/opts_x64.dis")"
+    if ! printf '%s\n' "$OPT11B" | grep -E 'lea[[:space:]]+\(%r[a-z0-9]+,%r[a-z0-9]+,1\),%e' >/dev/null \
+    || ! printf '%s\n' "$OPT11B" | grep -E 'lea[[:space:]]+-0x1\(%r[a-z0-9]+\),%e' >/dev/null \
+    || printf '%s\n' "$OPT11B" | grep -E '[[:space:]]add[[:space:]]' >/dev/null; then
+      echo "FAIL: opt11_lea_w did not emit 32-bit three-address lea" >&2
+      printf '%s\n' "$OPT11B" >&2
+      exit 1
+    fi
+    # Opt 11C: %r12 and %r13 as lea base (SIB / mod=01 disp8 forms)
+    OPT11C="$(awk '/<opt11_lea_callee>:/,/^$/' "$TMP_DIR/opts_x64.dis")"
+    for r in r12 r13; do
+      printf '%s\n' "$OPT11C" | grep -E "lea[[:space:]]+(0x0)?\(%$r[,)]" >/dev/null || {
+        echo "FAIL: opt11_lea_callee has no lea with %$r base" >&2
+        printf '%s\n' "$OPT11C" >&2
+        exit 1
+      }
+    done
+    # Opt 11D: Kw add whose ZF feeds jnz must stay add (FLAGS live)
+    OPT11D="$(awk '/<opt11_lea_flags>:/,/^$/' "$TMP_DIR/opts_x64.dis")"
+    if ! printf '%s\n' "$OPT11D" | grep -E '[[:space:]]add[[:space:]]+%' >/dev/null \
+    || printf '%s\n' "$OPT11D" | sed -n '1,/j[n]\{0,1\}[ez]/p' | grep -E '[[:space:]]lea[[:space:]]' >/dev/null; then
+      echo "FAIL: opt11_lea_flags turned a FLAGS-producing add into lea" >&2
+      printf '%s\n' "$OPT11D" >&2
+      exit 1
+    fi
   fi
   "$CC" -O2 "$TMP_DIR/driver.c" "$TMP_DIR/opts_x64.o" -o "$TMP_DIR/test_x64"
   OUT_X64="$("$TMP_DIR/test_x64")"

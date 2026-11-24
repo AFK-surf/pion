@@ -1873,6 +1873,96 @@ emitjtbl(Blk *b, EF *e)
 
 /* ---- Function emission ---- */
 
+/* ---- Intrablock arithmetic-FLAGS liveness ----
+ *
+ * flags_dead_before(i, after): are CF/PF/AF/ZF/SF/OF dead just before i,
+ * given whether they are dead just after it?  Sound by construction:
+ *  - Ocall: SysV preserves no flags across a call; the call reads none.
+ *  - Oxcmp/Oxtest: cmp/test/ucomis[sd] write every arithmetic flag and
+ *    read none (emitins also uses `test r,r` for cmp $0, same effect).
+ *  - integer Oadd/Osub/Oand/Oor/Oxor: emitins always ends in add/sub/
+ *    and/or/xor (Osub may prefix neg); each writes all six flags and reads
+ *    none.  When the lea rewrite below replaces an Oadd it writes nothing,
+ *    but it only fires when flags are already dead after it, so "dead
+ *    before" stays true either way.
+ *  - Onop/Odbgloc/Ocopy/Oaddr/loads/stores read no flags (Oaddr's SExtThr
+ *    add may write them), so dead-after implies dead-before.
+ *  - Everything else (setcc, cmov, shifts, swaps, ...) is unknown: live.
+ * Block exits: only ret (ABI) and ud2 kill flags; every jump, including a
+ * plain Jjmp, is treated as live, since successors are not analysed. */
+static int
+flags_dead_before(Ins *i, int after)
+{
+	switch (i->op) {
+	case Ocall: case Oxcmp: case Oxtest:
+		return 1;
+	case Oadd: case Osub: case Oand: case Oor: case Oxor:
+		return !KBASE(i->cls) || after;
+	case Onop: case Odbgloc: case Ocopy: case Oaddr:
+		return after;
+	default:
+		return (isload(i->op) || isstore(i->op)) ? after : 0;
+	}
+}
+
+/* `copy 0` into a GPR, flags dead after: xor %r32, %r32 (2-3 bytes, also
+ * zero-extends to 64 bits) instead of mov $0, %r32 (5-6 bytes). */
+static int
+emit_zero_idiom(Ins *i, Fn *fn)
+{
+	if (i->op != Ocopy || KBASE(i->cls) || req(i->to, R) || !isreg(i->to)
+	|| is_xmm(i->to.val) || rtype(i->arg[0]) != RCon)
+		return 0;
+	Con *c = &fn->con[i->arg[0].val];
+	if (c->type != CBits || c->bits.i != 0)
+		return 0;
+	uint8_t d = hw_reg(i->to.val);
+	emit_modrm(0, 0, 0, 0x31, -1, d, rm_reg(d), 0, 0);
+	return 1;
+}
+
+/* Three-address integer add, flags dead after: lea (a,v), to or
+ * lea disp32(a), to instead of mov a, to; add v, to.  Kw uses the 32-bit
+ * lea, which truncates the 64-bit sum and zero-extends, so a Kw immediate
+ * only needs its low 32 bits (taken sign-extended to fit disp32). */
+static int
+emit_lea_add(Ins *i, Fn *fn)
+{
+	if (i->op != Oadd || KBASE(i->cls) || req(i->to, R) || !isreg(i->to)
+	|| req(i->to, i->arg[0]) || req(i->to, i->arg[1]))
+		return 0;
+	Ref a = i->arg[0], v = i->arg[1];
+	if (!isreg(a)) {
+		Ref t = a;
+		a = v;
+		v = t;
+	}
+	if (!isreg(a) || is_xmm(a.val))
+		return 0;
+	int64_t disp = 0;
+	if (isreg(v)) {
+		if (is_xmm(v.val) || (req(a, TMP(RSP)) && req(v, TMP(RSP))))
+			return 0;
+		/* SIB index 100b means "no index": %rsp can only be the base. */
+		if (req(v, TMP(RSP))) {
+			v = a;
+			a = TMP(RSP);
+		}
+	} else if (rtype(v) == RCon && fn->con[v.val].type == CBits) {
+		disp = fn->con[v.val].bits.i;
+		if (!KWIDE(i->cls))
+			disp = (int64_t)(int32_t)(uint32_t)disp;
+		if (!fits_i32(disp))
+			return 0;
+	} else
+		return 0;
+	RmOp m = rm_base_disp(hw_reg(a.val), disp);
+	if (isreg(v))
+		m.index = hw_reg(v.val);
+	emit_modrm(0, KWIDE(i->cls), 0, 0x8d, -1, hw_reg(i->to.val), m, 0, 0);
+	return 1;
+}
+
 static int resolve_custom_sec(const char *sec_str, const char *secf_str);
 
 typedef struct {
@@ -2057,8 +2147,18 @@ amd64_elf_fn(Fn *fn)
 		}
 		l->start = blk_off[b->id] = text_pos();
 
-		for (Ins *i = b->ins; i != &b->ins[b->nins]; i++)
+		/* dead[n]: arithmetic flags dead just before b->ins[n]. */
+		uint8_t *dead = emalloc(b->nins + 1);
+		dead[b->nins] = b->jmp.type == Jret0 || b->jmp.type == Jhlt;
+		for (uint n = b->nins; n > 0; n--)
+			dead[n-1] = flags_dead_before(&b->ins[n-1], dead[n]);
+		for (uint n = 0; n < b->nins; n++) {
+			Ins *i = &b->ins[n];
+			if (dead[n+1] && (emit_zero_idiom(i, fn) || emit_lea_add(i, fn)))
+				continue;
 			emitins(*i, &e);
+		}
+		free(dead);
 
 		lbl = 1;
 		switch (b->jmp.type) {
