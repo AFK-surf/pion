@@ -13,6 +13,9 @@ import PionProofs.QbeCodegenOpts
 import PionProofs.QbeGvnSpeedup
 import PionProofs.QbeBackendOpts2
 import PionProofs.QbeLoopArrayOpts
+import PionProofs.QbeX86ZeroLea
+import PionProofs.QbeCompileSpeedOpts
+import PionProofs.QbeConcatScratch
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -526,3 +529,27 @@ import PionProofs.QbeLoopArrayOpts
 #print axioms PionQbeLoopArrayOpts.ByteScan.bounded
 #print axioms PionQbeLoopArrayOpts.ByteScan.equivalent
 #print axioms PionQbeLoopArrayOpts.ByteScan.no_increment_overflow
+#print axioms PionQbeX86ZeroLea.trunc_add
+#print axioms PionQbeX86ZeroLea.trunc_zext
+#print axioms PionQbeX86ZeroLea.trunc_signExtend
+#print axioms PionQbeX86ZeroLea.zeroIdiom
+#print axioms PionQbeX86ZeroLea.zeroIdiom_state
+#print axioms PionQbeX86ZeroLea.leaQ
+#print axioms PionQbeX86ZeroLea.leaW
+#print axioms PionQbeX86ZeroLea.leaDisp
+#print axioms PionQbeX86ZeroLea.leaQ_state
+#print axioms PionQbeX86ZeroLea.leaW_state
+#print axioms PionQbeCompileSpeedOpts.absent_def_no_rewrite
+#print axioms PionQbeCompileSpeedOpts.fold_defining_blocks
+#print axioms PionQbeCompileSpeedOpts.record_hits_once
+#print axioms PionQbeCompileSpeedOpts.fresh_mark
+#print axioms PionQbeCompileSpeedOpts.split_fits
+#print axioms PionQbeCompileSpeedOpts.no_open_no_effect
+#print axioms PionQbeCompileSpeedOpts.arena_disjoint
+#print axioms PionQbeConcatScratch.width_le
+#print axioms PionQbeConcatScratch.no_grow
+#print axioms PionQbeConcatScratch.extsw_preserves
+#print axioms PionQbeConcatScratch.observe
+#print axioms PionQbeConcatScratch.fill_frame
+#print axioms PionQbeConcatScratch.scratch_concat
+#print axioms PionQbeConcatScratch.slot_reuse
