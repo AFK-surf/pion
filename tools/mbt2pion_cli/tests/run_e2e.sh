@@ -1216,10 +1216,12 @@ print("[e2e] PASS: Round 10 Astra P0 suite (0555 read-only subdir hardlink backu
 path_max = os.pathconf(root, "PC_PATH_MAX")
 if path_max <= 0:
     path_max = 1024
-deep_base = os.path.join(root, "d10j")
+deep_base = os.path.join(os.path.realpath(root), "d10j")
 os.makedirs(deep_base, exist_ok=True)
-# Build nested dir so len(deep_base) is ~path_max - 18 (fits `O/r.json` as path, but `.m2pvp.<pid>.<seq>` exceeds PATH_MAX!)
-target_len = path_max - 18
+# Build nested dir so len(deep_base) == path_max - 13:
+#   - `<deep_base>/O/r.json` (+7) and `<deep_base>/É.json` (+8) stay strictly < PATH_MAX
+#   - `<deep_base>/.m2pvp.<pid>.0/o` (+12 + len(pid)) is ALWAYS >= PATH_MAX even for a 1-digit PID!
+target_len = path_max - 13
 while len(deep_base) + 120 < target_len:
     deep_base = os.path.join(deep_base, "x" * 119)
 rem = target_len - len(deep_base) - 1
