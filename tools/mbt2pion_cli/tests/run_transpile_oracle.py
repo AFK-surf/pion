@@ -1037,7 +1037,7 @@ pub fn m2_r2_side_effects() -> Int {
   c
 }
 
-pub fn m2_r2_lazy_iter() -> (Bool, Int, Bool, Int) {
+pub fn m2_r2_lazy_iter() -> (Bool, Int, Bool, Int, Bool, Int, Int) {
   let mut calls1 = 0
   let r1 = [1, 2, 3, 4, 5, 6]
     .iter()
@@ -1048,7 +1048,15 @@ pub fn m2_r2_lazy_iter() -> (Bool, Int, Bool, Int) {
     .iter()
     .map(fn(x) { calls2 = calls2 + 1; x * 10 })
     .all(fn(x) { x < 30 })
-  (r1, calls1, r2, calls2)
+  let mut zf = 0
+  let mut zg = 0
+  let _unused = [1, 2, 3].iter().map(fn(x) { zf = zf + 1; x }).zip([10, 20, 30].iter().map(fn(y) { zg = zg + 1; y }))
+  let r3 = [1, 2, 3, 4, 5, 6]
+    .iter()
+    .map(fn(x) { zf = zf + 1; x })
+    .zip([10, 20, 30, 40, 50, 60].iter().map(fn(y) { zg = zg + 1; y }))
+    .any(fn(p) { p.0 + p.1 == 22 })
+  (r1, calls1, r2, calls2, r3, zf, zg)
 }
 
 pub(all) enum R2ShowTok {
@@ -1568,16 +1576,16 @@ fn main {
     let (d_big, i64_big, d_if) = @m12.m2_r2_large_int_coerce(false)
     let eq_h = @m12.m2_r2_eq_hygiene()
     let se = @m12.m2_r2_side_effects()
-    let (la1, lc1, la2, lc2) = @m12.m2_r2_lazy_iter()
+    let (la1, lc1, la2, lc2, lz, lzf, lzg) = @m12.m2_r2_lazy_iter()
     let sh = @m12.m2_r2_show_early_return()
     let (aeq, tup, lit) = @m12.m2_r2_arr_add_eq_and_tuple()
-    trace("r2", "\{tm1},\{tm2},\{tm3},\{d_big},\{i64_big},\{d_if},\{eq_h},\{se},\{la1}:\{lc1},\{la2}:\{lc2},\{sh},\{aeq},\{tup},\{lit}")
+    trace("r2", "\{tm1},\{tm2},\{tm3},\{d_big},\{i64_big},\{d_if},\{eq_h},\{se},\{la1}:\{lc1},\{la2}:\{lc2},\{lz}:\{lzf}:\{lzg},\{sh},\{aeq},\{tup},\{lit}")
     check("r2.tuple_match", tm1 == 7 && tm2 == 8 && tm3 == 9)
     check("r2.large_int_double", d_big == 4294967296.0 && d_if == 4.0)
     check("r2.large_int_i64", i64_big == 4294967296L)
     check("r2.eq_hygiene", !eq_h)
     check("r2.side_effects", se == 11)
-    check("r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3)
+    check("r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2)
     check("r2.show_return", sh == "early:normal")
     check("r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
   } else {
@@ -2090,16 +2098,16 @@ pub fn main(w : World) -> Int {
     let (d_big, i64_big, d_if) = m12::m2_r2_large_int_coerce(false)
     let eq_h = m12::m2_r2_eq_hygiene()
     let se = m12::m2_r2_side_effects()
-    let (la1, lc1, la2, lc2) = m12::m2_r2_lazy_iter()
+    let (la1, lc1, la2, lc2, lz, lzf, lzg) = m12::m2_r2_lazy_iter()
     let sh = m12::m2_r2_show_early_return()
     let (aeq, tup, lit) = m12::m2_r2_arr_add_eq_and_tuple()
-    trace(w, "r2", tm1.to_string() + "," + tm2.to_string() + "," + tm3.to_string() + "," + mbt_compat::double_to_string(d_big) + "," + i64_big.to_string() + "," + mbt_compat::double_to_string(d_if) + "," + eq_h.to_string() + "," + se.to_string() + "," + la1.to_string() + ":" + lc1.to_string() + "," + la2.to_string() + ":" + lc2.to_string() + "," + sh + "," + aeq.to_string() + "," + tup.to_string() + "," + lit)
+    trace(w, "r2", tm1.to_string() + "," + tm2.to_string() + "," + tm3.to_string() + "," + mbt_compat::double_to_string(d_big) + "," + i64_big.to_string() + "," + mbt_compat::double_to_string(d_if) + "," + eq_h.to_string() + "," + se.to_string() + "," + la1.to_string() + ":" + lc1.to_string() + "," + la2.to_string() + ":" + lc2.to_string() + "," + lz.to_string() + ":" + lzf.to_string() + ":" + lzg.to_string() + "," + sh + "," + aeq.to_string() + "," + tup.to_string() + "," + lit)
     check(w, "r2.tuple_match", tm1 == 7 && tm2 == 8 && tm3 == 9)
     check(w, "r2.large_int_double", d_big == 4294967296.0 && d_if == 4.0)
     check(w, "r2.large_int_i64", i64_big == 4294967296L)
     check(w, "r2.eq_hygiene", !eq_h)
     check(w, "r2.side_effects", se == 11)
-    check(w, "r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3)
+    check(w, "r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2)
     check(w, "r2.show_return", sh == "early:normal")
     check(w, "r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
   } else {

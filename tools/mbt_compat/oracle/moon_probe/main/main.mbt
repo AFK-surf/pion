@@ -697,13 +697,22 @@ fn case_wave_m2_round2() -> Unit {
   check("r2.math_max_nan", @math.maximum(nan, 1.0) == 1.0 && @math.maximum(1.0, nan).is_nan())
   check("r2.math_min_nan", @math.minimum(nan, 1.0).is_nan() && @math.minimum(1.0, nan) == 1.0)
 
-  // P1-8: Lazy iter short-circuiting
+  // P1-8: Lazy iter short-circuiting (including lazy zip!)
   let mut c1 = 0
   let a1 = [1, 2, 3, 4, 5, 6].iter().map(fn(x) { c1 = c1 + 1; x * 2 }).any(fn(x) { x == 4 })
   let mut c2 = 0
   let a2 = [1, 2, 3, 4, 5, 6].iter().map(fn(x) { c2 = c2 + 1; x * 2 }).all(fn(x) { x < 6 })
-  trace("iter", "\{a1}:\{c1},\{a2}:\{c2}")
-  check("r2.iter_lazy", a1 && c1 == 2 && !a2 && c2 == 3)
+  let mut zf = 0
+  let mut zg = 0
+  let _unused_zip = [1, 2, 3].iter().map(fn(x) { zf = zf + 1; x }).zip([10, 20, 30].iter().map(fn(y) { zg = zg + 1; y }))
+  let z_unused_cnt = "\{zf}:\{zg}"
+  let za = [1, 2, 3, 4, 5, 6]
+    .iter()
+    .map(fn(x) { zf = zf + 1; x })
+    .zip([10, 20, 30, 40, 50, 60].iter().map(fn(y) { zg = zg + 1; y }))
+    .any(fn(p) { p.0 + p.1 == 22 })
+  trace("iter", "\{a1}:\{c1},\{a2}:\{c2},zip_unused=\{z_unused_cnt},zip_any=\{za}:\{zf}:\{zg}")
+  check("r2.iter_lazy", a1 && c1 == 2 && !a2 && c2 == 3 && z_unused_cnt == "0:0" && za && zf == 2 && zg == 2)
 
   // P0-1: Debug formatting for String & Char
   let ds = "\"ab\\n\\t\\\\\\\"\""
