@@ -165,29 +165,29 @@ static char *rname[][4] = {
 };
 
 
-static int
+static int64_t
 slot(Ref r, E *e)
 {
-	int s;
+	int64_t s;
 
 	s = rsval(r);
 	assert(s <= e->fn->slot);
 	/* specific to NAlign == 3 */
 	if (s < 0) {
 		if (e->fp == RSP)
-			return 4*-s - 8 + e->fsz + e->nclob*8;
+			return 4LL * -s - 8LL + (int64_t)e->fsz + (int64_t)e->nclob * 8LL;
 		else
-			return 4*-s;
+			return 4LL * -s;
 	}
 	else if (e->fp == RSP)
-		return 4*s + e->nclob*8;
+		return 4LL * s + (int64_t)e->nclob * 8LL;
 	else if (e->fn->vararg) {
 		if (T.windows)
-			return -4 * (e->fn->slot - s);
+			return -4LL * ((int64_t)e->fn->slot - s);
 		else
-			return -176 + -4 * (e->fn->slot - s);
+			return -176LL + -4LL * ((int64_t)e->fn->slot - s);
 	} else
-		return -4 * (e->fn->slot - s);
+		return -4LL * ((int64_t)e->fn->slot - s);
 }
 
 static void
@@ -317,18 +317,28 @@ Next:
 			assert(isreg(ref));
 			fprintf(e->f, "%%%s", regtoa(ref.val, sz));
 			break;
-		case RSlot:
-			fprintf(e->f, "%d(%%%s)",
-				slot(ref, e),
+		case RSlot: {
+			int64_t so = slot(ref, e);
+			if (so < INT32_MIN || so > INT32_MAX)
+				die("amd64 emit: stack slot displacement out of disp32 range");
+			fprintf(e->f, "%"PRId64"(%%%s)",
+				so,
 				regtoa(e->fp, SLong)
 			);
 			break;
+		}
 		case RMem:
 		Mem:
 			m = &e->fn->mem[ref.val];
 			if (rtype(m->base) == RSlot) {
+				int64_t so = slot(m->base, e);
+				int64_t cur = (m->offset.type == CUndef) ? 0 : m->offset.bits.i;
+				if (so < INT32_MIN || so > INT32_MAX
+				|| cur < INT32_MIN || cur > INT32_MAX
+				|| cur + so < INT32_MIN || cur + so > INT32_MAX)
+					die("amd64 emit: stack displacement out of disp32 range");
 				off.type = CBits;
-				off.bits.i = slot(m->base, e);
+				off.bits.i = so;
 				addcon(&m->offset, &off, 1);
 				m->base = TMP(e->fp);
 			}
@@ -380,12 +390,16 @@ Next:
 		switch (rtype(ref)) {
 		case RMem:
 			goto Mem;
-		case RSlot:
-			fprintf(e->f, "%d(%%%s)",
-				slot(ref, e),
+		case RSlot: {
+			int64_t so = slot(ref, e);
+			if (so < INT32_MIN || so > INT32_MAX)
+				die("amd64 emit: stack slot displacement out of disp32 range");
+			fprintf(e->f, "%"PRId64"(%%%s)",
+				so,
 				regtoa(e->fp, SLong)
 			);
 			break;
+		}
 		case RCon:
 			off = e->fn->con[ref.val];
 			emitcon(&off, e);

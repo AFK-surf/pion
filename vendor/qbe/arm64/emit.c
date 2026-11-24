@@ -951,13 +951,35 @@ arm64_emitfn(Fn *fn, FILE *out)
 		);
 	fputs("\tmov\tx29, sp\n", e->f);
 	s = (e->frame - e->padding) / 4;
-	for (r=arm64_rclob; *r>=0; r++)
-		if (e->fn->reg & BIT(*r)) {
+	{
+		int saved[NCLR], nsaved = 0;
+		for (r=arm64_rclob; *r>=0; r++)
+			if (e->fn->reg & BIT(*r))
+				saved[nsaved++] = *r;
+		for (int k = 0; k < nsaved; ) {
+			int r0 = saved[k];
+			if (k + 1 < nsaved && (r0 >= V0) == (saved[k + 1] >= V0)) {
+				int r1 = saved[k + 1];
+				int s1 = s - 4;
+				uint64_t lo = slot(SLOT(s1), e);
+				if ((lo & 7) == 0 && lo <= 504) {
+					int cls = r0 >= V0 ? Kd : Kl;
+					char rn1[4], rn0[4];
+					strcpy(rn1, rname(r1, cls));
+					strcpy(rn0, rname(r0, cls));
+					fprintf(e->f, "\tstp\t%s, %s, [x29, #%"PRIu64"]\n", rn1, rn0, lo);
+					s = s1;
+					k += 2;
+					continue;
+				}
+			}
 			s -= 2;
-			i = &(Ins){.arg = {TMP(*r), SLOT(s)}};
-			i->op = *r >= V0 ? Ostored : Ostorel;
+			i = &(Ins){.arg = {TMP(r0), SLOT(s)}};
+			i->op = r0 >= V0 ? Ostored : Ostorel;
 			emitins(i, e);
+			k++;
 		}
+	}
 
 	uint64_t *gpr_out = arm64_compute_gpr_out(e->fn);
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
@@ -1176,13 +1198,35 @@ arm64_emitfn(Fn *fn, FILE *out)
 			break;
 		case Jret0:
 			s = (e->frame - e->padding) / 4;
-			for (r=arm64_rclob; *r>=0; r++)
-				if (e->fn->reg & BIT(*r)) {
+			{
+				int saved[NCLR], nsaved = 0;
+				for (r=arm64_rclob; *r>=0; r++)
+					if (e->fn->reg & BIT(*r))
+						saved[nsaved++] = *r;
+				for (int k = 0; k < nsaved; ) {
+					int r0 = saved[k];
+					if (k + 1 < nsaved && (r0 >= V0) == (saved[k + 1] >= V0)) {
+						int r1 = saved[k + 1];
+						int s1 = s - 4;
+						uint64_t lo = slot(SLOT(s1), e);
+						if ((lo & 7) == 0 && lo <= 504) {
+							int cls = r0 >= V0 ? Kd : Kl;
+							char rn1[4], rn0[4];
+							strcpy(rn1, rname(r1, cls));
+							strcpy(rn0, rname(r0, cls));
+							fprintf(e->f, "\tldp\t%s, %s, [x29, #%"PRIu64"]\n", rn1, rn0, lo);
+							s = s1;
+							k += 2;
+							continue;
+						}
+					}
 					s -= 2;
-					i = &(Ins){Oload, 0, TMP(*r), {SLOT(s)}};
-					i->cls = *r >= V0 ? Kd : Kl;
+					i = &(Ins){Oload, 0, TMP(r0), {SLOT(s)}};
+					i->cls = r0 >= V0 ? Kd : Kl;
 					emitins(i, e);
+					k++;
 				}
+			}
 			if (e->fn->dynalloc)
 				fputs("\tmov sp, x29\n", e->f);
 			o = e->frame + 16;

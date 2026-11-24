@@ -156,6 +156,8 @@ typedef struct {
 	uint32_t disp_off;     /* offset of 4-byte rel32 in .text */
 	uint32_t next_pc;      /* offset of instruction after branch */
 	uint32_t target_bid;
+	uint8_t is_cond;       /* 1 = jcc (0f 8x -> 7x), 0 = jmp (e9 -> eb) */
+	uint8_t cc;            /* condition code for jcc */
 } BrFixup;
 
 typedef struct {
@@ -344,6 +346,30 @@ sec_size(const Sec *s)
 }
 
 static void
+emit_nops(Buf *b, size_t n)
+{
+	static const uint8_t nop1[] = { 0x90 };
+	static const uint8_t nop2[] = { 0x66, 0x90 };
+	static const uint8_t nop3[] = { 0x0f, 0x1f, 0x00 };
+	static const uint8_t nop4[] = { 0x0f, 0x1f, 0x40, 0x00 };
+	static const uint8_t nop5[] = { 0x0f, 0x1f, 0x44, 0x00, 0x00 };
+	static const uint8_t nop6[] = { 0x66, 0x0f, 0x1f, 0x44, 0x00, 0x00 };
+	static const uint8_t nop7[] = { 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00 };
+	static const uint8_t nop8[] = { 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	static const uint8_t nop9[] = { 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
+	static const uint8_t *const nops[10] = {
+		NULL, nop1, nop2, nop3, nop4, nop5, nop6, nop7, nop8, nop9
+	};
+	buf_reserve(b, n);
+	while (n > 0) {
+		size_t k = n > 9 ? 9 : n;
+		memcpy(b->data + b->len, nops[k], k);
+		b->len += k;
+		n -= k;
+	}
+}
+
+static void
 sec_align(int sec_idx, uint64_t align_bytes)
 {
 	Sec *s = &E0.secs[sec_idx];
@@ -361,10 +387,7 @@ sec_align(int sec_idx, uint64_t align_bytes)
 		if (s->is_nobits) {
 			s->nb_size = nxt;
 		} else if (s->flags & SHF_EXECINSTR) {
-			size_t n = (size_t)(nxt - cur);
-			buf_reserve(&s->buf, n);
-			memset(s->buf.data + s->buf.len, 0x90, n);
-			s->buf.len += n;
+			emit_nops(&s->buf, (size_t)(nxt - cur));
 		} else {
 			buf_put_zeros(&s->buf, (size_t)(nxt - cur));
 		}
@@ -533,7 +556,10 @@ text_buf(void)
 static inline uint32_t
 text_pos(void)
 {
-	return (uint32_t)E0.secs[E0.cur_text_sec].buf.len;
+	size_t len = E0.secs[E0.cur_text_sec].buf.len;
+	if (len > UINT32_MAX)
+		die("elf: .text section exceeds 4GiB");
+	return (uint32_t)len;
 }
 
 static inline void
@@ -607,7 +633,8 @@ typedef struct {
 } EF;
 
 static void
-ef_add_fixup(EF *e, uint32_t disp_off, uint32_t next_pc, uint32_t target_bid)
+ef_add_fixup(EF *e, uint32_t disp_off, uint32_t next_pc, uint32_t target_bid,
+             uint8_t is_cond, uint8_t cc)
 {
 	if (e->nfixups == e->cap_fixups) {
 		e->cap_fixups = e->cap_fixups ? e->cap_fixups * 2 : 64;
@@ -619,6 +646,8 @@ ef_add_fixup(EF *e, uint32_t disp_off, uint32_t next_pc, uint32_t target_bid)
 	f->disp_off = disp_off;
 	f->next_pc = next_pc;
 	f->target_bid = target_bid;
+	f->is_cond = is_cond;
+	f->cc = cc;
 }
 
 static void
@@ -636,22 +665,22 @@ ef_add_jtfixup(EF *e, uint32_t entry_off, uint32_t tbl_base_off, uint32_t target
 	f->target_bid = target_bid;
 }
 
-static int
+static int64_t
 slot(Ref r, EF *e)
 {
-	int s = rsval(r);
+	int64_t s = rsval(r);
 	assert(s <= e->fn->slot);
 	if (s < 0) {
 		if (e->fp == RSP)
-			return 4 * -s - 8 + (int)e->fsz + e->nclob * 8;
+			return 4LL * -s - 8LL + (int64_t)e->fsz + (int64_t)e->nclob * 8LL;
 		else
-			return 4 * -s;
+			return 4LL * -s;
 	} else if (e->fp == RSP) {
-		return 4 * s + e->nclob * 8;
+		return 4LL * s + (int64_t)e->nclob * 8LL;
 	} else if (e->fn->vararg) {
-		return -176 + -4 * (e->fn->slot - s);
+		return -176LL + -4LL * ((int64_t)e->fn->slot - s);
 	} else {
-		return -4 * (e->fn->slot - s);
+		return -4LL * ((int64_t)e->fn->slot - s);
 	}
 }
 
@@ -757,13 +786,21 @@ ref_to_rm(Ref r, int as_mem, EF *e)
 		o.is_mem = 1;
 		o.base = (int)hw_reg(e->fp);
 		o.disp = slot(r, e);
+		if (o.disp < INT32_MIN || o.disp > INT32_MAX)
+			die("elf: stack slot displacement out of disp32 range");
 		return o;
 	case RMem: {
 		Addr a = e->fn->mem[r.val];
 		Con off;
 		if (rtype(a.base) == RSlot) {
+			int64_t so = slot(a.base, e);
+			int64_t cur = (a.offset.type == CUndef) ? 0 : a.offset.bits.i;
+			if (so < INT32_MIN || so > INT32_MAX
+			|| cur < INT32_MIN || cur > INT32_MAX
+			|| cur + so < INT32_MIN || cur + so > INT32_MAX)
+				die("elf: stack displacement out of disp32 range");
 			off.type = CBits;
-			off.bits.i = slot(a.base, e);
+			off.bits.i = so;
 			addcon(&a.offset, &off, 1);
 			a.base = TMP(e->fp);
 		}
@@ -892,6 +929,8 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 				rm.disp - 4 - imm_bytes);
 			emit_u32(0);
 		} else {
+			if (rm.disp < INT32_MIN || rm.disp > INT32_MAX)
+				die("elf: disp32 overflow");
 			emit_u32((uint32_t)(int32_t)rm.disp);
 		}
 	} else if (rm.base < 0 && rm.index < 0) {
@@ -903,6 +942,8 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 			sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type, rm.disp);
 			emit_u32(0);
 		} else {
+			if (rm.disp < INT32_MIN || rm.disp > INT32_MAX)
+				die("elf: disp32 overflow");
 			emit_u32((uint32_t)(int32_t)rm.disp);
 		}
 	} else if (rm.base < 0 && rm.index >= 0) {
@@ -915,6 +956,8 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 			sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type, rm.disp);
 			emit_u32(0);
 		} else {
+			if (rm.disp < INT32_MIN || rm.disp > INT32_MAX)
+				die("elf: disp32 overflow");
 			emit_u32((uint32_t)(int32_t)rm.disp);
 		}
 	} else {
@@ -943,6 +986,8 @@ emit_modrm(uint8_t pfx, int rex_w, int force_rex,
 				sec_add_reloc(E0.cur_text_sec, disp_off, rm.sym, rm.rel_type, rm.disp);
 				emit_u32(0);
 			} else {
+				if (rm.disp < INT32_MIN || rm.disp > INT32_MAX)
+					die("elf: disp32 overflow");
 				emit_u32((uint32_t)(int32_t)rm.disp);
 			}
 		}
@@ -1002,7 +1047,14 @@ enc_alu_imm(int is64, uint8_t grp, RmOp dst, int64_t imm)
 		emit_modrm(0, is64, 0, 0x83, -1, grp, dst, 1, (uint64_t)imm);
 	} else {
 		assert(fits_i32(imm));
-		emit_modrm(0, is64, 0, 0x81, -1, grp, dst, 4, (uint64_t)imm);
+		if (!dst.is_mem && dst.reg == 0) {
+			if (is64)
+				emit_u8(0x48);
+			emit_u8((uint8_t)(grp * 8u + 5u));
+			emit_u32((uint32_t)imm);
+		} else {
+			emit_modrm(0, is64, 0, 0x81, -1, grp, dst, 4, (uint64_t)imm);
+		}
 	}
 }
 
@@ -1648,7 +1700,16 @@ emitins(Ins i, EF *e)
 			assert(isreg(i.arg[1]));
 			emit_modrm(pfx, 0, 0, 0x0f, 0x2e, hw_reg(i.arg[1].val), s0, 0, 0);
 		} else {
-			/* cmp%k %0, %1 -> compute %1 - %0 */
+			/* cmp%k %0, %1 -> compute %1 - %0; cmp $0, %r == test %r, %r */
+			if (rtype(i.arg[0]) == RCon && isreg(i.arg[1])) {
+				Con *c = &e->fn->con[i.arg[0].val];
+				if (c->type == CBits
+				&& (is64 ? c->bits.i : (int64_t)(int32_t)(uint32_t)c->bits.i) == 0) {
+					RmOp d = rm_reg(hw_reg(i.arg[1].val));
+					emit_modrm(0, is64, 0, 0x85, -1, d.reg, d, 0, 0);
+					break;
+				}
+			}
 			enc_alu_op(is64, 7, i.arg[0], i.arg[1], e);
 		}
 		break;
@@ -1762,7 +1823,7 @@ emitjtbl(Blk *b, EF *e)
 	emit_u8((uint8_t)(0x80u | CC_AE));
 	uint32_t jae_disp = text_pos();
 	emit_u32(0);
-	ef_add_fixup(e, jae_disp, text_pos(), b->s1->id);
+	ef_add_fixup(e, jae_disp, text_pos(), b->s1->id, 1, CC_AE);
 
 	/* leaq tbl(%rip), %r11 */
 	uint8_t r11 = hw_reg(R11);
@@ -1836,6 +1897,10 @@ amd64_elf_fn(Fn *fn)
 	sec_align(E0.cur_text_sec, al);
 
 	uint64_t fn_start = sec_size(&E0.secs[E0.cur_text_sec]);
+	int exclusive_sec = (fn->lnk.sec == NULL && E0.cur_text_sec != SEC_TEXT
+		&& fn_start == 0 && E0.secs[E0.cur_text_sec].nrelocs == 0);
+	int has_inner_align = 0;
+	int has_jtbl = 0;
 	uint32_t fn_sym = sym_define(fn->name, E0.cur_text_sec, fn_start, fn->lnk.export, STT_FUNC);
 
 	/* endbr64 */
@@ -1890,8 +1955,10 @@ amd64_elf_fn(Fn *fn)
 			for (p = 0; p < b->npred; p++)
 				if (b->pred[p]->id >= b->id)
 					break;
-			if (p != b->npred)
+			if (p != b->npred) {
+				has_inner_align = 1;
 				sec_align(E0.cur_text_sec, 16);
+			}
 		}
 		blk_off[b->id] = text_pos();
 
@@ -1942,13 +2009,14 @@ amd64_elf_fn(Fn *fn)
 				emit_u8(0xe9);
 				uint32_t disp_off = text_pos();
 				emit_u32(0);
-				ef_add_fixup(&e, disp_off, text_pos(), b->s1->id);
+				ef_add_fixup(&e, disp_off, text_pos(), b->s1->id, 0, 0);
 			} else {
 				lbl = 0;
 			}
 			break;
 
 		case Jjtbl:
+			has_jtbl = 1;
 			emitjtbl(b, &e);
 			break;
 
@@ -1969,7 +2037,7 @@ amd64_elf_fn(Fn *fn)
 				emit_u8((uint8_t)(0x80u | cc));
 				uint32_t disp_off = text_pos();
 				emit_u32(0);
-				ef_add_fixup(&e, disp_off, text_pos(), b->s2->id);
+				ef_add_fixup(&e, disp_off, text_pos(), b->s2->id, 1, cc);
 				goto Jmp;
 			}
 			die("elf: unhandled jump %d", b->jmp.type);
@@ -1979,13 +2047,121 @@ amd64_elf_fn(Fn *fn)
 
 	uint8_t *code = text_buf()->data;
 
-	/* Patch branch rel32 displacements */
-	for (size_t k = 0; k < e.nfixups; k++) {
-		BrFixup *f = &e.fixups[k];
-		int64_t diff = (int64_t)blk_off[f->target_bid] - (int64_t)f->next_pc;
-		if (!fits_i32(diff))
-			die("elf: branch out of 2GB range in %s", fn->name);
-		patch_u32(code + f->disp_off, (uint32_t)(int32_t)diff);
+	if (exclusive_sec && !has_inner_align && !has_jtbl && e.nfixups > 0) {
+		size_t nf = e.nfixups;
+		uint32_t orig_len = text_pos();
+		uint8_t *is_short = calloc(nf, 1);
+		uint32_t *pref = emalloc((nf + 1) * sizeof *pref);
+		uint32_t *new_blk = emalloc((fn->nblk ? fn->nblk : 1) * sizeof *new_blk);
+		uint32_t *new_next = emalloc(nf * sizeof *new_next);
+		if (!is_short)
+			die("elf: out of memory");
+
+		int changed = 1;
+		while (changed) {
+			changed = 0;
+			pref[0] = 0;
+			for (size_t k = 0; k < nf; k++) {
+				uint32_t sh = is_short[k] ? (e.fixups[k].is_cond ? 4u : 3u) : 0u;
+				pref[k + 1] = pref[k] + sh;
+				new_next[k] = e.fixups[k].next_pc - pref[k + 1];
+			}
+			for (uint32_t bid = 0; bid < fn->nblk; bid++) {
+				uint32_t orig = blk_off[bid];
+				size_t lo = 0, hi = nf;
+				while (lo < hi) {
+					size_t mid = lo + (hi - lo) / 2;
+					if (e.fixups[mid].next_pc <= orig)
+						lo = mid + 1;
+					else
+						hi = mid;
+				}
+				new_blk[bid] = orig - pref[lo];
+			}
+			for (size_t k = 0; k < nf; k++) {
+				int64_t diff = (int64_t)new_blk[e.fixups[k].target_bid] - (int64_t)new_next[k];
+				if (!is_short[k] && fits_i8(diff)) {
+					is_short[k] = 1;
+					changed = 1;
+				} else if (is_short[k] && !fits_i8(diff)) {
+					is_short[k] = 0;
+					changed = 1;
+				}
+			}
+		}
+
+		if (pref[nf] > 0) {
+			uint8_t *dst = code;
+			uint32_t src_pos = 0;
+			for (size_t k = 0; k < nf; k++) {
+				BrFixup *f = &e.fixups[k];
+				uint32_t op_off = f->disp_off - (f->is_cond ? 2u : 1u);
+				size_t chunk = (size_t)(op_off - src_pos);
+				if (chunk)
+					memmove(dst, code + src_pos, chunk);
+				dst += chunk;
+				int64_t diff = (int64_t)new_blk[f->target_bid] - (int64_t)new_next[k];
+				if (is_short[k]) {
+					assert(fits_i8(diff));
+					*dst++ = f->is_cond ? (uint8_t)(0x70u | f->cc) : 0xeb;
+					*dst++ = (uint8_t)(int8_t)diff;
+				} else {
+					if (!fits_i32(diff))
+						die("elf: branch out of 2GB range in %s", fn->name);
+					if (f->is_cond) {
+						*dst++ = 0x0f;
+						*dst++ = (uint8_t)(0x80u | f->cc);
+					} else {
+						*dst++ = 0xe9;
+					}
+					patch_u32(dst, (uint32_t)(int32_t)diff);
+					dst += 4;
+				}
+				assert((uint32_t)(dst - code) == new_next[k]);
+				src_pos = f->next_pc;
+			}
+			size_t tail = (size_t)(orig_len - src_pos);
+			if (tail)
+				memmove(dst, code + src_pos, tail);
+			dst += tail;
+			text_buf()->len = (size_t)(dst - code);
+
+			Sec *sec = &E0.secs[E0.cur_text_sec];
+			for (size_t r = 0; r < sec->nrelocs; r++) {
+				uint64_t roff = sec->relocs[r].offset;
+				size_t lo = 0, hi = nf;
+				while (lo < hi) {
+					size_t mid = lo + (hi - lo) / 2;
+					if ((uint64_t)e.fixups[mid].next_pc <= roff)
+						lo = mid + 1;
+					else
+						hi = mid;
+				}
+				sec->relocs[r].offset = roff - pref[lo];
+			}
+		} else {
+			for (size_t k = 0; k < nf; k++) {
+				BrFixup *f = &e.fixups[k];
+				int64_t diff = (int64_t)blk_off[f->target_bid] - (int64_t)f->next_pc;
+				if (!fits_i32(diff))
+					die("elf: branch out of 2GB range in %s", fn->name);
+				patch_u32(code + f->disp_off, (uint32_t)(int32_t)diff);
+			}
+		}
+
+		free(is_short);
+		free(pref);
+		free(new_blk);
+		free(new_next);
+	} else {
+		/* Patch branch rel32 displacements */
+		for (size_t k = 0; k < e.nfixups; k++) {
+			BrFixup *f = &e.fixups[k];
+			int64_t diff = (int64_t)blk_off[f->target_bid] - (int64_t)f->next_pc;
+			if (!fits_i32(diff))
+				die("elf: branch out of 2GB range in %s", fn->name);
+			patch_u32(code + f->disp_off, (uint32_t)(int32_t)diff);
+		}
 	}
 
 	/* Patch inline jump table entries */

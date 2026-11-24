@@ -1721,11 +1721,32 @@ arm64_macho_fn1(Fn *fn, int far, uint64_t *gpr_out)
 	enc_mov_reg(1, FP, SP);
 
 	int s = (int)((e.frame - e.padding) / 4);
-	for (int *r = arm64_rclob; *r >= 0; r++) {
-		if (fn->reg & BIT(*r)) {
+	{
+		int saved[NCLR], nsaved = 0;
+		for (int *r = arm64_rclob; *r >= 0; r++)
+			if (fn->reg & BIT(*r))
+				saved[nsaved++] = *r;
+		for (int k = 0; k < nsaved; ) {
+			int r0 = saved[k];
+			if (k + 1 < nsaved && (r0 >= V0) == (saved[k + 1] >= V0)) {
+				int r1 = saved[k + 1];
+				int s1 = s - 4;
+				uint64_t lo = me_slot(SLOT(s1), &e);
+				if ((lo & 7) == 0 && lo <= 504) {
+					uint32_t imm7 = (uint32_t)(lo / 8) & 0x7fu;
+					if (r0 >= V0)
+						emit_u32(0x6d000000u | (imm7 << 15) | (freg(r0) << 10) | (29u << 5) | freg(r1));
+					else
+						emit_u32(0xa9000000u | (imm7 << 15) | (greg(r0) << 10) | (29u << 5) | greg(r1));
+					s = s1;
+					k += 2;
+					continue;
+				}
+			}
 			s -= 2;
-			Ins ins = { .op = *r >= V0 ? Ostored : Ostorel, .cls = Kw, .to = R, .arg = { TMP(*r), SLOT(s) } };
+			Ins ins = { .op = r0 >= V0 ? Ostored : Ostorel, .cls = Kw, .to = R, .arg = { TMP(r0), SLOT(s) } };
 			me_emitins(&ins, &e);
+			k++;
 		}
 	}
 
@@ -1980,11 +2001,32 @@ arm64_macho_fn1(Fn *fn, int far, uint64_t *gpr_out)
 			break;
 		case Jret0: {
 			int rs = (int)((e.frame - e.padding) / 4);
-			for (int *r = arm64_rclob; *r >= 0; r++) {
-				if (fn->reg & BIT(*r)) {
+			{
+				int saved[NCLR], nsaved = 0;
+				for (int *r = arm64_rclob; *r >= 0; r++)
+					if (fn->reg & BIT(*r))
+						saved[nsaved++] = *r;
+				for (int k = 0; k < nsaved; ) {
+					int r0 = saved[k];
+					if (k + 1 < nsaved && (r0 >= V0) == (saved[k + 1] >= V0)) {
+						int r1 = saved[k + 1];
+						int s1 = rs - 4;
+						uint64_t lo = me_slot(SLOT(s1), &e);
+						if ((lo & 7) == 0 && lo <= 504) {
+							uint32_t imm7 = (uint32_t)(lo / 8) & 0x7fu;
+							if (r0 >= V0)
+								emit_u32(0x6d400000u | (imm7 << 15) | (freg(r0) << 10) | (29u << 5) | freg(r1));
+							else
+								emit_u32(0xa9400000u | (imm7 << 15) | (greg(r0) << 10) | (29u << 5) | greg(r1));
+							rs = s1;
+							k += 2;
+							continue;
+						}
+					}
 					rs -= 2;
-					Ins ins = { .op = Oload, .cls = *r >= V0 ? Kd : Kl, .to = TMP(*r), .arg = { SLOT(rs), R } };
+					Ins ins = { .op = Oload, .cls = r0 >= V0 ? Kd : Kl, .to = TMP(r0), .arg = { SLOT(rs), R } };
 					me_emitins(&ins, &e);
+					k++;
 				}
 			}
 			if (fn->dynalloc)
