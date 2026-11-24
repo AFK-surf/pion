@@ -3064,12 +3064,12 @@ test "p87_cleanup_rc_cancel_immortal_and_budget" {
   assert_eq(rev_out.contains("call $pion_rc_inc(l %c500)"), false)
   assert_eq(rev_out.contains("call $pion_rc_dec(l %c500)"), false)
 
-  // 4. Exact 12L Int64 product budget boundary:
-  // For K blocks with 1 inc + storel + 1 dec and 2 params:
-  //   est_blk = (1 + K) + 13*K = 1 + 14*K
+  // 4. Exact 12L Int64 product budget boundary (inside a loop so selective inline_rc selects all K blocks):
+  // For K loop blocks with 1 inc + storel + 1 dec, 2 params, plus @start and @done:
+  //   est_blk = (2 + K) + 13*K = 2 + 14*K
   //   est_tmp = 2 + 12*(2*K) = 2 + 24*K
-  //   K = 893 -> 12503 * 21434 = 267,989,302 <= 268,435,456 (expands)
-  //   K = 894 -> 12517 * 21458 = 268,589,786 >  268,435,456 (skips; 11L would wrongly expand!)
+  //   K = 893 -> 12504 * 21434 = 268,010,736 <= 268,435,456 (expands)
+  //   K = 894 -> 12518 * 21458 = 268,611,244 >  268,435,456 (skips; 11L would wrongly expand!)
   let under_sb = StringBuilder()
   under_sb.write_string("export function w $under(l %x, l %p) {\n@start\n")
   let mut bi = 0
@@ -3079,7 +3079,7 @@ test "p87_cleanup_rc_cancel_immortal_and_budget" {
     under_sb.write_string("\n    call $pion_rc_inc(l %x)\n    storel %x, %p\n    call $pion_rc_dec(l %x)\n")
     bi = bi + 1
   }
-  under_sb.write_string("    ret 0\n}\n")
+  under_sb.write_string("    jnz %x, @b0, @done\n@done\n    ret 0\n}\n")
   let under_out = inline_native_rc_ssa(under_sb.to_string())
   assert_true(under_out.contains("@_rci_fast_0"), "K=893 must expand under 12L budget")
 
@@ -3092,7 +3092,7 @@ test "p87_cleanup_rc_cancel_immortal_and_budget" {
     over_sb.write_string("\n    call $pion_rc_inc(l %x) # retain\n    storel %x, %p\n    call $pion_rc_dec(l %x) # release\n")
     bi = bi + 1
   }
-  over_sb.write_string("    ret 0\n}\n")
+  over_sb.write_string("    jnz %x, @b0, @done\n@done\n    ret 0\n}\n")
   let over_out = inline_native_rc_ssa(over_sb.to_string())
   assert_eq(over_out.contains("@_rci_fast_"), false)
   assert_true(over_out.contains("call $pion_rc_inc(l %x) # retain"), "K=894 must skip under 12L budget")
@@ -13556,4 +13556,375 @@ test "j2: layer3 inline_rc safe load whitelist & CFG trap-branch penetration" {
   assert_true(f3_sl.contains("ret %w"), f3_sl)
   assert_true(!f3_sl.contains("$pion_rc_inc"), f3_sl)
   assert_true(!f3_sl.contains("$pion_rc_dec"), f3_sl)
+}
+
+///|
+test "k1b_selective_inline_rc_cfg_scc_called_in_loop" {
+  // 1. Loop block expands while cold prologue & cold epilogue in the same function
+  //    keep compact `call $pion_rc_*`, and mixed cold/hot + back-edge phi predecessors
+  //    rewrite ONLY the split hot block labels.
+  let ssa_loop_vs_cold =
+    #|export function l $loop_mix(l %a, l %b, l %slot, w %n) {
+    #|@entry
+    #|    call $pion_rc_inc(l %a)
+    #|    storel %a, %slot
+    #|    call $pion_rc_inc(l %b)
+    #|    storel %b, %slot
+    #|    call $pion_rc_dec(l %b)
+    #|    %has_work =w csgtw %n, 0
+    #|    jnz %has_work, @loop_hdr, @exit
+    #|@loop_hdr
+    #|    %i =w phi @entry 0, @loop_body %i1
+    #|    %cur =l phi @entry %a, @loop_body %next
+    #|    %next =l copy %b
+    #|    jmp @loop_body
+    #|@loop_body
+    #|    call $pion_rc_inc(l %cur)
+    #|    storel %cur, %slot
+    #|    call $pion_rc_dec(l %cur)
+    #|    %i1 =w add %i, 1
+    #|    %cont =w csltw %i1, %n
+    #|    jnz %cont, @loop_hdr, @exit
+    #|@exit
+    #|    %res =l phi @entry %a, @loop_body %cur
+    #|    call $pion_rc_dec(l %res)
+    #|    storel %res, %slot
+    #|    call $pion_rc_inc(l %res)
+    #|    call $pion_rc_dec(l %a)
+    #|    ret %res
+    #|}
+    #|
+  let out_mix = inline_native_rc_ssa(ssa_loop_vs_cold)
+  // Loop body RC ops (2 calls -> id 0 inc, id 1 dec) must expand:
+  assert_true(out_mix.contains("@_rci_fast_0"), out_mix)
+  assert_true(out_mix.contains("@_rcd_fast_1"), out_mix)
+  assert_eq(out_mix.contains("@_rci_fast_2"), false)
+  assert_eq(out_mix.contains("@_rcd_fast_2"), false)
+  // Cold entry & cold exit must retain compact `call $pion_rc_*` (not expanded):
+  assert_true(out_mix.contains("@entry\n    call $pion_rc_inc(l %a)\n"), out_mix)
+  assert_true(out_mix.contains("    call $pion_rc_dec(l %res)\n    storel %res, %slot\n"), out_mix)
+  // Mixed cold/hot phi predecessors: `@entry` MUST stay `@entry`, `@loop_body` MUST rewrite to `@_rcd_end_1`:
+  assert_true(out_mix.contains("%i =w phi @entry 0, @_rcd_end_1 %i1"), out_mix)
+  assert_true(out_mix.contains("%cur =l phi @entry %a, @_rcd_end_1 %next"), out_mix)
+  assert_true(out_mix.contains("%res =l phi @entry %a, @_rcd_end_1 %cur"), out_mix)
+
+  // 2. Large cold straight-line function (>10 RC calls, acyclic, not called in loop)
+  //    MUST stay compact `call $pion_rc_*` (zero expansion).
+  let cold_sb = StringBuilder()
+  cold_sb.write_string("export function w $cold_ui_builder(l %x, l %slot) {\n@start\n")
+  let mut ci = 0
+  while ci < 12 {
+    cold_sb.write_string("    call $pion_rc_inc(l %x)\n    storel %x, %slot\n    call $pion_rc_dec(l %x)\n")
+    ci = ci + 1
+  }
+  cold_sb.write_string("    ret 0\n}\n")
+  let out_cold = inline_native_rc_ssa(cold_sb.to_string())
+  assert_eq(out_cold.contains("@_rci_fast_"), false)
+  assert_eq(out_cold.contains("@_rcd_fast_"), false)
+  assert_true(out_cold.contains("call $pion_rc_inc(l %x)"), out_cold)
+
+  // 3. Comment & blank-line invariance: adding 60 comments + blank lines to a small
+  //    acyclic function MUST NOT push `eff_insts` over the small-fn threshold (32).
+  let small_plain =
+    #|export function w $small_leaf(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|
+  let small_commented_sb = StringBuilder()
+  small_commented_sb.write_string("export function w $small_leaf(l %x, l %slot) {\n@start\n")
+  let mut k = 0
+  while k < 60 {
+    small_commented_sb.write_string("# comment line " + k.to_string() + "\n\n")
+    k = k + 1
+  }
+  small_commented_sb.write_string("    call $pion_rc_inc(l %x) # inline comment\n")
+  small_commented_sb.write_string("    storel %x, %slot\n")
+  small_commented_sb.write_string("    call $pion_rc_dec(l %x) # inline comment\n")
+  small_commented_sb.write_string("    ret 0\n}\n")
+  let out_plain = inline_native_rc_ssa(small_plain)
+  let out_commented = inline_native_rc_ssa(small_commented_sb.to_string())
+  assert_true(out_plain.contains("@_rci_fast_0"), out_plain)
+  assert_true(out_plain.contains("@_rcd_fast_1"), out_plain)
+  assert_true(out_commented.contains("@_rci_fast_0"), out_commented)
+  assert_true(out_commented.contains("@_rcd_fast_1"), out_commented)
+
+  // 4. Irreducible multi-entry loop, self-loop, and `jtbl` cycle MUST all expand.
+  let ssa_cycles =
+    #|export function w $self_loop(l %x, l %slot, w %c) {
+    #|@entry
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    jmp @spin
+    #|@spin
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    jnz %c, @spin, @done
+    #|@done
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|export function w $irred_loop(l %x, l %slot, w %c) {
+    #|@entry
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    jnz %c, @left, @right
+    #|@left
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    jnz %c, @right, @done
+    #|@right
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    jnz %c, @left, @done
+    #|@done
+    #|    ret 0
+    #|}
+    #|export function w $jtbl_loop(l %x, l %slot, w %idx) {
+    #|@entry
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    jmp @disp
+    #|@disp
+    #|    jtbl %idx, @done, @case0, @case1
+    #|@case0
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    jmp @disp
+    #|@case1
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    jmp @disp
+    #|@done
+    #|    ret 0
+    #|}
+    #|
+  let out_cycles = inline_native_rc_ssa(ssa_cycles)
+  let fn_self = j2_extract_fn(out_cycles, "export function w $self_loop(")
+  assert_true(fn_self.contains("@_rcd_fast_0"), fn_self)
+  assert_eq(fn_self.contains("@_rci_fast_"), false)
+  let fn_irred = j2_extract_fn(out_cycles, "export function w $irred_loop(")
+  assert_true(fn_irred.contains("@_rci_fast_0"), fn_irred)
+  assert_true(fn_irred.contains("@_rcd_fast_1"), fn_irred)
+  assert_eq(fn_irred.contains("@_rci_fast_2"), false)
+  let fn_jtbl = j2_extract_fn(out_cycles, "export function w $jtbl_loop(")
+  assert_true(fn_jtbl.contains("@_rci_fast_0"), fn_jtbl)
+  assert_true(fn_jtbl.contains("@_rcd_fast_1"), fn_jtbl)
+  assert_eq(fn_jtbl.contains("@_rci_fast_2"), false)
+
+  // 5. Intra-module `called_in_loop` propagation:
+  //    - Pure-compute outer loop `$driver` calls `$mid_helper` (acyclic, >2 RC calls -> not small-fn),
+  //      which calls `$leaf_helper` (acyclic, >2 RC calls -> 1st hop): BOTH must expand!
+  //    - `$cold_sibling` (identical to `$mid_helper` but NOT called in loop) must stay compact!
+  let ssa_cil =
+    #|export function w $driver(l %x, l %slot, w %n) {
+    #|@start
+    #|    jmp @loop
+    #|@loop
+    #|    %i =w phi @start 0, @loop %i1
+    #|    %r =w call $mid_helper(l %x, l %slot)
+    #|    %i1 =w add %i, 1
+    #|    %c =w csltw %i1, %n
+    #|    jnz %c, @loop, @exit
+    #|@exit
+    #|    ret 0
+    #|}
+    #|export function w $mid_helper(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    %v =w call $leaf_helper(l %x, l %slot)
+    #|    ret %v
+    #|}
+    #|export function w $leaf_helper(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|export function w $cold_sibling(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|
+  let out_cil = inline_native_rc_ssa(ssa_cil)
+  let fn_mid = j2_extract_fn(out_cil, "export function w $mid_helper(")
+  let fn_leaf = j2_extract_fn(out_cil, "export function w $leaf_helper(")
+  let fn_sib = j2_extract_fn(out_cil, "export function w $cold_sibling(")
+  assert_true(fn_mid.contains("@_rci_fast_0"), fn_mid)
+  assert_true(fn_leaf.contains("@_rci_fast_0"), fn_leaf)
+  assert_eq(fn_sib.contains("@_rci_fast_"), false)
+  assert_true(fn_sib.contains("call $pion_rc_inc(l %x)"), fn_sib)
+
+  // 6. Malformed / unresolvable CFG (duplicate label, unknown target) safely falls
+  //    back to compact `call $pion_rc_*` (zero expansion, zero crash).
+  let ssa_bad_cfg =
+    #|export function w $dup_lbl(l %x, l %slot) {
+    #|@dup
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|@dup
+    #|    call $pion_rc_dec(l %x)
+    #|    jmp @dup
+    #|}
+    #|export function w $unk_tgt(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    jmp @does_not_exist
+    #|}
+    #|
+  let out_bad = inline_native_rc_ssa(ssa_bad_cfg)
+  assert_eq(out_bad.contains("@_rci_fast_"), false)
+  assert_eq(out_bad.contains("@_rcd_fast_"), false)
+  assert_true(out_bad.contains("call $pion_rc_inc(l %x)"), out_bad)
+  assert_true(out_bad.contains("call $pion_rc_dec(l %x)"), out_bad)
+
+  // 7. QBE global function names containing interior `$` (e.g. `$helper$tail` vs `$tail`):
+  //    2 declaration orders x 2 call targets (4 sub-cases): ONLY the callee invoked inside
+  //    the loop must expand; the other must stay compact `call $pion_rc_*`.
+  let fn_helper_tail =
+    #|export function w $helper$tail(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|
+  let fn_tail =
+    #|export function w $tail(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|
+  let drv_call_ht =
+    #|export function w $drv_ht(l %x, l %slot, w %n) {
+    #|@start
+    #|    jmp @loop
+    #|@loop
+    #|    %i =w phi @start 0, @loop %i1
+    #|    %r =w call $helper$tail(l %x, l %slot)
+    #|    %i1 =w add %i, 1
+    #|    %c =w csltw %i1, %n
+    #|    jnz %c, @loop, @exit
+    #|@exit
+    #|    ret 0
+    #|}
+    #|
+  let drv_call_t =
+    #|export function w $drv_t(l %x, l %slot, w %n) {
+    #|@start
+    #|    jmp @loop
+    #|@loop
+    #|    %i =w phi @start 0, @loop %i1
+    #|    %r =w call $tail(l %x, l %slot)
+    #|    %i1 =w add %i, 1
+    #|    %c =w csltw %i1, %n
+    #|    jnz %c, @loop, @exit
+    #|@exit
+    #|    ret 0
+    #|}
+    #|
+  // Order A: $helper$tail then $tail
+  let out_ht_a = inline_native_rc_ssa(drv_call_ht + fn_helper_tail + fn_tail)
+  let a_ht = j2_extract_fn(out_ht_a, "export function w $helper$tail(")
+  let a_t = j2_extract_fn(out_ht_a, "export function w $tail(")
+  assert_true(a_ht.contains("@_rci_fast_0"), a_ht)
+  assert_eq(a_t.contains("@_rci_fast_"), false)
+  assert_true(a_t.contains("call $pion_rc_inc(l %x)"), a_t)
+
+  let out_t_a = inline_native_rc_ssa(drv_call_t + fn_helper_tail + fn_tail)
+  let a2_ht = j2_extract_fn(out_t_a, "export function w $helper$tail(")
+  let a2_t = j2_extract_fn(out_t_a, "export function w $tail(")
+  assert_eq(a2_ht.contains("@_rci_fast_"), false)
+  assert_true(a2_ht.contains("call $pion_rc_inc(l %x)"), a2_ht)
+  assert_true(a2_t.contains("@_rci_fast_0"), a2_t)
+
+  // Order B: $tail then $helper$tail
+  let out_ht_b = inline_native_rc_ssa(drv_call_ht + fn_tail + fn_helper_tail)
+  let b_ht = j2_extract_fn(out_ht_b, "export function w $helper$tail(")
+  let b_t = j2_extract_fn(out_ht_b, "export function w $tail(")
+  assert_true(b_ht.contains("@_rci_fast_0"), b_ht)
+  assert_eq(b_t.contains("@_rci_fast_"), false)
+  assert_true(b_t.contains("call $pion_rc_inc(l %x)"), b_t)
+
+  let out_t_b = inline_native_rc_ssa(drv_call_t + fn_tail + fn_helper_tail)
+  let b2_ht = j2_extract_fn(out_t_b, "export function w $helper$tail(")
+  let b2_t = j2_extract_fn(out_t_b, "export function w $tail(")
+  assert_eq(b2_ht.contains("@_rci_fast_"), false)
+  assert_true(b2_ht.contains("call $pion_rc_inc(l %x)"), b2_ht)
+  assert_true(b2_t.contains("@_rci_fast_0"), b2_t)
+
+  // 8. Unreachable dead self-loop after `ret 0` must NOT mark `$dead_loop_callee` hot.
+  let ssa_dead_loop =
+    #|export function w $has_dead_loop(l %x, l %slot) {
+    #|@entry
+    #|    ret 0
+    #|@dead_spin
+    #|    %r =w call $dead_loop_callee(l %x, l %slot)
+    #|    jmp @dead_spin
+    #|}
+    #|export function w $dead_loop_callee(l %x, l %slot) {
+    #|@start
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_inc(l %x)
+    #|    storel %x, %slot
+    #|    call $pion_rc_dec(l %x)
+    #|    ret 0
+    #|}
+    #|
+  let out_dead = inline_native_rc_ssa(ssa_dead_loop)
+  let fn_dead_callee = j2_extract_fn(out_dead, "export function w $dead_loop_callee(")
+  assert_eq(fn_dead_callee.contains("@_rci_fast_"), false)
+  assert_true(fn_dead_callee.contains("call $pion_rc_inc(l %x)"), fn_dead_callee)
 }

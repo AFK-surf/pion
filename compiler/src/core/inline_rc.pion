@@ -819,7 +819,10 @@ fn irc_is_close_brace_range(s : String, line_start : Int, line_end : Int) -> Boo
 
 ///|
 /// Single-pass zero-allocation scan of a function body byte range `[start, end)`.
-/// Returns bitmask: bit 0 (`1`) = contains `$pion_rc_`, bit 1 (`2`) = contains `_hdr`.
+/// Returns bitmask:
+/// - bit 0 (`1`) = contains `$pion_rc_`
+/// - bit 1 (`2`) = contains `_hdr`
+/// - bit 2 (`4`) = contains `call` keyword
 fn irc_scan_body_flags(s : String, start : Int, end : Int) -> Int {
   let mut flags = 0
   let mut i = start
@@ -836,8 +839,8 @@ fn irc_scan_body_flags(s : String, start : Int, end : Int) -> Int {
         str_code_at(s, i + 7) == 99 &&
         str_code_at(s, i + 8) == 95 {
         flags = flags | 1
-        if flags == 3 {
-          return 3
+        if flags == 7 {
+          return 7
         }
         i = i + 9
         continue
@@ -848,8 +851,21 @@ fn irc_scan_body_flags(s : String, start : Int, end : Int) -> Int {
         str_code_at(s, i + 2) == 100 &&
         str_code_at(s, i + 3) == 114 {
         flags = flags | 2
-        if flags == 3 {
-          return 3
+        if flags == 7 {
+          return 7
+        }
+        i = i + 4
+        continue
+      }
+    } else if c == 99 && (flags & 4) == 0 && i + 5 <= end {
+      // "call" followed by non-ident separator
+      if str_code_at(s, i + 1) == 97 &&
+        str_code_at(s, i + 2) == 108 &&
+        str_code_at(s, i + 3) == 108 &&
+        !irc_is_qbe_ident_char(str_code_at(s, i + 4)) {
+        flags = flags | 4
+        if flags == 7 {
+          return 7
         }
         i = i + 4
         continue
@@ -1087,37 +1103,34 @@ fn irc_is_trap_block(
 }
 
 ///|
-/// Step 1: O(N) RC pair cancellation with:
-/// - strict pure-register + verified read-only call + safe non-RC-header load whitelist,
-/// - CFG single-predecessor trap-branch penetration across abort-only `$pion_panic*` + `hlt`
-///   blocks (e.g. bounds checks), with bounds-checked container data-pointer element loads
-///   enabled strictly inside the dominated `@ok` block.
-fn irc_cancel_same_block_rc(
-  fn_hdr : String,
-  fn_lines : Array[String],
-  disable_mask : Int,
-) -> Array[String] {
-  let n = fn_lines.length()
-  let allow_safe_load = (disable_mask & 4) == 0
-  let allow_trap_pen = (disable_mask & 8) == 0
-  let safe_info = if allow_safe_load {
-    irc_collect_safe_load_info(fn_hdr, fn_lines)
-  } else {
-    IrcSafeInfo::{
-      def_count: Map::new(),
-      valid_rc_objs: Map::new(),
-      safe_addrs: Map::new(),
-      dp_addr_of: Map::new(),
-    }
-  }
-  let safe_load_addrs = safe_info.safe_addrs
+struct IrcCfg {
+  blk_starts : Array[Int]
+  blk_ends : Array[Int]
+  has_phi : Array[Bool]
+  pred_count : Array[Int]
+  term_idx : Array[Int]
+  term_kind : Array[Int]
+  term_cond : Array[String]
+  term_b1 : Array[Int]
+  term_b2 : Array[Int]
+  succs : Array[Array[Int]]
+  disable_cfg : Bool
+}
 
-  // Build basic block table & CFG predecessor counts in O(N).
+///|
+/// Shared O(N) QBE SSA basic-block & CFG builder (reused by both same-block
+/// trap-branch RC cancellation and loop-guided selective inline_rc).
+/// Handles `@label`, implicit fallthrough (`bi -> bi + 1`), `jmp`, `jnz`,
+/// all `jtbl` targets, unreachable blocks, self-loops, and irreducible cycles.
+/// Sets `disable_cfg = true` on duplicate/malformed labels, unknown targets,
+/// or unparseable jump terminators.
+fn irc_build_cfg(fn_lines : Array[String]) -> IrcCfg {
+  let n = fn_lines.length()
   let blk_starts : Array[Int] = []
   let blk_ends : Array[Int] = []
   let label_to_blk : Map[String, Int] = Map::new()
   let has_phi : Array[Bool] = []
-  let mut disable_xblock = false
+  let mut disable_cfg = false
   let mut cur_start = -1
   let mut cur_has_phi = false
   let mut li = 0
@@ -1133,7 +1146,7 @@ fn irc_cancel_same_block_rc(
       let line_t = irc_strip_comment(raw)
       let lbl = irc_extract_label_tok(line_t)
       if lbl.length() < 2 || lbl != line_t || label_to_blk.contains(lbl) {
-        disable_xblock = true
+        disable_cfg = true
       }
       label_to_blk.set(lbl, blk_starts.length())
       cur_start = li
@@ -1161,6 +1174,7 @@ fn irc_cancel_same_block_rc(
   let term_cond : Array[String] = []
   let term_b1 : Array[Int] = []
   let term_b2 : Array[Int] = []
+  let succs : Array[Array[Int]] = []
   let mut bi = 0
   while bi < nblk {
     pred_count.push(0)
@@ -1169,6 +1183,8 @@ fn irc_cancel_same_block_rc(
     term_cond.push("")
     term_b1.push(-1)
     term_b2.push(-1)
+    let empty_s : Array[Int] = []
+    succs.push(empty_s)
     bi = bi + 1
   }
   bi = 0
@@ -1198,8 +1214,9 @@ fn irc_cancel_same_block_rc(
             Some(tb) => {
               term_b1[bi] = tb
               pred_count[tb] = pred_count[tb] + 1
+              succs[bi].push(tb)
             }
-            None => disable_xblock = true
+            None => disable_cfg = true
           }
         } else {
           let (jcond, t1, t2) = irc_parse_jnz_full(lt)
@@ -1210,33 +1227,38 @@ fn irc_cancel_same_block_rc(
               Some(tb1) => {
                 term_b1[bi] = tb1
                 pred_count[tb1] = pred_count[tb1] + 1
+                succs[bi].push(tb1)
               }
-              None => disable_xblock = true
+              None => disable_cfg = true
             }
             match label_to_blk.get(t2) {
               Some(tb2) => {
                 term_b2[bi] = tb2
                 pred_count[tb2] = pred_count[tb2] + 1
+                succs[bi].push(tb2)
               }
-              None => disable_xblock = true
+              None => disable_cfg = true
             }
           } else if irc_has_kw_sep(lt, "jtbl") {
             term_kind[bi] = 3
             let jtgts = irc_parse_jtbl_targets(lt)
             if jtgts.length() == 0 {
-              disable_xblock = true
+              disable_cfg = true
             }
             let mut ji = 0
             while ji < jtgts.length() {
               match label_to_blk.get(jtgts[ji]) {
-                Some(tb) => pred_count[tb] = pred_count[tb] + 1
-                None => disable_xblock = true
+                Some(tb) => {
+                  pred_count[tb] = pred_count[tb] + 1
+                  succs[bi].push(tb)
+                }
+                None => disable_cfg = true
               }
               ji = ji + 1
             }
           } else {
             // Fallthrough or unknown terminator: conservatively record any `@label`
-            // targets plus fallthrough to `bi + 1`, and disable cross-block elision
+            // targets plus fallthrough to `bi + 1`, and disable CFG-guided opts
             // whenever unparsed labels or jump keywords appear.
             term_kind[bi] = 4
             let unk_lbls = irc_collect_at_labels(lt)
@@ -1244,27 +1266,219 @@ fn irc_cancel_same_block_rc(
               irc_has_kw_sep(lt, "jmp") ||
               irc_has_kw_sep(lt, "jnz") ||
               irc_has_kw_sep(lt, "jtbl") {
-              disable_xblock = true
+              disable_cfg = true
             }
             let mut ui = 0
             while ui < unk_lbls.length() {
               match label_to_blk.get(unk_lbls[ui]) {
-                Some(tb) => pred_count[tb] = pred_count[tb] + 1
+                Some(tb) => {
+                  pred_count[tb] = pred_count[tb] + 1
+                  succs[bi].push(tb)
+                }
                 None => ()
               }
               ui = ui + 1
             }
             if bi + 1 < nblk {
               pred_count[bi + 1] = pred_count[bi + 1] + 1
+              succs[bi].push(bi + 1)
             }
           }
         }
       }
     } else if bi + 1 < nblk {
       pred_count[bi + 1] = pred_count[bi + 1] + 1
+      succs[bi].push(bi + 1)
     }
     bi = bi + 1
   }
+  IrcCfg::{
+    blk_starts: blk_starts,
+    blk_ends: blk_ends,
+    has_phi: has_phi,
+    pred_count: pred_count,
+    term_idx: term_idx,
+    term_kind: term_kind,
+    term_cond: term_cond,
+    term_b1: term_b1,
+    term_b2: term_b2,
+    succs: succs,
+    disable_cfg: disable_cfg,
+  }
+}
+
+///|
+/// Compute CFG blocks reachable from entry block `0` in O(V + E).
+fn irc_compute_reachable_blocks(cfg : IrcCfg) -> Array[Bool] {
+  let nblk = cfg.blk_starts.length()
+  let reach : Array[Bool] = []
+  let mut i = 0
+  while i < nblk {
+    reach.push(false)
+    i = i + 1
+  }
+  if nblk == 0 {
+    return reach
+  }
+  let stack : Array[Int] = [0]
+  reach[0] = true
+  while stack.length() > 0 {
+    match stack.pop() {
+      Some(v) => {
+        let adj = cfg.succs[v]
+        let mut ei = 0
+        while ei < adj.length() {
+          let w = adj[ei]
+          if !reach[w] {
+            reach[w] = true
+            stack.push(w)
+          }
+          ei = ei + 1
+        }
+      }
+      None => break
+    }
+  }
+  reach
+}
+
+///|
+/// Deterministic iterative Tarjan SCC over `0..nblk-1`.
+/// Marks `in_loop[b] = true` iff `b` belongs to an SCC of size `> 1` or has a
+/// self-loop edge `b -> b`. Handles reducible loops, irreducible multi-entry
+/// loops, `jtbl` cycles, and unreachable cycles in O(V + E) with zero recursion.
+fn irc_compute_loop_blocks(cfg : IrcCfg) -> Array[Bool] {
+  let nblk = cfg.blk_starts.length()
+  let index : Array[Int] = []
+  let lowlink : Array[Int] = []
+  let on_stack : Array[Bool] = []
+  let in_loop : Array[Bool] = []
+  let mut i = 0
+  while i < nblk {
+    index.push(-1)
+    lowlink.push(0)
+    on_stack.push(false)
+    in_loop.push(false)
+    i = i + 1
+  }
+  let tarjan_stack : Array[Int] = []
+  let dfs_node : Array[Int] = []
+  let dfs_edge : Array[Int] = []
+  let mut next_index = 0
+  let mut root = 0
+  while root < nblk {
+    if index[root] != -1 {
+      root = root + 1
+      continue
+    }
+    index[root] = next_index
+    lowlink[root] = next_index
+    next_index = next_index + 1
+    tarjan_stack.push(root)
+    on_stack[root] = true
+    dfs_node.push(root)
+    dfs_edge.push(0)
+    while dfs_node.length() > 0 {
+      let top = dfs_node.length() - 1
+      let v = dfs_node[top]
+      let ei = dfs_edge[top]
+      let adj = cfg.succs[v]
+      if ei < adj.length() {
+        dfs_edge[top] = ei + 1
+        let w = adj[ei]
+        if w == v {
+          in_loop[v] = true
+        }
+        if index[w] == -1 {
+          index[w] = next_index
+          lowlink[w] = next_index
+          next_index = next_index + 1
+          tarjan_stack.push(w)
+          on_stack[w] = true
+          dfs_node.push(w)
+          dfs_edge.push(0)
+        } else if on_stack[w] {
+          if index[w] < lowlink[v] {
+            lowlink[v] = index[w]
+          }
+        }
+      } else {
+        let _ = dfs_node.pop()
+        let _ = dfs_edge.pop()
+        if lowlink[v] == index[v] {
+          let scc : Array[Int] = []
+          while tarjan_stack.length() > 0 {
+            match tarjan_stack.pop() {
+              Some(w) => {
+                on_stack[w] = false
+                scc.push(w)
+                if w == v {
+                  break
+                }
+              }
+              None => break
+            }
+          }
+          if scc.length() > 1 {
+            let mut si = 0
+            while si < scc.length() {
+              in_loop[scc[si]] = true
+              si = si + 1
+            }
+          }
+        }
+        if dfs_node.length() > 0 {
+          let parent = dfs_node[dfs_node.length() - 1]
+          if lowlink[v] < lowlink[parent] {
+            lowlink[parent] = lowlink[v]
+          }
+        }
+      }
+    }
+    root = root + 1
+  }
+  in_loop
+}
+
+///|
+/// Step 1: O(N) RC pair cancellation with:
+/// - strict pure-register + verified read-only call + safe non-RC-header load whitelist,
+/// - CFG single-predecessor trap-branch penetration across abort-only `$pion_panic*` + `hlt`
+///   blocks (e.g. bounds checks), with bounds-checked container data-pointer element loads
+///   enabled strictly inside the dominated `@ok` block.
+fn irc_cancel_same_block_rc(
+  fn_hdr : String,
+  fn_lines : Array[String],
+  disable_mask : Int,
+) -> Array[String] {
+  let n = fn_lines.length()
+  let allow_safe_load = (disable_mask & 4) == 0
+  let allow_trap_pen = (disable_mask & 8) == 0
+  let safe_info = if allow_safe_load {
+    irc_collect_safe_load_info(fn_hdr, fn_lines)
+  } else {
+    IrcSafeInfo::{
+      def_count: Map::new(),
+      valid_rc_objs: Map::new(),
+      safe_addrs: Map::new(),
+      dp_addr_of: Map::new(),
+    }
+  }
+  let safe_load_addrs = safe_info.safe_addrs
+
+  let cfg = irc_build_cfg(fn_lines)
+  let blk_starts = cfg.blk_starts
+  let blk_ends = cfg.blk_ends
+  let has_phi = cfg.has_phi
+  let pred_count = cfg.pred_count
+  let term_idx = cfg.term_idx
+  let term_kind = cfg.term_kind
+  let term_cond = cfg.term_cond
+  let term_b1 = cfg.term_b1
+  let term_b2 = cfg.term_b2
+  let disable_xblock = cfg.disable_cfg
+  let nblk = blk_starts.length()
+  let mut bi = 0
 
   let deleted_idxs : Array[Int] = []
   let entry_open : Map[Int, Map[String, Array[Int]]] = Map::new()
@@ -1965,8 +2179,212 @@ fn irc_cleanup_fn_body_fast(
 }
 
 ///|
+/// Extract a QBE global symbol starting at `$` at `s[pos]`: either `$"..."`
+/// (quote/escape-aware) or `$[A-Za-z0-9._$]+`. Returns `""` if invalid.
+fn irc_extract_global_sym(s : String, pos : Int, end : Int) -> String {
+  if pos >= end || str_code_at(s, pos) != 36 {
+    return ""
+  }
+  if pos + 1 < end && str_code_at(s, pos + 1) == 34 {
+    let mut i = pos + 2
+    let mut esc = false
+    while i < end {
+      let c = str_code_at(s, i)
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        return slice_str(s, pos, i + 1)
+      }
+      i = i + 1
+    }
+    return ""
+  }
+  let mut j = pos + 1
+  while j < end && irc_is_qbe_ident_char(str_code_at(s, j)) {
+    j = j + 1
+  }
+  if j > pos + 1 {
+    slice_str(s, pos, j)
+  } else {
+    ""
+  }
+}
+
+///|
+/// Extract `$fn_name` (or `$"..."`) from a QBE function header line.
+/// Matches only the leading `$` of a full QBE global symbol token (never an
+/// interior `$` inside `$helper$tail`) and verifies only whitespace follows
+/// before `(`.
+fn irc_extract_fn_name(fn_hdr : String) -> String {
+  let hdr = irc_strip_comment(fn_hdr)
+  let lp = irc_find_char_unquoted(hdr, 0, 40)
+  if lp <= 0 {
+    return ""
+  }
+  let mut in_quote = false
+  let mut escaped = false
+  let mut last_dollar = -1
+  let mut i = 0
+  while i < lp {
+    let c = str_code_at(hdr, i)
+    if in_quote {
+      if escaped {
+        escaped = false
+      } else if c == 92 {
+        escaped = true
+      } else if c == 34 {
+        in_quote = false
+      }
+    } else if c == 34 {
+      in_quote = true
+    } else if c == 36 {
+      if i == 0 || !irc_is_qbe_ident_char(str_code_at(hdr, i - 1)) {
+        last_dollar = i
+      }
+    }
+    i = i + 1
+  }
+  if last_dollar < 0 {
+    return ""
+  }
+  let sym = irc_extract_global_sym(hdr, last_dollar, lp)
+  if sym.length() == 0 {
+    return ""
+  }
+  let mut tail = last_dollar + sym.length()
+  while tail < lp {
+    if !irc_is_ws(str_code_at(hdr, tail)) {
+      return ""
+    }
+    tail = tail + 1
+  }
+  sym
+}
+
+///|
+/// Extract direct call target `$callee` from a comment-stripped QBE line
+/// (`call $callee(...)` or `%r =<ty> call $callee(...)`). Ignores `$pion_rc_inc`
+/// and `$pion_rc_dec` and indirect `call %fp(...)`.
+fn irc_extract_direct_call_target(t : String) -> String {
+  let n = t.length()
+  if n < 7 {
+    return ""
+  }
+  let mut p = 0
+  if irc_has_kw_sep(t, "call") {
+    p = 4
+  } else if str_code_at(t, 0) == 37 {
+    let eq = irc_find_char_unquoted(t, 1, 61)
+    if eq < 0 {
+      return ""
+    }
+    p = eq + 1
+    while p < n && irc_is_ws(str_code_at(t, p)) {
+      p = p + 1
+    }
+    if p >= n {
+      return ""
+    }
+    let tc = str_code_at(t, p)
+    if tc == 58 {
+      p = p + 1
+      let ts = p
+      while p < n && irc_is_qbe_ident_char(str_code_at(t, p)) {
+        p = p + 1
+      }
+      if p == ts {
+        return ""
+      }
+    } else if irc_is_qbe_ident_char(tc) {
+      while p < n && irc_is_qbe_ident_char(str_code_at(t, p)) {
+        p = p + 1
+      }
+    } else {
+      return ""
+    }
+    while p < n && irc_is_ws(str_code_at(t, p)) {
+      p = p + 1
+    }
+    if p + 4 < n &&
+      irc_slice_starts_with(t, p, n, "call") &&
+      !irc_is_qbe_ident_char(str_code_at(t, p + 4)) {
+      p = p + 4
+    } else {
+      return ""
+    }
+  } else {
+    return ""
+  }
+  while p < n && irc_is_ws(str_code_at(t, p)) {
+    p = p + 1
+  }
+  let sym = irc_extract_global_sym(t, p, n)
+  if sym.length() == 0 || sym == "$pion_rc_inc" || sym == "$pion_rc_dec" {
+    ""
+  } else {
+    sym
+  }
+}
+
+///|
+/// Build per-line RC expansion mask from CFG loop membership and whole-function
+/// hot/small override. Returns `(expand_mask, selected_count)`.
+/// When `cfg.disable_cfg` is true, conservatively returns all-false (`selected_count = 0`).
+fn irc_build_expand_mask(
+  fn_lines : Array[String],
+  cfg : IrcCfg,
+  in_loop : Array[Bool],
+  expand_whole_fn : Bool,
+) -> (Array[Bool], Int) {
+  let n = fn_lines.length()
+  let mask : Array[Bool] = []
+  let mut i = 0
+  while i < n {
+    mask.push(false)
+    i = i + 1
+  }
+  if cfg.disable_cfg {
+    return (mask, 0)
+  }
+  let nblk = cfg.blk_starts.length()
+  let mut sel = 0
+  let mut bi = 0
+  while bi < nblk {
+    let want_blk = expand_whole_fn || (bi < in_loop.length() && in_loop[bi])
+    if want_blk {
+      let bs = cfg.blk_starts[bi]
+      let be = cfg.blk_ends[bi]
+      let mut li = bs
+      while li < be {
+        let raw = fn_lines[li]
+        let ws = irc_first_non_ws(raw)
+        if ws < raw.length() && str_code_at(raw, ws) == 99 {
+          let t = irc_strip_comment(raw)
+          let kind = irc_match_rc_call(t)
+          if kind != 0 && irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
+            mask[li] = true
+            sel = sel + 1
+          }
+        }
+        li = li + 1
+      }
+    }
+    bi = bi + 1
+  }
+  (mask, sel)
+}
+
+///|
 /// Step 3: `Int64` exact product budget `est_blk * est_tmp <= 2^28` (`268435456L`).
-fn irc_within_inline_budget(fn_hdr : String, fn_lines : Array[String]) -> Bool {
+/// Counts all base blocks and temporaries in the function, and adds expansion
+/// cost ONLY for RC call sites selected in `expand_mask`.
+fn irc_within_inline_budget_mask(
+  fn_hdr : String,
+  fn_lines : Array[String],
+  expand_mask : Array[Bool],
+) -> Bool {
   let dummy_defs : Map[String, Int] = Map::new()
   let nparams = irc_scan_fn_params(fn_hdr, dummy_defs)
   if nparams < 0 {
@@ -1982,7 +2400,7 @@ fn irc_within_inline_budget(fn_hdr : String, fn_lines : Array[String]) -> Bool {
     let t = irc_strip_comment(fn_lines[i])
     if t.length() > 1 && str_code_at(t, 0) == 64 {
       nblk = nblk + 1L
-    } else {
+    } else if i < expand_mask.length() && expand_mask[i] {
       let kind = irc_match_rc_call(t)
       if kind == 1 {
         if irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
@@ -1992,11 +2410,11 @@ fn irc_within_inline_budget(fn_hdr : String, fn_lines : Array[String]) -> Bool {
         if irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
           ndec = ndec + 1L
         }
-      } else {
-        match irc_extract_def_lhs(t) {
-          Some(_) => ntmp = ntmp + 1L
-          None => ()
-        }
+      }
+    } else {
+      match irc_extract_def_lhs(t) {
+        Some(_) => ntmp = ntmp + 1L
+        None => ()
       }
     }
     i = i + 1
@@ -2103,10 +2521,15 @@ fn irc_emit_lines(lines : Array[String], out : StringBuilder) -> Unit {
 }
 
 ///|
-/// Step 4: Expand remaining RC calls with zero-extra-block `phi` fast path
-/// (reusing `@_rci_fast_` / `@_rcd_fast_` for both `local_rc` at `-20` and
-/// single-threaded frozen `shared_rc` at `-16`).
-fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
+/// Step 4: Expand RC calls selected in `expand_mask` with zero-extra-block `phi`
+/// fast path (reusing `@_rci_fast_` / `@_rcd_fast_` for both `local_rc` at `-20`
+/// and single-threaded frozen `shared_rc` at `-16`). Unselected RC calls stay as
+/// compact `call $pion_rc_*` without splitting their basic block.
+fn irc_expand_fn_body_mask(
+  fn_lines : Array[String],
+  expand_mask : Array[Bool],
+  out : StringBuilder,
+) -> Unit {
   let out_lines : Array[String] = []
   let tail_map : Map[String, String] = Map::new()
   let mut cur_orig = ""
@@ -2126,112 +2549,114 @@ fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
       cur_tail = lbl
       out_lines.push(line)
     } else {
-      let kind = irc_match_rc_call(t)
-      if kind != 0 {
-        let arg = irc_extract_rc_arg(t)
-        if irc_is_valid_qbe_val(arg) {
-          let id_s = rc_id.to_string()
-          rc_id = rc_id + 1
-          if kind == 1 {
-            out_lines.push("    %_rci_nz_" + id_s + " =w cnel " + arg + ", 0")
-            out_lines.push(
-              "    jnz %_rci_nz_" + id_s + ", @_rci_nn_" + id_s + ", @_rci_end_" + id_s,
-            )
-            out_lines.push("@_rci_nn_" + id_s)
-            out_lines.push("    %_rci_mt_" + id_s + " =w loaduw $pion_mt_flag")
-            out_lines.push(
-              "    jnz %_rci_mt_" + id_s + ", @_rci_slow_" + id_s + ", @_rci_st_" + id_s,
-            )
-            out_lines.push("@_rci_st_" + id_s)
-            out_lines.push("    %_rci_oa_" + id_s + " =l sub " + arg + ", 24")
-            out_lines.push("    %_rci_ot_" + id_s + " =w loaduw %_rci_oa_" + id_s)
-            out_lines.push("    %_rci_la_" + id_s + " =l sub " + arg + ", 20")
-            out_lines.push(
-              "    jnz %_rci_ot_" + id_s + ", @_rci_fast_" + id_s + ", @_rci_imm_" + id_s,
-            )
-            out_lines.push("@_rci_imm_" + id_s)
-            out_lines.push("    %_rci_fa_" + id_s + " =l sub " + arg + ", 10")
-            out_lines.push("    %_rci_fl_" + id_s + " =w loaduh %_rci_fa_" + id_s)
-            out_lines.push("    %_rci_im_" + id_s + " =w and %_rci_fl_" + id_s + ", 2")
-            out_lines.push("    %_rci_sa_" + id_s + " =l sub " + arg + ", 16")
-            out_lines.push(
-              "    jnz %_rci_im_" + id_s + ", @_rci_end_" + id_s + ", @_rci_fast_" + id_s,
-            )
-            out_lines.push("@_rci_fast_" + id_s)
-            out_lines.push(
-              "    %_rci_ra_" +
-              id_s +
-              " =l phi @_rci_st_" +
-              id_s +
-              " %_rci_la_" +
-              id_s +
-              ", @_rci_imm_" +
-              id_s +
-              " %_rci_sa_" +
-              id_s,
-            )
-            out_lines.push("    %_rci_rc_" + id_s + " =w loaduw %_rci_ra_" + id_s)
-            out_lines.push("    %_rci_r1_" + id_s + " =w add %_rci_rc_" + id_s + ", 1")
-            out_lines.push("    storew %_rci_r1_" + id_s + ", %_rci_ra_" + id_s)
-            out_lines.push("    jmp @_rci_end_" + id_s)
-            out_lines.push("@_rci_slow_" + id_s)
-            out_lines.push("    call $pion_rc_inc(l " + arg + ")")
-            out_lines.push("@_rci_end_" + id_s)
-            cur_tail = "@_rci_end_" + id_s
-          } else {
-            out_lines.push("    %_rcd_nz_" + id_s + " =w cnel " + arg + ", 0")
-            out_lines.push(
-              "    jnz %_rcd_nz_" + id_s + ", @_rcd_nn_" + id_s + ", @_rcd_end_" + id_s,
-            )
-            out_lines.push("@_rcd_nn_" + id_s)
-            out_lines.push("    %_rcd_mt_" + id_s + " =w loaduw $pion_mt_flag")
-            out_lines.push(
-              "    jnz %_rcd_mt_" + id_s + ", @_rcd_slow_" + id_s + ", @_rcd_st_" + id_s,
-            )
-            out_lines.push("@_rcd_st_" + id_s)
-            out_lines.push("    %_rcd_oa_" + id_s + " =l sub " + arg + ", 24")
-            out_lines.push("    %_rcd_ot_" + id_s + " =w loaduw %_rcd_oa_" + id_s)
-            out_lines.push("    %_rcd_la_" + id_s + " =l sub " + arg + ", 20")
-            out_lines.push(
-              "    jnz %_rcd_ot_" + id_s + ", @_rcd_fast_" + id_s + ", @_rcd_imm_" + id_s,
-            )
-            out_lines.push("@_rcd_imm_" + id_s)
-            out_lines.push("    %_rcd_fa_" + id_s + " =l sub " + arg + ", 10")
-            out_lines.push("    %_rcd_fl_" + id_s + " =w loaduh %_rcd_fa_" + id_s)
-            out_lines.push("    %_rcd_im_" + id_s + " =w and %_rcd_fl_" + id_s + ", 2")
-            out_lines.push("    %_rcd_sa_" + id_s + " =l sub " + arg + ", 16")
-            out_lines.push(
-              "    jnz %_rcd_im_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_fast_" + id_s,
-            )
-            out_lines.push("@_rcd_fast_" + id_s)
-            out_lines.push(
-              "    %_rcd_ra_" +
-              id_s +
-              " =l phi @_rcd_st_" +
-              id_s +
-              " %_rcd_la_" +
-              id_s +
-              ", @_rcd_imm_" +
-              id_s +
-              " %_rcd_sa_" +
-              id_s,
-            )
-            out_lines.push("    %_rcd_rc_" + id_s + " =w loaduw %_rcd_ra_" + id_s)
-            out_lines.push("    %_rcd_r1_" + id_s + " =w sub %_rcd_rc_" + id_s + ", 1")
-            out_lines.push("    storew %_rcd_r1_" + id_s + ", %_rcd_ra_" + id_s)
-            out_lines.push(
-              "    jnz %_rcd_r1_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_drop_" + id_s,
-            )
-            out_lines.push("@_rcd_drop_" + id_s)
-            out_lines.push("    call $pion_destroy_obj(l " + arg + ")")
-            out_lines.push("    jmp @_rcd_end_" + id_s)
-            out_lines.push("@_rcd_slow_" + id_s)
-            out_lines.push("    call $pion_rc_dec(l " + arg + ")")
-            out_lines.push("@_rcd_end_" + id_s)
-            cur_tail = "@_rcd_end_" + id_s
+      if i < expand_mask.length() && expand_mask[i] {
+        let kind = irc_match_rc_call(t)
+        if kind != 0 {
+          let arg = irc_extract_rc_arg(t)
+          if irc_is_valid_qbe_val(arg) {
+            let id_s = rc_id.to_string()
+            rc_id = rc_id + 1
+            if kind == 1 {
+              out_lines.push("    %_rci_nz_" + id_s + " =w cnel " + arg + ", 0")
+              out_lines.push(
+                "    jnz %_rci_nz_" + id_s + ", @_rci_nn_" + id_s + ", @_rci_end_" + id_s,
+              )
+              out_lines.push("@_rci_nn_" + id_s)
+              out_lines.push("    %_rci_mt_" + id_s + " =w loaduw $pion_mt_flag")
+              out_lines.push(
+                "    jnz %_rci_mt_" + id_s + ", @_rci_slow_" + id_s + ", @_rci_st_" + id_s,
+              )
+              out_lines.push("@_rci_st_" + id_s)
+              out_lines.push("    %_rci_oa_" + id_s + " =l sub " + arg + ", 24")
+              out_lines.push("    %_rci_ot_" + id_s + " =w loaduw %_rci_oa_" + id_s)
+              out_lines.push("    %_rci_la_" + id_s + " =l sub " + arg + ", 20")
+              out_lines.push(
+                "    jnz %_rci_ot_" + id_s + ", @_rci_fast_" + id_s + ", @_rci_imm_" + id_s,
+              )
+              out_lines.push("@_rci_imm_" + id_s)
+              out_lines.push("    %_rci_fa_" + id_s + " =l sub " + arg + ", 10")
+              out_lines.push("    %_rci_fl_" + id_s + " =w loaduh %_rci_fa_" + id_s)
+              out_lines.push("    %_rci_im_" + id_s + " =w and %_rci_fl_" + id_s + ", 2")
+              out_lines.push("    %_rci_sa_" + id_s + " =l sub " + arg + ", 16")
+              out_lines.push(
+                "    jnz %_rci_im_" + id_s + ", @_rci_end_" + id_s + ", @_rci_fast_" + id_s,
+              )
+              out_lines.push("@_rci_fast_" + id_s)
+              out_lines.push(
+                "    %_rci_ra_" +
+                id_s +
+                " =l phi @_rci_st_" +
+                id_s +
+                " %_rci_la_" +
+                id_s +
+                ", @_rci_imm_" +
+                id_s +
+                " %_rci_sa_" +
+                id_s,
+              )
+              out_lines.push("    %_rci_rc_" + id_s + " =w loaduw %_rci_ra_" + id_s)
+              out_lines.push("    %_rci_r1_" + id_s + " =w add %_rci_rc_" + id_s + ", 1")
+              out_lines.push("    storew %_rci_r1_" + id_s + ", %_rci_ra_" + id_s)
+              out_lines.push("    jmp @_rci_end_" + id_s)
+              out_lines.push("@_rci_slow_" + id_s)
+              out_lines.push("    call $pion_rc_inc(l " + arg + ")")
+              out_lines.push("@_rci_end_" + id_s)
+              cur_tail = "@_rci_end_" + id_s
+            } else {
+              out_lines.push("    %_rcd_nz_" + id_s + " =w cnel " + arg + ", 0")
+              out_lines.push(
+                "    jnz %_rcd_nz_" + id_s + ", @_rcd_nn_" + id_s + ", @_rcd_end_" + id_s,
+              )
+              out_lines.push("@_rcd_nn_" + id_s)
+              out_lines.push("    %_rcd_mt_" + id_s + " =w loaduw $pion_mt_flag")
+              out_lines.push(
+                "    jnz %_rcd_mt_" + id_s + ", @_rcd_slow_" + id_s + ", @_rcd_st_" + id_s,
+              )
+              out_lines.push("@_rcd_st_" + id_s)
+              out_lines.push("    %_rcd_oa_" + id_s + " =l sub " + arg + ", 24")
+              out_lines.push("    %_rcd_ot_" + id_s + " =w loaduw %_rcd_oa_" + id_s)
+              out_lines.push("    %_rcd_la_" + id_s + " =l sub " + arg + ", 20")
+              out_lines.push(
+                "    jnz %_rcd_ot_" + id_s + ", @_rcd_fast_" + id_s + ", @_rcd_imm_" + id_s,
+              )
+              out_lines.push("@_rcd_imm_" + id_s)
+              out_lines.push("    %_rcd_fa_" + id_s + " =l sub " + arg + ", 10")
+              out_lines.push("    %_rcd_fl_" + id_s + " =w loaduh %_rcd_fa_" + id_s)
+              out_lines.push("    %_rcd_im_" + id_s + " =w and %_rcd_fl_" + id_s + ", 2")
+              out_lines.push("    %_rcd_sa_" + id_s + " =l sub " + arg + ", 16")
+              out_lines.push(
+                "    jnz %_rcd_im_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_fast_" + id_s,
+              )
+              out_lines.push("@_rcd_fast_" + id_s)
+              out_lines.push(
+                "    %_rcd_ra_" +
+                id_s +
+                " =l phi @_rcd_st_" +
+                id_s +
+                " %_rcd_la_" +
+                id_s +
+                ", @_rcd_imm_" +
+                id_s +
+                " %_rcd_sa_" +
+                id_s,
+              )
+              out_lines.push("    %_rcd_rc_" + id_s + " =w loaduw %_rcd_ra_" + id_s)
+              out_lines.push("    %_rcd_r1_" + id_s + " =w sub %_rcd_rc_" + id_s + ", 1")
+              out_lines.push("    storew %_rcd_r1_" + id_s + ", %_rcd_ra_" + id_s)
+              out_lines.push(
+                "    jnz %_rcd_r1_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_drop_" + id_s,
+              )
+              out_lines.push("@_rcd_drop_" + id_s)
+              out_lines.push("    call $pion_destroy_obj(l " + arg + ")")
+              out_lines.push("    jmp @_rcd_end_" + id_s)
+              out_lines.push("@_rcd_slow_" + id_s)
+              out_lines.push("    call $pion_rc_dec(l " + arg + ")")
+              out_lines.push("@_rcd_end_" + id_s)
+              cur_tail = "@_rcd_end_" + id_s
+            }
+            i = i + 1
+            continue
           }
-          i = i + 1
-          continue
         }
       }
       out_lines.push(line)
@@ -2258,11 +2683,88 @@ fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
 }
 
 ///|
+struct IrcModFn {
+  line_start : Int
+  body_end : Int
+  close_end : Int
+  fn_end : Int
+  fn_hdr : String
+  fn_name : String
+  cleaned : Array[String]
+  cfg : IrcCfg
+  in_loop : Array[Bool]
+  eff_insts : Int
+  rc_count : Int
+}
+
+///|
+/// Scan a function's lines block-by-block to compute:
+/// - `eff_insts`: effective non-empty, non-comment, non-label instructions
+/// - `rc_count`: remaining valid `$pion_rc_inc`/`$pion_rc_dec` calls
+/// - direct call targets appended to `fn_callees` (all blocks) and
+///   `loop_callees` (only blocks with `in_loop[bi] == true`, when `!cfg.disable_cfg`).
+fn irc_analyze_fn_body(
+  fn_lines : Array[String],
+  cfg : IrcCfg,
+  in_loop : Array[Bool],
+  fn_callees : Array[String],
+  loop_callees : Array[String],
+) -> (Int, Int) {
+  let seen_all : Map[String, Bool] = Map::new()
+  let seen_loop : Map[String, Bool] = Map::new()
+  let reachable = if cfg.disable_cfg { [] } else { irc_compute_reachable_blocks(cfg) }
+  let mut eff_insts = 0
+  let mut rc_count = 0
+  let nblk = cfg.blk_starts.length()
+  let mut bi = 0
+  while bi < nblk {
+    let bs = cfg.blk_starts[bi]
+    let be = cfg.blk_ends[bi]
+    let blk_reach = !cfg.disable_cfg && bi < reachable.length() && reachable[bi]
+    let blk_hot = blk_reach && bi < in_loop.length() && in_loop[bi]
+    let mut li = bs
+    while li < be {
+      let t = irc_strip_comment(fn_lines[li])
+      if t.length() > 0 && str_code_at(t, 0) != 64 {
+        eff_insts = eff_insts + 1
+        let kind = irc_match_rc_call(t)
+        if kind != 0 {
+          if irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
+            rc_count = rc_count + 1
+          }
+        } else if blk_reach {
+          let callee = irc_extract_direct_call_target(t)
+          if callee.length() > 0 {
+            if !seen_all.contains(callee) {
+              seen_all.set(callee, true)
+              fn_callees.push(callee)
+            }
+            if blk_hot && !seen_loop.contains(callee) {
+              seen_loop.set(callee, true)
+              loop_callees.push(callee)
+            }
+          }
+        }
+      }
+      li = li + 1
+    }
+    bi = bi + 1
+  }
+  (eff_insts, rc_count)
+}
+
+///|
 /// Function-level two-tier fast-path driver over raw SSA text:
 /// 1. Non-function lines and functions without `$pion_rc_` are streamed verbatim
-///    without line splitting or Map allocation.
-/// 2. Functions with `$pion_rc_` but without `_hdr` still run same-block pair
-///    cancellation and release inline expansion, skipping only `irc_collect_immortal_regs`.
+///    without line splitting or Map allocation (in `do_inline` mode, non-RC
+///    functions containing `call` are lightly scanned for loop-callee propagation
+///    while still emitted verbatim).
+/// 2. Functions with `$pion_rc_` always run `irc_cleanup_fn_body_fast` (0 code bloat).
+/// 3. In `do_inline` mode, remaining RC calls are selectively expanded for:
+///    - loop basic blocks (deterministic iterative Tarjan SCC),
+///    - intra-module `called_in_loop` callees (direct loop callees + 1 hop, `eff_insts <= 128`),
+///    - small leaf/recursive functions (`rc_count <= 2 && eff_insts <= 32`),
+///    subject to the `Int64` product budget `est_blk * est_tmp <= 2^28`.
 fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String {
   if !ssa.contains("$pion_rc_inc") && !ssa.contains("$pion_rc_dec") {
     return ssa
@@ -2274,6 +2776,122 @@ fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String
   let mut in_quote = false
   let mut escaped = false
   let mut brace_depth = 0
+
+  if !do_inline {
+    while pos < n {
+      let line_start = pos
+      let mut line_end = pos
+      while line_end < n && str_code_at(ssa, line_end) != 10 {
+        line_end = line_end + 1
+      }
+      let next_pos = if line_end < n { line_end + 1 } else { n }
+      let is_hdr = !in_quote &&
+        brace_depth == 0 &&
+        irc_is_fn_hdr_range(ssa, line_start, line_end)
+      let (nq, ne, nd, n_braces) = irc_scan_line_lex(
+        ssa,
+        line_start,
+        next_pos,
+        in_quote,
+        escaped,
+        brace_depth,
+      )
+      in_quote = nq
+      escaped = ne
+      brace_depth = nd
+      if is_hdr {
+        if brace_depth == 0 {
+          pos = next_pos
+          continue
+        }
+        let body_start = next_pos
+        let mut cur = body_start
+        let mut body_end = n
+        let mut close_end = n
+        let mut fn_end = n
+        let mut has_unclean = in_quote || brace_depth != 1 || n_braces != 1
+        while cur < n {
+          let ls = cur
+          let mut le = cur
+          while le < n && str_code_at(ssa, le) != 10 {
+            le = le + 1
+          }
+          let np = if le < n { le + 1 } else { n }
+          if !in_quote && brace_depth == 1 && irc_is_close_brace_range(ssa, ls, le) {
+            brace_depth = 0
+            body_end = ls
+            close_end = le
+            fn_end = np
+            break
+          }
+          let (bq, be, bd, b_braces) = irc_scan_line_lex(
+            ssa,
+            ls,
+            np,
+            in_quote,
+            escaped,
+            brace_depth,
+          )
+          in_quote = bq
+          escaped = be
+          brace_depth = bd
+          if in_quote || b_braces > 0 {
+            has_unclean = true
+          }
+          if !in_quote && brace_depth == 0 {
+            fn_end = np
+            break
+          }
+          cur = np
+        }
+        if has_unclean || brace_depth != 0 {
+          pos = fn_end
+          continue
+        }
+        let flags = irc_scan_body_flags(ssa, body_start, body_end)
+        if (flags & 1) == 0 {
+          pos = fn_end
+          continue
+        }
+        if line_start > raw_start {
+          out.write_string(slice_str(ssa, raw_start, line_start))
+        }
+        let fn_hdr = slice_str(ssa, line_start, line_end)
+        out.write_string(fn_hdr)
+        out.write_char('\n')
+        let body = irc_split_lines_range(ssa, body_start, body_end)
+        let has_hdr = (flags & 2) != 0
+        let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, has_hdr, disable_mask)
+        irc_emit_lines(cleaned, out)
+        if body_end < n {
+          out.write_string(slice_str(ssa, body_end, close_end))
+          out.write_char('\n')
+        }
+        pos = fn_end
+        raw_start = fn_end
+      } else {
+        pos = next_pos
+      }
+    }
+    if raw_start == 0 && n > 0 && str_code_at(ssa, n - 1) == 10 {
+      return ssa
+    }
+    if raw_start < n {
+      out.write_string(slice_str(ssa, raw_start, n))
+      if str_code_at(ssa, n - 1) != 10 {
+        out.write_char('\n')
+      }
+    }
+    return out.to_string()
+  }
+
+  // Release (`do_inline == true`):
+  // Pass 1: clean all RC-bearing functions, build CFGs + Tarjan SCCs, and collect
+  // intra-module call graph + loop-call seeds.
+  let mod_fns : Array[IrcModFn] = []
+  let fn_eff_insts : Map[String, Int] = Map::new()
+  let all_callees : Map[String, Array[String]] = Map::new()
+  let loop_callees : Array[String] = []
 
   while pos < n {
     let line_start = pos
@@ -2298,7 +2916,6 @@ fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String
     brace_depth = nd
     if is_hdr {
       if brace_depth == 0 {
-        // Single-line function definition (closed on header line): pass through verbatim.
         pos = next_pos
         continue
       }
@@ -2343,40 +2960,158 @@ fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String
         cur = np
       }
       if has_unclean || brace_depth != 0 {
-        // Function contains a multi-line quoted token or non-standalone brace boundary
-        // (e.g. `} export function ... {`): pass the entire span through verbatim.
         pos = fn_end
         continue
       }
       let flags = irc_scan_body_flags(ssa, body_start, body_end)
-      if (flags & 1) == 0 {
-        // Fast path 1: function contains no `$pion_rc_` — keep verbatim in raw chunk.
+      let has_rc = (flags & 1) != 0
+      let has_call = (flags & 4) != 0
+      if !has_rc && !has_call {
         pos = fn_end
         continue
       }
-      if line_start > raw_start {
-        out.write_string(slice_str(ssa, raw_start, line_start))
-      }
       let fn_hdr = slice_str(ssa, line_start, line_end)
-      out.write_string(fn_hdr)
-      out.write_char('\n')
+      let fn_name = irc_extract_fn_name(fn_hdr)
       let body = irc_split_lines_range(ssa, body_start, body_end)
+      if !has_rc {
+        let cfg = irc_build_cfg(body)
+        let in_loop = if cfg.disable_cfg { [] } else { irc_compute_loop_blocks(cfg) }
+        let callees : Array[String] = []
+        let (eff_insts, _) = irc_analyze_fn_body(body, cfg, in_loop, callees, loop_callees)
+        if fn_name.length() > 0 {
+          fn_eff_insts.set(fn_name, eff_insts)
+          if callees.length() > 0 {
+            all_callees.set(fn_name, callees)
+          }
+        }
+        pos = fn_end
+        continue
+      }
       let has_hdr = (flags & 2) != 0
       let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, has_hdr, disable_mask)
-      if do_inline && irc_within_inline_budget(fn_hdr, cleaned) {
-        irc_expand_fn_body(cleaned, out)
-      } else {
-        irc_emit_lines(cleaned, out)
+      let cfg = irc_build_cfg(cleaned)
+      let in_loop = if cfg.disable_cfg { [] } else { irc_compute_loop_blocks(cfg) }
+      let callees : Array[String] = []
+      let (eff_insts, rc_count) = irc_analyze_fn_body(
+        cleaned,
+        cfg,
+        in_loop,
+        callees,
+        loop_callees,
+      )
+      if fn_name.length() > 0 {
+        fn_eff_insts.set(fn_name, eff_insts)
+        if callees.length() > 0 {
+          all_callees.set(fn_name, callees)
+        }
       }
-      if body_end < n {
-        out.write_string(slice_str(ssa, body_end, close_end))
-        out.write_char('\n')
-      }
+      mod_fns.push(IrcModFn::{
+        line_start: line_start,
+        body_end: body_end,
+        close_end: close_end,
+        fn_end: fn_end,
+        fn_hdr: fn_hdr,
+        fn_name: fn_name,
+        cleaned: cleaned,
+        cfg: cfg,
+        in_loop: in_loop,
+        eff_insts: eff_insts,
+        rc_count: rc_count,
+      })
       pos = fn_end
-      raw_start = fn_end
     } else {
       pos = next_pos
     }
+  }
+
+  // Propagate `called_in_loop` (direct loop callees + 1 hop) across compact
+  // intra-module callees (`eff_insts <= 128`), plus small leaf/recursive fallback.
+  let max_hot_callee_insts = 128
+  let max_hot_hops = 1
+  let small_fn_max_rc = 2
+  let small_fn_max_insts = 32
+
+  let hot_callees : Map[String, Bool] = Map::new()
+  let mut frontier : Array[String] = []
+  let mut li = 0
+  while li < loop_callees.length() {
+    let tgt = loop_callees[li]
+    if !hot_callees.contains(tgt) {
+      match fn_eff_insts.get(tgt) {
+        Some(insts) =>
+          if insts <= max_hot_callee_insts {
+            hot_callees.set(tgt, true)
+            frontier.push(tgt)
+          }
+        None => ()
+      }
+    }
+    li = li + 1
+  }
+  let mut hop = 0
+  while hop < max_hot_hops && frontier.length() > 0 {
+    let next_frontier : Array[String] = []
+    let mut fi = 0
+    while fi < frontier.length() {
+      let cur_fn = frontier[fi]
+      match all_callees.get(cur_fn) {
+        Some(callees) => {
+          let mut ci = 0
+          while ci < callees.length() {
+            let tgt = callees[ci]
+            if !hot_callees.contains(tgt) {
+              match fn_eff_insts.get(tgt) {
+                Some(insts) =>
+                  if insts <= max_hot_callee_insts {
+                    hot_callees.set(tgt, true)
+                    next_frontier.push(tgt)
+                  }
+                None => ()
+              }
+            }
+            ci = ci + 1
+          }
+        }
+        None => ()
+      }
+      fi = fi + 1
+    }
+    frontier = next_frontier
+    hop = hop + 1
+  }
+
+  // Pass 2: emit module with selective RC expansion.
+  let mut mi = 0
+  while mi < mod_fns.length() {
+    let mf = mod_fns[mi]
+    if mf.line_start > raw_start {
+      out.write_string(slice_str(ssa, raw_start, mf.line_start))
+    }
+    out.write_string(mf.fn_hdr)
+    out.write_char('\n')
+    if mf.rc_count == 0 || mf.cfg.disable_cfg {
+      irc_emit_lines(mf.cleaned, out)
+    } else {
+      let is_hot = mf.fn_name.length() > 0 && hot_callees.contains(mf.fn_name)
+      let is_small = mf.rc_count <= small_fn_max_rc && mf.eff_insts <= small_fn_max_insts
+      let (expand_mask, sel_count) = irc_build_expand_mask(
+        mf.cleaned,
+        mf.cfg,
+        mf.in_loop,
+        is_hot || is_small,
+      )
+      if sel_count > 0 && irc_within_inline_budget_mask(mf.fn_hdr, mf.cleaned, expand_mask) {
+        irc_expand_fn_body_mask(mf.cleaned, expand_mask, out)
+      } else {
+        irc_emit_lines(mf.cleaned, out)
+      }
+    }
+    if mf.body_end < n {
+      out.write_string(slice_str(ssa, mf.body_end, mf.close_end))
+      out.write_char('\n')
+    }
+    raw_start = mf.fn_end
+    mi = mi + 1
   }
 
   if raw_start == 0 && n > 0 && str_code_at(ssa, n - 1) == 10 {

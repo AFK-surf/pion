@@ -649,25 +649,92 @@ fi
 python3 - "$TMP_DIR/a2_amd64.s" "$TMP_DIR/a2_arm64.s" "$TMP_DIR/a2_amd64.rega" "$TMP_DIR/a2_arm64.rega" <<'PYEOF'
 import re, sys
 
-def audit_asm(path, fn_sub, is_arm64):
-    txt = open(path).read()
-    m = re.search(rf'({fn_sub}:.*?/\* end function)', txt, re.S)
-    assert m, f"{fn_sub} not found in {path}"
-    body = m.group(1)
+def audit_asm_text(body, label, is_arm64):
     # Check that cold callq/bl pion_rc_inc_slow / pion_rc_dec_slow / pion_rc_drop are sunk
-    # past the main loop backward branch (no cold RC calls inside the hot loop body)
+    # past the main loop backward branch (no cold RC calls inside the hot loop body).
+    # With loop-guided selective inline_rc, the post-loop epilogue may retain a compact
+    # `call pion_rc_dec` right before `ret`, which runs once after loop exit.
     lines = body.splitlines()
     ret_idx = next((i for i, l in enumerate(lines) if re.match(r'^\tret\b', l)), -1)
-    assert ret_idx > 0, f"no ret found in {path}"
-    slow_idxs = [i for i, l in enumerate(lines) if re.search(r'(?:pion_rc_(?:inc|dec)|pion_destroy_obj)\b', l)]
+    assert ret_idx > 0, f"no ret found in {label}"
+    # Locate the loop's backward branch using real arch branch instructions only
+    # (never matching address-taking instructions like `leaq .Lold(%rip), %rax`).
+    br_re = (
+        r'^\t(?:b(?:\.\w+)?|cbn?z|tbn?z)\b.*?(?<!\w)(\.?L\w+)\b'
+        if is_arm64
+        else r'^\t(?:jmp|j[a-z]{1,3})\b.*?(?<!\w)(\.?L\w+)\b'
+    )
+    lbl_pos = {}
+    last_back_br = -1
+    for i, l in enumerate(lines[:ret_idx]):
+        lm = re.match(r'^(\.?L\w+):', l)
+        if lm:
+            lbl_pos[lm.group(1)] = i
+        else:
+            bm = re.match(br_re, l)
+            if bm and bm.group(1) in lbl_pos and lbl_pos[bm.group(1)] < i:
+                last_back_br = i
+    assert last_back_br > 0, f"no loop backward branch found before ret in {label}"
+    call_re = r'^\t(?:bl|callq?)\b.*\b(?:_?pion_rc_(?:inc|dec)|_?pion_destroy_obj)\b'
+    slow_idxs = [i for i, l in enumerate(lines) if re.match(call_re, l)]
+    in_loop_calls = [i for i in slow_idxs if i < last_back_br]
     after_ret = sum(1 for i in slow_idxs if i > ret_idx)
     mov_re = r'^\tmov\b' if is_arm64 else r'^\tmov[qwl]?\b'
     hot_movs = sum(1 for l in lines[:ret_idx] if re.match(mov_re, l))
     uncond_re = r'^\tb\t' if is_arm64 else r'^\tjmp\t'
     hot_jmps = sum(1 for l in lines[:ret_idx] if re.match(uncond_re, l))
-    assert len(slow_idxs) > 0, f"expected slow RC calls in {path}"
-    assert after_ret == len(slow_idxs), f"expected all {len(slow_idxs)} cold RC calls sunk after ret ({ret_idx}), got {after_ret} in {path}"
-    return len(slow_idxs), hot_movs, hot_jmps
+    assert len(in_loop_calls) == 0, f"found {len(in_loop_calls)} cold RC calls inside hot loop (before L{last_back_br}): {in_loop_calls} in {label}"
+    assert after_ret >= 6, f"expected >= 6 sunk loop RC slow/drop calls after ret ({ret_idx}), got {after_ret} in {label}"
+    return after_ret, hot_movs, hot_jmps
+
+def audit_asm(path, fn_sub, is_arm64):
+    txt = open(path).read()
+    m = re.search(rf'({fn_sub}:.*?/\* end function)', txt, re.S)
+    assert m, f"{fn_sub} not found in {path}"
+    return audit_asm_text(m.group(1), path, is_arm64)
+
+# Self-test negative cases for audit_asm_text:
+# (a) `leaq .Lold(%rip), %rax` backward label reference without a real backward branch must be rejected.
+neg_lea_only = "\n".join([
+    "fake_fn:",
+    ".Lold:",
+    "\tleaq .Lold(%rip), %rax",
+    "\tret",
+    "\tcallq pion_rc_inc", "\tcallq pion_rc_inc", "\tcallq pion_rc_dec",
+    "\tcallq pion_rc_dec", "\tcallq pion_destroy_obj", "\tcallq pion_destroy_obj",
+])
+try:
+    audit_asm_text(neg_lea_only, "neg_lea_only", False)
+    raise RuntimeError("neg_lea_only should have failed audit_asm_text")
+except AssertionError as e:
+    assert "no loop backward branch" in str(e), str(e)
+
+# (b) Real cold RC call before backward branch must be rejected on both amd64 and arm64.
+for _label, _is_arm64, _snippet in [
+    ("neg_amd64_in_loop", False, "\n".join([
+        "fake_amd64:",
+        ".Lloop:",
+        "\tcallq pion_rc_dec",
+        "\tjl .Lloop",
+        "\tret",
+        "\tcallq pion_rc_inc", "\tcallq pion_rc_inc", "\tcallq pion_rc_dec",
+        "\tcallq pion_rc_dec", "\tcallq pion_destroy_obj", "\tcallq pion_destroy_obj",
+    ])),
+    ("neg_arm64_in_loop", True, "\n".join([
+        "fake_arm64:",
+        "Lloop:",
+        "\tbl _pion_rc_dec",
+        "\tb.lt Lloop",
+        "\tret",
+        "\tbl _pion_rc_inc", "\tbl _pion_rc_inc", "\tbl _pion_rc_dec",
+        "\tbl _pion_rc_dec", "\tbl _pion_destroy_obj", "\tbl _pion_destroy_obj",
+    ])),
+]:
+    try:
+        audit_asm_text(_snippet, _label, _is_arm64)
+        raise RuntimeError(f"{_label} should have failed audit_asm_text")
+    except AssertionError as e:
+        assert "inside hot loop" in str(e), str(e)
 
 def rega_stats(path, fn_sub):
     txt = open(path).read()
