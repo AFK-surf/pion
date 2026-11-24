@@ -2092,9 +2092,16 @@ with open(os.path.join(r2_di_src, "di_wbtest.mbt"), "w") as f:
         'test "di_quoted_pass" {\n'
         '  debug_inspect("ab", content="\\"ab\\"")\n'
         '  debug_inspect([(1, 2), (3, 4)], content="[(1, 2), (3, 4)]")\n'
+        '  debug_inspect("\\u{00}\\u{01}\\u{7f}", content="\\"\\\\u{00}\\\\u{01}\x7f\\"")\n'
+        '  debug_inspect(\'\\u{00}\', content="\'\\\\u{00}\'")\n'
+        '  debug_inspect(\'\\u{7f}\', content="\'\\\\u{7f}\'")\n'
+        '  debug_inspect(\'\\u{200b}\', content="\'\\\\u{200b}\'")\n'
         '}\n'
         'test "di_unquoted_fail" {\n'
         '  debug_inspect("ab", content="ab")\n'
+        '}\n'
+        'test "di_nul_slash0_fail" {\n'
+        '  debug_inspect("\\u{00}", content="\\"\\\\0\\"")\n'
         '}\n'
     )
 r2_di = run_cli(["--src", r2_di_src, "--out", r2_di_out, "--target", "native", "--mode", "publish", "--with-tests",
@@ -2107,7 +2114,23 @@ for fn in os.listdir(r2_di_out):
 with open(os.path.join(pkg_r2_di, "pion.toml"), "w") as f:
     f.write(f'[package]\nname = "r2_di"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
 r2_di_t = subprocess.run([pionc, "test", pkg_r2_di], capture_output=True, text=True)
-assert r2_di_t.returncode != 0 and "1 passed; 1 failed" in r2_di_t.stdout, f"R2 debug_inspect expected 1 passed + 1 failed, got:\n{r2_di_t.stdout}\n{r2_di_t.stderr}"
+assert r2_di_t.returncode != 0 and "1 passed; 2 failed" in r2_di_t.stdout, f"R2 debug_inspect expected 1 passed + 2 failed, got:\n{r2_di_t.stdout}\n{r2_di_t.stderr}"
+
+# (2b) Astra P0-2: Check 2 symlink collision (broken logic_test.mbt + valid logic_test__mbt_test_chk.mbt) must FAIL & preserve --out!
+r2_col_src = os.path.join(root, "r2_col_src")
+r2_col_out = os.path.join(root, "r2_col_out")
+os.makedirs(r2_col_src, exist_ok=True)
+os.makedirs(r2_col_out, exist_ok=True)
+with open(os.path.join(r2_col_out, "keep.pion"), "w") as f:
+    f.write("// KEEP_SENTINEL\n")
+with open(os.path.join(r2_col_src, "logic_test.mbt"), "w") as f:
+    f.write('test "bad_logic" { let v : Int = "text"; let _ = v }\n')
+with open(os.path.join(r2_col_src, "logic_test__mbt_test_chk.mbt"), "w") as f:
+    f.write("pub fn ok_helper() -> Int { 1 }\n")
+r2_col = run_cli(["--src", r2_col_src, "--out", r2_col_out, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r2_col.returncode != 0, "R2 P0-2 Check 2 collision with broken logic_test.mbt must fail publish --with-tests"
+assert open(os.path.join(r2_col_out, "keep.pion")).read() == "// KEEP_SENTINEL\n", "R2 P0-2 failed publish must preserve --out"
 
 # (3) Item 1 negative: debug_inspect on unsupported user struct must fail closed with MBT2PION_UNSUPPORTED_SYNTAX!
 r2_di_bad_src = os.path.join(root, "r2_di_bad_src")

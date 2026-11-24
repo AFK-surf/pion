@@ -714,10 +714,21 @@ fn case_wave_m2_round2() -> Unit {
   trace("iter", "\{a1}:\{c1},\{a2}:\{c2},zip_unused=\{z_unused_cnt},zip_any=\{za}:\{zf}:\{zg}")
   check("r2.iter_lazy", a1 && c1 == 2 && !a2 && c2 == 3 && z_unused_cnt == "0:0" && za && zf == 2 && zg == 2)
 
-  // P0-1: Debug formatting for String & Char
-  let ds = "\"ab\\n\\t\\\\\\\"\""
-  trace("dbg_str", ds)
-  check("r2.dbg_str", ds.length() == 12)
+  // P0-1 + P2: Debug formatting for String & Char + arr_iter length snapshot
+  let ds0 = "\u{00}\u{01}\u{1f}\u{7f}\b\n\t\\\"".escape()
+  let dc0 = '\u{00}'.escape()
+  let dc7f = '\u{7f}'.escape()
+  let dc200b = '\u{200b}'.escape()
+  let dc_a = 'A'.escape()
+  trace("dbg_str", ds0)
+  trace("dbg_chr", "\{dc0}|\{dc7f}|\{dc200b}|\{dc_a}")
+  let snap_xs = [1, 2]
+  let snap_it = snap_xs.iter()
+  snap_xs.push(3)
+  let snap_cnt = snap_it.count()
+  let fold_v = [1, 2].iter().fold(init=0, fn(x, y) { x * 10 + y })
+  trace("iter_snap_fold", "\{snap_cnt},\{fold_v}")
+  check("r2.dbg_str", ds0.contains("\\u{00}\\u{01}\\u{1f}") && dc0 == "'\\u{00}'" && dc7f == "'\\u{7f}'" && dc200b == "'\\u{200b}'" && snap_cnt == 2 && fold_v == 12)
 }
 
 ///|

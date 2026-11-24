@@ -3653,6 +3653,20 @@ fn lower_one_token_or_form(
         return (trivia + "{ let _ = " + clean_cap + "; [] }", close_p + 1)
       }
     }
+    // `Array::new()` / `Array::new(capacity=<expr>)` -> `[]` / `{ let _ = <expr>; [] }`
+    if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Array" &&
+    i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
+    tokens[i + 2].raw == "new" && tokens[i + 3].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 3)
+      if close_p == i + 4 {
+        return (trivia + "[]", close_p + 1)
+      }
+      if i + 6 < close_p && tokens[i + 4].kind == TokenKind::Ident && tokens[i + 4].raw == "capacity" && tokens[i + 5].kind == TokenKind::Eq {
+        let cap_e = lower_expr_range(ctx, tokens, i + 6, close_p, file, false).trim()
+        let clean_cap = if cap_e.ends_with(",") { cap_e.slice(0, cap_e.length() - 1).trim() } else { cap_e }
+        return (trivia + "{ let _ = " + clean_cap + "; [] }", close_p + 1)
+      }
+    }
     // `Array::makei(...)` -> `mbt_compat::arr_makei(...)`
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Array" &&
     i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
@@ -4673,6 +4687,8 @@ fn lower_match_arms_with_ty(
       let cp = find_matching_delim(tokens, i + 1)
       if cp == pat_end - 1 {
         let sub_pats : Array[String] = []
+        let sub_ranges : Array[(Int, Int)] = []
+        let mut has_array_subpat = false
         let mut all_irrefutable = true
         let mut bad_rest = false
         let mut saw_rest = false
@@ -4697,8 +4713,12 @@ fn lower_match_arms_with_ty(
             pe = pe + 1
           }
           if pe > pi {
+            if tokens[pi].kind == TokenKind::LBracket && find_matching_delim(tokens, pi) == pe - 1 {
+              has_array_subpat = true
+            }
             let ps = lower_expr_range(ctx, tokens, pi, pe, file, true).trim()
             sub_pats.push(ps)
+            sub_ranges.push((pi, pe))
             if !(pe == pi + 1 && (tokens[pi].kind == TokenKind::Ident || tokens[pi].kind == TokenKind::Underscore)) {
               all_irrefutable = false
             }
@@ -4715,7 +4735,89 @@ fn lower_match_arms_with_ty(
           ))
         }
         let ts_var = fresh_temp(ctx, "ts")
-        if sub_pats.length() == 0 {
+        if has_array_subpat {
+          // Astra P1-2: Option-threading lowering for nested array sub-patterns inside tuple structs;
+          // binds array elements ONCE before guard so guard mutations cannot corrupt bound values!
+          let len_checks : Array[String] = []
+          let flat_exprs : Array[String] = []
+          let flat_pats : Array[String] = []
+          let mut k = 0
+          while k < sub_ranges.length() {
+            let sr = sub_ranges[k]
+            let field_e = ts_var + "._" + k.to_string()
+            if tokens[sr.0].kind == TokenKind::LBracket && find_matching_delim(tokens, sr.0) == sr.1 - 1 {
+              let cbr = sr.1 - 1
+              let elems : Array[String] = []
+              let mut ei = sr.0 + 1
+              while ei < cbr {
+                if tokens[ei].kind == TokenKind::Comma { ei = ei + 1; continue }
+                let mut ee = ei
+                let mut ed = 0
+                while ee < cbr {
+                  let ek = tokens[ee].kind
+                  if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { ed = ed + 1 }
+                  else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { ed = ed - 1 }
+                  else if ed == 0 && ek == TokenKind::Comma { break }
+                  ee = ee + 1
+                }
+                if tokens[ei].kind == TokenKind::DotDot {
+                  ctx.diags.push(diag_error(
+                    "MBT2PION_UNSUPPORTED_SYNTAX",
+                    file,
+                    tokens[ei].line,
+                    tokens[ei].col,
+                    "array rest pattern `..` inside tuple struct `" + tokens[i].raw + "` is not supported",
+                  ))
+                } else if ee > ei {
+                  elems.push(lower_expr_range(ctx, tokens, ei, ee, file, true).trim())
+                }
+                ei = ee + 1
+              }
+              len_checks.push(field_e + ".length() == " + elems.length().to_string())
+              let mut j = 0
+              while j < elems.length() {
+                flat_exprs.push(field_e + "[" + j.to_string() + "]")
+                flat_pats.push(elems[j])
+                j = j + 1
+              }
+            } else {
+              flat_exprs.push(field_e)
+              flat_pats.push(sub_pats[k])
+            }
+            k = k + 1
+          }
+          let lc_sb = StringBuilder()
+          let mut li = 0
+          while li < len_checks.length() {
+            if li > 0 { lc_sb.write_string(" && ") }
+            lc_sb.write_string(len_checks[li])
+            li = li + 1
+          }
+          let g_rhs = if guard_str.length() > 0 { "(" + guard_str + ")" } else { "true" }
+          let inner_opt = if flat_exprs.length() == 0 {
+            "if " + lc_sb.to_string() + " && " + g_rhs + " { Some(" + body_raw.trim() + ") } else { None }"
+          } else {
+            let scrut_f = if flat_exprs.length() == 1 { flat_exprs[0] } else { "(" + join_comma(flat_exprs) + ")" }
+            let pat_f = if flat_pats.length() == 1 { flat_pats[0] } else { "(" + join_comma(flat_pats) + ")" }
+            "if " + lc_sb.to_string() + " { match " + scrut_f + " { " + pat_f + " => if " + g_rhs + " { Some(" + body_raw.trim() + ") } else { None }, _ => None } } else { None }"
+          }
+          let res_var = fresh_temp(ctx, "tsr")
+          let rest_arms = if next_i < end {
+            lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
+          } else {
+            ""
+          }
+          let none_arm = if rest_arms.length() > 0 {
+            "match " + ts_var + " { " + rest_arms + " }"
+          } else {
+            "panic(\"unreachable\")"
+          }
+          sb.write_string(
+            lead_triv + ts_var + tokens[fa].leading_trivia + "=> match (" + inner_opt + ") { Some(" + res_var + ") => " + res_var + ", None => " + none_arm + " }" + trail_sep,
+          )
+          pop_expected_type(ctx)
+          break
+        } else if sub_pats.length() == 0 {
           if guard_str.length() > 0 {
             sb.write_string(lead_triv + ts_var + " if " + guard_str + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
           } else {
@@ -5881,6 +5983,43 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           pi = cp + 1
         }
         if pi < n && tokens[pi].kind == TokenKind::Keyword && tokens[pi].raw == "fn" {
+          // Collect generic type params (`pub fn[T] f(...)` or `pub fn f[T](...)`) so they never shadow local enum names
+          let local_tparams : Map[String, Bool] = Map()
+          let mut tp_scan = pi + 1
+          if tp_scan < n && tokens[tp_scan].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, tp_scan)
+            let mut k = tp_scan + 1
+            let mut bd = 0
+            while k < cb {
+              let kk = tokens[k].kind
+              if kk == TokenKind::LBracket || kk == TokenKind::LParen { bd = bd + 1 }
+              else if kk == TokenKind::RBracket || kk == TokenKind::RParen { if bd > 0 { bd = bd - 1 } }
+              else if bd == 0 && kk == TokenKind::UpperIdent && (k == tp_scan + 1 || tokens[k - 1].kind == TokenKind::Comma) {
+                local_tparams[tokens[k].raw] = true
+              }
+              k = k + 1
+            }
+            tp_scan = cb + 1
+          }
+          // Advance past fn name (possibly `Type::method`) and check trailing `[T]`
+          while tp_scan < n && tokens[tp_scan].kind != TokenKind::LParen && tokens[tp_scan].kind != TokenKind::LBracket &&
+          tokens[tp_scan].kind != TokenKind::LBrace && tokens[tp_scan].kind != TokenKind::Eq {
+            tp_scan = tp_scan + 1
+          }
+          if tp_scan < n && tokens[tp_scan].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, tp_scan)
+            let mut k = tp_scan + 1
+            let mut bd = 0
+            while k < cb {
+              let kk = tokens[k].kind
+              if kk == TokenKind::LBracket || kk == TokenKind::LParen { bd = bd + 1 }
+              else if kk == TokenKind::RBracket || kk == TokenKind::RParen { if bd > 0 { bd = bd - 1 } }
+              else if bd == 0 && kk == TokenKind::UpperIdent && (k == tp_scan + 1 || tokens[k - 1].kind == TokenKind::Comma) {
+                local_tparams[tokens[k].raw] = true
+              }
+              k = k + 1
+            }
+          }
           // Scan params and return type up to `{` or `=`
           let mut si = pi + 1
           let mut sd = 0
@@ -5889,7 +6028,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
             if sd == 0 && (sk == TokenKind::LBrace || sk == TokenKind::Eq) { break }
             if sk == TokenKind::LParen || sk == TokenKind::LBracket { sd = sd + 1 }
             else if sk == TokenKind::RParen || sk == TokenKind::RBracket { if sd > 0 { sd = sd - 1 } }
-            else if sk == TokenKind::UpperIdent {
+            else if sk == TokenKind::UpperIdent && !local_tparams.contains(tokens[si].raw) {
               ctx.symtab.pub_sig_referenced_types[tokens[si].raw] = true
             }
             si = si + 1
@@ -5897,7 +6036,8 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         } else if pi < n && tokens[pi].kind == TokenKind::Keyword && (tokens[pi].raw == "let" || tokens[pi].raw == "const") {
           let mut si = pi + 1
           let mut seen_col = false
-          while si < n && tokens[si].kind != TokenKind::Eq && !tokens[si].newline_before {
+          while si < n && tokens[si].kind != TokenKind::Eq && tokens[si].kind != TokenKind::Semi {
+            if si > pi + 1 && tokens[si].newline_before && is_top_level_decl_start(tokens, si) { break }
             if tokens[si].kind == TokenKind::Colon { seen_col = true }
             else if seen_col && tokens[si].kind == TokenKind::UpperIdent {
               ctx.symtab.pub_sig_referenced_types[tokens[si].raw] = true
@@ -5906,12 +6046,25 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           }
         } else if pi + 1 < n && tokens[pi].kind == TokenKind::Keyword &&
         (tokens[pi].raw == "type" || tokens[pi].raw == "typealias") {
-          let mut si = pi + 1
+          let local_tparams : Map[String, Bool] = Map()
+          let mut si = pi + 2
+          if si < n && tokens[si].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, si)
+            let mut k = si + 1
+            while k < cb {
+              if tokens[k].kind == TokenKind::UpperIdent && (k == si + 1 || tokens[k - 1].kind == TokenKind::Comma) {
+                local_tparams[tokens[k].raw] = true
+              }
+              k = k + 1
+            }
+            si = cb + 1
+          }
           let mut seen_eq = false
-          while si < n && !tokens[si].newline_before && tokens[si].kind != TokenKind::Semi {
+          while si < n && tokens[si].kind != TokenKind::Semi {
+            if tokens[si].newline_before && is_top_level_decl_start(tokens, si) { break }
             if tokens[si].kind == TokenKind::Eq {
               seen_eq = true
-            } else if seen_eq && tokens[si].kind == TokenKind::UpperIdent {
+            } else if seen_eq && tokens[si].kind == TokenKind::UpperIdent && !local_tparams.contains(tokens[si].raw) {
               ctx.symtab.pub_sig_referenced_types[tokens[si].raw] = true
             }
             si = si + 1
@@ -5919,15 +6072,26 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         } else if pi + 1 < n && tokens[pi].kind == TokenKind::Keyword &&
         (tokens[pi].raw == "struct" || tokens[pi].raw == "enum") {
           let is_struct_decl = tokens[pi].raw == "struct"
+          let local_tparams : Map[String, Bool] = Map()
           let mut lb = pi + 2
-          if lb < n && tokens[lb].kind == TokenKind::LBracket { lb = find_matching_delim(tokens, lb) + 1 }
+          if lb < n && tokens[lb].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, lb)
+            let mut k = lb + 1
+            while k < cb {
+              if tokens[k].kind == TokenKind::UpperIdent && (k == lb + 1 || tokens[k - 1].kind == TokenKind::Comma) {
+                local_tparams[tokens[k].raw] = true
+              }
+              k = k + 1
+            }
+            lb = cb + 1
+          }
           if lb < n && (tokens[lb].kind == TokenKind::LBrace || tokens[lb].kind == TokenKind::LParen) {
             let rb = find_matching_delim(tokens, lb)
             if is_pub_all {
               let mut si = lb + 1
               while si < rb {
-                if tokens[si].kind == TokenKind::UpperIdent {
-                  let prev_c = si > lb + 1 && (tokens[si - 1].kind == TokenKind::Colon || tokens[si - 1].kind == TokenKind::LParen ||
+                if tokens[si].kind == TokenKind::UpperIdent && !local_tparams.contains(tokens[si].raw) {
+                  let prev_c = si >= lb + 1 && (tokens[si - 1].kind == TokenKind::Colon || tokens[si - 1].kind == TokenKind::LParen ||
                     tokens[si - 1].kind == TokenKind::Comma || tokens[si - 1].kind == TokenKind::LBracket)
                   if prev_c { ctx.symtab.pub_sig_referenced_types[tokens[si].raw] = true }
                 }
@@ -5948,7 +6112,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
                   seen_colon = false
                 } else if in_pub_field && tokens[si].kind == TokenKind::Colon {
                   seen_colon = true
-                } else if in_pub_field && seen_colon && tokens[si].kind == TokenKind::UpperIdent {
+                } else if in_pub_field && seen_colon && tokens[si].kind == TokenKind::UpperIdent && !local_tparams.contains(tokens[si].raw) {
                   ctx.symtab.pub_sig_referenced_types[tokens[si].raw] = true
                 }
                 si = si + 1
@@ -5959,8 +6123,19 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
       // Bare `struct` (default abstract-public in MoonBit) with explicitly `pub` fields
       if t.kind == TokenKind::Keyword && t.raw == "struct" && (i == 0 || (tokens[i - 1].raw != "pub" && tokens[i - 1].raw != "priv" && tokens[i - 1].kind != TokenKind::RParen)) {
+        let local_tparams : Map[String, Bool] = Map()
         let mut lb = i + 2
-        if lb < n && tokens[lb].kind == TokenKind::LBracket { lb = find_matching_delim(tokens, lb) + 1 }
+        if lb < n && tokens[lb].kind == TokenKind::LBracket {
+          let cb = find_matching_delim(tokens, lb)
+          let mut k = lb + 1
+          while k < cb {
+            if tokens[k].kind == TokenKind::UpperIdent && (k == lb + 1 || tokens[k - 1].kind == TokenKind::Comma) {
+              local_tparams[tokens[k].raw] = true
+            }
+            k = k + 1
+          }
+          lb = cb + 1
+        }
         if lb < n && tokens[lb].kind == TokenKind::LBrace {
           let rb = find_matching_delim(tokens, lb)
           let mut si = lb + 1
@@ -5976,7 +6151,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
               seen_colon = false
             } else if in_pub_field && tokens[si].kind == TokenKind::Colon {
               seen_colon = true
-            } else if in_pub_field && seen_colon && tokens[si].kind == TokenKind::UpperIdent {
+            } else if in_pub_field && seen_colon && tokens[si].kind == TokenKind::UpperIdent && !local_tparams.contains(tokens[si].raw) {
               ctx.symtab.pub_sig_referenced_types[tokens[si].raw] = true
             }
             si = si + 1
