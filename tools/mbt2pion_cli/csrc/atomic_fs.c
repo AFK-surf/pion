@@ -108,3 +108,83 @@ int mbt_fs_realpath(const char *path, char *out, int cap) {
     memcpy(out, buf, len + 1);
     return (int)len;
 }
+
+/* Return 1 if paths `a` and `b` resolve via stat() to the exact same (st_dev, st_ino), 0 otherwise. */
+int mbt_fs_same_inode(const char *a, const char *b) {
+    if (!a || !b) {
+        return 0;
+    }
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+        return 0;
+    }
+    return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) ? 1 : 0;
+}
+
+/* Kernel-truth check whether two filenames (`name_a`, `name_b`, basenames only) collide on the
+ * filesystem volume backing `dir` (covers ASCII case-folding, Unicode État/état, APFS NFC/NFD, etc.).
+ * Returns 1 if colliding, 0 if distinct, -1 on error (e.g. unwritable dir). Always cleans up.
+ */
+int mbt_fs_names_collide_in_dir(const char *dir, const char *name_a, const char *name_b) {
+    if (!dir || !name_a || !name_b || !*dir || !*name_a || !*name_b) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strchr(name_a, '/') || strchr(name_b, '/') ||
+        strcmp(name_a, ".") == 0 || strcmp(name_a, "..") == 0 ||
+        strcmp(name_b, ".") == 0 || strcmp(name_b, "..") == 0) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (strcmp(name_a, name_b) == 0) {
+        return 1;
+    }
+    char probe_dir[PATH_MAX];
+    int created = 0;
+    long pid = (long)getpid();
+    for (int seq = 0; seq < 64; seq++) {
+        int n = snprintf(probe_dir, sizeof(probe_dir), "%s/.m2pvp.%ld.%d", dir, pid, seq);
+        if (n < 0 || (size_t)n >= sizeof(probe_dir)) {
+            errno = ENAMETOOLONG;
+            return -1;
+        }
+        if (mkdir(probe_dir, 0700) == 0) {
+            created = 1;
+            break;
+        }
+        if (errno != EEXIST) {
+            return -1;
+        }
+    }
+    if (!created) {
+        errno = EEXIST;
+        return -1;
+    }
+    char path_a[PATH_MAX];
+    char path_b[PATH_MAX];
+    int na = snprintf(path_a, sizeof(path_a), "%s/%s", probe_dir, name_a);
+    int nb = snprintf(path_b, sizeof(path_b), "%s/%s", probe_dir, name_b);
+    if (na < 0 || (size_t)na >= sizeof(path_a) || nb < 0 || (size_t)nb >= sizeof(path_b)) {
+        rmdir(probe_dir);
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    int res = -1;
+    int fda = open(path_a, O_CREAT | O_EXCL | O_WRONLY, 0600);
+    if (fda >= 0) {
+        close(fda);
+        int fdb = open(path_b, O_CREAT | O_EXCL | O_WRONLY, 0600);
+        if (fdb >= 0) {
+            close(fdb);
+            res = 0;
+        } else if (errno == EEXIST) {
+            res = 1;
+        } else {
+            res = -1;
+        }
+        unlink(path_b);
+        unlink(path_a);
+    }
+    rmdir(probe_dir);
+    return res;
+}

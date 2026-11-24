@@ -1018,20 +1018,81 @@ assert "MBT2PION_REPORT_PATH_COLLISION" in (r10_ext.stdout + r10_ext.stderr), "1
 assert os.listdir(ext_dir10) == [], f"10b wrote colliding external report: {os.listdir(ext_dir10)}"
 assert {p: open(os.path.join(o10, p), "rb").read() for p in sorted(os.listdir(o10))} == snap_10, "10b OUT modified on collision!"
 
-# 10c. Distinct filenames in --out succeed and actually produce 2 distinct JSON files with respective schemas
-r10_ok = run_cli(["--src", s10, "--out", o10, "--target", "native", "--mode", "publish",
-                  "--mbt-compat", compat_dir, "--pionc", pionc,
-                  "--report", os.path.join(o10, "migration.json"),
-                  "--drift-ledger", os.path.join(o10, "drift.json")])
-assert r10_ok.returncode == 0, f"10c distinct report filenames failed: {r10_ok.stderr}"
-entries10 = sorted(os.listdir(o10))
-assert "migration.json" in entries10 and "drift.json" in entries10, f"10c missing distinct JSON files: {entries10}"
-mig_obj = json.load(open(os.path.join(o10, "migration.json")))
-drift_obj = json.load(open(os.path.join(o10, "drift.json")))
-assert "files_generated" in mig_obj, f"10c migration.json missing files_generated: {list(mig_obj.keys())}"
-assert "unresolved_entries" in drift_obj, f"10c drift.json missing unresolved_entries: {list(drift_obj.keys())}"
+# 10c. Distinct filenames with case-aliased `--out` dir (`--out output --report OUTPUT/report.json --drift-ledger output/ledger.json`)
+o10c = os.path.join(root, "output")
+os.makedirs(o10c, exist_ok=True)
+o10c_upper = os.path.join(root, "OUTPUT")
+r10_alias = run_cli(["--src", s10, "--out", o10c, "--target", "native", "--mode", "publish",
+                     "--mbt-compat", compat_dir, "--pionc", pionc,
+                     "--report", os.path.join(o10c_upper, "report.json"),
+                     "--drift-ledger", os.path.join(o10c, "ledger.json")])
+assert r10_alias.returncode == 0, f"10c case-aliased --out dir publish failed: {r10_alias.returncode} {r10_alias.stderr}"
+rep10c_path = os.path.join(o10c_upper, "report.json")
+drf10c_path = os.path.join(o10c, "ledger.json")
+assert os.path.isfile(rep10c_path) and os.path.isfile(drf10c_path), "10c missing report.json or ledger.json"
+assert "files_generated" in json.load(open(rep10c_path)), "10c report.json missing files_generated"
+assert "unresolved_entries" in json.load(open(drf10c_path)), "10c ledger.json missing unresolved_entries"
+if os.path.exists(o10c_upper) and os.path.samefile(o10c, o10c_upper):
+    entries10c = sorted(os.listdir(o10c))
+    assert "report.json" in entries10c and "ledger.json" in entries10c, f"10c case-insensitive volume lost in-out report: {entries10c}"
 
-print("[e2e] PASS: Round 7 Astra P1 suite (case-folded report collision in-out & external blocked + distinct reports verified)")
+# 10d. Unicode case (`État.json` vs `état.json`) and NFC/NFD (`caf\u00e9.json` vs `cafe\u0301.json`), both in-out and external
+def volume_folds(base_dir, n1, n2):
+    import shutil
+    td = os.path.join(base_dir, ".probe_fold_" + str(abs(hash((n1, n2))) % 100000))
+    os.makedirs(td, exist_ok=True)
+    try:
+        fd1 = os.open(os.path.join(td, n1), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+        os.close(fd1)
+        try:
+            fd2 = os.open(os.path.join(td, n2), os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+            os.close(fd2)
+            return False
+        except FileExistsError:
+            return True
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+
+for tag, n1, n2 in [
+    ("unicode_case", "\u00c9tat.json", "\u00e9tat.json"),
+    ("nfc_nfd", "caf\u00e9.json", "cafe\u0301.json"),
+]:
+    folds = volume_folds(root, n1, n2)
+    # In-out test
+    o10u = os.path.join(root, f"o10u_{tag}")
+    r_init = run_cli(["--src", s10, "--out", o10u, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_init.returncode == 0
+    snap_u = {p: open(os.path.join(o10u, p), "rb").read() for p in sorted(os.listdir(o10u))}
+    r_u_in = run_cli(["--src", s10, "--out", o10u, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc,
+                      "--report", os.path.join(o10u, n1),
+                      "--drift-ledger", os.path.join(o10u, n2)])
+    if folds:
+        assert r_u_in.returncode == 1, f"10d in-out {tag} must block on folding volume, got {r_u_in.returncode}"
+        assert "MBT2PION_REPORT_PATH_COLLISION" in (r_u_in.stdout + r_u_in.stderr), f"10d in-out {tag} missing collision code"
+        assert {p: open(os.path.join(o10u, p), "rb").read() for p in sorted(os.listdir(o10u))} == snap_u, f"10d in-out {tag} mutated OUT!"
+    else:
+        assert r_u_in.returncode == 0, f"10d in-out {tag} must succeed on case-sensitive volume, got {r_u_in.returncode} {r_u_in.stderr}"
+        assert "files_generated" in json.load(open(os.path.join(o10u, n1)))
+        assert "unresolved_entries" in json.load(open(os.path.join(o10u, n2)))
+    # External test
+    ext_u = os.path.join(root, f"ext10u_{tag}")
+    os.makedirs(ext_u, exist_ok=True)
+    r_u_ext = run_cli(["--src", s10, "--out", o10u, "--target", "native", "--mode", "publish",
+                       "--mbt-compat", compat_dir, "--pionc", pionc,
+                       "--report", os.path.join(ext_u, n1),
+                       "--drift-ledger", os.path.join(ext_u, n2)])
+    if folds:
+        assert r_u_ext.returncode == 1, f"10d ext {tag} must block on folding volume, got {r_u_ext.returncode}"
+        assert "MBT2PION_REPORT_PATH_COLLISION" in (r_u_ext.stdout + r_u_ext.stderr), f"10d ext {tag} missing collision code"
+        assert os.listdir(ext_u) == [], f"10d ext {tag} leaked files: {os.listdir(ext_u)}"
+    else:
+        assert r_u_ext.returncode == 0, f"10d ext {tag} must succeed on case-sensitive volume, got {r_u_ext.returncode} {r_u_ext.stderr}"
+        assert "files_generated" in json.load(open(os.path.join(ext_u, n1)))
+        assert "unresolved_entries" in json.load(open(os.path.join(ext_u, n2)))
+
+print("[e2e] PASS: Round 7+8 Astra P1 suite (ASCII + inode-aliased --out + Unicode État/état + NFC/NFD café volume-truth collision & delivery)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"

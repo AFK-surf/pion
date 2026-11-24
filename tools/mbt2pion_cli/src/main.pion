@@ -33,6 +33,8 @@ extern "C" fn c_fs_lstat_mode(path : Ptr) -> Int = "mbt_fs_lstat_mode"
 extern "C" fn c_fs_hardlink(oldpath : Ptr, newpath : Ptr) -> Int = "mbt_fs_hardlink"
 extern "C" fn c_fs_dir_readable(path : Ptr) -> Int = "mbt_fs_dir_readable"
 extern "C" fn c_fs_realpath(path : Ptr, out : Ptr, cap : Int) -> Int = "mbt_fs_realpath"
+extern "C" fn c_fs_same_inode(a : Ptr, b : Ptr) -> Int = "mbt_fs_same_inode"
+extern "C" fn c_fs_names_collide_in_dir(dir : Ptr, name_a : Ptr, name_b : Ptr) -> Int = "mbt_fs_names_collide_in_dir"
 
 fn atomic_swap_dir(a : String, b : String) -> Bool {
   c_atomic_swap_dir(a.as_cstr(), b.as_cstr()) == 0
@@ -61,6 +63,66 @@ fn fs_realpath(path : String) -> Option[String] {
     ptr_free(buf)
     None
   }
+}
+
+fn fs_same_inode(a : String, b : String) -> Bool {
+  if a.length() == 0 || b.length() == 0 {
+    return false
+  }
+  c_fs_same_inode(a.as_cstr(), b.as_cstr()) == 1
+}
+
+fn fs_names_collide_in_dir(dir : String, name_a : String, name_b : String) -> Int {
+  if dir.length() == 0 || name_a.length() == 0 || name_b.length() == 0 {
+    return -1
+  }
+  c_fs_names_collide_in_dir(dir.as_cstr(), name_a.as_cstr(), name_b.as_cstr())
+}
+
+fn path_basename(p : String) -> String {
+  let d = dirname(p)
+  if d.length() == 0 {
+    p
+  } else if d == "/" {
+    p.slice(1, p.length())
+  } else {
+    p.slice(d.length() + 1, p.length())
+  }
+}
+
+fn path_parent_dir(p : String) -> String {
+  let d = dirname(p)
+  if d.length() == 0 { "." } else { d }
+}
+
+///| Kernel-truth check whether two normalized report paths collide on the target volume
+///| (handles ASCII case-folding, Unicode État/état, APFS NFC/NFD café, and aliased parent dirs).
+fn report_paths_collide_on_volume(p1 : String, p2 : String) -> Bool {
+  if p1.length() == 0 || p2.length() == 0 {
+    return false
+  }
+  if fs_same_inode(p1, p2) {
+    return true
+  }
+  let d1 = path_parent_dir(p1)
+  let d2 = path_parent_dir(p2)
+  let b1 = path_basename(p1)
+  let b2 = path_basename(p2)
+  let same_parent = d1 == d2 || str_to_lower(d1) == str_to_lower(d2) || fs_same_inode(d1, d2)
+  if !same_parent {
+    return false
+  }
+  // Probe on the actual parent dir (or nearest existing ancestor on the exact same volume)
+  let mut probe_dir = d1
+  while probe_dir.length() > 0 && !fs_same_inode(probe_dir, probe_dir) {
+    let up = dirname(probe_dir)
+    if up == probe_dir || up.length() == 0 {
+      probe_dir = "."
+      break
+    }
+    probe_dir = up
+  }
+  fs_names_collide_in_dir(probe_dir, b1, b2) == 1
 }
 
 ///| Resolve a path to its canonical realpath (normalizing `/tmp` -> `/private/tmp`, etc.);
@@ -528,6 +590,8 @@ fn normalize_path(cwd : String, p : String) -> String {
 }
 
 ///| If `target` lies strictly inside `root_dir`, return its relative path under `root_dir`.
+///| Uses kernel-truth `fs_same_inode` fallback so `OUTPUT/report.json` under `--out output`
+///| on case-insensitive macOS APFS is accurately recognized as in-`--out` (Astra Round 8 P1).
 fn rel_path_within(cwd : String, root_dir : String, target : String) -> Option[String] {
   if root_dir.length() == 0 || target.length() == 0 {
     return None
@@ -536,10 +600,35 @@ fn rel_path_within(cwd : String, root_dir : String, target : String) -> Option[S
   let nt = normalize_path(cwd, target)
   let prefix = if nr == "/" { "/" } else { nr + "/" }
   if nt.starts_with(prefix) && nt.length() > prefix.length() {
-    Some(nt.slice(prefix.length(), nt.length()))
-  } else {
-    None
+    return Some(nt.slice(prefix.length(), nt.length()))
   }
+  if fs_same_inode(nr, nr) {
+    let tail : Array[String] = []
+    let mut cur = nt
+    while cur.length() > 1 {
+      let base = path_basename(cur)
+      let up = dirname(cur)
+      let next_cur = if up.length() == 0 { "." } else { up }
+      if next_cur == cur {
+        break
+      }
+      tail.push(base)
+      if fs_same_inode(next_cur, nr) {
+        let sb = StringBuilder()
+        let mut k = tail.length() - 1
+        while k >= 0 {
+          if k < tail.length() - 1 {
+            sb.write_string("/")
+          }
+          sb.write_string(tail[k])
+          k = k - 1
+        }
+        return Some(sb.to_string())
+      }
+      cur = next_cur
+    }
+  }
+  None
 }
 
 ///| Check whether an existing `.pion` path is a regular file (NOT a symlink) managed by `mbt2pion`.
@@ -1105,20 +1194,23 @@ pub fn main(world : World) -> Int {
   let mut report_path_bad = false
   let mut drift_path_bad = false
   let mut run_path_bad = false
-  if norm_report_lower.length() > 0 && norm_drift_lower.length() > 0 && norm_report_lower == norm_drift_lower {
-    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --drift-ledger point to the same (or case-colliding) path: " + report_path + " vs " + drift_ledger_path))
+  if norm_report_lower.length() > 0 && norm_drift_lower.length() > 0 &&
+  (norm_report_lower == norm_drift_lower || report_paths_collide_on_volume(norm_report_path, norm_drift_path)) {
+    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --drift-ledger point to the same (or colliding) path: " + report_path + " vs " + drift_ledger_path))
     final_blockers = final_blockers + 1
     report_path_bad = true
     drift_path_bad = true
   }
-  if norm_report_lower.length() > 0 && norm_run_lower.length() > 0 && norm_report_lower == norm_run_lower {
-    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --run-report point to the same (or case-colliding) path: " + report_path + " vs " + run_report_path))
+  if norm_report_lower.length() > 0 && norm_run_lower.length() > 0 &&
+  (norm_report_lower == norm_run_lower || report_paths_collide_on_volume(norm_report_path, norm_run_path)) {
+    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --run-report point to the same (or colliding) path: " + report_path + " vs " + run_report_path))
     final_blockers = final_blockers + 1
     report_path_bad = true
     run_path_bad = true
   }
-  if norm_drift_lower.length() > 0 && norm_run_lower.length() > 0 && norm_drift_lower == norm_run_lower {
-    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", drift_ledger_path, 1, 1, "--drift-ledger and --run-report point to the same (or case-colliding) path: " + drift_ledger_path + " vs " + run_report_path))
+  if norm_drift_lower.length() > 0 && norm_run_lower.length() > 0 &&
+  (norm_drift_lower == norm_run_lower || report_paths_collide_on_volume(norm_drift_path, norm_run_path)) {
+    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", drift_ledger_path, 1, 1, "--drift-ledger and --run-report point to the same (or colliding) path: " + drift_ledger_path + " vs " + run_report_path))
     final_blockers = final_blockers + 1
     drift_path_bad = true
     run_path_bad = true
@@ -1138,7 +1230,7 @@ pub fn main(world : World) -> Int {
     }
     let rnorm_lower = str_to_lower(rnorm)
     let mut bad = false
-    if norm_out_lower.length() > 0 && rnorm_lower == norm_out_lower {
+    if norm_out_lower.length() > 0 && (rnorm_lower == norm_out_lower || fs_same_inode(rnorm, norm_out_dir)) {
       final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", rnorm, 1, 1, rflag + " cannot point to --out directory itself: " + rnorm))
       final_blockers = final_blockers + 1
       bad = true
@@ -1325,13 +1417,13 @@ pub fn main(world : World) -> Int {
       for fm in unmanaged_files {
         let rel = fm.0
         let mode_bits = fm.1
+        let src = join_path(clean_out_dir, rel)
         if mode == "publish" &&
-        ((report_rel_str.length() > 0 && rel == report_rel_str) ||
-          (drift_rel_str.length() > 0 && rel == drift_rel_str) ||
-          (run_rel_str.length() > 0 && rel == run_rel_str)) {
+        ((report_rel_str.length() > 0 && (rel == report_rel_str || fs_same_inode(src, report_path))) ||
+          (drift_rel_str.length() > 0 && (rel == drift_rel_str || fs_same_inode(src, drift_ledger_path))) ||
+          (run_rel_str.length() > 0 && (rel == run_rel_str || fs_same_inode(src, run_report_path)))) {
           continue
         }
-        let src = join_path(clean_out_dir, rel)
         let dst = join_path(stage_dir, rel)
         let parent = dirname(dst)
         if parent.length() > 0 {

@@ -94,6 +94,7 @@ CASES = {
     "const_upper_idx_and_generic": ("ok", 3),
     "cross_pkg_cap_noshadow": ("ok", 2),
     "cross_pkg_cap_shadow": ("ok", 3),
+    "cross_pkg_no_apimap_box": ("ok", 3),
 }
 
 MOON_TRAPS = {
@@ -504,6 +505,36 @@ ACME_API_MAP_JSON = '''{
 }
 '''
 
+# Round 8 Astra P0-1: NO api_map cross-package `@ext.CAP[INDEX]` inside struct literal `Box::{ n: ... }`
+# alongside genuine type annotations `struct Holder { w : @ext.Wrap[Int] }` and `fn(w : @ext.Wrap[Int]) -> @ext.Wrap[Int]`.
+NO_APIMAP_LIB_MBT = r'''
+const INDEX : Int = 1
+
+pub struct Box {
+  n : Int
+}
+
+pub struct Holder {
+  w : @ext.Wrap[Int]
+}
+
+pub fn box_const_idx() -> Int {
+  Box::{ n: @ext.CAP[INDEX].to_int() }.n
+}
+
+pub fn box_lit_idx() -> Int {
+  Box::{ n: @ext.CAP[1].to_int() }.n
+}
+
+pub fn holder_wrap(w : @ext.Wrap[Int]) -> @ext.Wrap[Int] {
+  Holder::{ w: w }.w
+}
+
+pub fn holder_roundtrip(v : Int) -> Int {
+  @ext.wrap_get(holder_wrap(@ext.wrap_new(v)))
+}
+'''
+
 MOON_DRIVER_MBT = r'''
 fn trace(k : String, v : String) -> Unit {
   println("T \{k}=\{v}")
@@ -878,6 +909,14 @@ fn main {
     check("r7.shadow_cap", a == 65)
     check("r7.shadow_box", b == 65)
     check("r7.shadow_wrap", c == 42)
+  } else if kase == "cross_pkg_no_apimap_box" {
+    let a = @nomap.box_const_idx()
+    let b = @nomap.box_lit_idx()
+    let c = @nomap.holder_roundtrip(99)
+    trace("r", "\{a},\{b},\{c}")
+    check("r8.box_const_idx", a == 65)
+    check("r8.box_lit_idx", b == 65)
+    check("r8.holder_wrap", c == 99)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -887,6 +926,7 @@ fn main {
 PION_DRIVER_PION = r'''
 import "mbt_compat" as mbt_compat
 import "shadow" as shadow
+import "nomap" as nomap
 
 fn trace(w : World, k : String, v : String) -> Unit {
   io_println(w, "T " + k + "=" + v)
@@ -1269,6 +1309,14 @@ pub fn main(w : World) -> Int {
     check(w, "r7.shadow_cap", a == 65)
     check(w, "r7.shadow_box", b == 65)
     check(w, "r7.shadow_wrap", c == 42)
+  } else if kase == "cross_pkg_no_apimap_box" {
+    let a = nomap::box_const_idx()
+    let b = nomap::box_lit_idx()
+    let c = nomap::holder_roundtrip(99)
+    trace(w, "r", a.to_string() + "," + b.to_string() + "," + c.to_string())
+    check(w, "r8.box_const_idx", a == 65)
+    check(w, "r8.box_lit_idx", b == 65)
+    check(w, "r8.holder_wrap", c == 99)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -1423,7 +1471,7 @@ def prepare(env):
     api_map_path = os.path.join(env.workdir, "acme_api_map.json")
     write_file(api_map_path, ACME_API_MAP_JSON)
 
-    # 1b. Write real Pion `acme` dependency package
+    # 1b. Write real Pion `acme` and `ext` dependency packages
     pion_acme_dir = os.path.join(env.workdir, "pion_acme")
     write_file(
         os.path.join(pion_acme_dir, "pion.toml"),
@@ -1431,13 +1479,25 @@ def prepare(env):
     )
     write_file(os.path.join(pion_acme_dir, "src", "lib.pion"), ACME_PION_SRC)
 
-    # 2. Build MoonBit packages (`acme`, `shadow`, `main`) around the exact same `.mbt` files
+    pion_ext_dir = os.path.join(env.workdir, "pion_ext")
+    write_file(
+        os.path.join(pion_ext_dir, "pion.toml"),
+        '[package]\nname = "ext"\nversion = "0.1.0"\n',
+    )
+    write_file(os.path.join(pion_ext_dir, "src", "lib.pion"), ACME_PION_SRC)
+
+    nomap_mbt_dir = os.path.join(env.workdir, "nomap_mbt_src")
+    write_file(os.path.join(nomap_mbt_dir, "nomap_lib.mbt"), NO_APIMAP_LIB_MBT)
+
+    # 2. Build MoonBit packages (`acme`, `ext`, `shadow`, `nomap`, `main`) around the exact same `.mbt` files
     write_file(
         os.path.join(env.moon_dir, "moon.mod"),
         'name = "oracle/transpile"\n',
     )
     write_file(os.path.join(env.moon_dir, "acme", "moon.pkg"), "\n")
     write_file(os.path.join(env.moon_dir, "acme", "lib.mbt"), ACME_MOON_MBT)
+    write_file(os.path.join(env.moon_dir, "ext", "moon.pkg"), "\n")
+    write_file(os.path.join(env.moon_dir, "ext", "lib.mbt"), ACME_MOON_MBT)
     write_file(
         os.path.join(env.moon_dir, "shadow", "moon.pkg"),
         'import {\n  "oracle/transpile/acme",\n}\n',
@@ -1447,8 +1507,16 @@ def prepare(env):
         os.path.join(env.moon_dir, "shadow", "shadow_lib.mbt"),
     )
     write_file(
+        os.path.join(env.moon_dir, "nomap", "moon.pkg"),
+        'import {\n  "oracle/transpile/ext",\n}\n',
+    )
+    shutil.copyfile(
+        os.path.join(nomap_mbt_dir, "nomap_lib.mbt"),
+        os.path.join(env.moon_dir, "nomap", "nomap_lib.mbt"),
+    )
+    write_file(
         os.path.join(env.moon_dir, "main", "moon.pkg"),
-        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n}\n\npkgtype(kind: "executable")\n',
+        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n  "oracle/transpile/nomap",\n}\n\npkgtype(kind: "executable")\n',
     )
     shutil.copyfile(
         os.path.join(env.mbt_src_dir, "oracle_lib.mbt"),
@@ -1489,6 +1557,31 @@ def prepare(env):
         '[package]\nname = "shadow"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir),
     )
 
+    # Transpile `nomap_lib.mbt` WITHOUT `--api-map` (Round 8 Astra P0-1 regression)
+    pion_nomap_dir = os.path.join(env.workdir, "pion_nomap")
+    pion_nomap_src = os.path.join(pion_nomap_dir, "src")
+    os.makedirs(pion_nomap_src, exist_ok=True)
+    rc, out, err, to, secs = run_cmd([
+        env.mbt2pion_bin,
+        "--src", nomap_mbt_dir,
+        "--out", pion_nomap_src,
+        "--target", "native",
+        "--mode", "publish",
+        "--dep", "ext=" + pion_ext_dir,
+        "--mbt-compat", COMPAT_DIR,
+        "--pionc", env.pionc,
+        "--mbt2pion-commit", "oracle-test",
+        "--toolchain-lock", "oracle-lock",
+        "--source-commit", "oracle-src",
+    ])
+    if rc != 0:
+        print("SETUP FAILED: mbt2pion --mode publish nomap_lib.mbt (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
+        return False
+    write_file(
+        os.path.join(pion_nomap_dir, "pion.toml"),
+        '[package]\nname = "nomap"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\next = { path = "%s" }\n' % (COMPAT_DIR, pion_ext_dir),
+    )
+
     pion_src = os.path.join(env.pion_dir, "src")
     os.makedirs(pion_src, exist_ok=True)
     rc, out, err, to, secs = run_cmd([
@@ -1512,10 +1605,10 @@ def prepare(env):
         return False
     print("setup ok   %-44s %.1fs" % ("mbt2pion --mode publish oracle_lib.mbt", secs))
 
-    # 5. Wire generated `.pion` files with real `tools/mbt_compat` + `acme` + `shadow` + thin driver
+    # 5. Wire generated `.pion` files with real `tools/mbt_compat` + `acme` + `shadow` + `nomap` + thin driver
     write_file(
         os.path.join(env.pion_dir, "pion.toml"),
-        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir),
+        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\nnomap = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir, pion_nomap_dir),
     )
     write_file(os.path.join(pion_src, "main.pion"), PION_DRIVER_PION)
 
@@ -1718,6 +1811,62 @@ def self_test(env, moon_results):
     return ok
 
 
+def emit_ci_golden(pionc, out_dir):
+    """Single source of truth for CI cross-host golden generation (Astra Round 8 P0-2)."""
+    import hashlib
+    workdir = tempfile.mkdtemp(prefix="mbt2pion_ci_golden_")
+    try:
+        mbt_src_dir = os.path.join(workdir, "src")
+        write_file(os.path.join(mbt_src_dir, "oracle_lib.mbt"), ORACLE_LIB_MBT)
+        pion_acme_dir = os.path.join(workdir, "pion_acme")
+        write_file(
+            os.path.join(pion_acme_dir, "pion.toml"),
+            '[package]\nname = "acme"\nversion = "0.1.0"\n',
+        )
+        write_file(os.path.join(pion_acme_dir, "src", "lib.pion"), ACME_PION_SRC)
+        api_map_path = os.path.join(workdir, "acme_api_map.json")
+        write_file(api_map_path, ACME_API_MAP_JSON)
+        cli_bin = os.path.join(workdir, "mbt2pion")
+        rc, out, err, to, secs = run_cmd([pionc, "build", CLI_DIR, "-o", cli_bin])
+        if rc != 0:
+            print("CI GOLDEN FAILED: build mbt2pion (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
+            return 1
+        os.makedirs(out_dir, exist_ok=True)
+        rc, out, err, to, secs = run_cmd([
+            cli_bin,
+            "--src", mbt_src_dir,
+            "--out", out_dir,
+            "--target", "native",
+            "--mode", "publish",
+            "--api-map", api_map_path,
+            "--dep", "acme=" + pion_acme_dir,
+            "--mbt-compat", COMPAT_DIR,
+            "--pionc", pionc,
+            "--mbt2pion-commit", "ci-parity",
+            "--toolchain-lock", "ci-lock",
+            "--source-commit", "ci-src",
+        ])
+        if rc != 0:
+            print("CI GOLDEN FAILED: mbt2pion publish (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
+            return 1
+        got_files = sorted(os.listdir(out_dir))
+        expected_files = ["00_init_order.pion", "oracle_lib.pion"]
+        if got_files != expected_files:
+            print("CI GOLDEN FAILED: expected files %s, got %s" % (expected_files, got_files))
+            return 1
+        for fname in expected_files:
+            fpath = os.path.join(out_dir, fname)
+            data = open(fpath, "rb").read()
+            if len(data) == 0:
+                print("CI GOLDEN FAILED: empty output file %s" % fname)
+                return 1
+            print("ci-golden ok  %-22s sha256=%s (%d bytes)" % (
+                fname, hashlib.sha256(data).hexdigest(), len(data)))
+        return 0
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--no-self-test", action="store_true")
@@ -1725,10 +1874,17 @@ def main():
     ap.add_argument("--pionc", default="")
     ap.add_argument("--report", default="")
     ap.add_argument("--case", action="append", default=[])
+    ap.add_argument("--emit-ci-golden", default="")
     args = ap.parse_args()
 
-    moon = find_tool("moon", ["~/.moon/bin"])
     pionc = args.pionc or os.environ.get("PIONC", "") or find_tool("pionc", ["~/.pion/bin"])
+    if args.emit_ci_golden:
+        if not pionc:
+            print("missing tool: pionc=%s" % (pionc,))
+            return 2
+        return emit_ci_golden(pionc, args.emit_ci_golden)
+
+    moon = find_tool("moon", ["~/.moon/bin"])
     node = shutil.which("node")
     if not moon or not pionc or not node:
         print("missing tool: moon=%s pionc=%s node=%s" % (moon, pionc, node))
