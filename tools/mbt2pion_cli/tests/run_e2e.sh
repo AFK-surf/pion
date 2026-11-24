@@ -1944,6 +1944,37 @@ rep6c_j = json.load(open(rep10q6c))
 pds6c = [(p["file"], p["line"], p["col"]) for p in rep6c_j["probe_dispositions"] if p["disposition"] == "rewritten"]
 assert ("v.mbt", 1, 47) in pds6c, f"10q-6c expected v.mbt:1:47, got {pds6c}"
 
+# 10q-6d (Astra Final P1): 1, 2, 3 consecutive interpolations in top-level `let` report exact cols
+# [28], [28, 42], [28, 42, 56] AND Pion native outputs `a2b2b2`!
+for k_cnt, body_lit, exp_cols in [
+    (1, '"a\\{s.length()}"', [28]),
+    (2, '"a\\{s.length()}b\\{s.length()}"', [28, 42]),
+    (3, '"a\\{s.length()}b\\{s.length()}b\\{s.length()}"', [28, 42, 56]),
+]:
+    s10q6d = os.path.join(root, f"s10q6d_{k_cnt}")
+    o10q6d = os.path.join(root, f"o10q6d_{k_cnt}")
+    rep10q6d = os.path.join(root, f"rep10q6d_{k_cnt}.json")
+    os.makedirs(s10q6d, exist_ok=True)
+    with open(os.path.join(s10q6d, "vi.mbt"), "w") as f:
+        f.write(f'pub let s : String = "hi"\npub let n : String = {body_lit}\n')
+    r10q6d = run_cli(["--src", s10q6d, "--out", o10q6d, "--target", "native", "--mode", "publish",
+                      "--report", rep10q6d, "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r10q6d.returncode == 0, f"10q-6d({k_cnt}) publish failed: {r10q6d.returncode}\n{r10q6d.stdout}\n{r10q6d.stderr}"
+    rep6d_j = json.load(open(rep10q6d))
+    got_cols = [p["col"] for p in rep6d_j["probe_dispositions"] if p["file"] == "vi.mbt" and p["line"] == 2 and p["probe_kind"] == "mbt_len_probe"]
+    assert got_cols == exp_cols, f"10q-6d({k_cnt}) expected cols {exp_cols}, got {got_cols}"
+    if k_cnt == 3:
+        pkg10q6d = os.path.join(root, "pkg10q6d")
+        os.makedirs(os.path.join(pkg10q6d, "src"), exist_ok=True)
+        for fn in os.listdir(o10q6d):
+            if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q6d, fn), os.path.join(pkg10q6d, "src", fn))
+        with open(os.path.join(pkg10q6d, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "s10q6d"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+        with open(os.path.join(pkg10q6d, "src", "main.pion"), "w") as f:
+            f.write('pub fn main(_w : World) -> Int { if n != "a2b2b2" { panic("bad: " + n) }; 0 }\n')
+        r10q6d_run = subprocess.run([pionc, "run", pkg10q6d], capture_output=True, text=True)
+        assert r10q6d_run.returncode == 0, f"10q-6d pionc run failed: {r10q6d_run.stderr}"
+
 # 10q-3 (P0-3): `assert_true(true, msg={ n = n + 1; "expected" })` evaluates side effects AND `msg=abort("boom")` fails!
 s10q3 = os.path.join(root, "s10q3")
 o10q3 = os.path.join(root, "o10q3")
