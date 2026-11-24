@@ -76,6 +76,12 @@ CASES = {
     "interp_probe": ("ok", 2),
     "arrayview_backing": ("ok", 5),
     "init_invoke_closure": ("ok", 1),
+    "div_const_then_rt_zero": ("panic:div_zero", 0),
+    "div_len_rt_zero": ("panic:div_zero", 0),
+    "div_byte_zero": ("panic:div_zero", 0),
+    "div_min_neg1": ("panic:div_overflow", 0),
+    "init_wrap_invoke_closure": ("ok", 1),
+    "array_slice_to_owned": ("ok", 2),
 }
 
 MOON_TRAPS = {
@@ -333,6 +339,27 @@ let inv_z : Int = read_arr_0([42])
 
 pub fn get_inv_a() -> Int {
   inv_a
+}
+
+// Round 2 Astra P0-3 / P1-1 / P1-4 cases
+pub fn div_const_then_rt(a : Int, b : Int) -> Int { a / 2 / b }
+pub fn div_len_rt(xs : Array[Int], b : Int) -> Int { xs.length() / b }
+pub fn div_byte_const0(a : Byte) -> Byte { a / b'\x00' }
+pub fn div_i32_neg1(a : Int) -> Int { a / -1 }
+
+fn wrap_invoke() -> Int {
+  invoke_init(fn() { wrap_z })
+}
+let wrap_a : Int = wrap_invoke()
+let wrap_z : Int = read_arr_0([42])
+
+pub fn get_wrap_a() -> Int {
+  wrap_a
+}
+
+pub fn slice_owned_first(xs : Array[Int]) -> Int {
+  let cp = xs[1:3].to_owned()
+  cp[0] + cp[1]
 }
 '''
 
@@ -599,6 +626,31 @@ fn main {
     let v = get_inv_a()
     trace("inv_a", v.to_string())
     check("init.inv_a", v == 42)
+  } else if kase == "div_const_then_rt_zero" {
+    let z = [0][0]
+    trace("before", "ok")
+    trace("after", div_const_then_rt(10, z).to_string())
+  } else if kase == "div_len_rt_zero" {
+    let z = [0][0]
+    trace("before", "ok")
+    trace("after", div_len_rt([1, 2, 3], z).to_string())
+  } else if kase == "div_byte_zero" {
+    trace("before", "ok")
+    trace("after", div_byte_const0(b'\x07').to_int().to_string())
+  } else if kase == "div_min_neg1" {
+    let m = [-2147483648][0]
+    trace("before", "ok")
+    trace("after", div_i32_neg1(m).to_string())
+  } else if kase == "init_wrap_invoke_closure" {
+    let v = get_wrap_a()
+    trace("wrap_a", v.to_string())
+    check("init.wrap_a", v == 42)
+  } else if kase == "array_slice_to_owned" {
+    let xs = [10, 20, 30, 40]
+    let sum = slice_owned_first(xs)
+    trace("sum", sum.to_string())
+    check("slice_owned.sum", sum == 50)
+    check("slice_owned.orig", xs[1] == 20)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -878,6 +930,31 @@ pub fn main(w : World) -> Int {
     let v = get_inv_a()
     trace(w, "inv_a", v.to_string())
     check(w, "init.inv_a", v == 42)
+  } else if kase == "div_const_then_rt_zero" {
+    let z = [0][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_const_then_rt(10, z).to_string())
+  } else if kase == "div_len_rt_zero" {
+    let z = [0][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_len_rt([1, 2, 3], z).to_string())
+  } else if kase == "div_byte_zero" {
+    trace(w, "before", "ok")
+    trace(w, "after", div_byte_const0(7.to_byte()).to_int().to_string())
+  } else if kase == "div_min_neg1" {
+    let m = [-2147483647 - 1][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_i32_neg1(m).to_string())
+  } else if kase == "init_wrap_invoke_closure" {
+    let v = get_wrap_a()
+    trace(w, "wrap_a", v.to_string())
+    check(w, "init.wrap_a", v == 42)
+  } else if kase == "array_slice_to_owned" {
+    let xs = [10, 20, 30, 40]
+    let sum = slice_owned_first(xs)
+    trace(w, "sum", sum.to_string())
+    check(w, "slice_owned.sum", sum == 50)
+    check(w, "slice_owned.orig", xs[1] == 20)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -1127,21 +1204,64 @@ def run_suite(env, cases, jobs):
     return results
 
 
-# Negative self-tests: every mutant MUST turn the oracle RED with its EXACT expected failure class (P2).
+# Negative self-tests: dual-set validation (Opus P2-R1 + Astra P2):
+# Every observed error class must be in `allowed_classes` (rejecting unrelated infra errors like
+# MODULE_NOT_FOUND or empty runs!), AND all `required_classes` must be observed!
 MUTANTS = [
     ("drop-assertion", "guard", "main.pion",
      'check(w, "guard.val_false", g1 == 17)\n', "",
-     "assertion ids differ"),
+     {"assertion_id_mismatch", "assertion_count_mismatch"},
+     {"assertion_id_mismatch", "assertion_count_mismatch"}),
     ("bypass-utf16-len", "utf16", "oracle_lib.pion",
      "mbt_compat::utf16_len(s)", "s.length()",
-     "FAILED utf16.len"),
+     {"unexpected_output", "trace_mismatch"},
+     {"unexpected_output", "outcome_mismatch", "trace_mismatch", "assertion_id_mismatch", "assertion_count_mismatch"}),
     ("bypass-div-checked", "div_i32_rt_zero", "oracle_lib.pion",
      "mbt_compat::div_checked_i32(a, b)", "(a / b)",
-     "raw-wasm-trap(divide by zero)"),
+     {"hard_fail:raw-wasm-trap", "outcome_mismatch"},
+     {"hard_fail:raw-wasm-trap", "outcome_mismatch", "trace_mismatch"}),
     ("bypass-double-fmt", "double_fmt", "oracle_lib.pion",
      "mbt_compat::double_to_string(d)", "d.to_string()",
-     "FAILED dbl.small"),
+     {"unexpected_output", "trace_mismatch"},
+     {"unexpected_output", "outcome_mismatch", "trace_mismatch", "assertion_id_mismatch", "assertion_count_mismatch"}),
 ]
+
+
+def error_classes(errs):
+    classes = set()
+    for e in errs:
+        if "MODULE_NOT_FOUND" in e:
+            classes.add("infra:module_not_found")
+        elif "hard fail raw-wasm-trap" in e:
+            classes.add("hard_fail:raw-wasm-trap")
+        elif "hard fail " in e:
+            classes.add("hard_fail:other")
+        elif "executed nothing" in e:
+            classes.add("empty_run")
+        elif "unexpected output" in e:
+            classes.add("unexpected_output")
+        elif "outcome " in e:
+            classes.add("outcome_mismatch")
+        elif "trace differs" in e:
+            classes.add("trace_mismatch")
+        elif "assertion ids differ" in e:
+            classes.add("assertion_id_mismatch")
+        elif "assertions executed, expected" in e:
+            classes.add("assertion_count_mismatch")
+        else:
+            classes.add("unknown")
+    return classes
+
+
+def mutant_detected(errs, required_classes, allowed_classes):
+    got = error_classes(errs)
+    if not got:
+        return False, got
+    if not got.issubset(allowed_classes):
+        return False, got
+    if not required_classes.issubset(got):
+        return False, got
+    return True, got
 
 
 def make_mutant(env, name, rel_file, old, new):
@@ -1176,18 +1296,28 @@ def classifier_selftest():
     errs, _ = evaluate("guard", empty)
     if not any("executed nothing" in e for e in errs):
         problems.append("empty run was not rejected")
+    # Opus P2-R1 + Astra P2: MODULE_NOT_FOUND + empty output must NEVER count as a mutant detection!
+    infra_res = {
+        "moon": (0, "T val_false=17\nA guard.val_false\n", "", False),
+        "pion-native": (1, "", "Error: MODULE_NOT_FOUND\n", False),
+        "pion-wasm32": (1, "", "Error: MODULE_NOT_FOUND\n", False),
+    }
+    infra_errs, _ = evaluate("guard", infra_res)
+    det, _ = mutant_detected(infra_errs, {"assertion_id_mismatch"}, {"assertion_id_mismatch", "assertion_count_mismatch"})
+    if det:
+        problems.append("MODULE_NOT_FOUND infra error was falsely counted as mutant detection")
     return problems
 
 
 def self_test(env, moon_results):
-    print("\n== negative self-test (every mutant must turn oracle RED)")
+    print("\n== negative self-test (every mutant must turn oracle RED with exact failure class)")
     ok = True
     for p in classifier_selftest():
         print("SELFTEST FAIL  classifier: " + p)
         ok = False
     if ok:
-        print("selftest ok    classifier hard-fails SIGSEGV/timeout/raw-wasm-trap/empty-run")
-    for name, case, rel_file, old, new, want_err in MUTANTS:
+        print("selftest ok    classifier hard-fails SIGSEGV/timeout/raw-wasm-trap/empty-run and rejects MODULE_NOT_FOUND as detection")
+    for name, case, rel_file, old, new, req_cls, allow_cls in MUTANTS:
         d = make_mutant(env, name, rel_file, old, new)
         res = {
             "moon": moon_results[case],
@@ -1195,14 +1325,12 @@ def self_test(env, moon_results):
             "pion-wasm32": run_pion(env, d, "wasm32", case),
         }
         errs, _ = evaluate(case, res)
-        matched = any(want_err in e for e in errs)
-        if errs and matched:
-            print("selftest ok    mutant %-20s on %-18s -> red (%s): %s" % (name, case, want_err, errs[0][:100]))
-        elif errs:
-            print("SELFTEST FAIL  mutant %-20s on %-18s failed with wrong class (wanted %r): %s" % (name, case, want_err, errs[0][:120]))
-            ok = False
+        detected, got_cls = mutant_detected(errs, req_cls, allow_cls)
+        if detected:
+            print("selftest ok    mutant %-20s on %-18s -> red %s" % (name, case, sorted(got_cls)))
         else:
-            print("SELFTEST FAIL  mutant %-20s on %-18s stayed green" % (name, case))
+            print("SELFTEST FAIL  mutant %-20s on %-18s got=%s req=%s allow=%s err=%s" % (
+                name, case, sorted(got_cls), sorted(req_cls), sorted(allow_cls), errs[:2]))
             ok = False
     return ok
 

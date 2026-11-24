@@ -618,10 +618,101 @@ test "P1-1, P1-2, P1-3, P1-4, P1-5, P1-6: review hardening regressions" {
     l15,
   )
   assert_eq(d15.length(), 0)
-  assert_true(str_has(conv15, "let __mbt_s_0 = get_text();") && str_has(conv15, "let __mbt_s_1 = get_text();"), "each call binds get_text() once")
+  assert_true(str_has(conv15, "let __mbt_s_0 = get_text();") && str_has(conv15, "let __mbt_s_2 = get_text();"), "each call binds get_text() once")
   assert_true(l15.length() == 2, "both same-line calls converted")
 
   // P1-6: migration_report.json serializes finalized span_map
   let rep_json = render_migration_report_json(p14_res, default_options())
   assert_true(str_has(rep_json, "\"span_map\":["), "migration_report.json contains span_map")
+}
+
+test "Round 2 dual-seat regressions: interp imports, MIN/-1, byte zero, lexer boundary, DSL targets, x?=e, to_owned, full span_map" {
+  // 1. InterpString package scanning (Opus P1-R1)
+  let ipkgs = collect_referenced_packages("pub fn f(a : Int, b : Int) -> String { \"r=\\{mbt_compat::div_checked_i32(a, b)}\" }\n")
+  assert_true(ipkgs.length() == 1 && ipkgs[0] == "mbt_compat", "InterpString inner pkg scanned")
+
+  // 2. Signed MIN / -1 not omitted + Byte b'\x00' static zero (Astra P0-3)
+  let (inst_div, sites_div) = instrument_probes_for_file("d.pion", "pub fn f(a : Int, b : Byte) -> Int { let _ = a / -1; let _ = b / 0.to_byte(); 0 }\n")
+  assert_true(str_has(inst_div, "(a).mbt_div_probe(-1)"), "a / -1 probed")
+  assert_true(str_has(inst_div, "(b).mbt_div_probe(0.to_byte())"), "b / 0.to_byte() probed")
+  let d_diags : Array[Diag] = []
+  let d_ledger : Array[DriftEntry] = []
+  let r_neg1 = rewrite_for_probe(sites_div[0], "Int", default_recipes(), d_diags, d_ledger)
+  assert_true(match r_neg1 { Some(s) => str_has(s, "mbt_compat::div_checked_i32"), None => false }, "Int / -1 MUST use div_checked_i32")
+  let r_b0 = rewrite_for_probe(sites_div[1], "Byte", default_recipes(), d_diags, d_ledger)
+  assert_true(match r_b0 { Some(s) => str_has(s, "mbt_compat::trap_div_zero()"), None => false }, "Byte / 0.to_byte() uses trap_div_zero()")
+
+  // 3. Lexer-based boundary conversion: string literal untouched + strict left-to-right arg eval order (Astra P0-5)
+  let d6 : Array[Diag] = []
+  let l6 : Array[DriftEntry] = []
+  let am6 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"acme\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"acme\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"ty\":\"String\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m6.json",
+    d6,
+  )
+  let lit_and_order = "let lit = \"acme::caret(text=s, offset=1)\"\nlet r = acme::caret(offset=off(), text=txt())\n"
+  let conv6 = apply_api_boundary_conversions(lit_and_order, am6, "p6.pion", d6, l6)
+  assert_true(str_has(conv6, "let lit = \"acme::caret(text=s, offset=1)\""), "string literal NEVER rewritten")
+  assert_true(conv6.index_of("= off();") < conv6.index_of("= txt();"), "strict left-to-right arg eval order preserved (off before txt)")
+
+  // 4. Helper fn propagating invoke(fn() { z }) init dependency (Astra P1-1)
+  let p7_src = SourceFile::{
+    rel_path: "p7.mbt",
+    content: "fn invoke(f : () -> Int) -> Int { f() }\nfn wrap() -> Int { invoke(fn() { z }) }\nlet a : Int = wrap()\nlet z : Int = 42\n",
+    is_test: false,
+  }
+  let p7_res = transpile_package([p7_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p7_res.blockers, 0)
+  assert_true(p7_res.files[0].content.index_of("let z") < p7_res.files[0].content.index_of("let a"), "z before wrap()->invoke(fn(){z})")
+
+  // 5. Real MoonBit `moon.pkg` DSL `options(targets: { ... })` (Astra P1-2)
+  let dsl_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "options(\n  targets: {\n    \"a_native.mbt\": [ \"native\" ],\n    \"a_js.mbt\": [ \"js\" ],\n  }\n)\n",
+    header: default_header_meta("native"),
+  }
+  let dsl_res = transpile_package(
+    [
+      SourceFile::{ rel_path: "a_native.mbt", content: "pub fn f() -> Int { 1 }\n", is_test: false },
+      SourceFile::{ rel_path: "a_js.mbt", content: "pub fn f() -> Int { 2 }\n", is_test: false },
+    ],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    dsl_opts,
+    [],
+    false,
+    noop_check,
+  )
+  assert_eq(dsl_res.files.length(), 1)
+  assert_true(dsl_res.files[0].rel_path == "a_native.pion", "DSL targets kept native and excluded js")
+
+  // 6. Explicit `x?=expr` external optional forwarding (Astra P1-3) + `a[0:1].to_owned()` suffix consumed (Astra P1-4)
+  let d9 : Array[Diag] = []
+  let am9 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"tally\",\"kind\":\"fn\",\"target_pkg\":\"ext\",\"target_name\":\"tally\",\"external_tilde_default\":true}]}",
+    "m9.json",
+    d9,
+  )
+  let p9_src = SourceFile::{
+    rel_path: "p9.mbt",
+    content: "pub fn go(xs : Array[Int], x? : Int, y? : Int) -> Int {\n  let _ = xs[0:1].to_owned()\n  @ext.tally(x?=x, y?=y)\n}\n",
+    is_test: false,
+  }
+  let p9_res = transpile_package([p9_src], am9, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p9_res.blockers, 0)
+  let out9 = p9_res.files[0].content
+  assert_true(str_has(out9, "mbt_compat::array_slice_clamp(xs, 0, 1)") && !str_has(out9, ".to_owned()"), ".to_owned() suffix consumed")
+  assert_true(str_has(out9, "Some(__mbt_v0)") && str_has(out9, "Some(__mbt_v1)"), "explicit x?=x, y?=y expanded to 4 combos")
+
+  // 7. Finalized span_map covers FULL declaration bytes (Astra P1-5)
+  let fin_spans = finalize_span_map(p9_res.files, p9_res.span_map)
+  assert_true(fin_spans.length() >= 1, "at least one span entry")
+  let sp0 = fin_spans[0]
+  let slice0 = p9_res.files[0].content.slice(sp0.out_start, sp0.out_end)
+  assert_true(slice0.starts_with("pub fn go(") && slice0.ends_with("}"), "span_map covers full pub fn go(...) { ... }")
 }

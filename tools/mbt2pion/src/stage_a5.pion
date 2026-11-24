@@ -30,6 +30,7 @@ pub struct ProbeSite {
   rhs_expr : String
   divisor_is_zero : Bool
   divisor_is_nonzero : Bool
+  divisor_is_neg_one : Bool
 }
 
 pub struct ProbeResult {
@@ -267,9 +268,16 @@ fn find_receiver_start(tokens : Array[Token], end_idx : Int) -> Int {
   -1
 }
 
+///| Check whether a RHS expression represents a statically known Byte zero (`0.to_byte()`, `b'\x00'`, `b'\0'`).
+fn is_byte_zero_expr(rhs : String) -> Bool {
+  let t = rhs.trim()
+  t == "0.to_byte()" || t == "(0).to_byte()" || t == "0x0.to_byte()" || t == "0x00.to_byte()" ||
+  t == "b'\\x00'" || t == "b'\\0'" || t == "b'\\u{0}'"
+}
+
 ///| Find end token index (inclusive) of a unary/postfix RHS operand for `*`, `/`, or `%`.
 ///| Handles unary `-` / `+` / `!` (e.g. `a / -b`, `a / -(b + c)`), parenthesized `(b - c)`,
-///| field chains `h.n`, qualified `pkg::fn(x)`, and indexed `arr[i]`.
+///| byte char literals `b'\x00'`, field chains `h.n`, qualified `pkg::fn(x)`, and indexed `arr[i]`.
 fn find_rhs_end(tokens : Array[Token], start_idx : Int, limit : Int) -> Int {
   let mut cur = start_idx
   while cur < limit && (tokens[cur].kind == TokenKind::Minus || tokens[cur].kind == TokenKind::Plus || tokens[cur].kind == TokenKind::Bang) {
@@ -281,8 +289,8 @@ fn find_rhs_end(tokens : Array[Token], start_idx : Int, limit : Int) -> Int {
   let k = tokens[cur].kind
   if k == TokenKind::LParen {
     cur = find_matching_delim(tokens, cur)
-  } else if k == TokenKind::Ident || k == TokenKind::UpperIdent || k == TokenKind::IntLit || k == TokenKind::FloatLit {
-    // primary atom
+  } else if k == TokenKind::Ident || k == TokenKind::UpperIdent || k == TokenKind::IntLit ||
+  k == TokenKind::FloatLit || k == TokenKind::ByteCharLit {
     let _ = 0
   } else {
     return -1
@@ -414,6 +422,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
                 rhs_expr: isite.rhs_expr,
                 divisor_is_zero: isite.divisor_is_zero,
                 divisor_is_nonzero: isite.divisor_is_nonzero,
+                divisor_is_neg_one: isite.divisor_is_neg_one,
               })
             }
             rebuilt.write_string("\\{" + inner_inst + "}")
@@ -432,6 +441,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
                 rhs_expr: "__INTERP_SHOW__",
                 divisor_is_zero: false,
                 divisor_is_nonzero: false,
+                divisor_is_neg_one: false,
               })
               rebuilt.write_string("\\{" + et + ".mbt_show_probe()}")
             } else {
@@ -451,12 +461,15 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
     }
 
     // 1. `<recv>.length()` -> `<recv>.mbt_len_probe()`
+    //    (skip when immediately followed by `*`/`/`/`%` so outer div/mod probes first in Round 0!)
     if t.kind == TokenKind::Dot && i + 3 < n &&
     tokens[i + 1].raw == "length" &&
     tokens[i + 2].kind == TokenKind::LParen &&
     tokens[i + 3].kind == TokenKind::RParen {
+      let len_next_mul_div = i + 4 < n &&
+      (tokens[i + 4].kind == TokenKind::Star || tokens[i + 4].kind == TokenKind::Slash || tokens[i + 4].kind == TokenKind::Percent)
       let recv_start = find_receiver_start(tokens, i - 1)
-      if recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+      if !len_next_mul_div && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
@@ -472,6 +485,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
             rhs_expr: "",
             divisor_is_zero: false,
             divisor_is_nonzero: false,
+            divisor_is_neg_one: false,
           })
           edits.push((start_b, end_b, recv_expr + ".mbt_len_probe()"))
           covered_end = end_b
@@ -503,6 +517,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
             rhs_expr: "",
             divisor_is_zero: false,
             divisor_is_nonzero: false,
+            divisor_is_neg_one: false,
           })
           edits.push((start_b, end_b, recv_expr + ".mbt_show_probe()"))
           covered_end = end_b
@@ -530,6 +545,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
           rhs_expr: "",
           divisor_is_zero: false,
           divisor_is_nonzero: false,
+          divisor_is_neg_one: false,
         })
         edits.push((start_b, end_b, recv_expr + ".mbt_val_probe()"))
         covered_end = end_b
@@ -538,8 +554,9 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
       }
     }
 
-    // 4. `<recv>[<idx>]` -> `<recv>.mbt_idx_probe(<idx>)` (skipping `.length()` chains on index so outer probe runs first or next round)
-    if t.kind == TokenKind::LBracket && i > 0 {
+    // 4. `<recv>[<idx>]` -> `<recv>.mbt_idx_probe(<idx>)` (skipping `.length()` chains on index so outer probe runs first or next round;
+    //    NEVER treat a newline-leading `[a, b]` array literal after a previous statement as indexing!)
+    if t.kind == TokenKind::LBracket && i > 0 && !t.newline_before {
       let close_br = find_matching_delim(tokens, i)
       let next_is_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
       let next_is_probe_dot = close_br + 2 < n && tokens[close_br + 1].kind == TokenKind::Dot &&
@@ -566,6 +583,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
           rhs_expr: idx_expr,
           divisor_is_zero: false,
           divisor_is_nonzero: false,
+          divisor_is_neg_one: false,
         })
         edits.push((start_b, end_b, recv_expr + ".mbt_idx_probe(" + idx_expr + ")"))
         covered_end = end_b
@@ -594,16 +612,18 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
         } else {
           -1
         }
-        let is_zero = rhs_lit_idx >= 0 && is_statically_zero_literal(tokens[rhs_lit_idx])
-        let is_nonzero = rhs_lit_idx >= 0 && is_statically_nonzero_literal(tokens[rhs_lit_idx])
-        if is_nonzero && !verify_const_nonzero {
-          i = i + 1
-          continue
-        }
         let start_b = tokens[lhs_start].start_byte
         let end_b = tokens[rhs_end].end_byte
         let lhs_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         let rhs_expr = content.slice(tokens[i + 1].start_byte, end_b).trim()
+        let is_zero = (rhs_lit_idx >= 0 && is_statically_zero_literal(tokens[rhs_lit_idx])) || is_byte_zero_expr(rhs_expr)
+        let is_neg_one = rhs_end == i + 2 && tokens[i + 1].kind == TokenKind::Minus &&
+        tokens[i + 2].kind == TokenKind::IntLit && (tokens[i + 2].raw == "1" || tokens[i + 2].raw == "1L")
+        let is_nonzero = rhs_lit_idx >= 0 && is_statically_nonzero_literal(tokens[rhs_lit_idx]) && !is_neg_one
+        if is_nonzero && !verify_const_nonzero {
+          i = i + 1
+          continue
+        }
         sites.push(ProbeSite::{
           file: file,
           probe_kind: pkind,
@@ -615,6 +635,7 @@ fn instrument_probes_for_file_opts(file : String, content : String, verify_const
           rhs_expr: rhs_expr,
           divisor_is_zero: is_zero,
           divisor_is_nonzero: is_nonzero,
+          divisor_is_neg_one: is_neg_one,
         })
         edits.push((start_b, end_b, "(" + lhs_expr + ")." + pkind + "(" + rhs_expr + ")"))
         covered_end = end_b
@@ -929,6 +950,7 @@ pub fn run_stage_a5(
     // Apply rewrites to each file, consuming each ProbeResult at most once in `(file, line, col)` order!
     let next_files : Array[GeneratedFile] = []
     let mut any_changed = false
+    let mut saw_verified_nonzero = false
     for f in cur_files {
       let sites = match sites_by_file.get(f.rel_path) {
         Some(xs) => xs
@@ -936,6 +958,9 @@ pub fn run_stage_a5(
       }
       let edits : Array[(Int, Int, String)] = []
       for site in sites {
+        if site.divisor_is_nonzero {
+          saw_verified_nonzero = true
+        }
         let mut matched_idx = -1
         let mut pi = 0
         while pi < probe_results.length() {
@@ -971,7 +996,7 @@ pub fn run_stage_a5(
       }
     }
     cur_files = next_files
-    if !any_changed {
+    if !any_changed && !(round == 0 && saw_verified_nonzero) {
       break
     }
     round = round + 1

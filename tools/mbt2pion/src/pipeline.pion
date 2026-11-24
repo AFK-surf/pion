@@ -11,8 +11,8 @@
 ///|    0 unresolved drift entries, 0 error diagnostics).
 
 ///| Collect sorted unique external package prefixes (`<pkg>::`) actually referenced in `content`,
-///| ignoring comments, string literals, uppercase type/enum namespaces, `self`/`super`, and
-///| packages already imported in `content`.
+///| ignoring comments, plain string literals, uppercase type/enum namespaces, `self`/`super`, and
+///| packages already imported in `content`. Recursively scans `\{...}` inside interpolated strings!
 pub fn collect_referenced_packages(content : String) -> Array[String] {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
@@ -27,6 +27,21 @@ pub fn collect_referenced_packages(content : String) -> Array[String] {
         already[raw_s.slice(1, raw_s.length() - 1)] = true
       }
       i = i + 2
+      continue
+    }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let parts = split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline)
+      for p in parts {
+        if p.is_expr {
+          let inner_pkgs = collect_referenced_packages(p.text)
+          for ip in inner_pkgs {
+            if !already.contains(ip) {
+              found[ip] = true
+            }
+          }
+        }
+      }
+      i = i + 1
       continue
     }
     if t.kind == TokenKind::Ident && i + 1 < n && tokens[i + 1].kind == TokenKind::ColonColon {
@@ -97,14 +112,20 @@ fn prepend_headers_and_imports(
   final_files
 }
 
-///| Parse `"targets": { "file.mbt": ["native", ...], ... }` from `moon.pkg.json` or `moon.pkg` (P1-3).
+///| Parse targets map from BOTH `moon.pkg.json` (`"targets": { ... }`) AND
+///| real MoonBit `moon.pkg` DSL (`options(targets: { "file.mbt": [ "native" ], ... })`) (Astra P1-2).
 pub fn parse_moon_pkg_targets(content : String) -> Map[String, Array[String]] {
   let out : Map[String, Array[String]] = Map()
-  let t_idx = content.index_of("\"targets\"")
-  if t_idx < 0 {
+  let q_idx = content.index_of("\"targets\"")
+  let dsl_idx = content.index_of("targets:")
+  let start_after = if q_idx >= 0 {
+    q_idx + 9
+  } else if dsl_idx >= 0 {
+    dsl_idx + 8
+  } else {
     return out
   }
-  let after_t = content.slice(t_idx + 9, content.length())
+  let after_t = content.slice(start_after, content.length())
   let lb = after_t.index_of("{")
   if lb < 0 {
     return out
@@ -192,7 +213,50 @@ pub fn target_matches_moon_rules(pion_target : String, rules : Array[String]) ->
   false
 }
 
-///| Recompute final byte/line/col `span_map` entries against the final formatted `.pion` files (P1-6).
+///| Locate the full declaration byte range `[start_byte, end_byte)` in a finalized `.pion` file
+///| using the lexer + balanced `{ ... }` brace matching (Astra P1-5).
+fn find_final_decl_span(final_txt : String, kind_tag : String) -> Option[(Int, Int)] {
+  let colon_i = kind_tag.index_of(":")
+  if colon_i <= 0 {
+    return None
+  }
+  let dkind = kind_tag.slice(0, colon_i)
+  let dname = kind_tag.slice(colon_i + 1, kind_tag.length())
+  let toks = lex_moonbit(final_txt)
+  let n = toks.length() - 1
+  let mut i = 0
+  while i < n {
+    let t = toks[i]
+    if t.kind == TokenKind::Keyword && t.raw == dkind && i + 1 < n {
+      // Match name (strip generic suffix `[T]` if present in `dname`)
+      let base_name = {
+        let bi = dname.index_of("[")
+        if bi > 0 { dname.slice(0, bi) } else { dname }
+      }
+      if toks[i + 1].raw == base_name {
+        // Walk back to include leading `pub` if immediately preceding
+        let start_tok = if i > 0 && toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "pub" {
+          i - 1
+        } else {
+          i
+        }
+        let mut lb = i + 2
+        while lb < n && toks[lb].kind != TokenKind::LBrace {
+          lb = lb + 1
+        }
+        if lb < n && toks[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(toks, lb)
+          return Some((toks[start_tok].start_byte, toks[rb].end_byte))
+        }
+      }
+    }
+    i = i + 1
+  }
+  None
+}
+
+///| Recompute final byte/line/col `span_map` entries covering FULL declarations against
+///| the final formatted `.pion` files (Astra P1-5).
 pub fn finalize_span_map(
   files : Array[GeneratedFile],
   raw_spans : Array[SpanMapEntry],
@@ -205,22 +269,19 @@ pub fn finalize_span_map(
   for sp in raw_spans {
     match content_by_file.get(sp.out_file) {
       Some(final_txt) => {
-        // Compute exact header + auto-import byte/line offset by locating declaration anchor in final bytes
         let mut out_start = sp.out_start
         let mut out_end = sp.out_end
         let mut out_line = sp.out_line
         let mut out_col = sp.out_col
-        if sp.kind.starts_with("fn:") {
-          let fname = sp.kind.slice(3, sp.kind.length())
-          let needle = "fn " + fname + "("
-          let idx = final_txt.index_of(needle)
-          if idx >= 0 {
-            out_start = idx
-            out_end = idx + needle.length()
-            let (ln, cl) = byte_offset_to_line_col(final_txt, idx)
+        match find_final_decl_span(final_txt, sp.kind) {
+          Some((s_b, e_b)) => {
+            out_start = s_b
+            out_end = e_b
+            let (ln, cl) = byte_offset_to_line_col(final_txt, s_b)
             out_line = ln
             out_col = cl
           }
+          None => ()
         }
         out.push(SpanMapEntry::{
           src_file: sp.src_file,

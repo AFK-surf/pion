@@ -164,20 +164,19 @@ fn run_pionc_check_batch_status(
     let _ = fs_mkdir_p(world, src_root)
     let toml_sb = StringBuilder()
     toml_sb.write_string("[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+    let imp_sb = StringBuilder()
     let seen_dep : Map[String, Bool] = Map()
-    let mut has_mbt_compat = false
     for dep in deps {
       if !seen_dep.contains(dep.0) {
         seen_dep[dep.0] = true
         toml_sb.write_string(dep.0 + " = { path = \"" + dep.1 + "\" }\n")
-        if dep.0 == "mbt_compat" {
-          has_mbt_compat = true
-        }
+        imp_sb.write_string("import \"" + dep.0 + "\" as " + dep.0 + "\n")
       }
     }
     let _ = fs_write(world, join_path(scratch_dir, "pion.toml"), toml_sb.to_string())
-    if inject_compat_import && has_mbt_compat {
-      let _ = fs_write(world, join_path(src_root, "__mbt_compat_import.pion"), "import \"mbt_compat\" as mbt_compat\n")
+    // Opus P0-R1: inject imports for ALL configured dependencies during Stage A.5 / Stage B probe rounds
+    if inject_compat_import && imp_sb.to_string().length() > 0 {
+      let _ = fs_write(world, join_path(src_root, "__mbt_dep_imports.pion"), imp_sb.to_string())
     }
     for pair in batch {
       let fpath = join_path(src_root, pair.0)
@@ -255,6 +254,35 @@ fn run_pionc_fmt_file(world : World, pionc_bin : String, scratch_file : String, 
   match fs_read(world, scratch_file) {
     Ok(formatted) => (true, formatted)
     Err(_) => (false, content)
+  }
+}
+
+fn strip_trailing_slash(p : String) -> String {
+  let mut s = p
+  while s.length() > 1 && s.ends_with("/") {
+    s = s.slice(0, s.length() - 1)
+  }
+  s
+}
+
+///| Recursively collect all relative file paths under `root` in deterministic sorted order.
+fn collect_all_files_sorted(world : World, root : String, rel_dir : String, out : Array[String]) -> Unit {
+  let full_dir = if rel_dir.length() == 0 { root } else { join_path(root, rel_dir) }
+  if !fs_is_dir(world, full_dir) {
+    return
+  }
+  let entries = m2p::sort_strings(fs_list_dir(world, full_dir))
+  for entry in entries {
+    if entry == "." || entry == ".." {
+      continue
+    }
+    let rel = if rel_dir.length() == 0 { entry } else { rel_dir + "/" + entry }
+    let full = join_path(root, rel)
+    if fs_is_dir(world, full) {
+      collect_all_files_sorted(world, root, rel, out)
+    } else {
+      out.push(rel)
+    }
   }
 }
 
@@ -393,9 +421,9 @@ pub fn main(world : World) -> Int {
     io_eprintln(world, "mbt2pion: invalid --mode `" + mode + "` (expected `audit` or `publish`)")
     return 2
   }
-  // P0-2: `--no-probes` is strictly forbidden in `--mode publish`!
-  if mode == "publish" && !run_probes {
-    io_eprintln(world, "mbt2pion: --no-probes is forbidden in --mode publish (allowed only in --mode audit)")
+  // P0-2 + Astra P0-1: `--no-probes` is strictly forbidden in BOTH `--mode publish` AND `--check`!
+  if (mode == "publish" || check_only) && !run_probes {
+    io_eprintln(world, "mbt2pion: --no-probes is forbidden in --mode publish and --check (allowed only in --mode audit)")
     return 2
   }
   // P0-4: validate `--src` is an existing readable directory BEFORE touching `--out`!
@@ -599,12 +627,64 @@ pub fn main(world : World) -> Int {
     })
   }
 
-  // P0-2: Final zero-diagnostic `pionc check --json` hard gate on the exact final formatted candidate package!
-  // Required for `--mode publish` and `--check` (and when `--pionc` is broken or diagnostics remain).
+  // Astra P0-1: inspect `--out` for preserved hand-written (unmanaged) `.pion` files and collisions!
+  let clean_out_dir = strip_trailing_slash(out_dir)
+  let preserved_unmanaged_pions : Array[(String, String)] = []
+  let preserved_other_files : Array[(String, String)] = []
+  if (mode == "publish" || check_only) && clean_out_dir.length() > 0 && fs_is_dir(world, clean_out_dir) {
+    let gen_set : Map[String, Bool] = Map()
+    for gf in final_files {
+      gen_set[gf.rel_path] = true
+      let dst = join_path(clean_out_dir, gf.rel_path)
+      if fs_is_dir(world, dst) {
+        final_diags.push(m2p::diag_error(
+          "MBT2PION_OUT_DIR_COLLISION",
+          gf.rel_path,
+          1,
+          1,
+          "destination path is an existing directory, cannot overwrite: " + dst,
+        ))
+        final_blockers = final_blockers + 1
+      } else if fs_exists(world, dst) && !is_managed_pion_file(world, dst) {
+        final_diags.push(m2p::diag_error(
+          "MBT2PION_UNMANAGED_COLLISION",
+          gf.rel_path,
+          1,
+          1,
+          "refusing to overwrite hand-written unmanaged file: " + dst,
+        ))
+        final_blockers = final_blockers + 1
+      }
+    }
+    let all_existing : Array[String] = []
+    collect_all_files_sorted(world, clean_out_dir, "", all_existing)
+    for rel in all_existing {
+      let full = join_path(clean_out_dir, rel)
+      if rel.ends_with(".pion") {
+        if !is_managed_pion_file(world, full) && !gen_set.contains(rel) {
+          match fs_read(world, full) {
+            Ok(txt) => preserved_unmanaged_pions.push((rel, txt))
+            Err(_) => ()
+          }
+        }
+      } else {
+        match fs_read(world, full) {
+          Ok(txt) => preserved_other_files.push((rel, txt))
+          Err(_) => ()
+        }
+      }
+    }
+  }
+
+  // P0-2 + Astra P0-1: Final zero-diagnostic `pionc check --json` hard gate on the exact final formatted
+  // candidate package INCLUDING preserved hand-written unmanaged `.pion` files in `--out`!
   if (mode == "publish" || check_only) && final_blockers == 0 {
     let final_batch : Array[(String, String)] = []
     for gf in final_files {
       final_batch.push((gf.rel_path, gf.content))
+    }
+    for pair in preserved_unmanaged_pions {
+      final_batch.push(pair)
     }
     let (chk_ok, chk_raw) = run_pionc_check_batch_status(
       world,
@@ -706,66 +786,80 @@ pub fn main(world : World) -> Int {
       }
       exit_code = 1
     } else {
-      // Pre-check that no destination path is occupied by an existing directory before modifying `--out`!
-      let mut pre_ok = true
+      // Astra P0-2: True directory-level atomic transaction publish!
+      // Assemble ALL new generated files + ALL preserved unmanaged files in a unique sibling
+      // staging directory, then atomically swap directories with full rollback on failure.
+      let parent_of_out = dirname(clean_out_dir)
+      if parent_of_out.length() > 0 {
+        let _ = fs_mkdir_p(world, parent_of_out)
+      }
+      let stage_dir = clean_out_dir + ".mbt2pion-stage-" + uniq_tag
+      let bak_dir = clean_out_dir + ".mbt2pion-bak-" + uniq_tag
+      let _ = proc_exec(world, ["rm", "-rf", stage_dir])
+      let _ = fs_mkdir_p(world, stage_dir)
+      let mut stage_ok = true
       for gf in final_res.files {
-        let dst = join_path(out_dir, gf.rel_path)
-        if fs_is_dir(world, dst) {
-          io_eprintln(world, "mbt2pion: destination path is a directory, cannot overwrite: " + dst)
-          pre_ok = false
+        let dst = join_path(stage_dir, gf.rel_path)
+        let parent = dirname(dst)
+        if parent.length() > 0 {
+          let _ = fs_mkdir_p(world, parent)
+        }
+        match fs_write(world, dst, gf.content) {
+          Ok(_) => ()
+          Err(e) => {
+            io_eprintln(world, "mbt2pion: failed staging " + dst + ": " + e)
+            stage_ok = false
+          }
         }
       }
-      if !pre_ok {
-        exit_code = 3
-      } else {
-        let _ = fs_mkdir_p(world, out_dir)
-        let expected_set : Map[String, Bool] = Map()
-        let staged_tmps : Array[(String, String)] = []
-        let mut stage_ok = true
-        for gf in final_res.files {
-          expected_set[gf.rel_path] = true
-          let dst = join_path(out_dir, gf.rel_path)
-          let parent = dirname(dst)
-          if parent.length() > 0 {
-            let _ = fs_mkdir_p(world, parent)
-          }
-          let tmp_dst = dst + ".mbt2pion." + uniq_tag + ".tmp"
-          match fs_write(world, tmp_dst, gf.content) {
-            Ok(_) => staged_tmps.push((tmp_dst, dst))
-            Err(e) => {
-              io_eprintln(world, "mbt2pion: failed staging " + tmp_dst + ": " + e)
-              stage_ok = false
-            }
+      for pair in preserved_unmanaged_pions {
+        let dst = join_path(stage_dir, pair.0)
+        let parent = dirname(dst)
+        if parent.length() > 0 {
+          let _ = fs_mkdir_p(world, parent)
+        }
+        match fs_write(world, dst, pair.1) {
+          Ok(_) => ()
+          Err(e) => {
+            io_eprintln(world, "mbt2pion: failed preserving unmanaged file " + dst + ": " + e)
+            stage_ok = false
           }
         }
-        if !stage_ok {
-          for pair in staged_tmps {
-            let _ = fs_remove(world, pair.0)
+      }
+      for pair in preserved_other_files {
+        let dst = join_path(stage_dir, pair.0)
+        let parent = dirname(dst)
+        if parent.length() > 0 {
+          let _ = fs_mkdir_p(world, parent)
+        }
+        match fs_write(world, dst, pair.1) {
+          Ok(_) => ()
+          Err(e) => {
+            io_eprintln(world, "mbt2pion: failed preserving file " + dst + ": " + e)
+            stage_ok = false
           }
+        }
+      }
+      if !stage_ok {
+        let _ = proc_exec(world, ["rm", "-rf", stage_dir])
+        exit_code = 3
+      } else if fs_exists(world, clean_out_dir) {
+        if !fs_rename(world, clean_out_dir, bak_dir) {
+          io_eprintln(world, "mbt2pion: failed moving existing --out aside for atomic swap: " + clean_out_dir)
+          let _ = proc_exec(world, ["rm", "-rf", stage_dir])
+          exit_code = 3
+        } else if !fs_rename(world, stage_dir, clean_out_dir) {
+          io_eprintln(world, "mbt2pion: failed committing staged directory to --out; rolling back: " + clean_out_dir)
+          let _ = fs_rename(world, bak_dir, clean_out_dir)
+          let _ = proc_exec(world, ["rm", "-rf", stage_dir])
           exit_code = 3
         } else {
-          for pair in staged_tmps {
-            if !fs_rename(world, pair.0, pair.1) {
-              io_eprintln(world, "mbt2pion: failed committing " + pair.1)
-              let _ = fs_remove(world, pair.0)
-              exit_code = 3
-            }
-          }
-          // Prune ONLY stale managed `.pion` files (starting with `// GENERATED BY mbt2pion`);
-          // NEVER delete hand-written `.pion` files (e.g. `main.pion`)!
-          if exit_code == 0 {
-            let existing_pions : Array[String] = []
-            collect_files_sorted(world, out_dir, "", ".pion", existing_pions)
-            for rel in existing_pions {
-              if !expected_set.contains(rel) {
-                let full = join_path(out_dir, rel)
-                if is_managed_pion_file(world, full) {
-                  let _ = fs_remove(world, full)
-                }
-              }
-            }
-          }
+          let _ = proc_exec(world, ["rm", "-rf", bak_dir])
         }
+      } else if !fs_rename(world, stage_dir, clean_out_dir) {
+        io_eprintln(world, "mbt2pion: failed committing staged directory to --out: " + clean_out_dir)
+        let _ = proc_exec(world, ["rm", "-rf", stage_dir])
+        exit_code = 3
       }
     }
   } else {

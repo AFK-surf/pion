@@ -401,6 +401,62 @@ if ls "$OCC_OUT"/*.tmp 2>/dev/null; then
   echo "[e2e] FAIL: leftover .tmp file after failed publish"
   exit 1
 fi
+
+# 5j. `--check --no-probes` rejected (Astra P0-1)
+if "$BIN" --src "$SRC_A" --out "$OUT_A" --target native --check --no-probes --mbt-compat "$COMPAT_DIR" --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: --check --no-probes should have exited non-zero"
+  exit 1
+fi
+
+# 5k. Hand-written unmanaged file collision rejected without overwriting + dual-file atomic rollback (Astra P0-1 + P0-2)
+ATOM_SRC="$WORK/atom_src"
+ATOM_OUT="$WORK/atom_out"
+mkdir -p "$ATOM_SRC" "$ATOM_OUT"
+cat > "$ATOM_SRC/a.mbt" << 'EOF'
+pub fn fa() -> Int { 1 }
+EOF
+cat > "$ATOM_SRC/b.mbt" << 'EOF'
+pub fn fb() -> Int { 1 }
+EOF
+"$BIN" --src "$ATOM_SRC" --out "$ATOM_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --pionc "$PIONC"
+# Replace b.pion with hand-written unmanaged file, mutate a.mbt to v2, attempt publish -> MUST fail and keep a.pion at v1!
+echo "pub fn fb() -> Int { 999 }" > "$ATOM_OUT/b.pion"
+cat > "$ATOM_SRC/a.mbt" << 'EOF'
+pub fn fa() -> Int { 2 }
+EOF
+if "$BIN" --src "$ATOM_SRC" --out "$ATOM_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: unmanaged file collision should have exited non-zero"
+  exit 1
+fi
+grep -q "pub fn fa() -> Int { 1 }" "$ATOM_OUT/a.pion"
+grep -q "pub fn fb() -> Int { 999 }" "$ATOM_OUT/b.pion"
+
+# 5l. Hand-written `driver.pion` with duplicate `fn fa` caught by final check gate (Astra P0-1)
+DUP_OUT="$WORK/dup_out"
+mkdir -p "$DUP_OUT"
+echo "pub fn fa() -> Int { 777 }" > "$DUP_OUT/driver.pion"
+if "$BIN" --src "$ATOM_SRC" --out "$DUP_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: duplicate def with preserved unmanaged driver.pion should have been rejected"
+  exit 1
+fi
+test ! -f "$DUP_OUT/a.pion"
+
+# 5m. Same-file String slice + param Array borrowed slice MUST STILL block publish (Astra P0-4)
+MIX_SLICE_SRC="$WORK/mix_slice_src"
+MIX_SLICE_OUT="$WORK/mix_slice_out"
+mkdir -p "$MIX_SLICE_SRC" "$MIX_SLICE_OUT"
+cat > "$MIX_SLICE_SRC/mix.mbt" << 'EOF'
+pub fn bad_mix(s : String, xs : Array[Int]) -> Int {
+  let _ = s[0:1]
+  let _ = xs[0:1]
+  0
+}
+EOF
+if "$BIN" --src "$MIX_SLICE_SRC" --out "$MIX_SLICE_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: unresolved param Array slice in same file as String slice should have blocked publish"
+  exit 1
+fi
+
 echo "[e2e] PASS: all negative & atomic-publish tests rejected & preserved --out / hand-written files"
 
 # -----------------------------------------------------------------------------
@@ -440,6 +496,9 @@ pub fn take_a(a : AlignA) -> Int {
     Middle => 2
     Bottom => 3
   }
+}
+pub fn label(n : Int) -> String {
+  if n > 0 { "A中😀B" } else { "" }
 }
 EOF
 
@@ -517,7 +576,7 @@ pub fn xpkg_smoke(xs : Array[(Int?, String?)]) -> Int {
     Nil => 0
   }
   let call_def = deferred_fn
-  @p1.read_cell(c) + call_def() + a + b + t + local_xs.length()
+  @p1.read_cell(c) + call_def() + a + b + t + local_xs.length() + @p1.label(base_num).length()
 }
 EOF
 
@@ -542,11 +601,12 @@ version = "0.1.0"
 [dependencies]
 p1 = { path = "$XPKG_P1" }
 p2 = { path = "$XPKG_P2" }
+mbt_compat = { path = "$COMPAT_DIR" }
 EOF
 cat > "$XPKG_APP/src/main.pion" << 'EOF'
 pub fn main(_w : World) -> Int {
   let got = xpkg_smoke([(Some(1), None)])
-  if got != 163 { panic("xpkg_smoke mismatch") }
+  if got != 168 { panic("xpkg_smoke mismatch") }
   0
 }
 EOF
