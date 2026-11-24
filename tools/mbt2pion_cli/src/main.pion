@@ -32,6 +32,7 @@ extern "C" fn c_atomic_swap_dir(a : Ptr, b : Ptr) -> Int = "mbt_atomic_swap_dir"
 extern "C" fn c_fs_lstat_mode(path : Ptr) -> Int = "mbt_fs_lstat_mode"
 extern "C" fn c_fs_hardlink(oldpath : Ptr, newpath : Ptr) -> Int = "mbt_fs_hardlink"
 extern "C" fn c_fs_dir_readable(path : Ptr) -> Int = "mbt_fs_dir_readable"
+extern "C" fn c_fs_realpath(path : Ptr, out : Ptr, cap : Int) -> Int = "mbt_fs_realpath"
 
 fn atomic_swap_dir(a : String, b : String) -> Bool {
   c_atomic_swap_dir(a.as_cstr(), b.as_cstr()) == 0
@@ -47,6 +48,68 @@ fn fs_hardlink(oldpath : String, newpath : String) -> Bool {
 
 fn fs_dir_readable(path : String) -> Bool {
   c_fs_dir_readable(path.as_cstr()) != 0
+}
+
+fn fs_realpath(path : String) -> Option[String] {
+  let buf = ptr_alloc(4096L)
+  let n = c_fs_realpath(path.as_cstr(), buf, 4096)
+  if n >= 0 {
+    let s = cstr_to_str(buf)
+    ptr_free(buf)
+    Some(s)
+  } else {
+    ptr_free(buf)
+    None
+  }
+}
+
+///| Resolve a path to its canonical realpath (normalizing `/tmp` -> `/private/tmp`, etc.);
+///| if the leaf does not yet exist, resolves its nearest existing ancestor and appends remaining segments.
+fn resolve_canonical_path(cwd : String, path : String) -> String {
+  let norm = normalize_path(cwd, path)
+  match fs_realpath(norm) {
+    Some(rp) => return rp
+    None => ()
+  }
+  let tail : Array[String] = []
+  let mut cur = norm
+  while cur.length() > 1 {
+    let d = dirname(cur)
+    let base = if d.length() == 0 {
+      cur
+    } else if d == "/" {
+      cur.slice(1, cur.length())
+    } else {
+      cur.slice(d.length() + 1, cur.length())
+    }
+    tail.push(base)
+    let next_cur = if d.length() == 0 { "." } else { d }
+    match fs_realpath(next_cur) {
+      Some(rp) => {
+        let mut res = rp
+        let mut k = tail.length() - 1
+        while k >= 0 {
+          res = join_path(res, tail[k])
+          k = k - 1
+        }
+        return res
+      }
+      None => {
+        if next_cur == cur || next_cur == "." {
+          break
+        }
+        cur = next_cur
+      }
+    }
+  }
+  norm
+}
+
+///| Fixed-length short sibling temp filename (always <= 35 bytes, NEVER triggers ENAMETOOLONG!).
+fn short_sibling_tmp(path : String, uniq_tag : String, tag : String) -> String {
+  let d = dirname(path)
+  let name = ".m2p." + uniq_tag + "." + tag
+  if d.length() > 0 { join_path(d, name) } else { name }
 }
 
 fn usage(world : World) -> Int {
@@ -169,20 +232,28 @@ fn parse_manifest_deps(manifest_path : String, content : String, out_deps : Arra
   }
 }
 
-///| Run `pionc check --json` directly against an assembled sibling candidate directory `abs_stage_dir`
-///| via a temporary package manifest + `src -> abs_stage_dir` symlink (Astra Round 5 P0-2).
-///| Because `stage_dir` lives beside `--out` with all newly generated files, preserved files, and
-///| restored symlinks, every relative/absolute symlink resolves to its exact post-swap target!
-fn run_pionc_check_dir_status(
+///| Run `pionc check --json` against a lightweight post-swap verification view of `stage_dir`
+///| (Astra Round 6 P0-2): maps all regular files to `real_stage/<rel>` and rewrites any symlink
+///| (relative, `../OUT/...`, or absolute `/abs/OUT/...`) whose post-swap target falls inside
+///| `real_out` so it resolves to `real_stage/<inner_rel>`, while leaving the real symlinks in
+///| `stage_dir` untouched for the user!
+fn run_pionc_check_candidate_view(
   world : World,
   pionc_bin : String,
   scratch_dir : String,
   deps : Array[(String, String)],
-  abs_stage_dir : String,
-) -> (Bool, String) {
+  cwd : String,
+  clean_out_dir : String,
+  stage_dir : String,
+  final_files : Array[m2p::GeneratedFile],
+  unmanaged_dirs : Array[(String, Int)],
+  unmanaged_files : Array[(String, Int)],
+  unmanaged_symlinks : Array[(String, String)],
+) -> (Bool, String, String) {
   let rm_bin = if fs_exists(world, "/bin/rm") { "/bin/rm" } else { "rm" }
   let _ = proc_exec(world, [rm_bin, "-rf", scratch_dir])
-  let _ = fs_mkdir_p(world, scratch_dir)
+  let src_view = join_path(scratch_dir, "src")
+  let _ = fs_mkdir_p(world, src_view)
   let toml_sb = StringBuilder()
   toml_sb.write_string("[package]\nname = \"mbt2pion_final_check\"\nversion = \"0.1.0\"\n")
   if deps.length() > 0 {
@@ -196,33 +267,64 @@ fn run_pionc_check_dir_status(
     }
   }
   let _ = fs_write(world, join_path(scratch_dir, "pion.toml"), toml_sb.to_string())
-  let src_link = join_path(scratch_dir, "src")
-  if !fs_symlink(world, abs_stage_dir, src_link) {
-    return (false, "{\"ok\":false,\"diagnostics\":[{\"file\":\"<final_check>\",\"line\":1,\"col\":1,\"code\":\"E_IO\",\"message\":\"failed to symlink stage_dir for final_check\"}]}")
+
+  let real_out = resolve_canonical_path(cwd, clean_out_dir)
+  let real_stage = resolve_canonical_path(cwd, stage_dir)
+  let out_prefix = if real_out == "/" { "/" } else { real_out + "/" }
+
+  for dm in unmanaged_dirs {
+    let _ = fs_mkdir_p(world, join_path(src_view, dm.0))
+  }
+  for gf in final_files {
+    let dst = join_path(src_view, gf.rel_path)
+    let parent = dirname(dst)
+    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+    let _ = fs_symlink(world, join_path(real_stage, gf.rel_path), dst)
+  }
+  for fm in unmanaged_files {
+    let real_src = join_path(real_stage, fm.0)
+    if fs_exists(world, real_src) {
+      let dst = join_path(src_view, fm.0)
+      let parent = dirname(dst)
+      if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+      let _ = fs_symlink(world, real_src, dst)
+    }
+  }
+  for sl in unmanaged_symlinks {
+    let rel = sl.0
+    let raw_target = sl.1
+    let dst = join_path(src_view, rel)
+    let parent = dirname(dst)
+    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+    // Compute post-swap canonical target path (as if `rel` already lives inside `real_out`)
+    let post_target = if raw_target.starts_with("/") {
+      resolve_canonical_path(cwd, raw_target)
+    } else {
+      let link_dir = dirname(rel)
+      let base_dir = if link_dir.length() > 0 { join_path(real_out, link_dir) } else { real_out }
+      resolve_canonical_path(cwd, join_path(base_dir, raw_target))
+    }
+    let view_target = if post_target == real_out {
+      real_stage
+    } else if post_target.starts_with(out_prefix) {
+      let inner_rel = post_target.slice(out_prefix.length(), post_target.length())
+      join_path(real_stage, inner_rel)
+    } else {
+      post_target
+    }
+    if !fs_symlink(world, view_target, dst) {
+      return (false, "", "failed creating candidate check symlink for " + rel)
+    }
+    if rel.ends_with(".pion") {
+      match fs_read(world, dst) {
+        Ok(_) => ()
+        Err(e) => return (false, "", "dangling or unreadable .pion symlink in candidate --out (" + rel + " -> " + raw_target + "): " + e)
+      }
+    }
   }
   match proc_exec_capture(world, [pionc_bin, "check", "--json", scratch_dir]) {
-    Ok(out) => (true, out)
-    Err(out) => (false, out)
-  }
-}
-
-///| Verify whether an external report path is writable (target is not a dir, and sibling temp file can be created).
-fn precheck_external_report_writable(world : World, path : String, uniq_tag : String) -> Bool {
-  match lstat_kind(world, path) {
-    Some("dir") => return false
-    _ => ()
-  }
-  let p = dirname(path)
-  if p.length() > 0 && !fs_mkdir_p(world, p) {
-    return false
-  }
-  let probe = path + ".mbt2pion-pre-" + uniq_tag
-  match fs_write(world, probe, "") {
-    Ok(_) => {
-      let _ = fs_remove(world, probe)
-      true
-    }
-    Err(_) => false
+    Ok(out) => (true, out, "")
+    Err(out) => (false, out, "")
   }
 }
 
@@ -568,13 +670,17 @@ fn cleanup_dir_preserve_hardlinks(world : World, dir : String) -> Unit {
   let _ = proc_exec(world, [rm_bin, "-rf", dir])
 }
 
-///| Atomically write a file via a unique sibling temp file + `fs_rename`.
+///| Atomically write a file via a fixed-length short sibling temp file + `fs_rename` (Astra Round 6 P0-3).
 fn write_file_atomic(world : World, path : String, content : String, uniq_tag : String) -> Bool {
-  let p = dirname(path)
-  if p.length() > 0 {
-    let _ = fs_mkdir_p(world, p)
+  match lstat_kind(world, path) {
+    Some("dir") => return false
+    _ => ()
   }
-  let tmp = path + ".mbt2pion-tmp-" + uniq_tag
+  let p = dirname(path)
+  if p.length() > 0 && !fs_mkdir_p(world, p) {
+    return false
+  }
+  let tmp = short_sibling_tmp(path, uniq_tag, "a")
   match fs_write(world, tmp, content) {
     Ok(_) =>
     if fs_rename(world, tmp, path) {
@@ -1226,30 +1332,25 @@ pub fn main(world : World) -> Int {
       }
     }
 
-    // 5. Verify any symlinked `.pion` in `stage_dir` is readable (catches dangling `.pion` symlinks post-assembly)
-    if stage_ok {
-      for sl in unmanaged_symlinks {
-        if sl.0.ends_with(".pion") {
-          let dst = join_path(stage_dir, sl.0)
-          match fs_read(world, dst) {
-            Ok(_) => ()
-            Err(e) => fs_fatal_err = "dangling or unreadable .pion symlink in candidate --out (" + sl.0 + " -> " + sl.1 + "): " + e
-          }
-        }
-      }
-    }
-
-    // 6. Run final zero-diagnostic `pionc check --json` directly on the assembled `stage_dir`!
+    // 5 & 6. Run final zero-diagnostic `pionc check --json` on post-swap candidate view of `stage_dir`
+    //        (rewriting both relative AND absolute symlinks pointing into `real_out` to `real_stage`!)
     if stage_ok && fs_fatal_err.length() == 0 {
-      let abs_stage = normalize_path(cwd, stage_dir)
-      let (chk_ok, chk_raw) = run_pionc_check_dir_status(
+      let (chk_ok, chk_raw, view_err) = run_pionc_check_candidate_view(
         world,
         pionc_bin,
         join_path(scratch_root, "final_check_pkg"),
         check_deps,
-        abs_stage,
+        cwd,
+        clean_out_dir,
+        stage_dir,
+        final_files,
+        unmanaged_dirs,
+        unmanaged_files,
+        unmanaged_symlinks,
       )
-      if !chk_ok || !is_pionc_check_clean_json(chk_raw) {
+      if view_err.length() > 0 {
+        fs_fatal_err = view_err
+      } else if !chk_ok || !is_pionc_check_clean_json(chk_raw) {
         let rem_diags = m2p::parse_pionc_diagnostics(chk_raw)
         final_diags.push(m2p::diag_error(
           "MBT2PION_FINAL_CHECK_FAILED",
@@ -1355,49 +1456,66 @@ pub fn main(world : World) -> Int {
       }
       exit_code = 3
     } else {
-      // Astra Round 5 P0-3: Two-phase external report pre-commit BEFORE atomic directory swap!
-      // Any external report write/precheck failure aborts cleanly BEFORE touching `--out`!
+      // Astra Round 6 P0-3: Two-phase external report staging + commit BEFORE atomic directory swap!
+      // Every external report (`--report`, `--drift-ledger`, `--run-report`) writes its full real
+      // content to a fixed-length short sibling temp file and commits via `fs_rename` BEFORE
+      // `atomic_swap_dir`, making `atomic_swap_dir` the ABSOLUTE FINAL step on the success path!
+      let stage_elapsed = clock_now_ms(world) - start_ms
+      let stage_pionc_ver = if run_report_path.length() > 0 {
+        match proc_exec_capture(world, [pionc_bin, "--version"]) {
+          Ok(v) => v.trim()
+          Err(_) => "unknown"
+        }
+      } else {
+        "unknown"
+      }
+      let stage_run_json = if run_report_path.length() > 0 {
+        m2p::render_run_report_json(opts, stage_elapsed, "host", stage_pionc_ver, true, final_res.blockers)
+      } else {
+        ""
+      }
+
+      // Phase 1a: Write full real contents of ALL external reports to short sibling temp files
+      let ext_staged : Array[(String, String, Int)] = [] // (tmp_path, dst_path, kind: 0=rep, 1=drf, 2=run)
       let mut ext_io_ok = true
-      if report_path.length() > 0 && !report_is_in_out && !report_path_bad {
-        let is_dir_dst = match lstat_kind(world, report_path) { Some("dir") => true, _ => false }
-        if is_dir_dst || !write_file_atomic(world, report_path, report_json, uniq_tag + "-rep") {
-          io_eprintln(world, "mbt2pion: failed writing external report before commit (old --out preserved): " + report_path)
-          ext_io_ok = false
-        } else {
-          report_written = true
-        }
-      }
-      if ext_io_ok && drift_ledger_path.length() > 0 && !drift_is_in_out && !drift_path_bad {
-        let is_dir_dst = match lstat_kind(world, drift_ledger_path) { Some("dir") => true, _ => false }
-        if is_dir_dst || !write_file_atomic(world, drift_ledger_path, drift_json, uniq_tag + "-drf") {
-          io_eprintln(world, "mbt2pion: failed writing external drift ledger before commit (old --out preserved): " + drift_ledger_path)
-          ext_io_ok = false
-        } else {
-          drift_written = true
-        }
-      }
-      if ext_io_ok && run_report_path.length() > 0 && !run_is_in_out && !run_path_bad {
-        if !precheck_external_report_writable(world, run_report_path, uniq_tag) {
-          io_eprintln(world, "mbt2pion: external run report path is not writable before commit (old --out preserved): " + run_report_path)
-          ext_io_ok = false
+      let ext_specs : Array[(Int, String, Bool, Bool, String, String)] = [
+        (0, report_path, report_is_in_out, report_path_bad, report_json, "rep"),
+        (1, drift_ledger_path, drift_is_in_out, drift_path_bad, drift_json, "drf"),
+        (2, run_report_path, run_is_in_out, run_path_bad, stage_run_json, "run"),
+      ]
+      for sp in ext_specs {
+        let skind = sp.0
+        let spath = sp.1
+        let sin_out = sp.2
+        let sbad = sp.3
+        let scontent = sp.4
+        let stag = sp.5
+        if ext_io_ok && spath.length() > 0 && !sin_out && !sbad {
+          let is_dir_dst = match lstat_kind(world, spath) { Some("dir") => true, _ => false }
+          let parent = dirname(spath)
+          let mk_ok = if parent.length() > 0 { fs_mkdir_p(world, parent) } else { true }
+          if is_dir_dst || !mk_ok {
+            io_eprintln(world, "mbt2pion: external report target is unwritable or a directory (old --out preserved): " + spath)
+            ext_io_ok = false
+          } else {
+            let tmp = short_sibling_tmp(spath, uniq_tag, stag)
+            match fs_write(world, tmp, scontent) {
+              Ok(_) => ext_staged.push((tmp, spath, skind))
+              Err(e) => {
+                io_eprintln(world, "mbt2pion: failed staging external report " + spath + ": " + e)
+                ext_io_ok = false
+              }
+            }
+          }
         }
       }
 
-      if !ext_io_ok {
-        if stage_created {
-          cleanup_dir_preserve_hardlinks(world, stage_dir)
-          stage_created = false
-        }
-        exit_code = 3
-      } else {
-        // All external reports succeeded / verified writable! Now stage ALL in-`--out` reports
-        // (including `--run-report` with `ok: true`) right before the single atomic directory swap.
+      // Phase 1b: Stage ALL in-`--out` reports into `stage_dir` & restore directory modes
+      if ext_io_ok {
         if report_is_in_out && !report_path_bad {
           let dst = join_path(stage_dir, report_rel_str)
           let parent = dirname(dst)
-          if parent.length() > 0 {
-            let _ = fs_mkdir_p(world, parent)
-          }
+          if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
           match fs_write(world, dst, report_json) {
             Ok(_) => report_written = true
             Err(e) => {
@@ -1409,9 +1527,7 @@ pub fn main(world : World) -> Int {
         if stage_ok && drift_is_in_out && !drift_path_bad {
           let dst = join_path(stage_dir, drift_rel_str)
           let parent = dirname(dst)
-          if parent.length() > 0 {
-            let _ = fs_mkdir_p(world, parent)
-          }
+          if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
           match fs_write(world, dst, drift_json) {
             Ok(_) => drift_written = true
             Err(e) => {
@@ -1423,15 +1539,7 @@ pub fn main(world : World) -> Int {
         if stage_ok && run_is_in_out && !run_path_bad {
           let dst = join_path(stage_dir, run_rel_str)
           let parent = dirname(dst)
-          if parent.length() > 0 {
-            let _ = fs_mkdir_p(world, parent)
-          }
-          let stage_elapsed = clock_now_ms(world) - start_ms
-          let stage_pionc_ver = match proc_exec_capture(world, [pionc_bin, "--version"]) {
-            Ok(v) => v.trim()
-            Err(_) => "unknown"
-          }
-          let stage_run_json = m2p::render_run_report_json(opts, stage_elapsed, "host", stage_pionc_ver, true, final_res.blockers)
+          if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
           match fs_write(world, dst, stage_run_json) {
             Ok(_) => run_written = true
             Err(e) => {
@@ -1440,8 +1548,6 @@ pub fn main(world : World) -> Int {
             }
           }
         }
-
-        // Restore exact directory modes bottom-up (deepest first), then stage_dir itself
         if stage_ok {
           let bottom_up = sort_dirs_bottom_up(unmanaged_dirs)
           for dm in bottom_up {
@@ -1455,20 +1561,59 @@ pub fn main(world : World) -> Int {
             let _ = fs_chmod(world, stage_dir, out_dir_mode)
           }
         }
+      }
 
-        // Single-syscall atomic commit!
-        if !stage_ok {
+      if !ext_io_ok || !stage_ok {
+        for es in ext_staged {
+          let _ = fs_remove(world, es.0)
+        }
+        if stage_created {
           cleanup_dir_preserve_hardlinks(world, stage_dir)
           stage_created = false
+        }
+        report_written = true
+        drift_written = true
+        run_written = true
+        exit_code = 3
+      } else {
+        // Phase 2: Commit ALL external reports via atomic `fs_rename` BEFORE swapping `--out`!
+        let mut ext_commit_ok = true
+        for es in ext_staged {
+          if ext_commit_ok {
+            if !fs_rename(world, es.0, es.1) {
+              io_eprintln(world, "mbt2pion: failed committing external report before swap (old --out preserved): " + es.1)
+              let _ = fs_remove(world, es.0)
+              ext_commit_ok = false
+            } else {
+              if es.2 == 0 { report_written = true }
+              if es.2 == 1 { drift_written = true }
+              if es.2 == 2 { run_written = true }
+            }
+          } else {
+            let _ = fs_remove(world, es.0)
+          }
+        }
+        if !ext_commit_ok {
+          if stage_created {
+            cleanup_dir_preserve_hardlinks(world, stage_dir)
+            stage_created = false
+          }
+          report_written = true
+          drift_written = true
+          run_written = true
           exit_code = 3
         } else if out_existed_as_dir {
+          // ABSOLUTE FINAL STEP: Single-syscall atomic swap! Zero fallible report I/O after this!
           if !atomic_swap_dir(stage_dir, clean_out_dir) {
             io_eprintln(world, "mbt2pion: atomic directory swap failed (old --out preserved): " + clean_out_dir)
             cleanup_dir_preserve_hardlinks(world, stage_dir)
             stage_created = false
             exit_code = 3
+            if run_report_path.length() > 0 && !run_is_in_out && !run_path_bad {
+              let fail_run = m2p::render_run_report_json(opts, stage_elapsed, "host", stage_pionc_ver, false, final_res.blockers)
+              let _ = write_file_atomic(world, run_report_path, fail_run, uniq_tag + "rf")
+            }
           } else {
-            // Old `--out` is now at `stage_dir`; clean up dirs only (never chmod files!)
             cleanup_dir_preserve_hardlinks(world, stage_dir)
             stage_created = false
           }
@@ -1477,6 +1622,10 @@ pub fn main(world : World) -> Int {
           cleanup_dir_preserve_hardlinks(world, stage_dir)
           stage_created = false
           exit_code = 3
+          if run_report_path.length() > 0 && !run_is_in_out && !run_path_bad {
+            let fail_run = m2p::render_run_report_json(opts, stage_elapsed, "host", stage_pionc_ver, false, final_res.blockers)
+            let _ = write_file_atomic(world, run_report_path, fail_run, uniq_tag + "rf")
+          }
         } else {
           stage_created = false
         }

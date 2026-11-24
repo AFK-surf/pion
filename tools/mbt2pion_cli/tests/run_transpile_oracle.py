@@ -90,6 +90,8 @@ CASES = {
     "div_min_allones_i32": ("panic:div_overflow", 0),
     "div_min_allones_i64": ("panic:div_overflow", 0),
     "utf16_lit_struct_interp": ("ok", 5),
+    "mbt_compat_chain_len": ("ok", 3),
+    "const_upper_idx_and_generic": ("ok", 3),
 }
 
 MOON_TRAPS = {
@@ -405,6 +407,25 @@ pub fn str_lit_idx_1() -> Int { "中A"[1].to_int() }
 pub fn str_paren_lit_len_mul2() -> Int { ("中A").length() * 2 }
 pub fn str_struct_field_len(s : String) -> Int { LenBox::{ n: s.length() * 2 }.n }
 pub fn str_interp_len(x : Int) -> Int { "中\{x}".length() }
+
+// Round 6 Opus P1 & Astra P0-1 cases
+pub fn filter_chain_len(xs : Array[Int]) -> Int {
+  xs.filter(fn(x) { x > 1 }).length()
+}
+
+pub fn map_str_chain_len(xs : Array[String]) -> Int {
+  xs.map(fn(t) { t.length() % 3 }).length()
+}
+
+pub fn slice_owned_str_len(s : String) -> Int {
+  s[0:2].to_owned().length()
+}
+
+const CAP : String = "中A"
+
+pub fn cap_idx_1() -> Int { CAP[1].to_int() }
+pub fn cap_in_box() -> Int { LenBox::{ n: CAP[1].to_int() }.n }
+pub fn[T] id_arr(xs : Array[T]) -> Option[Array[T]] { Some(xs) }
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -748,6 +769,25 @@ fn main {
     check("r5.paren_lit", r3 == 4)
     check("r5.struct_field", r4 == 4)
     check("r5.interp_len", r5 == 2)
+  } else if kase == "mbt_compat_chain_len" {
+    let a = filter_chain_len([1, 2, 3, 4])
+    let b = map_str_chain_len(["A中😀", "xy"])
+    let c = slice_owned_str_len("中A😀")
+    trace("r", "\{a},\{b},\{c}")
+    check("r6.filter_len", a == 3)
+    check("r6.map_len", b == 2)
+    check("r6.slice_str_len", c == 2)
+  } else if kase == "const_upper_idx_and_generic" {
+    let a = cap_idx_1()
+    let b = cap_in_box()
+    let c = match id_arr([10, 20, 30]) {
+      Some(v) => v.length()
+      None => 0
+    }
+    trace("r", "\{a},\{b},\{c}")
+    check("r6.cap_idx", a == 65)
+    check("r6.cap_box", b == 65)
+    check("r6.id_arr", c == 3)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1105,6 +1145,25 @@ pub fn main(w : World) -> Int {
     check(w, "r5.paren_lit", r3 == 4)
     check(w, "r5.struct_field", r4 == 4)
     check(w, "r5.interp_len", r5 == 2)
+  } else if kase == "mbt_compat_chain_len" {
+    let a = filter_chain_len([1, 2, 3, 4])
+    let b = map_str_chain_len(["A中😀", "xy"])
+    let c = slice_owned_str_len("中A😀")
+    trace(w, "r", a.to_string() + "," + b.to_string() + "," + c.to_string())
+    check(w, "r6.filter_len", a == 3)
+    check(w, "r6.map_len", b == 2)
+    check(w, "r6.slice_str_len", c == 2)
+  } else if kase == "const_upper_idx_and_generic" {
+    let a = cap_idx_1()
+    let b = cap_in_box()
+    let c = match id_arr([10, 20, 30]) {
+      Some(v) => v.length()
+      None => 0
+    }
+    trace(w, "r", a.to_string() + "," + b.to_string() + "," + c.to_string())
+    check(w, "r6.cap_idx", a == 65)
+    check(w, "r6.cap_box", b == 65)
+    check(w, "r6.id_arr", c == 3)
   } else {
     panic("abort: unknown case " + kase)
   }

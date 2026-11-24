@@ -10,7 +10,10 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -83,4 +86,25 @@ int mbt_fs_dir_readable(const char *path) {
     }
     closedir(d);
     return 1;
+}
+
+/* Resolve canonical path via POSIX realpath (normalizing /tmp -> /private/tmp, etc.).
+ * Writes NUL-terminated result into out[0..cap-1] and returns length >= 0, or -1 on error.
+ */
+int mbt_fs_realpath(const char *path, char *out, int cap) {
+    if (!path || !out || cap <= 1) {
+        errno = EINVAL;
+        return -1;
+    }
+    char buf[PATH_MAX];
+    if (!realpath(path, buf)) {
+        return -1;
+    }
+    size_t len = strlen(buf);
+    if (len >= (size_t)cap) {
+        errno = ENAMETOOLONG;
+        return -1;
+    }
+    memcpy(out, buf, len + 1);
+    return (int)len;
 }

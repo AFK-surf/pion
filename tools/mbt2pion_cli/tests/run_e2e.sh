@@ -930,30 +930,56 @@ r9_v2_chk = run_cli(["--src", s9, "--out", o9, "--target", "native", "--check",
                      "--mbt-compat", compat_dir, "--pionc", pionc])
 assert r9_v2_chk.returncode == 1, f"9a v2 --check must fail (rc=1), got {r9_v2_chk.returncode}"
 
-# 9b. P0-3: external report write failure MUST abort BEFORE atomic swap (old_key preserved, NO new_key, NO ok:true run.json!)
+# 9a-2. Round 6 Astra P0-2: ABSOLUTE symlink `alias.pion -> <abs_OUT>/a.pion` MUST also block on new_key,
+#       while a stable external symlink `ext.pion -> <external>/ok.pion` passes!
+os.unlink(os.path.join(o9, "alias.pion"))
+os.symlink(os.path.join(os.path.abspath(o9), "a.pion"), os.path.join(o9, "alias.pion"))
+r9_abs_pub = run_cli(["--src", s9, "--out", o9, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_abs_pub.returncode == 1, f"9a-2 absolute symlink to OUT/a.pion must block publish (rc=1), got {r9_abs_pub.returncode}"
+assert open(os.path.join(o9, "a.pion"), "rb").read() == old_a_bytes, "9a-2 old OUT modified on blocked abs symlink publish!"
+r9_abs_chk = run_cli(["--src", s9, "--out", o9, "--target", "native", "--check",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_abs_chk.returncode == 1, f"9a-2 absolute symlink must fail --check (rc=1), got {r9_abs_chk.returncode}"
+
+os.unlink(os.path.join(o9, "alias.pion"))
+ext_ok = os.path.join(root, "ext_ok.pion")
+with open(ext_ok, "w") as f:
+    f.write("pub fn ext_helper() -> Int { 99 }\n")
+os.symlink(ext_ok, os.path.join(o9, "ext.pion"))
+r9_ext_ok = run_cli(["--src", s9, "--out", o9, "--target", "native", "--mode", "publish",
+                     "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_ext_ok.returncode == 0, f"9a-3 stable external symlink should succeed, got {r9_ext_ok.returncode} {r9_ext_ok.stderr}"
+
+# 9b. P0-3: (1) 228-byte legal external --run-report filename succeeds (short sibling temp never hits ENAMETOOLONG);
+#           (2) external --run-report target failure (existing dir) aborts BEFORE swap (old_key preserved, NO rep.json!)
 s9b = os.path.join(root, "s9b")
 o9b = os.path.join(root, "o9b")
 os.makedirs(s9b, exist_ok=True)
 with open(os.path.join(s9b, "a.mbt"), "w") as f:
     f.write("pub fn old_key() -> Int { 1 }\n")
+long_run_rep = os.path.join(root, "r" * 223 + ".json") # 228-byte filename (< NAME_MAX 255)
 r9b_1 = run_cli(["--src", s9b, "--out", o9b, "--target", "native", "--mode", "publish",
-                 "--mbt-compat", compat_dir, "--pionc", pionc])
-assert r9b_1.returncode == 0, f"9b initial publish failed: {r9b_1.stderr}"
+                 "--mbt-compat", compat_dir, "--pionc", pionc,
+                 "--run-report", long_run_rep])
+assert r9b_1.returncode == 0, f"9b 228-byte external --run-report failed: {r9b_1.returncode} {r9b_1.stderr}"
+assert json.load(open(long_run_rep))["ok"] is True, "9b 228-byte run report missing ok:true"
+
 snap_9b = {p: open(os.path.join(o9b, p), "rb").read() for p in sorted(os.listdir(o9b))}
 with open(os.path.join(s9b, "a.mbt"), "w") as f:
     f.write("pub fn new_key() -> Int { 2 }\n")
-blk9 = os.path.join(root, "not_dir_9b")
-with open(blk9, "w") as f: f.write("x")
+dir_as_run_rep = os.path.join(root, "run_rep_is_dir")
+os.makedirs(dir_as_run_rep, exist_ok=True)
 r9b_2 = run_cli(["--src", s9b, "--out", o9b, "--target", "native", "--mode", "publish",
                  "--mbt-compat", compat_dir, "--pionc", pionc,
-                 "--run-report", os.path.join(o9b, "run.json"),
-                 "--report", os.path.join(blk9, "report.json")])
-assert r9b_2.returncode == 3, f"9b external report failure must exit 3, got {r9b_2.returncode}"
+                 "--report", os.path.join(o9b, "rep.json"),
+                 "--run-report", dir_as_run_rep])
+assert r9b_2.returncode == 3, f"9b external --run-report dir collision must exit 3, got {r9b_2.returncode}"
 after_9b = {p: open(os.path.join(o9b, p), "rb").read() for p in sorted(os.listdir(o9b))}
-assert after_9b == snap_9b, f"9b OUT was mutated on external report failure! before={list(snap_9b.keys())} after={list(after_9b.keys())}"
-assert not os.path.exists(os.path.join(o9b, "run.json")), "9b run.json leaked into OUT on failure!"
+assert after_9b == snap_9b, f"9b OUT mutated on external run-report failure! before={list(snap_9b.keys())} after={list(after_9b.keys())}"
+assert not os.path.exists(os.path.join(o9b, "rep.json")), "9b in-out rep.json leaked on external run-report failure!"
 
-print("[e2e] PASS: Round 5 Astra P0-2/P0-3 suite (post-assembly relative symlink final_check, pre-swap external report failure leaves OUT untouched)")
+print("[e2e] PASS: Round 5+6 Astra P0-2/P0-3 suite (relative+absolute+external symlinks, 228-byte short-temp run-report, pre-swap failure leaves OUT untouched)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
