@@ -1209,6 +1209,47 @@ finally:
         os.chmod(rep10h_dir, 0o755)
 
 print("[e2e] PASS: Round 10 Astra P0 suite (0555 read-only subdir hardlink backup preserved + 0555 mode kept + 0555 Unicode État/état collision)")
+
+# 10j. Round 11 Astra P1: Near-PATH_MAX directory triggers probe_err (-1, unknown location);
+#      publish MUST exit 3 AND MUST NOT create `o/` or `O/` for any of --report / --drift-ledger / --run-report,
+#      while a confirmed-external diagnostic report on a normal blocked publish is still written!
+path_max = os.pathconf(root, "PC_PATH_MAX")
+if path_max <= 0:
+    path_max = 1024
+deep_base = os.path.join(root, "d10j")
+os.makedirs(deep_base, exist_ok=True)
+# Build nested dir so len(deep_base) is ~path_max - 18 (fits `O/r.json` as path, but `.m2pvp.<pid>.<seq>` exceeds PATH_MAX!)
+target_len = path_max - 18
+while len(deep_base) + 120 < target_len:
+    deep_base = os.path.join(deep_base, "x" * 119)
+rem = target_len - len(deep_base) - 1
+if rem > 4:
+    deep_base = os.path.join(deep_base, "y" * rem)
+os.makedirs(deep_base, exist_ok=True)
+o_low = os.path.join(deep_base, "o")
+o_up = os.path.join(deep_base, "O")
+for rflag in ("--report", "--drift-ledger", "--run-report"):
+    r10j = run_cli(["--src", s10, "--out", o_low, "--target", "native", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc,
+                    rflag, os.path.join(o_up, "r.json")])
+    assert r10j.returncode == 3, f"10j near-PATH_MAX {rflag} must exit 3, got {r10j.returncode} {r10j.stderr}"
+    assert not os.path.exists(o_low), f"10j {rflag} leaked o/ directory!"
+    assert not os.path.exists(o_up), f"10j {rflag} leaked O/ directory!"
+
+# Confirmed-external diagnostic report on a normal blocked publish is still written
+s10j_bad = os.path.join(root, "s10j_bad")
+o10j_bad = os.path.join(root, "o10j_bad")
+os.makedirs(s10j_bad, exist_ok=True)
+with open(os.path.join(s10j_bad, "a.mbt"), "w") as f:
+    f.write("pub fn broken() -> Int { unknown_sym_10j() }\n")
+ext_diag_rep = os.path.join(root, "ext_diag_10j.json")
+r10j_ext = run_cli(["--src", s10j_bad, "--out", o10j_bad, "--target", "native", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc,
+                    "--run-report", ext_diag_rep])
+assert r10j_ext.returncode == 1, f"10j normal blocked publish should exit 1, got {r10j_ext.returncode}"
+assert os.path.isfile(ext_diag_rep) and json.load(open(ext_diag_rep))["ok"] is False, "10j confirmed-external run-report missing or not ok:false"
+
+print("[e2e] PASS: Round 11 Astra P1 suite (unknown-location probe_err never leaks o/ or O/ for any report flag; confirmed-external diag report still written)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
