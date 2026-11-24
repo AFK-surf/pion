@@ -95,6 +95,10 @@ CASES = {
     "cross_pkg_cap_noshadow": ("ok", 2),
     "cross_pkg_cap_shadow": ("ok", 3),
     "cross_pkg_no_apimap_box": ("ok", 3),
+    "m12_val_probes": ("ok", 6),
+    "m12_recursive_local_fn": ("ok", 5),
+    "m12_per_site_enum": ("ok", 4),
+    "m12_pipe_loops_compat": ("ok", 10),
 }
 
 MOON_TRAPS = {
@@ -535,6 +539,242 @@ pub fn holder_roundtrip(v : Int) -> Int {
 }
 '''
 
+# Wave M1.2 Track A (A.1 - A.6) 3-engine Differential Oracle library
+M12_RECIPES_TOML = '''[ref]
+type_name = "mbt_compat::MbtCell"
+field_name = "v"
+ctor_call = "mbt_compat::mbt_cell"
+
+[derives]
+allow = ["Eq", "Hash"]
+ignore = ["Show"]
+'''
+
+M12_LIB_MBT = r'''
+// A.1: chained `.val.val`, side-effecting `get_ref().val += 1`, nested RHS `r.val = s.val + 1`,
+//      collision-free `struct SVal { val; val_ }` (3, 8), and enum RHS `box.val = Blue`
+pub enum Color {
+  Red
+  Blue
+}
+
+pub struct SVal {
+  val : Int
+  val_ : Int
+}
+
+pub fn m12_sval_pair() -> (Int, Int) {
+  let s : SVal = { val: 3, val_: 8 }
+  (s.val, s.val_)
+}
+
+pub fn m12_chained_val() -> Int {
+  let inner : Ref[Int] = { val: 10 }
+  let outer : Ref[Ref[Int]] = { val: inner }
+  outer.val.val = outer.val.val + 5
+  outer.val.val
+}
+
+pub fn m12_compound_single_eval() -> (Int, Int) {
+  let calls : Ref[Int] = { val: 0 }
+  let target : Ref[Int] = { val: 10 }
+  fn get_ref() -> Ref[Int] {
+    calls.val = calls.val + 1
+    target
+  }
+  get_ref().val += 7
+  (calls.val, target.val)
+}
+
+pub fn m12_nested_rhs_and_color() -> (Int, Bool) {
+  let r : Ref[Int] = { val: 0 }
+  let s : Ref[Int] = { val: 41 }
+  r.val = s.val + 1
+  let cbox : Ref[Color] = { val: Red }
+  cbox.val = Blue
+  let is_blue = match cbox.val {
+    Blue => true
+    Red => false
+  }
+  (r.val, is_blue)
+}
+
+// A.2: escaping recursive local `fn` with shared mutable capture (`14, 16`),
+//      sibling block shadowing, mutual recursion, closure optional types, `if x is Some(v)`
+pub fn m12_escaping_rec() -> (Int, Int) {
+  let mut acc : Int = 10
+  fn step(n : Int) -> Int {
+    if n <= 0 {
+      acc
+    } else {
+      acc = acc + n
+      step(n - 1)
+    }
+  }
+  let cb = fn(k : Int) -> Int { step(k) }
+  let r1 = cb(2) + 1
+  let r2 = cb(2)
+  (r1, r2)
+}
+
+pub fn m12_sibling_shadow_and_mutual() -> (Int, Bool, Bool) {
+  let a = {
+    fn f(n : Int) -> Int { if n <= 0 { 0 } else { 1 + f(n - 1) } }
+    f(3)
+  }
+  let b = {
+    fn f(n : Int) -> Int { if n <= 0 { 0 } else { 2 + f(n - 1) } }
+    f(3)
+  }
+  fn is_even(n : Int) -> Bool {
+    if n == 0 { true } else if n == 1 { false } else { is_even(n - 2) }
+  }
+  fn is_odd(n : Int) -> Bool {
+    if n == 0 { false } else { is_even(n - 1) }
+  }
+  (a * 10 + b, is_even(6), is_odd(5))
+}
+
+pub fn m12_closure_opt_and_is(cb : (() -> Unit)?, f : () -> Int64?) -> Int {
+  let mut res = 0
+  if cb is Some(g) {
+    g()
+    res = res + 10
+  }
+  if f() is Some(v) {
+    res = res + v.to_int()
+  }
+  res
+}
+
+// A.5: same-file `enum Local { Some(Int); None }` + `let x = Some(17)` + `take_opt(Some(17))` -> (false, true)
+//      plus dual-enum leading-dot positive control -> (11, 21)
+enum Local {
+  Some(Int)
+  None
+}
+
+enum E1 {
+  Tag(Int)
+}
+
+enum E2 {
+  Tag(Int)
+}
+
+fn take_opt(o : Int?) -> Bool {
+  match o {
+    Some(_) => true
+    None => false
+  }
+}
+
+fn take_e1(e : E1) -> Int {
+  match e {
+    E1::Tag(v) => v + 10
+  }
+}
+
+fn take_e2(e : E2) -> Int {
+  match e {
+    E2::Tag(v) => v + 20
+  }
+}
+
+pub fn m12_per_site_enum_demo() -> (Bool, Bool, Int, Int) {
+  let x = Some(17)
+  let a = match x {
+    Local::Some(v) => v == 0
+    Local::None => false
+  }
+  let b = take_opt(Some(17))
+  let c1 = take_e1(Tag(1))
+  let c2 = take_e2(Tag(1))
+  (a, b, c1, c2)
+}
+
+// A.6: single-param arrow closure, placeholder pipe (`5 |> take(2, _) == 25`, eval order `213` / `123`),
+//      custom `7 |> ignore == 7`, live OrderedMap cursor mutation (`13`) + break/continue/return,
+//      String cursor break/continue/return, and new `mbt_compat` helpers
+fn ignore(x : Int) -> Int {
+  x
+}
+
+fn take2(a : Int, b : Int) -> Int {
+  a * 10 + b
+}
+
+fn combine3(a : Int, b : Int, c : Int) -> Int {
+  a * 100 + b * 10 + c
+}
+
+pub fn m12_pipe_and_arrow_demo() -> (Int, Int, Int, Int) {
+  let inc : (Int) -> Int = x => x + 1
+  let p1 = inc(4) |> take2(2, _)
+  let p2 = 7 |> ignore
+  let trace : Ref[Int] = { val: 0 }
+  fn step(n : Int) -> Int {
+    trace.val = trace.val * 10 + n
+    n
+  }
+  let p3 = step(1) |> combine3(step(2), _, step(3))
+  (p1, p2, p3, trace.val)
+}
+
+pub fn m12_live_map_update() -> Int {
+  let m : Map[String, Int] = { "a": 1, "b": 2 }
+  let mut acc = 0
+  for k, v in m {
+    if k == "a" {
+      m.set("b", 3)
+    }
+    acc = acc * 10 + v
+  }
+  acc
+}
+
+pub fn m12_map_and_str_control_flow() -> (Int, Int) {
+  let m : Map[String, Int] = { "a": 1, "b": 2, "c": 3, "d": 4 }
+  let mut msum = 0
+  for k, v in m {
+    if k == "b" {
+      continue
+    }
+    if k == "d" {
+      break
+    }
+    msum = msum + v
+  }
+  let mut scount = 0
+  for ch in "A中😀B" {
+    if ch == '中' {
+      continue
+    }
+    if ch == 'B' {
+      return (msum, scount)
+    }
+    scount = scount + 1
+  }
+  (msum, scount)
+}
+
+pub fn m12_compat_helpers_demo() -> (Int, String, Int, Bool, Bool, String) {
+  let rf = match "a/b/c".rev_find("/") {
+    Some(i) => i
+    None => -1
+  }
+  let lo = "Hello WORLD".to_lower()
+  let idx = match [10, 20, 30].search(20) {
+    Some(i) => i
+    None => -1
+  }
+  let has = [10, 20, 30].contains(30)
+  let dig = '7'.is_ascii_digit() && 'Z'.to_ascii_lowercase() == 'z'
+  let built = String::from_array(['A', (0x1F600).unsafe_to_char(), 'B'])
+  (rf, lo, idx, has, dig, built)
+}
+'''
+
 MOON_DRIVER_MBT = r'''
 fn trace(k : String, v : String) -> Unit {
   println("T \{k}=\{v}")
@@ -917,6 +1157,52 @@ fn main {
     check("r8.box_const_idx", a == 65)
     check("r8.box_lit_idx", b == 65)
     check("r8.holder_wrap", c == 99)
+  } else if kase == "m12_val_probes" {
+    let (s1, s2) = @m12.m12_sval_pair()
+    let ch = @m12.m12_chained_val()
+    let (calls, tv) = @m12.m12_compound_single_eval()
+    let (nr, is_blue) = @m12.m12_nested_rhs_and_color()
+    trace("r", "\{s1},\{s2},\{ch},\{calls},\{tv},\{nr},\{is_blue}")
+    check("m12.sval_3", s1 == 3)
+    check("m12.sval_8", s2 == 8)
+    check("m12.chained_val", ch == 15)
+    check("m12.compound_calls_1", calls == 1)
+    check("m12.compound_val_17", tv == 17)
+    check("m12.nested_and_blue", nr == 42 && is_blue)
+  } else if kase == "m12_recursive_local_fn" {
+    let (r1, r2) = @m12.m12_escaping_rec()
+    let (sh, ev, od) = @m12.m12_sibling_shadow_and_mutual()
+    let mut ping = 0
+    let co = @m12.m12_closure_opt_and_is(Some(fn() { ping = ping + 1 }), fn() { Some(7L) })
+    trace("r", "\{r1},\{r2},\{sh},\{ev},\{od},\{co},\{ping}")
+    check("m12.esc_14", r1 == 14)
+    check("m12.esc_16", r2 == 16)
+    check("m12.sibling_shadow", sh == 36)
+    check("m12.mutual_rec", ev && od)
+    check("m12.closure_opt_is", co == 17 && ping == 1)
+  } else if kase == "m12_per_site_enum" {
+    let (a, b, c1, c2) = @m12.m12_per_site_enum_demo()
+    trace("r", "\{a},\{b},\{c1},\{c2}")
+    check("m12.local_some_false", !a)
+    check("m12.opt_some_true", b)
+    check("m12.dual_e1_11", c1 == 11)
+    check("m12.dual_e2_21", c2 == 21)
+  } else if kase == "m12_pipe_loops_compat" {
+    let (p1, p2, p3, tr) = @m12.m12_pipe_and_arrow_demo()
+    let lm = @m12.m12_live_map_update()
+    let (ms, sc) = @m12.m12_map_and_str_control_flow()
+    let (rf, lo, idx, has, dig, built) = @m12.m12_compat_helpers_demo()
+    trace("r", "\{p1},\{p2},\{p3},\{tr},\{lm},\{ms},\{sc},\{rf},\{lo},\{idx},\{has},\{dig},\{built}")
+    check("m12.pipe_25", p1 == 25)
+    check("m12.pipe_ignore_7", p2 == 7)
+    check("m12.pipe_order_213", p3 == 213)
+    check("m12.pipe_trace_123", tr == 123)
+    check("m12.live_map_13", lm == 13)
+    check("m12.map_ctrl_4", ms == 4)
+    check("m12.str_ctrl_2", sc == 2)
+    check("m12.rev_find_3", rf == 3)
+    check("m12.arr_search_contains", idx == 1 && has)
+    check("m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B")
   } else {
     abort("unknown case: \{kase}")
   }
@@ -927,6 +1213,7 @@ PION_DRIVER_PION = r'''
 import "mbt_compat" as mbt_compat
 import "shadow" as shadow
 import "nomap" as nomap
+import "m12" as m12
 
 fn trace(w : World, k : String, v : String) -> Unit {
   io_println(w, "T " + k + "=" + v)
@@ -1317,6 +1604,52 @@ pub fn main(w : World) -> Int {
     check(w, "r8.box_const_idx", a == 65)
     check(w, "r8.box_lit_idx", b == 65)
     check(w, "r8.holder_wrap", c == 99)
+  } else if kase == "m12_val_probes" {
+    let (s1, s2) = m12::m12_sval_pair()
+    let ch = m12::m12_chained_val()
+    let (calls, tv) = m12::m12_compound_single_eval()
+    let (nr, is_blue) = m12::m12_nested_rhs_and_color()
+    trace(w, "r", s1.to_string() + "," + s2.to_string() + "," + ch.to_string() + "," + calls.to_string() + "," + tv.to_string() + "," + nr.to_string() + "," + is_blue.to_string())
+    check(w, "m12.sval_3", s1 == 3)
+    check(w, "m12.sval_8", s2 == 8)
+    check(w, "m12.chained_val", ch == 15)
+    check(w, "m12.compound_calls_1", calls == 1)
+    check(w, "m12.compound_val_17", tv == 17)
+    check(w, "m12.nested_and_blue", nr == 42 && is_blue)
+  } else if kase == "m12_recursive_local_fn" {
+    let (r1, r2) = m12::m12_escaping_rec()
+    let (sh, ev, od) = m12::m12_sibling_shadow_and_mutual()
+    let mut ping = 0
+    let co = m12::m12_closure_opt_and_is(Some(fn() { ping = ping + 1 }), fn() { Some(7L) })
+    trace(w, "r", r1.to_string() + "," + r2.to_string() + "," + sh.to_string() + "," + ev.to_string() + "," + od.to_string() + "," + co.to_string() + "," + ping.to_string())
+    check(w, "m12.esc_14", r1 == 14)
+    check(w, "m12.esc_16", r2 == 16)
+    check(w, "m12.sibling_shadow", sh == 36)
+    check(w, "m12.mutual_rec", ev && od)
+    check(w, "m12.closure_opt_is", co == 17 && ping == 1)
+  } else if kase == "m12_per_site_enum" {
+    let (a, b, c1, c2) = m12::m12_per_site_enum_demo()
+    trace(w, "r", a.to_string() + "," + b.to_string() + "," + c1.to_string() + "," + c2.to_string())
+    check(w, "m12.local_some_false", !a)
+    check(w, "m12.opt_some_true", b)
+    check(w, "m12.dual_e1_11", c1 == 11)
+    check(w, "m12.dual_e2_21", c2 == 21)
+  } else if kase == "m12_pipe_loops_compat" {
+    let (p1, p2, p3, tr) = m12::m12_pipe_and_arrow_demo()
+    let lm = m12::m12_live_map_update()
+    let (ms, sc) = m12::m12_map_and_str_control_flow()
+    let (rf, lo, idx, has, dig, built) = m12::m12_compat_helpers_demo()
+    trace(w, "r", p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + tr.to_string() + "," + lm.to_string() + "," + ms.to_string() + "," + sc.to_string() + "," + rf.to_string() + "," + lo + "," + idx.to_string() + "," + has.to_string() + "," + dig.to_string() + "," + built)
+    check(w, "m12.pipe_25", p1 == 25)
+    check(w, "m12.pipe_ignore_7", p2 == 7)
+    check(w, "m12.pipe_order_213", p3 == 213)
+    check(w, "m12.pipe_trace_123", tr == 123)
+    check(w, "m12.live_map_13", lm == 13)
+    check(w, "m12.map_ctrl_4", ms == 4)
+    check(w, "m12.str_ctrl_2", sc == 2)
+    check(w, "m12.rev_find_3", rf == 3)
+    check(w, "m12.arr_search_contains", idx == 1 && has)
+    check(w, "m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B")
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -1489,6 +1822,11 @@ def prepare(env):
     nomap_mbt_dir = os.path.join(env.workdir, "nomap_mbt_src")
     write_file(os.path.join(nomap_mbt_dir, "nomap_lib.mbt"), NO_APIMAP_LIB_MBT)
 
+    m12_mbt_dir = os.path.join(env.workdir, "m12_mbt_src")
+    write_file(os.path.join(m12_mbt_dir, "m12_lib.mbt"), M12_LIB_MBT)
+    m12_recipes_path = os.path.join(env.workdir, "m12_recipes.toml")
+    write_file(m12_recipes_path, M12_RECIPES_TOML)
+
     # 2. Build MoonBit packages (`acme`, `ext`, `shadow`, `nomap`, `main`) around the exact same `.mbt` files
     write_file(
         os.path.join(env.moon_dir, "moon.mod"),
@@ -1514,9 +1852,14 @@ def prepare(env):
         os.path.join(nomap_mbt_dir, "nomap_lib.mbt"),
         os.path.join(env.moon_dir, "nomap", "nomap_lib.mbt"),
     )
+    write_file(os.path.join(env.moon_dir, "m12", "moon.pkg"), "\n")
+    shutil.copyfile(
+        os.path.join(m12_mbt_dir, "m12_lib.mbt"),
+        os.path.join(env.moon_dir, "m12", "m12_lib.mbt"),
+    )
     write_file(
         os.path.join(env.moon_dir, "main", "moon.pkg"),
-        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n  "oracle/transpile/nomap",\n}\n\npkgtype(kind: "executable")\n',
+        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n  "oracle/transpile/nomap",\n  "oracle/transpile/m12",\n}\n\npkgtype(kind: "executable")\n',
     )
     shutil.copyfile(
         os.path.join(env.mbt_src_dir, "oracle_lib.mbt"),
@@ -1582,6 +1925,31 @@ def prepare(env):
         '[package]\nname = "nomap"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\next = { path = "%s" }\n' % (COMPAT_DIR, pion_ext_dir),
     )
 
+    # Transpile `m12_lib.mbt` (Wave M1.2 Track A A.1-A.6 differential oracle)
+    pion_m12_dir = os.path.join(env.workdir, "pion_m12")
+    pion_m12_src = os.path.join(pion_m12_dir, "src")
+    os.makedirs(pion_m12_src, exist_ok=True)
+    rc, out, err, to, secs = run_cmd([
+        env.mbt2pion_bin,
+        "--src", m12_mbt_dir,
+        "--out", pion_m12_src,
+        "--target", "native",
+        "--mode", "publish",
+        "--recipes", m12_recipes_path,
+        "--mbt-compat", COMPAT_DIR,
+        "--pionc", env.pionc,
+        "--mbt2pion-commit", "oracle-test",
+        "--toolchain-lock", "oracle-lock",
+        "--source-commit", "oracle-src",
+    ])
+    if rc != 0:
+        print("SETUP FAILED: mbt2pion --mode publish m12_lib.mbt (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
+        return False
+    write_file(
+        os.path.join(pion_m12_dir, "pion.toml"),
+        '[package]\nname = "m12"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\n' % (COMPAT_DIR,),
+    )
+
     pion_src = os.path.join(env.pion_dir, "src")
     os.makedirs(pion_src, exist_ok=True)
     rc, out, err, to, secs = run_cmd([
@@ -1608,7 +1976,7 @@ def prepare(env):
     # 5. Wire generated `.pion` files with real `tools/mbt_compat` + `acme` + `shadow` + `nomap` + thin driver
     write_file(
         os.path.join(env.pion_dir, "pion.toml"),
-        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\nnomap = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir, pion_nomap_dir),
+        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\nnomap = { path = "%s" }\nm12 = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir, pion_nomap_dir, pion_m12_dir),
     )
     write_file(os.path.join(pion_src, "main.pion"), PION_DRIVER_PION)
 

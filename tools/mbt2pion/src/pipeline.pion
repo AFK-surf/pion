@@ -706,17 +706,59 @@ pub fn transpile_package(
   run_probes : Bool,
   check_fn : (Array[(String, String)]) -> String,
 ) -> TranspileResult {
+  transpile_package_ex(sources, api_map, recipes, overlays, mbti_files, [], [], opts, pre_diags, run_probes, check_fn)
+}
+
+pub fn transpile_package_ex(
+  sources : Array[SourceFile],
+  api_map : ApiMap,
+  recipes : Recipes,
+  overlays : Array[OverlaySpec],
+  mbti_files : Array[(String, String)],
+  dep_doc_jsons : Array[String],
+  asset_bypass_rules : Array[AssetBypassRule],
+  opts : TranspileOptions,
+  pre_diags : Array[Diag],
+  run_probes : Bool,
+  check_fn : (Array[(String, String)]) -> String,
+) -> TranspileResult {
   let sorted_sources = sort_source_files(sources)
   let symtab = empty_symbol_table()
   symtab_load_api_map(symtab, api_map)
   for pair in mbti_files {
     symtab_load_mbti(symtab, pair.0, pair.1)
   }
+  for doc_json in dep_doc_jsons {
+    symtab_load_pionc_doc_json(symtab, doc_json)
+  }
 
   let ctx = stage_a_context_new(symtab, recipes, opts)
   for d in pre_diags {
     ctx.diags.push(d)
   }
+
+  // Build validated asset-bypass table (combining `recipes.asset_bypass` and CLI `--asset-manifest`).
+  // Strict disjoint partition order: 1) `excluded_manifest_assets` -> 2) `excluded_by_target` -> 3) `emitted`.
+  let all_asset_rules : Array[AssetBypassRule] = []
+  for r in recipes.asset_bypass { all_asset_rules.push(r) }
+  for r in asset_bypass_rules { all_asset_rules.push(r) }
+  let asset_rule_by_path : Map[String, AssetBypassRule] = Map()
+  let asset_rule_matched : Map[String, Bool] = Map()
+  for rule in all_asset_rules {
+    if asset_rule_by_path.contains(rule.path) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_ASSET_MANIFEST_ERROR",
+        rule.path,
+        1,
+        1,
+        "duplicate asset-bypass manifest entry for `" + rule.path + "`",
+      ))
+    } else {
+      asset_rule_by_path[rule.path] = rule
+    }
+  }
+  let excluded_manifest_assets : Array[FileAccountingEntry] = []
+  let excluded_by_target : Array[FileAccountingEntry] = []
 
   // Filter test files unless `--with-tests` is enabled, AND apply `moon.pkg` / `moon.pkg.json` target rules (P1-3)
   let pkg_targets = if opts.moon_pkg_content.length() > 0 {
@@ -751,7 +793,8 @@ pub fn transpile_package(
       })
       continue
     }
-    // Check basename and rel_path against moon.pkg targets
+    let sf_sha = content_sha256(sf.content)
+    // Check basename and rel_path
     let mut base = sf.rel_path
     let mut ls = -1
     let mut bi = 0
@@ -764,6 +807,61 @@ pub fn transpile_package(
     if ls >= 0 {
       base = base.slice(ls + 1, base.length())
     }
+    // 1. Disjoint Set 1: `excluded_manifest_assets` (checked FIRST before target rules!)
+    let asset_opt = match asset_rule_by_path.get(sf.rel_path) {
+      Some(r) => Some((sf.rel_path, r))
+      None =>
+      match asset_rule_by_path.get(base) {
+        Some(r) => Some((base, r))
+        None => None
+      }
+    }
+    match asset_opt {
+      Some((matched_key, rule)) => {
+        asset_rule_matched[matched_key] = true
+        if rule.sha256.length() > 0 && rule.sha256 != sf_sha {
+          ctx.diags.push(diag_error(
+            "MBT2PION_ASSET_MANIFEST_ERROR",
+            sf.rel_path,
+            1,
+            1,
+            "stale SHA-256 in asset manifest for `" + sf.rel_path + "`: manifest=" + rule.sha256 + " actual=" + sf_sha,
+          ))
+        }
+        if rule.allowed_decls.length() > 0 {
+          let allowed_set : Map[String, Bool] = Map()
+          for ad in rule.allowed_decls { allowed_set[ad] = true }
+          let defs = collect_file_defined_symbols(sf.content)
+          for def_sym in defs {
+            if !allowed_set.contains(def_sym) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_ASSET_UNEXPECTED_DECL",
+                sf.rel_path,
+                1,
+                1,
+                "unexpected declaration `" + def_sym + "` inside asset-bypassed file `" + sf.rel_path + "`",
+              ))
+            }
+          }
+        }
+        excluded_manifest_assets.push(FileAccountingEntry::{
+          path: sf.rel_path,
+          sha256: sf_sha,
+          reason: rule.reason,
+        })
+        ctx.dispositions.push(DispositionEntry::{
+          file: sf.rel_path,
+          decl: "<file>",
+          line: 1,
+          col: 1,
+          disposition: "excluded_manifest_asset",
+          detail: rule.reason,
+        })
+        continue
+      }
+      None => ()
+    }
+    // 2. Disjoint Set 2: `excluded_by_target` (checked SECOND!)
     let rules_opt = match pkg_targets.get(sf.rel_path) {
       Some(r) => Some(r)
       None => pkg_targets.get(base)
@@ -773,6 +871,11 @@ pub fn transpile_package(
       match eval_target_rule_ast(opts.target, rule_ast) {
         Some(true) => ()
         Some(false) => {
+          excluded_by_target.push(FileAccountingEntry::{
+            path: sf.rel_path,
+            sha256: sf_sha,
+            reason: "excluded by moon.pkg targets for target=" + opts.target,
+          })
           ctx.dispositions.push(DispositionEntry::{
             file: sf.rel_path,
             decl: "<file>",
@@ -806,6 +909,18 @@ pub fn transpile_package(
       None => ()
     }
     selected.push(sf)
+  }
+  // Conservation check: every manifest asset entry MUST match an actual source file (catches file swaps!)
+  for rule in all_asset_rules {
+    if !asset_rule_matched.contains(rule.path) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_ASSET_MANIFEST_ERROR",
+        rule.path,
+        1,
+        1,
+        "asset manifest entry `" + rule.path + "` did not match any source file in --src",
+      ))
+    }
   }
 
   // Stage A.0: prescan intra-package symbols
@@ -846,11 +961,22 @@ pub fn transpile_package(
   let mut probes_instrumented = 0
   let mut probes_resolved = 0
   let mut pre_b_iters = 0
+  let probe_dispositions : Array[ProbeDisposition] = []
   if run_probes {
     let (pre_files, pre_it, _) = run_stage_b(gen_files, api_map, check_fn, ctx.diags, ctx.drift_ledger)
     gen_files = pre_files
     pre_b_iters = pre_it
-    let (a5_files, pr, pi, pres) = run_stage_a5_with_api_map(gen_files, recipes, api_map, check_fn, ctx.diags, ctx.drift_ledger)
+    let (a5_files, pr, pi, pres) = run_stage_a5_ex(
+      gen_files,
+      recipes,
+      api_map,
+      ctx.struct_val_fields,
+      check_fn,
+      ctx.diags,
+      ctx.drift_ledger,
+      probe_dispositions,
+      64,
+    )
     gen_files = a5_files
     probe_rounds = pr
     probes_instrumented = pi
@@ -882,12 +1008,32 @@ pub fn transpile_package(
     }
   }
 
+  let emitted_sources : Array[FileAccountingEntry] = []
+  for sf in selected {
+    emitted_sources.push(FileAccountingEntry::{
+      path: sf.rel_path,
+      sha256: content_sha256(sf.content),
+      reason: "emitted",
+    })
+  }
+  let synthesized_files : Array[String] = []
+  for gf in final_files {
+    if gf.source_file == "<package-init-order>" {
+      synthesized_files.push(gf.rel_path)
+    }
+  }
+
   TranspileResult::{
     files: final_files,
     span_map: ctx.span_map,
     diagnostics: ctx.diags,
     drift_ledger: ctx.drift_ledger,
     dispositions: ctx.dispositions,
+    probe_dispositions: probe_dispositions,
+    excluded_manifest_assets: excluded_manifest_assets,
+    excluded_by_target: excluded_by_target,
+    emitted_sources: emitted_sources,
+    synthesized_files: synthesized_files,
     pionc_diag_histogram: diag_hist,
     probe_rounds: probe_rounds,
     probes_instrumented: probes_instrumented,

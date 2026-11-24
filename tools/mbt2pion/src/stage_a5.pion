@@ -20,6 +20,7 @@
 import "json" as json
 
 pub struct ProbeSite {
+  probe_id : String
   file : String
   probe_kind : String
   start_byte : Int
@@ -29,6 +30,7 @@ pub struct ProbeSite {
   col : Int
   lhs_expr : String
   rhs_expr : String
+  assign_op : String
   slice_hi : String
   divisor_is_zero : Bool
   rhs_has_lit : Bool
@@ -779,7 +781,21 @@ fn instrument_probes_for_file_with_safe(
   let sites : Array[ProbeSite] = []
   let edits : Array[(Int, Int, String)] = []
   let mut covered_end = 0
-  let slice_only_pass = str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow")
+  let mut slice_only_pass = false
+  if str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow") {
+    let mut si = 0
+    while si + 3 < n {
+      if tokens[si].kind == TokenKind::Ident && tokens[si].raw == "mbt_compat" &&
+      tokens[si + 1].kind == TokenKind::ColonColon &&
+      (tokens[si + 2].raw == "__mbt_slice_owned" || tokens[si + 2].raw == "__mbt_slice_borrow") &&
+      tokens[si + 3].kind == TokenKind::LParen &&
+      !safe_offsets.contains(base_offset + tokens[si + 2].start_byte) {
+        slice_only_pass = true
+        break
+      }
+      si = si + 1
+    }
+  }
   let mut i = 0
 
   while i < n {
@@ -824,7 +840,7 @@ fn instrument_probes_for_file_with_safe(
           }
           ai = ae + 1
         }
-        if s_args.length() == 3 {
+        if s_args.length() == 3 && !safe_offsets.contains(base_offset + tokens[i + 2].start_byte) {
           let pkind = if tokens[i + 2].raw == "__mbt_slice_owned" {
             "mbt_slice_owned_probe"
           } else {
@@ -833,6 +849,7 @@ fn instrument_probes_for_file_with_safe(
           let start_b = t.start_byte
           let end_b = tokens[close_p].end_byte
           sites.push(ProbeSite::{
+            probe_id: "",
             file: file,
             probe_kind: pkind,
             start_byte: start_b,
@@ -842,6 +859,7 @@ fn instrument_probes_for_file_with_safe(
             col: t.col,
             lhs_expr: s_args[0],
             rhs_expr: s_args[1],
+            assign_op: "",
             slice_hi: s_args[2],
             divisor_is_zero: false,
             rhs_has_lit: false,
@@ -891,6 +909,7 @@ fn instrument_probes_for_file_with_safe(
             any_interp_probe = true
             for isite in inner_sites {
               sites.push(ProbeSite::{
+                probe_id: "",
                 file: file,
                 probe_kind: isite.probe_kind,
                 start_byte: expr_start_byte + isite.start_byte,
@@ -900,6 +919,7 @@ fn instrument_probes_for_file_with_safe(
                 col: t.col,
                 lhs_expr: isite.lhs_expr,
                 rhs_expr: isite.rhs_expr,
+                assign_op: isite.assign_op,
                 slice_hi: isite.slice_hi,
                 divisor_is_zero: isite.divisor_is_zero,
                 rhs_has_lit: isite.rhs_has_lit,
@@ -916,6 +936,7 @@ fn instrument_probes_for_file_with_safe(
             et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
               any_interp_probe = true
               sites.push(ProbeSite::{
+                probe_id: "",
                 file: file,
                 probe_kind: "mbt_show_probe",
                 start_byte: expr_start_byte,
@@ -925,6 +946,7 @@ fn instrument_probes_for_file_with_safe(
                 col: t.col,
                 lhs_expr: et,
                 rhs_expr: "__INTERP_SHOW__",
+                assign_op: "",
                 slice_hi: "",
                 divisor_is_zero: false,
                 rhs_has_lit: false,
@@ -963,6 +985,7 @@ fn instrument_probes_for_file_with_safe(
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_len_probe",
           start_byte: start_b,
@@ -972,6 +995,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -998,6 +1022,7 @@ fn instrument_probes_for_file_with_safe(
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_show_probe",
           start_byte: start_b,
@@ -1007,6 +1032,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -1021,15 +1047,86 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    // 3. `<recv>.val` -> `<recv>.mbt_val_probe()`
+    // 3. `<recv>.val` (read), `<recv>.val = <rhs>` (write), `<recv>.val <op>= <rhs>` (compound write)
     if t.kind == TokenKind::Dot && i + 1 < n && tokens[i + 1].raw == "val" {
       let op_b = base_offset + tokens[i + 1].start_byte
       let recv_start = find_receiver_start(tokens, i - 1)
       if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
-        let end_b = tokens[i + 1].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        if i + 2 < n && (tokens[i + 2].kind == TokenKind::Eq || tokens[i + 2].kind == TokenKind::AssignOp) {
+          let rhs_end = find_expr_end(tokens, i + 3, n)
+          if rhs_end > i + 3 {
+            let end_b = tokens[rhs_end - 1].end_byte
+            let rhs_expr = content.slice(tokens[i + 3].start_byte, end_b).trim()
+            let aop = if tokens[i + 2].kind == TokenKind::Eq {
+              "="
+            } else {
+              let rraw = tokens[i + 2].raw
+              if rraw.ends_with("=") && rraw.length() > 1 { rraw.slice(0, rraw.length() - 1) } else { rraw }
+            }
+            sites.push(ProbeSite::{
+              probe_id: "",
+              file: file,
+              probe_kind: "mbt_val_set_probe",
+              start_byte: start_b,
+              end_byte: end_b,
+              op_byte: op_b,
+              line: tokens[i + 1].line,
+              col: tokens[i + 1].col,
+              lhs_expr: recv_expr,
+              rhs_expr: rhs_expr,
+              assign_op: aop,
+              slice_hi: "",
+              divisor_is_zero: false,
+              rhs_has_lit: false,
+              rhs_is_neg: false,
+              rhs_u64: 0UL,
+              rhs_overflow: false,
+            })
+            let probed_rhs = if str_has(rhs_expr, ".val") {
+              let rtoks = lex_moonbit(rhs_expr)
+              let rn = rtoks.length() - 1
+              let redits : Array[(Int, Int, String)] = []
+              let mut ri = 0
+              while ri + 1 < rn {
+                if rtoks[ri].kind == TokenKind::Dot && rtoks[ri + 1].raw == "val" {
+                  redits.push((rtoks[ri].start_byte, rtoks[ri + 1].end_byte, ".mbt_val_probe()"))
+                  ri = ri + 2
+                } else {
+                  ri = ri + 1
+                }
+              }
+              apply_byte_edits(rhs_expr, redits)
+            } else {
+              rhs_expr
+            }
+            let probed_lhs = if str_has(recv_expr, ".val") {
+              let ltoks = lex_moonbit(recv_expr)
+              let ln = ltoks.length() - 1
+              let ledits : Array[(Int, Int, String)] = []
+              let mut li = 0
+              while li + 1 < ln {
+                if ltoks[li].kind == TokenKind::Dot && ltoks[li + 1].raw == "val" {
+                  ledits.push((ltoks[li].start_byte, ltoks[li + 1].end_byte, ".mbt_val_probe()"))
+                  li = li + 2
+                } else {
+                  li = li + 1
+                }
+              }
+              apply_byte_edits(recv_expr, ledits)
+            } else {
+              recv_expr
+            }
+            edits.push((start_b, end_b, probed_lhs + ".mbt_val_set_probe(" + probed_rhs + ")"))
+            covered_end = end_b
+            i = rhs_end
+            continue
+          }
+        }
+        let end_b = tokens[i + 1].end_byte
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_val_probe",
           start_byte: start_b,
@@ -1039,6 +1136,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -1071,6 +1169,7 @@ fn instrument_probes_for_file_with_safe(
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         let idx_expr = content.slice(tokens[i + 1].start_byte, tokens[close_br - 1].end_byte).trim()
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_idx_probe",
           start_byte: start_b,
@@ -1080,6 +1179,7 @@ fn instrument_probes_for_file_with_safe(
           col: t.col,
           lhs_expr: recv_expr,
           rhs_expr: idx_expr,
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -1137,6 +1237,7 @@ fn instrument_probes_for_file_with_safe(
           }
         }
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: pkind,
           start_byte: start_b,
@@ -1146,6 +1247,7 @@ fn instrument_probes_for_file_with_safe(
           col: t.col,
           lhs_expr: lhs_expr,
           rhs_expr: rhs_expr,
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: is_zero,
           rhs_has_lit: has_int_lit,
@@ -1167,12 +1269,58 @@ fn instrument_probes_for_file_with_safe(
   (instrumented, sites)
 }
 
+///| Check whether `resolved_type` strictly matches `[ref].type_name` (never bare `Ref` from another package).
+fn is_recipe_ref_type(resolved_type : String, recipes : Recipes) -> Bool {
+  if recipes.ref_recipe.enabled && recipes.ref_recipe.type_name.length() > 0 {
+    let tn = recipes.ref_recipe.type_name
+    return resolved_type == tn || resolved_type.starts_with(tn + "[")
+  }
+  resolved_type == "Ref" || resolved_type.starts_with("Ref[")
+}
+
+///| Strip trailing generic arguments `[...]` from a resolved type name.
+fn strip_type_args(ty : String) -> String {
+  let br = ty.index_of("[")
+  if br > 0 { ty.slice(0, br).trim() } else { ty.trim() }
+}
+
+///| Check whether an expression is a pure simple identifier (safe to repeat without side effects).
+fn is_simple_ident_expr(expr : String) -> Bool {
+  let s = expr.trim()
+  if s.length() == 0 {
+    return false
+  }
+  let c0 = s.code_unit_at(0)
+  if !is_alpha(c0) {
+    return false
+  }
+  let mut i = 1
+  while i < s.length() {
+    if !is_alnum(s.code_unit_at(i)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
 ///| Compute the rewritten expression for a single `(ProbeSite, resolved_type)` pair.
 ///| Returns `Some(replacement)` if a rewrite is needed, or `None` if original code stays untouched.
 pub fn rewrite_for_probe(
   site : ProbeSite,
   resolved_type : String,
   recipes : Recipes,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Option[String] {
+  rewrite_for_probe_with_fields(site, resolved_type, recipes, Map(), diags, drift_ledger)
+}
+
+pub fn rewrite_for_probe_with_fields(
+  site : ProbeSite,
+  resolved_type : String,
+  recipes : Recipes,
+  struct_val_fields : Map[String, String],
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> Option[String] {
@@ -1288,18 +1436,36 @@ pub fn rewrite_for_probe(
     return None
   }
 
-  if site.probe_kind == "mbt_val_probe" {
-    let is_ref = resolved_type.starts_with("Ref[") ||
-    (recipes.ref_recipe.enabled && recipes.ref_recipe.type_name.length() > 0 && resolved_type.starts_with(recipes.ref_recipe.type_name))
-    if is_ref {
-      let field = if recipes.ref_recipe.enabled && recipes.ref_recipe.field_name.length() > 0 {
+  if site.probe_kind == "mbt_val_probe" || site.probe_kind == "mbt_val_set_probe" {
+    let is_ref = is_recipe_ref_type(resolved_type, recipes)
+    let target_field = if is_ref {
+      if recipes.ref_recipe.enabled && recipes.ref_recipe.field_name.length() > 0 {
         recipes.ref_recipe.field_name
       } else {
         "v"
       }
-      return Some(site.lhs_expr + "." + field)
+    } else {
+      let base_ty = strip_type_args(resolved_type)
+      match struct_val_fields.get(base_ty) {
+        Some(renamed) => renamed
+        None => "val_"
+      }
     }
-    return Some(site.lhs_expr + ".val_")
+    if site.assign_op.length() == 0 {
+      return Some(site.lhs_expr + "." + target_field)
+    }
+    if site.assign_op == "=" {
+      return Some(site.lhs_expr + "." + target_field + " = " + site.rhs_expr)
+    }
+    // Compound assignment (`+=`, `-=`, `*=`, `/=`, etc.): evaluate complex receiver strictly ONCE!
+    if is_simple_ident_expr(site.lhs_expr) {
+      return Some(
+        site.lhs_expr + "." + target_field + " = " + site.lhs_expr + "." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ")",
+      )
+    }
+    return Some(
+      "{ let __mbt_r = " + site.lhs_expr + "; __mbt_r." + target_field + " = __mbt_r." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ") }",
+    )
   }
 
   // Astra Round 3 P0-2: exact per-node slice type classification (zero receiver-name heuristics!)
@@ -1435,6 +1601,7 @@ pub fn has_probe_residual(content : String) -> Bool {
   str_has(content, "mbt_mod_probe") ||
   str_has(content, "mbt_show_probe") ||
   str_has(content, "mbt_val_probe") ||
+  str_has(content, "mbt_val_set_probe") ||
   str_has(content, "mbt_slice_owned_probe") ||
   str_has(content, "mbt_slice_borrow_probe") ||
   str_has(content, "__mbt_slice_owned") ||
@@ -1781,19 +1948,39 @@ pub fn run_stage_a5_full(
   drift_ledger : Array[DriftEntry],
   max_rounds : Int,
 ) -> (Array[GeneratedFile], Int, Int, Int) {
+  let dummy_disps : Array[ProbeDisposition] = []
+  run_stage_a5_ex(files, recipes, api_map, Map(), check_fn, diags, drift_ledger, dummy_disps, max_rounds)
+}
+
+pub fn run_stage_a5_ex(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
   let mut cur_files : Array[GeneratedFile] = []
   let safe_list_by_file : Map[String, Array[Int]] = Map()
   let safe_map_by_file : Map[String, Map[Int, Bool]] = Map()
+  let failed_list_by_file : Map[String, Array[Int]] = Map()
+  let failed_map_by_file : Map[String, Map[Int, Bool]] = Map()
   for f in files {
     cur_files.push(f)
     safe_list_by_file[f.rel_path] = []
     safe_map_by_file[f.rel_path] = Map()
+    failed_list_by_file[f.rel_path] = []
+    failed_map_by_file[f.rel_path] = Map()
   }
   let (declared_values, declared_types) = collect_package_value_and_type_names(cur_files)
   let (qual_values, qual_types) = collect_qualified_api_names(api_map)
   let mut total_rounds = 0
   let mut total_instrumented = 0
   let mut total_resolved = 0
+  let mut global_probe_seq = 0
 
   let mut round = 0
   while round < max_rounds {
@@ -1806,19 +1993,50 @@ pub fn run_stage_a5_full(
         Some(m) => m
         None => Map()
       }
-      let (inst_src, sites) = instrument_probes_for_file_with_safe(
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let skip_map : Map[Int, Bool] = Map()
+      for k in smap.keys() { skip_map[k] = true }
+      for k in fmap.keys() { skip_map[k] = true }
+      let (inst_src, raw_sites) = instrument_probes_for_file_with_safe(
         f.rel_path,
         f.content,
-        smap,
+        skip_map,
         0,
         declared_values,
         declared_types,
         qual_values,
         qual_types,
       )
+      let numbered_sites : Array[ProbeSite] = []
+      for rs in raw_sites {
+        global_probe_seq = global_probe_seq + 1
+        let pid = "p" + (round + 1).to_string() + "_" + global_probe_seq.to_string()
+        numbered_sites.push(ProbeSite::{
+          probe_id: pid,
+          file: rs.file,
+          probe_kind: rs.probe_kind,
+          start_byte: rs.start_byte,
+          end_byte: rs.end_byte,
+          op_byte: rs.op_byte,
+          line: rs.line,
+          col: rs.col,
+          lhs_expr: rs.lhs_expr,
+          rhs_expr: rs.rhs_expr,
+          assign_op: rs.assign_op,
+          slice_hi: rs.slice_hi,
+          divisor_is_zero: rs.divisor_is_zero,
+          rhs_has_lit: rs.rhs_has_lit,
+          rhs_is_neg: rs.rhs_is_neg,
+          rhs_u64: rs.rhs_u64,
+          rhs_overflow: rs.rhs_overflow,
+        })
+      }
       instrumented_batch.push((f.rel_path, inst_src))
-      sites_by_file[f.rel_path] = sites
-      round_probes = round_probes + sites.length()
+      sites_by_file[f.rel_path] = numbered_sites
+      round_probes = round_probes + numbered_sites.length()
     }
 
     if round_probes == 0 {
@@ -1846,20 +2064,9 @@ pub fn run_stage_a5_full(
       }
     }
 
-    // MANDATORY COVERAGE GUARD: probe_diagnostics_received MUST equal probes_instrumented!
-    if raw_results.length() != round_probes {
-      diags.push(diag_error(
-        "MBT2PION_PROBE_MISMATCH",
-        "<stage_a5>",
-        round + 1,
-        1,
-        "Stage A.5 coverage guard failed in round " + (round + 1).to_string() +
-        ": probes_instrumented=" + round_probes.to_string() +
-        " != probe_diagnostics_received=" + raw_results.length().to_string(),
-      ))
-      break
-    }
-
+    // Per-probe-ID disposal (Wave M1.2 A.1):
+    // Dispose EVERY probe whose concrete type is resolved, and report each unresolved probe
+    // individually as `MBT2PION_UNDISPOSED_PROBE_SITE` (still strictly fail-closed for publish!).
     let probe_results = sort_probe_results(raw_results)
     let consumed : Array[Bool] = []
     let mut ci = 0
@@ -1867,9 +2074,7 @@ pub fn run_stage_a5_full(
       consumed.push(false)
       ci = ci + 1
     }
-    total_resolved = total_resolved + probe_results.length()
 
-    // Apply rewrites to each file, consuming each ProbeResult at most once in `(file, line, col)` order!
     let next_files : Array[GeneratedFile] = []
     let mut any_changed = false
     let mut newly_marked_safe = false
@@ -1886,35 +2091,121 @@ pub fn run_stage_a5_full(
         Some(m) => m
         None => Map()
       }
+      let flist = match failed_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
       let edits : Array[(Int, Int, String)] = []
       let remap_edits : Array[(Int, Int, String, String, String)] = []
       for site in sites {
         let mut matched_idx = -1
+        let mut best_col_dist = 1000000
         let mut pi = 0
         while pi < probe_results.length() {
           let pr = probe_results[pi]
           if !consumed[pi] &&
           (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
           pr.line == site.line && pr.probe_kind == site.probe_kind {
-            matched_idx = pi
-            break
+            let dist = if pr.col >= site.col { pr.col - site.col } else { site.col - pr.col }
+            if matched_idx < 0 || dist < best_col_dist {
+              matched_idx = pi
+              best_col_dist = dist
+            }
           }
           pi = pi + 1
         }
         if matched_idx >= 0 {
           consumed[matched_idx] = true
+          total_resolved = total_resolved + 1
           let matched_ty = probe_results[matched_idx].resolved_type
-          match rewrite_for_probe(site, matched_ty, recipes, diags, drift_ledger) {
+          match rewrite_for_probe_with_fields(site, matched_ty, recipes, struct_val_fields, diags, drift_ledger) {
             Some(repl) => {
               edits.push((site.start_byte, site.end_byte, repl))
               remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+              probe_dispositions.push(ProbeDisposition::{
+                probe_id: site.probe_id,
+                probe_kind: site.probe_kind,
+                file: site.file,
+                line: site.line,
+                col: site.col,
+                resolved_type: matched_ty,
+                disposition: "rewritten",
+              })
             }
-            None =>
-            if !smap.contains(site.op_byte) {
-              smap[site.op_byte] = true
-              slist.push(site.op_byte)
-              newly_marked_safe = true
+            None => {
+              if !smap.contains(site.op_byte) {
+                smap[site.op_byte] = true
+                slist.push(site.op_byte)
+                newly_marked_safe = true
+              }
+              probe_dispositions.push(ProbeDisposition::{
+                probe_id: site.probe_id,
+                probe_kind: site.probe_kind,
+                file: site.file,
+                line: site.line,
+                col: site.col,
+                resolved_type: matched_ty,
+                disposition: "kept_safe",
+              })
             }
+          }
+        } else {
+          // Unresolved probe site: report individually and record in failed_map so other sites still converge
+          diags.push(diag_error(
+            "MBT2PION_UNDISPOSED_PROBE_SITE",
+            site.file,
+            site.line,
+            site.col,
+            "unresolved Stage A.5 probe `" + site.probe_id + "` (" + site.probe_kind + ") at " + site.file + ":" + site.line.to_string() + ":" + site.col.to_string(),
+          ))
+          drift_ledger.push(DriftEntry::{
+            category: site.probe_kind,
+            file: site.file,
+            line: site.line,
+            col: site.col,
+            expr: site.lhs_expr,
+            resolution: "blocked",
+            status: "unresolved",
+            detail: "probe " + site.probe_id + " received no type diagnostic from pionc",
+          })
+          probe_dispositions.push(ProbeDisposition::{
+            probe_id: site.probe_id,
+            probe_kind: site.probe_kind,
+            file: site.file,
+            line: site.line,
+            col: site.col,
+            resolved_type: "",
+            disposition: "unresolved",
+          })
+          if !fmap.contains(site.op_byte) {
+            fmap[site.op_byte] = true
+            flist.push(site.op_byte)
+          }
+          // Emit syntax-safe fallback for unresolved `.val` (reserved keyword in Pion) and `__mbt_slice_*`
+          // placeholders so audit passes never cascade into `E_PARSE` or residual placeholders;
+          // `MBT2PION_UNDISPOSED_PROBE_SITE` above still strictly blocks `--mode publish`!
+          if site.probe_kind == "mbt_val_probe" && recipes.ref_recipe.enabled {
+            let rf = if recipes.ref_recipe.field_name.length() > 0 { recipes.ref_recipe.field_name } else { "v" }
+            let repl = site.lhs_expr + "." + rf
+            edits.push((site.start_byte, site.end_byte, repl))
+            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, ""))
+          } else if site.probe_kind == "mbt_val_set_probe" && recipes.ref_recipe.enabled {
+            let rf = if recipes.ref_recipe.field_name.length() > 0 { recipes.ref_recipe.field_name } else { "v" }
+            let repl = if site.assign_op == "=" || site.assign_op.length() == 0 {
+              site.lhs_expr + "." + rf + " = " + site.rhs_expr
+            } else {
+              "{ let __mbt_r = " + site.lhs_expr + "; __mbt_r." + rf + " = __mbt_r." + rf + " " + site.assign_op + " (" + site.rhs_expr + ") }"
+            }
+            edits.push((site.start_byte, site.end_byte, repl))
+            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+          } else if site.probe_kind == "mbt_slice_owned_probe" || site.probe_kind == "mbt_slice_borrow_probe" {
+            let repl = "mbt_compat::array_slice_clamp(" + site.lhs_expr + ", " + site.rhs_expr + ", " + site.slice_hi + ")"
+            edits.push((site.start_byte, site.end_byte, repl))
+            remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
           }
         }
       }
@@ -1922,8 +2213,11 @@ pub fn run_stage_a5_full(
         any_changed = true
         let updated = apply_byte_edits(f.content, edits)
         let (nl, nm) = remap_safe_offsets(f.content, slist, remap_edits)
+        let (nfl, nfm) = remap_safe_offsets(f.content, flist, remap_edits)
         safe_list_by_file[f.rel_path] = nl
         safe_map_by_file[f.rel_path] = nm
+        failed_list_by_file[f.rel_path] = nfl
+        failed_map_by_file[f.rel_path] = nfm
         next_files.push(GeneratedFile::{
           rel_path: f.rel_path,
           content: updated,
@@ -1933,6 +2227,8 @@ pub fn run_stage_a5_full(
       } else {
         safe_list_by_file[f.rel_path] = slist
         safe_map_by_file[f.rel_path] = smap
+        failed_list_by_file[f.rel_path] = flist
+        failed_map_by_file[f.rel_path] = fmap
         next_files.push(f)
       }
     }
@@ -1957,13 +2253,20 @@ pub fn run_stage_a5_full(
       Some(m) => m
       None => Map()
     }
-    audit_undisposed_div_mod(f.rel_path, f.content, smap, 0, 0, diags, drift_ledger)
+    let fmap = match failed_map_by_file.get(f.rel_path) {
+      Some(m) => m
+      None => Map()
+    }
+    let audit_skip : Map[Int, Bool] = Map()
+    for k in smap.keys() { audit_skip[k] = true }
+    for k in fmap.keys() { audit_skip[k] = true }
+    audit_undisposed_div_mod(f.rel_path, f.content, audit_skip, 0, 0, diags, drift_ledger)
     // Astra Round 5 P0-1: independent raw-token audit covering `.length()`, `.to_string()`,
     // `.val`, and `[i]` without sharing `find_receiver_start` / `is_non_expr_receiver`!
     audit_undisposed_raw_tokens(
       f.rel_path,
       f.content,
-      smap,
+      audit_skip,
       0,
       0,
       declared_values,

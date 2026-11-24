@@ -10,6 +10,8 @@
 ///| 5. Emits items in deterministic topological order (tie-breaking by original MoonBit order)
 ///|    into a single `00_init_order.pion`, lowering `fn init` to `let __mbt_init_<file>_<n> : Unit = { ... }`.
 
+import "json" as json
+
 pub struct InitItem {
   id : String
   name : String
@@ -603,4 +605,199 @@ pub fn render_init_order_file(sorted : Array[InitItem]) -> String {
     sb.write_string("\n")
   }
   sb.to_string()
+}
+
+///| Collect top-level symbol names defined in a MoonBit source file for symbol-graph closure analysis.
+fn collect_file_defined_symbols(content : String) -> Array[String] {
+  let toks = lex_moonbit(content)
+  let n = toks.length() - 1
+  let seen : Map[String, Bool] = Map()
+  let out : Array[String] = []
+  let mut i = 0
+  let mut depth = 0
+  while i < n {
+    let t = toks[i]
+    if depth == 0 && t.kind == TokenKind::Keyword {
+      if t.raw == "fn" && i + 1 < n {
+        let mut ni = i + 1
+        if toks[ni].kind == TokenKind::LBracket {
+          ni = init_find_matching(toks, ni, n) + 1
+        }
+        if ni < n && (toks[ni].kind == TokenKind::Ident || toks[ni].kind == TokenKind::UpperIdent) && toks[ni].raw != "init" {
+          let nm = toks[ni].raw
+          if !seen.contains(nm) { seen[nm] = true; out.push(nm) }
+        }
+      } else if (t.raw == "let" || t.raw == "const") && i + 1 < n {
+        let mut ni = i + 1
+        if toks[ni].kind == TokenKind::Keyword && toks[ni].raw == "mut" && ni + 1 < n {
+          ni = ni + 1
+        }
+        if ni < n && (toks[ni].kind == TokenKind::Ident || toks[ni].kind == TokenKind::UpperIdent) {
+          let nm = toks[ni].raw
+          if !seen.contains(nm) { seen[nm] = true; out.push(nm) }
+        }
+      } else if (t.raw == "struct" || t.raw == "type" || t.raw == "typealias" || t.raw == "trait") && i + 1 < n {
+        if toks[i + 1].kind == TokenKind::UpperIdent || toks[i + 1].kind == TokenKind::Ident {
+          let nm = toks[i + 1].raw
+          if !seen.contains(nm) { seen[nm] = true; out.push(nm) }
+        }
+      } else if t.raw == "enum" && i + 1 < n && toks[i + 1].kind == TokenKind::UpperIdent {
+        let ename = toks[i + 1].raw
+        if !seen.contains(ename) { seen[ename] = true; out.push(ename) }
+        let mut lb = i + 2
+        if lb < n && toks[lb].kind == TokenKind::LBracket {
+          lb = init_find_matching(toks, lb, n) + 1
+        }
+        if lb < n && toks[lb].kind == TokenKind::LBrace {
+          let rb = init_find_matching(toks, lb, n)
+          let mut k = lb + 1
+          let mut ed = 0
+          while k < rb {
+            let kk = toks[k].kind
+            if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { ed = ed + 1 }
+            else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { ed = ed - 1 }
+            else if ed == 0 && kk == TokenKind::UpperIdent {
+              let prev_c = k > lb + 1 && (toks[k - 1].kind == TokenKind::Colon || toks[k - 1].kind == TokenKind::ColonColon)
+              if !prev_c && !seen.contains(toks[k].raw) {
+                seen[toks[k].raw] = true
+                out.push(toks[k].raw)
+              }
+            }
+            k = k + 1
+          }
+          i = rb + 1
+          continue
+        }
+      }
+    }
+    if t.kind == TokenKind::LParen || t.kind == TokenKind::LBracket || t.kind == TokenKind::LBrace {
+      depth = depth + 1
+    } else if t.kind == TokenKind::RParen || t.kind == TokenKind::RBracket || t.kind == TokenKind::RBrace {
+      if depth > 0 { depth = depth - 1 }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Compute deterministic per-file symbol-graph dependency closures and render JSON (`--closure-report`, Wave M1.2 A.4).
+pub fn render_closure_report_json(sources : Array[SourceFile]) -> String {
+  let sorted = sort_source_files(sources)
+  let sym_owners : Map[String, Array[String]] = Map()
+  for sf in sorted {
+    let defs = collect_file_defined_symbols(sf.content)
+    for d in defs {
+      match sym_owners.get(d) {
+        Some(xs) => xs.push(sf.rel_path)
+        None => sym_owners[d] = [sf.rel_path]
+      }
+    }
+  }
+  let direct_deps_by_file : Map[String, Array[String]] = Map()
+  let mut total_edges = 0
+  for sf in sorted {
+    let toks = lex_moonbit(sf.content)
+    let n = toks.length() - 1
+    let dep_set : Map[String, Bool] = Map()
+    let mut i = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent {
+        let prev_dot_cc = i > 0 && (toks[i - 1].kind == TokenKind::Dot || toks[i - 1].kind == TokenKind::ColonColon)
+        if !prev_dot_cc {
+          match sym_owners.get(t.raw) {
+            Some(owners) => {
+              for ow in owners {
+                if ow != sf.rel_path {
+                  dep_set[ow] = true
+                }
+              }
+            }
+            None => ()
+          }
+        }
+      }
+      i = i + 1
+    }
+    let deps = sorted_map_keys(dep_set)
+    total_edges = total_edges + deps.length()
+    direct_deps_by_file[sf.rel_path] = deps
+  }
+
+  let file_entries : Array[json::JsonValue] = []
+  let closure_sizes : Array[Int] = []
+  let leaf_files : Array[json::JsonValue] = []
+  for sf in sorted {
+    // BFS transitive closure
+    let visited : Map[String, Bool] = Map()
+    let queue : Array[String] = [sf.rel_path]
+    visited[sf.rel_path] = true
+    let mut qi = 0
+    while qi < queue.length() {
+      let cur = queue[qi]
+      qi = qi + 1
+      match direct_deps_by_file.get(cur) {
+        Some(ds) => {
+          for d in ds {
+            if !visited.contains(d) {
+              visited[d] = true
+              queue.push(d)
+            }
+          }
+        }
+        None => ()
+      }
+    }
+    let closure_list = sorted_map_keys(visited)
+    let csize = closure_list.length()
+    closure_sizes.push(csize)
+    if csize == 1 {
+      leaf_files.push(json_str(sf.rel_path))
+    }
+    let ddeps = match direct_deps_by_file.get(sf.rel_path) {
+      Some(xs) => xs
+      None => []
+    }
+    let d_json : Array[json::JsonValue] = []
+    for d in ddeps { d_json.push(json_str(d)) }
+    let c_json : Array[json::JsonValue] = []
+    for c in closure_list { c_json.push(json_str(c)) }
+    file_entries.push(json_obj([
+      json_field("file", json_str(sf.rel_path)),
+      json_field("direct_dep_count", json_int(ddeps.length())),
+      json_field("closure_size", json_int(csize)),
+      json_field("direct_deps", json_arr(d_json)),
+      json_field("closure", json_arr(c_json)),
+    ]))
+  }
+
+  // Sort closure_sizes ascending for min/median/max
+  let mut si = 1
+  while si < closure_sizes.length() {
+    let key = closure_sizes[si]
+    let mut sj = si - 1
+    while sj >= 0 && closure_sizes[sj] > key {
+      closure_sizes[sj + 1] = closure_sizes[sj]
+      sj = sj - 1
+    }
+    closure_sizes[sj + 1] = key
+    si = si + 1
+  }
+  let n_files = closure_sizes.length()
+  let min_c = if n_files > 0 { closure_sizes[0] } else { 0 }
+  let max_c = if n_files > 0 { closure_sizes[n_files - 1] } else { 0 }
+  let med_c = if n_files > 0 { closure_sizes[n_files / 2] } else { 0 }
+
+  let root = json_obj([
+    json_field("schema_version", json_int(1)),
+    json_field("file_count", json_int(n_files)),
+    json_field("direct_edge_count", json_int(total_edges)),
+    json_field("min_closure_size", json_int(min_c)),
+    json_field("median_closure_size", json_int(med_c)),
+    json_field("max_closure_size", json_int(max_c)),
+    json_field("leaf_file_count", json_int(leaf_files.length())),
+    json_field("leaf_files", json_arr(leaf_files)),
+    json_field("files", json_arr(file_entries)),
+  ])
+  json::stringify(root) + "\n"
 }
