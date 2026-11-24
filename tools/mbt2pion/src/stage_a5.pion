@@ -1,17 +1,21 @@
 ///| Stage A.5: Type-Probe Pass for silent-compile drift sites.
 ///|
-///| Instruments syntactically ambiguous silent-drift sites on a scratch copy:
-///| - `x.length()` -> `x.mbt_len_probe()`
-///| - `x[i]` -> `x.mbt_idx_probe(i)`
-///| - `a / b` (when `b` not statically proven non-zero) -> `a.mbt_div_probe(b)`
-///| - `a % b` (when `b` not statically proven non-zero) -> `a.mbt_mod_probe(b)`
-///| - `x.to_string()` -> `x.mbt_show_probe()`
-///| - `r.val` -> `r.mbt_val_probe()`
+///| Instruments syntactically ambiguous silent-drift sites on a scratch copy
+///| (supporting both simple identifiers and complex/chained receivers like
+///| `self.text.length()`, `f().length()`, `arr[i].length()`, `(a + b) / n`, `self.r.val`):
+///| - `<recv>.length()` -> `<recv>.mbt_len_probe()`
+///| - `<recv>[i]` -> `<recv>.mbt_idx_probe(i)`
+///| - `<lhs> / <rhs>` (when `<rhs>` not statically proven non-zero) -> `<lhs>.mbt_div_probe(<rhs>)`
+///| - `<lhs> % <rhs>` (when `<rhs>` not statically proven non-zero) -> `<lhs>.mbt_mod_probe(<rhs>)`
+///| - `<recv>.to_string()` & `"...\{x}..."` -> `<recv>.mbt_show_probe()`
+///| - `<recv>.val` -> `<recv>.mbt_val_probe()`
 ///|
 ///| Calls `pionc check --json` via callback, enforces strict coverage guard
 ///| (`probe_diagnostics_received == probes_instrumented` every round; mismatch hard-fails),
-///| rewrites each site by `(probe, resolved_type)`, records `semantic_drift_ledger.json`,
-///| iterates for nested probes, and enforces 0 `mbt_*_probe` residuals.
+///| matches same-line multi-probes by `(file, line, col)` / occurrence order consuming each
+///| diagnostic at most once, rewrites each site to canonical `mbt_compat::*` helpers,
+///| records `semantic_drift_ledger.json`, iterates for nested probes, and enforces
+///| 0 `mbt_*_probe` residuals.
 
 import "json" as json
 
@@ -42,7 +46,6 @@ pub fn parse_pionc_diagnostics(json_text : String) -> Array[PioncDiag] {
   if trimmed.length() == 0 {
     return out
   }
-  // Find first `{` in case stderr/warnings preceded JSON
   let start = trimmed.index_of("{")
   let clean = if start >= 0 { trimmed.slice(start, trimmed.length()) } else { trimmed }
   let root = match json::parse(clean) {
@@ -137,6 +140,9 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
 }
 
 ///| Check whether a numeric literal token is statically known to be non-zero.
+///| Only treats `A-F`/`a-f` as digits in hexadecimal (`0x`/`0X`) literals, and stops
+///| before decimal exponent `e`/`E` or float suffix `f`/`F` so `0.0e5`, `0.0f`, `0L`, `0U`
+///| are all recognized as zero!
 pub fn is_statically_nonzero_literal(tok : Token) -> Bool {
   if tok.kind != TokenKind::IntLit && tok.kind != TokenKind::FloatLit {
     return false
@@ -144,12 +150,26 @@ pub fn is_statically_nonzero_literal(tok : Token) -> Bool {
   let s = tok.raw
   let n = s.length()
   let mut i = 0
-  if n >= 2 && s.code_unit_at(0) == 48 && (s.code_unit_at(1) == 120 || s.code_unit_at(1) == 88 || s.code_unit_at(1) == 98 || s.code_unit_at(1) == 66 || s.code_unit_at(1) == 111 || s.code_unit_at(1) == 79) {
-    i = 2
+  let mut is_hex_lit = false
+  if n >= 2 && s.code_unit_at(0) == 48 {
+    let p1 = s.code_unit_at(1)
+    if p1 == 120 || p1 == 88 {
+      is_hex_lit = true
+      i = 2
+    } else if p1 == 98 || p1 == 66 || p1 == 111 || p1 == 79 {
+      i = 2
+    }
   }
   while i < n {
     let c = s.code_unit_at(i)
-    if (c >= 49 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102) {
+    if !is_hex_lit && (c == 101 || c == 69 || c == 102 || c == 70 || c == 76 || c == 108 || c == 85 || c == 117) {
+      // Exponent (`e`/`E`) or suffix (`f`/`L`/`U`): mantissa ended with no non-zero digit
+      return false
+    }
+    if c >= 49 && c <= 57 {
+      return true
+    }
+    if is_hex_lit && ((c >= 65 && c <= 70) || (c >= 97 && c <= 102)) {
       return true
     }
     i = i + 1
@@ -157,25 +177,25 @@ pub fn is_statically_nonzero_literal(tok : Token) -> Bool {
   false
 }
 
-///| Check whether a numeric literal token is statically known to be zero (`0`, `0L`, `0x0`, etc.).
+///| Check whether a numeric literal token is statically known to be zero (`0`, `0L`, `0U`, `0x0`, `0.0e5`).
 pub fn is_statically_zero_literal(tok : Token) -> Bool {
-  if tok.kind != TokenKind::IntLit {
+  if tok.kind != TokenKind::IntLit && tok.kind != TokenKind::FloatLit {
     return false
   }
   !is_statically_nonzero_literal(tok)
 }
 
-///| Supported integer types for checked division/modulo lowering.
+///| Canonical `mbt_compat::*` checked division/modulo helper names aligned 1:1 with `tools/mbt_compat`.
 pub fn checked_div_helper(ty : String, is_mod : Bool) -> Option[String] {
   let op = if is_mod { "mod_checked_" } else { "div_checked_" }
   if ty == "Int" {
-    Some("mbt_compat::" + op + "int")
+    Some("mbt_compat::" + op + "i32")
   } else if ty == "Int64" {
-    Some("mbt_compat::" + op + "int64")
+    Some("mbt_compat::" + op + "i64")
   } else if ty == "UInt" {
-    Some("mbt_compat::" + op + "uint")
+    Some("mbt_compat::" + op + "u32")
   } else if ty == "UInt64" {
-    Some("mbt_compat::" + op + "uint64")
+    Some("mbt_compat::" + op + "u64")
   } else if ty == "Byte" {
     Some("mbt_compat::" + op + "byte")
   } else {
@@ -191,18 +211,120 @@ pub fn is_unsupported_int_type(ty : String) -> Bool {
   ty == "Int16" || ty == "UInt16" || ty == "Int8" || ty == "UInt8" || ty == "Int128" || ty == "UInt128"
 }
 
+///| Walk backwards from `end_idx` (inclusive, the last token of a receiver expression) to find
+///| the starting token index of a postfix/primary receiver chain:
+///| supports `ident`, `a.b.c`, `f(x).y`, `arr[i]`, `(a + b)`, `pkg::fn(x)`.
+///| Returns `-1` if `end_idx` cannot end a probeable receiver expression.
+fn find_receiver_start(tokens : Array[Token], end_idx : Int) -> Int {
+  if end_idx < 0 || end_idx >= tokens.length() {
+    return -1
+  }
+  let mut cur = end_idx
+  while cur >= 0 {
+    let k = tokens[cur].kind
+    if k == TokenKind::RParen || k == TokenKind::RBracket {
+      let close_k = k
+      let open_k = if k == TokenKind::RParen { TokenKind::LParen } else { TokenKind::LBracket }
+      let mut depth = 0
+      let mut j = cur
+      while j >= 0 {
+        if tokens[j].kind == close_k {
+          depth = depth + 1
+        } else if tokens[j].kind == open_k {
+          depth = depth - 1
+          if depth == 0 {
+            break
+          }
+        }
+        j = j - 1
+      }
+      if depth != 0 {
+        return -1
+      }
+      cur = j
+      // If preceded by ident / `)` / `]`, this was a call `f(...)` or index `arr[...]` — continue walking!
+      if cur > 0 {
+        let pk = tokens[cur - 1].kind
+        if pk == TokenKind::Ident || pk == TokenKind::UpperIdent || pk == TokenKind::RParen || pk == TokenKind::RBracket {
+          cur = cur - 1
+          continue
+        }
+      }
+      return cur
+    }
+    if k == TokenKind::Ident || k == TokenKind::UpperIdent || k == TokenKind::IntLit || k == TokenKind::FloatLit {
+      if cur > 0 && (tokens[cur - 1].kind == TokenKind::Dot || tokens[cur - 1].kind == TokenKind::ColonColon) {
+        if cur >= 2 {
+          cur = cur - 2
+          continue
+        }
+      }
+      return cur
+    }
+    return -1
+  }
+  -1
+}
+
+///| Find end token index (inclusive) of a simple/postfix RHS expression for `/` or `%`.
+fn find_rhs_end(tokens : Array[Token], start_idx : Int, limit : Int) -> Int {
+  if start_idx >= limit {
+    return -1
+  }
+  let k = tokens[start_idx].kind
+  if k == TokenKind::LParen {
+    return find_matching_delim(tokens, start_idx)
+  }
+  if k == TokenKind::Ident || k == TokenKind::IntLit || k == TokenKind::FloatLit {
+    let mut cur = start_idx
+    while cur + 1 < limit {
+      let nk = tokens[cur + 1].kind
+      if nk == TokenKind::Dot && cur + 2 < limit && tokens[cur + 2].kind == TokenKind::Ident {
+        cur = cur + 2
+      } else if nk == TokenKind::LParen || nk == TokenKind::LBracket {
+        cur = find_matching_delim(tokens, cur + 1)
+      } else {
+        break
+      }
+    }
+    return cur
+  }
+  -1
+}
+
+///| Check whether a receiver starting at `recv_start` is inside a declaration header or `mbt_compat::` call.
+fn is_non_expr_receiver(tokens : Array[Token], recv_start : Int) -> Bool {
+  if recv_start <= 0 {
+    return false
+  }
+  let pk = tokens[recv_start - 1].kind
+  let pr = tokens[recv_start - 1].raw
+  if pk == TokenKind::Keyword && (pr == "fn" || pr == "struct" || pr == "enum" || pr == "let" || pr == "mut" || pr == "type" || pr == "trait") {
+    return true
+  }
+  if pk == TokenKind::Colon || pk == TokenKind::Arrow {
+    return true
+  }
+  false
+}
+
 ///| Instrument a single Pion file with `mbt_*_probe` calls for one pass.
-///| Returns `(instrumented_source, list_of_probe_sites)`.
-///| Skips sites already rewritten to `mbt_compat::*` or inside comments/strings (lexer-driven!).
+///| Supports chained/complex receivers (`self.text.length()`, `f().length()`, `arr[i].length()`,
+///| `(a + b) / n`, `self.r.val`, `"{d}"`) while skipping already-rewritten `mbt_compat::*` calls.
 pub fn instrument_probes_for_file(file : String, content : String) -> (String, Array[ProbeSite]) {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
   let sites : Array[ProbeSite] = []
-  let sb = StringBuilder()
+  let edits : Array[(Int, Int, String)] = []
+  let mut covered_end = 0
   let mut i = 0
 
   while i < n {
     let t = tokens[i]
+    if t.start_byte < covered_end {
+      i = i + 1
+      continue
+    }
 
     // 0. Interpolated string `"...\{x}..."` where `x` is a simple identifier -> probe `x.mbt_show_probe()`
     if t.kind == TokenKind::InterpString {
@@ -217,7 +339,7 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
         }
       }
       if has_ident_interp {
-        let mut rebuilt = StringBuilder()
+        let rebuilt = StringBuilder()
         rebuilt.write_string("\"")
         for p in parts {
           if !p.is_expr {
@@ -243,146 +365,168 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
           }
         }
         rebuilt.write_string("\"")
-        sb.write_string(t.leading_trivia + rebuilt.to_string())
+        edits.push((t.start_byte, t.end_byte, rebuilt.to_string()))
+        covered_end = t.end_byte
         i = i + 1
         continue
       }
     }
 
-    // Skip `let` / `fn` / `struct` / `enum` declaration headers (only instrument inside expressions)
-    // 1. `<ident>.length()` -> `<ident>.mbt_len_probe()`
-    if t.kind == TokenKind::Ident && i + 4 < n &&
-    tokens[i + 1].kind == TokenKind::Dot &&
-    tokens[i + 2].raw == "length" &&
-    tokens[i + 3].kind == TokenKind::LParen &&
-    tokens[i + 4].kind == TokenKind::RParen {
-      // Avoid double-probing inside `mbt_compat::`
-      let prev_cc = i > 0 && tokens[i - 1].kind == TokenKind::ColonColon
-      if !prev_cc {
-        let start_b = t.start_byte
-        let end_b = tokens[i + 4].end_byte
+    // 1. `<recv>.length()` -> `<recv>.mbt_len_probe()`
+    if t.kind == TokenKind::Dot && i + 3 < n &&
+    tokens[i + 1].raw == "length" &&
+    tokens[i + 2].kind == TokenKind::LParen &&
+    tokens[i + 3].kind == TokenKind::RParen {
+      let recv_start = find_receiver_start(tokens, i - 1)
+      if recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+        let start_b = tokens[recv_start].start_byte
+        let end_b = tokens[i + 3].end_byte
+        let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        if !recv_expr.starts_with("mbt_compat::") {
+          sites.push(ProbeSite::{
+            file: file,
+            probe_kind: "mbt_len_probe",
+            start_byte: start_b,
+            end_byte: end_b,
+            line: tokens[i + 1].line,
+            col: tokens[i + 1].col,
+            lhs_expr: recv_expr,
+            rhs_expr: "",
+            divisor_is_zero: false,
+          })
+          edits.push((start_b, end_b, recv_expr + ".mbt_len_probe()"))
+          covered_end = end_b
+          i = i + 4
+          continue
+        }
+      }
+    }
+
+    // 2. `<recv>.to_string()` -> `<recv>.mbt_show_probe()`
+    if t.kind == TokenKind::Dot && i + 3 < n &&
+    tokens[i + 1].raw == "to_string" &&
+    tokens[i + 2].kind == TokenKind::LParen &&
+    tokens[i + 3].kind == TokenKind::RParen {
+      let recv_start = find_receiver_start(tokens, i - 1)
+      if recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+        let start_b = tokens[recv_start].start_byte
+        let end_b = tokens[i + 3].end_byte
+        let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        if !recv_expr.starts_with("mbt_compat::") {
+          sites.push(ProbeSite::{
+            file: file,
+            probe_kind: "mbt_show_probe",
+            start_byte: start_b,
+            end_byte: end_b,
+            line: tokens[i + 1].line,
+            col: tokens[i + 1].col,
+            lhs_expr: recv_expr,
+            rhs_expr: "",
+            divisor_is_zero: false,
+          })
+          edits.push((start_b, end_b, recv_expr + ".mbt_show_probe()"))
+          covered_end = end_b
+          i = i + 4
+          continue
+        }
+      }
+    }
+
+    // 3. `<recv>.val` -> `<recv>.mbt_val_probe()`
+    if t.kind == TokenKind::Dot && i + 1 < n && tokens[i + 1].raw == "val" {
+      let recv_start = find_receiver_start(tokens, i - 1)
+      if recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+        let start_b = tokens[recv_start].start_byte
+        let end_b = tokens[i + 1].end_byte
+        let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         sites.push(ProbeSite::{
           file: file,
-          probe_kind: "mbt_len_probe",
+          probe_kind: "mbt_val_probe",
           start_byte: start_b,
           end_byte: end_b,
-          line: t.line,
-          col: t.col,
-          lhs_expr: t.raw,
+          line: tokens[i + 1].line,
+          col: tokens[i + 1].col,
+          lhs_expr: recv_expr,
           rhs_expr: "",
           divisor_is_zero: false,
         })
-        sb.write_string(t.leading_trivia + t.raw + ".mbt_len_probe()")
-        i = i + 5
+        edits.push((start_b, end_b, recv_expr + ".mbt_val_probe()"))
+        covered_end = end_b
+        i = i + 2
         continue
       }
     }
 
-    // 2. `<ident>.to_string()` -> `<ident>.mbt_show_probe()`
-    if t.kind == TokenKind::Ident && i + 4 < n &&
-    tokens[i + 1].kind == TokenKind::Dot &&
-    tokens[i + 2].raw == "to_string" &&
-    tokens[i + 3].kind == TokenKind::LParen &&
-    tokens[i + 4].kind == TokenKind::RParen {
-      let start_b = t.start_byte
-      let end_b = tokens[i + 4].end_byte
-      sites.push(ProbeSite::{
-        file: file,
-        probe_kind: "mbt_show_probe",
-        start_byte: start_b,
-        end_byte: end_b,
-        line: t.line,
-        col: t.col,
-        lhs_expr: t.raw,
-        rhs_expr: "",
-        divisor_is_zero: false,
-      })
-      sb.write_string(t.leading_trivia + t.raw + ".mbt_show_probe()")
-      i = i + 5
-      continue
-    }
-
-    // 3. `<ident>.val` -> `<ident>.mbt_val_probe()`
-    if t.kind == TokenKind::Ident && i + 2 < n &&
-    tokens[i + 1].kind == TokenKind::Dot &&
-    tokens[i + 2].raw == "val" {
-      let start_b = t.start_byte
-      let end_b = tokens[i + 2].end_byte
-      sites.push(ProbeSite::{
-        file: file,
-        probe_kind: "mbt_val_probe",
-        start_byte: start_b,
-        end_byte: end_b,
-        line: t.line,
-        col: t.col,
-        lhs_expr: t.raw,
-        rhs_expr: "",
-        divisor_is_zero: false,
-      })
-      sb.write_string(t.leading_trivia + t.raw + ".mbt_val_probe()")
-      i = i + 3
-      continue
-    }
-
-    // 4. `<ident>[<idx>]` (simple index expression, not type params or slice) -> `<ident>.mbt_idx_probe(<idx>)`
-    if t.kind == TokenKind::Ident && i + 3 < n &&
-    tokens[i + 1].kind == TokenKind::LBracket {
-      let close_br = find_matching_delim(tokens, i + 1)
-      let prev_kw = i > 0 && (tokens[i - 1].raw == "fn" || tokens[i - 1].raw == "struct" || tokens[i - 1].raw == "enum")
-      let next_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
-      if !prev_kw && !next_eq && close_br > i + 2 {
-        let idx_expr = content.slice(tokens[i + 2].start_byte, tokens[close_br - 1].end_byte).trim()
+    // 4. `<recv>[<idx>]` -> `<recv>.mbt_idx_probe(<idx>)` (skipping `.length()` chains on index so outer probe runs first or next round)
+    if t.kind == TokenKind::LBracket && i > 0 {
+      let close_br = find_matching_delim(tokens, i)
+      let next_is_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
+      let next_is_dot = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Dot
+      let recv_start = find_receiver_start(tokens, i - 1)
+      if !next_is_eq && !next_is_dot && recv_start >= 0 && close_br > i + 1 &&
+      tokens[recv_start].start_byte >= covered_end &&
+      tokens[i - 1].kind != TokenKind::UpperIdent &&
+      !is_non_expr_receiver(tokens, recv_start) {
+        let start_b = tokens[recv_start].start_byte
+        let end_b = tokens[close_br].end_byte
+        let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        let idx_expr = content.slice(tokens[i + 1].start_byte, tokens[close_br - 1].end_byte).trim()
         sites.push(ProbeSite::{
           file: file,
           probe_kind: "mbt_idx_probe",
-          start_byte: t.start_byte,
-          end_byte: tokens[close_br].end_byte,
+          start_byte: start_b,
+          end_byte: end_b,
           line: t.line,
           col: t.col,
-          lhs_expr: t.raw,
+          lhs_expr: recv_expr,
           rhs_expr: idx_expr,
           divisor_is_zero: false,
         })
-        sb.write_string(t.leading_trivia + t.raw + ".mbt_idx_probe(" + idx_expr + ")")
+        edits.push((start_b, end_b, recv_expr + ".mbt_idx_probe(" + idx_expr + ")"))
+        covered_end = end_b
         i = close_br + 1
         continue
       }
     }
 
     // 5. `<lhs> / <rhs>` or `<lhs> % <rhs>` when `<rhs>` is NOT statically proven non-zero!
-    if (t.kind == TokenKind::Ident || t.kind == TokenKind::IntLit || t.kind == TokenKind::FloatLit) &&
-    i + 2 < n && (tokens[i + 1].kind == TokenKind::Slash || tokens[i + 1].kind == TokenKind::Percent) {
-      let op_tok = tokens[i + 1]
-      let rhs_tok = tokens[i + 2]
-      let is_mod = op_tok.kind == TokenKind::Percent
-      if !is_statically_nonzero_literal(rhs_tok) &&
-      (rhs_tok.kind == TokenKind::Ident || rhs_tok.kind == TokenKind::IntLit) {
-        let pkind = if is_mod { "mbt_mod_probe" } else { "mbt_div_probe" }
-        let is_zero = is_statically_zero_literal(rhs_tok)
-        sites.push(ProbeSite::{
-          file: file,
-          probe_kind: pkind,
-          start_byte: t.start_byte,
-          end_byte: rhs_tok.end_byte,
-          line: op_tok.line,
-          col: op_tok.col,
-          lhs_expr: t.raw,
-          rhs_expr: rhs_tok.raw,
-          divisor_is_zero: is_zero,
-        })
-        sb.write_string(t.leading_trivia + t.raw + "." + pkind + "(" + rhs_tok.raw + ")")
-        i = i + 3
-        continue
+    if (t.kind == TokenKind::Slash || t.kind == TokenKind::Percent) && i > 0 && i + 1 < n {
+      let lhs_start = find_receiver_start(tokens, i - 1)
+      let rhs_end = find_rhs_end(tokens, i + 1, n)
+      if lhs_start >= 0 && rhs_end >= i + 1 && tokens[lhs_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, lhs_start) {
+        let rhs_is_single_lit = rhs_end == i + 1 && (tokens[i + 1].kind == TokenKind::IntLit || tokens[i + 1].kind == TokenKind::FloatLit)
+        if !(rhs_is_single_lit && is_statically_nonzero_literal(tokens[i + 1])) {
+          let is_mod = t.kind == TokenKind::Percent
+          let pkind = if is_mod { "mbt_mod_probe" } else { "mbt_div_probe" }
+          let is_zero = rhs_is_single_lit && is_statically_zero_literal(tokens[i + 1])
+          let start_b = tokens[lhs_start].start_byte
+          let end_b = tokens[rhs_end].end_byte
+          let lhs_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+          let rhs_expr = content.slice(tokens[i + 1].start_byte, end_b).trim()
+          sites.push(ProbeSite::{
+            file: file,
+            probe_kind: pkind,
+            start_byte: start_b,
+            end_byte: end_b,
+            line: t.line,
+            col: t.col,
+            lhs_expr: lhs_expr,
+            rhs_expr: rhs_expr,
+            divisor_is_zero: is_zero,
+          })
+          edits.push((start_b, end_b, lhs_expr + "." + pkind + "(" + rhs_expr + ")"))
+          covered_end = end_b
+          i = rhs_end + 1
+          continue
+        }
       }
     }
 
-    sb.write_string(t.leading_trivia + t.raw)
     i = i + 1
   }
-  if tokens.length() > 0 {
-    sb.write_string(tokens[tokens.length() - 1].leading_trivia)
-  }
-  (sb.to_string(), sites)
+
+  let instrumented = apply_byte_edits(content, edits)
+  (instrumented, sites)
 }
 
 ///| Compute the rewritten expression for a single `(ProbeSite, resolved_type)` pair.
@@ -456,18 +600,18 @@ pub fn rewrite_for_probe(
     match checked_div_helper(resolved_type, is_mod) {
       Some(helper) => {
         if site.divisor_is_zero {
-          // Statically known 0: preserve lhs evaluation order then trap explicitly!
+          let trap_call = if is_mod { "mbt_compat::trap_rem_zero()" } else { "mbt_compat::trap_div_zero()" }
           drift_ledger.push(DriftEntry::{
             category: "int_div_zero",
             file: site.file,
             line: site.line,
             col: site.col,
             expr: site.lhs_expr + (if is_mod { " % 0" } else { " / 0" }),
-            resolution: "explicit_trap_preserving_eval_order",
+            resolution: trap_call,
             status: "resolved",
             detail: "statically known zero divisor on " + resolved_type + " lowered to explicit trap",
           })
-          return Some("{ let _ = " + site.lhs_expr + "; panic(\"integer division by zero\") }")
+          return Some("{ let _ = " + site.lhs_expr + "; " + trap_call + " }")
         }
         drift_ledger.push(DriftEntry::{
           category: "int_div_zero",
@@ -516,14 +660,13 @@ pub fn rewrite_for_probe(
       }
       return Some(site.lhs_expr + "." + field)
     }
-    // Non-Ref struct field named `val` -> renamed field `val_`!
     return Some(site.lhs_expr + ".val_")
   }
 
   None
 }
 
-///| Apply non-overlapping byte-range edits `(start, end, replacement)` to a string (sorted descending).
+///| Apply non-overlapping byte-range edits `(start, end, replacement)` to a string.
 pub fn apply_byte_edits(src : String, edits : Array[(Int, Int, String)]) -> String {
   if edits.length() == 0 {
     return src
@@ -532,7 +675,6 @@ pub fn apply_byte_edits(src : String, edits : Array[(Int, Int, String)]) -> Stri
   for e in edits {
     sorted.push(e)
   }
-  // Sort ascending by start_byte
   let mut i = 1
   while i < sorted.length() {
     let key = sorted[i]
@@ -569,9 +711,43 @@ pub fn has_probe_residual(content : String) -> Bool {
   str_has(content, "mbt_val_probe")
 }
 
+///| Sort `ProbeResult`s deterministically by `(file, line, col)` so same-line multi-probes
+///| align 1:1 in left-to-right occurrence order with `ProbeSite`s!
+fn sort_probe_results(xs : Array[ProbeResult]) -> Array[ProbeResult] {
+  let out : Array[ProbeResult] = []
+  for x in xs {
+    out.push(x)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 {
+      let c = str_cmp(out[j].file, key.file)
+      let gt = if c != 0 {
+        c > 0
+      } else if out[j].line != key.line {
+        out[j].line > key.line
+      } else {
+        out[j].col > key.col
+      }
+      if gt {
+        out[j + 1] = out[j]
+        j = j - 1
+      } else {
+        break
+      }
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
 ///| Execute Stage A.5 on a set of generated files using a `check_fn` callback that runs
 ///| `pionc check --json` on the instrumented file map and returns the raw JSON output.
-///| Enforces the mandatory coverage guard: `probe_diagnostics_received == probes_instrumented`.
+///| Enforces the mandatory coverage guard (`probe_diagnostics_received == probes_instrumented`)
+///| and consumes each `ProbeResult` at most once in `(file, line, col)` order!
 pub fn run_stage_a5(
   files : Array[GeneratedFile],
   recipes : Recipes,
@@ -610,12 +786,11 @@ pub fn run_stage_a5(
     let raw_json = check_fn(instrumented_batch)
     let pionc_diags = parse_pionc_diagnostics(raw_json)
 
-    // Collect probe diagnostics matched by `(file_suffix, line, probe_kind)`
-    let probe_results : Array[ProbeResult] = []
+    let raw_results : Array[ProbeResult] = []
     for pd in pionc_diags {
       match extract_probe_from_diag(pd) {
         Some((pkind, rty)) =>
-        probe_results.push(ProbeResult::{
+        raw_results.push(ProbeResult::{
           file: pd.file,
           line: pd.line,
           col: pd.col,
@@ -627,7 +802,7 @@ pub fn run_stage_a5(
     }
 
     // MANDATORY COVERAGE GUARD: probe_diagnostics_received MUST equal probes_instrumented!
-    if probe_results.length() != round_probes {
+    if raw_results.length() != round_probes {
       diags.push(diag_error(
         "MBT2PION_PROBE_MISMATCH",
         "<stage_a5>",
@@ -635,14 +810,21 @@ pub fn run_stage_a5(
         1,
         "Stage A.5 coverage guard failed in round " + (round + 1).to_string() +
         ": probes_instrumented=" + round_probes.to_string() +
-        " != probe_diagnostics_received=" + probe_results.length().to_string(),
+        " != probe_diagnostics_received=" + raw_results.length().to_string(),
       ))
       break
     }
 
+    let probe_results = sort_probe_results(raw_results)
+    let consumed : Array[Bool] = []
+    let mut ci = 0
+    while ci < probe_results.length() {
+      consumed.push(false)
+      ci = ci + 1
+    }
     total_resolved = total_resolved + probe_results.length()
 
-    // Apply rewrites to each file
+    // Apply rewrites to each file, consuming each ProbeResult at most once in `(file, line, col)` order!
     let next_files : Array[GeneratedFile] = []
     let mut any_changed = false
     for f in cur_files {
@@ -651,25 +833,27 @@ pub fn run_stage_a5(
         None => []
       }
       let edits : Array[(Int, Int, String)] = []
-      let mut si = 0
-      while si < sites.length() {
-        let site = sites[si]
-        // Match probe result by file suffix + line + probe_kind
-        let mut matched_ty = ""
-        for pr in probe_results {
-          if (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
+      for site in sites {
+        let mut matched_idx = -1
+        let mut pi = 0
+        while pi < probe_results.length() {
+          let pr = probe_results[pi]
+          if !consumed[pi] &&
+          (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
           pr.line == site.line && pr.probe_kind == site.probe_kind {
-            matched_ty = pr.resolved_type
+            matched_idx = pi
             break
           }
+          pi = pi + 1
         }
-        if matched_ty.length() > 0 {
+        if matched_idx >= 0 {
+          consumed[matched_idx] = true
+          let matched_ty = probe_results[matched_idx].resolved_type
           match rewrite_for_probe(site, matched_ty, recipes, diags, drift_ledger) {
             Some(repl) => edits.push((site.start_byte, site.end_byte, repl))
             None => ()
           }
         }
-        si = si + 1
       }
       if edits.length() > 0 {
         any_changed = true
@@ -691,7 +875,6 @@ pub fn run_stage_a5(
     round = round + 1
   }
 
-  // Final hard gate: 0 `mbt_*_probe` residuals!
   for f in cur_files {
     if has_probe_residual(f.content) {
       diags.push(diag_error(

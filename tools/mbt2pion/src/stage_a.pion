@@ -494,7 +494,7 @@ fn lower_map_literal(
   file : String,
 ) -> String {
   let sb = StringBuilder()
-  sb.write_string("mbt_compat::ordered_map_from([")
+  sb.write_string("mbt_compat::ordered_map_from_array([")
   let mut i = open_b + 1
   let mut first = true
   while i < close_b {
@@ -691,18 +691,44 @@ fn lower_stmts_range(
           if after_else < end && tokens[after_else].kind == TokenKind::Semi {
             after_else = after_else + 1
           }
-          let cond_str = lower_expr_range(ctx, tokens, i + 1, else_idx, file, false).trim()
           let else_body = lower_block_range(ctx, tokens, else_open, else_close, file, "")
           let rest_body = lower_stmts_range(ctx, tokens, after_else, end, file)
+          // Check if condition is `<scrut> is <Pat>` (without top-level `&&`) -> lower to `match <scrut> { <Pat> => { <rest> }, _ => <else> }`
+          let mut is_idx = -1
+          let mut has_ampamp = false
+          let mut ci = i + 1
+          let mut cd = 0
+          while ci < else_idx {
+            let ck = tokens[ci].kind
+            if ck == TokenKind::LParen || ck == TokenKind::LBracket || ck == TokenKind::LBrace {
+              cd = cd + 1
+            } else if ck == TokenKind::RParen || ck == TokenKind::RBracket || ck == TokenKind::RBrace {
+              cd = cd - 1
+            } else if cd == 0 {
+              if ck == TokenKind::Keyword && tokens[ci].raw == "is" && is_idx < 0 {
+                is_idx = ci
+              } else if ck == TokenKind::AmpAmp {
+                has_ampamp = true
+              }
+            }
+            ci = ci + 1
+          }
           sb.write_string(t.leading_trivia)
-          sb.write_string("if " + cond_str + " {\n" + rest_body + "\n  } else " + else_body)
+          let cond_str = lower_expr_range(ctx, tokens, i + 1, else_idx, file, false).trim()
+          if is_idx > i + 1 && !has_ampamp {
+            let scrut_str = lower_expr_range(ctx, tokens, i + 1, is_idx, file, false).trim()
+            let pat_str = lower_expr_range(ctx, tokens, is_idx + 1, else_idx, file, true).trim()
+            sb.write_string("match " + scrut_str + " {\n    " + pat_str + " => {\n" + rest_body + "\n    }\n    _ => " + else_body + "\n  }")
+          } else {
+            sb.write_string("if " + cond_str + " {\n" + rest_body + "\n  } else " + else_body)
+          }
           ctx.drift_ledger.push(DriftEntry::{
             category: "value_guard",
             file: file,
             line: t.line,
             col: t.col,
             expr: "guard " + cond_str,
-            resolution: "rewritten_to_if_else_with_remainder",
+            resolution: if is_idx > i + 1 && !has_ampamp { "rewritten_to_match_with_remainder" } else { "rewritten_to_if_else_with_remainder" },
             status: "resolved",
             detail: "non-diverging guard else rewritten with enclosing block remainder",
           })
@@ -1048,24 +1074,109 @@ fn lower_one_token_or_form(
     return (trivia + mapped_pkg, i + 1)
   }
 
-  // 6. Unqualified `UpperIdent`: check cross-package enum constructor resolution!
+  // 6. Unqualified `UpperIdent`:
+  //    - constructor rest pattern expansion `Ctor(a, ..)` -> `Ctor(a, _, _)` using enum arity
+  //    - struct literal cascade `S::{ ... }..init()`
+  //    - cross-package enum constructor resolution
   if t.kind == TokenKind::UpperIdent {
     let prev_colon2 = i > 0 && tokens[i - 1].kind == TokenKind::ColonColon
     let prev_dot = i > 0 && tokens[i - 1].kind == TokenKind::Dot
-    if !prev_colon2 && !prev_dot {
+    let head_name = if !prev_colon2 && !prev_dot {
       match resolve_ctor(ctx.symtab, t.raw, in_pattern, file, t.line, t.col, ctx.diags) {
-        Some(resolved) => return (trivia + resolved, i + 1)
-        None => ()
+        Some(resolved) => resolved
+        None => t.raw
+      }
+    } else {
+      t.raw
+    }
+
+    // In pattern context: check `Ctor(..., ..)` rest pattern expansion!
+    if in_pattern && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 1)
+      let raw_pats : Array[(Int, Int)] = []
+      let mut has_rest = false
+      let mut pi = i + 2
+      while pi < close_p {
+        if tokens[pi].kind == TokenKind::Comma {
+          pi = pi + 1
+          continue
+        }
+        let mut pe = pi
+        let mut pd = 0
+        while pe < close_p {
+          let pk = tokens[pe].kind
+          if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace {
+            pd = pd + 1
+          } else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace {
+            pd = pd - 1
+          } else if pd == 0 && pk == TokenKind::Comma {
+            break
+          }
+          pe = pe + 1
+        }
+        if pe == pi + 1 && tokens[pi].kind == TokenKind::DotDot {
+          has_rest = true
+        } else {
+          raw_pats.push((pi, pe))
+        }
+        pi = pe + 1
+      }
+      if has_rest {
+        let arity = lookup_ctor_arity(ctx.symtab, t.raw)
+        if arity < 0 || arity < raw_pats.length() {
+          ctx.diags.push(diag_error(
+            "MBT2PION_MANUAL",
+            file,
+            t.line,
+            t.col,
+            "cannot expand constructor rest pattern `" + t.raw + "(.., ..)` because variant arity is unknown",
+          ))
+          return (trivia + head_name + "/* MBT2PION_MANUAL: unknown ctor arity */", close_p + 1)
+        }
+        let psb = StringBuilder()
+        psb.write_string(trivia + head_name + "(")
+        let mut idx = 0
+        while idx < raw_pats.length() {
+          if idx > 0 {
+            psb.write_string(", ")
+          }
+          let (s, e) = raw_pats[idx]
+          psb.write_string(lower_expr_range(ctx, tokens, s, e, file, true).trim())
+          idx = idx + 1
+        }
+        let missing = arity - raw_pats.length()
+        let mut m = 0
+        while m < missing {
+          if raw_pats.length() + m > 0 {
+            psb.write_string(", ")
+          }
+          psb.write_string("_")
+          m = m + 1
+        }
+        psb.write_string(")")
+        return (psb.to_string(), close_p + 1)
       }
     }
-    return (trivia + t.raw, i + 1)
+
+    // In expression context: struct literal followed by cascade `S::{ ... }..init()`
+    if !in_pattern && i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::LBrace {
+      let close_b = find_matching_delim(tokens, i + 2)
+      let struct_lit = head_name + "::" + lower_block_range(ctx, tokens, i + 2, close_b, file, "")
+      if close_b + 1 < end && tokens[close_b + 1].kind == TokenKind::DotDot &&
+      close_b + 2 < end && tokens[close_b + 2].kind == TokenKind::Ident {
+        return lower_cascade_chain(ctx, trivia, struct_lit, tokens, close_b + 1, end, file)
+      }
+      return (trivia + struct_lit, close_b + 1)
+    }
+
+    return (trivia + head_name, i + 1)
   }
 
-  // 7. Identifier: check for cascade `recv..m1()..m2()`, slicing `xs[a:b]`, call with `loc`/external `x?`, or keyword rename
+  // 7. Identifier: check for cascade `recv..m1()..m2()` (incl. `a.b..m()`), slicing `xs[a:b]`, call with `loc`/external `x?`, or keyword rename
   if t.kind == TokenKind::Ident {
     let prev_dot = i > 0 && tokens[i - 1].kind == TokenKind::Dot
     // Leave `.val` intact for Stage A.5 to distinguish `Ref.val` vs struct field `val`!
-    let mut name = if prev_dot && t.raw == "val" { "val" } else { rename_keyword_ident(t.raw) }
+    let name = if prev_dot && t.raw == "val" { "val" } else { rename_keyword_ident(t.raw) }
     let mut next_i = i + 1
 
     // Check function call `foo(...)`
@@ -1118,26 +1229,44 @@ fn lower_one_token_or_form(
           line: t.line,
           col: t.col,
           expr: name + "[" + lo + ":" + hi + "]",
-          resolution: "mbt_compat::array_view_clamp",
+          resolution: "mbt_compat::array_slice_clamp",
           status: "resolved",
           detail: "clamped slice lowered to backing-stable ArrayView helper",
         })
-        return (trivia + "mbt_compat::array_view_clamp(" + name + ", " + lo + ", " + hi + ")", close_br + 1)
+        return (trivia + "mbt_compat::array_slice_clamp(" + name + ", " + lo + ", " + hi + ")", close_br + 1)
       }
     }
 
-    // Check cascade `recv..m1(...)..m2(...)`
-    if !in_pattern && next_i < end && tokens[next_i].kind == TokenKind::DotDot &&
-    next_i + 1 < end && tokens[next_i + 1].kind == TokenKind::Ident {
-      return lower_cascade_chain(ctx, trivia, name, tokens, next_i, end, file)
+    // Check chained field access followed by cascade `a.b.c..m1(...)..m2(...)`
+    if !in_pattern && !prev_dot {
+      let mut chain_end = next_i
+      let chain_sb = StringBuilder()
+      chain_sb.write_string(name)
+      while chain_end + 1 < end && tokens[chain_end].kind == TokenKind::Dot && tokens[chain_end + 1].kind == TokenKind::Ident {
+        let fraw = tokens[chain_end + 1].raw
+        let fname = if fraw == "val" { "val" } else { rename_keyword_ident(fraw) }
+        chain_sb.write_string("." + fname)
+        chain_end = chain_end + 2
+      }
+      if chain_end < end && tokens[chain_end].kind == TokenKind::DotDot &&
+      chain_end + 1 < end && tokens[chain_end + 1].kind == TokenKind::Ident {
+        return lower_cascade_chain(ctx, trivia, chain_sb.to_string(), tokens, chain_end, end, file)
+      }
     }
 
     return (trivia + name, next_i)
   }
 
-  // 8. Pattern rest `..` inside constructor pattern `Ctor(_, ..)`
+  // 8. Unhandled pattern rest `..` outside a recognized constructor pattern -> hard fail
   if in_pattern && t.kind == TokenKind::DotDot {
-    return (trivia + "..", i + 1)
+    ctx.diags.push(diag_error(
+      "MBT2PION_MANUAL",
+      file,
+      t.line,
+      t.col,
+      "unsupported rest pattern `..` outside known enum constructor",
+    ))
+    return (trivia + "/* MBT2PION_MANUAL: rest pattern */", i + 1)
   }
 
   // 9. Keyword `in` used as identifier (outside `for ... in ...`)
@@ -1270,11 +1399,37 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
             } else if depth == 0 && kk == TokenKind::UpperIdent {
               let prev_c = k > lb + 1 && (tokens[k - 1].kind == TokenKind::Colon || tokens[k - 1].kind == TokenKind::ColonColon)
               if !prev_c {
+                let mut arity = 0
+                if k + 1 < rb && tokens[k + 1].kind == TokenKind::LParen {
+                  let vp = find_matching_delim(tokens, k + 1)
+                  let mut vi = k + 2
+                  let mut vd = 0
+                  let mut has_item = false
+                  while vi < vp {
+                    let vk = tokens[vi].kind
+                    if vk == TokenKind::LParen || vk == TokenKind::LBracket || vk == TokenKind::LBrace {
+                      vd = vd + 1
+                      has_item = true
+                    } else if vk == TokenKind::RParen || vk == TokenKind::RBracket || vk == TokenKind::RBrace {
+                      vd = vd - 1
+                    } else if vd == 0 && vk == TokenKind::Comma {
+                      arity = arity + 1
+                      has_item = false
+                    } else {
+                      has_item = true
+                    }
+                    vi = vi + 1
+                  }
+                  if has_item {
+                    arity = arity + 1
+                  }
+                }
                 symtab_add_ctor(ctx.symtab, tokens[k].raw, CtorTarget::{
                   pkg: "",
                   enum_name: ename,
                   ctor_name: tokens[k].raw,
                   is_local: true,
+                  arity: arity,
                 })
               }
             }
@@ -1498,7 +1653,9 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let mut all_fields_primitive = true
         let field_names : Array[String] = []
 
-        // Parse struct fields or enum variants
+        // Parse struct fields or enum variants (preserving types for recursive structural equality)
+        let field_types : Array[(String, String)] = []
+        let enum_variants : Array[(String, Array[String])] = []
         let body_sb = StringBuilder()
         if kind_kw == "struct" {
           let mut fi = lb + 1
@@ -1548,6 +1705,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
               all_fields_primitive = false
             }
             field_names.push(fname)
+            field_types.push((fname, fty))
             body_sb.write_string("  ")
             if f_pub {
               body_sb.write_string("pub ")
@@ -1559,23 +1717,49 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             fi = f_end
           }
         } else {
-          // enum body: lower type params inside variants
+          // enum body: lower type params inside variants & record payload types
           let mut ei = lb + 1
           while ei < rb {
             if tokens[ei].kind == TokenKind::UpperIdent {
               let vname = tokens[ei].raw
+              let varg_tys : Array[String] = []
               body_sb.write_string("  " + vname)
               if ei + 1 < rb && tokens[ei + 1].kind == TokenKind::LParen {
                 let vp = find_matching_delim(tokens, ei + 1)
-                let vty = lower_type_tokens(tokens, ei + 2, vp, ctx.symtab, ctx.recipes)
-                if !is_primitive_type(vty) {
-                  all_fields_primitive = false
+                let mut ai = ei + 2
+                let arg_strs : Array[String] = []
+                while ai < vp {
+                  if tokens[ai].kind == TokenKind::Comma {
+                    ai = ai + 1
+                    continue
+                  }
+                  let mut ae = ai
+                  let mut ad = 0
+                  while ae < vp {
+                    let ak = tokens[ae].kind
+                    if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace {
+                      ad = ad + 1
+                    } else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace {
+                      ad = ad - 1
+                    } else if ad == 0 && ak == TokenKind::Comma {
+                      break
+                    }
+                    ae = ae + 1
+                  }
+                  let aty = lower_type_tokens(tokens, ai, ae, ctx.symtab, ctx.recipes).trim()
+                  if !is_primitive_type(aty) {
+                    all_fields_primitive = false
+                  }
+                  varg_tys.push(aty)
+                  arg_strs.push(aty)
+                  ai = ae + 1
                 }
-                body_sb.write_string("(" + vty + ")")
+                body_sb.write_string("(" + join_comma(arg_strs) + ")")
                 ei = vp + 1
               } else {
                 ei = ei + 1
               }
+              enum_variants.push((vname, varg_tys))
               body_sb.write_string("\n")
             } else {
               ei = ei + 1
@@ -1601,43 +1785,27 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           } else {
             if d == "Eq" && all_fields_primitive {
               pion_derives.push("Eq")
-            } else if d == "Eq" && kind_kw == "struct" {
-              // Synthesize structural equality function
+            } else if d == "Eq" {
+              // Synthesize recursive structural equality function for non-primitive struct or enum
               let eq_fn_name = ctx.recipes.eq_recipe.helper_prefix + ascii_to_lower(tname)
-              recipe_impls_sb.write_string("\npub fn " + eq_fn_name + "(a : " + tname + ", b : " + tname + ") -> Bool {\n  ")
-              if field_names.length() == 0 {
-                recipe_impls_sb.write_string("true")
+              let eq_body = if kind_kw == "struct" {
+                gen_struct_eq_body("a", "b", field_types)
               } else {
-                let mut k = 0
-                while k < field_names.length() {
-                  if k > 0 {
-                    recipe_impls_sb.write_string(" && ")
-                  }
-                  recipe_impls_sb.write_string("a." + field_names[k] + " == b." + field_names[k])
-                  k = k + 1
-                }
+                gen_enum_eq_body("a", "b", enum_variants)
               }
-              recipe_impls_sb.write_string("\n}\n")
+              recipe_impls_sb.write_string("\npub fn " + eq_fn_name + "(a : " + tname + ", b : " + tname + ") -> Bool {\n  " + eq_body + "\n}\n")
             }
-            // Declarative recipe trait-impl synthesis (zero hardcoded project symbols!)
+            // Declarative recipe trait-impl synthesis for BOTH `struct` and `enum` (zero hardcoded project symbols!)
             for tr in ctx.recipes.trait_recipes {
-              if tr.derive_name == d && kind_kw == "struct" {
+              if tr.derive_name == d {
                 let mname = if tr.method_name.length() > 0 { tr.method_name } else { "eq" }
-                recipe_impls_sb.write_string("\nimpl " + tr.target_trait + " for " + tname + " {\n")
-                recipe_impls_sb.write_string("  fn " + tname + "::" + mname + "(self : " + tname + ", other : " + tname + ") -> Bool {\n    ")
-                if field_names.length() == 0 {
-                  recipe_impls_sb.write_string("true")
+                let eq_body = if kind_kw == "struct" {
+                  gen_struct_eq_body("self", "other", field_types)
                 } else {
-                  let mut k = 0
-                  while k < field_names.length() {
-                    if k > 0 {
-                      recipe_impls_sb.write_string(" && ")
-                    }
-                    recipe_impls_sb.write_string("self." + field_names[k] + " == other." + field_names[k])
-                    k = k + 1
-                  }
+                  gen_enum_eq_body("self", "other", enum_variants)
                 }
-                recipe_impls_sb.write_string("\n  }\n}\n")
+                recipe_impls_sb.write_string("\nimpl " + tr.target_trait + " for " + tname + " {\n")
+                recipe_impls_sb.write_string("  fn " + tname + "::" + mname + "(self : " + tname + ", other : " + tname + ") -> Bool {\n    " + eq_body + "\n  }\n}\n")
               }
             }
           }
@@ -1774,11 +1942,17 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
       }
     }
 
-    // --- 5. Top-level `fn` (including `Type::method`) ---
+    // --- 5. Top-level `fn` (including MoonBit leading generics `fn[T] foo(...)` & `Type::method`) ---
     if kw.kind == TokenKind::Keyword && kw.raw == "fn" && i + 1 < n {
-      let mut name_end = i + 1
+      let mut name_start = i + 1
+      let mut leading_generics = ""
+      if name_start < n && tokens[name_start].kind == TokenKind::LBracket {
+        let close_gb = find_matching_delim(tokens, name_start)
+        leading_generics = "[" + lower_type_tokens(tokens, name_start + 1, close_gb, ctx.symtab, ctx.recipes) + "]"
+        name_start = close_gb + 1
+      }
+      let mut name_end = name_start
       let name_sb = StringBuilder()
-      // Optional generic params `[T]` before or after name
       while name_end < n && tokens[name_end].kind != TokenKind::LParen && tokens[name_end].kind != TokenKind::LBrace {
         if tokens[name_end].kind == TokenKind::Ident {
           name_sb.write_string(rename_keyword_ident(tokens[name_end].raw))
@@ -1787,7 +1961,8 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         }
         name_end = name_end + 1
       }
-      let fn_name = name_sb.to_string()
+      let fn_name_base = name_sb.to_string()
+      let fn_name = fn_name_base + leading_generics
       if name_end < n && tokens[name_end].kind == TokenKind::LParen {
         let close_p = find_matching_delim(tokens, name_end)
         let (p_str, p_pre, has_opt_def) = lower_param_list(ctx, tokens, name_end, close_p, sf.rel_path, autofill_loc)
@@ -1917,6 +2092,78 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
     source_file: sf.rel_path,
     anchors: anchors,
   }
+}
+
+///| Generate a recursive structural equality expression for two values of type `ty`
+///| (handles `Option[T]` and `Array[T]` without emitting invalid Pion `==`!).
+fn gen_eq_expr(a : String, b : String, ty : String, depth : Int) -> String {
+  let t = ty.trim()
+  if t.starts_with("Option[") && t.ends_with("]") {
+    let inner = t.slice(7, t.length() - 1).trim()
+    let ax = "__oa_" + depth.to_string()
+    let bx = "__ob_" + depth.to_string()
+    let inner_eq = gen_eq_expr(ax, bx, inner, depth + 1)
+    return "match (" + a + ", " + b + ") { (Some(" + ax + "), Some(" + bx + ")) => " + inner_eq + ", (None, None) => true, _ => false }"
+  }
+  if t.starts_with("Array[") && t.ends_with("]") {
+    let inner = t.slice(6, t.length() - 1).trim()
+    let idx = "__ai_" + depth.to_string()
+    let eqv = "__aeq_" + depth.to_string()
+    let elem_eq = gen_eq_expr(a + "[" + idx + "]", b + "[" + idx + "]", inner, depth + 1)
+    return "{ let mut " + eqv + " = " + a + ".length() == " + b + ".length(); if " + eqv + " { let mut " + idx + " = 0; while " + idx + " < " + a + ".length() { if !(" + elem_eq + ") { " + eqv + " = false; break }; " + idx + " = " + idx + " + 1 } }; " + eqv + " }"
+  }
+  a + " == " + b
+}
+
+fn gen_struct_eq_body(lhs : String, rhs : String, field_types : Array[(String, String)]) -> String {
+  if field_types.length() == 0 {
+    return "true"
+  }
+  let sb = StringBuilder()
+  let mut k = 0
+  while k < field_types.length() {
+    if k > 0 {
+      sb.write_string(" && ")
+    }
+    let ft = field_types[k]
+    sb.write_string("(" + gen_eq_expr(lhs + "." + ft.0, rhs + "." + ft.0, ft.1, k) + ")")
+    k = k + 1
+  }
+  sb.to_string()
+}
+
+fn gen_enum_eq_body(lhs : String, rhs : String, variants : Array[(String, Array[String])]) -> String {
+  if variants.length() == 0 {
+    return "true"
+  }
+  let sb = StringBuilder()
+  sb.write_string("match (" + lhs + ", " + rhs + ") {\n")
+  for v in variants {
+    let vname = v.0
+    let args = v.1
+    if args.length() == 0 {
+      sb.write_string("      (." + vname + ", ." + vname + ") => true\n")
+    } else {
+      let la : Array[String] = []
+      let ra : Array[String] = []
+      let conds = StringBuilder()
+      let mut k = 0
+      while k < args.length() {
+        let an = "__a" + k.to_string()
+        let bn = "__b" + k.to_string()
+        la.push(an)
+        ra.push(bn)
+        if k > 0 {
+          conds.write_string(" && ")
+        }
+        conds.write_string("(" + gen_eq_expr(an, bn, args[k], k) + ")")
+        k = k + 1
+      }
+      sb.write_string("      (." + vname + "(" + join_comma(la) + "), ." + vname + "(" + join_comma(ra) + ")) => " + conds.to_string() + "\n")
+    }
+  }
+  sb.write_string("      _ => false\n    }")
+  sb.to_string()
 }
 
 fn join_comma(xs : Array[String]) -> String {
