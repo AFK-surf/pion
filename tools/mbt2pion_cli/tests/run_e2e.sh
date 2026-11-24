@@ -1532,6 +1532,8 @@ for tag_es, pkg_txt in [
 for tag_eb, bad_pkg_txt in [
     ("duplicate_decoded", 'options(targets: {"extra.mbt": "native", "ex\\u0074ra.mbt": "wasm"})\n'),
     ("invalid_escape", 'options(targets: {"extra.mbt": "w\\qsm"})\n'),
+    ("escapedhex", 'options(targets: {"ex\\x74ra.mbt": "wasm"})\n'),
+    ("escapedbraces", 'options(targets: {"ex\\u{74}ra.mbt": "wasm"})\n'),
 ]:
     s_eb = os.path.join(root, f"s10m5_bad_{tag_eb}")
     o_eb = os.path.join(root, f"o10m5_bad_{tag_eb}")
@@ -1545,7 +1547,17 @@ for tag_eb, bad_pkg_txt in [
     assert r_eb.returncode == 1, f"10m-5 {tag_eb} must fail (rc=1), got {r_eb.returncode}"
     assert "MBT2PION_UNSUPPORTED_TARGET_RULE" in (r_eb.stdout + r_eb.stderr), f"10m-5 {tag_eb} missing MBT2PION_UNSUPPORTED_TARGET_RULE"
 
-print("[e2e] PASS: Final Astra P0 escape-decoding suite (10m-5: escaped_name/field/value -> 21, duplicate_decoded & invalid_escape -> rc=1)")
+s_cfg_esc = os.path.join(root, "s10m5_cfg_escape")
+o_cfg_esc = os.path.join(root, "o10m5_cfg_escape")
+os.makedirs(s_cfg_esc, exist_ok=True)
+with open(os.path.join(s_cfg_esc, "a.mbt"), "w") as f:
+    f.write('#cfg(target="w\\u0061sm-gc")\npub fn f() -> Int { 1 }\n')
+r_cfg_esc = run_cli(["--src", s_cfg_esc, "--out", o_cfg_esc, "--target", "wasm32", "--mode", "publish",
+                     "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r_cfg_esc.returncode == 1, f"10m-5 cfg_escape must fail (rc=1), got {r_cfg_esc.returncode}"
+assert "MBT2PION_UNSUPPORTED_CFG" in (r_cfg_esc.stdout + r_cfg_esc.stderr), "10m-5 cfg_escape missing MBT2PION_UNSUPPORTED_CFG"
+
+print("[e2e] PASS: Final Astra P0+P1 strict RFC 8259 JSON escape & raw #cfg suite (10m-5: escaped_name/field/value -> 21, duplicate/hex/braces/cfg_escape -> rc=1)")
 
 # 10n. Red-team P0 live native acceptance:
 #      extern "C" fn c_abs(x : Int) -> Int = "abs" + #cfg(target="js") js_only + #cfg(target="native") native_only + kept()
