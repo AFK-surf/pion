@@ -58,7 +58,34 @@ fi
 
 echo "=== [5/8] E2E multicore_bench.pion (scope + 4x spawn + Channel + Mutex + AtomicInt > 3.0x) ==="
 "$PIONC" build -o "$TMP_DIR/multicore_bench" "$ROOT_DIR/tests/e2e/multicore_bench.pion"
-"$TMP_DIR/multicore_bench"
+BENCH_NCPUS=""
+case "${PION_BENCH_NCPUS:-}" in
+  ""|*[!0-9]*) ;;
+  *)
+    _ov=$(awk -v s="${PION_BENCH_NCPUS}" 'BEGIN { v=0; for(i=1;i<=length(s);i++){ d=substr(s,i,1)+0; if(v<1000000){ v=v*10+d; if(v>1000000) v=1000000 } } if(v>0) print v }')
+    if [ -n "$_ov" ]; then BENCH_NCPUS="$_ov"; fi
+    ;;
+esac
+if [ -z "$BENCH_NCPUS" ]; then
+  BENCH_NCPUS="$(sysctl -n hw.activecpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+  _cg_root="${PION_TEST_CGROUP_ROOT:-/sys/fs/cgroup}"
+  _cg_proc="${PION_TEST_PROC_CGROUP:-/proc/self/cgroup}"
+  if [ -r "$_cg_proc" ] && [ -d "$_cg_root" ]; then
+    _cg_rel=$(awk -F: '$1 == "0" && $2 == "" { sub(/^0::/, ""); print; exit }' "$_cg_proc" 2>/dev/null || true)
+    _cg_cur="${_cg_root}${_cg_rel}"
+    while :; do
+      if [ -r "$_cg_cur/cpu.max" ]; then
+        _cg=$(awk 'NR==1 && $1 != "max" && $2 > 0 { q=int($1/$2); if (q<1) q=1; print q }' "$_cg_cur/cpu.max" 2>/dev/null || true)
+        if [ -n "$_cg" ] && [ "$_cg" -lt "$BENCH_NCPUS" ] 2>/dev/null; then BENCH_NCPUS="$_cg"; fi
+      fi
+      [ "$_cg_cur" = "$_cg_root" ] && break
+      _cg_parent="${_cg_cur%/*}"
+      [ -z "$_cg_parent" ] || [ "$_cg_parent" = "$_cg_cur" ] && break
+      _cg_cur="$_cg_parent"
+    done
+  fi
+fi
+PION_BENCH_NCPUS="$BENCH_NCPUS" "$TMP_DIR/multicore_bench"
 
 echo "=== [6/8] E2E contracts.pion (dev debug_assert aborts, --release strips to 0 bytes) ==="
 "$PIONC" build --emit-ssa "$TMP_DIR/contracts_dev.ssa" -o "$TMP_DIR/contracts_dev" "$ROOT_DIR/tests/e2e/contracts.pion"
