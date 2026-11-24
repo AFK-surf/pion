@@ -199,7 +199,7 @@ theorem eval_inst_sound {vg : ValGraph} {vids : Pion.Array Std.I32} {inst : Inst
         have hok : BinArgOK vg5 c op av bv := by
           unfold BinArgOK
           cases op <;> simp [isCmp, isShift, binArgCls] at ca' cb ⊢ <;>
-            first | exact ⟨ca', cb⟩ | exact ca' | trivial
+            first | exact ⟨ca', cb⟩ | exact ca'
         obtain ⟨e7, d7, v7, -, val7⟩ := vg_canon_bin_sound (pair_ok h) d5 (extends_valid e5 va) vb hok
         have hsafe : ∀ env, evalBin c op (evI vg5 env av) (evI vg5 env bv) ≠ none := by
           intro env
@@ -808,7 +808,6 @@ theorem edge_dead_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pion.
           have e67 : t6 = t7 := ok_inj' ht7'
           exact ⟨hne, by rw [ht6, e67, h7]⟩
         · cases ok_inj' ht7; cases h7
-      try simp only at h
       obtain ⟨q1, hq1, h⟩ := bind_eq_ok h
       obtain ⟨cv0, vg1⟩ := q1
       try simp only [uncurry_apply_pair] at h
@@ -1201,7 +1200,6 @@ theorem sole_pred_sound {f : Func} {p r : Std.I32} (h : sole_pred f p = ok r) (h
     simp only [term_nsucc_spec, bind_ok] at hc
     obtain ⟨q1, hq1, hc⟩ := bind_eq_ok hc
     obtain ⟨k1, found1, count1⟩ := q1
-    try simp only at hc
     rw [← ok_inj' hc]
     dsimp only
     unfold sole_pred_loop1 at hq1
@@ -1247,7 +1245,7 @@ theorem sole_pred_sound {f : Func} {p r : Std.I32} (h : sole_pred f p = ok r) (h
       rw [term_succ_spec _ _ hk0 hklt', bind_ok] at hc
       have htake : (termSuccs B.term).take (kI.val + 1).toNat =
           (termSuccs B.term).take kI.val.toNat ++ [(termSuccs B.term)[kI.val.toNat]'(by omega)] := by
-        rw [show (kI.val + 1).toNat = kI.val.toNat + 1 by omega, List.take_succ,
+        rw [show (kI.val + 1).toNat = kI.val.toNat + 1 by omega, List.take_add_one,
           List.getElem?_eq_getElem (by omega)]
         rfl
       obtain ⟨q2, hq2, hc⟩ := bind_eq_ok hc
@@ -1409,7 +1407,6 @@ theorem phi_select_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
       obtain ⟨t14, ht14, hc⟩ := bind_eq_ok hc
       obtain ⟨q2, hq2, hc⟩ := bind_eq_ok hc
       obtain ⟨p11, p01⟩ := q2
-      try simp only at hc
       rw [← ok_inj' hc]
       dsimp only
       refine ⟨by omega, by omega, vg_extends_trans hej e1, d1, ?_, ?_⟩
@@ -1468,7 +1465,6 @@ theorem phi_select_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
     obtain ⟨a1, ha1, ha1p, ha1c⟩ := hp1 hp10'
     obtain ⟨a0, ha0, ha0p, ha0c⟩ := hp0 hp00'
     obtain ⟨B1, hB1, h⟩ := bind_eq_ok h
-    try simp only at h
     split at h
     rotate_left
     · exact fail vg1 (vg_extends_refl _) d1 0#i32 h
@@ -1476,7 +1472,6 @@ theorem phi_select_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
     split at h
     · exact fail vg1 (vg_extends_refl _) d1 0#i32 h
     obtain ⟨B0, hB0, h⟩ := bind_eq_ok h
-    try simp only at h
     split at h
     rotate_left
     · exact fail vg1 (vg_extends_refl _) d1 0#i32 h
@@ -1500,7 +1495,6 @@ theorem phi_select_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
     obtain ⟨-, -, hsole0⟩ := sole_pred_sound hd2 hd0
     obtain ⟨Bd, hBd, h⟩ := bind_eq_ok h
     obtain ⟨_, hBdl, hBdv⟩ := arr_get_ok hBd
-    try simp only at h
     split at h
     rotate_left
     · exact fail vg1 (vg_extends_refl _) d1 0#i32 h
@@ -1622,7 +1616,7 @@ theorem phiArg_idx {P : Phi} {prev : Int} {ai : Nat} (hai : ai < P.arms.val.leng
     rw [h]; rfl
   rw [List.find?_eq_some_iff_getElem]
   refine ⟨by simp [hp], ai, hai, rfl, fun j hj => ?_⟩
-  simp only [decide_eq_true_eq, Bool.not_eq_true', decide_eq_false_iff_not]
+  simp only [Bool.not_eq_true', decide_eq_false_iff_not]
   exact hfirst j hj (by omega)
 
 /-- On the edge of arm `a2` of phi `P2`, phi `P1` takes the same value (or both are their own

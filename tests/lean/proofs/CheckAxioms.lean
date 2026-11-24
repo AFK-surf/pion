@@ -8,6 +8,11 @@ import PionProofs.AlgosProofs
 import PionProofs.CapTableProofs
 import PionProofs.QbeTvProofs
 import PionProofs.QbeArm64SlotPairs
+import PionProofs.Pr2Checks
+import PionProofs.QbeCodegenOpts
+import PionProofs.QbeGvnSpeedup
+import PionProofs.QbeBackendOpts2
+import PionProofs.QbeLoopArrayOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -474,3 +479,50 @@ import PionProofs.QbeArm64SlotPairs
 #print axioms PionQbeArm64SlotPairs.slotAdjacent
 #print axioms PionQbeArm64SlotPairs.pairWord_fields
 #print axioms PionQbeArm64SlotPairs.pairBases
+#print axioms PionProofs.Pr2Checks.i8_wrapping_add
+#print axioms PionProofs.Pr2Checks.i8_rem_min_overflow
+#print axioms PionProofs.Pr2Checks.i8_eq_instance
+#print axioms PionProofs.Pr2Checks.bytes_new_checked_neg
+#print axioms PionProofs.Pr2Checks.bytes_new_checked_zero
+#print axioms PionProofs.Pr2Checks.sb_split_utf8_no_panic
+#print axioms PionQbeCodegenOpts.cmpTest
+#print axioms PionQbeCodegenOpts.cmpTestCarryOverflow
+#print axioms PionQbeCodegenOpts.cmpTestCarryOverflow64
+#print axioms PionQbeCodegenOpts.cmpTestCarryOverflow32
+#print axioms PionQbeCodegenOpts.scaleAddr
+#print axioms PionQbeCodegenOpts.synthScaleChecks
+#print axioms PionQbeCodegenOpts.shortBranch
+#print axioms PionQbeCodegenOpts.padSum
+#print axioms PionQbeCodegenOpts.padEquiv
+#print axioms PionQbeCodegenOpts.padTotal
+#print axioms PionQbeCodegenOpts.padEncodable
+#print axioms PionQbeCodegenOpts.widthsBound
+#print axioms PionQbeCodegenOpts.padMinimal
+#print axioms PionQbeCodegenOpts.accumulatorDecode
+#print axioms PionQbeCodegenOpts.stpDescending
+#print axioms PionQbeCodegenOpts.ldpDescending
+#print axioms PionQbeGvnSpeedup.ReachEpoch.mark
+#print axioms PionQbeGvnSpeedup.ReachEpoch.initial
+#print axioms PionQbeGvnSpeedup.ReachEpoch.bounded_mark
+#print axioms PionQbeGvnSpeedup.ReachEpoch.fresh
+#print axioms PionQbeGvnSpeedup.ReachEpoch.simulate
+#print axioms PionQbeGvnSpeedup.ReachEpoch.search_equivalent
+#print axioms PionQbeGvnSpeedup.Trail.record_then_undo
+#print axioms PionQbeGvnSpeedup.Trail.undo_append
+#print axioms PionQbeGvnSpeedup.Trail.restore
+#print axioms PionQbeGvnSpeedup.Trail.equivalent
+#print axioms PionQbeBackendOpts2.rematIndex
+#print axioms PionQbeBackendOpts2.rematIndexSwap
+#print axioms PionQbeBackendOpts2.align16_exact
+#print axioms PionQbeBackendOpts2.layout_bound
+#print axioms PionQbeBackendOpts2.taken_fallthrough
+#print axioms PionQbeBackendOpts2.relocation
+#print axioms PionQbeBackendOpts2.cmp_mem
+#print axioms PionQbeBackendOpts2.cmp_mem_imm
+#print axioms PionQbeLoopArrayOpts.ReadPair.step
+#print axioms PionQbeLoopArrayOpts.ReadPair.resize_allowed
+#print axioms PionQbeLoopArrayOpts.ReadPair.preserve
+#print axioms PionQbeLoopArrayOpts.ReadPair.trace
+#print axioms PionQbeLoopArrayOpts.ByteScan.bounded
+#print axioms PionQbeLoopArrayOpts.ByteScan.equivalent
+#print axioms PionQbeLoopArrayOpts.ByteScan.no_increment_overflow

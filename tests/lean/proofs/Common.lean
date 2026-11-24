@@ -69,7 +69,7 @@ theorem nth_set_eq {l : List Std.I32} {k : Nat} (x : Std.I32) (h : k < l.length)
 
 theorem nth_set_ne {l : List Std.I32} {k m : Nat} (x : Std.I32) (h : m ≠ k) :
     nth (l.set m x) k = nth l k := by
-  simp [nth, List.getElem?_set, h]
+  simp [nth, h]
 
 theorem listGet_eq (l : List Std.I32) (i : Std.I32) (h0 : 0 ≤ i.val) (h1 : i.val < l.length) :
     listGet l i = ok (nth l i.val.toNat) := by

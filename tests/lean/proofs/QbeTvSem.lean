@@ -433,19 +433,18 @@ theorem is_safe_div_const_spec (c : Cls) (op : BinOp) (l r : Std.U64) :
   simp only [is_safe_div_const, mask_cls_spec, is_signed_div_spec, all_ones_spec,
     int_min_of_spec, bind_ok]
   by_cases h0 : maskC c r.bv = 0
-  · rw [ite_t (u64_ext (by simp [h0, bv_zero]) : (⟨maskC c r.bv⟩ : Std.U64) = 0#u64)]
+  · rw [ite_t (u64_ext (by simp [h0]) : (⟨maskC c r.bv⟩ : Std.U64) = 0#u64)]
     simp [safeDiv, h0]
   · rw [ite_f (fun e => h0 (by simpa [bv_zero] using congrArg (·.bv) e) :
       ¬ (⟨maskC c r.bv⟩ : Std.U64) = 0#u64)]
     cases hs : signedDivOp op
-    · simp [safeDiv, h0, hs]
+    · simp [safeDiv, hs]
       exact h0
     · by_cases h1 : maskC c r.bv = allOnesC c <;> by_cases h2 : maskC c l.bv = intMinC c <;>
-        simp [safeDiv, h0, h1, h2, hs, u64_eq, allOnesC_ne] <;>
+        simp [safeDiv, h1, h2, hs] <;>
         first
         | exact h0
-        | exact allOnesC_ne c
-        | (rw [Bool.eq_iff_iff]; simp [h2, u64_eq, allOnesC_ne]; try exact allOnesC_ne c)
+        | (rw [Bool.eq_iff_iff]; simp [h2]; try exact allOnesC_ne c)
 
 theorem toInt_extS32_lt (x : BitVec 64) : (extS 32 x).toInt < 2 ^ 31 := by
   simp only [extS]
@@ -465,17 +464,17 @@ theorem extS32_eq_zero (x : BitVec 64) : extS 32 x = 0 ↔ maskC .W x = 0 := by
     apply BitVec.eq_of_getLsbD_eq
     intro i hi
     have := congrArg (fun y => y.getLsbD i) h
-    simp only [extS, BitVec.getLsbD_signExtend, BitVec.getLsbD_setWidth, BitVec.getLsbD_zero] at this
-    simp only [maskC, zx32, lo32, BitVec.getLsbD_setWidth, BitVec.getLsbD_zero]
+    simp only [extS, BitVec.getLsbD_signExtend, BitVec.getLsbD_setWidth] at this
+    simp only [maskC, zx32, lo32, BitVec.getLsbD_setWidth]
     by_cases h' : i < 32 <;> simp_all
   · intro h
     apply BitVec.eq_of_getLsbD_eq
     intro i hi
     have h7 := congrArg (fun y => y.getLsbD 31) h
-    simp only [maskC, zx32, lo32, BitVec.getLsbD_setWidth, BitVec.getLsbD_zero] at h7
+    simp only [maskC, zx32, lo32, BitVec.getLsbD_setWidth] at h7
     have := congrArg (fun y => y.getLsbD i) h
-    simp only [maskC, zx32, lo32, BitVec.getLsbD_setWidth, BitVec.getLsbD_zero] at this
-    simp only [extS, BitVec.getLsbD_signExtend, BitVec.getLsbD_setWidth, BitVec.getLsbD_zero,
+    simp only [maskC, zx32, lo32, BitVec.getLsbD_setWidth] at this
+    simp only [extS, BitVec.getLsbD_signExtend, BitVec.getLsbD_setWidth,
       BitVec.msb_setWidth]
     by_cases h' : i < 32 <;> simp_all
 
@@ -531,7 +530,7 @@ theorem i64_rem_ok (x y : BitVec 64) (h0 : y ≠ 0)
 theorem u64_div_ok (x y : BitVec 64) (h0 : y ≠ 0) :
     Pion.U64.div (⟨x⟩ : Std.U64) (⟨y⟩ : Std.U64) = ok (⟨x / y⟩ : Std.U64) := by
   have hc1 : (((⟨y⟩ : Std.U64).bv != 0) = true) := by
-    simp only [bne_iff_ne, ne_eq, u64_mk_bv]; exact h0
+    simp only [bne_iff_ne, ne_eq]; exact h0
   show UScalar.div (ty := .U64) ⟨x⟩ ⟨y⟩ = _
   unfold UScalar.div
   rw [ite_t hc1]
@@ -614,12 +613,11 @@ theorem eval_bin_const_sound (cls : Cls) (op : BinOp) (a b : Std.U64) :
     eval_bin_const cls op a b = ok ((evalBin cls op a.bv b.bv).map (fun x => (⟨x⟩ : Std.U64))) := by
   cases op <;>
     simp only [eval_bin_const, evalBin, mask_cls_spec, bind_ok, Option.map_some,
-      shift_amount_spec, as_signed_spec, bool_u64_spec, is_safe_div_const_spec, u64_mk_bv,
-      i64_reinterpret]
+      shift_amount_spec, as_signed_spec, bool_u64_spec, is_safe_div_const_spec, u64_mk_bv]
   case Add | Sub | Mul | And | Or | Xor => simp
   case Shl => rw [shl_sa]; simp
   case Shr => rw [shr_sa]; simp
-  case Sar => rw [sar_sa]; simp [i64_reinterpret]
+  case Sar => rw [sar_sa]; simp
   case Ror =>
     by_cases hs : shAmt cls b.bv = 0
     · have h0 : saI cls b = 0#i32 := (saI_eq_zero_iff cls b).2 hs
@@ -632,14 +630,14 @@ theorem eval_bin_const_sound (cls : Cls) (op : BinOp) (a b : Std.U64) :
     by_cases hs : safeDiv cls .Div (maskC cls a.bv) (maskC cls b.bv)
     · simp only [hs, decide_true, ↓reduceIte]
       rw [i64_div_ok _ _ (asS_ne_zero cls _ hs.1) (asS_no_ovf cls _ _ (hs.2 rfl))]
-      simp [i64_reinterpret]
+      simp
     · simp only [hs, decide_false, ↓reduceIte]
       rfl
   case Rem =>
     by_cases hs : safeDiv cls .Rem (maskC cls a.bv) (maskC cls b.bv)
     · simp only [hs, decide_true, ↓reduceIte]
       rw [i64_rem_ok _ _ (asS_ne_zero cls _ hs.1) (asS_no_ovf cls _ _ (hs.2 rfl))]
-      simp [i64_reinterpret]
+      simp
     · simp only [hs, decide_false, ↓reduceIte]
       rfl
   case UDiv =>
@@ -750,7 +748,7 @@ def evalSym (vg : ValGraph) (env : SymEnv) (i : Nat) : BitVec 64 :=
   match vg.nodes.val[i]? with
   | none => 0
   | some n =>
-    evalNode env (fun a => if h : 0 ≤ a.val ∧ a.val.toNat < i then evalSym vg env a.val.toNat else 0) n
+    evalNode env (fun a => if _h : 0 ≤ a.val ∧ a.val.toNat < i then evalSym vg env a.val.toNat else 0) n
 termination_by i
 decreasing_by omega
 
@@ -810,7 +808,7 @@ theorem evalSym_unfold (vg : ValGraph) (env : SymEnv) (i : Nat) :
     evalSym vg env i = match vg.nodes.val[i]? with
       | none => 0
       | some n => evalNode env
-          (fun a => if h : 0 ≤ a.val ∧ a.val.toNat < i then evalSym vg env a.val.toNat else 0) n := by
+          (fun a => if _h : 0 ≤ a.val ∧ a.val.toNat < i then evalSym vg env a.val.toNat else 0) n := by
   rw [evalSym]
 
 theorem evalNode_congr (env : SymEnv) (n : SymNode) (sub sub' : Std.I32 → BitVec 64)
@@ -1518,9 +1516,9 @@ theorem vid_mentions_blk_sound {vg : ValGraph} {v blk : Std.I32} {env env' : Sym
     have hm1' := arr_set_ok hm1
     try simp only [Pion.Array.make, listMake, hv1] at hm1'
     have hlen1 : mark1.val.length = v.val.toNat + 1 := by
-      rw [hm1']; simp [hv1]; omega
+      rw [hm1']; simp; omega
     have hmv : mark1.val[v.val.toNat]? = some true := by
-      rw [hm1', List.getElem?_set]; simp [hv1]; try omega
+      rw [hm1', List.getElem?_set]; simp; try omega
     have key := loop_ok_inv
       (fun (p : Std.I32 × Pion.Array Bool) => vid_mentions_blk_loop0.body vg blk p.1 p.2)
       (fun p => p.2.val.length = v.val.toNat + 1 ∧ -1 ≤ p.1.val ∧ p.1.val ≤ v.val ∧
@@ -1609,7 +1607,7 @@ theorem vid_mentions_blk_sound {vg : ValGraph} {v blk : Std.I32} {env env' : Sym
                   unfold SweepOK; rw [hnode]
                   intro _
                   have hai : a.val.toNat < mark.val.length := by rw [hl]; omega
-                  simp [List.getElem?_set, hai]
+                  simp [hai]
                 · rename_i hcond
                   simp only [Bool.and_eq_true, decide_eq_true_eq, i32_le_iff, i32_lt_iff,
                     i32_zero_val] at hcond
@@ -1633,7 +1631,7 @@ theorem vid_mentions_blk_sound {vg : ValGraph} {v blk : Std.I32} {env env' : Sym
                     rw [← ok_inj' hm2, arr_set_ok hm3]
                     refine ⟨markStep_set (markStep_refl _ _) (by omega), fun _ => ?_⟩
                     have hai : a.val.toNat < mark.val.length := by rw [hl]; omega
-                    simp [List.getElem?_set, hai]
+                    simp [hai]
                   · rename_i hcond
                     simp only [Bool.and_eq_true, decide_eq_true_eq, i32_le_iff, i32_lt_iff,
                       i32_zero_val] at hcond
@@ -1656,7 +1654,7 @@ theorem vid_mentions_blk_sound {vg : ValGraph} {v blk : Std.I32} {env env' : Sym
                   refine ⟨fun ha' => ?_, fun _ => ?_⟩
                   · exact mark_set_true (hstep2.2 ha')
                   · have hdi : d.val.toNat < m2.val.length := by rw [hl2, hl]; omega
-                    simp [List.getElem?_set, hdi]
+                    simp [hdi]
                 · rename_i hcond
                   simp only [Bool.and_eq_true, decide_eq_true_eq, i32_le_iff, i32_lt_iff,
                     i32_zero_val] at hcond
@@ -2000,7 +1998,7 @@ theorem blk_mentions_table_sound {vg : ValGraph} {blk : Std.I32} {m : Pion.Array
           rw [hf] at hh
           cases hh
         · intro _
-          rw [hs]; simp [List.getElem?_set, hl, hlt']
+          rw [hs]; simp [List.getElem?_set, hl]
       · rename_i hh
         cases ok_inj' hm1
         exact ⟨hl, fun _ _ => rfl, fun _ => rfl, fun ht' => absurd ht' hh⟩

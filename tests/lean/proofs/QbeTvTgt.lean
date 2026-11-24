@@ -206,7 +206,7 @@ theorem tgt_enter {G : ValGraph} {tgt : Func} {ti : FnInfo} {tvid : List Std.I32
     show R t = _
     rw [hRt]
     exact hval v (by rw [hPd]; exact hv) hvv
-  · push_neg at hex
+  · push Not at hex
     show R t = _
     rw [(hRs t).1 hex]
     obtain ⟨htn, hcase⟩ := ht

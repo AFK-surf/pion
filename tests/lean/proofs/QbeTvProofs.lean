@@ -396,6 +396,7 @@ theorem pair_enter {G : ValGraph} {src tgt : Func} {si ti : FnInfo} {svid tvid :
       restFrom o args src n' sj.val.toNat Bj 0 { regs := R, world := s.world } = some res ∧
       tgt.blocks.val[tj.val.toNat]? = some Btj ∧ execPhis o ts.regs tc Btj.phis.val ts.regs = some R' ∧
       TIn G tgt ti tvid.val tavail env' tj.val.toNat Btj { ts with regs := R' } 0 [sj] ∧ 0 ≤ tj.val := by
+  have _ := hw
   have hlen := CS.wf.len_le
   have tlen := CT.wf.len_le
   obtain ⟨n', Bj, R, hn, hBj, hR, hin, hhist', hrun⟩ := src_enter_about CS hab
@@ -653,6 +654,7 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
           sx1.val.toNat tx1.val.toNat schain →
         MidState G src tgt cert si ti o args res env n sc.val.toNat tc.val.toNat Bs Bt s0 sx4.val.toNat
           tx3.val.toNat sj4 tj3 schain ts1 tx1.val.toNat) := by
+  have _ := htc0
   subst hr
   obtain ⟨hnsi1, hnsi2⟩ := arr_length_ok hnsi
   obtain ⟨hnti1, hnti2⟩ := arr_length_ok hnti
@@ -686,8 +688,8 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
     obtain ⟨e9, es, et, ej, ek⟩ := e1
     subst e9 es et ej ek
     by_cases hcond : ((!(decide (sx1 < nsi))) || (!(decide (tx1 < nti)))) = true
-    · rw [if_pos hcond] at hq2; cases ok_inj' hq2
-    rw [if_neg hcond] at hq2
+    · rw [ite_eq_left hcond] at hq2; cases ok_inj' hq2
+    rw [ite_eq_right hcond] at hq2
     have hsx : sx1.val.toNat < Bs.insts.val.length := hsh.1 (by revert hcond; cases decide (sx1 < nsi) <;> simp)
     have htx : tx1.val.toNat < Bt.insts.val.length := hth.1 (by
       revert hcond; cases decide (sx1 < nsi) <;> cases decide (tx1 < nti) <;> simp)
@@ -790,8 +792,8 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
     obtain ⟨e9, es, et, ej, ek⟩ := e1
     subst e9 es et ej ek
     by_cases hcond : (!(decide (sx1 < nsi))) = true
-    · rw [if_pos hcond] at ht24; cases ok_inj' ht24
-    rw [if_neg hcond] at ht24
+    · rw [ite_eq_left hcond] at ht24; cases ok_inj' ht24
+    rw [ite_eq_right hcond] at ht24
     have hsx : sx1.val.toNat < Bs.insts.val.length := hsh.1 (by revert hcond; cases decide (sx1 < nsi) <;> simp)
     obtain ⟨a, ha, h2⟩ := bind_eq_ok ht24
     rw [hBs] at ha; cases ok_inj' ha
@@ -821,8 +823,8 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
   | SrcJmp =>
     simp only at hst
     by_cases hcond : decide (sx1 < nsi) = true
-    · rw [if_pos hcond] at hst; cases ok_inj' hst
-    rw [if_neg hcond] at hst
+    · rw [ite_eq_left hcond] at hst; cases ok_inj' hst
+    rw [ite_eq_right hcond] at hst
     obtain ⟨q4, hq4, h1⟩ := bind_eq_ok hst
     obtain ⟨v, vg4⟩ := q4
     try simp only [uncurry_apply_pair] at h1
@@ -858,8 +860,8 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
   | SrcJoin =>
     simp only at hst
     by_cases hcond : decide (sx1 < nsi) = true
-    · rw [if_pos hcond] at hst; cases ok_inj' hst
-    rw [if_neg hcond] at hst
+    · rw [ite_eq_left hcond] at hst; cases ok_inj' hst
+    rw [ite_eq_right hcond] at hst
     obtain ⟨q5, hq5, h1⟩ := bind_eq_ok hst
     obtain ⟨v, vg5⟩ := q5
     try simp only [uncurry_apply_pair] at h1
@@ -893,15 +895,15 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
           exact ⟨s1, ts1, Or.inr ⟨hsj0, prev', n', s', ha', hn', by rw [hw', hw]⟩, htin, Or.inl (by simp),
             fun m hm => hm⟩
         by_cases hcv : atomVal o s1.regs .W c ≠ 0
-        · exact hleave r1 (by rw [hT]; simp only [EdgeTaken]; rw [if_pos hcv]) hr1
-        · exact hleave r2 (by rw [hT]; simp only [EdgeTaken]; rw [if_neg hcv]) hr2
+        · exact hleave r1 (by rw [hT]; simp only [EdgeTaken]; rw [ite_eq_left hcv]) hr1
+        · exact hleave r2 (by rw [hT]; simp only [EdgeTaken]; rw [ite_eq_right hcv]) hr2
       · exact ⟨s1, ts1, Or.inl ⟨by omega, hin, hrun, hw⟩, htin, Or.inl (by simp), fun m hm => hm⟩
     | _ => simp only at h1; cases ok_inj' h1
   | TgtJmp =>
     simp only at hst
     by_cases hcond : decide (tx1 < nti) = true
-    · rw [if_pos hcond] at hst; cases ok_inj' hst
-    rw [if_neg hcond] at hst
+    · rw [ite_eq_left hcond] at hst; cases ok_inj' hst
+    rw [ite_eq_right hcond] at hst
     obtain ⟨q6, hq6, h1⟩ := bind_eq_ok hst
     obtain ⟨v, vg6⟩ := q6
     try simp only [uncurry_apply_pair] at h1
@@ -936,8 +938,8 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
   | BothJmp =>
     simp only at hst
     by_cases hcond : ((decide (sx1 < nsi)) || (decide (tx1 < nti))) = true
-    · rw [if_pos hcond] at hst; cases ok_inj' hst
-    rw [if_neg hcond] at hst
+    · rw [ite_eq_left hcond] at hst; cases ok_inj' hst
+    rw [ite_eq_right hcond] at hst
     have hsxn : ¬ decide (sx1 < nsi) = true := by revert hcond; cases decide (sx1 < nsi) <;> simp
     have htxn : ¬ decide (tx1 < nti) = true := by
       revert hcond; cases decide (sx1 < nsi) <;> cases decide (tx1 < nti) <;> simp
@@ -951,8 +953,8 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
     obtain ⟨tj2, htj2, h4⟩ := bind_eq_ok h3
     rw [hvj] at hsj3 htj2
     by_cases hneg : ((decide (sj3 < 0#i32)) || (decide (tj2 < 0#i32))) = true
-    · rw [if_pos hneg] at h4; cases ok_inj' h4
-    rw [if_neg hneg] at h4
+    · rw [ite_eq_left hneg] at h4; cases ok_inj' h4
+    rw [ite_eq_right hneg] at h4
     have hsj0 : 0 ≤ sj3.val := by
       have : ¬ decide (sj3 < 0#i32) = true := by revert hneg; cases decide (sj3 < 0#i32) <;> simp
       simpa [i32_lt_iff] using this
@@ -1032,13 +1034,16 @@ theorem tail_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
         ∃ env' n' s0' s' ts', RState G src tgt cert si ti o args res N sc2 sx6 tc2 tx5 schain2 env' n' s0' s' ts' ∧
           (TGoal tgt o args res tc2 tx5 ts' →
             ∃ m, restFrom o args tgt m tc.val.toNat Bt tx1 ts1 = some res)) := by
+  have _ := hBs
+  have _ := hinfo_s
+  have _ := hinfo_t
   -- the target part
   have htail : vg_extends vg9 vg12 ∧ GPre cert vg12 ∧ 0 ≤ tc2.val ∧ 0 ≤ tx5.val ∧
       (tj3.val < 0 → tc2 = tc ∧ tx5 = tx3 ∧ tchain2 = tchain) ∧
       (0 ≤ tj3.val → tc2 = tj3 ∧ tx5 = 0#i32 ∧ 0 < tj3.val ∧ tj3.val < ti.nb.val ∧
         absorb_ok vg9 tgt cert.tvid tj3 tc = ok (true, vg12)) := by
     by_cases hj : tj3 >= 0#i32
-    · rw [if_pos hj] at hs1
+    · rw [ite_eq_left hj] at hs1
       obtain ⟨t41, ht41, h1⟩ := bind_eq_ok hs1
       obtain ⟨q44, hq44, h2⟩ := bind_eq_ok h1
       obtain ⟨t44, vg10⟩ := q44
@@ -1068,13 +1073,13 @@ theorem tail_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
       have hj0 : 0 ≤ tj3.val := by simpa [i32_le_iff] using hj
       have hrange : 0 < tj3.val ∧ tj3.val < ti.nb.val := by
         by_contra hc
-        rw [if_pos (by
+        rw [ite_eq_left (by
           simp only [Bool.or_eq_true, decide_eq_true_eq, i32_le_iff, ge_iff_le, i32_zero_val]
           omega)] at ht41
         cases ok_inj' ht41
       exact ⟨e10, gPre_ext e10 d10 hg9, hj0, by simp, fun h => by omega,
         fun _ => ⟨rfl, rfl, hrange.1, hrange.2, hq43⟩⟩
-    · rw [if_neg hj] at hs1
+    · rw [ite_eq_right hj] at hs1
       have e1 := ok_inj' hs1
       simp only [Sum.inr.injEq, Prod.mk.injEq] at e1
       obtain ⟨eg, ec, et, ex⟩ := e1
@@ -1088,7 +1093,7 @@ theorem tail_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
         0 < sj4.val ∧ sj4.val < si.nb.val ∧ contains_int schain sj4 = ok false ∧
         src_enter_scope_ok vg12 tgt cert.tvid tc2 sj4 = ok true ∧ bm_has cert tc2 sj4 = ok true) := by
     by_cases hj : sj4 >= 0#i32
-    · rw [if_pos hj] at hs2
+    · rw [ite_eq_left hj] at hs2
       have hj0 : 0 ≤ sj4.val := by simpa [i32_le_iff] using hj
       refine ⟨fun h => by omega, fun _ => ?_⟩
       obtain ⟨t46, ht46, h1⟩ := bind_eq_ok hs2
@@ -1118,14 +1123,14 @@ theorem tail_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
       have ht50' : t50 = true := by have := ok_inj' h5; revert this; cases t50 <;> simp
       subst ht50'
       by_cases hr : ((decide (sj4 <= 0#i32)) || (decide (sj4 >= si.nb))) = true
-      · rw [if_pos hr] at ht46; cases ok_inj' ht46
-      rw [if_neg hr] at ht46
+      · rw [ite_eq_left hr] at ht46; cases ok_inj' ht46
+      rw [ite_eq_right hr] at ht46
       have hrange : 0 < sj4.val ∧ sj4.val < si.nb.val := by
         simp only [Bool.or_eq_true, decide_eq_true_eq, i32_le_iff, ge_iff_le, i32_zero_val, not_or,
           not_le] at hr
         exact ⟨hr.1, hr.2⟩
       exact ⟨rfl, rfl, rfl, hrange.1, hrange.2, bind_id_ok ht46, ht49, ht50⟩
-    · rw [if_neg hj] at hs2
+    · rw [ite_eq_right hj] at hs2
       have e1 := ok_inj' hs2
       simp only [Sum.inr.injEq, Prod.mk.injEq] at e1
       obtain ⟨es, ec, ex⟩ := e1
@@ -1254,8 +1259,8 @@ theorem body_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
   obtain ⟨nst, hnst, hb1⟩ := bind_eq_ok hb
   by_cases hilt : i < nst
   swap
-  · rw [if_neg hilt] at hb1; cases ok_inj' hb1
-  rw [if_pos hilt] at hb1
+  · rw [ite_eq_right hilt] at hb1; cases ok_inj' hb1
+  rw [ite_eq_left hilt] at hb1
   obtain ⟨st, hst, hb2⟩ := bind_eq_ok hb1
   obtain ⟨sx1, hsx1, hb3⟩ := bind_eq_ok hb2
   obtain ⟨q4, hq4, hb4⟩ := bind_eq_ok hb3
@@ -1343,7 +1348,7 @@ theorem body_done {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si t
   unfold replay_pair_loop0.body at hb
   obtain ⟨nst, hnst, hb1⟩ := bind_eq_ok hb
   by_cases hilt : i < nst
-  · rw [if_pos hilt] at hb1
+  · rw [ite_eq_left hilt] at hb1
     obtain ⟨st, -, hb2⟩ := bind_eq_ok hb1
     obtain ⟨sx1, -, hb3⟩ := bind_eq_ok hb2
     obtain ⟨q4, -, hb4⟩ := bind_eq_ok hb3
@@ -1373,7 +1378,7 @@ theorem body_done {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si t
     obtain ⟨schain2, sc2, sx6⟩ := q
     simp only at hb12
     cases ok_inj' hb12
-  · rw [if_neg hilt] at hb1
+  · rw [ite_eq_right hilt] at hb1
     have e := ok_inj' hb1
     simp only [ControlFlow.done.injEq, Sum.inr.injEq] at e
     exact e.symm
@@ -1561,7 +1566,7 @@ theorem body_inl {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti
   unfold replay_pair_loop0.body at hb
   obtain ⟨nst, -, hb1⟩ := bind_eq_ok hb
   by_cases hilt : i < nst
-  · rw [if_pos hilt] at hb1
+  · rw [ite_eq_left hilt] at hb1
     obtain ⟨st, -, hb2⟩ := bind_eq_ok hb1
     obtain ⟨sx1, -, hb3⟩ := bind_eq_ok hb2
     obtain ⟨q4, -, hb4⟩ := bind_eq_ok hb3
@@ -1624,7 +1629,7 @@ theorem body_inl {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti
     obtain ⟨schain2, sc2, sx6⟩ := q
     simp only at hb12
     cases ok_inj' hb12
-  · rw [if_neg hilt] at hb1
+  · rw [ite_eq_right hilt] at hb1
     cases ok_inj' hb1
 
 theorem loop_inl {steps : Pion.Array Step} {src tgt : Func} {cert : Cert} {si ti : FnInfo} :
@@ -1837,8 +1842,8 @@ theorem pair_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
   obtain ⟨hnti1, -⟩ := arr_length_ok hnti
   have hG3 : vg_extends vg3 G := vg_extends_trans e4 hg'G
   have hgoal := hsem (vg_extends_trans e3 hG3) o args res N env N s0 s0 ts
-    ⟨hsb0, by simp, htb0, by simp, le_refl N, by simp [ofList_val], henv, hw,
-      fun x hx => by simp [ofList_val] at hx; rw [hx]; exact hsb0, Bs, Bt,
+    ⟨hsb0, by simp, htb0, by simp, le_refl N, by simp, henv, hw,
+      fun x hx => by simp at hx; rw [hx]; exact hsb0, Bs, Bt,
       by simpa using hin, hhist, by simpa using hrun, by simpa [ofList_val] using htin⟩
     (fun env' n' s0' s' ts' hrs => ?_)
   · obtain ⟨Bt0, m, hBt0, hm⟩ := hgoal
@@ -2074,6 +2079,9 @@ theorem stable_transport {vg G : ValGraph} (hp : vg_extends vg G) {vids : List S
     {x : Nat} {v sb : Std.I32} (hx : vids[x]? = some v) (h0 : 0 ≤ v.val)
     (hm : Valid vg v ∧ Indep vg sb v.val.toNat) :
     ∀ env env', AgreeExcept sb env env' → evI G env' v = evI G env v := by
+  have _ := hv
+  have _ := hx
+  have _ := h0
   intro env env' hag
   rw [extends_evI hp env' hm.1, extends_evI hp env hm.1]
   exact hm.2 env env' hag
@@ -2088,27 +2096,27 @@ theorem cert_ctx {src tgt : Func} {cert : Cert} (h : cert_fail_code src tgt cert
   obtain ⟨w1, hw1, h⟩ := bind_eq_ok h
   obtain ⟨t2, ht2, h⟩ := bind_eq_ok h
   cases t2 with
-  | true => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h; exact absurd (ok_inj' h) (by decide)
+  | true => simp only [↓reduceIte] at h; exact absurd (ok_inj' h) (by decide)
   | false => ?_
-  simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h
+  simp only [Bool.false_eq_true, ↓reduceIte] at h
   have hwf : w1 = 0#i32 ∧ wf_code tgt = ok 0#i32 := by
     by_cases hw0 : w1 = 0#i32
     · subst hw0
-      rw [if_neg (fun hc : (0#i32 : Std.I32) ≠ 0#i32 => hc rfl)] at ht2
+      rw [ite_eq_right (fun hc : (0#i32 : Std.I32) ≠ 0#i32 => hc rfl)] at ht2
       obtain ⟨w2, hw2, ht2⟩ := bind_eq_ok ht2
       have e := ok_inj' ht2
       refine ⟨rfl, ?_⟩
       rw [hw2]; congr 1; simpa using e
-    · rw [if_pos hw0] at ht2; cases ok_inj' ht2
+    · rw [ite_eq_left hw0] at ht2; cases ok_inj' ht2
   obtain ⟨hw10, hwt⟩ := hwf
   rw [hw10] at hw1
   have WS := wf_code_sound hw1
   have WT := wf_code_sound hwt
   obtain ⟨t3, ht3, h⟩ := bind_eq_ok h
   cases t3 with
-  | false => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h; exact absurd (ok_inj' h) (by decide)
+  | false => simp only [Bool.not_false, ↓reduceIte] at h; exact absurd (ok_inj' h) (by decide)
   | true => ?_
-  simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h
+  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
   have hdag := check_vg_dag_sound ht3
   obtain ⟨si, hsi, h⟩ := bind_eq_ok h
   obtain ⟨ti, hti, h⟩ := bind_eq_ok h
@@ -2117,18 +2125,16 @@ theorem cert_ctx {src tgt : Func} {cert : Cert} (h : cert_fail_code src tgt cert
   obtain ⟨t6, ht6, h⟩ := bind_eq_ok h
   obtain ⟨t8, ht8, h⟩ := bind_eq_ok h
   cases t8 with
-  | true => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h; exact absurd (ok_inj' h) (by decide)
+  | true => simp only [↓reduceIte] at h; exact absurd (ok_inj' h) (by decide)
   | false => ?_
-  simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h
+  simp only [Bool.false_eq_true, ↓reduceIte] at h
   have hvids : vids_ok cert.vg cert.svid si.nt = ok true ∧ vids_ok cert.vg cert.tvid ti.nt = ok true := by
     cases t6 with
     | false =>
-      simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true,
-        if_false] at ht8
+      simp only [Bool.not_false, ↓reduceIte] at ht8
       all_goals cases ok_inj' ht8
     | true =>
-      simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true,
-        if_false] at ht8
+      simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ht8
       obtain ⟨t7, ht7, ht8⟩ := bind_eq_ok ht8
       cases t7 with
       | false => cases ok_inj' ht8
@@ -2139,31 +2145,31 @@ theorem cert_ctx {src tgt : Func} {cert : Cert} (h : cert_fail_code src tgt cert
   obtain ⟨t10, vg1⟩ := q10
   try simp only [uncurry_apply_pair] at h
   cases t10 with
-  | false => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h; exact absurd (ok_inj' h) (by decide)
+  | false => simp only [Bool.not_false, ↓reduceIte] at h; exact absurd (ok_inj' h) (by decide)
   | true => ?_
-  simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h
+  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
   obtain ⟨e1, d1, hsd⟩ := check_src_defs_sound hq10 rfl hdag IS hsv
   obtain ⟨q12, hq12, h⟩ := bind_eq_ok h
   obtain ⟨t12, vg2⟩ := q12
   try simp only [uncurry_apply_pair] at h
   cases t12 with
-  | false => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h; exact absurd (ok_inj' h) (by decide)
+  | false => simp only [Bool.not_false, ↓reduceIte] at h; exact absurd (ok_inj' h) (by decide)
   | true => ?_
-  simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h
+  simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h
   obtain ⟨e2, d2, htd⟩ := check_tgt_defs_sound hq12 rfl d1 IT (vidsOK_extends e1 htv)
   obtain ⟨ids, hids, h⟩ := bind_eq_ok h
   obtain ⟨t14, ht14, h⟩ := bind_eq_ok h
   by_cases h14 : t14 = 0#i32
   swap
-  · rw [if_pos h14] at h; exact absurd (ok_inj' h) (by decide)
-  rw [if_neg (not_not.mpr h14)] at h
+  · rw [ite_eq_left h14] at h; exact absurd (ok_inj' h) (by decide)
+  rw [ite_eq_right (not_not.mpr h14)] at h
   rw [h14] at ht14
   have AS := check_avail_sound ht14 IS
   obtain ⟨t15, ht15, h⟩ := bind_eq_ok h
   by_cases h15 : t15 = 0#i32
   swap
-  · rw [if_pos h15] at h; exact absurd (ok_inj' h) (by decide)
-  rw [if_neg (not_not.mpr h15)] at h
+  · rw [ite_eq_left h15] at h; exact absurd (ok_inj' h) (by decide)
+  rw [ite_eq_right (not_not.mpr h15)] at h
   rw [h15] at ht15
   have AT := check_avail_sound ht15 IT
   have hv2s : VidsOK vg2 cert.svid.val := vidsOK_extends (vg_extends_trans e1 e2) hsv
@@ -2173,8 +2179,8 @@ theorem cert_ctx {src tgt : Func} {cert : Cert} (h : cert_fail_code src tgt cert
   try simp only [uncurry_apply_pair] at h
   by_cases h17 : t17 = 0#i32
   swap
-  · rw [if_pos h17] at h; exact absurd (ok_inj' h) (by decide)
-  rw [if_neg (not_not.mpr h17)] at h
+  · rw [ite_eq_left h17] at h; exact absurd (ok_inj' h) (by decide)
+  rw [ite_eq_right (not_not.mpr h17)] at h
   obtain ⟨e3, d3, hfa⟩ := check_facts_sound hq17 h17 d2 IS hv2s
   dsimp only at e3 d3 hfa
   -- the first pair
@@ -2182,14 +2188,14 @@ theorem cert_ctx {src tgt : Func} {cert : Cert} (h : cert_fail_code src tgt cert
   obtain ⟨t20, ht20, h⟩ := bind_eq_ok h
   obtain ⟨t22, ht22, h⟩ := bind_eq_ok h
   cases t22 with
-  | true => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h; exact absurd (ok_inj' h) (by decide)
+  | true => simp only [↓reduceIte] at h; exact absurd (ok_inj' h) (by decide)
   | false => ?_
-  simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at h
+  simp only [Bool.false_eq_true, ↓reduceIte] at h
   have hp0 : ∃ p, cert.pairs.val[0]? = some p ∧ p.sb = 0#i32 ∧ p.tb = 0#i32 := by
     cases t20 with
-    | true => simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at ht22; cases ok_inj' ht22
+    | true => simp only [↓reduceIte] at ht22; cases ok_inj' ht22
     | false =>
-      simp only [Bool.not_false, Bool.not_true, Bool.false_eq_true, eq_self_iff_true, ↓reduceIte, if_true, if_false] at ht22
+      simp only [Bool.false_eq_true, ↓reduceIte] at ht22
       obtain ⟨pa, hpa, ht22⟩ := bind_eq_ok ht22
       have h22 := ok_inj' ht22
       split at ht20
@@ -2268,7 +2274,7 @@ theorem src_start {G : ValGraph} {src : Func} {si : FnInfo} {svid : List Std.I32
       (by rw [i32n_toNat (by omega)]; exact hBs)
     have hidx : idx Bs.insts.val (i32n i) = some inst := by
       unfold idx
-      rw [if_pos (by rw [i32n_val (by omega)]; omega), i32n_toNat (by omega)]
+      rw [ite_eq_left (by rw [i32n_val (by omega)]; omega), i32n_toNat (by omega)]
       exact hii
     rw [enterEnv_eff o args base (i32n 0) Bs (-1) s0.regs s0 c (i32n i) inst hidx hl, i32n_toNat (by omega)]
 

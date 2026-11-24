@@ -48,8 +48,9 @@ theorem i32_ne_iff {a b : Std.I32} : a ≠ b ↔ a.val ≠ b.val :=
   ⟨fun h e => h (i32_ext e), fun h e => h (by rw [e])⟩
 
 theorem getElem?_toNat {α : Type} {l : List α} {i : Std.I32} (h0 : 0 ≤ i.val)
-    (h : i.val.toNat < l.length) : l[i.val.toNat]? = some (l[i.val.toNat]'h) :=
-  List.getElem?_eq_getElem h
+    (h : i.val.toNat < l.length) : l[i.val.toNat]? = some (l[i.val.toNat]'h) := by
+  have _ := h0
+  exact List.getElem?_eq_getElem h
 
 /-- A loop over `[i0, n)` that stops early with `inl` or finishes with `inr`: the
 generic shape of every `for` / `while` scan of `validate.pion`. -/
@@ -160,7 +161,7 @@ theorem is_edge_true {f : Func} {p s : Std.I32} (h : is_edge f p s = ok true) :
   have hk := key 0#i32 r hr (by simp)
   cases r with
   | inl b =>
-    try simp only [uncurry_apply_pair] at h
+    try simp only at h
     have hb : b = true := ok_inj' h
     obtain ⟨_, _, _, hk, _⟩ := hk
     exact ⟨B, hp0, by rw [getElem?_toNat hp0 hpl, hpB], hk hb⟩
@@ -614,11 +615,11 @@ theorem wf_loop1_early (phis : Pion.Array Phi) (nt nb : Std.I32) :
       obtain ⟨s, hs, hc⟩ := bind_eq_ok hc
       cases s with
       | inl r' =>
-        try simp only [uncurry_apply_pair] at hc
+        try simp only at hc
         cases ok_inj' hc
         exact wf_loop2_early _ _ _ _ _ hs
       | inr _ =>
-        try simp only [uncurry_apply_pair] at hc
+        try simp only at hc
         cases ok_inj' hc
   · cases ok_inj' hc
 
@@ -637,7 +638,7 @@ theorem wf_loop3_early (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : 
     obtain ⟨s, hs, hc⟩ := bind_eq_ok hc
     cases s with
     | inl r' =>
-      try simp only [uncurry_apply_pair] at hc
+      try simp only at hc
       cases ok_inj' hc
       split at hs
       · split at hs
@@ -647,7 +648,7 @@ theorem wf_loop3_early (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : 
           · cases ok_inj' hs
       · cases ok_inj' hs
     | inr seen2 =>
-      try simp only [uncurry_apply_pair] at hc
+      try simp only at hc
       obtain ⟨t18, -, hc⟩ := bind_eq_ok hc
       split at hc
       · cases ok_inj' hc; decide
@@ -655,7 +656,7 @@ theorem wf_loop3_early (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : 
         obtain ⟨s1, hs1, hc⟩ := bind_eq_ok hc
         cases s1 with
         | inl r1 =>
-          try simp only [uncurry_apply_pair] at hc
+          try simp only at hc
           cases ok_inj' hc
           split at hs1
           · obtain ⟨t20, -, hs1⟩ := bind_eq_ok hs1
@@ -666,7 +667,7 @@ theorem wf_loop3_early (insts : Pion.Array Inst) (b : Std.I32) (f : Func) (nt : 
               cases ok_inj' hs1
           · cases ok_inj' hs1
         | inr _ =>
-          try simp only [uncurry_apply_pair] at hc
+          try simp only at hc
           cases ok_inj' hc
   · cases ok_inj' hc
 
@@ -700,7 +701,7 @@ theorem wf_code_sound {f : Func} (h : wf_code f = ok 0#i32) : WFc f := by
   · exact absurd (ok_inj' h) (by decide)
   rename_i htd'
   have hdsts := dsts_ok_sound (by rw [htd]; simpa using htd')
-  try simp only [uncurry_apply_pair] at h
+  try simp only at h
   obtain ⟨s, hs, h⟩ := bind_eq_ok h
   have key := loop_ok_inv
     (fun (p : Std.I32 × Pion.Array Std.I32) => wf_code_loop0.body nb f f.ntemps p.1 p.2)
@@ -725,27 +726,27 @@ theorem wf_code_sound {f : Func} (h : wf_code f = ok 0#i32) : WFc f := by
         rename_i ht4f
         obtain ⟨B5, hB5, hc⟩ := bind_eq_ok hc
         rw [hB] at hB5; cases ok_inj' hB5
-        try simp only [uncurry_apply_pair] at hc
+        try simp only at hc
         obtain ⟨s1, hs1, hc⟩ := bind_eq_ok hc
         cases s1 with
         | inl r =>
-          try simp only [uncurry_apply_pair] at hc
+          try simp only at hc
           rw [← ok_inj' hc]
           exact wf_loop1_early B.phis f.ntemps nb (0#i32, defs) r hs1
         | inr p1 =>
           obtain ⟨i1, defs1⟩ := p1
-          try simp only [uncurry_apply_pair] at hc
+          try simp only at hc
           obtain ⟨B15, hB15, hc⟩ := bind_eq_ok hc
           rw [hB] at hB15; cases ok_inj' hB15
           obtain ⟨s2, hs2, hc⟩ := bind_eq_ok hc
           cases s2 with
           | inl r =>
-            try simp only [uncurry_apply_pair] at hc
+            try simp only at hc
             rw [← ok_inj' hc]
             exact wf_loop3_early B.insts b f f.ntemps (0#i32, false, defs1) r hs2
           | inr p2 =>
             obtain ⟨i2, seen2, defs2⟩ := p2
-            try simp only [uncurry_apply_pair] at hc
+            try simp only at hc
             obtain ⟨B24, hB24, hc⟩ := bind_eq_ok hc
             rw [hB] at hB24; cases ok_inj' hB24
             obtain ⟨s3, hs3, hc⟩ := bind_eq_ok hc
@@ -835,7 +836,7 @@ theorem wf_code_sound {f : Func} (h : wf_code f = ok 0#i32) : WFc f := by
   have hp := key _ s hs ⟨by simp, fun k hk => by simp at hk⟩
   cases s with
   | inl r =>
-    try simp only [uncurry_apply_pair] at h
+    try simp only at h
     exact absurd (ok_inj' h) hp
   | inr p =>
     refine ⟨hpos, hnb2, fun B hB => ((hp 0 hpos) B hB).1 rfl, fun b B hB => ?_, ?_⟩
@@ -867,7 +868,7 @@ theorem count_set_true : ∀ (l : List Bool) (i : Nat), l[i]? = some false →
   | a :: l, 0, h => by
     simp only [List.getElem?_cons_zero, Option.some.injEq] at h
     subst h
-    simp [List.count_cons]
+    simp
   | a :: l, i + 1, h => by
     simp only [List.getElem?_cons_succ] at h
     simp only [List.set_cons_succ, List.count_cons, count_set_true l i h]
@@ -1079,7 +1080,7 @@ theorem build_info_sound {f : Func} {info : FnInfo} (h : build_info f = ok info)
   unfold build_info at h
   obtain ⟨nb, hnb, h⟩ := bind_eq_ok h
   obtain ⟨hnb1, hnb2⟩ := arr_length_ok hnb
-  try simp only [uncurry_apply_pair] at h
+  try simp only at h
   obtain ⟨q0, -, h⟩ := bind_eq_ok h
   obtain ⟨b1, dk1, db1, di1, ninst1⟩ := q0
   try simp only [uncurry_apply_pair] at h
@@ -1121,7 +1122,7 @@ theorem build_info_sound {f : Func} {info : FnInfo} (h : build_info f = ok info)
         simp only [Bool.and_eq_true, decide_eq_true_eq] at hcond
         obtain ⟨hct, hrle⟩ := hcond
         obtain ⟨hr0, hrc⟩ := hch hct
-        try simp only [uncurry_apply_pair] at hc
+        try simp only at hc
         obtain ⟨q, hq, hc⟩ := bind_eq_ok hc
         obtain ⟨x1, reach3, ch2⟩ := q
         rw [← ok_inj' hc]
@@ -1185,9 +1186,14 @@ def trapOp : BinOp → Bool
 theorem is_trapping_binop_spec (op : BinOp) : is_trapping_binop op = ok (trapOp op) := by
   cases op <;> rfl
 
+/-- An `if` whose arms are both `some` is never `none` (the `s = 0` split of `Ror`). -/
+theorem ite_some_some_ne_none {α : Type} (p : Prop) [Decidable p] (a b : α) :
+    ¬((if p then some a else some b) = none) := by
+  split <;> simp
+
 theorem evalBin_some_of_not_trap {op : BinOp} (h : trapOp op = false) (c : Cls) (x y : BitVec 64) :
     evalBin c op x y ≠ none := by
-  cases op <;> simp [trapOp] at h <;> simp [evalBin]
+  cases op <;> simp [trapOp] at h <;> simp [evalBin, ite_some_some_ne_none]
 
 theorem asS_maskC (c : Cls) (x : BitVec 64) : asS c (maskC c x) = asS c x := by
   cases c
@@ -1195,7 +1201,7 @@ theorem asS_maskC (c : Cls) (x : BitVec 64) : asS c (maskC c x) = asS c x := by
     congr 1
     apply BitVec.eq_of_getLsbD_eq
     intro i hi
-    simp [BitVec.getLsbD_setWidth, hi, show i < 64 by omega]
+    simp [hi, show i < 64 by omega]
   · rfl
 
 theorem maskC_neg_maskC (c : Cls) (x : BitVec 64) : maskC c (-(maskC c x)) = maskC c (-x) := by
@@ -1252,7 +1258,7 @@ theorem bin_safe_sound {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
   cases ob with
   | none => simp at h
   | some y =>
-    try simp only [uncurry_apply_pair] at h
+    try simp only at h
     obtain ⟨hy, -⟩ := vg_const_some hob
     have hbv := constOf_evI hd env hy
     obtain ⟨oa, hoa, h⟩ := bind_eq_ok h
@@ -1275,7 +1281,7 @@ theorem bin_safe_sound {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
         split at hr
         · simp at hr
         · rename_i h0
-          have h0' : maskC c y.bv ≠ 0 := fun e => h0 (u64_ext (by simp [e, bv_zero]))
+          have h0' : maskC c y.bv ≠ 0 := fun e => h0 (u64_ext (by simp [e]))
           refine ⟨h0', fun hs hall => ?_⟩
           simp only [hs, ↓reduceIte, bind_ok] at hr
           have hbeq : ((⟨maskC c y.bv⟩ : Std.U64) == ⟨allOnesC c⟩) = true := by simp [hall]
@@ -1286,7 +1292,7 @@ theorem bin_safe_sound {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
       unfold safeDiv at hs ⊢
       simp only [maskC_idem]
       exact hs
-    cases op <;> simp [evalBin, hsm]
+    cases op <;> simp [evalBin, hsm, ite_some_some_ne_none]
 
 /-! ## Branch facts and `apply_facts` -/
 
@@ -1419,7 +1425,7 @@ theorem fact_post_sound {vg : ValGraph} {fs : Pion.Array Fact} {r : Std.I32} {p 
             exact ⟨constOf_evI hd env hy0, h2 hfz, hxv⟩
           cases op
           case CEq cc =>
-            simp only [vg_cls_eq hl, bind_ok] at h
+            simp only at h
             split at h
             · rename_i hcc
               simp only [beq_iff_eq] at hcc
@@ -1433,7 +1439,7 @@ theorem fact_post_sound {vg : ValGraph} {fs : Pion.Array Fact} {r : Std.I32} {p 
               simpa using hx
             · exact hid p (ok_inj' h)
           case CNe cc =>
-            simp only [vg_cls_eq hl, bind_ok] at h
+            simp only at h
             split at h
             · rename_i hcc
               simp only [beq_iff_eq] at hcc
@@ -1474,7 +1480,7 @@ theorem getElem?_set_true_self {l : List Bool} {a : Nat} (h : a < l.length) :
     (l.set a true)[a]? = some true := by simp [h]
 
 theorem getElem?_set_ne' {l : List Bool} {a k : Nat} (h : a ≠ k) (x : Bool) :
-    (l.set a x)[k]? = l[k]? := by simp [List.getElem?_set, h]
+    (l.set a x)[k]? = l[k]? := by simp [h]
 
 /-- The backward marking sweep of `apply_facts` marks every child of a marked node. -/
 theorem mark_loop {vg : ValGraph} {v : Std.I32} (hv : Valid vg v) :
@@ -1632,6 +1638,7 @@ theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bo
       (0 ≤ x.1.val ∧ vg_extends vg x.2.1 ∧ ValGraphDAG x.2.1 ∧ x.2.2.val.length = n0.val.toNat ∧
         MemoOK vg x.2.1 fs.val mark.val x.2.2.val x.1.val.toNat) →
       vg_extends vg r.2.1 ∧ ValGraphDAG r.2.1 ∧ MemoOK vg r.2.1 fs.val mark.val r.2.2.val n0.val.toNat := by
+  have _ := hd
   intro x r h hx
   unfold apply_facts_loop1 at h
   refine loop_ok_inv (fun (x : Std.I32 × ValGraph × Pion.Array Std.I32) =>
@@ -1693,7 +1700,7 @@ theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bo
           cases hm; rfl
         cases n
         case SUn c op a =>
-          try simp only [uncurry_apply_pair] at h
+          try simp only at h
           split at h
           · rename_i hcond
             simp only [Bool.and_eq_true, decide_eq_true_eq, i32_le_iff, i32_lt_iff, i32_zero_val] at hcond
@@ -1714,10 +1721,10 @@ theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bo
             rw [val4 env]; dsimp only
             rw [val3 env, evalUn_argmask, hmval G env (vg_extends_trans (vg_extends_trans e3 e4) hG) hf, hval env]
             simp only [evalNode]
-            rw [if_pos ⟨hcond.1, by omega⟩]
+            rw [ite_eq_left ⟨hcond.1, by omega⟩]
           · exact hid (ok_inj' h).symm
         case SBin c op a b =>
-          try simp only [uncurry_apply_pair] at h
+          try simp only at h
           split at h
           · rename_i hcond
             simp only [Bool.and_eq_true, decide_eq_true_eq, i32_le_iff, i32_lt_iff, i32_zero_val] at hcond
@@ -1749,7 +1756,7 @@ theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bo
               intro env
               rw [hval env]
               simp only [evalNode]
-              rw [if_pos ⟨ha0, by omega⟩, if_pos ⟨hb0, by omega⟩]
+              rw [ite_eq_left ⟨ha0, by omega⟩, ite_eq_left ⟨hb0, by omega⟩]
             obtain ⟨t33, ht33, h⟩ := bind_eq_ok h
             split at h
             · -- a division that may trap keeps its operation
@@ -1781,7 +1788,7 @@ theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bo
               have hok : BinArgOK vg6 c op ua ub := by
                 unfold BinArgOK
                 cases op <;> simp [isCmp, isShift, binArgCls] at c5' c6 ⊢ <;>
-                  first | exact ⟨c5', c6⟩ | exact c5' | trivial
+                  first | exact ⟨c5', c6⟩ | exact c5'
               obtain ⟨e8, d8, v8, -, val8⟩ := vg_canon_bin_sound (pair_ok h) d6 (extends_valid e6 v5) v6 hok
               refine ⟨vg_extends_trans e5 (vg_extends_trans e6 e8), d8, v8, fun G env hG hf => ?_⟩
               obtain ⟨w, hw⟩ := Option.ne_none_iff_exists'.1 (hsafe env)
@@ -1789,7 +1796,7 @@ theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bo
               rw [hA G env (vg_extends_trans e8 hG) hf, hB G env (vg_extends_trans e8 hG) hf, evalBin_argmask] at hw
               rw [hw]; rfl
           · exact hid (ok_inj' h).symm
-        all_goals (try simp only [uncurry_apply_pair] at h); exact hid (ok_inj' h).symm
+        all_goals (try simp only at h); exact hid (ok_inj' h).symm
       obtain ⟨r, vg2⟩ := q2
       obtain ⟨e2, d2, v2, val2⟩ := hstep
       dsimp only at e2 d2 v2 val2
@@ -1855,7 +1862,6 @@ theorem apply_facts_sound {vg : ValGraph} {fs : Pion.Array Fact} {v : Std.I32} {
   have hv0 := hv.1
   have hvl := hv.2
   have hvs := i32_succ_val' (m := vg.nodes.val.length) (i := v) (by have := hv.2; omega) hl
-  try simp only [uncurry_apply_pair] at h
   obtain ⟨mark1, hm1, h⟩ := bind_eq_ok h
   have hm1' := arr_set_ok hm1
   have hn0 : (Pion.I32.add v 1#i32).val.toNat = v.val.toNat + 1 := by omega
@@ -2008,6 +2014,7 @@ theorem atom_use_sound {vg : ValGraph} {vids : Pion.Array Std.I32} {cls : Cls} {
       (0 ≤ p.1.val → Valid p.2 p.1 ∧ clsOf p.2 p.1 = cls ∧
         (∀ t, a = .Temp t → 0 ≤ t.val ∧ ∃ v, vids.val[t.val.toNat]? = some v ∧ Valid vg v) ∧
         ∀ env, evI p.2 env p.1 = maskC cls (atomSem vg env vids.val a)) := by
+  have _ := hv
   unfold atom_use at h
   cases a with
   | Temp t =>
@@ -2156,11 +2163,11 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
           CondAgree vg env vids.val o regs B.term → EdgeTaken o regs B.term s → FactsHold q.2 env q.1.val := by
     rintro vg1 e1 d1 rfl
     exact ⟨e1, d1, fun fa hfa => by simp at hfa, fun _ _ _ _ _ _ _ _ _ fa hfa => by simp at hfa⟩
-  try simp only [uncurry_apply_pair] at h
+  try simp only at h
   generalize hT : B0.term = T at h
   cases T with
   | Jnz c s1 s2 =>
-    try simp only [uncurry_apply_pair] at h
+    try simp only at h
     split at h
     · rename_i hcond
       simp only [Bool.and_eq_true, bne_iff_ne, ne_eq, Bool.or_eq_true, beq_iff_eq] at hcond
@@ -2188,9 +2195,9 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
           simp only [EdgeTaken] at het
           rw [hval]
           constructor
-          · intro hnz; rw [het, if_pos hnz]
+          · intro hnz; rw [het, ite_eq_left hnz]
           · intro hs1 hz
-            rw [het, if_neg (fun hc => hc hz)] at hs1
+            rw [het, ite_eq_right (fun hc => hc hz)] at hs1
             exact hne hs1.symm
         obtain ⟨node, hnode, h⟩ := bind_eq_ok h
         have hnd := nodes_get_ok hnode
@@ -2223,7 +2230,7 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
             intro env; rw [evI_node d1 env hnd]; rfl
           cases op
           case CEq cc =>
-            try simp only [uncurry_apply_pair] at h
+            try simp only at h
             obtain ⟨t5, ht5, h⟩ := bind_eq_ok h
             obtain ⟨t7, ht7, h⟩ := bind_eq_ok h
             split at h
@@ -2236,12 +2243,12 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
               simp only [beq_iff_eq] at h7
               cases ok_inj' h
               refine ⟨e1, d1, fun fa hfa => by
-                  simp only [Pion.Array.push, Pion.Array.ofList, List.append_eq, List.nil_append, List.cons_append, List.mem_cons,
-                    List.mem_singleton, List.not_mem_nil, or_false] at hfa
+                  simp only [Pion.Array.push, Pion.Array.ofList, List.nil_append, List.cons_append, List.mem_cons,
+                    List.not_mem_nil, or_false] at hfa
                   rcases hfa with rfl | rfl <;> rfl,
                 fun B _ hB W o regs env hca het fa hfa => ?_⟩
-              simp only [Pion.Array.push, Pion.Array.ofList, List.append_eq, List.nil_append, List.cons_append, List.mem_cons,
-                List.mem_singleton, List.not_mem_nil, or_false] at hfa
+              simp only [Pion.Array.push, Pion.Array.ofList, List.nil_append, List.cons_append, List.mem_cons,
+                List.not_mem_nil, or_false] at hfa
               rcases hfa with rfl | rfl
               · exact hfirst B hB o regs env hca het
               · have hr := hrun B hB o regs env hca het
@@ -2256,16 +2263,16 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
                 · simp only [beq_iff_eq] at hz
                   by_contra hc
                   apply hr.2 hz
-                  rw [hcv]; simp [hc] <;> exact hc
+                  rw [hcv]; simp; exact hc
                 · simp only [beq_eq_false_iff_ne, ne_eq] at hnz
                   intro hc
                   apply hnz
                   apply hr.1
-                  rw [hcv]; simp [hc] <;> exact hc
+                  rw [hcv]; simp [hc]
             · cases ok_inj' h
               exact hone rfl
           case CNe cc =>
-            try simp only [uncurry_apply_pair] at h
+            try simp only at h
             obtain ⟨t5, ht5, h⟩ := bind_eq_ok h
             obtain ⟨t7, ht7, h⟩ := bind_eq_ok h
             split at h
@@ -2278,12 +2285,12 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
               simp only [beq_iff_eq] at h7
               cases ok_inj' h
               refine ⟨e1, d1, fun fa hfa => by
-                  simp only [Pion.Array.push, Pion.Array.ofList, List.append_eq, List.nil_append, List.cons_append, List.mem_cons,
-                    List.mem_singleton, List.not_mem_nil, or_false] at hfa
+                  simp only [Pion.Array.push, Pion.Array.ofList, List.nil_append, List.cons_append, List.mem_cons,
+                    List.not_mem_nil, or_false] at hfa
                   rcases hfa with rfl | rfl <;> rfl,
                 fun B _ hB W o regs env hca het fa hfa => ?_⟩
-              simp only [Pion.Array.push, Pion.Array.ofList, List.append_eq, List.nil_append, List.cons_append, List.mem_cons,
-                List.mem_singleton, List.not_mem_nil, or_false] at hfa
+              simp only [Pion.Array.push, Pion.Array.ofList, List.nil_append, List.cons_append, List.mem_cons,
+                List.not_mem_nil, or_false] at hfa
               rcases hfa with rfl | rfl
               · exact hfirst B hB o regs env hca het
               · have hr := hrun B hB o regs env hca het
@@ -2299,15 +2306,15 @@ theorem edge_facts_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} 
                   by_contra hc
                   apply hz
                   apply hr.1
-                  rw [hcv]; simp [hc] <;> exact hc
+                  rw [hcv]; simp; exact hc
                 · simp only [Bool.not_eq_false', beq_iff_eq] at hnz
                   intro hc
                   apply hr.2 hnz
-                  rw [hcv]; simp [hc] <;> exact hc
+                  rw [hcv]; simp [hc]
             · cases ok_inj' h
               exact hone rfl
-          all_goals (try simp only [uncurry_apply_pair] at h); exact hone (ok_inj' h).symm
-        all_goals (try simp only [uncurry_apply_pair] at h); exact hone (ok_inj' h).symm
+          all_goals (try simp only at h); exact hone (ok_inj' h).symm
+        all_goals (try simp only at h); exact hone (ok_inj' h).symm
       · cases ok_inj' h
         exact hnil vg1 e1 d1 rfl
     · exact hnil vg (vg_extends_refl _) hd (ok_inj' h).symm
@@ -2338,7 +2345,7 @@ theorem retarget_spec {fs : Pion.Array Fact} {b : Std.I32} {out : Pion.Array Fac
         obtain ⟨_, hfl, hfv⟩ := arr_get_ok hfa
         have hs := i32_succ_val' hlt ht2
         have htake : fs.val.take (i.val.toNat + 1) = fs.val.take i.val.toNat ++ [fa] := by
-          rw [List.take_succ, List.getElem?_eq_getElem hfl, hfv]; rfl
+          rw [List.take_add_one, List.getElem?_eq_getElem hfl, hfv]; rfl
         rw [← ok_inj' hc]
         simp only
         refine ⟨by omega, by omega, ?_⟩
@@ -2605,7 +2612,7 @@ theorem check_facts_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pio
     have his := i32_succ_val' hlt ht2
     obtain ⟨fa, hfa, hc⟩ := bind_eq_ok hc
     obtain ⟨_, hfal, hfav⟩ := arr_get_ok hfa
-    try simp only [uncurry_apply_pair] at hc
+    try simp only at hc
     obtain ⟨t2, ht2', hc⟩ := bind_eq_ok hc
     split at hc
     · rw [← ok_inj' hc]; show (1#i32 : Std.I32) ≠ 0#i32; decide
@@ -2615,7 +2622,7 @@ theorem check_facts_sound {vg : ValGraph} {f : Func} {info : FnInfo} {vids : Pio
       split at ht2'
       · cases ok_inj' ht2'; exact absurd rfl ht2f
       · rename_i hcond
-        simp only [Bool.or_eq_true, decide_eq_true_eq, not_or, not_le, i32_lt_iff, i32_le_iff,
+        simp only [Bool.or_eq_true, decide_eq_true_eq, not_or, not_le, i32_le_iff,
           i32_zero_val, hnb] at hcond
         obtain ⟨t1, ht1', ht2'⟩ := bind_eq_ok ht2'
         obtain ⟨_, ht1l, ht1v⟩ := arr_get_ok ht1'
@@ -2779,7 +2786,7 @@ theorem phiArg_of_index {P : Phi} {prev : Nat} {ai : Nat} (hai : ai < P.arms.val
     rw [h]; rfl
   rw [List.find?_eq_some_iff_getElem]
   refine ⟨by simp [hp], ai, hai, rfl, fun j hj => ?_⟩
-  simp only [decide_eq_true_eq, Bool.not_eq_true', decide_eq_false_iff_not]
+  simp only [Bool.not_eq_true', decide_eq_false_iff_not]
   exact hfirst j hj (by omega)
 
 /-- What `check_avail` certifies. -/
@@ -3197,6 +3204,7 @@ theorem avail_loop10 {np : Std.I32} {f : Func} {sI bI : Std.I32} {cur : Pion.Arr
       | .inl e => e ≠ 0#i32
       | .inr _ => ∀ P ∈ S.phis.val, ∃ a, phiArg P bI.val.toNat = some a ∧
           AvailAtom (fun t => cur.val[t]? = some true) a := by
+  have _ := hs0
   intro q r h hq
   unfold check_avail_loop10 at h
   have key := scan_loop (fun q => check_avail_loop10.body np f sI bI cur q) S.phis.val.length
@@ -3298,9 +3306,8 @@ theorem avail_loop8 {n : Std.I32} {tm : Term} {nb bI nt : Std.I32} {av cur : Pio
         split at hc
         · left; exact ⟨_, (ok_inj' hc).symm, b1_ne0 hb0 hb1⟩
         rename_i hrange
-        simp only [Bool.or_eq_true, decide_eq_true_eq, not_or, not_le, i32_lt_iff, i32_le_iff,
+        simp only [Bool.or_eq_true, decide_eq_true_eq, not_or, not_le, i32_le_iff,
           i32_zero_val, hnb] at hrange
-        try simp only at hc
         obtain ⟨s9, hs9, hc⟩ := bind_eq_ok hc
         have h9 := avail_loop9 hb0 hb1 _ s9 hs9 rfl
         cases s9 with
@@ -3311,7 +3318,6 @@ theorem avail_loop8 {n : Std.I32} {tm : Term} {nb bI nt : Std.I32} {av cur : Pio
           obtain ⟨_, hSl, hSv⟩ := arr_get_ok hS
           obtain ⟨np, hnp, hc⟩ := bind_eq_ok hc
           obtain ⟨hnp1, -⟩ := arr_length_ok hnp
-          try simp only at hc
           obtain ⟨s10, hs10, hc⟩ := bind_eq_ok hc
           have hS' : f.blocks.val[sk.val.toNat]? = some S := by rw [List.getElem?_eq_getElem hSl, hSv]
           have h10 := avail_loop10 hb0 hb1 S (by omega) hS' hnp1 _ s10 hs10 rfl
@@ -3676,7 +3682,7 @@ theorem check_avail_sound {vg : ValGraph} {f : Func} {info : FnInfo} {av : Pion.
             AvailBlock vg f info av vids.val bm_t.val bm_s.val bI.val.toNat) := by
           split at hsres
           · rename_i h4
-            try simp only [uncurry_apply_pair] at hsres
+            try simp only at hsres
             obtain ⟨q2, hq2, hsres⟩ := bind_eq_ok hsres
             obtain ⟨j1, xs1⟩ := q2
             try simp only [uncurry_apply_pair] at hsres
@@ -3702,7 +3708,6 @@ theorem check_avail_sound {vg : ValGraph} {f : Func} {info : FnInfo} {av : Pion.
             obtain ⟨B, hB, hsres⟩ := bind_eq_ok hsres
             obtain ⟨_, hBl, hBv⟩ := arr_get_ok hB
             have hBb : f.blocks.val[bI.val.toNat]? = some B := by rw [List.getElem?_eq_getElem hBl, hBv]
-            try simp only [uncurry_apply_pair] at hsres
             obtain ⟨q6, hq6, hsres⟩ := bind_eq_ok hsres
             obtain ⟨i1, cur2⟩ := q6
             try simp only [uncurry_apply_pair] at hsres
@@ -3713,7 +3718,6 @@ theorem check_avail_sound {vg : ValGraph} {f : Func} {info : FnInfo} {av : Pion.
             dsimp only at h6
             obtain ⟨B2, hB2, hsres⟩ := bind_eq_ok hsres
             rw [hB] at hB2; cases ok_inj' hB2
-            try simp only [uncurry_apply_pair] at hsres
             obtain ⟨s7, hs7, hsres⟩ := bind_eq_ok hsres
             have hcl1 : cur1.val.length = info.nt.val.toNat := by
               rw [h5.1]; simp [Pion.Array.make, listMake]
@@ -3730,7 +3734,6 @@ theorem check_avail_sound {vg : ValGraph} {f : Func} {info : FnInfo} {av : Pion.
             obtain ⟨h7i, h7c⟩ := h7
             obtain ⟨B3, hB3, hsres⟩ := bind_eq_ok hsres
             rw [hB] at hB3; cases ok_inj' hB3
-            try simp only [uncurry_apply_pair] at hsres
             obtain ⟨t35, ht35, hsres⟩ := bind_eq_ok hsres
             split at hsres
             · cases ok_inj' hsres

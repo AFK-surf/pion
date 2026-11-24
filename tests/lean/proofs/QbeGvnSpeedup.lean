@@ -5,7 +5,7 @@ Formally verified equivalence theorems for QBE GVN compile-speed optimizations:
   2. `Trail`: undo-trail restoration for `dwl` phi width marks in `vendor/qbe/copy.c`
      (`defwidthle` / `dwlundo`), including repeated writes and nested rollbacks.
 
-Zero external dependencies, zero `sorry`, pure kernel checks (compatible with
+Zero external dependencies, no unfinished proofs, pure kernel checks (compatible with
 both standalone `lean -DwarningAsError=true` and `scripts/test-lean.sh`).
 -/
 
