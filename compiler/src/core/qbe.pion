@@ -36782,6 +36782,9 @@ fn qbe_probe_expr_ty_with(
     EBinary(op, lhs, rhs, _) =>
       if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" || op == "&&" || op == "||" {
         Some(TBool)
+      } else if op == "<<" || op == ">>" {
+        // A shift has the type of its left operand; the count's type says nothing.
+        qbe_probe_expr_ty_with(g, lhs, hints)
       } else {
         match qbe_probe_expr_ty_with(g, lhs, hints) {
           Some(t) => Some(t)
@@ -36789,6 +36792,7 @@ fn qbe_probe_expr_ty_with(
         }
       }
     EMove(inner, _) => qbe_probe_expr_ty_with(g, inner, hints)
+    EAs(_, ty_e, _) => Some(qbe_resolve_type(g, ty_e))
     ETry(inner, _) =>
       match qbe_probe_expr_ty_with(g, inner, hints) {
         Some(TOption(inner_ty)) => Some(inner_ty)
@@ -37774,6 +37778,89 @@ fn qbe_emit_mono_call(
     j = j + 1
   }
   qval(res, concrete_ret)
+}
+
+///|
+/// `qbe_probe_expr_ty` guessed `Int` / `Int64` but the receiver evaluated to
+/// another type: bind the already evaluated value to a fresh hidden local of
+/// its real type (owned, so an RC value is released with the scope) and run
+/// the ordinary `.to_string()` lowering on it. The receiver is not evaluated
+/// a second time.
+fn qbe_concat_part_heap_to_string(g : QbeGen, iv : QbeVal, sp : Span) -> QbeArgVal {
+  qbe_scope_push(g)
+  let name = "$concat_recv" + qbe_tmp(g)
+  let loc = qbe_define_local(g, name, iv.ty, true)
+  qbe_store_local_slot(g, iv.reg, loc.slot, iv.ty)
+  let r = qbe_emit_method_call(g, EIdent(name, sp), "to_string", [], Some(TString), sp)
+  qbe_scope_pop(g)
+  QbeArgVal::{ qv: r, borrowed: false }
+}
+
+///|
+/// One part of a flattened `pion_str_concat_n` chain. `pion_str_concat_n`
+/// reads only `len` and the `len` payload bytes of each part, always returns a
+/// fresh string and never touches the parts' reference counts. A built-in
+/// `Int` / `Int64` `.to_string()` (no trait dispatch) is therefore formatted
+/// by `pion_strbuf_push_int` into a pseudo `PionString` in its own
+/// nonescaping caller stack slot (32 B: `len` + 24 payload bytes; the 24 B
+/// `PionStrBuf` points at the payload with `cap = 24`) instead of a heap
+/// temporary. A signed 64-bit decimal needs at most 20 bytes plus NUL, so the
+/// buffer never grows (`tests/lean/proofs/QbeConcatScratch.lean`). The part
+/// is reported as borrowed, so no `rc_dec` is ever emitted for the slot.
+/// Each call site owns distinct slots, so parts of one chain never alias and
+/// a loop re-formats into the same slots only after the previous concat
+/// copied them. The receiver is evaluated exactly where the heap path would
+/// evaluate it, which keeps left-to-right order and early exits unchanged.
+fn qbe_concat_part(
+  g : QbeGen,
+  part : Expr,
+  borrow : Bool,
+  borrow_fields : Bool,
+  use_scratch : Bool,
+) -> QbeArgVal {
+  if use_scratch {
+    match part {
+      EMethodCall(inner, "to_string", args, sp) =>
+        if args.length() == 0 && !qbe_has_expected_trait(g, sp) {
+          let is_int = match qbe_probe_expr_ty(g, inner) {
+            Some(TInt) | Some(TInt64) => true
+            _ => false
+          }
+          if is_int {
+            g.block_immut_fields = Map([])
+            let iv = qbe_emit_expr(g, inner, None)
+            g.block_immut_fields = Map([])
+            // Dispatch on the evaluated type, never on the probe alone.
+            // `Int` is a `w` value: sign-extend (`extsw`) like the heap path.
+            let value = match iv.ty {
+              TInt => qbe_as_l(g, iv)
+              TInt64 => iv.reg
+              _ => return qbe_concat_part_heap_to_string(g, iv, sp)
+            }
+            let slot = qbe_tmp(g)
+            let sb = qbe_tmp(g)
+            let cap_p = qbe_tmp(g)
+            let data_p = qbe_tmp(g)
+            let bytes = qbe_tmp(g)
+            let len = qbe_tmp(g)
+            g.fn_allocs.write_string("    " + slot + " =l alloc8 32\n")
+            g.fn_allocs.write_string("    " + sb + " =l alloc8 24\n")
+            qbe_emit(g, cap_p + " =l add " + sb + ", 8")
+            qbe_emit(g, data_p + " =l add " + sb + ", 16")
+            qbe_emit(g, bytes + " =l add " + slot + ", 8")
+            qbe_emit(g, "storel 0, " + sb)
+            qbe_emit(g, "storel 24, " + cap_p)
+            qbe_emit(g, "storel " + bytes + ", " + data_p)
+            qbe_emit(g, "call $pion_strbuf_push_int(l " + sb + ", l " + value + ")")
+            qbe_emit(g, len + " =l loadl " + sb)
+            qbe_emit(g, "storel " + len + ", " + slot)
+            return QbeArgVal::{ qv: qval(slot, TString), borrowed: true }
+          }
+        }
+      _ => ()
+    }
+  }
+  qbe_emit_arg_maybe_borrow_ext(g, part, Some(TString), borrow, borrow_fields)
 }
 
 ///|
@@ -38944,6 +39031,9 @@ fn qbe_emit_expr_inner(
                 }
               }
               let n_parts = parts.length()
+              // Native only: Wasm32 keeps the heap temporaries. The bound
+              // caps the per-call-site frame cost at 8 * 56 B.
+              let use_scratch = !g.target_wasm && n_parts <= 8
               let arr_slot = qbe_tmp(g)
               g.fn_allocs.write_string("    ")
               g.fn_allocs.write_string(arr_slot)
@@ -38955,12 +39045,12 @@ fn qbe_emit_expr_inner(
               let guards = qbe_arg_guards_in_order(g, parts)
               let mut pi = 0
               while pi < n_parts {
-                let pa = qbe_emit_arg_maybe_borrow_ext(
+                let pa = qbe_concat_part(
                   g,
                   parts[pi],
-                  Some(TString),
                   can_borrow,
                   can_borrow_af,
+                  use_scratch,
                 )
                 let sp = qbe_tmp(g)
                 qbe_emit(g, sp + " =l add " + arr_slot + ", " + (pi * 8).to_string())

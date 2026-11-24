@@ -631,6 +631,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_enum_sroa/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC"
 # P108: QbeReadPair hoisted pair headers/bounds & bounded memchr byte scan.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p108_read_pair_and_byte_scan/run_e2e.sh" "$PIONC"
+# P109: native 3..8 part concat_n Int / Int64 `.to_string()` stack scratch parts (SSA + Native + Wasm32 + ASan).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p109_concat_scratch/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"

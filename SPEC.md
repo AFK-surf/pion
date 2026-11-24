@@ -370,7 +370,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `int64_t pion_str_len(void *s);`
 - `int32_t pion_str_byte_at(void *s, int64_t idx);`
 - `void*   pion_str_concat(void *a, void *b);`
-- `void*   pion_str_concat_n(int64_t n, void **parts);` (single-allocation N-way string concatenation)
+- `void*   pion_str_concat_n(int64_t n, void **parts);` (single-allocation N-way string concatenation; reads only `len` and the first `len` payload bytes of each part, never changes a part's reference count and always returns a fresh string, so native codegen may pass caller-stack pseudo strings: 3..8 part chains format built-in `Int`/`Int64` `.to_string()` parts with `pion_strbuf_push_int` into such stack slots)
 - `int32_t pion_str_eq(void *a, void *b);`
 - `int32_t pion_str_cmp(void *a, void *b);`
 - `void*   pion_str_slice(void *s, int64_t start, int64_t end);`
