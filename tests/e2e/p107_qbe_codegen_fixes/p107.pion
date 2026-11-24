@@ -1,0 +1,478 @@
+// P107: Regression suite for qbe.pion & types.pion codegen fixes:
+// 1. Default parameter referencing prior parameter must not capture caller locals;
+//    early `return` inside default preserves caller `mut` writeback and RC cleanup;
+//    TCO self-jump falls back when default args are used; stack-view is disabled
+//    when defaults are present (0 ASan UAF); generic `T` / bounds visible in default.
+// 2a. Default parameter referencing prior optional parameter (`a?`).
+// 2b. Transitive generic `Map(xs.copy())` monomorphization (`wrap[J] -> mk[K]`).
+// 3a/3b. Early `return` / `?` RC cleanup (0 leaks / 0 UAF / 0 double-free).
+// 4. Trait & dyn Trait methods with labelled params (`w~`/`h~`) called positionally.
+// 5. Generic flat struct arrays (`Array[Pair[Int, Int]]`) keep flat 16B layout while
+//    polymorphic functions (`get_first`/`push_pair`/`set_pair`) monomorphize cleanly.
+
+// --- 1 & 2a: Default parameter scoping, early-exit mut writeback, TCO, stack-view, generic T ---
+
+fn pick_prior(x : Int, y~ : Int = x) -> Int {
+  x + y
+}
+
+fn chain_def(a : Int, b~ : Int = a + 1, c~ : Int = b * 2) -> Int {
+  a + b + c
+}
+
+struct Counter {
+  base : Int
+}
+
+fn Counter::calc(self : Counter, step : Int, bonus~ : Int = self.base + step) -> Int {
+  self.base + step + bonus
+}
+
+fn pick_opt(a? : Int, y~ : Int = a.unwrap_or(7)) -> Int {
+  y
+}
+
+// Early return inside default arg must still run caller `mut` writeback & RC cleanup
+fn pick_early_ret(go : Bool, y~ : Int = if go { return 7 } else { 2 }) -> Int {
+  y
+}
+
+fn outer_mut_default(mut n : Int, go : Bool) -> Int {
+  let held = "keep_" + n.to_string()
+  let _ = held
+  n = 41
+  let v = pick_early_ret(go)
+  v + 10
+}
+
+// TCO self-jump with default param referencing prior param
+fn tco_default(x : Int, y~ : Int = x) -> Int {
+  if x == 0 {
+    y
+  } else if x > 100 {
+    tco_default(x - 1, y=y)
+  } else {
+    tco_default(x - 1)
+  }
+}
+
+// Stack-view arg referenced by default param must not UAF under ASan
+struct KeepView {
+  v : StrView
+}
+
+fn keep_view(v : StrView, k~ : StrView = v) -> KeepView {
+  KeepView::{ v: k }
+}
+
+fn make_keep_view() -> KeepView {
+  let s = "hello_" + (1 + 2).to_string()
+  keep_view(s.as_view())
+}
+
+// Generic type parameter `T` visible in default expression explicit type annotation
+fn pick_generic_def[T](x : T, y~ : T = { let saved : T = x; saved }) -> T {
+  y
+}
+
+// Closure in default parameter captures prior param (never caller's shadowing local)
+fn pick_clo_def(x : Int, act~ : (Int) -> Int = fn(n : Int) -> Int { n + x }) -> Int {
+  act(2)
+}
+
+// Nested default-arg early return across inlined outer -> mid -> leaf
+fn nested_def_leaf(go : Bool, v~ : Int = if go { return 7 } else { 2 }) -> Int {
+  v
+}
+
+fn nested_def_mid(go : Bool, v~ : Int = nested_def_leaf(go)) -> Int {
+  v
+}
+
+fn nested_def_outer(go : Bool) -> Int {
+  nested_def_mid(go) + 10
+}
+
+fn nested_def_call(mut n : Int, go : Bool) -> Int {
+  let answer = nested_def_outer(go)
+  n = n + 1
+  100 + answer
+}
+
+// --- 2b: Transitive generic Map(xs.copy()) ---
+
+fn mk_map_len[K](xs : Array[(K, Int)]) -> Int {
+  let m : Map[K, Int] = Map(xs.copy())
+  m.length()
+}
+
+fn wrap_map_len[J](xs : Array[(J, Int)]) -> Int {
+  mk_map_len(xs)
+}
+
+// --- 3a & 3b: Early return / ? RC cleanup ---
+
+struct Item {
+  id : Int
+  name : String
+}
+
+fn make_items(n : Int) -> Array[Item] {
+  [
+    Item::{ id: n, name: "item_" + n.to_string() },
+    Item::{ id: n + 1, name: "item_" + (n + 1).to_string() },
+  ]
+}
+
+fn make_strings(n : Int) -> Array[String] {
+  ["s_" + n.to_string(), "t_" + (n + 1).to_string()]
+}
+
+fn fail_idx(fail : Bool) -> Result[Int, String] {
+  if fail {
+    Err("bad_idx")
+  } else {
+    Ok(1)
+  }
+}
+
+fn test_3a_flat_proj(fail : Bool) -> Result[String, String] {
+  let s = make_items(17)[fail_idx(fail)?].name
+  Ok(s)
+}
+
+fn test_3a_flat_idx(early : Bool) -> Int {
+  let it = make_items(17)[if early { return 21 } else { 1 }]
+  it.id
+}
+
+fn test_3a_nonflat_idx(fail : Bool) -> Result[String, String] {
+  let s = make_strings(5)[fail_idx(fail)?]
+  Ok(s)
+}
+
+struct PairRec {
+  s : String
+  n : Int
+}
+
+fn make_pair_recs() -> Array[PairRec] {
+  [PairRec::{ s: "init_" + (1 + 1).to_string(), n: 1 }]
+}
+
+fn test_3b_push_local(early : Bool) -> Int {
+  let xs : Array[PairRec] = []
+  xs.push(
+    PairRec::{
+      s: "hello_" + (1 + 2).to_string(),
+      n: if early { return 32 } else { 10 },
+    },
+  )
+  xs.length()
+}
+
+fn test_3b_push_temp(early : Bool) -> Int {
+  make_pair_recs().push(
+    PairRec::{
+      s: "tmp_" + (2 + 3).to_string(),
+      n: if early { return 33 } else { 20 },
+    },
+  )
+  99
+}
+
+fn test_3b_arrlit(early : Bool) -> Int {
+  let xs = ["a_" + (1 + 2).to_string(), if early { return 41 } else { "b" }]
+  xs.length()
+}
+
+fn test_3b_tuple(early : Bool) -> Int {
+  let t = ("t_" + (1 + 2).to_string(), if early { return 51 } else { 2 })
+  t.1
+}
+
+fn test_3b_strcat(early : Bool) -> String {
+  ("lhs_" + (1 + 2).to_string()) + (if early { return "ecat" } else { "_rhs" })
+}
+
+fn test_3b_strcat_n(early : Bool) -> String {
+  ("a_" + (1 + 2).to_string()) +
+    ("b_" + (3 + 4).to_string()) +
+    (if early { return "ecatn" } else { "_c" })
+}
+
+fn test_3b_interp(early : Bool) -> String {
+  let prefix = "p_" + (1 + 2).to_string()
+  let e_ret = "einterp"
+  let ok_ret = "ok"
+  "\{prefix}_\{if early { return e_ret } else { ok_ret }}"
+}
+
+fn test_3b_map_set(early : Bool) -> Int {
+  let m : Map[String, Int] = Map([])
+  m.set("k_" + (1 + 2).to_string(), if early { return 61 } else { 7 })
+  m.length()
+}
+
+// --- 4: Trait & dyn Trait methods with labelled params (called positionally per SPEC) ---
+
+trait Boxed {
+  fn area(self : Self, w~ : Int, h~ : Int) -> Int
+}
+
+struct Rect {
+  scale : Int
+}
+
+impl Boxed for Rect {
+  fn area(self : Rect, w~ : Int, h~ : Int) -> Int {
+    self.scale * w * h
+  }
+}
+
+fn bump(mut n : Int, v : Int) -> Int {
+  n = n + 1
+  v
+}
+
+fn call_generic_boxed[T: Boxed](x : T, a : Int, b : Int) -> Int {
+  x.area(a, b)
+}
+
+// --- 5: Generic flat struct arrays + polymorphic functions (monomorphized) ---
+
+struct Pair[A, B] {
+  first : A
+  second : B
+}
+
+fn make_flat_int_pairs() -> Array[Pair[Int, Int]] {
+  let xs : Array[Pair[Int, Int]] = []
+  xs.push(Pair::{ first: 10, second: 20 })
+  xs.push(Pair::{ first: 30, second: 40 })
+  xs
+}
+
+fn get_first[A, B](xs : Array[Pair[A, B]], i : Int) -> A {
+  xs[i].first
+}
+
+fn get_second[A, B](xs : Array[Pair[A, B]], i : Int) -> B {
+  xs[i].second
+}
+
+fn push_and_set_pair[A, B](xs : Array[Pair[A, B]], p : Pair[A, B], q : Pair[A, B]) -> Int {
+  xs.push(p)
+  xs[0] = q
+  xs.length()
+}
+
+fn main(w : World) -> Unit {
+  // 1. Default param referencing prior param + early-ret mut writeback + TCO + stack-view + generic T
+  let x = 99
+  let _ = x
+  let r1_a = pick_prior(5)
+  let a = 100
+  let b = 200
+  let _ = a + b
+  let r1_b = chain_def(3)
+  let step = 500
+  let _ = step
+  let c = Counter::{ base: 10 }
+  let r1_c = c.calc(4)
+  let mut mn = 1
+  let r1_mut_early = outer_mut_default(mut mn, true)
+  let r1_tco = tco_default(3)
+  let kv = make_keep_view()
+  let r1_gen = pick_generic_def(5)
+  let r1_clo = pick_clo_def(5)
+  let mut r1_nn = 0
+  let r1_n1 = nested_def_call(mut r1_nn, true)
+  let r1_n2 = nested_def_call(mut r1_nn, false)
+  io_println(
+    w,
+    "def=" +
+    r1_a.to_string() +
+    "," +
+    r1_b.to_string() +
+    "," +
+    r1_c.to_string() +
+    ",mut=" +
+    r1_mut_early.to_string() +
+    ":" +
+    mn.to_string() +
+    ",tco=" +
+    r1_tco.to_string() +
+    ",view=" +
+    kv.v.to_string() +
+    ",gen=" +
+    r1_gen.to_string() +
+    ",clo=" +
+    r1_clo.to_string() +
+    ",nest=" +
+    r1_n1.to_string() +
+    ":" +
+    r1_n2.to_string() +
+    ":" +
+    r1_nn.to_string(),
+  )
+
+  // 2a. Default param referencing prior optional param
+  let r2a_1 = pick_opt()
+  let r2a_2 = pick_opt(a=42)
+  let r2a_3 = {
+    let a : Option[Int] = Some(88)
+    let _ = a
+    pick_opt()
+  }
+  let r2a_4 = {
+    let a : Option[Int] = None
+    let _ = a
+    pick_opt()
+  }
+  io_println(
+    w,
+    "opt=" +
+    r2a_1.to_string() +
+    "," +
+    r2a_2.to_string() +
+    "," +
+    r2a_3.to_string() +
+    "," +
+    r2a_4.to_string(),
+  )
+
+  // 2b. Transitive generic Map(xs.copy())
+  let r2b_int = wrap_map_len([(3, 4), (3, 9)])
+  let r2b_str = wrap_map_len([("a", 1), ("b", 2), ("a", 3)])
+  let r2b_tup = wrap_map_len([((1, 2), 10), ((1, 2), 20), ((1, 3), 30)])
+  io_println(
+    w,
+    "map=" +
+    r2b_int.to_string() +
+    "," +
+    r2b_str.to_string() +
+    "," +
+    r2b_tup.to_string(),
+  )
+
+  // 3a & 3b. Early return / ? RC cleanup
+  let e1 = match test_3a_flat_proj(true) {
+    Ok(v) => v
+    Err(e) => e
+  }
+  let e2 = match test_3a_flat_proj(false) {
+    Ok(v) => v
+    Err(e) => e
+  }
+  let e3 = test_3a_flat_idx(true)
+  let e4 = test_3a_flat_idx(false)
+  let e5 = match test_3a_nonflat_idx(true) {
+    Ok(v) => v
+    Err(e) => e
+  }
+  let e6 = test_3b_push_local(true)
+  let e7 = test_3b_push_local(false)
+  let e8 = test_3b_push_temp(true)
+  let e9 = test_3b_push_temp(false)
+  let e10 = test_3b_arrlit(true)
+  let e11 = test_3b_tuple(true)
+  let e12 = test_3b_strcat(true)
+  let e13 = test_3b_strcat_n(true)
+  let e14 = test_3b_interp(true)
+  let e15 = test_3b_map_set(true)
+  io_println(
+    w,
+    "rc=" +
+    e1 +
+    "," +
+    e2 +
+    "," +
+    e3.to_string() +
+    "," +
+    e4.to_string() +
+    "," +
+    e5 +
+    "," +
+    e6.to_string() +
+    "," +
+    e7.to_string() +
+    "," +
+    e8.to_string() +
+    "," +
+    e9.to_string() +
+    "," +
+    e10.to_string() +
+    "," +
+    e11.to_string() +
+    "," +
+    e12 +
+    "," +
+    e13 +
+    "," +
+    e14 +
+    "," +
+    e15.to_string(),
+  )
+
+  // 4. Trait & dyn Trait labelled params called positionally (with side effects)
+  let rect = Rect::{ scale: 2 }
+  let mut calls = 0
+  let t_pos = rect.area(bump(mut calls, 3), bump(mut calls, 4))
+  let t_gen = call_generic_boxed(rect, 3, 4)
+  let d : dyn Boxed = rect
+  let mut dcalls = 0
+  let t_dyn_pos = d.area(bump(mut dcalls, 3), bump(mut dcalls, 5))
+  io_println(
+    w,
+    "trait=" +
+    t_pos.to_string() +
+    ",calls=" +
+    calls.to_string() +
+    ",gen=" +
+    t_gen.to_string() +
+    ",dyn=" +
+    t_dyn_pos.to_string() +
+    ",dcalls=" +
+    dcalls.to_string(),
+  )
+
+  // 5. Generic flat struct arrays + polymorphic functions (get/push/set)
+  let fp = make_flat_int_pairs()
+  let ps : Array[Pair[String, Array[Int]]] = [
+    Pair::{ first: "hello", second: [1, 2] },
+    Pair::{ first: "world", second: [3, 4, 5] },
+  ]
+  let pi : Array[Pair[Int, String]] = [
+    Pair::{ first: 11, second: "eleven" },
+    Pair::{ first: 22, second: "twenty-two" },
+  ]
+  let f1 = get_first(ps, 1)
+  let s1 = get_second(ps, 1)
+  let f2 = get_first(pi, 0)
+  let s2 = get_second(pi, 1)
+  let plen = push_and_set_pair(
+    ps,
+    Pair::{ first: "third", second: [6] },
+    Pair::{ first: "zero", second: [0] },
+  )
+  io_println(
+    w,
+    "poly=" +
+    f1 +
+    "," +
+    s1.length().to_string() +
+    "," +
+    f2.to_string() +
+    "," +
+    s2 +
+    ",len=" +
+    plen.to_string() +
+    ",p0=" +
+    get_first(ps, 0) +
+    ",fp=" +
+    get_first(fp, 1).to_string() +
+    ":" +
+    get_second(fp, 0).to_string(),
+  )
+}

@@ -612,6 +612,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p75a_compact_i8_f32/run_e2e.sh" "$PION
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p75b_simd_primitives/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p72a_flat_pod_opt/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p106_flat_array_field_proj/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p107_qbe_codegen_fixes/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74c_licm_alias_soundness/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74d_float_to_int_sat/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p74f_xpkg_pod_borrow_soundness/run_e2e.sh" "$PIONC"
