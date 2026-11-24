@@ -884,4 +884,154 @@ if [ "$OUT_CHOST" != "c_host ok t=1,2,3 opt=0,2 score=100,2" ]; then
   exit 1
 fi
 
+# Regression: qualified local generic struct inside monomorphized closure calling erased generic fn/method
+# (matches invar/packages/view/src/list_window.pion: Sight[K] + Places[K] + sg.first == k with K=Int)
+mkdir -p "$TMP_DIR/qmono/view/src" "$TMP_DIR/qmono/app/src"
+cat > "$TMP_DIR/qmono/view/pion.toml" <<'EOF'
+[package]
+name = "view"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/qmono/view/src/lib.pion" <<'EOF'
+pub struct Places[K] {
+  items : Array[K]
+}
+
+pub fn Places::length[K](self : Places[K]) -> Int {
+  self.items.length()
+}
+
+pub fn Places::key[K](self : Places[K], idx : Int) -> K {
+  self.items[idx]
+}
+
+pub struct Sight[K] {
+  first : K
+  last : K
+  whole : Option[K]
+}
+
+pub struct RefBox[T] {
+  mut v : T
+}
+
+pub fn sight_counted[K](all : Places[K]) -> Option[Sight[K]] {
+  if all.length() == 0 {
+    None
+  } else {
+    let f = all.key(0)
+    let l = all.key(all.length() - 1)
+    Some(Sight::{ first: f, last: l, whole: Some(f) })
+  }
+}
+
+pub fn opt_eq[K](a : Option[K], b : Option[K]) -> Bool {
+  match a {
+    None =>
+      match b {
+        None => true
+        Some(_) => false
+      }
+    Some(x) =>
+      match b {
+        None => false
+        Some(y) => x == y
+      }
+  }
+}
+
+pub struct ListPlace[K] {
+  all : Places[K]
+  fading : RefBox[Option[(K, Double)]]
+}
+
+pub fn make_sight_fn[K](lp : ListPlace[K]) -> () -> Option[Sight[K]] {
+  let all = lp.all
+  let fading = lp.fading
+  fn() -> Option[Sight[K]] {
+    match sight_counted(all) {
+      Some(sg) =>
+        match fading.v {
+          Some(fd) if all.length() >= 2 => {
+            let k = fd.0
+            let over = all.key(all.length() - 2)
+            Some(Sight::{
+              ..sg,
+              first: if sg.first == k { over } else { sg.first },
+              last: if sg.last == k { over } else { sg.last },
+              whole: if opt_eq(sg.whole, Some(k)) { Some(over) } else { sg.whole },
+            })
+          }
+          _ => Some(sg)
+        }
+      other => other
+    }
+  }
+}
+
+pub fn run_window[K](lp : ListPlace[K]) -> Option[Sight[K]] {
+  let f = make_sight_fn(lp)
+  f()
+}
+EOF
+cat > "$TMP_DIR/qmono/app/pion.toml" <<'EOF'
+[package]
+name = "qapp"
+version = "0.1.0"
+
+[dependencies]
+view = { path = "../view" }
+EOF
+cat > "$TMP_DIR/qmono/app/src/main.pion" <<'EOF'
+import "view"
+
+pub fn main(world : World) -> Int {
+  let lp = view::ListPlace::{
+    all: view::Places::{ items: [10, 20, 30] },
+    fading: view::RefBox::{ v: Some((10, 1.5)) },
+  }
+  let res = view::run_window(lp)
+  let out1 = match res {
+    Some(sg) => {
+      let w = match sg.whole {
+        Some(x) => x.to_string()
+        None => "none"
+      }
+      "first=" + sg.first.to_string() + " last=" + sg.last.to_string() + " whole=" + w
+    }
+    None => "none"
+  }
+  let lp_d = view::ListPlace::{
+    all: view::Places::{ items: [0.0, 2.5, 3.5] },
+    fading: view::RefBox::{ v: Some((-0.0, 1.5)) },
+  }
+  let res_d = view::run_window(lp_d)
+  let out2 = match res_d {
+    Some(sg) => {
+      let w = match sg.whole {
+        Some(x) => x.to_string()
+        None => "none"
+      }
+      "dfirst=" + sg.first.to_string() + " dlast=" + sg.last.to_string() + " dwhole=" + w
+    }
+    None => "none"
+  }
+  io_println(world, "qmono ok " + out1 + " " + out2)
+  0
+}
+EOF
+EXP_QMONO="qmono ok first=20 last=30 whole=20 dfirst=2.5 dlast=3.5 dwhole=2.5"
+OUT_QMONO_DEV=$("$PIONC" run "$TMP_DIR/qmono/app")
+echo "p89_unit_enum qmono dev -> $OUT_QMONO_DEV"
+if [ "$OUT_QMONO_DEV" != "$EXP_QMONO" ]; then
+  echo "FAIL: p89 qmono dev mismatch: $OUT_QMONO_DEV" >&2
+  exit 1
+fi
+OUT_QMONO_REL=$("$PIONC" run --release "$TMP_DIR/qmono/app")
+echo "p89_unit_enum qmono release -> $OUT_QMONO_REL"
+if [ "$OUT_QMONO_REL" != "$EXP_QMONO" ]; then
+  echo "FAIL: p89 qmono release mismatch: $OUT_QMONO_REL" >&2
+  exit 1
+fi
+
 echo "p89_unit_enum: ALL PASSED"
