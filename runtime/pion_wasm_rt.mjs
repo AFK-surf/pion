@@ -61,34 +61,80 @@ function getBuiltin(name) {
 const textDecoder = new TextDecoder("utf-8", { fatal: false });
 const textEncoder = new TextEncoder();
 
-function formatG(v, sigDigits) {
+const _f64Buf = new ArrayBuffer(8);
+const _f64Arr = new Float64Array(_f64Buf);
+const _u64Arr = new BigUint64Array(_f64Buf);
+
+function c99Pow(x, y) {
+  if (y === 0) return 1.0;
+  if (x === 1) return 1.0;
+  if (x === -1 && (y === Infinity || y === -Infinity)) return 1.0;
+  return Math.pow(x, y);
+}
+
+function c99Round(x) {
+  if (!Number.isFinite(x) || x === 0) return x;
+  const ax = Math.abs(x);
+  const fl = Math.floor(ax);
+  const res = (ax - fl >= 0.5) ? (fl + 1) : fl;
+  return x < 0 ? -res : res;
+}
+
+export function formatG(v, sigDigits) {
   if (Number.isNaN(v)) return "nan";
   if (v === Infinity) return "inf";
   if (v === -Infinity) return "-inf";
   if (v === 0) return Object.is(v, -0) ? "-0" : "0";
-  const abs = Math.abs(v);
-  const exp = Math.floor(Math.log10(abs));
-  let s;
-  if (exp < -4 || exp >= sigDigits) {
-    s = v.toExponential(sigDigits - 1);
-    // Strip trailing zeros in mantissa before 'e'
-    const eIdx = s.indexOf("e");
-    let mant = s.slice(0, eIdx);
-    let expo = s.slice(eIdx + 1);
-    if (mant.includes(".")) {
-      mant = mant.replace(/\.?0+$/, "");
-    }
-    const sign = expo[0];
-    let digits = expo.slice(1);
-    if (digits.length < 2) digits = "0" + digits;
-    s = mant + "e" + sign + digits;
-  } else {
-    s = v.toPrecision(sigDigits);
-    if (s.includes(".")) {
-      s = s.replace(/\.?0+$/, "");
-    }
+  _f64Arr[0] = v;
+  const bits = _u64Arr[0];
+  const sign = (bits >> 63n) !== 0n;
+  const rawExp = Number((bits >> 52n) & 0x7ffn);
+  const frac = bits & 0xfffffffffffffn;
+  const mant = rawExp === 0 ? frac : ((1n << 52n) | frac);
+  const e2 = rawExp === 0 ? -1074 : (rawExp - 1075);
+  const p = sigDigits > 0 ? sigDigits : 1;
+  let e10 = Math.floor(Math.log10(Math.abs(v)));
+  const num = e2 >= 0 ? (mant << BigInt(e2)) : mant;
+  const den = e2 >= 0 ? 1n : (1n << BigInt(-e2));
+  const shift = (p - 1) - e10;
+  let sNum = shift >= 0 ? (num * (10n ** BigInt(shift))) : num;
+  let sDen = shift >= 0 ? den : (den * (10n ** BigInt(-shift)));
+  const low = 10n ** BigInt(p - 1);
+  const high = low * 10n;
+  while (sNum < low * sDen) {
+    e10 -= 1;
+    sNum *= 10n;
   }
-  return s;
+  while (sNum >= high * sDen) {
+    e10 += 1;
+    sDen *= 10n;
+  }
+  let q = sNum / sDen;
+  const rem = sNum % sDen;
+  const twiceRem = rem << 1n;
+  if (twiceRem > sDen || (twiceRem === sDen && (q & 1n) === 1n)) {
+    q += 1n;
+  }
+  if (q === high) {
+    q = low;
+    e10 += 1;
+  }
+  const digits = q.toString();
+  const pfx = sign ? "-" : "";
+  if (e10 < -4 || e10 >= p) {
+    const trimmed = digits.replace(/0+$/, "");
+    const mantStr = trimmed.length === 1 ? trimmed : (trimmed[0] + "." + trimmed.slice(1));
+    const expSign = e10 >= 0 ? "+" : "-";
+    const expAbs = Math.abs(e10).toString().padStart(2, "0");
+    return pfx + mantStr + "e" + expSign + expAbs;
+  }
+  if (e10 < 0) {
+    const trimmed = digits.replace(/0+$/, "");
+    return pfx + "0." + "0".repeat(-e10 - 1) + trimmed;
+  }
+  const intPart = digits.slice(0, e10 + 1);
+  const fracPart = digits.slice(e10 + 1).replace(/0+$/, "");
+  return fracPart.length > 0 ? (pfx + intPart + "." + fracPart) : (pfx + intPart);
 }
 
 function splitmix64(x) {
@@ -661,7 +707,7 @@ export function createPionRuntime(options = {}) {
   const pion_math_ceil = (x) => Math.ceil(x);
   const pion_math_sin = (x) => Math.sin(x);
   const pion_math_cos = (x) => Math.cos(x);
-  const pion_math_pow = (x, y) => Math.pow(x, y);
+  const pion_math_pow = (x, y) => c99Pow(x, y);
 
   // --- String ---
   function pion_str_from_cstr(cstrPtr, len) {
@@ -2133,16 +2179,28 @@ export function createPionRuntime(options = {}) {
       // Math & C libm functions emitted directly by qbe.pion
       pion_math_sqrt, pion_math_abs, pion_math_floor, pion_math_ceil,
       pion_math_sin, pion_math_cos, pion_math_pow,
-      sqrt: Math.sqrt, fabs: Math.abs, floor: Math.floor, ceil: Math.ceil,
-      round: (x) => (x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
-      trunc: Math.trunc, sin: Math.sin, cos: Math.cos, pow: Math.pow,
+      sqrt: Math.sqrt, cbrt: Math.cbrt, fabs: Math.abs, floor: Math.floor, ceil: Math.ceil,
+      round: c99Round,
+      trunc: Math.trunc, sin: Math.sin, cos: Math.cos, tan: Math.tan,
+      asin: Math.asin, acos: Math.acos, atan: Math.atan, pow: c99Pow,
       atan2: Math.atan2, log: Math.log, log1p: Math.log1p, exp: Math.exp, fmod: (a, b) => a % b,
-      roundf: (x) => Math.fround(x >= 0 ? Math.floor(x + 0.5) : Math.ceil(x - 0.5)),
+      roundf: (x) => Math.fround(c99Round(Math.fround(x))),
       truncf: (x) => Math.fround(Math.trunc(x)),
       floorf: (x) => Math.fround(Math.floor(x)),
       ceilf: (x) => Math.fround(Math.ceil(x)),
       fabsf: (x) => Math.fround(Math.abs(x)),
       sqrtf: (x) => Math.fround(Math.sqrt(x)),
+      cbrtf: (x) => Math.fround(Math.cbrt(x)),
+      powf: (x, y) => Math.fround(c99Pow(x, y)),
+      expf: (x) => Math.fround(Math.exp(x)),
+      logf: (x) => Math.fround(Math.log(x)),
+      sinf: (x) => Math.fround(Math.sin(x)),
+      cosf: (x) => Math.fround(Math.cos(x)),
+      tanf: (x) => Math.fround(Math.tan(x)),
+      atan2f: (y, x) => Math.fround(Math.atan2(y, x)),
+      asinf: (x) => Math.fround(Math.asin(x)),
+      acosf: (x) => Math.fround(Math.acos(x)),
+      atanf: (x) => Math.fround(Math.atan(x)),
 
       // String
       pion_str_from_cstr, pion_str_len, pion_str_byte_at,

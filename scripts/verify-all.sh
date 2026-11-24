@@ -222,6 +222,8 @@ sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p91_data_ptr_safety/run_e2e.sh" "$PIONC2"
 # Wave I1: pionc test single-pkg default + deps_skipped + parallel check+emit & c_sources + --version abi_rev.
 sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC2"
+# Wave I3: zero-byte math primitives, exact Double::to_string, panic path sanitization & Web Wasm host bridge.
+sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="

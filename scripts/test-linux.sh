@@ -64,10 +64,13 @@ if [ "$LIB_SIZE" -ge 65536 ]; then
   echo "FAIL: libpionrt.a (${LIB_SIZE} bytes) exceeds 64 KB budget" >&2
   exit 1
 fi
+"$CC" -std=c11 "$RT_OPT" $RT_EXTRA -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident -Wall -Wextra -Werror -c "$RT_DIR/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
+rm -f "$OUT_DIR/libpionrt_cli.a"
+ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
 
 echo "=== [3/6] Runtime Unit + MT + 4-Core Speedup + P6-A Stdlib (test_rt.c) ==="
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
-  "$RT_DIR/test_rt.c" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$OUT_DIR/test_rt_linux"
+  "$RT_DIR/test_rt.c" "$RT_DIR/pion_cli.c" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$OUT_DIR/test_rt_linux"
 if ! "$OUT_DIR/test_rt_linux" > "$TMP_DIR/test_rt.out" 2>&1; then
   cat "$TMP_DIR/test_rt.out"
   exit 1
@@ -187,7 +190,7 @@ else
   "$OUT_DIR/qbe" -t "$LINUX_TARGET" -o "$TMP_DIR/pionc_linux.s" "$PION_LINUX_SSA"
   "$CC" -c "$TMP_DIR/pionc_linux.s" -o "$OUT_DIR/pionc_linux.o"
 fi
-"$CC" "$OUT_DIR/pionc_linux.o" "$OUT_DIR/libpionrt.a" -lm -lpthread -o "$OUT_DIR/pionc_linux"
+"$CC" "$OUT_DIR/pionc_linux.o" "$OUT_DIR/libpionrt_cli.a" -lm -lpthread -o "$OUT_DIR/pionc_linux"
 T_B1="$(now_ms)"
 PIONC_O_FILE="$(file "$OUT_DIR/pionc_linux.o")"
 echo "$PIONC_O_FILE"
@@ -217,13 +220,13 @@ unset PION_TARGET || true
 # runs with PION_TARGET unset to prove pionc_linux_s3 auto-detects its own host arch!
 T_S3_0="$(now_ms)"
 if [ "$USE_DIRECT_OBJ" -eq 1 ]; then
-  (cd "$ROOT_DIR" && "$PIONC" build \
+  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" "$PIONC" build \
     --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
     -o "$TMP_DIR/pionc_linux_s3" \
     compiler/src/core \
     compiler/src/cli/main.pion)
 else
-  (cd "$ROOT_DIR" && PION_TARGET="$LINUX_TARGET" "$PIONC" build \
+  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_TARGET="$LINUX_TARGET" "$PIONC" build \
     --emit-ssa "$TMP_DIR/linux_stage3.ssa" \
     -o "$TMP_DIR/pionc_linux_s3" \
     compiler/src/core \
@@ -234,7 +237,7 @@ S3_SIZE="$(wc -c < "$TMP_DIR/pionc_linux_s3" | tr -d ' ')"
 echo "Linux ${LINUX_ARCH_LABEL} native self-host Stage 3: build=$((T_S3_1 - T_S3_0))ms, binary=${S3_SIZE} bytes"
 
 T_S4_0="$(now_ms)"
-(cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_linux_s4" "$TMP_DIR/pionc_linux_s3" build \
+(cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_CACHE_DIR="$TMP_DIR/cas_linux_s4" "$TMP_DIR/pionc_linux_s3" build \
   --emit-ssa "$TMP_DIR/linux_stage4.ssa" \
   -o "$TMP_DIR/pionc_linux_s4" \
   compiler/src/core \
@@ -249,7 +252,7 @@ FP_B=4
 if ! cmp -s "$TMP_DIR/linux_stage3.ssa" "$TMP_DIR/linux_stage4.ssa"; then
   echo "Stage 3 (seed) != Stage 4 (new codegen); running Stage 5 (pionc_linux_s4 -> pionc_linux_s5) to verify Stage 4 == Stage 5 fixed-point"
   T_S5_0="$(now_ms)"
-  (cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_linux_s5" "$TMP_DIR/pionc_linux_s4" build \
+  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_CACHE_DIR="$TMP_DIR/cas_linux_s5" "$TMP_DIR/pionc_linux_s4" build \
     --emit-ssa "$TMP_DIR/linux_stage5.ssa" \
     -o "$TMP_DIR/pionc_linux_s5" \
     compiler/src/core \
@@ -523,6 +526,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p89_unit_enum/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_data_ptr_safety/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

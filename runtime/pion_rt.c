@@ -1137,6 +1137,7 @@ PION_HOT void *pion_int_to_str(int64_t v) {
 }
 
 PION_MINSIZE void *pion_double_to_str(double v) {
+    if (isnan(v)) return pion_str_from_cstr("nan", 3);
     char buf[64];
     int n = 0;
     for (int prec = 15; prec <= 17; prec++) {
@@ -3202,8 +3203,94 @@ PION_MINSIZE void *pion_world_fs_readlink(void *w_ptr, void *path_str, int32_t *
     (void)w_ptr;
     if (ok_out) *ok_out = 0;
 #ifdef _WIN32
-    (void)path_str;
-    return pion_errno_str(ENOSYS);
+#ifndef WC_ERR_INVALID_CHARS
+#define WC_ERR_INVALID_CHARS 0x80
+#endif
+    PionString *path = (PionString *)path_str;
+    if (!path || path->len <= 0 || path->len > INT_MAX ||
+        memchr(path->data, '\0', (size_t)path->len) != NULL) {
+        return pion_errno_str(EINVAL);
+    }
+    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                                   path->data, (int)path->len, NULL, 0);
+    if (wlen <= 0) return pion_errno_str(EINVAL);
+    wchar_t *wp = (wchar_t *)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
+    if (!wp) return pion_errno_str(ENOMEM);
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
+                            path->data, (int)path->len, wp, wlen) != wlen) {
+        free(wp);
+        return pion_errno_str(EINVAL);
+    }
+    wp[wlen] = L'\0';
+    DWORD attr = GetFileAttributesW(wp);
+    if (attr == INVALID_FILE_ATTRIBUTES) {
+        free(wp);
+        return pion_errno_str(ENOENT);
+    }
+    if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
+        free(wp);
+        return pion_errno_str(EINVAL);
+    }
+    HANDLE h = CreateFileW(wp, 0,
+                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                           NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
+    free(wp);
+    if (h == INVALID_HANDLE_VALUE) return pion_errno_str(ENOENT);
+    DWORD cap = 260;
+    wchar_t *wbuf = NULL;
+    DWORD n = 0;
+    int err = 0;
+    for (;;) {
+        wchar_t *nb = (wchar_t *)realloc(wbuf, (size_t)cap * sizeof(wchar_t));
+        if (!nb) { err = ENOMEM; break; }
+        wbuf = nb;
+        n = GetFinalPathNameByHandleW(h, wbuf, cap, FILE_NAME_NORMALIZED);
+        if (n == 0) { err = ENOENT; break; }
+        if (n < cap) break;
+        if (n > (1u << 20)) { err = ENAMETOOLONG; break; }
+        cap = n + 1;
+    }
+    CloseHandle(h);
+    if (err != 0) {
+        free(wbuf);
+        return pion_errno_str(err);
+    }
+    wchar_t *src = wbuf;
+    DWORD slen = n;
+    if (slen >= 8 && memcmp(src, L"\\\\?\\UNC\\", 8 * sizeof(wchar_t)) == 0) {
+        src += 6;
+        slen -= 6;
+        src[0] = L'\\';
+    } else if (slen >= 4 && memcmp(src, L"\\\\?\\", 4 * sizeof(wchar_t)) == 0) {
+        src += 4;
+        slen -= 4;
+    }
+    if (slen == 0 || slen > (DWORD)INT_MAX) {
+        free(wbuf);
+        return pion_errno_str(EINVAL);
+    }
+    int u8len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                                    src, (int)slen, NULL, 0, NULL, NULL);
+    if (u8len <= 0) {
+        free(wbuf);
+        return pion_errno_str(EINVAL);
+    }
+    char *u8buf = (char *)malloc((size_t)u8len);
+    if (!u8buf) {
+        free(wbuf);
+        return pion_errno_str(ENOMEM);
+    }
+    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
+                            src, (int)slen, u8buf, u8len, NULL, NULL) != u8len) {
+        free(u8buf);
+        free(wbuf);
+        return pion_errno_str(EINVAL);
+    }
+    void *out = pion_str_from_cstr(u8buf, (int64_t)u8len);
+    free(u8buf);
+    free(wbuf);
+    if (ok_out) *ok_out = 1;
+    return out;
 #else
     PionString *path = (PionString *)path_str;
     int err = EINVAL;

@@ -31,9 +31,13 @@ if [ "$LIB_SIZE" -ge 65536 ]; then
   echo "FAIL: libpionrt.a (${LIB_SIZE} bytes) exceeds 64 KB budget" >&2
   exit 1
 fi
+"$CC" -std=c11 -O2 -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
+  -Wall -Wextra -Werror -c "$RT_DIR/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
+rm -f "$OUT_DIR/libpionrt_cli.a"
+ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
 
 "$CC" -std=c11 -O2 -Wall -Wextra -Werror -I"$RT_DIR" \
-  "$RT_DIR/test_rt.c" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -o "$OUT_DIR/test_rt_win.exe"
+  "$RT_DIR/test_rt.c" "$RT_DIR/pion_cli.c" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -o "$OUT_DIR/test_rt_win.exe"
 if ! "$OUT_DIR/test_rt_win.exe" > "$TMP_DIR/test_rt.out" 2>&1; then
   cat "$TMP_DIR/test_rt.out"
   exit 1
@@ -51,7 +55,7 @@ gzip -dc "$ROOT_DIR/bootstrap/pionc-seed.ssa.gz" > "$SEED_SSA"
 T_B0="$(now_ms)"
 "$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/pionc_win.s" "$SEED_SSA"
 "$CC" -c "$TMP_DIR/pionc_win.s" -o "$OUT_DIR/pionc_win.o"
-"$CC" "$OUT_DIR/pionc_win.o" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$OUT_DIR/pionc_win.exe"
+"$CC" "$OUT_DIR/pionc_win.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$OUT_DIR/pionc_win.exe"
 T_B1="$(now_ms)"
 PIONC_SIZE="$(wc -c < "$OUT_DIR/pionc_win.exe" | tr -d ' ')"
 echo "Native Windows x86_64 pionc_win.exe: assemble+link=$((T_B1 - T_B0))ms, size=${PIONC_SIZE} bytes"
@@ -78,7 +82,7 @@ T_S3_0="$(now_ms)"
   --emit-obj "$TMP_DIR/pionc_win_s3.o" \
   compiler/src/core \
   compiler/src/cli/main.pion)
-"$CC" "$TMP_DIR/pionc_win_s3.o" "$OUT_DIR/libpionrt.a" -lm -lws2_32 -Wl,--stack,16777216 \
+"$CC" "$TMP_DIR/pionc_win_s3.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 \
   -o "$TMP_DIR/pionc_win_s3.exe"
 T_S3_1="$(now_ms)"
 S3_SIZE="$(wc -c < "$TMP_DIR/pionc_win_s3.exe" | tr -d ' ')"
@@ -95,7 +99,7 @@ esac
 # Stage 4 runs with PION_TARGET unset to prove pionc_win_s3 auto-detects Windows -> amd64_win!
 unset PION_TARGET || true
 T_S4_0="$(now_ms)"
-(cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_win_s4" "$TMP_DIR/pionc_win_s3.exe" build \
+(cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_CACHE_DIR="$TMP_DIR/cas_win_s4" "$TMP_DIR/pionc_win_s3.exe" build \
   --emit-ssa "$TMP_DIR/win_stage4.ssa" \
   -o "$TMP_DIR/pionc_win_s4.exe" \
   compiler/src/core \
@@ -109,7 +113,7 @@ FP_A=3
 FP_B=4
 if ! cmp -s "$TMP_DIR/win_stage3.ssa" "$TMP_DIR/win_stage4.ssa"; then
   echo "Stage 3 (seed) != Stage 4 (new codegen); running Stage 5 (pionc_win_s4.exe -> pionc_win_s5.exe) to verify Stage 4 == Stage 5 fixed-point"
-  (cd "$ROOT_DIR" && PION_CACHE_DIR="$TMP_DIR/cas_win_s5" "$TMP_DIR/pionc_win_s4.exe" build \
+  (cd "$ROOT_DIR" && PION_RT_LIB="$OUT_DIR/libpionrt_cli.a" PION_CACHE_DIR="$TMP_DIR/cas_win_s5" "$TMP_DIR/pionc_win_s4.exe" build \
     --emit-ssa "$TMP_DIR/win_stage5.ssa" \
     -o "$TMP_DIR/pionc_win_s5.exe" \
     compiler/src/core \
@@ -151,6 +155,72 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
 fi
 
 sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
+
+# Windows directory junction collision regression for --emit-web-rt
+JUNC_BASE="$TMP_DIR/junc_web_rt"
+JUNC_REAL="$JUNC_BASE/real"
+JUNC_LINK="$JUNC_BASE/junc"
+mkdir -p "$JUNC_REAL"
+printf 'pub fn main() -> Int { 0 }\n' > "$JUNC_BASE/main.pion"
+printf 'SENTINEL_WIN_MJS\n' > "$JUNC_REAL/out.mjs"
+if command -v cygpath >/dev/null 2>&1; then
+  JUNC_REAL_WIN="$(cygpath -w "$JUNC_REAL")"
+  JUNC_LINK_WIN="$(cygpath -w "$JUNC_LINK")"
+else
+  JUNC_REAL_WIN="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$JUNC_REAL")"
+  JUNC_LINK_WIN="$(python3 -c 'import os, sys; print(os.path.abspath(sys.argv[1]))' "$JUNC_LINK")"
+fi
+MSYS_NO_PATHCONV=1 cmd /c mklink /J "$JUNC_LINK_WIN" "$JUNC_REAL_WIN" >/dev/null
+JUNC_ERR="$TMP_DIR/junc_err.txt"
+if "$PIONC" build --target wasm32 -o "$JUNC_LINK_WIN\\out.mjs" --emit-web-rt="$JUNC_REAL_WIN\\out.mjs" "$JUNC_BASE/main.pion" 2>"$JUNC_ERR"; then
+  echo "FAIL: Windows junction existing-file collision should fail" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+grep -qi 'collides' "$JUNC_ERR" || { echo "FAIL: Windows junction existing-file error missing 'collides': $(cat "$JUNC_ERR")" >&2; MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true; exit 1; }
+if [ "$(cat "$JUNC_REAL/out.mjs" | tr -d '\r')" != "SENTINEL_WIN_MJS" ]; then
+  echo "FAIL: Windows junction collision overwrote real/out.mjs" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+if "$PIONC" build --target wasm32 -o "$JUNC_LINK_WIN\\new.mjs" --emit-web-rt="$JUNC_REAL_WIN\\new.mjs" "$JUNC_BASE/main.pion" 2>"$JUNC_ERR"; then
+  echo "FAIL: Windows junction non-existent-file collision should fail" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+grep -qi 'collides' "$JUNC_ERR" || { echo "FAIL: Windows junction non-existent-file error missing 'collides': $(cat "$JUNC_ERR")" >&2; MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true; exit 1; }
+if [ -e "$JUNC_REAL/new.mjs" ]; then
+  echo "FAIL: Windows junction collision created real/new.mjs" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+
+# Relative path (out.mjs vs C:\...\out.mjs) and drive-root path (\...\out.mjs vs C:\...\out.mjs) collisions
+if (cd "$JUNC_REAL" && "$PIONC" build --target wasm32 -o "out.mjs" --emit-web-rt="$JUNC_REAL_WIN\\out.mjs" "$JUNC_BASE/main.pion" 2>"$JUNC_ERR"); then
+  echo "FAIL: Windows relative-vs-abs collision should fail" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+grep -qi 'collides' "$JUNC_ERR" || { echo "FAIL: Windows relative-vs-abs error missing 'collides': $(cat "$JUNC_ERR")" >&2; MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true; exit 1; }
+if [ "$(cat "$JUNC_REAL/out.mjs" | tr -d '\r')" != "SENTINEL_WIN_MJS" ]; then
+  echo "FAIL: Windows relative-vs-abs collision overwrote real/out.mjs" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+JUNC_DRV_ROOT_WIN="${JUNC_REAL_WIN#?:}"
+if (cd "$JUNC_REAL" && MSYS_NO_PATHCONV=1 "$PIONC" build --target wasm32 -o "${JUNC_DRV_ROOT_WIN}\\new.mjs" --emit-web-rt="$JUNC_REAL_WIN\\new.mjs" "$JUNC_BASE/main.pion" 2>"$JUNC_ERR"); then
+  echo "FAIL: Windows drive-root-vs-abs collision should fail" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+grep -qi 'collides' "$JUNC_ERR" || { echo "FAIL: Windows drive-root-vs-abs error missing 'collides': $(cat "$JUNC_ERR")" >&2; MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true; exit 1; }
+if [ -e "$JUNC_REAL/new.mjs" ]; then
+  echo "FAIL: Windows drive-root-vs-abs collision created real/new.mjs" >&2
+  MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+  exit 1
+fi
+MSYS_NO_PATHCONV=1 cmd /c rmdir "$JUNC_LINK_WIN" >/dev/null 2>&1 || true
+echo "[PASS] Windows directory junction, relative & drive-root --emit-web-rt collision guards verified"
 
 verify_bench() {
   name="$1"

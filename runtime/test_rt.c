@@ -2820,6 +2820,117 @@ static void test_p22a_systems_io(int argc, char **argv) {
     void *rl = pion_world_fs_readlink(w, l_s, &ok);
     assert(ok == 1 && pion_str_eq(rl, tgt_s) == 1);
     pion_rc_dec(rl);
+
+    /* pion_fs_canon_path: symlink, dangling symlink, nonexistent dir + '..', cycle -> NULL & empty */
+    char *cp_f = pion_fs_canon_path(fbuf);
+    char *cp_l = pion_fs_canon_path(lbuf);
+    assert(cp_f != NULL && cp_l != NULL && strcmp(cp_f, cp_l) == 0);
+    free(cp_f);
+    free(cp_l);
+    assert(pion_fs_canon_path("") == NULL);
+
+    char dlink[320], dne[320], bypass[340], cyca[320], cycb[320];
+    snprintf(dlink, sizeof(dlink), "%s/dlink.mjs", dirbuf);
+    snprintf(dne, sizeof(dne), "%s/nonexistent.mjs", dirbuf);
+    assert(symlink("nonexistent.mjs", dlink) == 0);
+    char *cp_dl = pion_fs_canon_path(dlink);
+    char *cp_dne = pion_fs_canon_path(dne);
+    assert(cp_dl != NULL && cp_dne != NULL && strcmp(cp_dl, cp_dne) == 0);
+    free(cp_dl);
+    free(cp_dne);
+
+    snprintf(bypass, sizeof(bypass), "%s/nope/../sym.bin", dirbuf);
+    char *cp_bp = pion_fs_canon_path(bypass);
+    char *cp_real_f = pion_fs_canon_path(fbuf);
+    assert(cp_bp != NULL && cp_real_f != NULL && strcmp(cp_bp, cp_real_f) == 0);
+    free(cp_bp);
+    free(cp_real_f);
+
+    /* Non-existent dir + '..' followed by directory symlink + '..' must resolve the symlink first */
+    char hop_sub[340], hop_lnk[340], hop_in[380], hop_exp[340];
+    snprintf(hop_sub, sizeof(hop_sub), "%s/sub/inner", dirbuf);
+    void *hop_sub_s = pion_str_from_cstr(hop_sub, (int64_t)strlen(hop_sub));
+    assert(pion_world_fs_mkdir_p(w, hop_sub_s) == 1);
+    pion_rc_dec(hop_sub_s);
+    snprintf(hop_lnk, sizeof(hop_lnk), "%s/hop", dirbuf);
+    assert(symlink(hop_sub, hop_lnk) == 0);
+    snprintf(hop_in, sizeof(hop_in), "%s/nope/../hop/../out.mjs", dirbuf);
+    snprintf(hop_exp, sizeof(hop_exp), "%s/sub/out.mjs", dirbuf);
+    char *cp_hop_in = pion_fs_canon_path(hop_in);
+    char *cp_hop_exp = pion_fs_canon_path(hop_exp);
+    assert(cp_hop_in != NULL && cp_hop_exp != NULL && strcmp(cp_hop_in, cp_hop_exp) == 0);
+    free(cp_hop_in);
+    free(cp_hop_exp);
+    assert(unlink(hop_lnk) == 0);
+    assert(rmdir(hop_sub) == 0);
+
+    snprintf(cyca, sizeof(cyca), "%s/cyc_a", dirbuf);
+    snprintf(cycb, sizeof(cycb), "%s/cyc_b", dirbuf);
+    assert(symlink("cyc_b", cyca) == 0);
+    assert(symlink("cyc_a", cycb) == 0);
+    assert(pion_fs_canon_path(cyca) == NULL);
+    assert(unlink(dlink) == 0);
+    assert(unlink(cyca) == 0);
+    assert(unlink(cycb) == 0);
+#else
+    char jbuf[320], jcmd[768];
+    snprintf(jbuf, sizeof(jbuf), "%s\\junc_sub", dirbuf);
+    for (char *q = jbuf; *q; q++) {
+        if (*q == '/') *q = '\\';
+    }
+    char sub_win[300];
+    snprintf(sub_win, sizeof(sub_win), "%s", sbuf);
+    for (char *q = sub_win; *q; q++) {
+        if (*q == '/') *q = '\\';
+    }
+    snprintf(jcmd, sizeof(jcmd), "cmd /c mklink /J \"%s\" \"%s\" >nul 2>&1", jbuf, sub_win);
+    assert(system(jcmd) == 0);
+    void *j_s = pion_str_from_cstr(jbuf, (int64_t)strlen(jbuf));
+    void *rl_j = pion_world_fs_readlink(w, j_s, &ok);
+    assert(ok == 1 && pion_str_len(rl_j) > 0);
+    assert(strstr(((PionString *)rl_j)->data, "sub") != NULL);
+    pion_rc_dec(rl_j);
+    void *rl_dir = pion_world_fs_readlink(w, sub_s, &ok);
+    assert(ok == 0 && pion_str_len(rl_dir) > 0);
+    pion_rc_dec(rl_dir);
+
+    /* Short-name parent must NOT make ordinary dir look like a reparse point,
+       while pion_fs_canon_path must canonicalize short-name, junction, relative & drive-root paths identically */
+    wchar_t sub_w[320], short_w[320];
+    int sub_wl = MultiByteToWideChar(CP_UTF8, 0, sub_win, -1, sub_w, 320);
+    if (sub_wl > 0) {
+        DWORD swl = GetShortPathNameW(sub_w, short_w, 320);
+        if (swl > 0 && swl < 320) {
+            char short_u8[320];
+            int su8 = WideCharToMultiByte(CP_UTF8, 0, short_w, (int)swl, short_u8, 319, NULL, NULL);
+            if (su8 > 0) {
+                short_u8[su8] = '\0';
+                void *short_s = pion_str_from_cstr(short_u8, (int64_t)su8);
+                void *rl_short = pion_world_fs_readlink(w, short_s, &ok);
+                assert(ok == 0);
+                pion_rc_dec(rl_short);
+                char *cp_short = pion_fs_canon_path(short_u8);
+                char *cp_sub = pion_fs_canon_path(sub_win);
+                assert(cp_short != NULL && cp_sub != NULL && strcmp(cp_short, cp_sub) == 0);
+                free(cp_short);
+                free(cp_sub);
+                pion_rc_dec(short_s);
+            }
+        }
+    }
+    char *cp_junc = pion_fs_canon_path(jbuf);
+    char *cp_real = pion_fs_canon_path(sub_win);
+    assert(cp_junc != NULL && cp_real != NULL && strcmp(cp_junc, cp_real) == 0);
+    if (strlen(cp_real) >= 3 && cp_real[1] == ':') {
+        char *cp_drel = pion_fs_canon_path(cp_real + 2);
+        assert(cp_drel != NULL && strlen(cp_drel) > 0);
+        free(cp_drel);
+    }
+    free(cp_junc);
+    free(cp_real);
+    pion_rc_dec(j_s);
+    snprintf(jcmd, sizeof(jcmd), "cmd /c rmdir \"%s\" >nul 2>&1", jbuf);
+    (void)system(jcmd);
 #endif
 
     void *rl_err = pion_world_fs_readlink(w, f_s, &ok);

@@ -251,6 +251,7 @@ int32_t  pion_fs_mkdir_excl(const char *path);
 int32_t  pion_fs_rmdir(const char *path);
 int64_t  pion_fs_trylock(const char *path);
 void     pion_fs_unlock(int64_t handle);
+char*    pion_fs_canon_path(const char *path);
 void*    pion_world_fs_list_dir(void *w, void *path_str);
 int32_t  pion_world_fs_remove(void *w, void *path_str);
 int32_t  pion_world_fs_rename(void *w, void *old_path, void *new_path);

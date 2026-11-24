@@ -17,11 +17,17 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 
 export PION_QBE="$OUT_DIR/qbe"
 export PION_RT_LIB="$OUT_DIR/libpionrt.a"
+PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
 
 echo "=== [1/9] Build QBE + Runtime ==="
 sh "$ROOT_DIR/scripts/build-qbe.sh" "$PION_QBE"
 if [ "${PION_SKIP_RT_TEST:-0}" = "1" ] && [ -f "$PION_RT_LIB" ]; then
   echo "Using pre-verified $PION_RT_LIB (PION_SKIP_RT_TEST=1)"
+  if [ ! -f "$PION_RT_CLI_LIB" ]; then
+    "${CC:-cc}" -std=c11 -O2 -fPIC -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
+    rm -f "$PION_RT_CLI_LIB"
+    ar rcs "$PION_RT_CLI_LIB" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
+  fi
 else
   sh "$ROOT_DIR/scripts/test-runtime.sh"
 fi
@@ -48,19 +54,19 @@ else
   CC_BIN="${CC:-cc}"
   if [ "$UNAME_S" = "Darwin" ] && [ "$UNAME_M" = "x86_64" ]; then
     "$PION_QBE" -t amd64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
-    "$CC_BIN" -arch x86_64 "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+    "$CC_BIN" -arch x86_64 "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Darwin" ]; then
     "$PION_QBE" -t arm64_apple -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
-    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "x86_64" ]; then
     "$PION_QBE" -t amd64_sysv --obj -o "$TMP_DIR/pionc0.o" "$SEED_SSA"
-    "$CC_BIN" "$TMP_DIR/pionc0.o" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+    "$CC_BIN" "$TMP_DIR/pionc0.o" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Linux" ] && { [ "$UNAME_M" = "aarch64" ] || [ "$UNAME_M" = "arm64" ]; }; then
     "$PION_QBE" -t arm64 -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
-    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   elif [ "$UNAME_S" = "Linux" ] && [ "$UNAME_M" = "riscv64" ]; then
     "$PION_QBE" -t rv64 -o "$TMP_DIR/pionc0.s" "$SEED_SSA"
-    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
+    "$CC_BIN" "$TMP_DIR/pionc0.s" "$PION_RT_CLI_LIB" -lm -lpthread -o "$OUT_DIR/pionc0"
   else
     echo "FAIL: unsupported host platform $UNAME_S/$UNAME_M for Stage 0 bootstrap" >&2
     exit 1
@@ -75,7 +81,7 @@ echo "=== [3/9] Stage 1: pionc0 -> out/pionc1 (fresh CAS) ==="
 CAS_S1="$TMP_DIR/cas_stage1"
 mkdir -p "$CAS_S1"
 T_S1_0=$(now_ms)
-PION_CACHE_DIR="$CAS_S1" "$OUT_DIR/pionc0" build \
+PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$CAS_S1" "$OUT_DIR/pionc0" build \
   --emit-ssa "$OUT_DIR/stage1.ssa" \
   --emit-asm "$OUT_DIR/stage1.s" \
   -o "$OUT_DIR/pionc1" \
@@ -93,7 +99,7 @@ echo "=== [4/9] Stage 2: pionc1 -> out/pionc2 (fresh CAS, pure pion native + mul
 CAS_S2="$TMP_DIR/cas_stage2"
 mkdir -p "$CAS_S2"
 T_S2_0=$(now_ms)
-PION_CACHE_DIR="$CAS_S2" "$OUT_DIR/pionc1" build \
+PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$CAS_S2" "$OUT_DIR/pionc1" build \
   --emit-ssa "$OUT_DIR/stage2.ssa" \
   --emit-asm "$OUT_DIR/stage2.s" \
   -o "$OUT_DIR/pionc2" \
@@ -123,7 +129,7 @@ else
   echo "Stage 1 (seed) != Stage 2 (new codegen); running Stage 3 (pionc2 -> pionc3) to verify Stage 2 == Stage 3 fixed-point"
   CAS_S3="$TMP_DIR/cas_stage3"
   mkdir -p "$CAS_S3"
-  PION_CACHE_DIR="$CAS_S3" "$OUT_DIR/pionc2" build \
+  PION_RT_LIB="$PION_RT_CLI_LIB" PION_CACHE_DIR="$CAS_S3" "$OUT_DIR/pionc2" build \
     --emit-ssa "$OUT_DIR/stage3.ssa" \
     --emit-asm "$OUT_DIR/stage3.s" \
     -o "$OUT_DIR/pionc3" \

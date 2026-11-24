@@ -71,6 +71,10 @@ if ! PIONC_BIN=$(find_pionc); then
     fi
     rm -f "$OUT_DIR/libpionrt.a"
     ar rcs "$OUT_DIR/libpionrt.a" "$OUT_DIR/pion_rt.o"
+    "$CC_BIN" -std=c11 -O2 -fPIC -fno-unwind-tables -fno-asynchronous-unwind-tables -fno-ident \
+      -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
+    rm -f "$OUT_DIR/libpionrt_cli.a"
+    ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
     PION_SKIP_RT_TEST=1 CC="$CC_BIN" sh "$ROOT_DIR/scripts/bootstrap.sh"
   else
     sh "$ROOT_DIR/scripts/bootstrap.sh"
@@ -84,6 +88,7 @@ RT_LIB="$OUT_DIR/libpionrt.a"
 
 for req in "$PIONC_BIN" "$QBE_BIN" "$RT_LIB" \
   "$ROOT_DIR/runtime/pion_wasm_rt.mjs" \
+  "$ROOT_DIR/runtime/pion_wasm_rt_web.mjs" \
   "$ROOT_DIR/runtime/pion_rt.c" \
   "$ROOT_DIR/runtime/pion_rt.h"; do
   if [ ! -f "$req" ]; then
@@ -98,6 +103,7 @@ cp "$QBE_BIN" "$PREFIX/bin/qbe${EXE_EXT}"
 chmod +x "$PREFIX/bin/pionc${EXE_EXT}" "$PREFIX/bin/qbe${EXE_EXT}"
 cp "$RT_LIB" "$PREFIX/lib/libpionrt.a"
 cp "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$PREFIX/share/pion/pion_wasm_rt.mjs"
+cp "$ROOT_DIR/runtime/pion_wasm_rt_web.mjs" "$PREFIX/share/pion/pion_wasm_rt_web.mjs"
 cp "$ROOT_DIR/runtime/pion_rt.c" "$PREFIX/share/pion/runtime/pion_rt.c"
 cp "$ROOT_DIR/runtime/pion_rt.h" "$PREFIX/share/pion/runtime/pion_rt.h"
 

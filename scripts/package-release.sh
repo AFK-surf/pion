@@ -62,13 +62,14 @@ if [ ! -f "$QBE_BIN" ] && [ -f "$OUT_DIR/qbe" ]; then
 fi
 RT_LIB="${PION_RT_LIB:-$OUT_DIR/libpionrt.a}"
 WASM_RT="$ROOT_DIR/runtime/pion_wasm_rt.mjs"
+WASM_WEB_RT="$ROOT_DIR/runtime/pion_wasm_rt_web.mjs"
 RT_C="$ROOT_DIR/runtime/pion_rt.c"
 RT_H="$ROOT_DIR/runtime/pion_rt.h"
 LICENSE_FILE="$ROOT_DIR/LICENSE"
 NOTICES_FILE="$ROOT_DIR/THIRD_PARTY_NOTICES.md"
 QBE_LICENSE="$ROOT_DIR/vendor/qbe/LICENSE"
 
-for req in "$QBE_BIN" "$RT_LIB" "$WASM_RT" "$RT_C" "$RT_H" "$LICENSE_FILE" "$NOTICES_FILE" "$QBE_LICENSE"; do
+for req in "$QBE_BIN" "$RT_LIB" "$WASM_RT" "$WASM_WEB_RT" "$RT_C" "$RT_H" "$LICENSE_FILE" "$NOTICES_FILE" "$QBE_LICENSE"; do
   if [ ! -s "$req" ]; then
     echo "FAIL: missing or empty required release file: $req" >&2
     exit 1
@@ -86,6 +87,7 @@ cp "$QBE_BIN" "$STAGE/bin/qbe${EXE_EXT}"
 chmod +x "$STAGE/bin/pionc${EXE_EXT}" "$STAGE/bin/qbe${EXE_EXT}"
 cp "$RT_LIB" "$STAGE/lib/libpionrt.a"
 cp "$WASM_RT" "$STAGE/share/pion/pion_wasm_rt.mjs"
+cp "$WASM_WEB_RT" "$STAGE/share/pion/pion_wasm_rt_web.mjs"
 cp "$RT_C" "$STAGE/share/pion/runtime/pion_rt.c"
 cp "$RT_H" "$STAGE/share/pion/runtime/pion_rt.h"
 cp "$QBE_LICENSE" "$STAGE/share/pion/licenses/QBE-LICENSE"
