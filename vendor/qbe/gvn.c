@@ -352,7 +352,7 @@ zeroval(Fn *fn, Blk *b, Ref r, int cls, int *z)
 }
 
 static int
-usecls(Use *u, Ref r, int cls)
+usecls(Fn *fn, Use *u, Ref r, int cls)
 {
 	int k;
 
@@ -370,7 +370,25 @@ usecls(Use *u, Ref r, int cls)
 			return cls; /* eliminated */
 		return u->u.phi->cls;
 	case UJmp:
-		return Kw;
+		switch (fn->rpo[u->bid]->jmp.type) {
+		case Jretl:
+		case Jretc:
+			return Kl;
+		case Jrets:
+			return Ks;
+		case Jretd:
+			return Kd;
+		case Jretw:
+		case Jretsb:
+		case Jretub:
+		case Jretsh:
+		case Jretuh:
+		case Jjnz:
+		case Jjtbl:
+			return Kw;
+		default:
+			return Kx; /* unknown: never cls */
+		}
 	default:
 		break;
 	}
@@ -392,7 +410,7 @@ propjnz0(Fn *fn, Blk *bif, Blk *s0, Blk *snon0, Ref r, int cls)
 		/* we may compare an l temp with a w
 		 * comparison; so check that the use
 		 * does not involve high bits */
-		if (usecls(u, r, cls) == cls)
+		if (usecls(fn, u, r, cls) == cls)
 		if (branchdom(fn, bif, s0, snon0, b))
 			replaceuse(fn, u, r, CON_Z);
 	}

@@ -1,4 +1,4 @@
-/* Exact-result checks for tests/tv/qbe_bugs/qbe_bugs.ssa (B1-B6). */
+/* Exact-result checks for tests/tv/qbe_bugs/qbe_bugs.ssa (B1-B12). */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -10,6 +10,15 @@ int32_t bug4b_amd64_jnz_l_neg(int64_t);
 int32_t bug4c_amd64_sel_l_and(int64_t, int64_t, int32_t, int32_t);
 int32_t bug5_amd64_shift_zflag(int32_t, int32_t, int64_t);
 int64_t bug6_amd64_shift_imm(int64_t, int32_t);
+int32_t bug7_dwl_phi_retry(int32_t, int32_t, int32_t);
+int32_t bug8_dwl_phi_cycle(int32_t, int32_t, int32_t);
+int64_t bug9_gvn_jnz_retl(int64_t);
+int32_t bug10_load_shr_mask(int32_t);
+int64_t bug11a_promote_loadsw(int64_t);
+int64_t bug11b_promote_loaduw(int64_t);
+int64_t bug11c_promote_s_loadsw(int32_t);
+int64_t bug11d_promote_s_loaduw(int32_t);
+int64_t bug12_cnew_l_result(int32_t);
 
 static int fails;
 
@@ -94,6 +103,35 @@ main(void)
 				         as[i], k, (long long)ks[j]);
 				check(what, s ? 1 : 2, bug5_amd64_shift_zflag(as[i], k, ks[j]));
 			}
+	}
+
+	for (i = 0; i < n; i++) {
+		int64_t c = ls[i];
+		int32_t lo = (int32_t)(uint32_t)c;
+		int32_t y = (int32_t)(uint32_t)ls[(i + 1) % n];
+
+		snprintf(what, sizeof what, "bug7_dwl_phi_retry(1, %d, %d)", lo, y);
+		check(what, (uint16_t)lo, bug7_dwl_phi_retry(1, lo, y));
+		snprintf(what, sizeof what, "bug7_dwl_phi_retry(0, %d, %d)", lo, y);
+		check(what, (uint16_t)y, bug7_dwl_phi_retry(0, lo, y));
+		snprintf(what, sizeof what, "bug8_dwl_phi_cycle(1, 0, %d)", lo);
+		check(what, (uint16_t)lo, bug8_dwl_phi_cycle(1, 0, lo));
+		snprintf(what, sizeof what, "bug8_dwl_phi_cycle(0, 0, %d)", lo);
+		check(what, (uint16_t)(lo & 1), bug8_dwl_phi_cycle(0, 0, lo));
+		snprintf(what, sizeof what, "bug9_gvn_jnz_retl(%lld)", (long long)c);
+		check(what, (uint32_t)c ? 7 : c, bug9_gvn_jnz_retl(c));
+		snprintf(what, sizeof what, "bug10_load_shr_mask(%d)", lo);
+		check(what, ((uint32_t)lo >> 8) & 0xff, bug10_load_shr_mask(lo));
+		snprintf(what, sizeof what, "bug11a_promote_loadsw(%lld)", (long long)c);
+		check(what, (int64_t)lo, bug11a_promote_loadsw(c));
+		snprintf(what, sizeof what, "bug11b_promote_loaduw(%lld)", (long long)c);
+		check(what, (int64_t)(uint32_t)lo, bug11b_promote_loaduw(c));
+		snprintf(what, sizeof what, "bug11c_promote_s_loadsw(%d)", lo);
+		check(what, (int64_t)lo, bug11c_promote_s_loadsw(lo));
+		snprintf(what, sizeof what, "bug11d_promote_s_loaduw(%d)", lo);
+		check(what, (int64_t)(uint32_t)lo, bug11d_promote_s_loaduw(lo));
+		snprintf(what, sizeof what, "bug12_cnew_l_result(%d)", lo);
+		check(what, lo < 0, bug12_cnew_l_result(lo));
 	}
 
 	if (fails) {

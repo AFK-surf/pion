@@ -333,7 +333,12 @@ def(Slice sl, bits msk, Blk *b, Ins *i, Loc *il)
 				r1 = getcon(8*off, curf);
 				r = iins(cls1, op, r, r1, il);
 			}
-			if ((msk1 & msk) != msk1 || off + sz < sl.sz)
+			/* r holds sz valid bytes; after the shift
+			 * they end at byte sz-off (Oshr) or sz+off
+			 * (Oshl), and whatever r has above them
+			 * must not reach the bytes of the slice */
+			if ((msk1 & msk) != msk1
+			|| (op == Oshr ? sz - off : sz + off) < sl.sz)
 				mask(cls, &r, msk1 & msk, il);
 			if ((msk & ~msk1) != 0) {
 				r1 = def(sl, msk & ~msk1, b, i, il);

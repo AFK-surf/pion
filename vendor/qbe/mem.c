@@ -45,6 +45,16 @@ promote(Fn *fn)
 			}
 			goto Skip;
 		}
+		/* an l-class loadsw/loaduw extends the low 32
+		 * bits; only an integer store gives a source
+		 * an extension can take */
+		if (k != -1 && KBASE(k) == 1)
+		for (u=t->use; u<&t->use[t->nuse]; u++) {
+			l = u->u.ins;
+			if ((l->op == Oloadsw || l->op == Oloaduw)
+			&& l->cls == Kl)
+				goto Skip;
+		}
 		/* get rid of the alloc and replace uses */
 		*i = (Ins){.op = Onop};
 		t->ndef--;
@@ -67,7 +77,10 @@ promote(Fn *fn)
 				switch(l->op) {
 				case Oloadsw:
 				case Oloaduw:
-					if (k == Kl)
+					/* the slot holds 4 bytes (k is Kw
+					 * or Ks); an l result needs the
+					 * 32 -> 64 extension */
+					if (l->cls == Kl)
 						goto Extend;
 					/* fall through */
 				case Oload:

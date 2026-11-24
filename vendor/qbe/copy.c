@@ -130,6 +130,42 @@ min(int v1, int v2)
 	return v1 < v2 ? v1 : v2;
 }
 
+/* dwl() proves a phi narrow coinductively: Phi.visit = w
+ * assumes "no wider than w" while the phi is explored and
+ * keeps it as a cached result when the exploration succeeds.
+ * Both stay sound only while no assumption they rest on has
+ * been refuted; a failure refutes every mark set since the
+ * enclosing disjunction (the arms of Oand) started, so the
+ * marks are logged and rolled back to that point. */
+typedef struct DwlMark DwlMark;
+
+struct DwlMark {
+	Phi *p;
+	int visit;
+};
+
+static DwlMark *dwltrail;
+static uint ndwltrail;
+
+static void
+dwlmark(Phi *p, int w)
+{
+	if (!dwltrail)
+		dwltrail = vnew(0, sizeof dwltrail[0], PHeap);
+	vgrow(&dwltrail, ndwltrail+1);
+	dwltrail[ndwltrail++] = (DwlMark){p, p->visit};
+	p->visit = w;
+}
+
+static void
+dwlundo(uint n)
+{
+	while (ndwltrail > n) {
+		ndwltrail--;
+		dwltrail[ndwltrail].p->visit = dwltrail[ndwltrail].visit;
+	}
+}
+
 static int
 dwl(Fn *fn, Ref r, int w)
 {
@@ -137,7 +173,7 @@ dwl(Fn *fn, Ref r, int w)
 	Tmp *t;
 	Phi *p;
 	Ins *i;
-	uint n;
+	uint n, top;
 	int64_t v;
 	int x;
 
@@ -160,7 +196,7 @@ dwl(Fn *fn, Ref r, int w)
 		assert(p);
 		if (p->visit && p->visit <= w)
 			return 1;
-		p->visit = w;
+		dwlmark(p, w);
 		for (n=0; n<p->narg; n++)
 			if (!dwl(fn, p->arg[n], w))
 				return 0;
@@ -187,10 +223,11 @@ dwl(Fn *fn, Ref r, int w)
 	if (iscmp(i->op, &x, &x))
 		return w >= 1;
 	if (i->op == Oand) {
-		if (dwl(fn, i->arg[0], w)
-		|| dwl(fn, i->arg[1], w))
+		top = ndwltrail;
+		if (dwl(fn, i->arg[0], w))
 			return 1;
-		return 0;
+		dwlundo(top);
+		return dwl(fn, i->arg[1], w);
 	}
 	if (i->op == Oor || i->op == Oxor) {
 		if (dwl(fn, i->arg[0], w)
@@ -212,6 +249,7 @@ dwl(Fn *fn, Ref r, int w)
 static int
 defwidthle(Fn *fn, Ref r, int w)
 {
+	ndwltrail = 0;
 	return visit(fn, r, w, dwl);
 }
 
@@ -310,7 +348,11 @@ copyref(Fn *fn, Blk *b, Ins *i)
 	if (optab[i->op].hasid
 	&& KBASE(i->cls) == 0 /* integer only - fp NaN! */
 	&& req(i->arg[1], con01[optab[i->op].idval])
-	&& (!optab[i->op].cmpeqwl || isw1(fn, i->arg[0])))
+	&& (!optab[i->op].cmpeqwl || isw1(fn, i->arg[0]))
+	/* do not break typing by returning a
+	 * narrower temp (e.g. =l cnew %w, 0) */
+	&& (rtype(i->arg[0]) != RTmp
+	    || KWIDE(i->cls) <= KWIDE(fn->tmp[i->arg[0].val].cls)))
 		return i->arg[0];
 
 	/* idempotent op with identical args */

@@ -242,6 +242,8 @@ sh "$ROOT_DIR/tests/e2e/p68b_qbe_caddr_cast/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p78_qbe_arm64_bigframe_spill/run_e2e.sh" "$PIONC2"
 # P79: QBE ARM64 fcsel/csel branchless if-conversion + ops.h xsel* widening + NaN soundness.
 sh "$ROOT_DIR/tests/e2e/p79_qbe_fcsel/run_e2e.sh" "$PIONC2"
+# P100: QBE soundness (copy.c dwl phi retry/cycle, gvn.c usecls jnz vs 64-bit ret, load.c shifted-store mask, mem.c 4-byte slot l extension, copyref cnew width).
+sh "$ROOT_DIR/tests/e2e/p100_qbe_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p82a_wasm_arr_clear_f32_push/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p85_enum_sroa/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC2"
