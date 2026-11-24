@@ -274,6 +274,18 @@ pub fn lower_type_tokens(
       piece = "Option[" + piece + "]"
       i = i + 1
     }
+    if parts.length() > 0 && piece.length() > 0 {
+      let prev_p = parts[parts.length() - 1]
+      if prev_p.length() > 0 {
+        let lc = prev_p.code_unit_at(prev_p.length() - 1)
+        let fc = piece.code_unit_at(0)
+        let prev_word_end = is_alnum(lc) || lc == 93
+        let cur_word_start = is_alpha(fc)
+        if prev_word_end && cur_word_start {
+          parts.push(" ")
+        }
+      }
+    }
     parts.push(piece)
   }
   join_str_array(parts)
@@ -626,8 +638,12 @@ fn try_lower_ref_literal(
   None
 }
 
-///| Check whether `( ... ) => ...` at `open_p` is an arrow function (not a match arm).
+///| Check whether `( ... ) => ...` at `open_p` is an arrow function (not a match arm / constructor pattern).
 fn is_arrow_fn_at(tokens : Array[Token], open_p : Int, end : Int) -> Int {
+  // Constructor patterns like `Failure(msg) => ...` or `Some(v) => ...` are NEVER arrow functions (#12a P1-2)!
+  if open_p > 0 && (tokens[open_p - 1].kind == TokenKind::UpperIdent || tokens[open_p - 1].kind == TokenKind::Ident) {
+    return -1
+  }
   let close_p = find_matching_delim(tokens, open_p)
   if close_p + 1 < end && tokens[close_p + 1].kind == TokenKind::FatArrow {
     // Verify params inside parens look like simple identifiers (not match patterns with literals/ctors)
@@ -1220,6 +1236,18 @@ fn lower_one_token_or_form(
     return (trivia + lower_byte_char(t.raw), i + 1)
   }
 
+  // 1a. Fail-loud on unsupported MoonBit error-handling keywords (`raise`, `noraise`, `try`, `catch`) (#12a P1-2)
+  if is_unsupported_error_kw(t) && !(i > 0 && tokens[i - 1].kind == TokenKind::Dot) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      t.line,
+      t.col,
+      "unsupported MoonBit error-handling syntax `" + t.raw + "` (requires explicit lowering or overlay)",
+    ))
+    return (trivia + t.raw, i + 1)
+  }
+
   // 1b. Local `let [mut] <name> [: <Type>] =` — lower `<Type>` through `lower_type_tokens`
   //     and wrap local `ArrayBuf`-promoted array literals in `mbt_compat::ArrayBuf::from_array(...)`!
   if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "let" {
@@ -1706,19 +1734,271 @@ fn lower_match_arms(
   sb.to_string()
 }
 
+fn is_unsupported_error_kw(tk : Token) -> Bool {
+  (tk.kind == TokenKind::Keyword || tk.kind == TokenKind::Ident) &&
+  (tk.raw == "raise" || tk.raw == "noraise" || tk.raw == "try" || tk.raw == "catch")
+}
+
+fn check_unsupported_error_tokens(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> Unit {
+  let mut k = start
+  while k < end {
+    if is_unsupported_error_kw(tokens[k]) && !(k > 0 && tokens[k - 1].kind == TokenKind::Dot) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[k].line,
+        tokens[k].col,
+        "unsupported MoonBit error-handling syntax `" + tokens[k].raw + "` (requires explicit lowering or overlay)",
+      ))
+    }
+    k = k + 1
+  }
+}
+
+fn count_error_diags(diags : Array[Diag]) -> Int {
+  let mut c = 0
+  for d in diags {
+    if d.severity == "error" {
+      c = c + 1
+    }
+  }
+  c
+}
+
+///| Split top-level comma-separated `#cfg(...)` arguments respecting nested `(...)` and `"..."`.
+fn split_cfg_args(inner : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut depth = 0
+  let mut in_str = false
+  let mut start = 0
+  let mut i = 0
+  let n = inner.length()
+  while i < n {
+    let c = inner.code_unit_at(i)
+    if in_str {
+      if c == 92 && i + 1 < n {
+        i = i + 2
+        continue
+      }
+      if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 40 {
+      depth = depth + 1
+    } else if c == 41 {
+      if depth > 0 { depth = depth - 1 }
+    } else if c == 44 && depth == 0 {
+      out.push(inner.slice(start, i).trim())
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start <= n {
+    let last = inner.slice(start, n).trim()
+    if last.length() > 0 {
+      out.push(last)
+    }
+  }
+  out
+}
+
+///| Statically evaluate a `#cfg(...)` inner boolean expression for `pion_target` (#12a P1-1).
+///| Supports `target="native"|"wasm"|"wasm-gc"|"wasm32"|"js"|"llvm"`, `any(...)`, `all(...)`, `not(...)`.
+///| Returns `None` on any unknown/complex predicate (must fail-loud with `MBT2PION_UNSUPPORTED_CFG`!).
+fn eval_cfg_expr(raw : String, pion_target : String) -> Option[Bool] {
+  let s = raw.trim()
+  if s.length() == 0 {
+    return None
+  }
+  if s.starts_with("not(") && s.ends_with(")") {
+    match eval_cfg_expr(s.slice(4, s.length() - 1), pion_target) {
+      Some(b) => return Some(!b)
+      None => return None
+    }
+  }
+  if s.starts_with("any(") && s.ends_with(")") {
+    let parts = split_cfg_args(s.slice(4, s.length() - 1))
+    if parts.length() == 0 {
+      return None
+    }
+    let mut any_true = false
+    for p in parts {
+      match eval_cfg_expr(p, pion_target) {
+        Some(b) => if b { any_true = true }
+        None => return None
+      }
+    }
+    return Some(any_true)
+  }
+  if s.starts_with("all(") && s.ends_with(")") {
+    let parts = split_cfg_args(s.slice(4, s.length() - 1))
+    if parts.length() == 0 {
+      return None
+    }
+    let mut all_true = true
+    for p in parts {
+      match eval_cfg_expr(p, pion_target) {
+        Some(b) => if !b { all_true = false }
+        None => return None
+      }
+    }
+    return Some(all_true)
+  }
+  let eq_i = s.index_of("=")
+  if eq_i > 0 {
+    let lhs = s.slice(0, eq_i).trim()
+    let rhs = s.slice(eq_i + 1, s.length()).trim()
+    if lhs == "target" && rhs.length() >= 2 && rhs.starts_with("\"") && rhs.ends_with("\"") {
+      let tv = rhs.slice(1, rhs.length() - 1)
+      if tv == "native" || tv == "wasm" || tv == "wasm-gc" || tv == "wasm32" || tv == "js" || tv == "llvm" {
+        if pion_target == "native" {
+          return Some(tv == "native")
+        } else if pion_target == "wasm32" {
+          return Some(tv == "wasm" || tv == "wasm-gc" || tv == "wasm32")
+        } else {
+          return Some(tv == pion_target)
+        }
+      }
+    }
+  }
+  None
+}
+
+///| Statically evaluate a `#cfg(...)` attribute against `pion_target`.
+pub fn eval_cfg_attr(raw_attr : String, pion_target : String) -> Option[Bool] {
+  let s = raw_attr.trim()
+  if !s.starts_with("#cfg(") || !s.ends_with(")") {
+    return None
+  }
+  eval_cfg_expr(s.slice(5, s.length() - 1), pion_target)
+}
+
+///| Skip one complete top-level declaration starting at `start_i` (after leading `#` attributes).
+fn skip_top_level_decl(tokens : Array[Token], start_i : Int, n : Int) -> Int {
+  let mut i = start_i
+  if i < n && tokens[i].kind == TokenKind::Keyword && tokens[i].raw == "pub" {
+    i = i + 1
+    if i < n && tokens[i].kind == TokenKind::LParen {
+      i = find_matching_delim(tokens, i) + 1
+    }
+  } else if i < n && tokens[i].kind == TokenKind::Keyword && tokens[i].raw == "priv" {
+    i = i + 1
+  }
+  if i >= n {
+    return n
+  }
+  let kw = tokens[i]
+  if kw.kind == TokenKind::Keyword && (kw.raw == "let" || kw.raw == "const") {
+    let mut eq_i = i + 1
+    while eq_i < n && tokens[eq_i].kind != TokenKind::Eq {
+      eq_i = eq_i + 1
+    }
+    if eq_i < n {
+      return find_expr_end(tokens, eq_i + 1, n)
+    }
+  }
+  if kw.kind == TokenKind::Keyword && (kw.raw == "struct" || kw.raw == "enum") {
+    let mut lb = i + 1
+    while lb < n && tokens[lb].kind != TokenKind::LBrace {
+      lb = lb + 1
+    }
+    if lb < n {
+      let mut decl_end = find_matching_delim(tokens, lb) + 1
+      if decl_end < n && tokens[decl_end].kind == TokenKind::Keyword && tokens[decl_end].raw == "derive" &&
+      decl_end + 1 < n && tokens[decl_end + 1].kind == TokenKind::LParen {
+        decl_end = find_matching_delim(tokens, decl_end + 1) + 1
+      }
+      return decl_end
+    }
+  }
+  if kw.kind == TokenKind::Keyword && (kw.raw == "fn" || kw.raw == "impl" || kw.raw == "test" || kw.raw == "trait") {
+    let mut lb = i + 1
+    while lb < n && tokens[lb].kind != TokenKind::LBrace {
+      lb = lb + 1
+    }
+    if lb < n {
+      return find_matching_delim(tokens, lb) + 1
+    }
+  }
+  if kw.kind == TokenKind::Keyword && kw.raw == "type" {
+    let mut k = i + 1
+    while k < n && tokens[k].kind != TokenKind::LBrace && !tokens[k].newline_before {
+      k = k + 1
+    }
+    if k < n && tokens[k].kind == TokenKind::LBrace {
+      return find_matching_delim(tokens, k) + 1
+    }
+    return k
+  }
+  i + 1
+}
+
+///| Extract a concise declaration label (`fn:foo`, `struct:Bar`, etc.) starting at `start_i` (after `#` attrs).
+fn peek_decl_label(tokens : Array[Token], start_i : Int, n : Int) -> String {
+  let mut i = start_i
+  if i < n && tokens[i].kind == TokenKind::Keyword && tokens[i].raw == "pub" {
+    i = i + 1
+    if i < n && tokens[i].kind == TokenKind::LParen {
+      i = find_matching_delim(tokens, i) + 1
+    }
+  } else if i < n && tokens[i].kind == TokenKind::Keyword && tokens[i].raw == "priv" {
+    i = i + 1
+  }
+  if i >= n {
+    return "<decl>"
+  }
+  let kw = tokens[i].raw
+  let mut ni = i + 1
+  if ni < n && tokens[ni].kind == TokenKind::LBracket {
+    ni = find_matching_delim(tokens, ni) + 1
+  }
+  if ni < n && tokens[ni].kind == TokenKind::Keyword && tokens[ni].raw == "mut" {
+    ni = ni + 1
+  }
+  if ni < n {
+    kw + ":" + tokens[ni].raw
+  } else {
+    kw
+  }
+}
+
 ///| Pre-scan all source files to register intra-package enums, `#callsite(autofill(loc))`,
 ///| and migrated functions with optional defaults into `ctx.symtab`.
+///| Skips declarations excluded by `#cfg(...)` for `ctx.opts.target` (#12a P1-1).
 pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -> Unit {
   for sf in files {
     let tokens = lex_moonbit(sf.content)
     let n = tokens.length() - 1
     let mut i = 0
     let mut next_autofill = false
+    let mut next_cfg_excluded = false
     while i < n {
       let t = tokens[i]
-      if t.kind == TokenKind::Attr && t.raw.starts_with("#callsite") && str_has(t.raw, "autofill(loc)") {
-        next_autofill = true
+      if t.kind == TokenKind::Attr {
+        if t.raw.starts_with("#callsite") && str_has(t.raw, "autofill(loc)") {
+          next_autofill = true
+        } else if t.raw.starts_with("#cfg") {
+          match eval_cfg_attr(t.raw, ctx.opts.target) {
+            Some(false) => next_cfg_excluded = true
+            None => next_cfg_excluded = true
+            Some(true) => ()
+          }
+        }
         i = i + 1
+        continue
+      }
+      if next_cfg_excluded {
+        next_cfg_excluded = false
+        next_autofill = false
+        i = skip_top_level_decl(tokens, i, n)
         continue
       }
       if t.kind == TokenKind::Keyword && t.raw == "enum" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
@@ -1818,12 +2098,15 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
 
     // Collect leading attributes (`#callsite`, `#warnings`, `#deprecated`, `#cfg`, `#derive`)
     let mut pending_derives : Array[String] = []
+    let pending_cfgs : Array[Token] = []
     while i < n && tokens[i].kind == TokenKind::Attr {
       let at = tokens[i]
       attrs_trivia.write_string(at.leading_trivia)
       if at.raw.starts_with("#callsite") && str_has(at.raw, "autofill(loc)") {
         autofill_loc = true
-      } else if at.raw.starts_with("#warnings") || at.raw.starts_with("#deprecated") || at.raw.starts_with("#cfg") {
+      } else if at.raw.starts_with("#cfg") {
+        pending_cfgs.push(at)
+      } else if at.raw.starts_with("#warnings") || at.raw.starts_with("#deprecated") {
         // Strip MoonBit-only compiler directives cleanly
         kept_attrs.write_string("// mbt-attr: " + at.raw + "\n")
       } else if at.raw.starts_with("#derive") {
@@ -1841,6 +2124,68 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
       out_sb.write_string(kept_attrs.to_string())
       break
     }
+
+    // Evaluate `#cfg(...)` attributes statically against `ctx.opts.target` (#12a P1-1):
+    // - Unknown/complex predicate -> fail-loud `MBT2PION_UNSUPPORTED_CFG` + disposition "unsupported"
+    // - Statically false -> skip declaration completely + disposition "excluded_by_cfg"
+    if pending_cfgs.length() > 0 {
+      let mut cfg_unsupported = false
+      let mut cfg_unsupported_raw = ""
+      let mut cfg_excluded = false
+      let mut cfg_excluded_raw = ""
+      for cat in pending_cfgs {
+        match eval_cfg_attr(cat.raw, ctx.opts.target) {
+          None => {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_CFG",
+              sf.rel_path,
+              cat.line,
+              cat.col,
+              "unsupported `#cfg` predicate `" + cat.raw + "` cannot be statically evaluated for target=" + ctx.opts.target,
+            ))
+            cfg_unsupported = true
+            if cfg_unsupported_raw.length() == 0 {
+              cfg_unsupported_raw = cat.raw
+            }
+          }
+          Some(false) => {
+            cfg_excluded = true
+            if cfg_excluded_raw.length() == 0 {
+              cfg_excluded_raw = cat.raw
+            }
+          }
+          Some(true) => ()
+        }
+      }
+      if cfg_unsupported {
+        let lbl = peek_decl_label(tokens, i, n)
+        ctx.dispositions.push(DispositionEntry::{
+          file: sf.rel_path,
+          decl: lbl,
+          line: tokens[i].line,
+          col: tokens[i].col,
+          disposition: "unsupported",
+          detail: "unsupported #cfg predicate " + cfg_unsupported_raw,
+        })
+        i = skip_top_level_decl(tokens, i, n)
+        continue
+      }
+      if cfg_excluded {
+        let lbl = peek_decl_label(tokens, i, n)
+        ctx.dispositions.push(DispositionEntry::{
+          file: sf.rel_path,
+          decl: lbl,
+          line: tokens[i].line,
+          col: tokens[i].col,
+          disposition: "excluded_by_cfg",
+          detail: "excluded by " + cfg_excluded_raw + " for target=" + ctx.opts.target,
+        })
+        i = skip_top_level_decl(tokens, i, n)
+        continue
+      }
+    }
+
+    let decl_err_before = count_error_diags(ctx.diags)
 
     // Parse visibility (`pub`, `pub(all)`, `pub(open)`, `priv`)
     let mut vis = ""
@@ -1896,13 +2241,14 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         })
         out_sb.write_string(attrs_trivia.to_string() + vis_trivia)
         out_sb.write_string("// moved to 00_init_order.pion: " + init_name + "\n")
+        let had_err = count_error_diags(ctx.diags) > decl_err_before
         ctx.dispositions.push(DispositionEntry::{
           file: sf.rel_path,
           decl: init_name,
           line: decl_line,
           col: decl_col,
-          disposition: "moved_to_00_init_order",
-          detail: "fn init lowered to topological let Unit binding",
+          disposition: if had_err { "unsupported" } else { "moved_to_00_init_order" },
+          detail: if had_err { "fn init contains unsupported syntax" } else { "fn init lowered to topological let Unit binding" },
         })
         i = rb + 1
         continue
@@ -1955,13 +2301,14 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         })
         out_sb.write_string(attrs_trivia.to_string() + vis_trivia)
         out_sb.write_string("// moved to 00_init_order.pion: " + pion_name + "\n")
+        let had_err = count_error_diags(ctx.diags) > decl_err_before
         ctx.dispositions.push(DispositionEntry::{
           file: sf.rel_path,
           decl: "let:" + pion_name,
           line: decl_line,
           col: decl_col,
-          disposition: "moved_to_00_init_order",
-          detail: "top-level let scheduled in topological order",
+          disposition: if had_err { "unsupported" } else { "moved_to_00_init_order" },
+          detail: if had_err { "top-level let contains unsupported syntax" } else { "top-level let scheduled in topological order" },
         })
         i = expr_end
         continue
@@ -2284,7 +2631,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         }
         let mut ret_str = ""
         if close_p + 1 < lb && tokens[close_p + 1].kind == TokenKind::Arrow {
+          check_unsupported_error_tokens(ctx, tokens, close_p + 2, lb, sf.rel_path)
           ret_str = " -> " + lower_type_tokens(tokens, close_p + 2, lb, ctx.symtab, ctx.recipes)
+        } else if close_p + 1 < lb {
+          check_unsupported_error_tokens(ctx, tokens, close_p + 1, lb, sf.rel_path)
         }
         let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, p_pre)
         let decl_code = "impl " + trait_name + " for " + self_ty + " {\n  fn " + self_ty + "::" + mname + "(" + typed_params + ")" + ret_str + " " + body + "\n}"
@@ -2302,6 +2652,15 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           end_byte: anchor_end,
           line: decl_line,
           col: decl_col,
+        })
+        let had_err = count_error_diags(ctx.diags) > decl_err_before
+        ctx.dispositions.push(DispositionEntry::{
+          file: sf.rel_path,
+          decl: "impl:" + trait_name + ":" + self_ty + "::" + mname,
+          line: decl_line,
+          col: decl_col,
+          disposition: if had_err { "unsupported" } else { "transpiled" },
+          detail: if had_err { "impl method contains unsupported syntax" } else { "impl method lowered cleanly" },
         })
         i = rb + 1
         continue
@@ -2342,12 +2701,15 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           while r_end < n && tokens[r_end].kind != TokenKind::LBrace {
             r_end = r_end + 1
           }
+          check_unsupported_error_tokens(ctx, tokens, lb + 1, r_end, sf.rel_path)
           ret_str = " -> " + lower_type_tokens(tokens, lb + 1, r_end, ctx.symtab, ctx.recipes)
           lb = r_end
         } else {
+          let sig_start = lb
           while lb < n && tokens[lb].kind != TokenKind::LBrace {
             lb = lb + 1
           }
+          check_unsupported_error_tokens(ctx, tokens, sig_start, lb, sf.rel_path)
         }
         if lb < n {
           let rb = find_matching_delim(tokens, lb)
@@ -2383,13 +2745,14 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             out_end: anchor_end,
             kind: "fn:" + fn_name,
           })
+          let had_err = count_error_diags(ctx.diags) > decl_err_before
           ctx.dispositions.push(DispositionEntry::{
             file: sf.rel_path,
             decl: "fn:" + fn_name,
             line: decl_line,
             col: decl_col,
-            disposition: "transpiled",
-            detail: "function lowered cleanly",
+            disposition: if had_err { "unsupported" } else { "transpiled" },
+            detail: if had_err { "function contains unsupported syntax" } else { "function lowered cleanly" },
           })
           i = rb + 1
           continue
@@ -2427,13 +2790,14 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           line: decl_line,
           col: decl_col,
         })
+        let had_err = count_error_diags(ctx.diags) > decl_err_before
         ctx.dispositions.push(DispositionEntry::{
           file: sf.rel_path,
           decl: "test:" + tname,
           line: decl_line,
           col: decl_col,
-          disposition: "transpiled",
-          detail: "test block lowered with assertions preserved",
+          disposition: if had_err { "unsupported" } else { "transpiled" },
+          detail: if had_err { "test block contains unsupported syntax" } else { "test block lowered with assertions preserved" },
         })
         i = rb + 1
         continue
