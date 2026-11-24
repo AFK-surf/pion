@@ -934,7 +934,7 @@ theorem bin_safe_any {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
       unfold safeDiv at hs ⊢
       simp only [maskC_idem]
       exact hs
-    cases op <;> simp [evalBin, hsm]
+    cases op <;> simp [evalBin, hsm, ite_some_some_ne_none]
 
 /-- A target instruction the replay may run without a source counterpart: no effect on the
 world, and no trap (a division only when its divisor is a safe constant, its value checked). -/

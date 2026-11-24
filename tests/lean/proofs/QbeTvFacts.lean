@@ -1185,9 +1185,14 @@ def trapOp : BinOp → Bool
 theorem is_trapping_binop_spec (op : BinOp) : is_trapping_binop op = ok (trapOp op) := by
   cases op <;> rfl
 
+/-- An `if` whose arms are both `some` is never `none` (the `s = 0` split of `Ror`). -/
+theorem ite_some_some_ne_none {α : Type} (p : Prop) [Decidable p] (a b : α) :
+    ¬((if p then some a else some b) = none) := by
+  split <;> simp
+
 theorem evalBin_some_of_not_trap {op : BinOp} (h : trapOp op = false) (c : Cls) (x y : BitVec 64) :
     evalBin c op x y ≠ none := by
-  cases op <;> simp [trapOp] at h <;> simp [evalBin]
+  cases op <;> simp [trapOp] at h <;> simp [evalBin, ite_some_some_ne_none]
 
 theorem asS_maskC (c : Cls) (x : BitVec 64) : asS c (maskC c x) = asS c x := by
   cases c
@@ -1286,7 +1291,7 @@ theorem bin_safe_sound {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
       unfold safeDiv at hs ⊢
       simp only [maskC_idem]
       exact hs
-    cases op <;> simp [evalBin, hsm]
+    cases op <;> simp [evalBin, hsm, ite_some_some_ne_none]
 
 /-! ## Branch facts and `apply_facts` -/
 
