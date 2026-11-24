@@ -1156,6 +1156,59 @@ if os.path.exists(fresh_upper) and os.path.samefile(fresh_out, fresh_upper):
     assert "a.pion" in entries10g and "report.json" in entries10g and "ledger.json" in entries10g, f"10g missing files in fresh_output: {entries10g}"
 
 print("[e2e] PASS: Round 9 Astra P0/P1 suite (hardlink backup retained.json preserved, non-existent Équipe/équipe subdir collision, brand-new fresh_output/FRESH_OUTPUT atomic delivery)")
+
+# 10h. Round 10 Astra P0: 0555 read-only subdir `OUT/reports/` with `Migration.json` hardlinked to
+#      `retained.json`: re-publishing with `--report OUT/reports/migration.json` MUST preserve
+#      `retained.json` byte-for-byte with old content AND preserve `0555` mode on `OUT/reports`!
+s10h = os.path.join(root, "s10h")
+o10h = os.path.join(root, "o10h")
+os.makedirs(s10h, exist_ok=True)
+with open(os.path.join(s10h, "a.mbt"), "w") as f:
+    f.write("pub fn ro_v1() -> Int { 1 }\n")
+rep10h_dir = os.path.join(o10h, "reports")
+rep10h_cap = os.path.join(rep10h_dir, "Migration.json")
+rep10h_low = os.path.join(rep10h_dir, "migration.json")
+rep10h_ret = os.path.join(rep10h_dir, "retained.json")
+r10h_1 = run_cli(["--src", s10h, "--out", o10h, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--report", rep10h_cap])
+assert r10h_1.returncode == 0, f"10h v1 publish failed: {r10h_1.stderr}"
+old_10h_bytes = open(rep10h_cap, "rb").read()
+os.link(rep10h_cap, rep10h_ret)
+os.chmod(rep10h_dir, 0o555)
+try:
+    with open(os.path.join(s10h, "a.mbt"), "w") as f:
+        f.write("pub fn ro_v2_a() -> Int { 2 }\npub fn ro_v2_b() -> Int { 3 }\n")
+    r10h_2 = run_cli(["--src", s10h, "--out", o10h, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc,
+                      "--report", rep10h_low])
+    assert r10h_2.returncode == 0, f"10h v2 publish in 0555 reports/ failed: {r10h_2.returncode} {r10h_2.stderr}"
+    new_10h_bytes = open(rep10h_low, "rb").read()
+    assert new_10h_bytes != old_10h_bytes, "10h migration.json was not updated!"
+    assert os.path.isfile(rep10h_ret), "10h retained.json was deleted!"
+    assert open(rep10h_ret, "rb").read() == old_10h_bytes, "10h retained.json bytes corrupted by shared-inode overwrite!"
+    assert (os.stat(rep10h_dir).st_mode & 0o777) == 0o555, f"10h reports/ mode changed: {oct(os.stat(rep10h_dir).st_mode & 0o777)}"
+
+    # 10i. Round 10 Astra P0: 0555 read-only subdir `OUT/reports/` Unicode `État.json` vs `état.json`
+    folds_ro = volume_folds(root, "\u00c9tat.json", "\u00e9tat.json")
+    snap_10i = {p: open(os.path.join(rep10h_dir, p), "rb").read() for p in sorted(os.listdir(rep10h_dir))}
+    r10i = run_cli(["--src", s10h, "--out", o10h, "--target", "native", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc,
+                    "--report", os.path.join(rep10h_dir, "\u00c9tat.json"),
+                    "--drift-ledger", os.path.join(rep10h_dir, "\u00e9tat.json")])
+    if folds_ro:
+        assert r10i.returncode == 1, f"10i 0555 reports/ État/état must block on folding volume, got {r10i.returncode}"
+        assert "MBT2PION_REPORT_PATH_COLLISION" in (r10i.stdout + r10i.stderr), "10i missing collision code"
+        assert {p: open(os.path.join(rep10h_dir, p), "rb").read() for p in sorted(os.listdir(rep10h_dir))} == snap_10i, "10i 0555 reports/ mutated!"
+    else:
+        assert r10i.returncode == 0, f"10i 0555 reports/ État/état must succeed on case-sensitive volume, got {r10i.returncode} {r10i.stderr}"
+        assert "files_generated" in json.load(open(os.path.join(rep10h_dir, "\u00c9tat.json")))
+        assert "unresolved_entries" in json.load(open(os.path.join(rep10h_dir, "\u00e9tat.json")))
+finally:
+    if os.path.isdir(rep10h_dir):
+        os.chmod(rep10h_dir, 0o755)
+
+print("[e2e] PASS: Round 10 Astra P0 suite (0555 read-only subdir hardlink backup preserved + 0555 mode kept + 0555 Unicode État/état collision)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"

@@ -121,6 +121,26 @@ int mbt_fs_same_inode(const char *a, const char *b) {
     return (sa.st_dev == sb.st_dev && sa.st_ino == sb.st_ino) ? 1 : 0;
 }
 
+/* Return 1 if paths `a` and `b` reside on the same filesystem device (st_dev), 0 otherwise. */
+int mbt_fs_same_dev(const char *a, const char *b) {
+    if (!a || !b) {
+        return 0;
+    }
+    struct stat sa, sb;
+    if (stat(a, &sa) != 0 || stat(b, &sb) != 0) {
+        return 0;
+    }
+    return (sa.st_dev == sb.st_dev) ? 1 : 0;
+}
+
+/* Return 1 if directory `path` is writable and searchable by the current user, 0 otherwise. */
+int mbt_fs_dir_writable(const char *path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    return (access(path, W_OK | X_OK) == 0) ? 1 : 0;
+}
+
 /* Kernel-truth check whether two filenames (`name_a`, `name_b`, basenames only) collide on the
  * filesystem volume backing `dir` (covers ASCII case-folding, Unicode État/état, APFS NFC/NFD, etc.).
  * Returns 1 if colliding, 0 if distinct, -1 on error (e.g. unwritable dir). Always cleans up.

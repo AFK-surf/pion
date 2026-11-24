@@ -34,6 +34,8 @@ extern "C" fn c_fs_hardlink(oldpath : Ptr, newpath : Ptr) -> Int = "mbt_fs_hardl
 extern "C" fn c_fs_dir_readable(path : Ptr) -> Int = "mbt_fs_dir_readable"
 extern "C" fn c_fs_realpath(path : Ptr, out : Ptr, cap : Int) -> Int = "mbt_fs_realpath"
 extern "C" fn c_fs_same_inode(a : Ptr, b : Ptr) -> Int = "mbt_fs_same_inode"
+extern "C" fn c_fs_same_dev(a : Ptr, b : Ptr) -> Int = "mbt_fs_same_dev"
+extern "C" fn c_fs_dir_writable(path : Ptr) -> Int = "mbt_fs_dir_writable"
 extern "C" fn c_fs_names_collide_in_dir(dir : Ptr, name_a : Ptr, name_b : Ptr) -> Int = "mbt_fs_names_collide_in_dir"
 
 fn atomic_swap_dir(a : String, b : String) -> Bool {
@@ -72,6 +74,20 @@ fn fs_same_inode(a : String, b : String) -> Bool {
   c_fs_same_inode(a.as_cstr(), b.as_cstr()) == 1
 }
 
+fn fs_same_dev(a : String, b : String) -> Bool {
+  if a.length() == 0 || b.length() == 0 {
+    return false
+  }
+  c_fs_same_dev(a.as_cstr(), b.as_cstr()) == 1
+}
+
+fn fs_dir_writable(path : String) -> Bool {
+  if path.length() == 0 {
+    return false
+  }
+  c_fs_dir_writable(path.as_cstr()) == 1
+}
+
 fn fs_names_collide_in_dir(dir : String, name_a : String, name_b : String) -> Int {
   if dir.length() == 0 || name_a.length() == 0 || name_b.length() == 0 {
     return -1
@@ -107,9 +123,34 @@ fn nearest_existing_dir(world : World, start : String) -> String {
   if cur.length() == 0 { "." } else { cur }
 }
 
-///| Kernel-truth recursive directory identity check (Astra Round 9 P0/P1):
-///| returns 1 if `d1` and `d2` denote the same directory on the target volume (even if not yet created!),
-///| 0 if distinct, -1 on probe error. Only calls `fs_same_inode` on EXISTING directories (never files).
+///| Find the nearest writable ancestor directory on the EXACT SAME filesystem device (`st_dev`)
+///| as `nearest_existing_dir(world, start)` so `0555` read-only subdirectories still get 100%
+///| exact kernel-truth volume collision checks without crossing mount boundaries (Astra Round 10 P0).
+fn nearest_writable_same_dev_dir(world : World, start : String) -> Option[String] {
+  let anchor = nearest_existing_dir(world, start)
+  if !fs_is_dir(world, anchor) {
+    return None
+  }
+  let mut cur = anchor
+  while cur.length() > 0 {
+    if !fs_same_dev(cur, anchor) {
+      return None
+    }
+    if fs_dir_writable(cur) {
+      return Some(cur)
+    }
+    let up = dirname(cur)
+    if up == cur || up.length() == 0 {
+      return None
+    }
+    cur = up
+  }
+  None
+}
+
+///| Kernel-truth recursive directory identity check (Astra Round 9/10 P0/P1):
+///| returns 1 if `d1` and `d2` denote the same directory on the target volume (even if not yet created
+///| or inside a `0555` read-only subdir), 0 if distinct, -1 on probe error (strictly fail-closed).
 fn vol_dirs_same(world : World, d1 : String, d2 : String) -> Int {
   if d1.length() == 0 || d2.length() == 0 {
     return 0
@@ -137,13 +178,15 @@ fn vol_dirs_same(world : World, d1 : String, d2 : String) -> Int {
   if b1 == b2 {
     return 1
   }
-  let probe_dir = nearest_existing_dir(world, p1)
-  fs_names_collide_in_dir(probe_dir, b1, b2)
+  match nearest_writable_same_dev_dir(world, p1) {
+    Some(probe_dir) => fs_names_collide_in_dir(probe_dir, b1, b2)
+    None => -1
+  }
 }
 
-///| Kernel-truth directory-entry identity check (Astra Round 9 P0/P1):
-///| returns 1 if `p1` and `p2` denote the same directory entry (same parent dir + colliding leaf name
-///| on the target volume), 0 if distinct (including distinct hardlinks to the same file inode!), -1 on error.
+///| Kernel-truth directory-entry identity check (Astra Round 9/10 P0/P1):
+///| returns 1 if `p1` and `p2` denote the same directory entry, 0 if distinct (including distinct
+///| hardlinks to the same file inode!), -1 on probe error (strictly fail-closed).
 fn vol_same_dir_entry(world : World, p1 : String, p2 : String) -> Int {
   if p1.length() == 0 || p2.length() == 0 {
     return 0
@@ -162,13 +205,10 @@ fn vol_same_dir_entry(world : World, p1 : String, p2 : String) -> Int {
   if b1 == b2 {
     return 1
   }
-  let probe_dir = nearest_existing_dir(world, d1)
-  fs_names_collide_in_dir(probe_dir, b1, b2)
-}
-
-///| Kernel-truth check whether two normalized report paths collide on the target volume.
-fn report_paths_collide_on_volume(world : World, p1 : String, p2 : String) -> Bool {
-  vol_same_dir_entry(world, p1, p2) == 1
+  match nearest_writable_same_dev_dir(world, d1) {
+    Some(probe_dir) => fs_names_collide_in_dir(probe_dir, b1, b2)
+    None => -1
+  }
 }
 
 ///| Resolve a path to its canonical realpath (normalizing `/tmp` -> `/private/tmp`, etc.);
@@ -635,18 +675,17 @@ fn normalize_path(cwd : String, p : String) -> String {
   if out.length() == 0 { "." } else { out }
 }
 
-///| If `target` lies strictly inside `root_dir`, return its relative path under `root_dir`.
-///| Uses recursive kernel-truth `vol_dirs_same` so both existing and brand-new `--out output`
-///| with `--report OUTPUT/report.json` on case-insensitive APFS is recognized as in-`--out` (Astra Round 9 P1).
-fn rel_path_within(world : World, cwd : String, root_dir : String, target : String) -> Option[String] {
+///| If `target` lies strictly inside `root_dir`, return `(Some(rel), false)`.
+///| Uses recursive kernel-truth `vol_dirs_same` and propagates probe failures as `(None, true)` (fail-closed, Astra Round 10 P0).
+fn rel_path_within(world : World, cwd : String, root_dir : String, target : String) -> (Option[String], Bool) {
   if root_dir.length() == 0 || target.length() == 0 {
-    return None
+    return (None, false)
   }
   let nr = normalize_path(cwd, root_dir)
   let nt = normalize_path(cwd, target)
   let prefix = if nr == "/" { "/" } else { nr + "/" }
   if nt.starts_with(prefix) && nt.length() > prefix.length() {
-    return Some(nt.slice(prefix.length(), nt.length()))
+    return (Some(nt.slice(prefix.length(), nt.length())), false)
   }
   let tail : Array[String] = []
   let mut cur = nt
@@ -658,7 +697,11 @@ fn rel_path_within(world : World, cwd : String, root_dir : String, target : Stri
       break
     }
     tail.push(base)
-    if vol_dirs_same(world, next_cur, nr) == 1 {
+    let cmp = vol_dirs_same(world, next_cur, nr)
+    if cmp < 0 {
+      return (None, true)
+    }
+    if cmp == 1 {
       let sb = StringBuilder()
       let mut k = tail.length() - 1
       while k >= 0 {
@@ -668,11 +711,11 @@ fn rel_path_within(world : World, cwd : String, root_dir : String, target : Stri
         sb.write_string(tail[k])
         k = k - 1
       }
-      return Some(sb.to_string())
+      return (Some(sb.to_string()), false)
     }
     cur = next_cur
   }
-  None
+  (None, false)
 }
 
 ///| Check whether an existing `.pion` path is a regular file (NOT a symlink) managed by `mbt2pion`.
@@ -1208,9 +1251,13 @@ pub fn main(world : World) -> Int {
   let out_kind = if clean_out_dir.length() > 0 { lstat_kind(world, clean_out_dir) } else { None }
   let out_existed_as_dir = match out_kind { Some("dir") => true, _ => false }
   let out_dir_mode = if out_existed_as_dir { fs_lstat_mode(clean_out_dir) } else { -1 }
-  let report_in_out_rel = rel_path_within(world, cwd, clean_out_dir, report_path)
-  let drift_in_out_rel = rel_path_within(world, cwd, clean_out_dir, drift_ledger_path)
-  let run_in_out_rel = rel_path_within(world, cwd, clean_out_dir, run_report_path)
+  let mut fs_fatal_err = ""
+  let (report_in_out_rel, rep_probe_err) = rel_path_within(world, cwd, clean_out_dir, report_path)
+  let (drift_in_out_rel, drf_probe_err) = rel_path_within(world, cwd, clean_out_dir, drift_ledger_path)
+  let (run_in_out_rel, run_probe_err) = rel_path_within(world, cwd, clean_out_dir, run_report_path)
+  if rep_probe_err || drf_probe_err || run_probe_err {
+    fs_fatal_err = "failed volume path-equivalence probe for report path against --out"
+  }
   let norm_out_dir = if clean_out_dir.length() > 0 { normalize_path(cwd, clean_out_dir) } else { "" }
   let norm_report_path = if report_path.length() > 0 { normalize_path(cwd, report_path) } else { "" }
   let norm_drift_path = if drift_ledger_path.length() > 0 { normalize_path(cwd, drift_ledger_path) } else { "" }
@@ -1220,7 +1267,6 @@ pub fn main(world : World) -> Int {
   let unmanaged_dirs : Array[(String, Int)] = []
   let unmanaged_symlinks : Array[(String, String)] = []
   let unmanaged_files : Array[(String, Int)] = []
-  let mut fs_fatal_err = ""
   let gen_set : Map[String, Bool] = Map()
   let gen_set_lower : Map[String, Bool] = Map()
   for gf in final_files {
@@ -1228,8 +1274,8 @@ pub fn main(world : World) -> Int {
     gen_set_lower[str_to_lower(gf.rel_path)] = true
   }
 
-  // Astra Round 4 P0-1 + Round 7 P1: Validate all 3 report paths for role collisions
-  // using ASCII case-folding (safe on both case-insensitive macOS APFS and case-sensitive Linux)
+  // Astra Round 4 P0-1 + Round 7..10: Validate all 3 report paths for role collisions
+  // (ASCII case-folding + kernel-truth volume equivalence, strictly fail-closed on probe error)
   // BEFORE touching `--out`!
   let norm_out_lower = str_to_lower(norm_out_dir)
   let norm_report_lower = str_to_lower(norm_report_path)
@@ -1238,26 +1284,38 @@ pub fn main(world : World) -> Int {
   let mut report_path_bad = false
   let mut drift_path_bad = false
   let mut run_path_bad = false
-  if norm_report_lower.length() > 0 && norm_drift_lower.length() > 0 &&
-  (norm_report_lower == norm_drift_lower || report_paths_collide_on_volume(world, norm_report_path, norm_drift_path)) {
-    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --drift-ledger point to the same (or colliding) path: " + report_path + " vs " + drift_ledger_path))
-    final_blockers = final_blockers + 1
-    report_path_bad = true
-    drift_path_bad = true
+  if norm_report_lower.length() > 0 && norm_drift_lower.length() > 0 {
+    let vc = if norm_report_lower == norm_drift_lower { 1 } else { vol_same_dir_entry(world, norm_report_path, norm_drift_path) }
+    if vc == 1 {
+      final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --drift-ledger point to the same (or colliding) path: " + report_path + " vs " + drift_ledger_path))
+      final_blockers = final_blockers + 1
+      report_path_bad = true
+      drift_path_bad = true
+    } else if vc < 0 && fs_fatal_err.length() == 0 {
+      fs_fatal_err = "failed volume collision probe between --report and --drift-ledger"
+    }
   }
-  if norm_report_lower.length() > 0 && norm_run_lower.length() > 0 &&
-  (norm_report_lower == norm_run_lower || report_paths_collide_on_volume(world, norm_report_path, norm_run_path)) {
-    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --run-report point to the same (or colliding) path: " + report_path + " vs " + run_report_path))
-    final_blockers = final_blockers + 1
-    report_path_bad = true
-    run_path_bad = true
+  if norm_report_lower.length() > 0 && norm_run_lower.length() > 0 {
+    let vc = if norm_report_lower == norm_run_lower { 1 } else { vol_same_dir_entry(world, norm_report_path, norm_run_path) }
+    if vc == 1 {
+      final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", report_path, 1, 1, "--report and --run-report point to the same (or colliding) path: " + report_path + " vs " + run_report_path))
+      final_blockers = final_blockers + 1
+      report_path_bad = true
+      run_path_bad = true
+    } else if vc < 0 && fs_fatal_err.length() == 0 {
+      fs_fatal_err = "failed volume collision probe between --report and --run-report"
+    }
   }
-  if norm_drift_lower.length() > 0 && norm_run_lower.length() > 0 &&
-  (norm_drift_lower == norm_run_lower || report_paths_collide_on_volume(world, norm_drift_path, norm_run_path)) {
-    final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", drift_ledger_path, 1, 1, "--drift-ledger and --run-report point to the same (or colliding) path: " + drift_ledger_path + " vs " + run_report_path))
-    final_blockers = final_blockers + 1
-    drift_path_bad = true
-    run_path_bad = true
+  if norm_drift_lower.length() > 0 && norm_run_lower.length() > 0 {
+    let vc = if norm_drift_lower == norm_run_lower { 1 } else { vol_same_dir_entry(world, norm_drift_path, norm_run_path) }
+    if vc == 1 {
+      final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", drift_ledger_path, 1, 1, "--drift-ledger and --run-report point to the same (or colliding) path: " + drift_ledger_path + " vs " + run_report_path))
+      final_blockers = final_blockers + 1
+      drift_path_bad = true
+      run_path_bad = true
+    } else if vc < 0 && fs_fatal_err.length() == 0 {
+      fs_fatal_err = "failed volume collision probe between --drift-ledger and --run-report"
+    }
   }
   let report_checks : Array[(Int, String, String, Option[String])] = [
     (0, "--report", norm_report_path, report_in_out_rel),
@@ -1274,7 +1332,16 @@ pub fn main(world : World) -> Int {
     }
     let rnorm_lower = str_to_lower(rnorm)
     let mut bad = false
-    if norm_out_lower.length() > 0 && (rnorm_lower == norm_out_lower || vol_dirs_same(world, rnorm, norm_out_dir) == 1) {
+    let out_cmp = if norm_out_lower.length() == 0 {
+      0
+    } else if rnorm_lower == norm_out_lower {
+      1
+    } else {
+      vol_dirs_same(world, rnorm, norm_out_dir)
+    }
+    if out_cmp < 0 && fs_fatal_err.length() == 0 {
+      fs_fatal_err = "failed volume directory probe comparing " + rflag + " against --out"
+    } else if out_cmp == 1 {
       final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", rnorm, 1, 1, rflag + " cannot point to --out directory itself: " + rnorm))
       final_blockers = final_blockers + 1
       bad = true
@@ -1463,11 +1530,38 @@ pub fn main(world : World) -> Int {
         let mode_bits = fm.1
         let src = join_path(clean_out_dir, rel)
         let norm_src = normalize_path(cwd, src)
-        if mode == "publish" &&
-        ((report_rel_str.length() > 0 && (rel == report_rel_str || vol_same_dir_entry(world, norm_src, norm_report_path) == 1)) ||
-          (drift_rel_str.length() > 0 && (rel == drift_rel_str || vol_same_dir_entry(world, norm_src, norm_drift_path) == 1)) ||
-          (run_rel_str.length() > 0 && (rel == run_rel_str || vol_same_dir_entry(world, norm_src, norm_run_path) == 1))) {
-          continue
+        if mode == "publish" {
+          let mut skip_old_report = false
+          if report_rel_str.length() > 0 {
+            let rc_rep = if rel == report_rel_str { 1 } else { vol_same_dir_entry(world, norm_src, norm_report_path) }
+            if rc_rep < 0 {
+              io_eprintln(world, "mbt2pion: failed volume directory-entry probe for " + src)
+              stage_ok = false
+              break
+            }
+            if rc_rep == 1 { skip_old_report = true }
+          }
+          if !skip_old_report && drift_rel_str.length() > 0 {
+            let rc_drf = if rel == drift_rel_str { 1 } else { vol_same_dir_entry(world, norm_src, norm_drift_path) }
+            if rc_drf < 0 {
+              io_eprintln(world, "mbt2pion: failed volume directory-entry probe for " + src)
+              stage_ok = false
+              break
+            }
+            if rc_drf == 1 { skip_old_report = true }
+          }
+          if !skip_old_report && run_rel_str.length() > 0 {
+            let rc_run = if rel == run_rel_str { 1 } else { vol_same_dir_entry(world, norm_src, norm_run_path) }
+            if rc_run < 0 {
+              io_eprintln(world, "mbt2pion: failed volume directory-entry probe for " + src)
+              stage_ok = false
+              break
+            }
+            if rc_run == 1 { skip_old_report = true }
+          }
+          if skip_old_report {
+            continue
+          }
         }
         let dst = join_path(stage_dir, rel)
         let parent = dirname(dst)
@@ -1675,42 +1769,34 @@ pub fn main(world : World) -> Int {
         }
       }
 
-      // Phase 1b: Stage ALL in-`--out` reports into `stage_dir` & restore directory modes
+      // Phase 1b: Stage ALL in-`--out` reports into `stage_dir` using fresh-inode atomic replace
+      // (`write_file_atomic`, NEVER in-place overwrite of a shared hardlink inode!) & restore dir modes
       if ext_io_ok {
         if report_is_in_out && !report_path_bad {
           let dst = join_path(stage_dir, report_rel_str)
-          let parent = dirname(dst)
-          if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-          match fs_write(world, dst, report_json) {
-            Ok(_) => report_written = true
-            Err(e) => {
-              io_eprintln(world, "mbt2pion: failed staging report " + dst + ": " + e)
-              stage_ok = false
-            }
+          if write_file_atomic(world, dst, report_json, uniq_tag + "sr") {
+            report_written = true
+          } else {
+            io_eprintln(world, "mbt2pion: failed staging report " + dst)
+            stage_ok = false
           }
         }
         if stage_ok && drift_is_in_out && !drift_path_bad {
           let dst = join_path(stage_dir, drift_rel_str)
-          let parent = dirname(dst)
-          if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-          match fs_write(world, dst, drift_json) {
-            Ok(_) => drift_written = true
-            Err(e) => {
-              io_eprintln(world, "mbt2pion: failed staging drift ledger " + dst + ": " + e)
-              stage_ok = false
-            }
+          if write_file_atomic(world, dst, drift_json, uniq_tag + "sd") {
+            drift_written = true
+          } else {
+            io_eprintln(world, "mbt2pion: failed staging drift ledger " + dst)
+            stage_ok = false
           }
         }
         if stage_ok && run_is_in_out && !run_path_bad {
           let dst = join_path(stage_dir, run_rel_str)
-          let parent = dirname(dst)
-          if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
-          match fs_write(world, dst, stage_run_json) {
-            Ok(_) => run_written = true
-            Err(e) => {
-              io_eprintln(world, "mbt2pion: failed staging run report " + dst + ": " + e)
-              stage_ok = false
-            }
+          if write_file_atomic(world, dst, stage_run_json, uniq_tag + "su") {
+            run_written = true
+          } else {
+            io_eprintln(world, "mbt2pion: failed staging run report " + dst)
+            stage_ok = false
           }
         }
         if stage_ok {
