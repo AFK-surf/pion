@@ -48008,6 +48008,247 @@ fn qbe_try_emit_let_match_opt_res(
 }
 
 ///|
+///| Cached headers for two consecutive scalar reads at the same Int index.
+pub struct QbeReadPair {
+  a : QbeLocal
+  b : QbeLocal
+  index : QbeLocal
+}
+
+fn qbe_pair_container(t : Ty) -> Bool {
+  match t {
+    TArray(TInt) | TFixedArray(TInt) | TImmArray(TInt) | TStrView | TBytesView => true
+    _ => false
+  }
+}
+
+///| Prove header stability, not element stability. In-place indexed writes can
+/// change elements, so the fast path still reads both payloads on every visit.
+/// 'fresh' is lexical: each entry denotes an immutable binding initialized by
+/// an array literal after both cached objects were already live.
+fn qbe_pair_expr(g : QbeGen, e : Expr, p : QbeReadPair, h : QbeProbeHints, fresh : Array[String]) -> Bool {
+  match e {
+    EInt(_, _) | EInt64(_, _) | EBool(_, _) | EUnit(_) => true
+    EIdent(n, _) => n != p.a.name && n != p.b.name &&
+      (qbe_hints_get(h, n) is Some(_) || qbe_lookup_local(g, n) is Some(_) ||
+        (g.mono_pkg == "" && g.const_int_vals.contains(n)))
+    EUnary(_, v, _) | EField(v, _, _) => qbe_pair_expr(g, v, p, h, fresh)
+    EBinary(op, l, r, _) => op != "|>" && qbe_pair_expr(g, l, p, h, fresh) && qbe_pair_expr(g, r, p, h, fresh)
+    EIndex(obj, ix, _) => {
+      if !qbe_pair_expr(g, ix, p, h, fresh) { return false }
+      match obj {
+        EIdent(n, _) => if n == p.a.name || n == p.b.name { return true }
+        _ => ()
+      }
+      match qbe_probe_expr_ty_with(g, obj, h) {
+        Some(TArray(_)) | Some(TFixedArray(_)) | Some(TImmArray(_)) | Some(TStrView) | Some(TBytesView) =>
+          qbe_pair_expr(g, obj, p, h, fresh)
+        _ => false
+      }
+    }
+    EMethodCall(EIdent(n, _), m, args, sp) => {
+      if qbe_has_expected_trait(g, sp) { return false }
+      let rt = qbe_probe_expr_ty_with(g, EIdent(n, sp), h)
+      if m == "length" && args.length() == 0 {
+        return match rt {
+          Some(TArray(_)) | Some(TFixedArray(_)) | Some(TImmArray(_)) | Some(TStrView) | Some(TBytesView) => true
+          _ => false
+        }
+      }
+      // The pair accepts only Int arrays or byte views. A nested array's
+      // outer header cannot be either input, even if its elements alias them.
+      m == "push" && args.length() == 1 &&
+        (str_arr_contains(fresh, n) || (match rt { Some(TArray(TArray(_))) => true
+      _ => false })) &&
+        qbe_pair_expr(g, args[0], p, h, fresh)
+    }
+    EBlock(ss, _) => qbe_pair_stmts(g, ss, p, h, fresh)
+    EIf(c, ts, eo, _) => qbe_pair_expr(g, c, p, h, fresh) &&
+      qbe_pair_stmts(g, ts, p, h, fresh) &&
+      (match eo { Some(el) => qbe_pair_expr(g, el, p, h, fresh)
+      None => true })
+    EArrayLit(xs, _) => xs.length() == 0
+    EStructLit(_, None, fs, _) => {
+      let mut i = 0
+      while i < fs.length() {
+        if !qbe_pair_expr(g, fs[i].value, p, h, fresh) { return false }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+fn qbe_pair_stmts(g : QbeGen, ss : Array[Stmt], p : QbeReadPair, outer : QbeProbeHints, inherited : Array[String]) -> Bool {
+  let h = qbe_hints_copy(outer)
+  let fresh = inherited.copy()
+  let mut i = 0
+  while i < ss.length() {
+    match ss[i] {
+      SLet(n, is_mut, te, v, sp) => {
+        if n == p.a.name || n == p.b.name || str_arr_contains(fresh, n) ||
+          !qbe_pair_expr(g, v, p, h, fresh) { return false }
+        let t = match te {
+          TyMissing(_) => match qbe_let_infer(g, sp) { Some(t) => t
+      None => TError }
+          _ => qbe_resolve_type(g, te)
+        }
+        qbe_hints_set(h, n, t)
+        match (v, t) {
+          (EArrayLit(_, _), TArray(_)) => if !is_mut && n != "_" { fresh.push(n) }
+          _ => ()
+        }
+      }
+      SWhile(c, b, _) => if !qbe_pair_expr(g, c, p, h, fresh) || !qbe_pair_stmts(g, b, p, h, fresh) { return false }
+      SAssign(l, r, _) | SCompoundAssign(_, l, r, _) => {
+        match l {
+          EIdent(n, _) => if n == p.a.name || n == p.b.name || str_arr_contains(fresh, n) ||
+            !(qbe_hints_get(h, n) is Some(_) || qbe_lookup_local(g, n) is Some(_)) { return false }
+          EIndex(obj, _, _) => {
+            match obj {
+              EIdent(n, _) => if n == p.a.name || n == p.b.name { return false }
+              _ => ()
+            }
+            if !qbe_pair_expr(g, l, p, h, fresh) { return false }
+          }
+          _ => return false
+        }
+        if !qbe_pair_expr(g, r, p, h, fresh) { return false }
+      }
+      SExpr(v, _) | SReturn(Some(v), _) => if !qbe_pair_expr(g, v, p, h, fresh) { return false }
+      SReturn(None, _) | SBreak(_) | SContinue(_) => ()
+      _ => return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+fn qbe_read_pair(g : QbeGen, cond : Expr, body : Array[Stmt]) -> Option[QbeReadPair] {
+  if g.target_wasm || body.length() < 3 || g.promoted_push_len.length() > 0 { return None }
+  match (body[0], body[1]) {
+    (SLet(x, false, TyMissing(_), EIndex(EIdent(a, _), EIdent(i, _), _), _),
+     SLet(y, false, TyMissing(_), EIndex(EIdent(b, _), EIdent(j, _), _), _)) => {
+      if g.boxed_mut_vars.contains(x) || g.boxed_mut_vars.contains(y) ||
+        i != j || x == "_" || y == "_" || x == i || x == b || x == a || y == i || y == a || y == b || x == y { return None }
+      match (qbe_lookup_local(g, a), qbe_lookup_local(g, b), qbe_lookup_local(g, i)) {
+        (Some(aa), Some(bb), Some(ix)) => {
+          if aa.is_cell || bb.is_cell || ix.is_cell || aa.ref_slot != "" || bb.ref_slot != "" ||
+            !qbe_pair_container(aa.ty) || !qbe_pair_container(bb.ty) { return None }
+          match ix.ty { TInt => ()
+      _ => return None }
+          let p = QbeReadPair::{ a: aa, b: bb, index: ix }
+          let h = qbe_hints_new()
+          if qbe_pair_expr(g, cond, p, h, []) && qbe_pair_stmts(g, body, p, h, []) { return Some(p) }
+        }
+        _ => ()
+      }
+    }
+    _ => ()
+  }
+  None
+}
+
+pub struct QbePairHead {
+  len : String
+  data : String
+}
+
+fn qbe_pair_head(g : QbeGen, v : QbeLocal) -> QbePairHead {
+  let obj = qbe_tmp(g)
+  qbe_emit(g, obj + " =l loadl " + v.slot)
+  let view = match v.ty { TStrView | TBytesView => true
+      _ => false }
+  let lp = if view {
+    let r = qbe_tmp(g)
+    qbe_emit(g, r + " =l add " + obj + ", 16")
+    r
+  } else { obj }
+  let pp = qbe_tmp(g)
+  let len = qbe_tmp(g)
+  let data = qbe_tmp(g)
+  qbe_emit(g, pp + " =l add " + obj + (if view { ", 8" } else { ", 24" }))
+  qbe_emit(g, len + " =l loadl " + lp)
+  qbe_emit(g, data + " =l loadl " + pp)
+  QbePairHead::{ len: len, data: data }
+}
+
+fn qbe_pair_select(g : QbeGen, cmp : String, yes : String, no : String) -> String {
+  let t = qbe_lbl(g, "pair_t")
+  let f = qbe_lbl(g, "pair_f")
+  let end = qbe_lbl(g, "pair_merge")
+  qbe_emit_term(g, "jnz " + cmp + ", " + t + ", " + f)
+  qbe_emit_lbl(g, t)
+  qbe_emit_term(g, "jmp " + end)
+  qbe_emit_lbl(g, f)
+  qbe_emit_term(g, "jmp " + end)
+  qbe_emit_lbl(g, end)
+  let v = qbe_tmp(g)
+  qbe_emit(g, v + " =l phi " + t + " " + yes + ", " + f + " " + no)
+  v
+}
+
+fn qbe_pair_bind(g : QbeGen, s : Stmt, v : QbeLocal, dp : String, ix : String) -> Unit {
+  match s {
+    SLet(name, _, _, _, _) => {
+      let loaded = match v.ty {
+        TStrView | TBytesView => {
+          let ep = qbe_tmp(g)
+          let w = qbe_tmp(g)
+          qbe_emit(g, ep + " =l add " + dp + ", " + ix)
+          qbe_emit(g, w + " =w loadub " + ep)
+          match v.ty { TBytesView => qval(qbe_as_l(g, qval(w, TInt)), TByte)
+      _ => qval(w,TInt) }
+        }
+        _ => {
+          let ep = qbe_emit_arr_ep_ty(g, dp, ix, TInt)
+          qval(qbe_load_arr_elem(g, ep, TInt), TInt)
+        }
+      }
+      let loc = qbe_define_local(g, name, loaded.ty, false)
+      qbe_store_local_slot(g, loaded.reg, loc.slot, loaded.ty)
+    }
+    _ => ()
+  }
+}
+
+///| Entered only after the original first condition succeeded. The cold
+/// branch reports exactly the first failing length, including for negative i.
+fn qbe_pair_body(g : QbeGen, p : QbeReadPair, body : Array[Stmt], loop_body : String) -> QbeVal {
+  let a = qbe_pair_head(g, p.a)
+  let b = if p.a.slot == p.b.slot { a } else { qbe_pair_head(g, p.b) }
+  let limit = if p.a.slot == p.b.slot { a.len } else {
+    let cmp = qbe_tmp(g)
+    qbe_emit(g, cmp + " =w cultl " + a.len + ", " + b.len)
+    qbe_pair_select(g, cmp, a.len, b.len)
+  }
+  qbe_emit_term(g, "jmp " + loop_body)
+  qbe_emit_lbl(g, loop_body)
+  let ix = qbe_as_l(g, qval(qbe_load_local_slot(g, p.index.slot, TInt), TInt))
+  let oob = qbe_tmp(g)
+  let fail = qbe_lbl(g, "pair_oob")
+  let ok = qbe_lbl(g, "pair_ok")
+  qbe_emit(g, oob + " =w cugel " + ix + ", " + limit)
+  qbe_emit_term(g, "jnz " + oob + ", " + fail + ", " + ok)
+  qbe_emit_lbl(g, fail)
+  let bad = if p.a.slot == p.b.slot { a.len } else {
+    let first = qbe_tmp(g)
+    qbe_emit(g, first + " =w cugel " + ix + ", " + a.len)
+    qbe_pair_select(g, first, a.len, b.len)
+  }
+  qbe_emit(g, "call $pion_panic_oob(l " + ix + ", l " + bad + ")")
+  qbe_emit_term(g, "hlt")
+  qbe_emit_lbl(g, ok)
+  qbe_pair_bind(g, body[0], p.a, a.data, ix)
+  qbe_pair_bind(g, body[1], p.b, b.data, ix)
+  let tail : Array[Stmt] = []
+  let mut j = 2
+  while j < body.length() { tail.push(body[j])
+      j = j + 1 }
+  qbe_emit_stmts(g, tail, None)
+}
+
 fn qbe_emit_stmts(
   g : QbeGen,
   stmts : Array[Stmt],
@@ -48584,6 +48825,90 @@ fn qbe_emit_compound_binop(
 }
 
 ///|
+///| Lower a counted byte search in an immutable string to bounded memchr.
+/// Keep the scalar loop for invalid ranges: it can find a delimiter before
+/// its first out-of-bounds read, or report the original index and length.
+fn qbe_try_emit_byte_scan(g : QbeGen, cond : Expr, body : Array[Stmt]) -> Bool {
+  if g.target_wasm || body.length() != 1 { return false }
+  let (iv, bound, str, needle) = match cond {
+    EBinary("&&", EBinary("<", EIdent(i, _), EIdent(n, _), _),
+      EBinary("!=", EMethodCall(EIdent(s, _), "code_unit_at", args, sp), EInt(lit, _), _), _) => {
+      if qbe_has_expected_trait(g, sp) || args.length() != 1 { return false }
+      match args[0] { EIdent(j, _) => if i != j { return false }
+         _ => return false }
+      let byte = qbe_parse_int64_lit(lit)
+      if byte < 0L || byte > 255L { return false }
+      (i, n, s, byte)
+    }
+    _ => return false
+  }
+  match body[0] {
+    SAssign(EIdent(i, _), EBinary("+", EIdent(j, _), EInt("1", _), _), _) =>
+      if i != iv || j != iv { return false }
+    _ => return false
+  }
+  match (qbe_lookup_local(g, iv), qbe_lookup_local(g, bound), qbe_lookup_local(g, str)) {
+    (Some(idx), Some(last), Some(s)) => {
+      if idx.is_cell || last.is_cell || s.is_cell || idx.slot == last.slot { return false }
+      match (idx.ty, last.ty, s.ty) { (TInt, TInt, TString) => ()
+         _ => return false }
+      let first = qbe_load_local_slot(g, idx.slot, TInt)
+      let stop = qbe_load_local_slot(g, last.slot, TInt)
+      let active = qbe_tmp(g)
+      let range = qbe_lbl(g, "scan_range")
+      let slow = qbe_lbl(g, "scan_scalar")
+      let step = qbe_lbl(g, "scan_step")
+      let fast = qbe_lbl(g, "scan_fast")
+      let hit = qbe_lbl(g, "scan_hit")
+      let miss = qbe_lbl(g, "scan_miss")
+      let done = qbe_lbl(g, "scan_end")
+      qbe_emit(g, active + " =w csltw " + first + ", " + stop)
+      qbe_emit_term(g, "jnz " + active + ", " + range + ", " + done)
+      qbe_emit_lbl(g, range)
+      let obj = qbe_load_local_slot(g, s.slot, TString)
+      let len = qbe_tmp(g)
+      let lo = qbe_as_l(g, qval(first, TInt))
+      let hi = qbe_as_l(g, qval(stop, TInt))
+      let nonneg = qbe_tmp(g)
+      let fits = qbe_tmp(g)
+      let valid = qbe_tmp(g)
+      qbe_emit(g, len + " =l loadl " + obj)
+      qbe_emit(g, nonneg + " =w csgew " + first + ", 0")
+      qbe_emit(g, fits + " =w culel " + hi + ", " + len)
+      qbe_emit(g, valid + " =w and " + nonneg + ", " + fits)
+      qbe_emit_term(g, "jnz " + valid + ", " + fast + ", " + slow)
+      qbe_emit_lbl(g, fast)
+      let dp = qbe_tmp(g)
+      let begin = qbe_tmp(g)
+      let span = qbe_tmp(g)
+      let found = qbe_tmp(g)
+      let present = qbe_tmp(g)
+      qbe_emit(g, dp + " =l add " + obj + ", 8")
+      qbe_emit(g, begin + " =l add " + dp + ", " + lo)
+      qbe_emit(g, span + " =l sub " + hi + ", " + lo)
+      qbe_emit(g, found + " =l call $memchr(l " + begin + ", w " + needle.to_string() + ", l " + span + ")")
+      qbe_emit(g, present + " =w cnel " + found + ", 0")
+      qbe_emit_term(g, "jnz " + present + ", " + hit + ", " + miss)
+      qbe_emit_lbl(g, hit)
+      let index = qbe_tmp(g)
+      qbe_emit(g, index + " =l sub " + found + ", " + dp)
+      qbe_emit(g, "storew " + index + ", " + idx.slot)
+      qbe_emit_term(g, "jmp " + done)
+      qbe_emit_lbl(g, miss)
+      qbe_emit(g, "storew " + stop + ", " + idx.slot)
+      qbe_emit_term(g, "jmp " + done)
+      qbe_emit_lbl(g, slow)
+      qbe_emit_cond_branch(g, cond, step, done)
+      qbe_emit_lbl(g, step)
+      let _ = qbe_emit_stmt(g, body[0], None, false)
+      qbe_emit_term(g, "jmp " + slow)
+      qbe_emit_lbl(g, done)
+      true
+    }
+    _ => false
+  }
+}
+
 fn qbe_emit_stmt(
   g : QbeGen,
   stmt : Stmt,
@@ -51036,7 +51361,8 @@ fn qbe_emit_stmt(
           pci = pci + 1
         }
       }
-      let mut emitted_loop = false
+      // Keep existing BCE facts active in the scalar fallback.
+      let mut emitted_loop = qbe_try_emit_byte_scan(g, cond, body)
       if !emitted_loop {
         emitted_loop = qbe_try_emit_while_bce_versioned(g, cond, body)
       }
@@ -51057,15 +51383,21 @@ fn qbe_emit_stmt(
           let l_body = qbe_lbl(g, "wh_b")
           let l_cond = qbe_lbl(g, "wh_c")
           let l_end = qbe_lbl(g, "wh_e")
-          qbe_emit_cond_branch(g, cond, l_body, l_end)
-          qbe_emit_lbl(g, l_body)
+          let pair = qbe_read_pair(g, cond, body)
+          let entry = match pair { Some(_) => qbe_lbl(g, "pair_setup")
+            None => l_body }
+          qbe_emit_cond_branch(g, cond, entry, l_end)
+          qbe_emit_lbl(g, entry)
           let loop_depth = g.scopes.length()
           g.loop_breaks.push(l_end)
           g.loop_conts.push(l_cond)
           g.loop_depths.push(loop_depth)
           g.hot_loop_depth = g.hot_loop_depth + 1
           qbe_scope_push(g)
-          let bv = qbe_emit_stmts(g, body, None)
+          let bv = match pair {
+            Some(p) => qbe_pair_body(g, p, body, l_body)
+            None => qbe_emit_stmts(g, body, None)
+          }
           if !g.block_term {
             qbe_rc_dec(g, bv.reg, bv.ty)
           }

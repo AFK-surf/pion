@@ -616,6 +616,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p105_arm64_spill_pairs/run_e2e.sh" "$P
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p82a_wasm_arr_clear_f32_push/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_enum_sroa/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC"
+# P108: QbeReadPair hoisted pair headers/bounds & bounded memchr byte scan.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p108_read_pair_and_byte_scan/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
