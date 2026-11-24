@@ -282,11 +282,52 @@ fn qval(reg : String, ty : Ty) -> QbeVal {
 }
 
 ///|
-fn qbe_is_obj_ty(t : Ty) -> Bool {
+fn qbe_enum_info_is_unit_only(einfo : EnumInfo) -> Bool {
+  if einfo.decl.type_params.length() != 0 || einfo.decl.variants.length() == 0 {
+    return false
+  }
+  let mut vi = 0
+  while vi < einfo.decl.variants.length() {
+    if einfo.decl.variants[vi].fields.length() > 0 {
+      return false
+    }
+    vi = vi + 1
+  }
+  true
+}
+
+///|
+fn qbe_is_unboxed_unit_enum(g : QbeGen, raw_ty : Ty) -> Bool {
+  let ty = subst_ty(raw_ty, g.cur_type_subst)
+  match ty {
+    TEnum(ename, eargs) =>
+      if eargs.length() != 0 {
+        false
+      } else {
+        match qbe_lookup_enum_info(g, ename) {
+          Some(einfo) => qbe_enum_info_is_unit_only(einfo)
+          None => false
+        }
+      }
+    _ => false
+  }
+}
+
+///|
+fn qbe_is_hashable_scalar_ty(g : QbeGen, raw_ty : Ty) -> Bool {
+  let ty = subst_ty(raw_ty, g.cur_type_subst)
+  is_hashable_scalar_ty(ty) || qbe_is_unboxed_unit_enum(g, ty)
+}
+
+///|
+fn qbe_is_obj_ty(g : QbeGen, raw_t : Ty) -> Bool {
+  let t = subst_ty(raw_t, g.cur_type_subst)
   match t {
     TInt | TInt64 | TUInt | TUInt64 | TDouble | TFloat | TBool | TByte | TInt8 | TChar | TUnit | TPtr | TNever | TError =>
       false
     TParam(_) => false
+    TEnum(_, _) => !qbe_is_unboxed_unit_enum(g, t)
+    TOption(inner) => !qbe_is_unboxed_unit_enum(g, inner)
     _ => true
   }
 }
@@ -612,6 +653,24 @@ fn qbe_c_abi_ty(t : Ty) -> String {
 }
 
 ///|
+fn qbe_mangle_escape(s : String) -> String {
+  let clean = qbe_sanitize_sym(s)
+  let sb = StringBuilder()
+  let n = clean.length()
+  let mut i = 0
+  while i < n {
+    if i + 1 < n && clean.slice(i, i + 2) == "_Z" {
+      sb.write_string("_ZZ")
+      i = i + 2
+    } else {
+      sb.write_string(clean.slice(i, i + 1))
+      i = i + 1
+    }
+  }
+  sb.to_string()
+}
+
+///|
 fn qbe_mangle_ty(t : Ty) -> String {
   match t {
     TInt => "Int"
@@ -632,9 +691,73 @@ fn qbe_mangle_ty(t : Ty) -> String {
     TOption(e) => "Option_" + qbe_mangle_ty(e)
     TResult(ok, err) => "Result_" + qbe_mangle_ty(ok) + "_" + qbe_mangle_ty(err)
     TMap(k, v) => "Map_" + qbe_mangle_ty(k) + "_" + qbe_mangle_ty(v)
-    TStruct(n, _) => qbe_sanitize_sym(n)
-    TEnum(n, _) => qbe_sanitize_sym(n)
-    TDynTrait(n) => "dyn_" + qbe_sanitize_sym(n)
+    TStruct(n, args) =>
+      if args.length() == 0 {
+        qbe_mangle_escape(n)
+      } else {
+        let sb = StringBuilder()
+        sb.write_string(qbe_mangle_escape(n))
+        sb.write_string("_ZA")
+        let mut i = 0
+        while i < args.length() {
+          if i > 0 {
+            sb.write_string("_ZS")
+          }
+          sb.write_string(qbe_mangle_ty(args[i]))
+          i = i + 1
+        }
+        sb.write_string("_ZE")
+        sb.to_string()
+      }
+    TEnum(n, args) =>
+      if args.length() == 0 {
+        qbe_mangle_escape(n)
+      } else {
+        let sb = StringBuilder()
+        sb.write_string(qbe_mangle_escape(n))
+        sb.write_string("_ZA")
+        let mut i = 0
+        while i < args.length() {
+          if i > 0 {
+            sb.write_string("_ZS")
+          }
+          sb.write_string(qbe_mangle_ty(args[i]))
+          i = i + 1
+        }
+        sb.write_string("_ZE")
+        sb.to_string()
+      }
+    TDynTrait(n) => "dyn_" + qbe_mangle_escape(n)
+    TTuple(elems) => {
+      let sb = StringBuilder()
+      sb.write_string("_ZT")
+      let mut i = 0
+      while i < elems.length() {
+        if i > 0 {
+          sb.write_string("_ZS")
+        }
+        sb.write_string(qbe_mangle_ty(elems[i]))
+        i = i + 1
+      }
+      sb.write_string("_ZE")
+      sb.to_string()
+    }
+    TFn(params, ret) => {
+      let sb = StringBuilder()
+      sb.write_string("_ZF")
+      let mut i = 0
+      while i < params.length() {
+        if i > 0 {
+          sb.write_string("_ZS")
+        }
+        sb.write_string(qbe_mangle_ty(params[i]))
+        i = i + 1
+      }
+      sb.write_string("_ZR")
+      sb.write_string(qbe_mangle_ty(ret))
+      sb.write_string("_ZE")
+      sb.to_string()
+    }
     _ => qbe_sanitize_sym(ty_to_string(t))
   }
 }
@@ -698,12 +821,22 @@ fn qbe_last_qual_seg(s : String) -> String {
 }
 
 ///|
+fn qbe_local_unqual_target(g : QbeGen, name : String) -> String {
+  let qp = split_qual_name(name)
+  if qp.prefix != "" && g.tc.pkg_name != "" && qp.prefix == g.tc.pkg_name {
+    qp.name
+  } else {
+    name
+  }
+}
+
+///|
 fn qbe_find_impl_method(
   g : QbeGen,
   recv_ty : Ty,
   method_name : String,
 ) -> Option[QbeImplMethodMatch] {
-  let tname = ty_base_name(recv_ty)
+  let tname = qbe_local_unqual_target(g, ty_base_name(recv_ty))
   let mut i = 0
   while i < g.tc.impl_keys.length() {
     let k = g.tc.impl_keys[i]
@@ -1347,11 +1480,14 @@ fn qbe_method_call_sym(
 /// pointer identity would differ across packages.
 fn qbe_cmp_operand(g : QbeGen, reg : String, ty : Ty) -> String {
   match ty {
-    TEnum(_, _) => {
-      let t = qbe_tmp(g)
-      qbe_emit(g, t + " =l loadl " + reg)
-      t
-    }
+    TEnum(_, _) =>
+      if qbe_is_unboxed_unit_enum(g, ty) {
+        reg
+      } else {
+        let t = qbe_tmp(g)
+        qbe_emit(g, t + " =l loadl " + reg)
+        t
+      }
     _ => reg
   }
 }
@@ -1591,16 +1727,104 @@ fn qbe_qualify_enum_info(pkg_name : String, ei : EnumInfo) -> EnumInfo {
 }
 
 ///|
-fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
-  match g.tc.structs.get(name) {
-    Some(si) => return Some(si)
-    None => ()
-  }
-  if g.mono_pkg != "" {
-    match g.tc.structs.get(g.mono_pkg + "::" + name) {
-      Some(si) => return Some(si)
+fn qbe_qualify_nominal_name(g : QbeGen, name : String) -> String {
+  let qp = split_qual_name(name)
+  if qp.prefix == "" {
+    let cur_pkg = if g.mono_pkg != "" { g.mono_pkg } else { g.tc.pkg_name }
+    if cur_pkg != "" {
+      cur_pkg + "::" + name
+    } else {
+      name
+    }
+  } else {
+    if g.tc.pkg_name != "" && qp.prefix == g.tc.pkg_name {
+      return name
+    }
+    match resolve_alias_pkg(g.tc, qp.prefix) {
+      Some(ipkg) => return ipkg.name + "::" + qp.name
       None => ()
     }
+    if g.mono_pkg != "" {
+      match g.tc.imported_pkgs.get(g.mono_pkg) {
+        Some(mpkg) =>
+          match resolve_alias_pkg(mpkg.tc, qp.prefix) {
+            Some(ipkg) => return ipkg.name + "::" + qp.name
+            None => ()
+          }
+        None => ()
+      }
+    }
+    match lookup_imported_pkg_transitive(g.tc, qp.prefix) {
+      Some(ipkg) => ipkg.name + "::" + qp.name
+      None => name
+    }
+  }
+}
+
+///|
+fn qbe_qualify_nominal_ty(g : QbeGen, raw_ty : Ty) -> Ty {
+  let t = subst_ty(raw_ty, g.cur_type_subst)
+  match t {
+    TArray(e) => TArray(qbe_qualify_nominal_ty(g, e))
+    TFixedArray(e) => TFixedArray(qbe_qualify_nominal_ty(g, e))
+    TOption(e) => TOption(qbe_qualify_nominal_ty(g, e))
+    TResult(ok, err) =>
+      TResult(qbe_qualify_nominal_ty(g, ok), qbe_qualify_nominal_ty(g, err))
+    TMap(k, v) =>
+      TMap(qbe_qualify_nominal_ty(g, k), qbe_qualify_nominal_ty(g, v))
+    TChannel(e) => TChannel(qbe_qualify_nominal_ty(g, e))
+    TMutex(e) => TMutex(qbe_qualify_nominal_ty(g, e))
+    TStruct(name, args) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(qbe_qualify_nominal_ty(g, args[i]))
+        i = i + 1
+      }
+      TStruct(qbe_qualify_nominal_name(g, name), out)
+    }
+    TEnum(name, args) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < args.length() {
+        out.push(qbe_qualify_nominal_ty(g, args[i]))
+        i = i + 1
+      }
+      TEnum(qbe_qualify_nominal_name(g, name), out)
+    }
+    TDynTrait(name) => TDynTrait(qbe_qualify_nominal_name(g, name))
+    TFn(params, ret) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < params.length() {
+        out.push(qbe_qualify_nominal_ty(g, params[i]))
+        i = i + 1
+      }
+      TFn(out, qbe_qualify_nominal_ty(g, ret))
+    }
+    TTuple(elems) => {
+      let out : Array[Ty] = []
+      let mut i = 0
+      while i < elems.length() {
+        out.push(qbe_qualify_nominal_ty(g, elems[i]))
+        i = i + 1
+      }
+      TTuple(out)
+    }
+    _ => t
+  }
+}
+
+///|
+fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
+  let qp0 = split_qual_name(name)
+  if qp0.prefix != "" && g.tc.pkg_name != "" && qp0.prefix == g.tc.pkg_name {
+    match g.tc.structs.get(qp0.name) {
+      Some(si) => return Some(qbe_qualify_struct_info(g.tc.pkg_name, si))
+      None => ()
+    }
+  }
+  if g.mono_pkg != "" && !has_qual_sep(name) {
     match g.tc.imported_pkgs.get(g.mono_pkg) {
       Some(ipkg) =>
         match ipkg.tc.structs.get(name) {
@@ -1609,8 +1833,16 @@ fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
         }
       None => ()
     }
+    match g.tc.structs.get(g.mono_pkg + "::" + name) {
+      Some(si) => return Some(si)
+      None => ()
+    }
   }
-  let qp = split_qual_name(name)
+  match g.tc.structs.get(name) {
+    Some(si) => return Some(si)
+    None => ()
+  }
+  let qp = qp0
   if qp.prefix != "" {
     match resolve_alias_pkg(g.tc, qp.prefix) {
       Some(ipkg) =>
@@ -1648,6 +1880,13 @@ fn qbe_lookup_struct_info(g : QbeGen, name : String) -> Option[StructInfo] {
 
 ///|
 fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
+  let qp0 = split_qual_name(name)
+  if qp0.prefix != "" && g.tc.pkg_name != "" && qp0.prefix == g.tc.pkg_name {
+    match g.tc.enums.get(qp0.name) {
+      Some(ei) => return Some(qbe_qualify_enum_info(g.tc.pkg_name, ei))
+      None => ()
+    }
+  }
   if g.mono_pkg != "" && !has_qual_sep(name) {
     match g.tc.imported_pkgs.get(g.mono_pkg) {
       Some(ipkg) =>
@@ -1666,7 +1905,7 @@ fn qbe_lookup_enum_info(g : QbeGen, name : String) -> Option[EnumInfo] {
     Some(ei) => return Some(ei)
     None => ()
   }
-  let qp = split_qual_name(name)
+  let qp = qp0
   if qp.prefix != "" {
     match resolve_alias_pkg(g.tc, qp.prefix) {
       Some(ipkg) =>
@@ -1708,6 +1947,13 @@ fn qbe_lookup_method_info(
   sname : String,
   method_name : String,
 ) -> Option[FnInfo] {
+  let qp0 = split_qual_name(sname)
+  if qp0.prefix != "" && g.tc.pkg_name != "" && qp0.prefix == g.tc.pkg_name {
+    match g.tc.methods.get(qp0.name + "::" + method_name) {
+      Some(mi) => return Some(mi)
+      None => ()
+    }
+  }
   let key = sname + "::" + method_name
   match g.tc.methods.get(key) {
     Some(mi) => return Some(mi)
@@ -1821,8 +2067,9 @@ pub struct QbeVMapKeyArgs {
 }
 
 ///|
-fn qbe_vmap_key_fields(g : QbeGen, kty : Ty) -> Array[Ty] {
-  if is_hashable_scalar_ty(kty) {
+fn qbe_vmap_key_fields(g : QbeGen, raw_kty : Ty) -> Array[Ty] {
+  let kty = subst_ty(raw_kty, g.cur_type_subst)
+  if qbe_is_hashable_scalar_ty(g, kty) {
     return [kty]
   }
   match kty {
@@ -1832,7 +2079,7 @@ fn qbe_vmap_key_fields(g : QbeGen, kty : Ty) -> Array[Ty] {
       }
       let mut i = 0
       while i < elems.length() {
-        if !is_hashable_scalar_ty(elems[i]) {
+        if !qbe_is_hashable_scalar_ty(g, elems[i]) {
           return []
         }
         i = i + 1
@@ -1854,7 +2101,7 @@ fn qbe_vmap_key_fields(g : QbeGen, kty : Ty) -> Array[Ty] {
               return []
             }
             let fty = subst_ty(si.field_tys[i], subst)
-            if !is_hashable_scalar_ty(fty) {
+            if !qbe_is_hashable_scalar_ty(g, fty) {
               return []
             }
             out.push(fty)
@@ -2229,7 +2476,9 @@ fn qbe_ensure_vmap_get_or_fn(g : QbeGen, kty : Ty, vty : Ty) -> String {
 
 ///|
 fn qbe_vmap_sym_base(g : QbeGen, kty : Ty, vty : Ty) -> String {
-  g.pkg_prefix + "vm_" + qbe_mangle_ty(kty) + "_" + qbe_mangle_ty(vty)
+  let qk = qbe_qualify_nominal_ty(g, kty)
+  let qv = qbe_qualify_nominal_ty(g, vty)
+  g.pkg_prefix + "vm_" + qbe_mangle_ty(qk) + "_" + qbe_mangle_ty(qv)
 }
 
 ///|
@@ -2264,7 +2513,7 @@ fn qbe_ensure_vmap_fns(g : QbeGen, kty : Ty, vty : Ty) -> String {
   }
   let ksig = qbe_vmap_param_sig(kfields)
   let vabi = qbe_abi_ty(vty)
-  let v_is_obj = qbe_is_obj_ty(vty)
+  let v_is_obj = qbe_is_obj_ty(g, vty)
   let per_slot = 1 + lay.slot_bytes
   let msg_id = qbe_intern_cstring(g, "key not found in Map")
   let file_id = qbe_intern_cstring(g, "<vmap>")
@@ -2571,7 +2820,7 @@ fn qbe_ensure_vmap_fns(g : QbeGen, kty : Ty, vty : Ty) -> String {
   sb.write_string("    %cp =l add %buf, %i\n    %c =w loadub %cp\n    jnz %c, @emit_k, @next\n@emit_k\n")
   qbe_vmap_idx_mul(sb, "%soff", "%i", lay.slot_bytes)
   sb.write_string("    %sp =l add %slots, %soff\n    %oi =l loadl %o_sl\n")
-  if is_hashable_scalar_ty(kty) {
+  if qbe_is_hashable_scalar_ty(g, kty) {
     match kty {
       TBool | TByte | TInt8 => {
         sb.write_string("    %kb =w loadub %sp\n")
@@ -2641,7 +2890,7 @@ fn qbe_emit_vmap_key_args(
   let n = kfields.length()
   let regs : Array[String] = []
   let abis : Array[String] = []
-  if is_hashable_scalar_ty(kty) {
+  if qbe_is_hashable_scalar_ty(g, kty) {
     let kv = qbe_emit_expr(g, key_expr, Some(kty))
     let cv = qbe_coerce_val(g, kv, kty)
     regs.push(cv)
@@ -3290,13 +3539,13 @@ fn qbe_ty_needs_deep_freeze(g : QbeGen, raw_ty : Ty, depth : Int) -> Bool {
       if qbe_is_niche_opt_inner(inner) {
         qbe_ty_needs_deep_freeze(g, inner, depth + 1)
       } else {
-        qbe_is_obj_ty(inner)
+        qbe_is_obj_ty(g, inner)
       }
-    TResult(ok_ty, err_ty) => qbe_is_obj_ty(ok_ty) || qbe_is_obj_ty(err_ty)
+    TResult(ok_ty, err_ty) => qbe_is_obj_ty(g, ok_ty) || qbe_is_obj_ty(g, err_ty)
     TTuple(elems) => {
       let mut i = 0
       while i < elems.length() {
-        if qbe_is_obj_ty(elems[i]) {
+        if qbe_is_obj_ty(g, elems[i]) {
           return true
         }
         i = i + 1
@@ -3310,7 +3559,7 @@ fn qbe_ty_needs_deep_freeze(g : QbeGen, raw_ty : Ty, depth : Int) -> Bool {
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
             let fty = subst_ty(sinfo.field_tys[fi], subst)
-            if qbe_is_obj_ty(fty) {
+            if qbe_is_obj_ty(g, fty) {
               return true
             }
             fi = fi + 1
@@ -3329,7 +3578,7 @@ fn qbe_ty_needs_deep_freeze(g : QbeGen, raw_ty : Ty, depth : Int) -> Bool {
             let mut fi = 0
             while fi < v.field_tys.length() {
               let fty = subst_ty(v.field_tys[fi], subst)
-              if qbe_is_obj_ty(fty) {
+              if qbe_is_obj_ty(g, fty) {
                 return true
               }
               fi = fi + 1
@@ -3340,8 +3589,8 @@ fn qbe_ty_needs_deep_freeze(g : QbeGen, raw_ty : Ty, depth : Int) -> Bool {
         }
         None => false
       }
-    TArray(elem) | TFixedArray(elem) => qbe_is_obj_ty(elem)
-    TMap(_, vty) => qbe_is_obj_ty(vty)
+    TArray(elem) | TFixedArray(elem) => qbe_is_obj_ty(g, elem)
+    TMap(_, vty) => qbe_is_obj_ty(g, vty)
     _ => false
   }
 }
@@ -5633,7 +5882,7 @@ fn qbe_emit_arg_maybe_borrow_ext(
               if !aloc.is_cell {
               match aloc.ty {
                 TArray(elem) | TFixedArray(elem) =>
-                  if qbe_is_obj_ty(elem) && qbe_flat_pod_stride(g, elem) == 0 {
+                  if qbe_is_obj_ty(g, elem) && qbe_flat_pod_stride(g, elem) == 0 {
                     match qbe_try_emit_borrowed_arr_elem(g, aname, idx_expr) {
                       Some(ev) => return QbeArgVal::{ qv: ev, borrowed: true }
                       None => ()
@@ -7309,11 +7558,11 @@ fn qbe_tys_strictly_distinct(a : Ty, b : Ty) -> Bool {
 }
 
 ///|
-fn qbe_ty_safe_dst_for_borrowed_arr(t : Ty, elem_ty : Ty) -> Bool {
+fn qbe_ty_safe_dst_for_borrowed_arr(g : QbeGen, t : Ty, elem_ty : Ty) -> Bool {
   if !qbe_ty_is_concrete_for_alias(t) {
     return false
   }
-  if !qbe_is_obj_ty(t) {
+  if !qbe_is_obj_ty(g, t) {
     return true
   }
   match t {
@@ -7321,7 +7570,7 @@ fn qbe_ty_safe_dst_for_borrowed_arr(t : Ty, elem_ty : Ty) -> Bool {
     TArray(e2) | TFixedArray(e2) => {
       let leaf_elem = match e2 {
         TString => true
-        _ => qbe_ty_is_concrete_for_alias(e2) && !qbe_is_obj_ty(e2)
+        _ => qbe_ty_is_concrete_for_alias(e2) && !qbe_is_obj_ty(g, e2)
       }
       leaf_elem && qbe_tys_strictly_distinct(e2, elem_ty)
     }
@@ -7578,7 +7827,7 @@ fn qbe_match_arr_alias_safe_stmt(
             true
           } else {
             match qbe_probe_expr_ty_with(g, lhs, hints) {
-              Some(dty) => qbe_ty_safe_dst_for_borrowed_arr(dty, elem_ty)
+              Some(dty) => qbe_ty_safe_dst_for_borrowed_arr(g, dty, elem_ty)
               None => false
             }
           }
@@ -14633,6 +14882,9 @@ enum QbeOptResPodKind {
 ///|
 fn qbe_pure_scalar_pod_enum_info(g : QbeGen, raw_ty : Ty) -> Option[(EnumInfo, Int)] {
   let ty = subst_ty(raw_ty, g.cur_type_subst)
+  if qbe_is_unboxed_unit_enum(g, ty) {
+    return None
+  }
   match ty {
     TEnum(ename, eargs) =>
       match qbe_lookup_enum_info(g, ename) {
@@ -17989,7 +18241,7 @@ fn qbe_try_emit_scalar_opt_res_method(
                   }
                 _ => false
               }
-              if !qbe_is_obj_ty(vty) && def_is_pure {
+              if !qbe_is_obj_ty(g, vty) && def_is_pure {
                 let _ = qbe_ensure_vmap_get_or_fn(g, kty, vty)
                 let dv = qbe_emit_expr(g, args[0], Some(vty))
                 let dc = qbe_coerce_val(g, dv, vty)
@@ -18023,7 +18275,7 @@ fn qbe_try_emit_scalar_opt_res_method(
                 hw + " =w call $pion_vmap_try_get_" + m + "(l " + obj_av.qv.reg + kstr + ", l " + out_slot + ")",
               )
               let mut hit_own_slot = ""
-              if qbe_is_obj_ty(vty) {
+              if qbe_is_obj_ty(g, vty) {
                 qbe_scope_push(g)
                 let hit_tmp_name = "$__vmu_hit_own_" + g.next_tmp.to_string()
                 g.next_tmp = g.next_tmp + 1
@@ -18122,7 +18374,7 @@ fn qbe_try_emit_scalar_opt_res_method(
     qbe_emit_lbl(g, l_def)
     match err_ty_opt {
       Some(err_ty) =>
-        if qbe_is_obj_ty(err_ty) {
+        if qbe_is_obj_ty(g, err_ty) {
           let v_err = qbe_load_heap_slot(g, sc.err_slot, err_ty)
           qbe_rc_dec(g, v_err, err_ty)
         }
@@ -18136,9 +18388,9 @@ fn qbe_try_emit_scalar_opt_res_method(
   }
   // `is_some` / `is_none` / `is_ok` / `is_err`
   let want_true_on_ok = method_name == "is_some" || method_name == "is_ok"
-  let ok_is_obj = !sc.val_is_pod_buf && qbe_is_obj_ty(ok_ty)
+  let ok_is_obj = !sc.val_is_pod_buf && qbe_is_obj_ty(g, ok_ty)
   let err_is_obj = match err_ty_opt {
-    Some(et) => qbe_is_obj_ty(et)
+    Some(et) => qbe_is_obj_ty(g, et)
     None => false
   }
   let tag_w = qbe_tmp(g)
@@ -18263,9 +18515,9 @@ fn qbe_try_emit_scalar_is_branch(
     TResult(_, et) => Some(et)
     _ => None
   }
-  let ok_is_obj = !sc.val_is_pod_buf && qbe_is_obj_ty(ok_ty)
+  let ok_is_obj = !sc.val_is_pod_buf && qbe_is_obj_ty(g, ok_ty)
   let err_is_obj = match err_ty_opt {
-    Some(et) => qbe_is_obj_ty(et)
+    Some(et) => qbe_is_obj_ty(g, et)
     None => false
   }
   let tag_w = qbe_tmp(g)
@@ -18351,9 +18603,9 @@ fn qbe_try_emit_scalar_is_expr(
     TResult(_, et) => Some(et)
     _ => None
   }
-  let ok_is_obj = !sc.val_is_pod_buf && qbe_is_obj_ty(ok_ty)
+  let ok_is_obj = !sc.val_is_pod_buf && qbe_is_obj_ty(g, ok_ty)
   let err_is_obj = match err_ty_opt {
-    Some(et) => qbe_is_obj_ty(et)
+    Some(et) => qbe_is_obj_ty(g, et)
     None => false
   }
   let tag_w = qbe_tmp(g)
@@ -18988,7 +19240,7 @@ fn qbe_release_scope_locals(g : QbeGen, sc : QbeScope) -> Unit {
             qbe_rc_dec(g, v, loc.ty)
           }
           _ =>
-            if qbe_is_obj_ty(loc.ty) {
+            if qbe_is_obj_ty(g, loc.ty) {
               let v = qbe_tmp(g)
               qbe_emit(g, v + " =l loadl " + loc.slot)
               qbe_emit(g, "call $pion_rc_dec(l " + v + ")")
@@ -19087,7 +19339,7 @@ fn qbe_writeback_ref_local(g : QbeGen, loc : QbeLocal) -> Unit {
   let cur = qbe_load_local_slot(g, loc.slot, loc.ty)
   let needs_rc = match loc.ty {
     TParam(_) => true
-    _ => qbe_is_obj_ty(loc.ty)
+    _ => qbe_is_obj_ty(g, loc.ty)
   }
   if needs_rc {
     let old = qbe_tmp(g)
@@ -19207,12 +19459,12 @@ fn qbe_emit_mut_writebacks(g : QbeGen, wbs : Array[QbeMutWb]) -> Unit {
     g.movable_locals = mm
     let _ = qbe_emit_stmt(g, SAssign(wb.place, EIdent(hname, span_new("", 0, 0)), span_new("", 0, 0)), None, false)
     g.movable_locals = saved_mov
-    if !qbe_is_early_drop_ty(wb.ty) {
+    if !qbe_is_early_drop_ty(g, wb.ty) {
       // Not moved by the read above (scalars, generic `T`): drop the hidden
       // local's reference now so loops never accumulate it.
       let needs_rc = match wb.ty {
         TParam(_) => true
-        _ => qbe_is_obj_ty(wb.ty)
+        _ => qbe_is_obj_ty(g, wb.ty)
       }
       if needs_rc {
         let hv = qbe_tmp(g)
@@ -19876,7 +20128,7 @@ fn qbe_is_obj_flag(g : QbeGen, raw_t : Ty) -> String {
       } else {
         "0"
       }
-    _ => if qbe_is_obj_ty(t) { "1" } else { "0" }
+    _ => if qbe_is_obj_ty(g, t) { "1" } else { "0" }
   }
 }
 
@@ -19892,7 +20144,7 @@ fn qbe_is_obj_flag_w(g : QbeGen, raw_t : Ty) -> String {
       } else {
         "0"
       }
-    _ => if qbe_is_obj_ty(t) { "1" } else { "0" }
+    _ => if qbe_is_obj_ty(g, t) { "1" } else { "0" }
   }
 }
 
@@ -19918,10 +20170,15 @@ fn qbe_flat_pod_struct_info(g : QbeGen, raw_ty : Ty) -> Option[StructInfo] {
               return None
             }
             let fty = subst_ty(sinfo.field_tys[i], subst)
-            if !qbe_is_prim_array_elem(fty) {
+            let is_unit_enum_scalar = qbe_is_unboxed_unit_enum(g, fty) ||
+              match fty {
+                TOption(inner) => qbe_is_unboxed_unit_enum(g, inner)
+                _ => false
+              }
+            if !qbe_is_prim_array_elem(fty) && !is_unit_enum_scalar {
               let ok_rc = match fty {
                 TDynTrait(_) | TParam(_) | TError => false
-                _ => qbe_is_obj_ty(fty)
+                _ => qbe_is_obj_ty(g, fty)
               }
               if !ok_rc {
                 return None
@@ -19966,7 +20223,7 @@ fn qbe_flat_struct_obj_mask(g : QbeGen, raw_ty : Ty) -> Int {
       let mut bit = 1
       let mut i = 0
       while i < ftys.length() {
-        if qbe_is_obj_ty(ftys[i]) {
+        if qbe_is_obj_ty(g, ftys[i]) {
           mask = mask + bit
         }
         bit = bit * 2
@@ -20051,7 +20308,7 @@ fn qbe_emit_flat_copy_slots_rc(
   if inc_rc {
     fi = 0
     while fi < nfields {
-      if qbe_is_obj_ty(ftys[fi]) {
+      if qbe_is_obj_ty(g, ftys[fi]) {
         qbe_rc_inc(g, vals[fi], ftys[fi])
       }
       fi = fi + 1
@@ -20060,7 +20317,7 @@ fn qbe_emit_flat_copy_slots_rc(
   if adopt_arr != "" {
     fi = 0
     while fi < nfields {
-      if qbe_is_obj_ty(ftys[fi]) {
+      if qbe_is_obj_ty(g, ftys[fi]) {
         qbe_emit_adopt_if_frozen(g, adopt_arr, vals[fi], ftys[fi], !inc_rc)
       }
       fi = fi + 1
@@ -20071,7 +20328,7 @@ fn qbe_emit_flat_copy_slots_rc(
   if dec_old {
     fi = 0
     while fi < nfields {
-      if qbe_is_obj_ty(ftys[fi]) {
+      if qbe_is_obj_ty(g, ftys[fi]) {
         let dp_f = if fi == 0 {
           dst_ep
         } else {
@@ -20119,7 +20376,7 @@ fn qbe_emit_flat_adopt_vals(
   }
   let mut fi = 0
   while fi < slot_vals.length() {
-    if qbe_is_obj_ty(slot_vals[fi].ty) {
+    if qbe_is_obj_ty(g, slot_vals[fi].ty) {
       let vl = qbe_as_l(g, slot_vals[fi])
       qbe_emit_adopt_if_frozen(g, arr_reg, vl, slot_vals[fi].ty, false)
     }
@@ -20141,7 +20398,7 @@ fn qbe_emit_flat_store_vals_rc(
   if dec_old {
     let mut fi = 0
     while fi < slot_vals.length() {
-      if qbe_is_obj_ty(slot_vals[fi].ty) {
+      if qbe_is_obj_ty(g, slot_vals[fi].ty) {
         let dp_f = if fi == 0 {
           dst_ep
         } else {
@@ -20180,7 +20437,7 @@ fn qbe_emit_flat_materialize(
   let obj_slots : Array[Int] = []
   let mut fi = 0
   while fi < nfields {
-    if qbe_is_obj_ty(ftys[fi]) {
+    if qbe_is_obj_ty(g, ftys[fi]) {
       obj_slots.push(fi)
     }
     fi = fi + 1
@@ -20511,7 +20768,7 @@ fn qbe_emit_flat_load_slots_rc(
   if inc_rc {
     fi = 0
     while fi < nfields {
-      if qbe_is_obj_ty(ftys[fi]) {
+      if qbe_is_obj_ty(g, ftys[fi]) {
         qbe_rc_inc(g, out[fi].reg, ftys[fi])
       }
       fi = fi + 1
@@ -22061,7 +22318,7 @@ fn qbe_rc_inc(g : QbeGen, vreg : String, raw_ty : Ty) -> Unit {
         qbe_emit_lbl(g, l_sk)
       }
     _ =>
-      if qbe_is_obj_ty(ty) {
+      if qbe_is_obj_ty(g, ty) {
         qbe_emit(g, "call $pion_rc_inc(l " + vreg + ")")
       }
   }
@@ -22082,7 +22339,7 @@ fn qbe_rc_dec(g : QbeGen, vreg : String, raw_ty : Ty) -> Unit {
         qbe_emit_lbl(g, l_sk)
       }
     _ =>
-      if qbe_is_obj_ty(ty) {
+      if qbe_is_obj_ty(g, ty) {
         qbe_emit(g, "call $pion_rc_dec(l " + vreg + ")")
       }
   }
@@ -22267,7 +22524,7 @@ fn qbe_freeze_ty_key(ty : Ty) -> String {
 
 ///|
 fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
-  if !qbe_is_obj_ty(ty) {
+  if !qbe_is_obj_ty(g, ty) {
     return ""
   }
   match ty {
@@ -22280,7 +22537,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
             let fty = subst_ty(sinfo.field_tys[fi], subst)
-            if qbe_is_obj_ty(fty) {
+            if qbe_is_obj_ty(g, fty) {
               obj_slots.push(fi)
               obj_tys.push(fty)
             }
@@ -22333,7 +22590,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       let obj_tys : Array[Ty] = []
       let mut i = 0
       while i < elems.length() {
-        if qbe_is_obj_ty(elems[i]) {
+        if qbe_is_obj_ty(g, elems[i]) {
           obj_slots.push(i)
           obj_tys.push(elems[i])
         }
@@ -22383,7 +22640,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       if qbe_is_niche_opt_inner(inner) {
         return qbe_ensure_freeze_fn(g, inner)
       }
-      if !qbe_is_obj_ty(inner) {
+      if !qbe_is_obj_ty(g, inner) {
         return "$pion_rc_freeze"
       }
       let fn_sym = "$pion_freeze_" + qbe_freeze_ty_key(ty)
@@ -22402,8 +22659,8 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       fn_sym
     }
     TResult(ok_ty, err_ty) => {
-      let ok_obj = qbe_is_obj_ty(ok_ty)
-      let err_obj = qbe_is_obj_ty(err_ty)
+      let ok_obj = qbe_is_obj_ty(g, ok_ty)
+      let err_obj = qbe_is_obj_ty(g, err_ty)
       if !ok_obj && !err_obj {
         return "$pion_rc_freeze"
       }
@@ -22443,7 +22700,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
             let v = einfo.variants[vi]
             let mut fi = 0
             while fi < v.field_tys.length() {
-              if qbe_is_obj_ty(subst_ty(v.field_tys[fi], subst)) {
+              if qbe_is_obj_ty(g, subst_ty(v.field_tys[fi], subst)) {
                 any_obj = true
                 break
               }
@@ -22474,7 +22731,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
             let mut fi = 0
             while fi < v.field_tys.length() {
               let fty = subst_ty(v.field_tys[fi], subst)
-              if qbe_is_obj_ty(fty) {
+              if qbe_is_obj_ty(g, fty) {
                 obj_slots.push(fi)
                 child_syms.push(qbe_ensure_freeze_fn(g, fty))
               }
@@ -22533,7 +22790,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
         None => "$pion_rc_freeze"
       }
     TArray(elem) | TFixedArray(elem) => {
-      if !qbe_is_obj_ty(elem) {
+      if !qbe_is_obj_ty(g, elem) {
         return "$pion_rc_freeze"
       }
       match qbe_flat_pod_struct_info(g, elem) {
@@ -22542,7 +22799,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
           let obj_fis : Array[Int] = []
           let mut fi = 0
           while fi < ftys.length() {
-            if qbe_is_obj_ty(ftys[fi]) {
+            if qbe_is_obj_ty(g, ftys[fi]) {
               obj_fis.push(fi)
             }
             fi = fi + 1
@@ -22609,7 +22866,7 @@ fn qbe_ensure_freeze_fn(g : QbeGen, ty : Ty) -> String {
       fn_sym
     }
     TMap(kty, vty) => {
-      if !qbe_is_obj_ty(vty) {
+      if !qbe_is_obj_ty(g, vty) {
         return "$pion_rc_freeze"
       }
       let fn_sym = "$pion_freeze_" + qbe_freeze_ty_key(ty)
@@ -23426,11 +23683,14 @@ fn qbe_emit_eq_field_cmp(
         sb.write_string("    %ok_" + pfx + " =w call " + child_sym + "(l %av_" + pfx + ", l %bv_" + pfx + ")\n")
       } else {
         match fty {
-          TEnum(_, _) => {
-            sb.write_string("    %at_" + pfx + " =l loadl %av_" + pfx + "\n")
-            sb.write_string("    %bt_" + pfx + " =l loadl %bv_" + pfx + "\n")
-            sb.write_string("    %ok_" + pfx + " =w ceql %at_" + pfx + ", %bt_" + pfx + "\n")
-          }
+          TEnum(_, _) =>
+            if qbe_is_unboxed_unit_enum(g, fty) {
+              sb.write_string("    %ok_" + pfx + " =w ceql %av_" + pfx + ", %bv_" + pfx + "\n")
+            } else {
+              sb.write_string("    %at_" + pfx + " =l loadl %av_" + pfx + "\n")
+              sb.write_string("    %bt_" + pfx + " =l loadl %bv_" + pfx + "\n")
+              sb.write_string("    %ok_" + pfx + " =w ceql %at_" + pfx + ", %bt_" + pfx + "\n")
+            }
           _ =>
             sb.write_string("    %ok_" + pfx + " =w ceql %av_" + pfx + ", %bv_" + pfx + "\n")
         }
@@ -23540,7 +23800,7 @@ fn qbe_ensure_dyn_vtable(
   concrete_ty : Ty,
 ) -> String {
   let c_trait = canon_trait_name(g.tc, trait_name)
-  let tname = ty_base_name(concrete_ty)
+  let tname = qbe_local_unqual_target(g, ty_base_name(concrete_ty))
   let vt_sym = "$pion_vtable_" +
     qbe_sanitize_sym(c_trait) +
     "__" +
@@ -23549,8 +23809,8 @@ fn qbe_ensure_dyn_vtable(
     return vt_sym
   }
   g.dyn_vtable_seen.set(vt_sym, true)
-  let is_obj_s = if qbe_is_obj_ty(concrete_ty) { "1" } else { "0" }
-  let fz_sym = if qbe_is_obj_ty(concrete_ty) {
+  let is_obj_s = if qbe_is_obj_ty(g, concrete_ty) { "1" } else { "0" }
+  let fz_sym = if qbe_is_obj_ty(g, concrete_ty) {
     let f = qbe_ensure_freeze_fn(g, concrete_ty)
     if f.length() > 0 { f } else { "0" }
   } else {
@@ -23668,7 +23928,7 @@ fn qbe_emit_adopt_if_frozen(
   deep_only : Bool,
 ) -> Unit {
   let elem = subst_ty(raw_elem, g.cur_type_subst)
-  if !qbe_is_obj_ty(elem) {
+  if !qbe_is_obj_ty(g, elem) {
     return
   }
   let sym = qbe_ensure_freeze_fn(g, elem)
@@ -23707,7 +23967,7 @@ fn qbe_emit_deep_freeze(g : QbeGen, reg_l : String, raw_ty : Ty) -> Unit {
       }
     _ => ()
   }
-  if !qbe_is_obj_ty(ty) {
+  if !qbe_is_obj_ty(g, ty) {
     return
   }
   let sym = qbe_ensure_freeze_fn(g, ty)
@@ -24417,7 +24677,7 @@ fn qbe_emit_some(g : QbeGen, vreg : String, raw_inner_ty : Ty) -> String {
         "0"
       }
     _ =>
-      if qbe_is_obj_ty(inner_ty) {
+      if qbe_is_obj_ty(g, inner_ty) {
         g.need_drop_opt_obj = true
         "$pion_drop_opt_obj"
       } else {
@@ -24460,7 +24720,7 @@ fn qbe_emit_result(
         "0"
       }
     _ =>
-      if qbe_is_obj_ty(active_ty) {
+      if qbe_is_obj_ty(g, active_ty) {
         if tag == 0 {
           g.need_drop_res_ok = true
         } else {
@@ -25224,6 +25484,11 @@ fn qbe_emit_variant_ctor(
         vi = vi + 1
       }
       if arg_vals.length() == 0 {
+        if qbe_enum_info_is_unit_only(einfo) {
+          let obj = qbe_tmp(g)
+          qbe_emit(g, obj + " =l copy " + (tag + 1).to_string())
+          return qval(obj, TEnum(resolved_enum, []))
+        }
         let sym = qbe_register_enum_const(g, resolved_enum, vname, tag)
         let obj = qbe_tmp(g)
         qbe_emit(g, obj + " =l add " + sym + ", 24")
@@ -25303,7 +25568,7 @@ fn qbe_emit_variant_ctor(
         let tp_slots : Array[Array[Int]] = []
         let mut fi = 0
         while fi < arg_tys.length() {
-          if qbe_is_obj_ty(arg_tys[fi]) {
+          if qbe_is_obj_ty(g, arg_tys[fi]) {
             obj_slots.push(fi + 1)
           } else {
             match arg_tys[fi] {
@@ -25501,7 +25766,7 @@ fn qbe_emit_closure_obj(
   let mut has_tparam_cap = false
   let mut mi = 0
   while mi < cap_locals.length() {
-    if cap_locals[mi].is_cell || qbe_is_obj_ty(cap_locals[mi].ty) {
+    if cap_locals[mi].is_cell || qbe_is_obj_ty(g, cap_locals[mi].ty) {
       drop_slots.push(mi + 1)
     } else {
       match cap_locals[mi].ty {
@@ -25522,7 +25787,7 @@ fn qbe_emit_closure_obj(
     while di < cap_locals.length() {
       let cty = cap_locals[di].ty
       let off = (di + 1) * 8
-      if cap_locals[di].is_cell || qbe_is_obj_ty(cty) {
+      if cap_locals[di].is_cell || qbe_is_obj_ty(g, cty) {
         dsb.write_string("    %a" + di.to_string() + " =l add %p, " + off.to_string() + "\n")
         dsb.write_string("    %v" + di.to_string() + " =l loadl %a" + di.to_string() + "\n")
         dsb.write_string("    call $pion_rc_dec(l %v" + di.to_string() + ")\n")
@@ -29049,7 +29314,7 @@ fn qbe_emit_method_call(
         let vv = va.qv
         let vl = qbe_as_l(g, vv)
         let is_prim = qbe_is_prim_array_elem(elem)
-        let is_owned_obj = !is_prim && qbe_is_obj_ty(elem) && !va.borrowed
+        let is_owned_obj = !is_prim && qbe_is_obj_ty(g, elem) && !va.borrowed
         let push_aname2 = match obj_expr {
           EIdent(aname, _) => aname
           _ => ""
@@ -30229,6 +30494,14 @@ fn qbe_emit_pat_test(
           }
         _ => ()
       }
+      if qbe_is_unboxed_unit_enum(g, scrut_ty) {
+        let eq = qbe_tmp(g)
+        let ok_lbl = qbe_lbl(g, "tag_ok")
+        qbe_emit(g, eq + " =w ceql " + vreg + ", " + (tag + 1).to_string())
+        qbe_emit_term(g, "jnz " + eq + ", " + ok_lbl + ", " + fail_lbl)
+        qbe_emit_lbl(g, ok_lbl)
+        return
+      }
       let actual_tag = qbe_tmp(g)
       let eq = qbe_tmp(g)
       let ok_lbl = qbe_lbl(g, "tag_ok")
@@ -30261,7 +30534,7 @@ fn qbe_emit_pat_bind(
     PWild(_) | PBool(_, _) | PInt(_, _) | PString(_, _) | PChar(_, _) => ()
     PIdent(name, _) => {
       let borrow_this = allow_borrow &&
-        qbe_is_obj_ty(scrut_ty) &&
+        qbe_is_obj_ty(g, scrut_ty) &&
         qbe_ident_is_borrow_safe_expr(g, arm_body, name)
       if !borrow_this {
         qbe_rc_inc(g, vreg, scrut_ty)
@@ -30370,7 +30643,7 @@ fn qbe_release_scope_locals_from(g : QbeGen, start_idx : Int) -> Unit {
           qbe_rc_dec(g, v, loc.ty)
         }
         _ =>
-          if qbe_is_obj_ty(loc.ty) {
+          if qbe_is_obj_ty(g, loc.ty) {
             let v = qbe_tmp(g)
             qbe_emit(g, v + " =l loadl " + loc.slot)
             qbe_rc_dec(g, v, loc.ty)
@@ -32734,7 +33007,7 @@ fn qbe_emit_extern_fn_call(
     }
     let aa = qbe_emit_arg_maybe_borrow(g, args[i], Some(decl_pty), can_borrow)
     let av = aa.qv
-    if !aa.borrowed && qbe_is_obj_ty(av.ty) {
+    if !aa.borrowed && qbe_is_obj_ty(g, av.ty) {
       owned_vals.push(av.reg)
       owned_tys.push(av.ty)
     }
@@ -32849,7 +33122,7 @@ fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal 
       TInt64
     }
     let av = qbe_emit_arg_maybe_borrow(g, args[i], Some(pty), can_borrow)
-    if !av.borrowed && qbe_is_obj_ty(av.qv.ty) {
+    if !av.borrowed && qbe_is_obj_ty(g, av.qv.ty) {
       owned_vals.push(av.qv.reg)
       owned_tys.push(av.qv.ty)
     }
@@ -33003,13 +33276,23 @@ fn qbe_emit_mono_call(
   arg_borrowed : Array[Bool],
   decl_pkg : String,
 ) -> QbeVal {
-  let mono_sym = qbe_mono_fn_sym(base_sym, finfo.decl.type_params, subst)
+  let qsubst : Map[String, Ty] = Map([])
+  let mut tpi = 0
+  while tpi < finfo.decl.type_params.length() {
+    let tp = finfo.decl.type_params[tpi]
+    match subst.get(tp) {
+      Some(ty) => qsubst.set(tp, qbe_qualify_nominal_ty(g, ty))
+      None => ()
+    }
+    tpi = tpi + 1
+  }
+  let mono_sym = qbe_mono_fn_sym(base_sym, finfo.decl.type_params, qsubst)
   if !g.mono_seen.contains(mono_sym) {
     g.mono_seen.set(mono_sym, true)
     g.mono_queue.push(QbeMonoReq::{
       sym: mono_sym,
       finfo: finfo,
-      subst: subst,
+      subst: qsubst,
       pkg: decl_pkg,
     })
   }
@@ -33018,7 +33301,7 @@ fn qbe_emit_mono_call(
   let mut j = 0
   while j < arg_vals.length() {
     let decl_pty = if j < finfo.param_tys.length() {
-      subst_ty(finfo.param_tys[j], subst)
+      subst_ty(finfo.param_tys[j], qsubst)
     } else {
       arg_tys[j]
     }
@@ -33031,7 +33314,7 @@ fn qbe_emit_mono_call(
     }
     j = j + 1
   }
-  let concrete_ret = subst_ty(finfo.ret_ty, subst)
+  let concrete_ret = subst_ty(finfo.ret_ty, qsubst)
   let ret_abi = qbe_abi_ty(concrete_ret)
   let res = qbe_tmp(g)
   let sb = StringBuilder()
@@ -33232,7 +33515,7 @@ fn qbe_emit_expr_inner(
             let hv = qbe_emit_view_materialize(g, stk)
             return qval(hv, loc.ty)
           }
-          let moved = if loc.owned && qbe_is_early_drop_ty(loc.ty) {
+          let moved = if loc.owned && qbe_is_early_drop_ty(g, loc.ty) {
             match g.movable_locals.get(name) {
               Some(mslot) => mslot == loc.slot
               None => false
@@ -35959,7 +36242,12 @@ fn qbe_emit_expr_inner(
                     }
                     None =>
                       match ipkg.tc.extern_fns.get(mem) {
-                        Some(ei) => return qbe_emit_extern_fn_call(g, ei, args)
+                        Some(ei) =>
+                          return qbe_emit_extern_fn_call(
+                            g,
+                            qualify_extern_fn_info(ipkg, ei),
+                            args,
+                          )
                         None => ()
                       }
                   }
@@ -36972,7 +37260,7 @@ fn qbe_emit_expr_inner(
           None => {
             let elem_is_owned = match subst_ty(elem_ty, g.cur_type_subst) {
               TParam(_) => true
-              t => qbe_is_obj_ty(t)
+              t => qbe_is_obj_ty(g, t)
             }
             let elem_step = if is_u8 { 1 } else if is_4b { 4 } else { 8 }
             i = 0
@@ -37175,8 +37463,8 @@ fn qbe_emit_expr_inner(
                 subst_ty(sinfo.field_tys[fk], subst),
                 g.cur_type_subst,
               )
-              let needs_drop_fk = qbe_is_obj_ty(concrete_fk) ||
-                qbe_is_obj_ty(slot_tys[fk]) ||
+              let needs_drop_fk = qbe_is_obj_ty(g, concrete_fk) ||
+                qbe_is_obj_ty(g, slot_tys[fk]) ||
                 match concrete_fk {
                   TParam(tn) => qbe_tp_live(g, tn)
                   _ =>
@@ -37214,7 +37502,7 @@ fn qbe_emit_expr_inner(
             let mut has_obj = false
             let mut k = 0
             while k < n_fields {
-              if qbe_is_obj_ty(sinfo.field_tys[k]) {
+              if qbe_is_obj_ty(g, sinfo.field_tys[k]) {
                 has_obj = true
                 break
               }
@@ -37238,7 +37526,7 @@ fn qbe_emit_expr_inner(
                 subst_ty(sinfo.field_tys[k], subst),
                 g.cur_type_subst,
               )
-              if qbe_is_obj_ty(concrete_ty) || qbe_is_obj_ty(slot_tys[k]) {
+              if qbe_is_obj_ty(g, concrete_ty) || qbe_is_obj_ty(g, slot_tys[k]) {
                 obj_slots.push(k)
               } else {
                 match concrete_ty {
@@ -37329,7 +37617,7 @@ fn qbe_emit_expr_inner(
         let coerced = qbe_coerce_val(g, ev, slot_ty)
         vals.push(coerced)
         tys.push(slot_ty)
-        if qbe_is_obj_ty(slot_ty) {
+        if qbe_is_obj_ty(g, slot_ty) {
           obj_slots.push(i)
         } else {
           match slot_ty {
@@ -38227,7 +38515,7 @@ fn qbe_emit_expr_inner(
                         TDynTrait(_) => true
                         _ => false
                       }
-                      if qbe_is_obj_ty(elem) &&
+                      if qbe_is_obj_ty(g, elem) &&
                         qbe_flat_pod_stride(g, elem) == 0 &&
                         !is_dyn &&
                         qbe_arr_is_stable_expr(idx_expr, aname, false) &&
@@ -38445,7 +38733,11 @@ fn qbe_emit_expr_inner(
                   let cur_sv = qbe_load_local_slot(g, scrut_loc.slot, sv.ty)
                   let tag_l = qbe_tmp(g)
                   let tag_w = qbe_tmp(g)
-                  qbe_emit(g, tag_l + " =l loadl " + cur_sv)
+                  if qbe_is_unboxed_unit_enum(g, sv.ty) {
+                    qbe_emit(g, tag_l + " =l sub " + cur_sv + ", 1")
+                  } else {
+                    qbe_emit(g, tag_l + " =l loadl " + cur_sv)
+                  }
                   qbe_emit(g, tag_w + " =w copy " + tag_l)
                   let idx_w = if min_tag == 0 {
                     tag_w
@@ -39722,7 +40014,7 @@ fn qbe_try_emit_stack_pod_let(
                         let ev = qbe_load_heap_slot(g, sc.err_slot, err_ty)
                         let eloc = qbe_define_local(g, err_bind, err_ty, true)
                         qbe_store_local_slot(g, ev, eloc.slot, err_ty)
-                      } else if qbe_is_obj_ty(err_ty) {
+                      } else if qbe_is_obj_ty(g, err_ty) {
                         let ev = qbe_load_heap_slot(g, sc.err_slot, err_ty)
                         qbe_rc_dec(g, ev, err_ty)
                       }
@@ -39814,7 +40106,7 @@ fn qbe_try_emit_stack_pod_let(
               g.block_immut_fields = Map([])
               match sc.ret_ty {
                 TResult(_, err_ty) =>
-                  if qbe_is_obj_ty(err_ty) {
+                  if qbe_is_obj_ty(g, err_ty) {
                     let ev = qbe_load_heap_slot(g, sc.err_slot, err_ty)
                     qbe_rc_dec(g, ev, err_ty)
                   }
@@ -40289,7 +40581,7 @@ fn qbe_try_emit_borrowed_arr_elem_let(
           } else {
           match aloc.ty {
             TArray(elem) | TFixedArray(elem) => {
-              if !qbe_is_obj_ty(elem) {
+              if !qbe_is_obj_ty(g, elem) {
                 return false
               }
               let flat_stride = qbe_flat_pod_stride(g, elem)
@@ -40448,7 +40740,7 @@ fn qbe_try_emit_borrowed_arr_elem_let(
                       let fty = subst_ty(sinfo.field_tys[fi], subst)
                       match fty {
                         TArray(elem) | TFixedArray(elem) => {
-                          if !qbe_is_obj_ty(elem) {
+                          if !qbe_is_obj_ty(g, elem) {
                             return false
                           }
                           let flat_stride = qbe_flat_pod_stride(g, elem)
@@ -40557,7 +40849,7 @@ fn qbe_try_emit_borrowed_arr_elem_let(
                   while fi < sinfo.field_names.length() {
                     if sinfo.field_names[fi] == fname {
                       let fty = subst_ty(sinfo.field_tys[fi], subst)
-                      if !qbe_is_obj_ty(fty) {
+                      if !qbe_is_obj_ty(g, fty) {
                         return false
                       }
                       let final_ty = match ty_expr {
@@ -40659,7 +40951,7 @@ fn qbe_try_emit_borrowed_arr_elem_let(
                                     return false
                                   }
                                   let fty = subst_ty(si2.field_tys[fi2], sub2)
-                                  if !qbe_is_obj_ty(fty) {
+                                  if !qbe_is_obj_ty(g, fty) {
                                     return false
                                   }
                                   let final_ty = match ty_expr {
@@ -44286,10 +44578,10 @@ fn qbe_try_emit_while_sq_reuse(
 }
 
 ///|
-fn qbe_is_early_drop_ty(t : Ty) -> Bool {
+fn qbe_is_early_drop_ty(g : QbeGen, t : Ty) -> Bool {
   match t {
     TWorld | TScope | TParam(_) => false
-    _ => qbe_is_obj_ty(t)
+    _ => qbe_is_obj_ty(g, t)
   }
 }
 
@@ -44610,7 +44902,7 @@ fn qbe_emit_stmts(
         let dname = def_names[i]
         match qbe_lookup_local(g, dname) {
           Some(loc) =>
-            if loc.owned && !loc.is_cell && loc.ref_slot == "" && qbe_is_early_drop_ty(loc.ty) {
+            if loc.owned && !loc.is_cell && loc.ref_slot == "" && qbe_is_early_drop_ty(g, loc.ty) {
               ed_names.push(dname)
               ed_slots.push(loc.slot)
               ed_last.push(def_last_use[i])
@@ -44978,7 +45270,7 @@ fn qbe_emit_stmt(
               "0"
             }
           _ =>
-            if qbe_is_obj_ty(final_ty) {
+            if qbe_is_obj_ty(g, final_ty) {
               qbe_register_slot_drop(g, [0])
             } else {
               "0"
@@ -45343,7 +45635,7 @@ fn qbe_emit_stmt(
                 qbe_emit(g, cell_p + " =l loadl " + loc.slot)
                 let need_cell_dec = match loc.ty {
                   TParam(_) => true
-                  _ => qbe_is_obj_ty(loc.ty)
+                  _ => qbe_is_obj_ty(g, loc.ty)
                 }
                 if need_cell_dec {
                   let old = qbe_tmp(g)
@@ -45357,7 +45649,7 @@ fn qbe_emit_stmt(
                 let need_dec = if loc.owned {
                   match loc.ty {
                     TParam(_) => true
-                    _ => qbe_is_obj_ty(loc.ty)
+                    _ => qbe_is_obj_ty(g, loc.ty)
                   }
                 } else {
                   false
@@ -45445,7 +45737,7 @@ fn qbe_emit_stmt(
                       qbe_emit(g, p + " =l add " + ov.reg + ", " + (i * 8).to_string())
                       let need_dec = match fty {
                         TParam(_) => true
-                        _ => qbe_is_obj_ty(fty)
+                        _ => qbe_is_obj_ty(g, fty)
                       }
                       if need_dec {
                         let old = qbe_tmp(g)
@@ -46182,7 +46474,7 @@ fn qbe_emit_stmt(
                       let old_v = qbe_load_heap_slot(g, fp, fty)
                       let rv = qbe_emit_expr(g, rhs, Some(fty))
                       let new_v = qbe_emit_compound_binop(g, op, old_v, rv, fty)
-                      if qbe_is_obj_ty(fty) {
+                      if qbe_is_obj_ty(g, fty) {
                         qbe_emit_adopt_if_frozen(g, ov.reg, new_v, fty, true)
                         qbe_rc_dec(g, old_v, fty)
                       }
@@ -46329,7 +46621,7 @@ fn qbe_emit_stmt(
             }
           }
           qbe_scope_push(g)
-          if !borrowed && qbe_is_obj_ty(ov.ty) {
+          if !borrowed && qbe_is_obj_ty(g, ov.ty) {
             let ov_nm = "$__ca_ov_" + g.next_tmp.to_string()
             g.next_tmp = g.next_tmp + 1
             let ov_loc = qbe_define_local(g, ov_nm, ov.ty, true)
@@ -46379,7 +46671,7 @@ fn qbe_emit_stmt(
               }
               let ep = qbe_emit_arr_ep_ty(g, dp, il, elem)
               let old_v = qbe_load_arr_elem(g, ep, elem)
-              let hold_old_obj = !rhs_pure && qbe_is_obj_ty(elem)
+              let hold_old_obj = !rhs_pure && qbe_is_obj_ty(g, elem)
               if hold_old_obj {
                 qbe_rc_inc(g, old_v, elem)
                 let old_nm = "$__ca_old_" + g.next_tmp.to_string()
@@ -46504,7 +46796,7 @@ fn qbe_emit_stmt(
                   g,
                   old_v + " =" + qbe_abi_ty(vty) + " call $pion_vmap_get_" + m + "(l " + ov.reg + kstr + ")",
                 )
-                if !rhs_pure && qbe_is_obj_ty(vty) {
+                if !rhs_pure && qbe_is_obj_ty(g, vty) {
                   qbe_rc_inc(g, old_v, vty)
                   let old_nm = "$__ca_mv_" + g.next_tmp.to_string()
                   g.next_tmp = g.next_tmp + 1
@@ -46533,7 +46825,7 @@ fn qbe_emit_stmt(
                   vc +
                   ")",
                 )
-                if qbe_is_obj_ty(vty) {
+                if qbe_is_obj_ty(g, vty) {
                   qbe_rc_dec(g, new_v, vty)
                 }
               } else {
@@ -46542,7 +46834,7 @@ fn qbe_emit_stmt(
                   qbe_scope_pop(g)
                   return qval("0", TNever)
                 }
-                if qbe_is_obj_ty(kv.ty) {
+                if qbe_is_obj_ty(g, kv.ty) {
                   let kv_nm = "$__ca_kv_" + g.next_tmp.to_string()
                   g.next_tmp = g.next_tmp + 1
                   let kv_loc = qbe_define_local(g, kv_nm, kv.ty, true)
@@ -46568,7 +46860,7 @@ fn qbe_emit_stmt(
                   TFloat => qbe_from_l(g, old_l, TFloat)
                   _ => old_l
                 }
-                if !rhs_pure && qbe_is_obj_ty(vty) {
+                if !rhs_pure && qbe_is_obj_ty(g, vty) {
                   qbe_rc_inc(g, old_v, vty)
                   let old_nm = "$__ca_mv_" + g.next_tmp.to_string()
                   g.next_tmp = g.next_tmp + 1
@@ -46587,7 +46879,7 @@ fn qbe_emit_stmt(
                   g,
                   "call $pion_map_set(l " + ov.reg + ", l " + kl + ", l " + vl + ")",
                 )
-                if qbe_is_obj_ty(vty) {
+                if qbe_is_obj_ty(g, vty) {
                   qbe_rc_dec(g, new_v, vty)
                 }
               }
@@ -47623,7 +47915,7 @@ fn qbe_emit_stmt(
       qbe_invalidate_escaping_unfrozen_arrs(g, None, None, body)
       let arr_name = "__pion_fa_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
-      let arr_loc = qbe_define_local(g, arr_name, av.ty, qbe_is_obj_ty(av.ty))
+      let arr_loc = qbe_define_local(g, arr_name, av.ty, qbe_is_obj_ty(g, av.ty))
       qbe_store_local_slot(g, av.reg, arr_loc.slot, av.ty)
       let len_name = "__pion_fl_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
@@ -47779,7 +48071,7 @@ fn qbe_emit_stmt(
                     if loc.owned &&
                       !loc.is_cell &&
                       loc.ref_slot == "" &&
-                      qbe_is_early_drop_ty(loc.ty) &&
+                      qbe_is_early_drop_ty(g, loc.ty) &&
                       !g.zeroed_slots.contains(loc.slot) &&
                       !g.pinned_slots.contains(loc.slot) &&
                       qbe_expr_count_mentions(e, loc.name) == 1 {
@@ -47848,7 +48140,7 @@ fn qbe_emit_stmt(
                   if loc.owned &&
                     !loc.is_cell &&
                     loc.ref_slot == "" &&
-                    qbe_is_early_drop_ty(loc.ty) &&
+                    qbe_is_early_drop_ty(g, loc.ty) &&
                     !g.zeroed_slots.contains(loc.slot) &&
                     !g.pinned_slots.contains(loc.slot) &&
                     qbe_expr_count_mentions(e, loc.name) == 1 {
@@ -48584,6 +48876,7 @@ fn qbe_tco_expr_is_borrowed_subpath(
 
 ///|
 fn qbe_tco_call_is_eligible(
+  g : QbeGen,
   fd : FnDecl,
   finfo : FnInfo,
   e : Expr,
@@ -48605,7 +48898,7 @@ fn qbe_tco_call_is_eligible(
           EMutArg(_, _) => return false
           _ => ()
         }
-        if qbe_is_obj_ty(finfo.param_tys[pi]) {
+        if qbe_is_obj_ty(g, finfo.param_tys[pi]) {
           if !qbe_tco_expr_is_borrowed_subpath(norm_args[pi], borrowed_roots) {
             return false
           }
@@ -48627,15 +48920,15 @@ fn qbe_tco_scan_tail_expr(
   borrowed_roots : Array[String],
   counts : Array[Int],
 ) -> Unit {
-  if qbe_tco_call_is_eligible(fd, finfo, e, borrowed_roots) {
+  if qbe_tco_call_is_eligible(g, fd, finfo, e, borrowed_roots) {
     counts[0] = counts[0] + 1
     return
   }
   match e {
     EBinary("+", lhs, rhs, _) => {
-      if qbe_tco_call_is_eligible(fd, finfo, rhs, borrowed_roots) {
+      if qbe_tco_call_is_eligible(g, fd, finfo, rhs, borrowed_roots) {
         counts[1] = counts[1] + 1
-      } else if qbe_tco_call_is_eligible(fd, finfo, lhs, borrowed_roots) &&
+      } else if qbe_tco_call_is_eligible(g, fd, finfo, lhs, borrowed_roots) &&
         qbe_expr_is_pure_no_trap(g, rhs, false) {
         counts[1] = counts[1] + 1
       }
@@ -48789,7 +49082,7 @@ fn qbe_tco_mode(
       return 0
     }
     let pty = finfo.param_tys[pi]
-    if qbe_is_obj_ty(pty) {
+    if qbe_is_obj_ty(g, pty) {
       has_rc_param = true
       if !qbe_ty_has_no_mut_fields(g, pty, Map([])) {
         return 0
@@ -48960,7 +49253,7 @@ fn qbe_tco_try_emit_self_jump(
       // Verify all RC args are loadable borrowed subpaths BEFORE emitting any code (including left_delta)
       let mut pi = 0
       while pi < norm_args.length() {
-        if qbe_is_obj_ty(g.tco_param_tys[pi]) {
+        if qbe_is_obj_ty(g, g.tco_param_tys[pi]) {
           if !qbe_tco_can_load_borrowed_rc_arg(g, norm_args[pi]) {
             return false
           }
@@ -48986,7 +49279,7 @@ fn qbe_tco_try_emit_self_jump(
       pi = 0
       while pi < norm_args.length() {
         let pty = g.tco_param_tys[pi]
-        if qbe_is_obj_ty(pty) {
+        if qbe_is_obj_ty(g, pty) {
           match qbe_tco_load_borrowed_rc_arg(g, norm_args[pi], pty) {
             Some(r) => new_vals.push(r)
             None => return false
@@ -49468,7 +49761,7 @@ fn qbe_emit_fn_decl(g : QbeGen, fd : FnDecl) -> String {
         while tpi2 < fd.params.length() {
           let pslot = g.scopes[0].locals[tpi2].slot
           p_slots.push(pslot)
-          if qbe_is_obj_ty(finfo.param_tys[tpi2]) {
+          if qbe_is_obj_ty(g, finfo.param_tys[tpi2]) {
             b_roots.push(pslot)
           }
           tpi2 = tpi2 + 1
@@ -49994,7 +50287,7 @@ fn qbe_emit_struct_drops(g : QbeGen, out : StringBuilder) -> Unit {
           let obj_slots : Array[Int] = []
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
-            if qbe_is_obj_ty(sinfo.field_tys[fi]) {
+            if qbe_is_obj_ty(g, sinfo.field_tys[fi]) {
               obj_slots.push(fi)
             }
             fi = fi + 1
@@ -50049,7 +50342,7 @@ fn qbe_emit_enum_drops(g : QbeGen, out : StringBuilder) -> Unit {
     let ename = g.enum_order[i]
     match qbe_lookup_enum_info(g, ename) {
       Some(einfo) =>
-        if einfo.decl.type_params.length() == 0 {
+        if einfo.decl.type_params.length() == 0 && !qbe_enum_info_is_unit_only(einfo) {
           if g.unit_mode && !has_qual_sep(ename) {
             out.write_string("export ")
           }
@@ -50063,7 +50356,7 @@ fn qbe_emit_enum_drops(g : QbeGen, out : StringBuilder) -> Unit {
             let obj_slots : Array[Int] = []
             let mut fi = 0
             while fi < v.field_tys.length() {
-              if qbe_is_obj_ty(v.field_tys[fi]) {
+              if qbe_is_obj_ty(g, v.field_tys[fi]) {
                 obj_slots.push(fi)
               }
               fi = fi + 1
@@ -50638,7 +50931,7 @@ pub fn emit_qbe_package_multi_entry_target(
       }
       let cv = qbe_emit_expr(g, qbe_fn_expr(g, cd.value), Some(cty))
       let cv_reg = qbe_coerce_val(g, cv, cty)
-      if qbe_is_obj_ty(cty) {
+      if qbe_is_obj_ty(g, cty) {
         qbe_emit(g, "call $pion_rc_immortalize(l " + cv_reg + ")")
       }
       qbe_store_heap_slot(
@@ -51083,7 +51376,7 @@ pub fn emit_qbe_unit_entry_target(
       }
       let cv = qbe_emit_expr(g, qbe_fn_expr(g, cd.value), Some(cty))
       let cv_reg = qbe_coerce_val(g, cv, cty)
-      if qbe_is_obj_ty(cty) {
+      if qbe_is_obj_ty(g, cty) {
         qbe_emit(g, "call $pion_rc_immortalize(l " + cv_reg + ")")
       }
       qbe_store_heap_slot(g, cv_reg, "$pion_const_" + cd.name, cty)
@@ -51475,7 +51768,7 @@ pub fn emit_qbe_test_package_target(
       }
       let cv = qbe_emit_expr(g, qbe_fn_expr(g, cd.value), Some(cty))
       let cv_reg = qbe_coerce_val(g, cv, cty)
-      if qbe_is_obj_ty(cty) {
+      if qbe_is_obj_ty(g, cty) {
         qbe_emit(g, "call $pion_rc_immortalize(l " + cv_reg + ")")
       }
       qbe_store_heap_slot(
