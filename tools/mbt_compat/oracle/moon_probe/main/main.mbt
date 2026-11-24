@@ -690,7 +690,9 @@ fn case_wave_m2_round2() -> Unit {
   for item in pairs {
     let mx = @math.maximum(item.1, item.2)
     let mn = @math.minimum(item.1, item.2)
-    trace("mm." + item.0, "\{mx.reinterpret_as_int64()},\{mn.reinterpret_as_int64()}")
+    let mx_s = if mx.is_nan() { "NaN" } else { mx.reinterpret_as_int64().to_string() }
+    let mn_s = if mn.is_nan() { "NaN" } else { mn.reinterpret_as_int64().to_string() }
+    trace("mm." + item.0, "\{mx_s},\{mn_s}")
   }
   check("r2.math_max_nan", @math.maximum(nan, 1.0) == 1.0 && @math.maximum(1.0, nan).is_nan())
   check("r2.math_min_nan", @math.minimum(nan, 1.0).is_nan() && @math.minimum(1.0, nan) == 1.0)
