@@ -856,6 +856,43 @@ arm64_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg, uint64_t live_out)
 	return (live_out & BIT(reg.val)) == 0;
 }
 
+static uint64_t
+sat_add_u64(uint64_t a, uint64_t b)
+{
+	return (a > UINT64_MAX - b) ? UINT64_MAX : (a + b);
+}
+
+static uint64_t
+sat_mul_u64(uint64_t a, uint64_t b)
+{
+	if (a == 0 || b == 0)
+		return 0;
+	return (a > UINT64_MAX / b) ? UINT64_MAX : (a * b);
+}
+
+static uint64_t
+arm64_est_fn_bytes(Fn *fn)
+{
+	uint64_t est = 512; /* prologue / vararg save / callee-save / epilogue margin */
+	Blk *b;
+	Ins *i;
+
+	for (b = fn->start; b; b = b->link) {
+		est = sat_add_u64(est, 64); /* terminator / epilogue / jtbl overhead */
+		est = sat_add_u64(est, sat_mul_u64((uint64_t)b->nins, 40));
+		for (i = b->ins; i < &b->ins[b->nins]; i++) {
+			if (i->op == Oblit1) {
+				int sz = rsval(i->arg[0]);
+				if (sz > 0)
+					est = sat_add_u64(est, sat_mul_u64((uint64_t)sz, 4));
+			}
+		}
+		if (b->jmp.type == Jjtbl)
+			est = sat_add_u64(est, sat_mul_u64((uint64_t)b->njtbl, 4));
+	}
+	return est;
+}
+
 void
 arm64_emitfn(Fn *fn, FILE *out)
 {
@@ -865,13 +902,14 @@ arm64_emitfn(Fn *fn, FILE *out)
 	#undef X
 	};
 	static int id0;
-	int s, n, c, lbl, *r;
+	int s, n, c, lbl, far, *r;
 	uint64_t o;
-	Blk *b, *t;
+	Blk *b, *s1, *s2, *t;
 	Ins *i;
 	E *e;
 
 	e = &(E){.f = out, .fn = fn};
+	far = (arm64_est_fn_bytes(fn) >= 983040u);
 	if (T.apple)
 		e->fn->lnk.align = 4;
 	emitfnlnk(e->fn->name, &e->fn->lnk, e->f);
@@ -1179,7 +1217,6 @@ arm64_emitfn(Fn *fn, FILE *out)
 			fprintf(e->f, "\tret\n");
 			break;
 		case Jjmp:
-		Jmp:
 			if (b->s1 != b->link)
 				fprintf(e->f,
 					"\tb\t%s%d\n",
@@ -1217,14 +1254,23 @@ arm64_emitfn(Fn *fn, FILE *out)
 					b->njtbl & 0xffffu, b->njtbl >> 16,
 					rname(idx_r, Kw));
 			}
+			if (!far) {
+				fprintf(e->f,
+					"\tbhs\t%s%d\n",
+					T.asloc, id0 + b->s1->id);
+			} else {
+				fprintf(e->f,
+					"\tbcc\t1f\n"
+					"\tb\t%s%d\n"
+					"1:\n",
+					T.asloc, id0 + b->s1->id);
+			}
 			fprintf(e->f,
-				"\tbhs\t%s%d\n"
 				"\tadr\tx17, %sjt%d\n"
 				"\tldrsw\tx16, [x17, %s, uxtw #2]\n"
 				"\tadd\tx17, x17, x16\n"
 				"\tbr\tx17\n"
 				"%sjt%d:\n",
-				T.asloc, id0 + b->s1->id,
 				T.asloc, jtid,
 				rname(idx_r, Kw),
 				T.asloc, jtid);
@@ -1238,35 +1284,75 @@ arm64_emitfn(Fn *fn, FILE *out)
 			c = b->jmp.type - Jjf;
 			if (c < 0 || c > NCmp)
 				die("unhandled jump %d", b->jmp.type);
-			if (b->link == b->s2) {
-				t = b->s1;
-				b->s1 = b->s2;
-				b->s2 = t;
+			s1 = b->s1;
+			s2 = b->s2;
+			if (b->link == s2) {
+				t = s1;
+				s1 = s2;
+				s2 = t;
 				n = 0;
 			} else
 				n = 1;
 			if (flag_ins) {
 				int fc = flag_ins->op - Oflag;
 				int fn_inv = (c == Cieq) ? (n ^ 1) : n;
-				fprintf(e->f,
-					"\tb%s\t%s%d\n",
-					ctoa[fc][fn_inv], T.asloc, id0+b->s2->id
-				);
+				if (!far) {
+					fprintf(e->f,
+						"\tb%s\t%s%d\n",
+						ctoa[fc][fn_inv], T.asloc, id0+s2->id
+					);
+				} else {
+					fprintf(e->f,
+						"\tb%s\t1f\n"
+						"\tb\t%s%d\n"
+						"1:\n",
+						ctoa[fc][fn_inv ^ 1],
+						T.asloc, id0+s2->id
+					);
+				}
 			} else if (cbz_ins) {
 				int is_nz = (c == Cine) ^ n;
-				fprintf(e->f,
-					"\t%s\t%s, %s%d\n",
-					is_nz ? "cbnz" : "cbz",
-					rname(cbz_ins->arg[0].val, cbz_ins->cls),
-					T.asloc, id0+b->s2->id
-				);
+				if (!far) {
+					fprintf(e->f,
+						"\t%s\t%s, %s%d\n",
+						is_nz ? "cbnz" : "cbz",
+						rname(cbz_ins->arg[0].val, cbz_ins->cls),
+						T.asloc, id0+s2->id
+					);
+				} else {
+					fprintf(e->f,
+						"\t%s\t%s, 1f\n"
+						"\tb\t%s%d\n"
+						"1:\n",
+						is_nz ? "cbz" : "cbnz",
+						rname(cbz_ins->arg[0].val, cbz_ins->cls),
+						T.asloc, id0+s2->id
+					);
+				}
 			} else {
-				fprintf(e->f,
-					"\tb%s\t%s%d\n",
-					ctoa[c][n], T.asloc, id0+b->s2->id
-				);
+				if (!far) {
+					fprintf(e->f,
+						"\tb%s\t%s%d\n",
+						ctoa[c][n], T.asloc, id0+s2->id
+					);
+				} else {
+					fprintf(e->f,
+						"\tb%s\t1f\n"
+						"\tb\t%s%d\n"
+						"1:\n",
+						ctoa[c][n ^ 1],
+						T.asloc, id0+s2->id
+					);
+				}
 			}
-			goto Jmp;
+			if (s1 != b->link)
+				fprintf(e->f,
+					"\tb\t%s%d\n",
+					T.asloc, id0+s1->id
+				);
+			else
+				lbl = 0;
+			break;
 		}
 	}
 	id0 += e->fn->nblk;

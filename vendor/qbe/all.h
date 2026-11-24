@@ -280,6 +280,7 @@ struct Blk {
 	int loop;
 	char hascall;
 	char loopcall;
+	char istramp;
 	char *name;
 };
 

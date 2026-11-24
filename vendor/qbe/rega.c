@@ -532,12 +532,19 @@ rega(Fn *fn)
 		n = b->id;
 		loop = b->loop;
 		/* Seed visit registers from the hottest already-allocated
-		 * successor so end[b] aligns directly with beg[s]. */
+		 * successor so end[b] aligns directly with beg[s].
+		 * Priority: higher loop depth > call-free block > fall-through. */
 		s = 0;
 		if (b->s1 && allocd[b->s1->id])
 			s = b->s1;
-		if (b->s2 && allocd[b->s2->id] && (!s || b->s2->loop > s->loop))
-			s = b->s2;
+		if (b->s2 && allocd[b->s2->id]) {
+			if (!s
+			|| b->s2->loop > s->loop
+			|| (b->s2->loop == s->loop && !b->s2->hascall && s->hascall)
+			|| (b->s2->loop == s->loop && b->s2->hascall == s->hascall
+			    && b->s2 == b->link && s != b->link))
+				s = b->s2;
+		}
 		if (s) {
 			for (t=Tmp0; bsiter(b->out, &t); t++) {
 				r = rfind(&beg[s->id], t);
@@ -740,6 +747,7 @@ rega(Fn *fn)
 			if (curi == &insb[NIns])
 				continue;
 			b1 = newblk();
+			b1->istramp = 1;
 			b1->loop = (b->loop+s->loop) / 2;
 			b1->link = blist;
 			blist = b1;

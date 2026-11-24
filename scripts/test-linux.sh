@@ -520,6 +520,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p86_qbe_rss_budget/run_e2e.sh" "$PIONC
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p88_borrow_moveout/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p89_unit_enum/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

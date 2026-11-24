@@ -90,6 +90,65 @@ data(Dat *d)
 	}
 }
 
+static int
+is_cold_rc_or_hlt(const Blk *b)
+{
+	if (b->jmp.type == Jhlt)
+		return 1;
+	if (!b->name)
+		return 0;
+	return strncmp(b->name, "_rci_slow_", 10) == 0
+		|| strncmp(b->name, "_rcd_slow_", 10) == 0
+		|| strncmp(b->name, "_rcd_drop_", 10) == 0;
+}
+
+static int
+is_cold_block(const Blk *b)
+{
+	if (is_cold_rc_or_hlt(b))
+		return 1;
+	if (b->istramp && b->jmp.type == Jjmp && b->s1 && is_cold_rc_or_hlt(b->s1))
+		return 1;
+	return 0;
+}
+
+static void
+layout_cold_blocks(Fn *fn)
+{
+	Blk *hot_head, *hot_tail, *cold_head, *cold_tail, *b, *next;
+
+	/* Only enable on arm64/amd64; rv64 conditional branches have +-4KB range. */
+	if (strncmp(T.name, "arm64", 5) != 0 && strncmp(T.name, "amd64", 5) != 0)
+		return;
+	if (!fn->start || !fn->start->link)
+		return;
+	hot_head = hot_tail = 0;
+	cold_head = cold_tail = 0;
+	for (b = fn->start->link; b; b = next) {
+		next = b->link;
+		b->link = 0;
+		if (is_cold_block(b)) {
+			if (cold_tail)
+				cold_tail->link = b;
+			else
+				cold_head = b;
+			cold_tail = b;
+		} else {
+			if (hot_tail)
+				hot_tail->link = b;
+			else
+				hot_head = b;
+			hot_tail = b;
+		}
+	}
+	if (hot_head) {
+		fn->start->link = hot_head;
+		hot_tail->link = cold_head;
+	} else {
+		fn->start->link = cold_head;
+	}
+}
+
 static void
 func(Fn *fn)
 {
@@ -162,6 +221,7 @@ func(Fn *fn)
 			break;
 		} else
 			fn->rpo[n]->link = fn->rpo[n+1];
+	layout_cold_blocks(fn);
 	if (!dbg) {
 		if (objmode) {
 			if (strcmp(T.name, "arm64_apple") == 0)

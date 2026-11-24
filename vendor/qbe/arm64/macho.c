@@ -759,6 +759,7 @@ typedef struct {
 	Fn *fn;
 	uint64_t frame;
 	uint padding;
+	int far;
 	BrFixup *fixups;
 	size_t nfixups;
 	size_t cap_fixups;
@@ -1675,15 +1676,28 @@ me_reg_dead_after(Fn *fn, Ins *start, Ins *end, Ref reg, uint64_t live_out)
 	return (live_out & BIT(reg.val)) == 0;
 }
 
-void
-arm64_macho_fn(Fn *fn)
+static void
+me_condbr(ME *e, uint32_t base, uint32_t bid)
+{
+	if (!e->far) {
+		me_add_fixup(e, text_pos(), bid, base, 1);
+		emit_u32(base);
+		return;
+	}
+	/* Invert condition and branch +8 bytes (imm19 = 2) over the 26-bit b. */
+	uint32_t inv = ((base & 0x7e000000u) == 0x34000000u) ? (base ^ (1u << 24)) : (base ^ 1u);
+	emit_u32(inv | (2u << 5));
+	me_add_fixup(e, text_pos(), bid, 0x14000000u, 0);
+	emit_u32(0x14000000u);
+}
+
+static int
+arm64_macho_fn1(Fn *fn, int far, uint64_t *gpr_out)
 {
 	ME e;
 	memset(&e, 0, sizeof e);
 	e.fn = fn;
-
-	sec_align(SEC_TEXT, 4);
-	sym_define(fn->name, "", SEC_TEXT, sec_size(&M.secs[SEC_TEXT]), fn->lnk.export);
+	e.far = far;
 
 	/* hint #34 (bti c) */
 	emit_u32(0xd503245fu);
@@ -1717,7 +1731,6 @@ arm64_macho_fn(Fn *fn)
 
 	uint32_t *blk_off = emalloc((size_t)(fn->nblk + 1) * sizeof *blk_off);
 
-	uint64_t *gpr_out = me_compute_gpr_out(fn);
 	for (Blk *b = fn->start; b; b = b->link) {
 		uint64_t live_out = gpr_out[b->id];
 		Ins *cbz_ins = me_can_fuse_cbz(b, fn);
@@ -1942,7 +1955,8 @@ arm64_macho_fn(Fn *fn)
 							uint32_t r = greg(ra.val);
 							uint32_t cc = cmp_cc[(int)i2->op - Oxsel][0];
 							uint32_t cond = inv == 0 ? ((cc ^ 1u) & 0xfu) : (cc & 0xfu);
-							me_emitins(i1, &e);
+							Ins tmp1 = *i1;
+							me_emitins(&tmp1, &e);
 							/* csinc rd, ra, ra, cond (alias: cinc rd, ra, inv(cond)) */
 							emit_u32(0x1a800400u | (sf << 31) | (r << 16) | (cond << 12) | (r << 5) | r);
 							if (last_w32 == i->to.val)
@@ -1955,7 +1969,8 @@ arm64_macho_fn(Fn *fn)
 				}
 			}
 			int next_w32 = me_w32_def_reg(i, last_w32);
-			me_emitins(i, &e);
+			Ins tmp = *i;
+			me_emitins(&tmp, &e);
 			last_w32 = next_w32;
 		}
 
@@ -1994,7 +2009,6 @@ arm64_macho_fn(Fn *fn)
 			break;
 		}
 		case Jjmp:
-		Jmp:
 			if (b->s1 != b->link) {
 				me_add_fixup(&e, text_pos(), b->s1->id, 0x14000000u, 0);
 				emit_u32(0x14000000u); /* b placeholder */
@@ -2023,8 +2037,7 @@ arm64_macho_fn(Fn *fn)
 				emit_u32(0x6b11001fu | (idx << 5));
 			}
 			/* b.hs <s1> (cond 0x2 = CS/HS) */
-			me_add_fixup(&e, text_pos(), b->s1->id, 0x54000002u, 1);
-			emit_u32(0x54000002u);
+			me_condbr(&e, 0x54000002u, b->s1->id);
 			/* adr x17, .+16 */
 			emit_u32(0x10000091u);
 			/* ldrsw x16, [x17, w<idx>, uxtw #2] */
@@ -2044,11 +2057,12 @@ arm64_macho_fn(Fn *fn)
 			int c = b->jmp.type - Jjf;
 			if (c < 0 || c >= NCmp)
 				die("macho: unhandled jump %d", b->jmp.type);
+			Blk *s1 = b->s1, *s2 = b->s2;
 			int inv;
-			if (b->link == b->s2) {
-				Blk *t = b->s1;
-				b->s1 = b->s2;
-				b->s2 = t;
+			if (b->link == s2) {
+				Blk *t = s1;
+				s1 = s2;
+				s2 = t;
 				inv = 0;
 			} else {
 				inv = 1;
@@ -2057,22 +2071,39 @@ arm64_macho_fn(Fn *fn)
 				int fc = flag_ins->op - Oflag;
 				int fn_inv = (c == Cieq) ? (inv ^ 1) : inv;
 				uint32_t base = 0x54000000u | cmp_cc[fc][fn_inv];
-				me_add_fixup(&e, text_pos(), b->s2->id, base, 1);
-				emit_u32(base);
+				me_condbr(&e, base, s2->id);
 			} else if (cbz_ins) {
 				int is_nz = (c == Cine) ^ inv;
 				uint32_t sf = KWIDE(cbz_ins->cls) ? 1u : 0u;
 				uint32_t rt = greg(cbz_ins->arg[0].val);
 				uint32_t base = 0x34000000u | (sf << 31) | ((uint32_t)is_nz << 24) | rt;
-				me_add_fixup(&e, text_pos(), b->s2->id, base, 1);
-				emit_u32(base);
+				me_condbr(&e, base, s2->id);
 			} else {
 				uint32_t base = 0x54000000u | cmp_cc[c][inv];
-				me_add_fixup(&e, text_pos(), b->s2->id, base, 1);
-				emit_u32(base); /* b.cc placeholder */
+				me_condbr(&e, base, s2->id);
 			}
-			goto Jmp;
+			if (s1 != b->link) {
+				me_add_fixup(&e, text_pos(), s1->id, 0x14000000u, 0);
+				emit_u32(0x14000000u); /* b placeholder */
+			}
+			break;
 		}
+		}
+	}
+
+	/* Check if any 19-bit conditional branch exceeds +-1MB before patching */
+	if (!far) {
+		for (size_t k = 0; k < e.nfixups; k++) {
+			BrFixup *f = &e.fixups[k];
+			if (f->is_imm19) {
+				int64_t diff = ((int64_t)blk_off[f->target_bid] - (int64_t)f->pc_off) / 4;
+				if (diff < -262144 || diff > 262143) {
+					free(blk_off);
+					free(e.fixups);
+					free(e.jtfixups);
+					return 1;
+				}
+			}
 		}
 	}
 
@@ -2111,6 +2142,24 @@ arm64_macho_fn(Fn *fn)
 	free(blk_off);
 	free(e.fixups);
 	free(e.jtfixups);
+	return 0;
+}
+
+void
+arm64_macho_fn(Fn *fn)
+{
+	sec_align(SEC_TEXT, 4);
+	sym_define(fn->name, "", SEC_TEXT, sec_size(&M.secs[SEC_TEXT]), fn->lnk.export);
+	size_t len0 = M.secs[SEC_TEXT].buf.len;
+	size_t nrel0 = M.secs[SEC_TEXT].nrelocs;
+	uint64_t *gpr_out = me_compute_gpr_out(fn);
+
+	if (arm64_macho_fn1(fn, 0, gpr_out)) {
+		M.secs[SEC_TEXT].buf.len = len0;
+		M.secs[SEC_TEXT].nrelocs = nrel0;
+		if (arm64_macho_fn1(fn, 1, gpr_out))
+			die("macho: conditional branch out of range after far retry in %s", fn->name);
+	}
 }
 
 /* ---- Data section emission ---- */

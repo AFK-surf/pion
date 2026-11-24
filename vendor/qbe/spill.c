@@ -117,11 +117,16 @@ static BSet l2b[1], pmu[1]; /* scratch bitsets for limit2() and dopm() */
 static int
 tcmp0(const void *pa, const void *pb)
 {
+	int ta, tb;
 	uint ca, cb;
 
-	ca = tmp[*(int *)pa].cost;
-	cb = tmp[*(int *)pb].cost;
-	return (cb < ca) ? -1 : (cb > ca);
+	ta = *(int *)pa;
+	tb = *(int *)pb;
+	ca = tmp[ta].cost;
+	cb = tmp[tb].cost;
+	if (ca != cb)
+		return (cb < ca) ? -1 : 1;
+	return (ta > tb) - (ta < tb);
 }
 
 static int

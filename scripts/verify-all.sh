@@ -212,6 +212,8 @@ sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p88_borrow_moveout/run_e2e.sh" "$PIONC2"
 # Wave H-2 Track H4: unboxed 1-based C-style unit enums + Option[UnitEnum] null niche (dev + release + ASan/LSan + Wasm32 + xpkg).
 sh "$ROOT_DIR/tests/e2e/p89_unit_enum/run_e2e.sh" "$PIONC2"
+# Wave H-2 Track H5: ARM64 far conditional branches (> +-1MB) + QBE rega cold-call seeding + cold-block layout.
+sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
