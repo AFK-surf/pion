@@ -89,6 +89,7 @@ CASES = {
     "utf16_arith_and_idx": ("ok", 7),
     "div_min_allones_i32": ("panic:div_overflow", 0),
     "div_min_allones_i64": ("panic:div_overflow", 0),
+    "utf16_lit_struct_interp": ("ok", 5),
 }
 
 MOON_TRAPS = {
@@ -393,6 +394,17 @@ pub fn arr_str_idx_len(xs : Array[String], i : Int) -> Int { xs[i].length() }
 
 pub fn div_allones_i32(a : Int) -> Int { a / 0xffffffff }
 pub fn div_allones_i64(a : Int64) -> Int64 { a / 0xffffffffffffffffL }
+
+// Round 5 Astra P0-1 cases: string literals, struct field init after `:`, parenthesized lit, interp string length
+pub struct LenBox {
+  n : Int
+}
+
+pub fn str_lit_len_mul2() -> Int { "中A".length() * 2 }
+pub fn str_lit_idx_1() -> Int { "中A"[1].to_int() }
+pub fn str_paren_lit_len_mul2() -> Int { ("中A").length() * 2 }
+pub fn str_struct_field_len(s : String) -> Int { LenBox::{ n: s.length() * 2 }.n }
+pub fn str_interp_len(x : Int) -> Int { "中\{x}".length() }
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -724,6 +736,18 @@ fn main {
     let m = [-9223372036854775807L - 1L][0]
     trace("before", "ok")
     trace("after", div_allones_i64(m).to_string())
+  } else if kase == "utf16_lit_struct_interp" {
+    let r1 = str_lit_len_mul2()
+    let r2 = str_lit_idx_1()
+    let r3 = str_paren_lit_len_mul2()
+    let r4 = str_struct_field_len("中A")
+    let r5 = str_interp_len(7)
+    trace("r", "\{r1},\{r2},\{r3},\{r4},\{r5}")
+    check("r5.lit_len", r1 == 4)
+    check("r5.lit_idx", r2 == 65)
+    check("r5.paren_lit", r3 == 4)
+    check("r5.struct_field", r4 == 4)
+    check("r5.interp_len", r5 == 2)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1069,6 +1093,18 @@ pub fn main(w : World) -> Int {
     let m = [-9223372036854775807L - 1L][0]
     trace(w, "before", "ok")
     trace(w, "after", div_allones_i64(m).to_string())
+  } else if kase == "utf16_lit_struct_interp" {
+    let r1 = str_lit_len_mul2()
+    let r2 = str_lit_idx_1()
+    let r3 = str_paren_lit_len_mul2()
+    let r4 = str_struct_field_len("中A")
+    let r5 = str_interp_len(7)
+    trace(w, "r", r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string())
+    check(w, "r5.lit_len", r1 == 4)
+    check(w, "r5.lit_idx", r2 == 65)
+    check(w, "r5.paren_lit", r3 == 4)
+    check(w, "r5.struct_field", r4 == 4)
+    check(w, "r5.interp_len", r5 == 2)
   } else {
     panic("abort: unknown case " + kase)
   }

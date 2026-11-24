@@ -169,6 +169,63 @@ fn parse_manifest_deps(manifest_path : String, content : String, out_deps : Arra
   }
 }
 
+///| Run `pionc check --json` directly against an assembled sibling candidate directory `abs_stage_dir`
+///| via a temporary package manifest + `src -> abs_stage_dir` symlink (Astra Round 5 P0-2).
+///| Because `stage_dir` lives beside `--out` with all newly generated files, preserved files, and
+///| restored symlinks, every relative/absolute symlink resolves to its exact post-swap target!
+fn run_pionc_check_dir_status(
+  world : World,
+  pionc_bin : String,
+  scratch_dir : String,
+  deps : Array[(String, String)],
+  abs_stage_dir : String,
+) -> (Bool, String) {
+  let rm_bin = if fs_exists(world, "/bin/rm") { "/bin/rm" } else { "rm" }
+  let _ = proc_exec(world, [rm_bin, "-rf", scratch_dir])
+  let _ = fs_mkdir_p(world, scratch_dir)
+  let toml_sb = StringBuilder()
+  toml_sb.write_string("[package]\nname = \"mbt2pion_final_check\"\nversion = \"0.1.0\"\n")
+  if deps.length() > 0 {
+    toml_sb.write_string("\n[dependencies]\n")
+    let seen_dep : Map[String, Bool] = Map()
+    for dep in deps {
+      if !seen_dep.contains(dep.0) {
+        seen_dep[dep.0] = true
+        toml_sb.write_string(dep.0 + " = { path = \"" + dep.1 + "\" }\n")
+      }
+    }
+  }
+  let _ = fs_write(world, join_path(scratch_dir, "pion.toml"), toml_sb.to_string())
+  let src_link = join_path(scratch_dir, "src")
+  if !fs_symlink(world, abs_stage_dir, src_link) {
+    return (false, "{\"ok\":false,\"diagnostics\":[{\"file\":\"<final_check>\",\"line\":1,\"col\":1,\"code\":\"E_IO\",\"message\":\"failed to symlink stage_dir for final_check\"}]}")
+  }
+  match proc_exec_capture(world, [pionc_bin, "check", "--json", scratch_dir]) {
+    Ok(out) => (true, out)
+    Err(out) => (false, out)
+  }
+}
+
+///| Verify whether an external report path is writable (target is not a dir, and sibling temp file can be created).
+fn precheck_external_report_writable(world : World, path : String, uniq_tag : String) -> Bool {
+  match lstat_kind(world, path) {
+    Some("dir") => return false
+    _ => ()
+  }
+  let p = dirname(path)
+  if p.length() > 0 && !fs_mkdir_p(world, p) {
+    return false
+  }
+  let probe = path + ".mbt2pion-pre-" + uniq_tag
+  match fs_write(world, probe, "") {
+    Ok(_) => {
+      let _ = fs_remove(world, probe)
+      true
+    }
+    Err(_) => false
+  }
+}
+
 ///| Run `pionc check --json` on a batch of `(rel_path, content)` files in a clean scratch directory.
 ///| Returns `(ok_exit_zero, raw_stdout_or_stderr)`.
 ///| When `deps` is non-empty, constructs a real package `pion.toml` with the full dependency graph (P0-3).
@@ -466,22 +523,7 @@ fn scan_unmanaged_tree(
       }
       Some("link") =>
       match fs_readlink(world, full) {
-        Ok(tgt) => {
-          unmanaged_symlinks.push((rel, tgt))
-          // Astra Round 4 P0-2: symlinked `.pion` files (or symlinked dirs containing `.pion`)
-          // are loaded by `pionc check`, so they MUST be included in `preserved_unmanaged_pions`!
-          if rel.ends_with(".pion") && !gen_set.contains(rel) {
-            match fs_read(world, full) {
-              Ok(txt) => preserved_unmanaged_pions.push((rel, txt))
-              Err(e) => return Err("unreadable or dangling .pion symlink in --out (" + full + "): " + e)
-            }
-          } else if fs_is_dir(world, full) {
-            match scan_symlinked_dir_pions(world, full, rel, gen_set, 0, preserved_unmanaged_pions) {
-              Ok(_) => ()
-              Err(e) => return Err(e)
-            }
-          }
-        }
+        Ok(tgt) => unmanaged_symlinks.push((rel, tgt))
         Err(e) => return Err("cannot readlink in --out (" + full + "): " + e)
       }
       Some("file") =>
@@ -1071,34 +1113,153 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  // P0-2 + Astra P0-1: Final zero-diagnostic `pionc check --json` hard gate on the exact final formatted
-  // candidate package INCLUDING preserved hand-written unmanaged `.pion` files in `--out`!
+  // Astra Round 5 P0-2: Assemble sibling `stage_dir` BEFORE final_check (for BOTH publish and --check!)
+  // so every relative & absolute symlink (e.g. `alias.pion -> a.pion`, `../common/shared.pion`) resolves
+  // to its exact post-swap target when `pionc check --json` validates the candidate package!
+  let mut stage_dir = ""
+  let mut stage_created = false
+  let mut stage_ok = true
+  let report_rel_str = match report_in_out_rel { Some(r) => r, None => "" }
+  let drift_rel_str = match drift_in_out_rel { Some(r) => r, None => "" }
+  let run_rel_str = match run_in_out_rel { Some(r) => r, None => "" }
+
   if (mode == "publish" || check_only) && final_blockers == 0 && fs_fatal_err.length() == 0 {
-    let final_batch : Array[(String, String)] = []
-    for gf in final_files {
-      final_batch.push((gf.rel_path, gf.content))
+    let parent_of_out = dirname(clean_out_dir)
+    if mode == "publish" && parent_of_out.length() > 0 {
+      let _ = fs_mkdir_p(world, parent_of_out)
     }
-    for pair in preserved_unmanaged_pions {
-      final_batch.push(pair)
+    stage_dir = if mode == "publish" || (parent_of_out.length() > 0 && fs_is_dir(world, parent_of_out)) || out_existed_as_dir {
+      clean_out_dir + ".mbt2pion-stage-" + uniq_tag
+    } else {
+      join_path(scratch_root, "check_stage")
     }
-    let (chk_ok, chk_raw) = run_pionc_check_batch_status(
-      world,
-      pionc_bin,
-      join_path(scratch_root, "final_check"),
-      check_deps,
-      false,
-      final_batch,
-    )
-    if !chk_ok || !is_pionc_check_clean_json(chk_raw) {
-      let rem_diags = m2p::parse_pionc_diagnostics(chk_raw)
-      final_diags.push(m2p::diag_error(
-        "MBT2PION_FINAL_CHECK_FAILED",
-        "<final_check>",
-        1,
-        1,
-        "final pionc check --json failed (exit_ok=" + chk_ok.to_string() + ", diagnostics=" + rem_diags.length().to_string() + ")",
-      ))
-      final_blockers = final_blockers + 1
+    cleanup_dir_preserve_hardlinks(world, stage_dir)
+    if fs_mkdir_p(world, stage_dir) {
+      stage_created = true
+      let _ = fs_chmod(world, stage_dir, 448) // 0700 while populating
+    } else {
+      stage_ok = false
+    }
+
+    // 1. Recreate all unmanaged directories (0700 initially; exact modes restored bottom-up right before commit)
+    if stage_ok {
+      for dm in unmanaged_dirs {
+        let dpath = join_path(stage_dir, dm.0)
+        if !fs_mkdir_p(world, dpath) {
+          io_eprintln(world, "mbt2pion: failed staging directory " + dpath)
+          stage_ok = false
+        }
+        let _ = fs_chmod(world, dpath, 448)
+      }
+    }
+
+    // 2. Write all newly generated `.pion` files
+    if stage_ok {
+      for gf in final_files {
+        let dst = join_path(stage_dir, gf.rel_path)
+        let parent = dirname(dst)
+        if parent.length() > 0 {
+          let _ = fs_mkdir_p(world, parent)
+        }
+        match fs_write(world, dst, gf.content) {
+          Ok(_) => ()
+          Err(e) => {
+            io_eprintln(world, "mbt2pion: failed staging " + dst + ": " + e)
+            stage_ok = false
+          }
+        }
+      }
+    }
+
+    // 3. Recreate all unmanaged symlinks without dereferencing
+    if stage_ok {
+      for sl in unmanaged_symlinks {
+        let dst = join_path(stage_dir, sl.0)
+        let parent = dirname(dst)
+        if parent.length() > 0 {
+          let _ = fs_mkdir_p(world, parent)
+        }
+        if !fs_symlink(world, sl.1, dst) {
+          io_eprintln(world, "mbt2pion: failed staging symlink " + dst + " -> " + sl.1)
+          stage_ok = false
+        }
+      }
+    }
+
+    // 4. Preserve all unmanaged regular files (skipping in-`--out` reports that will be freshly written on publish)
+    if stage_ok {
+      for fm in unmanaged_files {
+        let rel = fm.0
+        let mode_bits = fm.1
+        if mode == "publish" &&
+        ((report_rel_str.length() > 0 && rel == report_rel_str) ||
+          (drift_rel_str.length() > 0 && rel == drift_rel_str) ||
+          (run_rel_str.length() > 0 && rel == run_rel_str)) {
+          continue
+        }
+        let src = join_path(clean_out_dir, rel)
+        let dst = join_path(stage_dir, rel)
+        let parent = dirname(dst)
+        if parent.length() > 0 {
+          let _ = fs_mkdir_p(world, parent)
+        }
+        if !fs_hardlink(src, dst) {
+          match fs_read_bytes(world, src) {
+            Ok(bs) =>
+            match fs_write_bytes(world, dst, bs) {
+              Ok(_) =>
+              if !fs_chmod(world, dst, mode_bits) {
+                io_eprintln(world, "mbt2pion: failed chmod on preserved file " + dst)
+                stage_ok = false
+              }
+              Err(e) => {
+                io_eprintln(world, "mbt2pion: failed copying unmanaged file " + dst + ": " + e)
+                stage_ok = false
+              }
+            }
+            Err(e) => {
+              io_eprintln(world, "mbt2pion: failed preserving unmanaged file " + src + ": " + e)
+              stage_ok = false
+            }
+          }
+        }
+      }
+    }
+
+    // 5. Verify any symlinked `.pion` in `stage_dir` is readable (catches dangling `.pion` symlinks post-assembly)
+    if stage_ok {
+      for sl in unmanaged_symlinks {
+        if sl.0.ends_with(".pion") {
+          let dst = join_path(stage_dir, sl.0)
+          match fs_read(world, dst) {
+            Ok(_) => ()
+            Err(e) => fs_fatal_err = "dangling or unreadable .pion symlink in candidate --out (" + sl.0 + " -> " + sl.1 + "): " + e
+          }
+        }
+      }
+    }
+
+    // 6. Run final zero-diagnostic `pionc check --json` directly on the assembled `stage_dir`!
+    if stage_ok && fs_fatal_err.length() == 0 {
+      let abs_stage = normalize_path(cwd, stage_dir)
+      let (chk_ok, chk_raw) = run_pionc_check_dir_status(
+        world,
+        pionc_bin,
+        join_path(scratch_root, "final_check_pkg"),
+        check_deps,
+        abs_stage,
+      )
+      if !chk_ok || !is_pionc_check_clean_json(chk_raw) {
+        let rem_diags = m2p::parse_pionc_diagnostics(chk_raw)
+        final_diags.push(m2p::diag_error(
+          "MBT2PION_FINAL_CHECK_FAILED",
+          "<final_check>",
+          1,
+          1,
+          "final pionc check --json failed on candidate package (exit_ok=" + chk_ok.to_string() + ", diagnostics=" + rem_diags.length().to_string() + ")",
+        ))
+        final_blockers = final_blockers + 1
+      }
     }
   }
 
@@ -1121,13 +1282,20 @@ pub fn main(world : World) -> Int {
 
   let report_json = if report_path.length() > 0 { m2p::render_migration_report_json(final_res, opts) } else { "" }
   let drift_json = if drift_ledger_path.length() > 0 { m2p::render_drift_ledger_json(final_res, opts) } else { "" }
-  let mut report_written_in_stage = false
-  let mut drift_written_in_stage = false
-  let mut run_written_in_stage = false
+  let report_is_in_out = report_rel_str.length() > 0
+  let drift_is_in_out = drift_rel_str.length() > 0
+  let run_is_in_out = run_rel_str.length() > 0
+  let mut report_written = false
+  let mut drift_written = false
+  let mut run_written = false
 
   let mut exit_code = 0
 
   if check_only {
+    if stage_created {
+      cleanup_dir_preserve_hardlinks(world, stage_dir)
+      stage_created = false
+    }
     // `--check`: verify managed file set equality AND full-byte equality (including headers) against `--out` (P0-4)
     let mut diffs = 0
     let expected_set : Map[String, Bool] = Map()
@@ -1154,14 +1322,22 @@ pub fn main(world : World) -> Int {
         diffs = diffs + 1
       }
     }
-    if final_res.blockers > 0 || diffs > 0 || fs_fatal_err.length() > 0 {
+    if final_res.blockers > 0 || diffs > 0 || fs_fatal_err.length() > 0 || !stage_ok {
       exit_code = 1
     }
   } else if mode == "publish" {
     if fs_fatal_err.length() > 0 {
+      if stage_created {
+        cleanup_dir_preserve_hardlinks(world, stage_dir)
+        stage_created = false
+      }
       io_eprintln(world, "mbt2pion: refusing publish (cannot safely preserve --out): " + fs_fatal_err)
       exit_code = 3
     } else if final_res.blockers > 0 {
+      if stage_created {
+        cleanup_dir_preserve_hardlinks(world, stage_dir)
+        stage_created = false
+      }
       io_eprintln(
         world,
         "mbt2pion: publish blocked (" + final_res.blockers.to_string() + " blocker(s)); --out was NOT modified",
@@ -1172,182 +1348,138 @@ pub fn main(world : World) -> Int {
         }
       }
       exit_code = 1
+    } else if !stage_ok {
+      if stage_created {
+        cleanup_dir_preserve_hardlinks(world, stage_dir)
+        stage_created = false
+      }
+      exit_code = 3
     } else {
-      // Astra Round 3 P0-1: True zero-ENOENT atomic directory swap (`renamex_np` / `renameat2`)
-      // preserving ALL unmanaged dirs (incl. empty) + exact modes, symlinks, and unmanaged files
-      // (via hardlink first so mode 0000/0751 and binary bytes are preserved identically)!
-      let parent_of_out = dirname(clean_out_dir)
-      if parent_of_out.length() > 0 {
-        let _ = fs_mkdir_p(world, parent_of_out)
-      }
-      let stage_dir = clean_out_dir + ".mbt2pion-stage-" + uniq_tag
-      cleanup_dir_preserve_hardlinks(world, stage_dir)
-      let mut stage_ok = fs_mkdir_p(world, stage_dir)
-      let _ = fs_chmod(world, stage_dir, 448) // 0700 while populating
-
-      // 1. Recreate all unmanaged directories (writable 0700 initially; exact modes applied bottom-up below)
-      for dm in unmanaged_dirs {
-        let dpath = join_path(stage_dir, dm.0)
-        if !fs_mkdir_p(world, dpath) {
-          io_eprintln(world, "mbt2pion: failed staging directory " + dpath)
-          stage_ok = false
+      // Astra Round 5 P0-3: Two-phase external report pre-commit BEFORE atomic directory swap!
+      // Any external report write/precheck failure aborts cleanly BEFORE touching `--out`!
+      let mut ext_io_ok = true
+      if report_path.length() > 0 && !report_is_in_out && !report_path_bad {
+        let is_dir_dst = match lstat_kind(world, report_path) { Some("dir") => true, _ => false }
+        if is_dir_dst || !write_file_atomic(world, report_path, report_json, uniq_tag + "-rep") {
+          io_eprintln(world, "mbt2pion: failed writing external report before commit (old --out preserved): " + report_path)
+          ext_io_ok = false
+        } else {
+          report_written = true
         }
-        let _ = fs_chmod(world, dpath, 448)
+      }
+      if ext_io_ok && drift_ledger_path.length() > 0 && !drift_is_in_out && !drift_path_bad {
+        let is_dir_dst = match lstat_kind(world, drift_ledger_path) { Some("dir") => true, _ => false }
+        if is_dir_dst || !write_file_atomic(world, drift_ledger_path, drift_json, uniq_tag + "-drf") {
+          io_eprintln(world, "mbt2pion: failed writing external drift ledger before commit (old --out preserved): " + drift_ledger_path)
+          ext_io_ok = false
+        } else {
+          drift_written = true
+        }
+      }
+      if ext_io_ok && run_report_path.length() > 0 && !run_is_in_out && !run_path_bad {
+        if !precheck_external_report_writable(world, run_report_path, uniq_tag) {
+          io_eprintln(world, "mbt2pion: external run report path is not writable before commit (old --out preserved): " + run_report_path)
+          ext_io_ok = false
+        }
       }
 
-      // 2. Write all newly generated `.pion` files
-      for gf in final_res.files {
-        let dst = join_path(stage_dir, gf.rel_path)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
+      if !ext_io_ok {
+        if stage_created {
+          cleanup_dir_preserve_hardlinks(world, stage_dir)
+          stage_created = false
         }
-        match fs_write(world, dst, gf.content) {
-          Ok(_) => ()
-          Err(e) => {
-            io_eprintln(world, "mbt2pion: failed staging " + dst + ": " + e)
-            stage_ok = false
+        exit_code = 3
+      } else {
+        // All external reports succeeded / verified writable! Now stage ALL in-`--out` reports
+        // (including `--run-report` with `ok: true`) right before the single atomic directory swap.
+        if report_is_in_out && !report_path_bad {
+          let dst = join_path(stage_dir, report_rel_str)
+          let parent = dirname(dst)
+          if parent.length() > 0 {
+            let _ = fs_mkdir_p(world, parent)
           }
-        }
-      }
-
-      // 3. Recreate all unmanaged symlinks without dereferencing
-      for sl in unmanaged_symlinks {
-        let dst = join_path(stage_dir, sl.0)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
-        }
-        if !fs_symlink(world, sl.1, dst) {
-          io_eprintln(world, "mbt2pion: failed staging symlink " + dst + " -> " + sl.1)
-          stage_ok = false
-        }
-      }
-
-      // 4. Preserve all unmanaged regular files (skipping reports that will be freshly written into stage_dir)
-      let report_rel_str = match report_in_out_rel { Some(r) => r, None => "" }
-      let drift_rel_str = match drift_in_out_rel { Some(r) => r, None => "" }
-      let run_rel_str = match run_in_out_rel { Some(r) => r, None => "" }
-      for fm in unmanaged_files {
-        let rel = fm.0
-        let mode_bits = fm.1
-        if (report_rel_str.length() > 0 && rel == report_rel_str) ||
-        (drift_rel_str.length() > 0 && rel == drift_rel_str) ||
-        (run_rel_str.length() > 0 && rel == run_rel_str) {
-          continue
-        }
-        let src = join_path(clean_out_dir, rel)
-        let dst = join_path(stage_dir, rel)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
-        }
-        if !fs_hardlink(src, dst) {
-          // Fallback: raw byte copy + exact chmod
-          match fs_read_bytes(world, src) {
-            Ok(bs) =>
-            match fs_write_bytes(world, dst, bs) {
-              Ok(_) =>
-              if !fs_chmod(world, dst, mode_bits) {
-                io_eprintln(world, "mbt2pion: failed chmod on preserved file " + dst)
-                stage_ok = false
-              }
-              Err(e) => {
-                io_eprintln(world, "mbt2pion: failed copying unmanaged file " + dst + ": " + e)
-                stage_ok = false
-              }
-            }
+          match fs_write(world, dst, report_json) {
+            Ok(_) => report_written = true
             Err(e) => {
-              io_eprintln(world, "mbt2pion: failed preserving unmanaged file " + src + ": " + e)
+              io_eprintln(world, "mbt2pion: failed staging report " + dst + ": " + e)
               stage_ok = false
             }
           }
         }
-      }
+        if stage_ok && drift_is_in_out && !drift_path_bad {
+          let dst = join_path(stage_dir, drift_rel_str)
+          let parent = dirname(dst)
+          if parent.length() > 0 {
+            let _ = fs_mkdir_p(world, parent)
+          }
+          match fs_write(world, dst, drift_json) {
+            Ok(_) => drift_written = true
+            Err(e) => {
+              io_eprintln(world, "mbt2pion: failed staging drift ledger " + dst + ": " + e)
+              stage_ok = false
+            }
+          }
+        }
+        if stage_ok && run_is_in_out && !run_path_bad {
+          let dst = join_path(stage_dir, run_rel_str)
+          let parent = dirname(dst)
+          if parent.length() > 0 {
+            let _ = fs_mkdir_p(world, parent)
+          }
+          let stage_elapsed = clock_now_ms(world) - start_ms
+          let stage_pionc_ver = match proc_exec_capture(world, [pionc_bin, "--version"]) {
+            Ok(v) => v.trim()
+            Err(_) => "unknown"
+          }
+          let stage_run_json = m2p::render_run_report_json(opts, stage_elapsed, "host", stage_pionc_ver, true, final_res.blockers)
+          match fs_write(world, dst, stage_run_json) {
+            Ok(_) => run_written = true
+            Err(e) => {
+              io_eprintln(world, "mbt2pion: failed staging run report " + dst + ": " + e)
+              stage_ok = false
+            }
+          }
+        }
 
-      // 5. Write ALL in-`--out` reports (`--report`, `--drift-ledger`, `--run-report`) directly into `stage_dir`
-      //    so they commit in the exact same atomic directory swap transaction!
-      if report_rel_str.length() > 0 && !report_path_bad {
-        let dst = join_path(stage_dir, report_rel_str)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
-        }
-        match fs_write(world, dst, report_json) {
-          Ok(_) => report_written_in_stage = true
-          Err(e) => {
-            io_eprintln(world, "mbt2pion: failed staging report " + dst + ": " + e)
-            stage_ok = false
+        // Restore exact directory modes bottom-up (deepest first), then stage_dir itself
+        if stage_ok {
+          let bottom_up = sort_dirs_bottom_up(unmanaged_dirs)
+          for dm in bottom_up {
+            let dpath = join_path(stage_dir, dm.0)
+            if !fs_chmod(world, dpath, dm.1) {
+              io_eprintln(world, "mbt2pion: failed restoring mode on directory " + dpath)
+              stage_ok = false
+            }
+          }
+          if out_dir_mode >= 0 {
+            let _ = fs_chmod(world, stage_dir, out_dir_mode)
           }
         }
-      }
-      if drift_rel_str.length() > 0 && !drift_path_bad {
-        let dst = join_path(stage_dir, drift_rel_str)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
-        }
-        match fs_write(world, dst, drift_json) {
-          Ok(_) => drift_written_in_stage = true
-          Err(e) => {
-            io_eprintln(world, "mbt2pion: failed staging drift ledger " + dst + ": " + e)
-            stage_ok = false
-          }
-        }
-      }
-      if run_rel_str.length() > 0 && !run_path_bad {
-        let dst = join_path(stage_dir, run_rel_str)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
-        }
-        let stage_elapsed = clock_now_ms(world) - start_ms
-        let stage_pionc_ver = match proc_exec_capture(world, [pionc_bin, "--version"]) {
-          Ok(v) => v.trim()
-          Err(_) => "unknown"
-        }
-        let stage_run_json = m2p::render_run_report_json(opts, stage_elapsed, "host", stage_pionc_ver, true, final_res.blockers)
-        match fs_write(world, dst, stage_run_json) {
-          Ok(_) => run_written_in_stage = true
-          Err(e) => {
-            io_eprintln(world, "mbt2pion: failed staging run report " + dst + ": " + e)
-            stage_ok = false
-          }
-        }
-      }
 
-      // 6. Restore exact directory modes bottom-up (deepest first), then stage_dir itself
-      if stage_ok {
-        let bottom_up = sort_dirs_bottom_up(unmanaged_dirs)
-        for dm in bottom_up {
-          let dpath = join_path(stage_dir, dm.0)
-          if !fs_chmod(world, dpath, dm.1) {
-            io_eprintln(world, "mbt2pion: failed restoring mode on directory " + dpath)
-            stage_ok = false
-          }
-        }
-        if out_dir_mode >= 0 {
-          let _ = fs_chmod(world, stage_dir, out_dir_mode)
-        }
-      }
-
-      // 7. Single-syscall atomic commit!
-      if !stage_ok {
-        cleanup_dir_preserve_hardlinks(world, stage_dir)
-        exit_code = 3
-      } else if out_existed_as_dir {
-        if !atomic_swap_dir(stage_dir, clean_out_dir) {
-          io_eprintln(world, "mbt2pion: atomic directory swap failed (old --out preserved): " + clean_out_dir)
+        // Single-syscall atomic commit!
+        if !stage_ok {
           cleanup_dir_preserve_hardlinks(world, stage_dir)
+          stage_created = false
+          exit_code = 3
+        } else if out_existed_as_dir {
+          if !atomic_swap_dir(stage_dir, clean_out_dir) {
+            io_eprintln(world, "mbt2pion: atomic directory swap failed (old --out preserved): " + clean_out_dir)
+            cleanup_dir_preserve_hardlinks(world, stage_dir)
+            stage_created = false
+            exit_code = 3
+          } else {
+            // Old `--out` is now at `stage_dir`; clean up dirs only (never chmod files!)
+            cleanup_dir_preserve_hardlinks(world, stage_dir)
+            stage_created = false
+          }
+        } else if !fs_rename(world, stage_dir, clean_out_dir) {
+          io_eprintln(world, "mbt2pion: failed committing staged directory to --out: " + clean_out_dir)
+          cleanup_dir_preserve_hardlinks(world, stage_dir)
+          stage_created = false
           exit_code = 3
         } else {
-          // Old `--out` is now at `stage_dir`; clean up dirs only (never chmod files!)
-          cleanup_dir_preserve_hardlinks(world, stage_dir)
+          stage_created = false
         }
-      } else if !fs_rename(world, stage_dir, clean_out_dir) {
-        io_eprintln(world, "mbt2pion: failed committing staged directory to --out: " + clean_out_dir)
-        cleanup_dir_preserve_hardlinks(world, stage_dir)
-        exit_code = 3
       }
     }
   } else {
@@ -1369,20 +1501,15 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  // Astra Round 4 P0-1: Write reports outside `--out` (or in audit/--check mode), NEVER writing
-  // inside `--out` when `publish` failed/blocked, and NEVER swallowing report write failures!
+  // Write remaining reports (outside `--out` on blocked/failed publish, or any report in audit/--check mode)
   let block_in_out_reports = mode == "publish" && exit_code != 0
-  let report_is_in_out = match report_in_out_rel { Some(_) => true, None => false }
-  let drift_is_in_out = match drift_in_out_rel { Some(_) => true, None => false }
-  let run_is_in_out = match run_in_out_rel { Some(_) => true, None => false }
-
-  if report_path.length() > 0 && !report_written_in_stage && !report_path_bad && !(block_in_out_reports && report_is_in_out) {
+  if report_path.length() > 0 && !report_written && !report_path_bad && !(block_in_out_reports && report_is_in_out) {
     if !write_file_atomic(world, report_path, report_json, uniq_tag + "-rep") {
       io_eprintln(world, "mbt2pion: failed writing report: " + report_path)
       if exit_code == 0 { exit_code = 3 }
     }
   }
-  if drift_ledger_path.length() > 0 && !drift_written_in_stage && !drift_path_bad && !(block_in_out_reports && drift_is_in_out) {
+  if drift_ledger_path.length() > 0 && !drift_written && !drift_path_bad && !(block_in_out_reports && drift_is_in_out) {
     if !write_file_atomic(world, drift_ledger_path, drift_json, uniq_tag + "-drf") {
       io_eprintln(world, "mbt2pion: failed writing drift ledger: " + drift_ledger_path)
       if exit_code == 0 { exit_code = 3 }
@@ -1390,7 +1517,7 @@ pub fn main(world : World) -> Int {
   }
 
   let elapsed_ms = clock_now_ms(world) - start_ms
-  if run_report_path.length() > 0 && !run_written_in_stage && !run_path_bad && !(block_in_out_reports && run_is_in_out) {
+  if run_report_path.length() > 0 && !run_written && !run_path_bad && !(block_in_out_reports && run_is_in_out) {
     let pionc_ver = match proc_exec_capture(world, [pionc_bin, "--version"]) {
       Ok(v) => v.trim()
       Err(_) => "unknown"

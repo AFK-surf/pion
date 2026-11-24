@@ -898,6 +898,62 @@ rr8 = subprocess.run([pionc, "run", pkg8], capture_output=True, text=True)
 assert rr8.returncode == 0, f"8c pionc run failed: {rr8.stderr}"
 
 print("[e2e] PASS: Round 4 Astra P0-1/P0-2/P0-4 suite (report role collisions, zero-write on failed publish, symlink .pion E_DUP_DEF, optional-skip positional binding == 65)")
+
+# -----------------------------------------------------------------------------
+# 9. Round 5 Astra P0-2 & P0-3 E2E acceptance suite
+# -----------------------------------------------------------------------------
+# 9a. P0-2: relative symlink `alias.pion -> a.pion` starts valid (comment-only a.pion);
+#     when a.mbt adds `pub fn new_key()`, BOTH publish AND --check MUST block & preserve old OUT!
+s9 = os.path.join(root, "s9")
+o9 = os.path.join(root, "o9")
+os.makedirs(s9, exist_ok=True)
+os.makedirs(o9, exist_ok=True)
+with open(os.path.join(s9, "a.mbt"), "w") as f:
+    f.write("// comment-only v1\n")
+r9_v1 = run_cli(["--src", s9, "--out", o9, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_v1.returncode == 0, f"9a v1 publish failed: {r9_v1.stderr}"
+os.symlink("a.pion", os.path.join(o9, "alias.pion"))
+old_a_bytes = open(os.path.join(o9, "a.pion"), "rb").read()
+# Verify v1 with alias.pion is valid under pionc check
+r9_v1_pub2 = run_cli(["--src", s9, "--out", o9, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_v1_pub2.returncode == 0, f"9a v1 re-publish with alias.pion failed: {r9_v1_pub2.stderr}"
+# Now add `pub fn new_key() -> Int { 1 }` to a.mbt: alias.pion -> a.pion will now cause E_DUP_DEF!
+with open(os.path.join(s9, "a.mbt"), "w") as f:
+    f.write("pub fn new_key() -> Int { 1 }\n")
+r9_v2_pub = run_cli(["--src", s9, "--out", o9, "--target", "native", "--mode", "publish",
+                     "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_v2_pub.returncode == 1, f"9a v2 publish with relative alias.pion -> a.pion E_DUP_DEF must block (rc=1), got {r9_v2_pub.returncode}"
+assert open(os.path.join(o9, "a.pion"), "rb").read() == old_a_bytes, "9a old OUT was modified on blocked v2 publish!"
+r9_v2_chk = run_cli(["--src", s9, "--out", o9, "--target", "native", "--check",
+                     "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9_v2_chk.returncode == 1, f"9a v2 --check must fail (rc=1), got {r9_v2_chk.returncode}"
+
+# 9b. P0-3: external report write failure MUST abort BEFORE atomic swap (old_key preserved, NO new_key, NO ok:true run.json!)
+s9b = os.path.join(root, "s9b")
+o9b = os.path.join(root, "o9b")
+os.makedirs(s9b, exist_ok=True)
+with open(os.path.join(s9b, "a.mbt"), "w") as f:
+    f.write("pub fn old_key() -> Int { 1 }\n")
+r9b_1 = run_cli(["--src", s9b, "--out", o9b, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r9b_1.returncode == 0, f"9b initial publish failed: {r9b_1.stderr}"
+snap_9b = {p: open(os.path.join(o9b, p), "rb").read() for p in sorted(os.listdir(o9b))}
+with open(os.path.join(s9b, "a.mbt"), "w") as f:
+    f.write("pub fn new_key() -> Int { 2 }\n")
+blk9 = os.path.join(root, "not_dir_9b")
+with open(blk9, "w") as f: f.write("x")
+r9b_2 = run_cli(["--src", s9b, "--out", o9b, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", compat_dir, "--pionc", pionc,
+                 "--run-report", os.path.join(o9b, "run.json"),
+                 "--report", os.path.join(blk9, "report.json")])
+assert r9b_2.returncode == 3, f"9b external report failure must exit 3, got {r9b_2.returncode}"
+after_9b = {p: open(os.path.join(o9b, p), "rb").read() for p in sorted(os.listdir(o9b))}
+assert after_9b == snap_9b, f"9b OUT was mutated on external report failure! before={list(snap_9b.keys())} after={list(after_9b.keys())}"
+assert not os.path.exists(os.path.join(o9b, "run.json")), "9b run.json leaked into OUT on failure!"
+
+print("[e2e] PASS: Round 5 Astra P0-2/P0-3 suite (post-assembly relative symlink final_check, pre-swap external report failure leaves OUT untouched)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
