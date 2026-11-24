@@ -126,11 +126,11 @@ theorem execPhis_spec (regs : Nat → BitVec 64) (prev : Int) :
         · exact hall P' hP'
       · rw [(ih t).1 (fun P' hP' => hn P' (List.mem_cons_of_mem _ hP'))]
         simp only [setReg]
-        rw [if_neg (fun e => hn P (List.mem_cons_self) e.symm)]
+        rw [ite_eq_right (fun e => hn P (List.mem_cons_self) e.symm)]
       · by_cases hex : ∃ P' ∈ ps, P'.dst.val.toNat = t
         · obtain ⟨P', hP', hd, a', ha', hR⟩ := (ih t).2 hex
           exact ⟨P', List.mem_cons_of_mem _ hP', hd, a', ha', hR⟩
-        · push_neg at hex
+        · push Not at hex
           rw [(ih t).1 hex]
           by_cases hpt : P.dst.val.toNat = t
           · refine ⟨P, List.mem_cons_self, hpt, a, ha, ?_⟩
@@ -185,10 +185,10 @@ theorem iota_sound {n : Std.I32} {xs : Pion.Array Std.I32} (h : iota n = ok xs) 
     rw [hset, List.getElem?_set]
     by_cases hji : iI.val.toNat = j
     · subst hji
-      rw [if_pos rfl, if_pos (by omega)]
+      rw [ite_eq_left rfl, ite_eq_left (by omega)]
       simp only [Option.some.injEq]
       exact i32n_of_val hi0
-    · rw [if_neg hji]
+    · rw [ite_eq_right hji]
       exact hall j (by omega)
   · rename_i hge
     have hge' : n.val ≤ iI.val := by simpa [i32_lt_iff] using hge
@@ -298,7 +298,7 @@ theorem phiValAt_masked {W : Type} (o : WorldOracle W) (R : Nat → BitVec 64) (
   unfold phiValAt
   split
   · exact maskC_idem _ _
-  · cases P.cls <;> first | rfl | decide | simp [maskC, zx32, lo32]
+  · cases P.cls <;> rfl
 
 /-! ## The source run -/
 
@@ -432,7 +432,7 @@ theorem src_phi_sem {G : ValGraph} {src : Func} {si : FnInfo} {svid : List Std.I
   rw [hv] at hv'; cases hv'
   have hidx : idx Bb.phis.val (i32n k) = some P := by
     unfold idx
-    rw [if_pos (by rw [i32n_val (by omega)]; omega), hkn]
+    rw [ite_eq_left (by rw [i32n_val (by omega)]; omega), hkn]
     exact hP
   obtain ⟨hvalid, hcase⟩ := hdef
   rcases hcase with hleaf | ⟨hst, hmask, hfarms⟩ | hsel | ⟨k1, hk1, P1, hP1, hcls, hv1, hd1, hsame⟩
@@ -492,17 +492,17 @@ theorem src_phi_sem {G : ValGraph} {src : Func} {si : FnInfo} {svid : List Std.I
       rw [hBdt] at hedged
       simp only [EdgeTaken] at hedged
       have hc : atomVal o regs_d .W cond ≠ 0 := by
-        intro hc; rw [if_neg (by simpa using hc)] at hedged; exact hne hedged
+        intro hc; rw [ite_eq_right (by simpa using hc)] at hedged; exact hne hedged
       rw [hstb, hsst p1 (Or.inr (Or.inl rfl)) env_d env_p hagd, hselv env_d, ← hcond regs_d env_d hendd hsymd,
-        if_neg hc, ← hAv, atomVal_eq hk (hag _ (hAv ▸ haAv)), h1 env_p]
+        ite_eq_right hc, ← hAv, atomVal_eq hk (hag _ (hAv ▸ haAv)), h1 env_p]
     · obtain ⟨regs_d, env_d, hendd, hedged, hagd⟩ := hfrom p0 hq (Or.inr rfl)
       have hsymd : env_d.symAddr = o.symAddr := by rw [← hsym, hagd.2.1]
       rw [hBdt] at hedged
       simp only [EdgeTaken] at hedged
       have hc : atomVal o regs_d .W cond = 0 := by
-        by_contra hc; rw [if_pos hc] at hedged; exact hne hedged.symm
+        by_contra hc; rw [ite_eq_left hc] at hedged; exact hne hedged.symm
       rw [hstb, hsst p0 (Or.inr (Or.inr rfl)) env_d env_p hagd, hselv env_d, ← hcond regs_d env_d hendd hsymd,
-        if_pos hc, ← hAv, atomVal_eq hk (hag _ (hAv ▸ haAv)), h0 env_p]
+        ite_eq_left hc, ← hAv, atomVal_eq hk (hag _ (hAv ▸ haAv)), h0 env_p]
   · -- an earlier phi with the same arguments
     have hP1m : P1 ∈ Bb.phis.val := List.mem_of_getElem? hP1
     rw [ih k1 (by rw [hkn] at hk1; exact hk1) P1 hP1 v hv1]
@@ -536,7 +536,7 @@ theorem execInsts_append {W : Type} (o : WorldOracle W) (args : List (BitVec 64)
 theorem execInsts_take_succ {W : Type} (o : WorldOracle W) (args : List (BitVec 64)) {l : List Inst}
     {x : Nat} (hx : x < l.length) {s0 s s' : MState W} (h0 : execInsts o args (l.take x) s0 = some s)
     (h1 : execInst o args s l[x] = some s') : execInsts o args (l.take (x + 1)) s0 = some s' := by
-  rw [List.take_succ, List.getElem?_eq_getElem hx, Option.toList_some, execInsts_append, h0]
+  rw [List.take_add_one, List.getElem?_eq_getElem hx, Option.toList_some, execInsts_append, h0]
   simp [execInsts, h1]
 
 /-- An instruction writes at most its destination. -/
@@ -546,7 +546,7 @@ theorem execInst_regs {W : Type} {o : WorldOracle W} {args : List (BitVec 64)} {
   have key : ∀ (d : Std.I32) v, 0 ≤ d.val → (d.val.toNat ≠ t ∨ d.val < 0) → setReg s.regs d v t = s.regs t := by
     intro d v hd0 ht'
     simp only [setReg]
-    rw [if_neg]
+    rw [ite_eq_right]
     rcases ht' with h1 | h1
     · exact fun e => h1 e.symm
     · omega
@@ -759,7 +759,7 @@ theorem src_enter {G : ValGraph} {src : Func} {si : FnInfo} {svid : List Std.I32
         (by rw [List.getElem?_eq_getElem hk, hkP]) v hv
       rw [this]
       simp only [hR, phiValAt, ha']
-    · push_neg at hex
+    · push Not at hex
       show R t = _
       rw [(hphiR t).1 hex]
       obtain ⟨htn, hcase⟩ := ht
@@ -776,7 +776,7 @@ theorem src_enter {G : ValGraph} {src : Func} {si : FnInfo} {svid : List Std.I32
       by_contra hc; rw [List.getElem?_eq_none (by omega)] at hii; cases hii
     have hidx : idx Bb.insts.val (i32n i) = some inst := by
       unfold idx
-      rw [if_pos (by rw [i32n_val (by omega)]; omega), i32n_toNat (by omega)]
+      rw [ite_eq_left (by rw [i32n_val (by omega)]; omega), i32n_toNat (by omega)]
       exact hii
     rw [enterEnv_eff o args env_p (i32n b) Bb p regs_p _ c (i32n i) inst hidx hl, i32n_toNat (by omega)]
 

@@ -111,8 +111,8 @@ theorem src_view_sound {vg : ValGraph} {f : Func} {vids : Pion.Array Std.I32} {f
       simp only [ViewOK, EdgeTaken, ← hcv]
       have hxb : x ≠ 0#u64 ↔ x.bv ≠ 0 := by rw [u64_ne]; exact Iff.rfl
       by_cases hx0 : x ≠ 0#u64
-      · rw [if_pos hx0, if_pos (hxb.1 hx0)]
-      · rw [if_neg hx0, if_neg (fun h => hx0 (hxb.2 h))]
+      · rw [ite_eq_left hx0, ite_eq_left (hxb.1 hx0)]
+      · rw [ite_eq_right hx0, ite_eq_right (fun h => hx0 (hxb.2 h))]
     | none =>
       simp only at h
       cases ok_inj' h
@@ -387,7 +387,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
         rw [et5] at ht5
         rw [← eg]
         by_cases hcond : (sc == tc && sw == tw && ssg == tsg) = true
-        · rw [if_pos hcond] at hq1
+        · rw [ite_eq_left hcond] at hq1
           simp only [Bool.and_eq_true] at hcond
           obtain ⟨⟨ec, ew⟩, eg'⟩ := hcond
           have ec' : sc = tc := by simpa using ec
@@ -408,7 +408,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
             refine ⟨{ ts with regs := setReg ts.regs td (maskC sc v) }, ?_, hw.symm,
               Or.inr ⟨w, hsd0, htd0, hsw, hw0, htw, by simp [setReg, instDst]⟩⟩
             simp only [execInst, ← hval, ← hw, hl, Option.map_some]
-        · rw [if_neg hcond] at hq1; cases ok_inj' hq1
+        · rw [ite_eq_right hcond] at hq1; cases ok_inj' hq1
     | _ => simp only at h; cases ok_inj' h
   | Store sw sv sa =>
     cases tinst with
@@ -422,11 +422,11 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
       | false =>
       simp only [Bool.false_eq_true, ↓reduceIte] at h1
       cases hsw' : (sw != tw) with
-      | true => rw [if_pos hsw'] at hq1; cases ok_inj' hq1
+      | true => rw [ite_eq_left hsw'] at hq1; cases ok_inj' hq1
       | false =>
       have hsw := memWidth_bne hsw'
       subst hsw
-      rw [if_neg (by rw [memWidth_bne_self]; simp)] at hq1
+      rw [ite_eq_right (by rw [memWidth_bne_self]; simp)] at hq1
       obtain ⟨q9, hq9, hq1'⟩ := bind_eq_ok hq1
       obtain ⟨t9, vg4⟩ := q9
       try simp only [uncurry_apply_pair] at hq1'
@@ -511,9 +511,9 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
       | false =>
       simp only [Bool.false_eq_true, ↓reduceIte] at h1
       cases hcond : ((sh != th) || (sh && (sc != tc))) with
-      | true => rw [if_pos hcond] at hq1; cases ok_inj' hq1
+      | true => rw [ite_eq_left hcond] at hq1; cases ok_inj' hq1
       | false =>
-      rw [if_neg (by simp [hcond])] at hq1
+      rw [ite_eq_right (by simp [hcond])] at hq1
       have hshth : sh = th := by revert hcond; cases sh <;> cases th <;> simp
       subst hshth
       have hcls : sh = true → sc = tc := by
@@ -533,7 +533,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
       obtain ⟨n2, hn2', h3⟩ := bind_eq_ok h2
       obtain ⟨hn21, -⟩ := arr_length_ok hn2'
       by_cases hnn : n = n2
-      · rw [if_neg (by simp [hnn])] at h3
+      · rw [ite_eq_right (by simp [hnn])] at h3
         have hlen : sargs.val.length = targs.val.length := by subst hnn; omega
         obtain ⟨s, hs, h4⟩ := bind_eq_ok h3
         unfold match_effect_c_loop0 at hs
@@ -609,7 +609,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
         try dsimp only at hj0 hej hdj hall hc
         unfold match_effect_c_loop0.body at hc
         by_cases hlt : jI < n
-        · rw [if_pos hlt] at hc
+        · rw [ite_eq_left hlt] at hc
           have hlt' : jI.val < sargs.val.length := by simpa [i32_lt_iff, hn1] using hlt
           have hjs := i32_succ_val' hlt' hn2
           obtain ⟨SA, hSA, hc1⟩ := bind_eq_ok hc
@@ -625,9 +625,9 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
           simp only [Bool.false_eq_true, ↓reduceIte] at hc3
           have hcl : SA.cls = TA.cls := by
             by_contra hne
-            rw [if_pos (by simp [hne])] at hq39
+            rw [ite_eq_left (by simp [hne])] at hq39
             cases ok_inj' hq39
-          rw [if_neg (by simp [hcl])] at hq39
+          rw [ite_eq_right (by simp [hcl])] at hq39
           obtain ⟨SA2, hSA2, hq39⟩ := bind_eq_ok hq39
           rw [hSA] at hSA2; cases ok_inj' hSA2
           obtain ⟨SA3, hSA3, hq39⟩ := bind_eq_ok hq39
@@ -656,18 +656,18 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
             exact hobs2 rfl G hG o rs rt env hfs ha1 ha2
           · obtain ⟨hc1, hv1⟩ := hall k hk hk' (by omega)
             exact ⟨hc1, fun G hG => hv1 G (vg_extends_trans e2 hG)⟩
-        · rw [if_neg hlt] at hc
+        · rw [ite_eq_right hlt] at hc
           have hge' : sargs.val.length ≤ jI.val := by simpa [i32_lt_iff, hn1] using hlt
           rw [← ok_inj' hc]
           exact ⟨hej, hdj, fun k hk hk' => hall k hk hk' (by omega)⟩
-      · rw [if_pos hnn] at h3; cases ok_inj' h3
+      · rw [ite_eq_left hnn] at h3; cases ok_inj' h3
     | _ => simp only at h; cases ok_inj' h
   | Alloc sd sal ssz =>
     cases tinst with
     | Alloc td tal tsz =>
       simp only at h
       by_cases hc : (sal == tal && ssz == tsz) = true
-      · rw [if_pos hc] at h
+      · rw [ite_eq_left hc] at h
         obtain ⟨t39, ht39, h1⟩ := bind_eq_ok h
         have e1 := ok_inj' h1
         simp only [Prod.mk.injEq] at e1
@@ -686,7 +686,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
           refine ⟨{ regs := setReg ts.regs td p.2, world := p.1 }, ?_, rfl,
             Or.inr ⟨w, hsd0, htd0, hsw, hw0, htw, by simp [setReg, instDst]⟩⟩
           simp only [execInst, ← hw, ha, Option.map_some]
-      · rw [if_neg hc] at h; cases ok_inj' h
+      · rw [ite_eq_right hc] at h; cases ok_inj' h
     | _ => simp only at h; cases ok_inj' h
   | Bin sd sc sop sa sb =>
     cases tinst with
@@ -712,7 +712,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
       | true =>
       simp only [↓reduceIte] at hq49
       by_cases hc : (sc == tc && sop == top) = true
-      · rw [if_pos hc] at hq45
+      · rw [ite_eq_left hc] at hq45
         simp only [Bool.and_eq_true, beq_iff_eq] at hc
         obtain ⟨ec, eo⟩ := hc
         subst ec eo
@@ -735,7 +735,7 @@ theorem match_effect_c_sound {vg : ValGraph} {svid tvid : Pion.Array Std.I32} {f
           refine ⟨{ ts with regs := setReg ts.regs td v }, ?_, hw.symm,
             Or.inr ⟨w, hsd0, htd0, hsw, hw0, htw, by simp [setReg, instDst]⟩⟩
           simp only [execInst, ← h0, ← h1', hb, Option.map_some]
-      · rw [if_neg hc] at hq45; cases ok_inj' hq45
+      · rw [ite_eq_right hc] at hq45; cases ok_inj' hq45
     | _ => simp only at h; cases ok_inj' h
   | Par _ _ _ => simp only at h; cases ok_inj' h
   | Un _ _ _ _ => simp only at h; cases ok_inj' h
@@ -794,7 +794,7 @@ theorem src_inst_is_effect_bin {vg : ValGraph} {svid : Pion.Array Std.I32} {d : 
   by_cases hd0 : d.val < 0
   · exact Or.inl hd0
   have ht3f : t3 = decide (svid.val.length ≤ d.val.toNat) := by
-    rw [if_neg (by simpa [i32_lt_iff] using hd0)] at ht3
+    rw [ite_eq_right (by simpa [i32_lt_iff] using hd0)] at ht3
     obtain ⟨n, hn, ht3⟩ := bind_eq_ok ht3
     obtain ⟨hn1, -⟩ := arr_length_ok hn
     rw [← ok_inj' ht3]
@@ -858,7 +858,7 @@ theorem skip_src_pure_sound {vg : ValGraph} {f : Func} {svid : Pion.Array Std.I3
   unfold skip_src_pure_loop0.body at hc
   obtain ⟨t5, ht5, hc⟩ := bind_eq_ok hc
   by_cases hlt : x < n
-  · rw [if_pos hlt] at ht5
+  · rw [ite_eq_left hlt] at ht5
     have hlt' : x.val < B.insts.val.length := by simpa [i32_lt_iff, hn1] using hlt
     obtain ⟨B2, hB2, ht5⟩ := bind_eq_ok ht5
     rw [hB] at hB2; cases ok_inj' hB2
@@ -879,7 +879,7 @@ theorem skip_src_pure_sound {vg : ValGraph} {f : Func} {svid : Pion.Array Std.I3
       simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at hc
       rw [← ok_inj' hc]
       exact ⟨hx1, hxl, hall, fun _ _ => by rw [hiv]; exact he⟩
-  · rw [if_neg hlt] at ht5
+  · rw [ite_eq_right hlt] at ht5
     cases ok_inj' ht5
     simp only [Bool.false_eq_true, ↓reduceIte] at hc
     rw [← ok_inj' hc]
@@ -897,7 +897,7 @@ theorem bin_safe_any {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
   cases ob with
   | none => simp at h
   | some y =>
-    try simp only [uncurry_apply_pair] at h
+    try simp only at h
     obtain ⟨hy, -⟩ := vg_const_some hob
     have hbv := constOf_evI hd env hy
     refine ⟨constOf_valid hy, ?_⟩
@@ -920,7 +920,7 @@ theorem bin_safe_any {vg : ValGraph} {c : Cls} {op : BinOp} {av bv : Std.I32}
         split at hr
         · simp at hr
         · rename_i h0
-          have h0' : maskC c y.bv ≠ 0 := fun e => h0 (u64_ext (by simp [e, bv_zero]))
+          have h0' : maskC c y.bv ≠ 0 := fun e => h0 (u64_ext (by simp [e]))
           refine ⟨h0', fun hs hall => ?_⟩
           simp only [hs, ↓reduceIte, bind_ok] at hr
           have hbeq : ((⟨maskC c y.bv⟩ : Std.U64) == ⟨allOnesC c⟩) = true := by simp [hall]
@@ -1063,7 +1063,7 @@ theorem tgt_pure_c_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I32} 
         have hdl : d.val.toNat < tvid.val.length := by
           by_contra hc; rw [List.getElem?_eq_none (by omega)] at hw; cases hw
         have h9 : t9 = true := by
-          rw [if_pos (by simpa [i32_le_iff] using hd0)] at ht9
+          rw [ite_eq_left (by simpa [i32_le_iff] using hd0)] at ht9
           obtain ⟨n, hn, ht9⟩ := bind_eq_ok ht9
           obtain ⟨hn1, -⟩ := arr_length_ok hn
           rw [← ok_inj' ht9]
@@ -1117,7 +1117,7 @@ theorem tgt_pure_c_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I32} 
       · cases hl
 
 theorem skip_tgt_pure_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I32} {b x0 : Std.I32}
-    {q : Std.I32 × ValGraph} (h : skip_tgt_pure vg f tvid b x0 = ok q) (hx0 : 0 ≤ x0.val)
+    {q : Std.I32 × ValGraph} (h : skip_tgt_pure vg f tvid b x0 = ok q) (_hx0 : 0 ≤ x0.val)
     (hd : ValGraphDAG vg) (hv : VidsOK vg tvid.val) :
     vg_extends vg q.2 ∧ ValGraphDAG q.2 ∧ ∃ B, f.blocks.val[b.val.toNat]? = some B ∧ 0 ≤ b.val ∧
       x0.val ≤ q.1.val ∧ (x0.val ≤ B.insts.val.length → q.1.val ≤ B.insts.val.length) ∧
@@ -1149,7 +1149,7 @@ theorem skip_tgt_pure_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I3
   obtain ⟨t4, vg1⟩ := q4
   try simp only [uncurry_apply_pair] at hc1
   by_cases hlt : x < n
-  · rw [if_pos hlt] at hq4
+  · rw [ite_eq_left hlt] at hq4
     have hlt' : x.val < B.insts.val.length := by simpa [i32_lt_iff, hn1] using hlt
     have hq4' := pair_ok hq4
     cases t4 with
@@ -1226,7 +1226,7 @@ theorem skip_tgt_pure_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I3
         cases hinst
         exact hpt
       · exact pureTgt_extends e1 (hall i hi h1 (by omega))
-  · rw [if_neg hlt] at hq4
+  · rw [ite_eq_right hlt] at hq4
     cases ok_inj' hq4
     simp only [Bool.false_eq_true, ↓reduceIte] at hc1
     rw [← ok_inj' hc1]
@@ -1455,7 +1455,7 @@ theorem absorb_ok_sound {vg : ValGraph} {tgt : Func} {tvid : Pion.Array Std.I32}
   try dsimp only at hj0 hej hdj hall hc
   unfold absorb_ok_loop0.body at hc
   by_cases hlt : jI < np
-  · rw [if_pos hlt] at hc
+  · rw [ite_eq_left hlt] at hc
     have hlt' : jI.val < B.phis.val.length := by simpa [i32_lt_iff, hnp1] using hlt
     have hjs := i32_succ_val' hlt' hnp2
     obtain ⟨B2, hB2, hc1⟩ := bind_eq_ok hc
@@ -1468,8 +1468,8 @@ theorem absorb_ok_sound {vg : ValGraph} {tgt : Func} {tvid : Pion.Array Std.I32}
     rw [hP] at hP3; cases ok_inj' hP3
     obtain ⟨ai, hai, hc5⟩ := bind_eq_ok hc4
     by_cases hain : ai < 0#i32
-    · rw [if_pos hain] at hc5; rw [← ok_inj' hc5]; intro hf; cases hf
-    rw [if_neg hain] at hc5
+    · rw [ite_eq_left hain] at hc5; rw [← ok_inj' hc5]; intro hf; cases hf
+    rw [ite_eq_right hain] at hc5
     have hai0 : 0 ≤ ai.val := by simpa [i32_lt_iff] using hain
     obtain ⟨B', P', -, hB', -, hP', hcase⟩ := phi_arm_index_spec hai
     rw [hBb] at hB'; cases hB'
@@ -1508,9 +1508,9 @@ theorem absorb_ok_sound {vg : ValGraph} {tgt : Func} {tvid : Pion.Array Std.I32}
     dsimp only
     have hv0 : 0 ≤ v.val := by
       by_contra hc
-      rw [if_pos (by simpa [i32_lt_iff] using hc)] at ht14
+      rw [ite_eq_left (by simpa [i32_lt_iff] using hc)] at ht14
       cases ok_inj' ht14
-    rw [if_neg (by simpa [i32_lt_iff] using hv0)] at ht14
+    rw [ite_eq_right (by simpa [i32_lt_iff] using hv0)] at ht14
     obtain ⟨w, hw, ht14'⟩ := bind_eq_ok ht14
     obtain ⟨hw0, hwl, hwv⟩ := arr_get_ok hw
     have hwv' : w = v := by simpa using ok_inj' ht14'
@@ -1524,7 +1524,7 @@ theorem absorb_ok_sound {vg : ValGraph} {tgt : Func} {tvid : Pion.Array Std.I32}
       · rw [hAv]; exact atomKnown_extends e1 vk
       · rw [vs env, hAv, atomSem_extends e1 vk]
     · exact good_mono _ _ _ e1 (hall j hj (by omega))
-  · rw [if_neg hlt] at hc
+  · rw [ite_eq_right hlt] at hc
     have hge : B.phis.val.length ≤ jI.val := by simpa [i32_lt_iff, hnp1] using hlt
     rw [← ok_inj' hc]
     refine ⟨hej, hdj, fun P hP => ?_⟩
@@ -1559,10 +1559,10 @@ theorem phi_case_test {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
   have hk1 := hk
   obtain ⟨hn1, -⟩ := arr_length_ok hn
   by_cases hdn : d < n
-  · rw [if_pos hdn] at hk1
+  · rw [ite_eq_left hdn] at hk1
     have hfk := bind_id_ok hk1
     by_cases hk0 : k >= 0#i32
-    · rw [if_pos hk0] at ht
+    · rw [ite_eq_left hk0] at ht
       obtain ⟨x, hx, ht1⟩ := bind_eq_ok ht
       obtain ⟨hd0, hxl, hxv⟩ := arr_get_ok hx
       have hsv : svid.val[d.val.toNat]? = some x := by rw [List.getElem?_eq_getElem hxl, hxv]
@@ -1572,16 +1572,16 @@ theorem phi_case_test {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
       obtain ⟨-, -, -, v, hsv', hn'⟩ := hc
       rw [hsv] at hsv'; cases hsv'
       exact hy.2 hn'
-    · rw [if_neg hk0] at ht
+    · rw [ite_eq_right hk0] at ht
       cases ok_inj' ht
       refine ⟨⟨fun h => (by cases h), fun hc => ?_⟩, fun h => (by cases h)⟩
       obtain ⟨-, -, ⟨k', hk', hk0'⟩, -⟩ := hc
       rw [hfk] at hk'; cases ok_inj' hk'
       exact absurd (by simpa [i32_le_iff] using hk0') hk0
-  · rw [if_neg hdn] at hk1
+  · rw [ite_eq_right hdn] at hk1
     cases ok_inj' hk1
     simp only [ge_iff_le] at ht
-    rw [if_neg (by decide)] at ht
+    rw [ite_eq_right (by decide)] at ht
     cases ok_inj' ht
     refine ⟨⟨fun h => (by cases h), fun hc => ?_⟩, fun h => (by cases h)⟩
     obtain ⟨-, hl, -⟩ := hc
@@ -1617,7 +1617,7 @@ theorem head_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
       intro i c hi hc
       unfold head_ok_loop0.body at hc
       by_cases hlt : i < np
-      · rw [if_pos hlt] at hc
+      · rw [ite_eq_left hlt] at hc
         have hlt' : i.val < B.phis.val.length := by simpa [i32_lt_iff, hnp1] using hlt
         left
         refine ⟨hlt', hnp2, ?_⟩
@@ -1663,7 +1663,8 @@ theorem head_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
             cases t18
             · simp only [Bool.false_eq_true, ↓reduceIte] at hsres1
               obtain ⟨node, -, hsres2⟩ := bind_eq_ok hsres1
-              cases node <;> (simp only at hsres2; cases ok_inj' hsres2) <;> rfl
+              cases node <;> (simp only at hsres2; cases ok_inj' hsres2)
+              rfl
             · simp only [↓reduceIte] at hsres1; cases ok_inj' hsres1; rfl
         | inr u =>
           simp only at hc9
@@ -1703,7 +1704,7 @@ theorem head_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
             cases t18 with
             | true => simp only [↓reduceIte] at hsres; cases ok_inj' hsres
             | false => exact ht18
-      · rw [if_neg hlt] at hc
+      · rw [ite_eq_right hlt] at hc
         right
         exact ⟨by simpa [i32_lt_iff, hnp1] using hlt, _, (ok_inj' hc).symm, trivial⟩)
   have hk := key 0#i32 s hs (by simp)
@@ -1801,7 +1802,7 @@ theorem edge_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
   try dsimp only at hj0 hej hdj hall hc
   unfold edge_ok_loop0.body at hc
   by_cases hlt : jI < np
-  · rw [if_pos hlt] at hc
+  · rw [ite_eq_left hlt] at hc
     have hlt' : jI.val < B.phis.val.length := by simpa [i32_lt_iff, hnp1] using hlt
     have hjs := i32_succ_val' hlt' hnp2
     obtain ⟨B2, hB2, hc1⟩ := bind_eq_ok hc
@@ -1814,8 +1815,8 @@ theorem edge_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
     rw [hP] at hP3; cases ok_inj' hP3
     obtain ⟨ai, hai, hc5⟩ := bind_eq_ok hc4
     by_cases hain : ai < 0#i32
-    · rw [if_pos hain] at hc5; rw [← ok_inj' hc5]
-    rw [if_neg hain] at hc5
+    · rw [ite_eq_left hain] at hc5; rw [← ok_inj' hc5]
+    rw [ite_eq_right hain] at hc5
     obtain ⟨B', P', -, hB', -, hP', hcase⟩ := phi_arm_index_spec hai
     rw [hBb] at hB'; cases hB'
     rw [List.getElem?_eq_getElem hPl, hPv] at hP'; cases hP'
@@ -1824,7 +1825,7 @@ theorem edge_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
         ∀ j < ai.val.toNat, ∀ hj : j < P.arms.val.length, P.arms.val[j].pred ≠ tp := by
       rcases hcase with hc1 | ⟨hm, -⟩
       · exact hc1
-      · have : ¬ ai < 0#i32 := hain; simp [i32_lt_iff] at this; omega
+      · have : ¬ ai < 0#i32 := hain; simp at this; omega
     have hphiarg : phiArg P tp.val = some P.arms.val[ai.val.toNat].value :=
       phiArg_idx hail (by rw [haip]) (fun j hj hjl e => haif j hj hjl (i32_ext e))
     obtain ⟨B9, hB9, hc6⟩ := bind_eq_ok hc5
@@ -1859,15 +1860,15 @@ theorem edge_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
         simp only [↓reduceIte] at hsres
         obtain ⟨sa, hsa, hs1⟩ := bind_eq_ok hsres
         by_cases hsan : sa < 0#i32
-        · rw [if_pos hsan] at hs1; left; exact ⟨_, (ok_inj' hs1).symm, rfl⟩
-        rw [if_neg hsan] at hs1
+        · rw [ite_eq_left hsan] at hs1; left; exact ⟨_, (ok_inj' hs1).symm, rfl⟩
+        rw [ite_eq_right hsan] at hs1
         obtain ⟨Bs', SP', -, hBs', -, hSP', hcs⟩ := phi_arm_index_spec hsa
         obtain ⟨-, hsal, hsap, hsaf⟩ : 0 ≤ sa.val ∧ ∃ hr : sa.val.toNat < SP'.arms.val.length,
             SP'.arms.val[sa.val.toNat].pred = sp ∧
             ∀ j < sa.val.toNat, ∀ hj : j < SP'.arms.val.length, SP'.arms.val[j].pred ≠ sp := by
           rcases hcs with hc1 | ⟨hm, -⟩
           · exact hc1
-          · have : ¬ sa < 0#i32 := hsan; simp [i32_lt_iff] at this; omega
+          · have : ¬ sa < 0#i32 := hsan; simp at this; omega
         obtain ⟨Bs, hBs, hs2⟩ := bind_eq_ok hs1
         obtain ⟨_, hBsl, hBsv⟩ := arr_get_ok hBs
         rw [List.getElem?_eq_getElem hBsl, hBsv] at hBs'
@@ -1946,7 +1947,7 @@ theorem edge_ok_sound {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {
         cases hv
         rw [extends_evI (vg_extends_trans e4 hG) env vsv2, hsv2tv, htvv]
     · exact good_mono _ _ _ E14 (hall j hj (by omega))
-  · rw [if_neg hlt] at hc
+  · rw [ite_eq_right hlt] at hc
     have hge : B.phis.val.length ≤ jI.val := by simpa [i32_lt_iff, hnp1] using hlt
     rw [← ok_inj' hc]
     refine ⟨hej, hdj, fun P hP => ?_⟩
@@ -1978,7 +1979,7 @@ theorem next_ok_true {vg : ValGraph} {src : Func} {svid : Pion.Array Std.I32} {t
   simp only [↓reduceIte] at ht1 ht3 ht5
   have hi0 : 0 ≤ i.val := by
     by_contra hc
-    rw [if_neg (by simpa [i32_le_iff] using hc)] at ht1
+    rw [ite_eq_right (by simpa [i32_le_iff] using hc)] at ht1
     cases ok_inj' ht1
   obtain ⟨p, hp, ht3'⟩ := bind_eq_ok ht3
   obtain ⟨_, hpl, hpv⟩ := arr_get_ok hp
@@ -2004,7 +2005,6 @@ theorem cmp_zero_sound {vg : ValGraph} {c : Std.I32} {q : Std.I32 × ValGraph} (
     apply val2 env
     simp only [evalBin, valz env, extends_evI e1 env hvc]
     congr 3
-    try simp [maskC, zx32, lo32]
   · have hneg : c.val < 0 := hc.resolve_left hvc
     have hinv : ¬ (Valid vg1 c ∧ Valid vg1 z) := fun h' => by have := h'.1.1; omega
     rw [vg_canon_bin_invalid h2 hinv]
@@ -2081,7 +2081,7 @@ theorem check_end_sound {vg : ValGraph} {src tgt : Func} {cert : Cert} {fs : Pio
       | VRet th tcls tvv =>
         simp only at h2
         by_cases hst : sh = th
-        · rw [if_pos hst] at h2
+        · rw [ite_eq_left hst] at h2
           subst hst
           cases sh with
           | false =>
@@ -2093,7 +2093,7 @@ theorem check_end_sound {vg : ValGraph} {src tgt : Func} {cert : Cert} {fs : Pio
           | true =>
             simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h2
             by_cases hcl : scls = tcls
-            · rw [if_pos (by simp [hcl])] at h2
+            · rw [ite_eq_left (by simp [hcl])] at h2
               subst hcl
               have h3 := pair_ok h2
               obtain ⟨e3, d3⟩ := eq_under_ext h3 d2
@@ -2106,8 +2106,8 @@ theorem check_end_sound {vg : ValGraph} {src tgt : Func} {cert : Cert} {fs : Pio
               rw [← hs rfl (extends_valid E3 vsv), ← ht' rfl (extends_valid E3 vtv),
                 extends_evI E3 env vsv, extends_evI E3 env vtv]
               exact heq G env hG hfs
-            · rw [if_neg (by simp [hcl])] at h2; cases ok_inj' h2
-        · rw [if_neg hst] at h2; cases ok_inj' h2
+            · rw [ite_eq_right (by simp [hcl])] at h2; cases ok_inj' h2
+        · rw [ite_eq_right hst] at h2; cases ok_inj' h2
       | _ => simp only at h2; cases ok_inj' h2
     | _ => simp only at h2; cases ok_inj' h2
   | EndHlt =>
@@ -2182,14 +2182,14 @@ theorem check_end_sound {vg : ValGraph} {src tgt : Func} {cert : Cert} {fs : Pio
           rw [hBsT] at hs
           simp only [EdgeTaken] at hs
           by_cases hc0 : atomVal o sregs .W c ≠ 0
-          · rw [if_pos hc0] at hs
+          · rw [ite_eq_left hc0] at hs
             subst hs
             refine ⟨t1, i1, vg5, vg6, ?_, h5, vg_extends_trans E2 e5, d5, vg_extends_trans e7 (vg_extends_refl _)⟩
-            rw [hBtT]; simp only [EdgeTaken]; rw [if_pos (by rw [← hcond]; exact hc0)]
-          · rw [if_neg hc0] at hs
+            rw [hBtT]; simp only [EdgeTaken]; rw [ite_eq_left (by rw [← hcond]; exact hc0)]
+          · rw [ite_eq_right hc0] at hs
             subst hs
             refine ⟨t2, i2, vg6, qg, ?_, h6, vg_extends_trans E2 (vg_extends_trans e5 e6), d6, vg_extends_refl _⟩
-            rw [hBtT]; simp only [EdgeTaken]; rw [if_neg (by rw [← hcond]; exact hc0)]
+            rw [hBtT]; simp only [EdgeTaken]; rw [ite_eq_right (by rw [← hcond]; exact hc0)]
         | true =>
           simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at h2
           obtain ⟨q9, hq9, h3⟩ := bind_eq_ok h2
@@ -2303,15 +2303,15 @@ theorem check_end_sound {vg : ValGraph} {src tgt : Func} {cert : Cert} {fs : Pio
           rw [hBsT] at hs
           simp only [EdgeTaken] at hs
           by_cases hc0 : atomVal o sregs .W c ≠ 0
-          · rw [if_pos hc0] at hs
+          · rw [ite_eq_left hc0] at hs
             subst hs
             refine ⟨t2, i1, vg12, vg14, ?_, hn1, vg_extends_trans E2 E12, d12, vg_extends_trans e14 (vg_extends_refl _)⟩
-            rw [hBtT]; simp only [EdgeTaken]; rw [if_neg (by simpa using hiff.1 hc0)]
-          · rw [if_neg hc0] at hs
+            rw [hBtT]; simp only [EdgeTaken]; rw [ite_eq_right (by simpa using hiff.1 hc0)]
+          · rw [ite_eq_right hc0] at hs
             subst hs
             refine ⟨t1, i2, vg14, qg, ?_, hn2, vg_extends_trans E2 (vg_extends_trans E12 e13), d13, vg_extends_refl _⟩
             rw [hBtT]; simp only [EdgeTaken]
-            rw [if_pos (fun hz => hc0 (hiff.2 hz))]
+            rw [ite_eq_left (fun hz => hc0 (hiff.2 hz))]
       | _ => simp only at h2; cases ok_inj' h2
     | _ => simp only at h2; cases ok_inj' h2
   | EndSrcBranch i1 i2 =>
@@ -2368,9 +2368,9 @@ theorem check_end_sound {vg : ValGraph} {src tgt : Func} {cert : Cert} {fs : Pio
         rw [edgeTaken_unique hs hes]
         by_cases hc0 : atomVal o tregs .W c' ≠ 0
         · refine ⟨t1, i1, vg2, vg19, ?_, hq54, E2, d2, e20⟩
-          rw [hBtT]; simp only [EdgeTaken]; rw [if_pos hc0]
+          rw [hBtT]; simp only [EdgeTaken]; rw [ite_eq_left hc0]
         · refine ⟨t2, i2, vg19, qg, ?_, h4, vg_extends_trans E2 e19, d19, vg_extends_refl _⟩
-          rw [hBtT]; simp only [EdgeTaken]; rw [if_neg hc0]
+          rw [hBtT]; simp only [EdgeTaken]; rw [ite_eq_right hc0]
       | _ => simp only at h2; cases ok_inj' h2
     | _ => simp only at h2; cases ok_inj' h2
 
@@ -2394,8 +2394,8 @@ theorem is_trivial_sound {f : Func} {b : Std.I32} (h : is_trivial f b = ok true)
   obtain ⟨np, hnp, h2⟩ := bind_eq_ok h1
   obtain ⟨hnp1, -⟩ := arr_length_ok hnp
   by_cases hp : np > 0#i32
-  · rw [if_pos hp] at h2; cases ok_inj' h2
-  rw [if_neg hp] at h2
+  · rw [ite_eq_left hp] at h2; cases ok_inj' h2
+  rw [ite_eq_right hp] at h2
   have hph : B.phis.val = [] := by
     apply List.eq_nil_of_length_eq_zero
     have : np.val ≤ 0 := by simpa [i32_lt_iff, gt_iff_lt] using hp
@@ -2520,12 +2520,12 @@ theorem src_join_sound {f : Func} {b r : Std.I32} (h : src_join f b = ok r) (hr 
     obtain ⟨r1, hr1, h2⟩ := bind_eq_ok h1
     obtain ⟨r2, hr2, h3⟩ := bind_eq_ok h2
     by_cases he : r1 = r2
-    · rw [if_pos he] at h3
+    · rw [ite_eq_left he] at h3
       cases ok_inj' h3
       subst he
       exact ⟨B, c, s1, s2, by rw [List.getElem?_eq_getElem hBl, hBv], hb0, hT,
         resolve_trivial_sound hr1, resolve_trivial_sound hr2⟩
-    · rw [if_neg he] at h3; cases ok_inj' h3; simp at hr
+    · rw [ite_eq_right he] at h3; cases ok_inj' h3; simp at hr
   | _ => simp only at h1; cases ok_inj' h1; simp at hr
 
 end PionProofs.QbeTvP

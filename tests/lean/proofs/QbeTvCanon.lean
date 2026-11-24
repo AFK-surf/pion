@@ -167,7 +167,7 @@ theorem extS_of_lt (k : Nat) (hk : 1 ≤ k) (hk' : k ≤ 64) (x : BitVec 64) (h 
     have e2 : x.getLsbD i = false := hb i (by omega)
     have e1' := e1
     simp only [BitVec.getLsbD_eq_getElem hi, BitVec.getLsbD_eq_getElem (show k - 1 < 64 by omega)] at e1' e2
-    simp [h', hi, e1, e1', e2, show 0 < k by omega]
+    simp [h', hi, e1, e2, show 0 < k by omega]
 
 theorem extU_of_lt (k : Nat) (hk : k ≤ 64) (x : BitVec 64) (h : x.toNat < 2 ^ k) : extU k x = x := by
   apply BitVec.eq_of_toNat_eq
@@ -352,7 +352,7 @@ theorem fits_bits_sound (vg : ValGraph) (hd : ValGraphDAG vg) :
           have h1 := (ih a _ t ht hr).2.2 env
           apply shr_lt
           refine Nat.lt_of_le_of_lt (maskC_toNat_le _ _) (Nat.lt_of_lt_of_le h1 (pow_mono ?_))
-          split <;> rename_i hlt <;> simp only [i32_lt_iff, hwk, i32_32_val, i32_31_val] at hlt ⊢ <;> omega
+          split <;> rename_i hlt <;> simp only [i32_lt_iff, hwk, i32_32_val] at hlt ⊢ <;> omega
     | Sar =>
       simp only [vg_const_eq hl, bind_ok] at h
       simp only [evalBin, Option.getD_some, asS]
@@ -387,7 +387,7 @@ theorem fits_bits_sound (vg : ValGraph) (hd : ValGraphDAG vg) :
             then Pion.I32.add w (Pion.U64.to_int (Pion.U64.band (⟨y⟩ : Std.U64) 31#u64)) else 31#i32) →
             z.val.toNat ≤ w.val.toNat + y.toNat % 32 ∧ z.val.toNat ≤ 31 := by
           intro z hz; subst hz
-          split <;> rename_i hlt <;> simp only [i32_lt_iff, hwk, i32_32_val, i32_31_val] at hlt ⊢ <;> omega
+          split <;> rename_i hlt <;> simp only [i32_lt_iff, hwk, i32_31_val] at hlt ⊢ <;> omega
         have hm' := hm _ rfl
         have hx : (maskC .W (evI vg env a)).toNat < 2 ^ (w.val.toNat + y.toNat % 32) :=
           Nat.lt_of_le_of_lt (maskC_toNat_le _ _) (Nat.lt_of_lt_of_le h1 (pow_mono hm'.1))
@@ -520,7 +520,7 @@ theorem evalUn_masked (cls : Cls) (op : UnOp) (v : BitVec 64) :
 theorem maskC_low (c : Cls) (v : BitVec 64) (i : Nat) (hi : i < 32) :
     (maskC c v).getLsbD i = v.getLsbD i := by
   cases c
-  · simp [maskC, zx32, lo32, BitVec.getLsbD_setWidth, hi, show i < 64 by omega]
+  · simp [maskC, zx32, lo32, hi, show i < 64 by omega]
   · rfl
 
 theorem extS_low (k : Nat) (y : BitVec 64) (i : Nat) (hi : i < k) (hk : k ≤ 64) :
@@ -530,7 +530,7 @@ theorem extS_low (k : Nat) (y : BitVec 64) (i : Nat) (hi : i < k) (hk : k ≤ 64
 
 theorem extU_low (k : Nat) (y : BitVec 64) (i : Nat) (hi : i < k) (hk : k ≤ 64) :
     (extU k y).getLsbD i = y.getLsbD i := by
-  simp [extU, BitVec.getLsbD_setWidth, hi, show i < 64 by omega]
+  simp [extU, hi, show i < 64 by omega]
 
 /-- The number of low bits an extension reads (`unop_ext_bits`). -/
 def extBits : UnOp → Nat
@@ -628,7 +628,7 @@ theorem extBits_le (op : UnOp) : extBits op ≤ 32 := by
 
 theorem i32_ofNat_val (n : Nat) (h : n < 2 ^ 31) : (⟨BitVec.ofNat 32 n⟩ : Std.I32).val = n := by
   show (BitVec.ofNat 32 n).toInt = n
-  rw [BitVec.toInt_eq_toNat_of_lt] <;> simp [Nat.mod_eq_of_lt (show n < 2 ^ 32 by omega)] <;> omega
+  rw [BitVec.toInt_eq_toNat_of_lt] <;> simp <;> omega
 
 theorem extBits_val (op : UnOp) : (⟨BitVec.ofNat 32 (extBits op)⟩ : Std.I32).val = extBits op :=
   i32_ofNat_val _ (by have := extBits_le op; omega)
@@ -773,7 +773,7 @@ theorem vg_canon_un_sound (vg : ValGraph) (cls : Cls) (op : UnOp) (hd : ValGraph
     subst hq
     cases nd with
     | SUn c2 op2 x2 =>
-      simp only [unop_ext_bits_spec, bind_ok] at hs1
+      simp only at hs1
       split at hs1
       · rename_i hk2
         have hk2' : extBits op ≤ extBits op2 := by
@@ -810,8 +810,7 @@ theorem vg_canon_un_sound (vg : ValGraph) (cls : Cls) (op : UnOp) (hd : ValGraph
             rw [hev env]
             simp only [evalNode]
             exact (evalUn_absorb cls c2 op op2 hop0 hk2' _).symm
-        · try simp only [bind_ok, Bool.false_eq_true, ↓reduceIte] at hs1
-          have := ok_inj' hs1; cases this
+        · have := ok_inj' hs1; cases this
       · try simp only [bind_ok, Bool.false_eq_true, ↓reduceIte] at hs1
         have := ok_inj' hs1; cases this
     | SConst _ _ => have := ok_inj' hs1; cases this
@@ -825,7 +824,7 @@ theorem vg_canon_un_sound (vg : ValGraph) (cls : Cls) (op : UnOp) (hd : ValGraph
     subst hg
     cases nd with
     | SUn c2 op2 x2 =>
-      simp only [unop_ext_bits_spec, bind_ok] at hs1
+      simp only at hs1
       split at hs1
       · simp only [vg_cls_eq hl, bind_ok] at hs1
         split at hs1
@@ -833,8 +832,7 @@ theorem vg_canon_un_sound (vg : ValGraph) (cls : Cls) (op : UnOp) (hd : ValGraph
           · have := ok_inj' hs1; cases this
           · obtain ⟨q2, hq2, hs1⟩ := bind_eq_ok hs1
             have := ok_inj' hs1; cases this
-        · try simp only [bind_ok, Bool.false_eq_true, ↓reduceIte] at hs1
-          have := ok_inj' hs1; simp only [Sum.inr.injEq] at this; exact this.symm
+        · have := ok_inj' hs1; simp only [Sum.inr.injEq] at this; exact this.symm
       · try simp only [bind_ok, Bool.false_eq_true, ↓reduceIte] at hs1
         have := ok_inj' hs1; simp only [Sum.inr.injEq] at this; exact this.symm
     | SConst _ _ => have := ok_inj' hs1; simp only [Sum.inr.injEq] at this; exact this.symm
@@ -1332,7 +1330,7 @@ theorem shAmt_maskW (cls : Cls) (v : BitVec 64) : shAmt cls (maskC .W v) = shAmt
 
 theorem rc_shl0 {cls : Cls} {x y : BitVec 64} (hy : shAmt cls y = 0) (hx : maskC cls x = x) :
     evalBin cls .Shl x y = some x := by
-  simp [evalBin, hy, hx, maskC_idem]
+  simp [evalBin, hy, hx]
 
 theorem rc_shr0 {cls : Cls} {x y : BitVec 64} (hy : shAmt cls y = 0) (hx : maskC cls x = x) :
     evalBin cls .Shr x y = some x := by
@@ -1612,7 +1610,7 @@ theorem vg_canon_bin_motive (cls : Cls) : BinMotive1 cls (fun vg => vg_canon_bin
           constOf_evI hd env hkb]
         congr 1
         simp only [sub_bv, bv_zero, u64_mk_bv, liftC_maskR]
-        cases cls <;> simp [liftC, ringOp, lo32_sub, lo32_neg, BitVec.sub_eq_add_neg]
+        cases cls <;> simp [liftC, ringOp, lo32_neg, BitVec.sub_eq_add_neg]
       · exact (ok_inr_ne_inl hs1).elim
     | inr g3 =>
     have hg3 : g3 = vg := by
@@ -1725,14 +1723,14 @@ theorem vg_canon_bin_motive (cls : Cls) : BinMotive1 cls (fun vg => vg_canon_bin
           have := ok_inj' hs3; simp only [Sum.inl.injEq] at this; subst this
           refine binOut_konst' e7 d7 hq1 (fun env v hv => ?_)
           rw [hsemF, evalBin_ring rfl, Option.some.injEq] at hv
-          rw [← hv]; cases cls <;> simp [liftC, ringOp, maskC, zx32, lo32, bv_zero]
+          rw [← hv]; cases cls <;> simp [liftC, ringOp, maskC, zx32, lo32]
         case Xor =>
           obtain ⟨q1, hq1, hs3⟩ := bind_eq_ok hs3
           obtain ⟨r8, vg8⟩ := q1
           have := ok_inj' hs3; simp only [Sum.inl.injEq] at this; subst this
           refine binOut_konst' e7 d7 hq1 (fun env v hv => ?_)
           rw [hsemF, evalBin_ring rfl, Option.some.injEq] at hv
-          rw [← hv]; cases cls <;> simp [liftC, ringOp, maskC, zx32, lo32, bv_zero]
+          rw [← hv]; cases cls <;> simp [liftC, ringOp, maskC, zx32, lo32]
         case And =>
           have := ok_inj' hs3; simp only [Sum.inl.injEq] at this; subst this
           have hc3 : clsOf vg a3 = cls := by
