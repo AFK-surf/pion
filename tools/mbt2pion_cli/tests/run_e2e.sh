@@ -1853,6 +1853,50 @@ with open(os.path.join(pkg10q7, "pion.toml"), "w") as f:
 r10q7_t = subprocess.run([pionc, "test", pkg10q7], capture_output=True, text=True)
 assert r10q7_t.returncode == 0 and "1 passed; 0 failed" in r10q7_t.stdout, f"10q-7 expected 1 passed, got:\n{r10q7_t.stdout}\n{r10q7_t.stderr}"
 
+# 10q-2d (Astra Final P0): black-box `b_test.mbt` sees production `pub fn assert_true`,
+# while production private `fn assert_false` is NOT visible to black-box (falls through to builtin)!
+s10q2d = os.path.join(root, "s10q2d")
+o10q2d = os.path.join(root, "o10q2d")
+os.makedirs(s10q2d, exist_ok=True)
+with open(os.path.join(s10q2d, "main.mbt"), "w") as f:
+    f.write(
+        'pub fn assert_true(_v : Bool) -> Unit { abort("in library") }\n'
+        'fn assert_false(_v : Bool) -> Unit { () }\n'
+    )
+with open(os.path.join(s10q2d, "b_test.mbt"), "w") as f:
+    f.write(
+        'test "bb_sees_prod_pub" { assert_true(true) }\n'
+        'test "bb_ignores_prod_priv" { assert_false(true) }\n'
+    )
+r10q2d = run_cli(["--src", s10q2d, "--out", o10q2d, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2d.returncode == 0, f"10q-2d publish failed: {r10q2d.returncode}\n{r10q2d.stdout}\n{r10q2d.stderr}"
+btest_txt = open(os.path.join(o10q2d, "b_test.pion")).read()
+assert "mbt_compat::assert_true" not in btest_txt, f"10q-2d prod pub assert_true must not be rewritten:\n{btest_txt}"
+assert "mbt_compat::assert_false" in btest_txt, f"10q-2d prod priv assert_false must fall through to builtin:\n{btest_txt}"
+pkg10q2d = os.path.join(root, "pkg10q2d")
+os.makedirs(os.path.join(pkg10q2d, "src"), exist_ok=True)
+for fn in os.listdir(o10q2d):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2d, fn), os.path.join(pkg10q2d, "src", fn))
+with open(os.path.join(pkg10q2d, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2d"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2d_t = subprocess.run([pionc, "test", pkg10q2d], capture_output=True, text=True)
+assert r10q2d_t.returncode != 0 and "0 passed; 2 failed" in r10q2d_t.stdout, f"10q-2d expected 0 passed + 2 failed, got:\n{r10q2d_t.stdout}\n{r10q2d_t.stderr}"
+
+# 10q-6b (Astra Final P1): compact single-line `pub let n:Int="x".length() + "ab".length()` reports exact 1:19 and 1:35!
+s10q6b = os.path.join(root, "s10q6b")
+o10q6b = os.path.join(root, "o10q6b")
+rep10q6b = os.path.join(root, "rep10q6b.json")
+os.makedirs(s10q6b, exist_ok=True)
+with open(os.path.join(s10q6b, "vs.mbt"), "w") as f:
+    f.write('pub let n:Int="x".length() + "ab".length()\n')
+r10q6b = run_cli(["--src", s10q6b, "--out", o10q6b, "--target", "native", "--mode", "publish",
+                  "--report", rep10q6b, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q6b.returncode == 0, f"10q-6b publish failed: {r10q6b.returncode}\n{r10q6b.stdout}\n{r10q6b.stderr}"
+rep6b_j = json.load(open(rep10q6b))
+pds6b = [(p["file"], p["line"], p["col"]) for p in rep6b_j["probe_dispositions"] if p["disposition"] == "rewritten"]
+assert ("vs.mbt", 1, 19) in pds6b and ("vs.mbt", 1, 35) in pds6b, f"10q-6b expected vs.mbt:1:19 and vs.mbt:1:35, got {pds6b}"
+
 # 10q-3 (P0-3): `assert_true(true, msg={ n = n + 1; "expected" })` evaluates side effects AND `msg=abort("boom")` fails!
 s10q3 = os.path.join(root, "s10q3")
 o10q3 = os.path.join(root, "o10q3")

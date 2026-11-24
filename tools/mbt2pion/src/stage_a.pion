@@ -3587,6 +3587,7 @@ fn lower_one_token_or_form(
     let is_cur_blackbox = file.ends_with("_test.mbt") && !file.ends_with("_wbtest.mbt")
     let is_shadowed_assert = if is_cur_blackbox {
       ctx.symtab.blackbox_decls.contains(t.raw) ||
+      ctx.symtab.prod_pub_decls.contains(t.raw) ||
       ctx.lifted_local_fns.contains(name) ||
       (lookup_scope_var(ctx, name) is Some(_))
     } else {
@@ -4880,6 +4881,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
     let mut i = 0
     let mut next_autofill = false
     let mut next_cfg_excluded = false
+    let mut next_is_pub = false
     while i < n {
       let t = tokens[i]
       if t.kind == TokenKind::Attr {
@@ -4898,10 +4900,25 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if next_cfg_excluded {
         next_cfg_excluded = false
         next_autofill = false
+        next_is_pub = false
         i = skip_top_level_decl(tokens, i, n)
         continue
       }
+      if t.kind == TokenKind::Keyword && t.raw == "pub" {
+        next_is_pub = true
+        if i + 1 < n && tokens[i + 1].kind == TokenKind::LParen {
+          i = find_matching_delim(tokens, i + 1) + 1
+        } else {
+          i = i + 1
+        }
+        continue
+      }
+      if t.kind == TokenKind::LBrace || t.kind == TokenKind::RBrace ||
+      (t.kind == TokenKind::Keyword && (t.raw == "priv" || t.raw == "trait" || t.raw == "impl")) {
+        next_is_pub = false
+      }
       if t.kind == TokenKind::Keyword && t.raw == "struct" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        next_is_pub = false
         let sname = tokens[i + 1].raw
         let mut lb = i + 2
         if lb < n && tokens[lb].kind == TokenKind::LBracket {
@@ -5042,6 +5059,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       }
       if t.kind == TokenKind::Keyword && t.raw == "type" && i + 3 < n &&
       tokens[i + 1].kind == TokenKind::UpperIdent && tokens[i + 2].kind == TokenKind::Eq {
+        next_is_pub = false
         let aname = tokens[i + 1].raw
         let rhs_end = find_top_level_let_expr_end(tokens, i + 3, n)
         let rty = lower_type_tokens(tokens, i + 3, rhs_end, ctx.symtab, ctx.recipes).trim()
@@ -5052,6 +5070,8 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         continue
       }
       if t.kind == TokenKind::Keyword && (t.raw == "const" || t.raw == "let") && i + 1 < n {
+        let decl_pub = next_is_pub
+        next_is_pub = false
         let mut ni = i + 1
         if tokens[ni].kind == TokenKind::Keyword && tokens[ni].raw == "mut" && ni + 1 < n {
           ni = ni + 1
@@ -5061,10 +5081,15 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
             bb_decls[tokens[ni].raw] = true
           } else {
             ctx.symtab.local_value_names[tokens[ni].raw] = true
+            if !sf.is_test && decl_pub {
+              ctx.symtab.prod_pub_decls[tokens[ni].raw] = true
+            }
           }
         }
       }
       if t.kind == TokenKind::Keyword && t.raw == "fn" && i + 1 < n {
+        let decl_pub = next_is_pub
+        next_is_pub = false
         let mut name_i = i + 1
         if tokens[name_i].kind == TokenKind::LBracket {
           name_i = find_matching_delim(tokens, name_i) + 1
@@ -5078,6 +5103,9 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
                 ctx.symtab.blackbox_autofill_loc_fns[fn_tok.raw] = true
               }
             } else {
+              if !sf.is_test && decl_pub {
+                ctx.symtab.prod_pub_decls[fn_tok.raw] = true
+              }
               if next_autofill {
                 ctx.symtab.autofill_loc_fns[fn_tok.raw] = true
               }
@@ -5360,6 +5388,7 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let (refs, calls, arg_closures) = collect_init_refs_full(tokens, lb, rb + 1)
         let init_target = if sf.is_test { ctx.test_init_items } else { ctx.init_items }
         let init_file_lbl = if sf.is_test { "00_init_order_test.pion" } else { "00_init_order.pion" }
+        let init_prefix = "let " + init_name + " : Unit = "
         init_target.push(InitItem::{
           id: init_name,
           name: init_name,
@@ -5368,7 +5397,9 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           order_index: ctx.init_order_seq,
           line: decl_line,
           col: decl_col,
-          code: "let " + init_name + " : Unit = " + body,
+          rhs_orig_col: tokens[lb].col,
+          rhs_gen_col: init_prefix.length() + 1,
+          code: init_prefix + body,
           referenced_idents: refs,
           called_fns: calls,
           arg_closure_refs: arg_closures,
@@ -5435,8 +5466,12 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         let (refs, calls, arg_closures) = collect_init_refs_full(tokens, eq_i + 1, expr_end)
         ctx.init_order_seq = ctx.init_order_seq + 1
         let mut_kw = if is_mut { "mut " } else { "" }
-        let eq_sep = if val_str.starts_with("\n") || val_str.starts_with("\r") { " =" } else { " = " }
-        let code = vis + "let " + mut_kw + pion_name + ty_str + eq_sep + val_str
+        let is_multiline_val = val_str.starts_with("\n") || val_str.starts_with("\r")
+        let eq_sep = if is_multiline_val { " =" } else { " = " }
+        let let_prefix = vis + "let " + mut_kw + pion_name + ty_str + eq_sep
+        let code = let_prefix + val_str
+        let rhs_orig_col = if is_multiline_val || eq_i + 1 >= n { 1 } else { tokens[eq_i + 1].col }
+        let rhs_gen_col = if is_multiline_val { 1 } else { let_prefix.length() + 1 }
         let init_target = if sf.is_test { ctx.test_init_items } else { ctx.init_items }
         let init_file_lbl = if sf.is_test { "00_init_order_test.pion" } else { "00_init_order.pion" }
         init_target.push(InitItem::{
@@ -5447,6 +5482,8 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           order_index: ctx.init_order_seq,
           line: decl_line,
           col: decl_col,
+          rhs_orig_col: rhs_orig_col,
+          rhs_gen_col: rhs_gen_col,
           code: code,
           referenced_idents: refs,
           called_fns: calls,
