@@ -95,6 +95,12 @@ CASES = {
     "cross_pkg_cap_noshadow": ("ok", 2),
     "cross_pkg_cap_shadow": ("ok", 3),
     "cross_pkg_no_apimap_box": ("ok", 3),
+    "m12_val_probes": ("ok", 6),
+    "m12_recursive_local_fn": ("ok", 5),
+    "m12_per_site_enum": ("ok", 4),
+    "m12_pipe_loops_compat": ("ok", 10),
+    "q2_semantics_p0": ("ok", 13),
+    "q2_mechanical_compat": ("ok", 10),
 }
 
 MOON_TRAPS = {
@@ -535,6 +541,424 @@ pub fn holder_roundtrip(v : Int) -> Int {
 }
 '''
 
+# Wave M1.2 Track A (A.1 - A.6) 3-engine Differential Oracle library
+M12_RECIPES_TOML = '''[ref]
+type_name = "mbt_compat::MbtCell"
+field_name = "v"
+ctor_call = "mbt_compat::mbt_cell"
+
+[derives]
+allow = ["Eq", "Hash"]
+ignore = ["Show"]
+'''
+
+M12_LIB_MBT = r'''
+// A.1: chained `.val.val`, side-effecting `get_ref().val += 1`, nested RHS `r.val = s.val + 1`,
+//      collision-free `struct SVal { val; val_ }` (3, 8), and enum RHS `box.val = Blue`
+pub enum Color {
+  Red
+  Blue
+}
+
+pub struct SVal {
+  val : Int
+  val_ : Int
+}
+
+pub fn m12_sval_pair() -> (Int, Int) {
+  let s : SVal = { val: 3, val_: 8 }
+  (s.val, s.val_)
+}
+
+pub fn m12_chained_val() -> Int {
+  let inner : Ref[Int] = { val: 10 }
+  let outer : Ref[Ref[Int]] = { val: inner }
+  outer.val.val = outer.val.val + 5
+  outer.val.val
+}
+
+pub fn m12_compound_single_eval() -> (Int, Int) {
+  let calls : Ref[Int] = { val: 0 }
+  let target : Ref[Int] = { val: 10 }
+  fn get_ref() -> Ref[Int] {
+    calls.val = calls.val + 1
+    target
+  }
+  get_ref().val += 7
+  (calls.val, target.val)
+}
+
+pub fn m12_nested_rhs_and_color() -> (Int, Bool) {
+  let r : Ref[Int] = { val: 0 }
+  let s : Ref[Int] = { val: 41 }
+  r.val = s.val + 1
+  let cbox : Ref[Color] = { val: Red }
+  cbox.val = Blue
+  let is_blue = match cbox.val {
+    Blue => true
+    Red => false
+  }
+  (r.val, is_blue)
+}
+
+// A.2: escaping recursive local `fn` with shared mutable capture (`14, 16`),
+//      sibling block shadowing, mutual recursion, closure optional types, `if x is Some(v)`
+pub fn m12_escaping_rec() -> (Int, Int) {
+  let mut acc : Int = 10
+  fn step(n : Int) -> Int {
+    if n <= 0 {
+      acc
+    } else {
+      acc = acc + n
+      step(n - 1)
+    }
+  }
+  let cb = fn(k : Int) -> Int { step(k) }
+  let r1 = cb(2) + 1
+  let r2 = cb(2)
+  (r1, r2)
+}
+
+pub fn m12_sibling_shadow_and_mutual() -> (Int, Bool, Bool) {
+  let a = {
+    fn f(n : Int) -> Int { if n <= 0 { 0 } else { 1 + f(n - 1) } }
+    f(3)
+  }
+  let b = {
+    fn f(n : Int) -> Int { if n <= 0 { 0 } else { 2 + f(n - 1) } }
+    f(3)
+  }
+  fn is_even(n : Int) -> Bool {
+    if n == 0 { true } else if n == 1 { false } else { is_even(n - 2) }
+  }
+  fn is_odd(n : Int) -> Bool {
+    if n == 0 { false } else { is_even(n - 1) }
+  }
+  (a * 10 + b, is_even(6), is_odd(5))
+}
+
+pub fn m12_closure_opt_and_is(cb : (() -> Unit)?, f : () -> Int64?) -> Int {
+  let mut res = 0
+  if cb is Some(g) {
+    g()
+    res = res + 10
+  }
+  if f() is Some(v) {
+    res = res + v.to_int()
+  }
+  res
+}
+
+// A.5: same-file `enum Local { Some(Int); None }` + `let x = Some(17)` + `take_opt(Some(17))` -> (false, true)
+//      plus dual-enum leading-dot positive control -> (11, 21)
+enum Local {
+  Some(Int)
+  None
+}
+
+enum E1 {
+  Tag(Int)
+}
+
+enum E2 {
+  Tag(Int)
+}
+
+fn take_opt(o : Int?) -> Bool {
+  match o {
+    Some(_) => true
+    None => false
+  }
+}
+
+fn take_e1(e : E1) -> Int {
+  match e {
+    E1::Tag(v) => v + 10
+  }
+}
+
+fn take_e2(e : E2) -> Int {
+  match e {
+    E2::Tag(v) => v + 20
+  }
+}
+
+pub fn m12_per_site_enum_demo() -> (Bool, Bool, Int, Int) {
+  let x = Some(17)
+  let a = match x {
+    Local::Some(v) => v == 0
+    Local::None => false
+  }
+  let b = take_opt(Some(17))
+  let c1 = take_e1(Tag(1))
+  let c2 = take_e2(Tag(1))
+  (a, b, c1, c2)
+}
+
+// A.6: single-param arrow closure, placeholder pipe (`5 |> take(2, _) == 25`, eval order `213` / `123`),
+//      custom `7 |> ignore == 7`, live OrderedMap cursor mutation (`13`) + break/continue/return,
+//      String cursor break/continue/return, and new `mbt_compat` helpers
+fn ignore(x : Int) -> Int {
+  x
+}
+
+fn take2(a : Int, b : Int) -> Int {
+  a * 10 + b
+}
+
+fn combine3(a : Int, b : Int, c : Int) -> Int {
+  a * 100 + b * 10 + c
+}
+
+pub fn m12_pipe_and_arrow_demo() -> (Int, Int, Int, Int) {
+  let inc : (Int) -> Int = x => x + 1
+  let p1 = inc(4) |> take2(2, _)
+  let p2 = 7 |> ignore
+  let trace : Ref[Int] = { val: 0 }
+  fn step(n : Int) -> Int {
+    trace.val = trace.val * 10 + n
+    n
+  }
+  let p3 = step(1) |> combine3(step(2), _, step(3))
+  (p1, p2, p3, trace.val)
+}
+
+pub fn m12_live_map_update() -> Int {
+  let m : Map[String, Int] = { "a": 1, "b": 2 }
+  let mut acc = 0
+  for k, v in m {
+    if k == "a" {
+      m.set("b", 3)
+    }
+    acc = acc * 10 + v
+  }
+  acc
+}
+
+pub fn m12_map_and_str_control_flow() -> (Int, Int) {
+  let m : Map[String, Int] = { "a": 1, "b": 2, "c": 3, "d": 4 }
+  let mut msum = 0
+  for k, v in m {
+    if k == "b" {
+      continue
+    }
+    if k == "d" {
+      break
+    }
+    msum = msum + v
+  }
+  let mut scount = 0
+  for ch in "A中😀B" {
+    if ch == '中' {
+      continue
+    }
+    if ch == 'B' {
+      return (msum, scount)
+    }
+    scount = scount + 1
+  }
+  (msum, scount)
+}
+
+pub fn m12_compat_helpers_demo() -> (Int, String, Int, Bool, Bool, String, Bool) {
+  let rf = match "a/b/c".rev_find("/") {
+    Some(i) => i
+    None => -1
+  }
+  let lo = "Hello WORLD".to_lower()
+  let idx = match [10, 20, 30].search(20) {
+    Some(i) => i
+    None => -1
+  }
+  let has = [10, 20, 30].contains(30)
+  let dig = '7'.is_ascii_digit() && 'Z'.to_ascii_lowercase() == 'z'
+  let built = String::from_array(['A', (0x1F600).unsafe_to_char(), 'B'])
+  let lex = "alpha".lexical_compare("k9") < 0 && "abc".lexical_compare("abcd") < 0 && "abc".lexical_compare("abc") == 0
+  (rf, lo, idx, has, dig, built, lex)
+}
+
+// Quadrant 2 P0 semantics:
+// 1. Anon struct literal `arr.push({ start: 0, count: 1 })` & `let s = { start: 0, count: 1 }`
+//    + single-field `struct BoxVal { val: Int }; let b = { val: 3 }` (not misclassified as Ref!)
+pub struct SpanRec {
+  start : Int
+  count : Int
+}
+
+pub struct BoxVal {
+  val : Int
+}
+
+pub fn q2_anon_struct_and_boxval() -> (Int, Int, Int) {
+  let arr : Array[SpanRec] = []
+  arr.push({ start: 4, count: 9 })
+  let s = { start: 2, count: 5 }
+  let b : BoxVal = { val: 3 }
+  (arr[0].start + arr[0].count, s.start * 10 + s.count, b.val)
+}
+
+// 2. Type ascriptions `(e : T)` never silently stripped
+pub fn q2_type_ascriptions() -> (Int64, Double, Int64, Double, Bool) {
+  let a = (3 : Int64) * 1000000000L
+  let b = (7 : Double) / 2.0
+  let c = (-3 : Int64)
+  let d = (1.5 : Float).to_double()
+  let e = match (None : Option[Int]) {
+    Some(_) => false
+    None => true
+  }
+  (a, b, c, d, e)
+}
+
+// 3. Constructor struct patterns `Ctor({ ... })`: non-binding guards, swapped order, dual binders, guard fallthrough
+pub(all) struct NodeRec {
+  ok : Bool
+  tag : Int
+  x : Option[Int]
+  y : Option[Int]
+}
+
+pub(all) enum TreeRec {
+  Leaf(NodeRec)
+  EmptyTree
+}
+
+pub fn q2_ctor_struct_pat(t : TreeRec) -> Int {
+  match t {
+    Leaf({ ok: true, x: Some(a), y: Some(b), .. }) if a > 0 => a * 10 + b
+    Leaf({ x: Some(v), ok: true, .. }) => v + 100
+    Leaf({ ok: false, tag: 7, .. }) => 700
+    Leaf({ tag: 1, .. }) => 111
+    _ => -1
+  }
+}
+
+// 4. Local fn declaration-order visibility + param shadowing outer `let` and `let mut`
+fn outer_helper(x : Int) -> Int {
+  x + 1000
+}
+
+pub fn q2_local_fn_order_and_shadow() -> (Int, Int) {
+  let mut acc : Int = 5
+  fn first_fn(n : Int) -> Int {
+    outer_helper(n)
+  }
+  fn outer_helper(n : Int) -> Int {
+    n + 1
+  }
+  fn shadow_rec(acc : Int) -> Int {
+    if acc <= 0 { 0 } else { acc + shadow_rec(acc - 1) }
+  }
+  let r1 = first_fn(7) + outer_helper(7)
+  let r2 = shadow_rec(3) + acc
+  acc = acc + 1
+  (r1, r2 + acc)
+}
+
+// 5. Placeholder pipe temp-name collision + named args `lbl=rhs`
+fn sub_named(x : Int, scale~ : Int) -> Int {
+  x * scale - 1
+}
+
+pub fn q2_pipe_collision_and_named() -> (Int, Int) {
+  let __mbt_p_1 = 2
+  let r1 = 5 |> take2(__mbt_p_1, _)
+  let r2 = 6 |> sub_named(scale=3, _)
+  (r1, r2)
+}
+
+// 6. Same-line two-type division + cascading probe + `for ch in s` with `'}'` char literal
+pub fn q2_sameline_div_cascade_and_brace(a : Int, b : Int, x : Double, y : Double, n : Int) -> (Int, String, Int) {
+  let s1 = (a / b) + (x / y).to_int()
+  let part = n % 10
+  let p_str = part.to_string()
+  let mut braces = 0
+  for ch in "a}b}c" {
+    if ch == '}' {
+      braces = braces + 1
+    }
+  }
+  (s1, p_str, braces)
+}
+
+// 6b. Package-defined `fail` must NEVER be rewritten to `mbt_compat::fail` (P0)
+//     and cross-line parenthesized receiver `let d = (7 : Double)\n(d / 2.0).to_string()` (P2)
+pub fn fail(msg : String) -> String {
+  "ok:" + msg
+}
+
+pub fn q2_crossline_paren_tail() -> String {
+  let d = (7 : Double)
+  (d / 2.0).to_string()
+}
+
+pub fn q2_shadowed_fail_and_crossline_paren() -> (String, String, Int) {
+  let r1 = fail("x")
+  let r2 = q2_crossline_paren_tail()
+  let _ = ".mbt_len_probe("
+  let s = "中😀"
+  let arr = [1, 2]
+  let r3 = s.length() * 10 + arr.length()
+  (r1, r2, r3)
+}
+
+// 7. Quadrant 2 mechanical & compat:
+//    Double +0.0/-0.0 hash, is_nan/compare/reinterpret_as_int64, Int::lnot,
+//    Array unsafe_get/unsafe_set/is_empty/truncate, Map::new, self.arr[a:b],
+//    trailing tuple newline, `(Double, (Double) -> Double)?`, fixed-length array patterns, `type Alias = T`
+type NumPair = (Int, Int)
+
+pub struct HolderArr {
+  arr : Array[Int]
+}
+
+fn HolderArr::mid(self : HolderArr) -> Array[Int] {
+  self.arr[1:3].to_owned()
+}
+
+pub fn q2_trailing_tuple_newline(x : Int) -> NumPair {
+  let pieces = x + 1
+  let _ = pieces
+  (pieces, pieces * 2)
+}
+
+pub fn q2_tuple_opt_fn(opt : (Double, (Double) -> Double)?) -> Double {
+  match opt {
+    Some((v, f)) => f(v)
+    None => 0.0
+  }
+}
+
+pub fn q2_fixed_arr_match(xs : Array[Int]) -> Int {
+  match xs {
+    [] => 0
+    [one] => one * 10
+    [first, _] => first + 100
+    _ => -1
+  }
+}
+
+pub fn q2_double_and_collections() -> (Int, Bool, Int, Int, Int, Int) {
+  let m : Map[Double, Int] = Map::new()
+  m.set(0.0, 11)
+  m.set(-0.0, 22)
+  let mv = match m.get(0.0) {
+    Some(v) => v
+    None => -1
+  }
+  let nan_ok = (0.0 / 0.0).is_nan() && (1.0).compare(2.0) < 0 && (0.0).reinterpret_as_int64() == 0L
+  let ln = (0).lnot()
+  let xs = [10, 20, 30, 40]
+  xs.unsafe_set(1, 25)
+  let g = xs.unsafe_get(1)
+  let h = HolderArr::{ arr: xs }
+  let mid = h.mid()
+  xs.truncate(2)
+  let empty_ok = if xs.is_empty() { 0 } else { xs.length() }
+  (mv, nan_ok, ln, g, mid[0] + mid[1], empty_ok)
+}
+'''
+
 MOON_DRIVER_MBT = r'''
 fn trace(k : String, v : String) -> Unit {
   println("T \{k}=\{v}")
@@ -917,6 +1341,97 @@ fn main {
     check("r8.box_const_idx", a == 65)
     check("r8.box_lit_idx", b == 65)
     check("r8.holder_wrap", c == 99)
+  } else if kase == "m12_val_probes" {
+    let (s1, s2) = @m12.m12_sval_pair()
+    let ch = @m12.m12_chained_val()
+    let (calls, tv) = @m12.m12_compound_single_eval()
+    let (nr, is_blue) = @m12.m12_nested_rhs_and_color()
+    trace("r", "\{s1},\{s2},\{ch},\{calls},\{tv},\{nr},\{is_blue}")
+    check("m12.sval_3", s1 == 3)
+    check("m12.sval_8", s2 == 8)
+    check("m12.chained_val", ch == 15)
+    check("m12.compound_calls_1", calls == 1)
+    check("m12.compound_val_17", tv == 17)
+    check("m12.nested_and_blue", nr == 42 && is_blue)
+  } else if kase == "m12_recursive_local_fn" {
+    let (r1, r2) = @m12.m12_escaping_rec()
+    let (sh, ev, od) = @m12.m12_sibling_shadow_and_mutual()
+    let mut ping = 0
+    let co = @m12.m12_closure_opt_and_is(Some(fn() { ping = ping + 1 }), fn() { Some(7L) })
+    trace("r", "\{r1},\{r2},\{sh},\{ev},\{od},\{co},\{ping}")
+    check("m12.esc_14", r1 == 14)
+    check("m12.esc_16", r2 == 16)
+    check("m12.sibling_shadow", sh == 36)
+    check("m12.mutual_rec", ev && od)
+    check("m12.closure_opt_is", co == 17 && ping == 1)
+  } else if kase == "m12_per_site_enum" {
+    let (a, b, c1, c2) = @m12.m12_per_site_enum_demo()
+    trace("r", "\{a},\{b},\{c1},\{c2}")
+    check("m12.local_some_false", !a)
+    check("m12.opt_some_true", b)
+    check("m12.dual_e1_11", c1 == 11)
+    check("m12.dual_e2_21", c2 == 21)
+  } else if kase == "m12_pipe_loops_compat" {
+    let (p1, p2, p3, tr) = @m12.m12_pipe_and_arrow_demo()
+    let lm = @m12.m12_live_map_update()
+    let (ms, sc) = @m12.m12_map_and_str_control_flow()
+    let (rf, lo, idx, has, dig, built, lex) = @m12.m12_compat_helpers_demo()
+    trace("r", "\{p1},\{p2},\{p3},\{tr},\{lm},\{ms},\{sc},\{rf},\{lo},\{idx},\{has},\{dig},\{built},\{lex}")
+    check("m12.pipe_25", p1 == 25)
+    check("m12.pipe_ignore_7", p2 == 7)
+    check("m12.pipe_order_213", p3 == 213)
+    check("m12.pipe_trace_123", tr == 123)
+    check("m12.live_map_13", lm == 13)
+    check("m12.map_ctrl_4", ms == 4)
+    check("m12.str_ctrl_2", sc == 2)
+    check("m12.rev_find_3", rf == 3)
+    check("m12.arr_search_contains", idx == 1 && has)
+    check("m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B" && lex)
+  } else if kase == "q2_semantics_p0" {
+    let (a1, a2, a3) = @m12.q2_anon_struct_and_boxval()
+    let (t1, t2, t3, t4, t5) = @m12.q2_type_ascriptions()
+    let p1 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: true, tag: 1, x: Some(3), y: Some(4) }))
+    let p2 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: true, tag: 1, x: Some(-2), y: Some(4) }))
+    let p3 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: false, tag: 7, x: Some(3), y: Some(4) }))
+    let p4 = @m12.q2_ctor_struct_pat(@m12.TreeRec::Leaf(@m12.NodeRec::{ ok: false, tag: 1, x: None, y: None }))
+    let (l1, l2) = @m12.q2_local_fn_order_and_shadow()
+    let (pp1, pp2) = @m12.q2_pipe_collision_and_named()
+    let (sd1, sd2, sd3) = @m12.q2_sameline_div_cascade_and_brace(-7, 2, 7.0, 2.0, -23)
+    let (sf1, cl1, sp1) = @m12.q2_shadowed_fail_and_crossline_paren()
+    trace("r", "\{a1},\{a2},\{a3},\{t1},\{t2},\{t3},\{t4},\{t5},\{p1},\{p2},\{p3},\{p4},\{l1},\{l2},\{pp1},\{pp2},\{sd1},\{sd2},\{sd3},\{sf1},\{cl1},\{sp1}")
+    check("q2.anon_struct", a1 == 13 && a2 == 25)
+    check("q2.boxval_3", a3 == 3)
+    check("q2.ascribe_i64_dbl", t1 == 3000000000L && t2 == 3.5 && t3 == -3L && t4 == 1.5 && t5)
+    check("q2.ctor_pat_dual", p1 == 34)
+    check("q2.ctor_pat_fallthrough", p2 == 98)
+    check("q2.ctor_pat_guard_and_tag", p3 == 700 && p4 == 111)
+    check("q2.local_fn_order", l1 == 1015)
+    check("q2.local_fn_shadow", l2 == 17)
+    check("q2.pipe_collision_named", pp1 == 25 && pp2 == 17)
+    check("q2.sameline_div_cascade_brace", sd1 == 0 && sd2 == "-3" && sd3 == 2)
+    check("q2.shadowed_fail", sf1 == "ok:x")
+    check("q2.crossline_paren_recv", cl1 == "3.5")
+    check("q2.str_lit_probe_32", sp1 == 32)
+  } else if kase == "q2_mechanical_compat" {
+    let (nt1, nt2) = @m12.q2_trailing_tuple_newline(9)
+    let tf1 = @m12.q2_tuple_opt_fn(Some((3.0, fn(v) { v * 2.0 })))
+    let tf2 = @m12.q2_tuple_opt_fn(None)
+    let fm0 = @m12.q2_fixed_arr_match([])
+    let fm1 = @m12.q2_fixed_arr_match([7])
+    let fm2 = @m12.q2_fixed_arr_match([5, 9])
+    let fm3 = @m12.q2_fixed_arr_match([1, 2, 3])
+    let (mv, nan_ok, ln, g, mid_s, emp) = @m12.q2_double_and_collections()
+    trace("r", "\{nt1},\{nt2},\{tf1},\{tf2},\{fm0},\{fm1},\{fm2},\{fm3},\{mv},\{nan_ok},\{ln},\{g},\{mid_s},\{emp}")
+    check("q2.trailing_tuple", nt1 == 10 && nt2 == 20)
+    check("q2.tuple_opt_fn", tf1 == 6.0 && tf2 == 0.0)
+    check("q2.arr_pat_0", fm0 == 0)
+    check("q2.arr_pat_1", fm1 == 70)
+    check("q2.arr_pat_2_3", fm2 == 105 && fm3 == -1)
+    check("q2.dbl_zero_hash", mv == 22)
+    check("q2.dbl_nan_cmp", nan_ok)
+    check("q2.int_lnot", ln == -1)
+    check("q2.unsafe_get_set", g == 25)
+    check("q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -927,6 +1442,7 @@ PION_DRIVER_PION = r'''
 import "mbt_compat" as mbt_compat
 import "shadow" as shadow
 import "nomap" as nomap
+import "m12" as m12
 
 fn trace(w : World, k : String, v : String) -> Unit {
   io_println(w, "T " + k + "=" + v)
@@ -1317,6 +1833,97 @@ pub fn main(w : World) -> Int {
     check(w, "r8.box_const_idx", a == 65)
     check(w, "r8.box_lit_idx", b == 65)
     check(w, "r8.holder_wrap", c == 99)
+  } else if kase == "m12_val_probes" {
+    let (s1, s2) = m12::m12_sval_pair()
+    let ch = m12::m12_chained_val()
+    let (calls, tv) = m12::m12_compound_single_eval()
+    let (nr, is_blue) = m12::m12_nested_rhs_and_color()
+    trace(w, "r", s1.to_string() + "," + s2.to_string() + "," + ch.to_string() + "," + calls.to_string() + "," + tv.to_string() + "," + nr.to_string() + "," + is_blue.to_string())
+    check(w, "m12.sval_3", s1 == 3)
+    check(w, "m12.sval_8", s2 == 8)
+    check(w, "m12.chained_val", ch == 15)
+    check(w, "m12.compound_calls_1", calls == 1)
+    check(w, "m12.compound_val_17", tv == 17)
+    check(w, "m12.nested_and_blue", nr == 42 && is_blue)
+  } else if kase == "m12_recursive_local_fn" {
+    let (r1, r2) = m12::m12_escaping_rec()
+    let (sh, ev, od) = m12::m12_sibling_shadow_and_mutual()
+    let mut ping = 0
+    let co = m12::m12_closure_opt_and_is(Some(fn() { ping = ping + 1 }), fn() { Some(7L) })
+    trace(w, "r", r1.to_string() + "," + r2.to_string() + "," + sh.to_string() + "," + ev.to_string() + "," + od.to_string() + "," + co.to_string() + "," + ping.to_string())
+    check(w, "m12.esc_14", r1 == 14)
+    check(w, "m12.esc_16", r2 == 16)
+    check(w, "m12.sibling_shadow", sh == 36)
+    check(w, "m12.mutual_rec", ev && od)
+    check(w, "m12.closure_opt_is", co == 17 && ping == 1)
+  } else if kase == "m12_per_site_enum" {
+    let (a, b, c1, c2) = m12::m12_per_site_enum_demo()
+    trace(w, "r", a.to_string() + "," + b.to_string() + "," + c1.to_string() + "," + c2.to_string())
+    check(w, "m12.local_some_false", !a)
+    check(w, "m12.opt_some_true", b)
+    check(w, "m12.dual_e1_11", c1 == 11)
+    check(w, "m12.dual_e2_21", c2 == 21)
+  } else if kase == "m12_pipe_loops_compat" {
+    let (p1, p2, p3, tr) = m12::m12_pipe_and_arrow_demo()
+    let lm = m12::m12_live_map_update()
+    let (ms, sc) = m12::m12_map_and_str_control_flow()
+    let (rf, lo, idx, has, dig, built, lex) = m12::m12_compat_helpers_demo()
+    trace(w, "r", p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + tr.to_string() + "," + lm.to_string() + "," + ms.to_string() + "," + sc.to_string() + "," + rf.to_string() + "," + lo + "," + idx.to_string() + "," + has.to_string() + "," + dig.to_string() + "," + built + "," + lex.to_string())
+    check(w, "m12.pipe_25", p1 == 25)
+    check(w, "m12.pipe_ignore_7", p2 == 7)
+    check(w, "m12.pipe_order_213", p3 == 213)
+    check(w, "m12.pipe_trace_123", tr == 123)
+    check(w, "m12.live_map_13", lm == 13)
+    check(w, "m12.map_ctrl_4", ms == 4)
+    check(w, "m12.str_ctrl_2", sc == 2)
+    check(w, "m12.rev_find_3", rf == 3)
+    check(w, "m12.arr_search_contains", idx == 1 && has)
+    check(w, "m12.char_and_from_arr", dig && lo == "hello world" && built == "A😀B" && lex)
+  } else if kase == "q2_semantics_p0" {
+    let (a1, a2, a3) = m12::q2_anon_struct_and_boxval()
+    let (t1, t2, t3, t4, t5) = m12::q2_type_ascriptions()
+    let p1 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: true, tag: 1, x: Some(3), y: Some(4) }))
+    let p2 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: true, tag: 1, x: Some(-2), y: Some(4) }))
+    let p3 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: false, tag: 7, x: Some(3), y: Some(4) }))
+    let p4 = m12::q2_ctor_struct_pat(m12::TreeRec::Leaf(m12::NodeRec::{ ok: false, tag: 1, x: None, y: None }))
+    let (l1, l2) = m12::q2_local_fn_order_and_shadow()
+    let (pp1, pp2) = m12::q2_pipe_collision_and_named()
+    let (sd1, sd2, sd3) = m12::q2_sameline_div_cascade_and_brace(-7, 2, 7.0, 2.0, -23)
+    let (sf1, cl1, sp1) = m12::q2_shadowed_fail_and_crossline_paren()
+    trace(w, "r", a1.to_string() + "," + a2.to_string() + "," + a3.to_string() + "," + t1.to_string() + "," + mbt_compat::double_to_string(t2) + "," + t3.to_string() + "," + mbt_compat::double_to_string(t4) + "," + t5.to_string() + "," + p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + p4.to_string() + "," + l1.to_string() + "," + l2.to_string() + "," + pp1.to_string() + "," + pp2.to_string() + "," + sd1.to_string() + "," + sd2 + "," + sd3.to_string() + "," + sf1 + "," + cl1 + "," + sp1.to_string())
+    check(w, "q2.anon_struct", a1 == 13 && a2 == 25)
+    check(w, "q2.boxval_3", a3 == 3)
+    check(w, "q2.ascribe_i64_dbl", t1 == 3000000000L && t2 == 3.5 && t3 == -3L && t4 == 1.5 && t5)
+    check(w, "q2.ctor_pat_dual", p1 == 34)
+    check(w, "q2.ctor_pat_fallthrough", p2 == 98)
+    check(w, "q2.ctor_pat_guard_and_tag", p3 == 700 && p4 == 111)
+    check(w, "q2.local_fn_order", l1 == 1015)
+    check(w, "q2.local_fn_shadow", l2 == 17)
+    check(w, "q2.pipe_collision_named", pp1 == 25 && pp2 == 17)
+    check(w, "q2.sameline_div_cascade_brace", sd1 == 0 && sd2 == "-3" && sd3 == 2)
+    check(w, "q2.shadowed_fail", sf1 == "ok:x")
+    check(w, "q2.crossline_paren_recv", cl1 == "3.5")
+    check(w, "q2.str_lit_probe_32", sp1 == 32)
+  } else if kase == "q2_mechanical_compat" {
+    let (nt1, nt2) = m12::q2_trailing_tuple_newline(9)
+    let tf1 = m12::q2_tuple_opt_fn(Some((3.0, fn(v) { v * 2.0 })))
+    let tf2 = m12::q2_tuple_opt_fn(None)
+    let fm0 = m12::q2_fixed_arr_match([])
+    let fm1 = m12::q2_fixed_arr_match([7])
+    let fm2 = m12::q2_fixed_arr_match([5, 9])
+    let fm3 = m12::q2_fixed_arr_match([1, 2, 3])
+    let (mv, nan_ok, ln, g, mid_s, emp) = m12::q2_double_and_collections()
+    trace(w, "r", nt1.to_string() + "," + nt2.to_string() + "," + mbt_compat::double_to_string(tf1) + "," + mbt_compat::double_to_string(tf2) + "," + fm0.to_string() + "," + fm1.to_string() + "," + fm2.to_string() + "," + fm3.to_string() + "," + mv.to_string() + "," + nan_ok.to_string() + "," + ln.to_string() + "," + g.to_string() + "," + mid_s.to_string() + "," + emp.to_string())
+    check(w, "q2.trailing_tuple", nt1 == 10 && nt2 == 20)
+    check(w, "q2.tuple_opt_fn", tf1 == 6.0 && tf2 == 0.0)
+    check(w, "q2.arr_pat_0", fm0 == 0)
+    check(w, "q2.arr_pat_1", fm1 == 70)
+    check(w, "q2.arr_pat_2_3", fm2 == 105 && fm3 == -1)
+    check(w, "q2.dbl_zero_hash", mv == 22)
+    check(w, "q2.dbl_nan_cmp", nan_ok)
+    check(w, "q2.int_lnot", ln == -1)
+    check(w, "q2.unsafe_get_set", g == 25)
+    check(w, "q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -1489,6 +2096,11 @@ def prepare(env):
     nomap_mbt_dir = os.path.join(env.workdir, "nomap_mbt_src")
     write_file(os.path.join(nomap_mbt_dir, "nomap_lib.mbt"), NO_APIMAP_LIB_MBT)
 
+    m12_mbt_dir = os.path.join(env.workdir, "m12_mbt_src")
+    write_file(os.path.join(m12_mbt_dir, "m12_lib.mbt"), M12_LIB_MBT)
+    m12_recipes_path = os.path.join(env.workdir, "m12_recipes.toml")
+    write_file(m12_recipes_path, M12_RECIPES_TOML)
+
     # 2. Build MoonBit packages (`acme`, `ext`, `shadow`, `nomap`, `main`) around the exact same `.mbt` files
     write_file(
         os.path.join(env.moon_dir, "moon.mod"),
@@ -1514,9 +2126,14 @@ def prepare(env):
         os.path.join(nomap_mbt_dir, "nomap_lib.mbt"),
         os.path.join(env.moon_dir, "nomap", "nomap_lib.mbt"),
     )
+    write_file(os.path.join(env.moon_dir, "m12", "moon.pkg"), "\n")
+    shutil.copyfile(
+        os.path.join(m12_mbt_dir, "m12_lib.mbt"),
+        os.path.join(env.moon_dir, "m12", "m12_lib.mbt"),
+    )
     write_file(
         os.path.join(env.moon_dir, "main", "moon.pkg"),
-        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n  "oracle/transpile/nomap",\n}\n\npkgtype(kind: "executable")\n',
+        'import {\n  "moonbitlang/core/env",\n  "oracle/transpile/acme",\n  "oracle/transpile/shadow",\n  "oracle/transpile/nomap",\n  "oracle/transpile/m12",\n}\n\npkgtype(kind: "executable")\n',
     )
     shutil.copyfile(
         os.path.join(env.mbt_src_dir, "oracle_lib.mbt"),
@@ -1582,6 +2199,31 @@ def prepare(env):
         '[package]\nname = "nomap"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\next = { path = "%s" }\n' % (COMPAT_DIR, pion_ext_dir),
     )
 
+    # Transpile `m12_lib.mbt` (Wave M1.2 Track A A.1-A.6 differential oracle)
+    pion_m12_dir = os.path.join(env.workdir, "pion_m12")
+    pion_m12_src = os.path.join(pion_m12_dir, "src")
+    os.makedirs(pion_m12_src, exist_ok=True)
+    rc, out, err, to, secs = run_cmd([
+        env.mbt2pion_bin,
+        "--src", m12_mbt_dir,
+        "--out", pion_m12_src,
+        "--target", "native",
+        "--mode", "publish",
+        "--recipes", m12_recipes_path,
+        "--mbt-compat", COMPAT_DIR,
+        "--pionc", env.pionc,
+        "--mbt2pion-commit", "oracle-test",
+        "--toolchain-lock", "oracle-lock",
+        "--source-commit", "oracle-src",
+    ])
+    if rc != 0:
+        print("SETUP FAILED: mbt2pion --mode publish m12_lib.mbt (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
+        return False
+    write_file(
+        os.path.join(pion_m12_dir, "pion.toml"),
+        '[package]\nname = "m12"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\n' % (COMPAT_DIR,),
+    )
+
     pion_src = os.path.join(env.pion_dir, "src")
     os.makedirs(pion_src, exist_ok=True)
     rc, out, err, to, secs = run_cmd([
@@ -1608,7 +2250,7 @@ def prepare(env):
     # 5. Wire generated `.pion` files with real `tools/mbt_compat` + `acme` + `shadow` + `nomap` + thin driver
     write_file(
         os.path.join(env.pion_dir, "pion.toml"),
-        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\nnomap = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir, pion_nomap_dir),
+        '[package]\nname = "mbt2pion_transpile_oracle"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = { path = "%s" }\nacme = { path = "%s" }\nshadow = { path = "%s" }\nnomap = { path = "%s" }\nm12 = { path = "%s" }\n' % (COMPAT_DIR, pion_acme_dir, pion_shadow_dir, pion_nomap_dir, pion_m12_dir),
     )
     write_file(os.path.join(pion_src, "main.pion"), PION_DRIVER_PION)
 

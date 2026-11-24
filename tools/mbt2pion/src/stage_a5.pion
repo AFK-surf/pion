@@ -20,6 +20,7 @@
 import "json" as json
 
 pub struct ProbeSite {
+  probe_id : String
   file : String
   probe_kind : String
   start_byte : Int
@@ -29,6 +30,7 @@ pub struct ProbeSite {
   col : Int
   lhs_expr : String
   rhs_expr : String
+  assign_op : String
   slice_hi : String
   divisor_is_zero : Bool
   rhs_has_lit : Bool
@@ -42,6 +44,7 @@ pub struct ProbeResult {
   line : Int
   col : Int
   probe_kind : String
+  probe_id : String
   resolved_type : String
 }
 
@@ -114,9 +117,9 @@ pub fn parse_pionc_diagnostics(json_text : String) -> Array[PioncDiag] {
   out
 }
 
-///| Extract `(probe_kind, resolved_type)` from a `pionc` diagnostic message of the form:
-///| `unknown method `mbt_*_probe` on type `<T>``
-pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
+///| Extract `(probe_kind, probe_id, resolved_type)` from a `pionc` diagnostic message of the form:
+///| `unknown method `mbt_*_probe[__p<id>]` on type `<T>``
+pub fn extract_probe_with_id_from_diag(d : PioncDiag) -> Option[(String, String, String)] {
   let prefix = "unknown method `mbt_"
   let p_idx = d.message.index_of(prefix)
   if p_idx < 0 {
@@ -127,8 +130,15 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
   if tick_end < 0 {
     return None
   }
-  let probe_name = after_m.slice(0, tick_end)
-  if !probe_name.ends_with("_probe") {
+  let raw_name = after_m.slice(0, tick_end)
+  let mut probe_kind = raw_name
+  let mut probe_id = ""
+  let tag_idx = raw_name.index_of("__p")
+  if tag_idx > 0 {
+    probe_kind = raw_name.slice(0, tag_idx)
+    probe_id = raw_name.slice(tag_idx + 2, raw_name.length())
+  }
+  if !probe_kind.ends_with("_probe") {
     return None
   }
   let on_ty = " on type `"
@@ -142,7 +152,15 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
     return None
   }
   let resolved_ty = after_ty.slice(0, ty_end)
-  Some((probe_name, resolved_ty))
+  Some((probe_kind, probe_id, resolved_ty))
+}
+
+///| Backwards-compatible wrapper returning `(probe_kind, resolved_type)`.
+pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
+  match extract_probe_with_id_from_diag(d) {
+    Some((k, _, t)) => Some((k, t))
+    None => None
+  }
 }
 
 ///| Parse an integer literal token (`0`, `1`, `0x1`, `0xffffffff`, `0xffffffffffffffffL`,
@@ -350,8 +368,9 @@ fn find_receiver_start(tokens : Array[Token], end_idx : Int) -> Int {
         return -1
       }
       cur = j
-      // If preceded by ident / `)` / `]` / literal, this was a call `f(...)` or index `arr[...]` — continue walking!
-      if cur > 0 {
+      // If preceded on the SAME line by ident / `)` / `]` / literal, this was a call `f(...)` or index `arr[...]` — continue walking!
+      // NEVER cross a newline into the previous statement (e.g. `let d = 7.0\n(d / 2).to_string()`).
+      if cur > 0 && !tokens[cur].newline_before {
         let pk = tokens[cur - 1].kind
         if pk == TokenKind::Ident || pk == TokenKind::UpperIdent || pk == TokenKind::RParen || pk == TokenKind::RBracket || is_literal_expr_token(pk) {
           cur = cur - 1
@@ -779,7 +798,21 @@ fn instrument_probes_for_file_with_safe(
   let sites : Array[ProbeSite] = []
   let edits : Array[(Int, Int, String)] = []
   let mut covered_end = 0
-  let slice_only_pass = str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow")
+  let mut slice_only_pass = false
+  if str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow") {
+    let mut si = 0
+    while si + 3 < n {
+      if tokens[si].kind == TokenKind::Ident && tokens[si].raw == "mbt_compat" &&
+      tokens[si + 1].kind == TokenKind::ColonColon &&
+      (tokens[si + 2].raw == "__mbt_slice_owned" || tokens[si + 2].raw == "__mbt_slice_borrow") &&
+      tokens[si + 3].kind == TokenKind::LParen &&
+      !safe_offsets.contains(base_offset + tokens[si + 2].start_byte) {
+        slice_only_pass = true
+        break
+      }
+      si = si + 1
+    }
+  }
   let mut i = 0
 
   while i < n {
@@ -824,7 +857,7 @@ fn instrument_probes_for_file_with_safe(
           }
           ai = ae + 1
         }
-        if s_args.length() == 3 {
+        if s_args.length() == 3 && !safe_offsets.contains(base_offset + tokens[i + 2].start_byte) {
           let pkind = if tokens[i + 2].raw == "__mbt_slice_owned" {
             "mbt_slice_owned_probe"
           } else {
@@ -833,6 +866,7 @@ fn instrument_probes_for_file_with_safe(
           let start_b = t.start_byte
           let end_b = tokens[close_p].end_byte
           sites.push(ProbeSite::{
+            probe_id: "",
             file: file,
             probe_kind: pkind,
             start_byte: start_b,
@@ -842,6 +876,7 @@ fn instrument_probes_for_file_with_safe(
             col: t.col,
             lhs_expr: s_args[0],
             rhs_expr: s_args[1],
+            assign_op: "",
             slice_hi: s_args[2],
             divisor_is_zero: false,
             rhs_has_lit: false,
@@ -891,6 +926,7 @@ fn instrument_probes_for_file_with_safe(
             any_interp_probe = true
             for isite in inner_sites {
               sites.push(ProbeSite::{
+                probe_id: "",
                 file: file,
                 probe_kind: isite.probe_kind,
                 start_byte: expr_start_byte + isite.start_byte,
@@ -900,6 +936,7 @@ fn instrument_probes_for_file_with_safe(
                 col: t.col,
                 lhs_expr: isite.lhs_expr,
                 rhs_expr: isite.rhs_expr,
+                assign_op: isite.assign_op,
                 slice_hi: isite.slice_hi,
                 divisor_is_zero: isite.divisor_is_zero,
                 rhs_has_lit: isite.rhs_has_lit,
@@ -916,6 +953,7 @@ fn instrument_probes_for_file_with_safe(
             et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
               any_interp_probe = true
               sites.push(ProbeSite::{
+                probe_id: "",
                 file: file,
                 probe_kind: "mbt_show_probe",
                 start_byte: expr_start_byte,
@@ -925,6 +963,7 @@ fn instrument_probes_for_file_with_safe(
                 col: t.col,
                 lhs_expr: et,
                 rhs_expr: "__INTERP_SHOW__",
+                assign_op: "",
                 slice_hi: "",
                 divisor_is_zero: false,
                 rhs_has_lit: false,
@@ -963,6 +1002,7 @@ fn instrument_probes_for_file_with_safe(
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_len_probe",
           start_byte: start_b,
@@ -972,6 +1012,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -998,6 +1039,7 @@ fn instrument_probes_for_file_with_safe(
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_show_probe",
           start_byte: start_b,
@@ -1007,6 +1049,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -1021,15 +1064,86 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    // 3. `<recv>.val` -> `<recv>.mbt_val_probe()`
+    // 3. `<recv>.val` (read), `<recv>.val = <rhs>` (write), `<recv>.val <op>= <rhs>` (compound write)
     if t.kind == TokenKind::Dot && i + 1 < n && tokens[i + 1].raw == "val" {
       let op_b = base_offset + tokens[i + 1].start_byte
       let recv_start = find_receiver_start(tokens, i - 1)
       if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
-        let end_b = tokens[i + 1].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        if i + 2 < n && (tokens[i + 2].kind == TokenKind::Eq || tokens[i + 2].kind == TokenKind::AssignOp) {
+          let rhs_end = find_expr_end(tokens, i + 3, n)
+          if rhs_end > i + 3 {
+            let end_b = tokens[rhs_end - 1].end_byte
+            let rhs_expr = content.slice(tokens[i + 3].start_byte, end_b).trim()
+            let aop = if tokens[i + 2].kind == TokenKind::Eq {
+              "="
+            } else {
+              let rraw = tokens[i + 2].raw
+              if rraw.ends_with("=") && rraw.length() > 1 { rraw.slice(0, rraw.length() - 1) } else { rraw }
+            }
+            sites.push(ProbeSite::{
+              probe_id: "",
+              file: file,
+              probe_kind: "mbt_val_set_probe",
+              start_byte: start_b,
+              end_byte: end_b,
+              op_byte: op_b,
+              line: tokens[i + 1].line,
+              col: tokens[i + 1].col,
+              lhs_expr: recv_expr,
+              rhs_expr: rhs_expr,
+              assign_op: aop,
+              slice_hi: "",
+              divisor_is_zero: false,
+              rhs_has_lit: false,
+              rhs_is_neg: false,
+              rhs_u64: 0UL,
+              rhs_overflow: false,
+            })
+            let probed_rhs = if str_has(rhs_expr, ".val") {
+              let rtoks = lex_moonbit(rhs_expr)
+              let rn = rtoks.length() - 1
+              let redits : Array[(Int, Int, String)] = []
+              let mut ri = 0
+              while ri + 1 < rn {
+                if rtoks[ri].kind == TokenKind::Dot && rtoks[ri + 1].raw == "val" {
+                  redits.push((rtoks[ri].start_byte, rtoks[ri + 1].end_byte, ".mbt_val_probe()"))
+                  ri = ri + 2
+                } else {
+                  ri = ri + 1
+                }
+              }
+              apply_byte_edits(rhs_expr, redits)
+            } else {
+              rhs_expr
+            }
+            let probed_lhs = if str_has(recv_expr, ".val") {
+              let ltoks = lex_moonbit(recv_expr)
+              let ln = ltoks.length() - 1
+              let ledits : Array[(Int, Int, String)] = []
+              let mut li = 0
+              while li + 1 < ln {
+                if ltoks[li].kind == TokenKind::Dot && ltoks[li + 1].raw == "val" {
+                  ledits.push((ltoks[li].start_byte, ltoks[li + 1].end_byte, ".mbt_val_probe()"))
+                  li = li + 2
+                } else {
+                  li = li + 1
+                }
+              }
+              apply_byte_edits(recv_expr, ledits)
+            } else {
+              recv_expr
+            }
+            edits.push((start_b, end_b, probed_lhs + ".mbt_val_set_probe(" + probed_rhs + ")"))
+            covered_end = end_b
+            i = rhs_end
+            continue
+          }
+        }
+        let end_b = tokens[i + 1].end_byte
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_val_probe",
           start_byte: start_b,
@@ -1039,6 +1153,7 @@ fn instrument_probes_for_file_with_safe(
           col: tokens[i + 1].col,
           lhs_expr: recv_expr,
           rhs_expr: "",
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -1071,6 +1186,7 @@ fn instrument_probes_for_file_with_safe(
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         let idx_expr = content.slice(tokens[i + 1].start_byte, tokens[close_br - 1].end_byte).trim()
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: "mbt_idx_probe",
           start_byte: start_b,
@@ -1080,6 +1196,7 @@ fn instrument_probes_for_file_with_safe(
           col: t.col,
           lhs_expr: recv_expr,
           rhs_expr: idx_expr,
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: false,
           rhs_has_lit: false,
@@ -1137,6 +1254,7 @@ fn instrument_probes_for_file_with_safe(
           }
         }
         sites.push(ProbeSite::{
+          probe_id: "",
           file: file,
           probe_kind: pkind,
           start_byte: start_b,
@@ -1146,6 +1264,7 @@ fn instrument_probes_for_file_with_safe(
           col: t.col,
           lhs_expr: lhs_expr,
           rhs_expr: rhs_expr,
+          assign_op: "",
           slice_hi: "",
           divisor_is_zero: is_zero,
           rhs_has_lit: has_int_lit,
@@ -1167,12 +1286,58 @@ fn instrument_probes_for_file_with_safe(
   (instrumented, sites)
 }
 
+///| Check whether `resolved_type` strictly matches `[ref].type_name` (never bare `Ref` from another package).
+fn is_recipe_ref_type(resolved_type : String, recipes : Recipes) -> Bool {
+  if recipes.ref_recipe.enabled && recipes.ref_recipe.type_name.length() > 0 {
+    let tn = recipes.ref_recipe.type_name
+    return resolved_type == tn || resolved_type.starts_with(tn + "[")
+  }
+  resolved_type == "Ref" || resolved_type.starts_with("Ref[")
+}
+
+///| Strip trailing generic arguments `[...]` from a resolved type name.
+fn strip_type_args(ty : String) -> String {
+  let br = ty.index_of("[")
+  if br > 0 { ty.slice(0, br).trim() } else { ty.trim() }
+}
+
+///| Check whether an expression is a pure simple identifier (safe to repeat without side effects).
+fn is_simple_ident_expr(expr : String) -> Bool {
+  let s = expr.trim()
+  if s.length() == 0 {
+    return false
+  }
+  let c0 = s.code_unit_at(0)
+  if !is_alpha(c0) {
+    return false
+  }
+  let mut i = 1
+  while i < s.length() {
+    if !is_alnum(s.code_unit_at(i)) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
 ///| Compute the rewritten expression for a single `(ProbeSite, resolved_type)` pair.
 ///| Returns `Some(replacement)` if a rewrite is needed, or `None` if original code stays untouched.
 pub fn rewrite_for_probe(
   site : ProbeSite,
   resolved_type : String,
   recipes : Recipes,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Option[String] {
+  rewrite_for_probe_with_fields(site, resolved_type, recipes, Map(), diags, drift_ledger)
+}
+
+pub fn rewrite_for_probe_with_fields(
+  site : ProbeSite,
+  resolved_type : String,
+  recipes : Recipes,
+  struct_val_fields : Map[String, String],
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> Option[String] {
@@ -1288,18 +1453,36 @@ pub fn rewrite_for_probe(
     return None
   }
 
-  if site.probe_kind == "mbt_val_probe" {
-    let is_ref = resolved_type.starts_with("Ref[") ||
-    (recipes.ref_recipe.enabled && recipes.ref_recipe.type_name.length() > 0 && resolved_type.starts_with(recipes.ref_recipe.type_name))
-    if is_ref {
-      let field = if recipes.ref_recipe.enabled && recipes.ref_recipe.field_name.length() > 0 {
+  if site.probe_kind == "mbt_val_probe" || site.probe_kind == "mbt_val_set_probe" {
+    let is_ref = is_recipe_ref_type(resolved_type, recipes)
+    let target_field = if is_ref {
+      if recipes.ref_recipe.enabled && recipes.ref_recipe.field_name.length() > 0 {
         recipes.ref_recipe.field_name
       } else {
         "v"
       }
-      return Some(site.lhs_expr + "." + field)
+    } else {
+      let base_ty = strip_type_args(resolved_type)
+      match struct_val_fields.get(base_ty) {
+        Some(renamed) => renamed
+        None => "val_"
+      }
     }
-    return Some(site.lhs_expr + ".val_")
+    if site.assign_op.length() == 0 {
+      return Some(site.lhs_expr + "." + target_field)
+    }
+    if site.assign_op == "=" {
+      return Some(site.lhs_expr + "." + target_field + " = " + site.rhs_expr)
+    }
+    // Compound assignment (`+=`, `-=`, `*=`, `/=`, etc.): evaluate complex receiver strictly ONCE!
+    if is_simple_ident_expr(site.lhs_expr) {
+      return Some(
+        site.lhs_expr + "." + target_field + " = " + site.lhs_expr + "." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ")",
+      )
+    }
+    return Some(
+      "{ let __mbt_r = " + site.lhs_expr + "; __mbt_r." + target_field + " = __mbt_r." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ") }",
+    )
   }
 
   // Astra Round 3 P0-2: exact per-node slice type classification (zero receiver-name heuristics!)
@@ -1427,18 +1610,41 @@ pub fn apply_byte_edits(src : String, edits : Array[(Int, Int, String)]) -> Stri
   sb.to_string()
 }
 
-///| Check whether a file still contains any `mbt_*_probe` or slice placeholder residual (hard merge gate!).
+///| Check whether a file still contains any real `mbt_*_probe` or slice placeholder identifier
+///| (lexed so string literals like `".mbt_len_probe("` and comments never trigger false positives,
+///| while interpolated string `\{...}` expression holes ARE checked!).
 pub fn has_probe_residual(content : String) -> Bool {
-  str_has(content, "mbt_len_probe") ||
-  str_has(content, "mbt_idx_probe") ||
-  str_has(content, "mbt_div_probe") ||
-  str_has(content, "mbt_mod_probe") ||
-  str_has(content, "mbt_show_probe") ||
-  str_has(content, "mbt_val_probe") ||
-  str_has(content, "mbt_slice_owned_probe") ||
-  str_has(content, "mbt_slice_borrow_probe") ||
-  str_has(content, "__mbt_slice_owned") ||
-  str_has(content, "__mbt_slice_borrow")
+  let toks = lex_moonbit(content)
+  let tn = toks.length() - 1
+  let mut i = 0
+  while i < tn {
+    let t = toks[i]
+    if t.kind == TokenKind::Ident {
+      let r = t.raw
+      if r.starts_with("mbt_len_probe") ||
+      r.starts_with("mbt_idx_probe") ||
+      r.starts_with("mbt_div_probe") ||
+      r.starts_with("mbt_mod_probe") ||
+      r.starts_with("mbt_show_probe") ||
+      r.starts_with("mbt_val_probe") ||
+      r.starts_with("mbt_val_set_probe") ||
+      r.starts_with("mbt_slice_owned_probe") ||
+      r.starts_with("mbt_slice_borrow_probe") ||
+      r == "__mbt_slice_owned" ||
+      r == "__mbt_slice_borrow" {
+        return true
+      }
+    } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let parts = split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline)
+      for p in parts {
+        if p.is_expr && has_probe_residual(p.text) {
+          return true
+        }
+      }
+    }
+    i = i + 1
+  }
+  false
 }
 
 ///| Remap a set of proven-safe byte offsets through a list of non-overlapping byte edits,
@@ -1781,19 +1987,238 @@ pub fn run_stage_a5_full(
   drift_ledger : Array[DriftEntry],
   max_rounds : Int,
 ) -> (Array[GeneratedFile], Int, Int, Int) {
+  let dummy_disps : Array[ProbeDisposition] = []
+  run_stage_a5_ex(files, recipes, api_map, Map(), check_fn, diags, drift_ledger, dummy_disps, max_rounds)
+}
+
+fn collect_probe_ident_spans(src : String, base_off : Int, out : Array[(Int, Int, String)]) -> Unit {
+  let toks = lex_moonbit(src)
+  let tn = toks.length() - 1
+  let mut ti = 0
+  while ti < tn {
+    let t = toks[ti]
+    if ti + 2 < tn && t.kind == TokenKind::Dot &&
+    toks[ti + 1].kind == TokenKind::Ident &&
+    toks[ti + 2].kind == TokenKind::LParen {
+      let r = toks[ti + 1].raw
+      if r.starts_with("mbt_") && r.ends_with("_probe") {
+        out.push((base_off + toks[ti + 1].start_byte, base_off + toks[ti + 1].end_byte, r))
+        ti = ti + 3
+        continue
+      }
+    }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let raw = t.raw
+      let rlen = raw.length()
+      let mut p = 0
+      while p + 1 < rlen {
+        if raw.code_unit_at(p) == 92 && raw.code_unit_at(p + 1) == 123 {
+          let hole_s = p + 2
+          let mut q = hole_s
+          let mut d = 1
+          let mut in_s = false
+          let mut esc = false
+          while q < rlen && d > 0 {
+            let c = raw.code_unit_at(q)
+            if in_s {
+              if esc { esc = false }
+              else if c == 92 { esc = true }
+              else if c == 34 { in_s = false }
+            } else if c == 34 {
+              in_s = true
+            } else if c == 123 {
+              d = d + 1
+            } else if c == 125 {
+              d = d - 1
+              if d == 0 { break }
+            }
+            q = q + 1
+          }
+          if d == 0 && q > hole_s {
+            collect_probe_ident_spans(raw.slice(hole_s, q), base_off + t.start_byte + hole_s, out)
+            p = q + 1
+            continue
+          }
+        }
+        p = p + 1
+      }
+    }
+    ti = ti + 1
+  }
+}
+
+///| Tag each real `.<probe_kind>(` call in `inst_src` (including inside `\{...}` interp holes!)
+///| with a unique `__<probe_id>` suffix using `lex_moonbit` tokens (NEVER raw substring search,
+///| so string/char literals like `".mbt_len_probe("` or comments can NEVER corrupt probe IDs!).
+fn tag_instrumented_probes_unique(inst_src : String, sites : Array[ProbeSite]) -> String {
+  if sites.length() == 0 {
+    return inst_src
+  }
+  let spans : Array[(Int, Int, String)] = []
+  collect_probe_ident_spans(inst_src, 0, spans)
+  let edits : Array[(Int, Int, String)] = []
+  let mut si = 0
+  for site in sites {
+    while si < spans.length() {
+      let sp = spans[si]
+      si = si + 1
+      if sp.2 == site.probe_kind {
+        edits.push((sp.0, sp.1, site.probe_kind + "__" + site.probe_id))
+        break
+      }
+    }
+  }
+  if edits.length() == 0 {
+    return inst_src
+  }
+  apply_byte_edits(inst_src, edits)
+}
+
+///| Parse `// origin-probes: kind=l1:c1,l2:c2;...` for a specific `probe_kind`.
+fn parse_origin_probes_for_kind(spec : String, probe_kind : String) -> Array[(Int, Int)] {
+  let out : Array[(Int, Int)] = []
+  let prefix = probe_kind + "="
+  let groups = spec.split(";")
+  for g in groups {
+    let gt = g.trim()
+    if gt.starts_with(prefix) {
+      let coords = gt.slice(prefix.length(), gt.length()).split(",")
+      for c in coords {
+        let ct = c.trim()
+        let ci = ct.index_of(":")
+        if ci > 0 {
+          let ln = parse_simple_pos_int(ct.slice(0, ci), 1)
+          let cl = parse_simple_pos_int(ct.slice(ci + 1, ct.length()), 1)
+          out.push((ln, cl))
+        }
+      }
+      break
+    }
+  }
+  out
+}
+
+///| Find the enclosing `// origin:` header index and optional `// origin-probes:` line for `line_1based`
+///| in `00_init_order.pion` or `00_init_order_test.pion`.
+fn find_init_origin_header(content : String, file : String, line_1based : Int) -> (Int, String, String) {
+  if file != "00_init_order.pion" && file != "00_init_order_test.pion" {
+    return (-1, "", "")
+  }
+  let lines = content.split("\n")
+  let mut li = if line_1based - 1 < lines.length() { line_1based - 1 } else { lines.length() - 1 }
+  while li >= 0 {
+    let t = lines[li].trim()
+    if t.starts_with("// origin: ") {
+      let origin_rest = t.slice(11, t.length()).trim()
+      let probes_rest = if li + 1 < lines.length() && lines[li + 1].trim().starts_with("// origin-probes: ") {
+        let p = lines[li + 1].trim()
+        p.slice(18, p.length()).trim()
+      } else {
+        ""
+      }
+      return (li, origin_rest, probes_rest)
+    }
+    li = li - 1
+  }
+  (-1, "", "")
+}
+
+///| Resolve original MoonBit `(file, line, col)` from nearest `// origin:` + `// origin-probes:`
+///| metadata above `line_1based` in `00_init_order.pion` or `00_init_order_test.pion`.
+///| When `probe_slot >= 0` and `// origin-probes:` has an entry for `probe_kind` at `probe_slot`,
+///| returns the exact original MoonBit token `(line, col)` directly (zero column-offset arithmetic!).
+fn resolve_init_order_origin_slot(
+  content : String,
+  file : String,
+  line_1based : Int,
+  col_1based : Int,
+  probe_kind : String,
+  probe_slot : Int,
+) -> (String, Int, Int) {
+  let (li, rest, probes_rest) = find_init_origin_header(content, file, line_1based)
+  if li < 0 {
+    return (file, line_1based, col_1based)
+  }
+  let c1 = rest.index_of(":")
+  if c1 > 0 {
+    let orig_f = rest.slice(0, c1)
+    if probe_kind.length() > 0 && probe_slot >= 0 && probes_rest.length() > 0 {
+      let coords = parse_origin_probes_for_kind(probes_rest, probe_kind)
+      if probe_slot < coords.length() {
+        return (orig_f, coords[probe_slot].0, coords[probe_slot].1)
+      }
+    }
+    let after1 = rest.slice(c1 + 1, rest.length())
+    let parts = after1.split(":")
+    let orig_l = if parts.length() >= 1 { parse_simple_pos_int(parts[0], line_1based) } else { line_1based }
+    let rhs_orig_col = if parts.length() >= 3 { parse_simple_pos_int(parts[2], 1) } else { 1 }
+    let rhs_gen_col = if parts.length() >= 4 { parse_simple_pos_int(parts[3], 1) } else { 1 }
+    let decl_start_line = if probes_rest.length() > 0 { li + 3 } else { li + 2 }
+    let line_delta = if line_1based > decl_start_line { line_1based - decl_start_line } else { 0 }
+    let orig_col = if line_delta == 0 {
+      let adj = col_1based - (rhs_gen_col - rhs_orig_col)
+      if adj < 1 { 1 } else { adj }
+    } else {
+      col_1based
+    }
+    return (orig_f, orig_l + line_delta, orig_col)
+  }
+  (file, line_1based, col_1based)
+}
+
+fn resolve_init_order_origin(content : String, file : String, line_1based : Int, col_1based : Int) -> (String, Int, Int) {
+  resolve_init_order_origin_slot(content, file, line_1based, col_1based, "", -1)
+}
+
+fn parse_simple_pos_int(s : String, fallback : Int) -> Int {
+  let t = s.trim()
+  if t.length() == 0 {
+    return fallback
+  }
+  let mut acc = 0
+  let mut i = 0
+  while i < t.length() {
+    let c = t.code_unit_at(i)
+    if c >= 48 && c <= 57 {
+      acc = acc * 10 + (c - 48)
+    } else {
+      return fallback
+    }
+    i = i + 1
+  }
+  acc
+}
+
+pub fn run_stage_a5_ex(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
   let mut cur_files : Array[GeneratedFile] = []
   let safe_list_by_file : Map[String, Array[Int]] = Map()
   let safe_map_by_file : Map[String, Map[Int, Bool]] = Map()
+  let failed_list_by_file : Map[String, Array[Int]] = Map()
+  let failed_map_by_file : Map[String, Map[Int, Bool]] = Map()
+  let init_used_slots : Map[String, Map[Int, Bool]] = Map()
   for f in files {
     cur_files.push(f)
     safe_list_by_file[f.rel_path] = []
     safe_map_by_file[f.rel_path] = Map()
+    failed_list_by_file[f.rel_path] = []
+    failed_map_by_file[f.rel_path] = Map()
   }
   let (declared_values, declared_types) = collect_package_value_and_type_names(cur_files)
   let (qual_values, qual_types) = collect_qualified_api_names(api_map)
   let mut total_rounds = 0
   let mut total_instrumented = 0
   let mut total_resolved = 0
+  let mut global_probe_seq = 0
 
   let mut round = 0
   while round < max_rounds {
@@ -1806,19 +2231,51 @@ pub fn run_stage_a5_full(
         Some(m) => m
         None => Map()
       }
-      let (inst_src, sites) = instrument_probes_for_file_with_safe(
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let skip_map : Map[Int, Bool] = Map()
+      for k in smap.keys() { skip_map[k] = true }
+      for k in fmap.keys() { skip_map[k] = true }
+      let (inst_src, raw_sites) = instrument_probes_for_file_with_safe(
         f.rel_path,
         f.content,
-        smap,
+        skip_map,
         0,
         declared_values,
         declared_types,
         qual_values,
         qual_types,
       )
-      instrumented_batch.push((f.rel_path, inst_src))
-      sites_by_file[f.rel_path] = sites
-      round_probes = round_probes + sites.length()
+      let numbered_sites : Array[ProbeSite] = []
+      for rs in raw_sites {
+        global_probe_seq = global_probe_seq + 1
+        let pid = "p" + (round + 1).to_string() + "_" + global_probe_seq.to_string()
+        numbered_sites.push(ProbeSite::{
+          probe_id: pid,
+          file: rs.file,
+          probe_kind: rs.probe_kind,
+          start_byte: rs.start_byte,
+          end_byte: rs.end_byte,
+          op_byte: rs.op_byte,
+          line: rs.line,
+          col: rs.col,
+          lhs_expr: rs.lhs_expr,
+          rhs_expr: rs.rhs_expr,
+          assign_op: rs.assign_op,
+          slice_hi: rs.slice_hi,
+          divisor_is_zero: rs.divisor_is_zero,
+          rhs_has_lit: rs.rhs_has_lit,
+          rhs_is_neg: rs.rhs_is_neg,
+          rhs_u64: rs.rhs_u64,
+          rhs_overflow: rs.rhs_overflow,
+        })
+      }
+      let tagged_src = tag_instrumented_probes_unique(inst_src, numbered_sites)
+      instrumented_batch.push((f.rel_path, tagged_src))
+      sites_by_file[f.rel_path] = numbered_sites
+      round_probes = round_probes + numbered_sites.length()
     }
 
     if round_probes == 0 {
@@ -1833,33 +2290,28 @@ pub fn run_stage_a5_full(
 
     let raw_results : Array[ProbeResult] = []
     for pd in pionc_diags {
-      match extract_probe_from_diag(pd) {
-        Some((pkind, rty)) =>
+      match extract_probe_with_id_from_diag(pd) {
+        Some((pkind, pid, rty)) =>
         raw_results.push(ProbeResult::{
           file: pd.file,
           line: pd.line,
           col: pd.col,
           probe_kind: pkind,
+          probe_id: pid,
           resolved_type: rty,
         })
         None => ()
       }
     }
 
-    // MANDATORY COVERAGE GUARD: probe_diagnostics_received MUST equal probes_instrumented!
-    if raw_results.length() != round_probes {
-      diags.push(diag_error(
-        "MBT2PION_PROBE_MISMATCH",
-        "<stage_a5>",
-        round + 1,
-        1,
-        "Stage A.5 coverage guard failed in round " + (round + 1).to_string() +
-        ": probes_instrumented=" + round_probes.to_string() +
-        " != probe_diagnostics_received=" + raw_results.length().to_string(),
-      ))
-      break
-    }
-
+    // Per-probe-ID 1-to-1 disposal with multi-round fixpoint retry for cascading probes:
+    // 1. Match by unique `probe_id` first (zero same-line collision); fall back to (file, line, col, kind)
+    //    only when a mock check_fn returns untagged probe names.
+    // 2. Defer reporting unresolved probes until fixpoint (`!any_changed && !newly_marked_safe`) so
+    //    cascading probes (e.g. `let part = n % 10; part.to_string()`) are retried and resolved once
+    //    upstream probes rewrite!
+    // 3. Zero silent fallback guessing on unresolved probes; map `00_init_order.pion` locations back
+    //    to their `// origin: <file>:<line>:<col>` comment.
     let probe_results = sort_probe_results(raw_results)
     let consumed : Array[Bool] = []
     let mut ci = 0
@@ -1867,10 +2319,9 @@ pub fn run_stage_a5_full(
       consumed.push(false)
       ci = ci + 1
     }
-    total_resolved = total_resolved + probe_results.length()
 
-    // Apply rewrites to each file, consuming each ProbeResult at most once in `(file, line, col)` order!
     let next_files : Array[GeneratedFile] = []
+    let round_unresolved : Array[(String, String, ProbeSite, Int)] = []
     let mut any_changed = false
     let mut newly_marked_safe = false
     for f in cur_files {
@@ -1886,35 +2337,130 @@ pub fn run_stage_a5_full(
         Some(m) => m
         None => Map()
       }
+      let flist = match failed_list_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let fmap = match failed_map_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
       let edits : Array[(Int, Int, String)] = []
       let remap_edits : Array[(Int, Int, String, String, String)] = []
+      let round_seen_per_item_kind : Map[String, Int] = Map()
+      let round_newly_used : Array[(String, Int)] = []
       for site in sites {
+        // Compute exact slot index in this `InitItem`'s `// origin-probes:` list (immune to multi-round edits!)
+        let mut site_slot = -1
+        let mut slot_key = ""
+        if f.rel_path == "00_init_order.pion" || f.rel_path == "00_init_order_test.pion" {
+          let (hdr_li, hdr_origin, hdr_probes) = find_init_origin_header(f.content, f.rel_path, site.line)
+          if hdr_li >= 0 && hdr_probes.length() > 0 {
+            slot_key = f.rel_path + "|" + hdr_origin + "|" + site.probe_kind
+            let rem_idx = match round_seen_per_item_kind.get(slot_key) {
+              Some(k) => k
+              None => 0
+            }
+            round_seen_per_item_kind[slot_key] = rem_idx + 1
+            let used_m = match init_used_slots.get(slot_key) {
+              Some(m) => m
+              None => Map()
+            }
+            let total_coords = parse_origin_probes_for_kind(hdr_probes, site.probe_kind).length()
+            let mut avail_seen = 0
+            let mut cand = 0
+            while cand < total_coords {
+              if !used_m.contains(cand) {
+                if avail_seen == rem_idx {
+                  site_slot = cand
+                  break
+                }
+                avail_seen = avail_seen + 1
+              }
+              cand = cand + 1
+            }
+          }
+        }
         let mut matched_idx = -1
+        // Pass 1: exact 1-to-1 match by globally unique `probe_id`
         let mut pi = 0
         while pi < probe_results.length() {
           let pr = probe_results[pi]
-          if !consumed[pi] &&
-          (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
-          pr.line == site.line && pr.probe_kind == site.probe_kind {
+          if !consumed[pi] && pr.probe_id.length() > 0 && pr.probe_id == site.probe_id && pr.probe_kind == site.probe_kind {
             matched_idx = pi
             break
           }
           pi = pi + 1
         }
+        // Pass 2: fallback for untagged diagnostics (e.g. unit-test mocks)
+        if matched_idx < 0 {
+          let mut best_col_dist = 1000000
+          let mut pi2 = 0
+          while pi2 < probe_results.length() {
+            let pr = probe_results[pi2]
+            if !consumed[pi2] && pr.probe_id.length() == 0 &&
+            (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
+            pr.line == site.line && pr.probe_kind == site.probe_kind {
+              let dist = if pr.col >= site.col { pr.col - site.col } else { site.col - pr.col }
+              if matched_idx < 0 || dist < best_col_dist {
+                matched_idx = pi2
+                best_col_dist = dist
+              }
+            }
+            pi2 = pi2 + 1
+          }
+        }
         if matched_idx >= 0 {
           consumed[matched_idx] = true
+          total_resolved = total_resolved + 1
           let matched_ty = probe_results[matched_idx].resolved_type
-          match rewrite_for_probe(site, matched_ty, recipes, diags, drift_ledger) {
+          if slot_key.length() > 0 && site_slot >= 0 {
+            round_newly_used.push((slot_key, site_slot))
+          }
+          let (disp_file, disp_line, disp_col) = resolve_init_order_origin_slot(f.content, f.rel_path, site.line, site.col, site.probe_kind, site_slot)
+          match rewrite_for_probe_with_fields(site, matched_ty, recipes, struct_val_fields, diags, drift_ledger) {
             Some(repl) => {
               edits.push((site.start_byte, site.end_byte, repl))
               remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
+              probe_dispositions.push(ProbeDisposition::{
+                probe_id: site.probe_id,
+                probe_kind: site.probe_kind,
+                file: disp_file,
+                line: disp_line,
+                col: disp_col,
+                resolved_type: matched_ty,
+                disposition: "rewritten",
+              })
             }
-            None =>
-            if !smap.contains(site.op_byte) {
-              smap[site.op_byte] = true
-              slist.push(site.op_byte)
-              newly_marked_safe = true
+            None => {
+              if !smap.contains(site.op_byte) {
+                smap[site.op_byte] = true
+                slist.push(site.op_byte)
+                newly_marked_safe = true
+              }
+              probe_dispositions.push(ProbeDisposition::{
+                probe_id: site.probe_id,
+                probe_kind: site.probe_kind,
+                file: disp_file,
+                line: disp_line,
+                col: disp_col,
+                resolved_type: matched_ty,
+                disposition: "kept_safe",
+              })
             }
+          }
+        } else {
+          // Defer unresolved probe reporting until fixpoint so cascading probes can resolve in the next round.
+          round_unresolved.push((f.rel_path, f.content, site, site_slot))
+        }
+      }
+      for nu in round_newly_used {
+        match init_used_slots.get(nu.0) {
+          Some(m) => m[nu.1] = true
+          None => {
+            let m : Map[Int, Bool] = Map()
+            m[nu.1] = true
+            init_used_slots[nu.0] = m
           }
         }
       }
@@ -1922,8 +2468,11 @@ pub fn run_stage_a5_full(
         any_changed = true
         let updated = apply_byte_edits(f.content, edits)
         let (nl, nm) = remap_safe_offsets(f.content, slist, remap_edits)
+        let (nfl, nfm) = remap_safe_offsets(f.content, flist, remap_edits)
         safe_list_by_file[f.rel_path] = nl
         safe_map_by_file[f.rel_path] = nm
+        failed_list_by_file[f.rel_path] = nfl
+        failed_map_by_file[f.rel_path] = nfm
         next_files.push(GeneratedFile::{
           rel_path: f.rel_path,
           content: updated,
@@ -1933,11 +2482,56 @@ pub fn run_stage_a5_full(
       } else {
         safe_list_by_file[f.rel_path] = slist
         safe_map_by_file[f.rel_path] = smap
+        failed_list_by_file[f.rel_path] = flist
+        failed_map_by_file[f.rel_path] = fmap
         next_files.push(f)
       }
     }
     cur_files = next_files
-    if !any_changed && !newly_marked_safe {
+    let will_continue = (any_changed || newly_marked_safe) && (round + 1 < max_rounds)
+    if !will_continue {
+      // Fixpoint reached: report every remaining unresolved probe fail-closed (zero silent fallback).
+      for entry in round_unresolved {
+        let (rel_p, fcontent, site, site_slot) = entry
+        let (rep_file, rep_line, rep_col) = resolve_init_order_origin_slot(fcontent, rel_p, site.line, site.col, site.probe_kind, site_slot)
+        diags.push(diag_error(
+          "MBT2PION_UNDISPOSED_PROBE_SITE",
+          rep_file,
+          rep_line,
+          rep_col,
+          "unresolved Stage A.5 probe `" + site.probe_id + "` (" + site.probe_kind + ") at " + rep_file + ":" + rep_line.to_string() + ":" + rep_col.to_string(),
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: site.probe_kind,
+          file: rep_file,
+          line: rep_line,
+          col: rep_col,
+          expr: site.lhs_expr,
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "probe " + site.probe_id + " received no type diagnostic from pionc",
+        })
+        probe_dispositions.push(ProbeDisposition::{
+          probe_id: site.probe_id,
+          probe_kind: site.probe_kind,
+          file: rep_file,
+          line: rep_line,
+          col: rep_col,
+          resolved_type: "",
+          disposition: "unresolved",
+        })
+        match failed_map_by_file.get(rel_p) {
+          Some(fmap) =>
+          if !fmap.contains(site.op_byte) {
+            fmap[site.op_byte] = true
+            match failed_list_by_file.get(rel_p) {
+              Some(flist) => flist.push(site.op_byte)
+              None => ()
+            }
+          }
+          None => ()
+        }
+      }
       break
     }
     round = round + 1
@@ -1957,13 +2551,20 @@ pub fn run_stage_a5_full(
       Some(m) => m
       None => Map()
     }
-    audit_undisposed_div_mod(f.rel_path, f.content, smap, 0, 0, diags, drift_ledger)
+    let fmap = match failed_map_by_file.get(f.rel_path) {
+      Some(m) => m
+      None => Map()
+    }
+    let audit_skip : Map[Int, Bool] = Map()
+    for k in smap.keys() { audit_skip[k] = true }
+    for k in fmap.keys() { audit_skip[k] = true }
+    audit_undisposed_div_mod(f.rel_path, f.content, audit_skip, 0, 0, diags, drift_ledger)
     // Astra Round 5 P0-1: independent raw-token audit covering `.length()`, `.to_string()`,
     // `.val`, and `[i]` without sharing `find_receiver_start` / `is_non_expr_receiver`!
     audit_undisposed_raw_tokens(
       f.rel_path,
       f.content,
-      smap,
+      audit_skip,
       0,
       0,
       declared_values,

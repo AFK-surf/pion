@@ -530,7 +530,14 @@ fn run_pionc_check_batch_status(
       let _ = fs_write(world, join_path(src_root, "__mbt_dep_imports.pion"), imp_sb.to_string())
     }
     for pair in batch {
-      let fpath = join_path(src_root, pair.0)
+      // `pionc check` skips `*_test.pion` files; alias them during Stage A.5/B probe runs
+      // so test files get full type-directed probing & rewriting, then map filenames back!
+      let check_rel = if pair.0.ends_with("_test.pion") {
+        pair.0.slice(0, pair.0.length() - 5) + "__mbt_probe.pion"
+      } else {
+        pair.0
+      }
+      let fpath = join_path(src_root, check_rel)
       let parent = dirname(fpath)
       if parent.length() > 0 {
         let _ = fs_mkdir_p(world, parent)
@@ -538,8 +545,8 @@ fn run_pionc_check_batch_status(
       let _ = fs_write(world, fpath, pair.1)
     }
     return match proc_exec_capture(world, [pionc_bin, "check", "--json", scratch_dir]) {
-      Ok(out) => (true, out)
-      Err(out) => (false, out)
+      Ok(out) => (true, m2p::str_replace_all(out, "__mbt_probe.pion", ".pion"))
+      Err(out) => (false, m2p::str_replace_all(out, "__mbt_probe.pion", ".pion"))
     }
   }
   let argv : Array[String] = [pionc_bin, "check", "--json"]
@@ -931,6 +938,8 @@ pub fn main(world : World) -> Int {
   let mut report_path = ""
   let mut drift_ledger_path = ""
   let mut run_report_path = ""
+  let mut closure_report_path = ""
+  let mut asset_manifest_path = ""
   let mut check_only = false
   let mut mode = "audit"
   let mut mbt2pion_commit = "dev"
@@ -976,6 +985,12 @@ pub fn main(world : World) -> Int {
       i = i + 2
     } else if a == "--run-report" && i + 1 < args.length() {
       run_report_path = args[i + 1]
+      i = i + 2
+    } else if a == "--closure-report" && i + 1 < args.length() {
+      closure_report_path = args[i + 1]
+      i = i + 2
+    } else if a == "--asset-manifest" && i + 1 < args.length() {
+      asset_manifest_path = args[i + 1]
       i = i + 2
     } else if a == "--check" {
       check_only = true
@@ -1163,6 +1178,17 @@ pub fn main(world : World) -> Int {
     }
   }
 
+  let clean_src_dir = if src_dir.ends_with("/") { src_dir.slice(0, src_dir.length() - 1) } else { src_dir }
+  let mut src_ls = -1
+  let mut src_i = 0
+  while src_i < clean_src_dir.length() {
+    if clean_src_dir.code_unit_at(src_i) == 47 { src_ls = src_i }
+    src_i = src_i + 1
+  }
+  let src_pkg_base = if src_ls >= 0 { clean_src_dir.slice(src_ls + 1, clean_src_dir.length()) } else { clean_src_dir }
+  if src_pkg_base.length() > 0 && !api_map.pkg_aliases.contains("__mbt_self_pkg__") {
+    api_map.pkg_aliases["__mbt_self_pkg__"] = src_pkg_base
+  }
   let opts = m2p::TranspileOptions::{
     target: target,
     mode: mode,
@@ -1199,12 +1225,39 @@ pub fn main(world : World) -> Int {
     raw_out
   }
 
-  let res = m2p::transpile_package(
+  // Wave M1.2 A.5: load ALL target enums & fn signatures from `--dep` packages via `pionc doc --json`
+  let dep_doc_jsons : Array[String] = []
+  let seen_doc_dep : Map[String, Bool] = Map()
+  for dep in check_deps {
+    if !seen_doc_dep.contains(dep.0) && fs_is_dir(world, dep.1) {
+      seen_doc_dep[dep.0] = true
+      match proc_exec_capture(world, [pionc_bin, "doc", "--json", dep.1]) {
+        Ok(doc_out) => dep_doc_jsons.push(doc_out)
+        Err(_) => ()
+      }
+    }
+  }
+
+  // Load optional `--asset-manifest` (Wave M1.2 A.6)
+  let mut asset_bypass_rules : Array[m2p::AssetBypassRule] = []
+  if asset_manifest_path.length() > 0 {
+    match fs_read(world, asset_manifest_path) {
+      Ok(txt) => asset_bypass_rules = m2p::parse_asset_manifest(txt, asset_manifest_path, pre_diags)
+      Err(e) => {
+        io_eprintln(world, "mbt2pion: cannot read --asset-manifest " + asset_manifest_path + ": " + e)
+        return 3
+      }
+    }
+  }
+
+  let res = m2p::transpile_package_ex(
     sources,
     api_map,
     recipes,
     overlays,
     mbti_files,
+    dep_doc_jsons,
+    asset_bypass_rules,
     opts,
     pre_diags,
     run_probes,
@@ -1262,13 +1315,15 @@ pub fn main(world : World) -> Int {
   let (report_in_out_rel, rep_probe_err) = rel_path_within(world, cwd, clean_out_dir, report_path)
   let (drift_in_out_rel, drf_probe_err) = rel_path_within(world, cwd, clean_out_dir, drift_ledger_path)
   let (run_in_out_rel, run_probe_err) = rel_path_within(world, cwd, clean_out_dir, run_report_path)
-  if rep_probe_err || drf_probe_err || run_probe_err {
+  let (closure_in_out_rel, cls_probe_err) = rel_path_within(world, cwd, clean_out_dir, closure_report_path)
+  if rep_probe_err || drf_probe_err || run_probe_err || cls_probe_err {
     fs_fatal_err = "failed volume path-equivalence probe for report path against --out"
   }
   let norm_out_dir = if clean_out_dir.length() > 0 { normalize_path(cwd, clean_out_dir) } else { "" }
   let norm_report_path = if report_path.length() > 0 { normalize_path(cwd, report_path) } else { "" }
   let norm_drift_path = if drift_ledger_path.length() > 0 { normalize_path(cwd, drift_ledger_path) } else { "" }
   let norm_run_path = if run_report_path.length() > 0 { normalize_path(cwd, run_report_path) } else { "" }
+  let norm_closure_path = if closure_report_path.length() > 0 { normalize_path(cwd, closure_report_path) } else { "" }
 
   let preserved_unmanaged_pions : Array[(String, String)] = []
   let unmanaged_dirs : Array[(String, Int)] = []
@@ -1288,9 +1343,37 @@ pub fn main(world : World) -> Int {
   let norm_report_lower = str_to_lower(norm_report_path)
   let norm_drift_lower = str_to_lower(norm_drift_path)
   let norm_run_lower = str_to_lower(norm_run_path)
+  let norm_closure_lower = str_to_lower(norm_closure_path)
   let mut report_path_bad = false
   let mut drift_path_bad = false
   let mut run_path_bad = false
+  let mut closure_path_bad = false
+  let report_pairs : Array[(Int, String, String, String, String, Int, String, String, String, String)] = [
+    (0, "--report", report_path, norm_report_path, norm_report_lower, 3, "--closure-report", closure_report_path, norm_closure_path, norm_closure_lower),
+    (1, "--drift-ledger", drift_ledger_path, norm_drift_path, norm_drift_lower, 3, "--closure-report", closure_report_path, norm_closure_path, norm_closure_lower),
+    (2, "--run-report", run_report_path, norm_run_path, norm_run_lower, 3, "--closure-report", closure_report_path, norm_closure_path, norm_closure_lower),
+  ]
+  for rp in report_pairs {
+    if rp.4.length() > 0 && rp.9.length() > 0 {
+      let vc = if rp.4 == rp.9 { 1 } else { vol_same_dir_entry(world, rp.3, rp.8) }
+      if vc == 1 {
+        final_diags.push(m2p::diag_error("MBT2PION_REPORT_PATH_COLLISION", rp.2, 1, 1, rp.1 + " and " + rp.6 + " point to the same (or colliding) path: " + rp.2 + " vs " + rp.7))
+        final_blockers = final_blockers + 1
+        if rp.0 == 0 { report_path_bad = true }
+        if rp.0 == 1 { drift_path_bad = true }
+        if rp.0 == 2 { run_path_bad = true }
+        closure_path_bad = true
+      } else if vc < 0 {
+        if rp.0 == 0 { report_path_bad = true }
+        if rp.0 == 1 { drift_path_bad = true }
+        if rp.0 == 2 { run_path_bad = true }
+        closure_path_bad = true
+        if fs_fatal_err.length() == 0 {
+          fs_fatal_err = "failed volume collision probe between " + rp.1 + " and " + rp.6
+        }
+      }
+    }
+  }
   if norm_report_lower.length() > 0 && norm_drift_lower.length() > 0 {
     let vc = if norm_report_lower == norm_drift_lower { 1 } else { vol_same_dir_entry(world, norm_report_path, norm_drift_path) }
     if vc == 1 {
@@ -1340,6 +1423,7 @@ pub fn main(world : World) -> Int {
     (0, "--report", norm_report_path, report_in_out_rel),
     (1, "--drift-ledger", norm_drift_path, drift_in_out_rel),
     (2, "--run-report", norm_run_path, run_in_out_rel),
+    (3, "--closure-report", norm_closure_path, closure_in_out_rel),
   ]
   for rc in report_checks {
     let rkind = rc.0
@@ -1397,6 +1481,7 @@ pub fn main(world : World) -> Int {
       if rkind == 0 { report_path_bad = true }
       if rkind == 1 { drift_path_bad = true }
       if rkind == 2 { run_path_bad = true }
+      if rkind == 3 { closure_path_bad = true }
     }
   }
 
@@ -1481,6 +1566,7 @@ pub fn main(world : World) -> Int {
   let report_rel_str = match report_in_out_rel { Some(r) => r, None => "" }
   let drift_rel_str = match drift_in_out_rel { Some(r) => r, None => "" }
   let run_rel_str = match run_in_out_rel { Some(r) => r, None => "" }
+  let closure_rel_str = match closure_in_out_rel { Some(r) => r, None => "" }
 
   if (mode == "publish" || check_only) && final_blockers == 0 && fs_fatal_err.length() == 0 {
     let parent_of_out = dirname(clean_out_dir)
@@ -1581,6 +1667,15 @@ pub fn main(world : World) -> Int {
             }
             if rc_run == 1 { skip_old_report = true }
           }
+          if !skip_old_report && closure_rel_str.length() > 0 {
+            let rc_cls = if rel == closure_rel_str { 1 } else { vol_same_dir_entry(world, norm_src, norm_closure_path) }
+            if rc_cls < 0 {
+              io_eprintln(world, "mbt2pion: failed volume directory-entry probe for " + src)
+              stage_ok = false
+              break
+            }
+            if rc_cls == 1 { skip_old_report = true }
+          }
           if skip_old_report {
             continue
           }
@@ -1654,6 +1749,11 @@ pub fn main(world : World) -> Int {
     diagnostics: final_diags,
     drift_ledger: res.drift_ledger,
     dispositions: res.dispositions,
+    probe_dispositions: res.probe_dispositions,
+    excluded_manifest_assets: res.excluded_manifest_assets,
+    excluded_by_target: res.excluded_by_target,
+    emitted_sources: res.emitted_sources,
+    synthesized_files: res.synthesized_files,
     pionc_diag_histogram: res.pionc_diag_histogram,
     probe_rounds: res.probe_rounds,
     probes_instrumented: res.probes_instrumented,
@@ -1664,12 +1764,29 @@ pub fn main(world : World) -> Int {
 
   let report_json = if report_path.length() > 0 { m2p::render_migration_report_json(final_res, opts) } else { "" }
   let drift_json = if drift_ledger_path.length() > 0 { m2p::render_drift_ledger_json(final_res, opts) } else { "" }
+  let closure_json = if closure_report_path.length() > 0 {
+    let closure_sources : Array[m2p::SourceFile] = []
+    let emitted_set : Map[String, Bool] = Map()
+    for es in final_res.emitted_sources {
+      emitted_set[es.path] = true
+    }
+    for sf in sources {
+      if emitted_set.contains(sf.rel_path) {
+        closure_sources.push(sf)
+      }
+    }
+    m2p::render_closure_report_json(closure_sources)
+  } else {
+    ""
+  }
   let report_is_in_out = report_rel_str.length() > 0
   let drift_is_in_out = drift_rel_str.length() > 0
   let run_is_in_out = run_rel_str.length() > 0
+  let closure_is_in_out = closure_rel_str.length() > 0
   let mut report_written = false
   let mut drift_written = false
   let mut run_written = false
+  let mut closure_written = false
 
   let mut exit_code = 0
 
@@ -1757,12 +1874,13 @@ pub fn main(world : World) -> Int {
       }
 
       // Phase 1a: Write full real contents of ALL external reports to short sibling temp files
-      let ext_staged : Array[(String, String, Int)] = [] // (tmp_path, dst_path, kind: 0=rep, 1=drf, 2=run)
+      let ext_staged : Array[(String, String, Int)] = [] // (tmp_path, dst_path, kind: 0=rep, 1=drf, 2=run, 3=cls)
       let mut ext_io_ok = true
       let ext_specs : Array[(Int, String, Bool, Bool, String, String)] = [
         (0, report_path, report_is_in_out, report_path_bad, report_json, "rep"),
         (1, drift_ledger_path, drift_is_in_out, drift_path_bad, drift_json, "drf"),
         (2, run_report_path, run_is_in_out, run_path_bad, stage_run_json, "run"),
+        (3, closure_report_path, closure_is_in_out, closure_path_bad, closure_json, "cls"),
       ]
       for sp in ext_specs {
         let skind = sp.0
@@ -1821,6 +1939,15 @@ pub fn main(world : World) -> Int {
             stage_ok = false
           }
         }
+        if stage_ok && closure_is_in_out && !closure_path_bad {
+          let dst = join_path(stage_dir, closure_rel_str)
+          if write_file_atomic(world, dst, closure_json, uniq_tag + "sc") {
+            closure_written = true
+          } else {
+            io_eprintln(world, "mbt2pion: failed staging closure report " + dst)
+            stage_ok = false
+          }
+        }
         if stage_ok {
           let bottom_up = sort_dirs_bottom_up(unmanaged_dirs)
           for dm in bottom_up {
@@ -1847,6 +1974,7 @@ pub fn main(world : World) -> Int {
         report_written = true
         drift_written = true
         run_written = true
+        closure_written = true
         exit_code = 3
       } else {
         // Phase 2: Commit ALL external reports via atomic `fs_rename` BEFORE swapping `--out`!
@@ -1861,6 +1989,7 @@ pub fn main(world : World) -> Int {
               if es.2 == 0 { report_written = true }
               if es.2 == 1 { drift_written = true }
               if es.2 == 2 { run_written = true }
+              if es.2 == 3 { closure_written = true }
             }
           } else {
             let _ = fs_remove(world, es.0)
@@ -1874,6 +2003,7 @@ pub fn main(world : World) -> Int {
           report_written = true
           drift_written = true
           run_written = true
+          closure_written = true
           exit_code = 3
         } else if out_existed_as_dir {
           // ABSOLUTE FINAL STEP: Single-syscall atomic swap! Zero fallible report I/O after this!
@@ -1952,6 +2082,13 @@ pub fn main(world : World) -> Int {
       uniq_tag + "-run",
     ) {
       io_eprintln(world, "mbt2pion: failed writing run report: " + run_report_path)
+      if exit_code == 0 { exit_code = 3 }
+    }
+  }
+
+  if closure_report_path.length() > 0 && !closure_written && !closure_path_bad && !(block_in_out_reports && (closure_is_in_out || cls_probe_err)) {
+    if !write_file_atomic(world, closure_report_path, closure_json, uniq_tag + "-cls") {
+      io_eprintln(world, "mbt2pion: failed writing closure report: " + closure_report_path)
       if exit_code == 0 { exit_code = 3 }
     }
   }

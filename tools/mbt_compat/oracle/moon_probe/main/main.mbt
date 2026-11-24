@@ -600,6 +600,33 @@ fn case_arr_remove_oob() -> Unit {
 }
 
 ///|
+fn case_double_compare_nan() -> Unit {
+  let nan = 0.0 / 0.0
+  let ninf = -1.0 / 0.0
+  let c1 = nan.compare(1.0)
+  let c2 = (1.0).compare(nan)
+  let c3 = nan.compare(ninf)
+  let c4 = nan.compare(nan)
+  let c5 = (-0.0).compare(0.0)
+  let xs : Array[Double] = [3.0, nan, 1.0, -0.0, 2.0, ninf]
+  xs.sort_by((a, b) => a.compare(b))
+  let sb = StringBuilder::new()
+  for i = 0; i < xs.length(); i = i + 1 {
+    if i > 0 { sb.write_string(",") }
+    sb.write_string(xs[i].to_string())
+  }
+  let sorted_s = sb.to_string()
+  trace("cmp", "\{c1},\{c2},\{c3},\{c4},\{c5}")
+  trace("sort", sorted_s)
+  check("double.cmp_nan_1", c1 == 0)
+  check("double.cmp_1_nan", c2 == 0)
+  check("double.cmp_nan_ninf", c3 == 0)
+  check("double.cmp_nan_nan", c4 == 0)
+  check("double.cmp_neg0_0", c5 == 0)
+  check("double.sort_nan", sorted_s.length() > 0)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -618,6 +645,7 @@ fn main {
     "map.order" => case_map_order()
     "map.enum_keys" => case_map_enum_keys()
     "double.golden" => case_double_golden()
+    "double.compare_nan" => case_double_compare_nan()
     "double.random" => case_double_random()
     "div.nonzero" => case_div_nonzero()
     "collections" => case_collections()

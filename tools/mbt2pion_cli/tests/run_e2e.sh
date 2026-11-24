@@ -1625,6 +1625,447 @@ disps10n2 = [(d["decl"], d["disposition"]) for d in json.load(open(rep10n2))["di
 assert disps10n2 == [("fn:first", "unsupported")], f"10n-2 unexpected dispositions: {disps10n2}"
 
 print("[e2e] PASS: Final Astra P1 suite (10n-2: #borrow(s) String extern \"C\" fn -> rc=1 MBT2PION_UNSUPPORTED_FFI_SIGNATURE + unsupported)")
+
+# 10o. Quadrant 2: CLI negative tests for P0-5 (5 malformed asset manifests) & P0-6 (--closure-report path collision)
+s10o = os.path.join(root, "s10o")
+o10o = os.path.join(root, "o10o")
+os.makedirs(s10o, exist_ok=True)
+with open(os.path.join(s10o, "ok.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10o, "data.mbt"), "w") as f:
+    f.write("pub let d : Array[Int] = [1, 2]\n")
+import hashlib
+d_sha = hashlib.sha256(open(os.path.join(s10o, "data.mbt"), "rb").read()).hexdigest()
+bad_manifests = [
+    ("missing_sha", [{"path": "data.mbt", "sha256": "", "allowed_decls": ["d"]}]),
+    ("empty_decls", [{"path": "data.mbt", "sha256": d_sha, "allowed_decls": []}]),
+    ("abs_path", [{"path": "/etc/passwd", "sha256": d_sha, "allowed_decls": ["d"]}]),
+    ("parent_ref", [{"path": "../data.mbt", "sha256": d_sha, "allowed_decls": ["d"]}]),
+    ("bad_ident", [{"path": "data.mbt", "sha256": d_sha, "allowed_decls": ["9bad"]}]),
+]
+for mtag, mlist in bad_manifests:
+    mf = os.path.join(root, f"bad_manifest_{mtag}.json")
+    with open(mf, "w") as f:
+        json.dump({"assets": mlist}, f)
+    rm = run_cli(["--src", s10o, "--out", o10o, "--target", "native", "--mode", "publish",
+                  "--asset-manifest", mf, "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert rm.returncode == 1, f"10o {mtag} must fail (rc=1), got {rm.returncode}"
+    assert "MBT2PION_ASSET_MANIFEST_INVALID" in (rm.stdout + rm.stderr), f"10o {mtag} missing MBT2PION_ASSET_MANIFEST_INVALID"
+
+# P0-6: --closure-report inside --out must fail before publish!
+r_cc = run_cli(["--src", s10o, "--out", o10o, "--target", "native", "--mode", "publish",
+                "--closure-report", os.path.join(o10o, "ok.pion"), "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r_cc.returncode == 1, f"10o --closure-report inside --out must fail (rc=1), got {r_cc.returncode}"
+assert "--closure-report" in (r_cc.stdout + r_cc.stderr), f"10o missing --closure-report error: {r_cc.stdout} {r_cc.stderr}"
+
+print("[e2e] PASS: Quadrant 2 P0-5 & P0-6 CLI negative tests (5 malformed manifests + --closure-report collision)")
+
+# 10p. Quadrant 2 Item 10: --with-tests end-to-end (`*_wbtest.mbt` -> `*_wb_test.pion`, `*_test.mbt` -> `*_test.pion`,
+#      isolation from `00_init_order.pion`, assertions + `raise` stripping -> `pionc check` + `pionc test` PASS,
+#      and mutated assertion FAILS `pionc test`!)
+s10p = os.path.join(root, "s10p_pkg")
+o10p = os.path.join(root, "o10p")
+os.makedirs(s10p, exist_ok=True)
+with open(os.path.join(s10p, "math.mbt"), "w") as f:
+    f.write("pub let base_val = 40\npub fn add2(x : Int) -> Int { x + 2 }\nfn internal_mul(x : Int) -> Int { x * 3 }\n")
+with open(os.path.join(s10p, "math_wbtest.mbt"), "w") as f:
+    f.write(
+        'let wb_k = 7\n'
+        'fn check_pair(a : Int, b : Int) raise {\n'
+        '  assert_eq(a, b)\n'
+        '  assert_not_eq(a, b + 1)\n'
+        '}\n'
+        'test {\n'
+        '  check_pair(internal_mul(wb_k), 21)\n'
+        '  assert_true(add2(base_val) == 42)\n'
+        '  assert_false(add2(base_val) == 0)\n'
+        '  inspect(add2(base_val), content="42")\n'
+        '}\n'
+    )
+with open(os.path.join(s10p, "math_test.mbt"), "w") as f:
+    f.write(
+        'test "blackbox_add2" {\n'
+        '  assert_eq(@s10p_pkg.add2(@s10p_pkg.base_val), 42)\n'
+        '  inspect(@s10p_pkg.add2(10), content="12")\n'
+        '}\n'
+    )
+r10p = run_cli(["--src", s10p, "--out", o10p, "--target", "native", "--mode", "publish", "--with-tests",
+                "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10p.returncode == 0, f"10p --with-tests publish failed: {r10p.returncode}\n{r10p.stdout}\n{r10p.stderr}"
+assert os.path.exists(os.path.join(o10p, "math_wbtest_test.pion")), "10p missing math_wbtest_test.pion"
+assert os.path.exists(os.path.join(o10p, "math_test.pion")), "10p missing math_test.pion"
+assert os.path.exists(os.path.join(o10p, "00_init_order.pion")), "10p missing 00_init_order.pion"
+assert os.path.exists(os.path.join(o10p, "00_init_order_test.pion")), "10p missing 00_init_order_test.pion"
+prod_init_10p = open(os.path.join(o10p, "00_init_order.pion")).read()
+assert "wb_k" not in prod_init_10p, f"10p test let leaked into production 00_init_order.pion:\n{prod_init_10p}"
+
+pkg10p = os.path.join(root, "pkg10p")
+os.makedirs(os.path.join(pkg10p, "src"), exist_ok=True)
+for fn in sorted(os.listdir(o10p)):
+    if fn.endswith(".pion"):
+        shutil.copyfile(os.path.join(o10p, fn), os.path.join(pkg10p, "src", fn))
+with open(os.path.join(pkg10p, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10p_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10p_chk = subprocess.run([pionc, "check", pkg10p], capture_output=True, text=True)
+assert r10p_chk.returncode == 0, f"10p pionc check failed:\n{r10p_chk.stdout}\n{r10p_chk.stderr}"
+r10p_tst = subprocess.run([pionc, "test", pkg10p], capture_output=True, text=True)
+assert r10p_tst.returncode == 0, f"10p pionc test failed:\n{r10p_tst.stdout}\n{r10p_tst.stderr}"
+assert "2 passed; 0 failed" in r10p_tst.stdout, f"10p expected 2 passed tests, got:\n{r10p_tst.stdout}"
+
+# Mutate one assertion and verify `pionc test` genuinely FAILS!
+mut_path = os.path.join(pkg10p, "src", "math_test.pion")
+mut_orig = open(mut_path).read()
+assert "42" in mut_orig, f"10p expected 42 in math_test.pion:\n{mut_orig}"
+with open(mut_path, "w") as f:
+    f.write(mut_orig.replace("42", "999", 1))
+r10p_fail = subprocess.run([pionc, "test", pkg10p], capture_output=True, text=True)
+assert r10p_fail.returncode != 0, f"10p mutated assertion MUST fail pionc test!\n{r10p_fail.stdout}"
+
+print("[e2e] PASS: Quadrant 2 --with-tests E2E (math_wbtest_test.pion + math_test.pion + isolated init -> pionc check & test 2/2 PASS, mutant FAIL)")
+
+# 10q. Astra Final 5 P0 + 2 P1 E2E regressions:
+# 10q-1 (P0-1): `f_wb_test.mbt` (pass) + `f_wbtest.mbt` (fail) must NOT collide!
+s10q1 = os.path.join(root, "s10q1")
+o10q1 = os.path.join(root, "o10q1")
+os.makedirs(s10q1, exist_ok=True)
+with open(os.path.join(s10q1, "lib.mbt"), "w") as f:
+    f.write("pub fn id(x : Int) -> Int { x }\n")
+with open(os.path.join(s10q1, "f_wb_test.mbt"), "w") as f:
+    f.write('test "bb_pass" { assert_true(true) }\n')
+with open(os.path.join(s10q1, "f_wbtest.mbt"), "w") as f:
+    f.write('test "wb_fail" { assert_true(false) }\n')
+r10q1 = run_cli(["--src", s10q1, "--out", o10q1, "--target", "native", "--mode", "publish", "--with-tests",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q1.returncode == 0, f"10q-1 publish failed: {r10q1.returncode}\n{r10q1.stdout}\n{r10q1.stderr}"
+assert os.path.exists(os.path.join(o10q1, "f_wb_test.pion")), "10q-1 missing f_wb_test.pion"
+assert os.path.exists(os.path.join(o10q1, "f_wbtest_test.pion")), "10q-1 missing f_wbtest_test.pion"
+pkg10q1 = os.path.join(root, "pkg10q1")
+os.makedirs(os.path.join(pkg10q1, "src"), exist_ok=True)
+for fn in os.listdir(o10q1):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q1, fn), os.path.join(pkg10q1, "src", fn))
+with open(os.path.join(pkg10q1, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q1"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q1_t = subprocess.run([pionc, "test", pkg10q1], capture_output=True, text=True)
+assert r10q1_t.returncode != 0 and "1 passed; 1 failed" in r10q1_t.stdout, f"10q-1 expected 1 passed + 1 failed, got:\n{r10q1_t.stdout}\n{r10q1_t.stderr}"
+
+# 10q-2 (P0-2): black-box `bb_test.mbt` defining no-op `fn assert_true` MUST NOT shadow white-box `wb_wbtest.mbt`!
+s10q2 = os.path.join(root, "s10q2")
+o10q2 = os.path.join(root, "o10q2")
+os.makedirs(s10q2, exist_ok=True)
+with open(os.path.join(s10q2, "lib.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10q2, "bb_test.mbt"), "w") as f:
+    f.write('fn assert_true(_c : Bool) -> Unit { () }\ntest "bb_noop_pass" { assert_true(false) }\n')
+with open(os.path.join(s10q2, "wb_wbtest.mbt"), "w") as f:
+    f.write('test "wb_real_fail" { assert_true(false) }\n')
+r10q2 = run_cli(["--src", s10q2, "--out", o10q2, "--target", "native", "--mode", "publish", "--with-tests",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2.returncode == 0, f"10q-2 publish failed: {r10q2.returncode}\n{r10q2.stdout}\n{r10q2.stderr}"
+pkg10q2 = os.path.join(root, "pkg10q2")
+os.makedirs(os.path.join(pkg10q2, "src"), exist_ok=True)
+for fn in os.listdir(o10q2):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2, fn), os.path.join(pkg10q2, "src", fn))
+with open(os.path.join(pkg10q2, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2_t = subprocess.run([pionc, "test", pkg10q2], capture_output=True, text=True)
+assert r10q2_t.returncode != 0 and "1 passed; 1 failed" in r10q2_t.stdout, f"10q-2 expected bb PASS + wb FAIL, got:\n{r10q2_t.stdout}\n{r10q2_t.stderr}"
+
+# 10q-2b (Astra Follow-up P0): black-box `a_test.mbt` + `b_test.mbt` share black-box module symbols,
+# while staying isolated from white-box `c_wbtest.mbt`!
+s10q2b = os.path.join(root, "s10q2b")
+o10q2b = os.path.join(root, "o10q2b")
+os.makedirs(s10q2b, exist_ok=True)
+with open(os.path.join(s10q2b, "lib.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10q2b, "a_test.mbt"), "w") as f:
+    f.write('fn assert_true(_v : Bool) -> Unit { abort("custom") }\n')
+with open(os.path.join(s10q2b, "b_test.mbt"), "w") as f:
+    f.write('test "bb_calls_a_assert" { assert_true(true) }\n')
+with open(os.path.join(s10q2b, "c_wbtest.mbt"), "w") as f:
+    f.write('test "wb_calls_builtin_assert" { assert_true(false) }\n')
+r10q2b = run_cli(["--src", s10q2b, "--out", o10q2b, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2b.returncode == 0, f"10q-2b publish failed: {r10q2b.returncode}\n{r10q2b.stdout}\n{r10q2b.stderr}"
+pkg10q2b = os.path.join(root, "pkg10q2b")
+os.makedirs(os.path.join(pkg10q2b, "src"), exist_ok=True)
+for fn in os.listdir(o10q2b):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2b, fn), os.path.join(pkg10q2b, "src", fn))
+with open(os.path.join(pkg10q2b, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2b"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2b_t = subprocess.run([pionc, "test", pkg10q2b], capture_output=True, text=True)
+assert r10q2b_t.returncode != 0 and "0 passed; 2 failed" in r10q2b_t.stdout, f"10q-2b expected 0 passed + 2 failed, got:\n{r10q2b_t.stdout}\n{r10q2b_t.stderr}"
+
+# 10q-6 (Astra Follow-up P1-3): multiline top-level `let` in `v.mbt` reports distinct ProbeDisposition lines (2 & 3) AND runs via `pionc run`!
+s10q6 = os.path.join(root, "s10q6")
+o10q6 = os.path.join(root, "o10q6")
+rep10q6 = os.path.join(root, "rep10q6.json")
+os.makedirs(s10q6, exist_ok=True)
+with open(os.path.join(s10q6, "v.mbt"), "w") as f:
+    f.write('pub let n : Int =\n  "x".length() +\n  "ab".length()\n')
+r10q6 = run_cli(["--src", s10q6, "--out", o10q6, "--target", "native", "--mode", "publish",
+                 "--report", rep10q6, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q6.returncode == 0, f"10q-6 publish failed: {r10q6.returncode}\n{r10q6.stdout}\n{r10q6.stderr}"
+rep6_j = json.load(open(rep10q6))
+pds6 = [(p["file"], p["line"], p["col"]) for p in rep6_j["probe_dispositions"] if p["disposition"] == "rewritten"]
+assert ("v.mbt", 2, 7) in pds6 and ("v.mbt", 3, 8) in pds6, f"10q-6 expected v.mbt:2:7 and v.mbt:3:8, got {pds6}"
+pkg10q6 = os.path.join(root, "pkg10q6")
+os.makedirs(os.path.join(pkg10q6, "src"), exist_ok=True)
+for fn in os.listdir(o10q6):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q6, fn), os.path.join(pkg10q6, "src", fn))
+with open(os.path.join(pkg10q6, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q6"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+with open(os.path.join(pkg10q6, "src", "main.pion"), "w") as f:
+    f.write('pub fn main(_w : World) -> Int { if n != 3 { panic("bad") }; 0 }\n')
+r10q6_run = subprocess.run([pionc, "run", pkg10q6], capture_output=True, text=True)
+assert r10q6_run.returncode == 0, f"10q-6 pionc run failed: {r10q6_run.stderr}"
+
+# 10q-3b (Opus P2-1): assertion args evaluate in MoonBit declaration order (positional -> msg= -> loc=),
+# AND 10q-2c (Opus P2-2): black-box module preserves `#callsite(autofill(loc))` without leaking to white-box!
+s10q7 = os.path.join(root, "s10q7")
+o10q7 = os.path.join(root, "o10q7")
+os.makedirs(s10q7, exist_ok=True)
+with open(os.path.join(s10q7, "lib.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10q7, "af_test.mbt"), "w") as f:
+    f.write(
+        '#callsite(autofill(loc))\n'
+        'fn chk(x : Int, loc~ : SourceLoc) -> String {\n'
+        '  let _ = x\n'
+        '  loc.to_string()\n'
+        '}\n'
+        'test "bb_autofill_and_decl_order" {\n'
+        '  let mut log = ""\n'
+        '  assert_eq(msg={ log = log + "1"; "m" }, { log = log + "2"; 10 }, { log = log + "2"; 10 })\n'
+        '  assert_eq(log, "221")\n'
+        '  let got = chk(6)\n'
+        '  assert_true(got.starts_with("af_test.mbt:"))\n'
+        '}\n'
+    )
+r10q7 = run_cli(["--src", s10q7, "--out", o10q7, "--target", "native", "--mode", "publish", "--with-tests",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q7.returncode == 0, f"10q-7 publish failed: {r10q7.returncode}\n{r10q7.stdout}\n{r10q7.stderr}"
+pkg10q7 = os.path.join(root, "pkg10q7")
+os.makedirs(os.path.join(pkg10q7, "src"), exist_ok=True)
+for fn in os.listdir(o10q7):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q7, fn), os.path.join(pkg10q7, "src", fn))
+with open(os.path.join(pkg10q7, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q7"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q7_t = subprocess.run([pionc, "test", pkg10q7], capture_output=True, text=True)
+assert r10q7_t.returncode == 0 and "1 passed; 0 failed" in r10q7_t.stdout, f"10q-7 expected 1 passed, got:\n{r10q7_t.stdout}\n{r10q7_t.stderr}"
+
+# 10q-2d (Astra Final P0): black-box `b_test.mbt` sees production `pub fn assert_true`,
+# while production private `fn assert_false` is NOT visible to black-box (falls through to builtin)!
+s10q2d = os.path.join(root, "s10q2d")
+o10q2d = os.path.join(root, "o10q2d")
+os.makedirs(s10q2d, exist_ok=True)
+with open(os.path.join(s10q2d, "main.mbt"), "w") as f:
+    f.write(
+        'pub fn assert_true(_v : Bool) -> Unit { abort("in library") }\n'
+        'fn assert_false(_v : Bool) -> Unit { () }\n'
+    )
+with open(os.path.join(s10q2d, "b_test.mbt"), "w") as f:
+    f.write(
+        'test "bb_sees_prod_pub" { assert_true(true) }\n'
+        'test "bb_ignores_prod_priv" { assert_false(true) }\n'
+    )
+r10q2d = run_cli(["--src", s10q2d, "--out", o10q2d, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2d.returncode == 0, f"10q-2d publish failed: {r10q2d.returncode}\n{r10q2d.stdout}\n{r10q2d.stderr}"
+btest_txt = open(os.path.join(o10q2d, "b_test.pion")).read()
+assert "mbt_compat::assert_true" not in btest_txt, f"10q-2d prod pub assert_true must not be rewritten:\n{btest_txt}"
+assert "mbt_compat::assert_false" in btest_txt, f"10q-2d prod priv assert_false must fall through to builtin:\n{btest_txt}"
+pkg10q2d = os.path.join(root, "pkg10q2d")
+os.makedirs(os.path.join(pkg10q2d, "src"), exist_ok=True)
+for fn in os.listdir(o10q2d):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2d, fn), os.path.join(pkg10q2d, "src", fn))
+with open(os.path.join(pkg10q2d, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2d"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2d_t = subprocess.run([pionc, "test", pkg10q2d], capture_output=True, text=True)
+assert r10q2d_t.returncode != 0 and "0 passed; 2 failed" in r10q2d_t.stdout, f"10q-2d expected 0 passed + 2 failed, got:\n{r10q2d_t.stdout}\n{r10q2d_t.stderr}"
+
+# 10q-6b (Astra Final P1): compact single-line `pub let n:Int="x".length() + "ab".length()` reports exact 1:19 and 1:35!
+s10q6b = os.path.join(root, "s10q6b")
+o10q6b = os.path.join(root, "o10q6b")
+rep10q6b = os.path.join(root, "rep10q6b.json")
+os.makedirs(s10q6b, exist_ok=True)
+with open(os.path.join(s10q6b, "vs.mbt"), "w") as f:
+    f.write('pub let n:Int="x".length() + "ab".length()\n')
+r10q6b = run_cli(["--src", s10q6b, "--out", o10q6b, "--target", "native", "--mode", "publish",
+                  "--report", rep10q6b, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q6b.returncode == 0, f"10q-6b publish failed: {r10q6b.returncode}\n{r10q6b.stdout}\n{r10q6b.stderr}"
+rep6b_j = json.load(open(rep10q6b))
+pds6b = [(p["file"], p["line"], p["col"]) for p in rep6b_j["probe_dispositions"] if p["disposition"] == "rewritten"]
+assert ("vs.mbt", 1, 19) in pds6b and ("vs.mbt", 1, 35) in pds6b, f"10q-6b expected vs.mbt:1:19 and vs.mbt:1:35, got {pds6b}"
+
+# 10q-2e (Astra Structural P0): `pub enum Mode { Ready }\nfn assert_true` MUST NOT leak pub to `assert_true`,
+# AND fn-body local `let assert_true = ...` MUST NOT pollute package-level symtab!
+s10q2e = os.path.join(root, "s10q2e")
+o10q2e = os.path.join(root, "o10q2e")
+os.makedirs(s10q2e, exist_ok=True)
+with open(os.path.join(s10q2e, "main.mbt"), "w") as f:
+    f.write(
+        'pub enum Mode { Ready }\n'
+        'fn assert_true(_v : Bool) -> Unit { () }\n'
+        'pub fn helper() -> Int {\n'
+        '  let assert_false = 1\n'
+        '  assert_false\n'
+        '}\n'
+    )
+with open(os.path.join(s10q2e, "b_test.mbt"), "w") as f:
+    f.write('test "bb_enum_no_pub_leak" { assert_true(false) }\n')
+with open(os.path.join(s10q2e, "w_wbtest.mbt"), "w") as f:
+    f.write('test "wb_local_let_no_symtab_leak" { assert_false(true) }\n')
+r10q2e = run_cli(["--src", s10q2e, "--out", o10q2e, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2e.returncode == 0, f"10q-2e publish failed: {r10q2e.returncode}\n{r10q2e.stdout}\n{r10q2e.stderr}"
+assert "mbt_compat::assert_true" in open(os.path.join(o10q2e, "b_test.pion")).read(), "10q-2e b_test.pion must call builtin assert_true"
+assert "mbt_compat::assert_false" in open(os.path.join(o10q2e, "w_wbtest_test.pion")).read(), "10q-2e w_wbtest_test.pion must call builtin assert_false"
+pkg10q2e = os.path.join(root, "pkg10q2e")
+os.makedirs(os.path.join(pkg10q2e, "src"), exist_ok=True)
+for fn in os.listdir(o10q2e):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2e, fn), os.path.join(pkg10q2e, "src", fn))
+with open(os.path.join(pkg10q2e, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2e"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2e_t = subprocess.run([pionc, "test", pkg10q2e], capture_output=True, text=True)
+assert r10q2e_t.returncode != 0 and "0 passed; 2 failed" in r10q2e_t.stdout, f"10q-2e expected 0 passed + 2 failed, got:\n{r10q2e_t.stdout}\n{r10q2e_t.stderr}"
+
+# 10q-6c (Astra Structural P1): single-line `pub let n:Int={ let _v : Int? = Some(1); "ab".length() }`
+# reports exact source column 1:47 despite `Int?` -> `Option[Int]` Stage A expansion!
+s10q6c = os.path.join(root, "s10q6c")
+o10q6c = os.path.join(root, "o10q6c")
+rep10q6c = os.path.join(root, "rep10q6c.json")
+os.makedirs(s10q6c, exist_ok=True)
+with open(os.path.join(s10q6c, "v.mbt"), "w") as f:
+    f.write('pub let n:Int={ let _v : Int? = Some(1); "ab".length() }\n')
+r10q6c = run_cli(["--src", s10q6c, "--out", o10q6c, "--target", "native", "--mode", "publish",
+                  "--report", rep10q6c, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q6c.returncode == 0, f"10q-6c publish failed: {r10q6c.returncode}\n{r10q6c.stdout}\n{r10q6c.stderr}"
+rep6c_j = json.load(open(rep10q6c))
+pds6c = [(p["file"], p["line"], p["col"]) for p in rep6c_j["probe_dispositions"] if p["disposition"] == "rewritten"]
+assert ("v.mbt", 1, 47) in pds6c, f"10q-6c expected v.mbt:1:47, got {pds6c}"
+
+# 10q-6d (Astra Final P1): 1, 2, 3 consecutive interpolations in top-level `let` report exact cols
+# [28], [28, 42], [28, 42, 56] AND Pion native outputs `a2b2b2`!
+for k_cnt, body_lit, exp_cols in [
+    (1, '"a\\{s.length()}"', [28]),
+    (2, '"a\\{s.length()}b\\{s.length()}"', [28, 42]),
+    (3, '"a\\{s.length()}b\\{s.length()}b\\{s.length()}"', [28, 42, 56]),
+]:
+    s10q6d = os.path.join(root, f"s10q6d_{k_cnt}")
+    o10q6d = os.path.join(root, f"o10q6d_{k_cnt}")
+    rep10q6d = os.path.join(root, f"rep10q6d_{k_cnt}.json")
+    os.makedirs(s10q6d, exist_ok=True)
+    with open(os.path.join(s10q6d, "vi.mbt"), "w") as f:
+        f.write(f'pub let s : String = "hi"\npub let n : String = {body_lit}\n')
+    r10q6d = run_cli(["--src", s10q6d, "--out", o10q6d, "--target", "native", "--mode", "publish",
+                      "--report", rep10q6d, "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r10q6d.returncode == 0, f"10q-6d({k_cnt}) publish failed: {r10q6d.returncode}\n{r10q6d.stdout}\n{r10q6d.stderr}"
+    rep6d_j = json.load(open(rep10q6d))
+    got_cols = [p["col"] for p in rep6d_j["probe_dispositions"] if p["file"] == "vi.mbt" and p["line"] == 2 and p["probe_kind"] == "mbt_len_probe"]
+    assert got_cols == exp_cols, f"10q-6d({k_cnt}) expected cols {exp_cols}, got {got_cols}"
+    if k_cnt == 3:
+        pkg10q6d = os.path.join(root, "pkg10q6d")
+        os.makedirs(os.path.join(pkg10q6d, "src"), exist_ok=True)
+        for fn in os.listdir(o10q6d):
+            if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q6d, fn), os.path.join(pkg10q6d, "src", fn))
+        with open(os.path.join(pkg10q6d, "pion.toml"), "w") as f:
+            f.write(f'[package]\nname = "s10q6d"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+        with open(os.path.join(pkg10q6d, "src", "main.pion"), "w") as f:
+            f.write('pub fn main(_w : World) -> Int { if n != "a2b2b2" { panic("bad: " + n) }; 0 }\n')
+        r10q6d_run = subprocess.run([pionc, "run", pkg10q6d], capture_output=True, text=True)
+        assert r10q6d_run.returncode == 0, f"10q-6d pionc run failed: {r10q6d_run.stderr}"
+
+# 10q-6e (Astra Final 3-line P1): simple-ident `mbt_show_probe` in `"a\{  s  }b\{ s }"` reports [28, 36]
+# and `"a\{s}b\{s}"` reports [26, 31], AND `pionc run == "ahibhi"`!
+for tag, body_lit, exp_cols in [
+    ("padded", '"a\\{  s  }b\\{ s }"', [28, 36]),
+    ("tight", '"a\\{s}b\\{s}"', [26, 31]),
+]:
+    s10q6e = os.path.join(root, f"s10q6e_{tag}")
+    o10q6e = os.path.join(root, f"o10q6e_{tag}")
+    rep10q6e = os.path.join(root, f"rep10q6e_{tag}.json")
+    os.makedirs(s10q6e, exist_ok=True)
+    with open(os.path.join(s10q6e, "vs_show.mbt"), "w") as f:
+        f.write(f'pub let s : String = "hi"\npub let n : String = {body_lit}\n')
+    r10q6e = run_cli(["--src", s10q6e, "--out", o10q6e, "--target", "native", "--mode", "publish",
+                      "--report", rep10q6e, "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r10q6e.returncode == 0, f"10q-6e({tag}) publish failed: {r10q6e.returncode}\n{r10q6e.stdout}\n{r10q6e.stderr}"
+    rep6e_j = json.load(open(rep10q6e))
+    got_cols = [p["col"] for p in rep6e_j["probe_dispositions"] if p["file"] == "vs_show.mbt" and p["line"] == 2 and p["probe_kind"] == "mbt_show_probe"]
+    assert got_cols == exp_cols, f"10q-6e({tag}) expected cols {exp_cols}, got {got_cols}"
+    pkg10q6e = os.path.join(root, f"pkg10q6e_{tag}")
+    os.makedirs(os.path.join(pkg10q6e, "src"), exist_ok=True)
+    for fn in os.listdir(o10q6e):
+        if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q6e, fn), os.path.join(pkg10q6e, "src", fn))
+    with open(os.path.join(pkg10q6e, "pion.toml"), "w") as f:
+        f.write(f'[package]\nname = "s10q6e_{tag}"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+    with open(os.path.join(pkg10q6e, "src", "main.pion"), "w") as f:
+        f.write('pub fn main(_w : World) -> Int { if n != "ahibhi" { panic("bad: " + n) }; 0 }\n')
+    r10q6e_run = subprocess.run([pionc, "run", pkg10q6e], capture_output=True, text=True)
+    assert r10q6e_run.returncode == 0, f"10q-6e({tag}) pionc run failed: {r10q6e_run.stderr}"
+
+# 10q-3 (P0-3): `assert_true(true, msg={ n = n + 1; "expected" })` evaluates side effects AND `msg=abort("boom")` fails!
+s10q3 = os.path.join(root, "s10q3")
+o10q3 = os.path.join(root, "o10q3")
+os.makedirs(s10q3, exist_ok=True)
+with open(os.path.join(s10q3, "lib.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10q3, "msg_wbtest.mbt"), "w") as f:
+    f.write(
+        'test "msg_side_effect_evals" {\n'
+        '  let mut n = 0\n'
+        '  assert_true(true, msg={ n = n + 1; "expected" })\n'
+        '  assert_eq(n, 1)\n'
+        '}\n'
+        'test "msg_abort_fails" {\n'
+        '  assert_true(true, msg=panic("boom"))\n'
+        '}\n'
+    )
+r10q3 = run_cli(["--src", s10q3, "--out", o10q3, "--target", "native", "--mode", "publish", "--with-tests",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q3.returncode == 0, f"10q-3 publish failed: {r10q3.returncode}\n{r10q3.stdout}\n{r10q3.stderr}"
+pkg10q3 = os.path.join(root, "pkg10q3")
+os.makedirs(os.path.join(pkg10q3, "src"), exist_ok=True)
+for fn in os.listdir(o10q3):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q3, fn), os.path.join(pkg10q3, "src", fn))
+with open(os.path.join(pkg10q3, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q3"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q3_t = subprocess.run([pionc, "test", pkg10q3], capture_output=True, text=True)
+assert r10q3_t.returncode != 0 and "1 passed; 1 failed" in r10q3_t.stdout, f"10q-3 expected 1 passed (n==1) + 1 failed (msg panic), got:\n{r10q3_t.stdout}\n{r10q3_t.stderr}"
+
+# 10q-4 (P0-4): Asset manifest `blob.mbt` MUST NOT match `nested/blob.mbt` by basename!
+s10q4 = os.path.join(root, "s10q4")
+o10q4 = os.path.join(root, "o10q4")
+os.makedirs(os.path.join(s10q4, "nested"), exist_ok=True)
+with open(os.path.join(s10q4, "nested", "blob.mbt"), "w") as f:
+    f.write("pub let b : Int = 1\n")
+b_sha = hashlib.sha256(open(os.path.join(s10q4, "nested", "blob.mbt"), "rb").read()).hexdigest()
+mf10q4 = os.path.join(root, "mf10q4.json")
+with open(mf10q4, "w") as f:
+    json.dump({"assets": [{"path": "blob.mbt", "sha256": b_sha, "allowed_decls": ["b"]}]}, f)
+r10q4 = run_cli(["--src", s10q4, "--out", o10q4, "--target", "native", "--mode", "publish",
+                 "--asset-manifest", mf10q4, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q4.returncode != 0, f"10q-4 basename manifest entry must fail for nested/blob.mbt, got rc=0"
+
+# 10q-5 (P0-5): `--closure-report <nonempty_dir>` must fail AND leave `--out` untouched (no `new.pion`)!
+s10q5 = os.path.join(root, "s10q5")
+o10q5 = os.path.join(root, "o10q5")
+cls_dir10q5 = os.path.join(root, "cls_nonempty_dir")
+os.makedirs(s10q5, exist_ok=True)
+os.makedirs(o10q5, exist_ok=True)
+os.makedirs(cls_dir10q5, exist_ok=True)
+with open(os.path.join(cls_dir10q5, "keep.txt"), "w") as f:
+    f.write("nonempty")
+with open(os.path.join(s10q5, "new.mbt"), "w") as f:
+    f.write("pub fn hi() -> Int { 1 }\n")
+r10q5 = run_cli(["--src", s10q5, "--out", o10q5, "--target", "native", "--mode", "publish",
+                 "--closure-report", cls_dir10q5, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q5.returncode != 0, f"10q-5 --closure-report <nonempty_dir> must fail, got rc=0"
+assert not os.path.exists(os.path.join(o10q5, "new.pion")), f"10q-5 --out was polluted with new.pion!"
+
+print("[e2e] PASS: Astra Final 5 P0 regressions (10q-1..10q-5: no wbtest collision, blackbox isolation, msg= side effects, no basename asset bypass, atomic --closure-report)")
 PY
+
+PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"
 
 echo "[e2e] ALL E2E TESTS PASSED!"
