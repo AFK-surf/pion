@@ -5,8 +5,9 @@
 # Verifies:
 # 1. SSA (dev & --release): every 3..8 part Int / Int64 hot function calls
 #    `$pion_strbuf_push_int` and never `$pion_int_to_str` / `$pion_i64_to_str`;
-#    the 9 part chain, the trait-dispatched `Render::to_string` and the Wasm32
-#    module keep the heap path.
+#    the 9 part chain, the trait-dispatched `Render::to_string`, unsigned
+#    receivers (`(x as UInt64) >> 1`, `UInt` / `UInt64` extremes) and the
+#    Wasm32 module keep the heap path.
 # 2. Exact output across Native dev & --release, Wasm32 dev & --release and
 #    ASan/LSan dev & --release (0..8 parts, INT32/INT64 extremes, repeated
 #    receivers, loop slot reuse, side-effect order, `?` exits, custom types).
@@ -58,7 +59,12 @@ for name, n in want.items():
 w9 = body('wide9')
 assert '$pion_strbuf_push_int' not in w9 and w9.count('call $pion_int_to_str(') == 5, f"{mode}: wide9 must use heap temporaries"
 assert '$pion_strbuf_push_int' not in body('wrap__mono_Int'), f"{mode}: trait-dispatched to_string was rewritten"
-print(f"p109 {mode} SSA ok ({len(want)} stack-formatted chains, 2 fallbacks)")
+# Unsigned receivers (shifts with an `Int` count, `as` casts) keep their own
+# lowering: never `extsw`-truncated into the signed stack formatter.
+for name in ('shr_u64', 'unsigned_parts', 'effect_u64', 'closure_u64'):
+    assert '$pion_strbuf_push_int' not in body(name), f"{mode}: unsigned receiver in {name} was stack-formatted"
+assert 'u64s_big' in body('shr_u64'), f"{mode}: shr_u64 lost the UInt64 to_string lowering"
+print(f"p109 {mode} SSA ok ({len(want)} stack-formatted chains, 6 fallbacks)")
 PYEOF
   "$TMP_DIR/p109_$MODE" > "$TMP_DIR/$MODE.out"
   check "native $MODE" "$TMP_DIR/$MODE.out"
