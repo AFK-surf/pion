@@ -86,6 +86,9 @@ CASES = {
     "div_deep_7": ("panic:div_zero", 0),
     "div_idx_paren": ("panic:div_zero", 0),
     "init_iife_helper": ("ok", 1),
+    "utf16_arith_and_idx": ("ok", 7),
+    "div_min_allones_i32": ("panic:div_overflow", 0),
+    "div_min_allones_i64": ("panic:div_overflow", 0),
 }
 
 MOON_TRAPS = {
@@ -378,6 +381,18 @@ let iife_z : Int = read_arr_0([42])
 pub fn get_iife_a() -> Int {
   iife_a
 }
+
+// Round 4 Opus P0 & Astra P0-3 cases
+pub fn str_len_mod3(s : String) -> Int { s.length() % 3 }
+pub fn str_len_div2(s : String) -> Int { s.length() / 2 }
+pub fn str_len_mul3(s : String) -> Int { 1 + s.length() * 3 }
+pub fn str_len_mul2_mod3(s : String) -> Int { s.length() * 2 % 3 }
+pub fn str_len_div_plus_mod(s : String, n : Int) -> Int { s.length() / n + s.length() % 3 }
+pub fn str_idx_mul2(s : String, i : Int) -> Int { s[i].to_int() * 2 }
+pub fn arr_str_idx_len(xs : Array[String], i : Int) -> Int { xs[i].length() }
+
+pub fn div_allones_i32(a : Int) -> Int { a / 0xffffffff }
+pub fn div_allones_i64(a : Int64) -> Int64 { a / 0xffffffffffffffffL }
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -684,6 +699,31 @@ fn main {
     let v = get_iife_a()
     trace("iife_a", v.to_string())
     check("init.iife_a", v == 42)
+  } else if kase == "utf16_arith_and_idx" {
+    let s = "A中😀Bxyz"
+    let r1 = str_len_mod3(s)
+    let r2 = str_len_div2(s)
+    let r3 = str_len_mul3(s)
+    let r4 = str_len_mul2_mod3(s)
+    let r5 = str_len_div_plus_mod(s, 2)
+    let r6 = str_idx_mul2(s, 4)
+    let r7 = arr_str_idx_len([s, "中😀"], 1)
+    trace("r", "\{r1},\{r2},\{r3},\{r4},\{r5},\{r6},\{r7}")
+    check("u16.mod3", r1 == 2)
+    check("u16.div2", r2 == 4)
+    check("u16.mul3", r3 == 25)
+    check("u16.mul2_mod3", r4 == 1)
+    check("u16.div_plus_mod", r5 == 6)
+    check("u16.idx_mul2", r6 == 132)
+    check("u16.arr_idx_len", r7 == 3)
+  } else if kase == "div_min_allones_i32" {
+    let m = [-2147483648][0]
+    trace("before", "ok")
+    trace("after", div_allones_i32(m).to_string())
+  } else if kase == "div_min_allones_i64" {
+    let m = [-9223372036854775807L - 1L][0]
+    trace("before", "ok")
+    trace("after", div_allones_i64(m).to_string())
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1004,6 +1044,31 @@ pub fn main(w : World) -> Int {
     let v = get_iife_a()
     trace(w, "iife_a", v.to_string())
     check(w, "init.iife_a", v == 42)
+  } else if kase == "utf16_arith_and_idx" {
+    let s = "A中😀Bxyz"
+    let r1 = str_len_mod3(s)
+    let r2 = str_len_div2(s)
+    let r3 = str_len_mul3(s)
+    let r4 = str_len_mul2_mod3(s)
+    let r5 = str_len_div_plus_mod(s, 2)
+    let r6 = str_idx_mul2(s, 4)
+    let r7 = arr_str_idx_len([s, "中😀"], 1)
+    trace(w, "r", r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "," + r7.to_string())
+    check(w, "u16.mod3", r1 == 2)
+    check(w, "u16.div2", r2 == 4)
+    check(w, "u16.mul3", r3 == 25)
+    check(w, "u16.mul2_mod3", r4 == 1)
+    check(w, "u16.div_plus_mod", r5 == 6)
+    check(w, "u16.idx_mul2", r6 == 132)
+    check(w, "u16.arr_idx_len", r7 == 3)
+  } else if kase == "div_min_allones_i32" {
+    let m = [-2147483647 - 1][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_allones_i32(m).to_string())
+  } else if kase == "div_min_allones_i64" {
+    let m = [-9223372036854775807L - 1L][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_allones_i64(m).to_string())
   } else {
     panic("abort: unknown case " + kase)
   }

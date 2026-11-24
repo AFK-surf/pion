@@ -31,8 +31,10 @@ pub struct ProbeSite {
   rhs_expr : String
   slice_hi : String
   divisor_is_zero : Bool
-  divisor_is_nonzero : Bool
-  divisor_is_neg_one : Bool
+  rhs_has_lit : Bool
+  rhs_is_neg : Bool
+  rhs_u64 : UInt64
+  rhs_overflow : Bool
 }
 
 pub struct ProbeResult {
@@ -143,9 +145,11 @@ pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
   Some((probe_name, resolved_ty))
 }
 
-///| Parse an integer literal token (`0`, `1`, `0x1`, `0x01`, `0b1`, `0o1`, `1_`, `1L`, `0UL`, etc.)
-///| into its exact numeric value (capped at 1_000_000_000_000L so huge literals never wrap to 0 or 1).
-pub fn parse_int_literal_value(tok : Token) -> Option[Int64] {
+///| Parse an integer literal token (`0`, `1`, `0x1`, `0xffffffff`, `0xffffffffffffffffL`,
+///| `0b1`, `0o1`, `1_`, `0UL`, etc.) into its exact unsigned 64-bit magnitude and an overflow flag.
+///| Never truncates or saturates silently so bit-width/signedness checks in `can_omit_div_check`
+///| are 100% exact (Astra Round 4 P0-3).
+pub fn parse_int_literal_u64(tok : Token) -> Option[(UInt64, Bool)] {
   if tok.kind != TokenKind::IntLit {
     return None
   }
@@ -154,7 +158,6 @@ pub fn parse_int_literal_value(tok : Token) -> Option[Int64] {
   while end > 0 {
     let lc = s.code_unit_at(end - 1)
     if lc == 76 || lc == 108 || lc == 85 || lc == 117 {
-      // L, l, U, u
       end = end - 1
     } else {
       break
@@ -164,60 +167,95 @@ pub fn parse_int_literal_value(tok : Token) -> Option[Int64] {
     return None
   }
   let mut i = 0
-  let mut base : Int64 = 10L
+  let mut base : UInt64 = 10UL
   if end >= 2 && s.code_unit_at(0) == 48 {
     let p1 = s.code_unit_at(1)
     if p1 == 120 || p1 == 88 {
-      base = 16L
+      base = 16UL
       i = 2
     } else if p1 == 98 || p1 == 66 {
-      base = 2L
+      base = 2UL
       i = 2
     } else if p1 == 111 || p1 == 79 {
-      base = 8L
+      base = 8UL
       i = 2
     }
   }
-  let mut acc : Int64 = 0L
+  let max_u64 : UInt64 = 18446744073709551615UL
+  let mut acc : UInt64 = 0UL
+  let mut overflowed = false
   let mut saw_digit = false
-  let cap : Int64 = 1000000000000L
   while i < end {
     let c = s.code_unit_at(i)
     if c == 95 {
-      // '_'
       i = i + 1
       continue
     }
-    let d : Int64 = if c >= 48 && c <= 57 {
-      (c - 48).to_int64()
+    let d_i = if c >= 48 && c <= 57 {
+      c - 48
     } else if c >= 97 && c <= 102 {
-      (c - 97 + 10).to_int64()
+      c - 97 + 10
     } else if c >= 65 && c <= 70 {
-      (c - 65 + 10).to_int64()
+      c - 65 + 10
     } else {
-      -1L
+      -1
     }
-    if d < 0L || d >= base {
+    if d_i < 0 {
+      return None
+    }
+    let d = d_i.to_int64().reinterpret_as_uint64()
+    if d >= base {
       return None
     }
     saw_digit = true
-    if acc < cap {
-      acc = acc * base + d
-      if acc > cap {
-        acc = cap
+    if !overflowed {
+      if acc > (max_u64 - d) / base {
+        overflowed = true
+      } else {
+        acc = acc * base + d
       }
     }
     i = i + 1
   }
-  if saw_digit { Some(acc) } else { None }
+  if saw_digit { Some((acc, overflowed)) } else { None }
+}
+
+///| Strictly decide whether a constant integer divisor on `resolved_type` can safely omit
+///| the runtime `div_checked_*` / `mod_checked_*` helper without risking div-by-zero OR
+///| signed `MIN / -1` overflow (including all-ones bit patterns like `0xffffffff` / `0xffffffffffffffffL`).
+pub fn can_omit_div_check(resolved_type : String, site : ProbeSite) -> Bool {
+  if !site.rhs_has_lit || site.rhs_overflow {
+    return false
+  }
+  if resolved_type == "Int" {
+    if !site.rhs_is_neg {
+      return site.rhs_u64 >= 1UL && site.rhs_u64 <= 2147483647UL
+    }
+    return site.rhs_u64 >= 2UL && site.rhs_u64 <= 2147483648UL
+  }
+  if resolved_type == "Int64" {
+    if !site.rhs_is_neg {
+      return site.rhs_u64 >= 1UL && site.rhs_u64 <= 9223372036854775807UL
+    }
+    return site.rhs_u64 >= 2UL && site.rhs_u64 <= 9223372036854775808UL
+  }
+  if resolved_type == "UInt" {
+    return !site.rhs_is_neg && site.rhs_u64 >= 1UL && site.rhs_u64 <= 4294967295UL
+  }
+  if resolved_type == "UInt64" {
+    return !site.rhs_is_neg && site.rhs_u64 >= 1UL
+  }
+  if resolved_type == "Byte" {
+    return !site.rhs_is_neg && site.rhs_u64 >= 1UL && site.rhs_u64 <= 255UL
+  }
+  false
 }
 
 ///| Check whether a numeric literal token is statically known to be non-zero.
-///| Uses numeric value parsing for integer literals and stops before exponent/suffix for floats.
 pub fn is_statically_nonzero_literal(tok : Token) -> Bool {
   if tok.kind == TokenKind::IntLit {
-    return match parse_int_literal_value(tok) {
-      Some(v) => v != 0L
+    return match parse_int_literal_u64(tok) {
+      Some((v, ovf)) => ovf || v != 0UL
       None => false
     }
   }
@@ -515,8 +553,10 @@ fn instrument_probes_for_file_with_safe(
             rhs_expr: s_args[1],
             slice_hi: s_args[2],
             divisor_is_zero: false,
-            divisor_is_nonzero: false,
-            divisor_is_neg_one: false,
+            rhs_has_lit: false,
+            rhs_is_neg: false,
+            rhs_u64: 0UL,
+            rhs_overflow: false,
           })
           edits.push((start_b, end_b, "(" + s_args[0] + ")." + pkind + "(" + s_args[1] + ", " + s_args[2] + ")"))
           covered_end = end_b
@@ -567,8 +607,10 @@ fn instrument_probes_for_file_with_safe(
                 rhs_expr: isite.rhs_expr,
                 slice_hi: isite.slice_hi,
                 divisor_is_zero: isite.divisor_is_zero,
-                divisor_is_nonzero: isite.divisor_is_nonzero,
-                divisor_is_neg_one: isite.divisor_is_neg_one,
+                rhs_has_lit: isite.rhs_has_lit,
+                rhs_is_neg: isite.rhs_is_neg,
+                rhs_u64: isite.rhs_u64,
+                rhs_overflow: isite.rhs_overflow,
               })
             }
             rebuilt.write_string("\\{" + inner_inst + "}")
@@ -590,8 +632,10 @@ fn instrument_probes_for_file_with_safe(
                 rhs_expr: "__INTERP_SHOW__",
                 slice_hi: "",
                 divisor_is_zero: false,
-                divisor_is_nonzero: false,
-                divisor_is_neg_one: false,
+                rhs_has_lit: false,
+                rhs_is_neg: false,
+                rhs_u64: 0UL,
+                rhs_overflow: false,
               })
               rebuilt.write_string("\\{" + et + ".mbt_show_probe()}")
             } else {
@@ -611,16 +655,15 @@ fn instrument_probes_for_file_with_safe(
     }
 
     // 1. `<recv>.length()` -> `<recv>.mbt_len_probe()`
-    //    (skip when immediately followed by `*`/`/`/`%` so outer div/mod probes first in Round 0!)
+    //    (Opus Round 4 P0: NEVER skip when followed by `*`/`/`/`%` — `safe_offsets` ensures outer
+    //    div/mod is probed in the next round if `recv` turns out to be non-String!)
     if t.kind == TokenKind::Dot && i + 3 < n &&
     tokens[i + 1].raw == "length" &&
     tokens[i + 2].kind == TokenKind::LParen &&
     tokens[i + 3].kind == TokenKind::RParen {
       let op_b = base_offset + tokens[i + 1].start_byte
-      let len_next_mul_div = i + 4 < n &&
-      (tokens[i + 4].kind == TokenKind::Star || tokens[i + 4].kind == TokenKind::Slash || tokens[i + 4].kind == TokenKind::Percent)
       let recv_start = find_receiver_start(tokens, i - 1)
-      if !safe_offsets.contains(op_b) && !len_next_mul_div && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
+      if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
         let start_b = tokens[recv_start].start_byte
         let end_b = tokens[i + 3].end_byte
         let recv_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
@@ -637,8 +680,10 @@ fn instrument_probes_for_file_with_safe(
             rhs_expr: "",
             slice_hi: "",
             divisor_is_zero: false,
-            divisor_is_nonzero: false,
-            divisor_is_neg_one: false,
+            rhs_has_lit: false,
+            rhs_is_neg: false,
+            rhs_u64: 0UL,
+            rhs_overflow: false,
           })
           edits.push((start_b, end_b, recv_expr + ".mbt_len_probe()"))
           covered_end = end_b
@@ -672,8 +717,10 @@ fn instrument_probes_for_file_with_safe(
             rhs_expr: "",
             slice_hi: "",
             divisor_is_zero: false,
-            divisor_is_nonzero: false,
-            divisor_is_neg_one: false,
+            rhs_has_lit: false,
+            rhs_is_neg: false,
+            rhs_u64: 0UL,
+            rhs_overflow: false,
           })
           edits.push((start_b, end_b, recv_expr + ".mbt_show_probe()"))
           covered_end = end_b
@@ -703,8 +750,10 @@ fn instrument_probes_for_file_with_safe(
           rhs_expr: "",
           slice_hi: "",
           divisor_is_zero: false,
-          divisor_is_nonzero: false,
-          divisor_is_neg_one: false,
+          rhs_has_lit: false,
+          rhs_is_neg: false,
+          rhs_u64: 0UL,
+          rhs_overflow: false,
         })
         edits.push((start_b, end_b, recv_expr + ".mbt_val_probe()"))
         covered_end = end_b
@@ -713,18 +762,16 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    // 4. `<recv>[<idx>]` -> `<recv>.mbt_idx_probe(<idx>)` (skipping `.length()` chains on index so outer probe runs first or next round;
+    // 4. `<recv>[<idx>]` -> `<recv>.mbt_idx_probe(<idx>)`
+    //    (Opus Round 4 P0: NEVER skip when followed by `*`/`/`/`%` or `.length()`/`.to_string()`/`.val` —
+    //    `safe_offsets` ensures outer probes run cleanly in subsequent rounds!
     //    NEVER treat a newline-leading `[a, b]` array literal after a previous statement as indexing!)
     if t.kind == TokenKind::LBracket && i > 0 && !t.newline_before {
       let op_b = base_offset + t.start_byte
       let close_br = find_matching_delim(tokens, i)
       let next_is_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
-      let next_is_probe_dot = close_br + 2 < n && tokens[close_br + 1].kind == TokenKind::Dot &&
-      (tokens[close_br + 2].raw == "length" || tokens[close_br + 2].raw == "to_string" || tokens[close_br + 2].raw == "val")
-      let next_is_mul_div = close_br + 1 < n &&
-      (tokens[close_br + 1].kind == TokenKind::Star || tokens[close_br + 1].kind == TokenKind::Slash || tokens[close_br + 1].kind == TokenKind::Percent)
       let recv_start = find_receiver_start(tokens, i - 1)
-      if !safe_offsets.contains(op_b) && !next_is_eq && !next_is_probe_dot && !next_is_mul_div && recv_start >= 0 && close_br > i + 1 &&
+      if !safe_offsets.contains(op_b) && !next_is_eq && recv_start >= 0 && close_br > i + 1 &&
       tokens[recv_start].start_byte >= covered_end &&
       tokens[i - 1].kind != TokenKind::UpperIdent &&
       !is_non_expr_receiver(tokens, recv_start) {
@@ -744,8 +791,10 @@ fn instrument_probes_for_file_with_safe(
           rhs_expr: idx_expr,
           slice_hi: "",
           divisor_is_zero: false,
-          divisor_is_nonzero: false,
-          divisor_is_neg_one: false,
+          rhs_has_lit: false,
+          rhs_is_neg: false,
+          rhs_u64: 0UL,
+          rhs_overflow: false,
         })
         edits.push((start_b, end_b, recv_expr + ".mbt_idx_probe(" + idx_expr + ")"))
         covered_end = end_b
@@ -756,8 +805,8 @@ fn instrument_probes_for_file_with_safe(
 
     // 5. `<lhs> / <rhs>` or `<lhs> % <rhs>`:
     //    - Parses full left-associative `*` LHS chain (e.g. `a * b / c` -> `(a * b) / c`)
-    //    - Parses unary/postfix RHS (e.g. `a / -b`, `a / (b - c)`, `a / -0x1`)
-    //    - ALWAYS probes until proven safe (`safe_offsets`) or rewritten!
+    //    - Parses unary/postfix RHS (e.g. `a / -b`, `a / (b - c)`, `a / -0x1`, `a / 0xffffffff`)
+    //    - Records exact parsed `UInt64` magnitude & sign without deciding omission until `resolved_type` is known!
     if (t.kind == TokenKind::Slash || t.kind == TokenKind::Percent) && i > 0 && i + 1 < n {
       let op_b = base_offset + t.start_byte
       if safe_offsets.contains(op_b) {
@@ -782,12 +831,20 @@ fn instrument_probes_for_file_with_safe(
         let lhs_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
         let rhs_expr = content.slice(tokens[i + 1].start_byte, end_b).trim()
         let is_zero = (rhs_lit_idx >= 0 && is_statically_zero_literal(tokens[rhs_lit_idx])) || is_byte_zero_expr(rhs_expr)
-        let is_neg_one = rhs_end == i + 2 && tokens[i + 1].kind == TokenKind::Minus &&
-        match parse_int_literal_value(tokens[i + 2]) {
-          Some(v) => v == 1L
-          None => false
+        let is_neg = rhs_end == i + 2 && tokens[i + 1].kind == TokenKind::Minus
+        let mut has_int_lit = false
+        let mut mag_u64 : UInt64 = 0UL
+        let mut ovf = false
+        if rhs_lit_idx >= 0 && tokens[rhs_lit_idx].kind == TokenKind::IntLit {
+          match parse_int_literal_u64(tokens[rhs_lit_idx]) {
+            Some((v, o)) => {
+              has_int_lit = true
+              mag_u64 = v
+              ovf = o
+            }
+            None => ()
+          }
         }
-        let is_nonzero = rhs_lit_idx >= 0 && is_statically_nonzero_literal(tokens[rhs_lit_idx]) && !is_neg_one
         sites.push(ProbeSite::{
           file: file,
           probe_kind: pkind,
@@ -800,8 +857,10 @@ fn instrument_probes_for_file_with_safe(
           rhs_expr: rhs_expr,
           slice_hi: "",
           divisor_is_zero: is_zero,
-          divisor_is_nonzero: is_nonzero,
-          divisor_is_neg_one: is_neg_one,
+          rhs_has_lit: has_int_lit,
+          rhs_is_neg: is_neg,
+          rhs_u64: mag_u64,
+          rhs_overflow: ovf,
         })
         edits.push((start_b, end_b, "(" + lhs_expr + ")." + pkind + "(" + rhs_expr + ")"))
         covered_end = end_b
@@ -901,8 +960,8 @@ pub fn rewrite_for_probe(
           })
           return Some("{ let _ = " + site.lhs_expr + "; " + trap_call + " }")
         }
-        if site.divisor_is_nonzero {
-          // Supported integer type with statically proven non-zero divisor: omit runtime check
+        if can_omit_div_check(resolved_type, site) {
+          // Supported integer type with strictly bit-width/signedness-proven safe constant divisor: omit runtime check
           return None
         }
         drift_ledger.push(DriftEntry::{
@@ -1449,6 +1508,30 @@ pub fn run_stage_a5_with_max_rounds(
       None => Map()
     }
     audit_undisposed_div_mod(f.rel_path, f.content, smap, 0, 0, diags, drift_ledger)
+    // Opus Round 4 P0: full-probe-type undisposed audit covering `.length()`, `[i]`,
+    // `.to_string()`, `.val`, `\{...}`, and `__mbt_slice_*`!
+    let (_, rem_sites) = instrument_probes_for_file_with_safe(f.rel_path, f.content, smap, 0)
+    for rs in rem_sites {
+      if rs.probe_kind != "mbt_div_probe" && rs.probe_kind != "mbt_mod_probe" {
+        diags.push(diag_error(
+          "MBT2PION_UNDISPOSED_PROBE_SITE",
+          f.rel_path,
+          rs.line,
+          rs.col,
+          "undisposed " + rs.probe_kind + " candidate remained after Stage A.5 on `" + rs.lhs_expr + "`",
+        ))
+        drift_ledger.push(DriftEntry::{
+          category: rs.probe_kind,
+          file: f.rel_path,
+          line: rs.line,
+          col: rs.col,
+          expr: rs.lhs_expr,
+          resolution: "blocked",
+          status: "unresolved",
+          detail: "undisposed probe candidate after Stage A.5",
+        })
+      }
+    }
   }
 
   (cur_files, total_rounds, total_instrumented, total_resolved)

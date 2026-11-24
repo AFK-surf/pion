@@ -791,6 +791,113 @@ sl = raw_bytes[m_spans[0]["out_start"]:m_spans[0]["out_end"]]
 assert sl.startswith(b"pub fn Widget::value_of") and sl.endswith(b"}"), f"7f bad span bytes: {sl!r}"
 
 print("[e2e] PASS: Round 3 Astra structural suite (0-ENOENT atomic swap, modes/symlinks/empty-dir, in-out reports, same_receiver, positional api_map, qualified span_map)")
+
+# -----------------------------------------------------------------------------
+# 8. Round 4 Astra P0-1, P0-2, P0-4 E2E acceptance suite
+# -----------------------------------------------------------------------------
+# 8a. P0-1: report colliding with generated `.pion` or hand-written `.pion` MUST block;
+#     failed publish MUST NOT write report into `--out`; unwritable report MUST exit non-zero!
+s8 = os.path.join(root, "s8")
+o8 = os.path.join(root, "o8")
+os.makedirs(s8, exist_ok=True)
+os.makedirs(o8, exist_ok=True)
+with open(os.path.join(s8, "a.mbt"), "w") as f:
+    f.write("pub fn ok_fn() -> Int { 7 }\n")
+with open(os.path.join(o8, "driver.pion"), "w") as f:
+    f.write("pub fn keep_driver() -> Int { 11 }\n")
+# First clean publish
+r8_0 = run_cli(["--src", s8, "--out", o8, "--target", "native", "--mode", "publish",
+                "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r8_0.returncode == 0, f"8a initial publish failed: {r8_0.stderr}"
+snap_a = open(os.path.join(o8, "a.pion"), "rb").read()
+snap_drv = open(os.path.join(o8, "driver.pion"), "rb").read()
+
+# Collide --report with generated a.pion
+r8_rep = run_cli(["--src", s8, "--out", o8, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--report", os.path.join(o8, "a.pion")])
+assert r8_rep.returncode == 1, f"8a --report OUT/a.pion must block (rc=1), got {r8_rep.returncode}"
+assert open(os.path.join(o8, "a.pion"), "rb").read() == snap_a, "8a a.pion was overwritten by --report!"
+
+# Collide --drift-ledger with hand-written driver.pion
+r8_drf = run_cli(["--src", s8, "--out", o8, "--target", "native", "--mode", "publish",
+                  "--mbt-compat", compat_dir, "--pionc", pionc,
+                  "--drift-ledger", os.path.join(o8, "driver.pion")])
+assert r8_drf.returncode == 1, f"8a --drift-ledger OUT/driver.pion must block (rc=1), got {r8_drf.returncode}"
+assert open(os.path.join(o8, "driver.pion"), "rb").read() == snap_drv, "8a driver.pion was overwritten!"
+
+# Blocked publish with --report OUT/failure.json MUST NOT create OUT/failure.json!
+s8_bad = os.path.join(root, "s8_bad")
+os.makedirs(s8_bad, exist_ok=True)
+with open(os.path.join(s8_bad, "a.mbt"), "w") as f:
+    f.write("pub fn bad(x : Array[Int]) -> Int { let v = x[0:1]; v[0] }\n")
+r8_fail = run_cli(["--src", s8_bad, "--out", o8, "--target", "native", "--mode", "publish",
+                   "--mbt-compat", compat_dir, "--pionc", pionc,
+                   "--report", os.path.join(o8, "failure.json"),
+                   "--run-report", os.path.join(o8, "run_fail.json")])
+assert r8_fail.returncode == 1, f"8a blocked publish should exit 1, got {r8_fail.returncode}"
+assert not os.path.exists(os.path.join(o8, "failure.json")), "8a blocked publish polluted --out with failure.json!"
+assert not os.path.exists(os.path.join(o8, "run_fail.json")), "8a blocked publish polluted --out with run_fail.json!"
+assert open(os.path.join(o8, "a.pion"), "rb").read() == snap_a, "8a --out modified on blocked publish"
+
+# Unwritable report path (parent is a regular file) MUST exit non-zero (rc=3)
+blk_file = os.path.join(root, "not_a_dir")
+with open(blk_file, "w") as f: f.write("x")
+r8_io = run_cli(["--src", s8, "--out", o8, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", compat_dir, "--pionc", pionc,
+                 "--report", os.path.join(blk_file, "rep.json")])
+assert r8_io.returncode == 3, f"8a unwritable report should exit 3, got {r8_io.returncode}"
+
+# 8b. P0-2: symlinked `.pion` (`shared.pion -> common.pion`) causing E_DUP_DEF MUST block publish & --check!
+common_pion = os.path.join(root, "common.pion")
+with open(common_pion, "w") as f:
+    f.write("pub fn key() -> Int { 1 }\n")
+s8_dup = os.path.join(root, "s8_dup")
+o8_dup = os.path.join(root, "o8_dup")
+os.makedirs(s8_dup, exist_ok=True)
+os.makedirs(o8_dup, exist_ok=True)
+with open(os.path.join(s8_dup, "a.mbt"), "w") as f:
+    f.write("pub fn key() -> Int { 2 }\n")
+os.symlink(common_pion, os.path.join(o8_dup, "shared.pion"))
+r8_sym_pub = run_cli(["--src", s8_dup, "--out", o8_dup, "--target", "native", "--mode", "publish",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r8_sym_pub.returncode == 1, f"8b symlinked .pion E_DUP_DEF must block publish (rc=1), got {r8_sym_pub.returncode}"
+r8_sym_chk = run_cli(["--src", s8_dup, "--out", o8_dup, "--target", "native", "--check",
+                      "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r8_sym_chk.returncode == 1, f"8b symlinked .pion E_DUP_DEF must fail --check (rc=1), got {r8_sym_chk.returncode}"
+
+# 8c. P0-4: optional/default `flag? : Int = 0` skipped for positional args; BOTH caret("中A", 1) & caret("中A", flag=1, 1) -> 65!
+dep8 = os.path.join(root, "acme_opt_dep")
+os.makedirs(os.path.join(dep8, "src"), exist_ok=True)
+with open(os.path.join(dep8, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "acme_opt"\nversion = "0.1.0"\n')
+with open(os.path.join(dep8, "src", "main.pion"), "w") as f:
+    f.write('pub fn caret(text : String, flag~ : Int = 0, offset : Int) -> Int { let _ = flag; text.code_unit_at(offset) }\n')
+am8 = os.path.join(root, "opt_map.json")
+with open(am8, "w") as f:
+    json.dump({"symbols": [{"src_pkg": "ext", "src_name": "caret", "kind": "fn",
+                            "target_pkg": "acme_opt", "target_name": "caret",
+                            "params": [{"name": "text", "type": "String", "unit": "none"},
+                                       {"name": "flag", "type": "Int", "is_optional": True, "has_default": True, "unit": "none"},
+                                       {"name": "offset", "type": "Int", "unit": "utf8", "str_param": "text"}]}]}, f)
+s8_opt = os.path.join(root, "s8_opt")
+pkg8 = os.path.join(root, "pkg8")
+os.makedirs(s8_opt, exist_ok=True)
+os.makedirs(os.path.join(pkg8, "src"), exist_ok=True)
+with open(os.path.join(s8_opt, "a.mbt"), "w") as f:
+    f.write('pub fn s_omit() -> Int { @ext.caret("中A", 1) }\npub fn s_flag() -> Int { @ext.caret("中A", flag=1, 1) }\n')
+r8_opt = run_cli(["--src", s8_opt, "--out", os.path.join(pkg8, "src"), "--target", "native", "--mode", "publish",
+                  "--api-map", am8, "--dep", "acme_opt=" + dep8,
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r8_opt.returncode == 0, f"8c publish failed: {r8_opt.stderr}"
+with open(os.path.join(pkg8, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "opt_chk"\nversion = "0.1.0"\n[dependencies]\nacme_opt = {{ path = "{dep8}" }}\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+with open(os.path.join(pkg8, "src", "main.pion"), "w") as f:
+    f.write('pub fn main(_w : World) -> Int { if s_omit() != 65 { panic("s_omit != 65") }; if s_flag() != 65 { panic("s_flag != 65") }; 0 }\n')
+rr8 = subprocess.run([pionc, "run", pkg8], capture_output=True, text=True)
+assert rr8.returncode == 0, f"8c pionc run failed: {rr8.stderr}"
+
+print("[e2e] PASS: Round 4 Astra P0-1/P0-2/P0-4 suite (report role collisions, zero-write on failed publish, symlink .pion E_DUP_DEF, optional-skip positional binding == 65)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
