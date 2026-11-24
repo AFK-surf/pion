@@ -1368,6 +1368,9 @@ print("[e2e] PASS: Final Astra P0-1+P0-2 suite (10m: #cfg brace-less decls + exc
 for tag_mp, rules_str, expected_out in [
     ("wasm_only", '["wasm"]', "21"),
     ("not_wasm", '["not", "wasm"]', "22"),
+    ("single_str_wasm", '"wasm"', "21"),
+    ("and_wasmgc_native", '["and", "wasm-gc", "native"]', "21"),
+    ("or_and_js", '["or", ["and", "wasm", "native"], "js"]', "21"),
 ]:
     s_mp = os.path.join(root, f"s10m_{tag_mp}")
     o_mp = os.path.join(root, f"o10m_{tag_mp}")
@@ -1407,7 +1410,23 @@ for tag_mp, rules_str, expected_out in [
     assert r_mp_run.returncode == 0, f"10m-2 {tag_mp} run failed: {r_mp_run.stdout} {r_mp_run.stderr}"
     assert r_mp_run.stdout.strip() == expected_out, f"10m-2 {tag_mp} expected {expected_out!r}, got {r_mp_run.stdout!r}"
 
-print("[e2e] PASS: Final Astra moon.pkg+#cfg alignment suite (10m-2: [\"wasm\"] -> 21, [\"not\", \"wasm\"] -> 22 on live wasm32)")
+print("[e2e] PASS: Final Astra moon.pkg+#cfg alignment suite (10m-2: [\"wasm\"]/'wasm'/and/or -> 21, [\"not\", \"wasm\"] -> 22 on live wasm32)")
+
+# 10m-3. Astra P0 fail-closed unknown moon.pkg predicates `["debug"]` and `["not", "debug"]` MUST exit 1 with MBT2PION_UNSUPPORTED_TARGET_RULE
+for tag_bad, bad_rule in [("debug", '["debug"]'), ("not_debug", '["not", "debug"]')]:
+    s_bd = os.path.join(root, f"s10m_bad_{tag_bad}")
+    o_bd = os.path.join(root, f"o10m_bad_{tag_bad}")
+    os.makedirs(s_bd, exist_ok=True)
+    with open(os.path.join(s_bd, "moon.pkg"), "w") as f:
+        f.write(f'options(targets: {{"extra.mbt": {bad_rule}}})\n')
+    with open(os.path.join(s_bd, "extra.mbt"), "w") as f:
+        f.write("pub fn x() -> Int { 1 }\n")
+    r_bd = run_cli(["--src", s_bd, "--out", o_bd, "--target", "wasm32", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_bd.returncode == 1, f"10m-3 {tag_bad} must fail (rc=1), got {r_bd.returncode}"
+    assert "MBT2PION_UNSUPPORTED_TARGET_RULE" in (r_bd.stdout + r_bd.stderr), f"10m-3 {tag_bad} missing MBT2PION_UNSUPPORTED_TARGET_RULE"
+
+print("[e2e] PASS: Final Astra P0 fail-closed unknown moon.pkg rules (10m-3: [\"debug\"] & [\"not\", \"debug\"] -> rc=1 MBT2PION_UNSUPPORTED_TARGET_RULE)")
 
 # 10n. Red-team P0 live native acceptance:
 #      extern "C" fn c_abs(x : Int) -> Int = "abs" + #cfg(target="js") js_only + #cfg(target="native") native_only + kept()
@@ -1458,6 +1477,23 @@ assert r10n_run.returncode == 0, f"10n pionc run failed: {r10n_run.stdout} {r10n
 assert r10n_run.stdout.strip() == "2", f"10n expected '2', got {r10n_run.stdout!r}"
 
 print("[e2e] PASS: Red-team P0 suite (10n: extern \"C\" fn c_abs = \"abs\" + #cfg(target=\"js\") excluded + live native run == 2)")
+
+# 10n-2. Astra P1: `#borrow(s) extern "C" fn first(s : String) -> Int = "first_unit"` MUST fail publish (rc=1)
+#        with MBT2PION_UNSUPPORTED_FFI_SIGNATURE and disposition `fn:first` == "unsupported"!
+s10n2 = os.path.join(root, "s10n2")
+o10n2 = os.path.join(root, "o10n2")
+rep10n2 = os.path.join(root, "rep10n2.json")
+os.makedirs(s10n2, exist_ok=True)
+with open(os.path.join(s10n2, "bad_ffi.mbt"), "w") as f:
+    f.write('#borrow(s)\nextern "C" fn first(s : String) -> Int = "first_unit"\n')
+r10n2 = run_cli(["--src", s10n2, "--out", o10n2, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", compat_dir, "--pionc", pionc, "--report", rep10n2])
+assert r10n2.returncode == 1, f"10n-2 non-C-ABI extern C fn must fail (rc=1), got {r10n2.returncode}"
+assert "MBT2PION_UNSUPPORTED_FFI_SIGNATURE" in (r10n2.stdout + r10n2.stderr), "10n-2 missing MBT2PION_UNSUPPORTED_FFI_SIGNATURE"
+disps10n2 = [(d["decl"], d["disposition"]) for d in json.load(open(rep10n2))["dispositions"]]
+assert disps10n2 == [("fn:first", "unsupported")], f"10n-2 unexpected dispositions: {disps10n2}"
+
+print("[e2e] PASS: Final Astra P1 suite (10n-2: #borrow(s) String extern \"C\" fn -> rc=1 MBT2PION_UNSUPPORTED_FFI_SIGNATURE + unsupported)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"

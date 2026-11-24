@@ -2207,6 +2207,53 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
 
 ///| Lower a single `.mbt` file through Stage A, emitting declaration anchors,
 ///| extracting top-level `let`/`fn init` into `ctx.init_items`, and recording span maps.
+///| Exact Pion compiler C-ABI parameter type allowlist (`compiler/src/core/types.pion`).
+fn is_pion_c_abi_param_type(ty : String) -> Bool {
+  let t = ty.trim()
+  t == "Int" || t == "Int64" || t == "UInt" || t == "UInt64" || t == "Double" ||
+  t == "Float" || t == "Float32" || t == "Bool" || t == "Byte" || t == "Int8" || t == "Ptr"
+}
+
+///| Exact Pion compiler C-ABI return type allowlist (param types + `Unit`).
+fn is_pion_c_abi_ret_type(ty : String) -> Bool {
+  let t = ty.trim()
+  t == "Unit" || is_pion_c_abi_param_type(t)
+}
+
+///| Validate every parameter in a lowered `p_str` (`x : T, y : U`) against Pion's C-ABI allowlist.
+fn check_pion_c_abi_params(p_str : String) -> Bool {
+  let s = p_str.trim()
+  if s.length() == 0 {
+    return true
+  }
+  let mut start = 0
+  let mut depth = 0
+  let mut i = 0
+  while i <= s.length() {
+    let at_end = i == s.length()
+    let c = if at_end { 44 } else { s.code_unit_at(i) }
+    if !at_end && (c == 40 || c == 91 || c == 123) {
+      depth = depth + 1
+    } else if !at_end && (c == 41 || c == 93 || c == 125) {
+      if depth > 0 { depth = depth - 1 }
+    } else if depth == 0 && c == 44 {
+      let part = s.slice(start, i).trim()
+      if part.length() > 0 {
+        let ci = part.index_of(":")
+        if ci < 0 {
+          return false
+        }
+        if !is_pion_c_abi_param_type(part.slice(ci + 1, part.length())) {
+          return false
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  true
+}
+
 pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile {
   let tokens = lex_moonbit(sf.content)
   let n = tokens.length() - 1
@@ -2227,9 +2274,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
     let mut attrs_trivia = StringBuilder()
     let mut kept_attrs = StringBuilder()
 
-    // Collect leading attributes (`#callsite`, `#warnings`, `#deprecated`, `#cfg`, `#derive`)
+    // Collect leading attributes (`#callsite`, `#warnings`, `#deprecated`, `#cfg`, `#derive`, `#borrow`/`#owned`)
     let mut pending_derives : Array[String] = []
     let pending_cfgs : Array[Token] = []
+    let pending_ffi_attrs : Array[String] = []
     while i < n && tokens[i].kind == TokenKind::Attr {
       let at = tokens[i]
       attrs_trivia.write_string(at.leading_trivia)
@@ -2237,6 +2285,9 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         autofill_loc = true
       } else if at.raw.starts_with("#cfg") {
         pending_cfgs.push(at)
+      } else if at.raw.starts_with("#borrow") || at.raw.starts_with("#owned") {
+        pending_ffi_attrs.push(at.raw)
+        kept_attrs.write_string("// mbt-attr: " + at.raw + "\n")
       } else if at.raw.starts_with("#warnings") || at.raw.starts_with("#deprecated") {
         // Strip MoonBit-only compiler directives cleanly
         kept_attrs.write_string("// mbt-attr: " + at.raw + "\n")
@@ -3033,6 +3084,21 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
               decl_col,
               "unsupported MoonBit extern/intrinsic function declaration `= ...` (requires explicit lowering or overlay)",
             ))
+          } else {
+            let ret_ty = if ret_str.starts_with(" -> ") {
+              ret_str.slice(4, ret_str.length()).trim()
+            } else {
+              "Unit"
+            }
+            if pending_ffi_attrs.length() > 0 || !check_pion_c_abi_params(p_str) || !is_pion_c_abi_ret_type(ret_ty) {
+              ctx.diags.push(diag_error(
+                "MBT2PION_UNSUPPORTED_FFI_SIGNATURE",
+                sf.rel_path,
+                decl_line,
+                decl_col,
+                "extern \"C\" function `" + fn_name + "` uses non-C-ABI Pion type or unsupported MoonBit FFI attribute (requires explicit lowering or overlay)",
+              ))
+            }
           }
           let decl_code = if is_legal_c_ffi {
             vis + "extern \"C\" fn " + fn_name + "(" + p_str + ")" + ret_str + " = " + rhs_raw
