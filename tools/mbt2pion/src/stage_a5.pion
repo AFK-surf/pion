@@ -1,0 +1,708 @@
+///| Stage A.5: Type-Probe Pass for silent-compile drift sites.
+///|
+///| Instruments syntactically ambiguous silent-drift sites on a scratch copy:
+///| - `x.length()` -> `x.mbt_len_probe()`
+///| - `x[i]` -> `x.mbt_idx_probe(i)`
+///| - `a / b` (when `b` not statically proven non-zero) -> `a.mbt_div_probe(b)`
+///| - `a % b` (when `b` not statically proven non-zero) -> `a.mbt_mod_probe(b)`
+///| - `x.to_string()` -> `x.mbt_show_probe()`
+///| - `r.val` -> `r.mbt_val_probe()`
+///|
+///| Calls `pionc check --json` via callback, enforces strict coverage guard
+///| (`probe_diagnostics_received == probes_instrumented` every round; mismatch hard-fails),
+///| rewrites each site by `(probe, resolved_type)`, records `semantic_drift_ledger.json`,
+///| iterates for nested probes, and enforces 0 `mbt_*_probe` residuals.
+
+import "json" as json
+
+pub struct ProbeSite {
+  file : String
+  probe_kind : String
+  start_byte : Int
+  end_byte : Int
+  line : Int
+  col : Int
+  lhs_expr : String
+  rhs_expr : String
+  divisor_is_zero : Bool
+}
+
+pub struct ProbeResult {
+  file : String
+  line : Int
+  col : Int
+  probe_kind : String
+  resolved_type : String
+}
+
+///| Parse `pionc check --json` stdout into structured `PioncDiag`s.
+pub fn parse_pionc_diagnostics(json_text : String) -> Array[PioncDiag] {
+  let out : Array[PioncDiag] = []
+  let trimmed = json_text.trim()
+  if trimmed.length() == 0 {
+    return out
+  }
+  // Find first `{` in case stderr/warnings preceded JSON
+  let start = trimmed.index_of("{")
+  let clean = if start >= 0 { trimmed.slice(start, trimmed.length()) } else { trimmed }
+  let root = match json::parse(clean) {
+    Ok(v) => v
+    Err(_) => return out
+  }
+  match json::obj_get(root, "diagnostics") {
+    Some(arr_v) =>
+    match json::as_arr(arr_v) {
+      Some(items) => {
+        for it in items {
+          let file = match json::obj_get(it, "file") {
+            Some(v) => match json::as_str(v) { Some(s) => s, None => "" }
+            None => ""
+          }
+          let line = match json::obj_get(it, "line") {
+            Some(v) => match json::as_int(v) { Some(n) => n.to_int(), None => 0 }
+            None => 0
+          }
+          let col = match json::obj_get(it, "col") {
+            Some(v) => match json::as_int(v) { Some(n) => n.to_int(), None => 0 }
+            None => 0
+          }
+          let code = match json::obj_get(it, "code") {
+            Some(v) => match json::as_str(v) { Some(s) => s, None => "" }
+            None => ""
+          }
+          let message = match json::obj_get(it, "message") {
+            Some(v) => match json::as_str(v) { Some(s) => s, None => "" }
+            None => ""
+          }
+          let expected = match json::obj_get(it, "expected") {
+            Some(v) => match json::as_str(v) { Some(s) => s, None => "" }
+            None => ""
+          }
+          let found = match json::obj_get(it, "found") {
+            Some(v) => match json::as_str(v) { Some(s) => s, None => "" }
+            None => ""
+          }
+          let fixit = match json::obj_get(it, "fixit") {
+            Some(v) => match json::as_str(v) { Some(s) => s, None => "" }
+            None => ""
+          }
+          out.push(PioncDiag::{
+            file: file,
+            line: line,
+            col: col,
+            code: code,
+            message: message,
+            expected: expected,
+            found: found,
+            fixit: fixit,
+          })
+        }
+      }
+      None => ()
+    }
+    None => ()
+  }
+  out
+}
+
+///| Extract `(probe_kind, resolved_type)` from a `pionc` diagnostic message of the form:
+///| `unknown method `mbt_*_probe` on type `<T>``
+pub fn extract_probe_from_diag(d : PioncDiag) -> Option[(String, String)] {
+  let prefix = "unknown method `mbt_"
+  let p_idx = d.message.index_of(prefix)
+  if p_idx < 0 {
+    return None
+  }
+  let after_m = d.message.slice(p_idx + 16, d.message.length())
+  let tick_end = after_m.index_of("`")
+  if tick_end < 0 {
+    return None
+  }
+  let probe_name = after_m.slice(0, tick_end)
+  if !probe_name.ends_with("_probe") {
+    return None
+  }
+  let on_ty = " on type `"
+  let ty_idx = after_m.index_of(on_ty)
+  if ty_idx < 0 {
+    return None
+  }
+  let after_ty = after_m.slice(ty_idx + on_ty.length(), after_m.length())
+  let ty_end = after_ty.index_of("`")
+  if ty_end < 0 {
+    return None
+  }
+  let resolved_ty = after_ty.slice(0, ty_end)
+  Some((probe_name, resolved_ty))
+}
+
+///| Check whether a numeric literal token is statically known to be non-zero.
+pub fn is_statically_nonzero_literal(tok : Token) -> Bool {
+  if tok.kind != TokenKind::IntLit && tok.kind != TokenKind::FloatLit {
+    return false
+  }
+  let s = tok.raw
+  let n = s.length()
+  let mut i = 0
+  if n >= 2 && s.code_unit_at(0) == 48 && (s.code_unit_at(1) == 120 || s.code_unit_at(1) == 88 || s.code_unit_at(1) == 98 || s.code_unit_at(1) == 66 || s.code_unit_at(1) == 111 || s.code_unit_at(1) == 79) {
+    i = 2
+  }
+  while i < n {
+    let c = s.code_unit_at(i)
+    if (c >= 49 && c <= 57) || (c >= 65 && c <= 70) || (c >= 97 && c <= 102) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///| Check whether a numeric literal token is statically known to be zero (`0`, `0L`, `0x0`, etc.).
+pub fn is_statically_zero_literal(tok : Token) -> Bool {
+  if tok.kind != TokenKind::IntLit {
+    return false
+  }
+  !is_statically_nonzero_literal(tok)
+}
+
+///| Supported integer types for checked division/modulo lowering.
+pub fn checked_div_helper(ty : String, is_mod : Bool) -> Option[String] {
+  let op = if is_mod { "mod_checked_" } else { "div_checked_" }
+  if ty == "Int" {
+    Some("mbt_compat::" + op + "int")
+  } else if ty == "Int64" {
+    Some("mbt_compat::" + op + "int64")
+  } else if ty == "UInt" {
+    Some("mbt_compat::" + op + "uint")
+  } else if ty == "UInt64" {
+    Some("mbt_compat::" + op + "uint64")
+  } else if ty == "Byte" {
+    Some("mbt_compat::" + op + "byte")
+  } else {
+    None
+  }
+}
+
+pub fn is_float_type(ty : String) -> Bool {
+  ty == "Double" || ty == "Float"
+}
+
+pub fn is_unsupported_int_type(ty : String) -> Bool {
+  ty == "Int16" || ty == "UInt16" || ty == "Int8" || ty == "UInt8" || ty == "Int128" || ty == "UInt128"
+}
+
+///| Instrument a single Pion file with `mbt_*_probe` calls for one pass.
+///| Returns `(instrumented_source, list_of_probe_sites)`.
+///| Skips sites already rewritten to `mbt_compat::*` or inside comments/strings (lexer-driven!).
+pub fn instrument_probes_for_file(file : String, content : String) -> (String, Array[ProbeSite]) {
+  let tokens = lex_moonbit(content)
+  let n = tokens.length() - 1
+  let sites : Array[ProbeSite] = []
+  let sb = StringBuilder()
+  let mut i = 0
+
+  while i < n {
+    let t = tokens[i]
+
+    // 0. Interpolated string `"...\{x}..."` where `x` is a simple identifier -> probe `x.mbt_show_probe()`
+    if t.kind == TokenKind::InterpString {
+      let parts = split_interp_string(t.raw, false)
+      let mut has_ident_interp = false
+      for p in parts {
+        if p.is_expr {
+          let et = p.text.trim()
+          if et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
+            has_ident_interp = true
+          }
+        }
+      }
+      if has_ident_interp {
+        let mut rebuilt = StringBuilder()
+        rebuilt.write_string("\"")
+        for p in parts {
+          if !p.is_expr {
+            rebuilt.write_string(p.text)
+          } else {
+            let et = p.text.trim()
+            if et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
+              sites.push(ProbeSite::{
+                file: file,
+                probe_kind: "mbt_show_probe",
+                start_byte: t.start_byte,
+                end_byte: t.end_byte,
+                line: t.line,
+                col: t.col,
+                lhs_expr: et,
+                rhs_expr: t.raw,
+                divisor_is_zero: false,
+              })
+              rebuilt.write_string("\\{" + et + ".mbt_show_probe()}")
+            } else {
+              rebuilt.write_string("\\{" + p.text + "}")
+            }
+          }
+        }
+        rebuilt.write_string("\"")
+        sb.write_string(t.leading_trivia + rebuilt.to_string())
+        i = i + 1
+        continue
+      }
+    }
+
+    // Skip `let` / `fn` / `struct` / `enum` declaration headers (only instrument inside expressions)
+    // 1. `<ident>.length()` -> `<ident>.mbt_len_probe()`
+    if t.kind == TokenKind::Ident && i + 4 < n &&
+    tokens[i + 1].kind == TokenKind::Dot &&
+    tokens[i + 2].raw == "length" &&
+    tokens[i + 3].kind == TokenKind::LParen &&
+    tokens[i + 4].kind == TokenKind::RParen {
+      // Avoid double-probing inside `mbt_compat::`
+      let prev_cc = i > 0 && tokens[i - 1].kind == TokenKind::ColonColon
+      if !prev_cc {
+        let start_b = t.start_byte
+        let end_b = tokens[i + 4].end_byte
+        sites.push(ProbeSite::{
+          file: file,
+          probe_kind: "mbt_len_probe",
+          start_byte: start_b,
+          end_byte: end_b,
+          line: t.line,
+          col: t.col,
+          lhs_expr: t.raw,
+          rhs_expr: "",
+          divisor_is_zero: false,
+        })
+        sb.write_string(t.leading_trivia + t.raw + ".mbt_len_probe()")
+        i = i + 5
+        continue
+      }
+    }
+
+    // 2. `<ident>.to_string()` -> `<ident>.mbt_show_probe()`
+    if t.kind == TokenKind::Ident && i + 4 < n &&
+    tokens[i + 1].kind == TokenKind::Dot &&
+    tokens[i + 2].raw == "to_string" &&
+    tokens[i + 3].kind == TokenKind::LParen &&
+    tokens[i + 4].kind == TokenKind::RParen {
+      let start_b = t.start_byte
+      let end_b = tokens[i + 4].end_byte
+      sites.push(ProbeSite::{
+        file: file,
+        probe_kind: "mbt_show_probe",
+        start_byte: start_b,
+        end_byte: end_b,
+        line: t.line,
+        col: t.col,
+        lhs_expr: t.raw,
+        rhs_expr: "",
+        divisor_is_zero: false,
+      })
+      sb.write_string(t.leading_trivia + t.raw + ".mbt_show_probe()")
+      i = i + 5
+      continue
+    }
+
+    // 3. `<ident>.val` -> `<ident>.mbt_val_probe()`
+    if t.kind == TokenKind::Ident && i + 2 < n &&
+    tokens[i + 1].kind == TokenKind::Dot &&
+    tokens[i + 2].raw == "val" {
+      let start_b = t.start_byte
+      let end_b = tokens[i + 2].end_byte
+      sites.push(ProbeSite::{
+        file: file,
+        probe_kind: "mbt_val_probe",
+        start_byte: start_b,
+        end_byte: end_b,
+        line: t.line,
+        col: t.col,
+        lhs_expr: t.raw,
+        rhs_expr: "",
+        divisor_is_zero: false,
+      })
+      sb.write_string(t.leading_trivia + t.raw + ".mbt_val_probe()")
+      i = i + 3
+      continue
+    }
+
+    // 4. `<ident>[<idx>]` (simple index expression, not type params or slice) -> `<ident>.mbt_idx_probe(<idx>)`
+    if t.kind == TokenKind::Ident && i + 3 < n &&
+    tokens[i + 1].kind == TokenKind::LBracket {
+      let close_br = find_matching_delim(tokens, i + 1)
+      let prev_kw = i > 0 && (tokens[i - 1].raw == "fn" || tokens[i - 1].raw == "struct" || tokens[i - 1].raw == "enum")
+      let next_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
+      if !prev_kw && !next_eq && close_br > i + 2 {
+        let idx_expr = content.slice(tokens[i + 2].start_byte, tokens[close_br - 1].end_byte).trim()
+        sites.push(ProbeSite::{
+          file: file,
+          probe_kind: "mbt_idx_probe",
+          start_byte: t.start_byte,
+          end_byte: tokens[close_br].end_byte,
+          line: t.line,
+          col: t.col,
+          lhs_expr: t.raw,
+          rhs_expr: idx_expr,
+          divisor_is_zero: false,
+        })
+        sb.write_string(t.leading_trivia + t.raw + ".mbt_idx_probe(" + idx_expr + ")")
+        i = close_br + 1
+        continue
+      }
+    }
+
+    // 5. `<lhs> / <rhs>` or `<lhs> % <rhs>` when `<rhs>` is NOT statically proven non-zero!
+    if (t.kind == TokenKind::Ident || t.kind == TokenKind::IntLit || t.kind == TokenKind::FloatLit) &&
+    i + 2 < n && (tokens[i + 1].kind == TokenKind::Slash || tokens[i + 1].kind == TokenKind::Percent) {
+      let op_tok = tokens[i + 1]
+      let rhs_tok = tokens[i + 2]
+      let is_mod = op_tok.kind == TokenKind::Percent
+      if !is_statically_nonzero_literal(rhs_tok) &&
+      (rhs_tok.kind == TokenKind::Ident || rhs_tok.kind == TokenKind::IntLit) {
+        let pkind = if is_mod { "mbt_mod_probe" } else { "mbt_div_probe" }
+        let is_zero = is_statically_zero_literal(rhs_tok)
+        sites.push(ProbeSite::{
+          file: file,
+          probe_kind: pkind,
+          start_byte: t.start_byte,
+          end_byte: rhs_tok.end_byte,
+          line: op_tok.line,
+          col: op_tok.col,
+          lhs_expr: t.raw,
+          rhs_expr: rhs_tok.raw,
+          divisor_is_zero: is_zero,
+        })
+        sb.write_string(t.leading_trivia + t.raw + "." + pkind + "(" + rhs_tok.raw + ")")
+        i = i + 3
+        continue
+      }
+    }
+
+    sb.write_string(t.leading_trivia + t.raw)
+    i = i + 1
+  }
+  if tokens.length() > 0 {
+    sb.write_string(tokens[tokens.length() - 1].leading_trivia)
+  }
+  (sb.to_string(), sites)
+}
+
+///| Compute the rewritten expression for a single `(ProbeSite, resolved_type)` pair.
+///| Returns `Some(replacement)` if a rewrite is needed, or `None` if original code stays untouched.
+pub fn rewrite_for_probe(
+  site : ProbeSite,
+  resolved_type : String,
+  recipes : Recipes,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Option[String] {
+  if site.probe_kind == "mbt_len_probe" {
+    if resolved_type == "String" {
+      drift_ledger.push(DriftEntry::{
+        category: "string_utf16_len",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: site.lhs_expr + ".length()",
+        resolution: "mbt_compat::utf16_len",
+        status: "resolved",
+        detail: "String.length() routed to UTF-16 code-unit length",
+      })
+      return Some("mbt_compat::utf16_len(" + site.lhs_expr + ")")
+    }
+    return None
+  }
+
+  if site.probe_kind == "mbt_idx_probe" {
+    if resolved_type == "String" {
+      drift_ledger.push(DriftEntry::{
+        category: "string_utf16_index",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: site.lhs_expr + "[" + site.rhs_expr + "]",
+        resolution: "mbt_compat::utf16_code_unit_at",
+        status: "resolved",
+        detail: "String[i] routed to UTF-16 code unit access",
+      })
+      return Some("mbt_compat::utf16_code_unit_at(" + site.lhs_expr + ", " + site.rhs_expr + ")")
+    }
+    return None
+  }
+
+  if site.probe_kind == "mbt_div_probe" || site.probe_kind == "mbt_mod_probe" {
+    let is_mod = site.probe_kind == "mbt_mod_probe"
+    if is_float_type(resolved_type) {
+      return None
+    }
+    if is_unsupported_int_type(resolved_type) {
+      diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_INT_DIV",
+        site.file,
+        site.line,
+        site.col,
+        "unsupported integer type `" + resolved_type + "` for checked division/modulo",
+      ))
+      drift_ledger.push(DriftEntry::{
+        category: "int_div_zero",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: site.lhs_expr + (if is_mod { " % " } else { " / " }) + site.rhs_expr,
+        resolution: "blocked",
+        status: "unresolved",
+        detail: "unsupported integer type " + resolved_type,
+      })
+      return None
+    }
+    match checked_div_helper(resolved_type, is_mod) {
+      Some(helper) => {
+        if site.divisor_is_zero {
+          // Statically known 0: preserve lhs evaluation order then trap explicitly!
+          drift_ledger.push(DriftEntry::{
+            category: "int_div_zero",
+            file: site.file,
+            line: site.line,
+            col: site.col,
+            expr: site.lhs_expr + (if is_mod { " % 0" } else { " / 0" }),
+            resolution: "explicit_trap_preserving_eval_order",
+            status: "resolved",
+            detail: "statically known zero divisor on " + resolved_type + " lowered to explicit trap",
+          })
+          return Some("{ let _ = " + site.lhs_expr + "; panic(\"integer division by zero\") }")
+        }
+        drift_ledger.push(DriftEntry::{
+          category: "int_div_zero",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: site.lhs_expr + (if is_mod { " % " } else { " / " }) + site.rhs_expr,
+          resolution: helper,
+          status: "resolved",
+          detail: "runtime divisor on " + resolved_type + " lowered to checked helper (wasm-gc trap oracle)",
+        })
+        return Some(helper + "(" + site.lhs_expr + ", " + site.rhs_expr + ")")
+      }
+      None => return None
+    }
+  }
+
+  if site.probe_kind == "mbt_show_probe" {
+    if resolved_type == "Double" {
+      drift_ledger.push(DriftEntry::{
+        category: "double_to_string",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: if site.rhs_expr.length() > 0 { site.rhs_expr } else { site.lhs_expr + ".to_string()" },
+        resolution: "mbt_compat::double_to_string",
+        status: "resolved",
+        detail: "Double formatting routed to MoonBit-compatible formatter",
+      })
+      if site.rhs_expr.length() > 0 {
+        return Some(str_replace_all(site.rhs_expr, "\\{" + site.lhs_expr + "}", "\\{mbt_compat::double_to_string(" + site.lhs_expr + ")}"))
+      }
+      return Some("mbt_compat::double_to_string(" + site.lhs_expr + ")")
+    }
+    return None
+  }
+
+  if site.probe_kind == "mbt_val_probe" {
+    let is_ref = resolved_type.starts_with("Ref[") ||
+    (recipes.ref_recipe.enabled && recipes.ref_recipe.type_name.length() > 0 && resolved_type.starts_with(recipes.ref_recipe.type_name))
+    if is_ref {
+      let field = if recipes.ref_recipe.enabled && recipes.ref_recipe.field_name.length() > 0 {
+        recipes.ref_recipe.field_name
+      } else {
+        "v"
+      }
+      return Some(site.lhs_expr + "." + field)
+    }
+    // Non-Ref struct field named `val` -> renamed field `val_`!
+    return Some(site.lhs_expr + ".val_")
+  }
+
+  None
+}
+
+///| Apply non-overlapping byte-range edits `(start, end, replacement)` to a string (sorted descending).
+pub fn apply_byte_edits(src : String, edits : Array[(Int, Int, String)]) -> String {
+  if edits.length() == 0 {
+    return src
+  }
+  let sorted : Array[(Int, Int, String)] = []
+  for e in edits {
+    sorted.push(e)
+  }
+  // Sort ascending by start_byte
+  let mut i = 1
+  while i < sorted.length() {
+    let key = sorted[i]
+    let mut j = i - 1
+    while j >= 0 && sorted[j].0 > key.0 {
+      sorted[j + 1] = sorted[j]
+      j = j - 1
+    }
+    sorted[j + 1] = key
+    i = i + 1
+  }
+  let sb = StringBuilder()
+  let mut cursor = 0
+  for e in sorted {
+    if e.0 >= cursor && e.1 <= src.length() {
+      sb.write_string(src.slice(cursor, e.0))
+      sb.write_string(e.2)
+      cursor = e.1
+    }
+  }
+  if cursor < src.length() {
+    sb.write_string(src.slice(cursor, src.length()))
+  }
+  sb.to_string()
+}
+
+///| Check whether a file still contains any `mbt_*_probe` residual (hard merge gate!).
+pub fn has_probe_residual(content : String) -> Bool {
+  str_has(content, "mbt_len_probe") ||
+  str_has(content, "mbt_idx_probe") ||
+  str_has(content, "mbt_div_probe") ||
+  str_has(content, "mbt_mod_probe") ||
+  str_has(content, "mbt_show_probe") ||
+  str_has(content, "mbt_val_probe")
+}
+
+///| Execute Stage A.5 on a set of generated files using a `check_fn` callback that runs
+///| `pionc check --json` on the instrumented file map and returns the raw JSON output.
+///| Enforces the mandatory coverage guard: `probe_diagnostics_received == probes_instrumented`.
+pub fn run_stage_a5(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  let mut cur_files : Array[GeneratedFile] = []
+  for f in files {
+    cur_files.push(f)
+  }
+  let mut total_rounds = 0
+  let mut total_instrumented = 0
+  let mut total_resolved = 0
+
+  let mut round = 0
+  while round < 3 {
+    let instrumented_batch : Array[(String, String)] = []
+    let sites_by_file : Map[String, Array[ProbeSite]] = Map()
+    let mut round_probes = 0
+
+    for f in cur_files {
+      let (inst_src, sites) = instrument_probes_for_file(f.rel_path, f.content)
+      instrumented_batch.push((f.rel_path, inst_src))
+      sites_by_file[f.rel_path] = sites
+      round_probes = round_probes + sites.length()
+    }
+
+    if round_probes == 0 {
+      break
+    }
+
+    total_rounds = total_rounds + 1
+    total_instrumented = total_instrumented + round_probes
+
+    let raw_json = check_fn(instrumented_batch)
+    let pionc_diags = parse_pionc_diagnostics(raw_json)
+
+    // Collect probe diagnostics matched by `(file_suffix, line, probe_kind)`
+    let probe_results : Array[ProbeResult] = []
+    for pd in pionc_diags {
+      match extract_probe_from_diag(pd) {
+        Some((pkind, rty)) =>
+        probe_results.push(ProbeResult::{
+          file: pd.file,
+          line: pd.line,
+          col: pd.col,
+          probe_kind: pkind,
+          resolved_type: rty,
+        })
+        None => ()
+      }
+    }
+
+    // MANDATORY COVERAGE GUARD: probe_diagnostics_received MUST equal probes_instrumented!
+    if probe_results.length() != round_probes {
+      diags.push(diag_error(
+        "MBT2PION_PROBE_MISMATCH",
+        "<stage_a5>",
+        round + 1,
+        1,
+        "Stage A.5 coverage guard failed in round " + (round + 1).to_string() +
+        ": probes_instrumented=" + round_probes.to_string() +
+        " != probe_diagnostics_received=" + probe_results.length().to_string(),
+      ))
+      break
+    }
+
+    total_resolved = total_resolved + probe_results.length()
+
+    // Apply rewrites to each file
+    let next_files : Array[GeneratedFile] = []
+    let mut any_changed = false
+    for f in cur_files {
+      let sites = match sites_by_file.get(f.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let edits : Array[(Int, Int, String)] = []
+      let mut si = 0
+      while si < sites.length() {
+        let site = sites[si]
+        // Match probe result by file suffix + line + probe_kind
+        let mut matched_ty = ""
+        for pr in probe_results {
+          if (pr.file == site.file || pr.file.ends_with("/" + site.file)) &&
+          pr.line == site.line && pr.probe_kind == site.probe_kind {
+            matched_ty = pr.resolved_type
+            break
+          }
+        }
+        if matched_ty.length() > 0 {
+          match rewrite_for_probe(site, matched_ty, recipes, diags, drift_ledger) {
+            Some(repl) => edits.push((site.start_byte, site.end_byte, repl))
+            None => ()
+          }
+        }
+        si = si + 1
+      }
+      if edits.length() > 0 {
+        any_changed = true
+        let updated = apply_byte_edits(f.content, edits)
+        next_files.push(GeneratedFile::{
+          rel_path: f.rel_path,
+          content: updated,
+          source_file: f.source_file,
+          anchors: f.anchors,
+        })
+      } else {
+        next_files.push(f)
+      }
+    }
+    cur_files = next_files
+    if !any_changed {
+      break
+    }
+    round = round + 1
+  }
+
+  // Final hard gate: 0 `mbt_*_probe` residuals!
+  for f in cur_files {
+    if has_probe_residual(f.content) {
+      diags.push(diag_error(
+        "MBT2PION_PROBE_RESIDUAL",
+        f.rel_path,
+        1,
+        1,
+        "Stage A.5 residual probe identifier found in final output of " + f.rel_path,
+      ))
+    }
+  }
+
+  (cur_files, total_rounds, total_instrumented, total_resolved)
+}

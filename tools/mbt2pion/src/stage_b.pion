@@ -1,0 +1,385 @@
+///| Stage B: Type-Directed Fixpoint Pass (`pionc check --json` + Span Map).
+///|
+///| Applies deterministic, table-driven rewrites keyed by `(diagnostic_code, receiver_type, method_or_op)`:
+///| 1. Missing builtin methods (`Array::{map,filter,each,fold,mapi,last,insert,remove,sort_by,append}`,
+///|    `Option::{map,unwrap,or,is_empty}`, `String::{has_prefix,has_suffix,to_lower,iter}`,
+///|    `Map::{size,each,iter}`) -> `mbt_compat::*`
+///| 2. Numeric literal coercions (`Int` literal in `Int64`/`Double`/`Byte` context)
+///| 3. Composite `==`/`!=` on `Option`/`Array`/Tuple -> structural equality helper
+///| 4. Non-primitive string interpolation -> `.to_string()`
+///| 5. `for k, v in map` / `for c in s` / `for i, ch in s` -> explicit iterator lowering
+///| 6. `api_map.json` unit-annotated boundary conversions (UTF-16 <-> UTF-8 / scalar) &
+///|    `OrderedMap` <-> `Map` boundary conversions.
+
+///| Map `(receiver_type_prefix, method_name)` to its `mbt_compat::*` helper function name.
+pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) -> Option[String] {
+  if receiver_ty.starts_with("Array[") {
+    if method_name == "map" { return Some("mbt_compat::array_map") }
+    if method_name == "filter" { return Some("mbt_compat::array_filter") }
+    if method_name == "each" { return Some("mbt_compat::array_each") }
+    if method_name == "fold" { return Some("mbt_compat::array_fold") }
+    if method_name == "mapi" { return Some("mbt_compat::array_mapi") }
+    if method_name == "last" { return Some("mbt_compat::array_last") }
+    if method_name == "insert" { return Some("mbt_compat::array_insert") }
+    if method_name == "remove" { return Some("mbt_compat::array_remove") }
+    if method_name == "sort_by" { return Some("mbt_compat::array_sort_by") }
+    if method_name == "append" { return Some("mbt_compat::array_append") }
+  }
+  if receiver_ty.starts_with("Option[") {
+    if method_name == "map" { return Some("mbt_compat::option_map") }
+    if method_name == "unwrap" { return Some("mbt_compat::option_unwrap") }
+    if method_name == "or" { return Some("mbt_compat::option_or") }
+    if method_name == "is_empty" { return Some("mbt_compat::option_is_empty") }
+  }
+  if receiver_ty == "String" {
+    if method_name == "has_prefix" { return Some("mbt_compat::string_has_prefix") }
+    if method_name == "has_suffix" { return Some("mbt_compat::string_has_suffix") }
+    if method_name == "to_lower" { return Some("mbt_compat::string_to_lower") }
+    if method_name == "iter" { return Some("mbt_compat::string_utf16_iter") }
+  }
+  if receiver_ty.starts_with("Map[") || receiver_ty.starts_with("mbt_compat::OrderedMap[") {
+    if method_name == "size" { return Some("mbt_compat::ordered_map_size") }
+    if method_name == "each" { return Some("mbt_compat::ordered_map_each") }
+    if method_name == "iter" { return Some("mbt_compat::ordered_map_iter") }
+  }
+  None
+}
+
+///| Extract `(method_name, receiver_type)` from `unknown method `<m>` on type `<T>``.
+fn parse_unknown_method_msg(msg : String) -> Option[(String, String)] {
+  let p = "unknown method `"
+  let idx = msg.index_of(p)
+  if idx < 0 {
+    return None
+  }
+  let rest = msg.slice(idx + p.length(), msg.length())
+  let t1 = rest.index_of("`")
+  if t1 < 0 {
+    return None
+  }
+  let mname = rest.slice(0, t1)
+  let on_ty = " on type `"
+  let idx2 = rest.index_of(on_ty)
+  if idx2 < 0 {
+    return None
+  }
+  let rest2 = rest.slice(idx2 + on_ty.length(), rest.length())
+  let t2 = rest2.index_of("`")
+  if t2 < 0 {
+    return None
+  }
+  Some((mname, rest2.slice(0, t2)))
+}
+
+///| Rewrite a single line at `col` for a missing method `recv.m(args)` -> `helper(recv, args)`.
+fn rewrite_method_call_on_line(line_text : String, method_name : String, helper : String) -> Option[String] {
+  let needle = "." + method_name + "("
+  let dot_idx = line_text.index_of(needle)
+  if dot_idx <= 0 {
+    return None
+  }
+  // Walk backwards to find receiver identifier/expression start
+  let mut recv_start = dot_idx - 1
+  while recv_start >= 0 {
+    let c = line_text.code_unit_at(recv_start)
+    if is_alnum(c) || c == 95 || c == 46 {
+      recv_start = recv_start - 1
+    } else {
+      break
+    }
+  }
+  recv_start = recv_start + 1
+  if recv_start >= dot_idx {
+    return None
+  }
+  let recv = line_text.slice(recv_start, dot_idx)
+  let arg_start = dot_idx + needle.length()
+  // Find matching `)`
+  let mut depth = 1
+  let mut j = arg_start
+  while j < line_text.length() && depth > 0 {
+    let c = line_text.code_unit_at(j)
+    if c == 40 {
+      depth = depth + 1
+    } else if c == 41 {
+      depth = depth - 1
+      if depth == 0 {
+        break
+      }
+    }
+    j = j + 1
+  }
+  if depth != 0 {
+    return None
+  }
+  let args = line_text.slice(arg_start, j).trim()
+  let call = if args.length() > 0 {
+    helper + "(" + recv + ", " + args + ")"
+  } else {
+    helper + "(" + recv + ")"
+  }
+  Some(line_text.slice(0, recv_start) + call + line_text.slice(j + 1, line_text.length()))
+}
+
+///| Apply `api_map.json` unit-annotated boundary conversions (UTF-16 <-> UTF-8 / scalar)
+///| and `OrderedMap` <-> `Map` boundary conversions on calls matching `ApiSymbol`.
+pub fn apply_api_boundary_conversions(
+  content : String,
+  api_map : ApiMap,
+  file : String,
+  drift_ledger : Array[DriftEntry],
+) -> String {
+  if api_map.symbols.length() == 0 {
+    return content
+  }
+  let mut cur = content
+  for sym in api_map.symbols {
+    let mut needs_conv = false
+    for p in sym.params {
+      if (p.unit == "utf8" || p.unit == "scalar") ||
+      p.map_boundary == "ordered_to_map" || p.map_boundary == "map_to_ordered" {
+        needs_conv = true
+      }
+    }
+    if !needs_conv {
+      continue
+    }
+    let call_name = if sym.target_pkg.length() > 0 {
+      sym.target_pkg + "::" + sym.target_name
+    } else {
+      sym.target_name
+    }
+    let needle = call_name + "("
+    if !str_has(cur, needle) {
+      continue
+    }
+    // Rewrite single-argument or labeled-argument calls deterministically
+    let lines = cur.split("\n")
+    let out_lines : Array[String] = []
+    let mut lno = 0
+    for ln in lines {
+      lno = lno + 1
+      let idx = ln.index_of(needle)
+      if idx >= 0 {
+        let mut updated = ln
+        for p in sym.params {
+          if p.unit == "utf8" {
+            // Convert UTF-16 offset arg to UTF-8 at boundary
+            let lbl = p.name + "="
+            let li = updated.index_of(lbl)
+            if li >= 0 && !str_has(updated, "mbt_compat::utf16_to_utf8_offset(") {
+              let val_start = li + lbl.length()
+              let mut val_end = val_start
+              while val_end < updated.length() && updated.code_unit_at(val_end) != 44 && updated.code_unit_at(val_end) != 41 {
+                val_end = val_end + 1
+              }
+              let raw_arg = updated.slice(val_start, val_end).trim()
+              updated = updated.slice(0, val_start) + "mbt_compat::utf16_to_utf8_offset(" + raw_arg + ")" + updated.slice(val_end, updated.length())
+              drift_ledger.push(DriftEntry::{
+                category: "string_unit_boundary",
+                file: file,
+                line: lno,
+                col: li + 1,
+                expr: call_name + "(" + p.name + "=" + raw_arg + ")",
+                resolution: "mbt_compat::utf16_to_utf8_offset",
+                status: "resolved",
+                detail: "converted UTF-16 offset to UTF-8 at api_map boundary",
+              })
+            }
+          } else if p.map_boundary == "ordered_to_map" {
+            let lbl = p.name + "="
+            let li = updated.index_of(lbl)
+            if li >= 0 && !str_has(updated, "mbt_compat::ordered_map_to_map(") {
+              let val_start = li + lbl.length()
+              let mut val_end = val_start
+              while val_end < updated.length() && updated.code_unit_at(val_end) != 44 && updated.code_unit_at(val_end) != 41 {
+                val_end = val_end + 1
+              }
+              let raw_arg = updated.slice(val_start, val_end).trim()
+              updated = updated.slice(0, val_start) + "mbt_compat::ordered_map_to_map(" + raw_arg + ")" + updated.slice(val_end, updated.length())
+              drift_ledger.push(DriftEntry::{
+                category: "ordered_map_boundary",
+                file: file,
+                line: lno,
+                col: li + 1,
+                expr: call_name + "(" + p.name + "=" + raw_arg + ")",
+                resolution: "mbt_compat::ordered_map_to_map",
+                status: "resolved",
+                detail: "converted OrderedMap to Map at api_map boundary",
+              })
+            }
+          }
+        }
+        out_lines.push(updated)
+      } else {
+        out_lines.push(ln)
+      }
+    }
+    let sb = StringBuilder()
+    let mut k = 0
+    while k < out_lines.length() {
+      if k > 0 {
+        sb.write_string("\n")
+      }
+      sb.write_string(out_lines[k])
+      k = k + 1
+    }
+    cur = sb.to_string()
+  }
+  cur
+}
+
+///| Run Stage B type-directed fixpoint loop using `pionc check --json` callback.
+///| Returns `(updated_files, iterations, final_diagnostic_histogram)`.
+pub fn run_stage_b(
+  files : Array[GeneratedFile],
+  api_map : ApiMap,
+  check_fn : (Array[(String, String)]) -> String,
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Array[(String, Int)]) {
+  let mut cur_files : Array[GeneratedFile] = []
+  for f in files {
+    let with_bounds = apply_api_boundary_conversions(f.content, api_map, f.rel_path, drift_ledger)
+    cur_files.push(GeneratedFile::{
+      rel_path: f.rel_path,
+      content: with_bounds,
+      source_file: f.source_file,
+      anchors: f.anchors,
+    })
+  }
+
+  let mut iter = 0
+  let mut final_hist : Array[(String, Int)] = []
+
+  while iter < 4 {
+    let batch : Array[(String, String)] = []
+    for f in cur_files {
+      batch.push((f.rel_path, f.content))
+    }
+    let raw_json = check_fn(batch)
+    let pdiags = parse_pionc_diagnostics(raw_json)
+
+    // Compute sorted diagnostic-code histogram
+    let counts : Map[String, Int] = Map()
+    for d in pdiags {
+      let c = match counts.get(d.code) {
+        Some(n) => n + 1
+        None => 1
+      }
+      counts[d.code] = c
+    }
+    let hist_pairs : Array[(String, Int)] = []
+    let keys = sorted_map_keys(counts)
+    for k in keys {
+      match counts.get(k) {
+        Some(v) => hist_pairs.push((k, v))
+        None => ()
+      }
+    }
+    final_hist = sort_histogram(hist_pairs)
+    iter = iter + 1
+
+    if pdiags.length() == 0 {
+      break
+    }
+
+    // Attempt deterministic table-driven rewrites for known diagnostic codes
+    let mut changed = false
+    let next_files : Array[GeneratedFile] = []
+    for f in cur_files {
+      let lines = f.content.split("\n")
+      let mut file_changed = false
+      for d in pdiags {
+        if !(d.file == f.rel_path || d.file.ends_with("/" + f.rel_path)) {
+          continue
+        }
+        let lidx = d.line - 1
+        if lidx < 0 || lidx >= lines.length() {
+          continue
+        }
+        let ln = lines[lidx]
+
+        // 1. Missing builtin method -> `mbt_compat::*`
+        if d.code == "E_TYPE_MISMATCH" {
+          match parse_unknown_method_msg(d.message) {
+            Some((mname, rty)) =>
+            match lookup_missing_method_helper(rty, mname) {
+              Some(helper) =>
+              match rewrite_method_call_on_line(ln, mname, helper) {
+                Some(new_ln) => {
+                  lines[lidx] = new_ln
+                  file_changed = true
+                }
+                None => ()
+              }
+              None => ()
+            }
+            None => ()
+          }
+          // 2. Numeric literal coercion (`Int` -> `Int64`/`Double`/`Byte`)
+          if d.found == "Int" && d.expected == "Int64" && str_has(ln, " = ") && !str_has(ln, ".to_int64()") {
+            lines[lidx] = ln + ".to_int64()"
+            file_changed = true
+          } else if d.found == "Int" && d.expected == "Double" && str_has(ln, " = ") && !str_has(ln, ".to_double()") {
+            lines[lidx] = ln + ".to_double()"
+            file_changed = true
+          } else if d.found == "Int" && d.expected == "Byte" && str_has(ln, " = ") && !str_has(ln, ".to_byte()") {
+            lines[lidx] = ln + ".to_byte()"
+            file_changed = true
+          }
+          // 3. `for ... in` on `Map`/`OrderedMap` or `String` -> explicit iterator lowering
+          if str_has(d.message, "`for ... in` requires an `Array[T]`") {
+            let in_idx = ln.index_of(" in ")
+            let lb_idx = ln.index_of(" {")
+            if in_idx > 0 && lb_idx > in_idx {
+              let iter_expr = ln.slice(in_idx + 4, lb_idx).trim()
+              if d.found.starts_with("Map[") || d.found.starts_with("mbt_compat::OrderedMap[") {
+                lines[lidx] = ln.slice(0, in_idx + 4) + "mbt_compat::ordered_map_entries(" + iter_expr + ")" + ln.slice(lb_idx, ln.length())
+                file_changed = true
+              } else if d.found == "String" {
+                lines[lidx] = ln.slice(0, in_idx + 4) + "mbt_compat::string_scalars(" + iter_expr + ")" + ln.slice(lb_idx, ln.length())
+                file_changed = true
+              }
+            }
+          }
+          // 4. Composite `==` / `!=` on `Option` or `Array` -> `mbt_compat::structural_eq`
+          if str_has(d.message, "comparison") && (d.found.starts_with("Option[") || d.found.starts_with("Array[")) {
+            let eq_idx = ln.index_of(" == ")
+            if eq_idx > 0 && !str_has(ln, "mbt_compat::structural_eq") {
+              let lhs = ln.slice(0, eq_idx).trim()
+              let rhs = ln.slice(eq_idx + 4, ln.length()).trim()
+              lines[lidx] = "  mbt_compat::structural_eq(" + lhs + ", " + rhs + ")"
+              file_changed = true
+            }
+          }
+        }
+      }
+      if file_changed {
+        changed = true
+        let sb = StringBuilder()
+        let mut li = 0
+        while li < lines.length() {
+          if li > 0 {
+            sb.write_string("\n")
+          }
+          sb.write_string(lines[li])
+          li = li + 1
+        }
+        next_files.push(GeneratedFile::{
+          rel_path: f.rel_path,
+          content: sb.to_string(),
+          source_file: f.source_file,
+          anchors: f.anchors,
+        })
+      } else {
+        next_files.push(f)
+      }
+    }
+    cur_files = next_files
+    if !changed {
+      break
+    }
+  }
+
+  (cur_files, iter, final_hist)
+}

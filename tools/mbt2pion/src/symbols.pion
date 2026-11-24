@@ -1,0 +1,569 @@
+///| Package interface & symbol table loader:
+///| - Parses `api_map.json` with strict `unit` validation on offset-like Int params/returns
+///| - Parses `recipes.toml` (declarative, zero hardcoded project identifiers)
+///| - Parses `.mbti` (`pkg.generated.mbti`) and `pionc doc --json` symbol tables
+///| - Resolves cross-package enum constructors & detects ambiguities with source spans
+
+import "json" as json
+
+///| Valid string unit annotations in `api_map.json`.
+pub fn is_valid_unit(u : String) -> Bool {
+  u == "utf8" || u == "utf16" || u == "scalar" || u == "none"
+}
+
+///| Heuristic check for string offset/length-like parameter/field names that MUST carry
+///| an explicit `unit` annotation (`utf8`/`utf16`/`scalar`/`none`) in `api_map.json`.
+pub fn is_offset_like_name(name : String) -> Bool {
+  let s = ascii_to_lower(name)
+  s == "offset" ||
+  s == "byte_offset" ||
+  s == "char_offset" ||
+  s == "utf8_offset" ||
+  s == "utf16_offset" ||
+  s == "index" ||
+  s == "idx" ||
+  s == "pos" ||
+  s == "start" ||
+  s == "end" ||
+  s == "len" ||
+  s == "length" ||
+  s == "cursor" ||
+  s == "caret" ||
+  s == "selection_start" ||
+  s == "selection_end" ||
+  s.ends_with("_offset") ||
+  s.ends_with("_idx") ||
+  s.ends_with("_index") ||
+  s.ends_with("_len") ||
+  s.ends_with("_length") ||
+  s.ends_with("_pos")
+}
+
+fn j_str(v : json::JsonValue, key : String, def : String) -> String {
+  match json::obj_get(v, key) {
+    Some(x) =>
+    match json::as_str(x) {
+      Some(s) => s
+      None => def
+    }
+    None => def
+  }
+}
+
+fn j_bool(v : json::JsonValue, key : String, def : Bool) -> Bool {
+  match json::obj_get(v, key) {
+    Some(x) =>
+    match json::as_bool(x) {
+      Some(b) => b
+      None => def
+    }
+    None => def
+  }
+}
+
+///| Parse `api_map.json` and validate all string-offset unit annotations.
+///| Hard-fails (emits error diagnostics) if any offset-like `Int` param/return lacks a valid `unit`.
+pub fn parse_api_map(content : String, path : String, diags : Array[Diag]) -> ApiMap {
+  let out = empty_api_map()
+  if content.trim().length() == 0 {
+    return out
+  }
+  let root = match json::parse(content) {
+    Ok(v) => v
+    Err(e) => {
+      diags.push(diag_error("MBT2PION_APIMAP_PARSE", path, 1, 1, "failed to parse api_map.json: " + e))
+      return out
+    }
+  }
+  match json::obj_get(root, "pkg_aliases") {
+    Some(json::JsonValue::JObj(fields)) => {
+      for f in fields {
+        match json::as_str(f.value) {
+          Some(v) => out.pkg_aliases[f.key] = v
+          None => ()
+        }
+      }
+    }
+    _ => ()
+  }
+  match json::obj_get(root, "symbols") {
+    Some(arr_v) =>
+    match json::as_arr(arr_v) {
+      Some(items) => {
+        for item in items {
+          let src_pkg = j_str(item, "src_pkg", "")
+          let src_name = j_str(item, "src_name", "")
+          let kind = j_str(item, "kind", "fn")
+          let target_pkg = j_str(item, "target_pkg", src_pkg)
+          let target_name = j_str(item, "target_name", src_name)
+          let target_enum = j_str(item, "target_enum", "")
+          let ret_ty = j_str(item, "ret_ty", "")
+          let ret_unit = j_str(item, "ret_unit", "")
+          let ret_map_boundary = j_str(item, "ret_map_boundary", "none")
+          let autofill_loc = j_bool(item, "autofill_loc", false)
+          let external_tilde_default = j_bool(item, "external_tilde_default", false)
+          let params : Array[ApiParam] = []
+          match json::obj_get(item, "params") {
+            Some(pv) =>
+            match json::as_arr(pv) {
+              Some(pitems) => {
+                for pi in pitems {
+                  let pname = j_str(pi, "name", "")
+                  let pty = j_str(pi, "ty", "")
+                  let punit = j_str(pi, "unit", "")
+                  let pmb = j_str(pi, "map_boundary", "none")
+                  let is_opt = j_bool(pi, "is_optional", false)
+                  let has_def = j_bool(pi, "has_default", false)
+                  if pty == "Int" && is_offset_like_name(pname) {
+                    if !is_valid_unit(punit) {
+                      diags.push(diag_error(
+                        "MBT2PION_UNTAGGED_UNIT",
+                        path,
+                        1,
+                        1,
+                        "api_map symbol `" + src_pkg + "::" + src_name + "` offset-like Int param `" + pname + "` must declare explicit `unit` (`utf8`|`utf16`|`scalar`|`none`), got `" + punit + "`",
+                      ))
+                    }
+                  } else if punit.length() > 0 && !is_valid_unit(punit) {
+                    diags.push(diag_error(
+                      "MBT2PION_INVALID_UNIT",
+                      path,
+                      1,
+                      1,
+                      "api_map symbol `" + src_pkg + "::" + src_name + "` param `" + pname + "` has invalid unit `" + punit + "`",
+                    ))
+                  }
+                  params.push(ApiParam::{
+                    name: pname,
+                    ty: pty,
+                    is_optional: is_opt,
+                    has_default: has_def,
+                    unit: if punit.length() == 0 { "none" } else { punit },
+                    map_boundary: pmb,
+                  })
+                }
+              }
+              None => ()
+            }
+            None => ()
+          }
+          if ret_ty == "Int" && is_offset_like_name(src_name) && !is_valid_unit(ret_unit) {
+            diags.push(diag_error(
+              "MBT2PION_UNTAGGED_UNIT",
+              path,
+              1,
+              1,
+              "api_map symbol `" + src_pkg + "::" + src_name + "` offset-like Int return must declare explicit `ret_unit` (`utf8`|`utf16`|`scalar`|`none`)",
+            ))
+          }
+          out.symbols.push(ApiSymbol::{
+            src_pkg: src_pkg,
+            src_name: src_name,
+            kind: kind,
+            target_pkg: target_pkg,
+            target_name: target_name,
+            target_enum: target_enum,
+            params: params,
+            ret_ty: ret_ty,
+            ret_unit: if ret_unit.length() == 0 { "none" } else { ret_unit },
+            ret_map_boundary: ret_map_boundary,
+            autofill_loc: autofill_loc,
+            external_tilde_default: external_tilde_default,
+          })
+        }
+      }
+      None => ()
+    }
+    None => ()
+  }
+  out
+}
+
+///| Strip surrounding double quotes from a TOML string scalar.
+fn unquote_toml(s : String) -> String {
+  let t = s.trim()
+  if t.length() >= 2 && t.starts_with("\"") && t.ends_with("\"") {
+    return t.slice(1, t.length() - 1)
+  }
+  t
+}
+
+///| Parse declarative `recipes.toml` (supports `[ref]`, `[eq]`, `[derives]`, `[[trait_impl]]`).
+pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) -> Recipes {
+  let mut ref_enabled = false
+  let mut ref_ctor = ""
+  let mut ref_field = "v"
+  let mut ref_type = ""
+  let mut eq_wrapper = ""
+  let mut eq_prefix = "__mbt_eq_"
+  let allowed_derives : Array[String] = ["Eq"]
+  let trait_recipes : Array[TraitRecipe] = []
+
+  let mut section = ""
+  let mut cur_derive = ""
+  let mut cur_trait = ""
+  let mut cur_method = ""
+  let mut cur_kind = "eq"
+  let mut in_trait_item = false
+
+  let lines = content.split("\n")
+  let mut line_no = 0
+  for raw_line in lines {
+    line_no = line_no + 1
+    let line = raw_line.trim()
+    if line.length() == 0 || line.starts_with("#") {
+      continue
+    }
+    if line.starts_with("[[") && line.ends_with("]]") {
+      if in_trait_item && cur_derive.length() > 0 && cur_trait.length() > 0 {
+        trait_recipes.push(TraitRecipe::{
+          derive_name: cur_derive,
+          target_trait: cur_trait,
+          method_name: cur_method,
+          kind: cur_kind,
+        })
+      }
+      section = line.slice(2, line.length() - 2).trim()
+      in_trait_item = section == "trait_impl"
+      cur_derive = ""
+      cur_trait = ""
+      cur_method = ""
+      cur_kind = "eq"
+      continue
+    }
+    if line.starts_with("[") && line.ends_with("]") {
+      if in_trait_item && cur_derive.length() > 0 && cur_trait.length() > 0 {
+        trait_recipes.push(TraitRecipe::{
+          derive_name: cur_derive,
+          target_trait: cur_trait,
+          method_name: cur_method,
+          kind: cur_kind,
+        })
+      }
+      in_trait_item = false
+      section = line.slice(1, line.length() - 1).trim()
+      continue
+    }
+    let eq_idx = line.index_of("=")
+    if eq_idx < 0 {
+      diags.push(diag_error("MBT2PION_RECIPE_PARSE", path, line_no, 1, "invalid recipes.toml line: " + line))
+      continue
+    }
+    let key = line.slice(0, eq_idx).trim()
+    let val_s = line.slice(eq_idx + 1, line.length()).trim()
+    if section == "ref" {
+      if key == "enabled" {
+        ref_enabled = val_s == "true"
+      } else if key == "ctor_call" {
+        ref_ctor = unquote_toml(val_s)
+        if ref_ctor.length() > 0 {
+          ref_enabled = true
+        }
+      } else if key == "field_name" {
+        ref_field = unquote_toml(val_s)
+      } else if key == "type_name" {
+        ref_type = unquote_toml(val_s)
+      }
+    } else if section == "eq" {
+      if key == "wrapper_call" {
+        eq_wrapper = unquote_toml(val_s)
+      } else if key == "helper_prefix" {
+        eq_prefix = unquote_toml(val_s)
+      }
+    } else if section == "derives" {
+      if key == "allow" && val_s.starts_with("[") && val_s.ends_with("]") {
+        let inner = val_s.slice(1, val_s.length() - 1)
+        let items = inner.split(",")
+        for it in items {
+          let d = unquote_toml(it)
+          if d.length() > 0 {
+            let mut found = false
+            for e in allowed_derives {
+              if e == d {
+                found = true
+              }
+            }
+            if !found {
+              allowed_derives.push(d)
+            }
+          }
+        }
+      }
+    } else if in_trait_item {
+      if key == "derive" {
+        cur_derive = unquote_toml(val_s)
+      } else if key == "target_trait" {
+        cur_trait = unquote_toml(val_s)
+      } else if key == "method" {
+        cur_method = unquote_toml(val_s)
+      } else if key == "kind" {
+        cur_kind = unquote_toml(val_s)
+      }
+    }
+  }
+  if in_trait_item && cur_derive.length() > 0 && cur_trait.length() > 0 {
+    trait_recipes.push(TraitRecipe::{
+      derive_name: cur_derive,
+      target_trait: cur_trait,
+      method_name: cur_method,
+      kind: cur_kind,
+    })
+  }
+  Recipes::{
+    ref_recipe: RefRecipe::{ enabled: ref_enabled, ctor_call: ref_ctor, field_name: ref_field, type_name: ref_type },
+    trait_recipes: trait_recipes,
+    eq_recipe: EqRecipe::{ wrapper_call: eq_wrapper, helper_prefix: eq_prefix },
+    allowed_derives: allowed_derives,
+  }
+}
+
+///| Symbol table combining intra-package declarations, `.mbti`, `pionc doc --json`, and `api_map.json`.
+pub struct CtorTarget {
+  pkg : String
+  enum_name : String
+  ctor_name : String
+  is_local : Bool
+}
+
+pub struct SymbolTable {
+  ctors : Map[String, Array[CtorTarget]]
+  autofill_loc_fns : Map[String, Bool]
+  external_tilde_fns : Map[String, Bool]
+  api_by_key : Map[String, ApiSymbol]
+  pkg_aliases : Map[String, String]
+}
+
+pub fn empty_symbol_table() -> SymbolTable {
+  SymbolTable::{
+    ctors: Map(),
+    autofill_loc_fns: Map(),
+    external_tilde_fns: Map(),
+    api_by_key: Map(),
+    pkg_aliases: Map(),
+  }
+}
+
+pub fn symtab_add_ctor(st : SymbolTable, ctor_name : String, target : CtorTarget) -> Unit {
+  let list = match st.ctors.get(ctor_name) {
+    Some(xs) => xs
+    None => {
+      let xs : Array[CtorTarget] = []
+      st.ctors[ctor_name] = xs
+      xs
+    }
+  }
+  for existing in list {
+    if existing.pkg == target.pkg && existing.enum_name == target.enum_name && existing.is_local == target.is_local {
+      return
+    }
+  }
+  list.push(target)
+}
+
+///| Load symbols from `ApiMap` into `SymbolTable`.
+pub fn symtab_load_api_map(st : SymbolTable, am : ApiMap) -> Unit {
+  let alias_keys = sorted_map_keys(am.pkg_aliases)
+  for k in alias_keys {
+    match am.pkg_aliases.get(k) {
+      Some(v) => st.pkg_aliases[k] = v
+      None => ()
+    }
+  }
+  for sym in am.symbols {
+    let key = if sym.src_pkg.length() > 0 { sym.src_pkg + "::" + sym.src_name } else { sym.src_name }
+    st.api_by_key[key] = sym
+    if sym.autofill_loc {
+      st.autofill_loc_fns[sym.src_name] = true
+      st.autofill_loc_fns[key] = true
+    }
+    if sym.external_tilde_default {
+      st.external_tilde_fns[sym.src_name] = true
+      st.external_tilde_fns[key] = true
+    }
+    if sym.kind == "ctor" {
+      symtab_add_ctor(st, sym.src_name, CtorTarget::{
+        pkg: sym.target_pkg,
+        enum_name: sym.target_enum,
+        ctor_name: sym.target_name,
+        is_local: false,
+      })
+    }
+  }
+}
+
+///| Load enum constructors and `#callsite(autofill(loc))` signatures from a `.mbti` file.
+pub fn symtab_load_mbti(st : SymbolTable, pkg_name : String, content : String) -> Unit {
+  let lines = content.split("\n")
+  let mut in_enum = ""
+  let mut next_autofill = false
+  for raw in lines {
+    let line = raw.trim()
+    if line.starts_with("#callsite") && str_has(line, "autofill(loc)") {
+      next_autofill = true
+      continue
+    }
+    if line.starts_with("pub(all) enum ") || line.starts_with("pub enum ") || line.starts_with("enum ") {
+      let rest = if line.starts_with("pub(all) enum ") {
+        line.slice(14, line.length())
+      } else if line.starts_with("pub enum ") {
+        line.slice(9, line.length())
+      } else {
+        line.slice(5, line.length())
+      }
+      let mut end_i = 0
+      while end_i < rest.length() && is_alnum(rest.code_unit_at(end_i)) {
+        end_i = end_i + 1
+      }
+      in_enum = rest.slice(0, end_i)
+      continue
+    }
+    if in_enum.length() > 0 {
+      if line == "}" {
+        in_enum = ""
+        continue
+      }
+      if line.length() > 0 && is_upper(line.code_unit_at(0)) {
+        let mut ci = 0
+        while ci < line.length() && is_alnum(line.code_unit_at(ci)) {
+          ci = ci + 1
+        }
+        let cname = line.slice(0, ci)
+        symtab_add_ctor(st, cname, CtorTarget::{
+          pkg: pkg_name,
+          enum_name: in_enum,
+          ctor_name: cname,
+          is_local: false,
+        })
+      }
+    }
+    if next_autofill && (line.starts_with("pub fn ") || line.starts_with("fn ")) {
+      let rest = if line.starts_with("pub fn ") { line.slice(7, line.length()) } else { line.slice(3, line.length()) }
+      let mut fi = 0
+      while fi < rest.length() && is_alnum(rest.code_unit_at(fi)) {
+        fi = fi + 1
+      }
+      let fname = rest.slice(0, fi)
+      if fname.length() > 0 {
+        st.autofill_loc_fns[fname] = true
+        if pkg_name.length() > 0 {
+          st.autofill_loc_fns[pkg_name + "::" + fname] = true
+        }
+      }
+      next_autofill = false
+    }
+  }
+}
+
+///| Load enum constructors and function signatures from `pionc doc --json` output.
+pub fn symtab_load_pionc_doc_json(st : SymbolTable, json_text : String) -> Unit {
+  if json_text.trim().length() == 0 {
+    return
+  }
+  let root = match json::parse(json_text) {
+    Ok(v) => v
+    Err(_) => return
+  }
+  match json::obj_get(root, "packages") {
+    Some(pv) =>
+    match json::as_arr(pv) {
+      Some(pkgs) => {
+        for pkg in pkgs {
+          let pkg_name = j_str(pkg, "name", "")
+          match json::obj_get(pkg, "items") {
+            Some(iv) =>
+            match json::as_arr(iv) {
+              Some(items) => {
+                for it in items {
+                  let kind = j_str(it, "kind", "")
+                  let name = j_str(it, "name", "")
+                  let sig = j_str(it, "sig", "")
+                  if kind == "enum" && name.length() > 0 {
+                    let lb = sig.index_of("{")
+                    let rb = sig.index_of("}")
+                    if lb >= 0 && rb > lb {
+                      let body = sig.slice(lb + 1, rb)
+                      let parts = body.split(";")
+                      for p in parts {
+                        let t = p.trim()
+                        if t.length() > 0 && is_upper(t.code_unit_at(0)) {
+                          let mut ci = 0
+                          while ci < t.length() && is_alnum(t.code_unit_at(ci)) {
+                            ci = ci + 1
+                          }
+                          let cname = t.slice(0, ci)
+                          symtab_add_ctor(st, cname, CtorTarget::{
+                            pkg: pkg_name,
+                            enum_name: name,
+                            ctor_name: cname,
+                            is_local: false,
+                          })
+                        }
+                      }
+                    }
+                  } else if kind == "fn" && str_has(sig, "~ :") && str_has(sig, "=") {
+                    st.external_tilde_fns[name] = true
+                    if pkg_name.length() > 0 {
+                      st.external_tilde_fns[pkg_name + "::" + name] = true
+                    }
+                  }
+                }
+              }
+              None => ()
+            }
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+    None => ()
+  }
+}
+
+///| Resolve an unqualified enum constructor name:
+///| - Local enum constructors remain unqualified (Pion-native)
+///| - Single cross-package match -> `pkg::Enum::Case` (or `.Case` when `allow_leading_dot`)
+///| - Multiple cross-package matches -> ambiguity error with source span
+pub fn resolve_ctor(
+  st : SymbolTable,
+  name : String,
+  allow_leading_dot : Bool,
+  file : String,
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+) -> Option[String] {
+  match st.ctors.get(name) {
+    None => None
+    Some(targets) => {
+      for t in targets {
+        if t.is_local {
+          return None
+        }
+      }
+      if targets.length() == 1 {
+        let t = targets[0]
+        if allow_leading_dot {
+          return Some("." + t.ctor_name)
+        }
+        if t.pkg.length() > 0 && t.enum_name.length() > 0 {
+          return Some(t.pkg + "::" + t.enum_name + "::" + t.ctor_name)
+        }
+        if t.enum_name.length() > 0 {
+          return Some(t.enum_name + "::" + t.ctor_name)
+        }
+        return Some("." + t.ctor_name)
+      }
+      if targets.length() > 1 {
+        diags.push(diag_error(
+          "MBT2PION_AMBIGUOUS_CTOR",
+          file,
+          line,
+          col,
+          "ambiguous cross-package constructor `" + name + "` matches " + targets.length().to_string() + " enum variants",
+        ))
+      }
+      None
+    }
+  }
+}

@@ -1,0 +1,311 @@
+///| Comprehensive public-safe unit tests for `tools/mbt2pion` (zero project-specific identifiers).
+
+fn assert_true(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic("ASSERTION FAILED: " + msg)
+  }
+}
+
+fn assert_eq(a : Int, b : Int) -> Unit {
+  if a != b {
+    panic("ASSERTION FAILED: expected " + b.to_string() + ", got " + a.to_string())
+  }
+}
+
+fn noop_check(_batch : Array[(String, String)]) -> String {
+  "{\"ok\":true,\"diagnostics\":[]}"
+}
+
+test "lexer lossless round-trip across MoonBit touchstone matrix" {
+  let src = "// line comment\n" +
+  "///| doc comment\n" +
+  "/* nested /* block */ comment */\n" +
+  "#callsite(autofill(loc))\n" +
+  "pub(all) fn demo(x? : Int = 1_000, f : () -> Int?) -> String {\n" +
+  "  let hex = 0xFF_00L\n" +
+  "  let bin = 0b1010_0101\n" +
+  "  let flt = 1.5e-7\n" +
+  "  let ch = '\\u{1F600}'\n" +
+  "  let by = b'A'\n" +
+  "  let bs = b\"hi\"\n" +
+  "  let raw = #|raw \\{no_interp}\n" +
+  "  let interp = \"a=\\{x + 1} b=\\{\"inner\"}\"\n" +
+  "  let mline = $|line \\{x}\n" +
+  "  let r = 0..<10\n" +
+  "  let r2 = 0..=10\n" +
+  "  let a = xs\n" +
+  "    |> f\n" +
+  "  let b = obj\n" +
+  "    ..push(1)\n" +
+  "  interp\n" +
+  "}\n"
+  let toks = lex_moonbit(src)
+  let rebuilt = tokens_to_source(toks)
+  assert_true(rebuilt == src, "lossless lexer round-trip must preserve every byte")
+  let mut saw_interp = false
+  let mut saw_raw_ml = false
+  let mut saw_interp_ml = false
+  let mut saw_dotdot_lt = false
+  let mut saw_dotdot_eq = false
+  let mut saw_nl_pipegt = false
+  let mut saw_nl_dotdot = false
+  for t in toks {
+    if t.kind == TokenKind::InterpString { saw_interp = true }
+    if t.kind == TokenKind::RawMultiline { saw_raw_ml = true }
+    if t.kind == TokenKind::InterpMultiline { saw_interp_ml = true }
+    if t.kind == TokenKind::DotDotLt { saw_dotdot_lt = true }
+    if t.kind == TokenKind::DotDotEq { saw_dotdot_eq = true }
+    if t.kind == TokenKind::PipeGt && t.newline_before { saw_nl_pipegt = true }
+    if t.kind == TokenKind::DotDot && t.newline_before { saw_nl_dotdot = true }
+  }
+  assert_true(saw_interp, "must lex InterpString")
+  assert_true(saw_raw_ml, "must lex RawMultiline #|")
+  assert_true(saw_interp_ml, "must lex InterpMultiline $|")
+  assert_true(saw_dotdot_lt, "must lex ..<")
+  assert_true(saw_dotdot_eq, "must lex ..=")
+  assert_true(saw_nl_pipegt, "must track newline_before on |>")
+  assert_true(saw_nl_dotdot, "must track newline_before on ..")
+}
+
+test "stage A: value-returning guard rewritten while diverging guard stays native" {
+  let src = SourceFile::{
+    rel_path: "guards.mbt",
+    content: "pub fn val_g(ok : Bool) -> Int {\n  guard ok else { 17 }\n  42\n}\n\npub fn div_g(ok : Bool) -> Int {\n  guard ok else { return 0 }\n  42\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  assert_eq(res.files.length(), 1)
+  let out = res.files[0].content
+  assert_true(str_has(out, "if ok {"), "value-returning guard must rewrite to if/else")
+  assert_true(str_has(out, "guard ok else { return 0 }"), "diverging guard must remain Pion-native")
+  assert_true(res.drift_ledger.length() >= 1, "value guard recorded in drift ledger")
+}
+
+test "stage A: topological init order with indirect fn reads and cycle detection" {
+  let f1 = SourceFile::{
+    rel_path: "a.mbt",
+    content: "let first : Int = helper()\n\nfn helper() -> Int {\n  second + 1\n}\n\nfn init {\n  let _ = first\n}\n",
+    is_test: false,
+  }
+  let f2 = SourceFile::{
+    rel_path: "b.mbt",
+    content: "let second : Int = 42\n",
+    is_test: false,
+  }
+  let res = transpile_package([f1, f2], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let mut init_code = ""
+  for gf in res.files {
+    if gf.rel_path == "00_init_order.pion" {
+      init_code = gf.content
+    }
+  }
+  assert_true(init_code.length() > 0, "00_init_order.pion must be emitted")
+  let pos_second = init_code.index_of("let second")
+  let pos_first = init_code.index_of("let first")
+  let pos_init = init_code.index_of("__mbt_init_a_mbt_1")
+  assert_true(pos_second >= 0 && pos_first > pos_second, "second must initialize before first (indirect read via helper)")
+  assert_true(pos_init > pos_first, "fn init must initialize after first")
+
+  // Negative test: cyclic top-level initialization must hard-fail
+  let cyc = SourceFile::{
+    rel_path: "cyc.mbt",
+    content: "let x : Int = y + 1\nlet y : Int = x + 1\n",
+    is_test: false,
+  }
+  let cyc_res = transpile_package([cyc], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(cyc_res.blockers > 0, "cyclic init must produce blocker")
+  let mut found_cycle_code = false
+  for d in cyc_res.diagnostics {
+    if d.code == "MBT2PION_INIT_CYCLE" {
+      found_cycle_code = true
+    }
+  }
+  assert_true(found_cycle_code, "must emit MBT2PION_INIT_CYCLE")
+}
+
+test "stage A: optional default forwarding, cascade, types, arrow fn, SourceLoc, and keywords" {
+  let api_json = "{\"pkg_aliases\":{\"ext\":\"acme_ext\"},\"symbols\":[" +
+  "{\"src_pkg\":\"ext\",\"src_name\":\"FixedTag\",\"kind\":\"ctor\",\"target_pkg\":\"acme_ext\",\"target_name\":\"FixedTag\",\"target_enum\":\"Tag\"}," +
+  "{\"src_pkg\":\"ext\",\"src_name\":\"ext_tally\",\"kind\":\"fn\",\"target_pkg\":\"acme_ext\",\"target_name\":\"ext_tally\",\"external_tilde_default\":true}" +
+  "]}"
+  let pre_diags : Array[Diag] = []
+  let am = parse_api_map(api_json, "api_map.json", pre_diags)
+  assert_eq(pre_diags.length(), 0)
+
+  let src = SourceFile::{
+    rel_path: "syntax.mbt",
+    content: "#callsite(autofill(loc))\n" +
+    "pub fn trace(msg : String, loc~ : SourceLoc) -> String {\n  msg + loc\n}\n\n" +
+    "pub fn tally(base : Int, x? : Int = 17) -> Int {\n  base + x\n}\n\n" +
+    "pub fn relay(a : Int, x? : Int) -> Int {\n  let _ = trace(\"one\")\n  let _ = trace(\"two\")\n  let _ = @ext.ext_tally(a, x?)\n  tally(a, x?)\n}\n\n" +
+    "pub fn syntax_mix(f : () -> Int?, val : Int, xs : Array[Int]) -> Array[Int] {\n" +
+    "  let g = (n) => n + val\n" +
+    "  let _ = FixedTag\n" +
+    "  let _ = b\"ok\"\n" +
+    "  let _ = xs[1:3]\n" +
+    "  let _ = { \"k\": 1 }\n" +
+    "  xs..push(g(1))..push(2)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "loc~ : String = \"\""), "SourceLoc lowered to String default")
+  assert_true(str_has(out, "loc=\"syntax.mbt:11:"), "callsite 1 gets distinct SourceLoc")
+  assert_true(str_has(out, "loc=\"syntax.mbt:12:"), "callsite 2 gets distinct SourceLoc")
+  assert_true(str_has(out, "match x { Some(__mbt_v) => __mbt_v, None => 17 }"), "migrated default lazy None branch")
+  assert_true(str_has(out, "tally(a, x?=x)"), "optional forwarding to migrated callee")
+  assert_true(str_has(out, "acme_ext::ext_tally(__mbt_arg_"), "external tilde default call-site branch")
+  assert_true(str_has(out, "() -> Option[Int]"), "T? precedence in function return type")
+  assert_true(str_has(out, "val_ : Int"), "keyword val renamed consistently")
+  assert_true(str_has(out, "fn(n) { n + val_ }"), "arrow fn lowered and keyword renamed")
+  assert_true(str_has(out, "acme_ext::Tag::FixedTag"), "cross-package constructor qualified")
+  assert_true(str_has(out, "\"ok\".to_bytes()"), "byte string lowered")
+  assert_true(str_has(out, "mbt_compat::array_view_clamp(xs, 1, 3)"), "slice lowered")
+  assert_true(str_has(out, "mbt_compat::ordered_map_from([(\"k\", 1)])"), "map literal lowered")
+  assert_true(str_has(out, "__mbt_cas_"), "cascade evaluates receiver once and returns receiver")
+}
+
+test "stage A: strict derive allowlist rejects unknown derive and recipes synthesize generic trait" {
+  let recipes_toml = "[ref]\n" +
+  "enabled = true\n" +
+  "ctor_call = \"acme::cell_new\"\n" +
+  "field_name = \"v\"\n" +
+  "type_name = \"acme::Cell\"\n\n" +
+  "[[trait_impl]]\n" +
+  "derive = \"Eq\"\n" +
+  "target_trait = \"acme::ReactiveEq\"\n" +
+  "method = \"eq\"\n"
+  let rdiags : Array[Diag] = []
+  let rec = parse_recipes_toml(recipes_toml, "recipes.toml", rdiags)
+  assert_eq(rdiags.length(), 0)
+
+  let ok_src = SourceFile::{
+    rel_path: "rec.mbt",
+    content: "#derive(Eq)\npub(all) struct Boxed {\n  n : Int\n}\n\npub fn mk() -> Ref[Int] {\n  { val: 9 }\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([ok_src], empty_api_map(), rec, [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "impl acme::ReactiveEq for Boxed"), "recipe synthesized generic trait impl")
+  assert_true(str_has(out, "acme::cell_new(9)"), "recipe bound Ref literal")
+  assert_true(str_has(out, "acme::Cell[Int]"), "recipe bound Ref type")
+
+  // Negative test: unknown `#derive(Mystery)` hard-fails
+  let bad_src = SourceFile::{
+    rel_path: "bad_derive.mbt",
+    content: "#derive(Mystery)\npub struct Bad { x : Int }\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(bad_res.blockers > 0, "unknown derive must block")
+  assert_true(bad_res.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "must emit MBT2PION_UNKNOWN_DERIVE")
+}
+
+test "stage A.5: type probes rewrite silent drifts and enforce coverage guard" {
+  let src = SourceFile::{
+    rel_path: "drift.mbt",
+    content: "pub fn run(s : String, a : Int, b : Int, d : Double) -> Unit {\n" +
+    "  let _ = s.length()\n" +
+    "  let _ = a / b\n" +
+    "  let _ = a / 0\n" +
+    "  let _ = a / 2\n" +
+    "  let _ = d.to_string()\n" +
+    "}\n",
+    is_test: false,
+  }
+  // Mock `pionc check --json` responding with exact probe diagnostics
+  let mock_check = fn(batch : Array[(String, String)]) -> String {
+    let mut has_probe = false
+    for p in batch {
+      if has_probe_residual(p.1) { has_probe = true }
+    }
+    if !has_probe {
+      return "{\"ok\":true,\"diagnostics\":[]}"
+    }
+    "{\"ok\":false,\"diagnostics\":[" +
+    "{\"file\":\"drift.pion\",\"line\":2,\"col\":12,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_len_probe` on type `String`\"}," +
+    "{\"file\":\"drift.pion\",\"line\":3,\"col\":12,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}," +
+    "{\"file\":\"drift.pion\",\"line\":4,\"col\":12,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}," +
+    "{\"file\":\"drift.pion\",\"line\":6,\"col\":12,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_show_probe` on type `Double`\"}" +
+    "]}"
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], true, mock_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::utf16_len(s)"), "String.length() rewritten via probe")
+  assert_true(str_has(out, "mbt_compat::div_checked_int(a, b)"), "runtime Int / b rewritten via probe")
+  assert_true(str_has(out, "panic(\"integer division by zero\")"), "known-zero Int / 0 traps explicitly")
+  assert_true(str_has(out, "a / 2"), "statically non-zero divisor stays fast")
+  assert_true(str_has(out, "mbt_compat::double_to_string(d)"), "Double.to_string() rewritten via probe")
+  assert_true(!has_probe_residual(out), "0 probe residuals in final output")
+
+  // Negative test: probe count mismatch MUST trigger coverage guard error
+  let bad_check = fn(_batch : Array[(String, String)]) -> String {
+    "{\"ok\":false,\"diagnostics\":[{\"file\":\"drift.pion\",\"line\":2,\"col\":12,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_len_probe` on type `String`\"}]}"
+  }
+  let mismatch_res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], true, bad_check)
+  assert_true(mismatch_res.blockers > 0, "coverage guard mismatch must block")
+  let mut saw_mismatch = false
+  for d in mismatch_res.diagnostics {
+    if d.code == "MBT2PION_PROBE_MISMATCH" { saw_mismatch = true }
+  }
+  assert_true(saw_mismatch, "must emit MBT2PION_PROBE_MISMATCH")
+}
+
+test "api_map rejects untagged offset-like Int param and applies boundary conversions" {
+  let bad_map = "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"hit\",\"kind\":\"fn\",\"params\":[{\"name\":\"offset\",\"ty\":\"Int\"}]}]}"
+  let diags : Array[Diag] = []
+  let _ = parse_api_map(bad_map, "bad_api_map.json", diags)
+  assert_true(diags.length() == 1 && diags[0].code == "MBT2PION_UNTAGGED_UNIT", "untagged offset param must hard-fail")
+
+  let good_map = "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"hit\",\"kind\":\"fn\",\"target_pkg\":\"p\",\"target_name\":\"hit\",\"params\":[{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\"}]}]}"
+  let diags2 : Array[Diag] = []
+  let am = parse_api_map(good_map, "good_api_map.json", diags2)
+  assert_eq(diags2.length(), 0)
+  let drift : Array[DriftEntry] = []
+  let rewritten = apply_api_boundary_conversions("let _ = p::hit(offset=pos)\n", am, "f.pion", drift)
+  assert_true(str_has(rewritten, "mbt_compat::utf16_to_utf8_offset(pos)"), "boundary conversion inserted for utf8 param")
+}
+
+test "double-hash overlay exact match and stale source rejection" {
+  let src = SourceFile::{
+    rel_path: "ov.mbt",
+    content: "pub fn compute(x : Int) -> Int {\n  x + 1\n}\n",
+    is_test: false,
+  }
+  let base = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(base.blockers, 0)
+  assert_true(base.files[0].anchors.length() == 1, "one anchor emitted")
+  let anc = base.files[0].anchors[0]
+
+  let ov = OverlaySpec::{
+    id: "ov-1",
+    source_file: "ov.mbt",
+    decl_identity: anc.decl_identity,
+    target: "native",
+    normalized_source_cst_hash: anc.normalized_source_cst_hash,
+    pre_overlay_generated_hash: anc.pre_overlay_generated_hash,
+    replacement: "pub fn compute(x : Int) -> Int {\n  x + 100\n}",
+    reason: "test override",
+    behavior_test: "ov_test",
+    upstream_issue_or_removal_condition: "issue#1",
+  }
+  let applied = transpile_package([src], empty_api_map(), default_recipes(), [ov], [], default_options(), [], false, noop_check)
+  assert_eq(applied.blockers, 0)
+  assert_true(str_has(applied.files[0].content, "x + 100"), "overlay applied cleanly")
+
+  // Negative test: mutate upstream source body -> MUST hard-fail with STALE_SOURCE!
+  let mutated_src = SourceFile::{
+    rel_path: "ov.mbt",
+    content: "pub fn compute(x : Int) -> Int {\n  x + 2\n}\n",
+    is_test: false,
+  }
+  let stale = transpile_package([mutated_src], empty_api_map(), default_recipes(), [ov], [], default_options(), [], false, noop_check)
+  assert_true(stale.blockers > 0, "mutated upstream source must reject stale overlay")
+  assert_true(stale.diagnostics[0].code == "MBT2PION_OVERLAY_STALE_SOURCE", "must emit MBT2PION_OVERLAY_STALE_SOURCE")
+}

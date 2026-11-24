@@ -1,0 +1,186 @@
+///| End-to-end 3-stage deterministic transpilation pipeline (`mbt2pion`).
+///|
+///| Orchestrates:
+///| 1. Deterministic source file ordering
+///| 2. Stage A (symbol prescan, lossless CST lowering, topological `00_init_order.pion`)
+///| 3. Declaration-granularity double-hash-anchored Overlays
+///| 4. Stage A.5 (type-probe pass with mandatory coverage guard)
+///| 5. Stage B (`pionc check --json` type-directed fixpoint pass)
+///| 6. Platform-neutral header prepending
+///| 7. Hard merge/publish gate checks (0 `MBT2PION_MANUAL`, 0 `mbt_*_probe` residuals,
+///|    0 unresolved drift entries, 0 error diagnostics).
+
+///| Sort `SourceFile`s deterministically by `rel_path`.
+fn sort_source_files(files : Array[SourceFile]) -> Array[SourceFile] {
+  let out : Array[SourceFile] = []
+  for f in files {
+    out.push(f)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].rel_path, key.rel_path) > 0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
+///| Run the full 3-stage deterministic `mbt2pion` pipeline.
+///| `check_fn` invokes `pionc check --json` on a batch of `(rel_path, content)` files.
+///| Pass a no-op callback `fn(_) { "{\"ok\":true,\"diagnostics\":[]}" }` when running Stage A standalone in unit tests.
+pub fn transpile_package(
+  sources : Array[SourceFile],
+  api_map : ApiMap,
+  recipes : Recipes,
+  overlays : Array[OverlaySpec],
+  mbti_files : Array[(String, String)],
+  opts : TranspileOptions,
+  pre_diags : Array[Diag],
+  run_probes : Bool,
+  check_fn : (Array[(String, String)]) -> String,
+) -> TranspileResult {
+  let sorted_sources = sort_source_files(sources)
+  let symtab = empty_symbol_table()
+  symtab_load_api_map(symtab, api_map)
+  for pair in mbti_files {
+    symtab_load_mbti(symtab, pair.0, pair.1)
+  }
+
+  let ctx = stage_a_context_new(symtab, recipes, opts)
+  for d in pre_diags {
+    ctx.diags.push(d)
+  }
+
+  // Filter test files unless `--with-tests` is enabled
+  let selected : Array[SourceFile] = []
+  for sf in sorted_sources {
+    if sf.is_test && !opts.with_tests {
+      ctx.dispositions.push(DispositionEntry::{
+        file: sf.rel_path,
+        decl: "<file>",
+        line: 1,
+        col: 1,
+        disposition: "skipped_test_file",
+        detail: "excluded because --with-tests not set",
+      })
+      continue
+    }
+    selected.push(sf)
+  }
+
+  // Stage A.0: prescan intra-package symbols
+  prescan_package_symbols(ctx, selected)
+
+  // Stage A: lower every file
+  let mut gen_files : Array[GeneratedFile] = []
+  for sf in selected {
+    gen_files.push(lower_file_stage_a(ctx, sf))
+  }
+
+  // Stage A: topological declaration reordering into single `00_init_order.pion`
+  if ctx.init_items.length() > 0 {
+    let sorted_inits = topo_sort_init_items(ctx.init_items, ctx.fn_bodies, ctx.diags)
+    if sorted_inits.length() > 0 {
+      let init_body = render_init_order_file(sorted_inits)
+      let with_init : Array[GeneratedFile] = []
+      with_init.push(GeneratedFile::{
+        rel_path: "00_init_order.pion",
+        content: init_body,
+        source_file: "<package-init-order>",
+        anchors: [],
+      })
+      for gf in gen_files {
+        with_init.push(gf)
+      }
+      gen_files = with_init
+    }
+  }
+
+  // Declaration-granularity double-hash-anchored Overlays
+  gen_files = apply_overlays(gen_files, overlays, opts.target, ctx.diags, ctx.dispositions)
+
+  // Stage A.5: Type-Probe Pass for silent-compile drift sites
+  let mut probe_rounds = 0
+  let mut probes_instrumented = 0
+  let mut probes_resolved = 0
+  if run_probes {
+    let (a5_files, pr, pi, pres) = run_stage_a5(gen_files, recipes, check_fn, ctx.diags, ctx.drift_ledger)
+    gen_files = a5_files
+    probe_rounds = pr
+    probes_instrumented = pi
+    probes_resolved = pres
+  }
+
+  // Stage B: Type-Directed Fixpoint Pass (`pionc check --json`)
+  let (b_files, stage_b_iters, diag_hist) = if run_probes {
+    run_stage_b(gen_files, api_map, check_fn, ctx.drift_ledger)
+  } else {
+    (gen_files, 0, [])
+  }
+  gen_files = b_files
+
+  // Prepend platform-neutral headers to every generated file
+  let final_files : Array[GeneratedFile] = []
+  for gf in gen_files {
+    let hdr = render_platform_neutral_header(opts.header, gf.source_file)
+    let full = hdr + gf.content
+    // Hard gate: check for `MBT2PION_MANUAL` markers
+    if str_has(full, "MBT2PION_MANUAL") {
+      ctx.diags.push(diag_error(
+        "MBT2PION_MANUAL",
+        gf.rel_path,
+        1,
+        1,
+        "unresolved MBT2PION_MANUAL marker in " + gf.rel_path,
+      ))
+    }
+    // Hard gate: check for `mbt_*_probe` residuals
+    if has_probe_residual(full) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_PROBE_RESIDUAL",
+        gf.rel_path,
+        1,
+        1,
+        "probe residual found in final output of " + gf.rel_path,
+      ))
+    }
+    final_files.push(GeneratedFile::{
+      rel_path: gf.rel_path,
+      content: full,
+      source_file: gf.source_file,
+      anchors: gf.anchors,
+    })
+  }
+
+  // Count blockers: any error diagnostic or unresolved drift entry
+  let mut blockers = 0
+  for d in ctx.diags {
+    if d.severity == "error" {
+      blockers = blockers + 1
+    }
+  }
+  for e in ctx.drift_ledger {
+    if e.status != "resolved" {
+      blockers = blockers + 1
+    }
+  }
+
+  TranspileResult::{
+    files: final_files,
+    span_map: ctx.span_map,
+    diagnostics: ctx.diags,
+    drift_ledger: ctx.drift_ledger,
+    dispositions: ctx.dispositions,
+    pionc_diag_histogram: diag_hist,
+    probe_rounds: probe_rounds,
+    probes_instrumented: probes_instrumented,
+    probes_resolved: probes_resolved,
+    stage_b_iterations: stage_b_iters,
+    blockers: blockers,
+  }
+}

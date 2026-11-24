@@ -1,0 +1,227 @@
+///| Declaration-granularity double-hash-anchored overlay engine.
+///|
+///| Overlay key:
+///|   `(source_file, decl_identity, target, normalized_source_cst_hash, pre_overlay_generated_hash)`
+///|
+///| Strict invariants (zero fuzzy patching):
+///| - Every applicable overlay MUST match EXACTLY 1 declaration anchor.
+///| - 0 matches -> `MBT2PION_OVERLAY_NO_MATCH` (hard fail).
+///| - >1 matches -> `MBT2PION_OVERLAY_MULTI_MATCH` (hard fail).
+///| - Overlapping overlays on the same anchor -> `MBT2PION_OVERLAY_OVERLAP` (hard fail).
+///| - Upstream source CST changed (`normalized_source_cst_hash` mismatch) -> `MBT2PION_OVERLAY_STALE_SOURCE` (hard fail).
+///| - Pre-overlay generated code changed (`pre_overlay_generated_hash` mismatch) -> `MBT2PION_OVERLAY_STALE_GEN` (hard fail).
+///| - Every overlay must carry non-empty `reason`, `behavior_test`, and `upstream_issue_or_removal_condition`.
+
+import "json" as json
+
+fn ov_str(v : json::JsonValue, key : String) -> String {
+  match json::obj_get(v, key) {
+    Some(x) => match json::as_str(x) { Some(s) => s, None => "" }
+    None => ""
+  }
+}
+
+///| Parse an overlay JSON document (single object or array of objects).
+pub fn parse_overlay_json(content : String, path : String, diags : Array[Diag]) -> Array[OverlaySpec] {
+  let out : Array[OverlaySpec] = []
+  if content.trim().length() == 0 {
+    return out
+  }
+  let root = match json::parse(content) {
+    Ok(v) => v
+    Err(e) => {
+      diags.push(diag_error("MBT2PION_OVERLAY_PARSE", path, 1, 1, "failed to parse overlay JSON: " + e))
+      return out
+    }
+  }
+  let items : Array[json::JsonValue] = match json::as_arr(root) {
+    Some(arr) => arr
+    None => [root]
+  }
+  let mut idx = 0
+  for it in items {
+    idx = idx + 1
+    let id = {
+      let raw = ov_str(it, "id")
+      if raw.length() > 0 { raw } else { path + "#" + idx.to_string() }
+    }
+    let source_file = ov_str(it, "source_file")
+    let decl_identity = ov_str(it, "decl_identity")
+    let target = {
+      let t = ov_str(it, "target")
+      if t.length() > 0 { t } else { "all" }
+    }
+    let src_hash = ov_str(it, "normalized_source_cst_hash")
+    let gen_hash = ov_str(it, "pre_overlay_generated_hash")
+    let replacement = ov_str(it, "replacement")
+    let reason = ov_str(it, "reason")
+    let behavior_test = ov_str(it, "behavior_test")
+    let removal = ov_str(it, "upstream_issue_or_removal_condition")
+
+    if source_file.length() == 0 || decl_identity.length() == 0 || src_hash.length() == 0 || gen_hash.length() == 0 {
+      diags.push(diag_error(
+        "MBT2PION_OVERLAY_INVALID_KEY",
+        path,
+        1,
+        1,
+        "overlay `" + id + "` must specify `source_file`, `decl_identity`, `normalized_source_cst_hash`, and `pre_overlay_generated_hash`",
+      ))
+      continue
+    }
+    if reason.length() == 0 || behavior_test.length() == 0 || removal.length() == 0 {
+      diags.push(diag_error(
+        "MBT2PION_OVERLAY_MISSING_META",
+        path,
+        1,
+        1,
+        "overlay `" + id + "` must specify `reason`, `behavior_test`, and `upstream_issue_or_removal_condition`",
+      ))
+      continue
+    }
+    out.push(OverlaySpec::{
+      id: id,
+      source_file: source_file,
+      decl_identity: decl_identity,
+      target: target,
+      normalized_source_cst_hash: src_hash,
+      pre_overlay_generated_hash: gen_hash,
+      replacement: replacement,
+      reason: reason,
+      behavior_test: behavior_test,
+      upstream_issue_or_removal_condition: removal,
+    })
+  }
+  out
+}
+
+///| Apply all overlays matching `target` (or `target == "all"`) to Stage A generated files.
+///| Enforces exact-1 hit, non-overlap, and both source CST & pre-overlay generated hashes.
+pub fn apply_overlays(
+  files : Array[GeneratedFile],
+  overlays : Array[OverlaySpec],
+  target : String,
+  diags : Array[Diag],
+  dispositions : Array[DispositionEntry],
+) -> Array[GeneratedFile] {
+  if overlays.length() == 0 {
+    return files
+  }
+  // Collect edits per file index, tracking claimed anchors to forbid overlaps
+  let edits_by_file : Array[Array[(Int, Int, String)]] = []
+  let claimed : Map[String, String] = Map()
+  let mut fi = 0
+  while fi < files.length() {
+    edits_by_file.push([])
+    fi = fi + 1
+  }
+
+  for ov in overlays {
+    if ov.target != "all" && ov.target != target {
+      continue
+    }
+    let mut match_file_idx = -1
+    let mut match_anchor_idx = -1
+    let mut match_count = 0
+    let mut stale_src_msg = ""
+    let mut stale_gen_msg = ""
+
+    let mut f_idx = 0
+    while f_idx < files.length() {
+      let gf = files[f_idx]
+      if gf.source_file == ov.source_file {
+        let mut a_idx = 0
+        while a_idx < gf.anchors.length() {
+          let anc = gf.anchors[a_idx]
+          if anc.decl_identity == ov.decl_identity {
+            if anc.normalized_source_cst_hash != ov.normalized_source_cst_hash {
+              stale_src_msg = "overlay `" + ov.id + "` stale source CST hash for `" + ov.source_file + "::" + ov.decl_identity +
+              "`: expected " + ov.normalized_source_cst_hash + ", got " + anc.normalized_source_cst_hash
+            } else if anc.pre_overlay_generated_hash != ov.pre_overlay_generated_hash {
+              stale_gen_msg = "overlay `" + ov.id + "` stale pre-overlay generated hash for `" + ov.source_file + "::" + ov.decl_identity +
+              "`: expected " + ov.pre_overlay_generated_hash + ", got " + anc.pre_overlay_generated_hash
+            } else {
+              match_count = match_count + 1
+              match_file_idx = f_idx
+              match_anchor_idx = a_idx
+            }
+          }
+          a_idx = a_idx + 1
+        }
+      }
+      f_idx = f_idx + 1
+    }
+
+    if stale_src_msg.length() > 0 {
+      diags.push(diag_error("MBT2PION_OVERLAY_STALE_SOURCE", ov.source_file, 1, 1, stale_src_msg))
+      continue
+    }
+    if stale_gen_msg.length() > 0 {
+      diags.push(diag_error("MBT2PION_OVERLAY_STALE_GEN", ov.source_file, 1, 1, stale_gen_msg))
+      continue
+    }
+    if match_count == 0 {
+      diags.push(diag_error(
+        "MBT2PION_OVERLAY_NO_MATCH",
+        ov.source_file,
+        1,
+        1,
+        "overlay `" + ov.id + "` matched 0 declarations for `" + ov.source_file + "::" + ov.decl_identity + "`",
+      ))
+      continue
+    }
+    if match_count > 1 {
+      diags.push(diag_error(
+        "MBT2PION_OVERLAY_MULTI_MATCH",
+        ov.source_file,
+        1,
+        1,
+        "overlay `" + ov.id + "` matched " + match_count.to_string() + " declarations (exact 1 required)",
+      ))
+      continue
+    }
+
+    let anc = files[match_file_idx].anchors[match_anchor_idx]
+    let claim_key = ov.source_file + "::" + ov.decl_identity + "@" + anc.start_byte.to_string()
+    match claimed.get(claim_key) {
+      Some(prev_id) => {
+        diags.push(diag_error(
+          "MBT2PION_OVERLAY_OVERLAP",
+          ov.source_file,
+          anc.line,
+          anc.col,
+          "overlay `" + ov.id + "` overlaps with overlay `" + prev_id + "` on `" + ov.decl_identity + "`",
+        ))
+        continue
+      }
+      None => claimed[claim_key] = ov.id
+    }
+    edits_by_file[match_file_idx].push((anc.start_byte, anc.end_byte, ov.replacement))
+    dispositions.push(DispositionEntry::{
+      file: ov.source_file,
+      decl: ov.decl_identity,
+      line: anc.line,
+      col: anc.col,
+      disposition: "overlay_applied",
+      detail: "overlay " + ov.id + " (" + ov.reason + ")",
+    })
+  }
+
+  let out : Array[GeneratedFile] = []
+  fi = 0
+  while fi < files.length() {
+    let gf = files[fi]
+    if edits_by_file[fi].length() > 0 {
+      let updated = apply_byte_edits(gf.content, edits_by_file[fi])
+      out.push(GeneratedFile::{
+        rel_path: gf.rel_path,
+        content: updated,
+        source_file: gf.source_file,
+        anchors: gf.anchors,
+      })
+    } else {
+      out.push(gf)
+    }
+    fi = fi + 1
+  }
+  out
+}

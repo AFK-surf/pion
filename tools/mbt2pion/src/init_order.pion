@@ -1,0 +1,239 @@
+///| Top-level `let` + `fn init` dependency graph & deterministic topological sorter.
+///|
+///| Pion evaluates top-level `let` bindings strictly in file/declaration order,
+///| whereas MoonBit allows forward and indirect reads through functions.
+///| This module:
+///| 1. Collects all top-level `let` bindings and `fn init` blocks across all files.
+///| 2. Collects all top-level `fn` bodies to trace indirect reads (`let a = f()` where `f` reads `b`).
+///| 3. Builds the transitive dependency graph over init items (`let` + `fn init`).
+///| 4. Hard-fails with `MBT2PION_INIT_CYCLE` on any cycle.
+///| 5. Emits items in deterministic topological order (tie-breaking by original MoonBit order)
+///|    into a single `00_init_order.pion`, lowering `fn init` to `let __mbt_init_<file>_<n> : Unit = { ... }`.
+
+pub struct InitItem {
+  id : String
+  name : String
+  is_fn_init : Bool
+  source_file : String
+  order_index : Int
+  line : Int
+  col : Int
+  code : String
+  referenced_idents : Array[String]
+}
+
+pub struct FnBodyRefs {
+  name : String
+  referenced_idents : Array[String]
+}
+
+///| Sanitize a relative filename into a valid Pion identifier segment for `__mbt_init_<file>_<n>`.
+pub fn sanitize_file_id(rel_path : String) -> String {
+  let sb = StringBuilder()
+  let n = rel_path.length()
+  let mut i = 0
+  while i < n {
+    let c = rel_path.code_unit_at(i)
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) {
+      sb.write_string(rel_path.slice(i, i + 1))
+    } else {
+      sb.write_string("_")
+    }
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///| Collect unique identifier references from a token slice `[start, end)`.
+pub fn collect_ident_refs(tokens : Array[Token], start : Int, end : Int) -> Array[String] {
+  let seen : Map[String, Bool] = Map()
+  let out : Array[String] = []
+  let mut i = start
+  while i < end && i < tokens.length() {
+    let t = tokens[i]
+    if t.kind == TokenKind::Ident {
+      // Skip field accesses `.ident`
+      let prev_dot = i > start && tokens[i - 1].kind == TokenKind::Dot
+      if !prev_dot {
+        if !seen.contains(t.raw) {
+          seen[t.raw] = true
+          out.push(t.raw)
+        }
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Compute transitive top-level `let` dependencies of an init item, traversing indirect calls through `fn`s.
+fn compute_transitive_deps(
+  item_refs : Array[String],
+  let_id_by_name : Map[String, Int],
+  fn_refs_by_name : Map[String, Array[String]],
+  self_idx : Int,
+) -> Array[Int] {
+  let dep_set : Map[Int, Bool] = Map()
+  let visited_fns : Map[String, Bool] = Map()
+  let work : Array[String] = []
+  for r in item_refs {
+    work.push(r)
+  }
+  let mut wi = 0
+  while wi < work.length() {
+    let sym = work[wi]
+    wi = wi + 1
+    match let_id_by_name.get(sym) {
+      Some(target_idx) =>
+      if target_idx != self_idx {
+        dep_set[target_idx] = true
+      }
+      None => ()
+    }
+    match fn_refs_by_name.get(sym) {
+      Some(frefs) =>
+      if !visited_fns.contains(sym) {
+        visited_fns[sym] = true
+        for fr in frefs {
+          work.push(fr)
+        }
+      }
+      None => ()
+    }
+  }
+  let out : Array[Int] = []
+  for d in dep_set.keys() {
+    out.push(d)
+  }
+  // Sort ints ascending
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && out[j] > key {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
+///| Topologically sort `InitItem`s (tie-breaking by `order_index`).
+///| Hard-fails with `MBT2PION_INIT_CYCLE` if any cycle exists.
+pub fn topo_sort_init_items(
+  items : Array[InitItem],
+  fn_bodies : Array[FnBodyRefs],
+  diags : Array[Diag],
+) -> Array[InitItem] {
+  let n = items.length()
+  if n == 0 {
+    return []
+  }
+  let let_id_by_name : Map[String, Int] = Map()
+  let mut i = 0
+  while i < n {
+    if !items[i].is_fn_init && items[i].name.length() > 0 {
+      let_id_by_name[items[i].name] = i
+    }
+    i = i + 1
+  }
+  let fn_refs_by_name : Map[String, Array[String]] = Map()
+  for fb in fn_bodies {
+    fn_refs_by_name[fb.name] = fb.referenced_idents
+  }
+
+  // Adjacency: edge dep -> item (dep must initialize before item)
+  let adj : Array[Array[Int]] = []
+  let indeg : Array[Int] = []
+  i = 0
+  while i < n {
+    adj.push([])
+    indeg.push(0)
+    i = i + 1
+  }
+  i = 0
+  while i < n {
+    let deps = compute_transitive_deps(items[i].referenced_idents, let_id_by_name, fn_refs_by_name, i)
+    for d in deps {
+      adj[d].push(i)
+      indeg[i] = indeg[i] + 1
+    }
+    i = i + 1
+  }
+
+  // Kahn's algorithm picking minimum `order_index` among ready nodes (deterministic tie-break)
+  let emitted : Array[Bool] = []
+  i = 0
+  while i < n {
+    emitted.push(false)
+    i = i + 1
+  }
+  let sorted : Array[InitItem] = []
+  let mut step = 0
+  while step < n {
+    let mut best = -1
+    let mut j = 0
+    while j < n {
+      if !emitted[j] && indeg[j] == 0 {
+        if best < 0 || items[j].order_index < items[best].order_index {
+          best = j
+        }
+      }
+      j = j + 1
+    }
+    if best < 0 {
+      // Cycle detected: report all remaining nodes deterministically
+      let cyc_names = StringBuilder()
+      let mut first = true
+      let mut first_idx = -1
+      let mut k = 0
+      while k < n {
+        if !emitted[k] {
+          if first_idx < 0 {
+            first_idx = k
+          }
+          if !first {
+            cyc_names.write_string(" -> ")
+          }
+          cyc_names.write_string(items[k].id)
+          first = false
+        }
+        k = k + 1
+      }
+      let blame = if first_idx >= 0 { items[first_idx] } else { items[0] }
+      diags.push(diag_error(
+        "MBT2PION_INIT_CYCLE",
+        blame.source_file,
+        blame.line,
+        blame.col,
+        "cyclic top-level initialization dependency detected: " + cyc_names.to_string(),
+      ))
+      return []
+    }
+    emitted[best] = true
+    sorted.push(items[best])
+    for nxt in adj[best] {
+      indeg[nxt] = indeg[nxt] - 1
+    }
+    step = step + 1
+  }
+  sorted
+}
+
+///| Render `00_init_order.pion` body from topologically sorted `InitItem`s.
+pub fn render_init_order_file(sorted : Array[InitItem]) -> String {
+  let sb = StringBuilder()
+  sb.write_string("///| Topologically ordered top-level initializers (`let` and `fn init`).\n")
+  sb.write_string("///| Emitted in deterministic dependency order to guarantee initialization safety.\n\n")
+  for it in sorted {
+    sb.write_string("// origin: " + it.source_file + ":" + it.line.to_string() + ":" + it.col.to_string() + "\n")
+    sb.write_string(it.code)
+    if !it.code.ends_with("\n") {
+      sb.write_string("\n")
+    }
+    sb.write_string("\n")
+  }
+  sb.to_string()
+}
