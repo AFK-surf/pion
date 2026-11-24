@@ -6,6 +6,125 @@ OUT_DIR="$ROOT_DIR/out"
 RT_DIR="$ROOT_DIR/runtime"
 CC="${CC:-cc}"
 
+# Helper sub-commands invoked inside run-e2e-parallel.sh (each uses its own
+# mktemp -d + PION_CACHE_DIR and writes nothing to shared out/ or source tree).
+if [ "${1:-}" = "--group" ]; then
+  GROUP="$2"
+  PIONC="${PIONC:-$OUT_DIR/pionc_linux}"
+  G_TMP="$(mktemp -d)"
+  trap 'rm -rf "$G_TMP"' EXIT
+  export PION_CACHE_DIR="$G_TMP/cas"
+  mkdir -p "$PION_CACHE_DIR"
+  case "$GROUP" in
+    mbt_tests)
+      for TPKG in tools/mbt_compat tools/mbt2pion; do
+        STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
+        echo "pionc_linux test --json $TPKG -> $STD_JSON"
+        printf '%s' "$STD_JSON" | grep -q '"ok":true'
+        printf '%s' "$STD_JSON" | grep -q '"failed":0'
+      done
+      # tools/mbt2pion_cli compiles c_sources (csrc/atomic_fs.c), which needs real `as` via ORIG_PATH under GCC.
+      MBT2PION_CLI_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/tools/mbt2pion_cli")"
+      echo "pionc_linux test --json tools/mbt2pion_cli -> $MBT2PION_CLI_JSON"
+      printf '%s' "$MBT2PION_CLI_JSON" | grep -q '"ok":true'
+      printf '%s' "$MBT2PION_CLI_JSON" | grep -q '"failed":0'
+      echo "[SUMMARY] mbt_tests (mbt_compat, mbt2pion, mbt2pion_cli): OK"
+      ;;
+    std_tests)
+      TEST_JSON="$("$PIONC" test --deps --json "$ROOT_DIR/examples/text_stats")"
+      echo "pionc_linux test --deps --json examples/text_stats -> $TEST_JSON"
+      printf '%s' "$TEST_JSON" | grep -q '"failed":0'
+      for TPKG in std/json std/http std/net std/regex examples/http_event_server; do
+        STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
+        echo "pionc_linux test --json $TPKG -> $STD_JSON"
+        printf '%s' "$STD_JSON" | grep -q '"ok":true'
+        printf '%s' "$STD_JSON" | grep -q '"failed":0'
+      done
+      # std/proc: streaming subprocess + cross-platform PTY (c_sources needs real `as` via ORIG_PATH).
+      PROC_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/proc")"
+      echo "pionc_linux test --json std/proc -> $PROC_JSON"
+      printf '%s' "$PROC_JSON" | grep -q '"ok":true'
+      printf '%s' "$PROC_JSON" | grep -q '"failed":0'
+      echo "[SUMMARY] std_tests (text_stats, std/*, http_event_server): OK"
+      ;;
+    standalone_e2e)
+      # P22-A, P25-A, P27-A, P17-A, dyn_trait, Wave J2 (under zero-`as` PATH on x86_64).
+      P22A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p22a_systems_io.pion")"
+      echo "pionc_linux run p22a_systems_io -> $P22A_OUT"
+      [ "$P22A_OUT" = "p22a_systems_io ok" ] || { echo "FAIL: p22a_systems_io output mismatch" >&2; exit 1; }
+      P25A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion")"
+      echo "pionc_linux run p25a_c_varargs -> $P25A_OUT"
+      [ "$P25A_OUT" = "a=42 b=-7 c=3.25" ] || { echo "FAIL: p25a_c_varargs output mismatch" >&2; exit 1; }
+      P27A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion")"
+      echo "pionc_linux run p27a_ergonomics_bug4 -> $P27A_OUT"
+      [ "$P27A_OUT" = "p27a_ergonomics_bug4 ok" ] || { echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2; exit 1; }
+      P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
+      echo "pionc_linux run p17a_ergonomics_mt -> $P17A_OUT"
+      [ "$P17A_OUT" = "p17a_ok log=2401 recs=3200 index=3200 keys=16" ] || { echo "FAIL: p17a_ergonomics_mt output mismatch" >&2; exit 1; }
+      DYN_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/dyn_trait.pion")"
+      echo "pionc_linux run dyn_trait -> $DYN_OUT"
+      [ "$DYN_OUT" = "dyn_trait ok" ] || { echo "FAIL: dyn_trait output mismatch" >&2; exit 1; }
+      J2_DEV_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion")"
+      "$PIONC" build --release -o "$G_TMP/wave_j2_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
+      J2_REL_OUT="$("$G_TMP/wave_j2_rel")"
+      echo "pionc_linux run wave_j2_rc_elision -> dev=$J2_DEV_OUT release=$J2_REL_OUT"
+      case "$J2_DEV_OUT" in
+        wave_j2_ok:*) ;;
+        *) echo "FAIL: wave_j2_rc_elision bad dev output ($J2_DEV_OUT)" >&2; exit 1 ;;
+      esac
+      [ "$J2_DEV_OUT" = "$J2_REL_OUT" ] || {
+        echo "FAIL: wave_j2_rc_elision dev/release mismatch (dev=$J2_DEV_OUT release=$J2_REL_OUT)" >&2
+        exit 1
+      }
+      "$PIONC" build --release -o "$G_TMP/wave_j2_st_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+      J2_ST_NAT="$("$G_TMP/wave_j2_st_rel")"
+      case "$J2_ST_NAT" in
+        wave_j2_st_ok:*) ;;
+        *) echo "FAIL: wave_j2_rc_elision_st bad native output ($J2_ST_NAT)" >&2; exit 1 ;;
+      esac
+      if command -v node >/dev/null 2>&1; then
+        "$PIONC" build --release --target wasm32 -o "$G_TMP/wave_j2_st.wasm" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+        J2_ST_WASM="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$G_TMP/wave_j2_st.wasm")"
+        echo "wave_j2_rc_elision_st -> native=$J2_ST_NAT wasm32=$J2_ST_WASM"
+        [ "$J2_ST_NAT" = "$J2_ST_WASM" ] || {
+          echo "FAIL: wave_j2_rc_elision_st native/wasm32 mismatch (native=$J2_ST_NAT wasm32=$J2_ST_WASM)" >&2
+          exit 1
+        }
+      fi
+      echo "[SUMMARY] standalone_e2e (p22a, p25a, p27a, p17a, dyn_trait, wave_j2): OK"
+      ;;
+    tls_client)
+      TLS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/tls")"
+      echo "pionc_linux test --json std/tls -> $TLS_JSON"
+      printf '%s' "$TLS_JSON" | grep -q '"ok":true'
+      printf '%s' "$TLS_JSON" | grep -q '"failed":0'
+      PATH="$ORIG_PATH" sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
+      echo "[SUMMARY] tls_client (std/tls unit + e2e): OK"
+      ;;
+    https_server)
+      HTTPS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/examples/https_server")"
+      echo "pionc_linux test --json examples/https_server -> $HTTPS_JSON"
+      printf '%s' "$HTTPS_JSON" | grep -q '"ok":true'
+      printf '%s' "$HTTPS_JSON" | grep -q '"failed":0'
+      PATH="$ORIG_PATH" sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
+      echo "[SUMMARY] https_server (examples/https_server unit + run_server_e2e): OK"
+      ;;
+    pion_station)
+      STATION_JSON="$(PATH="$ORIG_PATH" LIBRARY_PATH="${STATION_LIB_PATH:-}" "$PIONC" test --deps --json "$ROOT_DIR/examples/pion_station")"
+      echo "pionc_linux test --deps --json examples/pion_station -> $STATION_JSON"
+      printf '%s' "$STATION_JSON" | grep -q '"ok":true'
+      printf '%s' "$STATION_JSON" | grep -q '"failed":0'
+      PATH="$ORIG_PATH" LIBRARY_PATH="${STATION_LIB_PATH:-}" sh "$ROOT_DIR/examples/pion_station/run_e2e.sh" "$PIONC"
+      echo "[SUMMARY] pion_station (examples/pion_station unit + run_e2e): OK"
+      ;;
+    *)
+      echo "FAIL: unknown test-linux group: $GROUP" >&2
+      exit 2
+      ;;
+  esac
+  exit 0
+fi
+
 mkdir -p "$OUT_DIR"
 
 now_ms() {
@@ -327,22 +446,6 @@ bg_start "$TMP_DIR/core_test.log" env PION_CACHE_DIR="$TMP_DIR/cas_core" \
   sh "$ROOT_DIR/scripts/core-test.sh" "$PIONC"
 CORE_PID="$BG_PID"
 
-TEST_JSON="$("$PIONC" test --deps --json "$ROOT_DIR/examples/text_stats")"
-echo "pionc_linux test --deps --json examples/text_stats -> $TEST_JSON"
-printf '%s' "$TEST_JSON" | grep -q '"failed":0'
-
-for TPKG in std/json std/http std/net std/regex examples/http_event_server tools/mbt_compat tools/mbt2pion; do
-  STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
-  echo "pionc_linux test --json $TPKG -> $STD_JSON"
-  printf '%s' "$STD_JSON" | grep -q '"ok":true'
-  printf '%s' "$STD_JSON" | grep -q '"failed":0'
-done
-# tools/mbt2pion_cli compiles c_sources (csrc/atomic_fs.c), which needs real `as` via ORIG_PATH under GCC.
-MBT2PION_CLI_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/tools/mbt2pion_cli")"
-echo "pionc_linux test --json tools/mbt2pion_cli -> $MBT2PION_CLI_JSON"
-printf '%s' "$MBT2PION_CLI_JSON" | grep -q '"ok":true'
-printf '%s' "$MBT2PION_CLI_JSON" | grep -q '"failed":0'
-
 # POSIX TCP + FFI runtime primitives from Pion, over real 127.0.0.1 TCP
 NET_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/net_ffi.pion" --loopback)"
 echo "pionc_linux run net_ffi --loopback -> $(printf '%s' "$NET_OUT" | tr '\n' ' ')"
@@ -412,123 +515,32 @@ if [ "$FIXED_CHK" != '{"ok":true,"unformatted":[]}' ]; then
   exit 1
 fi
 
-# P22-A: systems IO & byte FFI primitives.
-P22A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p22a_systems_io.pion")"
-echo "pionc_linux run p22a_systems_io -> $P22A_OUT"
-if [ "$P22A_OUT" != "p22a_systems_io ok" ]; then
-  echo "FAIL: p22a_systems_io output mismatch" >&2
-  exit 1
-fi
-
-# P25-A: native C variadic ABI (extern "C" fn with `...`).
-P25A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion")"
-echo "pionc_linux run p25a_c_varargs -> $P25A_OUT"
-if [ "$P25A_OUT" != "a=42 b=-7 c=3.25" ]; then
-  echo "FAIL: p25a_c_varargs output mismatch" >&2
-  exit 1
-fi
-
-# P27-A: Bug #4 tuple expected-type propagation, scientific notation, \xNN, numeric/Double methods, Map::clear, |>, ignore, compound assign, guard/is, ..</..=, indexed for, struct update.
-P27A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion")"
-echo "pionc_linux run p27a_ergonomics_bug4 -> $P27A_OUT"
-if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
-  echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2
-  exit 1
-fi
-
-# P17-A: Mutex[Array]/Mutex[Map[String, Array]] across 8 workers, String/Option/Result helpers, generic ==.
-P17A_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")"
-echo "pionc_linux run p17a_ergonomics_mt -> $P17A_OUT"
-if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
-  echo "FAIL: p17a_ergonomics_mt output mismatch" >&2
-  exit 1
-fi
-
-# std/proc: streaming subprocess + cross-platform PTY (c_sources needs real `as` via ORIG_PATH).
-PROC_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/proc")"
-echo "pionc_linux test --json std/proc -> $PROC_JSON"
-printf '%s' "$PROC_JSON" | grep -q '"ok":true'
-printf '%s' "$PROC_JSON" | grep -q '"failed":0'
-
-# std/tls: platform C shim (`csrc/tls_openssl.c` invokes system cc which needs real `as`).
-# Unit tests plus real TLS 1.3/1.2 loopback handshakes (incl. `tls_wrap_fd` and refused wrong host)
-# whenever libssl/libcrypto can be linked.
+# Build the parallel E2E pool command list (slowest & folded [6/6] suites first).
+# Lines without PATH="$ORIG_PATH" keep the failing-`as` PATH of this gate.
+E2E_CMDS="$TMP_DIR/e2e_cmds.txt"
+: > "$E2E_CMDS"
+STATION_LIB_PATH="${LIBRARY_PATH:-}"
 if [ -f /usr/include/openssl/ssl.h ] || pkg-config --exists openssl 2>/dev/null; then
-  TLS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/tls")"
-  echo "pionc_linux test --json std/tls -> $TLS_JSON"
-  printf '%s' "$TLS_JSON" | grep -q '"ok":true'
-  printf '%s' "$TLS_JSON" | grep -q '"failed":0'
-  PATH="$ORIG_PATH" sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC"
-  HTTPS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/examples/https_server")"
-  echo "pionc_linux test --json examples/https_server -> $HTTPS_JSON"
-  printf '%s' "$HTTPS_JSON" | grep -q '"ok":true'
-  printf '%s' "$HTTPS_JSON" | grep -q '"failed":0'
-  # Server side: pure-Pion HTTPS service vs Python ssl / curl, TLS 1.3 and 1.2.
-  PATH="$ORIG_PATH" sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC"
-  # Flagship examples/pion_station also links the system libsqlite3 and checks
-  # restart recovery with the sqlite3 CLI.
+  printf '%s\n' 'sh "$ROOT_DIR/scripts/test-linux.sh" --group tls_client' >> "$E2E_CMDS"
+  printf '%s\n' 'sh "$ROOT_DIR/scripts/test-linux.sh" --group https_server' >> "$E2E_CMDS"
   if { [ -f /usr/include/sqlite3.h ] || pkg-config --exists sqlite3 2>/dev/null || [ -f "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" ]; } \
     && command -v sqlite3 >/dev/null 2>&1; then
-    STATION_LIB_PATH="${LIBRARY_PATH:-}"
     if [ -f "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" ] && [ ! -e "${MULTIARCH_LIB_DIR}/libsqlite3.so" ]; then
       # Runtime package only (no -dev): give the linker a libsqlite3.so outside the source tree.
       ln -sf "${MULTIARCH_LIB_DIR}/libsqlite3.so.0" "$OUT_DIR/libsqlite3.so"
       STATION_LIB_PATH="$OUT_DIR${STATION_LIB_PATH:+:$STATION_LIB_PATH}"
     fi
-    STATION_JSON="$(PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" "$PIONC" test --deps --json "$ROOT_DIR/examples/pion_station")"
-    echo "pionc_linux test --deps --json examples/pion_station -> $STATION_JSON"
-    printf '%s' "$STATION_JSON" | grep -q '"ok":true'
-    printf '%s' "$STATION_JSON" | grep -q '"failed":0'
-    PATH="$ORIG_PATH" LIBRARY_PATH="$STATION_LIB_PATH" sh "$ROOT_DIR/examples/pion_station/run_e2e.sh" "$PIONC"
+    printf '%s\n' 'sh "$ROOT_DIR/scripts/test-linux.sh" --group pion_station' >> "$E2E_CMDS"
   else
     echo "NOTE: libsqlite3 or the sqlite3 CLI not found; skipping examples/pion_station tests and e2e"
   fi
 else
   echo "NOTE: OpenSSL development files not found; skipping std/tls + examples/https_server tests and client/server e2e handshakes"
 fi
-
-# dyn Trait: fat-pointer dispatch, vtables, Option[dyn Trait] niche, freeze/drop.
-DYN_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/dyn_trait.pion")"
-echo "pionc_linux run dyn_trait -> $DYN_OUT"
-if [ "$DYN_OUT" != "dyn_trait ok" ]; then
-  echo "FAIL: dyn_trait output mismatch" >&2
-  exit 1
-fi
-
-# Wave J2: hot-path RC elision soundness (dev & --release + Wasm32 parity on single-threaded subset).
-J2_DEV_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion")"
-"$PIONC" build --release -o "$TMP_DIR/wave_j2_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
-J2_REL_OUT="$("$TMP_DIR/wave_j2_rel")"
-echo "pionc_linux run wave_j2_rc_elision -> dev=$J2_DEV_OUT release=$J2_REL_OUT"
-case "$J2_DEV_OUT" in
-  wave_j2_ok:*) ;;
-  *) echo "FAIL: wave_j2_rc_elision bad dev output ($J2_DEV_OUT)" >&2; exit 1 ;;
-esac
-if [ "$J2_DEV_OUT" != "$J2_REL_OUT" ]; then
-  echo "FAIL: wave_j2_rc_elision dev/release mismatch (dev=$J2_DEV_OUT release=$J2_REL_OUT)" >&2
-  exit 1
-fi
-"$PIONC" build --release -o "$TMP_DIR/wave_j2_st_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
-J2_ST_NAT="$("$TMP_DIR/wave_j2_st_rel")"
-case "$J2_ST_NAT" in
-  wave_j2_st_ok:*) ;;
-  *) echo "FAIL: wave_j2_rc_elision_st bad native output ($J2_ST_NAT)" >&2; exit 1 ;;
-esac
-if command -v node >/dev/null 2>&1; then
-  "$PIONC" build --release --target wasm32 -o "$TMP_DIR/wave_j2_st.wasm" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
-  J2_ST_WASM="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$TMP_DIR/wave_j2_st.wasm")"
-  echo "wave_j2_rc_elision_st -> native=$J2_ST_NAT wasm32=$J2_ST_WASM"
-  if [ "$J2_ST_NAT" != "$J2_ST_WASM" ]; then
-    echo "FAIL: wave_j2_rc_elision_st native/wasm32 mismatch (native=$J2_ST_NAT wasm32=$J2_ST_WASM)" >&2
-    exit 1
-  fi
-fi
-
-# Independent E2E suites (each in its own mktemp -d + CAS, ephemeral ports, nothing
-# written to the source tree or out/) run concurrently; see scripts/run-e2e-parallel.sh.
-# Lines without PATH="$ORIG_PATH" keep the failing-`as` PATH of this gate.
-export ROOT_DIR PIONC ORIG_PATH OUT_DIR
-sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" <<'E2E'
+cat >> "$E2E_CMDS" <<'E2E'
+sh "$ROOT_DIR/scripts/test-linux.sh" --group mbt_tests
+sh "$ROOT_DIR/scripts/test-linux.sh" --group std_tests
+sh "$ROOT_DIR/scripts/test-linux.sh" --group standalone_e2e
 # Slowest suites first so the pool packs well.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p90_qbe_far_branch_rega/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p87_st_frozen_rc/run_e2e.sh" "$PIONC"
@@ -633,12 +645,19 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.s
 # assembly (and cc compiles their C driver) besides `--obj`.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/scripts/test-tv.sh" "$PIONC" "$OUT_DIR/qbe"
 E2E
-# Join p98 (started before [6/6]).
-if wait "$P98_PID"; then
-  P98_PID=""
+export ROOT_DIR PIONC ORIG_PATH OUT_DIR STATION_LIB_PATH
+sh "$ROOT_DIR/scripts/run-e2e-parallel.sh" < "$E2E_CMDS"
+# Join p98 (started before [6/6]); reap any straggling descendants in its session.
+P98_RC=0
+wait "$P98_PID" || P98_RC=$?
+if kill -0 -"$P98_PID" 2>/dev/null; then
+  echo "[WARN] test-linux: reaping straggler process(es) in p98 pgid $P98_PID" >&2
+  bg_kill "$P98_PID"
+fi
+P98_PID=""
+if [ "$P98_RC" -eq 0 ]; then
   echo "[PASS] tests/e2e/p98_section_gc/run_e2e.sh (overlapped, $(( $(now_ms) - T_P98_0 )) ms since start)"
 else
-  P98_PID=""
   cat "$TMP_DIR/p98.log"
   echo "FAIL: tests/e2e/p98_section_gc/run_e2e.sh" >&2
   exit 1

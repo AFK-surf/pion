@@ -4,10 +4,47 @@ set -eu
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/out"
 RT_DIR="$ROOT_DIR/runtime"
-CC="${CC:-clang}"
 
+# Bypass macOS /usr/bin/{cc,clang,ar,strip,ld,git} xcrun shims (~17ms/call).
+if [ "$(uname -s)" = "Darwin" ]; then
+    _xc_dirs=""
+    for _xc_tool in clang git; do
+        _xc_p="$(xcrun --find "$_xc_tool" 2>/dev/null || true)"
+        if [ -n "$_xc_p" ]; then
+            _xc_d="$(dirname -- "$_xc_p")"
+            case ":$_xc_dirs:$PATH:" in
+                *":$_xc_d:"*) ;;
+                *) _xc_dirs="${_xc_dirs:+$_xc_dirs:}$_xc_d" ;;
+            esac
+        fi
+    done
+    if [ -n "$_xc_dirs" ]; then
+        export PATH="$_xc_dirs:$PATH"
+    fi
+    if [ -z "${SDKROOT:-}" ]; then
+        _xc_sdk="$(xcrun --show-sdk-path 2>/dev/null || true)"
+        if [ -n "$_xc_sdk" ]; then
+            export SDKROOT="$_xc_sdk"
+        fi
+    fi
+fi
+
+CC="${CC:-clang}"
 mkdir -p "$OUT_DIR"
 
+MODE="all"
+STEP_NAME=""
+if [ "${1:-}" = "--prep-only" ]; then
+    MODE="prep"
+elif [ "${1:-}" = "--step" ]; then
+    MODE="step"
+    STEP_NAME="${2:?usage: test-runtime.sh --step tsan|asan|smoke}"
+elif [ $# -gt 0 ]; then
+    echo "usage: test-runtime.sh [--prep-only | --step tsan|asan|smoke]" >&2
+    exit 2
+fi
+
+step_prep() {
 echo "=== 1. Build libpionrt.a (-O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror) ==="
 "$CC" -std=c11 -O2 -fno-asynchronous-unwind-tables -Wall -Wextra -Werror -c "$RT_DIR/pion_rt.c" -o "$OUT_DIR/pion_rt.o"
 if command -v strip >/dev/null 2>&1; then
@@ -35,23 +72,7 @@ echo "=== 2. Run unit + MT + 4-core speedup benchmark (-O2) ==="
 "$OUT_DIR/test_rt_o2" --bench
 # spawn workers keep their explicit 8 MiB stacks under a 1 MiB RLIMIT_STACK.
 (ulimit -s 1024 && "$OUT_DIR/test_rt_o2" --spawn-stack)
-
-# Steps 3-5 are independent (own binaries and outputs): run them concurrently,
-# after the 4-core speedup benchmark above, and print their logs in order.
-LOG_DIR="$(mktemp -d)"
-TSAN_PID=""
-ASAN_PID=""
-SMOKE_PID=""
-cleanup() {
-    for P in $TSAN_PID $ASAN_PID $SMOKE_PID; do
-        kill "$P" 2>/dev/null || true
-        wait "$P" 2>/dev/null || true
-    done
-    rm -rf "$LOG_DIR"
 }
-trap cleanup EXIT
-trap 'exit 130' INT
-trap 'exit 143' TERM
 
 step_tsan() {
 echo "=== 3. Run ThreadSanitizer (-fsanitize=thread) ==="
@@ -158,6 +179,39 @@ grep -n 'fsqrt\.d' "$OUT_DIR/smoke_qbe_rv64.s" || {
 }
 echo "[PASS] QBE arm64_apple/amd64_sysv/rv64 end-to-end ABI & hardware sqrt smoke test"
 }
+
+if [ "$MODE" = "prep" ]; then
+    step_prep
+    sh "$ROOT_DIR/scripts/build-qbe.sh" "$OUT_DIR/qbe"
+    exit 0
+elif [ "$MODE" = "step" ]; then
+    case "$STEP_NAME" in
+        tsan)  step_tsan ;;
+        asan)  step_asan ;;
+        smoke) step_smoke ;;
+        *) echo "FAIL: unknown test-runtime.sh --step '$STEP_NAME'" >&2; exit 2 ;;
+    esac
+    exit 0
+fi
+
+step_prep
+
+# Steps 3-5 are independent (own binaries and outputs): run them concurrently,
+# after the 4-core speedup benchmark above, and print their logs in order.
+LOG_DIR="$(mktemp -d)"
+TSAN_PID=""
+ASAN_PID=""
+SMOKE_PID=""
+cleanup() {
+    for P in $TSAN_PID $ASAN_PID $SMOKE_PID; do
+        kill "$P" 2>/dev/null || true
+        wait "$P" 2>/dev/null || true
+    done
+    rm -rf "$LOG_DIR"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # `set -e` stays in force inside each background subshell (unlike in `step || ...`).
 (step_tsan) > "$LOG_DIR/tsan.log" 2>&1 &

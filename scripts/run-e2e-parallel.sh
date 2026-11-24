@@ -76,11 +76,34 @@ def run(idx_cmd):
         with proc_lock:
             if stopping.is_set():
                 return (cmd, 130, 0.0)
+            child_env = dict(os.environ)
+            child_env["PION_BG_INHERIT_PG"] = "1"
             p = subprocess.Popen(["sh", "-c", cmd], stdin=subprocess.DEVNULL,
                                  stdout=log, stderr=subprocess.STDOUT,
+                                 env=child_env,
                                  start_new_session=True)
             procs.add(p)
         rc = p.wait()
+        # Reap any straggling descendants (incl. reparented grandchildren) still
+        # left in the isolated session after the leader exits.
+        if pg_alive(p.pid):
+            with out_lock:
+                print("[WARN] %s: reaping straggler process(es) in pgid %d" % (name_of(cmd), p.pid), file=sys.stderr, flush=True)
+            try:
+                os.killpg(p.pid, signal.SIGTERM)
+            except OSError:
+                pass
+            reap_deadline = time.time() + 0.3
+            while time.time() < reap_deadline and pg_alive(p.pid):
+                time.sleep(0.02)
+            if pg_alive(p.pid):
+                try:
+                    os.killpg(p.pid, signal.SIGKILL)
+                except OSError:
+                    pass
+                kill_deadline = time.time() + 0.5
+                while time.time() < kill_deadline and pg_alive(p.pid):
+                    time.sleep(0.02)
         with proc_lock:
             procs.discard(p)
     if stopping.is_set():

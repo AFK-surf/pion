@@ -3,6 +3,30 @@ set -eu
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
+# Bypass macOS /usr/bin/{cc,clang,ar,strip,ld,git} xcrun shims (~17ms/call).
+if [ "$(uname -s)" = "Darwin" ]; then
+  _xc_dirs=""
+  for _xc_tool in clang git; do
+    _xc_p="$(xcrun --find "$_xc_tool" 2>/dev/null || true)"
+    if [ -n "$_xc_p" ]; then
+      _xc_d="$(dirname -- "$_xc_p")"
+      case ":$_xc_dirs:$PATH:" in
+        *":$_xc_d:"*) ;;
+        *) _xc_dirs="${_xc_dirs:+$_xc_dirs:}$_xc_d" ;;
+      esac
+    fi
+  done
+  if [ -n "$_xc_dirs" ]; then
+    export PATH="$_xc_dirs:$PATH"
+  fi
+  if [ -z "${SDKROOT:-}" ]; then
+    _xc_sdk="$(xcrun --show-sdk-path 2>/dev/null || true)"
+    if [ -n "$_xc_sdk" ]; then
+      export SDKROOT="$_xc_sdk"
+    fi
+  fi
+fi
+
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 COMPILER_DIR="$ROOT_DIR/compiler"
 OUT_DIR="$ROOT_DIR/out"
@@ -20,7 +44,11 @@ export PION_RT_LIB="$OUT_DIR/libpionrt.a"
 PION_RT_CLI_LIB="$OUT_DIR/libpionrt_cli.a"
 
 echo "=== [1/9] Build QBE + Runtime ==="
-sh "$ROOT_DIR/scripts/build-qbe.sh" "$PION_QBE"
+if [ "${PION_SKIP_QBE_BUILD:-0}" = "1" ] && [ -x "$PION_QBE" ]; then
+  echo "Using pre-built $PION_QBE (PION_SKIP_QBE_BUILD=1)"
+else
+  sh "$ROOT_DIR/scripts/build-qbe.sh" "$PION_QBE"
+fi
 RT_SRC="$ROOT_DIR/runtime/pion_rt.c"
 RT_HDR="$ROOT_DIR/runtime/pion_rt.h"
 # PION_SKIP_RT_TEST=1 reuses a libpionrt.a that test-runtime.sh already built
@@ -47,7 +75,9 @@ fi
 echo "=== [2/9] Stage 0: Bootstrap Seed -> out/pionc0 (zero MoonBit, pure C + QBE) ==="
 T_S0_0=$(now_ms)
 if [ -n "${PION_STAGE0_BIN:-}" ]; then
-  cp "$PION_STAGE0_BIN" "$OUT_DIR/pionc0"
+  if [ "$PION_STAGE0_BIN" != "$OUT_DIR/pionc0" ]; then
+    cp "$PION_STAGE0_BIN" "$OUT_DIR/pionc0"
+  fi
   chmod +x "$OUT_DIR/pionc0"
 else
   if [ -n "${PION_STAGE0_SSA:-}" ]; then
@@ -89,6 +119,10 @@ T_S0_1=$(now_ms)
 S0_MS=$((T_S0_1 - T_S0_0))
 S0_BYTES=$(wc -c < "$OUT_DIR/pionc0" | tr -d ' ')
 echo "Stage 0 (pionc0): build=${S0_MS} ms, size=${S0_BYTES} bytes"
+
+if [ "${PION_STAGE0_ONLY:-0}" = "1" ]; then
+  exit 0
+fi
 
 echo "=== [3/9] Stage 1: pionc0 -> out/pionc1 (fresh CAS) ==="
 CAS_S1="$TMP_DIR/cas_stage1"

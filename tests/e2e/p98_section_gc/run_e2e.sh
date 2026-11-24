@@ -6,14 +6,12 @@ set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
 ROOT_DIR="$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)"
+. "$ROOT_DIR/scripts/bg-lib.sh"
 TMP="$(mktemp -d)"
 BIGOBJ_PID=""
 CBIG_PID=""
 cleanup() {
-  for P in $BIGOBJ_PID $CBIG_PID; do
-    kill "$P" 2>/dev/null || true
-    wait "$P" 2>/dev/null || true
-  done
+  bg_kill "$BIGOBJ_PID" "$CBIG_PID"
   rm -rf "$TMP"
 }
 trap cleanup EXIT
@@ -621,16 +619,15 @@ with open(sys.argv[1], "w") as f:
     f.write('.section .text$main,"xr"\n.linkonce one_only\n.globl main\nmain:\n\tcall f_0\n\txorl %eax,%eax\n\tret\n')
 PYEOF
   # GNU as takes ~20-35 s on each >65,279-section object: this one and the
-  # c_sources one below are built in the background and joined at the end.
-  (
-    set -e
-    x86_64-w64-mingw32-gcc -Wa,-mbig-obj -c "$TMP/bigobj.s" -o "$TMP/bigobj.o"
-    "$MINGW_AR" rcs "$TMP/libbigobj.a" "$TMP/bigobj.o"
-    x86_64-w64-mingw32-gcc -Wl,--gc-sections "$TMP/bigobj.o" -o "$TMP/bigobj.exe"
-  ) > "$TMP/bigobj.log" 2>&1 &
-  BIGOBJ_PID=$!
+  # c_sources one below are built in their own process groups and joined at the end.
+  bg_start "$TMP/bigobj.log" sh -euc '
+    x86_64-w64-mingw32-gcc -Wa,-mbig-obj -c "$1/bigobj.s" -o "$1/bigobj.o"
+    "$2" rcs "$1/libbigobj.a" "$1/bigobj.o"
+    x86_64-w64-mingw32-gcc -Wl,--gc-sections "$1/bigobj.o" -o "$1/bigobj.exe"
+  ' bigobj "$TMP" "$MINGW_AR"
+  BIGOBJ_PID="$BG_PID"
 
-  # Real manifest `c_sources` >66,000-section COFF big-obj via `pionc build --target amd64_win`.
+  # Real manifest `c_sources` >65,600-section COFF big-obj via `pionc build --target amd64_win`.
   CBIG="$TMP/c_bigobj_pkg"
   mkdir -p "$CBIG/src" "$CBIG/csrc"
   cat > "$CBIG/pion.toml" <<'EOF'
@@ -653,13 +650,32 @@ EOF
 import sys
 with open(sys.argv[1], "w") as f:
     f.write("#include <stdint.h>\nint64_t cbig_live(void) { return 42; }\n")
-    for i in range(34000):
+    for i in range(65600):
         f.write(f"int cbig_d_{i} = {i + 1};\n")
+    for i in range(16):
         f.write(f"int cbig_f_{i}(void) {{ return cbig_d_{i}; }}\n")
 PYEOF
-  env -u PION_RT_LIB CC=x86_64-w64-mingw32-gcc PION_CACHE_DIR="$TMP/cas_cbig" \
-    "$PIONC" build --release --target amd64_win -o "$TMP/c_bigobj.exe" "$CBIG" > "$TMP/cbig.log" 2>&1 &
-  CBIG_PID=$!
+  bg_start "$TMP/cbig.log" sh -euc '
+    env -u PION_RT_LIB CC=x86_64-w64-mingw32-gcc PION_CACHE_DIR="$1/cas_cbig" \
+      "$2" build --release --target amd64_win -o "$1/c_bigobj.exe" "$3"
+    # Confirm big.c genuinely exceeds the 65,279-section standard COFF limit (COFF BigObj).
+    python3 - "$1/cas_cbig" <<'\''PYEOF'\''
+import glob, os, struct, sys
+max_sec = 0
+for p in glob.glob(os.path.join(sys.argv[1], "**", "*.o"), recursive=True):
+    with open(p, "rb") as f:
+        hdr = f.read(56)
+    if len(hdr) >= 56:
+        sig1, sig2, ver = struct.unpack_from("<HHH", hdr, 0)
+        if sig1 == 0 and sig2 == 0xFFFF and ver >= 2:
+            nsec = struct.unpack_from("<I", hdr, 44)[0]
+            if nsec > max_sec:
+                max_sec = nsec
+assert max_sec > 65279, f"FAIL: expected COFF BigObj (>65279 sections) in {sys.argv[1]}, max={max_sec}"
+print(f"p98 c_bigobj COFF BigObj verified: {max_sec} sections (>65279)")
+PYEOF
+  ' cbig "$TMP" "$PIONC" "$CBIG"
+  CBIG_PID="$BG_PID"
 fi
 
 # 4. MSVC lld-link & link.exe verification (runs whenever clang + lld-link / link.exe are available).
@@ -793,6 +809,47 @@ if [ -n "$CLANG_BIN" ]; then
 #include <string.h>
 #ifdef _WIN32
 #include <process.h>
+/* Quote a single argv element using Microsoft CRT CommandLineToArgvW rules so
+ * _spawnvp preserves spaces/quotes (e.g. C:\Program Files\LLVM\bin\clang.exe). */
+static char *quote_win_arg(const char *arg) {
+    int need_quote = (*arg == '\0');
+    for (const char *p = arg; *p; p++) {
+        if (*p == ' ' || *p == '\t' || *p == '"') {
+            need_quote = 1;
+            break;
+        }
+    }
+    if (!need_quote) {
+        size_t len = strlen(arg);
+        char *out = (char *)malloc(len + 1);
+        if (!out) return NULL;
+        memcpy(out, arg, len + 1);
+        return out;
+    }
+    size_t cap = strlen(arg) * 2 + 3;
+    char *out = (char *)malloc(cap);
+    if (!out) return NULL;
+    char *w = out;
+    *w++ = '"';
+    for (const char *p = arg; *p; ) {
+        size_t bs = 0;
+        while (*p == '\\') { bs++; p++; }
+        if (*p == '\0') {
+            for (size_t i = 0; i < bs * 2; i++) *w++ = '\\';
+            break;
+        } else if (*p == '"') {
+            for (size_t i = 0; i < bs * 2 + 1; i++) *w++ = '\\';
+            *w++ = '"';
+            p++;
+        } else {
+            for (size_t i = 0; i < bs; i++) *w++ = '\\';
+            *w++ = *p++;
+        }
+    }
+    *w++ = '"';
+    *w = '\0';
+    return out;
+}
 #else
 #include <sys/wait.h>
 #include <unistd.h>
@@ -838,7 +895,21 @@ int main(int argc, char **argv) {
     int rc = 0;
 #ifdef _WIN32
     if (dry_log && *dry_log) freopen(dry_log, "w", stderr);
-    rc = (int)_spawnvp(_P_WAIT, real_clang, (const char *const *)nargv);
+    char **qargv = (char **)malloc((size_t)(k + 1) * sizeof(char *));
+    if (!qargv) { free(nargv); return 127; }
+    for (int i = 0; i < k; i++) {
+        qargv[i] = quote_win_arg(nargv[i]);
+        if (!qargv[i]) {
+            for (int j = 0; j < i; j++) free(qargv[j]);
+            free(qargv);
+            free(nargv);
+            return 127;
+        }
+    }
+    qargv[k] = NULL;
+    rc = (int)_spawnvp(_P_WAIT, real_clang, (const char *const *)qargv);
+    for (int i = 0; i < k; i++) free(qargv[i]);
+    free(qargv);
 #else
     pid_t pid = fork();
     if (pid == 0) {
@@ -961,25 +1032,21 @@ fi
 
 # Join the two big-obj builds of section 3.
 if [ -n "$CBIG_PID" ]; then
-  if ! wait "$CBIG_PID"; then
+  if ! bg_join "$CBIG_PID" "$TMP/cbig.log"; then
     CBIG_PID=""
-    cat "$TMP/cbig.log" >&2
-    echo "FAIL: p98: c_sources >68,000-section COFF big-obj build failed" >&2
+    echo "FAIL: p98: c_sources >65,600-section COFF big-obj build failed" >&2
     exit 1
   fi
   CBIG_PID=""
-  cat "$TMP/cbig.log"
-  echo "[PASS] p98: real manifest c_sources >68,000-section COFF big-obj compiled & linked via pionc"
+  echo "[PASS] p98: real manifest c_sources >65,600-section COFF big-obj compiled & linked via pionc"
 fi
 if [ -n "$BIGOBJ_PID" ]; then
-  if ! wait "$BIGOBJ_PID"; then
+  if ! bg_join "$BIGOBJ_PID" "$TMP/bigobj.log"; then
     BIGOBJ_PID=""
-    cat "$TMP/bigobj.log" >&2
     echo "FAIL: p98: 66,000-section COFF big-obj assemble/archive/GC-link failed" >&2
     exit 1
   fi
   BIGOBJ_PID=""
-  cat "$TMP/bigobj.log"
   echo "[PASS] p98: 66,000-section COFF big-obj assembled, archived, and GC-linked"
 fi
 

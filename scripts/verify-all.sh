@@ -3,14 +3,259 @@ set -eu
 
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
+# Bypass macOS /usr/bin/{cc,clang,ar,strip,ld,git} xcrun shims (~17ms/call).
+if [ "$(uname -s)" = "Darwin" ]; then
+  _xc_dirs=""
+  for _xc_tool in clang git; do
+    _xc_p="$(xcrun --find "$_xc_tool" 2>/dev/null || true)"
+    if [ -n "$_xc_p" ]; then
+      _xc_d="$(dirname -- "$_xc_p")"
+      case ":$_xc_dirs:$PATH:" in
+        *":$_xc_d:"*) ;;
+        *) _xc_dirs="${_xc_dirs:+$_xc_dirs:}$_xc_d" ;;
+      esac
+    fi
+  done
+  if [ -n "$_xc_dirs" ]; then
+    export PATH="$_xc_dirs:$PATH"
+  fi
+  if [ -z "${SDKROOT:-}" ]; then
+    _xc_sdk="$(xcrun --show-sdk-path 2>/dev/null || true)"
+    if [ -n "$_xc_sdk" ]; then
+      export SDKROOT="$_xc_sdk"
+    fi
+  fi
+fi
+
 ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 OUT_DIR="$ROOT_DIR/out"
 
-echo "=== [1/6] Runtime Gate (libpionrt.a + MT bench + TSan + ASan + QBE smoke) ==="
-sh "$ROOT_DIR/scripts/test-runtime.sh"
+# Helper sub-commands invoked inside run-e2e-parallel.sh (each uses its own
+# mktemp -d + PION_CACHE_DIR and writes nothing to shared out/ or source tree).
+if [ "${1:-}" = "--group" ]; then
+  GROUP="$2"
+  PIONC2="${PIONC2:-$OUT_DIR/pionc2}"
+  G_TMP=$(mktemp -d)
+  trap 'rm -rf "$G_TMP"' EXIT
+  export PION_CACHE_DIR="$G_TMP/cas"
+  mkdir -p "$PION_CACHE_DIR"
+  case "$GROUP" in
+    std_tests)
+      for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc std/tls; do
+        if [ "$TPKG" = "examples/text_stats" ]; then
+          TEST_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/$TPKG")
+        else
+          TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
+        fi
+        printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
+        if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
+          echo "FAIL: pionc2 test --json $TPKG failed" >&2
+          exit 1
+        fi
+        if [ "$TPKG" = "std/regex" ]; then
+          # std/regex: 9 tests, two of them linear-time ReDoS guards ((a?){n}a{n}, nested quantifiers).
+          REGEX_PASSED=$(printf '%s' "$TEST_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("%d/%d" % (d["passed"], len(d["tests"])))')
+          if [ "$REGEX_PASSED" != "9/9" ] || ! printf '%s' "$TEST_OUT" | grep -q '"name":"ReDoS: (a?){n}a{n} is linear","ok":true'; then
+            echo "FAIL: std/regex expected 9/9 incl. ReDoS guards, got $REGEX_PASSED" >&2
+            exit 1
+          fi
+          echo "std/regex: $REGEX_PASSED passed (ReDoS guards included)"
+        fi
+      done
+      # `pionc init` scaffolds a package that is check/test/run/fmt-clean as is.
+      "$PIONC2" init --json "$G_TMP/demo"
+      "$PIONC2" check --json "$G_TMP/demo" | grep -q '"ok":true'
+      INIT_TEST=$("$PIONC2" test --json "$G_TMP/demo")
+      printf 'pionc2 test --json <init demo> -> %s\n' "$INIT_TEST"
+      printf '%s' "$INIT_TEST" | grep -q '"ok":true'
+      printf '%s' "$INIT_TEST" | grep -q '"failed":0'
+      "$PIONC2" run "$G_TMP/demo"
+      "$PIONC2" fmt --check --json "$G_TMP/demo" | grep -q '"ok":true'
+      for DPKG in std/json std/http std/regex std/proc; do
+        "$PIONC2" doc --json "$ROOT_DIR/$DPKG" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("pionc2 doc --json %s -> valid JSON, %d package(s), %d public item(s)" % (sys.argv[1], len(d["packages"]), sum(len(p["items"]) for p in d["packages"])))' "$DPKG"
+      done
+      echo "[SUMMARY] std_tests (std/*, text_stats, regex 9/9 ReDoS, init, doc): OK"
+      ;;
+    mbt_tests)
+      for TPKG in tools/mbt_compat tools/mbt2pion tools/mbt2pion_cli; do
+        TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
+        printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
+        if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
+          echo "FAIL: pionc2 test --json $TPKG failed" >&2
+          exit 1
+        fi
+      done
+      echo "[SUMMARY] mbt_tests (mbt_compat, mbt2pion, mbt2pion_cli): OK"
+      ;;
+    dogfood_apps)
+      for TPKG in examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
+        TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
+        printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
+        if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
+          echo "FAIL: pionc2 test --json $TPKG failed" >&2
+          exit 1
+        fi
+      done
+      "$PIONC2" build --release -o "$G_TMP/http_kv_service" "$ROOT_DIR/examples/http_kv_service"
+      "$G_TMP/http_kv_service" --self-test
+      "$PIONC2" build --release -o "$G_TMP/http_event_server" "$ROOT_DIR/examples/http_event_server"
+      "$G_TMP/http_event_server" --self-test
+      "$PIONC2" build --release -o "$G_TMP/sqlite_indexer" "$ROOT_DIR/examples/sqlite_indexer"
+      IDX_DB="$G_TMP/sqlite_indexer_check.db"
+      IDX_JSON=$("$G_TMP/sqlite_indexer" "$ROOT_DIR/compiler/src/core" "$IDX_DB")
+      echo "sqlite_indexer -> $(printf '%s' "$IDX_JSON" | cut -c1-160)..."
+      IDX_WANT=$(printf '%s' "$IDX_JSON" | python3 -c 'import json, sys; t = json.load(sys.stdin)["totals"]; print("%d|%d" % (t["files"], t["lines"]))')
+      if command -v sqlite3 >/dev/null 2>&1; then
+        IDX_GOT=$(sqlite3 "$IDX_DB" "SELECT COUNT(*), SUM(lines) FROM files;")
+        if [ "$IDX_GOT" != "$IDX_WANT" ]; then
+          echo "FAIL: sqlite3 CLI sees $IDX_GOT, indexer reported $IDX_WANT" >&2
+          exit 1
+        fi
+        echo "sqlite3 CLI cross-check: $IDX_GOT (files|lines) == indexer JSON"
+      fi
+      # std/http over a workspace dependency graph (http -> json) must build and link.
+      "$PIONC2" build -o "$G_TMP/http_loopback" "$ROOT_DIR/examples/http_loopback"
+      echo "[SUMMARY] dogfood_apps (http_kv_service, http_event_server, sqlite_indexer, http_loopback): OK"
+      ;;
+    standalone_e2e)
+      "$PIONC2" run "$ROOT_DIR/examples/text_stats"
+      "$PIONC2" run "$ROOT_DIR/tests/e2e/net_ffi.pion"
+      "$PIONC2" run "$ROOT_DIR/tests/e2e/utf8_text.pion"
+      P22A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p22a_systems_io.pion")
+      echo "p22a_systems_io -> $P22A_OUT"
+      [ "$P22A_OUT" = "p22a_systems_io ok" ] || { echo "FAIL: p22a_systems_io output mismatch" >&2; exit 1; }
+      P25A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion")
+      echo "p25a_c_varargs -> $P25A_OUT"
+      [ "$P25A_OUT" = "a=42 b=-7 c=3.25" ] || { echo "FAIL: p25a_c_varargs output mismatch" >&2; exit 1; }
+      P27A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion")
+      echo "p27a_ergonomics_bug4 -> $P27A_OUT"
+      [ "$P27A_OUT" = "p27a_ergonomics_bug4 ok" ] || { echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2; exit 1; }
+      P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
+      echo "p17a_ergonomics_mt -> $P17A_OUT"
+      [ "$P17A_OUT" = "p17a_ok log=2401 recs=3200 index=3200 keys=16" ] || { echo "FAIL: p17a_ergonomics_mt output mismatch" >&2; exit 1; }
+      # Native libraries: `[link]` in pion.toml, `-l<lib>` on the CLI, and a failing link without them.
+      "$PIONC2" run "$ROOT_DIR/tests/e2e/link_z"
+      "$PIONC2" build -lz -o "$G_TMP/link_z_cli" "$ROOT_DIR/tests/e2e/link_z/src/main.pion"
+      "$G_TMP/link_z_cli"
+      if "$PIONC2" build -o "$G_TMP/link_z_nolib" "$ROOT_DIR/tests/e2e/link_z/src/main.pion" 2>/dev/null; then
+        echo "FAIL: linking zlibVersion without -lz unexpectedly succeeded" >&2
+        exit 1
+      fi
+      CROSS_O="$G_TMP/cross_ffi_traits.o"
+      "$PIONC2" build --target amd64_sysv --emit-obj "$CROSS_O" "$ROOT_DIR/tests/e2e/ffi_traits.pion"
+      CROSS_FILE=$(file "$CROSS_O")
+      echo "$CROSS_FILE"
+      printf '%s' "$CROSS_FILE" | grep -q 'ELF 64-bit LSB relocatable, x86-64' || {
+        echo "FAIL: --target amd64_sysv --emit-obj did not produce an x86-64 ELF64 relocatable" >&2
+        exit 1
+      }
+      # dyn Trait: fat-pointer dispatch, vtables, Option[dyn Trait] niche, freeze/drop.
+      "$PIONC2" build -o "$G_TMP/dyn_trait" "$ROOT_DIR/tests/e2e/dyn_trait.pion"
+      DYN_OUT=$("$G_TMP/dyn_trait")
+      echo "dyn_trait -> $DYN_OUT"
+      [ "$DYN_OUT" = "dyn_trait ok" ] || { echo "FAIL: dyn_trait output mismatch" >&2; exit 1; }
+      # Wave J2: hot-path RC elision soundness (dev & --release + Wasm32 parity on single-threaded subset).
+      "$PIONC2" build -o "$G_TMP/wave_j2_dev" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
+      J2_DEV_OUT=$("$G_TMP/wave_j2_dev")
+      "$PIONC2" build --release -o "$G_TMP/wave_j2_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
+      J2_REL_OUT=$("$G_TMP/wave_j2_rel")
+      echo "wave_j2_rc_elision -> dev=$J2_DEV_OUT release=$J2_REL_OUT"
+      case "$J2_DEV_OUT" in
+        wave_j2_ok:*) ;;
+        *) echo "FAIL: wave_j2_rc_elision bad dev output ($J2_DEV_OUT)" >&2; exit 1 ;;
+      esac
+      [ "$J2_DEV_OUT" = "$J2_REL_OUT" ] || {
+        echo "FAIL: wave_j2_rc_elision dev/release mismatch (dev=$J2_DEV_OUT release=$J2_REL_OUT)" >&2
+        exit 1
+      }
+      "$PIONC2" build --release -o "$G_TMP/wave_j2_st_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+      J2_ST_NAT=$("$G_TMP/wave_j2_st_rel")
+      case "$J2_ST_NAT" in
+        wave_j2_st_ok:*) ;;
+        *) echo "FAIL: wave_j2_rc_elision_st bad native output ($J2_ST_NAT)" >&2; exit 1 ;;
+      esac
+      if command -v node >/dev/null 2>&1; then
+        "$PIONC2" build --release --target wasm32 -o "$G_TMP/wave_j2_st.wasm" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
+        J2_ST_WASM=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$G_TMP/wave_j2_st.wasm")
+        echo "wave_j2_rc_elision_st -> native=$J2_ST_NAT wasm32=$J2_ST_WASM"
+        [ "$J2_ST_NAT" = "$J2_ST_WASM" ] || {
+          echo "FAIL: wave_j2_rc_elision_st native/wasm32 mismatch (native=$J2_ST_NAT wasm32=$J2_ST_WASM)" >&2
+          exit 1
+        }
+      fi
+      echo "[SUMMARY] standalone_e2e (text_stats, net_ffi, utf8, p22a/p25a/p27a/p17a, link_z, cross_elf, dyn_trait, wave_j2): OK"
+      ;;
+    flagship_https_station)
+      HTTPS_OUT=$("$PIONC2" test --json "$ROOT_DIR/examples/https_server")
+      printf 'pionc2 test --json examples/https_server -> %s\n' "$HTTPS_OUT"
+      if ! printf '%s' "$HTTPS_OUT" | grep -q '"ok":true' || ! printf '%s' "$HTTPS_OUT" | grep -q '"failed":0'; then
+        echo "FAIL: pionc2 test --json examples/https_server failed" >&2
+        exit 1
+      fi
+      # Flagship: HTTPS + SSE + SQLite WAL + dyn Handler + std/regex + worker pool.
+      STATION_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/examples/pion_station")
+      printf 'pionc2 test --json examples/pion_station -> %s\n' "$STATION_OUT"
+      if ! printf '%s' "$STATION_OUT" | grep -q '"ok":true' || ! printf '%s' "$STATION_OUT" | grep -q '"failed":0'; then
+        echo "FAIL: pionc2 test --json examples/pion_station failed" >&2
+        exit 1
+      fi
+      echo "[SUMMARY] flagship_https_station (https_server + pion_station): OK"
+      ;;
+    *)
+      echo "FAIL: unknown verify-all group: $GROUP" >&2
+      exit 2
+      ;;
+  esac
+  exit 0
+fi
+
+. "$ROOT_DIR/scripts/bg-lib.sh"
+RT_LOG_DIR=$(mktemp -d)
+TSAN_PID=""
+ASAN_PID=""
+SMOKE_PID=""
+cleanup_verify() {
+  bg_kill "$TSAN_PID" "$ASAN_PID" "$SMOKE_PID"
+  rm -rf "$RT_LOG_DIR"
+}
+trap cleanup_verify EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+echo "=== [1/6] Runtime Gate (libpionrt.a + MT bench; TSan + ASan + QBE smoke overlapped with Stage 0) ==="
+sh "$ROOT_DIR/scripts/test-runtime.sh" --prep-only
+bg_start "$RT_LOG_DIR/tsan.log" sh "$ROOT_DIR/scripts/test-runtime.sh" --step tsan
+TSAN_PID="$BG_PID"
+bg_start "$RT_LOG_DIR/asan.log" sh "$ROOT_DIR/scripts/test-runtime.sh" --step asan
+ASAN_PID="$BG_PID"
+bg_start "$RT_LOG_DIR/smoke.log" sh "$ROOT_DIR/scripts/test-runtime.sh" --step smoke
+SMOKE_PID="$BG_PID"
 
 echo "=== [2/6] 9/9 Pure-Pion Fixed-Point Self-Hosting Bootstrap (seed -> pionc0 -> pionc1 -> pionc2 + compiler/src/core tests) ==="
-PION_SKIP_RT_TEST=1 PION_DEFER_CORE_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
+PION_SKIP_RT_TEST=1 PION_SKIP_QBE_BUILD=1 PION_STAGE0_ONLY=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
+
+echo "=== Joining async runtime gates (TSan + ASan + QBE smoke) ==="
+RT_FAIL=0
+if ! bg_join "$TSAN_PID" "$RT_LOG_DIR/tsan.log"; then
+  RT_FAIL=1
+  echo "FAIL: runtime ThreadSanitizer step" >&2
+fi
+TSAN_PID=""
+if ! bg_join "$ASAN_PID" "$RT_LOG_DIR/asan.log"; then
+  RT_FAIL=1
+  echo "FAIL: runtime AddressSanitizer step" >&2
+fi
+ASAN_PID=""
+if ! bg_join "$SMOKE_PID" "$RT_LOG_DIR/smoke.log"; then
+  RT_FAIL=1
+  echo "FAIL: QBE smoke step" >&2
+fi
+SMOKE_PID=""
+if [ "$RT_FAIL" -ne 0 ]; then
+  exit 1
+fi
+
+PION_STAGE0_ONLY=0 PION_STAGE0_BIN="$OUT_DIR/pionc0" PION_SKIP_RT_TEST=1 PION_SKIP_QBE_BUILD=1 PION_DEFER_CORE_TEST=1 sh "$ROOT_DIR/scripts/bootstrap.sh"
 
 PIONC2="$OUT_DIR/pionc2"
 export PION_QBE="$OUT_DIR/qbe"
@@ -46,137 +291,10 @@ fi
 rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
-echo "=== [4/6] Standalone pionc2 Test Runner (examples/text_stats, std/*, dogfood apps, init, doc) ==="
-for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc std/tls examples/http_kv_service examples/http_event_server examples/sqlite_indexer tools/mbt_compat tools/mbt2pion tools/mbt2pion_cli; do
-  if [ "$TPKG" = "examples/text_stats" ]; then
-    TEST_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/$TPKG")
-  else
-    TEST_OUT=$("$PIONC2" test --json "$ROOT_DIR/$TPKG")
-  fi
-  printf 'pionc2 test --json %s -> %s\n' "$TPKG" "$TEST_OUT"
-  if ! printf '%s' "$TEST_OUT" | grep -q '"ok":true' || ! printf '%s' "$TEST_OUT" | grep -q '"failed":0'; then
-    echo "FAIL: pionc2 test --json $TPKG failed" >&2
-    exit 1
-  fi
-done
-# std/regex: 9 tests, two of them linear-time ReDoS guards ((a?){n}a{n}, nested quantifiers).
-REGEX_OUT=$("$PIONC2" test --json "$ROOT_DIR/std/regex")
-REGEX_PASSED=$(printf '%s' "$REGEX_OUT" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("%d/%d" % (d["passed"], len(d["tests"])))')
-if [ "$REGEX_PASSED" != "9/9" ] || ! printf '%s' "$REGEX_OUT" | grep -q '"name":"ReDoS: (a?){n}a{n} is linear","ok":true'; then
-  echo "FAIL: std/regex expected 9/9 incl. ReDoS guards, got $REGEX_PASSED" >&2
-  exit 1
-fi
-echo "std/regex: $REGEX_PASSED passed (ReDoS guards included)"
-
-# `pionc init` scaffolds a package that is check/test/run/fmt-clean as is.
-INIT_TMP=$(mktemp -d)
-"$PIONC2" init --json "$INIT_TMP/demo"
-"$PIONC2" check --json "$INIT_TMP/demo" | grep -q '"ok":true'
-INIT_TEST=$("$PIONC2" test --json "$INIT_TMP/demo")
-printf 'pionc2 test --json <init demo> -> %s\n' "$INIT_TEST"
-printf '%s' "$INIT_TEST" | grep -q '"ok":true'
-printf '%s' "$INIT_TEST" | grep -q '"failed":0'
-"$PIONC2" run "$INIT_TMP/demo"
-"$PIONC2" fmt --check --json "$INIT_TMP/demo" | grep -q '"ok":true'
-rm -rf "$INIT_TMP"
-echo "pionc2 init -> check/test/run/fmt --check: OK"
-
-for DPKG in std/json std/http std/regex std/proc; do
-  "$PIONC2" doc --json "$ROOT_DIR/$DPKG" | python3 -c 'import json, sys; d = json.load(sys.stdin); print("pionc2 doc --json %s -> valid JSON, %d package(s), %d public item(s)" % (sys.argv[1], len(d["packages"]), sum(len(p["items"]) for p in d["packages"])))' "$DPKG"
-done
-
-echo "=== [5/6] Standalone pionc2 Run + E2E Suites + Cross ELF64 .o ==="
-"$PIONC2" run "$ROOT_DIR/examples/text_stats"
-"$PIONC2" run "$ROOT_DIR/tests/e2e/net_ffi.pion"
-"$PIONC2" run "$ROOT_DIR/tests/e2e/utf8_text.pion"
-P22A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p22a_systems_io.pion")
-echo "p22a_systems_io -> $P22A_OUT"
-if [ "$P22A_OUT" != "p22a_systems_io ok" ]; then
-  echo "FAIL: p22a_systems_io output mismatch" >&2
-  exit 1
-fi
-P25A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion")
-echo "p25a_c_varargs -> $P25A_OUT"
-if [ "$P25A_OUT" != "a=42 b=-7 c=3.25" ]; then
-  echo "FAIL: p25a_c_varargs output mismatch" >&2
-  exit 1
-fi
-P27A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion")
-echo "p27a_ergonomics_bug4 -> $P27A_OUT"
-if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
-  echo "FAIL: p27a_ergonomics_bug4 output mismatch" >&2
-  exit 1
-fi
-P17A_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion")
-echo "p17a_ergonomics_mt -> $P17A_OUT"
-if [ "$P17A_OUT" != "p17a_ok log=2401 recs=3200 index=3200 keys=16" ]; then
-  echo "FAIL: p17a_ergonomics_mt output mismatch" >&2
-  exit 1
-fi
-# Native libraries: `[link]` in pion.toml, `-l<lib>` on the CLI, and a failing link without them.
-"$PIONC2" run "$ROOT_DIR/tests/e2e/link_z"
-"$PIONC2" build -lz -o "$OUT_DIR/link_z_cli" "$ROOT_DIR/tests/e2e/link_z/src/main.pion"
-"$OUT_DIR/link_z_cli"
-if "$PIONC2" build -o "$OUT_DIR/link_z_nolib" "$ROOT_DIR/tests/e2e/link_z/src/main.pion" 2>/dev/null; then
-  echo "FAIL: linking zlibVersion without -lz unexpectedly succeeded" >&2
-  exit 1
-fi
-rm -f "$OUT_DIR/link_z_cli" "$OUT_DIR/link_z_nolib"
-CROSS_O="$OUT_DIR/cross_ffi_traits.o"
-rm -f "$CROSS_O"
-"$PIONC2" build --target amd64_sysv --emit-obj "$CROSS_O" "$ROOT_DIR/tests/e2e/ffi_traits.pion"
-CROSS_FILE=$(file "$CROSS_O")
-echo "$CROSS_FILE"
-if ! printf '%s' "$CROSS_FILE" | grep -q 'ELF 64-bit LSB relocatable, x86-64'; then
-  echo "FAIL: --target amd64_sysv --emit-obj did not produce an x86-64 ELF64 relocatable" >&2
-  exit 1
-fi
-rm -f "$CROSS_O"
-# dyn Trait: fat-pointer dispatch, vtables, Option[dyn Trait] niche, freeze/drop.
-"$PIONC2" build -o "$OUT_DIR/dyn_trait" "$ROOT_DIR/tests/e2e/dyn_trait.pion"
-DYN_OUT=$("$OUT_DIR/dyn_trait")
-rm -f "$OUT_DIR/dyn_trait"
-echo "dyn_trait -> $DYN_OUT"
-if [ "$DYN_OUT" != "dyn_trait ok" ]; then
-  echo "FAIL: dyn_trait output mismatch" >&2
-  exit 1
-fi
-# Wave J2: hot-path RC elision soundness (dev & --release + Wasm32 parity on single-threaded subset).
-"$PIONC2" build -o "$OUT_DIR/wave_j2_dev" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
-J2_DEV_OUT=$("$OUT_DIR/wave_j2_dev")
-rm -f "$OUT_DIR/wave_j2_dev"
-"$PIONC2" build --release -o "$OUT_DIR/wave_j2_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision.pion"
-J2_REL_OUT=$("$OUT_DIR/wave_j2_rel")
-rm -f "$OUT_DIR/wave_j2_rel"
-echo "wave_j2_rc_elision -> dev=$J2_DEV_OUT release=$J2_REL_OUT"
-case "$J2_DEV_OUT" in
-  wave_j2_ok:*) ;;
-  *) echo "FAIL: wave_j2_rc_elision bad dev output ($J2_DEV_OUT)" >&2; exit 1 ;;
-esac
-if [ "$J2_DEV_OUT" != "$J2_REL_OUT" ]; then
-  echo "FAIL: wave_j2_rc_elision dev/release mismatch (dev=$J2_DEV_OUT release=$J2_REL_OUT)" >&2
-  exit 1
-fi
-"$PIONC2" build --release -o "$OUT_DIR/wave_j2_st_rel" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
-J2_ST_NAT=$("$OUT_DIR/wave_j2_st_rel")
-rm -f "$OUT_DIR/wave_j2_st_rel"
-case "$J2_ST_NAT" in
-  wave_j2_st_ok:*) ;;
-  *) echo "FAIL: wave_j2_rc_elision_st bad native output ($J2_ST_NAT)" >&2; exit 1 ;;
-esac
-if command -v node >/dev/null 2>&1; then
-  "$PIONC2" build --release --target wasm32 -o "$OUT_DIR/wave_j2_st.wasm" "$ROOT_DIR/tests/e2e/wave_j2_rc_elision_st.pion"
-  J2_ST_WASM=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$OUT_DIR/wave_j2_st.wasm")
-  rm -f "$OUT_DIR/wave_j2_st.wasm"
-  echo "wave_j2_rc_elision_st -> native=$J2_ST_NAT wasm32=$J2_ST_WASM"
-  if [ "$J2_ST_NAT" != "$J2_ST_WASM" ]; then
-    echo "FAIL: wave_j2_rc_elision_st native/wasm32 mismatch (native=$J2_ST_NAT wasm32=$J2_ST_WASM)" >&2
-    exit 1
-  fi
-fi
-
-# Independent E2E suites (each in its own mktemp -d + CAS, ephemeral ports, nothing
-# written to the source tree or out/) run concurrently; see scripts/run-e2e-parallel.sh.
+echo "=== [4-6/6] Parallel Test Runner, E2E Suites, Cross ELF64 .o & Flagship Dogfood ==="
+# Independent test groups, E2E suites, dogfood apps and flagship TLS/SQLite tests
+# (each in its own mktemp -d + CAS, ephemeral ports, nothing written to the source
+# tree or out/) run concurrently; see scripts/run-e2e-parallel.sh.
 export ROOT_DIR OUT_DIR PIONC2
 # One ASan/TSan build of the runtime for all suites (see scripts/san-rt.sh).
 . "$ROOT_DIR/scripts/san-rt-env.sh"
@@ -196,6 +314,14 @@ sh "$ROOT_DIR/tests/e2e/pkg_cli/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
 # Wave J4b: Cargo-style package aliases, canonical package IDs, lockfile compat & C-export collision guard.
 sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC2"
+# Folded [4/6] std/* + text_stats + regex 9/9 ReDoS + init + doc, mbt*, dogfood release apps, [5/6] standalone e2e, and [6/6] TLS/flagship.
+sh "$ROOT_DIR/scripts/verify-all.sh" --group std_tests
+sh "$ROOT_DIR/scripts/verify-all.sh" --group mbt_tests
+sh "$ROOT_DIR/scripts/verify-all.sh" --group dogfood_apps
+sh "$ROOT_DIR/scripts/verify-all.sh" --group standalone_e2e
+sh "$ROOT_DIR/scripts/verify-all.sh" --group flagship_https_station
+sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC2"
 # Wave J3: first-class immutable Send sequence type ImmArray[T].
 sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p76_value_key_map/run_e2e.sh" "$PIONC2"
@@ -298,49 +424,5 @@ sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 E2E
 # P71-C asserts wall-clock HashDoS budgets: run it alone, never next to the pool.
 sh "$ROOT_DIR/tests/e2e/p71c_hashdos_bytes/run_e2e.sh" "$PIONC2"
-
-echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
-# Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent
-# stress) and the pure-pion libsqlite3 indexer cross-checked by the sqlite3 CLI.
-"$PIONC2" build --release -o "$OUT_DIR/http_kv_service" "$ROOT_DIR/examples/http_kv_service"
-"$OUT_DIR/http_kv_service" --self-test
-"$PIONC2" build --release -o "$OUT_DIR/http_event_server" "$ROOT_DIR/examples/http_event_server"
-"$OUT_DIR/http_event_server" --self-test
-"$PIONC2" build --release -o "$OUT_DIR/sqlite_indexer" "$ROOT_DIR/examples/sqlite_indexer"
-IDX_DB="$OUT_DIR/sqlite_indexer_check.db"
-rm -f "$IDX_DB"
-IDX_JSON=$("$OUT_DIR/sqlite_indexer" "$ROOT_DIR/compiler/src/core" "$IDX_DB")
-echo "sqlite_indexer -> $(printf '%s' "$IDX_JSON" | cut -c1-160)..."
-IDX_WANT=$(printf '%s' "$IDX_JSON" | python3 -c 'import json, sys; t = json.load(sys.stdin)["totals"]; print("%d|%d" % (t["files"], t["lines"]))')
-if command -v sqlite3 >/dev/null 2>&1; then
-  IDX_GOT=$(sqlite3 "$IDX_DB" "SELECT COUNT(*), SUM(lines) FROM files;")
-  if [ "$IDX_GOT" != "$IDX_WANT" ]; then
-    echo "FAIL: sqlite3 CLI sees $IDX_GOT, indexer reported $IDX_WANT" >&2
-    exit 1
-  fi
-  echo "sqlite3 CLI cross-check: $IDX_GOT (files|lines) == indexer JSON"
-fi
-rm -f "$IDX_DB" "$OUT_DIR/http_kv_service" "$OUT_DIR/http_event_server" "$OUT_DIR/sqlite_indexer"
-# std/http over a workspace dependency graph (http -> json) must build and link;
-# its real-TCP run is part of scripts/test-linux.sh.
-"$PIONC2" build -o "$OUT_DIR/http_loopback" "$ROOT_DIR/examples/http_loopback"
-rm -f "$OUT_DIR/http_loopback"
-# std/tls (macOS native Network.framework + Security.framework, zero OpenSSL),
-# examples/https_server and examples/pion_station run unconditionally with zero LIBRARY_PATH.
-sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC2"
-sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC2"
-HTTPS_OUT=$("$PIONC2" test --json "$ROOT_DIR/examples/https_server")
-printf 'pionc2 test --json examples/https_server -> %s\n' "$HTTPS_OUT"
-if ! printf '%s' "$HTTPS_OUT" | grep -q '"ok":true' || ! printf '%s' "$HTTPS_OUT" | grep -q '"failed":0'; then
-  echo "FAIL: pionc2 test --json examples/https_server failed" >&2
-  exit 1
-fi
-# Flagship: HTTPS + SSE + SQLite WAL + dyn Handler + std/regex + worker pool.
-STATION_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/examples/pion_station")
-printf 'pionc2 test --json examples/pion_station -> %s\n' "$STATION_OUT"
-if ! printf '%s' "$STATION_OUT" | grep -q '"ok":true' || ! printf '%s' "$STATION_OUT" | grep -q '"failed":0'; then
-  echo "FAIL: pionc2 test --json examples/pion_station failed" >&2
-  exit 1
-fi
 
 echo "=== ALL 6 VERIFY-ALL GATES PASSED ==="
