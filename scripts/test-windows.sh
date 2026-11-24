@@ -35,6 +35,135 @@ bg_finish() {
   fi
 }
 
+# Verify Windows Job Object cleanup and fail-closed startup gates:
+# 1. A failing wrapper that leaves a detached native child must propagate
+#    failure through bg_finish AND leave the child dead.
+# 2. EOF on child_code's release pipe must exit non-zero without starting the workload.
+# 3. AssignProcessToJobObject failure in a normal-env bg_start must fail closed,
+#    preserve the Win32 error, and never start the workload.
+verify_bg_win_job() {
+  _job_pid_file="$TMP_DIR/job_probe_child.pid"
+  _job_log="$TMP_DIR/job_probe.log"
+  rm -f "$_job_pid_file"
+  _job_rc=0
+  (
+    bg_start "$_job_log" python3 -c '
+import os, subprocess, sys
+child = subprocess.Popen(
+    [sys.executable, "-c", "import os, sys, time; print(os.getpid(), flush=True); time.sleep(30)"],
+    stdin=subprocess.DEVNULL,
+    stdout=subprocess.PIPE,
+    stderr=subprocess.DEVNULL,
+)
+pid_line = child.stdout.readline().decode("ascii").strip()
+with open(sys.argv[1], "w") as f:
+    f.write(pid_line)
+os._exit(1)
+' "$_job_pid_file"
+    bg_finish "bg-lib job probe" "$BG_PID" "$_job_log"
+  ) >/dev/null 2>&1 || _job_rc=$?
+  if [ "$_job_rc" -eq 0 ]; then
+    echo "FAIL: bg_finish unexpectedly succeeded for failing job probe" >&2
+    cat "$_job_log" >&2 || true
+    exit 1
+  fi
+  if [ ! -s "$_job_pid_file" ]; then
+    echo "FAIL: bg-lib job probe did not write native child PID" >&2
+    cat "$_job_log" >&2 || true
+    exit 1
+  fi
+  python3 - "$_job_pid_file" "$ROOT_DIR/scripts/bg-lib.sh" <<'PYEOF'
+import ast, ctypes, ctypes.wintypes as w, re, subprocess, sys
+
+# 1. Reparented native child must be dead after bg_finish.
+pid = int(open(sys.argv[1]).read().strip())
+k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+k32.OpenProcess.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+k32.OpenProcess.restype = w.HANDLE
+k32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
+k32.WaitForSingleObject.restype = w.DWORD
+k32.CloseHandle.argtypes = [w.HANDLE]
+k32.CloseHandle.restype = w.BOOL
+h = k32.OpenProcess(0x00100000, False, pid)
+if h:
+    res = k32.WaitForSingleObject(h, 0)
+    k32.CloseHandle(h)
+    assert res == 0, f"FAIL: native child PID {pid} still alive after bg_finish (wait={res})"
+
+# 2. EOF on child_code release pipe must NOT start the workload.
+txt = open(sys.argv[2]).read()
+m = re.search(r"_bg_py='\n(.*?)\n'\n", txt, re.S)
+assert m, "missing _bg_py"
+tree = ast.parse(m.group(1))
+child_src = None
+for node in ast.walk(tree):
+    if isinstance(node, ast.Assign) and len(node.targets) == 1 and getattr(node.targets[0], "id", "") == "child_code":
+        child_src = ast.literal_eval(node.value)
+        break
+assert child_src, "missing child_code"
+r_eof = subprocess.run(
+    [sys.executable, "-c", child_src, "sh", "-c", "echo WORKLOAD_STARTED"],
+    input=b"",
+    capture_output=True,
+)
+assert r_eof.returncode != 0, f"FAIL: child_code succeeded on EOF (rc={r_eof.returncode})"
+assert b"WORKLOAD_STARTED" not in r_eof.stdout, f"FAIL: workload started on EOF: {r_eof.stdout!r}"
+print(f"[PASS] bg-lib Windows Job Object reparented-child cleanup & EOF fail-closed verified (child pid={pid} exited, eof_rc={r_eof.returncode})")
+PYEOF
+
+  # 3. Normal-env AssignProcessToJobObject failure must fail closed with Win32 error and never run workload.
+  _inj_dir="$TMP_DIR/win_job_inject"
+  _inj_marker="$TMP_DIR/win_job_inject.marker"
+  _inj_log="$TMP_DIR/win_job_inject.log"
+  mkdir -p "$_inj_dir"
+  rm -f "$_inj_marker" "$_inj_log"
+  cat > "$_inj_dir/sitecustomize.py" <<'PYEOF'
+import ctypes
+_orig_windll = ctypes.WinDLL
+class _FailAssign:
+    def __init__(self, inner):
+        self._inner = inner
+    def __getattr__(self, name):
+        if name == "AssignProcessToJobObject":
+            class _Fn:
+                argtypes = None
+                restype = None
+                def __call__(self, _job, _proc):
+                    ctypes.set_last_error(5)
+                    return 0
+            return _Fn()
+        return getattr(self._inner, name)
+def _patched_windll(name, *args, **kwargs):
+    dll = _orig_windll(name, *args, **kwargs)
+    if str(name).lower().startswith("kernel32"):
+        return _FailAssign(dll)
+    return dll
+ctypes.WinDLL = _patched_windll
+PYEOF
+  _inj_rc=0
+  (
+    export PYTHONPATH="$(cygpath -w "$_inj_dir")${PYTHONPATH:+;$PYTHONPATH}"
+    bg_start "$_inj_log" sh -c 'echo WORKLOAD_STARTED > "$1"' _ "$_inj_marker"
+    bg_finish "bg-lib assign-fail probe" "$BG_PID" "$_inj_log"
+  ) >/dev/null 2>&1 || _inj_rc=$?
+  if [ "$_inj_rc" -eq 0 ]; then
+    echo "FAIL: bg_finish unexpectedly succeeded when AssignProcessToJobObject failed" >&2
+    cat "$_inj_log" >&2 || true
+    exit 1
+  fi
+  if [ -e "$_inj_marker" ]; then
+    echo "FAIL: workload started despite AssignProcessToJobObject failure" >&2
+    exit 1
+  fi
+  if ! grep -q "winerr=5" "$_inj_log"; then
+    echo "FAIL: missing preserved Win32 error (winerr=5) in job failure log:" >&2
+    cat "$_inj_log" >&2 || true
+    exit 1
+  fi
+  echo "[PASS] bg-lib Windows Job Object assign-failure fail-closed verified (rc=$_inj_rc, winerr=5, workload not started)"
+}
+verify_bg_win_job
+
 echo "=== [1/5] Windows x86_64 Environment & QBE (T_amd64_win) Build ==="
 uname -a
 "$CC" --version | head -n 1
