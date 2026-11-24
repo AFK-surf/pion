@@ -22,6 +22,7 @@ pub enum Ty {
   TAtomicInt
   TArray(Ty)
   TFixedArray(Ty)
+  TImmArray(Ty)
   TOption(Ty)
   TResult(Ty, Ty)
   TMap(Ty, Ty)
@@ -62,6 +63,7 @@ pub fn ty_to_string(t : Ty) -> String {
     TAtomicInt => "AtomicInt"
     TArray(e) => "Array[" + ty_to_string(e) + "]"
     TFixedArray(e) => "FixedArray[" + ty_to_string(e) + "]"
+    TImmArray(e) => "ImmArray[" + ty_to_string(e) + "]"
     TOption(e) => "Option[" + ty_to_string(e) + "]"
     TResult(ok, err) =>
       "Result[" + ty_to_string(ok) + ", " + ty_to_string(err) + "]"
@@ -443,6 +445,8 @@ pub struct EqUse {
   tparam : String
   concrete : Ty
   caller_key : String
+  caller_is_verify : Bool
+  callee_is_verify_opaque : Bool
   span : Span
 }
 
@@ -503,7 +507,12 @@ pub struct TypeChecker {
   /// Generic fn decl key -> type params its body compares with `==` / `!=`.
   eq_tparams : Map[String, Array[String]]
   eq_keys : Array[String]
+  /// Generic fn decl key -> type params compared with `==` / `!=` inside transparent `#verify` bodies (stops at `#verify_opaque`).
+  verify_eq_tparams : Map[String, Array[String]]
+  verify_eq_keys : Array[String]
   eq_uses : Array[EqUse]
+  /// `span_key` of a method call on a `TParam` with trait bounds -> canonical bound trait name.
+  resolved_trait_methods : Map[String, String]
   /// Dedup keys of machine-applicable edits already attached.
   edit_keys : Map[String, Bool]
   /// `span_key` of an unannotated `let x = []` / `Map([])` -> the collection
@@ -813,6 +822,7 @@ pub fn qualify_imported_ty(pkg_name : String, t : Ty) -> Ty {
   match t {
     TArray(e) => TArray(qualify_imported_ty(pkg_name, e))
     TFixedArray(e) => TFixedArray(qualify_imported_ty(pkg_name, e))
+    TImmArray(e) => TImmArray(qualify_imported_ty(pkg_name, e))
     TOption(e) => TOption(qualify_imported_ty(pkg_name, e))
     TResult(ok, err) =>
       TResult(
@@ -926,6 +936,117 @@ fn qualify_struct_lit_name(ipkg : ImportedPkg, sname : String) -> String {
 }
 
 ///|
+fn qualify_imported_path(
+  ipkg : ImportedPkg,
+  qual : String,
+  mem : String,
+  sp : Span,
+  is_call : Bool,
+) -> Expr {
+  if starts_with_str(qual, "@canon:") {
+    return EPath(qual, mem, sp)
+  }
+  if is_call {
+    if (qual == "Double" && mem == "from_bits") ||
+      (
+        (qual == "Float" || qual == "Float32") &&
+        (mem == "from_double" || mem == "from_int" || mem == "from_bits")
+      ) ||
+      (qual == "StringBuilder" && (mem == "new" || mem == "with_capacity")) ||
+      (qual == "Bytes" && mem == "new") ||
+      (qual == "Map" && (mem == "new" || mem == "with_capacity")) ||
+      (
+        qual == "Array" &&
+        (mem == "new" || mem == "with_capacity" || mem == "make")
+      ) ||
+      (
+        qual == "FixedArray" &&
+        (mem == "make" || mem == "makei" || mem == "from_array")
+      ) ||
+      (
+        qual == "ImmArray" &&
+        (mem == "new" || mem == "make" || mem == "from_array")
+      ) ||
+      (
+        (qual == "Channel" || qual == "Mutex" || qual == "AtomicInt") &&
+        mem == "new"
+      ) {
+      return EPath(qual, mem, sp)
+    }
+    if qual == "Option" || qual == "Result" {
+      return EPath(qual, mem, sp)
+    }
+    if ipkg.tc.enums.contains(qual) &&
+      (
+        tc_enum_has_variant(ipkg.tc, qual, mem) ||
+        !ipkg.tc.methods.contains(qual + "::" + mem)
+      ) {
+      return EPath("@canon:" + ipkg.name + "::" + qual, mem, sp)
+    }
+  } else {
+    if qual == "Option" && (mem == "None" || mem != "Some") {
+      return EPath(qual, mem, sp)
+    }
+    if qual == "Result" && mem != "Ok" && mem != "Err" {
+      return EPath(qual, mem, sp)
+    }
+    if ipkg.tc.enums.contains(qual) &&
+      (
+        tc_enum_has_variant(ipkg.tc, qual, mem) ||
+        !ipkg.tc.methods.contains(qual + "::" + mem)
+      ) {
+      return EPath("@canon:" + ipkg.name + "::" + qual, mem, sp)
+    }
+  }
+  if has_qual_sep(qual) {
+    let qp = split_qual_name(qual)
+    match resolve_alias_pkg(ipkg.tc, qp.prefix) {
+      Some(dep) => {
+        let dep_has_enum_mem = match dep.tc.enums.get(qp.name) {
+          Some(ei) =>
+            enum_info_has_variant(ei, mem) ||
+            !dep.tc.methods.contains(qp.name + "::" + mem)
+          None => false
+        }
+        if dep_has_enum_mem || dep.tc.methods.contains(qp.name + "::" + mem) {
+          return EPath("@canon:" + dep.name + "::" + qp.name, mem, sp)
+        }
+      }
+      None => ()
+    }
+  } else {
+    match resolve_alias_pkg(ipkg.tc, qual) {
+      Some(dep) => {
+        let dep_has_mem = if is_call {
+          dep.tc.fns.contains(mem) ||
+          dep.tc.extern_fns.contains(mem) ||
+          dep.tc.variant_to_enum.contains(mem)
+        } else {
+          dep.tc.consts.contains(mem) ||
+          dep.tc.fns.contains(mem) ||
+          dep.tc.variant_to_enum.contains(mem)
+        }
+        if dep_has_mem {
+          return EPath("@canon:" + dep.name, mem, sp)
+        }
+      }
+      None => ()
+    }
+  }
+  if ipkg.tc.methods.contains(qual + "::" + mem) ||
+    ipkg.tc.enums.contains(qual) ||
+    ipkg.tc.structs.contains(qual) {
+    return EPath("@canon:" + ipkg.name + "::" + qual, mem, sp)
+  }
+  EPath(qual, mem, sp)
+}
+
+///|
+/// Rewrites package-local references in an imported default-argument expression
+/// using the reserved `@canon:<pkg>` prefix so they cannot be hijacked by
+/// caller/defining-package aliases. All `EPath` consumers must route package
+/// lookup through `resolve_alias_pkg` / `resolve_pkg_for_lookup` /
+/// `qbe_resolve_pkg_in_scope` so `@canon:` paths resolve directly.
 fn qualify_imported_expr(ipkg : ImportedPkg, e : Expr, bound : Array[String]) -> Expr {
   match e {
     EIdent(name, sp) =>
@@ -940,26 +1061,11 @@ fn qualify_imported_expr(ipkg : ImportedPkg, e : Expr, bound : Array[String]) ->
           ipkg.tc.extern_fns.contains(name) ||
           ipkg.tc.variant_to_enum.contains(name)
         ) {
-        EPath(ipkg.name, name, sp)
+        EPath("@canon:" + ipkg.name, name, sp)
       } else {
         e
       }
-    EPath(qual, mem, sp) =>
-      match resolve_alias_pkg(ipkg.tc, qual) {
-        Some(dep) => EPath(dep.name, mem, sp)
-        None =>
-          if has_qual_sep(qual) {
-            let qp = split_qual_name(qual)
-            match resolve_alias_pkg(ipkg.tc, qp.prefix) {
-              Some(dep) => EPath(dep.name + "::" + qp.name, mem, sp)
-              None => e
-            }
-          } else if ipkg.tc.enums.contains(qual) || ipkg.tc.structs.contains(qual) {
-            EPath(ipkg.name + "::" + qual, mem, sp)
-          } else {
-            e
-          }
-      }
+    EPath(qual, mem, sp) => qualify_imported_path(ipkg, qual, mem, sp, false)
     EStructLit(sname, spread_opt, fields, sp) => {
       let qname = qualify_struct_lit_name(ipkg, sname)
       let qspread = match spread_opt {
@@ -988,7 +1094,10 @@ fn qualify_imported_expr(ipkg : ImportedPkg, e : Expr, bound : Array[String]) ->
         sp,
       )
     ECall(callee, args, sp) => {
-      let qc = qualify_imported_expr(ipkg, callee, bound)
+      let qc = match callee {
+        EPath(qual, mem, psp) => qualify_imported_path(ipkg, qual, mem, psp, true)
+        _ => qualify_imported_expr(ipkg, callee, bound)
+      }
       let qargs : Array[Expr] = []
       let mut i = 0
       while i < args.length() {
@@ -1373,6 +1482,15 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
     }
     ei = ei + 1
   }
+  let mut vei = 0
+  while vei < ipkg.tc.verify_eq_keys.length() {
+    let vek = ipkg.tc.verify_eq_keys[vei]
+    match ipkg.tc.verify_eq_tparams.get(vek) {
+      Some(tps) => verify_eq_tparams_add_all(tc, vek, tps)
+      None => ()
+    }
+    vei = vei + 1
+  }
   let skeys = ipkg.tc.struct_names
   let mut i = 0
   while i < skeys.length() {
@@ -1624,6 +1742,9 @@ pub fn resolve_alias_pkg(
   tc : TypeChecker,
   alias_name : String,
 ) -> Option[ImportedPkg] {
+  if starts_with_str(alias_name, "@canon:") {
+    return lookup_imported_pkg_transitive(tc, slice_str(alias_name, 7, alias_name.length()))
+  }
   match tc.import_aliases.get(alias_name) {
     Some(canon) => tc.imported_pkgs.get(canon)
     None => None
@@ -1647,6 +1768,9 @@ fn resolve_pkg_for_lookup(
   qual : String,
   allow_transitive : Bool,
 ) -> Option[ImportedPkg] {
+  if starts_with_str(qual, "@canon:") {
+    return lookup_imported_pkg_transitive(tc, slice_str(qual, 7, qual.length()))
+  }
   match resolve_alias_pkg(tc, qual) {
     Some(p) => Some(p)
     None =>
@@ -1963,7 +2087,7 @@ fn default_val_for_ty(t : Ty) -> String {
     TInt8 => "0"
     TChar => "'a'"
     TWorld => "world"
-    TArray(_) | TFixedArray(_) => "[]"
+    TArray(_) | TFixedArray(_) | TImmArray(_) => "[]"
     TOption(_) => "None"
     _ => "panic(\"todo\")"
   }
@@ -2120,7 +2244,7 @@ fn add_missing_impl_edit(
 fn ty_mentions_self(t : Ty) -> Bool {
   match t {
     TParam(n) => n == "Self"
-    TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) => ty_mentions_self(e)
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) | TChannel(e) | TMutex(e) => ty_mentions_self(e)
     TResult(o, e) | TMap(o, e) => ty_mentions_self(o) || ty_mentions_self(e)
     TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
       let mut i = 0
@@ -2257,29 +2381,196 @@ fn eq_tparams_add_all(tc : TypeChecker, key : String, tps : Array[String]) -> Un
 }
 
 ///|
+fn verify_eq_tparams_has(tc : TypeChecker, key : String, tparam : String) -> Bool {
+  match tc.verify_eq_tparams.get(key) {
+    Some(tps) => str_arr_contains(tps, tparam)
+    None => false
+  }
+}
+
+///|
+fn verify_eq_tparams_add(tc : TypeChecker, key : String, tparam : String) -> Bool {
+  match tc.verify_eq_tparams.get(key) {
+    Some(tps) =>
+      if str_arr_contains(tps, tparam) {
+        false
+      } else {
+        tps.push(tparam)
+        true
+      }
+    None => {
+      tc.verify_eq_tparams.set(key, [tparam])
+      tc.verify_eq_keys.push(key)
+      true
+    }
+  }
+}
+
+///|
+fn verify_eq_tparams_add_all(tc : TypeChecker, key : String, tps : Array[String]) -> Unit {
+  let mut i = 0
+  while i < tps.length() {
+    let _ = verify_eq_tparams_add(tc, key, tps[i])
+    i = i + 1
+  }
+}
+
+///|
+fn collect_eq_tparams_in_ty(
+  tc : TypeChecker,
+  t : Ty,
+  out : Array[String],
+  visiting : Array[String],
+) -> Unit {
+  if visiting.length() > 32 {
+    return
+  }
+  match t {
+    TParam(n) =>
+      if !str_arr_contains(out, n) {
+        out.push(n)
+      }
+    TImmArray(e) | TOption(e) => collect_eq_tparams_in_ty(tc, e, out, visiting)
+    TResult(a, b) => {
+      collect_eq_tparams_in_ty(tc, a, out, visiting)
+      collect_eq_tparams_in_ty(tc, b, out, visiting)
+    }
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        collect_eq_tparams_in_ty(tc, es[i], out, visiting)
+        i = i + 1
+      }
+    }
+    TStruct(name, sargs) => {
+      let key = ty_to_string(t)
+      if str_arr_contains(visiting, key) {
+        return
+      }
+      match tc_lookup_struct_info(tc, name) {
+        Some(sinfo) => {
+          visiting.push(key)
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            collect_eq_tparams_in_ty(tc, subst_ty(sinfo.field_tys[fi], subst), out, visiting)
+            fi = fi + 1
+          }
+          let _ = visiting.pop()
+        }
+        None => {
+          let mut i = 0
+          while i < sargs.length() {
+            collect_eq_tparams_in_ty(tc, sargs[i], out, visiting)
+            i = i + 1
+          }
+        }
+      }
+    }
+    TEnum(name, eargs) => {
+      let key = ty_to_string(t)
+      if str_arr_contains(visiting, key) {
+        return
+      }
+      let mut enum_pkg_qual = ""
+      let found : Option[EnumInfo] = match tc.enums.get(name) {
+        Some(ei) => Some(ei)
+        None => {
+          let qp = split_qual_name(name)
+          match lookup_imported_pkg_transitive(tc, qp.prefix) {
+            Some(ipkg) => {
+              enum_pkg_qual = ipkg.name
+              ipkg.tc.enums.get(qp.name)
+            }
+            None => None
+          }
+        }
+      }
+      match found {
+        Some(einfo) => {
+          visiting.push(key)
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              let raw_fty = if enum_pkg_qual.length() > 0 {
+                qualify_imported_ty(enum_pkg_qual, v.field_tys[fi])
+              } else {
+                v.field_tys[fi]
+              }
+              collect_eq_tparams_in_ty(tc, subst_ty(raw_fty, subst), out, visiting)
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          let _ = visiting.pop()
+        }
+        None => {
+          let mut i = 0
+          while i < eargs.length() {
+            collect_eq_tparams_in_ty(tc, eargs[i], out, visiting)
+            i = i + 1
+          }
+        }
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
 /// Closes the generic `==` / `!=` check: a type parameter compared in a
 /// generic body must be instantiated with a value-comparable type.
 /// Requirements propagate through generic callers before reporting.
 fn resolve_eq_uses(tc : TypeChecker) -> Unit {
+  let max_rounds = tc.eq_uses.length() + 16
   let mut changed = true
   let mut rounds = 0
-  while changed && rounds < 16 {
+  while changed && rounds < max_rounds {
     changed = false
     let mut i = 0
     while i < tc.eq_uses.length() {
       let u = tc.eq_uses[i]
       if u.caller_key != "" && eq_tparams_has(tc, u.callee_key, u.tparam) {
-        match u.concrete {
-          TParam(outer) =>
-            if eq_tparams_add(tc, u.caller_key, outer) {
-              changed = true
-            }
-          _ => ()
+        let tps : Array[String] = []
+        collect_eq_tparams_in_ty(tc, u.concrete, tps, [])
+        let mut ti = 0
+        while ti < tps.length() {
+          if eq_tparams_add(tc, u.caller_key, tps[ti]) {
+            changed = true
+          }
+          ti = ti + 1
         }
       }
       i = i + 1
     }
     rounds = rounds + 1
+  }
+  let mut v_changed = true
+  let mut v_rounds = 0
+  while v_changed && v_rounds < max_rounds {
+    v_changed = false
+    let mut i = 0
+    while i < tc.eq_uses.length() {
+      let u = tc.eq_uses[i]
+      if u.caller_key != "" &&
+        !u.callee_is_verify_opaque &&
+        verify_eq_tparams_has(tc, u.callee_key, u.tparam) {
+        let tps : Array[String] = []
+        collect_eq_tparams_in_ty(tc, u.concrete, tps, [])
+        let mut ti = 0
+        while ti < tps.length() {
+          if verify_eq_tparams_add(tc, u.caller_key, tps[ti]) {
+            v_changed = true
+          }
+          ti = ti + 1
+        }
+      }
+      i = i + 1
+    }
+    v_rounds = v_rounds + 1
   }
   let mut i = 0
   while i < tc.eq_uses.length() {
@@ -2306,6 +2597,26 @@ fn resolve_eq_uses(tc : TypeChecker) -> Unit {
         "` with a scalar, `String` or payload-less enum, or compare `" +
         cname +
         "` values with `match`",
+      )
+    } else if u.caller_is_verify &&
+      !u.callee_is_verify_opaque &&
+      verify_eq_tparams_has(tc, u.callee_key, u.tparam) &&
+      v_has_float_in(tc, u.concrete, []) {
+      let cname = ty_to_string(u.concrete)
+      tc_err(
+        tc,
+        u.span,
+        "E_VERIFY_UNSUPPORTED",
+        "generic `" +
+        u.callee_name +
+        "` compares `" +
+        u.tparam +
+        "` with `==`/`!=`, which is not supported on float-containing type `" +
+        cname +
+        "` in `#verify`",
+        "non-float value-comparable type for `" + u.tparam + "`",
+        cname,
+        "compare bit patterns (`to_bits()`) or move floating-point equality into a `#verify_opaque` helper",
       )
     }
     i = i + 1
@@ -2655,6 +2966,21 @@ fn resolve_type_expr(
         let elem = if rargs.length() >= 1 { rargs[0] } else { TError }
         return TFixedArray(elem)
       }
+      if name == "ImmArray" {
+        if rargs.length() != 1 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`ImmArray` expects 1 type argument, found " + rargs.length().to_string(),
+            "1 type arg",
+            rargs.length().to_string() + " type args",
+            "write `ImmArray[T]` with 1 element type argument",
+          )
+          return TError
+        }
+        return TImmArray(rargs[0])
+      }
       if name == "Option" {
         let elem = if rargs.length() >= 1 { rargs[0] } else { TError }
         return TOption(elem)
@@ -2778,6 +3104,7 @@ fn subst_ty(t : Ty, subst : Map[String, Ty]) -> Ty {
       }
     TArray(e) => TArray(subst_ty(e, subst))
     TFixedArray(e) => TFixedArray(subst_ty(e, subst))
+    TImmArray(e) => TImmArray(subst_ty(e, subst))
     TOption(e) => TOption(subst_ty(e, subst))
     TResult(ok, err) => TResult(subst_ty(ok, subst), subst_ty(err, subst))
     TMap(k, v) => TMap(subst_ty(k, subst), subst_ty(v, subst))
@@ -2842,6 +3169,7 @@ fn subst_ty_mask_unbound(
       }
     TArray(e) => TArray(subst_ty_mask_unbound(e, decl_tparams, subst))
     TFixedArray(e) => TFixedArray(subst_ty_mask_unbound(e, decl_tparams, subst))
+    TImmArray(e) => TImmArray(subst_ty_mask_unbound(e, decl_tparams, subst))
     TOption(e) => TOption(subst_ty_mask_unbound(e, decl_tparams, subst))
     TResult(ok, err) =>
       TResult(
@@ -2939,6 +3267,11 @@ fn unify_tparams(pattern : Ty, actual : Ty, subst : Map[String, Ty]) -> Unit {
         TFixedArray(ae) => unify_tparams(pe, ae, subst)
         _ => ()
       }
+    TImmArray(pe) =>
+      match actual {
+        TImmArray(ae) => unify_tparams(pe, ae, subst)
+        _ => ()
+      }
     TOption(pe) =>
       match actual {
         TOption(ae) => unify_tparams(pe, ae, subst)
@@ -3027,6 +3360,7 @@ fn ty_has_unresolved(t : Ty) -> Bool {
     TError => true
     TArray(e) => ty_has_unresolved(e)
     TFixedArray(e) => ty_has_unresolved(e)
+    TImmArray(e) => ty_has_unresolved(e)
     TMap(k, v) => ty_has_unresolved(k) || ty_has_unresolved(v)
     TOption(e) => ty_has_unresolved(e)
     TResult(ok, err) => ty_has_unresolved(ok) || ty_has_unresolved(err)
@@ -3103,6 +3437,11 @@ fn ty_prefer_concrete(a : Ty, b : Ty) -> Ty {
     TFixedArray(ae) =>
       match b {
         TFixedArray(be) => return TFixedArray(ty_prefer_concrete(ae, be))
+        _ => ()
+      }
+    TImmArray(ae) =>
+      match b {
+        TImmArray(be) => return TImmArray(ty_prefer_concrete(ae, be))
         _ => ()
       }
     TMap(ak, av) =>
@@ -3272,6 +3611,11 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
     TFixedArray(e1) =>
       match found {
         TFixedArray(e2) => ty_compat(e1, e2)
+        _ => false
+      }
+    TImmArray(e1) =>
+      match found {
+        TImmArray(e2) => ty_compat(e1, e2)
         _ => false
       }
     TOption(e1) =>
@@ -3459,6 +3803,9 @@ fn is_mutex_inner_send(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bo
 
 ///|
 fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
+  if visiting.length() > 32 {
+    return false
+  }
   match t {
     TInt | TInt64 | TUInt | TUInt64 | TDouble | TFloat | TBool | TByte | TInt8 | TChar | TString | TStrView | TUnit => true
     TAtomicInt | TScope | TNever | TError => true
@@ -3468,6 +3815,7 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
     TPtr | TArray(_) | TFixedArray(_) | TBytes | TBytesView | TMap(_, _) | TStringBuilder => false
     TDynTrait(_) => false
     TParam(_) => false
+    TImmArray(e) => is_send_ty(tc, e, visiting)
     TOption(e) => is_send_ty(tc, e, visiting)
     TResult(ok, err) =>
       is_send_ty(tc, ok, visiting) && is_send_ty(tc, err, visiting)
@@ -3486,14 +3834,15 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
       true
     }
     TStruct(name, args) => {
-      if str_arr_contains(visiting, name) {
+      let key = ty_to_string(t)
+      if str_arr_contains(visiting, key) {
         return true
       }
       match tc.structs.get(name) {
         None => false
         Some(sinfo) => {
           let next_vis = visiting.copy()
-          next_vis.push(name)
+          next_vis.push(key)
           let subst = make_subst(sinfo.decl.type_params, args)
           let mut i = 0
           while i < sinfo.field_tys.length() {
@@ -3511,14 +3860,15 @@ fn is_send_ty(tc : TypeChecker, t : Ty, visiting : Array[String]) -> Bool {
       }
     }
     TEnum(name, args) => {
-      if str_arr_contains(visiting, name) {
+      let key = ty_to_string(t)
+      if str_arr_contains(visiting, key) {
         return true
       }
       match tc.enums.get(name) {
         None => false
         Some(einfo) => {
           let next_vis = visiting.copy()
-          next_vis.push(name)
+          next_vis.push(key)
           let subst = make_subst(einfo.decl.type_params, args)
           let mut vi = 0
           while vi < einfo.variants.length() {
@@ -4685,6 +5035,7 @@ fn infer_empty_kind(init : Expr) -> Int {
     ECall(EPath("Map", "with_capacity", _), args, _) => if args.length() == 1 { 2 } else { 0 }
     ECall(EPath("Array", "new", _), args, _) => if args.length() == 0 { 1 } else { 0 }
     ECall(EPath("Array", "with_capacity", _), args, _) => if args.length() == 1 { 1 } else { 0 }
+    ECall(EPath("ImmArray", "new", _), args, _) => if args.length() == 0 { 4 } else { 0 }
     EIdent("None", _) => 3
     EPath("Option", "None", _) => 3
     _ => 0
@@ -4698,6 +5049,7 @@ fn infer_kind_fits(kind : Int, t : Ty) -> Bool {
   }
   match t {
     TArray(_) | TFixedArray(_) => kind == 1
+    TImmArray(_) => kind == 1 || kind == 4
     TMap(_, _) => kind == 2
     TOption(_) => kind == 3
     _ => false
@@ -4969,7 +5321,7 @@ fn infer_map_pending(tc : TypeChecker, env : Env, name : String) -> Bool {
 fn ty_contains_never(t : Ty) -> Bool {
   match t {
     TNever => true
-    TArray(e) | TFixedArray(e) | TOption(e) => ty_contains_never(e)
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) => ty_contains_never(e)
     TMap(k, v) => ty_contains_never(k) || ty_contains_never(v)
     _ => false
   }
@@ -5011,11 +5363,12 @@ fn eq_comparable_depth(
   visited : Map[String, Bool],
 ) -> Bool {
   if depth > 16 {
-    return true
+    return false
   }
   match t {
     TInt | TInt64 | TUInt | TUInt64 | TDouble | TFloat | TBool | TByte | TInt8 | TChar | TString | TStrView | TPtr => true
     TUnit | TParam(_) | TNever | TError => true
+    TImmArray(e) => eq_comparable_depth(tc, e, depth + 1, visited)
     TStruct(name, sargs) => {
       let key = ty_to_string(t)
       if visited.contains(key) {
@@ -5225,6 +5578,8 @@ fn check_let(
               TMap(TError, TError)
             } else if kind == 3 {
               TOption(TError)
+            } else if kind == 4 {
+              TImmArray(TError)
             } else {
               TArray(TError)
             }
@@ -5404,6 +5759,90 @@ fn check_stmt(
             )
           }
         }
+        EIndex(obj, idx, lsp) => {
+          let oty = check_expr(tc, env, obj, None)
+          let lty = match oty {
+            TImmArray(elem) => {
+              let _ = check_expr(tc, env, idx, Some(TInt))
+              tc_err(
+                tc,
+                lsp,
+                "E_TYPE_MISMATCH",
+                "cannot assign to element of immutable `" + ty_to_string(oty) + "`",
+                "mutable Array or FixedArray",
+                ty_to_string(oty),
+                "convert to a mutable `Array` with `.to_array()` before modifying elements",
+              )
+              elem
+            }
+            TArray(elem) | TFixedArray(elem) => {
+              let ity = check_expr(tc, env, idx, Some(TInt))
+              if !ty_compat(TInt, ity) {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_TYPE_MISMATCH",
+                  "array index must be `Int`",
+                  "Int",
+                  ty_to_string(ity),
+                  "use an `Int` index",
+                )
+              }
+              elem
+            }
+            TMap(kty, vty) => {
+              let ity = check_expr(tc, env, idx, Some(kty))
+              if !ty_compat(kty, ity) {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_TYPE_MISMATCH",
+                  "map index key type mismatch",
+                  ty_to_string(kty),
+                  ty_to_string(ity),
+                  "use a key of type `" + ty_to_string(kty) + "`",
+                )
+              }
+              vty
+            }
+            TBytes => {
+              let _ = check_expr(tc, env, idx, Some(TInt))
+              TByte
+            }
+            TError => {
+              let _ = check_expr(tc, env, idx, None)
+              TError
+            }
+            _ => {
+              let _ = check_expr(tc, env, idx, None)
+              tc_err(
+                tc,
+                lsp,
+                "E_TYPE_MISMATCH",
+                "cannot assign to indexed type `" + ty_to_string(oty) + "`",
+                "mutable Array, FixedArray, Map, or Bytes",
+                ty_to_string(oty),
+                "index-assign only into mutable collections",
+              )
+              TError
+            }
+          }
+          if env.in_verify || tc.record_analyze {
+            tc.expr_tys.set(span_key(lsp), lty)
+          }
+          let rty = check_expr(tc, env, rhs, Some(lty))
+          if !ty_compat(lty, rty) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "type mismatch in assignment",
+              ty_to_string(lty),
+              ty_to_string(rty),
+              "assign a value of type `" + ty_to_string(lty) + "`",
+            )
+          }
+        }
         _ => {
           let lty = check_expr(tc, env, lhs, None)
           let rty = check_expr(tc, env, rhs, Some(lty))
@@ -5443,6 +5882,79 @@ fn check_stmt(
             None => check_expr(tc, env, lhs, None)
           }
         EField(obj, fname, lsp) => check_field_assign_target(tc, env, obj, fname, lsp)
+        EIndex(obj, idx, lsp) => {
+          let oty = check_expr(tc, env, obj, None)
+          let t = match oty {
+            TImmArray(elem) => {
+              let _ = check_expr(tc, env, idx, Some(TInt))
+              tc_err(
+                tc,
+                lsp,
+                "E_TYPE_MISMATCH",
+                "cannot assign to element of immutable `" + ty_to_string(oty) + "`",
+                "mutable Array or FixedArray",
+                ty_to_string(oty),
+                "convert to a mutable `Array` with `.to_array()` before modifying elements",
+              )
+              elem
+            }
+            TArray(elem) | TFixedArray(elem) => {
+              let ity = check_expr(tc, env, idx, Some(TInt))
+              if !ty_compat(TInt, ity) {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_TYPE_MISMATCH",
+                  "array index must be `Int`",
+                  "Int",
+                  ty_to_string(ity),
+                  "use an `Int` index",
+                )
+              }
+              elem
+            }
+            TMap(kty, vty) => {
+              let ity = check_expr(tc, env, idx, Some(kty))
+              if !ty_compat(kty, ity) {
+                tc_err(
+                  tc,
+                  lsp,
+                  "E_TYPE_MISMATCH",
+                  "map index key type mismatch",
+                  ty_to_string(kty),
+                  ty_to_string(ity),
+                  "use a key of type `" + ty_to_string(kty) + "`",
+                )
+              }
+              vty
+            }
+            TBytes => {
+              let _ = check_expr(tc, env, idx, Some(TInt))
+              TByte
+            }
+            TError => {
+              let _ = check_expr(tc, env, idx, None)
+              TError
+            }
+            _ => {
+              let _ = check_expr(tc, env, idx, None)
+              tc_err(
+                tc,
+                lsp,
+                "E_TYPE_MISMATCH",
+                "cannot assign to indexed type `" + ty_to_string(oty) + "`",
+                "mutable Array, FixedArray, Map, or Bytes",
+                ty_to_string(oty),
+                "index-assign only into mutable collections",
+              )
+              TError
+            }
+          }
+          if env.in_verify || tc.record_analyze {
+            tc.expr_tys.set(span_key(lsp), t)
+          }
+          t
+        }
         _ => check_expr(tc, env, lhs, None)
       }
       let rty = check_expr(tc, env, rhs, Some(lty))
@@ -5576,7 +6088,7 @@ fn check_stmt(
     SForIn(idx_name, vname, iter_e, body, sp) => {
       let ity = check_expr(tc, env, iter_e, None)
       let elem_ty = match ity {
-        TArray(et) | TFixedArray(et) => et
+        TArray(et) | TFixedArray(et) | TImmArray(et) => et
         TError => TError
         _ => {
           tc_err(
@@ -5922,6 +6434,7 @@ pub fn ty_base_name(t : Ty) -> String {
     TAtomicInt => "AtomicInt"
     TArray(_) => "Array"
     TFixedArray(_) => "FixedArray"
+    TImmArray(_) => "ImmArray"
     TOption(_) => "Option"
     TResult(_, _) => "Result"
     TMap(_, _) => "Map"
@@ -7056,7 +7569,7 @@ fn param_is_into_at(params : Array[Param], idx : Int) -> Bool {
 fn ty_contains_world_rec(tc : TypeChecker, t : Ty, visited : Array[String]) -> Bool {
   match t {
     TWorld => true
-    TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
       ty_contains_world_rec(tc, e, visited)
     TResult(a, b) | TMap(a, b) =>
       ty_contains_world_rec(tc, a, visited) || ty_contains_world_rec(tc, b, visited)
@@ -7907,6 +8420,8 @@ fn check_fn_call(
           tparam: tp,
           concrete: concrete,
           caller_key: env.fn_key,
+          caller_is_verify: env.in_verify,
+          callee_is_verify_opaque: finfo.decl.is_verify_opaque,
           span: sp,
         })
       None => ()
@@ -9014,13 +9529,32 @@ fn check_method_call(
       if method_name == "copy" {
         return TArray(elem)
       }
+      if method_name == "to_imm" {
+        if args.length() != 0 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`Array::to_imm` expects 0 arguments, found " + args.length().to_string(),
+            "0 args",
+            args.length().to_string() + " args",
+            "call `.to_imm()` with no arguments",
+          )
+        }
+        return TImmArray(elem)
+      }
       if method_name == "contains" {
-        match elem {
-          TParam(tp) =>
-            if env.fn_key != "" && str_arr_contains(env.type_params, tp) {
-              let _ = eq_tparams_add(tc, env.fn_key, tp)
+        let tps : Array[String] = []
+        collect_eq_tparams_in_ty(tc, elem, tps, [])
+        let mut cti = 0
+        while cti < tps.length() {
+          if env.fn_key != "" && str_arr_contains(env.type_params, tps[cti]) {
+            let _ = eq_tparams_add(tc, env.fn_key, tps[cti])
+            if env.in_verify {
+              let _ = verify_eq_tparams_add(tc, env.fn_key, tps[cti])
             }
-          _ => ()
+          }
+          cti = cti + 1
         }
         if args.length() >= 1 {
           let aty = check_expr(tc, env, args[0], Some(elem))
@@ -9104,12 +9638,17 @@ fn check_method_call(
         return TUnit
       }
       if method_name == "contains" {
-        match elem {
-          TParam(tp) =>
-            if env.fn_key != "" && str_arr_contains(env.type_params, tp) {
-              let _ = eq_tparams_add(tc, env.fn_key, tp)
+        let tps : Array[String] = []
+        collect_eq_tparams_in_ty(tc, elem, tps, [])
+        let mut cti = 0
+        while cti < tps.length() {
+          if env.fn_key != "" && str_arr_contains(env.type_params, tps[cti]) {
+            let _ = eq_tparams_add(tc, env.fn_key, tps[cti])
+            if env.in_verify {
+              let _ = verify_eq_tparams_add(tc, env.fn_key, tps[cti])
             }
-          _ => ()
+          }
+          cti = cti + 1
         }
         if args.length() >= 1 {
           let aty = check_expr(tc, env, args[0], Some(elem))
@@ -9213,6 +9752,31 @@ fn check_method_call(
           ai = ai + 1
         }
         return TUnit
+      }
+    }
+    TImmArray(elem) => {
+      if method_name == "length" || method_name == "is_empty" || method_name == "copy" || method_name == "to_array" {
+        if args.length() != 0 {
+          tc_err(
+            tc,
+            sp,
+            "E_ARITY_MISMATCH",
+            "`ImmArray::" + method_name + "` expects 0 arguments, found " + args.length().to_string(),
+            "0 args",
+            args.length().to_string() + " args",
+            "call `." + method_name + "()` with no arguments",
+          )
+        }
+        if method_name == "length" {
+          return TInt
+        }
+        if method_name == "is_empty" {
+          return TBool
+        }
+        if method_name == "copy" {
+          return TImmArray(elem)
+        }
+        return TArray(elem)
       }
     }
     TMap(kty, vty) => {
@@ -9547,6 +10111,25 @@ fn check_method_call(
           tc_check_verify_callee(tc, env, minfo.decl, mtarget, sp)
           tc_record_call(tc, env, sp, mtarget, minfo.decl.type_params, subst)
           tc_record_arg_order(tc, env, sp, args, resolved_args)
+          let mut mti = 0
+          while mti < minfo.decl.type_params.length() {
+            let tp = minfo.decl.type_params[mti]
+            match subst.get(tp) {
+              Some(concrete) =>
+                tc.eq_uses.push(EqUse::{
+                  callee_key: span_key(minfo.decl.span),
+                  callee_name: key,
+                  tparam: tp,
+                  concrete: concrete,
+                  caller_key: env.fn_key,
+                  caller_is_verify: env.in_verify,
+                  callee_is_verify_opaque: minfo.decl.is_verify_opaque,
+                  span: sp,
+                })
+              None => ()
+            }
+            mti = mti + 1
+          }
           return subst_ty(minfo.ret_ty, subst)
         }
         None => {
@@ -9770,6 +10353,10 @@ fn check_method_call(
                       }
                       ai = ai + 1
                     }
+                    tc.resolved_trait_methods.set(
+                      span_key(sp),
+                      canon_trait_name(tc, bound_traits[bi]),
+                    )
                     if env.in_verify || tc.record_analyze {
                       tc.call_targets.set(
                         span_key(sp),
@@ -10565,12 +11152,17 @@ fn check_expr_inner(
         TBool
       } else if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
         if op == "==" || op == "!=" {
-          match lty {
-            TParam(tp) =>
-              if env.fn_key != "" && str_arr_contains(env.type_params, tp) {
-                let _ = eq_tparams_add(tc, env.fn_key, tp)
+          let tps : Array[String] = []
+          collect_eq_tparams_in_ty(tc, lty, tps, [])
+          let mut ti = 0
+          while ti < tps.length() {
+            if env.fn_key != "" && str_arr_contains(env.type_params, tps[ti]) {
+              let _ = eq_tparams_add(tc, env.fn_key, tps[ti])
+              if env.in_verify {
+                let _ = verify_eq_tparams_add(tc, env.fn_key, tps[ti])
               }
-            _ => ()
+            }
+            ti = ti + 1
           }
         }
         if (op == "==" || op == "!=") && !eq_comparable(tc, lty) {
@@ -11651,6 +12243,106 @@ fn check_expr_inner(
             }
             return TFixedArray(ety)
           }
+          if qual == "ImmArray" && mem == "new" {
+            if args.length() != 0 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`ImmArray::new` expects 0 arguments, found " + args.length().to_string(),
+                "0 args",
+                args.length().to_string() + " args",
+                "call `ImmArray::new()` with no arguments",
+              )
+            }
+            return match expected {
+              Some(TImmArray(e)) => TImmArray(e)
+              _ => TImmArray(TError)
+            }
+          }
+          if qual == "ImmArray" && mem == "make" {
+            let exp_elem : Option[Ty] = match expected {
+              Some(TImmArray(e)) => Some(e)
+              _ => None
+            }
+            if args.length() != 2 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`ImmArray::make` expects 2 arguments, found " + args.length().to_string(),
+                "2 args",
+                args.length().to_string() + " args",
+                "call `ImmArray::make(len, val)` with length and initial value",
+              )
+            }
+            if args.length() >= 1 {
+              let lty = check_expr(tc, env, args[0], Some(TInt))
+              if !ty_compat(TInt, lty) {
+                tc_err(
+                  tc,
+                  expr_span(args[0]),
+                  "E_TYPE_MISMATCH",
+                  "`ImmArray::make` length must be `Int`",
+                  "Int",
+                  ty_to_string(lty),
+                  "pass an `Int` length",
+                )
+              }
+            }
+            let ety = if args.length() >= 2 {
+              check_expr(tc, env, args[1], exp_elem)
+            } else {
+              match exp_elem {
+                Some(e) => e
+                None => TError
+              }
+            }
+            return TImmArray(ety)
+          }
+          if qual == "ImmArray" && mem == "from_array" {
+            let exp_arr : Option[Ty] = match expected {
+              Some(TImmArray(e)) => Some(TArray(e))
+              _ => None
+            }
+            if args.length() != 1 {
+              tc_err(
+                tc,
+                sp,
+                "E_ARITY_MISMATCH",
+                "`ImmArray::from_array` expects 1 argument, found " + args.length().to_string(),
+                "1 arg",
+                args.length().to_string() + " args",
+                "call `ImmArray::from_array(arr)` with 1 `Array[T]` argument",
+              )
+            }
+            let ety = if args.length() >= 1 {
+              let aty = check_expr(tc, env, args[0], exp_arr)
+              match aty {
+                TArray(e) => e
+                TError =>
+                  match expected {
+                    Some(TImmArray(e)) => e
+                    _ => TError
+                  }
+                _ => {
+                  tc_err(
+                    tc,
+                    expr_span(args[0]),
+                    "E_TYPE_MISMATCH",
+                    "`ImmArray::from_array` expects `Array[T]`",
+                    "Array[T]",
+                    ty_to_string(aty),
+                    "pass an `Array[T]` value",
+                  )
+                  TError
+                }
+              }
+            } else {
+              TError
+            }
+            return TImmArray(ety)
+          }
           if qual == "Channel" && mem == "new" {
             if args.length() >= 1 {
               let cty = check_expr(tc, env, args[0], Some(TInt))
@@ -11999,7 +12691,7 @@ fn check_expr_inner(
           let _ = check_expr(tc, env, idx, None)
           TError
         }
-        TArray(elem) | TFixedArray(elem) => {
+        TArray(elem) | TFixedArray(elem) | TImmArray(elem) => {
           let ity = check_expr(tc, env, idx, Some(TInt))
           if !ty_compat(TInt, ity) {
             tc_err(
@@ -12057,8 +12749,12 @@ fn check_expr_inner(
         Some(TFixedArray(_)) => true
         _ => false
       }
+      let is_imm = match expected {
+        Some(TImmArray(_)) => true
+        _ => false
+      }
       let exp_elem : Option[Ty] = match expected {
-        Some(TArray(e)) | Some(TFixedArray(e)) => Some(e)
+        Some(TArray(e)) | Some(TFixedArray(e)) | Some(TImmArray(e)) => Some(e)
         _ => None
       }
       if elems.length() == 0 {
@@ -12066,7 +12762,13 @@ fn check_expr_inner(
           Some(et) => et
           None => TError
         }
-        return if is_fixed { TFixedArray(e) } else { TArray(e) }
+        return if is_fixed {
+          TFixedArray(e)
+        } else if is_imm {
+          TImmArray(e)
+        } else {
+          TArray(e)
+        }
       }
       let first_ty = check_expr(tc, env, elems[0], exp_elem)
       let target_elem = match exp_elem {
@@ -12089,7 +12791,13 @@ fn check_expr_inner(
         }
         i = i + 1
       }
-      if is_fixed { TFixedArray(target_elem) } else { TArray(target_elem) }
+      if is_fixed {
+        TFixedArray(target_elem)
+      } else if is_imm {
+        TImmArray(target_elem)
+      } else {
+        TArray(target_elem)
+      }
     }
     EStructLit(sname, spread_opt, fields, sp) => {
       let base_ty_opt : Option[Ty] = match spread_opt {
@@ -12951,7 +13659,10 @@ pub fn check_package_with_imports_mapped(
     diagnostics: [],
     eq_tparams: Map([]),
     eq_keys: [],
+    verify_eq_tparams: Map([]),
+    verify_eq_keys: [],
     eq_uses: [],
+    resolved_trait_methods: Map([]),
     edit_keys: Map([]),
     let_infer: Map([]),
     shift_rhs_infer: Map([]),

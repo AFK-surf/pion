@@ -322,11 +322,11 @@ EOF
 
   sib_b_ssa_count=0
   for f in "$SHARED_CAS"/ssa/*.ssa; do
-    if grep -Eq "pion_pkg_sib_b(__[0-9a-f]{8})?_init_consts" "$f" && \
-       ! grep -Eq "pion_pkg_combo(__[0-9a-f]{8})?_init_consts" "$f" && \
-       ! grep -Eq "pion_pkg_solo_b(__[0-9a-f]{8})?_init_consts" "$f"; then
+    if grep -Eq "pion_pkg_0L[0-9]+_sib_ub(_u_u[0-9a-f]{8})?_init_consts" "$f" && \
+       ! grep -Eq "pion_pkg_(combo|0L[0-9]+_combo_u_u[0-9a-f]{8})_init_consts" "$f" && \
+       ! grep -Eq "pion_pkg_0L[0-9]+_solo_ub(_u_u[0-9a-f]{8})?_init_consts" "$f"; then
       sib_b_ssa_count=$((sib_b_ssa_count + 1))
-      if grep -Eq "pion_pkg_sib_a(__[0-9a-f]{8})?_init_consts" "$f"; then
+      if grep -Eq "pion_pkg_0L[0-9]+_sib_ua(_u_u[0-9a-f]{8})?_init_consts" "$f"; then
         echo "FAIL: sib_b cached CAS .ssa ($f) is polluted by sibling sib_a init_consts" >&2
         exit 1
       fi

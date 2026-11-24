@@ -223,11 +223,16 @@ structure FixedArray (α : Type u) where
   val : List α
 deriving Repr, BEq, DecidableEq
 
+structure ImmArray (α : Type u) where
+  val : List α
+deriving Repr, BEq, DecidableEq
+
 structure Bytes where
   val : List Std.U8
 deriving Repr, BEq, DecidableEq
 
 instance {α : Type u} [BEq α] : Pion.Eq (Pion.Array α) := { toBEq := inferInstance }
+instance {α : Type u} [BEq α] : Pion.Eq (Pion.ImmArray α) := { toBEq := inferInstance }
 
 /-- Index check shared by every container: `0 ≤ i < n`. -/
 @[simp] def inBounds (i : Std.I32) (n : Nat) : Prop := 0 ≤ i.val ∧ i.val < n
@@ -297,6 +302,19 @@ def swap (a : Pion.FixedArray α) (i j : Std.I32) : Result (Pion.FixedArray α) 
 @[simp] def fill (a : Pion.FixedArray α) (x : α) : Pion.FixedArray α := ⟨a.val.map (fun _ => x)⟩
 @[simp] def contains [BEq α] (a : Pion.FixedArray α) (x : α) : Bool := a.val.contains x
 end FixedArray
+
+namespace ImmArray
+variable {α : Type u}
+@[simp] def new : Pion.ImmArray α := ⟨[]⟩
+@[simp] def ofList (l : List α) : Pion.ImmArray α := ⟨l⟩
+@[simp] def make (n : Std.I32) (x : α) : Pion.ImmArray α := ⟨listMake n x⟩
+@[simp] def from_array (a : Pion.Array α) : Pion.ImmArray α := ⟨a.val⟩
+@[simp] def to_array (a : Pion.ImmArray α) : Pion.Array α := ⟨a.val⟩
+def length (a : Pion.ImmArray α) : Result Std.I32 := lengthOf a.val.length
+@[simp] def is_empty (a : Pion.ImmArray α) : Bool := a.val.isEmpty
+def get (a : Pion.ImmArray α) (i : Std.I32) : Result α := listGet a.val i
+@[simp] def copy (a : Pion.ImmArray α) : Pion.ImmArray α := a
+end ImmArray
 
 namespace Bytes
 /-- `Bytes::new(n)`: `n` zero bytes. -/

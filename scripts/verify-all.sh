@@ -268,6 +268,8 @@ sh "$ROOT_DIR/tests/e2e/p96_pod_stack_rc_soundness/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p97_stage_dir_race/run_e2e.sh" "$PIONC2"
 # Wave J4b: Cargo-style package aliases, canonical package IDs, lockfile compat & C-export collision guard.
 sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC2"
+# Wave J3: first-class immutable Send sequence type ImmArray[T].
+sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
 

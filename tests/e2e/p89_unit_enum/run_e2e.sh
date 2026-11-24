@@ -435,13 +435,13 @@ fi
 python3 - "$TMP_DIR/p89_core.ssa" <<'SSA_EOF'
 import sys
 ssa = open(sys.argv[1]).read()
-assert "$pion_enum_Color__" not in ssa, "unexpected static $pion_enum_Color__ hdr"
-assert "$pion_enum_Day__" not in ssa, "unexpected static $pion_enum_Day__ hdr"
+assert "$pion_enum_u_Color_" not in ssa, "unexpected static $pion_enum_u_Color_ hdr"
+assert "$pion_enum_u_Day_" not in ssa, "unexpected static $pion_enum_u_Day_ hdr"
 assert "$pion_drop_enum_Color" not in ssa, "unexpected $pion_drop_enum_Color"
 assert "$pion_drop_enum_Day" not in ssa, "unexpected $pion_drop_enum_Day"
 assert "jtbl " in ssa, "expected jtbl for 7-variant Day match"
 assert "_ZAInt_ZE" in ssa and "Color_ZE" in ssa, "expected distinct GKey[Int] and GKey[Color] vmap symbols"
-assert "$pion_enum_GenUnit__U1_hdr" in ssa, "generic unit-like enum GenUnit[T] must remain boxed"
+assert "$pion_enum_u_GenUnit_M2_U1_hdr" in ssa, "generic unit-like enum GenUnit[T] must remain boxed"
 SSA_EOF
 echo "p89_unit_enum core SSA audit -> OK"
 

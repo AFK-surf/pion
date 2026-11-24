@@ -189,6 +189,18 @@ namespace Pion
   unfold FixedArray.set listSet
   simp [h0, h1]
 
+@[step] theorem ImmArray.length_spec {α : Type u} (a : Pion.ImmArray α)
+    (h : a.val.length ≤ 2147483647) :
+    a.length ⦃ n => n.val = a.val.length ⦄ := by
+  unfold ImmArray.length
+  exact lengthOf_spec _ h
+
+@[step] theorem ImmArray.get_spec {α : Type u} (a : Pion.ImmArray α) (i : Std.I32)
+    (h0 : 0 ≤ i.val) (h1 : i.val < a.val.length) :
+    a.get i ⦃ x => a.val[i.val.toNat]? = some x ⦄ := by
+  unfold ImmArray.get
+  exact listGet_spec _ _ h0 h1
+
 @[step] theorem debugAssert_spec (b : Bool) (h : b = true) :
     debugAssert b ⦃ _ => True ⦄ := by
   unfold debugAssert
