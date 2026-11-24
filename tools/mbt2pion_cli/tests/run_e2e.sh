@@ -1250,6 +1250,31 @@ assert r10j_ext.returncode == 1, f"10j normal blocked publish should exit 1, got
 assert os.path.isfile(ext_diag_rep) and json.load(open(ext_diag_rep))["ok"] is False, "10j confirmed-external run-report missing or not ok:false"
 
 print("[e2e] PASS: Round 11 Astra P1 suite (unknown-location probe_err never leaks o/ or O/ for any report flag; confirmed-external diag report still written)")
+
+# 10k. Round 12 Astra P1: Pairwise volume collision probe failure (`vc < 0` in near-PATH_MAX external dir)
+#      MUST mark both participating reports bad (preserving pre-existing `É.json` sentinel byte-for-byte & leaving `--out` untouched),
+#      while still writing an independent 3rd external `--run-report` with `"ok": false`!
+o10k = os.path.join(root, "o10k")
+r10k_init = run_cli(["--src", s10, "--out", o10k, "--target", "native", "--mode", "publish",
+                     "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10k_init.returncode == 0
+snap_10k = {p: open(os.path.join(o10k, p), "rb").read() for p in sorted(os.listdir(o10k))}
+sentinel_e = os.path.join(deep_base, "\u00c9.json")
+sentinel_bytes = b'{"sentinel":"keep-me-r12"}\n'
+with open(sentinel_e, "wb") as f:
+    f.write(sentinel_bytes)
+diag_run_10k = os.path.join(root, "diag_run_10k.json")
+r10k = run_cli(["--src", s10, "--out", o10k, "--target", "native", "--mode", "publish",
+                "--mbt-compat", compat_dir, "--pionc", pionc,
+                "--report", sentinel_e,
+                "--drift-ledger", os.path.join(deep_base, "\u00e9.json"),
+                "--run-report", diag_run_10k])
+assert r10k.returncode == 3, f"10k pairwise probe_err must exit 3, got {r10k.returncode} {r10k.stderr}"
+assert open(sentinel_e, "rb").read() == sentinel_bytes, "10k pre-existing É.json sentinel was overwritten!"
+assert {p: open(os.path.join(o10k, p), "rb").read() for p in sorted(os.listdir(o10k))} == snap_10k, "10k OUT mutated!"
+assert os.path.isfile(diag_run_10k) and json.load(open(diag_run_10k))["ok"] is False, "10k independent 3rd external --run-report missing or not ok:false"
+
+print("[e2e] PASS: Round 12 Astra P1 suite (pairwise probe_err preserves pre-existing É.json sentinel & OUT, still writes independent external --run-report)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
