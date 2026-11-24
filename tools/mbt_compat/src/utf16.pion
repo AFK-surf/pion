@@ -101,8 +101,91 @@ fn seq_units(n : Int) -> Int {
   }
 }
 
-/// MoonBit `String::length()`: number of UTF-16 code units.
-pub fn utf16_len(s : String) -> Int {
+// ---------------------------------------------------------------------------
+// Index cache. MoonBit code indexes strings in loops such as
+//   for i = 0; i < s.length(); i = i + 1 { ... s[i] ... }
+// which translates to `utf16_len(s)` / `utf16_code_unit_at(s, i)` per step.
+// A plain UTF-8 scan makes every call O(n) and the loop O(n^2) (seconds on a
+// 40K string). Strings of at least `U16_CACHE_MIN` bytes therefore get an
+// index built once in O(n): their UTF-16 length, whether they are pure ASCII
+// (then unit i is byte i), and for other strings the byte/unit position of
+// the scalar holding every `U16_CK`-th unit, so a lookup walks at most
+// `U16_CK` units. The last `U16_CACHE_SLOTS` indexed strings are kept in a
+// process-wide cache behind a `Mutex`, keyed by the string's data address and
+// byte length. Each entry holds a reference to its string, so that address
+// cannot be freed and reused by another string while the entry exists, and
+// strings are immutable: a key match is always the same string.
+
+let U16_CACHE_MIN : Int = 64
+
+let U16_CK : Int = 32
+
+let U16_CACHE_SLOTS : Int = 4
+
+struct U16Index {
+  s : String
+  addr : Int64
+  nbytes : Int
+  units : Int
+  ascii : Bool
+  ck_byte : Array[Int]
+  ck_unit : Array[Int]
+}
+
+struct U16Cache {
+  entries : Array[U16Index]
+  mut next : Int
+}
+
+let U16_CACHE : Mutex[U16Cache] = Mutex::new(U16Cache::{ entries: [], next: 0 })
+
+fn u16_build(s : String, addr : Int64) -> U16Index {
+  let n = s.length()
+  let ck_byte : Array[Int] = []
+  let ck_unit : Array[Int] = []
+  let mut ascii = true
+  let mut i = 0
+  let mut u = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    let l = if b < 0x80 { 1 } else { seq_len(s, i) }
+    if b >= 0x80 {
+      ascii = false
+    }
+    let w = seq_units(l)
+    // Checkpoints whose unit falls in [u, u + w) start at this scalar.
+    while ck_byte.length() * U16_CK < u + w {
+      ck_byte.push(i)
+      ck_unit.push(u)
+    }
+    u = u + w
+    i = i + l
+  }
+  U16Index::{ s, addr, nbytes: n, units: u, ascii, ck_byte, ck_unit }
+}
+
+/// The cached index of `s` (built and inserted on a miss).
+fn u16_index(s : String) -> U16Index {
+  let addr = ptr_addr(str_data_ptr(s))
+  let n = s.length()
+  U16_CACHE.with_lock(fn(c : U16Cache) -> U16Index {
+    for e in c.entries {
+      if e.addr == addr && e.nbytes == n {
+        return e
+      }
+    }
+    let e = u16_build(s, addr)
+    if c.entries.length() < U16_CACHE_SLOTS {
+      c.entries.push(e)
+    } else {
+      c.entries[c.next] = e
+      c.next = (c.next + 1) % U16_CACHE_SLOTS
+    }
+    e
+  })
+}
+
+fn utf16_len_scan(s : String) -> Int {
   let n = s.length()
   let mut i = 0
   let mut units = 0
@@ -119,16 +202,11 @@ pub fn utf16_len(s : String) -> Int {
   units
 }
 
-/// MoonBit `String::code_unit_at(idx)` / `s[idx]`: the UTF-16 code unit at
-/// `idx` (surrogate halves for scalars >= U+10000). Panics when `idx` is out
-/// of `0..<utf16_len(s)`.
-pub fn utf16_code_unit_at(s : String, idx : Int) -> Int {
-  if idx < 0 {
-    panic("index out of bounds: utf16_code_unit_at(\{idx})")
-  }
+/// Code unit `idx` walking from byte `i0` / unit `u0` (a scalar start).
+fn code_unit_from(s : String, idx : Int, i0 : Int, u0 : Int) -> Int {
   let n = s.length()
-  let mut i = 0
-  let mut u = 0
+  let mut i = i0
+  let mut u = u0
   while i < n {
     let l = seq_len(s, i)
     let c = seq_scalar(s, i, l)
@@ -151,9 +229,40 @@ pub fn utf16_code_unit_at(s : String, idx : Int) -> Int {
   panic("index out of bounds: utf16_code_unit_at(\{idx}), length \{u}")
 }
 
-/// Every UTF-16 code unit of `s`, in order. `utf16_code_unit_at` scans from
-/// the start (O(n) per call); a translated loop that indexes `s[i]` for many
-/// `i` should take this array once and index it in O(1).
+/// MoonBit `String::length()`: number of UTF-16 code units. O(1) after the
+/// first call on a string of >= 64 bytes (see the index cache above).
+pub fn utf16_len(s : String) -> Int {
+  if s.length() < U16_CACHE_MIN {
+    return utf16_len_scan(s)
+  }
+  u16_index(s).units
+}
+
+/// MoonBit `String::code_unit_at(idx)` / `s[idx]`: the UTF-16 code unit at
+/// `idx` (surrogate halves for scalars >= U+10000). Panics when `idx` is out
+/// of `0..<utf16_len(s)`. O(1) for indexed ASCII strings, at most 32 units of
+/// walking for other indexed strings.
+pub fn utf16_code_unit_at(s : String, idx : Int) -> Int {
+  if idx < 0 {
+    panic("index out of bounds: utf16_code_unit_at(\{idx})")
+  }
+  if s.length() < U16_CACHE_MIN {
+    return code_unit_from(s, idx, 0, 0)
+  }
+  let e = u16_index(s)
+  if idx >= e.units {
+    panic("index out of bounds: utf16_code_unit_at(\{idx}), length \{e.units}")
+  }
+  if e.ascii {
+    return s.code_unit_at(idx)
+  }
+  let c = idx / U16_CK
+  code_unit_from(s, idx, e.ck_byte[c], e.ck_unit[c])
+}
+
+/// Every UTF-16 code unit of `s`, in order (one O(n) pass, no cache): for a
+/// loop hoisted by the translator, or when many strings are indexed in turn
+/// (the index cache keeps only the last 4).
 pub fn utf16_units(s : String) -> Array[Int] {
   let out : Array[Int] = []
   let n = s.length()

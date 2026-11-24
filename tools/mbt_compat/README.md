@@ -17,6 +17,12 @@ MoonBit aborts and traps become Pion panics whose message starts with
 `abort:`, `index out of bounds`, `divide by zero`, `remainder by zero` or
 `divide result unrepresentable`.
 
+`utf16_len` / `utf16_code_unit_at` on strings of 64+ bytes use a small
+process-wide index cache (last 4 strings, behind a `Mutex`, keyed by data
+address + length while holding the string), so the translated loop
+`for i = 0; i < utf16_len(s); i = i + 1 { utf16_code_unit_at(s, i) }` is linear
+instead of quadratic.
+
 From another package, construct `MapKey`-keyed maps with `ordered_map_new()` /
 `ordered_map_from_array()`: pionc 0.1.0 checks the trait bound of an imported
 static method (`OrderedMap::new`) against the caller's package and reports
@@ -28,7 +34,7 @@ static method (`OrderedMap::new`) against the caller's package and reports
 pionc fmt --check tools/mbt_compat
 pionc check --json tools/mbt_compat
 pionc test --json tools/mbt_compat
-python3 tools/mbt_compat/oracle/run_oracle.py   # needs moon (wasm-gc), pionc, node
+python3 tools/mbt_compat/oracle/run_oracle.py --pionc <pionc under test>   # also $PIONC; needs moon (wasm-gc), node
 ```
 
 `oracle/run_oracle.py` runs every case of `oracle/moon_probe` (MoonBit) and
@@ -38,5 +44,6 @@ requires identical outcome class (ok / panic kind), trace and executed
 assertion ids, plus the frozen per-case expectation. Crashes, timeouts, raw
 Wasm traps on the Pion side and empty runs are hard failures. A negative
 self-test then mutates the Pion probe (dropped assertion, swallowed panic,
-bypassed helper) and requires each mutant to be reported red. The harness
+bypassed helper) and requires each mutant to be reported red with its
+expected failure category; an infrastructure error never counts as a detection. The harness
 also prints hot-path micro-benchmarks.

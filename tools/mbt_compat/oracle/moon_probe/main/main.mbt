@@ -117,6 +117,22 @@ fn case_utf16_basic() -> Unit {
 }
 
 ///|
+fn case_utf16_long() -> Unit {
+  let pieces = ["abcdefgh", "abc中文😀de", "😀", "x😀", "é"]
+  for pi, piece in pieces {
+    let s = piece.repeat(500)
+    let mut h = 0
+    for i = 0; i < s.length(); i = i + 1 {
+      h = h * 31 + s.code_unit_at(i).to_int()
+    }
+    trace("long\{pi}.len", s.length().to_string())
+    trace("long\{pi}.hash", h.to_string())
+    trace("long\{pi}.last", s.code_unit_at(s.length() - 1).to_string())
+  }
+  check("utf16.long_len", "abc中文😀de".repeat(500).length() == 4500)
+}
+
+///|
 fn case_utf16_slices() -> Unit {
   let samples = ["A中😀B", "😀😀", "e\u{301}x", "", "ab👍🏽cd"]
   for si, s in samples {
@@ -589,6 +605,7 @@ fn main {
   let name = if args.length() > 1 { args[1] } else { "" }
   match name {
     "utf16.basic" => case_utf16_basic()
+    "utf16.long" => case_utf16_long()
     "utf16.slices" => case_utf16_slices()
     "utf16.boundary" => case_utf16_boundary()
     "utf16.exact_mid_pair" => case_utf16_exact_mid_pair()

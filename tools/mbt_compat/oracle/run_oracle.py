@@ -22,10 +22,14 @@ assertion, swallow a panic, bypass a compat helper) and the harness itself
 must report each mutant red. `bench` prints hot-path timings (informative,
 not compared).
 
-Usage: python3 tools/mbt_compat/oracle/run_oracle.py [--no-self-test]
-       [--no-bench] [--jobs N] [--report out.json] [--case NAME ...]
-Needs `moon` (with the wasm-gc backend), `pionc` and `node` on PATH (or in
-~/.moon/bin, ~/.pion/bin). Exit status 0 only when everything is green.
+Usage: python3 tools/mbt_compat/oracle/run_oracle.py [--pionc PATH]
+       [--moon PATH] [--no-self-test] [--no-bench] [--jobs N]
+       [--report out.json] [--case NAME ...]
+The pionc under test is --pionc, else $PIONC, else `pionc` on PATH (moon:
+--moon, else $MOON, else PATH); an explicit path that is not an executable,
+or a missing pionc / moon / node, is a hard failure (exit 2), never a
+fallback to another installation. Exit status 0 only when everything is
+green.
 """
 
 import argparse
@@ -50,6 +54,7 @@ DIV_TYPES = ["i32", "i64", "u32", "u64", "byte"]
 # Frozen expectations: case -> (outcome, number of assertion ids).
 CASES = {
     "utf16.basic": ("ok", 9),
+    "utf16.long": ("ok", 1),
     "utf16.slices": ("ok", 5),
     "utf16.boundary": ("ok", 3),
     "utf16.exact_mid_pair": ("panic:abort", 0),
@@ -99,15 +104,19 @@ PION_PANICS = [
 ENGINES = ["moon", "pion-native", "pion-wasm32"]
 
 
-def find_tool(name, extra_dirs):
+def resolve_tool(name, flag, env_var):
+    """Tool path from --flag, else $ENV_VAR, else PATH; never a silent fallback.
+
+    An explicit flag or variable that does not name an executable file is an
+    error (None), not a reason to try the next source."""
+    for value, src in ((flag, "--" + name), (os.environ.get(env_var, ""), "$" + env_var)):
+        if value:
+            path = os.path.abspath(os.path.expanduser(value))
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path, src
+            return None, "%s=%s is not an executable file" % (src, value)
     path = shutil.which(name)
-    if path:
-        return path
-    for d in extra_dirs:
-        cand = os.path.join(os.path.expanduser(d), name)
-        if os.path.isfile(cand) and os.access(cand, os.X_OK):
-            return cand
-    return None
+    return (path, "PATH") if path else (None, "not on PATH")
 
 
 def run(cmd, cwd=None, env=None):
@@ -167,6 +176,8 @@ def classify(engine, rc, out, err, timed_out):
         return "HARD:raw-wasm-trap(%s)" % t
     if rc in (139, -11):
         return "HARD:SIGSEGV"
+    if rc in (136, -8):
+        return "HARD:SIGFPE"
     if rc is not None and rc < 0:
         return "HARD:signal-%d" % (-rc)
     return "HARD:exit-%s" % rc
@@ -195,32 +206,35 @@ def evaluate(case, results):
         traces, asserts, junk = parse_lines(out)
         parsed[eng] = (cls, traces, asserts)
         if cls.startswith("HARD:"):
-            errors.append("%s: hard fail %s (rc=%s) stderr=%s" %
-                          (eng, cls[5:], rc, err.strip()[-300:]))
+            errors.append(("hard_fail:" + cls[5:], "%s: hard fail %s (rc=%s) stderr=%s" %
+                           (eng, cls[5:], rc, err.strip()[-300:])))
         if not traces and not asserts:
-            errors.append("%s: executed nothing (0 traces, 0 assertions)" % eng)
+            errors.append(("empty_run", "%s: executed nothing (0 traces, 0 assertions)" % eng))
         if junk:
-            errors.append("%s: unexpected output %r" % (eng, junk[:3]))
+            errors.append(("unexpected_output", "%s: unexpected output %r" % (eng, junk[:3])))
     classes = {eng: parsed[eng][0] for eng in ENGINES}
     for eng in ENGINES:
         if classes[eng] != expect:
-            errors.append("%s: outcome %s, expected %s" % (eng, classes[eng], expect))
+            if not classes[eng].startswith("HARD:"):
+                errors.append(("outcome_mismatch",
+                               "%s: outcome %s, expected %s" % (eng, classes[eng], expect)))
     ref_t, ref_a = parsed["moon"][1], parsed["moon"][2]
     for eng in ENGINES[1:]:
         t, a = parsed[eng][1], parsed[eng][2]
         if t != ref_t:
             diff = next((i for i in range(min(len(t), len(ref_t))) if t[i] != ref_t[i]),
                         min(len(t), len(ref_t)))
-            errors.append("%s: trace differs from moon at line %d: moon=%r %s=%r" % (
+            errors.append(("trace_mismatch", "%s: trace differs from moon at line %d: moon=%r %s=%r" % (
                 eng, diff,
                 ref_t[diff] if diff < len(ref_t) else "<end>", eng,
-                t[diff] if diff < len(t) else "<end>"))
+                t[diff] if diff < len(t) else "<end>")))
         if a != ref_a:
-            errors.append("%s: assertion ids differ: moon=%s %s=%s" % (eng, ref_a, eng, a))
+            errors.append(("assertion_id_mismatch",
+                           "%s: assertion ids differ: moon=%s %s=%s" % (eng, ref_a, eng, a)))
     for eng in ENGINES:
         if len(parsed[eng][2]) != n_asserts:
-            errors.append("%s: %d assertions executed, expected %d" %
-                          (eng, len(parsed[eng][2]), n_asserts))
+            errors.append(("assertion_count_mismatch", "%s: %d assertions executed, expected %d" %
+                           (eng, len(parsed[eng][2]), n_asserts)))
     return errors, parsed
 
 
@@ -289,20 +303,52 @@ def run_suite(env, cases, jobs):
 # --------------------------------------------------------------------------
 # Negative self-test: every mutant must turn the oracle red.
 
+# (name, case, anchor, replacement, required, allowed): the mutant is detected
+# only when (1) some error has a category in `required` and (2) every error
+# has a category in `allowed`. Anything else, for instance an infrastructure
+# failure (a compile error, a missing Node.js runner `MODULE_NOT_FOUND`,
+# `exit-1`), fails the self-test instead of counting as a detection.
 MUTANTS = [
     ("drop-assertion", "map.order",
-     'check(w, "map.insertion_order", ks == "zeta alpha mid beta k9")\n', ""),
+     'check(w, "map.insertion_order", ks == "zeta alpha mid beta k9")\n', "",
+     {"assertion_id_mismatch"},
+     {"assertion_id_mismatch", "assertion_count_mismatch"}),
     ("swallow-panic-div", "div.i32.div.rt",
-     "mc::div_checked_i32(ZERO_I32[3], ZERO_I32[0])", "(ZERO_I32[3] / ZERO_I32[0])"),
+     "mc::div_checked_i32(ZERO_I32[3], ZERO_I32[0])", "(ZERO_I32[3] / ZERO_I32[0])",
+     # ARM64 native returns 0 (outcome ok), x86_64 native raises SIGFPE,
+     # wasm32 traps outside a Pion panic.
+     {"outcome_mismatch", "hard_fail:SIGFPE", "hard_fail:raw-wasm-trap(divide by zero)"},
+     {"outcome_mismatch", "trace_mismatch", "hard_fail:SIGFPE",
+      "hard_fail:raw-wasm-trap(divide by zero)"}),
     ("swallow-panic-unwrap", "opt.unwrap_none",
-     "mc::opt_unwrap(n).to_string()", "mc::opt_or(n, 0).to_string()"),
+     "mc::opt_unwrap(n).to_string()", "mc::opt_or(n, 0).to_string()",
+     {"outcome_mismatch"},
+     {"outcome_mismatch", "trace_mismatch"}),
     ("raw-double-format", "double.golden",
-     'trace(w, "d\\{i}", mc::double_to_string(d))', 'trace(w, "d\\{i}", "\\{d}")'),
+     'trace(w, "d\\{i}", mc::double_to_string(d))', 'trace(w, "d\\{i}", "\\{d}")',
+     {"trace_mismatch"},
+     {"trace_mismatch"}),
     ("raw-utf8-length", "utf16.basic",
-     'trace(w, "len", mc::utf16_len(s).to_string())', 'trace(w, "len", s.length().to_string())'),
+     'trace(w, "len", mc::utf16_len(s).to_string())', 'trace(w, "len", s.length().to_string())',
+     {"trace_mismatch"},
+     {"trace_mismatch"}),
     ("reinsert-keeps-position", "map.order",
-     'm.remove("alpha")\n  m.set("alpha", 6)', 'm.set("alpha", 6)'),
+     'm.remove("alpha")\n  m.set("alpha", 6)', 'm.set("alpha", 6)',
+     {"outcome_mismatch"},
+     {"outcome_mismatch", "trace_mismatch", "unexpected_output", "assertion_id_mismatch",
+      "assertion_count_mismatch"}),
 ]
+
+
+def mutant_detected(errs, required, allowed):
+    """(detected, reason) for the errors the oracle reported on a mutant."""
+    cats = [c for c, _ in errs]
+    stray = [m for c, m in errs if c not in allowed]
+    if stray:
+        return False, "unexpected failure category: " + stray[0][:160]
+    if not any(c in required for c in cats):
+        return False, "stayed green" if not cats else "no expected category in %s" % sorted(set(cats))
+    return True, "%s: %s" % (",".join(sorted(set(cats))), errs[0][1][:90])
 
 
 def make_mutant(env, name, old, new):
@@ -343,10 +389,28 @@ def classifier_selftest():
         got = classify(eng, rc, out, err, to)
         if got != want:
             problems.append("classify(%s, rc=%s) = %s, want %s" % (eng, rc, got, want))
+    probes2 = [
+        ("pion-native", 136, "", "", False, "HARD:SIGFPE"),
+    ]
+    for eng, rc, out, err, to, want in probes2:
+        got = classify(eng, rc, out, err, to)
+        if got != want:
+            problems.append("classify(%s, rc=%s) = %s, want %s" % (eng, rc, got, want))
     empty = {e: (0, "", "", False) for e in ENGINES}
     errs, _ = evaluate("utf16.basic", empty)
-    if not any("executed nothing" in e for e in errs):
+    if not any(c == "empty_run" for c, _ in errs):
         problems.append("a run with 0 assertions was not reported")
+    # An infrastructure failure must never count as a mutant detection.
+    infra = ("swallow-panic-div", [
+        ("hard_fail:exit-1", "pion-wasm32: hard fail exit-1 Error: Cannot find module "
+         "'pion_wasm_rt.mjs' code: 'MODULE_NOT_FOUND'"),
+        ("outcome_mismatch", "pion-native: outcome ok, expected panic:div_zero"),
+    ])
+    m = [x for x in MUTANTS if x[0] == infra[0]][0]
+    if mutant_detected(infra[1], m[4], m[5])[0]:
+        problems.append("an infrastructure failure was accepted as a mutant detection")
+    if mutant_detected([], m[4], m[5])[0]:
+        problems.append("a green mutant was accepted")
     return problems
 
 
@@ -357,17 +421,19 @@ def self_test(env, moon_results):
         print("SELFTEST FAIL  classifier: " + p)
         ok = False
     if ok:
-        print("selftest ok    classifier hard-fails SIGSEGV/timeout/exit/raw trap/empty run")
-    for name, case, old, new in MUTANTS:
+        print("selftest ok    classifier hard-fails SIGSEGV/SIGFPE/timeout/exit/raw trap/empty run;"
+              " infrastructure failures never count as detections")
+    for name, case, old, new, required, allowed in MUTANTS:
         d = make_mutant(env, name, old, new)
         res = {"moon": moon_results[case],
                "pion-native": run_pion(env, d, "native", case),
                "pion-wasm32": run_pion(env, d, "wasm32", case)}
         errs, _ = evaluate(case, res)
-        if errs:
-            print("selftest ok    mutant %-22s on %-18s -> red: %s" % (name, case, errs[0][:110]))
+        detected, why = mutant_detected(errs, required, allowed)
+        if detected:
+            print("selftest ok    mutant %-24s on %-16s -> red [%s]" % (name, case, why))
         else:
-            print("SELFTEST FAIL  mutant %-22s on %-18s stayed green" % (name, case))
+            print("SELFTEST FAIL  mutant %-24s on %-16s %s" % (name, case, why))
             ok = False
     return ok
 
@@ -396,13 +462,25 @@ def main():
     ap.add_argument("--jobs", type=int, default=8)
     ap.add_argument("--report", default="")
     ap.add_argument("--case", action="append", default=[])
+    ap.add_argument("--pionc", default="",
+                    help="pionc under test (else $PIONC, else pionc on PATH)")
+    ap.add_argument("--moon", default="",
+                    help="reference moon (else $MOON, else moon on PATH)")
     args = ap.parse_args()
 
-    moon = find_tool("moon", ["~/.moon/bin"])
-    pionc = find_tool("pionc", ["~/.pion/bin"])
-    if not moon or not pionc or not shutil.which("node"):
-        print("missing tool: moon=%s pionc=%s node=%s" % (moon, pionc, shutil.which("node")))
+    pionc, pionc_src = resolve_tool("pionc", args.pionc, "PIONC")
+    moon, moon_src = resolve_tool("moon", args.moon, "MOON")
+    node = shutil.which("node")
+    if not pionc or not moon or not node:
+        print("HARD FAIL: missing tool: pionc=%s (%s) moon=%s (%s) node=%s" %
+              (pionc, pionc_src, moon, moon_src, node))
         return 2
+    for label, tool, src in (("pionc", pionc, pionc_src), ("moon", moon, moon_src)):
+        rc, out, err, to, _ = run([tool, "version"] if label == "moon" else [tool, "--version"])
+        if rc != 0:
+            print("HARD FAIL: %s %s does not run (rc=%s): %s" % (label, tool, rc, err.strip()[:300]))
+            return 2
+        print("tool       %-5s %s [%s] %s" % (label, tool, src, out.strip().splitlines()[0]))
     for c in args.case:
         if c not in CASES:
             print("unknown case " + c)
@@ -434,12 +512,13 @@ def main():
             status = "PASS" if not errs else "FAIL"
             print("%s %-24s outcome=%-19s traces=%-5d asserts=%-2d (moon=pion-native=pion-wasm32)"
                   % (status, c, cls, n_t, n_a) if not errs else "%s %s" % (status, c))
-            for e in errs:
-                print("     " + e)
+            for cat, e in errs:
+                print("     [%s] %s" % (cat, e))
             if errs:
                 failed += 1
             report.append({"case": c, "ok": not errs, "outcome": {e: parsed[e][0] for e in ENGINES},
-                           "traces": n_t, "asserts": parsed["moon"][2], "errors": errs})
+                           "traces": n_t, "asserts": parsed["moon"][2],
+                           "errors": [{"category": c, "message": m} for c, m in errs]})
         if total_asserts == 0:
             print("HARD FAIL: 0 assertions executed")
             failed += 1
