@@ -152,22 +152,45 @@ fn split_bracket_items(inner : String) -> Array[String] {
   out
 }
 
-///| Reconstruct a canonical target-rule expression string from `lex_moonbit` tokens
-///| (automatically strips all comments/whitespace and rejects malformed syntax).
-fn parse_target_rule_expr_tokens(tokens : Array[Token], val_i : Int, limit : Int) -> Result[(String, Int), String] {
+///| Structured AST for `moon.pkg` / `moon.pkg.json` target-rule expressions.
+pub enum TargetRuleExpr {
+  Atom(String)
+  List(Array[TargetRuleExpr])
+}
+
+///| Format a `TargetRuleExpr` for diagnostics and compatibility display.
+pub fn format_target_rule_expr(expr : TargetRuleExpr) -> String {
+  match expr {
+    TargetRuleExpr::Atom(s) => "\"" + s + "\""
+    TargetRuleExpr::List(items) => {
+      let parts : Array[String] = []
+      for it in items {
+        parts.push(format_target_rule_expr(it))
+      }
+      "[" + join_comma(parts) + "]"
+    }
+  }
+}
+
+///| Parse a structured `TargetRuleExpr` directly from `lex_moonbit` tokens
+///| (decodes every string literal escape and rejects malformed syntax fail-closed).
+fn parse_target_rule_expr_tokens(tokens : Array[Token], val_i : Int, limit : Int) -> Result[(TargetRuleExpr, Int), String] {
   if val_i >= limit {
     return Err("malformed moon.pkg target rule: unexpected end of expression")
   }
   let tok = tokens[val_i]
   if tok.kind == TokenKind::StringLit {
-    return Ok((tok.raw, val_i + 1))
+    match decode_mbt_string_lit(tok.raw) {
+      Ok(decoded) => return Ok((TargetRuleExpr::Atom(decoded), val_i + 1))
+      Err(e) => return Err("malformed moon.pkg target rule string: " + e)
+    }
   }
   if tok.kind == TokenKind::LBracket {
     let rb = find_matching_delim(tokens, val_i)
     if rb >= limit || tokens[rb].kind != TokenKind::RBracket {
       return Err("malformed moon.pkg target rule: unclosed `[`")
     }
-    let items : Array[String] = []
+    let items : Array[TargetRuleExpr] = []
     let mut k = val_i + 1
     while k < rb {
       if tokens[k].kind == TokenKind::Comma {
@@ -175,8 +198,8 @@ fn parse_target_rule_expr_tokens(tokens : Array[Token], val_i : Int, limit : Int
       }
       match parse_target_rule_expr_tokens(tokens, k, rb) {
         Err(e) => return Err(e)
-        Ok((item_str, next_k)) => {
-          items.push(item_str)
+        Ok((item_ast, next_k)) => {
+          items.push(item_ast)
           k = next_k
         }
       }
@@ -188,17 +211,18 @@ fn parse_target_rule_expr_tokens(tokens : Array[Token], val_i : Int, limit : Int
         }
       }
     }
-    return Ok(("[" + join_comma(items) + "]", rb + 1))
+    return Ok((TargetRuleExpr::List(items), rb + 1))
   }
   Err("invalid moon.pkg target rule expression near `" + tok.raw + "`")
 }
 
-///| Strictly parse a `{ "file.mbt": <rule_expr>, ... }` targets table from `lex_moonbit` tokens.
+///| Strictly parse a `{ "file.mbt": <rule_expr>, ... }` targets table from `lex_moonbit` tokens,
+///| decoding all filename keys and checking duplicate keys AFTER decoding.
 fn parse_targets_table_tokens(
   tokens : Array[Token],
   start : Int,
   limit : Int,
-  out : Map[String, String],
+  out : Map[String, TargetRuleExpr],
 ) -> Result[Int, String] {
   if start >= limit || tokens[start].kind != TokenKind::LBrace {
     return Err("malformed moon.pkg targets table: expected `{ ... }`")
@@ -212,8 +236,10 @@ fn parse_targets_table_tokens(
     if tokens[k].kind != TokenKind::StringLit {
       return Err("malformed moon.pkg targets table: expected quoted filename key near `" + tokens[k].raw + "`")
     }
-    let raw_key = tokens[k].raw
-    let fname = if raw_key.length() >= 2 { raw_key.slice(1, raw_key.length() - 1) } else { "" }
+    let fname = match decode_mbt_string_lit(tokens[k].raw) {
+      Ok(s) => s
+      Err(e) => return Err("malformed moon.pkg targets filename key: " + e)
+    }
     if fname.length() == 0 {
       return Err("malformed moon.pkg targets table: empty filename key")
     }
@@ -224,11 +250,11 @@ fn parse_targets_table_tokens(
     k = k + 1
     match parse_target_rule_expr_tokens(tokens, k, rb) {
       Err(e) => return Err(e)
-      Ok((expr_str, next_k)) => {
+      Ok((expr_ast, next_k)) => {
         if out.contains(fname) {
-          return Err("duplicate moon.pkg target rule for `" + fname + "`")
+          return Err("duplicate target rule for " + fname)
         }
-        out[fname] = expr_str
+        out[fname] = expr_ast
         k = next_k
       }
     }
@@ -245,14 +271,16 @@ fn parse_targets_table_tokens(
 
 ///| Lexer-backed strict parser for BOTH `moon.pkg.json` (`"targets": { ... }`) AND
 ///| real MoonBit `moon.pkg` DSL (`options(targets: { ... })`).
-///| Immune to `//` comments, whitespace/newlines, and string literals containing `targets:` or `}`.
-pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, String], String] {
-  let out : Map[String, String] = Map()
+///| Decodes JSON/MoonBit string escapes in field names, filenames, and rule atoms,
+///| rejects duplicate `targets` fields and duplicate decoded filenames fail-closed.
+pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, TargetRuleExpr], String] {
+  let out : Map[String, TargetRuleExpr] = Map()
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
   if n <= 0 {
     return Ok(out)
   }
+  let mut seen_targets = false
   // 1. JSON manifest (`moon.pkg.json`): root `{ ... }` top-level `"targets": { ... }`
   if tokens[0].kind == TokenKind::LBrace {
     let rb = find_matching_delim(tokens, 0)
@@ -266,9 +294,16 @@ pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, Str
         continue
       }
       if tokens[k].kind == TokenKind::StringLit && k + 1 < rb && tokens[k + 1].kind == TokenKind::Colon {
-        let key_raw = tokens[k].raw
+        let key_decoded = match decode_mbt_string_lit(tokens[k].raw) {
+          Ok(s) => s
+          Err(e) => return Err("malformed moon.pkg.json key: " + e)
+        }
         let val_i = k + 2
-        if key_raw == "\"targets\"" {
+        if key_decoded == "targets" {
+          if seen_targets {
+            return Err("duplicate targets field in moon.pkg")
+          }
+          seen_targets = true
           match parse_targets_table_tokens(tokens, val_i, rb, out) {
             Err(e) => return Err(e)
             Ok(next_k) => {
@@ -315,9 +350,20 @@ pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, Str
           j = j + 1
           continue
         }
-        let is_targets_key = ((tokens[j].kind == TokenKind::Ident || tokens[j].kind == TokenKind::Keyword) && tokens[j].raw == "targets") ||
-        (tokens[j].kind == TokenKind::StringLit && tokens[j].raw == "\"targets\"")
+        let mut is_targets_key = false
+        if (tokens[j].kind == TokenKind::Ident || tokens[j].kind == TokenKind::Keyword) && tokens[j].raw == "targets" {
+          is_targets_key = true
+        } else if tokens[j].kind == TokenKind::StringLit && j + 1 < rp && tokens[j + 1].kind == TokenKind::Colon {
+          match decode_mbt_string_lit(tokens[j].raw) {
+            Ok(s) => if s == "targets" { is_targets_key = true }
+            Err(e) => return Err("malformed moon.pkg option key: " + e)
+          }
+        }
         if is_targets_key && j + 1 < rp && tokens[j + 1].kind == TokenKind::Colon {
+          if seen_targets {
+            return Err("duplicate targets field in moon.pkg")
+          }
+          seen_targets = true
           match parse_targets_table_tokens(tokens, j + 2, rp, out) {
             Err(e) => return Err(e)
             Ok(next_j) => {
@@ -347,92 +393,114 @@ pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, Str
 
 ///| Compatibility wrapper returning `Map[String, String]` (empty map on parse error).
 pub fn parse_moon_pkg_targets(content : String) -> Map[String, String] {
+  let out : Map[String, String] = Map()
   match parse_moon_pkg_targets_strict(content) {
-    Ok(m) => m
-    Err(_) => Map()
+    Ok(m) => {
+      for k in m.keys() {
+        match m.get(k) {
+          Some(ast) => out[k] = format_target_rule_expr(ast)
+          None => ()
+        }
+      }
+    }
+    Err(_) => ()
+  }
+  out
+}
+
+///| Recursively evaluate a decoded `TargetRuleExpr` AST for `pion_target` (fail-closed:
+///| returns `None` on any unknown predicate, empty array, or malformed operator arity).
+pub fn eval_target_rule_ast(pion_target : String, expr : TargetRuleExpr) -> Option[Bool] {
+  match expr {
+    TargetRuleExpr::Atom(v) => {
+      if v == "all" {
+        return Some(true)
+      }
+      if v == "native" || v == "wasm" || v == "wasm-gc" || v == "js" || v == "llvm" {
+        return Some(v == moon_source_backend_for_target(pion_target))
+      }
+      None
+    }
+    TargetRuleExpr::List(items) => {
+      if items.length() == 0 {
+        return None
+      }
+      match items[0] {
+        TargetRuleExpr::Atom("not") => {
+          if items.length() < 2 {
+            return None
+          }
+          let mut any_true = false
+          let mut i = 1
+          while i < items.length() {
+            match eval_target_rule_ast(pion_target, items[i]) {
+              None => return None
+              Some(true) => any_true = true
+              Some(false) => ()
+            }
+            i = i + 1
+          }
+          Some(!any_true)
+        }
+        TargetRuleExpr::Atom("and") => {
+          if items.length() < 2 {
+            return None
+          }
+          let mut all_true = true
+          let mut i = 1
+          while i < items.length() {
+            match eval_target_rule_ast(pion_target, items[i]) {
+              None => return None
+              Some(false) => all_true = false
+              Some(true) => ()
+            }
+            i = i + 1
+          }
+          Some(all_true)
+        }
+        TargetRuleExpr::Atom("or") => {
+          if items.length() < 2 {
+            return None
+          }
+          let mut any_true = false
+          let mut i = 1
+          while i < items.length() {
+            match eval_target_rule_ast(pion_target, items[i]) {
+              None => return None
+              Some(true) => any_true = true
+              Some(false) => ()
+            }
+            i = i + 1
+          }
+          Some(any_true)
+        }
+        _ => {
+          let mut any_true = false
+          for item in items {
+            match eval_target_rule_ast(pion_target, item) {
+              None => return None
+              Some(true) => any_true = true
+              Some(false) => ()
+            }
+          }
+          Some(any_true)
+        }
+      }
+    }
   }
 }
 
-///| Recursively evaluate a `moon.pkg` file-target expression for `pion_target` (fail-closed:
-///| returns `None` on any unknown predicate, empty array, or malformed expression).
+///| Compatibility wrapper: parse `raw_expr` via `lex_moonbit` and evaluate via `eval_target_rule_ast`.
 pub fn eval_moon_pkg_target_rule(pion_target : String, raw_expr : String) -> Option[Bool] {
-  let s = raw_expr.trim()
-  if s.length() >= 2 && s.starts_with("\"") && s.ends_with("\"") {
-    let v = s.slice(1, s.length() - 1)
-    if v == "all" {
-      return Some(true)
-    }
-    if v == "native" || v == "wasm" || v == "wasm-gc" || v == "js" || v == "llvm" {
-      return Some(v == moon_source_backend_for_target(pion_target))
-    }
+  let tokens = lex_moonbit(raw_expr)
+  let n = tokens.length() - 1
+  if n <= 0 {
     return None
   }
-  if s.length() >= 2 && s.starts_with("[") && s.ends_with("]") {
-    let items = split_bracket_items(s.slice(1, s.length() - 1))
-    if items.length() == 0 {
-      return None
-    }
-    let first = items[0].trim()
-    if first == "\"not\"" {
-      if items.length() < 2 {
-        return None
-      }
-      let mut any_true = false
-      let mut i = 1
-      while i < items.length() {
-        match eval_moon_pkg_target_rule(pion_target, items[i]) {
-          None => return None
-          Some(true) => any_true = true
-          Some(false) => ()
-        }
-        i = i + 1
-      }
-      return Some(!any_true)
-    }
-    if first == "\"and\"" {
-      if items.length() < 2 {
-        return None
-      }
-      let mut all_true = true
-      let mut i = 1
-      while i < items.length() {
-        match eval_moon_pkg_target_rule(pion_target, items[i]) {
-          None => return None
-          Some(false) => all_true = false
-          Some(true) => ()
-        }
-        i = i + 1
-      }
-      return Some(all_true)
-    }
-    if first == "\"or\"" {
-      if items.length() < 2 {
-        return None
-      }
-      let mut any_true = false
-      let mut i = 1
-      while i < items.length() {
-        match eval_moon_pkg_target_rule(pion_target, items[i]) {
-          None => return None
-          Some(true) => any_true = true
-          Some(false) => ()
-        }
-        i = i + 1
-      }
-      return Some(any_true)
-    }
-    // Plain array (implicit OR): every element must still be a known predicate (fail-closed)
-    let mut any_true = false
-    for item in items {
-      match eval_moon_pkg_target_rule(pion_target, item) {
-        None => return None
-        Some(true) => any_true = true
-        Some(false) => ()
-      }
-    }
-    return Some(any_true)
+  match parse_target_rule_expr_tokens(tokens, 0, n) {
+    Ok((ast, next_i)) => if next_i == n { eval_target_rule_ast(pion_target, ast) } else { None }
+    Err(_) => None
   }
-  None
 }
 
 ///| Compatibility wrapper around `eval_moon_pkg_target_rule` for flat string-array rules.
@@ -701,8 +769,8 @@ pub fn transpile_package(
       None => pkg_targets.get(base)
     }
     match rules_opt {
-      Some(raw_rule) =>
-      match eval_moon_pkg_target_rule(opts.target, raw_rule) {
+      Some(rule_ast) =>
+      match eval_target_rule_ast(opts.target, rule_ast) {
         Some(true) => ()
         Some(false) => {
           ctx.dispositions.push(DispositionEntry::{
@@ -716,6 +784,7 @@ pub fn transpile_package(
           continue
         }
         None => {
+          let raw_rule = format_target_rule_expr(rule_ast)
           ctx.diags.push(diag_error(
             "MBT2PION_UNSUPPORTED_TARGET_RULE",
             sf.rel_path,

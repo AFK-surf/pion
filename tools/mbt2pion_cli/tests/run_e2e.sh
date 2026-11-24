@@ -1487,6 +1487,66 @@ assert "MBT2PION_UNSUPPORTED_TARGET_RULE" in (r_lx_bad.stdout + r_lx_bad.stderr)
 
 print("[e2e] PASS: Final Astra P0 lexer-backed moon.pkg suite (10m-4: targets : / // comment / // } -> 21/22/21 + malformed 123 -> rc=1)")
 
+# 10m-5. Final Astra P0 moon.pkg string escape decoding + decoded duplicate key fail-closed:
+#        escaped_name / escaped_field / escaped_value -> publish rc=0, extra.pion absent, live wasm32 == 21;
+#        duplicate_decoded & invalid_escape -> publish rc=1 + MBT2PION_UNSUPPORTED_TARGET_RULE!
+for tag_es, pkg_txt in [
+    ("escaped_name", 'options(targets: {"ex\\u0074ra.mbt": "wasm"})\n'),
+    ("escaped_field", 'options("tar\\u0067ets": {"extra.mbt": "wasm"})\n'),
+    ("escaped_value", 'options(targets: {"extra.mbt": "w\\u0061sm"})\n'),
+]:
+    s_es = os.path.join(root, f"s10m5_{tag_es}")
+    o_es = os.path.join(root, f"o10m5_{tag_es}")
+    os.makedirs(s_es, exist_ok=True)
+    with open(os.path.join(s_es, "moon.pkg"), "w") as f:
+        f.write(pkg_txt)
+    with open(os.path.join(s_es, "extra.mbt"), "w") as f:
+        f.write("fn init {\n  xs.push(9)\n}\n")
+    with open(os.path.join(s_es, "common.mbt"), "w") as f:
+        f.write(
+            'let xs : Array[Int] = [0]\n'
+            '#cfg(target="wasm-gc")\n'
+            'fn bit() -> Int { 20 }\n'
+            '#cfg(not(target="wasm-gc"))\n'
+            'fn bit() -> Int { 10 }\n'
+            'pub fn sample() -> Int { xs.length() + bit() }\n'
+        )
+    r_es_pub = run_cli(["--src", s_es, "--out", o_es, "--target", "wasm32", "--mode", "publish",
+                        "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_es_pub.returncode == 0, f"10m-5 {tag_es} publish failed: {r_es_pub.returncode} {r_es_pub.stdout} {r_es_pub.stderr}"
+    assert not os.path.isfile(os.path.join(o_es, "extra.pion")), f"10m-5 {tag_es} should have excluded extra.pion!"
+    pkg_es = os.path.join(root, f"pkg10m5_{tag_es}")
+    os.makedirs(os.path.join(pkg_es, "src"), exist_ok=True)
+    for fn in sorted(os.listdir(o_es)):
+        if fn.endswith(".pion"):
+            shutil.copyfile(os.path.join(o_es, fn), os.path.join(pkg_es, "src", fn))
+    with open(os.path.join(pkg_es, "pion.toml"), "w") as f:
+        f.write(f'[package]\nname = "e2e_10m5_{tag_es}"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+    with open(os.path.join(pkg_es, "src", "main.pion"), "w") as f:
+        f.write('pub fn main(world : World) -> Int {\n  io_println(world, sample().to_string())\n  0\n}\n')
+    run_cmd = [pionc, "run", "--target", "wasm32", pkg_es] if shutil.which("node") else [pionc, "run", pkg_es]
+    r_es_run = subprocess.run(run_cmd, capture_output=True, text=True)
+    assert r_es_run.returncode == 0, f"10m-5 {tag_es} run failed: {r_es_run.stdout} {r_es_run.stderr}"
+    assert r_es_run.stdout.strip() == "21", f"10m-5 {tag_es} expected '21', got {r_es_run.stdout!r}"
+
+for tag_eb, bad_pkg_txt in [
+    ("duplicate_decoded", 'options(targets: {"extra.mbt": "native", "ex\\u0074ra.mbt": "wasm"})\n'),
+    ("invalid_escape", 'options(targets: {"extra.mbt": "w\\qsm"})\n'),
+]:
+    s_eb = os.path.join(root, f"s10m5_bad_{tag_eb}")
+    o_eb = os.path.join(root, f"o10m5_bad_{tag_eb}")
+    os.makedirs(s_eb, exist_ok=True)
+    with open(os.path.join(s_eb, "moon.pkg"), "w") as f:
+        f.write(bad_pkg_txt)
+    with open(os.path.join(s_eb, "extra.mbt"), "w") as f:
+        f.write("pub fn ok() -> Int { 1 }\n")
+    r_eb = run_cli(["--src", s_eb, "--out", o_eb, "--target", "wasm32", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc])
+    assert r_eb.returncode == 1, f"10m-5 {tag_eb} must fail (rc=1), got {r_eb.returncode}"
+    assert "MBT2PION_UNSUPPORTED_TARGET_RULE" in (r_eb.stdout + r_eb.stderr), f"10m-5 {tag_eb} missing MBT2PION_UNSUPPORTED_TARGET_RULE"
+
+print("[e2e] PASS: Final Astra P0 escape-decoding suite (10m-5: escaped_name/field/value -> 21, duplicate_decoded & invalid_escape -> rc=1)")
+
 # 10n. Red-team P0 live native acceptance:
 #      extern "C" fn c_abs(x : Int) -> Int = "abs" + #cfg(target="js") js_only + #cfg(target="native") native_only + kept()
 #      -> publish --target native rc=0, 0 js_only, 4 exact dispositions, live `pionc run` prints `2`!
