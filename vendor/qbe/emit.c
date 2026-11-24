@@ -63,6 +63,21 @@ emitlnk(char *n, Lnk *l, int s, FILE *f)
 			fprintf(f, ".section .data.%s,\"aw\",%%progbits", n);
 		else
 			fprintf(f, ".section .bss.%s,\"aw\",%%nobits", n);
+	} else if (T.windows && !l->thread && n[0] != '"' && n[0] != '\0') {
+		if (s == SecText)
+			fprintf(f, ".section .text$%s,\"xr\"", n);
+		else if (s == SecData)
+			fprintf(f, ".section .data$%s,\"dw\"", n);
+		else
+			fprintf(f, ".section .bss$%s,\"bw\"", n);
+		/* Emit IMAGE_COMDAT_SELECT_NODUPLICATES (`.linkonce one_only`) on
+		 * every per-symbol COFF section (matching Clang `-ffunction-sections`):
+		 * MSVC `link.exe`/`lld-link /OPT:REF` requires COMDAT to GC dead
+		 * static/local functions, drop helpers, vtables and string data too.
+		 * Non-exported symbols lack `.globl` (`IMAGE_SYM_CLASS_STATIC`, scl 3)
+		 * so same-named locals across `.o` files remain isolated, while
+		 * exported strong symbols (`.globl`, scl 2) still reject duplicates. */
+		fputs("\n.linkonce one_only", f);
 	} else
 		fputs(sec[l->thread != 0][s], f);
 	fputc('\n', f);
@@ -267,6 +282,7 @@ macho_emitfin(FILE *f)
 	};
 
 	emitfin(f, sec);
+	fputs(".subsections_via_symbols\n", f);
 }
 
 void

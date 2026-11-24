@@ -54,7 +54,7 @@ gzip -dc "$ROOT_DIR/bootstrap/pionc-seed.ssa.gz" > "$SEED_SSA"
 
 T_B0="$(now_ms)"
 "$OUT_DIR/qbe.exe" -t amd64_win -o "$TMP_DIR/pionc_win.s" "$SEED_SSA"
-"$CC" -c "$TMP_DIR/pionc_win.s" -o "$OUT_DIR/pionc_win.o"
+"$CC" -Wa,-mbig-obj -c "$TMP_DIR/pionc_win.s" -o "$OUT_DIR/pionc_win.o"
 "$CC" "$OUT_DIR/pionc_win.o" "$OUT_DIR/libpionrt_cli.a" -lm -lws2_32 -Wl,--stack,16777216 -o "$OUT_DIR/pionc_win.exe"
 T_B1="$(now_ms)"
 PIONC_SIZE="$(wc -c < "$OUT_DIR/pionc_win.exe" | tr -d ' ')"
@@ -155,6 +155,7 @@ if [ "$P27A_OUT" != "p27a_ergonomics_bug4 ok" ]; then
 fi
 
 sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
+sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
 
 # Windows directory junction collision regression for --emit-web-rt
 JUNC_BASE="$TMP_DIR/junc_web_rt"

@@ -577,6 +577,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC"
 # P94: Wave J3 — first-class immutable Send sequence type ImmArray[T].
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC"
+# Wave K1-A: Windows COFF per-symbol section GC, same-section jump tables, Mach-O .subsections_via_symbols & c_sources sections.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p98_section_gc/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"
