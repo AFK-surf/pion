@@ -627,6 +627,111 @@ fn case_double_compare_nan() -> Unit {
 }
 
 ///|
+fn case_wave_m2_compat() -> Unit {
+  let inf = 1.0 / 0.0
+  let ninf = -1.0 / 0.0
+  let nan = 0.0 / 0.0
+  check("m2.is_inf_pos", inf.is_inf())
+  check("m2.is_inf_neg", ninf.is_inf())
+  check("m2.is_inf_nan", !nan.is_inf())
+  check("m2.is_inf_fin", !(42.5).is_inf())
+  let h1 : Double = 0x1.0p1023
+  let h2 : Double = 0x1.fp-1022
+  let h3 : Double = 0x1.0p-54
+  let h4 : Double = 0x1.0p-1074
+  trace("hex_bits", "\{h1.reinterpret_as_int64()},\{h2.reinterpret_as_int64()},\{h3.reinterpret_as_int64()},\{h4.reinterpret_as_int64()}")
+  let r1 : Ref[Int] = { val: 10 }
+  let r2 : Ref[Int] = { val: 10 }
+  r1.val = r1.val + 5
+  check("m2.ref_mut", r1.val == 15 && r2.val == 10)
+  check("m2.ref_phys", physical_equal(r1, r1) && !physical_equal(r1, r2))
+  let bs = Bytes::makei(4, fn(i) { (65 + i).to_byte() })
+  let sub = bs[1:3]
+  trace("bytes", "\{bs.length()},\{sub.length()},\{sub[0].to_int()},\{sub[1].to_int()}")
+  check("m2.bytes_makei", bs.length() == 4 && sub.length() == 2 && sub[0] == b'B' && sub[1] == b'C')
+  let fa = FixedArray::makei(3, fn(i) { i * 10 })
+  check("m2.fa_makei", fa.length() == 3 && fa[0] == 0 && fa[1] == 10 && fa[2] == 20)
+}
+
+///|
+fn case_wave_m2_round2() -> Unit {
+  // P1-6: UTF-8 lossy maximal subpart (Unicode Table 3-7 / WHATWG)
+  let samples : Array[(String, Array[Byte])] = [
+    ("e0a0", [b'\xE0', b'\xA0']),
+    ("e282", [b'\xE2', b'\x82']),
+    ("e28241", [b'\xE2', b'\x82', b'\x41']),
+    ("f09f92", [b'\xF0', b'\x9F', b'\x92']),
+    ("f0908041", [b'\xF0', b'\x90', b'\x80', b'\x41']),
+    ("mixed", [b'\xC0', b'\x80', b'\xED', b'\xA0', b'\x80', b'\xF4', b'\x90', b'\x80', b'\x80', b'\xFF', b'\x7A']),
+  ]
+  for pair in samples {
+    let dec = @utf8.decode_lossy(Bytes::from_array(pair.1))
+    let sb = StringBuilder::new()
+    for i = 0; i < dec.length(); i = i + 1 {
+      if i > 0 { sb.write_string(",") }
+      sb.write_string(dec[i].to_int().to_string())
+    }
+    trace("utf8." + pair.0, sb.to_string())
+  }
+  check("r2.utf8_subpart", @utf8.decode_lossy(Bytes::from_array([b'\xE0', b'\xA0'])).length() == 1)
+
+  // P1-7: math.maximum / math.minimum on NaN and ±0.0
+  let nan = 0.0 / 0.0
+  let p0 = 0.0
+  let n0 = -0.0
+  let pairs : Array[(String, Double, Double)] = [
+    ("nan_1", nan, 1.0),
+    ("1_nan", 1.0, nan),
+    ("p0_n0", p0, n0),
+    ("n0_p0", n0, p0),
+    ("nan_nan", nan, nan),
+    ("2_5", 2.0, 5.0),
+  ]
+  for item in pairs {
+    let mx = @math.maximum(item.1, item.2)
+    let mn = @math.minimum(item.1, item.2)
+    let mx_s = if mx.is_nan() { "NaN" } else { mx.reinterpret_as_int64().to_string() }
+    let mn_s = if mn.is_nan() { "NaN" } else { mn.reinterpret_as_int64().to_string() }
+    trace("mm." + item.0, "\{mx_s},\{mn_s}")
+  }
+  check("r2.math_max_nan", @math.maximum(nan, 1.0) == 1.0 && @math.maximum(1.0, nan).is_nan())
+  check("r2.math_min_nan", @math.minimum(nan, 1.0).is_nan() && @math.minimum(1.0, nan) == 1.0)
+
+  // P1-8: Lazy iter short-circuiting (including lazy zip!)
+  let mut c1 = 0
+  let a1 = [1, 2, 3, 4, 5, 6].iter().map(fn(x) { c1 = c1 + 1; x * 2 }).any(fn(x) { x == 4 })
+  let mut c2 = 0
+  let a2 = [1, 2, 3, 4, 5, 6].iter().map(fn(x) { c2 = c2 + 1; x * 2 }).all(fn(x) { x < 6 })
+  let mut zf = 0
+  let mut zg = 0
+  let _unused_zip = [1, 2, 3].iter().map(fn(x) { zf = zf + 1; x }).zip([10, 20, 30].iter().map(fn(y) { zg = zg + 1; y }))
+  let z_unused_cnt = "\{zf}:\{zg}"
+  let za = [1, 2, 3, 4, 5, 6]
+    .iter()
+    .map(fn(x) { zf = zf + 1; x })
+    .zip([10, 20, 30, 40, 50, 60].iter().map(fn(y) { zg = zg + 1; y }))
+    .any(fn(p) { p.0 + p.1 == 22 })
+  trace("iter", "\{a1}:\{c1},\{a2}:\{c2},zip_unused=\{z_unused_cnt},zip_any=\{za}:\{zf}:\{zg}")
+  check("r2.iter_lazy", a1 && c1 == 2 && !a2 && c2 == 3 && z_unused_cnt == "0:0" && za && zf == 2 && zg == 2)
+
+  // P0-1 + P2: Debug formatting for String & Char + arr_iter length snapshot
+  let ds0 = "\u{00}\u{01}\u{1f}\u{7f}\b\n\t\\\"".escape()
+  let dc0 = '\u{00}'.escape()
+  let dc7f = '\u{7f}'.escape()
+  let dc200b = '\u{200b}'.escape()
+  let dc_a = 'A'.escape()
+  trace("dbg_str", ds0)
+  trace("dbg_chr", "\{dc0}|\{dc7f}|\{dc200b}|\{dc_a}")
+  let snap_xs = [1, 2]
+  let snap_it = snap_xs.iter()
+  snap_xs.push(3)
+  let snap_cnt = snap_it.count()
+  let fold_v = [1, 2].iter().fold(init=0, fn(x, y) { x * 10 + y })
+  trace("iter_snap_fold", "\{snap_cnt},\{fold_v}")
+  check("r2.dbg_str", ds0.contains("\\u{00}\\u{01}\\u{1f}") && dc0 == "'\\u{00}'" && dc7f == "'\\u{7f}'" && dc200b == "'\\u{200b}'" && snap_cnt == 2 && fold_v == 12)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -651,6 +756,8 @@ fn main {
     "collections" => case_collections()
     "opt.unwrap_none" => case_opt_unwrap_none()
     "arr.remove_oob" => case_arr_remove_oob()
+    "wave_m2.compat" => case_wave_m2_compat()
+    "wave_m2.round2" => case_wave_m2_round2()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)

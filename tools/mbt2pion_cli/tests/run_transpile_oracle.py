@@ -101,6 +101,8 @@ CASES = {
     "m12_pipe_loops_compat": ("ok", 10),
     "q2_semantics_p0": ("ok", 13),
     "q2_mechanical_compat": ("ok", 10),
+    "wave_m2_core": ("ok", 7),
+    "wave_m2_round2": ("ok", 8),
 }
 
 MOON_TRAPS = {
@@ -123,7 +125,7 @@ PION_PANICS = [
 
 # Single shared MoonBit library transpiled by `mbt2pion` AND executed directly by `moon`.
 ORACLE_LIB_MBT = r'''
-pub enum Tri {
+pub(all) enum Tri {
   Tri(Int, b~ : Int, c~ : Int)
   Empty
 }
@@ -957,6 +959,161 @@ pub fn q2_double_and_collections() -> (Int, Bool, Int, Int, Int, Int) {
   let empty_ok = if xs.is_empty() { 0 } else { xs.length() }
   (mv, nan_ok, ln, g, mid[0] + mid[1], empty_ok)
 }
+
+///| Wave M2-A: Tuple Structs, default visibility, SourceLoc positional, OrderedMap m[k]=v, hex floats, debug_inspect
+struct M2Pair[T](Int, T)
+
+pub fn m2_tuple_struct_roundtrip(a : Int, b : String) -> (Int, String, Int) {
+  let p = M2Pair(a, b)
+  let M2Pair(k, v) = p
+  let idx_sum = p.0 + k
+  (idx_sum, v, p.1.length())
+}
+
+pub fn m2_pos_loc(msg : String, loc : SourceLoc) -> String {
+  msg + ":" + loc.to_string()
+}
+
+pub fn m2_map_index_set() -> (Int, Int) {
+  let m : Map[String, Int] = {}
+  m["a"] = 10
+  m["b"] = 20
+  m["a"] = 35
+  let a = match m.get("a") { Some(v) => v; None => 0 }
+  let b = match m.get("b") { Some(v) => v; None => 0 }
+  (a, b)
+}
+
+pub fn m2_hex_floats() -> (Int64, Int64, Int64, Bool) {
+  let h1 : Double = 0x1.0p1023
+  let h2 : Double = 0x1.fp-1022
+  let h3 : Double = 0x1.0p-54
+  let inf_ok = (1.0 / 0.0).is_inf() && !(h1.is_inf())
+  (h1.reinterpret_as_int64(), h2.reinterpret_as_int64(), h3.reinterpret_as_int64(), inf_ok)
+}
+
+pub fn m2_ref_default_check() -> Int {
+  let r : Ref[Int] = { val: 40 }
+  r.val = r.val + 2
+  r.val
+}
+
+struct R2Pair(Int, Int)
+struct R2Trip(Int, Int, Int)
+
+pub fn m2_r2_tuple_match() -> (Int, Int, Int) {
+  let a = match R2Pair(1, 7) {
+    R2Pair(1, n) => n
+    R2Pair(x, n) => x + n
+  }
+  let b = match R2Pair(2, 6) {
+    R2Pair(1, n) => n
+    R2Pair(x, n) => x + n
+  }
+  let c = match R2Trip(9, 10, 11) {
+    R2Trip(x, _, _) => x
+  }
+  (a, b, c)
+}
+
+pub fn m2_r2_large_int_coerce(flag : Bool) -> (Double, Int64, Double) {
+  let n : Double = 4294967296
+  let n64 : Int64 = 4294967296
+  let e : Double = if flag { 3 } else { 4 }
+  (n, n64, e)
+}
+
+pub fn m2_r2_eq_hygiene() -> Bool {
+  let __eq_l_3 = [99]
+  let v = [1]
+  v == __eq_l_3
+}
+
+pub fn m2_r2_side_effects() -> Int {
+  let mut c = 0
+  let xs : Array[Int] = Array(capacity={ c = c + 1; 4 })
+  xs.push(1)
+  xs.release_unused(placeholder={ c = c + 10; 0 })
+  let ys : Array[Int] = Array::new(capacity={ c = c + 100; 4 })
+  let _ = ys
+  c
+}
+
+struct R2ArrPair(Array[Int], Int)
+
+pub fn m2_r2_tuple_arr_guard() -> (Int, Int, Int) {
+  let a1 = [1]
+  let r1 = match R2ArrPair(a1, 7) {
+    R2ArrPair([x], _n) if { a1[0] = 2; true } => x
+    _ => 9
+  }
+  let a2 = [1]
+  let r2 = match R2ArrPair(a2, 7) {
+    R2ArrPair([1], n) if { a2[0] = 2; true } => n
+    _ => 9
+  }
+  let a3 = [1]
+  let r3 = match R2ArrPair(a3, 7) {
+    R2ArrPair([1], _n) if { a3[0] = 2; false } => 0
+    _ => 9
+  }
+  (r1, r2, r3)
+}
+
+pub fn m2_r2_iter_fold_and_snap() -> (Int, Int) {
+  let f = [1, 2].iter().fold(init=0, fn(x, y) { x * 10 + y })
+  let xs = [1, 2]
+  let it = xs.iter()
+  xs.push(3)
+  (f, it.count())
+}
+
+pub fn m2_r2_lazy_iter() -> (Bool, Int, Bool, Int, Bool, Int, Int) {
+  let mut calls1 = 0
+  let r1 = [1, 2, 3, 4, 5, 6]
+    .iter()
+    .map(fn(x) { calls1 = calls1 + 1; x * 10 })
+    .any(fn(x) { x == 20 })
+  let mut calls2 = 0
+  let r2 = [1, 2, 3, 4, 5, 6]
+    .iter()
+    .map(fn(x) { calls2 = calls2 + 1; x * 10 })
+    .all(fn(x) { x < 30 })
+  let mut zf = 0
+  let mut zg = 0
+  let _unused = [1, 2, 3].iter().map(fn(x) { zf = zf + 1; x }).zip([10, 20, 30].iter().map(fn(y) { zg = zg + 1; y }))
+  let r3 = [1, 2, 3, 4, 5, 6]
+    .iter()
+    .map(fn(x) { zf = zf + 1; x })
+    .zip([10, 20, 30, 40, 50, 60].iter().map(fn(y) { zg = zg + 1; y }))
+    .any(fn(p) { p.0 + p.1 == 22 })
+  (r1, calls1, r2, calls2, r3, zf, zg)
+}
+
+pub(all) enum R2ShowTok {
+  Early
+  Normal
+}
+
+pub impl Show for R2ShowTok with output(self, logger) {
+  match self {
+    Early => {
+      logger.write_string("early")
+      return
+    }
+    Normal => logger.write_string("normal")
+  }
+}
+
+pub fn m2_r2_show_early_return() -> String {
+  "\{Early}:\{Normal}"
+}
+
+pub fn m2_r2_arr_add_eq_and_tuple() -> (Bool, Int, String) {
+  let eq_ok = [1, 2] + [3] == [1, 2, 3]
+  let nested = ((10, 20), 30)
+  (eq_ok, nested.0.1, ".0")
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1432,6 +1589,38 @@ fn main {
     check("q2.int_lnot", ln == -1)
     check("q2.unsafe_get_set", g == 25)
     check("q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
+  } else if kase == "wave_m2_core" {
+    let (ts1, ts2, ts3) = @m12.m2_tuple_struct_roundtrip(7, "hi")
+    let (ma, mb) = @m12.m2_map_index_set()
+    let (b1, b2, b3, inf_ok) = @m12.m2_hex_floats()
+    let rv = @m12.m2_ref_default_check()
+    trace("m2", "\{ts1},\{ts2},\{ts3},\{ma},\{mb},\{b1},\{b2},\{b3},\{inf_ok},\{rv}")
+    check("m2.tuple_struct_idx", ts1 == 14 && ts2 == "hi" && ts3 == 2)
+    check("m2.map_idx_set", ma == 35 && mb == 20)
+    check("m2.hex_1p1023", b1 == 9214364837600034816L)
+    check("m2.hex_1fp_1022", b2 == 8725724278030336L)
+    check("m2.hex_1p_54", b3 == 4363988038922010624L)
+    check("m2.double_is_inf", inf_ok)
+    check("m2.ref_default", rv == 42)
+  } else if kase == "wave_m2_round2" {
+    let (tm1, tm2, tm3) = @m12.m2_r2_tuple_match()
+    let (d_big, i64_big, d_if) = @m12.m2_r2_large_int_coerce(false)
+    let eq_h = @m12.m2_r2_eq_hygiene()
+    let se = @m12.m2_r2_side_effects()
+    let (ag1, ag2, ag3) = @m12.m2_r2_tuple_arr_guard()
+    let (ifld, isnp) = @m12.m2_r2_iter_fold_and_snap()
+    let (la1, lc1, la2, lc2, lz, lzf, lzg) = @m12.m2_r2_lazy_iter()
+    let sh = @m12.m2_r2_show_early_return()
+    let (aeq, tup, lit) = @m12.m2_r2_arr_add_eq_and_tuple()
+    trace("r2", "\{tm1},\{tm2},\{tm3},\{d_big},\{i64_big},\{d_if},\{eq_h},\{se},\{ag1}:\{ag2}:\{ag3},\{ifld}:\{isnp},\{la1}:\{lc1},\{la2}:\{lc2},\{lz}:\{lzf}:\{lzg},\{sh},\{aeq},\{tup},\{lit}")
+    check("r2.tuple_match", tm1 == 7 && tm2 == 8 && tm3 == 9 && ag1 == 1 && ag2 == 7 && ag3 == 9)
+    check("r2.large_int_double", d_big == 4294967296.0 && d_if == 4.0)
+    check("r2.large_int_i64", i64_big == 4294967296L)
+    check("r2.eq_hygiene", !eq_h)
+    check("r2.side_effects", se == 111)
+    check("r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
+    check("r2.show_return", sh == "early:normal")
+    check("r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
   } else {
     abort("unknown case: \{kase}")
   }
@@ -1924,6 +2113,38 @@ pub fn main(w : World) -> Int {
     check(w, "q2.int_lnot", ln == -1)
     check(w, "q2.unsafe_get_set", g == 25)
     check(w, "q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
+  } else if kase == "wave_m2_core" {
+    let (ts1, ts2, ts3) = m12::m2_tuple_struct_roundtrip(7, "hi")
+    let (ma, mb) = m12::m2_map_index_set()
+    let (b1, b2, b3, inf_ok) = m12::m2_hex_floats()
+    let rv = m12::m2_ref_default_check()
+    trace(w, "m2", ts1.to_string() + "," + ts2 + "," + ts3.to_string() + "," + ma.to_string() + "," + mb.to_string() + "," + b1.to_string() + "," + b2.to_string() + "," + b3.to_string() + "," + inf_ok.to_string() + "," + rv.to_string())
+    check(w, "m2.tuple_struct_idx", ts1 == 14 && ts2 == "hi" && ts3 == 2)
+    check(w, "m2.map_idx_set", ma == 35 && mb == 20)
+    check(w, "m2.hex_1p1023", b1 == 9214364837600034816L)
+    check(w, "m2.hex_1fp_1022", b2 == 8725724278030336L)
+    check(w, "m2.hex_1p_54", b3 == 4363988038922010624L)
+    check(w, "m2.double_is_inf", inf_ok)
+    check(w, "m2.ref_default", rv == 42)
+  } else if kase == "wave_m2_round2" {
+    let (tm1, tm2, tm3) = m12::m2_r2_tuple_match()
+    let (d_big, i64_big, d_if) = m12::m2_r2_large_int_coerce(false)
+    let eq_h = m12::m2_r2_eq_hygiene()
+    let se = m12::m2_r2_side_effects()
+    let (ag1, ag2, ag3) = m12::m2_r2_tuple_arr_guard()
+    let (ifld, isnp) = m12::m2_r2_iter_fold_and_snap()
+    let (la1, lc1, la2, lc2, lz, lzf, lzg) = m12::m2_r2_lazy_iter()
+    let sh = m12::m2_r2_show_early_return()
+    let (aeq, tup, lit) = m12::m2_r2_arr_add_eq_and_tuple()
+    trace(w, "r2", tm1.to_string() + "," + tm2.to_string() + "," + tm3.to_string() + "," + mbt_compat::double_to_string(d_big) + "," + i64_big.to_string() + "," + mbt_compat::double_to_string(d_if) + "," + eq_h.to_string() + "," + se.to_string() + "," + ag1.to_string() + ":" + ag2.to_string() + ":" + ag3.to_string() + "," + ifld.to_string() + ":" + isnp.to_string() + "," + la1.to_string() + ":" + lc1.to_string() + "," + la2.to_string() + ":" + lc2.to_string() + "," + lz.to_string() + ":" + lzf.to_string() + ":" + lzg.to_string() + "," + sh + "," + aeq.to_string() + "," + tup.to_string() + "," + lit)
+    check(w, "r2.tuple_match", tm1 == 7 && tm2 == 8 && tm3 == 9 && ag1 == 1 && ag2 == 7 && ag3 == 9)
+    check(w, "r2.large_int_double", d_big == 4294967296.0 && d_if == 4.0)
+    check(w, "r2.large_int_i64", i64_big == 4294967296L)
+    check(w, "r2.eq_hygiene", !eq_h)
+    check(w, "r2.side_effects", se == 111)
+    check(w, "r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
+    check(w, "r2.show_return", sh == "early:normal")
+    check(w, "r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
   } else {
     panic("abort: unknown case " + kase)
   }
