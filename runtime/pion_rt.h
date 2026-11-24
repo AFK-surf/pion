@@ -247,6 +247,12 @@ int64_t  pion_world_fs_mtime_ms(void *w, void *path_str);
 int32_t  pion_world_fs_exists(void *w, void *path_str);
 int32_t  pion_world_fs_is_dir(void *w, void *path_str);
 int32_t  pion_world_fs_mkdir_p(void *w, void *path_str);
+/* `data` if its first `len` bytes are non-empty and NUL-free, else NULL. Only
+ * those bytes are checked: the caller guarantees `data[len]` is a readable
+ * terminating NUL (as in a Pion String) and keeps the owner alive until the
+ * `const char *` consumer it feeds (pion_fs_mkdir_excl / pion_fs_trylock)
+ * returns. */
+const char* pion_fs_cpath(const char *data, int64_t len);
 int32_t  pion_fs_mkdir_excl(const char *path);
 int32_t  pion_fs_rmdir(const char *path);
 int64_t  pion_fs_trylock(const char *path);

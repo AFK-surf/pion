@@ -1604,7 +1604,14 @@ void pion_strbuf_push_str(void *sb_ptr, void *s_ptr) {
     sb->data[sb->len] = '\0';
 }
 
-void pion_strbuf_push_slice(void *sb_ptr, void *s_ptr, int64_t start, int64_t end) {
+static PION_NOINLINE PION_MINSIZE void pion_strbuf_append_raw(PionStrBuf *sb, const char *p, int64_t n) {
+    pion_strbuf_reserve(sb, n);
+    memcpy(sb->data + sb->len, p, (size_t)n);
+    sb->len += n;
+    sb->data[sb->len] = '\0';
+}
+
+PION_MINSIZE void pion_strbuf_push_slice(void *sb_ptr, void *s_ptr, int64_t start, int64_t end) {
     PionStrBuf *sb = (PionStrBuf *)sb_ptr;
     PionString *s = (PionString *)s_ptr;
     if (__builtin_expect(!sb || !s, 0)) return;
@@ -1612,11 +1619,7 @@ void pion_strbuf_push_slice(void *sb_ptr, void *s_ptr, int64_t start, int64_t en
     if (start < 0) start = 0;
     if (end > slen) end = slen;
     if (start >= end) return;
-    int64_t n = end - start;
-    pion_strbuf_reserve(sb, n);
-    memcpy(sb->data + sb->len, s->data + start, (size_t)n);
-    sb->len += n;
-    sb->data[sb->len] = '\0';
+    pion_strbuf_append_raw(sb, s->data + start, end - start);
 }
 
 void pion_strbuf_push_byte(void *sb_ptr, int32_t b) {
@@ -1647,10 +1650,7 @@ PION_MINSIZE void pion_strbuf_push_char(void *sb_ptr, int32_t cp) {
         buf[n++] = (char)(0x80 | ((cp >> 6) & 0x3F));
     }
     buf[n++] = (char)(0x80 | (cp & 0x3F));
-    pion_strbuf_reserve(sb, n);
-    memcpy(sb->data + sb->len, buf, (size_t)n);
-    sb->len += n;
-    sb->data[sb->len] = '\0';
+    pion_strbuf_append_raw(sb, buf, n);
 }
 
 void pion_strbuf_push_int(void *sb_ptr, int64_t v) {
@@ -1901,7 +1901,7 @@ PION_MINSIZE int64_t pion_arr_pop(void *a_ptr) {
     return a->data[--a->len];
 }
 
-void *pion_arr_copy(void *a_ptr) {
+PION_MINSIZE void *pion_arr_copy(void *a_ptr) {
     PionArray *a = (PionArray *)a_ptr;
     if (!a) return pion_arr_new(0, 0);
     int32_t flags = (a->elem_stride > 1) ? (a->elem_stride | (a->elem_is_obj << 8))
@@ -2637,7 +2637,7 @@ PION_MINSIZE int64_t pion_mutex_lock(void *m_ptr) {
     return m->val;
 }
 
-PION_MINSIZE void pion_mutex_set(void *m_ptr, int64_t new_val) {
+static PION_NOINLINE PION_MINSIZE void pion_mutex_set_impl(void *m_ptr, int64_t new_val, int unlock) {
     PionMutex *m = (PionMutex *)m_ptr;
     int64_t old_val = 0;
     if (m->val_is_obj) {
@@ -2648,26 +2648,18 @@ PION_MINSIZE void pion_mutex_set(void *m_ptr, int64_t new_val) {
         old_val = m->val;
     }
     m->val = new_val;
+    if (unlock) pion_mu_unlock(&m->mu);
     if (m->val_is_obj && old_val != 0) {
         pion_rc_dec((void *)(uintptr_t)old_val);
     }
 }
 
+PION_MINSIZE void pion_mutex_set(void *m_ptr, int64_t new_val) {
+    pion_mutex_set_impl(m_ptr, new_val, 0);
+}
+
 PION_MINSIZE void pion_mutex_set_and_unlock(void *m_ptr, int64_t new_val) {
-    PionMutex *m = (PionMutex *)m_ptr;
-    int64_t old_val = 0;
-    if (m->val_is_obj) {
-        if (new_val != 0) {
-            pion_rc_freeze((void *)(uintptr_t)new_val);
-            pion_rc_inc((void *)(uintptr_t)new_val);
-        }
-        old_val = m->val;
-    }
-    m->val = new_val;
-    pion_mu_unlock(&m->mu);
-    if (m->val_is_obj && old_val != 0) {
-        pion_rc_dec((void *)(uintptr_t)old_val);
-    }
+    pion_mutex_set_impl(m_ptr, new_val, 1);
 }
 
 PION_MINSIZE void pion_mutex_unlock(void *m_ptr) {
@@ -2815,10 +2807,79 @@ PION_MINSIZE void *pion_world_read_line(void *w_ptr, int32_t *ok_out) {
 #endif
 }
 
+/* The same gate for Pion code feeding the `const char *` entries
+ * (`pion_fs_mkdir_excl`, `pion_fs_trylock`, which refuse NULL): `data` while
+ * its `len` bytes are non-empty and NUL-free, else NULL. */
+PION_MINSIZE const char *pion_fs_cpath(const char *data, int64_t len) {
+    return (data && len > 0 && !memchr(data, 0, (size_t)len)) ? data : NULL;
+}
+
+/* `path_str`'s bytes as a C path, or NULL when it is missing, empty or holds
+ * an embedded NUL (the OS would silently cut the path short at it). */
+static PION_NOINLINE PION_MINSIZE const char *pion_path_cstr(void *path_str) {
+    PionString *p = (PionString *)path_str;
+    return p ? pion_fs_cpath(p->data, p->len) : NULL;
+}
+
+#ifdef _WIN32
+#ifndef WC_ERR_INVALID_CHARS
+#define WC_ERR_INVALID_CHARS 0x80
+#endif
+#define PION_WBUF 512
+#define PION_WSEP(c) ((c) == L'/' || (c) == L'\\')
+/* Strict UTF-8 -> NUL-terminated UTF-16 path, in `buf` (PION_WBUF units) or a
+ * malloc'd buffer when longer (release with pion_wfree), with room for one
+ * more unit before the NUL. NULL for an empty path, an embedded NUL or
+ * invalid UTF-8 (never replaced by U+FFFD). */
+static PION_NOINLINE PION_MINSIZE wchar_t *pion_utf8_to_wide(const char *s, size_t len, wchar_t *buf) {
+    if (!s || len == 0 || len >= (size_t)INT_MAX || memchr(s, 0, len)) return NULL;
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)len, NULL, 0);
+    if (n <= 0) return NULL;
+    wchar_t *w = n < PION_WBUF - 1 ? buf : (wchar_t *)malloc(((size_t)n + 2) * sizeof(wchar_t));
+    if (!w) return NULL;
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, s, (int)len, w, n) != n) {
+        if (w != buf) free(w);
+        return NULL;
+    }
+    w[n] = L'\0';
+    return w;
+}
+
+static PION_NOINLINE PION_MINSIZE wchar_t *pion_wpath(void *path_str, wchar_t *buf) {
+    PionString *p = (PionString *)path_str;
+    return p ? pion_utf8_to_wide(p->data, (size_t)p->len, buf) : NULL;
+}
+
+static PION_NOINLINE PION_MINSIZE void pion_wfree(wchar_t *w, const wchar_t *buf) {
+    if (w != buf) free(w);
+}
+
+/* Strict NUL-terminated UTF-16 -> owned UTF-8 String; NULL on an unpaired
+ * surrogate (never replaced by U+FFFD). */
+static PION_NOINLINE PION_MINSIZE void *pion_wide_to_str(const wchar_t *w) {
+    int n = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, NULL, 0, NULL, NULL);
+    if (n <= 0) return NULL;
+    char *s = (char *)malloc((size_t)n);
+    void *out = NULL;
+    if (s && WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, w, -1, s, n, NULL, NULL) == n) {
+        out = pion_str_from_cstr(s, (int64_t)n - 1);
+    }
+    free(s);
+    return out;
+}
+#endif
+
 static PION_NOINLINE PION_MINSIZE void *pion_read_file_obj(void *path_str, int as_bytes, int32_t *ok_out) {
     if (ok_out) *ok_out = 0;
-    PionString *path = (PionString *)path_str;
-    FILE *f = path ? fopen(path->data, "rb") : NULL;
+#ifdef _WIN32
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    FILE *f = wp ? _wfopen(wp, L"rb") : NULL;
+    pion_wfree(wp, wb);
+#else
+    const char *cpath = pion_path_cstr(path_str);
+    FILE *f = cpath ? fopen(cpath, "rb") : NULL;
+#endif
     char *buf = NULL;
     long sz = -1;
     if (f) {
@@ -2845,9 +2906,16 @@ PION_MINSIZE void *pion_world_fs_read(void *w_ptr, void *path_str, int32_t *ok_o
 
 static PION_NOINLINE PION_MINSIZE int32_t pion_write_file_raw(void *path_str, const char *mode,
                                                 const void *data, int64_t len) {
-    PionString *path = (PionString *)path_str;
-    if (!path) return 0;
-    FILE *f = fopen(path->data, mode);
+#ifdef _WIN32
+    wchar_t wb[PION_WBUF];
+    wchar_t wmode[3] = {(wchar_t)mode[0], (wchar_t)mode[1], L'\0'};
+    wchar_t *wp = pion_wpath(path_str, wb);
+    FILE *f = wp ? _wfopen(wp, wmode) : NULL;
+    pion_wfree(wp, wb);
+#else
+    const char *cpath = pion_path_cstr(path_str);
+    FILE *f = cpath ? fopen(cpath, mode) : NULL;
+#endif
     if (!f) return 0;
     size_t written = len > 0 ? fwrite(data, 1, (size_t)len, f) : 0;
     return (fclose(f) == 0 && written == (size_t)len) ? 1 : 0;
@@ -2885,8 +2953,8 @@ PION_MINSIZE static int64_t pion_win_filetime_to_ms(FILETIME ft) {
 
 #ifndef _WIN32
 static PION_NOINLINE PION_MINSIZE int pion_stat_path(void *path_str, struct stat *st) {
-    PionString *path = (PionString *)path_str;
-    return path && path->len > 0 && stat(path->data, st) == 0;
+    const char *cpath = pion_path_cstr(path_str);
+    return cpath && stat(cpath, st) == 0;
 }
 
 static inline int64_t pion_stat_mtime_ms(const struct stat *st) {
@@ -2903,11 +2971,12 @@ static inline int64_t pion_stat_mtime_ms(const struct stat *st) {
 PION_MINSIZE int64_t pion_world_fs_mtime_ms(void *w_ptr, void *path_str) {
     (void)w_ptr;
 #ifdef _WIN32
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return -1;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(path->data, GetFileExInfoStandard, &fad)) return -1;
-    return pion_win_filetime_to_ms(fad.ftLastWriteTime);
+    BOOL ok = wp && GetFileAttributesExW(wp, GetFileExInfoStandard, &fad);
+    pion_wfree(wp, wb);
+    return ok ? pion_win_filetime_to_ms(fad.ftLastWriteTime) : -1;
 #else
     struct stat st;
     return pion_stat_path(path_str, &st) ? pion_stat_mtime_ms(&st) : -1;
@@ -2916,21 +2985,25 @@ PION_MINSIZE int64_t pion_world_fs_mtime_ms(void *w_ptr, void *path_str) {
 
 PION_MINSIZE int32_t pion_world_fs_exists(void *w_ptr, void *path_str) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    if (!path) return 0;
 #ifdef _WIN32
-    return GetFileAttributesA(path->data) != INVALID_FILE_ATTRIBUTES ? 1 : 0;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    int ok = wp && GetFileAttributesW(wp) != INVALID_FILE_ATTRIBUTES;
+    pion_wfree(wp, wb);
+    return ok;
 #else
-    return access(path->data, F_OK) == 0 ? 1 : 0;
+    const char *cpath = pion_path_cstr(path_str);
+    return cpath && access(cpath, F_OK) == 0 ? 1 : 0;
 #endif
 }
 
 PION_MINSIZE int32_t pion_world_fs_is_dir(void *w_ptr, void *path_str) {
     (void)w_ptr;
 #ifdef _WIN32
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return 0;
-    DWORD attr = GetFileAttributesA(path->data);
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    DWORD attr = wp ? GetFileAttributesW(wp) : INVALID_FILE_ATTRIBUTES;
+    pion_wfree(wp, wb);
     return (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY)) ? 1 : 0;
 #else
     struct stat st;
@@ -2940,37 +3013,64 @@ PION_MINSIZE int32_t pion_world_fs_is_dir(void *w_ptr, void *path_str) {
 
 PION_MINSIZE int32_t pion_world_fs_mkdir_p(void *w_ptr, void *path_str) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return 0;
-    char *tmp = (char *)malloc((size_t)path->len + 1);
-    if (!tmp) return 0;
-    memcpy(tmp, path->data, (size_t)path->len + 1);
-    size_t len = (size_t)path->len;
 #ifdef _WIN32
-    while (len > 1 && (tmp[len - 1] == '/' || tmp[len - 1] == '\\')) {
-        if (len == 3 && tmp[1] == ':') break;
-        tmp[--len] = '\0';
+    wchar_t wb[PION_WBUF];
+    wchar_t *tmp = pion_wpath(path_str, wb);
+    if (!tmp) return 0;
+    size_t len = wcslen(tmp);
+    /* Root prefix, never created and never stripped of its separator: `X:\`,
+     * a UNC share `\\server\share\` (either slash), else the leading char. */
+    size_t start = (len >= 2 && tmp[1] == L':') ? 3u : 1u;
+    int unc = len >= 2 && PION_WSEP(tmp[0]) && PION_WSEP(tmp[1]);
+    if (unc) {
+        int seps = 0;
+        for (start = 2; start < len && seps < 2; start++) {
+            if (PION_WSEP(tmp[start])) seps++;
+        }
     }
-    size_t start = (len >= 2 && tmp[1] == ':') ? 3u : 1u;
-    for (size_t i = start; i < len; i++) {
-        if (tmp[i] == '/' || tmp[i] == '\\') {
-            char saved = tmp[i];
-            tmp[i] = '\0';
-            if (_mkdir(tmp) != 0 && errno != EEXIST) {
-                free(tmp);
-                return 0;
-            }
+    while (len > start && PION_WSEP(tmp[len - 1])) tmp[--len] = L'\0';
+    int ok = 1;
+    if (unc && len <= start) {
+        /* The share itself cannot be created: it exists when it has non-empty
+         * server and share names and GetDiskFreeSpaceExW answers for
+         * `\\server\share\` (attribute queries on a share root are not
+         * guaranteed). */
+        size_t sep = 2;
+        while (sep < len && !PION_WSEP(tmp[sep])) sep++;
+        ok = sep > 2 && sep + 1 < len && !PION_WSEP(tmp[sep + 1]);
+        for (size_t i = 0; i < len; i++) {
+            if (tmp[i] == L'/') tmp[i] = L'\\';
+        }
+        if (tmp[len - 1] != L'\\') {
+            tmp[len++] = L'\\';
+            tmp[len] = L'\0';
+        }
+        ok = ok && GetDiskFreeSpaceExW(tmp, NULL, NULL, NULL);
+        len = 0;
+    }
+    for (size_t i = start; i < len && ok; i++) {
+        if (PION_WSEP(tmp[i])) {
+            wchar_t saved = tmp[i];
+            tmp[i] = L'\0';
+            if (_wmkdir(tmp) != 0 && errno != EEXIST) ok = 0;
             tmp[i] = saved;
         }
     }
-    int ok = 1;
-    if (_mkdir(tmp) != 0) {
-        DWORD attr = GetFileAttributesA(tmp);
-        if (errno != EEXIST || attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) {
-            ok = 0;
-        }
+    if (ok && len > 0 && _wmkdir(tmp) != 0) {
+        /* An existing directory (a drive root reports EACCES, not EEXIST) is
+         * success. */
+        DWORD attr = GetFileAttributesW(tmp);
+        if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY)) ok = 0;
     }
+    pion_wfree(tmp, wb);
+    return ok;
 #else
+    const char *cpath = pion_path_cstr(path_str);
+    if (!cpath) return 0;
+    size_t len = (size_t)((PionString *)path_str)->len;
+    char *tmp = (char *)malloc(len + 1);
+    if (!tmp) return 0;
+    memcpy(tmp, cpath, len + 1);
     while (len > 1 && tmp[len - 1] == '/') {
         tmp[--len] = '\0';
     }
@@ -2990,9 +3090,9 @@ PION_MINSIZE int32_t pion_world_fs_mkdir_p(void *w_ptr, void *path_str) {
             if (!sv) break;
         }
     }
-#endif
     free(tmp);
     return ok;
+#endif
 }
 
 /* Exclusive single-directory create (no shell, no parents): 0 if this call
@@ -3000,7 +3100,11 @@ PION_MINSIZE int32_t pion_world_fs_mkdir_p(void *w_ptr, void *path_str) {
 PION_MINSIZE int32_t pion_fs_mkdir_excl(const char *path) {
     if (!path || !*path) return -1;
 #ifdef _WIN32
-    return _mkdir(path) == 0 ? 0 : -1;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_utf8_to_wide(path, strlen(path), wb);
+    int rc = (wp && _wmkdir(wp) == 0) ? 0 : -1;
+    pion_wfree(wp, wb);
+    return rc;
 #else
     return mkdir(path, 0700) == 0 ? 0 : -1;
 #endif
@@ -3010,7 +3114,11 @@ PION_MINSIZE int32_t pion_fs_mkdir_excl(const char *path) {
 PION_MINSIZE int32_t pion_fs_rmdir(const char *path) {
     if (!path || !*path) return -1;
 #ifdef _WIN32
-    return _rmdir(path) == 0 ? 0 : -1;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_utf8_to_wide(path, strlen(path), wb);
+    int rc = (wp && _wrmdir(wp) == 0) ? 0 : -1;
+    pion_wfree(wp, wb);
+    return rc;
 #else
     return rmdir(path) == 0 ? 0 : -1;
 #endif
@@ -3023,8 +3131,12 @@ PION_MINSIZE int32_t pion_fs_rmdir(const char *path) {
 PION_MINSIZE int64_t pion_fs_trylock(const char *path) {
     if (!path || !*path) return -1;
 #ifdef _WIN32
-    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_utf8_to_wide(path, strlen(path), wb);
+    HANDLE h = wp ? CreateFileW(wp, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL)
+                  : INVALID_HANDLE_VALUE;
+    pion_wfree(wp, wb);
     if (h == INVALID_HANDLE_VALUE) return -1;
     OVERLAPPED ov;
     memset(&ov, 0, sizeof ov);
@@ -3058,42 +3170,41 @@ PION_MINSIZE void pion_fs_unlock(int64_t handle) {
 #endif
 }
 
-PION_MINSIZE static int pion_str_slot_cmp(const void *a, const void *b) {
-    void *sa = (void *)(uintptr_t)(*(const int64_t *)a);
-    void *sb = (void *)(uintptr_t)(*(const int64_t *)b);
-    return (int)pion_str_cmp(sa, sb);
-}
-
 PION_MINSIZE void *pion_world_fs_list_dir(void *w_ptr, void *path_str) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
     void *arr = pion_arr_new(8, 1);
-    if (!path) return arr;
 #ifdef _WIN32
-    size_t plen = (size_t)path->len;
-    char *pat = (char *)malloc(plen + 3);
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    if (!wp) return arr;
+    size_t plen = wcslen(wp);
+    wchar_t *pat = (wchar_t *)malloc((plen + 3) * sizeof(wchar_t));
+    if (pat) memcpy(pat, wp, plen * sizeof(wchar_t));
+    pion_wfree(wp, wb);
     if (!pat) return arr;
-    memcpy(pat, path->data, plen);
-    if (plen > 0 && pat[plen - 1] != '/' && pat[plen - 1] != '\\') {
-        pat[plen++] = '\\';
+    if (pat[plen - 1] != L'/' && pat[plen - 1] != L'\\') {
+        pat[plen++] = L'\\';
     }
-    pat[plen++] = '*';
-    pat[plen] = '\0';
-    WIN32_FIND_DATAA fd;
-    HANDLE h = FindFirstFileA(pat, &fd);
+    pat[plen++] = L'*';
+    pat[plen] = L'\0';
+    WIN32_FIND_DATAW fd;
+    HANDLE h = FindFirstFileW(pat, &fd);
     free(pat);
     if (h == INVALID_HANDLE_VALUE) return arr;
     do {
-        if (strcmp(fd.cFileName, ".") == 0 || strcmp(fd.cFileName, "..") == 0) {
+        const wchar_t *fn = fd.cFileName;
+        if (fn[0] == L'.' && (fn[1] == L'\0' || (fn[1] == L'.' && fn[2] == L'\0'))) {
             continue;
         }
-        void *name = pion_str_from_cstr(fd.cFileName, (int64_t)strlen(fd.cFileName));
-        pion_arr_push(arr, (int64_t)(uintptr_t)name);
-        pion_rc_dec(name);
-    } while (FindNextFileA(h, &fd));
+        /* A name that is not valid UTF-16 (unpaired surrogate) has no UTF-8
+         * spelling and could not be opened again by path: it is omitted. */
+        void *name = pion_wide_to_str(fn);
+        if (name) pion_arr_push_owned(arr, (int64_t)(uintptr_t)name);
+    } while (FindNextFileW(h, &fd));
     FindClose(h);
 #else
-    DIR *d = opendir(path->data);
+    const char *cpath = pion_path_cstr(path_str);
+    DIR *d = cpath ? opendir(cpath) : NULL;
     if (!d) return arr;
     struct dirent *ent;
     while ((ent = readdir(d)) != NULL) {
@@ -3105,44 +3216,50 @@ PION_MINSIZE void *pion_world_fs_list_dir(void *w_ptr, void *path_str) {
     }
     closedir(d);
 #endif
-    PionArray *a = (PionArray *)arr;
-    if (a->len > 1) {
-        qsort(a->data, (size_t)a->len, sizeof(int64_t), pion_str_slot_cmp);
-    }
+    pion_arr_sort_str(arr);
     return arr;
 }
 
 PION_MINSIZE int32_t pion_world_fs_remove(void *w_ptr, void *path_str) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return 0;
 #ifdef _WIN32
-    return DeleteFileA(path->data) != 0 ? 1 : 0;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    int ok = wp && DeleteFileW(wp);
+    pion_wfree(wp, wb);
+    return ok;
 #else
-    return unlink(path->data) == 0 ? 1 : 0;
+    const char *cpath = pion_path_cstr(path_str);
+    return cpath && unlink(cpath) == 0 ? 1 : 0;
 #endif
 }
 
 PION_MINSIZE int32_t pion_world_fs_rename(void *w_ptr, void *old_path, void *new_path) {
     (void)w_ptr;
-    PionString *op = (PionString *)old_path;
-    PionString *np = (PionString *)new_path;
-    if (!op || !np || op->len == 0 || np->len == 0) return 0;
 #ifdef _WIN32
-    return MoveFileExA(op->data, np->data, MOVEFILE_REPLACE_EXISTING) != 0 ? 1 : 0;
+    wchar_t ob[PION_WBUF], nb[PION_WBUF];
+    wchar_t *wo = pion_wpath(old_path, ob);
+    wchar_t *wn = pion_wpath(new_path, nb);
+    int ok = wo && wn && MoveFileExW(wo, wn, MOVEFILE_REPLACE_EXISTING);
+    pion_wfree(wo, ob);
+    pion_wfree(wn, nb);
+    return ok;
 #else
-    return rename(op->data, np->data) == 0 ? 1 : 0;
+    const char *op = pion_path_cstr(old_path);
+    const char *np = pion_path_cstr(new_path);
+    return op && np && rename(op, np) == 0 ? 1 : 0;
 #endif
 }
 
 PION_MINSIZE int64_t pion_world_fs_size(void *w_ptr, void *path_str) {
     (void)w_ptr;
 #ifdef _WIN32
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return -1;
-    struct __stat64 st;
-    if (_stat64(path->data, &st) != 0) return -1;
-    return (int64_t)st.st_size;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    struct _stat64 st;
+    int ok = wp && _wstat64(wp, &st) == 0;
+    pion_wfree(wp, wb);
+    return ok ? (int64_t)st.st_size : -1;
 #else
     struct stat st;
     return pion_stat_path(path_str, &st) ? (int64_t)st.st_size : -1;
@@ -3166,13 +3283,14 @@ static PION_NOINLINE PION_MINSIZE void *pion_errno_str(int err) {
 PION_MINSIZE void *pion_world_fs_lstat(void *w_ptr, void *path_str, int32_t *ok_out) {
     (void)w_ptr;
     if (ok_out) *ok_out = 0;
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return pion_errno_str(EINVAL);
 #ifdef _WIN32
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    if (!wp) return pion_errno_str(EINVAL);
     WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(path->data, GetFileExInfoStandard, &fad)) {
-        return pion_errno_str(ENOENT);
-    }
+    BOOL got = GetFileAttributesExW(wp, GetFileExInfoStandard, &fad);
+    pion_wfree(wp, wb);
+    if (!got) return pion_errno_str(ENOENT);
     const char *kind = (fad.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) ? "link"
                      : (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) ? "dir"
                      : "file";
@@ -3184,8 +3302,10 @@ PION_MINSIZE void *pion_world_fs_lstat(void *w_ptr, void *path_str, int32_t *ok_
     if (ok_out) *ok_out = 1;
     return pion_str_from_cstr(buf, n > 0 ? (int64_t)n : 0);
 #else
+    const char *cpath = pion_path_cstr(path_str);
+    if (!cpath) return pion_errno_str(EINVAL);
     struct stat st;
-    if (lstat(path->data, &st) != 0) return pion_errno_str(errno);
+    if (lstat(cpath, &st) != 0) return pion_errno_str(errno);
     const char *kind = S_ISREG(st.st_mode) ? "file"
                      : S_ISDIR(st.st_mode) ? "dir"
                      : S_ISLNK(st.st_mode) ? "link"
@@ -3203,38 +3323,22 @@ PION_MINSIZE void *pion_world_fs_readlink(void *w_ptr, void *path_str, int32_t *
     (void)w_ptr;
     if (ok_out) *ok_out = 0;
 #ifdef _WIN32
-#ifndef WC_ERR_INVALID_CHARS
-#define WC_ERR_INVALID_CHARS 0x80
-#endif
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len <= 0 || path->len > INT_MAX ||
-        memchr(path->data, '\0', (size_t)path->len) != NULL) {
-        return pion_errno_str(EINVAL);
-    }
-    int wlen = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                                   path->data, (int)path->len, NULL, 0);
-    if (wlen <= 0) return pion_errno_str(EINVAL);
-    wchar_t *wp = (wchar_t *)malloc(((size_t)wlen + 1) * sizeof(wchar_t));
-    if (!wp) return pion_errno_str(ENOMEM);
-    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS,
-                            path->data, (int)path->len, wp, wlen) != wlen) {
-        free(wp);
-        return pion_errno_str(EINVAL);
-    }
-    wp[wlen] = L'\0';
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    if (!wp) return pion_errno_str(EINVAL);
     DWORD attr = GetFileAttributesW(wp);
     if (attr == INVALID_FILE_ATTRIBUTES) {
-        free(wp);
+        pion_wfree(wp, wb);
         return pion_errno_str(ENOENT);
     }
     if (!(attr & FILE_ATTRIBUTE_REPARSE_POINT)) {
-        free(wp);
+        pion_wfree(wp, wb);
         return pion_errno_str(EINVAL);
     }
     HANDLE h = CreateFileW(wp, 0,
                            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                            NULL, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, NULL);
-    free(wp);
+    pion_wfree(wp, wb);
     if (h == INVALID_HANDLE_VALUE) return pion_errno_str(ENOENT);
     DWORD cap = 260;
     wchar_t *wbuf = NULL;
@@ -3255,6 +3359,7 @@ PION_MINSIZE void *pion_world_fs_readlink(void *w_ptr, void *path_str, int32_t *
         free(wbuf);
         return pion_errno_str(err);
     }
+    wbuf[n] = L'\0';
     wchar_t *src = wbuf;
     DWORD slen = n;
     if (slen >= 8 && memcmp(src, L"\\\\?\\UNC\\", 8 * sizeof(wchar_t)) == 0) {
@@ -3269,38 +3374,21 @@ PION_MINSIZE void *pion_world_fs_readlink(void *w_ptr, void *path_str, int32_t *
         free(wbuf);
         return pion_errno_str(EINVAL);
     }
-    int u8len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                                    src, (int)slen, NULL, 0, NULL, NULL);
-    if (u8len <= 0) {
-        free(wbuf);
-        return pion_errno_str(EINVAL);
-    }
-    char *u8buf = (char *)malloc((size_t)u8len);
-    if (!u8buf) {
-        free(wbuf);
-        return pion_errno_str(ENOMEM);
-    }
-    if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS,
-                            src, (int)slen, u8buf, u8len, NULL, NULL) != u8len) {
-        free(u8buf);
-        free(wbuf);
-        return pion_errno_str(EINVAL);
-    }
-    void *out = pion_str_from_cstr(u8buf, (int64_t)u8len);
-    free(u8buf);
+    void *out = pion_wide_to_str(src);
     free(wbuf);
+    if (!out) return pion_errno_str(EINVAL);
     if (ok_out) *ok_out = 1;
     return out;
 #else
-    PionString *path = (PionString *)path_str;
+    const char *cpath = pion_path_cstr(path_str);
     int err = EINVAL;
     char *buf = NULL;
-    if (path && path->len > 0) {
+    if (cpath) {
         for (size_t cap = 256; ; cap *= 2) {
             char *nb = (char *)realloc(buf, cap);
             if (!nb) { err = ENOMEM; break; }
             buf = nb;
-            ssize_t n = readlink(path->data, buf, cap);
+            ssize_t n = readlink(cpath, buf, cap);
             if (n < 0) { err = errno; break; }
             if ((size_t)n < cap) {
                 void *out = pion_str_from_cstr(buf, (int64_t)n);
@@ -3318,24 +3406,28 @@ PION_MINSIZE void *pion_world_fs_readlink(void *w_ptr, void *path_str, int32_t *
 
 PION_MINSIZE int32_t pion_world_fs_symlink(void *w_ptr, void *target_str, void *linkpath_str) {
     (void)w_ptr;
-    PionString *target = (PionString *)target_str;
-    PionString *linkpath = (PionString *)linkpath_str;
-    if (!target || !linkpath || target->len == 0 || linkpath->len == 0) return 0;
 #ifdef _WIN32
+    (void)target_str;
+    (void)linkpath_str;
     return 0;
 #else
-    return symlink(target->data, linkpath->data) == 0 ? 1 : 0;
+    const char *target = pion_path_cstr(target_str);
+    const char *linkpath = pion_path_cstr(linkpath_str);
+    return target && linkpath && symlink(target, linkpath) == 0 ? 1 : 0;
 #endif
 }
 
 PION_MINSIZE int32_t pion_world_fs_chmod(void *w_ptr, void *path_str, int32_t mode) {
     (void)w_ptr;
-    PionString *path = (PionString *)path_str;
-    if (!path || path->len == 0) return 0;
 #ifdef _WIN32
-    return _chmod(path->data, (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD) == 0 ? 1 : 0;
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    int ok = wp && _wchmod(wp, (mode & 0200) ? (_S_IREAD | _S_IWRITE) : _S_IREAD) == 0;
+    pion_wfree(wp, wb);
+    return ok;
 #else
-    return chmod(path->data, (mode_t)mode) == 0 ? 1 : 0;
+    const char *cpath = pion_path_cstr(path_str);
+    return cpath && chmod(cpath, (mode_t)mode) == 0 ? 1 : 0;
 #endif
 }
 
@@ -3350,28 +3442,27 @@ PION_MINSIZE void *pion_world_fs_read_range_nofollow(void *w_ptr, void *path_str
                                                      int64_t expected_size, int32_t *ok_out) {
     (void)w_ptr;
     if (ok_out) *ok_out = 0;
-    PionString *path = (PionString *)path_str;
     PionBytes *out = NULL;
 #ifdef _WIN32
-    if (!path || path->len == 0 || offset < 0 || length < 0 || expected_size < 0 ||
+    if (offset < 0 || length < 0 || expected_size < 0 ||
         offset > expected_size || length > expected_size - offset) {
         return pion_str_from_cstr("changed", 7);
     }
-    WIN32_FILE_ATTRIBUTE_DATA fad;
-    if (!GetFileAttributesExA(path->data, GetFileExInfoStandard, &fad) ||
-        (fad.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT))) {
-        return pion_str_from_cstr("changed", 7);
-    }
-    int64_t fsz = ((int64_t)fad.nFileSizeHigh << 32) | (int64_t)fad.nFileSizeLow;
-    if (fsz != expected_size) return pion_str_from_cstr("changed", 7);
-    HANDLE h = CreateFileA(path->data, GENERIC_READ,
-                           FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                           NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    /* Open the link itself (never its target), then check the opened object:
+     * no TOCTOU window between the check and the read. */
+    wchar_t wb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, wb);
+    HANDLE h = wp ? CreateFileW(wp, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                NULL, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, NULL)
+                  : INVALID_HANDLE_VALUE;
+    pion_wfree(wp, wb);
     if (h == INVALID_HANDLE_VALUE) return pion_str_from_cstr("changed", 7);
-    LARGE_INTEGER li_sz;
+    BY_HANDLE_FILE_INFORMATION bhfi;
     LARGE_INTEGER li_off;
     li_off.QuadPart = offset;
-    if (!GetFileSizeEx(h, &li_sz) || li_sz.QuadPart != expected_size ||
+    if (!GetFileInformationByHandle(h, &bhfi) ||
+        (bhfi.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) ||
+        (((int64_t)bhfi.nFileSizeHigh << 32) | (int64_t)bhfi.nFileSizeLow) != expected_size ||
         !SetFilePointerEx(h, li_off, NULL, FILE_BEGIN)) {
         CloseHandle(h);
         return pion_str_from_cstr("changed", 7);
@@ -3393,12 +3484,13 @@ PION_MINSIZE void *pion_world_fs_read_range_nofollow(void *w_ptr, void *path_str
 #else
     int fd = -1;
     struct stat st;
-    if (!path || path->len == 0 || offset < 0 || length < 0 || expected_size < 0 ||
+    const char *cpath = pion_path_cstr(path_str);
+    if (!cpath || offset < 0 || length < 0 || expected_size < 0 ||
         offset > expected_size || length > expected_size - offset ||
-        lstat(path->data, &st) != 0 || !pion_stat_is_reg_size(&st, expected_size)) {
+        lstat(cpath, &st) != 0 || !pion_stat_is_reg_size(&st, expected_size)) {
         goto changed;
     }
-    fd = open(path->data, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
+    fd = open(cpath, O_RDONLY | O_NOFOLLOW | O_NONBLOCK | O_CLOEXEC);
     if (fd < 0 || fstat(fd, &st) != 0 || !pion_stat_is_reg_size(&st, expected_size)) {
         goto changed;
     }
@@ -3467,9 +3559,8 @@ PION_MINSIZE void *pion_fs_mmap_ro(void *path_str, int32_t *ok_out) {
     pion_rc_dec(res);
     return pion_str_from_cstr("fs_mmap_ro failed", 17);
 #else
-    PionString *path = (PionString *)path_str;
-    const char *err = "fs_mmap_ro failed";
-    int fd = (path && path->len > 0) ? open(path->data, O_RDONLY) : -1;
+    const char *cpath = pion_path_cstr(path_str);
+    int fd = cpath ? open(cpath, O_RDONLY) : -1;
     if (fd < 0) goto fail;
     struct stat st;
     if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode)) { close(fd); goto fail; }
@@ -3489,7 +3580,7 @@ PION_MINSIZE void *pion_fs_mmap_ro(void *path_str, int32_t *ok_out) {
     if (ok_out) *ok_out = 1;
     return b;
 fail:
-    return pion_str_from_cstr(err, (int64_t)strlen(err));
+    return pion_str_from_cstr("fs_mmap_ro failed", 17);
 #endif
 }
 
@@ -3509,25 +3600,51 @@ PION_MINSIZE int64_t pion_clock_monotonic_us(void) {
 
 PION_MINSIZE int32_t pion_fs_write_atomic_bytes(void *path_str, void *bytes_obj) {
     static _Atomic uint64_t pion_atomic_tmp_seq = 0;
-    PionString *path = (PionString *)path_str;
+    const char *cpath = pion_path_cstr(path_str);
     PionBytes *b = (PionBytes *)bytes_obj;
-    if (!path || path->len == 0 || !b) return 0;
+    if (!cpath || !b) return 0;
     uint64_t seq = atomic_fetch_add_explicit(&pion_atomic_tmp_seq, 1, memory_order_relaxed);
-    size_t tcap = (size_t)path->len + 48;
+    size_t tcap = (size_t)((PionString *)path_str)->len + 48;
     char *tmp = (char *)malloc(tcap);
     if (!tmp) return 0;
 #ifdef _WIN32
-    snprintf(tmp, tcap, "%s.piontmp.%lu.%llu", path->data, (unsigned long)_getpid(), (unsigned long long)seq);
-    FILE *f = fopen(tmp, "wb");
-    if (!f) { free(tmp); return 0; }
-    size_t written = b->len > 0 ? fwrite(b->data, 1, (size_t)b->len, f) : 0;
-    int ok = (fclose(f) == 0 && written == (size_t)b->len);
-    if (ok && !MoveFileExA(tmp, path->data, MOVEFILE_REPLACE_EXISTING)) ok = 0;
-    if (!ok) DeleteFileA(tmp);
+    /* The temporary file is created exclusively (CREATE_NEW): an existing file
+     * with the candidate name is never truncated or deleted, the next name is
+     * tried instead. Only a file this call created is ever removed. */
+    wchar_t tb[PION_WBUF], pb[PION_WBUF];
+    wchar_t *wp = pion_wpath(path_str, pb);
+    wchar_t *wt = NULL;
+    HANDLE h = INVALID_HANDLE_VALUE;
+    for (int tries = 0; wp && tries < 16; tries++) {
+        snprintf(tmp, tcap, "%s.piontmp.%lu.%llu", cpath, (unsigned long)_getpid(), (unsigned long long)seq);
+        wt = pion_utf8_to_wide(tmp, strlen(tmp), tb);
+        if (!wt) break;
+        h = CreateFileW(wt, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+        if (h != INVALID_HANDLE_VALUE || GetLastError() != ERROR_FILE_EXISTS) break;
+        pion_wfree(wt, tb);
+        wt = NULL;
+        seq = atomic_fetch_add_explicit(&pion_atomic_tmp_seq, 1, memory_order_relaxed);
+    }
     free(tmp);
-    return ok ? 1 : 0;
+    int ok = 0;
+    if (h != INVALID_HANDLE_VALUE) {
+        ok = 1;
+        for (int64_t off = 0; ok && off < b->len; ) {
+            DWORD chunk = (b->len - off) > 0x7fffffffLL ? 0x7fffffffu : (DWORD)(b->len - off);
+            DWORD n = 0;
+            if (!WriteFile(h, b->data + off, chunk, &n, NULL) || n == 0) ok = 0;
+            off += (int64_t)n;
+        }
+        if (ok && !FlushFileBuffers(h)) ok = 0;
+        if (!CloseHandle(h)) ok = 0;
+        if (ok && !MoveFileExW(wt, wp, MOVEFILE_REPLACE_EXISTING)) ok = 0;
+        if (!ok) DeleteFileW(wt);
+    }
+    pion_wfree(wt, tb);
+    pion_wfree(wp, pb);
+    return ok;
 #else
-    snprintf(tmp, tcap, "%s.piontmp.%ld.%llu", path->data, (long)getpid(), (unsigned long long)seq);
+    snprintf(tmp, tcap, "%s.piontmp.%ld.%llu", cpath, (long)getpid(), (unsigned long long)seq);
     int fd = open(tmp, O_WRONLY | O_CREAT | O_EXCL, 0644);
     if (fd < 0) { free(tmp); return 0; }
     int ok = 1;
@@ -3543,7 +3660,7 @@ PION_MINSIZE int32_t pion_fs_write_atomic_bytes(void *path_str, void *bytes_obj)
     }
     if (ok && fsync(fd) != 0) ok = 0;
     if (close(fd) != 0) ok = 0;
-    if (ok && rename(tmp, path->data) != 0) ok = 0;
+    if (ok && rename(tmp, cpath) != 0) ok = 0;
     if (!ok) unlink(tmp);
     free(tmp);
     return ok ? 1 : 0;
@@ -3687,8 +3804,8 @@ static PION_MINSIZE char *pion_exec_capture_raw(void *argv_arr, int silence_stde
     SetHandleInformation(rd, HANDLE_FLAG_INHERIT, 0);
     HANDLE nul_h = INVALID_HANDLE_VALUE;
     if (silence_stderr) {
-        nul_h = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
-                            &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+        nul_h = CreateFileW(L"NUL", GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                             &sa, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
     }
     STARTUPINFOA si;
     PROCESS_INFORMATION pi;
@@ -4185,10 +4302,7 @@ PION_MINSIZE int32_t pion_tcp_read_nb(void *w_ptr, int32_t fd, void *sb_ptr, int
         n = recv(pion_to_sock(fd), buf, cap, 0);
     } while (n == SOCKET_ERROR && WSAGetLastError() == WSAEINTR);
     if (n > 0) {
-        pion_strbuf_reserve(sb, (int64_t)n);
-        memcpy(sb->data + sb->len, buf, (size_t)n);
-        sb->len += (int64_t)n;
-        sb->data[sb->len] = '\0';
+        pion_strbuf_append_raw(sb, buf, (int64_t)n);
         return (int32_t)n;
     }
     if (n == 0) return 0;
@@ -4532,10 +4646,7 @@ PION_MINSIZE int32_t pion_tcp_read_nb(void *w_ptr, int32_t fd, void *sb_ptr, int
         n = recv(fd, buf, cap, 0);
     } while (n < 0 && errno == EINTR);
     if (n > 0) {
-        pion_strbuf_reserve(sb, (int64_t)n);
-        memcpy(sb->data + sb->len, buf, (size_t)n);
-        sb->len += (int64_t)n;
-        sb->data[sb->len] = '\0';
+        pion_strbuf_append_raw(sb, buf, (int64_t)n);
         return (int32_t)n;
     }
     if (n == 0) return 0;
@@ -4713,7 +4824,7 @@ PION_MINSIZE void pion_sleep_ms(void *w_ptr, int32_t ms) {
 #include <immintrin.h>
 #endif
 
-static PION_NOINLINE void *pion_simd_slice(
+static PION_NOINLINE PION_MINSIZE void *pion_simd_slice(
     void *obj, int32_t is_bytes, int32_t elem_stride, int32_t off, int64_t need) {
     int64_t len;
     uint8_t *data;

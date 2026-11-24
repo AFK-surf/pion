@@ -21,6 +21,11 @@
 #define pion_test_getpid() ((int)_getpid())
 #define pion_test_unlink(p) _unlink(p)
 #define pion_test_rmdir(p) _rmdir(p)
+static int pion_test_rmdir_u8(const char *p) {
+    wchar_t w[1024];
+    if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, p, -1, w, 1024) <= 0) return -1;
+    return RemoveDirectoryW(w) ? 0 : -1;
+}
 #define PION_TEST_SH "sh"
 #define PION_TEST_TRUE "true"
 static const char *pion_test_tmpdir(void) {
@@ -62,6 +67,7 @@ static const char *pion_test_tmpdir(void) {
 #define pion_test_getpid() ((int)getpid())
 #define pion_test_unlink(p) unlink(p)
 #define pion_test_rmdir(p) rmdir(p)
+#define pion_test_rmdir_u8(p) rmdir(p)
 #define PION_TEST_SH "/bin/sh"
 #define PION_TEST_TRUE "/usr/bin/true"
 static const char *pion_test_tmpdir(void) {
@@ -3388,6 +3394,451 @@ static void test_p71c_hashdos_bit63_noncollision(void) {
     printf("[PASS] p71c_hashdos_bit63_noncollision (%d bit-63 attack keys insert+lookup: %.2f ms)\n", n, dt);
 }
 
+/* UTF-8 paths through every runtime file API (UTF-16 wide APIs on Windows),
+ * and paths with an embedded NUL refused while their length is still known:
+ * `<prefix>\0<suffix>` must fail and never touch `<prefix>` on disk. */
+static void *u8s(const char *a, const char *b) {
+    char buf[1400];
+    int n = snprintf(buf, sizeof(buf), "%s%s", a, b);
+    assert(n > 0 && (size_t)n < sizeof(buf));
+    return pion_str_from_cstr(buf, n);
+}
+
+static void *u8s_nul(const char *prefix, const char *suffix) {
+    char buf[1400];
+    size_t pl = strlen(prefix), sl = strlen(suffix);
+    assert(pl + 1 + sl < sizeof(buf));
+    memcpy(buf, prefix, pl);
+    buf[pl] = '\0';
+    memcpy(buf + pl + 1, suffix, sl);
+    return pion_str_from_cstr(buf, (int64_t)(pl + 1 + sl));
+}
+
+static int u8_str_is(void *s, const char *want) {
+    void *w = pion_str_from_cstr(want, -1);
+    int eq = pion_str_eq(s, w) == 1;
+    pion_rc_dec(w);
+    return eq;
+}
+
+static void test_utf8_paths_and_embedded_nul(int argc, char **argv) {
+    void *w = pion_world_init(argc, argv);
+    int32_t ok = 0;
+    char root[600];
+    snprintf(root, sizeof(root), "%s/pion_u8_%d", pion_test_tmpdir(), pion_test_getpid());
+#ifdef _WIN32
+    /* Exercise drive-letter paths spelled with forward slashes (C:/...). */
+    if (root[0] && root[1] == ':') {
+        for (char *q = root; *q; q++) if (*q == '\\') *q = '/';
+    }
+#endif
+    /* Chinese, a space and a non-BMP emoji (a UTF-16 surrogate pair). */
+    char dir[700];
+    snprintf(dir, sizeof(dir), "%s/中文 目录 \xF0\x9F\x9A\x80", root);
+    void *dir_s = pion_str_from_cstr(dir, -1);
+    void *sub_s = u8s(dir, "/子目录");
+    assert(pion_world_fs_mkdir_p(w, sub_s) == 1);
+    assert(pion_world_fs_mkdir_p(w, sub_s) == 1);
+    assert(pion_world_fs_is_dir(w, dir_s) == 1 && pion_world_fs_is_dir(w, sub_s) == 1);
+    assert(pion_world_fs_exists(w, sub_s) == 1);
+
+    /* File named with CJK Extension B U+20000 (also a surrogate pair). */
+    char file[800];
+    snprintf(file, sizeof(file), "%s/文件 \xF0\xA0\x80\x80.txt", dir);
+    void *file_s = pion_str_from_cstr(file, -1);
+    void *body = pion_str_from_cstr("héllo 🚀 world\n", -1);
+    int64_t blen = pion_str_len(body);
+    assert(pion_world_fs_mtime_ms(w, file_s) == -1);
+    assert(pion_world_fs_write(w, file_s, body) == 1);
+    assert(pion_world_fs_exists(w, file_s) == 1 && pion_world_fs_is_dir(w, file_s) == 0);
+    assert(pion_world_fs_size(w, file_s) == blen);
+    assert(pion_world_fs_mtime_ms(w, file_s) > 1700000000000LL);
+    void *rd = pion_world_fs_read(w, file_s, &ok);
+    assert(ok == 1 && pion_str_eq(rd, body) == 1);
+    pion_rc_dec(rd);
+    assert(pion_world_fs_append(w, file_s, body) == 1);
+    assert(pion_world_fs_size(w, file_s) == 2 * blen);
+    void *ls = pion_world_fs_lstat(w, file_s, &ok);
+    assert(ok == 1 && strncmp(((PionString *)ls)->data, "file|", 5) == 0);
+    pion_rc_dec(ls);
+    ls = pion_world_fs_lstat(w, dir_s, &ok);
+    assert(ok == 1 && strncmp(((PionString *)ls)->data, "dir|", 4) == 0);
+    pion_rc_dec(ls);
+    assert(pion_world_fs_chmod(w, file_s, 0644) == 1);
+
+    /* Bytes, atomic replace, nofollow range read and read-only map. */
+    void *bytes = pion_bytes_new(6);
+    for (int i = 0; i < 6; i++) pion_bytes_set(bytes, i, 'A' + i);
+    assert(pion_world_fs_write_bytes(w, file_s, bytes) == 1);
+    void *rb = pion_world_fs_read_bytes(w, file_s, &ok);
+    assert(ok == 1 && pion_bytes_len(rb) == 6 && pion_bytes_get(rb, 5) == 'F');
+    pion_rc_dec(rb);
+    for (int i = 0; i < 6; i++) pion_bytes_set(bytes, i, 'a' + i);
+    assert(pion_fs_write_atomic_bytes(file_s, bytes) == 1);
+    assert(pion_fs_write_atomic_bytes(file_s, bytes) == 1);
+    void *rng = pion_world_fs_read_range_nofollow(w, file_s, 2, 3, 6, &ok);
+    assert(ok == 1 && pion_bytes_len(rng) == 3 && pion_bytes_get(rng, 0) == 'c' &&
+           pion_bytes_get(rng, 2) == 'e');
+    pion_rc_dec(rng);
+    void *mm = pion_fs_mmap_ro(file_s, &ok);
+    assert(ok == 1 && pion_bytes_len(mm) == 6 && pion_bytes_get(mm, 1) == 'b');
+    pion_rc_dec(mm);
+
+    /* Listing converts names back to UTF-8 and sorts them by bytes. */
+    const char *names[] = {"c.txt", "b-\xC3\xA9.txt", "a-\xF0\x9F\x9A\x80.txt"};
+    for (int i = 0; i < 3; i++) {
+        char nb[16];
+        snprintf(nb, sizeof(nb), "/%s", names[i]);
+        void *ps = u8s(dir, nb);
+        assert(pion_world_fs_write(w, ps, body) == 1);
+        pion_rc_dec(ps);
+    }
+    const char *sorted[] = {"a-\xF0\x9F\x9A\x80.txt", "b-\xC3\xA9.txt", "c.txt",
+                            "子目录", "文件 \xF0\xA0\x80\x80.txt"};
+#ifdef _WIN32
+    /* An entry that is not valid UTF-16 (unpaired surrogate) is omitted. */
+    wchar_t lone[1024];
+    int wl = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, dir, -1, lone, 1000);
+    assert(wl > 0);
+    lone[wl - 1] = L'/';
+    lone[wl] = L'x';
+    lone[wl + 1] = (wchar_t)0xD800;
+    lone[wl + 2] = L'\0';
+    HANDLE lh = CreateFileW(lone, GENERIC_WRITE, 0, NULL, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (lh != INVALID_HANDLE_VALUE) CloseHandle(lh);
+#endif
+    void *ents = pion_world_fs_list_dir(w, dir_s);
+    assert(pion_arr_len(ents) == 5);
+    for (int i = 0; i < 5; i++) {
+        assert(u8_str_is((void *)(uintptr_t)pion_arr_get(ents, i), sorted[i]));
+    }
+    pion_rc_dec(ents);
+#ifdef _WIN32
+    if (lh != INVALID_HANDLE_VALUE) assert(DeleteFileW(lone));
+#endif
+
+    /* Exclusive mkdir, rmdir and the kernel file lock on UTF-8 names. */
+    char excl[800], excl_rm[800], lockp[800];
+    snprintf(excl, sizeof(excl), "%s/独占 \xF0\x9F\x94\x92", dir);
+    snprintf(excl_rm, sizeof(excl_rm), "%s/删目录 \xF0\x9F\x94\x92", dir);
+    snprintf(lockp, sizeof(lockp), "%s/锁 \xF0\x9F\x94\x92.flock", dir);
+    assert(pion_fs_mkdir_excl(excl) == 0);
+    assert(pion_fs_mkdir_excl(excl) == -1);
+    void *excl_s = pion_str_from_cstr(excl, -1);
+    assert(pion_world_fs_is_dir(w, excl_s) == 1);
+    assert(pion_fs_mkdir_excl(excl_rm) == 0);
+    void *excl_rm_s = pion_str_from_cstr(excl_rm, -1);
+    assert(pion_world_fs_is_dir(w, excl_rm_s) == 1);
+    assert(pion_fs_rmdir(excl_rm) == 0);
+    assert(pion_fs_rmdir(excl_rm) == -1);
+    assert(pion_world_fs_exists(w, excl_rm_s) == 0);
+    pion_rc_dec(excl_rm_s);
+    int64_t lk = pion_fs_trylock(lockp);
+    assert(lk >= 0);
+    assert(pion_fs_trylock(lockp) == -1);
+    pion_fs_unlock(lk);
+    lk = pion_fs_trylock(lockp);
+    assert(lk >= 0);
+    pion_fs_unlock(lk);
+    void *lock_s = pion_str_from_cstr(lockp, -1);
+    assert(pion_world_fs_exists(w, lock_s) == 1);
+
+    /* Rename between UTF-8 names (replacing an existing target), then delete. */
+    void *moved_s = u8s(dir, "/移动 \xF0\x9F\x9A\x80.bin");
+    assert(pion_world_fs_write(w, moved_s, body) == 1);
+    assert(pion_world_fs_rename(w, file_s, moved_s) == 1);
+    assert(pion_world_fs_exists(w, file_s) == 0 && pion_world_fs_size(w, moved_s) == 6);
+
+    /* Embedded NUL: refused, and `<prefix>` is never created, read or removed. */
+    void *real_s = u8s(dir, "/real");
+    assert(pion_world_fs_write(w, real_s, body) == 1);
+    char realp[800], ghost[800];
+    snprintf(realp, sizeof(realp), "%s/real", dir);
+    snprintf(ghost, sizeof(ghost), "%s/ghost", dir);
+    void *ghost_s = pion_str_from_cstr(ghost, -1);
+    void *real_nul = u8s_nul(realp, "junk");
+    void *ghost_nul = u8s_nul(ghost, "x/y");
+    void *dir_nul = u8s_nul(dir, "zz");
+    assert(pion_world_fs_exists(w, real_nul) == 0);
+    assert(pion_world_fs_is_dir(w, dir_nul) == 0);
+    assert(pion_world_fs_size(w, real_nul) == -1);
+    assert(pion_world_fs_mtime_ms(w, real_nul) == -1);
+    void *r = pion_world_fs_read(w, real_nul, &ok);
+    assert(ok == 0);
+    pion_rc_dec(r);
+    r = pion_world_fs_read_bytes(w, real_nul, &ok);
+    assert(ok == 0);
+    pion_rc_dec(r);
+    r = pion_world_fs_lstat(w, real_nul, &ok);
+    assert(ok == 0);
+    pion_rc_dec(r);
+    r = pion_world_fs_readlink(w, real_nul, &ok);
+    assert(ok == 0);
+    pion_rc_dec(r);
+    r = pion_world_fs_read_range_nofollow(w, real_nul, 0, 1, blen, &ok);
+    assert(ok == 0);
+    pion_rc_dec(r);
+    r = pion_fs_mmap_ro(real_nul, &ok);
+    assert(ok == 0);
+    pion_rc_dec(r);
+    r = pion_world_fs_list_dir(w, dir_nul);
+    assert(pion_arr_len(r) == 0);
+    pion_rc_dec(r);
+    assert(pion_world_fs_chmod(w, real_nul, 0644) == 0);
+    assert(pion_world_fs_remove(w, real_nul) == 0);
+    assert(pion_world_fs_exists(w, real_s) == 1);
+    assert(pion_world_fs_rename(w, real_nul, ghost_s) == 0);
+    assert(pion_world_fs_rename(w, real_s, ghost_nul) == 0);
+    assert(pion_world_fs_exists(w, real_s) == 1);
+    assert(pion_world_fs_write(w, ghost_nul, body) == 0);
+    assert(pion_world_fs_write_bytes(w, ghost_nul, bytes) == 0);
+    assert(pion_world_fs_append(w, ghost_nul, body) == 0);
+    assert(pion_fs_write_atomic_bytes(ghost_nul, bytes) == 0);
+    assert(pion_world_fs_mkdir_p(w, ghost_nul) == 0);
+    assert(pion_world_fs_symlink(w, real_s, ghost_nul) == 0);
+    assert(pion_world_fs_symlink(w, real_nul, ghost_s) == 0);
+    /* The `const char *` entries are fed through pion_fs_cpath, which refuses
+     * the NUL path; both entries refuse NULL. */
+    PionString *gn = (PionString *)ghost_nul;
+    PionString *gs = (PionString *)ghost_s;
+    assert(pion_fs_cpath(gn->data, gn->len) == NULL);
+    assert(pion_fs_cpath(gs->data, gs->len) == gs->data);
+    assert(pion_fs_cpath(gs->data, 0) == NULL && pion_fs_cpath(NULL, 4) == NULL);
+    assert(pion_fs_mkdir_excl(pion_fs_cpath(gn->data, gn->len)) == -1);
+    assert(pion_fs_rmdir(pion_fs_cpath(gn->data, gn->len)) == -1);
+    assert(pion_fs_trylock(pion_fs_cpath(gn->data, gn->len)) == -1);
+    assert(pion_fs_canon_path(pion_fs_cpath(gn->data, gn->len)) == NULL);
+    assert(pion_world_fs_exists(w, ghost_s) == 0);
+    ls = pion_world_fs_lstat(w, ghost_s, &ok);
+    assert(ok == 0);
+    pion_rc_dec(ls);
+    ents = pion_world_fs_list_dir(w, dir_s);
+    for (int64_t i = 0; i < pion_arr_len(ents); i++) {
+        void *e = (void *)(uintptr_t)pion_arr_get(ents, i);
+        assert(!u8_str_is(e, "ghost"));
+        assert(strncmp(((PionString *)e)->data, "ghost.piontmp", 13) != 0);
+    }
+    pion_rc_dec(ents);
+
+#ifdef _WIN32
+    /* Invalid UTF-8 never reaches the OS (no U+FFFD substitution). */
+    const char *bad[] = {"/bad\xFF\xFE.txt", "/cesu\xED\xA0\x80.txt", "/over\xC0\xAF.txt",
+                         "/cut\xF0\x9F\x9A.txt"};
+    for (int i = 0; i < 4; i++) {
+        void *bs = u8s(dir, bad[i]);
+        assert(pion_world_fs_write(w, bs, body) == 0);
+        assert(pion_world_fs_mkdir_p(w, bs) == 0);
+        assert(pion_world_fs_exists(w, bs) == 0);
+        pion_rc_dec(bs);
+    }
+    char badc[800];
+    snprintf(badc, sizeof(badc), "%s/bad\xFF", dir);
+    assert(pion_fs_mkdir_excl(badc) == -1);
+    assert(pion_fs_rmdir(badc) == -1);
+    assert(pion_fs_trylock(badc) == -1);
+    assert(pion_fs_canon_path(badc) == NULL);
+    ents = pion_world_fs_list_dir(w, dir_s);
+    assert(pion_arr_len(ents) == 8);
+    pion_rc_dec(ents);
+#endif
+
+#ifdef _WIN32
+    /* UNC paths: mkdir_p starts after `\\server\share\` (either slash) and
+     * accepts the share itself. The local admin share needs the runner to
+     * expose it, so whether it ran is printed; PION_REQUIRE_WIN_UNC=1 makes
+     * any skip (including a non-drive temp dir) a hard failure. */
+    {
+        const char *req = getenv("PION_REQUIRE_WIN_UNC");
+        int require_unc = req && strcmp(req, "1") == 0;
+        int unc_exercised = 0;
+        if (dir[1] == ':') {
+            char share[24], share_sl[32], probe[900], unc[960], local[960];
+            snprintf(share, sizeof(share), "//127.0.0.1/%c$", dir[0]);
+            snprintf(share_sl, sizeof(share_sl), "%s/", share);
+            snprintf(probe, sizeof(probe), "%s%s", share, dir + 2);
+            snprintf(unc, sizeof(unc), "%s/unc 目录/a/b", probe);
+            snprintf(local, sizeof(local), "%s/unc 目录/a/b", dir);
+            void *probe_s = pion_str_from_cstr(probe, -1);
+            if (pion_world_fs_is_dir(w, probe_s)) {
+                const char *roots[] = {share, share_sl};
+                for (int i = 0; i < 2; i++) {
+                    void *rs = pion_str_from_cstr(roots[i], -1);
+                    assert(pion_world_fs_mkdir_p(w, rs) == 1);
+                    pion_rc_dec(rs);
+                }
+                const char *missing[] = {"//127.0.0.1/__pion_no_such_share__",
+                                         "//127.0.0.1/__pion_no_such_share__/", "//127.0.0.1", "//"};
+                for (int i = 0; i < 4; i++) {
+                    void *ms = pion_str_from_cstr(missing[i], -1);
+                    assert(pion_world_fs_mkdir_p(w, ms) == 0);
+                    pion_rc_dec(ms);
+                }
+                void *unc_s = pion_str_from_cstr(unc, -1);
+                assert(pion_world_fs_mkdir_p(w, unc_s) == 1);
+                assert(pion_world_fs_mkdir_p(w, unc_s) == 1);
+                void *local_s = pion_str_from_cstr(local, -1);
+                assert(pion_world_fs_is_dir(w, local_s) == 1);
+                for (int i = 0; i < 3; i++) {
+                    assert(pion_test_rmdir_u8(local) == 0);
+                    *strrchr(local, '/') = '\0';
+                }
+                pion_rc_dec(local_s);
+                pion_rc_dec(unc_s);
+                unc_exercised = 1;
+                printf("  utf8_paths: UNC mkdir_p via %s ok\n", share_sl);
+            } else {
+                printf("  utf8_paths: UNC path %s not reachable, UNC mkdir_p skipped\n", probe);
+            }
+            pion_rc_dec(probe_s);
+        } else {
+            printf("  utf8_paths: temp dir '%s' has no drive prefix, UNC mkdir_p skipped\n", dir);
+        }
+        if (require_unc && !unc_exercised) {
+            fprintf(stderr, "FAIL: PION_REQUIRE_WIN_UNC=1 but UNC mkdir_p assertions did not run\n");
+            exit(1);
+        }
+    }
+
+    /* nofollow range read checks the opened object: a junction (a reparse
+     * point, creatable without admin rights) is refused even for 0 bytes. */
+    {
+        char jp[800], jt[800];
+        snprintf(jp, sizeof(jp), "%s/junc", dir);
+        snprintf(jt, sizeof(jt), "%s/子目录", dir);
+        wchar_t wj[1024], wt[1024], cmd[2200];
+        assert(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, jp, -1, wj, 1024) > 0);
+        assert(MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, jt, -1, wt, 1024) > 0);
+        for (wchar_t *q = wj; *q; q++) if (*q == L'/') *q = L'\\';
+        for (wchar_t *q = wt; *q; q++) if (*q == L'/') *q = L'\\';
+        swprintf(cmd, 2200, L"cmd /c mklink /J \"%ls\" \"%ls\" >NUL", wj, wt);
+        assert(_wsystem(cmd) == 0);
+        DWORD ja = GetFileAttributesW(wj);
+        assert(ja != INVALID_FILE_ATTRIBUTES && (ja & FILE_ATTRIBUTE_REPARSE_POINT));
+        void *j_s = pion_str_from_cstr(jp, -1);
+        void *jr = pion_world_fs_read_range_nofollow(w, j_s, 0, 0, 0, &ok);
+        assert(ok == 0);
+        pion_rc_dec(jr);
+        pion_rc_dec(j_s);
+        assert(RemoveDirectoryW(wj));
+    }
+#endif
+
+    /* A 0-byte regular file reads back as 0 bytes. */
+    {
+        void *z_s = u8s(dir, "/零.bin");
+        void *zb = pion_bytes_new(0);
+        assert(pion_world_fs_write_bytes(w, z_s, zb) == 1);
+        void *zr = pion_world_fs_read_range_nofollow(w, z_s, 0, 0, 0, &ok);
+        assert(ok == 1 && pion_bytes_len(zr) == 0);
+        pion_rc_dec(zr);
+        zr = pion_world_fs_read_range_nofollow(w, z_s, 0, 0, 1, &ok);
+        assert(ok == 0);
+        pion_rc_dec(zr);
+        assert(pion_world_fs_remove(w, z_s) == 1);
+        pion_rc_dec(zb);
+        pion_rc_dec(z_s);
+    }
+
+    /* Atomic write never truncates or removes a file that already holds a
+     * candidate temporary name (`<path>.piontmp.<pid>.<seq>`): sentinels
+     * cover seq 0..63, so the first calls collide until a free name. */
+    {
+        char tgt[800], sen[900];
+        snprintf(tgt, sizeof(tgt), "%s/atomic \xF0\x9F\x9A\x80.bin", dir);
+        void *tgt_s = pion_str_from_cstr(tgt, -1);
+        void *sent = pion_str_from_cstr("SENTINEL", 8);
+        for (int i = 0; i < 64; i++) {
+            snprintf(sen, sizeof(sen), "%s.piontmp.%d.%d", tgt, pion_test_getpid(), i);
+            void *ss = pion_str_from_cstr(sen, -1);
+            assert(pion_world_fs_write(w, ss, sent) == 1);
+            pion_rc_dec(ss);
+        }
+        int wrote = 0;
+        for (int tries = 0; tries < 80 && !wrote; tries++) {
+            wrote = pion_fs_write_atomic_bytes(tgt_s, bytes);
+        }
+        assert(wrote == 1);
+        void *tb = pion_world_fs_read_bytes(w, tgt_s, &ok);
+        assert(ok == 1 && pion_bytes_len(tb) == 6 && pion_bytes_get(tb, 0) == 'a');
+        pion_rc_dec(tb);
+        for (int i = 0; i < 64; i++) {
+            snprintf(sen, sizeof(sen), "%s.piontmp.%d.%d", tgt, pion_test_getpid(), i);
+            void *ss = pion_str_from_cstr(sen, -1);
+            void *sr = pion_world_fs_read(w, ss, &ok);
+            assert(ok == 1 && pion_str_eq(sr, sent) == 1);
+            pion_rc_dec(sr);
+            assert(pion_world_fs_remove(w, ss) == 1);
+            pion_rc_dec(ss);
+        }
+        ents = pion_world_fs_list_dir(w, dir_s);
+        for (int64_t i = 0; i < pion_arr_len(ents); i++) {
+            const char *en = ((PionString *)(uintptr_t)pion_arr_get(ents, i))->data;
+            assert(strstr(en, ".piontmp.") == NULL);
+        }
+        pion_rc_dec(ents);
+        assert(pion_world_fs_remove(w, tgt_s) == 1);
+        pion_rc_dec(sent);
+        pion_rc_dec(tgt_s);
+    }
+
+    /* A path longer than the stack conversion buffer (heap fallback), while
+     * staying under macOS PATH_MAX (1024 bytes): 6 components of 88 ASCII +
+     * 1 CJK char -> > 512 UTF-16 units (~540 + dir) and ~600-660 UTF-8 bytes. */
+    char deep[1400];
+    int dl = snprintf(deep, sizeof(deep), "%s", dir);
+    for (int i = 0; i < 6; i++) {
+        deep[dl++] = '/';
+        memset(deep + dl, 'a', 88);
+        dl += 88;
+        memcpy(deep + dl, "\xE9\x95\xBF", 3);
+        dl += 3;
+    }
+    deep[dl] = '\0';
+    void *deep_s = pion_str_from_cstr(deep, dl);
+    int deep_ok = pion_world_fs_mkdir_p(w, deep_s);
+#ifndef _WIN32
+    assert(deep_ok == 1);
+#endif
+    assert(pion_world_fs_is_dir(w, deep_s) == deep_ok);
+    /* Windows without long-path support may stop part way: remove what exists. */
+    while (dl > (int)strlen(dir)) {
+        int rc = pion_test_rmdir_u8(deep);
+#ifndef _WIN32
+        assert(rc == 0);
+#else
+        (void)rc;
+#endif
+        while (deep[--dl] != '/') {}
+        deep[dl] = '\0';
+    }
+    pion_rc_dec(deep_s);
+
+    /* Cleanup. */
+    assert(pion_world_fs_remove(w, moved_s) == 1);
+    assert(pion_world_fs_exists(w, moved_s) == 0);
+    assert(pion_world_fs_remove(w, real_s) == 1);
+    assert(pion_world_fs_remove(w, lock_s) == 1);
+    for (int i = 0; i < 3; i++) {
+        char nb[16];
+        snprintf(nb, sizeof(nb), "/%s", names[i]);
+        void *ps = u8s(dir, nb);
+        assert(pion_world_fs_remove(w, ps) == 1);
+        pion_rc_dec(ps);
+    }
+    assert(pion_test_rmdir_u8(excl) == 0);
+    char subp[800];
+    snprintf(subp, sizeof(subp), "%s/子目录", dir);
+    assert(pion_test_rmdir_u8(subp) == 0);
+    assert(pion_test_rmdir_u8(dir) == 0);
+    assert(pion_test_rmdir_u8(root) == 0);
+
+    void *objs[] = {dir_s, sub_s, file_s, body, bytes, excl_s, lock_s, moved_s, real_s,
+                    ghost_s, real_nul, ghost_nul, dir_nul};
+    for (size_t i = 0; i < sizeof(objs) / sizeof(objs[0]); i++) pion_rc_dec(objs[i]);
+    pion_rc_dec(w);
+    printf("[PASS] utf8_paths_and_embedded_nul\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -3408,6 +3859,7 @@ int main(int argc, char **argv) {
     test_sha256();
     test_world(argc, argv);
     test_p22a_systems_io(argc, argv);
+    test_utf8_paths_and_embedded_nul(argc, argv);
     test_ffi_ptr_and_cstr();
     test_str_to_double();
     test_p57b_hot_str_and_split();
