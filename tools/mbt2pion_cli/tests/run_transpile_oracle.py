@@ -103,6 +103,7 @@ CASES = {
     "q2_mechanical_compat": ("ok", 10),
     "wave_m2_core": ("ok", 7),
     "wave_m2_round2": ("ok", 8),
+    "wave_m2b_mid_tier": ("ok", 9),
 }
 
 MOON_TRAPS = {
@@ -1114,6 +1115,128 @@ pub fn m2_r2_arr_add_eq_and_tuple() -> (Bool, Int, String) {
   let nested = ((10, 20), 30)
   (eq_ok, nested.0.1, ".0")
 }
+
+// Wave M2-B: complex postfix slice single-eval, trailing `..` array patterns, StringView,
+//            `for b in bytes`, MbtJson + controlled catch, expected-type Auto, Stage B multi-diag/multiline,
+//            nested `.val = None` / `match from.val` / `-way_dir.val * h`, `#derive(Debug, Hash)`, `noraise`.
+pub(all) enum M2bDim { Auto; Px(Int) }
+pub(all) enum M2bAlign { Auto; Center }
+
+#derive(Debug, Eq, Hash)
+pub struct M2bKey {
+  a : Int
+  b : Double
+  c : String
+}
+
+pub struct M2bPair(Int, Int)
+pub struct M2bWrap(M2bPair, Int)
+
+pub fn m2b_postfix_slice_single_eval() -> (Int, String, Int) {
+  let calls : Ref[Int] = Ref(0)
+  let get_s = fn() -> String {
+    calls.val = calls.val + 1
+    "abcdef"
+  }
+  let s1 : StringView = get_s()[1:]
+  let xs = [10, 20, 30, 40][1:3].to_array()
+  (calls.val, s1.to_string(), xs[0] + xs[1])
+}
+
+pub fn m2b_array_rest_pat(flag : Bool) -> (Int, Int, Int) {
+  let o1 : Array[Int]? = Some([7, 8, 9, 10])
+  let r1 = match o1 {
+    Some([a, b, ..]) if flag => a * 10 + b
+    _ => -1
+  }
+  let r2 = match o1 {
+    Some([a, b, ..]) if !flag => a + b
+    _ => 99
+  }
+  let r3 = match [5, 6, 7] {
+    [h, ..] => h
+    _ => 0
+  }
+  (r1, r2, r3)
+}
+
+pub fn m2b_bytes_for_loop() -> (Int, Int) {
+  let b = @utf8.encode("ABCD")
+  let mut sum = 0
+  for x in b {
+    if x == b'B' { continue }
+    sum = sum + x.to_int()
+  }
+  let mut idx_sum = 0
+  for i, x in b {
+    if i == 2 { break }
+    idx_sum = idx_sum + i * 100 + x.to_int()
+  }
+  (sum, idx_sum)
+}
+
+pub fn m2b_json_and_catch() -> (String, Int, Int, Bool) {
+  let j = @json.parse("{\"n\":42,\"s\":\"ok\"}") catch { _ => Json::null() }
+  let n_val = match j {
+    Json::Object(m) => match m.get("n") {
+      Some(Json::Number(v, ..)) => v.to_int()
+      _ => -1
+    }
+    _ => -2
+  }
+  let bad_j = @json.parse("{bad") catch { _ => Json::string("fallback") }
+  let parsed_i = @string.parse_int("123") catch { _ => -1 }
+  let bad_i = @string.parse_int("xyz") catch { _ => -7 }
+  let good_u : String? = Some(@utf8.decode(@utf8.encode("hi"))) catch { _ => Option::None }
+  let bad_u : String? = Some(@utf8.decode(Bytes::from_array([b'\xC0', b'\xAF']))) catch { _ => Option::None }
+  (bad_j.stringify(), n_val, parsed_i + bad_i, good_u == Option::Some("hi") && bad_u == Option::None)
+}
+
+pub fn m2b_expected_auto_and_stage_b() -> (Bool, Int, Int) {
+  let d : M2bDim = if true { Auto } else { Px(1) }
+  let a : M2bAlign = Auto
+  let o1 : Int? = Option::Some(3)
+  let o2 : Int? = Option::None
+  let eq_same_line = o1 == Option::Some(3) && o2 == Option::None
+  let m : Map[String, M2bKey] = Map([])
+  m["k"] = M2bKey::{
+    a: 1,
+    b: 2.5,
+    c: "z",
+  }
+  let w = M2bWrap(M2bPair(11, 22), 33)
+  let d_ok = match (d, a) {
+    (M2bDim::Auto, M2bAlign::Auto) => true
+    _ => false
+  }
+  (eq_same_line && d_ok, w.0.1, m.get("k").map(fn(k) { k.a }).unwrap_or(0))
+}
+
+pub fn m2b_val_contexts_and_noraise(h : Double) -> (Bool, Int, Double) noraise {
+  let unkeep : Ref[(() -> Unit)?] = Ref(Option::None)
+  unkeep.val = Option::Some(fn() {
+    unkeep.val = Option::None
+  })
+  match unkeep.val {
+    Option::Some(f) => f()
+    Option::None => ()
+  }
+  let cleared = unkeep.val is Option::None
+  let from : Ref[Int?] = Ref(Option::Some(42))
+  let fv = match from.val {
+    Option::Some(x) => x
+    Option::None => 0
+  }
+  let way_dir : Ref[Double] = Ref(2.0)
+  let neg_v = -way_dir.val * h
+  (cleared, fv, neg_v)
+}
+
+pub fn m2b_hash_consistency() -> Bool {
+  let k1 = M2bKey::{ a: 7, b: 1.5, c: "abc" }
+  let k2 = M2bKey::{ a: 7, b: 1.5, c: "abc" }
+  k1 == k2
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1621,6 +1744,24 @@ fn main {
     check("r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
     check("r2.show_return", sh == "early:normal")
     check("r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
+  } else if kase == "wave_m2b_mid_tier" {
+    let (sc, ss, ssum) = @m12.m2b_postfix_slice_single_eval()
+    let (ar1, ar2, ar3) = @m12.m2b_array_rest_pat(true)
+    let (bs1, bs2) = @m12.m2b_bytes_for_loop()
+    let (js, jn, ji, ju) = @m12.m2b_json_and_catch()
+    let (sb_ok, w01, mk) = @m12.m2b_expected_auto_and_stage_b()
+    let (vc, vf, vn) = @m12.m2b_val_contexts_and_noraise(3.5)
+    let hk = @m12.m2b_hash_consistency()
+    trace("m2b", "\{sc},\{ss},\{ssum},\{ar1}:\{ar2}:\{ar3},\{bs1}:\{bs2},\{js},\{jn},\{ji},\{ju},\{sb_ok}:\{w01}:\{mk},\{vc}:\{vf}:\{vn},\{hk}")
+    check("m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
+    check("m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 5)
+    check("m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
+    check("m2b.json_parse_stringify", js == "\"fallback\"" && jn == 42)
+    check("m2b.catch_int_utf8", ji == 116 && ju)
+    check("m2b.expected_auto_stage_b", sb_ok && w01 == 22 && mk == 1)
+    check("m2b.val_nested_none", vc)
+    check("m2b.val_match_neg", vf == 42 && vn == -7.0)
+    check("m2b.derive_debug_hash", hk)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2145,6 +2286,24 @@ pub fn main(w : World) -> Int {
     check(w, "r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
     check(w, "r2.show_return", sh == "early:normal")
     check(w, "r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
+  } else if kase == "wave_m2b_mid_tier" {
+    let (sc, ss, ssum) = m12::m2b_postfix_slice_single_eval()
+    let (ar1, ar2, ar3) = m12::m2b_array_rest_pat(true)
+    let (bs1, bs2) = m12::m2b_bytes_for_loop()
+    let (js, jn, ji, ju) = m12::m2b_json_and_catch()
+    let (sb_ok, w01, mk) = m12::m2b_expected_auto_and_stage_b()
+    let (vc, vf, vn) = m12::m2b_val_contexts_and_noraise(3.5)
+    let hk = m12::m2b_hash_consistency()
+    trace(w, "m2b", sc.to_string() + "," + ss + "," + ssum.to_string() + "," + ar1.to_string() + ":" + ar2.to_string() + ":" + ar3.to_string() + "," + bs1.to_string() + ":" + bs2.to_string() + "," + js + "," + jn.to_string() + "," + ji.to_string() + "," + ju.to_string() + "," + sb_ok.to_string() + ":" + w01.to_string() + ":" + mk.to_string() + "," + vc.to_string() + ":" + vf.to_string() + ":" + mbt_compat::double_to_string(vn) + "," + hk.to_string())
+    check(w, "m2b.slice_single_eval", sc == 1 && ss == "bcdef" && ssum == 50)
+    check(w, "m2b.array_rest_pat", ar1 == 78 && ar2 == 99 && ar3 == 5)
+    check(w, "m2b.bytes_for_loop", bs1 == 65 + 67 + 68 && bs2 == 65 + 166)
+    check(w, "m2b.json_parse_stringify", js == "\"fallback\"" && jn == 42)
+    check(w, "m2b.catch_int_utf8", ji == 116 && ju)
+    check(w, "m2b.expected_auto_stage_b", sb_ok && w01 == 22 && mk == 1)
+    check(w, "m2b.val_nested_none", vc)
+    check(w, "m2b.val_match_neg", vf == 42 && vn == -7.0)
+    check(w, "m2b.derive_debug_hash", hk)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -2347,7 +2506,10 @@ def prepare(env):
         os.path.join(nomap_mbt_dir, "nomap_lib.mbt"),
         os.path.join(env.moon_dir, "nomap", "nomap_lib.mbt"),
     )
-    write_file(os.path.join(env.moon_dir, "m12", "moon.pkg"), "\n")
+    write_file(
+        os.path.join(env.moon_dir, "m12", "moon.pkg"),
+        'import {\n  "moonbitlang/core/encoding/utf8",\n  "moonbitlang/core/json",\n  "moonbitlang/core/string",\n}\n',
+    )
     shutil.copyfile(
         os.path.join(m12_mbt_dir, "m12_lib.mbt"),
         os.path.join(env.moon_dir, "m12", "m12_lib.mbt"),

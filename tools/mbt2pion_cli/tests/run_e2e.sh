@@ -2148,6 +2148,41 @@ r2_di_bad_codes = [d["code"] for d in json.load(open(r2_di_bad_rep)).get("diagno
 assert "MBT2PION_UNSUPPORTED_SYNTAX" in r2_di_bad_codes, f"R2 debug_inspect(Foo) expected MBT2PION_UNSUPPORTED_SYNTAX, got {r2_di_bad_codes}"
 
 print("[e2e] PASS: Wave M2-A Round 2 regressions (Check 2 test gate, debug_inspect quoted/unquoted/struct fail-closed)")
+
+# ---------------------------------------------------------------------------
+# Wave M2-B E2E regressions:
+# (1) Relative `--package-manifest ../pkg/pion.toml` with `path = "../dep"` canonicalized cleanly
+# (2) Black-box `*_test.mbt` private top-level `fn` colliding with prod `fn` passes publish --with-tests + pionc test
+# ---------------------------------------------------------------------------
+m2b_root = os.path.join(root, "m2b_rel")
+m2b_dep = os.path.join(m2b_root, "dep")
+m2b_pkg = os.path.join(m2b_root, "pkg")
+m2b_sub = os.path.join(m2b_root, "sub")
+os.makedirs(os.path.join(m2b_dep, "src"), exist_ok=True)
+os.makedirs(os.path.join(m2b_pkg, "mbt_src"), exist_ok=True)
+os.makedirs(m2b_sub, exist_ok=True)
+with open(os.path.join(m2b_dep, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "dep"\nversion = "0.1.0"\n')
+with open(os.path.join(m2b_dep, "src", "dep.pion"), "w") as f:
+    f.write("pub fn dep_add(x : Int) -> Int { x + 10 }\n")
+with open(os.path.join(m2b_pkg, "pion.toml"), "w") as f:
+    f.write('[package]\nname = "pkg"\nversion = "0.1.0"\n\n[dependencies]\ndep = { path = "../dep" }\n')
+with open(os.path.join(m2b_pkg, "mbt_src", "lib.mbt"), "w") as f:
+    f.write("fn dmax(a : Int, b : Int) -> Int { if a > b { a } else { b } }\npub fn use_dep(x : Int) -> Int { @dep.dep_add(dmax(x, 1)) }\n")
+with open(os.path.join(m2b_pkg, "mbt_src", "lib_test.mbt"), "w") as f:
+    f.write('fn dmax(a : Int, b : Int) -> Int { a + b }\ntest "bb_priv_iso" {\n  assert_eq(dmax(2, 3), 5)\n  assert_eq(use_dep(4), 14)\n}\n')
+m2b_pub = subprocess.run(
+    [bin_path, "--src", "../pkg/mbt_src", "--out", "../pkg/src", "--package-manifest", "../pkg/pion.toml",
+     "--mbt-compat", os.path.relpath(os.path.realpath(compat_dir), os.path.realpath(m2b_sub)), "--target", "native", "--mode", "publish",
+     "--with-tests", "--pionc", pionc],
+    cwd=m2b_sub, capture_output=True, text=True
+)
+assert m2b_pub.returncode == 0, f"Wave M2-B relative manifest + bb priv publish failed:\n{m2b_pub.stdout}\n{m2b_pub.stderr}"
+with open(os.path.join(m2b_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "pkg"\nversion = "0.1.0"\n\n[dependencies]\ndep = {{ path = "../dep" }}\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+m2b_t = subprocess.run([pionc, "test", m2b_pkg], capture_output=True, text=True)
+assert m2b_t.returncode == 0 and "1 passed; 0 failed" in m2b_t.stdout, f"Wave M2-B pionc test failed:\n{m2b_t.stdout}\n{m2b_t.stderr}"
+print("[e2e] PASS: Wave M2-B regressions (relative --package-manifest + black-box private fn isolation)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"
