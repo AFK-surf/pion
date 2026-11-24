@@ -1,6 +1,6 @@
 /-
 Formally verified equivalence theorems for the 3 x86-64 QBE backend
-optimizations in PR-14:
+optimizations in PR-15:
   1. Cross-BB SIB index reconstruction (`rematindex` in `vendor/qbe/amd64/isel.c`).
   2. Short-branch `rel8` layout solver with 16-byte loop alignment
      (`relaxloops` in `vendor/qbe/amd64/elf.c`).

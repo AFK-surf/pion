@@ -1,11 +1,14 @@
 #!/bin/sh
-# P102: Regression test for the 6 Lean-verified QBE backend codegen optimizations:
+# P102: Regression test for the 9 Lean-verified QBE backend codegen optimizations:
 #   1. x86-64 cmp $0, %r -> test %r, %r
 #   2. x86-64 Kl shl $1/$2/$3 folded into SIB scale 2/4/8 (+ disp32 overflow & CAddr guards)
 #   3. x86-64 intra-function short branch rel8 relaxation + reloc shift + >127B long fallback
 #   4. x86-64 multi-byte NOP alignment padding
 #   5. x86-64 accumulator ALU imm32 short form (05 + 8*g)
 #   6. AArch64 prologue/epilogue callee-saved stp/ldp pairing (emit.c & macho.c)
+#   7. x86-64 cross-BB SIB index reconstruction (rematindex) + dead shift elimination
+#   8. x86-64 short-branch rel8 layout solver with 16-byte loop alignment (relaxloops)
+#   9. x86-64 adjacent single-use integer load folding into cmp (foldcompareloads) + safety guards
 set -eu
 
 PIONC="${1:-}"
@@ -189,25 +192,37 @@ export function l $opt6_clob(l %a, l %b, l %c, l %d, d %fa, d %fb) {
   ret %tot
 }
 
-# Opt 7: cross-BB SIB index reconstruction (rematindex) + live-use preservation
-export function l $opt7_xbb_sib(l %p32, l %p64, l %idx, l %len) {
+# Opt 7A: cross-BB SIB index reconstruction (rematindex) across two distinct successor blocks
+# Shared %s in @start cannot be sunk locally; rematindex rewrites both successors to scale-8 SIB
+# and eliminates the dead shl instruction.
+export function l $opt7_xbb_sib(l %p, l %q, l %idx, w %flag) {
 @start
-  %s2 =l shl %idx, 2
-  %s3 =l shl %idx, 3
-  %ok =w cultl %idx, %len
-  jnz %ok, @body, @oob
-@body
-  %a1 =l add %p32, %s2
-  %v1 =w loaduw %a1
-  %v1l =l extuw %v1
-  %a2 =l add %p64, %s3
-  %v2 =l loadl %a2
-  %sum =l add %v1l, %v2
-  # Keep %s3 live so only %s2's shl is dead; %s3's shl must stay live
-  %out =l add %sum, %s3
-  ret %out
-@oob
-  ret -1
+  %s =l shl %idx, 3
+  jnz %flag, @left, @right
+@left
+  %a =l add %p, %s
+  %v1 =l loadl %a
+  ret %v1
+@right
+  %b =l add %q, %s
+  %v2 =l loadl %b
+  ret %v2
+}
+
+# Opt 7B: cross-BB SIB live-use preservation (%s still used in arithmetic, so shl must remain live)
+export function l $opt7_xbb_sib_live(l %p, l %q, l %idx, w %flag) {
+@start
+  %s =l shl %idx, 3
+  jnz %flag, @left, @right
+@left
+  %a =l add %p, %s
+  %v1 =l loadl %a
+  %r1 =l add %v1, %s
+  ret %r1
+@right
+  %b =l add %q, %s
+  %v2 =l loadl %b
+  ret %v2
 }
 
 # Opt 8A: loop with 16-byte alignment, short branches, and inner relocation
@@ -277,33 +292,39 @@ export function l $opt8_relax_loop_far(l %n, l %flag) {
   ret -999
 }
 
-# Opt 9A: memory operand cmp folding (reg-mem, mem-reg, imm-mem incl. $0, Kw & Kl, + cross-BB SIB interaction)
-export function l $opt9_memcmp(l %p64, l %p32, l %idx, l %key64, w %key32) {
+# Opt 9A: memory operand cmp folding — 4 independent single-use shapes (no CSE/reuse)
+# (a) 32-bit integer load (`load`, which parses as Oload Kw, not Oloadsw) + csltw
+export function w $opt9_memcmp_w(l %p32, w %key32) {
 @start
-  %s3 =l shl %idx, 3
-  %ok =w csgtl %idx, -1
-  jnz %ok, @body, @oob
-@body
-  # Cross-BB scaled load folded directly into cmp against register
-  %a64 =l add %p64, %s3
-  %v64 =l loadl %a64
-  %c1 =w ceql %v64, %key64
-  # Adjacent loadl folded into cmp against $0 (must stay cmp $0, (%mem), never test)
-  %v0 =l loadl %p64
-  %c2 =w ceql %v0, 0
-  # Adjacent loadw folded into 32-bit cmp against register
-  %v32 =w loadw %p32
-  %c3 =w csltw %v32, %key32
-  # Adjacent loadl folded into cmp against non-zero imm32
-  %v1 =l loadl %a64
-  %c4 =w csgtl %v1, 100
-  %t1 =w add %c1, %c2
-  %t2 =w add %t1, %c3
-  %t3 =w add %t2, %c4
-  %res =l extsw %t3
-  ret %res
-@oob
-  ret -1
+  %v =w load %p32
+  %c =w csltw %v, %key32
+  ret %c
+}
+
+# (b) 64-bit SIB scaled load + ceql
+export function w $opt9_memcmp_sib(l %p64, l %idx, l %key64) {
+@start
+  %s =l shl %idx, 3
+  %a =l add %p64, %s
+  %v =l loadl %a
+  %c =w ceql %v, %key64
+  ret %c
+}
+
+# (c) 64-bit load + cmp against $0 (must stay cmpq $0, (%mem), never mis-encoded as test)
+export function w $opt9_memcmp_zero(l %p64) {
+@start
+  %v =l loadl %p64
+  %c =w ceql %v, 0
+  ret %c
+}
+
+# (d) 64-bit load + cmp against non-zero imm32 (100 = 0x64)
+export function w $opt9_memcmp_imm(l %p64) {
+@start
+  %v =l loadl %p64
+  %c =w csgtl %v, 100
+  ret %c
 }
 
 # Opt 9B: negative safety guards — loadsw vs 64-bit cmp, intervening store alias, multi-use load
@@ -380,10 +401,14 @@ extern int64_t opt3_long_br(int64_t x);
 extern int64_t opt4_loop(int64_t n);
 extern int64_t opt5_acc(int64_t x);
 extern int64_t opt6_clob(int64_t a, int64_t b, int64_t c, int64_t d, double fa, double fb);
-extern int64_t opt7_xbb_sib(const uint32_t *p32, const int64_t *p64, int64_t idx, int64_t len);
+extern int64_t opt7_xbb_sib(const int64_t *p, const int64_t *q, int64_t idx, int32_t flag);
+extern int64_t opt7_xbb_sib_live(const int64_t *p, const int64_t *q, int64_t idx, int32_t flag);
 extern int64_t opt8_relax_loop(int64_t n);
 extern int64_t opt8_relax_loop_far(int64_t n, int64_t flag);
-extern int64_t opt9_memcmp(const int64_t *p64, const int32_t *p32, int64_t idx, int64_t key64, int32_t key32);
+extern int32_t opt9_memcmp_w(const int32_t *p32, int32_t key32);
+extern int32_t opt9_memcmp_sib(const int64_t *p64, int64_t idx, int64_t key64);
+extern int32_t opt9_memcmp_zero(const int64_t *p64);
+extern int32_t opt9_memcmp_imm(const int64_t *p64);
 extern int64_t opt9_memcmp_guards(int64_t *p64, const int32_t *p32);
 
 int main(void) {
@@ -446,16 +471,26 @@ int main(void) {
     int64_t e6 = (1+2+3+4) + (8+9+10+11) + 20;
     if (r6 != e6) { fprintf(stderr, "opt6 got %lld exp %lld\n", (long long)r6, (long long)e6); return 1; }
 
-    /* Opt 7: cross-BB SIB index reconstruction */
+    /* Opt 7: cross-BB SIB index reconstruction across two successors + live-use preservation */
+    int64_t b64[4] = {10000, 20000, 30000, 40000};
     for (int64_t i = 0; i < 4; i++) {
-        int64_t got = opt7_xbb_sib(a32, a64, i, 4);
-        int64_t exp = (int64_t)a32[i] + a64[i] + (i << 3);
-        if (got != exp) {
-            fprintf(stderr, "opt7(%lld) got %lld exp %lld\n", (long long)i, (long long)got, (long long)exp);
+        if (opt7_xbb_sib(a64, b64, i, 1) != a64[i]) {
+            fprintf(stderr, "opt7_xbb_sib(left,%lld) failed\n", (long long)i);
+            return 1;
+        }
+        if (opt7_xbb_sib(a64, b64, i, 0) != b64[i]) {
+            fprintf(stderr, "opt7_xbb_sib(right,%lld) failed\n", (long long)i);
+            return 1;
+        }
+        if (opt7_xbb_sib_live(a64, b64, i, 1) != a64[i] + (i << 3)) {
+            fprintf(stderr, "opt7_xbb_sib_live(left,%lld) failed\n", (long long)i);
+            return 1;
+        }
+        if (opt7_xbb_sib_live(a64, b64, i, 0) != b64[i]) {
+            fprintf(stderr, "opt7_xbb_sib_live(right,%lld) failed\n", (long long)i);
             return 1;
         }
     }
-    if (opt7_xbb_sib(a32, a64, 4, 4) != -1) { fprintf(stderr, "opt7(oob) failed\n"); return 1; }
 
     /* Opt 8: loop alignment + short branch relaxation + far branch widening */
     int64_t r8 = opt8_relax_loop(10);
@@ -464,11 +499,21 @@ int main(void) {
     if (opt8_relax_loop_far(3, 1) != -999) { fprintf(stderr, "opt8_far(flag=1) failed\n"); return 1; }
     if (opt8_relax_loop_far(3, 0) != 3 * 20 * 7) { fprintf(stderr, "opt8_far(flag=0) failed\n"); return 1; }
 
-    /* Opt 9: memory operand cmp folding + safety guards */
+    /* Opt 9: memory operand cmp folding (4 independent shapes) + safety guards */
     int64_t m64[4] = {0, 50, 200, 300};
     int32_t m32[2] = {-5, 10};
-    if (opt9_memcmp(m64, m32, 2, 200, 0) != 4) { fprintf(stderr, "opt9(match) failed\n"); return 1; }
-    if (opt9_memcmp(m64, m32, 1, 999, -10) != 1) { fprintf(stderr, "opt9(partial) failed\n"); return 1; }
+    if (opt9_memcmp_w(m32, 0) != 1 || opt9_memcmp_w(m32, -5) != 0) {
+        fprintf(stderr, "opt9_memcmp_w failed\n"); return 1;
+    }
+    if (opt9_memcmp_sib(m64, 2, 200) != 1 || opt9_memcmp_sib(m64, 2, 999) != 0) {
+        fprintf(stderr, "opt9_memcmp_sib failed\n"); return 1;
+    }
+    if (opt9_memcmp_zero(&m64[0]) != 1 || opt9_memcmp_zero(&m64[1]) != 0) {
+        fprintf(stderr, "opt9_memcmp_zero failed\n"); return 1;
+    }
+    if (opt9_memcmp_imm(&m64[2]) != 1 || opt9_memcmp_imm(&m64[1]) != 0) {
+        fprintf(stderr, "opt9_memcmp_imm failed\n"); return 1;
+    }
     int64_t g64 = 42;
     int64_t r9g = opt9_memcmp_guards(&g64, m32);
     if (r9g != 3 + 9999 || g64 != 9999) {
@@ -589,14 +634,18 @@ if [ "$UNAME_M" = "x86_64" ]; then
       awk '/<opt5_acc>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
       exit 1
     }
-    # Opt 7: cross-BB SIB index reconstruction (scales 4 and 8)
-    for sc in 4 8; do
-      awk '/<opt7_xbb_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -F ",${sc})" >/dev/null || {
-        echo "FAIL: amd64/isel.c did not reconstruct cross-BB SIB scale ${sc} in opt7_xbb_sib" >&2
-        awk '/<opt7_xbb_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
-        exit 1
-      }
-    done
+    # Opt 7A: cross-BB SIB index reconstruction across two successors (>=2 scale-8 SIBs, 0 shl)
+    OPT7_SIB_CNT="$(awk '/<opt7_xbb_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -Fc ',8)' || true)"
+    if [ "$OPT7_SIB_CNT" -lt 2 ]; then
+      echo "FAIL: amd64/isel.c did not reconstruct >=2 cross-BB scale-8 SIBs in opt7_xbb_sib (got $OPT7_SIB_CNT)" >&2
+      awk '/<opt7_xbb_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
+      exit 1
+    fi
+    if awk '/<opt7_xbb_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E '\bshl[lq]?\b' >/dev/null; then
+      echo "FAIL: amd64/isel.c did not eliminate dead shl in opt7_xbb_sib" >&2
+      awk '/<opt7_xbb_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
+      exit 1
+    fi
     # Opt 8A: aligned loop has both multi-byte NOPs and short rel8 branches
     awk '/<opt8_relax_loop>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E ':[[:space:]]+(eb|7[0-9a-f])[[:space:]]' >/dev/null || {
       echo "FAIL: amd64/elf.c did not emit rel8 short branch in aligned opt8_relax_loop" >&2
@@ -609,15 +658,28 @@ if [ "$UNAME_M" = "x86_64" ]; then
       awk '/<opt8_relax_loop_far>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
       exit 1
     }
-    # Opt 9A: memory-operand cmp folding (including cmp $0, (%mem) and scaled SIB cmp)
-    awk '/<opt9_memcmp>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E 'cmp[lq][[:space:]]+.*\(' >/dev/null || {
-      echo "FAIL: amd64/isel.c did not fold load into memory-operand cmp in opt9_memcmp" >&2
-      awk '/<opt9_memcmp>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
+    # Opt 9A(a): 32-bit memory-operand cmp (objdump omits 'l' suffix when reg is 32-bit)
+    awk '/<opt9_memcmp_w>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E 'cmpl?[[:space:]]+.*\(' >/dev/null || {
+      echo "FAIL: amd64/isel.c did not fold 32-bit load into cmp in opt9_memcmp_w" >&2
+      awk '/<opt9_memcmp_w>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
       exit 1
     }
-    awk '/<opt9_memcmp>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E 'cmpq[[:space:]]+\$0x0,' >/dev/null || {
-      echo "FAIL: opt9_memcmp did not emit cmpq \$0, (%mem) cleanly" >&2
-      awk '/<opt9_memcmp>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
+    # Opt 9A(b): 64-bit SIB scaled memory-operand cmp
+    awk '/<opt9_memcmp_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E 'cmpq?[[:space:]]+.*,8\)' >/dev/null || {
+      echo "FAIL: amd64/isel.c did not fold SIB load into cmp in opt9_memcmp_sib" >&2
+      awk '/<opt9_memcmp_sib>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
+      exit 1
+    }
+    # Opt 9A(c): 64-bit cmpq $0x0, (%mem) (not mis-encoded as test)
+    awk '/<opt9_memcmp_zero>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E 'cmpq[[:space:]]+\$0x0,.*\(' >/dev/null || {
+      echo "FAIL: opt9_memcmp_zero did not emit cmpq \$0x0, (%mem)" >&2
+      awk '/<opt9_memcmp_zero>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
+      exit 1
+    }
+    # Opt 9A(d): 64-bit non-zero immediate cmpq $0x64, (%mem)
+    awk '/<opt9_memcmp_imm>:/,/^$/' "$TMP_DIR/opts_x64.dis" | grep -E 'cmpq[[:space:]]+\$0x64,.*\(' >/dev/null || {
+      echo "FAIL: opt9_memcmp_imm did not emit cmpq \$0x64, (%mem)" >&2
+      awk '/<opt9_memcmp_imm>:/,/^$/' "$TMP_DIR/opts_x64.dis" >&2
       exit 1
     }
   fi
