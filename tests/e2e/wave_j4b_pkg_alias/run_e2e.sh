@@ -220,6 +220,12 @@ if [ "$BAD_TY_RC" -eq 0 ] || ! printf '%s' "$BAD_TY_OUT" | grep -q "E_TYPE_MISMA
   echo "FAIL: expected E_TYPE_MISMATCH when passing json::Val to ext_json::get_val, rc=$BAD_TY_RC out=$BAD_TY_OUT" >&2
   exit 1
 fi
+if ! printf '%s' "$BAD_TY_OUT" | grep -q "json::Val" || \
+   ! printf '%s' "$BAD_TY_OUT" | grep -q "ext_json::Val" || \
+   printf '%s' "$BAD_TY_OUT" | grep -Eq 'json__[0-9a-f]{8}::'; then
+  echo "FAIL: E_TYPE_MISMATCH leaked raw canon_id hash instead of clean alias display names! out=$BAD_TY_OUT" >&2
+  exit 1
+fi
 echo "2. Same-name different-source coexistence (native+wasm32) + nominal type rejection -> OK"
 
 # ============================================================================

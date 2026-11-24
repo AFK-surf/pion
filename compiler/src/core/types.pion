@@ -491,6 +491,8 @@ pub struct TypeChecker {
   scalar_const_exprs : Map[String, Expr]
   import_aliases : Map[String, String]
   dep_map : Map[String, String]
+  canon_display_keys : Array[String]
+  canon_display_vals : Array[String]
   exported_c_syms : Map[String, String]
   exported_c_sym_names : Array[String]
   imported_pkgs : Map[String, ImportedPkg]
@@ -2311,6 +2313,179 @@ fn resolve_eq_uses(tc : TypeChecker) -> Unit {
 }
 
 ///|
+fn tc_is_lower_hex(c : Int) -> Bool {
+  (c >= 48 && c <= 57) || (c >= 97 && c <= 102)
+}
+
+///|
+fn tc_is_ident_char(c : Int) -> Bool {
+  (c >= 65 && c <= 90) ||
+  (c >= 97 && c <= 122) ||
+  (c >= 48 && c <= 57) ||
+  c == 95
+}
+
+///|
+fn tc_strip_canon_hash(s : String) -> String {
+  let n = s.length()
+  if n <= 10 {
+    return s
+  }
+  if str_code_at(s, n - 10) != 95 || str_code_at(s, n - 9) != 95 {
+    return s
+  }
+  let mut i = n - 8
+  while i < n {
+    if !tc_is_lower_hex(str_code_at(s, i)) {
+      return s
+    }
+    i = i + 1
+  }
+  slice_str(s, 0, n - 10)
+}
+
+///|
+fn tc_build_canon_display_map(tc : TypeChecker) -> Unit {
+  let base_counts : Map[String, Int] = Map([])
+  let mut i = 0
+  while i < tc.all_imported_pkg_names.length() {
+    let cid = tc.all_imported_pkg_names[i]
+    let base = tc_strip_canon_hash(cid)
+    let prev = match base_counts.get(base) {
+      Some(c) => c
+      None => 0
+    }
+    base_counts.set(base, prev + 1)
+    i = i + 1
+  }
+  let cand_keys : Array[String] = []
+  let cand_vals : Array[String] = []
+  let disp_counts : Map[String, Int] = Map([])
+  let alias_keys = tc.import_aliases.keys()
+  let dep_keys = tc.dep_map.keys()
+  i = 0
+  while i < tc.all_imported_pkg_names.length() {
+    let cid = tc.all_imported_pkg_names[i]
+    let base = tc_strip_canon_hash(cid)
+    if base != cid {
+      let mut best = ""
+      let mut ai = 0
+      while ai < alias_keys.length() {
+        let al = alias_keys[ai]
+        match tc.import_aliases.get(al) {
+          Some(t) =>
+            if t == cid {
+              if al == base {
+                best = base
+              } else if best != base && (best == "" || al < best) {
+                best = al
+              }
+            }
+          None => ()
+        }
+        ai = ai + 1
+      }
+      if best == "" {
+        let mut di = 0
+        while di < dep_keys.length() {
+          let al = dep_keys[di]
+          match tc.dep_map.get(al) {
+            Some(t) =>
+              if t == cid {
+                if al == base {
+                  best = base
+                } else if best != base && (best == "" || al < best) {
+                  best = al
+                }
+              }
+            None => ()
+          }
+          di = di + 1
+        }
+      }
+      if best == "" {
+        let bc = match base_counts.get(base) {
+          Some(c) => c
+          None => 0
+        }
+        if bc == 1 {
+          best = base
+        }
+      }
+      if best != "" && best != cid {
+        cand_keys.push(cid)
+        cand_vals.push(best)
+        let dc = match disp_counts.get(best) {
+          Some(c) => c
+          None => 0
+        }
+        disp_counts.set(best, dc + 1)
+      }
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < cand_keys.length() {
+    let disp = cand_vals[i]
+    let dc = match disp_counts.get(disp) {
+      Some(c) => c
+      None => 0
+    }
+    if dc == 1 {
+      tc.canon_display_keys.push(cand_keys[i])
+      tc.canon_display_vals.push(disp)
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn tc_replace_canon_qual(s : String, cid : String, disp : String) -> String {
+  let needle = cid + "::"
+  let nlen = needle.length()
+  let slen = s.length()
+  if slen < nlen || !s.contains(needle) {
+    return s
+  }
+  let sb = StringBuilder()
+  let mut last = 0
+  let mut i = 0
+  while i < slen {
+    if i + nlen <= slen &&
+      (i == 0 || !tc_is_ident_char(str_code_at(s, i - 1))) &&
+      slice_str(s, i, i + nlen) == needle {
+      if i > last {
+        sb.write_string(slice_str(s, last, i))
+      }
+      sb.write_string(disp)
+      sb.write_string("::")
+      i = i + nlen
+      last = i
+    } else {
+      i = i + 1
+    }
+  }
+  if last < slen {
+    sb.write_string(slice_str(s, last, slen))
+  }
+  sb.to_string()
+}
+
+///|
+fn tc_display_diag_str(tc : TypeChecker, s : String) -> String {
+  if tc.canon_display_keys.length() == 0 || !s.contains("::") {
+    return s
+  }
+  let mut out = s
+  let mut i = 0
+  while i < tc.canon_display_keys.length() {
+    out = tc_replace_canon_qual(out, tc.canon_display_keys[i], tc.canon_display_vals[i])
+    i = i + 1
+  }
+  out
+}
+
+///|
 fn tc_err(
   tc : TypeChecker,
   span : Span,
@@ -2320,7 +2495,16 @@ fn tc_err(
   found : String,
   fixit : String,
 ) -> Unit {
-  tc.diagnostics.push(diag_new(span, code, message, expected, found, fixit))
+  tc.diagnostics.push(
+    diag_new(
+      span,
+      code,
+      tc_display_diag_str(tc, message),
+      tc_display_diag_str(tc, expected),
+      tc_display_diag_str(tc, found),
+      tc_display_diag_str(tc, fixit),
+    ),
+  )
 }
 
 ///|
@@ -12756,6 +12940,8 @@ pub fn check_package_with_imports_mapped(
     scalar_const_exprs: Map([]),
     import_aliases: Map([]),
     dep_map: dep_map,
+    canon_display_keys: [],
+    canon_display_vals: [],
     exported_c_syms: Map([]),
     exported_c_sym_names: [],
     imported_pkgs: Map([]),
@@ -12855,6 +13041,7 @@ pub fn check_package_with_imports_mapped(
     }
     fi_imp = fi_imp + 1
   }
+  tc_build_canon_display_map(tc)
 
   // Pass 1: register type names (structs & enums)
   let mut fi = 0
