@@ -52,6 +52,86 @@ else
   echo "NOTE: cc -fsanitize=address unavailable; skipping p101 ASan check"
 fi
 
+# Cross-package: monomorphized bodies and reordered generic calls of an imported package,
+# first with a cold cache, then with the library served from the CAS (warm rebuild).
+LIB="$TMP_DIR/lib"; APP="$TMP_DIR/app"
+mkdir -p "$LIB/src" "$APP/src"
+cat > "$LIB/pion.toml" <<'EOF'
+[package]
+name = "maplib"
+version = "0.1.0"
+EOF
+cat > "$LIB/src/lib.pion" <<'EOF'
+pub struct Key {
+  a : Int
+  b : Int
+}
+
+fn id[T](x : T) -> T {
+  x
+}
+
+fn pairs[K, V](k : K, v : V) -> Array[(K, V)] {
+  [(k, v), (k, v)]
+}
+
+pub fn keep[T](x~ : T, o~ : Option[T]) -> Int {
+  match o {
+    Some(_) => 1
+    None => 2
+  }
+}
+
+pub fn inner[T](v : T) -> Int {
+  keep(o=None, x=id(v)) * 10 + Map([(id(7), v)]).length()
+}
+
+pub fn lit[T](v : T) -> Int {
+  let m = Map([(Key::{ a: 1, b: 2 }, id(v)), (Key::{ a: 3, b: 4 }, v)])
+  let n = Map(pairs("k", v))
+  m.length() * 10 + n.length()
+}
+
+pub fn fixed() -> Int {
+  let m = Map(pairs(id(5), "five"))
+  match m.get(5) {
+    Some(s) => s.length()
+    None => -1
+  }
+}
+EOF
+cat > "$APP/pion.toml" <<EOF
+[package]
+name = "mapapp"
+version = "0.1.0"
+
+[dependencies]
+maplib = { path = "$LIB" }
+EOF
+cat > "$APP/src/main.pion" <<'EOF'
+import "maplib" as l
+
+fn id[T](x : T) -> T {
+  x
+}
+
+pub fn main(w : World) -> Int {
+  io_println(w, "\{l::keep(o=None, x=id("s"))} \{l::keep(o=None, x=id(1))} \{l::inner("a")} \{l::inner(3)} \{l::lit("a")} \{l::lit([1])} \{l::fixed()}")
+  0
+}
+EOF
+XWANT="2 2 21 21 21 21 4"
+for round in cold warm; do
+  XDEV="$("$PIONC" run "$APP")"
+  XREL="$("$PIONC" run --release "$APP")"
+  if [ "$XDEV" != "$XWANT" ] || [ "$XREL" != "$XWANT" ]; then
+    echo "FAIL: p101 cross-package ($round) dev=$XDEV release=$XREL want=$XWANT" >&2
+    exit 1
+  fi
+  printf '\nfn unused_%s() -> Int {\n  0\n}\n' "$round" >> "$APP/src/main.pion"
+done
+echo "p101 cross-package ok"
+
 cat > "$TMP_DIR/bad.pion" <<'EOF'
 fn main(w : World) -> Unit {
   let m : Map[Int, String] = Map([(1, 5)])
