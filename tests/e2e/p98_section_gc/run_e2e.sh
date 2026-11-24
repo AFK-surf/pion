@@ -477,11 +477,16 @@ EOF
 fi
 
 if command -v x86_64-w64-mingw32-gcc >/dev/null 2>&1; then
+  MINGW_NM="x86_64-w64-mingw32-nm"
+  command -v "$MINGW_NM" >/dev/null 2>&1 || MINGW_NM="nm"
+  MINGW_AR="x86_64-w64-mingw32-ar"
+  command -v "$MINGW_AR" >/dev/null 2>&1 || MINGW_AR="ar"
   WIN_EXE="$TMP/app_win_gc.exe"
   env -u PION_RT_LIB CC=x86_64-w64-mingw32-gcc "$PIONC" build --release --target amd64_win -o "$WIN_EXE" "$WS/app"
   # MinGW GCC's default PE linker script KEEP()s `.pdata*` for C sources unless
   # compiled with `-fno-asynchronous-unwind-tables`, so check Pion QBE symbols here.
-  if x86_64-w64-mingw32-nm --defined-only "$WIN_EXE" | grep -q 'dead_bloat_fn_0\|dead_match_jtbl_fn\|dead_priv_local_fn'; then
+  "$MINGW_NM" --defined-only "$WIN_EXE" > "$TMP/win_nm.txt"
+  if grep -q 'dead_bloat_fn_0\|dead_match_jtbl_fn\|dead_priv_local_fn' "$TMP/win_nm.txt"; then
     echo "FAIL: dead Pion symbols survived in MinGW amd64_win .exe" >&2
     exit 1
   fi
@@ -605,7 +610,7 @@ with open(sys.argv[1], "w") as f:
     f.write('.section .text$main,"xr"\n.linkonce one_only\n.globl main\nmain:\n\tcall f_0\n\txorl %eax,%eax\n\tret\n')
 PYEOF
   x86_64-w64-mingw32-gcc -Wa,-mbig-obj -c "$TMP/bigobj.s" -o "$TMP/bigobj.o"
-  x86_64-w64-mingw32-ar rcs "$TMP/libbigobj.a" "$TMP/bigobj.o"
+  "$MINGW_AR" rcs "$TMP/libbigobj.a" "$TMP/bigobj.o"
   x86_64-w64-mingw32-gcc -Wl,--gc-sections "$TMP/bigobj.o" -o "$TMP/bigobj.exe"
   echo "[PASS] p98: 66,000-section COFF big-obj assembled, archived, and GC-linked"
 
@@ -878,12 +883,18 @@ $FLAGS_LINE
 EOF
     CL_ARGV_LOG="$TMP/cl_argv_${CASE}.log"
     CL_DRY_LOG="$TMP/cl_dry_${CASE}.log"
+    CL_ARGV_LOG_NAT="${TMP_NAT}${NAT_SEP}cl_argv_${CASE}.log"
+    CL_DRY_LOG_NAT="${TMP_NAT}${NAT_SEP}cl_dry_${CASE}.log"
+    CLANG_BIN_NAT="$CLANG_BIN"
+    if command -v cygpath >/dev/null 2>&1; then
+      CLANG_BIN_NAT="$(cygpath -w "$CLANG_BIN")"
+    fi
     rm -f "$CL_ARGV_LOG" "$CL_DRY_LOG" "$TMP/cl_out_${CASE}.exe"
     PION_CACHE_DIR="$TMP/cas_cl_${CASE}" \
       PION_RT_LIB="$DUMMY_RT" \
-      P98_REAL_CLANG="$CLANG_BIN" \
-      P98_CL_ARGV_LOG="$CL_ARGV_LOG" \
-      P98_CL_DRY_LOG="$CL_DRY_LOG" \
+      P98_REAL_CLANG="$CLANG_BIN_NAT" \
+      P98_CL_ARGV_LOG="$CL_ARGV_LOG_NAT" \
+      P98_CL_DRY_LOG="$CL_DRY_LOG_NAT" \
       CC="$CL_SHIM" \
       "$PIONC" build --release --target amd64_win -o "$TMP/cl_out_${CASE}.exe" "$CL_PKG"
     python3 - "$CL_ARGV_LOG" "$CL_DRY_LOG" "$CASE" <<'PYEOF'
