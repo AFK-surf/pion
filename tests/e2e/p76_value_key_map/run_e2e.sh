@@ -388,7 +388,27 @@ fi
     echo "FAIL: hot_vmap SSA did not lower m.get().unwrap_or() to pion_vmap_get_or_" >&2
     exit 1
   fi
-  echo "3. SSA audit (0 pion_alloc_uninit in hot_vmap + register-return pion_vmap_get_or_) -> OK"
+  # QBE `jnz` tests only the low 32 bits: a heap pointer such as 0x600000000000 reads as null.
+  # vmap null guards on 64-bit buffers must go through `cnel ..., 0` first.
+  GROW_BODY="$(awk '/function .*\$pion_vmap_grow_/,/^}/' "$TMP_DIR/audit.ssa")"
+  DROP_BODY="$(awk '/function .*\$pion_vmap_drop_/,/^}/' "$TMP_DIR/audit.ssa")"
+  if [ -z "$GROW_BODY" ] || [ -z "$DROP_BODY" ]; then
+    echo "FAIL: audit SSA lacks \$pion_vmap_grow_ / \$pion_vmap_drop_" >&2
+    exit 1
+  fi
+  if printf '%s' "$GROW_BODY" | grep -q 'jnz %obuf,' ||
+    ! printf '%s' "$GROW_BODY" | grep -q '%obuf_nz =w cnel %obuf, 0'; then
+    echo "FAIL: \$pion_vmap_grow_ branches on 64-bit %obuf with a 32-bit jnz" >&2
+    printf '%s\n' "$GROW_BODY" >&2
+    exit 1
+  fi
+  if printf '%s' "$DROP_BODY" | grep -q 'jnz %buf,' ||
+    ! printf '%s' "$DROP_BODY" | grep -q '%buf_nz =w cnel %buf, 0'; then
+    echo "FAIL: \$pion_vmap_drop_ branches on 64-bit %buf with a 32-bit jnz" >&2
+    printf '%s\n' "$DROP_BODY" >&2
+    exit 1
+  fi
+  echo "3. SSA audit (0 pion_alloc_uninit in hot_vmap + register-return pion_vmap_get_or_ + 64-bit cnel null guards in vmap grow/drop) -> OK"
 
 # 4. Native ASan/LSan (0 leaks)
 CC_BIN="${CC:-cc}"
