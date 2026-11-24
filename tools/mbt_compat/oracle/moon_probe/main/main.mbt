@@ -654,6 +654,62 @@ fn case_wave_m2_compat() -> Unit {
 }
 
 ///|
+fn case_wave_m2_round2() -> Unit {
+  // P1-6: UTF-8 lossy maximal subpart (Unicode Table 3-7 / WHATWG)
+  let samples : Array[(String, Array[Byte])] = [
+    ("e0a0", [b'\xE0', b'\xA0']),
+    ("e282", [b'\xE2', b'\x82']),
+    ("e28241", [b'\xE2', b'\x82', b'\x41']),
+    ("f09f92", [b'\xF0', b'\x9F', b'\x92']),
+    ("f0908041", [b'\xF0', b'\x90', b'\x80', b'\x41']),
+    ("mixed", [b'\xC0', b'\x80', b'\xED', b'\xA0', b'\x80', b'\xF4', b'\x90', b'\x80', b'\x80', b'\xFF', b'\x7A']),
+  ]
+  for pair in samples {
+    let dec = @utf8.decode_lossy(Bytes::from_array(pair.1))
+    let sb = StringBuilder::new()
+    for i = 0; i < dec.length(); i = i + 1 {
+      if i > 0 { sb.write_string(",") }
+      sb.write_string(dec[i].to_int().to_string())
+    }
+    trace("utf8." + pair.0, sb.to_string())
+  }
+  check("r2.utf8_subpart", @utf8.decode_lossy(Bytes::from_array([b'\xE0', b'\xA0'])).length() == 1)
+
+  // P1-7: math.maximum / math.minimum on NaN and ±0.0
+  let nan = 0.0 / 0.0
+  let p0 = 0.0
+  let n0 = -0.0
+  let pairs : Array[(String, Double, Double)] = [
+    ("nan_1", nan, 1.0),
+    ("1_nan", 1.0, nan),
+    ("p0_n0", p0, n0),
+    ("n0_p0", n0, p0),
+    ("nan_nan", nan, nan),
+    ("2_5", 2.0, 5.0),
+  ]
+  for item in pairs {
+    let mx = @math.maximum(item.1, item.2)
+    let mn = @math.minimum(item.1, item.2)
+    trace("mm." + item.0, "\{mx.reinterpret_as_int64()},\{mn.reinterpret_as_int64()}")
+  }
+  check("r2.math_max_nan", @math.maximum(nan, 1.0) == 1.0 && @math.maximum(1.0, nan).is_nan())
+  check("r2.math_min_nan", @math.minimum(nan, 1.0).is_nan() && @math.minimum(1.0, nan) == 1.0)
+
+  // P1-8: Lazy iter short-circuiting
+  let mut c1 = 0
+  let a1 = [1, 2, 3, 4, 5, 6].iter().map(fn(x) { c1 = c1 + 1; x * 2 }).any(fn(x) { x == 4 })
+  let mut c2 = 0
+  let a2 = [1, 2, 3, 4, 5, 6].iter().map(fn(x) { c2 = c2 + 1; x * 2 }).all(fn(x) { x < 6 })
+  trace("iter", "\{a1}:\{c1},\{a2}:\{c2}")
+  check("r2.iter_lazy", a1 && c1 == 2 && !a2 && c2 == 3)
+
+  // P0-1: Debug formatting for String & Char
+  let ds = "\"ab\\n\\t\\\\\\\"\""
+  trace("dbg_str", ds)
+  check("r2.dbg_str", ds.length() == 12)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -679,6 +735,7 @@ fn main {
     "opt.unwrap_none" => case_opt_unwrap_none()
     "arr.remove_oob" => case_arr_remove_oob()
     "wave_m2.compat" => case_wave_m2_compat()
+    "wave_m2.round2" => case_wave_m2_round2()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)
