@@ -233,12 +233,10 @@ if [ "$RC" -ne 0 ]; then
   echo "FAIL: Pr3Eval.lean (rc=$RC)" >&2
   exit 1
 fi
-# NOTE: c_20_default_ref_prior_param (Lean = 10) awaits native qbe.pion fix for
-# default parameter caller-local capture; l_25..l_29 are Lean-only extraction/eval
-# regressions; all other 24 `c_*` cases (incl. c_13=21, c_18=1241, c_22=1) are
-# directly diffed Native == Lean.
-grep -v '^c_20_' "$PR3_OUT/native.out" > "$PR3_OUT/native_cmp.out"
-grep -vE '^(c_20_|l_)' "$PR3_OUT/lean.out" > "$PR3_OUT/lean_cmp.out"
+# NOTE: l_25..l_29 are Lean-only extraction/eval regressions; all 25 `c_*` cases
+# (incl. c_13=21, c_18=1241, c_20=10, c_22=1) are directly diffed Native == Lean.
+cp "$PR3_OUT/native.out" "$PR3_OUT/native_cmp.out"
+grep -vE '^l_' "$PR3_OUT/lean.out" > "$PR3_OUT/lean_cmp.out"
 if ! diff -u "$PR3_OUT/native_cmp.out" "$PR3_OUT/lean_cmp.out"; then
   echo "FAIL: pr3_soundness native and Lean disagree" >&2
   exit 1
