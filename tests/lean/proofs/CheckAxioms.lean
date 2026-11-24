@@ -7,6 +7,7 @@ import PionProofs.CodecProofs
 import PionProofs.AlgosProofs
 import PionProofs.CapTableProofs
 import PionProofs.QbeTvProofs
+import PionProofs.QbeArm64SlotPairs
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -465,3 +466,11 @@ import PionProofs.QbeTvProofs
 #print axioms PionProofs.QbeTvP.tgt_start
 #print axioms PionProofs.QbeTvP.verify_cert_sound
 #print axioms PionProofs.QbeTvP.validate_fn_sound
+#print axioms PionQbeArm64SlotPairs.adjacent_store
+#print axioms PionQbeArm64SlotPairs.storePair_frame
+#print axioms PionQbeArm64SlotPairs.adjacent_load
+#print axioms PionQbeArm64SlotPairs.same_dest_order_matters
+#print axioms PionQbeArm64SlotPairs.slotPairEncoding
+#print axioms PionQbeArm64SlotPairs.slotAdjacent
+#print axioms PionQbeArm64SlotPairs.pairWord_fields
+#print axioms PionQbeArm64SlotPairs.pairBases

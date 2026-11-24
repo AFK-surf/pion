@@ -16,8 +16,8 @@ adjacent private spill slots become one `stp`/`ldp [x29, #off]`.
      `base | L<<22 | imm7<<15 | Rt2<<10 | Rn<<5 | Rt` decodes back to each
      field, i.e. the fields occupy disjoint bit ranges.
 
-Zero external dependencies, zero `sorry`, pure kernel checks (no
-`bv_decide` / `native_decide`), compatible with both standalone
+Zero external dependencies, complete kernel proofs without external
+solvers or compiled-code evaluation, compatible with both standalone
 `lean -DwarningAsError=true` and `scripts/test-lean.sh`.
 -/
 

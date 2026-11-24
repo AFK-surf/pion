@@ -127,6 +127,22 @@ if [ "$UNAME_S" = Darwin ] && { [ "$UNAME_M" = arm64 ] || [ "$UNAME_M" = aarch64
     done
     echo "[PASS] Mach-O --obj stp/ldp encodings == assembler's"
   fi
+elif [ "$UNAME_S" = Linux ] && { [ "$UNAME_M" = aarch64 ] || [ "$UNAME_M" = arm64 ]; }; then
+  "$CC" -O2 "$HERE/driver.c" "$TMP_DIR/pairs.s" -o "$TMP_DIR/run_arm64"
+  OUT="$("$TMP_DIR/run_arm64")"
+  if [ "$OUT" != "$EXPECT" ]; then
+    echo "FAIL: linux arm64 native execution: $OUT" >&2
+    echo "      expected:                   $EXPECT" >&2
+    exit 1
+  fi
+  echo "[PASS] linux arm64 native execution: $OUT"
+  if command -v objdump >/dev/null 2>&1; then
+    # The assembler's encoding of every pair, disassembled back, keeps its shape.
+    objdump -d --no-show-raw-insn "$TMP_DIR/run_arm64" \
+      | sed -E 's/^[[:space:]]*[0-9a-f]+:[[:space:]]+//; s/^([a-z]+)[[:space:]]+/\1\t/; s/<([A-Za-z_0-9]+)>:$/\1:/; s/^[0-9a-f]+ //' \
+      > "$TMP_DIR/run_arm64.dis"
+    check_asm "$TMP_DIR/run_arm64.dis" "linux arm64 objdump"
+  fi
 elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && command -v qemu-aarch64 >/dev/null 2>&1; then
   aarch64-linux-gnu-gcc -static -O2 "$HERE/driver.c" "$TMP_DIR/pairs.s" -o "$TMP_DIR/run_arm64"
   OUT="$(qemu-aarch64 "$TMP_DIR/run_arm64")"
@@ -135,5 +151,7 @@ elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && command -v qemu-aarch64
     exit 1
   fi
   echo "[PASS] aarch64 qemu execution: $OUT"
+else
+  echo "[SKIP] P105 execution: not AArch64 and no aarch64-linux-gnu-gcc + qemu-aarch64 (text-asm checks only)"
 fi
 echo "P105 arm64 private spill-slot pairing: OK"
