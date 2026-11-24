@@ -262,6 +262,11 @@ deriving Repr, BEq, DecidableEq
 
 instance {α : Type u} [BEq α] : Pion.Eq (Pion.Array α) := { toBEq := inferInstance }
 instance {α : Type u} [BEq α] : Pion.Eq (Pion.ImmArray α) := { toBEq := inferInstance }
+instance {α : Type u} {β : Type v} [BEq α] [BEq β] : Pion.Eq (α × β) := { toBEq := inferInstance }
+instance {α : Type u} [BEq α] : Pion.Eq (_root_.Option α) := { toBEq := inferInstance }
+instance {α : Type u} {ε : Type v} [BEq α] [BEq ε] : Pion.Eq (Pion.Res α ε) := { toBEq := inferInstance }
+instance {α : Type u} [BEq α] : Pion.Eq (Pion.FixedArray α) := { toBEq := inferInstance }
+instance : Pion.Eq Pion.Bytes := { toBEq := inferInstance }
 
 /-- Index check shared by every container: `0 ≤ i < n`. -/
 @[simp] def inBounds (i : Std.I32) (n : Nat) : Prop := 0 ≤ i.val ∧ i.val < n
