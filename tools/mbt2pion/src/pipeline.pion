@@ -1,0 +1,898 @@
+///| End-to-end 3-stage deterministic transpilation pipeline (`mbt2pion`).
+///|
+///| Orchestrates:
+///| 1. Deterministic source file ordering
+///| 2. Stage A (symbol prescan, lossless CST lowering, topological `00_init_order.pion`)
+///| 3. Declaration-granularity double-hash-anchored Overlays
+///| 4. Stage A.5 (type-probe pass with mandatory coverage guard)
+///| 5. Stage B (`pionc check --json` type-directed fixpoint pass)
+///| 6. Platform-neutral header prepending
+///| 7. Hard merge/publish gate checks (0 `MBT2PION_MANUAL`, 0 `mbt_*_probe` residuals,
+///|    0 unresolved drift entries, 0 error diagnostics).
+
+///| Collect sorted unique external package prefixes (`<pkg>::`) actually referenced in `content`,
+///| ignoring comments, plain string literals, uppercase type/enum namespaces, `self`/`super`, and
+///| packages already imported in `content`. Recursively scans `\{...}` inside interpolated strings!
+pub fn collect_referenced_packages(content : String) -> Array[String] {
+  let tokens = lex_moonbit(content)
+  let n = tokens.length() - 1
+  let already : Map[String, Bool] = Map()
+  let found : Map[String, Bool] = Map()
+  let mut i = 0
+  while i < n {
+    let t = tokens[i]
+    if t.kind == TokenKind::Keyword && t.raw == "import" && i + 1 < n && tokens[i + 1].kind == TokenKind::StringLit {
+      let raw_s = tokens[i + 1].raw
+      if raw_s.length() >= 2 {
+        already[raw_s.slice(1, raw_s.length() - 1)] = true
+      }
+      i = i + 2
+      continue
+    }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let parts = split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline)
+      for p in parts {
+        if p.is_expr {
+          let inner_pkgs = collect_referenced_packages(p.text)
+          for ip in inner_pkgs {
+            if !already.contains(ip) {
+              found[ip] = true
+            }
+          }
+        }
+      }
+      i = i + 1
+      continue
+    }
+    if t.kind == TokenKind::Ident && i + 1 < n && tokens[i + 1].kind == TokenKind::ColonColon {
+      let prev_dot_or_cc = i > 0 && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)
+      let c0 = if t.raw.length() > 0 { t.raw.code_unit_at(0) } else { 0 }
+      let is_lower = c0 >= 97 && c0 <= 122
+      if !prev_dot_or_cc && is_lower && t.raw != "self" && t.raw != "super" && !already.contains(t.raw) {
+        found[t.raw] = true
+      }
+    }
+    i = i + 1
+  }
+  sorted_map_keys(found)
+}
+
+///| Render deterministic `import "<pkg>"` block for a generated `.pion` file.
+pub fn render_auto_imports(content : String) -> String {
+  let pkgs = collect_referenced_packages(content)
+  if pkgs.length() == 0 {
+    return ""
+  }
+  let sb = StringBuilder()
+  for pkg in pkgs {
+    sb.write_string("import \"" + pkg + "\"\n")
+  }
+  sb.write_string("\n")
+  sb.to_string()
+}
+
+///| Prepend platform-neutral headers to every generated file
+fn prepend_headers_and_imports(
+  gen_files : Array[GeneratedFile],
+  opts : TranspileOptions,
+  diags : Array[Diag],
+) -> Array[GeneratedFile] {
+  let final_files : Array[GeneratedFile] = []
+  for gf in gen_files {
+    let hdr = render_platform_neutral_header(opts.header, gf.source_file)
+    let imports = render_auto_imports(gf.content)
+    let full = hdr + imports + gf.content
+    // Hard gate: check for `MBT2PION_MANUAL` markers
+    if str_has(full, "MBT2PION_MANUAL") {
+      diags.push(diag_error(
+        "MBT2PION_MANUAL",
+        gf.rel_path,
+        1,
+        1,
+        "unresolved MBT2PION_MANUAL marker in " + gf.rel_path,
+      ))
+    }
+    // Hard gate: check for `mbt_*_probe` residuals
+    if has_probe_residual(full) {
+      diags.push(diag_error(
+        "MBT2PION_PROBE_RESIDUAL",
+        gf.rel_path,
+        1,
+        1,
+        "probe residual found in final output of " + gf.rel_path,
+      ))
+    }
+    final_files.push(GeneratedFile::{
+      rel_path: gf.rel_path,
+      content: full,
+      source_file: gf.source_file,
+      anchors: gf.anchors,
+    })
+  }
+  final_files
+}
+
+///| Split a comma-separated bracket list interior respecting nested `[...]` and `"..."` strings.
+fn split_bracket_items(inner : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut depth = 0
+  let mut in_str = false
+  let mut esc = false
+  let mut i = 0
+  while i < inner.length() {
+    let c = inner.code_unit_at(i)
+    if in_str {
+      if esc {
+        esc = false
+      } else if c == 92 {
+        esc = true
+      } else if c == 34 {
+        in_str = false
+      }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 91 {
+      depth = depth + 1
+    } else if c == 93 {
+      if depth > 0 { depth = depth - 1 }
+    } else if c == 44 && depth == 0 {
+      let piece = inner.slice(start, i).trim()
+      if piece.length() > 0 {
+        out.push(piece)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  let tail = inner.slice(start, inner.length()).trim()
+  if tail.length() > 0 {
+    out.push(tail)
+  }
+  out
+}
+
+///| Structured AST for `moon.pkg` / `moon.pkg.json` target-rule expressions.
+pub enum TargetRuleExpr {
+  Atom(String)
+  List(Array[TargetRuleExpr])
+}
+
+///| Format a `TargetRuleExpr` for diagnostics and compatibility display.
+pub fn format_target_rule_expr(expr : TargetRuleExpr) -> String {
+  match expr {
+    TargetRuleExpr::Atom(s) => "\"" + s + "\""
+    TargetRuleExpr::List(items) => {
+      let parts : Array[String] = []
+      for it in items {
+        parts.push(format_target_rule_expr(it))
+      }
+      "[" + join_comma(parts) + "]"
+    }
+  }
+}
+
+///| Parse a structured `TargetRuleExpr` directly from `lex_moonbit` tokens
+///| (decodes every string literal escape and rejects malformed syntax fail-closed).
+fn parse_target_rule_expr_tokens(tokens : Array[Token], val_i : Int, limit : Int) -> Result[(TargetRuleExpr, Int), String] {
+  if val_i >= limit {
+    return Err("malformed moon.pkg target rule: unexpected end of expression")
+  }
+  let tok = tokens[val_i]
+  if tok.kind == TokenKind::StringLit {
+    match decode_mbt_string_lit(tok.raw) {
+      Ok(decoded) => return Ok((TargetRuleExpr::Atom(decoded), val_i + 1))
+      Err(e) => return Err("malformed moon.pkg target rule string: " + e)
+    }
+  }
+  if tok.kind == TokenKind::LBracket {
+    let rb = find_matching_delim(tokens, val_i)
+    if rb >= limit || tokens[rb].kind != TokenKind::RBracket {
+      return Err("malformed moon.pkg target rule: unclosed `[`")
+    }
+    let items : Array[TargetRuleExpr] = []
+    let mut k = val_i + 1
+    while k < rb {
+      if tokens[k].kind == TokenKind::Comma {
+        return Err("malformed moon.pkg target rule: empty array item")
+      }
+      match parse_target_rule_expr_tokens(tokens, k, rb) {
+        Err(e) => return Err(e)
+        Ok((item_ast, next_k)) => {
+          items.push(item_ast)
+          k = next_k
+        }
+      }
+      if k < rb {
+        if tokens[k].kind == TokenKind::Comma {
+          k = k + 1
+        } else {
+          return Err("malformed moon.pkg target rule: expected `,` in array near `" + tokens[k].raw + "`")
+        }
+      }
+    }
+    return Ok((TargetRuleExpr::List(items), rb + 1))
+  }
+  Err("invalid moon.pkg target rule expression near `" + tok.raw + "`")
+}
+
+///| Strictly parse a `{ "file.mbt": <rule_expr>, ... }` targets table from `lex_moonbit` tokens,
+///| decoding all filename keys and checking duplicate keys AFTER decoding.
+fn parse_targets_table_tokens(
+  tokens : Array[Token],
+  start : Int,
+  limit : Int,
+  out : Map[String, TargetRuleExpr],
+) -> Result[Int, String] {
+  if start >= limit || tokens[start].kind != TokenKind::LBrace {
+    return Err("malformed moon.pkg targets table: expected `{ ... }`")
+  }
+  let rb = find_matching_delim(tokens, start)
+  if rb >= limit || tokens[rb].kind != TokenKind::RBrace {
+    return Err("malformed moon.pkg targets table: unclosed `{`")
+  }
+  let mut k = start + 1
+  while k < rb {
+    if tokens[k].kind != TokenKind::StringLit {
+      return Err("malformed moon.pkg targets table: expected quoted filename key near `" + tokens[k].raw + "`")
+    }
+    let fname = match decode_mbt_string_lit(tokens[k].raw) {
+      Ok(s) => s
+      Err(e) => return Err("malformed moon.pkg targets filename key: " + e)
+    }
+    if fname.length() == 0 {
+      return Err("malformed moon.pkg targets table: empty filename key")
+    }
+    k = k + 1
+    if k >= rb || tokens[k].kind != TokenKind::Colon {
+      return Err("malformed moon.pkg targets table: expected `:` after `" + fname + "`")
+    }
+    k = k + 1
+    match parse_target_rule_expr_tokens(tokens, k, rb) {
+      Err(e) => return Err(e)
+      Ok((expr_ast, next_k)) => {
+        if out.contains(fname) {
+          return Err("duplicate target rule for " + fname)
+        }
+        out[fname] = expr_ast
+        k = next_k
+      }
+    }
+    if k < rb {
+      if tokens[k].kind == TokenKind::Comma {
+        k = k + 1
+      } else {
+        return Err("malformed moon.pkg targets table: expected `,` or `}` after rule for `" + fname + "`")
+      }
+    }
+  }
+  Ok(rb + 1)
+}
+
+///| Lexer-backed strict parser for BOTH `moon.pkg.json` (`"targets": { ... }`) AND
+///| real MoonBit `moon.pkg` DSL (`options(targets: { ... })`).
+///| Decodes JSON/MoonBit string escapes in field names, filenames, and rule atoms,
+///| rejects duplicate `targets` fields and duplicate decoded filenames fail-closed.
+pub fn parse_moon_pkg_targets_strict(content : String) -> Result[Map[String, TargetRuleExpr], String] {
+  let out : Map[String, TargetRuleExpr] = Map()
+  let tokens = lex_moonbit(content)
+  let n = tokens.length() - 1
+  if n <= 0 {
+    return Ok(out)
+  }
+  let mut seen_targets = false
+  // 1. JSON manifest (`moon.pkg.json`): root `{ ... }` top-level `"targets": { ... }`
+  if tokens[0].kind == TokenKind::LBrace {
+    let rb = find_matching_delim(tokens, 0)
+    if rb >= n || tokens[rb].kind != TokenKind::RBrace {
+      return Err("malformed moon.pkg.json: unclosed top-level `{`")
+    }
+    let mut k = 1
+    while k < rb {
+      if tokens[k].kind == TokenKind::Comma {
+        k = k + 1
+        continue
+      }
+      if tokens[k].kind == TokenKind::StringLit && k + 1 < rb && tokens[k + 1].kind == TokenKind::Colon {
+        let key_decoded = match decode_mbt_string_lit(tokens[k].raw) {
+          Ok(s) => s
+          Err(e) => return Err("malformed moon.pkg.json key: " + e)
+        }
+        let val_i = k + 2
+        if key_decoded == "targets" {
+          if seen_targets {
+            return Err("duplicate targets field in moon.pkg")
+          }
+          seen_targets = true
+          match parse_targets_table_tokens(tokens, val_i, rb, out) {
+            Err(e) => return Err(e)
+            Ok(next_k) => {
+              k = next_k
+              continue
+            }
+          }
+        }
+        // Skip non-targets JSON value at top level
+        if val_i < rb && (tokens[val_i].kind == TokenKind::LBrace || tokens[val_i].kind == TokenKind::LBracket || tokens[val_i].kind == TokenKind::LParen) {
+          k = find_matching_delim(tokens, val_i) + 1
+        } else {
+          k = val_i
+          while k < rb && tokens[k].kind != TokenKind::Comma {
+            if tokens[k].kind == TokenKind::LBrace || tokens[k].kind == TokenKind::LBracket || tokens[k].kind == TokenKind::LParen {
+              k = find_matching_delim(tokens, k) + 1
+            } else {
+              k = k + 1
+            }
+          }
+        }
+        continue
+      }
+      if tokens[k].kind == TokenKind::LBrace || tokens[k].kind == TokenKind::LBracket || tokens[k].kind == TokenKind::LParen {
+        k = find_matching_delim(tokens, k) + 1
+      } else {
+        k = k + 1
+      }
+    }
+    return Ok(out)
+  }
+  // 2. DSL manifest (`moon.pkg`): top-level `options( ... targets: { ... } ... )`
+  let mut k = 0
+  while k < n {
+    if (tokens[k].kind == TokenKind::Ident || tokens[k].kind == TokenKind::Keyword) &&
+    tokens[k].raw == "options" && k + 1 < n && tokens[k + 1].kind == TokenKind::LParen {
+      let rp = find_matching_delim(tokens, k + 1)
+      if rp >= n || tokens[rp].kind != TokenKind::RParen {
+        return Err("malformed moon.pkg: unclosed `options(...)`")
+      }
+      let mut j = k + 2
+      while j < rp {
+        if tokens[j].kind == TokenKind::Comma {
+          j = j + 1
+          continue
+        }
+        let mut is_targets_key = false
+        if (tokens[j].kind == TokenKind::Ident || tokens[j].kind == TokenKind::Keyword) && tokens[j].raw == "targets" {
+          is_targets_key = true
+        } else if tokens[j].kind == TokenKind::StringLit && j + 1 < rp && tokens[j + 1].kind == TokenKind::Colon {
+          match decode_mbt_string_lit(tokens[j].raw) {
+            Ok(s) => if s == "targets" { is_targets_key = true }
+            Err(e) => return Err("malformed moon.pkg option key: " + e)
+          }
+        }
+        if is_targets_key && j + 1 < rp && tokens[j + 1].kind == TokenKind::Colon {
+          if seen_targets {
+            return Err("duplicate targets field in moon.pkg")
+          }
+          seen_targets = true
+          match parse_targets_table_tokens(tokens, j + 2, rp, out) {
+            Err(e) => return Err(e)
+            Ok(next_j) => {
+              j = next_j
+              continue
+            }
+          }
+        }
+        // Skip non-targets field inside `options(...)`
+        if tokens[j].kind == TokenKind::LBrace || tokens[j].kind == TokenKind::LBracket || tokens[j].kind == TokenKind::LParen {
+          j = find_matching_delim(tokens, j) + 1
+        } else {
+          j = j + 1
+        }
+      }
+      k = rp + 1
+      continue
+    }
+    if tokens[k].kind == TokenKind::LBrace || tokens[k].kind == TokenKind::LBracket || tokens[k].kind == TokenKind::LParen {
+      k = find_matching_delim(tokens, k) + 1
+    } else {
+      k = k + 1
+    }
+  }
+  Ok(out)
+}
+
+///| Compatibility wrapper returning `Map[String, String]` (empty map on parse error).
+pub fn parse_moon_pkg_targets(content : String) -> Map[String, String] {
+  let out : Map[String, String] = Map()
+  match parse_moon_pkg_targets_strict(content) {
+    Ok(m) => {
+      for k in m.keys() {
+        match m.get(k) {
+          Some(ast) => out[k] = format_target_rule_expr(ast)
+          None => ()
+        }
+      }
+    }
+    Err(_) => ()
+  }
+  out
+}
+
+///| Recursively evaluate a decoded `TargetRuleExpr` AST for `pion_target` (fail-closed:
+///| returns `None` on any unknown predicate, empty array, or malformed operator arity).
+pub fn eval_target_rule_ast(pion_target : String, expr : TargetRuleExpr) -> Option[Bool] {
+  match expr {
+    TargetRuleExpr::Atom(v) => {
+      if v == "all" {
+        return Some(true)
+      }
+      if v == "native" || v == "wasm" || v == "wasm-gc" || v == "js" || v == "llvm" {
+        return Some(v == moon_source_backend_for_target(pion_target))
+      }
+      None
+    }
+    TargetRuleExpr::List(items) => {
+      if items.length() == 0 {
+        return None
+      }
+      match items[0] {
+        TargetRuleExpr::Atom("not") => {
+          if items.length() < 2 {
+            return None
+          }
+          let mut any_true = false
+          let mut i = 1
+          while i < items.length() {
+            match eval_target_rule_ast(pion_target, items[i]) {
+              None => return None
+              Some(true) => any_true = true
+              Some(false) => ()
+            }
+            i = i + 1
+          }
+          Some(!any_true)
+        }
+        TargetRuleExpr::Atom("and") => {
+          if items.length() < 2 {
+            return None
+          }
+          let mut all_true = true
+          let mut i = 1
+          while i < items.length() {
+            match eval_target_rule_ast(pion_target, items[i]) {
+              None => return None
+              Some(false) => all_true = false
+              Some(true) => ()
+            }
+            i = i + 1
+          }
+          Some(all_true)
+        }
+        TargetRuleExpr::Atom("or") => {
+          if items.length() < 2 {
+            return None
+          }
+          let mut any_true = false
+          let mut i = 1
+          while i < items.length() {
+            match eval_target_rule_ast(pion_target, items[i]) {
+              None => return None
+              Some(true) => any_true = true
+              Some(false) => ()
+            }
+            i = i + 1
+          }
+          Some(any_true)
+        }
+        _ => {
+          let mut any_true = false
+          for item in items {
+            match eval_target_rule_ast(pion_target, item) {
+              None => return None
+              Some(true) => any_true = true
+              Some(false) => ()
+            }
+          }
+          Some(any_true)
+        }
+      }
+    }
+  }
+}
+
+///| Compatibility wrapper: parse `raw_expr` via `lex_moonbit` and evaluate via `eval_target_rule_ast`.
+pub fn eval_moon_pkg_target_rule(pion_target : String, raw_expr : String) -> Option[Bool] {
+  let tokens = lex_moonbit(raw_expr)
+  let n = tokens.length() - 1
+  if n <= 0 {
+    return None
+  }
+  match parse_target_rule_expr_tokens(tokens, 0, n) {
+    Ok((ast, next_i)) => if next_i == n { eval_target_rule_ast(pion_target, ast) } else { None }
+    Err(_) => None
+  }
+}
+
+///| Compatibility wrapper around `eval_moon_pkg_target_rule` for flat string-array rules.
+pub fn target_matches_moon_rules(pion_target : String, rules : Array[String]) -> Bool {
+  if rules.length() == 0 {
+    return true
+  }
+  let sb = StringBuilder()
+  sb.write_string("[")
+  let mut i = 0
+  while i < rules.length() {
+    if i > 0 { sb.write_string(", ") }
+    sb.write_string("\"" + rules[i] + "\"")
+    i = i + 1
+  }
+  sb.write_string("]")
+  match eval_moon_pkg_target_rule(pion_target, sb.to_string()) {
+    Some(b) => b
+    None => false
+  }
+}
+
+///| Locate the full declaration byte range `[start_byte, end_byte)` in a finalized `.pion` file
+///| using the lexer + balanced `{ ... }` brace matching (Astra P1-5 / Round 3 P1-2).
+///| Supports `pub`/`pub(all)`/`pub(open)`, leading generics `fn[T]`, qualified names `Widget::value_of`,
+///| and non-brace declarations (`let`/`const`/`type`).
+fn find_final_decl_span(final_txt : String, kind_tag : String) -> Option[(Int, Int)] {
+  let colon_i = kind_tag.index_of(":")
+  if colon_i <= 0 {
+    return None
+  }
+  let dkind = kind_tag.slice(0, colon_i)
+  let dname = kind_tag.slice(colon_i + 1, kind_tag.length())
+  let base_name = {
+    let bi = dname.index_of("[")
+    if bi > 0 { dname.slice(0, bi) } else { dname }
+  }
+  let toks = lex_moonbit(final_txt)
+  let n = toks.length() - 1
+  let mut i = 0
+  while i < n {
+    let t = toks[i]
+    if t.kind == TokenKind::Keyword && t.raw == dkind && i + 1 < n {
+      let mut name_i = i + 1
+      // Skip optional leading generic parameter list `fn[T, U]`
+      if dkind == "fn" && name_i < n && toks[name_i].kind == TokenKind::LBracket {
+        name_i = find_matching_delim(toks, name_i) + 1
+      }
+      // Build full qualified declaration name across `Ident`/`UpperIdent` + `::` (e.g. `Widget::value_of`)
+      let name_sb = StringBuilder()
+      let mut cur_n = name_i
+      while cur_n < n && (toks[cur_n].kind == TokenKind::Ident || toks[cur_n].kind == TokenKind::UpperIdent) {
+        name_sb.write_string(toks[cur_n].raw)
+        cur_n = cur_n + 1
+        if cur_n + 1 < n && toks[cur_n].kind == TokenKind::ColonColon &&
+        (toks[cur_n + 1].kind == TokenKind::Ident || toks[cur_n + 1].kind == TokenKind::UpperIdent) {
+          name_sb.write_string("::")
+          cur_n = cur_n + 1
+        } else {
+          break
+        }
+      }
+      if name_sb.to_string() == base_name {
+        // Walk back to include leading `pub`, `pub(all)`, `pub(open)` if immediately preceding
+        let mut start_tok = i
+        if start_tok > 0 && toks[start_tok - 1].kind == TokenKind::Keyword && toks[start_tok - 1].raw == "pub" {
+          start_tok = start_tok - 1
+        } else if start_tok >= 4 && toks[start_tok - 1].kind == TokenKind::RParen &&
+        toks[start_tok - 3].kind == TokenKind::LParen &&
+        toks[start_tok - 4].kind == TokenKind::Keyword && toks[start_tok - 4].raw == "pub" {
+          start_tok = start_tok - 4
+        }
+        if dkind == "let" || dkind == "const" || dkind == "type" {
+          // Non-brace declaration: scan to end of balanced expression/line
+          let mut end_tok = cur_n
+          let mut d = 0
+          while end_tok < n {
+            let ek = toks[end_tok].kind
+            if d == 0 && end_tok > cur_n && toks[end_tok].newline_before {
+              break
+            }
+            if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace {
+              d = d + 1
+            } else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace {
+              d = d - 1
+            }
+            end_tok = end_tok + 1
+          }
+          let last_tok = if end_tok > start_tok { end_tok - 1 } else { start_tok }
+          return Some((toks[start_tok].start_byte, toks[last_tok].end_byte))
+        }
+        let mut lb = cur_n
+        while lb < n && toks[lb].kind != TokenKind::LBrace {
+          lb = lb + 1
+        }
+        if lb < n && toks[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(toks, lb)
+          return Some((toks[start_tok].start_byte, toks[rb].end_byte))
+        }
+      }
+    }
+    i = i + 1
+  }
+  None
+}
+
+///| Recompute final byte/line/col `span_map` entries covering FULL declarations against
+///| the final formatted `.pion` files (Astra P1-5).
+pub fn finalize_span_map(
+  files : Array[GeneratedFile],
+  raw_spans : Array[SpanMapEntry],
+) -> Array[SpanMapEntry] {
+  let out : Array[SpanMapEntry] = []
+  let content_by_file : Map[String, String] = Map()
+  for gf in files {
+    content_by_file[gf.rel_path] = gf.content
+  }
+  for sp in raw_spans {
+    match content_by_file.get(sp.out_file) {
+      Some(final_txt) => {
+        let mut out_start = sp.out_start
+        let mut out_end = sp.out_end
+        let mut out_line = sp.out_line
+        let mut out_col = sp.out_col
+        match find_final_decl_span(final_txt, sp.kind) {
+          Some((s_b, e_b)) => {
+            out_start = s_b
+            out_end = e_b
+            let (ln, cl) = byte_offset_to_line_col(final_txt, s_b)
+            out_line = ln
+            out_col = cl
+          }
+          None => ()
+        }
+        out.push(SpanMapEntry::{
+          src_file: sp.src_file,
+          src_start: sp.src_start,
+          src_end: sp.src_end,
+          src_line: sp.src_line,
+          src_col: sp.src_col,
+          out_file: sp.out_file,
+          out_start: out_start,
+          out_end: out_end,
+          out_line: out_line,
+          out_col: out_col,
+          kind: sp.kind,
+        })
+      }
+      None => out.push(sp)
+    }
+  }
+  out
+}
+
+fn byte_offset_to_line_col(s : String, off : Int) -> (Int, Int) {
+  let mut line = 1
+  let mut col = 1
+  let lim = if off < s.length() { off } else { s.length() }
+  let mut i = 0
+  while i < lim {
+    if s.code_unit_at(i) == 10 {
+      line = line + 1
+      col = 1
+    } else {
+      col = col + 1
+    }
+    i = i + 1
+  }
+  (line, col)
+}
+
+///| Sort `SourceFile`s deterministically by `rel_path`.
+fn sort_source_files(files : Array[SourceFile]) -> Array[SourceFile] {
+  let out : Array[SourceFile] = []
+  for f in files {
+    out.push(f)
+  }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]
+    let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].rel_path, key.rel_path) > 0 {
+      out[j + 1] = out[j]
+      j = j - 1
+    }
+    out[j + 1] = key
+    i = i + 1
+  }
+  out
+}
+
+///| Run the full 3-stage deterministic `mbt2pion` pipeline.
+///| `check_fn` invokes `pionc check --json` on a batch of `(rel_path, content)` files.
+///| Pass a no-op callback `fn(_) { "{\"ok\":true,\"diagnostics\":[]}" }` when running Stage A standalone in unit tests.
+pub fn transpile_package(
+  sources : Array[SourceFile],
+  api_map : ApiMap,
+  recipes : Recipes,
+  overlays : Array[OverlaySpec],
+  mbti_files : Array[(String, String)],
+  opts : TranspileOptions,
+  pre_diags : Array[Diag],
+  run_probes : Bool,
+  check_fn : (Array[(String, String)]) -> String,
+) -> TranspileResult {
+  let sorted_sources = sort_source_files(sources)
+  let symtab = empty_symbol_table()
+  symtab_load_api_map(symtab, api_map)
+  for pair in mbti_files {
+    symtab_load_mbti(symtab, pair.0, pair.1)
+  }
+
+  let ctx = stage_a_context_new(symtab, recipes, opts)
+  for d in pre_diags {
+    ctx.diags.push(d)
+  }
+
+  // Filter test files unless `--with-tests` is enabled, AND apply `moon.pkg` / `moon.pkg.json` target rules (P1-3)
+  let pkg_targets = if opts.moon_pkg_content.length() > 0 {
+    match parse_moon_pkg_targets_strict(opts.moon_pkg_content) {
+      Ok(m) => m
+      Err(reason) => {
+        ctx.diags.push(diag_error("MBT2PION_UNSUPPORTED_TARGET_RULE", "moon.pkg", 1, 1, reason))
+        ctx.dispositions.push(DispositionEntry::{
+          file: "moon.pkg",
+          decl: "file:moon.pkg",
+          line: 1,
+          col: 1,
+          disposition: "unsupported",
+          detail: reason,
+        })
+        Map()
+      }
+    }
+  } else {
+    Map()
+  }
+  let selected : Array[SourceFile] = []
+  for sf in sorted_sources {
+    if sf.is_test && !opts.with_tests {
+      ctx.dispositions.push(DispositionEntry::{
+        file: sf.rel_path,
+        decl: "<file>",
+        line: 1,
+        col: 1,
+        disposition: "skipped_test_file",
+        detail: "excluded because --with-tests not set",
+      })
+      continue
+    }
+    // Check basename and rel_path against moon.pkg targets
+    let mut base = sf.rel_path
+    let mut ls = -1
+    let mut bi = 0
+    while bi < base.length() {
+      if base.code_unit_at(bi) == 47 {
+        ls = bi
+      }
+      bi = bi + 1
+    }
+    if ls >= 0 {
+      base = base.slice(ls + 1, base.length())
+    }
+    let rules_opt = match pkg_targets.get(sf.rel_path) {
+      Some(r) => Some(r)
+      None => pkg_targets.get(base)
+    }
+    match rules_opt {
+      Some(rule_ast) =>
+      match eval_target_rule_ast(opts.target, rule_ast) {
+        Some(true) => ()
+        Some(false) => {
+          ctx.dispositions.push(DispositionEntry::{
+            file: sf.rel_path,
+            decl: "<file>",
+            line: 1,
+            col: 1,
+            disposition: "excluded_by_target",
+            detail: "excluded by moon.pkg targets for target=" + opts.target,
+          })
+          continue
+        }
+        None => {
+          let raw_rule = format_target_rule_expr(rule_ast)
+          ctx.diags.push(diag_error(
+            "MBT2PION_UNSUPPORTED_TARGET_RULE",
+            sf.rel_path,
+            1,
+            1,
+            "unsupported moon.pkg target rule `" + raw_rule + "` for `" + sf.rel_path + "` cannot be statically evaluated for target=" + opts.target,
+          ))
+          ctx.dispositions.push(DispositionEntry::{
+            file: sf.rel_path,
+            decl: "file:" + sf.rel_path,
+            line: 1,
+            col: 1,
+            disposition: "unsupported",
+            detail: "unsupported moon.pkg target rule " + raw_rule,
+          })
+          continue
+        }
+      }
+      None => ()
+    }
+    selected.push(sf)
+  }
+
+  // Stage A.0: prescan intra-package symbols
+  prescan_package_symbols(ctx, selected)
+
+  // Stage A: lower every file
+  let mut gen_files : Array[GeneratedFile] = []
+  for sf in selected {
+    gen_files.push(lower_file_stage_a(ctx, sf))
+  }
+
+  // Stage A: topological declaration reordering into single `00_init_order.pion`
+  if ctx.init_items.length() > 0 {
+    let sorted_inits = topo_sort_init_items(ctx.init_items, ctx.fn_bodies, ctx.diags)
+    if sorted_inits.length() > 0 {
+      let init_body = render_init_order_file(sorted_inits)
+      let with_init : Array[GeneratedFile] = []
+      with_init.push(GeneratedFile::{
+        rel_path: "00_init_order.pion",
+        content: init_body,
+        source_file: "<package-init-order>",
+        anchors: [],
+      })
+      for gf in gen_files {
+        with_init.push(gf)
+      }
+      gen_files = with_init
+    }
+  }
+
+  // Declaration-granularity double-hash-anchored Overlays
+  gen_files = apply_overlays(gen_files, overlays, opts.target, ctx.diags, ctx.dispositions)
+
+  // Stage B pre-pass + Stage A.5 Type-Probe Pass + Stage B final fixpoint pass:
+  // Running Stage B first fixes compile-time errors (`for k, v in m`, `for i, ch in s`,
+  // `String` slices, missing methods) so Stage A.5 probes see exact resolved types!
+  let mut probe_rounds = 0
+  let mut probes_instrumented = 0
+  let mut probes_resolved = 0
+  let mut pre_b_iters = 0
+  if run_probes {
+    let (pre_files, pre_it, _) = run_stage_b(gen_files, api_map, check_fn, ctx.diags, ctx.drift_ledger)
+    gen_files = pre_files
+    pre_b_iters = pre_it
+    let (a5_files, pr, pi, pres) = run_stage_a5_with_api_map(gen_files, recipes, api_map, check_fn, ctx.diags, ctx.drift_ledger)
+    gen_files = a5_files
+    probe_rounds = pr
+    probes_instrumented = pi
+    probes_resolved = pres
+  }
+
+  // Stage B: Type-Directed Fixpoint Pass (`pionc check --json`)
+  let (b_files, post_b_iters, diag_hist) = if run_probes {
+    run_stage_b(gen_files, api_map, check_fn, ctx.diags, ctx.drift_ledger)
+  } else {
+    (gen_files, 0, [])
+  }
+  let stage_b_iters = pre_b_iters + post_b_iters
+  gen_files = b_files
+
+  // Prepend platform-neutral headers + auto-emitted `import "<pkg>"` block to every generated file
+  let final_files = prepend_headers_and_imports(gen_files, opts, ctx.diags)
+
+  // Count blockers: any error diagnostic or unresolved drift entry
+  let mut blockers = 0
+  for d in ctx.diags {
+    if d.severity == "error" {
+      blockers = blockers + 1
+    }
+  }
+  for e in ctx.drift_ledger {
+    if e.status != "resolved" {
+      blockers = blockers + 1
+    }
+  }
+
+  TranspileResult::{
+    files: final_files,
+    span_map: ctx.span_map,
+    diagnostics: ctx.diags,
+    drift_ledger: ctx.drift_ledger,
+    dispositions: ctx.dispositions,
+    pionc_diag_histogram: diag_hist,
+    probe_rounds: probe_rounds,
+    probes_instrumented: probes_instrumented,
+    probes_resolved: probes_resolved,
+    stage_b_iterations: stage_b_iters,
+    blockers: blockers,
+  }
+}

@@ -1,0 +1,357 @@
+///| mbt_compat/array_view: MoonBit `Array[T]` + `ArrayView[T]` buffer semantics.
+///|
+///| A MoonBit `Array` is a length plus a replaceable backing buffer. A view
+///| (`xs[a:b]`, `xs.exact_view(...)`) captures the buffer the array has at the
+///| moment the view is created: writes through the array stay visible to the
+///| view only until the array reallocates (push past capacity, insert, append),
+///| after which array and view refer to different buffers.
+///|
+///|   let a = [1, 2, 3]; let v = a[0:2]
+///|   a[0] = 2                       // v[0] == 2 (same buffer)
+///|   for i in 0..<256 { a.push(i) } // reallocates
+///|   a[0] = 3                       // a[0] == 3, v[0] == 2
+///|
+///| `ArrayBuf[T]` reproduces that with an explicit `FixedArray[T]` handle and
+///| MoonBit's growth policy (`array_growth_capacity`: start at 8, then double;
+///| an array built from a literal or `from_array` has capacity == length), so
+///| reallocation happens at the same pushes as in MoonBit. `ArrayView[T]`
+///| keeps the handle it was created from.
+///|
+///| Out-of-range element access panics (MoonBit aborts); `view` clamps like
+///| `xs[a:b]` (`clamped_view`); `exact_view` panics on an invalid range.
+
+pub struct ArrayBuf[T] {
+  mut buf : FixedArray[T]
+  mut cap : Int
+  mut len : Int
+}
+
+pub struct ArrayView[T] {
+  buf : FixedArray[T]
+  start : Int
+  len : Int
+}
+
+/// MoonBit `array_growth_capacity(current, len, required)`.
+fn growth_capacity(current : Int, required : Int) -> Int {
+  let mut space = if current == 0 { 8 } else { current }
+  while space < required {
+    let next = space * 2
+    if next <= space {
+      return required
+    }
+    space = next
+  }
+  space
+}
+
+fn clamp_off(off : Int, len : Int) -> Int {
+  if off < 0 {
+    0
+  } else if off > len {
+    len
+  } else {
+    off
+  }
+}
+
+/// Empty array, capacity 0 (MoonBit `[]` / `Array::new()`).
+pub fn ArrayBuf::new[T]() -> ArrayBuf[T] {
+  ArrayBuf::{ buf: FixedArray::from_array([]), cap: 0, len: 0 }
+}
+
+/// Empty array with reserved capacity (MoonBit `Array::new(capacity=n)`).
+/// The buffer is materialized on the first push, at exactly `cap` slots.
+pub fn ArrayBuf::with_capacity[T](cap : Int) -> ArrayBuf[T] {
+  ArrayBuf::{
+    buf: FixedArray::from_array([]),
+    cap: if cap < 0 { 0 } else { cap },
+    len: 0,
+  }
+}
+
+/// Copy of `xs` with capacity == length (MoonBit array literal).
+pub fn ArrayBuf::from_array[T](xs : Array[T]) -> ArrayBuf[T] {
+  let n = xs.length()
+  ArrayBuf::{ buf: FixedArray::from_array(xs), cap: n, len: n }
+}
+
+/// MoonBit `Array::make(n, v)`.
+pub fn ArrayBuf::make[T](n : Int, v : T) -> ArrayBuf[T] {
+  let m = if n < 0 { 0 } else { n }
+  ArrayBuf::{ buf: FixedArray::make(m, v), cap: m, len: m }
+}
+
+pub fn ArrayBuf::length[T](self : ArrayBuf[T]) -> Int {
+  self.len
+}
+
+pub fn ArrayBuf::capacity[T](self : ArrayBuf[T]) -> Int {
+  self.cap
+}
+
+pub fn ArrayBuf::is_empty[T](self : ArrayBuf[T]) -> Bool {
+  self.len == 0
+}
+
+fn ArrayBuf::check_index[T](self : ArrayBuf[T], i : Int) -> Unit {
+  if i < 0 || i >= self.len {
+    panic("abort: index out of bounds: the len is \{self.len} but the index is \{i}")
+  }
+}
+
+/// MoonBit `a[i]`.
+pub fn ArrayBuf::get[T](self : ArrayBuf[T], i : Int) -> T {
+  self.check_index(i)
+  self.buf[i]
+}
+
+/// MoonBit `a[i] = v` (visible to views sharing the current buffer).
+pub fn ArrayBuf::set[T](self : ArrayBuf[T], i : Int, v : T) -> Unit {
+  self.check_index(i)
+  self.buf[i] = v
+}
+
+/// Replaces the backing buffer with a fresh one of `new_cap` slots holding the
+/// live prefix; `fill` pads the unused tail (never observable). The old buffer
+/// is left untouched, so earlier views keep their contents.
+fn ArrayBuf::realloc_to[T](self : ArrayBuf[T], new_cap : Int, fill : T) -> Unit {
+  let nb = FixedArray::make(new_cap, fill)
+  let mut i = 0
+  while i < self.len {
+    nb[i] = self.buf[i]
+    i = i + 1
+  }
+  self.buf = nb
+  self.cap = new_cap
+}
+
+/// Makes sure the physical buffer has `cap` slots before writing at `len`.
+fn ArrayBuf::ensure_slot[T](self : ArrayBuf[T], v : T) -> Unit {
+  if self.len == self.cap {
+    self.realloc_to(growth_capacity(self.cap, self.len + 1), v)
+  } else if self.buf.length() < self.cap {
+    // Reserved but not yet materialized (`with_capacity`, len == 0).
+    self.realloc_to(self.cap, v)
+  }
+}
+
+/// MoonBit `a.push(v)`.
+pub fn ArrayBuf::push[T](self : ArrayBuf[T], v : T) -> Unit {
+  self.ensure_slot(v)
+  self.buf[self.len] = v
+  self.len = self.len + 1
+}
+
+/// MoonBit `a.pop()`: the capacity and buffer are kept.
+pub fn ArrayBuf::pop[T](self : ArrayBuf[T]) -> Option[T] {
+  if self.len == 0 {
+    return None
+  }
+  self.len = self.len - 1
+  Some(self.buf[self.len])
+}
+
+/// MoonBit `a.insert(i, v)`: panics unless `0 <= i <= length`.
+pub fn ArrayBuf::insert[T](self : ArrayBuf[T], i : Int, v : T) -> Unit {
+  if i < 0 || i > self.len {
+    panic("abort: index out of bounds: the len is from 0 to \{self.len} but the index is \{i}")
+  }
+  self.ensure_slot(v)
+  let mut j = self.len
+  while j > i {
+    self.buf[j] = self.buf[j - 1]
+    j = j - 1
+  }
+  self.buf[i] = v
+  self.len = self.len + 1
+}
+
+/// MoonBit `a.remove(i)`: returns the removed element; panics when out of range.
+pub fn ArrayBuf::remove[T](self : ArrayBuf[T], i : Int) -> T {
+  self.check_index(i)
+  let v = self.buf[i]
+  let mut j = i
+  while j + 1 < self.len {
+    self.buf[j] = self.buf[j + 1]
+    j = j + 1
+  }
+  self.len = self.len - 1
+  v
+}
+
+/// MoonBit `a.append(view)`: reallocates (growth policy) when it overflows.
+pub fn ArrayBuf::append[T](self : ArrayBuf[T], other : ArrayView[T]) -> Unit {
+  let n = other.len
+  if n == 0 {
+    return
+  }
+  let new_len = self.len + n
+  if new_len > self.cap {
+    self.realloc_to(
+      growth_capacity(self.cap, new_len),
+      other.buf[other.start],
+    )
+  } else if self.buf.length() < self.cap {
+    self.realloc_to(self.cap, other.buf[other.start])
+  }
+  let mut i = 0
+  while i < n {
+    self.buf[self.len + i] = other.buf[other.start + i]
+    i = i + 1
+  }
+  self.len = new_len
+}
+
+/// MoonBit `a[start:end]` (`clamped_view`): clamps both ends to
+/// `0..=length`; an inverted range is empty.
+pub fn ArrayBuf::view[T](self : ArrayBuf[T], start : Int, end : Int) -> ArrayView[T] {
+  let lo = clamp_off(start, self.len)
+  let hi0 = clamp_off(end, self.len)
+  let hi = if hi0 > lo { hi0 } else { lo }
+  ArrayView::{ buf: self.buf, start: lo, len: hi - lo }
+}
+
+/// MoonBit `a[start:]`.
+pub fn ArrayBuf::view_from[T](self : ArrayBuf[T], start : Int) -> ArrayView[T] {
+  self.view(start, self.len)
+}
+
+/// MoonBit `a[:]`.
+pub fn ArrayBuf::as_view[T](self : ArrayBuf[T]) -> ArrayView[T] {
+  self.view(0, self.len)
+}
+
+/// MoonBit `a.exact_view(start~, end~)`: panics unless
+/// `0 <= start <= end <= length`.
+pub fn ArrayBuf::exact_view[T](
+  self : ArrayBuf[T],
+  start : Int,
+  end : Int,
+) -> ArrayView[T] {
+  if !(start >= 0 && start <= end && end <= self.len) {
+    panic("abort: View index out of bounds")
+  }
+  ArrayView::{ buf: self.buf, start, len: end - start }
+}
+
+/// Owned copy of the elements (MoonBit `a.copy()`).
+pub fn ArrayBuf::to_array[T](self : ArrayBuf[T]) -> Array[T] {
+  let out : Array[T] = []
+  let mut i = 0
+  while i < self.len {
+    out.push(self.buf[i])
+    i = i + 1
+  }
+  out
+}
+
+pub fn ArrayBuf::each[T](self : ArrayBuf[T], f : (T) -> Unit) -> Unit {
+  let mut i = 0
+  while i < self.len {
+    f(self.buf[i])
+    i = i + 1
+  }
+}
+
+pub fn ArrayView::length[T](self : ArrayView[T]) -> Int {
+  self.len
+}
+
+pub fn ArrayView::is_empty[T](self : ArrayView[T]) -> Bool {
+  self.len == 0
+}
+
+fn ArrayView::check_index[T](self : ArrayView[T], i : Int) -> Unit {
+  if i < 0 || i >= self.len {
+    panic("abort: index out of bounds: the len is \{self.len} but the index is \{i}")
+  }
+}
+
+/// MoonBit `v[i]`.
+pub fn ArrayView::get[T](self : ArrayView[T], i : Int) -> T {
+  self.check_index(i)
+  self.buf[self.start + i]
+}
+
+/// MoonBit `v[i] = x`: writes the shared buffer (visible to the array while
+/// it has not reallocated).
+pub fn ArrayView::set[T](self : ArrayView[T], i : Int, v : T) -> Unit {
+  self.check_index(i)
+  self.buf[self.start + i] = v
+}
+
+/// MoonBit `v[start:end]` on a view: clamped, relative to the view.
+pub fn ArrayView::view[T](
+  self : ArrayView[T],
+  start : Int,
+  end : Int,
+) -> ArrayView[T] {
+  let lo = clamp_off(start, self.len)
+  let hi0 = clamp_off(end, self.len)
+  let hi = if hi0 > lo { hi0 } else { lo }
+  ArrayView::{ buf: self.buf, start: self.start + lo, len: hi - lo }
+}
+
+/// MoonBit `v.exact_view(start~, end~)`: panics on an invalid range.
+pub fn ArrayView::exact_view[T](
+  self : ArrayView[T],
+  start : Int,
+  end : Int,
+) -> ArrayView[T] {
+  if !(start >= 0 && start <= end && end <= self.len) {
+    panic("abort: View index out of bounds")
+  }
+  ArrayView::{ buf: self.buf, start: self.start + start, len: end - start }
+}
+
+/// MoonBit `v.to_owned()` / `v.to_array()`: an independent `Array` copy.
+pub fn ArrayView::to_owned[T](self : ArrayView[T]) -> Array[T] {
+  let out : Array[T] = []
+  let mut i = 0
+  while i < self.len {
+    out.push(self.buf[self.start + i])
+    i = i + 1
+  }
+  out
+}
+
+/// Independent `ArrayBuf` copy (capacity == length), MoonBit `v.to_owned()`
+/// when the result keeps being used as a MoonBit `Array`.
+pub fn ArrayView::to_buf[T](self : ArrayView[T]) -> ArrayBuf[T] {
+  ArrayBuf::from_array(self.to_owned())
+}
+
+pub fn ArrayView::each[T](self : ArrayView[T], f : (T) -> Unit) -> Unit {
+  let mut i = 0
+  while i < self.len {
+    f(self.buf[self.start + i])
+    i = i + 1
+  }
+}
+
+pub fn ArrayView::eachi[T](self : ArrayView[T], f : (Int, T) -> Unit) -> Unit {
+  let mut i = 0
+  while i < self.len {
+    f(i, self.buf[self.start + i])
+    i = i + 1
+  }
+}
+
+/// MoonBit `xs[start:end].to_owned()` on a plain `Array`: the same clamping as
+/// `ArrayBuf::view` (both ends to `0..=length`, inverted range empty), returned
+/// as an independent copy. For translated code that never relies on the view
+/// sharing the array's buffer.
+pub fn array_slice_clamp[T](xs : Array[T], start : Int, end : Int) -> Array[T] {
+  let n = xs.length()
+  let lo = clamp_off(start, n)
+  let hi0 = clamp_off(end, n)
+  let hi = if hi0 > lo { hi0 } else { lo }
+  let out : Array[T] = []
+  let mut i = lo
+  while i < hi {
+    out.push(xs[i])
+    i = i + 1
+  }
+  out
+}

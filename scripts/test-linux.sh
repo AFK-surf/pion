@@ -296,7 +296,7 @@ TEST_JSON="$("$PIONC" test --deps --json "$ROOT_DIR/examples/text_stats")"
 echo "pionc_linux test --deps --json examples/text_stats -> $TEST_JSON"
 printf '%s' "$TEST_JSON" | grep -q '"failed":0'
 
-for TPKG in std/json std/http std/net std/regex examples/http_event_server; do
+for TPKG in std/json std/http std/net std/regex examples/http_event_server tools/mbt_compat tools/mbt2pion tools/mbt2pion_cli; do
   STD_JSON="$("$PIONC" test --json "$ROOT_DIR/$TPKG")"
   echo "pionc_linux test --json $TPKG -> $STD_JSON"
   printf '%s' "$STD_JSON" | grep -q '"ok":true'
@@ -345,7 +345,8 @@ fi
 FMT_JSON="$("$PIONC" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DIR/benchmarks/pion" "$ROOT_DIR/std/json" "$ROOT_DIR/std/http" \
   "$ROOT_DIR/std/net" "$ROOT_DIR/examples/http_event_server" "$ROOT_DIR/std/regex" "$ROOT_DIR/std/proc" "$ROOT_DIR/std/tls" "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" \
   "$ROOT_DIR/examples/https_server" "$ROOT_DIR/tests/e2e/dyn_trait.pion" \
-  "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/examples/pion_station")"
+  "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/examples/pion_station" \
+  "$ROOT_DIR/tools/mbt_compat" "$ROOT_DIR/tools/mbt2pion" "$ROOT_DIR/tools/mbt2pion_cli")"
 echo "pionc_linux fmt --check --json -> $FMT_JSON"
 if [ "$FMT_JSON" != '{"ok":true,"unformatted":[]}' ]; then
   echo "FAIL: fmt --check failed on Linux: $FMT_JSON" >&2
@@ -532,6 +533,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p91_test_runner_cli/run_e2e.sh" "$PION
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC"
 # P93: symlinked pionc self-location + atomic (temp + rename) native/Wasm32 link publishing.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
 
 # Multi-package run (cold + hot + 0-pollution)
 BEFORE_TS="$(find "$ROOT_DIR/examples/text_stats" -type f | sort)"

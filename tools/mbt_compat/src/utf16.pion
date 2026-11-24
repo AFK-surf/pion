@@ -1,0 +1,637 @@
+///| mbt_compat/utf16: MoonBit string semantics on top of Pion's UTF-8 `String`.
+///|
+///| MoonBit strings are UTF-16: `length()`, `code_unit_at`, slicing and offsets
+///| count UTF-16 code units, while `for i, ch in s` counts Unicode scalars.
+///| Pion strings are UTF-8 bytes. The helpers below walk the UTF-8 bytes and
+///| report positions in the unit the caller asks for:
+///|   - `utf16`  : UTF-16 code units (a scalar >= U+10000 takes 2 units),
+///|   - `utf8`   : bytes of the Pion string,
+///|   - `scalar` : Unicode scalar values (Pion `Char`).
+///|
+///| Malformed UTF-8 (only reachable through `\xHH` escapes or raw bytes) is
+///| decoded one byte at a time as U+FFFD, one UTF-16 unit per byte, so every
+///| function is total and all of them agree on the same decoding.
+///|
+///| Failure behaviour mirrors MoonBit:
+///|   - `utf16_code_unit_at` out of range panics (MoonBit traps),
+///|   - `utf16_exact_view` panics on a bad range or a split surrogate pair
+///|     (MoonBit `String::exact_view` aborts),
+///|   - `utf16_slice` clamps and moves split pairs inward (MoonBit `s[a:b]`,
+///|     `String::clamped_view`).
+
+/// Byte length of the UTF-8 sequence starting at byte `i` (1 for a malformed
+/// or truncated sequence, which then decodes as U+FFFD).
+fn seq_len(s : String, i : Int) -> Int {
+  let n = s.length()
+  let b0 = s.code_unit_at(i)
+  if b0 < 0x80 {
+    return 1
+  }
+  let want = if b0 >= 0xC2 && b0 <= 0xDF {
+    2
+  } else if b0 >= 0xE0 && b0 <= 0xEF {
+    3
+  } else if b0 >= 0xF0 && b0 <= 0xF4 {
+    4
+  } else {
+    0
+  }
+  if want == 0 || i + want > n {
+    return 1
+  }
+  let b1 = s.code_unit_at(i + 1)
+  // Second-byte ranges exclude overlong forms, surrogates and > U+10FFFF.
+  let lo = if b0 == 0xE0 {
+    0xA0
+  } else if b0 == 0xF0 {
+    0x90
+  } else {
+    0x80
+  }
+  let hi = if b0 == 0xED {
+    0x9F
+  } else if b0 == 0xF4 {
+    0x8F
+  } else {
+    0xBF
+  }
+  if b1 < lo || b1 > hi {
+    return 1
+  }
+  let mut k = 2
+  while k < want {
+    let bk = s.code_unit_at(i + k)
+    if bk < 0x80 || bk > 0xBF {
+      return 1
+    }
+    k = k + 1
+  }
+  want
+}
+
+/// Scalar value of the sequence of byte length `n` starting at byte `i`.
+fn seq_scalar(s : String, i : Int, n : Int) -> Int {
+  let b0 = s.code_unit_at(i)
+  if n == 1 {
+    if b0 < 0x80 {
+      return b0
+    }
+    return 0xFFFD
+  }
+  if n == 2 {
+    return ((b0 & 0x1F) << 6) | (s.code_unit_at(i + 1) & 0x3F)
+  }
+  if n == 3 {
+    return ((b0 & 0x0F) << 12) |
+    ((s.code_unit_at(i + 1) & 0x3F) << 6) |
+    (s.code_unit_at(i + 2) & 0x3F)
+  }
+  ((b0 & 0x07) << 18) |
+  ((s.code_unit_at(i + 1) & 0x3F) << 12) |
+  ((s.code_unit_at(i + 2) & 0x3F) << 6) |
+  (s.code_unit_at(i + 3) & 0x3F)
+}
+
+/// UTF-16 width (1 or 2) of the sequence of byte length `n`.
+fn seq_units(n : Int) -> Int {
+  if n == 4 {
+    2
+  } else {
+    1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Index cache. MoonBit code indexes strings in loops such as
+//   for i = 0; i < s.length(); i = i + 1 { ... s[i] ... }
+// which translates to `utf16_len(s)` / `utf16_code_unit_at(s, i)` per step.
+// A plain UTF-8 scan makes every call O(n) and the loop O(n^2) (seconds on a
+// 40K string). Strings of at least `U16_CACHE_MIN` bytes therefore get an
+// index built once in O(n): their UTF-16 length, whether they are pure ASCII
+// (then unit i is byte i), and for other strings the byte/unit position of
+// the scalar holding every `U16_CK`-th unit, so a lookup walks at most
+// `U16_CK` units. The last `U16_CACHE_SLOTS` indexed strings are kept in a
+// process-wide cache behind a `Mutex`, keyed by the string's data address and
+// byte length. Each entry holds a reference to its string, so that address
+// cannot be freed and reused by another string while the entry exists, and
+// strings are immutable: a key match is always the same string.
+
+let U16_CACHE_MIN : Int = 64
+
+let U16_CK : Int = 32
+
+let U16_CACHE_SLOTS : Int = 4
+
+struct U16Index {
+  s : String
+  addr : Int64
+  nbytes : Int
+  units : Int
+  ascii : Bool
+  ck_byte : Array[Int]
+  ck_unit : Array[Int]
+}
+
+struct U16Cache {
+  entries : Array[U16Index]
+  mut next : Int
+}
+
+let U16_CACHE : Mutex[U16Cache] = Mutex::new(U16Cache::{ entries: [], next: 0 })
+
+fn u16_build(s : String, addr : Int64) -> U16Index {
+  let n = s.length()
+  let ck_byte : Array[Int] = []
+  let ck_unit : Array[Int] = []
+  let mut ascii = true
+  let mut i = 0
+  let mut u = 0
+  while i < n {
+    let b = s.code_unit_at(i)
+    let l = if b < 0x80 { 1 } else { seq_len(s, i) }
+    if b >= 0x80 {
+      ascii = false
+    }
+    let w = seq_units(l)
+    // Checkpoints whose unit falls in [u, u + w) start at this scalar.
+    while ck_byte.length() * U16_CK < u + w {
+      ck_byte.push(i)
+      ck_unit.push(u)
+    }
+    u = u + w
+    i = i + l
+  }
+  U16Index::{ s, addr, nbytes: n, units: u, ascii, ck_byte, ck_unit }
+}
+
+/// The cached index of `s` (built and inserted on a miss).
+fn u16_index(s : String) -> U16Index {
+  let addr = ptr_addr(str_data_ptr(s))
+  let n = s.length()
+  U16_CACHE.with_lock(fn(c : U16Cache) -> U16Index {
+    for e in c.entries {
+      if e.addr == addr && e.nbytes == n {
+        return e
+      }
+    }
+    let e = u16_build(s, addr)
+    if c.entries.length() < U16_CACHE_SLOTS {
+      c.entries.push(e)
+    } else {
+      c.entries[c.next] = e
+      c.next = (c.next + 1) % U16_CACHE_SLOTS
+    }
+    e
+  })
+}
+
+fn utf16_len_scan(s : String) -> Int {
+  let n = s.length()
+  let mut i = 0
+  let mut units = 0
+  while i < n {
+    if s.code_unit_at(i) < 0x80 {
+      i = i + 1
+      units = units + 1
+    } else {
+      let l = seq_len(s, i)
+      i = i + l
+      units = units + seq_units(l)
+    }
+  }
+  units
+}
+
+/// Code unit `idx` walking from byte `i0` / unit `u0` (a scalar start).
+fn code_unit_from(s : String, idx : Int, i0 : Int, u0 : Int) -> Int {
+  let n = s.length()
+  let mut i = i0
+  let mut u = u0
+  while i < n {
+    let l = seq_len(s, i)
+    let c = seq_scalar(s, i, l)
+    if l == 4 {
+      if u == idx {
+        return 0xD800 + ((c - 0x10000) >> 10)
+      }
+      if u + 1 == idx {
+        return 0xDC00 + ((c - 0x10000) & 0x3FF)
+      }
+      u = u + 2
+    } else {
+      if u == idx {
+        return c
+      }
+      u = u + 1
+    }
+    i = i + l
+  }
+  panic("index out of bounds: utf16_code_unit_at(\{idx}), length \{u}")
+}
+
+/// MoonBit `String::length()`: number of UTF-16 code units. O(1) after the
+/// first call on a string of >= 64 bytes (see the index cache above).
+pub fn utf16_len(s : String) -> Int {
+  if s.length() < U16_CACHE_MIN {
+    return utf16_len_scan(s)
+  }
+  u16_index(s).units
+}
+
+/// MoonBit `String::code_unit_at(idx)` / `s[idx]`: the UTF-16 code unit at
+/// `idx` (surrogate halves for scalars >= U+10000). Panics when `idx` is out
+/// of `0..<utf16_len(s)`. O(1) for indexed ASCII strings, at most 32 units of
+/// walking for other indexed strings.
+pub fn utf16_code_unit_at(s : String, idx : Int) -> Int {
+  if idx < 0 {
+    panic("index out of bounds: utf16_code_unit_at(\{idx})")
+  }
+  if s.length() < U16_CACHE_MIN {
+    return code_unit_from(s, idx, 0, 0)
+  }
+  let e = u16_index(s)
+  if idx >= e.units {
+    panic("index out of bounds: utf16_code_unit_at(\{idx}), length \{e.units}")
+  }
+  if e.ascii {
+    return s.code_unit_at(idx)
+  }
+  let c = idx / U16_CK
+  code_unit_from(s, idx, e.ck_byte[c], e.ck_unit[c])
+}
+
+/// Every UTF-16 code unit of `s`, in order (one O(n) pass, no cache): for a
+/// loop hoisted by the translator, or when many strings are indexed in turn
+/// (the index cache keeps only the last 4).
+pub fn utf16_units(s : String) -> Array[Int] {
+  let out : Array[Int] = []
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let l = seq_len(s, i)
+    let c = seq_scalar(s, i, l)
+    if l == 4 {
+      out.push(0xD800 + ((c - 0x10000) >> 10))
+      out.push(0xDC00 + ((c - 0x10000) & 0x3FF))
+    } else {
+      out.push(c)
+    }
+    i = i + l
+  }
+  out
+}
+
+/// Byte offset of UTF-16 offset `utf16_off` (`0..=utf16_len(s)`). An offset
+/// that falls between the two halves of a surrogate pair maps to the start of
+/// that scalar. Panics when the offset is out of range.
+pub fn utf16_to_utf8_off(s : String, utf16_off : Int) -> Int {
+  if utf16_off < 0 {
+    panic("index out of bounds: utf16_to_utf8_off(\{utf16_off})")
+  }
+  let n = s.length()
+  let mut i = 0
+  let mut u = 0
+  while i < n {
+    if u == utf16_off {
+      return i
+    }
+    let l = seq_len(s, i)
+    let w = seq_units(l)
+    if u + w > utf16_off {
+      return i
+    }
+    u = u + w
+    i = i + l
+  }
+  if u == utf16_off {
+    return n
+  }
+  panic("index out of bounds: utf16_to_utf8_off(\{utf16_off}), length \{u}")
+}
+
+/// UTF-16 offset of byte offset `utf8_off` (`0..=s.length()`). A byte offset
+/// inside a multi-byte sequence maps to the start of that scalar. Panics when
+/// the offset is out of range.
+pub fn utf8_to_utf16_off(s : String, utf8_off : Int) -> Int {
+  let n = s.length()
+  if utf8_off < 0 || utf8_off > n {
+    panic("index out of bounds: utf8_to_utf16_off(\{utf8_off}), length \{n}")
+  }
+  let mut i = 0
+  let mut u = 0
+  while i < n {
+    let l = seq_len(s, i)
+    if i + l > utf8_off {
+      return u
+    }
+    u = u + seq_units(l)
+    i = i + l
+  }
+  u
+}
+
+/// Scalar index of byte offset `utf8_off`; inner bytes map to their scalar.
+pub fn utf8_to_scalar_off(s : String, utf8_off : Int) -> Int {
+  let n = s.length()
+  if utf8_off < 0 || utf8_off > n {
+    panic("index out of bounds: utf8_to_scalar_off(\{utf8_off}), length \{n}")
+  }
+  let mut i = 0
+  let mut k = 0
+  while i < n {
+    let l = seq_len(s, i)
+    if i + l > utf8_off {
+      return k
+    }
+    k = k + 1
+    i = i + l
+  }
+  k
+}
+
+/// Byte offset of scalar index `scalar_off` (`0..=scalar count`).
+pub fn scalar_to_utf8_off(s : String, scalar_off : Int) -> Int {
+  if scalar_off < 0 {
+    panic("index out of bounds: scalar_to_utf8_off(\{scalar_off})")
+  }
+  let n = s.length()
+  let mut i = 0
+  let mut k = 0
+  while i < n {
+    if k == scalar_off {
+      return i
+    }
+    i = i + seq_len(s, i)
+    k = k + 1
+  }
+  if k == scalar_off {
+    return n
+  }
+  panic("index out of bounds: scalar_to_utf8_off(\{scalar_off}), count \{k}")
+}
+
+/// Scalar index of UTF-16 offset `utf16_off` (`0..=utf16_len(s)`). An offset
+/// between the two halves of a surrogate pair maps to that scalar (floor), as
+/// in `utf16_to_utf8_off`. Panics when the offset is out of range.
+pub fn utf16_to_scalar_off(s : String, utf16_off : Int) -> Int {
+  if utf16_off < 0 {
+    panic("index out of bounds: utf16_to_scalar_off(\{utf16_off})")
+  }
+  let n = s.length()
+  let mut i = 0
+  let mut u = 0
+  let mut k = 0
+  while i < n {
+    if u == utf16_off {
+      return k
+    }
+    let l = seq_len(s, i)
+    let w = seq_units(l)
+    if u + w > utf16_off {
+      return k
+    }
+    u = u + w
+    i = i + l
+    k = k + 1
+  }
+  if u == utf16_off {
+    return k
+  }
+  panic("index out of bounds: utf16_to_scalar_off(\{utf16_off}), length \{u}")
+}
+
+/// UTF-16 offset of scalar index `scalar_off` (`0..=scalar count`). Panics
+/// when the index is out of range.
+pub fn scalar_to_utf16_off(s : String, scalar_off : Int) -> Int {
+  if scalar_off < 0 {
+    panic("index out of bounds: scalar_to_utf16_off(\{scalar_off})")
+  }
+  let n = s.length()
+  let mut i = 0
+  let mut u = 0
+  let mut k = 0
+  while i < n {
+    if k == scalar_off {
+      return u
+    }
+    let l = seq_len(s, i)
+    u = u + seq_units(l)
+    i = i + l
+    k = k + 1
+  }
+  if k == scalar_off {
+    return u
+  }
+  panic("index out of bounds: scalar_to_utf16_off(\{scalar_off}), count \{k}")
+}
+
+/// Number of Unicode scalars (MoonBit `String::char_length()`).
+pub fn scalar_len(s : String) -> Int {
+  let n = s.length()
+  let mut i = 0
+  let mut k = 0
+  while i < n {
+    i = i + seq_len(s, i)
+    k = k + 1
+  }
+  k
+}
+
+fn is_trailing_at(s : String, u : Int) -> Bool {
+  let c = utf16_code_unit_at(s, u)
+  c >= 0xDC00 && c <= 0xDFFF
+}
+
+fn is_leading_at(s : String, u : Int) -> Bool {
+  let c = utf16_code_unit_at(s, u)
+  c >= 0xD800 && c <= 0xDBFF
+}
+
+/// Copy of the bytes between two UTF-16 offsets that are not inside a pair.
+fn utf16_copy(s : String, start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  let b0 = utf16_to_utf8_off(s, start)
+  let b1 = utf16_to_utf8_off(s, end)
+  let sb = StringBuilder::with_capacity(b1 - b0)
+  sb.write_substring(s, b0, b1)
+  sb.to_string()
+}
+
+/// MoonBit `s[start:end]` (`String::clamped_view`), owned: offsets are clamped
+/// to `0..=len`, an interior start inside a surrogate pair moves forward past
+/// the pair, an interior end inside a pair moves back before it, and an empty
+/// or inverted range yields `""`.
+pub fn utf16_slice(s : String, start : Int, end : Int) -> String {
+  let len = utf16_len(s)
+  let lo = if start <= 0 {
+    0
+  } else if start >= len {
+    len
+  } else if is_trailing_at(s, start) && is_leading_at(s, start - 1) {
+    start + 1
+  } else {
+    start
+  }
+  let hi = if end <= 0 {
+    0
+  } else if end >= len {
+    len
+  } else if is_trailing_at(s, end) && is_leading_at(s, end - 1) {
+    end - 1
+  } else {
+    end
+  }
+  if lo >= hi {
+    return ""
+  }
+  utf16_copy(s, lo, hi)
+}
+
+/// MoonBit `s[start:]`.
+pub fn utf16_slice_from(s : String, start : Int) -> String {
+  utf16_slice(s, start, utf16_len(s))
+}
+
+/// MoonBit `String::exact_view(start~, end~)`, owned: panics unless
+/// `0 <= start <= end <= len` and neither bound lands on a trailing surrogate.
+pub fn utf16_exact_view(s : String, start : Int, end : Int) -> String {
+  let len = utf16_len(s)
+  if !(start >= 0 && start <= end && end <= len) {
+    panic("abort: utf16_exact_view(\{start}, \{end}) out of bounds, length \{len}")
+  }
+  if start < len && is_trailing_at(s, start) {
+    panic("abort: utf16_exact_view start \{start} splits a surrogate pair")
+  }
+  if end < len && is_trailing_at(s, end) {
+    panic("abort: utf16_exact_view end \{end} splits a surrogate pair")
+  }
+  utf16_copy(s, start, end)
+}
+
+/// MoonBit `String::get_view`, owned: `None` where `utf16_exact_view` panics.
+pub fn utf16_get_view(s : String, start : Int, end : Int) -> Option[String] {
+  let len = utf16_len(s)
+  if !(start >= 0 && start <= end && end <= len) {
+    return None
+  }
+  if start < len && is_trailing_at(s, start) {
+    return None
+  }
+  if end < len && is_trailing_at(s, end) {
+    return None
+  }
+  Some(utf16_copy(s, start, end))
+}
+
+/// MoonBit `for i, ch in s { ... }`: calls `f` with the scalar index
+/// (0, 1, 2, ...) and the scalar of every character in order.
+pub fn str_iter_scalar_indexed(s : String, f : (Int, Char) -> Unit) -> Unit {
+  let n = s.length()
+  let mut i = 0
+  let mut k = 0
+  while i < n {
+    let l = seq_len(s, i)
+    f(k, seq_scalar(s, i, l).unsafe_to_char())
+    k = k + 1
+    i = i + l
+  }
+}
+
+/// Scalars of `s` in order (MoonBit `s.to_array()` / `s.iter().collect()`).
+pub fn str_scalars(s : String) -> Array[Char] {
+  let out : Array[Char] = []
+  str_iter_scalar_indexed(s, fn(_i : Int, c : Char) -> Unit { out.push(c) })
+  out
+}
+
+/// MoonBit `String::compare` (`<`, `sort()`, `Compare`): the shorter string
+/// in UTF-16 units is smaller; equal lengths compare UTF-16 code units in
+/// order. Differs from byte order twice: `"k9" < "alpha"`, and `"😀"`
+/// (D83D DE00) < `"！！"` (FF01 FF01) although its UTF-8 bytes are larger.
+/// Returns -1, 0 or 1.
+pub fn str_compare(a : String, b : String) -> Int {
+  if a == b {
+    return 0
+  }
+  let la = utf16_len(a)
+  let lb = utf16_len(b)
+  if la != lb {
+    return if la < lb { -1 } else { 1 }
+  }
+  let ua = utf16_units(a)
+  let ub = utf16_units(b)
+  let mut i = 0
+  while i < la {
+    if ua[i] != ub[i] {
+      return if ua[i] < ub[i] { -1 } else { 1 }
+    }
+    i = i + 1
+  }
+  0
+}
+
+/// Identity helper when a MoonBit `StringView` slice lowered to `String` calls `.to_owned()`.
+pub fn str_to_owned(s : String) -> String {
+  s
+}
+
+/// MoonBit `String::has_prefix`. For well-formed strings the UTF-16 and UTF-8
+/// prefix relations coincide, so this compares bytes.
+pub fn str_has_prefix(s : String, prefix : String) -> Bool {
+  s.starts_with(prefix)
+}
+
+/// MoonBit `String::has_suffix` (byte comparison, see `str_has_prefix`).
+pub fn str_has_suffix(s : String, suffix : String) -> Bool {
+  s.ends_with(suffix)
+}
+
+/// MoonBit `String::to_lower`: ASCII `A`-`Z` only, every other character
+/// (including non-ASCII letters such as `Ä`) is kept as is.
+pub fn str_to_lower(s : String) -> String {
+  let n = s.length()
+  let mut first = -1
+  let mut i = 0
+  while i < n && first < 0 {
+    let b = s.code_unit_at(i)
+    if b >= 0x41 && b <= 0x5A {
+      first = i
+    }
+    i = i + 1
+  }
+  if first < 0 {
+    return s
+  }
+  let sb = StringBuilder::with_capacity(n)
+  sb.write_substring(s, 0, first)
+  let mut j = first
+  while j < n {
+    let b = s.code_unit_at(j)
+    if b >= 0x41 && b <= 0x5A {
+      sb.write_byte((b + 32).to_byte())
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    j = j + 1
+  }
+  sb.to_string()
+}
+
+/// MoonBit `String::to_upper`: ASCII `a`-`z` only.
+pub fn str_to_upper(s : String) -> String {
+  let n = s.length()
+  let sb = StringBuilder::with_capacity(n)
+  let mut j = 0
+  while j < n {
+    let b = s.code_unit_at(j)
+    if b >= 0x61 && b <= 0x7A {
+      sb.write_byte((b - 32).to_byte())
+    } else {
+      sb.write_byte(b.to_byte())
+    }
+    j = j + 1
+  }
+  sb.to_string()
+}

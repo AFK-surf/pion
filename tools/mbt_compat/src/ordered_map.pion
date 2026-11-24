@@ -1,0 +1,470 @@
+///| mbt_compat/ordered_map: MoonBit `Map[K, V]` semantics.
+///|
+///| MoonBit maps iterate in insertion order: `set` on an existing key keeps its
+///| position and replaces the value, `remove` followed by `set` moves the key
+///| to the end, and keys may be any `Hash + Eq` type (enums, tuples holding
+///| `String`, ...). Pion's `Map` iterates in hash order and only takes scalar,
+///| `String` and POD keys, so translated code uses `OrderedMap` instead.
+///|
+///| Storage: entries live in insertion order in parallel arrays (removed ones
+///| become tombstones and are compacted once they outnumber the live ones), and
+///| an open-addressing table with linear probing maps hashes to entry indexes.
+///| Keys are hashed and compared through two functions fixed at construction:
+///| `new()` takes them from the `MapKey` trait (implemented here for every
+///| scalar type and `String`), `new_by(hash, eq)` takes them as closures, which
+///| covers enums, tuples and any other key type.
+///|
+///| Mutating a map from inside `each` / `eachi` is not supported (as in
+///| MoonBit, where the outcome is unspecified).
+
+/// Key types usable with `OrderedMap::new()` / `from_array`.
+pub trait MapKey {
+  key_hash(self : Self) -> Int
+  key_eq(self : Self, other : Self) -> Bool
+}
+
+/// 32-bit finalizer (murmur3 fmix32) on wrapping `Int` arithmetic.
+pub fn hash_mix(h : Int) -> Int {
+  let mut x = h
+  x = x ^ ((x >> 16) & 0xFFFF)
+  x = x * -2048144789
+  x = x ^ ((x >> 13) & 0x7FFFF)
+  x = x * -1028477387
+  x = x ^ ((x >> 16) & 0xFFFF)
+  x
+}
+
+/// Combines two hashes (for composite keys built with `new_by`).
+pub fn hash_combine(a : Int, b : Int) -> Int {
+  hash_mix(a * 31 + b)
+}
+
+/// FNV-1a over the UTF-8 bytes of `s`, finalized with `hash_mix`.
+pub fn hash_string(s : String) -> Int {
+  let mut h = -2128831035
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    h = (h ^ s.code_unit_at(i)) * 16777619
+    i = i + 1
+  }
+  hash_mix(h)
+}
+
+impl MapKey for Int {
+  fn key_hash(self : Int) -> Int {
+    hash_mix(self)
+  }
+
+  fn key_eq(self : Int, other : Int) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for Int64 {
+  fn key_hash(self : Int64) -> Int {
+    hash_mix((self ^ (self >> 32L)).to_int())
+  }
+
+  fn key_eq(self : Int64, other : Int64) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for UInt {
+  fn key_hash(self : UInt) -> Int {
+    hash_mix(self.reinterpret_as_int())
+  }
+
+  fn key_eq(self : UInt, other : UInt) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for UInt64 {
+  fn key_hash(self : UInt64) -> Int {
+    let x = self.reinterpret_as_int64()
+    hash_mix((x ^ (x >> 32L)).to_int())
+  }
+
+  fn key_eq(self : UInt64, other : UInt64) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for Byte {
+  fn key_hash(self : Byte) -> Int {
+    hash_mix(self.to_int())
+  }
+
+  fn key_eq(self : Byte, other : Byte) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for Char {
+  fn key_hash(self : Char) -> Int {
+    hash_mix(self.to_int())
+  }
+
+  fn key_eq(self : Char, other : Char) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for Bool {
+  fn key_hash(self : Bool) -> Int {
+    if self {
+      1
+    } else {
+      0
+    }
+  }
+
+  fn key_eq(self : Bool, other : Bool) -> Bool {
+    self == other
+  }
+}
+
+impl MapKey for String {
+  fn key_hash(self : String) -> Int {
+    hash_string(self)
+  }
+
+  fn key_eq(self : String, other : String) -> Bool {
+    self == other
+  }
+}
+
+let SLOT_EMPTY : Int = -1
+let SLOT_DELETED : Int = -2
+
+pub struct OrderedMap[K, V] {
+  hash_fn : (K) -> Int
+  eq_fn : (K, K) -> Bool
+  mut ekeys : Array[K]
+  mut evals : Array[V]
+  mut ehash : Array[Int]
+  mut elive : Array[Bool]
+  mut slots : Array[Int]
+  mut count : Int
+  mut used : Int
+}
+
+fn empty_slots(cap : Int) -> Array[Int] {
+  Array::make(cap, SLOT_EMPTY)
+}
+
+/// Empty map whose keys hash and compare with `hash` / `eq` (any key type).
+pub fn OrderedMap::new_by[K, V](
+  hash : (K) -> Int,
+  eq : (K, K) -> Bool,
+) -> OrderedMap[K, V] {
+  OrderedMap::{
+    hash_fn: hash,
+    eq_fn: eq,
+    ekeys: [],
+    evals: [],
+    ehash: [],
+    elive: [],
+    slots: empty_slots(8),
+    count: 0,
+    used: 0,
+  }
+}
+
+/// Empty map for a `MapKey` key type (MoonBit `Map::new()` / `{}`).
+pub fn OrderedMap::new[K : MapKey, V]() -> OrderedMap[K, V] {
+  ordered_map_new()
+}
+
+/// MoonBit `Map::from_array` / map literal: later duplicates replace the value
+/// and keep the first position.
+pub fn OrderedMap::from_array[K : MapKey, V](
+  pairs : Array[(K, V)],
+) -> OrderedMap[K, V] {
+  ordered_map_from_array(pairs)
+}
+
+/// Free-function form of `OrderedMap::new()`. Use this one from other
+/// packages: pionc 0.1.0 resolves the trait bound of an imported *static*
+/// method in the caller's package and reports `E_TRAIT_NOT_IMPLEMENTED`
+/// (free generic functions are checked correctly).
+pub fn ordered_map_new[K : MapKey, V]() -> OrderedMap[K, V] {
+  OrderedMap::new_by(fn(k : K) -> Int { k.key_hash() }, fn(a : K, b : K) -> Bool {
+    a.key_eq(b)
+  })
+}
+
+/// Free-function form of `OrderedMap::from_array()` (see `ordered_map_new`).
+pub fn ordered_map_from_array[K : MapKey, V](
+  pairs : Array[(K, V)],
+) -> OrderedMap[K, V] {
+  let m : OrderedMap[K, V] = ordered_map_new()
+  for p in pairs {
+    m.set(p.0, p.1)
+  }
+  m
+}
+
+/// Slot holding `k` (with hash `h`), or -1.
+fn OrderedMap::find_slot[K, V](self : OrderedMap[K, V], k : K, h : Int) -> Int {
+  let mask = self.slots.length() - 1
+  let mut i = h & mask
+  while true {
+    let e = self.slots[i]
+    if e == SLOT_EMPTY {
+      return -1
+    }
+    if e >= 0 && self.ehash[e] == h && self.eq_fn(self.ekeys[e], k) {
+      return i
+    }
+    i = (i + 1) & mask
+  }
+  -1
+}
+
+/// Rebuilds the table at capacity `cap`, dropping tombstoned entries.
+fn OrderedMap::rebuild[K, V](self : OrderedMap[K, V], cap : Int) -> Unit {
+  let nk : Array[K] = []
+  let nv : Array[V] = []
+  let nh : Array[Int] = []
+  let nl : Array[Bool] = []
+  let slots = empty_slots(cap)
+  let mask = cap - 1
+  let n = self.ekeys.length()
+  let mut i = 0
+  while i < n {
+    if self.elive[i] {
+      let idx = nk.length()
+      let h = self.ehash[i]
+      nk.push(self.ekeys[i])
+      nv.push(self.evals[i])
+      nh.push(h)
+      nl.push(true)
+      let mut j = h & mask
+      while slots[j] != SLOT_EMPTY {
+        j = (j + 1) & mask
+      }
+      slots[j] = idx
+    }
+    i = i + 1
+  }
+  self.ekeys = nk
+  self.evals = nv
+  self.ehash = nh
+  self.elive = nl
+  self.slots = slots
+  self.used = self.count
+}
+
+fn table_cap_for(count : Int) -> Int {
+  let mut cap = 8
+  while cap * 3 <= (count + 1) * 4 {
+    cap = cap * 2
+  }
+  cap
+}
+
+/// MoonBit `m.set(k, v)` / `m[k] = v`.
+pub fn OrderedMap::set[K, V](self : OrderedMap[K, V], k : K, v : V) -> Unit {
+  let h = self.hash_fn(k)
+  let s = self.find_slot(k, h)
+  if s >= 0 {
+    self.evals[self.slots[s]] = v
+    return
+  }
+  if (self.used + 1) * 4 >= self.slots.length() * 3 {
+    self.rebuild(table_cap_for(self.count + 1))
+  }
+  let idx = self.ekeys.length()
+  self.ekeys.push(k)
+  self.evals.push(v)
+  self.ehash.push(h)
+  self.elive.push(true)
+  let mask = self.slots.length() - 1
+  let mut j = h & mask
+  while self.slots[j] >= 0 {
+    j = (j + 1) & mask
+  }
+  if self.slots[j] == SLOT_EMPTY {
+    self.used = self.used + 1
+  }
+  self.slots[j] = idx
+  self.count = self.count + 1
+}
+
+/// MoonBit `m.get(k)`.
+pub fn OrderedMap::get[K, V](self : OrderedMap[K, V], k : K) -> Option[V] {
+  let s = self.find_slot(k, self.hash_fn(k))
+  if s < 0 {
+    None
+  } else {
+    Some(self.evals[self.slots[s]])
+  }
+}
+
+/// MoonBit `m.get_or_default(k, d)`.
+pub fn OrderedMap::get_or_default[K, V](
+  self : OrderedMap[K, V],
+  k : K,
+  d : V,
+) -> V {
+  let s = self.find_slot(k, self.hash_fn(k))
+  if s < 0 {
+    d
+  } else {
+    self.evals[self.slots[s]]
+  }
+}
+
+/// MoonBit `m.contains(k)`.
+pub fn OrderedMap::contains[K, V](self : OrderedMap[K, V], k : K) -> Bool {
+  self.find_slot(k, self.hash_fn(k)) >= 0
+}
+
+/// MoonBit `m.remove(k)`: no-op when absent.
+pub fn OrderedMap::remove[K, V](self : OrderedMap[K, V], k : K) -> Unit {
+  let s = self.find_slot(k, self.hash_fn(k))
+  if s < 0 {
+    return
+  }
+  let e = self.slots[s]
+  self.slots[s] = SLOT_DELETED
+  self.elive[e] = false
+  self.count = self.count - 1
+  let dead = self.ekeys.length() - self.count
+  if dead > 8 && dead > self.count {
+    self.rebuild(table_cap_for(self.count))
+  }
+}
+
+/// MoonBit `m.size()` / `m.length()`.
+pub fn OrderedMap::size[K, V](self : OrderedMap[K, V]) -> Int {
+  self.count
+}
+
+/// MoonBit `m.is_empty()`.
+pub fn OrderedMap::is_empty[K, V](self : OrderedMap[K, V]) -> Bool {
+  self.count == 0
+}
+
+/// MoonBit `m.clear()`.
+pub fn OrderedMap::clear[K, V](self : OrderedMap[K, V]) -> Unit {
+  self.ekeys = []
+  self.evals = []
+  self.ehash = []
+  self.elive = []
+  self.slots = empty_slots(8)
+  self.count = 0
+  self.used = 0
+}
+
+/// MoonBit `m.each(fn(k, v) { ... })`, insertion order.
+pub fn OrderedMap::each[K, V](
+  self : OrderedMap[K, V],
+  f : (K, V) -> Unit,
+) -> Unit {
+  let n = self.ekeys.length()
+  let mut i = 0
+  while i < n {
+    if self.elive[i] {
+      f(self.ekeys[i], self.evals[i])
+    }
+    i = i + 1
+  }
+}
+
+/// MoonBit `m.eachi(fn(i, k, v) { ... })`: `i` counts live entries from 0.
+pub fn OrderedMap::eachi[K, V](
+  self : OrderedMap[K, V],
+  f : (Int, K, V) -> Unit,
+) -> Unit {
+  let n = self.ekeys.length()
+  let mut i = 0
+  let mut k = 0
+  while i < n {
+    if self.elive[i] {
+      f(k, self.ekeys[i], self.evals[i])
+      k = k + 1
+    }
+    i = i + 1
+  }
+}
+
+/// Keys in insertion order (MoonBit `m.keys().collect()`).
+pub fn OrderedMap::keys[K, V](self : OrderedMap[K, V]) -> Array[K] {
+  let out : Array[K] = []
+  let n = self.ekeys.length()
+  let mut i = 0
+  while i < n {
+    if self.elive[i] {
+      out.push(self.ekeys[i])
+    }
+    i = i + 1
+  }
+  out
+}
+
+/// Values in insertion order (MoonBit `m.values().collect()`).
+pub fn OrderedMap::values[K, V](self : OrderedMap[K, V]) -> Array[V] {
+  let out : Array[V] = []
+  let n = self.ekeys.length()
+  let mut i = 0
+  while i < n {
+    if self.elive[i] {
+      out.push(self.evals[i])
+    }
+    i = i + 1
+  }
+  out
+}
+
+/// `(key, value)` pairs in insertion order (MoonBit `m.to_array()`).
+pub fn OrderedMap::to_array[K, V](self : OrderedMap[K, V]) -> Array[(K, V)] {
+  let out : Array[(K, V)] = []
+  let n = self.ekeys.length()
+  let mut i = 0
+  while i < n {
+    if self.elive[i] {
+      out.push((self.ekeys[i], self.evals[i]))
+    }
+    i = i + 1
+  }
+  out
+}
+
+/// `OrderedMap` -> Pion `Map` at an API boundary. `K` must be a Pion `Map` key
+/// type (`String`, integer scalars, `Char`, `Bool`, scalar tuples / POD
+/// structs); the insertion order is not kept (Pion `Map` is unordered).
+pub fn ordered_map_to_map[K, V](m : OrderedMap[K, V]) -> Map[K, V] {
+  let out : Map[K, V] = Map::new()
+  m.each(fn(k : K, v : V) -> Unit { out.set(k, v) })
+  out
+}
+
+/// Pion `Map` -> `OrderedMap` at an API boundary. Entries are inserted in the
+/// Pion `Map`'s iteration order (`keys()`), which is the only order it has.
+pub fn ordered_map_from_map[K : MapKey, V](m : Map[K, V]) -> OrderedMap[K, V] {
+  let out : OrderedMap[K, V] = ordered_map_new()
+  for k in m.keys() {
+    match m.get(k) {
+      Some(v) => out.set(k, v)
+      None => ()
+    }
+  }
+  out
+}
+
+/// Top-level helper wrappers matching `mbt2pion` Stage B rewrites.
+pub fn ordered_map_size[K, V](m : OrderedMap[K, V]) -> Int {
+  m.size()
+}
+
+pub fn ordered_map_each[K, V](m : OrderedMap[K, V], f : (K, V) -> Unit) -> Unit {
+  m.each(f)
+}
+
+pub fn ordered_map_iter[K, V](m : OrderedMap[K, V]) -> Array[(K, V)] {
+  m.to_array()
+}

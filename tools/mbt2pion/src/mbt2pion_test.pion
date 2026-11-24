@@ -1,0 +1,1545 @@
+///| Comprehensive public-safe unit tests for `tools/mbt2pion` (zero project-specific identifiers).
+
+fn assert_true(cond : Bool, msg : String) -> Unit {
+  if !cond {
+    panic("ASSERTION FAILED: " + msg)
+  }
+}
+
+fn assert_eq(a : Int, b : Int) -> Unit {
+  if a != b {
+    panic("ASSERTION FAILED: expected " + b.to_string() + ", got " + a.to_string())
+  }
+}
+
+fn noop_check(_batch : Array[(String, String)]) -> String {
+  "{\"ok\":true,\"diagnostics\":[]}"
+}
+
+test "lexer lossless round-trip across MoonBit touchstone matrix" {
+  let src = "// line comment\n" +
+  "///| doc comment\n" +
+  "/* nested /* block */ comment */\n" +
+  "#callsite(autofill(loc))\n" +
+  "pub(all) fn demo(x? : Int = 1_000, f : () -> Int?) -> String {\n" +
+  "  let hex = 0xFF_00L\n" +
+  "  let bin = 0b1010_0101\n" +
+  "  let flt = 1.5e-7\n" +
+  "  let ch = '\\u{1F600}'\n" +
+  "  let by = b'A'\n" +
+  "  let bs = b\"hi\"\n" +
+  "  let raw = #|raw \\{no_interp}\n" +
+  "  let interp = \"a=\\{x + 1} b=\\{\"inner\"}\"\n" +
+  "  let mline = $|line \\{x}\n" +
+  "  let r = 0..<10\n" +
+  "  let r2 = 0..=10\n" +
+  "  let a = xs\n" +
+  "    |> f\n" +
+  "  let b = obj\n" +
+  "    ..push(1)\n" +
+  "  interp\n" +
+  "}\n"
+  let toks = lex_moonbit(src)
+  let rebuilt = tokens_to_source(toks)
+  assert_true(rebuilt == src, "lossless lexer round-trip must preserve every byte")
+  let mut saw_interp = false
+  let mut saw_raw_ml = false
+  let mut saw_interp_ml = false
+  let mut saw_dotdot_lt = false
+  let mut saw_dotdot_eq = false
+  let mut saw_nl_pipegt = false
+  let mut saw_nl_dotdot = false
+  for t in toks {
+    if t.kind == TokenKind::InterpString { saw_interp = true }
+    if t.kind == TokenKind::RawMultiline { saw_raw_ml = true }
+    if t.kind == TokenKind::InterpMultiline { saw_interp_ml = true }
+    if t.kind == TokenKind::DotDotLt { saw_dotdot_lt = true }
+    if t.kind == TokenKind::DotDotEq { saw_dotdot_eq = true }
+    if t.kind == TokenKind::PipeGt && t.newline_before { saw_nl_pipegt = true }
+    if t.kind == TokenKind::DotDot && t.newline_before { saw_nl_dotdot = true }
+  }
+  assert_true(saw_interp, "must lex InterpString")
+  assert_true(saw_raw_ml, "must lex RawMultiline #|")
+  assert_true(saw_interp_ml, "must lex InterpMultiline $|")
+  assert_true(saw_dotdot_lt, "must lex ..<")
+  assert_true(saw_dotdot_eq, "must lex ..=")
+  assert_true(saw_nl_pipegt, "must track newline_before on |>")
+  assert_true(saw_nl_dotdot, "must track newline_before on ..")
+}
+
+test "stage A: value-returning guard (bool and is-pattern) vs diverging guard" {
+  let src = SourceFile::{
+    rel_path: "guards.mbt",
+    content: "pub fn val_g(ok : Bool) -> Int {\n  guard ok else { 17 }\n  42\n}\n\npub fn guard_is(opt : Int?) -> Int {\n  guard opt is Some(v) else { 17 }\n  v + 1\n}\n\npub fn div_g(ok : Bool) -> Int {\n  guard ok else { return 0 }\n  42\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "if ok {"), "value-returning bool guard must rewrite to if/else")
+  assert_true(str_has(out, "match opt {"), "value-returning guard-is must rewrite to match")
+  assert_true(str_has(out, "Some(v) => {"), "guard-is binds pattern variable v")
+  assert_true(str_has(out, "guard ok else { return 0 }"), "diverging guard must remain Pion-native")
+}
+
+test "stage A: topological init order with indirect fn reads and cycle detection" {
+  let f1 = SourceFile::{
+    rel_path: "a.mbt",
+    content: "let first : Int = helper()\n\nfn helper() -> Int {\n  second + 1\n}\n\nfn init {\n  let _ = first\n}\n",
+    is_test: false,
+  }
+  let f2 = SourceFile::{
+    rel_path: "b.mbt",
+    content: "let second : Int = 42\n",
+    is_test: false,
+  }
+  let res = transpile_package([f1, f2], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let mut init_code = ""
+  for gf in res.files {
+    if gf.rel_path == "00_init_order.pion" {
+      init_code = gf.content
+    }
+  }
+  assert_true(init_code.length() > 0, "00_init_order.pion must be emitted")
+  let pos_second = init_code.index_of("let second")
+  let pos_first = init_code.index_of("let first")
+  let pos_init = init_code.index_of("__mbt_init_a_mbt_1")
+  assert_true(pos_second >= 0 && pos_first > pos_second, "second must initialize before first")
+  assert_true(pos_init > pos_first, "fn init must initialize after first")
+
+  let cyc = SourceFile::{
+    rel_path: "cyc.mbt",
+    content: "let x : Int = y + 1\nlet y : Int = x + 1\n",
+    is_test: false,
+  }
+  let cyc_res = transpile_package([cyc], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(cyc_res.blockers > 0, "cyclic init must produce blocker")
+  let mut found_cycle_code = false
+  for d in cyc_res.diagnostics {
+    if d.code == "MBT2PION_INIT_CYCLE" {
+      found_cycle_code = true
+    }
+  }
+  assert_true(found_cycle_code, "must emit MBT2PION_INIT_CYCLE")
+}
+
+test "stage A: leading generics, rest patterns, chained cascade, optional forwarding, and canonical mbt_compat" {
+  let api_json = "{\"pkg_aliases\":{\"ext\":\"acme_ext\"},\"symbols\":[" +
+  "{\"src_pkg\":\"ext\",\"src_name\":\"FixedTag\",\"kind\":\"ctor\",\"target_pkg\":\"acme_ext\",\"target_name\":\"FixedTag\",\"target_enum\":\"Tag\"}," +
+  "{\"src_pkg\":\"ext\",\"src_name\":\"ext_tally\",\"kind\":\"fn\",\"target_pkg\":\"acme_ext\",\"target_name\":\"ext_tally\",\"external_tilde_default\":true}" +
+  "]}"
+  let pre_diags : Array[Diag] = []
+  let am = parse_api_map(api_json, "api_map.json", pre_diags)
+  assert_eq(pre_diags.length(), 0)
+
+  let src = SourceFile::{
+    rel_path: "syntax.mbt",
+    content: "pub enum Tri {\n  Tri(Int, Int, Int)\n  Empty\n}\n\n" +
+    "pub fn[T] id(x : T) -> T {\n  x\n}\n\n" +
+    "pub fn first_of(t : Tri) -> Int {\n  match t {\n    Tri(a, ..) => a\n    Empty => 0\n  }\n}\n\n" +
+    "#callsite(autofill(loc))\n" +
+    "pub fn trace(msg : String, loc~ : SourceLoc) -> String {\n  msg + loc\n}\n\n" +
+    "pub fn tally(base : Int, x? : Int = 17) -> Int {\n  base + x\n}\n\n" +
+    "pub fn relay(a : Int, x? : Int) -> Int {\n  let _ = trace(\"one\")\n  let _ = trace(\"two\")\n  let _ = @ext.ext_tally(a, x?)\n  tally(a, x?)\n}\n\n" +
+    "pub fn syntax_mix(f : () -> Int?, val : Int, xs : Array[Int], box_ : Box) -> Array[Int] {\n" +
+    "  let g = (n) => n + val\n" +
+    "  let _ = FixedTag\n" +
+    "  let _ = b\"ok\"\n" +
+    "  let _ = xs[1:3].to_owned()\n" +
+    "  let _ = { \"k\": 1 }\n" +
+    "  let _ = box_.items..push(9)\n" +
+    "  xs..push(g(1))..push(2)\n" +
+    "}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
+  let out = res.files[0].content
+  assert_true(str_has(out, "pub fn id[T](x : T) -> T"), "leading generics moved after fn name")
+  assert_true(str_has(out, "Tri(a, _, _) => a"), "ctor rest pattern expanded to exact arity")
+  assert_true(str_has(out, "loc~ : String = \"\""), "SourceLoc lowered to String default")
+  assert_true(str_has(out, "loc=\"syntax.mbt:"), "callsites get SourceLoc")
+  assert_true(str_has(out, "match x { Some(__mbt_v) => __mbt_v, None => 17 }"), "migrated default lazy None branch")
+  assert_true(str_has(out, "tally(a, x?=x)"), "optional forwarding to migrated callee")
+  assert_true(str_has(out, "acme_ext::ext_tally(__mbt_arg_"), "external tilde default call-site branch")
+  assert_true(str_has(out, "() -> Option[Int]"), "T? precedence in function return type")
+  assert_true(str_has(out, "val_ : Int"), "keyword val renamed consistently")
+  assert_true(str_has(out, "fn(n) { n + val_ }"), "arrow fn lowered and keyword renamed")
+  assert_true(str_has(out, "acme_ext::Tag::FixedTag"), "cross-package constructor qualified")
+  assert_true(str_has(out, "\"ok\".to_bytes()"), "byte string lowered")
+  assert_true(str_has(out, "mbt_compat::__mbt_slice_"), "canonical slice placeholder deferred to Stage A.5")
+  assert_true(str_has(out, "mbt_compat::ordered_map_from_array([(\"k\", 1)])"), "canonical map literal helper")
+  assert_true(str_has(out, "box_.items;"), "chained field cascade receiver supported")
+
+  // Unknown constructor arity in rest pattern MUST hard-fail with MBT2PION_MANUAL
+  let unk = SourceFile::{
+    rel_path: "unk_rest.mbt",
+    content: "pub fn f(x : Any) -> Int {\n  match x {\n    Mystery(a, ..) => a\n    _ => 0\n  }\n}\n",
+    is_test: false,
+  }
+  let unk_res = transpile_package([unk], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(unk_res.blockers > 0, "unknown rest pattern arity must hard-fail")
+}
+
+test "stage A: derive Eq handles non-primitive struct Option/Array fields and enum trait_recipes" {
+  let recipes_toml = "[ref]\n" +
+  "enabled = true\n" +
+  "ctor_call = \"acme::cell_new\"\n" +
+  "field_name = \"v\"\n" +
+  "type_name = \"acme::Cell\"\n\n" +
+  "[[trait_impl]]\n" +
+  "derive = \"Eq\"\n" +
+  "target_trait = \"acme::ReactiveEq\"\n" +
+  "method = \"eq\"\n"
+  let rdiags : Array[Diag] = []
+  let rec = parse_recipes_toml(recipes_toml, "recipes.toml", rdiags)
+  assert_eq(rdiags.length(), 0)
+
+  let ok_src = SourceFile::{
+    rel_path: "rec.mbt",
+    content: "#derive(Eq)\npub(all) struct Complex {\n  opt : Int?\n  arr : Array[Int]\n}\n\n#derive(Eq)\npub enum State {\n  Idle\n  Data(Option[Int])\n}\n\npub fn mk() -> Ref[Int] {\n  { val: 9 }\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([ok_src], empty_api_map(), rec, [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "impl acme::ReactiveEq for Complex"), "recipe synthesized struct trait impl")
+  assert_true(str_has(out, "impl acme::ReactiveEq for State"), "recipe synthesized enum trait impl")
+  assert_true(str_has(out, "match (a.opt, b.opt)"), "Option field uses match, not raw ==")
+  assert_true(str_has(out, "while __ai_"), "Array field uses element loop, not raw ==")
+  assert_true(str_has(out, "(.Idle, .Idle) => true"), "enum match arms generated")
+  assert_true(str_has(out, "acme::cell_new(9)"), "recipe bound Ref literal")
+
+  let bad_src = SourceFile::{
+    rel_path: "bad_derive.mbt",
+    content: "#derive(Mystery)\npub struct Bad { x : Int }\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(bad_res.blockers > 0, "unknown derive must block")
+  assert_true(bad_res.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "must emit MBT2PION_UNKNOWN_DERIVE")
+}
+
+test "stage A.5: nonzero literal check, same-line multi-probes, complex receivers, and canonical div helpers" {
+  // B.3: is_statically_nonzero_literal edge cases
+  assert_true(!is_statically_nonzero_literal(lex_moonbit("0.0e5")[0]), "0.0e5 must be zero")
+  assert_true(!is_statically_nonzero_literal(lex_moonbit("0L")[0]), "0L must be zero")
+  assert_true(!is_statically_nonzero_literal(lex_moonbit("0U")[0]), "0U must be zero")
+  assert_true(!is_statically_nonzero_literal(lex_moonbit("0x0")[0]), "0x0 must be zero")
+  assert_true(is_statically_nonzero_literal(lex_moonbit("0x1")[0]), "0x1 must be nonzero")
+  assert_true(is_statically_nonzero_literal(lex_moonbit("1.5e-7")[0]), "1.5e-7 must be nonzero")
+
+  // B.1 + B.2 + A.1: same-line `s.length() + arr.length()`, complex receiver `self.text.length()`, `(a + b) / n`, `a / 0`
+  let src = SourceFile::{
+    rel_path: "drift.mbt",
+    content: "pub fn run(s : String, arr : Array[Int], a : Int, b : Int, d : Double) -> Unit {\n" +
+    "  let _ = s.length() + arr.length()\n" +
+    "  let _ = (a + b) / b\n" +
+    "  let _ = a / 0\n" +
+    "  let _ = a / 2\n" +
+    "  let _ = d.to_string()\n" +
+    "}\n",
+    is_test: false,
+  }
+  let mock_check = fn(batch : Array[(String, String)]) -> String {
+    let mut txt = ""
+    for p in batch {
+      if p.0 == "drift.pion" { txt = p.1 }
+    }
+    let items : Array[String] = []
+    if str_has(txt, "s.mbt_len_probe()") {
+      items.push("{\"file\":\"drift.pion\",\"line\":2,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_len_probe` on type `String`\"}")
+    }
+    if str_has(txt, "arr.mbt_len_probe()") {
+      items.push("{\"file\":\"drift.pion\",\"line\":2,\"col\":35,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_len_probe` on type `Array[Int]`\"}")
+    }
+    if str_has(txt, "((a + b)).mbt_div_probe(b)") {
+      items.push("{\"file\":\"drift.pion\",\"line\":3,\"col\":19,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}")
+    }
+    if str_has(txt, "(a).mbt_div_probe(0)") {
+      items.push("{\"file\":\"drift.pion\",\"line\":4,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}")
+    }
+    if str_has(txt, "(a).mbt_div_probe(2)") {
+      items.push("{\"file\":\"drift.pion\",\"line\":5,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}")
+    }
+    if str_has(txt, "d.mbt_show_probe()") {
+      items.push("{\"file\":\"drift.pion\",\"line\":6,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_show_probe` on type `Double`\"}")
+    }
+    if items.length() == 0 {
+      return "{\"ok\":true,\"diagnostics\":[]}"
+    }
+    let sb = StringBuilder()
+    sb.write_string("{\"ok\":false,\"diagnostics\":[")
+    let mut k = 0
+    while k < items.length() {
+      if k > 0 { sb.write_string(",") }
+      sb.write_string(items[k])
+      k = k + 1
+    }
+    sb.write_string("]}")
+    sb.to_string()
+  }
+  let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], true, mock_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "mbt_compat::utf16_len(s) + arr.length()"), "same-line multi-probe must NOT misclassify arr.length()")
+  assert_true(str_has(out, "mbt_compat::div_checked_i32((a + b), b)"), "complex receiver (a + b) / b uses canonical div_checked_i32")
+  assert_true(str_has(out, "mbt_compat::trap_div_zero()"), "known-zero uses canonical trap_div_zero()")
+  assert_true(str_has(out, "a / 2"), "statically non-zero divisor stays fast")
+  assert_true(str_has(out, "mbt_compat::double_to_string(d)"), "Double.to_string() rewritten")
+  assert_true(!has_probe_residual(out), "0 probe residuals")
+}
+
+test "stage B: 2-arg utf16_to_utf8_off with str_param, missing str_param error, and col-precise coercion" {
+  let bad_map = "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"hit\",\"kind\":\"fn\",\"params\":[{\"name\":\"offset\",\"ty\":\"Int\"}]}]}"
+  let diags : Array[Diag] = []
+  let _ = parse_api_map(bad_map, "bad_api_map.json", diags)
+  assert_true(diags.length() == 1 && diags[0].code == "MBT2PION_UNTAGGED_UNIT", "untagged offset param must hard-fail")
+
+  // Missing `str_param` on `utf8` boundary conversion MUST emit MBT2PION_MISSING_STR_PARAM (never illegal 1-arg call!)
+  let no_str_map = "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"hit\",\"kind\":\"fn\",\"target_pkg\":\"p\",\"target_name\":\"hit\",\"params\":[{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\"}]}]}"
+  let d_ns : Array[Diag] = []
+  let am_ns = parse_api_map(no_str_map, "ns.json", d_ns)
+  let drift_ns : Array[DriftEntry] = []
+  let _ = apply_api_boundary_conversions("let _ = p::hit(offset=pos)\n", am_ns, "f.pion", d_ns, drift_ns)
+  assert_true(d_ns.length() == 1 && d_ns[0].code == "MBT2PION_MISSING_STR_PARAM", "missing str_param must hard-fail")
+
+  // With `str_param`: emits 2-arg `mbt_compat::utf16_to_utf8_off(text, pos)`
+  let good_map = "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"hit\",\"kind\":\"fn\",\"target_pkg\":\"p\",\"target_name\":\"hit\",\"params\":[{\"name\":\"text\",\"ty\":\"String\",\"unit\":\"none\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}"
+  let diags2 : Array[Diag] = []
+  let am = parse_api_map(good_map, "good_api_map.json", diags2)
+  assert_eq(diags2.length(), 0)
+  let drift : Array[DriftEntry] = []
+  let rewritten = apply_api_boundary_conversions("let _ = p::hit(text=my_s, offset=pos)\n", am, "f.pion", diags2, drift)
+  assert_eq(diags2.length(), 0)
+  assert_true(str_has(rewritten, "mbt_compat::utf16_to_utf8_off(my_s, pos)"), "2-arg utf16_to_utf8_off emitted")
+
+  // Token-precise numeric coercion preserves trailing comment!
+  let coerced = match coerce_numeric_token_at_col("  let x : Double = 42 // keep comment", 20, "to_double") {
+    Some(s) => s
+    None => ""
+  }
+  assert_true(coerced == "  let x : Double = 42.to_double() // keep comment", "coercion must not append after trailing comment")
+}
+
+test "double-hash overlay exact match and stale source rejection" {
+  let src = SourceFile::{
+    rel_path: "ov.mbt",
+    content: "pub fn compute(x : Int) -> Int {\n  x + 1\n}\n",
+    is_test: false,
+  }
+  let base = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(base.blockers, 0)
+  assert_true(base.files[0].anchors.length() == 1, "one anchor emitted")
+  let anc = base.files[0].anchors[0]
+
+  let ov = OverlaySpec::{
+    id: "ov-1",
+    source_file: "ov.mbt",
+    decl_identity: anc.decl_identity,
+    target: "native",
+    normalized_source_cst_hash: anc.normalized_source_cst_hash,
+    pre_overlay_generated_hash: anc.pre_overlay_generated_hash,
+    replacement: "pub fn compute(x : Int) -> Int {\n  x + 100\n}",
+    reason: "test override",
+    behavior_test: "ov_test",
+    upstream_issue_or_removal_condition: "issue#1",
+  }
+  let applied = transpile_package([src], empty_api_map(), default_recipes(), [ov], [], default_options(), [], false, noop_check)
+  assert_eq(applied.blockers, 0)
+  assert_true(str_has(applied.files[0].content, "x + 100"), "overlay applied cleanly")
+
+  let mutated_src = SourceFile::{
+    rel_path: "ov.mbt",
+    content: "pub fn compute(x : Int) -> Int {\n  x + 2\n}\n",
+    is_test: false,
+  }
+  let stale = transpile_package([mutated_src], empty_api_map(), default_recipes(), [ov], [], default_options(), [], false, noop_check)
+  assert_true(stale.blockers > 0, "mutated upstream source must reject stale overlay")
+  assert_true(stale.diagnostics[0].code == "MBT2PION_OVERLAY_STALE_SOURCE", "must emit MBT2PION_OVERLAY_STALE_SOURCE")
+}
+
+test "BUG-1: extract_mbti_pkg_name handles package header, pkg.generated.mbti, and foo.mbti" {
+  assert_true(
+    extract_mbti_pkg_name("foo/pkg.generated.mbti", "package \"org/repo/ui/layout\"\n\npub enum Mode {\n  Auto\n}\n") == "layout",
+    "package header takes precedence",
+  )
+  assert_true(
+    extract_mbti_pkg_name("libs/theme/pkg.generated.mbti", "pub enum Tone {\n  Warm\n}\n") == "theme",
+    "pkg.generated.mbti falls back to parent dir",
+  )
+  assert_true(
+    extract_mbti_pkg_name("deps/canvas.mbti", "pub enum Brush {\n  Flat\n}\n") == "canvas",
+    "foo.mbti strips dir and .mbti suffix",
+  )
+  let src = SourceFile::{
+    rel_path: "use.mbt",
+    content: "pub fn f() -> Int { let _ = Auto; 1 }\n",
+    is_test: false,
+  }
+  let res = transpile_package(
+    [src],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [("layout.mbti", "package \"org/repo/layout\"\npub enum Mode {\n  Auto\n}\n")],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_eq(res.blockers, 0)
+  assert_true(str_has(res.files[0].content, "layout::Mode::Auto"), "clean package name without .mbti suffix")
+  assert_true(!str_has(res.files[0].content, ".mbti::"), "must never emit .mbti::")
+  assert_true(str_has(res.files[0].content, "import \"layout\""), "BUG-2 auto-emits import for referenced pkg")
+}
+
+test "BUG-2 & BUG-3 & BUG-4: auto-imports, nested generic T?, and direct Ref(expr) lowering" {
+  let diags : Array[Diag] = []
+  let recipes = parse_recipes_toml(
+    "[ref]\nenabled = true\nctor_call = \"acme_ns::make_ref\"\nfield_name = \"v\"\ntype_name = \"acme_ns::Cell\"\n",
+    "recipes.toml",
+    diags,
+  )
+  assert_eq(diags.length(), 0)
+  let src = SourceFile::{
+    rel_path: "types_ref.mbt",
+    content: "pub struct Box[T] { pub item : T }\npub fn f(a : Box[Int?], b : Box[acme_ns::Item?], c : Array[(Int?, String?)]) -> Ref[Int] {\n  let x : Array[(Int?, String?)] = c\n  let _ = (a, b, x)\n  Ref(42)\n}\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], empty_api_map(), recipes, [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "import \"acme_ns\""), "auto-emits import \"acme_ns\"")
+  assert_true(str_has(out, "Box[Option[Int]]"), "Box[Int?] -> Box[Option[Int]]")
+  assert_true(str_has(out, "Box[Option[acme_ns::Item]]"), "Box[acme_ns::Item?] -> Box[Option[acme_ns::Item]]")
+  assert_true(str_has(out, "Array[(Option[Int], Option[String])]"), "Array[(Int?, String?)] lowered in params and local let")
+  assert_true(str_has(out, "acme_ns::make_ref(42)"), "Ref(42) directly lowered by [ref] recipe in Stage A")
+}
+
+test "BUG-5: init_order skips closures and uncalled fn values without false cycles, keeps real cycles" {
+  let ok_src = SourceFile::{
+    rel_path: "closures.mbt",
+    content: "let a : () -> Int = fn() { b }\nlet b : Int = 1\nlet cb : () -> Int = read_cb\nfn read_cb() -> Int { let _ = cb; b }\nlet arrow_cb : (Int) -> Int = (x) => x + b\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package([ok_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(ok_res.blockers, 0)
+  assert_true(ok_res.files[0].rel_path == "00_init_order.pion", "00_init_order.pion emitted without false cycle")
+
+  let cyc_src = SourceFile::{
+    rel_path: "real_cyc.mbt",
+    content: "let x : Int = y + 1\nlet y : Int = x + 1\n",
+    is_test: false,
+  }
+  let cyc_res = transpile_package([cyc_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(cyc_res.blockers > 0, "real immediate cycle must still block")
+  assert_true(cyc_res.diagnostics[0].code == "MBT2PION_INIT_CYCLE", "real cycle emits MBT2PION_INIT_CYCLE")
+}
+
+test "BUG-6: ambiguous cross-package ctor uses leading-dot .Case in exprs, blocks in patterns" {
+  let mbti1 = ("p1/pkg.generated.mbti", "package \"org/p1\"\npub enum AlignA {\n  Top\n  Middle\n  Bottom\n}\n")
+  let mbti2 = ("p2/pkg.generated.mbti", "package \"org/p2\"\npub enum AlignB {\n  Left\n  Middle\n  Right\n}\n")
+  let expr_src = SourceFile::{
+    rel_path: "expr.mbt",
+    content: "pub fn use_expr() -> Int { let _ = @p1.take_a(Middle); let _ = @p2.take_b(Middle); 1 }\n",
+    is_test: false,
+  }
+  let expr_res = transpile_package([expr_src], empty_api_map(), default_recipes(), [], [mbti1, mbti2], default_options(), [], false, noop_check)
+  assert_eq(expr_res.blockers, 0)
+  let out = expr_res.files[0].content
+  assert_true(str_has(out, "p1::take_a(.Middle)"), "ambiguous expr ctor lowered to .Middle")
+  assert_true(str_has(out, "p2::take_b(.Middle)"), "second ambiguous expr ctor lowered to .Middle")
+  assert_true(str_has(out, "import \"p1\"") && str_has(out, "import \"p2\""), "auto-emits sorted imports for p1 and p2")
+
+  let pat_src = SourceFile::{
+    rel_path: "pat.mbt",
+    content: "pub fn use_pat(x : Int) -> Int { match x { Middle => 1, _ => 0 } }\n",
+    is_test: false,
+  }
+  let pat_res = transpile_package([pat_src], empty_api_map(), default_recipes(), [], [mbti1, mbti2], default_options(), [], false, noop_check)
+  assert_true(pat_res.blockers > 0, "ambiguous ctor in pattern must still error")
+  assert_true(pat_res.diagnostics[0].code == "MBT2PION_AMBIGUOUS_CTOR", "pattern ambiguity emits MBT2PION_AMBIGUOUS_CTOR")
+}
+
+test "BUG-7: recipes [derives] ignore and Ctor(..)/Ctor(.., ..) rest patterns with mbti/api_map arity" {
+  let diags : Array[Diag] = []
+  let recipes = parse_recipes_toml("[derives]\nignore = [\"Debug\"]\n", "recipes.toml", diags)
+  assert_eq(diags.length(), 0)
+  let am = parse_api_map("{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"Quad\",\"kind\":\"ctor\",\"target_pkg\":\"ext\",\"target_name\":\"Quad\",\"target_enum\":\"Shape\",\"arity\":4}]}", "api_map.json", diags)
+  assert_eq(diags.length(), 0)
+  let src = SourceFile::{
+    rel_path: "rest.mbt",
+    content: "#derive(Debug, Eq)\npub struct Pt { x : Int }\npub enum Tri { Tri(Int, Int, Int) }\npub fn m1(t : Tri) -> Int { match t { Tri(..) => 1 } }\npub fn m2(t : Tri) -> Int { match t { Tri(.., ..) => 2 } }\npub fn m3(q : Int) -> Int { match q { Quad(a, ..) => a, _ => 0 } }\n",
+    is_test: false,
+  }
+  let res = transpile_package([src], am, recipes, [], [], default_options(), [], false, noop_check)
+  assert_eq(res.blockers, 0)
+  let out = res.files[0].content
+  assert_true(str_has(out, "#derive(Eq)"), "Eq kept while Debug ignored via recipe")
+  assert_true(!str_has(out, "Debug"), "ignored Debug stripped")
+  assert_true(str_has(out, "Tri(_, _, _)"), "Ctor(..) and Ctor(.., ..) expanded to 3 wildcards")
+  assert_true(str_has(out, ".Quad(a, _, _, _)"), "cross-pkg Quad(a, ..) expanded using api_map arity=4")
+
+  // Without recipe ignore, #derive(Debug) must still hard-fail!
+  let no_rec = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(no_rec.blockers > 0, "Debug without ignore recipe must still hard-fail")
+  assert_true(no_rec.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "emits MBT2PION_UNKNOWN_DERIVE")
+}
+
+test "P0-1 & P0-2: mul/div/mod precedence, unary neg divisor, Int16 / 2 block, and interp probing" {
+  let code = "pub fn f(a : Int, b : Int, c : Int, s : String, xs : Array[Int], i : Int, u : Int16) -> String {\n" +
+  "  let p1 = a * b / c\n" +
+  "  let p2 = a / -b\n" +
+  "  let p3 = xs[i] * 2 / c\n" +
+  "  let p4 = u / 2\n" +
+  "  \"r=\\{a / b} len=\\{s.length()}\"\n" +
+  "}\n"
+  let (inst, sites) = instrument_probes_for_file("p01.pion", code)
+  assert_true(str_has(inst, "(a * b).mbt_div_probe(c)"), "a * b / c preserves left-associativity")
+  assert_true(str_has(inst, "(a).mbt_div_probe(-b)"), "a / -b captures unary minus divisor")
+  assert_true(str_has(inst, "xs.mbt_idx_probe(i)"), "xs[i] * 2 / c probes inner index first in Round 0 (outer div in Round 1)")
+  assert_true(str_has(inst, "(u).mbt_div_probe(2)"), "Int16 / 2 is probed before const-nonzero opt")
+  assert_true(str_has(inst, "(a).mbt_div_probe(b)"), "interp \\{a / b} is probed")
+  assert_true(str_has(inst, "s.mbt_len_probe()"), "interp \\{s.length()} is probed")
+  assert_true(sites.length() >= 6, "all 6 sites instrumented")
+
+  // Verify Int16 / 2 produces MBT2PION_UNSUPPORTED_INT_DIV blocker
+  let diags : Array[Diag] = []
+  let ledger : Array[DriftEntry] = []
+  let mut u_site = sites[0]
+  for st in sites {
+    if st.lhs_expr == "u" { u_site = st }
+  }
+  let _ = rewrite_for_probe(u_site, "Int16", default_recipes(), diags, ledger)
+  assert_true(diags.length() == 1 && diags[0].code == "MBT2PION_UNSUPPORTED_INT_DIV", "Int16 / 2 rejected")
+}
+
+test "P0-5: local borrowed ArrayView uses ArrayBuf/ArrayView; unrewritable param slice blocks publish" {
+  let ok_src = SourceFile::{
+    rel_path: "av.mbt",
+    content: "pub fn f() -> Int {\n  let a = [1, 2, 3]\n  let v = a[0:2]\n  let w = v[1:2]\n  a[0] = 2\n  v[0] + w[0]\n}\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package([ok_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(ok_res.blockers, 0)
+  let out = ok_res.files[0].content
+  assert_true(str_has(out, "mbt_compat::ArrayBuf::from_array([1, 2, 3])"), "owner promoted to ArrayBuf")
+  assert_true(str_has(out, "a.view(0, 2)"), "borrowed slice uses .view()")
+  assert_true(str_has(out, "v.view(1, 2)"), "nested borrowed slice uses .view()")
+  assert_true(str_has(out, "a.set(0, 2)"), "index write lowered to .set()")
+  assert_true(str_has(out, "v.get(0)"), "index read lowered to .get()")
+
+  let bad_src = SourceFile::{
+    rel_path: "bad_av.mbt",
+    content: "pub fn bad(xs : Array[Int]) -> Array[Int] {\n  xs[0:2]\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(bad_res.blockers > 0, "unrewritable borrowed Array slice must block publish as unresolved")
+}
+
+test "P1-1, P1-2, P1-3, P1-4, P1-5, P1-6: review hardening regressions" {
+  // P1-1: invoke(fn() { z }) orders z before a!
+  let p11_src = SourceFile::{
+    rel_path: "p11.mbt",
+    content: "fn invoke(f : () -> Int) -> Int { f() }\nlet a : Int = invoke(fn() { z })\nlet z : Int = 42\n",
+    is_test: false,
+  }
+  let p11_res = transpile_package([p11_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p11_res.blockers, 0)
+  let init_code = p11_res.files[0].content
+  assert_true(init_code.index_of("let z") < init_code.index_of("let a"), "z initialized before invoke(fn() { z })")
+
+  // P1-2: string literal whitespace change ("a b" -> "a  b") MUST invalidate overlay!
+  let s1 = SourceFile::{ rel_path: "str.mbt", content: "pub fn msg() -> String { \"a b\" }\n", is_test: false }
+  let s2 = SourceFile::{ rel_path: "str.mbt", content: "pub fn msg() -> String { \"a  b\" }\n", is_test: false }
+  let r1 = transpile_package([s1], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let r2 = transpile_package([s2], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(
+    r1.files[0].anchors[0].normalized_source_cst_hash != r2.files[0].anchors[0].normalized_source_cst_hash,
+    "string literal internal space change must change normalized_source_cst_hash",
+  )
+
+  // P1-3: moon.pkg targets excludes js-only file on native target and records disposition
+  let native_f = SourceFile::{ rel_path: "plat_native.mbt", content: "pub fn plat() -> Int { 1 }\n", is_test: false }
+  let js_f = SourceFile::{ rel_path: "plat_js.mbt", content: "pub fn plat() -> Int { 2 }\n", is_test: false }
+  let opts_p13 = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "{\"targets\":{\"plat_native.mbt\":[\"native\"],\"plat_js.mbt\":[\"js\"]}}",
+    header: default_header_meta("native"),
+  }
+  let p13_res = transpile_package([native_f, js_f], empty_api_map(), default_recipes(), [], [], opts_p13, [], false, noop_check)
+  assert_eq(p13_res.files.length(), 1)
+  assert_true(p13_res.files[0].rel_path == "plat_native.pion", "only native file emitted")
+  let mut saw_excl = false
+  for dp in p13_res.dispositions {
+    if dp.file == "plat_js.mbt" && dp.disposition == "excluded_by_target" {
+      saw_excl = true
+    }
+  }
+  assert_true(saw_excl, "excluded js-only file recorded in dispositions")
+
+  // P1-4: external multi-optional forwarding preserves labels and emits 4 combinations
+  let d14 : Array[Diag] = []
+  let am14 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"tally\",\"kind\":\"fn\",\"target_pkg\":\"ext\",\"target_name\":\"tally\",\"external_tilde_default\":true}]}",
+    "m.json",
+    d14,
+  )
+  let p14_src = SourceFile::{
+    rel_path: "p14.mbt",
+    content: "pub fn go(x? : Int, y? : Int) -> Int { @ext.tally(x?, y?, z=10) }\n",
+    is_test: false,
+  }
+  let p14_res = transpile_package([p14_src], am14, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p14_res.blockers, 0)
+  let out14 = p14_res.files[0].content
+  assert_true(str_has(out14, "z=__mbt_arg_"), "named arg z= label preserved")
+  assert_true(str_has(out14, "Some(__mbt_v0)") && str_has(out14, "Some(__mbt_v1)"), "both optional params branched (4 combos)")
+
+  // P1-5: same-line dual boundary conversion + single-eval binding for get_text()
+  let d15 : Array[Diag] = []
+  let l15 : Array[DriftEntry] = []
+  let am15 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"p\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"ty\":\"String\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m15.json",
+    d15,
+  )
+  let conv15 = apply_api_boundary_conversions(
+    "  let r = p::caret(text=get_text(), offset=1) + p::caret(text=get_text(), offset=2)\n",
+    am15,
+    "p15.pion",
+    d15,
+    l15,
+  )
+  assert_eq(d15.length(), 0)
+  assert_true(str_has(conv15, "let __mbt_s_0 = get_text();") && str_has(conv15, "let __mbt_s_2 = get_text();"), "each call binds get_text() once")
+  assert_true(l15.length() == 2, "both same-line calls converted")
+
+  // P1-6: migration_report.json serializes finalized span_map
+  let rep_json = render_migration_report_json(p14_res, default_options())
+  assert_true(str_has(rep_json, "\"span_map\":["), "migration_report.json contains span_map")
+}
+
+test "Round 2 dual-seat regressions: interp imports, MIN/-1, byte zero, lexer boundary, DSL targets, x?=e, to_owned, full span_map" {
+  // 1. InterpString package scanning (Opus P1-R1)
+  let ipkgs = collect_referenced_packages("pub fn f(a : Int, b : Int) -> String { \"r=\\{mbt_compat::div_checked_i32(a, b)}\" }\n")
+  assert_true(ipkgs.length() == 1 && ipkgs[0] == "mbt_compat", "InterpString inner pkg scanned")
+
+  // 2. Signed MIN / -1 not omitted + Byte b'\x00' static zero (Astra P0-3)
+  let (inst_div, sites_div) = instrument_probes_for_file("d.pion", "pub fn f(a : Int, b : Byte) -> Int { let _ = a / -1; let _ = b / 0.to_byte(); 0 }\n")
+  assert_true(str_has(inst_div, "(a).mbt_div_probe(-1)"), "a / -1 probed")
+  assert_true(str_has(inst_div, "(b).mbt_div_probe(0.to_byte())"), "b / 0.to_byte() probed")
+  let d_diags : Array[Diag] = []
+  let d_ledger : Array[DriftEntry] = []
+  let r_neg1 = rewrite_for_probe(sites_div[0], "Int", default_recipes(), d_diags, d_ledger)
+  assert_true(match r_neg1 { Some(s) => str_has(s, "mbt_compat::div_checked_i32"), None => false }, "Int / -1 MUST use div_checked_i32")
+  let r_b0 = rewrite_for_probe(sites_div[1], "Byte", default_recipes(), d_diags, d_ledger)
+  assert_true(match r_b0 { Some(s) => str_has(s, "mbt_compat::trap_div_zero()"), None => false }, "Byte / 0.to_byte() uses trap_div_zero()")
+
+  // 3. Lexer-based boundary conversion: string literal untouched + strict left-to-right arg eval order (Astra P0-5)
+  let d6 : Array[Diag] = []
+  let l6 : Array[DriftEntry] = []
+  let am6 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"acme\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"acme\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"ty\":\"String\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m6.json",
+    d6,
+  )
+  let lit_and_order = "let lit = \"acme::caret(text=s, offset=1)\"\nlet r = acme::caret(offset=off(), text=txt())\n"
+  let conv6 = apply_api_boundary_conversions(lit_and_order, am6, "p6.pion", d6, l6)
+  assert_true(str_has(conv6, "let lit = \"acme::caret(text=s, offset=1)\""), "string literal NEVER rewritten")
+  assert_true(conv6.index_of("= off();") < conv6.index_of("= txt();"), "strict left-to-right arg eval order preserved (off before txt)")
+
+  // 4. Helper fn propagating invoke(fn() { z }) init dependency (Astra P1-1)
+  let p7_src = SourceFile::{
+    rel_path: "p7.mbt",
+    content: "fn invoke(f : () -> Int) -> Int { f() }\nfn wrap() -> Int { invoke(fn() { z }) }\nlet a : Int = wrap()\nlet z : Int = 42\n",
+    is_test: false,
+  }
+  let p7_res = transpile_package([p7_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p7_res.blockers, 0)
+  assert_true(p7_res.files[0].content.index_of("let z") < p7_res.files[0].content.index_of("let a"), "z before wrap()->invoke(fn(){z})")
+
+  // 5. Real MoonBit `moon.pkg` DSL `options(targets: { ... })` (Astra P1-2)
+  let dsl_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "options(\n  targets: {\n    \"a_native.mbt\": [ \"native\" ],\n    \"a_js.mbt\": [ \"js\" ],\n  }\n)\n",
+    header: default_header_meta("native"),
+  }
+  let dsl_res = transpile_package(
+    [
+      SourceFile::{ rel_path: "a_native.mbt", content: "pub fn f() -> Int { 1 }\n", is_test: false },
+      SourceFile::{ rel_path: "a_js.mbt", content: "pub fn f() -> Int { 2 }\n", is_test: false },
+    ],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    dsl_opts,
+    [],
+    false,
+    noop_check,
+  )
+  assert_eq(dsl_res.files.length(), 1)
+  assert_true(dsl_res.files[0].rel_path == "a_native.pion", "DSL targets kept native and excluded js")
+
+  // 6. Explicit `x?=expr` external optional forwarding (Astra P1-3) + `a[0:1].to_owned()` suffix consumed (Astra P1-4)
+  let d9 : Array[Diag] = []
+  let am9 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"tally\",\"kind\":\"fn\",\"target_pkg\":\"ext\",\"target_name\":\"tally\",\"external_tilde_default\":true}]}",
+    "m9.json",
+    d9,
+  )
+  let p9_src = SourceFile::{
+    rel_path: "p9.mbt",
+    content: "pub fn go(xs : Array[Int], x? : Int, y? : Int) -> Int {\n  let _ = xs[0:1].to_owned()\n  @ext.tally(x?=x, y?=y)\n}\n",
+    is_test: false,
+  }
+  let p9_res = transpile_package([p9_src], am9, default_recipes(), [], [], default_options(), [], false, noop_check)
+  let out9 = p9_res.files[0].content
+  assert_true(str_has(out9, "mbt_compat::__mbt_slice_owned(xs, 0, 1)") && !str_has(out9, ".to_owned()"), ".to_owned() suffix consumed into Stage A.5 slice placeholder")
+  assert_true(str_has(out9, "Some(__mbt_v0)") && str_has(out9, "Some(__mbt_v1)"), "explicit x?=x, y?=y expanded to 4 combos")
+
+  // 7. Finalized span_map covers FULL declaration bytes (Astra P1-5)
+  let fin_spans = finalize_span_map(p9_res.files, p9_res.span_map)
+  assert_true(fin_spans.length() >= 1, "at least one span entry")
+  let sp0 = fin_spans[0]
+  let slice0 = p9_res.files[0].content.slice(sp0.out_start, sp0.out_end)
+  assert_true(slice0.starts_with("pub fn go(") && slice0.ends_with("}"), "span_map covers full pub fn go(...) { ... }")
+}
+
+test "Round 3 Astra structural regressions: same_receiver slice probe, numeric div/-0x1/cap, positional api_map, IIFE init, qualified span_map" {
+  // 1. P0-2: same_receiver in same file (borrowed Array[Int] slice vs String slice) via Stage A.5 exact-span probes
+  let sr_src = "fn view_val(x : Array[Int]) -> Int {\n  let v = mbt_compat::__mbt_slice_borrow(x, 0, 1)\n  v[0]\n}\npub fn text(x : String) -> String {\n  mbt_compat::__mbt_slice_owned(x, 0, 1)\n}\n"
+  let sr_diags : Array[Diag] = []
+  let sr_ledger : Array[DriftEntry] = []
+  let sr_mock = fn(batch : Array[(String, String)]) -> String {
+    let body = batch[0].1
+    if str_has(body, "mbt_slice_borrow_probe") {
+      "{\"ok\":false,\"diagnostics\":[" +
+      "{\"file\":\"sr.pion\",\"line\":2,\"col\":15,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_slice_borrow_probe` on type `Array[Int]`\"}," +
+      "{\"file\":\"sr.pion\",\"line\":6,\"col\":7,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_slice_owned_probe` on type `String`\"}" +
+      "]}"
+    } else if str_has(body, "mbt_idx_probe") {
+      "{\"ok\":false,\"diagnostics\":[" +
+      "{\"file\":\"sr.pion\",\"line\":3,\"col\":4,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_idx_probe` on type `Array[Int]`\"}" +
+      "]}"
+    } else {
+      "{\"ok\":true,\"diagnostics\":[]}"
+    }
+  }
+  let (sr_out, _, _, _) = run_stage_a5(
+    [GeneratedFile::{ rel_path: "sr.pion", content: sr_src, source_file: "sr.mbt", anchors: [] }],
+    default_recipes(),
+    sr_mock,
+    sr_diags,
+    sr_ledger,
+  )
+  assert_true(!has_probe_residual(sr_out[0].content), "no slice probe residuals")
+  assert_true(str_has(sr_out[0].content, "mbt_compat::utf16_slice(x, 0, 1)"), "String slice lowered to utf16_slice")
+  let mut saw_borrow_err = false
+  for d in sr_diags {
+    if d.code == "MBT2PION_BORROWED_ARRAY_SLICE" { saw_borrow_err = true }
+  }
+  assert_true(saw_borrow_err, "borrowed Array[Int] slice MUST block even when same file has String slice named x")
+  let mut unresolved_arr = 0
+  let mut resolved_str = 0
+  for le in sr_ledger {
+    if le.category == "array_view_slice" && le.status == "unresolved" { unresolved_arr = unresolved_arr + 1 }
+    if le.category == "string_utf16_slice" && le.status == "resolved" { resolved_str = resolved_str + 1 }
+  }
+  assert_eq(unresolved_arr, 1)
+  assert_eq(resolved_str, 1)
+
+  // 2. P0-3: numeric literal parser for -0x1, -0x01, -0b1, -0o1, -1_, and round-cap undisposed div blocker
+  let (_, neg_sites) = instrument_probes_for_file(
+    "n.pion",
+    "pub fn f(a : Int) -> Int { let _ = a / -0x1; let _ = a / -0b1; let _ = a / -0o1; a / -1_ }\n",
+  )
+  assert_eq(neg_sites.length(), 4)
+  for ns in neg_sites {
+    assert_true(!can_omit_div_check("Int", ns), "every numeric -1 spelling must NOT omit Int div check")
+  }
+  let cap_diags : Array[Diag] = []
+  let cap_ledger : Array[DriftEntry] = []
+  let cap_mock = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":false,\"diagnostics\":[{\"file\":\"c.pion\",\"line\":1,\"col\":10,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}]}"
+  }
+  let (_, _, _, _) = run_stage_a5_with_max_rounds(
+    [GeneratedFile::{ rel_path: "c.pion", content: "pub fn f(a : Int, b : Int) -> Int { a / b / b / b }\n", source_file: "c.mbt", anchors: [] }],
+    default_recipes(),
+    cap_mock,
+    cap_diags,
+    cap_ledger,
+    2,
+  )
+  let mut saw_undisp = false
+  for d in cap_diags {
+    if d.code == "MBT2PION_UNDISPOSED_DIV_MOD" { saw_undisp = true }
+  }
+  assert_true(saw_undisp, "reaching round cap with remaining `/` MUST emit MBT2PION_UNDISPOSED_DIV_MOD blocker")
+
+  // 3. P0-4: positional AND mixed positional+named api_map boundary conversions
+  let d4 : Array[Diag] = []
+  let l4 : Array[DriftEntry] = []
+  let am4 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"acme\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"ty\":\"String\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m4.json",
+    d4,
+  )
+  let pos_conv = apply_api_boundary_conversions(
+    "let r1 = acme::caret(\"中A\", 1)\nlet r2 = acme::caret(\"中A\", offset=1)\n",
+    am4,
+    "pos.pion",
+    d4,
+    l4,
+  )
+  assert_eq(d4.length(), 0)
+  assert_true(str_has(pos_conv, "mbt_compat::utf16_to_utf8_off(\"中A\", 1)"), "positional arg converted")
+  assert_true(str_has(pos_conv, "offset=mbt_compat::utf16_to_utf8_off(\"中A\", 1)"), "mixed positional+named converted")
+  assert_eq(l4.length(), 2)
+
+  // 4. P1-1: IIFE calling helper function that reads `z` orders `z` before `a`
+  let iife_src = SourceFile::{
+    rel_path: "iife.mbt",
+    content: "fn read_z() -> Int { z }\nfn read_val(xs : Array[Int]) -> Int { xs[0] }\nlet a : Int = (fn() { read_z() })()\nlet z : Int = read_val([42])\n",
+    is_test: false,
+  }
+  let iife_res = transpile_package([iife_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(iife_res.blockers, 0)
+  assert_true(iife_res.files[0].content.index_of("let z") < iife_res.files[0].content.index_of("let a"), "z ordered before IIFE calling read_z()")
+
+  // 5. P1-2: qualified method name `pub fn Widget::value_of` finalized span_map
+  let q_src = SourceFile::{
+    rel_path: "q.mbt",
+    content: "pub struct Widget {\n  value : Int\n}\npub fn Widget::value_of(self : Widget) -> Int {\n  self.value\n}\n",
+    is_test: false,
+  }
+  let q_res = transpile_package([q_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(q_res.blockers, 0)
+  let q_spans = finalize_span_map(q_res.files, q_res.span_map)
+  let mut saw_method_span = false
+  for sp in q_spans {
+    if sp.kind == "fn:Widget::value_of" {
+      let sl = q_res.files[0].content.slice(sp.out_start, sp.out_end)
+      assert_true(sl.starts_with("pub fn Widget::value_of(") && sl.ends_with("}"), "qualified method span_map matches full decl")
+      saw_method_span = true
+    }
+  }
+  assert_true(saw_method_span, "found finalized span for fn:Widget::value_of")
+}
+
+test "Round 4 Opus+Astra P0 regressions: len/idx before mul/div, all-ones signed divisors, full probe audit, optional-skip positional binding" {
+  // 1. Opus P0: `.length()` followed by `*`/`/`/`%` is NEVER skipped
+  let (inst_len, sites_len) = instrument_probes_for_file(
+    "len_mul.pion",
+    "pub fn f(s : String) -> Int { s.length() * 3 + s.length() / 2 + s.length() % 3 }\n",
+  )
+  assert_true(str_has(inst_len, "s.mbt_len_probe() * 3"), "s.length() * 3 probed")
+  assert_true(sites_len.length() == 3, "all 3 s.length() before */% probed in Round 0")
+
+  // 2. Opus P0: full-probe-type undisposed audit catches undisposed `.length()` when round cap hit
+  let u_diags : Array[Diag] = []
+  let u_ledger : Array[DriftEntry] = []
+  let u_mock = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let (_, _, _, _) = run_stage_a5_with_max_rounds(
+    [GeneratedFile::{ rel_path: "u.pion", content: "pub fn f(s : String) -> Int { s.length() * 3 }\n", source_file: "u.mbt", anchors: [] }],
+    default_recipes(),
+    u_mock,
+    u_diags,
+    u_ledger,
+    0,
+  )
+  let mut saw_undisp_probe = false
+  for d in u_diags {
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" { saw_undisp_probe = true }
+  }
+  assert_true(saw_undisp_probe, "undisposed mbt_len_probe MUST emit MBT2PION_UNDISPOSED_PROBE_SITE")
+
+  // 3. Astra P0-3: all-ones signed divisors (0xffffffff on Int, 0xffffffffffffffffL on Int64) NEVER omit div check
+  let (_, ao_sites) = instrument_probes_for_file(
+    "ao.pion",
+    "pub fn f(a : Int, b : Int64) -> Int { let _ = a / 0xffffffff; let _ = b / 0xffffffffffffffffL; let _ = a / 2; 0 }\n",
+  )
+  assert_eq(ao_sites.length(), 3)
+  assert_true(!can_omit_div_check("Int", ao_sites[0]), "Int / 0xffffffff MUST NOT omit check")
+  assert_true(!can_omit_div_check("Int64", ao_sites[1]), "Int64 / 0xffffffffffffffffL MUST NOT omit check")
+  assert_true(can_omit_div_check("Int", ao_sites[2]), "Int / 2 safely omits check")
+
+  // 4. Astra P0-4: positional arg binding skips optional/default `flag? : Int = 0`
+  let d_opt : Array[Diag] = []
+  let l_opt : Array[DriftEntry] = []
+  let am_opt = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"acme\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"type\":\"String\",\"unit\":\"none\"},{\"name\":\"flag\",\"type\":\"Int\",\"is_optional\":true,\"has_default\":true,\"unit\":\"none\"},{\"name\":\"offset\",\"type\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m_opt.json",
+    d_opt,
+  )
+  let opt_conv = apply_api_boundary_conversions(
+    "let r1 = acme::caret(\"中A\", 1)\nlet r2 = acme::caret(\"中A\", flag=1, 1)\n",
+    am_opt,
+    "opt.pion",
+    d_opt,
+    l_opt,
+  )
+  assert_eq(d_opt.length(), 0)
+  assert_true(str_has(opt_conv, "acme::caret(\"中A\", mbt_compat::utf16_to_utf8_off(\"中A\", 1))"), "omitted optional flag still converts positional offset")
+  assert_true(str_has(opt_conv, "acme::caret(\"中A\", flag=1, mbt_compat::utf16_to_utf8_off(\"中A\", 1))"), "explicit flag=1 still converts positional offset")
+  assert_eq(l_opt.length(), 2)
+}
+
+test "Round 5 Astra P0-1 regressions: literal receivers, struct field init after colon, independent raw-token audit" {
+  let (inst_lit, sites_lit) = instrument_probes_for_file(
+    "lit.pion",
+    "pub fn f(s : String) -> Int { let a = \"中A\".length() * 2; let b = \"中A\"[1].to_int(); let c = LenBox::{ n: s.length() * 2 }.n; a + b + c }\n",
+  )
+  assert_true(str_has(inst_lit, "\"中A\".mbt_len_probe() * 2"), "string literal .length() * 2 probed")
+  assert_true(str_has(inst_lit, "\"中A\".mbt_idx_probe(1)"), "string literal [1] probed")
+  assert_true(str_has(inst_lit, "n: s.mbt_len_probe() * 2"), "struct field value after `:` probed")
+  assert_eq(sites_lit.length(), 3)
+
+  // Round 6 Opus P1 & Astra P0-1: mbt_compat::*.length() probed + uppercase const CAP[1] probed while Array[T] skipped
+  let (inst_r6, sites_r6) = instrument_probes_for_file(
+    "r6.pion",
+    "const CAP : String = \"中A\"\npub fn id_arr[T](xs : Array[T]) -> Option[Array[T]] { Some(xs) }\npub fn g(xs : Array[Int]) -> Int { let a = mbt_compat::arr_filter(xs, fn(x) { x > 1 }).length(); a + CAP[1].to_int() }\n",
+  )
+  assert_true(str_has(inst_r6, "mbt_compat::arr_filter(xs, fn(x) { x > 1 }).mbt_len_probe()"), "mbt_compat::*.length() probed")
+  assert_true(str_has(inst_r6, "CAP.mbt_idx_probe(1)"), "uppercase const CAP[1] probed")
+  assert_eq(sites_r6.length(), 2)
+
+  // Round 7 Astra P0: cross-package `acme::CAP[1]` MUST NOT be shadowed by local `pub struct CAP { n : Int }`,
+  // while `acme::Wrap[Int]` (both via api_map kind="struct" and in Option[acme::Wrap[Int]]) stays a type arg!
+  let d_r7 : Array[Diag] = []
+  let am_r7 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"acme\",\"src_name\":\"CAP\",\"kind\":\"const\",\"target_pkg\":\"acme\",\"target_name\":\"CAP\"},{\"src_pkg\":\"acme\",\"src_name\":\"Wrap\",\"kind\":\"struct\",\"target_pkg\":\"acme\",\"target_name\":\"Wrap\"}]}",
+    "r7_map.json",
+    d_r7,
+  )
+  assert_eq(d_r7.length(), 0)
+  let (inst_r7, sites_r7) = instrument_probes_for_file_with_api_map(
+    "r7.pion",
+    "pub struct CAP { n : Int }\npub fn id_wrap(w : acme::Wrap[Int]) -> Option[acme::Wrap[Int]] { Some(w) }\npub fn read_cap() -> Int { acme::CAP[1].to_int() }\n",
+    am_r7,
+  )
+  assert_true(str_has(inst_r7, "acme::CAP.mbt_idx_probe(1)"), "cross-pkg acme::CAP[1] probed even with local struct CAP")
+  assert_true(str_has(inst_r7, "Option[acme::Wrap[Int]]"), "nested cross-pkg type arg acme::Wrap[Int] preserved")
+  assert_eq(sites_r7.length(), 1)
+
+  // Round 8 Astra P0-1: WITHOUT api_map, `Box::{ n: ext::CAP[INDEX].to_int() }.n` MUST probe `ext::CAP[INDEX]`
+  // (struct literal field colon != type annotation colon; `INDEX` is declared_value; followed by `.`),
+  // while `struct Holder { w : ext::Wrap[Int] }` and `fn f(w : ext::Wrap[Int]) -> ext::Wrap[Int]` stay type args!
+  let (inst_r8, sites_r8) = instrument_probes_for_file(
+    "r8.pion",
+    "const INDEX : Int = 1\npub struct Box { n : Int }\npub struct Holder { w : ext::Wrap[Int] }\npub fn h(w : ext::Wrap[Int]) -> ext::Wrap[Int] { Holder::{ w: w }.w }\npub fn g() -> Int { Box::{ n: ext::CAP[INDEX].to_int() }.n }\n",
+  )
+  assert_true(str_has(inst_r8, "ext::CAP.mbt_idx_probe(INDEX)"), "no-apimap struct literal ext::CAP[INDEX] probed")
+  assert_true(str_has(inst_r8, "w : ext::Wrap[Int]"), "struct def & fn param ext::Wrap[Int] preserved")
+  assert_eq(sites_r8.length(), 1)
+}
+
+test "Red-team #12a P1-1 & P1-2: #cfg static eval + fail-loud, and raise/try/catch/noraise preservation & fail-loud" {
+  let empty_check = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+
+  // 1. #cfg(target=...) static evaluation for wasm32 vs native + excluded_by_cfg disposition
+  let cfg_src = "#cfg(target=\"js\")\npub fn which() -> Int { 10101 }\n#cfg(target=\"native\")\npub fn which() -> Int { 20202 }\n#cfg(target=\"wasm-gc\")\npub fn which() -> Int { 30303 }\n"
+  let base_opts = default_options()
+  let opts_wasm = TranspileOptions::{
+    target: "wasm32",
+    mode: base_opts.mode,
+    with_tests: base_opts.with_tests,
+    src_prefix: base_opts.src_prefix,
+    moon_pkg_content: base_opts.moon_pkg_content,
+    header: default_header_meta("wasm32"),
+  }
+  let res_wasm = transpile_package(
+    [SourceFile::{ rel_path: "cfg.mbt", content: cfg_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_wasm,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(res_wasm.blockers, 0)
+  assert_true(str_has(res_wasm.files[0].content, "30303") && !str_has(res_wasm.files[0].content, "10101") && !str_has(res_wasm.files[0].content, "20202"), "wasm32 keeps only wasm-gc #cfg decl")
+  let mut excl_wasm = 0
+  for d in res_wasm.dispositions {
+    if d.disposition == "excluded_by_cfg" { excl_wasm = excl_wasm + 1 }
+  }
+  assert_eq(excl_wasm, 2)
+
+  let opts_nat = default_options()
+  let res_nat = transpile_package(
+    [SourceFile::{ rel_path: "cfg.mbt", content: cfg_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(res_nat.blockers, 0)
+  assert_true(str_has(res_nat.files[0].content, "20202") && !str_has(res_nat.files[0].content, "10101") && !str_has(res_nat.files[0].content, "30303"), "native keeps only native #cfg decl")
+
+  // 2. Unknown #cfg(feature="experimental") MUST fail-loud with MBT2PION_UNSUPPORTED_CFG + disposition "unsupported"
+  let res_bad_cfg = transpile_package(
+    [SourceFile::{ rel_path: "bad_cfg.mbt", content: "#cfg(feature=\"experimental\")\npub fn exp() -> Int { 9 }\n", is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_wasm,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(res_bad_cfg.blockers > 0, "unknown #cfg MUST block")
+  let mut saw_cfg_err = false
+  for d in res_bad_cfg.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_CFG" { saw_cfg_err = true }
+  }
+  assert_true(saw_cfg_err, "unknown #cfg MUST emit MBT2PION_UNSUPPORTED_CFG")
+  let mut saw_cfg_unsup = false
+  for dp in res_bad_cfg.dispositions {
+    if dp.disposition == "unsupported" { saw_cfg_unsup = true }
+  }
+  assert_true(saw_cfg_unsup, "unknown #cfg MUST record disposition unsupported")
+
+  // 3. raise / noraise / try / catch: NO token mangling (Unitraise / IntraiseError / Failurefn / (Int, Int)raise),
+  //    MUST emit MBT2PION_UNSUPPORTED_SYNTAX (incl. callback param types), blockers > 0, and disposition == "unsupported"!
+  let err_src = "pub fn f1() -> Unit raise { raise Failure(\"boom\") }\npub fn f2() -> Int raise Error { 1 }\npub fn f3() -> Int noraise { try { f2() } catch { Failure(msg) => msg.length() } }\npub fn f4() -> (Int, Int) raise Error { (1, 2) }\npub fn f5(cb : () -> Unit raise) -> Unit { let _ = cb; () }\n"
+  let res_err = transpile_package(
+    [SourceFile::{ rel_path: "err.mbt", content: err_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  let out_err = res_err.files[0].content
+  assert_true(!str_has(out_err, "Unitraise"), "must NOT mangle `Unit raise` into `Unitraise`")
+  assert_true(!str_has(out_err, "IntraiseError"), "must NOT mangle `Int raise Error` into `IntraiseError`")
+  assert_true(!str_has(out_err, "Failurefn"), "must NOT mangle `Failure(msg) =>` into `Failurefn`")
+  assert_true(!str_has(out_err, ")raise"), "must NOT mangle `(Int, Int) raise Error` into `(Int, Int)raise`")
+  assert_true(res_err.blockers > 0, "raise/try/catch/noraise MUST block")
+  let mut saw_unsup_syn = 0
+  for d in res_err.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_unsup_syn = saw_unsup_syn + 1 }
+  }
+  assert_true(saw_unsup_syn >= 7, "raise/noraise/try/catch (incl. callback param) MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  for dp in res_err.dispositions {
+    assert_true(dp.disposition == "unsupported", "decl with unsupported error syntax MUST NOT be marked transpiled")
+  }
+}
+
+test "Final Opus+Astra regressions: #cfg brace-less decl skip, wasm32->wasm-gc exclusivity, nested raise/noraise type checks & struct/enum disposition" {
+  let empty_check = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let base_opts = default_options()
+  let opts_wasm = TranspileOptions::{
+    target: "wasm32",
+    mode: base_opts.mode,
+    with_tests: base_opts.with_tests,
+    src_prefix: base_opts.src_prefix,
+    moon_pkg_content: base_opts.moon_pkg_content,
+    header: default_header_meta("wasm32"),
+  }
+
+  // 1. Astra P0-1: #cfg(target="js") on brace-less decls (tuple struct, = "%identity", extern "js" fn)
+  //    MUST NOT swallow the following `pub fn kept() -> Int { 41 }`!
+  let braceless_src =
+  "#cfg(target=\"js\")\nstruct Box(Int)\npub fn kept1() -> Int { 41 }\n" +
+  "#cfg(target=\"js\")\nfn ident(x : Int) -> Int = \"%identity\"\npub fn kept2() -> Int { 41 }\n" +
+  "#cfg(target=\"js\")\nextern \"js\" fn js_f() -> Int = \"() => 1\"\npub fn kept3() -> Int { 41 }\n"
+  let res_bl = transpile_package(
+    [SourceFile::{ rel_path: "bl.mbt", content: braceless_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_wasm,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(res_bl.blockers, 0)
+  let out_bl = res_bl.files[0].content
+  assert_true(str_has(out_bl, "pub fn kept1()"), "tuple struct #cfg skip MUST preserve kept1")
+  assert_true(str_has(out_bl, "pub fn kept2()"), "= \"%identity\" #cfg skip MUST preserve kept2")
+  assert_true(str_has(out_bl, "pub fn kept3()"), "extern \"js\" fn #cfg skip MUST preserve kept3")
+  assert_true(!str_has(out_bl, "struct Box") && !str_has(out_bl, "ident(") && !str_has(out_bl, "js_f("), "excluded #cfg decls removed")
+  let mut saw_ext_label = false
+  for dp in res_bl.dispositions {
+    if dp.disposition == "excluded_by_cfg" && dp.decl == "fn:js_f" { saw_ext_label = true }
+  }
+  assert_true(saw_ext_label, "peek_decl_label skips extern \"js\" to produce fn:js_f")
+
+  // 2. Astra P0-2: --target wasm32 maps EXCLUSIVELY to MoonBit target="wasm-gc" (NOT target="wasm"!)
+  let wasm_excl_src =
+  "#cfg(target=\"wasm\")\npub fn w() -> Int { 1 }\n" +
+  "#cfg(not(target=\"wasm\"))\npub fn w() -> Int { 0 }\n" +
+  "#cfg(target=\"wasm-gc\")\npub fn g() -> Int { 2 }\n" +
+  "#cfg(not(target=\"wasm-gc\"))\npub fn g() -> Int { 0 }\n" +
+  "#cfg(target=\"wasm\")\npub fn which_w() -> Int { 10 }\n" +
+  "#cfg(target=\"wasm-gc\")\npub fn which_w() -> Int { 20 }\n" +
+  "pub fn wasm_bothbits() -> Int { w() + g() }\n"
+  let res_we = transpile_package(
+    [SourceFile::{ rel_path: "we.mbt", content: wasm_excl_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_wasm,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(res_we.blockers, 0)
+  let out_we = res_we.files[0].content
+  assert_true(str_has(out_we, "pub fn w() -> Int { 0 }") && !str_has(out_we, "pub fn w() -> Int { 1 }"), "wasm32 excludes target=\"wasm\"")
+  assert_true(str_has(out_we, "pub fn g() -> Int { 2 }") && !str_has(out_we, "pub fn g() -> Int { 0 }"), "wasm32 selects target=\"wasm-gc\"")
+  assert_true(str_has(out_we, "pub fn which_w() -> Int { 20 }") && !str_has(out_we, "pub fn which_w() -> Int { 10 }"), "no E_DUP_DEF between wasm and wasm-gc")
+  assert_true(eval_cfg_attr("#cfg(target=\"wasm32\")", "wasm32") is None, "unknown MoonBit target=\"wasm32\" returns None (fail-loud)")
+  assert_true(!target_matches_moon_rules("wasm32", ["wasm"]), "moon.pkg [\"wasm\"] excluded for wasm32")
+  assert_true(target_matches_moon_rules("wasm32", ["not", "wasm"]), "moon.pkg [\"not\", \"wasm\"] included for wasm32")
+  assert_true(target_matches_moon_rules("wasm32", ["wasm-gc"]), "moon.pkg [\"wasm-gc\"] included for wasm32")
+  assert_true(!target_matches_moon_rules("wasm32", ["not", "wasm-gc"]), "moon.pkg [\"not\", \"wasm-gc\"] excluded for wasm32")
+
+  // 3. Astra P1-3: nested raise/noraise in struct field, enum payload, local let, top-level let
+  //    MUST all emit MBT2PION_UNSUPPORTED_SYNTAX and mark disposition == "unsupported"!
+  let nested_err_src =
+  "pub struct BoxR { cb : () -> Int raise }\n" +
+  "pub struct BoxN { cb : () -> Int noraise }\n" +
+  "pub enum C { Call(() -> Int raise) }\n" +
+  "pub let top_cb : () -> Int raise = fn() { 1 }\n" +
+  "pub fn local_holder() -> Int { let cb : () -> Int raise = fn() { 1 }; let _ = cb; 0 }\n"
+  let res_ne = transpile_package(
+    [SourceFile::{ rel_path: "ne.mbt", content: nested_err_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    base_opts,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(res_ne.blockers >= 5, "all 5 nested raise/noraise type sites MUST block")
+  let mut ne_syn = 0
+  for d in res_ne.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { ne_syn = ne_syn + 1 }
+  }
+  assert_true(ne_syn >= 5, "all 5 nested raise/noraise sites MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  assert_eq(res_ne.dispositions.length(), 5)
+  for dp in res_ne.dispositions {
+    assert_true(dp.disposition == "unsupported", "struct/enum/let/fn with nested raise/noraise MUST have disposition unsupported: " + dp.decl)
+  }
+}
+
+test "Red-team P0+P1: non-#cfg extern/intrinsic/tuple-struct never swallow next decl or break #cfg, and trait dispositions" {
+  let empty_check = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+  let opts_nat = default_options()
+
+  // 1. Exact red-team counterexample: extern "C" fn c_abs = "abs" + #cfg(target="js") + #cfg(target="native") + kept()
+  let rt_c_src =
+  "extern \"C\" fn c_abs(x : Int) -> Int = \"abs\"\n" +
+  "#cfg(target=\"js\")\npub fn js_only() -> Int { 1 }\n" +
+  "#cfg(target=\"native\")\npub fn native_only() -> Int { c_abs(-2) }\n" +
+  "pub fn kept() -> Int { native_only() }\n"
+  let res_c = transpile_package(
+    [SourceFile::{ rel_path: "rt_c.mbt", content: rt_c_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(res_c.blockers, 0)
+  let out_c = res_c.files[0].content
+  assert_true(str_has(out_c, "extern \"C\" fn c_abs(x : Int) -> Int = \"abs\""), "legal extern C fn lowered cleanly")
+  assert_true(!str_has(out_c, "js_only"), "#cfg(target=\"js\") MUST be excluded (0 residual)")
+  assert_true(str_has(out_c, "pub fn native_only()") && str_has(out_c, "pub fn kept()"), "native_only and kept preserved")
+  assert_eq(res_c.dispositions.length(), 4)
+  assert_true(res_c.dispositions[0].decl == "fn:c_abs" && res_c.dispositions[0].disposition == "transpiled", "c_abs transpiled")
+  assert_true(res_c.dispositions[1].decl == "fn:js_only" && res_c.dispositions[1].disposition == "excluded_by_cfg", "js_only excluded_by_cfg")
+  assert_true(res_c.dispositions[2].decl == "fn:native_only" && res_c.dispositions[2].disposition == "transpiled", "native_only transpiled")
+  assert_true(res_c.dispositions[3].decl == "fn:kept" && res_c.dispositions[3].disposition == "transpiled", "kept transpiled")
+
+  // 2. Non-#cfg `fn ident = "%identity"` + #cfg(target="js") + kept()
+  let id_src =
+  "fn ident(x : Int) -> Int = \"%identity\"\n" +
+  "#cfg(target=\"js\")\npub fn js_only() -> Int { 1 }\n" +
+  "pub fn kept() -> Int { 41 }\n"
+  let res_id = transpile_package(
+    [SourceFile::{ rel_path: "rt_id.mbt", content: id_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(res_id.blockers >= 1, "non-C intrinsic MUST block")
+  assert_true(!str_has(res_id.files[0].content, "js_only") && str_has(res_id.files[0].content, "pub fn kept()"), "ident = \"%identity\" MUST NOT swallow #cfg or kept()")
+  assert_eq(res_id.dispositions.length(), 3)
+  assert_true(res_id.dispositions[0].disposition == "unsupported" && res_id.dispositions[1].disposition == "excluded_by_cfg" && res_id.dispositions[2].disposition == "transpiled", "exact 3 dispositions for ident+js_only+kept")
+
+  // 3. Non-#cfg `extern "js" fn` + multiline `fn add_i32 = \n "%i32_add"` + kept()
+  let ext_ml_src =
+  "extern \"js\" fn js_fn() -> Int = \"() => 1\"\n" +
+  "fn add_i32(a : Int, b : Int) -> Int =\n  \"%i32_add\"\n" +
+  "pub fn kept() -> Int { 41 }\n"
+  let res_em = transpile_package(
+    [SourceFile::{ rel_path: "rt_em.mbt", content: ext_ml_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(res_em.blockers >= 2, "extern js + multiline intrinsic MUST both block")
+  assert_true(str_has(res_em.files[0].content, "pub fn kept()"), "kept() preserved after extern js + multiline =")
+  assert_eq(res_em.dispositions.length(), 3)
+  assert_true(res_em.dispositions[0].disposition == "unsupported" && res_em.dispositions[1].disposition == "unsupported" && res_em.dispositions[2].disposition == "transpiled", "dispositions for extern js + add_i32 + kept")
+
+  // 4. Non-#cfg tuple struct `pub struct Wrap(Int)` + kept()
+  let ts_src = "pub struct Wrap(Int)\npub fn kept() -> Int { 41 }\n"
+  let res_ts = transpile_package(
+    [SourceFile::{ rel_path: "rt_ts.mbt", content: ts_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(res_ts.blockers >= 1, "tuple struct MUST block")
+  assert_true(str_has(res_ts.files[0].content, "pub fn kept()"), "tuple struct MUST NOT swallow kept()")
+  assert_eq(res_ts.dispositions.length(), 2)
+  assert_true(res_ts.dispositions[0].decl == "struct:Wrap" && res_ts.dispositions[0].disposition == "unsupported", "struct:Wrap unsupported")
+  assert_true(res_ts.dispositions[1].decl == "fn:kept" && res_ts.dispositions[1].disposition == "transpiled", "kept transpiled")
+
+  // 5. `pub trait T { run(Self) -> Int raise }` + kept() -> trait:T unsupported
+  let tr_bad_src = "pub trait T {\n  run(Self) -> Int raise\n}\npub fn kept() -> Int { 41 }\n"
+  let res_tb = transpile_package(
+    [SourceFile::{ rel_path: "rt_tb.mbt", content: tr_bad_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(res_tb.blockers >= 1, "trait with raise MUST block")
+  assert_eq(res_tb.dispositions.length(), 2)
+  assert_true(res_tb.dispositions[0].decl == "trait:T" && res_tb.dispositions[0].disposition == "unsupported", "trait:T marked unsupported")
+  assert_true(res_tb.dispositions[1].decl == "fn:kept" && res_tb.dispositions[1].disposition == "transpiled", "kept transpiled after trait:T")
+
+  // 6. `pub trait Clean { val(Self) -> Int }` -> trait:Clean transpiled
+  let tr_ok_src = "pub trait Clean {\n  val(Self) -> Int\n}\n"
+  let res_to = transpile_package(
+    [SourceFile::{ rel_path: "rt_to.mbt", content: tr_ok_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    opts_nat,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(res_to.blockers, 0)
+  assert_eq(res_to.dispositions.length(), 1)
+  assert_true(res_to.dispositions[0].decl == "trait:Clean" && res_to.dispositions[0].disposition == "transpiled", "trait:Clean marked transpiled")
+}
+
+test "Final Astra P0+P1: moon.pkg full target rule evaluator (fail-closed) & extern \"C\" C-ABI signature allowlist" {
+  let empty_check = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+
+  // 1. eval_moon_pkg_target_rule full matrix for wasm32 (maps exclusively to wasm-gc)
+  assert_true(eval_moon_pkg_target_rule("wasm32", "\"wasm\"") is Some(false), "single-string \"wasm\" -> false")
+  assert_true(eval_moon_pkg_target_rule("wasm32", "[\"and\",\"wasm-gc\",\"native\"]") is Some(false), "and(wasm-gc, native) -> false")
+  assert_true(eval_moon_pkg_target_rule("wasm32", "[\"or\",[\"and\",\"wasm\",\"native\"],\"js\"]") is Some(false), "or(and(wasm,native), js) -> false")
+  assert_true(eval_moon_pkg_target_rule("wasm32", "[\"or\",\"wasm\",\"wasm-gc\"]") is Some(true), "or(wasm, wasm-gc) -> true")
+  assert_true(eval_moon_pkg_target_rule("wasm32", "[\"not\",\"wasm\"]") is Some(true), "not(wasm) -> true")
+  assert_true(eval_moon_pkg_target_rule("wasm32", "[\"debug\"]") is None, "unknown [\"debug\"] -> None (fail-closed)")
+  assert_true(eval_moon_pkg_target_rule("wasm32", "[\"not\",\"debug\"]") is None, "unknown [\"not\",\"debug\"] -> None (fail-closed)")
+
+  // transpile_package blocks with MBT2PION_UNSUPPORTED_TARGET_RULE on ["debug"] and ["not","debug"]
+  for bad_rule in ["[\"debug\"]", "[\"not\", \"debug\"]"] {
+    let bad_opts = TranspileOptions::{
+      target: "wasm32",
+      mode: "audit",
+      with_tests: false,
+      src_prefix: "",
+      moon_pkg_content: "options(targets: { \"extra.mbt\": " + bad_rule + " })\n",
+      header: default_header_meta("wasm32"),
+    }
+    let r_bad = transpile_package(
+      [SourceFile::{ rel_path: "extra.mbt", content: "pub fn x() -> Int { 1 }\n", is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      bad_opts,
+      [],
+      false,
+      empty_check,
+    )
+    assert_true(r_bad.blockers >= 1, "unknown moon.pkg rule MUST block: " + bad_rule)
+    let mut saw_tr_err = false
+    for d in r_bad.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_TARGET_RULE" { saw_tr_err = true }
+    }
+    assert_true(saw_tr_err, "MUST emit MBT2PION_UNSUPPORTED_TARGET_RULE for " + bad_rule)
+    let mut saw_file_unsup = false
+    for dp in r_bad.dispositions {
+      if dp.decl == "file:extra.mbt" && dp.disposition == "unsupported" { saw_file_unsup = true }
+    }
+    assert_true(saw_file_unsup, "MUST mark file:extra.mbt unsupported for " + bad_rule)
+  }
+
+  // 2. extern "C" C-ABI signature allowlist: #borrow(s) + String param MUST emit MBT2PION_UNSUPPORTED_FFI_SIGNATURE
+  let bad_ffi_src = "#borrow(s)\nextern \"C\" fn first(s : String) -> Int = \"first_unit\"\nextern \"C\" fn c_abs(x : Int) -> Int = \"abs\"\n"
+  let r_ffi = transpile_package(
+    [SourceFile::{ rel_path: "ffi.mbt", content: bad_ffi_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(r_ffi.blockers, 1)
+  let mut saw_ffi_sig = false
+  for d in r_ffi.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_FFI_SIGNATURE" { saw_ffi_sig = true }
+  }
+  assert_true(saw_ffi_sig, "#borrow(s) + String extern C fn MUST emit MBT2PION_UNSUPPORTED_FFI_SIGNATURE")
+  assert_eq(r_ffi.dispositions.length(), 2)
+  assert_true(r_ffi.dispositions[0].decl == "fn:first" && r_ffi.dispositions[0].disposition == "unsupported", "fn:first marked unsupported")
+  assert_true(r_ffi.dispositions[1].decl == "fn:c_abs" && r_ffi.dispositions[1].disposition == "transpiled", "fn:c_abs stays transpiled")
+}
+
+test "Final Astra P0: lexer-backed parse_moon_pkg_targets_strict handles whitespace, // comments, nested exprs, and malformed rules" {
+  let empty_check = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+
+  // 1-6. All 6 Astra comment/whitespace/nested manifest forms
+  match parse_moon_pkg_targets_strict("options(targets: {\"extra.mbt\": \"wasm\"})") {
+    Ok(m) =>
+    match m.get("extra.mbt") {
+      Some(ast) => assert_true(format_target_rule_expr(ast) == "\"wasm\"", "case 1: compact targets:")
+      None => assert_true(false, "case 1 missing extra.mbt")
+    }
+    Err(e) => assert_true(false, "case 1 unexpected err: " + e)
+  }
+  match parse_moon_pkg_targets_strict("options(targets : {\"extra.mbt\": \"wasm\"})") {
+    Ok(m) =>
+    match m.get("extra.mbt") {
+      Some(ast) => assert_true(format_target_rule_expr(ast) == "\"wasm\"", "case 2: space before colon `targets :`")
+      None => assert_true(false, "case 2 missing extra.mbt")
+    }
+    Err(e) => assert_true(false, "case 2 unexpected err: " + e)
+  }
+  match parse_moon_pkg_targets_strict("options(targets: {\n // \"extra.mbt\": \"wasm\",\n})") {
+    Ok(m) => assert_true(m.get("extra.mbt") is None, "case 3: commented-out rule ignored")
+    Err(e) => assert_true(false, "case 3 unexpected err: " + e)
+  }
+  match parse_moon_pkg_targets_strict("// Previous targets: {}\noptions(targets: {\"extra.mbt\": \"wasm\"})") {
+    Ok(m) =>
+    match m.get("extra.mbt") {
+      Some(ast) => assert_true(format_target_rule_expr(ast) == "\"wasm\"", "case 4: // Previous targets: {} comment ignored")
+      None => assert_true(false, "case 4 missing extra.mbt")
+    }
+    Err(e) => assert_true(false, "case 4 unexpected err: " + e)
+  }
+  match parse_moon_pkg_targets_strict("options(targets: {\n // }\n \"extra.mbt\": \"wasm\",\n})") {
+    Ok(m) =>
+    match m.get("extra.mbt") {
+      Some(ast) => assert_true(format_target_rule_expr(ast) == "\"wasm\"", "case 5: // } inside targets table ignored")
+      None => assert_true(false, "case 5 missing extra.mbt")
+    }
+    Err(e) => assert_true(false, "case 5 unexpected err: " + e)
+  }
+  match parse_moon_pkg_targets_strict("options(targets: {\"extra.mbt\": [\"or\", [\"and\", \"wasm-gc\", \"native\"], \"js\"]})") {
+    Ok(m) =>
+    match m.get("extra.mbt") {
+      Some(ast) => assert_true(eval_target_rule_ast("wasm32", ast) is Some(false), "case 6: nested or(and(wasm-gc,native), js) -> false")
+      None => assert_true(false, "case 6 missing extra.mbt")
+    }
+    Err(e) => assert_true(false, "case 6 unexpected err: " + e)
+  }
+
+  // 7. Comment inside array literal stripped cleanly
+  match parse_moon_pkg_targets_strict("options(targets: {\"extra.mbt\": [\n // \"wasm-gc\",\n \"wasm\",\n]})") {
+    Ok(m) =>
+    match m.get("extra.mbt") {
+      Some(ast) => {
+        assert_true(format_target_rule_expr(ast) == "[\"wasm\"]", "case 7: comment inside array stripped -> [\"wasm\"]")
+        assert_true(eval_target_rule_ast("wasm32", ast) is Some(false), "case 7: evaluates to false on wasm32")
+      }
+      None => assert_true(false, "case 7 missing extra.mbt")
+    }
+    Err(e) => assert_true(false, "case 7 unexpected err: " + e)
+  }
+
+  // 8. Malformed targets (`options(targets: 123)` and `options(targets: { bad: "wasm" })`) -> Err & blockers > 0
+  for bad_pkg in ["options(targets: 123)", "options(targets: { bad: \"wasm\" })"] {
+    assert_true(parse_moon_pkg_targets_strict(bad_pkg) is Err(_), "malformed manifest MUST return Err: " + bad_pkg)
+    let bad_opts = TranspileOptions::{
+      target: "wasm32",
+      mode: "audit",
+      with_tests: false,
+      src_prefix: "",
+      moon_pkg_content: bad_pkg,
+      header: default_header_meta("wasm32"),
+    }
+    let r_bad = transpile_package(
+      [SourceFile::{ rel_path: "a.mbt", content: "pub fn ok() -> Int { 1 }\n", is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      bad_opts,
+      [],
+      false,
+      empty_check,
+    )
+    assert_true(r_bad.blockers >= 1, "malformed moon.pkg MUST block: " + bad_pkg)
+    let mut saw_err = false
+    for d in r_bad.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_TARGET_RULE" { saw_err = true }
+    }
+    assert_true(saw_err, "malformed moon.pkg MUST emit MBT2PION_UNSUPPORTED_TARGET_RULE: " + bad_pkg)
+  }
+
+  // 9. Strict RFC 8259 JSON escape decoding (\uHHHH, surrogate pairs), decoded duplicate keys, non-JSON escape rejection, and raw #cfg
+  for esc_pkg in [
+    "options(targets: {\"ex\\u0074ra.mbt\": \"wasm\"})",
+    "options(\"tar\\u0067ets\": {\"extra.mbt\": \"wasm\"})",
+    "options(targets: {\"extra.mbt\": \"w\\u0061sm\"})",
+  ] {
+    match parse_moon_pkg_targets_strict(esc_pkg) {
+      Ok(m) =>
+      match m.get("extra.mbt") {
+        Some(ast) => assert_true(eval_target_rule_ast("wasm32", ast) is Some(false), "escaped rule must decode and exclude extra.mbt: " + esc_pkg)
+        None => assert_true(false, "escaped rule missing decoded extra.mbt: " + esc_pkg)
+      }
+      Err(e) => assert_true(false, "escaped rule unexpected err for " + esc_pkg + ": " + e)
+    }
+  }
+  assert_true(decode_mbt_string_lit("\"\\uD83D\\uDE00\"") is Ok("😀"), "UTF-16 surrogate pair decodes to UTF-8 emoji")
+  for bad_esc_pkg in [
+    "options(targets: {\"extra.mbt\": \"native\", \"ex\\u0074ra.mbt\": \"wasm\"})",
+    "options(targets: {\"extra.mbt\": \"\\q\"})",
+    "options(targets: {\"extra.mbt\": \"\\uD800\"})",
+    "options(targets: {\"ex\\x74ra.mbt\": \"wasm\"})",
+    "options(targets: {\"ex\\u{74}ra.mbt\": \"wasm\"})",
+    "options(targets: {\"ex\\'tra.mbt\": \"wasm\"})",
+  ] {
+    assert_true(parse_moon_pkg_targets_strict(bad_esc_pkg) is Err(_), "duplicate/non-JSON escape MUST fail-closed: " + bad_esc_pkg)
+    let bo = TranspileOptions::{
+      target: "wasm32",
+      mode: "audit",
+      with_tests: false,
+      src_prefix: "",
+      moon_pkg_content: bad_esc_pkg,
+      header: default_header_meta("wasm32"),
+    }
+    let rb = transpile_package(
+      [SourceFile::{ rel_path: "extra.mbt", content: "pub fn ok() -> Int { 1 }\n", is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      bo,
+      [],
+      false,
+      empty_check,
+    )
+    assert_true(rb.blockers >= 1, "duplicate/non-JSON escape MUST block transpile: " + bad_esc_pkg)
+    let mut saw_tr = false
+    for d in rb.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_TARGET_RULE" { saw_tr = true }
+    }
+    assert_true(saw_tr, "MUST emit MBT2PION_UNSUPPORTED_TARGET_RULE for " + bad_esc_pkg)
+  }
+  // #cfg(target="...") does NOT decode escapes in MoonBit -> must fail-closed with MBT2PION_UNSUPPORTED_CFG!
+  for esc_cfg in [
+    "#cfg(target=\"w\\u0061sm-gc\")",
+    "#cfg(target=\"w\\x61sm-gc\")",
+    "#cfg(target=\"w\\u{61}sm-gc\")",
+  ] {
+    assert_true(eval_cfg_attr(esc_cfg, "wasm32") is None, "#cfg escaped target MUST return None: " + esc_cfg)
+    let r_ec = transpile_package(
+      [SourceFile::{ rel_path: "ec.mbt", content: esc_cfg + "\npub fn f() -> Int { 1 }\n", is_test: false }],
+      empty_api_map(),
+      default_recipes(),
+      [],
+      [],
+      TranspileOptions::{
+        target: "wasm32",
+        mode: "audit",
+        with_tests: false,
+        src_prefix: "",
+        moon_pkg_content: "",
+        header: default_header_meta("wasm32"),
+      },
+      [],
+      false,
+      empty_check,
+    )
+    assert_true(r_ec.blockers >= 1, "#cfg escaped target MUST block: " + esc_cfg)
+    let mut saw_cfg = false
+    for d in r_ec.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_CFG" { saw_cfg = true }
+    }
+    assert_true(saw_cfg, "MUST emit MBT2PION_UNSUPPORTED_CFG for " + esc_cfg)
+  }
+  assert_true(eval_cfg_attr("#cfg(target=\"wasm-gc\")", "wasm32") is Some(true), "plain #cfg(target=\"wasm-gc\") -> Some(true)")
+}

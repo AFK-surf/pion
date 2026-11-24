@@ -25,7 +25,8 @@ FMT_OUT=$("$PIONC2" fmt --check --json "$ROOT_DIR/examples/text_stats" "$ROOT_DI
   "$ROOT_DIR/tests/e2e/p17a_ergonomics_mt.pion" "$ROOT_DIR/examples/https_server" \
   "$ROOT_DIR/tests/e2e/dyn_trait.pion" "$ROOT_DIR/tests/e2e/p22a_systems_io.pion" \
   "$ROOT_DIR/tests/e2e/p25a_c_varargs.pion" "$ROOT_DIR/tests/e2e/p27a_ergonomics_bug4.pion" \
-  "$ROOT_DIR/examples/pion_station")
+  "$ROOT_DIR/examples/pion_station" \
+  "$ROOT_DIR/tools/mbt_compat" "$ROOT_DIR/tools/mbt2pion" "$ROOT_DIR/tools/mbt2pion_cli")
 printf 'pionc2 fmt --check --json -> %s\n' "$FMT_OUT"
 if ! printf '%s' "$FMT_OUT" | grep -q '"ok":true'; then
   echo "FAIL: pionc2 fmt --check --json reported unformatted files" >&2
@@ -46,7 +47,7 @@ rm -rf "$UTF8_TMP"
 echo "pionc2 fmt keeps UTF-8 text byte-for-byte: OK"
 
 echo "=== [4/6] Standalone pionc2 Test Runner (examples/text_stats, std/*, dogfood apps, init, doc) ==="
-for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc std/tls examples/http_kv_service examples/http_event_server examples/sqlite_indexer; do
+for TPKG in examples/text_stats std/json std/http std/net std/regex std/proc std/tls examples/http_kv_service examples/http_event_server examples/sqlite_indexer tools/mbt_compat tools/mbt2pion tools/mbt2pion_cli; do
   if [ "$TPKG" = "examples/text_stats" ]; then
     TEST_OUT=$("$PIONC2" test --deps --json "$ROOT_DIR/$TPKG")
   else
@@ -227,6 +228,7 @@ sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PIONC2"
 # Wave J0: symlinked pionc self-location + atomic (temp + rename) native/Wasm32 link publishing.
 sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC2"
 
 echo "=== [6/6] Dogfood Release Apps & OpenSSL/SQLite Flagship Tests ==="
 # Dogfood apps: multithreaded KV service (in-process routes + 8x500 concurrent
