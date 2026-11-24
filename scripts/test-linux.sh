@@ -560,6 +560,7 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c1_crosspkg_clo_intmap_eq/run_e2e.s
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p27c2_float_uint_fixedarray/run_e2e.sh" "$PIONC"
 # std/proc: streaming subprocess + cross-platform PTY (native + ASan).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/std/proc/e2e/run_e2e.sh" "$PIONC"
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p101_map_init_arg_order/run_e2e.sh" "$PIONC"
 # P26-A: native link (c_sources .c/.cc invoke system cc/c++ which need real `as`).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/native_link/run_e2e.sh" "$PIONC"
 # P26-B: C callbacks, zero-copy FFI/math/StringBuilder, cross-pkg generic Option mono & private exports.

@@ -44,6 +44,8 @@ pub struct QbeMutWb {
   place : Expr
   slot : String
   ty : Ty
+  /// Owned hidden locals the snapshotted `place` refers to.
+  holds : Array[QbeLocal]
 }
 
 ///|
@@ -945,6 +947,30 @@ fn qbe_let_infer(g : QbeGen, sp : Span) -> Option[Ty] {
   let key = span_key(sp)
   let raw = if g.mono_pkg != "" {
     match g.tc.imported_pkgs.get(g.mono_pkg) {
+      Some(ipkg) =>
+        match ipkg.tc.let_infer.get(key) {
+          Some(t) => Some(qualify_imported_ty(ipkg.name, t))
+          None => None
+        }
+      None => g.tc.let_infer.get(key)
+    }
+  } else {
+    g.tc.let_infer.get(key)
+  }
+  match raw {
+    Some(t) => Some(subst_ty(t, g.cur_type_subst))
+    None => None
+  }
+}
+
+///|
+/// Type the checker recorded for the call at `sp` under `tag` (`#map`: type of a
+/// `Map(...)` construction, `#targs:<fn>`: type arguments of a generic call with
+/// named / default arguments).
+fn qbe_call_infer(g : QbeGen, sp : Span, tag : String) -> Option[Ty] {
+  let key = span_key(sp) + tag
+  let raw = if g.mono_pkg != "" {
+    match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
       Some(ipkg) =>
         match ipkg.tc.let_infer.get(key) {
           Some(t) => Some(qualify_imported_ty(ipkg.name, t))
@@ -13908,6 +13934,7 @@ fn qbe_try_inline_hof_call(
   key : String,
   finfo : FnInfo,
   norm_args : Array[Expr],
+  order : Array[Int],
 ) -> Option[QbeVal] {
   if g.mono_pkg != "" ||
     g.inline_depth >= 2 ||
@@ -14040,12 +14067,15 @@ fn qbe_try_inline_hof_call(
       let arg_vals : Array[String] = []
       let arg_tys : Array[Ty] = []
       let arg_borrowed : Array[Bool] = []
-      i = 0
-      while i < norm_args.length() {
+      qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+      let guards = qbe_arg_guards(norm_args, order)
+      let mut oi = 0
+      while oi < order.length() {
+        i = order[oi]
         if is_spec[i] {
-          arg_vals.push("0")
-          arg_tys.push(finfo.param_tys[i])
-          arg_borrowed.push(true)
+          arg_vals[i] = "0"
+          arg_tys[i] = finfo.param_tys[i]
+          arg_borrowed[i] = true
         } else {
           match norm_args[i] {
             EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
@@ -14057,12 +14087,14 @@ fn qbe_try_inline_hof_call(
             Some(finfo.param_tys[i]),
             can_borrow,
           )
-          arg_vals.push(aa.qv.reg)
-          arg_tys.push(aa.qv.ty)
-          arg_borrowed.push(aa.borrowed)
+          arg_vals[i] = aa.qv.reg
+          arg_tys[i] = aa.qv.ty
+          arg_borrowed[i] = aa.borrowed
+          qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(finfo.decl.params, i, norm_args[i]), guards.exits[oi])
         }
-        i = i + 1
+        oi = oi + 1
       }
+      qbe_release_guards(g, guards)
       g.inline_depth = g.inline_depth + 1
       g.inline_stack.push(key)
       let inl_hlen = g.hoisted_arr_len
@@ -14237,6 +14269,7 @@ fn qbe_emit_inline_closure_call(
 ) -> QbeVal {
   let can_borrow = !qbe_args_may_mutate_locals(g, args)
   let body_no_calls = qbe_loop_has_no_calls_stmts(g, iclo.body)
+  let guards = qbe_arg_guards_in_order(args)
   let arg_vals : Array[String] = []
   let arg_tys : Array[Ty] = []
   let arg_borrowed : Array[Bool] = []
@@ -14276,9 +14309,11 @@ fn qbe_emit_inline_closure_call(
       arg_vals.push(aa.qv.reg)
       arg_tys.push(aa.qv.ty)
       arg_borrowed.push(aa.borrowed)
+      qbe_guard_val(g, guards, aa, false, guards.exits[i])
     }
     i = i + 1
   }
+  qbe_release_guards(g, guards)
   let saved_scopes = g.scopes
   let saved_breaks = g.loop_breaks
   let saved_conts = g.loop_conts
@@ -14492,6 +14527,7 @@ fn qbe_emit_inline_closure_flat_struct_lit(
 ) -> Array[QbeVal] {
   let can_borrow = !qbe_args_may_mutate_locals(g, args)
   let body_no_calls = qbe_loop_has_no_calls_stmts(g, iclo.body)
+  let guards = qbe_arg_guards_in_order(args)
   let arg_vals : Array[String] = []
   let arg_tys : Array[Ty] = []
   let arg_borrowed : Array[Bool] = []
@@ -14531,9 +14567,11 @@ fn qbe_emit_inline_closure_flat_struct_lit(
       arg_vals.push(aa.qv.reg)
       arg_tys.push(aa.qv.ty)
       arg_borrowed.push(aa.borrowed)
+      qbe_guard_val(g, guards, aa, false, guards.exits[i])
     }
     i = i + 1
   }
+  qbe_release_guards(g, guards)
   let saved_scopes = g.scopes
   let saved_breaks = g.loop_breaks
   let saved_conts = g.loop_conts
@@ -18597,8 +18635,12 @@ fn qbe_try_emit_opt_res_scalarized(
                   let arg_tys : Array[Ty] = []
                   let arg_borrowed : Array[Bool] = []
                   let wbs : Array[QbeMutWb] = []
-                  let mut i = 0
-                  while i < norm_args.length() {
+                  let order = qbe_call_eval_order(finfo.decl.params, 0, args, norm_args.length())
+                  qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+                  let guards = qbe_arg_guards(norm_args, order)
+                  let mut oi = 0
+                  while oi < order.length() {
+                    let i = order[oi]
                     match norm_args[i] {
                       EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                       _ => ()
@@ -18611,12 +18653,15 @@ fn qbe_try_emit_opt_res_scalarized(
                       Some(finfo.param_tys[i]),
                       can_borrow,
                       wbs,
+                      norm_args,
                     )
-                    arg_vals.push(aa.qv.reg)
-                    arg_tys.push(aa.qv.ty)
-                    arg_borrowed.push(aa.borrowed)
-                    i = i + 1
+                    arg_vals[i] = aa.qv.reg
+                    arg_tys[i] = aa.qv.ty
+                    arg_borrowed[i] = aa.borrowed
+                    qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(finfo.decl.params, i, norm_args[i]), guards.exits[oi])
+                    oi = oi + 1
                   }
+                  qbe_release_guards(g, guards)
                   let stack_key = if target_pkg != "" {
                     target_pkg + "::" + name
                   } else {
@@ -18771,8 +18816,12 @@ fn qbe_try_emit_opt_res_scalarized(
                   let arg_tys : Array[Ty] = []
                   let arg_borrowed : Array[Bool] = []
                   let wbs : Array[QbeMutWb] = []
-                  let mut i = 0
-                  while i < norm_args.length() {
+                  let order = qbe_call_eval_order(minfo.decl.params, 0, args, norm_args.length())
+                  qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+                  let guards = qbe_arg_guards(norm_args, order)
+                  let mut oi = 0
+                  while oi < order.length() {
+                    let i = order[oi]
                     match norm_args[i] {
                       EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                       _ => ()
@@ -18785,12 +18834,15 @@ fn qbe_try_emit_opt_res_scalarized(
                       Some(minfo.param_tys[i]),
                       can_borrow,
                       wbs,
+                      norm_args,
                     )
-                    arg_vals.push(aa.qv.reg)
-                    arg_tys.push(aa.qv.ty)
-                    arg_borrowed.push(aa.borrowed)
-                    i = i + 1
+                    arg_vals[i] = aa.qv.reg
+                    arg_tys[i] = aa.qv.ty
+                    arg_borrowed[i] = aa.borrowed
+                    qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i, norm_args[i]), guards.exits[oi])
+                    oi = oi + 1
                   }
+                  qbe_release_guards(g, guards)
                   let stack_key = if target_pkg != "" {
                     target_pkg + "::" + key
                   } else {
@@ -18881,8 +18933,13 @@ fn qbe_try_emit_opt_res_scalarized(
                       let arg_tys : Array[Ty] = [ra.qv.ty]
                       let arg_borrowed : Array[Bool] = [ra.borrowed]
                       let wbs : Array[QbeMutWb] = []
-                      let mut i = 0
-                      while i < norm_args.length() {
+                      let order = qbe_call_eval_order(minfo.decl.params, 1, args, norm_args.length())
+                      qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
+                      let guards = qbe_arg_guards(norm_args, order)
+                      qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, false, qbe_guards_any_exit(norm_args))
+                      let mut oi = 0
+                      while oi < order.length() {
+                        let i = order[oi]
                         let p_idx = i + 1
                         let aa = qbe_emit_call_arg(
                           g,
@@ -18892,12 +18949,15 @@ fn qbe_try_emit_opt_res_scalarized(
                           Some(minfo.param_tys[p_idx]),
                           recv_pure,
                           wbs,
+                          norm_args,
                         )
-                        arg_vals.push(aa.qv.reg)
-                        arg_tys.push(aa.qv.ty)
-                        arg_borrowed.push(aa.borrowed)
-                        i = i + 1
+                        arg_vals[i + 1] = aa.qv.reg
+                        arg_tys[i + 1] = aa.qv.ty
+                        arg_borrowed[i + 1] = aa.borrowed
+                        qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i + 1, norm_args[i]), guards.exits[oi])
+                        oi = oi + 1
                       }
+                      qbe_release_guards(g, guards)
                       let stack_key = if mpkg != "" { mpkg + "::" + key } else { key }
                       Some(
                         qbe_inline_body_into_opt_res_slots(
@@ -20904,23 +20964,539 @@ fn qbe_param_is_mut(params : Array[Param], i : Int) -> Bool {
 }
 
 ///|
+/// A hidden owned local holding `v` (its name cannot be written in source).
+fn qbe_hold_local(g : QbeGen, prefix : String, v : QbeVal) -> QbeLocal {
+  g.mut_wb_seq = g.mut_wb_seq + 1
+  let loc = qbe_define_local(g, prefix + g.mut_wb_seq.to_string(), v.ty, true)
+  qbe_store_local_slot(g, v.reg, loc.slot, v.ty)
+  loc
+}
+
+///|
+/// No argument evaluation can rebind a plain local of the caller.
+fn qbe_mut_places_stable(g : QbeGen, args : Array[Expr]) -> Bool {
+  let mut i = 0
+  while i < args.length() {
+    let e = match args[i] {
+      EMutArg(inner, _) => inner
+      x => x
+    }
+    if qbe_expr_may_mutate_locals(g, e) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+/// A plain non-captured local that keeps its binding until the write-back.
+fn qbe_is_stable_local(g : QbeGen, e : Expr, stable : Bool) -> Bool {
+  match e {
+    EInt(_, _) => true
+    EIdent(n, _) =>
+      if stable {
+        match qbe_lookup_local(g, n) {
+          Some(loc) => !loc.is_cell
+          None => false
+        }
+      } else {
+        false
+      }
+    _ => false
+  }
+}
+
+///|
+/// Evaluates the container and index of `a[i]`, or the object owning the field of
+/// `o.f`, once, so the write-back targets the element or field that was read,
+/// whatever later arguments or the callee do to what the place is spelled with. Only
+/// a plain local that nothing can rebind meanwhile is left as it is.
+fn qbe_snapshot_place(
+  g : QbeGen,
+  place : Expr,
+  stable : Bool,
+  holds : Array[QbeLocal],
+) -> Expr {
+  match place {
+    EField(base, f, sp) =>
+      if qbe_is_stable_local(g, base, stable) {
+        place
+      } else {
+        let bv = qbe_emit_expr(g, base, None)
+        let loc = qbe_hold_local(g, "@mut_obj_", bv)
+        holds.push(loc)
+        EField(EIdent(loc.name, sp), f, sp)
+      }
+    EIndex(base, idx, sp) => {
+      let b = if qbe_is_stable_local(g, base, stable) {
+        base
+      } else {
+        let bv = qbe_emit_expr(g, base, None)
+        let loc = qbe_hold_local(g, "@mut_base_", bv)
+        holds.push(loc)
+        EIdent(loc.name, sp)
+      }
+      let i = if qbe_is_stable_local(g, idx, stable) {
+        idx
+      } else {
+        let iv = qbe_emit_expr(g, idx, Some(TInt))
+        let loc = qbe_hold_local(g, "@mut_idx_", iv)
+        EIdent(loc.name, sp)
+      }
+      EIndex(b, i, sp)
+    }
+    _ => place
+  }
+}
+
+///|
 /// Caller side of a `mut <place>` argument: the place's current value moves
 /// into a fresh 64-bit slot whose address is passed (`l`); after the call the
-/// slot's (possibly replaced) value is assigned back to the place.
+/// slot's (possibly replaced) value is assigned back to the place. `args` are all
+/// written arguments of the call.
 fn qbe_emit_mut_arg(
   g : QbeGen,
   place : Expr,
   exp : Option[Ty],
   wbs : Array[QbeMutWb],
+  args : Array[Expr],
 ) -> QbeArgVal {
   let slot = qbe_alloc_slot(g)
   let saved_mov = g.movable_locals
   g.movable_locals = Map([])
-  let v = qbe_emit_expr(g, place, exp)
+  let holds : Array[QbeLocal] = []
+  let snap = qbe_snapshot_place(g, place, qbe_mut_places_stable(g, args), holds)
+  let v = qbe_emit_expr(g, snap, exp)
   g.movable_locals = saved_mov
   qbe_store_heap_slot(g, v.reg, slot, v.ty)
-  wbs.push(QbeMutWb::{ place: place, slot: slot, ty: v.ty })
+  wbs.push(QbeMutWb::{ place: snap, slot: slot, ty: v.ty, holds: holds })
   QbeArgVal::{ qv: qval(slot, v.ty), borrowed: true }
+}
+
+///|
+/// Caller-side temporaries kept alive across later arguments that may leave the
+/// call early (`return`, `break`, `continue`, `?`): each is registered as an owned
+/// local of the current scope, so that exit path releases it.
+struct QbeArgGuards {
+  exits : Array[Bool]
+  slots : Array[String]
+  stores : Array[Bool]
+}
+
+///|
+/// `exits[k]`: some argument evaluated after position `k` may leave the call early.
+fn qbe_arg_guards(args : Array[Expr], order : Array[Int]) -> QbeArgGuards {
+  let exits : Array[Bool] = []
+  while exits.length() < order.length() {
+    exits.push(false)
+  }
+  let mut any = false
+  let mut k = order.length() - 1
+  while k >= 0 {
+    exits[k] = any
+    if !any {
+      any = qbe_expr_has_cf(args[order[k]], true, true, true)
+    }
+    k = k - 1
+  }
+  QbeArgGuards::{ exits: exits, slots: [], stores: [] }
+}
+
+///|
+fn qbe_arg_guards_in_order(args : Array[Expr]) -> QbeArgGuards {
+  let order : Array[Int] = []
+  while order.length() < args.length() {
+    order.push(order.length())
+  }
+  qbe_arg_guards(args, order)
+}
+
+///|
+/// Guards a value evaluated before every argument (receiver, callee closure).
+fn qbe_guard_callee(
+  g : QbeGen,
+  gs : QbeArgGuards,
+  args : Array[Expr],
+  v : QbeVal,
+  borrowed : Bool,
+) -> Unit {
+  qbe_guard_val(g, gs, QbeArgVal::{ qv: v, borrowed: borrowed }, false, qbe_guards_any_exit(args))
+}
+
+///|
+/// The argument was passed as the address of a caller slot owning its value.
+fn qbe_is_mut_slot_arg(params : Array[Param], pi : Int, arg : Expr) -> Bool {
+  match arg {
+    EMutArg(_, _) => qbe_param_is_mut(params, pi)
+    _ => false
+  }
+}
+
+///|
+fn qbe_guards_any_exit(args : Array[Expr]) -> Bool {
+  let mut i = 0
+  while i < args.length() {
+    if qbe_expr_has_cf(args[i], true, true, true) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn qbe_guard_val(g : QbeGen, gs : QbeArgGuards, aa : QbeArgVal, is_mut_slot : Bool, exits : Bool) -> Unit {
+  if !exits || g.block_term {
+    return
+  }
+  let needs_rc = match subst_ty(aa.qv.ty, g.cur_type_subst) {
+    TParam(_) => true
+    t => qbe_is_obj_ty(g, t)
+  }
+  if !needs_rc {
+    return
+  }
+  if is_mut_slot {
+    g.mut_wb_seq = g.mut_wb_seq + 1
+    let top = g.scopes[g.scopes.length() - 1]
+    top.locals.push(
+      QbeLocal::{
+        name: "@arg_" + g.mut_wb_seq.to_string(),
+        slot: aa.qv.reg,
+        ty: aa.qv.ty,
+        owned: true,
+        is_cell: false,
+        ref_slot: "",
+      },
+    )
+    gs.slots.push(aa.qv.reg)
+    gs.stores.push(false)
+  } else if !aa.borrowed {
+    let loc = qbe_hold_local(g, "@arg_", aa.qv)
+    gs.slots.push(loc.slot)
+    gs.stores.push(true)
+  }
+}
+
+///|
+/// All arguments are evaluated: the call takes over every guarded value.
+fn qbe_release_guards(g : QbeGen, gs : QbeArgGuards) -> Unit {
+  let mut i = 0
+  while i < gs.slots.length() {
+    if gs.stores[i] && !g.block_term {
+      qbe_emit(g, "storel 0, " + gs.slots[i])
+    }
+    g.zeroed_slots.set(gs.slots[i], true)
+    i = i + 1
+  }
+}
+
+///|
+/// Evaluation order of a call's normalized argument slots (`SPEC.md`: arguments
+/// are evaluated left to right as written): written arguments in source order,
+/// then omitted (default / optional) slots in parameter order.
+fn qbe_call_eval_order(
+  params : Array[Param],
+  offset : Int,
+  raw_args : Array[Expr],
+  n : Int,
+) -> Array[Int] {
+  let order : Array[Int] = []
+  let mut k = 0
+  if !params_need_named_resolution(params, offset, raw_args) {
+    while k < n {
+      order.push(k)
+      k = k + 1
+    }
+    return order
+  }
+  let raw_idx = resolve_call_args_impl(None, params, offset, raw_args, "", span_new("", 0, 0)).raw_idx
+  let slot_of_raw : Array[Int] = []
+  while slot_of_raw.length() < raw_args.length() {
+    slot_of_raw.push(-1)
+  }
+  while k < n {
+    if raw_idx[k] >= 0 {
+      slot_of_raw[raw_idx[k]] = k
+    }
+    k = k + 1
+  }
+  let mut ri = 0
+  while ri < slot_of_raw.length() {
+    if slot_of_raw[ri] >= 0 {
+      order.push(slot_of_raw[ri])
+    }
+    ri = ri + 1
+  }
+  k = 0
+  while k < n {
+    if raw_idx[k] < 0 {
+      order.push(k)
+    }
+    k = k + 1
+  }
+  order
+}
+
+///|
+/// Extends the parallel per-slot argument arrays with placeholders up to `n`.
+fn qbe_fill_arg_slots(
+  arg_vals : Array[String],
+  arg_tys : Array[Ty],
+  arg_borrowed : Array[Bool],
+  n : Int,
+) -> Unit {
+  while arg_vals.length() < n {
+    arg_vals.push("0")
+    arg_tys.push(TUnit)
+    arg_borrowed.push(true)
+  }
+}
+
+///|
+/// Generic arguments are inferred in parameter order (as the checker does), so
+/// a reordered call binds what is statically known before emitting any argument.
+fn qbe_preunify_reordered_args(
+  g : QbeGen,
+  finfo : FnInfo,
+  offset : Int,
+  norm_args : Array[Expr],
+  order : Array[Int],
+  subst : Map[String, Ty],
+  sp : Span,
+) -> Unit {
+  if finfo.decl.type_params.length() == 0 {
+    return
+  }
+  let mut reordered = false
+  let mut k = 0
+  while k < order.length() {
+    if order[k] != k {
+      reordered = true
+    }
+    k = k + 1
+  }
+  if !reordered {
+    return
+  }
+  match qbe_call_infer(g, sp, "#targs:" + finfo.decl.name) {
+    Some(TTuple(targs)) =>
+      if targs.length() == finfo.decl.type_params.length() {
+        k = 0
+        while k < targs.length() {
+          if !ty_has_unresolved(targs[k]) {
+            qbe_unify_tparams(g, TParam(finfo.decl.type_params[k]), targs[k], subst)
+          }
+          k = k + 1
+        }
+      }
+    _ => ()
+  }
+  k = 0
+  while k < norm_args.length() && k + offset < finfo.param_tys.length() {
+    match qbe_probe_expr_ty(g, norm_args[k]) {
+      Some(t) =>
+        if !ty_has_unresolved(t) && !qbe_ty_has_param(t) {
+          qbe_unify_tparams(g, finfo.param_tys[k + offset], t, subst)
+        }
+      None => ()
+    }
+    k = k + 1
+  }
+}
+
+///|
+fn qbe_map_ty_resolved(g : QbeGen, t : Ty) -> Bool {
+  !ty_has_unresolved(t) &&
+  match t {
+    TMap(_, _) => true
+    _ => false
+  }
+}
+
+///|
+/// Emits an empty map of the given type.
+fn qbe_emit_map_new(g : QbeGen, kty : Ty, vty : Ty) -> QbeVal {
+  let r = qbe_tmp(g)
+  if qbe_is_vmap_key_ty(g, kty) {
+    let m = qbe_ensure_vmap_fns(g, kty, vty)
+    qbe_emit(g, r + " =l call $pion_vmap_new_" + m + "(l 0)")
+  } else {
+    let vo = qbe_is_obj_flag_w(g, vty)
+    let new_fn = if qbe_map_key_is_int(kty) {
+      "$pion_map_new_int"
+    } else {
+      "$pion_map_new"
+    }
+    qbe_emit(g, r + " =l call " + new_fn + "(w " + vo + ")")
+  }
+  qval(r, TMap(kty, vty))
+}
+
+///|
+/// `Map([(k, v), ..])` / `Map(pairs)`: inserts every pair into a fresh map in
+/// order (a later key replaces an earlier one), exactly as `m.set(k, v)` would.
+/// The map lives in an owned hidden local meanwhile, so an early exit out of a
+/// key or value (`return`, `?`) releases it. The map type is the checker's, then
+/// the expected one, else that of the emitted pairs; an unknown key type would
+/// select the wrong runtime map, so it is an internal error.
+fn qbe_emit_map_init(g : QbeGen, expected : Option[Ty], arg : Expr, call_sp : Span) -> QbeVal {
+  let sp = span_new("", 0, 0)
+  let mut mty = TMap(TError, TError)
+  match qbe_call_infer(g, call_sp, "#map") {
+    Some(t) => if qbe_map_ty_resolved(g, t) { mty = t }
+    None => ()
+  }
+  if !qbe_map_ty_resolved(g, mty) {
+    match expected {
+      Some(t) => if qbe_map_ty_resolved(g, t) { mty = t }
+      None => ()
+    }
+  }
+  let is_lit = match arg {
+    EArrayLit(_, _) => qbe_map_ty_resolved(g, mty)
+    _ => false
+  }
+  qbe_scope_push(g)
+  let mut pairs : Option[QbeVal] = None
+  if !is_lit {
+    let want : Option[Ty] = match mty {
+      TMap(k, v) => if qbe_map_ty_resolved(g, mty) { Some(TArray(TTuple([k, v]))) } else { None }
+      _ => None
+    }
+    let av = qbe_emit_expr(g, arg, want)
+    if g.block_term {
+      qbe_scope_pop(g)
+      return qval("0", mty)
+    }
+    pairs = Some(av)
+    if !qbe_map_ty_resolved(g, mty) {
+      match av.ty {
+        TArray(TTuple(kv)) => if kv.length() == 2 { mty = TMap(kv[0], kv[1]) }
+        _ => ()
+      }
+    }
+  }
+  let (kty, vty) = match mty {
+    TMap(k, v) => (k, v)
+    _ => (TError, TError)
+  }
+  if !qbe_map_ty_resolved(g, mty) {
+    abort(
+      "internal compiler error: unresolved `Map(...)` type `" +
+      ty_to_string(mty) +
+      "` at " +
+      call_sp.file +
+      ":" +
+      call_sp.line.to_string() +
+      ":" +
+      call_sp.col.to_string(),
+    )
+  }
+  g.mut_wb_seq = g.mut_wb_seq + 1
+  let hname = "@map_init_" + g.mut_wb_seq.to_string()
+  // Own the evaluated pairs before allocating anything else.
+  let aname = hname + "_pairs"
+  match pairs {
+    Some(av) => {
+      let aloc = qbe_define_local(g, aname, av.ty, true)
+      qbe_store_local_slot(g, av.reg, aloc.slot, av.ty)
+    }
+    None => ()
+  }
+  let m = qbe_emit_map_new(g, kty, vty)
+  let loc = qbe_define_local(g, hname, mty, true)
+  qbe_store_local_slot(g, m.reg, loc.slot, mty)
+  let hmap = EIdent(hname, sp)
+  match arg {
+    EArrayLit(elems, _) if is_lit => {
+      let mut i = 0
+      while i < elems.length() && !g.block_term {
+        match elems[i] {
+          ETuple(kv, _) =>
+            if kv.length() == 2 {
+              qbe_emit_map_init_kv(g, hmap, kv, kty, vty)
+            }
+          pair => qbe_emit_map_init_pair(g, hmap, pair, TTuple([kty, vty]))
+        }
+        i = i + 1
+      }
+    }
+    _ => {
+      let pname = hname + "_pair"
+      let body = [
+        SExpr(
+          EMethodCall(
+            hmap,
+            "set",
+            [EField(EIdent(pname, sp), "0", sp), EField(EIdent(pname, sp), "1", sp)],
+            sp,
+          ),
+          sp,
+        ),
+      ]
+      let _ = qbe_emit_stmt(g, SForIn("", pname, EIdent(aname, sp), body, sp), None, false)
+    }
+  }
+  if g.block_term {
+    qbe_scope_pop(g)
+    return qval("0", mty)
+  }
+  // Hand the reference over: the hidden local must not release it.
+  let r = qbe_tmp(g)
+  qbe_emit(g, r + " =l loadl " + loc.slot)
+  qbe_emit(g, "storel 0, " + loc.slot)
+  g.zeroed_slots.set(loc.slot, true)
+  qbe_scope_pop(g)
+  qval(r, mty)
+}
+
+///|
+/// `hmap.set(k, v)` for one literal pair. Operands that may leave the expression
+/// early are bound to owned hidden locals first, so nothing evaluated so far (nor
+/// a retained receiver) leaks on that path.
+fn qbe_emit_map_init_kv(g : QbeGen, hmap : Expr, kv : Array[Expr], kty : Ty, vty : Ty) -> Unit {
+  let sp = span_new("", 0, 0)
+  if !qbe_args_may_mutate_locals(g, kv) {
+    let _ = qbe_emit_method_call(g, hmap, "set", kv, None, sp)
+    return
+  }
+  qbe_scope_push(g)
+  let names : Array[Expr] = []
+  let mut i = 0
+  while i < 2 && !g.block_term {
+    let v = qbe_emit_expr(g, kv[i], Some(if i == 0 { kty } else { vty }))
+    if !g.block_term {
+      g.mut_wb_seq = g.mut_wb_seq + 1
+      let name = "@map_kv_" + g.mut_wb_seq.to_string()
+      let loc = qbe_define_local(g, name, v.ty, true)
+      qbe_store_local_slot(g, v.reg, loc.slot, v.ty)
+      names.push(EIdent(name, sp))
+    }
+    i = i + 1
+  }
+  if !g.block_term {
+    let _ = qbe_emit_method_call(g, hmap, "set", names, None, sp)
+  }
+  qbe_scope_pop(g)
+}
+
+///|
+fn qbe_emit_map_init_pair(g : QbeGen, hmap : Expr, pair : Expr, pair_ty : Ty) -> Unit {
+  let sp = span_new("", 0, 0)
+  let pv = qbe_emit_expr(g, pair, Some(pair_ty))
+  if g.block_term {
+    return
+  }
+  qbe_scope_push(g)
+  g.mut_wb_seq = g.mut_wb_seq + 1
+  let pname = "@map_pair_" + g.mut_wb_seq.to_string()
+  let ploc = qbe_define_local(g, pname, pv.ty, true)
+  qbe_store_local_slot(g, pv.reg, ploc.slot, pv.ty)
+  let kv = [EField(EIdent(pname, sp), "0", sp), EField(EIdent(pname, sp), "1", sp)]
+  let _ = qbe_emit_method_call(g, hmap, "set", kv, None, sp)
+  qbe_scope_pop(g)
 }
 
 ///|
@@ -20932,11 +21508,12 @@ fn qbe_emit_call_arg(
   exp : Option[Ty],
   can_borrow : Bool,
   wbs : Array[QbeMutWb],
+  args : Array[Expr],
 ) -> QbeArgVal {
   match arg {
     EMutArg(inner, _) =>
       if qbe_param_is_mut(params, pi) {
-        qbe_emit_mut_arg(g, inner, exp, wbs)
+        qbe_emit_mut_arg(g, inner, exp, wbs, args)
       } else {
         qbe_emit_arg_maybe_borrow(g, inner, exp, can_borrow)
       }
@@ -20951,7 +21528,7 @@ fn qbe_emit_mut_writebacks(g : QbeGen, wbs : Array[QbeMutWb]) -> Unit {
     let wb = wbs[i]
     let nv = qbe_load_heap_slot(g, wb.slot, wb.ty)
     g.mut_wb_seq = g.mut_wb_seq + 1
-    let hname = "__mut_wb_" + g.mut_wb_seq.to_string()
+    let hname = "@mut_wb_" + g.mut_wb_seq.to_string()
     let loc = qbe_define_local(g, hname, wb.ty, true)
     qbe_store_local_slot(g, nv, loc.slot, wb.ty)
     let saved_mov = g.movable_locals
@@ -20974,6 +21551,18 @@ fn qbe_emit_mut_writebacks(g : QbeGen, wbs : Array[QbeMutWb]) -> Unit {
         qbe_emit(g, "storel 0, " + loc.slot)
       }
       g.zeroed_slots.set(loc.slot, true)
+    }
+    let mut hi = 0
+    while hi < wb.holds.length() {
+      let h = wb.holds[hi]
+      if qbe_is_obj_ty(g, h.ty) {
+        let hv = qbe_tmp(g)
+        qbe_emit(g, hv + " =l loadl " + h.slot)
+        qbe_rc_dec(g, hv, h.ty)
+        qbe_emit(g, "storel 0, " + h.slot)
+      }
+      g.zeroed_slots.set(h.slot, true)
+      hi = hi + 1
     }
     i = i + 1
   }
@@ -21973,6 +22562,11 @@ fn qbe_emit_flat_eval_struct_lit(
     slot_vals.push(qval(qbe_zero_reg(fty), fty))
     init_i = init_i + 1
   }
+  let field_exprs : Array[Expr] = []
+  while field_exprs.length() < fields.length() {
+    field_exprs.push(fields[field_exprs.length()].value)
+  }
+  let guards = qbe_arg_guards_in_order(field_exprs)
   let mut fi = 0
   while fi < fields.length() {
     let f = fields[fi]
@@ -21983,12 +22577,20 @@ fn qbe_emit_flat_eval_struct_lit(
         let fv = qbe_emit_expr(g, f.value, Some(fty))
         let coerced = qbe_coerce_val(g, fv, fty)
         slot_vals[j] = qval(coerced, fty)
+        qbe_guard_val(
+          g,
+          guards,
+          QbeArgVal::{ qv: slot_vals[j], borrowed: false },
+          false,
+          guards.exits[fi],
+        )
         break
       }
       j = j + 1
     }
     fi = fi + 1
   }
+  qbe_release_guards(g, guards)
   slot_vals
 }
 
@@ -27348,6 +27950,7 @@ fn qbe_emit_variant_ctor(
         if v.name == vname {
           tag = vi
           matched_field_tys = v.field_tys
+          let guards = qbe_arg_guards_in_order(args)
           let mut fi = 0
           while fi < args.length() {
             let exp_f : Option[Ty] = if fi < v.field_tys.length() {
@@ -27361,8 +27964,10 @@ fn qbe_emit_variant_ctor(
             }
             arg_vals.push(av.reg)
             arg_tys.push(av.ty)
+            qbe_guard_val(g, guards, QbeArgVal::{ qv: av, borrowed: false }, false, guards.exits[fi])
             fi = fi + 1
           }
+          qbe_release_guards(g, guards)
           break
         }
         vi = vi + 1
@@ -28259,8 +28864,13 @@ fn qbe_emit_impl_method_call(
   let arg_vals : Array[String] = [obj_val]
   let arg_tys : Array[Ty] = [recv_ty]
   let arg_borrowed : Array[Bool] = [obj_borrowed]
-  let mut i = 0
-  while i < norm_args.length() {
+  let order = qbe_call_eval_order(minfo.decl.params, 1, args, norm_args.length())
+  qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
+  let guards = qbe_arg_guards(norm_args, order)
+  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, recv_wbs.length() > 0, qbe_guards_any_exit(norm_args))
+  let mut oi = 0
+  while oi < order.length() {
+    let i = order[oi]
     let p_idx = i + 1
     let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
       Some(minfo.param_tys[p_idx])
@@ -28275,12 +28885,15 @@ fn qbe_emit_impl_method_call(
       exp_p,
       norm_pure,
       recv_wbs,
+      norm_args,
     )
-    arg_vals.push(aa.qv.reg)
-    arg_tys.push(aa.qv.ty)
-    arg_borrowed.push(aa.borrowed)
-    i = i + 1
+    arg_vals[i + 1] = aa.qv.reg
+    arg_tys[i + 1] = aa.qv.ty
+    arg_borrowed[i + 1] = aa.borrowed
+    qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i + 1, norm_args[i]), guards.exits[oi])
+    oi = oi + 1
   }
+  qbe_release_guards(g, guards)
   let call_args : Array[String] = []
   let call_abis : Array[String] = []
   let mut j = 0
@@ -28827,7 +29440,7 @@ fn qbe_emit_method_call(
   }
   let recv_wbs : Array[QbeMutWb] = []
   let obj_av = match obj_expr {
-    EMutArg(inner, _) => qbe_emit_mut_arg(g, inner, None, recv_wbs)
+    EMutArg(inner, _) => qbe_emit_mut_arg(g, inner, None, recv_wbs, args)
     _ => qbe_emit_arg_maybe_borrow(g, obj_expr, None, can_borrow_obj)
   }
   if preserve_unfrozen && can_borrow_obj {
@@ -32139,8 +32752,14 @@ fn qbe_emit_method_call(
           let arg_vals : Array[String] = [obj_val]
           let arg_tys : Array[Ty] = [recv_ty]
           let arg_borrowed : Array[Bool] = [obj_borrowed]
-          let mut i = 0
-          while i < norm_args.length() {
+          let order = qbe_call_eval_order(minfo.decl.params, 1, args, norm_args.length())
+          qbe_preunify_reordered_args(g, minfo, 1, norm_args, order, subst, sp)
+          qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
+          let guards = qbe_arg_guards(norm_args, order)
+          qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, recv_wbs.length() > 0, qbe_guards_any_exit(norm_args))
+          let mut oi = 0
+          while oi < order.length() {
+            let i = order[oi]
             let p_idx = i + 1
             let exp_p : Option[Ty] = if p_idx < minfo.param_tys.length() {
               qbe_generic_arg_expect(
@@ -32161,16 +32780,19 @@ fn qbe_emit_method_call(
               exp_p,
               norm_pure,
               recv_wbs,
+              norm_args,
             )
             let av = aa.qv
             if p_idx < minfo.param_tys.length() {
               qbe_unify_tparams(g, minfo.param_tys[p_idx], av.ty, subst)
             }
-            arg_vals.push(av.reg)
-            arg_tys.push(av.ty)
-            arg_borrowed.push(aa.borrowed)
-            i = i + 1
+            arg_vals[i + 1] = av.reg
+            arg_tys[i + 1] = av.ty
+            arg_borrowed[i + 1] = aa.borrowed
+            qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i + 1, norm_args[i]), guards.exits[oi])
+            oi = oi + 1
           }
+          qbe_release_guards(g, guards)
           if qbe_call_needs_mono(g, minfo, subst, mpkg) {
             let mres = qbe_emit_mono_call(
               g,
@@ -32294,6 +32916,8 @@ fn qbe_emit_method_call(
                       if !obj_borrowed {
                         qbe_rc_dec(g, obj_val, recv_ty)
                       }
+                      let guards = qbe_arg_guards_in_order(args)
+                      qbe_guard_callee(g, guards, args, qval(clo_v, fty), false)
                       let arg_vals : Array[String] = []
                       let arg_tys : Array[Ty] = []
                       let mut ai = 0
@@ -32308,8 +32932,16 @@ fn qbe_emit_method_call(
                         let creg = qbe_coerce_val(g, av, cty)
                         arg_vals.push(creg)
                         arg_tys.push(cty)
+                        qbe_guard_val(
+                          g,
+                          guards,
+                          QbeArgVal::{ qv: qval(creg, cty), borrowed: false },
+                          false,
+                          guards.exits[ai],
+                        )
                         ai = ai + 1
                       }
+                      qbe_release_guards(g, guards)
                       let res_l = qbe_emit_closure_call(g, clo_v, arg_vals, arg_tys)
                       return qval(qbe_from_l(g, res_l, rty), rty)
                     }
@@ -32334,6 +32966,8 @@ fn qbe_emit_method_call(
               let arg_vals : Array[String] = []
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
+              let guards = qbe_arg_guards_in_order(args)
+              qbe_guard_callee(g, guards, args, qval(obj_val, recv_ty), obj_borrowed)
               let mut i = 0
               while i < args.length() {
                 let p_idx = i + 1
@@ -32346,8 +32980,10 @@ fn qbe_emit_method_call(
                 arg_vals.push(aa.qv.reg)
                 arg_tys.push(aa.qv.ty)
                 arg_borrowed.push(aa.borrowed)
+                qbe_guard_val(g, guards, aa, false, guards.exits[i])
                 i = i + 1
               }
+              qbe_release_guards(g, guards)
               let data_r = qbe_tmp(g)
               let vp_r = qbe_tmp(g)
               let vt_r = qbe_tmp(g)
@@ -34470,7 +35106,7 @@ fn qbe_probe_expr_ty_with(
       let scrut_ty_opt = qbe_probe_expr_ty_with(g, scrut, hints)
       qbe_probe_arms_ty_with(g, arms, scrut_ty_opt, None, hints)
     }
-    ECall(callee, args, _) =>
+    ECall(callee, args, probe_sp) =>
       match callee {
         EIdent(name, _) =>
           if name == "Some" && args.length() == 1 {
@@ -34485,6 +35121,8 @@ fn qbe_probe_expr_ty_with(
             }
           } else if name == "StringBuilder" {
             Some(TStringBuilder)
+          } else if name == "Map" && args.length() == 1 {
+            qbe_call_infer(g, probe_sp, "#map")
           } else {
             match qbe_hints_get(hints, name) {
               Some(TFn(_, rt)) =>
@@ -35141,6 +35779,7 @@ fn qbe_emit_extern_fn_call(
   args : Array[Expr],
 ) -> QbeVal {
   let can_borrow = !qbe_args_may_mutate_locals(g, args)
+  let guards = qbe_arg_guards_in_order(args)
   let call_args : Array[String] = []
   let call_abis : Array[String] = []
   let owned_vals : Array[String] = []
@@ -35179,8 +35818,10 @@ fn qbe_emit_extern_fn_call(
     }
     call_args.push(carg)
     call_abis.push(cabi)
+    qbe_guard_val(g, guards, aa, false, guards.exits[i])
     i = i + 1
   }
+  qbe_release_guards(g, guards)
   let sb = StringBuilder()
   let is_unit = match einfo.ret_ty {
     TUnit => true
@@ -35255,6 +35896,7 @@ fn qbe_emit_extern_fn_call(
 fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal {
   let can_borrow = !qbe_args_may_mutate_locals(g, args)
   let off = if pr.world { 1 } else { 0 }
+  let guards = qbe_arg_guards_in_order(args)
   let call_args : Array[String] = []
   let call_abis : Array[String] = []
   let owned_vals : Array[String] = []
@@ -35297,8 +35939,10 @@ fn qbe_emit_rt_prim_call(g : QbeGen, pr : RtPrim, args : Array[Expr]) -> QbeVal 
     }
     call_args.push(carg)
     call_abis.push(cabi)
+    qbe_guard_val(g, guards, av, false, guards.exits[i])
     i = i + 1
   }
+  qbe_release_guards(g, guards)
   let mut target_sym = pr.c_sym
   let mut emit_args = call_args
   let mut emit_abis = call_abis
@@ -35439,6 +36083,7 @@ fn qbe_emit_resolved_finfo_call(
   sp : Span,
 ) -> QbeVal {
   let norm_args = resolve_call_args_qbe(minfo.decl.params, 0, args, sp)
+  let order = qbe_call_eval_order(minfo.decl.params, 0, args, norm_args.length())
   let subst : Map[String, Ty] = Map([])
   match expected {
     Some(et) => qbe_unify_tparams(g, minfo.ret_ty, et, subst)
@@ -35449,7 +36094,7 @@ fn qbe_emit_resolved_finfo_call(
     g.mono_pkg == "" &&
     !has_qual_sep(qual) &&
     minfo.decl.type_params.length() == 0 {
-    match qbe_try_inline_hof_call(g, qual + "::" + mem, minfo, norm_args) {
+    match qbe_try_inline_hof_call(g, qual + "::" + mem, minfo, norm_args, order) {
       Some(qv) => return qv
       None => ()
     }
@@ -35458,8 +36103,12 @@ fn qbe_emit_resolved_finfo_call(
   let arg_tys : Array[Ty] = []
   let arg_borrowed : Array[Bool] = []
   let wbs : Array[QbeMutWb] = []
-  let mut i = 0
-  while i < norm_args.length() {
+  qbe_preunify_reordered_args(g, minfo, 0, norm_args, order, subst, sp)
+  qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+  let guards = qbe_arg_guards(norm_args, order)
+  let mut oi = 0
+  while oi < order.length() {
+    let i = order[oi]
     match norm_args[i] {
       EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
       _ => ()
@@ -35489,17 +36138,19 @@ fn qbe_emit_resolved_finfo_call(
       }
     }
     if !used_stack_view {
-      aa = qbe_emit_call_arg(g, minfo.decl.params, i, norm_args[i], exp_p, can_borrow, wbs)
+      aa = qbe_emit_call_arg(g, minfo.decl.params, i, norm_args[i], exp_p, can_borrow, wbs, norm_args)
     }
     let av = aa.qv
     if i < minfo.param_tys.length() {
       qbe_unify_tparams(g, minfo.param_tys[i], av.ty, subst)
     }
-    arg_vals.push(av.reg)
-    arg_tys.push(av.ty)
-    arg_borrowed.push(aa.borrowed)
-    i = i + 1
+    arg_vals[i] = av.reg
+    arg_tys[i] = av.ty
+    arg_borrowed[i] = aa.borrowed
+    qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i, norm_args[i]), guards.exits[oi])
+    oi = oi + 1
   }
+  qbe_release_guards(g, guards)
   if qbe_call_needs_mono(g, minfo, subst, target_pkg) {
     let mres = qbe_emit_mono_call(
       g,
@@ -37563,30 +38214,18 @@ fn qbe_emit_expr_inner(
             return qval(r, TStringBuilder)
           }
           if name == "Map" {
-            let mut kty = TString
-            let mut vty = TError
-            match expected {
-              Some(TMap(k, v)) => {
-                kty = k
-                vty = v
-              }
-              _ => ()
+            let has_init = args.length() == 1 &&
+              (match args[0] {
+                EArrayLit(elems, _) => elems.length() > 0
+                _ => true
+              })
+            if has_init {
+              return qbe_emit_map_init(g, expected, args[0], sp)
             }
-            if qbe_is_vmap_key_ty(g, kty) {
-              let m = qbe_ensure_vmap_fns(g, kty, vty)
-              let r = qbe_tmp(g)
-              qbe_emit(g, r + " =l call $pion_vmap_new_" + m + "(l 0)")
-              return qval(r, TMap(kty, vty))
+            return match expected {
+              Some(TMap(k, v)) => qbe_emit_map_new(g, k, v)
+              _ => qbe_emit_map_new(g, TString, TError)
             }
-            let vo = qbe_is_obj_flag_w(g, vty)
-            let new_fn = if qbe_map_key_is_int(kty) {
-              "$pion_map_new_int"
-            } else {
-              "$pion_map_new"
-            }
-            let r = qbe_tmp(g)
-            qbe_emit(g, r + " =l call " + new_fn + "(w " + vo + ")")
-            return qval(r, TMap(kty, vty))
           }
           if !qbe_has_user_callee(g, name) {
           if name == "sha256_hex" {
@@ -37962,6 +38601,8 @@ fn qbe_emit_expr_inner(
                   qbe_emit(g, "call $pion_rc_inc(l " + clo_v + ")")
                   let arg_vals : Array[String] = []
                   let arg_tys : Array[Ty] = []
+                  let guards = qbe_arg_guards_in_order(args)
+                  qbe_guard_callee(g, guards, args, qval(clo_v, loc.ty), false)
                   let mut i = 0
                   while i < args.length() {
                     let ep : Option[Ty] = if i < ptys.length() {
@@ -37972,8 +38613,16 @@ fn qbe_emit_expr_inner(
                     let av = qbe_emit_expr(g, args[i], ep)
                     arg_vals.push(av.reg)
                     arg_tys.push(av.ty)
+                    qbe_guard_val(
+                      g,
+                      guards,
+                      QbeArgVal::{ qv: av, borrowed: false },
+                      false,
+                      guards.exits[i],
+                    )
                     i = i + 1
                   }
+                  qbe_release_guards(g, guards)
                   let res = qbe_emit_closure_call(g, clo_v, arg_vals, arg_tys)
                   g.block_immut_fields = Map([])
                   return qval(qbe_from_l(g, res, rty), rty)
@@ -38044,8 +38693,9 @@ fn qbe_emit_expr_inner(
           match g.tc.fns.get(name) {
             Some(finfo) => {
               let norm_args = resolve_call_args_qbe(finfo.decl.params, 0, args, sp)
+              let order = qbe_call_eval_order(finfo.decl.params, 0, args, norm_args.length())
               if finfo.decl.type_params.length() == 0 {
-                match qbe_try_inline_hof_call(g, name, finfo, norm_args) {
+                match qbe_try_inline_hof_call(g, name, finfo, norm_args, order) {
                   Some(qv) => return qv
                   None => ()
                 }
@@ -38060,8 +38710,12 @@ fn qbe_emit_expr_inner(
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
               let wbs : Array[QbeMutWb] = []
-              let mut i = 0
-              while i < norm_args.length() {
+              qbe_preunify_reordered_args(g, finfo, 0, norm_args, order, subst, sp)
+              qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+              let guards = qbe_arg_guards(norm_args, order)
+              let mut oi = 0
+              while oi < order.length() {
+                let i = order[oi]
                 match norm_args[i] {
                   EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                   _ => ()
@@ -38085,17 +38739,19 @@ fn qbe_emit_expr_inner(
                   }
                 }
                 if !used_stack_view {
-                  aa = qbe_emit_call_arg(g, finfo.decl.params, i, norm_args[i], exp_p, can_borrow, wbs)
+                  aa = qbe_emit_call_arg(g, finfo.decl.params, i, norm_args[i], exp_p, can_borrow, wbs, norm_args)
                 }
                 let av = aa.qv
                 if i < finfo.param_tys.length() {
                   qbe_unify_tparams(g, finfo.param_tys[i], av.ty, subst)
                 }
-                arg_vals.push(av.reg)
-                arg_tys.push(av.ty)
-                arg_borrowed.push(aa.borrowed)
-                i = i + 1
+                arg_vals[i] = av.reg
+                arg_tys[i] = av.ty
+                arg_borrowed[i] = aa.borrowed
+                qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(finfo.decl.params, i, norm_args[i]), guards.exits[oi])
+                oi = oi + 1
               }
+              qbe_release_guards(g, guards)
               if qbe_call_needs_mono(g, finfo, subst, "") {
                 let mres = qbe_emit_mono_call(
                   g,
@@ -38794,6 +39450,8 @@ fn qbe_emit_expr_inner(
             }
             _ => ()
           }
+          let guards = qbe_arg_guards_in_order(args)
+          qbe_guard_callee(g, guards, args, cv, false)
           let arg_vals : Array[String] = []
           let arg_tys : Array[Ty] = []
           let mut i = 0
@@ -38806,8 +39464,10 @@ fn qbe_emit_expr_inner(
             let av = qbe_emit_expr(g, args[i], ep)
             arg_vals.push(av.reg)
             arg_tys.push(av.ty)
+            qbe_guard_val(g, guards, QbeArgVal::{ qv: av, borrowed: false }, false, guards.exits[i])
             i = i + 1
           }
+          qbe_release_guards(g, guards)
           let res = qbe_emit_closure_call(g, cv.reg, arg_vals, arg_tys)
           g.block_immut_fields = Map([])
           qval(qbe_from_l(g, res, rty), rty)
@@ -39697,7 +40357,46 @@ fn qbe_emit_expr_inner(
             overridden.push(false)
             init_i = init_i + 1
           }
+          let order : Array[Int] = []
+          let field_exprs : Array[Expr] = []
           let mut fi = 0
+          while fi < fields.length() {
+            order.push(fi)
+            field_exprs.push(fields[fi].value)
+            fi = fi + 1
+          }
+          let guards = qbe_arg_guards(field_exprs, order)
+          // `..base` fields are read before any override runs.
+          match base_qv_opt {
+            Some(bv) => {
+              let exits = qbe_guards_any_exit(field_exprs)
+              let mut bi = 0
+              while bi < n_fields {
+                let mut is_over = false
+                fi = 0
+                while fi < fields.length() {
+                  if fields[fi].name == sinfo.field_names[bi] {
+                    is_over = true
+                  }
+                  fi = fi + 1
+                }
+                if !is_over {
+                  let concrete_ty = subst_ty(sinfo.field_tys[bi], subst)
+                  let bp = qbe_tmp(g)
+                  qbe_emit(g, bp + " =l add " + bv.reg + ", " + (bi * 8).to_string())
+                  let loaded = qbe_load_heap_slot(g, bp, concrete_ty)
+                  qbe_rc_inc(g, loaded, concrete_ty)
+                  slot_vals[bi] = loaded
+                  slot_tys[bi] = concrete_ty
+                  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(loaded, concrete_ty), borrowed: false }, false, exits)
+                }
+                bi = bi + 1
+              }
+              qbe_rc_dec(g, bv.reg, bv.ty)
+            }
+            None => ()
+          }
+          fi = 0
           while fi < fields.length() {
             let f = fields[fi]
             let mut j = 0
@@ -39713,31 +40412,14 @@ fn qbe_emit_expr_inner(
                 slot_vals[j] = fv.reg
                 slot_tys[j] = fv.ty
                 overridden[j] = true
+                qbe_guard_val(g, guards, QbeArgVal::{ qv: fv, borrowed: false }, false, guards.exits[fi])
                 break
               }
               j = j + 1
             }
             fi = fi + 1
           }
-          match base_qv_opt {
-            Some(bv) => {
-              let mut bi = 0
-              while bi < n_fields {
-                if !overridden[bi] {
-                  let concrete_ty = subst_ty(sinfo.field_tys[bi], subst)
-                  let bp = qbe_tmp(g)
-                  qbe_emit(g, bp + " =l add " + bv.reg + ", " + (bi * 8).to_string())
-                  let loaded = qbe_load_heap_slot(g, bp, concrete_ty)
-                  qbe_rc_inc(g, loaded, concrete_ty)
-                  slot_vals[bi] = loaded
-                  slot_tys[bi] = concrete_ty
-                }
-                bi = bi + 1
-              }
-              qbe_rc_dec(g, bv.reg, bv.ty)
-            }
-            None => ()
-          }
+          qbe_release_guards(g, guards)
           let payload_sz = if n_fields == 0 { 8 } else { n_fields * 8 }
           let mut all_immut_struct = match spread_opt {
             None => true
@@ -42605,8 +43287,12 @@ fn qbe_try_emit_stack_pod_let(
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
               let wbs : Array[QbeMutWb] = []
-              let mut i = 0
-              while i < norm_args.length() {
+              let order = qbe_call_eval_order(finfo.decl.params, 0, args, norm_args.length())
+              qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+              let guards = qbe_arg_guards(norm_args, order)
+              let mut oi = 0
+              while oi < order.length() {
+                let i = order[oi]
                 match norm_args[i] {
                   EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                   _ => ()
@@ -42619,12 +43305,15 @@ fn qbe_try_emit_stack_pod_let(
                   Some(finfo.param_tys[i]),
                   can_borrow,
                   wbs,
+                  norm_args,
                 )
-                arg_vals.push(aa.qv.reg)
-                arg_tys.push(aa.qv.ty)
-                arg_borrowed.push(aa.borrowed)
-                i = i + 1
+                arg_vals[i] = aa.qv.reg
+                arg_tys[i] = aa.qv.ty
+                arg_borrowed[i] = aa.borrowed
+                qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(finfo.decl.params, i, norm_args[i]), guards.exits[oi])
+                oi = oi + 1
               }
+              qbe_release_guards(g, guards)
               let stack_key = if target_pkg != "" {
                 target_pkg + "::" + name
               } else {
@@ -42752,8 +43441,12 @@ fn qbe_try_emit_stack_pod_let(
               let arg_tys : Array[Ty] = []
               let arg_borrowed : Array[Bool] = []
               let wbs : Array[QbeMutWb] = []
-              let mut i = 0
-              while i < norm_args.length() {
+              let order = qbe_call_eval_order(minfo.decl.params, 0, args, norm_args.length())
+              qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length())
+              let guards = qbe_arg_guards(norm_args, order)
+              let mut oi = 0
+              while oi < order.length() {
+                let i = order[oi]
                 match norm_args[i] {
                   EIdent(aname, _) => qbe_invalidate_len_aliases_for(g, aname)
                   _ => ()
@@ -42766,12 +43459,15 @@ fn qbe_try_emit_stack_pod_let(
                   Some(minfo.param_tys[i]),
                   can_borrow,
                   wbs,
+                  norm_args,
                 )
-                arg_vals.push(aa.qv.reg)
-                arg_tys.push(aa.qv.ty)
-                arg_borrowed.push(aa.borrowed)
-                i = i + 1
+                arg_vals[i] = aa.qv.reg
+                arg_tys[i] = aa.qv.ty
+                arg_borrowed[i] = aa.borrowed
+                qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i, norm_args[i]), guards.exits[oi])
+                oi = oi + 1
               }
+              qbe_release_guards(g, guards)
               let stack_key = if target_pkg != "" {
                 target_pkg + "::" + key
               } else {
@@ -42839,8 +43535,13 @@ fn qbe_try_emit_stack_pod_let(
                   let arg_tys : Array[Ty] = [ra.qv.ty]
                   let arg_borrowed : Array[Bool] = [ra.borrowed]
                   let wbs : Array[QbeMutWb] = []
-                  let mut i = 0
-                  while i < norm_args.length() {
+                  let order = qbe_call_eval_order(minfo.decl.params, 1, args, norm_args.length())
+                  qbe_fill_arg_slots(arg_vals, arg_tys, arg_borrowed, norm_args.length() + 1)
+                  let guards = qbe_arg_guards(norm_args, order)
+                  qbe_guard_val(g, guards, QbeArgVal::{ qv: qval(arg_vals[0], arg_tys[0]), borrowed: arg_borrowed[0] }, false, qbe_guards_any_exit(norm_args))
+                  let mut oi = 0
+                  while oi < order.length() {
+                    let i = order[oi]
                     let p_idx = i + 1
                     let aa = qbe_emit_call_arg(
                       g,
@@ -42850,12 +43551,15 @@ fn qbe_try_emit_stack_pod_let(
                       Some(minfo.param_tys[p_idx]),
                       recv_pure,
                       wbs,
+                      norm_args,
                     )
-                    arg_vals.push(aa.qv.reg)
-                    arg_tys.push(aa.qv.ty)
-                    arg_borrowed.push(aa.borrowed)
-                    i = i + 1
+                    arg_vals[i + 1] = aa.qv.reg
+                    arg_tys[i + 1] = aa.qv.ty
+                    arg_borrowed[i + 1] = aa.borrowed
+                    qbe_guard_val(g, guards, aa, qbe_is_mut_slot_arg(minfo.decl.params, i + 1, norm_args[i]), guards.exits[oi])
+                    oi = oi + 1
                   }
+                  qbe_release_guards(g, guards)
                   let stack_key = if mpkg != "" { mpkg + "::" + key } else { key }
                   let stk = qbe_alloc_stack_buf(g, pod_bytes)
                   qbe_inline_body_into_pod_buf(
@@ -50435,12 +51139,12 @@ fn qbe_emit_stmt(
       let sv = qbe_emit_expr(g, start_e, Some(TInt))
       let ev = qbe_emit_expr(g, end_e, Some(sv.ty))
       let idx_ty = sv.ty
-      let end_name = "__pion_fe_" + g.next_tmp.to_string()
+      let end_name = "@pion_fe_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
       let end_loc = qbe_define_local(g, end_name, idx_ty, false)
       qbe_store_local_slot(g, ev.reg, end_loc.slot, idx_ty)
       let idx_name = if var_name == "_" {
-        let nm = "__pion_fi_" + g.next_tmp.to_string()
+        let nm = "@pion_fi_" + g.next_tmp.to_string()
         g.next_tmp = g.next_tmp + 1
         nm
       } else {
@@ -50541,11 +51245,11 @@ fn qbe_emit_stmt(
       qbe_scope_push(g)
       let av = qbe_emit_expr(g, iter_e, None)
       qbe_invalidate_escaping_unfrozen_arrs(g, None, None, body)
-      let arr_name = "__pion_fa_" + g.next_tmp.to_string()
+      let arr_name = "@pion_fa_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
       let arr_loc = qbe_define_local(g, arr_name, av.ty, qbe_is_obj_ty(g, av.ty))
       qbe_store_local_slot(g, av.reg, arr_loc.slot, av.ty)
-      let len_name = "__pion_fl_" + g.next_tmp.to_string()
+      let len_name = "@pion_fl_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
       let len_r64 = qbe_tmp(g)
       let len_rw = qbe_tmp(g)
@@ -50553,7 +51257,7 @@ fn qbe_emit_stmt(
       qbe_emit(g, len_rw + " =w copy " + len_r64)
       let len_loc = qbe_define_local(g, len_name, TInt, false)
       qbe_store_local_slot(g, len_rw, len_loc.slot, TInt)
-      let idx_name = "__pion_fi_" + g.next_tmp.to_string()
+      let idx_name = "@pion_fi_" + g.next_tmp.to_string()
       g.next_tmp = g.next_tmp + 1
       let idx_loc = qbe_define_local(g, idx_name, TInt, false)
       qbe_store_local_slot(g, "0", idx_loc.slot, TInt)
@@ -51903,13 +52607,18 @@ fn qbe_tco_try_emit_self_jump(
         None => ()
       }
       // Evaluate ALL new parameter values before overwriting any param slot
+      let order = qbe_call_eval_order(finfo.decl.params, 0, args, norm_args.length())
       let new_vals : Array[String] = []
-      pi = 0
-      while pi < norm_args.length() {
+      while new_vals.length() < norm_args.length() {
+        new_vals.push("0")
+      }
+      let mut oi = 0
+      while oi < order.length() {
+        pi = order[oi]
         let pty = g.tco_param_tys[pi]
         if qbe_is_obj_ty(g, pty) {
           match qbe_tco_load_borrowed_rc_arg(g, norm_args[pi], pty) {
-            Some(r) => new_vals.push(r)
+            Some(r) => new_vals[pi] = r
             None => return false
           }
         } else {
@@ -51917,9 +52626,9 @@ fn qbe_tco_try_emit_self_jump(
           if g.block_term {
             return true
           }
-          new_vals.push(qbe_coerce_val(g, av, pty))
+          new_vals[pi] = qbe_coerce_val(g, av, pty)
         }
-        pi = pi + 1
+        oi = oi + 1
       }
       // Right-add TRMA (pure/no-trap rhs): evaluate rhs after args, before storing params
       match right_delta {

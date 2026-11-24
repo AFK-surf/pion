@@ -5014,6 +5014,137 @@ fn check_stmts_ex(
 }
 
 ///|
+/// `Map()`, `Map([])`, `Map([(k, v), ..])` and `Map(pairs)` (`Array[(K, V)]`).
+fn check_map_init(
+  tc : TypeChecker,
+  env : Env,
+  args : Array[Expr],
+  expected : Option[Ty],
+  sp : Span,
+) -> Ty {
+  let t = check_map_init_ty(tc, env, args, expected, sp)
+  if args.length() == 1 {
+    // Codegen picks the runtime map from this type.
+    tc.let_infer.set(span_key(sp) + "#map", t)
+  }
+  t
+}
+
+///|
+fn check_map_init_ty(
+  tc : TypeChecker,
+  env : Env,
+  args : Array[Expr],
+  expected : Option[Ty],
+  sp : Span,
+) -> Ty {
+  if args.length() > 1 {
+    tc_err(
+      tc,
+      sp,
+      "E_TYPE_MISMATCH",
+      "`Map` expects at most 1 argument, found " + args.length().to_string(),
+      "0 or 1 args",
+      args.length().to_string() + " args",
+      "pass one array of pairs: `Map([(k, v), ..])`",
+    )
+  }
+  let default_ty = match expected {
+    Some(TMap(k, v)) => TMap(k, v)
+    _ => TMap(TString, TError)
+  }
+  if args.length() != 1 {
+    let mut i = 0
+    while i < args.length() {
+      let _ = check_expr(tc, env, args[i], None)
+      i = i + 1
+    }
+    return default_ty
+  }
+  match args[0] {
+    EArrayLit(elems, _) => if elems.length() == 0 { return default_ty }
+    _ => ()
+  }
+  let want : Option[Ty] = match expected {
+    Some(TMap(k, v)) => Some(TArray(TTuple([k, v])))
+    _ => None
+  }
+  let got = check_expr(tc, env, args[0], want)
+  match want {
+    Some(wt) => {
+      if !ty_compat(wt, got) {
+        tc_err(
+          tc,
+          expr_span(args[0]),
+          "E_TYPE_MISMATCH",
+          "`Map` initializer type mismatch",
+          ty_to_string(wt),
+          ty_to_string(got),
+          "pass `(key, value)` pairs of the map's key and value types",
+        )
+      }
+      match got {
+        TArray(TTuple(kv)) =>
+          if kv.length() == 2 && ty_has_unresolved(default_ty) {
+            return ty_prefer_concrete(default_ty, TMap(kv[0], kv[1]))
+          }
+        _ => ()
+      }
+      default_ty
+    }
+    None =>
+      match got {
+        TArray(TTuple(kv)) =>
+          if kv.length() == 2 {
+            if !is_valid_map_key_ty(tc, kv[0]) {
+              tc_err(
+                tc,
+                expr_span(args[0]),
+                "E_MAP_KEY_TYPE",
+                "`Map` keys must be `String`, an integer/char/bool scalar, or an immutable pure-scalar tuple/POD struct (1..6 fields), got `" +
+                ty_to_string(kv[0]) +
+                "`",
+                "String, scalar integer/char/bool, or immutable pure-scalar tuple/struct",
+                ty_to_string(kv[0]),
+                "use a supported scalar, tuple, or immutable POD struct key",
+              )
+            }
+            if ty_has_unresolved(kv[0]) || ty_has_unresolved(kv[1]) {
+              tc_err(
+                tc,
+                expr_span(args[0]),
+                "E_MISSING_TYPE",
+                "cannot infer key/value types of `Map` initializer",
+                "Map[K, V]",
+                ty_to_string(TMap(kv[0], kv[1])),
+                "add a `Map[K, V]` type annotation",
+              )
+            }
+            TMap(kv[0], kv[1])
+          } else {
+            map_init_shape_err(tc, args[0], got)
+          }
+        TError | TNever => default_ty
+        _ => map_init_shape_err(tc, args[0], got)
+      }
+  }
+}
+
+///|
+fn map_init_shape_err(tc : TypeChecker, arg : Expr, got : Ty) -> Ty {
+  tc_err(
+    tc,
+    expr_span(arg),
+    "E_TYPE_MISMATCH",
+    "`Map` initializer must be an array of `(key, value)` pairs",
+    "Array[(K, V)]",
+    ty_to_string(got),
+    "pass `(key, value)` pairs: `Map([(k, v), ..])`",
+  )
+  TMap(TString, TError)
+}
+
+///|
 /// 1 for an empty array initializer (`[]`, `Array::new()`, `Array::with_capacity(n)`),
 /// 2 for an empty map (`Map([])`, `Map()`, `Map::new()`, `Map::with_capacity(n)`),
 /// 3 for an untyped `None` (`None`, `Option::None`), 0 otherwise.
@@ -7172,6 +7303,30 @@ fn tc_record_call(
 }
 
 ///|
+/// Codegen evaluates named arguments as written, which may be before the argument
+/// that fixes a type parameter: record the instantiation for it.
+fn tc_record_named_targs(
+  tc : TypeChecker,
+  fd : FnDecl,
+  subst : Map[String, Ty],
+  sp : Span,
+) -> Unit {
+  if fd.type_params.length() == 0 {
+    return
+  }
+  let targs : Array[Ty] = []
+  let mut i = 0
+  while i < fd.type_params.length() {
+    match subst.get(fd.type_params[i]) {
+      Some(t) => targs.push(t)
+      None => targs.push(TError)
+    }
+    i = i + 1
+  }
+  tc.let_infer.set(span_key(sp) + "#targs:" + fd.name, TTuple(targs))
+}
+
+///|
 fn tc_qualify_local_name(tc : TypeChecker, name : String) -> String {
   if has_qual_sep(name) {
     name
@@ -8407,6 +8562,9 @@ fn check_fn_call(
   tc_check_verify_callee(tc, env, finfo.decl, target, sp)
   tc_record_call(tc, env, sp, target, finfo.decl.type_params, subst)
   tc_record_arg_order(tc, env, sp, args, resolved_args)
+  if use_named {
+    tc_record_named_targs(tc, finfo.decl, subst, sp)
+  }
   // Record instantiations; `resolve_eq_uses` rejects non-comparable ones once
   // every generic body (and its `==` uses) has been checked.
   let mut ti = 0
@@ -10111,6 +10269,9 @@ fn check_method_call(
           tc_check_verify_callee(tc, env, minfo.decl, mtarget, sp)
           tc_record_call(tc, env, sp, mtarget, minfo.decl.type_params, subst)
           tc_record_arg_order(tc, env, sp, args, resolved_args)
+          if use_named {
+            tc_record_named_targs(tc, minfo.decl, subst, sp)
+          }
           let mut mti = 0
           while mti < minfo.decl.type_params.length() {
             let tp = minfo.decl.type_params[mti]
@@ -11290,10 +11451,7 @@ fn check_expr_inner(
             return TStringBuilder
           }
           if name == "Map" {
-            return match expected {
-              Some(TMap(k, v)) => TMap(k, v)
-              _ => TMap(TString, TError)
-            }
+            return check_map_init(tc, env, args, expected, sp)
           }
           let has_local_fn = match env_lookup(env, name) {
             Some(b) =>

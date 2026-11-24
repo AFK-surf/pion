@@ -1,8 +1,9 @@
 ///| Native QBE SSA post-pass:
 ///| 1. `cleanup_native_rc_ssa` (dev & release, zero new basic blocks):
 ///|    - Same-block strict-whitelist `pion_rc_inc(%x) ... pion_rc_dec(%x)` pair cancellation.
-///|    - Multi-definition-safe static immortal RC elimination (`$pion_str_*_hdr`,
-///|      `$pion_none_hdr`, `$pion_enum_*_hdr`).
+///|    - Multi-definition-safe elimination of RC on proven NULL / static immortal values
+///|      (literal `0`, `$pion_str_*_hdr`, `$pion_none_hdr`, `$pion_enum_*_hdr`), through
+///|      copies, phis and private stack slots.
 ///| 2. `inline_native_rc_ssa` (native `--release` only):
 ///|    - Runs `cleanup_native_rc_ssa` per function,
 ///|    - Enforces `Int64` product budget `est_blk * est_tmp <= 2^28`,
@@ -2030,9 +2031,153 @@ fn irc_extract_def_lhs(t : String) -> Option[String] {
 }
 
 ///|
-/// Step 2: Multi-definition-safe collection of SSA temporaries proven to hold
-/// statically immortal objects (`$pion_str_*_hdr`, `$pion_none_hdr`, `$pion_enum_*_hdr`).
-/// Only uniquely defined SSA temporaries (`def_count == 1`) may be marked immortal.
+/// Parses `storel <val>, <addr>` (comment-stripped) into `(val, addr)`.
+fn irc_parse_storel(t : String) -> Option[(String, String)] {
+  if !irc_starts_with(t, "storel ") {
+    return None
+  }
+  let comma = irc_find_char_unquoted(t, 7, 44)
+  if comma < 0 {
+    return None
+  }
+  let v = irc_trim(slice_str(t, 7, comma))
+  let a = irc_trim(slice_str(t, comma + 1, t.length()))
+  if v.length() == 0 || !irc_is_valid_qbe_tmp(a) {
+    return None
+  }
+  Some((v, a))
+}
+
+///|
+/// Parses the operands of `phi @a v, @b w, ...` (`rest` is the text after `phi`).
+/// An empty result means the line is malformed.
+fn irc_parse_phi_vals(rest : String) -> Array[String] {
+  let out : Array[String] = []
+  let n = rest.length()
+  let mut p = 0
+  while p < n {
+    let comma = irc_find_char_unquoted(rest, p, 44)
+    let e = if comma < 0 { n } else { comma }
+    let part = irc_trim(slice_str(rest, p, e))
+    let lbl = if part.length() > 1 && str_code_at(part, 0) == 64 {
+      irc_extract_label_tok(part)
+    } else {
+      ""
+    }
+    let pval = irc_trim(slice_str(part, lbl.length(), part.length()))
+    if lbl.length() < 2 || pval.length() == 0 {
+      return []
+    }
+    out.push(pval)
+    p = e + 1
+  }
+  out
+}
+
+///|
+/// RC provenance facts: temporaries on which `$pion_rc_inc`/`$pion_rc_dec` are
+/// proven no-ops (`runtime/pion_rt.c` returns early for NULL and `IMMORTAL`).
+/// A node is a uniquely defined temporary or a private stack slot (keyed
+/// `"=" + %slot`); it becomes silent once all of its inputs are. `pending` counts
+/// the inputs still unproven, `users` maps an input to the nodes waiting on it.
+struct IrcSilent {
+  silent : Map[String, Bool]
+  pending : Map[String, Int]
+  users : Map[String, Array[String]]
+  queue : Array[String]
+}
+
+///|
+fn irc_silent_mark(st : IrcSilent, node : String) -> Unit {
+  if !st.silent.contains(node) {
+    st.silent.set(node, true)
+    st.queue.push(node)
+  }
+}
+
+///|
+/// Declares `node` silent as soon as every value of `inputs` is.
+fn irc_silent_node(st : IrcSilent, node : String, inputs : Array[String]) -> Unit {
+  let mut open = 0
+  let mut i = 0
+  while i < inputs.length() {
+    let v = inputs[i]
+    if v != "0" {
+      open = open + 1
+      match st.users.get(v) {
+        Some(us) => us.push(node)
+        None => {
+          let us : Array[String] = [node]
+          st.users.set(v, us)
+        }
+      }
+    }
+    i = i + 1
+  }
+  if open == 0 {
+    irc_silent_mark(st, node)
+  } else {
+    st.pending.set(node, open)
+  }
+}
+
+///|
+/// Allocation-free classification of a `%x =l <op>` line this pass cares about:
+/// `1` `loadl`, `2` `copy`, `3` `add ..., 24`, `4` `phi`, `5` `alloc8`; `0` for
+/// anything else.
+fn irc_silent_op(t : String) -> Int {
+  let n = t.length()
+  let mut j = 1
+  while j < n && !irc_is_ws(str_code_at(t, j)) {
+    j = j + 1
+  }
+  if !irc_slice_starts_with(t, j, n, " =l ") {
+    return 0
+  }
+  let mut o = j + 4
+  while o < n && irc_is_ws(str_code_at(t, o)) {
+    o = o + 1
+  }
+  if irc_slice_starts_with(t, o, n, "loadl ") {
+    1
+  } else if irc_slice_starts_with(t, o, n, "copy ") {
+    2
+  } else if irc_slice_starts_with(t, o, n, "add ") {
+    if irc_ends_with(t, ", 24") { 3 } else { 0 }
+  } else if irc_slice_starts_with(t, o, n, "phi") {
+    4
+  } else if irc_slice_starts_with(t, o, n, "alloc8 ") {
+    5
+  } else {
+    0
+  }
+}
+
+///|
+/// Index of `s[start, end)` in the 1024-entry slot name filter.
+fn irc_name_bucket(s : String, start : Int, end : Int) -> Int {
+  let mut h = 0
+  let mut i = start
+  while i < end {
+    h = (h * 31 + str_code_at(s, i)) & 1023
+    i = i + 1
+  }
+  h
+}
+
+///|
+/// Step 2: collection of SSA temporaries proven to be NULL or statically immortal
+/// (`$pion_str_*_hdr`, `$pion_none_hdr`, `$pion_enum_*_hdr`) on every path.
+/// Seeds are literal `0` and `add $<immortal>_hdr, 24`; facts propagate (least
+/// fixpoint, so a cycle never proves itself) through:
+/// - `copy` and `phi` with all inputs proven,
+/// - `loadl` of a private stack slot: the latest `storel` of the same block, else
+///   every `storel` of the function, provided the entry block (which nothing jumps
+///   to) allocates and initializes the slot before any load of it.
+/// Only uniquely defined temporaries (`def_count == 1`) take part. A slot is private
+/// when it is one `alloc8 8` whose temporary occurs nowhere but as the address of
+/// `storel` / `=l loadl`; any other mention (call argument, arithmetic, narrower
+/// access, stored value) disqualifies it.
 fn irc_collect_immortal_regs(
   fn_hdr : String,
   fn_lines : Array[String],
@@ -2041,121 +2186,265 @@ fn irc_collect_immortal_regs(
   if irc_scan_fn_params(fn_hdr, def_count) < 0 {
     return Map::new()
   }
+  let n = fn_lines.length()
+  // Pass A: definition counts, candidate slots, entry block.
+  let slots : Map[String, Bool] = Map::new()
+  let maybe_slot : Array[Bool] = Array::make(1024, false)
+  let code : Array[String] = []
+  let mut entry_lbl = ""
+  let mut entry_end = n
+  let mut entry_ok = false
   let mut i = 0
-  while i < fn_lines.length() {
-    let raw = fn_lines[i]
-    let ws = irc_first_non_ws(raw)
-    if ws < raw.length() && str_code_at(raw, ws) == 37 {
-      let t = irc_strip_comment(raw)
-      match irc_extract_def_lhs(t) {
-        Some(lhs) => irc_bump_def(def_count, lhs)
-        None => ()
+  while i < n {
+    let t = irc_strip_comment(fn_lines[i])
+    code.push(t)
+    if t.length() > 0 {
+      let c0 = str_code_at(t, 0)
+      if c0 == 37 {
+        match irc_extract_def_lhs(t) {
+          Some(lhs) => {
+            irc_bump_def(def_count, lhs)
+            if irc_ends_with(t, " =l alloc8 8") && lhs.length() + 12 == t.length() {
+              slots.set(lhs, entry_ok && entry_end == n)
+              maybe_slot[irc_name_bucket(lhs, 0, lhs.length())] = true
+            }
+          }
+          None => ()
+        }
+      } else if c0 == 64 {
+        if entry_lbl == "" {
+          entry_lbl = irc_extract_label_tok(t)
+          entry_ok = true
+        } else if entry_end == n {
+          entry_end = i
+        }
+      } else if c0 == 106 {
+        // `jmp` / `jnz` / `jtbl` back to the entry block.
+        let targets = irc_collect_at_labels(t)
+        if str_arr_contains(targets, entry_lbl) {
+          entry_ok = false
+        }
+      } else if entry_lbl == "" {
+        // Code before the first label: not a shape this pass understands.
+        entry_lbl = "@"
+        entry_ok = false
       }
     }
     i = i + 1
   }
 
-  let imm : Map[String, Bool] = Map::new()
-  let rev_copies : Map[String, Array[String]] = Map::new()
-  let queue : Array[String] = []
-
-  i = 0
-  while i < fn_lines.length() {
-    let raw = fn_lines[i]
-    let ws = irc_first_non_ws(raw)
-    if ws + 10 < raw.length() && str_code_at(raw, ws) == 37 {
-      let t = irc_strip_comment(raw)
-      if t.length() > 10 && str_code_at(t, 0) == 37 {
-        let mut eq_pos = -1
-        let mut j = 1
-        while j + 3 < t.length() {
-          if str_code_at(t, j) == 32 &&
-            str_code_at(t, j + 1) == 61 &&
-            str_code_at(t, j + 2) == 108 &&
-            str_code_at(t, j + 3) == 32 {
-            eq_pos = j
-            break
+  // Pass B: drop every slot with an occurrence that is not a whole-word access.
+  if slots.length() > 0 {
+    i = 0
+    while i < n {
+      let t = code[i]
+      let tn = t.length()
+      let mut scan_from = 0
+      let mut scan_to = tn
+      if tn > 0 {
+        if str_code_at(t, 0) == 37 {
+          // The definition itself is not a use (a second one is caught by `def_count`).
+          scan_from = 1
+          if irc_silent_op(t) == 1 {
+            // The only operand is the address.
+            scan_to = 0
           }
-          if irc_is_ws(str_code_at(t, j)) {
-            break
+        } else {
+          match irc_parse_storel(t) {
+            Some(_) => {
+              // Only the stored value can leak a slot address.
+              scan_from = 7
+              scan_to = irc_find_char_unquoted(t, 7, 44)
+            }
+            None => ()
           }
-          j = j + 1
         }
-        if eq_pos > 1 {
-          let lhs = slice_str(t, 0, eq_pos)
-          let is_unique = match def_count.get(lhs) {
-            Some(c) => c == 1
-            None => false
+      }
+      let mut p = scan_from
+      while p < scan_to {
+        if str_code_at(t, p) == 37 {
+          let mut q = p + 1
+          while q < scan_to && irc_is_qbe_ident_char(str_code_at(t, q)) {
+            q = q + 1
           }
-          if is_unique {
-            let rhs = irc_trim(slice_str(t, eq_pos + 4, t.length()))
-            if irc_starts_with(rhs, "add ") && irc_ends_with(rhs, ", 24") {
-              let sym = irc_trim(slice_str(rhs, 4, rhs.length() - 4))
-              if irc_is_static_immortal_hdr(sym) {
-                if !irc_is_immortal_arg(lhs, imm) {
-                  imm.set(lhs, true)
-                  queue.push(lhs)
-                }
+          if q > p + 1 && maybe_slot[irc_name_bucket(t, p, q)] {
+            slots.remove(slice_str(t, p, q))
+          }
+          p = q
+        } else {
+          p = p + 1
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  // Pass C: build the dependency graph.
+  let st = IrcSilent::{
+    silent: Map::new(),
+    pending: Map::new(),
+    users: Map::new(),
+    queue: [],
+  }
+  // Values stored to each private slot; slots initialized by the entry block so far.
+  let stores : Map[String, Array[String]] = Map::new()
+  let entry_init : Map[String, Bool] = Map::new()
+  let mut latest : Map[String, String] = Map::new()
+  i = 0
+  while i < n {
+    let t = code[i]
+    if t.length() > 0 {
+      let c0 = str_code_at(t, 0)
+      if c0 == 64 {
+        if latest.length() > 0 {
+          latest = Map::new()
+        }
+      } else if c0 == 115 {
+        match irc_parse_storel(t) {
+          Some((v, a)) =>
+            if irc_unique_slot(slots, def_count, a) {
+              latest.set(a, v)
+              if i < entry_end && entry_ok {
+                entry_init.set(a, true)
               }
-            } else if irc_starts_with(rhs, "copy ") {
-              let src = irc_trim(slice_str(rhs, 5, rhs.length()))
-              if irc_is_valid_qbe_tmp(src) {
-                match rev_copies.get(src) {
-                  Some(dsts) => dsts.push(lhs)
-                  None => {
-                    let dsts : Array[String] = [lhs]
-                    rev_copies.set(src, dsts)
-                  }
+              match stores.get(a) {
+                Some(vs) => vs.push(v)
+                None => {
+                  let vs : Array[String] = [v]
+                  stores.set(a, vs)
                 }
               }
             }
-          }
+          None => ()
+        }
+      } else if c0 == 37 {
+        let op = irc_silent_op(t)
+        match if op != 0 { irc_parse_typed_def(t) } else { None } {
+          Some((lhs, ty_c, rhs)) =>
+            if ty_c == 108 {
+              if op == 1 {
+                let a = irc_trim(slice_str(rhs, 6, rhs.length()))
+                if irc_def_is_unique(def_count, lhs) && irc_unique_slot(slots, def_count, a) {
+                  match latest.get(a) {
+                    Some(v) => irc_silent_node(st, lhs, [v])
+                    None => if entry_init.contains(a) { irc_silent_node(st, lhs, ["=" + a]) }
+                  }
+                }
+              } else if op == 5 {
+                // A re-executed `alloc8` yields a new slot.
+                latest.remove(lhs)
+              } else if op == 2 {
+                if irc_def_is_unique(def_count, lhs) {
+                  irc_silent_node(st, lhs, [irc_trim(slice_str(rhs, 5, rhs.length()))])
+                }
+              } else if op == 3 {
+                let sym = irc_trim(slice_str(rhs, 4, rhs.length() - 4))
+                if irc_is_static_immortal_hdr(sym) && irc_def_is_unique(def_count, lhs) {
+                  irc_silent_mark(st, lhs)
+                }
+              } else if irc_has_kw_sep(rhs, "phi") {
+                let vals = irc_parse_phi_vals(irc_trim(slice_str(rhs, 3, rhs.length())))
+                if vals.length() > 0 && irc_def_is_unique(def_count, lhs) {
+                  irc_silent_node(st, lhs, vals)
+                }
+              }
+            }
+          None => ()
+        }
+      }
+    }
+    i = i + 1
+  }
+  // A slot read across blocks is silent once all the values ever stored to it are.
+  i = 0
+  while i < n {
+    let t = code[i]
+    if irc_ends_with(t, " =l alloc8 8") {
+      let a = slice_str(t, 0, t.length() - 12)
+      if entry_init.contains(a) {
+        match stores.get(a) {
+          Some(vs) => irc_silent_node(st, "=" + a, vs)
+          None => ()
         }
       }
     }
     i = i + 1
   }
 
-  // O(N) BFS propagation over reverse copy adjacency list
+  // Least fixpoint.
   let mut qh = 0
-  while qh < queue.length() {
-    let cur = queue[qh]
+  while qh < st.queue.length() {
+    let cur = st.queue[qh]
     qh = qh + 1
-    match rev_copies.get(cur) {
-      Some(dsts) => {
-        let mut ci = 0
-        while ci < dsts.length() {
-          let dst = dsts[ci]
-          if !irc_is_immortal_arg(dst, imm) {
-            imm.set(dst, true)
-            queue.push(dst)
+    match st.users.get(cur) {
+      Some(us) => {
+        let mut ui = 0
+        while ui < us.length() {
+          let node = us[ui]
+          match st.pending.get(node) {
+            Some(open) => {
+              st.pending.set(node, open - 1)
+              if open == 1 {
+                irc_silent_mark(st, node)
+              }
+            }
+            None => ()
           }
-          ci = ci + 1
+          ui = ui + 1
         }
       }
       None => ()
     }
   }
-  imm
+  st.silent
 }
 
 ///|
-/// Run Step 1 (same-block RC pair cancellation) + Step 2 (multi-def-safe immortal
-/// RC elimination, skipped when `!has_hdr`) on a single function body. Zero CFG changes.
+fn irc_def_is_unique(def_count : Map[String, Int], name : String) -> Bool {
+  match def_count.get(name) {
+    Some(c) => c == 1
+    None => false
+  }
+}
+
+///|
+fn irc_unique_slot(
+  slots : Map[String, Bool],
+  def_count : Map[String, Int],
+  name : String,
+) -> Bool {
+  match slots.get(name) {
+    Some(in_entry) => in_entry && irc_def_is_unique(def_count, name)
+    None => false
+  }
+}
+
+///|
+fn irc_has_rc_call(lines : Array[String]) -> Bool {
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    if irc_slice_starts_with(line, irc_first_non_ws(line), line.length(), "call $pion_rc_") {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+/// Run Step 1 (same-block RC pair cancellation) + Step 2 (elimination of RC calls on
+/// proven NULL / immortal values) on a single function body. Zero CFG changes.
 fn irc_cleanup_fn_body_fast(
   fn_hdr : String,
   fn_lines : Array[String],
-  has_hdr : Bool,
   disable_mask : Int,
 ) -> Array[String] {
   let after_cancel = irc_cancel_same_block_rc(fn_hdr, fn_lines, disable_mask)
-  if !has_hdr {
+  if !irc_has_rc_call(after_cancel) {
     return after_cancel
   }
   let immortal_regs = irc_collect_immortal_regs(fn_hdr, after_cancel)
-  if immortal_regs.length() == 0 {
-    return after_cancel
-  }
   let res : Array[String] = []
   let mut i = 0
   while i < after_cancel.length() {
@@ -2166,7 +2455,8 @@ fn irc_cleanup_fn_body_fast(
       let kind = irc_match_rc_call(t)
       if kind != 0 {
         let arg = irc_extract_rc_arg(t)
-        if irc_is_valid_qbe_val(arg) && irc_is_immortal_arg(arg, immortal_regs) {
+        if arg == "0" ||
+          (irc_is_valid_qbe_val(arg) && irc_is_immortal_arg(arg, immortal_regs)) {
           i = i + 1
           continue
         }
@@ -2860,8 +3150,7 @@ fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String
         out.write_string(fn_hdr)
         out.write_char('\n')
         let body = irc_split_lines_range(ssa, body_start, body_end)
-        let has_hdr = (flags & 2) != 0
-        let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, has_hdr, disable_mask)
+        let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, disable_mask)
         irc_emit_lines(cleaned, out)
         if body_end < n {
           out.write_string(slice_str(ssa, body_end, close_end))
@@ -2987,8 +3276,7 @@ fn irc_process_ssa(ssa : String, do_inline : Bool, disable_mask : Int) -> String
         pos = fn_end
         continue
       }
-      let has_hdr = (flags & 2) != 0
-      let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, has_hdr, disable_mask)
+      let cleaned = irc_cleanup_fn_body_fast(fn_hdr, body, disable_mask)
       let cfg = irc_build_cfg(cleaned)
       let in_loop = if cfg.disable_cfg { [] } else { irc_compute_loop_blocks(cfg) }
       let callees : Array[String] = []
