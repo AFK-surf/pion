@@ -36,6 +36,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <pthread.h>
+#include <sched.h>
 #include <signal.h>
 #if defined(__APPLE__)
 #include <TargetConditionals.h>
@@ -756,6 +757,9 @@ PION_NOINLINE PION_HOT void pion_rc_inc(void *obj) {
             hdr->local_rc++;
             return;
         }
+        uint32_t rc = atomic_load_explicit(&hdr->shared_rc, memory_order_relaxed);
+        atomic_store_explicit(&hdr->shared_rc, rc + 1u, memory_order_relaxed);
+        return;
     } else if (__builtin_expect(hdr->owner_tid == pion_cur_tid_mt(), 1)) {
         hdr->local_rc++;
         return;
@@ -774,6 +778,12 @@ PION_NOINLINE PION_HOT void pion_rc_dec(void *obj) {
             }
             return;
         }
+        uint32_t rc = atomic_load_explicit(&hdr->shared_rc, memory_order_relaxed);
+        atomic_store_explicit(&hdr->shared_rc, rc - 1u, memory_order_relaxed);
+        if (rc == 1u) {
+            pion_destroy(hdr, obj);
+        }
+        return;
     } else if (__builtin_expect(hdr->owner_tid == pion_cur_tid_mt(), 1)) {
         if (--hdr->local_rc == 0) {
             if (atomic_load_explicit(&hdr->shared_rc, memory_order_acquire) == 0) {
@@ -787,14 +797,49 @@ PION_NOINLINE PION_HOT void pion_rc_dec(void *obj) {
     }
 }
 
-PION_MINSIZE static void pion_enter_mt(void) {
-    if (__builtin_expect(atomic_load_explicit(&g_pion_mt, memory_order_relaxed) == 0, 0)) {
-        if (tls_tid == 0) tls_tid = 1u;
+PION_MINSIZE void pion_enter_mt(void) {
+    if (__builtin_expect(atomic_load_explicit(&g_pion_mt, memory_order_acquire) == 0u, 0)) {
+        if (tls_tid == 0u) tls_tid = 1u;
 #if PION_USE_SLAB
         if (tls_slab == NULL) tls_slab = &g_main_slab;
 #endif
         pion_mt_flag = 1u;
         atomic_store_explicit(&g_pion_mt, 1u, memory_order_release);
+    }
+}
+
+PION_MINSIZE void pion_once_call(uint32_t *guard, void (*init_fn)(void)) {
+    _Atomic uint32_t *ag = (_Atomic uint32_t *)guard;
+    if (__builtin_expect(atomic_load_explicit(ag, memory_order_acquire) == 1u, 1)) {
+        return;
+    }
+    if (__builtin_expect(!atomic_load_explicit(&g_pion_mt, memory_order_acquire), 1)) {
+        uint32_t cur = atomic_load_explicit(ag, memory_order_relaxed);
+        if (cur != 0u) return;
+        atomic_store_explicit(ag, 3u, memory_order_relaxed);
+        init_fn();
+        atomic_store_explicit(ag, 1u, memory_order_release);
+        return;
+    }
+    uint32_t my_tag = pion_cur_tid_mt() + 2u;
+    for (;;) {
+        uint32_t cur = atomic_load_explicit(ag, memory_order_acquire);
+        if (cur == 1u || cur == my_tag) return;
+        if (cur == 0u) {
+            if (atomic_compare_exchange_strong_explicit(
+                    ag, &cur, my_tag,
+                    memory_order_acq_rel, memory_order_acquire)) {
+                init_fn();
+                atomic_store_explicit(ag, 1u, memory_order_release);
+                return;
+            }
+            continue;
+        }
+#ifdef _WIN32
+        Sleep(0);
+#else
+        sched_yield();
+#endif
     }
 }
 

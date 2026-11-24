@@ -1,5 +1,14 @@
-///| Native QBE SSA post-pass: inline single-threaded Biased RC fast path
-///| and eliminate RC inc/dec on statically immortal objects (string literals, None, static enums).
+///| Native QBE SSA post-pass:
+///| 1. `cleanup_native_rc_ssa` (dev & release, zero new basic blocks):
+///|    - Same-block strict-whitelist `pion_rc_inc(%x) ... pion_rc_dec(%x)` pair cancellation.
+///|    - Multi-definition-safe static immortal RC elimination (`$pion_str_*_hdr`,
+///|      `$pion_none_hdr`, `$pion_enum_*_hdr`).
+///| 2. `inline_native_rc_ssa` (native `--release` only):
+///|    - Runs `cleanup_native_rc_ssa` per function,
+///|    - Enforces `Int64` product budget `est_blk * est_tmp <= 2^28`,
+///|    - Expands remaining RC ops with zero-extra-block `phi` fast path covering
+///|      both `owner_tid != 0` (`local_rc` at `-20`) and single-threaded frozen
+///|      objects (`owner_tid == 0 && !(flags & 2)`, `shared_rc` at `-16`).
 ///| Stage-0 bootstrap safe (pure Pion, zero external dependencies).
 
 ///|
@@ -111,18 +120,19 @@ fn irc_is_valid_qbe_val(arg : String) -> Bool {
 }
 
 ///|
-fn irc_is_static_immortal_sym(sym : String) -> Bool {
-  irc_starts_with(sym, "$pion_str_") ||
-  irc_starts_with(sym, "$str_") ||
-  irc_starts_with(sym, "$pion_enum_") ||
-  sym == "$pion_none_hdr"
+fn irc_is_valid_qbe_tmp(arg : String) -> Bool {
+  arg.length() >= 2 && str_code_at(arg, 0) == 37 && irc_is_valid_qbe_val(arg)
+}
+
+///|
+fn irc_is_static_immortal_hdr(sym : String) -> Bool {
+  sym == "$pion_none_hdr" ||
+  (irc_ends_with(sym, "_hdr") &&
+    (irc_starts_with(sym, "$pion_str_") || irc_starts_with(sym, "$pion_enum_")))
 }
 
 ///|
 fn irc_is_immortal_arg(arg : String, immortal_regs : Map[String, Bool]) -> Bool {
-  if irc_is_static_immortal_sym(arg) {
-    return true
-  }
   match immortal_regs.get(arg) {
     Some(b) => b
     None => false
@@ -130,50 +140,133 @@ fn irc_is_immortal_arg(arg : String, immortal_regs : Map[String, Bool]) -> Bool 
 }
 
 ///|
-/// Collect SSA temporaries known to hold pointers to statically immortal objects
-/// (e.g. `%t =l add $pion_str_0_hdr, 24`, `%t =l add $pion_none_hdr, 24`,
-/// `%t =l add $pion_enum_..., 24`, or `%t2 =l copy %t`).
-fn irc_collect_immortal_regs(fn_lines : Array[String]) -> Map[String, Bool] {
-  let imm : Map[String, Bool] = Map::new()
-  let mut i = 0
-  while i < fn_lines.length() {
-    let t = irc_trim(fn_lines[i])
-    if t.length() > 10 && str_code_at(t, 0) == 37 {
-      // Find " =l "
-      let mut eq_pos = -1
-      let mut j = 1
-      while j + 3 < t.length() {
-        if str_code_at(t, j) == 32 &&
-          str_code_at(t, j + 1) == 61 &&
-          str_code_at(t, j + 2) == 108 &&
-          str_code_at(t, j + 3) == 32 {
-          eq_pos = j
-          break
-        }
-        if irc_is_ws(str_code_at(t, j)) {
-          break
-        }
-        j = j + 1
-      }
-      if eq_pos > 1 {
-        let lhs = slice_str(t, 0, eq_pos)
-        let rhs = slice_str(t, eq_pos + 4, t.length())
-        if irc_starts_with(rhs, "add ") && irc_ends_with(rhs, ", 24") {
-          let sym = irc_trim(slice_str(rhs, 4, rhs.length() - 4))
-          if irc_is_static_immortal_sym(sym) {
-            imm.set(lhs, true)
-          }
-        } else if irc_starts_with(rhs, "copy ") {
-          let src = irc_trim(slice_str(rhs, 5, rhs.length()))
-          if irc_is_immortal_arg(src, imm) {
-            imm.set(lhs, true)
-          }
-        }
-      }
-    }
-    i = i + 1
+fn irc_is_pure_reg_op(op : String) -> Bool {
+  op == "copy" ||
+  op == "neg" ||
+  op == "add" ||
+  op == "sub" ||
+  op == "mul" ||
+  op == "udiv" ||
+  op == "div" ||
+  op == "urem" ||
+  op == "rem" ||
+  op == "and" ||
+  op == "or" ||
+  op == "xor" ||
+  op == "shl" ||
+  op == "shr" ||
+  op == "sar" ||
+  op == "ror" ||
+  op == "extsb" ||
+  op == "extub" ||
+  op == "extsh" ||
+  op == "extuh" ||
+  op == "extsw" ||
+  op == "extuw" ||
+  op == "exts" ||
+  op == "truncd" ||
+  op == "stosi" ||
+  op == "stoui" ||
+  op == "dtosi" ||
+  op == "dtoui" ||
+  op == "swtof" ||
+  op == "uwtof" ||
+  op == "sltof" ||
+  op == "ultof" ||
+  op == "cast" ||
+  op == "ceqw" ||
+  op == "cnew" ||
+  op == "cslew" ||
+  op == "csltw" ||
+  op == "csgew" ||
+  op == "csgtw" ||
+  op == "culew" ||
+  op == "cultw" ||
+  op == "cugew" ||
+  op == "cugtw" ||
+  op == "ceql" ||
+  op == "cnel" ||
+  op == "cslel" ||
+  op == "csltl" ||
+  op == "csgel" ||
+  op == "csgtl" ||
+  op == "culel" ||
+  op == "cultl" ||
+  op == "cugel" ||
+  op == "cugtl" ||
+  op == "ceqs" ||
+  op == "cnes" ||
+  op == "cles" ||
+  op == "clts" ||
+  op == "cges" ||
+  op == "cgts" ||
+  op == "cos" ||
+  op == "cuos" ||
+  op == "ceqd" ||
+  op == "cned" ||
+  op == "cled" ||
+  op == "cltd" ||
+  op == "cged" ||
+  op == "cgtd" ||
+  op == "cod" ||
+  op == "cuod"
+}
+
+///|
+/// If `t` is a whitelisted pure-register SSA instruction or a verified read-only
+/// string comparison call (`$pion_str_eq` / `$pion_str_cmp`), returns `Some(lhs)`.
+/// Otherwise returns `None` (which terminates all open `rc_inc` windows).
+fn irc_whitelist_def_lhs(t : String) -> Option[String] {
+  let n = t.length()
+  if n < 7 || str_code_at(t, 0) != 37 {
+    return None
   }
-  imm
+  let mut eq_pos = -1
+  let mut j = 1
+  while j + 3 < n {
+    let c = str_code_at(t, j)
+    if c == 32 {
+      if str_code_at(t, j + 1) == 61 && str_code_at(t, j + 3) == 32 {
+        let kc = str_code_at(t, j + 2)
+        if kc == 119 || kc == 108 || kc == 115 || kc == 100 {
+          eq_pos = j
+        }
+      }
+      break
+    }
+    if irc_is_ws(c) {
+      break
+    }
+    j = j + 1
+  }
+  if eq_pos < 2 {
+    return None
+  }
+  let lhs = slice_str(t, 0, eq_pos)
+  let ty_c = str_code_at(t, eq_pos + 2)
+  let rhs = irc_trim(slice_str(t, eq_pos + 4, n))
+  let rn = rhs.length()
+  if rn == 0 {
+    return None
+  }
+  let mut op_end = 0
+  while op_end < rn && !irc_is_ws(str_code_at(rhs, op_end)) {
+    op_end = op_end + 1
+  }
+  let op = slice_str(rhs, 0, op_end)
+  if op == "call" {
+    if ty_c == 119 &&
+      irc_ends_with(rhs, ")") &&
+      (irc_starts_with(rhs, "call $pion_str_eq(") ||
+        irc_starts_with(rhs, "call $pion_str_cmp(")) {
+      return Some(lhs)
+    }
+    return None
+  }
+  if irc_is_pure_reg_op(op) {
+    return Some(lhs)
+  }
+  None
 }
 
 ///|
@@ -193,6 +286,345 @@ fn irc_match_rc_call(t : String) -> Int {
 fn irc_extract_rc_arg(t : String) -> String {
   // Both "call $pion_rc_inc(l " and "call $pion_rc_dec(l " have length 20
   irc_trim(slice_str(t, 20, t.length() - 1))
+}
+
+///|
+/// Step 1: O(N) same-block strict-whitelist `pion_rc_inc(%x) ... pion_rc_dec(%x)` cancellation
+/// using per-temp index stacks (`Map[String, Array[Int]]`).
+fn irc_cancel_same_block_rc(fn_lines : Array[String]) -> Array[String] {
+  let n = fn_lines.length()
+  let deleted : Array[Bool] = []
+  let mut di = 0
+  while di < n {
+    deleted.push(false)
+    di = di + 1
+  }
+  let mut open_stacks : Map[String, Array[Int]] = Map::new()
+  let mut any_deleted = false
+
+  let mut i = 0
+  while i < n {
+    let t = irc_trim(fn_lines[i])
+    if t.length() == 0 {
+      i = i + 1
+      continue
+    }
+    let kind = irc_match_rc_call(t)
+    if kind == 1 {
+      let arg = irc_extract_rc_arg(t)
+      if irc_is_valid_qbe_tmp(arg) {
+        match open_stacks.get(arg) {
+          Some(stk) => stk.push(i)
+          None => {
+            let stk : Array[Int] = [i]
+            open_stacks.set(arg, stk)
+          }
+        }
+      } else {
+        open_stacks = Map::new()
+      }
+    } else if kind == 2 {
+      let arg = irc_extract_rc_arg(t)
+      let mut matched = false
+      match open_stacks.get(arg) {
+        Some(stk) =>
+          if stk.length() > 0 {
+            match stk.pop() {
+              Some(inc_idx) => {
+                deleted[inc_idx] = true
+                deleted[i] = true
+                any_deleted = true
+                matched = true
+              }
+              None => ()
+            }
+          }
+        None => ()
+      }
+      if !matched {
+        // Unmatched rc_dec may trigger a destructor; terminate all open windows.
+        open_stacks = Map::new()
+      }
+    } else if open_stacks.length() > 0 {
+      match irc_whitelist_def_lhs(t) {
+        Some(lhs) =>
+          match open_stacks.get(lhs) {
+            Some(stk) => {
+              while stk.length() > 0 {
+                let _ = stk.pop()
+              }
+            }
+            None => ()
+          }
+        None => open_stacks = Map::new()
+      }
+    }
+    i = i + 1
+  }
+
+  if !any_deleted {
+    return fn_lines
+  }
+  let res : Array[String] = []
+  let mut k = 0
+  while k < n {
+    if !deleted[k] {
+      res.push(fn_lines[k])
+    }
+    k = k + 1
+  }
+  res
+}
+
+///|
+fn irc_bump_def(def_count : Map[String, Int], name : String) -> Unit {
+  let prev = match def_count.get(name) {
+    Some(c) => c
+    None => 0
+  }
+  def_count.set(name, prev + 1)
+}
+
+///|
+/// Scan function signature `...(...) {` and count parameter `%name` definitions.
+fn irc_scan_fn_params(fn_hdr : String, def_count : Map[String, Int]) -> Int {
+  let n = fn_hdr.length()
+  let mut lp = -1
+  let mut rp = -1
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(fn_hdr, i)
+    if c == 40 && lp < 0 {
+      lp = i
+    } else if c == 41 {
+      rp = i
+      break
+    }
+    i = i + 1
+  }
+  if lp < 0 || rp <= lp {
+    return 0
+  }
+  let mut count = 0
+  let mut p = lp + 1
+  while p < rp {
+    if str_code_at(fn_hdr, p) == 37 {
+      let mut q = p + 1
+      while q < rp {
+        let c = str_code_at(fn_hdr, q)
+        if irc_is_ws(c) || c == 44 || c == 41 || c == 40 {
+          break
+        }
+        q = q + 1
+      }
+      if q > p + 1 {
+        irc_bump_def(def_count, slice_str(fn_hdr, p, q))
+        count = count + 1
+      }
+      p = q
+    } else {
+      p = p + 1
+    }
+  }
+  count
+}
+
+///|
+/// Extract `%lhs` if trimmed line `t` is any SSA definition (`%lhs =...`).
+fn irc_extract_def_lhs(t : String) -> Option[String] {
+  let n = t.length()
+  if n < 4 || str_code_at(t, 0) != 37 {
+    return None
+  }
+  let mut j = 1
+  while j + 1 < n {
+    let c = str_code_at(t, j)
+    if c == 32 {
+      if str_code_at(t, j + 1) == 61 {
+        return Some(slice_str(t, 0, j))
+      }
+      return None
+    }
+    if irc_is_ws(c) {
+      return None
+    }
+    j = j + 1
+  }
+  None
+}
+
+///|
+/// Step 2: Multi-definition-safe collection of SSA temporaries proven to hold
+/// statically immortal objects (`$pion_str_*_hdr`, `$pion_none_hdr`, `$pion_enum_*_hdr`).
+/// Only uniquely defined SSA temporaries (`def_count == 1`) may be marked immortal.
+fn irc_collect_immortal_regs(
+  fn_hdr : String,
+  fn_lines : Array[String],
+) -> Map[String, Bool] {
+  let def_count : Map[String, Int] = Map::new()
+  let _ = irc_scan_fn_params(fn_hdr, def_count)
+  let mut i = 0
+  while i < fn_lines.length() {
+    let t = irc_trim(fn_lines[i])
+    match irc_extract_def_lhs(t) {
+      Some(lhs) => irc_bump_def(def_count, lhs)
+      None => ()
+    }
+    i = i + 1
+  }
+
+  let imm : Map[String, Bool] = Map::new()
+  let rev_copies : Map[String, Array[String]] = Map::new()
+  let queue : Array[String] = []
+
+  i = 0
+  while i < fn_lines.length() {
+    let t = irc_trim(fn_lines[i])
+    if t.length() > 10 && str_code_at(t, 0) == 37 {
+      let mut eq_pos = -1
+      let mut j = 1
+      while j + 3 < t.length() {
+        if str_code_at(t, j) == 32 &&
+          str_code_at(t, j + 1) == 61 &&
+          str_code_at(t, j + 2) == 108 &&
+          str_code_at(t, j + 3) == 32 {
+          eq_pos = j
+          break
+        }
+        if irc_is_ws(str_code_at(t, j)) {
+          break
+        }
+        j = j + 1
+      }
+      if eq_pos > 1 {
+        let lhs = slice_str(t, 0, eq_pos)
+        let is_unique = match def_count.get(lhs) {
+          Some(c) => c == 1
+          None => false
+        }
+        if is_unique {
+          let rhs = irc_trim(slice_str(t, eq_pos + 4, t.length()))
+          if irc_starts_with(rhs, "add ") && irc_ends_with(rhs, ", 24") {
+            let sym = irc_trim(slice_str(rhs, 4, rhs.length() - 4))
+            if irc_is_static_immortal_hdr(sym) {
+              if !irc_is_immortal_arg(lhs, imm) {
+                imm.set(lhs, true)
+                queue.push(lhs)
+              }
+            }
+          } else if irc_starts_with(rhs, "copy ") {
+            let src = irc_trim(slice_str(rhs, 5, rhs.length()))
+            if irc_is_valid_qbe_tmp(src) {
+              match rev_copies.get(src) {
+                Some(dsts) => dsts.push(lhs)
+                None => {
+                  let dsts : Array[String] = [lhs]
+                  rev_copies.set(src, dsts)
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+
+  // O(N) BFS propagation over reverse copy adjacency list
+  let mut qh = 0
+  while qh < queue.length() {
+    let cur = queue[qh]
+    qh = qh + 1
+    match rev_copies.get(cur) {
+      Some(dsts) => {
+        let mut ci = 0
+        while ci < dsts.length() {
+          let dst = dsts[ci]
+          if !irc_is_immortal_arg(dst, imm) {
+            imm.set(dst, true)
+            queue.push(dst)
+          }
+          ci = ci + 1
+        }
+      }
+      None => ()
+    }
+  }
+  imm
+}
+
+///|
+/// Run Step 1 (same-block RC pair cancellation) + Step 2 (multi-def-safe immortal
+/// RC elimination) on a single function body. Zero CFG changes.
+fn irc_cleanup_fn_body(
+  fn_hdr : String,
+  fn_lines : Array[String],
+) -> Array[String] {
+  let after_cancel = irc_cancel_same_block_rc(fn_lines)
+  let immortal_regs = irc_collect_immortal_regs(fn_hdr, after_cancel)
+  if immortal_regs.length() == 0 {
+    return after_cancel
+  }
+  let res : Array[String] = []
+  let mut i = 0
+  while i < after_cancel.length() {
+    let line = after_cancel[i]
+    let t = irc_trim(line)
+    let kind = irc_match_rc_call(t)
+    if kind != 0 {
+      let arg = irc_extract_rc_arg(t)
+      if irc_is_valid_qbe_val(arg) && irc_is_immortal_arg(arg, immortal_regs) {
+        i = i + 1
+        continue
+      }
+    }
+    res.push(line)
+    i = i + 1
+  }
+  res
+}
+
+///|
+/// Step 3: `Int64` exact product budget `est_blk * est_tmp <= 2^28` (`268435456L`).
+fn irc_within_inline_budget(fn_hdr : String, fn_lines : Array[String]) -> Bool {
+  let dummy_defs : Map[String, Int] = Map::new()
+  let nparams = irc_scan_fn_params(fn_hdr, dummy_defs)
+  let mut nblk = 0L
+  let mut ntmp = nparams.to_int64()
+  let mut ninc = 0L
+  let mut ndec = 0L
+
+  let mut i = 0
+  while i < fn_lines.length() {
+    let t = irc_trim(fn_lines[i])
+    if t.length() > 1 && str_code_at(t, 0) == 64 {
+      nblk = nblk + 1L
+    } else {
+      let kind = irc_match_rc_call(t)
+      if kind == 1 {
+        if irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
+          ninc = ninc + 1L
+        }
+      } else if kind == 2 {
+        if irc_is_valid_qbe_val(irc_extract_rc_arg(t)) {
+          ndec = ndec + 1L
+        }
+      } else {
+        match irc_extract_def_lhs(t) {
+          Some(_) => ntmp = ntmp + 1L
+          None => ()
+        }
+      }
+    }
+    i = i + 1
+  }
+  if nblk == 0L {
+    nblk = 1L
+  }
+  let est_blk = nblk + 6L * ninc + 7L * ndec
+  let est_tmp = ntmp + 12L * (ninc + ndec)
+  let limit = 268435456L
+  est_blk <= limit && est_tmp <= limit && est_blk * est_tmp <= limit
 }
 
 ///|
@@ -246,8 +678,20 @@ fn irc_rewrite_phi_line(
 }
 
 ///|
-fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
-  let immortal_regs = irc_collect_immortal_regs(fn_lines)
+fn irc_emit_lines(lines : Array[String], out : StringBuilder) -> Unit {
+  let mut k = 0
+  while k < lines.length() {
+    out.write_string(lines[k])
+    out.write_char('\n')
+    k = k + 1
+  }
+}
+
+///|
+/// Step 4: Expand remaining RC calls with zero-extra-block `phi` fast path
+/// (reusing `@_rci_fast_` / `@_rcd_fast_` for both `local_rc` at `-20` and
+/// single-threaded frozen `shared_rc` at `-16`).
+fn irc_expand_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
   let out_lines : Array[String] = []
   let tail_map : Map[String, String] = Map::new()
   let mut cur_orig = ""
@@ -271,11 +715,6 @@ fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
       if kind != 0 {
         let arg = irc_extract_rc_arg(t)
         if irc_is_valid_qbe_val(arg) {
-          if irc_is_immortal_arg(arg, immortal_regs) {
-            // Static immortal object: zero-instruction elimination
-            i = i + 1
-            continue
-          }
           let id_s = rc_id.to_string()
           rc_id = rc_id + 1
           if kind == 1 {
@@ -291,6 +730,7 @@ fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
             out_lines.push("@_rci_st_" + id_s)
             out_lines.push("    %_rci_oa_" + id_s + " =l sub " + arg + ", 24")
             out_lines.push("    %_rci_ot_" + id_s + " =w loaduw %_rci_oa_" + id_s)
+            out_lines.push("    %_rci_la_" + id_s + " =l sub " + arg + ", 20")
             out_lines.push(
               "    jnz %_rci_ot_" + id_s + ", @_rci_fast_" + id_s + ", @_rci_imm_" + id_s,
             )
@@ -298,11 +738,23 @@ fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
             out_lines.push("    %_rci_fa_" + id_s + " =l sub " + arg + ", 10")
             out_lines.push("    %_rci_fl_" + id_s + " =w loaduh %_rci_fa_" + id_s)
             out_lines.push("    %_rci_im_" + id_s + " =w and %_rci_fl_" + id_s + ", 2")
+            out_lines.push("    %_rci_sa_" + id_s + " =l sub " + arg + ", 16")
             out_lines.push(
-              "    jnz %_rci_im_" + id_s + ", @_rci_end_" + id_s + ", @_rci_slow_" + id_s,
+              "    jnz %_rci_im_" + id_s + ", @_rci_end_" + id_s + ", @_rci_fast_" + id_s,
             )
             out_lines.push("@_rci_fast_" + id_s)
-            out_lines.push("    %_rci_ra_" + id_s + " =l sub " + arg + ", 20")
+            out_lines.push(
+              "    %_rci_ra_" +
+              id_s +
+              " =l phi @_rci_st_" +
+              id_s +
+              " %_rci_la_" +
+              id_s +
+              ", @_rci_imm_" +
+              id_s +
+              " %_rci_sa_" +
+              id_s,
+            )
             out_lines.push("    %_rci_rc_" + id_s + " =w loaduw %_rci_ra_" + id_s)
             out_lines.push("    %_rci_r1_" + id_s + " =w add %_rci_rc_" + id_s + ", 1")
             out_lines.push("    storew %_rci_r1_" + id_s + ", %_rci_ra_" + id_s)
@@ -324,6 +776,7 @@ fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
             out_lines.push("@_rcd_st_" + id_s)
             out_lines.push("    %_rcd_oa_" + id_s + " =l sub " + arg + ", 24")
             out_lines.push("    %_rcd_ot_" + id_s + " =w loaduw %_rcd_oa_" + id_s)
+            out_lines.push("    %_rcd_la_" + id_s + " =l sub " + arg + ", 20")
             out_lines.push(
               "    jnz %_rcd_ot_" + id_s + ", @_rcd_fast_" + id_s + ", @_rcd_imm_" + id_s,
             )
@@ -331,11 +784,23 @@ fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
             out_lines.push("    %_rcd_fa_" + id_s + " =l sub " + arg + ", 10")
             out_lines.push("    %_rcd_fl_" + id_s + " =w loaduh %_rcd_fa_" + id_s)
             out_lines.push("    %_rcd_im_" + id_s + " =w and %_rcd_fl_" + id_s + ", 2")
+            out_lines.push("    %_rcd_sa_" + id_s + " =l sub " + arg + ", 16")
             out_lines.push(
-              "    jnz %_rcd_im_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_slow_" + id_s,
+              "    jnz %_rcd_im_" + id_s + ", @_rcd_end_" + id_s + ", @_rcd_fast_" + id_s,
             )
             out_lines.push("@_rcd_fast_" + id_s)
-            out_lines.push("    %_rcd_ra_" + id_s + " =l sub " + arg + ", 20")
+            out_lines.push(
+              "    %_rcd_ra_" +
+              id_s +
+              " =l phi @_rcd_st_" +
+              id_s +
+              " %_rcd_la_" +
+              id_s +
+              ", @_rcd_imm_" +
+              id_s +
+              " %_rcd_sa_" +
+              id_s,
+            )
             out_lines.push("    %_rcd_rc_" + id_s + " =w loaduw %_rcd_ra_" + id_s)
             out_lines.push("    %_rcd_r1_" + id_s + " =w sub %_rcd_rc_" + id_s + ", 1")
             out_lines.push("    storew %_rcd_r1_" + id_s + ", %_rcd_ra_" + id_s)
@@ -378,7 +843,52 @@ fn irc_process_fn_body(fn_lines : Array[String], out : StringBuilder) -> Unit {
 }
 
 ///|
-/// Inline single-threaded Biased RC fast paths and eliminate static-immortal RC calls
+/// Clean up native QBE SSA RC calls (same-block pair cancellation + multi-def-safe
+/// static immortal RC elimination) with zero new basic blocks. Runs in both dev and
+/// release native builds; never called for wasm32.
+pub fn cleanup_native_rc_ssa(ssa : String) -> String {
+  if !ssa.contains("$pion_rc_inc") && !ssa.contains("$pion_rc_dec") {
+    return ssa
+  }
+  let lines = irc_split_lines(ssa)
+  let out = StringBuilder()
+  let mut i = 0
+  while i < lines.length() {
+    let line = lines[i]
+    let t = irc_trim(line)
+    let is_fn_hdr = (irc_starts_with(t, "export function ") || irc_starts_with(t, "function ")) &&
+      irc_ends_with(t, "{")
+    if is_fn_hdr {
+      out.write_string(line)
+      out.write_char('\n')
+      let body : Array[String] = []
+      i = i + 1
+      while i < lines.length() {
+        let bl = lines[i]
+        if irc_trim(bl) == "}" {
+          break
+        }
+        body.push(bl)
+        i = i + 1
+      }
+      let cleaned = irc_cleanup_fn_body(line, body)
+      irc_emit_lines(cleaned, out)
+      if i < lines.length() {
+        out.write_string(lines[i])
+        out.write_char('\n')
+      }
+    } else {
+      out.write_string(line)
+      out.write_char('\n')
+    }
+    i = i + 1
+  }
+  out.to_string()
+}
+
+///|
+/// Clean up RC calls, apply `Int64` product budget, and inline single-threaded
+/// Biased RC fast paths (including single-threaded frozen `shared_rc` via `phi`)
 /// in native QBE SSA (for release builds; never called for wasm32).
 pub fn inline_native_rc_ssa(ssa : String) -> String {
   if !ssa.contains("$pion_rc_inc") && !ssa.contains("$pion_rc_dec") {
@@ -405,7 +915,12 @@ pub fn inline_native_rc_ssa(ssa : String) -> String {
         body.push(bl)
         i = i + 1
       }
-      irc_process_fn_body(body, out)
+      let cleaned = irc_cleanup_fn_body(line, body)
+      if irc_within_inline_budget(line, cleaned) {
+        irc_expand_fn_body(cleaned, out)
+      } else {
+        irc_emit_lines(cleaned, out)
+      }
       if i < lines.length() {
         out.write_string(lines[i])
         out.write_char('\n')

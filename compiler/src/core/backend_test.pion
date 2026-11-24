@@ -2900,10 +2900,13 @@ test "p30d_inline_native_rc_ssa_phi_and_immortal" {
     #|export function l $demo(l %x, w %cond) {
     #|@start
     #|    %lit =l add $pion_str_0_hdr, 24
+    #|    %lit2 =l copy %lit
+    #|    %none =l add $pion_none_hdr, 24
+    #|    %en =l add $pion_enum_0_hdr, 24
     #|    call $pion_rc_inc(l %lit)
-    #|    call $pion_rc_dec(l %lit)
-    #|    call $pion_rc_inc(l $str_static)
-    #|    call $pion_rc_dec(l $str_static)
+    #|    call $pion_rc_dec(l %lit2)
+    #|    call $pion_rc_inc(l %none)
+    #|    call $pion_rc_dec(l %en)
     #|    jnz %cond, @b1, @b10
     #|@b1
     #|    call $pion_rc_inc(l %x)
@@ -2916,21 +2919,166 @@ test "p30d_inline_native_rc_ssa_phi_and_immortal" {
     #|    ret %res
     #|}
   let out = inline_native_rc_ssa(raw_ssa)
-  // Static immortal string literals must be completely eliminated (zero inc/dec)
+  // Static immortal string/none/enum literals must be completely eliminated (zero inc/dec)
   assert_eq(out.contains("call $pion_rc_inc(l %lit)"), false)
-  assert_eq(out.contains("call $pion_rc_dec(l %lit)"), false)
-  assert_eq(out.contains("call $pion_rc_inc(l $str_static)"), false)
-  assert_eq(out.contains("call $pion_rc_dec(l $str_static)"), false)
-  // Dynamic RC inc/dec must expand with pion_mt_flag + owner_tid + flags + local_rc + destroy_obj
+  assert_eq(out.contains("call $pion_rc_dec(l %lit2)"), false)
+  assert_eq(out.contains("call $pion_rc_inc(l %none)"), false)
+  assert_eq(out.contains("call $pion_rc_dec(l %en)"), false)
+  // Dynamic RC inc/dec must expand with pion_mt_flag + owner_tid + flags + phi(-20/-16) + destroy_obj
   assert_true(out.contains("loaduw $pion_mt_flag"), out)
   assert_true(out.contains("sub %x, 24"), out)
   assert_true(out.contains("sub %x, 10"), out)
   assert_true(out.contains("sub %x, 20"), out)
+  assert_true(out.contains("sub %x, 16"), out)
+  assert_true(out.contains("%_rci_ra_0 =l phi @_rci_st_0 %_rci_la_0, @_rci_imm_0 %_rci_sa_0"), out)
+  assert_true(out.contains("%_rcd_ra_1 =l phi @_rcd_st_1 %_rcd_la_1, @_rcd_imm_1 %_rcd_sa_1"), out)
+  assert_true(out.contains("jnz %_rci_im_0, @_rci_end_0, @_rci_fast_0"), out)
+  assert_true(out.contains("jnz %_rcd_im_1, @_rcd_end_1, @_rcd_fast_1"), out)
   assert_true(out.contains("call $pion_destroy_obj(l %x)"), out)
   // Phi predecessor labels @b1 and @b10 must be remapped cleanly without prefix collision
   assert_true(out.contains("%res =l phi @_rci_end_0 %x, @_rcd_end_1 %lit"), out)
   // Branch targets to block entries @b1 and @b10 must stay unchanged
   assert_true(out.contains("jnz %cond, @b1, @b10"), out)
+}
+
+///|
+test "p87_cleanup_rc_cancel_immortal_and_budget" {
+  // 1. Same-block RC cancellation positive & negative cases
+  let cancel_ssa =
+    #|export function w $cancel_test(l %a, l %b, l %ptr) {
+    #|@start
+    #|    call $pion_rc_inc(l %a)
+    #|    %eq =w call $pion_str_eq(l %a, l %b)
+    #|    %n =w add %eq, 1
+    #|    call $pion_rc_dec(l %a)
+    #|    call $pion_rc_inc(l %a)
+    #|    storew %n, %ptr
+    #|    call $pion_rc_dec(l %a)
+    #|    call $pion_rc_inc(l %b)
+    #|    %ld =w loadw %ptr
+    #|    call $pion_rc_dec(l %b)
+    #|    call $pion_rc_inc(l %a)
+    #|    call $pion_rc_dec(l %b)
+    #|    call $pion_rc_dec(l %a)
+    #|    ret %ld
+    #|}
+  let cleaned = cleanup_native_rc_ssa(cancel_ssa)
+  // First pair around pion_str_eq + add must be cancelled; remaining 3 pairs must stay!
+  assert_true(cleaned.contains("call $pion_str_eq(l %a, l %b)"), cleaned)
+  assert_true(cleaned.contains("storew %n, %ptr"), cleaned)
+  // Count surviving rc_inc(l %a): originally 3, first cancelled -> 2 remain
+  let mut inc_a = 0
+  let mut dec_a = 0
+  let mut inc_b = 0
+  let mut pos = 0
+  while pos < cleaned.length() {
+    let idx = p18_find_from(cleaned, "call $pion_rc_inc(l %a)", pos)
+    if idx < 0 {
+      break
+    }
+    inc_a = inc_a + 1
+    pos = idx + 1
+  }
+  pos = 0
+  while pos < cleaned.length() {
+    let idx = p18_find_from(cleaned, "call $pion_rc_dec(l %a)", pos)
+    if idx < 0 {
+      break
+    }
+    dec_a = dec_a + 1
+    pos = idx + 1
+  }
+  pos = 0
+  while pos < cleaned.length() {
+    let idx = p18_find_from(cleaned, "call $pion_rc_inc(l %b)", pos)
+    if idx < 0 {
+      break
+    }
+    inc_b = inc_b + 1
+    pos = idx + 1
+  }
+  assert_eq(inc_a, 2)
+  assert_eq(dec_a, 2)
+  assert_eq(inc_b, 1)
+
+  // 2. Multi-definition immortal negative test + strict _hdr suffix check
+  // Insert a store between inc/dec of %v so Step 1 doesn't cancel it, isolating Step 2
+  let multidef_ssa2 =
+    #|export function l $multidef2(l %p, l %slot) {
+    #|@start
+    #|    %v =l copy %p
+    #|    call $pion_rc_inc(l %v)
+    #|    storel %v, %slot
+    #|    call $pion_rc_dec(l %v)
+    #|    %v =l add $pion_str_0_hdr, 24
+    #|    %bad1 =l add $str_static, 24
+    #|    call $pion_rc_inc(l %bad1)
+    #|    %bad2 =l add $pion_str_no_suffix, 24
+    #|    call $pion_rc_inc(l %bad2)
+    #|    %good =l add $pion_str_0_hdr, 24
+    #|    call $pion_rc_inc(l %good)
+    #|    ret %v
+    #|}
+  let md_out = cleanup_native_rc_ssa(multidef_ssa2)
+  assert_true(md_out.contains("call $pion_rc_inc(l %v)"), md_out)
+  assert_true(md_out.contains("call $pion_rc_dec(l %v)"), md_out)
+  assert_true(md_out.contains("call $pion_rc_inc(l %bad1)"), md_out)
+  assert_true(md_out.contains("call $pion_rc_inc(l %bad2)"), md_out)
+  assert_eq(md_out.contains("call $pion_rc_inc(l %good)"), false)
+
+  // 3. O(N) reverse-order 500-level copy chain immortal propagation
+  let rev_sb = StringBuilder()
+  rev_sb.write_string("export function l $rev_chain(l %slot) {\n@start\n")
+  let mut ri = 500
+  while ri >= 1 {
+    rev_sb.write_string("    %c")
+    rev_sb.write_string(ri.to_string())
+    rev_sb.write_string(" =l copy %c")
+    rev_sb.write_string((ri - 1).to_string())
+    rev_sb.write_string("\n")
+    ri = ri - 1
+  }
+  rev_sb.write_string("    %c0 =l add $pion_str_0_hdr, 24\n")
+  rev_sb.write_string("    call $pion_rc_inc(l %c500)\n")
+  rev_sb.write_string("    storel %c500, %slot\n")
+  rev_sb.write_string("    call $pion_rc_dec(l %c500)\n")
+  rev_sb.write_string("    ret %c500\n}\n")
+  let rev_out = cleanup_native_rc_ssa(rev_sb.to_string())
+  assert_eq(rev_out.contains("call $pion_rc_inc(l %c500)"), false)
+  assert_eq(rev_out.contains("call $pion_rc_dec(l %c500)"), false)
+
+  // 4. Exact 12L Int64 product budget boundary:
+  // For K blocks with 1 inc + storel + 1 dec and 2 params:
+  //   est_blk = (1 + K) + 13*K = 1 + 14*K
+  //   est_tmp = 2 + 12*(2*K) = 2 + 24*K
+  //   K = 893 -> 12503 * 21434 = 267,989,302 <= 268,435,456 (expands)
+  //   K = 894 -> 12517 * 21458 = 268,589,786 >  268,435,456 (skips; 11L would wrongly expand!)
+  let under_sb = StringBuilder()
+  under_sb.write_string("export function w $under(l %x, l %p) {\n@start\n")
+  let mut bi = 0
+  while bi < 893 {
+    under_sb.write_string("@b")
+    under_sb.write_string(bi.to_string())
+    under_sb.write_string("\n    call $pion_rc_inc(l %x)\n    storel %x, %p\n    call $pion_rc_dec(l %x)\n")
+    bi = bi + 1
+  }
+  under_sb.write_string("    ret 0\n}\n")
+  let under_out = inline_native_rc_ssa(under_sb.to_string())
+  assert_true(under_out.contains("@_rci_fast_0"), "K=893 must expand under 12L budget")
+
+  let over_sb = StringBuilder()
+  over_sb.write_string("export function w $over(l %x, l %p) {\n@start\n")
+  bi = 0
+  while bi < 894 {
+    over_sb.write_string("@b")
+    over_sb.write_string(bi.to_string())
+    over_sb.write_string("\n    call $pion_rc_inc(l %x)\n    storel %x, %p\n    call $pion_rc_dec(l %x)\n")
+    bi = bi + 1
+  }
+  over_sb.write_string("    ret 0\n}\n")
+  let over_out = inline_native_rc_ssa(over_sb.to_string())
+  assert_eq(over_out.contains("@_rci_fast_"), false)
+  assert_true(over_out.contains("call $pion_rc_inc(l %x)"), "K=894 must skip under 12L budget")
 }
 
 ///|
@@ -6090,9 +6238,10 @@ test "p48c_immut_field_index_borrow_and_u8_table_bce" {
     ca_ssa.length() > 0 && !ca_ssa.contains("pion_rc_inc") && !ca_ssa.contains("pion_rc_dec"),
     ca_ssa,
   )
-  // (b) Mutable struct field: MUST retain RC
+  // (b) Mutable struct field with pure local index: Track H3 borrows with 0 rc_inc / 0 rc_dec
+  //     (negative case with call/assign in index is verified in p88_borrow_moveout_ssa)
   assert_true(
-    mb_ssa.length() > 0 && mb_ssa.contains("pion_rc_inc") && mb_ssa.contains("pion_rc_dec"),
+    mb_ssa.length() > 0 && !mb_ssa.contains("pion_rc_inc") && !mb_ssa.contains("pion_rc_dec"),
     mb_ssa,
   )
   // (c) [0, 255] table lookup BCE: 256-entry stable table has 0 pion_panic_oob in fast path
@@ -11143,4 +11292,354 @@ test "p85_r4_no_tc_shift_xpkg_const_and_scalar_method_mono" {
   // keep[T](x, n) & keep_ch[T](x, n) calling builtin scalar methods on n must NOT monomorphize
   assert_true(!has_keep_mono, ssa)
   assert_true(!has_keep_ch_mono, ssa)
+}
+
+///|
+test "qbe native caller inline budget caps huge function and isolates nested closure" {
+  let sb = StringBuilder()
+  sb.write_string("fn tiny_getter(x : Int) -> Int { x + 7 }\n")
+  sb.write_string("fn leaf_helper(x : Int) -> Int {\n")
+  sb.write_string("  let a = x * 3 + 7\n")
+  sb.write_string("  let b = a ^ (x + 11)\n")
+  sb.write_string("  let c = b + a * 2 - 5\n")
+  sb.write_string("  if c > 100 { c - 17 } else { c + 19 }\n")
+  sb.write_string("}\n")
+  sb.write_string("fn opt_helper(x : Int) -> Option[Int] {\n")
+  sb.write_string("  let a = x + 3\n")
+  sb.write_string("  let b = a * 5\n")
+  sb.write_string("  if b > 0 { Some(b + 1) } else { None }\n")
+  sb.write_string("}\n")
+  sb.write_string("fn hof_apply(x : Int, f : (Int) -> Int) -> Int {\n")
+  sb.write_string("  let a = f(x)\n")
+  sb.write_string("  let b = f(a + 1)\n")
+  sb.write_string("  let c = f(b + 2)\n")
+  sb.write_string("  a + b + c\n")
+  sb.write_string("}\n")
+  sb.write_string("pub fn big_dispatch(k : Int) -> Int {\n")
+  sb.write_string("  let mut acc = 0\n")
+  let mut i = 0
+  while i < 80 {
+    sb.write_string("  if k == " + i.to_string() + " {\n")
+    sb.write_string("    acc = acc + leaf_helper(k + " + i.to_string() + ")\n")
+    sb.write_string("    acc = acc + opt_helper(k + " + i.to_string() + ").unwrap_or(0)\n")
+    sb.write_string("    acc = acc + hof_apply(k + " + i.to_string() + ", fn(v : Int) -> Int { let t = v * 2 + 1; t ^ (v + 3) })\n")
+    sb.write_string("    acc = acc + tiny_getter(k + " + i.to_string() + ")\n")
+    sb.write_string("  }\n")
+    i = i + 1
+  }
+  sb.write_string("  acc + tiny_getter(k)\n")
+  sb.write_string("}\n")
+  sb.write_string("fn mid_after_clo(x : Int) -> Int {\n")
+  sb.write_string("  let a = x * 5 + 3\n")
+  sb.write_string("  let b = a ^ (x + 17)\n")
+  sb.write_string("  if b > 50 { b - 9 } else { b + 11 }\n")
+  sb.write_string("}\n")
+  sb.write_string("pub fn outer_with_big_closure(k : Int) -> Int {\n")
+  sb.write_string("  let f = fn(n : Int) -> Int {\n")
+  sb.write_string("    let mut s = n\n")
+  let mut j = 0
+  while j < 60 {
+    sb.write_string("    s = s + leaf_helper(n + " + j.to_string() + ")\n")
+    j = j + 1
+  }
+  sb.write_string("    s\n")
+  sb.write_string("  }\n")
+  sb.write_string("  f(k) + mid_after_clo(k)\n")
+  sb.write_string("}\n")
+  let src = sb.to_string()
+  let cr = check_source_files_full("h1budget", ["main.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let funcs = ssa.split("function ")
+  let mut f_big = ""
+  let mut f_outer = ""
+  let mut fi = 0
+  while fi < funcs.length() {
+    let f = funcs[fi]
+    if f.contains("$pion_fn_big_dispatch(") { f_big = f }
+    if f.contains("$pion_fn_outer_with_big_closure(") { f_outer = f }
+    fi = fi + 1
+  }
+  assert_true(f_big != "" && f_outer != "", ssa)
+  // Once big_dispatch exceeds the native caller inline budget, larger callees
+  // (callee_cost > 12) and multi-call HOFs must fall back to calls, while tiny
+  // getters (callee_cost <= 12) stay inlined throughout the function.
+  assert_true(f_big.contains("call $pion_fn_leaf_helper("), f_big)
+  assert_true(f_big.contains("call $pion_fn_opt_helper("), f_big)
+  assert_true(f_big.contains("call $pion_fn_hof_apply("), f_big)
+  assert_true(!f_big.contains("call $pion_fn_tiny_getter("), f_big)
+  // Nested closure's budget usage must NOT pollute outer_with_big_closure:
+  // mid_after_clo (callee_cost > 12) must still be inlined in outer_with_big_closure.
+  assert_true(!f_outer.contains("call $pion_fn_mid_after_clo("), f_outer)
+}
+
+///|
+test "p88_borrow_moveout_ssa" {
+  let src =
+    #|struct Leaf {
+    #|  mut items : Array[Int]
+    #|  mut tag : String
+    #|  score : Int
+    #|}
+    #|struct Mid {
+    #|  mut leaf : Leaf
+    #|}
+    #|struct Top {
+    #|  mut mid : Mid
+    #|  mut children : Array[Int]
+    #|}
+    #|pub fn mut_field_len(parent : Top) -> Int {
+    #|  parent.children.length()
+    #|}
+    #|pub fn chain_field_len(t : Top) -> Int {
+    #|  t.mid.leaf.items.length()
+    #|}
+    #|pub fn arr_elem_field_len(arr : Array[Leaf], i : Int) -> Int {
+    #|  arr[i].items.length()
+    #|}
+    #|pub fn chain_read_scalar(t : Top) -> Int {
+    #|  t.mid.leaf.score
+    #|}
+    #|pub fn chain_read_heap(t : Top) -> String {
+    #|  t.mid.leaf.tag
+    #|}
+    #|pub fn mut_arr_idx_pure(parent : Top, i : Int) -> Int {
+    #|  parent.children[i]
+    #|}
+    #|fn mutate_and_index(parent : Top) -> Int {
+    #|  parent.children = [99, 100]
+    #|  0
+    #|}
+    #|pub fn mut_arr_idx_call_neg(parent : Top) -> Int {
+    #|  parent.children[mutate_and_index(parent)]
+    #|}
+    #|pub fn block_tail_mut_moveout(n : Int) -> Array[Int] {
+    #|  let mut out : Array[Int] = []
+    #|  out.push(n)
+    #|  out
+    #|}
+    #|pub fn outer_mut_branch_neg(c : Bool) -> Int {
+    #|  let mut x : Array[Int] = [1, 2]
+    #|  let y : Array[Int] = [3, 4]
+    #|  let picked = if c { x } else { y }
+    #|  picked.length() + x.length()
+    #|}
+    #|fn inline_early_ret(cond : Bool, n : Int) -> Array[Int] {
+    #|  let mut a : Array[Int] = []
+    #|  a.push(n)
+    #|  if cond {
+    #|    return a
+    #|  }
+    #|  let mut b : Array[Int] = []
+    #|  b.push(n + 1)
+    #|  b
+    #|}
+    #|pub fn call_inline_early_ret(cond : Bool, n : Int) -> Int {
+    #|  let r = inline_early_ret(cond, n)
+    #|  r.length()
+    #|}
+    #|struct Mutator {
+    #|  target : Top
+    #|}
+    #|fn Mutator::length(self : Mutator) -> Int {
+    #|  self.target.children = [77, 88]
+    #|  0
+    #|}
+    #|pub fn mut_arr_idx_shadow_match_neg(parent : Top, opt : Option[Mutator]) -> Int {
+    #|  let x : String = "outer_str"
+    #|  let _ = x.length()
+    #|  parent.children[match opt { Some(x) => x.length(); None => 0 }]
+    #|}
+    #|pub fn mut_arr_idx_shadow_is_neg(parent : Top, opt : Option[Mutator]) -> Int {
+    #|  let x : String = "outer_str"
+    #|  let _ = x.length()
+    #|  parent.children[if opt is Some(x) { x.length() } else { 0 }]
+    #|}
+    #|pub fn mut_arr_idx_shadow_block_neg(parent : Top, m : Mutator) -> Int {
+    #|  let x : String = "outer_str"
+    #|  let _ = x.length()
+    #|  parent.children[{ let x = m; x.length() }]
+    #|}
+    #|pub fn mut_arr_idx_shadow_is_and_neg(parent : Top, opt : Option[Mutator]) -> Int {
+    #|  let x : String = "outer_str"
+    #|  let _ = x.length()
+    #|  parent.children[if opt is Some(x) && x.length() > 0 { 1 } else { 0 }]
+    #|}
+    #|pub fn drop_owner(box : Array[String], depth : Int) -> Int {
+    #|  if depth > 0 {
+    #|    return drop_owner(box, depth - 1)
+    #|  }
+    #|  box[0].length()
+    #|}
+    #|fn pinned_view_inline(cond : Bool, prefix : String) -> Int {
+    #|  let mut s = prefix + "_payload_123456"
+    #|  let v = s.view(0, 6)
+    #|  if cond {
+    #|    return drop_owner([s], 0) + v.code_unit_at(0)
+    #|  }
+    #|  v.length()
+    #|}
+    #|pub fn call_pinned_view_inline(cond : Bool, prefix : String) -> Int {
+    #|  pinned_view_inline(cond, prefix)
+    #|}
+    #|pub fn pinned_view_non_inline(cond : Bool, prefix : String, depth : Int) -> Int {
+    #|  if depth > 0 {
+    #|    return pinned_view_non_inline(cond, prefix, depth - 1)
+    #|  }
+    #|  let mut s = prefix + "_payload_123456"
+    #|  let v = s.view(0, 6)
+    #|  if cond {
+    #|    return drop_owner([s], 0) + v.code_unit_at(0)
+    #|  }
+    #|  v.length()
+    #|}
+    #|fn make_vmap(seed : Int) -> Map[(Int, Int), Array[Int]] {
+    #|  let m : Map[(Int, Int), Array[Int]] = Map([])
+    #|  m.set((1, 2), [seed, seed + 1])
+    #|  m
+    #|}
+    #|pub fn vmap_owned_unwrap_or(seed : Int, hit : Bool) -> Array[Int] {
+    #|  let m = make_vmap(seed)
+    #|  let k = if hit { (1, 2) } else { (9, 9) }
+    #|  (move m).get(k).unwrap_or([70, 80])
+    #|}
+    #|pub fn main() -> Int { 0 }
+  let cr = check_source_files_with_imports("p88ssa", ["main.pion"], [src], [], true)
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, true).ssa
+  let funcs = ssa.split("function ")
+  let mut f_mut_len = ""
+  let mut f_chain_len = ""
+  let mut f_arr_len = ""
+  let mut f_chain_scalar = ""
+  let mut f_chain_heap = ""
+  let mut f_mut_idx = ""
+  let mut f_mut_idx_neg = ""
+  let mut f_block_move = ""
+  let mut f_outer_neg = ""
+  let mut f_inline_caller = ""
+  let mut f_shadow_match = ""
+  let mut f_shadow_is = ""
+  let mut f_shadow_block = ""
+  let mut f_shadow_is_and = ""
+  let mut f_call_pinned_inline = ""
+  let mut f_pinned_non_inline = ""
+  let mut f_vmap_owned = ""
+  let mut i = 0
+  while i < funcs.length() {
+    let f = funcs[i]
+    if f.contains("_fn_mut_field_len(") { f_mut_len = f }
+    if f.contains("_fn_chain_field_len(") { f_chain_len = f }
+    if f.contains("_fn_arr_elem_field_len(") { f_arr_len = f }
+    if f.contains("_fn_chain_read_scalar(") { f_chain_scalar = f }
+    if f.contains("_fn_chain_read_heap(") { f_chain_heap = f }
+    if f.contains("_fn_mut_arr_idx_pure(") { f_mut_idx = f }
+    if f.contains("_fn_mut_arr_idx_call_neg(") { f_mut_idx_neg = f }
+    if f.contains("_fn_block_tail_mut_moveout(") { f_block_move = f }
+    if f.contains("_fn_outer_mut_branch_neg(") { f_outer_neg = f }
+    if f.contains("_fn_call_inline_early_ret(") { f_inline_caller = f }
+    if f.contains("_fn_mut_arr_idx_shadow_match_neg(") { f_shadow_match = f }
+    if f.contains("_fn_mut_arr_idx_shadow_is_neg(") { f_shadow_is = f }
+    if f.contains("_fn_mut_arr_idx_shadow_block_neg(") { f_shadow_block = f }
+    if f.contains("_fn_mut_arr_idx_shadow_is_and_neg(") { f_shadow_is_and = f }
+    if f.contains("_fn_call_pinned_view_inline(") { f_call_pinned_inline = f }
+    if f.contains("_fn_pinned_view_non_inline(") { f_pinned_non_inline = f }
+    if f.contains("_fn_vmap_owned_unwrap_or(") { f_vmap_owned = f }
+    i = i + 1
+  }
+  assert_true(
+    f_mut_len != "" &&
+      f_chain_len != "" &&
+      f_arr_len != "" &&
+      f_chain_scalar != "" &&
+      f_chain_heap != "" &&
+      f_mut_idx != "" &&
+      f_mut_idx_neg != "" &&
+      f_block_move != "" &&
+      f_outer_neg != "" &&
+      f_inline_caller != "" &&
+      f_shadow_match != "" &&
+      f_shadow_is != "" &&
+      f_shadow_block != "" &&
+      f_shadow_is_and != "" &&
+      f_call_pinned_inline != "" &&
+      f_pinned_non_inline != "" &&
+      f_vmap_owned != "",
+    ssa,
+  )
+  // 1) mut field .length(): zero RC
+  assert_true(!f_mut_len.contains("pion_rc_inc") && !f_mut_len.contains("pion_rc_dec"), f_mut_len)
+  // 2) chained .length(), arr[i].field.length(), chained EField scalar/heap: zero intermediate RC
+  assert_true(!f_chain_len.contains("pion_rc_inc") && !f_chain_len.contains("pion_rc_dec"), f_chain_len)
+  assert_true(!f_arr_len.contains("pion_rc_inc") && !f_arr_len.contains("pion_rc_dec"), f_arr_len)
+  assert_true(!f_chain_scalar.contains("pion_rc_inc") && !f_chain_scalar.contains("pion_rc_dec"), f_chain_scalar)
+  assert_true(f_chain_heap.contains("pion_rc_inc") && !f_chain_heap.contains("pion_rc_dec"), f_chain_heap)
+  // 3) mut field [idx] pure: zero RC; call/shadow negatives: must retain RC (not borrowed)
+  assert_true(!f_mut_idx.contains("pion_rc_inc") && !f_mut_idx.contains("pion_rc_dec"), f_mut_idx)
+  assert_true(f_mut_idx_neg.contains("pion_rc_inc") && f_mut_idx_neg.contains("pion_rc_dec"), f_mut_idx_neg)
+  assert_true(f_shadow_match.contains("pion_rc_inc") && f_shadow_match.contains("pion_rc_dec"), f_shadow_match)
+  assert_true(f_shadow_is.contains("pion_rc_inc") && f_shadow_is.contains("pion_rc_dec"), f_shadow_is)
+  assert_true(f_shadow_block.contains("pion_rc_inc") && f_shadow_block.contains("pion_rc_dec"), f_shadow_block)
+  assert_true(f_shadow_is_and.contains("pion_rc_inc") && f_shadow_is_and.contains("pion_rc_dec"), f_shadow_is_and)
+  // 4) block-tail mut local move-out: zero rc_inc/rc_dec; outer mut in if branch: must keep rc_inc
+  assert_true(!f_block_move.contains("pion_rc_inc") && !f_block_move.contains("pion_rc_dec"), f_block_move)
+  assert_true(f_outer_neg.contains("pion_rc_inc"), f_outer_neg)
+  // 5) inlined early return of mut local: must actually inline AND have zero rc_inc inside caller
+  assert_true(
+    !f_inline_caller.contains("call $pion_fn_inline_early_ret") &&
+      !f_inline_caller.contains("pion_rc_inc"),
+    f_inline_caller,
+  )
+  // 6) pinned stack view across inlined & non-inlined SReturn:
+  //    must actually inline pinned_view_inline, and MUST retain pion_rc_inc on `s` before drop_owner(s)
+  assert_true(
+    !f_call_pinned_inline.contains("call $pion_fn_pinned_view_inline") &&
+      f_call_pinned_inline.contains("pion_rc_inc"),
+    f_call_pinned_inline,
+  )
+  assert_true(f_pinned_non_inline.contains("pion_rc_inc"), f_pinned_non_inline)
+  // 7) composite-key vmap owned `(move m).get(k).unwrap_or(...)` must hit try_get fast path
+  //    AND retain hit value (pion_rc_inc) BEFORE dropping owned map (pion_rc_dec)
+  let try_pos = f_vmap_owned.index_of("call $pion_vmap_try_get_")
+  assert_true(try_pos >= 0, f_vmap_owned)
+  let after_try = f_vmap_owned.slice(try_pos, f_vmap_owned.length())
+  let inc_pos = after_try.index_of("call $pion_rc_inc")
+  let dec_pos = after_try.index_of("call $pion_rc_dec")
+  assert_true(inc_pos >= 0 && dec_pos >= 0 && inc_pos < dec_pos, after_try)
+}
+
+///|
+test "p87_unit_mode_pkg_once_init_ssa" {
+  let src_a =
+    #|extern "C" fn host_eval_x() -> Int
+    #|pub let X : Int = host_eval_x()
+  let src_b =
+    #|pub let Y : Int = X + 100
+    #|pub extern "C" fn ping() -> Int { 7 }
+    #|pub extern "C" fn get_y() -> Int { Y }
+  let prep = match cli_prepare_qbe_units("p87_reent", ["a.pion", "b.pion"], [src_a, src_b]) {
+    Ok(p) => p
+    Err(e) => {
+      assert_true(false, e)
+      return ()
+    }
+  }
+  let ssa_a = emit_qbe_unit_entry_target(prep, 0, true, "amd64_sysv", "main", true)
+  let ssa_b = emit_qbe_unit_entry_target(prep, 1, true, "amd64_sysv", "main", true)
+  // Unit 0 defines the single package-level once wrapper & guard calling both units in order
+  assert_true(
+    ssa_a.contains("data $pion_unit_init_all_p87_reent_guard = align 4 { w 0 }") &&
+      ssa_a.contains("export function $pion_unit_init_all_p87_reent()") &&
+      ssa_a.contains("call $pion_init_consts_0()") &&
+      ssa_a.contains("call $pion_init_consts_1()"),
+    ssa_a,
+  )
+  // Unit 1 must NOT redefine wrapper/guard, and its exports must call the single wrapper
+  assert_true(
+    !ssa_b.contains("data $pion_unit_init_all_p87_reent_guard") &&
+      !ssa_b.contains("export function $pion_unit_init_all_p87_reent()") &&
+      !ssa_b.contains("call $pion_init_consts_0()") &&
+      ssa_b.contains("call $pion_unit_init_all_p87_reent()"),
+    ssa_b,
+  )
 }

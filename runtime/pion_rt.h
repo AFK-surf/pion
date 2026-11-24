@@ -116,6 +116,8 @@ typedef struct PionMap {
 #define PION_HIDDEN
 #endif
 extern PION_HIDDEN uint32_t pion_mt_flag;
+void     pion_enter_mt(void);
+void     pion_once_call(uint32_t *guard, void (*init_fn)(void));
 uint64_t pion_cur_tid(void);
 void*    pion_alloc(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn);
 void*    pion_alloc_uninit(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn);

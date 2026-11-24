@@ -254,9 +254,10 @@ static void
 pmgen()
 {
 	int i;
-	enum PMStat *status;
+	enum PMStat status[NPm];
 
-	status = alloc(npm * sizeof status[0]);
+	assert(npm <= NPm);
+	memset(status, 0, (size_t)npm * sizeof status[0]);
 	assert(!npm || status[npm-1] == ToMove);
 	for (i=0; i<npm; i++)
 		if (status[i] == ToMove)
