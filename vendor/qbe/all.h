@@ -100,7 +100,7 @@ enum {
 #define CON_Z    (Ref){RCon, 1}
 #define TMP(x)   (Ref){RTmp, x}
 #define CON(x)   (Ref){RCon, x}
-#define SLOT(x)  (Ref){RSlot, (x)&0x1fffffff}
+#define SLOT(x)  mkslot(x)
 #define TYPE(x)  (Ref){RType, x}
 #define CALL(x)  (Ref){RCall, x}
 #define MEM(x)   (Ref){RMem, x}
@@ -489,6 +489,13 @@ extern Typ *typ;
 extern Ins insb[NIns], *curi;
 uint32_t hash(char *);
 void die_(char *, char *, ...) __attribute__((noreturn));
+
+static inline Ref mkslot(int s)
+{
+	if (s < -(1 << 28) || s >= (1 << 28))
+		die("qbe: stack slot index out of 29-bit range");
+	return (Ref){RSlot, (uint)s & 0x1fffffffu};
+}
 void *emalloc(size_t);
 void *alloc(size_t);
 void freeall(void);

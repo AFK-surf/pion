@@ -871,7 +871,7 @@ static uchar *matcher[] = {
 /* end of generated code */
 
 static void
-anumber(Num *tn, Blk *b, Con *con)
+anumber(Num *tn, Blk *b, Fn *fn)
 {
 	Ins *i;
 	Num *n;
@@ -880,12 +880,85 @@ anumber(Num *tn, Blk *b, Con *con)
 		if (rtype(i->to) != RTmp)
 			continue;
 		n = &tn[i->to.val];
+		if (i->op == Oshl && i->cls == Kl
+		&& rtype(i->arg[0]) == RTmp && rtype(i->arg[1]) == RCon) {
+			Con *sc = &fn->con[i->arg[1].val];
+			if (sc->type == CBits
+			&& (sc->bits.i == 1 || sc->bits.i == 2 || sc->bits.i == 3)) {
+				Con c = {.type = CBits, .bits.i = 1LL << sc->bits.i};
+				n->l = i->arg[0];
+				n->r = newcon(&c, fn);
+				n->nl = refn(n->l, tn, fn->con);
+				n->nr = 0;
+				n->n = opn(Omul, n->nl, n->nr);
+				continue;
+			}
+		}
 		n->l = i->arg[0];
 		n->r = i->arg[1];
-		n->nl = refn(n->l, tn, con);
-		n->nr = refn(n->r, tn, con);
+		n->nl = refn(n->l, tn, fn->con);
+		n->nr = refn(n->r, tn, fn->con);
 		n->n = opn(i->op, n->nl, n->nr);
 	}
+}
+
+static int
+addcon_disp32(Con *c0, const Con *c1, int m)
+{
+	int64_t base, prod, sum;
+
+	if (m != 1 && c1->type == CAddr)
+		return 0;
+	if (c0->type != CUndef && c0->type == CAddr && c1->type == CAddr)
+		return 0;
+	if (m < 1 || m > 8)
+		return 0;
+	if (c1->bits.i < -(INT64_C(1) << 33) || c1->bits.i > (INT64_C(1) << 33))
+		return 0;
+	base = (c0->type == CUndef) ? 0 : c0->bits.i;
+	if (base < INT32_MIN || base > INT32_MAX)
+		return 0;
+	prod = c1->bits.i * (int64_t)m;
+	sum = base + prod;
+	if (sum < INT32_MIN || sum > INT32_MAX)
+		return 0;
+	if (c0->type == CUndef) {
+		*c0 = *c1;
+		c0->bits.i = sum;
+	} else {
+		if (c1->type == CAddr) {
+			c0->type = CAddr;
+			c0->sym = c1->sym;
+		}
+		c0->bits.i = sum;
+	}
+	return 1;
+}
+
+static uint64_t isel_total_nins;
+
+static int
+slot_disp32_ok(const Con *off, int s, const Fn *fn)
+{
+	uint64_t max_slot_final, max_frame, arg_extra;
+	int64_t v;
+
+	if (s < -(1 << 28) || s >= (1 << 28))
+		return 0;
+	v = (off->type == CUndef) ? 0 : off->bits.i;
+	if (v < INT32_MIN || v > INT32_MAX)
+		return 0;
+	if (isel_total_nins > (UINT64_C(1) << 28) || (uint64_t)fn->ntmp > (UINT64_C(1) << 28))
+		return 0;
+	max_slot_final = (uint64_t)(fn->slot > 0 ? fn->slot : 0)
+		+ 2ULL * ((uint64_t)fn->ntmp + 16ULL * isel_total_nins) + 8ULL;
+	arg_extra = (s < 0) ? 4ULL * (uint64_t)(-(int64_t)s) : 0ULL;
+	if (max_slot_final > (uint64_t)INT32_MAX / 4ULL)
+		return 0;
+	max_frame = 176ULL + 128ULL + 4ULL * max_slot_final + arg_extra;
+	if (max_frame > (uint64_t)INT32_MAX)
+		return 0;
+	return v + (int64_t)max_frame <= INT32_MAX && v - (int64_t)max_frame >= INT32_MIN;
 }
 
 static Ref
@@ -901,7 +974,8 @@ adisp(Con *c, Num *tn, Ref r, Fn *fn, int s)
 			break;
 		runmatch(matcher[Pob], tn, r, v);
 		assert(rtype(v[0]) == RCon);
-		addcon(c, &fn->con[v[0].val], s);
+		if (!addcon_disp32(c, &fn->con[v[0].val], s))
+			break;
 		r = v[1];
 	}
 	return r;
@@ -936,12 +1010,17 @@ amatch(Addr *a, Num *tn, Ref r, Fn *fn)
 	s = 1;
 
 	if (*p < 0 && co.type != CUndef)
-	if (amatch(a, tn, rb, fn))
-		return addcon(&a->offset, &co, 1);
+	if (amatch(a, tn, rb, fn)) {
+		if (!addcon_disp32(&a->offset, &co, 1))
+			return 0;
+		if (rtype(a->base) == RSlot && !slot_disp32_ok(&a->offset, rsval(a->base), fn))
+			return 0;
+		return 1;
+	}
 	if (!req(ro, R)) {
 		assert(rtype(ro) == RCon);
 		c = &fn->con[ro.val];
-		if (!addcon(&co, c, 1))
+		if (!addcon_disp32(&co, c, 1))
 			return 0;
 	}
 	if (!req(rs, R)) {
@@ -964,8 +1043,11 @@ amatch(Addr *a, Num *tn, Ref r, Fn *fn)
 	if (!req(a->base, R)) {
 		assert(rtype(a->base) == RTmp);
 		s = fn->tmp[a->base.val].slot;
-		if (s != -1)
+		if (s != -1) {
+			if (!slot_disp32_ok(&a->offset, s, fn))
+				return 0;
 			a->base = SLOT(s);
+		}
 	}
 	return 1;
 }
@@ -1006,6 +1088,12 @@ amd64_isel(Fn *fn)
 			}
 
 	/* process basic blocks */
+	isel_total_nins = 0;
+	for (b=fn->start; b; b=b->link) {
+		isel_total_nins += b->nins;
+		for (p=b->phi; p; p=p->link)
+			isel_total_nins += p->narg;
+	}
 	n = fn->ntmp;
 	num = emalloc(n * sizeof num[0]);
 	for (b=fn->start; b; b=b->link) {
@@ -1035,7 +1123,7 @@ amd64_isel(Fn *fn)
 			}
 		}
 		memset(num, 0, n * sizeof num[0]);
-		anumber(num, b, fn->con);
+		anumber(num, b, fn);
 		seljmp(b, fn);
 		for (i=&b->ins[b->nins]; i!=b->ins;) {
 			--i;
