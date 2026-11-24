@@ -1770,6 +1770,89 @@ with open(os.path.join(pkg10q2, "pion.toml"), "w") as f:
 r10q2_t = subprocess.run([pionc, "test", pkg10q2], capture_output=True, text=True)
 assert r10q2_t.returncode != 0 and "1 passed; 1 failed" in r10q2_t.stdout, f"10q-2 expected bb PASS + wb FAIL, got:\n{r10q2_t.stdout}\n{r10q2_t.stderr}"
 
+# 10q-2b (Astra Follow-up P0): black-box `a_test.mbt` + `b_test.mbt` share black-box module symbols,
+# while staying isolated from white-box `c_wbtest.mbt`!
+s10q2b = os.path.join(root, "s10q2b")
+o10q2b = os.path.join(root, "o10q2b")
+os.makedirs(s10q2b, exist_ok=True)
+with open(os.path.join(s10q2b, "lib.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10q2b, "a_test.mbt"), "w") as f:
+    f.write('fn assert_true(_v : Bool) -> Unit { abort("custom") }\n')
+with open(os.path.join(s10q2b, "b_test.mbt"), "w") as f:
+    f.write('test "bb_calls_a_assert" { assert_true(true) }\n')
+with open(os.path.join(s10q2b, "c_wbtest.mbt"), "w") as f:
+    f.write('test "wb_calls_builtin_assert" { assert_true(false) }\n')
+r10q2b = run_cli(["--src", s10q2b, "--out", o10q2b, "--target", "native", "--mode", "publish", "--with-tests",
+                  "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q2b.returncode == 0, f"10q-2b publish failed: {r10q2b.returncode}\n{r10q2b.stdout}\n{r10q2b.stderr}"
+pkg10q2b = os.path.join(root, "pkg10q2b")
+os.makedirs(os.path.join(pkg10q2b, "src"), exist_ok=True)
+for fn in os.listdir(o10q2b):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q2b, fn), os.path.join(pkg10q2b, "src", fn))
+with open(os.path.join(pkg10q2b, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q2b"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q2b_t = subprocess.run([pionc, "test", pkg10q2b], capture_output=True, text=True)
+assert r10q2b_t.returncode != 0 and "0 passed; 2 failed" in r10q2b_t.stdout, f"10q-2b expected 0 passed + 2 failed, got:\n{r10q2b_t.stdout}\n{r10q2b_t.stderr}"
+
+# 10q-6 (Astra Follow-up P1-3): multiline top-level `let` in `v.mbt` reports distinct ProbeDisposition lines (2 & 3) AND runs via `pionc run`!
+s10q6 = os.path.join(root, "s10q6")
+o10q6 = os.path.join(root, "o10q6")
+rep10q6 = os.path.join(root, "rep10q6.json")
+os.makedirs(s10q6, exist_ok=True)
+with open(os.path.join(s10q6, "v.mbt"), "w") as f:
+    f.write('pub let n : Int =\n  "x".length() +\n  "ab".length()\n')
+r10q6 = run_cli(["--src", s10q6, "--out", o10q6, "--target", "native", "--mode", "publish",
+                 "--report", rep10q6, "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q6.returncode == 0, f"10q-6 publish failed: {r10q6.returncode}\n{r10q6.stdout}\n{r10q6.stderr}"
+rep6_j = json.load(open(rep10q6))
+pds6 = [(p["file"], p["line"], p["col"]) for p in rep6_j["probe_dispositions"] if p["disposition"] == "rewritten"]
+assert ("v.mbt", 2, 7) in pds6 and ("v.mbt", 3, 8) in pds6, f"10q-6 expected v.mbt:2:7 and v.mbt:3:8, got {pds6}"
+pkg10q6 = os.path.join(root, "pkg10q6")
+os.makedirs(os.path.join(pkg10q6, "src"), exist_ok=True)
+for fn in os.listdir(o10q6):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q6, fn), os.path.join(pkg10q6, "src", fn))
+with open(os.path.join(pkg10q6, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q6"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+with open(os.path.join(pkg10q6, "src", "main.pion"), "w") as f:
+    f.write('pub fn main(_w : World) -> Int { if n != 3 { panic("bad") }; 0 }\n')
+r10q6_run = subprocess.run([pionc, "run", pkg10q6], capture_output=True, text=True)
+assert r10q6_run.returncode == 0, f"10q-6 pionc run failed: {r10q6_run.stderr}"
+
+# 10q-3b (Opus P2-1): assertion args evaluate in MoonBit declaration order (positional -> msg= -> loc=),
+# AND 10q-2c (Opus P2-2): black-box module preserves `#callsite(autofill(loc))` without leaking to white-box!
+s10q7 = os.path.join(root, "s10q7")
+o10q7 = os.path.join(root, "o10q7")
+os.makedirs(s10q7, exist_ok=True)
+with open(os.path.join(s10q7, "lib.mbt"), "w") as f:
+    f.write("pub fn ok() -> Int { 1 }\n")
+with open(os.path.join(s10q7, "af_test.mbt"), "w") as f:
+    f.write(
+        '#callsite(autofill(loc))\n'
+        'fn chk(x : Int, loc~ : SourceLoc) -> String {\n'
+        '  let _ = x\n'
+        '  loc.to_string()\n'
+        '}\n'
+        'test "bb_autofill_and_decl_order" {\n'
+        '  let mut log = ""\n'
+        '  assert_eq(msg={ log = log + "1"; "m" }, { log = log + "2"; 10 }, { log = log + "2"; 10 })\n'
+        '  assert_eq(log, "221")\n'
+        '  let got = chk(6)\n'
+        '  assert_true(got.starts_with("af_test.mbt:"))\n'
+        '}\n'
+    )
+r10q7 = run_cli(["--src", s10q7, "--out", o10q7, "--target", "native", "--mode", "publish", "--with-tests",
+                 "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10q7.returncode == 0, f"10q-7 publish failed: {r10q7.returncode}\n{r10q7.stdout}\n{r10q7.stderr}"
+pkg10q7 = os.path.join(root, "pkg10q7")
+os.makedirs(os.path.join(pkg10q7, "src"), exist_ok=True)
+for fn in os.listdir(o10q7):
+    if fn.endswith(".pion"): shutil.copyfile(os.path.join(o10q7, fn), os.path.join(pkg10q7, "src", fn))
+with open(os.path.join(pkg10q7, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "s10q7"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r10q7_t = subprocess.run([pionc, "test", pkg10q7], capture_output=True, text=True)
+assert r10q7_t.returncode == 0 and "1 passed; 0 failed" in r10q7_t.stdout, f"10q-7 expected 1 passed, got:\n{r10q7_t.stdout}\n{r10q7_t.stderr}"
+
 # 10q-3 (P0-3): `assert_true(true, msg={ n = n + 1; "expected" })` evaluates side effects AND `msg=abort("boom")` fails!
 s10q3 = os.path.join(root, "s10q3")
 o10q3 = os.path.join(root, "o10q3")

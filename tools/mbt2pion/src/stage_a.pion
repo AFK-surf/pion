@@ -376,6 +376,7 @@ pub struct StageAContext {
   active_generics : Map[String, Bool]
   used_idents : Map[String, Bool]
   mut cur_is_test : Bool
+  mut cur_is_blackbox : Bool
   mut self_pkg_name : String
   mut cur_enclosing_fn : String
   mut lift_counter : Int
@@ -412,6 +413,7 @@ pub fn stage_a_context_new(
     active_generics: Map(),
     used_idents: Map(),
     cur_is_test: false,
+    cur_is_blackbox: false,
     self_pkg_name: "",
     cur_enclosing_fn: "top",
     lift_counter: 0,
@@ -1360,12 +1362,25 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       return rty
     }
   }
-  // Local function call `f(...)` -> look up `symtab.fn_ret_types` or `scope_vars` closure return type
+  // Local function call `f(...)` -> look up `symtab.fn_ret_types` (or `blackbox_fn_ret_types` in black-box tests) or `scope_vars` closure return type
   if t.kind == TokenKind::Ident && start + 1 < end && tokens[start + 1].kind == TokenKind::LParen {
     let fname = rename_keyword_ident(t.raw)
-    match ctx.symtab.fn_ret_types.get(fname) {
-      Some(r) => if r.length() > 0 { return r }
-      None => ()
+    if ctx.cur_is_blackbox {
+      match ctx.symtab.blackbox_fn_ret_types.get(fname) {
+        Some(r) => if r.length() > 0 { return r }
+        None => ()
+      }
+      if !ctx.symtab.blackbox_decls.contains(t.raw) {
+        match ctx.symtab.fn_ret_types.get(fname) {
+          Some(r) => if r.length() > 0 { return r }
+          None => ()
+        }
+      }
+    } else {
+      match ctx.symtab.fn_ret_types.get(fname) {
+        Some(r) => if r.length() > 0 { return r }
+        None => ()
+      }
     }
     match lookup_scope_var(ctx, fname) {
       Some(sv) => {
@@ -2101,9 +2116,24 @@ fn lower_call_args(
   }
 
   // Look up callee parameter types for per-use-site expected-type guidance (Wave M1.2 A.5)
-  let callee_pts : Array[(String, String)] = match ctx.symtab.fn_param_types.get(callee_expr) {
-    Some(pts) => pts
-    None => []
+  let callee_pts : Array[(String, String)] = if ctx.cur_is_blackbox {
+    match ctx.symtab.blackbox_fn_param_types.get(callee_expr) {
+      Some(pts) => pts
+      None =>
+      if ctx.symtab.blackbox_decls.contains(callee_expr) {
+        []
+      } else {
+        match ctx.symtab.fn_param_types.get(callee_expr) {
+          Some(pts) => pts
+          None => []
+        }
+      }
+    }
+  } else {
+    match ctx.symtab.fn_param_types.get(callee_expr) {
+      Some(pts) => pts
+      None => []
+    }
   }
   let mut pos_param_idx = 0
   let mut has_explicit_loc = false
@@ -3556,11 +3586,9 @@ fn lower_one_token_or_form(
     let prev_cc = i > 0 && tokens[i - 1].kind == TokenKind::ColonColon
     let is_cur_blackbox = file.ends_with("_test.mbt") && !file.ends_with("_wbtest.mbt")
     let is_shadowed_assert = if is_cur_blackbox {
-      let bb_has = match ctx.symtab.blackbox_file_decls.get(file) {
-        Some(m) => m.contains(t.raw)
-        None => false
-      }
-      bb_has || ctx.lifted_local_fns.contains(name) || (lookup_scope_var(ctx, name) is Some(_))
+      ctx.symtab.blackbox_decls.contains(t.raw) ||
+      ctx.lifted_local_fns.contains(name) ||
+      (lookup_scope_var(ctx, name) is Some(_))
     } else {
       ctx.symtab.local_value_names.contains(t.raw) ||
       ctx.symtab.fn_param_types.contains(t.raw) ||
@@ -3573,7 +3601,13 @@ fn lower_one_token_or_form(
     if !in_pattern && !prev_dot && !prev_cc && !is_shadowed_assert && next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before &&
     (t.raw == "assert_eq" || t.raw == "assert_not_eq" || t.raw == "assert_true" || t.raw == "assert_false" || t.raw == "fail" || t.raw == "inspect") {
       let close_p = find_matching_delim(tokens, next_i)
-      let bind_stmts : Array[String] = []
+      // Opus P2-1: Evaluate assertion arguments in MoonBit parameter declaration order
+      // (positional args first, then `msg=`/`content=`, then `loc=`), matching Moon native & wasm-gc!
+      let pos_binds : Array[String] = []
+      let msg_binds : Array[String] = []
+      let content_binds : Array[String] = []
+      let loc_binds : Array[String] = []
+      let other_binds : Array[String] = []
       let pos_temps : Array[String] = []
       let mut msg_temp = ""
       let mut content_temp = ""
@@ -3595,34 +3629,40 @@ fn lower_one_token_or_form(
           let rhs = lower_expr_range(ctx, tokens, ai + 2, ae, file, false).trim()
           let tmp = fresh_temp(ctx, "aa")
           let ty_ann = if lbl == "msg" || lbl == "content" || lbl == "loc" { " : String" } else { "" }
-          bind_stmts.push("let " + tmp + ty_ann + " = " + rhs + "; ")
+          let stmt = "let " + tmp + ty_ann + " = " + rhs + "; "
           if lbl == "msg" {
             msg_temp = tmp
+            msg_binds.push(stmt)
           } else if lbl == "content" {
             content_temp = tmp
+            content_binds.push(stmt)
           } else if lbl == "loc" {
-            let _ = tmp
+            loc_binds.push(stmt)
           } else {
             has_unsupported_arg = true
+            other_binds.push(stmt)
           }
         } else if ae == ai + 2 && tokens[ai].kind == TokenKind::Ident && tokens[ai + 1].kind == TokenKind::Tilde {
           let lbl = tokens[ai].raw
           let tmp = fresh_temp(ctx, "aa")
           let ty_ann = if lbl == "msg" || lbl == "content" || lbl == "loc" { " : String" } else { "" }
-          bind_stmts.push("let " + tmp + ty_ann + " = " + rename_keyword_ident(lbl) + "; ")
+          let stmt = "let " + tmp + ty_ann + " = " + rename_keyword_ident(lbl) + "; "
           if lbl == "msg" {
             msg_temp = tmp
+            msg_binds.push(stmt)
           } else if lbl == "content" {
             content_temp = tmp
+            content_binds.push(stmt)
           } else if lbl == "loc" {
-            let _ = tmp
+            loc_binds.push(stmt)
           } else {
             has_unsupported_arg = true
+            other_binds.push(stmt)
           }
         } else if ae > ai {
           let rhs = lower_expr_range(ctx, tokens, ai, ae, file, false).trim()
           let tmp = fresh_temp(ctx, "aa")
-          bind_stmts.push("let " + tmp + " = " + rhs + "; ")
+          pos_binds.push("let " + tmp + " = " + rhs + "; ")
           pos_temps.push(tmp)
         }
         ai = ae + 1
@@ -3636,7 +3676,7 @@ fn lower_one_token_or_form(
           "unsupported named argument in assertion `" + t.raw + "`",
         ))
       }
-      let pre = join_str_array(bind_stmts)
+      let pre = join_str_array(pos_binds) + join_str_array(msg_binds) + join_str_array(content_binds) + join_str_array(loc_binds) + join_str_array(other_binds)
       let loc_str = "\"" + file + ":" + t.line.to_string() + "\""
       let msg_suffix = if msg_temp.length() > 0 { " + \": \" + " + msg_temp } else { "" }
       if t.raw == "assert_eq" && pos_temps.length() >= 2 {
@@ -3694,7 +3734,15 @@ fn lower_one_token_or_form(
     // Check function call `foo(...)` — NEVER merge a newline-separated trailing tuple `(a, b)` into a call!
     if !in_pattern && !prev_dot && next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before {
       let close_p = find_matching_delim(tokens, next_i)
-      let needs_loc = ctx.symtab.autofill_loc_fns.contains(t.raw)
+      let needs_loc = if ctx.cur_is_blackbox {
+        if ctx.symtab.blackbox_decls.contains(t.raw) {
+          ctx.symtab.blackbox_autofill_loc_fns.contains(t.raw)
+        } else {
+          ctx.symtab.autofill_loc_fns.contains(t.raw)
+        }
+      } else {
+        ctx.symtab.autofill_loc_fns.contains(t.raw)
+      }
       let is_ext = ctx.symtab.external_tilde_fns.contains(t.raw)
       let call_str = lower_call_args(ctx, tokens, next_i, close_p, file, t.line, t.col, name, needs_loc, is_ext)
       // Check if followed by cascade `..m()`!
@@ -4826,18 +4874,7 @@ fn peek_decl_label(tokens : Array[Token], start_i : Int, n : Int) -> String {
 pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -> Unit {
   for sf in files {
     let is_blackbox = sf.rel_path.ends_with("_test.mbt") && !sf.rel_path.ends_with("_wbtest.mbt")
-    let bb_decls : Map[String, Bool] = if is_blackbox {
-      match ctx.symtab.blackbox_file_decls.get(sf.rel_path) {
-        Some(m) => m
-        None => {
-          let m : Map[String, Bool] = Map()
-          ctx.symtab.blackbox_file_decls[sf.rel_path] = m
-          m
-        }
-      }
-    } else {
-      Map()
-    }
+    let bb_decls : Map[String, Bool] = if is_blackbox { ctx.symtab.blackbox_decls } else { Map() }
     let tokens = lex_moonbit(sf.content)
     let n = tokens.length() - 1
     let mut i = 0
@@ -5037,32 +5074,43 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           if fn_tok.kind == TokenKind::Ident && fn_tok.raw != "init" {
             if is_blackbox {
               bb_decls[fn_tok.raw] = true
+              if next_autofill {
+                ctx.symtab.blackbox_autofill_loc_fns[fn_tok.raw] = true
+              }
             } else {
               if next_autofill {
                 ctx.symtab.autofill_loc_fns[fn_tok.raw] = true
               }
-              if name_i + 1 < n && tokens[name_i + 1].kind == TokenKind::LParen {
-                let cp = find_matching_delim(tokens, name_i + 1)
-                let (pnames, ptys, _) = extract_param_info(ctx, tokens, name_i + 1, cp, sf.rel_path)
-                let pts : Array[(String, String)] = []
-                let mut pk = 0
-                while pk < pnames.length() {
-                  pts.push((pnames[pk], if pk < ptys.length() { ptys[pk] } else { "" }))
-                  pk = pk + 1
-                }
+            }
+            if name_i + 1 < n && tokens[name_i + 1].kind == TokenKind::LParen {
+              let cp = find_matching_delim(tokens, name_i + 1)
+              let (pnames, ptys, _) = extract_param_info(ctx, tokens, name_i + 1, cp, sf.rel_path)
+              let pts : Array[(String, String)] = []
+              let mut pk = 0
+              while pk < pnames.length() {
+                pts.push((pnames[pk], if pk < ptys.length() { ptys[pk] } else { "" }))
+                pk = pk + 1
+              }
+              if is_blackbox {
+                ctx.symtab.blackbox_fn_param_types[fn_tok.raw] = pts
+              } else {
                 ctx.symtab.fn_param_types[fn_tok.raw] = pts
-                if cp + 1 < n && tokens[cp + 1].kind == TokenKind::Arrow {
-                  let mut re = cp + 2
-                  let mut rd = 0
-                  while re < n {
-                    let rk = tokens[re].kind
-                    if rd == 0 && (rk == TokenKind::LBrace || rk == TokenKind::Eq) { break }
-                    if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
-                    else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
-                    re = re + 1
-                  }
-                  let rty = lower_type_tokens(tokens, cp + 2, re, ctx.symtab, ctx.recipes).trim()
-                  if rty.length() > 0 {
+              }
+              if cp + 1 < n && tokens[cp + 1].kind == TokenKind::Arrow {
+                let mut re = cp + 2
+                let mut rd = 0
+                while re < n {
+                  let rk = tokens[re].kind
+                  if rd == 0 && (rk == TokenKind::LBrace || rk == TokenKind::Eq) { break }
+                  if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+                  else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
+                  re = re + 1
+                }
+                let rty = lower_type_tokens(tokens, cp + 2, re, ctx.symtab, ctx.recipes).trim()
+                if rty.length() > 0 {
+                  if is_blackbox {
+                    ctx.symtab.blackbox_fn_ret_types[fn_tok.raw] = rty
+                  } else {
                     ctx.symtab.fn_ret_types[fn_tok.raw] = rty
                   }
                 }
@@ -5129,6 +5177,7 @@ fn check_pion_c_abi_params(p_str : String) -> Bool {
 pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile {
   ctx.lifted_fns.clear()
   ctx.cur_is_test = sf.is_test
+  ctx.cur_is_blackbox = sf.rel_path.ends_with("_test.mbt") && !sf.rel_path.ends_with("_wbtest.mbt")
   let tokens = lex_moonbit(sf.content)
   let n = tokens.length() - 1
   // Pre-populate `ctx.used_idents` with every source identifier so `fresh_temp` NEVER collides!
@@ -5372,11 +5421,22 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
             ""
           }
         }
-        let val_str = lower_expr_range(ctx, tokens, eq_i + 1, expr_end, sf.rel_path, false).trim()
+        let raw_val_str = lower_expr_range(ctx, tokens, eq_i + 1, expr_end, sf.rel_path, false)
+        let mut vs = 0
+        while vs < raw_val_str.length() && (raw_val_str.code_unit_at(vs) == 32 || raw_val_str.code_unit_at(vs) == 9) {
+          vs = vs + 1
+        }
+        let mut ve = raw_val_str.length()
+        while ve > vs {
+          let ch = raw_val_str.code_unit_at(ve - 1)
+          if ch == 32 || ch == 9 || ch == 10 || ch == 13 { ve = ve - 1 } else { break }
+        }
+        let val_str = raw_val_str.slice(vs, ve)
         let (refs, calls, arg_closures) = collect_init_refs_full(tokens, eq_i + 1, expr_end)
         ctx.init_order_seq = ctx.init_order_seq + 1
         let mut_kw = if is_mut { "mut " } else { "" }
-        let code = vis + "let " + mut_kw + pion_name + ty_str + " = " + val_str
+        let eq_sep = if val_str.starts_with("\n") || val_str.starts_with("\r") { " =" } else { " = " }
+        let code = vis + "let " + mut_kw + pion_name + ty_str + eq_sep + val_str
         let init_target = if sf.is_test { ctx.test_init_items } else { ctx.init_items }
         let init_file_lbl = if sf.is_test { "00_init_order_test.pion" } else { "00_init_order.pion" }
         init_target.push(InitItem::{
