@@ -1875,6 +1875,96 @@ emitjtbl(Blk *b, EF *e)
 
 static int resolve_custom_sec(const char *sec_str, const char *secf_str);
 
+typedef struct {
+	uint32_t before, start, end, new_start;
+	size_t first, limit;
+	int aligned;
+} LayoutBlock;
+
+/* Branches are a contiguous suffix of each non-jump-table block.  Start
+ * short and only widen.  Recompute alignment even at original zero pads. */
+static void
+relaxloops(Fn *fn, EF *e, LayoutBlock *blocks)
+{
+	Sec *sec = &E0.secs[E0.cur_text_sec];
+	size_t nf = e->nfixups, r = 0;
+	uint8_t *wide = calloc(nf, 1);
+	uint32_t *next = emalloc(nf * sizeof *next);
+	Buf out = {0};
+	if (!wide)
+		die("elf: out of memory");
+	int changed;
+	do {
+		changed = 0;
+		uint32_t pc = blocks[fn->start->id].before;
+		for (Blk *b = fn->start; b; b = b->link) {
+			LayoutBlock *l = blocks + b->id;
+			if (l->aligned)
+				pc = (uint32_t)align_up(pc, 16);
+			l->new_start = pc;
+			pc += l->end - l->start;
+			uint32_t shrink = 0;
+			for (size_t k = l->first; k < l->limit; k++) {
+				BrFixup *f = e->fixups + k;
+				if (!wide[k])
+					shrink += f->is_cond ? 4u : 3u;
+				next[k] = l->new_start + (f->next_pc - l->start) - shrink;
+			}
+			pc -= shrink;
+		}
+		for (size_t k = 0; k < nf; k++) {
+			int64_t d = (int64_t)blocks[e->fixups[k].target_bid].new_start - (int64_t)next[k];
+			if (!wide[k] && !fits_i8(d)) {
+				wide[k] = 1;
+				changed = 1;
+			}
+		}
+	} while (changed);
+	buf_put(&out, sec->buf.data, blocks[fn->start->id].before);
+	while (r < sec->nrelocs && sec->relocs[r].offset < out.len)
+		r++;
+	for (Blk *b = fn->start; b; b = b->link) {
+		LayoutBlock *l = blocks + b->id;
+		emit_nops(&out, l->new_start - out.len);
+		uint32_t stop = l->end;
+		if (l->first != l->limit) {
+			BrFixup *f = e->fixups + l->first;
+			stop = f->disp_off - (f->is_cond ? 2u : 1u);
+		}
+		while (r < sec->nrelocs && sec->relocs[r].offset < stop) {
+			assert(sec->relocs[r].offset >= l->start);
+			sec->relocs[r].offset = l->new_start + (sec->relocs[r].offset - l->start);
+			r++;
+		}
+		buf_put(&out, sec->buf.data + l->start, stop - l->start);
+		for (size_t k = l->first; k < l->limit; k++) {
+			BrFixup *f = e->fixups + k;
+			int64_t d = (int64_t)blocks[f->target_bid].new_start - (int64_t)next[k];
+			assert(stop == f->disp_off - (f->is_cond ? 2u : 1u));
+			stop = f->next_pc;
+			if (wide[k]) {
+				if (!fits_i32(d))
+					die("elf: branch out of 2GB range in %s", fn->name);
+				if (f->is_cond)
+					buf_put_u8(&out, 0x0f);
+				buf_put_u8(&out, f->is_cond ? (uint8_t)(0x80u | f->cc) : 0xe9);
+				buf_put_u32(&out, (uint32_t)(int32_t)d);
+			} else {
+				assert(fits_i8(d));
+				buf_put_u8(&out, f->is_cond ? (uint8_t)(0x70u | f->cc) : 0xeb);
+				buf_put_u8(&out, (uint8_t)(int8_t)d);
+			}
+			assert(out.len == next[k]);
+		}
+		assert(stop == l->end);
+	}
+	assert(r == sec->nrelocs && out.len <= sec->buf.len);
+	free(sec->buf.data);
+	sec->buf = out;
+	free(wide);
+	free(next);
+}
+
 void
 amd64_elf_fn(Fn *fn)
 {
@@ -1899,6 +1989,7 @@ amd64_elf_fn(Fn *fn)
 	uint64_t fn_start = sec_size(&E0.secs[E0.cur_text_sec]);
 	int exclusive_sec = (fn->lnk.sec == NULL && E0.cur_text_sec != SEC_TEXT
 		&& fn_start == 0 && E0.secs[E0.cur_text_sec].nrelocs == 0);
+	LayoutBlock *layout = emalloc((fn->nblk ? fn->nblk : 1) * sizeof *layout);
 	int has_inner_align = 0;
 	int has_jtbl = 0;
 	uint32_t fn_sym = sym_define(fn->name, E0.cur_text_sec, fn_start, fn->lnk.export, STT_FUNC);
@@ -1950,17 +2041,21 @@ amd64_elf_fn(Fn *fn)
 	int lbl = 0;
 
 	for (Blk *b = fn->start; b; b = b->link) {
+		LayoutBlock *l = layout + b->id;
+		l->aligned = 0;
+		l->before = text_pos();
+		l->first = e.nfixups;
 		if (lbl || b->npred > 1) {
 			uint p;
 			for (p = 0; p < b->npred; p++)
 				if (b->pred[p]->id >= b->id)
 					break;
 			if (p != b->npred) {
-				has_inner_align = 1;
+				l->aligned = has_inner_align = 1;
 				sec_align(E0.cur_text_sec, 16);
 			}
 		}
-		blk_off[b->id] = text_pos();
+		l->start = blk_off[b->id] = text_pos();
 
 		for (Ins *i = b->ins; i != &b->ins[b->nins]; i++)
 			emitins(*i, &e);
@@ -2043,11 +2138,16 @@ amd64_elf_fn(Fn *fn)
 			die("elf: unhandled jump %d", b->jmp.type);
 		}
 		}
+		l->limit = e.nfixups;
+		l->end = text_pos();
 	}
 
 	uint8_t *code = text_buf()->data;
 
-	if (exclusive_sec && !has_inner_align && !has_jtbl && e.nfixups > 0) {
+	if (exclusive_sec && has_inner_align && !has_jtbl && e.nfixups > 0) {
+		relaxloops(fn, &e, layout);
+		code = text_buf()->data;
+	} else if (exclusive_sec && !has_inner_align && !has_jtbl && e.nfixups > 0) {
 		size_t nf = e.nfixups;
 		uint32_t orig_len = text_pos();
 		uint8_t *is_short = calloc(nf, 1);
@@ -2175,6 +2275,7 @@ amd64_elf_fn(Fn *fn)
 
 	E0.syms[fn_sym].size = sec_size(&E0.secs[E0.cur_text_sec]) - fn_start;
 
+	free(layout);
 	free(blk_off);
 	free(e.fixups);
 	free(e.jtfixups);
