@@ -375,6 +375,8 @@ copyref(Fn *fn, Blk *b, Ins *i)
 	if (i->op == Oand
 	&& isconbits(fn, i->arg[1], &v)
 	&& (v > 0 && ((v+1) & v) == 0)
+	&& (rtype(i->arg[0]) != RTmp
+	    || KWIDE(i->cls) <= KWIDE(fn->tmp[i->arg[0].val].cls))
 	&& defwidthle(fn, i->arg[0], bitwidth(v)))
 		return i->arg[0];
 
@@ -472,7 +474,12 @@ phicopyref(Fn *fn, Blk *b, Phi *p)
 	 * without the jump type checks */
 	if (d->s1 == s[1] && d->s2 == s[0]
 	&& d->s1->jmp.type == Jjmp
-	&& d->s2->jmp.type == Jjmp)
+	&& d->s2->jmp.type == Jjmp
+	/* the jnz argument is a w value; do not
+	 * replace a wider (or fp) phi by it */
+	&& KBASE(p->cls) == 0
+	&& (rtype(d->jmp.arg) != RTmp
+	    || KWIDE(p->cls) <= KWIDE(fn->tmp[d->jmp.arg.val].cls)))
 		return d->jmp.arg;
 
 	return R;

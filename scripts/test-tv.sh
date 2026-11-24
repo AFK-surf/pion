@@ -15,11 +15,11 @@ set -eu
 #   4. `qbe-tv --pair` on tests/tv/adversarial (miscompilations): every
 #      pair rejected;
 #   5. tests/tv/qbe_bugs: reproducers of vendor/qbe bugs B1-B6 found by
-#      qbe-tv + differential fuzzing and B7-B12 found by the Lean-model
+#      qbe-tv + differential fuzzing and B7-B13 found by the Lean-model
 #      review, built through text assembly and, where the target has it,
 #      `--obj`, and run against exact expected results; their `-d MG` trace
-#      validated by the strict checker (all but bug1, whose fold is beyond
-#      qbe-tv's completeness, and bug10/bug11c/bug11d, whose slot rewrites
+#      validated by the strict checker (all but bug1 and bug13_phi_width_l,
+#      beyond qbe-tv's completeness, and bug10/bug11c/bug11d, whose slot rewrites
 #      happen before the first traced snapshot or use class s).
 #
 # usage: sh scripts/test-tv.sh <pionc> <qbe>
@@ -173,20 +173,24 @@ printf '%s\n' "$OUT"
 # qbe-tv's completeness, so it is not required to validate; the driver checks
 # it. bug10 (load.c forwarding) and bug11c/d (mem.c promotion of an s store)
 # act before the first traced snapshot and are skipped (slot coalescing,
-# class s); the driver checks them too. Every other reproducer must validate.
+# class s); the driver checks them too. bug13_phi_width_l is unchanged by
+# GVN/GCM, yet qbe-tv rejects it ("phi argument differs"): its `l` 0/1 phi
+# over a w jnz boolean is beyond qbe-tv's completeness, like bug1; the driver
+# and p100_qbe_soundness check it. Every other reproducer must validate.
 for f in bug2_phi_class bug3_dwl_shr32 bug4a_amd64_jnz_l_and bug4b_amd64_jnz_l_neg \
          bug4c_amd64_sel_l_and bug5_amd64_shift_zflag bug6_amd64_shift_imm \
          bug7_dwl_phi_retry bug8_dwl_phi_cycle bug9_gvn_jnz_retl \
-         bug11a_promote_loadsw bug11b_promote_loaduw bug12_cnew_l_result; do
+         bug11a_promote_loadsw bug11b_promote_loaduw bug12_cnew_l_result \
+         bug7b_dwl_nested_cycle bug13_phi_width_w; do
   if ! printf '%s\n' "$OUT" | grep -qx "VALIDATED $f"; then
     echo "FAIL: qbe_bugs trace: $f not validated" >&2
     exit 1
   fi
 done
 if printf '%s\n' "$OUT" | grep -E '^(REJECTED|SKIPPED) ' |
-   grep -Evq '^(REJECTED bug1_dedupjmp_lowbits|SKIPPED (bug10_load_shr_mask|bug11c_promote_s_loadsw|bug11d_promote_s_loaduw)): '; then
+   grep -Evq '^(REJECTED (bug1_dedupjmp_lowbits|bug13_phi_width_l)|SKIPPED (bug10_load_shr_mask|bug11c_promote_s_loadsw|bug11d_promote_s_loaduw)): '; then
   echo "FAIL: qbe_bugs trace: unexpected rejection" >&2
   exit 1
 fi
-echo "qbe_bugs: asm + obj exact, trace 13/13 validated (bug1, bug10, bug11c/d outside qbe-tv's reach)"
+echo "qbe_bugs: asm + obj exact, trace 15/15 validated (bug1, bug10, bug11c/d, bug13_phi_width_l outside qbe-tv's reach)"
 echo "PASS: test-tv"

@@ -1,4 +1,4 @@
-/* Exact-result checks for tests/tv/qbe_bugs/qbe_bugs.ssa (B1-B12). */
+/* Exact-result checks for tests/tv/qbe_bugs/qbe_bugs.ssa (B1-B13). */
 #include <stdint.h>
 #include <stdio.h>
 
@@ -19,6 +19,9 @@ int64_t bug11b_promote_loaduw(int64_t);
 int64_t bug11c_promote_s_loadsw(int32_t);
 int64_t bug11d_promote_s_loaduw(int32_t);
 int64_t bug12_cnew_l_result(int32_t);
+int32_t bug7b_dwl_nested_cycle(int32_t, int32_t, int32_t);
+int64_t bug13_phi_width_l(int32_t);
+int32_t bug13_phi_width_w(int32_t);
 
 static int fails;
 
@@ -132,6 +135,14 @@ main(void)
 		check(what, (int64_t)(uint32_t)lo, bug11d_promote_s_loaduw(lo));
 		snprintf(what, sizeof what, "bug12_cnew_l_result(%d)", lo);
 		check(what, lo < 0, bug12_cnew_l_result(lo));
+		snprintf(what, sizeof what, "bug7b_dwl_nested_cycle(1, 0, %d)", lo);
+		check(what, lo != 0, bug7b_dwl_nested_cycle(1, 0, lo));
+		snprintf(what, sizeof what, "bug7b_dwl_nested_cycle(0, 0, %d)", lo);
+		check(what, 0, bug7b_dwl_nested_cycle(0, 0, lo));
+		snprintf(what, sizeof what, "bug13_phi_width_l(%d)", lo);
+		check(what, lo < 0 ? 2 : 3, bug13_phi_width_l(lo));
+		snprintf(what, sizeof what, "bug13_phi_width_w(%d)", lo);
+		check(what, lo < 0 ? 2 : 3, bug13_phi_width_w(lo));
 	}
 
 	if (fails) {

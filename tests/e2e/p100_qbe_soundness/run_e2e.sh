@@ -1,6 +1,6 @@
 #!/bin/sh
 # P100: QBE soundness regressions found by the Lean-model review of vendor/qbe
-# (tests/tv/qbe_bugs B7-B12):
+# (tests/tv/qbe_bugs B7-B13):
 #   QBE-1 copy.c dwl: a phi refuted in one arm of an `and` (or proved only by
 #         a refuted cycle assumption) must not count as narrow in the other
 #         arm, or `& 65535` is dropped;
@@ -10,12 +10,13 @@
 #         offset masks the bits shifted down from above the stored bytes;
 #   QBE-4 mem.c promote: an l-class loadsw/loaduw of a promoted 4-byte slot
 #         extends 32 -> 64 bits;
-#   QBE-5 copy.c copyref: `=l cnew %w, 0` is not replaced by the w temp.
+#   QBE-5 copy.c copyref: `=l cnew %w, 0` is not replaced by the w temp,
+#         nor (phicopyref, B13) an l 0/1 phi by the w jnz argument.
 # 1. the 10-line pure-Pion QBE-1 reproducer: dev, --release and Wasm32 print
 #    the masked value 22136 (0x5678), not 305419896 (0x12345678);
 # 2. tests/tv/qbe_bugs through the host's text assembly and --obj with exact
 #    results, arm64_apple / amd64_sysv text + --obj all emitted, and the
-#    `qbe -d MG` trace of B7-B9, B11a/b, B12 validated by qbe-tv --strict.
+#    `qbe -d MG` trace of B7-B9, B11a/b, B12, B13 (w) validated by qbe-tv --strict.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -83,13 +84,30 @@ if ! grep -q '=w and %ld\.[0-9]*, 255$' "$TMP_DIR/bug10.le"; then
   exit 1
 fi
 
-# 3. qbe-tv on the real optimiser's trace.
+# B13: the l 0/1 phi stays, the w one still folds into the jnz argument.
+gvn_of() {
+  awk -v fn="$1" '$0 == "**** Function " fn " ****" {f=1} f&&/^> After GVN:/{l=1} l&&/^}/{exit} l{print}' "$TMP_DIR/bugs.mg"
+}
+if ! gvn_of bug13_phi_width_l | grep -q '=l phi '; then
+  gvn_of bug13_phi_width_l >&2
+  echo "FAIL: p100 B13 l phi was replaced" >&2
+  exit 1
+fi
+if gvn_of bug13_phi_width_w | grep -q ' phi '; then
+  gvn_of bug13_phi_width_w >&2
+  echo "FAIL: p100 B13 w phi no longer folds" >&2
+  exit 1
+fi
+
+# 3. qbe-tv on the real optimiser's trace (bug13_phi_width_l: see test-tv.sh,
+#    its unchanged l phi is checked in step 2).
 "$PIONC" build -o "$TMP_DIR/qbe-tv" "$ROOT_DIR/tools/qbe_tv_cli"
 set +e
 TV=$("$TMP_DIR/qbe-tv" --trace "$TMP_DIR/bugs.mg" --strict)
 set -e
-for f in bug7_dwl_phi_retry bug8_dwl_phi_cycle bug9_gvn_jnz_retl \
-         bug11a_promote_loadsw bug11b_promote_loaduw bug12_cnew_l_result; do
+for f in bug7_dwl_phi_retry bug7b_dwl_nested_cycle bug8_dwl_phi_cycle bug9_gvn_jnz_retl \
+         bug11a_promote_loadsw bug11b_promote_loaduw bug12_cnew_l_result \
+         bug13_phi_width_w; do
   if ! printf '%s\n' "$TV" | grep -qx "VALIDATED $f"; then
     printf '%s\n' "$TV" >&2
     echo "FAIL: p100 qbe-tv did not validate $f" >&2
