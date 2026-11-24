@@ -623,8 +623,8 @@ import json, os, stat, subprocess, sys, threading
 bin_path, pionc, compat_dir, root = sys.argv[1:5]
 os.makedirs(root, exist_ok=True)
 
-def run_cli(args):
-    return subprocess.run([bin_path] + args, capture_output=True, text=True)
+def run_cli(args, cwd=None):
+    return subprocess.run([bin_path] + args, capture_output=True, text=True, cwd=cwd)
 
 # 7a. P0-1: preserve mode 0000 file, mode 0751 binary file, symlink, empty dir + reports inside --out
 s1 = os.path.join(root, "s1")
@@ -1277,6 +1277,91 @@ assert {p: open(os.path.join(o10k, p), "rb").read() for p in sorted(os.listdir(o
 assert os.path.isfile(diag_run_10k) and json.load(open(diag_run_10k))["ok"] is False, "10k independent 3rd external --run-report missing or not ok:false"
 
 print("[e2e] PASS: Round 12 Astra P1 suite (pairwise probe_err preserves pre-existing É.json sentinel & OUT, still writes independent external --run-report)")
+
+# 10l. Final Opus P1: dirname("/tmp") must return "/" (not ""), so running from `cd $WORK` with
+#      nonexistent `--out out` and any report flag succeeds (rc=0) instead of EINVAL exit 3!
+w10l = os.path.join(root, "w10l")
+os.makedirs(w10l, exist_ok=True)
+s10l = os.path.join(w10l, "src")
+os.makedirs(s10l, exist_ok=True)
+with open(os.path.join(s10l, "a.mbt"), "w") as f:
+    f.write("pub fn ok10l() -> Int { 10 }\n")
+os.makedirs(os.path.join(w10l, "rep"), exist_ok=True)
+os.makedirs(os.path.join(w10l, "out6"), exist_ok=True)
+
+cases_10l = [
+    ("1_nonexist_out_rel_report", ["--out", "out1", "--report", "r1.json"], "out1", "r1.json", "files_generated"),
+    ("2_nonexist_out_subdir_report", ["--out", "out2", "--report", "rep/r2.json"], "out2", "rep/r2.json", "files_generated"),
+    ("3_nonexist_out_drift", ["--out", "out3", "--drift-ledger", "d3.json"], "out3", "d3.json", "unresolved_entries"),
+    ("4_nonexist_abs_from_cwd", ["--out", os.path.join(w10l, "out4"), "--report", os.path.join(w10l, "r4.json")], "out4", "r4.json", "files_generated"),
+    ("5_nonexist_out_no_report", ["--out", "out5"], "out5", None, None),
+    ("6_exist_out_rel_report", ["--out", "out6", "--report", "r6.json"], "out6", "r6.json", "files_generated"),
+]
+for label, extra, out_rel, rep_rel, rep_key in cases_10l:
+    r = run_cli(["--src", "src", "--target", "native", "--mode", "publish",
+                 "--mbt-compat", compat_dir, "--pionc", pionc] + extra, cwd=w10l)
+    assert r.returncode == 0, f"10l {label} failed (rc={r.returncode}): {r.stdout} {r.stderr}"
+    assert os.path.isfile(os.path.join(w10l, out_rel, "a.pion")), f"10l {label} missing a.pion"
+    if rep_rel is not None:
+        rp = os.path.join(w10l, rep_rel)
+        assert os.path.isfile(rp), f"10l {label} missing report {rep_rel}"
+        assert rep_key in json.load(open(rp)), f"10l {label} report missing key {rep_key}"
+
+print("[e2e] PASS: Final Opus P1 suite (10l: 6/6 fresh/existing --out + report combos from cd $WORK exit 0)")
+
+# 10m. Final Astra P0-1 + P0-2 downstream runtime acceptance:
+#      #cfg(target="js") brace-less decls (tuple struct, = "%identity", extern "js" fn) followed by kept() -> 41,
+#      and wasm_bothbits w() + g() under --target wasm32 (exclusive wasm-gc) -> live `pionc run --target wasm32` prints 41:2!
+s10m = os.path.join(root, "s10m")
+o10m = os.path.join(root, "o10m")
+os.makedirs(s10m, exist_ok=True)
+with open(os.path.join(s10m, "cfg_exec.mbt"), "w") as f:
+    f.write(
+        '#cfg(target="js")\n'
+        'struct Box(Int)\n'
+        '#cfg(target="js")\n'
+        'fn ident(x : Int) -> Int = "%identity"\n'
+        '#cfg(target="js")\n'
+        'extern "js" fn js_f() -> Int = "() => 1"\n'
+        'pub fn kept() -> Int { 41 }\n'
+        '#cfg(target="wasm")\n'
+        'pub fn w() -> Int { 1 }\n'
+        '#cfg(not(target="wasm"))\n'
+        'pub fn w() -> Int { 0 }\n'
+        '#cfg(target="wasm-gc")\n'
+        'pub fn g() -> Int { 2 }\n'
+        '#cfg(not(target="wasm-gc"))\n'
+        'pub fn g() -> Int { 0 }\n'
+    )
+r10m_pub = run_cli(["--src", s10m, "--out", o10m, "--target", "wasm32", "--mode", "publish",
+                    "--mbt-compat", compat_dir, "--pionc", pionc])
+assert r10m_pub.returncode == 0, f"10m wasm32 publish failed: {r10m_pub.returncode} {r10m_pub.stdout} {r10m_pub.stderr}"
+
+pkg10m = os.path.join(root, "pkg10m")
+os.makedirs(os.path.join(pkg10m, "src"), exist_ok=True)
+import shutil
+shutil.copyfile(os.path.join(o10m, "cfg_exec.pion"), os.path.join(pkg10m, "src", "cfg_exec.pion"))
+with open(os.path.join(pkg10m, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "e2e_10m"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+with open(os.path.join(pkg10m, "src", "main.pion"), "w") as f:
+    f.write(
+        'pub fn main(world : World) -> Int {\n'
+        '  let a = kept()\n'
+        '  let b = w() + g()\n'
+        '  io_println(world, a.to_string() + ":" + b.to_string())\n'
+        '  0\n'
+        '}\n'
+    )
+if shutil.which("node"):
+    r10m_run = subprocess.run([pionc, "run", "--target", "wasm32", pkg10m], capture_output=True, text=True)
+    assert r10m_run.returncode == 0, f"10m pionc run --target wasm32 failed: {r10m_run.stdout} {r10m_run.stderr}"
+    assert r10m_run.stdout.strip() == "41:2", f"10m expected '41:2', got {r10m_run.stdout!r}"
+else:
+    r10m_run = subprocess.run([pionc, "run", pkg10m], capture_output=True, text=True)
+    assert r10m_run.returncode == 0, f"10m pionc run failed: {r10m_run.stdout} {r10m_run.stderr}"
+    assert r10m_run.stdout.strip() == "41:2", f"10m expected '41:2', got {r10m_run.stdout!r}"
+
+print("[e2e] PASS: Final Astra P0-1+P0-2 suite (10m: #cfg brace-less decls + exclusive wasm-gc live wasm32 run == 41:2)")
 PY
 
 echo "[e2e] ALL E2E TESTS PASSED!"
