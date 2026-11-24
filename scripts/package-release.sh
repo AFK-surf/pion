@@ -183,7 +183,14 @@ mkdir -p "$WORK"
 
 (
   unset PION_QBE PION_RT_LIB PION_WASM_RT PION_SRC PION_TARGET PION_REGISTRY || true
-  export PION_CACHE_DIR="$VERIFY_DIR/cas"
+  if [ "$IS_WIN" -eq 1 ] && command -v cygpath >/dev/null 2>&1; then
+    WIN_VERIFY_DIR="$(cygpath -m "$VERIFY_DIR")"
+    export PION_CACHE_DIR="$WIN_VERIFY_DIR/cas"
+    WASM_OUT="$WIN_VERIFY_DIR/demo.wasm"
+  else
+    export PION_CACHE_DIR="$VERIFY_DIR/cas"
+    WASM_OUT="$VERIFY_DIR/demo.wasm"
+  fi
   export PATH="$EXTRACTED/bin:$PATH"
   cd "$WORK"
 
@@ -212,7 +219,7 @@ mkdir -p "$WORK"
   }
 
   pionc run >/dev/null
-  pionc build --target wasm32 -o "$VERIFY_DIR/demo.wasm"
+  pionc build --target wasm32 -o "$WASM_OUT"
   if [ ! -s "$VERIFY_DIR/demo.wasm" ]; then
     echo "FAIL: packaged pionc build --target wasm32 produced no output" >&2
     exit 1
