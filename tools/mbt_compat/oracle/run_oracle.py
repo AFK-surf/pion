@@ -67,6 +67,7 @@ CASES = {
     "map.order": ("ok", 3),
     "map.enum_keys": ("ok", 2),
     "double.golden": ("ok", 4),
+    "double.compare_nan": ("ok", 6),
     "double.random": ("ok", 1),
     "div.nonzero": ("ok", 2),
     "collections": ("ok", 3),

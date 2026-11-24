@@ -99,7 +99,7 @@ CASES = {
     "m12_recursive_local_fn": ("ok", 5),
     "m12_per_site_enum": ("ok", 4),
     "m12_pipe_loops_compat": ("ok", 10),
-    "q2_semantics_p0": ("ok", 10),
+    "q2_semantics_p0": ("ok", 12),
     "q2_mechanical_compat": ("ok", 10),
 }
 
@@ -881,6 +881,23 @@ pub fn q2_sameline_div_cascade_and_brace(a : Int, b : Int, x : Double, y : Doubl
   (s1, p_str, braces)
 }
 
+// 6b. Package-defined `fail` must NEVER be rewritten to `mbt_compat::fail` (P0)
+//     and cross-line parenthesized receiver `let d = (7 : Double)\n(d / 2.0).to_string()` (P2)
+pub fn fail(msg : String) -> String {
+  "ok:" + msg
+}
+
+pub fn q2_crossline_paren_tail() -> String {
+  let d = (7 : Double)
+  (d / 2.0).to_string()
+}
+
+pub fn q2_shadowed_fail_and_crossline_paren() -> (String, String) {
+  let r1 = fail("x")
+  let r2 = q2_crossline_paren_tail()
+  (r1, r2)
+}
+
 // 7. Quadrant 2 mechanical & compat:
 //    Double +0.0/-0.0 hash, is_nan/compare/reinterpret_as_int64, Int::lnot,
 //    Array unsafe_get/unsafe_set/is_empty/truncate, Map::new, self.arr[a:b],
@@ -1376,7 +1393,8 @@ fn main {
     let (l1, l2) = @m12.q2_local_fn_order_and_shadow()
     let (pp1, pp2) = @m12.q2_pipe_collision_and_named()
     let (sd1, sd2, sd3) = @m12.q2_sameline_div_cascade_and_brace(-7, 2, 7.0, 2.0, -23)
-    trace("r", "\{a1},\{a2},\{a3},\{t1},\{t2},\{t3},\{t4},\{t5},\{p1},\{p2},\{p3},\{p4},\{l1},\{l2},\{pp1},\{pp2},\{sd1},\{sd2},\{sd3}")
+    let (sf1, cl1) = @m12.q2_shadowed_fail_and_crossline_paren()
+    trace("r", "\{a1},\{a2},\{a3},\{t1},\{t2},\{t3},\{t4},\{t5},\{p1},\{p2},\{p3},\{p4},\{l1},\{l2},\{pp1},\{pp2},\{sd1},\{sd2},\{sd3},\{sf1},\{cl1}")
     check("q2.anon_struct", a1 == 13 && a2 == 25)
     check("q2.boxval_3", a3 == 3)
     check("q2.ascribe_i64_dbl", t1 == 3000000000L && t2 == 3.5 && t3 == -3L && t4 == 1.5 && t5)
@@ -1387,6 +1405,8 @@ fn main {
     check("q2.local_fn_shadow", l2 == 17)
     check("q2.pipe_collision_named", pp1 == 25 && pp2 == 17)
     check("q2.sameline_div_cascade_brace", sd1 == 0 && sd2 == "-3" && sd3 == 2)
+    check("q2.shadowed_fail", sf1 == "ok:x")
+    check("q2.crossline_paren_recv", cl1 == "3.5")
   } else if kase == "q2_mechanical_compat" {
     let (nt1, nt2) = @m12.q2_trailing_tuple_newline(9)
     let tf1 = @m12.q2_tuple_opt_fn(Some((3.0, fn(v) { v * 2.0 })))
@@ -1864,7 +1884,8 @@ pub fn main(w : World) -> Int {
     let (l1, l2) = m12::q2_local_fn_order_and_shadow()
     let (pp1, pp2) = m12::q2_pipe_collision_and_named()
     let (sd1, sd2, sd3) = m12::q2_sameline_div_cascade_and_brace(-7, 2, 7.0, 2.0, -23)
-    trace(w, "r", a1.to_string() + "," + a2.to_string() + "," + a3.to_string() + "," + t1.to_string() + "," + mbt_compat::double_to_string(t2) + "," + t3.to_string() + "," + mbt_compat::double_to_string(t4) + "," + t5.to_string() + "," + p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + p4.to_string() + "," + l1.to_string() + "," + l2.to_string() + "," + pp1.to_string() + "," + pp2.to_string() + "," + sd1.to_string() + "," + sd2 + "," + sd3.to_string())
+    let (sf1, cl1) = m12::q2_shadowed_fail_and_crossline_paren()
+    trace(w, "r", a1.to_string() + "," + a2.to_string() + "," + a3.to_string() + "," + t1.to_string() + "," + mbt_compat::double_to_string(t2) + "," + t3.to_string() + "," + mbt_compat::double_to_string(t4) + "," + t5.to_string() + "," + p1.to_string() + "," + p2.to_string() + "," + p3.to_string() + "," + p4.to_string() + "," + l1.to_string() + "," + l2.to_string() + "," + pp1.to_string() + "," + pp2.to_string() + "," + sd1.to_string() + "," + sd2 + "," + sd3.to_string() + "," + sf1 + "," + cl1)
     check(w, "q2.anon_struct", a1 == 13 && a2 == 25)
     check(w, "q2.boxval_3", a3 == 3)
     check(w, "q2.ascribe_i64_dbl", t1 == 3000000000L && t2 == 3.5 && t3 == -3L && t4 == 1.5 && t5)
@@ -1875,6 +1896,8 @@ pub fn main(w : World) -> Int {
     check(w, "q2.local_fn_shadow", l2 == 17)
     check(w, "q2.pipe_collision_named", pp1 == 25 && pp2 == 17)
     check(w, "q2.sameline_div_cascade_brace", sd1 == 0 && sd2 == "-3" && sd3 == 2)
+    check(w, "q2.shadowed_fail", sf1 == "ok:x")
+    check(w, "q2.crossline_paren_recv", cl1 == "3.5")
   } else if kase == "q2_mechanical_compat" {
     let (nt1, nt2) = m12::q2_trailing_tuple_newline(9)
     let tf1 = m12::q2_tuple_opt_fn(Some((3.0, fn(v) { v * 2.0 })))
