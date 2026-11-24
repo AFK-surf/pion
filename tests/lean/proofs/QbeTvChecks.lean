@@ -1117,12 +1117,13 @@ theorem tgt_pure_c_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I32} 
       · cases hl
 
 theorem skip_tgt_pure_sound {vg : ValGraph} {f : Func} {tvid : Pion.Array Std.I32} {b x0 : Std.I32}
-    {q : Std.I32 × ValGraph} (h : skip_tgt_pure vg f tvid b x0 = ok q) (_hx0 : 0 ≤ x0.val)
+    {q : Std.I32 × ValGraph} (h : skip_tgt_pure vg f tvid b x0 = ok q) (hx0 : 0 ≤ x0.val)
     (hd : ValGraphDAG vg) (hv : VidsOK vg tvid.val) :
     vg_extends vg q.2 ∧ ValGraphDAG q.2 ∧ ∃ B, f.blocks.val[b.val.toNat]? = some B ∧ 0 ≤ b.val ∧
       x0.val ≤ q.1.val ∧ (x0.val ≤ B.insts.val.length → q.1.val ≤ B.insts.val.length) ∧
       ∀ i (hi : i < B.insts.val.length), x0.val.toNat ≤ i → i < q.1.val.toNat →
         PureTgt q.2 tvid.val B.insts.val[i] := by
+  have _ := hx0
   unfold skip_tgt_pure at h
   obtain ⟨B, hB, h1⟩ := bind_eq_ok h
   obtain ⟨hb0, hBl, hBv⟩ := arr_get_ok hB

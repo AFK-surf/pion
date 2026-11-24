@@ -382,7 +382,7 @@ theorem pair_enter {G : ValGraph} {src tgt : Func} {si ti : FnInfo} {svid tvid :
     (hab : SrcAbout G src si svid.val facts.val savail o args env sc sj n s res)
     {tc : Nat} {Bt : Block} {ts : MState W} {schain : List Std.I32}
     (htin : TIn G tgt ti tvid.val tavail env tc Bt ts Bt.insts.val.length schain)
-    {tj : Std.I32} (htj : EdgeTaken o ts.regs Bt.term tj) (_hw : ts.world = s.world)
+    {tj : Std.I32} (htj : EdgeTaken o ts.regs Bt.term tj) (hw : ts.world = s.world)
     {g g' : ValGraph} (hedge : edge_ok g src svid facts tgt tvid (i32n sc) (i32n tc) sj tj = ok (true, g'))
     (hgd : ValGraphDAG g) (hgG : vg_extends g' G) (hgs : VidsOK g svid.val) (hgt : VidsOK g tvid.val)
     (hgf : ∀ fb ∈ facts.val, Valid g fb.vid)
@@ -396,6 +396,7 @@ theorem pair_enter {G : ValGraph} {src tgt : Func} {si ti : FnInfo} {svid tvid :
       restFrom o args src n' sj.val.toNat Bj 0 { regs := R, world := s.world } = some res ∧
       tgt.blocks.val[tj.val.toNat]? = some Btj ∧ execPhis o ts.regs tc Btj.phis.val ts.regs = some R' ∧
       TIn G tgt ti tvid.val tavail env' tj.val.toNat Btj { ts with regs := R' } 0 [sj] ∧ 0 ≤ tj.val := by
+  have _ := hw
   have hlen := CS.wf.len_le
   have tlen := CT.wf.len_le
   obtain ⟨n', Bj, R, hn, hBj, hR, hin, hhist', hrun⟩ := src_enter_about CS hab
@@ -584,7 +585,7 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
     {g vg1 : ValGraph} {sc tc sx1 tx1 : Std.I32} {Bs Bt : Block} {nsi nti : Std.I32}
     {fs : Pion.Array Fact} (st : Step) {r : Sum (Std.I32 × ValGraph) (ValGraph × Std.I32 × Std.I32 × Std.I32 × Std.I32)}
     {vg9 : ValGraph} {sx4 tx3 sj4 tj3 : Std.I32}
-    (hsc0 : 0 ≤ sc.val) (_htc0 : 0 ≤ tc.val) (hsx0 : 0 ≤ sx1.val) (htx0 : 0 ≤ tx1.val)
+    (hsc0 : 0 ≤ sc.val) (htc0 : 0 ≤ tc.val) (hsx0 : 0 ≤ sx1.val) (htx0 : 0 ≤ tx1.val)
     (hBs : Pion.Array.get src.blocks sc = ok Bs) (hBt : Pion.Array.get tgt.blocks tc = ok Bt)
     (hnsi : Pion.Array.length Bs.insts = ok nsi) (hnti : Pion.Array.length Bt.insts = ok nti)
     (hfs : facts_of cert.facts sc = ok fs) (hg1 : GPre cert vg1) (hgg1 : vg_extends g vg1)
@@ -653,6 +654,7 @@ theorem action_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo
           sx1.val.toNat tx1.val.toNat schain →
         MidState G src tgt cert si ti o args res env n sc.val.toNat tc.val.toNat Bs Bt s0 sx4.val.toNat
           tx3.val.toNat sj4 tj3 schain ts1 tx1.val.toNat) := by
+  have _ := htc0
   subst hr
   obtain ⟨hnsi1, hnsi2⟩ := arr_length_ok hnsi
   obtain ⟨hnti1, hnti2⟩ := arr_length_ok hnti
@@ -1004,8 +1006,8 @@ theorem tail_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
     {vg9 vg12 : ValGraph} {sc tc sx4 tx3 sj4 tj3 tc2 tx5 sc2 sx6 : Std.I32}
     {tchain schain tchain2 schain2 : Pion.Array Std.I32} {Bs Bt : Block}
     (hsc0 : 0 ≤ sc.val) (htc0 : 0 ≤ tc.val) (hsx0 : 0 ≤ sx4.val) (htx0 : 0 ≤ tx3.val)
-    (_hBs : src.blocks.val[sc.val.toNat]? = some Bs) (hBt : tgt.blocks.val[tc.val.toNat]? = some Bt)
-    (hg9 : GPre cert vg9) (_hinfo_s : InfoOK src si) (_hinfo_t : InfoOK tgt ti)
+    (hBs : src.blocks.val[sc.val.toNat]? = some Bs) (hBt : tgt.blocks.val[tc.val.toNat]? = some Bt)
+    (hg9 : GPre cert vg9) (hinfo_s : InfoOK src si) (hinfo_t : InfoOK tgt ti)
     (hs1 : (if tj3 >= 0#i32 then do
         let t41 ← (if ((decide (tj3 <= 0#i32)) || (decide (tj3 >= ti.nb))) then ok true
           else do let x ← contains_int tchain tj3; ok x)
@@ -1032,6 +1034,9 @@ theorem tail_sim {G : ValGraph} {src tgt : Func} {cert : Cert} {si ti : FnInfo}
         ∃ env' n' s0' s' ts', RState G src tgt cert si ti o args res N sc2 sx6 tc2 tx5 schain2 env' n' s0' s' ts' ∧
           (TGoal tgt o args res tc2 tx5 ts' →
             ∃ m, restFrom o args tgt m tc.val.toNat Bt tx1 ts1 = some res)) := by
+  have _ := hBs
+  have _ := hinfo_s
+  have _ := hinfo_t
   -- the target part
   have htail : vg_extends vg9 vg12 ∧ GPre cert vg12 ∧ 0 ≤ tc2.val ∧ 0 ≤ tx5.val ∧
       (tj3.val < 0 → tc2 = tc ∧ tx5 = tx3 ∧ tchain2 = tchain) ∧
@@ -2070,10 +2075,13 @@ theorem factOK_restrict {vg vg' : ValGraph} (hp : vg_extends vg vg') {env : SymE
   obtain ⟨-, h1, h2⟩ := h
   exact ⟨hv, by rw [← extends_evI hp env hv]; exact h1, by rw [← extends_evI hp env hv]; exact h2⟩
 
-theorem stable_transport {vg G : ValGraph} (hp : vg_extends vg G) {vids : List Std.I32} (_hv : VidsOK vg vids)
-    {x : Nat} {v sb : Std.I32} (_hx : vids[x]? = some v) (_h0 : 0 ≤ v.val)
+theorem stable_transport {vg G : ValGraph} (hp : vg_extends vg G) {vids : List Std.I32} (hv : VidsOK vg vids)
+    {x : Nat} {v sb : Std.I32} (hx : vids[x]? = some v) (h0 : 0 ≤ v.val)
     (hm : Valid vg v ∧ Indep vg sb v.val.toNat) :
     ∀ env env', AgreeExcept sb env env' → evI G env' v = evI G env v := by
+  have _ := hv
+  have _ := hx
+  have _ := h0
   intro env env' hag
   rw [extends_evI hp env' hm.1, extends_evI hp env hm.1]
   exact hm.2 env env' hag

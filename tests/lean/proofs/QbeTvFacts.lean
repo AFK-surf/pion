@@ -47,9 +47,10 @@ theorem i32_eq_of_val {a b : Std.I32} (h : a.val = b.val) : a = b := i32_ext h
 theorem i32_ne_iff {a b : Std.I32} : a ≠ b ↔ a.val ≠ b.val :=
   ⟨fun h e => h (i32_ext e), fun h e => h (by rw [e])⟩
 
-theorem getElem?_toNat {α : Type} {l : List α} {i : Std.I32} (_h0 : 0 ≤ i.val)
-    (h : i.val.toNat < l.length) : l[i.val.toNat]? = some (l[i.val.toNat]'h) :=
-  List.getElem?_eq_getElem h
+theorem getElem?_toNat {α : Type} {l : List α} {i : Std.I32} (h0 : 0 ≤ i.val)
+    (h : i.val.toNat < l.length) : l[i.val.toNat]? = some (l[i.val.toNat]'h) := by
+  have _ := h0
+  exact List.getElem?_eq_getElem h
 
 /-- A loop over `[i0, n)` that stops early with `inl` or finishes with `inr`: the
 generic shape of every `for` / `while` scan of `validate.pion`. -/
@@ -1630,13 +1631,14 @@ theorem i32_toNat_val {k : Nat} (hk : k < 2147483648) :
   rw [this]; simp
 
 theorem apply_loop1 {vg : ValGraph} {fs : Pion.Array Fact} {mark : Pion.Array Bool} {n0 : Std.I32}
-    (_hd : ValGraphDAG vg) (hn0 : n0.val ≤ vg.nodes.val.length)
+    (hd : ValGraphDAG vg) (hn0 : n0.val ≤ vg.nodes.val.length)
     (hmark : ∀ k : Nat, k < n0.val.toNat → mark.val[k]? = some true → ChildMarked vg mark.val k) :
     ∀ (x : Std.I32 × ValGraph × Pion.Array Std.I32) r,
       apply_facts_loop1 n0 mark fs x.1 x.2.1 x.2.2 = ok r →
       (0 ≤ x.1.val ∧ vg_extends vg x.2.1 ∧ ValGraphDAG x.2.1 ∧ x.2.2.val.length = n0.val.toNat ∧
         MemoOK vg x.2.1 fs.val mark.val x.2.2.val x.1.val.toNat) →
       vg_extends vg r.2.1 ∧ ValGraphDAG r.2.1 ∧ MemoOK vg r.2.1 fs.val mark.val r.2.2.val n0.val.toNat := by
+  have _ := hd
   intro x r h hx
   unfold apply_facts_loop1 at h
   refine loop_ok_inv (fun (x : Std.I32 × ValGraph × Pion.Array Std.I32) =>
@@ -2007,11 +2009,12 @@ theorem m1_neg : ((-1)#i32 : Std.I32).val < 0 := by decide
 /-- `atom_use vg vids cls a`: `a` read at class `cls`, or `-1` for a temp without value. -/
 theorem atom_use_sound {vg : ValGraph} {vids : Pion.Array Std.I32} {cls : Cls} {a : Atom}
     {p : Std.I32 × ValGraph} (h : atom_use vg vids cls a = ok p) (hd : ValGraphDAG vg)
-    (_hv : VidsOK vg vids.val) :
+    (hv : VidsOK vg vids.val) :
     vg_extends vg p.2 ∧ ValGraphDAG p.2 ∧
       (0 ≤ p.1.val → Valid p.2 p.1 ∧ clsOf p.2 p.1 = cls ∧
         (∀ t, a = .Temp t → 0 ≤ t.val ∧ ∃ v, vids.val[t.val.toNat]? = some v ∧ Valid vg v) ∧
         ∀ env, evI p.2 env p.1 = maskC cls (atomSem vg env vids.val a)) := by
+  have _ := hv
   unfold atom_use at h
   cases a with
   | Temp t =>
@@ -3194,13 +3197,14 @@ theorem avail_loop9 {nt : Std.I32} {av : Pion.Array Bool} {sI : Std.I32} {cur : 
 
 /-- Every phi of a successor has an argument on the edge, initialised at the end of the block. -/
 theorem avail_loop10 {np : Std.I32} {f : Func} {sI bI : Std.I32} {cur : Pion.Array Bool}
-    (hb0 : 0 ≤ bI.val) (hb1 : bI.val < 2147483647) (S : Block) (_hs0 : 0 ≤ sI.val)
+    (hb0 : 0 ≤ bI.val) (hb1 : bI.val < 2147483647) (S : Block) (hs0 : 0 ≤ sI.val)
     (hS : f.blocks.val[sI.val.toNat]? = some S) (hnp : np.val = S.phis.val.length) :
     ∀ q r, check_avail_loop10 np f sI bI cur q = ok r → q = 0#i32 →
       match r with
       | .inl e => e ≠ 0#i32
       | .inr _ => ∀ P ∈ S.phis.val, ∃ a, phiArg P bI.val.toNat = some a ∧
           AvailAtom (fun t => cur.val[t]? = some true) a := by
+  have _ := hs0
   intro q r h hq
   unfold check_avail_loop10 at h
   have key := scan_loop (fun q => check_avail_loop10.body np f sI bI cur q) S.phis.val.length
