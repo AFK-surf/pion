@@ -271,13 +271,7 @@ fn drv_parent_dir(path : String) -> String {
   if idx <= 0 {
     return ""
   }
-  let sb = StringBuilder()
-  let mut i = 0
-  while i < idx {
-    sb.write_char(str_code_at(path, i).unsafe_to_char())
-    i = i + 1
-  }
-  sb.to_string()
+  slice_str(path, 0, idx)
 }
 
 ///|
@@ -298,17 +292,11 @@ fn drv_basename_pkg(path : String) -> String {
   while start >= 0 && !drv_is_path_sep(str_code_at(path, start)) {
     start = start - 1
   }
-  let sb = StringBuilder()
   let mut i = start + 1
-  while i < end {
-    let ch = str_code_at(path, i)
-    if ch == 46 {
-      break
-    }
-    sb.write_char(ch.unsafe_to_char())
+  while i < end && str_code_at(path, i) != 46 {
     i = i + 1
   }
-  let name = sb.to_string()
+  let name = slice_str(path, start + 1, i)
   if name.length() == 0 {
     "main"
   } else {
@@ -1505,23 +1493,17 @@ fn drv_cas_record_batch_and_evict(
 ///|
 fn drv_split_lines(s : String) -> Array[String] {
   let out : Array[String] = []
-  let mut cur = StringBuilder()
-  let mut has_any = false
+  let mut start = 0
   let mut i = 0
   while i < s.length() {
-    let c = str_code_at(s, i)
-    if c == 10 {
-      out.push(cur.to_string())
-      cur = StringBuilder()
-      has_any = false
-    } else {
-      cur.write_char(c.unsafe_to_char())
-      has_any = true
+    if str_code_at(s, i) == 10 {
+      out.push(slice_str(s, start, i))
+      start = i + 1
     }
     i = i + 1
   }
-  if has_any {
-    out.push(cur.to_string())
+  if start < s.length() {
+    out.push(slice_str(s, start, s.length()))
   }
   out
 }
@@ -1581,16 +1563,37 @@ fn drv_compute_self_fp(world : World, tag : String) -> String {
 }
 
 ///|
-fn drv_normalize_path(path : String) -> String {
+fn drv_normalize_path(path_in : String) -> String {
+  // A Windows drive path (`C:`, `C:/...`, `C:\...`): `\` is a separator too
+  // and the drive root `C:/` is never popped.
+  let mut path = path_in
+  let mut root = ""
+  if drv_is_drive_abs(path_in) {
+    root = slice_str(path_in, 0, 2) + "/"
+    let rb = StringBuilder()
+    let mut run = 2
+    let mut q = 2
+    while q < path_in.length() {
+      if str_code_at(path_in, q) == 92 {
+        rb.write_string(slice_str(path_in, run, q))
+        rb.write_string("/")
+        run = q + 1
+      }
+      q = q + 1
+    }
+    rb.write_string(slice_str(path_in, run, path_in.length()))
+    path = "/" + rb.to_string()
+  }
   let is_abs = path.length() > 0 && str_code_at(path, 0) == 47
   let parts : Array[String] = []
-  let mut sb = StringBuilder()
+  let mut seg_start = 0
   let mut i = 0
   while i <= path.length() {
     let is_sep = i == path.length() || str_code_at(path, i) == 47
     if is_sep {
-      let seg = sb.to_string()
-      sb = StringBuilder()
+      // Segments are copied as whole byte ranges so UTF-8 names stay intact.
+      let seg = slice_str(path, seg_start, i)
+      seg_start = i + 1
       if seg.length() == 0 || seg == "." {
         ()
       } else if seg == ".." {
@@ -1602,13 +1605,13 @@ fn drv_normalize_path(path : String) -> String {
       } else {
         parts.push(seg)
       }
-    } else {
-      sb.write_char(str_code_at(path, i).unsafe_to_char())
     }
     i = i + 1
   }
   let out = StringBuilder()
-  if is_abs {
+  if root.length() > 0 {
+    out.write_string(root)
+  } else if is_abs {
     out.write_char('/')
   }
   let mut j = 0
@@ -1628,8 +1631,26 @@ fn drv_normalize_path(path : String) -> String {
 }
 
 ///|
+/// True for a Windows drive root or drive-absolute path: `C:`, `C:/...` or
+/// `C:\...` (not `g:repo.git`, an scp-style remote).
+fn drv_is_drive_abs(p : String) -> Bool {
+  if p.length() < 2 || str_code_at(p, 1) != 58 {
+    return false
+  }
+  let c = str_code_at(p, 0)
+  if !((c >= 65 && c <= 90) || (c >= 97 && c <= 122)) {
+    return false
+  }
+  if p.length() == 2 {
+    return true
+  }
+  let s = str_code_at(p, 2)
+  s == 47 || s == 92
+}
+
+///|
 fn drv_resolve_rel_path(base_dir : String, rel : String) -> String {
-  if rel.length() > 0 && str_code_at(rel, 0) == 47 {
+  if rel.length() > 0 && (str_code_at(rel, 0) == 47 || drv_is_drive_abs(rel)) {
     drv_normalize_path(rel)
   } else {
     drv_normalize_path(drv_join_path(base_dir, rel))
@@ -1743,19 +1764,84 @@ fn drv_trim_ws(s : String) -> String {
 }
 
 ///|
-/// Runs `git <args>` without a terminal prompt; stdout is captured (never
-/// mixed into pionc's own JSON output), stderr passes through.
+/// Runs `git <args>` without a terminal prompt and with only the
+/// `file`/`http`/`https`/`ssh` transports allowed (no `ext::` helpers); stdout
+/// is captured and trimmed (never mixed into pionc's own JSON output).
 fn drv_git(world : World, args : Array[String]) -> Result[String, String] {
-  let argv : Array[String] = ["env", "GIT_TERMINAL_PROMPT=0", "git"]
+  match drv_git_raw(world, args) {
+    Ok(out) => Ok(drv_trim_ws(out))
+    Err(e) => Err(e)
+  }
+}
+
+///|
+/// Marker between git's stdout and its captured stderr in a failed run.
+fn drv_git_err_mark() -> String {
+  let rs = 30
+  let sb = StringBuilder()
+  sb.write_char(rs.unsafe_to_char())
+  sb.write_string("PION_GIT_STDERR")
+  sb.write_char(rs.unsafe_to_char())
+  sb.to_string()
+}
+
+///|
+/// Runs `git <args>` like `drv_git` but returns stdout byte for byte (no
+/// trimming; NUL bytes kept). git's stderr never reaches the terminal raw: on
+/// POSIX it is captured and, on failure, appended to the error with every
+/// control character neutralized (`drv_term_safe`); on Windows it is dropped.
+fn drv_git_raw(world : World, args : Array[String]) -> Result[String, String] {
+  let windows = drv_env_str(world, "OS") == "Windows_NT"
+  let argv : Array[String] = if windows {
+    []
+  } else {
+    ["sh", "-c", drv_git_sh_wrap("\"$@\""), "pionc-git"]
+  }
+  argv.push("env")
+  argv.push("GIT_TERMINAL_PROMPT=0")
+  argv.push("GIT_ALLOW_PROTOCOL=file:http:https:ssh")
+  argv.push("git")
   let mut i = 0
   while i < args.length() {
     argv.push(args[i])
     i = i + 1
   }
-  match proc_exec_capture(world, argv) {
-    Ok(out) => Ok(drv_trim_ws(out))
-    Err(e) => Err(e)
+  let r = if windows {
+    match proc_exec_capture_bytes(world, argv) {
+      Ok(b) => Ok(b.to_string())
+      Err(e) => Err(e)
+    }
+  } else {
+    proc_exec_capture(world, argv)
   }
+  match r {
+    Ok(out) => Ok(out)
+    Err(e) => Err(drv_git_err_text(e))
+  }
+}
+
+///|
+/// The `sh` prologue/epilogue around a git command (`$f` holds its stderr):
+/// on failure the stderr is printed after `drv_git_err_mark()`.
+fn drv_git_sh_wrap(cmd : String) -> String {
+  "f=$(mktemp) || exit 125; " +
+  cmd +
+  " 2>\"$f\"; rc=$?; if [ $rc -ne 0 ]; then printf '\\036PION_GIT_STDERR\\036'; cat \"$f\"; fi; rm -f \"$f\"; exit $rc"
+}
+
+///|
+/// A failed wrapped git run as one line: exit status, stdout, then the
+/// captured stderr, every control character neutralized.
+fn drv_git_err_text(e : String) -> String {
+  let m = drv_find_substr(e, drv_git_err_mark(), 0)
+  let msg = if m >= 0 {
+    drv_trim_ws(slice_str(e, 0, m)) +
+    " " +
+    drv_trim_ws(slice_str(e, m + drv_git_err_mark().length(), e.length()))
+  } else {
+    e
+  }
+  drv_trim_ws(drv_term_safe(msg))
 }
 
 ///|
@@ -1793,11 +1879,11 @@ fn drv_cwd(world : World) -> String {
 
 ///|
 fn drv_abs_path(world : World, path : String) -> String {
-  if path.length() > 0 && str_code_at(path, 0) == 47 {
+  if path.length() > 0 && (str_code_at(path, 0) == 47 || drv_is_drive_abs(path)) {
     return drv_normalize_path(path)
   }
   let cwd = drv_cwd(world)
-  if cwd.length() > 0 && str_code_at(cwd, 0) == 47 {
+  if cwd.length() > 0 && (str_code_at(cwd, 0) == 47 || drv_is_drive_abs(cwd)) {
     drv_normalize_path(drv_join_path(cwd, path))
   } else {
     drv_normalize_path(path)
@@ -2152,6 +2238,9 @@ fn drv_git_resolve_rev(
   } else {
     "HEAD^{commit}"
   }
+  if drv_starts_with(spec, "-") {
+    return Err("refusing git revision `" + spec + "`: it must not start with `-`")
+  }
   drv_git(world, ["--git-dir", repo, "rev-parse", "--verify", "--quiet", spec])
 }
 
@@ -2174,10 +2263,16 @@ fn drv_git_fetch_once(
     return Ok(())
   }
   ctx.fetched.set(repo, true)
+  if drv_starts_with(url, "-") {
+    return Err("refusing git URL `" + url + "`: it must not start with `-`")
+  }
   if !fs_is_dir(world, repo) {
     let _ = fs_mkdir_p(world, ctx.git_root + "/repos")
-    let tmp = repo + ".tmp." + drv_tmp_tag(world, repo)
-    match drv_git(world, ["clone", "--quiet", "--mirror", url, tmp]) {
+    let tmp = match drv_mktemp_dir_near(world, repo) {
+      Err(e) => return Err(e)
+      Ok(d) => d
+    }
+    match drv_git(world, ["clone", "--quiet", "--mirror", "--", url, tmp]) {
       Err(e) => {
         drv_rm_rf(world, tmp)
         return Err("git clone " + url + " failed: " + e)
@@ -2207,13 +2302,16 @@ fn drv_git_checkout(
   repo : String,
   rev : String,
 ) -> Result[String, String] {
+  if !lock_is_hex_oid(rev) {
+    return Err("refusing git revision `" + rev + "`: not a full hex commit id")
+  }
   let co = ctx.git_root + "/checkouts/" + rev
   if fs_is_dir(world, co) {
     return Ok(co)
   }
   let _ = fs_mkdir_p(world, ctx.git_root + "/checkouts")
   let tmp = co + ".tmp." + drv_tmp_tag(world, co)
-  match drv_git(world, ["clone", "--quiet", "--shared", "--no-checkout", repo, tmp]) {
+  match drv_git(world, ["clone", "--quiet", "--shared", "--no-checkout", "--", repo, tmp]) {
     Err(e) => {
       drv_rm_rf(world, tmp)
       return Err("git clone of cached mirror failed: " + e)
@@ -2249,6 +2347,11 @@ fn drv_git_dep_dir(
   dep : ManifestDep,
 ) -> Result[String, String] {
   let url = dep.git
+  if drv_starts_with(url, "-") {
+    return Err(
+      "git dependency `" + dep.name + "`: refusing git URL `" + url + "`: it must not start with `-`",
+    )
+  }
   let repo = ctx.git_root + "/repos/" + sha256_hex(url) + ".git"
   let reference = manifest_dep_ref(dep)
   let mut rev = match lock_find(ctx.new_lock, dep) {
@@ -2258,6 +2361,11 @@ fn drv_git_dep_dir(
         Some(e) => e.rev
         None => ""
       }
+  }
+  if rev.length() > 0 && !lock_is_hex_oid(rev) {
+    return Err(
+      "git dependency `" + dep.name + "`: locked rev `" + rev + "` is not a full hex commit id",
+    )
   }
   let co_ready = rev.length() > 0 &&
     fs_is_dir(world, ctx.git_root + "/checkouts/" + rev)
@@ -7784,59 +7892,446 @@ fn drv_registry_cache_root(world : World) -> String {
 }
 
 ///|
-/// A registry given as a relative local path is made absolute (it is written
-/// into `pion.toml`); URLs and absolute paths are kept as they are.
-fn drv_abs_registry(world : World, url : String) -> String {
-  if url.length() == 0 ||
-    drv_find_substr(url, "://", 0) >= 0 ||
-    str_code_at(url, 0) == 47 ||
-    drv_starts_with(url, "git@") {
-    return url
+/// The official registry, used when neither `--registry`, `[registry] url`
+/// nor `$PION_REGISTRY` names one.
+fn drv_default_registry() -> String {
+  "https://github.com/AFK-surf/pion-packages.git"
+}
+
+///|
+/// `pionc search` reuses a registry mirror whose last successful clone/fetch
+/// is younger than this (10 minutes); `add`/`update` always refresh.
+fn drv_registry_ttl_ms() -> Int64 {
+  600000L
+}
+
+///|
+/// A URL (`scheme://...`) or an scp-style `[user@]host:path` (a `:` before
+/// any `/`, not a Windows drive letter `C:`): kept as is. Anything else is a
+/// local path.
+fn drv_registry_is_remote(url : String) -> Bool {
+  if drv_find_substr(url, "://", 0) >= 0 {
+    return true
   }
-  let pwd = drv_env_str(world, "PWD")
-  if pwd.length() == 0 {
+  let colon = drv_find_substr(url, ":", 0)
+  if colon <= 0 {
+    return false
+  }
+  let slash = drv_find_substr(url, "/", 0)
+  if slash >= 0 && slash < colon {
+    return false
+  }
+  let bslash = drv_find_substr(url, "\\", 0)
+  if bslash >= 0 && bslash < colon {
+    return false
+  }
+  !drv_is_drive_abs(url)
+}
+
+///|
+/// A registry given as a local path is made absolute against `base_dir` (an
+/// absolute directory) and normalized; URLs are kept as they are.
+fn drv_norm_registry(base_dir : String, url : String) -> String {
+  if drv_registry_is_remote(url) {
     url
   } else {
-    drv_resolve_rel_path(pwd, url)
+    drv_resolve_rel_path(base_dir, url)
   }
 }
 
 ///|
+/// ASCII-only lower-casing; every other byte (UTF-8 included) is kept as is.
+fn drv_ascii_lower(s : String) -> String {
+  let n = s.length()
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c >= 65 && c <= 90 {
+      break
+    }
+    i = i + 1
+  }
+  if i == n {
+    return s
+  }
+  let sb = StringBuilder()
+  let mut run = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c >= 65 && c <= 90 {
+      sb.write_string(slice_str(s, run, i))
+      sb.write_char((c + 32).unsafe_to_char())
+      run = i + 1
+    }
+    i = i + 1
+  }
+  sb.write_string(slice_str(s, run, n))
+  sb.to_string()
+}
+
+///|
+/// Where a registry command reads its index from: `url` (a URL as given, a
+/// local path made absolute and normalized) and the level that chose it
+/// (`flag` / `manifest` / `env` / `default`), or a stable error `code`.
+struct DrvRegistryPick {
+  url : String
+  source : String
+  code : String
+  error : String
+}
+
+///|
+fn drv_registry_pick_err(code : String, error : String) -> DrvRegistryPick {
+  DrvRegistryPick::{ url: "", source: "", code: code, error: error }
+}
+
+///|
+/// The registry source shared by `pionc add` and `pionc search`, in fixed
+/// priority order:
+/// 1. `flag` (`--registry`; a local path is relative to the working directory),
+/// 2. `manifest_url` (`[registry] url`; a local path is relative to
+///    `manifest_dir`, the absolute directory of that `pion.toml`),
+/// 3. `$PION_REGISTRY` (empty = unset; `none` / `off`, any case, disable the
+///    default registry with `E_REGISTRY_DISABLED`; a local path is relative to
+///    the working directory),
+/// 4. the official registry `drv_default_registry()`.
+/// A location starting with `-` is refused (`E_INVALID_ARGS`) so it can never
+/// reach `git` as an option.
+fn drv_pick_registry(
+  world : World,
+  flag : String,
+  manifest_dir : String,
+  manifest_url : String,
+) -> DrvRegistryPick {
+  let mut raw = ""
+  let mut base = ""
+  let mut source = ""
+  if flag.length() > 0 {
+    raw = flag
+    source = "flag"
+  } else if manifest_url.length() > 0 {
+    raw = manifest_url
+    base = manifest_dir
+    source = "manifest"
+  } else {
+    let env = drv_env_str(world, "PION_REGISTRY")
+    if env.length() > 0 {
+      let low = drv_ascii_lower(env)
+      if low == "none" || low == "off" {
+        return drv_registry_pick_err(
+          "E_REGISTRY_DISABLED",
+          "$PION_REGISTRY=" +
+          env +
+          " disables the default registry; pass --registry <url_or_path> or set [registry] url in pion.toml",
+        )
+      }
+      raw = env
+      source = "env"
+    } else {
+      raw = drv_default_registry()
+      source = "default"
+    }
+  }
+  if drv_starts_with(raw, "-") {
+    return drv_registry_pick_err(
+      "E_INVALID_ARGS",
+      "refusing registry `" + raw + "`: a registry URL or path must not start with `-`",
+    )
+  }
+  if drv_registry_is_remote(raw) {
+    return DrvRegistryPick::{ url: raw, source: source, code: "", error: "" }
+  }
+  if base.length() == 0 {
+    base = drv_abs_path(world, ".")
+  }
+  DrvRegistryPick::{
+    url: drv_norm_registry(base, raw),
+    source: source,
+    code: "",
+    error: "",
+  }
+}
+
+///|
+/// Bare mirror of the (normalized) registry `url`, shared by `add`, `update`
+/// and `search`: `<registry cache>/<sha256(url)>.git`.
+fn drv_registry_repo_path(world : World, url : String) -> String {
+  drv_registry_cache_root(world) + "/" + sha256_hex(url) + ".git"
+}
+
+///|
+/// Stamp inside a registry mirror: wall-clock milliseconds of its last
+/// successful clone/fetch (a failed fetch never renews it).
+fn drv_registry_stamp_path(repo : String) -> String {
+  repo + "/.pion_last_fetch"
+}
+
+///|
+fn drv_registry_stamp(world : World, repo : String) -> Unit {
+  let _ = drv_write_text_atomic(
+    world,
+    drv_registry_stamp_path(repo),
+    clock_now_ms(world).to_string() + "\n",
+  )
+}
+
+///|
+fn drv_registry_has_mirror(world : World, repo : String) -> Bool {
+  fs_is_dir(world, repo) && fs_exists(world, repo + "/HEAD")
+}
+
+///|
+/// The commit the mirror's `HEAD` resolves to, or "" when there is no usable
+/// mirror (missing, empty, or `HEAD` naming a branch that is gone).
+fn drv_registry_mirror_oid(world : World, repo : String) -> String {
+  if !drv_registry_has_mirror(world, repo) {
+    return ""
+  }
+  match drv_git(world, ["--git-dir", repo, "rev-parse", "--verify", "--quiet", "HEAD^{commit}"]) {
+    Ok(o) => o
+    Err(_) => ""
+  }
+}
+
+///|
+/// Points the mirror's `HEAD` at the upstream default branch (a mirror clone
+/// never follows a later switch on its own, and `fetch --prune` deletes the
+/// old branch once upstream drops it).
+/// Upstream `HEAD` is either a branch (`ref: refs/heads/<b>\tHEAD` plus its
+/// `<oid>\tHEAD`) or detached (`<oid>\tHEAD` only); either way the mirror
+/// publishes the advertised commit as its detached `HEAD`. An upstream `HEAD`
+/// that names no commit (nothing advertised) is an error, so a stale branch is
+/// never taken for a successful refresh.
+fn drv_registry_sync_head(
+  world : World,
+  repo : String,
+  old_oid : String,
+) -> Result[Unit, String] {
+  let out = match drv_git(world, ["--git-dir", repo, "ls-remote", "--symref", "origin", "HEAD"]) {
+    Err(e) => return Err(e)
+    Ok(o) => o
+  }
+  let lines = drv_split_char(out, 10)
+  let mut target = ""
+  let mut oid = ""
+  let mut li = 0
+  while li < lines.length() {
+    let ln = drv_trim_ws(lines[li])
+    let tab = drv_find_substr(ln, "\t", 0)
+    if tab > 0 && slice_str(ln, tab + 1, ln.length()) == "HEAD" {
+      let left = slice_str(ln, 0, tab)
+      if drv_starts_with(left, "ref: refs/heads/") {
+        target = slice_str(left, 5, left.length())
+      } else if lock_is_hex_oid(left) {
+        oid = left
+      }
+    }
+    li = li + 1
+  }
+  if oid.length() == 0 {
+    return Err("upstream HEAD names no commit")
+  }
+  // The advertised commit must be local before publishing: a detached
+  // upstream HEAD outside every ref, or a branch moved after the fetch,
+  // needs one explicit fetch.
+  if !drv_git_has_commit(world, repo, oid) {
+    let spec = if target.length() > 0 { "+" + target + ":" + target } else { "HEAD" }
+    match drv_git(world, ["--git-dir", repo, "fetch", "--quiet", "--", "origin", spec]) {
+      Err(e) => return Err(e)
+      Ok(_) => ()
+    }
+    if !drv_git_has_commit(world, repo, oid) {
+      return Err("upstream HEAD commit " + oid + " is not available")
+    }
+  }
+  // Publishing is one atomic compare-and-swap with no network: every failure
+  // above leaves the old detached HEAD in place (search then reports
+  // `stale`), and a slower refresh never overwrites a newer concurrent one.
+  match drv_git(world, ["--git-dir", repo, "update-ref", "--no-deref", "HEAD", oid, old_oid]) {
+    Err(_) =>
+      if drv_registry_mirror_oid(world, repo) != oid {
+        return Err("registry mirror updated concurrently")
+      }
+    Ok(_) => ()
+  }
+  if drv_registry_mirror_oid(world, repo) != oid {
+    return Err("mirror HEAD does not match upstream HEAD " + oid)
+  }
+  Ok(())
+}
+
+///|
+extern "C" fn c_fs_mkdir_excl(path : Ptr) -> Int = "pion_fs_mkdir_excl"
+
+///|
+extern "C" fn c_fs_trylock(path : Ptr) -> Int64 = "pion_fs_trylock"
+
+///|
+extern "C" fn c_fs_unlock(handle : Int64) -> Unit = "pion_fs_unlock"
+
+///|
+/// Creates a fresh, exclusively owned temporary directory next to `path`
+/// with the runtime's native exclusive `mkdir` (no subprocess, no shell):
+/// up to 32 process-unique candidate names, else an error.
+fn drv_mktemp_dir_near(world : World, path : String) -> Result[String, String] {
+  let mut k = 0
+  while k < 32 {
+    let cand = path + ".tmp." + drv_tmp_tag(world, path + "#" + k.to_string()) + "." + k.to_string()
+    if c_fs_mkdir_excl(str_data_ptr(cand)) == 0 {
+      return Ok(cand)
+    }
+    k = k + 1
+  }
+  Err("cannot create a temporary directory next to " + path)
+}
+
+///|
+/// True when the mirror was successfully fetched less than
+/// `drv_registry_ttl_ms()` ago.
+fn drv_registry_is_fresh(world : World, repo : String) -> Bool {
+  if !drv_registry_has_mirror(world, repo) {
+    return false
+  }
+  let stamp = match fs_read(world, drv_registry_stamp_path(repo)) {
+    Ok(t) => drv_parse_pos_int64(drv_trim_ws(t), 0L)
+    Err(_) => 0L
+  }
+  if stamp <= 0L {
+    return false
+  }
+  let now = clock_now_ms(world)
+  now >= stamp && now - stamp < drv_registry_ttl_ms()
+}
+
+///|
 /// Clones or fetches (once per run) the registry index repository `url` into
-/// its bare mirror and returns the mirror's path.
+/// its bare mirror, re-points the mirror's `HEAD` at the upstream default
+/// branch, and returns the mirror's path. Only a run that leaves `HEAD`
+/// resolving to a commit renews the mirror's fetch stamp.
 fn drv_registry_sync(
   world : World,
   url : String,
   fetched : Map[String, Bool],
 ) -> Result[String, String] {
   let root = drv_registry_cache_root(world)
-  let repo = root + "/" + sha256_hex(url) + ".git"
+  let repo = drv_registry_repo_path(world, url)
   if fetched.contains(repo) {
     return Ok(repo)
   }
   fetched.set(repo, true)
-  if !fs_is_dir(world, repo) {
+  if drv_starts_with(url, "-") {
+    return Err("refusing registry `" + url + "`: it must not start with `-`")
+  }
+  let existing = fs_is_dir(world, repo)
+  if !existing || drv_registry_mirror_oid(world, repo).length() == 0 {
+    // No usable mirror (none, or an empty / broken one from earlier): clone
+    // a fresh one aside and only put it in place once it has a commit.
     let _ = fs_mkdir_p(world, root)
-    let tmp = repo + ".tmp." + drv_tmp_tag(world, repo)
-    match drv_git(world, ["clone", "--quiet", "--mirror", url, tmp]) {
+    let tmp = match drv_mktemp_dir_near(world, repo) {
+      Err(e) => return Err(e)
+      Ok(d) => d
+    }
+    match drv_git(world, ["clone", "--quiet", "--mirror", "--", url, tmp]) {
       Err(e) => {
         drv_rm_rf(world, tmp)
         return Err("cannot clone registry " + url + ": " + e)
       }
       Ok(_) => ()
     }
-    if !fs_rename(world, tmp, repo) {
+    // A mirror is born with a detached HEAD: its only published reference.
+    let init_oid = drv_registry_mirror_oid(world, tmp)
+    if init_oid.length() == 0 {
+      drv_rm_rf(world, tmp)
+      return Err("registry " + url + " has no commit on its default branch")
+    }
+    match drv_git(world, ["--git-dir", tmp, "update-ref", "--no-deref", "HEAD", init_oid]) {
+      Err(e) => {
+        drv_rm_rf(world, tmp)
+        return Err("cannot detach the HEAD of registry mirror " + tmp + ": " + e)
+      }
+      Ok(_) => ()
+    }
+    if existing {
+      // Replacing is mutually exclusive (a kernel file lock, released even if
+      // this process dies) and re-checked under the lock: a mirror repaired
+      // concurrently wins. The lock file itself is never removed.
+      // Bound to a local so the C string outlives the call (a temporary would
+      // be released before c_fs_trylock reads it).
+      let lock_path = repo + ".replace.flock"
+      let lk = c_fs_trylock(str_data_ptr(lock_path))
+      if lk < 0L {
+        drv_rm_rf(world, tmp)
+        return Err("registry mirror " + repo + " is being replaced concurrently")
+      }
+      if fs_is_dir(world, repo) && drv_registry_mirror_oid(world, repo).length() > 0 {
+        c_fs_unlock(lk)
+        drv_rm_rf(world, tmp)
+        return Err("registry mirror " + repo + " replaced concurrently")
+      }
+      let bak = tmp + ".old"
+      let moved_old = !fs_is_dir(world, repo) || fs_rename(world, repo, bak)
+      let ok = moved_old && fs_rename(world, tmp, repo)
+      let mut kept = ""
+      if ok {
+        drv_rm_rf(world, bak)
+      } else if moved_old && fs_is_dir(world, bak) {
+        if fs_rename(world, bak, repo) {
+          drv_rm_rf(world, bak)
+        } else {
+          // Rollback failed: the old mirror survives only as `bak`; keep it.
+          kept = " (backup preserved at " + bak + ")"
+        }
+      }
+      c_fs_unlock(lk)
+      if !ok {
+        drv_rm_rf(world, tmp)
+        return Err("cannot replace the unusable registry mirror " + repo + kept)
+      }
+    } else if !fs_rename(world, tmp, repo) {
       drv_rm_rf(world, tmp)
       if !fs_is_dir(world, repo) {
         return Err("failed to move registry mirror into " + repo)
       }
+      return Ok(repo)
     }
-    return Ok(repo)
+  } else {
+    // The published snapshot is the mirror's detached HEAD (also its GC
+    // root); a fetch never moves it. A mirror from an older pionc may still
+    // have a symbolic HEAD: detach it once, compare-and-swap against the
+    // value just read so a concurrent publish is never overwritten.
+    let old_oid = drv_registry_mirror_oid(world, repo)
+    if old_oid.length() == 0 {
+      return Err("registry mirror " + repo + " changed concurrently")
+    }
+    match drv_git(world, ["--git-dir", repo, "symbolic-ref", "--quiet", "HEAD"]) {
+      Ok(_) =>
+        match drv_git(world, ["--git-dir", repo, "update-ref", "--no-deref", "HEAD", old_oid, old_oid]) {
+          Err(e) => return Err("cannot detach the HEAD of registry mirror " + repo + ": " + e)
+          Ok(_) => ()
+        }
+      Err(_) => ()
+    }
+    // One fetch; --prune only touches branches and tags.
+    match drv_git(
+      world,
+      [
+        "--git-dir", repo, "fetch", "--quiet", "--prune", "--", "origin", "+refs/heads/*:refs/heads/*",
+        "+refs/tags/*:refs/tags/*",
+      ],
+    ) {
+      Err(e) => return Err("cannot fetch registry " + url + ": " + e)
+      Ok(_) => ()
+    }
+    match drv_registry_sync_head(world, repo, old_oid) {
+      Err(e) => return Err("cannot read the default branch of registry " + url + ": " + e)
+      Ok(_) => ()
+    }
   }
-  match drv_git(world, ["--git-dir", repo, "fetch", "--quiet", "--prune", "origin"]) {
-    Err(e) => Err("cannot fetch registry " + url + ": " + e)
-    Ok(_) => Ok(repo)
+  if drv_registry_mirror_oid(world, repo).length() == 0 {
+    return Err("registry " + url + " has no commit on its default branch")
   }
+  drv_registry_stamp(world, repo)
+  Ok(repo)
 }
 
 ///|
@@ -7881,6 +8376,1366 @@ fn drv_cmd_fail(world : World, as_json : Bool, msg : String) -> Int {
     io_eprintln(world, "error: " + msg)
   }
   1
+}
+
+///|
+/// Length of the well-formed UTF-8 sequence starting at byte `i` of `s`
+/// (1 for ASCII), or 0 for a malformed / overlong / surrogate / truncated one.
+fn drv_utf8_seq_len(s : String, i : Int) -> Int {
+  let n = s.length()
+  let c = str_code_at(s, i)
+  if c < 0x80 {
+    return 1
+  }
+  let mut need = 0
+  let mut min = 0
+  let mut cp = 0
+  if c >= 0xC2 && c <= 0xDF {
+    need = 1
+    min = 0x80
+    cp = c & 0x1F
+  } else if c >= 0xE0 && c <= 0xEF {
+    need = 2
+    min = 0x800
+    cp = c & 0x0F
+  } else if c >= 0xF0 && c <= 0xF4 {
+    need = 3
+    min = 0x10000
+    cp = c & 0x07
+  } else {
+    return 0
+  }
+  if i + need >= n {
+    return 0
+  }
+  let mut k = 1
+  while k <= need {
+    let b = str_code_at(s, i + k)
+    if (b & 0xC0) != 0x80 {
+      return 0
+    }
+    cp = (cp << 6) | (b & 0x3F)
+    k = k + 1
+  }
+  if cp < min || cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+    return 0
+  }
+  need + 1
+}
+
+///|
+/// Writes `s` as a quoted JSON string. Unlike `json_quote` (which re-encodes
+/// every byte >= 0x80 as its own code point), well-formed UTF-8 is copied
+/// through byte for byte, so non-ASCII text round-trips losslessly; `"`, `\`,
+/// control characters and DEL are escaped, and a malformed UTF-8 byte becomes
+/// `�` so the output is always valid JSON.
+fn drv_json_write_str(sb : StringBuilder, s : String) -> Unit {
+  sb.write_string("\"")
+  let n = s.length()
+  let mut run = 0
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    if c < 0x80 {
+      if c == 34 || c == 92 || c < 32 || c == 127 {
+        sb.write_string(slice_str(s, run, i))
+        if c == 34 {
+          sb.write_string("\\\"")
+        } else if c == 92 {
+          sb.write_string("\\\\")
+        } else if c == 10 {
+          sb.write_string("\\n")
+        } else if c == 13 {
+          sb.write_string("\\r")
+        } else if c == 9 {
+          sb.write_string("\\t")
+        } else {
+          sb.write_string("\\u00")
+          sb.write_char(hex_digit((c >> 4) & 15))
+          sb.write_char(hex_digit(c & 15))
+        }
+        run = i + 1
+      }
+      i = i + 1
+    } else {
+      let l = drv_utf8_seq_len(s, i)
+      if l == 0 {
+        sb.write_string(slice_str(s, run, i))
+        sb.write_string("\\ufffd")
+        i = i + 1
+        run = i
+      } else {
+        i = i + l
+      }
+    }
+  }
+  sb.write_string(slice_str(s, run, n))
+  sb.write_string("\"")
+}
+
+///|
+fn drv_json_q(s : String) -> String {
+  let sb = StringBuilder()
+  drv_json_write_str(sb, s)
+  sb.to_string()
+}
+
+///|
+/// Makes registry text safe to print on a terminal: C0 controls, DEL and C1
+/// controls (U+0080..U+009F, e.g. a bare CSI) become `?` (tab / newline /
+/// carriage return become a space), and malformed UTF-8 bytes become `?`, so
+/// no escape sequence from a registry can reach the terminal.
+fn drv_term_safe(s : String) -> String {
+  let sb = StringBuilder()
+  let n = s.length()
+  let mut run = 0
+  let mut i = 0
+  while i < n {
+    let c = str_code_at(s, i)
+    let mut bad = 0
+    let mut l = 1
+    if c < 32 || c == 127 {
+      bad = if c == 9 || c == 10 || c == 13 { 2 } else { 1 }
+    } else if c >= 0x80 {
+      l = drv_utf8_seq_len(s, i)
+      if l == 0 {
+        bad = 1
+        l = 1
+      } else if l == 2 && c == 0xC2 && str_code_at(s, i + 1) < 0xA0 {
+        bad = 1
+      }
+    }
+    if bad > 0 {
+      sb.write_string(slice_str(s, run, i))
+      sb.write_string(if bad == 2 { " " } else { "?" })
+      run = i + l
+    }
+    i = i + l
+  }
+  sb.write_string(slice_str(s, run, n))
+  sb.to_string()
+}
+
+///|
+/// A parsed JSON value (catalog reader; numbers keep their source text).
+enum DrvJv {
+  DjNull
+  DjBool(Bool)
+  DjNum(String)
+  DjStr(String)
+  DjArr(Array[DrvJv])
+  DjObj(Array[String], Array[DrvJv])
+}
+
+///|
+struct DrvJp {
+  src : String
+  mut pos : Int
+}
+
+///|
+fn drv_jp_err(p : DrvJp, msg : String) -> String {
+  msg + " at byte " + p.pos.to_string()
+}
+
+///|
+fn drv_jp_ws(p : DrvJp) -> Unit {
+  let n = p.src.length()
+  while p.pos < n {
+    let c = str_code_at(p.src, p.pos)
+    if c == 32 || c == 9 || c == 10 || c == 13 {
+      p.pos = p.pos + 1
+    } else {
+      break
+    }
+  }
+}
+
+///|
+fn drv_jp_peek(p : DrvJp) -> Int {
+  if p.pos < p.src.length() {
+    str_code_at(p.src, p.pos)
+  } else {
+    -1
+  }
+}
+
+///|
+fn drv_hex_val(c : Int) -> Int {
+  if c >= 48 && c <= 57 {
+    c - 48
+  } else if c >= 97 && c <= 102 {
+    c - 87
+  } else if c >= 65 && c <= 70 {
+    c - 55
+  } else {
+    -1
+  }
+}
+
+///|
+/// Reads the 4 hex digits of a `\uXXXX` escape at `p.pos` (-1 if malformed).
+fn drv_jp_hex4(p : DrvJp) -> Int {
+  if p.pos + 4 > p.src.length() {
+    return -1
+  }
+  let mut v = 0
+  let mut k = 0
+  while k < 4 {
+    let h = drv_hex_val(str_code_at(p.src, p.pos + k))
+    if h < 0 {
+      return -1
+    }
+    v = v * 16 + h
+    k = k + 1
+  }
+  p.pos = p.pos + 4
+  v
+}
+
+///|
+/// Strict RFC 8259 string at `p.pos` (on the opening quote): escapes decoded
+/// (surrogate pairs joined, lone surrogates rejected), raw control characters
+/// and malformed UTF-8 rejected, everything else copied byte for byte.
+fn drv_jp_string(p : DrvJp) -> Result[String, String] {
+  let src = p.src
+  let n = src.length()
+  p.pos = p.pos + 1
+  let sb = StringBuilder()
+  let mut run = p.pos
+  while p.pos < n {
+    let c = str_code_at(src, p.pos)
+    if c == 34 {
+      sb.write_string(slice_str(src, run, p.pos))
+      p.pos = p.pos + 1
+      return Ok(sb.to_string())
+    }
+    if c == 92 {
+      sb.write_string(slice_str(src, run, p.pos))
+      if p.pos + 1 >= n {
+        return Err(drv_jp_err(p, "unterminated escape"))
+      }
+      let e = str_code_at(src, p.pos + 1)
+      p.pos = p.pos + 2
+      if e == 34 {
+        sb.write_string("\"")
+      } else if e == 92 {
+        sb.write_string("\\")
+      } else if e == 47 {
+        sb.write_string("/")
+      } else if e == 98 {
+        let bs = 8
+        sb.write_char(bs.unsafe_to_char())
+      } else if e == 102 {
+        let ff = 12
+        sb.write_char(ff.unsafe_to_char())
+      } else if e == 110 {
+        sb.write_string("\n")
+      } else if e == 114 {
+        sb.write_string("\r")
+      } else if e == 116 {
+        sb.write_string("\t")
+      } else if e == 117 {
+        let hi = drv_jp_hex4(p)
+        if hi < 0 {
+          return Err(drv_jp_err(p, "invalid \\u escape"))
+        }
+        let mut cp = hi
+        if hi >= 0xD800 && hi <= 0xDBFF {
+          if p.pos + 2 > n ||
+            str_code_at(src, p.pos) != 92 ||
+            str_code_at(src, p.pos + 1) != 117 {
+            return Err(drv_jp_err(p, "unpaired surrogate in \\u escape"))
+          }
+          p.pos = p.pos + 2
+          let lo = drv_jp_hex4(p)
+          if lo < 0xDC00 || lo > 0xDFFF {
+            return Err(drv_jp_err(p, "unpaired surrogate in \\u escape"))
+          }
+          cp = 0x10000 + ((hi - 0xD800) << 10) + (lo - 0xDC00)
+        } else if hi >= 0xDC00 && hi <= 0xDFFF {
+          return Err(drv_jp_err(p, "unpaired surrogate in \\u escape"))
+        }
+        sb.write_char(cp.unsafe_to_char())
+      } else {
+        return Err(drv_jp_err(p, "invalid escape"))
+      }
+      run = p.pos
+      continue
+    }
+    if c < 32 {
+      return Err(drv_jp_err(p, "control character in string"))
+    }
+    if c >= 0x80 {
+      let l = drv_utf8_seq_len(src, p.pos)
+      if l == 0 {
+        return Err(drv_jp_err(p, "malformed UTF-8 in string"))
+      }
+      p.pos = p.pos + l
+    } else {
+      p.pos = p.pos + 1
+    }
+  }
+  Err(drv_jp_err(p, "unterminated string"))
+}
+
+///|
+fn drv_jp_digits(p : DrvJp) -> Int {
+  let start = p.pos
+  while p.pos < p.src.length() {
+    let c = str_code_at(p.src, p.pos)
+    if c >= 48 && c <= 57 {
+      p.pos = p.pos + 1
+    } else {
+      break
+    }
+  }
+  p.pos - start
+}
+
+///|
+fn drv_jp_number(p : DrvJp) -> Result[DrvJv, String] {
+  let start = p.pos
+  if drv_jp_peek(p) == 45 {
+    p.pos = p.pos + 1
+  }
+  let c = drv_jp_peek(p)
+  if c == 48 {
+    p.pos = p.pos + 1
+  } else if c >= 49 && c <= 57 {
+    let _ = drv_jp_digits(p)
+  } else {
+    return Err(drv_jp_err(p, "invalid number"))
+  }
+  if drv_jp_peek(p) == 46 {
+    p.pos = p.pos + 1
+    if drv_jp_digits(p) == 0 {
+      return Err(drv_jp_err(p, "invalid number"))
+    }
+  }
+  let e = drv_jp_peek(p)
+  if e == 101 || e == 69 {
+    p.pos = p.pos + 1
+    let sgn = drv_jp_peek(p)
+    if sgn == 43 || sgn == 45 {
+      p.pos = p.pos + 1
+    }
+    if drv_jp_digits(p) == 0 {
+      return Err(drv_jp_err(p, "invalid number"))
+    }
+  }
+  Ok(DjNum(slice_str(p.src, start, p.pos)))
+}
+
+///|
+fn drv_jp_word(p : DrvJp, w : String) -> Bool {
+  let end_pos = p.pos + w.length()
+  if end_pos > p.src.length() || slice_str(p.src, p.pos, end_pos) != w {
+    return false
+  }
+  p.pos = end_pos
+  true
+}
+
+///|
+/// One JSON value at `p.pos` (nesting capped at 64 levels).
+fn drv_jp_value(p : DrvJp, depth : Int) -> Result[DrvJv, String] {
+  if depth > 64 {
+    return Err(drv_jp_err(p, "nesting deeper than 64 levels"))
+  }
+  drv_jp_ws(p)
+  let c = drv_jp_peek(p)
+  if c < 0 {
+    return Err(drv_jp_err(p, "unexpected end of input"))
+  }
+  if c == 123 {
+    p.pos = p.pos + 1
+    let keys : Array[String] = []
+    let vals : Array[DrvJv] = []
+    drv_jp_ws(p)
+    if drv_jp_peek(p) == 125 {
+      p.pos = p.pos + 1
+      return Ok(DjObj(keys, vals))
+    }
+    while true {
+      drv_jp_ws(p)
+      if drv_jp_peek(p) != 34 {
+        return Err(drv_jp_err(p, "expected object key"))
+      }
+      let k = match drv_jp_string(p) {
+        Err(e) => return Err(e)
+        Ok(s) => s
+      }
+      drv_jp_ws(p)
+      if drv_jp_peek(p) != 58 {
+        return Err(drv_jp_err(p, "expected `:`"))
+      }
+      p.pos = p.pos + 1
+      let v = match drv_jp_value(p, depth + 1) {
+        Err(e) => return Err(e)
+        Ok(x) => x
+      }
+      keys.push(k)
+      vals.push(v)
+      drv_jp_ws(p)
+      let d = drv_jp_peek(p)
+      if d == 44 {
+        p.pos = p.pos + 1
+      } else if d == 125 {
+        p.pos = p.pos + 1
+        break
+      } else {
+        return Err(drv_jp_err(p, "expected `,` or `}`"))
+      }
+    }
+    return Ok(DjObj(keys, vals))
+  }
+  if c == 91 {
+    p.pos = p.pos + 1
+    let items : Array[DrvJv] = []
+    drv_jp_ws(p)
+    if drv_jp_peek(p) == 93 {
+      p.pos = p.pos + 1
+      return Ok(DjArr(items))
+    }
+    while true {
+      let v = match drv_jp_value(p, depth + 1) {
+        Err(e) => return Err(e)
+        Ok(x) => x
+      }
+      items.push(v)
+      drv_jp_ws(p)
+      let d = drv_jp_peek(p)
+      if d == 44 {
+        p.pos = p.pos + 1
+      } else if d == 93 {
+        p.pos = p.pos + 1
+        break
+      } else {
+        return Err(drv_jp_err(p, "expected `,` or `]`"))
+      }
+    }
+    return Ok(DjArr(items))
+  }
+  if c == 34 {
+    return match drv_jp_string(p) {
+      Err(e) => Err(e)
+      Ok(s) => Ok(DjStr(s))
+    }
+  }
+  if c == 45 || (c >= 48 && c <= 57) {
+    return drv_jp_number(p)
+  }
+  if drv_jp_word(p, "true") {
+    return Ok(DjBool(true))
+  }
+  if drv_jp_word(p, "false") {
+    return Ok(DjBool(false))
+  }
+  if drv_jp_word(p, "null") {
+    return Ok(DjNull)
+  }
+  Err(drv_jp_err(p, "unexpected character"))
+}
+
+///|
+/// Parses a complete JSON document (no trailing bytes besides whitespace).
+fn drv_json_parse(text : String) -> Result[DrvJv, String] {
+  let p = DrvJp::{ src: text, pos: 0 }
+  let v = match drv_jp_value(p, 0) {
+    Err(e) => return Err(e)
+    Ok(x) => x
+  }
+  drv_jp_ws(p)
+  if p.pos != text.length() {
+    return Err(drv_jp_err(p, "trailing characters after JSON value"))
+  }
+  Ok(v)
+}
+
+///|
+/// One searchable registry package (the 10 `catalog.json` fields; `wasm32` /
+/// `world_free` are 1 / 0, or -1 when the registry does not say).
+struct DrvPkgInfo {
+  name : String
+  version : String
+  tag : String
+  subdir : String
+  category : String
+  summary : String
+  keywords : Array[String]
+  deps : Array[String]
+  wasm32 : Int
+  world_free : Int
+}
+
+///|
+fn drv_jv_field(keys : Array[String], vals : Array[DrvJv], key : String) -> Option[DrvJv] {
+  let mut i = 0
+  while i < keys.length() {
+    if keys[i] == key {
+      return Some(vals[i])
+    }
+    i = i + 1
+  }
+  None
+}
+
+///|
+fn drv_jv_str_field(
+  keys : Array[String],
+  vals : Array[DrvJv],
+  key : String,
+  ctx : String,
+) -> Result[String, String] {
+  match drv_jv_field(keys, vals, key) {
+    None => Ok("")
+    Some(DjStr(s)) => Ok(s)
+    Some(_) => Err(ctx + ": `" + key + "` must be a string")
+  }
+}
+
+///|
+fn drv_jv_strs_field(
+  keys : Array[String],
+  vals : Array[DrvJv],
+  key : String,
+  ctx : String,
+) -> Result[Array[String], String] {
+  let out : Array[String] = []
+  match drv_jv_field(keys, vals, key) {
+    None => Ok(out)
+    Some(DjArr(items)) => {
+      let mut i = 0
+      while i < items.length() {
+        match items[i] {
+          DjStr(s) => out.push(s)
+          _ => return Err(ctx + ": `" + key + "` must be an array of strings")
+        }
+        i = i + 1
+      }
+      Ok(out)
+    }
+    Some(_) => Err(ctx + ": `" + key + "` must be an array of strings")
+  }
+}
+
+///|
+fn drv_jv_bool_field(
+  keys : Array[String],
+  vals : Array[DrvJv],
+  key : String,
+  ctx : String,
+) -> Result[Int, String] {
+  match drv_jv_field(keys, vals, key) {
+    None => Ok(-1)
+    Some(DjBool(b)) => Ok(if b { 1 } else { 0 })
+    Some(_) => Err(ctx + ": `" + key + "` must be a boolean")
+  }
+}
+
+///|
+fn drv_catalog_pkg(
+  keys : Array[String],
+  vals : Array[DrvJv],
+  idx : Int,
+) -> Result[DrvPkgInfo, String] {
+  let ctx = "packages[" + idx.to_string() + "]"
+  let name = match drv_jv_str_field(keys, vals, "name", ctx) {
+    Err(e) => return Err(e)
+    Ok(s) => s
+  }
+  if name.length() == 0 {
+    return Err(ctx + ": missing `name`")
+  }
+  if !manifest_valid_dep_name(name) {
+    return Err(ctx + ": invalid package name `" + name + "`")
+  }
+  let strs : Array[String] = []
+  let skeys : Array[String] = ["version", "tag", "subdir", "category", "summary"]
+  let mut k = 0
+  while k < skeys.length() {
+    match drv_jv_str_field(keys, vals, skeys[k], ctx) {
+      Err(e) => return Err(e)
+      Ok(s) => strs.push(s)
+    }
+    k = k + 1
+  }
+  let keywords = match drv_jv_strs_field(keys, vals, "keywords", ctx) {
+    Err(e) => return Err(e)
+    Ok(a) => a
+  }
+  let deps = match drv_jv_strs_field(keys, vals, "deps", ctx) {
+    Err(e) => return Err(e)
+    Ok(a) => a
+  }
+  let wasm32 = match drv_jv_bool_field(keys, vals, "wasm32", ctx) {
+    Err(e) => return Err(e)
+    Ok(b) => b
+  }
+  let world_free = match drv_jv_bool_field(keys, vals, "world_free", ctx) {
+    Err(e) => return Err(e)
+    Ok(b) => b
+  }
+  Ok(DrvPkgInfo::{
+    name: name,
+    version: strs[0],
+    tag: strs[1],
+    subdir: strs[2],
+    category: strs[3],
+    summary: strs[4],
+    keywords: keywords,
+    deps: deps,
+    wasm32: wasm32,
+    world_free: world_free,
+  })
+}
+
+///|
+/// Validates and reads a registry `catalog.json`: a top-level object with
+/// `"schema_version": 1` and a `packages` array of package objects.
+fn drv_catalog_parse(text : String) -> Result[Array[DrvPkgInfo], String] {
+  let root = match drv_json_parse(text) {
+    Err(e) => return Err("invalid JSON: " + e)
+    Ok(v) => v
+  }
+  let out : Array[DrvPkgInfo] = []
+  match root {
+    DjObj(keys, vals) => {
+      match drv_jv_field(keys, vals, "schema_version") {
+        Some(DjNum(t)) => {
+          if t != "1" {
+            return Err("unsupported schema_version " + t + " (this pionc reads 1)")
+          }
+        }
+        None => return Err("missing schema_version")
+        Some(_) => return Err("schema_version must be a number")
+      }
+      match drv_jv_field(keys, vals, "packages") {
+        Some(DjArr(items)) => {
+          let mut i = 0
+          while i < items.length() {
+            match items[i] {
+              DjObj(pk, pv) =>
+                match drv_catalog_pkg(pk, pv, i) {
+                  Err(e) => return Err(e)
+                  Ok(info) => out.push(info)
+                }
+              _ => return Err("packages[" + i.to_string() + "] must be an object")
+            }
+            i = i + 1
+          }
+        }
+        None => return Err("missing `packages` array")
+        Some(_) => return Err("`packages` must be an array")
+      }
+    }
+    _ => return Err("top-level value must be an object")
+  }
+  Ok(out)
+}
+
+///|
+/// One `git ls-tree -z` record: `<mode> <type> <oid>\t<name>`.
+struct DrvTreeEnt {
+  mode : String
+  kind : String
+  oid : String
+  name : String
+}
+
+///|
+fn drv_parse_ls_tree_z(out : String) -> Array[DrvTreeEnt] {
+  let ents : Array[DrvTreeEnt] = []
+  let n = out.length()
+  let mut start = 0
+  let mut i = 0
+  while i <= n {
+    if i == n || str_code_at(out, i) == 0 {
+      if i > start {
+        let rec = slice_str(out, start, i)
+        let tab = drv_find_substr(rec, "\t", 0)
+        let sp1 = drv_find_substr(rec, " ", 0)
+        let sp2 = if sp1 >= 0 { drv_find_substr(rec, " ", sp1 + 1) } else { -1 }
+        if tab > 0 && sp1 > 0 && sp2 > sp1 && sp2 < tab {
+          ents.push(DrvTreeEnt::{
+            mode: slice_str(rec, 0, sp1),
+            kind: slice_str(rec, sp1 + 1, sp2),
+            oid: slice_str(rec, sp2 + 1, tab),
+            name: slice_str(rec, tab + 1, rec.length()),
+          })
+        }
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  ents
+}
+
+///|
+/// Non-negative decimal (at most 15 digits, so it cannot overflow), or -1.
+fn drv_parse_size(s : String) -> Int64 {
+  if s.length() == 0 || s.length() > 15 {
+    return -1L
+  }
+  let mut v = 0L
+  let mut i = 0
+  while i < s.length() {
+    let c = str_code_at(s, i)
+    if c < 48 || c > 57 {
+      return -1L
+    }
+    v = v * 10L + (c - 48).to_int64()
+    i = i + 1
+  }
+  v
+}
+
+///|
+/// Reads the blobs `oids` of `repo` with a single `git cat-file --batch`
+/// whose stdin is a temporary `<oid>\n` list file (no argv size limit), and
+/// splits its output by the exact byte length of each `<oid> blob <size>`
+/// header. On Windows (no `sh`) each blob is read with `git cat-file blob`.
+fn drv_git_cat_batch(
+  world : World,
+  repo : String,
+  oids : Array[String],
+) -> Result[Array[String], String] {
+  let res : Array[String] = []
+  if oids.length() == 0 {
+    return Ok(res)
+  }
+  if drv_env_str(world, "OS") == "Windows_NT" {
+    let mut w = 0
+    while w < oids.length() {
+      match drv_git_raw(world, ["--git-dir", repo, "cat-file", "blob", oids[w]]) {
+        Err(e) => return Err("git cat-file blob " + oids[w] + " failed: " + e)
+        Ok(t) => res.push(t)
+      }
+      w = w + 1
+    }
+    return Ok(res)
+  }
+  let list = match proc_exec_capture(world, ["mktemp"]) {
+    Err(e) => return Err("cannot create a temporary file: " + e)
+    Ok(t) => drv_trim_ws(t)
+  }
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < oids.length() {
+    sb.write_string(oids[i])
+    sb.write_string("\n")
+    i = i + 1
+  }
+  match fs_write(world, list, sb.to_string()) {
+    Err(e) => {
+      let _ = fs_remove(world, list)
+      return Err("cannot write " + list + ": " + e)
+    }
+    Ok(_) => ()
+  }
+  let got = proc_exec_capture(
+    world,
+    [
+      "sh", "-c", drv_git_sh_wrap(
+        "env GIT_TERMINAL_PROMPT=0 GIT_ALLOW_PROTOCOL=file:http:https:ssh git --git-dir \"$1\" cat-file --batch < \"$2\"",
+      ),
+      "pionc-git", repo, list,
+    ],
+  )
+  let _ = fs_remove(world, list)
+  let out = match got {
+    Err(e) => return Err("git cat-file --batch failed: " + drv_git_err_text(e))
+    Ok(o) => o
+  }
+  let mut pos = 0
+  let mut k = 0
+  while k < oids.length() {
+    let nl = drv_find_substr(out, "\n", pos)
+    if nl < 0 {
+      return Err("truncated git cat-file --batch output")
+    }
+    let header = slice_str(out, pos, nl)
+    let parts = drv_split_char(header, 32)
+    if parts.length() != 3 || parts[0] != oids[k] || parts[1] != "blob" {
+      return Err("unexpected git cat-file --batch header `" + drv_term_safe(header) + "`")
+    }
+    let size = drv_parse_size(parts[2])
+    // The body and its trailing newline must fit in what is left.
+    let left = (out.length() - (nl + 1)).to_int64()
+    if size < 0L || size + 1L > left {
+      return Err("truncated git cat-file --batch output")
+    }
+    let body_end = nl + 1 + size.to_int()
+    if str_code_at(out, body_end) != 10 {
+      return Err("malformed git cat-file --batch output")
+    }
+    res.push(slice_str(out, nl + 1, body_end))
+    pos = body_end + 1
+    k = k + 1
+  }
+  if pos != out.length() {
+    return Err("unexpected trailing bytes in git cat-file --batch output")
+  }
+  Ok(res)
+}
+
+///|
+/// Packages of a registry at one fixed commit `oid` of mirror `repo`:
+/// `catalog.json` when the commit has one (a malformed or unsupported one is
+/// an error, never a silent fallback), else the legacy `index/<name>.toml`
+/// entries (regular blobs with a valid package name; read in one batch).
+struct DrvRegistryPkgs {
+  format : String
+  pkgs : Array[DrvPkgInfo]
+  /// Names with an `index/<name>.toml` in the same commit (what
+  /// `pionc add <name>` can install).
+  installable : Map[String, Bool]
+}
+
+///|
+fn drv_registry_packages(
+  world : World,
+  repo : String,
+  oid : String,
+) -> Result[DrvRegistryPkgs, String] {
+  let root_ls = match drv_git_raw(world, ["--git-dir", repo, "ls-tree", "-z", oid]) {
+    Err(e) => return Err("cannot list commit " + oid + ": " + e)
+    Ok(o) => o
+  }
+  let ents = drv_parse_ls_tree_z(root_ls)
+  let mut cat_i = -1
+  let mut idx_i = -1
+  let mut i = 0
+  while i < ents.length() {
+    if ents[i].name == "catalog.json" {
+      cat_i = i
+    } else if ents[i].name == "index" && ents[i].kind == "tree" {
+      idx_i = i
+    }
+    i = i + 1
+  }
+  if cat_i < 0 && idx_i < 0 {
+    return Err("commit " + oid + " has neither catalog.json nor an index/ directory")
+  }
+  // index/ entries: regular blobs named `<valid name>.toml`.
+  let names : Array[String] = []
+  let oids : Array[String] = []
+  let installable : Map[String, Bool] = Map([])
+  if idx_i >= 0 {
+    let idx_ls = match drv_git_raw(world, ["--git-dir", repo, "ls-tree", "-z", ents[idx_i].oid]) {
+      Err(e) => return Err("cannot list index/ at " + oid + ": " + e)
+      Ok(o) => o
+    }
+    let ients = drv_parse_ls_tree_z(idx_ls)
+    i = 0
+    while i < ients.length() {
+      let e = ients[i]
+      if (e.mode == "100644" || e.mode == "100755") &&
+        e.kind == "blob" &&
+        drv_ends_with(e.name, ".toml") {
+        let stem = slice_str(e.name, 0, e.name.length() - 5)
+        if manifest_valid_dep_name(stem) {
+          names.push(stem)
+          oids.push(e.oid)
+          installable.set(stem, true)
+        }
+      }
+      i = i + 1
+    }
+  }
+  if cat_i >= 0 {
+    let ce = ents[cat_i]
+    if ce.kind != "blob" {
+      return Err("catalog.json at " + oid + " is not a file")
+    }
+    let text = match drv_git_raw(world, ["--git-dir", repo, "cat-file", "blob", ce.oid]) {
+      Err(e) => return Err("cannot read catalog.json at " + oid + ": " + e)
+      Ok(t) => t
+    }
+    return match drv_catalog_parse(text) {
+      Err(e) => Err("catalog.json at " + oid + ": " + e)
+      Ok(pkgs) =>
+        Ok(DrvRegistryPkgs::{ format: "catalog", pkgs: pkgs, installable: installable })
+    }
+  }
+  let texts = match drv_git_cat_batch(world, repo, oids) {
+    Err(e) => return Err(e)
+    Ok(t) => t
+  }
+  let pkgs : Array[DrvPkgInfo] = []
+  i = 0
+  while i < names.length() {
+    match parse_registry_entry(names[i], texts[i]) {
+      Err(e) => return Err(e)
+      Ok(re) =>
+        pkgs.push(DrvPkgInfo::{
+          name: re.name,
+          version: re.version,
+          tag: re.tag,
+          subdir: re.subdir,
+          category: "",
+          summary: "",
+          keywords: [],
+          deps: [],
+          wasm32: -1,
+          world_free: -1,
+        })
+    }
+    i = i + 1
+  }
+  Ok(DrvRegistryPkgs::{ format: "index", pkgs: pkgs, installable: installable })
+}
+
+///|
+/// `s` as one POSIX shell word: unchanged when it only has safe characters,
+/// else single-quoted (`'` written as `'\''`).
+fn drv_shell_quote(s : String) -> String {
+  let mut safe = s.length() > 0
+  let mut i = 0
+  while safe && i < s.length() {
+    let c = str_code_at(s, i)
+    safe = (c >= 48 && c <= 57) ||
+      (c >= 65 && c <= 90) ||
+      (c >= 97 && c <= 122) ||
+      c == 45 ||
+      c == 46 ||
+      c == 47 ||
+      c == 58 ||
+      c == 64 ||
+      c == 95 ||
+      c == 43 ||
+      c == 61 ||
+      c == 44 ||
+      c == 37
+    i = i + 1
+  }
+  if safe {
+    return s
+  }
+  let sb = StringBuilder()
+  sb.write_string("'")
+  let mut run = 0
+  i = 0
+  while i < s.length() {
+    if str_code_at(s, i) == 39 {
+      sb.write_string(slice_str(s, run, i))
+      sb.write_string("'\\''")
+      run = i + 1
+    }
+    i = i + 1
+  }
+  sb.write_string(slice_str(s, run, s.length()))
+  sb.write_string("'")
+  sb.to_string()
+}
+
+///|
+/// Splits a query argument into lower-cased words at ASCII whitespace.
+fn drv_push_terms(terms : Array[String], arg : String) -> Unit {
+  let n = arg.length()
+  let mut start = 0
+  let mut i = 0
+  while i <= n {
+    let c = if i == n { 32 } else { str_code_at(arg, i) }
+    if c == 32 || (c >= 9 && c <= 13) {
+      if i > start {
+        terms.push(drv_ascii_lower(slice_str(arg, start, i)))
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// Every term (already lower-cased) must occur in the name, the summary or
+/// one keyword (ASCII case-insensitive).
+fn drv_pkg_matches(p : DrvPkgInfo, terms : Array[String]) -> Bool {
+  let name = drv_ascii_lower(p.name)
+  let summary = drv_ascii_lower(p.summary)
+  let kws : Array[String] = []
+  let mut k = 0
+  while k < p.keywords.length() {
+    kws.push(drv_ascii_lower(p.keywords[k]))
+    k = k + 1
+  }
+  let mut t = 0
+  while t < terms.length() {
+    let term = terms[t]
+    let mut hit = drv_find_substr(name, term, 0) >= 0 ||
+      drv_find_substr(summary, term, 0) >= 0
+    k = 0
+    while !hit && k < kws.length() {
+      hit = drv_find_substr(kws[k], term, 0) >= 0
+      k = k + 1
+    }
+    if !hit {
+      return false
+    }
+    t = t + 1
+  }
+  true
+}
+
+///|
+/// 0: a term equals the name; 1: the name starts with a term; 2: other match.
+fn drv_pkg_rank(p : DrvPkgInfo, terms : Array[String]) -> Int {
+  let name = drv_ascii_lower(p.name)
+  let mut best = 2
+  let mut t = 0
+  while t < terms.length() {
+    if terms[t] == name {
+      return 0
+    }
+    if drv_starts_with(name, terms[t]) {
+      best = 1
+    }
+    t = t + 1
+  }
+  best
+}
+
+///|
+fn drv_json_tri(v : Int) -> String {
+  if v > 0 {
+    "true"
+  } else if v == 0 {
+    "false"
+  } else {
+    "null"
+  }
+}
+
+///|
+fn drv_json_write_strs(sb : StringBuilder, items : Array[String]) -> Unit {
+  sb.write_string("[")
+  let mut i = 0
+  while i < items.length() {
+    if i > 0 {
+      sb.write_string(",")
+    }
+    drv_json_write_str(sb, items[i])
+    i = i + 1
+  }
+  sb.write_string("]")
+}
+
+///|
+fn drv_pkg_write_json(sb : StringBuilder, p : DrvPkgInfo, installable : Bool) -> Unit {
+  sb.write_string("{\"name\":")
+  drv_json_write_str(sb, p.name)
+  sb.write_string(",\"version\":")
+  drv_json_write_str(sb, p.version)
+  sb.write_string(",\"tag\":")
+  drv_json_write_str(sb, p.tag)
+  sb.write_string(",\"subdir\":")
+  drv_json_write_str(sb, p.subdir)
+  sb.write_string(",\"category\":")
+  drv_json_write_str(sb, p.category)
+  sb.write_string(",\"summary\":")
+  drv_json_write_str(sb, p.summary)
+  sb.write_string(",\"keywords\":")
+  drv_json_write_strs(sb, p.keywords)
+  sb.write_string(",\"deps\":")
+  drv_json_write_strs(sb, p.deps)
+  sb.write_string(",\"wasm32\":")
+  sb.write_string(drv_json_tri(p.wasm32))
+  sb.write_string(",\"world_free\":")
+  sb.write_string(drv_json_tri(p.world_free))
+  sb.write_string(",\"installable\":")
+  sb.write_string(if installable { "true" } else { "false" })
+  sb.write_string("}")
+}
+
+///|
+/// Failure with a stable error `code`: `{"ok":false,"code":"...","error":"..."}`
+/// with `--json`, else `error[CODE]: ...` on stderr; exit code 1.
+fn drv_cmd_fail_code(world : World, as_json : Bool, code : String, msg : String) -> Int {
+  if as_json {
+    io_println(
+      world,
+      "{\"ok\":false,\"code\":" + drv_json_q(code) + ",\"error\":" + drv_json_q(msg) + "}",
+    )
+  } else {
+    io_eprintln(world, "error[" + code + "]: " + drv_term_safe(msg))
+  }
+  1
+}
+
+///|
+fn drv_pad_right(s : String, w : Int) -> String {
+  if s.length() >= w {
+    return s
+  }
+  let sb = StringBuilder()
+  sb.write_string(s)
+  let mut i = s.length()
+  while i < w {
+    sb.write_string(" ")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+///|
+/// `pionc search [--json] [--offline] [--refresh] [--registry <url_or_path>]
+/// [--category <cat>] [query...]`: lists registry packages whose name, summary
+/// or keywords contain every query word (ASCII case-insensitive), optionally
+/// only those of one category; reads one fixed commit of the registry mirror
+/// (refreshed at most every 10 minutes unless `--refresh`; never with
+/// `--offline`; a failed refresh falls back to the cached mirror as `stale`).
+fn drv_run_search_cmd(world : World, args : Array[String]) -> Int {
+  let mut as_json = false
+  let mut i = 2
+  while i < args.length() {
+    if args[i] == "--" {
+      break
+    }
+    if args[i] == "--json" {
+      as_json = true
+    }
+    i = i + 1
+  }
+  let mut offline = false
+  let mut refresh = false
+  let mut registry = ""
+  let mut category = ""
+  let terms : Array[String] = []
+  let mut only_terms = false
+  i = 2
+  while i < args.length() {
+    let a = args[i]
+    if only_terms {
+      drv_push_terms(terms, a)
+    } else if a == "--" {
+      only_terms = true
+    } else if a == "--json" {
+      ()
+    } else if a == "--offline" {
+      offline = true
+    } else if a == "--refresh" {
+      refresh = true
+    } else if a == "--registry" || a == "--category" {
+      if i + 1 >= args.length() ||
+        args[i + 1].length() == 0 ||
+        drv_starts_with(args[i + 1], "--") {
+        return drv_cmd_fail_code(world, as_json, "E_INVALID_ARGS", "missing value for `" + a + "`")
+      }
+      if a == "--registry" {
+        registry = args[i + 1]
+      } else {
+        category = args[i + 1]
+      }
+      i = i + 1
+    } else if a.length() > 1 && drv_starts_with(a, "-") {
+      return drv_cmd_fail_code(world, as_json, "E_INVALID_ARGS", "unknown option `" + a + "`")
+    } else {
+      drv_push_terms(terms, a)
+    }
+    i = i + 1
+  }
+  if offline && refresh {
+    return drv_cmd_fail_code(world, as_json, "E_INVALID_ARGS", "--offline and --refresh cannot be combined")
+  }
+  let mut mf_dir = ""
+  let mut mf_url = ""
+  // A pion.toml in the working directory must parse even when --registry
+  // makes its [registry] url irrelevant.
+  match drv_detect_manifest_dir(world, ".") {
+    Some(d) => {
+      let mf_path = drv_join_path(d, "pion.toml")
+      let text = match fs_read(world, mf_path) {
+        Err(e) =>
+          return drv_cmd_fail_code(world, as_json, "E_INVALID_MANIFEST", "failed to read " + mf_path + ": " + e)
+        Ok(t) => t
+      }
+      match parse_pion_toml(text) {
+        Err(e) =>
+          return drv_cmd_fail_code(world, as_json, "E_INVALID_MANIFEST", mf_path + ": " + e)
+        Ok(m) => {
+          mf_url = m.registry
+          mf_dir = drv_abs_path(world, d)
+        }
+      }
+    }
+    None => ()
+  }
+  let pick = drv_pick_registry(world, registry, mf_dir, mf_url)
+  if pick.code.length() > 0 {
+    return drv_cmd_fail_code(world, as_json, pick.code, pick.error)
+  }
+  let url = pick.url
+  let repo = drv_registry_repo_path(world, url)
+  let mut stale = false
+  let mut warning = ""
+  if !offline && (refresh || !drv_registry_is_fresh(world, repo)) {
+    match drv_registry_sync(world, url, Map([])) {
+      Ok(_) => ()
+      Err(e) => {
+        stale = true
+        warning = e
+      }
+    }
+  }
+  // One commit for the whole query; a mirror whose HEAD resolves to no commit
+  // (none cached, empty, default branch gone) is unusable.
+  let oid = drv_registry_mirror_oid(world, repo)
+  if oid.length() == 0 {
+    let why = if offline {
+      "registry " + url + " has no usable cached mirror (run `pionc search` once online)"
+    } else if warning.length() > 0 {
+      warning
+    } else {
+      "registry " + url + " has no commit on its default branch"
+    }
+    return drv_cmd_fail_code(world, as_json, "E_REGISTRY_UNREACHABLE", why)
+  }
+  let loaded = match drv_registry_packages(world, repo, oid) {
+    Err(e) =>
+      return drv_cmd_fail_code(world, as_json, "E_REGISTRY_INVALID_CATALOG", "registry " + url + ": " + e)
+    Ok(l) => l
+  }
+  let cat_low = drv_ascii_lower(category)
+  let hits : Array[DrvPkgInfo] = []
+  let ranks : Array[Int] = []
+  let mut pi = 0
+  while pi < loaded.pkgs.length() {
+    let p = loaded.pkgs[pi]
+    let cat_ok = category.length() == 0 ||
+      (p.category.length() > 0 && drv_ascii_lower(p.category) == cat_low)
+    if cat_ok && drv_pkg_matches(p, terms) {
+      let r = drv_pkg_rank(p, terms)
+      // Stable insertion by (rank, name).
+      hits.push(p)
+      ranks.push(r)
+      let mut j = hits.length() - 1
+      while j > 0 &&
+        (ranks[j - 1] > r || (ranks[j - 1] == r && p.name < hits[j - 1].name)) {
+        hits[j] = hits[j - 1]
+        ranks[j] = ranks[j - 1]
+        j = j - 1
+      }
+      hits[j] = p
+      ranks[j] = r
+    }
+    pi = pi + 1
+  }
+  if as_json {
+    let sb = StringBuilder()
+    sb.write_string("{\"ok\":true,\"registry\":")
+    drv_json_write_str(sb, url)
+    sb.write_string(",\"source\":")
+    drv_json_write_str(sb, pick.source)
+    sb.write_string(",\"commit\":")
+    drv_json_write_str(sb, oid)
+    sb.write_string(",\"format\":")
+    drv_json_write_str(sb, loaded.format)
+    sb.write_string(",\"stale\":")
+    sb.write_string(if stale { "true" } else { "false" })
+    if stale {
+      sb.write_string(",\"warning\":")
+      drv_json_write_str(sb, warning)
+    }
+    sb.write_string(",\"count\":")
+    sb.write_string(hits.length().to_string())
+    sb.write_string(",\"packages\":[")
+    let mut h = 0
+    while h < hits.length() {
+      if h > 0 {
+        sb.write_string(",")
+      }
+      drv_pkg_write_json(sb, hits[h], loaded.installable.contains(hits[h].name))
+      h = h + 1
+    }
+    sb.write_string("]}")
+    io_println(world, sb.to_string())
+    return 0
+  }
+  if stale {
+    io_eprintln(
+      world,
+      "warning: showing the cached (stale) index of registry " +
+      drv_term_safe(url) +
+      ": " +
+      drv_term_safe(warning),
+    )
+  }
+  if hits.length() == 0 {
+    io_println(world, "no packages match (registry " + drv_term_safe(url) + ")")
+    return 0
+  }
+  let rows_name : Array[String] = []
+  let rows_ver : Array[String] = []
+  let rows_cat : Array[String] = []
+  let mut w_name = 0
+  let mut w_ver = 0
+  let mut w_cat = 0
+  let mut h = 0
+  while h < hits.length() {
+    let nm = drv_term_safe(hits[h].name)
+    let vr = drv_term_safe(hits[h].version)
+    let ct = drv_term_safe(hits[h].category)
+    if nm.length() > w_name {
+      w_name = nm.length()
+    }
+    if vr.length() > w_ver {
+      w_ver = vr.length()
+    }
+    if ct.length() > w_cat {
+      w_cat = ct.length()
+    }
+    rows_name.push(nm)
+    rows_ver.push(vr)
+    rows_cat.push(ct)
+    h = h + 1
+  }
+  let sb = StringBuilder()
+  h = 0
+  while h < hits.length() {
+    sb.write_string(drv_pad_right(rows_name[h], w_name))
+    sb.write_string("  ")
+    sb.write_string(drv_pad_right(rows_ver[h], w_ver))
+    if w_cat > 0 {
+      sb.write_string("  ")
+      sb.write_string(drv_pad_right(rows_cat[h], w_cat))
+    }
+    let sm = drv_term_safe(hits[h].summary)
+    if sm.length() > 0 {
+      sb.write_string("  ")
+      sb.write_string(sm)
+    }
+    sb.write_string("\n")
+    h = h + 1
+  }
+  sb.write_string(
+    hits.length().to_string() +
+    (if hits.length() == 1 { " package" } else { " packages" }) +
+    " (registry " +
+    drv_term_safe(url) +
+    ")",
+  )
+  let mut first_ok = ""
+  h = 0
+  while h < hits.length() && first_ok.length() == 0 {
+    // With --registry the hint must name exactly that location; one that
+    // cannot be shown losslessly on a terminal gets no hint at all.
+    if manifest_valid_dep_name(hits[h].name) &&
+      loaded.installable.contains(hits[h].name) &&
+      (pick.source != "flag" || drv_term_safe(url) == url) {
+      first_ok = hits[h].name
+    }
+    h = h + 1
+  }
+  if first_ok.length() > 0 {
+    sb.write_string("\ninstall: pionc add " + first_ok)
+    if pick.source == "flag" {
+      sb.write_string(" --registry " + drv_shell_quote(url))
+    }
+  }
+  io_println(world, sb.to_string())
+  0
 }
 
 ///|
@@ -8089,6 +9944,7 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
   let mut branch = ""
   let mut subdir = ""
   let mut registry = ""
+  let mut registry_set = false
   let mut i = 2
   while i < args.length() {
     let a = args[i]
@@ -8115,6 +9971,7 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
       i = i + 1
     } else if a == "--registry" && has_val {
       registry = args[i + 1]
+      registry_set = true
       i = i + 1
     } else if drv_starts_with(a, "--") {
       return drv_cmd_fail(world, as_json, "unknown or incomplete option `" + a + "`")
@@ -8126,6 +9983,9 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
       return drv_cmd_fail(world, as_json, "unexpected argument `" + a + "`")
     }
     i = i + 1
+  }
+  if registry_set && registry.length() == 0 {
+    return drv_cmd_fail_code(world, as_json, "E_INVALID_ARGS", "--registry needs a non-empty URL or path")
   }
   if name.length() == 0 {
     return drv_cmd_fail(world, as_json, "usage: pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]")
@@ -8188,21 +10048,16 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
     location = git
     manifest_dep_new(name, "", git, tag, rev, branch, subdir)
   } else {
-    let mut url = registry
-    if url.length() == 0 {
-      url = mf.registry
-    }
-    if url.length() == 0 {
-      url = drv_env_str(world, "PION_REGISTRY")
-    }
-    if url.length() == 0 {
-      return drv_cmd_fail(
+    let pick = drv_pick_registry(world, registry, drv_abs_path(world, root_dir), mf.registry)
+    if pick.code.length() > 0 {
+      return drv_cmd_fail_code(
         world,
         as_json,
-        "no source for `" + name + "`: pass --path, --git or --registry, or set [registry] url in pion.toml or $PION_REGISTRY",
+        pick.code,
+        "no source for `" + name + "`: " + pick.error,
       )
     }
-    let abs_url = drv_abs_registry(world, url)
+    let abs_url = pick.url
     source = "registry"
     location = abs_url
     match drv_registry_lookup(world, abs_url, name, fetched) {
@@ -8262,7 +10117,7 @@ fn drv_run_add_cmd(world : World, args : Array[String]) -> Int {
     sb.write_string(",\"source\":")
     sb.write_string(json_quote(source))
     sb.write_string(",\"location\":")
-    sb.write_string(json_quote(location))
+    drv_json_write_str(sb, location)
     sb.write_string(",\"version\":")
     sb.write_string(json_quote(dep.version))
     sb.write_string(",\"rev\":")
@@ -9570,6 +11425,7 @@ fn drv_usage_text() -> String {
   "  pionc add [--json] <name> (--path <p> | --git <url> [--tag <t>|--rev <r>|--branch <b>] [--subdir <s>] | [--registry <url_or_path>]) [dir]\n" +
   "  pionc remove [--json] <name> [dir]\n" +
   "  pionc update [--json] [pkg] [dir]\n" +
+  "  pionc search [--json] [--offline] [--refresh] [--registry <url_or_path>] [--category <cat>] [query...]\n" +
   "  pionc doctor [--json]\n" +
   "  pionc cache stats|prune|clear [--all] [--json]\n" +
   "  pionc clean [--all] [--json]\n" +
@@ -9634,6 +11490,9 @@ pub fn main(world : World) -> Int {
   }
   if cmd == "update" {
     return drv_run_update_cmd(world, args)
+  }
+  if cmd == "search" {
+    return drv_run_search_cmd(world, args)
   }
   if cmd == "fetch" {
     let mut dir = ""

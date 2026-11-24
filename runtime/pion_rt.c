@@ -51,6 +51,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -2991,6 +2992,59 @@ PION_MINSIZE int32_t pion_world_fs_mkdir_p(void *w_ptr, void *path_str) {
 #endif
     free(tmp);
     return ok;
+}
+
+/* Exclusive single-directory create (no shell, no parents): 0 if this call
+ * created `path`, -1 if it already exists or cannot be created. */
+PION_MINSIZE int32_t pion_fs_mkdir_excl(const char *path) {
+    if (!path || !*path) return -1;
+#ifdef _WIN32
+    return _mkdir(path) == 0 ? 0 : -1;
+#else
+    return mkdir(path, 0700) == 0 ? 0 : -1;
+#endif
+}
+
+/* Non-blocking exclusive lock on `path` (created if missing, never removed):
+ * a handle >= 0, or -1 when another process holds it. The lock lives on the
+ * open file description (close-on-exec, not inherited), so the kernel drops
+ * it when the holder exits or is killed. */
+PION_MINSIZE int64_t pion_fs_trylock(const char *path) {
+    if (!path || !*path) return -1;
+#ifdef _WIN32
+    HANDLE h = CreateFileA(path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return -1;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    if (!LockFileEx(h, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &ov)) {
+        CloseHandle(h);
+        return -1;
+    }
+    return (int64_t)(uintptr_t)h & INT64_MAX;
+#else
+    int fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0600);
+    if (fd < 0) return -1;
+    if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        close(fd);
+        return -1;
+    }
+    return (int64_t)fd;
+#endif
+}
+
+/* Releases a `pion_fs_trylock` handle (the lock file stays). */
+PION_MINSIZE void pion_fs_unlock(int64_t handle) {
+    if (handle < 0) return;
+#ifdef _WIN32
+    HANDLE h = (HANDLE)(uintptr_t)handle;
+    OVERLAPPED ov;
+    memset(&ov, 0, sizeof ov);
+    UnlockFileEx(h, 0, 1, 0, &ov);
+    CloseHandle(h);
+#else
+    close((int)handle);
+#endif
 }
 
 PION_MINSIZE static int pion_str_slot_cmp(const void *a, const void *b) {
