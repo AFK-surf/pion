@@ -12,6 +12,9 @@
 ///|            [--run-report <path>]
 ///|            [--check]
 ///|            [--mode audit|publish]
+///|            [--mbt-compat <dir>]
+///|            [--package-manifest <pion.toml>]
+///|            [--dep <name=path>]...
 ///|            [--mbt2pion-commit <sha>]
 ///|            [--toolchain-lock <digest>]
 ///|            [--source-commit <sha>]
@@ -20,12 +23,13 @@
 ///|            [--no-probes]
 ///|            [--no-fmt]
 
+import "json" as json
 import "mbt2pion" as m2p
 
 fn usage(world : World) -> Int {
   io_eprintln(
     world,
-    "usage: mbt2pion --src <dir> --out <dir> [--target native|wasm32] [--api-map <path>] [--recipes <path>] [--overlay-dir <path>] [--with-tests] [--report <path>] [--drift-ledger <path>] [--run-report <path>] [--check] [--mode audit|publish]",
+    "usage: mbt2pion --src <dir> --out <dir> [--target native|wasm32] [--api-map <path>] [--recipes <path>] [--overlay-dir <path>] [--with-tests] [--report <path>] [--drift-ledger <path>] [--run-report <path>] [--check] [--mode audit|publish] [--mbt-compat <dir>] [--package-manifest <pion.toml>] [--dep <name=path>]",
   )
   64
 }
@@ -98,23 +102,83 @@ fn resolve_pionc(world : World, explicit : String) -> String {
   "pionc"
 }
 
+///| Parse `[dependencies]` `name = { path = "..." }` entries from a target `pion.toml` (P0-3).
+fn parse_manifest_deps(manifest_path : String, content : String, out_deps : Array[(String, String)]) -> Unit {
+  let base_dir = dirname(manifest_path)
+  let lines = content.split("\n")
+  let mut in_deps = false
+  for raw in lines {
+    let line = raw.trim()
+    if line.length() == 0 || line.starts_with("#") {
+      continue
+    }
+    if line.starts_with("[") && line.ends_with("]") {
+      in_deps = line == "[dependencies]"
+      continue
+    }
+    if !in_deps {
+      continue
+    }
+    let eq_i = line.index_of("=")
+    if eq_i <= 0 {
+      continue
+    }
+    let name = line.slice(0, eq_i).trim()
+    let rhs = line.slice(eq_i + 1, line.length()).trim()
+    let p_idx = rhs.index_of("path")
+    if p_idx >= 0 {
+      let after_p = rhs.slice(p_idx + 4, rhs.length())
+      let q1 = after_p.index_of("\"")
+      if q1 >= 0 {
+        let rest = after_p.slice(q1 + 1, after_p.length())
+        let q2 = rest.index_of("\"")
+        if q2 > 0 {
+          let dep_path = rest.slice(0, q2)
+          let resolved = if dep_path.starts_with("/") || base_dir.length() == 0 {
+            dep_path
+          } else {
+            join_path(base_dir, dep_path)
+          }
+          out_deps.push((name, resolved))
+        }
+      }
+    }
+  }
+}
+
 ///| Run `pionc check --json` on a batch of `(rel_path, content)` files in a clean scratch directory.
-///| When `mbt_compat_dir` is non-empty, creates a scratch package depending on `mbt_compat` so
-///| Stage A.5 and Stage B resolve real `mbt_compat::*` types during `pionc check --json`.
-fn run_pionc_check_batch(
+///| Returns `(ok_exit_zero, raw_stdout_or_stderr)`.
+///| When `deps` is non-empty, constructs a real package `pion.toml` with the full dependency graph (P0-3).
+fn run_pionc_check_batch_status(
   world : World,
   pionc_bin : String,
   scratch_dir : String,
-  mbt_compat_dir : String,
+  deps : Array[(String, String)],
+  inject_compat_import : Bool,
   batch : Array[(String, String)],
-) -> String {
+) -> (Bool, String) {
+  let _ = proc_exec(world, ["rm", "-rf", scratch_dir])
   let _ = fs_mkdir_p(world, scratch_dir)
-  if mbt_compat_dir.length() > 0 {
+  if deps.length() > 0 {
     let src_root = join_path(scratch_dir, "src")
     let _ = fs_mkdir_p(world, src_root)
-    let toml = "[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\nmbt_compat = { path = \"" + mbt_compat_dir + "\" }\n"
-    let _ = fs_write(world, join_path(scratch_dir, "pion.toml"), toml)
-    let _ = fs_write(world, join_path(src_root, "__mbt_compat_import.pion"), "import \"mbt_compat\" as mbt_compat\n")
+    let toml_sb = StringBuilder()
+    toml_sb.write_string("[package]\nname = \"mbt2pion_check\"\nversion = \"0.1.0\"\n\n[dependencies]\n")
+    let seen_dep : Map[String, Bool] = Map()
+    let mut has_mbt_compat = false
+    for dep in deps {
+      if !seen_dep.contains(dep.0) {
+        seen_dep[dep.0] = true
+        toml_sb.write_string(dep.0 + " = { path = \"" + dep.1 + "\" }\n")
+        if dep.0 == "mbt_compat" {
+          has_mbt_compat = true
+        }
+      }
+    }
+    let _ = fs_write(world, join_path(scratch_dir, "pion.toml"), toml_sb.to_string())
+    if inject_compat_import && has_mbt_compat {
+      let _ = fs_write(world, join_path(src_root, "__mbt_compat_import.pion"), "import \"mbt_compat\" as mbt_compat\n")
+    }
     for pair in batch {
       let fpath = join_path(src_root, pair.0)
       let parent = dirname(fpath)
@@ -124,8 +188,8 @@ fn run_pionc_check_batch(
       let _ = fs_write(world, fpath, pair.1)
     }
     return match proc_exec_capture(world, [pionc_bin, "check", "--json", scratch_dir]) {
-      Ok(out) => out
-      Err(out) => out
+      Ok(out) => (true, out)
+      Err(out) => (false, out)
     }
   }
   let argv : Array[String] = [pionc_bin, "check", "--json"]
@@ -139,22 +203,72 @@ fn run_pionc_check_batch(
     argv.push(fpath)
   }
   match proc_exec_capture(world, argv) {
-    Ok(out) => out
-    Err(out) => out
+    Ok(out) => (true, out)
+    Err(out) => (false, out)
+  }
+}
+
+///| Verify that `raw_json` is valid `pionc check --json` output with `"ok": true` and 0 diagnostics (P0-2).
+fn is_pionc_check_clean_json(raw_json : String) -> Bool {
+  let trimmed = raw_json.trim()
+  let start = trimmed.index_of("{")
+  if start < 0 {
+    return false
+  }
+  let clean = trimmed.slice(start, trimmed.length())
+  let root = match json::parse(clean) {
+    Ok(v) => v
+    Err(_) => return false
+  }
+  let ok_val = match json::obj_get(root, "ok") {
+    Some(v) => match json::as_bool(v) { Some(b) => b, None => false }
+    None => false
+  }
+  if !ok_val {
+    return false
+  }
+  match json::obj_get(root, "diagnostics") {
+    Some(arr_v) =>
+    match json::as_arr(arr_v) {
+      Some(items) => items.length() == 0
+      None => false
+    }
+    None => false
   }
 }
 
 ///| Normalize a generated `.pion` file with `pionc fmt` in a scratch file.
-fn run_pionc_fmt_file(world : World, pionc_bin : String, scratch_file : String, content : String) -> String {
+///| Returns `(ok, formatted_content)` and checks process exit status (P0-2/P0-4).
+fn run_pionc_fmt_file(world : World, pionc_bin : String, scratch_file : String, content : String) -> (Bool, String) {
   let parent = dirname(scratch_file)
   if parent.length() > 0 {
     let _ = fs_mkdir_p(world, parent)
   }
-  let _ = fs_write(world, scratch_file, content)
-  let _ = proc_exec(world, [pionc_bin, "fmt", scratch_file])
+  match fs_write(world, scratch_file, content) {
+    Ok(_) => ()
+    Err(_) => return (false, content)
+  }
+  let rc = proc_exec(world, [pionc_bin, "fmt", scratch_file])
+  if rc != 0 {
+    return (false, content)
+  }
   match fs_read(world, scratch_file) {
-    Ok(formatted) => formatted
-    Err(_) => content
+    Ok(formatted) => (true, formatted)
+    Err(_) => (false, content)
+  }
+}
+
+///| Check whether an existing `.pion` file is managed by `mbt2pion` (starts with generated header).
+fn is_managed_pion_file(world : World, full_path : String) -> Bool {
+  match fs_read(world, full_path) {
+    Ok(txt) => txt.starts_with("// GENERATED BY mbt2pion")
+    Err(_) => false
+  }
+}
+
+fn cleanup_scratch(world : World, scratch_root : String) -> Unit {
+  if scratch_root.length() > 0 {
+    let _ = proc_exec(world, ["rm", "-rf", scratch_root])
   }
 }
 
@@ -180,6 +294,8 @@ pub fn main(world : World) -> Int {
   let mut src_prefix = ""
   let mut explicit_pionc = ""
   let mut mbt_compat_dir = ""
+  let mut pkg_manifest_path = ""
+  let cli_deps : Array[(String, String)] = []
   let mut run_probes = true
   let mut run_fmt = true
 
@@ -240,6 +356,18 @@ pub fn main(world : World) -> Int {
     } else if a == "--mbt-compat" && i + 1 < args.length() {
       mbt_compat_dir = args[i + 1]
       i = i + 2
+    } else if a == "--package-manifest" && i + 1 < args.length() {
+      pkg_manifest_path = args[i + 1]
+      i = i + 2
+    } else if a == "--dep" && i + 1 < args.length() {
+      let spec = args[i + 1]
+      let eq_i = spec.index_of("=")
+      if eq_i <= 0 || eq_i + 1 >= spec.length() {
+        io_eprintln(world, "mbt2pion: invalid --dep `" + spec + "` (expected `name=path`)")
+        return 2
+      }
+      cli_deps.push((spec.slice(0, eq_i), spec.slice(eq_i + 1, spec.length())))
+      i = i + 2
     } else if a == "--no-probes" {
       run_probes = false
       i = i + 1
@@ -265,8 +393,36 @@ pub fn main(world : World) -> Int {
     io_eprintln(world, "mbt2pion: invalid --mode `" + mode + "` (expected `audit` or `publish`)")
     return 2
   }
+  // P0-2: `--no-probes` is strictly forbidden in `--mode publish`!
+  if mode == "publish" && !run_probes {
+    io_eprintln(world, "mbt2pion: --no-probes is forbidden in --mode publish (allowed only in --mode audit)")
+    return 2
+  }
+  // P0-4: validate `--src` is an existing readable directory BEFORE touching `--out`!
+  if !fs_is_dir(world, src_dir) {
+    io_eprintln(world, "mbt2pion: --src directory does not exist or is not readable: " + src_dir)
+    return 3
+  }
 
   let pre_diags : Array[m2p::Diag] = []
+
+  // Assemble real target package dependency graph (P0-3)
+  let check_deps : Array[(String, String)] = []
+  if mbt_compat_dir.length() > 0 {
+    check_deps.push(("mbt_compat", mbt_compat_dir))
+  }
+  if pkg_manifest_path.length() > 0 {
+    match fs_read(world, pkg_manifest_path) {
+      Ok(txt) => parse_manifest_deps(pkg_manifest_path, txt, check_deps)
+      Err(e) => {
+        io_eprintln(world, "mbt2pion: cannot read --package-manifest " + pkg_manifest_path + ": " + e)
+        return 3
+      }
+    }
+  }
+  for dep in cli_deps {
+    check_deps.push(dep)
+  }
 
   // Load optional `--api-map`
   let mut api_map_sha = "none"
@@ -319,9 +475,13 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  // Discover `.mbt` and `.mbti` files deterministically
+  // Discover `.mbt` and `.mbti` files deterministically; require >= 1 `.mbt` file (P0-4)
   let mbt_rels : Array[String] = []
   collect_files_sorted(world, src_dir, "", ".mbt", mbt_rels)
+  if mbt_rels.length() == 0 {
+    io_eprintln(world, "mbt2pion: no `.mbt` source files found in --src directory: " + src_dir)
+    return 3
+  }
   let sources : Array[m2p::SourceFile] = []
   for rel in mbt_rels {
     let full = join_path(src_dir, rel)
@@ -347,11 +507,23 @@ pub fn main(world : World) -> Int {
     }
   }
 
+  // Load optional `moon.pkg.json` / `moon.pkg` target filtering rules (P1-3)
+  let mut moon_pkg_content = ""
+  match fs_read(world, join_path(src_dir, "moon.pkg.json")) {
+    Ok(txt) => moon_pkg_content = txt
+    Err(_) =>
+    match fs_read(world, join_path(src_dir, "moon.pkg")) {
+      Ok(txt) => moon_pkg_content = txt
+      Err(_) => ()
+    }
+  }
+
   let opts = m2p::TranspileOptions::{
     target: target,
     mode: mode,
     with_tests: with_tests,
     src_prefix: src_prefix,
+    moon_pkg_content: moon_pkg_content,
     header: m2p::HeaderMeta::{
       mbt2pion_commit: mbt2pion_commit,
       toolchain_lock: toolchain_lock,
@@ -367,10 +539,19 @@ pub fn main(world : World) -> Int {
     Some(t) => if t.length() > 0 { t } else { "/tmp" }
     None => "/tmp"
   }
-  let scratch_root = join_path(tmp_base, "mbt2pion-scratch-" + start_ms.to_string())
+  let uniq_tag = m2p::content_sha256(src_dir + "|" + out_dir + "|" + start_ms.to_string()).slice(0, 12)
+  let scratch_root = join_path(tmp_base, "mbt2pion-scratch-" + start_ms.to_string() + "-" + uniq_tag)
 
   let check_cb = fn(batch : Array[(String, String)]) -> String {
-    run_pionc_check_batch(world, pionc_bin, join_path(scratch_root, "check"), mbt_compat_dir, batch)
+    let (_, raw_out) = run_pionc_check_batch_status(
+      world,
+      pionc_bin,
+      join_path(scratch_root, "check"),
+      check_deps,
+      true,
+      batch,
+    )
+    raw_out
   }
 
   let res = m2p::transpile_package(
@@ -385,11 +566,28 @@ pub fn main(world : World) -> Int {
     check_cb,
   )
 
-  // Optional `pionc fmt` canonicalization of every generated `.pion` file
+  let final_diags : Array[m2p::Diag] = []
+  for d in res.diagnostics {
+    final_diags.push(d)
+  }
+  let mut final_blockers = res.blockers
+
+  // Format every generated `.pion` file in scratch, checking exit code (P0-2/P0-4)
   let final_files : Array[m2p::GeneratedFile] = []
   for gf in res.files {
     let content = if run_fmt {
-      run_pionc_fmt_file(world, pionc_bin, join_path(scratch_root, "fmt/" + gf.rel_path), gf.content)
+      let (fmt_ok, formatted) = run_pionc_fmt_file(world, pionc_bin, join_path(scratch_root, "fmt/" + gf.rel_path), gf.content)
+      if !fmt_ok {
+        final_diags.push(m2p::diag_error(
+          "MBT2PION_FMT_FAILED",
+          gf.rel_path,
+          1,
+          1,
+          "pionc fmt failed on generated file `" + gf.rel_path + "` (pionc=" + pionc_bin + ")",
+        ))
+        final_blockers = final_blockers + 1
+      }
+      formatted
     } else {
       gf.content
     }
@@ -401,10 +599,41 @@ pub fn main(world : World) -> Int {
     })
   }
 
+  // P0-2: Final zero-diagnostic `pionc check --json` hard gate on the exact final formatted candidate package!
+  // Required for `--mode publish` and `--check` (and when `--pionc` is broken or diagnostics remain).
+  if (mode == "publish" || check_only) && final_blockers == 0 {
+    let final_batch : Array[(String, String)] = []
+    for gf in final_files {
+      final_batch.push((gf.rel_path, gf.content))
+    }
+    let (chk_ok, chk_raw) = run_pionc_check_batch_status(
+      world,
+      pionc_bin,
+      join_path(scratch_root, "final_check"),
+      check_deps,
+      false,
+      final_batch,
+    )
+    if !chk_ok || !is_pionc_check_clean_json(chk_raw) {
+      let rem_diags = m2p::parse_pionc_diagnostics(chk_raw)
+      final_diags.push(m2p::diag_error(
+        "MBT2PION_FINAL_CHECK_FAILED",
+        "<final_check>",
+        1,
+        1,
+        "final pionc check --json failed (exit_ok=" + chk_ok.to_string() + ", diagnostics=" + rem_diags.length().to_string() + ")",
+      ))
+      final_blockers = final_blockers + 1
+    }
+  }
+
+  // P1-6: Recompute final span_map pointing to exact final formatted bytes/lines/cols
+  let final_span_map = m2p::finalize_span_map(final_files, res.span_map)
+
   let final_res = m2p::TranspileResult::{
     files: final_files,
-    span_map: res.span_map,
-    diagnostics: res.diagnostics,
+    span_map: final_span_map,
+    diagnostics: final_diags,
     drift_ledger: res.drift_ledger,
     dispositions: res.dispositions,
     pionc_diag_histogram: res.pionc_diag_histogram,
@@ -412,7 +641,7 @@ pub fn main(world : World) -> Int {
     probes_instrumented: res.probes_instrumented,
     probes_resolved: res.probes_resolved,
     stage_b_iterations: res.stage_b_iterations,
-    blockers: res.blockers,
+    blockers: final_blockers,
   }
 
   // Write reports if requested (always written in both audit and publish modes)
@@ -434,9 +663,11 @@ pub fn main(world : World) -> Int {
   let mut exit_code = 0
 
   if check_only {
-    // `--check`: verify full-byte equality (including headers) against `--out`
+    // `--check`: verify managed file set equality AND full-byte equality (including headers) against `--out` (P0-4)
     let mut diffs = 0
+    let expected_set : Map[String, Bool] = Map()
     for gf in final_res.files {
+      expected_set[gf.rel_path] = true
       let dst = join_path(out_dir, gf.rel_path)
       match fs_read(world, dst) {
         Ok(existing) =>
@@ -450,11 +681,19 @@ pub fn main(world : World) -> Int {
         }
       }
     }
+    let existing_pions : Array[String] = []
+    collect_files_sorted(world, out_dir, "", ".pion", existing_pions)
+    for rel in existing_pions {
+      if !expected_set.contains(rel) && is_managed_pion_file(world, join_path(out_dir, rel)) {
+        io_eprintln(world, "mbt2pion --check: unexpected stale managed file " + rel)
+        diffs = diffs + 1
+      }
+    }
     if final_res.blockers > 0 || diffs > 0 {
       exit_code = 1
     }
   } else if mode == "publish" {
-    // `--mode publish`: atomic write to `--out` ONLY when 0 blockers remain!
+    // `--mode publish`: atomic staged write to `--out` ONLY when 0 blockers remain (P0-4)!
     if final_res.blockers > 0 {
       io_eprintln(
         world,
@@ -467,33 +706,65 @@ pub fn main(world : World) -> Int {
       }
       exit_code = 1
     } else {
-      // Stage into a sibling temp directory, then move files atomically into `--out`
-      let _ = fs_mkdir_p(world, out_dir)
-      let expected_set : Map[String, Bool] = Map()
+      // Pre-check that no destination path is occupied by an existing directory before modifying `--out`!
+      let mut pre_ok = true
       for gf in final_res.files {
-        expected_set[gf.rel_path] = true
         let dst = join_path(out_dir, gf.rel_path)
-        let parent = dirname(dst)
-        if parent.length() > 0 {
-          let _ = fs_mkdir_p(world, parent)
-        }
-        let tmp_dst = dst + ".mbt2pion.tmp"
-        match fs_write(world, tmp_dst, gf.content) {
-          Ok(_) => {
-            let _ = fs_rename(world, tmp_dst, dst)
-          }
-          Err(e) => {
-            io_eprintln(world, "mbt2pion: failed writing " + dst + ": " + e)
-            exit_code = 3
-          }
+        if fs_is_dir(world, dst) {
+          io_eprintln(world, "mbt2pion: destination path is a directory, cannot overwrite: " + dst)
+          pre_ok = false
         }
       }
-      // Prune stale generated `.pion` files in `--out` whose source `.mbt` was deleted
-      let existing_pions : Array[String] = []
-      collect_files_sorted(world, out_dir, "", ".pion", existing_pions)
-      for rel in existing_pions {
-        if !expected_set.contains(rel) {
-          let _ = fs_remove(world, join_path(out_dir, rel))
+      if !pre_ok {
+        exit_code = 3
+      } else {
+        let _ = fs_mkdir_p(world, out_dir)
+        let expected_set : Map[String, Bool] = Map()
+        let staged_tmps : Array[(String, String)] = []
+        let mut stage_ok = true
+        for gf in final_res.files {
+          expected_set[gf.rel_path] = true
+          let dst = join_path(out_dir, gf.rel_path)
+          let parent = dirname(dst)
+          if parent.length() > 0 {
+            let _ = fs_mkdir_p(world, parent)
+          }
+          let tmp_dst = dst + ".mbt2pion." + uniq_tag + ".tmp"
+          match fs_write(world, tmp_dst, gf.content) {
+            Ok(_) => staged_tmps.push((tmp_dst, dst))
+            Err(e) => {
+              io_eprintln(world, "mbt2pion: failed staging " + tmp_dst + ": " + e)
+              stage_ok = false
+            }
+          }
+        }
+        if !stage_ok {
+          for pair in staged_tmps {
+            let _ = fs_remove(world, pair.0)
+          }
+          exit_code = 3
+        } else {
+          for pair in staged_tmps {
+            if !fs_rename(world, pair.0, pair.1) {
+              io_eprintln(world, "mbt2pion: failed committing " + pair.1)
+              let _ = fs_remove(world, pair.0)
+              exit_code = 3
+            }
+          }
+          // Prune ONLY stale managed `.pion` files (starting with `// GENERATED BY mbt2pion`);
+          // NEVER delete hand-written `.pion` files (e.g. `main.pion`)!
+          if exit_code == 0 {
+            let existing_pions : Array[String] = []
+            collect_files_sorted(world, out_dir, "", ".pion", existing_pions)
+            for rel in existing_pions {
+              if !expected_set.contains(rel) {
+                let full = join_path(out_dir, rel)
+                if is_managed_pion_file(world, full) {
+                  let _ = fs_remove(world, full)
+                }
+              }
+            }
+          }
         }
       }
     }
@@ -506,7 +777,13 @@ pub fn main(world : World) -> Int {
       if parent.length() > 0 {
         let _ = fs_mkdir_p(world, parent)
       }
-      let _ = fs_write(world, dst, gf.content)
+      match fs_write(world, dst, gf.content) {
+        Ok(_) => ()
+        Err(e) => {
+          io_eprintln(world, "mbt2pion: failed writing " + dst + ": " + e)
+          exit_code = 3
+        }
+      }
     }
   }
 
@@ -527,5 +804,6 @@ pub fn main(world : World) -> Int {
     )
   }
 
+  cleanup_scratch(world, scratch_root)
   exit_code
 }

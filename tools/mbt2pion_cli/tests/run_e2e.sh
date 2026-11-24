@@ -40,7 +40,7 @@ mkdir -p "$SRC_A" "$SRC_B"
 
 cat > "$SRC_A/demo.mbt" << 'EOF'
 pub enum Tri {
-  Tri(Int, Int, Int)
+  Tri(Int, b~ : Int, c~ : Int)
   Empty
 }
 
@@ -68,7 +68,7 @@ pub fn match_tri(t : Tri) -> Int {
 
 #callsite(autofill(loc))
 pub fn audit_log(msg : String, loc~ : SourceLoc) -> String {
-  msg + "@" + loc
+  msg + "@" + loc.to_string()
 }
 
 pub fn val_guard_demo(flag : Bool) -> Int {
@@ -137,17 +137,20 @@ EOF
 cp "$SRC_A/demo.mbt" "$SRC_B/demo.mbt"
 
 "$BIN" --src "$SRC_A" --out "$OUT_A" --target native --mode publish \
+  --mbt-compat "$COMPAT_DIR" \
   --mbt2pion-commit "test-sha" --toolchain-lock "lock-v1" --source-commit "src-v1" \
   --report "$WORK/report_a.json" --drift-ledger "$WORK/drift_a.json" --run-report "$WORK/run_a.json" \
   --pionc "$PIONC"
 
 # Verify `--check` passes with 0 diff
 "$BIN" --src "$SRC_A" --out "$OUT_A" --target native --check \
+  --mbt-compat "$COMPAT_DIR" \
   --mbt2pion-commit "test-sha" --toolchain-lock "lock-v1" --source-commit "src-v1" \
   --pionc "$PIONC"
 
 # Run from a second completely different absolute path
 "$BIN" --src "$SRC_B" --out "$OUT_B" --target native --mode publish \
+  --mbt-compat "$COMPAT_DIR" \
   --mbt2pion-commit "test-sha" --toolchain-lock "lock-v1" --source-commit "src-v1" \
   --report "$WORK/report_b.json" --drift-ledger "$WORK/drift_b.json" --run-report "$WORK/run_b.json" \
   --pionc "$PIONC"
@@ -262,7 +265,7 @@ pub fn make_item() -> Ref[Int] {
   { val: 7 }
 }
 EOF
-"$BIN" --src "$ACME_SRC" --out "$ACME_OUT" --target native --mode publish \
+"$BIN" --src "$ACME_SRC" --out "$ACME_OUT" --target native --mode audit \
   --api-map "$WORK/acme_map.json" --recipes "$WORK/acme_recipes.toml" \
   --no-probes --pionc "$PIONC"
 
@@ -294,7 +297,7 @@ cat > "$WORK/bad_map.json" << 'EOF'
   ]
 }
 EOF
-if "$BIN" --src "$ACME_SRC" --out "$NEG_OUT" --target native --mode publish --api-map "$WORK/bad_map.json" --no-probes --pionc "$PIONC" 2>/dev/null; then
+if "$BIN" --src "$ACME_SRC" --out "$NEG_OUT" --target native --mode publish --api-map "$WORK/bad_map.json" --pionc "$PIONC" 2>/dev/null; then
   echo "[e2e] FAIL: untagged offset param should have exited non-zero"
   exit 1
 fi
@@ -307,10 +310,11 @@ cat > "$NEG_DERIVE/bad.mbt" << 'EOF'
 #derive(UnknownTrait)
 pub struct S { x : Int }
 EOF
-if "$BIN" --src "$NEG_DERIVE" --out "$NEG_OUT" --target native --mode publish --no-probes --pionc "$PIONC" 2>/dev/null; then
+if "$BIN" --src "$NEG_DERIVE" --out "$NEG_OUT" --target native --mode publish --pionc "$PIONC" 2>/dev/null; then
   echo "[e2e] FAIL: unknown #derive should have exited non-zero"
   exit 1
 fi
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
 # 5c. Cyclic top-level initialization
 NEG_CYC="$WORK/neg_cyc"
@@ -319,10 +323,11 @@ cat > "$NEG_CYC/cyc.mbt" << 'EOF'
 let a : Int = b + 1
 let b : Int = a + 1
 EOF
-if "$BIN" --src "$NEG_CYC" --out "$NEG_OUT" --target native --mode publish --no-probes --pionc "$PIONC" 2>/dev/null; then
+if "$BIN" --src "$NEG_CYC" --out "$NEG_OUT" --target native --mode publish --pionc "$PIONC" 2>/dev/null; then
   echo "[e2e] FAIL: cyclic init should have exited non-zero"
   exit 1
 fi
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
 # 5d. Stale overlay after upstream function body change
 NEG_OV_SRC="$WORK/neg_ov_src"
@@ -347,12 +352,56 @@ cat > "$NEG_OV_DIR/ov.json" << 'EOF'
   "upstream_issue_or_removal_condition": "issue#1"
 }
 EOF
-if "$BIN" --src "$NEG_OV_SRC" --out "$NEG_OUT" --target native --mode publish --overlay-dir "$NEG_OV_DIR" --no-probes --pionc "$PIONC" 2>/dev/null; then
+if "$BIN" --src "$NEG_OV_SRC" --out "$NEG_OUT" --target native --mode publish --overlay-dir "$NEG_OV_DIR" --pionc "$PIONC" 2>/dev/null; then
   echo "[e2e] FAIL: stale overlay should have exited non-zero"
   exit 1
 fi
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
-echo "[e2e] PASS: all 4 negative tests rejected & publish left --out untouched"
+
+# 5e. `--no-probes` is strictly forbidden in `--mode publish` (P0-2)
+if "$BIN" --src "$SRC_A" --out "$NEG_OUT" --target native --mode publish --no-probes --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: --no-probes in --mode publish should have exited non-zero"
+  exit 1
+fi
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
+# 5f. Nonexistent `--pionc` fails hard in `--mode publish` (P0-2)
+if "$BIN" --src "$SRC_A" --out "$NEG_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --pionc "/nonexistent/pionc" 2>/dev/null; then
+  echo "[e2e] FAIL: nonexistent --pionc should have exited non-zero"
+  exit 1
+fi
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
+# 5g. Missing `--src` directory fails non-zero and never wipes `--out` (P0-4)
+if "$BIN" --src "$WORK/does_not_exist" --out "$NEG_OUT" --target native --mode publish --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: missing --src should have exited non-zero"
+  exit 1
+fi
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
+# 5h. Hand-written `main.pion` preserved; stale managed `.pion` pruned; `--check` catches extra managed `.pion` (P0-4)
+echo "// hand-written entry" > "$OUT_A/main.pion"
+echo "// GENERATED BY mbt2pion — DO NOT HAND-EDIT" > "$OUT_A/stale_extra.pion"
+if "$BIN" --src "$SRC_A" --out "$OUT_A" --target native --check --mbt-compat "$COMPAT_DIR" --mbt2pion-commit "test-sha" --toolchain-lock "lock-v1" --source-commit "src-v1" --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: --check should have detected unexpected stale managed file"
+  exit 1
+fi
+"$BIN" --src "$SRC_A" --out "$OUT_A" --target native --mode publish --mbt-compat "$COMPAT_DIR" --mbt2pion-commit "test-sha" --toolchain-lock "lock-v1" --source-commit "src-v1" --pionc "$PIONC"
+test -f "$OUT_A/main.pion"
+test ! -f "$OUT_A/stale_extra.pion"
+
+# 5i. Destination path occupied by directory exits non-zero and leaves no `.mbt2pion.*.tmp` (P0-4)
+OCC_OUT="$WORK/occ_out"
+mkdir -p "$OCC_OUT/demo.pion"
+if "$BIN" --src "$SRC_A" --out "$OCC_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --pionc "$PIONC" 2>/dev/null; then
+  echo "[e2e] FAIL: directory-occupied destination should have exited non-zero"
+  exit 1
+fi
+if ls "$OCC_OUT"/*.tmp 2>/dev/null; then
+  echo "[e2e] FAIL: leftover .tmp file after failed publish"
+  exit 1
+fi
+echo "[e2e] PASS: all negative & atomic-publish tests rejected & preserved --out / hand-written files"
 
 # -----------------------------------------------------------------------------
 # Test 6: Cross-package live pionc check + run covering BUG-1..BUG-7
@@ -473,7 +522,10 @@ pub fn xpkg_smoke(xs : Array[(Int?, String?)]) -> Int {
 EOF
 
 "$BIN" --src "$XPKG_SRC" --out "$XPKG_APP/src" --target native --mode publish \
-  --recipes "$WORK/xpkg_recipes.toml" --no-probes --pionc "$PIONC"
+  --recipes "$WORK/xpkg_recipes.toml" \
+  --mbt-compat "$COMPAT_DIR" \
+  --dep "p1=$XPKG_P1" --dep "p2=$XPKG_P2" \
+  --pionc "$PIONC"
 
 grep -q '^import "p1"$' "$XPKG_APP/src/app_lib.pion"
 grep -q '^import "p2"$' "$XPKG_APP/src/app_lib.pion"

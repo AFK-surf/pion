@@ -21,6 +21,7 @@ pub struct InitItem {
   code : String
   referenced_idents : Array[String]
   called_fns : Array[String]
+  arg_closure_refs : Array[(String, Array[String])]
 }
 
 pub struct FnBodyRefs {
@@ -73,20 +74,144 @@ fn init_find_matching(tokens : Array[Token], open_i : Int, end : Int) -> Int {
   if end > open_i { end - 1 } else { open_i }
 }
 
-///| Collect immediate initialization-time identifier references and called functions from `[start, end)`.
-///| Skips closure bodies (`fn(...) { ... }` and `(...) => ...`) because closures do NOT execute
-///| during top-level initialization, and records `called_fns` ONLY for identifiers immediately
-///| followed by `(` so uncalled function-value references do not trigger false transitive cycles.
-pub fn collect_init_refs(tokens : Array[Token], start : Int, end : Int) -> (Array[String], Array[String]) {
-  let seen_val : Map[String, Bool] = Map()
-  let seen_call : Map[String, Bool] = Map()
-  let val_out : Array[String] = []
-  let call_out : Array[String] = []
+///| Collect ALL identifiers (including inside closures) from a token slice `[start, end)`.
+///| Used when a closure is immediately invoked `(fn() { z })()` or passed as a call argument
+///| `invoke(fn() { z })` where the callee may invoke the callback during initialization (P1-1).
+fn collect_all_idents_flat(tokens : Array[Token], start : Int, end : Int) -> Array[String] {
+  let seen : Map[String, Bool] = Map()
+  let out : Array[String] = []
   let lim = if end < tokens.length() { end } else { tokens.length() }
   let mut i = start
   while i < lim {
     let t = tokens[i]
-    // Skip anonymous closure literal `fn(...) [-> Ret] { ... }`
+    if t.kind == TokenKind::Ident {
+      let prev_dot_or_cc = i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)
+      if !prev_dot_or_cc && !seen.contains(t.raw) {
+        seen[t.raw] = true
+        out.push(t.raw)
+      }
+    }
+    i = i + 1
+  }
+  out
+}
+
+///| Collect immediate initialization-time identifier references, called functions, and
+///| closures passed as arguments to calls (`callee(fn() { z })`) from `[start, end)`.
+///| - Stored closures (`let f = fn() { z }`) are skipped (not executed during init).
+///| - Immediately invoked closures (`(fn() { z })()`) are collected as immediate dependencies.
+///| - Closures passed as call arguments (`invoke(fn() { z })`) are recorded in `arg_closure_refs`
+///|   so `topo_sort_init_items` includes their captured deps when `invoke` calls its callback!
+pub fn collect_init_refs_full(
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+) -> (Array[String], Array[String], Array[(String, Array[String])]) {
+  let seen_val : Map[String, Bool] = Map()
+  let seen_call : Map[String, Bool] = Map()
+  let val_out : Array[String] = []
+  let call_out : Array[String] = []
+  let arg_closures : Array[(String, Array[String])] = []
+  let lim = if end < tokens.length() { end } else { tokens.length() }
+  let mut i = start
+  while i < lim {
+    let t = tokens[i]
+    // Check immediately-invoked parenthesized closure `(fn(...) { ... })(...)`
+    if t.kind == TokenKind::LParen && i + 1 < lim && tokens[i + 1].kind == TokenKind::Keyword && tokens[i + 1].raw == "fn" {
+      let rp = init_find_matching(tokens, i, lim)
+      if rp + 1 < lim && tokens[rp + 1].kind == TokenKind::LParen {
+        // Immediately invoked! Collect its body refs directly.
+        let inner = collect_all_idents_flat(tokens, i + 1, rp)
+        for r in inner {
+          if !seen_val.contains(r) {
+            seen_val[r] = true
+            val_out.push(r)
+          }
+        }
+        i = rp + 1
+        continue
+      }
+    }
+    // Check function call `callee(...)`: if any argument is a closure, record it in `arg_closures`!
+    if t.kind == TokenKind::Ident && i + 1 < lim && tokens[i + 1].kind == TokenKind::LParen {
+      let prev_dot_or_cc = i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)
+      let callee_name = t.raw
+      if !prev_dot_or_cc {
+        if !seen_val.contains(callee_name) {
+          seen_val[callee_name] = true
+          val_out.push(callee_name)
+        }
+        if !seen_call.contains(callee_name) {
+          seen_call[callee_name] = true
+          call_out.push(callee_name)
+        }
+      }
+      let rp = init_find_matching(tokens, i + 1, lim)
+      // Scan arguments for closure literals `fn(...) { ... }` or `(...) => ...`
+      let mut ai = i + 2
+      while ai < rp {
+        let at = tokens[ai]
+        if at.kind == TokenKind::Keyword && at.raw == "fn" && ai + 1 < rp && tokens[ai + 1].kind == TokenKind::LParen {
+          let arp = init_find_matching(tokens, ai + 1, rp)
+          let mut alb = arp + 1
+          let mut ad = 0
+          while alb < rp {
+            let ak = tokens[alb].kind
+            if ak == TokenKind::LParen || ak == TokenKind::LBracket {
+              ad = ad + 1
+            } else if ak == TokenKind::RParen || ak == TokenKind::RBracket {
+              ad = ad - 1
+            } else if ak == TokenKind::LBrace && ad == 0 {
+              break
+            }
+            alb = alb + 1
+          }
+          if alb < rp && tokens[alb].kind == TokenKind::LBrace {
+            let arb = init_find_matching(tokens, alb, rp)
+            let caps = collect_all_idents_flat(tokens, alb + 1, arb)
+            if caps.length() > 0 {
+              arg_closures.push((callee_name, caps))
+            }
+            ai = arb + 1
+            continue
+          }
+        }
+        if at.kind == TokenKind::LParen {
+          let arp = init_find_matching(tokens, ai, rp)
+          if arp + 1 < rp && tokens[arp + 1].kind == TokenKind::FatArrow {
+            let bstart = arp + 2
+            let mut bend = bstart
+            if bstart < rp && tokens[bstart].kind == TokenKind::LBrace {
+              bend = init_find_matching(tokens, bstart, rp) + 1
+            } else {
+              let mut bd = 0
+              while bend < rp {
+                let bk = tokens[bend].kind
+                if bk == TokenKind::LParen || bk == TokenKind::LBracket || bk == TokenKind::LBrace {
+                  bd = bd + 1
+                } else if bk == TokenKind::RParen || bk == TokenKind::RBracket || bk == TokenKind::RBrace {
+                  if bd == 0 { break }
+                  bd = bd - 1
+                } else if bd == 0 && bk == TokenKind::Comma {
+                  break
+                }
+                bend = bend + 1
+              }
+            }
+            let caps = collect_all_idents_flat(tokens, bstart, bend)
+            if caps.length() > 0 {
+              arg_closures.push((callee_name, caps))
+            }
+            ai = bend
+            continue
+          }
+        }
+        ai = ai + 1
+      }
+      i = i + 2
+      continue
+    }
+    // Skip stored anonymous closure literal `fn(...) [-> Ret] { ... }`
     if t.kind == TokenKind::Keyword && t.raw == "fn" && i + 1 < lim && tokens[i + 1].kind == TokenKind::LParen {
       let rp = init_find_matching(tokens, i + 1, lim)
       let mut lb = rp + 1
@@ -108,7 +233,7 @@ pub fn collect_init_refs(tokens : Array[Token], start : Int, end : Int) -> (Arra
         continue
       }
     }
-    // Skip arrow closure literal `(...) => { ... }` or `(...) => <expr>`
+    // Skip stored arrow closure literal `(...) => { ... }` or `(...) => <expr>`
     if t.kind == TokenKind::LParen {
       let rp = init_find_matching(tokens, i, lim)
       if rp + 1 < lim && tokens[rp + 1].kind == TokenKind::FatArrow {
@@ -118,7 +243,6 @@ pub fn collect_init_refs(tokens : Array[Token], start : Int, end : Int) -> (Arra
           i = rb + 1
           continue
         }
-        // Single-expression arrow body: skip to `,`, `)`, `]`, `}`, `;`, or newline at depth 0
         let mut be = body_start
         let mut bd = 0
         while be < lim {
@@ -143,7 +267,6 @@ pub fn collect_init_refs(tokens : Array[Token], start : Int, end : Int) -> (Arra
       }
     }
     if t.kind == TokenKind::Ident {
-      // Skip field accesses `.ident` and qualified `pkg::ident`
       let prev_dot_or_cc = i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)
       if !prev_dot_or_cc {
         if !seen_val.contains(t.raw) {
@@ -160,7 +283,13 @@ pub fn collect_init_refs(tokens : Array[Token], start : Int, end : Int) -> (Arra
     }
     i = i + 1
   }
-  (val_out, call_out)
+  (val_out, call_out, arg_closures)
+}
+
+///| Collect immediate initialization-time identifier references and called functions from `[start, end)`.
+pub fn collect_init_refs(tokens : Array[Token], start : Int, end : Int) -> (Array[String], Array[String]) {
+  let (v, c, _) = collect_init_refs_full(tokens, start, end)
+  (v, c)
 }
 
 ///| Collect unique immediate identifier references from `[start, end)` (skipping closure bodies).
@@ -282,9 +411,33 @@ pub fn topo_sort_init_items(
   }
   i = 0
   while i < n {
+    // Merge captured identifiers from closures passed to calls during init (P1-1):
+    // if the callee is external/unknown OR calls a function/parameter, include its captured deps!
+    let eff_vals : Array[String] = []
+    for vr in items[i].referenced_idents {
+      eff_vals.push(vr)
+    }
+    let eff_calls : Array[String] = []
+    for cr in items[i].called_fns {
+      eff_calls.push(cr)
+    }
+    for pair in items[i].arg_closure_refs {
+      let callee = pair.0
+      let caps = pair.1
+      let may_invoke = match fn_call_refs_by_name.get(callee) {
+        Some(cc) => cc.length() > 0
+        None => true
+      }
+      if may_invoke {
+        for cap in caps {
+          eff_vals.push(cap)
+          eff_calls.push(cap)
+        }
+      }
+    }
     let deps = compute_transitive_deps(
-      items[i].referenced_idents,
-      items[i].called_fns,
+      eff_vals,
+      eff_calls,
       let_id_by_name,
       fn_val_refs_by_name,
       fn_call_refs_by_name,

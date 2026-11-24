@@ -29,6 +29,7 @@ pub struct ProbeSite {
   lhs_expr : String
   rhs_expr : String
   divisor_is_zero : Bool
+  divisor_is_nonzero : Bool
 }
 
 pub struct ProbeResult {
@@ -266,30 +267,83 @@ fn find_receiver_start(tokens : Array[Token], end_idx : Int) -> Int {
   -1
 }
 
-///| Find end token index (inclusive) of a simple/postfix RHS expression for `/` or `%`.
+///| Find end token index (inclusive) of a unary/postfix RHS operand for `*`, `/`, or `%`.
+///| Handles unary `-` / `+` / `!` (e.g. `a / -b`, `a / -(b + c)`), parenthesized `(b - c)`,
+///| field chains `h.n`, qualified `pkg::fn(x)`, and indexed `arr[i]`.
 fn find_rhs_end(tokens : Array[Token], start_idx : Int, limit : Int) -> Int {
-  if start_idx >= limit {
+  let mut cur = start_idx
+  while cur < limit && (tokens[cur].kind == TokenKind::Minus || tokens[cur].kind == TokenKind::Plus || tokens[cur].kind == TokenKind::Bang) {
+    cur = cur + 1
+  }
+  if cur >= limit {
     return -1
   }
-  let k = tokens[start_idx].kind
+  let k = tokens[cur].kind
   if k == TokenKind::LParen {
-    return find_matching_delim(tokens, start_idx)
+    cur = find_matching_delim(tokens, cur)
+  } else if k == TokenKind::Ident || k == TokenKind::UpperIdent || k == TokenKind::IntLit || k == TokenKind::FloatLit {
+    // primary atom
+    let _ = 0
+  } else {
+    return -1
   }
-  if k == TokenKind::Ident || k == TokenKind::IntLit || k == TokenKind::FloatLit {
-    let mut cur = start_idx
-    while cur + 1 < limit {
-      let nk = tokens[cur + 1].kind
-      if nk == TokenKind::Dot && cur + 2 < limit && tokens[cur + 2].kind == TokenKind::Ident {
-        cur = cur + 2
-      } else if nk == TokenKind::LParen || nk == TokenKind::LBracket {
-        cur = find_matching_delim(tokens, cur + 1)
+  while cur + 1 < limit {
+    let nk = tokens[cur + 1].kind
+    if (nk == TokenKind::Dot || nk == TokenKind::ColonColon) && cur + 2 < limit &&
+    (tokens[cur + 2].kind == TokenKind::Ident || tokens[cur + 2].kind == TokenKind::UpperIdent) {
+      cur = cur + 2
+    } else if nk == TokenKind::LParen || nk == TokenKind::LBracket {
+      cur = find_matching_delim(tokens, cur + 1)
+    } else {
+      break
+    }
+  }
+  cur
+}
+
+///| Walk backwards across a full left-associative multiplicative LHS chain (`a * b`, `xs[i] * 2`,
+///| `pkg::f(x) * 3L`, unary `-a`) ending at `end_idx` (inclusive).
+///| Returns the starting token index of the full LHS operand of `/` or `%`.
+fn find_mul_lhs_start(tokens : Array[Token], end_idx : Int) -> Int {
+  let mut start = find_receiver_start(tokens, end_idx)
+  if start < 0 {
+    return -1
+  }
+  // Include leading unary `-` if preceded by an operator/delimiter/keyword
+  if start > 0 && tokens[start - 1].kind == TokenKind::Minus {
+    let is_unary = if start == 1 {
+      true
+    } else {
+      let pk = tokens[start - 2].kind
+      pk != TokenKind::Ident && pk != TokenKind::UpperIdent && pk != TokenKind::IntLit &&
+      pk != TokenKind::FloatLit && pk != TokenKind::RParen && pk != TokenKind::RBracket
+    }
+    if is_unary {
+      start = start - 1
+    }
+  }
+  // Extend left across `*`, `/`, `%` (same precedence, left-associative!)
+  while start >= 2 &&
+  (tokens[start - 1].kind == TokenKind::Star || tokens[start - 1].kind == TokenKind::Slash || tokens[start - 1].kind == TokenKind::Percent) {
+    let prev_start = find_receiver_start(tokens, start - 2)
+    if prev_start < 0 {
+      break
+    }
+    start = prev_start
+    if start > 0 && tokens[start - 1].kind == TokenKind::Minus {
+      let is_unary = if start == 1 {
+        true
       } else {
-        break
+        let pk = tokens[start - 2].kind
+        pk != TokenKind::Ident && pk != TokenKind::UpperIdent && pk != TokenKind::IntLit &&
+        pk != TokenKind::FloatLit && pk != TokenKind::RParen && pk != TokenKind::RBracket
+      }
+      if is_unary {
+        start = start - 1
       }
     }
-    return cur
   }
-  -1
+  start
 }
 
 ///| Check whether a receiver starting at `recv_start` is inside a declaration header or `mbt_compat::` call.
@@ -312,6 +366,10 @@ fn is_non_expr_receiver(tokens : Array[Token], recv_start : Int) -> Bool {
 ///| Supports chained/complex receivers (`self.text.length()`, `f().length()`, `arr[i].length()`,
 ///| `(a + b) / n`, `self.r.val`, `"{d}"`) while skipping already-rewritten `mbt_compat::*` calls.
 pub fn instrument_probes_for_file(file : String, content : String) -> (String, Array[ProbeSite]) {
+  instrument_probes_for_file_opts(file, content, true)
+}
+
+fn instrument_probes_for_file_opts(file : String, content : String, verify_const_nonzero : Bool) -> (String, Array[ProbeSite]) {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
   let sites : Array[ProbeSite] = []
@@ -326,45 +384,65 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
       continue
     }
 
-    // 0. Interpolated string `"...\{x}..."` where `x` is a simple identifier -> probe `x.mbt_show_probe()`
+    // 0. Interpolated string `"...\{expr}..."` — recursively instrument ANY inner expression
+    //    (e.g. `"r=\{a / b} len=\{s.length()}"`) AND probe simple idents for `Double` formatting!
     if t.kind == TokenKind::InterpString {
       let parts = split_interp_string(t.raw, false)
-      let mut has_ident_interp = false
+      let mut any_interp_probe = false
+      let rebuilt = StringBuilder()
+      rebuilt.write_string("\"")
+      let mut part_off = t.start_byte + 1
       for p in parts {
-        if p.is_expr {
-          let et = p.text.trim()
-          if et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
-            has_ident_interp = true
-          }
-        }
-      }
-      if has_ident_interp {
-        let rebuilt = StringBuilder()
-        rebuilt.write_string("\"")
-        for p in parts {
-          if !p.is_expr {
-            rebuilt.write_string(p.text)
+        if !p.is_expr {
+          rebuilt.write_string(p.text)
+          part_off = part_off + p.text.length()
+        } else {
+          // `p.text` sits inside `\{` ... `}`
+          let expr_start_byte = part_off + 2
+          let (inner_inst, inner_sites) = instrument_probes_for_file(file, p.text)
+          if inner_sites.length() > 0 {
+            any_interp_probe = true
+            for isite in inner_sites {
+              sites.push(ProbeSite::{
+                file: file,
+                probe_kind: isite.probe_kind,
+                start_byte: expr_start_byte + isite.start_byte,
+                end_byte: expr_start_byte + isite.end_byte,
+                line: t.line,
+                col: t.col,
+                lhs_expr: isite.lhs_expr,
+                rhs_expr: isite.rhs_expr,
+                divisor_is_zero: isite.divisor_is_zero,
+                divisor_is_nonzero: isite.divisor_is_nonzero,
+              })
+            }
+            rebuilt.write_string("\\{" + inner_inst + "}")
           } else {
             let et = p.text.trim()
             if et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
+              any_interp_probe = true
               sites.push(ProbeSite::{
                 file: file,
                 probe_kind: "mbt_show_probe",
-                start_byte: t.start_byte,
-                end_byte: t.end_byte,
+                start_byte: expr_start_byte,
+                end_byte: expr_start_byte + p.text.length(),
                 line: t.line,
                 col: t.col,
                 lhs_expr: et,
-                rhs_expr: t.raw,
+                rhs_expr: "__INTERP_SHOW__",
                 divisor_is_zero: false,
+                divisor_is_nonzero: false,
               })
               rebuilt.write_string("\\{" + et + ".mbt_show_probe()}")
             } else {
               rebuilt.write_string("\\{" + p.text + "}")
             }
           }
+          part_off = part_off + 2 + p.text.length() + 1
         }
-        rebuilt.write_string("\"")
+      }
+      rebuilt.write_string("\"")
+      if any_interp_probe {
         edits.push((t.start_byte, t.end_byte, rebuilt.to_string()))
         covered_end = t.end_byte
         i = i + 1
@@ -393,6 +471,7 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
             lhs_expr: recv_expr,
             rhs_expr: "",
             divisor_is_zero: false,
+            divisor_is_nonzero: false,
           })
           edits.push((start_b, end_b, recv_expr + ".mbt_len_probe()"))
           covered_end = end_b
@@ -423,6 +502,7 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
             lhs_expr: recv_expr,
             rhs_expr: "",
             divisor_is_zero: false,
+            divisor_is_nonzero: false,
           })
           edits.push((start_b, end_b, recv_expr + ".mbt_show_probe()"))
           covered_end = end_b
@@ -449,6 +529,7 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
           lhs_expr: recv_expr,
           rhs_expr: "",
           divisor_is_zero: false,
+          divisor_is_nonzero: false,
         })
         edits.push((start_b, end_b, recv_expr + ".mbt_val_probe()"))
         covered_end = end_b
@@ -463,8 +544,10 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
       let next_is_eq = close_br + 1 < n && tokens[close_br + 1].kind == TokenKind::Eq
       let next_is_probe_dot = close_br + 2 < n && tokens[close_br + 1].kind == TokenKind::Dot &&
       (tokens[close_br + 2].raw == "length" || tokens[close_br + 2].raw == "to_string" || tokens[close_br + 2].raw == "val")
+      let next_is_mul_div = close_br + 1 < n &&
+      (tokens[close_br + 1].kind == TokenKind::Star || tokens[close_br + 1].kind == TokenKind::Slash || tokens[close_br + 1].kind == TokenKind::Percent)
       let recv_start = find_receiver_start(tokens, i - 1)
-      if !next_is_eq && !next_is_probe_dot && recv_start >= 0 && close_br > i + 1 &&
+      if !next_is_eq && !next_is_probe_dot && !next_is_mul_div && recv_start >= 0 && close_br > i + 1 &&
       tokens[recv_start].start_byte >= covered_end &&
       tokens[i - 1].kind != TokenKind::UpperIdent &&
       !is_non_expr_receiver(tokens, recv_start) {
@@ -482,6 +565,7 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
           lhs_expr: recv_expr,
           rhs_expr: idx_expr,
           divisor_is_zero: false,
+          divisor_is_nonzero: false,
         })
         edits.push((start_b, end_b, recv_expr + ".mbt_idx_probe(" + idx_expr + ")"))
         covered_end = end_b
@@ -490,36 +574,52 @@ pub fn instrument_probes_for_file(file : String, content : String) -> (String, A
       }
     }
 
-    // 5. `<lhs> / <rhs>` or `<lhs> % <rhs>` when `<rhs>` is NOT statically proven non-zero!
+    // 5. `<lhs> / <rhs>` or `<lhs> % <rhs>`:
+    //    - Parses full left-associative `*` LHS chain (e.g. `a * b / c` -> `(a * b) / c`)
+    //    - Parses unary/postfix RHS (e.g. `a / -b`, `a / (b - c)`)
+    //    - ALWAYS probes first so unsupported integer types (e.g. `Int16 / 2`) are caught
+    //      BEFORE applying the constant non-zero divisor omission optimization!
     if (t.kind == TokenKind::Slash || t.kind == TokenKind::Percent) && i > 0 && i + 1 < n {
-      let lhs_start = find_receiver_start(tokens, i - 1)
+      let lhs_start = find_mul_lhs_start(tokens, i - 1)
       let rhs_end = find_rhs_end(tokens, i + 1, n)
       if lhs_start >= 0 && rhs_end >= i + 1 && tokens[lhs_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, lhs_start) {
-        let rhs_is_single_lit = rhs_end == i + 1 && (tokens[i + 1].kind == TokenKind::IntLit || tokens[i + 1].kind == TokenKind::FloatLit)
-        if !(rhs_is_single_lit && is_statically_nonzero_literal(tokens[i + 1])) {
-          let is_mod = t.kind == TokenKind::Percent
-          let pkind = if is_mod { "mbt_mod_probe" } else { "mbt_div_probe" }
-          let is_zero = rhs_is_single_lit && is_statically_zero_literal(tokens[i + 1])
-          let start_b = tokens[lhs_start].start_byte
-          let end_b = tokens[rhs_end].end_byte
-          let lhs_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
-          let rhs_expr = content.slice(tokens[i + 1].start_byte, end_b).trim()
-          sites.push(ProbeSite::{
-            file: file,
-            probe_kind: pkind,
-            start_byte: start_b,
-            end_byte: end_b,
-            line: t.line,
-            col: t.col,
-            lhs_expr: lhs_expr,
-            rhs_expr: rhs_expr,
-            divisor_is_zero: is_zero,
-          })
-          edits.push((start_b, end_b, lhs_expr + "." + pkind + "(" + rhs_expr + ")"))
-          covered_end = end_b
-          i = rhs_end + 1
+        let is_mod = t.kind == TokenKind::Percent
+        let pkind = if is_mod { "mbt_mod_probe" } else { "mbt_div_probe" }
+        // Check if RHS is a static zero or static non-zero literal (incl. unary `-2` -> nonzero, `-0` -> zero)
+        let rhs_lit_idx = if rhs_end == i + 1 && (tokens[i + 1].kind == TokenKind::IntLit || tokens[i + 1].kind == TokenKind::FloatLit) {
+          i + 1
+        } else if rhs_end == i + 2 && (tokens[i + 1].kind == TokenKind::Minus || tokens[i + 1].kind == TokenKind::Plus) &&
+        (tokens[i + 2].kind == TokenKind::IntLit || tokens[i + 2].kind == TokenKind::FloatLit) {
+          i + 2
+        } else {
+          -1
+        }
+        let is_zero = rhs_lit_idx >= 0 && is_statically_zero_literal(tokens[rhs_lit_idx])
+        let is_nonzero = rhs_lit_idx >= 0 && is_statically_nonzero_literal(tokens[rhs_lit_idx])
+        if is_nonzero && !verify_const_nonzero {
+          i = i + 1
           continue
         }
+        let start_b = tokens[lhs_start].start_byte
+        let end_b = tokens[rhs_end].end_byte
+        let lhs_expr = content.slice(start_b, tokens[i - 1].end_byte).trim()
+        let rhs_expr = content.slice(tokens[i + 1].start_byte, end_b).trim()
+        sites.push(ProbeSite::{
+          file: file,
+          probe_kind: pkind,
+          start_byte: start_b,
+          end_byte: end_b,
+          line: t.line,
+          col: t.col,
+          lhs_expr: lhs_expr,
+          rhs_expr: rhs_expr,
+          divisor_is_zero: is_zero,
+          divisor_is_nonzero: is_nonzero,
+        })
+        edits.push((start_b, end_b, "(" + lhs_expr + ")." + pkind + "(" + rhs_expr + ")"))
+        covered_end = end_b
+        i = rhs_end + 1
+        continue
       }
     }
 
@@ -614,6 +714,10 @@ pub fn rewrite_for_probe(
           })
           return Some("{ let _ = " + site.lhs_expr + "; " + trap_call + " }")
         }
+        if site.divisor_is_nonzero {
+          // Supported integer type with statically proven non-zero divisor: omit runtime check
+          return None
+        }
         drift_ledger.push(DriftEntry::{
           category: "int_div_zero",
           file: site.file,
@@ -637,14 +741,11 @@ pub fn rewrite_for_probe(
         file: site.file,
         line: site.line,
         col: site.col,
-        expr: if site.rhs_expr.length() > 0 { site.rhs_expr } else { site.lhs_expr + ".to_string()" },
+        expr: if site.rhs_expr == "__INTERP_SHOW__" { "\\{" + site.lhs_expr + "}" } else { site.lhs_expr + ".to_string()" },
         resolution: "mbt_compat::double_to_string",
         status: "resolved",
         detail: "Double formatting routed to MoonBit-compatible formatter",
       })
-      if site.rhs_expr.length() > 0 {
-        return Some(str_replace_all(site.rhs_expr, "\\{" + site.lhs_expr + "}", "\\{mbt_compat::double_to_string(" + site.lhs_expr + ")}"))
-      }
       return Some("mbt_compat::double_to_string(" + site.lhs_expr + ")")
     }
     return None
@@ -765,13 +866,13 @@ pub fn run_stage_a5(
   let mut total_resolved = 0
 
   let mut round = 0
-  while round < 3 {
+  while round < 6 {
     let instrumented_batch : Array[(String, String)] = []
     let sites_by_file : Map[String, Array[ProbeSite]] = Map()
     let mut round_probes = 0
 
     for f in cur_files {
-      let (inst_src, sites) = instrument_probes_for_file(f.rel_path, f.content)
+      let (inst_src, sites) = instrument_probes_for_file_opts(f.rel_path, f.content, round == 0)
       instrumented_batch.push((f.rel_path, inst_src))
       sites_by_file[f.rel_path] = sites
       round_probes = round_probes + sites.length()

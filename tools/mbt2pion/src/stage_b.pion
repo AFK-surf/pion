@@ -74,14 +74,130 @@ fn parse_unknown_method_msg(msg : String) -> Option[(String, String)] {
   Some((mname, rest2.slice(0, t2)))
 }
 
-///| Rewrite a single line for a missing method `recv.m(args)` -> `helper(recv, args)`.
-///| Supports both simple identifiers and complex/chained receivers like `pkg::fn(a, b).m()` or `arr[i].m()`.
-fn rewrite_method_call_on_line(line_text : String, method_name : String, helper : String) -> Option[String] {
+///| Find the `.method_name(` offset on `line_text` closest to 1-based column `col` (P1-5).
+fn find_method_dot_at_col(line_text : String, method_name : String, col : Int) -> Int {
   let needle = "." + method_name + "("
-  let dot_idx = line_text.index_of(needle)
-  if dot_idx <= 0 {
-    return None
+  let n = line_text.length()
+  let m = needle.length()
+  let target_0 = if col > 0 { col - 1 } else { 0 }
+  let mut best = -1
+  let mut best_dist = 1000000
+  let mut pos = 0
+  while pos <= n - m {
+    if line_text.slice(pos, pos + m) == needle {
+      let dist = if pos >= target_0 { pos - target_0 } else { target_0 - pos }
+      if dist < best_dist {
+        best_dist = dist
+        best = pos
+      }
+      pos = pos + 1
+    } else {
+      pos = pos + 1
+    }
   }
+  best
+}
+
+///| Rewrite a missing method call at `(lidx, col)` -> `helper(recv, args)`.
+///| Supports:
+///| - Column-precise disambiguation when multiple `.m(...)` calls share one line
+///| - Multiline / newline-leading method chains (`xs\n  .map(...)\n  .filter(...)`)
+///| - Complex/chained receivers (`pkg::fn(a, b).m()`, `arr[i].m()`).
+fn rewrite_method_call_at(
+  lines : Array[String],
+  lidx : Int,
+  col : Int,
+  method_name : String,
+  helper : String,
+) -> Bool {
+  let line_text = lines[lidx]
+  let needle = "." + method_name + "("
+  let dot_idx = find_method_dot_at_col(line_text, method_name, col)
+  if dot_idx < 0 {
+    return false
+  }
+  let arg_start = dot_idx + needle.length()
+  let mut depth = 1
+  let mut j = arg_start
+  while j < line_text.length() && depth > 0 {
+    let c = line_text.code_unit_at(j)
+    if c == 40 {
+      depth = depth + 1
+    } else if c == 41 {
+      depth = depth - 1
+      if depth == 0 {
+        break
+      }
+    }
+    j = j + 1
+  }
+  if depth != 0 {
+    return false
+  }
+  let args = line_text.slice(arg_start, j).trim()
+  let tail = line_text.slice(j + 1, line_text.length())
+  let before_dot = line_text.slice(0, dot_idx)
+
+  // Newline-leading chain (`  .map(...)` where only whitespace precedes `.` on this line)
+  if before_dot.trim().length() == 0 && lidx > 0 {
+    let mut prev_l = lidx - 1
+    while prev_l >= 0 && lines[prev_l].trim().length() == 0 {
+      prev_l = prev_l - 1
+    }
+    if prev_l < 0 {
+      return false
+    }
+    let prev_line = lines[prev_l]
+    // Find receiver expression at the end of `prev_line`
+    let mut r_end = prev_line.length() - 1
+    while r_end >= 0 && (prev_line.code_unit_at(r_end) == 32 || prev_line.code_unit_at(r_end) == 9) {
+      r_end = r_end - 1
+    }
+    if r_end < 0 {
+      return false
+    }
+    let mut r_start = r_end
+    let mut pd = 0
+    let mut bd = 0
+    while r_start >= 0 {
+      let c = prev_line.code_unit_at(r_start)
+      if c == 41 {
+        pd = pd + 1
+        r_start = r_start - 1
+      } else if c == 40 {
+        if pd == 0 { break }
+        pd = pd - 1
+        r_start = r_start - 1
+      } else if c == 93 {
+        bd = bd + 1
+        r_start = r_start - 1
+      } else if c == 91 {
+        if bd == 0 { break }
+        bd = bd - 1
+        r_start = r_start - 1
+      } else if pd > 0 || bd > 0 {
+        r_start = r_start - 1
+      } else if is_alnum(c) || c == 95 || c == 46 || c == 58 {
+        r_start = r_start - 1
+      } else {
+        break
+      }
+    }
+    r_start = r_start + 1
+    if r_start > r_end {
+      return false
+    }
+    let recv = prev_line.slice(r_start, r_end + 1)
+    let call = if args.length() > 0 {
+      helper + "(" + recv + ", " + args + ")"
+    } else {
+      helper + "(" + recv + ")"
+    }
+    lines[prev_l] = prev_line.slice(0, r_start) + call + tail
+    lines[lidx] = ""
+    return true
+  }
+
   let mut recv_start = dot_idx - 1
   let mut paren_d = 0
   let mut brack_d = 0
@@ -115,34 +231,16 @@ fn rewrite_method_call_on_line(line_text : String, method_name : String, helper 
   }
   recv_start = recv_start + 1
   if recv_start >= dot_idx {
-    return None
+    return false
   }
   let recv = line_text.slice(recv_start, dot_idx)
-  let arg_start = dot_idx + needle.length()
-  let mut depth = 1
-  let mut j = arg_start
-  while j < line_text.length() && depth > 0 {
-    let c = line_text.code_unit_at(j)
-    if c == 40 {
-      depth = depth + 1
-    } else if c == 41 {
-      depth = depth - 1
-      if depth == 0 {
-        break
-      }
-    }
-    j = j + 1
-  }
-  if depth != 0 {
-    return None
-  }
-  let args = line_text.slice(arg_start, j).trim()
   let call = if args.length() > 0 {
     helper + "(" + recv + ", " + args + ")"
   } else {
     helper + "(" + recv + ")"
   }
-  Some(line_text.slice(0, recv_start) + call + line_text.slice(j + 1, line_text.length()))
+  lines[lidx] = line_text.slice(0, recv_start) + call + tail
+  true
 }
 
 ///| Extract the argument value for a labeled argument `name=<val>` in a call line.
@@ -172,8 +270,29 @@ fn extract_labeled_arg(ln : String, name : String) -> Option[(Int, Int, String)]
   Some((val_start, val_end, ln.slice(val_start, val_end).trim()))
 }
 
+///| Check whether `expr` is a pure simple identifier or string literal (safe to duplicate without side effects).
+fn is_pure_str_atom(expr : String) -> Bool {
+  let t = expr.trim()
+  if t.length() == 0 {
+    return true
+  }
+  if t.starts_with("\"") && t.ends_with("\"") {
+    return true
+  }
+  let mut i = 0
+  while i < t.length() {
+    let c = t.code_unit_at(i)
+    if !(is_alnum(c) || c == 95) {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
 ///| Apply `api_map.json` unit-annotated 2-arg boundary conversions (`utf16_to_utf8_off(s, off)`,
 ///| `utf16_to_scalar_off(s, off)`) and `OrderedMap` <-> `Map` boundary conversions.
+///| Handles MULTIPLE calls on the same line and binds impure `str_param` expressions once!
 ///| Hard-fails (`MBT2PION_MISSING_STR_PARAM`) when `utf8`/`scalar` conversion is needed without `str_param`!
 pub fn apply_api_boundary_conversions(
   content : String,
@@ -186,6 +305,7 @@ pub fn apply_api_boundary_conversions(
     return content
   }
   let mut cur = content
+  let mut tmp_seq = 0
   for sym in api_map.symbols {
     let mut needs_conv = false
     for p in sym.params {
@@ -211,13 +331,47 @@ pub fn apply_api_boundary_conversions(
     let mut lno = 0
     for ln in lines {
       lno = lno + 1
-      let idx = ln.index_of(needle)
-      if idx >= 0 {
-        let mut updated = ln
+      if !str_has(ln, needle) {
+        out_lines.push(ln)
+        continue
+      }
+      // Iterate EVERY call occurrence of `call_name(...)` on this line!
+      let line_sb = StringBuilder()
+      let mut scan = 0
+      while scan < ln.length() {
+        let rest = ln.slice(scan, ln.length())
+        let rel_idx = rest.index_of(needle)
+        if rel_idx < 0 {
+          line_sb.write_string(rest)
+          break
+        }
+        let call_start = scan + rel_idx
+        line_sb.write_string(ln.slice(scan, call_start))
+        let open_p = call_start + call_name.length()
+        let mut close_p = open_p + 1
+        let mut depth = 1
+        while close_p < ln.length() && depth > 0 {
+          let c = ln.code_unit_at(close_p)
+          if c == 40 {
+            depth = depth + 1
+          } else if c == 41 {
+            depth = depth - 1
+            if depth == 0 {
+              break
+            }
+          }
+          close_p = close_p + 1
+        }
+        if depth != 0 {
+          line_sb.write_string(ln.slice(call_start, ln.length()))
+          break
+        }
+        let mut call_text = ln.slice(call_start, close_p + 1)
+        let mut pre_bind = ""
         for p in sym.params {
           if p.unit == "utf8" || p.unit == "scalar" {
             let helper = if p.unit == "utf8" { "mbt_compat::utf16_to_utf8_off" } else { "mbt_compat::utf16_to_scalar_off" }
-            match extract_labeled_arg(updated, p.name) {
+            match extract_labeled_arg(call_text, p.name) {
               Some((val_start, val_end, raw_arg)) =>
               if !str_has(raw_arg, helper + "(") {
                 if p.str_param.length() == 0 {
@@ -225,40 +379,55 @@ pub fn apply_api_boundary_conversions(
                     "MBT2PION_MISSING_STR_PARAM",
                     file,
                     lno,
-                    val_start + 1,
+                    call_start + val_start + 1,
                     "api_map boundary conversion for `" + call_name + "(" + p.name + ")` requires `str_param` to supply string argument to `" + helper + "(s, off)`",
                   ))
                 } else {
-                  let str_arg = match extract_labeled_arg(updated, p.str_param) {
-                    Some((_, _, sv)) => sv
-                    None => p.str_param
+                  let mut str_arg = p.str_param
+                  match extract_labeled_arg(call_text, p.str_param) {
+                    Some((sv_start, sv_end, sv)) =>
+                    if is_pure_str_atom(sv) {
+                      str_arg = sv
+                    } else {
+                      let tname = "__mbt_s_" + tmp_seq.to_string()
+                      tmp_seq = tmp_seq + 1
+                      pre_bind = pre_bind + "let " + tname + " = " + sv + "; "
+                      call_text = call_text.slice(0, sv_start) + tname + call_text.slice(sv_end, call_text.length())
+                      str_arg = tname
+                    }
+                    None => ()
                   }
-                  updated = updated.slice(0, val_start) + helper + "(" + str_arg + ", " + raw_arg + ")" + updated.slice(val_end, updated.length())
-                  drift_ledger.push(DriftEntry::{
-                    category: "string_unit_boundary",
-                    file: file,
-                    line: lno,
-                    col: val_start + 1,
-                    expr: call_name + "(" + p.name + "=" + raw_arg + ")",
-                    resolution: helper,
-                    status: "resolved",
-                    detail: "converted UTF-16 offset to " + p.unit + " at api_map boundary with string arg `" + str_arg + "`",
-                  })
+                  match extract_labeled_arg(call_text, p.name) {
+                    Some((n_start, n_end, n_raw)) => {
+                      call_text = call_text.slice(0, n_start) + helper + "(" + str_arg + ", " + n_raw + ")" + call_text.slice(n_end, call_text.length())
+                      drift_ledger.push(DriftEntry::{
+                        category: "string_unit_boundary",
+                        file: file,
+                        line: lno,
+                        col: call_start + n_start + 1,
+                        expr: call_name + "(" + p.name + "=" + n_raw + ")",
+                        resolution: helper,
+                        status: "resolved",
+                        detail: "converted UTF-16 offset to " + p.unit + " at api_map boundary with string arg `" + str_arg + "`",
+                      })
+                    }
+                    None => ()
+                  }
                 }
               }
               None => ()
             }
           } else if p.map_boundary == "ordered_to_map" || p.map_boundary == "map_to_ordered" {
             let helper = if p.map_boundary == "ordered_to_map" { "mbt_compat::ordered_map_to_map" } else { "mbt_compat::ordered_map_from_map" }
-            match extract_labeled_arg(updated, p.name) {
+            match extract_labeled_arg(call_text, p.name) {
               Some((val_start, val_end, raw_arg)) =>
               if !str_has(raw_arg, helper + "(") {
-                updated = updated.slice(0, val_start) + helper + "(" + raw_arg + ")" + updated.slice(val_end, updated.length())
+                call_text = call_text.slice(0, val_start) + helper + "(" + raw_arg + ")" + call_text.slice(val_end, call_text.length())
                 drift_ledger.push(DriftEntry::{
                   category: "ordered_map_boundary",
                   file: file,
                   line: lno,
-                  col: val_start + 1,
+                  col: call_start + val_start + 1,
                   expr: call_name + "(" + p.name + "=" + raw_arg + ")",
                   resolution: helper,
                   status: "resolved",
@@ -269,10 +438,14 @@ pub fn apply_api_boundary_conversions(
             }
           }
         }
-        out_lines.push(updated)
-      } else {
-        out_lines.push(ln)
+        if pre_bind.length() > 0 {
+          line_sb.write_string("{ " + pre_bind + call_text + " }")
+        } else {
+          line_sb.write_string(call_text)
+        }
+        scan = close_p + 1
       }
+      out_lines.push(line_sb.to_string())
     }
     let sb = StringBuilder()
     let mut k = 0
@@ -383,24 +556,20 @@ pub fn run_stage_b(
             Some((mname, rty)) =>
             match lookup_missing_method_helper(rty, mname) {
               Some(helper) =>
-              match rewrite_method_call_on_line(ln, mname, helper) {
-                Some(new_ln) => {
-                  lines[lidx] = new_ln
-                  file_changed = true
-                  if helper == "mbt_compat::str_compare" {
-                    drift_ledger.push(DriftEntry::{
-                      category: "string_compare",
-                      file: f.rel_path,
-                      line: d.line,
-                      col: d.col,
-                      expr: mname,
-                      resolution: helper,
-                      status: "resolved",
-                      detail: "String::compare routed to MoonBit UTF-16 length-first comparison",
-                    })
-                  }
+              if rewrite_method_call_at(lines, lidx, d.col, mname, helper) {
+                file_changed = true
+                if helper == "mbt_compat::str_compare" {
+                  drift_ledger.push(DriftEntry::{
+                    category: "string_compare",
+                    file: f.rel_path,
+                    line: d.line,
+                    col: d.col,
+                    expr: mname,
+                    resolution: helper,
+                    status: "resolved",
+                    detail: "String::compare routed to MoonBit UTF-16 length-first comparison",
+                  })
                 }
-                None => ()
               }
               None => ()
             }
@@ -432,20 +601,29 @@ pub fn run_stage_b(
               None => ()
             }
           }
-          // 4. Stage A lowered `s[a:b]` to `mbt_compat::array_slice_clamp(s, a, b)`; when `s` is `String`, route to `mbt_compat::utf16_slice`.
+          // 4. Stage A lowered `s[a:b]` to `mbt_compat::array_slice_clamp(s, a, b)`; when `s` is `String`, route to `mbt_compat::utf16_slice`
+          //    and resolve any matching `unresolved` `array_view_slice` drift entry for this file!
           if d.found == "String" && str_has(ln, "mbt_compat::array_slice_clamp(") {
             lines[lidx] = str_replace_all(ln, "mbt_compat::array_slice_clamp(", "mbt_compat::utf16_slice(")
             file_changed = true
-            drift_ledger.push(DriftEntry::{
-              category: "string_utf16_slice",
-              file: f.rel_path,
-              line: d.line,
-              col: d.col,
-              expr: "s[a:b]",
-              resolution: "mbt_compat::utf16_slice",
-              status: "resolved",
-              detail: "String slice routed to UTF-16 clamped slice",
-            })
+            let mut di = 0
+            while di < drift_ledger.length() {
+              let de = drift_ledger[di]
+              if de.category == "array_view_slice" && de.status == "unresolved" &&
+              (f.rel_path == de.file || f.source_file == de.file) {
+                drift_ledger[di] = DriftEntry::{
+                  category: "string_utf16_slice",
+                  file: de.file,
+                  line: de.line,
+                  col: de.col,
+                  expr: de.expr,
+                  resolution: "mbt_compat::utf16_slice",
+                  status: "resolved",
+                  detail: "String slice routed to UTF-16 clamped slice",
+                }
+              }
+              di = di + 1
+            }
           }
           // 3. `for ... in` on `OrderedMap` -> `.to_array()`, or `String` -> `str_scalars`
           if str_has(d.message, "`for ... in` requires an `Array[T]`") {

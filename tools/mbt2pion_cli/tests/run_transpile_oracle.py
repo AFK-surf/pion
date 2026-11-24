@@ -71,6 +71,11 @@ CASES = {
     "mod_u64_rt_zero": ("panic:rem_zero", 0),
     "cascade_generics": ("ok", 6),
     "source_loc": ("ok", 3),
+    "mul_div_prec": ("ok", 8),
+    "div_neg_zero": ("panic:div_zero", 0),
+    "interp_probe": ("ok", 2),
+    "arrayview_backing": ("ok", 5),
+    "init_invoke_closure": ("ok", 1),
 }
 
 MOON_TRAPS = {
@@ -279,6 +284,55 @@ pub fn two_source_locs() -> (String, String) {
   let a = tag_loc("first")
   let b = tag_loc("second")
   (a, b)
+}
+
+// P0-1: mul/div/mod left-associativity, unary neg divisor, chained div/mod
+pub fn mul_div_chain(a : Int, b : Int, c : Int) -> Int { a * b / c }
+pub fn mul_mod_chain(a : Int, b : Int, c : Int) -> Int { a * b % c }
+pub fn idx_mul_div(xs : Array[Int], i : Int, n : Int) -> Int { xs[i] * 2 / n }
+pub fn mul_div_i64(a : Int64, b : Int64) -> Int64 { a * 3L / b }
+pub fn mod_then_div(a : Int, b : Int, c : Int) -> Int { a % b / c }
+pub fn div_then_div(a : Int, b : Int, c : Int) -> Int { a / b / c }
+pub fn div_paren_sub(a : Int, b : Int, c : Int) -> Int { a / (b - c) }
+pub fn div_unary_neg(a : Int, b : Int) -> Int { a / -b }
+
+// P0-2: interpolation probing for arbitrary inner expressions
+pub fn interp_probe_demo(a : Int, b : Int, s : String, d : Double) -> String {
+  "r=\{a / b} len=\{s.length()} d=\{d}"
+}
+
+// P0-5: borrowed ArrayView shared backing before realloc + isolation after 256 pushes + nested view
+pub fn arrayview_backing_demo() -> Array[Int] {
+  let a = [1, 2, 3]
+  let v = a[0:2]
+  let w = v[1:2]
+  a[0] = 2
+  let pre_v0 = v[0]
+  let pre_w0 = w[0]
+  for i = 0; i < 256; i = i + 1 {
+    a.push(i)
+  }
+  a[0] = 3
+  let post_v0 = v[0]
+  let post_a0 = a[0]
+  let post_w0 = w[0]
+  [pre_v0, pre_w0, post_v0, post_a0, post_w0]
+}
+
+// P1-1: top-level init calling a function that immediately invokes its closure argument
+fn invoke_init(f : () -> Int) -> Int {
+  f()
+}
+
+fn read_arr_0(xs : Array[Int]) -> Int {
+  xs[0]
+}
+
+let inv_a : Int = invoke_init(fn() { inv_z })
+let inv_z : Int = read_arr_0([42])
+
+pub fn get_inv_a() -> Int {
+  inv_a
 }
 '''
 
@@ -504,6 +558,47 @@ fn main {
     check("loc.file_a", has_file_a)
     check("loc.file_b", has_file_b)
     check("loc.distinct", distinct)
+  } else if kase == "mul_div_prec" {
+    let r1 = mul_div_chain(5, 3, 2)
+    let r2 = mul_mod_chain(5, 3, 4)
+    let r3 = idx_mul_div([7, 9], 1, 4)
+    let r4 = mul_div_i64(5L, 2L)
+    let r5 = mod_then_div(23, 10, 2)
+    let r6 = div_then_div(24, 3, 2)
+    let r7 = div_paren_sub(20, 9, 5)
+    let r8 = div_unary_neg(20, 4)
+    trace("r", "\{r1},\{r2},\{r3},\{r4},\{r5},\{r6},\{r7},\{r8}")
+    check("prec.mul_div", r1 == 7)
+    check("prec.mul_mod", r2 == 3)
+    check("prec.idx_mul_div", r3 == 4)
+    check("prec.i64", r4 == 7L)
+    check("prec.mod_div", r5 == 1)
+    check("prec.div_div", r6 == 4)
+    check("prec.paren_sub", r7 == 5)
+    check("prec.unary_neg", r8 == -5)
+  } else if kase == "div_neg_zero" {
+    let z = [0][0]
+    trace("before", "ok")
+    trace("after", div_unary_neg(7, z).to_string())
+  } else if kase == "interp_probe" {
+    let s = interp_probe_demo(15, 2, "A中😀B", 1.5e-7)
+    trace("interp", s)
+    check("interp.val", s == "r=7 len=5 d=1.5e-7")
+    let s2 = interp_probe_demo(9, 4, "😀", -0.0)
+    trace("interp2", s2)
+    check("interp.val2", s2 == "r=2 len=2 d=0")
+  } else if kase == "arrayview_backing" {
+    let out = arrayview_backing_demo()
+    trace("av", join_ints(out))
+    check("av.pre_v0", out[0] == 2)
+    check("av.pre_w0", out[1] == 2)
+    check("av.post_v0", out[2] == 2)
+    check("av.post_a0", out[3] == 3)
+    check("av.post_w0", out[4] == 2)
+  } else if kase == "init_invoke_closure" {
+    let v = get_inv_a()
+    trace("inv_a", v.to_string())
+    check("init.inv_a", v == 42)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -742,6 +837,47 @@ pub fn main(w : World) -> Int {
     check(w, "loc.file_a", has_file_a)
     check(w, "loc.file_b", has_file_b)
     check(w, "loc.distinct", distinct)
+  } else if kase == "mul_div_prec" {
+    let r1 = mul_div_chain(5, 3, 2)
+    let r2 = mul_mod_chain(5, 3, 4)
+    let r3 = idx_mul_div([7, 9], 1, 4)
+    let r4 = mul_div_i64(5L, 2L)
+    let r5 = mod_then_div(23, 10, 2)
+    let r6 = div_then_div(24, 3, 2)
+    let r7 = div_paren_sub(20, 9, 5)
+    let r8 = div_unary_neg(20, 4)
+    trace(w, "r", r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "," + r7.to_string() + "," + r8.to_string())
+    check(w, "prec.mul_div", r1 == 7)
+    check(w, "prec.mul_mod", r2 == 3)
+    check(w, "prec.idx_mul_div", r3 == 4)
+    check(w, "prec.i64", r4 == 7L)
+    check(w, "prec.mod_div", r5 == 1)
+    check(w, "prec.div_div", r6 == 4)
+    check(w, "prec.paren_sub", r7 == 5)
+    check(w, "prec.unary_neg", r8 == -5)
+  } else if kase == "div_neg_zero" {
+    let z = [0][0]
+    trace(w, "before", "ok")
+    trace(w, "after", div_unary_neg(7, z).to_string())
+  } else if kase == "interp_probe" {
+    let s = interp_probe_demo(15, 2, "A中😀B", 1.5e-7)
+    trace(w, "interp", s)
+    check(w, "interp.val", s == "r=7 len=5 d=1.5e-7")
+    let s2 = interp_probe_demo(9, 4, "😀", -0.0)
+    trace(w, "interp2", s2)
+    check(w, "interp.val2", s2 == "r=2 len=2 d=0")
+  } else if kase == "arrayview_backing" {
+    let out = arrayview_backing_demo()
+    trace(w, "av", join_ints(out))
+    check(w, "av.pre_v0", out[0] == 2)
+    check(w, "av.pre_w0", out[1] == 2)
+    check(w, "av.post_v0", out[2] == 2)
+    check(w, "av.post_a0", out[3] == 3)
+    check(w, "av.post_w0", out[4] == 2)
+  } else if kase == "init_invoke_closure" {
+    let v = get_inv_a()
+    trace(w, "inv_a", v.to_string())
+    check(w, "init.inv_a", v == 42)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -991,16 +1127,20 @@ def run_suite(env, cases, jobs):
     return results
 
 
-# Negative self-tests: every mutant MUST turn the oracle RED.
+# Negative self-tests: every mutant MUST turn the oracle RED with its EXACT expected failure class (P2).
 MUTANTS = [
     ("drop-assertion", "guard", "main.pion",
-     'check(w, "guard.val_false", g1 == 17)\n', ""),
+     'check(w, "guard.val_false", g1 == 17)\n', "",
+     "assertion ids differ"),
     ("bypass-utf16-len", "utf16", "oracle_lib.pion",
-     "mbt_compat::utf16_len(s)", "s.length()"),
+     "mbt_compat::utf16_len(s)", "s.length()",
+     "FAILED utf16.len"),
     ("bypass-div-checked", "div_i32_rt_zero", "oracle_lib.pion",
-     "mbt_compat::div_checked_i32(a, b)", "(a / b)"),
+     "mbt_compat::div_checked_i32(a, b)", "(a / b)",
+     "raw-wasm-trap(divide by zero)"),
     ("bypass-double-fmt", "double_fmt", "oracle_lib.pion",
-     "mbt_compat::double_to_string(d)", "d.to_string()"),
+     "mbt_compat::double_to_string(d)", "d.to_string()",
+     "FAILED dbl.small"),
 ]
 
 
@@ -1047,7 +1187,7 @@ def self_test(env, moon_results):
         ok = False
     if ok:
         print("selftest ok    classifier hard-fails SIGSEGV/timeout/raw-wasm-trap/empty-run")
-    for name, case, rel_file, old, new in MUTANTS:
+    for name, case, rel_file, old, new, want_err in MUTANTS:
         d = make_mutant(env, name, rel_file, old, new)
         res = {
             "moon": moon_results[case],
@@ -1055,8 +1195,12 @@ def self_test(env, moon_results):
             "pion-wasm32": run_pion(env, d, "wasm32", case),
         }
         errs, _ = evaluate(case, res)
-        if errs:
-            print("selftest ok    mutant %-20s on %-18s -> red: %s" % (name, case, errs[0][:110]))
+        matched = any(want_err in e for e in errs)
+        if errs and matched:
+            print("selftest ok    mutant %-20s on %-18s -> red (%s): %s" % (name, case, want_err, errs[0][:100]))
+        elif errs:
+            print("SELFTEST FAIL  mutant %-20s on %-18s failed with wrong class (wanted %r): %s" % (name, case, want_err, errs[0][:120]))
+            ok = False
         else:
             print("SELFTEST FAIL  mutant %-20s on %-18s stayed green" % (name, case))
             ok = False

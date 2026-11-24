@@ -146,7 +146,7 @@ test "stage A: leading generics, rest patterns, chained cascade, optional forwar
     "  let g = (n) => n + val\n" +
     "  let _ = FixedTag\n" +
     "  let _ = b\"ok\"\n" +
-    "  let _ = xs[1:3]\n" +
+    "  let _ = xs[1:3].to_owned()\n" +
     "  let _ = { \"k\": 1 }\n" +
     "  let _ = box_.items..push(9)\n" +
     "  xs..push(g(1))..push(2)\n" +
@@ -254,11 +254,14 @@ test "stage A.5: nonzero literal check, same-line multi-probes, complex receiver
     if str_has(txt, "arr.mbt_len_probe()") {
       items.push("{\"file\":\"drift.pion\",\"line\":2,\"col\":35,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_len_probe` on type `Array[Int]`\"}")
     }
-    if str_has(txt, "(a + b).mbt_div_probe(b)") {
+    if str_has(txt, "((a + b)).mbt_div_probe(b)") {
       items.push("{\"file\":\"drift.pion\",\"line\":3,\"col\":19,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}")
     }
-    if str_has(txt, "a.mbt_div_probe(0)") {
+    if str_has(txt, "(a).mbt_div_probe(0)") {
       items.push("{\"file\":\"drift.pion\",\"line\":4,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}")
+    }
+    if str_has(txt, "(a).mbt_div_probe(2)") {
+      items.push("{\"file\":\"drift.pion\",\"line\":5,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_div_probe` on type `Int`\"}")
     }
     if str_has(txt, "d.mbt_show_probe()") {
       items.push("{\"file\":\"drift.pion\",\"line\":6,\"col\":13,\"code\":\"E_TYPE_MISMATCH\",\"message\":\"unknown method `mbt_show_probe` on type `Double`\"}")
@@ -483,4 +486,142 @@ test "BUG-7: recipes [derives] ignore and Ctor(..)/Ctor(.., ..) rest patterns wi
   let no_rec = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
   assert_true(no_rec.blockers > 0, "Debug without ignore recipe must still hard-fail")
   assert_true(no_rec.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "emits MBT2PION_UNKNOWN_DERIVE")
+}
+
+test "P0-1 & P0-2: mul/div/mod precedence, unary neg divisor, Int16 / 2 block, and interp probing" {
+  let code = "pub fn f(a : Int, b : Int, c : Int, s : String, xs : Array[Int], i : Int, u : Int16) -> String {\n" +
+  "  let p1 = a * b / c\n" +
+  "  let p2 = a / -b\n" +
+  "  let p3 = xs[i] * 2 / c\n" +
+  "  let p4 = u / 2\n" +
+  "  \"r=\\{a / b} len=\\{s.length()}\"\n" +
+  "}\n"
+  let (inst, sites) = instrument_probes_for_file("p01.pion", code)
+  assert_true(str_has(inst, "(a * b).mbt_div_probe(c)"), "a * b / c preserves left-associativity")
+  assert_true(str_has(inst, "(a).mbt_div_probe(-b)"), "a / -b captures unary minus divisor")
+  assert_true(str_has(inst, "(xs[i] * 2).mbt_div_probe(c)"), "xs[i] * 2 / c captures full mul LHS")
+  assert_true(str_has(inst, "(u).mbt_div_probe(2)"), "Int16 / 2 is probed before const-nonzero opt")
+  assert_true(str_has(inst, "(a).mbt_div_probe(b)"), "interp \\{a / b} is probed")
+  assert_true(str_has(inst, "s.mbt_len_probe()"), "interp \\{s.length()} is probed")
+  assert_true(sites.length() >= 6, "all 6 sites instrumented")
+
+  // Verify Int16 / 2 produces MBT2PION_UNSUPPORTED_INT_DIV blocker
+  let diags : Array[Diag] = []
+  let ledger : Array[DriftEntry] = []
+  let mut u_site = sites[0]
+  for st in sites {
+    if st.lhs_expr == "u" { u_site = st }
+  }
+  let _ = rewrite_for_probe(u_site, "Int16", default_recipes(), diags, ledger)
+  assert_true(diags.length() == 1 && diags[0].code == "MBT2PION_UNSUPPORTED_INT_DIV", "Int16 / 2 rejected")
+}
+
+test "P0-5: local borrowed ArrayView uses ArrayBuf/ArrayView; unrewritable param slice blocks publish" {
+  let ok_src = SourceFile::{
+    rel_path: "av.mbt",
+    content: "pub fn f() -> Int {\n  let a = [1, 2, 3]\n  let v = a[0:2]\n  let w = v[1:2]\n  a[0] = 2\n  v[0] + w[0]\n}\n",
+    is_test: false,
+  }
+  let ok_res = transpile_package([ok_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(ok_res.blockers, 0)
+  let out = ok_res.files[0].content
+  assert_true(str_has(out, "mbt_compat::ArrayBuf::from_array([1, 2, 3])"), "owner promoted to ArrayBuf")
+  assert_true(str_has(out, "a.view(0, 2)"), "borrowed slice uses .view()")
+  assert_true(str_has(out, "v.view(1, 2)"), "nested borrowed slice uses .view()")
+  assert_true(str_has(out, "a.set(0, 2)"), "index write lowered to .set()")
+  assert_true(str_has(out, "v.get(0)"), "index read lowered to .get()")
+
+  let bad_src = SourceFile::{
+    rel_path: "bad_av.mbt",
+    content: "pub fn bad(xs : Array[Int]) -> Array[Int] {\n  xs[0:2]\n}\n",
+    is_test: false,
+  }
+  let bad_res = transpile_package([bad_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(bad_res.blockers > 0, "unrewritable borrowed Array slice must block publish as unresolved")
+}
+
+test "P1-1, P1-2, P1-3, P1-4, P1-5, P1-6: review hardening regressions" {
+  // P1-1: invoke(fn() { z }) orders z before a!
+  let p11_src = SourceFile::{
+    rel_path: "p11.mbt",
+    content: "fn invoke(f : () -> Int) -> Int { f() }\nlet a : Int = invoke(fn() { z })\nlet z : Int = 42\n",
+    is_test: false,
+  }
+  let p11_res = transpile_package([p11_src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p11_res.blockers, 0)
+  let init_code = p11_res.files[0].content
+  assert_true(init_code.index_of("let z") < init_code.index_of("let a"), "z initialized before invoke(fn() { z })")
+
+  // P1-2: string literal whitespace change ("a b" -> "a  b") MUST invalidate overlay!
+  let s1 = SourceFile::{ rel_path: "str.mbt", content: "pub fn msg() -> String { \"a b\" }\n", is_test: false }
+  let s2 = SourceFile::{ rel_path: "str.mbt", content: "pub fn msg() -> String { \"a  b\" }\n", is_test: false }
+  let r1 = transpile_package([s1], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let r2 = transpile_package([s2], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(
+    r1.files[0].anchors[0].normalized_source_cst_hash != r2.files[0].anchors[0].normalized_source_cst_hash,
+    "string literal internal space change must change normalized_source_cst_hash",
+  )
+
+  // P1-3: moon.pkg targets excludes js-only file on native target and records disposition
+  let native_f = SourceFile::{ rel_path: "plat_native.mbt", content: "pub fn plat() -> Int { 1 }\n", is_test: false }
+  let js_f = SourceFile::{ rel_path: "plat_js.mbt", content: "pub fn plat() -> Int { 2 }\n", is_test: false }
+  let opts_p13 = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "{\"targets\":{\"plat_native.mbt\":[\"native\"],\"plat_js.mbt\":[\"js\"]}}",
+    header: default_header_meta("native"),
+  }
+  let p13_res = transpile_package([native_f, js_f], empty_api_map(), default_recipes(), [], [], opts_p13, [], false, noop_check)
+  assert_eq(p13_res.files.length(), 1)
+  assert_true(p13_res.files[0].rel_path == "plat_native.pion", "only native file emitted")
+  let mut saw_excl = false
+  for dp in p13_res.dispositions {
+    if dp.file == "plat_js.mbt" && dp.disposition == "excluded_by_target" {
+      saw_excl = true
+    }
+  }
+  assert_true(saw_excl, "excluded js-only file recorded in dispositions")
+
+  // P1-4: external multi-optional forwarding preserves labels and emits 4 combinations
+  let d14 : Array[Diag] = []
+  let am14 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"tally\",\"kind\":\"fn\",\"target_pkg\":\"ext\",\"target_name\":\"tally\",\"external_tilde_default\":true}]}",
+    "m.json",
+    d14,
+  )
+  let p14_src = SourceFile::{
+    rel_path: "p14.mbt",
+    content: "pub fn go(x? : Int, y? : Int) -> Int { @ext.tally(x?, y?, z=10) }\n",
+    is_test: false,
+  }
+  let p14_res = transpile_package([p14_src], am14, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_eq(p14_res.blockers, 0)
+  let out14 = p14_res.files[0].content
+  assert_true(str_has(out14, "z=__mbt_arg_"), "named arg z= label preserved")
+  assert_true(str_has(out14, "Some(__mbt_v0)") && str_has(out14, "Some(__mbt_v1)"), "both optional params branched (4 combos)")
+
+  // P1-5: same-line dual boundary conversion + single-eval binding for get_text()
+  let d15 : Array[Diag] = []
+  let l15 : Array[DriftEntry] = []
+  let am15 = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"p\",\"src_name\":\"caret\",\"kind\":\"fn\",\"target_pkg\":\"p\",\"target_name\":\"caret\",\"params\":[{\"name\":\"text\",\"ty\":\"String\"},{\"name\":\"offset\",\"ty\":\"Int\",\"unit\":\"utf8\",\"str_param\":\"text\"}]}]}",
+    "m15.json",
+    d15,
+  )
+  let conv15 = apply_api_boundary_conversions(
+    "  let r = p::caret(text=get_text(), offset=1) + p::caret(text=get_text(), offset=2)\n",
+    am15,
+    "p15.pion",
+    d15,
+    l15,
+  )
+  assert_eq(d15.length(), 0)
+  assert_true(str_has(conv15, "let __mbt_s_0 = get_text();") && str_has(conv15, "let __mbt_s_1 = get_text();"), "each call binds get_text() once")
+  assert_true(l15.length() == 2, "both same-line calls converted")
+
+  // P1-6: migration_report.json serializes finalized span_map
+  let rep_json = render_migration_report_json(p14_res, default_options())
+  assert_true(str_has(rep_json, "\"span_map\":["), "migration_report.json contains span_map")
 }
