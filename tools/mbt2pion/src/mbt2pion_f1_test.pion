@@ -22,17 +22,16 @@ test "f1-1: pool = pools[d] infers Pool and disambiguates unsafe_set/set/push" {
   assert_true(str_has(out, "local_arr.set(0, AlignB::Auto)"), "local_arr.set must disambiguate AlignB::Auto")
 }
 
-test "f1-2: pure immediate read-only slice .iter() lowers to __mbt_slice_owned(__ITER__), escaping/mutating/external-call stays borrow" {
+test "f1-2: pure immediate read-only slice .iter() lowers to __mbt_slice_owned(__ITER__), escaping/mutating/external/indirect/shadowed stays borrow" {
   let src = SourceFile::{
     rel_path: "f12.mbt",
-    content: "pub struct Log { seen : Array[Int] }\nfn mutate(_l : Log) -> Unit { () }\nfn bump() -> Unit { () }\npub fn ok_iter(self : Log) -> String {\n  let n = self.seen.length()\n  self.seen[0:if n > 6 { 6 } else { n }].iter().map(fn(x) { x.to_string() }).collect().join(\"; \")\n}\npub fn bad_escape(self : Log) -> Int {\n  let it = self.seen[0:2].iter()\n  it.count()\n}\npub fn bad_mut(self : Log) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { self.seen[0] = x; x }).collect()\n}\npub fn bad_mutate_call(self : Log) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { mutate(self); x }).collect()\n}\npub fn bad_cb_var(self : Log, cb : (Int) -> Int) -> Array[Int] {\n  self.seen[0:2].iter().map(cb).collect()\n}\npub fn bad_free_call(self : Log) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { bump(); x }).collect()\n}\n",
+    content: "pub struct Log { seen : Array[Int] }\nfn mutate(_l : Log) -> Unit { () }\nfn bump() -> Unit { () }\npub fn ok_iter(self : Log) -> String {\n  let n = self.seen.length()\n  self.seen[0:if n > 6 { 6 } else { n }].iter().map(fn(x) { x.to_string() }).collect().join(\"; \")\n}\npub fn bad_escape(self : Log) -> Int {\n  let it = self.seen[0:2].iter()\n  it.count()\n}\npub fn bad_mut(self : Log) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { self.seen[0] = x; x }).collect()\n}\npub fn bad_mutate_call(self : Log) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { mutate(self); x }).collect()\n}\npub fn bad_cb_var(self : Log, cb : (Int) -> Int) -> Array[Int] {\n  self.seen[0:2].iter().map(cb).collect()\n}\npub fn bad_free_call(self : Log) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { bump(); x }).collect()\n}\npub fn bad_indirect_call(self : Log, cb : () -> Int) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { x + (cb)() }).collect()\n}\npub fn bad_alias_method(self : Log, alias_arr : Array[Int]) -> Array[Int] {\n  self.seen[0:2].iter().map(fn(x) { x + alias_arr.length() }).collect()\n}\n",
     is_test: false,
   }
   let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
   let out = res.files[0].content
   assert_true(str_has(out, "__mbt_slice_owned(self.seen, 0, if n > 6 { 6 } else { n }, \"__ITER__\").map("), "pure immediate .iter() uses __mbt_slice_owned with __ITER__")
   assert_true(str_has(out, "__mbt_slice_borrow(self.seen, 0, 2).iter()"), "escaping and mutating .iter() stay __mbt_slice_borrow")
-  // Count occurrences of __mbt_slice_borrow(self.seen, 0, 2) — all 5 bad_* functions must stay borrow
   let mut borrow_hits = 0
   let needle = "__mbt_slice_borrow(self.seen, 0, 2)"
   let mut pos = 0
@@ -44,7 +43,15 @@ test "f1-2: pure immediate read-only slice .iter() lowers to __mbt_slice_owned(_
       pos = pos + 1
     }
   }
-  assert_eq(borrow_hits, 5)
+  assert_eq(borrow_hits, 7)
+  // Also verify local `Holder::length` blocks even `x.length()` on `Array[Holder]`
+  let src2 = SourceFile::{
+    rel_path: "f12_shadow.mbt",
+    content: "pub struct Holder { xs : Array[Int] }\nfn Holder::length(self : Holder) -> Int { self.xs[0] = 99; 0 }\npub fn bad_local_len(hs : Array[Holder]) -> Array[Int] {\n  hs[0:2].iter().map(fn(x) { x.length() }).collect()\n}\n",
+    is_test: false,
+  }
+  let res2 = transpile_package([src2], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(str_has(res2.files[0].content, "__mbt_slice_borrow(hs, 0, 2).iter()"), "local Holder::length must force __mbt_slice_borrow")
 }
 
 test "f1-3: match followed by struct literal wraps direct for arms and preserves trailing struct" {
@@ -77,21 +84,23 @@ test "f1-4: Float::to_double, Float::reinterpret_from_int, array lit & is Some(C
   assert_true(str_has(out, "Some(Verb::Close)"), "is Some(Close) and is (Some(Move) | Some(Close) | None) disambiguate Verb::Close")
 }
 
-test "f1-5: trait object &Trait -> dyn Trait, split impl merging, targeted Self rewrite & UFCS trait calls" {
+test "f1-5: trait object &Trait -> dyn Trait, split impl merging, targeted Self/unnamed param rewrite & UFCS dyn dispatch" {
   let src = SourceFile::{
     rel_path: "f15.mbt",
-    content: "priv trait Sink {\n  put(Self, x : Int) -> Unit\n  put2(Self, x : Int, y : Int) -> Unit\n  pair(Self, f : (Self) -> Int) -> (Self, Self)\n  from_int(Int) -> Self\n}\npriv struct Acc { mut sum : Int }\nimpl Sink for Acc with put(self, x) {\n  self.sum = self.sum + x\n}\nimpl Sink for Acc with put2(self, x, y) {\n  Sink::put(self, x + y)\n}\nfn feed(s : &Sink, a : Int, b : Int) -> Unit {\n  s.put2(a, b)\n}\npub fn run() -> Int {\n  let a : Acc = { sum: 0 }\n  feed((a as &Sink), 3, 4)\n  let _ = Sink::from_int(42)\n  a.sum\n}\n",
+    content: "priv trait Sink {\n  put(Self, x : Int) -> Unit\n  put2(Self, x : Int, y : Int) -> Unit\n  name(Self, Int) -> String\n  pair(Self, f : (Self) -> Int) -> (Self, Self)\n  from_int(Int) -> Self\n}\npriv struct Acc { mut sum : Int }\nimpl Sink for Acc with put(self, x) {\n  self.sum = self.sum + x\n}\nimpl Sink for Acc with put2(self, x, y) {\n  Sink::put(self, x + y)\n}\nfn feed(s : &Sink, a : Int, b : Int) -> Unit {\n  s.put2(a, b)\n}\npub fn run() -> Int {\n  let a : Acc = { sum: 0 }\n  feed((a as &Sink), 3, 4)\n  let _ = Sink::from_int(42)\n  a.sum\n}\n",
     is_test: false,
   }
   let res = transpile_package([src], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
   assert_eq(res.blockers, 0)
   let out = res.files[0].content
   assert_true(str_has(out, "put(self : Self, x : Int) -> Unit"), "trait method Self lowered to self : Self")
+  assert_true(str_has(out, "name(self : Self, _p1 : Int) -> String"), "unnamed positional trait param gets synthetic _p1 name")
   assert_true(str_has(out, "pair(self : Self, f : (Self) -> Int) -> (Self, Self)"), "targeted Self rewrite must preserve fn-type params and return tuples")
+  assert_true(str_has(out, "from_int(_p0 : Int) -> Self"), "unnamed first non-Self param gets synthetic _p0 name")
   assert_true(str_has(out, "s : dyn Sink"), "&Sink lowered to dyn Sink")
   assert_true(str_has(out, "as dyn Sink"), "as &Sink lowered to as dyn Sink")
   assert_true(str_has(out, "fn put(self : Acc, x : Int) -> Unit"), "impl method inherits param/ret types from trait")
-  assert_true(str_has(out, "(self).put(x + y)"), "UFCS Sink::put(self, ...) lowered to (self).put(...)")
+  assert_true(str_has(out, "((self) as dyn Sink).put(x + y)"), "UFCS Sink::put(self, ...) lowered to ((self) as dyn Sink).put(...)")
   assert_true(str_has(out, "Sink::from_int(42)"), "associated trait method without Self receiver must not be rewritten to UFCS method call")
 }
 

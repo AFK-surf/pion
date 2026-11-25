@@ -174,11 +174,53 @@ fn drive(acc : &Accum, a : Int, b : Int) -> Unit {
   acc.add_pair(a, b)
 }
 
+priv trait Price {
+  cost(Self) -> Int
+}
+
+priv struct Item {
+  value : Int
+}
+
+fn Item::cost(self : Item) -> Int {
+  self.value + 100
+}
+
+impl Price for Item with cost(self) {
+  self.value + 1
+}
+
+priv trait Area {
+  area(Self) -> Int
+  name(Self, Int) -> String
+}
+
+priv struct Sq {
+  s : Int
+}
+
+impl Area for Sq with area(self) {
+  self.s * self.s
+}
+
+impl Area for Sq with name(self, tag) {
+  "sq:" + self.s.to_string() + ":" + tag.to_string()
+}
+
+fn show_area(a : &Area) -> String {
+  a.name(7) + "=" + a.area().to_string()
+}
+
 pub fn case6_dyn_trait_and_split_impl() -> String {
   let c : Counter = { total: 5 }
   let dyn_c : &Accum = (c as &Accum)
   drive(dyn_c, 2, 7)
-  c.total.to_string()
+  let it : Item = { value: 2 }
+  let p_trait = Price::cost(it)
+  let p_inherent = it.cost()
+  let q : Sq = { s: 3 }
+  let a_str = show_area(q as &Area)
+  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "|" + a_str
 }
 
 pub fn run_all() -> String {
@@ -188,6 +230,16 @@ pub fn run_all() -> String {
   "\nF1-4:" + case4_float_double_ops() +
   "\nF1-5:" + case5_ambig_close_disambig() +
   "\nF1-6:" + case6_dyn_trait_and_split_impl()
+}
+'''
+
+F1_SHADOW_MBT = r'''
+fn Float::reinterpret_from_int(_x : Int) -> Float {
+  7.0
+}
+
+pub fn run_shadow() -> String {
+  Float::reinterpret_from_int(0).to_double().to_string()
 }
 '''
 
@@ -234,8 +286,37 @@ def main():
         assert moon_out == pion_nat == pion_wasm, (
             f"3-ENGINE MISMATCH!\n--- MOON ---\n{moon_out}\n--- PION NATIVE ---\n{pion_nat}\n--- PION WASM32 ---\n{pion_wasm}"
         )
+
+        # Independent shadow package: local `fn Float::reinterpret_from_int` must not be hijacked by Float::from_bits
+        os.makedirs(os.path.join(md, "f1_shadow"))
+        os.makedirs(os.path.join(md, "cmd_shadow"))
+        open(os.path.join(md, "f1_shadow", "moon.pkg"), "w").write("\n")
+        open(os.path.join(md, "f1_shadow", "shadow.mbt"), "w").write(F1_SHADOW_MBT)
+        open(os.path.join(md, "cmd_shadow", "moon.pkg"), "w").write('import { "f1/oracle/f1_shadow" }\npkgtype(kind: "executable")\n')
+        open(os.path.join(md, "cmd_shadow", "main.mbt"), "w").write('fn main { println(@f1_shadow.run_shadow()) }\n')
+        moon_sh = run_cmd([args.moon, "run", "--target", "wasm-gc", "cmd_shadow"], cwd=md)
+
+        sdir = os.path.join(work, "pion_f1_shadow")
+        os.makedirs(os.path.join(sdir, "src"))
+        open(os.path.join(sdir, "pion.toml"), "w").write(
+            f'[package]\nname = "f1_shadow"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\n'
+        )
+        run_cmd([
+            bin_path, "--src", os.path.join(md, "f1_shadow"), "--out", os.path.join(sdir, "src"),
+            "--target", "native", "--mode", "publish", "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc
+        ])
+        open(os.path.join(sdir, "src", "main.pion"), "w").write(
+            'pub fn main(w : World) -> Int { io_println(w, run_shadow()); 0 }\n'
+        )
+        pion_sh_nat = run_cmd([args.pionc, "run", sdir])
+        pion_sh_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", sdir])
+        assert moon_sh == pion_sh_nat == pion_sh_wasm == "7", (
+            f"SHADOW 3-ENGINE MISMATCH! moon={moon_sh!r} nat={pion_sh_nat!r} wasm={pion_sh_wasm!r}"
+        )
+
         print("[f1-oracle] PASS: Moon wasm-gc == Pion native == Pion wasm32")
         print(moon_out)
+        print("F1-SHADOW:" + moon_sh)
     finally:
         shutil.rmtree(work, ignore_errors=True)
 

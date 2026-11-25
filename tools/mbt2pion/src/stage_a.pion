@@ -608,6 +608,7 @@ pub struct StageAContext {
   struct_field_renames : Map[String, Map[String, String]]
   struct_val_fields : Map[String, String]
   trait_methods : Map[String, Map[String, (Array[String], String)]]
+  local_method_names : Map[String, Bool]
   val_probe_sites : Array[ValProbeSite]
   exported_abi_enums : Array[AbiEnumSchema]
   exported_abi_struct_vals : Array[AbiStructValRename]
@@ -665,6 +666,7 @@ pub fn stage_a_context_new(
     struct_field_renames: Map(),
     struct_val_fields: Map(),
     trait_methods: Map(),
+    local_method_names: Map(),
     val_probe_sites: [],
     exported_abi_enums: [],
     exported_abi_struct_vals: [],
@@ -6241,14 +6243,19 @@ fn lower_one_token_or_form(
     !(lookup_scope_var(ctx, "Float") is Some(_)) &&
     i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 3].kind == TokenKind::LParen {
       let mname = tokens[i + 2].raw
-      if mname == "to_double" {
+      let qual_float_fn = "Float::" + mname
+      let shadowed_float_fn = ctx.symtab.local_fn_names.contains(qual_float_fn) ||
+      ctx.symtab.fn_param_types.contains(qual_float_fn) ||
+      ctx.symtab.fn_ret_types.contains(qual_float_fn) ||
+      (ctx.cur_is_blackbox && (ctx.symtab.blackbox_fn_param_types.contains(qual_float_fn) || ctx.symtab.blackbox_fn_ret_types.contains(qual_float_fn)))
+      if !shadowed_float_fn && mname == "to_double" {
         let close_p = find_matching_delim(tokens, i + 3)
         push_expected_type(ctx, "Float")
         let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
         pop_expected_type(ctx)
         return (trivia + "(" + inner + ").to_double()", close_p + 1)
       }
-      if mname == "reinterpret_from_int" {
+      if !shadowed_float_fn && mname == "reinterpret_from_int" {
         let close_p = find_matching_delim(tokens, i + 3)
         push_expected_type(ctx, "Int")
         let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
@@ -6256,7 +6263,7 @@ fn lower_one_token_or_form(
         return (trivia + "Float::from_bits(" + inner + ")", close_p + 1)
       }
     }
-    // UFCS trait method call `Trait::method(recv, args...)` -> `(recv).method(args...)`
+    // UFCS trait method call `Trait::method(recv, args...)` -> `((recv) as dyn Trait).method(args...)`
     if !in_pattern && !prev_colon2 && !prev_dot && ctx.trait_methods.contains(t.raw) &&
     i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
     tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen {
@@ -6295,7 +6302,7 @@ fn lower_one_token_or_form(
             if exp_pt.length() > 0 { pop_expected_type(ctx) }
             ai = ai + 1
           }
-          return (trivia + "(" + recv_s + ")." + mname + "(" + arg_sb.to_string() + ")", close_p + 1)
+          return (trivia + "((" + recv_s + ") as dyn " + t.raw + ")." + mname + "(" + arg_sb.to_string() + ")", close_p + 1)
         }
       }
     }
@@ -7548,9 +7555,90 @@ fn slice_iter_has_no_calls(tokens : Array[Token], start : Int, end : Int) -> Boo
   true
 }
 
+///| Extract parameter names of an inline lambda (`fn(x, y : T) { ... }`, `x => ...`, `(x, y) => ...`).
+fn extract_slice_lambda_params(tokens : Array[Token], start : Int, end : Int) -> Map[String, Bool] {
+  let params : Map[String, Bool] = Map()
+  if start >= end {
+    return params
+  }
+  let t0 = tokens[start]
+  if t0.kind == TokenKind::Ident && start + 1 < end && tokens[start + 1].kind == TokenKind::FatArrow {
+    params[t0.raw] = true
+    return params
+  }
+  let lp = if t0.kind == TokenKind::Keyword && t0.raw == "fn" &&
+  start + 1 < end && tokens[start + 1].kind == TokenKind::LParen {
+    start + 1
+  } else if t0.kind == TokenKind::LParen {
+    start
+  } else {
+    -1
+  }
+  if lp < 0 {
+    return params
+  }
+  let cp = find_matching_delim(tokens, lp)
+  if cp <= lp || cp >= end {
+    return params
+  }
+  let mut k = lp + 1
+  let mut depth = 0
+  let mut at_param_start = true
+  while k < cp {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
+      depth = depth + 1
+      at_param_start = false
+    } else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace {
+      if depth > 0 { depth = depth - 1 }
+      at_param_start = false
+    } else if depth == 0 && tk.kind == TokenKind::Comma {
+      at_param_start = true
+    } else if depth == 0 && at_param_start && tk.kind == TokenKind::Ident {
+      params[tk.raw] = true
+      at_param_start = false
+    } else if depth == 0 {
+      at_param_start = false
+    }
+    k = k + 1
+  }
+  params
+}
+
+///| Check that a parenthesized receiver `(expr)` before `.pure_method()` only references lambda params and literals (no calls, no dots, no external vars).
+fn slice_iter_paren_recv_uses_only_params(
+  tokens : Array[Token],
+  lp : Int,
+  rp : Int,
+  lambda_params : Map[String, Bool],
+) -> Bool {
+  let mut k = lp + 1
+  while k < rp {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Dot || tk.kind == TokenKind::ColonColon || tk.kind == TokenKind::PkgRef {
+      return false
+    }
+    if tk.kind == TokenKind::Ident && !lambda_params.contains(tk.raw) {
+      return false
+    }
+    if tk.kind == TokenKind::UpperIdent {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
 ///| E1-4 / Wave M2-F1: Check that argument tokens of a chained `.iter()` adapter/consumer
 ///| are strictly read-only and cannot mutate or alias the backing slice receiver.
-fn slice_iter_args_are_pure(tokens : Array[Token], start : Int, end : Int, recv_root : String) -> Bool {
+fn slice_iter_args_are_pure(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  recv_root : String,
+  lambda_params : Map[String, Bool],
+) -> Bool {
   let mut k = start
   while k < end {
     let tk = tokens[k]
@@ -7564,17 +7652,41 @@ fn slice_iter_args_are_pure(tokens : Array[Token], start : Int, end : Int, recv_
     !(k > start && tokens[k - 1].kind == TokenKind::Dot) {
       return false
     }
-    // Forbid all free function calls `ident(...)`, `Type::fn(...)`, `@pkg.fn(...)`, and non-whitelisted `.m(...)`
+    // Forbid all indirect calls `(...)()`, `[...]()`, `{...}()`, free/qualified/pkg calls,
+    // and any `.m(...)` outside strict pure whitelist or on non-lambda-param receivers or shadowed locally.
     if tk.kind == TokenKind::LParen && k > start {
       let prev = tokens[k - 1]
+      if prev.kind == TokenKind::RParen || prev.kind == TokenKind::RBracket || prev.kind == TokenKind::RBrace {
+        return false
+      }
       if prev.kind == TokenKind::Keyword && prev.raw == "fn" {
         // Explicit inline lambda header `fn(...)` is allowed
         ()
       } else if prev.kind == TokenKind::Ident {
         if k >= start + 2 && tokens[k - 2].kind == TokenKind::Dot &&
         !(k >= start + 3 && tokens[k - 3].kind == TokenKind::PkgRef) &&
-        slice_iter_is_pure_method(prev.raw) {
-          ()
+        slice_iter_is_pure_method(prev.raw) &&
+        !ctx.local_method_names.contains(prev.raw) {
+          // Receiver immediately before `.` must be a lambda param or pure paren expr over lambda params
+          if k >= start + 3 && tokens[k - 3].kind == TokenKind::Ident &&
+          lambda_params.contains(tokens[k - 3].raw) &&
+          !(k >= start + 4 && tokens[k - 4].kind == TokenKind::Dot) {
+            ()
+          } else if k >= start + 3 && tokens[k - 3].kind == TokenKind::RParen {
+            let mut lp = k - 4
+            let mut pd = 1
+            while lp >= start && pd > 0 {
+              if tokens[lp].kind == TokenKind::RParen { pd = pd + 1 }
+              else if tokens[lp].kind == TokenKind::LParen { pd = pd - 1 }
+              if pd == 0 { break }
+              lp = lp - 1
+            }
+            if pd != 0 || !slice_iter_paren_recv_uses_only_params(tokens, lp, k - 3, lambda_params) {
+              return false
+            }
+          } else {
+            return false
+          }
         } else {
           return false
         }
@@ -7589,8 +7701,15 @@ fn slice_iter_args_are_pure(tokens : Array[Token], start : Int, end : Int, recv_
 
 ///| E1-4 / Wave M2-F1: Return true iff `.iter()` at `close_br + 1 .. close_br + 5` is immediately
 ///| consumed by a pure read-only iterator chain ending in a terminal consumer (no escaping `Iter`,
-///| no mutation of backing array, no external closure variables or arbitrary calls).
-fn is_pure_immediate_iter_consumer(tokens : Array[Token], after_iter : Int, end : Int, recv_root : String) -> Bool {
+///| no mutation of backing array, no external closure variables or arbitrary/indirect calls).
+fn is_pure_immediate_iter_consumer(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  after_iter : Int,
+  end : Int,
+  recv_root : String,
+) -> Bool {
+  let empty_params : Map[String, Bool] = Map()
   let mut cur = after_iter
   while cur + 2 < end && tokens[cur].kind == TokenKind::Dot &&
   tokens[cur + 1].kind == TokenKind::Ident && tokens[cur + 2].kind == TokenKind::LParen {
@@ -7627,37 +7746,43 @@ fn is_pure_immediate_iter_consumer(tokens : Array[Token], after_iter : Int, end 
     if mname == "join" {
       return args.length() == 1 &&
       slice_iter_is_simple_arg(tokens, args[0].0, args[0].1) &&
-      slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root)
+      slice_iter_args_are_pure(ctx, tokens, args[0].0, args[0].1, recv_root, empty_params)
     }
     if mname == "take" || mname == "drop" {
       if args.length() != 1 ||
       !slice_iter_is_simple_arg(tokens, args[0].0, args[0].1) ||
-      !slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root) {
+      !slice_iter_args_are_pure(ctx, tokens, args[0].0, args[0].1, recv_root, empty_params) {
         return false
       }
       cur = close_p + 1
       continue
     }
     if mname == "any" || mname == "all" || mname == "find_first" {
-      return args.length() == 1 &&
-      slice_iter_is_inline_lambda(tokens, args[0].0, args[0].1) &&
-      slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root)
+      if args.length() != 1 || !slice_iter_is_inline_lambda(tokens, args[0].0, args[0].1) {
+        return false
+      }
+      let lparams = extract_slice_lambda_params(tokens, args[0].0, args[0].1)
+      return slice_iter_args_are_pure(ctx, tokens, args[0].0, args[0].1, recv_root, lparams)
     }
     if mname == "map" || mname == "filter" {
-      if args.length() != 1 ||
-      !slice_iter_is_inline_lambda(tokens, args[0].0, args[0].1) ||
-      !slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root) {
+      if args.length() != 1 || !slice_iter_is_inline_lambda(tokens, args[0].0, args[0].1) {
+        return false
+      }
+      let lparams = extract_slice_lambda_params(tokens, args[0].0, args[0].1)
+      if !slice_iter_args_are_pure(ctx, tokens, args[0].0, args[0].1, recv_root, lparams) {
         return false
       }
       cur = close_p + 1
       continue
     }
     if mname == "fold" {
-      return args.length() == 2 &&
-      slice_iter_has_no_calls(tokens, args[0].0, args[0].1) &&
-      slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root) &&
-      slice_iter_is_inline_lambda(tokens, args[1].0, args[1].1) &&
-      slice_iter_args_are_pure(tokens, args[1].0, args[1].1, recv_root)
+      if args.length() != 2 || !slice_iter_is_inline_lambda(tokens, args[1].0, args[1].1) {
+        return false
+      }
+      let lparams = extract_slice_lambda_params(tokens, args[1].0, args[1].1)
+      return slice_iter_has_no_calls(tokens, args[0].0, args[0].1) &&
+      slice_iter_args_are_pure(ctx, tokens, args[0].0, args[0].1, recv_root, empty_params) &&
+      slice_iter_args_are_pure(ctx, tokens, args[1].0, args[1].1, recv_root, lparams)
     }
     return false
   }
@@ -7702,7 +7827,7 @@ fn classify_slice_consumer(
   if !has_chained_slice && close_br + 4 < end && tokens[close_br + 1].kind == TokenKind::Dot &&
   tokens[close_br + 2].raw == "iter" &&
   tokens[close_br + 3].kind == TokenKind::LParen && tokens[close_br + 4].kind == TokenKind::RParen &&
-  is_pure_immediate_iter_consumer(tokens, close_br + 5, end, recv_root) {
+  is_pure_immediate_iter_consumer(ctx, tokens, close_br + 5, end, recv_root) {
     return ("mbt_compat::__mbt_slice_owned", close_br + 5, "\"__ITER__\"")
   }
   if !has_chained_slice && close_br + 4 < end && tokens[close_br + 1].kind == TokenKind::Dot &&
@@ -11309,6 +11434,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           tokens[name_i + 3].kind == TokenKind::LParen {
             let mname = tokens[name_i + 2].raw
             let qual_fn = fn_tok.raw + "::" + mname
+            ctx.local_method_names[mname] = true
             let cp = find_matching_delim(tokens, name_i + 3)
             let (pnames, ptys, _) = extract_param_info(ctx, tokens, name_i + 3, cp, sf.rel_path)
             let pts : Array[(String, String)] = []
@@ -11319,7 +11445,10 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
               pts.push((pnames[pk], clean_pt))
               pk = pk + 1
             }
-            if !is_blackbox {
+            if is_blackbox {
+              ctx.symtab.blackbox_fn_param_types[qual_fn] = pts
+            } else {
+              ctx.symtab.local_fn_names[qual_fn] = true
               ctx.symtab.fn_param_types[qual_fn] = pts
               let p_renames = compute_param_renames(extract_raw_param_names(tokens, name_i + 3, cp))
               if p_renames.length() > 0 {
@@ -11443,6 +11572,9 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         }
         pop_active_generics(ctx, fn_added_g)
         next_autofill = false
+      }
+      if t.kind == TokenKind::Keyword && t.raw == "impl" && i + 1 < n && tokens[i + 1].raw == "Show" {
+        ctx.local_method_names["to_string"] = true
       }
       if t.kind == TokenKind::Keyword && t.raw == "trait" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
         next_autofill = false
@@ -13193,8 +13325,10 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           ""
         }
         let raw_body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
-        // Rewrite only top-level trait method receiver `Ident(Self,` / `Ident(Self)` -> `self : Self`
-        // without touching return tuples `-> (Self, Self)` or fn-type params `f : (Self) -> Int`.
+        // Rewrite top-level trait method signatures:
+        // - First param `Self` -> `self : Self`
+        // - Any unnamed positional param (no top-level `:`) -> `_p<idx> : <Type>`
+        // Never touches return tuples `-> (Self, Self)` or named fn-type params `f : (Self) -> Int`.
         let btoks = lex_moonbit(raw_body)
         let bn = btoks.length() - 1
         let body_sb = StringBuilder()
@@ -13215,12 +13349,56 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           } else if bdepth == 1 && pdepth == 0 && btk.kind == TokenKind::Ident &&
           !(bk > 0 && (btoks[bk - 1].kind == TokenKind::Colon || btoks[bk - 1].kind == TokenKind::Arrow ||
             btoks[bk - 1].kind == TokenKind::Dot || btoks[bk - 1].kind == TokenKind::ColonColon)) &&
-          bk + 3 < bn && btoks[bk + 1].kind == TokenKind::LParen &&
-          btoks[bk + 2].kind == TokenKind::UpperIdent && btoks[bk + 2].raw == "Self" &&
-          (btoks[bk + 3].kind == TokenKind::Comma || btoks[bk + 3].kind == TokenKind::RParen) {
-            body_sb.write_string(raw_body.slice(last_b, btoks[bk + 2].start_byte))
-            body_sb.write_string("self : Self")
-            last_b = btoks[bk + 2].end_byte
+          bk + 1 < bn && btoks[bk + 1].kind == TokenKind::LParen {
+            let lp_i = bk + 1
+            let cp_i = find_matching_delim(btoks, lp_i)
+            if cp_i > lp_i && cp_i < bn {
+              let segs : Array[(Int, Int)] = []
+              let mut si = lp_i + 1
+              while si < cp_i {
+                if btoks[si].kind == TokenKind::Comma { si = si + 1; continue }
+                let mut se = si
+                let mut sd = 0
+                while se < cp_i {
+                  let sk = btoks[se].kind
+                  if sk == TokenKind::LParen || sk == TokenKind::LBracket || sk == TokenKind::LBrace { sd = sd + 1 }
+                  else if sk == TokenKind::RParen || sk == TokenKind::RBracket || sk == TokenKind::RBrace { sd = sd - 1 }
+                  else if sd == 0 && sk == TokenKind::Comma { break }
+                  se = se + 1
+                }
+                if se > si { segs.push((si, se)) }
+                si = se + 1
+              }
+              let mut pi = 0
+              while pi < segs.length() {
+                let (ps, pe) = segs[pi]
+                let mut has_top_colon = false
+                let mut pk = ps
+                let mut pd2 = 0
+                while pk < pe {
+                  let pkk = btoks[pk].kind
+                  if pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace { pd2 = pd2 + 1 }
+                  else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace { pd2 = pd2 - 1 }
+                  else if pd2 == 0 && pkk == TokenKind::Colon { has_top_colon = true; break }
+                  pk = pk + 1
+                }
+                if !has_top_colon {
+                  let seg_start_b = btoks[ps].start_byte
+                  let seg_end_b = btoks[pe - 1].end_byte
+                  if pi == 0 && pe == ps + 1 && btoks[ps].kind == TokenKind::UpperIdent && btoks[ps].raw == "Self" {
+                    body_sb.write_string(raw_body.slice(last_b, seg_start_b))
+                    body_sb.write_string("self : Self")
+                    last_b = seg_end_b
+                  } else if !(btoks[ps].kind == TokenKind::Ident && btoks[ps].raw == "self") {
+                    body_sb.write_string(raw_body.slice(last_b, seg_start_b))
+                    body_sb.write_string("_p" + pi.to_string() + " : " + raw_body.slice(seg_start_b, seg_end_b))
+                    last_b = seg_end_b
+                  }
+                }
+                pi = pi + 1
+              }
+              bk = cp_i
+            }
           }
           bk = bk + 1
         }
