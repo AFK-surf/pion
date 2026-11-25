@@ -412,6 +412,8 @@ sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
 # P120: Win64 nonvolatile xmm6..xmm15 in QBE amd64_win (xmm0..xmm5-only rsave, 128-bit movups save/restore of the used xmm6..xmm14 and the xmm15 scratch; check_frames.py + mutants, x86-64 execution of the Win64 code with all 160 bytes of xmm6..xmm15 checked, ASan+UBSan QBE replay).
 sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC2"
+# Generic arithmetic operator instantiation checks & QBE monomorphization (dev, --release, wasm32, ASan).
+sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
