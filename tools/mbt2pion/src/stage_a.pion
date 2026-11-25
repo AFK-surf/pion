@@ -2557,6 +2557,27 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       None => ()
     }
   }
+  // `recv.m(...).unwrap_or(...)` where `Type::m` of the statically typed receiver returns `Option[T]` -> `T`
+  if t.kind == TokenKind::Ident && start + 3 < end && tokens[start + 1].kind == TokenKind::Dot &&
+  tokens[start + 2].kind == TokenKind::Ident && tokens[start + 3].kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, start + 3)
+    if cp + 3 < end && tokens[cp + 1].kind == TokenKind::Dot && tokens[cp + 2].raw == "unwrap_or" &&
+    tokens[cp + 3].kind == TokenKind::LParen && find_matching_delim(tokens, cp + 3) == end - 1 {
+      let base = strip_type_args_sym(lookup_ident_static_type(ctx, t.raw))
+      if base.length() > 0 && !ctx.active_generics.contains(base) {
+        match ctx.symtab.fn_ret_types.get(base + "::" + tokens[start + 2].raw) {
+          Some(rty) =>
+          if rty.starts_with("Option[") && rty.ends_with("]") {
+            let inner = rty.slice(7, rty.length() - 1).trim()
+            if inner.length() > 0 && !ctx.active_generics.contains(inner) {
+              return inner
+            }
+          }
+          None => ()
+        }
+      }
+    }
+  }
   // Trailing Option-returning stdlib method calls `.get(...)`, `.rev_find(...)`, `.search(...)`, `.pop()`
   if end >= start + 4 && tokens[end - 1].kind == TokenKind::RParen {
     // Walk back to matching LParen
@@ -2836,6 +2857,241 @@ fn extract_raw_param_names(tokens : Array[Token], open_p : Int, close_p : Int) -
     i = p_end + 1
   }
   out
+}
+
+///| Pion parses `.Ctor` followed by `(` as a constructor call even across a newline, so a match arm whose body is a
+///| bare `.Ctor` would swallow the next arm's tuple pattern `(a, b) => ...` as arguments (MoonBit never continues
+///| a call across a newline). When the next arm (at `next_i`, no `,` in between) starts with `(`, parenthesize it.
+fn guard_dot_variant_arm_tail(body : String, tokens : Array[Token], next_i : Int, end : Int) -> String {
+  if next_i >= end || tokens[next_i].kind != TokenKind::LParen {
+    return body
+  }
+  let t = body.trim()
+  if t.length() < 2 || t.code_unit_at(0) != 46 || !is_upper(t.code_unit_at(1)) {
+    return body
+  }
+  let mut k = 2
+  while k < t.length() {
+    if !is_alnum(t.code_unit_at(k)) {
+      return body
+    }
+    k = k + 1
+  }
+  let lead = body.slice(0, body.index_of(t))
+  lead + "(" + t + ")"
+}
+
+///| True iff `tokens[s..e)` is a plain `ident(.field)*` path (no calls, indexing or operators).
+fn is_plain_field_path(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  if s >= e || tokens[s].kind != TokenKind::Ident {
+    return false
+  }
+  let mut k = s + 1
+  while k < e {
+    if k + 1 >= e || tokens[k].kind != TokenKind::Dot || tokens[k + 1].kind != TokenKind::Ident {
+      return false
+    }
+    k = k + 2
+  }
+  true
+}
+
+///| True iff the parenthesized list `tokens[open_p..=close_p]` has a depth-0 comma (more than one argument).
+fn paren_has_top_level_comma(tokens : Array[Token], open_p : Int, close_p : Int) -> Bool {
+  let mut k = open_p + 1
+  let mut d = 0
+  while k < close_p {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+    else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+    else if d == 0 && kk == TokenKind::Comma { return true }
+    k = k + 1
+  }
+  false
+}
+
+///| Simple Pion types an inferred closure parameter may be annotated with: built-in scalars, `String`, or a
+///| bare non-generic local type name. Anything else (generics, `Option[...]`, tuples, closures) is never guessed.
+fn is_simple_closure_param_type(ctx : StageAContext, ty : String) -> Bool {
+  if ty == "String" || ty == "Int" || ty == "Int64" || ty == "UInt" || ty == "UInt64" || ty == "Double" ||
+  ty == "Float" || ty == "Bool" || ty == "Byte" || ty == "Char" {
+    return true
+  }
+  ctx.symtab.local_types.contains(ty) && !ctx.active_generics.contains(ty)
+}
+
+///| Infer the type of untyped closure parameter `pname` from its uses in `[body_s, body_e)`: every use as a whole
+///| positional argument of `recv.m(...)` (receiver a scope variable of known type with a known `Type::m`) or of a
+///| known local function `f(...)` must agree on one simple type. Returns "" when there is no such use, any use
+///| disagrees, or the type is not simple (fail-closed: pionc then reports the unannotated parameter).
+fn infer_closure_param_type_from_body(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  body_s : Int,
+  body_e : Int,
+  pname : String,
+) -> String {
+  let mut found = ""
+  let mut j = body_s + 1
+  while j < body_e {
+    let tk = tokens[j]
+    if tk.kind == TokenKind::Ident && tk.raw == pname && j + 1 < body_e &&
+    (tokens[j - 1].kind == TokenKind::LParen || tokens[j - 1].kind == TokenKind::Comma) &&
+    (tokens[j + 1].kind == TokenKind::RParen || tokens[j + 1].kind == TokenKind::Comma) {
+      // Find the enclosing `(` and this argument's positional index.
+      let mut k = j - 1
+      let mut d = 0
+      let mut arg_idx = 0
+      while k > body_s {
+        let kk = tokens[k].kind
+        if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+          d = d + 1
+        } else if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+          if d == 0 { break }
+          d = d - 1
+        } else if d == 0 && kk == TokenKind::Comma {
+          arg_idx = arg_idx + 1
+        }
+        k = k - 1
+      }
+      if k <= body_s || tokens[k].kind != TokenKind::LParen || tokens[k].newline_before || k < 1 ||
+      tokens[k - 1].kind != TokenKind::Ident {
+        return ""
+      }
+      let callee = tokens[k - 1].raw
+      let mut pts : Array[(String, String)] = []
+      let mut strip_self = false
+      if k >= 3 && tokens[k - 2].kind == TokenKind::Dot && tokens[k - 3].kind == TokenKind::Ident {
+        match lookup_scope_var(ctx, rename_keyword_ident(tokens[k - 3].raw)) {
+          Some(sv) => {
+            let rbase = strip_type_args_sym(sv.ty)
+            if rbase.length() > 0 {
+              match ctx.symtab.fn_param_types.get(rbase + "::" + callee) {
+                Some(p) => {
+                  pts = p
+                  strip_self = true
+                }
+                None => ()
+              }
+            }
+          }
+          None => ()
+        }
+      } else if k >= 2 && tokens[k - 2].kind != TokenKind::Dot && tokens[k - 2].kind != TokenKind::ColonColon &&
+      ctx.symtab.local_fn_names.contains(callee) && lookup_scope_var(ctx, callee) is None {
+        match ctx.symtab.fn_param_types.get(callee) {
+          Some(p) => pts = p
+          None => ()
+        }
+      }
+      let off = if strip_self && pts.length() > 0 && pts[0].0 == "self" { 1 } else { 0 }
+      if strip_self && off == 0 {
+        return ""
+      }
+      if arg_idx + off >= pts.length() {
+        return ""
+      }
+      let ty = pts[arg_idx + off].1.trim()
+      if !is_simple_closure_param_type(ctx, ty) || (found.length() > 0 && found != ty) {
+        return ""
+      }
+      found = ty
+    }
+    j = j + 1
+  }
+  found
+}
+
+///| MoonBit infers untyped closure parameters (`let n = fn(aid) { doc.attr_number(child, aid) }`) from their
+///| uses, but Pion needs an expected function type or annotations. When no function type is expected, annotate
+///| each plain untyped parameter whose type `infer_closure_param_type_from_body` determines unambiguously.
+fn annotate_untyped_closure_params(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  end : Int,
+  p_str : String,
+  p_tys : Array[String],
+) -> (String, Array[String]) {
+  // Only a closure bound by an unannotated `let name = fn(...)` has nothing Pion could infer it from; a closure in
+  // argument/field/return position gets its parameter types from the expected function type.
+  let fn_i = open_p - 1
+  let is_let_init = fn_i >= 3 && tokens[fn_i - 1].kind == TokenKind::Eq && tokens[fn_i - 2].kind == TokenKind::Ident &&
+  tokens[fn_i - 3].kind == TokenKind::Keyword &&
+  (tokens[fn_i - 3].raw == "let" || (tokens[fn_i - 3].raw == "mut" && fn_i >= 4 && tokens[fn_i - 4].raw == "let"))
+  if !is_let_init || str_has(current_expected_type(ctx), "->") {
+    return (p_str, p_tys)
+  }
+  // Locate the body `{ ... }` after an optional `-> Ret`.
+  let mut b = close_p + 1
+  let mut rd = 0
+  while b < end {
+    let bk = tokens[b].kind
+    if rd == 0 && bk == TokenKind::LBrace { break }
+    if rd == 0 && (bk == TokenKind::RBrace || bk == TokenKind::RParen || bk == TokenKind::Semi) { return (p_str, p_tys) }
+    if bk == TokenKind::LParen || bk == TokenKind::LBracket { rd = rd + 1 }
+    else if bk == TokenKind::RParen || bk == TokenKind::RBracket { rd = rd - 1 }
+    b = b + 1
+  }
+  if b >= end {
+    return (p_str, p_tys)
+  }
+  let body_e = find_matching_delim(tokens, b)
+  let segs = p_str.split(", ")
+  if segs.length() != p_tys.length() {
+    return (p_str, p_tys)
+  }
+  // Each parameter must be exactly one identifier token (`fn(a, b)`) to be annotated.
+  let single : Array[String] = []
+  let mut i = open_p + 1
+  while i < close_p {
+    if tokens[i].kind == TokenKind::Comma { i = i + 1; continue }
+    if tokens[i].kind == TokenKind::Ident && i + 1 <= close_p &&
+    (i + 1 == close_p || tokens[i + 1].kind == TokenKind::Comma) {
+      single.push(tokens[i].raw)
+      i = i + 2
+    } else {
+      single.push("")
+      let mut d = 0
+      while i < close_p {
+        let k = tokens[i].kind
+        if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d = d + 1 }
+        else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { d = d - 1 }
+        else if d == 0 && k == TokenKind::Comma { break }
+        i = i + 1
+      }
+      i = i + 1
+    }
+  }
+  if single.length() != p_tys.length() {
+    return (p_str, p_tys)
+  }
+  let out_tys : Array[String] = []
+  let sb = StringBuilder()
+  let mut changed = false
+  let mut pi = 0
+  while pi < p_tys.length() {
+    let mut seg = segs[pi]
+    let mut ty = p_tys[pi]
+    let raw = single[pi]
+    if ty.length() == 0 && raw.length() > 0 && raw != "_" && !is_pion_reserved_ident(raw) && seg.trim() == raw {
+      let inf = infer_closure_param_type_from_body(ctx, tokens, b, body_e, raw)
+      if inf.length() > 0 {
+        seg = seg + " : " + inf
+        ty = inf
+        changed = true
+      }
+    }
+    if pi > 0 { sb.write_string(", ") }
+    sb.write_string(seg)
+    out_tys.push(ty)
+    pi = pi + 1
+  }
+  if !changed {
+    return (p_str, p_tys)
+  }
+  (sb.to_string(), out_tys)
 }
 
 ///| Extract `(param_names, param_types, all_typed)` from a parameter list `[open_p, close_p]`.
@@ -4442,7 +4698,16 @@ fn try_lower_general_postfix_slice(
     let extra_tail = if extra_arg.length() > 0 { ", " + extra_arg } else { "" }
     if has_hi {
       let hi = lower_expr_range(ctx, tokens, cur_col + 1, close_br, file, false).trim()
-      recv_str = helper + "(" + recv_str + ", " + lo + ", " + hi + extra_tail + ")"
+      if helper == "mbt_compat::__mbt_slice_borrow" && cur_br == slice_br && !is_plain_field_path(tokens, i, slice_br) {
+        // Bind a computed receiver (not a plain `a.b.c` path, which can never be fresh) to a hygienic temp, as the
+        // open-ended form does, so Stage B lowers it
+        // as a plain `let` initializer and Stage A.5 can prove it fresh (`slice_temp_bound_fresh`). MoonBit
+        // evaluates the receiver before the bounds, so the order is unchanged.
+        let sl_var = fresh_temp(ctx, "sl")
+        recv_str = "({ let " + sl_var + " = " + recv_str + "; " + helper + "(" + sl_var + ", " + lo + ", " + hi + extra_tail + ") })"
+      } else {
+        recv_str = helper + "(" + recv_str + ", " + lo + ", " + hi + extra_tail + ")"
+      }
     } else {
       let sl_var = fresh_temp(ctx, "sl")
       recv_str = "({ let " + sl_var + " = " + recv_str + "; " + helper + "(" + sl_var + ", " + lo + ", " + sl_var + ".length()" + extra_tail + ") })"
@@ -5109,9 +5374,10 @@ fn lower_one_token_or_form(
   if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "fn" && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
     let open_p = i + 1
     let close_p = find_matching_delim(tokens, open_p)
-    let (p_str, p_pre, _, p_renames) = lower_param_list_scoped(ctx, tokens, open_p, close_p, file, false, true)
+    let (p_str0, p_pre, _, p_renames) = lower_param_list_scoped(ctx, tokens, open_p, close_p, file, false, true)
     let raw_p_names = extract_raw_param_names(tokens, open_p, close_p)
-    let (_, p_tys, _) = extract_param_info(ctx, tokens, open_p, close_p, file)
+    let (_, p_tys0, _) = extract_param_info(ctx, tokens, open_p, close_p, file)
+    let (p_str, p_tys) = annotate_untyped_closure_params(ctx, tokens, open_p, close_p, end, p_str0, p_tys0)
     let mut cur = close_p + 1
     let mut ret_str = ""
     if cur < end && tokens[cur].kind == TokenKind::Arrow {
@@ -5646,9 +5912,14 @@ fn lower_one_token_or_form(
           if ae > ai {
             if !first { sb.write_string(", ") }
             first = false
-            push_expected_type(ctx, arr_elem_ty)
-            sb.write_string(lower_expr_range(ctx, tokens, ai, ae, file, false).trim())
-            pop_expected_type(ctx)
+            match byte_lit_for_int_token(tokens, ai, ae, arr_elem_ty) {
+              Some(bl) => sb.write_string(bl)
+              None => {
+                push_expected_type(ctx, arr_elem_ty)
+                sb.write_string(lower_expr_range(ctx, tokens, ai, ae, file, false).trim())
+                pop_expected_type(ctx)
+              }
+            }
           }
           ai = ae + 1
         }
@@ -6116,6 +6387,20 @@ fn lower_one_token_or_form(
       let inner_v = if pat_v.length() > 0 { pat_v } else if in_pattern { "_" } else { "0.0" }
       let inner_r = if repr_arg.length() > 0 { repr_arg } else if in_pattern { "_" } else { "Option::None" }
       return (trivia + "mbt_compat::MbtJson::Number(" + inner_v + ", " + inner_r + ")", close_p + 1)
+    }
+    // `Show::to_string(x)` (the trait method called by its trait's name) -> `(x).to_string()`, which then takes the
+    // regular `.to_string()` show-probe path (exact MoonBit formatting per resolved type). Only for MoonBit's builtin
+    // `Show` (unshadowed) with exactly one positional argument.
+    if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Show" &&
+    !ctx.symtab.local_types.contains("Show") && !ctx.symtab.local_value_names.contains("Show") &&
+    !ctx.active_generics.contains("Show") &&
+    i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
+    tokens[i + 2].raw == "to_string" && tokens[i + 3].kind == TokenKind::LParen && !tokens[i + 3].newline_before {
+      let close_p = find_matching_delim(tokens, i + 3)
+      if close_p > i + 4 && !paren_has_top_level_comma(tokens, i + 3, close_p) {
+        let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+        return (trivia + "(" + inner + ").to_string()", close_p + 1)
+      }
     }
     // `String::from_array(chars)` -> `mbt_compat::str_from_char_array(chars)`
     // Immediate-copy owned-slice exemption ONLY when `String` is unshadowed and arg is a direct sole slice.
@@ -6999,10 +7284,28 @@ fn lower_one_token_or_form(
     // Check function call `foo(...)` or `Type::method(...)` — NEVER merge a newline-separated trailing tuple `(a, b)` into a call!
     if !in_pattern && !prev_dot && next_i < end && tokens[next_i].kind == TokenKind::LParen && !tokens[next_i].newline_before {
       let close_p = find_matching_delim(tokens, next_i)
-      let qual_lookup = if prev_cc && i >= 2 && tokens[i - 2].kind == TokenKind::UpperIdent {
+      let type_qual = if prev_cc && i >= 2 && tokens[i - 2].kind == TokenKind::UpperIdent {
         tokens[i - 2].raw + "::" + t.raw
       } else {
         name
+      }
+      // `@pkg.Type::method(...)`: the dependency's signature is keyed `pkg::Type::method`; prefer it when known so
+      // arguments get the dependency's parameter types (e.g. a bare `Alpha` resolves against `pkg::MaskType`).
+      let pkg_qual = if type_qual != name && i >= 4 && tokens[i - 3].kind == TokenKind::Dot &&
+      tokens[i - 4].kind == TokenKind::PkgRef {
+        let raw_pkg = tokens[i - 4].raw.slice(1, tokens[i - 4].raw.length())
+        let mapped_pkg = match ctx.symtab.pkg_aliases.get(raw_pkg) {
+          Some(p) => p
+          None => raw_pkg
+        }
+        mapped_pkg + "::" + type_qual
+      } else {
+        ""
+      }
+      let qual_lookup = if pkg_qual.length() > 0 && ctx.symtab.fn_param_types.contains(pkg_qual) {
+        pkg_qual
+      } else {
+        type_qual
       }
       let needs_loc = if ctx.cur_is_blackbox {
         if ctx.symtab.blackbox_decls.contains(t.raw) {
@@ -8838,6 +9141,27 @@ fn check_and_lower_enum_site_d2(
   }
 }
 
+///| MoonBit types an unsuffixed integer literal by its expected type (`[0, 255] : FixedArray[Byte]`), while Pion only
+///| infers `Int`. When the expected element type is `Byte` and `[start, end)` is exactly one integer literal in
+///| `0..=255`, return the equivalent Pion byte literal `b'\xNN'` (valid in top-level initializers too); anything
+///| else (out of range, suffixed, expressions) returns `None` and keeps the regular lowering (pionc fails closed).
+fn byte_lit_for_int_token(tokens : Array[Token], start : Int, end : Int, elem_ty : String) -> Option[String] {
+  if elem_ty != "Byte" || end != start + 1 || tokens[start].kind != TokenKind::IntLit {
+    return None
+  }
+  match parse_json_int_literal_u64(tokens[start].raw) {
+    Some(v) =>
+    if v <= 255UL {
+      let n = v.to_int()
+      let hex = "0123456789abcdef"
+      Some("b'\\x" + hex.slice(n / 16, n / 16 + 1) + hex.slice(n % 16, n % 16 + 1) + "'")
+    } else {
+      None
+    }
+    None => None
+  }
+}
+
 ///| D2-4: Extract a compile-time scalar/string literal from a `const` RHS token range.
 fn extract_const_literal_pion(tokens : Array[Token], start : Int, end : Int) -> Option[String] {
   let mut e = end
@@ -9134,7 +9458,7 @@ fn lower_match_arms_with_ty(
           next_i = body_end
         } else {
           let body_end = find_expr_end(tokens, body_start, end)
-          body_raw = lower_expr_range(ctx, tokens, body_start, body_end, file, false)
+          body_raw = guard_dot_variant_arm_tail(lower_expr_range(ctx, tokens, body_start, body_end, file, false), tokens, body_end, end)
           next_i = body_end
         }
         let _ = ctx.match_arr_cache_ctor.pop()
@@ -9407,7 +9731,7 @@ fn lower_match_arms_with_ty(
       next_i = body_end
     } else {
       let body_end = find_expr_end(tokens, body_start, end)
-      body_raw = lower_expr_range(ctx, tokens, body_start, body_end, file, false)
+      body_raw = guard_dot_variant_arm_tail(lower_expr_range(ctx, tokens, body_start, body_end, file, false), tokens, body_end, end)
       next_i = body_end
     }
     let _ = ctx.match_arr_cache_ctor.pop()
