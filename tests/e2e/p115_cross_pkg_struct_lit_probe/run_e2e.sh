@@ -16,7 +16,8 @@
 #      + 1000) and `paint2` (also named `paint`, id `paint__<8hex>`) have the same
 #      structs. `app` imports the former as `paint` and instantiates `lg`, whose
 #      `paint` is the latter; `app2` imports the former as `rootp` and the latter
-#      as `paint`. An alias always means the package its own source imports.
+#      as `paint`. An alias always means the package its own source imports,
+#      for struct literals, struct / enum types and enum paths.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -94,4 +95,32 @@ for MODE in dev release; do
     fi
   done
 done
+# 4. `app2`'s `paint` is `paint2`: names only the root package declares are unknown.
+export PION_CACHE_DIR="$TMP_DIR/cas_neg"
+mkdir -p "$PION_CACHE_DIR"
+# neg <label> <statement> <name the diagnostic must mention>
+neg() {
+  printf 'import "paint"\nimport "rootp"\n\npub fn main(world : World) -> Int {\n  let r = rootp::RootOnly::{ n: 1 }\n  let g = paint::glass(1)\n  io_println(world, "\\{r.n} \\{g.blur}")\n  %s\n  0\n}\n' \
+    "$2" > "$PKGS/shadow/app2/src/main.pion"
+  if "$PIONC" build -o "$TMP_DIR/neg" "$PKGS/shadow/app2" > "$TMP_DIR/neg.out" 2>&1; then
+    echo "FAIL: p115 neg $1 compiled" >&2
+    exit 1
+  fi
+  if ! { grep -q '"code":"E_' "$TMP_DIR/neg.out" && grep -qF "$3" "$TMP_DIR/neg.out"; }; then
+    cat "$TMP_DIR/neg.out" >&2
+    echo "FAIL: p115 neg $1: no diagnostic mentions $3" >&2
+    exit 1
+  fi
+  echo "p115 neg $1 ok"
+}
+# Same source without the offending name must build, so `neg` fails for the name.
+printf 'import "paint"\nimport "rootp"\n\npub fn main(world : World) -> Int {\n  let r = rootp::RootOnly::{ n: 1 }\n  let g = paint::glass(1)\n  io_println(world, "\\{r.n} \\{g.blur}")\n  0\n}\n' \
+  > "$PKGS/shadow/app2/src/main.pion"
+"$PIONC" build -o "$TMP_DIR/neg" "$PKGS/shadow/app2"
+[ "$("$TMP_DIR/neg")" = "1 1" ] || { echo "FAIL: p115 neg control output" >&2; exit 1; }
+neg annotated-literal 'let x : paint::RootOnly = paint::RootOnly::{ n: 87 }' paint::RootOnly
+neg literal 'let x = paint::RootOnly::{ n: 87 }' paint::RootOnly
+neg type 'let x : paint::RootOnly = r' paint::RootOnly
+neg enum-type 'let x : paint::RootKind = rootp::RootKind::Root' paint::RootKind
+neg enum-path 'let x = paint::RootKind::Root' paint::RootKind
 echo "[SUMMARY] p115_cross_pkg_struct_lit_probe: OK"
