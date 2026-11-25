@@ -65,7 +65,12 @@ pub fn run_f3c_1() -> String {
   for ((x, y), z) in nested {
     s6 = s6 + x + y * 2 + z * 3
   }
-  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string() + "," + s6.to_string()
+  let mut s7 = 0
+  match Some(4) {
+    Some(t) => while { s7 < t } { s7 = s7 + 1 }
+    None => ()
+  }
+  s1.to_string() + "," + s2.to_string() + "," + s3.to_string() + "," + s4.to_string() + "," + s5.to_string() + "," + s6.to_string() + "," + s7.to_string()
 }
 
 pub fn run_f3c_2() -> String {
@@ -163,7 +168,13 @@ pub fn run_f3c_3() -> String {
   let r4 = eval_nested(Some(o_both), None)
   let r5 = eval_nested(Some(o_hit_only), Some(m_some))
   let r6 = eval_nested(Some(o_hit_only), Some(m_none))
-  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string()
+  let same_ctor_hit = fn(x : Leaf?) -> Int {
+    if x is (Some({ rest: 1 }) | Some({ rest: 3 })) { 1 } else { 0 }
+  }
+  let r7 = same_ctor_hit(Some(l1))
+  let r8 = same_ctor_hit(Some(l2))
+  let r9 = same_ctor_hit(None)
+  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "," + r7.to_string() + "," + r8.to_string() + "," + r9.to_string()
 }
 
 pub fn run_all() -> String {
@@ -218,9 +229,9 @@ def main():
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", pl])
 
         expected = (
-            "F3c-1:30,15,50,68,13,46\n"
+            "F3c-1:30,15,50,68,13,46,4\n"
             "F3c-2:1,-1|45-30-25-10|10-25-30-45|25-30|10-45|10-45-7-8|4-7-10|15,99,5,-1,-1|1,3,1,2,a=1;b=20;c=3;d=4|true,true,false,false\n"
-            "F3c-3:-1,-1,300,53,300,7"
+            "F3c-3:-1,-1,300,53,300,7,1,0,0"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"

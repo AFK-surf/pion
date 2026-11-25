@@ -193,3 +193,101 @@ test "F3c-3: recursive nested struct patterns, tuple-wrapped struct patterns, an
   assert_true(str_has(field_or_out, "=> true, _ => false })"), "field-level or-pattern uses match instead of invalid `is A | B`")
   assert_true(!str_has(field_or_out, " is A | B"), "must not emit invalid Pion `is A | B`")
 }
+
+test "F3c-4: Astra P1 regressions (search_by/iter mutation fail-closed, same-ctor or-is guard, mutating match guard, while block cond)" {
+  // P1-2: same-outer-ctor or-is (`Some({ x: 1 }) | Some({ x: 2 })`) uses `if` guards for fallthrough
+  let or_is_src = "priv struct S { x : Int }\n" +
+  "pub fn check_same_ctor(s : S?) -> Bool {\n" +
+  "  s is (Some({ x: 1 }) | Some({ x: 2 }))\n" +
+  "}\n"
+  let or_is_res = transpile_package([SourceFile::{ rel_path: "same_ctor_is.mbt", content: or_is_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(or_is_res.blockers == 0, "same-ctor or-is should have 0 blockers")
+  let or_is_out = or_is_res.files[0].content
+  assert_true(str_has(or_is_out, "if (__mbt_sp_") && str_has(or_is_out, "=> true"), "same-ctor or-is must emit `if` guard so fallthrough reaches second Some")
+
+  // P1-3: struct pattern with bindings + non-pure `if` guard fails closed; pure `if` guard succeeds
+  let mut_g_src = "priv struct Box { mut x : Int? }\n" +
+  "fn change(b : Box) -> Bool { b.x = Some(9); true }\n" +
+  "pub fn bad_guard(s : Box) -> Int {\n" +
+  "  match (Some(s), 0) {\n" +
+  "    (Some({ x: Some(k) }), _) if change(s) => k\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let mut_g_res = transpile_package([SourceFile::{ rel_path: "guard_change.mbt", content: mut_g_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(mut_g_res.blockers > 0, "non-pure guard with struct-pattern bindings must fail closed")
+  let mut saw_mg = false
+  for d in mut_g_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_mg = true }
+  }
+  assert_true(saw_mg, "non-pure guard with struct-pattern bindings must emit MBT2PION_UNSUPPORTED_SYNTAX")
+
+  let pure_g_src = "priv struct Box { x : Int? }\n" +
+  "pub fn ok_guard(s : Box?, target : Int) -> Int {\n" +
+  "  match s {\n" +
+  "    Some({ x: Some(k) }) if k == target => k\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let pure_g_res = transpile_package([SourceFile::{ rel_path: "guard_pure.mbt", content: pure_g_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(pure_g_res.blockers == 0, "pure guard with struct-pattern bindings should succeed")
+
+  // P1-5: `match` arm `while { n < t } { n = n + 1 }` block condition does not truncate at condition `{`
+  let wh_src = "pub fn while_block_cond(opt : Int?) -> Int {\n" +
+  "  let mut n = 0\n" +
+  "  match opt {\n" +
+  "    Some(t) => while { n < t } { n = n + 1 }\n" +
+  "    None => ()\n" +
+  "  }\n" +
+  "  n\n" +
+  "}\n"
+  let wh_res = transpile_package([SourceFile::{ rel_path: "while_expr.mbt", content: wh_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(wh_res.blockers == 0, "while block condition in match arm should have 0 blockers")
+  let wh_out = wh_res.files[0].content
+  assert_true(str_has(wh_out, "{ while { n < t } { n = n + 1 } }"), "while block condition and loop body both stay inside match arm wrapper")
+
+  // P1-1: `Array::search_by` callback mutating receiver fails closed via Stage B guard
+  let sb_pop_diags : Array[Diag] = []
+  let sb_pop_src = "pub fn f(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { if x == 1 { let _ = xs.pop() }; x == 2 })\n}\n"
+  let sb_ft1 : Map[String, Array[Token]] = Map()
+  let sb_pf1 : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(sb_ft1, sb_pf1, "sb_pop.pion", sb_pop_src, 2, 6, "search_by", sb_pop_diags)
+  assert_true(sb_pop_diags.length() > 0, "search_by callback calling xs.pop() must fail closed")
+
+  let sb_wr_diags : Array[Diag] = []
+  let sb_wr_src = "pub fn f(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { xs[1] = 99; x == 2 })\n}\n"
+  let sb_ft2 : Map[String, Array[Token]] = Map()
+  let sb_pf2 : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(sb_ft2, sb_pf2, "sb_wr.pion", sb_wr_src, 2, 6, "search_by", sb_wr_diags)
+  assert_true(sb_wr_diags.length() > 0, "search_by callback mutating xs[1] must fail closed")
+
+  // P1-4: escaping/mutated `Array::iter()` and self-`push_iter` fail closed with MBT2PION_ARRAY_ITER_MUTATION
+  let sh_diags : Array[Diag] = []
+  let sh_src = "pub fn f(a : Array[Int]) -> Int {\n  let it = a.iter()\n  a.shrink_to_fit()\n  a[0] = 42\n  it.count()\n}\n"
+  let sh_ft : Map[String, Array[Token]] = Map()
+  let sh_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_iter_mutation_cached(sh_ft, sh_pf, "shrink_iter.pion", sh_src, 2, 14, sh_diags)
+  assert_true(sh_diags.length() > 0 && sh_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "shrink_iter must emit MBT2PION_ARRAY_ITER_MUTATION")
+
+  let ic_diags : Array[Diag] = []
+  let ic_src = "pub fn f(a : Array[Int]) -> Int {\n  let it = a.iter()\n  let _ = a.pop()\n  it.count()\n}\n"
+  let ic_ft : Map[String, Array[Token]] = Map()
+  let ic_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_iter_mutation_cached(ic_ft, ic_pf, "iter_change.pion", ic_src, 2, 14, ic_diags)
+  assert_true(ic_diags.length() > 0 && ic_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "iter_change must emit MBT2PION_ARRAY_ITER_MUTATION")
+
+  let sa_diags : Array[Diag] = []
+  let sa_src = "pub fn f(xs : Array[Int]) -> Unit {\n  xs.push_iter(xs.iter())\n}\n"
+  let sa_ft : Map[String, Array[Token]] = Map()
+  let sa_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_iter_mutation_cached(sa_ft, sa_pf, "self_append.pion", sa_src, 2, 19, sa_diags)
+  assert_true(sa_diags.length() > 0 && sa_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "self push_iter(xs.iter()) must emit MBT2PION_ARRAY_ITER_MUTATION")
+
+  let ok_it_diags : Array[Diag] = []
+  let ok_it_src = "pub fn f(dst : Array[Int], src : Array[Int]) -> Bool {\n  dst.push_iter(src.iter())\n  src.iter().any(fn(x) { x > 0 })\n}\n"
+  let ok_ft : Map[String, Array[Token]] = Map()
+  let ok_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_iter_mutation_cached(ok_ft, ok_pf, "ok_iter.pion", ok_it_src, 2, 21, ok_it_diags)
+  stage_b_check_array_iter_mutation_cached(ok_ft, ok_pf, "ok_iter.pion", ok_it_src, 3, 7, ok_it_diags)
+  assert_true(ok_it_diags.length() == 0, "disjoint push_iter and pure immediate .iter().any() must pass with 0 diagnostics")
+}
