@@ -275,6 +275,10 @@ fn pick_price_cost(flag : Bool, a : &Price, b : &Price) -> Int {
   Price::cost(if flag { a } else { b })
 }
 
+fn[T : Price] gen_cost(v : T) -> Int {
+  Price::cost(v)
+}
+
 pub fn case6_dyn_trait_and_split_impl() -> String {
   let c : Counter = { total: 5 }
   let dyn_c : &Accum = (c as &Accum)
@@ -284,9 +288,11 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let p_trait = Price::cost(it)
   let p_inherent = it.cost()
   let p_dyn_cond = pick_price_cost(true, it as &Price, it2 as &Price)
+  let p_gen = gen_cost(it)
   let __mbt_ufcs_0 = 999
   let __mbt_ufcs_Grow_grow = 888
   let _keep = __mbt_ufcs_0 + __mbt_ufcs_Grow_grow
+  let interp_hyg = "\{ { let __mbt_ufcs_1 = fn(_x : Item) -> Item { { value: 42 } }; let _ = __mbt_ufcs_1; Grow::grow(it).value } }"
   let g_trait = Grow::grow(it).value
   let g_inherent = it.grow().value
   let pl_trait = Plus::combine(it, it).value
@@ -296,7 +302,7 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let rs_pair = ReadSelf::row_id(row).v * 10 + ReadSelf_row::id(row).v
   let q : Sq = { s: 3 }
   let a_str = show_area(q as &Area)
-  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "," + p_dyn_cond.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + r_pair.to_string() + "," + rs_pair.to_string() + "|" + a_str
+  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "," + p_dyn_cond.to_string() + "," + p_gen.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "," + interp_hyg + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + r_pair.to_string() + "," + rs_pair.to_string() + "|" + a_str
 }
 
 pub fn run_all() -> String {
