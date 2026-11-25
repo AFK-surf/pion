@@ -257,6 +257,16 @@ fn read_float(_s : String) -> Float {
   0.1
 }
 
+fn scale(x : Float) -> Float {
+  x
+}
+
+pub fn run_f3b_12() -> String {
+  let x : Float = 0.1
+  let f : Float = 2.5
+  "\{x|>scale}|\{f==f}|\{x+x}"
+}
+
 pub fn run_f3b_11() -> String {
   let r : Reading2 = { f: 0.1 }
   let f = r.f
@@ -286,7 +296,7 @@ pub fn run_f3b_10() -> String {
 pub fn run_all() -> String {
   "F3b-1:" + run_f3b_1() + "\nF3b-2:" + run_f3b_2() + "\nF3b-3:" + run_f3b_3() + "\nF3b-4:" + run_f3b_4() +
   "\nF3b-5:" + run_f3b_5() + "\nF3b-6:" + run_f3b_6() + "\nF3b-7:" + run_f3b_7() +
-  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9() + "\nF3b-10:" + run_f3b_10() + "\nF3b-11:" + run_f3b_11()
+  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9() + "\nF3b-10:" + run_f3b_10() + "\nF3b-11:" + run_f3b_11() + "\nF3b-12:" + run_f3b_12() + "\nF3b-13:" + crlf_case()
 }
 '''
 
@@ -307,6 +317,22 @@ pub fn copy_alias() -> Int {
   v[1]
 }
 '''
+
+# Written with CRLF line endings into the `f3b` package: `#|` / `$|` lines must not keep the `\r`.
+CRLF_MBT = (
+    "pub fn crlf_case() -> String {\n"
+    "  let x = \"f\"\n"
+    "  let s =\n"
+    "    #|abc\n"
+    "    $|de\\{x}\n"
+    "  let t =\n"
+    "    #|ab\n"
+    "    #|cd\n"
+    "  let u =\n"
+    "    $|u\\{x}\n"
+    "  s.length().to_string() + \",\" + t.length().to_string() + \",\" + u.length().to_string() + \":\" + s\n"
+    "}\n"
+).replace("\n", "\r\n")
 
 NEG_SHOW_MBT = r'''
 pub fn show_array() -> String {
@@ -510,6 +536,7 @@ def main():
             ("f3dep/dep.mbt", DEP_MBT),
             ("f3b/moon.pkg", 'import { "f3b/oracle/f3dep" }\n'),
             ("f3b/f3b.mbt", F3B_MBT),
+            ("f3b/crlf.mbt", CRLF_MBT),
             ("cmd/moon.pkg", 'import { "f3b/oracle/f3b" }\npkgtype(kind: "executable")\n'),
             ("cmd/main.mbt", "fn main { println(@f3b.run_all()) }\n"),
         ]:
@@ -546,7 +573,9 @@ def main():
             "F3b-8:7\n"
             "F3b-9:0.1|b\"abc\"|0.1|b\"abc\"|97|1e-7,1e+21,3.4028235e+38,0.33333334|2.5|0|b\"a\\x22b\\x5cc\\x0a\"|97|97\n"
             "F3b-10:0.2|0.1|-2.5|0.30000000000000004|2.5|v=2.5,-2.5\n"
-            "F3b-11:0.1|a=0.1\nb=0.1|hdr\na=0.1\nftr|q=\"0.1\"\nx\\y\"z"
+            "F3b-11:0.1|a=0.1\nb=0.1|hdr\na=0.1\nftr|q=\"0.1\"\nx\\y\"z\n"
+            "F3b-12:0.1|true|0.2\n"
+            "F3b-13:7,5,2:abc\ndef"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
