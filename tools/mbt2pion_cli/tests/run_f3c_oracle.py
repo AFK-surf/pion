@@ -91,7 +91,6 @@ pub fn run_f3c_2() -> String {
   let arr : Array[Int] = [10, 25, 30, 45]
   let idx1 = arr.search_by(fn(x) { x > 20 }).unwrap_or(-1)
   let idx2 = arr.search_by(fn(x) { x > 100 }).unwrap_or(-1)
-  arr.shrink_to_fit()
   let rev_arr = arr.rev()
   let rev_s = rev_arr.map(fn(x) { x.to_string() }).join("-")
   let orig_s = arr.map(fn(x) { x.to_string() }).join("-")
@@ -100,8 +99,9 @@ pub fn run_f3c_2() -> String {
   let rem_s = arr.map(fn(x) { x.to_string() }).join("-")
   arr.push_iter([7, 8].iter())
   let pushed_s = arr.map(fn(x) { x.to_string() }).join("-")
-  let collected = [3, 6, 9].iter().map(fn(x) { x + 1 }).to_array()
-  let col_s = collected.map(fn(x) { x.to_string() }).join("-")
+  let self_arr : Array[Int] = [1, 2]
+  self_arr.push_iter(self_arr.iter())
+  let self_s = self_arr.map(fn(x) { x.to_string() }).join("-")
 
   let mo1 = Some(5).map_or(99, fn(x) { x * 3 })
   let mo2 = (None : Int?).map_or(99, fn(x) { x * 3 })
@@ -134,7 +134,7 @@ pub fn run_f3c_2() -> String {
     '_'.is_ascii_alphabetic().to_string()
 
   idx1.to_string() + "," + idx2.to_string() + "|" + rev_s + "|" + orig_s + "|" +
-    dr_s + "|" + rem_s + "|" + pushed_s + "|" + col_s + "|" +
+    dr_s + "|" + rem_s + "|" + pushed_s + "|" + self_s + "|" +
     mo1.to_string() + "," + mo2.to_string() + "," + b1.to_string() + "," + b2.to_string() + "," + b3.to_string() + "|" +
     g1.to_string() + "," + g2.to_string() + "," + init_calls.to_string() + "," + m_b.to_string() + "," + cp_keys.join(";") + "|" +
     alpha
@@ -244,7 +244,7 @@ def main():
 
         expected = (
             "F3c-1:30,15,50,68,13,46,4,0\n"
-            "F3c-2:1,-1|45-30-25-10|10-25-30-45|25-30|10-45|10-45-7-8|4-7-10|15,99,5,-1,-1|1,3,1,2,a=1;b=20;c=3;d=4|true,true,false,false\n"
+            "F3c-2:1,-1|45-30-25-10|10-25-30-45|25-30|10-45|10-45-7-8|1-2-1-2|15,99,5,-1,-1|1,3,1,2,a=1;b=20;c=3;d=4|true,true,false,false\n"
             "F3c-3:-1,-1,300,53,300,7,1,0,0"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
