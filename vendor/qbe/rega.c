@@ -29,6 +29,10 @@ static struct {
 static int npm;        /* size of pm */
 static int loop;       /* current loop level */
 
+signed char *slporder; /* Physical scalar operand order, indexed by SSA result. */
+
+static int packed;
+
 static uint stmov;     /* stats: added moves */
 static uint stblk;     /* stats: added blocks */
 
@@ -426,6 +430,14 @@ doblk(Blk *b, RMap *cur)
 				insert(&i->arg[x], ra, nr++);
 				break;
 			}
+		if (packed && rf != -1 && !T.apple &&
+		    (i->op == Oordadd || i->op == Oordmul || i->op == Oordsub ||
+		     i->op == Ovadd || i->op == Ovmul || i->op == Ovsub || i->op == Ovsum))
+			if (rtype(i->arg[0]) == RTmp && i->arg[0].val >= Tmp0 &&
+			    !bshas(cur->b, i->arg[0].val) && !bshas(cur->b, rf)) {
+				tmp[i->arg[0].val].visit = rf;
+				ralloc(cur, i->arg[0].val);
+			}
 		for (r=0; r<nr; r++)
 			*ra[r] = ralloc(cur, ra[r]->val);
 		if (i->op == Ocopy && req(i->to, i->arg[0]))
@@ -449,6 +461,10 @@ doblk(Blk *b, RMap *cur)
 			 * the newly freed rt, but in this case
 			 * the above loop must be changed */
 		}
+		if (slporder && i1->cls == Kd && rtype(i1->to) == RTmp &&
+		    (i1->op == Oadd || i1->op == Omul || i1->op == Osub))
+			slporder[i1->to.val] =
+			    1 + (req(i->to, i->arg[1]) && !req(i->to, i->arg[0]));
 	}
 	idup(b, curi, &insb[NIns]-curi);
 }
@@ -661,6 +677,7 @@ rega(Fn *fn)
 	stblk = 0;
 	regu = 0;
 	tmp = fn->tmp;
+	packed = fn->packed;
 	mem = fn->mem;
 	blk = alloc(fn->nblk * sizeof blk[0]);
 	end = alloc(fn->nblk * sizeof end[0]);

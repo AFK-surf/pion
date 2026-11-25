@@ -667,6 +667,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p125_string_span_map_entry/run_e2e.sh"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.sh" "$PIONC"
 # P124: counted-fill length immediate for fresh local Array[Int] (qbe_record_counted_fill; 18 programs in --release and dev: immediate-only bounds checks for single / multi-array / empty fills, header length kept on alias, push, pop, capturing closure, mut and call arguments, shadowing incl. inside a while body that reads the outer array first; exact exit / stdout / stderr vs a plain-array reference incl. SIGABRT traps at -1, 37, 100 and 0 of 0).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC"
+# P127: strict 2 x f64 SLP in QBE (vendor/qbe/slp.h; amd64_sysv SSE2 / arm64_apple NEON packets behind an MXCSR / FPCR trap-mask entry test with the scalar graph retained; 16 x 16 IEEE-754 boundary rows in --release and dev, vector arm == scalar arm bit for bit incl. NaN payloads and aliasing, == strict C reference, packet kept in a 16-byte slot across a foreign call that dirties every vector register, direct object == assembled text, packed-code structure on Linux x86-64 / macOS arm64).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p127_qbe_double_simd_slp/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"

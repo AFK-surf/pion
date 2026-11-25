@@ -860,6 +860,8 @@ parseline(PState ps)
 	Ins:
 		if (curi - insb >= NIns)
 			err("too many instructions");
+		if (op == Ostored && curf->doubleStores < 2)
+			curf->doubleStores++;
 		curi->op = op;
 		curi->cls = k;
 		curi->to = r;
@@ -1430,7 +1432,7 @@ printref(Ref r, Fn *fn, FILE *f)
 void
 printfn(Fn *fn, FILE *f)
 {
-	static char ktoc[] = "wlsd";
+	static char ktoc[] = "wlsd???v";
 	static char *jtoa[NJmp] = {
 	#define X(j) [J##j] = #j,
 		JMPS(X)

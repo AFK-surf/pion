@@ -416,6 +416,8 @@ expandloops(Fn *fn, int *budget)
 	return changed;
 }
 
+#include "slp.h"
+
 static void
 func(Fn *fn)
 {
@@ -480,20 +482,41 @@ func(Fn *fn)
 	filluse(fn);
 	T.isel(fn);
 	fillcfg(fn);
+	/* Constant hoisting and SLP scheduling move instructions, preserving
+	 * the selected CFG and its loop weights through liveness. */
+	fillloop(fn);
 	if (strncmp(T.name, "arm64", 5) == 0) {
 		filldom(fn);
-		fillloop(fn);
 		arm64_hoist_consts(fn);
 	} else if (strncmp(T.name, "amd64", 5) == 0) {
 		filldom(fn);
-		fillloop(fn);
 		amd64_hoist_consts(fn);
 	}
+	Fn *packet = slpsnapshot(fn);
 	filllive(fn);
-	fillloop(fn);
 	fillcost(fn);
 	spill(fn);
 	rega(fn);
+	signed char *order = slporder;
+	slporder = 0;
+	if (packet && slpbuild(packet, order)) {
+		filllive(packet);
+		fillcost(packet);
+		spill(packet);
+		rega(packet);
+		int supported = 1;
+		/* pmrec widens a parallel-copy cycle to its largest class. A
+		 * narrower stack home in a mixed cycle must never be widened. */
+		for (Blk *b = packet->start; b; b = b->link)
+			for (uint j = 0; j < b->nins; j++) {
+				Ins i = b->ins[j];
+				if (i.op == Oswap && i.cls == Kv2d &&
+				    (!isreg(i.arg[0]) || !isreg(i.arg[1])))
+					supported = 0;
+			}
+		if (supported && !slpchangesenv(packet))
+			fn = slpversion(fn, packet);
+	}
 	fillcfg(fn);
 	simpljmp(fn);
 	fillcfg(fn);
