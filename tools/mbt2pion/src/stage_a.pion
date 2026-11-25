@@ -634,6 +634,7 @@ pub struct StageAContext {
   match_arr_cache_len : Array[String]
   active_generics : Map[String, Bool]
   used_idents : Map[String, Bool]
+  synth_sp_temps : Map[String, Bool]
   mut cur_is_test : Bool
   mut cur_is_blackbox : Bool
   mut cur_out_rel : String
@@ -697,6 +698,7 @@ pub fn stage_a_context_new(
     match_arr_cache_len: [],
     active_generics: Map(),
     used_idents: Map(),
+    synth_sp_temps: Map(),
     cur_is_test: false,
     cur_is_blackbox: false,
     cur_out_rel: "",
@@ -1947,10 +1949,123 @@ fn try_resolve_static_val_field_from_ty(ctx : StageAContext, recv_ty : String) -
   None
 }
 
+///| Split top-level comma-separated type arguments inside `s` (respecting `[]` and `()`).
+fn split_top_level_type_args(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut start = 0
+  let mut depth = 0
+  let mut i = 0
+  let n = s.length()
+  while i < n {
+    let ch = s.code_unit_at(i)
+    if ch == 91 || ch == 40 {
+      depth = depth + 1
+    } else if ch == 93 || ch == 41 {
+      if depth > 0 { depth = depth - 1 }
+    } else if depth == 0 && ch == 44 {
+      out.push(s.slice(start, i).trim())
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start <= n {
+    let tail = s.slice(start, n).trim()
+    if tail.length() > 0 { out.push(tail) }
+  }
+  out
+}
+
+///| Shallowly match a generic return-type pattern `pat` (e.g. `T`, `Option[T]`, `Array[T]`, `Result[T, E]`)
+///| against concrete expected type `concrete`, recording type-parameter bindings in `subst`.
+fn match_pipe_type_pattern(pat : String, concrete : String, subst : Map[String, String]) -> Unit {
+  let p = pat.trim()
+  let c = concrete.trim()
+  if p.length() == 0 || c.length() == 0 {
+    return
+  }
+  let p_lb = p.index_of("[")
+  let p_lp = p.index_of("(")
+  if p_lb < 0 && p_lp < 0 && !str_has(p, "::") && !str_has(p, ",") && !str_has(p, " ") {
+    if p != "Int" && p != "Int64" && p != "UInt" && p != "UInt64" && p != "Double" &&
+    p != "Float" && p != "Bool" && p != "String" && p != "Char" && p != "Unit" &&
+    p != "Byte" && p != "Bytes" && p != "Json" && p != "Never" {
+      subst[p] = c
+    }
+    return
+  }
+  if p_lb > 0 && p.ends_with("]") {
+    let head = p.slice(0, p_lb).trim()
+    let c_lb = c.index_of("[")
+    if c_lb > 0 && c.ends_with("]") && c.slice(0, c_lb).trim() == head {
+      let pargs = split_top_level_type_args(p.slice(p_lb + 1, p.length() - 1))
+      let cargs = split_top_level_type_args(c.slice(c_lb + 1, c.length() - 1))
+      if pargs.length() == cargs.length() {
+        let mut idx = 0
+        while idx < pargs.length() {
+          match_pipe_type_pattern(pargs[idx], cargs[idx], subst)
+          idx = idx + 1
+        }
+      }
+    }
+    return
+  }
+  if p.starts_with("(") && p.ends_with(")") && c.starts_with("(") && c.ends_with(")") {
+    let pargs = split_top_level_type_args(p.slice(1, p.length() - 1))
+    let cargs = split_top_level_type_args(c.slice(1, c.length() - 1))
+    if pargs.length() == cargs.length() {
+      let mut idx = 0
+      while idx < pargs.length() {
+        match_pipe_type_pattern(pargs[idx], cargs[idx], subst)
+        idx = idx + 1
+      }
+    }
+  }
+}
+
+///| Derive the expected parameter type of a generic `|>` target by unifying its return type `ret_ty`
+///| with the enclosing expected type `cur_exp` and substituting into `raw_p` (e.g. `Array[T] -> T`).
+fn unify_pipe_ret_to_param(ret_ty : String, cur_exp : String, raw_p : String) -> String {
+  let rt = ret_ty.trim()
+  let ce = cur_exp.trim()
+  let rp = raw_p.trim()
+  if rt.length() == 0 || ce.length() == 0 || rp.length() == 0 {
+    return ""
+  }
+  if rp == rt {
+    return ce
+  }
+  let subst : Map[String, String] = Map()
+  match_pipe_type_pattern(rt, ce, subst)
+  if subst.length() == 0 {
+    return ""
+  }
+  let toks = lex_moonbit(rp)
+  let sb = StringBuilder()
+  let mut replaced = false
+  let mut i = 0
+  while i < toks.length() - 1 {
+    let tok = toks[i]
+    let is_qual = i > 0 && (toks[i - 1].kind == TokenKind::ColonColon || toks[i - 1].kind == TokenKind::Dot)
+    if !is_qual && (tok.kind == TokenKind::UpperIdent || tok.kind == TokenKind::Ident) {
+      match subst.get(tok.raw) {
+        Some(rep) => {
+          sb.write_string(tok.leading_trivia + rep)
+          replaced = true
+        }
+        None => sb.write_string(tok.leading_trivia + tok.raw)
+      }
+    } else {
+      sb.write_string(tok.leading_trivia + tok.raw)
+    }
+    i = i + 1
+  }
+  if replaced { sb.to_string().trim() } else { "" }
+}
+
 ///| Resolve the effective outer expected type for a `.map`/`.filter_map` call ending at `close_p`:
 ///| skips enclosing grouping `)` (not call `f(...)` closing parens), clears expected type on
-///| chained `.method(...)`, and for `|> callee` resolves `callee`'s 0th parameter expected type
-///| (preserving outer expected type only for identity-like generic `fn[T](x : T) -> T`).
+///| chained `.method(...)`, and for `|> callee` resolves `callee`'s target parameter expected type
+///| (respecting local variable shadowing, `_` placeholder position, and generic `ret -> param` unification).
 fn resolve_method_closure_outer_exp(
   ctx : StageAContext,
   tokens : Array[Token],
@@ -1988,6 +2103,8 @@ fn resolve_method_closure_outer_exp(
   if after < n && tokens[after].kind == TokenKind::PipeGt {
     let ti = after + 1
     let mut callee_key = ""
+    let mut is_bare = false
+    let mut after_callee = ti
     if ti + 2 < n && tokens[ti].kind == TokenKind::PkgRef &&
     tokens[ti + 1].kind == TokenKind::Dot && tokens[ti + 2].kind == TokenKind::Ident {
       let raw_pkg = tokens[ti].raw.slice(1, tokens[ti].raw.length())
@@ -1996,30 +2113,79 @@ fn resolve_method_closure_outer_exp(
         None => raw_pkg
       }
       callee_key = pkg + "::" + tokens[ti + 2].raw
+      after_callee = ti + 3
     } else if ti + 2 < n && tokens[ti].kind == TokenKind::UpperIdent &&
     tokens[ti + 1].kind == TokenKind::ColonColon && tokens[ti + 2].kind == TokenKind::Ident {
       callee_key = tokens[ti].raw + "::" + tokens[ti + 2].raw
+      after_callee = ti + 3
     } else if ti < n && tokens[ti].kind == TokenKind::Ident {
       callee_key = tokens[ti].raw
+      is_bare = true
+      after_callee = ti + 1
+    }
+    // Determine pipe target parameter index (0 by default, or index of bare `_` placeholder in `callee(...)`).
+    let mut pipe_pos = 0
+    if after_callee < n && tokens[after_callee].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, after_callee)
+      let mut ai = after_callee + 1
+      let mut arg_idx = 0
+      while ai < cp {
+        let mut ae = ai
+        let mut ad = 0
+        while ae < cp {
+          let ak = tokens[ae].kind
+          if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+          else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { if ad > 0 { ad = ad - 1 } }
+          else if ad == 0 && ak == TokenKind::Comma { break }
+          ae = ae + 1
+        }
+        if ae == ai + 1 && tokens[ai].raw == "_" {
+          pipe_pos = arg_idx
+          break
+        }
+        arg_idx = arg_idx + 1
+        ai = ae + 1
+      }
     }
     if callee_key.length() > 0 {
-      match ctx.symtab.fn_param_types.get(callee_key) {
-        Some(pts) =>
-        if pts.length() > 0 && pts[0].1.trim().length() > 0 {
-          return pts[0].1.trim()
+      // Local variable / closure shadows any package-level `fn` of the same name.
+      if is_bare {
+        match lookup_scope_var(ctx, resolve_ident_in_scope(ctx, callee_key)) {
+          Some(sv) => {
+            let lptys = extract_expected_fn_param_types(sv.ty)
+            if pipe_pos < lptys.length() {
+              return lptys[pipe_pos].trim()
+            }
+            return ""
+          }
+          None => ()
         }
-        None => ()
       }
-      let raw_p0 = match ctx.symtab.fn_raw_param_types.get(callee_key) {
-        Some(rpts) => if rpts.length() > 0 { rpts[0].1.trim() } else { "" }
-        None => ""
+      let is_generic_callee = ctx.symtab.fn_type_params.contains(callee_key)
+      if !is_generic_callee {
+        match ctx.symtab.fn_param_types.get(callee_key) {
+          Some(pts) =>
+          if pipe_pos < pts.length() && pts[pipe_pos].1.trim().length() > 0 {
+            return pts[pipe_pos].1.trim()
+          }
+          None => ()
+        }
+      }
+      let raw_p = match ctx.symtab.fn_raw_param_types.get(callee_key) {
+        Some(rpts) => if pipe_pos < rpts.length() { rpts[pipe_pos].1.trim() } else { "" }
+        None =>
+        match ctx.symtab.fn_param_types.get(callee_key) {
+          Some(pts) => if pipe_pos < pts.length() { pts[pipe_pos].1.trim() } else { "" }
+          None => ""
+        }
       }
       let ret_ty = match ctx.symtab.fn_ret_types.get(callee_key) {
         Some(rt) => rt.trim()
         None => ""
       }
-      if raw_p0.length() > 0 && raw_p0 == ret_ty {
-        return current_expected_type(ctx).trim()
+      let unified = unify_pipe_ret_to_param(ret_ty, current_expected_type(ctx), raw_p)
+      if unified.length() > 0 {
+        return unified
       }
     }
     return ""
@@ -16113,7 +16279,9 @@ fn peel_struct_patterns_in_pat(
       let bind_var = if has_as {
         resolve_ident_in_scope(ctx, tokens[cb + 2].raw)
       } else {
-        fresh_temp(ctx, "sp")
+        let tmp = fresh_temp(ctx, "sp")
+        ctx.synth_sp_temps[tmp] = true
+        tmp
       }
       sb.write_string(tokens[k].leading_trivia + bind_var)
       let inferred_sname = strip_type_args_sym(current_expected_type(ctx))
@@ -16127,7 +16295,9 @@ fn peel_struct_patterns_in_pat(
       let bind_var = if has_as {
         resolve_ident_in_scope(ctx, tokens[cb + 2].raw)
       } else {
-        fresh_temp(ctx, "sp")
+        let tmp = fresh_temp(ctx, "sp")
+        ctx.synth_sp_temps[tmp] = true
+        tmp
       }
       sb.write_string(tokens[k].leading_trivia + bind_var)
       obls.push((bind_var, k + 2, cb, tokens[k].raw))

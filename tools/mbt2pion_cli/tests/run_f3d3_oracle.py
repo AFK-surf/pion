@@ -409,6 +409,21 @@ fn keep_json_arr(xs : Array[Json]) -> Array[Json] {
   xs
 }
 
+fn keep_json_arr2(_tag : Int, xs : Array[Json]) -> Array[Json] {
+  xs
+}
+
+fn[T] head_gen(xs : Array[T]) -> T {
+  xs[0]
+}
+
+fn guard_sp_user(__mbt_sp_user : PairAB, r : PairAB?) -> Int {
+  guard r is Some({ a, .. } as __mbt_sp_user) && a > 0 else {
+    return 0
+  }
+  __mbt_sp_user.b
+}
+
 pub fn run_f3d3_7() -> String {
   // P1-1: local out-of-order (implicit & explicit `LocalR::{ .. }`) & in-order effectful struct updates
   let s1 : LocalR = { a: 1, b: 2, c: 3 }
@@ -494,6 +509,15 @@ pub fn run_f3d3_7() -> String {
     Json::number(m.get("n").unwrap_or(0).to_double())
   })
   let j9_str = Json::array(jfs.map(fn(f) { { "x": Json::number(f.x) } })).stringify()
+  // Astra R2 4 micro-edges: generic `Array[T] -> T` (`|> head_gen`), `as __mbt_sp_user` in guard,
+  // local closure shadowing package `fn keep_json_arr`, and `|> keep_json_arr2(0, _)`.
+  let j10 : Json = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }) |> head_gen
+  let j11_arr : Array[Json] = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }) |> keep_json_arr2(0, _)
+  let keep_json_arr = fn(ms : Array[Map[String, Int]]) -> Int {
+    ms[1].get("n").unwrap_or(0)
+  }
+  let j12_sh = jxs.map(fn(x) { { "n": x } }) |> keep_json_arr
+  let sp_user_r = guard_sp_user({ a: 1, b: 11 }, Some({ a: 2, b: 42 }))
 
   t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "," +
   op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "," + g3t.a.to_string() + "," + cr1.a.to_string() + "," + qg1.a.to_string() + "," + qg1.b.v.to_string() + "|" +
@@ -501,7 +525,8 @@ pub fn run_f3d3_7() -> String {
   vb_pkg.to_string() + "," + vb2.to_string() + "|" +
   vf_r.to_string() + "|" + gs_r + "|" + j1.stringify() + "|" + j2.stringify() + "|" +
   Json::array(j3_arr).stringify() + "|" + Json::array(j4_arr).stringify() + "|" + Json::array(j5_arr).stringify() + "|" +
-  Json::array(j6_arr).stringify() + "|" + Json::array(j7_arr).stringify() + "|" + Json::array(j8_arr).stringify() + "|" + j9_str
+  Json::array(j6_arr).stringify() + "|" + Json::array(j7_arr).stringify() + "|" + Json::array(j8_arr).stringify() + "|" + j9_str + "|" +
+  j10.stringify() + "|" + Json::array(j11_arr).stringify() + "|" + j12_sh.to_string() + "|" + sp_user_r.to_string()
 }
 
 pub fn run_all() -> String {
@@ -726,7 +751,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]|[{"n":0},{"n":2}]|[{"n":0},{"n":2}]|[0,2]|[{"x":1.5},{"x":2}]'
+            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]|[{"n":0},{"n":2}]|[{"n":0},{"n":2}]|[0,2]|[{"x":1.5},{"x":2}]|{"n":0}|[{"n":0},{"n":2}]|2|42'
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
