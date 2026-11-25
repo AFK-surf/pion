@@ -609,7 +609,7 @@ pub struct StageAContext {
   struct_val_fields : Map[String, String]
   trait_methods : Map[String, Map[String, (Array[String], String)]]
   local_method_names : Map[String, Bool]
-  ufcs_forwarders : Map[String, Bool]
+  ufcs_forwarders : Map[String, String]
   val_probe_sites : Array[ValProbeSite]
   exported_abi_enums : Array[AbiEnumSchema]
   exported_abi_struct_vals : Array[AbiStructValRename]
@@ -643,6 +643,7 @@ pub struct StageAContext {
   mut temp_counter : Int
   mut val_site_seq : Int
   mut init_order_seq : Int
+  mut ufcs_seq : Int
 }
 
 pub fn stage_a_context_new(
@@ -702,6 +703,7 @@ pub fn stage_a_context_new(
     temp_counter: 0,
     val_site_seq: 0,
     init_order_seq: 0,
+    ufcs_seq: 0,
   }
 }
 
@@ -6265,9 +6267,10 @@ fn lower_one_token_or_form(
         return (trivia + "Float::from_bits(" + inner + ")", close_p + 1)
       }
     }
-    // UFCS trait method call `Trait::method(recv, args...)` -> generic-bounded forwarder `__mbt_ufcs_<Trait>_<method>(recv, args...)`
-    // (or direct `(recv).method(args...)` when receiver is already `dyn Trait`).
-    // Works for both object-safe and non-object-safe traits (e.g. `-> Self` / `(Self, Self) -> Self`) and is never hijacked by inherent `Type::method`.
+    // UFCS trait method call `Trait::method(recv, args...)`:
+    // - Object-safe traits: `((recv) as dyn Trait).method(args...)` (handles concrete, `dyn Trait`, and complex `&Trait` exprs with zero helpers).
+    // - Non-object-safe traits (e.g. `-> Self` / `(Self, Self) -> Self` / associated fns): receiver is guaranteed concrete;
+    //   emit deduplicated (keyed by `"Trait::method"`) hygienic generic-bounded forwarder `fn __mbt_ufcs_<N>[__MbtT : Trait](...)`.
     if !in_pattern && !prev_colon2 && !prev_dot && ctx.trait_methods.contains(t.raw) &&
     i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
     tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen {
@@ -6295,7 +6298,6 @@ fn lower_one_token_or_form(
           None => ([], "")
         }
         if t_ptys.length() >= 1 && t_ptys[0] == "Self" {
-          let recv_ty = infer_simple_expr_type(ctx, tokens, raw_uargs[0].0, raw_uargs[0].1)
           let recv_s = lower_expr_range(ctx, tokens, raw_uargs[0].0, raw_uargs[0].1, file, false).trim()
           let arg_sb = StringBuilder()
           let mut ai = 1
@@ -6308,31 +6310,42 @@ fn lower_one_token_or_form(
             ai = ai + 1
           }
           let rest_args = arg_sb.to_string()
-          if recv_ty == "dyn " + t.raw || recv_ty == "&" + t.raw {
-            return (trivia + "(" + recv_s + ")." + mname + "(" + rest_args + ")", close_p + 1)
+          if is_trait_object_safe(ctx, t.raw) {
+            return (trivia + "((" + recv_s + ") as dyn " + t.raw + ")." + mname + "(" + rest_args + ")", close_p + 1)
           }
-          let fwd_name = "__mbt_ufcs_" + t.raw + "_" + mname
-          if !ctx.ufcs_forwarders.contains(fwd_name) {
-            ctx.ufcs_forwarders[fwd_name] = true
-            let fp_sb = StringBuilder()
-            let fa_sb = StringBuilder()
-            fp_sb.write_string("__mbt_r : __MbtT")
-            let mut pi = 1
-            while pi < t_ptys.length() {
-              let pty_sub = replace_self_type_in_pion(t_ptys[pi], "__MbtT")
-              fp_sb.write_string(", _a" + pi.to_string() + " : " + pty_sub)
-              if pi > 1 { fa_sb.write_string(", ") }
-              fa_sb.write_string("_a" + pi.to_string())
-              pi = pi + 1
+          let fwd_key = t.raw + "::" + mname
+          let fwd_name = match ctx.ufcs_forwarders.get(fwd_key) {
+            Some(existing) => existing
+            None => {
+              let mut cand = "__mbt_ufcs_" + ctx.ufcs_seq.to_string()
+              ctx.ufcs_seq = ctx.ufcs_seq + 1
+              while ctx.used_idents.contains(cand) {
+                cand = "__mbt_ufcs_" + ctx.ufcs_seq.to_string()
+                ctx.ufcs_seq = ctx.ufcs_seq + 1
+              }
+              ctx.used_idents[cand] = true
+              ctx.ufcs_forwarders[fwd_key] = cand
+              let fp_sb = StringBuilder()
+              let fa_sb = StringBuilder()
+              fp_sb.write_string("__mbt_r : __MbtT")
+              let mut pi = 1
+              while pi < t_ptys.length() {
+                let pty_sub = replace_self_type_in_pion(t_ptys[pi], "__MbtT")
+                fp_sb.write_string(", _a" + pi.to_string() + " : " + pty_sub)
+                if pi > 1 { fa_sb.write_string(", ") }
+                fa_sb.write_string("_a" + pi.to_string())
+                pi = pi + 1
+              }
+              let ret_part = if t_rty.length() > 0 {
+                " -> " + replace_self_type_in_pion(t_rty, "__MbtT")
+              } else {
+                ""
+              }
+              ctx.lifted_fns.push(
+                "fn " + cand + "[__MbtT : " + t.raw + "](" + fp_sb.to_string() + ")" + ret_part + " {\n  __mbt_r." + mname + "(" + fa_sb.to_string() + ")\n}\n"
+              )
+              cand
             }
-            let ret_part = if t_rty.length() > 0 {
-              " -> " + replace_self_type_in_pion(t_rty, "__MbtT")
-            } else {
-              ""
-            }
-            ctx.lifted_fns.push(
-              "fn " + fwd_name + "[__MbtT : " + t.raw + "](" + fp_sb.to_string() + ")" + ret_part + " {\n  __mbt_r." + mname + "(" + fa_sb.to_string() + ")\n}\n"
-            )
           }
           let all_args = if rest_args.length() > 0 { recv_s + ", " + rest_args } else { recv_s }
           return (trivia + fwd_name + "(" + all_args + ")", close_p + 1)
@@ -7529,6 +7542,37 @@ fn lower_cascade_chain(
   }
   sb.write_string(tmp + " }")
   (sb.to_string(), cur)
+}
+
+///| Return true iff every method in `tname` takes `Self` as first param and never mentions standalone `Self`
+///| in any subsequent param type or return type (i.e. safe for `as dyn Trait` dynamic dispatch).
+fn is_trait_object_safe(ctx : StageAContext, tname : String) -> Bool {
+  match ctx.trait_methods.get(tname) {
+    Some(mm) => {
+      for mk in mm.keys() {
+        match mm.get(mk) {
+          Some((pts, rty)) => {
+            if pts.length() < 1 || pts[0] != "Self" {
+              return false
+            }
+            let mut pi = 1
+            while pi < pts.length() {
+              if replace_self_type_in_pion(pts[pi], "__MbtT") != pts[pi] {
+                return false
+              }
+              pi = pi + 1
+            }
+            if rty.length() > 0 && replace_self_type_in_pion(rty, "__MbtT") != rty {
+              return false
+            }
+          }
+          None => ()
+        }
+      }
+      true
+    }
+    None => false
+  }
 }
 
 ///| Replace standalone `Self` type identifier inside a Pion type string with `subst` (e.g. `__MbtT`).
