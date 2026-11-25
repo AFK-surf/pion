@@ -613,6 +613,7 @@ pub struct StageAContext {
   borrowed_views : Map[String, Bool]
   struct_field_renames : Map[String, Map[String, String]]
   struct_field_order : Map[String, Array[String]]
+  struct_type_params : Map[String, Array[String]]
   struct_val_fields : Map[String, String]
   trait_methods : Map[String, Map[String, (Array[String], String)]]
   local_method_names : Map[String, Bool]
@@ -675,6 +676,7 @@ pub fn stage_a_context_new(
     borrowed_views: Map(),
     struct_field_renames: Map(),
     struct_field_order: Map(),
+    struct_type_params: Map(),
     struct_val_fields: Map(),
     trait_methods: Map(),
     local_method_names: Map(),
@@ -996,6 +998,83 @@ fn is_pure_struct_update_val(tokens : Array[Token], start : Int, end : Int) -> B
   true
 }
 
+///| Instantiate a local struct field type `raw_field_ty` using the concrete type arguments
+///| extracted from `base_ty` (e.g. `GenRow[Array[Float]]` -> `T => Array[Float]`).
+///| Returns `""` if `raw_field_ty` is empty, contains `?`, or retains any unbound struct
+///| type parameter not in `ctx.active_generics` (so we never emit invalid `: T =`).
+fn instantiate_struct_field_ty(
+  ctx : StageAContext,
+  sname : String,
+  raw_field_ty : String,
+  base_ty : String,
+) -> String {
+  let ft = raw_field_ty.trim()
+  if ft.length() == 0 || str_has(ft, "?") {
+    return ""
+  }
+  let tparams = match ctx.struct_type_params.get(sname) {
+    Some(ps) => ps
+    None => []
+  }
+  if tparams.length() == 0 {
+    return ft
+  }
+  // Extract top-level comma-separated type arguments from `base_ty` (`S[A, B]`)
+  let subst : Map[String, String] = Map()
+  let lb = base_ty.index_of("[")
+  if lb > 0 && base_ty.ends_with("]") {
+    let inner = base_ty.slice(lb + 1, base_ty.length() - 1)
+    let targs : Array[String] = []
+    let mut s = 0
+    let mut d = 0
+    let mut k = 0
+    while k <= inner.length() {
+      let at_e = k == inner.length()
+      let ch = if at_e { 44 } else { inner.code_unit_at(k) }
+      if !at_e && (ch == 40 || ch == 91 || ch == 123) { d = d + 1 }
+      else if !at_e && (ch == 41 || ch == 93 || ch == 125) { if d > 0 { d = d - 1 } }
+      else if d == 0 && ch == 44 {
+        targs.push(inner.slice(s, k).trim())
+        s = k + 1
+      }
+      k = k + 1
+    }
+    if targs.length() == tparams.length() {
+      let mut pi = 0
+      while pi < tparams.length() {
+        if targs[pi].length() > 0 && !str_has(targs[pi], "?") {
+          subst[tparams[pi]] = targs[pi]
+        }
+        pi = pi + 1
+      }
+    }
+  }
+  let tparam_set : Map[String, Bool] = Map()
+  for tp in tparams { tparam_set[tp] = true }
+  let ftoks = lex_moonbit(ft)
+  let sb = StringBuilder()
+  let mut ti = 0
+  while ti < ftoks.length() - 1 {
+    let tok = ftoks[ti]
+    if (tok.kind == TokenKind::UpperIdent || tok.kind == TokenKind::Ident) && tparam_set.contains(tok.raw) {
+      match subst.get(tok.raw) {
+        Some(rep) => sb.write_string(tok.leading_trivia + rep)
+        None => {
+          if ctx.active_generics.contains(tok.raw) {
+            sb.write_string(tok.leading_trivia + tok.raw)
+          } else {
+            return ""
+          }
+        }
+      }
+    } else {
+      sb.write_string(tok.leading_trivia + tok.raw)
+    }
+    ti = ti + 1
+  }
+  sb.to_string().trim()
+}
+
 ///| Lower a struct update `{ ..base, f1: e1, ... }` preserving Moon's exact evaluation order:
 ///| - Pure overrides: emit `sname::{ ..base, ... }` directly.
 ///| - Local struct (known declaration order) with effectful overrides:
@@ -1117,6 +1196,10 @@ fn lower_struct_update_expr(
         sb.write_string(" } }")
         sb.to_string()
       } else {
+        let base_static_ty = {
+          let bt = infer_simple_expr_type(ctx, tokens, base_s, base_e).trim()
+          if bt.length() > 0 { bt } else { current_expected_type(ctx).trim() }
+        }
         let sb = StringBuilder()
         sb.write_string("{ let " + base_var + " = " + base_expr + "; ")
         let field_tmps : Array[(String, String)] = []
@@ -1127,20 +1210,17 @@ fn lower_struct_update_expr(
             Some(fmap) => match fmap.get(ov.0) { Some(ft) => ft.trim(), None => "" }
             None => ""
           }
+          let annot_ty = instantiate_struct_field_ty(ctx, sname, field_exp_ty, base_static_ty)
           let vs = if ov.1 {
             resolve_ident_in_scope(ctx, ov.0)
           } else {
-            push_expected_type(ctx, field_exp_ty)
+            push_expected_type(ctx, if annot_ty.length() > 0 { annot_ty } else { field_exp_ty })
             let s = lower_expr_range(ctx, tokens, ov.2, ov.3, file, false).trim()
             pop_expected_type(ctx)
             s
           }
-          let can_annot = field_exp_ty == "Float" || field_exp_ty == "Double" || field_exp_ty == "Int" ||
-          field_exp_ty == "UInt" || field_exp_ty == "Int64" || field_exp_ty == "UInt64" ||
-          field_exp_ty == "Byte" || field_exp_ty == "Char" || field_exp_ty == "Bool" ||
-          field_exp_ty == "String" || field_exp_ty == "Unit"
-          if can_annot {
-            sb.write_string("let " + tv + " : " + field_exp_ty + " = " + vs + "; ")
+          if annot_ty.length() > 0 {
+            sb.write_string("let " + tv + " : " + annot_ty + " = " + vs + "; ")
           } else {
             sb.write_string("let " + tv + " = " + vs + "; ")
           }
@@ -12403,7 +12483,9 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         let mut struct_added_g : Array[String] = []
         if lb < n && tokens[lb].kind == TokenKind::LBracket {
           let close_gb = find_matching_delim(tokens, lb)
-          struct_added_g = push_active_generics(ctx, collect_generic_param_names(tokens, lb, close_gb))
+          let gparams = collect_generic_param_names(tokens, lb, close_gb)
+          ctx.struct_type_params[sname] = gparams
+          struct_added_g = push_active_generics(ctx, gparams)
           lb = close_gb + 1
         }
         if lb < n && tokens[lb].kind == TokenKind::LBrace {

@@ -349,6 +349,14 @@ priv struct RowFloat {
   c : Int
 }
 
+priv struct CompRow {
+  mut a : Int
+  b : Array[Float]
+  o : Float?
+  p : (Float, Int)
+  c : Int
+}
+
 priv struct GenRow[T] {
   mut a : Int
   b : T
@@ -387,11 +395,15 @@ pub fn run_f3d3_7() -> String {
   let op0 : OpRow = { a: 1, b: { f: fn() { () } }, c: 3 }
   let p : Ping = { f: fn() { op0.a = 9 } }
   let op1 = OpRow::{ ..op0, c: 1, b: p + p }
-  // Generic struct `GenRow[Int]` and `GenRow[Array[Int]]` out-of-order update in non-generic fn
+  // Generic struct `GenRow[Int]`, `GenRow[Array[Int]]`, `GenRow[Array[Float]]` & compound `CompRow` out-of-order updates
   let g1 : GenRow[Int] = { a: 1, b: 2, c: 3 }
   let g1t = GenRow::{ ..g1, c: { g1.a = 9; 7 }, b: 7 }
   let g2 : GenRow[Array[Int]] = { a: 1, b: [2], c: 3 }
   let g2t = GenRow::{ ..g2, c: { g2.a = 8; 7 }, b: [7] }
+  let g3 : GenRow[Array[Float]] = { a: 1, b: [0.5], c: 3 }
+  let g3t = GenRow::{ ..g3, c: { g3.a = 6; 7 }, b: [0.1] }
+  let cr0 : CompRow = { a: 1, b: [0.5], o: None, p: (0.5, 0), c: 3 }
+  let cr1 = CompRow::{ ..cr0, c: { cr0.a = 5; 7 }, b: [0.1], o: Some(0.2), p: (0.3, 1) }
 
   // P1-2: shadowed `panic(...)` must NOT be treated as diverging (else must NOT run)
   let panic = fn(_s : String) -> Unit { () }
@@ -422,7 +434,7 @@ pub fn run_f3d3_7() -> String {
   let gs_r = gs_fn(Some({ x: "__MBT_GUARD_LEAF_TUPLE__" }))
 
   t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "," +
-  op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "|" +
+  op1.a.to_string() + "," + g1t.a.to_string() + "," + g2t.a.to_string() + "," + g3t.a.to_string() + "," + cr1.a.to_string() + "|" +
   n_p.to_string() + "|" +
   vb_pkg.to_string() + "," + vb2.to_string() + "|" +
   vf_r.to_string() + "|" + gs_r
@@ -650,7 +662,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            "F3d3-7:9,9,88,7,9,9,8|1|19,12|19|hit"
+            "F3d3-7:9,9,88,7,9,9,8,6,5|1|19,12|19|hit"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
