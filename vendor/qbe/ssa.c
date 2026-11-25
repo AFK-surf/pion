@@ -121,8 +121,114 @@ struct DefBlocks {
 	uint count;
 };
 
+/* At SSA construction phi placement queries virtual temporaries one at a
+ * time. Physical-register pressure is first needed after instruction
+ * selection. Project the ordinary backwards equations onto the candidates. */
+typedef struct PhiFlow PhiFlow;
+struct PhiFlow {
+	BSet gen[1], kill[1], phi[1];
+};
+
 static void
-phiins(Fn *fn)
+upuse(Ref r, int *index, PhiFlow *b)
+{
+	if (rtype(r) == RTmp && index[r.val] && !bshas(b->kill, index[r.val]))
+		bsset(b->gen, index[r.val]);
+}
+
+static void
+flowedge(BSet *out, Blk *s, PhiFlow *flow)
+{
+	if (s)
+		for (uint k=0; k<out->nt; k++)
+			out->t[k] |= s->in->t[k] & ~flow[s->id].phi->t[k];
+}
+
+static int *
+philive(Fn *f)
+{
+	uint slots = 1;
+	int *index;
+	PhiFlow *flow;
+
+	/* Preserve the general checker's target-specific call handling and
+	 * validation for non-abstract operands. */
+	for (Blk *b=f->start; b; b=b->link) {
+		if (rtype(b->jmp.arg) == RCall)
+			goto General;
+		for (Ins *i=b->ins; i<&b->ins[b->nins]; i++)
+			if ((!req(i->to, R) && rtype(i->to) != RTmp)
+			|| rtype(i->arg[0]) == RMem || rtype(i->arg[1]) == RMem
+			|| (i->op == Ocall && rtype(i->arg[1]) == RCall))
+				goto General;
+	}
+	index = alloc(f->ntmp * sizeof *index);
+	for (int t=Tmp0; t<f->ntmp; t++) {
+		Tmp *v = &f->tmp[t];
+		if (v->phi || !v->ndef)
+			continue;
+		if (v->ndef == 1) {
+			if (!v->def || v->bid == f->start->id)
+				continue;
+			uint i;
+			for (i=0; i<v->nuse && v->use[i].bid == v->bid; i++)
+				;
+			if (i == v->nuse)
+				continue;
+		}
+		index[t] = slots++;
+	}
+	flow = alloc(f->nblk * sizeof *flow);
+	for (Blk *b=f->start; b; b=b->link) {
+		bsinit(b->in, slots);
+		bsinit(b->out, slots);
+		bsinit(flow[b->id].gen, slots);
+		bsinit(flow[b->id].kill, slots);
+		bsinit(flow[b->id].phi, slots);
+	}
+	for (Blk *b=f->start; b; b=b->link) {
+		PhiFlow *v = &flow[b->id];
+		for (Phi *p=b->phi; p; p=p->link) {
+			if (rtype(p->to)==RTmp && index[p->to.val])
+				bsset(v->phi, index[p->to.val]);
+			for (uint j=0; j<p->narg; j++)
+				if (rtype(p->arg[j])==RTmp && index[p->arg[j].val])
+					bsset(p->blk[j]->out, index[p->arg[j].val]);
+		}
+		for (Ins *i=b->ins; i<&b->ins[b->nins]; i++) {
+			upuse(i->arg[0], index, v);
+			upuse(i->arg[1], index, v);
+			if (rtype(i->to)==RTmp && index[i->to.val])
+				bsset(v->kill, index[i->to.val]);
+		}
+		upuse(b->jmp.arg, index, v);
+	}
+	int changed;
+	do {
+		changed = 0;
+		for (int n=f->nblk-1; n>=0; n--) {
+			Blk *b = f->rpo[n];
+			PhiFlow *v = &flow[b->id];
+			flowedge(b->out, b->s1, flow);
+			flowedge(b->out, b->s2, flow);
+			if (b->jmp.type == Jjtbl)
+				for (uint j=0; j<b->njtbl; j++)
+					flowedge(b->out, b->jtbl[j], flow);
+			for (uint k=0; k<b->in->nt; k++) {
+				bits word = v->gen->t[k] | (b->out->t[k] & ~v->kill->t[k]);
+				changed |= word != b->in->t[k];
+				b->in->t[k] = word;
+			}
+		}
+	} while (changed);
+	return index;
+General:
+	filllive(f);
+	return 0;
+}
+
+static void
+phiins(Fn *fn, int *ti)
 {
 	BSet u[1], defs[1];
 	Blk *a, *b, **blist, **be, **bp;
@@ -180,6 +286,8 @@ phiins(Fn *fn)
 			single = 0;
 			count = index[t].count;
 		}
+		/* philive numbers exactly the temporaries queried below. */
+		assert(!ti || ti[t] > 0);
 		bszero(u);
 		k = Kx;
 		bp = be;
@@ -194,7 +302,7 @@ phiins(Fn *fn)
 						i->arg[1] = r;
 				}
 				if (req(i->to, TMP(t))) {
-					if (!bshas(b->out, t)) {
+					if (!bshas(b->out, ti ? ti[t] : t)) {
 						r = refindex(t, fn);
 						i->to = r;
 					} else {
@@ -220,7 +328,7 @@ phiins(Fn *fn)
 				if (seen[a->id] == (uint)t)
 					continue;
 				seen[a->id] = t;
-				if (bshas(a->in, t)) {
+				if (bshas(a->in, ti ? ti[t] : t)) {
 					p = alloc(sizeof *p);
 					p->cls = k;
 					p->to = TMP(t);
@@ -395,8 +503,7 @@ ssa(Fn *fn)
 		}
 	}
 	fillfron(fn);
-	filllive(fn);
-	phiins(fn);
+	phiins(fn, philive(fn));
 	renblk(fn->start, stk, fn);
 	while (nt--)
 		while ((n=stk[nt])) {

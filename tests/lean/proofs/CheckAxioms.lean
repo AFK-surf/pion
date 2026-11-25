@@ -25,6 +25,7 @@ import PionProofs.QbeRuntimeOpts3
 import PionProofs.QbeBigUnitSpeedOpts
 import PionProofs.QbeAmd64FpOpts
 import PionProofs.QbeJtblEdgeSpill
+import PionProofs.QbeColdBootstrapSpeedOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -674,3 +675,24 @@ import PionProofs.QbeJtblEdgeSpill
 #print axioms PionQbeJtblEdgeSpill.StorePlacement.markedOnPath
 #print axioms PionQbeJtblEdgeSpill.StorePlacement.prependOnce
 #print axioms PionQbeJtblEdgeSpill.StorePlacement.budgetSafe
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.compose_correct
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.block_transfer
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.register_file_transfer
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.sweep
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.retained_edge
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.clean_predecessor
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.copied_words
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.preemit
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.hashes_by_index
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.published_prefix
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.next_buffered
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.unread_delimiter
+#print axioms PionQbeColdBootstrapSpeedOpts.TrackP.float_marker
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.transfer_projects
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.block_projects
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.phi_projects
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.successors_project
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.rounds_agree
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.summarize
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.bindings
+#print axioms PionQbeColdBootstrapSpeedOpts.Projection.physical

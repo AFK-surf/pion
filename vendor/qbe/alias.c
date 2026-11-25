@@ -27,6 +27,14 @@ getalias(Alias *a, Ref r, Fn *fn)
 	}
 }
 
+/* Constant offsets wrap like the target's address arithmetic
+ * (`add %p, -1` from INT64_MIN is valid IL, signed overflow is not C). */
+static int64_t
+offadd(int64_t a, int64_t b)
+{
+	return (int64_t)((uint64_t)a + (uint64_t)b);
+}
+
 int
 alias(Ref p, int op, int sp, Ref q, int sq, int *delta, Fn *fn)
 {
@@ -35,7 +43,7 @@ alias(Ref p, int op, int sp, Ref q, int sq, int *delta, Fn *fn)
 
 	getalias(&ap, p, fn);
 	getalias(&aq, q, fn);
-	ap.offset += op;
+	ap.offset = offadd(ap.offset, op);
 	/* when delta is meaningful (ovlap == 1),
 	 * we do not overflow int because sp and
 	 * sq are bounded by 2^28 */
@@ -187,11 +195,11 @@ fillalias(Fn *fn)
 				getalias(&a1, i->arg[1], fn);
 				if (a0.type == ACon) {
 					*a = a1;
-					a->offset += a0.offset;
+					a->offset = offadd(a->offset, a0.offset);
 				}
 				else if (a1.type == ACon) {
 					*a = a0;
-					a->offset += a1.offset;
+					a->offset = offadd(a->offset, a1.offset);
 				}
 			}
 			if (req(i->to, R) || a->type == AUnk)

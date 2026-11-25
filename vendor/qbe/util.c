@@ -799,7 +799,14 @@ bsclr(BSet *bs, uint elt)
 			a->t[i] op b->t[i];   \
 	}
 
-BSOP(bscopy, =)
+void
+bscopy(BSet *a, BSet *b)
+{
+	assert(a->nt == b->nt);
+	if (a->nt && a->t != b->t)
+		memmove(a->t, b->t, a->nt * sizeof a->t[0]);
+}
+
 BSOP(bsunion, |=)
 BSOP(bsinter, &=)
 BSOP(bsdiff, &= ~)
@@ -807,13 +814,8 @@ BSOP(bsdiff, &= ~)
 int
 bsequal(BSet *a, BSet *b)
 {
-	uint i;
-
 	assert(a->nt == b->nt);
-	for (i=0; i<a->nt; i++)
-		if (a->t[i] != b->t[i])
-			return 0;
-	return 1;
+	return !a->nt || !memcmp(a->t, b->t, a->nt * sizeof a->t[0]);
 }
 
 void

@@ -1606,6 +1606,46 @@ me_compute_gpr_out(Fn *fn)
 	for (int r = V0; r <= V30; r++)
 		all_reg |= BIT(r);
 
+	/* A reverse instruction scan maps x to (x & keep) | gen.
+	 * Compose its constant masks once for each block. */
+	struct Transfer { uint64_t keep, gen; };
+	struct Transfer *transfer = alloc(fn->nblk * sizeof *transfer);
+	for (Blk *b = fn->start; b; b = b->link) {
+		uint64_t keep = UINT64_MAX, gen = 0;
+		for (Ins *ins = &b->ins[b->nins]; ins > b->ins;) {
+			--ins;
+			if (ins->op == Ocall) {
+				keep &= call_pres;
+				gen &= call_pres;
+				if (rtype(ins->arg[1]) == RCall)
+					gen |= arm64_argregs(ins->arg[1], 0) & all_reg;
+				else
+					gen |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8)
+						| BIT(V0) | BIT(V1) | BIT(V2) | BIT(V3) | BIT(V4) | BIT(V5) | BIT(V6) | BIT(V7);
+				if (isreg(ins->arg[0]) && (all_reg & BIT(ins->arg[0].val)))
+					gen |= BIT(ins->arg[0].val);
+				continue;
+			}
+			if (isreg(ins->to) && (all_reg & BIT(ins->to.val))
+			&& ins->op != Osel0 && !isxsel(ins->op)) {
+				keep &= ~BIT(ins->to.val);
+				gen &= ~BIT(ins->to.val);
+			}
+			for (int j = 0; j < 2; j++) {
+				Ref a = ins->arg[j];
+				if (isreg(a) && (all_reg & BIT(a.val)))
+					gen |= BIT(a.val);
+				else if (rtype(a) == RMem) {
+					Mem *m = &fn->mem[a.val];
+					if (isreg(m->base) && (all_reg & BIT(m->base.val)))
+						gen |= BIT(m->base.val);
+					if (isreg(m->index) && (all_reg & BIT(m->index.val)))
+						gen |= BIT(m->index.val);
+				}
+			}
+		}
+		transfer[b->id] = (struct Transfer){keep, gen};
+	}
 	int changed;
 	do {
 		changed = 0;
@@ -1633,35 +1673,7 @@ me_compute_gpr_out(Fn *fn)
 			if (isreg(b->jmp.arg) && (all_reg & BIT(b->jmp.arg.val)))
 				live |= BIT(b->jmp.arg.val);
 			out[b->id] = live;
-			for (Ins *ins = &b->ins[b->nins]; ins > b->ins;) {
-				--ins;
-				if (ins->op == Ocall) {
-					live &= call_pres;
-					if (rtype(ins->arg[1]) == RCall)
-						live |= arm64_argregs(ins->arg[1], 0) & all_reg;
-					else
-						live |= BIT(R0) | BIT(R1) | BIT(R2) | BIT(R3) | BIT(R4) | BIT(R5) | BIT(R6) | BIT(R7) | BIT(R8)
-							| BIT(V0) | BIT(V1) | BIT(V2) | BIT(V3) | BIT(V4) | BIT(V5) | BIT(V6) | BIT(V7);
-					if (isreg(ins->arg[0]) && (all_reg & BIT(ins->arg[0].val)))
-						live |= BIT(ins->arg[0].val);
-					continue;
-				}
-				if (isreg(ins->to) && (all_reg & BIT(ins->to.val))
-				&& ins->op != Osel0 && !isxsel(ins->op))
-					live &= ~BIT(ins->to.val);
-				for (int j = 0; j < 2; j++) {
-					Ref a = ins->arg[j];
-					if (isreg(a) && (all_reg & BIT(a.val)))
-						live |= BIT(a.val);
-					else if (rtype(a) == RMem) {
-						Mem *m = &fn->mem[a.val];
-						if (isreg(m->base) && (all_reg & BIT(m->base.val)))
-							live |= BIT(m->base.val);
-						if (isreg(m->index) && (all_reg & BIT(m->index.val)))
-							live |= BIT(m->index.val);
-					}
-				}
-			}
+			live = (live & transfer[b->id].keep) | transfer[b->id].gen;
 			if (live != in[b->id]) {
 				in[b->id] = live;
 				changed = 1;
