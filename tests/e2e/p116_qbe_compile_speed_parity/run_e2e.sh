@@ -16,7 +16,8 @@
 #      bytes, negative and extreme integers, data) and a two-file run whose
 #      first file ends without a newline: a C driver checks every value on the
 #      host through text assembly and, where QBE writes objects for the host,
-#      through `--obj` (exact check counts, `bad 0`); `--obj-batch` objects equal
+#      through `--obj` (exact check counts, `bad 0`; the driver itself under
+#      UBSan with alignment checks when available); `--obj-batch` objects equal
 #      one `--obj` run per file; four rejected inputs give exit 1 and the exact
 #      `qbe:file:line: unknown keyword ...` line.
 #   2. Liveness / phi placement / register allocation: flow.ssa (redefined
@@ -111,11 +112,20 @@ EXPECT_RUN="lex 40
 multifile 59
 flow 14673
 total 14772 bad 0"
+# The C driver itself runs under UBSan (alignment included, first report fatal) when available.
+DRV_SAN=""
+if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=undefined,alignment -fno-sanitize-recover=all \
+  -o "$TMP_DIR/drv_probe" 2>/dev/null && "$TMP_DIR/drv_probe"; then
+  DRV_SAN="-fsanitize=undefined,alignment -fno-sanitize-recover=all"
+elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
+  fail "needs UBSan for the C driver (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
+fi
+echo "p116 C driver sanitizers: ${DRV_SAN:-<none>}"
 host_run() { # $1 label, then objects / assembly files
   label=$1
   shift
-  "$CC_BIN" -O1 -ffp-contract=off "$F/check.c" "$@" -o "$TMP_DIR/check_$label"
-  "$TMP_DIR/check_$label" > "$TMP_DIR/check_$label.out" || {
+  "$CC_BIN" -O1 -ffp-contract=off $DRV_SAN "$F/check.c" "$@" -o "$TMP_DIR/check_$label"
+  UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 "$TMP_DIR/check_$label" > "$TMP_DIR/check_$label.out" || {
     cat "$TMP_DIR/check_$label.out" >&2
     fail "host $label: C driver reported failures"
   }

@@ -82,8 +82,13 @@ def lex_ssa():
           # sb / sh / ub parameters, swtof / sltof / dtosi / stosi / exts / truncd / extsw
           'export function l $lx_conv(sb %a, sh %b, ub %c, w %w) {',
           '@start',
-          '\t%x =w add %a, %b',
-          '\t%y =w add %x, %c',
+          # Only the low 8 / 16 bits of sub-word parameters are defined
+          # (AAPCS64 callers do not extend them): extend explicitly.
+          '\t%ae =w extsb %a',
+          '\t%be =w extsh %b',
+          '\t%ce =w extub %c',
+          '\t%x =w add %ae, %be',
+          '\t%y =w add %x, %ce',
           '\t%f =s swtof %y',
           '\t%g =d exts %f',
           '\t%z =l extsw %w',
@@ -179,8 +184,8 @@ def lex_expect():
         c.append(f'CHK("lx_long", (uint64_t)(uint32_t){LONG_FN}({v}), 0x{want:x}ull);')
     data = (-3 + (-(1 << 63)) + (-12) + m64) & m64
     c.append(f'CHK("lx_data", (uint64_t)lx_data(), 0x{data:x}ull);')
-    c.append(f'CHK("lx_data_s", (uint64_t)*(uint32_t *)((char *){LONG_DATA} + 15), 0x{sbits("1.5"):08x}ull);')
-    c.append(f'CHK("d_x_s", (uint64_t)*(uint32_t *)((char *)d_x + 8), 0x{sbits("-0"):08x}ull);')
+    c.append(f'CHK("lx_data_s", (uint64_t)read_u32((char *){LONG_DATA} + 15), 0x{sbits("1.5"):08x}ull);')
+    c.append(f'CHK("d_x_s", (uint64_t)read_u32((char *)d_x + 8), 0x{sbits("-0"):08x}ull);')
     return c
 
 
@@ -486,6 +491,8 @@ def main():
          '\treturn (int64_t)(((uint64_t)a ^ ((uint64_t)b << 1)) + 0x9e37u);', '}',
          FLOW_REF, p_ref,
          'static long total, bad;',
+         '/* QBE data has no padding: read unaligned fields through memcpy. */',
+         'static uint32_t read_u32(const void *p) { uint32_t v; memcpy(&v, p, sizeof v); return v; }',
          'static void CHK(const char *name, uint64_t got, uint64_t want) {',
          '\ttotal++;',
          '\tif (got != want) { bad++; printf("BAD %s got %llx want %llx\\n", name, (unsigned long long)got, (unsigned long long)want); }',
