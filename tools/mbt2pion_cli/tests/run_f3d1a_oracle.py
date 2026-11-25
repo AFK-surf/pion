@@ -543,6 +543,98 @@ pub fn closure_before_iter() -> Int {
   it.to_array().length()
 }
 
+let neg_handlers : Array[() -> Unit] = []
+
+fn neg_on(h : () -> Unit) -> Unit {
+  neg_handlers.push(h)
+}
+
+fn neg_fire() -> Unit {
+  for h in neg_handlers {
+    h()
+  }
+}
+
+pub fn handed_closure_before_iter() -> Int {
+  let handed = [1, 2, 3]
+  let g = fn() { let _ = handed.pop() }
+  neg_on(g)
+  let it = handed.iter()
+  neg_fire()
+  it.to_array().length()
+}
+
+fn sort_touch(xs : Array[Int], touch : () -> Unit) -> Unit {
+  xs.sort_by_key(fn(x) {
+    touch()
+    x
+  })
+}
+
+pub fn opaque_key_call() -> Int {
+  let a = [3, 1, 2]
+  sort_touch(a, fn() { a.push(8) })
+  a[0]
+}
+
+pub fn named_chain_callback() -> Int {
+  let a = [1, 2, 3]
+  let key = fn(x : Int) {
+    if x == 1 {
+      let _ = a.pop()
+    }
+    x
+  }
+  a.iter().map(key).to_array().length()
+}
+
+pub fn paren_alias() -> Int {
+  let a = [1, 2, 3]
+  let b = (a)
+  let it = a.iter()
+  let _ = b.pop()
+  it.to_array().length()
+}
+
+fn two_names(a : Array[Int], b : Array[Int]) -> Int {
+  let it = a.iter()
+  let _ = b.pop()
+  it.to_array().length()
+}
+
+pub fn same_array_twice() -> Int {
+  let a = [1, 2, 3]
+  two_names(a, a)
+}
+
+pub fn interp_pop() -> String {
+  let a = [1, 2, 3]
+  let it = a.iter()
+  let s = "\{a.pop().unwrap_or(0)}"
+  it.to_array().length().to_string() + ":" + s
+}
+
+fn trim_alias(src : Array[Int]) -> Unit {
+  let buf = src
+  buf.shrink_to_fit()
+}
+
+pub fn shrink_through_alias() -> Int {
+  let xs : Array[Int] = Array::new(capacity=8)
+  xs.push(1)
+  xs.push(2)
+  xs.push(3)
+  let mut s = 0
+  for x in xs {
+    s = s + x
+    if x == 1 {
+      trim_alias(xs)
+      xs[1] = 9
+    }
+  }
+  s
+}
+
 pub fn paren_pipe() -> Int {
   let m : Map[Int, Int] = ([(1, 10), (2, 20), (3, 30)]) |> Map::from_array
   m.length()
@@ -681,11 +773,14 @@ def main():
                        ["`xs.pop(..)` runs while it is kept", "appended to and written in place"])
         expect_blocked(bin_path, args.pionc, md, work, "negreview", NEG_REVIEW_MBT, "MBT2PION_ARRAY_ITER_MUTATION",
                        ["`Array::sort_by_key` with a key that is not a closure literal",
-                        "inside the iterator chain's callbacks", "`ys.pop(..)` runs while it is kept",
-                        "may change it while it is kept", "is passed to `mutate(..)`",
+                        "inside the iterator chain's callbacks", "`.pop(..)` runs while an iterator of a computed array",
+                        "`.clear_me(..)` on `b` may change the array", "is passed to `mutate(..)`",
                         "the iterator `it` leaves its expression", "MBT2PION_ARRAY_SHRINK_ITER",
                         "piped into `Map::from_array`", "reached from `helper2`",
-                        "in a closure defined before the iterator"])
+                        "in a closure defined before the iterator", "key closure is not supported",
+                        "`handed.pop(..)` runs while it is kept (in a closure defined before the iterator)",
+                        "runs while an iterator of a computed array is kept", "(in a string interpolation)",
+                        "comes from outside `trim_alias`"])
         expect_blocked(bin_path, args.pionc, md, work, "negmap", NEG_MAP_MBT, "MBT2PION_UNSUPPORTED_SYNTAX",
                        ["`Map(arr, capacity=...)` with a capacity expression that may run code"])
 
