@@ -155,33 +155,24 @@ fn loop_iterable_private_copy(
   if uses > 0 { -1 } else { status }
 }
 
-///| Why `recv.shrink_to_fit()` at token `name_i` (the `shrink_to_fit` token) could be observed by a buffer
-///| snapshot in its function, or "" when none can.
-pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, array_fields : Map[String, Bool]) -> String {
-  let n = tokens.length()
-  // Enclosing top-level function body: the outermost `{` around the call.
-  let mut body_open = -1
-  let mut k = name_i
-  while true {
-    let o = enclosing_open(tokens, k, 0, TokenKind::LBrace)
-    if o < 0 {
-      break
-    }
-    body_open = o
-    k = o
-  }
-  if body_open < 0 {
-    return ""
-  }
-  let body_close = find_matching_delim(tokens, body_open)
-  // 1. Inside a `for .. in` loop body or a closure given to an iteration helper.
-  let mut b = name_i
+///| Why the block structure around token `idx` (inside the function body `(body_open, body_close)`) iterates a
+///| buffer snapshot -- a `for .. in` body (unless over a private copy) or a closure handed to an iteration helper --
+///| or "".
+fn iteration_scope_reason(
+  tokens : Array[Token],
+  idx : Int,
+  body_open : Int,
+  body_close : Int,
+  array_fields : Map[String, Bool],
+) -> String {
+  let mut b = idx
   while true {
     let o = enclosing_open(tokens, b, body_open, TokenKind::LBrace)
     if o < 0 || o <= body_open {
       break
     }
-    // Header of this block: walk back over its line/statement to find `for .. in` or `fn(..)`.
+    // Header of this block: walk back over its statement to find `for .. in` or `fn(..)`; a block expression in
+    // the header (`for x in if c { xs } else { ys } {`) is stepped over as a unit.
     let mut h = o - 1
     let mut d = 0
     let mut saw_in = false
@@ -189,10 +180,18 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, array_fields 
     let mut kind = ""
     while h > body_open {
       let hk = tokens[h].kind
-      if hk == TokenKind::RParen || hk == TokenKind::RBracket || hk == TokenKind::RBrace {
-        if hk == TokenKind::RBrace && d == 0 {
+      if hk == TokenKind::RBrace && d == 0 {
+        if tokens[h].newline_before {
           break
         }
+        let ob = find_open_before(tokens, h, body_open)
+        if ob <= body_open {
+          break
+        }
+        h = ob - 1
+        continue
+      }
+      if hk == TokenKind::RParen || hk == TokenKind::RBracket || hk == TokenKind::RBrace {
         d = d + 1
       } else if hk == TokenKind::LParen || hk == TokenKind::LBracket || hk == TokenKind::LBrace {
         if d == 0 {
@@ -236,6 +235,235 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, array_fields 
     }
     b = o
   }
+  ""
+}
+
+///| Outermost `{` around `idx` (its top-level function or test body), or -1.
+fn outermost_body_open(tokens : Array[Token], idx : Int) -> Int {
+  let mut body_open = -1
+  let mut k = idx
+  while true {
+    let o = enclosing_open(tokens, k, 0, TokenKind::LBrace)
+    if o < 0 {
+      break
+    }
+    body_open = o
+    k = o
+  }
+  body_open
+}
+
+///| What the whole package tells about buffer snapshots that a `shrink_to_fit` in one function could meet in
+///| another (`collect_shrink_pkg`).
+pub struct ShrinkPkg {
+  array_fields : Map[String, Bool]
+  // Last name of every path iterated (a `for .. in` body, an iteration callback, a kept iterator) where the
+  // iteration may call a function of the package (which could shrink that array).
+  iterated_tails : Map[String, String]
+  // Functions / methods of the package a snapshot could be live around: `pub` (callers outside), called inside an
+  // iteration scope, or used as a value.
+  risky_fns : Map[String, String]
+  // Fields readable outside the package (a `pub struct` field without `priv`).
+  visible_fields : Map[String, Bool]
+}
+
+pub fn ShrinkPkg::empty() -> ShrinkPkg {
+  ShrinkPkg::{ array_fields: Map(), iterated_tails: Map(), risky_fns: Map(), visible_fields: Map() }
+}
+
+///| Name of the path ending at `end_idx` (`a.b.c` -> `c`; `f(x).c` -> `c`), or "".
+fn path_tail(tokens : Array[Token], end_idx : Int) -> String {
+  if end_idx >= 0 && tokens[end_idx].kind == TokenKind::Ident { tokens[end_idx].raw } else { "" }
+}
+
+///| Package function / method names declared in `ts` (`fn f(`, `fn T::m(`), with whether they are `pub`.
+fn declared_fns(ts : Array[Token], out : Map[String, Bool]) -> Unit {
+  let n = ts.length()
+  let mut i = 0
+  while i + 1 < n {
+    if ts[i].raw == "fn" && ts[i + 1].kind != TokenKind::LParen {
+      let mut j = i + 1
+      if j + 2 < n && ts[j + 1].kind == TokenKind::ColonColon {
+        j = j + 2
+      }
+      if ts[j].kind == TokenKind::Ident {
+        let is_pub = i > 0 && ts[i - 1].raw == "pub"
+        let prev = match out.get(ts[j].raw) {
+          Some(v) => v
+          None => false
+        }
+        out[ts[j].raw] = prev || is_pub
+      }
+    }
+    i = i + 1
+  }
+}
+
+///| `[s, e)` calls a function or method the package declares.
+fn calls_package_fn(ts : Array[Token], s : Int, e : Int, fns : Map[String, Bool]) -> Bool {
+  let mut k = s
+  while k + 1 < e {
+    if ts[k].kind == TokenKind::Ident && ts[k + 1].kind == TokenKind::LParen && fns.contains(ts[k].raw) &&
+    !(k > 0 && ts[k - 1].raw == "fn") {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Builds `ShrinkPkg` from the package's generated files.
+pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
+  let pkg = ShrinkPkg::empty()
+  let all_tokens : Array[Array[Token]] = []
+  for c in contents {
+    all_tokens.push(lex_moonbit(c))
+  }
+  let fns : Map[String, Bool] = Map()
+  for ts in all_tokens {
+    declared_fns(ts, fns)
+  }
+  for k in fns.keys() {
+    if fns.get(k) == Some(true) {
+      pkg.risky_fns[k] = "it is `pub` (a caller outside the package may iterate the array)"
+    }
+  }
+  let afs = collect_array_fields(contents)
+  for k in afs.keys() {
+    match afs.get(k) {
+      Some(v) => pkg.array_fields[k] = v
+      None => ()
+    }
+  }
+  for c in contents {
+    let ts = lex_moonbit(c)
+    let n = ts.length()
+    // Visible fields: `pub struct S { f : T }` without `priv`.
+    let mut i = 0
+    while i < n {
+      if ts[i].raw == "struct" && i > 0 && ts[i - 1].raw == "pub" {
+        let mut o = i + 1
+        while o < n && ts[o].kind != TokenKind::LBrace && ts[o].kind != TokenKind::LParen && ts[o].kind != TokenKind::Eof {
+          o = o + 1
+        }
+        if o < n && ts[o].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, o)
+          let mut k = o + 1
+          while k > 0 && k + 1 < close {
+            if ts[k].kind == TokenKind::Ident && ts[k + 1].kind == TokenKind::Colon &&
+            (ts[k].newline_before || ts[k - 1].raw == "mut") {
+              let hidden = ts[k - 1].raw == "priv" || k >= 2 && ts[k - 1].raw == "mut" && ts[k - 2].raw == "priv"
+              if !hidden {
+                pkg.visible_fields[ts[k].raw] = true
+              }
+            }
+            k = k + 1
+          }
+        }
+      }
+      i = i + 1
+    }
+    // Iterations and the functions called inside them.
+    let mut t = 0
+    while t + 2 < n {
+      let tk = ts[t]
+      // Calls inside an iteration scope; functions used as values.
+      if tk.kind == TokenKind::Ident && fns.contains(tk.raw) && !(t > 0 && ts[t - 1].raw == "fn") &&
+      !(t >= 2 && ts[t - 1].kind == TokenKind::ColonColon && ts[t - 2].raw == "fn") {
+        let is_call = ts[t + 1].kind == TokenKind::LParen
+        let is_decl = t >= 2 && ts[t - 1].kind == TokenKind::ColonColon && t >= 3 && ts[t - 3].raw == "fn"
+        if !is_call && !is_decl && !pkg.risky_fns.contains(tk.raw) &&
+        !(t > 0 && ts[t - 1].kind == TokenKind::Dot) {
+          pkg.risky_fns[tk.raw] = "it is used as a function value"
+        } else if is_call && !pkg.risky_fns.contains(tk.raw) {
+          let bo = outermost_body_open(ts, t)
+          if bo >= 0 {
+            let bc = find_matching_delim(ts, bo)
+            if iteration_scope_reason(ts, t, bo, bc, pkg.array_fields).length() > 0 {
+              pkg.risky_fns[tk.raw] = "it is called inside an iteration (line " + tk.line.to_string() + ")"
+            }
+          }
+        }
+      }
+      // `for .. in <path> {` whose body calls a package function.
+      if tk.raw == "for" && (tk.kind == TokenKind::Keyword || tk.kind == TokenKind::Ident) {
+        let mut j = t + 1
+        let mut in_i = -1
+        while j < n && ts[j].kind != TokenKind::LBrace && !ts[j].newline_before {
+          if ts[j].raw == "in" {
+            in_i = j
+          }
+          j = j + 1
+        }
+        if in_i > 0 && j < n && ts[j].kind == TokenKind::LBrace {
+          let close = find_matching_delim(ts, j)
+          let bo = outermost_body_open(ts, t)
+          let private = bo >= 0 &&
+          loop_iterable_private_copy(ts, bo, find_matching_delim(ts, bo), in_i, j, pkg.array_fields) == 1
+          let mut tail_i = j - 1
+          if tail_i >= 3 && ts[tail_i].kind == TokenKind::RParen && ts[tail_i - 1].kind == TokenKind::LParen &&
+          ts[tail_i - 2].raw == "iter" && ts[tail_i - 3].kind == TokenKind::Dot {
+            tail_i = tail_i - 4
+          }
+          let tail = path_tail(ts, tail_i)
+          if !private && tail.length() > 0 && calls_package_fn(ts, j, close, fns) {
+            pkg.iterated_tails[tail] = "line " + tk.line.to_string()
+          }
+        }
+      }
+      // `<path>.each(fn ..)` (and other iteration callees) / `mbt_compat::arr_each(<path>, fn ..)`.
+      if tk.kind == TokenKind::Dot && ts[t + 1].kind == TokenKind::Ident && ts[t + 2].kind == TokenKind::LParen &&
+      (is_iteration_callee(ts[t + 1].raw) || ts[t + 1].raw == "iter") && t > 0 {
+        let close = find_matching_delim(ts, t + 2)
+        let mut chain_end = close
+        while chain_end + 3 < n && ts[chain_end + 1].kind == TokenKind::Dot && ts[chain_end + 3].kind == TokenKind::LParen {
+          chain_end = find_matching_delim(ts, chain_end + 3)
+        }
+        let tail = path_tail(ts, t - 1)
+        let kept = ts[t + 1].raw == "iter" && !iter_chain_is_consumed(ts, close)
+        let scope_end = if kept {
+          let bo = outermost_body_open(ts, t)
+          if bo >= 0 { find_matching_delim(ts, bo) } else { chain_end }
+        } else {
+          chain_end
+        }
+        if tail.length() > 0 && chain_end > t && calls_package_fn(ts, t + 2, scope_end, fns) {
+          pkg.iterated_tails[tail] = "line " + tk.line.to_string()
+        }
+      }
+      if tk.raw == "mbt_compat" && ts[t + 1].kind == TokenKind::ColonColon && t + 4 < n &&
+      ts[t + 2].raw.starts_with("arr_") && ts[t + 3].kind == TokenKind::LParen &&
+      (is_iteration_callee(ts[t + 2].raw.slice(4, ts[t + 2].raw.length())) || ts[t + 2].raw == "arr_iter") {
+        let close = find_matching_delim(ts, t + 3)
+        let mut a = t + 4
+        while a + 1 < close && ts[a + 1].kind != TokenKind::Comma && ts[a + 1].kind != TokenKind::RParen {
+          a = a + 1
+        }
+        let tail = path_tail(ts, a)
+        if tail.length() > 0 && calls_package_fn(ts, t + 3, close, fns) {
+          pkg.iterated_tails[tail] = "line " + tk.line.to_string()
+        }
+      }
+      t = t + 1
+    }
+  }
+  pkg
+}
+
+///| Why `recv.shrink_to_fit()` at token `name_i` (the `shrink_to_fit` token) could be observed by a buffer
+///| snapshot -- in its function, or (through `pkg`) in a caller -- or "" when none can.
+pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkPkg) -> String {
+  let n = tokens.length()
+  let body_open = outermost_body_open(tokens, name_i)
+  if body_open < 0 {
+    return ""
+  }
+  let body_close = find_matching_delim(tokens, body_open)
+  // 1. Inside a `for .. in` loop body or a closure given to an iteration helper.
+  let in_iter = iteration_scope_reason(tokens, name_i, body_open, body_close, pkg.array_fields)
+  if in_iter.length() > 0 {
+    return in_iter
+  }
   // 2. An array iterator kept beyond the expression that creates it.
   let mut t = body_open + 1
   while t + 2 < body_close && t + 2 < n {
@@ -251,6 +479,57 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, array_fields 
       }
     }
     t = t + 1
+  }
+  // 3. Snapshots in other functions: an iteration elsewhere in the package over an array of this name that calls
+  //    package functions, or a receiver a caller can hand in or reach (a parameter, a visible field) while the
+  //    function may run inside a caller's iteration.
+  let tail = path_tail(tokens, name_i - 2)
+  match pkg.iterated_tails.get(tail) {
+    Some(at) => return "the package iterates an array named `" + tail + "` (" + at + ") around calls that may reach it"
+    None => ()
+  }
+  // Receiver path head and length.
+  let mut h = name_i - 2
+  while h >= 2 && tokens[h - 1].kind == TokenKind::Dot && tokens[h - 2].kind == TokenKind::Ident {
+    h = h - 2
+  }
+  let head = if h >= 0 && tokens[h].kind == TokenKind::Ident { tokens[h].raw } else { "" }
+  let is_field = h < name_i - 2
+  // Enclosing function: name and parameters.
+  let mut f = body_open - 1
+  while f > 0 && tokens[f].raw != "fn" {
+    f = f - 1
+  }
+  let mut fname = ""
+  let params : Map[String, Bool] = Map()
+  if f >= 0 && tokens[f].raw == "fn" && f + 1 < body_open {
+    let mut j = f + 1
+    if j + 2 < body_open && tokens[j + 1].kind == TokenKind::ColonColon {
+      j = j + 2
+    }
+    fname = tokens[j].raw
+    let mut d = 0
+    let mut k = j + 1
+    while k + 1 < body_open {
+      let kk = tokens[k].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket {
+        d = d + 1
+      } else if kk == TokenKind::RParen || kk == TokenKind::RBracket {
+        d = d - 1
+      } else if d == 1 && kk == TokenKind::Ident && tokens[k + 1].kind == TokenKind::Colon {
+        params[tokens[k].raw] = true
+      }
+      k = k + 1
+    }
+  }
+  let reachable = (!is_field && params.contains(head)) || (is_field && pkg.visible_fields.contains(tail)) ||
+  (is_field && params.contains(head) && head != "self")
+  if reachable {
+    match pkg.risky_fns.get(fname) {
+      Some(why) =>
+      return "its receiver comes from a caller and `" + fname + "` may run inside a caller's iteration: " + why
+      None => ()
+    }
   }
   ""
 }
@@ -420,13 +699,27 @@ fn kept_iter_escapes(tokens : Array[Token], dot_i : Int, close_p : Int, body_ope
     while k < body_close {
       let tk = tokens[k]
       let qualified = tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon
-      if tk.kind == TokenKind::Ident && tk.raw == nm && !qualified &&
-      !(k + 1 < body_close && tokens[k + 1].kind == TokenKind::Dot) {
+      if tk.kind == TokenKind::Ident && tk.raw == nm && !qualified {
         if k > 0 && (tokens[k - 1].raw == "let" || tokens[k - 1].raw == "mut") {
           // Rebound: later uses are another value.
           return ""
         }
-        return "the iterator `" + nm + "` leaves its expression (line " + tk.line.to_string() + ")"
+        // Only `it.m(..)..` chains that end in a terminal consumer (or `next()`) read it in place; a lazy
+        // `it.map(f)` is another iterator over the same snapshot.
+        let mut ends_in_consumer = false
+        let mut c2 = k
+        while c2 + 3 < body_close && tokens[c2 + 1].kind == TokenKind::Dot && tokens[c2 + 2].kind == TokenKind::Ident &&
+        tokens[c2 + 3].kind == TokenKind::LParen {
+          let m = tokens[c2 + 2].raw
+          if is_terminal_iter_consumer(m) || m == "next" {
+            ends_in_consumer = true
+            break
+          }
+          c2 = find_matching_delim(tokens, c2 + 3)
+        }
+        if !ends_in_consumer {
+          return "the iterator `" + nm + "` leaves its expression (line " + tk.line.to_string() + ")"
+        }
       }
       k = k + 1
     }
@@ -491,102 +784,213 @@ fn is_array_literal_end(tokens : Array[Token], rb : Int) -> Bool {
     tokens[lb - 1].kind == TokenKind::RBracket || tokens[lb - 1].kind == TokenKind::UpperIdent)
 }
 
-///| A kept `xs.iter()` (`dot_i`: its `.`) reads the buffer and length `xs` had when it was created (MoonBit:
-///| `self[:].iter()`); `mbt_compat::arr_iter` reads the live array up to that length. They agree while the array
-///| is only appended to (the length is snapshotted) or only written in place (one shared buffer) -- not after a
-///| removal (`pop`, `truncate`, `clear`, `remove`, `drain`, ...: MoonBit still yields the old elements), a
-///| reordering or shrink, or a write after an append (the append may have reallocated). Why the iterator could
-///| observe a difference in its function (any use of the receiver's root counts), or "".
-pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
-  let close_p = find_matching_delim(tokens, dot_i + 2)
-  if close_p < 0 || iter_chain_is_consumed(tokens, close_p) || iter_is_consumed_argument(tokens, dot_i, close_p) {
-    return ""
+///| `xs.length()`-style reads that cannot change an array (other names on an array path count as possible
+///| mutations: a user method on `self` may clear `self.xs`).
+fn is_read_only_array_method(m : String) -> Bool {
+  m == "length" || m == "get" || m == "contains" || m == "is_empty" || m == "iter" || m == "copy" ||
+  m == "to_string" || m == "map" || m == "mapi" || m == "filter" || m == "filter_map" || m == "fold" ||
+  m == "any" || m == "all" || m == "join" || m == "last" || m == "first" || m == "search" ||
+  m == "search_by" || m == "each" || m == "eachi" || m == "rev_each" || m == "unsafe_get" ||
+  m == "to_array" || m == "count" || m == "next" || m == "unwrap_or" || m == "unwrap" || m == "op_get" ||
+  m == "compare" || m == "equal" || m == "hash" || m == "rev" || m == "starts_with" || m == "ends_with"
+}
+
+///| Names of the array the iterator reads: `root` and the locals bound to it (`let ys = xs`, `ys = xs`, either way).
+fn array_aliases(tokens : Array[Token], root : String, body_open : Int, body_close : Int) -> Map[String, Bool] {
+  let names : Map[String, Bool] = Map()
+  names[root] = true
+  let mut changed = true
+  while changed {
+    changed = false
+    let mut k = body_open + 1
+    while k + 2 < body_close {
+      // `<a> = <b>` with `<b>` a bare name ending the statement.
+      if tokens[k].kind == TokenKind::Ident && tokens[k + 1].kind == TokenKind::Eq &&
+      tokens[k + 2].kind == TokenKind::Ident &&
+      (k + 3 >= body_close || tokens[k + 3].newline_before || tokens[k + 3].kind == TokenKind::Semi) &&
+      !(k > 0 && tokens[k - 1].kind == TokenKind::Dot) {
+        let a = tokens[k].raw
+        let b = tokens[k + 2].raw
+        if names.contains(a) && !names.contains(b) {
+          names[b] = true
+          changed = true
+        } else if names.contains(b) && !names.contains(a) {
+          names[a] = true
+          changed = true
+        }
+      }
+      k = k + 1
+    }
   }
-  if is_array_literal_end(tokens, dot_i - 1) {
-    return ""
+  names
+}
+
+///| Start of the region a kept iterator created at `idx` lives through: the statement creating it, or the
+///| outermost loop (inside the function body) around it, whose back edge brings earlier statements round again.
+fn kept_iter_region_start(tokens : Array[Token], idx : Int, body_open : Int) -> Int {
+  // The creating statement: back to the first token of its line.
+  let mut start = idx
+  while start > body_open + 1 && !tokens[start].newline_before {
+    start = start - 1
   }
-  let root = receiver_root(tokens, dot_i - 1)
-  let mut body_open = -1
-  let mut k = dot_i
+  let mut b = idx
   while true {
-    let o = enclosing_open(tokens, k, 0, TokenKind::LBrace)
-    if o < 0 {
+    let o = enclosing_open(tokens, b, body_open, TokenKind::LBrace)
+    if o < 0 || o <= body_open {
       break
     }
-    body_open = o
-    k = o
+    // A loop header on the line of this `{`.
+    let mut h = o - 1
+    while h > body_open {
+      let r = tokens[h].raw
+      if r == "for" || r == "while" || r == "loop" {
+        start = h
+        break
+      }
+      if tokens[h].newline_before {
+        break
+      }
+      h = h - 1
+    }
+    b = o
   }
-  if body_open < 0 {
-    return ""
-  }
-  let body_close = find_matching_delim(tokens, body_open)
-  let esc = kept_iter_escapes(tokens, dot_i, close_p, body_open, body_close)
-  if esc.length() > 0 {
-    return esc
-  }
+  start
+}
+
+///| Why a change to the iterated array inside `[s, e)` could differ between MoonBit's snapshot and the live array
+///| (`names`: the array's root names; "" for a computed receiver, where any array counts), or "".
+fn kept_iter_mutations(
+  tokens : Array[Token],
+  names : Map[String, Bool],
+  computed : Bool,
+  s : Int,
+  e : Int,
+  body_open : Int,
+) -> String {
   let mut pushes = false
   let mut writes = false
-  let mut t = body_open + 1
-  while t < body_close {
+  let mut t = s
+  while t < e {
     let tk = tokens[t]
     let qualified = t > 0 && (tokens[t - 1].kind == TokenKind::Dot || tokens[t - 1].kind == TokenKind::ColonColon)
-    // A receiver that is not a plain path (a call result, an index): any array's removal counts.
-    if root.length() == 0 && tk.kind == TokenKind::Dot && t + 2 < body_close && tokens[t + 1].kind == TokenKind::Ident &&
-    tokens[t + 2].kind == TokenKind::LParen {
-      let m = tokens[t + 1].raw
-      if m == "push" {
-        pushes = true
-      } else if m == "set" || m == "unsafe_set" {
+    if computed {
+      if tk.kind == TokenKind::Dot && t + 2 < e && tokens[t + 1].kind == TokenKind::Ident &&
+      tokens[t + 2].kind == TokenKind::LParen {
+        let m = tokens[t + 1].raw
+        if m == "push" {
+          pushes = true
+        } else if m == "set" || m == "unsafe_set" {
+          writes = true
+        } else if m != "iter" && is_array_mutating_method(m) {
+          return "`." + m + "(..)` runs while an iterator of a computed array is kept"
+        }
+      } else if tk.kind == TokenKind::Ident && t > 1 && tokens[t - 1].kind == TokenKind::ColonColon &&
+      tokens[t - 2].raw == "mbt_compat" && is_mbt_compat_arr_mutating(tk.raw) {
+        if tk.raw == "arr_push" || tk.raw == "arr_push_iter" {
+          pushes = true
+        } else {
+          return "`" + tk.raw + "(..)` runs while an iterator of a computed array is kept"
+        }
+      } else if tk.kind == TokenKind::RBracket && t + 1 < e &&
+      (tokens[t + 1].kind == TokenKind::Eq || tokens[t + 1].kind == TokenKind::AssignOp) {
         writes = true
-      } else if m != "iter" && is_array_mutating_method(m) {
-        return "`." + m + "(..)` runs while an iterator of a computed array is kept"
       }
-    } else if root.length() == 0 && tk.kind == TokenKind::Ident && t > 1 && tokens[t - 1].kind == TokenKind::ColonColon &&
-    tokens[t - 2].raw == "mbt_compat" && is_mbt_compat_arr_mutating(tk.raw) && tk.raw != "arr_push" &&
-    tk.raw != "arr_push_iter" {
-      return "`" + tk.raw + "(..)` runs while an iterator of a computed array is kept"
-    } else if root.length() == 0 && tk.kind == TokenKind::RBracket && t + 1 < body_close &&
-    (tokens[t + 1].kind == TokenKind::Eq || tokens[t + 1].kind == TokenKind::AssignOp) {
-      writes = true
-    }
-    if root.length() > 0 && tk.kind == TokenKind::Ident && tk.raw == root && !qualified {
-      // Walk the path `root.a.b` and look at what follows it.
-      let mut e = t
-      while e + 2 < body_close && tokens[e + 1].kind == TokenKind::Dot && tokens[e + 2].kind == TokenKind::Ident &&
-      !(e + 3 < body_close && tokens[e + 3].kind == TokenKind::LParen) {
-        e = e + 2
+    } else if tk.kind == TokenKind::Ident && names.contains(tk.raw) && !qualified {
+      let nm = tk.raw
+      // Walk the path `nm.a.b` (fields) and look at what follows it.
+      let mut p = t
+      while p + 2 < e && tokens[p + 1].kind == TokenKind::Dot && tokens[p + 2].kind == TokenKind::Ident &&
+      !(p + 3 < e && tokens[p + 3].kind == TokenKind::LParen) {
+        p = p + 2
       }
-      if e + 3 < body_close && tokens[e + 1].kind == TokenKind::Dot && tokens[e + 2].kind == TokenKind::Ident &&
-      tokens[e + 3].kind == TokenKind::LParen {
-        let m = tokens[e + 2].raw
+      if p + 3 < e && tokens[p + 1].kind == TokenKind::Dot && tokens[p + 2].kind == TokenKind::Ident &&
+      tokens[p + 3].kind == TokenKind::LParen {
+        let m = tokens[p + 2].raw
         if m == "push" {
           pushes = true
         } else if m == "set" || m == "unsafe_set" {
           writes = true
         } else if is_array_mutating_method(m) {
-          return "`" + root + "." + m + "(..)` runs while it is kept"
+          return "`" + nm + "." + m + "(..)` runs while it is kept"
+        } else if !is_read_only_array_method(m) {
+          return "`" + nm + "." + m + "(..)` may change it while it is kept"
         }
-      } else if e + 1 < body_close && tokens[e + 1].kind == TokenKind::LBracket {
-        let cb = find_matching_delim(tokens, e + 1)
-        if cb + 1 < body_close && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+      } else if p + 1 < e && tokens[p + 1].kind == TokenKind::LBracket {
+        let cb = find_matching_delim(tokens, p + 1)
+        if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
           writes = true
         }
       }
-      // As an argument of a call (`mbt_compat::arr_pop(xs)`, `f(xs)`): could mutate it.
-      if t > 0 && (tokens[t - 1].kind == TokenKind::LParen || tokens[t - 1].kind == TokenKind::Comma) && e == t {
-        let p = enclosing_open(tokens, t, body_open, TokenKind::LParen)
-        let callee = if p > 0 { tokens[p - 1].raw } else { "" }
-        if callee == "arr_push" {
+      // The path as a whole argument of a call (`f(xs)`, `arr_truncate(h.items, 0)`): could change it.
+      if t > 0 && (tokens[t - 1].kind == TokenKind::LParen || tokens[t - 1].kind == TokenKind::Comma) &&
+      p + 1 < e && (tokens[p + 1].kind == TokenKind::RParen || tokens[p + 1].kind == TokenKind::Comma) {
+        let o = enclosing_open(tokens, t, body_open, TokenKind::LParen)
+        let callee = if o > 0 { tokens[o - 1].raw } else { "" }
+        if callee == "arr_push" || callee == "arr_push_iter" {
           pushes = true
-        } else if callee != "arr_iter" {
-          return "`" + root + "` is passed to `" + callee + "(..)` while it is kept"
+        } else if callee != "arr_iter" && callee != "length" {
+          return "`" + nm + "` is passed to `" + callee + "(..)` while it is kept"
         }
       }
     }
     t = t + 1
   }
   if pushes && writes {
-    return "`" + (if root.length() > 0 { root } else { "an array" }) + "` is appended to and written in place while it is kept"
+    return "the array is appended to and written in place while it is kept"
   }
   ""
+}
+
+///| A kept `xs.iter()` (`dot_i`: its `.`) reads the buffer and length `xs` had when it was created (MoonBit:
+///| `self[:].iter()`); `mbt_compat::arr_iter` reads the live array up to that length. They agree while the array
+///| is only appended to (the length is snapshotted) or only written in place (one shared buffer) -- not after a
+///| removal (`pop`, `truncate`, `clear`, `remove`, `drain`, ...: MoonBit still yields the old elements), a
+///| reordering or shrink, a write after an append (the append may have reallocated), a call that may do any of
+///| those (a user method on the root, the array passed to a function), or once the iterator leaves its `let`.
+///| Changes are looked for from its creation (or the loop around it) to the end of the function, through `let`
+///| aliases of the root; an iterator consumed in its expression is checked for changes made by its own callbacks.
+///| Why the iterator could observe a difference, or "".
+pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
+  let close_p = find_matching_delim(tokens, dot_i + 2)
+  if close_p < 0 {
+    return "unbalanced `.iter(`"
+  }
+  if is_array_literal_end(tokens, dot_i - 1) {
+    return ""
+  }
+  let root = receiver_root(tokens, dot_i - 1)
+  let body_open = outermost_body_open(tokens, dot_i)
+  if body_open < 0 {
+    return ""
+  }
+  let body_close = find_matching_delim(tokens, body_open)
+  let names = if root.length() > 0 { array_aliases(tokens, root, body_open, body_close) } else { Map() }
+  let computed = root.length() == 0
+  if iter_chain_is_consumed(tokens, close_p) || iter_is_consumed_argument(tokens, dot_i, close_p) {
+    // Consumed at once: only the chain's own callbacks run while it reads.
+    let mut c = close_p
+    while c + 3 < body_close && tokens[c + 1].kind == TokenKind::Dot && tokens[c + 2].kind == TokenKind::Ident &&
+    tokens[c + 3].kind == TokenKind::LParen {
+      c = find_matching_delim(tokens, c + 3)
+    }
+    // An argument (`push_iter(xs.iter())`, `.zip(ys.iter())`): up to the end of the enclosing call's chain.
+    if c + 1 < body_close && tokens[c + 1].kind == TokenKind::RParen {
+      c = c + 1
+      while c + 3 < body_close && tokens[c + 1].kind == TokenKind::Dot && tokens[c + 2].kind == TokenKind::Ident &&
+      tokens[c + 3].kind == TokenKind::LParen {
+        c = find_matching_delim(tokens, c + 3)
+      }
+    }
+    let why = kept_iter_mutations(tokens, names, computed, close_p + 1, c + 1, body_open)
+    if why.length() > 0 {
+      return why + " (inside the iterator chain's callbacks)"
+    }
+    return ""
+  }
+  let esc = kept_iter_escapes(tokens, dot_i, close_p, body_open, body_close)
+  if esc.length() > 0 {
+    return esc
+  }
+  let start = kept_iter_region_start(tokens, dot_i, body_open)
+  kept_iter_mutations(tokens, names, computed, start, body_close, body_open)
 }

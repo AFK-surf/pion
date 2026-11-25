@@ -18,6 +18,8 @@ Covers (a two-package project: `f3d1adep` transpiled first, then `f3d1a` against
      copy are exact.
   6. `Iter::to_array`: empty, partly consumed, exhausted, called twice, mapped-callback order, an append after
      the iterator was taken.
+  7. Review round: pairs literals under `.length()` / `.get()` / `Some(..)` / `.copy()` and in parentheses (bound
+     by `let` before the generic call), a `pop()` before the iterator exists, `Map::new(capacity=n)`.
 Traps (MoonBit aborts; Pion must abort too, native and wasm32): `Int32` `MIN / -1` and `x / 0`,
 `Map(capacity=-1)`, `Map(capacity=872415233)`, `Array(capacity=-1)`.
 Negatives (must fail closed with no `--out`, never silently change semantics):
@@ -26,6 +28,9 @@ Negatives (must fail closed with no `--out`, never silently change semantics):
   - `Map(non_fresh, capacity=f())` (`MBT2PION_UNSUPPORTED_SYNTAX`)
   - a kept `xs.iter()` consumed by `to_array()` after `xs.pop()`, or after `xs.push(..)` + `xs[0] = ..`
     (MoonBit's iterator keeps the old buffer/length; `MBT2PION_ARRAY_ITER_MUTATION`)
+  - review round: an opaque `sort_by_key` key; a pop in a consumed chain's callback, through a `let` alias, by a
+    user method, by a function the field is passed to; a lazy `it.map(..)` escape; `shrink_to_fit` in a function
+    called from a caller's `for .. in`; a block expression as the `for` iterable; `([..]) |> Map::from_array`
 """
 import argparse, os, shutil, subprocess, tempfile
 
@@ -149,7 +154,8 @@ pub fn run_3() -> String {
     v
   }
   let m1 = Map::from_array([(1, 10), (2, 20), (1, 30), (3, 40), (2, 50)])
-  let m2 : Map[Int, Int] = [(9, 1), (8, 2), (9, 3)] |> Map::from_array
+  let ps2 = [(9, 1), (8, 2), (9, 3)]
+  let m2 : Map[Int, Int] = ps2 |> Map::from_array
   let ks = [4, 5, 6]
   let m3 : Map[Int, Int] = Map([], capacity=ks.length())
   for k in ks {
@@ -291,8 +297,31 @@ pub fn run_6() -> String {
   ints(log) + "|" + it2.count().to_string()
 }
 
+pub fn run_7() -> String {
+  let n1 : Int = Map::from_array([(1, 10), (2, 20), (1, 30)]).length()
+  let v1 : Int = { 1: 10, 2: 20, 1: 30 }.get(1).unwrap()
+  let o1 = Some(Map::from_array([(1, 10), (2, 20), (1, 30)]))
+  let n2 = match o1 {
+    Some(m) => m.length()
+    None => -1
+  }
+  let p1 = Map::from_array(([(1, 10), (2, 20), (3, 30)]))
+  let mut s1 = 0
+  for _, v in p1 {
+    s1 = s1 + v
+  }
+  let c1 = Map::from_array([(5, 1), (6, 2)]).copy()
+  let xs = [1, 2, 3]
+  let _ = xs.pop()
+  let it = xs.iter()
+  let k = it.count()
+  let mc : Map[Int, Int] = Map::new(capacity=4)
+  mc[1] = 1
+  ints([n1, v1, n2, s1, c1.length(), k, mc.length()])
+}
+
 pub fn run_all() -> String {
-  "F1:" + run_1() + "\nF2:" + run_2() + "\nF3:" + run_3() + "\nF4:" + run_4() + "\nF5:" + run_5() + "\nF6:" + run_6()
+  "F1:" + run_1() + "\nF2:" + run_2() + "\nF3:" + run_3() + "\nF4:" + run_4() + "\nF5:" + run_5() + "\nF6:" + run_6() + "\nF7:" + run_7()
 }
 
 pub fn trap_div_overflow() -> Int {
@@ -377,6 +406,102 @@ pub fn write_after_push() -> Array[Int] {
   xs.push(4)
   xs[0] = 9
   it.to_array()
+}
+'''
+
+NEG_REVIEW_MBT = r'''
+fn sort_with(xs : Array[Int], key : (Int) -> Int) -> Unit {
+  xs.sort_by_key(key)
+}
+
+pub fn opaque_key() -> Int {
+  let a = [2, 1]
+  sort_with(a, fn(x) { a.push(7); x })
+  a[0]
+}
+
+pub fn chain_callback_pop() -> Int {
+  let xs = [1, 2, 3]
+  let out = xs.iter().map(fn(x) { if x == 1 { let _ = xs.pop() }; x }).to_array()
+  out.length()
+}
+
+pub fn alias_pop() -> Int {
+  let xs = [1, 2, 3]
+  let ys = xs
+  let it = xs.iter()
+  let _ = ys.pop()
+  it.to_array().length()
+}
+
+priv struct Box {
+  items : Array[Int]
+}
+
+fn Box::clear_me(self : Box) -> Unit {
+  self.items.clear()
+}
+
+pub fn method_clear() -> Int {
+  let b : Box = { items: [1, 2, 3] }
+  let it = b.items.iter()
+  b.clear_me()
+  it.to_array().length()
+}
+
+fn mutate(xs : Array[Int]) -> Unit {
+  let _ = xs.pop()
+}
+
+pub fn field_arg() -> Int {
+  let b : Box = { items: [1, 2, 3] }
+  let it = b.items.iter()
+  mutate(b.items)
+  it.to_array().length()
+}
+
+pub fn lazy_escape() -> Int {
+  let xs = [1, 2, 3]
+  let it = xs.iter()
+  let m = it.map(fn(x) { x })
+  let _ = xs.pop()
+  m.count()
+}
+
+fn trim(xs : Array[Int]) -> Unit {
+  xs.shrink_to_fit()
+}
+
+pub fn shrink_from_caller() -> Int {
+  let xs : Array[Int] = Array::new(capacity=8)
+  xs.push(1)
+  xs.push(2)
+  xs.push(3)
+  let mut s = 0
+  for x in xs {
+    s = s + x
+    if x == 1 {
+      trim(xs)
+      xs[1] = 9
+    }
+  }
+  s
+}
+
+pub fn shrink_block_header(flag : Bool) -> Int {
+  let xs = [1, 2, 3]
+  let ys = [4]
+  let mut s = 0
+  for x in if flag { xs } else { ys } {
+    s = s + x
+    xs.shrink_to_fit()
+  }
+  s
+}
+
+pub fn paren_pipe() -> Int {
+  let m : Map[Int, Int] = ([(1, 10), (2, 20), (3, 30)]) |> Map::from_array
+  m.length()
 }
 '''
 
@@ -484,7 +609,8 @@ def main():
             "F3:1=30,2=50,3=40|9=3,8=2|4=16,5=25,6=36|7=70,6=60|arr,arr,cap|5=3,4=2|0|1=30,2=20\n"
             "F4:(1,2)=30,(0,0)=40,(2,1)=50|30|true|(1,1)=c,(1,2)=b|2,Some(3)|2000,2001000,0\n"
             "F5:(8,2,1,9)|(2,9,9)|(8,0,3)|1,4,5,6|1|15,5\n"
-            "F6:|Some(1)|2,3||10,20,30|1,2,3|2"
+            "F6:|Some(1)|2,3||10,20,30|1,2,3|2\n"
+            "F7:2,30,2,60,2,2,1"
         )
         assert moon_out == expected, f"Moon reference drifted:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}"
         assert pion_native == moon_out and pion_wasm == moon_out, (
@@ -509,6 +635,12 @@ def main():
                        ["inside a `for .. in` loop body", "inside a callback passed to", "keeps an `Array::iter()`"])
         expect_blocked(bin_path, args.pionc, md, work, "negiter", NEG_ITER_MBT, "MBT2PION_ARRAY_ITER_MUTATION",
                        ["`xs.pop(..)` runs while it is kept", "appended to and written in place"])
+        expect_blocked(bin_path, args.pionc, md, work, "negreview", NEG_REVIEW_MBT, "MBT2PION_ARRAY_ITER_MUTATION",
+                       ["`Array::sort_by_key` with a key that is not a closure literal",
+                        "inside the iterator chain's callbacks", "`ys.pop(..)` runs while it is kept",
+                        "may change it while it is kept", "is passed to `mutate(..)`",
+                        "the iterator `it` leaves its expression", "MBT2PION_ARRAY_SHRINK_ITER",
+                        "piped into `Map::from_array`"])
         expect_blocked(bin_path, args.pionc, md, work, "negmap", NEG_MAP_MBT, "MBT2PION_UNSUPPORTED_SYNTAX",
                        ["`Map(arr, capacity=...)` with a capacity expression that may run code"])
 
