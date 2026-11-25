@@ -361,7 +361,9 @@ fn qbe_is_niche_enum_decl(einfo : EnumInfo) -> Bool {
   if einfo.decl.variants.length() != 2 {
     return false
   }
-  false
+  let n0 = einfo.decl.variants[0].fields.length()
+  let n1 = einfo.decl.variants[1].fields.length()
+  (n0 == 0 && n1 > 0) || (n1 == 0 && n0 > 0)
 }
 
 ///|
@@ -17959,7 +17961,7 @@ enum QbeOptResPodKind {
 fn qbe_pure_scalar_pod_enum_info(g : QbeGen, raw_ty : Ty) -> Option[(EnumInfo, Int)] {
   let ty = subst_ty(raw_ty, g.cur_type_subst)
   let layout = qbe_enum_layout(g, ty)
-  if layout.is_unit_only || layout.is_niche {
+  if layout.is_unit_only {
     return None
   }
   match ty {
@@ -17998,7 +18000,7 @@ fn qbe_pure_scalar_pod_enum_info(g : QbeGen, raw_ty : Ty) -> Option[(EnumInfo, I
             }
             vi = vi + 1
           }
-          Some((einfo, 1 + max_payload))
+          Some((einfo, if layout.is_niche { max_payload } else { 1 + max_payload }))
         }
         None => None
       }
@@ -18044,7 +18046,44 @@ fn qbe_alloc_immortal_stack_buf(
 
 ///|
 fn qbe_alloc_immortal_enum_stack_buf(g : QbeGen, payload_bytes : Int) -> String {
-  qbe_alloc_immortal_stack_buf(g, payload_bytes, 5)
+  // Reserve 8 bytes immediately before the 24-byte PionHeader (`body - 32`) so
+  // null-niche POD enums can store their runtime pointer (`0` or `body`) alongside
+  // the immortal stack buffer without altering `QbeScalarOptRes` or caller ABIs.
+  let raw = qbe_tmp(g)
+  let total = 32 + payload_bytes
+  g.fn_allocs.write_string("    " + raw + " =l alloc8 " + total.to_string() + "\n")
+  g.fn_allocs.write_string("    storel 0, " + raw + "\n")
+  let h0 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + h0 + " =l add " + raw + ", 8\n")
+  g.fn_allocs.write_string("    storel 0, " + h0 + "\n")
+  let p8 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p8 + " =l add " + raw + ", 16\n")
+  g.fn_allocs.write_string("    storew 1, " + p8 + "\n")
+  let p12 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p12 + " =l add " + raw + ", 20\n")
+  g.fn_allocs.write_string("    storeh 5, " + p12 + "\n")
+  let p14 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p14 + " =l add " + raw + ", 22\n")
+  g.fn_allocs.write_string("    storeh 11, " + p14 + "\n")
+  let p16 = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + p16 + " =l add " + raw + ", 24\n")
+  g.fn_allocs.write_string("    storel 0, " + p16 + "\n")
+  let body = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + body + " =l add " + raw + ", 32\n")
+  body
+}
+
+///|
+fn qbe_pod_buf_val(g : QbeGen, val_slot : String, ty : Ty) -> String {
+  if qbe_is_niche_enum(g, ty) {
+    let pslot = qbe_tmp(g)
+    let r = qbe_tmp(g)
+    qbe_emit(g, pslot + " =l sub " + val_slot + ", 32")
+    qbe_emit(g, r + " =l loadl " + pslot)
+    r
+  } else {
+    val_slot
+  }
 }
 
 ///|
@@ -18057,6 +18096,48 @@ fn qbe_emit_copy_pod_enum_slots(
   einfo : EnumInfo,
 ) -> Unit {
   let layout = qbe_enum_layout_for_info(einfo)
+  if layout.is_niche {
+    let pslot = qbe_tmp(g)
+    qbe_emit(g, pslot + " =l sub " + dst_p + ", 32")
+    let nz = qbe_tmp(g)
+    let l_pay = qbe_lbl(g, "cpe_hit")
+    let l_null = qbe_lbl(g, "cpe_nnull")
+    let l_done = qbe_lbl(g, "cpe_ndone")
+    qbe_emit(g, nz + " =w cnel " + src_p + ", 0")
+    qbe_emit_term(g, "jnz " + nz + ", " + l_pay + ", " + l_null)
+    qbe_emit_lbl(g, l_null)
+    qbe_emit(g, "storel 0, " + pslot)
+    qbe_emit_term(g, "jmp " + l_done)
+    qbe_emit_lbl(g, l_pay)
+    let nf = einfo.variants[layout.payload_tag].field_tys.length()
+    let mut fi = 0
+    while fi < nf {
+      let off = layout.payload_offset + fi * 8
+      let sp_i = if off == 0 {
+        src_p
+      } else {
+        let t = qbe_tmp(g)
+        qbe_emit(g, t + " =l add " + src_p + ", " + off.to_string())
+        t
+      }
+      let dp_i = if off == 0 {
+        dst_p
+      } else {
+        let t = qbe_tmp(g)
+        qbe_emit(g, t + " =l add " + dst_p + ", " + off.to_string())
+        t
+      }
+      let fv = qbe_tmp(g)
+      qbe_emit(g, fv + " =l loadl " + sp_i)
+      qbe_emit(g, "storel " + fv + ", " + dp_i)
+      fi = fi + 1
+    }
+    qbe_emit(g, "storel " + dst_p + ", " + pslot)
+    qbe_emit_term(g, "jmp " + l_done)
+    qbe_emit_lbl(g, l_done)
+    g.block_immut_fields = Map([])
+    return
+  }
   let tag_l = qbe_tmp(g)
   qbe_emit(g, tag_l + " =l loadl " + src_p)
   qbe_emit(g, "storel " + tag_l + ", " + dst_p)
@@ -18126,22 +18207,93 @@ fn qbe_resolve_pod_enum_ctor(
     _ => return None
   }
   if cand_en != "" {
-    let matches_en = cand_en == enum_name ||
-      (g.mono_pkg != "" && g.mono_pkg + "::" + cand_en == enum_name) ||
-      (g.mono_pkg != "" && cand_en == g.mono_pkg + "::" + enum_name)
-    if !matches_en {
-      let qp = split_qual_name(enum_name)
-      if qp.name != cand_en {
-        return None
+    let cqp = split_qual_name(cand_en)
+    if cqp.prefix != "" {
+      // 3-part path like `pkg::E::Val` or `alias::E::Val`: resolve `cqp.prefix` in scope
+      // and verify canonical `ipkg.name + "::" + cqp.name == enum_name` (and not a struct).
+      match qbe_resolve_pkg_in_scope(g, cqp.prefix) {
+        Some(ipkg) => {
+          if ipkg.tc.structs.contains(cqp.name) || !ipkg.tc.enums.contains(cqp.name) {
+            return None
+          }
+          if ipkg.name + "::" + cqp.name != enum_name {
+            return None
+          }
+        }
+        None => return None
+      }
+    } else {
+      // 2-part path like `E::Val`: reject if `cand_en` is an imported package or alias in scope
+      // (e.g. `import "maker" as E; E::Val(7)` calls `maker::Val`, not `model::E::Val`).
+      match qbe_resolve_pkg_in_scope(g, cand_en) {
+        Some(_) => return None
+        None => ()
+      }
+      if g.mono_pkg != "" {
+        match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+          Some(mpkg) => {
+            if mpkg.tc.structs.contains(cand_en) || !mpkg.tc.enums.contains(cand_en) {
+              return None
+            }
+            if mpkg.name + "::" + cand_en != enum_name &&
+              g.mono_pkg + "::" + cand_en != enum_name {
+              return None
+            }
+          }
+          None => return None
+        }
+      } else {
+        if g.tc.structs.contains(cand_en) || !g.tc.enums.contains(cand_en) {
+          return None
+        }
+        if cand_en != enum_name {
+          return None
+        }
       }
     }
   } else {
     match e {
-      EIdent(vn, _) | ECall(EIdent(vn, _), _, _) =>
+      EIdent(vn, _) => {
         match qbe_lookup_local(g, vn) {
           Some(_) => return None
           None => ()
         }
+        if qbe_has_user_callee(g, vn) {
+          return None
+        }
+        if g.mono_pkg != "" {
+          match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+            Some(mpkg) =>
+              if mpkg.tc.consts.contains(vn) {
+                return None
+              }
+            None => ()
+          }
+        } else if g.tc.consts.contains(vn) {
+          return None
+        }
+      }
+      ECall(EIdent(vn, _), _, sp) => {
+        match qbe_lookup_local(g, vn) {
+          Some(_) => return None
+          None => ()
+        }
+        if qbe_has_user_callee(g, vn) {
+          return None
+        }
+        let def_tc = if g.mono_pkg != "" {
+          match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+            Some(mpkg) => mpkg.tc
+            None => return None
+          }
+        } else {
+          g.tc
+        }
+        if def_tc.consts.contains(vn) ||
+          !def_tc.resolved_method_calls.contains("ctor:" + span_key(sp)) {
+          return None
+        }
+      }
       _ => ()
     }
   }
@@ -18292,14 +18444,37 @@ fn qbe_emit_tail_pod_enum_into_buf(
             fi = fi + 1
           }
           let layout = qbe_enum_layout_for_info(einfo)
-          qbe_emit(g, "storel " + tag.to_string() + ", " + buf)
-          fi = 0
-          while fi < arg_regs.length() {
-            let off = layout.payload_offset + fi * 8
-            let addr = qbe_tmp(g)
-            qbe_emit(g, addr + " =l add " + buf + ", " + off.to_string())
-            qbe_store_heap_slot(g, arg_regs[fi], addr, ftys[fi])
-            fi = fi + 1
+          if layout.is_niche {
+            let pslot = qbe_tmp(g)
+            qbe_emit(g, pslot + " =l sub " + buf + ", 32")
+            if tag == layout.null_tag {
+              qbe_emit(g, "storel 0, " + pslot)
+            } else {
+              fi = 0
+              while fi < arg_regs.length() {
+                let off = layout.payload_offset + fi * 8
+                let addr = if off == 0 {
+                  buf
+                } else {
+                  let t = qbe_tmp(g)
+                  qbe_emit(g, t + " =l add " + buf + ", " + off.to_string())
+                  t
+                }
+                qbe_store_heap_slot(g, arg_regs[fi], addr, ftys[fi])
+                fi = fi + 1
+              }
+              qbe_emit(g, "storel " + buf + ", " + pslot)
+            }
+          } else {
+            qbe_emit(g, "storel " + tag.to_string() + ", " + buf)
+            fi = 0
+            while fi < arg_regs.length() {
+              let off = layout.payload_offset + fi * 8
+              let addr = qbe_tmp(g)
+              qbe_emit(g, addr + " =l add " + buf + ", " + off.to_string())
+              qbe_store_heap_slot(g, arg_regs[fi], addr, ftys[fi])
+              fi = fi + 1
+            }
           }
         }
         None => {
@@ -19361,7 +19536,15 @@ fn qbe_emit_tail_opt_res_forward_call(
             }
           Some(PodEnum(einfo, _, nslots)) =>
             if inner.val_is_pod_buf {
-              qbe_emit_copy_pod_slots(g, inner.val_slot, val_slot, nslots)
+              if qbe_enum_layout_for_info(einfo).is_niche {
+                let pslot = qbe_tmp(g)
+                let src_p = qbe_tmp(g)
+                qbe_emit(g, pslot + " =l sub " + inner.val_slot + ", 32")
+                qbe_emit(g, src_p + " =l loadl " + pslot)
+                qbe_emit_copy_pod_enum_slots(g, src_p, val_slot, einfo)
+              } else {
+                qbe_emit_copy_pod_slots(g, inner.val_slot, val_slot, nslots)
+              }
             } else {
               let src_p = qbe_tmp(g)
               qbe_emit(g, src_p + " =l loadl " + inner.val_slot)
@@ -19625,7 +19808,8 @@ fn qbe_emit_tail_opt_res_expr_into_slots(
               if sc.val_is_pod_buf {
                 if ok_bind != "" {
                   let vloc = qbe_define_local(g, ok_bind, ok_ty, false)
-                  qbe_emit(g, "storel " + sc.val_slot + ", " + vloc.slot)
+                  let pv = qbe_pod_buf_val(g, sc.val_slot, ok_ty)
+                  qbe_emit(g, "storel " + pv + ", " + vloc.slot)
                 }
               } else {
                 let v_ok = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
@@ -20971,14 +21155,14 @@ fn qbe_try_emit_scalar_opt_res_nested_match(
     let subpat = ok_subpats[oi]
     let l_next = qbe_lbl(g, "scmn_onext")
     let cur_ok = if sc.val_is_pod_buf {
-      sc.val_slot
+      qbe_pod_buf_val(g, sc.val_slot, ok_ty)
     } else {
       qbe_load_local_slot(g, ok_loc_slot, ok_ty)
     }
     qbe_emit_pat_test(g, subpat, cur_ok, ok_ty, l_next)
     qbe_scope_push(g)
     let bind_ok = if sc.val_is_pod_buf {
-      sc.val_slot
+      qbe_pod_buf_val(g, sc.val_slot, ok_ty)
     } else {
       qbe_load_local_slot(g, ok_loc_slot, ok_ty)
     }
@@ -20986,7 +21170,7 @@ fn qbe_try_emit_scalar_opt_res_nested_match(
       match subpat {
         PIdent(b, _) => {
           let vloc = qbe_define_local(g, b, ok_ty, false)
-          qbe_emit(g, "storel " + sc.val_slot + ", " + vloc.slot)
+          qbe_emit(g, "storel " + bind_ok + ", " + vloc.slot)
         }
         _ => qbe_emit_pat_bind(g, subpat, bind_ok, ok_ty, false, arm.body)
       }
@@ -21229,7 +21413,8 @@ fn qbe_try_emit_scalar_opt_res_match(
   if sc.val_is_pod_buf {
     if ok_bind != "" {
       let vloc = qbe_define_local(g, ok_bind, ok_ty, false)
-      qbe_emit(g, "storel " + sc.val_slot + ", " + vloc.slot)
+      let pv = qbe_pod_buf_val(g, sc.val_slot, ok_ty)
+      qbe_emit(g, "storel " + pv + ", " + vloc.slot)
     }
   } else {
     let v_ok = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
@@ -21709,7 +21894,8 @@ fn qbe_try_emit_scalar_is_branch(
     if sp.bind_name != "" {
       if sc.val_is_pod_buf {
         let loc = qbe_define_local(g, sp.bind_name, ok_ty, false)
-        qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+        let pv = qbe_pod_buf_val(g, sc.val_slot, ok_ty)
+        qbe_emit(g, "storel " + pv + ", " + loc.slot)
       } else {
         let v_ok = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
         let loc = qbe_define_local(g, sp.bind_name, ok_ty, true)
@@ -47387,7 +47573,8 @@ fn qbe_try_emit_stack_pod_let(
                       qbe_clear_shadowed_local_meta(g, bname)
                       if sc.val_is_pod_buf {
                         let loc = qbe_define_local(g, bname, final_ty, false)
-                        qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+                        let pv = qbe_pod_buf_val(g, sc.val_slot, final_ty)
+                        qbe_emit(g, "storel " + pv + ", " + loc.slot)
                       } else {
                         let payload = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
                         let loc = qbe_define_local(g, bname, final_ty, true)
@@ -47412,7 +47599,8 @@ fn qbe_try_emit_stack_pod_let(
                       qbe_clear_shadowed_local_meta(g, bname)
                       if sc.val_is_pod_buf {
                         let loc = qbe_define_local(g, bname, final_ty, false)
-                        qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+                        let pv = qbe_pod_buf_val(g, sc.val_slot, final_ty)
+                        qbe_emit(g, "storel " + pv + ", " + loc.slot)
                       } else {
                         let payload = qbe_load_heap_slot(g, sc.val_slot, inner_ty)
                         let loc = qbe_define_local(g, bname, final_ty, true)
@@ -47439,7 +47627,8 @@ fn qbe_try_emit_stack_pod_let(
             if !g.block_term {
               qbe_clear_shadowed_local_meta(g, bname)
               let loc = qbe_define_local(g, bname, final_ty, false)
-              qbe_emit(g, "storel " + stk + ", " + loc.slot)
+              let pv = qbe_pod_buf_val(g, stk, final_ty)
+              qbe_emit(g, "storel " + pv + ", " + loc.slot)
             }
             return true
           }
@@ -47825,7 +48014,8 @@ fn qbe_try_emit_stack_pod_let(
               qbe_clear_shadowed_local_meta(g, bname)
               if sc.val_is_pod_buf {
                 let loc = qbe_define_local(g, bname, final_ty, false)
-                qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+                let pv = qbe_pod_buf_val(g, sc.val_slot, final_ty)
+                qbe_emit(g, "storel " + pv + ", " + loc.slot)
               } else {
                 let payload = qbe_load_heap_slot(g, sc.val_slot, ok_ty)
                 let loc = qbe_define_local(g, bname, final_ty, true)
@@ -47850,7 +48040,8 @@ fn qbe_try_emit_stack_pod_let(
               qbe_clear_shadowed_local_meta(g, bname)
               if sc.val_is_pod_buf {
                 let loc = qbe_define_local(g, bname, final_ty, false)
-                qbe_emit(g, "storel " + sc.val_slot + ", " + loc.slot)
+                let pv = qbe_pod_buf_val(g, sc.val_slot, final_ty)
+                qbe_emit(g, "storel " + pv + ", " + loc.slot)
               } else {
                 let payload = qbe_load_heap_slot(g, sc.val_slot, inner_ty)
                 let loc = qbe_define_local(g, bname, final_ty, true)
