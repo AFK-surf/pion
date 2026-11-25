@@ -16,7 +16,7 @@ struct RMap {
 };
 
 enum {
-	NPm = 64,      /* max copies in a parallel move */
+	NPm = 64,      /* initial capacity of a parallel move */
 };
 
 static bits regu;      /* registers used */
@@ -25,7 +25,7 @@ static Mem *mem;       /* function mem references */
 static struct {
 	Ref src, dst;
 	int cls;
-} pm[NPm];             /* parallel move constructed */
+} *pm;                 /* parallel move constructed (grows) */
 static int npm;        /* size of pm */
 static int loop;       /* current loop level */
 
@@ -194,8 +194,12 @@ mdump(RMap *m)
 static void
 pmadd(Ref src, Ref dst, int k)
 {
-	if (npm == NPm)
-		die("no more pm slots");
+	/* An edge can carry more than NPm live values (e.g. a loop
+	 * rotating 70 locals): grow instead of dying.
+	 */
+	if (!pm)
+		pm = vnew(NPm, sizeof pm[0], PHeap);
+	vgrow(&pm, npm+1);
 	pm[npm].src = src;
 	pm[npm].dst = dst;
 	pm[npm].cls = k;
@@ -253,10 +257,12 @@ pmrec(enum PMStat *status, int i, int *k)
 static void
 pmgen()
 {
+	static enum PMStat *status;
 	int i;
-	enum PMStat status[NPm];
 
-	assert(npm <= NPm);
+	if (!status)
+		status = vnew(NPm, sizeof status[0], PHeap);
+	vgrow(&status, npm);
 	memset(status, 0, (size_t)npm * sizeof status[0]);
 	assert(!npm || status[npm-1] == ToMove);
 	for (i=0; i<npm; i++)

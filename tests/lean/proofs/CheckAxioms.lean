@@ -32,6 +32,7 @@ import PionProofs.QbeAmd64FpRhsLoadFold
 import PionProofs.QbeWin64XmmCalleeSaved
 import PionProofs.QbeAmd64GuardedExchange
 import PionProofs.QbeArm64GuardedDispatch
+import PionProofs.QbeFrontendColdSpeedOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -772,3 +773,16 @@ import PionProofs.QbeArm64GuardedDispatch
 #print axioms PionQbeArm64GuardedDispatch.fused_steps
 #print axioms PionQbeArm64GuardedDispatch.walk_fused
 #print axioms PionQbeArm64GuardedDispatch.replicate_correct
+#print axioms PionFrontendColdSpeedOpts.slotLinks_union_singleton
+#print axioms PionFrontendColdSpeedOpts.slotLinks_step
+#print axioms PionFrontendColdSpeedOpts.slotLinks_stable_order
+#print axioms PionFrontendColdSpeedOpts.slotLinks_emitted_bytes
+#print axioms PionFrontendColdSpeedOpts.planReuse_resolve_eq_keeps_resolved
+#print axioms PionFrontendColdSpeedOpts.planReuse_checked_plan
+#print axioms PionFrontendColdSpeedOpts.constPlan_scan_project
+#print axioms PionFrontendColdSpeedOpts.scan_mem
+#print axioms PionFrontendColdSpeedOpts.constPlan_empty_calls
+#print axioms PionFrontendColdSpeedOpts.constPlan_finish_project
+#print axioms PionFrontendColdSpeedOpts.constPlan_guarded_fast_path
+#print axioms PionFrontendColdSpeedOpts.loopFp_same_iterations_and_fallback
+#print axioms PionFrontendColdSpeedOpts.loopFp_same_length

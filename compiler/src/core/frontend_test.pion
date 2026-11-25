@@ -15092,3 +15092,377 @@ test "pkg::Variant shorthand pattern matches enum, disambiguates shared variants
     "flex::Secret on private enum must fail with E_PRIVATE_SYMBOL: " + j_priv,
   )
 }
+
+///|
+fn ott_strs_eq(a : Array[String], b : Array[String]) -> Bool {
+  if a.length() != b.length() {
+    return false
+  }
+  let mut i = 0
+  while i < a.length() {
+    if a[i] != b[i] {
+      return false
+    }
+    i = i + 1
+  }
+  true
+}
+
+///|
+fn ott_plan_eq(a : ConstInitPlan, b : ConstInitPlan) -> Bool {
+  ott_strs_eq(a.order, b.order) &&
+  a.has_cycle == b.has_cycle &&
+  ott_strs_eq(a.cycle_path, b.cycle_path) &&
+  a.plan_hash == b.plan_hash &&
+  a.has_ambiguous_method == b.has_ambiguous_method
+}
+
+///|
+fn ott_plan_str(p : ConstInitPlan) -> String {
+  "order=" + join_strs(p.order, ",") + " cycle=" + p.has_cycle.to_string() +
+  " path=" + join_strs(p.cycle_path, ",") + " hash=" + p.plan_hash +
+  " ambig=" + p.has_ambiguous_method.to_string()
+}
+
+///|
+fn ott_resolved_sigs(c : CheckedPackage) -> Array[String] {
+  let sigs : Array[String] = []
+  let mut fi = 0
+  while fi < c.pkg.files.length() {
+    sigs.push(emit_file_sig_entries_resolved(c.pkg.files[fi], c.tc.resolved_method_calls))
+    fi = fi + 1
+  }
+  sigs
+}
+
+///|
+fn ott_takes_rows(sigs : Array[String]) -> Bool {
+  match sig_const_rows_without_calls(sigs) {
+    Some(_) => true
+    None => false
+  }
+}
+
+///|
+/// Checks one package: `compute_const_init_plan_from_pkg_tc` (fast `#cdep` rows
+/// or fallback) must equal the full planner over every resolved summary line.
+fn ott_check_case(
+  name : String,
+  paths : Array[String],
+  sources : Array[String],
+  want_rows : Bool,
+  want_order : Array[String],
+  want_codes : Array[String],
+) -> Unit {
+  let c = check_source_files_full(name, paths, sources)
+  let json = check_result_to_json(c.diagnostics)
+  if want_codes.length() == 0 {
+    assert_true(c.diagnostics.length() == 0, name + ": " + json)
+  }
+  let mut wi = 0
+  while wi < want_codes.length() {
+    assert_true(json.contains(want_codes[wi]), name + " must report " + want_codes[wi] + ": " + json)
+    wi = wi + 1
+  }
+  let sigs = ott_resolved_sigs(c)
+  assert_true(ott_takes_rows(sigs) == want_rows, name + ": #cdep fast path taken != " + want_rows.to_string())
+  let got = compute_const_init_plan_from_pkg_tc(c.pkg, c.tc)
+  let full = compute_const_init_plan_from_sigs(sigs)
+  assert_true(ott_plan_eq(got, full), name + ": " + ott_plan_str(got) + " vs full " + ott_plan_str(full))
+  assert_true(ott_strs_eq(got.order, want_order), name + ": order " + join_strs(got.order, ","))
+}
+
+///|
+test "opt_t: front_const_rows fast #cdep rows == full planner (order, cycle, hash, ambiguity)" {
+  // Pure direct constant reads across two files: fast path, Kahn tie break by source index.
+  ott_check_case(
+    "ott_direct",
+    ["a.pion", "b.pion"],
+    [
+      "let A : Int = B + C\nlet C : Int = B * 2\npub fn main() -> Int { A }\n",
+      "let B : Int = 1\nlet D : Int = A - C\n",
+    ],
+    true,
+    ["B", "C", "A", "D"],
+    [],
+  )
+  // A call in an initializer: fallback, the callee's read of B orders B first.
+  ott_check_case(
+    "ott_call",
+    ["main.pion"],
+    ["fn f() -> Int { B }\nlet A : Int = f()\nlet B : Int = 2\npub fn main() -> Int { A }\n"],
+    false,
+    ["B", "A"],
+    [],
+  )
+  // Non-ASCII string literals never reach #cdep rows (identifiers are ASCII).
+  ott_check_case(
+    "ott_utf8",
+    ["main.pion"],
+    ["let S : String = \"h\u{e9}llo\" + T\nlet T : String = \"\u{fc}\u{4e2d}\"\npub fn main() -> Int { S.length() }\n"],
+    true,
+    ["T", "S"],
+    [],
+  )
+  // Direct cycle: fast path, same E_CONST_CYCLE path.
+  ott_check_case(
+    "ott_cycle_direct",
+    ["main.pion"],
+    ["let A : Int = B + 1\nlet B : Int = A + 1\npub fn main() -> Int { 0 }\n"],
+    true,
+    ["A", "B"],
+    ["E_CONST_CYCLE"],
+  )
+  // Cross-file cycle through a function: fallback.
+  ott_check_case(
+    "ott_cycle_call",
+    ["a.pion", "b.pion"],
+    ["let A : Int = g()\npub fn main() -> Int { 0 }\n", "fn g() -> Int { B }\nlet B : Int = A\n"],
+    false,
+    ["A", "B"],
+    ["E_CONST_CYCLE"],
+  )
+  // No constants at all.
+  ott_check_case("ott_none", ["main.pion"], ["pub fn main() -> Int { 0 }\n"], true, [], [])
+  // A type error next to the constant plan: diagnostics keep both.
+  ott_check_case(
+    "ott_type_error",
+    ["main.pion"],
+    ["let A : Int = B\nlet B : Int = \"x\"\npub fn main() -> Int { A }\n"],
+    true,
+    ["B", "A"],
+    ["E_TYPE_MISMATCH"],
+  )
+  // `call?:` ambiguity is a call descriptor: fallback keeps has_ambiguous_method decisions.
+  ott_check_case(
+    "ott_ambig",
+    ["main.pion"],
+    [
+      "fn f0() -> Int { 1 }\n" +
+      "fn go(f : () -> Int) -> Int { let B = f; B() }\n" +
+      "let A : Int = go(f0)\n" +
+      "let B : Int = f0()\n" +
+      "pub fn main() -> Int { A + B }\n",
+    ],
+    false,
+    ["A", "B"],
+    [],
+  )
+}
+
+///|
+test "opt_t: front_const_rows row filter shapes and first-record semantics" {
+  // Accepted: only #cdep rows survive, in order; the planner keeps the first A (file 1).
+  let sigs = [
+    "fn f() -> Int\n#cdep A|B,X|\n#fdep f|A|\nstruct S { a : Int }\n",
+    "#cdep B||\n#cdep A|Z|\n#cdep Z|A|\n",
+  ]
+  let rows = match sig_const_rows_without_calls(sigs) {
+    Some(r) => r
+    None => abort("rows must be accepted")
+  }
+  assert_true(ott_strs_eq(rows, ["#cdep A|B,X|", "#cdep B||", "#cdep A|Z|", "#cdep Z|A|"]), join_strs(rows, ";"))
+  let fast = compute_const_init_plan_from_sigs(rows)
+  let full = compute_const_init_plan_from_sigs(sigs)
+  assert_true(ott_plan_eq(fast, full), ott_plan_str(fast) + " vs " + ott_plan_str(full))
+  assert_true(ott_strs_eq(fast.order, ["B", "A", "Z"]), ott_plan_str(fast))
+  // Rejected shapes fall back to the full planner.
+  assert_true(!ott_takes_rows(["#cdep A|B|f\n"]), "call column")
+  assert_true(!ott_takes_rows(["#cdep A|B,C|f,g\n#cdep B||\n"]), "calls")
+  assert_true(!ott_takes_rows(["#cdep B||\n#cdep A|B\n"]), "missing second separator")
+  assert_true(!ott_takes_rows(["#cdep |B|\n"]), "empty name")
+  assert_true(!ott_takes_rows(["#cdep A\n"]), "no separator")
+  assert_true(!ott_takes_rows(["#cdep A|B||\n"]), "extra separator")
+  assert_true(!ott_takes_rows(["#cdep \u{c4}|B|\n"]), "non-ASCII name")
+  assert_true(!ott_takes_rows(["#cdep A|B\u{0D}|\n"]), "control byte")
+  // No rows / no constants: accepted with zero rows, empty plan either way.
+  let empty = compute_const_init_plan_from_sigs(["fn f() -> Int\n"])
+  assert_true(ott_takes_rows(["fn f() -> Int\n"]) && empty.plan_hash == "" && empty.order.length() == 0, ott_plan_str(empty))
+}
+
+///|
+test "opt_t: front_plan_once cold preparation reuses the checked plan" {
+  let a = "let A : Int = B + f()\npub fn main() -> Int { A + C }\n"
+  let b = "fn f() -> Int { C }\nlet C : Int = 3\nlet B : Int = C * 2\n"
+  let prep = match cli_prepare_qbe_units("ott_prep", ["a.pion", "b.pion"], [a, b]) {
+    Ok(p) => p
+    Err(e) => abort(e)
+  }
+  let again = compute_const_init_plan_from_pkg_tc(prep.pkg, prep.tc)
+  assert_true(ott_strs_eq(prep.const_init_order, again.order), join_strs(prep.const_init_order, ","))
+  assert_true(ott_strs_eq(prep.const_init_order, ["C", "B", "A"]), join_strs(prep.const_init_order, ","))
+  let sig0 = emit_file_sig_entries(prep.pkg.files[0])
+  let sig1 = emit_file_sig_entries(prep.pkg.files[1])
+  let summary = summarize_file_sigs("ott_prep", [sig0, sig1])
+  assert_eq(summary.sigs_hash, prep.sigs_hash)
+  // No top-level constant: the recorded plan is the planner's empty plan.
+  let nc = "fn helper(x : Int) -> Int { x * 3 }\npub fn main() -> Int { helper(2) }\n"
+  let prep0 = match cli_prepare_qbe_units("ott_prep_none", ["main.pion"], [nc]) {
+    Ok(p) => p
+    Err(e) => abort(e)
+  }
+  let again0 = compute_const_init_plan_from_pkg_tc(prep0.pkg, prep0.tc)
+  assert_true(
+    again0.order.length() == 0 && !again0.has_cycle && again0.cycle_path.length() == 0 &&
+    again0.plan_hash == "" && !again0.has_ambiguous_method && prep0.const_init_order.length() == 0,
+    ott_plan_str(again0),
+  )
+  let summary0 = summarize_file_sigs("ott_prep_none", [emit_file_sig_entries(prep0.pkg.files[0])])
+  assert_eq(summary0.sigs_hash, prep0.sigs_hash)
+  // The full check itself records exactly that plan (not left to the
+  // recompute fallback); a selective check records nothing.
+  let nc_pkg = Package::{ name: "ott_rec_none", files: [parse_source("main.pion", nc).file] }
+  let rec_full : Array[ConstInitPlan] = []
+  let _ = check_package_with_imports_mapped_plan(nc_pkg, [], [], [], [], false, false, Some(rec_full))
+  assert_true(rec_full.length() == 1, "full check records " + rec_full.length().to_string() + " plans")
+  let c_nc = check_source_files_full("ott_rec_none", ["main.pion"], [nc])
+  assert_true(
+    ott_plan_eq(rec_full[0], compute_const_init_plan_from_pkg_tc(c_nc.pkg, c_nc.tc)),
+    ott_plan_str(rec_full[0]),
+  )
+  let sel_pkg = Package::{ name: "ott_rec_sel", files: [parse_source("main.pion", nc).file] }
+  let rec_sel : Array[ConstInitPlan] = []
+  let _ = check_package_with_imports_mapped_plan(sel_pkg, [true], [], [], [], false, false, Some(rec_sel))
+  assert_true(rec_sel.length() == 0, "selective check records " + rec_sel.length().to_string() + " plans")
+  // Diagnostics still come first: cycle + type error is an Err with both codes.
+  let bad = cli_prepare_qbe_units(
+    "ott_prep_bad",
+    ["main.pion"],
+    ["let A : Int = B\nlet B : Int = A\nlet C : Int = \"x\"\npub fn main() -> Int { 0 }\n"],
+  )
+  match bad {
+    Ok(_) => abort("cycle + type error must fail")
+    Err(e) => {
+      assert_true(e.contains("E_CONST_CYCLE"), e)
+      assert_true(e.contains("E_TYPE_MISMATCH"), e)
+    }
+  }
+}
+
+///|
+/// A loop that rotates n + 1 container-holding `mut` locals by one per run
+/// (`a<n> = a<n-1>; ...; a1 = a0; a0 = [read_b]`). `sig_assign_local` copies
+/// the current `cslots` of the source local, so the new `[read_b]` cslot moves
+/// one local further per dependency pass: the fixed point needs n + 1 passes
+/// (n + 1 <= 63 converges; n >= 63 exhausts the 64-pass budget and takes
+/// `sig_fallback_dirty_outer_cslots`). `other = [read_c]` is an unrelated
+/// container: only the fallback (which unions every cslot's targets) makes
+/// `A` depend on `C`.
+fn ott_cslot_chain_src(kind : String, n : Int) -> String {
+  let sb = StringBuilder()
+  sb.write_string("fn zero() -> Int { 0 }\nfn read_b() -> Int { B }\nfn read_c() -> Int { C }\n")
+  sb.write_string("fn make_b() -> Int { 11 }\nfn make_c() -> Int { 13 }\nfn go() -> Int {\n")
+  sb.write_string("  let other = [read_c]\n")
+  let mut j = 0
+  while j <= n {
+    sb.write_string("  let mut a" + j.to_string() + " = [zero]\n")
+    j = j + 1
+  }
+  let shift = StringBuilder()
+  j = n
+  while j >= 1 {
+    shift.write_string("a" + j.to_string() + " = a" + (j - 1).to_string() + "; ")
+    j = j - 1
+  }
+  shift.write_string("a0 = [read_b]")
+  let runs = (n + 1).to_string()
+  if kind == "while" {
+    sb.write_string("  let mut i = 0\n  while i < " + runs + " { " + shift.to_string() + "; i = i + 1 }\n")
+  } else if kind == "while_is" {
+    sb.write_string("  let mut it : Option[Int] = Some(" + runs + ")\n")
+    sb.write_string(
+      "  while it is Some(m) { " + shift.to_string() + "; it = if m > 1 { Some(m - 1) } else { None } }\n",
+    )
+  } else if kind == "cfor" {
+    sb.write_string("  for i = 0; i < " + runs + "; i = i + 1 { " + shift.to_string() + " }\n")
+  } else if kind == "range" {
+    sb.write_string("  for i in 0..<" + runs + " { " + shift.to_string() + " }\n")
+  } else {
+    sb.write_string("  let xs : Array[Int] = []\n  let mut q = 0\n  while q < " + runs + " { xs.push(q); q = q + 1 }\n")
+    sb.write_string("  for x in xs { " + shift.to_string() + " }\n")
+  }
+  sb.write_string("  let f = a" + n.to_string() + "[0]\n  f() + 0 * other.length()\n}\n")
+  sb.write_string("let A : Int = go()\nlet B : Int = make_b()\nlet C : Int = make_c()\npub fn main() -> Int { A }\n")
+  sb.to_string()
+}
+
+///|
+test "opt_t: front_loop_fp multi-pass fixed points and the 64-pass fallback" {
+  let kinds = ["while", "while_is", "cfor", "range", "for_in"]
+  let mut ki = 0
+  while ki < kinds.length() {
+    let kind = kinds[ki]
+    // 6 passes: B must precede A (a shorter fixed point would miss read_b).
+    let c5 = check_source_files_full("ott_fp5_" + kind, ["main.pion"], [ott_cslot_chain_src(kind, 5)])
+    assert_true(c5.diagnostics.length() == 0, kind + "5: " + check_result_to_json(c5.diagnostics))
+    assert_true(
+      ott_strs_eq(c5.tc.const_init_order, ["B", "A", "C"]),
+      kind + "5 order " + join_strs(c5.tc.const_init_order, ","),
+    )
+    // 71 passes needed: the budget runs out, the fallback unions every cslot,
+    // so A also waits for C (read_c reaches a70 only through the fallback).
+    let c70 = check_source_files_full("ott_fp70_" + kind, ["main.pion"], [ott_cslot_chain_src(kind, 70)])
+    assert_true(c70.diagnostics.length() == 0, kind + "70: " + check_result_to_json(c70.diagnostics))
+    assert_true(
+      ott_strs_eq(c70.tc.const_init_order, ["B", "C", "A"]),
+      kind + "70 order " + join_strs(c70.tc.const_init_order, ","),
+    )
+    ki = ki + 1
+  }
+  // 41 passes (< 64) still converge exactly: no fallback over-approximation.
+  let c40 = check_source_files_full("ott_fp40", ["main.pion"], [ott_cslot_chain_src("while", 40)])
+  assert_true(
+    ott_strs_eq(c40.tc.const_init_order, ["B", "A", "C"]),
+    "while40 order " + join_strs(c40.tc.const_init_order, ","),
+  )
+  // Budget boundary: n = 62 converges on pass 63, n = 63 exhausts all 64.
+  let c62 = check_source_files_full("ott_fp62", ["main.pion"], [ott_cslot_chain_src("while", 62)])
+  assert_true(
+    ott_strs_eq(c62.tc.const_init_order, ["B", "A", "C"]),
+    "while62 order " + join_strs(c62.tc.const_init_order, ","),
+  )
+  let c63 = check_source_files_full("ott_fp63", ["main.pion"], [ott_cslot_chain_src("while", 63)])
+  assert_true(
+    ott_strs_eq(c63.tc.const_init_order, ["B", "C", "A"]),
+    "while63 order " + join_strs(c63.tc.const_init_order, ","),
+  )
+}
+
+///|
+fn ott_fmutlink_rows(src : String) -> Array[String] {
+  let pr = parse_source("dup.pion", src)
+  let rows : Array[String] = []
+  let lines = split_lines(emit_file_sig_entries(pr.file))
+  let mut li = 0
+  while li < lines.length() {
+    if starts_with_str(lines[li], "#fmutlink ") {
+      rows.push(lines[li])
+    }
+    li = li + 1
+  }
+  rows
+}
+
+///|
+test "opt_t: front_slot_seen keeps #fmutlink rows unique in first-occurrence order" {
+  let head = "fn zero() -> Int { 0 }\nfn r1() -> Int { 1 }\nfn r2() -> Int { 2 }\n" +
+    "fn i1(mut f : () -> Int) -> Unit { f = r1 }\nfn i2(mut f : () -> Int) -> Unit { f = r2 }\n" +
+    "fn go() -> Int {\n  let mut f = zero\n  let mut g = zero\n"
+  // Every link repeated (three rounds, later rounds in reverse order).
+  let dup = head +
+    "  i2(mut f)\n  i1(mut g)\n  i1(mut f)\n" +
+    "  i1(mut f)\n  i1(mut g)\n  i2(mut f)\n" +
+    "  i2(mut f)\n  i1(mut f)\n  i1(mut g)\n" +
+    "  let cb = fn() -> Int { i1(mut g); i2(mut f); f() }\n  cb() + g()\n}\n"
+  let rows = ott_fmutlink_rows(dup)
+  assert_true(
+    ott_strs_eq(
+      rows,
+      ["#fmutlink $slot_fn_go_0|i2|0", "#fmutlink $slot_fn_go_1|i1|0", "#fmutlink $slot_fn_go_0|i1|0"],
+    ),
+    join_strs(rows, ";"),
+  )
+  // Same rows as the source without the repeats.
+  let once = head + "  i2(mut f)\n  i1(mut g)\n  i1(mut f)\n  let cb = fn() -> Int { f() }\n  cb() + g()\n}\n"
+  assert_true(ott_strs_eq(rows, ott_fmutlink_rows(once)), join_strs(ott_fmutlink_rows(once), ";"))
+}
