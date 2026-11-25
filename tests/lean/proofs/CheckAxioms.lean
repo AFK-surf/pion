@@ -35,6 +35,7 @@ import PionProofs.QbeArm64GuardedDispatch
 import PionProofs.QbeFrontendColdSpeedOpts
 import PionProofs.QbeCountedArrayLength
 import PionProofs.QbeStringSpanMapEntry
+import PionProofs.QbeEcosystemUnboxFixedLen
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -812,3 +813,18 @@ import PionProofs.QbeStringSpanMapEntry
 #print axioms QbeStringSpanMapEntry.ringIndex
 #print axioms QbeStringSpanMapEntry.read_equiv
 #print axioms QbeStringSpanMapEntry.stringFreeze
+#print axioms PionQbeEcosystemUnboxFixedLen.VariantReturn.release_after_acquire
+#print axioms PionQbeEcosystemUnboxFixedLen.VariantReturn.slot_roundtrip
+#print axioms PionQbeEcosystemUnboxFixedLen.VariantReturn.all_exits
+#print axioms PionQbeEcosystemUnboxFixedLen.VariantReturn.call_equivalence
+#print axioms PionQbeEcosystemUnboxFixedLen.VariantReturn.lexical_boundary
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.untouched
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.fields_preserved
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.simulation
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.arity
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.destructure
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.shared_prefix
+#print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.alias_write
+#print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.shadow
+#print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.hoist
+#print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.run_prefix
