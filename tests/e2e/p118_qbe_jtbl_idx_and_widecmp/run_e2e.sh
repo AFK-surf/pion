@@ -144,7 +144,8 @@ python3 -E "$DIR/mk_selfcopy.py" "$TMP_DIR"
 if [ "$HT" = amd64_sysv ]; then
   for x in selfcopy wide; do
     "$CC_BIN" -c "$TMP_DIR/$x.s" -o "$TMP_DIR/$x.as.o"
-    [ -z "$(nm -u "$TMP_DIR/$x.as.o")" ] || fail "$x.s has undefined symbols"
+    undefined=$(nm -u "$TMP_DIR/$x.as.o") || fail "$x.s: nm -u failed"
+    [ -z "$undefined" ] || fail "$x.s has undefined symbols"
   done
 fi
 grep -qx 'ext_1 live 8' "$F/jtbl_expect.txt" || fail "ext_1 expectation"
