@@ -347,25 +347,60 @@ seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 	int side;
 
 	addr = *pr;
+	/* A local fixed allocation is already an FP-relative slot. Preserve
+	 * that representation for memory operations and avoid an address temp. */
+	if (rtype(addr) == RTmp && fn->tmp[addr.val].slot >= 0) {
+		*pr = SLOT(fn->tmp[addr.val].slot);
+		chuse(addr, -1, fn);
+		return 1;
+	}
 	def = blkdef(b, cur, addr, fn);
-	if (!def || def->op != Oadd || def->cls != Kl)
+	if (!def || (def->op != Oadd && def->op != Osub) || def->cls != Kl)
 		return 0;
 	a0 = def->arg[0];
 	a1 = def->arg[1];
 
-	/* Mode A: [base, #off] with ARM64 unsigned scaled offset */
+	/* Slot indices are four-byte units. Stay in the local region so the
+	 * spill-pair pass cannot mistake a user address for a private spill.
+	 * Only slot + displacement folds: slot - k would select the wrong slot. */
+	for (side = 0; def->op == Oadd && side < 2; side++) {
+		Ref local = def->arg[side], disp = def->arg[1-side];
+		if (rtype(local) != RTmp || fn->tmp[local.val].slot < 0 || rtype(disp) != RCon)
+			continue;
+		int slot = fn->tmp[local.val].slot;
+		c = &fn->con[disp.val];
+		off = c->bits.i;
+		if (c->type != CBits || off < 0 || off % 4 || off / 4 >= fn->slot-slot
+		|| off / 4 >= (1 << 28)-slot)
+			continue;
+		*pr = SLOT(slot + (int)(off/4));
+		chuse(addr, -1, fn);
+		if (fn->tmp[addr.val].nuse == 0) {
+			chuse(local, -1, fn);
+			*def = (Ins){.op = Onop};
+		}
+		return 1;
+	}
+
+	/* Mode A: unsigned scaled displacement, or a negative signed imm9. */
 	base = R;
 	c = 0;
 	if (iskltmp(a0, fn) && rtype(a1) == RCon) {
 		base = a0;
 		c = &fn->con[a1.val];
-	} else if (iskltmp(a1, fn) && rtype(a0) == RCon) {
+	} else if (def->op == Oadd && iskltmp(a1, fn) && rtype(a0) == RCon) {
 		base = a1;
 		c = &fn->con[a0.val];
 	}
 	if (c && c->type == CBits) {
 		off = c->bits.i;
-		if (off >= 0 && off <= (int64_t)4095 * sz && (off % sz) == 0) {
+		if (def->op == Osub) {
+			if (off < 1 || off > 256)
+				return 0;
+			off = -off;
+		}
+		if ((off >= 0 && off <= (int64_t)4095 * sz && off % sz == 0)
+		|| (off >= -256 && off < 0 && fn->tmp[addr.val].nuse == 1)) {
 			vgrow(&fn->mem, ++fn->nmem);
 			m = &fn->mem[fn->nmem - 1];
 			memset(m, 0, sizeof *m);
@@ -389,7 +424,7 @@ seladdr(Ref *pr, int sz, Blk *b, Ins *cur, Fn *fn)
 	}
 
 	/* Mode B: [base, idx, lsl #shift] or [base, idx] */
-	if (!iskltmp(a0, fn) || !iskltmp(a1, fn))
+	if (def->op != Oadd || !iskltmp(a0, fn) || !iskltmp(a1, fn))
 		return 0;
 
 	for (side = 0; side < 2; side++) {

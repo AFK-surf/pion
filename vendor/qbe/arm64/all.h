@@ -39,3 +39,4 @@ int arm64_slotpair(Ins *, uint padding, int firstspill, ArmSlotPair *);
 
 /* emit.c */
 void arm64_emitfn(Fn *, FILE *);
+int arm64_macho_needs_far(Fn *, uint64_t *);
