@@ -245,7 +245,8 @@ fi
 if [ "$IS_DARWIN_ARM64" = 1 ]; then
   for v in asm obj; do
     "$CC" -O2 "$HERE/driver.c" "$TMP_DIR/addr_$v.o" -o "$TMP_DIR/run_$v"
-    check_run "arm64_apple $v" "$("$TMP_DIR/run_$v")"
+    out=$("$TMP_DIR/run_$v")
+    check_run "arm64_apple $v" "$out"
   done
   if command -v otool >/dev/null 2>&1; then
     for v in asm obj; do
@@ -256,10 +257,12 @@ if [ "$IS_DARWIN_ARM64" = 1 ]; then
   fi
 elif [ "$UNAME_S" = Linux ] && { [ "$UNAME_M" = aarch64 ] || [ "$UNAME_M" = arm64 ]; }; then
   "$CC" -O2 "$HERE/driver.c" "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/run_arm64"
-  check_run "linux arm64 native" "$("$TMP_DIR/run_arm64")"
+  out=$("$TMP_DIR/run_arm64")
+  check_run "linux arm64 native" "$out"
 elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && command -v qemu-aarch64 >/dev/null 2>&1; then
   aarch64-linux-gnu-gcc -static -O2 "$HERE/driver.c" "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/run_arm64"
-  check_run "aarch64 qemu" "$(qemu-aarch64 "$TMP_DIR/run_arm64")"
+  out=$(qemu-aarch64 "$TMP_DIR/run_arm64")
+  check_run "aarch64 qemu" "$out"
 else
   echo "[SKIP] P111 execution: not AArch64 and no aarch64-linux-gnu-gcc + qemu-aarch64"
 fi
