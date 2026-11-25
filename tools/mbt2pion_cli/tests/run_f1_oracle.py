@@ -275,8 +275,33 @@ fn pick_price_cost(flag : Bool, a : &Price, b : &Price) -> Int {
   Price::cost(if flag { a } else { b })
 }
 
+priv struct PriceHolder {
+  price : &Price
+}
+
+fn boxed_price() -> &Price {
+  let it : Item = { value: 2 }
+  it as &Price
+}
+
+fn[T : Price] choose_first(_v : T, p : &Price) -> &Price {
+  p
+}
+
 fn[T : Price] gen_cost(v : T) -> Int {
   Price::cost(v)
+}
+
+fn[T] read_field(_m : T, h : PriceHolder) -> Int {
+  Price::cost(h.price)
+}
+
+fn[T] read_ret(_m : T) -> Int {
+  Price::cost(boxed_price())
+}
+
+fn[T : Price] read_choose(v : T, p : &Price) -> Int {
+  Price::cost(choose_first(v, p))
 }
 
 pub fn case6_dyn_trait_and_split_impl() -> String {
@@ -289,6 +314,10 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let p_inherent = it.cost()
   let p_dyn_cond = pick_price_cost(true, it as &Price, it2 as &Price)
   let p_gen = gen_cost(it)
+  let ph : PriceHolder = { price: it as &Price }
+  let p_field = read_field(0, ph)
+  let p_ret = read_ret(0)
+  let p_choose = read_choose(it, it as &Price)
   let __mbt_ufcs_0 = 999
   let __mbt_ufcs_Grow_grow = 888
   let _keep = __mbt_ufcs_0 + __mbt_ufcs_Grow_grow
@@ -302,7 +331,7 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let rs_pair = ReadSelf::row_id(row).v * 10 + ReadSelf_row::id(row).v
   let q : Sq = { s: 3 }
   let a_str = show_area(q as &Area)
-  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "," + p_dyn_cond.to_string() + "," + p_gen.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "," + interp_hyg + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + r_pair.to_string() + "," + rs_pair.to_string() + "|" + a_str
+  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "," + p_dyn_cond.to_string() + "," + p_gen.to_string() + "," + p_field.to_string() + "," + p_ret.to_string() + "," + p_choose.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "," + interp_hyg + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + r_pair.to_string() + "," + rs_pair.to_string() + "|" + a_str
 }
 
 pub fn run_all() -> String {
