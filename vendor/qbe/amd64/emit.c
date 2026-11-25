@@ -683,7 +683,7 @@ emitjtbl(Blk *b, int id0, E *e)
 	static int jt0;
 	int jtid = jt0++;
 	FILE *f = e->f;
-	char *idx_reg;
+	char *idx_reg, *address_index = rname[R10][SLong];
 	uint32_t jk;
 
 	if (rtype(b->jmp.arg) == RSlot) {
@@ -697,9 +697,11 @@ emitjtbl(Blk *b, int id0, E *e)
 	fprintf(f, "\tcmpl $%"PRIu32", %%%s\n", b->njtbl, idx_reg);
 	fprintf(f, "\tjae %sbb%d\n", T.asloc, id0 + b->s1->id);
 	fprintf(f, "\tleaq %sjt%d(%%rip), %%r11\n", T.asloc, jtid);
-	if (strcmp(idx_reg, "r10d") != 0)
+	if (amd64_table_word(b))
+		address_index = rname[b->jmp.arg.val][SLong];
+	else if (rtype(b->jmp.arg) != RSlot)
 		fprintf(f, "\tmovl %%%s, %%r10d\n", idx_reg);
-	fprintf(f, "\tmovslq (%%r11,%%r10,4), %%r10\n");
+	fprintf(f, "\tmovslq (%%r11,%%%s,4), %%r10\n", address_index);
 	fprintf(f, "\taddq %%r10, %%r11\n");
 	fprintf(f, "\tjmpq *%%r11\n");
 	if (!T.windows) {

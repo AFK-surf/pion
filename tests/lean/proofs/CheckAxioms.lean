@@ -27,6 +27,7 @@ import PionProofs.QbeAmd64FpOpts
 import PionProofs.QbeJtblEdgeSpill
 import PionProofs.QbeColdBootstrapSpeedOpts
 import PionProofs.QbeCountedLoopUnroll
+import PionProofs.QbeJtblIdxAndWideCmp
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -705,3 +706,14 @@ import PionProofs.QbeCountedLoopUnroll
 #print axioms PionQbeCountedLoopUnroll.renamedRead
 #print axioms PionQbeCountedLoopUnroll.budget_bound
 #print axioms PionQbeCountedLoopUnroll.budget_step
+#print axioms PionQbeJtblIdxAndWideCmp.keepLive
+#print axioms PionQbeJtblIdxAndWideCmp.dispatchEq
+#print axioms PionQbeJtblIdxAndWideCmp.normalizeWord
+#print axioms PionQbeJtblIdxAndWideCmp.provenIndex
+#print axioms PionQbeJtblIdxAndWideCmp.addressEq
+#print axioms PionQbeJtblIdxAndWideCmp.spillToIndexedJump
+#print axioms PionQbeJtblIdxAndWideCmp.uniform
+#print axioms PionQbeJtblIdxAndWideCmp.noWrap
+#print axioms PionQbeJtblIdxAndWideCmp.enclosure
+#print axioms PionQbeJtblIdxAndWideCmp.wordRange
+#print axioms PionQbeJtblIdxAndWideCmp.machineFold

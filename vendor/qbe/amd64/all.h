@@ -73,6 +73,36 @@ amd64_grouped_cvt(const Blk *b)
 	return 0;
 }
 
+/* Only trust real word writes. Stop at calls, swaps, implicit-register
+ * instructions or any other op outside this transparent subset. */
+static inline int
+amd64_table_word(const Blk *b)
+{
+	Ref idx = b->jmp.arg;
+
+	if (!isreg(idx) || req(idx, TMP(R11)) || req(idx, TMP(RSP)))
+		return 0;
+	for (uint n = b->nins; n; n--) {
+		const Ins *i = &b->ins[n-1];
+		switch (i->op) {
+		case Onop: case Odbgloc:
+			continue;
+		case Oloaduw:
+			if (req(i->to, idx))
+				return 1;
+			break;
+		case Oload: case Oloadsw: case Oloadub: case Oloaduh:
+		case Oadd: case Osub: case Oand: case Oor: case Oxor:
+			if (req(i->to, idx))
+				return i->cls == Kw;
+			break;
+		default:
+			return 0;
+		}
+	}
+	return 0;
+}
+
 /* targ.c */
 extern Amd64Op amd64_op[];
 

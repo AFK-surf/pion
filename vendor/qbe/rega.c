@@ -745,6 +745,9 @@ rega(Fn *fn)
 				if (T.jtblclob & BIT(r))
 					rfree(&cur, r);
 		snapshot(&end[n], &cur);
+		if (b->jmp.type == Jjtbl && T.jtblidx && rtype(b->jmp.arg) == RTmp
+		&& b->jmp.arg.val >= Tmp0 && !bshas(b->out, b->jmp.arg.val))
+			radd(&cur, b->jmp.arg.val, T.jtblidx);
 		doblk(b, &cur);
 		bscopy(b->in, cur.b);
 		for (p=b->phi; p; p=p->link)

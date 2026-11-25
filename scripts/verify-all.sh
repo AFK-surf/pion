@@ -404,6 +404,8 @@ sh "$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2e.sh" "$PIONC2"
 # P116: Opt-Track P byte-identical compile-speed changes (QBE 1-byte lexer lookahead, filllive worklist, philive projected phi liveness, rega compact snapshots next to sinktablehomes, Mach-O keep/gen GPR masks, main-thread first unit; checking QBE oracles with ASan+UBSan on 4 targets, host C differential, --jobs 1/2/4/8 parity).
 sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC2"
+# P118: Opt-Track R (amd64 jump-table selector in the dispatch scratch register, proven zero-extension indexes the table directly, widened-word interval comparison folding; text == --obj dispatch forms, -d G folds, host C differential with dirty high halves, bytecode_vm / fannkuchredux, ASan+UBSan QBE on 4 targets).
+sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
