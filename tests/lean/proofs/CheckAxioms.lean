@@ -36,6 +36,7 @@ import PionProofs.QbeFrontendColdSpeedOpts
 import PionProofs.QbeCountedArrayLength
 import PionProofs.QbeStringSpanMapEntry
 import PionProofs.QbeEcosystemUnboxFixedLen
+import PionProofs.QbeBinarySizeOpts
 import PionProofs.QbeRealWorkloadDataOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
@@ -829,6 +830,16 @@ import PionProofs.QbeRealWorkloadDataOpts
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.shadow
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.hoist
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.run_prefix
+#print axioms PionQbeBinarySizeOpts.WasmDeadFn.index_roundtrip
+#print axioms PionQbeBinarySizeOpts.WasmDeadFn.covers_live
+#print axioms PionQbeBinarySizeOpts.WasmDeadFn.avoids_deleted
+#print axioms PionQbeBinarySizeOpts.WasmDeadFn.delete_unreachable
+#print axioms PionQbeBinarySizeOpts.ElfNames.shared_names
+#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.rebased_value
+#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.rebased_relocation
+#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.got_not_rebased
+#print axioms PionQbeBinarySizeOpts.RuntimePool.pooled_diagnostic
+#print axioms PionQbeBinarySizeOpts.RuntimePool.grouped_link
 #print axioms QbeRealWorkloadDataOpts.QuotedBytes.literal_alphabet
 #print axioms QbeRealWorkloadDataOpts.QuotedBytes.scan_spec
 #print axioms QbeRealWorkloadDataOpts.QuotedBytes.pack_spec

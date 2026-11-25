@@ -128,6 +128,7 @@ typedef struct {
 	uint64_t align;
 	int is_nobits;
 	int has_sym;
+	int private_literal;
 	Buf buf;
 	uint64_t nb_size;
 	Reloc *relocs;
@@ -150,6 +151,7 @@ typedef struct {
 	int sec_idx;
 	uint64_t offset;       /* offset in section, or alignment if common */
 	uint64_t size;         /* st_size */
+	int keep_name;         /* referenced by a non-linear relocation */
 } SymEnt;
 
 typedef struct {
@@ -405,6 +407,12 @@ sec_add_reloc(int sec_idx, uint64_t offset, uint32_t sym_idx, uint32_t type, int
 			die("elf: out of memory");
 	}
 	Reloc *r = &s->relocs[s->nrelocs++];
+	/* Only S + A relocations stay exact when `ld -r` moves a literal away
+	 * from offset 0 of a merged section; GOT, PLT and TLS forms resolve the
+	 * symbol itself and keep its name. */
+	if (type != R_X86_64_64 && type != R_X86_64_PC32 &&
+	    type != R_X86_64_32 && type != R_X86_64_32S)
+		E0.syms[sym_idx].keep_name = 1;
 	r->offset = offset;
 	r->sym_idx = sym_idx;
 	r->type = type;
@@ -2489,6 +2497,26 @@ emit_ascii_str(Buf *b, const char *s)
 	}
 }
 
+/* These are compiler-generated, unnamed string literals in the source language. */
+static int
+is_literal_label(const char *name)
+{
+	const char *digits, *end;
+	int header;
+
+	if (strncmp(name, "pion_str_", 9) == 0) {
+		digits = name + 9;
+		header = 1;
+	} else if (strncmp(name, "pion_cstr_", 10) == 0) {
+		digits = name + 10;
+		header = 0;
+	} else
+		return 0;
+	for (end = digits; *end >= '0' && *end <= '9'; end++)
+		;
+	return end != digits && (header ? strcmp(end, "_hdr") == 0 : *end == 0);
+}
+
 static int
 dat_open_sec(int default_sec)
 {
@@ -2511,6 +2539,8 @@ dat_open_sec(int default_sec)
 			make_subsec_name(sname, sizeof sname, ".bss.", E0.dat_name);
 			sec_idx = add_sec(sname, SHT_NOBITS, SHF_ALLOC | SHF_WRITE, al, 1);
 		}
+		if (default_sec == SEC_DATA && !E0.dat_lnk.export)
+			E0.secs[sec_idx].private_literal = is_literal_label(E0.dat_name);
 	}
 
 	sec_align(sec_idx, al);
@@ -2698,6 +2728,11 @@ amd64_elf_finish(FILE *outf)
 		Sec *s = &E0.secs[i];
 		if (sec_size(s) > 0 || s->has_sym || i == SEC_TEXT) {
 			s->out_shndx = shndx++;
+			/* The section name is also the suffix of its relocation section name. */
+			if (s->nrelocs) {
+				s->rela_sh_name_off = (uint32_t)shstrtab.len;
+				buf_put(&shstrtab, ".rela", sizeof ".rela" - 1);
+			}
 			s->sh_name_off = strtab_add(&shstrtab, s->name);
 		} else {
 			s->out_shndx = 0;
@@ -2711,9 +2746,6 @@ amd64_elf_finish(FILE *outf)
 	for (size_t i = 0; i < E0.nsecs; i++) {
 		Sec *s = &E0.secs[i];
 		if (s->out_shndx && s->nrelocs > 0) {
-			char rname[256];
-			snprintf(rname, sizeof rname, ".rela%s", s->name);
-			s->rela_sh_name_off = strtab_add(&shstrtab, rname);
 			shndx++;
 			n_rela_secs++;
 		}
@@ -2767,6 +2799,17 @@ amd64_elf_finish(FILE *outf)
 	for (uint32_t ni = 0; ni < pos; ni++) {
 		SymEnt *e = &E0.syms[order[ni]];
 		Elf64_Sym *es = &esyms[1u + ni];
+		/* The address of a private literal occupying its own entire input
+		 * section is exactly the section base. Keep the relocation index,
+		 * addend and section identity, and let the linker omit its label.
+		 * Only S + A relocations refer to it (see sec_add_reloc). */
+		if (e->defined && !e->is_export && !e->keep_name && e->st_type == STT_OBJECT &&
+		    E0.secs[e->sec_idx].private_literal && e->offset == 0 &&
+		    e->size == E0.secs[e->sec_idx].buf.len) {
+			es->st_info = ELF64_ST_INFO(STB_LOCAL, STT_SECTION);
+			es->st_shndx = (uint16_t)E0.secs[e->sec_idx].out_shndx;
+			continue;
+		}
 		es->st_name = strtab_add(&strtab, e->name);
 		if (e->defined) {
 			Sec *s = &E0.secs[e->sec_idx];
