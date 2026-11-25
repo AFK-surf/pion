@@ -142,4 +142,30 @@ fi
 grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r7.json"
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
+# 8. User identifier `mbt_arrpat_len_probe_count` must NOT false-positive MBT2PION_PROBE_RESIDUAL in --mode publish
+S8="$WORK/s8"; OUT8="$WORK/out8"; mkdir -p "$S8" "$OUT8"
+cat > "$S8/t.mbt" << 'EOF'
+fn mbt_arrpat_len_probe_count() -> Int { 9 }
+pub fn sample() -> Int { mbt_arrpat_len_probe_count() }
+EOF
+"$BIN" --src "$S8" --out "$OUT8" --target native --mode publish --mbt-compat "$COMPAT_DIR" --report "$WORK/r8.json" --pionc "$PIONC"
+if grep -q "MBT2PION_PROBE_RESIDUAL" "$WORK/r8.json"; then
+  echo "[d2-e2e] FAIL: user identifier mbt_arrpat_len_probe_count triggered MBT2PION_PROBE_RESIDUAL"
+  exit 1
+fi
+
+# 9. Genuine unresolved `.mbt_arrpat_len_probe__p0()` residual must fail closed with MBT2PION_PROBE_RESIDUAL in --mode publish
+S9="$WORK/s9"; mkdir -p "$S9"
+cat > "$S9/t.mbt" << 'EOF'
+pub fn f(x : Array[Int]) -> Int {
+  (x).mbt_arrpat_len_probe__p0()
+}
+EOF
+if "$BIN" --src "$S9" --out "$NEG_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --report "$WORK/r9.json" --pionc "$PIONC" 2>/dev/null; then
+  echo "[d2-e2e] FAIL: unresolved .mbt_arrpat_len_probe__p0() should have exited non-zero"
+  exit 1
+fi
+grep -q "MBT2PION_PROBE_RESIDUAL" "$WORK/r9.json"
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
 echo "[d2-e2e] PASS: all Wave M2-D2 negative/fail-closed gates verified"
