@@ -8,9 +8,10 @@
 
 ## For AI Agents
 
-- **Read the docs first**: [`SPEC.md`](SPEC.md) defines the language & CLI contract; [`BEST_PRACTICES.md`](BEST_PRACTICES.md) covers `World` capabilities, structured concurrency, and zero-allocation patterns.
+- **Read the docs first**: [`SPEC.md`](SPEC.md) defines the language & CLI contract; [`BEST_PRACTICES.md`](BEST_PRACTICES.md) covers `World` capabilities, structured concurrency, zero-allocation patterns, and `#verify` Lean 4 formal verification.
+- **Formal verification built in (Lean 4)**: Pion ships an Aeneas-style Pion → Lean 4 extractor (`#verify` + `pionc extract-lean --out <dir>`, [`SPEC.md`](SPEC.md) §3.4–§3.5 & §5.5). Mark pure state machines / algorithms `#verify` (avoiding closures, `World` IO, `Float`/`Double` arithmetic and aliasing), extract them directly to Lean 4 (`Aeneas.Std` + `lean/PionLean`), and prove safety/liveness invariants directly on the production Pion code with zero proof-code drift.
 - **GUI / Invar apps**: scaffold with `pionc init --template invar-app <dir>`, keep `#render_thread` on view/event functions, and never pass `World` into the render thread — on `E_NO_IO_VIOLATION`, move blocking IO into the background worker (`ui::Worker::pair()` + `ui::wake_now()`).
-- **Verify every edit**: close the loop with `pionc check --json <path>` (apply `edits` when provided) and `pionc test --json <path>`.
+- **Reuse ecosystem packages & verify every edit**: search official pure-Pion packages with `pionc search --json <query>`, and close every edit loop with `pionc check --json <path>` (apply `edits` when provided) and `pionc test --json <path>`.
 
 ---
 
@@ -34,6 +35,7 @@
 - Full UTF-8 strings (scalar iteration, byte-exact formatting); `String::to_int/to_int64/to_double -> Option`.
 - Standard packages in pure `Pion`: `std/json`; `std/http` (HTTP/1.1 Keep-Alive, chunked bodies, pipelining, query decoding); `std/net` (non-blocking `kqueue`/`epoll` poller, `SO_REUSEPORT`); `std/regex` (Thompson NFA run by a Pike VM: linear time for every pattern, no ReDoS); `std/tls` (TLS 1.2/1.3 client and server over the system OpenSSL 1.1.x/3.x through `extern "C"` only, zero C glue: SNI + certificate/host verification, `tls_listen` / `tls_accept` with PEM certificate chains).
 - Packages: `pion.toml` `path` and `git` (`tag`/`rev`/`branch`, optional `subdir`) dependencies, pinned by `pion.lock`; `pionc add` / `pionc update` edit them in place from a path, a git URL or a git-index registry (`index/<pkg>.toml`, `[registry] url` or `$PION_REGISTRY`), restoring `pion.toml` / `pion.lock` on any failure.
+- **Formal verification (Lean 4 extraction)**: built-in Aeneas-style `#verify` subset & `pionc extract-lean` (`SPEC.md` §3.4–§3.5) lowering Pion-LLBC into executable Lean 4 (`Aeneas.Std` + `PionLean`) with `mut` parameters, loops, recursion, `Array`/`FixedArray`/`Bytes`/`StringBuilder`/`Map[K, V]` and `Double` bit-pattern primitives — dogfooded by the end-to-end Lean 4-verified QBE SSA translation validator (`tools/qbe_tv`, `SPEC.md` §3.6).
 - Equality is by value only: `==` on scalars, `String`, `Ptr` and payload-less enums; boxed values are inspected with `match` (also enforced when a generic `==` is instantiated with a boxed type).
 
 ## Language Tour
@@ -121,6 +123,7 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 | `pionc check [--fix] [--json] [path...]` | Type, exhaustiveness, must-use `Result`, `Send`, `World` and visibility checks; JSON diagnostics with fix-its and machine-applicable `edits` (`--fix` applies edits in up to 3 rounds and re-checks; defaults to `.` when `pion.toml` or `src/` exists) |
 | `pionc query defs\|sig\|callers\|deps [--json] [path...]` | Symbol definitions, exported `.pionsig` interface, call graph, package dependency graph; a path may be a file, a package directory or a whole workspace (defaults to `.`) |
 | `pionc doc [--json] [path...]` | Public API of each package (dependencies first; defaults to `.`) |
+| `pionc extract-lean --out <dir> [--pkg <name>] [--json] [path]` | Extract the `#verify` closure via Pion-LLBC into Lean 4 (`<Pkg>/{Types,Funs,FunsExternal}.lean` on `Aeneas.Std` + `PionLean`; `SPEC.md` §3.5 / §5.5) |
 | `pionc emit-sig <path...>` | Print the `.pionsig` export table |
 | `pionc build [--package\|-p <name>] [--release] [--target <t>] [--sysroot <dir>] [--emit-obj <f>] [--emit-staticlib <f.a>] [--emit-cdylib <f.so\|.dylib\|.dll>] [--emit-ssa <f>] [--emit-asm <f>] [--jobs <n>] [-l <lib>] [-o <bin>] [path...]` | Native binary, `.o`, C staticlib (`.a`), C cdylib (`.dylib`/`.so`/`.dll`), or zero-toolchain `.wasm` binary via the global CAS across `arm64_apple`, `amd64_apple`, `amd64_sysv`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`, and `wasm32` (`--release` strips `debug_assert`; `--package`/`-p` selects a `[workspace]` member; defaults to `.`) |
 | `pionc run [--package\|-p <name>] [--release] [--target <t>] [-l <lib>] [path] [-- args...]` | Build and execute a package, workspace member (`--package`/`-p`, or auto-selected unique `main` member), or `.pion` file (`--target wasm32` runs via `node pion_wasm_rt.mjs`; defaults to `.`) |
@@ -131,6 +134,7 @@ See [`examples/text_stats/`](examples/text_stats/) for a complete multi-package 
 | `pionc add [--json] <name> (--path <p> \| --git <url> [--tag\|--rev\|--branch <r>] [--subdir <s>] \| [--registry <url>]) [dir]` | Add or change one dependency in `pion.toml` (in place, idempotent) and lock it; files restored on failure |
 | `pionc remove [--json] <name> [dir]` | Remove a dependency from `pion.toml` (preserving comments and formatting) and prune `pion.lock` |
 | `pionc update [--json] [pkg] [dir]` | Re-read registry entries, re-resolve git dependencies to their newest target refs, rewrite `pion.lock`, re-check the workspace (restored on failure) |
+| `pionc search [--json] [--offline] [--refresh] [--registry <url>] [--category <cat>] [query...]` | Search packages in the official default registry (or custom `--registry`) by keyword or category |
 | `pionc doctor [--json]` | Inspect toolchain health (`pionc`, `qbe`, `libpionrt.a`, `pion_wasm_rt.mjs`, `cc`/`cxx`, `node`, `git`, CAS stats) |
 | `pionc cache stats\|prune\|clear [--all] [--json]` / `pionc clean [--all] [--json]` | Inspect, LRU-prune, or clear the global CAS (`--all` also clears cached `git/` and `registry/` repos) |
 | `pionc --version\|-V\|version [--json]` / `pionc --help\|-h\|help` | Print compiler version + host target (or JSON) / full CLI usage (exit 0) |
@@ -323,8 +327,10 @@ CI (`.github/workflows/ci.yml`) runs `verify-all.sh` on `macos-15` (zero MoonBit
 ## Repository Layout
 
 - `bootstrap/pionc-seed.ssa.gz` — architecture-independent QBE SSA Stage 0 bootstrap seed (zero external compiler dependency)
-- `compiler/src/core/` — pure `Pion` compiler core (`lexer`, `ast`, `parser`, `sig`, `types`, `qbe`, `cas`, `diag`, `query`, `fmt`, `manifest`, plus native `pionc test` suites)
-- `compiler/src/cli/` — native `Pion` CLI driver (parallel package compilation, CAS, workspace/package manager)
+- `compiler/src/core/` — pure `Pion` compiler core (`lexer`, `ast`, `parser`, `sig`, `types`, `llbc`, `lean`, `qbe`, `cas`, `diag`, `query`, `fmt`, `manifest`, plus native `pionc test` suites)
+- `compiler/src/cli/` — native `Pion` CLI driver (parallel package compilation, CAS, workspace/package manager, `extract-lean`)
+- `lean/` & `tests/lean/` — `PionLean` runtime/lemma library for `pionc extract-lean`, plus extracted proof suites (`AlgosProofs`, `CodecProofs`, `CapTableProofs`, `QbeTvProofs`) and native-vs-Lean differential cases
+- `tools/qbe_tv/` — QBE SSA translation validator written in `#verify` Pion with end-to-end Lean 4 soundness proofs (`SPEC.md` §3.6)
 - `runtime/` — `<64 KB` C11 runtime (`pion_rt.h`, `pion_rt.c`, `test_rt.c`; BRC, slab allocator, threads, `kqueue`/`epoll` event loop)
 - `vendor/qbe/` — vendored QBE with direct Mach-O / ELF64 object emission and hardware `sqrt` lowering
 - `std/json`, `std/http`, `std/net`, `std/regex`, `std/tls` — standard packages in pure `Pion`
