@@ -1,0 +1,476 @@
+///| Wave M2-F3d-3 unit tests:
+///| 1. `if`/`guard <expr> is <struct-pat> [as alias] && <cond>` lowering
+///| 2. `Int::to_char()` inline lowering & `match` guard binding/shadowing
+///| 3. Struct update `{ ..base, f: v }` type resolution + fail-closed when unknown/conflicting
+///| 4. `autofill_loc` strict single-fn attachment in `.mbti` and `.mbt`
+///| 5. Strictly sound exhaustive array-slice `match` analysis (positive & negative cases)
+///| 6. `Array::push_iter` post-convergence audit timing (positive + `#72` negative guards)
+
+test "F3d3-1: if/guard struct is-chain with as-alias and && lowers cleanly with else isolation" {
+  let src = "priv struct Way { px : Double; h : Double }\n" +
+  "priv struct Fling { v0 : Double; end_t : Double; till : Double; way : Way? }\n" +
+  "pub fn check_if(opt : Fling?, fallback : Int) -> Int {\n" +
+  "  let v0 = fallback\n" +
+  "  if opt is Some({ v0, way: Some(_), .. }) && v0 > 0.0 {\n" +
+  "    v0.to_int()\n" +
+  "  } else {\n" +
+  "    v0 + 100\n" +
+  "  }\n" +
+  "}\n" +
+  "pub fn check_guard(opt : Fling?, t : Double, most : Double, laid : Bool) -> Double {\n" +
+  "  guard opt is Some({ way: Some(w), .. } as f) && f.v0 > 0.0 && t <= f.end_t && (laid || f.till != most) else {\n" +
+  "    return -1.0\n" +
+  "  }\n" +
+  "  w.px / w.h + f.v0\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "is_chain.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "if/guard struct is-chain should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "is Some({"), "raw struct pattern in `is` must be lowered")
+  assert_true(str_has(out, "Option::Some(f)"), "as-alias `f` must be bound directly in outer pattern")
+  assert_true(str_has(out, "let (f, w) = match"), "diverging guard must unpack bound tuple outside else scope")
+}
+
+test "F3d3-2: rewrite_int_to_char_at lowers Int::to_char inline with exact Unicode scalar check" {
+  let used : Map[String, Bool] = Map()
+  let ln = "  match (c - 1000).to_char() {"
+  match rewrite_int_to_char_at(ln, 20, used) {
+    Some(rewritten) => {
+      assert_true(!str_has(rewritten, ".to_char()"), "to_char() must be rewritten")
+      assert_true(str_has(rewritten, "0x10FFFF"), "upper Unicode scalar bound must be checked")
+      assert_true(str_has(rewritten, "0xD800") && str_has(rewritten, "0xDFFF"), "surrogate gap must be excluded")
+      assert_true(str_has(rewritten, "unsafe_to_char()"), "valid scalar must convert via unsafe_to_char")
+    }
+    None => assert_true(false, "rewrite_int_to_char_at must rewrite (c - 1000).to_char()")
+  }
+}
+
+test "F3d3-3: struct update resolves from base static type or expected type and fails closed when ambiguous" {
+  // Positive: `items.get(prev) is Some(it)` + `items[prev] = { ..it, off: ... }` must resolve to `dep::Item`
+  // and NEVER hijack local `Decoy` that also has an `off` field!
+  let ok_src = "priv struct Decoy { off : Int; other : Int }\n" +
+  "pub fn upd(items : Map[Int, @dep.Item], prev : Int) -> Unit {\n" +
+  "  if items.get(prev) is Some(it) {\n" +
+  "    items[prev] = { ..it, off: 42 }\n" +
+  "  }\n" +
+  "}\n"
+  let ok_res = transpile_package(
+    [SourceFile::{ rel_path: "su_ok.mbt", content: ok_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(ok_res.blockers == 0, "struct update with known base/container type should have 0 blockers")
+  let ok_out = ok_res.files[0].content
+  assert_true(str_has(ok_out, "dep::Item::{ ..it, off: 42 }"), "must resolve to dep::Item, not Decoy")
+  assert_true(!str_has(ok_out, "Decoy::{"), "must never guess local Decoy by field name")
+
+  // Negative: unknown base type and no expected type MUST fail closed with MBT2PION_AMBIGUOUS_STRUCT_UPDATE
+  // even when a unique local struct `Decoy` happens to have field `off`!
+  let bad_src = "priv struct Decoy { off : Int; other : Int }\n" +
+  "pub fn bad_upd(x : @dep.Opaque) -> Unit {\n" +
+  "  let y = x.get_unknown()\n" +
+  "  let _ = { ..y, off: 7 }\n" +
+  "}\n"
+  let bad_res = transpile_package(
+    [SourceFile::{ rel_path: "su_bad.mbt", content: bad_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(bad_res.blockers > 0, "unknown struct update base must fail closed")
+  let mut saw_ambig = false
+  for d in bad_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" { saw_ambig = true }
+  }
+  assert_true(saw_ambig, "must emit MBT2PION_AMBIGUOUS_STRUCT_UPDATE instead of guessing Decoy")
+  assert_true(!str_has(bad_res.files[0].content, "Decoy::{"), "must not emit guessed Decoy struct update")
+}
+
+test "F3d3-4: autofill_loc attaches only to immediately following single fn in mbti and mbt" {
+  // 1. `.mbti` with generic `pub fn[K]` followed by `pub let` and `pub fn command_score`
+  let st = empty_symbol_table()
+  let mbti = "package \"demo/hl\"\n" +
+  "#callsite(autofill(loc))\n" +
+  "pub fn[K : Eq] combobox(Int, loc~ : SourceLoc) -> Int\n\n" +
+  "pub let combobox_next : String\n\n" +
+  "pub fn command_score(String, String) -> Double\n\n" +
+  "#callsite(autofill(loc))\n" +
+  "pub fn[K] Tree::item(Int, loc~ : SourceLoc) -> Int\n" +
+  "pub fn after_item(Int) -> Int\n"
+  symtab_load_mbti(st, "hl/pkg.generated.mbti", mbti)
+  assert_true(st.autofill_loc_fns.contains("combobox"), "generic combobox must get autofill_loc")
+  assert_true(st.autofill_loc_fns.contains("Tree::item"), "generic Tree::item must get autofill_loc")
+  assert_true(!st.autofill_loc_fns.contains("command_score"), "command_score must NOT inherit leaked autofill_loc")
+  assert_true(!st.autofill_loc_fns.contains("after_item"), "after_item must NOT inherit leaked autofill_loc")
+
+  // 2. `.mbt` with `#callsite(autofill(loc))` followed by a non-fn decl or consecutive fn decls
+  let mbt_src = "#callsite(autofill(loc))\n" +
+  "pub fn with_loc(x : Int, loc~ : SourceLoc) -> String { loc.to_string() + x.to_string() }\n" +
+  "pub fn without_loc(x : Int) -> Int { x + 1 }\n" +
+  "pub fn caller() -> (String, Int) {\n" +
+  "  (with_loc(1), without_loc(2))\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "af.mbt", content: mbt_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "autofill_loc test should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(str_has(out, "with_loc(1, loc="), "with_loc call must receive autofilled loc")
+  assert_true(str_has(out, "without_loc(2)"), "without_loc call must NOT receive autofilled loc")
+}
+
+test "F3d3-5: exhaustive array slice match appends unreachable ONLY when strictly sound" {
+  // Positive 1: `[]` + `[x, ..]`
+  let p1 = "pub fn first_or(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [x, ..] => x\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let r1 = transpile_package([SourceFile::{ rel_path: "arr_p1.mbt", content: p1, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(str_has(r1.files[0].content, "_ => panic(\"unreachable\")"), "[] + [x, ..] is exhaustive")
+
+  // Positive 2: `[.., last]` + `[]`
+  let p2 = "pub fn last_or(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [.., last] => last\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let r2 = transpile_package([SourceFile::{ rel_path: "arr_p2.mbt", content: p2, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(str_has(r2.files[0].content, "_ => panic(\"unreachable\")"), "[.., last] + [] is exhaustive")
+
+  // Negative 1: refutable element `[Some(x), ..]` + `[]` MUST NOT append unreachable!
+  let n1 = "pub fn bad_refut(xs : Array[Int?]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [Some(x), ..] => x\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let rn1 = transpile_package([SourceFile::{ rel_path: "arr_n1.mbt", content: n1, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(!str_has(rn1.files[0].content, "\n    _ => panic(\"unreachable\")"), "[] + [Some(x), ..] must NOT append unreachable")
+
+  // Negative 2: guarded `[x, ..] if x > 0` + `[]` MUST NOT append unreachable!
+  let n2 = "pub fn bad_guard(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [x, ..] if x > 0 => x\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let rn2 = transpile_package([SourceFile::{ rel_path: "arr_n2.mbt", content: n2, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(!str_has(rn2.files[0].content, "\n    _ => panic(\"unreachable\")"), "[] + [x, ..] if cond must NOT append unreachable")
+
+  // Negative 3: missing length 1 (`[]` + `[a, b, ..]`) MUST NOT append unreachable!
+  let n3 = "pub fn bad_gap(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [a, b, ..] => a + b\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let rn3 = transpile_package([SourceFile::{ rel_path: "arr_n3.mbt", content: n3, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(!str_has(rn3.files[0].content, "\n    _ => panic(\"unreachable\")"), "[] + [a, b, ..] (missing len 1) must NOT append unreachable")
+}
+
+test "F3d3-6: P1 red-team hardening (pipe+as, nested as, else-if chain, double-diverge, stacked autofill, filter/each isolation, to_char brace)" {
+  // P1-1a: `if e is (A as x | B as x)` must fail-closed with MBT2PION_UNSUPPORTED_SYNTAX
+  let pipe_as_src = "priv enum E { A(Int); B(Int) }\n" +
+  "pub fn bad_pipe_as(e : E) -> Int {\n" +
+  "  if e is (A(v) as x | B(v) as x) { v } else { 0 }\n" +
+  "}\n"
+  let r_pa = transpile_package([SourceFile::{ rel_path: "pa.mbt", content: pipe_as_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let mut has_pa_err = false
+  for d in r_pa.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_pa_err = true }
+  }
+  assert_true(has_pa_err, "top-level `|` with `as` in `is` must fail closed")
+
+  // P1-1b: nested `as` on non-struct sub-pattern `Some(x as y)` must fail-closed
+  let nested_as_src = "pub fn bad_nested_as(opt : Int?) -> Int {\n" +
+  "  if opt is Some(x as y) && y > 0 { x } else { 0 }\n" +
+  "}\n"
+  let r_na = transpile_package([SourceFile::{ rel_path: "na.mbt", content: nested_as_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let mut has_na_err = false
+  for d in r_na.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_na_err = true }
+  }
+  assert_true(has_na_err, "nested `as` on non-struct sub-pattern must fail closed")
+
+  // P1-2a: `if <is-chain> { 1 } else if flag { 2 } else { 3 }` must consume full else-if-else chain
+  let eie_src = "priv struct Box { x : Int }\n" +
+  "pub fn test_eie(opt : Box?, flag : Bool) -> Int {\n" +
+  "  if opt is Some({ x, .. }) && x > 0 { 1 } else if flag { 2 } else { 3 }\n" +
+  "}\n"
+  let r_eie = transpile_package([SourceFile::{ rel_path: "eie.mbt", content: eie_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_eie.diagnostics.length() == 0, "if-is-chain else-if else has 0 diags")
+  assert_true(!str_has(r_eie.files[0].content, "} else { 3 }\n}"), "trailing else must be inside match None arm, not orphaned")
+
+  // P1-2b: double-diverging `if <is-chain> { return 1 } else { return 2 }` avoids unconstrained Option[?T]
+  let dd_src = "priv struct Box { a : Int }\n" +
+  "pub fn test_dd(opt : Box?) -> Int {\n" +
+  "  if opt is Some({ a, .. }) && a > 0 { return 1 } else { return 2 }\n" +
+  "}\n"
+  let r_dd = transpile_package([SourceFile::{ rel_path: "dd.mbt", content: dd_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_dd.diagnostics.length() == 0, "double-diverging if-is-chain has 0 diags")
+  assert_true(!str_has(r_dd.files[0].content, "Option::None"), "double-diverging if-is-chain uses Unit-typed sequential lowering")
+
+  // P1-3: `.filter`/`.each` closure isolates outer expected type
+  let fe_src = "priv struct Item { v : Int }\n" +
+  "pub fn test_fe(xs : Array[Item]) -> Int {\n" +
+  "  let mut sum = 0\n" +
+  "  let ys = xs.filter(fn(x) { x.v > 0 })\n" +
+  "  ys.each(fn(x) { sum = sum + x.v })\n" +
+  "  sum\n" +
+  "}\n"
+  let r_fe = transpile_package([SourceFile::{ rel_path: "fe.mbt", content: fe_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_fe.diagnostics.length() == 0, "filter/each closure isolation has 0 diags")
+
+  // P1-4a: stacked `#callsite(autofill(loc))` + `#deprecated(...)` preserves autofill_loc
+  let st_src = "#callsite(autofill(loc))\n" +
+  "#deprecated(\"use new\")\n" +
+  "pub fn stacked_loc(x : Int, loc~ : SourceLoc) -> String {\n" +
+  "  x.to_string() + loc.to_string()\n" +
+  "}\n" +
+  "pub fn call_stacked() -> String {\n" +
+  "  stacked_loc(1)\n" +
+  "}\n"
+  let r_st = transpile_package([SourceFile::{ rel_path: "st.mbt", content: st_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(str_has(r_st.files[0].content, "stacked_loc(1, loc="), "stacked #deprecated preserves autofill(loc)")
+
+  // P1-4b: symtab_load_mbti nested `]` in `pub fn[T : Foo[Int]]`
+  let st_mbti = empty_symbol_table()
+  let mbti_txt = "package \"demo/dep\"\n#callsite(autofill(loc))\n#deprecated(\"x\")\npub fn[T : Foo[Int]] nested_gen(x : T, loc~ : SourceLoc) -> Unit\npub fn after_gen() -> Unit\n"
+  symtab_load_mbti(st_mbti, "dep/pkg.generated.mbti", mbti_txt)
+  assert_true(st_mbti.autofill_loc_fns.contains("dep::nested_gen"), "nested_gen with nested [] gets autofill_loc")
+  assert_true(!st_mbti.autofill_loc_fns.contains("dep::after_gen"), "after_gen does not inherit autofill_loc")
+
+  // P1-5b: rewrite_int_to_char_at handles `{ ... }.to_char()` and char literal with `(`
+  let used_m : Map[String, Bool] = Map()
+  let line1 = "let ch = { let n = 65; n }.to_char()"
+  let col1 = line1.index_of("to_char") + 1
+  match rewrite_int_to_char_at(line1, col1, used_m) {
+    Some(out1) => assert_true(str_has(out1, "{ let n = 65; n }") && str_has(out1, "unsafe_to_char()"), "brace receiver to_char rewritten")
+    None => assert_true(false, "brace receiver to_char should rewrite")
+  }
+  let line2 = "let ch = (if c == '(' { 65 } else { 66 }).to_char()"
+  let col2 = line2.index_of("to_char") + 1
+  match rewrite_int_to_char_at(line2, col2, used_m) {
+    Some(out2) => assert_true(str_has(out2, "(if c == '(' { 65 } else { 66 })") && str_has(out2, "unsafe_to_char()"), "char-lit paren receiver to_char rewritten")
+    None => assert_true(false, "char-lit paren receiver to_char should rewrite")
+  }
+}
+
+test "F3d3-7: Astra 5 adversarial regressions (struct update order, shadowed panic, val/val_ binder, val/val_ field, guard sentinel)" {
+  // P1-1: local out-of-order effectful struct update evaluates overrides into temps before constructing
+  let su_src = "priv struct R { mut a : Int; b : Int; c : Int }\n" +
+  "pub fn test_su() -> Int {\n" +
+  "  let s : R = { a: 1, b: 2, c: 3 }\n" +
+  "  let t = { ..s, c: { s.a = 8; 6 }, b: { s.a = 9; 5 } }\n" +
+  "  t.a\n" +
+  "}\n"
+  let r_su = transpile_package([SourceFile::{ rel_path: "su.mbt", content: su_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_su.diagnostics.length() == 0, "local out-of-order effectful struct update has 0 diags")
+  assert_true(str_has(r_su.files[0].content, "__mbt_su_f_"), "local out-of-order effectful struct update binds override temps")
+
+  // P1-2: shadowed `fn panic(...)` must NOT be treated as diverging
+  let pan_src = "priv struct B { a : Int }\n" +
+  "fn panic(_s : String) -> Unit { () }\n" +
+  "pub fn test_pan(v : B?) -> Int {\n" +
+  "  let mut n = 0\n" +
+  "  if v is Some({ a, .. }) && a > 0 { n = 1; panic(\"done\") } else { n = 2 }\n" +
+  "  n\n" +
+  "}\n"
+  let r_pan = transpile_package([SourceFile::{ rel_path: "pan.mbt", content: pan_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_pan.diagnostics.length() == 0, "shadowed panic has 0 diags")
+  assert_true(str_has(r_pan.files[0].content, "Option::None =>"), "shadowed panic must NOT skip Option isolation")
+
+  // P1-3: `val` binder in `is`-chain avoids outer `val_` and sibling `val_`
+  let val_src = "priv struct P { a : Int; b : Int }\n" +
+  "pub fn test_val(v : P?) -> Int {\n" +
+  "  let val_ = 9\n" +
+  "  let r1 = if v is Some({ a: val, .. }) && val > 0 { val * 10 + val_ } else { 0 }\n" +
+  "  let r2 = if v is Some({ a: val, b: val_ }) && val > 0 { val * 10 + val_ } else { 0 }\n" +
+  "  r1 + r2\n" +
+  "}\n"
+  let r_val = transpile_package([SourceFile::{ rel_path: "valb.mbt", content: val_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_val.diagnostics.length() == 0, "val vs val_ binder has 0 diags")
+  assert_true(str_has(r_val.files[0].content, "val_1"), "val binder renamed to val_1 to avoid val_")
+
+  // P1-4: `{ val: a, val_: b }` reads distinct renamed fields
+  let vf_src = "priv struct RF { val : Int; val_ : Int }\n" +
+  "pub fn test_vf(v : RF?) -> Int {\n" +
+  "  if v is Some({ val: a, val_: b }) && true { a * 10 + b } else { 0 }\n" +
+  "}\n"
+  let r_vf = transpile_package([SourceFile::{ rel_path: "vf.mbt", content: vf_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_vf.diagnostics.length() == 0, "val/val_ struct field pattern has 0 diags")
+  assert_true(str_has(r_vf.files[0].content, ".val_1") && str_has(r_vf.files[0].content, ".val_"), "val and val_ fields stay distinct")
+
+  // P1-5: guard condition containing literal `"__MBT_GUARD_LEAF_TUPLE__"` must NOT be corrupted
+  let gs_src = "priv struct S { x : String }\n" +
+  "pub fn test_gs(v : S?) -> String {\n" +
+  "  guard v is Some({ x, .. }) && x == \"__MBT_GUARD_LEAF_TUPLE__\" else { return \"miss\" }\n" +
+  "  \"hit\"\n" +
+  "}\n"
+  let r_gs = transpile_package([SourceFile::{ rel_path: "gs.mbt", content: gs_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_gs.diagnostics.length() == 0, "guard sentinel collision has 0 diags")
+  assert_true(str_has(r_gs.files[0].content, "\"__MBT_GUARD_LEAF_TUPLE__\""), "user string literal preserved intact")
+
+  // Final 5 Astra micro-edge regressions:
+  // (1) explicit `R::{ ..s, ... }` local out-of-order + Float field temp annotation (`b: 0.1`)
+  let row_src = "priv struct Row { mut a : Int; b : Float; c : Int }\n" +
+  "pub fn test_row() -> Int {\n" +
+  "  let s : Row = { a: 1, b: 0.5, c: 3 }\n" +
+  "  let t = Row::{ ..s, c: { s.a = 8; 6 }, b: 0.1 }\n" +
+  "  t.a\n" +
+  "}\n"
+  let r_row = transpile_package([SourceFile::{ rel_path: "row.mbt", content: row_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_row.diagnostics.length() == 0, "explicit R::{ ..s, ... } with Float field has 0 diags")
+  assert_true(str_has(r_row.files[0].content, ": Float ="), "out-of-order temp preserves : Float annotation")
+
+  // (2) package-level `let val_ : Int = 9` avoided by `is`-chain `val` binder
+  let pkg_val_src = "let val_ : Int = 9\n" +
+  "priv struct P { a : Int }\n" +
+  "pub fn test_pkg_val(v : P?) -> Int {\n" +
+  "  if v is Some({ a: val, .. }) && val > 0 { val * 10 + val_ } else { 0 }\n" +
+  "}\n"
+  let r_pv = transpile_package([SourceFile::{ rel_path: "pv.mbt", content: pkg_val_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_pv.diagnostics.length() == 0, "pkg-level val_ avoidance has 0 diags")
+  let mut pv_has_val1 = false
+  for pf in r_pv.files {
+    if str_has(pf.content, "val_1") { pv_has_val1 = true }
+  }
+  assert_true(pv_has_val1, "val binder avoids package-level val_")
+
+  // (3) unknown struct with keyword field `val` in anonymous struct pattern fails closed unconditionally
+  let unk_vf_src = "pub fn test_unk_vf(v : @dep.R?) -> Int {\n" +
+  "  if v is Some({ val: a, val_: b }) && true { a + b } else { 0 }\n" +
+  "}\n"
+  let r_uvf = transpile_package([SourceFile::{ rel_path: "uvf.mbt", content: unk_vf_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let mut has_uvf_err = false
+  for d in r_uvf.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { has_uvf_err = true }
+  }
+  assert_true(has_uvf_err, "unknown struct with keyword field val in anonymous struct pattern must fail closed")
+
+  // (4) overloaded `+` treated as non-pure so local out-of-order update evaluates overrides into temps
+  let op_src = "priv struct P { f : () -> Unit }\n" +
+  "impl Add for P with add(self, _other) { (self.f)(); self }\n" +
+  "priv struct ROp { mut a : Int; b : P; c : Int }\n" +
+  "pub fn test_op(s : ROp, p : P) -> Int {\n" +
+  "  let t = ROp::{ ..s, c: 1, b: p + p }\n" +
+  "  t.a\n" +
+  "}\n"
+  let r_op = transpile_package([SourceFile::{ rel_path: "op.mbt", content: op_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_op.diagnostics.length() == 0, "local overloaded + struct update has 0 diags")
+  assert_true(str_has(r_op.files[0].content, "__mbt_su_f_"), "overloaded + treated as non-pure and bound to temp")
+
+  // (5) generic struct `GenRow[T]` out-of-order update instantiates `T` from `base_ty` and never emits bare `: T =`
+  let gen_src = "priv struct GenRow[T] { mut a : Int; b : T; c : Int }\n" +
+  "priv struct CompRow { mut a : Int; b : Array[Float]; o : Float?; p : (Float, Int); c : Int }\n" +
+  "pub fn test_gen(s : GenRow[Array[Float]], cr : CompRow) -> Int {\n" +
+  "  let t1 = GenRow::{ ..s, c: { s.a = 9; 7 }, b: [0.1] }\n" +
+  "  let t2 = CompRow::{ ..cr, c: { cr.a = 8; 7 }, b: [0.1], o: Some(0.2), p: (0.3, 1) }\n" +
+  "  t1.a + t2.a\n" +
+  "}\n"
+  let r_gen = transpile_package([SourceFile::{ rel_path: "gen.mbt", content: gen_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_gen.diagnostics.length() == 0, "generic/compound struct out-of-order update has 0 diags")
+  assert_true(!str_has(r_gen.files[0].content, ": T ="), "must NOT annotate temp with unbound generic parameter T")
+  assert_true(str_has(r_gen.files[0].content, ": Array[Float] ="), "instantiated Array[Float] temp annotation preserved")
+
+  // (6) Opus P1: `Json::array(fs.map(fn(f) { { "x": ... } }))` preserves `MbtJson::Object(...)`
+  let jmap_src = "priv struct F { x : Double; ok : Bool }\n" +
+  "pub fn demo() -> String {\n" +
+  "  let fs : Array[F] = [{ x: 1.5, ok: true }]\n" +
+  "  let a = Json::array(fs.map(fn(f) { { \"x\": Json::number(f.x), \"ok\": Json::boolean(f.ok) } }))\n" +
+  "  a.stringify()\n" +
+  "}\n"
+  let r_jm = transpile_package([SourceFile::{ rel_path: "jm.mbt", content: jmap_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_jm.diagnostics.length() == 0, "Json::array(fs.map(...)) has 0 diags")
+  assert_true(str_has(r_jm.files[0].content, "mbt_compat::MbtJson::Object("), "map closure inside Json::array emits MbtJson::Object")
+
+  // (7) Qualified `@dep.T` in generic struct `Row[T]` must NOT be rewritten to `dep::Int`
+  let qg_src = "priv struct QRow[T] { mut a : Int; b : @dep.T; d : T; c : Int }\n" +
+  "pub fn test_qg(s : QRow[Int], v : @dep.T) -> Int {\n" +
+  "  let t = QRow::{ ..s, c: { s.a = 9; 7 }, b: v }\n" +
+  "  t.a\n" +
+  "}\n"
+  let r_qg = transpile_package([SourceFile::{ rel_path: "qg.mbt", content: qg_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_qg.diagnostics.length() == 0, "qualified @dep.T in generic struct has 0 diags")
+  assert_true(str_has(r_qg.files[0].content, ": dep::T ="), "preserves dep::T without substituting T -> Int")
+  assert_true(!str_has(r_qg.files[0].content, "dep::Int"), "must NOT rewrite dep::T to dep::Int")
+
+  // (8) Chained `.map(...).map(...)`, `Json::number(m.get("n").unwrap_or(0).to_double())`, and `.filter_map(...)`
+  let jedge_src = "pub fn test_jedge(xs : Array[Int]) -> String {\n" +
+  "  let a1 : Array[Json] = xs.map(fn(x) { { \"n\": x } }).map(fn(m) { Json::number(m.get(\"n\").unwrap_or(0).to_double()) })\n" +
+  "  let a2 : Array[Json] = xs.map(fn(x) { let m : Map[String, Int] = { \"n\": x }; Json::number(m.get(\"n\").unwrap_or(0).to_double()) })\n" +
+  "  let a3 : Array[Json] = xs.filter_map(fn(x) { if x == 0 { None } else { Some({ \"x\": Json::number(1.5) }) } })\n" +
+  "  Json::array(a1).stringify() + Json::array(a2).stringify() + Json::array(a3).stringify()\n" +
+  "}\n"
+  let r_je = transpile_package([SourceFile::{ rel_path: "je.mbt", content: jedge_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_je.diagnostics.length() == 0, "chained map / Json::number / filter_map has 0 diags")
+  assert_true(!str_has(r_je.files[0].content, "unwrap_or(mbt_compat::MbtJson"), "Json::number must not leak MbtJson into unwrap_or(0)")
+  assert_true(str_has(r_je.files[0].content, "Some(mbt_compat::MbtJson::Object("), "filter_map propagates Option[MbtJson] into Some({...})")
+
+  // (9) Grouping parens `(xs.map(...)).map(...)`, `xs.map(...) |> keep`, `(xs.map(...)) |> keep`, and `Json::array(xs.map(...)).stringify()`
+  let jp_src = "fn keep(xs : Array[Json]) -> Array[Json] { xs }\n" +
+  "pub fn test_jpipe(xs : Array[Int]) -> String {\n" +
+  "  let p1 : Array[Json] = xs.map(fn(x) { { \"n\": Json::number(x.to_double()) } }) |> keep\n" +
+  "  let p2 : Array[Json] = (xs.map(fn(x) { { \"n\": Json::number(x.to_double()) } })) |> keep\n" +
+  "  let p3 : Array[Json] = (xs.map(fn(x) { { \"n\": x } })).map(fn(m) { Json::number(m.get(\"n\").unwrap_or(0).to_double()) })\n" +
+  "  let p4 = Json::array(xs.map(fn(x) { { \"n\": Json::number(x.to_double()) } })).stringify()\n" +
+  "  Json::array(p1).stringify() + Json::array(p2).stringify() + Json::array(p3).stringify() + p4\n" +
+  "}\n"
+  let r_jp = transpile_package([SourceFile::{ rel_path: "jp.mbt", content: jp_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_jp.diagnostics.length() == 0, "pipe |> keep & parenthesized chained map has 0 diags")
+  assert_true(str_has(r_jp.files[0].content, "mbt_compat::MbtJson::Object("), "pipe |> keep & Json::array(...).stringify() emit MbtJson::Object")
+  assert_true(str_has(r_jp.files[0].content, "Map::from([(\"n\", x)])") || str_has(r_jp.files[0].content, "ordered_map_from_array([(\"n\", x)])"), "parenthesized (xs.map(...)).map(...) keeps plain Map for first map")
+
+  // (10) Astra R2 4 micro-edges: generic `Array[T] -> T` pipe (`|> head`), `as __mbt_sp_user` in guard,
+  //      local closure shadowing package `fn keep`, and `|> keep2(0, _)` non-0th placeholder position.
+  let r2_src = "priv struct BoxU { a : Int; b : Int }\n" +
+  "fn[T] head_g(xs : Array[T]) -> T { xs[0] }\n" +
+  "fn keep(xs : Array[Json]) -> Array[Json] { xs }\n" +
+  "fn keep2(_n : Int, xs : Array[Json]) -> Array[Json] { xs }\n" +
+  "fn[T] render_g(xs : Array[Json], extra : T) -> String { ignore(extra); Json::array(xs).stringify() }\n" +
+  "pub fn test_r2(xs : Array[Int], __mbt_sp_user : BoxU, r : BoxU?) -> String {\n" +
+  "  let j : Json = xs.map(fn(x) { { \"n\": Json::number(x.to_double()) } }) |> head_g\n" +
+  "  let k2 : Array[Json] = xs.map(fn(x) { { \"n\": Json::number(x.to_double()) } }) |> keep2(0, _)\n" +
+  "  let rg = xs.map(fn(x) { { \"n\": Json::number(x.to_double()) } }) |> render_g(_, 7)\n" +
+  "  let keep = fn(ms : Array[Map[String, Int]]) -> Int { ms[0].get(\"n\").unwrap_or(0) }\n" +
+  "  let sh = xs.map(fn(x) { { \"n\": x } }) |> keep\n" +
+  "  guard r is Some({ a, .. } as __mbt_sp_user) && a > 0 else { return \"0\" }\n" +
+  "  j.stringify() + Json::array(k2).stringify() + rg + sh.to_string() + __mbt_sp_user.b.to_string()\n" +
+  "}\n"
+  let r_r2 = transpile_package([SourceFile::{ rel_path: "r2.mbt", content: r2_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(r_r2.diagnostics.length() == 0, "Astra R2 4 micro-edges have 0 diags")
+  assert_true(str_has(r_r2.files[0].content, "mbt_compat::MbtJson::Object("), "head_g & keep2(0, _) emit MbtJson::Object")
+  assert_true(str_has(r_r2.files[0].content, "let (__mbt_sp_user, a) ="), "guard preserves user explicit alias __mbt_sp_user")
+}
