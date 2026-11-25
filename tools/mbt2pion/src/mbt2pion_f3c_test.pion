@@ -1,0 +1,417 @@
+///| Wave M2-F3c unit tests:
+///| 1. `match` arm `for`/`while` bodies (with `,`/`;`), multiline `match` scrutinees,
+///|    and tuple-destructuring `for (a, b) in xs` / `for i, (a, b) in xs` (fail-closed on refutable patterns)
+///| 2. High-frequency core method helpers (`Array::search_by`, `shrink_to_fit`, `push_iter`, `rev`, `drain`,
+///|    `Option::map_or`, `bind`, `Char::is_ascii_alphabetic`) without custom-type hijack
+///| 3. Recursive nested & tuple-wrapped struct patterns in `match` arms and `is (None | Some({ ... }))`
+
+test "F3c-1a: match arm for-in with comma, C-style for, and multiline match arm body" {
+  let src = "pub fn arm_loops(opt : Int?, pairs : Map[Int, Int], xs : Array[Int]) -> Int {\n" +
+  "  let mut acc = 0\n" +
+  "  match opt {\n" +
+  "    Some(limit) if limit > 0 =>\n" +
+  "      for k, v in pairs {\n" +
+  "        if k < limit {\n" +
+  "          acc = acc + v\n" +
+  "        }\n" +
+  "      }\n" +
+  "    Some(_) =>\n" +
+  "      for i = 0; i < xs.length(); i = i + 1 {\n" +
+  "        acc = acc + xs[i]\n" +
+  "      }\n" +
+  "    None =>\n" +
+  "      match\n" +
+  "        xs.get(0) {\n" +
+  "        Some(v) => acc = acc + v\n" +
+  "        None => ()\n" +
+  "      }\n" +
+  "  }\n" +
+  "  acc\n" +
+  "}\n"
+  let res = transpile_package([SourceFile::{ rel_path: "arm_loops.mbt", content: src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(res.blockers == 0, "match arm loops should transpile with 0 blockers")
+  let out = res.files[0].content
+  assert_true(str_has(out, "{ for k, v in pairs {"), "for k, v in inside match arm stays intact")
+  assert_true(str_has(out, "{ for i = 0; i < xs.length(); i = i + 1 {"), "C-style for inside match arm stays intact")
+  assert_true(!str_has(out, "{ for k },"), "comma in for k, v must never split match arm")
+  assert_true(!str_has(out, "__mbt_sp_"), "multiline match body must never be misparsed as struct pattern")
+}
+
+test "F3c-1b: tuple destructuring for-in lowers cleanly and rejects refutable patterns fail-closed" {
+  let ok_src = "pub fn sum_pairs(xs : Array[(Int, Int)], nested : Array[((Int, Int), Int)]) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  for (a, b) in xs {\n" +
+  "    s = s + a + b\n" +
+  "  }\n" +
+  "  for i, (a, _) in xs {\n" +
+  "    s = s + i * a\n" +
+  "  }\n" +
+  "  for ((x, y), z) in nested {\n" +
+  "    s = s + x + y + z\n" +
+  "  }\n" +
+  "  s\n" +
+  "}\n"
+  let ok_res = transpile_package([SourceFile::{ rel_path: "for_tup.mbt", content: ok_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(ok_res.blockers == 0, "irrefutable tuple for-in should have 0 blockers")
+  let out = ok_res.files[0].content
+  assert_true(str_has(out, "let (a, b) = __mbt_for_"), "for (a, b) in lowers to let (a, b) = tmp")
+  assert_true(str_has(out, "let (a, _) = __mbt_for_"), "for i, (a, _) in lowers to let (a, _) = tmp")
+  assert_true(str_has(out, "let (__mbt_ft_") && str_has(out, "let (x, y) = __mbt_ft_"), "nested tuple for-in flattens cleanly")
+
+  let bad_src = "pub fn bad_for(xs : Array[(Int?, Int)]) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  for (Some(a), b) in xs {\n" +
+  "    s = s + a + b\n" +
+  "  }\n" +
+  "  s\n" +
+  "}\n"
+  let bad_res = transpile_package([SourceFile::{ rel_path: "for_bad.mbt", content: bad_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(bad_res.blockers > 0, "refutable pattern in for-in must fail closed")
+  let mut saw_unsup = false
+  for d in bad_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_unsup = true }
+  }
+  assert_true(saw_unsup, "refutable for-in must emit MBT2PION_UNSUPPORTED_SYNTAX")
+
+  // P1-1: keyword/shadowed tuple binders must match the renamed loop body (emitted before restore_ident_renames)
+  let kw_src = "pub fn kw_tuple_for(xs : Array[(Int, Int)]) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  for (val, move) in xs {\n" +
+  "    s = s + val + move\n" +
+  "  }\n" +
+  "  s\n" +
+  "}\n"
+  let kw_res = transpile_package([SourceFile::{ rel_path: "for_kw.mbt", content: kw_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(kw_res.blockers == 0, "keyword tuple binders in for-in should have 0 blockers")
+  let kw_out = kw_res.files[0].content
+  assert_true(str_has(kw_out, "let (val_, move_) = __mbt_for_"), "keyword tuple binders use renamed idents")
+  assert_true(str_has(kw_out, "s = s + val_ + move_"), "body uses same renamed idents as let binding")
+
+  // P1-2: malformed / 1-element / 0-element tuple headers must fail closed
+  for bad_hdr in ["()", "(a)", "((a), b)", "(a b)"] {
+    let m_src = "pub fn bad_hdr(xs : Array[Int]) -> Int {\n  for " + bad_hdr + " in xs { () }\n  0\n}\n"
+    let m_res = transpile_package([SourceFile::{ rel_path: "for_hdr_bad.mbt", content: m_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+    assert_true(m_res.blockers > 0, "invalid tuple header `" + bad_hdr + "` must fail closed")
+    let mut saw_u = false
+    for d in m_res.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_u = true }
+    }
+    assert_true(saw_u, "invalid tuple header `" + bad_hdr + "` must emit MBT2PION_UNSUPPORTED_SYNTAX")
+  }
+}
+
+test "F3c-2: high-frequency Array/Option/Char methods map to mbt_compat without custom-type hijack" {
+  assert_true(lookup_missing_method_helper("Array[Int]", "search_by") == Some("mbt_compat::arr_search_by"), "Array::search_by mapped")
+  assert_true(lookup_missing_method_helper("Array[Int]", "push_iter") == Some("mbt_compat::arr_push_iter"), "Array::push_iter mapped")
+  assert_true(lookup_missing_method_helper("Array[Int]", "rev") == Some("mbt_compat::arr_rev"), "Array::rev mapped")
+  assert_true(lookup_missing_method_helper("Array[Int]", "drain") == Some("mbt_compat::arr_drain"), "Array::drain mapped")
+  assert_true(lookup_missing_method_helper("Option[Int]", "map_or") == Some("mbt_compat::opt_map_or"), "Option::map_or mapped")
+  assert_true(lookup_missing_method_helper("Option[Int]", "bind") == Some("mbt_compat::opt_bind"), "Option::bind mapped")
+  assert_true(lookup_missing_method_helper("Char", "is_ascii_alphabetic") == Some("mbt_compat::char_is_ascii_alphabetic"), "Char::is_ascii_alphabetic mapped")
+  assert_true(lookup_missing_method_helper("CustomList", "search_by") == None, "custom search_by not hijacked")
+  assert_true(lookup_missing_method_helper("CustomList", "drain") == None, "custom drain not hijacked")
+  assert_true(lookup_missing_method_helper("CustomOpt", "map_or") == None, "custom map_or not hijacked")
+  assert_true(lookup_missing_method_helper("CustomOpt", "bind") == None, "custom bind not hijacked")
+}
+
+test "F3c-3: recursive nested struct patterns, tuple-wrapped struct patterns, and or-is struct patterns" {
+  let src = "priv struct Leaf { rest : Int }\n" +
+  "priv struct Mid { back : Leaf? }\n" +
+  "priv struct Outer { hit : Mid?, way : Leaf? }\n\n" +
+  "pub fn inspect_nested(a : Outer?, b : Mid?) -> Int {\n" +
+  "  if a is None && b is (None | Some({ back: None, .. })) {\n" +
+  "    return -1\n" +
+  "  }\n" +
+  "  let x = match a {\n" +
+  "    Some({ hit: Some({ back: Some(p), .. }), .. }) => p.rest\n" +
+  "    _ => 0\n" +
+  "  }\n" +
+  "  let y = match (a, b) {\n" +
+  "    (Some({ way: Some(w), .. }), _) => w.rest\n" +
+  "    (_, Some({ back: Some(p), .. })) => p.rest + 10\n" +
+  "    _ => 100\n" +
+  "  }\n" +
+  "  x + y\n" +
+  "}\n"
+  let res = transpile_package([SourceFile::{ rel_path: "nested_sp.mbt", content: src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(res.blockers == 0, "nested & tuple struct patterns should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "{ back:"), "no raw struct pattern left in output")
+  assert_true(!str_has(out, "{ way:"), "no raw tuple-wrapped struct pattern left in output")
+  assert_true(!str_has(out, "{ hit:"), "no raw outer struct pattern left in output")
+  assert_true(str_has(out, "match b { Option::None => true, Option::Some("), "is (None | Some({ ... })) lowered cleanly with expected type")
+
+  // P1-3a: nested or-pattern containing struct pattern in match arm must fail closed
+  let or_sp_src = "priv struct Box { a : Int }\n" +
+  "pub fn bad_or_sp(x : Box?, y : Int) -> Int {\n" +
+  "  match (x, y) {\n" +
+  "    (None | Some({ a: 1, .. }), _) => 1\n" +
+  "    _ => 0\n" +
+  "  }\n" +
+  "}\n"
+  let or_sp_res = transpile_package([SourceFile::{ rel_path: "or_sp_bad.mbt", content: or_sp_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(or_sp_res.blockers > 0, "nested or-pattern with struct pattern must fail closed")
+  let mut saw_or_u = false
+  for d in or_sp_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_or_u = true }
+  }
+  assert_true(saw_or_u, "nested or-pattern with struct pattern must emit MBT2PION_UNSUPPORTED_SYNTAX")
+
+  // P1-3b: `is` expression with struct pattern introducing variable bindings (nested, shorthand, `as`) must fail closed
+  for bad_is in [
+    "b is Some({ back: Some(p), .. }) && p.rest > 0",
+    "b is Some({ back, .. })",
+    "b is Some({ back: None, .. } as m)",
+  ] {
+    let is_bind_src = "priv struct Leaf { rest : Int }\n" +
+    "priv struct Mid { back : Leaf? }\n" +
+    "pub fn bad_is_bind(b : Mid?) -> Int {\n" +
+    "  if " + bad_is + " { 1 } else { 0 }\n" +
+    "}\n"
+    let is_bind_res = transpile_package([SourceFile::{ rel_path: "is_bind_bad.mbt", content: is_bind_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+    assert_true(is_bind_res.blockers > 0, "`is` struct pattern with variable binder `" + bad_is + "` must fail closed")
+    let mut saw_is_u = false
+    for d in is_bind_res.diagnostics {
+      if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_is_u = true }
+    }
+    assert_true(saw_is_u, "`is` struct pattern with variable binder `" + bad_is + "` must emit MBT2PION_UNSUPPORTED_SYNTAX")
+  }
+
+  // Red-team: field-level or-pattern inside struct pattern lowers via `(match f { A | B => true, _ => false })`
+  let field_or_src = "priv enum Kind { A; B; C }\n" +
+  "priv struct Item { kind : Kind }\n" +
+  "pub fn check_kind(x : Item?) -> Int {\n" +
+  "  match x {\n" +
+  "    Some({ kind: A | B, .. }) => 1\n" +
+  "    _ => 0\n" +
+  "  }\n" +
+  "}\n"
+  let field_or_res = transpile_package([SourceFile::{ rel_path: "field_or.mbt", content: field_or_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(field_or_res.blockers == 0, "field-level or-pattern inside struct pattern should have 0 blockers")
+  let field_or_out = field_or_res.files[0].content
+  assert_true(str_has(field_or_out, "=> true, _ => false })"), "field-level or-pattern uses match instead of invalid `is A | B`")
+  assert_true(!str_has(field_or_out, " is A | B"), "must not emit invalid Pion `is A | B`")
+}
+
+test "F3c-4: Astra P1 regressions (search_by/iter mutation fail-closed, same-ctor or-is guard, mutating match guard, while block cond)" {
+  // P1-2: same-outer-ctor or-is (`Some({ x: 1 }) | Some({ x: 2 })`) uses `if` guards for fallthrough
+  let or_is_src = "priv struct S { x : Int }\n" +
+  "pub fn check_same_ctor(s : S?) -> Bool {\n" +
+  "  s is (Some({ x: 1 }) | Some({ x: 2 }))\n" +
+  "}\n"
+  let or_is_res = transpile_package([SourceFile::{ rel_path: "same_ctor_is.mbt", content: or_is_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(or_is_res.blockers == 0, "same-ctor or-is should have 0 blockers")
+  let or_is_out = or_is_res.files[0].content
+  assert_true(str_has(or_is_out, "if (__mbt_sp_") && str_has(or_is_out, "=> true"), "same-ctor or-is must emit `if` guard so fallthrough reaches second Some")
+
+  // P1-3: struct pattern with bindings + non-pure `if` guard fails closed; pure `if` guard succeeds
+  let mut_g_src = "priv struct Box { mut x : Int? }\n" +
+  "fn change(b : Box) -> Bool { b.x = Some(9); true }\n" +
+  "pub fn bad_guard(s : Box) -> Int {\n" +
+  "  match (Some(s), 0) {\n" +
+  "    (Some({ x: Some(k) }), _) if change(s) => k\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let mut_g_res = transpile_package([SourceFile::{ rel_path: "guard_change.mbt", content: mut_g_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(mut_g_res.blockers > 0, "non-pure guard with struct-pattern bindings must fail closed")
+  let mut saw_mg = false
+  for d in mut_g_res.diagnostics {
+    if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { saw_mg = true }
+  }
+  assert_true(saw_mg, "non-pure guard with struct-pattern bindings must emit MBT2PION_UNSUPPORTED_SYNTAX")
+
+  let pure_g_src = "priv struct Box { x : Int? }\n" +
+  "pub fn ok_guard(s : Box?, target : Int) -> Int {\n" +
+  "  match s {\n" +
+  "    Some({ x: Some(k) }) if k == target => k\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let pure_g_res = transpile_package([SourceFile::{ rel_path: "guard_pure.mbt", content: pure_g_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(pure_g_res.blockers == 0, "pure guard with struct-pattern bindings should succeed")
+
+  // P1-5: `match` arm `while { n < t } { n = n + 1 }` block condition does not truncate at condition `{`
+  let wh_src = "pub fn while_block_cond(opt : Int?) -> Int {\n" +
+  "  let mut n = 0\n" +
+  "  match opt {\n" +
+  "    Some(t) => while { n < t } { n = n + 1 }\n" +
+  "    None => ()\n" +
+  "  }\n" +
+  "  n\n" +
+  "}\n"
+  let wh_res = transpile_package([SourceFile::{ rel_path: "while_expr.mbt", content: wh_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(wh_res.blockers == 0, "while block condition in match arm should have 0 blockers")
+  let wh_out = wh_res.files[0].content
+  assert_true(str_has(wh_out, "{ while { n < t } { n = n + 1 } }"), "while block condition and loop body both stay inside match arm wrapper")
+
+  // P1-1: `Array::search_by` callback mutating receiver fails closed via Stage B guard
+  let sb_pop_diags : Array[Diag] = []
+  let sb_pop_src = "pub fn f(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { if x == 1 { let _ = xs.pop() }; x == 2 })\n}\n"
+  let sb_ft1 : Map[String, Array[Token]] = Map()
+  let sb_pf1 : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(sb_ft1, sb_pf1, "sb_pop.pion", sb_pop_src, 2, 6, "search_by", sb_pop_diags)
+  assert_true(sb_pop_diags.length() > 0, "search_by callback calling xs.pop() must fail closed")
+
+  let sb_wr_diags : Array[Diag] = []
+  let sb_wr_src = "pub fn f(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { xs[1] = 99; x == 2 })\n}\n"
+  let sb_ft2 : Map[String, Array[Token]] = Map()
+  let sb_pf2 : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(sb_ft2, sb_pf2, "sb_wr.pion", sb_wr_src, 2, 6, "search_by", sb_wr_diags)
+  assert_true(sb_wr_diags.length() > 0, "search_by callback mutating xs[1] must fail closed")
+
+  // Architect hardening: pipe-operator `|>` in guard with struct-pattern bindings must fail closed
+  let pipe_g_src = "priv struct Box { mut x : Int? }\n" +
+  "fn change(b : Box) -> Bool { b.x = Some(9); true }\n" +
+  "pub fn bad_pipe_guard(s : Box) -> Int {\n" +
+  "  match (Some(s), 0) {\n" +
+  "    (Some({ x: Some(k) }), _) if s |> change => k\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let pipe_g_res = transpile_package([SourceFile::{ rel_path: "guard_pipe.mbt", content: pipe_g_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(pipe_g_res.blockers > 0, "pipe operator in guard with struct-pattern bindings must fail closed")
+
+  // Red-team P1-1: `while` / `for` in match arm followed on the next line by `(2, n) => ...` or `.B => ...`
+  let next_arm_src = "priv enum Tag { A; B }\n" +
+  "pub fn loop_next_tuple_arm(x : (Int, Int)) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  match x {\n" +
+  "    (1, n) => while s < n { s = s + 1 }\n" +
+  "    (2, n) => { s = n * 10 }\n" +
+  "    _ => ()\n" +
+  "  }\n" +
+  "  s\n" +
+  "}\n" +
+  "pub fn loop_next_dot_arm(t : Tag, n : Int) -> Int {\n" +
+  "  let mut s = 0\n" +
+  "  match t {\n" +
+  "    .A => for i = 0; i < n; i = i + 1 { s = s + i }\n" +
+  "    .B => { s = 99 }\n" +
+  "  }\n" +
+  "  s\n" +
+  "}\n"
+  let next_arm_res = transpile_package([SourceFile::{ rel_path: "loop_next_arm.mbt", content: next_arm_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(next_arm_res.blockers == 0, "while/for arm followed by next-line tuple/dot match arm should have 0 blockers")
+  let next_arm_out = next_arm_res.files[0].content
+  assert_true(str_has(next_arm_out, "(1, n) => { while s < n { s = s + 1 } }"), "while arm must close before next-line `(2, n) =>` arm")
+  assert_true(str_has(next_arm_out, "(2, n) => { s = n * 10 }"), "next-line `(2, n) =>` arm must stay intact")
+  assert_true(str_has(next_arm_out, "=> { s = 99 }"), "next-line `.B =>` arm must stay intact")
+
+  // InterpString in guard & search_by callback fails closed
+  let g_interp_src = "priv struct Box { mut x : Int? }\n" +
+  "fn change(b : Box) -> Int { b.x = Some(9); 1 }\n" +
+  "pub fn bad_interp_guard(s : Box) -> Int {\n" +
+  "  match (Some(s), 0) {\n" +
+  "    (Some({ x: Some(k) }), _) if \"\\{change(s)}\" == \"1\" => k\n" +
+  "    _ => -1\n" +
+  "  }\n" +
+  "}\n"
+  let g_interp_res = transpile_package([SourceFile::{ rel_path: "guard_interp.mbt", content: g_interp_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(g_interp_res.blockers > 0, "InterpString in guard with struct-pattern bindings must fail closed")
+
+  let sb_eff_diags : Array[Diag] = []
+  let sb_eff_src = "pub fn f(xs : Array[Int]) -> Option[Int] {\n  xs.search_by(fn(x) { let _ = \"\\{xs.pop()}\"; x == 2 })\n}\n"
+  let sb_eff_ft : Map[String, Array[Token]] = Map()
+  let sb_eff_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(sb_eff_ft, sb_eff_pf, "search_effect.pion", sb_eff_src, 2, 6, "search_by", sb_eff_diags)
+  assert_true(sb_eff_diags.length() > 0, "search_by callback with InterpString must fail closed")
+
+  // Multiline lowercase method chain `.ok()` after block condition in `while` arm
+  let wd_src = "priv struct CBox { n : Int }\n" +
+  "fn CBox::ok(self : CBox) -> Bool { self.n > 0 }\n" +
+  "pub fn while_dot_cond(opt : Int?) -> Int {\n" +
+  "  let mut n = 3\n" +
+  "  match opt {\n" +
+  "    Some(_) => while { CBox::{ n: n } }\n" +
+  "      .ok() { n = n - 1 }\n" +
+  "    None => ()\n" +
+  "  }\n" +
+  "  n\n" +
+  "}\n"
+  let wd_res = transpile_package([SourceFile::{ rel_path: "while_dot.mbt", content: wd_src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(wd_res.blockers == 0, "multiline `.ok()` continuation after while block condition should have 0 blockers")
+  let wd_out = wd_res.files[0].content
+  assert_true(str_has(wd_out, ".ok() { n = n - 1 } }"), "multiline `.ok()` and loop body must stay inside match arm wrapper")
+
+  // Strict `search_by` 5 mathematical invariants:
+  // (1) shadow_match: `Some(h) => let a = h.copy()` shadowing top-level `let h = [1]` fails closed
+  let sm_diags : Array[Diag] = []
+  let sm_src = "pub fn f(opt : Option[Holder]) -> Option[Int] {\n  let h = [1]\n  match opt {\n    Some(h) => {\n      let a = h.copy()\n      h.xs.search_by(fn(x) { a.push(5); a[1] = 7; x == 2 })\n    }\n    None => None\n  }\n}\n"
+  let sm_ft : Map[String, Array[Token]] = Map()
+  let sm_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(sm_ft, sm_pf, "shadow_match.pion", sm_src, 6, 12, "search_by", sm_diags)
+  assert_true(sm_diags.length() > 0, "shadow_match must taint `h` and fail closed on search_by")
+
+  // (2) samesig: param `touch` shadowing pure package fn `touch()` fails closed
+  let ss_diags : Array[Diag] = []
+  let ss_src = "fn touch() -> Unit { () }\npub fn f(xs : Array[Int], touch : () -> Unit) -> Option[Int] {\n  xs.search_by(fn(x) { if x == 1 { touch() }; x == 2 })\n}\n"
+  let ss_ft : Map[String, Array[Token]] = Map()
+  let ss_pf = collect_stage_b_pkg_fns_cached([GeneratedFile::{ rel_path: "samesig.pion", content: ss_src, source_file: "samesig.mbt", anchors: [] }], ss_ft)
+  stage_b_check_array_retain_mutation_cached(ss_ft, ss_pf, "samesig.pion", ss_src, 3, 6, "search_by", ss_diags)
+  assert_true(ss_diags.length() > 0, "param shadowing same-named pkg fn `touch` must fail closed on search_by")
+
+  // (3) element_cb: non-inline non-ident callback `cb[0]` fails closed
+  let ec_diags : Array[Diag] = []
+  let ec_src = "pub fn f(xs : Array[Int], cb : Array[(Int) -> Bool]) -> Option[Int] {\n  xs.search_by(cb[0])\n}\n"
+  let ec_ft : Map[String, Array[Token]] = Map()
+  let ec_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(ec_ft, ec_pf, "element_cb.pion", ec_src, 2, 6, "search_by", ec_diags)
+  assert_true(ec_diags.length() > 0, "indexed callback `cb[0]` in search_by must fail closed")
+
+  // (4) nestedhigher: dot method call `z.map(cb)` inside search_by callback fails closed
+  let nh_diags : Array[Diag] = []
+  let nh_src = "pub fn f(xs : Array[Int], z : Array[Int], cb : (Int) -> Int) -> Option[Int] {\n  xs.search_by(fn(x) { let _ = z.map(cb); x == 2 })\n}\n"
+  let nh_ft : Map[String, Array[Token]] = Map()
+  let nh_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(nh_ft, nh_pf, "nestedhigher.pion", nh_src, 2, 6, "search_by", nh_diags)
+  assert_true(nh_diags.length() > 0, "nested higher-order dot call `z.map(cb)` in search_by must fail closed")
+
+  // (5) 3-segment cross-package qualified call `dep::Holder::touch(h)` fails closed
+  let dq_diags : Array[Diag] = []
+  let dq_src = "pub fn f(xs : Array[Int], h : dep::Holder) -> Option[Int] {\n  xs.search_by(fn(x) { dep::Holder::touch(h); x == 2 })\n}\n"
+  let dq_ft : Map[String, Array[Token]] = Map()
+  let dq_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(dq_ft, dq_pf, "dep_qual.pion", dq_src, 2, 6, "search_by", dq_diags)
+  assert_true(dq_diags.length() > 0, "3-segment qualified call `dep::Holder::touch(h)` in search_by must fail closed")
+
+  // (6) Cross-package dot method `h.length()` inside search_by callback fails closed
+  let hl_diags : Array[Diag] = []
+  let hl_src = "pub fn f(xs : Array[Int], h : dep::Holder) -> Option[Int] {\n  xs.search_by(fn(x) { let _ = h.length(); x == 2 })\n}\n"
+  let hl_ft : Map[String, Array[Token]] = Map()
+  let hl_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(hl_ft, hl_pf, "holder_len.pion", hl_src, 2, 6, "search_by", hl_diags)
+  assert_true(hl_diags.length() > 0, "cross-package dot method `h.length()` in search_by must fail closed")
+
+  // Positive: unshadowed `physical_equal(c, b)` in search_by passes with 0 diagnostics
+  let pe_diags : Array[Diag] = []
+  let pe_src = "pub fn f(xs : Array[Int], b : Int) -> Option[Int] {\n  xs.search_by(fn(c) { physical_equal(c, b) })\n}\n"
+  let pe_ft : Map[String, Array[Token]] = Map()
+  let pe_pf : Map[String, StageBPkgFn] = Map()
+  stage_b_check_array_retain_mutation_cached(pe_ft, pe_pf, "phys_eq.pion", pe_src, 2, 6, "search_by", pe_diags)
+  assert_true(pe_diags.length() == 0, "unshadowed physical_equal in search_by must pass")
+
+  // `Array::push_iter` strict guard: allow ONLY proven `mbt_compat::arr_iter(...)`; fail-closed on mapped/opaque/custom iterators
+  let pi_ok_diags : Array[Diag] = []
+  let pi_ok_src = "pub fn f(xs : Array[Int]) -> Unit {\n  xs.push_iter(mbt_compat::arr_iter(xs))\n}\n"
+  let pi_ok_ft : Map[String, Array[Token]] = Map()
+  assert_true(stage_b_check_push_iter_arg(pi_ok_ft, "pi_ok.pion", pi_ok_src, 2, 6, false, pi_ok_diags) == 1, "push_iter(mbt_compat::arr_iter(xs)) must be allowed")
+  assert_true(pi_ok_diags.length() == 0, "push_iter(mbt_compat::arr_iter(xs)) must emit 0 diagnostics")
+
+  let pi_map_diags : Array[Diag] = []
+  let pi_map_src = "pub fn f(xs : Array[Int]) -> Unit {\n  xs.push_iter(xs.iter().map(fn(x) { if xs.length() == 4 { xs[2] = 9 }; x }))\n}\n"
+  let pi_map_ft : Map[String, Array[Token]] = Map()
+  assert_true(stage_b_check_push_iter_arg(pi_map_ft, "pi_map.pion", pi_map_src, 2, 6, true, pi_map_diags) == -1, "push_iter(xs.iter().map(...)) must fail closed")
+  assert_true(pi_map_diags.length() > 0 && pi_map_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "push_iter(xs.iter().map(...)) must emit MBT2PION_ARRAY_ITER_MUTATION")
+
+  let pi_opq_diags : Array[Diag] = []
+  let pi_opq_src = "pub fn f(xs : Array[Int], it : MbtIter[Int]) -> Unit {\n  xs.push_iter(it)\n}\n"
+  let pi_opq_ft : Map[String, Array[Token]] = Map()
+  assert_true(stage_b_check_push_iter_arg(pi_opq_ft, "pi_opq.pion", pi_opq_src, 2, 6, false, pi_opq_diags) == -1, "push_iter(it) opaque iterator must fail closed")
+  assert_true(pi_opq_diags.length() > 0 && pi_opq_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "push_iter(it) must emit MBT2PION_ARRAY_ITER_MUTATION")
+
+  let pi_evil_diags : Array[Diag] = []
+  let pi_evil_src = "pub fn f(xs : Array[Int], evil : Evil) -> Unit {\n  mbt_compat::arr_push_iter(xs, evil.iter())\n}\n"
+  stage_b_audit_final_push_iter_calls([GeneratedFile::{ rel_path: "pi_evil.pion", content: pi_evil_src, source_file: "pi_evil.mbt", anchors: [] }], pi_evil_diags)
+  assert_true(pi_evil_diags.length() > 0 && pi_evil_diags[0].code == "MBT2PION_ARRAY_ITER_MUTATION", "post-convergence arr_push_iter(xs, evil.iter()) must emit MBT2PION_ARRAY_ITER_MUTATION")
+}

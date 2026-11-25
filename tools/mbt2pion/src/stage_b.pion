@@ -41,6 +41,10 @@ pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) 
     if method_name == "get" { return Some("mbt_compat::arr_get") }
     if method_name == "release_unused" { return Some("mbt_compat::arr_release_unused") }
     if method_name == "iter" { return Some("mbt_compat::arr_iter") }
+    if method_name == "search_by" { return Some("mbt_compat::arr_search_by") }
+    if method_name == "push_iter" { return Some("mbt_compat::arr_push_iter") }
+    if method_name == "rev" { return Some("mbt_compat::arr_rev") }
+    if method_name == "drain" { return Some("mbt_compat::arr_drain") }
   }
   if receiver_ty.starts_with("FixedArray[") {
     if method_name == "unsafe_get" { return Some("mbt_compat::fixed_array_unsafe_get") }
@@ -68,6 +72,8 @@ pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) 
   }
   if receiver_ty.starts_with("Option[") {
     if method_name == "map" { return Some("mbt_compat::opt_map") }
+    if method_name == "map_or" { return Some("mbt_compat::opt_map_or") }
+    if method_name == "bind" { return Some("mbt_compat::opt_bind") }
     if method_name == "unwrap" { return Some("mbt_compat::opt_unwrap") }
     if method_name == "or" { return Some("mbt_compat::opt_or") }
     if method_name == "is_empty" { return Some("mbt_compat::opt_is_empty") }
@@ -93,6 +99,7 @@ pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) 
   }
   if receiver_ty == "Char" {
     if method_name == "is_ascii_digit" { return Some("mbt_compat::char_is_ascii_digit") }
+    if method_name == "is_ascii_alphabetic" { return Some("mbt_compat::char_is_ascii_alphabetic") }
     if method_name == "to_ascii_lowercase" { return Some("mbt_compat::char_to_ascii_lowercase") }
   }
   if receiver_ty == "Byte" {
@@ -1710,7 +1717,8 @@ pub fn run_stage_b_with_ops(
             Some((mname, rty)) =>
             match lookup_missing_method_helper(rty, mname) {
               Some(helper) => {
-                if helper == "mbt_compat::arr_retain" || helper == "mbt_compat::arr_filter_map" {
+                if helper == "mbt_compat::arr_retain" || helper == "mbt_compat::arr_filter_map" ||
+                helper == "mbt_compat::arr_search_by" {
                   let pkg_fns = match round_pkg_fns {
                     Some(m) => m
                     None => {
@@ -1721,13 +1729,22 @@ pub fn run_stage_b_with_ops(
                   }
                   stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
                 }
-                let direct_end = if (mname == "unsafe_get" || mname == "unsafe_set") &&
+                let mut skip_rewrite = false
+                if helper == "mbt_compat::arr_push_iter" {
+                  let pi_status = stage_b_check_push_iter_arg(round_file_tokens, f.rel_path, f.content, d.line, d.col, true, diags)
+                  if pi_status < 0 {
+                    skip_rewrite = true
+                  }
+                }
+                let direct_end = if !skip_rewrite && (mname == "unsafe_get" || mname == "unsafe_set") &&
                 (rty.starts_with("Array[") || rty.starts_with("FixedArray[")) {
                   rewrite_unsafe_index_at(lines, lidx, d.col, mname)
                 } else {
                   -1
                 }
-                if direct_end >= 0 {
+                if skip_rewrite {
+                  ()
+                } else if direct_end >= 0 {
                   let mut ml = lidx + 1
                   while ml <= direct_end {
                     mutated_lines[ml] = true
@@ -2068,7 +2085,8 @@ pub fn run_stage_b_with_ops(
           //    NEVER snapshot via `.to_array()` / `str_scalars`! Advance cursor BEFORE body so `continue`/`break`/`return` work!
           if !line_mutated && str_has(d.message, "`for ... in` requires an `Array[T]`") {
             let in_idx = ln.index_of(" in ")
-            let lb_idx = ln.index_of(" {")
+            let lb_rel = if in_idx > 0 { ln.slice(in_idx + 4, ln.length()).index_of(" {") } else { -1 }
+            let lb_idx = if lb_rel >= 0 { in_idx + 4 + lb_rel } else { -1 }
             if in_idx > 0 && lb_idx > in_idx {
               let iter_expr = ln.slice(in_idx + 4, lb_idx).trim()
               let binders = ln.slice(0, in_idx)
@@ -2678,5 +2696,140 @@ pub fn run_stage_b_with_ops(
     }
   }
 
+  // Final post-convergence audit: every `mbt_compat::arr_push_iter(dst, arg)` MUST have its
+  // 2nd argument proven as `mbt_compat::arr_iter(...)` (catches custom `Evil::iter()` that never lowered).
+  stage_b_audit_final_push_iter_calls(cur_files, diags)
+
   (cur_files, iter, final_hist)
+}
+
+fn stage_b_audit_final_push_iter_calls(cur_files : Array[GeneratedFile], diags : Array[Diag]) -> Unit {
+  for f in cur_files {
+    if !str_has(f.content, "arr_push_iter(") {
+      continue
+    }
+    let tokens = lex_moonbit(f.content)
+    let n = tokens.length() - 1
+    let mut i = 0
+    while i + 3 < n {
+      if tokens[i].raw == "mbt_compat" && tokens[i + 1].kind == TokenKind::ColonColon &&
+      tokens[i + 2].raw == "arr_push_iter" && tokens[i + 3].kind == TokenKind::LParen {
+        let cp = find_matching_delim(tokens, i + 3)
+        // Find depth-0 comma separating arg0 (`dst`) and arg1 (`it`)
+        let mut comma_i = -1
+        let mut d = 0
+        let mut j = i + 4
+        while j < cp {
+          let jk = tokens[j].kind
+          if jk == TokenKind::LParen || jk == TokenKind::LBracket || jk == TokenKind::LBrace { d = d + 1 }
+          else if jk == TokenKind::RParen || jk == TokenKind::RBracket || jk == TokenKind::RBrace { d = d - 1 }
+          else if d == 0 && jk == TokenKind::Comma { comma_i = j; break }
+          j = j + 1
+        }
+        let arg_s = comma_i + 1
+        let arg_e = cp
+        let is_proven_arr_iter = comma_i > 0 && arg_e >= arg_s + 5 &&
+        tokens[arg_s].raw == "mbt_compat" && tokens[arg_s + 1].kind == TokenKind::ColonColon &&
+        tokens[arg_s + 2].raw == "arr_iter" && tokens[arg_s + 3].kind == TokenKind::LParen &&
+        find_matching_delim(tokens, arg_s + 3) == arg_e - 1
+        if !is_proven_arr_iter {
+          let line = tokens[i + 2].line
+          let col = tokens[i + 2].col
+          let mut dup = false
+          for existing in diags {
+            if existing.code == "MBT2PION_ARRAY_ITER_MUTATION" && existing.file == f.rel_path && existing.line == line && existing.col == col {
+              dup = true
+              break
+            }
+          }
+          if !dup {
+            diags.push(diag_error(
+              "MBT2PION_ARRAY_ITER_MUTATION",
+              f.rel_path,
+              line,
+              col,
+              "`Array::push_iter(...)` only supports bare `Array::iter()` arguments (fail-closed against callback/custom-iterator mutation)",
+            ))
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+}
+
+///| Stage B fail-closed guard for `Array::push_iter(arg)`:
+///| Returns:
+///|   1  -> `arg` is proven `mbt_compat::arr_iter(...)` (pure array iterator, zero user callbacks): allow rewrite.
+///|   0  -> `arg` still ends with `.iter()` and an `arr_iter` rewrite is pending in this file/round: defer 1 round.
+///|  -1  -> `arg` is non-array / custom `.iter()` / mapped iterator / opaque variable: emit `MBT2PION_ARRAY_ITER_MUTATION` and block rewrite.
+fn stage_b_check_push_iter_arg(
+  file_tokens : Map[String, Array[Token]],
+  f_rel : String,
+  content : String,
+  line : Int,
+  col : Int,
+  has_pending_arr_iter : Bool,
+  diags : Array[Diag],
+) -> Int {
+  let tokens = match file_tokens.get(f_rel) {
+    Some(ts) => ts
+    None => {
+      let ts = lex_moonbit(content)
+      file_tokens[f_rel] = ts
+      ts
+    }
+  }
+  let n = tokens.length() - 1
+  let mut dot_i = -1
+  let mut best_dist = 1000000
+  let mut ti = 0
+  while ti + 2 < n {
+    if tokens[ti].kind == TokenKind::Dot && tokens[ti + 1].raw == "push_iter" &&
+    tokens[ti + 2].kind == TokenKind::LParen && tokens[ti + 1].line == line {
+      let dist = if tokens[ti + 1].col >= col { tokens[ti + 1].col - col } else { col - tokens[ti + 1].col }
+      if dist < best_dist {
+        best_dist = dist
+        dot_i = ti
+      }
+    }
+    ti = ti + 1
+  }
+  if dot_i <= 0 {
+    return -1
+  }
+  let arg_s = dot_i + 3
+  let arg_e = find_matching_delim(tokens, dot_i + 2)
+  // Case A: exact `mbt_compat::arr_iter(...)` proven by `pionc check`
+  if arg_e >= arg_s + 5 && tokens[arg_s].raw == "mbt_compat" &&
+  tokens[arg_s + 1].kind == TokenKind::ColonColon && tokens[arg_s + 2].raw == "arr_iter" &&
+  tokens[arg_s + 3].kind == TokenKind::LParen && find_matching_delim(tokens, arg_s + 3) == arg_e - 1 {
+    return 1
+  }
+  // Case B: ends with `.iter()` — wait 1 round only if an `arr_iter` rewrite is pending in this file
+  if arg_e >= arg_s + 4 && tokens[arg_e - 4].kind == TokenKind::Dot &&
+  tokens[arg_e - 3].raw == "iter" && tokens[arg_e - 2].kind == TokenKind::LParen &&
+  tokens[arg_e - 1].kind == TokenKind::RParen {
+    if has_pending_arr_iter {
+      return 0
+    }
+  }
+  // Case B-fail / Case C: fail-closed with `MBT2PION_ARRAY_ITER_MUTATION`
+  let mut dup = false
+  for existing in diags {
+    if existing.code == "MBT2PION_ARRAY_ITER_MUTATION" && existing.file == f_rel && existing.line == line && existing.col == col {
+      dup = true
+      break
+    }
+  }
+  if !dup {
+    diags.push(diag_error(
+      "MBT2PION_ARRAY_ITER_MUTATION",
+      f_rel,
+      line,
+      col,
+      "`Array::push_iter(...)` only supports bare `Array::iter()` arguments (fail-closed against callback/custom-iterator mutation)",
+    ))
+  }
+  -1
 }
