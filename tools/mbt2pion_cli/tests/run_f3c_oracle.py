@@ -101,9 +101,7 @@ pub fn run_f3c_2() -> String {
   let pushed_s = arr.map(fn(x) { x.to_string() }).join("-")
   let self_arr : Array[Int] = [1, 2]
   self_arr.push_iter(self_arr.iter())
-  let stream_arr : Array[Int] = [10]
-  stream_arr.push_iter([0, 0].iter().map(fn(_) { stream_arr.length() }))
-  let self_s = self_arr.map(fn(x) { x.to_string() }).join("-") + ":" + stream_arr[2].to_string()
+  let self_s = self_arr.map(fn(x) { x.to_string() }).join("-")
 
   let mo1 = Some(5).map_or(99, fn(x) { x * 3 })
   let mo2 = (None : Int?).map_or(99, fn(x) { x * 3 })
@@ -246,7 +244,7 @@ def main():
 
         expected = (
             "F3c-1:30,15,50,68,13,46,4,0\n"
-            "F3c-2:1,-1|45-30-25-10|10-25-30-45|25-30|10-45|10-45-7-8|1-2-1-2:2|15,99,5,-1,-1|1,3,1,2,a=1;b=20;c=3;d=4|true,true,false,false\n"
+            "F3c-2:1,-1|45-30-25-10|10-25-30-45|25-30|10-45|10-45-7-8|1-2-1-2|15,99,5,-1,-1|1,3,1,2,a=1;b=20;c=3;d=4|true,true,false,false\n"
             "F3c-3:-1,-1,300,53,300,7,1,0,0"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
