@@ -241,10 +241,31 @@ pub fn run_f3b_9() -> String {
   nz.to_string() + "|" + b"a\"b\\c\n".to_string() + "|" + by.to_string() + "|" + "\{by}"
 }
 
+priv struct Reading2 {
+  f : Float
+}
+
+impl Show for Reading2 with output(self, logger) {
+  logger.write_string("\{self.f + self.f}")
+}
+
+fn get_float() -> Float {
+  0.1
+}
+
+pub fn run_f3b_10() -> String {
+  let r : Reading2 = { f: 0.1 }
+  let half : Float = 2.5
+  let ml =
+    $|v=\{half},\{-half}
+  Show::to_string(r) + "|" + "\{get_float()}" + "|" + "\{-half}" + "|" + "\{0.1 + 0.2}" + "|" +
+  "\{if half > 1.0 { half } else { -half }}" + "|" + ml
+}
+
 pub fn run_all() -> String {
   "F3b-1:" + run_f3b_1() + "\nF3b-2:" + run_f3b_2() + "\nF3b-3:" + run_f3b_3() + "\nF3b-4:" + run_f3b_4() +
   "\nF3b-5:" + run_f3b_5() + "\nF3b-6:" + run_f3b_6() + "\nF3b-7:" + run_f3b_7() +
-  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9()
+  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9() + "\nF3b-10:" + run_f3b_10()
 }
 '''
 
@@ -502,7 +523,8 @@ def main():
             "F3b-6:314104,2502,2302\n"
             "F3b-7:[ab][abc][][héllo][xé][A]1\n"
             "F3b-8:7\n"
-            "F3b-9:0.1|b\"abc\"|0.1|b\"abc\"|97|1e-7,1e+21,3.4028235e+38,0.33333334|2.5|0|b\"a\\x22b\\x5cc\\x0a\"|97|97"
+            "F3b-9:0.1|b\"abc\"|0.1|b\"abc\"|97|1e-7,1e+21,3.4028235e+38,0.33333334|2.5|0|b\"a\\x22b\\x5cc\\x0a\"|97|97\n"
+            "F3b-10:0.2|0.1|-2.5|0.30000000000000004|2.5|v=2.5,-2.5"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
