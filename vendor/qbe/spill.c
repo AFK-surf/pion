@@ -110,6 +110,7 @@ static Tmp *tmp;  /* current temporaries (for tcmpX) */
 static int ntmp;  /* current # of temps (for limit) */
 static int locs;  /* stack size used by locals */
 static int slot4; /* next slot of 4 bytes */
+static int hasvectorhome, hasvector;
 static int slot8; /* ditto, 8 bytes */
 static BSet mask[2][1]; /* class masks */
 static BSet l2b[1], pmu[1]; /* scratch bitsets for limit2() and dopm() */
@@ -153,7 +154,13 @@ slot(int t)
 		 *
 		 * invariant: slot4 <= slot8
 		 */
-		if (KWIDE(tmp[t].cls)) {
+		if (tmp[t].cls == Kv2d) {
+			/* slot indices grow in units of four bytes. Reserve a
+			 * separate aligned quartet and close the scalar hole. */
+			s = ((locs + slot8 + 3) & -4) - locs;
+			slot4 = slot8 = s + 4;
+			hasvectorhome = 1;
+		} else if (KWIDE(tmp[t].cls)) {
 			s = slot8;
 			if (slot4 == slot8)
 				slot4 += 2;
@@ -297,7 +304,7 @@ static void
 store(Ref r, int s)
 {
 	if (s != -1)
-		emit(Ostorew + tmp[r.val].cls, 0, R, r, SLOT(s));
+		emit(tmp[r.val].cls == Kv2d ? Ovstore : Ostorew + tmp[r.val].cls, 0, R, r, SLOT(s));
 }
 
 static int
@@ -337,6 +344,14 @@ dopm(Blk *b, Ins *i, BSet *v)
 	bscopy(pmu, v);
 	if (i != b->ins && (i-1)->op == Ocall) {
 		v->t[0] &= ~T.retregs((i-1)->arg[1], 0);
+		/* AAPCS64 preserves only the low D half of v8-v15. SysV
+		 * preserves no XMM register. Save the whole packet in either ABI. */
+		if (hasvector)
+			for (t = Tmp0; bsiter(v, &t); t++)
+				if (tmp[t].cls == Kv2d) {
+					slot(t);
+					bsclr(v, t);
+				}
 		limitregs(v, T.nrsave[0], T.nrsave[1], 0);
 		for (n=0, r=0; T.rsave[n]>=0; n++)
 			r |= BIT(T.rsave[n]);
@@ -401,6 +416,8 @@ spill(Fn *fn)
 	bsinit(l2b, ntmp);
 	bsinit(pmu, ntmp);
 	locs = fn->firstspill = fn->slot;
+	hasvectorhome = 0;
+	hasvector = fn->packed;
 	slot4 = 0;
 	slot8 = 0;
 	for (t=0; t<ntmp; t++) {
@@ -621,8 +638,15 @@ spill(Fn *fn)
 
 	/* align the locals to a 16 byte boundary */
 	/* specific to NAlign == 3 */
-	slot8 += slot8 & 3;
-	fn->slot += slot8;
+	if (hasvectorhome) {
+		fn->slot = (locs + slot8 + 3) & -4;
+		/* A vector home is a 16-byte aligned quartet of the frame. */
+		if (fn->salign < 4)
+			fn->salign = 4;
+	} else {
+		slot8 += slot8 & 3;
+		fn->slot += slot8;
+	}
 
 	if (debug['S']) {
 		fprintf(stderr, "\n> Block information:\n");

@@ -213,11 +213,12 @@ enum {
 	Kw,
 	Kl,
 	Ks,
-	Kd
+	Kd,
+	Kv2d = 7 /* 2 x f64, shares the floating register file */
 };
 
 #define KWIDE(k) ((k)&1)
-#define KBASE(k) ((k)>>1)
+#define KBASE(k) ((k) == Kv2d ? 1 : ((k)>>1))
 
 struct Op {
 	char *name;
@@ -234,9 +235,12 @@ struct Op {
 	uint pinned:1;    /* GCM pinned op? */
 };
 
+/* Keep the instruction header one word. Separate halfwords avoid masking
+ * every opcode read in the scalar passes. These fields are not serialized. */
+MAKESURE(opcode_fits_halfword, NOp <= UINT16_MAX);
 struct Ins {
-	uint op:30;
-	uint cls:2;
+	uint16_t op;
+	uint16_t cls;
 	Ref to;
 	Ref arg[2];
 };
@@ -425,6 +429,8 @@ struct Fn {
 	int salign;
 	char vararg;
 	char dynalloc;
+	uchar doubleStores; /* capped at two for the SLP eligibility test */
+	uchar packed;
 	char leaf;
 	char *name;
 	Lnk lnk;
