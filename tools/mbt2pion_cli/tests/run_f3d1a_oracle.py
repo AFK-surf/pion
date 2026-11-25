@@ -564,6 +564,31 @@ pub fn handed_closure_before_iter() -> Int {
   it.to_array().length()
 }
 
+pub fn handed_param_closure(xs : Array[Int]) -> Int {
+  let g = fn() { let _ = xs.pop() }
+  neg_on(g)
+  let it = xs.iter()
+  neg_fire()
+  it.to_array().length()
+}
+
+fn sort_mut_key(xs : Array[Int], touch : (Int) -> Int) -> Unit {
+  let mut g = fn(x : Int) { x }
+  g = touch
+  xs.sort_by_key(fn(x) { g(x) })
+}
+
+fn sort_interp_key(xs : Array[Int], touch : () -> Unit) -> Unit {
+  let g = fn() {
+    touch()
+    "k"
+  }
+  xs.sort_by_key(fn(x) {
+    let _ = "\{g()}"
+    x
+  })
+}
+
 fn sort_touch(xs : Array[Int], touch : () -> Unit) -> Unit {
   xs.sort_by_key(fn(x) {
     touch()
@@ -779,6 +804,9 @@ def main():
                         "piped into `Map::from_array`", "reached from `helper2`",
                         "in a closure defined before the iterator", "key closure is not supported",
                         "`handed.pop(..)` runs while it is kept (in a closure defined before the iterator)",
+                        "`.pop(..)` runs while an iterator of a computed array is kept (in a closure defined before the iterator)",
+                        "key closure is not supported: the callback makes a call to `g(..)`",
+                        "(through `g` in a string interpolation)",
                         "runs while an iterator of a computed array is kept", "(in a string interpolation)",
                         "comes from outside `trim_alias`"])
         expect_blocked(bin_path, args.pionc, md, work, "negmap", NEG_MAP_MBT, "MBT2PION_UNSUPPORTED_SYNTAX",
