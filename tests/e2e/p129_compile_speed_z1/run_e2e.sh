@@ -8,20 +8,23 @@
 #      trees, 1,500 mixed `&&` / `||` comparisons, 1,200-part String `+`,
 #      300 `?` operands in one chain, `==` / `!=` whose left operand takes the
 #      right one's type, shifts and `2.0 * x`; the lazily allocated left-operand
-#      guard: owned String / Array left operands whose right operand leaves
-#      early through `?` or `return`, both paths, 2,000 rounds.
+#      guard: owned String / Array left operands (fresh call results and `+`
+#      results) whose right operand leaves early through `?` or a `return`
+#      in a branch, both paths, 2,000 rounds.
 #   2. scan.pion: `inline_rc` function bodies with RC markers, without RC but
 #      with real calls, with `call`-prefixed identifiers and no call, and with
 #      UTF-8 literals.
 #   For every program in dev and --release (each build in its own empty
 #   PION_CACHE_DIR): exact stdout and exit status 0, empty stderr; with an
 #   AddressSanitizer runtime (LeakSanitizer on Linux) the same output; on
-#   Wasm32 the same output for binary.pion and scan.pion.
+#   Wasm32 the same output for binary.pion and scan.pion; stderr empty on all.
 #   3. Target reuse in `pionc build` / `pionc run`: the host default, an
 #      explicit --target, PION_TARGET, --target wasm32 (also for `run`), and
 #      --emit-web-rt with a non-wasm target (rejected, nothing written) or with
-#      wasm32 from PION_TARGET (accepted); host detection (`uname -sm`) runs at
-#      most once per command and not at all when the target is given.
+#      wasm32 from PION_TARGET (accepted), for a single file and a pion.toml
+#      package; host detection (`uname -sm`) runs at most once per command and
+#      not at all when the target is given. Runs with any PION_TARGET in the
+#      caller's environment (it is unset first).
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -29,17 +32,27 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 DIR="$ROOT_DIR/tests/e2e/p129_compile_speed_z1"
 WASM_RT="$ROOT_DIR/runtime/pion_wasm_rt.mjs"
 HELLO="$ROOT_DIR/tests/e2e/hello.pion"
+# Native legs must not inherit a target: only the commands that test
+# PION_TARGET set it, for themselves.
+unset PION_TARGET || true
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 CC_BIN="${CC:-cc}"
 UNAME_S=$(uname -s)
 
-N_CAS=0
+# A new empty CAS for the next build (not in a subshell: it exports).
 fresh_cas() {
-  N_CAS=$((N_CAS + 1))
-  PION_CACHE_DIR="$TMP_DIR/cas$N_CAS"
-  mkdir -p "$PION_CACHE_DIR"
+  PION_CACHE_DIR=$(mktemp -d "$TMP_DIR/cas.XXXXXX")
   export PION_CACHE_DIR
+}
+
+# Fails when file $1 is not empty.
+no_stderr() {
+  if [ -s "$1" ]; then
+    cat "$1" >&2
+    echo "FAIL: p129 $2 wrote to stderr" >&2
+    exit 1
+  fi
 }
 
 # Fails on a missing or empty reference, a missing or empty output, or any
@@ -85,20 +98,22 @@ for PROG in binary deep scan; do
     BASE="$TMP_DIR/${PROG}_$MODE"
     fresh_cas
     "$PIONC" build $FLAG -o "$BASE" "$SRC"
-    "$BASE" > "$BASE.out" 2> "$BASE.err"
-    [ -s "$BASE.err" ] && { cat "$BASE.err" >&2; echo "FAIL: p129 $PROG $MODE wrote to stderr" >&2; exit 1; }
+    "$BASE" > "$BASE.out" 2> "$BASE.err" || { RC=$?; cat "$BASE.err" >&2; echo "FAIL: p129 $PROG $MODE native exited $RC" >&2; exit 1; }
+    no_stderr "$BASE.err" "$PROG $MODE native"
     same "$REF" "$BASE.out" "$PROG $MODE native"
     if [ "$ASAN" -eq 1 ]; then
       fresh_cas
       "$PIONC" build $FLAG --emit-obj "$BASE.o" "$SRC"
       "$CC_BIN" -fsanitize=address "$BASE.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$BASE.asan"
-      ASAN_OPTIONS="$ASAN_OPTS" "$BASE.asan" > "$BASE.asan.out"
+      ASAN_OPTIONS="$ASAN_OPTS" "$BASE.asan" > "$BASE.asan.out" 2> "$BASE.asan.err" || { RC=$?; cat "$BASE.asan.err" >&2; echo "FAIL: p129 $PROG $MODE ASan exited $RC" >&2; exit 1; }
+      no_stderr "$BASE.asan.err" "$PROG $MODE ASan"
       same "$REF" "$BASE.asan.out" "$PROG $MODE ASan"
     fi
     if [ "$HAVE_NODE" -eq 1 ] && [ "$PROG" != "deep" ]; then
       fresh_cas
       "$PIONC" build $FLAG --target wasm32 -o "$BASE.wasm" "$SRC"
-      node "$WASM_RT" "$BASE.wasm" > "$BASE.wout"
+      node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr" || { RC=$?; cat "$BASE.werr" >&2; echo "FAIL: p129 $PROG $MODE Wasm32 exited $RC" >&2; exit 1; }
+      no_stderr "$BASE.werr" "$PROG $MODE Wasm32"
       same "$REF" "$BASE.wout" "$PROG $MODE Wasm32"
     fi
     echo "p129 $PROG $MODE: native$( [ "$ASAN" -eq 1 ] && echo ' + ASan')$( [ "$HAVE_NODE" -eq 1 ] && [ "$PROG" != deep ] && echo ' + Wasm32') output equals the reference"
@@ -107,46 +122,64 @@ for PROG in binary deep scan; do
 done
 [ "$N" -eq 3 ]
 
-# 3. Target reuse. A `uname` shim on PATH counts host probes.
-mkdir -p "$TMP_DIR/shim" "$TMP_DIR/web"
+# 3. Target reuse. A `uname` shim on PATH counts host probes (`uname -sm`).
+mkdir -p "$TMP_DIR/shim" "$TMP_DIR/web" "$TMP_DIR/ws/src"
 REAL_UNAME=$(command -v uname)
 cat > "$TMP_DIR/shim/uname" <<EOF
 #!/bin/sh
-echo "\$*" >> "$TMP_DIR/uname.log"
+[ "\$*" = "-sm" ] && echo probe >> "$TMP_DIR/uname.log"
 exec "$REAL_UNAME" "\$@"
 EOF
 chmod +x "$TMP_DIR/shim/uname"
 printf 'hello pion\n' > "$TMP_DIR/hello.expected"
-probes() {
+# probe <max> <label> <command...>: runs the command in a fresh CAS with the
+# shim first on PATH (its stdout in $TMP_DIR/probe.out) and fails when it
+# probed the host more than <max> times.
+probe() {
+  MAX=$1
+  LABEL=$2
+  shift 2
   : > "$TMP_DIR/uname.log"
   fresh_cas
-  PATH="$TMP_DIR/shim:$PATH" "$@"
-  wc -l < "$TMP_DIR/uname.log" | tr -d ' '
-}
-at_most() {
-  if [ "$1" -gt "$2" ]; then
-    cat "$TMP_DIR/uname.log" >&2
-    echo "FAIL: p129 $3: $1 host probes, want at most $2" >&2
+  PATH="$TMP_DIR/shim:$PATH" "$@" > "$TMP_DIR/probe.out"
+  PROBES=$(wc -l < "$TMP_DIR/uname.log" | tr -d ' ')
+  case "$PROBES" in
+    '' | *[!0-9]*) echo "FAIL: p129 $LABEL: bad probe count '$PROBES'" >&2; exit 1 ;;
+  esac
+  if [ "$PROBES" -gt "$MAX" ]; then
+    echo "FAIL: p129 $LABEL: $PROBES host probes, want at most $MAX" >&2
     exit 1
   fi
 }
-unset PION_TARGET || true
+# run_hello <binary> <label>: the binary prints exactly the hello reference.
+run_hello() {
+  "$1" > "$1.out"
+  same "$TMP_DIR/hello.expected" "$1.out" "$2"
+}
 
-P=$(probes "$PIONC" build -o "$TMP_DIR/h_default" "$HELLO")
-at_most "$P" 1 "build (host target)"
-"$TMP_DIR/h_default" > "$TMP_DIR/h_default.out"
-same "$TMP_DIR/hello.expected" "$TMP_DIR/h_default.out" "build (host target)"
+probe 1 "build (host target)" "$PIONC" build -o "$TMP_DIR/h_default" "$HELLO"
+run_hello "$TMP_DIR/h_default" "build (host target)"
+probe 1 "build --release (host target)" "$PIONC" build --release -o "$TMP_DIR/h_release" "$HELLO"
+run_hello "$TMP_DIR/h_release" "build --release (host target)"
+probe 1 "run (host target)" "$PIONC" run "$HELLO"
+same "$TMP_DIR/hello.expected" "$TMP_DIR/probe.out" "run (host target)"
 
-P=$(probes "$PIONC" build --release -o "$TMP_DIR/h_release" "$HELLO")
-at_most "$P" 1 "build --release (host target)"
-"$TMP_DIR/h_release" > "$TMP_DIR/h_release.out"
-same "$TMP_DIR/hello.expected" "$TMP_DIR/h_release.out" "build --release (host target)"
-
-: > "$TMP_DIR/uname.log"
-fresh_cas
-PATH="$TMP_DIR/shim:$PATH" "$PIONC" run "$HELLO" > "$TMP_DIR/h_run.out"
-at_most "$(wc -l < "$TMP_DIR/uname.log" | tr -d ' ')" 1 "run (host target)"
-same "$TMP_DIR/hello.expected" "$TMP_DIR/h_run.out" "run (host target)"
+# A package with pion.toml goes through the workspace build path.
+cat > "$TMP_DIR/ws/pion.toml" <<'EOF'
+[package]
+name = "p129ws"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/ws/src/main.pion" <<'EOF'
+pub fn main(world : World) -> Int {
+  io_println(world, "hello pion")
+  0
+}
+EOF
+probe 1 "workspace build (host target)" "$PIONC" build -o "$TMP_DIR/h_ws" "$TMP_DIR/ws"
+run_hello "$TMP_DIR/h_ws" "workspace build (host target)"
+probe 1 "workspace run (host target)" "$PIONC" run "$TMP_DIR/ws"
+same "$TMP_DIR/hello.expected" "$TMP_DIR/probe.out" "workspace run (host target)"
 
 # The host target named explicitly and through PION_TARGET: no host
 # detection at all.
@@ -160,35 +193,32 @@ case "$HOST_T" in
   *) HOST_T="" ;;
 esac
 if [ -n "$HOST_T" ]; then
-  P=$(probes "$PIONC" build --target "$HOST_T" -o "$TMP_DIR/h_explicit" "$HELLO")
-  at_most "$P" 0 "build --target $HOST_T"
-  "$TMP_DIR/h_explicit" > "$TMP_DIR/h_explicit.out"
-  same "$TMP_DIR/hello.expected" "$TMP_DIR/h_explicit.out" "build --target $HOST_T"
-  P=$(PION_TARGET="$HOST_T" probes "$PIONC" build -o "$TMP_DIR/h_env" "$HELLO")
-  at_most "$P" 0 "PION_TARGET=$HOST_T build"
-  "$TMP_DIR/h_env" > "$TMP_DIR/h_env.out"
-  same "$TMP_DIR/hello.expected" "$TMP_DIR/h_env.out" "PION_TARGET=$HOST_T build"
+  probe 0 "build --target $HOST_T" "$PIONC" build --target "$HOST_T" -o "$TMP_DIR/h_explicit" "$HELLO"
+  run_hello "$TMP_DIR/h_explicit" "build --target $HOST_T"
+  probe 0 "PION_TARGET=$HOST_T build" env PION_TARGET="$HOST_T" "$PIONC" build -o "$TMP_DIR/h_env" "$HELLO"
+  run_hello "$TMP_DIR/h_env" "PION_TARGET=$HOST_T build"
+  probe 0 "workspace build --target $HOST_T" "$PIONC" build --target "$HOST_T" -o "$TMP_DIR/h_ws_explicit" "$TMP_DIR/ws"
+  run_hello "$TMP_DIR/h_ws_explicit" "workspace build --target $HOST_T"
 fi
 
 # --target wasm32 and PION_TARGET=wasm32 produce Wasm modules.
-P=$(probes "$PIONC" build --target wasm32 -o "$TMP_DIR/h.wasm" "$HELLO")
-at_most "$P" 0 "build --target wasm32"
-P=$(PION_TARGET=wasm32 probes "$PIONC" build -o "$TMP_DIR/h_env.wasm" "$HELLO")
-at_most "$P" 0 "PION_TARGET=wasm32 build"
-for W in h.wasm h_env.wasm; do
+probe 0 "build --target wasm32" "$PIONC" build --target wasm32 -o "$TMP_DIR/h.wasm" "$HELLO"
+probe 0 "PION_TARGET=wasm32 build" env PION_TARGET=wasm32 "$PIONC" build -o "$TMP_DIR/h_env.wasm" "$HELLO"
+probe 0 "workspace build --target wasm32" "$PIONC" build --target wasm32 -o "$TMP_DIR/h_ws.wasm" "$TMP_DIR/ws"
+for W in h.wasm h_env.wasm h_ws.wasm; do
   if [ "$(od -An -tx1 -N4 "$TMP_DIR/$W" | tr -d ' \n')" != "0061736d" ]; then
     echo "FAIL: p129 $W is not a Wasm module" >&2
     exit 1
   fi
 done
 if [ "$HAVE_NODE" -eq 1 ]; then
-  node "$WASM_RT" "$TMP_DIR/h.wasm" > "$TMP_DIR/h_wasm.out"
-  same "$TMP_DIR/hello.expected" "$TMP_DIR/h_wasm.out" "build --target wasm32"
-  node "$WASM_RT" "$TMP_DIR/h_env.wasm" > "$TMP_DIR/h_env_wasm.out"
-  same "$TMP_DIR/hello.expected" "$TMP_DIR/h_env_wasm.out" "PION_TARGET=wasm32 build"
-  fresh_cas
-  "$PIONC" run --target wasm32 "$HELLO" > "$TMP_DIR/h_run_wasm.out"
-  same "$TMP_DIR/hello.expected" "$TMP_DIR/h_run_wasm.out" "run --target wasm32"
+  for W in h h_env h_ws; do
+    node "$WASM_RT" "$TMP_DIR/$W.wasm" > "$TMP_DIR/$W.wout" 2> "$TMP_DIR/$W.werr" || { RC=$?; cat "$TMP_DIR/$W.werr" >&2; echo "FAIL: p129 $W.wasm exited $RC" >&2; exit 1; }
+    no_stderr "$TMP_DIR/$W.werr" "$W.wasm"
+    same "$TMP_DIR/hello.expected" "$TMP_DIR/$W.wout" "$W.wasm"
+  done
+  probe 0 "run --target wasm32" "$PIONC" run --target wasm32 "$HELLO"
+  same "$TMP_DIR/hello.expected" "$TMP_DIR/probe.out" "run --target wasm32"
 fi
 
 # --emit-web-rt with a non-wasm target is rejected before anything is written.
@@ -215,9 +245,9 @@ for T in "" "${HOST_T:-amd64_sysv}" amd64_sysv; do
   fi
 done
 fresh_cas
-(cd "$TMP_DIR/web" && PION_TARGET=wasm32 "$PIONC" build --emit-web-rt -o out.wasm hello.pion)
+(cd "$TMP_DIR/web" && env PION_TARGET=wasm32 "$PIONC" build --emit-web-rt -o out.wasm hello.pion)
 test -s "$TMP_DIR/web/out.wasm" || { echo "FAIL: p129 PION_TARGET=wasm32 --emit-web-rt wrote no module" >&2; exit 1; }
 test -s "$TMP_DIR/web/pion_wasm_rt_web.mjs" || { echo "FAIL: p129 PION_TARGET=wasm32 --emit-web-rt wrote no runtime" >&2; exit 1; }
-echo "p129 target reuse: host / explicit / PION_TARGET / wasm32 build and run, --emit-web-rt accept and reject paths, host probes bounded"
+echo "p129 target reuse: host / explicit / PION_TARGET / wasm32 build and run (single file and pion.toml package), --emit-web-rt accept and reject paths, host probes bounded"
 
 echo "PASS: p129_compile_speed_z1"
