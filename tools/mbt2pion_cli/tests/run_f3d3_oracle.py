@@ -417,6 +417,11 @@ fn[T] head_gen(xs : Array[T]) -> T {
   xs[0]
 }
 
+fn[T] render_gen(xs : Array[Json], extra : T) -> String {
+  ignore(extra)
+  Json::array(xs).stringify()
+}
+
 fn guard_sp_user(__mbt_sp_user : PairAB, r : PairAB?) -> Int {
   guard r is Some({ a, .. } as __mbt_sp_user) && a > 0 else {
     return 0
@@ -517,6 +522,7 @@ pub fn run_f3d3_7() -> String {
     ms[1].get("n").unwrap_or(0)
   }
   let j12_sh = jxs.map(fn(x) { { "n": x } }) |> keep_json_arr
+  let j13_rg = jxs.map(fn(x) { { "n": Json::number(x.to_double()) } }) |> render_gen(_, 7)
   let sp_user_r = guard_sp_user({ a: 1, b: 11 }, Some({ a: 2, b: 42 }))
 
   t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "," +
@@ -526,7 +532,7 @@ pub fn run_f3d3_7() -> String {
   vf_r.to_string() + "|" + gs_r + "|" + j1.stringify() + "|" + j2.stringify() + "|" +
   Json::array(j3_arr).stringify() + "|" + Json::array(j4_arr).stringify() + "|" + Json::array(j5_arr).stringify() + "|" +
   Json::array(j6_arr).stringify() + "|" + Json::array(j7_arr).stringify() + "|" + Json::array(j8_arr).stringify() + "|" + j9_str + "|" +
-  j10.stringify() + "|" + Json::array(j11_arr).stringify() + "|" + j12_sh.to_string() + "|" + sp_user_r.to_string()
+  j10.stringify() + "|" + Json::array(j11_arr).stringify() + "|" + j12_sh.to_string() + "|" + j13_rg + "|" + sp_user_r.to_string()
 }
 
 pub fn run_all() -> String {
@@ -751,7 +757,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]|[{"n":0},{"n":2}]|[{"n":0},{"n":2}]|[0,2]|[{"x":1.5},{"x":2}]|{"n":0}|[{"n":0},{"n":2}]|2|42'
+            'F3d3-7:9,9,88,7,9,9,8,6,5,9,5|1|19,12|19|hit|{"floating":[{"x":1.5,"ok":true},{"x":2,"ok":false}]}|[{"x":1.5},{"x":2}]|[0,2]|[0,2]|[{"x":1.5}]|[{"n":0},{"n":2}]|[{"n":0},{"n":2}]|[0,2]|[{"x":1.5},{"x":2}]|{"n":0}|[{"n":0},{"n":2}]|2|[{"n":0},{"n":2}]|42'
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
