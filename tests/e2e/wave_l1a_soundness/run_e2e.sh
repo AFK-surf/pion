@@ -752,6 +752,7 @@ version = "0.1.0"
 rc_sources = ["app.rc"]
 EOF
 cat > "$TMP_DIR/ws_rc/src/lib.pion" <<'EOF'
+pub fn main() -> Int { 0 }
 test "rc_t" { debug_assert(true, "ok") }
 EOF
 for rcname in windres x86_64-w64-mingw32-windres llvm-rc; do
@@ -764,14 +765,46 @@ EOF
   chmod +x "$TMP_DIR/rc_bin_dir/$rcname"
 done
 printf 'dummy-rt' > "$TMP_DIR/fake_pionrt.a"
-set +e
-OUT="$(PION_TARGET=amd64_win PION_RT_LIB="$TMP_DIR/fake_pionrt.a" PION_CACHE_DIR="$TMP_DIR/cas_rc_noisy" PATH="$TMP_DIR/rc_bin_dir:$PATH" "$PIONC" test --json "$TMP_DIR/ws_rc")"
-RC=$?
-set -e
-[ "$RC" -ne 0 ]
-[ -f "$TMP_DIR/rc_invoked.flag" ]
-printf '%s' "$OUT" | grep -q "app.rc"
-check_single_json "rc_noisy_cold_fail" "$OUT" "false"
+case "$(uname -s)" in
+  MINGW*|MSYS*|CYGWIN*)
+    set +e
+    OUT="$(PION_TARGET=amd64_win PION_RT_LIB="$TMP_DIR/fake_pionrt.a" PION_CACHE_DIR="$TMP_DIR/cas_rc_noisy" PATH="$TMP_DIR/rc_bin_dir:$PATH" "$PIONC" test --json "$TMP_DIR/ws_rc")"
+    RC=$?
+    set -e
+    [ "$RC" -ne 0 ]
+    [ -f "$TMP_DIR/rc_invoked.flag" ]
+    printf '%s' "$OUT" | grep -q "app.rc"
+    check_single_json "rc_noisy_cold_fail" "$OUT" "false"
+    ;;
+  *)
+    set +e
+    OUT="$(PION_TARGET=amd64_win "$PIONC" test --json "$TMP_DIR/ws_rc")"
+    RC=$?
+    set -e
+    [ "$RC" -ne 0 ]
+    printf '%s' "$OUT" | grep -q "amd64_win"
+    check_single_json "rc_cross_target_refusal" "$OUT" "false"
+    cat > "$TMP_DIR/rc_bin_dir/fake_cc" <<'CCEOF'
+#!/bin/sh
+out=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then out="$2"; shift 2; continue; fi
+  shift
+done
+[ -n "$out" ] && printf 'dummy-obj' > "$out"
+exit 0
+CCEOF
+    chmod +x "$TMP_DIR/rc_bin_dir/fake_cc"
+    cp "$TMP_DIR/rc_bin_dir/fake_cc" "$TMP_DIR/rc_bin_dir/as"
+    set +e
+    BOUT="$(PION_TARGET=amd64_win CC="$TMP_DIR/rc_bin_dir/fake_cc" PION_CC="$TMP_DIR/rc_bin_dir/fake_cc" PION_RT_LIB="$TMP_DIR/fake_pionrt.a" PION_CACHE_DIR="$TMP_DIR/cas_rc_noisy" PATH="$TMP_DIR/rc_bin_dir:$PATH" "$PIONC" build -o "$TMP_DIR/ws_rc.exe" "$TMP_DIR/ws_rc" 2>&1)"
+    BRC=$?
+    set -e
+    [ "$BRC" -ne 0 ]
+    [ -f "$TMP_DIR/rc_invoked.flag" ]
+    printf '%s' "$BOUT" | grep -q "app.rc"
+    ;;
+esac
 echo "  [PASS] A5"
 
 echo "=== Wave L1-A E2E [6/6]: A6 Struct literal dup/missing & add_missing_impl_edit ==="

@@ -387,6 +387,10 @@ namespace Double
   let exp := (d.bits.bv >>> 52) &&& 0x7ff#64
   let frac := d.bits.bv &&& 0x000fffffffffffff#64
   exp == 0x7ff#64 && frac != 0#64
+@[simp] def is_inf (d : Pion.Double) : Bool :=
+  (d.bits.bv &&& 0x7fffffffffffffff#64) == 0x7ff0000000000000#64
+@[simp] def is_finite (d : Pion.Double) : Bool :=
+  (d.bits.bv &&& 0x7ff0000000000000#64) != 0x7ff0000000000000#64
 def compare (a b : Pion.Double) : Std.I32 :=
   let an := is_nan a
   let bn := is_nan b
