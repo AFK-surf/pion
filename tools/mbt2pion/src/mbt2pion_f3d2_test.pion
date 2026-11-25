@@ -1,0 +1,412 @@
+///| Wave M2-F3d Track F3d-2 unit tests:
+///| 1. Recursive local `fn` capture type inference (`Ref[T]`, tuple destructuring,
+///|    nested tuple destructuring, method/field chains, typed closures, arithmetic/bool)
+///|    + lexical shadowing & fail-closed rejection on uninferrable captures.
+///| 2. `MBT2PION_AMBIGUOUS_CTOR` expected-type propagation:
+///|    - Call args (positional vs labeled/optional by ABI name, generic substitution, chained methods)
+///|    - Generic enum & Option/Result payload propagation
+///|    - `==`/`!=` bidirectional, struct literal/update/pattern fields
+///|    - Sibling `match` arms (patterns & tuple bodies), `if`/`else`, `is (A | B)`
+///|    - Fail-closed negative cases (contradiction, non-unique, stack recovery)
+
+fn f3d2_transpile(rel : String, src : String) -> TranspileResult {
+  transpile_package([SourceFile::{ rel_path: rel, content: src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+}
+
+fn f3d2_all_out(res : TranspileResult) -> String {
+  let sb = StringBuilder()
+  for f in res.files {
+    sb.write_string(f.content)
+    sb.write_string("\n")
+  }
+  sb.to_string()
+}
+
+test "F3d2-1: recursive local fn captures Ref[T], tuple destructure, arithmetic, and typed closure" {
+  let src = "pub enum Dim { Pt(Double); Auto }\n" +
+  "pub struct Box2D { x : Double; y : Double; w : Double; h : Double }\n" +
+  "fn Box2D::rect(self : Box2D) -> (Double, Double, Double, Double) { (self.x, self.y, self.w, self.h) }\n" +
+  "pub fn scan_box(b : Box2D, d : Dim, n : Int) -> (Double, Double) {\n" +
+  "  let (left, top, w0, h0) = b.rect()\n" +
+  "  let right = left + w0\n" +
+  "  let foot = top + h0\n" +
+  "  let lo = Ref(1.0e9)\n" +
+  "  let hi = Ref(-1.0e9)\n" +
+  "  let stopped = Ref(false)\n" +
+  "  let pt = fn(dim : Dim) {\n" +
+  "    match dim {\n" +
+  "      Pt(v) => v\n" +
+  "      _ => 0.0\n" +
+  "    }\n" +
+  "  }\n" +
+  "  fn walk(k : Int) -> Unit {\n" +
+  "    if stopped.val || k <= 0 { return }\n" +
+  "    let x = left + pt(d)\n" +
+  "    if x < lo.val { lo.val = x }\n" +
+  "    if x + right + foot > hi.val { hi.val = x + right + foot }\n" +
+  "    walk(k - 1)\n" +
+  "  }\n" +
+  "  walk(n)\n" +
+  "  (lo.val, hi.val)\n" +
+  "}\n"
+  let res = f3d2_transpile("scan.mbt", src)
+  let out = f3d2_all_out(res)
+  assert_eq(res.blockers, 0)
+  assert_true(str_has(out, "fn __mbt_local_scan_box_walk_"), "recursive local fn lifted")
+  assert_true(str_has(out, "lo : mbt_compat::Ref[Double]"), "Ref(1.0e9) inferred as Ref[Double]")
+  assert_true(str_has(out, "hi : mbt_compat::Ref[Double]"), "Ref(-1.0e9) inferred as Ref[Double]")
+  assert_true(str_has(out, "stopped : mbt_compat::Ref[Bool]"), "Ref(false) inferred as Ref[Bool]")
+  assert_true(str_has(out, "left : Double") && str_has(out, "right : Double") && str_has(out, "foot : Double"), "tuple destructure + arithmetic inferred as Double")
+  assert_true(str_has(out, "pt : (Dim) -> Double"), "typed closure inferred as (Dim) -> Double")
+}
+
+test "F3d2-2: recursive local fn lexical shadowing, let mut boxing, nested recursion, and fail-closed unknown" {
+  // Inner `let shadow = ...` inside recursive fn must NOT capture outer untyped `shadow`
+  let src = "pub fn lex_ok(n : Int) -> Int {\n" +
+  "  let shadow = ext_opaque()\n" +
+  "  let mut acc = 0\n" +
+  "  fn go(k : Int) -> Unit {\n" +
+  "    if k <= 0 { return }\n" +
+  "    let shadow = k * 2\n" +
+  "    acc = acc + shadow\n" +
+  "    go(k - 1)\n" +
+  "  }\n" +
+  "  go(n)\n" +
+  "  let _ = shadow\n" +
+  "  acc\n" +
+  "}\n"
+  let res = f3d2_transpile("lex.mbt", src)
+  let out = f3d2_all_out(res)
+  assert_eq(res.blockers, 0)
+  assert_true(str_has(out, "acc : mbt_compat::MbtCell[Int]"), "captured let mut boxed into MbtCell[Int]")
+  assert_true(!str_has(out, "shadow :"), "inner-shadowed outer var is not captured")
+
+  // Truly captured variable with unknown type MUST fail-closed!
+  let bad_src = "pub fn lex_bad(n : Int) -> Int {\n" +
+  "  let unknown_v = ext_opaque()\n" +
+  "  fn go(k : Int) -> Int {\n" +
+  "    if k <= 0 { return unknown_v }\n" +
+  "    go(k - 1)\n" +
+  "  }\n" +
+  "  go(n)\n" +
+  "}\n"
+  let bad_res = f3d2_transpile("lex_bad.mbt", bad_src)
+  assert_true(bad_res.blockers > 0, "uninferrable captured var must fail closed")
+  let mut saw_lift_err = false
+  for d in bad_res.diagnostics {
+    if str_has(d.message, "cannot lift recursive local fn `go`: captured variable `unknown_v` lacks a statically known type") {
+      saw_lift_err = true
+    }
+  }
+  assert_true(saw_lift_err, "emits exact fail-closed lift diagnostic")
+}
+
+test "F3d2-3: call args (named vs positional, optional skip, generic substitution, chained methods)" {
+  let src = "pub enum Role { Button; Radio; Separator }\n" +
+  "pub enum Kind { Button; Radio }\n" +
+  "pub enum Along { Start; Middle; End }\n" +
+  "pub enum Align { Start; Middle; End }\n" +
+  "pub enum Live[T] { Is(T); By(() -> T) }\n" +
+  "pub struct Widget { id : Int }\n" +
+  "pub fn describe(label? : String = \"\", role : Role, alt? : Kind = Button) -> Int { let _ = (label, role, alt); 1 }\n" +
+  "pub fn[T] Widget::bind(self : Widget, live : Live[T], apply : (T) -> Unit) -> Widget { let _ = (live, apply); self }\n" +
+  "pub fn Widget::lies_along(self : Widget, v : Live[Along]) -> Widget { let _ = v; self }\n" +
+  "pub fn Widget::lines_up(self : Widget, v : Live[Along?]) -> Widget { let _ = v; self }\n" +
+  "pub fn demo(w : Widget, along : Live[Along?]) -> Int {\n" +
+  "  let _ = describe(alt=Radio, Separator, label=\"sep\")\n" +
+  "  let _ = w.lies_along(Is(Middle)).lines_up(Is(Some(Middle)))\n" +
+  "  let _ = w.bind(along, fn(a) {\n" +
+  "    match a {\n" +
+  "      None => ()\n" +
+  "      Some(Start) => ()\n" +
+  "      Some(Middle) => ()\n" +
+  "      Some(End) => ()\n" +
+  "    }\n" +
+  "  })\n" +
+  "  0\n" +
+  "}\n"
+  let res = f3d2_transpile("calls.mbt", src)
+  let out = f3d2_all_out(res)
+  assert_eq(res.blockers, 0)
+  assert_true(str_has(out, "alt=Kind::Radio"), "named arg matches ABI param name, not position")
+  assert_true(str_has(out, "Is(Along::Middle)"), "generic enum Is substitutes Along")
+  assert_true(str_has(out, "Is(Some(Along::Middle))"), "chained method + generic enum + Some unwraps Option[Along]")
+  assert_true(str_has(out, "Some(Along::Start)") && str_has(out, "Some(Along::End)"), "generic call bind substitutes T=Option[Along] into closure param")
+}
+
+test "F3d2-4: bidirectional ==/!=, struct literal/update/pattern, sibling match & if/else, and fail-closed negatives" {
+  let src = "pub enum Side { Below; Above; Left; Right }\n" +
+  "pub enum Dir { Left; Right }\n" +
+  "pub enum HoldRes { Ready; Cancelled }\n" +
+  "pub enum HoldRd { Waiting; Cancelled }\n" +
+  "pub enum Role { Image; Text }\n" +
+  "pub enum Asset { Image; Audio }\n" +
+  "pub struct Card { role : Role; side : Side }\n" +
+  "pub fn check_all(s : Side, c : Card, opt : Card?, flag : Bool) -> (Side, HoldRes, Bool, Bool, Bool) {\n" +
+  "  let (_, other) = match s {\n" +
+  "    Right => (1, Left)\n" +
+  "    Left => (2, Right)\n" +
+  "    Below => (3, Above)\n" +
+  "    Above => (4, Below)\n" +
+  "  }\n" +
+  "  let h = if flag { Ready } else { Cancelled }\n" +
+  "  let eq1 = s == Left && Right != s\n" +
+  "  let c2 = { ..c, role: Image }\n" +
+  "  let is_img = opt is Some({ role: Image, .. })\n" +
+  "  let _ = c2\n" +
+  "  (other, h, eq1, is_img, s is (Below | Left))\n" +
+  "}\n"
+  let res = f3d2_transpile("sib.mbt", src)
+  let out = f3d2_all_out(res)
+  assert_eq(res.blockers, 0)
+  assert_true(str_has(out, "Side::Left") && str_has(out, "Side::Right"), "opposite-order match sibling tuple arms & ==/!= resolved")
+  assert_true(str_has(out, "HoldRes::Cancelled"), "if/else sibling branch resolves Cancelled")
+  assert_true(str_has(out, "role: Role::Image"), "struct update resolves field ctor from base type")
+
+  // Negative 1: non-unique sibling arms (Left & Right belong to BOTH Side and Dir) MUST fail-closed!
+  let non_uniq = "pub enum Side { Below; Above; Left; Right }\n" +
+  "pub enum Dir { Left; Right }\n" +
+  "pub fn bad_non_uniq(b : Bool) -> Int {\n" +
+  "  let _ = if b { Left } else { Right }\n" +
+  "  0\n" +
+  "}\n"
+  let r_nu = f3d2_transpile("non_uniq.mbt", non_uniq)
+  assert_true(r_nu.blockers > 0, "non-unique sibling branches must fail closed")
+  let mut saw_amb_nu = false
+  for d in r_nu.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_CTOR" { saw_amb_nu = true }
+  }
+  assert_true(saw_amb_nu, "emits MBT2PION_AMBIGUOUS_CTOR on non-unique siblings")
+
+  // Negative 2: contradicting sibling arms (known Int vs ambiguous Left) MUST fail-closed!
+  let contra = "pub enum Side { Below; Above; Left; Right }\n" +
+  "pub enum Dir { Left; Right }\n" +
+  "pub fn bad_contra(x : Int) -> Int {\n" +
+  "  let _ = match x {\n" +
+  "    0 => 123\n" +
+  "    1 => Below\n" +
+  "    _ => Left\n" +
+  "  }\n" +
+  "  0\n" +
+  "}\n"
+  let r_co = f3d2_transpile("contra.mbt", contra)
+  assert_true(r_co.blockers > 0, "contradicting sibling match arms must fail closed")
+  let mut saw_amb_co = false
+  for d in r_co.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_CTOR" { saw_amb_co = true }
+  }
+  assert_true(saw_amb_co, "emits MBT2PION_AMBIGUOUS_CTOR on contradicting siblings")
+}
+
+test "F3d2-5: audit regressions (eq RHS, lexical scope, else-if chain, lbl?=expr, @pkg chain)" {
+  // P1-1: `p == Point::{ x: 1, y: 2 }`, `s == if/match`, `s == Left |> ignore`
+  let eq_src = "pub enum Side { Below; Above; Left; Right }\n" +
+  "pub enum Dir { Left; Right }\n" +
+  "pub struct Point { x : Int; y : Int }\n" +
+  "pub fn eq_cases(p : Point, s : Side, flag : Bool) -> Bool {\n" +
+  "  let a = p == Point::{ x: 1, y: 2 }\n" +
+  "  let b = s == if flag { Side::Left } else { Side::Right }\n" +
+  "  let c = s == match flag { true => Side::Left; false => Side::Right }\n" +
+  "  s == Left |> ignore\n" +
+  "  a && b && c\n" +
+  "}\n"
+  let eq_res = f3d2_transpile("eq_reg.mbt", eq_src)
+  let eq_out = f3d2_all_out(eq_res)
+  assert_eq(eq_res.blockers, 0)
+  assert_true(str_has(eq_out, "Point::{ x: 1, y: 2 }"), "struct literal RHS not truncated")
+  assert_true(str_has(eq_out, "Side::Left"), "eq RHS resolves ambiguous ctor before |>")
+
+  // P1-2: `if opt is Some(v)`, `guard opt is Some(v) else { ... }`, `foo(bar?=baz)`, `(x = 1)`, C-style `for`
+  let lex_src = "pub fn helper(bar? : Int = 0) -> Int { bar }\n" +
+  "pub fn check(limit~ : Int) -> Bool { limit > 0 }\n" +
+  "pub fn lex_reg(opt : Int?, n : Int) -> Int {\n" +
+  "  let v = ext_opaque()\n" +
+  "  let bar = ext_opaque()\n" +
+  "  let mut x = 1\n" +
+  "  let limit = 5\n" +
+  "  fn go(k : Int) -> Int {\n" +
+  "    if k <= 0 { return x }\n" +
+  "    let mut acc = 0\n" +
+  "    if opt is Some(v) {\n" +
+  "      acc = acc + v\n" +
+  "    }\n" +
+  "    guard opt is Some(v) else {\n" +
+  "      return acc\n" +
+  "    }\n" +
+  "    acc = acc + v + helper(bar?=opt)\n" +
+  "    (x = x + 1)\n" +
+  "    for x = x + 1; x < n; x = x + 1 {\n" +
+  "      acc = acc + x\n" +
+  "    }\n" +
+  "    for j = 0; check(limit=n) && j < 1; j = j + 1 {\n" +
+  "      acc = acc + limit\n" +
+  "    }\n" +
+  "    acc + go(k - 1)\n" +
+  "  }\n" +
+  "  let _ = (v, bar)\n" +
+  "  go(n)\n" +
+  "}\n"
+  let lex_res = f3d2_transpile("lex_reg.mbt", lex_src)
+  let lex_out = f3d2_all_out(lex_res)
+  assert_eq(lex_res.blockers, 0)
+  assert_true(!str_has(lex_out, "v :"), "is/guard pattern binder v not captured")
+  assert_true(!str_has(lex_out, "bar :"), "named optional label bar?= not captured")
+  assert_true(str_has(lex_out, "x : mbt_compat::MbtCell[Int]"), "grouped (x = 1) & C-for init RHS capture x")
+  assert_true(str_has(lex_out, "limit : Int"), "named arg limit= in C-for cond does not shadow outer limit")
+
+  // P1-3: `if c1 { Ready } else if c2 { Ready } else { Cancelled }`
+  let elif_src = "pub enum HoldRes { Ready; Cancelled }\n" +
+  "pub enum HoldRd { Waiting; Cancelled }\n" +
+  "pub fn elif_chain(c1 : Bool, c2 : Bool) -> HoldRes {\n" +
+  "  let h = if c1 { Ready } else if c2 { Ready } else { Cancelled }\n" +
+  "  h\n" +
+  "}\n"
+  let elif_res = f3d2_transpile("elif_reg.mbt", elif_src)
+  let elif_out = f3d2_all_out(elif_res)
+  assert_eq(elif_res.blockers, 0)
+  assert_true(str_has(elif_out, "HoldRes::Cancelled"), "else-if chain keeps __qual__::HoldRes through final else")
+
+  // P1-4: normal & generic `lbl?=expr` wraps Option[...]
+  let qeq_src = "pub enum Role { Button; Radio; Separator }\n" +
+  "pub enum Kind { Button; Radio }\n" +
+  "pub enum Side { Below; Above; Left; Right }\n" +
+  "pub enum Dir { Left; Right }\n" +
+  "pub fn describe(role : Role, alt? : Kind = Button) -> Int { let _ = (role, alt); 1 }\n" +
+  "pub fn[T] opt_pair(x? : T, y : T) -> T { let _ = x; y }\n" +
+  "pub fn test_qeq(opt_side : Side?) -> Side {\n" +
+  "  let _ = describe(Separator, alt?=Some(Radio))\n" +
+  "  opt_pair(x?=opt_side, Left)\n" +
+  "}\n"
+  let qeq_res = f3d2_transpile("qeq_reg.mbt", qeq_src)
+  let qeq_out = f3d2_all_out(qeq_res)
+  assert_eq(qeq_res.blockers, 0)
+  assert_true(str_has(qeq_out, "Some(Kind::Radio)"), "non-generic alt?=Some(Radio) unwraps Option[Kind]")
+  assert_true(str_has(qeq_out, "Side::Left"), "generic x?=opt_side unifies T=Side instead of Option[Side]")
+
+  // P2: `@pkg.make().apply(Middle)` cross-package chained receiver
+  let pkg_diags : Array[Diag] = []
+  let pkg_api = parse_api_map(
+    "{\"symbols\":[{\"src_pkg\":\"ext\",\"src_name\":\"make\",\"kind\":\"fn\",\"target_pkg\":\"ext\",\"target_name\":\"make\",\"ret_ty\":\"Box\"}]}",
+    "pkg_api.json",
+    pkg_diags,
+  )
+  let pkg_src = "pub enum Along { Start; Middle; End }\n" +
+  "pub enum Align { Start; Middle; End }\n" +
+  "pub struct Box { id : Int }\n" +
+  "pub fn Box::apply(self : Box, v : Along) -> Box { let _ = v; self }\n" +
+  "pub fn use_pkg() -> Unit {\n" +
+  "  let _ = @ext.make().apply(Middle)\n" +
+  "}\n"
+  let pkg_res = transpile_package(
+    [SourceFile::{ rel_path: "pkg_reg.mbt", content: pkg_src, is_test: false }],
+    pkg_api,
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let pkg_out = f3d2_all_out(pkg_res)
+  assert_eq(pkg_res.blockers, 0)
+  assert_true(str_has(pkg_out, "Along::Middle"), "@pkg.make().apply(Middle) resolves chained receiver type")
+}
+
+test "F3d2-6: Astra P1 regressions (call-site shadowing of lifted capture + string interpolation free idents)" {
+  // P1-1: inner `{ let x = 5; pick(x - 5) }` must NOT hijack captured outer `x = 30 + 12`
+  let shadow_src = "pub fn eval_shadow() -> Int {\n" +
+  "  let x = 30 + 12\n" +
+  "  fn pick(n : Int) -> Int { if n == 0 { x } else { pick(n - 1) } }\n" +
+  "  { let x = 5; pick(x - 5) }\n" +
+  "}\n"
+  let sh_res = f3d2_transpile("shadow_cap.mbt", shadow_src)
+  let sh_out = f3d2_all_out(sh_res)
+  assert_eq(sh_res.blockers, 0)
+  assert_true(str_has(sh_out, "let __mbt_cap_"), "emits unique capture snapshot alias at declaration site")
+  assert_true(str_has(sh_out, "__mbt_local_eval_shadow_pick_1(__mbt_cap_"), "call site passes snapshot alias, not shadowed x")
+
+  // P1-2: `"\{x}"` inside recursive local fn must capture outer `let x : Int = 42`, not package-level `x = 3`
+  let interp_src = "let x : Int = 3\n" +
+  "pub fn eval_interp() -> String {\n" +
+  "  let x : Int = 42\n" +
+  "  fn pick(n : Int) -> String {\n" +
+  "    let _ = fn(x : Int) { x }\n" +
+  "    if n == 0 { \"\\{x}\" } else { pick(n - 1) }\n" +
+  "  }\n" +
+  "  pick(1)\n" +
+  "}\n"
+  let in_res = f3d2_transpile("interp_cap.mbt", interp_src)
+  let in_out = f3d2_all_out(in_res)
+  assert_eq(in_res.blockers, 0)
+  assert_true(str_has(in_out, "_x : Int"), "interpolation hole \\{x} captures outer local x")
+
+  // P1-3: `let mut x` read ONLY inside `\{x}` interpolation hole must still be boxed into MbtCell[Int]
+  let mut_interp_src = "pub fn eval_mut_interp() -> String {\n" +
+  "  let mut x : Int = 42\n" +
+  "  fn pick(n : Int) -> String {\n" +
+  "    if n == 0 { \"\\{x}\" } else { pick(n - 1) }\n" +
+  "  }\n" +
+  "  x = 9\n" +
+  "  pick(1)\n" +
+  "}\n"
+  let mi_res = f3d2_transpile("mut_interp_cap.mbt", mut_interp_src)
+  let mi_out = f3d2_all_out(mi_res)
+  assert_eq(mi_res.blockers, 0)
+  assert_true(str_has(mi_out, "mbt_compat::MbtCell[Int]"), "let mut x read only in \\{x} is boxed into MbtCell[Int]")
+
+  // P1-4: user local named `__mbt_cap_1_x` must not collide with generated capture snapshot alias
+  let collide_src = "pub fn eval_cap_collide() -> Int {\n" +
+  "  let x : Int = 42\n" +
+  "  fn pick(n : Int) -> Int {\n" +
+  "    if n == 0 { x } else { pick(n - 1) }\n" +
+  "  }\n" +
+  "  { let __mbt_cap_1_x = 5; pick(__mbt_cap_1_x - 5) }\n" +
+  "}\n"
+  let co_res = f3d2_transpile("cap_collide.mbt", collide_src)
+  let co_out = f3d2_all_out(co_res)
+  assert_eq(co_res.blockers, 0)
+  assert_true(str_has(co_out, "let __mbt_cap_1_x_1 = x;"), "collision with user __mbt_cap_1_x advances suffix to _1")
+
+  // P1-5: collision with `__mbt_cap_1_x_1` bound inside string interpolation hole `\{...}`
+  let ic_src = "pub fn eval_interp_collide() -> String {\n" +
+  "  let x : Int = 42\n" +
+  "  let __mbt_cap_1_x = 0\n" +
+  "  fn pick(n : Int) -> Int {\n" +
+  "    if n == 0 { x } else { pick(n - 1) }\n" +
+  "  }\n" +
+  "  let _ = __mbt_cap_1_x\n" +
+  "  \"\\{{ let __mbt_cap_1_x_1 = 5; pick(__mbt_cap_1_x_1 - 5) }}\"\n" +
+  "}\n"
+  let ic_res = f3d2_transpile("interp_collide.mbt", ic_src)
+  let ic_out = f3d2_all_out(ic_res)
+  assert_eq(ic_res.blockers, 0)
+  assert_true(str_has(ic_out, "let __mbt_cap_1_x_2 = x;"), "avoids both __mbt_cap_1_x and interp-hole __mbt_cap_1_x_1")
+
+  // P1-6: collision with same-package cross-file `let __mbt_cap_1_x = 5` read inside interpolation
+  let cf_res = transpile_package(
+    [
+      SourceFile::{ rel_path: "defs.mbt", content: "let __mbt_cap_1_x : Int = 5\n", is_test: false },
+      SourceFile::{
+        rel_path: "use.mbt",
+        content: "pub fn eval_cross_file() -> String {\n" +
+        "  let x : Int = 42\n" +
+        "  fn pick(n : Int) -> Int { if n == 0 { x } else { pick(n - 1) } }\n" +
+        "  \"\\{__mbt_cap_1_x}:\\{pick(1)}\"\n" +
+        "}\n",
+        is_test: false,
+      },
+    ],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  let cf_out = f3d2_all_out(cf_res)
+  assert_eq(cf_res.blockers, 0)
+  assert_true(str_has(cf_out, "let __mbt_cap_1_x_1 = x;"), "avoids cross-file package value __mbt_cap_1_x")
+}
