@@ -451,6 +451,8 @@ sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC2"
 # Generic arithmetic operator instantiation checks & QBE monomorphization (dev, --release, wasm32, ASan).
 sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC2"
+# Round 232: untyped tuple array literal -> generic Array[(K, V)] monomorphization (dev, --release, wasm32, ASan).
+sh "$ROOT_DIR/tests/e2e/generic_tuple_array_lit/run_e2e.sh" "$PIONC2"
 # P122: arm64_apple guarded jump-table dispatch copies (main.c replicatedispatch; br sites on 6 targets, text == Mach-O --obj, checker mutations, both-sides-table symmetry, no copy of a table shared by a rewritten edge, 24-copy limit, 8 QBE mutants of the match conditions and limit, 243712-input C reference via arm64_apple text and --obj on macOS ARM64, bytecode_vm == C with 24 run_vm sites, ASan+UBSan QBE replay).
 sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC2"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
@@ -463,6 +465,8 @@ sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC2"
 # P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
 sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC2"
+# P128: Opt-Track Z2 output size (pooled runtime panic texts: 3 Pion traps in dev + --release and 15 runtime-ABI traps covering 14 of the 16 texts with exact diagnostics; `.text.pion_io` collected without host I/O (also with Ptr / cstr / sha256) and kept with file I/O, libpionrt.a < 64 KB with every declared entry point, on Linux x86_64; ELF64 `.rela` name suffix sharing and section symbols for S + A-only private literals, GOT-loaded literals keep their name, `ld -r` merged literals resolve exactly, direct object == `--emit-asm` object data and per-function literal relocations; Wasm32 Map module without `__pion_map_hash`, every body reachable, Node == native output).
+sh "$ROOT_DIR/tests/e2e/p128_binary_size_opts/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
