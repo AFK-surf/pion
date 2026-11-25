@@ -286,8 +286,9 @@ pub fn run_e1_4() -> String {
   let j1 = h.strs[:3].join("-")
   let j2 = h.strs[1:3].join(sep_var)
   let s1 = "\{h.arr[0:2]}"
-  // Astra P1: String/Char/FixedArray/ArrayBuf/ArrayView Show format (unquoted [a, b])
+  // Astra P1: String/Char/FixedArray/ArrayBuf/ArrayView Show format (unquoted [a, b]) + chained .to_string().length()
   let s_str = h.strs[0:2].to_string() + "/" + "\{h.strs[0:2]}" + "/" + h.chars[0:2].to_string() + "/" + "\{h.chars[0:2]}" + "/" + h.fstrs[0:2].to_string()
+  let s_len = h.strs[0:2].to_string().length().to_string() + "," + h.strs[:].to_string().length().to_string()
   // #1: ArrayBuf (promoted local array) + ArrayView param + Bytes slice ro_join/ro_show
   let buf_strs = ["p", "q", "r", "s"]
   let v_strs = buf_strs[0:4]
@@ -299,7 +300,7 @@ pub fn run_e1_4() -> String {
   let b : Bytes = b"\x09\x0a\x0d\x22\x5c\x20\x7e\x00\xff"
   let by_s = b[:].to_string() + "/" + "\{b[:]}"
   l1.to_string() + "," + e1.to_string() + "," + cp.length().to_string() + "," + cp[0].to_string() +
-  "|" + j1 + "|" + j2 + "|" + s1 + "|show=" + s_str +
+  "|" + j1 + "|" + j2 + "|" + s1 + "|show=" + s_str + "|slen=" + s_len +
   "|buf=" + bj + "," + bs_buf + "|view=" + vj + "|bytes=" + by_s +
   "|cnt=" + c_recv.val.to_string() + "," + c_lo.val.to_string() + "," + c_hi.val.to_string()
 }
@@ -379,7 +380,7 @@ def main():
             "E1-1:423|tab:dl,tab:ph",
             "E1-2:11,30|rev=12,c1=1|dep=594,c2=2",
             "E1-3:50,9,9|cache=93,13,13|gp=99,2,88,2,3|fl=3,3|fx=99,2,88,99,2,88|sh=4,4|misc=-7,42,99,708",
-            "E1-4:2,true,2,20|a-b-c|b:c|[10, 20]|show=[a, b]/[a, b]/[x, y]/[x, y]/[u, v]|buf=p-q-r,[5, 6]/[5, 6]/[p, q]|view=q:r|[5, 6]|[p, q]|bytes=b\"\\x09\\x0a\\x0d\\x22\\x5c ~\\x00\\xff\"/b\"\\x09\\x0a\\x0d\\x22\\x5c ~\\x00\\xff\"|cnt=1,1,1",
+            "E1-4:2,true,2,20|a-b-c|b:c|[10, 20]|show=[a, b]/[a, b]/[x, y]/[x, y]/[u, v]|slen=6,12|buf=p-q-r,[5, 6]/[5, 6]/[p, q]|view=q:r|[5, 6]|[p, q]|bytes=b\"\\x09\\x0a\\x0d\\x22\\x5c ~\\x00\\xff\"/b\"\\x09\\x0a\\x0d\\x22\\x5c ~\\x00\\xff\"|cnt=1,1,1",
         ]
         for ln in expected_lines:
             if ln not in moon_out.splitlines():
