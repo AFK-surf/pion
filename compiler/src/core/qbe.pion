@@ -36658,31 +36658,38 @@ fn qbe_probe_expr_ty_with(
       }
       Some(TTuple(etys))
     }
-    EStructLit(sname, _, _, _) =>
-      if sname != "" {
-        let norm_sname = if starts_with_str(sname, "@canon:") {
-          let raw = slice_str(sname, 7, sname.length())
-          let qp = split_qual_name(raw)
-          if qp.prefix != "" && g.tc.pkg_name != "" && qp.prefix == g.tc.pkg_name {
-            qp.name
-          } else {
-            raw
-          }
-        } else {
-          sname
-        }
-        match qbe_lookup_struct_info(g, norm_sname) {
-          Some(sinfo) =>
-            if sinfo.decl.type_params.length() == 0 {
-              Some(TStruct(norm_sname, []))
-            } else {
-              None
-            }
-          None => None
-        }
-      } else {
-        None
+    EStructLit(sname, spread_opt, _, _) => {
+      let base_ty_opt : Option[Ty] = match spread_opt {
+        Some(base_e) => qbe_probe_expr_ty_with(g, base_e, hints)
+        None => None
       }
+      if sname == "" {
+        return match base_ty_opt {
+          Some(TStruct(bn, bargs)) =>
+            Some(TStruct(qbe_resolve_struct_lit_name(g, bn, false), bargs))
+          _ => None
+        }
+      }
+      let resolved_name = qbe_resolve_struct_lit_name(g, sname, true)
+      match qbe_lookup_struct_info(g, resolved_name) {
+        Some(sinfo) =>
+          if sinfo.decl.type_params.length() == 0 {
+            Some(TStruct(resolved_name, []))
+          } else {
+            // `..base` has the type of the literal, type arguments included.
+            match base_ty_opt {
+              Some(TStruct(bn, bargs)) =>
+                if bn == resolved_name && !ty_has_unresolved(TStruct(bn, bargs)) {
+                  Some(TStruct(bn, bargs))
+                } else {
+                  None
+                }
+              _ => None
+            }
+          }
+        None => None
+      }
+    }
     EBlock(stmts, _) => qbe_probe_stmts_ty_with(g, stmts, hints)
     EIf(cond, then_stmts, Some(el), _) => {
       let then_hints = qbe_hints_copy(hints)
@@ -37654,6 +37661,72 @@ fn qbe_resolve_pkg_in_scope(g : QbeGen, qual : String) -> Option[ImportedPkg] {
     }
   } else {
     resolve_pkg_for_lookup(g.tc, qual, false)
+  }
+}
+
+///|
+/// Canonical `g.tc`-side name of unqualified struct `name` of the package being
+/// monomorphized, or `name` itself when `g.mono_pkg` does not define it.
+fn qbe_mono_pkg_struct_name(g : QbeGen, name : String) -> String {
+  if g.tc.structs.contains(g.mono_pkg + "::" + name) {
+    return g.mono_pkg + "::" + name
+  }
+  match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+    Some(ipkg) =>
+      if ipkg.tc.structs.contains(name) {
+        ipkg.name + "::" + name
+      } else {
+        name
+      }
+    None => name
+  }
+}
+
+///|
+/// Resolves the struct name of a struct literal to the name codegen uses for the
+/// type: package aliases become canonical package ids and `@canon:` is stripped.
+/// `explicit_name` tells a name written in the source (looked up in the package
+/// being monomorphized first) from one inferred from a spread base or the expected
+/// type. Emitting and probing a literal must agree on this name: method symbols
+/// are derived from it.
+fn qbe_resolve_struct_lit_name(
+  g : QbeGen,
+  sname : String,
+  explicit_name : Bool,
+) -> String {
+  if starts_with_str(sname, "@canon:") {
+    let raw = slice_str(sname, 7, sname.length())
+    let qp = split_qual_name(raw)
+    return if qp.prefix != "" &&
+      qp.prefix == g.tc.pkg_name &&
+      g.tc.structs.contains(qp.name) {
+      qp.name
+    } else {
+      raw
+    }
+  }
+  if sname == "" {
+    return sname
+  }
+  if !has_qual_sep(sname) {
+    return if g.mono_pkg != "" && (explicit_name || !g.tc.structs.contains(sname)) {
+      qbe_mono_pkg_struct_name(g, sname)
+    } else {
+      sname
+    }
+  }
+  if g.tc.structs.contains(sname) {
+    return sname
+  }
+  let qp = split_qual_name(sname)
+  match qbe_resolve_pkg_in_scope(g, qp.prefix) {
+    Some(ipkg) =>
+      if ipkg.tc.structs.contains(qp.name) {
+        ipkg.name + "::" + qp.name
+      } else {
+        sname
+      }
+    None => sname
   }
 }
 
@@ -41551,7 +41624,7 @@ fn qbe_emit_expr_inner(
         Some(base_e) => Some(qbe_emit_expr(g, base_e, expected))
         None => None
       }
-      let mut resolved_name = if sname != "" {
+      let raw_name = if sname != "" {
         sname
       } else {
         match base_qv_opt {
@@ -41567,56 +41640,7 @@ fn qbe_emit_expr_inner(
             }
         }
       }
-      if sname != "" && g.mono_pkg != "" && !has_qual_sep(resolved_name) {
-        if g.tc.structs.contains(g.mono_pkg + "::" + resolved_name) {
-          resolved_name = g.mono_pkg + "::" + resolved_name
-        } else {
-          match g.tc.imported_pkgs.get(g.mono_pkg) {
-            Some(ipkg) =>
-              if ipkg.tc.structs.contains(resolved_name) {
-                resolved_name = ipkg.name + "::" + resolved_name
-              }
-            None => ()
-          }
-        }
-      }
-      if resolved_name != "" && !g.tc.structs.contains(resolved_name) {
-        if g.mono_pkg != "" {
-          if g.tc.structs.contains(g.mono_pkg + "::" + resolved_name) {
-            resolved_name = g.mono_pkg + "::" + resolved_name
-          } else {
-            match g.tc.imported_pkgs.get(g.mono_pkg) {
-              Some(ipkg) =>
-                if ipkg.tc.structs.contains(resolved_name) {
-                  resolved_name = ipkg.name + "::" + resolved_name
-                }
-              None => ()
-            }
-          }
-        }
-      }
-      if resolved_name != "" && !g.tc.structs.contains(resolved_name) {
-        let qp = split_qual_name(resolved_name)
-        let q_alias = qp.prefix
-        let q_st = qp.name
-        if q_alias.length() > 0 {
-          if starts_with_str(q_alias, "@canon:") &&
-            g.tc.pkg_name != "" &&
-            slice_str(q_alias, 7, q_alias.length()) == g.tc.pkg_name {
-            if g.tc.structs.contains(q_st) {
-              resolved_name = q_st
-            }
-          } else {
-            match qbe_resolve_pkg_in_scope(g, q_alias) {
-              Some(ipkg) =>
-                if ipkg.tc.structs.contains(q_st) {
-                  resolved_name = ipkg.name + "::" + q_st
-                }
-              None => ()
-            }
-          }
-        }
-      }
+      let resolved_name = qbe_resolve_struct_lit_name(g, raw_name, sname != "")
       match qbe_lookup_struct_info(g, resolved_name) {
         // The type checker rejects every struct literal it cannot resolve, so reaching
         // this arm means codegen lost the struct context the checker had: stop with an
