@@ -244,7 +244,7 @@ fitcount(bits b)
 /* limit2 leaves the live set intact when both classes fit. The masks
  * partition all temporaries, so count only occupied words in each class. */
 static int
-fitsregs(BSet *v)
+fitsregs(BSet *v, int kg, int kf)
 {
 	uint i;
 	int gpr = 0, fpr = 0;
@@ -257,10 +257,18 @@ fitsregs(BSet *v)
 		fp = word & mask[1]->t[i];
 		gpr += fitcount(word ^ fp);
 		fpr += fitcount(fp);
-		if (gpr > T.ngpr || fpr > T.nfpr)
+		if (gpr > kg || fpr > kf)
 			return 0;
 	}
 	return 1;
+}
+
+/* When both classes fit, limit() is the identity in each partition. */
+static void
+limitregs(BSet *v, int k1, int k2, BSet *fav)
+{
+	if (!fitsregs(v, T.ngpr - k1, T.nfpr - k2))
+		limit2(v, k1, k2, fav);
 }
 
 static void
@@ -329,12 +337,12 @@ dopm(Blk *b, Ins *i, BSet *v)
 	bscopy(pmu, v);
 	if (i != b->ins && (i-1)->op == Ocall) {
 		v->t[0] &= ~T.retregs((i-1)->arg[1], 0);
-		limit2(v, T.nrsave[0], T.nrsave[1], 0);
+		limitregs(v, T.nrsave[0], T.nrsave[1], 0);
 		for (n=0, r=0; T.rsave[n]>=0; n++)
 			r |= BIT(T.rsave[n]);
 		v->t[0] |= T.argregs((i-1)->arg[1], 0);
 	} else {
-		limit2(v, 0, 0, 0);
+		limitregs(v, 0, 0, 0);
 		r = v->t[0];
 	}
 	sethint(v, r);
@@ -375,6 +383,7 @@ spill(Fn *fn)
 {
 	Blk *b, *s1, *s2, *hd, **bp;
 	int j, l, t, k, lvarg[2];
+	int preferred[5], np, pi;
 	uint n;
 	BSet u[1], v[1], w[1];
 	Ins *i;
@@ -479,7 +488,7 @@ spill(Fn *fn)
 					bsinter(w, u);
 				}
 			}
-			limit2(v, clob, 0, w);
+			limitregs(v, clob, 0, w);
 		} else {
 			bscopy(v, b->out);
 			if (rtype(b->jmp.arg) == RCall)
@@ -489,7 +498,7 @@ spill(Fn *fn)
 			t = b->jmp.arg.val;
 			assert(KBASE(tmp[t].cls) == 0);
 			bsset(v, t);
-			limit2(v, clob, 0, NULL);
+			limitregs(v, clob, 0, NULL);
 			if (!bshas(v, t))
 				b->jmp.arg = slot(t);
 		}
@@ -508,7 +517,7 @@ spill(Fn *fn)
 				i = dopm(b, i, v);
 				continue;
 			}
-			bszero(w);
+			np = 0;
 			if (!req(i->to, R)) {
 				assert(rtype(i->to) == RTmp);
 				t = i->to.val;
@@ -519,7 +528,7 @@ spill(Fn *fn)
 					 * for the result */
 					assert(t >= Tmp0 && "dead reg");
 					bsset(v, t);
-					bsset(w, t);
+					preferred[np++] = t;
 				}
 			}
 			j = T.memargs(i->op);
@@ -533,11 +542,11 @@ spill(Fn *fn)
 					m = &fn->mem[t];
 					if (rtype(m->base) == RTmp) {
 						bsset(v, m->base.val);
-						bsset(w, m->base.val);
+						preferred[np++] = m->base.val;
 					}
 					if (rtype(m->index) == RTmp) {
 						bsset(v, m->index.val);
-						bsset(w, m->index.val);
+						preferred[np++] = m->index.val;
 					}
 					break;
 				case RTmp:
@@ -545,10 +554,14 @@ spill(Fn *fn)
 					lvarg[n] = bshas(v, t);
 					bsset(v, t);
 					if (j-- <= 0)
-						bsset(w, t);
+						preferred[np++] = t;
 					break;
 				}
-			if (!fitsregs(v)) {
+			if (!fitsregs(v, T.ngpr, T.nfpr)) {
+				/* One result and at most two address temps per operand. */
+				bszero(w);
+				for (pi=0; pi<np; pi++)
+					bsset(w, preferred[pi]);
 				bscopy(u, v);
 				limit2(v, 0, 0, w);
 				for (n=0; n<2; n++)

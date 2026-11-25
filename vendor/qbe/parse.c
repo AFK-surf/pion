@@ -325,7 +325,8 @@ lex()
 			c = nextbyte();
 			if (c == EOF)
 				err("unterminated string");
-			vgrow(&tokval.str, i+2);
+			if (i >= 127) /* parse() reserves 128 bytes for every token. */
+				vgrow(&tokval.str, i+2);
 			tokval.str[i] = c;
 			if (c == '"' && !esc) {
 				tokval.str[i+1] = 0;
@@ -339,7 +340,8 @@ Alpha:
 		err("invalid character %c (%d)", c, c);
 	i = 0;
 	do {
-		vgrow(&tokval.str, i+2);
+		if (i >= 127)
+			vgrow(&tokval.str, i+2);
 		tokval.str[i++] = c;
 		c = nextbyte();
 	} while (isalpha(c) || c == '$' || c == '.' || c == '_' || isdigit(c));
@@ -435,7 +437,7 @@ tmpref()
 	t = curf->ntmp;
 	tmph[i] = t;
 	newtmp(0, Kx, curf);
-	curf->tmp[t].name = strf(PFn, "%s", tokval.str);
+	curf->tmp[t].name = pstrdup(PFn, tokval.str);
 	return TMP(t);
 }
 
@@ -608,7 +610,7 @@ findblk()
 			return b;
 	b = newblk();
 	b->id = nblk++;
-	b->name = strf(PFn, "%s", tokval.str);
+	b->name = pstrdup(PFn, tokval.str);
 	b->dlink = blkh[h];
 	blkh[h] = b;
 	return b;
@@ -992,7 +994,7 @@ parsefn(Lnk *lnk)
 		rcls = K0;
 	if (next() != Tglo)
 		err("function name expected");
-	curf->name = strf(PFn, "%s", tokval.str);
+	curf->name = pstrdup(PFn, tokval.str);
 	curf->vararg = parserefl(0);
 	if (nextnl() != Tlbrace)
 		err("function body must start with {");
@@ -1103,7 +1105,7 @@ parsetyp()
 	ty->size = 0;
 	if (nextnl() != Ttyp ||  nextnl() != Teq)
 		err("type name and then = expected");
-	ty->name = strf(PHeap, "%s", tokval.str);
+	ty->name = pstrdup(PHeap, tokval.str);
 	t = nextnl();
 	if (t == Talign) {
 		if (nextnl() != Tint)
@@ -1147,7 +1149,7 @@ parsedatref(Dat *d)
 	int t;
 
 	d->isref = 1;
-	d->u.ref.name = strf(PFn, "%s", tokval.str);
+	d->u.ref.name = pstrdup(PFn, tokval.str);
 	d->u.ref.off = 0;
 	t = peek();
 	if (t == Tplus) {
@@ -1162,7 +1164,7 @@ static void
 parsedatstr(Dat *d)
 {
 	d->isstr = 1;
-	d->u.str = strf(PFn, "%s", tokval.str);
+	d->u.str = pstrdup(PFn, tokval.str);
 }
 
 static void
@@ -1174,7 +1176,7 @@ parsedat(void cb(Dat *), Lnk *lnk)
 
 	if (nextnl() != Tglo || nextnl() != Teq)
 		err("data name, then = expected");
-	name = strf(PFn, "%s", tokval.str);
+	name = pstrdup(PFn, tokval.str);
 	t = nextnl();
 	lnk->align = 8;
 	if (t == Talign) {
@@ -1256,10 +1258,10 @@ parselnk(Lnk *lnk)
 				err("only one section allowed");
 			if (next() != Tstr)
 				err("section \"name\" expected");
-			lnk->sec = strf(PFn, "%s", tokval.str);
+			lnk->sec = pstrdup(PFn, tokval.str);
 			if (peek() == Tstr) {
 				next();
-				lnk->secf = strf(PFn, "%s", tokval.str);
+				lnk->secf = pstrdup(PFn, tokval.str);
 			}
 			break;
 		default:
