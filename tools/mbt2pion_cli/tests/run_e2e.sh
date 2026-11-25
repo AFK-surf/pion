@@ -2468,7 +2468,45 @@ r_bad_rec = subprocess.run(
 assert r_bad_rec.returncode != 0 and "MBT2PION_RECIPE_ERROR" in (r_bad_rec.stdout + r_bad_rec.stderr), (
     f"Invalid [comments] recipe MUST fail with MBT2PION_RECIPE_ERROR, got rc={r_bad_rec.returncode}\n{r_bad_rec.stdout}\n{r_bad_rec.stderr}"
 )
-print("[e2e] PASS: Upper-tier E2E suite (verified ABI, tamper fail-closed, multi-dep Bars, readonly pub enum, raising callbacks, [comments] redaction)")
+
+# 6. P0-3: mutable Array `[_, .. as tail]` MUST fail-closed with MBT2PION_BORROWED_ARRAY_SLICE
+mut_tail_src = os.path.join(ut_root, "mut_tail_src")
+mut_tail_out = os.path.join(ut_root, "mut_tail_out")
+os.makedirs(mut_tail_src, exist_ok=True)
+with open(os.path.join(mut_tail_src, "a.mbt"), "w") as f:
+    f.write('pub fn mut_tail(xs : Array[Int]) -> Int {\n  match xs {\n    [_, .. as tail] => { xs[1] = 9; tail[0] }\n    _ => 0\n  }\n}\n')
+r_mt = subprocess.run(
+    [bin_path, "--src", mut_tail_src, "--out", mut_tail_out,
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_mt.returncode != 0 and "MBT2PION_BORROWED_ARRAY_SLICE" in (r_mt.stdout + r_mt.stderr), (
+    f"Mutable Array `.. as tail` MUST fail-closed with MBT2PION_BORROWED_ARRAY_SLICE, got rc={r_mt.returncode}\n{r_mt.stdout}\n{r_mt.stderr}"
+)
+
+# 7. P1-5: `[comments]` redacting `Word` -> `origin: note.mbt:42:1:1:1` must NOT hijack real init-order probe origin
+spoof_src = os.path.join(ut_root, "spoof_src")
+spoof_out = os.path.join(ut_root, "spoof_out")
+spoof_rep = os.path.join(ut_root, "spoof_report.json")
+os.makedirs(spoof_src, exist_ok=True)
+with open(os.path.join(spoof_src, "v.mbt"), "w") as f:
+    f.write('pub let x : Int = {\n  // Word\n  let s = "abc"\n  s.length()\n}\n')
+spoof_rec = os.path.join(ut_root, "spoof_recipes.toml")
+with open(spoof_rec, "w") as f:
+    f.write('[comments]\nreplace = [{ from = "Word", to = "origin: note.mbt:42:1:1:1" }]\n')
+r_sp = subprocess.run(
+    [bin_path, "--src", spoof_src, "--out", spoof_out, "--recipes", spoof_rec,
+     "--report", spoof_rep, "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_sp.returncode == 0, f"P1-5 spoof comment publish failed:\n{r_sp.stdout}\n{r_sp.stderr}"
+sp_rep = json.load(open(spoof_rep))
+len_disps = [p for p in sp_rep.get("probe_dispositions", []) if p.get("probe_kind") == "mbt_len_probe"]
+assert len(len_disps) >= 1 and all(p.get("file") == "v.mbt" and p.get("line") == 4 for p in len_disps), (
+    f"P1-5 probe origin hijacked by redacted comment! got: {len_disps}"
+)
+
+print("[e2e] PASS: Upper-tier E2E suite (verified ABI, tamper fail-closed, multi-dep Bars, readonly pub enum, raising callbacks, [comments] redaction, P0-3 mutable tail gate, P1-5 structured init origin)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"

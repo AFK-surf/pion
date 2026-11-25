@@ -104,7 +104,7 @@ CASES = {
     "transpile_core": ("ok", 7),
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
-    "transpile_upper_tier": ("ok", 12),
+    "transpile_upper_tier": ("ok", 18),
 }
 
 MOON_TRAPS = {
@@ -1588,10 +1588,96 @@ pub fn ut_misc_syntax() -> (Int, String, Bool, Int, Bool) {
   let t3 = UtNestedTup::{ pair: ((1, "a"), (2, "c")) }
   let arr = [10, 20, 30]
   let as_sum = match arr {
-    [head, .. as tail] => head + tail.length()
+    [head, .. as tail] => {
+      arr[1] = 29
+      head + tail.length() + (tail[0] - 29)
+    }
     _ => -1
   }
   (sum + p + n + as_sum, emoji + "|" + esc + "|" + interp, t1 == t2 && !(t1 == t3), emoji.length(), true)
+}
+
+// Final review 10-item oracle regressions (P0-2, P0-3, P0-4, P1-2, P1-3, P1-4)
+pub fn ut_json_hex_and_extremes() -> (Bool, Bool, Bool, Bool) {
+  let j1 : Json = 0x1.8p0
+  let j2 : Json = -0x1.8p0
+  let j3 : Json = 0x1.0p1024
+  let j4 : Json = 1.0e309
+  let j5 : Json = -1.0e309
+  let j6 : Json = 1.0e-400
+  let j7 : Json = -1.0e-400
+  let j8 : Json = 0.1
+  let j9 : Json = 1.0e25
+  let ok1 = match (j1, j2) {
+    (Number(a, ..), Number(b, ..)) => a == 1.5 && b == -1.5
+    _ => false
+  }
+  let ok2 = match (j3, j4, j5) {
+    (Number(a, ..), Number(b, ..), Number(c, ..)) =>
+      a.reinterpret_as_uint64() == 0x7FF0000000000000UL &&
+      b.reinterpret_as_uint64() == 0x7FF0000000000000UL &&
+      c.reinterpret_as_uint64() == 0xFFF0000000000000UL
+    _ => false
+  }
+  let ok3 = match (j6, j7) {
+    (Number(a, ..), Number(b, ..)) =>
+      a.reinterpret_as_uint64() == 0UL &&
+      b.reinterpret_as_uint64() == 0x8000000000000000UL
+    _ => false
+  }
+  let ok4 = match (j8, j9) {
+    (Number(a, ..), Number(b, ..)) =>
+      a.reinterpret_as_uint64() == (0.1).reinterpret_as_uint64() &&
+      b.reinterpret_as_uint64() == (1.0e25).reinterpret_as_uint64()
+    _ => false
+  }
+  (ok1, ok2, ok3, ok4)
+}
+
+pub fn ut_retain_filter_map_mut() -> (Int, Int, Int, Int, Int) {
+  let a1 = [1, 2, 3]
+  a1.retain(fn(x) { if x == 1 { let _ = a1.pop() }; true })
+  let a2 = [1, 2, 3]
+  a2.retain(fn(x) { if x == 1 { let _ = a2.pop() }; x != 2 })
+  let a3 = [1, 2]
+  a3.retain(fn(x) { if x == 1 { a3.push(99) }; true })
+  let a4 = [1, 2]
+  a4.retain(fn(x) { if x == 1 { a4.push(99) }; x != 2 })
+  let a5 = [1, 2, 3]
+  let fm = a5.filter_map(fn(x) { if x == 1 { let _ = a5.pop() }; Option::Some(x * 10) })
+  (a1.length() * 10 + a1[1], a2.length() * 10 + a2[1], a3.length() * 100 + a3[2], a4.length() * 10 + a4[0], fm.length() * 100 + fm[2])
+}
+
+pub(all) struct UtKwCollision {
+  val : Int
+  val_ : Int
+}
+
+pub fn ut_kw_collision_score(val~ : Int, val_~ : Int) -> Int {
+  val * 10 + val_
+}
+
+pub fn ut_kw_collision_demo() -> (Int, Int) {
+  let k = UtKwCollision::{ val: 1, val_: 9 }
+  let r1 = match k {
+    { val, val_, .. } => val * 10 + val_
+  }
+  let r2 = ut_kw_collision_score(val=1, val_=9)
+  (r1, r2)
+}
+
+pub fn ut_tup_arr_and_set_ctor() -> (Int, Int, Int) {
+  let r1 = match ([10, 2], true) {
+    ([_, _] as fs, _) => fs[1]
+    _ => -1
+  }
+  let r2 = match ([10, 2], false) {
+    ([_, _] as fs, flag) if flag => fs[0]
+    ([a, b], _) => a + b
+    _ => -1
+  }
+  let s = Set([1, 2, 2])
+  (r1, r2, s.length())
 }
 '''
 
@@ -2148,6 +2234,17 @@ fn main {
     check("ut.labeled_enum", lv1 == 308 && lv2 == 4)
     check("ut.surrogate_len", elen == 2)
     check("ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
+    let (jh1, jh2, jh3, jh4) = @m12.ut_json_hex_and_extremes()
+    let (rm1, rm2, rm3, rm4, rm5) = @m12.ut_retain_filter_map_mut()
+    let (kc1, kc2) = @m12.ut_kw_collision_demo()
+    let (ta1, ta2, sc1) = @m12.ut_tup_arr_and_set_ctor()
+    trace("ut10", "\{jh1}:\{jh2}:\{jh3}:\{jh4},\{rm1}:\{rm2}:\{rm3}:\{rm4}:\{rm5},\{kc1}:\{kc2},\{ta1}:\{ta2}:\{sc1}")
+    check("ut.p0_2_json_hex_extremes", jh1 && jh2 && jh3 && jh4)
+    check("ut.p0_4_retain_pop", rm1 == 22 && rm2 == 23)
+    check("ut.p0_4_retain_push_fm", rm3 == 399 && rm4 == 11 && rm5 == 330)
+    check("ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
+    check("ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
+    check("ut.p1_4_set_ctor", sc1 == 2)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2720,6 +2817,17 @@ pub fn main(w : World) -> Int {
     check(w, "ut.labeled_enum", lv1 == 308 && lv2 == 4)
     check(w, "ut.surrogate_len", elen == 2)
     check(w, "ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
+    let (jh1, jh2, jh3, jh4) = m12::ut_json_hex_and_extremes()
+    let (rm1, rm2, rm3, rm4, rm5) = m12::ut_retain_filter_map_mut()
+    let (kc1, kc2) = m12::ut_kw_collision_demo()
+    let (ta1, ta2, sc1) = m12::ut_tup_arr_and_set_ctor()
+    trace(w, "ut10", jh1.to_string() + ":" + jh2.to_string() + ":" + jh3.to_string() + ":" + jh4.to_string() + "," + rm1.to_string() + ":" + rm2.to_string() + ":" + rm3.to_string() + ":" + rm4.to_string() + ":" + rm5.to_string() + "," + kc1.to_string() + ":" + kc2.to_string() + "," + ta1.to_string() + ":" + ta2.to_string() + ":" + sc1.to_string())
+    check(w, "ut.p0_2_json_hex_extremes", jh1 && jh2 && jh3 && jh4)
+    check(w, "ut.p0_4_retain_pop", rm1 == 22 && rm2 == 23)
+    check(w, "ut.p0_4_retain_push_fm", rm3 == 399 && rm4 == 11 && rm5 == 330)
+    check(w, "ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
+    check(w, "ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
+    check(w, "ut.p1_4_set_ctor", sc1 == 2)
   } else {
     panic("abort: unknown case " + kase)
   }
