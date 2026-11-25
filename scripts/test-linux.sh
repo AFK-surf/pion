@@ -552,6 +552,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tools/mbt2pion_cli/tests/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j4b_pkg_alias/run_e2e.sh" "$PIONC"
 # P94: Wave J3 — first-class immutable Send sequence type ImmArray[T].
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC"
+# Wave L1-B: physical_equal, Double/Float is_inf/is_finite/is_nan, @builtin:Eq + structural ==/!=, pion.toml [targets].
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_l1b_eq_targets/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p76_value_key_map/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p77_views_and_lib_os/run_e2e.sh" "$PIONC"
 # P30-H: cross-pkg generic Mutex[Array[Ev]] / Channel[Cmd] deep-freeze under real OS threads (release + ASan + TSan).

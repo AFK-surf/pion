@@ -985,6 +985,24 @@ fn qbe_let_infer(g : QbeGen, sp : Span) -> Option[Ty] {
 }
 
 ///|
+/// Operand type hint for `==`/`!=` and `physical_equal` when the LHS is
+/// under-specified (`None`, `[]`, `Ok(...)`, `(None, 1)`, etc.): prefers the
+/// checker-recorded `#eq_op` type (supporting cross-package monomorphization
+/// via `qbe_call_infer`) and falls back to `qbe_probe_expr_ty(g, rhs)`.
+fn qbe_eq_op_hint(g : QbeGen, sp : Span, rhs : Expr) -> Option[Ty] {
+  match qbe_call_infer(g, sp, "#eq_op") {
+    Some(t0) => {
+      let t = subst_ty(t0, g.cur_type_subst)
+      if !ty_has_unresolved(t) && !qbe_ty_has_error(t) && !qbe_ty_has_param(t) {
+        return Some(t)
+      }
+    }
+    None => ()
+  }
+  qbe_probe_expr_ty(g, rhs)
+}
+
+///|
 /// Type the checker recorded for the call at `sp` under `tag` (`#map`: type of a
 /// `Map(...)` construction, `#targs:<fn>`: type arguments of a generic call with
 /// named / default arguments).
@@ -1008,6 +1026,7 @@ fn qbe_call_infer(g : QbeGen, sp : Span, tag : String) -> Option[Ty] {
   }
 }
 
+
 ///|
 /// Type the checker inferred for the RHS shift count of `EBinary("<<" | ">>")`.
 fn qbe_shift_rhs_infer(g : QbeGen, sp : Span) -> Option[Ty] {
@@ -1029,6 +1048,7 @@ fn qbe_shift_rhs_infer(g : QbeGen, sp : Span) -> Option[Ty] {
     None => None
   }
 }
+
 
 ///|
 /// Fallback shift-count type hint when `g.tc.shift_rhs_infer` has no entry
@@ -1126,6 +1146,7 @@ fn qbe_closure_infer(g : QbeGen, sp : Span) -> Option[Ty] {
     None => None
   }
 }
+
 
 ///|
 fn qbe_abi_ty(t : Ty) -> String {
@@ -1773,12 +1794,21 @@ fn qbe_expr_has_eq(g : QbeGen, d : Int, e : Expr) -> Bool {
       op == "==" || op == "!=" || qbe_expr_has_eq(g, d, l) || qbe_expr_has_eq(g, d, r)
     EField(o, _, _) => qbe_expr_has_eq(g, d, o)
     EIndex(o, i, _) => qbe_expr_has_eq(g, d, o) || qbe_expr_has_eq(g, d, i)
-    ECall(callee, args, _) =>
+    ECall(callee, args, sp) => {
+      let is_phys_eq = match callee {
+        EIdent(cname, _) => cname == "physical_equal" && !qbe_has_user_callee_at(g, "physical_equal", sp)
+        _ => false
+      }
+      is_phys_eq ||
       qbe_expr_has_eq(g, d, callee) ||
       qbe_exprs_have_eq(g, d, args) ||
       qbe_callee_generic_has_eq(g, d, callee)
-    EMethodCall(obj, mname, args, _) =>
-      mname == "contains" || qbe_expr_has_eq(g, d, obj) || qbe_exprs_have_eq(g, d, args)
+    }
+    EMethodCall(obj, mname, args, sp) =>
+      mname == "contains" ||
+      qbe_expr_has_eq(g, d, obj) ||
+      qbe_exprs_have_eq(g, d, args) ||
+      qbe_method_generic_has_eq(g, d, mname, sp)
     EArrayLit(elems, _) | ETuple(elems, _) | EInterp(elems, _) | EDotVariant(_, elems, _) =>
       qbe_exprs_have_eq(g, d, elems)
     EStructLit(_, _spread, fields, _) => {
@@ -1886,6 +1916,157 @@ fn qbe_callee_generic_has_eq(g : QbeGen, d : Int, callee : Expr) -> Bool {
       fi.decl.type_bounds.length() == 0 &&
       qbe_stmts_have_eq(g, d + 1, fi.decl.body)
     None => false
+  }
+}
+
+///|
+fn qbe_method_generic_has_eq(g : QbeGen, d : Int, mname : String, sp : Span) -> Bool {
+  if d >= 4 {
+    return false
+  }
+  match g.tc.resolved_method_calls.get(span_key(sp)) {
+    Some(mk) =>
+      match g.tc.methods.get(mk) {
+        Some(mi) =>
+          return mi.decl.type_params.length() > 0 &&
+            mi.decl.type_bounds.length() == 0 &&
+            qbe_stmts_have_eq(g, d + 1, mi.decl.body)
+        None => ()
+      }
+    None => ()
+  }
+  let suffix = "::" + mname
+  let mut i = 0
+  while i < g.tc.method_names.length() {
+    let mk = g.tc.method_names[i]
+    if mk.length() > suffix.length() &&
+      slice_str(mk, mk.length() - suffix.length(), mk.length()) == suffix {
+      match g.tc.methods.get(mk) {
+        Some(mi) =>
+          if mi.decl.type_params.length() > 0 &&
+            mi.decl.type_bounds.length() == 0 &&
+            qbe_stmts_have_eq(g, d + 1, mi.decl.body) {
+            return true
+          }
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn qbe_lhs_needs_rhs_hint(lhs : Expr) -> Bool {
+  match lhs {
+    EIdent(n, _) => n == "None"
+    EPath(q, m, _) => q == "Option" && m == "None"
+    EArrayLit(elems, _) => {
+      if elems.length() == 0 {
+        return true
+      }
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_lhs_needs_rhs_hint(elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    ETuple(elems, _) => {
+      let mut i = 0
+      while i < elems.length() {
+        if qbe_lhs_needs_rhs_hint(elems[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    ECall(EIdent(n, _), args, _) =>
+      n == "Ok" ||
+      n == "Err" ||
+      (n == "Some" && args.length() == 1 && qbe_lhs_needs_rhs_hint(args[0]))
+    ECall(EPath(q, m, _), args, _) =>
+      (q == "Result" && (m == "Ok" || m == "Err")) ||
+      (q == "Option" && m == "Some" && args.length() == 1 && qbe_lhs_needs_rhs_hint(args[0]))
+    EStructLit(sname, spread, fields, _) => {
+      if sname == "" {
+        return true
+      }
+      match spread {
+        Some(se) => if qbe_lhs_needs_rhs_hint(se) { return true }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if qbe_lhs_needs_rhs_hint(fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) =>
+      if stmts.length() > 0 {
+        match stmts[stmts.length() - 1] {
+          SExpr(e, _) => qbe_lhs_needs_rhs_hint(e)
+          _ => false
+        }
+      } else {
+        false
+      }
+    EIf(_, then_stmts, else_opt, _) => {
+      let then_needs = if then_stmts.length() > 0 {
+        match then_stmts[then_stmts.length() - 1] {
+          SExpr(e, _) => qbe_lhs_needs_rhs_hint(e)
+          _ => false
+        }
+      } else {
+        false
+      }
+      if then_needs {
+        return true
+      }
+      match else_opt {
+        Some(ee) => qbe_lhs_needs_rhs_hint(ee)
+        None => false
+      }
+    }
+    EMatch(_, arms, _) => {
+      let mut i = 0
+      while i < arms.length() {
+        if qbe_lhs_needs_rhs_hint(arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EDotVariant(_, _, _) => true
+    _ => false
+  }
+}
+
+///|
+fn qbe_ty_has_error(t : Ty) -> Bool {
+  match t {
+    TError => true
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      qbe_ty_has_error(e)
+    TResult(a, b) | TMap(a, b) => qbe_ty_has_error(a) || qbe_ty_has_error(b)
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        if qbe_ty_has_error(args[i]) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
   }
 }
 
@@ -5194,6 +5375,8 @@ fn qbe_is_builtin_scalar_method_for(ty : Ty, mname : String) -> Bool {
       mname == "reinterpret_as_int64" ||
       mname == "reinterpret_as_uint64" ||
       mname == "is_nan" ||
+      mname == "is_inf" ||
+      mname == "is_finite" ||
       mname == "compare" ||
       mname == "sqrt" ||
       mname == "cbrt" ||
@@ -5221,6 +5404,9 @@ fn qbe_is_builtin_scalar_method_for(ty : Ty, mname : String) -> Bool {
       mname == "to_bits" ||
       mname == "reinterpret_as_int" ||
       mname == "reinterpret_as_uint" ||
+      mname == "is_nan" ||
+      mname == "is_inf" ||
+      mname == "is_finite" ||
       mname == "abs" ||
       mname == "sqrt" ||
       mname == "cbrt" ||
@@ -9228,6 +9414,8 @@ fn qbe_match_arr_alias_safe_expr(
           mname == "reinterpret_as_int64" ||
           mname == "reinterpret_as_uint64" ||
           mname == "is_nan" ||
+          mname == "is_inf" ||
+          mname == "is_finite" ||
           mname == "to_string" ||
           mname == "abs" ||
           mname == "floor" ||
@@ -9254,6 +9442,9 @@ fn qbe_match_arr_alias_safe_expr(
           mname == "to_bits" ||
           mname == "reinterpret_as_int" ||
           mname == "reinterpret_as_uint" ||
+          mname == "is_nan" ||
+          mname == "is_inf" ||
+          mname == "is_finite" ||
           mname == "to_string" ||
           mname == "abs" ||
           mname == "floor" ||
@@ -10325,6 +10516,8 @@ fn qbe_is_pure_builtin_method(recv_ty : Ty, mname : String, nargs : Int) -> Bool
       mname == "reinterpret_as_int64" ||
       mname == "reinterpret_as_uint64" ||
       mname == "is_nan" ||
+      mname == "is_inf" ||
+      mname == "is_finite" ||
       mname == "abs" ||
       mname == "floor" ||
       mname == "ceil" ||
@@ -10350,6 +10543,9 @@ fn qbe_is_pure_builtin_method(recv_ty : Ty, mname : String, nargs : Int) -> Bool
       mname == "to_bits" ||
       mname == "reinterpret_as_int" ||
       mname == "reinterpret_as_uint" ||
+      mname == "is_nan" ||
+      mname == "is_inf" ||
+      mname == "is_finite" ||
       mname == "abs" ||
       mname == "floor" ||
       mname == "ceil" ||
@@ -27446,9 +27642,79 @@ fn qbe_emit_strview_eq_raw(
 }
 
 ///|
+fn qbe_ty_may_contain_float(g : QbeGen, ty : Ty, visited : Map[String, Bool]) -> Bool {
+  let rty = subst_ty(ty, g.cur_type_subst)
+  match rty {
+    TDouble | TFloat | TParam(_) => true
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) =>
+      qbe_ty_may_contain_float(g, e, visited)
+    TResult(a, b) =>
+      qbe_ty_may_contain_float(g, a, visited) || qbe_ty_may_contain_float(g, b, visited)
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        if qbe_ty_may_contain_float(g, es[i], visited) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TStruct(sname, sargs) => {
+      let key = ty_to_string(rty)
+      if visited.contains(key) {
+        return false
+      }
+      visited.set(key, true)
+      match qbe_lookup_struct_info(g, sname) {
+        None => true
+        Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, sargs)
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            if qbe_ty_may_contain_float(g, subst_ty(sinfo.field_tys[fi], subst), visited) {
+              return true
+            }
+            fi = fi + 1
+          }
+          false
+        }
+      }
+    }
+    TEnum(ename, eargs) => {
+      let key = ty_to_string(rty)
+      if visited.contains(key) {
+        return false
+      }
+      visited.set(key, true)
+      match qbe_lookup_enum_info(g, ename) {
+        None => true
+        Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, eargs)
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              if qbe_ty_may_contain_float(g, subst_ty(v.field_tys[fi], subst), visited) {
+                return true
+              }
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          false
+        }
+      }
+    }
+    _ => false
+  }
+}
+
+///|
 fn qbe_type_needs_eq_fn(g : QbeGen, ty : Ty) -> Bool {
   match subst_ty(ty, g.cur_type_subst) {
-    TImmArray(_) => true
+    TImmArray(_) | TArray(_) | TFixedArray(_) | TOption(_) | TResult(_, _) | TTuple(_) => true
     TStruct(sname, _) =>
       match qbe_lookup_struct_info(g, sname) {
         Some(si) => si.decl.derive_eq
@@ -27541,6 +27807,8 @@ fn qbe_emit_eq_field_cmp_ptrs(
       sb.write_string("    %p2_" + pfx + " =l loadl %p2p_" + pfx + "\n")
       sb.write_string("    %ok_" + pfx + " =w call " + eq_bytes_sym + "(l %p1_" + pfx + ", l %p2_" + pfx + ", l %l1_" + pfx + ")\n")
     }
+    TUnit =>
+      sb.write_string("    %ok_" + pfx + " =w copy 1\n")
     _ => {
       sb.write_string("    %av_" + pfx + " =l loadl " + ap + "\n")
       sb.write_string("    %bv_" + pfx + " =l loadl " + bp + "\n")
@@ -27587,11 +27855,14 @@ fn qbe_ensure_eq_fn(g : QbeGen, ty : Ty) -> String {
   }
   g.eq_fn_seen.set(fn_sym, true)
   match rty {
-    TImmArray(elem_raw) => {
+    TImmArray(elem_raw) | TArray(elem_raw) | TFixedArray(elem_raw) => {
       let elem = subst_ty(elem_raw, g.cur_type_subst)
       let sb = StringBuilder()
       sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
       sb.write_string("    %i_slot =l alloc8 8\n")
+      if !qbe_ty_may_contain_float(g, elem, Map([])) {
+        sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_len\n@cmp_len\n")
+      }
       sb.write_string("    %la =l loadl %a\n    %lb =l loadl %b\n")
       sb.write_string("    %leq =w ceql %la, %lb\n    jnz %leq, @chk_empty, @ret_false\n")
       sb.write_string("@chk_empty\n    %has =w csgtl %la, 0\n    jnz %has, @init_loop, @ret_true\n")
@@ -27649,13 +27920,122 @@ fn qbe_ensure_eq_fn(g : QbeGen, ty : Ty) -> String {
       g.extra_fns.push(sb.to_string())
       fn_sym
     }
+    TOption(inner_raw) => {
+      let inner = subst_ty(inner_raw, g.cur_type_subst)
+      let sb = StringBuilder()
+      sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
+      if qbe_is_niche_opt_inner(inner) {
+        if qbe_is_unboxed_unit_enum(g, inner) {
+          sb.write_string("    %ok =w ceql %a, %b\n    ret %ok\n}\n\n")
+        } else {
+          sb.write_string("    %an =w ceql %a, 0\n    %bn =w ceql %b, 0\n")
+          sb.write_string("    jnz %an, @a_null, @a_some\n")
+          sb.write_string("@a_null\n    jnz %bn, @ret_true, @ret_false\n")
+          sb.write_string("@a_some\n    jnz %bn, @ret_false, @both_some\n")
+          sb.write_string("@both_some\n")
+          if !qbe_ty_may_contain_float(g, inner, Map([])) {
+            sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_val\n@cmp_val\n")
+          }
+          match inner {
+            TString =>
+              sb.write_string("    %ok =w call $pion_str_eq(l %a, l %b)\n    ret %ok\n")
+            TStrView => {
+              let eq_bytes_sym = qbe_ensure_view_eq_bytes_fn(g)
+              sb.write_string("    %l1p =l add %a, 16\n    %l1 =l loadl %l1p\n")
+              sb.write_string("    %l2p =l add %b, 16\n    %l2 =l loadl %l2p\n")
+              sb.write_string("    %leq =w ceql %l1, %l2\n    jnz %leq, @svcmp, @ret_false\n")
+              sb.write_string("@svcmp\n")
+              sb.write_string("    %p1p =l add %a, 8\n    %p1 =l loadl %p1p\n")
+              sb.write_string("    %p2p =l add %b, 8\n    %p2 =l loadl %p2p\n")
+              sb.write_string("    %ok =w call " + eq_bytes_sym + "(l %p1, l %p2, l %l1)\n    ret %ok\n")
+            }
+            _ =>
+              if qbe_type_needs_eq_fn(g, inner) {
+                let child_sym = qbe_ensure_eq_fn(g, inner)
+                sb.write_string("    %ok =w call " + child_sym + "(l %a, l %b)\n    ret %ok\n")
+              } else {
+                match inner {
+                  TEnum(_, _) => {
+                    sb.write_string("    %ta =l loadl %a\n    %tb =l loadl %b\n")
+                    sb.write_string("    %ok =w ceql %ta, %tb\n    ret %ok\n")
+                  }
+                  _ => sb.write_string("    %ok =w ceql %a, %b\n    ret %ok\n")
+                }
+              }
+          }
+          sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+        }
+      } else {
+        if !qbe_ty_may_contain_float(g, inner, Map([])) {
+          sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_tag\n@cmp_tag\n")
+        }
+        sb.write_string("    %ta =l loadl %a\n    %tb =l loadl %b\n")
+        sb.write_string("    %teq =w ceql %ta, %tb\n    jnz %teq, @chk_some, @ret_false\n")
+        sb.write_string("@chk_some\n    %taw =w cnel %ta, 0\n    jnz %taw, @cmp_payload, @ret_true\n")
+        sb.write_string("@cmp_payload\n")
+        qbe_emit_eq_field_cmp(g, sb, inner, 8, "opt", "@ret_true")
+        sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+      }
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    TResult(ok_raw, err_raw) => {
+      let ok_ty = subst_ty(ok_raw, g.cur_type_subst)
+      let err_ty = subst_ty(err_raw, g.cur_type_subst)
+      let sb = StringBuilder()
+      sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
+      if !qbe_ty_may_contain_float(g, rty, Map([])) {
+        sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_tag\n@cmp_tag\n")
+      }
+      sb.write_string("    %ta =l loadl %a\n    %tb =l loadl %b\n")
+      sb.write_string("    %teq =w ceql %ta, %tb\n    jnz %teq, @chk_tag, @ret_false\n")
+      sb.write_string("@chk_tag\n    %taw =w cnel %ta, 0\n    jnz %taw, @cmp_err, @cmp_ok\n")
+      sb.write_string("@cmp_ok\n")
+      qbe_emit_eq_field_cmp(g, sb, ok_ty, 8, "rok", "@ret_true")
+      sb.write_string("@cmp_err\n")
+      qbe_emit_eq_field_cmp(g, sb, err_ty, 8, "rerr", "@ret_true")
+      sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
+    TTuple(elems_raw) => {
+      let sb = StringBuilder()
+      sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
+      if !qbe_ty_may_contain_float(g, rty, Map([])) {
+        sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @t_0\n")
+      } else {
+        sb.write_string("    jmp @t_0\n")
+      }
+      let mut ei = 0
+      while ei < elems_raw.length() {
+        let ety = subst_ty(elems_raw[ei], g.cur_type_subst)
+        let next_lbl = if ei + 1 < elems_raw.length() {
+          "@t_" + (ei + 1).to_string()
+        } else {
+          "@ret_true"
+        }
+        sb.write_string("@t_" + ei.to_string() + "\n")
+        qbe_emit_eq_field_cmp(g, sb, ety, ei * 8, "t" + ei.to_string(), next_lbl)
+        ei = ei + 1
+      }
+      if elems_raw.length() == 0 {
+        sb.write_string("@t_0\n    jmp @ret_true\n")
+      }
+      sb.write_string("@ret_true\n    ret 1\n@ret_false\n    ret 0\n}\n\n")
+      g.extra_fns.push(sb.to_string())
+      fn_sym
+    }
     TStruct(sname, sargs) =>
       match qbe_lookup_struct_info(g, sname) {
         Some(sinfo) => {
           let subst = make_subst(sinfo.decl.type_params, sargs)
           let sb = StringBuilder()
           sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
-          sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @f_0\n")
+          if !qbe_ty_may_contain_float(g, rty, Map([])) {
+            sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @f_0\n")
+          } else {
+            sb.write_string("    jmp @f_0\n")
+          }
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
             let fty = subst_ty(sinfo.field_tys[fi], subst)
@@ -27683,7 +28063,12 @@ fn qbe_ensure_eq_fn(g : QbeGen, ty : Ty) -> String {
           let subst = make_subst(einfo.decl.type_params, eargs)
           let sb = StringBuilder()
           sb.write_string("function w " + fn_sym + "(l %a, l %b) {\n@start\n")
-          sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_tag\n@cmp_tag\n")
+          if !qbe_ty_may_contain_float(g, rty, Map([])) {
+            sb.write_string("    %same =w ceql %a, %b\n    jnz %same, @ret_true, @cmp_tag\n")
+          } else {
+            sb.write_string("    jmp @cmp_tag\n")
+          }
+          sb.write_string("@cmp_tag\n")
           sb.write_string("    %ta =l loadl %a\n    %tb =l loadl %b\n    %teq =w ceql %ta, %tb\n    jnz %teq, @vchk_0, @ret_false\n")
           let mut vi = 0
           while vi < einfo.variants.length() {
@@ -31285,6 +31670,42 @@ fn qbe_emit_method_call_dispatch(
         qbe_emit(g, r + " =l extuw " + w)
         return qval(r, TBool)
       }
+      if method_name == "is_inf" {
+        let dreg = if qbe_is_temp_reg(obj_val) {
+          obj_val
+        } else {
+          let dt = qbe_tmp(g)
+          qbe_emit(g, dt + " =d copy " + obj_val)
+          dt
+        }
+        let bits = qbe_tmp(g)
+        let mag = qbe_tmp(g)
+        let w = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, bits + " =l cast " + dreg)
+        qbe_emit(g, mag + " =l and " + bits + ", 9223372036854775807")
+        qbe_emit(g, w + " =w ceql " + mag + ", 9218868437227405312")
+        qbe_emit(g, r + " =l extuw " + w)
+        return qval(r, TBool)
+      }
+      if method_name == "is_finite" {
+        let dreg = if qbe_is_temp_reg(obj_val) {
+          obj_val
+        } else {
+          let dt = qbe_tmp(g)
+          qbe_emit(g, dt + " =d copy " + obj_val)
+          dt
+        }
+        let bits = qbe_tmp(g)
+        let exp = qbe_tmp(g)
+        let w = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, bits + " =l cast " + dreg)
+        qbe_emit(g, exp + " =l and " + bits + ", 9218868437227405312")
+        qbe_emit(g, w + " =w cnel " + exp + ", 9218868437227405312")
+        qbe_emit(g, r + " =l extuw " + w)
+        return qval(r, TBool)
+      }
       if method_name == "compare" {
         let av = qbe_emit_expr(g, args[0], Some(TDouble))
         let ad = qbe_coerce_val(g, av, TDouble)
@@ -31374,6 +31795,49 @@ fn qbe_emit_method_call_dispatch(
         let w = qbe_tmp(g)
         qbe_emit(g, w + " =w cast " + obj_val)
         return qval(w, TUInt)
+      }
+      if method_name == "is_nan" {
+        let w = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, w + " =w cnes " + obj_val + ", " + obj_val)
+        qbe_emit(g, r + " =l extuw " + w)
+        return qval(r, TBool)
+      }
+      if method_name == "is_inf" {
+        let freg = if qbe_is_temp_reg(obj_val) {
+          obj_val
+        } else {
+          let ft = qbe_tmp(g)
+          qbe_emit(g, ft + " =s copy " + obj_val)
+          ft
+        }
+        let bits = qbe_tmp(g)
+        let mag = qbe_tmp(g)
+        let w = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, bits + " =w cast " + freg)
+        qbe_emit(g, mag + " =w and " + bits + ", 2147483647")
+        qbe_emit(g, w + " =w ceqw " + mag + ", 2139095040")
+        qbe_emit(g, r + " =l extuw " + w)
+        return qval(r, TBool)
+      }
+      if method_name == "is_finite" {
+        let freg = if qbe_is_temp_reg(obj_val) {
+          obj_val
+        } else {
+          let ft = qbe_tmp(g)
+          qbe_emit(g, ft + " =s copy " + obj_val)
+          ft
+        }
+        let bits = qbe_tmp(g)
+        let exp = qbe_tmp(g)
+        let w = qbe_tmp(g)
+        let r = qbe_tmp(g)
+        qbe_emit(g, bits + " =w cast " + freg)
+        qbe_emit(g, exp + " =w and " + bits + ", 2139095040")
+        qbe_emit(g, w + " =w cnew " + exp + ", 2139095040")
+        qbe_emit(g, r + " =l extuw " + w)
+        return qval(r, TBool)
       }
       if method_name == "abs" {
         let w = qbe_tmp(g)
@@ -36343,7 +36807,7 @@ fn qbe_emit_cond_branch_leaf(
   l_false : String,
 ) -> Unit {
   match cond {
-    EBinary(op, lhs, rhs, _) => {
+    EBinary(op, lhs, rhs, bin_sp) => {
       if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
         let can_borrow = !qbe_expr_has_assign(lhs) && !qbe_expr_has_assign(rhs)
         let can_borrow_af = can_borrow &&
@@ -36414,12 +36878,17 @@ fn qbe_emit_cond_branch_leaf(
             None => ()
           }
         }
+        let lhs_exp : Option[Ty] = if (op == "==" || op == "!=") && qbe_lhs_needs_rhs_hint(lhs) {
+          qbe_eq_op_hint(g, bin_sp, rhs)
+        } else {
+          None
+        }
         let la = match lhs {
           EInt(raw, _) => {
             let v32 = qbe_parse_int64_lit(raw).to_int().to_int64().to_string()
             QbeArgVal::{ qv: qval(v32, TInt), borrowed: true }
           }
-          _ => qbe_emit_arg_maybe_borrow_ext(g, lhs, None, can_borrow, can_borrow_af)
+          _ => qbe_emit_arg_maybe_borrow_ext(g, lhs, lhs_exp, can_borrow, can_borrow_af)
         }
         let lv = la.qv
         let ra = match lv.ty {
@@ -36631,8 +37100,13 @@ fn qbe_emit_cond_branch_leaf(
             }
           }
           _ => {
-            if (op == "==" || op == "!=") && qbe_type_needs_eq_fn(g, lv.ty) {
-              let eq_sym = qbe_ensure_eq_fn(g, lv.ty)
+            let cmp_ty = if qbe_ty_has_error(lv.ty) && !qbe_ty_has_error(rv.ty) {
+              rv.ty
+            } else {
+              lv.ty
+            }
+            if (op == "==" || op == "!=") && qbe_type_needs_eq_fn(g, cmp_ty) {
+              let eq_sym = qbe_ensure_eq_fn(g, cmp_ty)
               let eq = qbe_tmp(g)
               qbe_emit(g, eq + " =w call " + eq_sym + "(l " + lv.reg + ", l " + rv.reg + ")")
               if !la.borrowed {
@@ -36960,7 +37434,7 @@ fn qbe_probe_call_ret_ty(
   hints : QbeProbeHints,
 ) -> Option[Ty] {
   let mut rt = finfo.ret_ty
-  if finfo.decl.type_params.length() > 0 {
+  if finfo.decl.type_params.length() > 0 && qbe_ty_has_param(finfo.ret_ty) {
     let psubst : Map[String, Ty] = Map([])
     let mut i = 0
     while i < args.length() && i < finfo.param_tys.length() {
@@ -37513,7 +37987,7 @@ fn qbe_probe_expr_ty_with(
                 mname == "count_ones" ||
                 mname == "compare" {
                 Some(TInt)
-              } else if mname == "is_nan" {
+              } else if mname == "is_nan" || mname == "is_inf" || mname == "is_finite" {
                 Some(TBool)
               } else if mname == "to_int64" || mname == "reinterpret_as_int64" {
                 Some(TInt64)
@@ -39321,8 +39795,13 @@ fn qbe_emit_binary_combine(
       }
     }
     _ => {
-      if (op == "==" || op == "!=") && qbe_type_needs_eq_fn(g, lv.ty) {
-        let eq_sym = qbe_ensure_eq_fn(g, lv.ty)
+      let cmp_ty = if qbe_ty_has_error(lv.ty) && !qbe_ty_has_error(rv.ty) {
+        rv.ty
+      } else {
+        lv.ty
+      }
+      if (op == "==" || op == "!=") && qbe_type_needs_eq_fn(g, cmp_ty) {
+        let eq_sym = qbe_ensure_eq_fn(g, cmp_ty)
         let eq = qbe_tmp(g)
         qbe_emit(g, eq + " =w call " + eq_sym + "(l " + lv.reg + ", l " + rv.reg + ")")
         if !la.borrowed {
@@ -39846,14 +40325,10 @@ fn qbe_emit_binary_chain(
             op != "<=" &&
             op != ">" &&
             op != ">="
-          let lhs_is_dot_variant = match lhs {
-            EDotVariant(_, _, _) => true
-            _ => false
-          }
           let lhs_exp : Option[Ty] = if is_arith_or_bit {
             cur_exp
-          } else if (op == "==" || op == "!=") && lhs_is_dot_variant {
-            qbe_probe_expr_ty(g, rhs)
+          } else if (op == "==" || op == "!=") && qbe_lhs_needs_rhs_hint(lhs) {
+            qbe_eq_op_hint(g, bin_sp, rhs)
           } else {
             None
           }
@@ -41391,6 +41866,115 @@ fn qbe_emit_expr_inner(
               qbe_rc_dec(g, v.reg, v.ty)
             }
             return qval("0", TUnit)
+          }
+          if name == "physical_equal" && args.length() == 2 {
+            let can_borrow = !qbe_args_may_mutate_locals(g, args)
+            let guards = qbe_arg_guards_in_order(g, args)
+            let lhs_exp : Option[Ty] = if qbe_lhs_needs_rhs_hint(args[0]) {
+              qbe_eq_op_hint(g, sp, args[1])
+            } else {
+              None
+            }
+            let la = qbe_emit_arg_maybe_borrow(g, args[0], lhs_exp, can_borrow)
+            qbe_guard_val(g, guards, la, false, guards.exits[0])
+            let ra_exp : Option[Ty] = if qbe_ty_has_error(la.qv.ty) {
+              None
+            } else {
+              match la.qv.ty {
+                TNever => None
+                _ => Some(la.qv.ty)
+              }
+            }
+            let ra = qbe_emit_arg_maybe_borrow(g, args[1], ra_exp, can_borrow)
+            qbe_guard_val(g, guards, ra, false, guards.exits[1])
+            qbe_release_guards(g, guards)
+            let lv = la.qv
+            let rv = ra.qv
+            let raw_ty = if qbe_ty_has_error(lv.ty) && !qbe_ty_has_error(rv.ty) {
+              rv.ty
+            } else {
+              match lv.ty {
+                TError | TNever => rv.ty
+                _ => lv.ty
+              }
+            }
+            let rty = subst_ty(raw_ty, g.cur_type_subst)
+            match rty {
+              TUnit => {
+                if !la.borrowed {
+                  qbe_rc_dec(g, lv.reg, lv.ty)
+                }
+                if !ra.borrowed {
+                  qbe_rc_dec(g, rv.reg, rv.ty)
+                }
+                return qval("1", TBool)
+              }
+              _ => ()
+            }
+            let abi = qbe_abi_ty(rty)
+            let cw = qbe_tmp(g)
+            let r = qbe_tmp(g)
+            if abi == "d" {
+              let ld0 = qbe_coerce_val(g, lv, TDouble)
+              let rd0 = qbe_coerce_val(g, rv, TDouble)
+              let ld = if qbe_is_temp_reg(ld0) {
+                ld0
+              } else {
+                let dt = qbe_tmp(g)
+                qbe_emit(g, dt + " =d copy " + ld0)
+                dt
+              }
+              let rd = if qbe_is_temp_reg(rd0) {
+                rd0
+              } else {
+                let dt = qbe_tmp(g)
+                qbe_emit(g, dt + " =d copy " + rd0)
+                dt
+              }
+              let lb = qbe_tmp(g)
+              let rb = qbe_tmp(g)
+              qbe_emit(g, lb + " =l cast " + ld)
+              qbe_emit(g, rb + " =l cast " + rd)
+              qbe_emit(g, cw + " =w ceql " + lb + ", " + rb)
+            } else if abi == "s" {
+              let lf0 = qbe_coerce_val(g, lv, TFloat)
+              let rf0 = qbe_coerce_val(g, rv, TFloat)
+              let lf = if qbe_is_temp_reg(lf0) {
+                lf0
+              } else {
+                let ft = qbe_tmp(g)
+                qbe_emit(g, ft + " =s copy " + lf0)
+                ft
+              }
+              let rf = if qbe_is_temp_reg(rf0) {
+                rf0
+              } else {
+                let ft = qbe_tmp(g)
+                qbe_emit(g, ft + " =s copy " + rf0)
+                ft
+              }
+              let lb = qbe_tmp(g)
+              let rb = qbe_tmp(g)
+              qbe_emit(g, lb + " =w cast " + lf)
+              qbe_emit(g, rb + " =w cast " + rf)
+              qbe_emit(g, cw + " =w ceqw " + lb + ", " + rb)
+            } else if abi == "w" {
+              let lw = qbe_coerce_val(g, lv, rty)
+              let rw = qbe_coerce_val(g, rv, rty)
+              qbe_emit(g, cw + " =w ceqw " + lw + ", " + rw)
+            } else {
+              let ll = qbe_as_l(g, lv)
+              let rl = qbe_as_l(g, rv)
+              qbe_emit(g, cw + " =w ceql " + ll + ", " + rl)
+            }
+            if !la.borrowed {
+              qbe_rc_dec(g, lv.reg, lv.ty)
+            }
+            if !ra.borrowed {
+              qbe_rc_dec(g, rv.reg, rv.ty)
+            }
+            qbe_emit(g, r + " =l extuw " + cw)
+            return qval(r, TBool)
           }
           if name == "math_sqrt" {
             let xv = qbe_emit_expr(g, args[0], Some(TDouble))
@@ -49970,6 +50554,8 @@ fn qbe_expr_unroll4_safe(g : QbeGen, e : Expr) -> Bool {
         mname == "count_ones" ||
         mname == "lnot" ||
         mname == "is_nan" ||
+        mname == "is_inf" ||
+        mname == "is_finite" ||
         mname == "compare" ||
         mname == "length"
       if !ok_m || !qbe_expr_unroll4_safe(g, recv) {

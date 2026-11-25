@@ -324,6 +324,7 @@ sh "$ROOT_DIR/std/tls/e2e/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/std/tls/e2e/run_server_e2e.sh" "$PIONC2"
 # Wave J3: first-class immutable Send sequence type ImmArray[T].
 sh "$ROOT_DIR/tests/e2e/p94_imm_array/run_e2e.sh" "$PIONC2"
+sh "$ROOT_DIR/tests/e2e/wave_l1b_eq_targets/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p76_value_key_map/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p77_views_and_lib_os/run_e2e.sh" "$PIONC2"
 # P30-H: cross-pkg generic Mutex[Array[Ev]] / Channel[Cmd] deep-freeze under real OS threads (release + ASan + TSan).
