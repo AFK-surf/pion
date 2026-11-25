@@ -178,6 +178,14 @@ priv trait Price {
   cost(Self) -> Int
 }
 
+priv trait Grow {
+  grow(Self) -> Self
+}
+
+priv trait Plus {
+  combine(Self, Self) -> Self
+}
+
 priv struct Item {
   value : Int
 }
@@ -186,8 +194,24 @@ fn Item::cost(self : Item) -> Int {
   self.value + 100
 }
 
+fn Item::grow(self : Item) -> Item {
+  { value: self.value + 100 }
+}
+
+fn Item::combine(self : Item, other : Item) -> Item {
+  { value: self.value + other.value + 100 }
+}
+
 impl Price for Item with cost(self) {
   self.value + 1
+}
+
+impl Grow for Item with grow(self) {
+  { value: self.value + 1 }
+}
+
+impl Plus for Item with combine(self, other) {
+  { value: self.value + other.value }
 }
 
 priv trait Area {
@@ -218,9 +242,13 @@ pub fn case6_dyn_trait_and_split_impl() -> String {
   let it : Item = { value: 2 }
   let p_trait = Price::cost(it)
   let p_inherent = it.cost()
+  let g_trait = Grow::grow(it).value
+  let g_inherent = it.grow().value
+  let pl_trait = Plus::combine(it, it).value
+  let pl_inherent = it.combine(it).value
   let q : Sq = { s: 3 }
   let a_str = show_area(q as &Area)
-  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "|" + a_str
+  c.total.to_string() + "|" + p_trait.to_string() + "," + p_inherent.to_string() + "|" + g_trait.to_string() + "," + g_inherent.to_string() + "|" + pl_trait.to_string() + "," + pl_inherent.to_string() + "|" + a_str
 }
 
 pub fn run_all() -> String {
