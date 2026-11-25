@@ -416,6 +416,190 @@ expandloops(Fn *fn, int *budget)
 	return changed;
 }
 
+typedef struct DivKey DivKey;
+struct DivKey {
+	Ref x;
+	int64_t d;
+	int cls;
+	int used;
+};
+
+static inline Ref
+canon_copy_ref(Ref *cval, int ntmp, Ref r)
+{
+	if (rtype(r) == RTmp && r.val < ntmp)
+		return cval[r.val];
+	return r;
+}
+
+static int
+const_divrem_val(Fn *fn, Ref cr, int k, int64_t *out_d)
+{
+	if (KBASE(k) != 0 || rtype(cr) != RCon || fn->con[cr.val].type != CBits)
+		return 0;
+	int64_t d = KWIDE(k) ? fn->con[cr.val].bits.i
+		: (int64_t)(int32_t)fn->con[cr.val].bits.i;
+	int64_t min_d = KWIDE(k) ? INT64_MIN : (int64_t)INT32_MIN;
+	if (d == min_d || (d > -2 && d < 2))
+		return 0;
+	uint64_t ad = d < 0 ? (uint64_t)(0ULL - (uint64_t)d) : (uint64_t)d;
+	if ((ad & (ad - 1ULL)) == 0)
+		return 0;
+	*out_d = d;
+	return 1;
+}
+
+static uint64_t
+divkey_hash(Ref x, int64_t d, int cls)
+{
+	uint64_t h = ((uint64_t)x.type << 32) ^ (uint64_t)x.val;
+	h ^= (uint64_t)d * 11400714819323198485ULL;
+	h ^= (uint64_t)cls * 2654435761ULL;
+	h ^= h >> 33;
+	return h;
+}
+
+/* Rewrite signed integer `rem x, d` with non-power-of-two constant `d`
+ * (excluding 0, +/-1, INT_MIN) into `q = div x, d; p = mul q, d; r = sub x, p`
+ * ONLY when a matching `div x, d` (same canonical dividend, divisor and class)
+ * exists in the same basic block. Runs after loadopt/coalesce and before GVN so
+ * it stays inside qbe_tv's validation window, shares one magic multiply / div
+ * across all targets, keeps standalone `remw`/`rem` on RV64 (including mutually
+ * exclusive sibling branches), and preserves arm64 `rem +/-2^k == 0 -> tst`. */
+static void
+rewrite_const_rem(Fn *fn)
+{
+	Blk *b;
+	Ins *i, *dst;
+	Ref *cval;
+	DivKey stk_ht[64], *ht;
+	uint bi, n, extra, j, ndiv, nrem, cap, mask;
+	int t, changed = 0;
+
+	/* Linear single-pass RPO Ocopy chain folding. */
+	cval = vnew(fn->ntmp, sizeof *cval, PFn);
+	for (t = 0; t < fn->ntmp; t++)
+		cval[t] = TMP(t);
+	for (bi = 0; bi < fn->nblk; bi++) {
+		b = fn->rpo[bi];
+		for (n = 0; n < b->nins; n++) {
+			i = &b->ins[n];
+			if (i->op == Ocopy && rtype(i->to) == RTmp && i->to.val < fn->ntmp)
+				cval[i->to.val] = canon_copy_ref(cval, fn->ntmp, i->arg[0]);
+		}
+	}
+
+	for (bi = 0; bi < fn->nblk; bi++) {
+		b = fn->rpo[bi];
+		ndiv = 0;
+		nrem = 0;
+		for (n = 0; n < b->nins; n++) {
+			int64_t d;
+			i = &b->ins[n];
+			if ((i->op == Odiv || i->op == Orem)
+			&& const_divrem_val(fn, canon_copy_ref(cval, fn->ntmp, i->arg[1]), i->cls, &d)) {
+				if (i->op == Odiv) {
+					if (rtype(i->to) == RTmp && i->to.val < fn->ntmp && fn->tmp[i->to.val].nuse > 0)
+						ndiv++;
+				} else {
+					nrem++;
+				}
+			}
+		}
+		if (ndiv == 0 || nrem == 0)
+			continue;
+
+		cap = 16;
+		while (cap < ndiv * 2)
+			cap <<= 1;
+		mask = cap - 1;
+		ht = (cap <= 64) ? stk_ht : alloc(cap * sizeof *ht);
+		memset(ht, 0, cap * sizeof *ht);
+
+		for (n = 0; n < b->nins; n++) {
+			int64_t d;
+			i = &b->ins[n];
+			if (i->op != Odiv
+			|| rtype(i->to) != RTmp || i->to.val >= fn->ntmp || fn->tmp[i->to.val].nuse == 0)
+				continue;
+			Ref cr = canon_copy_ref(cval, fn->ntmp, i->arg[1]);
+			if (!const_divrem_val(fn, cr, i->cls, &d))
+				continue;
+			Ref cx = canon_copy_ref(cval, fn->ntmp, i->arg[0]);
+			uint idx = (uint)divkey_hash(cx, d, i->cls) & mask;
+			for (;;) {
+				if (!ht[idx].used) {
+					ht[idx] = (DivKey){.x = cx, .d = d, .cls = i->cls, .used = 1};
+					break;
+				}
+				if (req(ht[idx].x, cx) && ht[idx].d == d && ht[idx].cls == i->cls)
+					break;
+				idx = (idx + 1) & mask;
+			}
+		}
+
+		extra = 0;
+		for (n = 0; n < b->nins; n++) {
+			int64_t d;
+			i = &b->ins[n];
+			if (i->op != Orem)
+				continue;
+			Ref cr = canon_copy_ref(cval, fn->ntmp, i->arg[1]);
+			if (!const_divrem_val(fn, cr, i->cls, &d))
+				continue;
+			Ref cx = canon_copy_ref(cval, fn->ntmp, i->arg[0]);
+			uint idx = (uint)divkey_hash(cx, d, i->cls) & mask;
+			while (ht[idx].used) {
+				if (req(ht[idx].x, cx) && ht[idx].d == d && ht[idx].cls == i->cls) {
+					extra++;
+					break;
+				}
+				idx = (idx + 1) & mask;
+			}
+		}
+		if (extra == 0)
+			continue;
+		dst = vnew(b->nins + extra * 2, sizeof *dst, PFn);
+		j = 0;
+		for (n = 0; n < b->nins; n++) {
+			int64_t d;
+			i = &b->ins[n];
+			if (i->op == Orem) {
+				Ref cr = canon_copy_ref(cval, fn->ntmp, i->arg[1]);
+				if (const_divrem_val(fn, cr, i->cls, &d)) {
+					Ref cx = canon_copy_ref(cval, fn->ntmp, i->arg[0]);
+					uint idx = (uint)divkey_hash(cx, d, i->cls) & mask;
+					int found = 0;
+					while (ht[idx].used) {
+						if (req(ht[idx].x, cx) && ht[idx].d == d && ht[idx].cls == i->cls) {
+							found = 1;
+							break;
+						}
+						idx = (idx + 1) & mask;
+					}
+					if (found) {
+						int k = i->cls;
+						Ref q = newtmp("rem", k, fn);
+						Ref p = newtmp("rem", k, fn);
+						dst[j++] = (Ins){.op = Odiv, .cls = k, .to = q, .arg = {i->arg[0], cr}};
+						dst[j++] = (Ins){.op = Omul, .cls = k, .to = p, .arg = {q, cr}};
+						dst[j++] = (Ins){.op = Osub, .cls = k, .to = i->to, .arg = {i->arg[0], p}};
+						changed = 1;
+						continue;
+					}
+				}
+			}
+			dst[j++] = *i;
+		}
+		b->ins = dst;
+		b->nins = j;
+	}
+	if (changed) {
+		filluse(fn);
+		ssacheck(fn);
+	}
+}
+
 #include "slp.h"
 
 static void
@@ -445,6 +629,7 @@ func(Fn *fn)
 	filluse(fn);
 	filldom(fn);
 	ssacheck(fn);
+	rewrite_const_rem(fn);
 	gvn(fn);
 	fillcfg(fn);
 	simplcfg(fn);

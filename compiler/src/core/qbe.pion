@@ -9103,6 +9103,59 @@ fn qbe_callee_cannot_mutate_arrays(g : QbeGen, fname : String) -> Bool {
 }
 
 ///|
+fn qbe_path_is_enum_variant(g : QbeGen, qual : String, mem : String) -> Bool {
+  let qp = split_qual_name(qual)
+  if qp.prefix.length() > 0 {
+    match qbe_resolve_pkg_in_scope(g, qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.enums.get(qp.name) {
+          Some(ei) => enum_info_has_variant(ei, mem) && !ipkg.tc.structs.contains(qp.name)
+          None => false
+        }
+      None => false
+    }
+  } else if g.mono_pkg != "" {
+    match lookup_imported_pkg_transitive(g.tc, g.mono_pkg) {
+      Some(ipkg) =>
+        match ipkg.tc.enums.get(qual) {
+          Some(ei) => enum_info_has_variant(ei, mem) && !ipkg.tc.structs.contains(qual)
+          None => false
+        }
+      None => false
+    }
+  } else {
+    match g.tc.enums.get(qual) {
+      Some(ei) => enum_info_has_variant(ei, mem) && !g.tc.structs.contains(qual)
+      None => false
+    }
+  }
+}
+
+///|
+fn qbe_method_preserves_arr_hdr(
+  g : QbeGen,
+  recv : Expr,
+  mname : String,
+  hints : QbeProbeHints,
+) -> Bool {
+  if mname != "write_byte" &&
+    mname != "write_char" &&
+    mname != "write_string" &&
+    mname != "write_substring" &&
+    mname != "write_bytes" {
+    return false
+  }
+  match qbe_probe_expr_ty_with(g, recv, hints) {
+    Some(raw_ty) =>
+      match subst_ty(raw_ty, g.cur_type_subst) {
+        TStringBuilder => true
+        _ => false
+      }
+    None => false
+  }
+}
+
+///|
 /// P74-C: Like `qbe_loop_has_no_calls_stmt_with`, but also permits mutating methods
 /// (`push`/`pop`/`clear`/`reserve`) on a provably-unaliased local array `tname != aname`
 /// in `g.unfrozen_local_arrs`, and calls to static pure-scalar-param functions that cannot
@@ -9117,15 +9170,24 @@ fn qbe_no_aliasing_calls_expr(
     return true
   }
   match e {
-    ECall(EIdent(fname, _), args, _) => {
-      let is_pure_ctor = fname == "panic" ||
+    ECall(EIdent(fname, _), args, call_sp) => {
+      match qbe_hints_get(hints, fname) {
+        Some(_) => return false
+        None => ()
+      }
+      match qbe_lookup_local(g, fname) {
+        Some(_) => return false
+        None => ()
+      }
+      let is_pure_ctor = !qbe_has_user_callee_at(g, fname, call_sp) && (
+        fname == "panic" ||
         fname == "Some" ||
         fname == "Ok" ||
         fname == "Err" ||
         (match qbe_lookup_variant_enum(g, fname) {
           Some(_) => true
           None => false
-        })
+        }))
       if is_pure_ctor || qbe_callee_cannot_mutate_arrays(g, fname) {
         let mut i = 0
         while i < args.length() {
@@ -9146,7 +9208,7 @@ fn qbe_no_aliasing_calls_expr(
         (qual == "ImmArray" && (mem == "make" || mem == "new" || mem == "from_array")) ||
         (qual == "StringBuilder" && (mem == "new" || mem == "with_capacity")) ||
         (qual == "Map" && (mem == "new" || mem == "with_capacity")) ||
-        tc_enum_has_variant(g.tc, qual, mem)
+        qbe_path_is_enum_variant(g, qual, mem)
       if is_pure_path {
         let mut i = 0
         while i < args.length() {
@@ -9178,10 +9240,17 @@ fn qbe_no_aliasing_calls_expr(
         EIdent(tname, _) =>
           if tname != aname &&
             g.unfrozen_local_arrs.contains(tname) &&
+            (match qbe_hints_get(hints, tname) {
+              Some(_) => false
+              None => true
+            }) &&
             (mname == "push" || mname == "pop" || mname == "clear" || mname == "truncate" || mname == "reserve") {
             return true
           }
         _ => ()
+      }
+      if qbe_method_preserves_arr_hdr(g, obj, mname, hints) {
+        return true
       }
       match qbe_probe_expr_ty_with(g, obj, hints) {
         Some(raw_ty) =>
@@ -9195,8 +9264,23 @@ fn qbe_no_aliasing_calls_expr(
     }
     EBlock(bs, _) => qbe_no_aliasing_calls_stmts(g, bs, aname, hints)
     EIf(c, ts, eo, _) => {
-      if !qbe_no_aliasing_calls_expr(g, c, aname, hints) ||
-        !qbe_no_aliasing_calls_stmts(g, ts, aname, hints) {
+      if !qbe_no_aliasing_calls_expr(g, c, aname, hints) {
+        return false
+      }
+      let cond_binds : Array[String] = []
+      qbe_collect_cond_is_binds_arr(c, cond_binds)
+      let then_hints = if cond_binds.length() > 0 {
+        let h2 = qbe_hints_copy(hints)
+        let mut bi = 0
+        while bi < cond_binds.length() {
+          qbe_hints_set(h2, cond_binds[bi], TError)
+          bi = bi + 1
+        }
+        h2
+      } else {
+        hints
+      }
+      if !qbe_no_aliasing_calls_stmts(g, ts, aname, then_hints) {
         return false
       }
       match eo {
@@ -9211,7 +9295,19 @@ fn qbe_no_aliasing_calls_expr(
       let scrut_ty_opt = qbe_probe_expr_ty_with(g, s, hints)
       let mut i = 0
       while i < arms.length() {
-        let mut arm_hints = hints
+        let arm_binds : Array[String] = []
+        qbe_collect_pat_binds_arr(arms[i].pat, arm_binds)
+        let arm_hints = if arm_binds.length() > 0 {
+          let h2 = qbe_hints_copy(hints)
+          let mut bi = 0
+          while bi < arm_binds.length() {
+            qbe_hints_set(h2, arm_binds[bi], TError)
+            bi = bi + 1
+          }
+          h2
+        } else {
+          hints
+        }
         match (scrut_ty_opt, arms[i].pat) {
           (Some(raw_st), PVariant(_, vname, subs, _, _)) => {
             let st = subst_ty(raw_st, g.cur_type_subst)
@@ -9229,11 +9325,7 @@ fn qbe_no_aliasing_calls_expr(
                           match subs[pi] {
                             PIdent(pn, _) =>
                               if pn != "_" {
-                                let ns = arm_hints.names.copy()
-                                let ts = arm_hints.tys.copy()
-                                ns.push(pn)
-                                ts.push(subst_ty(ptys[pi], esubst))
-                                arm_hints = QbeProbeHints::{ names: ns, tys: ts }
+                                qbe_hints_set(arm_hints, pn, subst_ty(ptys[pi], esubst))
                               }
                             _ => ()
                           }
@@ -9251,11 +9343,28 @@ fn qbe_no_aliasing_calls_expr(
           }
           _ => ()
         }
-        match arms[i].guard_expr {
-          Some(ge) => if !qbe_no_aliasing_calls_expr(g, ge, aname, arm_hints) { return false }
-          None => ()
+        let body_hints = match arms[i].guard_expr {
+          Some(ge) => {
+            if !qbe_no_aliasing_calls_expr(g, ge, aname, arm_hints) {
+              return false
+            }
+            let gbinds : Array[String] = []
+            qbe_collect_cond_is_binds_arr(ge, gbinds)
+            if gbinds.length() > 0 {
+              let bh = qbe_hints_copy(arm_hints)
+              let mut gbi = 0
+              while gbi < gbinds.length() {
+                qbe_hints_set(bh, gbinds[gbi], TError)
+                gbi = gbi + 1
+              }
+              bh
+            } else {
+              arm_hints
+            }
+          }
+          None => arm_hints
         }
-        if !qbe_no_aliasing_calls_expr(g, arms[i].body, aname, arm_hints) {
+        if !qbe_no_aliasing_calls_expr(g, arms[i].body, aname, body_hints) {
           return false
         }
         i = i + 1
@@ -9269,7 +9378,30 @@ fn qbe_no_aliasing_calls_expr(
     | EField(inner, _, _)
     | EIs(inner, _, _)
     | ETry(inner, _) => qbe_no_aliasing_calls_expr(g, inner, aname, hints)
-    EBinary(_, l, r, _) | EIndex(l, r, _) =>
+    EBinary(op, l, r, _) => {
+      if !qbe_no_aliasing_calls_expr(g, l, aname, hints) {
+        return false
+      }
+      let rhs_hints = if op == "&&" {
+        let binds : Array[String] = []
+        qbe_collect_cond_is_binds_arr(l, binds)
+        if binds.length() > 0 {
+          let rh = qbe_hints_copy(hints)
+          let mut bi = 0
+          while bi < binds.length() {
+            qbe_hints_set(rh, binds[bi], TError)
+            bi = bi + 1
+          }
+          rh
+        } else {
+          hints
+        }
+      } else {
+        hints
+      }
+      qbe_no_aliasing_calls_expr(g, r, aname, rhs_hints)
+    }
+    EIndex(l, r, _) =>
       qbe_no_aliasing_calls_expr(g, l, aname, hints) &&
       qbe_no_aliasing_calls_expr(g, r, aname, hints)
     EArrayLit(elems, _) | ETuple(elems, _) => {
@@ -9316,21 +9448,82 @@ fn qbe_no_aliasing_calls_stmt(
     SAssign(l, r, _) | SCompoundAssign(_, l, r, _) | SDebugAssert(l, r, _) =>
       qbe_no_aliasing_calls_expr(g, l, aname, hints) &&
       qbe_no_aliasing_calls_expr(g, r, aname, hints)
-    SWhile(c, b, _) | SGuard(c, b, _) =>
+    SWhile(c, b, _) => {
+      if !qbe_no_aliasing_calls_expr(g, c, aname, hints) {
+        return false
+      }
+      let wbinds : Array[String] = []
+      qbe_collect_cond_is_binds_arr(c, wbinds)
+      let body_hints = if wbinds.length() > 0 {
+        let h2 = qbe_hints_copy(hints)
+        let mut bi = 0
+        while bi < wbinds.length() {
+          qbe_hints_set(h2, wbinds[bi], TError)
+          bi = bi + 1
+        }
+        h2
+      } else {
+        hints
+      }
+      qbe_no_aliasing_calls_stmts(g, b, aname, body_hints)
+    }
+    SGuard(c, b, _) =>
       qbe_no_aliasing_calls_expr(g, c, aname, hints) &&
       qbe_no_aliasing_calls_stmts(g, b, aname, hints)
-    SFor(is_, c, ss, b, _) =>
-      qbe_no_aliasing_calls_stmt(g, is_, aname, hints) &&
-      qbe_no_aliasing_calls_expr(g, c, aname, hints) &&
-      qbe_no_aliasing_calls_stmt(g, ss, aname, hints) &&
-      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
-    SForRange(_, se, ee, _, b, _) =>
-      qbe_no_aliasing_calls_expr(g, se, aname, hints) &&
-      qbe_no_aliasing_calls_expr(g, ee, aname, hints) &&
-      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
-    SForIn(_, _, ie, b, _) =>
-      qbe_no_aliasing_calls_expr(g, ie, aname, hints) &&
-      qbe_no_aliasing_calls_stmts(g, b, aname, hints)
+    SFor(is_, c, ss, b, _) => {
+      if !qbe_no_aliasing_calls_stmt(g, is_, aname, hints) {
+        return false
+      }
+      let for_hints = match is_ {
+        SLet(vn, _, _, _, _) =>
+          if vn != "" && vn != "_" {
+            let h2 = qbe_hints_copy(hints)
+            qbe_hints_set(h2, vn, TError)
+            h2
+          } else {
+            hints
+          }
+        SLetTuple(vns, _, _, _) => {
+          let h2 = qbe_hints_copy(hints)
+          let mut bi = 0
+          while bi < vns.length() {
+            if vns[bi] != "" && vns[bi] != "_" {
+              qbe_hints_set(h2, vns[bi], TError)
+            }
+            bi = bi + 1
+          }
+          h2
+        }
+        _ => hints
+      }
+      qbe_no_aliasing_calls_expr(g, c, aname, for_hints) &&
+      qbe_no_aliasing_calls_stmt(g, ss, aname, for_hints) &&
+      qbe_no_aliasing_calls_stmts(g, b, aname, for_hints)
+    }
+    SForRange(vname, se, ee, _, b, _) => {
+      if !qbe_no_aliasing_calls_expr(g, se, aname, hints) ||
+        !qbe_no_aliasing_calls_expr(g, ee, aname, hints) {
+        return false
+      }
+      let bh = qbe_hints_copy(hints)
+      if vname != "" && vname != "_" {
+        qbe_hints_set(bh, vname, TInt)
+      }
+      qbe_no_aliasing_calls_stmts(g, b, aname, bh)
+    }
+    SForIn(idx_v, elem_v, ie, b, _) => {
+      if !qbe_no_aliasing_calls_expr(g, ie, aname, hints) {
+        return false
+      }
+      let bh = qbe_hints_copy(hints)
+      if idx_v != "" && idx_v != "_" {
+        qbe_hints_set(bh, idx_v, TInt)
+      }
+      if elem_v != "" && elem_v != "_" {
+        qbe_hints_set(bh, elem_v, TError)
+      }
+      qbe_no_aliasing_calls_stmts(g, b, aname, bh)
+    }
     SReturn(opt, _) =>
       match opt {
         Some(e) => qbe_no_aliasing_calls_expr(g, e, aname, hints)
@@ -9341,17 +9534,91 @@ fn qbe_no_aliasing_calls_stmt(
 }
 
 ///|
+fn qbe_hints_advance_stmt(
+  g : QbeGen,
+  s : Stmt,
+  local_hints : QbeProbeHints,
+) -> Unit {
+  match s {
+    SLet(name, _, te, init, let_sp) =>
+      if name != "_" {
+        let mut bound_ty = TError
+        match te {
+          TyMissing(_) =>
+            match qbe_let_infer(g, let_sp) {
+              Some(t) => bound_ty = t
+              None =>
+                match qbe_probe_expr_ty_with(g, init, local_hints) {
+                  Some(t) =>
+                    if !ty_has_unresolved(t) {
+                      bound_ty = t
+                    }
+                  None => ()
+                }
+            }
+          _ => {
+            let t = qbe_resolve_type(g, te)
+            if !ty_has_unresolved(t) {
+              bound_ty = t
+            }
+          }
+        }
+        qbe_hints_set(local_hints, name, bound_ty)
+      }
+    SLetTuple(names, te, init, _) => {
+      let mut tup_elems : Array[Ty] = []
+      match te {
+        TyMissing(_) =>
+          match qbe_probe_expr_ty_with(g, init, local_hints) {
+            Some(TTuple(es)) => tup_elems = es
+            _ => ()
+          }
+        _ =>
+          match qbe_resolve_type(g, te) {
+            TTuple(es) => tup_elems = es
+            _ => ()
+          }
+      }
+      let mut ni = 0
+      while ni < names.length() {
+        if names[ni] != "_" {
+          let bt = if ni < tup_elems.length() && !ty_has_unresolved(tup_elems[ni]) {
+            tup_elems[ni]
+          } else {
+            TError
+          }
+          qbe_hints_set(local_hints, names[ni], bt)
+        }
+        ni = ni + 1
+      }
+    }
+    SGuard(cond, _, _) => {
+      let gbinds : Array[String] = []
+      qbe_collect_cond_is_binds_arr(cond, gbinds)
+      let mut bi = 0
+      while bi < gbinds.length() {
+        qbe_hints_set(local_hints, gbinds[bi], TError)
+        bi = bi + 1
+      }
+    }
+    _ => ()
+  }
+}
+
+///|
 fn qbe_no_aliasing_calls_stmts(
   g : QbeGen,
   stmts : Array[Stmt],
   aname : String,
   hints : QbeProbeHints,
 ) -> Bool {
+  let local_hints = qbe_hints_copy(hints)
   let mut i = 0
   while i < stmts.length() {
-    if !qbe_no_aliasing_calls_stmt(g, stmts[i], aname, hints) {
+    if !qbe_no_aliasing_calls_stmt(g, stmts[i], aname, local_hints) {
       return false
     }
+    qbe_hints_advance_stmt(g, stmts[i], local_hints)
     i = i + 1
   }
   true
@@ -11049,14 +11316,28 @@ fn qbe_loop_has_no_calls_expr_with(
         } else {
           hints
         }
-        match arms[i].guard_expr {
-          Some(ge) =>
+        let body_hints = match arms[i].guard_expr {
+          Some(ge) => {
             if !qbe_loop_has_no_calls_expr_with(g, ge, arm_hints) {
               return false
             }
-          None => ()
+            let gbinds : Array[String] = []
+            qbe_collect_cond_is_binds_arr(ge, gbinds)
+            if gbinds.length() > 0 {
+              let bh = qbe_hints_copy(arm_hints)
+              let mut gbi = 0
+              while gbi < gbinds.length() {
+                qbe_hints_set(bh, gbinds[gbi], TError)
+                gbi = gbi + 1
+              }
+              bh
+            } else {
+              arm_hints
+            }
+          }
+          None => arm_hints
         }
-        if !qbe_loop_has_no_calls_expr_with(g, arms[i].body, arm_hints) {
+        if !qbe_loop_has_no_calls_expr_with(g, arms[i].body, body_hints) {
           return false
         }
         i = i + 1
@@ -33579,24 +33860,79 @@ fn qbe_emit_method_call_dispatch(
         let ba = qbe_emit_arg_maybe_borrow(g, args[0], Some(TBytes), args_pure)
         let bv = ba.qv
         let blen = qbe_tmp(g)
-        let bdp_p = qbe_tmp(g)
-        let bdp = qbe_tmp(g)
-        let idx_slot = qbe_alloc_slot(g)
-        let l_cond = qbe_lbl(g, "sb_wbs_cond")
-        let l_body = qbe_lbl(g, "sb_wbs_body")
+        let nz = qbe_tmp(g)
+        let l_nonempty = qbe_lbl(g, "sb_wbs_ne")
+        let l_fast = qbe_lbl(g, "sb_wbs_fast")
+        let l_fcond = qbe_lbl(g, "sb_wbs_fcond")
+        let l_fbody = qbe_lbl(g, "sb_wbs_fbody")
+        let l_fdone = qbe_lbl(g, "sb_wbs_fdone")
+        let l_slow = qbe_lbl(g, "sb_wbs_slow")
+        let l_scond = qbe_lbl(g, "sb_wbs_scond")
+        let l_sbody = qbe_lbl(g, "sb_wbs_sbody")
         let l_end = qbe_lbl(g, "sb_wbs_end")
         qbe_emit(g, blen + " =l loadl " + bv.reg)
+        qbe_emit(g, nz + " =w csgtl " + blen + ", 0")
+        qbe_emit_term(g, "jnz " + nz + ", " + l_nonempty + ", " + l_end)
+        qbe_emit_lbl(g, l_nonempty)
+        let bdp_p = qbe_tmp(g)
+        let bdp = qbe_tmp(g)
+        let slen = qbe_tmp(g)
+        let cap_p = qbe_tmp(g)
+        let scap = qbe_tmp(g)
+        let nlen = qbe_tmp(g)
+        let fits = qbe_tmp(g)
+        let idx_slot = qbe_alloc_slot(g)
         qbe_emit(g, bdp_p + " =l add " + bv.reg + ", 16")
         qbe_emit(g, bdp + " =l loadl " + bdp_p)
+        qbe_emit(g, slen + " =l loadl " + obj_val)
+        qbe_emit(g, cap_p + " =l add " + obj_val + ", 8")
+        qbe_emit(g, scap + " =l loadl " + cap_p)
+        qbe_emit(g, nlen + " =l add " + slen + ", " + blen)
+        qbe_emit(g, fits + " =w csltl " + nlen + ", " + scap)
+        qbe_emit_term(g, "jnz " + fits + ", " + l_fast + ", " + l_slow)
+        qbe_emit_lbl(g, l_fast)
+        let sdp_p = qbe_tmp(g)
+        let sdp = qbe_tmp(g)
+        let dst_base = qbe_tmp(g)
+        qbe_emit(g, sdp_p + " =l add " + obj_val + ", 16")
+        qbe_emit(g, sdp + " =l loadl " + sdp_p)
+        qbe_emit(g, dst_base + " =l add " + sdp + ", " + slen)
         qbe_emit(g, "storel 0, " + idx_slot)
-        qbe_emit_term(g, "jmp " + l_cond)
-        qbe_emit_lbl(g, l_cond)
+        qbe_emit_term(g, "jmp " + l_fcond)
+        qbe_emit_lbl(g, l_fcond)
+        let fi = qbe_tmp(g)
+        let fcmp = qbe_tmp(g)
+        qbe_emit(g, fi + " =l loadl " + idx_slot)
+        qbe_emit(g, fcmp + " =w csltl " + fi + ", " + blen)
+        qbe_emit_term(g, "jnz " + fcmp + ", " + l_fbody + ", " + l_fdone)
+        qbe_emit_lbl(g, l_fbody)
+        let fsp = qbe_tmp(g)
+        let fbw = qbe_tmp(g)
+        let fdp = qbe_tmp(g)
+        let fnext = qbe_tmp(g)
+        qbe_emit(g, fsp + " =l add " + bdp + ", " + fi)
+        qbe_emit(g, fbw + " =w loadub " + fsp)
+        qbe_emit(g, fdp + " =l add " + dst_base + ", " + fi)
+        qbe_emit(g, "storeb " + fbw + ", " + fdp)
+        qbe_emit(g, fnext + " =l add " + fi + ", 1")
+        qbe_emit(g, "storel " + fnext + ", " + idx_slot)
+        qbe_emit_term(g, "jmp " + l_fcond)
+        qbe_emit_lbl(g, l_fdone)
+        let zp = qbe_tmp(g)
+        qbe_emit(g, zp + " =l add " + sdp + ", " + nlen)
+        qbe_emit(g, "storeb 0, " + zp)
+        qbe_emit(g, "storel " + nlen + ", " + obj_val)
+        qbe_emit_term(g, "jmp " + l_end)
+        qbe_emit_lbl(g, l_slow)
+        qbe_emit(g, "storel 0, " + idx_slot)
+        qbe_emit_term(g, "jmp " + l_scond)
+        qbe_emit_lbl(g, l_scond)
         let cur_i = qbe_tmp(g)
         let cmp_i = qbe_tmp(g)
         qbe_emit(g, cur_i + " =l loadl " + idx_slot)
         qbe_emit(g, cmp_i + " =w csltl " + cur_i + ", " + blen)
-        qbe_emit_term(g, "jnz " + cmp_i + ", " + l_body + ", " + l_end)
-        qbe_emit_lbl(g, l_body)
+        qbe_emit_term(g, "jnz " + cmp_i + ", " + l_sbody + ", " + l_end)
+        qbe_emit_lbl(g, l_sbody)
         let bp = qbe_tmp(g)
         let bw = qbe_tmp(g)
         let next_i = qbe_tmp(g)
@@ -33605,7 +33941,7 @@ fn qbe_emit_method_call_dispatch(
         qbe_emit_strbuf_push_byte_inline(g, obj_val, bw)
         qbe_emit(g, next_i + " =l add " + cur_i + ", 1")
         qbe_emit(g, "storel " + next_i + ", " + idx_slot)
-        qbe_emit_term(g, "jmp " + l_cond)
+        qbe_emit_term(g, "jmp " + l_scond)
         qbe_emit_lbl(g, l_end)
         if !ba.borrowed {
           qbe_rc_dec(g, bv.reg, bv.ty)
@@ -47837,12 +48173,13 @@ fn qbe_try_emit_borrowed_arr_elem_let(
                   }
                   uj = uj + 1
                 }
-                let init_hints = QbeProbeHints::{ names: [bname], tys: [elem] }
+                let cur_hints = QbeProbeHints::{ names: [bname], tys: [elem] }
                 let mut cj = idx + 1
                 while cj <= last_use {
-                  if !qbe_no_aliasing_calls_stmt(g, stmts[cj], aname, init_hints) {
+                  if !qbe_no_aliasing_calls_stmt(g, stmts[cj], aname, cur_hints) {
                     return false
                   }
+                  qbe_hints_advance_stmt(g, stmts[cj], cur_hints)
                   if cj < last_use {
                     if qbe_stmt_has_other_arr_elem_assign(stmts[cj]) {
                       return false
