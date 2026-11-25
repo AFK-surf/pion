@@ -9,6 +9,7 @@ struct E {
 	int fp;
 	uint64_t fsz;
 	int nclob;
+	int grouped_cvt;
 };
 
 #define CMP(X) \
@@ -110,8 +111,8 @@ static struct {
 	{ Osqrt,    Kd, "sqrtsd %0, %=" },
 	{ Ostosi,   Ki, "cvttss2si%k %0, %=" },
 	{ Odtosi,   Ki, "cvttsd2si%k %0, %=" },
-	{ Oswtof,   Ka, "cvtsi2%k %W0, %=" },
-	{ Osltof,   Ka, "cvtsi2%k %L0, %=" },
+	{ Oswtof,   Ka, "cvtsi2%kl %W0, %=" },
+	{ Osltof,   Ka, "cvtsi2%kq %L0, %=" },
 	{ Ocast,    Ki, "movq %D0, %L=" },
 	{ Ocast,    Ka, "movq %L0, %D=" },
 
@@ -462,6 +463,13 @@ emitins(Ins i, E *e)
 		/* just do nothing for nops, they are inserted
 		 * by some passes */
 		break;
+	case Oswtof:
+	case Osltof:
+		/* Scalar SSE conversion merges the unused upper lanes
+		 * (grouped_cvt is never set by amd64_winabi_emitfn). */
+		if (e->grouped_cvt)
+			emitf("xorps %=, %=", &i, e);
+		goto Table;
 	case Omul:
 		/* here, we try to use the 3-addresss form
 		 * of multiplication when possible */
@@ -489,7 +497,7 @@ emitins(Ins i, E *e)
 		goto Table;
 	case Oneg:
 		if (!req(i.to, i.arg[0]))
-			emitf("mov%k %0, %=", &i, e);
+			emitcopy(i.to, i.arg[0], i.cls, e);
 		if (KBASE(i.cls) == 0)
 			emitf("neg%k %=", &i, e);
 		else
@@ -506,8 +514,8 @@ emitins(Ins i, E *e)
 		 * conversion to 2-address in emitf() would fail */
 		if (req(i.to, i.arg[1])) {
 			i.arg[1] = TMP(XMM0+15);
-			emitf("mov%k %=, %1", &i, e);
-			emitf("mov%k %0, %=", &i, e);
+			emitcopy(i.arg[1], i.to, i.cls, e);
+			emitcopy(i.to, i.arg[0], i.cls, e);
 			i.arg[0] = i.to;
 		}
 		goto Table;
@@ -520,6 +528,13 @@ emitins(Ins i, E *e)
 			break;
 		if (req(i.to, i.arg[0]))
 			break;
+		/* A register copy only has a live scalar low lane. Not on
+		 * Windows: xmm6..xmm15 are callee-saved there (all 128 bits)
+		 * and amd64_win does not save them, so keep the low-lane move. */
+		if (!T.windows && KBASE(i.cls) && isreg(i.to) && isreg(i.arg[0])) {
+			emitf("movaps %0, %=", &i, e);
+			break;
+		}
 		t0 = rtype(i.arg[0]);
 		if (i.cls == Kl
 		&& t0 == RCon
@@ -772,6 +787,7 @@ amd64_sysv_emitfn(Fn *fn, FILE *f)
 				fprintf(f, ".p2align 4\n");
 			fprintf(f, "%sbb%d:\n", T.asloc, id0+b->id);
 		}
+		e->grouped_cvt = amd64_grouped_cvt(b);
 		for (i=b->ins; i!=&b->ins[b->nins]; i++)
 			emitins(*i, e);
 		lbl = 1;
@@ -915,6 +931,8 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 	for (lbl=0, b=fn->start; b; b=b->link) {
 		if (lbl || b->npred > 1)
 			fprintf(f, "%sbb%d:\n", T.asloc, id0+b->id);
+		/* e->grouped_cvt stays 0: no xorps on Windows, where the
+		 * upper lanes of xmm6..xmm15 are callee-saved. */
 		for (i=b->ins; i!=&b->ins[b->nins]; i++)
 			emitins(*i, e);
 		lbl = 1;

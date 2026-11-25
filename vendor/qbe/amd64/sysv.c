@@ -319,7 +319,10 @@ selcall(Fn *fn, Ins *i0, Ins *i1, RAlloc **rap)
 	} else
 		ca = argsclass(i0, i1, ac, Oarg, 0, &env);
 
-	for (stk=0, a=&ac[i1-i0]; a>ac;)
+	stk = 0;
+	/* ac is NULL for a call without arguments: no NULL + 0. */
+	if (i1 > i0)
+	for (a=&ac[i1-i0]; a>ac;)
 		if ((--a)->inmem) {
 			if (a->align > 4)
 				err("sysv abi requires alignments of 16 or less");

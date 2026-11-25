@@ -630,6 +630,7 @@ typedef struct {
 	JtblFixup *jtfixups;
 	size_t njtfixups;
 	size_t cap_jtfixups;
+	int grouped_cvt;
 } EF;
 
 static void
@@ -1508,6 +1509,8 @@ emitins(Ins i, EF *e)
 		assert(isreg(i.to));
 		uint8_t pfx = (i.cls == Kd) ? 0xf2 : 0xf3;
 		int w = (i.op == Osltof) ? 1 : 0;
+		if (e->grouped_cvt)
+			emit_modrm(0, 0, 0, 0x0f, 0x57, hw_reg(i.to.val), rm_reg(hw_reg(i.to.val)), 0, 0);
 		emit_modrm(pfx, w, 0, 0x0f, 0x2a, hw_reg(i.to.val), s, 0, 0);
 		break;
 	}
@@ -1577,7 +1580,10 @@ emitins(Ins i, EF *e)
 				if (isreg(i.arg[0]))
 					assert(is_xmm(i.arg[0].val));
 				RmOp s = ref_to_rm(i.arg[0], 0, e);
-				emit_modrm(pfx, 0, 0, 0x0f, 0x10, hw_reg(i.to.val), s, 0, 0);
+				if (isreg(i.arg[0]))
+					emit_modrm(0, 0, 0, 0x0f, 0x28, hw_reg(i.to.val), s, 0, 0);
+				else
+					emit_modrm(pfx, 0, 0, 0x0f, 0x10, hw_reg(i.to.val), s, 0, 0);
 			} else {
 				RmOp d = ref_to_rm(i.to, 0, e);
 				assert(isreg(i.arg[0]));
@@ -2147,6 +2153,7 @@ amd64_elf_fn(Fn *fn)
 		}
 		l->start = blk_off[b->id] = text_pos();
 
+		e.grouped_cvt = amd64_grouped_cvt(b);
 		/* dead[n]: arithmetic flags dead just before b->ins[n]. */
 		uint8_t *dead = emalloc(b->nins + 1);
 		dead[b->nins] = b->jmp.type == Jret0 || b->jmp.type == Jhlt;
