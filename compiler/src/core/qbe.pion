@@ -38061,6 +38061,101 @@ fn qbe_concat_part(
   qbe_emit_arg_maybe_borrow_ext(g, part, Some(TString), borrow, borrow_fields)
 }
 
+///| Flatten one side of a string `+` chain (left and right nesting) for
+/// `qbe_bounded_format`. Stops early (false) at more than 8 parts or at a
+/// part that is neither a literal nor a `.to_string()` call; string
+/// concatenation is associative, so the flattened order is source order.
+fn qbe_bounded_format_parts(e : Expr, parts : Array[Expr]) -> Bool {
+  match e {
+    EBinary("+", l, r, _) =>
+      qbe_bounded_format_parts(l, parts) && qbe_bounded_format_parts(r, parts)
+    EString(_, _) | EMethodCall(_, "to_string", _, _) =>
+      if parts.length() >= 8 {
+        false
+      } else {
+        parts.push(e)
+        true
+      }
+    _ => false
+  }
+}
+
+///| Format a bounded chain directly into one buffer. Only literals and
+/// reads of integer locals qualify, so evaluation cannot call back into
+/// user code or observe the buffer before the final string is copied.
+fn qbe_bounded_format(g : QbeGen, parts : Array[Expr]) -> Option[QbeVal] {
+  if parts.length() > 8 { return None }
+  let mut cap = 1
+  let mut integers = 0
+  for part in parts {
+    match part {
+      EString(s, _) =>
+        match qbe_short_ascii_bytes(s) {
+          Some(bytes) => cap = cap + bytes.length()
+          None => return None
+        }
+      EMethodCall(EIdent(name, _), "to_string", args, sp) => {
+        if args.length() != 0 || qbe_has_expected_trait(g, sp) { return None }
+        match qbe_lookup_local(g, name) {
+          Some(loc) =>
+            match loc.ty {
+              TInt | TInt64 => {
+                integers = integers + 1
+                cap = cap + 20
+              }
+              _ => return None
+            }
+          None => return None
+        }
+      }
+      _ => return None
+    }
+  }
+  if integers == 0 { return None }
+  let sb = qbe_tmp(g)
+  let data = qbe_tmp(g)
+  let cp = qbe_tmp(g)
+  let dp = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + sb + " =l alloc8 24\n")
+  g.fn_allocs.write_string("    " + data + " =l alloc8 " + cap.to_string() + "\n")
+  qbe_emit(g, cp + " =l add " + sb + ", 8")
+  qbe_emit(g, dp + " =l add " + sb + ", 16")
+  qbe_emit(g, "storel 0, " + sb)
+  qbe_emit(g, "storel " + cap.to_string() + ", " + cp)
+  qbe_emit(g, "storel " + data + ", " + dp)
+  for part in parts {
+    match part {
+      EString(s, _) => {
+        let len = qbe_tmp(g)
+        let pos = qbe_tmp(g)
+        qbe_emit(g, len + " =l loadl " + sb)
+        qbe_emit(g, pos + " =l add " + data + ", " + len)
+        let mut i = 0
+        while i < s.length() {
+          let addr = qbe_tmp(g)
+          qbe_emit(g, addr + " =l add " + pos + ", " + i.to_string())
+          qbe_emit(g, "storeb " + s.code_unit_at(i).to_string() + ", " + addr)
+          i = i + 1
+        }
+        let next = qbe_tmp(g)
+        qbe_emit(g, next + " =l add " + len + ", " + s.length().to_string())
+        qbe_emit(g, "storel " + next + ", " + sb)
+      }
+      EMethodCall(inner, _, _, _) => {
+        let iv = qbe_emit_expr(g, inner, None)
+        let value = qbe_as_l(g, iv)
+        qbe_emit(g, "call $pion_strbuf_push_int(l " + sb + ", l " + value + ")")
+      }
+      _ => ()
+    }
+  }
+  let len = qbe_tmp(g)
+  let result = qbe_tmp(g)
+  qbe_emit(g, len + " =l loadl " + sb)
+  qbe_emit(g, result + " =l call $pion_str_from_cstr(l " + data + ", l " + len + ")")
+  Some(qval(result, TString))
+}
+
 ///|
 fn qbe_emit_expr(
   g : QbeGen,
@@ -39111,6 +39206,15 @@ fn qbe_emit_expr_inner(
         match lhs {
           EBinary("+", _, _, _) => is_add_chain = true
           _ => ()
+        }
+        if g.hot_loop_depth > 0 && !g.target_wasm {
+          let parts : Array[Expr] = []
+          if qbe_bounded_format_parts(lhs, parts) && qbe_bounded_format_parts(rhs, parts) {
+            match qbe_bounded_format(g, parts) {
+              Some(v) => return v
+              None => ()
+            }
+          }
         }
         if is_add_chain {
           let parts : Array[Expr] = []

@@ -637,6 +637,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p109_concat_scratch/run_e2e.sh" "$PION
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p110_fnval_flat_and_is_shadow/run_e2e.sh" "$PIONC"
 # P111: AArch64 seladdr local-slot [x29, #off] folding and single-use ldur/stur [base, #-1..-256] (text asm, matrix, native / qemu, Mach-O --obj == .s byte parity).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIONC"
+# P112: native bounded integer string format in hot loops + QBE gcm groupconverts (SSA + Native + Wasm32 + ASan, -d G order, 8 x 625 C reference).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
