@@ -4203,9 +4203,117 @@ fn eq_trait_ob_add(tc : TypeChecker, fn_key : String, ob : TraitObligation) -> B
 }
 
 ///|
+fn tc_map_key_depends_on_tparam(tc : TypeChecker, k : Ty, seen : Map[String, Bool]) -> Bool {
+  match k {
+    TParam(_) => true
+    TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      tc_map_key_depends_on_tparam(tc, e, seen)
+    TResult(a, b) | TMap(a, b) =>
+      tc_map_key_depends_on_tparam(tc, a, seen) || tc_map_key_depends_on_tparam(tc, b, seen)
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        if tc_map_key_depends_on_tparam(tc, es[i], seen) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, ret) => {
+      let mut i = 0
+      while i < ps.length() {
+        if tc_map_key_depends_on_tparam(tc, ps[i], seen) {
+          return true
+        }
+        i = i + 1
+      }
+      tc_map_key_depends_on_tparam(tc, ret, seen)
+    }
+    TStruct(name, args) => {
+      let mask_sb = StringBuilder()
+      let abs_args : Array[Ty] = []
+      let mut mi = 0
+      while mi < args.length() {
+        if tc_map_key_depends_on_tparam(tc, args[mi], seen) {
+          mask_sb.write_string("1")
+          abs_args.push(TParam("__p"))
+        } else {
+          mask_sb.write_string("0")
+          abs_args.push(TInt)
+        }
+        mi = mi + 1
+      }
+      let dk = "S:" + name + "|" + mask_sb.to_string()
+      if seen.contains(dk) {
+        return false
+      }
+      seen.set(dk, true)
+      match tc_lookup_struct_info(tc, name) {
+        Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, abs_args)
+          let mut fi = 0
+          while fi < sinfo.field_tys.length() {
+            if tc_map_key_depends_on_tparam(tc, subst_ty(sinfo.field_tys[fi], subst), seen) {
+              return true
+            }
+            fi = fi + 1
+          }
+          false
+        }
+        None => false
+      }
+    }
+    TEnum(name, args) => {
+      let mask_sb = StringBuilder()
+      let abs_args : Array[Ty] = []
+      let mut mi = 0
+      while mi < args.length() {
+        if tc_map_key_depends_on_tparam(tc, args[mi], seen) {
+          mask_sb.write_string("1")
+          abs_args.push(TParam("__p"))
+        } else {
+          mask_sb.write_string("0")
+          abs_args.push(TInt)
+        }
+        mi = mi + 1
+      }
+      let dk = "E:" + name + "|" + mask_sb.to_string()
+      if seen.contains(dk) {
+        return false
+      }
+      seen.set(dk, true)
+      match tc_lookup_enum_info_qualified(tc, name) {
+        Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, abs_args)
+          let mut vi = 0
+          while vi < einfo.variants.length() {
+            let v = einfo.variants[vi]
+            let mut fi = 0
+            while fi < v.field_tys.length() {
+              if tc_map_key_depends_on_tparam(tc, subst_ty(v.field_tys[fi], subst), seen) {
+                return true
+              }
+              fi = fi + 1
+            }
+            vi = vi + 1
+          }
+          false
+        }
+        None => false
+      }
+    }
+    _ => false
+  }
+}
+
+///|
 fn tc_ty_mentions_param_map_rec(tc : TypeChecker, t : Ty, seen_defs : Map[String, Bool]) -> Bool {
   match t {
-    TMap(k, v) => ty_has_tparam(k) || tc_ty_mentions_param_map_rec(tc, k, seen_defs) || tc_ty_mentions_param_map_rec(tc, v, seen_defs)
+    TMap(k, v) =>
+      tc_map_key_depends_on_tparam(tc, k, Map([])) ||
+      tc_ty_mentions_param_map_rec(tc, k, seen_defs) ||
+      tc_ty_mentions_param_map_rec(tc, v, seen_defs)
     TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
       tc_ty_mentions_param_map_rec(tc, e, seen_defs)
     TResult(a, b) =>
@@ -4727,6 +4835,7 @@ fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
   while vi < total_v {
     let c = comp[vi]
     if c >= 0 && scc_exp[c] {
+      tc.expansive_defs.set(node_def_key[vi], true)
       node_exp.push(true)
       exp_q.push(vi)
     } else {
@@ -4734,9 +4843,11 @@ fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
     }
     vi = vi + 1
   }
-  // Propagate expansiveness forward along parameter-flow edges in O(V + E):
-  // if param T grows unboundedly and flows into param K (e.g. `E[Array[T], T]`),
-  // K also receives unboundedly growing types.
+  // Propagate expansiveness forward along parameter-flow edges in O(V + E),
+  // but ONLY record `expansive_params` for defs already in `tc.expansive_defs`
+  // (i.e. defs owning a vertex in a 1-weight SCC). Acyclic/finite downstream
+  // defs (e.g. `G[A, B]` referenced by an unused expansive `N[U]`) are never
+  // polluted into `tc.expansive_defs`.
   let mut qh = 0
   while qh < exp_q.length() {
     let u = exp_q[qh]
@@ -4753,8 +4864,7 @@ fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
   }
   vi = 0
   while vi < total_v {
-    if node_exp[vi] {
-      tc.expansive_defs.set(node_def_key[vi], true)
+    if node_exp[vi] && tc.expansive_defs.contains(node_def_key[vi]) {
       tc.expansive_params.set(node_def_key[vi] + "#" + node_param_idx[vi].to_string(), true)
     }
     vi = vi + 1
