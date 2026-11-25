@@ -6,17 +6,23 @@
 # and `while i < N { a.push(lit); ...; i = i + 1 }` with a literal
 # 0 <= N <= 2147483647, later bounds checks on an array whose length stays
 # stable compare the index against the immediate N instead of the header length.
-# Verifies, for --release and dev builds of 15 programs (gen.py):
+# Verifies, for --release and dev builds of 18 programs (gen.py):
 #   1. Structure (check.py): single- and multi-array fills use the immediate in
 #      every bounds check of `probe` (37, and 0 for the empty fill); an alias
 #      that grows, a push, a pop, a capturing closure that pushes, a `mut`
 #      argument and a plain call argument keep the header length (no check
 #      against 37); a shadowing inner `let a = [...]` keeps its own length
-#      (exactly one check against 37: the outer read).
+#      (exactly one check against 37: the outer read), also when the shadowing
+#      `let` is inside a `while` body that first reads the outer array (exactly
+#      one check against 3; the inner array keeps its own header). Fallback and
+#      shadow cases must check at least one loaded header length; no check
+#      may use any other constant.
 #   2. Execution: exit status, stdout and stderr equal gen.py's plain-array
 #      reference exactly: alias / push / closure / `mut` growth read the new
 #      element 19 at index 37, pop traps at index 36 with len 36, the short
 #      shadow traps with len 2 and the long shadow reads past 37, and
+#      a loop that reads the outer array and then shadows it sees the inner
+#      length 2 (`a.length()`, `a[j]`, and a trap with len 2), and
 #      out-of-range reads and writes (-1, 37, 100, and 0 after an empty fill)
 #      abort with SIGABRT (134) naming the original index and the true length.
 set -eu
@@ -32,13 +38,13 @@ mkdir -p "$PION_CACHE_DIR"
 
 python3 -E "$DIR/gen.py" "$TMP_DIR"
 N_CASE=0
-while read -r NAME CODE IMM MIN MAX ALL; do
+while read -r NAME CODE IMM MIN MAX ALL DYN; do
   for MODE in release dev; do
     FLAG=""
     [ "$MODE" = "release" ] && FLAG="--release"
     BASE="$TMP_DIR/${NAME}_$MODE"
     "$PIONC" build $FLAG --emit-ssa "$BASE.ssa" -o "$BASE" "$TMP_DIR/$NAME.pion"
-    check "$NAME $MODE" "$BASE.ssa" "$IMM" "$MIN" "$MAX" "$ALL"
+    check "$NAME $MODE" "$BASE.ssa" "$IMM" "$MIN" "$MAX" "$ALL" "$DYN"
     set +e
     # Compare the program's own streams only: the shell's "Aborted" /
     # "Abort trap" notice for a signalled child stays out of $BASE.err.
@@ -64,6 +70,6 @@ while read -r NAME CODE IMM MIN MAX ALL; do
   done
   N_CASE=$((N_CASE + 1))
 done < "$TMP_DIR/cases.txt"
-[ "$N_CASE" -eq 15 ]
+[ "$N_CASE" -eq 18 ]
 
 echo "PASS: p124_counted_array_length"
