@@ -730,6 +730,7 @@ struct SigCbState {
   cb_param_fwds : Array[String]
   mut fdep_idx : Int
   mut fcallp_idx : Int
+  mut fret_idx : Int
 }
 
 ///|
@@ -739,6 +740,7 @@ struct SigDepCtx {
   extra_fdeps : Array[String]
   mut cb_counter : Int
   cb_prefix : String
+  root_cb_prefix : String
   cur_fn_key : String
   mut cond_depth : Int
   param_idx : Map[String, Int]
@@ -770,6 +772,10 @@ struct SigDepCtx {
   cb_param_fwds : Array[String]
   escaped_cbs : Array[String]
   slot_mut_links : Array[String]
+  slot_mut_links_seen : Map[String, Bool]
+  cslot_hub_lens : Array[Int]
+  cslot_hub_seen : Map[Int, Bool]
+  cslot_dirty_prefix_max : Array[Int]
   field_writes : Map[String, Array[String]]
   field_write_order : Array[String]
   field_puts : Map[String, Array[String]]
@@ -795,6 +801,7 @@ fn sig_dep_ctx_new(
     extra_fdeps: [],
     cb_counter: 0,
     cb_prefix: cb_prefix,
+    root_cb_prefix: cb_prefix,
     cur_fn_key: cur_fn_key,
     cond_depth: 0,
     param_idx: param_idx,
@@ -826,6 +833,10 @@ fn sig_dep_ctx_new(
     cb_param_fwds: [],
     escaped_cbs: [],
     slot_mut_links: [],
+    slot_mut_links_seen: Map([]),
+    cslot_hub_lens: [],
+    cslot_hub_seen: Map([]),
+    cslot_dirty_prefix_max: [0],
     field_writes: Map([]),
     field_write_order: [],
     field_puts: Map([]),
@@ -851,6 +862,7 @@ fn sig_dep_ctx_child_for_cb(
     extra_fdeps: parent.extra_fdeps,
     cb_counter: 0,
     cb_prefix: st.cb_key + "_",
+    root_cb_prefix: parent.root_cb_prefix,
     cur_fn_key: st.cb_key,
     cond_depth: 0,
     param_idx: param_idx,
@@ -882,6 +894,10 @@ fn sig_dep_ctx_child_for_cb(
     cb_param_fwds: st.cb_param_fwds,
     escaped_cbs: [],
     slot_mut_links: parent.slot_mut_links,
+    slot_mut_links_seen: parent.slot_mut_links_seen,
+    cslot_hub_lens: parent.cslot_hub_lens,
+    cslot_hub_seen: parent.cslot_hub_seen,
+    cslot_dirty_prefix_max: parent.cslot_dirty_prefix_max,
     field_writes: parent.field_writes,
     field_write_order: parent.field_write_order,
     field_puts: parent.field_puts,
@@ -1012,6 +1028,82 @@ fn sig_cslot_for_site(ctx : SigDepCtx, site_key : String) -> String {
       ctx.cslot_by_site.set(site_key, ck)
       ck
     }
+  }
+}
+
+///|
+fn sig_add_slot_mut_link(ctx : SigDepCtx, link : String) -> Unit {
+  if !ctx.slot_mut_links_seen.contains(link) {
+    ctx.slot_mut_links_seen.set(link, true)
+    ctx.slot_mut_links.push(link)
+  }
+}
+
+///|
+fn sig_mark_all_cslots_dirty(ctx : SigDepCtx) -> Unit {
+  let n = ctx.cslot_order.length()
+  if n > ctx.cslot_dirty_prefix_max[0] {
+    ctx.cslot_dirty_prefix_max[0] = n
+  }
+}
+
+///|
+fn sig_cslot_hub_key(ctx : SigDepCtx, n : Int) -> String {
+  "$cslot_hub_" + ctx.root_cb_prefix + n.to_string()
+}
+
+///|
+fn sig_ensure_cslot_hub(ctx : SigDepCtx) -> String {
+  let n = ctx.cslot_order.length()
+  if n == 0 {
+    return ""
+  }
+  if !ctx.cslot_hub_seen.contains(n) {
+    ctx.cslot_hub_seen.set(n, true)
+    ctx.cslot_hub_lens.push(n)
+  }
+  sig_cslot_hub_key(ctx, n)
+}
+
+///|
+fn sig_link_all_cslots_mut(
+  ctx : SigDepCtx,
+  target : String,
+  slot_key : String,
+  dirty_all : Bool,
+) -> Unit {
+  if dirty_all {
+    sig_mark_all_cslots_dirty(ctx)
+  }
+  let hkey = sig_ensure_cslot_hub(ctx)
+  if hkey != "" {
+    sig_add_slot_mut_link(ctx, hkey + "|" + target + "|" + slot_key)
+  }
+}
+
+///|
+fn sig_cslot_hub_add_targets(ctx : SigDepCtx, ts : Array[String]) -> Unit {
+  if ts.length() == 0 {
+    return
+  }
+  let hkey = sig_ensure_cslot_hub(ctx)
+  if hkey != "" {
+    sig_cslot_add_targets(ctx, hkey, ts)
+  }
+}
+
+///|
+fn sig_sort_ints(arr : Array[Int]) -> Unit {
+  let mut i = 1
+  while i < arr.length() {
+    let v = arr[i]
+    let mut j = i
+    while j > 0 && arr[j - 1] > v {
+      arr[j] = arr[j - 1]
+      j = j - 1
+    }
+    arr[j] = v
+    i = i + 1
   }
 }
 
@@ -2196,13 +2288,8 @@ fn sig_assign_container_elem(
     ci = ci + 1
   }
   if entry.cslot_unknown {
-    let mut ui = 0
-    while ui < ctx.cslot_order.length() {
-      let ck = ctx.cslot_order[ui]
-      ctx.cslot_dirty.set(ck, true)
-      sig_cslot_add_targets(ctx, ck, rt)
-      ui = ui + 1
-    }
+    sig_mark_all_cslots_dirty(ctx)
+    sig_cslot_hub_add_targets(ctx, rt)
   }
 }
 
@@ -2244,9 +2331,20 @@ fn sig_emit_mut_slot_fdeps(sb : StringBuilder, ctx : SigDepCtx) -> Unit {
     }
     si = si + 1
   }
+  let hub_lens : Array[Int] = []
+  let mut hli = 0
+  while hli < ctx.cslot_hub_lens.length() {
+    hub_lens.push(ctx.cslot_hub_lens[hli])
+    hli = hli + 1
+  }
+  sig_sort_ints(hub_lens)
+  let mut hi = 0
   let mut ci = 0
   while ci < ctx.cslot_order.length() {
     let ck = ctx.cslot_order[ci]
+    while hi < hub_lens.length() && hub_lens[hi] <= ci {
+      hi = hi + 1
+    }
     let tlist = match ctx.cslot_targets.get(ck) {
       Some(a) => a
       None => []
@@ -2257,8 +2355,11 @@ fn sig_emit_mut_slot_fdeps(sb : StringBuilder, ctx : SigDepCtx) -> Unit {
       scalls.push(tlist[ti] + "@0")
       ti = ti + 1
     }
+    if hi < hub_lens.length() {
+      scalls.push(sig_cslot_hub_key(ctx, hub_lens[hi]) + "@0")
+    }
     sb.write_string(sig_format_dep_line("#fdep ", ck, [], scalls))
-    let dirty = sig_cslot_is_dirty(ctx, ck)
+    let dirty = ci < ctx.cslot_dirty_prefix_max[0] || sig_cslot_is_dirty(ctx, ck)
     let all_fkeys : Array[String] = []
     match ctx.cslot_fields.get(ck) {
       Some(fm) => sig_union_str_array(all_fkeys, fm.keys())
@@ -2295,6 +2396,26 @@ fn sig_emit_mut_slot_fdeps(sb : StringBuilder, ctx : SigDepCtx) -> Unit {
       fi = fi + 1
     }
     ci = ci + 1
+  }
+  let mut hr = 0
+  while hr < hub_lens.length() {
+    let hkey = sig_cslot_hub_key(ctx, hub_lens[hr])
+    let hcalls : Array[String] = []
+    match ctx.cslot_targets.get(hkey) {
+      Some(ht) => {
+        let mut hti = 0
+        while hti < ht.length() {
+          hcalls.push(ht[hti] + "@0")
+          hti = hti + 1
+        }
+      }
+      None => ()
+    }
+    if hr + 1 < hub_lens.length() {
+      hcalls.push(sig_cslot_hub_key(ctx, hub_lens[hr + 1]) + "@0")
+    }
+    sb.write_string(sig_format_dep_line("#fdep ", hkey, [], hcalls))
+    hr = hr + 1
   }
   let mut li = 0
   while li < ctx.slot_mut_links.length() {
@@ -3294,6 +3415,7 @@ fn sig_materialize_closure(
             cb_param_fwds: [],
             fdep_idx: -1,
             fcallp_idx: -1,
+            fret_idx: -1,
           }
           ctx.cb_states.set(existing_key, fresh)
           ctx.cb_order.push(existing_key)
@@ -3327,6 +3449,7 @@ fn sig_materialize_closure(
         cb_param_fwds: [],
         fdep_idx: -1,
         fcallp_idx: -1,
+        fret_idx: -1,
       }
       ctx.cb_by_site.set(csite, cb_key)
       ctx.cb_states.set(cb_key, fresh)
@@ -3462,7 +3585,13 @@ fn sig_materialize_closure(
       rti = rti + 1
     }
     r_sb.write_string("\n")
-    ctx.extra_fdeps.push(r_sb.to_string())
+    let fret_line = r_sb.to_string()
+    if st.fret_idx < 0 {
+      st.fret_idx = ctx.extra_fdeps.length()
+      ctx.extra_fdeps.push(fret_line)
+    } else {
+      ctx.extra_fdeps[st.fret_idx] = fret_line
+    }
   }
   st.cb_key
 }
@@ -3987,28 +4116,15 @@ fn sig_format_call_desc(
                   }
                 }
                 if is_mut_arg && entry.slot_key != "" {
-                  sig_union_str_array(
-                    ctx.slot_mut_links,
-                    [entry.slot_key + "|" + target + "|" + slot_key],
-                  )
+                  sig_add_slot_mut_link(ctx, entry.slot_key + "|" + target + "|" + slot_key)
                 }
                 let mut ci2 = 0
                 while ci2 < entry.cslots.length() {
-                  sig_union_str_array(
-                    ctx.slot_mut_links,
-                    [entry.cslots[ci2] + "|" + target + "|" + slot_key],
-                  )
+                  sig_add_slot_mut_link(ctx, entry.cslots[ci2] + "|" + target + "|" + slot_key)
                   ci2 = ci2 + 1
                 }
                 if entry.cslot_unknown {
-                  let mut ui = 0
-                  while ui < ctx.cslot_order.length() {
-                    sig_union_str_array(
-                      ctx.slot_mut_links,
-                      [ctx.cslot_order[ui] + "|" + target + "|" + slot_key],
-                    )
-                    ui = ui + 1
-                  }
+                  sig_link_all_cslots_mut(ctx, target, slot_key, false)
                 }
               }
               None => ()
@@ -4032,28 +4148,15 @@ fn sig_format_call_desc(
                     sig_record_param_srcs_fwd(ctx, psrcs, target, slot_key)
                   }
                   if is_mut_arg && entry.slot_key != "" {
-                    sig_union_str_array(
-                      ctx.slot_mut_links,
-                      [entry.slot_key + "|" + target + "|" + slot_key],
-                    )
+                    sig_add_slot_mut_link(ctx, entry.slot_key + "|" + target + "|" + slot_key)
                   }
                   let mut ci2 = 0
                   while ci2 < entry.cslots.length() {
-                    sig_union_str_array(
-                      ctx.slot_mut_links,
-                      [entry.cslots[ci2] + "|" + target + "|" + slot_key],
-                    )
+                    sig_add_slot_mut_link(ctx, entry.cslots[ci2] + "|" + target + "|" + slot_key)
                     ci2 = ci2 + 1
                   }
                   if entry.cslot_unknown {
-                    let mut ui = 0
-                    while ui < ctx.cslot_order.length() {
-                      sig_union_str_array(
-                        ctx.slot_mut_links,
-                        [ctx.cslot_order[ui] + "|" + target + "|" + slot_key],
-                      )
-                      ui = ui + 1
-                    }
+                    sig_link_all_cslots_mut(ctx, target, slot_key, false)
                   }
                 }
                 None => ()
@@ -4067,22 +4170,11 @@ fn sig_format_call_desc(
             let mut ci2 = 0
             while ci2 < aev.cslots.length() {
               ctx.cslot_dirty.set(aev.cslots[ci2], true)
-              sig_union_str_array(
-                ctx.slot_mut_links,
-                [aev.cslots[ci2] + "|" + target + "|" + slot_key],
-              )
+              sig_add_slot_mut_link(ctx, aev.cslots[ci2] + "|" + target + "|" + slot_key)
               ci2 = ci2 + 1
             }
             if aev.cslot_unknown {
-              let mut ui = 0
-              while ui < ctx.cslot_order.length() {
-                ctx.cslot_dirty.set(ctx.cslot_order[ui], true)
-                sig_union_str_array(
-                  ctx.slot_mut_links,
-                  [ctx.cslot_order[ui] + "|" + target + "|" + slot_key],
-                )
-                ui = ui + 1
-              }
+              sig_link_all_cslots_mut(ctx, target, slot_key, true)
             }
           }
         }
@@ -4820,11 +4912,7 @@ fn sig_collect_expr_deps(
                     ci2 = ci2 + 1
                   }
                   if entry.cslot_unknown {
-                    let mut ui = 0
-                    while ui < ctx.cslot_order.length() {
-                      ctx.cslot_dirty.set(ctx.cslot_order[ui], true)
-                      ui = ui + 1
-                    }
+                    sig_mark_all_cslots_dirty(ctx)
                   }
                   let mut ai = 0
                   while ai < args.length() {
@@ -4838,11 +4926,7 @@ fn sig_collect_expr_deps(
                       ci2 = ci2 + 1
                     }
                     if entry.cslot_unknown {
-                      let mut ui = 0
-                      while ui < ctx.cslot_order.length() {
-                        sig_cslot_add_targets(ctx, ctx.cslot_order[ui], at)
-                        ui = ui + 1
-                      }
+                      sig_cslot_hub_add_targets(ctx, at)
                     }
                     if entry.slot_key != "" {
                       match ctx.mut_slot_targets.get(entry.slot_key) {
@@ -4875,11 +4959,11 @@ fn sig_collect_expr_deps(
                   }
                 }
                 if entry.slot_key != "" {
-                  sig_union_str_array(ctx.slot_mut_links, [entry.slot_key + "|" + target + "|0"])
+                  sig_add_slot_mut_link(ctx, entry.slot_key + "|" + target + "|0")
                 }
                 let mut ci2 = 0
                 while ci2 < entry.cslots.length() {
-                  sig_union_str_array(ctx.slot_mut_links, [entry.cslots[ci2] + "|" + target + "|0"])
+                  sig_add_slot_mut_link(ctx, entry.cslots[ci2] + "|" + target + "|0")
                   ci2 = ci2 + 1
                 }
               }
@@ -5183,7 +5267,19 @@ fn sig_outer_cslots_fp(
   bound : Map[String, Int],
   ctx : SigDepCtx,
 ) -> Int {
-  let mut fp = ctx.cslot_order.length() * 8
+  let mut fp = ctx.cslot_order.length() * 8 +
+    ctx.cslot_dirty_prefix_max[0] * 3 +
+    ctx.cslot_hub_lens.length() * 5 +
+    ctx.slot_mut_links.length() * 2
+  let mut hi_fp = 0
+  while hi_fp < ctx.cslot_hub_lens.length() {
+    let hkey = sig_cslot_hub_key(ctx, ctx.cslot_hub_lens[hi_fp])
+    match ctx.cslot_targets.get(hkey) {
+      Some(ts) => fp = fp + ts.length() * 2
+      None => ()
+    }
+    hi_fp = hi_fp + 1
+  }
   let mut i = 0
   while i < outer_keys.length() {
     match sig_local_callable_get_entry(bound, ctx, outer_keys[i]) {
@@ -5298,6 +5394,15 @@ fn sig_fallback_dirty_outer_cslots(
   let all_cslot_targets : Array[String] = []
   let all_cslot_refs : Array[String] = []
   sig_union_str_array(all_cslot_targets, all_mut_targets)
+  let mut hi_fb = 0
+  while hi_fb < ctx.cslot_hub_lens.length() {
+    let hkey = sig_cslot_hub_key(ctx, ctx.cslot_hub_lens[hi_fb])
+    match ctx.cslot_targets.get(hkey) {
+      Some(ts) => sig_union_str_array(all_cslot_targets, ts)
+      None => ()
+    }
+    hi_fb = hi_fb + 1
+  }
   let mut ci2 = 0
   while ci2 < ctx.cslot_order.length() {
     let ck = ctx.cslot_order[ci2]
@@ -8933,6 +9038,17 @@ fn sig_repeat_ret_prefix(d : Int, target : String) -> String {
 }
 
 ///|
+fn sig_count_ret_prefix(s : String) -> Int {
+  let mut d = 0
+  let mut cur = s
+  while starts_with_str(cur, "$ret:") {
+    d = d + 1
+    cur = slice_str(cur, 5, cur.length())
+  }
+  d
+}
+
+///|
 fn sig_fwd_slot_only(slot_and_args : String) -> String {
   let at = sig_find_char(slot_and_args, 64, 0)
   if at >= 0 { slice_str(slot_and_args, 0, at) } else { slot_and_args }
@@ -10856,6 +10972,15 @@ pub fn compute_const_init_plan_from_sigs(file_sigs : Array[String]) -> ConstInit
   }
   let active_fdef_idxs : Map[Int, Bool] = Map([])
   let seen_slot_calls : Map[String, Bool] = Map([])
+  let mut max_ret_depth = 8
+  let mut rdi0 = 0
+  while rdi0 < fn_keys.length() {
+    let rd = sig_count_ret_prefix(fn_keys[rdi0])
+    if rd + 2 > max_ret_depth {
+      max_ret_depth = rd + 2
+    }
+    rdi0 = rdi0 + 1
+  }
   let mut outer_mw_changed = true
   while outer_mw_changed {
     outer_mw_changed = false
@@ -11595,7 +11720,11 @@ pub fn compute_const_init_plan_from_sigs(file_sigs : Array[String]) -> ConstInit
         let inner = slice_str(rk, 5, rk.length())
         match fn_aliases.get(inner) {
           Some(at) => {
-            let nxt = "$ret:" + at
+            let nxt = if sig_count_ret_prefix(at) + 1 <= max_ret_depth {
+              "$ret:" + at
+            } else {
+              at
+            }
             if !fn_key_idx.contains(nxt) {
               let idx = fn_keys.length()
               fn_key_idx.set(nxt, idx)
@@ -11631,23 +11760,47 @@ pub fn compute_const_init_plan_from_sigs(file_sigs : Array[String]) -> ConstInit
               while ici < icalls.length() {
                 let tt = sig_parse_call_desc(icalls[ici]).target
                 if tt != "" && tt != "?" && tt != "$fp" {
-                  let nxt = "$ret:" + tt
-                  if !fn_key_idx.contains(nxt) {
-                    let idx = fn_keys.length()
-                    fn_key_idx.set(nxt, idx)
-                    fn_keys.push(nxt)
-                    fn_idents.push([])
-                    fn_calls.push([])
-                    fn_pnames.push([])
-                    fn_called_params.push(Map([]))
-                    fn_fwd_edges.push([])
-                    n_fns = fn_keys.length()
-                  }
-                  let before = fn_calls[rxi].length()
-                  sig_union_str_array(fn_calls[rxi], [nxt])
-                  if fn_calls[rxi].length() > before {
-                    fn_unknown_callp.set(rk, true)
-                    outer_mw_changed = true
+                  if sig_count_ret_prefix(tt) + 1 <= max_ret_depth {
+                    let nxt = "$ret:" + tt
+                    if !fn_key_idx.contains(nxt) {
+                      let idx = fn_keys.length()
+                      fn_key_idx.set(nxt, idx)
+                      fn_keys.push(nxt)
+                      fn_idents.push([])
+                      fn_calls.push([])
+                      fn_pnames.push([])
+                      fn_called_params.push(Map([]))
+                      fn_fwd_edges.push([])
+                      n_fns = fn_keys.length()
+                    }
+                    let before = fn_calls[rxi].length()
+                    sig_union_str_array(fn_calls[rxi], [nxt])
+                    if fn_calls[rxi].length() > before {
+                      fn_unknown_callp.set(rk, true)
+                      outer_mw_changed = true
+                    }
+                  } else {
+                    // Recursive `$ret:` cycle hit depth bound: fold soundly onto all
+                    // transitive return targets of `tt` without growing `$ret:^N` keys.
+                    let tr_idxs : Array[Int] = []
+                    sig_collect_transitive_ret_targets(
+                      tt,
+                      fn_key_idx,
+                      fn_calls,
+                      fn_aliases,
+                      tr_idxs,
+                    )
+                    let before = fn_calls[rxi].length()
+                    sig_union_str_array(fn_calls[rxi], [tt])
+                    let mut tri = 0
+                    while tri < tr_idxs.length() {
+                      sig_union_str_array(fn_calls[rxi], [fn_keys[tr_idxs[tri]]])
+                      tri = tri + 1
+                    }
+                    if fn_calls[rxi].length() > before {
+                      fn_unknown_callp.set(rk, true)
+                      outer_mw_changed = true
+                    }
                   }
                 }
                 ici = ici + 1
