@@ -661,6 +661,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh" "$PIONC"
+# P121: Opt-Track T byte-identical cold frontend (#fmutlink dedup rows, checked ConstInitPlan reuse, call-free #cdep row replay, carried loop fingerprints; fan-out mut slots, const-init fast/fallback/cycle/type-error plans, 5 loop kinds with multi-pass fixed points + 64-pass fallback, QBE >64-copy parallel move, cold SSA + binary parity).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
