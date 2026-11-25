@@ -12,12 +12,14 @@
 #             interval agree.
 # Verifies:
 #   1. gen_il.py jtbl.ssa (30 selector definitions x {dead, live on the
-#      successors}, plus two with 16 other live values; duplicate entries,
+#      successors}, two with 16 other live values and one whose compare register
+#      first holds another zero-extended value; duplicate entries,
 #      default, dirty high halves such as 0xdeadbeef00000002): the dispatch
 #      form and entry count of every table in amd64_sysv text and ELF `--obj`
 #      (identical registers, normalization and self-copies) and in amd64_win
 #      text (check_dispatch.py; the checker rejects dropped / added / misplaced
-#      normalizations, a wrong entry count and a live selector in %r10).
+#      normalizations, a wrong entry count, a live selector in %r10 and broken
+#      ELF table, branch or compare bytes).
 #      bounds.ssa: 432 comparisons, `-d G` folds exactly the constant ones and
 #      returns or branches on every kept one (relation, operand and limit
 #      checked by check_gvn.py; tampered dumps are rejected; four targets). A C
@@ -52,7 +54,7 @@ fail() {
 
 F="$TMP_DIR/fix"
 python3 -E "$DIR/gen_il.py" "$F"
-[ "$(wc -l < "$F/jtbl_expect.txt" | tr -d ' ')" -eq 62 ] || fail "jtbl_expect.txt length"
+[ "$(wc -l < "$F/jtbl_expect.txt" | tr -d ' ')" -eq 63 ] || fail "jtbl_expect.txt length"
 [ "$(wc -l < "$F/bounds_expect.txt" | tr -d ' ')" -eq 432 ] || fail "bounds_expect.txt length"
 
 HOST_S="$(uname -s)"
@@ -126,17 +128,37 @@ rejects self-copy-asm "d_add_0 is bad" "$DIR/check_dispatch.py" "$F/jtbl_expect.
 # Instruction boundaries: an immediate ending like `movl %r10d, %r10d` is no
 # self-copy (d_addmagic_0 above; its bytes must be there), and a self-copy after
 # an immediate that looks like a REX prefix is one.
-python3 -E - "$TMP_DIR/jt.o" <<'PYEOF'
-import sys
+python3 -E - "$TMP_DIR/jt.o" "$TMP_DIR/jt.s" <<'PYEOF'
+import re, sys
 if open(sys.argv[1], 'rb').read().count(bytes.fromhex('004589d24183fa08')) != 1:
     raise SystemExit('FAIL: p118 d_addmagic_0: immediate bytes not found before the compare')
+# ext_1: the zero-extension of the stored value precedes the selector's `addl`.
+s = open(sys.argv[2]).read()
+s = s[s.index('\next_1:\n'):s.index('/* end function ext_1 */')]
+if not re.search(r'\tmovl %eax, %eax\n\tmovq %rax, \(%\w+\)\n\taddl \$4294967293, %eax\n\tcmpl \$8, %eax\n', s):
+    raise SystemExit('FAIL: p118 ext_1: expected instructions not found:\n' + s)
+if len(re.findall(rb'\x89\xc0[\x48\x49]\x89.{1,3}\x83\xc0\xfd\x83\xf8\x08', open(sys.argv[1], 'rb').read(), re.S)) != 1:
+    raise SystemExit('FAIL: p118 ext_1: expected bytes not found')
 PYEOF
 python3 -E "$DIR/mk_selfcopy.py" "$TMP_DIR"
+if [ "$HT" = amd64_sysv ]; then
+  for x in selfcopy wide; do
+    "$CC_BIN" -c "$TMP_DIR/$x.s" -o "$TMP_DIR/$x.as.o"
+    [ -z "$(nm -u "$TMP_DIR/$x.as.o")" ] || fail "$x.s has undefined symbols"
+  done
+fi
+grep -qx 'ext_1 live 8' "$F/jtbl_expect.txt" || fail "ext_1 expectation"
 grep -qx 'd_addmagic_0 direct 8' "$F/jtbl_expect.txt" || fail "d_addmagic_0 expectation"
 python3 -E "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/selfcopy_ok.o"
 rejects elf-self-copy-both "selfcopy: text " "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/selfcopy_bad.o"
 rejects elf-self-copy-obj "selfcopy is bad" "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" obj "$TMP_DIR/selfcopy_bad.o"
-echo "p118 dispatch checker rejects 10 mutations"
+rejects elf-self-copy-gap "selfcopy is bad" "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" obj "$TMP_DIR/selfcopy_gap.o"
+rejects table-entry "jump target 0x41 is no instruction" "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/bad_entry.o"
+rejects jae "jump target 0x41 is no instruction" "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/bad_jae.o"
+rejects lea "lea addresses 0x21, the table is at 0x20" "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/bad_lea.o"
+python3 -E "$DIR/check_dispatch.py" "$TMP_DIR/wide_expect.txt" both "$TMP_DIR/wide.s" "$TMP_DIR/wide_ok.o"
+rejects imm8 "compares against 4294967168 entries" "$DIR/check_dispatch.py" "$TMP_DIR/wide_expect.txt" both "$TMP_DIR/wide.s" "$TMP_DIR/wide_bad.o"
+echo "p118 dispatch checker rejects 15 mutations"
 
 # 1b. GVN folds exactly the constant comparisons.
 for T in amd64_sysv amd64_win arm64 arm64_apple; do
@@ -169,10 +191,10 @@ elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
   fail "needs UBSan for the C driver (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
 fi
 echo "p118 C driver sanitizers: ${DRV_SAN:-<none>}"
-# (2048 + 5 * 12 * 4 * 2) inputs x 62 tables; 18 * 5 inputs x 432 comparisons.
-EXPECT_RUN="jtbl 156736
+# (2048 + 5 * 12 * 4 * 2) inputs x 63 tables; 18 * 5 inputs x 432 comparisons.
+EXPECT_RUN="jtbl 159264
 bounds 38880
-total 195616 bad 0"
+total 198144 bad 0"
 host_run() { # $1 label, then objects / assembly files
   label=$1
   shift
@@ -186,7 +208,7 @@ host_run() { # $1 label, then objects / assembly files
     diff -u "$TMP_DIR/check.want" "$TMP_DIR/check_$label.out" >&2 || true
     fail "host $label: unexpected driver output"
   fi
-  echo "p118 host $label: 195616 checks, bad 0"
+  echo "p118 host $label: 198144 checks, bad 0"
 }
 # 2. p114 loop tables next to sinktablehomes.
 mkdir -p "$TMP_DIR/cfg"

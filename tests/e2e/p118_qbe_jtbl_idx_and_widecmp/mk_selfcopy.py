@@ -1,40 +1,53 @@
 """usage: python3 -E mk_selfcopy.py OUT_DIR
 
-Writes selfcopy.s (text: `addl $64, %eax; cmpl $8, %eax`, then the dispatch),
-selfcopy_ok.o (the same instructions) and selfcopy_bad.o (with `movl %eax, %eax`
-before the compare, after an immediate that looks like a REX prefix) as minimal
-ELF64 objects, plus selfcopy_expect.txt.
+Writes selfcopy.s (text: `addl $64, %eax; cmpl $8, %eax`, then the dispatch)
+and minimal ELF64 objects:
+  selfcopy_ok.o    the same instructions;
+  selfcopy_bad.o   `movl %eax, %eax` before the compare, after an immediate that
+                   looks like a REX prefix;
+  selfcopy_gap.o   the same with a store of %rax between it and the compare;
+  bad_entry.o / bad_jae.o / bad_lea.o   selfcopy_ok.o with the first table entry,
+                   the `jae` or the `lea` displacement one too large;
+plus selfcopy_expect.txt. wide.s / wide_ok.o / wide_expect.txt are the same
+dispatch with 128 entries, wide_bad.o compares with `83 f8 80` ($-128).
 """
 import struct
 import sys
 from pathlib import Path
 
 NAME = 'selfcopy'
-TEXT = f'''.text
+
+
+def text(n):
+    table = '\t.long .Lbb1 - .Ljt0\n' * n
+    return f'''.text
 {NAME}:
 \taddl $64, %eax
-\tcmpl $8, %eax
+\tcmpl ${n}, %eax
 \tjae .Lbb1
 \tleaq .Ljt0(%rip), %r11
 \tmovslq (%r11,%rax,4), %r10
 \taddq %r10, %r11
 \tjmpq *%r11
-.Lbb1:
+\t.balign 4
+.Ljt0:
+{table}.Lbb1:
 \tret
 /* end function {NAME} */
 '''
 
 
-def code(selfcopy):
-    c = b'\x83\xc0\x40' + (b'\x89\xc0' if selfcopy else b'') + b'\x83\xf8\x08'
+def code(before=b'', n=8, compare=b'\x83\xf8\x08', jae_off=0, lea_off=0, entry_off=0):
+    c = b'\x83\xc0\x40' + before + compare
     jae, lea = len(c) + 6, len(c) + 13
     end = lea + 10  # movslq, addq, jmpq
     table = (end + 3) & ~3
-    ret = table + 32
-    c += b'\x0f\x83' + struct.pack('<i', ret - jae)
-    c += b'\x4c\x8d\x1d' + struct.pack('<i', table - lea)
+    ret = table + 4 * n
+    c += b'\x0f\x83' + struct.pack('<i', ret - jae + jae_off)
+    c += b'\x4c\x8d\x1d' + struct.pack('<i', table - lea + lea_off)
     c += b'\x4d\x63\x14\x83\x4d\x01\xd3\x41\xff\xe3'
-    return c.ljust(table, b'\0') + struct.pack('<i', ret - table) * 8 + b'\xc3'
+    rel = ret - table
+    return c.ljust(table, b'\0') + struct.pack(f'<{n}i', rel + entry_off, *[rel] * (n - 1)) + b'\xc3'
 
 
 def elf(text):
@@ -55,7 +68,19 @@ def elf(text):
 
 
 out = Path(sys.argv[1])
-(out / 'selfcopy.s').write_text(TEXT)
-(out / 'selfcopy_ok.o').write_bytes(elf(code(False)))
-(out / 'selfcopy_bad.o').write_bytes(elf(code(True)))
+COPY = b'\x89\xc0'
+WIDE = b'\x3d' + struct.pack('<I', 128)
+(out / 'selfcopy.s').write_text(text(8))
+(out / 'wide.s').write_text(text(128))
 (out / 'selfcopy_expect.txt').write_text(f'{NAME} live 8\n')
+(out / 'wide_expect.txt').write_text(f'{NAME} live 128\n')
+for name, body in (
+        ('selfcopy_ok', code()),
+        ('selfcopy_bad', code(COPY)),
+        ('selfcopy_gap', code(COPY + b'\x48\x89\x06')),  # movq %rax, (%rsi)
+        ('bad_entry', code(entry_off=1)),
+        ('bad_jae', code(jae_off=1)),
+        ('bad_lea', code(lea_off=1)),
+        ('wide_ok', code(n=128, compare=WIDE)),
+        ('wide_bad', code(n=128, compare=b'\x83\xf8\x80'))):
+    (out / f'{name}.o').write_bytes(elf(body))

@@ -109,6 +109,17 @@ def press_fun(live):
     return s + ['}']
 
 
+def ext_fun():
+    """The call result is zero-extended in place (`movl %eax, %eax`) for the
+    store; only the later `addl` defines the selector, so nothing is redundant."""
+    s = ['export function l $ext_1(l %w, l %p, w %arg) {', '@entry',
+         '%v =l call $p118_wide(l %w)', '%z =l extuw %v', 'storel %z, %p', '%x =w copy %z',
+         '%i =w add %x, 4294967293', f'jtbl %i, {TABLE}']
+    for label, val in ARMS:
+        s += ['@' + label, f'%z{label} =l extuw %i', f'%s{label} =l add %z{label}, {val}', f'ret %s{label}']
+    return s + ['}']
+
+
 # ---- widecmp ----
 
 I64MIN, I64MAX = -2**63, 2**63 - 1
@@ -218,6 +229,7 @@ def check_c(rows):
         c.append(f'extern uint64_t press_{live}(uint64_t, void *, uint32_t);')
     for name, il, _, _ in rows:
         c.append(f'extern uint32_t {name}(uint64_t);')
+    c.append('extern uint64_t ext_1(uint64_t, uint64_t *, uint32_t);')
     c.append('static void jtbl_one(uint64_t w, uint32_t y) {')
     c.append('  uint32_t x = (uint32_t)w;')
     # { x, dirty } then the values of press_*: loadl of the pair has dirty high bits.
@@ -235,6 +247,9 @@ def check_c(rows):
         c.append(f'  {{ uint32_t k = x + y; uint64_t e = k < 8 ? target[k] : 41, g = {name}(w, mem, y);'
                  f' for (unsigned n = 0; n < {NPRESS}; n++) e = (e * 33) ^ mem[n + 1];'
                  + (' if (k < 8 && target[k] == 9) e += k;' if live else '') + f' count++; if (g != e) fail("{name}", w, y, g, e); }}')
+    c.append('  { uint32_t k = x - 3u; uint64_t e = (k < 8 ? target[k] : 41) + (uint64_t)k, cell = ~UINT64_C(0),'
+             ' g = ext_1(w, &cell, y); count++;'
+             ' if (g != e) fail("ext_1", w, y, g, e); if (cell != x) fail("ext_1 store", w, y, cell, x); }')
     c.append('}')
     chunks = [rows[n:n + 64] for n in range(0, len(rows), 64)]
     for n, chunk in enumerate(chunks):
@@ -292,8 +307,8 @@ def main():
         for live in (0, 1):
             ssa += jtbl_fun(kind, setup, live, cls)
             expect.append(f'd_{kind}_{live} ' + (('live' if proven else 'livenorm') if live else ('direct' if proven else 'norm')) + f' {NTBL}')
-    ssa += press_fun(0) + press_fun(1)
-    expect += [f'press_0 direct {NTBL}', f'press_1 slot {NTBL}']
+    ssa += press_fun(0) + press_fun(1) + ext_fun()
+    expect += [f'press_0 direct {NTBL}', f'press_1 slot {NTBL}', f'ext_1 live {NTBL}']
     rows = bounds()
     (out / 'jtbl.ssa').write_text('\n'.join(ssa) + '\n')
     (out / 'jtbl_expect.txt').write_text('\n'.join(expect) + '\n')

@@ -4,13 +4,16 @@ usage: python3 -E check_dispatch.py EXPECT asm FILE.s
        python3 -E check_dispatch.py EXPECT obj FILE.o   (ELF64 x86-64)
        python3 -E check_dispatch.py EXPECT both FILE.s FILE.o
 EXPECT holds `name form entries` lines (forms: gen_il.py); every listed
-function has exactly one table, compared against exactly `entries`. A selector
-copied onto itself before the compare (a misplaced normalization) is rejected
-for `direct` / `live` and must agree between the encoders.
+function has exactly one table, compared against exactly `entries`. A
+misplaced normalization, i.e. `movl %reg, %reg` as the definition of the compare
+register that reaches the compare in its block, is rejected for `direct` / `live`
+and must agree between the encoders.
 
 Objects are decoded instruction by instruction from the function entry (the
-inline table is skipped); with an objdump that knows x86-64 its instruction
-addresses and self-copy verdict must be the same (P118_OBJDUMP=1 requires one,
+inline table is skipped, the `lea` must address it, and every branch and table
+target must be an instruction); with an objdump that knows x86-64 its instruction
+addresses, compare immediate, reaching definition and self-copy verdict must be
+the same (P118_OBJDUMP=1 requires one,
 for hosts whose toolchain has it). `both` additionally requires the two encoders
 to agree on (entries, compare register, normalization, index register, home
 load, self-copy).
@@ -37,6 +40,50 @@ ASM = re.compile(
     r'\tmovslq \(%r11,%(?P<idx>\w+),4\), %r10\n\taddq %r10, %r11\n\tjmpq \*%r11\n')
 
 
+R16 = ['ax', 'cx', 'dx', 'bx', 'sp', 'bp', 'si', 'di'] + [f'r{n}w' for n in range(8, 16)]
+R8 = ['al', 'cl', 'dl', 'bl', 'spl', 'bpl', 'sil', 'dil'] + [f'r{n}b' for n in range(8, 16)]
+REG = {name: n for names in (R64, R32, R16, R8) for n, name in enumerate(names)}
+REG.update(ah=0, ch=1, dh=2, bh=3)
+CALLER = {0, 1, 2, 6, 7, 8, 9, 10, 11}
+
+
+def att_writes(line):
+    """General registers (any width) an AT&T instruction may write."""
+    line = line.split('#')[0].strip()
+    m = re.match(r'(?:(?:lock|rep\w*|data16)\s+)*([a-z]\w*)\s*(.*)$', line)
+    if m is None:
+        return set()  # directive or blank
+    op, args = m[1], re.split(r',(?![^()]*\))', m[2])
+    args = [a.strip() for a in args if a.strip()]
+    regs = [REG.get(a[1:]) if a.startswith('%') else None for a in args]
+    if re.match(r'call', op):
+        return set(CALLER)
+    if re.match(r'(cmp[bwlq]?$|test|push|j|ret|nop|ucomis|comis|bt[wlq]?$|ud2|hlt|int3|leave)', op):
+        return {4, 5} if op.startswith('leave') else set()
+    if re.match(r'(cqto|cltd|cqo|cdq)', op):
+        return {2}
+    if re.match(r'(cltq|cwtl|cdqe|cwde)', op):
+        return {0}
+    if op == 'syscall':
+        return {0, 1, 11}
+    if op == 'cpuid':
+        return {0, 1, 2, 3}
+    if re.match(r'(movs|stos)[bwlq]?$', op) and any('%es:' in a for a in args):
+        return {1, 6, 7}
+    if re.match(r'i?(mul|div)[bwlq]?$', op) and len(args) == 1:
+        return {0, 2}
+    if re.match(r'xchg', op) and args == ['%ax', '%ax']:
+        return set()  # two-byte nop
+    if re.match(r'(xchg|xadd)', op):
+        return {g for g in regs if g is not None}
+    extra = {0} if re.match(r'cmpxchg', op) else set()
+    return extra | ({regs[-1]} if regs and regs[-1] is not None else set())
+
+
+def att_selfcopy(line, reg):
+    return re.match(rf'\s*movl?\s+%{R32[reg]},\s*%{R32[reg]}\s*(?:#.*)?$', line) is not None
+
+
 def parse_asm(path, names):
     text = open(path).read()
     res = {}
@@ -52,9 +99,11 @@ def parse_asm(path, names):
             die(f'{path}: {name}: unexpected registers {h.groupdict()}')
         if h['src'] is not None and h['src'] != h['cmp']:
             die(f'{path}: {name}: normalizes {h["src"]}, compares {h["cmp"]}')
-        # Everything of the dispatch block before the compare.
-        block = re.split(r'^(?:\S+:|\t(?:j|ret).*)\n', m.group(1)[:h.start()], flags=re.M)[-1]
-        selfcopy = re.search(rf'^\tmovl %{h["cmp"]}, %{h["cmp"]}$', block, re.M) is not None
+        # The dispatch block up to the compare.
+        block = re.split(r'^(?:\S+:|\t(?:j|ret).*)\n', m.group(1)[:h.start('n')], flags=re.M)[-1].split('\n')[:-1]
+        reg = R32.index(h['cmp'])
+        last = next((ln for ln in reversed(block) if reg in att_writes(ln)), None)
+        selfcopy = last is not None and att_selfcopy(last, reg)
         res[name] = (int(h['n']), R32.index(h['cmp']), h['src'] is not None, R64.index(h['idx']), h['slot'] is not None,
                      selfcopy)
     return res
@@ -63,7 +112,7 @@ def parse_asm(path, names):
 OBJ = re.compile(
     rb'(?P<slot>\x44\x8b(?:[\x54].|[\x55].|[\x94]\x24....|[\x95]....|\x54\x24.|\x14\x24))?'
     rb'(?P<crex>\x41)?(?:\x83(?P<cmod>[\xf8-\xff])(?P<n>.)|\x81(?P<cmodw>[\xf8-\xff])(?P<nw>....)|\x3d(?P<nax>....))'
-    rb'\x0f\x83....\x4c\x8d\x1d....'
+    rb'\x0f\x83....\x4c\x8d\x1d(?P<ldisp>....)'
     rb'(?P<norm>(?P<nrex>[\x41\x45])\x89(?P<nmod>.))?'
     rb'(?P<irex>[\x4d\x4f])\x63\x14(?P<sib>.)\x4d\x01\xd3\x41\xff\xe3', re.S)
 
@@ -138,22 +187,24 @@ def insn(c, p):
 
 
 def decode(path, name, code, value):
-    """(instruction starts -> decoded, block starts, dispatch matches)"""
-    ins, leaders, hits, p, skip = {}, {0}, {}, 0, None
+    """(instruction starts -> decoded, block starts, dispatch matches)
+
+    Every branch and table target must be an instruction of the function."""
+    ins, leaders, targets, hits, p, skip = {}, {0}, set(), {}, 0, None
     while p < len(code):
         h = OBJ.match(code, p)
         if h is not None and h.end() not in hits:
             hits[h.end()] = h
-            skip = (h.end(), entries(h))
+            skip = (h.end(), entries(h), h)
         end, opcode, modrm, rex = ins[p] = insn(code, p)
         if end > len(code):
             die(f'{path}: {name}: instruction at {p:#x} runs past the function')
         short = opcode[0] in range(0x70, 0x80) or opcode[0] == 0xeb
         near = opcode[0] in (0xe9,) or opcode[0] == 0x0f and opcode[1] in range(0x80, 0x90)
         if short:
-            leaders.add(end + struct.unpack_from('<b', code, end - 1)[0])
+            targets.add(end + struct.unpack_from('<b', code, end - 1)[0])
         elif near:
-            leaders.add(end + struct.unpack_from('<i', code, end - 4)[0])
+            targets.add(end + struct.unpack_from('<i', code, end - 4)[0])
         if short or near or opcode == (0xc3,):
             leaders.add(end)
         p = end
@@ -161,17 +212,99 @@ def decode(path, name, code, value):
             # The inline table, 4-byte aligned in the section.
             table = (value + p + 3 & ~3) - value
             p = table + 4 * skip[1]
+            if p > len(code):
+                die(f'{path}: {name}: compares against {skip[1]} entries, the table runs past the function')
+            base = skip[2].end('ldisp') + struct.unpack('<i', skip[2]['ldisp'])[0]
+            if base != table:
+                die(f'{path}: {name}: lea addresses {base:#x}, the table is at {table:#x}')
             for k in range(skip[1]):
-                leaders.add(table + struct.unpack_from('<i', code, table + 4 * k)[0])
+                targets.add(table + struct.unpack_from('<i', code, table + 4 * k)[0])
             skip = None
-    if not leaders - {len(code)} <= ins.keys():
-        die(f'{path}: {name}: jump target between instructions')
-    return ins, leaders, list(hits.values())
+    if not targets <= ins.keys():
+        die(f'{path}: {name}: jump target {min(targets - ins.keys()):#x} is no instruction')
+    return ins, leaders | targets, list(hits.values())
+
+
+def writes(c, p, opcode, modrm, rex):
+    """General registers (any width) the decoded instruction may write."""
+    pre = set()
+    while c[p] in LEGACY:
+        pre.add(c[p])
+        p += 1
+    op, b = opcode[-1], (rex & 1) * 8
+    reg = rm = None
+    ext = modrm >> 3 & 7 if modrm is not None else 0
+    byte = lambda n: n - 4 if not rex and 4 <= n < 8 else n  # %ah .. %bh
+    if modrm is not None:
+        reg = ext | (rex & 4) * 2
+        rm = (modrm & 7 | b) if modrm >> 6 == 3 else None
+    out = lambda *regs: {n for n in regs if n is not None}
+    if len(opcode) == 1:
+        narrow = not op & 1
+        if op in ALU:
+            if op >> 3 == 7:
+                return set()
+            kind = op & 7
+            return out(0 if kind >= 4 else reg if kind >= 2 and not narrow else byte(reg) if kind >= 2
+                       else rm if not narrow or rm is None else byte(rm))
+        if op in (0x63, 0x69, 0x6b, 0x8b, 0x8d):
+            return out(reg)
+        if op == 0x8a:
+            return out(byte(reg))
+        if op in (0x80, 0x81, 0x83):
+            return set() if ext == 7 else out(byte(rm) if op == 0x80 and rm is not None else rm)
+        if op in (0x86, 0x87):
+            return out(*(byte(n) if op == 0x86 and n is not None else n for n in (reg, rm)))
+        if op in (0x88, 0x89, 0x8f, 0xc0, 0xc1, 0xc6, 0xc7, 0xd0, 0xd1, 0xd2, 0xd3, 0xfe):
+            return out(byte(rm) if op != 0x8f and narrow and rm is not None else rm)
+        if op == 0x90:
+            return {0, 8} if b else set()
+        if op == 0x98:
+            return {0}
+        if op == 0x99:
+            return {2}
+        if op in range(0x58, 0x60):
+            return {op & 7 | b}
+        if op in range(0xb0, 0xb8):
+            return {byte(op & 7 | b)}
+        if op in range(0xb8, 0xc0):
+            return {op & 7 | b}
+        if op == 0xc9:
+            return {4, 5}
+        if op == 0xe8 or op == 0xff and ext == 2:
+            return set(CALLER)
+        if op in (0xf6, 0xf7):
+            return set() if ext < 2 else {0, 2} if ext > 3 else out(byte(rm) if narrow and rm is not None else rm)
+        if op == 0xff:
+            return out(rm) if ext < 2 else set()
+        return set()  # push, test, branches, ret, hlt
+    if op in range(0x40, 0x50) or op in (0xaf, 0xb6, 0xb7, 0xb8, 0xbc, 0xbd, 0xbe, 0xbf, 0x50, 0xc5, 0xd7, 0x2c, 0x2d):
+        return out(reg)
+    if op in range(0x90, 0xa0):
+        return out(byte(rm) if rm is not None else rm)
+    if op in (0xa4, 0xa5, 0xab, 0xac, 0xad, 0xb3, 0xbb):
+        return out(rm)
+    if op == 0xba:
+        return set() if ext == 4 else out(rm)
+    if op in (0xb0, 0xb1):
+        return out(0, rm)
+    if op in (0xc0, 0xc1):
+        return out(reg, rm)
+    if op in range(0xc8, 0xd0):
+        return {op & 7 | b}
+    if op == 0x7e and 0x66 in pre:
+        return out(rm)
+    if op == 0x05:
+        return {0, 1, 11}
+    if op == 0xa2:
+        return {0, 1, 2, 3}
+    return set()  # SSE, nop, ud2, branches
 
 
 def entries(h):
     if h['n'] is not None:
-        return h['n'][0]
+        # cmpl $imm8 sign-extends.
+        return struct.unpack('<b', h['n'])[0] & 0xffffffff
     return struct.unpack('<I', h['nw'] if h['nw'] is not None else h['nax'])[0]
 
 
@@ -242,19 +375,28 @@ def parse_obj(path, names):
             src = (mod >> 3 & 7) | (8 if h['nrex'] == b'\x45' else 0)
             if mod & 0xc7 != 0xc2 or src != reg:
                 die(f'{path}: {name}: unexpected normalization {h["norm"].hex()}')
-        # 32-bit movl %reg, %reg (89 /r or 8b /r, mod 11) in the dispatch block.
+        # The definition of the compare register reaching the compare in its block.
         cmp_at = h.start() + len(h['slot'] or b'')
-        block = [p for p in ins if max(q for q in leaders if q <= cmp_at) <= p < cmp_at]
-        rexes = (0x45,) if reg & 8 else (0, 0x40)
-        selfcopy = any(ins[p][1] in ((0x89,), (0x8b,)) and ins[p][2] == 0xc0 | (reg & 7) * 9 and ins[p][3] in rexes
-                       and not set(code[p:p + 1]) & LEGACY for p in block)
+        top = max(q for q in leaders if q <= cmp_at)
+        block = sorted((p for p in ins if top <= p < cmp_at), reverse=True)
+        last = next((p for p in block if reg in writes(code, p, *ins[p][1:])), None)
+        selfcopy = False
+        if last is not None:
+            # 32-bit movl %reg, %reg (89 /r or 8b /r, mod 11).
+            _, opcode, modrm, rex = ins[last]
+            selfcopy = opcode in ((0x89,), (0x8b,)) and modrm == 0xc0 | (reg & 7) * 9 \
+                and rex in ((0x45,) if reg & 8 else (0, 0x40)) and code[last] not in LEGACY
         if dump is not None:
             lines = dump.get(name, {})
-            want = {value + p for p in ins if p <= cmp_at}
-            if {q for q in lines if value <= q <= value + cmp_at} != want:
+            if {q for q in lines if value <= q <= value + cmp_at} != {value + p for p in ins if p <= cmp_at}:
                 die(f'{path}: {name}: objdump and the decoder disagree on instruction addresses')
-            same = re.compile(rf'movl?\s+%{R32[reg]},\s*%{R32[reg]}\b')
-            if selfcopy != any(same.match(lines[value + p]) for p in block):
+            imm = re.match(rf'cmpl?\s+\$(-?)(0x[0-9a-f]+|\d+),\s*%{R32[reg]}\b', lines[value + cmp_at])
+            if imm is None or int(imm[1] + imm[2], 0) & 0xffffffff != n:
+                die(f'{path}: {name}: compares against {n}, objdump shows {lines[value + cmp_at]!r}')
+            dlast = next((p for p in block if reg in att_writes(lines[value + p])), None)
+            if dlast != last:
+                die(f'{path}: {name}: objdump and the decoder disagree on the definition of %{R32[reg]}: {dlast} != {last}')
+            if last is not None and att_selfcopy(lines[value + last], reg) != selfcopy:
                 die(f'{path}: {name}: objdump and the decoder disagree on a self-copy')
         res[name] = (n, reg, h['norm'] is not None, idx, h['slot'] is not None, selfcopy)
     return res
