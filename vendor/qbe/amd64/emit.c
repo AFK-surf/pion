@@ -10,6 +10,10 @@ struct E {
 	uint64_t fsz;
 	int nclob;
 	int grouped_cvt;
+	bits xmm_save; /* amd64_win: nonvolatile xmm6..xmm15 to save */
+	int nxmm;
+	uint64_t locsz; /* amd64_win: bytes of the local slot area */
+	int framed; /* amd64_win: has a prologue (and unwind info) */
 };
 
 #define CMP(X) \
@@ -174,6 +178,16 @@ slot(Ref r, E *e)
 	s = rsval(r);
 	assert(s <= e->fn->slot);
 	/* specific to NAlign == 3 */
+	if (T.windows) {
+		/* amd64_win (winabi_framesz): %rbp, when used, equals %rsp
+		 * after the prologue; the slots start at 0(fp), and the
+		 * caller's area (s < 0, -2 is the return address) is past
+		 * the frame, the pushed GPRs and the saved %rbp. */
+		if (s < 0)
+			return 4LL * -s - 8LL + (int64_t)e->fsz
+				+ 8LL * ((int64_t)e->nclob + (e->fp == RBP));
+		return 4LL * s;
+	}
 	if (s < 0) {
 		if (e->fp == RSP)
 			return 4LL * -s - 8LL + (int64_t)e->fsz + (int64_t)e->nclob * 8LL;
@@ -182,12 +196,9 @@ slot(Ref r, E *e)
 	}
 	else if (e->fp == RSP)
 		return 4LL * s + (int64_t)e->nclob * 8LL;
-	else if (e->fn->vararg) {
-		if (T.windows)
-			return -4LL * ((int64_t)e->fn->slot - s);
-		else
-			return -176LL + -4LL * ((int64_t)e->fn->slot - s);
-	} else
+	else if (e->fn->vararg)
+		return -176LL + -4LL * ((int64_t)e->fn->slot - s);
+	else
 		return -4LL * ((int64_t)e->fn->slot - s);
 }
 
@@ -528,9 +539,9 @@ emitins(Ins i, E *e)
 			break;
 		if (req(i.to, i.arg[0]))
 			break;
-		/* A register copy only has a live scalar low lane. Not on
-		 * Windows: xmm6..xmm15 are callee-saved there (all 128 bits)
-		 * and amd64_win does not save them, so keep the low-lane move. */
+		/* A register copy only has a live scalar low lane. amd64_win
+		 * keeps the scalar low-lane move (its prologue saves the
+		 * nonvolatile xmm6..xmm15 it writes, all 128 bits). */
 		if (!T.windows && KBASE(i.cls) && isreg(i.to) && isreg(i.arg[0])) {
 			emitf("movaps %0, %=", &i, e);
 			break;
@@ -849,25 +860,211 @@ amd64_sysv_emitfn(Fn *fn, FILE *f)
 		elf_emitfnfin(fn->name, f);
 }
 
+/* Does the emitter write the reserved xmm15 scratch in fn? Mirrors
+ * every TMP(XMM0+15) write in emitins: Odiv with to == arg[1], a
+ * slot-to-slot (or memory-to-slot) copy, and a floating-point Oswap.
+ * Any other instruction whose 2-address conversion (emitf '+'/'-')
+ * copies a slot or memory operand into a slot destination is counted
+ * too, which over-approximates (isel never emits one). */
+static int
+winabi_uses_xmm15(Fn *fn)
+{
+	Blk *b;
+	Ins *i;
+	int t0;
+
+	for (b=fn->start; b; b=b->link)
+		for (i=b->ins; i<&b->ins[b->nins]; i++) {
+			if (i->op == Odiv && req(i->to, i->arg[1]))
+				return 1;
+			if (i->op == Oswap && KBASE(i->cls))
+				return 1;
+			if (req(i->to, R) || req(i->arg[0], R)
+			|| req(i->to, i->arg[0]))
+				continue;
+			t0 = rtype(i->arg[0]);
+			if (rtype(i->to) == RSlot
+			&& (t0 == RSlot || t0 == RMem))
+				return 1;
+		}
+	return 0;
+}
+
+/* Microsoft x64 frame (all offsets from %rsp after the prologue, which
+ * %rbp equals when used; 16-byte aligned):
+ *   [0, locsz)                    slots (4*fn->slot bytes used)
+ *   [locsz, locsz + 16*nxmm)      saved xmm6..xmm15, k-th at locsz+16k
+ *   [.., fsz)                     8*o pad
+ *   [fsz, fsz + 8*nclob)          pushed amd64_winabi_rclob GPRs
+ *   [.., +8)                      saved %rbp (rbp frames)
+ *   then the return address and the caller's home / stack area.
+ * The order (pushes, allocation, frame register, xmm saves) is the
+ * one the Windows unwinder describes with UWOP_PUSH_NONVOL,
+ * UWOP_ALLOC_*, UWOP_SET_FPREG (offset 0) and UWOP_SAVE_XMM128. */
 static void
 winabi_framesz(E *e)
 {
-	uint64_t i, o, f;
+	uint64_t f, o, npush;
+	int *r;
 
+	/* Nonvolatile xmm6..xmm14 the allocator used, plus the xmm15
+	 * scratch when the emitter writes it. */
+	e->xmm_save = e->fn->reg & (BIT(XMM15) - BIT(XMM6));
+	if (winabi_uses_xmm15(e->fn))
+		e->xmm_save |= BIT(XMM15);
+	e->nxmm = 0;
+	for (r=amd64_winabi_xclob; *r>=0; r++)
+		if (e->xmm_save & BIT(*r))
+			e->nxmm++;
+	e->nclob = 0;
+	for (r=amd64_winabi_rclob; *r>=0; r++)
+		if (e->fn->reg & BIT(*r))
+			e->nclob++;
 	/* specific to NAlign == 3 */
+	f = ((uint64_t)e->fn->slot + 3) & -4;
+	e->locsz = 4*f;
+	e->framed = e->fp == RBP || f || e->nclob || e->nxmm;
+	/* %rsp is 16-byte aligned after the prologue of every framed
+	 * function: entry %rsp = 8 mod 16, npush pushes, then fsz. */
 	o = 0;
-	if (!e->fn->leaf) {
-		for (i=0, o=0; i<NCLR_WIN; i++)
-			o ^= e->fn->reg >> amd64_winabi_rclob[i];
-		o &= 1;
+	npush = (uint64_t)e->nclob + (e->fp == RBP);
+	if (e->framed)
+		o = (npush + 1) & 1;
+	e->fsz = e->locsz + 16*(uint64_t)e->nxmm + 8*o;
+	if (e->fsz > INT32_MAX)
+		die("stack frame too large");
+}
+
+/* `.seh_*` directives only with --seh (pionc passes it for MSVC
+ * link / lld-link, which drop .pdata with dead functions; MinGW GNU
+ * ld KEEP()s every .pdata). The frame layout is the same either way. */
+static void
+winabi_sehreg(E *e, char *dir, int reg)
+{
+	if (win_seh)
+		fprintf(e->f, "\t%s %%%s\n", dir, rname[reg][0]);
+}
+
+/* Offset of the k-th saved xmm register, from %rsp after the
+ * prologue (== %rbp in rbp frames). */
+static int64_t
+winabi_xmmoff(E *e, int k)
+{
+	return (int64_t)(e->locsz + 16*(uint64_t)k);
+}
+
+static void
+winabi_xmmsave(E *e, int restore)
+{
+	int *r, k;
+
+	for (k=0, r=amd64_winabi_xclob; *r>=0; r++)
+		if (e->xmm_save & BIT(*r)) {
+			if (restore)
+				fprintf(e->f, "\tmovups %"PRId64"(%%%s), %%xmm%d\n",
+					winabi_xmmoff(e, k), rname[e->fp][0],
+					*r - XMM0);
+			else {
+				fprintf(e->f, "\tmovups %%xmm%d, %"PRId64"(%%rsp)\n",
+					*r - XMM0, winabi_xmmoff(e, k));
+				if (win_seh)
+					fprintf(e->f, "\t.seh_savexmm %%xmm%d, %"PRId64"\n",
+						*r - XMM0, winabi_xmmoff(e, k));
+			}
+			k++;
+		}
+}
+
+static void
+winabi_prologue(Fn *fn, E *e)
+{
+	static int chkstk_id;
+	FILE *f;
+	int *r, cid;
+
+	f = e->f;
+	if (e->framed && win_seh)
+		fprintf(f, "\t.seh_proc %s\n", fn->name);
+	fputs("\tendbr64\n", f);
+	if (fn->vararg) {
+		fprintf(f, "\tmovq %%rcx, 0x8(%%rsp)\n");
+		fprintf(f, "\tmovq %%rdx, 0x10(%%rsp)\n");
+		fprintf(f, "\tmovq %%r8, 0x18(%%rsp)\n");
+		fprintf(f, "\tmovq %%r9, 0x20(%%rsp)\n");
 	}
-	f = e->fn->slot;
-	f = (f + 3) & -4;
-	if (f > 0
-	&& e->fp == RSP
-	&& e->fn->salign == 4)
-		f += 2;
-	e->fsz = 4*f + 8*o;
+	if (!e->framed)
+		return;
+	if (e->fp == RBP) {
+		fputs("\tpushq %rbp\n", f);
+		winabi_sehreg(e, ".seh_pushreg", RBP);
+	}
+	for (r=amd64_winabi_rclob; *r>=0; r++)
+		if (fn->reg & BIT(*r)) {
+			fprintf(f, "\tpushq %%%s\n", rname[*r][0]);
+			winabi_sehreg(e, ".seh_pushreg", *r);
+		}
+	/* Windows commits the stack on demand behind a single 4 KB
+	 * guard page: a frame of 4 KB or more must touch every page in
+	 * order. Probe below %rsp with the volatile %r10 / %r11 (dead
+	 * here, not argument registers) and then allocate with one
+	 * subq, so that .seh_stackalloc describes one instruction. */
+	if (e->fsz >= 4096) {
+		cid = chkstk_id++;
+		fprintf(f,
+			"\tleaq -%"PRIu64"(%%rsp), %%r10\n"
+			"\tmovq %%rsp, %%r11\n"
+			"%schkstk%d:\n"
+			"\tsubq $4096, %%r11\n"
+			"\tcmpq %%r10, %%r11\n"
+			"\tjbe %schkstkd%d\n"
+			"\torq $0, (%%r11)\n"
+			"\tjmp %schkstk%d\n"
+			"%schkstkd%d:\n",
+			e->fsz, T.asloc, cid, T.asloc, cid, T.asloc, cid,
+			T.asloc, cid);
+	}
+	if (e->fsz) {
+		fprintf(f, "\tsubq $%"PRIu64", %%rsp\n", e->fsz);
+		if (win_seh)
+			fprintf(f, "\t.seh_stackalloc %"PRIu64"\n", e->fsz);
+		if (e->fsz >= 4000)
+			fputs("\torq $0, (%rsp)\n", f);
+	}
+	/* UNWIND_CODE: with a frame register, codes taking an offset
+	 * come after UWOP_SET_FPREG; FrameOffset 0 makes the frame base
+	 * %rbp == %rsp here, so the xmm offsets mean the same either
+	 * way, also after a dynalloc moves %rsp. */
+	if (e->fp == RBP) {
+		fputs("\tmovq %rsp, %rbp\n", f);
+		if (win_seh)
+			fputs("\t.seh_setframe %rbp, 0\n", f);
+	}
+	winabi_xmmsave(e, 0);
+	if (win_seh)
+		fputs("\t.seh_endprologue\n", f);
+}
+
+/* Restore everything the prologue saved and return. In rbp frames
+ * (dynalloc moves %rsp) the epilogue starts with the `lea` form the
+ * Windows unwinder recognizes. */
+static void
+winabi_epilogue(Fn *fn, E *e)
+{
+	FILE *f;
+	int *r;
+
+	f = e->f;
+	winabi_xmmsave(e, 1);
+	if (e->fp == RBP) {
+		fprintf(f, "\tleaq %"PRIu64"(%%rbp), %%rsp\n", e->fsz);
+	} else if (e->fsz)
+		fprintf(f, "\taddq $%"PRIu64", %%rsp\n", e->fsz);
+	for (r=&amd64_winabi_rclob[NCLR_WIN]; r>amd64_winabi_rclob;)
+		if (fn->reg & BIT(*--r))
+			fprintf(f, "\tpopq %%%s\n", rname[*r][0]);
+	if (e->fp == RBP)
+		fputs("\tpopq %rbp\n", f);
+	fputs("\tret\n", f);
 }
 
 void
@@ -880,61 +1077,21 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 	};
 	static int id0;
 	Blk *b, *s;
-	Ins *i, itmp;
-	int *r, c, n, lbl;
+	Ins *i;
+	int c, n, lbl;
 	E *e;
 
 	e = &(E){.f = f, .fn = fn};
 	emitfnlnk(fn->name, &fn->lnk, f);
-	fputs("\tendbr64\n", f);
-	if (fn->vararg) {
-		fprintf(f, "\tmovq %%rcx, 0x8(%%rsp)\n");
-		fprintf(f, "\tmovq %%rdx, 0x10(%%rsp)\n");
-		fprintf(f, "\tmovq %%r8, 0x18(%%rsp)\n");
-		fprintf(f, "\tmovq %%r9, 0x20(%%rsp)\n");
-	}
-	if (!fn->leaf || fn->vararg || fn->dynalloc) {
-		e->fp = RBP;
-		fputs("\tpushq %rbp\n\tmovq %rsp, %rbp\n", f);
-	} else
-		e->fp = RSP;
+	e->fp = (!fn->leaf || fn->vararg || fn->dynalloc) ? RBP : RSP;
 	winabi_framesz(e);
-	/* Windows commits the stack on demand behind a single 4 KB
-	 * guard page: a frame of 4 KB or more must touch every page
-	 * in order (inline __chkstk; %r11 is volatile and dead here). */
-	if (e->fsz >= 4096) {
-		static int chkstk_id;
-		int cid = chkstk_id++;
-		fprintf(f,
-			"\tmovq $%"PRIu64", %%r11\n"
-			"%schkstk%d:\n"
-			"\tsubq $4096, %%rsp\n"
-			"\torq $0, (%%rsp)\n"
-			"\tsubq $4096, %%r11\n"
-			"\tcmpq $4096, %%r11\n"
-			"\tjae %schkstk%d\n"
-			"\tsubq %%r11, %%rsp\n"
-			"\torq $0, (%%rsp)\n",
-			e->fsz, T.asloc, cid, T.asloc, cid);
-	} else if (e->fsz >= 4000) {
-		fprintf(f,
-			"\tsubq $%"PRIu64", %%rsp\n"
-			"\torq $0, (%%rsp)\n",
-			e->fsz);
-	} else if (e->fsz)
-		fprintf(f, "\tsubq $%"PRIu64", %%rsp\n", e->fsz);
-	for (r=amd64_winabi_rclob; r<&amd64_winabi_rclob[NCLR_WIN]; r++)
-		if (fn->reg & BIT(*r)) {
-			itmp.arg[0] = TMP(*r);
-			emitf("pushq %L0", &itmp, e);
-			e->nclob++;
-		}
+	winabi_prologue(fn, e);
 
 	for (lbl=0, b=fn->start; b; b=b->link) {
 		if (lbl || b->npred > 1)
 			fprintf(f, "%sbb%d:\n", T.asloc, id0+b->id);
-		/* e->grouped_cvt stays 0: no xorps on Windows, where the
-		 * upper lanes of xmm6..xmm15 are callee-saved. */
+		/* e->grouped_cvt stays 0: amd64_win keeps its scalar
+		 * conversions unchanged. */
 		for (i=b->ins; i!=&b->ins[b->nins]; i++)
 			emitins(*i, e);
 		lbl = 1;
@@ -943,23 +1100,7 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 			fprintf(f, "\tud2\n");
 			break;
 		case Jret0:
-			if (fn->dynalloc)
-				fprintf(f,
-					"\tmovq %%rbp, %%rsp\n"
-					"\tsubq $%"PRIu64", %%rsp\n",
-					e->fsz + e->nclob * 8);
-			for (r=&amd64_winabi_rclob[NCLR_WIN]; r>amd64_winabi_rclob;)
-				if (fn->reg & BIT(*--r)) {
-					itmp.arg[0] = TMP(*r);
-					emitf("popq %L0", &itmp, e);
-				}
-			if (e->fp == RBP)
-				fputs("\tleave\n", f);
-			else if (e->fsz)
-				fprintf(f,
-					"\taddq $%"PRIu64", %%rsp\n",
-					e->fsz);
-			fputs("\tret\n", f);
+			winabi_epilogue(fn, e);
 			break;
 		case Jjmp:
 		Jmp:
@@ -990,4 +1131,6 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 		}
 	}
 	id0 += fn->nblk;
+	if (e->framed && win_seh)
+		fputs("\t.seh_endproc\n", f);
 }

@@ -924,13 +924,17 @@ arm64_isel(Fn *fn)
 	Blk *b, **sb;
 	Ins *i;
 	Phi *p;
-	uint n, al;
+	uint n;
+	int al, maxa = 1;
 	int64_t sz;
 
 	/* assign slots to fast allocs */
 	b = fn->start;
-	/* specific to NAlign == 3 */ /* or change n=4 and sz /= 4 below */
-	for (al=Oalloc, n=4; al<=Oalloc1; al++, n*=2)
+	/* specific to NAlign == 3 */ /* or change n=16 and sz /= 4 below */
+	/* Largest alignment first: every size is rounded to its own
+	 * alignment, so each slot offset stays a multiple of it (an
+	 * alloc16 after an alloc4 used to land 4 bytes off). */
+	for (al=Oalloc1, n=16; al>=Oalloc; al--, n/=2)
 		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			if (i->op == al) {
 				if (rtype(i->arg[0]) != RCon)
@@ -940,10 +944,26 @@ arm64_isel(Fn *fn)
 					err("invalid alloc size %"PRId64, sz);
 				sz = (sz + n-1) & -n;
 				sz /= 4;
+				if (sz > INT_MAX - fn->slot)
+					die("alloc too large");
 				fn->tmp[i->to.val].slot = fn->slot;
+				if ((int)(n / 4) > maxa)
+					maxa = (int)(n / 4);
 				fn->slot += sz;
 				*i = (Ins){.op = Onop};
 			}
+	/* Frame bases are 16-byte aligned: keep the slot area a multiple
+	 * of the largest alloc alignment so offsets from either end stay
+	 * aligned (both 0 + 4*s and 4*(f - fn->slot + s)). */
+	if (maxa > 1) {
+		int rem = fn->slot & (maxa - 1);
+		if (rem) {
+			int pad = maxa - rem;
+			if (pad > INT_MAX - fn->slot)
+				die("alloc too large");
+			fn->slot += pad;
+		}
+	}
 
 	for (b=fn->start; b; b=b->link) {
 		curi = &insb[NIns];

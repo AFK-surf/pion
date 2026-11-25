@@ -6,6 +6,7 @@
 #include <stdarg.h>
 
 int strict_jnz;
+int win_seh;
 
 enum {
 	Ksb = 4, /* matches Oarg/Opar/Jret */

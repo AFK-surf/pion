@@ -33,14 +33,18 @@ struct ExtraAlloc {
 // Number of stack bytes required be reserved for the callee.
 #define SHADOW_SPACE_SIZE 32
 
-int amd64_winabi_rsave[] = {RCX,  RDX,   R8,    R9,    R10,   R11,   RAX,  XMM0,
-                            XMM1, XMM2,  XMM3,  XMM4,  XMM5,  XMM6,  XMM7, XMM8,
-                            XMM9, XMM10, XMM11, XMM12, XMM13, XMM14, -1};
+// Microsoft x64: only xmm0..xmm5 are volatile; xmm6..xmm15 are
+// nonvolatile in all 128 bits, saved by amd64_winabi_emitfn when written.
+int amd64_winabi_rsave[] = {RCX,  RDX,  R8,   R9,   R10,  R11, RAX,
+                            XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, -1};
 int amd64_winabi_rclob[] = {RBX, R12, R13, R14, R15, RSI, RDI, -1};
+int amd64_winabi_xclob[] = {XMM6,  XMM7,  XMM8,  XMM9,  XMM10,
+                            XMM11, XMM12, XMM13, XMM14, XMM15, -1};
 
 MAKESURE(winabi_arrays_ok,
-         sizeof amd64_winabi_rsave == (NGPS_WIN + NFPS + 1) * sizeof(int) &&
-             sizeof amd64_winabi_rclob == (NCLR_WIN + 1) * sizeof(int));
+         sizeof amd64_winabi_rsave == (NGPS_WIN + NFPS_WIN + 1) * sizeof(int) &&
+             sizeof amd64_winabi_rclob == (NCLR_WIN + 1) * sizeof(int) &&
+             sizeof amd64_winabi_xclob == (NXMM_WIN + 1) * sizeof(int));
 
 // layout of call's second argument (RCall)
 //
@@ -57,12 +61,11 @@ bits amd64_winabi_retregs(Ref r, int p[2]) {
 
   bits b = 0;
   int num_int_returns = r.val & 1;
-  int num_float_returns = r.val & 2;
-  if (num_int_returns == 1) {
+  int num_float_returns = (r.val >> 1) & 1;
+  if (num_int_returns)
     b |= BIT(RAX);
-  } else {
+  if (num_float_returns)
     b |= BIT(XMM0);
-  }
   if (p) {
     p[0] = num_int_returns;
     p[1] = num_float_returns;
@@ -104,7 +107,7 @@ bits amd64_winabi_argregs(Ref r, int p[2]) {
     // returned here wrt to using the same counter for int/float regs on win.
     // For now, try the number of registers in use even though they're not
     // contiguous.
-    p[0] = popcnt(int_passed);
+    p[0] = popcnt(int_passed) + env_param;
     p[1] = popcnt(float_passed);
   }
   return b;
@@ -539,10 +542,11 @@ static void lower_vastart(Fn* func,
   Ref offset = newtmp("abi.vastart", Kl, func);
   emit(Ostorel, 0, R, offset, valist);
 
-  // *8 for sizeof(u64), +16 because the return address and rbp have been pushed
-  // by the time we get to the body of the function.
-  emit(Oadd, Kl, offset, TMP(RBP),
-       getcon(param_reg_usage->num_named_args_passed * 8 + 16, func));
+  // The first unnamed argument's home / stack slot, 8 bytes past the return
+  // address for each named one: caller slot -2 is the return address and
+  // every 8 bytes is 2 slots (amd64/emit.c slot(), whatever the frame).
+  emit(Oaddr, Kl, offset,
+       SLOT(-(4 + 2 * (int)param_reg_usage->num_named_args_passed)), R);
 }
 
 static void lower_vaarg(Fn* func, Ins* vaarg_instr) {

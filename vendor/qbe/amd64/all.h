@@ -48,6 +48,10 @@ enum Amd64Reg {
 
 	NGPS_WIN = R11 - RAX + 1 - 2,  /* -2 for RDI/RDI */
 	NCLR_WIN = R15 - RBX + 1 + 2,  /* +2 for RDI/RDI */
+	/* Microsoft x64: xmm0..xmm5 are volatile, xmm6..xmm15 are
+	 * nonvolatile (all 128 bits) */
+	NFPS_WIN = XMM5 - XMM0 + 1,
+	NXMM_WIN = XMM15 - XMM6 + 1,
 };
 MAKESURE(reg_not_tmp, XMM15 < (int)Tmp0);
 
@@ -59,8 +63,9 @@ struct Amd64Op {
 
 /* Isolated conversions do not justify an extra instruction on all CPUs.
  * A group of conversions can repeatedly merge unused destination lanes.
- * Used by amd64_sysv (text and ELF) only: amd64_win does not save the
- * callee-saved xmm6..xmm15, so it adds no xorps there. */
+ * Used by amd64_sysv (text and ELF) only; amd64_win keeps its scalar
+ * conversions unchanged (its prologue saves the nonvolatile xmm6..xmm15
+ * it writes, see amd64_winabi_emitfn). */
 static inline int
 amd64_grouped_cvt(const Blk *b)
 {
@@ -116,6 +121,7 @@ void amd64_sysv_abi(Fn *);
 /* winabi.c */
 extern int amd64_winabi_rsave[];
 extern int amd64_winabi_rclob[];
+extern int amd64_winabi_xclob[];
 bits amd64_winabi_retregs(Ref, int[2]);
 bits amd64_winabi_argregs(Ref, int[2]);
 void amd64_winabi_abi(Fn *);

@@ -483,6 +483,7 @@ struct Dat {
 extern Target T;
 extern char debug['Z'+1];
 extern int strict_jnz;
+extern int win_seh; /* amd64_win: emit .seh_* unwind directives */
 
 /* util.c */
 typedef enum {

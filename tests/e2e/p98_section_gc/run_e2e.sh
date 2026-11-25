@@ -191,7 +191,11 @@ EOF
 WIN_ASM="$TMP/pkg_a_win.s"
 "$PIONC" build --target amd64_win --emit-asm "$WIN_ASM" "$WS/pkg_a/src/lib.pion"
 grep -q '\.section \.text\$' "$WIN_ASM" || { echo "FAIL: amd64_win asm missing .section .text\$" >&2; exit 1; }
-grep -q '^\.linkonce one_only$' "$WIN_ASM" || { echo "FAIL: amd64_win asm missing .linkonce one_only" >&2; exit 1; }
+if [ "${PION_WIN_ABI:-}" = "msvc" ]; then
+  grep -q ',one_only,' "$WIN_ASM" || { echo "FAIL: amd64_win msvc asm missing inline COMDAT one_only,<sym>" >&2; exit 1; }
+else
+  grep -q '^\.linkonce one_only$' "$WIN_ASM" || { echo "FAIL: amd64_win asm missing .linkonce one_only" >&2; exit 1; }
+fi
 if grep -q '\.section \.rdata' "$WIN_ASM"; then
   echo "FAIL: amd64_win jump table must stay in function section, not .rdata" >&2
   exit 1
@@ -201,21 +205,32 @@ if grep -q '^\.previous$' "$WIN_ASM"; then
   exit 1
 fi
 # Every COFF per-symbol section (both exported `.globl` and non-exported local)
-# MUST be followed by `.linkonce one_only` so MSVC `/OPT:REF` and MinGW
-# `--gc-sections` can GC both dead exports and dead locals.
-python3 - "$WIN_ASM" <<'PYEOF'
-import sys
+# MUST carry COMDAT `one_only` (inline `,one_only,<sym>` under MSVC/--seh for
+# associative .pdata/.xdata, or `.linkonce one_only` for MinGW GNU as) so
+# MSVC `/OPT:REF` and MinGW `--gc-sections` GC both dead exports and dead locals.
+python3 - "$WIN_ASM" "${PION_WIN_ABI:-}" <<'PYEOF'
+import re, sys
 lines = open(sys.argv[1]).read().splitlines()
+msvc = sys.argv[2] == "msvc"
 found_local = False
 found_export = False
 found_jtbl = False
 for idx, line in enumerate(lines):
+    m = re.match(r'^\.section \.(?:text|data|bss)\$([^,]+),"[a-z]+"(,one_only,(\S+))?$', line)
     if line.startswith('.section .text$') or line.startswith('.section .data$') or line.startswith('.section .bss$'):
+        if not m:
+            sys.exit(f"FAIL: unexpected COFF section syntax: {line!r}")
+        sym = m.group(1)
+        inline_sym = m.group(3)
         nxt = lines[idx + 1] if idx + 1 < len(lines) else ""
         window = lines[idx + 1 : min(idx + 5, len(lines))]
         is_globl = any(w.startswith(".globl ") for w in window)
-        if nxt != ".linkonce one_only":
-            sys.exit(f"FAIL: COFF section {line} missing .linkonce one_only (got {nxt!r})")
+        if msvc:
+            if inline_sym != sym:
+                sys.exit(f"FAIL: MSVC COFF section {line} missing inline ,one_only,{sym}")
+        else:
+            if nxt != ".linkonce one_only":
+                sys.exit(f"FAIL: COFF section {line} missing .linkonce one_only (got {nxt!r})")
         if is_globl:
             found_export = True
         else:
