@@ -112,9 +112,11 @@ pub fn case4_float_double_ops() -> String {
   let u1 = (42.9).to_uint()
   let u2 = (0.0 / 0.0).to_uint()
   let u3 = (5000000000.0).to_uint()
+  let u4 = (3000000000.0).to_uint()
+  let u5 = (4294967294.9).to_uint()
   let arr : FixedArray[Float] = FixedArray::make(2, 0.75)
   let pick = if true { arr[1] } else { 1.0 }
-  f_eps_cubed.to_string() + "|" + d1.to_string() + "|" + u0.to_string() + "," + u1.to_string() + "," + u2.to_string() + "," + u3.to_string() + "|" + Float::to_double(pick).to_string()
+  f_eps_cubed.to_string() + "|" + d1.to_string() + "|" + u0.to_string() + "," + u1.to_string() + "," + u2.to_string() + "," + u3.to_string() + "," + u4.to_string() + "," + u5.to_string() + "|" + Float::to_double(pick).to_string()
 }
 
 pub(all) enum Verb {

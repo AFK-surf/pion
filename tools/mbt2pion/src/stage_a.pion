@@ -4422,7 +4422,7 @@ fn try_lower_general_postfix_slice(
       outer_owned_exempt,
       has_chained_slice,
       allow_interp_top,
-      "",
+      if t.kind == TokenKind::Ident { t.raw } else { "" },
       file,
     )
     let extra_tail = if extra_arg.length() > 0 { ", " + extra_arg } else { "" }
@@ -6243,12 +6243,16 @@ fn lower_one_token_or_form(
       let mname = tokens[i + 2].raw
       if mname == "to_double" {
         let close_p = find_matching_delim(tokens, i + 3)
+        push_expected_type(ctx, "Float")
         let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+        pop_expected_type(ctx)
         return (trivia + "(" + inner + ").to_double()", close_p + 1)
       }
       if mname == "reinterpret_from_int" {
         let close_p = find_matching_delim(tokens, i + 3)
+        push_expected_type(ctx, "Int")
         let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+        pop_expected_type(ctx)
         return (trivia + "Float::from_bits(" + inner + ")", close_p + 1)
       }
     }
@@ -6279,18 +6283,20 @@ fn lower_one_token_or_form(
           Some(mm) => match mm.get(mname) { Some((pts, _)) => pts, None => [] }
           None => []
         }
-        let recv_s = lower_expr_range(ctx, tokens, raw_uargs[0].0, raw_uargs[0].1, file, false).trim()
-        let arg_sb = StringBuilder()
-        let mut ai = 1
-        while ai < raw_uargs.length() {
-          if ai > 1 { arg_sb.write_string(", ") }
-          let exp_pt = if ai < t_ptys.length() { t_ptys[ai] } else { "" }
-          if exp_pt.length() > 0 { push_expected_type(ctx, exp_pt) }
-          arg_sb.write_string(lower_expr_range(ctx, tokens, raw_uargs[ai].0, raw_uargs[ai].1, file, false).trim())
-          if exp_pt.length() > 0 { pop_expected_type(ctx) }
-          ai = ai + 1
+        if t_ptys.length() >= 1 && t_ptys[0] == "Self" {
+          let recv_s = lower_expr_range(ctx, tokens, raw_uargs[0].0, raw_uargs[0].1, file, false).trim()
+          let arg_sb = StringBuilder()
+          let mut ai = 1
+          while ai < raw_uargs.length() {
+            if ai > 1 { arg_sb.write_string(", ") }
+            let exp_pt = if ai < t_ptys.length() { t_ptys[ai] } else { "" }
+            if exp_pt.length() > 0 { push_expected_type(ctx, exp_pt) }
+            arg_sb.write_string(lower_expr_range(ctx, tokens, raw_uargs[ai].0, raw_uargs[ai].1, file, false).trim())
+            if exp_pt.length() > 0 { pop_expected_type(ctx) }
+            ai = ai + 1
+          }
+          return (trivia + "(" + recv_s + ")." + mname + "(" + arg_sb.to_string() + ")", close_p + 1)
         }
-        return (trivia + recv_s + "." + mname + "(" + arg_sb.to_string() + ")", close_p + 1)
       }
     }
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Map" &&
@@ -7485,6 +7491,63 @@ fn lower_cascade_chain(
   (sb.to_string(), cur)
 }
 
+///| Strict read-only pure method whitelist for E1-4 immediate slice `.iter()` consumers.
+fn slice_iter_is_pure_method(m : String) -> Bool {
+  m == "to_string" || m == "length" || m == "is_empty" || m == "abs" ||
+  m == "contains" || m == "has_prefix" || m == "has_suffix" ||
+  m == "to_int" || m == "to_double" || m == "to_float" ||
+  m == "to_int64" || m == "to_uint" || m == "trim"
+}
+
+///| Check whether `[start, end)` is an explicit inline lambda (`fn(...) { ... }`, `x => ...`, `(...) => ...`).
+fn slice_iter_is_inline_lambda(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  if start >= end {
+    return false
+  }
+  let t0 = tokens[start]
+  if t0.kind == TokenKind::Keyword && t0.raw == "fn" &&
+  start + 1 < end && tokens[start + 1].kind == TokenKind::LParen {
+    return true
+  }
+  if t0.kind == TokenKind::Ident && start + 1 < end && tokens[start + 1].kind == TokenKind::FatArrow {
+    return true
+  }
+  if t0.kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, start)
+    if cp > start && cp + 1 < end && tokens[cp + 1].kind == TokenKind::FatArrow {
+      return true
+    }
+  }
+  false
+}
+
+///| Check whether `[start, end)` is a single literal or simple identifier (no calls/mutations).
+fn slice_iter_is_simple_arg(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  if end != start + 1 {
+    return false
+  }
+  let tk = tokens[start]
+  tk.kind == TokenKind::IntLit || tk.kind == TokenKind::FloatLit ||
+  tk.kind == TokenKind::StringLit || tk.kind == TokenKind::RawMultiline ||
+  tk.kind == TokenKind::CharLit || tk.kind == TokenKind::Ident ||
+  (tk.kind == TokenKind::Keyword && (tk.raw == "true" || tk.raw == "false"))
+}
+
+///| Return true iff `[start, end)` contains no call expressions (`ident(...)`, `.m(...)`, `Type::fn(...)`).
+fn slice_iter_has_no_calls(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    if tokens[k].kind == TokenKind::LParen && k > start {
+      let pk = tokens[k - 1].kind
+      if pk == TokenKind::Ident || pk == TokenKind::UpperIdent {
+        return false
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
 ///| E1-4 / Wave M2-F1: Check that argument tokens of a chained `.iter()` adapter/consumer
 ///| are strictly read-only and cannot mutate or alias the backing slice receiver.
 fn slice_iter_args_are_pure(tokens : Array[Token], start : Int, end : Int, recv_root : String) -> Bool {
@@ -7501,13 +7564,21 @@ fn slice_iter_args_are_pure(tokens : Array[Token], start : Int, end : Int, recv_
     !(k > start && tokens[k - 1].kind == TokenKind::Dot) {
       return false
     }
-    // Forbid known mutating method names inside iterator callbacks/args
-    if tk.kind == TokenKind::Ident && k > start && tokens[k - 1].kind == TokenKind::Dot {
-      let m = tk.raw
-      if m == "push" || m == "pop" || m == "set" || m == "unsafe_set" || m == "clear" ||
-      m == "resize" || m == "shrink_to_fit" || m == "swap" || m == "sort" || m == "drain" ||
-      m == "insert" || m == "remove" || m == "retain" || m == "append" || m == "blit_to" ||
-      m == "write_string" || m == "write_char" {
+    // Forbid all free function calls `ident(...)`, `Type::fn(...)`, `@pkg.fn(...)`, and non-whitelisted `.m(...)`
+    if tk.kind == TokenKind::LParen && k > start {
+      let prev = tokens[k - 1]
+      if prev.kind == TokenKind::Keyword && prev.raw == "fn" {
+        // Explicit inline lambda header `fn(...)` is allowed
+        ()
+      } else if prev.kind == TokenKind::Ident {
+        if k >= start + 2 && tokens[k - 2].kind == TokenKind::Dot &&
+        !(k >= start + 3 && tokens[k - 3].kind == TokenKind::PkgRef) &&
+        slice_iter_is_pure_method(prev.raw) {
+          ()
+        } else {
+          return false
+        }
+      } else if prev.kind == TokenKind::UpperIdent {
         return false
       }
     }
@@ -7518,7 +7589,7 @@ fn slice_iter_args_are_pure(tokens : Array[Token], start : Int, end : Int, recv_
 
 ///| E1-4 / Wave M2-F1: Return true iff `.iter()` at `close_br + 1 .. close_br + 5` is immediately
 ///| consumed by a pure read-only iterator chain ending in a terminal consumer (no escaping `Iter`,
-///| no mutation of backing array).
+///| no mutation of backing array, no external closure variables or arbitrary calls).
 fn is_pure_immediate_iter_consumer(tokens : Array[Token], after_iter : Int, end : Int, recv_root : String) -> Bool {
   let mut cur = after_iter
   while cur + 2 < end && tokens[cur].kind == TokenKind::Dot &&
@@ -7528,18 +7599,65 @@ fn is_pure_immediate_iter_consumer(tokens : Array[Token], after_iter : Int, end 
     if close_p < cur + 2 || close_p >= end {
       return false
     }
-    if !slice_iter_args_are_pure(tokens, cur + 3, close_p, recv_root) {
-      return false
+    // Split top-level arguments inside `(cur + 3 .. close_p)`
+    let args : Array[(Int, Int)] = []
+    let mut ai = cur + 3
+    while ai < close_p {
+      if tokens[ai].kind == TokenKind::Comma { ai = ai + 1; continue }
+      let mut ae = ai
+      let mut ad = 0
+      while ae < close_p {
+        let ak = tokens[ae].kind
+        if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+        else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+        else if ad == 0 && ak == TokenKind::Comma { break }
+        ae = ae + 1
+      }
+      if ae > ai { args.push((ai, ae)) }
+      ai = ae + 1
     }
-    if mname == "collect" || mname == "count" || mname == "join" ||
-    mname == "any" || mname == "all" || mname == "fold" ||
-    mname == "find_first" || mname == "to_array" {
-      return true
+    if mname == "collect" || mname == "count" || mname == "to_array" {
+      return args.length() == 0
     }
-    if mname == "map" || mname == "filter" || mname == "take" ||
-    mname == "drop" || mname == "enumerate" || mname == "rev" {
+    if mname == "rev" || mname == "enumerate" {
+      if args.length() != 0 { return false }
       cur = close_p + 1
       continue
+    }
+    if mname == "join" {
+      return args.length() == 1 &&
+      slice_iter_is_simple_arg(tokens, args[0].0, args[0].1) &&
+      slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root)
+    }
+    if mname == "take" || mname == "drop" {
+      if args.length() != 1 ||
+      !slice_iter_is_simple_arg(tokens, args[0].0, args[0].1) ||
+      !slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root) {
+        return false
+      }
+      cur = close_p + 1
+      continue
+    }
+    if mname == "any" || mname == "all" || mname == "find_first" {
+      return args.length() == 1 &&
+      slice_iter_is_inline_lambda(tokens, args[0].0, args[0].1) &&
+      slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root)
+    }
+    if mname == "map" || mname == "filter" {
+      if args.length() != 1 ||
+      !slice_iter_is_inline_lambda(tokens, args[0].0, args[0].1) ||
+      !slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root) {
+        return false
+      }
+      cur = close_p + 1
+      continue
+    }
+    if mname == "fold" {
+      return args.length() == 2 &&
+      slice_iter_has_no_calls(tokens, args[0].0, args[0].1) &&
+      slice_iter_args_are_pure(tokens, args[0].0, args[0].1, recv_root) &&
+      slice_iter_is_inline_lambda(tokens, args[1].0, args[1].1) &&
+      slice_iter_args_are_pure(tokens, args[1].0, args[1].1, recv_root)
     }
     return false
   }
@@ -13075,8 +13193,39 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           ""
         }
         let raw_body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
-        // Rewrite MoonBit trait method receiver `(Self,` / `(Self)` -> Pion `(self : Self,` / `(self : Self)`
-        let body = str_replace_all(str_replace_all(raw_body, "(Self,", "(self : Self,"), "(Self)", "(self : Self)")
+        // Rewrite only top-level trait method receiver `Ident(Self,` / `Ident(Self)` -> `self : Self`
+        // without touching return tuples `-> (Self, Self)` or fn-type params `f : (Self) -> Int`.
+        let btoks = lex_moonbit(raw_body)
+        let bn = btoks.length() - 1
+        let body_sb = StringBuilder()
+        let mut last_b = 0
+        let mut bdepth = 0
+        let mut pdepth = 0
+        let mut bk = 0
+        while bk < bn {
+          let btk = btoks[bk]
+          if btk.kind == TokenKind::LBrace {
+            bdepth = bdepth + 1
+          } else if btk.kind == TokenKind::RBrace {
+            bdepth = bdepth - 1
+          } else if btk.kind == TokenKind::LParen {
+            pdepth = pdepth + 1
+          } else if btk.kind == TokenKind::RParen {
+            pdepth = pdepth - 1
+          } else if bdepth == 1 && pdepth == 0 && btk.kind == TokenKind::Ident &&
+          !(bk > 0 && (btoks[bk - 1].kind == TokenKind::Colon || btoks[bk - 1].kind == TokenKind::Arrow ||
+            btoks[bk - 1].kind == TokenKind::Dot || btoks[bk - 1].kind == TokenKind::ColonColon)) &&
+          bk + 3 < bn && btoks[bk + 1].kind == TokenKind::LParen &&
+          btoks[bk + 2].kind == TokenKind::UpperIdent && btoks[bk + 2].raw == "Self" &&
+          (btoks[bk + 3].kind == TokenKind::Comma || btoks[bk + 3].kind == TokenKind::RParen) {
+            body_sb.write_string(raw_body.slice(last_b, btoks[bk + 2].start_byte))
+            body_sb.write_string("self : Self")
+            last_b = btoks[bk + 2].end_byte
+          }
+          bk = bk + 1
+        }
+        body_sb.write_string(raw_body.slice(last_b, raw_body.length()))
+        let body = body_sb.to_string()
         pop_active_generics(ctx, trait_added_g)
         let decl_code = vis + "trait " + tname + header_extra + " " + body
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[rb].end_byte)
