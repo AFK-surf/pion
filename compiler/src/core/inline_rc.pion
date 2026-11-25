@@ -494,6 +494,7 @@ fn irc_find_phi_opcode_end(line : String, code_end : Int) -> Int {
 ///|
 /// True if a QBE instruction line is a `phi` instruction (`=... <ty> phi...`).
 fn irc_line_has_phi(raw : String) -> Bool {
+  if !raw.contains("phi") { return false }
   let code_end = irc_strip_comment_end(raw, 0, raw.length())
   irc_find_phi_opcode_end(raw, code_end) >= 0
 }
@@ -504,6 +505,28 @@ struct IrcSafeInfo {
   valid_rc_objs : Map[String, Bool]
   safe_addrs : Map[String, Bool]
   dp_addr_of : Map[String, String]
+}
+
+///|
+/// Prefilter for `irc_collect_safe_load_info`: only a `=l` `alloc*`, `copy` or
+/// `add` can extend its tables, so any other definition is not parsed at all.
+/// May accept too much, never too little.
+fn irc_may_define_safe(t : String) -> Bool {
+  let n = t.length()
+  let mut i = 1
+  while i < n && !irc_is_ws(t.code_unit_at(i)) { i = i + 1 }
+  if !irc_slice_starts_with(t, i, n, " =l ") { return false }
+  i = i + 4
+  while i < n && irc_is_ws(t.code_unit_at(i)) { i = i + 1 }
+  if i >= n { return false }
+  // Keep the general scalar decoder for a non-ASCII opcode prefix.
+  let c = t.code_unit_at(i)
+  if c >= 128 { return true }
+  if c != 97 && c != 99 { return false }
+  if i + 1 >= n { return false }
+  let next = t.code_unit_at(i + 1)
+  next >= 128 || (c == 97 && (next == 108 || next == 100)) ||
+    (c == 99 && next == 111)
 }
 
 ///|
@@ -579,7 +602,7 @@ fn irc_collect_safe_load_info(
     let ws = irc_first_non_ws(raw)
     if ws < raw.length() && str_code_at(raw, ws) == 37 {
       let t = irc_strip_comment(raw)
-      match irc_parse_typed_def(t) {
+      match if irc_may_define_safe(t) { irc_parse_typed_def(t) } else { None } {
         Some((lhs, ty_c, rhs)) => {
           let is_u = match def_count.get(lhs) {
             Some(c) => c == 1
@@ -2212,6 +2235,13 @@ fn irc_silent_op(t : String) -> Int {
   while j < n && !irc_is_ws(str_code_at(t, j)) {
     j = j + 1
   }
+  irc_silent_op_at(t, j)
+}
+
+///|
+/// `irc_silent_op` when the name is known to end at `j`.
+fn irc_silent_op_at(t : String, j : Int) -> Int {
+  let n = t.length()
   if !irc_slice_starts_with(t, j, n, " =l ") {
     return 0
   }
@@ -2247,6 +2277,63 @@ fn irc_name_bucket(s : String, start : Int, end : Int) -> Int {
 }
 
 ///|
+/// Definition-name census: for every line of `code` (comment-stripped) that
+/// defines `%t<1..9 digits>` as `%tN =...`, the end offset of the name; `0` for
+/// other lines. `n` buckets cannot hold a repeated spelling twice, so a non-empty
+/// result proves every definition unique and distinct from the parameters. Bucket
+/// collisions, longer numbers and any other spelling return `[]`: the caller then
+/// counts names in a Map.
+fn irc_unique_lhs_ends(code : Array[String], fn_hdr : String) -> Array[Int] {
+  let n = code.length()
+  // The whole header is searched, so a parameter can never share a `%t` name.
+  if n == 0 || irc_strip_comment(fn_hdr).contains("%t") { return [] }
+  let seen = Array::make(n, false)
+  let ends = Array::make(n, 0)
+  let mut i = 0
+  while i < n {
+    let t = code[i]
+    let end = t.length()
+    if end > 0 && t.code_unit_at(0) == 37 {
+      if end < 5 || t.code_unit_at(1) != 116 { return [] }
+      let mut j = 2
+      let mut id = 0
+      while j < end {
+        let c = t.code_unit_at(j)
+        if c < 48 || c > 57 { break }
+        if j >= 11 { return [] }
+        id = id * 10 + (c - 48)
+        j = j + 1
+      }
+      if j == 2 || end - j < 2 || t.code_unit_at(j) != 32 || t.code_unit_at(j + 1) != 61 {
+        return []
+      }
+      let bucket = id % n
+      if seen[bucket] { return [] }
+      seen[bucket] = true
+      ends[i] = j
+    }
+    i = i + 1
+  }
+  ends
+}
+
+///|
+/// Adds the edge of `lhs =l loadl addr` once `lhs` is known to be unique and
+/// `addr` to be a usable slot.
+fn irc_add_slot_load(
+  st : IrcSilent,
+  latest : Map[String, String],
+  entry_init : Map[String, Bool],
+  lhs : String,
+  addr : String,
+) -> Unit {
+  match latest.get(addr) {
+    Some(v) => irc_silent_node(st, lhs, [v])
+    None => if entry_init.contains(addr) { irc_silent_node(st, lhs, ["=" + addr]) }
+  }
+}
+
+///|
 /// Step 2: collection of SSA temporaries proven to be NULL or statically immortal
 /// (`$pion_str_*_hdr`, `$pion_none_hdr`, `$pion_enum_*_hdr`) on every path.
 /// Seeds are literal `0` and `add $<immortal>_hdr, 24`; facts propagate (least
@@ -2272,25 +2359,39 @@ fn irc_collect_immortal_regs(
   let slots : Map[String, Bool] = Map::new()
   let maybe_slot : Array[Bool] = Array::make(1024, false)
   let code : Array[String] = []
+  let mut ci = 0
+  while ci < n {
+    code.push(irc_strip_comment(fn_lines[ci]))
+    ci = ci + 1
+  }
+  let ends = irc_unique_lhs_ends(code, fn_hdr)
+  let unique = ends.length() != 0
   let mut entry_lbl = ""
   let mut entry_end = n
   let mut entry_ok = false
   let mut i = 0
   while i < n {
-    let t = irc_strip_comment(fn_lines[i])
-    code.push(t)
+    let t = code[i]
     if t.length() > 0 {
       let c0 = str_code_at(t, 0)
       if c0 == 37 {
-        match irc_extract_def_lhs(t) {
-          Some(lhs) => {
-            irc_bump_def(def_count, lhs)
-            if irc_ends_with(t, " =l alloc8 8") && lhs.length() + 12 == t.length() {
-              slots.set(lhs, entry_ok && entry_end == n)
-              maybe_slot[irc_name_bucket(lhs, 0, lhs.length())] = true
-            }
+        if unique {
+          let j = ends[i]
+          if t.length() - j == 12 && t.ends_with(" =l alloc8 8") {
+            slots.set(t.slice(0, j), entry_ok && entry_end == n)
+            maybe_slot[irc_name_bucket(t, 0, j)] = true
           }
-          None => ()
+        } else {
+          match irc_extract_def_lhs(t) {
+            Some(lhs) => {
+              irc_bump_def(def_count, lhs)
+              if irc_ends_with(t, " =l alloc8 8") && lhs.length() + 12 == t.length() {
+                slots.set(lhs, entry_ok && entry_end == n)
+                maybe_slot[irc_name_bucket(lhs, 0, lhs.length())] = true
+              }
+            }
+            None => ()
+          }
         }
       } else if c0 == 64 {
         if entry_lbl == "" {
@@ -2326,7 +2427,8 @@ fn irc_collect_immortal_regs(
         if str_code_at(t, 0) == 37 {
           // The definition itself is not a use (a second one is caught by `def_count`).
           scan_from = 1
-          if irc_silent_op(t) == 1 {
+          let op = if unique { irc_silent_op_at(t, ends[i]) } else { irc_silent_op(t) }
+          if op == 1 {
             // The only operand is the address.
             scan_to = 0
           }
@@ -2383,7 +2485,7 @@ fn irc_collect_immortal_regs(
       } else if c0 == 115 {
         match irc_parse_storel(t) {
           Some((v, a)) =>
-            if irc_unique_slot(slots, def_count, a) {
+            if irc_slot_is_usable(slots, def_count, a, unique) {
               latest.set(a, v)
               if i < entry_end && entry_ok {
                 entry_init.set(a, true)
@@ -2399,33 +2501,56 @@ fn irc_collect_immortal_regs(
           None => ()
         }
       } else if c0 == 37 {
-        let op = irc_silent_op(t)
+        let op = if unique { irc_silent_op_at(t, ends[i]) } else { irc_silent_op(t) }
+        if unique && op == 5 {
+          // A re-executed `alloc8` yields a new slot.
+          latest.remove(t.slice(0, ends[i]))
+          i = i + 1
+          continue
+        }
+        if unique && op == 1 {
+          // Canonical `%tN =l loadl %name`: look the address up only if it may be a slot.
+          let j = ends[i]
+          let pos = j + 10
+          let end = t.length()
+          if end - j > 11 && irc_slice_starts_with(t, j, end, " =l loadl %") {
+            let mut k = pos + 1
+            while k < end && irc_is_qbe_ident_char(t.code_unit_at(k)) { k = k + 1 }
+            if k == end {
+              if maybe_slot[irc_name_bucket(t, pos, end)] {
+                let addr = t.slice(pos, end)
+                if irc_slot_is_usable(slots, def_count, addr, true) {
+                  irc_add_slot_load(st, latest, entry_init, t.slice(0, j), addr)
+                }
+              }
+              i = i + 1
+              continue
+            }
+          }
+        }
         match if op != 0 { irc_parse_typed_def(t) } else { None } {
           Some((lhs, ty_c, rhs)) =>
             if ty_c == 108 {
               if op == 1 {
                 let a = irc_trim(irc_slice(rhs, 6, rhs.length()))
-                if irc_def_is_unique(def_count, lhs) && irc_unique_slot(slots, def_count, a) {
-                  match latest.get(a) {
-                    Some(v) => irc_silent_node(st, lhs, [v])
-                    None => if entry_init.contains(a) { irc_silent_node(st, lhs, ["=" + a]) }
-                  }
+                if (unique || irc_def_is_unique(def_count, lhs)) && irc_slot_is_usable(slots, def_count, a, unique) {
+                  irc_add_slot_load(st, latest, entry_init, lhs, a)
                 }
               } else if op == 5 {
                 // A re-executed `alloc8` yields a new slot.
                 latest.remove(lhs)
               } else if op == 2 {
-                if irc_def_is_unique(def_count, lhs) {
+                if unique || irc_def_is_unique(def_count, lhs) {
                   irc_silent_node(st, lhs, [irc_trim(irc_slice(rhs, 5, rhs.length()))])
                 }
               } else if op == 3 {
                 let sym = irc_trim(irc_slice(rhs, 4, rhs.length() - 4))
-                if irc_is_static_immortal_hdr(sym) && irc_def_is_unique(def_count, lhs) {
+                if irc_is_static_immortal_hdr(sym) && (unique || irc_def_is_unique(def_count, lhs)) {
                   irc_silent_mark(st, lhs)
                 }
               } else if irc_has_kw_sep(rhs, "phi") {
                 let vals = irc_parse_phi_vals(irc_trim(irc_slice(rhs, 3, rhs.length())))
-                if vals.length() > 0 && irc_def_is_unique(def_count, lhs) {
+                if vals.length() > 0 && (unique || irc_def_is_unique(def_count, lhs)) {
                   irc_silent_node(st, lhs, vals)
                 }
               }
@@ -2489,13 +2614,14 @@ fn irc_def_is_unique(def_count : Map[String, Int], name : String) -> Bool {
 }
 
 ///|
-fn irc_unique_slot(
+fn irc_slot_is_usable(
   slots : Map[String, Bool],
   def_count : Map[String, Int],
   name : String,
+  unique : Bool,
 ) -> Bool {
   match slots.get(name) {
-    Some(in_entry) => in_entry && irc_def_is_unique(def_count, name)
+    Some(in_entry) => in_entry && (unique || irc_def_is_unique(def_count, name))
     None => false
   }
 }
