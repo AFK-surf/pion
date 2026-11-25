@@ -705,6 +705,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC"
 # P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC"
+# P128: Opt-Track Z2 output size (pooled runtime panic texts: 3 Pion traps in dev + --release and all 12 user-reachable pooled panics via the runtime ABI with exact diagnostics; `.text.pion_io` collected without and kept with host file I/O on Linux x86_64; ELF64 `.rela` name suffix sharing and section symbols for private literals, direct object == `--emit-asm` object data and literal references; Wasm32 Map module without `__pion_map_hash`, every body reachable, Node == native output).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p128_binary_size_opts/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
