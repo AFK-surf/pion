@@ -346,7 +346,7 @@ sec_size(const Sec *s)
 }
 
 static void
-emit_nops(Buf *b, size_t n, int maxlen)
+emit_nops(Buf *b, size_t n)
 {
 	static const uint8_t nop1[] = { 0x90 };
 	static const uint8_t nop2[] = { 0x66, 0x90 };
@@ -357,13 +357,12 @@ emit_nops(Buf *b, size_t n, int maxlen)
 	static const uint8_t nop7[] = { 0x0f, 0x1f, 0x80, 0x00, 0x00, 0x00, 0x00 };
 	static const uint8_t nop8[] = { 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
 	static const uint8_t nop9[] = { 0x66, 0x0f, 0x1f, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00 };
-	static const uint8_t nop10[] = {0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0};
-	static const uint8_t nop11[] = {0x66, 0x66, 0x2e, 0x0f, 0x1f, 0x84, 0, 0, 0, 0, 0};
-	static const uint8_t *const nops[12] = {NULL, nop1, nop2, nop3, nop4,  nop5,
-						nop6, nop7, nop8, nop9, nop10, nop11};
+	static const uint8_t *const nops[10] = {
+		NULL, nop1, nop2, nop3, nop4, nop5, nop6, nop7, nop8, nop9
+	};
 	buf_reserve(b, n);
 	while (n > 0) {
-		size_t k = n > (size_t)maxlen ? (size_t)maxlen : n;
+		size_t k = n > 9 ? 9 : n;
 		memcpy(b->data + b->len, nops[k], k);
 		b->len += k;
 		n -= k;
@@ -388,7 +387,7 @@ sec_align(int sec_idx, uint64_t align_bytes)
 		if (s->is_nobits) {
 			s->nb_size = nxt;
 		} else if (s->flags & SHF_EXECINSTR) {
-			emit_nops(&s->buf, (size_t)(nxt - cur), 9);
+			emit_nops(&s->buf, (size_t)(nxt - cur));
 		} else {
 			buf_put_zeros(&s->buf, (size_t)(nxt - cur));
 		}
@@ -1153,70 +1152,7 @@ emitins(Ins i, EF *e)
 	int is64 = KWIDE(i.cls);
 	int isfp = KBASE(i.cls);
 
-	if (i.op==Oload && i.cls==Kv2d)
-		i.op=Ovload;
 	switch (i.op) {
-	case Ovload:
-	case Ovstore: {
-		int store = i.op == Ovstore;
-		Ref reg = store ? i.arg[0] : i.to;
-		RmOp m = ref_to_rm(i.arg[store], 1, e);
-		emit_modrm(0x66, 0, 0, 0x0f, store ? 0x11 : 0x10, hw_reg(reg.val), m, 0, 0);
-		break;
-	}
-	case Ovhigh:
-		emit_modrm(0x66, 0, 0, 0x0f, 0x70, hw_reg(i.to.val),
-			   ref_to_rm(i.arg[0], 0, e), 1, 238);
-		break;
-	case Otrapmask: {
-		RmOp m = ref_to_rm(i.arg[0], 1, e);
-		emit_modrm(0, 0, 0, 0x0f, 0xae, 3, m, 0, 0);
-		enc_alu_imm(0, 4, m, 8064);
-		enc_alu_imm(0, 7, m, 8064);
-	} break;
-	case Ovsum: {
-		Ins high = {Ovhigh, Kd, TMP(XMM15), {i.arg[0], R}};
-		emitins(high, e);
-		emitcopy(i.to, i.arg[0], Kd, e);
-		enc_sse_bin(Kd, 0x58, TMP(XMM15), i.to, e);
-		break;
-	}
-	case Ovlo:
-		emitcopy(i.to, i.arg[0], Kd, e);
-		break;
-	case Ovsplat:
-		emit_modrm(0x66, 0, 0, 0x0f, 0x70, hw_reg(i.to.val),
-			   ref_to_rm(i.arg[0], 0, e), 1, 68);
-		break;
-	case Ovzip:
-		if (req(i.to, i.arg[1])) {
-			emitcopy(TMP(XMM15), i.arg[1], Kd, e);
-			i.arg[1] = TMP(XMM15);
-		}
-		emitcopy(i.to, i.arg[0], Kd, e);
-		emit_modrm(0x66, 0, 0, 0x0f, 0x14, hw_reg(i.to.val),
-			   ref_to_rm(i.arg[1], 0, e), 0, 0);
-		break;
-	case Oordadd:
-	case Oordsub:
-	case Oordmul:
-	case Ovadd:
-	case Ovsub:
-	case Ovmul: {
-		int k = i.cls == Ks ? Ks : Kd;
-		if (req(i.to, i.arg[1]) && !req(i.to, i.arg[0])) {
-			emitcopy(TMP(XMM15), i.arg[1], k, e);
-			i.arg[1] = TMP(XMM15);
-		}
-		emitcopy(i.to, i.arg[0], k, e);
-		int op = i.op == Oordadd || i.op == Ovadd   ? 0x58
-			 : i.op == Oordsub || i.op == Ovsub ? 0x5c
-							    : 0x59;
-		emit_modrm(i.cls == Kv2d ? 0x66 : i.cls == Ks ? 0xf3 : 0xf2, 0, 0, 0x0f, op,
-			   hw_reg(i.to.val),
-			   ref_to_rm(i.arg[1], 0, e), 0, 0);
-		break;
-	}
 	case Onop:
 	case Odbgloc:
 		break;
@@ -1609,27 +1545,6 @@ emitins(Ins i, EF *e)
 		break;
 
 	case Ocopy: {
-		if (i.cls == Kv2d) {
-			Ins k = i;
-			Ref dst = k.to, src = k.arg[0];
-			if (req(dst, src))
-				break;
-			if (rtype(src) == RSlot) {
-				k = (Ins){Ovload,
-					  Kv2d,
-					  rtype(dst) == RSlot ? TMP(XMM15) : dst,
-					  {src, R}};
-				emitins(k, e);
-				src = k.to;
-			}
-			if (rtype(dst) == RSlot) {
-				k = (Ins){Ovstore, Kv2d, R, {src, dst}};
-				emitins(k, e);
-			} else if (!req(dst, src)) {
-				emitcopy(dst, src, Kd, e);
-			}
-			break;
-		}
 		assert(rtype(i.to) != RMem);
 		if (req(i.to, R) || req(i.arg[0], R) || req(i.to, i.arg[0]))
 			break;
@@ -1772,12 +1687,6 @@ emitins(Ins i, EF *e)
 		break;
 
 	case Oswap:
-		if (i.cls == Kv2d) {
-			emitcopy(TMP(XMM15), i.arg[0], Kd, e);
-			emitcopy(i.arg[0], i.arg[1], Kd, e);
-			emitcopy(i.arg[1], TMP(XMM15), Kd, e);
-			break;
-		}
 		if (isfp) {
 			emitcopy(TMP(XMM15), i.arg[0], i.cls, e);
 			emitcopy(i.arg[0], i.arg[1], i.cls, e);
@@ -2119,7 +2028,7 @@ relaxloops(Fn *fn, EF *e, LayoutBlock *blocks)
 		r++;
 	for (Blk *b = fn->start; b; b = b->link) {
 		LayoutBlock *l = blocks + b->id;
-		emit_nops(&out, l->new_start - out.len, fn->packed ? 11 : 9);
+		emit_nops(&out, l->new_start - out.len);
 		uint32_t stop = l->end;
 		if (l->first != l->limit) {
 			BrFixup *f = e->fixups + l->first;

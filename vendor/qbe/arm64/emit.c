@@ -479,79 +479,7 @@ emitins(Ins *i, E *e)
 	Ref r;
 	Con *c;
 
-	if (i->op==Oload && i->cls==Kv2d)
-		i->op=Ovload;
 	switch (i->op) {
-	case Oswap:
-		if (i->cls == Kv2d) {
-			uint x = i->arg[0].val - V0, y = i->arg[1].val - V0;
-			fprintf(e->f,
-				"\tmov\tv31.16b, v%u.16b\n\tmov\tv%u.16b, "
-				"v%u.16b\n\tmov\tv%u.16b, v31.16b\n",
-				x, x, y, y);
-			break;
-		}
-		goto Table;
-	case Ovload:
-	case Ovstore: {
-		int store = i->op == Ovstore;
-		Ref addr = i->arg[store];
-		uint r = (store ? i->arg[0] : i->to).val;
-		uint reg = r == V31 ? 31 : r - V0;
-		fixarg(&addr, 16, IP1, e);
-		int64_t off = rtype(addr) == RSlot  ? (int64_t)slot(addr, e)
-			      : rtype(addr) == RMem ? e->fn->mem[addr.val].offset.bits.i
-						    : 0;
-		uint base = rtype(addr) == RSlot  ? FP
-			    : rtype(addr) == RMem ? e->fn->mem[addr.val].base.val
-						  : addr.val;
-		fprintf(e->f, "\t%s\tq%u, [%s, #%" PRId64 "]\n",
-			store ? (off % 16 ? "stur" : "str") : (off % 16 ? "ldur" : "ldr"),
-			reg, rname(base, Kl), off);
-		break;
-	}
-	case Ovhigh:
-		fprintf(e->f, "\tdup\td%u, v%u.d[1]\n", i->to.val - V0, i->arg[0].val - V0);
-		break;
-	case Otrapmask:
-		fputs("\tmrs\tx17, fpcr\n\tmov\tw16, #0x9f00\n\ttst\tw17, w16\n", e->f);
-		break;
-	case Ovsum:
-		fprintf(e->f, "\tfaddp\td%u, v%u.2d\n", i->to.val - V0, i->arg[0].val - V0);
-		break;
-	case Ovmullane:
-		fprintf(e->f, "\tfmul\tv%u.2d, v%u.2d, v%u.d[0]\n", i->to.val - V0,
-			i->arg[0].val - V0, i->arg[1].val - V0);
-		break;
-	case Ovlo:
-	case Oordadd:
-	case Oordsub:
-	case Oordmul: {
-		Ins k = *i;
-		k.op = i->op == Ovlo	  ? Ocopy
-		       : i->op == Oordadd ? Oadd
-		       : i->op == Oordsub ? Osub
-					  : Omul;
-		emitins(&k, e);
-		break;
-	}
-	case Ovzip:
-		fprintf(e->f, "\tzip1\tv%u.2d, v%u.2d, v%u.2d\n", i->to.val - V0,
-			i->arg[0].val - V0, i->arg[1].val - V0);
-		break;
-	case Ovsplat:
-		fprintf(e->f, "\tdup\tv%u.2d, v%u.d[0]\n", i->to.val - V0,
-			i->arg[0].val - V0);
-		break;
-	case Ovadd:
-	case Ovsub:
-	case Ovmul:
-		fprintf(e->f, "\t%s\tv%u.2d, v%u.2d, v%u.2d\n",
-			i->op == Ovadd	 ? "fadd"
-			: i->op == Ovsub ? "fsub"
-					 : "fmul",
-			i->to.val - V0, i->arg[0].val - V0, i->arg[1].val - V0);
-		break;
 	default:
 		if (isload(i->op))
 			fixarg(&i->arg[0], loadsz(i), IP1, e);
@@ -595,28 +523,6 @@ emitins(Ins *i, E *e)
 	case Onop:
 		break;
 	case Ocopy:
-		if (i->cls == Kv2d) {
-			Ins k = *i;
-			Ref dst = k.to, src = k.arg[0];
-			if (req(dst, src))
-				break;
-			if (rtype(src) == RSlot) {
-				k = (Ins){Ovload,
-					  Kv2d,
-					  rtype(dst) == RSlot ? TMP(V31) : dst,
-					  {src, R}};
-				emitins(&k, e);
-				src = k.to;
-			}
-			if (rtype(dst) == RSlot) {
-				k = (Ins){Ovstore, Kv2d, R, {src, dst}};
-				emitins(&k, e);
-			} else if (!req(dst, src)) {
-				fprintf(e->f, "\tmov\tv%u.16b, v%u.16b\n", dst.val - V0,
-					src.val - V0);
-			}
-			break;
-		}
 		if (req(i->to, i->arg[0]))
 			break;
 		if (rtype(i->to) == RSlot) {
