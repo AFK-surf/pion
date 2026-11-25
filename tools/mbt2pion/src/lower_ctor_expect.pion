@@ -1,0 +1,2064 @@
+///| Wave M2-F3d Track F3d-2:
+///| - Local type inference for recursive local `fn` captures (`Ref[T]`, tuple destructuring,
+///|   method/field chains, typed closures, arithmetic/boolean/if/match expressions)
+///| - Lexical free-identifier analysis for recursive local `fn` lifting
+///| - Expected-type propagation for `MBT2PION_AMBIGUOUS_CTOR` resolution:
+///|   * Call arguments (positional vs labeled/optional by ABI name, generic substitution, chained methods)
+///|   * Generic enum / Option / Result payload type substitution
+///|   * `==` / `!=` bidirectional expected types
+///|   * Struct pattern field expected types
+///|   * Fail-closed sibling-arm / sibling-branch / OR-pattern reverse inference
+///|   * Expected-type stack guard helper
+
+///| Restore `ctx.expected_type_stack` back to `saved_len` (guarantees recovery on any early return or error).
+fn restore_expected_type_stack(ctx : StageAContext, saved_len : Int) -> Unit {
+  while ctx.expected_type_stack.length() > saved_len {
+    let _ = ctx.expected_type_stack.pop()
+  }
+}
+
+///| True iff `ty` is a complete, liftable static type (rejects empty or unparameterized generic shells).
+fn is_liftable_static_type(ty : String) -> Bool {
+  let t = ty.trim()
+  if t.length() == 0 {
+    return false
+  }
+  if t == "mbt_compat::Ref" || t == "Ref" || t == "Option" || t == "Result" ||
+  t == "Array" || t == "FixedArray" || t == "Map" || t == "mbt_compat::OrderedMap" ||
+  t == "mbt_compat::OrderedSet" || t == "mbt_compat::ArrayBuf" || t == "mbt_compat::ArrayView" {
+    return false
+  }
+  // Reject malformed tuple types with empty slots like `(Double, )` or `(, Int)`
+  if t.starts_with("(") && t.ends_with(")") {
+    let parts = split_top_level_type_list(t.slice(1, t.length() - 1))
+    for p in parts {
+      if !is_liftable_static_type(p) {
+        return false
+      }
+    }
+  }
+  true
+}
+
+///| Split a comma-separated type list at depth 0 (respecting `()`, `[]`, `{}`).
+fn split_top_level_type_list(s : String) -> Array[String] {
+  let out : Array[String] = []
+  let mut i = 0
+  let mut start = 0
+  let mut d = 0
+  while i < s.length() {
+    let ch = s.code_unit_at(i)
+    if ch == 40 || ch == 91 || ch == 123 {
+      d = d + 1
+    } else if ch == 41 || ch == 93 || ch == 125 {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && ch == 44 {
+      out.push(s.slice(start, i).trim())
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if start <= s.length() {
+    let tail = s.slice(start, s.length()).trim()
+    if tail.length() > 0 || out.length() > 0 {
+      out.push(tail)
+    }
+  }
+  out
+}
+
+///| Extract generic type arguments from `Name[A, B]` -> `["A", "B"]`, or `[]` if non-generic.
+fn extract_type_args_list(ty : String) -> Array[String] {
+  let t = ty.trim()
+  let lb = t.index_of("[")
+  if lb < 0 || !t.ends_with("]") {
+    return []
+  }
+  // Verify the `[` at `lb` matches the final `]`
+  let mut d = 0
+  let mut i = lb
+  while i < t.length() {
+    let ch = t.code_unit_at(i)
+    if ch == 91 { d = d + 1 }
+    else if ch == 93 {
+      d = d - 1
+      if d == 0 {
+        if i == t.length() - 1 {
+          return split_top_level_type_list(t.slice(lb + 1, i))
+        }
+        return []
+      }
+    }
+    i = i + 1
+  }
+  []
+}
+
+///| Unwrap `Option[T]` -> `T`, or `""` if not `Option[...]`.
+fn unwrap_option_type_str(ty : String) -> String {
+  let t = ty.trim()
+  if t.starts_with("Option[") && t.ends_with("]") {
+    let args = extract_type_args_list(t)
+    if args.length() == 1 {
+      return args[0]
+    }
+  }
+  ""
+}
+
+///| Unwrap `Result[T, E]` -> `(T, E)`, or `("", "")`.
+fn unwrap_result_type_str(ty : String) -> (String, String) {
+  let t = ty.trim()
+  if t.starts_with("Result[") && t.ends_with("]") {
+    let args = extract_type_args_list(t)
+    if args.length() == 2 {
+      return (args[0], args[1])
+    }
+  }
+  ("", "")
+}
+
+///| Extract parameter types from a function type `(T1, T2) -> R` -> `["T1", "T2"]`.
+fn extract_expected_fn_param_types(ty : String) -> Array[String] {
+  let mut t = ty.trim()
+  while t.starts_with("(") && t.ends_with(")") {
+    // Only strip outer parens if the closing paren at the end matches index 0
+    let mut d = 0
+    let mut i = 0
+    let mut matches_end = false
+    while i < t.length() {
+      let ch = t.code_unit_at(i)
+      if ch == 40 { d = d + 1 }
+      else if ch == 41 {
+        d = d - 1
+        if d == 0 {
+          matches_end = i == t.length() - 1
+          break
+        }
+      }
+      i = i + 1
+    }
+    if matches_end {
+      t = t.slice(1, t.length() - 1).trim()
+    } else {
+      break
+    }
+  }
+  if !t.starts_with("(") {
+    return []
+  }
+  // Find matching `)` for the param list
+  let mut d = 0
+  let mut rp = -1
+  let mut i = 0
+  while i < t.length() {
+    let ch = t.code_unit_at(i)
+    if ch == 40 { d = d + 1 }
+    else if ch == 41 {
+      d = d - 1
+      if d == 0 { rp = i; break }
+    }
+    i = i + 1
+  }
+  if rp < 1 {
+    return []
+  }
+  let rest = t.slice(rp + 1, t.length()).trim()
+  if !rest.starts_with("->") {
+    return []
+  }
+  let inner = t.slice(1, rp).trim()
+  if inner.length() == 0 {
+    return []
+  }
+  split_top_level_type_list(inner)
+}
+
+///| Extract return type from a function type `(T1, T2) -> R` -> `R`.
+fn extract_fn_ret_type_str(ty : String) -> String {
+  let t = ty.trim()
+  let mut d = 0
+  let mut i = 0
+  while i + 1 < t.length() {
+    let ch = t.code_unit_at(i)
+    if ch == 40 || ch == 91 || ch == 123 { d = d + 1 }
+    else if ch == 41 || ch == 93 || ch == 125 { if d > 0 { d = d - 1 } }
+    else if d == 0 && ch == 45 && t.code_unit_at(i + 1) == 62 {
+      return t.slice(i + 2, t.length()).trim()
+    }
+    i = i + 1
+  }
+  ""
+}
+
+///| Substitute type parameter bindings `subst` into a type string `ty` (identifier-boundary safe).
+fn subst_type_params_str(ty : String, subst : Map[String, String]) -> String {
+  if ty.length() == 0 || subst.length() == 0 {
+    return ty
+  }
+  let sb = StringBuilder()
+  let n = ty.length()
+  let mut i = 0
+  while i < n {
+    let ch = ty.code_unit_at(i)
+    if is_ident_start_cu(ch) {
+      let mut j = i + 1
+      while j < n && is_ident_cont_cu(ty.code_unit_at(j)) {
+        j = j + 1
+      }
+      let ident = ty.slice(i, j)
+      let prev_cc = i >= 2 && ty.code_unit_at(i - 1) == 58 && ty.code_unit_at(i - 2) == 58
+      let next_cc = j + 1 < n && ty.code_unit_at(j) == 58 && ty.code_unit_at(j + 1) == 58
+      if !prev_cc && !next_cc {
+        match subst.get(ident) {
+          Some(rep) => sb.write_string(rep)
+          None => sb.write_string(ident)
+        }
+      } else {
+        sb.write_string(ident)
+      }
+      i = j
+    } else {
+      sb.write_byte(ch.to_byte())
+      i = i + 1
+    }
+  }
+  sb.to_string()
+}
+
+fn is_ident_start_cu(ch : Int) -> Bool {
+  (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95
+}
+
+fn is_ident_cont_cu(ch : Int) -> Bool {
+  is_ident_start_cu(ch) || (ch >= 48 && ch <= 57)
+}
+
+///| Check whether `ty` still references any generic param in `gset`.
+fn type_mentions_any_generic(ty : String, gset : Map[String, Bool]) -> Bool {
+  if ty.length() == 0 || gset.length() == 0 {
+    return false
+  }
+  let n = ty.length()
+  let mut i = 0
+  while i < n {
+    let ch = ty.code_unit_at(i)
+    if is_ident_start_cu(ch) {
+      let mut j = i + 1
+      while j < n && is_ident_cont_cu(ty.code_unit_at(j)) {
+        j = j + 1
+      }
+      let ident = ty.slice(i, j)
+      let prev_cc = i >= 2 && ty.code_unit_at(i - 1) == 58 && ty.code_unit_at(i - 2) == 58
+      let next_cc = j + 1 < n && ty.code_unit_at(j) == 58 && ty.code_unit_at(j + 1) == 58
+      if !prev_cc && !next_cc && gset.contains(ident) {
+        return true
+      }
+      i = j
+    } else {
+      i = i + 1
+    }
+  }
+  false
+}
+
+///| Unify a pattern type `pat` (which may contain generic params in `gset`) against concrete type `actual`.
+///| Records bindings into `subst` and marks contradictions in `conflicts` (fail-closed!).
+fn unify_generic_type_pattern(
+  pat : String,
+  actual : String,
+  gset : Map[String, Bool],
+  subst : Map[String, String],
+  conflicts : Map[String, Bool],
+) -> Unit {
+  let p = pat.trim()
+  let a = actual.trim()
+  if p.length() == 0 || a.length() == 0 {
+    return
+  }
+  if gset.contains(p) {
+    if conflicts.contains(p) {
+      return
+    }
+    match subst.get(p) {
+      Some(prev) =>
+      if prev != a {
+        conflicts[p] = true
+      }
+      None => subst[p] = a
+    }
+    return
+  }
+  // Tuple pattern `(P1, P2)` vs `(A1, A2)`
+  if p.starts_with("(") && p.ends_with(")") && a.starts_with("(") && a.ends_with(")") &&
+  !str_has(p, "->") && !str_has(a, "->") {
+    let ps = split_top_level_type_list(p.slice(1, p.length() - 1))
+    let as_ = split_top_level_type_list(a.slice(1, a.length() - 1))
+    if ps.length() == as_.length() {
+      let mut k = 0
+      while k < ps.length() {
+        unify_generic_type_pattern(ps[k], as_[k], gset, subst, conflicts)
+        k = k + 1
+      }
+    }
+    return
+  }
+  // Generic nominal type `Foo[P1, P2]` vs `Foo[A1, A2]` (or `pkg::Foo[A1, A2]`)
+  let p_base = strip_type_args_sym(p)
+  let a_base = strip_type_args_sym(a)
+  let same_base = p_base == a_base ||
+  (str_has(a_base, "::") && a_base.ends_with("::" + p_base)) ||
+  (str_has(p_base, "::") && p_base.ends_with("::" + a_base))
+  if same_base {
+    let p_args = extract_type_args_list(p)
+    let a_args = extract_type_args_list(a)
+    if p_args.length() > 0 && p_args.length() == a_args.length() {
+      let mut k = 0
+      while k < p_args.length() {
+        unify_generic_type_pattern(p_args[k], a_args[k], gset, subst, conflicts)
+        k = k + 1
+      }
+    }
+  }
+}
+
+///| Substitute generic type parameters of `schema` using `outer_expected_ty` into `raw_field_ty`.
+fn substitute_enum_field_expected_type(
+  ctx : StageAContext,
+  schema : AbiEnumSchema,
+  raw_field_ty : String,
+  outer_expected_ty : String,
+) -> String {
+  let fty = raw_field_ty.trim()
+  if fty.length() == 0 {
+    return ""
+  }
+  let skey = if schema.pkg.length() > 0 { schema.pkg + "::" + schema.name } else { schema.name }
+  let tparams = match ctx.symtab.enum_type_params.get(skey) {
+    Some(tp) => tp
+    None =>
+    match ctx.symtab.enum_type_params.get(schema.name) {
+      Some(tp) => tp
+      None => []
+    }
+  }
+  if tparams.length() == 0 {
+    return fty
+  }
+  let gset : Map[String, Bool] = Map()
+  for tp in tparams { gset[tp] = true }
+  let exp_base = strip_type_args_sym(outer_expected_ty)
+  let exp_matches = exp_base == skey || exp_base == schema.name ||
+  (str_has(exp_base, "::") && exp_base.ends_with("::" + schema.name))
+  if exp_matches {
+    let targs = extract_type_args_list(outer_expected_ty)
+    if targs.length() == tparams.length() {
+      let subst : Map[String, String] = Map()
+      let mut k = 0
+      while k < tparams.length() {
+        subst[tparams[k]] = targs[k]
+        k = k + 1
+      }
+      let out = subst_type_params_str(fty, subst)
+      if !type_mentions_any_generic(out, gset) {
+        return out
+      }
+    }
+  }
+  if type_mentions_any_generic(fty, gset) {
+    return ""
+  }
+  fty
+}
+
+///| Lower positional enum constructor/pattern args `(a0, a1, ...)` with per-field expected types
+///| (including generic parameter substitution from `current_expected_type(ctx)`).
+fn lower_positional_enum_args_f3d2(
+  ctx : StageAContext,
+  schema : AbiEnumSchema,
+  variant : AbiEnumVariant,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  file : String,
+  in_pattern : Bool,
+) -> Option[String] {
+  if variant.fields.length() == 0 {
+    return None
+  }
+  // In pattern mode, defer `Ctor(a, ..)` rest patterns to the existing rest-pattern expander
+  if in_pattern {
+    let mut k = open_p + 1
+    let mut d = 0
+    while k < close_p {
+      let kk = tokens[k].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && kk == TokenKind::DotDot { return None }
+      k = k + 1
+    }
+  }
+  let outer_exp = current_expected_type(ctx)
+  let raw_args : Array[(Int, Int)] = []
+  let mut cur = open_p + 1
+  while cur < close_p {
+    if tokens[cur].kind == TokenKind::Comma {
+      cur = cur + 1
+      continue
+    }
+    let mut ae = cur
+    let mut d = 0
+    while ae < close_p {
+      let ak = tokens[ae].kind
+      if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { d = d + 1 }
+      else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && ak == TokenKind::Comma { break }
+      ae = ae + 1
+    }
+    if ae > cur {
+      raw_args.push((cur, ae))
+    }
+    cur = ae + 1
+  }
+  if raw_args.length() != variant.fields.length() {
+    return None
+  }
+  let lowered : Array[String] = []
+  let mut ai = 0
+  while ai < raw_args.length() {
+    let (s, e) = raw_args[ai]
+    let fexp = substitute_enum_field_expected_type(ctx, schema, variant.fields[ai].ty, outer_exp)
+    let saved_exp = ctx.expected_type_stack.length()
+    push_expected_type(ctx, fexp)
+    let piece = lower_expr_range(ctx, tokens, s, e, file, in_pattern).trim()
+    restore_expected_type_stack(ctx, saved_exp)
+    lowered.push(piece)
+    ai = ai + 1
+  }
+  Some("(" + join_comma(lowered) + ")")
+}
+
+///| Resolve a struct field type from `ctx.symtab.struct_field_types` (trying full `pkg::S` and bare `S`).
+fn lookup_struct_field_ty_f3d2(ctx : StageAContext, struct_ty : String, field : String) -> String {
+  let clean = strip_type_args_sym(struct_ty)
+  if clean.length() == 0 {
+    return ""
+  }
+  // `Ref[T].val` -> `T`
+  if field == "val" && is_known_mbt_ref_type(ctx, struct_ty) {
+    let targs = extract_type_args_list(struct_ty)
+    if targs.length() == 1 {
+      return targs[0]
+    }
+  }
+  match ctx.symtab.struct_field_types.get(clean) {
+    Some(fm) =>
+    match fm.get(field) {
+      Some(ft) => return qualify_dep_field_type_f3d2(ctx, clean, ft)
+      None => ()
+    }
+    None => ()
+  }
+  // Resolve type aliases if present
+  match ctx.symtab.type_aliases.get(clean) {
+    Some(aliased) => {
+      let abase = strip_type_args_sym(aliased)
+      if abase != clean && abase.length() > 0 {
+        match ctx.symtab.struct_field_types.get(abase) {
+          Some(fm) =>
+          match fm.get(field) {
+            Some(ft) => return qualify_dep_field_type_f3d2(ctx, abase, ft)
+            None => ()
+          }
+          None => ()
+        }
+      }
+    }
+    None => ()
+  }
+  ""
+}
+
+///| If `owner_clean` is `pkg::Struct` and `ft` is a bare type `T` defined in `pkg`, qualify as `pkg::T`.
+fn qualify_dep_field_type_f3d2(ctx : StageAContext, owner_clean : String, ft : String) -> String {
+  let cc = owner_clean.index_of("::")
+  if cc <= 0 {
+    return ft
+  }
+  let pkg = owner_clean.slice(0, cc)
+  let t = ft.trim()
+  if t.length() == 0 || str_has(t, "::") {
+    return ft
+  }
+  let base = strip_type_args_sym(t)
+  if base.length() > 0 && (ctx.symtab.struct_field_types.contains(pkg + "::" + base) ||
+    ctx.symtab.enum_schemas.contains(pkg + "::" + base)) {
+    return pkg + "::" + t
+  }
+  ft
+}
+
+///| Resolve a method return type `recv_ty.method(...)`.
+fn lookup_method_ret_ty_f3d2(ctx : StageAContext, recv_ty : String, method : String) -> String {
+  let base = strip_type_args_sym(recv_ty)
+  if base.length() > 0 {
+    let qk = base + "::" + method
+    if ctx.cur_is_blackbox {
+      match ctx.symtab.blackbox_fn_ret_types.get(qk) {
+        Some(r) => if r.length() > 0 { return r }
+        None => ()
+      }
+    }
+    match ctx.symtab.fn_ret_types.get(qk) {
+      Some(r) => if r.length() > 0 { return r }
+      None => ()
+    }
+    // Check type alias
+    match ctx.symtab.type_aliases.get(base) {
+      Some(aliased) => {
+        let abase = strip_type_args_sym(aliased)
+        if abase != base && abase.length() > 0 {
+          match ctx.symtab.fn_ret_types.get(abase + "::" + method) {
+            Some(r) => if r.length() > 0 { return r }
+            None => ()
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  // Built-in / stdlib methods (only when not overridden above)
+  if method == "length" { return "Int" }
+  if method == "is_empty" || method == "contains" { return "Bool" }
+  if method == "to_string" { return "String" }
+  if method == "to_int" { return "Int" }
+  if method == "to_int64" { return "Int64" }
+  if method == "to_double" { return "Double" }
+  if method == "to_float" { return "Float" }
+  if method == "push" || method == "clear" || method == "set" || method == "unsafe_set" ||
+  method == "retain" || method == "write_string" || method == "write_char" || method == "write_byte" {
+    return "Unit"
+  }
+  if method == "copy" || method == "abs" { return recv_ty }
+  if method == "get" || method == "last" || method == "pop" {
+    let ety = extract_container_value_type(recv_ty)
+    if ety.length() > 0 {
+      return "Option[" + ety + "]"
+    }
+  }
+  if method == "unwrap_or" || method == "unwrap" {
+    let inner = unwrap_option_type_str(recv_ty)
+    if inner.length() > 0 {
+      return inner
+    }
+  }
+  if method == "untracked" {
+    // e.g. Signal[T].untracked() -> T
+    let targs = extract_type_args_list(recv_ty)
+    if targs.length() == 1 {
+      return targs[0]
+    }
+  }
+  ""
+}
+
+///| Infer the static type of a postfix chain `base(.field | [idx] | .method(args...))*`.
+fn infer_postfix_chain_type(ctx : StageAContext, tokens : Array[Token], start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  let mut pos = start
+  let mut cur_ty = ""
+  let t0 = tokens[pos]
+  if t0.kind == TokenKind::Ident {
+    if pos + 1 < end && tokens[pos + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, pos + 1)
+      if cp + 1 >= end {
+        return ""
+      }
+      cur_ty = infer_simple_expr_type(ctx, tokens, pos, cp + 1)
+      pos = cp + 1
+    } else {
+      cur_ty = lookup_ident_static_type(ctx, t0.raw)
+      pos = pos + 1
+    }
+  } else if t0.kind == TokenKind::PkgRef && pos + 3 < end &&
+  tokens[pos + 1].kind == TokenKind::Dot && tokens[pos + 3].kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, pos + 3)
+    if cp + 1 >= end {
+      return ""
+    }
+    cur_ty = infer_simple_expr_type(ctx, tokens, pos, cp + 1)
+    pos = cp + 1
+  } else if t0.kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, pos)
+    if cp + 1 >= end {
+      return ""
+    }
+    cur_ty = infer_simple_expr_type(ctx, tokens, pos, cp + 1)
+    pos = cp + 1
+  } else {
+    return ""
+  }
+  if cur_ty.length() == 0 || pos >= end {
+    return cur_ty
+  }
+  while pos < end && cur_ty.length() > 0 {
+    let tk = tokens[pos].kind
+    if tk == TokenKind::Dot && pos + 1 < end {
+      if tokens[pos + 1].kind == TokenKind::IntLit {
+        // Tuple field `.0`, `.1`, ...
+        let ct = cur_ty.trim()
+        if ct.starts_with("(") && ct.ends_with(")") {
+          let parts = split_top_level_type_list(ct.slice(1, ct.length() - 1))
+          let idx = parse_nonneg_int_str(tokens[pos + 1].raw)
+          if idx >= 0 && idx < parts.length() {
+            cur_ty = parts[idx]
+            pos = pos + 2
+            continue
+          }
+        }
+        return ""
+      }
+      if tokens[pos + 1].kind == TokenKind::Ident {
+        let member = tokens[pos + 1].raw
+        if pos + 2 < end && tokens[pos + 2].kind == TokenKind::LParen && !tokens[pos + 2].newline_before {
+          let cp = find_matching_delim(tokens, pos + 2)
+          cur_ty = lookup_method_ret_ty_f3d2(ctx, cur_ty, member)
+          pos = cp + 1
+          continue
+        }
+        cur_ty = lookup_struct_field_ty_f3d2(ctx, cur_ty, member)
+        pos = pos + 2
+        continue
+      }
+      return ""
+    }
+    if tk == TokenKind::LBracket {
+      let cb = find_matching_delim(tokens, pos)
+      cur_ty = extract_container_value_type(cur_ty)
+      pos = cb + 1
+      continue
+    }
+    return ""
+  }
+  if pos == end { cur_ty } else { "" }
+}
+
+fn parse_nonneg_int_str(s : String) -> Int {
+  if s.length() == 0 { return -1 }
+  let mut acc = 0
+  let mut i = 0
+  while i < s.length() {
+    let ch = s.code_unit_at(i)
+    if ch < 48 || ch > 57 { return -1 }
+    acc = acc * 10 + (ch - 48)
+    i = i + 1
+  }
+  acc
+}
+
+///| Infer the tail expression / return type of a block `{ stmt1; stmt2; tail }`.
+fn infer_block_ret_type_f3d2(ctx : StageAContext, tokens : Array[Token], open_b : Int, close_b : Int) -> String {
+  if close_b <= open_b + 1 {
+    return "Unit"
+  }
+  let saved_sc = ctx.scope_vars.length()
+  let mut cur = open_b + 1
+  let mut last_s = -1
+  let mut last_e = -1
+  let mut last_is_void = false
+  let mut ret_ty = ""
+  let mut ret_conflict = false
+  while cur < close_b {
+    let t = tokens[cur]
+    if t.kind == TokenKind::Semi {
+      cur = cur + 1
+      continue
+    }
+    // Track `let [mut] x [: T] = rhs` inside block so tail expr can see local bindings!
+    if t.kind == TokenKind::Keyword && t.raw == "let" {
+      let mut ni = cur + 1
+      if ni < close_b && tokens[ni].kind == TokenKind::Keyword && tokens[ni].raw == "mut" {
+        ni = ni + 1
+      }
+      if ni < close_b && tokens[ni].kind == TokenKind::Ident {
+        let lname = rename_keyword_ident(tokens[ni].raw)
+        if ni + 2 < close_b && tokens[ni + 1].kind == TokenKind::Colon {
+          let mut eq_i = ni + 2
+          let mut td = 0
+          while eq_i < close_b {
+            let tk = tokens[eq_i].kind
+            if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+            else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+            else if td == 0 && tk == TokenKind::Eq { break }
+            eq_i = eq_i + 1
+          }
+          if eq_i < close_b && tokens[eq_i].kind == TokenKind::Eq {
+            let lty = lower_type_tokens(tokens, ni + 2, eq_i, ctx.symtab, ctx.recipes).trim()
+            let re = find_expr_end(tokens, eq_i + 1, close_b)
+            ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: false, is_boxed: false })
+            last_s = cur
+            last_e = re
+            last_is_void = true
+            cur = re
+            continue
+          }
+        } else if ni + 1 < close_b && tokens[ni + 1].kind == TokenKind::Eq {
+          let re = find_expr_end(tokens, ni + 2, close_b)
+          let ity = infer_simple_expr_type(ctx, tokens, ni + 2, re)
+          ctx.scope_vars.push(ScopeVar::{ name: lname, ty: ity, is_mut: false, is_boxed: false })
+          last_s = cur
+          last_e = re
+          last_is_void = true
+          cur = re
+          continue
+        }
+      }
+    }
+    if t.kind == TokenKind::Keyword && t.raw == "return" {
+      let next_i = cur + 1
+      if next_i >= close_b || tokens[next_i].newline_before || tokens[next_i].kind == TokenKind::Semi || tokens[next_i].kind == TokenKind::RBrace {
+        if ret_ty.length() > 0 && ret_ty != "Unit" { ret_conflict = true }
+        else { ret_ty = "Unit" }
+        last_s = cur
+        last_e = next_i
+        last_is_void = true
+        cur = next_i
+        continue
+      }
+      let re = find_expr_end(tokens, next_i, close_b)
+      let rt = infer_simple_expr_type(ctx, tokens, next_i, re)
+      if rt.length() > 0 {
+        if ret_ty.length() > 0 && ret_ty != rt { ret_conflict = true }
+        else { ret_ty = rt }
+      }
+      last_s = cur
+      last_e = re
+      last_is_void = false
+      cur = re
+      continue
+    }
+    if t.kind == TokenKind::Keyword && (t.raw == "for" || t.raw == "while") {
+      let le = find_loop_stmt_end(tokens, cur, close_b)
+      last_s = cur
+      last_e = le
+      last_is_void = true
+      cur = le
+      continue
+    }
+    let ee = find_expr_end(tokens, cur, close_b)
+    if ee <= cur {
+      break
+    }
+    // Check if this statement is an assignment `lhs = rhs` or `|> ignore` or `if` without `else`
+    let mut is_void_stmt = false
+    if tokens[cur].kind == TokenKind::Keyword && tokens[cur].raw == "if" {
+      let mut has_else = false
+      let mut k = cur + 1
+      let mut d = 0
+      while k < ee {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+        else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "else" { has_else = true; break }
+        k = k + 1
+      }
+      if !has_else { is_void_stmt = true }
+    } else if ee >= cur + 2 && tokens[ee - 2].kind == TokenKind::PipeGt && tokens[ee - 1].raw == "ignore" {
+      is_void_stmt = true
+    } else {
+      let mut k = cur
+      let mut d = 0
+      while k < ee {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+        else if d == 0 && kk == TokenKind::Eq { is_void_stmt = true; break }
+        k = k + 1
+      }
+    }
+    last_s = cur
+    last_e = ee
+    last_is_void = is_void_stmt
+    cur = ee
+  }
+  let mut result = ""
+  if ret_conflict {
+    result = ""
+  } else if last_s >= 0 && last_e > last_s {
+    if last_is_void {
+      result = if ret_ty.length() > 0 { ret_ty } else { "Unit" }
+    } else {
+      let tail_ty = infer_simple_expr_type(ctx, tokens, last_s, last_e)
+      if tail_ty.length() > 0 {
+        if ret_ty.length() > 0 && ret_ty != tail_ty { result = "" }
+        else { result = tail_ty }
+      } else {
+        result = ret_ty
+      }
+    }
+  }
+  restore_scope_vars(ctx, saved_sc)
+  result
+}
+
+///| Infer the result type of a `match scrut { pat => body, ... }` expression.
+fn infer_match_expr_type_f3d2(ctx : StageAContext, tokens : Array[Token], start : Int, end : Int) -> String {
+  let mut brace_i = start + 1
+  let mut d = 0
+  while brace_i < end {
+    let k = tokens[brace_i].kind
+    if k == TokenKind::LParen || k == TokenKind::LBracket { d = d + 1 }
+    else if k == TokenKind::RParen || k == TokenKind::RBracket { if d > 0 { d = d - 1 } }
+    else if d == 0 && k == TokenKind::LBrace {
+      break
+    }
+    brace_i = brace_i + 1
+  }
+  if brace_i >= end || tokens[brace_i].kind != TokenKind::LBrace {
+    return ""
+  }
+  let close_b = find_matching_delim(tokens, brace_i)
+  if close_b != end - 1 {
+    return ""
+  }
+  let mut found = ""
+  let mut i = brace_i + 1
+  while i < close_b {
+    let mut fa = i
+    let mut fd = 0
+    while fa < close_b {
+      let fk = tokens[fa].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+      else if fd == 0 && fk == TokenKind::FatArrow { break }
+      fa = fa + 1
+    }
+    if fa >= close_b { break }
+    let bs = fa + 1
+    let mut be = bs
+    if bs < close_b && tokens[bs].kind == TokenKind::LBrace {
+      be = find_matching_delim(tokens, bs) + 1
+    } else if bs < close_b {
+      be = find_expr_end(tokens, bs, close_b)
+    }
+    if be > bs {
+      let aty = if tokens[bs].kind == TokenKind::LBrace && be == find_matching_delim(tokens, bs) + 1 {
+        infer_block_ret_type_f3d2(ctx, tokens, bs, be - 1)
+      } else {
+        infer_simple_expr_type(ctx, tokens, bs, be)
+      }
+      if aty.length() > 0 {
+        if found.length() == 0 {
+          found = aty
+        } else if found != aty {
+          return ""
+        }
+      }
+    }
+    let mut ni = be
+    if ni < close_b && (tokens[ni].kind == TokenKind::Comma || tokens[ni].kind == TokenKind::Semi) {
+      ni = ni + 1
+    }
+    if ni <= i { break }
+    i = ni
+  }
+  found
+}
+
+///| Infer the type of an `if cond { then } else { else }` expression.
+fn infer_if_expr_type_f3d2(ctx : StageAContext, tokens : Array[Token], start : Int, end : Int) -> String {
+  let mut lb = start + 1
+  let mut d = 0
+  while lb < end {
+    let k = tokens[lb].kind
+    if d == 0 && k == TokenKind::LBrace {
+      if !(lb > start + 1 && tokens[lb - 1].kind == TokenKind::ColonColon) {
+        break
+      }
+    }
+    if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d = d + 1 }
+    else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+    lb = lb + 1
+  }
+  if lb >= end || tokens[lb].kind != TokenKind::LBrace {
+    return ""
+  }
+  let close_b = find_matching_delim(tokens, lb)
+  if close_b + 2 >= end || !(tokens[close_b + 1].kind == TokenKind::Keyword && tokens[close_b + 1].raw == "else") {
+    return ""
+  }
+  let then_ty = infer_block_ret_type_f3d2(ctx, tokens, lb, close_b)
+  let else_s = close_b + 2
+  let else_ty = if tokens[else_s].kind == TokenKind::LBrace && find_matching_delim(tokens, else_s) == end - 1 {
+    infer_block_ret_type_f3d2(ctx, tokens, else_s, end - 1)
+  } else if tokens[else_s].kind == TokenKind::Keyword && tokens[else_s].raw == "if" {
+    infer_if_expr_type_f3d2(ctx, tokens, else_s, end)
+  } else {
+    ""
+  }
+  if then_ty.length() > 0 && else_ty.length() > 0 {
+    if then_ty == else_ty { return then_ty }
+    return ""
+  }
+  if then_ty.length() > 0 { return then_ty }
+  else_ty
+}
+
+///| Extended static expression type inference called as fallback from `infer_simple_expr_type`.
+fn infer_expr_type_f3d2(ctx : StageAContext, tokens : Array[Token], start : Int, end : Int) -> String {
+  if start >= end {
+    return ""
+  }
+  let t = tokens[start]
+  // 1. Parenthesized single expression `(expr)` (not a tuple)
+  if t.kind == TokenKind::LParen && find_matching_delim(tokens, start) == end - 1 {
+    if !paren_has_top_level_comma(tokens, start, end - 1) {
+      return infer_simple_expr_type(ctx, tokens, start + 1, end - 1)
+    }
+  }
+  // 1b. `Some(expr)` -> `Option[T]` when unshadowed
+  if t.kind == TokenKind::UpperIdent && t.raw == "Some" && !has_local_ctor(ctx.symtab, "Some") &&
+  start + 1 < end && tokens[start + 1].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, start + 1) == end - 1 {
+    let inner_ty = infer_simple_expr_type(ctx, tokens, start + 2, end - 1).trim()
+    if inner_ty.length() > 0 && is_liftable_static_type(inner_ty) {
+      return "Option[" + inner_ty + "]"
+    }
+  }
+  // 2. Unary `!expr` -> Bool; unary `-expr` -> numeric type of `expr`
+  if t.kind == TokenKind::Bang && start + 1 < end {
+    return "Bool"
+  }
+  if t.kind == TokenKind::Minus && start + 1 < end {
+    // Make sure there is no top-level binary op after start + 1
+    let mut has_bin = false
+    let mut k = start + 1
+    let mut d = 0
+    while k < end {
+      let kk = tokens[k].kind
+      if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+      else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && is_binary_op_kind_f3d2(kk, tokens[k].raw) { has_bin = true; break }
+      k = k + 1
+    }
+    if !has_bin {
+      let sub = infer_simple_expr_type(ctx, tokens, start + 1, end)
+      if sub == "Int" || sub == "Int64" || sub == "Double" || sub == "Float" {
+        return sub
+      }
+    }
+  }
+  // 3. Anonymous closure `fn(p1 : T1, ...) [-> R] { body }` (including multi-arg typed closures!)
+  if t.kind == TokenKind::Keyword && t.raw == "fn" && start + 1 < end && tokens[start + 1].kind == TokenKind::LParen {
+    let open_p = start + 1
+    let close_p = find_matching_delim(tokens, open_p)
+    let (pnames, ptys, all_typed) = extract_param_info(ctx, tokens, open_p, close_p, "")
+    if all_typed {
+      let mut cur = close_p + 1
+      if cur < end && tokens[cur].kind == TokenKind::Arrow {
+        let mut lb = cur + 1
+        let mut rd = 0
+        while lb < end {
+          let rk = tokens[lb].kind
+          if rd == 0 && rk == TokenKind::LBrace { break }
+          if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+          else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
+          lb = lb + 1
+        }
+        if lb < end && tokens[lb].kind == TokenKind::LBrace && find_matching_delim(tokens, lb) == end - 1 {
+          let rty = lower_type_tokens(tokens, cur + 1, lb, ctx.symtab, ctx.recipes).trim()
+          if rty.length() > 0 {
+            return "(" + join_comma(ptys) + ") -> " + rty
+          }
+        }
+      } else if cur < end && tokens[cur].kind == TokenKind::LBrace && find_matching_delim(tokens, cur) == end - 1 {
+        let saved_sc = ctx.scope_vars.length()
+        let mut pi = 0
+        while pi < pnames.length() {
+          if pnames[pi] != "_" {
+            ctx.scope_vars.push(ScopeVar::{
+              name: pnames[pi],
+              ty: if pi < ptys.length() { ptys[pi] } else { "" },
+              is_mut: false,
+              is_boxed: false,
+            })
+          }
+          pi = pi + 1
+        }
+        let rty = infer_block_ret_type_f3d2(ctx, tokens, cur, end - 1)
+        restore_scope_vars(ctx, saved_sc)
+        if rty.length() > 0 {
+          return "(" + join_comma(ptys) + ") -> " + rty
+        }
+      }
+    }
+  }
+  // 4. `if ... else ...` expression
+  if t.kind == TokenKind::Keyword && t.raw == "if" {
+    let it = infer_if_expr_type_f3d2(ctx, tokens, start, end)
+    if it.length() > 0 {
+      return it
+    }
+  }
+  // 5. `match ... { ... }` expression
+  if t.kind == TokenKind::Keyword && t.raw == "match" {
+    let mt = infer_match_expr_type_f3d2(ctx, tokens, start, end)
+    if mt.length() > 0 {
+      return mt
+    }
+  }
+  // 6. Top-level binary operators (lowest precedence first: ||, &&, cmp/is, bitwise, add/sub, mul/div/mod)
+  let mut split_bool = -1
+  let mut split_arith = -1
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && k > start {
+      if kk == TokenKind::PipePipe || kk == TokenKind::AmpAmp ||
+      kk == TokenKind::EqEq || kk == TokenKind::BangEq ||
+      kk == TokenKind::Lt || kk == TokenKind::LtEq || kk == TokenKind::Gt || kk == TokenKind::GtEq ||
+      (kk == TokenKind::Keyword && tokens[k].raw == "is") {
+        split_bool = k
+        break
+      }
+      if kk == TokenKind::Plus || kk == TokenKind::Minus || kk == TokenKind::Star ||
+      kk == TokenKind::Slash || kk == TokenKind::Percent ||
+      kk == TokenKind::Amp || kk == TokenKind::Pipe || kk == TokenKind::Caret ||
+      kk == TokenKind::Shl || kk == TokenKind::Shr {
+        // Keep last low-precedence split (`+`/`-` preferred over `*`/`/`)
+        if split_arith < 0 || kk == TokenKind::Plus || kk == TokenKind::Minus {
+          split_arith = k
+        }
+      }
+    }
+    k = k + 1
+  }
+  if split_bool > start {
+    return "Bool"
+  }
+  if split_arith > start && split_arith + 1 < end {
+    let lt = infer_simple_expr_type(ctx, tokens, start, split_arith)
+    let rt = infer_simple_expr_type(ctx, tokens, split_arith + 1, end)
+    if lt.length() > 0 && rt.length() > 0 {
+      if lt == rt {
+        return lt
+      }
+      return ""
+    }
+    return ""
+  }
+  // 7. Arbitrary-depth postfix chain `base(.field | [idx] | .method(...))*`
+  infer_postfix_chain_type(ctx, tokens, start, end)
+}
+
+fn is_binary_op_kind_f3d2(kk : TokenKind, raw : String) -> Bool {
+  kk == TokenKind::Plus || kk == TokenKind::Minus || kk == TokenKind::Star ||
+  kk == TokenKind::Slash || kk == TokenKind::Percent ||
+  kk == TokenKind::EqEq || kk == TokenKind::BangEq ||
+  kk == TokenKind::Lt || kk == TokenKind::LtEq || kk == TokenKind::Gt || kk == TokenKind::GtEq ||
+  kk == TokenKind::AmpAmp || kk == TokenKind::PipePipe ||
+  kk == TokenKind::Amp || kk == TokenKind::Pipe || kk == TokenKind::Caret ||
+  kk == TokenKind::Shl || kk == TokenKind::Shr ||
+  (kk == TokenKind::Keyword && raw == "is")
+}
+
+///| Infer `Ref(expr)` / `Ref::new(expr)` / `{ val: expr }` with its inner type parameter `mbt_compat::Ref[T]`.
+fn infer_ref_with_inner_type(ctx : StageAContext, tokens : Array[Token], inner_s : Int, inner_e : Int) -> String {
+  let base = effective_ref_type(ctx.recipes)
+  let inner_ty = infer_simple_expr_type(ctx, tokens, inner_s, inner_e).trim()
+  if inner_ty.length() > 0 && is_liftable_static_type(inner_ty) {
+    base + "[" + inner_ty + "]"
+  } else {
+    base
+  }
+}
+
+///| Recursively bind tuple pattern elements in `ctx.scope_vars` using `rhs_ty` (handles nested `let ((a, b), c) = expr`).
+fn register_tuple_pattern_types_f3d2(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  ty : String,
+) -> Unit {
+  let mut s = start
+  let mut e = end
+  while s + 1 < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e - 1 {
+    if paren_has_top_level_comma(tokens, s, e - 1) {
+      break
+    }
+    s = s + 1
+    e = e - 1
+  }
+  if s >= e {
+    return
+  }
+  let clean_ty = ty.trim()
+  if s + 1 == e && tokens[s].kind == TokenKind::Ident && tokens[s].raw != "_" {
+    ctx.scope_vars.push(ScopeVar::{
+      name: resolve_ident_in_scope(ctx, tokens[s].raw),
+      ty: clean_ty,
+      is_mut: false,
+      is_boxed: false,
+    })
+    return
+  }
+  if tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e - 1 {
+    let elem_tys = if clean_ty.starts_with("(") && clean_ty.ends_with(")") {
+      split_top_level_type_list(clean_ty.slice(1, clean_ty.length() - 1))
+    } else {
+      []
+    }
+    let cp = e - 1
+    let mut ti = s + 1
+    let mut tidx = 0
+    while ti < cp {
+      if tokens[ti].kind == TokenKind::Comma { ti = ti + 1; continue }
+      let mut te = ti
+      let mut td = 0
+      while te < cp {
+        let tk = tokens[te].kind
+        if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+        else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+        else if td == 0 && tk == TokenKind::Comma { break }
+        te = te + 1
+      }
+      let ety = if tidx < elem_tys.length() { elem_tys[tidx] } else { "" }
+      register_tuple_pattern_types_f3d2(ctx, tokens, ti, te, ety)
+      tidx = tidx + 1
+      ti = te + 1
+    }
+    return
+  }
+  for rb in collect_raw_pattern_binders(tokens, s, e) {
+    if rb != "_" {
+      ctx.scope_vars.push(ScopeVar::{
+        name: resolve_ident_in_scope(ctx, rb),
+        ty: "",
+        is_mut: false,
+        is_boxed: false,
+      })
+    }
+  }
+}
+
+///| Collect lexically FREE identifier references inside `[start, end)` (respecting local `let`, `for`,
+///| `fn`, and `match` arm binders so shadowed inner variables are NEVER spuriously captured).
+fn collect_free_body_idents_f3d2(
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  init_bound : Map[String, Bool],
+) -> Map[String, Bool] {
+  let free : Map[String, Bool] = Map()
+  let bound : Map[String, Bool] = Map()
+  for k in init_bound.keys() { bound[k] = true }
+  collect_free_body_idents_walk(tokens, start, end, bound, free)
+  free
+}
+
+fn collect_free_body_idents_walk(
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  bound : Map[String, Bool],
+  free : Map[String, Bool],
+) -> Unit {
+  let added : Array[String] = []
+  let mut i = start
+  while i < end && i < tokens.length() {
+    let t = tokens[i]
+    // Nested `{ ... }` block: lexical scope for inner `let` bindings
+    if t.kind == TokenKind::LBrace {
+      let cb = find_matching_delim(tokens, i)
+      if cb < end {
+        collect_free_body_idents_walk(tokens, i + 1, cb, bound, free)
+        i = cb + 1
+        continue
+      }
+    }
+    // `let [mut] pat [: T] = rhs`: scan `rhs` with current `bound`, THEN add `pat` binders to `bound`!
+    if t.kind == TokenKind::Keyword && t.raw == "let" {
+      let mut eq_i = i + 1
+      let mut d = 0
+      while eq_i < end {
+        let ek = tokens[eq_i].kind
+        if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { d = d + 1 }
+        else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        else if d == 0 && ek == TokenKind::Eq { break }
+        eq_i = eq_i + 1
+      }
+      if eq_i < end && tokens[eq_i].kind == TokenKind::Eq {
+        let re = find_expr_end(tokens, eq_i + 1, end)
+        collect_free_body_idents_walk(tokens, eq_i + 1, re, bound, free)
+        // Extract pattern binders from `[i + 1, eq_i)` (stop before `:` type annotation if simple `let x : T`)
+        let mut pat_s = i + 1
+        if pat_s < eq_i && tokens[pat_s].kind == TokenKind::Keyword && tokens[pat_s].raw == "mut" {
+          pat_s = pat_s + 1
+        }
+        let mut pat_e = eq_i
+        let mut pk = pat_s
+        let mut pd = 0
+        while pk < eq_i {
+          let pkk = tokens[pk].kind
+          if pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace { pd = pd + 1 }
+          else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace { pd = pd - 1 }
+          else if pd == 0 && pkk == TokenKind::Colon { pat_e = pk; break }
+          pk = pk + 1
+        }
+        for rb in collect_raw_pattern_binders(tokens, pat_s, pat_e) {
+          let nm = rename_keyword_ident(rb)
+          if nm != "_" && !bound.contains(nm) {
+            bound[nm] = true
+            added.push(nm)
+          }
+        }
+        i = re
+        continue
+      }
+    }
+    // `for x in iter { body }` / `for idx, x in iter { body }`
+    if t.kind == TokenKind::Keyword && t.raw == "for" {
+      let mut lb = i + 1
+      let mut in_i = -1
+      let mut d = 0
+      while lb < end {
+        let lk = tokens[lb].kind
+        if d == 0 && lk == TokenKind::LBrace { break }
+        if d == 0 && lk == TokenKind::Keyword && tokens[lb].raw == "in" && in_i < 0 { in_i = lb }
+        if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace { d = d + 1 }
+        else if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+        lb = lb + 1
+      }
+      if lb < end && tokens[lb].kind == TokenKind::LBrace {
+        let cb = find_matching_delim(tokens, lb)
+        let loop_added : Array[String] = []
+        if in_i > i {
+          collect_free_body_idents_walk(tokens, in_i + 1, lb, bound, free)
+          for rb in collect_raw_pattern_binders(tokens, i + 1, in_i) {
+            let nm = rename_keyword_ident(rb)
+            if nm != "_" && !bound.contains(nm) {
+              bound[nm] = true
+              loop_added.push(nm)
+            }
+          }
+        } else {
+          // C-style `for k = init; cond; step { body }`
+          let mut k = i + 1
+          while k < lb {
+            if tokens[k].kind == TokenKind::Ident && k + 1 < lb && tokens[k + 1].kind == TokenKind::Eq {
+              let nm = rename_keyword_ident(tokens[k].raw)
+              if !bound.contains(nm) {
+                bound[nm] = true
+                loop_added.push(nm)
+              }
+            }
+            k = k + 1
+          }
+          collect_free_body_idents_walk(tokens, i + 1, lb, bound, free)
+        }
+        collect_free_body_idents_walk(tokens, lb + 1, cb, bound, free)
+        for la in loop_added { bound.remove(la) }
+        i = cb + 1
+        continue
+      }
+    }
+    // `fn [name](params) [-> R] { body }`
+    if t.kind == TokenKind::Keyword && t.raw == "fn" {
+      let mut open_p = -1
+      let mut fname = ""
+      if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+        open_p = i + 1
+      } else if i + 2 < end && tokens[i + 1].kind == TokenKind::Ident && tokens[i + 2].kind == TokenKind::LParen {
+        fname = rename_keyword_ident(tokens[i + 1].raw)
+        open_p = i + 2
+      }
+      if open_p >= 0 {
+        let close_p = find_matching_delim(tokens, open_p)
+        let mut lb = close_p + 1
+        let mut d = 0
+        while lb < end {
+          let lk = tokens[lb].kind
+          if d == 0 && lk == TokenKind::LBrace { break }
+          if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace { d = d + 1 }
+          else if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+          lb = lb + 1
+        }
+        if lb < end && tokens[lb].kind == TokenKind::LBrace {
+          let cb = find_matching_delim(tokens, lb)
+          let fn_added : Array[String] = []
+          if fname.length() > 0 && !bound.contains(fname) {
+            bound[fname] = true
+            added.push(fname)
+          }
+          for rpn in extract_raw_param_names(tokens, open_p, close_p) {
+            let nm = rename_keyword_ident(rpn)
+            if nm != "_" && !bound.contains(nm) {
+              bound[nm] = true
+              fn_added.push(nm)
+            }
+          }
+          collect_free_body_idents_walk(tokens, lb + 1, cb, bound, free)
+          for fa in fn_added { bound.remove(fa) }
+          i = cb + 1
+          continue
+        }
+      }
+    }
+    // `match scrut { pat [if guard] => body, ... }`
+    if t.kind == TokenKind::Keyword && t.raw == "match" {
+      let mut lb = i + 1
+      let mut d = 0
+      while lb < end {
+        let lk = tokens[lb].kind
+        if d == 0 && lk == TokenKind::LBrace { break }
+        if lk == TokenKind::LParen || lk == TokenKind::LBracket { d = d + 1 }
+        else if lk == TokenKind::RParen || lk == TokenKind::RBracket { if d > 0 { d = d - 1 } }
+        lb = lb + 1
+      }
+      if lb < end && tokens[lb].kind == TokenKind::LBrace {
+        let cb = find_matching_delim(tokens, lb)
+        collect_free_body_idents_walk(tokens, i + 1, lb, bound, free)
+        let mut ai = lb + 1
+        while ai < cb {
+          let mut fa = ai
+          let mut fd = 0
+          let mut if_i = -1
+          while fa < cb {
+            let fk = tokens[fa].kind
+            if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+            else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+            else if fd == 0 {
+              if fk == TokenKind::FatArrow { break }
+              else if fk == TokenKind::Keyword && tokens[fa].raw == "if" && if_i < 0 { if_i = fa }
+            }
+            fa = fa + 1
+          }
+          if fa >= cb { break }
+          let pe = if if_i >= 0 { if_i } else { fa }
+          let arm_added : Array[String] = []
+          for rb in collect_raw_pattern_binders(tokens, ai, pe) {
+            let nm = rename_keyword_ident(rb)
+            if nm != "_" && !bound.contains(nm) {
+              bound[nm] = true
+              arm_added.push(nm)
+            }
+          }
+          if if_i >= 0 {
+            collect_free_body_idents_walk(tokens, if_i + 1, fa, bound, free)
+          }
+          let bs = fa + 1
+          let mut be = bs
+          if bs < cb && tokens[bs].kind == TokenKind::LBrace {
+            be = find_matching_delim(tokens, bs) + 1
+          } else if bs < cb {
+            be = find_expr_end(tokens, bs, cb)
+          }
+          collect_free_body_idents_walk(tokens, bs, be, bound, free)
+          for aa in arm_added { bound.remove(aa) }
+          let mut ni = be
+          if ni < cb && (tokens[ni].kind == TokenKind::Comma || tokens[ni].kind == TokenKind::Semi) {
+            ni = ni + 1
+          }
+          if ni <= ai { break }
+          ai = ni
+        }
+        i = cb + 1
+        continue
+      }
+    }
+    if t.kind == TokenKind::Ident {
+      let prev_dot_cc = i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)
+      let next_colon = i + 1 < end && tokens[i + 1].kind == TokenKind::Colon
+      let next_eq_in_call = i + 1 < end && tokens[i + 1].kind == TokenKind::Eq &&
+      i > start && (tokens[i - 1].kind == TokenKind::LParen || tokens[i - 1].kind == TokenKind::Comma)
+      if !prev_dot_cc && !next_colon && !next_eq_in_call {
+        let nm = rename_keyword_ident(t.raw)
+        if !bound.contains(nm) {
+          free[nm] = true
+        }
+      }
+    }
+    i = i + 1
+  }
+  for a in added { bound.remove(a) }
+}
+
+///| Compute per-argument expected types for a call `callee(raw_args...)`:
+///| - Named args (`lbl=expr`, `lbl?=expr`) match STRICTLY by ABI parameter name (never by position).
+///| - Positional args match ONLY non-labeled positional parameters in order (skipping labeled/optional params).
+///| - Encountering `..` stops positional expected-type assignment (fail-closed).
+///| - Performs sound generic parameter substitution from already-typed arguments and outer expected return type.
+fn compute_call_arg_expected_types_f3d2(
+  ctx : StageAContext,
+  lookup_callee : String,
+  is_dot_method : Bool,
+  callee_pts : Array[(String, String)],
+  tokens : Array[Token],
+  raw_args : Array[(Int, Int)],
+) -> Array[String] {
+  let n = raw_args.length()
+  let out : Array[String] = []
+  let mut k = 0
+  while k < n { out.push(""); k = k + 1 }
+  if callee_pts.length() == 0 {
+    return out
+  }
+  // Look up raw (generic-preserving) param types, labeled param set, and generic type params
+  let raw_pts_all : Array[(String, String)] = match ctx.symtab.fn_raw_param_types.get(lookup_callee) {
+    Some(rp) => rp
+    None => callee_pts
+  }
+  let eff_pts : Array[(String, String)] = if is_dot_method &&
+  raw_pts_all.length() > 0 && raw_pts_all[0].0 == "self" &&
+  raw_pts_all.length() == callee_pts.length() + 1 {
+    let trimmed : Array[(String, String)] = []
+    let mut ti = 1
+    while ti < raw_pts_all.length() {
+      trimmed.push(raw_pts_all[ti])
+      ti = ti + 1
+    }
+    trimmed
+  } else {
+    callee_pts
+  }
+  let labeled_map : Map[String, Bool] = match ctx.symtab.fn_labeled_params.get(lookup_callee) {
+    Some(lm) => lm
+    None => Map()
+  }
+  let tparams : Array[String] = match ctx.symtab.fn_type_params.get(lookup_callee) {
+    Some(tp) => tp
+    None => []
+  }
+  let gset : Map[String, Bool] = Map()
+  for tp in tparams { gset[tp] = true }
+
+  // Build ordered list of positional-only parameter types (excluding labeled/optional params!)
+  let pos_pts : Array[String] = []
+  for pt in eff_pts {
+    if !labeled_map.contains(pt.0) {
+      pos_pts.push(pt.1)
+    }
+  }
+
+  // First pass: map each raw arg to its raw parameter type (before generic substitution)
+  let raw_arg_param_tys : Array[String] = []
+  let mut pos_idx = 0
+  let mut saw_spread = false
+  let mut ai = 0
+  while ai < n {
+    let (s, e) = raw_args[ai]
+    if s < e && tokens[s].kind == TokenKind::DotDot {
+      saw_spread = true
+      raw_arg_param_tys.push("")
+    } else if e - s >= 3 && tokens[s].kind == TokenKind::Ident &&
+    (tokens[s + 1].kind == TokenKind::Eq || tokens[s + 1].kind == TokenKind::QuestionEq) {
+      let lbl = tokens[s].raw
+      let mut found = ""
+      for pt in eff_pts {
+        if pt.0 == lbl { found = pt.1; break }
+      }
+      raw_arg_param_tys.push(found)
+    } else if e - s == 2 && tokens[s].kind == TokenKind::Ident &&
+    (tokens[s + 1].kind == TokenKind::Tilde || tokens[s + 1].kind == TokenKind::Question) {
+      raw_arg_param_tys.push("")
+    } else if saw_spread {
+      raw_arg_param_tys.push("")
+    } else {
+      let pt = if pos_idx < pos_pts.length() { pos_pts[pos_idx] } else { "" }
+      pos_idx = pos_idx + 1
+      raw_arg_param_tys.push(pt)
+    }
+    ai = ai + 1
+  }
+
+  // Second pass: if callee is generic, infer type parameter bindings from args & outer expected return type
+  let subst : Map[String, String] = Map()
+  let conflicts : Map[String, Bool] = Map()
+  if gset.length() > 0 {
+    // 2a. Unify return type with current_expected_type(ctx) if known
+    let cur_exp = current_expected_type(ctx).trim()
+    if cur_exp.length() > 0 {
+      match ctx.symtab.fn_ret_types.get(lookup_callee) {
+        Some(rty) => unify_generic_type_pattern(rty, cur_exp, gset, subst, conflicts)
+        None => ()
+      }
+    }
+    // 2b. Unify each argument's inferred type against its parameter type pattern
+    ai = 0
+    while ai < n {
+      let pty = raw_arg_param_tys[ai]
+      if pty.length() > 0 && type_mentions_any_generic(pty, gset) {
+        let (s, e) = raw_args[ai]
+        let vs = if e - s >= 3 && tokens[s].kind == TokenKind::Ident &&
+        (tokens[s + 1].kind == TokenKind::Eq || tokens[s + 1].kind == TokenKind::QuestionEq) {
+          s + 2
+        } else {
+          s
+        }
+        let arg_ty = infer_simple_expr_type(ctx, tokens, vs, e).trim()
+        if arg_ty.length() > 0 {
+          unify_generic_type_pattern(pty, arg_ty, gset, subst, conflicts)
+        }
+      }
+      ai = ai + 1
+    }
+    for ck in conflicts.keys() {
+      subst.remove(ck)
+    }
+  }
+
+  // Third pass: produce final expected type per arg (clearing any still-unresolved generic param)
+  ai = 0
+  while ai < n {
+    let raw_p = raw_arg_param_tys[ai]
+    if raw_p.length() > 0 {
+      let sub_p = if subst.length() > 0 { subst_type_params_str(raw_p, subst) } else { raw_p }
+      if gset.length() > 0 && type_mentions_any_generic(sub_p, gset) {
+        out[ai] = ""
+      } else {
+        out[ai] = sub_p
+      }
+    }
+    ai = ai + 1
+  }
+  out
+}
+
+///| Walk backwards from a dot at `dot_i` to find the start of the receiver expression chain
+///| (handles `self.m1(...).m2(...)`, `arr[i].m(...)`, `(expr).m(...)`, `a.b.m(...)`).
+fn find_dot_receiver_start_f3d2(tokens : Array[Token], start_bound : Int, dot_i : Int) -> Int {
+  let mut cur = dot_i - 1
+  while cur >= start_bound {
+    let tk = tokens[cur].kind
+    if tk == TokenKind::RParen || tk == TokenKind::RBracket {
+      // Walk back to matching opener
+      let open_k = if tk == TokenKind::RParen { TokenKind::LParen } else { TokenKind::LBracket }
+      let mut d = 1
+      let mut p = cur - 1
+      while p >= start_bound && d > 0 {
+        if tokens[p].kind == tk { d = d + 1 }
+        else if tokens[p].kind == open_k { d = d - 1; if d == 0 { break } }
+        p = p - 1
+      }
+      if d != 0 { return -1 }
+      cur = p
+      // If preceded by `.ident` or `ident` or `@pkg.ident`, continue walking back
+      if cur > start_bound && tokens[cur - 1].kind == TokenKind::Ident {
+        cur = cur - 1
+        if cur > start_bound && tokens[cur - 1].kind == TokenKind::Dot {
+          cur = cur - 1
+          if cur > start_bound {
+            cur = cur - 1
+            continue
+          }
+        }
+        return cur
+      }
+      return cur
+    } else if tk == TokenKind::Ident || tk == TokenKind::IntLit {
+      if cur > start_bound && tokens[cur - 1].kind == TokenKind::Dot {
+        cur = cur - 2
+        continue
+      }
+      return cur
+    } else {
+      return -1
+    }
+  }
+  -1
+}
+
+///| Try to infer a single bare constructor's enum type from `ctx.symtab` ONLY when unambiguous.
+///| Returns `""` if not a bare constructor or if ambiguous.
+fn bare_ctor_token_name_f3d2(ctx : StageAContext, tokens : Array[Token], s : Int, e : Int) -> String {
+  if s >= e {
+    return ""
+  }
+  let mut a = s
+  let mut b = e
+  // Strip single-expression `{ expr }` wrapper
+  if tokens[a].kind == TokenKind::LBrace && find_matching_delim(tokens, a) == b - 1 {
+    a = a + 1
+    b = b - 1
+  }
+  // Strip `(expr)` wrapper (non-tuple)
+  while a + 1 < b && tokens[a].kind == TokenKind::LParen && find_matching_delim(tokens, a) == b - 1 &&
+  !paren_has_top_level_comma(tokens, a, b - 1) {
+    a = a + 1
+    b = b - 1
+  }
+  if a >= b || tokens[a].kind != TokenKind::UpperIdent {
+    return ""
+  }
+  let cname = tokens[a].raw
+  if ctx.symtab.const_defs.contains(cname) || ctx.active_generics.contains(cname) ||
+  ctx.symtab.local_value_names.contains(cname) {
+    return ""
+  }
+  if (cname == "Some" || cname == "None" || cname == "Ok" || cname == "Err") &&
+  !has_local_ctor(ctx.symtab, cname) {
+    return ""
+  }
+  if a + 1 == b {
+    return cname
+  }
+  if a + 1 < b && tokens[a + 1].kind == TokenKind::LParen && find_matching_delim(tokens, a + 1) == b - 1 {
+    return cname
+  }
+  ""
+}
+
+///| Check whether `[s, e)` is a diverging expression (`return`/`break`/`continue`/`panic`/`abort`).
+fn is_diverging_expr_f3d2(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  let mut a = s
+  let mut b = e
+  if a < b && tokens[a].kind == TokenKind::LBrace && find_matching_delim(tokens, a) == b - 1 {
+    a = a + 1
+    b = b - 1
+  }
+  if a >= b { return false }
+  if tokens[a].kind == TokenKind::Keyword &&
+  (tokens[a].raw == "return" || tokens[a].raw == "break" || tokens[a].raw == "continue") {
+    return true
+  }
+  if tokens[a].kind == TokenKind::Ident && (tokens[a].raw == "panic" || tokens[a].raw == "abort") {
+    return true
+  }
+  false
+}
+
+///| Fail-closed sibling-branch enum inference across a list of expression spans `branches` at the
+///| SAME constrained position (e.g. `match` arm bodies or `if`/`else` branches).
+///| Returns:
+///| - `E` if all non-diverging branches are bare constructors (or known to have type `E`),
+///|   the intersection of candidate enums is UNIQUE (`len == 1`), and NO branch contradicts `E`.
+///| - `(E0, E1, ...)` (with `""` for unconstrained slots) if all non-diverging branches are N-tuples
+///|   and at least one slot `k` has a unique, non-contradicting enum intersection.
+///| - `""` otherwise (fail-closed!).
+fn infer_sibling_branches_expected_type_f3d2(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  branches : Array[(Int, Int)],
+) -> String {
+  if branches.length() < 2 || !symtab_sources_complete(ctx.symtab) {
+    return ""
+  }
+  // Mode 1: direct bare-ctor / typed sibling branches
+  let ctors : Array[String] = []
+  let mut known_ty = ""
+  let mut has_contradiction = false
+  let mut all_tuples = true
+  let mut tuple_arity = -1
+  let tuple_elems : Array[Array[(Int, Int)]] = []
+  for br in branches {
+    let (bs, be) = br
+    if is_diverging_expr_f3d2(tokens, bs, be) {
+      continue
+    }
+    let mut a = bs
+    let mut b = be
+    if a < b && tokens[a].kind == TokenKind::LBrace && find_matching_delim(tokens, a) == b - 1 {
+      a = a + 1
+      b = b - 1
+    }
+    // Check tuple structure for Mode 2
+    if all_tuples && a < b && tokens[a].kind == TokenKind::LParen &&
+    find_matching_delim(tokens, a) == b - 1 && paren_has_top_level_comma(tokens, a, b - 1) {
+      let elems : Array[(Int, Int)] = []
+      let mut ti = a + 1
+      while ti < b - 1 {
+        if tokens[ti].kind == TokenKind::Comma { ti = ti + 1; continue }
+        let mut te = ti
+        let mut td = 0
+        while te < b - 1 {
+          let tk = tokens[te].kind
+          if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+          else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+          else if td == 0 && tk == TokenKind::Comma { break }
+          te = te + 1
+        }
+        if te > ti { elems.push((ti, te)) }
+        ti = te + 1
+      }
+      if tuple_arity < 0 {
+        tuple_arity = elems.length()
+      } else if tuple_arity != elems.length() {
+        all_tuples = false
+      }
+      if all_tuples {
+        tuple_elems.push(elems)
+      }
+    } else {
+      all_tuples = false
+    }
+    // Check Mode 1 (bare ctor or known non-ctor type)
+    let cn = bare_ctor_token_name_f3d2(ctx, tokens, a, b)
+    if cn.length() > 0 {
+      ctors.push(cn)
+    } else {
+      let inf = infer_simple_expr_type(ctx, tokens, a, b).trim()
+      if inf.length() > 0 {
+        let base = strip_type_args_sym(inf)
+        if known_ty.length() == 0 {
+          known_ty = base
+        } else if known_ty != base {
+          has_contradiction = true
+        }
+      }
+    }
+  }
+  if ctors.length() > 0 && !has_contradiction {
+    let (inter, any_ambig) = symtab_intersect_ctor_enums(ctx.symtab, ctors)
+    if any_ambig && inter.length() == 1 {
+      let cand = inter[0]
+      if known_ty.length() == 0 || known_ty == cand ||
+      (str_has(cand, "::") && cand.ends_with("::" + known_ty)) {
+        return "__qual__::" + cand
+      }
+    }
+  }
+  // Mode 2: per-element tuple sibling inference (e.g. `match asked { Below => (..., Above), Right => (..., Left) }`)
+  if all_tuples && tuple_arity >= 2 && tuple_elems.length() >= 2 {
+    let slot_tys : Array[String] = []
+    let mut any_slot = false
+    let mut si = 0
+    while si < tuple_arity {
+      let slot_branches : Array[(Int, Int)] = []
+      for te in tuple_elems {
+        slot_branches.push(te[si])
+      }
+      let st = infer_sibling_branches_expected_type_f3d2(ctx, tokens, slot_branches)
+      if st.length() > 0 {
+        any_slot = true
+      }
+      slot_tys.push(st)
+      si = si + 1
+    }
+    if any_slot {
+      return "(" + join_comma(slot_tys) + ")"
+    }
+  }
+  ""
+}
+
+///| Collect all arm body spans `(body_start, body_end)` of a `match` body `[start, end)`.
+fn collect_match_arm_body_spans_f3d2(tokens : Array[Token], start : Int, end : Int) -> Array[(Int, Int)] {
+  let out : Array[(Int, Int)] = []
+  let mut i = start
+  while i < end {
+    let mut fa = i
+    let mut fd = 0
+    while fa < end {
+      let fk = tokens[fa].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+      else if fd == 0 && fk == TokenKind::FatArrow { break }
+      fa = fa + 1
+    }
+    if fa >= end { break }
+    let bs = fa + 1
+    let mut be = bs
+    if bs < end && tokens[bs].kind == TokenKind::LBrace {
+      be = find_matching_delim(tokens, bs) + 1
+    } else if bs < end {
+      be = find_expr_end(tokens, bs, end)
+    }
+    if be > bs {
+      out.push((bs, be))
+    }
+    let mut ni = be
+    if ni < end && (tokens[ni].kind == TokenKind::Comma || tokens[ni].kind == TokenKind::Semi) {
+      ni = ni + 1
+    }
+    if ni <= i { break }
+    i = ni
+  }
+  out
+}
+
+///| Collect branch spans for `if cond { b1 } else if cond2 { b2 } else { b3 }` starting at `if_i`.
+///| Returns `(has_else, branches)` where `branches` is non-empty only when the chain ends with `else { ... }`.
+fn collect_if_else_branch_spans_f3d2(tokens : Array[Token], if_i : Int, end : Int) -> Array[(Int, Int)] {
+  let out : Array[(Int, Int)] = []
+  let mut cur = if_i
+  while cur < end && tokens[cur].kind == TokenKind::Keyword && tokens[cur].raw == "if" {
+    let mut lb = cur + 1
+    let mut d = 0
+    while lb < end {
+      let lk = tokens[lb].kind
+      if d == 0 && lk == TokenKind::LBrace {
+        if !(lb > cur + 1 && tokens[lb - 1].kind == TokenKind::ColonColon) { break }
+      }
+      if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace { d = d + 1 }
+      else if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace { if d > 0 { d = d - 1 } }
+      lb = lb + 1
+    }
+    if lb >= end || tokens[lb].kind != TokenKind::LBrace { return [] }
+    let rb = find_matching_delim(tokens, lb)
+    out.push((lb, rb + 1))
+    if rb + 2 < end && tokens[rb + 1].kind == TokenKind::Keyword && tokens[rb + 1].raw == "else" {
+      if tokens[rb + 2].kind == TokenKind::LBrace {
+        let erb = find_matching_delim(tokens, rb + 2)
+        out.push((rb + 2, erb + 1))
+        return out
+      } else if tokens[rb + 2].kind == TokenKind::Keyword && tokens[rb + 2].raw == "if" {
+        cur = rb + 2
+        continue
+      }
+    }
+    return []
+  }
+  []
+}
+
+///| Fail-closed OR-pattern reverse inference for `expr is (A | B | ...)` when `lhs_ty == ""`.
+///| Returns unique enum `E` ONLY when `symtab_sources_complete` and all top-level bare ctors intersect uniquely.
+fn infer_or_is_pattern_enum_f3d2(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+) -> String {
+  if !symtab_sources_complete(ctx.symtab) {
+    return ""
+  }
+  let mut s = start
+  let mut e = end
+  while s + 1 < e && tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e - 1 {
+    s = s + 1
+    e = e - 1
+  }
+  let ctors : Array[String] = []
+  let mut cur = s
+  let mut has_pipe = false
+  while cur < e {
+    let mut seg_e = cur
+    let mut d = 0
+    while seg_e < e {
+      let k = tokens[seg_e].kind
+      if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d = d + 1 }
+      else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && k == TokenKind::Pipe { has_pipe = true; break }
+      seg_e = seg_e + 1
+    }
+    let cn = bare_ctor_token_name_f3d2(ctx, tokens, cur, seg_e)
+    if cn.length() > 0 {
+      ctors.push(cn)
+    }
+    cur = seg_e + 1
+  }
+  if !has_pipe || ctors.length() < 2 {
+    return ""
+  }
+  let (inter, any_ambig) = symtab_intersect_ctor_enums(ctx.symtab, ctors)
+  if any_ambig && inter.length() == 1 {
+    return inter[0]
+  }
+  ""
+}
+
+///| Find end of RHS of `==` or `!=` stopping at logical operators / `{` / `,` / `)` / `;` / newline.
+fn find_eq_rhs_end_f3d2(tokens : Array[Token], rhs_start : Int, end : Int) -> Int {
+  let mut re = rhs_start
+  let mut rd = 0
+  while re < end {
+    let rk = tokens[re].kind
+    if rd == 0 && re > rhs_start && tokens[re].newline_before { break }
+    if rd == 0 && (rk == TokenKind::AmpAmp || rk == TokenKind::PipePipe ||
+      rk == TokenKind::Comma || rk == TokenKind::Semi || rk == TokenKind::LBrace ||
+      rk == TokenKind::FatArrow) { break }
+    if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+    else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace {
+      if rd == 0 { break }
+      rd = rd - 1
+    }
+    re = re + 1
+  }
+  re
+}
+
+///| Record generic type params, raw param types, and labeled/optional param names for a local fn/method.
+fn register_local_fn_meta_f3d2(
+  ctx : StageAContext,
+  fn_key : String,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  pnames : Array[String],
+  ptys : Array[String],
+) -> Unit {
+  if ctx.active_generics.length() > 0 {
+    let tps : Array[String] = []
+    for gk in sorted_map_keys(ctx.active_generics) {
+      tps.push(gk)
+    }
+    ctx.symtab.fn_type_params[fn_key] = tps
+  }
+  let raw_pts : Array[(String, String)] = []
+  let mut k = 0
+  while k < pnames.length() {
+    let pt = if k < ptys.length() { ptys[k] } else { "" }
+    raw_pts.push((pnames[k], pt))
+    k = k + 1
+  }
+  if raw_pts.length() > 0 {
+    ctx.symtab.fn_raw_param_types[fn_key] = raw_pts
+  }
+  // Scan `[open_p + 1, close_p)` at depth 0 to detect labeled (`~`) and optional (`?`) params
+  let lmap : Map[String, Bool] = Map()
+  let mut pi = open_p + 1
+  while pi < close_p {
+    if tokens[pi].kind == TokenKind::Comma { pi = pi + 1; continue }
+    let mut pe = pi
+    let mut pd = 0
+    while pe < close_p {
+      let pk = tokens[pe].kind
+      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+      else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+      else if pd == 0 && pk == TokenKind::Comma { break }
+      pe = pe + 1
+    }
+    if pi + 1 < pe && tokens[pi].kind == TokenKind::Ident &&
+    (tokens[pi + 1].kind == TokenKind::Tilde || tokens[pi + 1].kind == TokenKind::Question) {
+      lmap[tokens[pi].raw] = true
+    }
+    pi = pe + 1
+  }
+  if lmap.length() > 0 {
+    ctx.symtab.fn_labeled_params[fn_key] = lmap
+  }
+}
+
+///| Lower a tuple expression `(e0, e1, ...)` propagating element types from a tuple expected type `(T0, T1, ...)`.
+fn lower_tuple_expr_with_expected_f3d2(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  file : String,
+) -> Option[String] {
+  let cur_exp = current_expected_type(ctx).trim()
+  if !cur_exp.starts_with("(") || !cur_exp.ends_with(")") || str_has(cur_exp, "->") {
+    return None
+  }
+  if !paren_has_top_level_comma(tokens, open_p, close_p) {
+    return None
+  }
+  let exp_elems = split_top_level_type_list(cur_exp.slice(1, cur_exp.length() - 1))
+  if exp_elems.length() < 2 {
+    return None
+  }
+  let raw_elems : Array[(Int, Int)] = []
+  let mut cur = open_p + 1
+  while cur < close_p {
+    if tokens[cur].kind == TokenKind::Comma { cur = cur + 1; continue }
+    let mut ae = cur
+    let mut d = 0
+    while ae < close_p {
+      let ak = tokens[ae].kind
+      if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { d = d + 1 }
+      else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && ak == TokenKind::Comma { break }
+      ae = ae + 1
+    }
+    if ae > cur { raw_elems.push((cur, ae)) }
+    cur = ae + 1
+  }
+  if raw_elems.length() != exp_elems.length() {
+    return None
+  }
+  let lowered : Array[String] = []
+  let mut idx = 0
+  while idx < raw_elems.length() {
+    let (s, e) = raw_elems[idx]
+    let saved_exp = ctx.expected_type_stack.length()
+    push_expected_type(ctx, exp_elems[idx])
+    let piece = lower_expr_range(ctx, tokens, s, e, file, false).trim()
+    restore_expected_type_stack(ctx, saved_exp)
+    lowered.push(piece)
+    idx = idx + 1
+  }
+  Some("(" + join_comma(lowered) + ")")
+}
+
+///| Handle multi-hop field assignment/equality `x.a.b.c = rhs` / `==` / `!=` with expected type of the final field.
+fn try_lower_chained_field_assign_or_eq_f3d2(
+  ctx : StageAContext,
+  trivia : String,
+  name : String,
+  tokens : Array[Token],
+  i : Int,
+  next_i : Int,
+  end : Int,
+  file : String,
+) -> Option[(String, Int)] {
+  // Require at least 2 hops (`x.a.b`) so 1-hop `x.field` stays on its existing path (with `.val` probe handling)
+  if next_i + 4 >= end || tokens[next_i].kind != TokenKind::Dot || tokens[next_i + 1].kind != TokenKind::Ident ||
+  tokens[next_i + 2].kind != TokenKind::Dot || tokens[next_i + 3].kind != TokenKind::Ident {
+    return None
+  }
+  let mut cur = next_i
+  while cur + 1 < end && tokens[cur].kind == TokenKind::Dot && tokens[cur + 1].kind == TokenKind::Ident {
+    if tokens[cur + 1].raw == "val" {
+      return None
+    }
+    cur = cur + 2
+  }
+  if cur >= end {
+    return None
+  }
+  let op_tok = tokens[cur]
+  if op_tok.kind != TokenKind::Eq && op_tok.kind != TokenKind::EqEq && op_tok.kind != TokenKind::BangEq {
+    return None
+  }
+  let lhs_ty = infer_postfix_chain_type(ctx, tokens, i, cur).trim()
+  if lhs_ty.length() == 0 {
+    return None
+  }
+  let rhs_start = cur + 1
+  let rhs_end = if op_tok.kind == TokenKind::Eq {
+    find_expr_end(tokens, rhs_start, end)
+  } else {
+    find_eq_rhs_end_f3d2(tokens, rhs_start, end)
+  }
+  if rhs_end <= rhs_start {
+    return None
+  }
+  let lhs_sb = StringBuilder()
+  lhs_sb.write_string(name)
+  let mut p = next_i
+  while p < cur {
+    lhs_sb.write_string("." + rename_keyword_ident(tokens[p + 1].raw))
+    p = p + 2
+  }
+  let saved_exp = ctx.expected_type_stack.length()
+  push_expected_type(ctx, lhs_ty)
+  let rhs_s = lower_expr_range(ctx, tokens, rhs_start, rhs_end, file, false)
+  restore_expected_type_stack(ctx, saved_exp)
+  Some((trivia + lhs_sb.to_string() + op_tok.leading_trivia + op_tok.raw + rhs_s, rhs_end))
+}
+
+///| Look up parameter types of a local closure variable (e.g. `let told = fn(kind : DragKind, ...) { ... }`).
+fn lookup_local_closure_param_types_f3d2(ctx : StageAContext, name : String) -> Array[(String, String)] {
+  let out : Array[(String, String)] = []
+  match lookup_scope_var(ctx, name) {
+    Some(sv) => {
+      let ptys = extract_expected_fn_param_types(sv.ty)
+      let mut i = 0
+      while i < ptys.length() {
+        out.push(("_p" + i.to_string(), ptys[i]))
+        i = i + 1
+      }
+    }
+    None => ()
+  }
+  out
+}
