@@ -42,6 +42,7 @@ filllive(Fn *f)
 	Ins *i;
 	int k, t, m[2], n, first, chg, nlv[2];
 	BSet u[1], v[1];
+	uchar *dirty = alloc(f->nblk * sizeof *dirty);
 	Mem *ma;
 
 	bsinit(u, f->ntmp);
@@ -56,6 +57,9 @@ filllive(Fn *f)
 Again:
 	for (n=f->nblk-1; n>=0; n--) {
 		b = f->rpo[n];
+		if (!first && !dirty[b->id])
+			continue;
+		dirty[b->id] = 0;
 
 		bscopy(u, b->out);
 		if (b->s1) {
@@ -134,6 +138,10 @@ Again:
 				if (nlv[k] > b->nlive[k])
 					b->nlive[k] = nlv[k];
 		}
+		/* Only predecessors read this block's input. Mark even when
+		 * its transfer happened to reproduce the previous input. */
+		for (uint j=0; j<b->npred; j++)
+			dirty[b->pred[j]->id] = 1;
 	}
 	if (chg) {
 		first = 0;

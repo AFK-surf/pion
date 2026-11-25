@@ -156,6 +156,7 @@ enum {
 
 static uchar lexh[1 << (32-M)];
 static FILE *inf;
+static int lookbyte;
 static char *inpath;
 static int thead;
 static struct {
@@ -227,13 +228,12 @@ nextbyte(void)
 }
 
 static int64_t
-getint()
+getint(int c)
 {
 	uint64_t n;
-	int c, m;
+	int m;
 
 	n = 0;
-	c = nextbyte();
 	m = (c == '-');
 	if (m) {
 		c = nextbyte();
@@ -244,7 +244,7 @@ getint()
 		n = 10*n + (c - '0');
 		c = nextbyte();
 	} while (isdigit(c));
-	ungetc(c, inf);
+	lookbyte = c;
 	if (m)
 		n = 1 + ~n;
 	return *(int64_t *)&n;
@@ -256,9 +256,10 @@ lex()
 	int c, i, esc;
 	int t;
 
-	do
+	c = lookbyte == EOF ? nextbyte() : lookbyte;
+	lookbyte = EOF;
+	while (isblank(c))
 		c = nextbyte();
-	while (isblank(c));
 	t = Txxx;
 	tokval.chr = c;
 	switch (c) {
@@ -279,13 +280,20 @@ lex()
 	case '+':
 		return Tplus;
 	case 's':
-		if (fscanf(inf, "_%f", &tokval.flts) != 1)
-			break;
-		return Tflts;
 	case 'd':
-		if (fscanf(inf, "_%lf", &tokval.fltd) != 1)
-			break;
-		return Tfltd;
+		i = nextbyte();
+		if (i != '_') {
+			tokval.str[0] = c;
+			c = i;
+			i = 1;
+			goto More;
+		}
+		if (c == 's') {
+			if (fscanf(inf, "%f", &tokval.flts) == 1)
+				return Tflts;
+		} else if (fscanf(inf, "%lf", &tokval.fltd) == 1)
+			return Tfltd;
+		break;
 	case '%':
 		t = Ttmp;
 		c = nextbyte();
@@ -312,8 +320,7 @@ lex()
 		return Tnl;
 	}
 	if (isdigit(c) || c == '-') {
-		ungetc(c, inf);
-		tokval.num = getint();
+		tokval.num = getint(c);
 		return Tint;
 	}
 	if (c == '"') {
@@ -338,15 +345,18 @@ lex()
 Alpha:
 	if (!isalpha(c) && c != '.' && c != '_')
 		err("invalid character %c (%d)", c, c);
-	i = 0;
-	do {
+	tokval.str[0] = c;
+	i = 1;
+	c = nextbyte();
+More:
+	while (isalpha(c) || c == '$' || c == '.' || c == '_' || isdigit(c)) {
 		if (i >= 127)
 			vgrow(&tokval.str, i+2);
 		tokval.str[i++] = c;
 		c = nextbyte();
-	} while (isalpha(c) || c == '$' || c == '.' || c == '_' || isdigit(c));
+	}
 	tokval.str[i] = 0;
-	ungetc(c, inf);
+	lookbyte = c;
 	if (t != Txxx) {
 		return t;
 	}
@@ -1281,6 +1291,7 @@ parse(FILE *f, char *path, void dbgfile(char *), void data(Dat *), void func(Fn 
 
 	lexinit();
 	inf = f;
+	lookbyte = EOF;
 	inpath = path;
 	lnum = 1;
 	thead = Txxx;

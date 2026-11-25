@@ -51,14 +51,14 @@ sethint(int t, int r)
 	}
 }
 
+/* Block snapshots use the ordered bindings. Only the entry snapshot
+ * also needs to query and reserve physical registers during edge moves. */
 static void
-rcopy(RMap *ma, RMap *mb)
+snapshot(RMap *dst, RMap *src)
 {
-	memcpy(ma->t, mb->t, sizeof ma->t);
-	memcpy(ma->r, mb->r, sizeof ma->r);
-	memcpy(ma->w, mb->w, sizeof ma->w);
-	bscopy(ma->b, mb->b);
-	ma->n = mb->n;
+	memcpy(dst->t, src->t, src->n * sizeof src->t[0]);
+	memcpy(dst->r, src->r, src->n * sizeof src->r[0]);
+	dst->n = src->n;
 }
 
 static int
@@ -642,7 +642,8 @@ rega(Fn *fn)
 {
 	int j, t, r, x, rl[Tmp0];
 	Blk *b, *b1, *s, *blist, **blk, **bp;
-	RMap *end, *beg, cur, old, *m;
+	RMap *end, *beg, cur, *m;
+	bits *entryregs;
 	uchar *allocd;
 	Ins *i;
 	Phi *p;
@@ -659,12 +660,8 @@ rega(Fn *fn)
 	end = alloc(fn->nblk * sizeof end[0]);
 	beg = alloc(fn->nblk * sizeof beg[0]);
 	allocd = alloc(fn->nblk * sizeof allocd[0]);
-	for (n=0; n<fn->nblk; n++) {
-		bsinit(end[n].b, fn->ntmp);
-		bsinit(beg[n].b, fn->ntmp);
-	}
+	entryregs = alloc(fn->nblk * sizeof *entryregs);
 	bsinit(cur.b, fn->ntmp);
-	bsinit(old.b, fn->ntmp);
 
 	loop = 0;
 	for (t=0; t<fn->ntmp; t++) {
@@ -747,13 +744,14 @@ rega(Fn *fn)
 			for (r = T.gpr0; r < T.gpr0 + T.ngpr; r++)
 				if (T.jtblclob & BIT(r))
 					rfree(&cur, r);
-		rcopy(&end[n], &cur);
+		snapshot(&end[n], &cur);
 		doblk(b, &cur);
 		bscopy(b->in, cur.b);
 		for (p=b->phi; p; p=p->link)
 			if (rtype(p->to) == RTmp)
 				bsclr(b->in, p->to.val);
-		rcopy(&beg[n], &cur);
+		snapshot(&beg[n], &cur);
+		entryregs[n] = cur.b->t[0];
 		allocd[n] = 1;
 	}
 
@@ -812,10 +810,10 @@ rega(Fn *fn)
 			r = m->r[j];
 			x = rl[r];
 			assert(x != 0 || t < Tmp0 /* todo, ditto */);
-			if (x > 0 && !bshas(m->b, x)) {
+			if (x > 0 && !(entryregs[s->id] & BIT(x))) {
 				pmadd(TMP(x), TMP(r), tmp[t].cls);
 				m->r[j] = x;
-				bsset(m->b, x);
+				entryregs[s->id] |= BIT(x);
 			}
 		}
 		curi = &insb[NIns];

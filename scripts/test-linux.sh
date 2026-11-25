@@ -645,6 +645,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p113_amd64_fp_dep_and_cvt_width/run_e2
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC"
 # P115: cross-package struct literal type probe uses canonical package ids (method symbols, SSA + Native + Wasm32).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2e.sh" "$PIONC"
+# P116: Opt-Track P byte-identical compile-speed changes (QBE 1-byte lexer lookahead, filllive worklist, philive projected phi liveness, rega compact snapshots next to sinktablehomes, Mach-O keep/gen GPR masks, main-thread first unit; checking QBE oracles with ASan+UBSan on 4 targets, host C differential, --jobs 1/2/4/8 parity).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
