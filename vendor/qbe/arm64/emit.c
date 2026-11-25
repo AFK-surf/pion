@@ -426,8 +426,11 @@ loadcon(Con *c, int r, int k, E *e)
 	}
 	if (!w)
 		n = (int32_t)n;
-	if ((n >= 0 && n <= 0xffff) || (n | 0xffff) == -1) {
+	if (n >= 0 && n <= 0xffff) {
 		fprintf(e->f, "\tmov\t%s, #%"PRIi64"\n", rn, n);
+	} else if ((n | 0xffff) == -1) {
+		/* Spell movn like macho.c: `mov w, #-65536` may assemble as movz. */
+		fprintf(e->f, "\tmovn\t%s, #%u\n", rn, (uint)(~n & 0xffff));
 	} else if (arm64_logimm(n, k)) {
 		/* A mov alias may assemble as a different move-wide instruction. */
 		fprintf(e->f, "\torr\t%s, %s, #0x%"PRIx64"\n", rn,

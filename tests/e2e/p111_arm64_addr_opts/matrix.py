@@ -1,6 +1,8 @@
 """P111 matrix and object-text helpers (stdlib only).
 
   matrix.py gen OUT.ssa            write the imm9 (4,608) + localaddr (112) cases
+  matrix.py consts OUT.ssa         write every W/X logical immediate (6,636) and
+                                   the movz/movn edges as `ret <const>` cases
   matrix.py text OBJ OUT.bin       executable section bytes of a Mach-O / ELF object
   matrix.py imm9 BIN               count negative signed-imm9 ldur/stur words
 """
@@ -42,6 +44,42 @@ def gen(out):
         for i, (sig, body) in enumerate(items)))
 
 
+def logical_immediates(width):
+    # Every AArch64 bitmask immediate of `width` bits: an element of 2..64
+    # bits holding a rotated run of 1..esize-1 ones, replicated.
+    out = set()
+    esize = 2
+    while esize <= width:
+        for ones in range(1, esize):
+            run = (1 << ones) - 1
+            for rot in range(esize):
+                elt = ((run >> rot) | (run << (esize - rot))) & ((1 << esize) - 1)
+                v = 0
+                for i in range(0, width, esize):
+                    v |= elt << i
+                out.add(v)
+        esize *= 2
+    return sorted(out)
+
+
+def signed(v, width):
+    return v - (1 << width) if v >> (width - 1) else v
+
+
+MOVE_EDGES = [0, 1, 0xffff, 0x10000, -1, -2, -0xffff, -0x10000, -0x10001, 0x7fffffff, -0x80000000]
+
+
+def consts(out):
+    items = []
+    for k, width in (('w', 32), ('l', 64)):
+        vals = [signed(v, width) for v in logical_immediates(width)]
+        vals += [v for v in MOVE_EDGES if -(1 << (width - 1)) <= v < (1 << (width - 1))]
+        items += [(k, v) for v in vals]
+    assert sum(1 for k, v in items) == 1302 + 5334 + 2 * len(MOVE_EDGES)
+    Path(out).write_text(''.join(
+        f'export function {k} $c{i}() {{\n@start\n  ret {v}\n}}\n' for i, (k, v) in enumerate(items)))
+
+
 def text(path):
     b = Path(path).read_bytes()
     if b[:4] == b'\x7fELF':
@@ -79,6 +117,8 @@ if __name__ == '__main__':
     cmd = sys.argv[1]
     if cmd == 'gen':
         gen(sys.argv[2])
+    elif cmd == 'consts':
+        consts(sys.argv[2])
     elif cmd == 'text':
         Path(sys.argv[3]).write_bytes(text(sys.argv[2]))
     elif cmd == 'imm9':

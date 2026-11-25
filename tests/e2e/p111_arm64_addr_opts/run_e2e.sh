@@ -13,12 +13,16 @@
 #   1. text asm (arm64 + arm64_apple) shapes of addr.ssa, and 4,608 negative
 #      offsets in the generated matrix (matrix.py: 256 offsets x 18 forms,
 #      plus 112 local-slot cases);
-#   2. execution: native AArch64 (Linux / Darwin) or aarch64 cross + qemu;
-#   3. Darwin ARM64: direct Mach-O (--obj) == `.s -> cc` __text byte for byte
-#      for addr.ssa and the matrix, and the Linux ARM64 ELF matrix text
-#      assembled by clang from `-t arm64` equals the Mach-O text; on other
-#      hosts the ELF matrix assembled by clang and/or GNU as has all 4,608
-#      ldur/stur words (and both assemblers agree byte for byte).
+#   2. constants (loadcon): every W/X logical immediate (6,636) as
+#      `orr rd, zr, #imm` plus the movz/movn edges (`w -65536` -> movn);
+#   3. Mach-O --obj == `.s -> assembler` __text byte for byte for addr.ssa,
+#      the matrix and the constants (system cc on Darwin, clang
+#      --target=arm64-apple-macos12 elsewhere); Linux ARM64 ELF matrix and
+#      constant text (clang) == Mach-O text; GNU as == clang ELF bytes;
+#   4. execution: Darwin ARM64 (.s and --obj), native Linux AArch64, or
+#      aarch64 cross + qemu.
+# An assembler is "missing" (SKIP) only if it cannot assemble a lone `nop`;
+# after that probe every real assembly must succeed.
 set -eu
 
 PIONC="${1:-}"
@@ -27,7 +31,7 @@ HERE=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 ROOT_DIR=$(CDPATH= cd -- "$HERE/../../.." && pwd)
 QBE="${PION_QBE:-$ROOT_DIR/out/qbe}"
 CC="${CC:-cc}"
-EXPECT="local_struct=12345699e local_array=13ec bigframe=20406092b4 unaligned=30052 sub_slot=0
+EXPECT="local_struct=12345699e local_array=13ec bigframe=20406092b4 unaligned=30052 sub_mid=2a
 hdr_w=5eed1234 neg_loads=ee9c49f52e4f650 neg_257=ffffffffffffffe6 neg_twice=be99744f2a05e0c0 mem=34c5fd20bbe6806c"
 NMATRIX=4608
 
@@ -78,6 +82,7 @@ check_asm() { # $1 asm, $2 label
   [ "$(count "$1" sub_slot 'sub[[:space:]]+x[0-9]+, x[0-9]+, #8')" -eq 1 ] || fail "$1" sub_slot "slot - 8 must not fold"
   [ "$(count "$1" sub_slot 'ldr[[:space:]]+x[0-9]+, \[x29, #?24\]')" -eq 0 ] || fail "$1" sub_slot "slot - 8 folded as slot + 8"
   [ "$(count "$1" sub_slot 'ldr[[:space:]]+x[0-9]+, \[x[0-9]+\]')" -eq 1 ] || fail "$1" sub_slot "slot - 8 must load through a register"
+  [ "$(count "$1" sub_mid 'ldr[[:space:]]+x0, \[x29, #?24\]')" -eq 1 ] || fail "$1" sub_mid "(p + 16) - 8 must read p + 8"
   [ "$(count "$1" hdr_w 'ldr[[:space:]]+w0, \[x0, #-24\]')" -eq 1 ] || fail "$1" hdr_w "no ldur w0, [x0, #-24]"
   [ "$(count "$1" hdr_w 'sub[[:space:]]')" -eq 0 ] || fail "$1" hdr_w "sub left behind"
   [ "$(count "$1" neg_loads "$NEG")" -eq 10 ] || fail "$1" neg_loads "expected 10 negative-offset loads"
@@ -139,21 +144,109 @@ imm9_words() { # $1 obj
 
 UNAME_M="$(uname -m)"
 UNAME_S="$(uname -s)"
+IS_DARWIN_ARM64=0
 if [ "$UNAME_S" = Darwin ] && { [ "$UNAME_M" = arm64 ] || [ "$UNAME_M" = aarch64 ]; }; then
-  for c in addr matrix; do
-    "$CC" -c "$TMP_DIR/${c}_arm64_apple.s" -o "$TMP_DIR/${c}_asm.o"
-    src="$TMP_DIR/matrix.ssa"
+  IS_DARWIN_ARM64=1
+fi
+
+# An assembler counts as present only if it assembles a lone `nop`; once the
+# probe passes, every real assembly below must succeed (set -e), never SKIP.
+printf '\tnop\n' > "$TMP_DIR/probe.s"
+APPLE_AS=""
+if [ "$IS_DARWIN_ARM64" = 1 ]; then
+  APPLE_AS="$CC -c"
+elif command -v clang >/dev/null 2>&1 \
+&& clang --target=arm64-apple-macos12 -c "$TMP_DIR/probe.s" -o "$TMP_DIR/probe_m.o" 2>/dev/null; then
+  APPLE_AS="clang --target=arm64-apple-macos12 -c"
+fi
+ELF_CLANG=0
+if command -v clang >/dev/null 2>&1 \
+&& clang --target=aarch64-linux-gnu -c "$TMP_DIR/probe.s" -o "$TMP_DIR/probe_e.o" 2>/dev/null; then
+  ELF_CLANG=1
+fi
+GAS=0
+if command -v aarch64-linux-gnu-as >/dev/null 2>&1 \
+&& aarch64-linux-gnu-as -o "$TMP_DIR/probe_g.o" "$TMP_DIR/probe.s" 2>/dev/null; then
+  GAS=1
+fi
+
+# Constant materialization (loadcon): every W/X logical immediate as
+# `orr rd, zr, #imm`, and the movz/movn edges; `w -65536` must be spelled
+# `movn w0, #65535` (a `mov` alias may assemble as movz ..., lsl #16).
+python3 -I "$HERE/matrix.py" consts "$TMP_DIR/consts.ssa"
+for t in arm64 arm64_apple; do
+  "$QBE" -t "$t" -o "$TMP_DIR/consts_$t.s" "$TMP_DIR/consts.ssa"
+  if ! grep -qE 'movn[[:space:]]+w0, #65535$' "$TMP_DIR/consts_$t.s"; then
+    echo "FAIL[$t]: w -65536 is not spelled movn w0, #65535" >&2
+    exit 1
+  fi
+done
+echo "[PASS] text asm: w -65536 -> movn w0, #65535"
+
+# Mach-O --obj == `.s -> assembler` __text, byte for byte.
+if [ -n "$APPLE_AS" ]; then
+  for c in addr matrix consts; do
+    src="$TMP_DIR/$c.ssa"
     [ "$c" = addr ] && src="$HERE/addr.ssa"
+    $APPLE_AS "$TMP_DIR/${c}_arm64_apple.s" -o "$TMP_DIR/${c}_asm.o"
     "$QBE" -t arm64_apple --obj -o "$TMP_DIR/${c}_obj.o" "$src"
-    same_text "$TMP_DIR/${c}_obj.o" "$TMP_DIR/${c}_asm.o" "$c: Mach-O --obj vs .s -> cc __text"
+    same_text "$TMP_DIR/${c}_obj.o" "$TMP_DIR/${c}_asm.o" "$c: Mach-O --obj vs .s -> $APPLE_AS __text"
   done
+  n=$(imm9_words "$TMP_DIR/matrix_obj.o")
+  [ "$n" -eq "$NMATRIX" ] || { echo "FAIL: --obj matrix has $n ldur/stur imm9 words, expected $NMATRIX" >&2; exit 1; }
+  m=$(imm9_words "$TMP_DIR/addr_obj.o")
+  [ "$m" -eq 17 ] || { echo "FAIL: --obj addr.ssa has $m ldur/stur imm9 words, expected 17" >&2; exit 1; }
+  echo "[PASS] Mach-O --obj: $n + $m negative ldur/stur words"
+else
+  echo "[SKIP] no Mach-O arm64 assembler (--obj byte parity)"
+fi
+
+# Linux ARM64 ELF. addr.ssa is not compared with Mach-O: its store fallbacks
+# use x18 on Linux and x17 on Apple, where x18 is the platform register.
+if [ "$ELF_CLANG" = 1 ]; then
+  for c in addr matrix consts; do
+    clang --target=aarch64-linux-gnu -c "$TMP_DIR/${c}_arm64.s" -o "$TMP_DIR/${c}_elf.o"
+  done
+  n=$(imm9_words "$TMP_DIR/matrix_elf.o")
+  m=$(imm9_words "$TMP_DIR/addr_elf.o")
+  if [ "$n" -ne "$NMATRIX" ] || [ "$m" -ne 17 ]; then
+    echo "FAIL: clang ELF: $n + $m negative ldur/stur words, expected $NMATRIX + 17" >&2
+    exit 1
+  fi
+  echo "[PASS] clang aarch64-linux-gnu: $NMATRIX + 17 negative ldur/stur words"
+  if [ -n "$APPLE_AS" ]; then
+    for c in matrix consts; do
+      same_text "$TMP_DIR/${c}_elf.o" "$TMP_DIR/${c}_obj.o" "$c: Linux ARM64 ELF text vs Mach-O --obj"
+    done
+  fi
+else
+  echo "[SKIP] no clang for aarch64-linux-gnu (ELF checks)"
+fi
+if [ "$GAS" = 1 ]; then
+  # GNU as must pick the same encodings (unscaled ldur/stur, orr, movn).
+  for c in addr matrix consts; do
+    aarch64-linux-gnu-as -o "$TMP_DIR/${c}_gas.o" "$TMP_DIR/${c}_arm64.s"
+  done
+  n=$(imm9_words "$TMP_DIR/matrix_gas.o")
+  m=$(imm9_words "$TMP_DIR/addr_gas.o")
+  if [ "$n" -ne "$NMATRIX" ] || [ "$m" -ne 17 ]; then
+    echo "FAIL: GNU as: $n + $m negative ldur/stur words, expected $NMATRIX + 17" >&2
+    exit 1
+  fi
+  if [ "$ELF_CLANG" = 1 ]; then
+    for c in addr matrix consts; do
+      same_text "$TMP_DIR/${c}_gas.o" "$TMP_DIR/${c}_elf.o" "$c: GNU as vs clang aarch64 ELF text"
+    done
+  fi
+  echo "[PASS] GNU as aarch64: $NMATRIX + 17 negative ldur/stur words"
+fi
+
+# Execution.
+if [ "$IS_DARWIN_ARM64" = 1 ]; then
   for v in asm obj; do
     "$CC" -O2 "$HERE/driver.c" "$TMP_DIR/addr_$v.o" -o "$TMP_DIR/run_$v"
     check_run "arm64_apple $v" "$("$TMP_DIR/run_$v")"
   done
-  n=$(imm9_words "$TMP_DIR/matrix_obj.o")
-  [ "$n" -eq "$NMATRIX" ] || { echo "FAIL: --obj matrix has $n ldur/stur imm9 words, expected $NMATRIX" >&2; exit 1; }
-  echo "[PASS] Mach-O --obj matrix: $n negative ldur/stur words"
   if command -v otool >/dev/null 2>&1; then
     for v in asm obj; do
       n=$(otool -tV "$TMP_DIR/addr_$v.o" | grep -cE '(ldur|stur)[a-z]*[[:space:]].*#-' || true)
@@ -161,49 +254,13 @@ if [ "$UNAME_S" = Darwin ] && { [ "$UNAME_M" = arm64 ] || [ "$UNAME_M" = aarch64
     done
     echo "[PASS] otool -tV: 17 ldur/stur in both objects"
   fi
-  # Linux ARM64 ELF text of the matrix (same instruction stream, ELF
-  # directives). addr.ssa is not compared: its store fallbacks use x18 on
-  # Linux and x17 on Apple, where x18 is the platform register.
-  if clang --target=aarch64-linux-gnu -c "$TMP_DIR/matrix_arm64.s" -o "$TMP_DIR/matrix_elf.o" 2>/dev/null; then
-    same_text "$TMP_DIR/matrix_elf.o" "$TMP_DIR/matrix_obj.o" "matrix: Linux ARM64 ELF text vs Mach-O --obj"
-  else
-    echo "[SKIP] clang cannot assemble aarch64-linux-gnu"
-  fi
+elif [ "$UNAME_S" = Linux ] && { [ "$UNAME_M" = aarch64 ] || [ "$UNAME_M" = arm64 ]; }; then
+  "$CC" -O2 "$HERE/driver.c" "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/run_arm64"
+  check_run "linux arm64 native" "$("$TMP_DIR/run_arm64")"
+elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && command -v qemu-aarch64 >/dev/null 2>&1; then
+  aarch64-linux-gnu-gcc -static -O2 "$HERE/driver.c" "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/run_arm64"
+  check_run "aarch64 qemu" "$(qemu-aarch64 "$TMP_DIR/run_arm64")"
 else
-  if command -v clang >/dev/null 2>&1 \
-  && clang --target=aarch64-linux-gnu -c "$TMP_DIR/matrix_arm64.s" -o "$TMP_DIR/matrix_elf.o" 2>/dev/null; then
-    n=$(imm9_words "$TMP_DIR/matrix_elf.o")
-    [ "$n" -eq "$NMATRIX" ] || { echo "FAIL: ELF matrix has $n ldur/stur imm9 words, expected $NMATRIX" >&2; exit 1; }
-    clang --target=aarch64-linux-gnu -c "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/addr_elf.o"
-    n=$(imm9_words "$TMP_DIR/addr_elf.o")
-    [ "$n" -eq 17 ] || { echo "FAIL: ELF addr.ssa has $n ldur/stur imm9 words, expected 17" >&2; exit 1; }
-    echo "[PASS] clang aarch64-linux-gnu: $NMATRIX + 17 negative ldur/stur words"
-  else
-    echo "[SKIP] no clang for aarch64-linux-gnu (ELF word checks)"
-  fi
-  if command -v aarch64-linux-gnu-as >/dev/null 2>&1; then
-    # GNU as must pick the same unscaled forms for `ldr/str [x, #-k]`.
-    aarch64-linux-gnu-as -o "$TMP_DIR/matrix_gas.o" "$TMP_DIR/matrix_arm64.s"
-    aarch64-linux-gnu-as -o "$TMP_DIR/addr_gas.o" "$TMP_DIR/addr_arm64.s"
-    n=$(imm9_words "$TMP_DIR/matrix_gas.o")
-    m=$(imm9_words "$TMP_DIR/addr_gas.o")
-    if [ "$n" -ne "$NMATRIX" ] || [ "$m" -ne 17 ]; then
-      echo "FAIL: GNU as: $n + $m negative ldur/stur words, expected $NMATRIX + 17" >&2
-      exit 1
-    fi
-    if [ -f "$TMP_DIR/matrix_elf.o" ]; then
-      same_text "$TMP_DIR/matrix_gas.o" "$TMP_DIR/matrix_elf.o" "matrix: GNU as vs clang aarch64 ELF text"
-    fi
-    echo "[PASS] GNU as aarch64: $NMATRIX + 17 negative ldur/stur words"
-  fi
-  if [ "$UNAME_S" = Linux ] && { [ "$UNAME_M" = aarch64 ] || [ "$UNAME_M" = arm64 ]; }; then
-    "$CC" -O2 "$HERE/driver.c" "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/run_arm64"
-    check_run "linux arm64 native" "$("$TMP_DIR/run_arm64")"
-  elif command -v aarch64-linux-gnu-gcc >/dev/null 2>&1 && command -v qemu-aarch64 >/dev/null 2>&1; then
-    aarch64-linux-gnu-gcc -static -O2 "$HERE/driver.c" "$TMP_DIR/addr_arm64.s" -o "$TMP_DIR/run_arm64"
-    check_run "aarch64 qemu" "$(qemu-aarch64 "$TMP_DIR/run_arm64")"
-  else
-    echo "[SKIP] P111 execution: not AArch64 and no aarch64-linux-gnu-gcc + qemu-aarch64"
-  fi
+  echo "[SKIP] P111 execution: not AArch64 and no aarch64-linux-gnu-gcc + qemu-aarch64"
 fi
-echo "P111 arm64 local-slot and imm9 address folding: OK"
+echo "P111 arm64 local-slot, imm9 address folding and constant parity: OK"
