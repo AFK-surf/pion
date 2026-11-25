@@ -190,6 +190,70 @@ fn find_method_dot_at_col(line_text : String, method_name : String, col : Int) -
   best
 }
 
+///| Index of the `"` closing the string literal opened at `q` on `s`, skipping escapes and `\{...}`
+///| interpolations (whose code may hold quotes, parens and commas); `-1` if it does not close on `s`.
+fn skip_string_lit(s : String, q : Int) -> Int {
+  let mut i = q + 1
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c == 92 {
+      if i + 1 < s.length() && s.code_unit_at(i + 1) == 123 {
+        let k = skip_string_interp(s, i + 1)
+        if k < 0 {
+          return -1
+        }
+        i = k + 1
+      } else {
+        i = i + 2
+      }
+    } else if c == 34 {
+      return i
+    } else {
+      i = i + 1
+    }
+  }
+  -1
+}
+
+///| Index of the `}` closing the interpolation whose `{` is at `b` on `s`; `-1` if it does not close on `s`.
+fn skip_string_interp(s : String, b : Int) -> Int {
+  let mut depth = 1
+  let mut i = b + 1
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if c == 34 {
+      let k = skip_string_lit(s, i)
+      if k < 0 {
+        return -1
+      }
+      i = k
+    } else if c == 39 {
+      let mut k = i + 1
+      if k < s.length() && s.code_unit_at(k) == 92 {
+        k = k + 2
+      } else {
+        k = k + 1
+      }
+      while k < s.length() && s.code_unit_at(k) != 39 {
+        k = k + 1
+      }
+      if k >= s.length() {
+        return -1
+      }
+      i = k
+    } else if c == 123 {
+      depth = depth + 1
+    } else if c == 125 {
+      depth = depth - 1
+      if depth == 0 {
+        return i
+      }
+    }
+    i = i + 1
+  }
+  -1
+}
+
 ///| Rewrite a missing method call at `(lidx, col)` -> `helper(recv, args)`.
 ///| Supports:
 ///| - Column-precise disambiguation when multiple `.m(...)` calls share one line
@@ -223,7 +287,13 @@ fn rewrite_method_call_at(
         else if c == 92 { esc = true }
         else if c == 34 { in_s = false }
       } else if c == 34 {
-        in_s = true
+        // Skip the whole literal so quotes / parens inside `\{...}` interpolations are not call syntax.
+        let k = skip_string_lit(aln, j)
+        if k < 0 {
+          in_s = true
+        } else {
+          j = k
+        }
       } else if c == 47 && j + 1 < aln.length() && aln.code_unit_at(j + 1) == 47 {
         break
       } else if c == 40 {
@@ -525,6 +595,213 @@ fn rewrite_method_call_at(
   lines[cur_l] = first_ln.slice(0, recv_start) + eff_helper + "(" + first_ln.slice(recv_start, first_ln.length())
   lines[lidx] = line_text.slice(0, dot_idx) + close_call + tail
   true
+}
+
+///| True iff the trimmed argument `piece` is a labelled / punned argument (`x=v`, `x?=v`, `x~`).
+fn unsafe_index_arg_is_labelled(piece : String) -> Bool {
+  let t = piece.trim()
+  if t.length() == 0 {
+    return false
+  }
+  if t.code_unit_at(t.length() - 1) == 126 {
+    return true
+  }
+  if !is_alpha(t.code_unit_at(0)) {
+    return false
+  }
+  let mut k = 1
+  while k < t.length() && is_alnum(t.code_unit_at(k)) {
+    k = k + 1
+  }
+  while k < t.length() && (t.code_unit_at(k) == 32 || t.code_unit_at(k) == 9) {
+    k = k + 1
+  }
+  if k < t.length() && t.code_unit_at(k) == 63 {
+    k = k + 1
+  }
+  k < t.length() && t.code_unit_at(k) == 61 && !(k + 1 < t.length() && t.code_unit_at(k + 1) == 61)
+}
+
+///| Wave M2-F3e: lower `Array[T]` / `FixedArray[T]` `recv.unsafe_get(i)` to native `recv[i]` and
+///| `recv.unsafe_set(i, v)` to `{ recv[i] = v }` instead of a cross-package generic helper call.
+///| Pion evaluates `recv`, then `i`, then `v` (left to right) for both `recv[i]` and `recv[i] = v`, accepts
+///| any receiver expression (`get_arr()[i] = v`), and a `{ ... }` block is valid in statement and expression
+///| position, so this preserves MoonBit semantics exactly. Fails closed (returns `-1`; the caller falls back
+///| to the `mbt_compat` helper) on anything else: a receiver not wholly on the diagnostic line, a wrong
+///| positional argument count, labelled arguments, `/*` or multi-line strings inside the argument list.
+///| `//` line comments inside the arguments are kept, each commented argument ending with a newline.
+///| Returns the last source line the rewritten call spanned.
+fn rewrite_unsafe_index_at(lines : Array[String], lidx : Int, col : Int, method_name : String) -> Int {
+  let want_args = if method_name == "unsafe_get" { 1 } else if method_name == "unsafe_set" { 2 } else { 0 }
+  if want_args == 0 {
+    return -1
+  }
+  let line_text = lines[lidx]
+  let dot_idx = find_method_dot_at_col(line_text, method_name, col)
+  if dot_idx < 0 {
+    return -1
+  }
+  // 1. Argument list up to the matching `)` (may span lines), split at depth-0 commas.
+  let pieces : Array[String] = []
+  let commented : Array[Bool] = []
+  let mut cur = ""
+  let mut cur_comment = false
+  let mut depth = 0
+  let mut in_c = false
+  let mut esc = false
+  let mut end_l = lidx
+  let mut j = dot_idx + method_name.length() + 2
+  let mut seg_start = j
+  let mut close_j = -1
+  while end_l < lines.length() {
+    let ln = lines[end_l]
+    while j < ln.length() {
+      let c = ln.code_unit_at(j)
+      if in_c {
+        if esc {
+          esc = false
+        } else if c == 92 {
+          esc = true
+        } else if c == 39 {
+          in_c = false
+        }
+      } else if c == 34 {
+        // A whole literal, interpolations included; one that does not close on this line fails closed.
+        let k = skip_string_lit(ln, j)
+        if k < 0 {
+          return -1
+        }
+        j = k
+      } else if c == 39 {
+        in_c = true
+      } else if c == 47 && j + 1 < ln.length() && ln.code_unit_at(j + 1) == 42 {
+        return -1
+      } else if c == 47 && j + 1 < ln.length() && ln.code_unit_at(j + 1) == 47 {
+        cur_comment = true
+        j = ln.length()
+        break
+      } else if c == 35 && j + 1 < ln.length() && ln.code_unit_at(j + 1) == 124 {
+        return -1
+      } else if c == 40 || c == 91 || c == 123 {
+        depth = depth + 1
+      } else if c == 41 || c == 93 || c == 125 {
+        if depth == 0 {
+          if c != 41 {
+            return -1
+          }
+          close_j = j
+          break
+        }
+        depth = depth - 1
+      } else if c == 44 && depth == 0 {
+        pieces.push(cur + ln.slice(seg_start, j))
+        commented.push(cur_comment)
+        cur = ""
+        cur_comment = false
+        seg_start = j + 1
+      }
+      j = j + 1
+    }
+    if close_j >= 0 {
+      break
+    }
+    if in_c {
+      return -1
+    }
+    cur = cur + ln.slice(seg_start, ln.length()) + "\n"
+    end_l = end_l + 1
+    j = 0
+    seg_start = 0
+  }
+  if close_j < 0 {
+    return -1
+  }
+  pieces.push(cur + lines[end_l].slice(seg_start, close_j))
+  commented.push(cur_comment)
+  if pieces.length() > 1 && pieces[pieces.length() - 1].trim().length() == 0 {
+    let _ = pieces.pop()
+    let _ = commented.pop()
+  }
+  if pieces.length() != want_args {
+    return -1
+  }
+  let args : Array[String] = []
+  let mut ai = 0
+  while ai < pieces.length() {
+    // Label check on the code lines only (a whole-line `//` comment may precede `name=`).
+    let mut code = ""
+    for pl in pieces[ai].split("\n") {
+      if !pl.trim().starts_with("//") {
+        code = code + pl + "\n"
+      }
+    }
+    if code.trim().length() == 0 || unsafe_index_arg_is_labelled(code) {
+      return -1
+    }
+    // A commented argument keeps a trailing newline so the comment never swallows `]` / `}`.
+    args.push(if commented[ai] { pieces[ai].trim() + "\n" } else { pieces[ai].trim() })
+    ai = ai + 1
+  }
+  // 2. Receiver: a postfix expression ending at `dot_idx`, wholly on line `lidx`.
+  let mut rs = dot_idx - 1
+  let mut paren_d = 0
+  let mut brack_d = 0
+  while rs >= 0 {
+    let c = line_text.code_unit_at(rs)
+    if c == 41 {
+      paren_d = paren_d + 1
+    } else if c == 40 {
+      if paren_d == 0 {
+        break
+      }
+      paren_d = paren_d - 1
+    } else if c == 93 {
+      brack_d = brack_d + 1
+    } else if c == 91 {
+      if brack_d == 0 {
+        break
+      }
+      brack_d = brack_d - 1
+    } else if paren_d > 0 || brack_d > 0 {
+      if c == 34 || c == 39 {
+        return -1
+      }
+    } else if c == 58 {
+      // Only a path separator `::` belongs to the receiver; a lone `:` (`{key:a.unsafe_get(0)}`) ends it.
+      if !(rs > 0 && line_text.code_unit_at(rs - 1) == 58) {
+        break
+      }
+      rs = rs - 1
+    } else if !(is_alnum(c) || c == 46) {
+      break
+    }
+    rs = rs - 1
+  }
+  if paren_d != 0 || brack_d != 0 {
+    return -1
+  }
+  rs = rs + 1
+  if rs >= dot_idx {
+    return -1
+  }
+  let recv = line_text.slice(rs, dot_idx)
+  let rc0 = recv.code_unit_at(0)
+  if !(is_alpha(rc0) || rc0 == 40 || rc0 == 91) || recv.code_unit_at(recv.length() - 1) == 58 {
+    return -1
+  }
+  let repl = if want_args == 1 {
+    recv + "[" + args[0] + "]"
+  } else {
+    "{ " + recv + "[" + args[0] + "] = " + args[1] + " }"
+  }
+  let last = lines[end_l]
+  lines[lidx] = line_text.slice(0, rs) + repl + last.slice(close_j + 1, last.length())
+  let mut bl = lidx + 1
+  while bl <= end_l {
+    lines[bl] = ""
+    bl = bl + 1
+  }
+  end_l
 }
 
 ///| Extract the argument value for a labeled argument `name=<val>` in a call line.
@@ -1445,7 +1722,21 @@ pub fn run_stage_b_with_ops(
                   }
                   stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
                 }
-                if rewrite_method_call_at(lines, lidx, d.col, mname, helper) {
+                let direct_end = if (mname == "unsafe_get" || mname == "unsafe_set") &&
+                (rty.starts_with("Array[") || rty.starts_with("FixedArray[")) {
+                  rewrite_unsafe_index_at(lines, lidx, d.col, mname)
+                } else {
+                  -1
+                }
+                if direct_end >= 0 {
+                  let mut ml = lidx + 1
+                  while ml <= direct_end {
+                    mutated_lines[ml] = true
+                    ml = ml + 1
+                  }
+                  file_changed = true
+                  line_mutated = true
+                } else if rewrite_method_call_at(lines, lidx, d.col, mname, helper) {
                   file_changed = true
                   line_mutated = true
                   if helper == "mbt_compat::str_compare" {

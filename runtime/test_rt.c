@@ -4083,6 +4083,163 @@ static void test_utf8_paths_and_embedded_nul(int argc, char **argv) {
     printf("[PASS] utf8_paths_and_embedded_nul\n");
 }
 
+/* String spans, scalar map entries and managed String file reads
+ * (pion_str_slice_data / pion_str_concat_spans / pion_strbuf_push_slice /
+ * pion_map_scalar_entry / pion_read_file_obj). */
+static uint32_t w1_rc(const void *obj) {
+    return ((const PionHeader *)obj - 1)->local_rc;
+}
+
+static void w1_write_file(const char *path, const char *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    assert(f != NULL);
+    assert(len == 0 || fwrite(data, 1, len, f) == len);
+    assert(fclose(f) == 0);
+}
+
+static void w1_check_read(void *path, int as_bytes, int32_t expected_ok, const char *data, size_t len) {
+    int32_t ok = -1;
+    void *out = as_bytes ? pion_world_fs_read_bytes(NULL, path, &ok) : pion_world_fs_read(NULL, path, &ok);
+    assert(ok == expected_ok);
+    if (as_bytes) {
+        PionBytes *b = (PionBytes *)out;
+        assert((size_t)b->len == len && (len == 0 || memcmp(b->data, data, len) == 0));
+    } else {
+        PionString *s = (PionString *)out;
+        assert((size_t)s->len == len && s->data[len] == '\0');
+        assert(len == 0 || memcmp(s->data, data, len) == 0);
+        assert(w1_rc(s) == 1);
+    }
+    pion_rc_dec(out);
+}
+
+static void test_w1_string_span_map_entry(void) {
+    /* 1. pion_str_slice_data: interior, empty and full-length spans. */
+    static const char raw[] = {'a', 0, (char)0xe6, (char)0x97, (char)0xa5, 'z'};
+    PionString *s = (PionString *)pion_str_from_cstr(raw, (int64_t)sizeof(raw));
+    assert(pion_str_slice_data(s, 0, 6) == s->data);
+    assert(pion_str_slice_data(s, 6, 6) == s->data + 6);
+    assert(pion_str_slice_data(s, 0, 0) == s->data);
+    const char *mid = pion_str_slice_data(s, 1, 5); /* "\0日" */
+
+    /* 2. pion_str_concat_spans: zero parts, empty parts, embedded NUL, many parts. */
+    PionString *none = (PionString *)pion_str_concat_spans(0, NULL);
+    assert(none->len == 0 && none->data[0] == '\0');
+    pion_rc_dec(none);
+    PionStrSpan parts[] = {{mid, 4}, {NULL, 0}, {s->data, 1}, {mid, 4}, {s->data + 5, 1}};
+    PionString *joined = (PionString *)pion_str_concat_spans(5, parts);
+    assert(joined->len == 10 && joined->data[10] == '\0');
+    assert(memcmp(joined->data, "\0\xe6\x97\xa5" "a" "\0\xe6\x97\xa5" "z", 10) == 0);
+    assert(joined != s && w1_rc(s) == 1 && w1_rc(joined) == 1);
+    pion_rc_dec(joined);
+    PionStrSpan many[40];
+    for (int i = 0; i < 40; i++) {
+        many[i].data = s->data + (i % 6);
+        many[i].len = 1;
+    }
+    PionString *wide = (PionString *)pion_str_concat_spans(40, many);
+    assert(wide->len == 40 && wide->data[40] == '\0');
+    for (int i = 0; i < 40; i++) assert(wide->data[i] == raw[i % 6]);
+    pion_rc_dec(wide);
+
+    /* 3. Builder appends of validated slices (sb.write_string(s.slice(lo, hi))):
+     * pion_str_slice_data checks the bounds, pion_strbuf_push_slice appends them;
+     * empty ranges are no-ops and growth keeps the prefix. */
+    void *sb = pion_strbuf_new(2);
+    assert(pion_str_slice_data(s, 3, 3) == s->data + 3);
+    pion_strbuf_push_slice(sb, s, 3, 3);
+    pion_strbuf_push_slice(sb, s, 1, 5);
+    for (int i = 0; i < 64; i++) pion_strbuf_push_slice(sb, s, 5, 6);
+    PionString *built = (PionString *)pion_strbuf_to_str(sb);
+    assert(built->len == 68 && built->data[68] == '\0' && memcmp(built->data, "\0\xe6\x97\xa5", 4) == 0);
+    for (int i = 4; i < 68; i++) assert(built->data[i] == 'z');
+    pion_rc_dec(built);
+    pion_rc_dec(sb);
+
+    /* 4. pion_map_scalar_entry: a pure probe. Misses return NULL without
+     * inserting (also on an unallocated map); hits return the value slot for span
+     * and whole keys alike, the stored key sits in the slot's PionMapEntry, and
+     * lookups stay right across rehashes and backward-shift removals. */
+    PionMap *m = (PionMap *)pion_map_new(0);
+    assert(pion_map_scalar_entry(m, mid, 4, NULL) == NULL && m->len == 0 && m->cap == 0);
+    PionString *stored = (PionString *)pion_str_from_cstr(mid, 4);
+    pion_map_set(m, stored, 7);
+    assert(pion_map_scalar_entry(m, "\0\xe6\x97", 3, NULL) == NULL);
+    int64_t *slot = pion_map_scalar_entry(m, mid, 4, NULL);
+    assert(slot && *slot == 7);
+    PionMapEntry *entry = (PionMapEntry *)(void *)((char *)slot - 16);
+    assert(entry->key == stored && entry->state == 1 && w1_rc(stored) == 2);
+    PionString *same = (PionString *)pion_str_from_cstr(mid, 4);
+    assert(pion_map_scalar_entry(m, NULL, 0, same) == slot);
+    assert(pion_map_scalar_entry(m, NULL, 0, stored) == slot);
+    *slot += 1;
+    int64_t v = 0;
+    assert(pion_map_try_get(m, same, &v) == 1 && v == 8 && pion_map_get(m, stored) == 8);
+    pion_rc_dec(same);
+    pion_rc_dec(stored);
+    /* empty span key */
+    assert(pion_map_scalar_entry(m, s->data, 0, NULL) == NULL);
+    void *empty = pion_str_from_cstr("", 0);
+    pion_map_set(m, empty, 3);
+    pion_rc_dec(empty);
+    slot = pion_map_scalar_entry(m, s->data + 6, 0, NULL);
+    assert(slot && *slot == 3);
+    /* drive several rehashes (16 -> 32 -> 64 -> 128) */
+    char kbuf[32];
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        assert(pion_map_scalar_entry(m, kbuf, n, NULL) == NULL);
+        void *k = pion_str_from_cstr(kbuf, n);
+        pion_map_set(m, k, i);
+        pion_rc_dec(k);
+    }
+    assert(m->len == 82 && m->cap >= 128);
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        slot = pion_map_scalar_entry(m, kbuf, n, NULL);
+        assert(slot && *slot == i);
+        entry = (PionMapEntry *)(void *)((char *)slot - 16);
+        assert(entry->key->len == n && memcmp(entry->key->data, kbuf, (size_t)n) == 0);
+        *slot = i * 3;
+    }
+    /* backward-shift removal, then probes of removed and kept keys */
+    for (int i = 0; i < 80; i += 2) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        void *k = pion_str_from_cstr(kbuf, n);
+        pion_map_remove(m, k);
+        pion_rc_dec(k);
+    }
+    assert(m->len == 42);
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        slot = pion_map_scalar_entry(m, kbuf, n, NULL);
+        assert((slot != NULL) == (i % 2) && (!slot || *slot == i * 3));
+    }
+    pion_rc_dec(m);
+    pion_rc_dec(s);
+
+    /* 5. Managed String file reads: empty, text, binary/UTF-8, missing. */
+    char path_buf[300];
+    snprintf(path_buf, sizeof(path_buf), "%s/pion_rt_w1_%d.bin", pion_test_tmpdir(), pion_test_getpid());
+    void *path = pion_str_from_cstr(path_buf, -1);
+    w1_write_file(path_buf, "", 0);
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, "", 0);
+    static const char lines[] = "first line\nsecond line\n\nlast";
+    w1_write_file(path_buf, lines, sizeof(lines) - 1);
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, lines, sizeof(lines) - 1);
+    static const char bin[] = {0, (char)0xff, (char)0xe6, (char)0x97, (char)0xa5, '\n', 0, (char)0x80};
+    w1_write_file(path_buf, bin, sizeof(bin));
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, bin, sizeof(bin));
+    char big[5000];
+    for (size_t i = 0; i < sizeof(big); i++) big[i] = (char)(i * 31u + 7u);
+    w1_write_file(path_buf, big, sizeof(big));
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, big, sizeof(big));
+    assert(pion_test_unlink(path_buf) == 0);
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 0, "", 0);
+    pion_rc_dec(path);
+    printf("  string spans, scalar map entries and managed String reads: OK\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -4116,6 +4273,7 @@ int main(int argc, char **argv) {
     test_p57b_hot_str_and_split();
     test_p61b_map_hint_hit_miss_aba();
     test_p71c_hashdos_bit63_noncollision();
+    test_w1_string_span_map_entry();
 
     test_st_frozen_slab_recycle();
     test_mt_shared_rc();
