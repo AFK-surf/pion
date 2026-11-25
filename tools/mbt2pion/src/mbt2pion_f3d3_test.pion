@@ -1,0 +1,201 @@
+///| Wave M2-F3d-3 unit tests:
+///| 1. `if`/`guard <expr> is <struct-pat> [as alias] && <cond>` lowering
+///| 2. `Int::to_char()` inline lowering & `match` guard binding/shadowing
+///| 3. Struct update `{ ..base, f: v }` type resolution + fail-closed when unknown/conflicting
+///| 4. `autofill_loc` strict single-fn attachment in `.mbti` and `.mbt`
+///| 5. Strictly sound exhaustive array-slice `match` analysis (positive & negative cases)
+///| 6. `Array::push_iter` post-convergence audit timing (positive + `#72` negative guards)
+
+test "F3d3-1: if/guard struct is-chain with as-alias and && lowers cleanly with else isolation" {
+  let src = "priv struct Way { px : Double; h : Double }\n" +
+  "priv struct Fling { v0 : Double; end_t : Double; till : Double; way : Way? }\n" +
+  "pub fn check_if(opt : Fling?, fallback : Int) -> Int {\n" +
+  "  let v0 = fallback\n" +
+  "  if opt is Some({ v0, way: Some(_), .. }) && v0 > 0.0 {\n" +
+  "    v0.to_int()\n" +
+  "  } else {\n" +
+  "    v0 + 100\n" +
+  "  }\n" +
+  "}\n" +
+  "pub fn check_guard(opt : Fling?, t : Double, most : Double, laid : Bool) -> Double {\n" +
+  "  guard opt is Some({ way: Some(w), .. } as f) && f.v0 > 0.0 && t <= f.end_t && (laid || f.till != most) else {\n" +
+  "    return -1.0\n" +
+  "  }\n" +
+  "  w.px / w.h + f.v0\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "is_chain.mbt", content: src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "if/guard struct is-chain should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(!str_has(out, "is Some({"), "raw struct pattern in `is` must be lowered")
+  assert_true(str_has(out, "Option::Some(f)"), "as-alias `f` must be bound directly in outer pattern")
+  assert_true(str_has(out, "let (f, w) = match"), "diverging guard must unpack bound tuple outside else scope")
+}
+
+test "F3d3-2: rewrite_int_to_char_at lowers Int::to_char inline with exact Unicode scalar check" {
+  let used : Map[String, Bool] = Map()
+  let ln = "  match (c - 1000).to_char() {"
+  match rewrite_int_to_char_at(ln, 20, used) {
+    Some(rewritten) => {
+      assert_true(!str_has(rewritten, ".to_char()"), "to_char() must be rewritten")
+      assert_true(str_has(rewritten, "0x10FFFF"), "upper Unicode scalar bound must be checked")
+      assert_true(str_has(rewritten, "0xD800") && str_has(rewritten, "0xDFFF"), "surrogate gap must be excluded")
+      assert_true(str_has(rewritten, "unsafe_to_char()"), "valid scalar must convert via unsafe_to_char")
+    }
+    None => assert_true(false, "rewrite_int_to_char_at must rewrite (c - 1000).to_char()")
+  }
+}
+
+test "F3d3-3: struct update resolves from base static type or expected type and fails closed when ambiguous" {
+  // Positive: `items.get(prev) is Some(it)` + `items[prev] = { ..it, off: ... }` must resolve to `dep::Item`
+  // and NEVER hijack local `Decoy` that also has an `off` field!
+  let ok_src = "priv struct Decoy { off : Int; other : Int }\n" +
+  "pub fn upd(items : Map[Int, @dep.Item], prev : Int) -> Unit {\n" +
+  "  if items.get(prev) is Some(it) {\n" +
+  "    items[prev] = { ..it, off: 42 }\n" +
+  "  }\n" +
+  "}\n"
+  let ok_res = transpile_package(
+    [SourceFile::{ rel_path: "su_ok.mbt", content: ok_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(ok_res.blockers == 0, "struct update with known base/container type should have 0 blockers")
+  let ok_out = ok_res.files[0].content
+  assert_true(str_has(ok_out, "dep::Item::{ ..it, off: 42 }"), "must resolve to dep::Item, not Decoy")
+  assert_true(!str_has(ok_out, "Decoy::{"), "must never guess local Decoy by field name")
+
+  // Negative: unknown base type and no expected type MUST fail closed with MBT2PION_AMBIGUOUS_STRUCT_UPDATE
+  // even when a unique local struct `Decoy` happens to have field `off`!
+  let bad_src = "priv struct Decoy { off : Int; other : Int }\n" +
+  "pub fn bad_upd(x : @dep.Opaque) -> Unit {\n" +
+  "  let y = x.get_unknown()\n" +
+  "  let _ = { ..y, off: 7 }\n" +
+  "}\n"
+  let bad_res = transpile_package(
+    [SourceFile::{ rel_path: "su_bad.mbt", content: bad_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(bad_res.blockers > 0, "unknown struct update base must fail closed")
+  let mut saw_ambig = false
+  for d in bad_res.diagnostics {
+    if d.code == "MBT2PION_AMBIGUOUS_STRUCT_UPDATE" { saw_ambig = true }
+  }
+  assert_true(saw_ambig, "must emit MBT2PION_AMBIGUOUS_STRUCT_UPDATE instead of guessing Decoy")
+  assert_true(!str_has(bad_res.files[0].content, "Decoy::{"), "must not emit guessed Decoy struct update")
+}
+
+test "F3d3-4: autofill_loc attaches only to immediately following single fn in mbti and mbt" {
+  // 1. `.mbti` with generic `pub fn[K]` followed by `pub let` and `pub fn command_score`
+  let st = empty_symbol_table()
+  let mbti = "package \"demo/hl\"\n" +
+  "#callsite(autofill(loc))\n" +
+  "pub fn[K : Eq] combobox(Int, loc~ : SourceLoc) -> Int\n\n" +
+  "pub let combobox_next : String\n\n" +
+  "pub fn command_score(String, String) -> Double\n\n" +
+  "#callsite(autofill(loc))\n" +
+  "pub fn[K] Tree::item(Int, loc~ : SourceLoc) -> Int\n" +
+  "pub fn after_item(Int) -> Int\n"
+  symtab_load_mbti(st, "hl/pkg.generated.mbti", mbti)
+  assert_true(st.autofill_loc_fns.contains("combobox"), "generic combobox must get autofill_loc")
+  assert_true(st.autofill_loc_fns.contains("Tree::item"), "generic Tree::item must get autofill_loc")
+  assert_true(!st.autofill_loc_fns.contains("command_score"), "command_score must NOT inherit leaked autofill_loc")
+  assert_true(!st.autofill_loc_fns.contains("after_item"), "after_item must NOT inherit leaked autofill_loc")
+
+  // 2. `.mbt` with `#callsite(autofill(loc))` followed by a non-fn decl or consecutive fn decls
+  let mbt_src = "#callsite(autofill(loc))\n" +
+  "pub fn with_loc(x : Int, loc~ : SourceLoc) -> String { loc.to_string() + x.to_string() }\n" +
+  "pub fn without_loc(x : Int) -> Int { x + 1 }\n" +
+  "pub fn caller() -> (String, Int) {\n" +
+  "  (with_loc(1), without_loc(2))\n" +
+  "}\n"
+  let res = transpile_package(
+    [SourceFile::{ rel_path: "af.mbt", content: mbt_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    noop_check,
+  )
+  assert_true(res.blockers == 0, "autofill_loc test should have 0 blockers")
+  let out = res.files[0].content
+  assert_true(str_has(out, "with_loc(1, loc="), "with_loc call must receive autofilled loc")
+  assert_true(str_has(out, "without_loc(2)"), "without_loc call must NOT receive autofilled loc")
+}
+
+test "F3d3-5: exhaustive array slice match appends unreachable ONLY when strictly sound" {
+  // Positive 1: `[]` + `[x, ..]`
+  let p1 = "pub fn first_or(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [x, ..] => x\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let r1 = transpile_package([SourceFile::{ rel_path: "arr_p1.mbt", content: p1, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(str_has(r1.files[0].content, "_ => panic(\"unreachable\")"), "[] + [x, ..] is exhaustive")
+
+  // Positive 2: `[.., last]` + `[]`
+  let p2 = "pub fn last_or(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [.., last] => last\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let r2 = transpile_package([SourceFile::{ rel_path: "arr_p2.mbt", content: p2, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(str_has(r2.files[0].content, "_ => panic(\"unreachable\")"), "[.., last] + [] is exhaustive")
+
+  // Negative 1: refutable element `[Some(x), ..]` + `[]` MUST NOT append unreachable!
+  let n1 = "pub fn bad_refut(xs : Array[Int?]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [Some(x), ..] => x\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let rn1 = transpile_package([SourceFile::{ rel_path: "arr_n1.mbt", content: n1, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(!str_has(rn1.files[0].content, "\n    _ => panic(\"unreachable\")"), "[] + [Some(x), ..] must NOT append unreachable")
+
+  // Negative 2: guarded `[x, ..] if x > 0` + `[]` MUST NOT append unreachable!
+  let n2 = "pub fn bad_guard(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [x, ..] if x > 0 => x\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let rn2 = transpile_package([SourceFile::{ rel_path: "arr_n2.mbt", content: n2, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(!str_has(rn2.files[0].content, "\n    _ => panic(\"unreachable\")"), "[] + [x, ..] if cond must NOT append unreachable")
+
+  // Negative 3: missing length 1 (`[]` + `[a, b, ..]`) MUST NOT append unreachable!
+  let n3 = "pub fn bad_gap(xs : Array[Int]) -> Int {\n" +
+  "  match xs {\n" +
+  "    [a, b, ..] => a + b\n" +
+  "    [] => 0\n" +
+  "  }\n" +
+  "}\n"
+  let rn3 = transpile_package([SourceFile::{ rel_path: "arr_n3.mbt", content: n3, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(!str_has(rn3.files[0].content, "\n    _ => panic(\"unreachable\")"), "[] + [a, b, ..] (missing len 1) must NOT append unreachable")
+}

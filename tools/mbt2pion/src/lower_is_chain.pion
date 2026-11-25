@@ -1,0 +1,1131 @@
+///| Track F3d-3 isolated lowering module:
+///| 1. `if`/`guard <expr> is <struct-pat> [as alias] && <cond>` lowering to nested `match`.
+///| 2. Strictly sound exhaustive array-slice `match` analysis (no guard, irrefutable elements,
+///|    exact coverage of all non-negative lengths).
+
+///| Return true if pattern token range `[start, end)` contains any `as` keyword.
+fn pattern_contains_as_kw(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    if tokens[k].kind == TokenKind::Keyword && tokens[k].raw == "as" {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Find depth-0 `is` keyword in `[start, end)`, or `-1` if absent.
+fn find_top_level_is_kw(tokens : Array[Token], start : Int, end : Int) -> Int {
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "is" {
+      return k
+    }
+    k = k + 1
+  }
+  -1
+}
+
+///| Split `[start, end)` by depth-0 `&&` into `(seg_start, seg_end)` ranges.
+///| Returns empty array if any depth-0 `||` is present.
+fn split_cond_ampamp_segs(tokens : Array[Token], start : Int, end : Int) -> Array[(Int, Int)] {
+  let segs : Array[(Int, Int)] = []
+  let mut seg_s = start
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && kk == TokenKind::PipePipe {
+      return []
+    } else if d == 0 && kk == TokenKind::AmpAmp {
+      if k > seg_s {
+        segs.push((seg_s, k))
+      }
+      seg_s = k + 1
+    }
+    k = k + 1
+  }
+  if end > seg_s {
+    segs.push((seg_s, end))
+  }
+  segs
+}
+
+///| Return true if pattern token range `[start, end)` has a top-level `|` (after stripping outer parens).
+fn pattern_has_top_pipe(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut ps = start
+  let mut pe = end
+  while ps + 1 < pe && tokens[ps].kind == TokenKind::LParen && find_matching_delim(tokens, ps) == pe - 1 {
+    ps = ps + 1
+    pe = pe - 1
+  }
+  let mut k = ps
+  let mut d = 0
+  while k < pe {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && kk == TokenKind::Pipe {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Check whether a condition `[start, end)` in `if` or `guard` contains an `is` segment
+///| whose pattern uses struct destructuring `{ ... }` (without top-level `|` or-pattern)
+///| or `as` aliasing and therefore requires nested `match` lowering instead of Pion's built-in `is`.
+fn cond_needs_is_chain_lowering(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let segs = split_cond_ampamp_segs(tokens, start, end)
+  if segs.length() == 0 {
+    return false
+  }
+  for seg in segs {
+    let (ss, se) = seg
+    let is_i = find_top_level_is_kw(tokens, ss, se)
+    if is_i > ss && is_i + 1 < se {
+      if pattern_contains_as_kw(tokens, is_i + 1, se) {
+        return true
+      }
+      if pattern_contains_struct_pat(tokens, is_i + 1, se) && !pattern_has_top_pipe(tokens, is_i + 1, se) {
+        return true
+      }
+    }
+  }
+  false
+}
+
+///| Find depth-0 `as <ident>` at the tail of pattern `[start, end)`, returning index of `as` or `-1`.
+fn find_top_level_as_kw(tokens : Array[Token], start : Int, end : Int) -> Int {
+  let mut k = start
+  let mut d = 0
+  while k < end {
+    let kk = tokens[k].kind
+    if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      d = d + 1
+    } else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    } else if d == 0 && kk == TokenKind::Keyword && tokens[k].raw == "as" {
+      return k
+    }
+    k = k + 1
+  }
+  -1
+}
+
+///| Record a binder name in `bound_out` (preserving order, deduplicated) and push onto `ctx.scope_vars`.
+fn record_is_chain_binder(
+  ctx : StageAContext,
+  name : String,
+  ty : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> Unit {
+  if name.length() == 0 || name == "_" {
+    return
+  }
+  ctx.scope_vars.push(ScopeVar::{ name: name, ty: ty, is_mut: false, is_boxed: false })
+  if !bound_seen.contains(name) {
+    bound_seen[name] = true
+    bound_out.push(name)
+  }
+}
+
+///| Collect and register binders from a non-struct pattern range `[start, end)`,
+///| inferring inner `Option[T]` / `Result[T, E]` binder type when `scrut_ty` is known.
+fn register_simple_is_pat_binders(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  scrut_ty : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> Unit {
+  let st = scrut_ty.trim()
+  // Special case: `Some(x)` on `Option[T]`
+  if start + 3 < end && tokens[start].kind == TokenKind::UpperIdent && tokens[start].raw == "Some" &&
+  tokens[start + 1].kind == TokenKind::LParen && find_matching_delim(tokens, start + 1) == end - 1 &&
+  start + 3 == end - 1 && tokens[start + 2].kind == TokenKind::Ident && tokens[start + 2].raw != "_" &&
+  st.starts_with("Option[") && st.ends_with("]") {
+    let inner_ty = st.slice(7, st.length() - 1).trim()
+    let bname = resolve_ident_in_scope(ctx, tokens[start + 2].raw)
+    record_is_chain_binder(ctx, bname, inner_ty, bound_out, bound_seen)
+    return
+  }
+  let raw_bs = collect_pattern_binders(tokens, start, end)
+  for rb in raw_bs {
+    let bname = resolve_ident_in_scope(ctx, rb)
+    record_is_chain_binder(ctx, bname, "", bound_out, bound_seen)
+  }
+}
+
+///| Expand peeled struct-pattern obligations for an `is`-chain in a single pass (zero double evaluation).
+fn expand_is_chain_struct_obls(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  obls : Array[(String, Int, Int, String)],
+  idx : Int,
+  segs : Array[(Int, Int)],
+  next_seg_idx : Int,
+  file : String,
+  then_expr : String,
+  fail_expr : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> String {
+  if idx >= obls.length() {
+    return lower_is_chain_segs(ctx, tokens, segs, next_seg_idx, file, then_expr, fail_expr, bound_out, bound_seen)
+  }
+  let (bind_var, open_b, close_b, explicit_sname) = obls[idx]
+  let checks : Array[String] = []
+  let bind_fields : Array[(String, String, Bool)] = []
+  let next_obls : Array[(String, Int, Int, String)] = []
+  let mut oi = idx + 1
+  while oi < obls.length() {
+    next_obls.push(obls[oi])
+    oi = oi + 1
+  }
+  let mut fi = open_b + 1
+  while fi < close_b {
+    if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot {
+      fi = fi + 1
+      continue
+    }
+    let mut fe = fi
+    let mut fd = 0
+    while fe < close_b {
+      let fk = tokens[fe].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+      else if fd == 0 && fk == TokenKind::Comma { break }
+      fe = fe + 1
+    }
+    let raw_f = tokens[fi].raw
+    let access_f = if explicit_sname.length() > 0 {
+      rename_struct_field(ctx, explicit_sname, raw_f)
+    } else {
+      rename_keyword_ident(raw_f)
+    }
+    if (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
+    fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Colon {
+      let fexpr = bind_var + "." + access_f
+      let vs = fi + 2
+      if pattern_contains_struct_pat(tokens, vs, fe) {
+        let (peeled_pat, child_obls) = peel_struct_patterns_in_pat(ctx, tokens, vs, fe, file)
+        for cob in child_obls {
+          if !cob.0.starts_with("__mbt_sp_") {
+            record_is_chain_binder(ctx, cob.0, "", bound_out, bound_seen)
+          }
+          next_obls.push(cob)
+        }
+        let pp = peeled_pat.trim()
+        bind_fields.push((fexpr, pp, is_irrefutable_simple_pat(pp)))
+      } else {
+        let mut has_binder = false
+        let mut bi = vs
+        while bi < fe {
+          if tokens[bi].kind == TokenKind::Ident && tokens[bi].raw != "_" &&
+          !(bi > vs && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon)) &&
+          !(bi + 1 < fe && tokens[bi + 1].kind == TokenKind::Colon) {
+            has_binder = true
+          }
+          bi = bi + 1
+        }
+        if has_binder {
+          register_simple_is_pat_binders(ctx, tokens, vs, fe, "", bound_out, bound_seen)
+          let pat_s = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
+          bind_fields.push((fexpr, pat_s, is_irrefutable_simple_pat(pat_s)))
+        } else if vs < fe {
+          let vt = tokens[vs]
+          if vs + 1 == fe && (vt.kind == TokenKind::Keyword && (vt.raw == "true" || vt.raw == "false") ||
+            vt.kind == TokenKind::IntLit || vt.kind == TokenKind::FloatLit || vt.kind == TokenKind::StringLit || vt.kind == TokenKind::CharLit) {
+            checks.push(fexpr + " == " + vt.raw)
+          } else {
+            let ps = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
+            if ps != "_" {
+              checks.push("(match " + fexpr + " { " + ps + " => true, _ => false })")
+            }
+          }
+        }
+      }
+    } else if tokens[fi].kind == TokenKind::Ident && fe == fi + 1 {
+      let bind_name = resolve_ident_in_scope(ctx, raw_f)
+      record_is_chain_binder(ctx, bind_name, "", bound_out, bound_seen)
+      bind_fields.push((bind_var + "." + access_f, bind_name, true))
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[fi].line,
+        tokens[fi].col,
+        "unsupported field pattern inside struct pattern",
+      ))
+    }
+    fi = fe + 1
+  }
+  let inner_s = expand_is_chain_struct_obls(
+    ctx,
+    tokens,
+    next_obls,
+    0,
+    segs,
+    next_seg_idx,
+    file,
+    then_expr,
+    fail_expr,
+    bound_out,
+    bound_seen,
+  )
+  let mut wrapped = inner_s
+  if bind_fields.length() > 0 {
+    let mut all_irref = true
+    for bf in bind_fields {
+      if !bf.2 {
+        all_irref = false
+        break
+      }
+    }
+    if all_irref {
+      let lsb = StringBuilder()
+      lsb.write_string("{ ")
+      for bf in bind_fields {
+        lsb.write_string("let " + bf.1 + " = " + bf.0 + "; ")
+      }
+      lsb.write_string(wrapped + " }")
+      wrapped = lsb.to_string()
+    } else {
+      let scrut_e = if bind_fields.length() == 1 {
+        bind_fields[0].0
+      } else {
+        let es : Array[String] = []
+        for bf in bind_fields { es.push(bf.0) }
+        "(" + join_comma(es) + ")"
+      }
+      let pat_e = if bind_fields.length() == 1 {
+        bind_fields[0].1
+      } else {
+        let ps : Array[String] = []
+        for bf in bind_fields { ps.push(bf.1) }
+        "(" + join_comma(ps) + ")"
+      }
+      wrapped = "match " + scrut_e + " { " + pat_e + " => " + wrapped + ", _ => " + fail_expr + " }"
+    }
+  }
+  if checks.length() > 0 {
+    let csb = StringBuilder()
+    let mut ci = 0
+    while ci < checks.length() {
+      if ci > 0 { csb.write_string(" && ") }
+      csb.write_string(checks[ci])
+      ci = ci + 1
+    }
+    wrapped = "if (" + csb.to_string() + ") { " + wrapped + " } else { " + fail_expr + " }"
+  }
+  wrapped
+}
+
+///| Lower a sequence of `&&`-separated condition segments `[idx, segs.length())`
+///| into a left-to-right short-circuiting nested `match`/`if` chain.
+fn lower_is_chain_segs(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  segs : Array[(Int, Int)],
+  idx : Int,
+  file : String,
+  then_expr : String,
+  fail_expr : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> String {
+  if idx >= segs.length() {
+    return then_expr
+  }
+  let (ss, se) = segs[idx]
+  let is_i = find_top_level_is_kw(tokens, ss, se)
+  if is_i <= ss || is_i + 1 >= se {
+    // Plain boolean condition segment
+    let cond_s = lower_expr_range(ctx, tokens, ss, se, file, false).trim()
+    let next_s = lower_is_chain_segs(ctx, tokens, segs, idx + 1, file, then_expr, fail_expr, bound_out, bound_seen)
+    return "if (" + cond_s + ") { " + next_s + " } else { " + fail_expr + " }"
+  }
+  // `<lhs> is <pat>` segment: evaluate `<lhs>` ONCE before binding any pattern variables!
+  let lhs_ty = infer_simple_expr_type(ctx, tokens, ss, is_i)
+  let lhs_s = lower_expr_range(ctx, tokens, ss, is_i, file, false).trim()
+  let mut pat_s = is_i + 1
+  let mut pat_e = se
+  while pat_s + 1 < pat_e && tokens[pat_s].kind == TokenKind::LParen && find_matching_delim(tokens, pat_s) == pat_e - 1 {
+    pat_s = pat_s + 1
+    pat_e = pat_e - 1
+  }
+  let top_as = find_top_level_as_kw(tokens, pat_s, pat_e)
+  let mut alias_var = ""
+  let mut inner_pat_e = pat_e
+  if top_as > pat_s && top_as + 1 < pat_e && tokens[top_as + 1].kind == TokenKind::Ident {
+    alias_var = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
+    inner_pat_e = top_as
+    record_is_chain_binder(ctx, alias_var, lhs_ty, bound_out, bound_seen)
+  }
+  let scrut_expr = if alias_var.length() > 0 { alias_var } else { lhs_s }
+  let body_expr = if pattern_contains_struct_pat(tokens, pat_s, inner_pat_e) {
+    if lhs_ty.length() > 0 {
+      push_expected_type(ctx, lhs_ty)
+    }
+    let (outer_pat_raw, obls) = peel_struct_patterns_in_pat(ctx, tokens, pat_s, inner_pat_e, file)
+    if lhs_ty.length() > 0 {
+      pop_expected_type(ctx)
+    }
+    let outer_pat = outer_pat_raw.trim()
+    // Register any explicit `as` alias binders created by `peel_struct_patterns_in_pat`
+    for ob in obls {
+      if !ob.0.starts_with("__mbt_sp_") {
+        record_is_chain_binder(ctx, ob.0, "", bound_out, bound_seen)
+      }
+    }
+    // Also register any non-struct binders directly in `outer_pat` (outside peeled struct vars)
+    let ob_set : Map[String, Bool] = Map()
+    for ob in obls { ob_set[ob.0] = true }
+    let outer_toks = lex_moonbit(outer_pat)
+    let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
+    for rb in outer_raw_bs {
+      if !ob_set.contains(rb) && !rb.starts_with("__mbt_sp_") {
+        record_is_chain_binder(ctx, rb, "", bound_out, bound_seen)
+      }
+    }
+    let expanded = expand_is_chain_struct_obls(
+      ctx,
+      tokens,
+      obls,
+      0,
+      segs,
+      idx + 1,
+      file,
+      then_expr,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+    if is_irrefutable_simple_pat(outer_pat) {
+      if outer_pat == scrut_expr {
+        expanded
+      } else {
+        "{ let " + outer_pat + " = " + scrut_expr + "; " + expanded + " }"
+      }
+    } else {
+      "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
+    }
+  } else {
+    if lhs_ty.length() > 0 {
+      push_expected_type(ctx, lhs_ty)
+    }
+    let pat_str = lower_expr_range(ctx, tokens, pat_s, inner_pat_e, file, true).trim()
+    if lhs_ty.length() > 0 {
+      pop_expected_type(ctx)
+    }
+    register_simple_is_pat_binders(ctx, tokens, pat_s, inner_pat_e, lhs_ty, bound_out, bound_seen)
+    let next_s = lower_is_chain_segs(ctx, tokens, segs, idx + 1, file, then_expr, fail_expr, bound_out, bound_seen)
+    if is_irrefutable_simple_pat(pat_str) {
+      if pat_str == "_" {
+        "{ let _ = " + scrut_expr + "; " + next_s + " }"
+      } else if pat_str == scrut_expr {
+        next_s
+      } else {
+        "{ let " + pat_str + " = " + scrut_expr + "; " + next_s + " }"
+      }
+    } else {
+      "match " + scrut_expr + " { " + pat_str + " => " + next_s + ", _ => " + fail_expr + " }"
+    }
+  }
+  if alias_var.length() > 0 {
+    "{ let " + alias_var + " = " + lhs_s + "; " + body_expr + " }"
+  } else {
+    body_expr
+  }
+}
+
+///| Lower `if <cond> { <then> } [else <else>]` when `<cond>` requires `is`-chain lowering.
+///| Returns `Some((pion_code, next_token_idx))` or `None` if not applicable.
+fn try_lower_if_is_chain(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  if_i : Int,
+  lb : Int,
+  close_b : Int,
+  end : Int,
+  file : String,
+  trivia : String,
+) -> Option[(String, Int)] {
+  if !cond_needs_is_chain_lowering(tokens, if_i + 1, lb) {
+    return None
+  }
+  let segs = split_cond_ampamp_segs(tokens, if_i + 1, lb)
+  if segs.length() == 0 {
+    return None
+  }
+  // Check for trailing `else { ... }` or `else if ...`
+  let has_else = close_b + 2 < end &&
+  tokens[close_b + 1].kind == TokenKind::Keyword && tokens[close_b + 1].raw == "else" &&
+  (tokens[close_b + 2].kind == TokenKind::LBrace ||
+    (tokens[close_b + 2].kind == TokenKind::Keyword && tokens[close_b + 2].raw == "if"))
+  if !has_else {
+    let saved_sc = ctx.scope_vars.length()
+    let bound_out : Array[String] = []
+    let bound_seen : Map[String, Bool] = Map()
+    // Pre-collect binders? No: lower_is_chain_segs pushes binders in order, then lowers then_expr!
+    // We pass a placeholder? Better: lower_then inside a small two-step? No, Pion closures can't
+    // capture mut ctx cleanly without care, so lower_is_chain_segs needs then_s AFTER binders are pushed.
+    // Wait: we can push binders in lower_is_chain_segs and pass `(lb, close_b)` to lower at the leaf!
+    let code = lower_is_chain_segs_with_block(
+      ctx,
+      tokens,
+      segs,
+      0,
+      file,
+      lb,
+      close_b,
+      false,
+      "()",
+      bound_out,
+      bound_seen,
+    )
+    restore_scope_vars(ctx, saved_sc)
+    return Some((trivia + code, close_b + 1))
+  }
+  // Has `else`: lower `else` FIRST in the outer scope (so `else` NEVER sees `is` binders!)
+  let (else_s, next_after_else) = if tokens[close_b + 2].kind == TokenKind::LBrace {
+    let else_lb = close_b + 2
+    let else_rb = find_matching_delim(tokens, else_lb)
+    (lower_block_range(ctx, tokens, else_lb, else_rb, file, ""), else_rb + 1)
+  } else {
+    lower_one_token_or_form(ctx, tokens, close_b + 2, end, file, false)
+  }
+  let saved_sc = ctx.scope_vars.length()
+  let bound_out : Array[String] = []
+  let bound_seen : Map[String, Bool] = Map()
+  let chain_s = lower_is_chain_segs_with_block(
+    ctx,
+    tokens,
+    segs,
+    0,
+    file,
+    lb,
+    close_b,
+    true,
+    "Option::None",
+    bound_out,
+    bound_seen,
+  )
+  restore_scope_vars(ctx, saved_sc)
+  let res_v = fresh_temp(ctx, "ic")
+  let out = trivia + "match (" + chain_s + ") { Option::Some(" + res_v + ") => " + res_v + ", Option::None => " + else_s.trim() + " }"
+  Some((out, next_after_else))
+}
+
+///| Variant of `lower_is_chain_segs` that lowers the `then` block `[then_lb, then_rb]` at the leaf
+///| AFTER all `is` binders have been pushed onto `ctx.scope_vars`.
+fn lower_is_chain_segs_with_block(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  segs : Array[(Int, Int)],
+  idx : Int,
+  file : String,
+  then_lb : Int,
+  then_rb : Int,
+  wrap_some : Bool,
+  fail_expr : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> String {
+  if idx >= segs.length() {
+    let then_s = lower_block_range(ctx, tokens, then_lb, then_rb, file, "")
+    return if wrap_some { "Option::Some(" + then_s + ")" } else { then_s }
+  }
+  let (ss, se) = segs[idx]
+  let is_i = find_top_level_is_kw(tokens, ss, se)
+  if is_i <= ss || is_i + 1 >= se {
+    let cond_s = lower_expr_range(ctx, tokens, ss, se, file, false).trim()
+    let next_s = lower_is_chain_segs_with_block(
+      ctx,
+      tokens,
+      segs,
+      idx + 1,
+      file,
+      then_lb,
+      then_rb,
+      wrap_some,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+    return "if (" + cond_s + ") { " + next_s + " } else { " + fail_expr + " }"
+  }
+  let lhs_ty = infer_simple_expr_type(ctx, tokens, ss, is_i)
+  let lhs_s = lower_expr_range(ctx, tokens, ss, is_i, file, false).trim()
+  let mut pat_s = is_i + 1
+  let mut pat_e = se
+  while pat_s + 1 < pat_e && tokens[pat_s].kind == TokenKind::LParen && find_matching_delim(tokens, pat_s) == pat_e - 1 {
+    pat_s = pat_s + 1
+    pat_e = pat_e - 1
+  }
+  let top_as = find_top_level_as_kw(tokens, pat_s, pat_e)
+  let mut alias_var = ""
+  let mut inner_pat_e = pat_e
+  if top_as > pat_s && top_as + 1 < pat_e && tokens[top_as + 1].kind == TokenKind::Ident {
+    alias_var = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
+    inner_pat_e = top_as
+    record_is_chain_binder(ctx, alias_var, lhs_ty, bound_out, bound_seen)
+  }
+  let scrut_expr = if alias_var.length() > 0 { alias_var } else { lhs_s }
+  let body_expr = if pattern_contains_struct_pat(tokens, pat_s, inner_pat_e) {
+    if lhs_ty.length() > 0 {
+      push_expected_type(ctx, lhs_ty)
+    }
+    let (outer_pat_raw, obls) = peel_struct_patterns_in_pat(ctx, tokens, pat_s, inner_pat_e, file)
+    if lhs_ty.length() > 0 {
+      pop_expected_type(ctx)
+    }
+    let outer_pat = outer_pat_raw.trim()
+    for ob in obls {
+      if !ob.0.starts_with("__mbt_sp_") {
+        record_is_chain_binder(ctx, ob.0, "", bound_out, bound_seen)
+      }
+    }
+    let ob_set : Map[String, Bool] = Map()
+    for ob in obls { ob_set[ob.0] = true }
+    let outer_toks = lex_moonbit(outer_pat)
+    let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
+    for rb in outer_raw_bs {
+      if !ob_set.contains(rb) && !rb.starts_with("__mbt_sp_") {
+        record_is_chain_binder(ctx, rb, "", bound_out, bound_seen)
+      }
+    }
+    let expanded = expand_is_chain_struct_obls_with_block(
+      ctx,
+      tokens,
+      obls,
+      0,
+      segs,
+      idx + 1,
+      file,
+      then_lb,
+      then_rb,
+      wrap_some,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+    if is_irrefutable_simple_pat(outer_pat) {
+      if outer_pat == scrut_expr {
+        expanded
+      } else {
+        "{ let " + outer_pat + " = " + scrut_expr + "; " + expanded + " }"
+      }
+    } else {
+      "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
+    }
+  } else {
+    if lhs_ty.length() > 0 {
+      push_expected_type(ctx, lhs_ty)
+    }
+    let pat_str = lower_expr_range(ctx, tokens, pat_s, inner_pat_e, file, true).trim()
+    if lhs_ty.length() > 0 {
+      pop_expected_type(ctx)
+    }
+    register_simple_is_pat_binders(ctx, tokens, pat_s, inner_pat_e, lhs_ty, bound_out, bound_seen)
+    let next_s = lower_is_chain_segs_with_block(
+      ctx,
+      tokens,
+      segs,
+      idx + 1,
+      file,
+      then_lb,
+      then_rb,
+      wrap_some,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+    if is_irrefutable_simple_pat(pat_str) {
+      if pat_str == "_" {
+        "{ let _ = " + scrut_expr + "; " + next_s + " }"
+      } else if pat_str == scrut_expr {
+        next_s
+      } else {
+        "{ let " + pat_str + " = " + scrut_expr + "; " + next_s + " }"
+      }
+    } else {
+      "match " + scrut_expr + " { " + pat_str + " => " + next_s + ", _ => " + fail_expr + " }"
+    }
+  }
+  if alias_var.length() > 0 {
+    "{ let " + alias_var + " = " + lhs_s + "; " + body_expr + " }"
+  } else {
+    body_expr
+  }
+}
+
+///| Expand struct obligations for `lower_is_chain_segs_with_block`.
+fn expand_is_chain_struct_obls_with_block(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  obls : Array[(String, Int, Int, String)],
+  idx : Int,
+  segs : Array[(Int, Int)],
+  next_seg_idx : Int,
+  file : String,
+  then_lb : Int,
+  then_rb : Int,
+  wrap_some : Bool,
+  fail_expr : String,
+  bound_out : Array[String],
+  bound_seen : Map[String, Bool],
+) -> String {
+  if idx >= obls.length() {
+    return lower_is_chain_segs_with_block(
+      ctx,
+      tokens,
+      segs,
+      next_seg_idx,
+      file,
+      then_lb,
+      then_rb,
+      wrap_some,
+      fail_expr,
+      bound_out,
+      bound_seen,
+    )
+  }
+  let (bind_var, open_b, close_b, explicit_sname) = obls[idx]
+  let checks : Array[String] = []
+  let bind_fields : Array[(String, String, Bool)] = []
+  let next_obls : Array[(String, Int, Int, String)] = []
+  let mut oi = idx + 1
+  while oi < obls.length() {
+    next_obls.push(obls[oi])
+    oi = oi + 1
+  }
+  let mut fi = open_b + 1
+  while fi < close_b {
+    if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot {
+      fi = fi + 1
+      continue
+    }
+    let mut fe = fi
+    let mut fd = 0
+    while fe < close_b {
+      let fk = tokens[fe].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+      else if fd == 0 && fk == TokenKind::Comma { break }
+      fe = fe + 1
+    }
+    let raw_f = tokens[fi].raw
+    let access_f = if explicit_sname.length() > 0 {
+      rename_struct_field(ctx, explicit_sname, raw_f)
+    } else {
+      rename_keyword_ident(raw_f)
+    }
+    if (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
+    fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Colon {
+      let fexpr = bind_var + "." + access_f
+      let vs = fi + 2
+      if pattern_contains_struct_pat(tokens, vs, fe) {
+        let (peeled_pat, child_obls) = peel_struct_patterns_in_pat(ctx, tokens, vs, fe, file)
+        for cob in child_obls {
+          if !cob.0.starts_with("__mbt_sp_") {
+            record_is_chain_binder(ctx, cob.0, "", bound_out, bound_seen)
+          }
+          next_obls.push(cob)
+        }
+        let pp = peeled_pat.trim()
+        bind_fields.push((fexpr, pp, is_irrefutable_simple_pat(pp)))
+      } else {
+        let mut has_binder = false
+        let mut bi = vs
+        while bi < fe {
+          if tokens[bi].kind == TokenKind::Ident && tokens[bi].raw != "_" &&
+          !(bi > vs && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon)) &&
+          !(bi + 1 < fe && tokens[bi + 1].kind == TokenKind::Colon) {
+            has_binder = true
+          }
+          bi = bi + 1
+        }
+        if has_binder {
+          register_simple_is_pat_binders(ctx, tokens, vs, fe, "", bound_out, bound_seen)
+          let pat_s = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
+          bind_fields.push((fexpr, pat_s, is_irrefutable_simple_pat(pat_s)))
+        } else if vs < fe {
+          let vt = tokens[vs]
+          if vs + 1 == fe && (vt.kind == TokenKind::Keyword && (vt.raw == "true" || vt.raw == "false") ||
+            vt.kind == TokenKind::IntLit || vt.kind == TokenKind::FloatLit || vt.kind == TokenKind::StringLit || vt.kind == TokenKind::CharLit) {
+            checks.push(fexpr + " == " + vt.raw)
+          } else {
+            let ps = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
+            if ps != "_" {
+              checks.push("(match " + fexpr + " { " + ps + " => true, _ => false })")
+            }
+          }
+        }
+      }
+    } else if tokens[fi].kind == TokenKind::Ident && fe == fi + 1 {
+      let bind_name = resolve_ident_in_scope(ctx, raw_f)
+      record_is_chain_binder(ctx, bind_name, "", bound_out, bound_seen)
+      bind_fields.push((bind_var + "." + access_f, bind_name, true))
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[fi].line,
+        tokens[fi].col,
+        "unsupported field pattern inside struct pattern",
+      ))
+    }
+    fi = fe + 1
+  }
+  let inner_s = expand_is_chain_struct_obls_with_block(
+    ctx,
+    tokens,
+    next_obls,
+    0,
+    segs,
+    next_seg_idx,
+    file,
+    then_lb,
+    then_rb,
+    wrap_some,
+    fail_expr,
+    bound_out,
+    bound_seen,
+  )
+  let mut wrapped = inner_s
+  if bind_fields.length() > 0 {
+    let mut all_irref = true
+    for bf in bind_fields {
+      if !bf.2 {
+        all_irref = false
+        break
+      }
+    }
+    if all_irref {
+      let lsb = StringBuilder()
+      lsb.write_string("{ ")
+      for bf in bind_fields {
+        lsb.write_string("let " + bf.1 + " = " + bf.0 + "; ")
+      }
+      lsb.write_string(wrapped + " }")
+      wrapped = lsb.to_string()
+    } else {
+      let scrut_e = if bind_fields.length() == 1 {
+        bind_fields[0].0
+      } else {
+        let es : Array[String] = []
+        for bf in bind_fields { es.push(bf.0) }
+        "(" + join_comma(es) + ")"
+      }
+      let pat_e = if bind_fields.length() == 1 {
+        bind_fields[0].1
+      } else {
+        let ps : Array[String] = []
+        for bf in bind_fields { ps.push(bf.1) }
+        "(" + join_comma(ps) + ")"
+      }
+      wrapped = "match " + scrut_e + " { " + pat_e + " => " + wrapped + ", _ => " + fail_expr + " }"
+    }
+  }
+  if checks.length() > 0 {
+    let csb = StringBuilder()
+    let mut ci = 0
+    while ci < checks.length() {
+      if ci > 0 { csb.write_string(" && ") }
+      csb.write_string(checks[ci])
+      ci = ci + 1
+    }
+    wrapped = "if (" + csb.to_string() + ") { " + wrapped + " } else { " + fail_expr + " }"
+  }
+  wrapped
+}
+
+///| Lower a diverging `guard <cond> else { <else_body> }` when `<cond>` requires `is`-chain lowering.
+///| Leaves all bound variables in `ctx.scope_vars` for the remainder of the enclosing block, while
+///| keeping `<else_body>` completely outside the scope of any `is` binder.
+fn try_lower_diverging_guard_is_chain(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  guard_i : Int,
+  else_idx : Int,
+  else_body : String,
+  file : String,
+) -> Option[String] {
+  if !cond_needs_is_chain_lowering(tokens, guard_i + 1, else_idx) {
+    return None
+  }
+  let segs = split_cond_ampamp_segs(tokens, guard_i + 1, else_idx)
+  if segs.length() == 0 {
+    return None
+  }
+  let bound_out : Array[String] = []
+  let bound_seen : Map[String, Bool] = Map()
+  // Use a leaf sentinel so we can substitute the final tuple of all discovered binders!
+  let sentinel = "__MBT_GUARD_LEAF_TUPLE__"
+  let chain_raw = lower_is_chain_segs(
+    ctx,
+    tokens,
+    segs,
+    0,
+    file,
+    sentinel,
+    "Option::None",
+    bound_out,
+    bound_seen,
+  )
+  let gv = fresh_temp(ctx, "gv")
+  if bound_out.length() == 0 {
+    let chain_s = chain_raw.replace(sentinel, "Option::Some(())")
+    return Some("match (" + chain_s + ") { Option::Some(_) => (), Option::None => " + else_body.trim() + " }")
+  }
+  if bound_out.length() == 1 {
+    let v0 = bound_out[0]
+    let chain_s = chain_raw.replace(sentinel, "Option::Some(" + v0 + ")")
+    return Some("let " + v0 + " = match (" + chain_s + ") { Option::Some(" + gv + ") => " + gv + ", Option::None => " + else_body.trim() + " }")
+  }
+  let tup = "(" + join_comma(bound_out) + ")"
+  let chain_s = chain_raw.replace(sentinel, "Option::Some(" + tup + ")")
+  Some("let " + tup + " = match (" + chain_s + ") { Option::Some(" + gv + ") => " + gv + ", Option::None => " + else_body.trim() + " }")
+}
+
+///| Lower a value-returning (non-diverging) `guard <cond> else { <else_body> }; <rest>`
+///| when `<cond>` requires `is`-chain lowering.
+fn try_lower_value_guard_is_chain(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  guard_i : Int,
+  else_idx : Int,
+  else_body : String,
+  after_else : Int,
+  end : Int,
+  file : String,
+) -> Option[String] {
+  if !cond_needs_is_chain_lowering(tokens, guard_i + 1, else_idx) {
+    return None
+  }
+  let segs = split_cond_ampamp_segs(tokens, guard_i + 1, else_idx)
+  if segs.length() == 0 {
+    return None
+  }
+  let saved_sc = ctx.scope_vars.length()
+  let bound_out : Array[String] = []
+  let bound_seen : Map[String, Bool] = Map()
+  let sentinel = "__MBT_VGUARD_LEAF__"
+  let chain_raw = lower_is_chain_segs(
+    ctx,
+    tokens,
+    segs,
+    0,
+    file,
+    sentinel,
+    "Option::None",
+    bound_out,
+    bound_seen,
+  )
+  let rest_body = lower_stmts_range(ctx, tokens, after_else, end, file)
+  restore_scope_vars(ctx, saved_sc)
+  let chain_s = chain_raw.replace(sentinel, "Option::Some({\n" + rest_body + "\n  })")
+  let gv = fresh_temp(ctx, "gv")
+  Some("match (" + chain_s + ") { Option::Some(" + gv + ") => " + gv + ", Option::None => " + else_body.trim() + " }")
+}
+
+// ============================================================================
+// Part 2: Strictly sound exhaustive array-slice `match` analysis
+// ============================================================================
+
+///| Check whether a single array element sub-pattern `[start, end)` is 100% irrefutable:
+///| - `_` (wildcard)
+///| - lowercase identifier (binding variable; never a constructor, literal, or const)
+///| - tuple `(p1, p2, ...)` whose elements are recursively irrefutable
+///| - `<irrefutable> as <ident>`
+///| Rejects constructors (`Some(x)`), literals, struct patterns, nested array patterns, `|`, ranges.
+fn is_irrefutable_array_elem_pat(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut s = start
+  let mut e = end
+  if s >= e {
+    return false
+  }
+  // Handle trailing `as <ident>` at depth 0
+  let top_as = find_top_level_as_kw(tokens, s, e)
+  if top_as > s {
+    if top_as + 2 != e || tokens[top_as + 1].kind != TokenKind::Ident {
+      return false
+    }
+    e = top_as
+  }
+  if e == s + 1 {
+    let k = tokens[s].kind
+    return k == TokenKind::Underscore || k == TokenKind::Ident
+  }
+  if tokens[s].kind == TokenKind::LParen && find_matching_delim(tokens, s) == e - 1 {
+    let mut k = s + 1
+    let mut has_item = false
+    while k < e - 1 {
+      if tokens[k].kind == TokenKind::Comma {
+        k = k + 1
+        continue
+      }
+      let mut ke = k
+      let mut kd = 0
+      while ke < e - 1 {
+        let kk = tokens[ke].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { kd = kd + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { kd = kd - 1 }
+        else if kd == 0 && kk == TokenKind::Comma { break }
+        ke = ke + 1
+      }
+      if ke <= k {
+        return false
+      }
+      has_item = true
+      if !is_irrefutable_array_elem_pat(tokens, k, ke) {
+        return false
+      }
+      k = ke + 1
+    }
+    return has_item
+  }
+  false
+}
+
+///| Strictly sound exhaustiveness check for a `match` arm list `[start, end)` over array slices.
+///| Returns `true` ONLY when:
+///|   (a) at least one top-level array pattern arm is present,
+///|   (b) qualifying arms have NO `if` guard, NO top-level `|` or-pattern, and EVERY element
+///|       sub-pattern is irrefutable (identifier, `_`, or recursively irrefutable tuple),
+///|   (c) the set of covered lengths covers EVERY non-negative integer `0, 1, 2, ...`
+///|       (i.e. some open-ended `..` arm covers `>= min_open`, and every `k` in `0..<min_open`
+///|       is covered by an exact-length qualifying arm).
+fn is_exhaustive_array_match_arms(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let exact_lens : Map[Int, Bool] = Map()
+  let mut min_open = -1
+  let mut has_any_arr_arm = false
+  let mut i = start
+  while i < end {
+    let mut fa = i
+    let mut depth = 0
+    let mut if_idx = -1
+    let mut has_pipe = false
+    while fa < end {
+      let k = tokens[fa].kind
+      if k == TokenKind::LParen || k == TokenKind::LBrace || k == TokenKind::LBracket {
+        depth = depth + 1
+      } else if k == TokenKind::RParen || k == TokenKind::RBrace || k == TokenKind::RBracket {
+        depth = depth - 1
+      } else if depth == 0 {
+        if k == TokenKind::FatArrow {
+          break
+        } else if k == TokenKind::Keyword && tokens[fa].raw == "if" && if_idx < 0 {
+          if_idx = fa
+        } else if k == TokenKind::Pipe && if_idx < 0 {
+          has_pipe = true
+        }
+      }
+      fa = fa + 1
+    }
+    if fa >= end {
+      break
+    }
+    let pat_end = if if_idx >= 0 { if_idx } else { fa }
+    // Advance past arm body to find next arm
+    let body_start = fa + 1
+    let mut next_i = body_start
+    if body_start < end && tokens[body_start].kind == TokenKind::LBrace {
+      next_i = find_matching_delim(tokens, body_start) + 1
+    } else if body_start < end && tokens[body_start].kind == TokenKind::Keyword &&
+    (tokens[body_start].raw == "for" || tokens[body_start].raw == "while") {
+      next_i = find_loop_stmt_end(tokens, body_start, end)
+    } else {
+      next_i = find_expr_end(tokens, body_start, end)
+    }
+    if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
+      next_i = next_i + 1
+    }
+
+    // Check if this arm is a qualifying unguarded top-level array pattern
+    if if_idx < 0 && !has_pipe && i < pat_end && tokens[i].kind == TokenKind::LBracket {
+      let cbr = find_matching_delim(tokens, i)
+      let has_as = cbr + 2 == pat_end - 1 &&
+      tokens[cbr + 1].kind == TokenKind::Keyword && tokens[cbr + 1].raw == "as" &&
+      tokens[cbr + 2].kind == TokenKind::Ident
+      if cbr == pat_end - 1 || has_as {
+        has_any_arr_arm = true
+        let mut seen_rest = false
+        let mut invalid = false
+        let mut elem_cnt = 0
+        let mut ei = i + 1
+        while ei < cbr {
+          if tokens[ei].kind == TokenKind::Comma {
+            ei = ei + 1
+            continue
+          }
+          let mut ee = ei
+          let mut ed = 0
+          while ee < cbr {
+            let ek = tokens[ee].kind
+            if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { ed = ed + 1 }
+            else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { ed = ed - 1 }
+            else if ed == 0 && ek == TokenKind::Comma { break }
+            ee = ee + 1
+          }
+          if ee == ei + 1 && tokens[ei].kind == TokenKind::DotDot {
+            if seen_rest { invalid = true; break }
+            seen_rest = true
+          } else if ee == ei + 3 && tokens[ei].kind == TokenKind::DotDot &&
+          tokens[ei + 1].kind == TokenKind::Keyword && tokens[ei + 1].raw == "as" &&
+          (tokens[ei + 2].kind == TokenKind::Ident || tokens[ei + 2].kind == TokenKind::Underscore) {
+            if seen_rest { invalid = true; break }
+            seen_rest = true
+          } else if ee > ei {
+            if !is_irrefutable_array_elem_pat(tokens, ei, ee) {
+              invalid = true
+              break
+            }
+            elem_cnt = elem_cnt + 1
+          }
+          ei = ee + 1
+        }
+        if !invalid {
+          if seen_rest {
+            if min_open < 0 || elem_cnt < min_open {
+              min_open = elem_cnt
+            }
+          } else {
+            exact_lens[elem_cnt] = true
+          }
+        }
+      }
+    }
+    i = next_i
+  }
+  if !has_any_arr_arm || min_open < 0 {
+    return false
+  }
+  let mut need = 0
+  while need < min_open {
+    if !exact_lens.contains(need) {
+      return false
+    }
+    need = need + 1
+  }
+  true
+}
