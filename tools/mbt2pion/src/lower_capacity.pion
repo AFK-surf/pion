@@ -166,6 +166,7 @@ fn iteration_scope_reason(
   body_open : Int,
   body_close : Int,
   array_fields : Map[String, Bool],
+  private_names : Map[String, Bool],
 ) -> String {
   let mut b = idx
   while true {
@@ -217,7 +218,9 @@ fn iteration_scope_reason(
       }
       h = h - 1
     }
-    if kind == "for" {
+    // A loop over something that cannot be the private array (`private_names`: its names) reads another buffer.
+    let other = private_names.length() > 0 && kind == "for" && !span_mentions(tokens, in_i + 1, o, private_names)
+    if kind == "for" && !other {
       if loop_iterable_private_copy(tokens, body_open, body_close, in_i, o, array_fields) != 1 {
         return "it runs inside a `for .. in` loop body (the loop reads the buffer it started with)"
       }
@@ -383,7 +386,7 @@ pub fn collect_shrink_pkg(contents : Array[String]) -> ShrinkPkg {
           let bo = outermost_body_open(ts, t)
           if bo >= 0 {
             let bc = find_matching_delim(ts, bo)
-            if iteration_scope_reason(ts, t, bo, bc, pkg.array_fields).length() > 0 {
+            if iteration_scope_reason(ts, t, bo, bc, pkg.array_fields, Map()).length() > 0 {
               pkg.iter_fns[tk.raw] = "it is called inside an iteration (line " + tk.line.to_string() + ")"
             }
           }
@@ -526,12 +529,26 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
     return ""
   }
   let body_close = find_matching_delim(tokens, body_open)
+  // A private receiver: allocated here (`let a = [..]` / `Array::new(..)`), never handed out or stored in the
+  // function: only an iteration over one of its names (`array_aliases`) can hold its buffer.
+  let mut h0 = name_i - 2
+  while h0 >= 2 && tokens[h0 - 1].kind == TokenKind::Dot && tokens[h0 - 2].kind == TokenKind::Ident {
+    h0 = h0 - 2
+  }
+  let head0 = if h0 >= 0 && tokens[h0].kind == TokenKind::Ident { tokens[h0].raw } else { "" }
+  // (Handed out after the shrink, outside any loop around it, it cannot hold the old buffer.)
+  let in_loop = kept_iter_region_start(tokens, name_i, body_open) < line_start(tokens, name_i, body_open)
+  let private = h0 == name_i - 2 && head0.length() > 0 &&
+  fresh_local_binding(tokens, head0, body_open, name_i, false) &&
+  !name_handed_out(tokens, head0, body_open, if in_loop { body_close } else { name_i })
+  let private_names : Map[String, Bool] = if private { array_aliases(tokens, head0, body_open, body_close) } else { Map() }
   // 1. Inside a `for .. in` loop body or a closure given to an iteration helper.
-  let in_iter = iteration_scope_reason(tokens, name_i, body_open, body_close, pkg.array_fields)
+  let in_iter = iteration_scope_reason(tokens, name_i, body_open, body_close, pkg.array_fields, private_names)
   if in_iter.length() > 0 {
     return in_iter
   }
-  // 2. An array iterator kept beyond the expression that creates it.
+  // 2. An array iterator kept beyond the expression that creates it (of the private receiver's names, or of
+  //    anything when the receiver is not private).
   let mut t = body_open + 1
   while t + 2 < body_close && t + 2 < n {
     let is_arr_iter = tokens[t].raw == "arr_iter" && tokens[t + 1].kind == TokenKind::LParen && t >= 2 &&
@@ -540,7 +557,15 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
     tokens[t + 2].kind == TokenKind::LParen
     if is_arr_iter || is_dot_iter {
       let open_p = if is_arr_iter { t + 1 } else { t + 2 }
-      if !iter_chain_is_consumed(tokens, find_matching_delim(tokens, open_p)) {
+      let mine = if !private {
+        true
+      } else if is_arr_iter {
+        span_mentions(tokens, t + 2, find_matching_delim(tokens, t + 1), private_names)
+      } else {
+        let r = receiver_root(tokens, t - 1)
+        r.length() == 0 || private_names.contains(r)
+      }
+      if mine && !iter_chain_is_consumed(tokens, find_matching_delim(tokens, open_p)) {
         return "its function keeps an `Array::iter()` (line " + tokens[t].line.to_string() +
         ") that reads the buffer it was created with"
       }
@@ -551,7 +576,7 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
   //    package functions, or a receiver a caller can hand in or reach (a parameter, a visible field) while the
   //    function may run inside a caller's iteration.
   let tail = path_tail(tokens, name_i - 2)
-  match pkg.iterated_tails.get(tail) {
+  match if private { None } else { pkg.iterated_tails.get(tail) } {
     Some(at) => return "the package iterates an array named `" + tail + "` (" + at + ") around calls that may reach it"
     None => ()
   }
@@ -615,6 +640,58 @@ pub fn shrink_snapshot_hazard(tokens : Array[Token], name_i : Int, pkg : ShrinkP
     }
   }
   ""
+}
+
+///| First token of the line of `idx` (not before `body_open + 1`).
+fn line_start(tokens : Array[Token], idx : Int, body_open : Int) -> Int {
+  let mut k = idx
+  while k > body_open + 1 && !tokens[k].newline_before {
+    k = k - 1
+  }
+  k
+}
+
+///| Some identifier of `names` occurs (unqualified) in `[s, e)`.
+fn span_mentions(tokens : Array[Token], s : Int, e : Int, names : Map[String, Bool]) -> Bool {
+  let mut k = s
+  while k < e {
+    if tokens[k].kind == TokenKind::Ident && names.contains(tokens[k].raw) &&
+    !(k > 0 && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)) {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| `name` (a path rooted at it) is handed to a call, stored (`a.f = xs`, `[xs]`, `{ f: xs }`), returned, or captured
+///| by a closure in the function before `limit` -- so something else may hold its buffer.
+fn name_handed_out(tokens : Array[Token], name : String, body_open : Int, limit : Int) -> Bool {
+  let body_close = find_matching_delim(tokens, body_open)
+  let mut j = body_open + 1
+  while j < limit {
+    let tk = tokens[j]
+    if tk.kind == TokenKind::Ident && tk.raw == name &&
+    !(tokens[j - 1].kind == TokenKind::Dot || tokens[j - 1].kind == TokenKind::ColonColon) {
+      let nx = if j + 1 < body_close { tokens[j + 1].kind } else { TokenKind::RBrace }
+      let read_through = nx == TokenKind::Dot || nx == TokenKind::LBracket
+      let pk = tokens[j - 1]
+      // (`mbt_compat::` helpers do not keep their arguments.)
+      let o = enclosing_open(tokens, j, body_open, TokenKind::LParen)
+      let compat = o >= 3 && tokens[o - 2].kind == TokenKind::ColonColon && tokens[o - 3].raw == "mbt_compat"
+      let arg = !compat && (pk.kind == TokenKind::LParen || pk.kind == TokenKind::Comma) &&
+      (nx == TokenKind::RParen || nx == TokenKind::Comma)
+      let stored = !read_through && (pk.kind == TokenKind::Eq || pk.kind == TokenKind::LBracket ||
+        pk.kind == TokenKind::Colon || pk.kind == TokenKind::Comma || pk.raw == "return")
+      // The last expression of the body (its value), or inside a closure.
+      let tail = !read_through && nx == TokenKind::RBrace && j + 1 == body_close
+      if arg || stored || tail || enclosing_closure_open(tokens, j, body_open) >= 0 {
+        return true
+      }
+    }
+    j = j + 1
+  }
+  false
 }
 
 ///| `{` of the innermost closure body (`fn(..) { .. }`) around `idx` inside the function body, or -1.
@@ -1020,9 +1097,10 @@ fn kept_iter_mutations(
   body_open : Int,
   head : String,
   callables : Map[String, Bool],
+  flags : Array[Bool],
 ) -> String {
-  let mut pushes = false
-  let mut writes = false
+  // `flags`: [appended, written in place] so far, shared by every part that runs while it is kept (interpolation
+  // holes, closures defined before it, the region): only both together are a hazard (`appends_and_writes`).
   let mut t = s
   while t < e {
     let tk = tokens[t]
@@ -1030,7 +1108,7 @@ fn kept_iter_mutations(
     // `"\{xs.pop()}"`: the holes of an interpolation run code too.
     if tk.kind == TokenKind::InterpString || tk.kind == TokenKind::InterpMultiline || tk.kind == TokenKind::StringLit {
       for sub in interp_holes(tk.raw) {
-        let why = kept_iter_mutations(sub, names, computed, 0, sub.length() - 1, 0, head, callables)
+        let why = kept_iter_mutations(sub, names, computed, 0, sub.length() - 1, 0, head, callables, flags)
         if why.length() > 0 {
           return why + " (in a string interpolation)"
         }
@@ -1041,9 +1119,9 @@ fn kept_iter_mutations(
       tokens[t + 2].kind == TokenKind::LParen {
         let m = tokens[t + 1].raw
         if m == "push" {
-          pushes = true
+          flags[0] = true
         } else if m == "set" || m == "unsafe_set" {
-          writes = true
+          flags[1] = true
         } else if m != "iter" && is_array_mutating_method(m) {
           return "`." + m + "(..)` runs while an iterator of a computed array is kept"
         } else if !is_read_only_array_method(m) && head.length() > 0 && receiver_root(tokens, t - 1) == head {
@@ -1052,7 +1130,7 @@ fn kept_iter_mutations(
       } else if tk.kind == TokenKind::Ident && t > 1 && tokens[t - 1].kind == TokenKind::ColonColon &&
       tokens[t - 2].raw == "mbt_compat" && t + 1 < e && tokens[t + 1].kind == TokenKind::LParen {
         if tk.raw == "arr_push" || tk.raw == "arr_push_iter" {
-          pushes = true
+          flags[0] = true
         } else if is_mbt_compat_arr_mutating(tk.raw) {
           return "`" + tk.raw + "(..)` runs while an iterator of a computed array is kept"
         }
@@ -1066,9 +1144,11 @@ fn kept_iter_mutations(
         }
       } else if is_opaque_call_at(tokens, t, e, callables) {
         return opaque_call_desc(tokens, t) + " may change the array of a kept iterator over a non-local array"
+      } else if passes_closure_value(tokens, t, e, callables) {
+        return passed_closure_desc(tokens, t) + " may change the array of a kept iterator over a non-local array"
       } else if tk.kind == TokenKind::RBracket && t + 1 < e &&
       (tokens[t + 1].kind == TokenKind::Eq || tokens[t + 1].kind == TokenKind::AssignOp) {
-        writes = true
+        flags[1] = true
       }
     } else if tk.kind == TokenKind::Ident && names.contains(tk.raw) && !qualified {
       let nm = tk.raw
@@ -1082,9 +1162,9 @@ fn kept_iter_mutations(
       tokens[p + 3].kind == TokenKind::LParen {
         let m = tokens[p + 2].raw
         if m == "push" {
-          pushes = true
+          flags[0] = true
         } else if m == "set" || m == "unsafe_set" {
-          writes = true
+          flags[1] = true
         } else if is_array_mutating_method(m) {
           return "`" + nm + "." + m + "(..)` runs while it is kept"
         } else if !is_read_only_array_method(m) {
@@ -1093,7 +1173,7 @@ fn kept_iter_mutations(
       } else if p + 1 < e && tokens[p + 1].kind == TokenKind::LBracket {
         let cb = find_matching_delim(tokens, p + 1)
         if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
-          writes = true
+          flags[1] = true
         }
       }
       // The path as a whole argument of a call (`f(xs)`, `arr_truncate(h.items, 0)`): could change it.
@@ -1102,7 +1182,7 @@ fn kept_iter_mutations(
         let o = enclosing_open(tokens, t, body_open, TokenKind::LParen)
         let callee = if o > 0 { tokens[o - 1].raw } else { "" }
         if callee == "arr_push" || callee == "arr_push_iter" {
-          pushes = true
+          flags[0] = true
         } else if callee != "arr_iter" && callee != "length" {
           return "`" + nm + "` is passed to `" + callee + "(..)` while it is kept"
         }
@@ -1110,10 +1190,15 @@ fn kept_iter_mutations(
     }
     t = t + 1
   }
-  if pushes && writes {
-    return "the array is appended to and written in place while it is kept"
-  }
   ""
+}
+
+fn appends_and_writes(flags : Array[Bool]) -> String {
+  if flags[0] && flags[1] {
+    "the array is appended to and written in place while it is kept"
+  } else {
+    ""
+  }
 }
 
 ///| A kept `xs.iter()` (`dot_i`: its `.`) reads the buffer and length `xs` had when it was created (MoonBit:
@@ -1145,6 +1230,7 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
   let names = if fresh_root { array_aliases(tokens, root, body_open, body_close) } else { Map() }
   let computed = !fresh_root
   let callables = callable_locals(tokens, body_open)
+  let flags = [false, false]
   if iter_chain_is_consumed(tokens, close_p) || iter_is_consumed_argument(tokens, dot_i, close_p) {
     // Consumed at once: only the chain's own callbacks run while it reads.
     let mut c = close_p
@@ -1164,15 +1250,15 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
     if cb.length() > 0 {
       return cb
     }
-    let pre = pre_closure_mutations(tokens, names, computed, body_open, close_p, root, callables, close_p + 1, c + 1, true)
+    let pre = pre_closure_mutations(tokens, names, computed, body_open, close_p, root, callables, close_p + 1, c + 1, true, flags)
     if pre.length() > 0 {
       return pre
     }
-    let why = kept_iter_mutations(tokens, names, computed, close_p + 1, c + 1, body_open, root, callables)
+    let why = kept_iter_mutations(tokens, names, computed, close_p + 1, c + 1, body_open, root, callables, flags)
     if why.length() > 0 {
       return why + " (inside the iterator chain's callbacks)"
     }
-    return ""
+    return appends_and_writes(flags)
   }
   let esc = kept_iter_escapes(tokens, dot_i, close_p, body_open, body_close)
   if esc.length() > 0 {
@@ -1180,11 +1266,15 @@ pub fn kept_iter_hazard(tokens : Array[Token], dot_i : Int) -> String {
   }
   let start = kept_iter_region_start(tokens, dot_i, body_open)
   // Closures defined before the iterator may run after it: their bodies count too.
-  let pre = pre_closure_mutations(tokens, names, computed, body_open, start, root, callables, start, body_close, false)
+  let pre = pre_closure_mutations(tokens, names, computed, body_open, start, root, callables, start, body_close, false, flags)
   if pre.length() > 0 {
     return pre
   }
-  kept_iter_mutations(tokens, names, computed, start, body_close, body_open, root, callables)
+  let why = kept_iter_mutations(tokens, names, computed, start, body_close, body_open, root, callables, flags)
+  if why.length() > 0 {
+    return why
+  }
+  appends_and_writes(flags)
 }
 
 ///| End (exclusive) of the statement starting at `s`: the next depth-0 token that starts a line, a `;`, or `limit`.
@@ -1210,7 +1300,7 @@ fn statement_end(tokens : Array[Token], s : Int, limit : Int) -> Int {
 }
 
 ///| `[s, e)` allocates a new array: `[..]`, `Array(..)` / `Array::new(..)`, `{ mbt_compat::arr_capacity_check(..); [] }`,
-///| `mbt_compat::arr_copy(..)` or `<path>.copy()`.
+///| or `mbt_compat::arr_copy(..)`.
 fn is_fresh_array_rhs(tokens : Array[Token], s : Int, e : Int) -> Bool {
   if s >= e {
     return false
@@ -1233,28 +1323,58 @@ fn is_fresh_array_rhs(tokens : Array[Token], s : Int, e : Int) -> Bool {
   tokens[e - 3].kind == TokenKind::LBracket {
     return true
   }
-  if tokens[s].raw == "mbt_compat" && s + 3 < e && tokens[s + 2].raw == "arr_copy" &&
-  tokens[s + 3].kind == TokenKind::LParen {
-    return whole(s + 3)
+  // (Not `<path>.copy()`: a user `copy` method may hand back the array it holds.)
+  tokens[s].raw == "mbt_compat" && s + 3 < e && tokens[s + 2].raw == "arr_copy" &&
+  tokens[s + 3].kind == TokenKind::LParen && whole(s + 3)
+}
+
+///| No `{ .. }` around `k` closes before `before` (`k`'s block is still open there).
+fn block_open_through(tokens : Array[Token], k : Int, before : Int) -> Bool {
+  let mut d = 0
+  let mut j = k
+  while j < before {
+    if tokens[j].kind == TokenKind::LBrace {
+      d = d + 1
+    } else if tokens[j].kind == TokenKind::RBrace {
+      d = d - 1
+      if d < 0 {
+        return false
+      }
+    }
+    j = j + 1
   }
-  e - s >= 4 && tokens[e - 1].kind == TokenKind::RParen && tokens[e - 2].kind == TokenKind::LParen &&
-  tokens[e - 3].raw == "copy" && tokens[e - 4].kind == TokenKind::Dot
+  true
 }
 
 ///| `name` is bound in the function body (before `before`) by `let [mut] name [: T] = <fresh array>`, never
 ///| assigned again, and (with `check_escape`) not handed to a call or stored before `before`.
 fn fresh_local_binding(tokens : Array[Token], name : String, body_open : Int, before : Int, check_escape : Bool) -> Bool {
   let body_close = find_matching_delim(tokens, body_open)
+  // The binding in scope at `before`: the last `let name` whose block is still open there (one in a block closed
+  // before `before` -- `if c { let xs = [..] }` -- names another array).
   let mut bind = -1
   let mut k = body_open + 1
   while k + 1 < before {
     if tokens[k].kind == TokenKind::Ident && tokens[k].raw == name && (tokens[k - 1].raw == "let" ||
-      tokens[k - 1].raw == "mut" && k >= 2 && tokens[k - 2].raw == "let") {
+      tokens[k - 1].raw == "mut" && k >= 2 && tokens[k - 2].raw == "let") && block_open_through(tokens, k, before) {
       bind = k
     }
     k = k + 1
   }
   if bind < 0 {
+    return false
+  }
+  // Bound some other way too (a parameter, a pattern, a `for` or closure variable): it may name another array
+  // where it is used.
+  let mut lets = 0
+  let mut z = body_open + 1
+  while z < body_close {
+    if tokens[z].kind == TokenKind::Ident && tokens[z].raw == name && (tokens[z - 1].raw == "let" || tokens[z - 1].raw == "mut") {
+      lets = lets + 1
+    }
+    z = z + 1
+  }
+  if name_binding_count(tokens, body_open, name) > lets {
     return false
   }
   // Optional annotation, then `=`.
@@ -1350,6 +1470,45 @@ fn is_opaque_call_at(tokens : Array[Token], t : Int, e : Int, callables : Map[St
     tokens[t - 1].kind == TokenKind::ColonColon || tokens[t - 1].raw == "fn")) && callables.contains(tk.raw)
 }
 
+///| A call at `t` (`f(..)`, `@p.f(..)`, `x.m(..)`) that hands on a closure value -- a parameter, local or closure
+///| parameter (`apply(touch)`) -- or, to a function that is not a method, a closure literal (`apply(fn() { .. })`):
+///| what the callee does with it is out of sight. Not in the light check (`light_mark`).
+fn passes_closure_value(tokens : Array[Token], t : Int, e : Int, callables : Map[String, Bool]) -> Bool {
+  if callables.contains(light_mark) || t + 1 >= e || tokens[t + 1].kind != TokenKind::LParen ||
+  tokens[t + 1].newline_before {
+    return false
+  }
+  let tk = tokens[t]
+  if !(tk.kind == TokenKind::RParen || tk.kind == TokenKind::Ident && tk.raw != "fn" && !(t > 0 && tokens[t - 1].raw == "fn")) {
+    return false
+  }
+  let method = t > 0 && tokens[t - 1].kind == TokenKind::Dot
+  let close = find_matching_delim(tokens, t + 1)
+  let mut a = t + 2
+  while a < close && a < e {
+    let ak = tokens[a]
+    if ak.kind == TokenKind::Ident && callables.contains("&" + ak.raw) &&
+    !(tokens[a - 1].kind == TokenKind::Dot || tokens[a - 1].kind == TokenKind::ColonColon) &&
+    !(a + 1 < close && (tokens[a + 1].kind == TokenKind::LParen || tokens[a + 1].kind == TokenKind::Dot ||
+      tokens[a + 1].kind == TokenKind::LBracket)) {
+      return true
+    }
+    if !method && ak.raw == "fn" && a + 1 < close && tokens[a + 1].kind == TokenKind::LParen {
+      return true
+    }
+    a = a + 1
+  }
+  false
+}
+
+fn passed_closure_desc(tokens : Array[Token], t : Int) -> String {
+  if tokens[t].kind == TokenKind::RParen {
+    "an indirect call given a closure"
+  } else {
+    "a call handing `" + tokens[t].raw + "(..)` a closure value"
+  }
+}
+
 ///| The path starting at `t` (`a`, `a.b.c`) ends an argument (followed by `)` or `,`).
 fn kept_iter_path_is_whole_arg(tokens : Array[Token], t : Int, e : Int) -> Bool {
   let mut p = t
@@ -1407,6 +1566,43 @@ fn callable_locals(tokens : Array[Token], body_open : Int) -> Map[String, Bool] 
     }
     k = k + 1
   }
+  // Which of them hold closures (`&name`, for `passes_closure_value`): a function-typed parameter, a name called
+  // somewhere, a `let` bound to a closure literal.
+  let mut p = f + 1
+  while p + 1 < body_open {
+    if tokens[p].kind == TokenKind::Ident && tokens[p + 1].kind == TokenKind::Colon &&
+    (tokens[p - 1].kind == TokenKind::LParen || tokens[p - 1].kind == TokenKind::Comma) {
+      let mut q = p + 2
+      let mut d = 0
+      while q < body_open && !(d == 0 && (tokens[q].kind == TokenKind::Comma || tokens[q].kind == TokenKind::RParen)) {
+        let qk = tokens[q].kind
+        if qk == TokenKind::LParen || qk == TokenKind::LBracket {
+          d = d + 1
+        } else if qk == TokenKind::RParen || qk == TokenKind::RBracket {
+          d = d - 1
+        } else if tokens[q].raw == "->" {
+          out["&" + tokens[p].raw] = true
+        }
+        q = q + 1
+      }
+    }
+    p = p + 1
+  }
+  k = body_open + 1
+  while k + 1 < body_close {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::Ident && !(tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon) {
+      if tokens[k + 1].kind == TokenKind::LParen && !tokens[k + 1].newline_before && tokens[k - 1].raw != "fn" &&
+      out.contains(tk.raw) {
+        out["&" + tk.raw] = true
+      }
+      if (tokens[k - 1].raw == "let" || tokens[k - 1].raw == "mut") && k + 2 < body_close &&
+      tokens[k + 1].kind == TokenKind::Eq && tokens[k + 2].raw == "fn" {
+        out["&" + tk.raw] = true
+      }
+    }
+    k = k + 1
+  }
   out
 }
 
@@ -1427,6 +1623,7 @@ fn pre_closure_mutations(
   span_s : Int,
   span_e : Int,
   consumed : Bool,
+  flags : Array[Bool],
 ) -> String {
   let body_close = find_matching_delim(tokens, body_open)
   // Code that runs while it reads and could run a closure it does not name: any call (in a consumed chain, one
@@ -1544,7 +1741,7 @@ fn pre_closure_mutations(
   for i, o in opens {
     if level[i] > 0 {
       let cs = if level[i] == 1 { light_callables } else { callables }
-      let why = kept_iter_mutations(tokens, names, computed, o + 1, find_matching_delim(tokens, o), body_open, root, cs)
+      let why = kept_iter_mutations(tokens, names, computed, o + 1, find_matching_delim(tokens, o), body_open, root, cs, flags)
       if why.length() > 0 {
         return why + " (in a closure defined before the iterator)"
       }
@@ -1660,6 +1857,9 @@ fn closure_body_opacity_rec(tokens : Array[Token], o : Int, oc : Int, callables 
     let tk = tokens[k]
     if is_opaque_call_at(tokens, k, oc, callables) {
       return "the callback makes " + opaque_call_desc(tokens, k)
+    }
+    if passes_closure_value(tokens, k, oc, callables) {
+      return "the callback makes " + passed_closure_desc(tokens, k)
     }
     // A call to a local closure literal: look inside it.
     if tk.kind == TokenKind::Ident && k + 1 < oc && tokens[k + 1].kind == TokenKind::LParen &&

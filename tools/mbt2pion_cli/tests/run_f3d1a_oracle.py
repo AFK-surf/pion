@@ -324,8 +324,31 @@ pub fn run_7() -> String {
   ints([n1, v1, n2, s1, c1.length(), k, mc.length()])
 }
 
+pub fn cap_collision() -> Int {
+  let __MBT_PAIRS_SITE__ = 4
+  let m = Map([(1, 2)], capacity=__MBT_PAIRS_SITE__)
+  m.length()
+}
+
+pub fn shrink_ok() -> String {
+  let a : Array[Int] = Array::new(capacity=10)
+  a.push(1)
+  a.push(2)
+  a.shrink_to_fit()
+  a.push(3)
+  let sorted = [3, 1, 2]
+  sorted.sort_by_key(fn(x) { -x })
+  let it = sorted.iter()
+  ints(a) + "&" + ints(it.to_array())
+}
+
+pub fn run_8() -> String {
+  cap_collision().to_string() + "|" + shrink_ok()
+}
+
 pub fn run_all() -> String {
-  "F1:" + run_1() + "\nF2:" + run_2() + "\nF3:" + run_3() + "\nF4:" + run_4() + "\nF5:" + run_5() + "\nF6:" + run_6() + "\nF7:" + run_7()
+  "F1:" + run_1() + "\nF2:" + run_2() + "\nF3:" + run_3() + "\nF4:" + run_4() + "\nF5:" + run_5() + "\nF6:" + run_6() + "\nF7:" + run_7() +
+  "\nF8:" + run_8()
 }
 
 pub fn trap_div_overflow() -> Int {
@@ -360,6 +383,18 @@ pub fn trap_arr_neg() -> Int {
 '''
 
 TRAPS = ["trap_div_overflow", "trap_div_zero", "trap_map_neg", "trap_map_big", "trap_arr_neg"]
+
+# `cap_collision` names a local exactly as the hoisted pairs literal of its `Map(..)` would be (`__mbt_pairs_<line>_<col>`
+# of the `Map` token): the generated name must step aside.
+def _pairs_site(src):
+    for ln, text in enumerate(src.split("\n"), 1):
+        if "let m = Map([(1, 2)], capacity=" in text:
+            return f"__mbt_pairs_{ln}_{text.index('Map') + 1}"
+    raise AssertionError("cap_collision site not found")
+
+
+PAIRS_SITE = _pairs_site(F3D1A_MBT)
+F3D1A_MBT = F3D1A_MBT.replace("__MBT_PAIRS_SITE__", PAIRS_SITE)
 
 NEG_SHRINK_MBT = r'''
 pub fn shrink_in_for() -> Array[Int] {
@@ -683,6 +718,145 @@ pub fn map_cap_call() -> Int {
 '''
 
 
+# Final review counterexamples, one package each (Moon / Pion would differ if they were published).
+FINAL_NEGS = {
+    "shr_copy": (r'''
+struct Holder {
+  data : Array[Int]
+}
+
+fn Holder::copy(self : Holder) -> Array[Int] {
+  self.data
+}
+
+fn trim_copy(h : Holder) -> Unit {
+  let buf = h.copy()
+  buf.shrink_to_fit()
+}
+
+pub fn shr_copy() -> Int {
+  let data : Array[Int] = Array::new(capacity=8)
+  data.push(1)
+  data.push(2)
+  data.push(3)
+  let h = { data: data }
+  let mut s = 0
+  for x in h.data {
+    if x == 1 {
+      trim_copy(h)
+      h.data[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_SHRINK_ITER", "comes from outside `trim_copy`"),
+    "shr_shadow": (r'''
+fn trim_shadow(src : Array[Int]) -> Unit {
+  if src.length() > 0 {
+    let src = [3]
+    src.push(1)
+  }
+  src.shrink_to_fit()
+}
+
+pub fn shr_shadow() -> Int {
+  let xs : Array[Int] = Array::new(capacity=8)
+  xs.push(1)
+  xs.push(2)
+  xs.push(3)
+  let mut s = 0
+  for x in xs {
+    if x == 1 {
+      trim_shadow(xs)
+      xs[1] = 9
+    }
+    s = s + x
+  }
+  s
+}
+''', "MBT2PION_ARRAY_SHRINK_ITER", "comes from outside `trim_shadow`"),
+    "iter_copy": (r'''
+struct Holder {
+  data : Array[Int]
+}
+
+fn Holder::copy(self : Holder) -> Array[Int] {
+  self.data
+}
+
+pub fn iter_copy() -> Int {
+  let h = { data: [1, 2, 3] }
+  let c = h.copy()
+  let it = c.iter()
+  let _ = h.data.remove(0)
+  it.to_array()[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "`.remove(..)` runs while an iterator of a computed array is kept"),
+    "iter_shadow": (r'''
+fn iter_shadow_of(a : Array[Int], b : Array[Int]) -> Int {
+  if a.length() > 0 {
+    let a = [3]
+    a.push(1)
+  }
+  let it = a.iter()
+  let _ = b.remove(0)
+  it.to_array()[0]
+}
+
+pub fn iter_shadow() -> Int {
+  let xs = [1, 2, 3]
+  iter_shadow_of(xs, xs)
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "`.remove(..)` runs while an iterator of a computed array is kept"),
+    "sort_hof": (r'''
+fn apply(f : () -> Unit) -> Unit {
+  f()
+}
+
+fn sort_hof_with(xs : Array[Int], touch : () -> Unit) -> Unit {
+  xs.sort_by_key(fn(x) {
+    apply(touch)
+    x
+  })
+}
+
+pub fn sort_hof() -> Int {
+  let a = [3, 1, 2]
+  sort_hof_with(a, fn() { a.push(8) })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "a call handing `apply(..)` a closure value"),
+    "sort_field": (r'''
+struct Hook {
+  f : () -> Unit
+}
+
+fn sort_field_with(xs : Array[Int], hook : Hook) -> Unit {
+  xs.sort_by_key(fn(x) {
+    (hook.f)()
+    x
+  })
+}
+
+pub fn sort_field() -> Int {
+  let a = [3, 1, 2]
+  sort_field_with(a, { f: fn() { a.push(8) } })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes an indirect call"),
+    "iter_interp": (r'''
+pub fn iter_interp() -> Int {
+  let xs = [1, 2]
+  let it = xs.iter()
+  let s = "\{ { xs.push(3); 0 } }"
+  xs[0] = 9
+  it.to_array()[0] + s.length() - 1
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "appended to and written in place"),
+}
+
+
 def run_cmd(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=600)
     if p.returncode != 0:
@@ -759,6 +933,8 @@ def main():
         gen = open(os.path.join(pl, "src", "f3d1a.pion"), encoding="utf-8").read()
         assert "f3d1adep::Cell32::make" in gen and "Int32" not in gen, "built-in `Int32` must lower to `Int`:\n" + gen
         assert "mbt_compat::arr_sort_by_key(" in gen and "mbt_compat::ArrayBuf::with_capacity(8)" in gen, gen
+        assert f"let {PAIRS_SITE}_1 = [(1, 2)]" in gen, f"hoisted pairs must not shadow `{PAIRS_SITE}`:\n" + gen
+        assert "mbt_compat::arr_shrink_to_fit(a)" in gen, "a private array's shrink is not blocked by another's iterator"
         write(os.path.join(pl, "src", "main.pion"), "pub fn main(w : World) -> Int { io_println(w, run_all()); 0 }\n")
         pion_native = run_cmd([args.pionc, "run", pl])
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", pl])
@@ -771,7 +947,8 @@ def main():
             "F4:(1,2)=30,(0,0)=40,(2,1)=50|30|true|(1,1)=c,(1,2)=b|2,Some(3)|2000,2001000,0\n"
             "F5:(8,2,1,9)|(2,9,9)|(8,0,3)|1,4,5,6|1|15,5\n"
             "F6:|Some(1)|2,3||10,20,30|1,2,3|2\n"
-            "F7:2,30,2,60,2,2,1"
+            "F7:2,30,2,60,2,2,1\n"
+            "F8:1|1,2,3&3,2,1"
         )
         assert moon_out == expected, f"Moon reference drifted:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}"
         assert pion_native == moon_out and pion_wasm == moon_out, (
@@ -809,6 +986,8 @@ def main():
                         "(through `g` in a string interpolation)",
                         "runs while an iterator of a computed array is kept", "(in a string interpolation)",
                         "comes from outside `trim_alias`"])
+        for name, (src, code, needle) in FINAL_NEGS.items():
+            expect_blocked(bin_path, args.pionc, md, work, "neg_" + name, src, code, [needle])
         expect_blocked(bin_path, args.pionc, md, work, "negmap", NEG_MAP_MBT, "MBT2PION_UNSUPPORTED_SYNTAX",
                        ["`Map(arr, capacity=...)` with a capacity expression that may run code"])
 
