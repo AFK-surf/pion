@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Validate syntaxes/pion.tmLanguage.json against compiler/src/core/lexer.pion."""
+"""Validate syntaxes/pion.tmLanguage.json against the Pion compiler's lexer & type checker."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ import sys
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 GRAMMAR_PATH = ROOT / "syntaxes" / "pion.tmLanguage.json"
 LEXER_PATH = ROOT / "compiler" / "src" / "core" / "lexer.pion"
-SAMPLE_PATH = ROOT / "syntaxes" / "samples" / "example.pion"
+TYPES_PATH = ROOT / "compiler" / "src" / "core" / "types.pion"
 
 
 def walk_rules(obj, repo_keys: set[str], regexes: list[tuple[str, str]], errors: list[str], path: str = "$") -> None:
@@ -40,6 +40,97 @@ def extract_lexer_keywords(lexer_src: str) -> set[str]:
     return set(re.findall(r'word == "([a-z_]+)"', m.group(0)))
 
 
+def extract_compiler_builtin_types(types_src: str) -> set[str]:
+    m = re.search(
+        r"TyName\(name, args, sp\) => \{.*?(?=let via_alias = tc_is_imported_pkg_alias)",
+        types_src,
+        flags=re.S,
+    )
+    if not m:
+        raise RuntimeError("Could not locate TyName builtin type table in types.pion")
+    return set(re.findall(r'name == "([A-Z][A-Za-z0-9_]*)"', m.group(0)))
+
+
+def extract_grammar_word_list(rule_match: str) -> set[str]:
+    m = re.fullmatch(r"\\b\(([A-Za-z0-9_|]+)\)\\b", rule_match)
+    if not m:
+        raise RuntimeError(f"Unexpected word-list regex format: {rule_match!r}")
+    return set(m.group(1).split("|"))
+
+
+def run_regression_checks(repo: dict, errors: list[str]) -> int:
+    checked = 0
+
+    # 1. JSX open tag end regex must NOT match the '>' of '=>' (prop=>{ expr })
+    jsx_open = [r for r in repo["jsx"]["patterns"] if r.get("name") == "meta.tag.jsx.open.pion"][0]
+    jsx_end = re.compile(jsx_open["end"])
+    sample_jsx = "<ui::Card on_press=>{ on_click() } active>"
+    m_end = jsx_end.search(sample_jsx)
+    if not m_end or m_end.start() != len(sample_jsx) - 1:
+        errors.append(
+            f"JSX open tag end regex matched prematurely on {sample_jsx!r}: "
+            f"{m_end.span() if m_end else None}"
+        )
+    jsx_inner_matches = [r.get("match") for r in jsx_open.get("patterns", []) if "match" in r]
+    if "=>" not in jsx_inner_matches or jsx_inner_matches.index("=>") > jsx_inner_matches.index("="):
+        errors.append("JSX open tag inner patterns must match '=>' before '='")
+    checked += 1
+
+    # 2. Contextual 'test' keyword matches 'test "name" {' but not identifier usage 'let test = 1'
+    test_rules = [r for r in repo["keywords"]["patterns"] if r.get("name") == "keyword.other.test.pion"]
+    if not test_rules:
+        errors.append("Missing keyword.other.test.pion rule")
+    else:
+        tp = re.compile(test_rules[0]["match"])
+        if not tp.search('test "shape area" {'):
+            errors.append('keyword.other.test.pion failed to match `test "shape area" {`')
+        if tp.search("let test = 1"):
+            errors.append("keyword.other.test.pion falsely matched `let test = 1`")
+    checked += 1
+
+    # 3. Labeled parameter rule must match `opt? : Int` / `label~ : String` but NOT `f(x?)`
+    param_rules = [
+        r for r in repo["namespaces-and-calls"]["patterns"]
+        if r.get("captures", {}).get("1", {}).get("name") == "variable.parameter.labeled.pion"
+    ]
+    if not param_rules:
+        errors.append("Missing variable.parameter.labeled.pion rule")
+    else:
+        pp = re.compile(param_rules[0]["match"])
+        if not pp.search("fn f(opt? : Int, label~ : String = \"\")"):
+            errors.append("Labeled parameter rule failed to match parameter declarations")
+        if pp.search("f(x?)") or pp.search("g(x?, y)"):
+            errors.append("Labeled parameter rule falsely matched error-propagation `x?` in call")
+    checked += 1
+
+    # 4. SCREAMING_SNAKE_CASE constants matched as constant.other.pion; single-letter generics untouched
+    const_rules = [r for r in repo["constants"]["patterns"] if r.get("name") == "constant.other.pion"]
+    if not const_rules:
+        errors.append("Missing constant.other.pion rule")
+    else:
+        cp = re.compile(const_rules[0]["match"])
+        if not cp.search("MAX_SIZE"):
+            errors.append("constant.other.pion failed to match MAX_SIZE")
+        if cp.search("Array") or cp.search("T") or cp.search("IO"):
+            errors.append("constant.other.pion over-matched type/generic name")
+    checked += 1
+
+    # 5. Unterminated string / char end regex stops at end-of-line
+    if not re.compile(repo["strings"]["end"]).search("unterminated"):
+        errors.append("strings.end must terminate at EOL for unterminated strings")
+    for cr in repo["chars-and-bytes"]["patterns"]:
+        if not re.compile(cr["end"]).search("unterminated"):
+            errors.append(f"{cr.get('name')}.end must terminate at EOL")
+    checked += 1
+
+    # 6. Raw string rule must not duplicate string.unquoted.raw.pion on outer rule + capture 2
+    if "name" in repo["raw-string"]:
+        errors.append("raw-string rule duplicates scope on outer rule and capture 2")
+    checked += 1
+
+    return checked
+
+
 def main() -> int:
     grammar = json.loads(GRAMMAR_PATH.read_text(encoding="utf-8"))
     errors: list[str] = []
@@ -54,32 +145,42 @@ def main() -> int:
     regexes: list[tuple[str, str]] = []
     walk_rules(grammar, repo_keys, regexes, errors)
 
-    compiled: list[tuple[str, re.Pattern[str]]] = []
     for loc, pattern in regexes:
         try:
-            compiled.append((loc, re.compile(pattern)))
+            re.compile(pattern)
         except re.error as exc:
             errors.append(f"{loc}: invalid regex {pattern!r}: {exc}")
 
-    # Verify every keyword in compiler/src/core/lexer.pion is matched by the grammar's keyword/constant rules.
+    # Two-way keyword parity against compiler/src/core/lexer.pion
     lexer_kws = extract_lexer_keywords(LEXER_PATH.read_text(encoding="utf-8"))
-    kw_patterns = []
+    grammar_kws: set[str] = set()
     for section in ("keywords", "constants"):
         for rule in repo.get(section, {}).get("patterns", []):
-            if "match" in rule:
-                kw_patterns.append(re.compile(rule["match"]))
-    missing_kws = sorted(kw for kw in lexer_kws if not any(p.search(kw) for p in kw_patterns))
+            match = rule.get("match", "")
+            if re.fullmatch(r"\\b\([a-z_|]+\)\\b", match):
+                grammar_kws |= extract_grammar_word_list(match)
+    # 'self' is a language variable, not in lexer.pion's keyword table.
+    missing_kws = sorted(lexer_kws - grammar_kws)
+    extra_kws = sorted((grammar_kws - lexer_kws) - {"self"})
     if missing_kws:
-        errors.append(f"Keywords from lexer.pion missing in grammar: {missing_kws}")
+        errors.append(f"Keywords in lexer.pion missing from grammar: {missing_kws}")
+    if extra_kws:
+        errors.append(f"Non-existent keywords in grammar not in lexer.pion: {extra_kws}")
 
-    # Smoke-check sample file: every non-empty sample line matches at least one grammar rule.
-    sample_lines = SAMPLE_PATH.read_text(encoding="utf-8").splitlines()
-    for lineno, line in enumerate(sample_lines, start=1):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if not any(p.search(line) for _, p in compiled):
-            errors.append(f"Sample line {lineno} matched no grammar pattern: {line!r}")
+    # Two-way built-in type parity against compiler/src/core/types.pion
+    compiler_types = extract_compiler_builtin_types(TYPES_PATH.read_text(encoding="utf-8"))
+    grammar_types: set[str] = set()
+    for rule in repo.get("types", {}).get("patterns", []):
+        if rule.get("name") in ("support.type.primitive.pion", "support.type.builtin.pion"):
+            grammar_types |= extract_grammar_word_list(rule["match"])
+    missing_types = sorted(compiler_types - grammar_types)
+    extra_types = sorted(grammar_types - compiler_types)
+    if missing_types:
+        errors.append(f"Built-in types in types.pion missing from grammar: {missing_types}")
+    if extra_types:
+        errors.append(f"Non-existent built-in types in grammar not in types.pion: {extra_types}")
+
+    regressions = run_regression_checks(repo, errors)
 
     if errors:
         for e in errors:
@@ -88,9 +189,10 @@ def main() -> int:
 
     print(
         f"OK: {GRAMMAR_PATH.relative_to(ROOT)} validated "
-        f"({len(repo_keys)} repo rules, {len(compiled)} regexes, "
-        f"{len(lexer_kws)}/{len(lexer_kws)} lexer keywords covered, "
-        f"{len(sample_lines)} sample lines checked)."
+        f"({len(repo_keys)} repo rules, {len(regexes)} regexes, "
+        f"{len(lexer_kws)} lexer keywords exact match, "
+        f"{len(compiler_types)} builtin types exact match, "
+        f"{regressions} regression checks passed)."
     )
     return 0
 
