@@ -1178,11 +1178,21 @@ countselected(Ref r, Fn *fn, uint *uses)
 	}
 }
 
-/* Fold an adjacent single-use integer Oload directly into Oxcmp as its
- * sole memory operand. Adjacent ordering guarantees no intervening store,
- * call, or alias write; equal class prevents width/sign mismatches. */
+/* Fold an adjacent single-use Oload of the same class as the sole memory
+ * operand of the next instruction. Adjacent ordering guarantees no
+ * intervening store, call or alias write; equal class prevents width/sign
+ * mismatches.
+ *  - integer Oxcmp: either operand (the other a register, or a constant when
+ *    the load is the right operand).
+ *  - scalar FP Osub / Odiv: only the right operand, the left one a temporary,
+ *    so `subs[sd]` / `divs[sd] mem, reg` keeps the written operand order.
+ *    Under XMM pressure spill may still leave the left operand of Osub in a
+ *    slot (amd64_op[Osub].nmem == 2); the two-address emitters copy it into
+ *    the register destination first, so no instruction gets two memory
+ *    operands. Odiv (nmem == 0) always reloads it.
+ * Lean: tests/lean/proofs/QbeAmd64FpRhsLoadFold.lean. */
 static void
-foldcompareloads(Fn *fn)
+foldoperandloads(Fn *fn)
 {
 	uint *uses = alloc(fn->ntmp * sizeof *uses);
 	for (Blk *b = fn->start; b; b = b->link) {
@@ -1198,15 +1208,18 @@ foldcompareloads(Fn *fn)
 	for (Blk *b = fn->start; b; b = b->link) {
 		for (uint j = 1; j < b->nins; j++) {
 			Ins *cmp = &b->ins[j], *ld = cmp - 1;
-			if (cmp->op != Oxcmp || KBASE(cmp->cls) || ld->op != Oload
+			int fp = KBASE(cmp->cls);
+			if (fp ? (cmp->op != Osub && cmp->op != Odiv) : cmp->op != Oxcmp)
+				continue;
+			if (ld->op != Oload
 			|| ld->cls != cmp->cls || rtype(ld->to) != RTmp
 			|| ld->to.val < Tmp0 || uses[ld->to.val] != 1)
 				continue;
 			int side = req(cmp->arg[0], ld->to) ? 0 : 1;
-			if (!req(cmp->arg[side], ld->to))
+			if ((fp && side != 1) || !req(cmp->arg[side], ld->to))
 				continue;
 			Ref other = cmp->arg[1 - side];
-			if (rtype(other) != RTmp && !(side == 1 && rtype(other) == RCon))
+			if (rtype(other) != RTmp && !(!fp && side == 1 && rtype(other) == RCon))
 				continue;
 			Ref m = ld->arg[0];
 			if (rtype(m) == RTmp) {
@@ -1309,7 +1322,7 @@ amd64_isel(Fn *fn)
 	free(num.touched);
 	free(num.v);
 	rematindex(fn);
-	foldcompareloads(fn);
+	foldoperandloads(fn);
 
 	if (debug['I']) {
 		fprintf(stderr, "\n> After instruction selection:\n");

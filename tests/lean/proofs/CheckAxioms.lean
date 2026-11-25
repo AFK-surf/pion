@@ -28,6 +28,7 @@ import PionProofs.QbeJtblEdgeSpill
 import PionProofs.QbeColdBootstrapSpeedOpts
 import PionProofs.QbeCountedLoopUnroll
 import PionProofs.QbeJtblIdxAndWideCmp
+import PionProofs.QbeAmd64FpRhsLoadFold
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -717,3 +718,16 @@ import PionProofs.QbeJtblIdxAndWideCmp
 #print axioms PionQbeJtblIdxAndWideCmp.enclosure
 #print axioms PionQbeJtblIdxAndWideCmp.wordRange
 #print axioms PionQbeJtblIdxAndWideCmp.machineFold
+#print axioms PionQbeAmd64FpRhsLoadFold.sameRead
+#print axioms PionQbeAmd64FpRhsLoadFold.otherRegisters
+#print axioms PionQbeAmd64FpRhsLoadFold.foldEquiv
+#print axioms PionQbeAmd64FpRhsLoadFold.singleUseOtherDistinct
+#print axioms PionQbeAmd64FpRhsLoadFold.sideOnePreservesOrder
+#print axioms PionQbeAmd64FpRhsLoadFold.sideZeroChangesResult
+#print axioms PionQbeAmd64FpRhsLoadFold.sideZeroCounterexample
+#print axioms PionQbeAmd64FpRhsLoadFold.noWritesMemUnchanged
+#print axioms PionQbeAmd64FpRhsLoadFold.deferredReadUnchanged
+#print axioms PionQbeAmd64FpRhsLoadFold.adjacentMemoryUnchanged
+#print axioms PionQbeAmd64FpRhsLoadFold.storeBetweenCounterexample
+#print axioms PionQbeAmd64FpRhsLoadFold.emitOneMem
+#print axioms PionQbeAmd64FpRhsLoadFold.spilledLhsEquiv
