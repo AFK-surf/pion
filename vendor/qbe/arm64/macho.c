@@ -1021,8 +1021,6 @@ me_emitins(Ins *i, ME *e)
 	uint32_t sf = is64 ? 1u : 0u;
 	uint32_t ftype = (k == Kd) ? 1u : 0u;
 
-	if (i->op==Oload && i->cls==Kv2d)
-		i->op=Ovload;
 	if (isload(i->op))
 		me_fixarg(&i->arg[0], loadsz(i), IP1, e);
 	if (isstore(i->op)) {
@@ -1042,70 +1040,6 @@ me_emitins(Ins *i, ME *e)
 	}
 
 	switch (i->op) {
-	case Ovload:
-	case Ovstore: {
-		int store = i->op == Ovstore;
-		Ref addr = i->arg[store];
-		uint reg = freg(store ? i->arg[0].val : i->to.val);
-		if (rtype(addr) == RSlot) {
-			me_fixarg(&addr, 16, IP1, e);
-			me_emit_mem(store ? 0x3d800000u : 0x3dc00000u, 0, reg, 16, addr, e);
-		} else {
-			uint off = rtype(addr) == RMem
-				       ? (uint)e->fn->mem[addr.val].offset.bits.i
-				       : 0;
-			uint base = greg(rtype(addr) == RMem ? e->fn->mem[addr.val].base.val
-							     : addr.val);
-			uint op = off % 16 ? (0x3c800000u | off << 12)
-					   : (0x3d800000u | (off / 16) << 10);
-			emit_u32(op | (!store << 22) | base << 5 | reg);
-		}
-		break;
-	}
-	case Ovhigh:
-		emit_u32(0x5e180400u | (freg(i->arg[0].val) << 5) | freg(i->to.val));
-		break;
-	case Otrapmask:
-		emit_u32(0xd53b4411u); /* mrs x17, fpcr */
-		emit_u32(0x52800010u | (0x9f00u << 5));
-		emit_u32(0x6a10023fu); /* tst w17, w16 */
-		break;
-	case Ovsum:
-		emit_u32(0x7e70d800u | freg(i->arg[0].val) << 5 | freg(i->to.val));
-		break;
-	case Ovmullane:
-		emit_u32(0x4fc09000u | freg(i->arg[1].val) << 16 |
-			 freg(i->arg[0].val) << 5 | freg(i->to.val));
-		break;
-	case Ovlo:
-	case Oordadd:
-	case Oordsub:
-	case Oordmul: {
-		Ins k = *i;
-		k.op = i->op == Ovlo	  ? Ocopy
-		       : i->op == Oordadd ? Oadd
-		       : i->op == Oordsub ? Osub
-					  : Omul;
-		me_emitins(&k, e);
-		break;
-	}
-	case Ovzip:
-		emit_u32(0x4ec03800u | freg(i->arg[1].val) << 16 |
-			 freg(i->arg[0].val) << 5 | freg(i->to.val));
-		break;
-	case Ovsplat:
-		emit_u32(0x4e080400u | freg(i->arg[0].val) << 5 | freg(i->to.val));
-		break;
-	case Ovadd:
-	case Ovsub:
-	case Ovmul: {
-		uint op = i->op == Ovadd   ? 0x4e60d400u
-			  : i->op == Ovsub ? 0x4ee0d400u
-					   : 0x6e60dc00u;
-		emit_u32(op | freg(i->arg[1].val) << 16 | freg(i->arg[0].val) << 5 |
-			 freg(i->to.val));
-		break;
-	}
 	default:
 		if (i->op >= Oflag && i->op <= Oflag1) {
 			int c = (int)i->op - Oflag;
@@ -1296,28 +1230,6 @@ me_emitins(Ins *i, ME *e)
 	}
 
 	case Ocopy:
-		if (i->cls == Kv2d) {
-			Ins k = *i;
-			Ref dst = k.to, src = k.arg[0];
-			if (req(dst, src))
-				break;
-			if (rtype(src) == RSlot) {
-				k = (Ins){Ovload,
-					  Kv2d,
-					  rtype(dst) == RSlot ? TMP(V31) : dst,
-					  {src, R}};
-				me_emitins(&k, e);
-				src = k.to;
-			}
-			if (rtype(dst) == RSlot) {
-				k = (Ins){Ovstore, Kv2d, R, {src, dst}};
-				me_emitins(&k, e);
-			} else if (!req(dst, src)) {
-				emit_u32(0x4ea01c00u | freg(src.val) << 16 |
-					 freg(src.val) << 5 | freg(dst.val));
-			}
-			break;
-		}
 		if (req(i->to, i->arg[0]))
 			break;
 		if (rtype(i->to) == RSlot) {
@@ -1353,13 +1265,6 @@ me_emitins(Ins *i, ME *e)
 		break;
 
 	case Oswap:
-		if (i->cls == Kv2d) {
-			uint x = i->arg[0].val - V0, y = i->arg[1].val - V0;
-			emit_u32(0x4ea01c00u | x << 16 | x << 5 | 31);
-			emit_u32(0x4ea01c00u | y << 16 | y << 5 | x);
-			emit_u32(0x4ea01c00u | 31u << 16 | 31u << 5 | y);
-			break;
-		}
 		if (KBASE(k) == 1) {
 			uint32_t r0 = freg(i->arg[0].val);
 			uint32_t r1 = freg(i->arg[1].val);

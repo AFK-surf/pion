@@ -681,8 +681,6 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC"
 # P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC"
-# P127: strict 2 x f64 SLP in QBE (vendor/qbe/slp.h; amd64_sysv SSE2 / arm64_apple NEON packets behind an MXCSR / FPCR trap-mask entry test with the scalar graph retained; 16 x 16 IEEE-754 boundary rows in --release and dev, vector arm == scalar arm bit for bit incl. NaN payloads and aliasing, == strict C reference, packet kept in a 16-byte slot across a foreign call that dirties every vector register, direct object == assembled text, packed-code structure on Linux x86-64 / macOS arm64).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p127_qbe_double_simd_slp/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
