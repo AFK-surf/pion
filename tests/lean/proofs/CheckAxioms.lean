@@ -36,6 +36,7 @@ import PionProofs.QbeFrontendColdSpeedOpts
 import PionProofs.QbeCountedArrayLength
 import PionProofs.QbeStringSpanMapEntry
 import PionProofs.QbeEcosystemUnboxFixedLen
+import PionProofs.QbeRealWorkloadDataOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -828,3 +829,22 @@ import PionProofs.QbeEcosystemUnboxFixedLen
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.shadow
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.hoist
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.run_prefix
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.literal_alphabet
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.scan_spec
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.pack_spec
+#print axioms QbeRealWorkloadDataOpts.QuotedBytes.same_static_bytes_and_length
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.encode_bytes
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.roundtrip
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.neg_literal_word
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.int32_min_word
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.stores_spec
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.array_equivalence
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.fresh_objects
+#print axioms QbeRealWorkloadDataOpts.LiteralWords.other_objects
+#print axioms QbeRealWorkloadDataOpts.FlatRows.immortal_refs
+#print axioms QbeRealWorkloadDataOpts.FlatRows.sameHeap
+#print axioms QbeRealWorkloadDataOpts.SparseData.prepend_ok
+#print axioms QbeRealWorkloadDataOpts.SparseData.scan_ok
+#print axioms QbeRealWorkloadDataOpts.SparseData.encode_ok
+#print axioms QbeRealWorkloadDataOpts.SparseData.coalesce
+#print axioms QbeRealWorkloadDataOpts.SparseData.region_equivalence

@@ -463,6 +463,8 @@ sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC2"
 # P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
 sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC2"
+# P130: real-workload static data (quoted QBE byte runs for long string literals; 1,024+ element Int literal arrays copied from a private word table, incl. INT32_MIN and side-effecting fallback; all-String record tables stored without row boxes; sparse Wasm32 active data segments; native dev + --release SSA checks and exact output, ASan/LSan, Wasm32 module parse and output).
+sh "$ROOT_DIR/tests/e2e/p130_real_workload_data_opts/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
