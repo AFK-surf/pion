@@ -20,6 +20,7 @@ import PionProofs.QbeCompileSpeedOpts2
 import PionProofs.QbeFrontendSpeedOpts
 import PionProofs.QbeArm64AddrOpts
 import PionProofs.QbeInlineRcSpeedOpts
+import PionProofs.QbeParallelRcSpeedOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -597,3 +598,20 @@ import PionProofs.QbeInlineRcSpeedOpts
 #print axioms PionQbeInlineRcSpeedOpts.Demand.guarded_read
 #print axioms PionQbeInlineRcSpeedOpts.Demand.leaf_default
 #print axioms PionQbeInlineRcSpeedOpts.Demand.emitted
+#print axioms PionQbeParallelRcSpeedOpts.Workers.completionOrder
+#print axioms PionQbeParallelRcSpeedOpts.Workers.orderedGate
+#print axioms PionQbeParallelRcSpeedOpts.Workers.contiguousBatches
+#print axioms PionQbeParallelRcSpeedOpts.Workers.purePass
+#print axioms PionQbeParallelRcSpeedOpts.Workers.failedWriteWins
+#print axioms PionQbeParallelRcSpeedOpts.Workers.predecessorsTerminate
+#print axioms PionQbeParallelRcSpeedOpts.Workers.canEnqueue
+#print axioms PionQbeParallelRcSpeedOpts.Workers.backendRoom
+#print axioms PionQbeParallelRcSpeedOpts.Offsets.wsAscii
+#print axioms PionQbeParallelRcSpeedOpts.Offsets.asciiOfTrim
+#print axioms PionQbeParallelRcSpeedOpts.Offsets.trimSlice
+#print axioms PionQbeParallelRcSpeedOpts.Offsets.offsetSlice
+#print axioms PionQbeParallelRcSpeedOpts.Offsets.asciiStep
+#print axioms PionQbeParallelRcSpeedOpts.Offsets.lineMaterialize
+#print axioms PionQbeParallelRcSpeedOpts.Chunks.acceptedCut
+#print axioms PionQbeParallelRcSpeedOpts.Chunks.lexicalRestart
+#print axioms PionQbeParallelRcSpeedOpts.Chunks.orderedConcat

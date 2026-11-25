@@ -5639,6 +5639,77 @@ fn drv_build_workspace_objects_entry(
   )
 }
 
+///| Cut only after complete ASCII lines at neutral QBE lexical state.
+fn drv_cleanup_ssa(world : World, ssa : String, mask : Int, jobs : Int) -> String {
+  let n = ssa.length()
+  if jobs <= 1 || n < 1048576 || ssa.code_unit_at(n - 1) != 10 {
+    return cleanup_native_rc_ssa_opts(ssa, mask)
+  }
+  if !ssa.contains("$pion_rc_inc") && !ssa.contains("$pion_rc_dec") { return ssa }
+  let per_job = n / jobs
+  let stride = if per_job > 1048576 { per_job } else { 1048576 }
+  let cuts : Array[Int] = [0]
+  let mut start = 0
+  let mut i = 0
+  let mut quoted = false
+  let mut escaped = false
+  let mut comment = false
+  let mut depth = 0
+  while i < n {
+    let c = ssa.code_unit_at(i)
+    if c >= 128 { return cleanup_native_rc_ssa_opts(ssa, mask) }
+    if comment {
+      if c == 10 { comment = false }
+    } else if quoted {
+      if escaped { escaped = false } else if c == 92 { escaped = true } else if c == 34 { quoted = false }
+    } else if c == 34 {
+      quoted = true
+    } else if c == 35 {
+      comment = true
+    } else if c == 123 {
+      depth = depth + 1
+    } else if c == 125 && depth > 0 {
+      depth = depth - 1
+    }
+    if c == 10 {
+      if i - start == 1 && ssa.code_unit_at(start) == 125 &&
+        !quoted && depth == 0 && cuts.length() < jobs &&
+        i + 1 < n && i - cuts[cuts.length() - 1] >= stride {
+        cuts.push(i + 1)
+      }
+      start = i + 1
+    }
+    i = i + 1
+  }
+  if cuts.length() == 1 { return cleanup_native_rc_ssa_opts(ssa, mask) }
+  cuts.push(n)
+  let replies : Array[Channel[String]] = []
+  scope(world, fn(s : Scope) -> Unit {
+    let mut k = 0
+    while k + 1 < cuts.length() {
+      let lo = cuts[k]
+      let hi = cuts[k + 1]
+      let reply : Channel[String] = Channel::new(1)
+      replies.push(reply)
+      spawn(s, fn() -> Unit {
+        let chunk = ssa.slice(lo, hi)
+        let _ = reply.send(cleanup_native_rc_ssa_opts(chunk, mask))
+      })
+      k = k + 1
+    }
+  })
+  let out = StringBuilder()
+  let mut k = 0
+  while k < replies.length() {
+    match replies[k].recv() {
+      Some(text) => out.write_string(text)
+      None => panic("missing unit cleanup result")
+    }
+    k = k + 1
+  }
+  out.to_string()
+}
+
 ///|
 /// Compiles CAS-missed `.ssa` units to `.o` (parallel `--obj-batch` on direct-object
 /// targets, parallel qbe+as otherwise).
@@ -6151,7 +6222,7 @@ fn drv_build_nodes_objects_entry(
       let final_ssa = if release {
         inline_native_rc_ssa_opts(res.ssa, j2_mask)
       } else {
-        cleanup_native_rc_ssa_opts(res.ssa, j2_mask)
+        drv_cleanup_ssa(world, res.ssa, j2_mask, jobs)
       }
       let _ = drv_write_cas_text_atomic(world, sig_path, pionsig)
       let _ = drv_write_cas_text_atomic(world, stub_path, pionstub)
@@ -6806,6 +6877,15 @@ fn drv_run_wasm_opt(
   }
 }
 
+///| The RC pass depends only on the emitted text and the build options.
+fn drv_finish_unit_ssa(raw : String, release : Bool, mask : Int) -> String {
+  if release {
+    inline_native_rc_ssa_opts(raw, mask)
+  } else {
+    cleanup_native_rc_ssa_opts(raw, mask)
+  }
+}
+
 ///| Emit one unit on the producer thread; the prepared type checker stays local.
 fn drv_emit_unit_file(
   world : World,
@@ -6819,12 +6899,7 @@ fn drv_emit_unit_file(
 ) -> Bool {
   let mask = drv_j2_disable_mask(world)
   let raw = emit_qbe_unit_entry_target_opts(prep, idx, release, target, entry_symbol, no_main, mask)
-  let text = if release {
-    inline_native_rc_ssa_opts(raw, mask)
-  } else {
-    cleanup_native_rc_ssa_opts(raw, mask)
-  }
-  drv_write_cas_text_atomic(world, output, text)
+  drv_write_cas_text_atomic(world, output, drv_finish_unit_ssa(raw, release, mask))
 }
 
 ///|
@@ -7363,72 +7438,89 @@ fn drv_build_targets(
           Some(p) => p
           None => return Err("missing prepared package for unit emission")
         }
-        let emit_errors : Array[String] = []
-        // Temporaries of the batches handed to a worker, published below.
+        let emit_errors : Channel[String] = Channel::new(1)
         let all_tmps : Array[String] = []
         let all_objs : Array[String] = []
+        let mask = drv_j2_disable_mask(world)
         let qmv = qbe_macos_ver
         let qb = qbe_bin
         let qt = qbe_target
         scope(world, fn(s : Scope) -> Unit {
+          let mut turn : Channel[Bool] = Channel::new(1)
+          let _ = turn.send(true)
           let mut wi = 0
           while wi < nw {
             let start = wi * n_miss / nw
             let end = (wi + 1) * n_miss / nw
-            let spec_sb = StringBuilder()
-            let batch_tmps : Array[String] = []
-            let batch_objs : Array[String] = []
+            let paths : Array[String] = []
+            let tmps : Array[String] = []
             let mut k = start
             while k < end {
               let idx = miss_indices[k]
-              let ukey = unit_keys[idx]
-              let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
-              if !drv_emit_unit_file(world, prep, idx, u_ssa, release, qt, entry_symbol, no_main) {
-                emit_errors.push("failed to write CAS unit ssa: " + u_ssa)
-                break
-              }
-              let u_obj = obj_paths[idx]
-              let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
-              spec_sb.write_string(u_ssa)
-              spec_sb.write_char('\n')
-              spec_sb.write_string(u_tmp)
-              spec_sb.write_char('\n')
-              batch_tmps.push(u_tmp)
-              batch_objs.push(u_obj)
+              let obj = obj_paths[idx]
+              let tmp = obj + ".tmp." + stamp_base + "_" + idx.to_string()
+              paths.push(cache_dir + "/ssa/" + unit_keys[idx] + ".ssa")
+              tmps.push(tmp)
+              all_tmps.push(tmp)
+              all_objs.push(obj)
               k = k + 1
             }
-            if emit_errors.length() > 0 {
-              break
-            }
-            let mut j = 0
-            while j < batch_tmps.length() {
-              all_tmps.push(batch_tmps[j])
-              all_objs.push(batch_objs[j])
-              j = j + 1
-            }
-            let spec = spec_sb.to_string()
+            let ssa_paths = paths.to_imm()
+            let obj_tmps = tmps.to_imm()
+            let inbox : Channel[String] = Channel::new(end - start)
+            let before = turn
+            let after : Channel[Bool] = Channel::new(1)
+            turn = after
             spawn(s, fn() -> Unit {
-              let lines = drv_split_lines(spec)
-              let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
-              let mut li = 0
-              while li + 1 < lines.length() {
-                argv.push(lines[li])
-                argv.push(lines[li + 1])
-                li = li + 2
+              let texts : Array[String] = []
+              while true {
+                match inbox.recv() {
+                  Some(raw) => texts.push(drv_finish_unit_ssa(raw, release, mask))
+                  None => break
+                }
               }
-              let rc_qbe = proc_exec(argv)
-              if rc_qbe != 0 {
-                let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+              // Propagate the first failed write; keep the baseline's SSA prefix.
+              let mut ok = before.recv().unwrap_or(false)
+              let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
+              let mut i = 0
+              while ok && i < texts.length() {
+                let path = ssa_paths[i]
+                ok = drv_write_cas_text_atomic(world, path, texts[i])
+                if ok {
+                  argv.push(path)
+                  argv.push(obj_tmps[i])
+                } else {
+                  let _ = emit_errors.send("failed to write CAS unit ssa: " + path)
+                }
+                i = i + 1
+              }
+              let _ = after.send(ok)
+              if ok {
+                let rc_qbe = proc_exec(world, argv)
+                if rc_qbe != 0 {
+                  let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+                }
               }
             })
+            k = start
+            while k < end {
+              let raw = emit_qbe_unit_entry_target_opts(
+                prep, miss_indices[k], release, qt, entry_symbol, no_main, mask,
+              )
+              let _ = inbox.send(raw)
+              k = k + 1
+            }
+            inbox.close()
             wi = wi + 1
           }
         })
-        // Every worker has exited: publish only when the whole frontend and
-        // every backend batch succeeded, as in the sequential producer.
-        if emit_errors.length() > 0 {
-          drv_remove_files(world, all_tmps, 0)
-          return Err(emit_errors[0])
+        emit_errors.close()
+        match emit_errors.recv() {
+          Some(msg) => {
+            drv_remove_files(world, all_tmps, 0)
+            return Err(msg)
+          }
+          None => ()
         }
         err_ch.close()
         match err_ch.recv() {
@@ -7697,7 +7789,7 @@ fn drv_build_targets(
     let final_ssa = if release {
       inline_native_rc_ssa_opts(compiled.ssa, j2_mask)
     } else {
-      cleanup_native_rc_ssa_opts(compiled.ssa, j2_mask)
+      drv_cleanup_ssa(world, compiled.ssa, j2_mask, jobs)
     }
     has_main = compiled.has_main
     if !drv_write_cas_text_atomic(world, sig_path, compiled.sig) {
