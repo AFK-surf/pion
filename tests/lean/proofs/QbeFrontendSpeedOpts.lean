@@ -6,8 +6,9 @@ Invariants behind two byte-identical frontend compile-speed optimizations:
      emitting every unit first. Emitting batch by batch yields the same
      results, and the same first frontend error, as emitting everything up
      front (`batch_order_and_failure`). Workers write private indexed
-     destinations, so the order in which they finish does not matter
-     (`disjoint_writes`).
+     temporaries, so the order in which they finish does not matter
+     (`disjoint_writes`); the main thread publishes them only after every
+     worker exited and every unit and batch succeeded.
   2. `compiler/src/core/lexer.pion`: identifier, number and `@pkg.member`
      ranges are accepted code unit by code unit with ASCII predicates, so
      they are ASCII (`accepted_prefix`), and copying an ASCII range scalar by
@@ -57,7 +58,7 @@ theorem batch_order_and_failure (emit : U → Except String S) (compile : List S
       | error msg => rfl
       | ok ys => rfl
 
-/-- A worker publishing its result into its own slot. -/
+/-- A worker writing its result into its own slot. -/
 def put (store : Nat → Option O) (i : Nat) (v : O) (k : Nat) : Option O :=
   if i = k then some v else store k
 
