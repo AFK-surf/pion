@@ -2525,6 +2525,16 @@ p01_cases = [
     ("fm_set", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { a[2] = 9; Some(x) })\n}\n'),
     ("fm_alias", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let b = a\n  a.filter_map(fn(x) { let _ = b.pop(); Some(x) })\n}\n'),
     ("fm_local_cb", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let cb = fn(x) { let _ = a.pop(); Some(x) }\n  a.filter_map(cb)\n}\n'),
+    ("retain_rev_alias", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let b = a\n  b.retain(fn(x) { if x == 1 { a.push(4); let _ = a.pop(); a[2] = 9 }; true })\n}\n'),
+    ("fm_rev_alias", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let b = a\n  b.filter_map(fn(x) { if x == 1 { a.push(4); let _ = a.pop(); a[2] = 9 }; Some(x) })\n}\n'),
+    ("retain_sep_params", 'pub fn visit(a : Array[Int], b : Array[Int]) -> Unit {\n  b.retain(fn(x) { if x == 1 { a.push(4); let _ = a.pop(); a[2] = 9 }; true })\n}\n'),
+    ("fm_sep_params", 'pub fn visit(a : Array[Int], b : Array[Int]) -> Array[Int] {\n  b.filter_map(fn(x) { if x == 1 { a.push(4); let _ = a.pop(); a[2] = 9 }; Some(x) })\n}\n'),
+    ("retain_inner_alias", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { let c = a; if x == 1 { c.push(4); let _ = c.pop(); c[2] = 9 }; true })\n}\n'),
+    ("fm_inner_alias", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  a.filter_map(fn(x) { let c = a; if x == 1 { c.push(4); let _ = c.pop(); c[2] = 9 }; Some(x) })\n}\n'),
+    ("retain_reassign_alias", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let mut c = [0]\n  c = a\n  a.retain(fn(x) { if x == 1 { c.push(4); let _ = c.pop(); c[2] = 9 }; true })\n}\n'),
+    ("fm_reassign_alias", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let mut c = [0]\n  c = a\n  a.filter_map(fn(x) { if x == 1 { c.push(4); let _ = c.pop(); c[2] = 9 }; Some(x) })\n}\n'),
+    ("retain_helper_arg", 'fn tweak(xs : Array[Int]) -> Unit { xs.push(4); let _ = xs.pop(); xs[2] = 9 }\npub fn f(a : Array[Int], b : Array[Int]) -> Unit {\n  b.retain(fn(x) { if x == 1 { tweak(a) }; true })\n}\n'),
+    ("fm_helper_arg", 'fn tweak(xs : Array[Int]) -> Unit { xs.push(4); let _ = xs.pop(); xs[2] = 9 }\npub fn f(a : Array[Int], b : Array[Int]) -> Array[Int] {\n  b.filter_map(fn(x) { if x == 1 { tweak(a) }; Some(x) })\n}\n'),
 ]
 for tag, code in p01_cases:
     p_src = os.path.join(ut_root, f"p01_{tag}_src")

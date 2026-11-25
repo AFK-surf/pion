@@ -104,7 +104,7 @@ CASES = {
     "transpile_core": ("ok", 7),
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
-    "transpile_upper_tier": ("ok", 30),
+    "transpile_upper_tier": ("ok", 34),
 }
 
 MOON_TRAPS = {
@@ -1793,6 +1793,71 @@ pub fn ut_r4_nested_kw_params(val~ : Int, val_~ : Int) -> (Int, Int, Int, Int) {
   }
   (f(1), g(1), inner(1), val * 10 + val_)
 }
+
+// Astra Round 5 P0-2, P1-1 positive (6 cases), P1-2 custom Holder::retain
+pub(all) struct UtCallA {
+  val : Int
+}
+
+pub(all) struct UtCallB {
+  val_ : Int
+  val : Int
+}
+
+fn ut_mk_b(_v : UtCallA) -> UtCallB {
+  UtCallB::{ val_: 9, val: 1 }
+}
+
+pub fn ut_r5_call_tuple_val() -> Int {
+  let r : (UtCallA, Int) = (UtCallA::{ val: 0 }, 0)
+  ut_mk_b(r.0).val
+}
+
+pub fn ut_r5_p1_1_retain_positive() -> (Int, Int, Int) {
+  let a1 = [1, 2, 3]
+  let b1 = a1.copy()
+  a1.retain(fn(x) { b1.push(x); x > 0 })
+  let a2 = [1, 2, 3]
+  a2.retain(fn(x) {
+    let a2 = [10, 20]
+    a2.push(30)
+    x > 0 && a2.length() == 3
+  })
+  let a3 = [1, 2, 3]
+  fn size3() -> Int { a3.length() }
+  a3.retain(fn(x) { size3() == 3 && x > 0 })
+  (a1[0] * 100 + a1[1] * 10 + a1[2], a2[0] * 100 + a2[1] * 10 + a2[2], a3[0] * 100 + a3[1] * 10 + a3[2])
+}
+
+pub fn ut_r5_p1_1_fm_positive() -> (Int, Int, Int) {
+  let a1 = [1, 2, 3]
+  let b1 = a1.copy()
+  let r1 = a1.filter_map(fn(x) { b1.push(x); Option::Some(x) })
+  let a2 = [1, 2, 3]
+  let r2 = a2.filter_map(fn(x) {
+    let a2 = [10, 20]
+    a2.push(30)
+    if a2.length() == 3 { Option::Some(x) } else { Option::None }
+  })
+  let a3 = [1, 2, 3]
+  fn size3() -> Int { a3.length() }
+  let r3 = a3.filter_map(fn(x) { if size3() == 3 { Option::Some(x) } else { Option::None } })
+  (r1[0] * 100 + r1[1] * 10 + r1[2], r2[0] * 100 + r2[1] * 10 + r2[2], r3[0] * 100 + r3[1] * 10 + r3[2])
+}
+
+pub(all) struct UtCustomHolder {
+  mut count : Int
+}
+
+fn UtCustomHolder::retain(self : UtCustomHolder, f : () -> Unit) -> Unit {
+  f()
+}
+
+pub fn ut_r5_p1_2_custom_holder_retain() -> Int {
+  let h = UtCustomHolder::{ count: 1 }
+  h.retain(fn() { h.count = 9 })
+  h.count
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -2379,6 +2444,15 @@ fn main {
     check("ut.r4_arrow_kw_param", nk2 == 19)
     check("ut.r4_local_fn_kw_param", nk3 == 19)
     check("ut.r4_outer_kw_preserved", nk4 == 89)
+    let r5v = @m12.ut_r5_call_tuple_val()
+    let (rp1, rp2, rp3) = @m12.ut_r5_p1_1_retain_positive()
+    let (fp1, fp2, fp3) = @m12.ut_r5_p1_1_fm_positive()
+    let r5h = @m12.ut_r5_p1_2_custom_holder_retain()
+    trace("utr5", "\{r5v},\{rp1}:\{rp2}:\{rp3},\{fp1}:\{fp2}:\{fp3},\{r5h}")
+    check("ut.r5_call_tuple_val", r5v == 1)
+    check("ut.r5_p1_1_retain_positive", rp1 == 123 && rp2 == 123 && rp3 == 123)
+    check("ut.r5_p1_1_fm_positive", fp1 == 123 && fp2 == 123 && fp3 == 123)
+    check("ut.r5_p1_2_custom_holder_retain", r5h == 9)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2982,6 +3056,15 @@ pub fn main(w : World) -> Int {
     check(w, "ut.r4_arrow_kw_param", nk2 == 19)
     check(w, "ut.r4_local_fn_kw_param", nk3 == 19)
     check(w, "ut.r4_outer_kw_preserved", nk4 == 89)
+    let r5v = m12::ut_r5_call_tuple_val()
+    let (rp1, rp2, rp3) = m12::ut_r5_p1_1_retain_positive()
+    let (fp1, fp2, fp3) = m12::ut_r5_p1_1_fm_positive()
+    let r5h = m12::ut_r5_p1_2_custom_holder_retain()
+    trace(w, "utr5", r5v.to_string() + "," + rp1.to_string() + ":" + rp2.to_string() + ":" + rp3.to_string() + "," + fp1.to_string() + ":" + fp2.to_string() + ":" + fp3.to_string() + "," + r5h.to_string())
+    check(w, "ut.r5_call_tuple_val", r5v == 1)
+    check(w, "ut.r5_p1_1_retain_positive", rp1 == 123 && rp2 == 123 && rp3 == 123)
+    check(w, "ut.r5_p1_1_fm_positive", fp1 == 123 && fp2 == 123 && fp3 == 123)
+    check(w, "ut.r5_p1_2_custom_holder_retain", r5h == 9)
   } else {
     panic("abort: unknown case " + kase)
   }
