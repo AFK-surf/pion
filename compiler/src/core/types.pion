@@ -463,6 +463,13 @@ pub struct Env {
 }
 
 ///|
+/// A generic fn value's instantiated type and the type params it binds.
+pub struct TcFnValInst {
+  ty : Ty
+  bound : Array[String]
+}
+
+///|
 /// A call `callee[tparam := concrete]` whose validity depends on whether the
 /// callee compares `tparam` values with `==` / `!=`.
 pub struct EqUse {
@@ -7988,6 +7995,772 @@ fn method_params_for(tc : TypeChecker, env : Env, recv_ty : Ty, m : String) -> O
 }
 
 ///|
+/// The type of a fn or static method used as a value. A generic one is
+/// instantiated from the expected `TFn` (`let f : (Array[Int]) -> Int =
+/// first_of`, the argument of a higher-order call); the type params it does
+/// not fix are left unresolved (never leaked as the callee's own `TParam`s).
+/// The enclosing call re-instantiates it once its later arguments fixed more
+/// (`tc_recheck_fn_value_args`).
+fn tc_fn_value_ty(
+  tc : TypeChecker,
+  env : Env,
+  fd : FnDecl,
+  callee_name : String,
+  ptys : Array[Ty],
+  rty : Ty,
+  expected : Option[Ty],
+  sp : Span,
+) -> Ty {
+  if fd.type_params.length() == 0 {
+    return TFn(ptys, rty)
+  }
+  // This occurrence resolved to the generic fn (not a local of that name):
+  // only marked occurrences are refined once their call's types are final.
+  tc.let_infer.set(span_key(sp) + "#fnref", TUnit)
+  match expected {
+    Some(TFn(eps, _)) =>
+      if eps.length() == ptys.length() {
+        let exp = match expected {
+          Some(t) => t
+          None => TError
+        }
+        tc_inst_fn_value(tc, env, fd, callee_name, ptys, rty, exp, sp, []).ty
+      } else {
+        TFn(ptys, rty)
+      }
+    _ => TFn(ptys, rty)
+  }
+}
+
+///|
+/// Instantiates a generic fn value against `exp` (a `TFn` of its arity).
+/// Every type param it binds, apart from those in `already`, obeys the same
+/// trait bounds and `==` rules as a direct call; the instance type is
+/// recorded (`<span>#fnval`) for codegen.
+fn tc_inst_fn_value(
+  tc : TypeChecker,
+  env : Env,
+  fd : FnDecl,
+  callee_name : String,
+  ptys : Array[Ty],
+  rty : Ty,
+  exp : Ty,
+  sp : Span,
+  already : Array[String],
+) -> TcFnValInst {
+  let subst : Map[String, Ty] = Map([])
+  match exp {
+    TFn(eps, er) => {
+      let mut i = 0
+      while i < ptys.length() && i < eps.length() {
+        unify_tparams(ptys[i], eps[i], subst)
+        i = i + 1
+      }
+      unify_tparams(rty, er, subst)
+    }
+    _ => ()
+  }
+  let bound : Array[String] = []
+  let fresh : Map[String, Ty] = Map([])
+  let mut i = 0
+  while i < fd.type_params.length() {
+    let tp = fd.type_params[i]
+    match subst.get(tp) {
+      Some(t) =>
+        if !ty_has_unresolved(t) {
+          bound.push(tp)
+          if !str_arr_contains(already, tp) {
+            fresh.set(tp, t)
+          }
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  tc_check_type_bounds(tc, env, fd, fresh, sp)
+  tc_push_eq_uses(tc, env, fd, callee_name, fresh, sp)
+  let inst : Array[Ty] = []
+  i = 0
+  while i < ptys.length() {
+    inst.push(subst_ty_mask_unbound(ptys[i], fd.type_params, subst))
+    i = i + 1
+  }
+  let ty = TFn(inst, subst_ty_mask_unbound(rty, fd.type_params, subst))
+  // A default argument is checked against the callee's own type params:
+  // codegen instantiates it per call from the expected type instead.
+  if !env.in_default_arg {
+    tc.let_infer.set(span_key(sp) + "#fnval", ty)
+  }
+  TcFnValInst::{ ty: ty, bound: bound }
+}
+
+///|
+/// The generic top-level fn or static method `e` names as a value, if any.
+fn tc_generic_fn_ref(tc : TypeChecker, env : Env, e : Expr) -> Option[FnInfo] {
+  let fi_opt : Option[FnInfo] = match e {
+    EIdent(n, _) =>
+      match env_lookup(env, n) {
+        Some(_) => None
+        None => tc.fns.get(n)
+      }
+    EPath(q, m, _) => {
+      match tc.methods.get(q + "::" + m) {
+        Some(mi) => return if mi.decl.type_params.length() > 0 { Some(mi) } else { None }
+        None => ()
+      }
+      match resolve_pkg_for_lookup(tc, q, true) {
+        Some(ipkg) =>
+          match ipkg.tc.fns.get(m) {
+            Some(fi) => return if fi.decl.type_params.length() > 0 { Some(qualify_fn_info(ipkg, fi)) } else { None }
+            None => ()
+          }
+        None => ()
+      }
+      let qp = split_qual_name(q)
+      if qp.prefix.length() > 0 {
+        match resolve_pkg_for_lookup(tc, qp.prefix, true) {
+          Some(ipkg) =>
+            match ipkg.tc.methods.get(qp.name + "::" + m) {
+              Some(mi) => return if mi.decl.type_params.length() > 0 { Some(qualify_fn_info(ipkg, mi)) } else { None }
+              None => ()
+            }
+          None => ()
+        }
+      }
+      None
+    }
+    _ => None
+  }
+  match fi_opt {
+    Some(fi) => if fi.decl.type_params.length() > 0 { Some(fi) } else { None }
+    None => None
+  }
+}
+
+///|
+/// Whether a generic fn value occurs where the value of `e` comes from: `e`
+/// itself, an element / field / payload / argument of it, or the value of a
+/// block, `if` or `match` in it.
+fn tc_expr_has_generic_fn_value(tc : TypeChecker, env : Env, e : Expr) -> Bool {
+  match e {
+    EIdent(_, _) | EPath(_, _, _) =>
+      match tc_generic_fn_ref(tc, env, e) {
+        Some(_) => true
+        None => false
+      }
+    ECall(_, args, _) | EDotVariant(_, args, _) | ETuple(args, _) | EArrayLit(args, _) =>
+      tc_exprs_have_generic_fn_value(tc, env, args)
+    EMethodCall(recv, _, args, _) =>
+      tc_expr_has_generic_fn_value(tc, env, recv) ||
+      tc_exprs_have_generic_fn_value(tc, env, args)
+    EStructLit(_, spread, fields, _) => {
+      match spread {
+        Some(b) => if tc_expr_has_generic_fn_value(tc, env, b) { return true }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if tc_expr_has_generic_fn_value(tc, env, fields[i].value) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EBlock(stmts, _) => tc_stmts_tail_has_generic_fn_value(tc, env, stmts)
+    EIf(_, then_stmts, else_opt, _) =>
+      tc_stmts_tail_has_generic_fn_value(tc, env, then_stmts) ||
+      (
+        match else_opt {
+          Some(el) => tc_expr_has_generic_fn_value(tc, env, el)
+          None => false
+        }
+      )
+    EMatch(_, arms, _) => {
+      let mut i = 0
+      while i < arms.length() {
+        if tc_expr_has_generic_fn_value(tc, env, arms[i].body) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    ENamedArg(_, _, inner, _) => tc_expr_has_generic_fn_value(tc, env, inner)
+    _ => false
+  }
+}
+
+///|
+fn tc_exprs_have_generic_fn_value(tc : TypeChecker, env : Env, es : Array[Expr]) -> Bool {
+  let mut i = 0
+  while i < es.length() {
+    if tc_expr_has_generic_fn_value(tc, env, es[i]) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn tc_stmts_tail_has_generic_fn_value(tc : TypeChecker, env : Env, stmts : Array[Stmt]) -> Bool {
+  if stmts.length() == 0 {
+    return false
+  }
+  match stmts[stmts.length() - 1] {
+    SExpr(e, _) => tc_expr_has_generic_fn_value(tc, env, e)
+    _ => false
+  }
+}
+
+///|
+fn tc_fnval_exp_key(exp : Option[Ty]) -> String {
+  match exp {
+    Some(t) => ty_to_string(t)
+    None => ""
+  }
+}
+
+///|
+/// Arguments are checked in source order, so a generic fn value in an
+/// argument may be instantiated before later arguments fixed the call's type
+/// params (`consume(id, 1, true)`, `both((score, score), 3, 4L)`,
+/// `run(keep(Holder::{ f: id }), 1, true)`). Once the call's substitution is
+/// final, every such argument whose expected type grew is walked again
+/// against it (`tc_refine_fn_values`): only its generic fn values are
+/// re-instantiated, nothing else is re-checked, so moves, inference and
+/// diagnostics keep source order.
+fn tc_recheck_fn_value_args(
+  tc : TypeChecker,
+  env : Env,
+  fd : FnDecl,
+  param_tys : Array[Ty],
+  offset : Int,
+  args : Array[Expr],
+  first_exp : Array[String],
+  subst : Map[String, Ty],
+  ctx : String,
+  numbered : Bool,
+) -> Unit {
+  let mut i = 0
+  while i < args.length() && i < first_exp.length() {
+    let p_idx = i + offset
+    if first_exp[i] != "" && p_idx < param_tys.length() {
+      let exp = subst_ty_mask_unbound(param_tys[p_idx], fd.type_params, subst)
+      if ty_to_string(exp) != first_exp[i] &&
+        tc_expr_has_generic_fn_value(tc, env, args[i]) {
+        let label = if numbered {
+          "argument " + (i + 1).to_string() + " type mismatch " + ctx
+        } else {
+          "argument type mismatch " + ctx
+        }
+        tc_refine_fn_values(tc, env, args[i], exp, label)
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// Walks `e` (already checked) together with its now final expected type
+/// `exp` down to the generic fn values its value comes from (tuple elements,
+/// array elements, struct fields, `Some` / `Ok` / `Err` / enum payloads, the
+/// arguments of generic calls relaying them, block / `if` / `match` values)
+/// and re-instantiates each against its own part of `exp`: bounds and `==`
+/// rules for the params it newly binds, a mismatch is `E_TYPE_MISMATCH`, and
+/// the recorded instantiation (`<span>#fnval`) is updated for codegen.
+fn tc_refine_fn_values(
+  tc : TypeChecker,
+  env : Env,
+  e : Expr,
+  exp : Ty,
+  label : String,
+) -> Unit {
+  let fnref = match tc.let_infer.get(span_key(expr_span(e)) + "#fnref") {
+    Some(_) => tc_generic_fn_ref(tc, env, e)
+    None => None
+  }
+  match fnref {
+    Some(fi) => {
+      match exp {
+        TFn(eps, _) =>
+          if eps.length() == fi.param_tys.length() {
+            let sp = expr_span(e)
+            let fn_ty = TFn(fi.param_tys, fi.ret_ty)
+            // Params the earlier instantiation already bound were checked;
+            // a param `exp` leaves open keeps that earlier binding.
+            let already : Array[String] = []
+            let merged : Map[String, Ty] = Map([])
+            unify_tparams(fn_ty, exp, merged)
+            match tc.let_infer.get(span_key(sp) + "#fnval") {
+              Some(prev) => {
+                let ps : Map[String, Ty] = Map([])
+                unify_tparams(fn_ty, prev, ps)
+                let mut k = 0
+                while k < fi.decl.type_params.length() {
+                  let tp = fi.decl.type_params[k]
+                  match ps.get(tp) {
+                    Some(t) =>
+                      if !ty_has_unresolved(t) {
+                        already.push(tp)
+                        let keep_prev = match merged.get(tp) {
+                          Some(m) => ty_has_unresolved(m)
+                          None => true
+                        }
+                        if keep_prev {
+                          merged.set(tp, t)
+                        }
+                      }
+                    None => ()
+                  }
+                  k = k + 1
+                }
+              }
+              None => ()
+            }
+            let r = tc_inst_fn_value(
+              tc,
+              env,
+              fi.decl,
+              fi.decl.name,
+              fi.param_tys,
+              fi.ret_ty,
+              subst_ty_mask_unbound(fn_ty, fi.decl.type_params, merged),
+              sp,
+              already,
+            )
+            if !ty_compat(exp, r.ty) {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                label,
+                ty_to_string(exp),
+                ty_to_string(r.ty),
+                "pass a value of type `" + ty_to_string(exp) + "`",
+              )
+            }
+          }
+        _ => ()
+      }
+      return
+    }
+    None => ()
+  }
+  match e {
+    ETuple(es, _) =>
+      match exp {
+        TTuple(ts) => {
+          let mut i = 0
+          while i < es.length() && i < ts.length() {
+            tc_refine_fn_values(tc, env, es[i], ts[i], label)
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    EArrayLit(es, _) =>
+      match exp {
+        TArray(et) | TFixedArray(et) | TImmArray(et) => {
+          let mut i = 0
+          while i < es.length() {
+            tc_refine_fn_values(tc, env, es[i], et, label)
+            i = i + 1
+          }
+        }
+        _ => ()
+      }
+    EStructLit(_, spread, fields, _) =>
+      match exp {
+        TStruct(sn, targs) => {
+          match spread {
+            Some(b) => tc_refine_fn_values(tc, env, b, exp, label)
+            None => ()
+          }
+          match tc_lookup_struct_info(tc, sn) {
+            Some(si) => {
+              let fs = make_subst(si.decl.type_params, targs)
+              let mut i = 0
+              while i < fields.length() {
+                let mut fi = 0
+                while fi < si.field_names.length() {
+                  if si.field_names[fi] == fields[i].name {
+                    tc_refine_fn_values(tc, env, fields[i].value, subst_ty(si.field_tys[fi], fs), label)
+                    break
+                  }
+                  fi = fi + 1
+                }
+                i = i + 1
+              }
+            }
+            None => ()
+          }
+        }
+        _ => ()
+      }
+    EDotVariant(vname, args, _) => tc_refine_variant_args(tc, env, vname, args, exp, label)
+    ECall(callee, args, call_sp) => {
+      let cname = match callee {
+        EIdent(n, _) => n
+        EPath(_, m, _) => m
+        _ => ""
+      }
+      match exp {
+        TOption(inner) =>
+          if cname == "Some" && args.length() == 1 {
+            tc_refine_fn_values(tc, env, args[0], inner, label)
+            return
+          }
+        TResult(ok, err) =>
+          if args.length() == 1 {
+            if cname == "Ok" {
+              tc_refine_fn_values(tc, env, args[0], ok, label)
+              return
+            }
+            if cname == "Err" {
+              tc_refine_fn_values(tc, env, args[0], err, label)
+              return
+            }
+          }
+        TEnum(_, _) =>
+          if tc_variant_field_tys(tc, cname, exp).length() > 0 {
+            tc_refine_variant_args(tc, env, cname, args, exp, label)
+            return
+          }
+        _ => ()
+      }
+      // A generic call relaying a value (`pass(id)`, `keep(Holder::{ f: id })`):
+      // its result has type `exp`, which fixes more of its type params.
+      match tc.let_infer.get(span_key(call_sp) + "#gcall") {
+        Some(_) => {
+          let callee_fi : Option[FnInfo] = match callee {
+            EIdent(n, _) =>
+              match env_lookup(env, n) {
+                Some(_) => None
+                None => tc.fns.get(n)
+              }
+            EPath(_, _, _) => tc_generic_fn_ref(tc, env, callee)
+            _ => None
+          }
+          match callee_fi {
+            Some(cf) => tc_refine_relay(tc, env, cf, 0, args, exp, call_sp, label)
+            None => ()
+          }
+        }
+        None => ()
+      }
+    }
+    EMethodCall(_, mname, args, call_sp) =>
+      match tc.let_infer.get(span_key(call_sp) + "#gmeth") {
+        Some(TStruct(sname, _)) =>
+          match tc.methods.get(sname + "::" + mname) {
+            Some(mi) => tc_refine_relay(tc, env, mi, 1, args, exp, call_sp, label)
+            None => ()
+          }
+        _ => ()
+      }
+    EBlock(stmts, _) => tc_refine_stmts_tail(tc, env, stmts, exp, label)
+    EIf(_, then_stmts, else_opt, _) => {
+      tc_refine_stmts_tail(tc, env, then_stmts, exp, label)
+      match else_opt {
+        Some(el) => tc_refine_fn_values(tc, env, el, exp, label)
+        None => ()
+      }
+    }
+    EMatch(_, arms, _) => {
+      let mut i = 0
+      while i < arms.length() {
+        tc_refine_fn_values(tc, env, arms[i].body, exp, label)
+        i = i + 1
+      }
+    }
+    ENamedArg(_, _, inner, _) => tc_refine_fn_values(tc, env, inner, exp, label)
+    _ => ()
+  }
+}
+
+///|
+/// Refines the arguments of a generic call (`pass(id)`) or method call
+/// (`b.pass(id)`, `offset = 1` for `self`) whose result is now known to have
+/// type `exp`. Starts from the call's own instantiation (`<span>#gcall`), so
+/// params its arguments already fixed are kept; the params `exp` newly fixes
+/// obey the callee's bounds and `==` rules, and the record is updated.
+fn tc_refine_relay(
+  tc : TypeChecker,
+  env : Env,
+  cf : FnInfo,
+  offset : Int,
+  args : Array[Expr],
+  exp : Ty,
+  call_sp : Span,
+  label : String,
+) -> Unit {
+  let tps = cf.decl.type_params
+  if tps.length() == 0 {
+    return
+  }
+  let key = span_key(call_sp) + "#gcall"
+  let cs : Map[String, Ty] = Map([])
+  match tc.let_infer.get(key) {
+    Some(TTuple(targs)) => {
+      let mut k = 0
+      while k < tps.length() && k < targs.length() {
+        if !ty_has_unresolved(targs[k]) {
+          cs.set(tps[k], targs[k])
+        }
+        k = k + 1
+      }
+    }
+    _ => ()
+  }
+  let had : Array[String] = []
+  let mut k = 0
+  while k < tps.length() {
+    match cs.get(tps[k]) {
+      Some(_) => had.push(tps[k])
+      None => ()
+    }
+    k = k + 1
+  }
+  unify_tparams(cf.ret_ty, exp, cs)
+  let fresh : Map[String, Ty] = Map([])
+  let targs : Array[Ty] = []
+  k = 0
+  while k < tps.length() {
+    match cs.get(tps[k]) {
+      Some(t) =>
+        if ty_has_unresolved(t) {
+          targs.push(TError)
+        } else {
+          targs.push(t)
+          if !str_arr_contains(had, tps[k]) {
+            fresh.set(tps[k], t)
+          }
+        }
+      None => targs.push(TError)
+    }
+    k = k + 1
+  }
+  tc_check_type_bounds(tc, env, cf.decl, fresh, call_sp)
+  tc_push_eq_uses(tc, env, cf.decl, cf.decl.name, fresh, call_sp)
+  tc.let_infer.set(key, TTuple(targs))
+  // Bind arguments to parameters exactly like the call did (named, optional
+  // `v=x` wrapped as `Some(x)`, positional skipping labelled params); no
+  // diagnostics, defaults and missing slots are not refined.
+  let res = resolve_call_args_impl(None, cf.decl.params, offset, args, cf.decl.name, call_sp)
+  let mut i = 0
+  while i < res.args.length() {
+    let is_def = i < res.from_default.length() && res.from_default[i]
+    let is_missing = i < res.missing.length() && res.missing[i]
+    if !is_def && !is_missing && i + offset < cf.param_tys.length() {
+      tc_refine_fn_values(
+        tc,
+        env,
+        res.args[i],
+        subst_ty_mask_unbound(cf.param_tys[i + offset], tps, cs),
+        label,
+      )
+    }
+    i = i + 1
+  }
+}
+
+///|
+fn tc_record_gcall(tc : TypeChecker, fd : FnDecl, subst : Map[String, Ty], sp : Span) -> Unit {
+  if fd.type_params.length() == 0 {
+    return
+  }
+  let targs : Array[Ty] = []
+  let mut k = 0
+  while k < fd.type_params.length() {
+    match subst.get(fd.type_params[k]) {
+      Some(t) => targs.push(if ty_has_unresolved(t) { TError } else { t })
+      None => targs.push(TError)
+    }
+    k = k + 1
+  }
+  tc.let_infer.set(span_key(sp) + "#gcall", TTuple(targs))
+}
+
+///|
+fn tc_refine_stmts_tail(
+  tc : TypeChecker,
+  env : Env,
+  stmts : Array[Stmt],
+  exp : Ty,
+  label : String,
+) -> Unit {
+  if stmts.length() > 0 {
+    match stmts[stmts.length() - 1] {
+      SExpr(e, _) => tc_refine_fn_values(tc, env, e, exp, label)
+      _ => ()
+    }
+  }
+}
+
+///|
+/// Payload types of variant `vname` of the enum type `exp`.
+fn tc_variant_field_tys(tc : TypeChecker, vname : String, exp : Ty) -> Array[Ty] {
+  match exp {
+    TEnum(en, targs) =>
+      match tc_lookup_enum_info(tc, en) {
+        Some(ei) => {
+          let es = make_subst(ei.decl.type_params, targs)
+          let mut vi = 0
+          while vi < ei.variants.length() {
+            if ei.variants[vi].name == vname {
+              let out : Array[Ty] = []
+              let mut k = 0
+              while k < ei.variants[vi].field_tys.length() {
+                out.push(subst_ty(ei.variants[vi].field_tys[k], es))
+                k = k + 1
+              }
+              return out
+            }
+            vi = vi + 1
+          }
+          []
+        }
+        None => []
+      }
+    _ => []
+  }
+}
+
+///|
+fn tc_refine_variant_args(
+  tc : TypeChecker,
+  env : Env,
+  vname : String,
+  args : Array[Expr],
+  exp : Ty,
+  label : String,
+) -> Unit {
+  let ftys = tc_variant_field_tys(tc, vname, exp)
+  let mut i = 0
+  while i < args.length() && i < ftys.length() {
+    tc_refine_fn_values(tc, env, args[i], ftys[i], label)
+    i = i + 1
+  }
+}
+
+///|
+/// Checks the trait bounds of `fd`'s type params against an instantiation.
+fn tc_check_type_bounds(
+  tc : TypeChecker,
+  env : Env,
+  fd : FnDecl,
+  subst : Map[String, Ty],
+  sp : Span,
+) -> Unit {
+  let mut bi = 0
+  while bi < fd.type_bounds.length() {
+    let tb = fd.type_bounds[bi]
+    match subst.get(tb.param) {
+      Some(concrete_ty) =>
+        match concrete_ty {
+          TError | TNever => ()
+          TParam(other_tp) => {
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let has_bound = match env.type_bounds.get(other_tp) {
+                Some(btrs) => str_arr_contains(btrs, req_tr)
+                None => false
+              }
+              if !has_bound {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TRAIT_NOT_IMPLEMENTED",
+                  "type parameter `" +
+                  other_tp +
+                  "` does not satisfy trait bound `" +
+                  req_tr +
+                  "` required by `" +
+                  fd.name +
+                  "`",
+                  other_tp + " : " + req_tr,
+                  other_tp,
+                  "add `: " + req_tr + "` bound to type parameter `" + other_tp + "`",
+                )
+              }
+              ti = ti + 1
+            }
+          }
+          _ => {
+            let tname = ty_base_name(concrete_ty)
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let impl_key = req_tr + "::" + tname
+              if !tc.impls.contains(impl_key) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TRAIT_NOT_IMPLEMENTED",
+                  "type `" +
+                  ty_to_string(concrete_ty) +
+                  "` does not implement trait `" +
+                  req_tr +
+                  "` required by `" +
+                  fd.name +
+                  "`",
+                  "impl " + req_tr + " for " + ty_to_string(concrete_ty),
+                  ty_to_string(concrete_ty),
+                  "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
+                )
+                add_missing_impl_edit(tc, req_tr, concrete_ty)
+              } else if env.in_verify {
+                match tc.impls.get(impl_key) {
+                  Some(ii) => tc_check_verify_impl(tc, env, ii, req_tr, tname, fd.name, sp)
+                  None => ()
+                }
+              }
+              ti = ti + 1
+            }
+          }
+        }
+      None => ()
+    }
+    bi = bi + 1
+  }
+}
+
+///|
+/// Records `fd`'s instantiation for `resolve_eq_uses`, which rejects
+/// non-comparable types for type params its body compares with `==`.
+fn tc_push_eq_uses(
+  tc : TypeChecker,
+  env : Env,
+  fd : FnDecl,
+  callee_name : String,
+  subst : Map[String, Ty],
+  sp : Span,
+) -> Unit {
+  let mut ti = 0
+  while ti < fd.type_params.length() {
+    let tp = fd.type_params[ti]
+    match subst.get(tp) {
+      Some(concrete) =>
+        tc.eq_uses.push(EqUse::{
+          callee_key: span_key(fd.span),
+          callee_name: callee_name,
+          tparam: tp,
+          concrete: concrete,
+          caller_key: env.fn_key,
+          caller_is_verify: env.in_verify,
+          callee_is_verify_opaque: fd.is_verify_opaque,
+          span: sp,
+        })
+      None => ()
+    }
+    ti = ti + 1
+  }
+}
+
+///|
 /// A function with `mut` parameters takes in-out pointers: it cannot become a
 /// first-class `(...) -> R` value.
 fn tc_check_fn_value_no_mut(tc : TypeChecker, fd : FnDecl, name : String, sp : Span) -> Unit {
@@ -9071,8 +9844,10 @@ fn check_fn_call(
     )
     add_arity_edit(tc, sp, args, finfo.param_tys)
   }
+  let fnval_exp : Array[String] = []
   let mut i = 0
   while i < resolved_args.length() {
+    fnval_exp.push("")
     if i < missing_flags.length() && missing_flags[i] {
       i = i + 1
       continue
@@ -9155,6 +9930,9 @@ fn check_fn_call(
         finfo.decl.name,
       )
       env.in_default_arg = saved_in_def
+      if !is_def {
+        fnval_exp[i] = tc_fnval_exp_key(arg_exp)
+      }
       if i < finfo.param_tys.length() {
         let mut eff_aty = if is_def { subst_ty(aty, subst) } else { aty }
         let pre_pty = subst_ty(finfo.param_tys[i], subst)
@@ -9192,79 +9970,20 @@ fn check_fn_call(
     }
     i = i + 1
   }
+  tc_recheck_fn_value_args(
+    tc,
+    env,
+    finfo.decl,
+    finfo.param_tys,
+    0,
+    resolved_args,
+    fnval_exp,
+    subst,
+    "in call to `" + finfo.decl.name + "`",
+    true,
+  )
   // Validate trait bounds on generic type parameters
-  let mut bi = 0
-  while bi < finfo.decl.type_bounds.length() {
-    let tb = finfo.decl.type_bounds[bi]
-    match subst.get(tb.param) {
-      Some(concrete_ty) =>
-        match concrete_ty {
-          TError | TNever => ()
-          TParam(other_tp) => {
-            let mut ti = 0
-            while ti < tb.traits.length() {
-              let req_tr = canon_trait_name(tc, tb.traits[ti])
-              let has_bound = match env.type_bounds.get(other_tp) {
-                Some(btrs) => str_arr_contains(btrs, req_tr)
-                None => false
-              }
-              if !has_bound {
-                tc_err(
-                  tc,
-                  sp,
-                  "E_TRAIT_NOT_IMPLEMENTED",
-                  "type parameter `" +
-                  other_tp +
-                  "` does not satisfy trait bound `" +
-                  req_tr +
-                  "` required by `" +
-                  finfo.decl.name +
-                  "`",
-                  other_tp + " : " + req_tr,
-                  other_tp,
-                  "add `: " + req_tr + "` bound to type parameter `" + other_tp + "`",
-                )
-              }
-              ti = ti + 1
-            }
-          }
-          _ => {
-            let tname = ty_base_name(concrete_ty)
-            let mut ti = 0
-            while ti < tb.traits.length() {
-              let req_tr = canon_trait_name(tc, tb.traits[ti])
-              let impl_key = req_tr + "::" + tname
-              if !tc.impls.contains(impl_key) {
-                tc_err(
-                  tc,
-                  sp,
-                  "E_TRAIT_NOT_IMPLEMENTED",
-                  "type `" +
-                  ty_to_string(concrete_ty) +
-                  "` does not implement trait `" +
-                  req_tr +
-                  "` required by `" +
-                  finfo.decl.name +
-                  "`",
-                  "impl " + req_tr + " for " + ty_to_string(concrete_ty),
-                  ty_to_string(concrete_ty),
-                  "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
-                )
-                add_missing_impl_edit(tc, req_tr, concrete_ty)
-              } else if env.in_verify {
-                match tc.impls.get(impl_key) {
-                  Some(ii) => tc_check_verify_impl(tc, env, ii, req_tr, tname, finfo.decl.name, sp)
-                  None => ()
-                }
-              }
-              ti = ti + 1
-            }
-          }
-        }
-      None => ()
-    }
-    bi = bi + 1
-  }
+  tc_check_type_bounds(tc, env, finfo.decl, subst, sp)
   if params_have_mut(finfo.decl.params) {
     let muts : Array[Bool] = []
     let mut mi = 0
@@ -9282,26 +10001,13 @@ fn check_fn_call(
   }
   // Record instantiations; `resolve_eq_uses` rejects non-comparable ones once
   // every generic body (and its `==` uses) has been checked.
-  let mut ti = 0
-  while ti < finfo.decl.type_params.length() {
-    let tp = finfo.decl.type_params[ti]
-    match subst.get(tp) {
-      Some(concrete) =>
-        tc.eq_uses.push(EqUse::{
-          callee_key: span_key(finfo.decl.span),
-          callee_name: finfo.decl.name,
-          tparam: tp,
-          concrete: concrete,
-          caller_key: env.fn_key,
-          caller_is_verify: env.in_verify,
-          callee_is_verify_opaque: finfo.decl.is_verify_opaque,
-          span: sp,
-        })
-      None => ()
-    }
-    ti = ti + 1
-  }
-  subst_ty(finfo.ret_ty, subst)
+  tc_push_eq_uses(tc, env, finfo.decl, finfo.decl.name, subst, sp)
+  // A generic call that may relay fn values (`tc_refine_relay`), with the
+  // instantiation its arguments fixed.
+  tc_record_gcall(tc, finfo.decl, subst, sp)
+  // A type param no argument fixed is unresolved, never the callee's own
+  // `TParam` leaking into the caller (`pass(second)` before `T` is known).
+  subst_ty_mask_unbound(finfo.ret_ty, finfo.decl.type_params, subst)
 }
 
 ///|
@@ -10974,8 +11680,10 @@ fn check_method_call(
               )
             }
           }
+          let fnval_exp : Array[String] = []
           let mut i = 0
           while i < resolved_args.length() {
+            fnval_exp.push("")
             if i < missing_flags.length() && missing_flags[i] {
               i = i + 1
               continue
@@ -11059,6 +11767,9 @@ fn check_method_call(
                 key,
               )
               env.in_default_arg = saved_in_def
+              if !is_def {
+                fnval_exp[i] = tc_fnval_exp_key(arg_exp)
+              }
               if p_idx < minfo.param_tys.length() {
                 let mut eff_aty = if is_def { subst_ty(aty, subst) } else { aty }
                 let pre_pty = subst_ty(minfo.param_tys[p_idx], subst)
@@ -11096,6 +11807,18 @@ fn check_method_call(
             }
             i = i + 1
           }
+          tc_recheck_fn_value_args(
+            tc,
+            env,
+            minfo.decl,
+            minfo.param_tys,
+            1,
+            resolved_args,
+            fnval_exp,
+            subst,
+            "in method `" + key + "`",
+            false,
+          )
           let mtarget = tc_qualify_local_name(tc, sname) + "::" + method_name
           tc_check_verify_callee(tc, env, minfo.decl, mtarget, sp)
           tc_record_call(tc, env, sp, mtarget, minfo.decl.type_params, subst)
@@ -11103,26 +11826,13 @@ fn check_method_call(
           if use_named {
             tc_record_named_targs(tc, minfo.decl, subst, sp)
           }
-          let mut mti = 0
-          while mti < minfo.decl.type_params.length() {
-            let tp = minfo.decl.type_params[mti]
-            match subst.get(tp) {
-              Some(concrete) =>
-                tc.eq_uses.push(EqUse::{
-                  callee_key: span_key(minfo.decl.span),
-                  callee_name: key,
-                  tparam: tp,
-                  concrete: concrete,
-                  caller_key: env.fn_key,
-                  caller_is_verify: env.in_verify,
-                  callee_is_verify_opaque: minfo.decl.is_verify_opaque,
-                  span: sp,
-                })
-              None => ()
-            }
-            mti = mti + 1
+          tc_check_type_bounds(tc, env, minfo.decl, subst, sp)
+          tc_push_eq_uses(tc, env, minfo.decl, key, subst, sp)
+          if minfo.decl.type_params.length() > 0 {
+            tc_record_gcall(tc, minfo.decl, subst, sp)
+            tc.let_infer.set(span_key(sp) + "#gmeth", TStruct(sname, []))
           }
-          return subst_ty(minfo.ret_ty, subst)
+          return subst_ty_mask_unbound(minfo.ret_ty, minfo.decl.type_params, subst)
         }
         None => {
           let qp = split_qual_name(sname)
@@ -11636,7 +12346,7 @@ fn check_expr_inner(
       match tc.fns.get(name) {
         Some(finfo) => {
           tc_check_fn_value_no_mut(tc, finfo.decl, name, sp)
-          return TFn(finfo.param_tys, finfo.ret_ty)
+          return tc_fn_value_ty(tc, env, finfo.decl, name, finfo.param_tys, finfo.ret_ty, expected, sp)
         }
         None => ()
       }
@@ -11703,7 +12413,16 @@ fn check_expr_inner(
                 }
                 let qmi = qualify_fn_info(ipkg, mi)
                 tc_check_fn_value_no_mut(tc, mi.decl, q_sub + "::" + mem, sp)
-                return TFn(qmi.param_tys, qmi.ret_ty)
+                return tc_fn_value_ty(
+                  tc,
+                  env,
+                  qmi.decl,
+                  q_sub + "::" + mem,
+                  qmi.param_tys,
+                  qmi.ret_ty,
+                  expected,
+                  sp,
+                )
               }
               None => ()
             }
@@ -11733,7 +12452,7 @@ fn check_expr_inner(
               }
               let qfi = qualify_fn_info(ipkg, fi)
               tc_check_fn_value_no_mut(tc, fi.decl, mem, sp)
-              return TFn(qfi.param_tys, qfi.ret_ty)
+              return tc_fn_value_ty(tc, env, qfi.decl, mem, qfi.param_tys, qfi.ret_ty, expected, sp)
             }
             None => ()
           }
@@ -11765,7 +12484,7 @@ fn check_expr_inner(
       match tc.methods.get(key) {
         Some(minfo) => {
           tc_check_fn_value_no_mut(tc, minfo.decl, key, sp)
-          return TFn(minfo.param_tys, minfo.ret_ty)
+          return tc_fn_value_ty(tc, env, minfo.decl, key, minfo.param_tys, minfo.ret_ty, expected, sp)
         }
         None => ()
       }
