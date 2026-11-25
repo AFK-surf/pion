@@ -190,7 +190,12 @@ PYEOF
 "$CC_BIN" -O2 -ffp-contract=off "$DIR/driver.c" "$TMP_DIR/sched.s" -o "$TMP_DIR/sched"
 "$TMP_DIR/sched" > "$TMP_DIR/sched.out"
 cat "$TMP_DIR/sched.out"
-if [ "$(grep -c ' 625/625$' "$TMP_DIR/sched.out" || true)" -ne 8 ]; then
+# grep exits 1 (no match) or 2 (unreadable): both fail here.
+COUNT=$(grep -c ' 625/625$' "$TMP_DIR/sched.out") || {
+  echo "FAIL: p112 groupconverts results missing or unreadable" >&2
+  exit 1
+}
+if [ "$COUNT" -ne 8 ]; then
   echo "FAIL: p112 groupconverts results differ from the C reference" >&2
   exit 1
 fi
