@@ -105,7 +105,7 @@ CASES = {
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
     "transpile_upper_tier": ("ok", 34),
-    "wave_m2_d1": ("ok", 11),
+    "wave_m2_d1": ("ok", 13),
 }
 
 MOON_TRAPS = {
@@ -1940,6 +1940,26 @@ pub fn d1_op_astra_and_redteam_regressions() -> (Int, Int, Int, Int, Int, Int) {
   (sh_add, sh_neg, deep6, mixed, dbl_neg_add, rhs_lit)
 }
 
+pub fn d1_op_neg_block_if_match() -> (Int, Int, Int, Int, Int) {
+  let st = D1Step::{ v: 7 }
+  let mut cnt = 0
+  let r_blk = (-{
+    cnt = cnt + 1
+    let q = st
+    q
+  }).v
+  let r_nested_blk = (-{
+    let q = -st
+    q
+  }).v
+  let r_if = (-(if true { st } else { D1Step::{ v: 1 } })).v
+  let r_match = (-(match Option::Some(st) {
+    Option::Some(v) => v
+    Option::None => D1Step::{ v: 1 }
+  })).v
+  (r_blk, cnt, r_nested_blk, r_if, r_match)
+}
+
 pub fn d1_op_prec_and_order() -> (Int, Int, Int, Int, Int, Int) {
   let a = D1P::{ n: 10 }
   let b = D1P::{ n: 3 }
@@ -2583,7 +2603,8 @@ fn main {
     let (p1, p2, p3, p4, p5, ord) = @m12.d1_op_prec_and_order()
     let (nan_ok, b_ok, fu_s, ru_s, bn, bz, bf, bf0, bf3) = @m12.d1_float_and_bytes_compat()
     let (sa, sn, d6, mx, dna, rl) = @m12.d1_op_astra_and_redteam_regressions()
-    trace("d1_ops", "\{rp}:\{rm}:\{n1}:\{n2}:\{n3}:\{n4},\{p1}:\{p2}:\{p3}:\{p4}:\{p5}:\{ord},\{sa}:\{sn}:\{d6}:\{mx}:\{dna}:\{rl}")
+    let (rb, rcnt, rnb, rif, rmat) = @m12.d1_op_neg_block_if_match()
+    trace("d1_ops", "\{rp}:\{rm}:\{n1}:\{n2}:\{n3}:\{n4},\{p1}:\{p2}:\{p3}:\{p4}:\{p5}:\{ord},\{sa}:\{sn}:\{d6}:\{mx}:\{dna}:\{rl},\{rb}:\{rcnt}:\{rnb}:\{rif}:\{rmat}")
     trace("d1_compat", "\{nan_ok}:\{b_ok},\{fu_s},\{ru_s},\{bn}:\{bz}:\{bf}:\{bf0}:\{bf3}")
     check("d1.op_coexist", rp == 10 && rm == 4)
     check("d1.op_neg", n1 == -7 && n2 == -4 && n3 == -9 && n4 == -10)
@@ -2596,6 +2617,8 @@ fn main {
     check("d1.op_neg_deep_and_mixed", d6 == 67 && mx == -17)
     check("d1.op_neg_nested_binop", dna == 10)
     check("d1.op_rhs_struct_lit", rl == 9)
+    check("d1.op_neg_block_once", rb == 17 && rcnt == 1 && rnb == 27)
+    check("d1.op_neg_if_match", rif == 17 && rmat == 17)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -3213,7 +3236,8 @@ pub fn main(w : World) -> Int {
     let (p1, p2, p3, p4, p5, ord) = m12::d1_op_prec_and_order()
     let (nan_ok, b_ok, fu_s, ru_s, bn, bz, bf, bf0, bf3) = m12::d1_float_and_bytes_compat()
     let (sa, sn, d6, mx, dna, rl) = m12::d1_op_astra_and_redteam_regressions()
-    trace(w, "d1_ops", rp.to_string() + ":" + rm.to_string() + ":" + n1.to_string() + ":" + n2.to_string() + ":" + n3.to_string() + ":" + n4.to_string() + "," + p1.to_string() + ":" + p2.to_string() + ":" + p3.to_string() + ":" + p4.to_string() + ":" + p5.to_string() + ":" + ord.to_string() + "," + sa.to_string() + ":" + sn.to_string() + ":" + d6.to_string() + ":" + mx.to_string() + ":" + dna.to_string() + ":" + rl.to_string())
+    let (rb, rcnt, rnb, rif, rmat) = m12::d1_op_neg_block_if_match()
+    trace(w, "d1_ops", rp.to_string() + ":" + rm.to_string() + ":" + n1.to_string() + ":" + n2.to_string() + ":" + n3.to_string() + ":" + n4.to_string() + "," + p1.to_string() + ":" + p2.to_string() + ":" + p3.to_string() + ":" + p4.to_string() + ":" + p5.to_string() + ":" + ord.to_string() + "," + sa.to_string() + ":" + sn.to_string() + ":" + d6.to_string() + ":" + mx.to_string() + ":" + dna.to_string() + ":" + rl.to_string() + "," + rb.to_string() + ":" + rcnt.to_string() + ":" + rnb.to_string() + ":" + rif.to_string() + ":" + rmat.to_string())
     trace(w, "d1_compat", nan_ok.to_string() + ":" + b_ok.to_string() + "," + fu_s + "," + ru_s + "," + bn.to_string() + ":" + bz.to_string() + ":" + bf.to_string() + ":" + bf0.to_string() + ":" + bf3.to_string())
     check(w, "d1.op_coexist", rp == 10 && rm == 4)
     check(w, "d1.op_neg", n1 == -7 && n2 == -4 && n3 == -9 && n4 == -10)
@@ -3226,6 +3250,8 @@ pub fn main(w : World) -> Int {
     check(w, "d1.op_neg_deep_and_mixed", d6 == 67 && mx == -17)
     check(w, "d1.op_neg_nested_binop", dna == 10)
     check(w, "d1.op_rhs_struct_lit", rl == 9)
+    check(w, "d1.op_neg_block_once", rb == 17 && rcnt == 1 && rnb == 27)
+    check(w, "d1.op_neg_if_match", rif == 17 && rmat == 17)
   } else {
     panic("abort: unknown case " + kase)
   }
