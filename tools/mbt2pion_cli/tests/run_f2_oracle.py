@@ -52,12 +52,13 @@ fn hue_calc(t1 : Float, t2 : Float, hue : Float) -> Float {
 pub fn run_f2_2() -> String {
   let f : Float = hue_calc((0.25 : Float), (0.75 : Float), (3.5 : Float))
   let d0 : Double = (0 : Double) + (0x10 : Double)
+  let big_hex : Double = (0x80000000 : Double)
   let i64 : Int64 = (42 : Int64)
   let x : Double = 3.5
   let xd : Double = (x : Double) * 2.0
   let opt : Int? = (None : Int?)
   let o = match opt { Some(v) => v; None => 9 }
-  (f.to_double() * 100.0).to_int().to_string() + "," + d0.to_int().to_string() + "," + i64.to_string() + "," + xd.to_int().to_string() + "," + o.to_string()
+  (f.to_double() * 100.0).to_int().to_string() + "," + d0.to_int().to_string() + "," + big_hex.to_int64().to_string() + "," + i64.to_string() + "," + xd.to_int().to_string() + "," + o.to_string()
 }
 
 fn lookup_kind(k : Int) -> Int? {
@@ -75,6 +76,10 @@ pub fn run_f2_3() -> String {
       (Some(x), Some(y)) if probe(1, x > 0) &&
         lookup_kind(y) is Some(kind) => x + kind
       (Some(x), _) if probe(2, x > 10) => x * 2
+      (Some(x), None) if {
+        let y = x + 1
+        y > 5
+      } => x + 100
       (Some(x), None) | (None, Some(x)) if x < 0 => -x
       _ => -99
     }
@@ -83,9 +88,10 @@ pub fn run_f2_3() -> String {
   let r2 = classify(Some(15), Some(-2))
   let r3 = classify(Some(-5), None)
   let r4 = classify(None, Some(-7))
-  let r5 = classify(None, None)
+  let r5 = classify(Some(6), None)
+  let r6 = classify(None, None)
   let tr = trace.map(fn(v) { v.to_string() }).join("-")
-  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "|" + tr
+  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "|" + tr
 }
 
 priv struct CustomRange {
@@ -167,8 +173,8 @@ def main():
 
         expected = (
             "F2-1:has_loc|has_loc|has_loc,has_loc,pos_opt|def_loc\n"
-            "F2-2:50,16,42,7,9\n"
-            "F2-3:43,30,5,7,-99|1-1-2-2\n"
+            "F2-2:50,16,2147483648,42,7,9\n"
+            "F2-3:43,30,5,7,106,-99|1-1-2-2-2\n"
             "F2-4:3,2,-4|5,9,-1|+1,+1,+0,-0,+2|+1,+1,+0,-0,+5|11,22"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
