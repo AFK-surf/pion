@@ -120,10 +120,16 @@ if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address -o
   && "$TMP_DIR/asan_probe"; then
   "$CC_BIN" -std=c11 -O1 -fsanitize=address -fno-omit-frame-pointer -c "$ROOT_DIR/runtime/pion_rt.c" -o "$TMP_DIR/pion_rt_asan.o"
   ar rcs "$TMP_DIR/libpionrt_asan.a" "$TMP_DIR/pion_rt_asan.o"
+  # LeakSanitizer is not available everywhere (e.g. Apple Clang on macOS ARM64).
+  ASAN_RUN_OPTS=""
+  if ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/asan_probe" >/dev/null 2>&1; then
+    ASAN_RUN_OPTS="detect_leaks=1"
+  fi
+  echo "p112 ASan options: ${ASAN_RUN_OPTS:-<none, no LeakSanitizer>}"
   for MODE in "" --release; do
     "$PIONC" build $MODE --emit-obj "$TMP_DIR/p112.o" "$SRC"
     "$CC_BIN" -fsanitize=address "$TMP_DIR/p112.o" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$TMP_DIR/p112_asan"
-    ASAN_OPTIONS=detect_leaks=1 "$TMP_DIR/p112_asan" > "$TMP_DIR/asan.out"
+    ASAN_OPTIONS="$ASAN_RUN_OPTS" "$TMP_DIR/p112_asan" > "$TMP_DIR/asan.out"
     check "ASan/LSan ${MODE:-dev}" "$TMP_DIR/asan.out"
   done
 elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
