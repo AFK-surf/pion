@@ -38,6 +38,30 @@ assert m, "make_flat_int_pairs not found in SSA"
 body = m.group(1)
 assert "$pion_arr_new(l 0, w 16)" in body, f"Array[Pair[Int, Int]] lost 16B flat stride:\n{body}"
 print("p107 SSA generic flat stride ok (w 16)")
+
+# Verify swapped generic default-arg closure in flip_swapped[A, B] -> keep_swapped(b, a)
+# retains and releases the captured `x` under the SAME caller flag (`%tp_B`, not `%tp_A`).
+mf = re.search(r"function [^\n]*\$[^\s(]*flip_swapped\([^\n]*\)\s*\{(.*?)\n\}", ssa, re.S)
+assert mf, "flip_swapped not found in SSA"
+fbody = mf.group(1)
+dm = re.search(r"call \$pion_alloc_uninit\(w \d+, w 6, l (\$pion_drop_clo_\d+)\)", fbody)
+assert dm, f"flip_swapped closure alloc/drop not found:\n{fbody}"
+drop_sym = dm.group(1)
+# Capture retain before store into env must test %tp_B (never %tp_A)
+alloc_pos = dm.start()
+after_alloc = fbody[alloc_pos:]
+m_rci = re.search(r"jnz (%tp_[AB]), @rci_do_", after_alloc)
+assert m_rci and m_rci.group(1) == "%tp_B", f"expected retain jnz %tp_B in flip_swapped, got {m_rci and m_rci.group(1)}:\n{after_alloc}"
+# Find which env offset %tp_B is stored at in flip_swapped
+m_tpb_off = re.search(r"(%t\d+) =l add %t\d+, (\d+)\n\s*storel %tp_B, \1", after_alloc)
+assert m_tpb_off, f"%tp_B env store not found in flip_swapped:\n{after_alloc}"
+tpb_off = m_tpb_off.group(2)
+# Destructor must load the flag from that exact same offset (tpb_off)
+md = re.search(r"function " + re.escape(drop_sym) + r"\(l %p\)\s*\{(.*?)\n\}", ssa, re.S)
+assert md, f"{drop_sym} not found in SSA"
+dbody = md.group(1)
+assert f"=l add %p, {tpb_off}\n" in dbody, f"{drop_sym} did not check %tp_B offset {tpb_off}:\n{dbody}"
+print(f"p107 SSA flip_swapped retain+drop %tp_B parity ok (offset {tpb_off}, {drop_sym})")
 PYEOF
 
 # 2. Native dev & release
