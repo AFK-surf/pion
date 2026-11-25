@@ -14,7 +14,9 @@ variant (release): the cross-file `Result` / `Option` callees are inlined into
 tuple (release): `project`, `second_only`, `loop_mix`, `use_wide` and
   `use_pair` keep the destructured tuple in a private `alloc8` stack buffer and
   call nothing (no `pion_alloc*`, no `mix` / `wide` / `pair_scale`); `escape`
-  and `use_named` still allocate a heap box.
+  and `use_named` still allocate a heap box; `use_drop_pair` inlines
+  `drop_pair` without a box and releases its first string (`pion_rc_dec`)
+  between the two `pion_int_to_str` calls (last-use early drop).
 tuple (dev and release): `scaled` / `use_pair` inline their callee with the
   callee's top-level `scale` (3): `mul ..., 3` and no call of `add_scale` /
   `pair_scale`.
@@ -22,6 +24,8 @@ fixed (dev and release): every unsigned bounds check (`=w cugel IDX, LEN`) of
   `probe_fixed_*` compares against 4 and of `probe_imm_*` against 6; every
   `probe_dyn_*` check compares against a loaded length, and at least one such
   check exists in each `probe_dyn_*` function.
+Every function named in REQUIRED must exist in every mode, so an empty or
+truncated SSA file fails.
 """
 import re
 import sys
@@ -30,6 +34,16 @@ import sys
 def fail(msg):
     print(f'FAIL: p126 {msg}', file=sys.stderr)
     sys.exit(1)
+
+
+REQUIRED = {
+    'variant': ['sum_bytes', 'through', 'opt_match', 'arg_early', 'show'],
+    'tuple': ['project', 'second_only', 'loop_mix', 'use_wide', 'escape',
+              'use_named', 'use_drop_pair', 'scaled', 'use_pair'],
+    'fixed': ['probe_fixed_sum', 'probe_imm_sum', 'probe_fixed_alias_write',
+              'probe_dyn_param', 'probe_dyn_local', 'probe_dyn_mut',
+              'probe_dyn_array'],
+}
 
 
 def functions(text):
@@ -90,12 +104,18 @@ def check_tuple(fns, label, release):
         fn = need(fns, label, name)
         if not any(c.startswith('$pion_alloc') for c in calls(fn)):
             fail(f'{label}: {name} lost its heap tuple box\n{fn}')
+    fn = need(fns, label, 'use_drop_pair')
+    cs = calls(fn)
+    if any(c.startswith('$pion_alloc') or c == '$pion_fn_drop_pair' for c in cs):
+        fail(f'{label}: use_drop_pair calls {sorted(set(cs))}\n{fn}')
+    seq = [c for c in cs if c in ('$pion_int_to_str', '$pion_rc_dec')]
+    if seq[:3] != ['$pion_int_to_str', '$pion_rc_dec', '$pion_int_to_str']:
+        fail(f'{label}: use_drop_pair does not release the first string before building the second: {seq}\n{fn}')
 
 
 def check_fixed(fns, label):
-    for name, fn in sorted(fns.items()):
-        if not name.startswith('probe_'):
-            continue
+    for name in REQUIRED['fixed']:
+        fn = need(fns, label, name)
         lens = [c[1] for c in re.findall(r'=w cugel (\S+), (\S+)$', fn, re.M)]
         if name.startswith('probe_dyn_'):
             if not lens or any(not x.startswith('%') for x in lens):
@@ -110,16 +130,18 @@ def check_fixed(fns, label):
 def main():
     program, mode, path = sys.argv[1:4]
     label = f'{program} {mode}'
+    if program not in REQUIRED or mode not in ('dev', 'release'):
+        fail(f'unknown program / mode {program} {mode}')
     fns = functions(open(path).read())
+    for name in REQUIRED[program]:
+        need(fns, label, name)
     release = mode == 'release'
     if program == 'variant':
         check_variant(fns, label, release)
     elif program == 'tuple':
         check_tuple(fns, label, release)
-    elif program == 'fixed':
-        check_fixed(fns, label)
     else:
-        fail(f'unknown program {program}')
+        check_fixed(fns, label)
     print(f'p126 {label}: SSA structure ok')
 
 

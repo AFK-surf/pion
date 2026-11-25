@@ -26,6 +26,9 @@ Soundness models for three QBE code-generation rules in
      list evaluation; `fields_preserved` / `arity`: reading the buffer back
      yields exactly the evaluated fields; `destructure`: the heap and stack
      paths give the same bound fields and state, including abrupt exits.
+     `shared_prefix`: the callee's `let` prefix is emitted by the same
+     `qbe_emit_stmts` (with its last-use early drops) on both paths, so any
+     prefix state transformer followed by the two tails agrees.
   3. `FixedLiteral` — an immutable local alias `let xs = T` of a package
      `FixedArray` / `ImmArray` literal global `T` (not shadowed by a local)
      carries the literal length as `counted_len`, so its bounds checks use the
@@ -299,6 +302,26 @@ theorem destructure {α : Type} (es : List Step) (buf : Nat → Word) (s : Memor
     | ok ws =>
       simp only
       rw [← arity es s t ws h, fields_preserved]
+
+-- The callee's `let` prefix is emitted by the same `qbe_emit_stmts` call on
+-- both paths (`destructure_tail` only changes how the tail tuple is built),
+-- so its effects, including the last-use early releases (`pion_rc_dec` of a
+-- binding right after its last mention, visible in `refs` and `trace`), are
+-- one and the same state transformer `pre`. Only the tail differs, and
+-- `destructure` covers it from whatever state the prefix leaves.
+theorem shared_prefix {α : Type} (pre : Memory → Except Exit Unit × Memory)
+    (es : List Step) (buf : Nat → Word) (s : Memory)
+    (bind : List Word → Memory → α) (stop : Exit → Memory → α) :
+    (match pre s with
+     | (.error x, t) => stop x t
+     | (.ok _, t) => heapPath es t bind stop) =
+    (match pre s with
+     | (.error x, t) => stop x t
+     | (.ok _, t) => stackPath es buf t bind stop) := by
+  rcases h : pre s with ⟨r, t⟩
+  cases r with
+  | error x => rfl
+  | ok u => exact destructure es buf t bind stop
 
 end TupleProjection
 

@@ -810,6 +810,7 @@ import PionProofs.QbeEcosystemUnboxFixedLen
 #print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.simulation
 #print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.arity
 #print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.destructure
+#print axioms PionQbeEcosystemUnboxFixedLen.TupleProjection.shared_prefix
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.alias_write
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.shadow
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.hoist

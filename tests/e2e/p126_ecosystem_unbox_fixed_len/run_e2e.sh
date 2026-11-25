@@ -19,7 +19,10 @@
 #      index equal to the length still traps.
 # For dev and --release: check.py on the emitted SSA (native), and exact
 # stdout (plus exit status, and stderr for the trap) natively and on Wasm32
-# against the reference outputs <program>.expected.
+# against the reference outputs <program>.expected. An `--emit-ssa` build
+# compiles the package as one unit; variant and tuple are also built once more
+# with a plain `build --release` (per-file CAS units, where cross-file callees
+# stay calls) and must print the same reference output.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -94,6 +97,16 @@ for PROG in variant tuple fixed; do
       diff -u "$DIR/$PROG.expected" "$BASE.wout" >&2 || true
       echo "FAIL: p126 $PROG $MODE Wasm32 stdout differs from the reference" >&2
       exit 1
+    fi
+    if [ "$MODE" = "release" ] && [ "$CODE" -eq 0 ]; then
+      "$PIONC" build --release -o "$BASE.plain" "$@"
+      "$BASE.plain" > "$BASE.plain.out"
+      if ! cmp -s "$DIR/$PROG.expected" "$BASE.plain.out"; then
+        diff -u "$DIR/$PROG.expected" "$BASE.plain.out" >&2 || true
+        echo "FAIL: p126 $PROG plain --release build stdout differs from the reference" >&2
+        exit 1
+      fi
+      echo "p126 $PROG plain --release build (per-file CAS units): output equals the reference"
     fi
     echo "p126 $PROG $MODE: SSA guards, native exit $RC and Wasm32 output equal the reference"
   done
