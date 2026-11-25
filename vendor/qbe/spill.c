@@ -383,7 +383,7 @@ spill(Fn *fn)
 {
 	Blk *b, *s1, *s2, *hd, **bp;
 	int j, l, t, k, lvarg[2];
-	int preferred[5], np, pi;
+	int preferred[5], np, pi, selector;
 	uint n;
 	BSet u[1], v[1], w[1];
 	Ins *i;
@@ -494,7 +494,14 @@ spill(Fn *fn)
 			if (rtype(b->jmp.arg) == RCall)
 				v->t[0] |= T.retregs(b->jmp.arg, 0);
 		}
-		if (rtype(b->jmp.arg) == RTmp) {
+		/* A selector dead on every successor only lives up to dispatch.
+		 * It can occupy a table scratch without evicting a live-out. */
+		selector = -1;
+		if (b->jmp.type == Jjtbl && T.jtblidx && rtype(b->jmp.arg) == RTmp
+		&& b->jmp.arg.val >= Tmp0 && !bshas(b->out, b->jmp.arg.val)) {
+			selector = b->jmp.arg.val;
+			assert(KBASE(tmp[selector].cls) == 0);
+		} else if (rtype(b->jmp.arg) == RTmp) {
 			t = b->jmp.arg.val;
 			assert(KBASE(tmp[t].cls) == 0);
 			bsset(v, t);
@@ -508,6 +515,8 @@ spill(Fn *fn)
 			if (!bshas(v, t))
 				slot(t);
 		bscopy(b->out, v);
+		if (selector >= 0)
+			bsset(v, selector);
 
 		/* 2. process the block instructions */
 		curi = &insb[NIns];

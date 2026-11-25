@@ -1848,15 +1848,17 @@ emitjtbl(Blk *b, EF *e)
 	uint32_t lea_next_pc = text_pos();
 
 	/* Ensure %r10 holds zero-extended 32-bit index */
-	if (rtype(b->jmp.arg) != RSlot)
+	if (rtype(b->jmp.arg) != RSlot && !amd64_table_word(b)) {
 		emit_modrm(0, 0, 0, 0x89, -1, idx_hw, rm_reg(r10), 0, 0);
+		idx_hw = r10;
+	}
 
 	/* movslq (%r11,%r10,4), %r10 */
 	RmOp tbl_elem;
 	memset(&tbl_elem, 0, sizeof tbl_elem);
 	tbl_elem.is_mem = 1;
 	tbl_elem.base = (int)r11;
-	tbl_elem.index = (int)r10;
+	tbl_elem.index = (int)idx_hw;
 	tbl_elem.scale = 4;
 	tbl_elem.sym = SYM_NONE;
 	emit_modrm(0, 1, 0, 0x63, -1, r10, tbl_elem, 0, 0);

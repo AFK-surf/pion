@@ -66,6 +66,7 @@ struct Target {
 	uint canfsel:1;
 	bits jtblclob; /* scratch regs clobbered by jtbl */
 	int njtblclob;
+	int jtblidx; /* scratch that can hold a dying table selector */
 };
 
 #define BIT(n) ((bits)1 << (n))

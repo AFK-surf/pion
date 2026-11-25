@@ -24,6 +24,7 @@ amd64_memargs(int op)
 	.isel = amd64_isel, \
 	.cansel = 1, \
 	.jtblclob = BIT(R10) | BIT(R11), \
+	.jtblidx = R10, \
 	.njtblclob = 2,
 
 Target T_amd64_sysv = {

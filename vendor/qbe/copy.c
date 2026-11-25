@@ -327,6 +327,39 @@ narrowpars(Fn *fn)
 	}
 }
 
+/* The signed long interval of a widened word and an optional small
+ * offset fits in int64_t. Compare both endpoints before folding. */
+static Ref
+widecmp(Fn *fn, Ins *i)
+{
+	int64_t limit, offset = 0, lo, hi;
+	Ins *d;
+
+	if (!INRANGE(i->op, Ocsgel, Ocsltl)
+	|| rtype(i->arg[0]) != RTmp || i->arg[0].val < Tmp0
+	|| !isconbits(fn, i->arg[1], &limit))
+		return R;
+	d = fn->tmp[i->arg[0].val].def;
+	if (d && d->op == Oadd && d->cls == Kl) {
+		if (rtype(d->arg[0]) != RTmp || d->arg[0].val < Tmp0
+		|| !isconbits(fn, d->arg[1], &offset)
+		|| offset < INT32_MIN || offset > INT32_MAX)
+			return R;
+		d = fn->tmp[d->arg[0].val].def;
+	}
+	if (!d || d->cls != Kl || (d->op != Oextsw && d->op != Oextuw))
+		return R;
+	lo = offset + (d->op == Oextsw ? (int64_t)INT32_MIN : 0);
+	hi = offset + (d->op == Oextsw ? (int64_t)INT32_MAX : (int64_t)UINT32_MAX);
+	switch (i->op) {
+	case Ocsgel: return lo >= limit ? con01[1] : hi < limit ? con01[0] : R;
+	case Ocsgtl: return lo > limit ? con01[1] : hi <= limit ? con01[0] : R;
+	case Ocslel: return hi <= limit ? con01[1] : lo > limit ? con01[0] : R;
+	case Ocsltl: return hi < limit ? con01[1] : lo >= limit ? con01[0] : R;
+	default: return R;
+	}
+}
+
 Ref
 copyref(Fn *fn, Blk *b, Ins *i)
 {
@@ -348,6 +381,11 @@ copyref(Fn *fn, Blk *b, Ins *i)
 
 	if (i->op == Ocopy)
 		return i->arg[0];
+	if (INRANGE(i->op, Ocsgel, Ocsltl)) {
+		Ref folded = widecmp(fn, i);
+		if (!req(folded, R))
+			return folded;
+	}
 
 	/* op identity value */
 	if (optab[i->op].hasid
