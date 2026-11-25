@@ -37,8 +37,9 @@
 #      assemble a lone `nop` for it.
 #   5. prog/ (4-file package, the largest unit is a jump-table interpreter):
 #      dev and --release with --jobs 1, 2, 4, 8, each from an empty CAS, give
-#      the same binary (4 CAS units) printing ref.py's output; Wasm32 and
-#      ASan dev / --release print it too.
+#      the same CAS units (4 SSA + 4 objects, byte for byte) and, outside
+#      Darwin (ld64 gives every link a new LC_UUID), the same binary, printing ref.py's
+#      output; Wasm32 and ASan dev / --release print it too.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -152,6 +153,24 @@ check_prog() { # $1 label, $2 output
     fail "prog $1"
   fi
 }
+cas_digest() { # every SSA unit and object of a CAS: relative path, size, SHA-256
+  python3 -E - "$1" <<'PYEOF'
+import hashlib, os, sys
+root = sys.argv[1]
+rows = []
+for sub in ('ssa', 'obj'):
+    for dp, _, fs in os.walk(os.path.join(root, sub)):
+        for f in fs:
+            if '.tmp.' in f:
+                raise SystemExit(f"FAIL: p116 temporary file left in the CAS: {f}")
+            p = os.path.join(dp, f)
+            rows.append((os.path.relpath(p, root), os.path.getsize(p), hashlib.sha256(open(p, 'rb').read()).hexdigest()))
+if sum(r[0].startswith('ssa' + os.sep) for r in rows) != 4 or sum(r[0].startswith('obj' + os.sep) for r in rows) != 4:
+    raise SystemExit(f"FAIL: p116 CAS holds {[r[0] for r in rows]}, want 4 SSA units and 4 objects")
+for r in sorted(rows):
+    print(*r)
+PYEOF
+}
 for MODE in dev release; do
   FLAG=""
   [ "$MODE" = release ] && FLAG="--release"
@@ -163,9 +182,18 @@ for MODE in dev release; do
     [ "$N" -eq 4 ] || fail "prog $MODE --jobs $J: $N CAS SSA units, want 4"
     "$TMP_DIR/prog_${MODE}_$J" > "$TMP_DIR/prog_${MODE}_$J.out"
     check_prog "$MODE --jobs $J" "$TMP_DIR/prog_${MODE}_$J.out"
-    cmp "$TMP_DIR/prog_${MODE}_1" "$TMP_DIR/prog_${MODE}_$J" || fail "prog $MODE: --jobs $J binary differs from --jobs 1"
+    cas_digest "$TMP_DIR/cas_j" > "$TMP_DIR/cas_${MODE}_$J.txt"
+    cmp "$TMP_DIR/cas_${MODE}_1.txt" "$TMP_DIR/cas_${MODE}_$J.txt" || fail "prog $MODE: --jobs $J CAS units differ from --jobs 1"
+    # Two ld64 links of the same objects differ (LC_UUID); ELF links are byte-stable.
+    if [ "$HOST_S" != Darwin ]; then
+      cmp "$TMP_DIR/prog_${MODE}_1" "$TMP_DIR/prog_${MODE}_$J" || fail "prog $MODE: --jobs $J binary differs from --jobs 1"
+    fi
   done
-  echo "p116 prog native $MODE: --jobs 1/2/4/8 identical binaries (4 units), output == ref.py"
+  if [ "$HOST_S" != Darwin ]; then
+    echo "p116 prog native $MODE: --jobs 1/2/4/8 identical binaries and CAS units (4 SSA + 4 objects), output == ref.py"
+  else
+    echo "p116 prog native $MODE: --jobs 1/2/4/8 identical CAS units (4 SSA + 4 objects), output == ref.py"
+  fi
   "$PIONC" build $FLAG --emit-ssa "$TMP_DIR/prog_$MODE.ssa" -o "$TMP_DIR/prog_ssa_$MODE" "$PROG"
   "$TMP_DIR/prog_ssa_$MODE" > "$TMP_DIR/prog_ssa_$MODE.out"
   check_prog "$MODE --emit-ssa" "$TMP_DIR/prog_ssa_$MODE.out"
