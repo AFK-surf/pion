@@ -3537,16 +3537,56 @@ fn lb_pat_into(b : LB, p : Pattern, st : Ty, checks : Array[LExpr]) -> LPat {
 }
 
 ///|
-fn l_pat_simple(p : Pattern) -> Bool {
+/// Pure predicate matching `lb_const_item_canon`: whether `(canon_pkg, n)`
+/// refers to a top-level constant in the extraction graph without mutating it.
+fn l_const_exists_canon(b : LB, canon_pkg : String, n : String) -> Bool {
+  let pkg = if canon_pkg.length() == 0 {
+    b.pkg
+  } else {
+    canon_pkg
+  }
+  match lg_tc(b.g, pkg) {
+    Some(tc) => tc.consts.contains(n)
+    None => false
+  }
+}
+
+///|
+fn l_pat_is_const(b : LB, pat_enum : String, vname : String, subs : Array[Pattern], explicit_ctor : Bool, sp : Span) -> Bool {
+  match b.tc.resolved_method_calls.get("pat_const:" + span_key(sp)) {
+    Some(ckey) => {
+      let (cq, cn) = if has_qual_sep(ckey) {
+        let qp = split_qual_name(ckey)
+        (qp.prefix, qp.name)
+      } else {
+        ("", ckey)
+      }
+      if l_const_exists_canon(b, cq, cn) {
+        return true
+      }
+    }
+    None => ()
+  }
+  if !explicit_ctor && subs.length() == 0 && starts_with_str(pat_enum, "@canon:") {
+    let cq = slice_str(pat_enum, 7, pat_enum.length())
+    if l_const_exists_canon(b, cq, vname) {
+      return true
+    }
+  }
+  false
+}
+
+///|
+fn l_pat_simple(b : LB, p : Pattern) -> Bool {
   match p {
     PInt(_, _) | PString(_, _) | PChar(_, _) => false
-    PVariant(_, _, subs, explicit_ctor, _) => {
-      if !explicit_ctor && subs.length() == 0 {
+    PVariant(pat_enum, vname, subs, explicit_ctor, sp) => {
+      if l_pat_is_const(b, pat_enum, vname, subs, explicit_ctor, sp) {
         return false
       }
       let mut i = 0
       while i < subs.length() {
-        if !l_pat_simple(subs[i]) {
+        if !l_pat_simple(b, subs[i]) {
           return false
         }
         i = i + 1
@@ -3556,7 +3596,7 @@ fn l_pat_simple(p : Pattern) -> Bool {
     PTuple(subs, _) => {
       let mut i = 0
       while i < subs.length() {
-        if !l_pat_simple(subs[i]) {
+        if !l_pat_simple(b, subs[i]) {
           return false
         }
         i = i + 1
@@ -3586,24 +3626,65 @@ fn l_lpat_irrefutable(p : LPat) -> Bool {
 }
 
 ///|
+/// Whether a lowered Lean pattern alone covers every inhabitant of its
+/// scrutinee type (so a trailing `| _ => ...` arm would be redundant in Lean).
+fn l_lpat_covers_all(b : LB, p : LPat) -> Bool {
+  match p {
+    LPWild | LPVar(_, _) => true
+    LPTuple(ps) => {
+      let mut i = 0
+      while i < ps.length() {
+        if !l_lpat_covers_all(b, ps[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    LPCtor(ek, _, ps) => {
+      let single_ctor = if ek == "Option" || ek == "Result" {
+        false
+      } else {
+        match lg_enum(b.g, ek) {
+          Some(ei) => ei.variants.length() == 1
+          None => false
+        }
+      }
+      if !single_ctor {
+        return false
+      }
+      let mut i = 0
+      while i < ps.length() {
+        if !l_lpat_covers_all(b, ps[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
 /// Emits the match of `sv` against `arms[from..]`, delivering the value into
-/// `dest`. Arms without guards / literal sub-patterns become one native
-/// `match`; a guarded / literal arm `P if g => B` becomes
-/// `match sv { P => if checks && g { B } else { REST }, _ => REST }` where
-/// REST matches the remaining arms (failed guards fall through).
+/// `dest`. When `from == 0` and no arm has guards or literal/const sub-patterns,
+/// emits one native `match`; otherwise peels one arm at a time into
+/// `match sv { P => if checks && g { B } else { REST }, _ => REST }` so
+/// previously peeled constructors never trigger Lean `Missing cases` errors.
 fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, dest : String, ty : Ty) -> Unit {
   if from >= arms.length() {
     lb_emit(b, LSPanic)
     return
   }
-  let mut all_simple = true
+  let mut all_simple = from == 0
   let mut k = from
-  while k < arms.length() {
+  while all_simple && k < arms.length() {
     match arms[k].guard_e {
       Some(_) => all_simple = false
       None => ()
     }
-    if !l_pat_simple(arms[k].pat) {
+    if !l_pat_simple(b, arms[k].pat) {
       all_simple = false
     }
     k = k + 1
@@ -3708,7 +3789,12 @@ fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, d
     let arm_block0 = lb_close(b, None)
     lb_pop_scope(b)
     let arm_block = l_concat_block(arm_block0.stmts, body)
-    lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: rest }], dest, ty))
+    let match_arms = if l_lpat_covers_all(b, lp) {
+      [LArm::{ pat: lp, body: arm_block }]
+    } else {
+      [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: rest }]
+    }
+    lb_emit(b, LSMatch(sv, st, match_arms, dest, ty))
     return
   }
   // Refutable pattern + checks/guard: evaluate arm to `Option[ty]` (or `Bool`
@@ -3750,7 +3836,12 @@ fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, d
   lb_pop_scope(b)
   let arm_block = LBlock::{ stmts: arm_block0.stmts, tail: Some(inner_val) }
   let mres = lb_temp(b, res_ty)
-  lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: miss_blk }], mres, res_ty))
+  let guard_arms = if l_lpat_covers_all(b, lp) {
+    [LArm::{ pat: lp, body: arm_block }]
+  } else {
+    [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: miss_blk }]
+  }
+  lb_emit(b, LSMatch(sv, st, guard_arms, mres, res_ty))
   if want {
     let mv = lb_temp(b, ty)
     let some_arm = LArm::{ pat: LPCtor("Option", "Some", [LPVar(mv, ty)]), body: LBlock::{ stmts: [], tail: Some(LVar(mv, ty)) } }
