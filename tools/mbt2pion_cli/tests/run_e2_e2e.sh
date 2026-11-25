@@ -56,6 +56,8 @@ neg_cases = [
     ("cat_a_meth_val", "t_wbtest.mbt", 'struct P { x : Int }\nfn P::check1(self : P) -> Unit raise { assert_eq(self.x, 1) }\ntest { let g = P::check1; g(P::{ x: 1 }) }\n', ["--with-tests"]),
     ("holder_field_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nstruct H { p : P }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\nfn holder() -> H { H::{ p: P::{ x: 1 } } }\npub fn f() -> Int { let p = holder().p; try { let _ = p.bad(); 10 } catch { Bad => 9 } }\n', []),
     ("field_chain_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nstruct H { p : P }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\npub fn f() -> Int { let h = H::{ p: P::{ x: 1 } }; try { let _ = h.p.bad(); 10 } catch { Bad => 9 } }\n', []),
+    ("generic_keep_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\nfn[T] keep(x : T) -> T { x }\npub fn f() -> Int { let p = keep(P::{ x: 0 }); try { let _ = p.bad(); 10 } catch { Bad => 9 } }\n', []),
+    ("shadow_holder_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nstruct H { x : Int }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\nfn holder() -> H { H::{ x: 0 } }\npub fn f() -> Int { let holder = fn() -> P { P::{ x: 0 } }; let p = holder(); try { let _ = p.bad(); 10 } catch { Bad => 9 } }\n', []),
 ]
 for tag, fn, code, extra in neg_cases:
     sd = os.path.join(work, "n_" + tag); os.makedirs(sd)
