@@ -665,6 +665,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.sh" "$PIONC"
 # P124: counted-fill length immediate for fresh local Array[Int] (qbe_record_counted_fill; 18 programs in --release and dev: immediate-only bounds checks for single / multi-array / empty fills, header length kept on alias, push, pop, capturing closure, mut and call arguments, shadowing incl. inside a while body that reads the outer array first; exact exit / stdout / stderr vs a plain-array reference incl. SIGABRT traps at -1, 37, 100 and 0 of 0).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC"
+# P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"

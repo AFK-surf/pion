@@ -179,6 +179,7 @@ pub struct QbeGen {
   const_i64_vals : Map[String, Int64]
   const_bool_vals : Map[String, Bool]
   global_min_len_arrs : Map[String, Int]
+  fixed_literal_lengths : Map[String, Int]
   freeze_fn_seen : Map[String, Bool]
   vmap_seen : Map[String, Bool]
   vmap_get_or_seen : Map[String, Bool]
@@ -16147,6 +16148,33 @@ fn qbe_callee_inline_cost_for_budget(
 }
 
 ///|
+fn qbe_has_simple_tuple_tail(body : Array[Stmt], ret_ty : Ty) -> Bool {
+  match ret_ty {
+    TTuple(fields) => {
+      if fields.length() < 2 || fields.length() > 5 || body.length() == 0 { return false }
+      let mut i = 0
+      while i < fields.length() {
+        if !qbe_is_prim_scalar_ty(fields[i]) { return false }
+        i = i + 1
+      }
+      i = 0
+      while i + 1 < body.length() {
+        match body[i] {
+          SLet(_, _, _, _, _) => ()
+          _ => return false
+        }
+        i = i + 1
+      }
+      match body[i] {
+        SExpr(ETuple(elems, _), _) => elems.length() == fields.length()
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+
+///|
 fn qbe_try_inline_fn_call(
   g : QbeGen,
   key : String,
@@ -16154,6 +16182,7 @@ fn qbe_try_inline_fn_call(
   arg_vals : Array[String],
   arg_tys : Array[Ty],
   arg_borrowed : Array[Bool],
+  destructure : Bool = false,
 ) -> Option[QbeVal] {
   if g.mono_pkg != "" ||
     g.inline_depth >= 2 ||
@@ -16274,6 +16303,10 @@ fn qbe_try_inline_fn_call(
         let inl_saved_verify = g.in_verify
         g.in_verify = inl_fd.is_verify
         let inl_scope_base = g.scopes.length()
+        // The inlined body resolves names in the callee's lexical scope only:
+        // caller locals must never capture a callee's reference to a global.
+        let caller_floor = g.lookup_scope_floor
+        g.lookup_scope_floor = inl_scope_base
         qbe_scope_push(g)
         let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
         let mut pi = 0
@@ -16304,7 +16337,20 @@ fn qbe_try_inline_fn_call(
         let has_ret = qbe_stmts_has_cf(inl_body, false, false, true) ||
           qbe_stmts_has_default_ret(g, inl_body)
         let out_reg = if !has_ret {
-          let bres = qbe_emit_stmts(g, inl_body, Some(finfo.ret_ty))
+          let bres = if destructure && qbe_has_simple_tuple_tail(inl_body, finfo.ret_ty) {
+            let mut i = 0
+            while i + 1 < inl_body.length() && !g.block_term {
+              let _ = qbe_emit_stmt(g, inl_body[i], None, false)
+              i = i + 1
+            }
+            match inl_body[inl_body.length() - 1] {
+              SExpr(tail, _) if !g.block_term =>
+                qbe_emit_expr_mode(g, tail, Some(finfo.ret_ty), true)
+              _ => qval("0", TNever)
+            }
+          } else {
+            qbe_emit_stmts(g, inl_body, Some(finfo.ret_ty))
+          }
           let r = qbe_coerce_val(g, bres, finfo.ret_ty)
           qbe_scope_pop(g)
           r
@@ -16340,6 +16386,7 @@ fn qbe_try_inline_fn_call(
             qbe_load_local_slot(g, ret_slot, finfo.ret_ty)
           }
         }
+        g.lookup_scope_floor = caller_floor
         g.in_verify = inl_saved_verify
         g.hoisted_arr_len = inl_hlen
         g.hoisted_arr_dp = inl_hdp
@@ -19646,6 +19693,8 @@ fn qbe_inline_body_into_opt_res_slots(
   let inl_saved_verify = g.in_verify
   g.in_verify = inl_fd.is_verify
   let inl_scope_base = g.scopes.length()
+  let caller_lookup_floor = g.lookup_scope_floor
+  g.lookup_scope_floor = inl_scope_base
   qbe_scope_push(g)
   let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
   let mut pi = 0
@@ -19713,6 +19762,7 @@ fn qbe_inline_body_into_opt_res_slots(
     qbe_emit_lbl(g, sc_ret)
     g.block_immut_fields = Map([])
   }
+  g.lookup_scope_floor = caller_lookup_floor
   g.in_verify = inl_saved_verify
   g.hoisted_arr_len = inl_hlen
   g.hoisted_arr_dp = inl_hdp
@@ -19785,7 +19835,12 @@ fn qbe_local_fn_can_scalar_inline(g : QbeGen, key : String, finfo : FnInfo) -> O
         Some(fidx) => g.cur_file_idx < 0 || fidx == g.cur_file_idx
         None => true
       }
-      let base_max_cost = if same_file { 42 } else { 22 }
+      // Immediate destructuring also removes the result allocation and its release.
+      let consumes_variant = match finfo.ret_ty {
+        TOption(_) | TResult(_, _) => true
+        _ => false
+      }
+      let base_max_cost = if same_file || consumes_variant { 42 } else { 22 }
       let loop_max_cost = if g.target_wasm { 96 } else { 220 }
       let max_cost = if same_file &&
         !inl_fd.is_pub &&
@@ -21602,6 +21657,7 @@ fn qbe_new_for_target_name(
     const_i64_vals: Map([]),
     const_bool_vals: Map([]),
     global_min_len_arrs: Map([]),
+    fixed_literal_lengths: Map([]),
     freeze_fn_seen: Map([]),
     vmap_seen: Map([]),
     vmap_get_or_seen: Map([]),
@@ -26569,6 +26625,7 @@ fn qbe_record_scalar_const(g : QbeGen, cd : ConstDecl, cty : Ty) -> Unit {
         EArrayLit(elems, _) =>
           if elems.length() >= 1 {
             g.global_min_len_arrs.set(cd.name, elems.length())
+            g.fixed_literal_lengths.set(cd.name, elems.length())
           }
         ECall(EPath("FixedArray", "make", _), args, _)
         | ECall(EPath("ImmArray", "make", _), args, _) =>
@@ -40823,7 +40880,17 @@ fn qbe_emit_expr(
   expr : Expr,
   expected : Option[Ty],
 ) -> QbeVal {
-  let res = qbe_emit_expr_inner(g, expr, expected)
+  qbe_emit_expr_mode(g, expr, expected, false)
+}
+
+///|
+fn qbe_emit_expr_mode(
+  g : QbeGen,
+  expr : Expr,
+  expected : Option[Ty],
+  destructure : Bool,
+) -> QbeVal {
+  let res = qbe_emit_expr_inner(g, expr, expected, destructure)
   if g.known_min_len_arrs.length() > 0 {
     match expr {
       ECall(_, _, _) | EMethodCall(_, _, _, _) =>
@@ -40858,6 +40925,7 @@ fn qbe_emit_expr_inner(
   g : QbeGen,
   expr : Expr,
   expected : Option[Ty],
+  destructure : Bool,
 ) -> QbeVal {
   match expr {
     EInt(raw, _) => {
@@ -42578,6 +42646,7 @@ fn qbe_emit_expr_inner(
                 arg_vals,
                 arg_tys,
                 arg_borrowed,
+                destructure,
               ) {
                 Some(qv) => return qv
                 None => ()
@@ -43917,17 +43986,23 @@ fn qbe_emit_expr_inner(
       } else {
         "$pion_alloc"
       }
-      qbe_emit(
-        g,
-        obj +
-        " =l call " +
-        alloc_fn +
-        "(w " +
-        sz.to_string() +
-        ", w 4, l " +
-        drop_sym +
-        ")",
-      )
+      if destructure && obj_slots.length() == 0 && tp_names.length() == 0 {
+        // The only consumer loads scalar fields immediately. No header is observed.
+        g.fn_allocs.write_string("    " + obj + " =l alloc8 " + sz.to_string() + "\n")
+        g.immortal_regs.set(obj, true)
+      } else {
+        qbe_emit(
+          g,
+          obj +
+          " =l call " +
+          alloc_fn +
+          "(w " +
+          sz.to_string() +
+          ", w 4, l " +
+          drop_sym +
+          ")",
+        )
+      }
       i = 0
       while i < vals.length() {
         let p = qbe_tmp(g)
@@ -51827,7 +51902,7 @@ fn qbe_record_counted_fill(g : QbeGen, stmts : Array[Stmt], at : Int) -> Unit {
 
 ///|
 /// Length operand for a bounds check on local `name` (array object `obj`): the
-/// immediate recorded by `qbe_record_counted_fill`, else a load of the header.
+/// exact local length recorded for a counted fill or a fixed literal, else a header load.
 fn qbe_array_length_operand(g : QbeGen, name : String, obj : String) -> String {
   match qbe_lookup_local(g, name) {
     Some(v) => if v.counted_len != "" { return v.counted_len }
@@ -52588,6 +52663,18 @@ fn qbe_emit_stmt(
         }
         // Precompute metadata against the OLD scope BEFORE `qbe_define_local`
         // shadows any outer variable of the same name (e.g. `let src = src.slice(0, 1)`).
+        let fixed_length = match init {
+          EIdent(global_name, _) if !is_mut && g.mono_pkg == "" =>
+            match g.fixed_literal_lengths.get(global_name) {
+              Some(n) =>
+                match qbe_lookup_local(g, global_name) {
+                  None => n.to_string()
+                  Some(_) => ""
+                }
+              None => ""
+            }
+          _ => ""
+        }
         let mut pre_unfrozen_arr = false
         let mut pre_min_len = -1
         let mut pre_writable_bytes = false
@@ -52760,6 +52847,7 @@ fn qbe_emit_stmt(
           qbe_is_obj_ty(g, final_ty) &&
           (coerced_iv == "0" || g.immortal_regs.contains(coerced_iv))
         let loc = qbe_define_local_ex(g, name, final_ty, !iv_immortal, is_mut)
+        if fixed_length != "" { loc.counted_len = fixed_length }
         qbe_store_local_slot(g, coerced_iv, loc.slot, final_ty)
         if iv_immortal {
           g.immortal_slots.set(loc.slot, true)
@@ -52880,7 +52968,7 @@ fn qbe_emit_stmt(
           }
         _ => ()
       }
-      let iv = qbe_emit_expr(g, init, ann_opt)
+      let iv = qbe_emit_expr_mode(g, init, ann_opt, g.release)
       let tup_ty = match ann_opt {
         Some(a) => a
         None => iv.ty
