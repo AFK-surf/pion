@@ -106,4 +106,40 @@ fi
 grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r5.json"
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
+# 6. Custom enum wrapping String `enum E { Text(String) }` matching `Text([_, _])` fails closed via Stage A.5 type probe
+S6="$WORK/s6"; mkdir -p "$S6"
+cat > "$S6/t.mbt" << 'EOF'
+pub enum E { Text(String) }
+pub fn f(e : E) -> Int {
+  match e {
+    Text([_, _]) => 2
+    Text([_]) => 1
+    _ => 0
+  }
+}
+EOF
+if "$BIN" --src "$S6" --out "$NEG_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --report "$WORK/r6.json" --pionc "$PIONC" 2>/dev/null; then
+  echo "[d2-e2e] FAIL: enum E { Text(String) } array pattern should have exited non-zero"
+  exit 1
+fi
+grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r6.json"
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
+# 7. Result[Int, Bytes] matching `Err([b, _])` fails closed with MBT2PION_UNSUPPORTED_SYNTAX
+S7="$WORK/s7"; mkdir -p "$S7"
+cat > "$S7/t.mbt" << 'EOF'
+pub fn f(r : Result[Int, Bytes]) -> Int {
+  match r {
+    Err([b, _]) => b.to_int()
+    _ => 0
+  }
+}
+EOF
+if "$BIN" --src "$S7" --out "$NEG_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --report "$WORK/r7.json" --pionc "$PIONC" 2>/dev/null; then
+  echo "[d2-e2e] FAIL: Result[Int, Bytes] Err([b, _]) should have exited non-zero"
+  exit 1
+fi
+grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r7.json"
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
 echo "[d2-e2e] PASS: all Wave M2-D2 negative/fail-closed gates verified"

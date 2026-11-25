@@ -157,10 +157,74 @@ pub fn run_nested_array_patterns() -> String {
     _ => x
   }
 
+  // Astra P0-1 + Red-team P1-1: inner shadowing inside arm body and guard
+  let s_let = match Some([7, 2]) {
+    Some([x, _]) => {
+      let x = 9
+      x
+    }
+    _ => -1
+  }
+  let s_yx = match Some([1, 2]) {
+    Some([x, _]) => {
+      let y = x
+      let x = 99
+      y + x
+    }
+    _ => -1
+  }
+  let s_fn = match Some([1, 2]) {
+    Some([x, _]) => {
+      let f = fn(x : Int) -> Int { x * 2 }
+      f(10) + x
+    }
+    _ => -1
+  }
+  let s_self = match Some([1, 2]) {
+    Some([x, y]) => {
+      let x = x * 100
+      x + y
+    }
+    _ => -1
+  }
+  let s_grd = match Some([5, 2]) {
+    Some([x, _]) if { let x = 0; x == 0 } => x
+    _ => -1
+  }
+
+  // Red-team P1-2: guard array length mutations (push / pop / element mutation)
+  let lp1 = [1, 2]
+  let r_push = match Some(lp1) {
+    Some([x, _]) if { lp1.push(99); false } => x
+    Some([_, _, z]) => z
+    _ => -1
+  }
+  let lp2 = [1, 2, 3]
+  let r_pop_fix = match Some(lp2) {
+    Some([x, _, _]) if { let _ = lp2.pop(); false } => x
+    Some([_, y]) => y
+    Some([_, _, z]) => z * 100
+    _ => -1
+  }
+  let lp3 = [1, 2, 3]
+  let r_pop_rest = match Some(lp3) {
+    Some([x, ..]) if { let _ = lp3.pop(); false } => x
+    Some([_, _, z]) => z
+    _ => -1
+  }
+  let lp4 = [1, 2, 3]
+  let r_mut_rest = match Some(lp4) {
+    Some([x, ..]) if { lp4[2] = 99; false } => x
+    Some([_, _, z]) => z
+    _ => -1
+  }
+
   r4.to_string() + "," + r3.to_string() + "," + rbad.to_string() +
   "|gt=" + g_true.to_string() + "," + a1[0].to_string() + "," + calls1.to_string() +
   "|gf=" + g_false.to_string() + "," + calls2.to_string() +
-  "|sh=" + shadow.to_string()
+  "|sh=" + shadow.to_string() +
+  "|in=" + s_let.to_string() + "," + s_yx.to_string() + "," + s_fn.to_string() + "," + s_self.to_string() + "," + s_grd.to_string() +
+  "|lm=" + r_push.to_string() + "," + r_pop_fix.to_string() + "," + r_pop_rest.to_string() + "," + r_mut_rest.to_string()
 }
 
 pub fn run_all() -> String {
@@ -246,7 +310,7 @@ def main():
             "D2-1:37",
             "D2-2:trace=2431|N(2,24,243,2431)|N(10,20,30,40)|F(7,3,9)",
             "D2-4:k,p,other|40,5|125129",
-            "D2-5:1234,-1,-1|gt=1,9,1|gf=9,1|sh=77",
+            "D2-5:1234,-1,-1|gt=1,9,1|gf=9,1|sh=77|in=9,100,21,102,5|lm=-1,300,-1,99",
         ]
         for ln in expected_lines:
             if ln not in moon_out.splitlines():

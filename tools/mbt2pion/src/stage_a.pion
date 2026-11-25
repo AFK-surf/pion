@@ -578,6 +578,7 @@ pub struct StageAContext {
   expected_type_stack : Array[String]
   match_arr_cache_ctor : Array[String]
   match_arr_cache_elems : Array[Array[String]]
+  match_arr_cache_len : Array[String]
   active_generics : Map[String, Bool]
   used_idents : Map[String, Bool]
   mut cur_is_test : Bool
@@ -631,6 +632,7 @@ pub fn stage_a_context_new(
     expected_type_stack: [],
     match_arr_cache_ctor: [],
     match_arr_cache_elems: [],
+    match_arr_cache_len: [],
     active_generics: Map(),
     used_idents: Map(),
     cur_is_test: false,
@@ -5390,9 +5392,11 @@ fn lower_one_token_or_form(
       // P0-2: Push sentinel so outer match's array element cache NEVER leaks into a nested `match`!
       ctx.match_arr_cache_ctor.push("__BLOCKED__")
       ctx.match_arr_cache_elems.push([])
+      ctx.match_arr_cache_len.push("")
       let arms = lower_match_arms_with_ty(ctx, tokens, brace_i + 1, close_b, file, scrut_ty)
       let _ = ctx.match_arr_cache_ctor.pop()
       let _ = ctx.match_arr_cache_elems.pop()
+      let _ = ctx.match_arr_cache_len.pop()
       return (trivia + "match" + scrut + tokens[brace_i].leading_trivia + "{" + arms + tokens[close_b].leading_trivia + "}", close_b + 1)
     }
   }
@@ -7634,13 +7638,14 @@ fn lower_match_arms_with_ty(
     match nested_arr_opt {
       Some((lbr, rbr, as_idx, outer_prefix, outer_suffix, is_json_arr)) => {
         let lead_triv = tokens[i].leading_trivia
-        // Fail closed on `Option[String]` / `Option[Bytes]` (`Some([c, _])`) and `Result[String, _]` / `Result[Bytes, _]` (`Ok([c, _])`)
+        // Static unwrap for `Option[T]` / `Result[T, E]` (fast fail-closed for String/Bytes; unproven types go through Stage A.5 `__mbt_arrpat_len` probe!)
         let scrut_t = scrut_ty.trim()
         let mut unwrapped_inner = ""
         if (outer_prefix == "Some(" || outer_prefix == "Option::Some(") &&
         scrut_t.starts_with("Option[") && scrut_t.ends_with("]") {
           unwrapped_inner = scrut_t.slice(7, scrut_t.length() - 1).trim()
-        } else if (outer_prefix == "Ok(" || outer_prefix == "Result::Ok(") &&
+        } else if (outer_prefix == "Ok(" || outer_prefix == "Result::Ok(" ||
+          outer_prefix == "Err(" || outer_prefix == "Result::Err(") &&
         scrut_t.starts_with("Result[") && scrut_t.ends_with("]") {
           let rbody = scrut_t.slice(7, scrut_t.length() - 1)
           let mut ri = 0
@@ -7653,7 +7658,11 @@ fn lower_match_arms_with_ty(
             else if rd == 0 && ch == 44 { rcomma = ri; break }
             ri = ri + 1
           }
-          unwrapped_inner = if rcomma > 0 { rbody.slice(0, rcomma).trim() } else { rbody.trim() }
+          if outer_prefix == "Err(" || outer_prefix == "Result::Err(" {
+            unwrapped_inner = if rcomma > 0 { rbody.slice(rcomma + 1, rbody.length()).trim() } else { "" }
+          } else {
+            unwrapped_inner = if rcomma > 0 { rbody.slice(0, rcomma).trim() } else { rbody.trim() }
+          }
         }
         let inner_clean = strip_type_args_sym(unwrapped_inner)
         if inner_clean == "String" || inner_clean == "Bytes" {
@@ -7665,7 +7674,10 @@ fn lower_match_arms_with_ty(
             "array pattern matching on `" + inner_clean + "` is not supported (only Array/FixedArray/ArrayView)",
           ))
         }
+        let is_proven_arr = is_json_arr || inner_clean == "Array" || inner_clean == "FixedArray" ||
+        inner_clean == "ArrayView" || inner_clean == "mbt_compat::ArrayView"
         // 1. Collect all raw lowercase binders in this arm's pattern & allocate globally unique hygienic temps!
+        let raw_binders : Array[String] = []
         let hyg_map : Map[String, String] = Map()
         let mut bi = lbr + 1
         while bi < pat_end {
@@ -7674,21 +7686,16 @@ fn lower_match_arms_with_ty(
           !(bi > lbr && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon)) &&
           !(bi + 1 < pat_end && (tokens[bi + 1].kind == TokenKind::Colon || tokens[bi + 1].kind == TokenKind::Eq)) &&
           !hyg_map.contains(bt.raw) {
+            raw_binders.push(bt.raw)
             hyg_map[bt.raw] = fresh_temp(ctx, "pb_" + bt.raw)
           }
           bi = bi + 1
         }
+        // 2. Push `hyg_map` ONLY while lowering pattern binders (`elem_pats`, `rest_as_var`, `arr_var`)!
         let saved_hyg_rn = ctx.ident_renames.length()
         if hyg_map.length() > 0 {
           ctx.ident_renames.push(hyg_map)
         }
-        for k_raw in hyg_map.keys() {
-          match hyg_map.get(k_raw) {
-            Some(hv) => ctx.scope_vars.push(ScopeVar::{ name: hv, ty: "", is_mut: false, is_boxed: false })
-            None => ()
-          }
-        }
-        // 2. Parse element patterns & trailing rest (`..` / `.. as rest`) under hygienic bindings
         let elem_pats : Array[String] = []
         let mut has_trailing_rest = false
         let mut rest_as_var = ""
@@ -7737,9 +7744,28 @@ fn lower_match_arms_with_ty(
             "array rest pattern `..` is only supported at the end of an array pattern",
           ))
         }
-        // 3. Lower user guard & arm body under hygienic bindings ONLY
+        let arr_var = if as_idx >= 0 { resolve_ident_in_scope(ctx, tokens[as_idx].raw) } else { fresh_temp(ctx, "ap") }
+        // 3. POP `hyg_map` BEFORE lowering guard & body so inner `let x` / `fn(x)` shadowing uses native Pion lexical scope!
+        restore_ident_renames(ctx, saved_hyg_rn)
+        let arm_kw_renames = compute_scoped_binder_renames(ctx, raw_binders)
+        let saved_kw_rn = ctx.ident_renames.length()
+        if arm_kw_renames.length() > 0 {
+          ctx.ident_renames.push(arm_kw_renames)
+        }
+        let rebind_sb = StringBuilder()
+        for raw_b in raw_binders {
+          let scoped_b = resolve_ident_in_scope(ctx, raw_b)
+          ctx.scope_vars.push(ScopeVar::{ name: scoped_b, ty: "", is_mut: false, is_boxed: false })
+          match hyg_map.get(raw_b) {
+            Some(hv) => rebind_sb.write_string("let " + scoped_b + " = " + hv + "; ")
+            None => ()
+          }
+        }
+        let rebind_prefix = rebind_sb.to_string()
+        // 4. Lower user guard & arm body under regular keyword renames only
         ctx.match_arr_cache_ctor.push("__BLOCKED__")
         ctx.match_arr_cache_elems.push([])
+        ctx.match_arr_cache_len.push("")
         let guard_str = if if_idx >= 0 {
           lower_expr_range(ctx, tokens, if_idx + 1, fa, file, false).trim()
         } else {
@@ -7765,22 +7791,28 @@ fn lower_match_arms_with_ty(
         }
         let _ = ctx.match_arr_cache_ctor.pop()
         let _ = ctx.match_arr_cache_elems.pop()
-        let arr_var = if as_idx >= 0 { resolve_ident_in_scope(ctx, tokens[as_idx].raw) } else { fresh_temp(ctx, "ap") }
-        // 4. POP hygienic bindings & restore outer scope BEFORE lowering `<next_arm_chain>` (Astra P0-3)!
-        restore_ident_renames(ctx, saved_hyg_rn)
+        let _ = ctx.match_arr_cache_len.pop()
+        // 5. POP keyword renames & restore outer scope BEFORE lowering `<next_arm_chain>` (Astra P0-3)!
+        restore_ident_renames(ctx, saved_kw_rn)
         restore_scope_vars(ctx, saved_arm_sc)
         let mut trail_sep = ""
         if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
           trail_sep = tokens[next_i].leading_trivia + tokens[next_i].raw
           next_i = next_i + 1
         }
-        // 5. Build pre-guard element snapshots & sequential decision chain with ZERO double-reads
+        // 6. Build pre-guard element/length snapshots & sequential decision chain with ZERO double-reads
         let mc_var = fresh_temp(ctx, "mc")
-        let cached_c : Array[String] = if ctx.match_arr_cache_ctor.length() > 0 &&
-        ctx.match_arr_cache_ctor[ctx.match_arr_cache_ctor.length() - 1] == outer_prefix {
+        let cache_hit = ctx.match_arr_cache_ctor.length() > 0 &&
+        ctx.match_arr_cache_ctor[ctx.match_arr_cache_ctor.length() - 1] == outer_prefix
+        let cached_c : Array[String] = if cache_hit {
           ctx.match_arr_cache_elems[ctx.match_arr_cache_elems.length() - 1]
         } else {
           []
+        }
+        let cached_len : String = if cache_hit && ctx.match_arr_cache_len.length() > 0 {
+          ctx.match_arr_cache_len[ctx.match_arr_cache_len.length() - 1]
+        } else {
+          ""
         }
         let ext_cached : Array[String] = []
         for ce in cached_c { ext_cached.push(ce) }
@@ -7807,25 +7839,38 @@ fn lower_match_arms_with_ty(
         } else {
           "panic(\"unreachable\")"
         }
-        let none_cached = if guard_str.length() > 0 && next_i < end && elem_pats.length() > 0 {
+        let next_cached_len = if cached_len.length() > 0 {
+          cached_len
+        } else if !has_trailing_rest {
+          elem_pats.length().to_string()
+        } else {
+          ""
+        }
+        let none_cached = if guard_str.length() > 0 && next_i < end && (elem_pats.length() > 0 || !has_trailing_rest) {
           ctx.match_arr_cache_ctor.push(outer_prefix)
           ctx.match_arr_cache_elems.push(ext_cached)
+          ctx.match_arr_cache_len.push(next_cached_len)
           let rc = lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
           let _ = ctx.match_arr_cache_ctor.pop()
           let _ = ctx.match_arr_cache_elems.pop()
+          let _ = ctx.match_arr_cache_len.pop()
           if rc.length() > 0 { "match " + mc_var + " { " + rc + " }" } else { "panic(\"unreachable\")" }
         } else {
           none_uncached
         }
         let len_op = if has_trailing_rest { " >= " } else { " == " }
-        let len_cond = arr_var + ".length()" + len_op + elem_pats.length().to_string()
+        let live_len_expr = if is_proven_arr { arr_var + ".length()" } else { "mbt_compat::__mbt_arrpat_len(" + arr_var + ")" }
+        let len_lhs = if cached_len.length() > 0 { cached_len } else { live_len_expr }
+        let len_cond = len_lhs + len_op + elem_pats.length().to_string()
         let outer_pat = outer_prefix + arr_var + outer_suffix
         let body_t = body_raw.trim()
+        let body_rebound = if rebind_prefix.length() > 0 { "{ " + rebind_prefix + body_t + " }" } else { body_t }
+        let guard_rebound = if rebind_prefix.length() > 0 { "{ " + rebind_prefix + guard_str + " }" } else { guard_str }
         let inner_branch = if elem_pats.length() == 0 {
           if guard_str.length() > 0 {
-            rest_bind_prefix + "if (" + guard_str + ") { " + body_t + " } else { " + none_cached + " }"
+            rest_bind_prefix + "if (" + guard_rebound + ") { " + body_rebound + " } else { " + none_cached + " }"
           } else {
-            rest_bind_prefix + body_t
+            rest_bind_prefix + body_rebound
           }
         } else {
           let el_exprs : Array[String] = []
@@ -7837,9 +7882,9 @@ fn lower_match_arms_with_ty(
           let tup_e = if elem_pats.length() == 1 { el_exprs[0] } else { "(" + join_comma(el_exprs) + ")" }
           let tup_p = if elem_pats.length() == 1 { elem_pats[0] } else { "(" + join_comma(elem_pats) + ")" }
           let matched_arm = if guard_str.length() > 0 {
-            "if (" + guard_str + ") { " + body_t + " } else { " + none_cached + " }"
+            "if (" + guard_rebound + ") { " + body_rebound + " } else { " + none_cached + " }"
           } else {
-            body_t
+            body_rebound
           }
           bind_sb.to_string() + rest_bind_prefix + "match " + tup_e + " { " + tup_p + " => " + matched_arm + ", _ => " + none_cached + " }"
         }
@@ -7934,6 +7979,7 @@ fn lower_match_arms_with_ty(
     // P0-2: Block outer match's array element cache while lowering arm guard & body so nested matches never read outer cache!
     ctx.match_arr_cache_ctor.push("__BLOCKED__")
     ctx.match_arr_cache_elems.push([])
+    ctx.match_arr_cache_len.push("")
     let guard_str = if if_idx >= 0 {
       lower_expr_range(ctx, tokens, if_idx + 1, fa, file, false).trim()
     } else {
@@ -7961,6 +8007,7 @@ fn lower_match_arms_with_ty(
     }
     let _ = ctx.match_arr_cache_ctor.pop()
     let _ = ctx.match_arr_cache_elems.pop()
+    let _ = ctx.match_arr_cache_len.pop()
     restore_scope_vars(ctx, saved_arm_sc)
     let mut trail_sep = ""
     if next_i < end && (tokens[next_i].kind == TokenKind::Comma || tokens[next_i].kind == TokenKind::Semi) {
@@ -8624,6 +8671,7 @@ fn lower_match_arms_with_ty(
               }
               ctx.match_arr_cache_ctor.push("")
               ctx.match_arr_cache_elems.push(ext_cached)
+              ctx.match_arr_cache_len.push("")
               let rest_cached = if next_i < end {
                 lower_match_arms_with_ty(ctx, tokens, next_i, end, file, scrut_ty).trim()
               } else {
@@ -8631,6 +8679,7 @@ fn lower_match_arms_with_ty(
               }
               let _ = ctx.match_arr_cache_ctor.pop()
               let _ = ctx.match_arr_cache_elems.pop()
+              let _ = ctx.match_arr_cache_len.pop()
               let none_uncached = if rest_uncached.length() > 0 {
                 "match " + arr_var + " { " + rest_uncached + " }"
               } else {
