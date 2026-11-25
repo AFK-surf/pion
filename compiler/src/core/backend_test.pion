@@ -15144,3 +15144,132 @@ test "counted fill: a loop body that shadows the array keeps its own header" {
   }
   assert_true(dynamic >= 1, body)
 }
+
+///|
+fn t_w1_ssa(src : String, release : Bool, target : String) -> String {
+  let cr = check_source_files_full("w1", ["w1.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  emit_qbe_package_with_tc_target(cr.pkg, cr.tc, release, target).ssa
+}
+
+///|
+fn t_w1_fn(ssa : String, name : String) -> String {
+  let s = p18_find_from(ssa, " $pion_fn_" + name + "(", 0)
+  assert_true(s >= 0, "missing function " + name + ":\n" + ssa)
+  let e = p18_find_from(ssa, "\n}", s)
+  assert_true(e > s, "unterminated function " + name)
+  slice_str(ssa, s, e)
+}
+
+///|
+test "qbe_w1_string_spans_scalar_map_entry_and_string_send" {
+  let src =
+    #|fn bump(m : Map[String, Int], k : String) -> Int {
+    #|  m.remove(k)
+    #|  1
+    #|}
+    #|pub fn cat(s : String, a : Int, b : Int) -> String {
+    #|  s.slice(a, b) + "-" + s.slice(b, s.length())
+    #|}
+    #|pub fn alias(s : String) -> String {
+    #|  let x = s.slice(0, 1)
+    #|  let y = s.slice(1, 2)
+    #|  let r = x + ":" + y
+    #|  r
+    #|}
+    #|pub fn plain(a : String, b : String) -> String {
+    #|  a + "-" + b
+    #|}
+    #|pub fn sbw(s : String, a : Int, b : Int) -> String {
+    #|  let sb = StringBuilder()
+    #|  sb.write_string(s.slice(a, b))
+    #|  sb.to_string()
+    #|}
+    #|pub fn count(m : Map[String, Int], k : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(k, v + 1)
+    #|    None => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn count64(m : Map[String, Int64], s : String) -> Unit {
+    #|  let k = s.slice(1, 3)
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(k, v * 2L)
+    #|    None => m.set(k, 7L)
+    #|  }
+    #|}
+    #|pub fn has(m : Map[String, Int], k : String, d : Int) -> Unit {
+    #|  if m.contains(k) { m.set(k, d) } else { m.set(k, d + 1) }
+    #|}
+    #|pub fn effect(m : Map[String, Int], k : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(k, v + bump(m, k))
+    #|    None => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn effect_if(m : Map[String, Int], k : String) -> Unit {
+    #|  if m.contains(k) { m.set(k, bump(m, k)) } else { m.set(k, 2) }
+    #|}
+    #|pub fn guarded(m : Map[String, Int], k : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) if v > 3 => m.set(k, v + 1)
+    #|    _ => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn other_key(m : Map[String, Int], k : String, j : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(j, v + 1)
+    #|    None => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn push(ch : Channel[String], s : String) -> Bool {
+    #|  ch.send(s)
+    #|}
+    #|pub fn main() -> Int {
+    #|  0
+    #|}
+  for release in [false, true] {
+    let ssa = t_w1_ssa(src, release, "amd64_sysv")
+    // Slices inside a `+` chain and immutable slice aliases feeding the next
+    // concatenation become validated spans plus one exact-size copy.
+    for name in ["cat", "alias"] {
+      let f = t_w1_fn(ssa, name)
+      assert_true(f.contains("call $pion_str_slice_data("), name + ":\n" + f)
+      assert_true(f.contains("call $pion_str_concat_spans(l 3,"), name + ":\n" + f)
+      assert_true(!f.contains("call $pion_str_slice("), name + ":\n" + f)
+    }
+    assert_true(!t_w1_fn(ssa, "plain").contains("$pion_str_concat_spans"), "plain concat keeps its lowering")
+    let sbw = t_w1_fn(ssa, "sbw")
+    assert_true(sbw.contains("call $pion_strbuf_push_span("), sbw)
+    assert_true(!sbw.contains("call $pion_str_slice("), sbw)
+    // Scalar map read-modify-write through one slot.
+    for name in ["count", "count64", "has"] {
+      let f = t_w1_fn(ssa, name)
+      assert_true(f.contains("call $pion_map_scalar_entry("), name + ":\n" + f)
+      assert_true(!f.contains("call $pion_map_set("), name + ":\n" + f)
+      assert_true(!f.contains("call $pion_map_try_get("), name + ":\n" + f)
+    }
+    // A sliced key is passed as a span (no slice allocation, no whole key).
+    let c64 = t_w1_fn(ssa, "count64")
+    assert_true(!c64.contains("call $pion_str_slice("), c64)
+    assert_true(c64.contains(", l 0, l %"), c64)
+    // Calls, guards and mismatched keys fall back to ordinary lookups.
+    for name in ["effect", "effect_if", "guarded", "other_key"] {
+      let f = t_w1_fn(ssa, name)
+      assert_true(!f.contains("$pion_map_scalar_entry"), name + ":\n" + f)
+      assert_true(f.contains("call $pion_map_set("), name + ":\n" + f)
+    }
+    // Native Channel[String].send relies on pion_chan_send's publication freeze.
+    let push = t_w1_fn(ssa, "push")
+    assert_true(push.contains("call $pion_chan_send("), push)
+    assert_true(!push.contains("$pion_rc_freeze"), push)
+  }
+  // Wasm32 keeps the ordinary lowering, including the String deep freeze.
+  let wasm = t_w1_ssa(src, false, "wasm32")
+  assert_true(!wasm.contains("$pion_str_concat_spans"), "wasm32 must not use spans")
+  assert_true(!wasm.contains("$pion_strbuf_push_span"), "wasm32 must not use builder spans")
+  assert_true(!wasm.contains("$pion_map_scalar_entry"), "wasm32 must not use scalar entries")
+  let wpush = t_w1_fn(wasm, "push")
+  assert_true(wpush.contains("call $pion_rc_freeze("), wpush)
+  assert_true(wpush.contains("$pion_chan_send("), wpush)
+}

@@ -4083,6 +4083,174 @@ static void test_utf8_paths_and_embedded_nul(int argc, char **argv) {
     printf("[PASS] utf8_paths_and_embedded_nul\n");
 }
 
+/* String spans, scalar map entries and managed String file reads
+ * (pion_str_slice_data / pion_str_concat_spans / pion_strbuf_push_span /
+ * pion_map_scalar_entry / pion_read_file_obj). */
+static uint32_t w1_rc(const void *obj) {
+    return ((const PionHeader *)obj - 1)->local_rc;
+}
+
+static void w1_write_file(const char *path, const char *data, size_t len) {
+    FILE *f = fopen(path, "wb");
+    assert(f != NULL);
+    assert(len == 0 || fwrite(data, 1, len, f) == len);
+    assert(fclose(f) == 0);
+}
+
+static void w1_check_read(void *path, int as_bytes, int32_t expected_ok, const char *data, size_t len) {
+    int32_t ok = -1;
+    void *out = as_bytes ? pion_world_fs_read_bytes(NULL, path, &ok) : pion_world_fs_read(NULL, path, &ok);
+    assert(ok == expected_ok);
+    if (as_bytes) {
+        PionBytes *b = (PionBytes *)out;
+        assert((size_t)b->len == len && (len == 0 || memcmp(b->data, data, len) == 0));
+    } else {
+        PionString *s = (PionString *)out;
+        assert((size_t)s->len == len && s->data[len] == '\0');
+        assert(len == 0 || memcmp(s->data, data, len) == 0);
+        assert(w1_rc(s) == 1);
+    }
+    pion_rc_dec(out);
+}
+
+static void test_w1_string_span_map_entry(void) {
+    /* 1. pion_str_slice_data: interior, empty and full-length spans. */
+    static const char raw[] = {'a', 0, (char)0xe6, (char)0x97, (char)0xa5, 'z'};
+    PionString *s = (PionString *)pion_str_from_cstr(raw, (int64_t)sizeof(raw));
+    assert(pion_str_slice_data(s, 0, 6) == s->data);
+    assert(pion_str_slice_data(s, 6, 6) == s->data + 6);
+    assert(pion_str_slice_data(s, 0, 0) == s->data);
+    const char *mid = pion_str_slice_data(s, 1, 5); /* "\0日" */
+
+    /* 2. pion_str_concat_spans: zero parts, empty parts, embedded NUL, many parts. */
+    PionString *none = (PionString *)pion_str_concat_spans(0, NULL);
+    assert(none->len == 0 && none->data[0] == '\0');
+    pion_rc_dec(none);
+    PionStrSpan parts[] = {{mid, 4}, {NULL, 0}, {s->data, 1}, {mid, 4}, {s->data + 5, 1}};
+    PionString *joined = (PionString *)pion_str_concat_spans(5, parts);
+    assert(joined->len == 10 && joined->data[10] == '\0');
+    assert(memcmp(joined->data, "\0\xe6\x97\xa5" "a" "\0\xe6\x97\xa5" "z", 10) == 0);
+    assert(joined != s && w1_rc(s) == 1 && w1_rc(joined) == 1);
+    pion_rc_dec(joined);
+    PionStrSpan many[40];
+    for (int i = 0; i < 40; i++) {
+        many[i].data = s->data + (i % 6);
+        many[i].len = 1;
+    }
+    PionString *wide = (PionString *)pion_str_concat_spans(40, many);
+    assert(wide->len == 40 && wide->data[40] == '\0');
+    for (int i = 0; i < 40; i++) assert(wide->data[i] == raw[i % 6]);
+    pion_rc_dec(wide);
+
+    /* 3. pion_strbuf_push_span: empty spans are no-ops, growth keeps the prefix. */
+    void *sb = pion_strbuf_new(2);
+    pion_strbuf_push_span(sb, NULL, 0);
+    pion_strbuf_push_span(sb, mid, 4);
+    for (int i = 0; i < 64; i++) pion_strbuf_push_span(sb, s->data + 5, 1);
+    pion_strbuf_push_span(NULL, mid, 4);
+    PionString *built = (PionString *)pion_strbuf_to_str(sb);
+    assert(built->len == 68 && built->data[68] == '\0' && memcmp(built->data, "\0\xe6\x97\xa5", 4) == 0);
+    for (int i = 4; i < 68; i++) assert(built->data[i] == 'z');
+    pion_rc_dec(built);
+    pion_rc_dec(sb);
+
+    /* 4. pion_map_scalar_entry: span miss materializes a fresh key, hits share
+     * the slot, whole keys keep their identity, rehash and remove keep lookups. */
+    PionMap *m = (PionMap *)pion_map_new(0);
+    PionString *resident = NULL;
+    int32_t hit = -1;
+    int64_t *slot = pion_map_scalar_entry(m, mid, 4, NULL, &hit, &resident);
+    assert(hit == 0 && resident != s && resident->len == 4 && memcmp(resident->data, mid, 4) == 0);
+    assert(w1_rc(resident) == 1 && w1_rc(s) == 1 && m->len == 1);
+    *slot = 7;
+    PionString *same = (PionString *)pion_str_from_cstr(mid, 4);
+    assert(pion_map_scalar_entry(m, NULL, -1, same, &hit, NULL) == slot && hit == 1 && *slot == 7);
+    assert(w1_rc(same) == 1 && m->len == 1);
+    int64_t v = 0;
+    assert(pion_map_try_get(m, same, &v) == 1 && v == 7);
+    pion_map_set(m, same, 8);
+    assert(pion_map_get(m, same) == 8);
+    pion_rc_dec(same);
+    /* empty span key */
+    slot = pion_map_scalar_entry(m, s->data, 0, NULL, &hit, &resident);
+    assert(hit == 0 && resident->len == 0);
+    *slot = 3;
+    /* whole key insertion keeps identity and takes one reference */
+    PionString *whole = (PionString *)pion_str_from_cstr("whole-key", 9);
+    slot = pion_map_scalar_entry(m, NULL, -1, whole, &hit, &resident);
+    assert(hit == 0 && resident == whole && w1_rc(whole) == 2);
+    *slot = 41;
+    slot = pion_map_scalar_entry(m, "whole-key", 9, NULL, &hit, &resident);
+    assert(hit == 1 && resident == whole && *slot == 41);
+    *slot += 1;
+    assert(pion_map_get(m, whole) == 42);
+    /* drive several rehashes (16 -> 32 -> 64 -> 128) through the entry path */
+    char kbuf[32];
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        slot = pion_map_scalar_entry(m, kbuf, n, NULL, &hit, NULL);
+        assert(hit == 0);
+        *slot = i;
+    }
+    assert(m->len == 83 && m->cap >= 128);
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        slot = pion_map_scalar_entry(m, kbuf, n, NULL, &hit, &resident);
+        assert(hit == 1 && *slot == i && resident->len == n);
+        *slot = i * 3;
+    }
+    assert(pion_map_get(m, whole) == 42 && m->len == 83);
+    /* backward-shift removal, then lookups and re-insertion through entries */
+    for (int i = 0; i < 80; i += 2) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        void *k = pion_str_from_cstr(kbuf, n);
+        pion_map_remove(m, k);
+        pion_rc_dec(k);
+    }
+    pion_map_remove(m, whole);
+    assert(w1_rc(whole) == 1 && m->len == 42);
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        slot = pion_map_scalar_entry(m, kbuf, n, NULL, &hit, NULL);
+        assert(hit == (i % 2) && (!hit || *slot == i * 3));
+        if (!hit) *slot = -i;
+    }
+    for (int i = 0; i < 80; i++) {
+        int n = snprintf(kbuf, sizeof(kbuf), "w1_%02d", i);
+        void *k = pion_str_from_cstr(kbuf, n);
+        assert(pion_map_get(m, k) == ((i % 2) ? i * 3 : -i));
+        pion_rc_dec(k);
+    }
+    slot = pion_map_scalar_entry(m, NULL, -1, whole, &hit, &resident);
+    assert(hit == 0 && resident == whole && w1_rc(whole) == 2 && m->len == 83);
+    *slot = 5;
+    pion_rc_dec(m);
+    assert(w1_rc(whole) == 1);
+    pion_rc_dec(whole);
+    pion_rc_dec(s);
+
+    /* 5. Managed String file reads: empty, text, binary/UTF-8, missing. */
+    char path_buf[300];
+    snprintf(path_buf, sizeof(path_buf), "%s/pion_rt_w1_%d.bin", pion_test_tmpdir(), pion_test_getpid());
+    void *path = pion_str_from_cstr(path_buf, -1);
+    w1_write_file(path_buf, "", 0);
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, "", 0);
+    static const char lines[] = "first line\nsecond line\n\nlast";
+    w1_write_file(path_buf, lines, sizeof(lines) - 1);
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, lines, sizeof(lines) - 1);
+    static const char bin[] = {0, (char)0xff, (char)0xe6, (char)0x97, (char)0xa5, '\n', 0, (char)0x80};
+    w1_write_file(path_buf, bin, sizeof(bin));
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, bin, sizeof(bin));
+    char big[5000];
+    for (size_t i = 0; i < sizeof(big); i++) big[i] = (char)(i * 31u + 7u);
+    w1_write_file(path_buf, big, sizeof(big));
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 1, big, sizeof(big));
+    assert(pion_test_unlink(path_buf) == 0);
+    for (int b = 0; b < 2; b++) w1_check_read(path, b, 0, "", 0);
+    pion_rc_dec(path);
+    printf("  string spans, scalar map entries and managed String reads: OK\n");
+}
+
 int main(int argc, char **argv) {
     int run_bench = 0;
     for (int i = 1; i < argc; i++) {
@@ -4116,6 +4284,7 @@ int main(int argc, char **argv) {
     test_p57b_hot_str_and_split();
     test_p61b_map_hint_hit_miss_aba();
     test_p71c_hashdos_bit63_noncollision();
+    test_w1_string_span_map_entry();
 
     test_st_frozen_slab_recycle();
     test_mt_shared_rc();
