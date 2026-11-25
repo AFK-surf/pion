@@ -37,6 +37,7 @@ import PionProofs.QbeCountedArrayLength
 import PionProofs.QbeStringSpanMapEntry
 import PionProofs.QbeEcosystemUnboxFixedLen
 import PionProofs.QbeBinarySizeOpts
+import PionProofs.QbeCompileSpeedZ1
 import PionProofs.QbeRealWorkloadDataOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
@@ -840,6 +841,17 @@ import PionProofs.QbeRealWorkloadDataOpts
 #print axioms PionQbeBinarySizeOpts.ElfLiteralSym.got_not_rebased
 #print axioms PionQbeBinarySizeOpts.RuntimePool.pooled_diagnostic
 #print axioms PionQbeBinarySizeOpts.RuntimePool.grouped_link
+#print axioms QbeCompileSpeedZ1.BinaryFrames.check_trace
+#print axioms QbeCompileSpeedZ1.BinaryFrames.emit_trace
+#print axioms QbeCompileSpeedZ1.BinaryFrames.read_eq
+#print axioms QbeCompileSpeedZ1.BinaryFrames.forget_unused
+#print axioms QbeCompileSpeedZ1.BinaryGuard.lazy_guard
+#print axioms QbeCompileSpeedZ1.BinaryGuard.same_emission
+#print axioms QbeCompileSpeedZ1.BodyScan.scan_eq
+#print axioms QbeCompileSpeedZ1.BodyScan.indexed_eq
+#print axioms QbeCompileSpeedZ1.BodyLines.partition_eq
+#print axioms QbeCompileSpeedZ1.DriverTarget.same_target
+#print axioms QbeCompileSpeedZ1.DriverTarget.repeated
 #print axioms QbeRealWorkloadDataOpts.QuotedBytes.literal_alphabet
 #print axioms QbeRealWorkloadDataOpts.QuotedBytes.scan_spec
 #print axioms QbeRealWorkloadDataOpts.QuotedBytes.pack_spec
