@@ -249,6 +249,41 @@ pub fn show_byte() -> String {
 }
 '''
 
+NEG_SHOW_INHERENT_MBT = r'''
+priv struct H {
+  x : Int
+} derive(Show)
+
+fn H::to_string(_self : H) -> String {
+  "inherent"
+}
+
+pub fn eval_derive() -> String {
+  let v : H = { x: 1 }
+  Show::to_string(v)
+}
+'''
+
+NEG_SHOW_BOTH_MBT = r'''
+priv struct G {
+  x : Int
+}
+
+impl Show for G with output(self, logger) {
+  logger.write_string("G")
+  ignore(self)
+}
+
+fn G::to_string(_self : G) -> String {
+  "inherent"
+}
+
+pub fn eval_impl() -> String {
+  let v : G = { x: 1 }
+  Show::to_string(v)
+}
+'''
+
 NEG_CLOSURE_MBT = r'''
 fn use_wide(_w : Int64) -> Unit {
   ()
@@ -352,6 +387,19 @@ pub fn struct_is_case(o : H?) -> Int {
   let g = fn(k) {
     let neg = (k + 1) < 0
     if o is Some({ k }) && k > 0L { use_wide(k) }
+    if neg { 1 } else { 0 }
+  }
+  g(2147483647)
+}
+
+pub fn guard_expr_case(o : H?) -> Int {
+  let g = fn(k) {
+    let neg = (k + 1) < 0
+    match o {
+      Some({ k }) if 1 >
+        0 => use_wide(k)
+      _ => ()
+    }
     if neg { 1 } else { 0 }
   }
   g(2147483647)
@@ -462,6 +510,40 @@ def main():
             assert "on type `" + ty + "` has no MoonBit-exact lowering" in sl, f"Show::to_string({ty}) must fail closed:\n{sl}"
         assert p.returncode != 0 and not os.listdir(sout), f"Show::to_string negatives must block publish:\n{sl}"
 
+        # Negative 1c: a user type whose `to_string` is (or may be) an inherent method, not its `Show`:
+        # `derive(Show)` ignored by recipes + `fn H::to_string`, and `impl Show` + `fn G::to_string`.
+        ineg = os.path.join(md, "f3ineg")
+        os.makedirs(ineg)
+        with open(os.path.join(ineg, "moon.pkg"), "w") as fh:
+            fh.write("\n")
+        with open(os.path.join(ineg, "neg.mbt"), "w") as fh:
+            fh.write(NEG_SHOW_INHERENT_MBT)
+        rec = os.path.join(work, "ignore_show.toml")
+        with open(rec, "w") as fh:
+            fh.write('[derives]\nignore = ["Show"]\n')
+        iout = os.path.join(work, "p_ineg", "src")
+        os.makedirs(iout)
+        p = subprocess.run([bin_path, "--src", ineg, "--out", iout, "--target", "native", "--mode", "publish",
+                            "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--recipes", rec],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        il = (p.stdout + p.stderr)
+        assert p.returncode != 0 and not os.listdir(iout), f"inherent to_string cases must block publish:\n{il}"
+        assert "on type `H` has no MoonBit-exact lowering" in il, f"derive(Show)-ignored + inherent H must fail closed:\n{il}"
+        bneg = os.path.join(md, "f3bneg")
+        os.makedirs(bneg)
+        with open(os.path.join(bneg, "moon.pkg"), "w") as fh:
+            fh.write("\n")
+        with open(os.path.join(bneg, "neg.mbt"), "w") as fh:
+            fh.write(NEG_SHOW_BOTH_MBT)
+        bout = os.path.join(work, "p_bneg", "src")
+        os.makedirs(bout)
+        p = subprocess.run([bin_path, "--src", bneg, "--out", bout, "--target", "native", "--mode", "publish",
+                            "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        assert p.returncode != 0 and not os.listdir(bout), (
+            "impl Show + inherent G::to_string must block publish:\n" + p.stdout + p.stderr
+        )
+
         # Negative 2: shadowed / field-receiver / named-argument closure params are never inferred.
         cneg = os.path.join(md, "f3cneg")
         os.makedirs(cneg)
@@ -475,12 +557,12 @@ def main():
                         "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", os.path.join(work, "cneg.json")],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
         gen = open(os.path.join(cout, "neg.pion"), encoding="utf-8").read()
-        assert gen.count("let g = fn(k) {") == 7 and "let g = fn(k : Int, r : Child) {" in gen and "fn(k : Int64" not in gen, (
+        assert gen.count("let g = fn(k) {") == 8 and "let g = fn(k : Int, r : Child) {" in gen and "fn(k : Int64" not in gen, (
             "shadow/field/loop-let/struct-let/struct-arm/struct-is/named closure params must stay unannotated and the sibling one must use `r : Child`:\n" + gen
         )
 
         print("[f3b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
-        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; Show::to_string on Float/Bytes/Byte blocked; 7 closure params not inferred; sibling param never reads outer `r`)")
+        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; Show::to_string on Float/Bytes/Byte and inherent-to_string types blocked; 8 closure params not inferred; sibling param never reads outer `r`)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
