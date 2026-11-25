@@ -463,6 +463,8 @@ sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC2"
 # P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
 sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC2"
+# P129: Opt-Track Z1 compile speed (single frame stack for check_binary_chain / qbe_emit_binary_chain, lazy left-operand guards, inline_rc substring scans + ASCII batch line split, target reuse in build/run; 4,000-deep left / right binary trees, 1,500 mixed &&/||, 1,200-part String +, 300 `?` operands, owned String/Array left operands with `?` / `return` right operands, inline_rc RC / call-only / `call`-prefixed identifier / UTF-8 bodies; dev + --release native, ASan/LSan and Wasm32 output, host / explicit / PION_TARGET / wasm32 build and run, --emit-web-rt accept / reject, bounded host probes).
+sh "$ROOT_DIR/tests/e2e/p129_compile_speed_z1/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.

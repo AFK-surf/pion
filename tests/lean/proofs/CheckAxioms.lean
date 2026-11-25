@@ -36,6 +36,7 @@ import PionProofs.QbeFrontendColdSpeedOpts
 import PionProofs.QbeCountedArrayLength
 import PionProofs.QbeStringSpanMapEntry
 import PionProofs.QbeEcosystemUnboxFixedLen
+import PionProofs.QbeCompileSpeedZ1
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -828,3 +829,14 @@ import PionProofs.QbeEcosystemUnboxFixedLen
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.shadow
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.hoist
 #print axioms PionQbeEcosystemUnboxFixedLen.FixedLiteral.run_prefix
+#print axioms QbeCompileSpeedZ1.BinaryFrames.check_trace
+#print axioms QbeCompileSpeedZ1.BinaryFrames.emit_trace
+#print axioms QbeCompileSpeedZ1.BinaryFrames.read_eq
+#print axioms QbeCompileSpeedZ1.BinaryFrames.forget_unused
+#print axioms QbeCompileSpeedZ1.BinaryGuard.lazy_guard
+#print axioms QbeCompileSpeedZ1.BinaryGuard.same_emission
+#print axioms QbeCompileSpeedZ1.BodyScan.scan_eq
+#print axioms QbeCompileSpeedZ1.BodyScan.indexed_eq
+#print axioms QbeCompileSpeedZ1.BodyLines.partition_eq
+#print axioms QbeCompileSpeedZ1.DriverTarget.same_target
+#print axioms QbeCompileSpeedZ1.DriverTarget.repeated
