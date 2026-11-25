@@ -1119,10 +1119,32 @@ fn revoke_bare_idents_in_range(
   }
 }
 
+fn is_mbt_compat_arr_mutating(m : String) -> Bool {
+  m == "arr_retain" || m == "arr_push" || m == "arr_pop" || m == "arr_clear" ||
+  m == "arr_truncate" || m == "arr_remove" || m == "arr_insert" || m == "arr_append" ||
+  m == "arr_set" || m == "arr_unsafe_set" || m == "arr_swap" || m == "arr_sort" ||
+  m == "arr_sort_by" || m == "arr_sort_by_key" || m == "arr_splice" || m == "arr_drain" ||
+  m == "arr_resize" || m == "arr_dedup" || m == "arr_rev_in_place" || m == "arr_map_in_place" ||
+  m == "arr_push_iter" || m == "arr_shrink_to_fit" || m == "arr_blit_to"
+}
+
 fn clone_bool_map(m : Map[String, Bool]) -> Map[String, Bool] {
   let out : Map[String, Bool] = Map()
   for k in m.keys() {
     out[k] = true
+  }
+  out
+}
+
+fn clone_local_fn_map(
+  m : Map[String, (Int, Int, Map[String, Bool])],
+) -> Map[String, (Int, Int, Map[String, Bool])] {
+  let out : Map[String, (Int, Int, Map[String, Bool])] = Map()
+  for k in m.keys() {
+    match m.get(k) {
+      Some(v) => out[k] = v
+      None => ()
+    }
   }
   out
 }
@@ -1176,24 +1198,30 @@ fn collect_stage_b_pkg_fns(cur_files : Array[GeneratedFile]) -> Map[String, Stag
         if ni < n && toks[ni].kind == TokenKind::LBracket {
           ni = find_matching_delim(toks, ni) + 1
         }
-        if ni + 1 < n && toks[ni].kind == TokenKind::Ident && toks[ni + 1].kind == TokenKind::LParen {
+        if ni < n && toks[ni].kind == TokenKind::Ident {
           let fname = toks[ni].raw
-          let cp = find_matching_delim(toks, ni + 1)
-          let pnames = collect_pion_fn_param_names(toks, ni + 1, cp)
-          let mut lb = cp + 1
-          while lb < n && toks[lb].kind != TokenKind::LBrace {
-            lb = lb + 1
+          let mut pi = ni + 1
+          if pi < n && toks[pi].kind == TokenKind::LBracket {
+            pi = find_matching_delim(toks, pi) + 1
           }
-          if lb < n && toks[lb].kind == TokenKind::LBrace {
-            let rb = find_matching_delim(toks, lb)
-            out[fname] = StageBPkgFn::{
-              tokens: toks,
-              body_s: lb + 1,
-              body_e: rb,
-              params: pnames,
+          if pi < n && toks[pi].kind == TokenKind::LParen {
+            let cp = find_matching_delim(toks, pi)
+            let pnames = collect_pion_fn_param_names(toks, pi, cp)
+            let mut lb = cp + 1
+            while lb < n && toks[lb].kind != TokenKind::LBrace {
+              lb = lb + 1
             }
-            i = rb + 1
-            continue
+            if lb < n && toks[lb].kind == TokenKind::LBrace {
+              let rb = find_matching_delim(toks, lb)
+              out[fname] = StageBPkgFn::{
+                tokens: toks,
+                body_s: lb + 1,
+                body_e: rb,
+                params: pnames,
+              }
+              i = rb + 1
+              continue
+            }
           }
         }
       }
@@ -1203,23 +1231,42 @@ fn collect_stage_b_pkg_fns(cur_files : Array[GeneratedFile]) -> Map[String, Stag
   out
 }
 
-///| Check whether a package top-level function `pf` mutates any global OR any parameter whose index
-///| is NOT in `fresh_arg_indices` (conservative on indirect calls).
+///| Check whether a scope `[s, e)` mutates any non-disjoint array or calls a helper that does.
+///| Mutates `inner_fresh` in place for this scope; callers pass a cloned map when entering child scopes.
 fn stage_b_scope_may_mutate(
   tokens : Array[Token],
   s : Int,
   e : Int,
-  outer_fresh : Map[String, Bool],
+  inner_fresh : Map[String, Bool],
   cb_params : Map[String, Bool],
   local_fn_bodies : Map[String, (Int, Int, Map[String, Bool])],
   pkg_fns : Map[String, StageBPkgFn],
   visited_fns : Map[String, Bool],
   recv_root : String,
 ) -> Bool {
-  let inner_fresh = clone_bool_map(outer_fresh)
+  let inner_local_fns = clone_local_fn_map(local_fn_bodies)
   let mut k = s
   while k < e {
     let tk = tokens[k]
+    // 0. Child block `{ ... }` — isolate inner `let` bindings, propagate revocations of existing `inner_fresh` keys
+    if tk.kind == TokenKind::LBrace {
+      let rb = find_matching_delim(tokens, k)
+      let child_fresh = clone_bool_map(inner_fresh)
+      if stage_b_scope_may_mutate(tokens, k + 1, rb, child_fresh, cb_params, inner_local_fns, pkg_fns, visited_fns, recv_root) {
+        return true
+      }
+      let to_revoke : Array[String] = []
+      for fk in inner_fresh.keys() {
+        if !child_fresh.contains(fk) {
+          to_revoke.push(fk)
+        }
+      }
+      for rk in to_revoke {
+        inner_fresh.remove(rk)
+      }
+      k = rb + 1
+      continue
+    }
     // 1. Local `let [mut] v [: T] = rhs` inside this scope
     if tk.kind == TokenKind::Keyword && tk.raw == "let" {
       let mut ni = k + 1
@@ -1242,17 +1289,42 @@ fn stage_b_scope_may_mutate(
         if eq_i < e && tokens[eq_i].kind == TokenKind::Eq && eq_i + 1 < e {
           let rhs_s = eq_i + 1
           let rhs_e = find_expr_end(tokens, rhs_s, e)
-          // Check RHS itself for mutations (unless RHS is a closure literal `fn(...) { ... }`, which is checked when called)
-          if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
-            if stage_b_scope_may_mutate(tokens, rhs_s, rhs_e, inner_fresh, cb_params, local_fn_bodies, pkg_fns, visited_fns, recv_root) {
-              return true
+          // Check RHS itself for mutations (unless RHS is a closure literal `fn(...) { ... }`, which is registered and checked when called)
+          if tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn" &&
+          rhs_s + 1 < rhs_e && tokens[rhs_s + 1].kind == TokenKind::LParen {
+            let cp = find_matching_delim(tokens, rhs_s + 1)
+            let lpm : Map[String, Bool] = Map()
+            for pn in collect_pion_fn_param_names(tokens, rhs_s + 1, cp) { lpm[pn] = true }
+            let mut lb = cp + 1
+            while lb < rhs_e && tokens[lb].kind != TokenKind::LBrace { lb = lb + 1 }
+            if lb < rhs_e && tokens[lb].kind == TokenKind::LBrace {
+              let rb = find_matching_delim(tokens, lb)
+              inner_local_fns[lhs_name] = (lb + 1, rb, lpm)
+            } else {
+              inner_local_fns.remove(lhs_name)
+            }
+          } else {
+            if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
+              if stage_b_scope_may_mutate(tokens, rhs_s, rhs_e, inner_fresh, cb_params, inner_local_fns, pkg_fns, visited_fns, recv_root) {
+                return true
+              }
+            }
+            if rhs_e == rhs_s + 1 && tokens[rhs_s].kind == TokenKind::Ident {
+              match inner_local_fns.get(tokens[rhs_s].raw) {
+                Some(fb) => inner_local_fns[lhs_name] = fb
+                None => inner_local_fns.remove(lhs_name)
+              }
+            } else {
+              inner_local_fns.remove(lhs_name)
             }
           }
           if is_fresh_container_alloc(tokens, rhs_s, rhs_e) {
             inner_fresh[lhs_name] = true
           } else {
             inner_fresh.remove(lhs_name)
-            revoke_bare_idents_in_range(tokens, rhs_s, rhs_e, inner_fresh)
+            if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
+              revoke_bare_idents_in_range(tokens, rhs_s, rhs_e, inner_fresh)
+            }
           }
           k = rhs_e
           continue
@@ -1260,19 +1332,70 @@ fn stage_b_scope_may_mutate(
       }
     }
     let prev_qual = k > s && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)
+    // 1b. Static qualified array mutation: `Array::<mutating>(arg0, ...)` or `mbt_compat::arr_<mutating>(arg0, ...)`
+    if (tk.raw == "Array" || tk.raw == "mbt_compat") && !prev_qual &&
+    k + 3 < e && tokens[k + 1].kind == TokenKind::ColonColon &&
+    tokens[k + 2].kind == TokenKind::Ident && tokens[k + 3].kind == TokenKind::LParen {
+      let qm = tokens[k + 2].raw
+      let is_static_mut = (tk.raw == "Array" && is_array_mutating_method(qm)) ||
+      (tk.raw == "mbt_compat" && is_mbt_compat_arr_mutating(qm))
+      if is_static_mut {
+        let cp = find_matching_delim(tokens, k + 3)
+        let a0s = k + 4
+        let mut a0e = a0s
+        let mut ad = 0
+        while a0e < cp {
+          let ak = tokens[a0e].kind
+          if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+          else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+          else if ad == 0 && ak == TokenKind::Comma { break }
+          a0e = a0e + 1
+        }
+        let arg0_disjoint = a0e == a0s + 1 && tokens[a0s].kind == TokenKind::Ident &&
+        (inner_fresh.contains(tokens[a0s].raw) || cb_params.contains(tokens[a0s].raw))
+        if !arg0_disjoint {
+          return true
+        }
+      }
+    }
     if tk.kind == TokenKind::Ident && !prev_qual {
       // 2. Reassignment `v = rhs`
       if k + 1 < e && tokens[k + 1].kind == TokenKind::Eq {
         let rhs_s = k + 2
         let rhs_e = find_expr_end(tokens, rhs_s, e)
-        if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
-          if stage_b_scope_may_mutate(tokens, rhs_s, rhs_e, inner_fresh, cb_params, local_fn_bodies, pkg_fns, visited_fns, recv_root) {
-            return true
+        if tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn" &&
+        rhs_s + 1 < rhs_e && tokens[rhs_s + 1].kind == TokenKind::LParen {
+          let cp = find_matching_delim(tokens, rhs_s + 1)
+          let lpm : Map[String, Bool] = Map()
+          for pn in collect_pion_fn_param_names(tokens, rhs_s + 1, cp) { lpm[pn] = true }
+          let mut lb = cp + 1
+          while lb < rhs_e && tokens[lb].kind != TokenKind::LBrace { lb = lb + 1 }
+          if lb < rhs_e && tokens[lb].kind == TokenKind::LBrace {
+            let rb = find_matching_delim(tokens, lb)
+            inner_local_fns[tk.raw] = (lb + 1, rb, lpm)
+          } else {
+            inner_local_fns.remove(tk.raw)
+          }
+        } else {
+          if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
+            if stage_b_scope_may_mutate(tokens, rhs_s, rhs_e, inner_fresh, cb_params, inner_local_fns, pkg_fns, visited_fns, recv_root) {
+              return true
+            }
+          }
+          if rhs_e == rhs_s + 1 && tokens[rhs_s].kind == TokenKind::Ident {
+            match inner_local_fns.get(tokens[rhs_s].raw) {
+              Some(fb) => inner_local_fns[tk.raw] = fb
+              None => inner_local_fns.remove(tk.raw)
+            }
+          } else {
+            inner_local_fns.remove(tk.raw)
           }
         }
         if !is_fresh_container_alloc(tokens, rhs_s, rhs_e) {
           inner_fresh.remove(tk.raw)
-          revoke_bare_idents_in_range(tokens, rhs_s, rhs_e, inner_fresh)
+          if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
+            revoke_bare_idents_in_range(tokens, rhs_s, rhs_e, inner_fresh)
+          }
         }
         k = rhs_e
         continue
@@ -1282,15 +1405,18 @@ fn stage_b_scope_may_mutate(
         let cp = find_matching_delim(tokens, k + 1)
         let callee = tk.raw
         // First scan arguments for mutations
-        if stage_b_scope_may_mutate(tokens, k + 2, cp, inner_fresh, cb_params, local_fn_bodies, pkg_fns, visited_fns, recv_root) {
+        if stage_b_scope_may_mutate(tokens, k + 2, cp, inner_fresh, cb_params, inner_local_fns, pkg_fns, visited_fns, recv_root) {
           return true
         }
         // Check local fn / closure variable
-        match local_fn_bodies.get(callee) {
+        match inner_local_fns.get(callee) {
           Some((bs, be, lparams)) =>
           if !visited_fns.contains("local:" + callee) {
             visited_fns["local:" + callee] = true
-            if stage_b_scope_may_mutate(tokens, bs, be, inner_fresh, lparams, local_fn_bodies, pkg_fns, visited_fns, recv_root) {
+            let call_fresh = clone_bool_map(inner_fresh)
+            let hit = stage_b_scope_may_mutate(tokens, bs, be, call_fresh, lparams, inner_local_fns, pkg_fns, visited_fns, recv_root)
+            visited_fns.remove("local:" + callee)
+            if hit {
               return true
             }
           }
@@ -1325,7 +1451,9 @@ fn stage_b_scope_may_mutate(
               }
               let empty_locals : Map[String, (Int, Int, Map[String, Bool])] = Map()
               let empty_cb : Map[String, Bool] = Map()
-              if stage_b_scope_may_mutate(pf.tokens, pf.body_s, pf.body_e, pf_fresh, empty_cb, empty_locals, pkg_fns, visited_fns, recv_root) {
+              let hit = stage_b_scope_may_mutate(pf.tokens, pf.body_s, pf.body_e, pf_fresh, empty_cb, empty_locals, pkg_fns, visited_fns, recv_root)
+              visited_fns.remove("pkg:" + callee)
+              if hit {
                 return true
               }
             }
@@ -1355,20 +1483,39 @@ fn stage_b_scope_may_mutate(
         k = cp + 1
         continue
       }
-      // 4. Direct array mutation on non-disjoint variable `x` (or `x.field...`)
-      if !inner_fresh.contains(tk.raw) && !cb_params.contains(tk.raw) {
-        let mut p = k + 1
-        while p + 2 < e && tokens[p].kind == TokenKind::Dot && tokens[p + 1].kind == TokenKind::Ident &&
-        tokens[p + 2].kind != TokenKind::LParen {
+      // 4. Direct/nested array mutation: walk full access chain (`.field`, `.0`, `[idx]`) first;
+      //    any `path_depth > 0` fails closed even if root container is fresh (e.g. `wrap[0].push`, `t.0.push`).
+      let mut p = k + 1
+      let mut path_depth = 0
+      while p < e {
+        if p + 2 < e && tokens[p].kind == TokenKind::Dot &&
+        tokens[p + 1].kind == TokenKind::Ident && tokens[p + 2].kind != TokenKind::LParen {
           p = p + 2
+          path_depth = path_depth + 1
+        } else if p + 1 < e && tokens[p].kind == TokenKind::Dot &&
+        tokens[p + 1].kind == TokenKind::IntLit {
+          p = p + 2
+          path_depth = path_depth + 1
+        } else if tokens[p].kind == TokenKind::LBracket {
+          let cb = find_matching_delim(tokens, p)
+          if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+            break
+          }
+          p = cb + 1
+          path_depth = path_depth + 1
+        } else {
+          break
         }
-        // Mutating method call `<x>.pop(...)` / `<x>.push(...)` / `<x>.set(...)` / etc.
+      }
+      let is_disjoint_root = path_depth == 0 && (inner_fresh.contains(tk.raw) || cb_params.contains(tk.raw))
+      if !is_disjoint_root {
+        // Mutating method call `<x>...pop(...)` / `<x>...push(...)` / `<x>...set(...)` / etc.
         if p + 2 < e && tokens[p].kind == TokenKind::Dot &&
         tokens[p + 1].kind == TokenKind::Ident && tokens[p + 2].kind == TokenKind::LParen &&
         is_array_mutating_method(tokens[p + 1].raw) {
           return true
         }
-        // Index assignment `<x>[...] = ...` (excluding `==`, `!=`, `=>`)
+        // Index assignment `<x>...[...] = ...` (excluding `==`, `!=`, `=>`)
         if p < e && tokens[p].kind == TokenKind::LBracket {
           let cb = find_matching_delim(tokens, p)
           if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
@@ -1454,9 +1601,10 @@ fn stage_b_check_array_retain_mutation(
     scan = scan - 1
   }
 
-  // Pass 1: collect candidate `fresh_disjoint` locals + `local_fn_bodies` in `[fn_lb + 1, fn_rb)` (excluding `[arg_s, arg_e)`)
+  // Pass 1: collect candidate `fresh_disjoint` locals + `local_fn_bodies` + `local_let_vars` in `[fn_lb + 1, fn_rb)` (excluding `[arg_s, arg_e)`)
   let fresh_disjoint : Map[String, Bool] = Map()
   let local_fn_bodies : Map[String, (Int, Int, Map[String, Bool])] = Map()
+  let local_let_vars : Map[String, Bool] = Map()
   let mut si = fn_lb + 1
   while si < fn_rb {
     if si >= arg_s && si < arg_e {
@@ -1471,6 +1619,7 @@ fn stage_b_check_array_retain_mutation(
       }
       if ni + 1 < fn_rb && tokens[ni].kind == TokenKind::Ident {
         let lhs_name = tokens[ni].raw
+        local_let_vars[lhs_name] = true
         let mut eq_i = ni + 1
         if eq_i < fn_rb && tokens[eq_i].kind == TokenKind::Colon {
           let mut td = 0
@@ -1498,6 +1647,11 @@ fn stage_b_check_array_retain_mutation(
             if lb < rhs_e && tokens[lb].kind == TokenKind::LBrace {
               let rb = find_matching_delim(tokens, lb)
               local_fn_bodies[lhs_name] = (lb + 1, rb, lpm)
+            }
+          } else if rhs_e == rhs_s + 1 && tokens[rhs_s].kind == TokenKind::Ident {
+            match local_fn_bodies.get(tokens[rhs_s].raw) {
+              Some(fb) => local_fn_bodies[lhs_name] = fb
+              None => ()
             }
           }
         }
@@ -1543,10 +1697,12 @@ fn stage_b_check_array_retain_mutation(
           }
         }
       }
-    } else if st.kind == TokenKind::Ident && !(si > fn_lb && (tokens[si - 1].kind == TokenKind::Dot || tokens[si - 1].kind == TokenKind::ColonColon)) &&
+    } else if st.kind == TokenKind::Ident && !(si > fn_lb && (tokens[si - 1].kind == TokenKind::Dot || tokens[si - 1].kind == TokenKind::ColonColon ||
+      (tokens[si - 1].kind == TokenKind::Keyword && (tokens[si - 1].raw == "let" || tokens[si - 1].raw == "mut")))) &&
     si + 1 < fn_rb && tokens[si + 1].kind == TokenKind::Eq {
       let rhs_s = si + 2
       let rhs_e = find_expr_end(tokens, rhs_s, fn_rb)
+      local_fn_bodies.remove(st.raw)
       if !is_fresh_container_alloc(tokens, rhs_s, rhs_e) {
         fresh_disjoint.remove(st.raw)
         if !(tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn") {
@@ -1572,14 +1728,15 @@ fn stage_b_check_array_retain_mutation(
     while lb < arg_e && tokens[lb].kind != TokenKind::LBrace { lb = lb + 1 }
     if lb < arg_e && tokens[lb].kind == TokenKind::LBrace {
       let rb = find_matching_delim(tokens, lb)
-      may_mutate = stage_b_scope_may_mutate(tokens, lb + 1, rb, fresh_disjoint, cb_params, local_fn_bodies, pkg_fns, visited_fns, recv_root)
+      may_mutate = stage_b_scope_may_mutate(tokens, lb + 1, rb, clone_bool_map(fresh_disjoint), cb_params, local_fn_bodies, pkg_fns, visited_fns, recv_root)
     }
   } else if arg_e == arg_s + 1 && tokens[arg_s].kind == TokenKind::Ident {
     let cb_name = tokens[arg_s].raw
     match local_fn_bodies.get(cb_name) {
       Some((bs, be, lparams)) => {
         visited_fns["local:" + cb_name] = true
-        may_mutate = stage_b_scope_may_mutate(tokens, bs, be, fresh_disjoint, lparams, local_fn_bodies, pkg_fns, visited_fns, recv_root)
+        may_mutate = stage_b_scope_may_mutate(tokens, bs, be, clone_bool_map(fresh_disjoint), lparams, local_fn_bodies, pkg_fns, visited_fns, recv_root)
+        visited_fns.remove("local:" + cb_name)
       }
       None =>
       match pkg_fns.get(cb_name) {
@@ -1590,13 +1747,17 @@ fn stage_b_check_array_retain_mutation(
           let cb_p : Map[String, Bool] = Map()
           for pn in pf.params { cb_p[pn] = true }
           may_mutate = stage_b_scope_may_mutate(pf.tokens, pf.body_s, pf.body_e, empty_f, cb_p, empty_l, pkg_fns, visited_fns, recv_root)
+          visited_fns.remove("pkg:" + cb_name)
         }
-        None => ()
+        None =>
+        if local_let_vars.contains(cb_name) {
+          may_mutate = true
+        }
       }
     }
   } else {
     let empty_p : Map[String, Bool] = Map()
-    may_mutate = stage_b_scope_may_mutate(tokens, arg_s, arg_e, fresh_disjoint, empty_p, local_fn_bodies, pkg_fns, visited_fns, recv_root)
+    may_mutate = stage_b_scope_may_mutate(tokens, arg_s, arg_e, clone_bool_map(fresh_disjoint), empty_p, local_fn_bodies, pkg_fns, visited_fns, recv_root)
   }
 
   if may_mutate {

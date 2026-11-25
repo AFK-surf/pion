@@ -2535,6 +2535,13 @@ p01_cases = [
     ("fm_reassign_alias", 'pub fn f() -> Array[Int] {\n  let a = [1, 2, 3]\n  let mut c = [0]\n  c = a\n  a.filter_map(fn(x) { if x == 1 { c.push(4); let _ = c.pop(); c[2] = 9 }; Some(x) })\n}\n'),
     ("retain_helper_arg", 'fn tweak(xs : Array[Int]) -> Unit { xs.push(4); let _ = xs.pop(); xs[2] = 9 }\npub fn f(a : Array[Int], b : Array[Int]) -> Unit {\n  b.retain(fn(x) { if x == 1 { tweak(a) }; true })\n}\n'),
     ("fm_helper_arg", 'fn tweak(xs : Array[Int]) -> Unit { xs.push(4); let _ = xs.pop(); xs[2] = 9 }\npub fn f(a : Array[Int], b : Array[Int]) -> Array[Int] {\n  b.filter_map(fn(x) { if x == 1 { tweak(a) }; Some(x) })\n}\n'),
+    ("retain_inner_closure", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { let f = fn() { a.push(4); let _ = a.pop(); a[2] = 9 }; if x == 1 { f() }; true })\n}\n'),
+    ("retain_visited_reuse", 'fn tweak(xs : Array[Int]) -> Unit { xs.push(4); let _ = xs.pop() }\npub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let b = [10, 20]\n  a.retain(fn(x) { if x == 1 { tweak(b); tweak(a) }; true })\n}\n'),
+    ("retain_wrap_idx", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let wrap = [a]\n  a.retain(fn(x) { if x == 1 { wrap[0].push(4) }; true })\n}\n'),
+    ("retain_tuple_idx", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  let t = (a, 0)\n  a.retain(fn(x) { if x == 1 { t.0.push(4) }; true })\n}\n'),
+    ("retain_generic_helper", 'fn[T] tweak_g(xs : Array[T], v : T) -> Unit { xs.push(v) }\npub fn f(a : Array[Int], b : Array[Int]) -> Unit {\n  b.retain(fn(x) { if x == 1 { tweak_g(a, 4) }; true })\n}\n'),
+    ("retain_static_array_push", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { if x == 1 { Array::push(a, 4) }; true })\n}\n'),
+    ("retain_block_scope_leak", 'pub fn f() -> Unit {\n  let a = [1, 2, 3]\n  a.retain(fn(x) { if false { let a = [1]; a.push(2) }; if x == 1 { a.push(3) }; true })\n}\n'),
 ]
 for tag, code in p01_cases:
     p_src = os.path.join(ut_root, f"p01_{tag}_src")
