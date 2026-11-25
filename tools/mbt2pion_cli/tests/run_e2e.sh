@@ -2281,7 +2281,23 @@ p04_pub = subprocess.run(
 assert p04_pub.returncode == 0, f"Astra P0-4 publish failed:\n{p04_pub.stdout}\n{p04_pub.stderr}"
 p04_t = subprocess.run([pionc, "test", p04_app], capture_output=True, text=True)
 assert p04_t.returncode == 0 and "1 passed; 0 failed" in p04_t.stdout, f"Astra P0-4 pionc test failed:\n{p04_t.stdout}\n{p04_t.stderr}"
-print("[e2e] PASS: Wave M2-B regressions (relative --package-manifest, black-box private isolation + P0-1/P0-3/P0-4)")
+
+# Lowercase float suffix `1.5f` and `0x1.8p0f` MUST fail-closed at real `publish` entry with MBT2PION_UNSUPPORTED_SYNTAX
+for tag, body in [("dec_low_f", "pub fn f() -> Float { 1.5f }\n"), ("hex_low_f", "pub fn f() -> Float { 0x1.8p0f }\n")]:
+    lf_src = os.path.join(root, f"lf_{tag}_src")
+    lf_out = os.path.join(root, f"lf_{tag}_out")
+    os.makedirs(lf_src, exist_ok=True)
+    with open(os.path.join(lf_src, "a.mbt"), "w") as f:
+        f.write(body)
+    lf_r = subprocess.run(
+        [bin_path, "--src", lf_src, "--out", lf_out, "--mbt-compat", compat_dir,
+         "--target", "native", "--mode", "publish", "--pionc", pionc],
+        capture_output=True, text=True
+    )
+    assert lf_r.returncode != 0 and "MBT2PION_UNSUPPORTED_SYNTAX" in (lf_r.stdout + lf_r.stderr), (
+        f"Lowercase float suffix {tag} MUST fail-closed with MBT2PION_UNSUPPORTED_SYNTAX, got rc={lf_r.returncode}\n{lf_r.stdout}\n{lf_r.stderr}"
+    )
+print("[e2e] PASS: Wave M2-B regressions (relative --package-manifest, black-box private isolation + P0-1/P0-3/P0-4 + lowercase f fail-closed)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"

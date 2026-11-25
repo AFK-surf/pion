@@ -5294,8 +5294,23 @@ fn lower_one_token_or_form(
     }
   }
 
-  // 10b. Hex float literal (`0x1.0p1023`, `0x1.fp-1022`, `0x1p-54`, and Float32 `0x1.8p0F`, `0x1p-149F`)
-  //      -> exact IEEE-754 `Double::from_bits(<bits>L)` or `Float::from_bits(<bits>)` (zero double-rounding)
+  // 10a. Reject MoonBit-invalid lowercase `f` suffix (`1.5f`, `0x1.8p0f`) fail-closed before Pion accepts it
+  if t.kind == TokenKind::FloatLit && i + 1 < end &&
+  tokens[i + 1].leading_trivia.length() == 0 &&
+  tokens[i + 1].kind == TokenKind::Ident &&
+  tokens[i + 1].raw == "f" {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      t.line,
+      t.col,
+      "lowercase float suffix `f` is not valid in MoonBit",
+    ))
+    return (trivia + t.raw + "f", i + 2)
+  }
+
+  // 10b. Hex float literal (`0x1.0p1023`, `0x1.fp-1022`, `0x1p-54`, and Float32 `0x1.8p0F`, `0x1.0p-149F`)
+  //      MoonBit rounds hex Float32 via binary64 then narrows to binary32: `Float::from_double(Double::from_bits(<bits64>L))`
   if t.kind == TokenKind::FloatLit && (t.raw.starts_with("0x") || t.raw.starts_with("0X")) {
     if t.raw.ends_with("F") {
       if in_pattern {
@@ -5309,8 +5324,8 @@ fn lower_one_token_or_form(
         return (trivia + t.raw, i + 1)
       }
       let hex_body = t.raw.slice(0, t.raw.length() - 1)
-      match parse_hex_float32_to_bits(hex_body) {
-        Some(bits) => return (trivia + "Float::from_bits(" + bits.to_string() + ")", i + 1)
+      match parse_hex_float_to_bits(hex_body) {
+        Some(bits64) => return (trivia + "Float::from_double(Double::from_bits(" + bits64.to_string() + "L))", i + 1)
         None => ()
       }
     } else if !in_pattern {
@@ -5490,155 +5505,6 @@ pub fn parse_hex_float_to_bits(raw : String) -> Option[Int64] {
     mant = mant + 1UL
   }
   Some(mant.reinterpret_as_int64())
-}
-
-///| Parse a MoonBit hexadecimal Float32 literal (`0x1.8p0`, `0x1p-149`)
-///| directly into its exact IEEE-754 binary32 bit pattern (24-bit significand, bias 127,
-///| ties-to-even rounding, subnormals, overflow/underflow — zero double-rounding).
-pub fn parse_hex_float32_to_bits(raw : String) -> Option[Int] {
-  let n = raw.length()
-  if n < 4 || !(raw.starts_with("0x") || raw.starts_with("0X")) {
-    return None
-  }
-  let mut p_idx = -1
-  let mut k = 2
-  while k < n {
-    let c = raw.code_unit_at(k)
-    if c == 112 || c == 80 {
-      p_idx = k
-      break
-    }
-    k = k + 1
-  }
-  if p_idx < 0 || p_idx + 1 >= n {
-    return None
-  }
-  let mut ei = p_idx + 1
-  let mut exp_neg = false
-  if raw.code_unit_at(ei) == 45 {
-    exp_neg = true
-    ei = ei + 1
-  } else if raw.code_unit_at(ei) == 43 {
-    ei = ei + 1
-  }
-  let mut exp_abs = 0
-  let mut saw_exp_dig = false
-  while ei < n {
-    let c = raw.code_unit_at(ei)
-    if c == 95 { ei = ei + 1; continue }
-    if c < 48 || c > 57 { return None }
-    saw_exp_dig = true
-    if exp_abs < 1000000 {
-      exp_abs = exp_abs * 10 + (c - 48)
-    }
-    ei = ei + 1
-  }
-  if !saw_exp_dig {
-    return None
-  }
-  let mut exp = if exp_neg { -exp_abs } else { exp_abs }
-
-  // Collect significant bits into 26-bit buffer (bit 25 = MSB, bits 24..2 = 23 frac, bit 1 = guard, bit 0 = sticky)
-  let mut sig : UInt64 = 0UL
-  let mut bits_collected = 0
-  let mut sticky = false
-  let mut seen_dot = false
-  let mut seen_nz = false
-  let mut int_bits_after_msb = 0
-  let mut mi = 2
-  while mi < p_idx {
-    let c = raw.code_unit_at(mi)
-    if c == 95 { mi = mi + 1; continue }
-    if c == 46 {
-      if seen_dot { return None }
-      seen_dot = true
-      mi = mi + 1
-      continue
-    }
-    let dig = if c >= 48 && c <= 57 { c - 48 }
-    else if c >= 97 && c <= 102 { c - 97 + 10 }
-    else if c >= 65 && c <= 70 { c - 65 + 10 }
-    else { return None }
-    let mut b = 3
-    while b >= 0 {
-      let bit = (dig >> b) & 1
-      if !seen_nz {
-        if bit != 0 {
-          seen_nz = true
-          sig = 1UL
-          bits_collected = 1
-          if seen_dot {
-            exp = exp - 1
-          }
-        } else if seen_dot {
-          exp = exp - 1
-        }
-      } else {
-        if !seen_dot {
-          int_bits_after_msb = int_bits_after_msb + 1
-        }
-        if bits_collected < 25 {
-          sig = (sig << 1UL) | bit.to_int64().reinterpret_as_uint64()
-          bits_collected = bits_collected + 1
-        } else if bit != 0 {
-          sticky = true
-        }
-      }
-      b = b - 1
-    }
-    mi = mi + 1
-  }
-  if !seen_nz {
-    return Some(0)
-  }
-  while bits_collected < 25 {
-    sig = sig << 1UL
-    bits_collected = bits_collected + 1
-  }
-  sig = (sig << 1UL) | (if sticky { 1UL } else { 0UL })
-  let mut msb_exp = exp + int_bits_after_msb
-
-  if msb_exp > 127 {
-    return Some(0x7f800000)
-  }
-  if msb_exp < -150 {
-    return Some(0)
-  }
-  if msb_exp >= -126 {
-    let gbit = (sig >> 1UL) & 1UL
-    let st = sig & 1UL
-    let mut mant24 = sig >> 2UL
-    if gbit == 1UL && (st == 1UL || (mant24 & 1UL) == 1UL) {
-      mant24 = mant24 + 1UL
-      if (mant24 >> 24UL) != 0UL {
-        mant24 = mant24 >> 1UL
-        msb_exp = msb_exp + 1
-      }
-    }
-    if msb_exp > 127 {
-      return Some(0x7f800000)
-    }
-    let exp_bits = (msb_exp + 127).to_int64().reinterpret_as_uint64()
-    let frac_bits = mant24 & 0x007fffffUL
-    let packed = (exp_bits << 23UL) | frac_bits
-    return Some(packed.to_int64().to_int())
-  }
-  // Subnormal number: `-150 <= msb_exp < -126`
-  let shift = -126 - msb_exp
-  let mut sub_sig = sig
-  let mut s = 0
-  while s < shift {
-    let lost = sub_sig & 1UL
-    sub_sig = (sub_sig >> 1UL) | lost
-    s = s + 1
-  }
-  let gbit = (sub_sig >> 1UL) & 1UL
-  let st = sub_sig & 1UL
-  let mut mant = sub_sig >> 2UL
-  if gbit == 1UL && (st == 1UL || (mant & 1UL) == 1UL) {
-    mant = mant + 1UL
-  }
-  Some(mant.to_int64().to_int())
 }
 
 ///| Lower a cascade chain `recv..m1(a)..m2(b)` into a hygienic block that evaluates `recv` ONCE
