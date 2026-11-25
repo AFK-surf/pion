@@ -150,8 +150,12 @@ for n in 'ax bx cx dx si di bp sp'.split():
 for k in range(8, 16):
     for suf in ('', 'd'):
         R64[f'r{k}{suf}'] = f'r{k}'
-def r64(r):
-    return R64.get(r.lstrip('%'), r)
+def width(r):
+    # 64 or 32 for a general register name (with or without %), else None.
+    r = r.lstrip('%')
+    if r not in R64:
+        return None
+    return 64 if R64[r] == r else 32
 # The lea fusion is only sound where the add's flags are dead: some later
 # instruction must overwrite all arithmetic flags before anything that reads
 # them, branches, calls or returns. Unknown instructions stop the scan.
@@ -164,6 +168,8 @@ def flags_dead(ins, j):
         if not FLAGS_NEUTRAL.match(t):
             return False
     return False
+TARGET = re.compile(r'\b([0-9a-f]+) <\w+(?:\+0x[0-9a-f]+)?>')
+NOP = re.compile(r'^((cs |ds |data16 )*nop[wl]?\b|xchg %ax,%ax$)')
 def canon(path):
     return canon_text(open(path).read())
 def canon_text(text):
@@ -178,38 +184,60 @@ def canon_text(text):
         if m and cur:
             out[cur].append((int(m.group(1), 16), re.sub(r'\s+', ' ', m.group(2))))
     res = {}
-    for fn, ins in out.items():
-        ins = [(a, t) for a, t in ins if not re.match(r'^((cs |ds |data16 )*nop[wl]?\b|xchg %ax,%ax$)', t)]
+    for fn, raw in out.items():
+        # A branch to padding lands on the first instruction after it; any
+        # other target must be an instruction entry exactly.
+        land, pending = {}, []
+        for a, t in raw:
+            if NOP.match(t):
+                pending.append(a)
+                continue
+            for p in pending:
+                land[p] = a
+            pending = []
+            land[a] = a
+        ins = [(a, t) for a, t in raw if not NOP.match(t)]
+        targets = {land.get(int(m.group(1), 16), -1) for _, t in ins for m in TARGET.finditer(t)}
         seq, k = [], 0
         while k < len(ins):
             a, t = ins[k]
             m1 = re.match(r'^mov (%\w+),(%\w+)$', t)
             m2 = k + 1 < len(ins) and re.match(r'^add (\$0x[0-9a-f]+|%\w+),(%\w+)$', ins[k + 1][1])
-            if m1 and m2 and m1.group(2) == m2.group(2) and flags_dead(ins, k + 2):
+            if (m1 and m2 and m1.group(2) == m2.group(2)
+                    # `mov s, d; add v, d` == `lea v(s), d` only with s, d (and
+                    # a register v) of one width, v != d (`add d, d` doubles s),
+                    # nothing branching to the add, and its flags dead.
+                    and width(m1.group(1)) is not None and width(m1.group(1)) == width(m1.group(2))
+                    and (m2.group(1).startswith('$') or (width(m2.group(1)) == width(m1.group(2))
+                                                         and m2.group(1) != m1.group(2)))
+                    and ins[k + 1][0] not in targets
+                    and flags_dead(ins, k + 2)):
                 d, v = m1.group(2).lstrip('%'), m2.group(1)
+                w = width(d)
                 if v.startswith('$'):
-                    w = 64 if d.startswith('r') and not d.endswith('d') else 32
-                    seq.append((a, f'lea {int(v[1:], 16) % (1 << w)} {r64(m1.group(1))} {d}'))
+                    seq.append((a, f'lea {int(v[1:], 16) % (1 << w)} {R64[m1.group(1).lstrip("%")]} {d}'))
                 else:
-                    seq.append((a, f'lea 0 {"+".join(sorted([r64(m1.group(1)), r64(v)]))} {d}'))
+                    regs = sorted([R64[m1.group(1).lstrip('%')], R64[v.lstrip('%')]])
+                    seq.append((a, f'lea 0 {"+".join(regs)} {d}'))
                 k += 2
                 continue
-            m = re.match(r'^lea (-?0x[0-9a-f]+)?\((%\w+)(?:,(%\w+),1)?\),(%\w+)$', t)
-            if m:
+            # Only 64-bit address registers are canonicalized: a 32-bit
+            # address (`lea 1(%edi), %rdx`) truncates the sum and stays as is.
+            m = re.match(r'^lea[lq]? (-?0x[0-9a-f]+)?\((%\w+)(?:,(%\w+),1)?\),(%\w+)$', t)
+            if m and width(m.group(2)) == 64 and (m.group(3) is None or width(m.group(3)) == 64) \
+                    and width(m.group(4)) is not None:
                 d = m.group(4).lstrip('%')
-                w = 64 if d.startswith('r') and not d.endswith('d') else 32
-                disp = int(m.group(1), 16) % (1 << w) if m.group(1) else 0
-                regs = [r64(m.group(2))] + ([r64(m.group(3))] if m.group(3) else [])
+                disp = int(m.group(1), 16) % (1 << width(d)) if m.group(1) else 0
+                regs = [m.group(2).lstrip('%')] + ([m.group(3).lstrip('%')] if m.group(3) else [])
                 seq.append((a, f'lea {disp} {"+".join(sorted(regs))} {d}'))
             else:
                 seq.append((a, t))
             k += 1
         index = {a: n for n, (a, _) in enumerate(seq)}
         def target(m):
-            addr = int(m.group(1), 16)
-            nxt = min((x for x in index if x >= addr), default=None)
-            return f'@{index[nxt]}' if nxt is not None else '@end'
-        res[fn] = [re.sub(r'\b([0-9a-f]+) <\w+(?:\+0x[0-9a-f]+)?>', target, t) for _, t in seq]
+            addr = land.get(int(m.group(1), 16))
+            return f'@{index[addr]}' if addr in index else f'@?{m.group(1)}'
+        res[fn] = [TARGET.sub(target, t) for _, t in seq]
     return res
 def need(ok, msg):
     if not ok:
@@ -228,6 +256,22 @@ need(probe(ADD, ['mov %edx,(%rsi)', 'call 0 <probe>', 'cmp $0x9,%edx']) != probe
      "canon self-check: mov+add before a call matched a lea")
 need(probe(ADD, ['mov %edx,(%rsi)', 'cmp $0x9,%edx', 'setne %al']) == probe(LEA, ['mov %edx,(%rsi)', 'cmp $0x9,%edx', 'setne %al']),
      "canon self-check: a flags-dead mov+add did not match its lea")
+# Flags dead, but not the same computation or not the same control flow.
+need(probe(['mov $0xa,%edx', 'mov %edi,%edx', 'add %edx,%edx'], ['cmp $0x0,%edx', 'ret'])
+     != probe(['mov $0xa,%edx', 'lea (%rdi,%rdx,1),%edx'], ['cmp $0x0,%edx', 'ret']),
+     "canon self-check: `mov s, d; add d, d` matched `lea (s, d), d`")
+def jprobe(rows):
+    return canon_text('0000000000000000 <probe>:\n' + ''.join(f'  {a:x}:\t{r}\n' for a, r in rows))['probe']
+need(jprobe([(0, 'mov $0xa,%edx'), (5, 'test %esi,%esi'), (7, 'je b <probe+0xb>'), (9, 'mov %edi,%edx'),
+             (0xb, 'add $0x1,%edx'), (0xe, 'cmp $0x0,%edx'), (0x11, 'ret')])
+     != jprobe([(0, 'mov $0xa,%edx'), (5, 'test %esi,%esi'), (7, 'je c <probe+0xc>'), (9, 'lea 0x1(%rdi),%edx'),
+                (0xc, 'cmp $0x0,%edx'), (0xf, 'ret')]),
+     "canon self-check: a branch into the add matched a branch past the lea")
+need(probe(['lea 0x1(%edi),%rdx'], ['mov %rdx,%rax', 'ret']) != probe(['lea 0x1(%rdi),%rdx'], ['mov %rdx,%rax', 'ret']),
+     "canon self-check: a 32-bit address lea matched a 64-bit one")
+need(jprobe([(0, 'jmp 5 <probe+0x5>'), (2, 'nopw 0x0(%rax,%rax,1)'), (5, 'ret')])
+     == jprobe([(0, 'jmp 2 <probe+0x2>'), (2, 'cs nopw 0x0(%rax,%rax,1)'), (5, 'ret')]),
+     "canon self-check: a branch to padding did not land on the next instruction")
 def exec_sections(path):
     # Executable sections with the 4-byte fields their RELA relocations patch
     # zeroed (the linker ignores them; as and --obj may leave different
