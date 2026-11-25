@@ -287,6 +287,29 @@ int main(void) {
           run_d(m, i, j, off, DV[i], DV[j]);
           run_s(m, i, j, off, SV[i], SV[j]);
         }
+    /* Two distinct quiet NaNs: pin payload selection for p_sub{d,s}_dst
+     * (folded direct subs[sd] selects lhs's payload, matching C). */
+    for (unsigned off = 1; off <= 3; off += 2) {
+      unsigned char buf[64], *p = buf + off;
+      Obs q, c;
+      uint64_t ldb = 0x7ff8000000000111ULL, rdb = 0x7ff8000000000222ULL;
+      D ld = fd(ldb), rd = fd(rdb);
+      memset(buf, 0xcc, sizeof buf); memcpy(p, &rdb, 8);
+      feclearexcept(FE_ALL_EXCEPT); D dq = p_subd_dst(0.0, ld, p);
+      q.flags = fetestexcept(FE_ALL_EXCEPT); q.bits = bd(dq); q.mem = digest(buf, sizeof buf);
+      feclearexcept(FE_ALL_EXCEPT); D dc = rsub_d(ld, rd);
+      c.flags = fetestexcept(FE_ALL_EXCEPT); c.bits = bd(dc); c.mem = digest(buf, sizeof buf);
+      report("p_subd_dst_2qnan", m, 14, 15, off, q, c);
+
+      uint32_t lsb = 0x7fc00111u, rsb = 0x7fc00222u;
+      F ls = fs(lsb), rs = fs(rsb);
+      memset(buf, 0xcc, sizeof buf); memcpy(p, &rsb, 4);
+      feclearexcept(FE_ALL_EXCEPT); F sq = p_subs_dst(0.0f, ls, p);
+      q.flags = fetestexcept(FE_ALL_EXCEPT); q.bits = bs(sq); q.mem = digest(buf, sizeof buf);
+      feclearexcept(FE_ALL_EXCEPT); F sc = rsub_s(ls, rs);
+      c.flags = fetestexcept(FE_ALL_EXCEPT); c.bits = bs(sc); c.mem = digest(buf, sizeof buf);
+      report("p_subs_dst_2qnan", m, 14, 15, off, q, c);
+    }
   }
   fesetround(FE_TONEAREST);
   fprintf(stderr, "p119 IEEE differential: %lu calls, %lu mismatches\n", calls, bad);

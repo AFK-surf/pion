@@ -66,8 +66,10 @@ Semantics. The folded instruction is a direct `subs{s,d}` / `divs{s,d}`
 with the written operand order, so its result equals the IEEE-754 scalar
 operation and C bit for bit. Where the unfolded code put the load temporary
 in the result register (`req(to, arg[1])`), the emitters lowered the
-subtraction as `neg; add`, which can flip the sign of a NaN result; the folded
-form keeps it. IEEE-754 does not specify the sign of a NaN result.
+subtraction as `neg; add`, which can flip the sign of a NaN result and, when
+both operands are NaN, swap which NaN payload is selected; the folded form
+matches direct `subs{s,d}`. IEEE-754 does not specify NaN sign or payload
+selection.
 
 No imports and no proof holes; plain kernel checks (compatible with both
 standalone `lean -DwarningAsError=true` and `scripts/test-lean.sh`).

@@ -181,9 +181,27 @@ assert m, f'p_subd_hp: {dst} of subsd is last written by {lines[j]!r}'
 lines[j] = f'\tmovss {m.group(1)}, {m.group(2)}'
 hp = '\n'.join(lines)
 open(f'{tmp}/narrow.s', 'w').write(text[:s] + hp + text[e:])
+# p_subd_hp: a 64-bit stack reload followed by a narrowing 32-bit reg copy
+# (movss) drops the high 32 bits of the double and must be rejected.
+lines[j:j + 1] = [f'\tmovsd {m.group(1)}, %xmm15', f'\tmovss %xmm15, {m.group(2)}']
+open(f'{tmp}/narrowcopy.s', 'w').write(text[:s] + '\n'.join(lines) + text[e:])
+# p_subs_hp: a 32-bit stack reload followed by a 64-bit register copy (movsd)
+# preserves all 32 bits of the float and must be accepted.
+s, e = body('p_subs_hp')
+lines = text[s:e].split('\n')
+k = next(i for i, l in enumerate(lines) if re.match(r'\tsubss \(', l))
+dst = lines[k].rsplit(' ', 1)[1]
+j = next(i for i in range(k - 1, -1, -1) if lines[i].endswith(', ' + dst))
+m = re.fullmatch(r'\tmovss (-?\d*\(%r[sb]p\)), (%xmm\d+)', lines[j])
+assert m, f'p_subs_hp: {dst} of subss is last written by {lines[j]!r}'
+lines[j:j + 1] = [f'\tmovss {m.group(1)}, %xmm15', f'\tmovsd %xmm15, {m.group(2)}']
+open(f'{tmp}/widecopy.s', 'w').write(text[:s] + '\n'.join(lines) + text[e:])
 PYEOF
 reject "control without its arithmetic (text)" n_call_divd check asm lost "$TMP_DIR/lost.s"
 reject "32-bit movss reload before subsd (text)" p_subd_hp check asm narrow "$TMP_DIR/narrow.s"
+reject "32-bit movss reg copy before subsd (text)" p_subd_hp check asm narrowcopy "$TMP_DIR/narrowcopy.s"
+check asm "64-bit movsd reg copy after movss reload (text)" "$TMP_DIR/widecopy.s" > /dev/null
+echo "p119 self-test: accepted 64-bit movsd reg copy after movss reload (text)"
 # Two objects whose code is identical but whose global datum differs.
 for v in 42 99; do
   printf 'export data $datum = { b %s }\nexport function w $getd() {\n@start\n\t%%v =w loadub $datum\n\tret %%v\n}\n' "$v" > "$TMP_DIR/datum$v.ssa"

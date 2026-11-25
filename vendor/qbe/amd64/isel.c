@@ -1194,8 +1194,10 @@ countselected(Ref r, Fn *fn, uint *uses)
  *    as a direct subs[sd] / divs[sd] (and C) does, bit for bit. When the
  *    unfolded allocation put the load temporary in the result register
  *    (req(to, arg[1])), emit lowered the sub as `neg; add`, which can flip the
- *    sign of a NaN result; the folded memory form has no arg[1] register and
- *    keeps it. IEEE-754 does not specify the sign of a NaN result.
+ *    sign of a NaN result and, when both operands are NaN, swap which NaN
+ *    payload is selected; the folded memory form has no arg[1] register and
+ *    matches direct subs[sd]. IEEE-754 does not specify NaN sign or payload
+ *    selection.
  * Lean: tests/lean/proofs/QbeAmd64FpRhsLoadFold.lean. */
 static void
 foldoperandloads(Fn *fn)

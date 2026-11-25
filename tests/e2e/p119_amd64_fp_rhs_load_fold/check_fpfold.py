@@ -32,10 +32,10 @@ Expectations per function (the name encodes them):
                      dst: (%base) (lhs - [p] where the unfolded load temp
                      shares the result register).
   p_<op><k>_hp       additionally: the destination register is written last
-                     (through full-width register copies: movaps/movapd, or
-                     movs<k> of the same width) by a movs<k> of the operation's
-                     width from a stack slot, i.e. the left operand comes back
-                     from its spill slot.
+                     (through non-narrowing register copies: movaps/movapd/
+                     movups/movupd, movsd, or movss for s) by a movs<k> of the
+                     operation's width from a stack slot, i.e. the left operand
+                     comes back from its spill slot.
   n_*                no scalar FP arithmetic (add/sub/mul/div) has a non-%rip
                      memory operand, and the function keeps the arithmetic it
                      computes (NEG_KEEP: every mnemonic of one alternative).
@@ -179,8 +179,8 @@ def last_writer(ins, idx, reg, k):
         mn, ops = ins[j]
         if ops and ops[-1] == reg:
             if FPMOVE.match(mn) and len(ops) == 2 and not is_mem(ops[0]):
-                if mn in ('movss', 'movsd') and mn != 'movs' + k:
-                    return f'{mn} {",".join(ops)} is not a {k}-width copy'
+                if k == 'd' and mn == 'movss':
+                    return f'{mn} {",".join(ops)} narrows a {k}-width copy'
                 reg = ops[0]
                 seen += 1
                 j -= 1
