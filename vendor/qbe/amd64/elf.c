@@ -1438,7 +1438,12 @@ emitins(Ins i, EF *e)
 	case Oextuw: {
 		RmOp s = ref_to_rm(i.arg[0], 0, e);
 		assert(isreg(i.to));
-		emit_modrm(0, 0, 0, 0x8b, -1, hw_reg(i.to.val), s, 0, 0);
+		/* `movl %src, %dst`: a register source takes the store form
+		 * (89 /r), as the assembler encodes the text route. */
+		if (!s.is_mem)
+			emit_modrm(0, 0, 0, 0x89, -1, s.reg, rm_reg(hw_reg(i.to.val)), 0, 0);
+		else
+			emit_modrm(0, 0, 0, 0x8b, -1, hw_reg(i.to.val), s, 0, 0);
 		break;
 	}
 

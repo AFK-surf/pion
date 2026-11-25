@@ -26,6 +26,7 @@ import PionProofs.QbeBigUnitSpeedOpts
 import PionProofs.QbeAmd64FpOpts
 import PionProofs.QbeJtblEdgeSpill
 import PionProofs.QbeColdBootstrapSpeedOpts
+import PionProofs.QbeCountedLoopUnroll
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -696,3 +697,11 @@ import PionProofs.QbeColdBootstrapSpeedOpts
 #print axioms PionQbeColdBootstrapSpeedOpts.Projection.summarize
 #print axioms PionQbeColdBootstrapSpeedOpts.Projection.bindings
 #print axioms PionQbeColdBootstrapSpeedOpts.Projection.physical
+#print axioms PionQbeCountedLoopUnroll.certifiedExpansion
+#print axioms PionQbeCountedLoopUnroll.certify_length
+#print axioms PionQbeCountedLoopUnroll.certify_head
+#print axioms PionQbeCountedLoopUnroll.certify_last_exits
+#print axioms PionQbeCountedLoopUnroll.renamedWrite
+#print axioms PionQbeCountedLoopUnroll.renamedRead
+#print axioms PionQbeCountedLoopUnroll.budget_bound
+#print axioms PionQbeCountedLoopUnroll.budget_step

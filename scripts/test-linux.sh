@@ -643,6 +643,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/ru
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p113_amd64_fp_dep_and_cvt_width/run_e2e.sh" "$PIONC"
 # P114: QBE loop jump-table private spill-home store sinking (rega.c sinktablehomes; -d SR structure on 3 targets, --obj / text C differential, Pion Native + Wasm32 + ASan, bytecode_vm, ASan+UBSan QBE replay).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC"
+# P117: QBE counted-loop expansion (main.c expandloops; -d G expansions on 5 targets, --obj / text C-oracle differential, --obj == as, no back edge, fannkuchredux, ASan+UBSan QBE replay).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p117_qbe_counted_loop_unroll/run_e2e.sh" "$PIONC"
 # P115: cross-package struct literal type probe uses canonical package ids (method symbols, SSA + Native + Wasm32).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2e.sh" "$PIONC"
 # P116: Opt-Track P byte-identical compile-speed changes (QBE 1-byte lexer lookahead, filllive worklist, philive projected phi liveness, rega compact snapshots next to sinktablehomes, Mach-O keep/gen GPR masks, main-thread first unit; checking QBE oracles with ASan+UBSan on 4 targets, host C differential, --jobs 1/2/4/8 parity).

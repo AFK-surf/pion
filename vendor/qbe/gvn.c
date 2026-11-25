@@ -223,6 +223,11 @@ assoccon(Fn *fn, Blk *b, Ins *i1)
 		assert(fail == 0);
 		op = Osub;
 	}
+	/* foldint does not truncate: keep a word constant within 32 bits
+	 * (as opfold does), or two zero-extended negatives sum to an
+	 * immediate above 2^32 (`addl $0x10000000e`). */
+	if (c.type == CBits && !KWIDE(i1->cls))
+		c.bits.i &= 0xffffffff;
 
 	i1->op = op;
 	i1->arg[0] = i2->arg[0];
