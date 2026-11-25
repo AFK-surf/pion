@@ -22,6 +22,7 @@ import PionProofs.QbeArm64AddrOpts
 import PionProofs.QbeInlineRcSpeedOpts
 import PionProofs.QbeParallelRcSpeedOpts
 import PionProofs.QbeRuntimeOpts3
+import PionProofs.QbeBigUnitSpeedOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -625,3 +626,30 @@ import PionProofs.QbeRuntimeOpts3
 #print axioms PionQbeRuntimeOpts3.ExactSchedule.slide
 #print axioms PionQbeRuntimeOpts3.ExactSchedule.schedule
 #print axioms PionQbeRuntimeOpts3.ExactSchedule.fitsSignificand
+#print axioms PionQbeBigUnitSpeedOpts.Backend.zeroGroup
+#print axioms PionQbeBigUnitSpeedOpts.Backend.skipFour
+#print axioms PionQbeBigUnitSpeedOpts.Backend.leastOnSet
+#print axioms PionQbeBigUnitSpeedOpts.Backend.countParts
+#print axioms PionQbeBigUnitSpeedOpts.Backend.capacityGuard
+#print axioms PionQbeBigUnitSpeedOpts.Backend.decimalStep
+#print axioms PionQbeBigUnitSpeedOpts.Backend.decimalDigit
+#print axioms PionQbeBigUnitSpeedOpts.Backend.decimalTerminates
+#print axioms PionQbeBigUnitSpeedOpts.Backend.copyTerminated
+#print axioms PionQbeBigUnitSpeedOpts.Backend.fitUnion
+#print axioms PionQbeBigUnitSpeedOpts.Backend.deferredWrites
+#print axioms PionQbeBigUnitSpeedOpts.Backend.zeroLow
+#print axioms PionQbeBigUnitSpeedOpts.Backend.nibbleTable
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.minLoad
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.firstTie
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.largerFirst
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.stableKey
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.moveFirst
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.reordering
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.failedPrefix
+#print axioms PionQbeBigUnitSpeedOpts.Schedule.writeBeforeBackend
+#print axioms PionQbeBigUnitSpeedOpts.Signature.splitStable
+#print axioms PionQbeBigUnitSpeedOpts.Signature.unreadRight
+#print axioms PionQbeBigUnitSpeedOpts.Signature.chooseLeftOnTie
+#print axioms PionQbeBigUnitSpeedOpts.Signature.bufferedEnough
+#print axioms PionQbeBigUnitSpeedOpts.Signature.insertionAsMerge
+#print axioms PionQbeBigUnitSpeedOpts.Signature.orderedMerge

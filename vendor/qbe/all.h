@@ -508,6 +508,7 @@ void vfree(void *);
 void vgrow(void *, ulong);
 void addins(Ins **, uint *, Ins *);
 void addbins(Ins **, uint *, Blk *);
+char *pstrdup(Pool, const char *);
 char *strf(Pool, char *, ...);
 uint32_t intern(char *);
 char *str(uint32_t);

@@ -211,6 +211,36 @@ addbins(Ins **pvins, uint *pnins, Blk *b)
 }
 
 char *
+pstrdup(Pool pool, const char *s)
+{
+	size_t n = strlen(s) + 1;
+	char *p = (pool == PFn ? alloc : emalloc)(n);
+	return memcpy(p, s, n);
+}
+
+/* newtmp_n is a positive int at every defined increment. */
+static char *
+tmpname(const char *prefix, unsigned id)
+{
+	char digits[sizeof id * CHAR_BIT + 1], *end, *d, *p;
+	size_t n = strlen(prefix), len;
+
+	end = digits + sizeof digits;
+	d = end;
+	do {
+		*--d = (char)('0' + id % 10);
+		id /= 10;
+	} while (id);
+	len = (size_t)(end - d);
+	p = alloc(n + 2 + len);
+	memcpy(p, prefix, n);
+	p[n++] = '.';
+	memcpy(p + n, d, len);
+	p[n + len] = 0;
+	return p;
+}
+
+char *
 strf(Pool pool, char *s, ...)
 {
 	va_list ap;
@@ -487,7 +517,7 @@ newtmp(char *prfx, int k,  Fn *fn)
 	vgrow(&fn->tmp, fn->ntmp);
 	memset(&fn->tmp[t], 0, sizeof(Tmp));
 	if (prfx)
-		fn->tmp[t].name = strf(PFn, "%s.%d", prfx, ++newtmp_n);
+		fn->tmp[t].name = tmpname(prfx, (unsigned)++newtmp_n);
 	fn->tmp[t].cls = k;
 	fn->tmp[t].slot = -1;
 	fn->tmp[t].nuse = +1;
@@ -683,6 +713,9 @@ MAKESURE(NBit_is_64, NBit == 64);
 inline static uint
 popcnt(bits b)
 {
+#if defined(__GNUC__) || defined(__clang__)
+	return (uint)__builtin_popcountll(b);
+#else
 	b = (b & 0x5555555555555555) + ((b>>1) & 0x5555555555555555);
 	b = (b & 0x3333333333333333) + ((b>>2) & 0x3333333333333333);
 	b = (b & 0x0f0f0f0f0f0f0f0f) + ((b>>4) & 0x0f0f0f0f0f0f0f0f);
@@ -690,11 +723,16 @@ popcnt(bits b)
 	b += (b>>16);
 	b += (b>>32);
 	return b & 0xff;
+#endif
 }
 
 inline static int
 firstbit(bits b)
 {
+#if defined(__GNUC__) || defined(__clang__)
+	/* bsiter only calls firstbit on a nonzero word. */
+	return __builtin_ctzll(b);
+#else
 	int n;
 
 	n = 0;
@@ -716,6 +754,7 @@ firstbit(bits b)
 	}
 	n += (char[16]){4,0,1,0,2,0,1,0,3,0,1,0,2,0,1,0}[b & 0xf];
 	return n;
+#endif
 }
 
 uint
@@ -803,6 +842,9 @@ bsiter(BSet *bs, int *elt)
 	b &= ~(BIT(i%NBit) - 1);
 	while (!b) {
 		++t;
+		while (t < bs->nt && bs->nt - t >= 4 &&
+		       !(bs->t[t] | bs->t[t+1] | bs->t[t+2] | bs->t[t+3]))
+			t += 4;
 		if (t >= bs->nt)
 			return 0;
 		b = bs->t[t];
