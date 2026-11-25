@@ -641,6 +641,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIO
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/run_e2e.sh" "$PIONC"
 # P113: AMD64 movaps XMM copies + grouped-conversion xorps + cvtsi2{ss,sd}{l,q} text width (Native + Wasm32 + ASan, --obj == as, C driver).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p113_amd64_fp_dep_and_cvt_width/run_e2e.sh" "$PIONC"
+# P114: QBE loop jump-table private spill-home store sinking (rega.c sinktablehomes; -d SR structure on 3 targets, --obj / text C differential, Pion Native + Wasm32 + ASan, bytecode_vm, ASan+UBSan QBE replay).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p114_qbe_jtbl_edge_spill/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"

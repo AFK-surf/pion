@@ -24,6 +24,7 @@ import PionProofs.QbeParallelRcSpeedOpts
 import PionProofs.QbeRuntimeOpts3
 import PionProofs.QbeBigUnitSpeedOpts
 import PionProofs.QbeAmd64FpOpts
+import PionProofs.QbeJtblEdgeSpill
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -667,3 +668,9 @@ import PionProofs.QbeAmd64FpOpts
 #print axioms PionQbeAmd64FpOpts.GroupedCvt.groupedAppend
 #print axioms PionQbeAmd64FpOpts.SpillWidth.explicitWidth
 #print axioms PionQbeAmd64FpOpts.SpillWidth.widthMatters
+#print axioms PionQbeJtblEdgeSpill.StorePlacement.deadHome
+#print axioms PionQbeJtblEdgeSpill.StorePlacement.crossPrefix
+#print axioms PionQbeJtblEdgeSpill.StorePlacement.sink
+#print axioms PionQbeJtblEdgeSpill.StorePlacement.markedOnPath
+#print axioms PionQbeJtblEdgeSpill.StorePlacement.prependOnce
+#print axioms PionQbeJtblEdgeSpill.StorePlacement.budgetSafe

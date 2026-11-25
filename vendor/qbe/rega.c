@@ -477,6 +477,163 @@ prio2(int t1, int t2)
 	return (tmp[t1].cost > tmp[t2].cost) - (tmp[t1].cost < tmp[t2].cost);
 }
 
+/* A jump table can carry the current value in a register to every arm
+ * while a minority of those arms also need the private spill home. Move
+ * the shadow store onto these edges using the physical end-of-block map.
+ * No reload, phi, bounds check or register assignment changes. */
+static int
+slotref(Ref r, Ref slot, Fn *fn)
+{
+	return req(r, slot) || (rtype(r) == RMem &&
+		(req(fn->mem[r.val].base, slot) || req(fn->mem[r.val].index, slot)));
+}
+
+static int
+touchslot(Ins *i, Ref slot, Fn *fn)
+{
+	return slotref(i->arg[0], slot, fn) || slotref(i->arg[1], slot, fn)
+		|| slotref(i->to, slot, fn);
+}
+
+static int
+sinkhome(Fn *fn, Blk *table, Blk *src, Ins *store, Ref reg,
+	uchar *needed, Blk **work)
+{
+	Blk *b, *s, *p;
+	Ins *i, *ins;
+	uint n, a, top, edges, uses;
+	Ref home = store->arg[1];
+
+	memset(needed, 0, fn->nblk);
+	top = 0;
+	for (b=fn->start; b; b=b->link) {
+		for (n=0; n<b->nins; n++) {
+			i = &b->ins[n];
+			if (i == store || !touchslot(i, home, fn))
+				continue;
+			/* The home never escapes. Reject a second definition,
+			 * address formation, and references crossed by the move. */
+			if (i->op == Oaddr || i->op == Oswap || i->op == Oblit0
+			|| req(i->to, home)
+			|| (isstore(i->op) && req(i->arg[1], home))
+			|| (b == src && i > store) || (b == table && src != table))
+				return 0;
+			needed[b->id] = 1;
+		}
+		if (req(b->jmp.arg, home)) {
+			if (b == src || b == table)
+				return 0;
+			needed[b->id] = 1;
+		}
+		if (needed[b->id])
+			work[top++] = b;
+	}
+	/* Backward may-read closure stops at the unique original definition. */
+	while (top) {
+		b = work[--top];
+		for (a=0; a<b->npred; a++) {
+			p = b->pred[a];
+			if (p != src && !needed[p->id]) {
+				needed[p->id] = 1;
+				work[top++] = p;
+			}
+		}
+	}
+	if (src != table) {
+		s = src->s1 == table ? src->s2 : src->s1;
+		if (s && needed[s->id])
+			return 0;
+	}
+	uses = edges = 0;
+	for (a=0; a<=table->njtbl; a++) {
+		s = a ? table->jtbl[a-1] : table->s1;
+		edges++;
+		if (needed[s->id]) {
+			if (s->npred != 1 || s == src || s == table)
+				return 0;
+			uses++;
+		}
+	}
+	if (uses > edges / 2)
+		return 0;
+	/* Prepend only once for duplicate table entries. Every selected target
+	 * has this table as its sole predecessor. The register still contains
+	 * the value when the dispatch finishes, before any edge shuffle. */
+	for (a=0; a<=table->njtbl; a++) {
+		s = a ? table->jtbl[a-1] : table->s1;
+		if (!needed[s->id])
+			continue;
+		needed[s->id] = 0;
+		ins = alloc((s->nins+1) * sizeof *ins);
+		ins[0] = *store;
+		ins[0].arg[0] = reg;
+		icpy(ins+1, s->ins, s->nins);
+		s->ins = ins;
+		s->nins++;
+	}
+	*store = (Ins){.op = Onop};
+	return 1;
+}
+
+static uint
+sinktablehomes(Fn *fn, RMap *end)
+{
+	Blk *b, *src, **work = 0;
+	uchar *needed = 0, *examined = 0;
+	int j, t, r, s;
+	uint n, pass, moved = 0;
+	/* Bound whole-CFG walks by the target register count, independently
+	 * of the number of tables in a function. */
+	uint budget = (uint)(2 * T.ngpr);
+	Ins *i;
+	for (b=fn->start; b; b=b->link) {
+		if (b->jmp.type != Jjtbl || b->loop <= 1)
+			continue;
+		if (!needed) {
+			fillpreds(fn);
+			needed = alloc(fn->nblk);
+			examined = alloc((size_t)fn->ntmp);
+			work = alloc(fn->nblk * sizeof *work);
+		}
+		for (pass=0; pass<2; pass++) {
+			src = b;
+			if (pass) {
+				if (b->npred != 1)
+					continue;
+				src = b->pred[0];
+				if (src == b || src->jmp.type == Jjtbl)
+					continue;
+			}
+			for (j=0; j<end[b->id].n; j++) {
+				t = end[b->id].t[j];
+				r = end[b->id].r[j];
+				if (t < Tmp0 || examined[t] || tmp[t].ndef != 1 || KBASE(tmp[t].cls)
+				|| (T.jtblclob & BIT(r)))
+					continue;
+				s = tmp[t].slot;
+				if (s < fn->firstspill)
+					continue;
+				for (n=0; n<src->nins; n++) {
+					i = &src->ins[n];
+					if (i->op == (uint)(Ostorew + tmp[t].cls)
+					&& req(i->arg[1], SLOT(s)) && isreg(i->arg[0])) {
+						if (!budget)
+							return moved;
+						budget--;
+						/* Examine only the original spill definition.
+						 * Never move a store introduced on an edge. */
+						examined[t] = 1;
+						moved += (uint)sinkhome(fn, b, src, i,
+							rref(&end[b->id], t), needed, work);
+						break;
+					}
+				}
+			}
+		}
+	}
+	return moved;
+}
+
 /* register allocation
  * depends on rpo, phi, cost, (and obviously spill)
  */
@@ -489,7 +646,7 @@ rega(Fn *fn)
 	uchar *allocd;
 	Ins *i;
 	Phi *p;
-	uint u, n;
+	uint u, n, sunk;
 	Ref src, dst;
 
 	/* 1. setup */
@@ -751,7 +908,7 @@ rega(Fn *fn)
 			b1->loop = (b->loop+s->loop) / 2;
 			b1->link = blist;
 			blist = b1;
-			fn->nblk++;
+			b1->id = fn->nblk++;
 			b1->name = strf(PFn, "%s_%s", b->name, s->name);
 			stmov += &insb[NIns]-curi;
 			stblk += 1;
@@ -770,11 +927,13 @@ rega(Fn *fn)
 	for (b=fn->start; b; b=b->link)
 		b->phi = 0;
 	fn->reg = regu;
+	sunk = sinktablehomes(fn, end);
 
 	if (debug['R']) {
 		fprintf(stderr, "\n> Register allocation statistics:\n");
 		fprintf(stderr, "\tnew moves:  %d\n", stmov);
 		fprintf(stderr, "\tnew blocks: %d\n", stblk);
+		fprintf(stderr, "\tsunk homes: %u\n", sunk);
 		fprintf(stderr, "\n> After register allocation:\n");
 		printfn(fn, stderr);
 	}
