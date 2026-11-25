@@ -1621,6 +1621,20 @@ fn stage_b_check_array_retain_mutation_cached(
   mname : String,
   diags : Array[Diag],
 ) -> Unit {
+  stage_b_check_array_retain_mutation_with_root(file_tokens, pkg_fns, f_rel, content, line, col, mname, "", diags)
+}
+
+fn stage_b_check_array_retain_mutation_with_root(
+  file_tokens : Map[String, Array[Token]],
+  pkg_fns : Map[String, StageBPkgFn],
+  f_rel : String,
+  content : String,
+  line : Int,
+  col : Int,
+  mname : String,
+  recv_root_override : String,
+  diags : Array[Diag],
+) -> Unit {
   let tokens = match file_tokens.get(f_rel) {
     Some(ts) => ts
     None => {
@@ -1653,7 +1667,7 @@ fn stage_b_check_array_retain_mutation_cached(
   if arg_s >= arg_e {
     return
   }
-  let recv_root = extract_dot_chain_root_ident(tokens, dot_i - 1)
+  let recv_root = if recv_root_override.length() > 0 { recv_root_override } else { extract_dot_chain_root_ident(tokens, dot_i - 1) }
   // Find enclosing top-level function / test block `[fn_lb, fn_rb]`
   let mut fn_lb = 0
   let mut fn_rb = n
@@ -1722,7 +1736,7 @@ fn stage_b_check_array_retain_mutation_cached(
         if eq_i < fn_rb && tokens[eq_i].kind == TokenKind::Eq && eq_i + 1 < fn_rb {
           let rhs_s = eq_i + 1
           let rhs_e = find_expr_end(tokens, rhs_s, fn_rb)
-          if is_fresh_container_alloc(tokens, rhs_s, rhs_e) && lhs_name != recv_root {
+          if is_fresh_container_alloc(tokens, rhs_s, rhs_e) && lhs_name != recv_root && recv_root != "__MBT2PION_UNKNOWN_RECV__" {
             fresh_disjoint[lhs_name] = true
           }
           if tokens[rhs_s].kind == TokenKind::Keyword && tokens[rhs_s].raw == "fn" &&
@@ -3382,6 +3396,26 @@ pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[D
   out_sources
 }
 
+fn iter_arg_tokens_are_pure(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::LBrace || tk == TokenKind::Eq || tk == TokenKind::AssignOp ||
+    tk == TokenKind::PipeGt || tk == TokenKind::LBracket {
+      return false
+    }
+    if tk == TokenKind::LParen && k > start {
+      let pk = tokens[k - 1].kind
+      if pk == TokenKind::Ident || pk == TokenKind::UpperIdent ||
+      pk == TokenKind::RParen || pk == TokenKind::RBracket {
+        return false
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
 ///| Stage B fail-closed guard for `Array::iter()` (`mbt_compat::arr_iter`):
 ///| Pion `Array[T]` does not expose an independent snapshot backing buffer like MoonBit's `Array::iter()`,
 ///| so reject escaping/mutated `Array::iter()` (e.g. `shrink_to_fit` / `pop` / self-`push_iter` / mutating
@@ -3449,6 +3483,7 @@ fn stage_b_check_array_iter_mutation_cached(
   // 2. Check if immediately consumed by an iterator chain ending in a terminal consumer.
   let mut cur = iter_rp + 1
   let mut terminated = false
+  let mut impure_arg = false
   let chain_cb_sites : Array[(Int, Int, String)] = []
   while cur + 2 < n && tokens[cur].kind == TokenKind::Dot && tokens[cur + 2].kind == TokenKind::LParen {
     let cm = tokens[cur + 1].raw
@@ -3459,6 +3494,9 @@ fn stage_b_check_array_iter_mutation_cached(
       continue
     }
     if cm == "take" || cm == "drop" || cm == "zip" {
+      if !iter_arg_tokens_are_pure(tokens, cur + 3, crp) {
+        impure_arg = true
+      }
       cur = crp + 1
       continue
     }
@@ -3468,24 +3506,39 @@ fn stage_b_check_array_iter_mutation_cached(
       break
     }
     if cm == "collect" || cm == "to_array" || cm == "count" || cm == "join" {
+      if !iter_arg_tokens_are_pure(tokens, cur + 3, crp) {
+        impure_arg = true
+      }
       terminated = true
       break
     }
     break
   }
   if terminated {
+    if impure_arg {
+      diags.push(diag_error(
+        "MBT2PION_ARRAY_ITER_MUTATION",
+        f_rel,
+        line,
+        col,
+        "Array::iter() chain argument contains non-pure expression that may mutate receiver during iteration",
+      ))
+      return
+    }
     // Verify none of the callbacks in the immediate consumer chain mutate the receiver array.
-    if recv_root.length() > 0 {
+    if chain_cb_sites.length() > 0 {
+      let eff_root = if recv_root.length() > 0 { recv_root } else { "__MBT2PION_UNKNOWN_RECV__" }
       for cb in chain_cb_sites {
         let before_n = diags.length()
-        stage_b_check_array_retain_mutation_cached(file_tokens, pkg_fns, f_rel, content, cb.0, cb.1, cb.2, diags)
+        stage_b_check_array_retain_mutation_with_root(file_tokens, pkg_fns, f_rel, content, cb.0, cb.1, cb.2, eff_root, diags)
         if diags.length() > before_n {
+          let label = if recv_root.length() > 0 { "`" + recv_root + "`" } else { "receiver" }
           diags[before_n] = diag_error(
             "MBT2PION_ARRAY_ITER_MUTATION",
             f_rel,
             line,
             col,
-            "Array::iter() callback may mutate receiver `" + recv_root + "` during iteration",
+            "Array::iter() callback may mutate " + label + " during iteration",
           )
           return
         }
@@ -3525,13 +3578,13 @@ fn stage_b_check_array_iter_mutation_cached(
     if rstart >= 3 && tokens[rstart - 1].kind == TokenKind::LParen &&
     tokens[rstart - 2].raw == "push_iter" && tokens[rstart - 3].kind == TokenKind::Dot {
       let dst_root = extract_dot_chain_root_ident(tokens, rstart - 4)
-      if recv_root.length() > 0 && dst_root == recv_root {
+      if recv_root.length() == 0 || dst_root.length() == 0 || dst_root == recv_root {
         diags.push(diag_error(
           "MBT2PION_ARRAY_ITER_MUTATION",
           f_rel,
           line,
           col,
-          "self-appending `" + recv_root + ".push_iter(" + recv_root + ".iter())` mutates receiver during iteration",
+          "self-appending or aliased `push_iter(*.iter())` cannot guarantee backing buffer isolation",
         ))
       }
       return
@@ -3551,123 +3604,153 @@ fn stage_b_check_array_iter_mutation_cached(
       }
       if pi >= 1 && tokens[pi].kind == TokenKind::LParen && tokens[pi - 1].raw == "arr_push_iter" {
         let dst_root = extract_dot_chain_root_ident(tokens, rstart - 2)
-        if recv_root.length() > 0 && dst_root == recv_root {
+        if recv_root.length() == 0 || dst_root.length() == 0 || dst_root == recv_root {
           diags.push(diag_error(
             "MBT2PION_ARRAY_ITER_MUTATION",
             f_rel,
             line,
             col,
-            "self-appending `arr_push_iter(" + recv_root + ", " + recv_root + ".iter())` mutates receiver during iteration",
+            "self-appending or aliased `arr_push_iter(_, *.iter())` cannot guarantee backing buffer isolation",
           ))
         }
         return
       }
     }
   }
-  // 4. Escaping iterator (e.g. `let it = a.iter()`): fail closed if `recv_root` is unknown or
-  //    if the enclosing function mutates/reallocates/passes `recv_root` or returns the iterator.
-  if recv_root.length() == 0 {
+  // 4. Escaping `Array::iter()` (e.g. `let it = xs.iter()`):
+  //    Default fail-closed; ONLY allow when ALL 3 invariants hold in the enclosing function:
+  //    (a) bound to an immutable local `let it = xs.iter()` whose only uses are terminal non-escaping consumers;
+  //    (b) `xs` is a freshly allocated local array (`let xs = [...]` / `Array::new()` / `Array::make(...)`);
+  //    (c) every other occurrence of `xs` in the function is strictly append-only (`xs.push(...)`) or pure read
+  //        (`xs.length()` / `xs.is_empty()` / `xs.copy()` / non-mutating `xs[i]`), never aliased or passed out.
+  let mut safe_append_only = false
+  if recv_root.length() > 0 && dot_i >= 4 &&
+  tokens[dot_i - 1].kind == TokenKind::Ident && tokens[dot_i - 1].raw == recv_root &&
+  tokens[dot_i - 2].kind == TokenKind::Eq &&
+  tokens[dot_i - 3].kind == TokenKind::Ident &&
+  tokens[dot_i - 4].kind == TokenKind::Keyword && tokens[dot_i - 4].raw == "let" &&
+  (iter_rp + 1 >= n || tokens[iter_rp + 1].newline_before || tokens[iter_rp + 1].kind == TokenKind::Semi) {
+    let it_var = tokens[dot_i - 3].raw
+    let mut fn_lb = 0
+    let mut fn_rb = n
+    let mut scan = dot_i
+    let mut depth = 0
+    while scan >= 0 {
+      let sk = tokens[scan].kind
+      if sk == TokenKind::RBrace { depth = depth + 1 }
+      else if sk == TokenKind::LBrace {
+        if depth == 0 {
+          fn_lb = scan
+          let mut check_i = scan - 1
+          let mut cd = 0
+          let mut found_outer = false
+          while check_i >= 0 {
+            let ck = tokens[check_i].kind
+            if ck == TokenKind::RBrace { cd = cd + 1 }
+            else if ck == TokenKind::LBrace {
+              if cd == 0 { found_outer = true; break }
+              cd = cd - 1
+            }
+            check_i = check_i - 1
+          }
+          if !found_outer {
+            fn_rb = find_matching_delim(tokens, fn_lb)
+            break
+          }
+        } else {
+          depth = depth - 1
+        }
+      }
+      scan = scan - 1
+    }
+    let mut xs_is_fresh_local = false
+    let mut xs_decl_idx = -1
+    let mut xs_ok = true
+    let mut it_ok = true
+    let mut si = fn_lb + 1
+    while si < fn_rb {
+      let st = tokens[si]
+      // Check fresh local declaration: `let [mut] <xs> [: T] = [...] | Array::new(...) | Array::make(...)`
+      if st.kind == TokenKind::Keyword && st.raw == "let" {
+        let mut ni = si + 1
+        if ni < fn_rb && tokens[ni].kind == TokenKind::Keyword && tokens[ni].raw == "mut" { ni = ni + 1 }
+        if ni < fn_rb && tokens[ni].kind == TokenKind::Ident && tokens[ni].raw == recv_root {
+          let mut eq_i = ni + 1
+          if eq_i < fn_rb && tokens[eq_i].kind == TokenKind::Colon {
+            let mut td = 0
+            while eq_i < fn_rb && !(td == 0 && tokens[eq_i].kind == TokenKind::Eq) {
+              let tk = tokens[eq_i].kind
+              if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace { td = td + 1 }
+              else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace { td = td - 1 }
+              eq_i = eq_i + 1
+            }
+          }
+          if eq_i + 1 < fn_rb && tokens[eq_i].kind == TokenKind::Eq {
+            let rhs = tokens[eq_i + 1]
+            let fresh_rhs = rhs.kind == TokenKind::LBracket ||
+            (rhs.raw == "Array" && eq_i + 3 < fn_rb && tokens[eq_i + 2].kind == TokenKind::ColonColon &&
+              (tokens[eq_i + 3].raw == "new" || tokens[eq_i + 3].raw == "make" || tokens[eq_i + 3].raw == "from_iter"))
+            if fresh_rhs && xs_decl_idx < 0 && ni < dot_i {
+              xs_is_fresh_local = true
+              xs_decl_idx = ni
+            } else {
+              xs_ok = false
+            }
+          } else {
+            xs_ok = false
+          }
+        }
+      }
+      // Verify every occurrence of `recv_root` (not preceded by `.` or `::`)
+      if st.kind == TokenKind::Ident && st.raw == recv_root &&
+      !(si > fn_lb && (tokens[si - 1].kind == TokenKind::Dot || tokens[si - 1].kind == TokenKind::ColonColon)) {
+        if si != xs_decl_idx && si != dot_i - 1 {
+          let is_dot_call = si + 3 < fn_rb && tokens[si + 1].kind == TokenKind::Dot && tokens[si + 3].kind == TokenKind::LParen
+          let is_allowed_method = is_dot_call && (
+            tokens[si + 2].raw == "push" || tokens[si + 2].raw == "length" ||
+            tokens[si + 2].raw == "is_empty" || tokens[si + 2].raw == "copy"
+          )
+          let mut is_read_index = false
+          if si + 1 < fn_rb && tokens[si + 1].kind == TokenKind::LBracket {
+            let cbr = find_matching_delim(tokens, si + 1)
+            if cbr + 1 >= fn_rb || (tokens[cbr + 1].kind != TokenKind::Eq && tokens[cbr + 1].kind != TokenKind::AssignOp) {
+              is_read_index = true
+            }
+          }
+          if !is_allowed_method && !is_read_index {
+            xs_ok = false
+          }
+        }
+      }
+      // Verify every occurrence of `it_var` (not preceded by `.` or `::`) is only a pure terminal consumer call
+      if st.kind == TokenKind::Ident && st.raw == it_var &&
+      !(si > fn_lb && (tokens[si - 1].kind == TokenKind::Dot || tokens[si - 1].kind == TokenKind::ColonColon)) {
+        if si != dot_i - 3 {
+          let is_term = si + 3 < fn_rb && tokens[si + 1].kind == TokenKind::Dot && tokens[si + 3].kind == TokenKind::LParen &&
+          (tokens[si + 2].raw == "count" || tokens[si + 2].raw == "to_array" || tokens[si + 2].raw == "collect")
+          if !is_term {
+            it_ok = false
+          } else {
+            let trp = find_matching_delim(tokens, si + 3)
+            if !iter_arg_tokens_are_pure(tokens, si + 4, trp) {
+              it_ok = false
+            }
+          }
+        }
+      }
+      si = si + 1
+    }
+    if xs_is_fresh_local && xs_ok && it_ok {
+      safe_append_only = true
+    }
+  }
+  if !safe_append_only {
     diags.push(diag_error(
       "MBT2PION_ARRAY_ITER_MUTATION",
       f_rel,
       line,
       col,
-      "escaping `Array::iter()` on non-trivial receiver cannot guarantee backing buffer isolation",
+      "escaping `Array::iter()` cannot guarantee backing buffer isolation; consume immediately or copy first",
     ))
-    return
-  }
-  let mut fn_lb = 0
-  let mut fn_rb = n
-  let mut scan = dot_i
-  let mut depth = 0
-  while scan >= 0 {
-    let sk = tokens[scan].kind
-    if sk == TokenKind::RBrace { depth = depth + 1 }
-    else if sk == TokenKind::LBrace {
-      if depth == 0 {
-        fn_lb = scan
-        let mut check_i = scan - 1
-        let mut cd = 0
-        let mut found_outer = false
-        while check_i >= 0 {
-          let ck = tokens[check_i].kind
-          if ck == TokenKind::RBrace { cd = cd + 1 }
-          else if ck == TokenKind::LBrace {
-            if cd == 0 { found_outer = true; break }
-            cd = cd - 1
-          }
-          check_i = check_i - 1
-        }
-        if !found_outer {
-          fn_rb = find_matching_delim(tokens, fn_lb)
-          break
-        }
-      } else {
-        depth = depth - 1
-      }
-    }
-    scan = scan - 1
-  }
-  let mut si = fn_lb + 1
-  while si < fn_rb {
-    let st = tokens[si]
-    if st.kind == TokenKind::Ident && st.raw == recv_root {
-      // Check `recv.mutating_method(...)`
-      if si + 3 < fn_rb && tokens[si + 1].kind == TokenKind::Dot && tokens[si + 3].kind == TokenKind::LParen {
-        let mm = tokens[si + 2].raw
-        if mm == "pop" || mm == "push" || mm == "shrink_to_fit" || mm == "drain" ||
-        mm == "insert" || mm == "remove" || mm == "clear" || mm == "truncate" ||
-        mm == "retain" || mm == "push_iter" || mm == "append" || mm == "sort" ||
-        mm == "sort_by" || mm == "sort_by_key" || mm == "rev_in_place" || mm == "set" ||
-        mm == "unsafe_set" || mm == "resize" || mm == "swap" {
-          diags.push(diag_error(
-            "MBT2PION_ARRAY_ITER_MUTATION",
-            f_rel,
-            line,
-            col,
-            "escaping `Array::iter()` on `" + recv_root + "` with `" + mm + "` mutation cannot guarantee backing buffer isolation",
-          ))
-          return
-        }
-      }
-      // Check `recv[...] = ...`
-      if si + 1 < fn_rb && tokens[si + 1].kind == TokenKind::LBracket {
-        let cbr = find_matching_delim(tokens, si + 1)
-        if cbr + 1 < fn_rb && (tokens[cbr + 1].kind == TokenKind::Eq || tokens[cbr + 1].kind == TokenKind::AssignOp) {
-          diags.push(diag_error(
-            "MBT2PION_ARRAY_ITER_MUTATION",
-            f_rel,
-            line,
-            col,
-            "escaping `Array::iter()` on `" + recv_root + "` with index mutation cannot guarantee backing buffer isolation",
-          ))
-          return
-        }
-      }
-      // Check `foo(recv, ...)` / `mbt_compat::arr_*(recv, ...)` passing `recv_root` as an argument
-      if si > fn_lb + 1 && (tokens[si - 1].kind == TokenKind::LParen || tokens[si - 1].kind == TokenKind::Comma) &&
-      !(si + 1 < fn_rb && tokens[si + 1].kind == TokenKind::Dot && tokens[si + 2].raw == "iter") {
-        let mut is_pure_read_helper = false
-        if tokens[si - 1].kind == TokenKind::LParen && si >= 3 {
-          let fnm = tokens[si - 2].raw
-          if fnm == "arr_get" || fnm == "arr_last" || fnm == "arr_is_empty" ||
-          fnm == "arr_contains" || fnm == "arr_search" || fnm == "arr_copy" ||
-          fnm == "arr_rev" || fnm == "arr_to_array" || fnm == "arr_iter" {
-            is_pure_read_helper = true
-          }
-        }
-        if !is_pure_read_helper {
-          diags.push(diag_error(
-            "MBT2PION_ARRAY_ITER_MUTATION",
-            f_rel,
-            line,
-            col,
-            "escaping `Array::iter()` on `" + recv_root + "` passed to function call cannot guarantee backing buffer isolation",
-          ))
-          return
-        }
-      }
-    }
-    si = si + 1
   }
 }
