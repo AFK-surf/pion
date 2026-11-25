@@ -103,7 +103,31 @@ if [ "${1:-}" = "--group" ]; then
         echo "p_clbg_p2_divrem_licm_strbuf -> wasm32=$P2_WASM_OUT"
         [ "$P2_WASM_OUT" = "p_clbg_p2_divrem_licm_strbuf ok" ] || { echo "FAIL: p_clbg_p2 wasm32 output ($P2_WASM_OUT)" >&2; exit 1; }
       fi
-      echo "[SUMMARY] standalone_e2e (p22a, p25a, p27a, p17a, dyn_trait, wave_j2, p_clbg_p2): OK"
+      # CLBG P1: 2-variant null-niche enum 4-mode E2E (Native dev/release + Wasm32 dev/release)
+      P1_DEV_OUT="$("$PIONC" run "$ROOT_DIR/tests/e2e/p_clbg_p1_null_niche_enum.pion")"
+      "$PIONC" build --release -o "$G_TMP/p1_niche_rel" "$ROOT_DIR/tests/e2e/p_clbg_p1_null_niche_enum.pion"
+      P1_REL_OUT="$("$G_TMP/p1_niche_rel")"
+      echo "p_clbg_p1_null_niche_enum -> dev=$P1_DEV_OUT release=$P1_REL_OUT"
+      [ "$P1_DEV_OUT" = "p1_ok s1=10 s2=64 s3=8 s4=60 s5=7 s6=28 s7=77 s8=39 s9=4102 s10=5 s11=441 s12=13" ] || {
+        echo "FAIL: p_clbg_p1_null_niche_enum unexpected dev output ($P1_DEV_OUT)" >&2
+        exit 1
+      }
+      [ "$P1_DEV_OUT" = "$P1_REL_OUT" ] || {
+        echo "FAIL: p_clbg_p1_null_niche_enum dev/release mismatch" >&2
+        exit 1
+      }
+      if command -v node >/dev/null 2>&1; then
+        "$PIONC" build --target wasm32 -o "$G_TMP/p1_niche_dev.wasm" "$ROOT_DIR/tests/e2e/p_clbg_p1_null_niche_enum.pion"
+        P1_WASM_DEV="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$G_TMP/p1_niche_dev.wasm")"
+        "$PIONC" build --release --target wasm32 -o "$G_TMP/p1_niche_rel.wasm" "$ROOT_DIR/tests/e2e/p_clbg_p1_null_niche_enum.pion"
+        P1_WASM_REL="$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$G_TMP/p1_niche_rel.wasm")"
+        echo "p_clbg_p1_null_niche_enum wasm32 -> dev=$P1_WASM_DEV release=$P1_WASM_REL"
+        [ "$P1_DEV_OUT" = "$P1_WASM_DEV" ] && [ "$P1_DEV_OUT" = "$P1_WASM_REL" ] || {
+          echo "FAIL: p_clbg_p1_null_niche_enum native/wasm32 mismatch" >&2
+          exit 1
+        }
+      fi
+      echo "[SUMMARY] standalone_e2e (p22a, p25a, p27a, p17a, dyn_trait, wave_j2, p_clbg_p2, p1_niche): OK"
       ;;
     tls_client)
       TLS_JSON="$(PATH="$ORIG_PATH" "$PIONC" test --json "$ROOT_DIR/std/tls")"
@@ -681,8 +705,6 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p121_frontend_cold_speed_opts/run_e2e.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p124_counted_array_length/run_e2e.sh" "$PIONC"
 # P126: Opt-Track X1 ecosystem codegen (cross-file immediately consumed Result/Option through scalar slots incl. ByteReader receiver writes, early Err, caller shadowing and argument `?`; immediately destructured 2-5 field primitive tuples in private stack slots, escaping / object-field tuples keep the heap box; fixed FixedArray / ImmArray literal table aliases check bounds against the literal length, shadowing / `let mut` / Array keep the header; native dev + --release SSA guards and exact output, Wasm32 dev + --release output).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p126_ecosystem_unbox_fixed_len/run_e2e.sh" "$PIONC"
-# P127: strict 2 x f64 SLP in QBE (vendor/qbe/slp.h; amd64_sysv SSE2 / arm64_apple NEON packets behind an MXCSR / FPCR trap-mask entry test with the scalar graph retained; 16 x 16 IEEE-754 boundary rows in --release and dev, vector arm == scalar arm bit for bit incl. NaN payloads and aliasing, == strict C reference, packet kept in a 16-byte slot across a foreign call that dirties every vector register, direct object == assembled text, packed-code structure on Linux x86-64 / macOS arm64).
-PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p127_qbe_double_simd_slp/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"

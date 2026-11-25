@@ -448,81 +448,7 @@ emitins(Ins i, E *e)
 	Con *con;
 	char *sym;
 
-	if (i.op==Oload && i.cls==Kv2d)
-		i.op=Ovload;
 	switch (i.op) {
-	case Ovload:
-		emitf("movupd %D0, %D=", &i, e);
-		break;
-	case Ovstore:
-		emitf("movupd %D0, %D1", &i, e);
-		break;
-	case Ovhigh:
-		emitf("pshufd $238, %D0, %D=", &i, e);
-		break;
-	case Oxcmp:
-		if (e->fn->packed && !KBASE(i.cls) && rtype(i.arg[0]) == RCon &&
-		    isreg(i.arg[1])) {
-			Con *c = &e->fn->con[i.arg[0].val];
-			if (c->type == CBits &&
-			    (KWIDE(i.cls) ? c->bits.i == 0 : (uint32_t)c->bits.i == 0)) {
-				emitf("test%k %1, %1", &i, e);
-				break;
-			}
-		}
-		goto Table;
-	case Otrapmask:
-		emitf("stmxcsr %D0", &i, e);
-		emitf("andl $8064, %D0", &i, e);
-		emitf("cmpl $8064, %D0", &i, e);
-		break;
-	case Ovsum: {
-		Ins high = {Ovhigh, Kd, TMP(XMM15), {i.arg[0], R}};
-		emitins(high, e);
-		emitcopy(i.to, i.arg[0], Kd, e);
-		i.arg[1] = TMP(XMM15);
-		emitf("addsd %D1, %D=", &i, e);
-		break;
-	}
-	case Ovlo:
-		emitcopy(i.to, i.arg[0], Kd, e);
-		break;
-	case Ovsplat:
-		emitf("pshufd $68, %D0, %D=", &i, e);
-		break;
-	case Ovzip:
-		if (req(i.to, i.arg[1])) {
-			emitcopy(TMP(XMM15), i.arg[1], Kd, e);
-			i.arg[1] = TMP(XMM15);
-		}
-		emitcopy(i.to, i.arg[0], Kd, e);
-		emitf("unpcklpd %D1, %D=", &i, e);
-		break;
-	case Oordadd:
-	case Oordsub:
-	case Oordmul:
-	case Ovadd:
-	case Ovsub:
-	case Ovmul:
-		if (req(i.to, i.arg[1]) && !req(i.to, i.arg[0])) {
-			emitcopy(TMP(XMM15), i.arg[1], i.cls == Ks ? Ks : Kd, e);
-			i.arg[1] = TMP(XMM15);
-		}
-		emitcopy(i.to, i.arg[0], i.cls == Ks ? Ks : Kd, e);
-		if (i.cls == Ks)
-			emitf(i.op == Oordadd	? "addss %S1, %S="
-			      : i.op == Oordsub ? "subss %S1, %S="
-						: "mulss %S1, %S=",
-			      &i, e);
-		else
-			emitf(i.op == Oordadd	? "addsd %D1, %D="
-			      : i.op == Oordsub ? "subsd %D1, %D="
-			      : i.op == Oordmul ? "mulsd %D1, %D="
-			      : i.op == Ovadd	? "addpd %D1, %D="
-			      : i.op == Ovsub	? "subpd %D1, %D="
-						: "mulpd %D1, %D=",
-			      &i, e);
-		break;
 	default:
 		if (isxsel(i.op))
 			goto case_Oxsel;
@@ -605,27 +531,6 @@ emitins(Ins i, E *e)
 		}
 		goto Table;
 	case Ocopy:
-		if (i.cls == Kv2d) {
-			Ins k = i;
-			Ref dst = k.to, src = k.arg[0];
-			if (req(dst, src))
-				break;
-			if (rtype(src) == RSlot) {
-				k = (Ins){Ovload,
-					  Kv2d,
-					  rtype(dst) == RSlot ? TMP(XMM15) : dst,
-					  {src, R}};
-				emitins(k, e);
-				src = k.to;
-			}
-			if (rtype(dst) == RSlot) {
-				k = (Ins){Ovstore, Kv2d, R, {src, dst}};
-				emitins(k, e);
-			} else if (!req(dst, src)) {
-				emitcopy(dst, src, Kd, e);
-			}
-			break;
-		}
 		/* copies are used for many things; see my note
 		 * to understand how to load big constants:
 		 * https://c9x.me/notes/2015-09-19.html */
@@ -759,12 +664,6 @@ emitins(Ins i, E *e)
 			emitcopy(i.to, TMP(RSP), Kl, e);
 		break;
 	case Oswap:
-		if (i.cls == Kv2d) {
-			emitcopy(TMP(XMM15), i.arg[0], Kd, e);
-			emitcopy(i.arg[0], i.arg[1], Kd, e);
-			emitcopy(i.arg[1], TMP(XMM15), Kd, e);
-			break;
-		}
 		if (KBASE(i.cls) == 0)
 			goto Table;
 		/* for floats, there is no swap instruction
