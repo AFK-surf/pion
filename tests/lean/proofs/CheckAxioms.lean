@@ -19,6 +19,7 @@ import PionProofs.QbeConcatScratch
 import PionProofs.QbeCompileSpeedOpts2
 import PionProofs.QbeFrontendSpeedOpts
 import PionProofs.QbeArm64AddrOpts
+import PionProofs.QbeInlineRcSpeedOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -583,3 +584,16 @@ import PionProofs.QbeArm64AddrOpts
 #print axioms PionQbeArm64AddrOpts.branch_same_edge
 #print axioms PionQbeArm64AddrOpts.branch_targets
 #print axioms PionQbeArm64AddrOpts.logical_move
+#print axioms PionQbeInlineRcSpeedOpts.Select.hits
+#print axioms PionQbeInlineRcSpeedOpts.Select.safeStep
+#print axioms PionQbeInlineRcSpeedOpts.Select.phi_required
+#print axioms PionQbeInlineRcSpeedOpts.Census.accepted
+#print axioms PionQbeInlineRcSpeedOpts.Census.lookup_one
+#print axioms PionQbeInlineRcSpeedOpts.Census.load_operand
+#print axioms PionQbeInlineRcSpeedOpts.Census.private_bucket
+#print axioms PionQbeInlineRcSpeedOpts.Census.ninth_digit_fits
+#print axioms PionQbeInlineRcSpeedOpts.Census.load_edge
+#print axioms PionQbeInlineRcSpeedOpts.Demand.need_iff
+#print axioms PionQbeInlineRcSpeedOpts.Demand.guarded_read
+#print axioms PionQbeInlineRcSpeedOpts.Demand.leaf_default
+#print axioms PionQbeInlineRcSpeedOpts.Demand.emitted
