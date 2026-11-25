@@ -4041,13 +4041,39 @@ fn try_lower_or_is_expr(
     return None
   }
   if has_struct_pat {
-    // Lower `<lhs> is Ctor({ f1: p1, .. })` and `<lhs> is (None | Some({ f1: p1, .. }))`
+    // Lower pure-predicate `<lhs> is Ctor({ f1: p1, .. })` and `<lhs> is (None | Some({ f1: p1, .. }))`
     // via recursive struct-pattern peeling into `(match <lhs> { ..., _ => false })`.
+    // Fail closed if the pattern introduces any variable binder (which a `(match ...)` wrapper would swallow).
     let mut ps = is_idx + 1
     let mut pe = pat_end
     while ps + 1 < pe && tokens[ps].kind == TokenKind::LParen && find_matching_delim(tokens, ps) == pe - 1 {
       ps = ps + 1
       pe = pe - 1
+    }
+    let mut has_var_binder = false
+    let mut vk = ps
+    while vk < pe {
+      if tokens[vk].kind == TokenKind::Ident && tokens[vk].raw != "_" &&
+      !(vk > ps && (tokens[vk - 1].kind == TokenKind::Dot || tokens[vk - 1].kind == TokenKind::ColonColon)) &&
+      !(vk + 1 < pe && tokens[vk + 1].kind == TokenKind::Colon) {
+        has_var_binder = true
+        break
+      }
+      vk = vk + 1
+    }
+    if has_var_binder {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[vk].line,
+        tokens[vk].col,
+        "struct pattern with variable bindings in `is` expression is not supported",
+      ))
+      return None
+    }
+    let lhs_ty_sp = infer_simple_expr_type(ctx, tokens, i, is_idx)
+    if lhs_ty_sp.length() > 0 {
+      push_expected_type(ctx, lhs_ty_sp)
     }
     let arms : Array[String] = []
     let mut bi = ps
@@ -4078,6 +4104,9 @@ fn try_lower_or_is_expr(
         }
       }
       bi = be + 1
+    }
+    if lhs_ty_sp.length() > 0 {
+      pop_expected_type(ctx)
     }
     if ok_all && arms.length() > 0 {
       return Some((tokens[i].leading_trivia + "(match " + lhs_str + " { " + join_comma(arms) + ", _ => false })", pat_end))
@@ -5083,11 +5112,9 @@ fn lower_one_token_or_form(
           }
         }
         let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
-        restore_scope_vars(ctx, saved_for_sc)
-        restore_ident_renames(ctx, saved_for_rn)
         // Lower tuple-destructuring `for (a, b) in xs { ... }` and `for i, (a, b) in xs { ... }`
-        // into `for __mbt_for_N in xs { let (a, b) = __mbt_for_N; ... }` (flattening nested tuples
-        // since Pion `let` destructuring only accepts flat identifier lists).
+        // BEFORE restoring `ctx.ident_renames` / `ctx.scope_vars` so bindings match the renamed body!
+        let mut tuple_out : Option[String] = None
         if tokens[i + 1].kind == TokenKind::LParen && find_matching_delim(tokens, i + 1) == in_idx - 1 {
           if is_irrefutable_tuple_pattern(tokens, i + 1, in_idx) {
             let tmp_v = fresh_temp(ctx, "for")
@@ -5097,14 +5124,14 @@ fn lower_one_token_or_form(
             } else {
               body_s
             }
-            return (trivia + "for " + tmp_v + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + patched_body, close_b + 1)
+            tuple_out = Some(trivia + "for " + tmp_v + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + patched_body)
           } else {
             ctx.diags.push(diag_error(
               "MBT2PION_UNSUPPORTED_SYNTAX",
               file,
               tokens[i + 1].line,
               tokens[i + 1].col,
-              "refutable pattern in `for ... in` loop header is not supported",
+              "invalid or refutable tuple pattern in `for ... in` loop header",
             ))
           }
         } else if i + 3 < in_idx && (tokens[i + 1].kind == TokenKind::Ident || tokens[i + 1].kind == TokenKind::Underscore) &&
@@ -5119,18 +5146,23 @@ fn lower_one_token_or_form(
             } else {
               body_s
             }
-            return (trivia + "for" + idx_s + ", " + tmp_v + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + patched_body, close_b + 1)
+            tuple_out = Some(trivia + "for" + idx_s + ", " + tmp_v + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + patched_body)
           } else {
             ctx.diags.push(diag_error(
               "MBT2PION_UNSUPPORTED_SYNTAX",
               file,
               tokens[i + 3].line,
               tokens[i + 3].col,
-              "refutable pattern in `for ... in` loop header is not supported",
+              "invalid or refutable tuple pattern in `for ... in` loop header",
             ))
           }
         }
-        return (trivia + "for" + vars_s + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + body_s, close_b + 1)
+        restore_scope_vars(ctx, saved_for_sc)
+        restore_ident_renames(ctx, saved_for_rn)
+        match tuple_out {
+          Some(s) => return (s, close_b + 1)
+          None => return (trivia + "for" + vars_s + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + body_s, close_b + 1)
+        }
       } else if semi1 > i + 1 {
         // C-style `for v1 = init1, v2 = init2; cond; step { body }`
         let loop_vars : Array[String] = []
@@ -9913,6 +9945,14 @@ fn lower_match_arms_with_ty(
           sb.write_string(lead_triv + outer_pat.trim() + g_suffix + tokens[fa].leading_trivia + "=> " + full_b + trail_sep)
           handled_special = true
         }
+      } else {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          tokens[i].line,
+          tokens[i].col,
+          "struct pattern inside or-pattern `|` in `match` arm is not supported",
+        ))
       }
     }
 
@@ -14213,8 +14253,9 @@ fn find_loop_stmt_end(tokens : Array[Token], start : Int, end : Int) -> Int {
   find_expr_end(tokens, start, end)
 }
 
-///| Check that `[start, end)` is an irrefutable tuple pattern `(p1, p2, ...)` whose leaves
-///| are only identifiers, `_`, or nested tuples (fail-closed on constructors/literals/structs).
+///| Check that `[start, end)` is a syntactically valid irrefutable tuple pattern `(p1, p2, ...)`
+///| with >= 2 comma-separated elements whose leaves are only identifiers, `_`, or nested >= 2-tuples
+///| (fail-closed on 0/1-tuples, missing commas, constructors, literals, or structs).
 fn is_irrefutable_tuple_pattern(tokens : Array[Token], start : Int, end : Int) -> Bool {
   if start >= end || tokens[start].kind != TokenKind::LParen {
     return false
@@ -14223,19 +14264,35 @@ fn is_irrefutable_tuple_pattern(tokens : Array[Token], start : Int, end : Int) -
     return false
   }
   let mut k = start + 1
-  let mut saw_elem = false
+  let mut elem_count = 0
+  let mut expect_elem = true
   while k < end - 1 {
     let tk = tokens[k].kind
-    if tk == TokenKind::Ident || tk == TokenKind::Underscore {
-      saw_elem = true
-    } else if tk == TokenKind::LParen || tk == TokenKind::RParen || tk == TokenKind::Comma {
-      ()
+    if expect_elem {
+      if tk == TokenKind::Ident || tk == TokenKind::Underscore {
+        elem_count = elem_count + 1
+        expect_elem = false
+        k = k + 1
+      } else if tk == TokenKind::LParen {
+        let cp = find_matching_delim(tokens, k)
+        if cp >= end - 1 || !is_irrefutable_tuple_pattern(tokens, k, cp + 1) {
+          return false
+        }
+        elem_count = elem_count + 1
+        expect_elem = false
+        k = cp + 1
+      } else {
+        return false
+      }
     } else {
-      return false
+      if tk != TokenKind::Comma {
+        return false
+      }
+      expect_elem = true
+      k = k + 1
     }
-    k = k + 1
   }
-  saw_elem
+  elem_count >= 2
 }
 
 ///| Flatten a potentially nested irrefutable tuple pattern `(p1, (p2, p3))` against `rhs_var`
@@ -14298,6 +14355,28 @@ fn peel_struct_patterns_in_pat(
   end : Int,
   file : String,
 ) -> (String, Array[(String, Int, Int, String)]) {
+  // Reject any depth-0 or-pattern `|` at this level if any branch contains `{ ... }`:
+  // peeling `{ ... }` into a fresh binding on one side of `|` produces invalid asymmetric or-patterns.
+  let mut pk = start
+  let mut pd = 0
+  let mut has_pipe = false
+  while pk < end {
+    let pkk = tokens[pk].kind
+    if pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace { pd = pd + 1 }
+    else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+    else if pd == 0 && pkk == TokenKind::Pipe { has_pipe = true; break }
+    pk = pk + 1
+  }
+  if has_pipe && pattern_contains_struct_pat(tokens, start, end) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[pk].line,
+      tokens[pk].col,
+      "struct pattern inside nested or-pattern `|` is not supported",
+    ))
+    return ("", [])
+  }
   let sb = StringBuilder()
   let obls : Array[(String, Int, Int, String)] = []
   let mut k = start
@@ -14332,6 +14411,9 @@ fn peel_struct_patterns_in_pat(
       let cp = find_matching_delim(tokens, k)
       if pattern_contains_struct_pat(tokens, k + 1, cp) {
         let (inner_s, inner_obls) = peel_struct_patterns_in_pat(ctx, tokens, k + 1, cp, file)
+        if inner_obls.length() == 0 {
+          return ("", [])
+        }
         sb.write_string(tokens[k].leading_trivia + "(" + inner_s + tokens[cp].leading_trivia + ")")
         for ob in inner_obls { obls.push(ob) }
         k = cp + 1
@@ -14435,7 +14517,7 @@ fn expand_struct_pat_obligations(
           } else {
             let ps = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
             if ps != "_" {
-              non_bind_guards.push("(" + fexpr + " is " + ps + ")")
+              non_bind_guards.push("(match " + fexpr + " { " + ps + " => true, _ => false })")
             }
           }
         }
