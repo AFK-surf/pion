@@ -184,6 +184,56 @@ pub fn run_e1_3() -> String {
     [.., z] => z
     _ => -1
   }
+  // #3: fixed-length arm guard push -> rest arm reuses cached len == 2 (top-level & nested => 3, 3)
+  let fl1 = [1, 2]
+  let r_fl_top = match fl1 {
+    [x, y] if { let _ = x + y; fl1.push(99); false } => 1
+    [_, _, _, ..] => 2
+    _ => 3
+  }
+  let fl2 = [1, 2]
+  let r_fl_nest = match Some(fl2) {
+    Some([x, y]) if { let _ = x + y; fl2.push(99); false } => 1
+    Some([_, _, _, ..]) => 2
+    _ => 3
+  }
+  // #4: fixed-length [a, b, c] must NOT cross-fill reverse suffix cache (push/pop/mut => 99, 2, 88 top & nested)
+  let fx1 = [1, 2, 3]
+  let r_fx1 = match fx1 {
+    [a, b, c] if { fx1.push(99); false } => a + b + c
+    [.., z] => z
+    _ => -1
+  }
+  let fx2 = [1, 2, 3]
+  let r_fx2 = match fx2 {
+    [a, b, c] if { let _ = fx2.pop(); false } => a + b + c
+    [.., z] => z
+    _ => -1
+  }
+  let fx3 = [1, 2, 3]
+  let r_fx3 = match fx3 {
+    [a, b, c] if { fx3[2] = 88; false } => a + b + c
+    [.., z] => z
+    _ => -1
+  }
+  let fx4 = [1, 2, 3]
+  let r_fx4 = match Some(fx4) {
+    Some([a, b, c]) if { fx4.push(99); false } => a + b + c
+    Some([.., z]) => z
+    _ => -1
+  }
+  let fx5 = [1, 2, 3]
+  let r_fx5 = match Some(fx5) {
+    Some([a, b, c]) if { let _ = fx5.pop(); false } => a + b + c
+    Some([.., z]) => z
+    _ => -1
+  }
+  let fx6 = [1, 2, 3]
+  let r_fx6 = match Some(fx6) {
+    Some([a, b, c]) if { fx6[2] = 88; false } => a + b + c
+    Some([.., z]) => z
+    _ => -1
+  }
   // Empty/single/multi & inner shadow
   let empty_r = match ([] : Array[Int]) { [.., last] => last; _ => -7 }
   let single_r = match [42] { [.., last] => last; _ => -7 }
@@ -193,12 +243,18 @@ pub fn run_e1_3() -> String {
   opus50.to_string() + "," + astra9_top.to_string() + "," + astra9_nest.to_string() +
   "|cache=" + r93.to_string() + "," + r13_top.to_string() + "," + r13_nest.to_string() +
   "|gp=" + r_push_top.to_string() + "," + r_pop_top.to_string() + "," + r_push_nest.to_string() + "," + r_pop_nest.to_string() + "," + r_cached_suf.to_string() +
+  "|fl=" + r_fl_top.to_string() + "," + r_fl_nest.to_string() +
+  "|fx=" + r_fx1.to_string() + "," + r_fx2.to_string() + "," + r_fx3.to_string() + "," + r_fx4.to_string() + "," + r_fx5.to_string() + "," + r_fx6.to_string() +
   "|misc=" + empty_r.to_string() + "," + single_r.to_string() + "," + sh_r.to_string() + "," + mid_empty.to_string()
 }
 
 pub struct Holder {
   arr : Array[Int]
   strs : Array[String]
+}
+
+fn view_join_show(vs : ArrayView[String], vi : ArrayView[Int]) -> String {
+  vs[1:3].join(":") + "|" + "\{vi[0:2]}"
 }
 
 pub fn run_e1_4() -> String {
@@ -216,8 +272,19 @@ pub fn run_e1_4() -> String {
   let j1 = h.strs[:3].join("-")
   let j2 = h.strs[1:3].join(sep_var)
   let s1 = "\{h.arr[0:2]}"
+  // #1: ArrayBuf (promoted local array) + ArrayView param + Bytes slice ro_join/ro_show
+  let buf_strs = ["p", "q", "r", "s"]
+  let v_strs = buf_strs[0:4]
+  let buf_ints = [5, 6, 7]
+  let v_ints = buf_ints[0:3]
+  let bj = buf_strs[:3].join("-")
+  let bs_buf = "\{buf_ints[0:2]}" + "/" + buf_ints[0:2].to_string()
+  let vj = view_join_show(v_strs, v_ints)
+  let b : Bytes = b"AB\x00\xff"
+  let by_s = b[0:2].to_string() + "/" + "\{b[0:3]}"
   l1.to_string() + "," + e1.to_string() + "," + cp.length().to_string() + "," + cp[0].to_string() +
   "|" + j1 + "|" + j2 + "|" + s1 +
+  "|buf=" + bj + "," + bs_buf + "|view=" + vj + "|bytes=" + by_s +
   "|cnt=" + c_recv.val.to_string() + "," + c_lo.val.to_string() + "," + c_hi.val.to_string()
 }
 
@@ -295,8 +362,8 @@ def main():
         expected_lines = [
             "E1-1:423|tab:dl,tab:ph",
             "E1-2:11,30|rev=12,c1=1|dep=594,c2=2",
-            "E1-3:50,9,9|cache=93,13,13|gp=99,2,88,2,3|misc=-7,42,99,708",
-            "E1-4:2,true,2,20|a-b-c|b:c|[10, 20]|cnt=1,1,1",
+            "E1-3:50,9,9|cache=93,13,13|gp=99,2,88,2,3|fl=3,3|fx=99,2,88,99,2,88|misc=-7,42,99,708",
+            "E1-4:2,true,2,20|a-b-c|b:c|[10, 20]|buf=p-q-r,[5, 6]/[5, 6]|view=q:r|[5, 6]|bytes=b\"AB\"/b\"AB\\x00\"|cnt=1,1,1",
         ]
         for ln in expected_lines:
             if ln not in moon_out.splitlines():
