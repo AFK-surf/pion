@@ -28,6 +28,7 @@ pub struct CompileQbeOut {
 
 ///|
 pub struct QbeLocal {
+  mut counted_len : String
   name : String
   slot : String
   ty : Ty
@@ -15337,6 +15338,7 @@ fn qbe_try_inline_hof_call(
                             ty: loc.ty,
                             owned: false,
                             is_cell: false,
+                            counted_len: "",
                             ref_slot: "",
                           },
                         )
@@ -22428,6 +22430,7 @@ fn qbe_define_local_ex(
     ty: ty,
     owned: owned,
     is_cell: false,
+    counted_len: "",
     ref_slot: "",
   }
   let top = g.scopes[g.scopes.length() - 1]
@@ -22466,6 +22469,7 @@ fn qbe_define_cell_local(
     ty: ty,
     owned: owned,
     is_cell: true,
+    counted_len: "",
     ref_slot: "",
   }
   let top = g.scopes[g.scopes.length() - 1]
@@ -22513,6 +22517,7 @@ fn qbe_define_fn_params(g : QbeGen, params : Array[Param], ptys : Array[Ty]) -> 
         ty: pty,
         owned: true,
         is_cell: false,
+        counted_len: "",
         ref_slot: preg,
       }
       let top = g.scopes[g.scopes.length() - 1]
@@ -22759,6 +22764,7 @@ fn qbe_guard_val(g : QbeGen, gs : QbeArgGuards, aa : QbeArgVal, is_mut_slot : Bo
         ty: aa.qv.ty,
         owned: true,
         is_cell: false,
+        counted_len: "",
         ref_slot: "",
       },
     )
@@ -23251,6 +23257,7 @@ fn qbe_emit_default_call_arg(
           ty: pty,
           owned: false,
           is_cell: false,
+          counted_len: "",
           ref_slot: "",
         },
       )
@@ -51751,6 +51758,83 @@ fn qbe_pair_body(g : QbeGen, p : QbeReadPair, body : Array[Stmt], loop_body : St
 }
 
 ///|
+/// Recover the length established by a complete counted fill of fresh local
+/// integer arrays. Keep the fact on the local binding so shadowing is harmless.
+fn qbe_record_counted_fill(g : QbeGen, stmts : Array[Stmt], at : Int) -> Unit {
+  if at < 2 || g.target_wasm { return }
+  let (counter, limit, body) = match stmts[at] {
+    SWhile(EBinary("<", EIdent(i, _), EInt(raw, _), _), body, _) =>
+      (i, qbe_parse_int64_lit(raw), body)
+    _ => return
+  }
+  let pushes = body.length() - 1
+  if pushes < 1 || at < pushes + 1 || limit < 0L || limit > 2147483647L { return }
+  match stmts[at - 1] {
+    SLet(n, true, _, EInt("0", _), _) => if n != counter { return }
+    _ => return
+  }
+  match qbe_lookup_local(g, counter) {
+    Some(v) => match v.ty {
+      TInt => if v.is_cell || v.ref_slot != "" { return }
+      _ => return
+    }
+    None => return
+  }
+  match body[pushes] {
+    SAssign(EIdent(n, _), EBinary("+", EIdent(m, _), EInt("1", _), _), _) =>
+      if n != counter || m != counter { return }
+    _ => return
+  }
+  let names : Array[String] = []
+  let mut i = 0
+  while i < pushes {
+    match (stmts[at - pushes - 1 + i], body[i]) {
+      (SLet(n, false, _, EArrayLit(xs, _), _),
+       SExpr(EMethodCall(EIdent(a, _), "push", args, _), _)) => {
+        if n != a || n == counter || xs.length() != 0 || args.length() != 1 ||
+          str_arr_contains(names, n) { return }
+        match args[0] { EInt(_, _) => ()
+          _ => return }
+        match qbe_lookup_local(g, n) {
+          Some(v) => match v.ty {
+            TArray(TInt) => if v.is_cell || v.ref_slot != "" { return }
+            _ => return
+          }
+          None => return
+        }
+        names.push(n)
+      }
+      _ => return
+    }
+    i = i + 1
+  }
+  i = 0
+  while i < pushes {
+    let n = names[i]
+    if qbe_arr_is_stable_stmts(stmts, at + 1, n, true) {
+      match qbe_lookup_local(g, n) {
+        Some(v) => v.counted_len = limit.to_string()
+        None => ()
+      }
+    }
+    i = i + 1
+  }
+}
+
+///|
+/// Length operand for a bounds check on local `name` (array object `obj`): the
+/// immediate recorded by `qbe_record_counted_fill`, else a load of the header.
+fn qbe_array_length_operand(g : QbeGen, name : String, obj : String) -> String {
+  match qbe_lookup_local(g, name) {
+    Some(v) => if v.counted_len != "" { return v.counted_len }
+    None => ()
+  }
+  let len = qbe_tmp(g)
+  qbe_emit(g, len + " =l loadl " + obj)
+  len
+}
+
+///|
 /// `qbe_emit_stmts` consults its block-level data-pointer predicate only for a
 /// non-final binding or for a guard (a final guard's condition included); every
 /// other block skips the scan.
@@ -51986,6 +52070,8 @@ fn qbe_emit_stmts(
         None => ()
       }
       last = qbe_emit_stmt(g, stmts[i], exp, is_last)
+      match stmts[i] { SWhile(_, _, _) => qbe_record_counted_fill(g, stmts, i)
+        _ => () }
       let cur_moved = g.moved_slots
       if did_mov_setup {
         g.movable_locals = old_mov
@@ -53256,11 +53342,7 @@ fn qbe_emit_stmt(
                         if !bce_safe {
                           let alen = match g.hoisted_arr_len.get(arr_local_name) {
                             Some(hlen) => hlen
-                            None => {
-                              let t = qbe_tmp(g)
-                              qbe_emit(g, t + " =l loadl " + ov.reg)
-                              t
-                            }
+                            None => qbe_array_length_operand(g, arr_local_name, ov.reg)
                           }
                           let oob = qbe_tmp(g)
                           let l_oob = qbe_lbl(g, "arr_oob")
@@ -53340,11 +53422,7 @@ fn qbe_emit_stmt(
                             if !bce_safe {
                               let alen = match g.hoisted_arr_len.get(arr_local_name) {
                                 Some(hlen) => hlen
-                                None => {
-                                  let t = qbe_tmp(g)
-                                  qbe_emit(g, t + " =l loadl " + ov.reg)
-                                  t
-                                }
+                                None => qbe_array_length_operand(g, arr_local_name, ov.reg)
                               }
                               let oob = qbe_tmp(g)
                               let l_oob = qbe_lbl(g, "arr_oob")
@@ -53397,11 +53475,7 @@ fn qbe_emit_stmt(
                   if !bce_safe {
                     let alen = match g.hoisted_arr_len.get(arr_local_name) {
                       Some(hlen) => hlen
-                      None => {
-                        let t = qbe_tmp(g)
-                        qbe_emit(g, t + " =l loadl " + ov.reg)
-                        t
-                      }
+                      None => qbe_array_length_operand(g, arr_local_name, ov.reg)
                     }
                     let oob = qbe_tmp(g)
                     let l_oob = qbe_lbl(g, "arr_oob")
@@ -53458,11 +53532,7 @@ fn qbe_emit_stmt(
                   if !bce_safe {
                     let alen = match g.hoisted_arr_len.get(arr_local_name) {
                       Some(hlen) => hlen
-                      None => {
-                        let t = qbe_tmp(g)
-                        qbe_emit(g, t + " =l loadl " + ov.reg)
-                        t
-                      }
+                      None => qbe_array_length_operand(g, arr_local_name, ov.reg)
                     }
                     let oob = qbe_tmp(g)
                     let l_oob = qbe_lbl(g, "arr_oob")
@@ -53506,11 +53576,7 @@ fn qbe_emit_stmt(
                   if !bce_safe {
                     let alen = match g.hoisted_arr_len.get(arr_local_name) {
                       Some(hlen) => hlen
-                      None => {
-                        let t = qbe_tmp(g)
-                        qbe_emit(g, t + " =l loadl " + ov.reg)
-                        t
-                      }
+                      None => qbe_array_length_operand(g, arr_local_name, ov.reg)
                     }
                     let oob = qbe_tmp(g)
                     let l_oob = qbe_lbl(g, "arr_oob")
@@ -53859,11 +53925,7 @@ fn qbe_emit_stmt(
               if !bce_safe {
                 let alen = match g.hoisted_arr_len.get(arr_local_name) {
                   Some(hlen) => hlen
-                  None => {
-                    let t = qbe_tmp(g)
-                    qbe_emit(g, t + " =l loadl " + ov.reg)
-                    t
-                  }
+                  None => qbe_array_length_operand(g, arr_local_name, ov.reg)
                 }
                 let oob = qbe_tmp(g)
                 let l_oob = qbe_lbl(g, "arr_oob")
@@ -54352,11 +54414,10 @@ fn qbe_emit_stmt(
         match qbe_lookup_local(g, aname) {
           Some(aloc) => {
             let ap = qbe_tmp(g)
-            let alen = qbe_tmp(g)
             let dp_p = qbe_tmp(g)
             let adp = qbe_tmp(g)
             qbe_emit(g, ap + " =l loadl " + aloc.slot)
-            qbe_emit(g, alen + " =l loadl " + ap)
+            let alen = qbe_array_length_operand(g, aname, ap)
             qbe_emit(g, dp_p + " =l add " + ap + ", 24")
             qbe_emit(g, adp + " =l loadl " + dp_p)
             g.hoisted_arr_len.set(aname, alen)
@@ -59944,11 +60005,7 @@ fn qbe_emit_index_on(
           if !bce_safe {
             let alen = match g.hoisted_arr_len.get(arr_local_name) {
               Some(hlen) => hlen
-              None => {
-                let t = qbe_tmp(g)
-                qbe_emit(g, t + " =l loadl " + ov.reg)
-                t
-              }
+              None => qbe_array_length_operand(g, arr_local_name, ov.reg)
             }
             let oob = qbe_tmp(g)
             let l_oob = qbe_lbl(g, qbe_arr_oob_lbl_prefix(g, elem))

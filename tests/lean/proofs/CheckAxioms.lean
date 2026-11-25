@@ -33,6 +33,7 @@ import PionProofs.QbeWin64XmmCalleeSaved
 import PionProofs.QbeAmd64GuardedExchange
 import PionProofs.QbeArm64GuardedDispatch
 import PionProofs.QbeFrontendColdSpeedOpts
+import PionProofs.QbeCountedArrayLength
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -786,3 +787,15 @@ import PionProofs.QbeFrontendColdSpeedOpts
 #print axioms PionFrontendColdSpeedOpts.constPlan_guarded_fast_path
 #print axioms PionFrontendColdSpeedOpts.loopFp_same_iterations_and_fallback
 #print axioms PionFrontendColdSpeedOpts.loopFp_same_length
+#print axioms PionQbeCountedArrayLength.counted_fill
+#print axioms PionQbeCountedArrayLength.terminal_length
+#print axioms PionQbeCountedArrayLength.int_counter_safe
+#print axioms PionQbeCountedArrayLength.pushAll_eq
+#print axioms PionQbeCountedArrayLength.fillMany_eq
+#print axioms PionQbeCountedArrayLength.multi_array_fill_independent
+#print axioms PionQbeCountedArrayLength.checks_preserved
+#print axioms PionQbeCountedArrayLength.stable_length
+#print axioms PionQbeCountedArrayLength.effect_size
+#print axioms PionQbeCountedArrayLength.trace_equivalence
+#print axioms PionQbeCountedArrayLength.oob_negative_index_traps
+#print axioms PionQbeCountedArrayLength.empty_fill_always_traps
