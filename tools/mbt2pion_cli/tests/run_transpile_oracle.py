@@ -1388,11 +1388,15 @@ pub fn m2b_p1_views_map_and_hash() -> (String, Int, Int, Int, Int, Int, Bool) {
   let hf_neg0 = Hash::hash(M2bFloatKey::{ f: -0.0F })
   let hf_exp = Hash::hash(M2bFloatKey::{ f: 1.0e3F })
   let fneg_bits = (-0.0F).reinterpret_as_uint()
+  let fhex_pos = (0x1.8p0F).reinterpret_as_uint()
+  let fhex_sub = (0x1.0p-149F).reinterpret_as_uint()
+  let fhex_neg = (-0x1.8p0F).reinterpret_as_uint()
+  let hex_int = 0xFF
   let he = Hash::hash(M2bHashEnum::Pair(1, "x")) ^ hnt ^ hf1 ^ hf_exp
   let bx : M2bBoxed[Int] = M2bBoxed::{ val0: m2b_generic_json_id(17) }
   let be : M2bBoxE[Int] = M2bBoxE::Val(bx.val0)
   let gj = match be { M2bBoxE::Val(v) => v }
-  let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2) && hf1 == -1445830834 && hf_pos0 == 148298089 && hf_neg0 == 148298089 && fneg_bits == 0x80000000U
+  let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2) && hf1 == -1445830834 && hf_pos0 == 148298089 && hf_neg0 == 148298089 && fneg_bits == 0x80000000U && fhex_pos == 0x3fc00000U && fhex_sub == 1U && fhex_neg == 0xbfc00000U && hex_int == 255
   (vs, m.get(0).unwrap_or(-1), m.get(1).unwrap_or(-1), gj, hs, he, h_ok)
 }
 '''
