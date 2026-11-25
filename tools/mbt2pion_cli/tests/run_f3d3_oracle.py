@@ -45,6 +45,17 @@ pub(all) struct Boxed {
   c : Int
 }
 
+pub(all) struct StrBoxed {
+  mut a : Int
+  b : String
+  c : String
+}
+
+pub(all) struct DepValFields {
+  val : Int
+  val_ : Int
+}
+
 #callsite(autofill(loc))
 pub fn[T] dep_loc_fn(x : T, loc~ : SourceLoc) -> (T, String) {
   (x, loc.to_string())
@@ -326,12 +337,25 @@ priv struct StrBox {
   x : String
 }
 
+priv struct RowFloat {
+  mut a : Int
+  b : Float
+  c : Int
+}
+
+let val_ : Int = 9
+
 pub fn run_f3d3_7() -> String {
-  // P1-1: local out-of-order & in-order effectful struct updates
+  // P1-1: local out-of-order (implicit & explicit `LocalR::{ .. }`) & in-order effectful struct updates
   let s1 : LocalR = { a: 1, b: 2, c: 3 }
   let t1 = { ..s1, c: { s1.a = 8; 6 }, b: { s1.a = 9; 5 } }
+  let s1e : LocalR = { a: 1, b: 2, c: 3 }
+  let t1e = LocalR::{ ..s1e, c: { s1e.a = 8; 6 }, b: { s1e.a = 9; 5 } }
   let s2 : LocalR = { a: 1, b: 2, c: 3 }
   let t2 = { ..s2, a: { s2.b = 88; 10 }, c: { s2.b = 99; 30 } }
+  // Out-of-order with Float literal field `b: 0.1` preserving `: Float` temp annotation
+  let rf0 : RowFloat = { a: 1, b: 0.5, c: 3 }
+  let rf1 = { ..rf0, c: { rf0.a = 7; 6 }, b: 0.1 }
 
   // P1-2: shadowed `panic(...)` must NOT be treated as diverging (else must NOT run)
   let panic = fn(_s : String) -> Unit { () }
@@ -344,9 +368,8 @@ pub fn run_f3d3_7() -> String {
     n_p = 2
   }
 
-  // P1-3: `val` binder vs outer `val_` and sibling `val_`
-  let val_ = 9
-  let vb1 = if v_p is Some({ a: val, .. }) && val > 0 { val * 10 + val_ } else { 0 }
+  // P1-3: `val` binder vs package-level `let val_ = 9`, local `val_`, and sibling `val_`
+  let vb_pkg = if v_p is Some({ a: val, .. }) && val > 0 { val * 10 + val_ } else { 0 }
   let vb2 = if v_p is Some({ a: val, b: val_ }) && val > 0 { val * 10 + val_ } else { 0 }
 
   // P1-4: `{ val: a, val_: b }` distinct field access
@@ -362,9 +385,9 @@ pub fn run_f3d3_7() -> String {
   }
   let gs_r = gs_fn(Some({ x: "__MBT_GUARD_LEAF_TUPLE__" }))
 
-  t1.a.to_string() + "," + t2.b.to_string() + "|" +
+  t1.a.to_string() + "," + t1e.a.to_string() + "," + t2.b.to_string() + "," + rf1.a.to_string() + "|" +
   n_p.to_string() + "|" +
-  vb1.to_string() + "," + vb2.to_string() + "|" +
+  vb_pkg.to_string() + "," + vb2.to_string() + "|" +
   vf_r.to_string() + "|" + gs_r
 }
 
@@ -473,6 +496,35 @@ pub fn f(s : @f3d3dep.Boxed) -> Int {
 }
 '''
 
+NEG_FOREIGN_EXPLICIT_SU_MBT = r'''
+pub fn f(s : @f3d3dep.Boxed) -> Int {
+  let t = @f3d3dep.Boxed::{ ..s, c: { s.a = 8; 6 }, b: { s.a = 9; 5 } }
+  t.a
+}
+'''
+
+NEG_FOREIGN_INTERP_SU_MBT = r'''
+fn touch(s : @f3d3dep.StrBoxed, v : Int) -> Int {
+  s.a = v
+  v
+}
+
+pub fn f(s : @f3d3dep.StrBoxed) -> Int {
+  let t = { ..s, c: "\{touch(s, 8)}", b: "\{touch(s, 9)}" }
+  t.a
+}
+'''
+
+NEG_FOREIGN_VAL_PAT_MBT = r'''
+pub fn f(v : @f3d3dep.DepValFields?) -> Int {
+  if v is Some({ val: a, val_: b }) && true {
+    a * 10 + b
+  } else {
+    0
+  }
+}
+'''
+
 
 def run_cmd(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
@@ -554,7 +606,7 @@ def main():
             "F3d3-4:1,2,3|15,12|true,true,true\n"
             "F3d3-5:-1,4|-2,9|0,30,307\n"
             "F3d3-6:3,4,5|7,8,7,8\n"
-            "F3d3-7:9,88|1|19,12|19|hit"
+            "F3d3-7:9,9,88,7|1|19,12|19|hit"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
@@ -570,28 +622,34 @@ def main():
         assert_publish_blocked(bin_path, args.pionc, work, "pipe_as", NEG_PIPE_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
         assert_publish_blocked(bin_path, args.pionc, work, "nested_as", NEG_NESTED_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
 
-        # Cross-package effectful struct update must fail-closed with MBT2PION_UNSUPPORTED_SYNTAX
-        fs_sdir = os.path.join(work, "neg_foreign_su_src")
-        fs_odir = os.path.join(work, "neg_foreign_su_out")
-        fs_rep = os.path.join(work, "neg_foreign_su_report.json")
-        os.makedirs(fs_sdir)
-        os.makedirs(fs_odir)
-        with open(os.path.join(fs_sdir, "moon.pkg"), "w") as fh:
-            fh.write('import { "f3d3/oracle/f3d3dep" }\n')
-        with open(os.path.join(fs_sdir, "fsu.mbt"), "w") as fh:
-            fh.write(NEG_FOREIGN_EFFECT_SU_MBT)
-        p_fsu = subprocess.run(
-            [bin_path, "--src", fs_sdir, "--out", fs_odir, "--target", "native", "--mode", "publish",
-             "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--dep", f"f3d3dep={pd}", "--report", fs_rep],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
-        )
-        fsu_combined = p_fsu.stdout + "\n" + p_fsu.stderr + "\n" + (open(fs_rep).read() if os.path.exists(fs_rep) else "")
-        assert p_fsu.returncode != 0 and "MBT2PION_UNSUPPORTED_SYNTAX" in fsu_combined, (
-            f"foreign effectful struct update must fail closed:\n{fsu_combined}"
-        )
-        assert not os.listdir(fs_odir), "blocked foreign_su publish must leave --out empty"
+        # Cross-package fail-closed gates (effectful/explicit/interp struct update & keyword-colliding foreign struct pattern)
+        for neg_name, neg_src in [
+            ("foreign_su", NEG_FOREIGN_EFFECT_SU_MBT),
+            ("foreign_explicit_su", NEG_FOREIGN_EXPLICIT_SU_MBT),
+            ("foreign_interp_su", NEG_FOREIGN_INTERP_SU_MBT),
+            ("foreign_val_pat", NEG_FOREIGN_VAL_PAT_MBT),
+        ]:
+            fs_sdir = os.path.join(work, f"neg_{neg_name}_src")
+            fs_odir = os.path.join(work, f"neg_{neg_name}_out")
+            fs_rep = os.path.join(work, f"neg_{neg_name}_report.json")
+            os.makedirs(fs_sdir)
+            os.makedirs(fs_odir)
+            with open(os.path.join(fs_sdir, "moon.pkg"), "w") as fh:
+                fh.write('import { "f3d3/oracle/f3d3dep" }\n')
+            with open(os.path.join(fs_sdir, f"{neg_name}.mbt"), "w") as fh:
+                fh.write(neg_src)
+            p_fsu = subprocess.run(
+                [bin_path, "--src", fs_sdir, "--out", fs_odir, "--target", "native", "--mode", "publish",
+                 "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--dep", f"f3d3dep={pd}", "--report", fs_rep],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+            )
+            fsu_combined = p_fsu.stdout + "\n" + p_fsu.stderr + "\n" + (open(fs_rep).read() if os.path.exists(fs_rep) else "")
+            assert p_fsu.returncode != 0 and "MBT2PION_UNSUPPORTED_SYNTAX" in fsu_combined, (
+                f"foreign negative `{neg_name}` must fail closed:\n{fsu_combined}"
+            )
+            assert not os.listdir(fs_odir), f"blocked `{neg_name}` publish must leave --out empty"
 
-        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 7 positive + 9 negative cases)")
+        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 7 positive + 12 negative cases)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
