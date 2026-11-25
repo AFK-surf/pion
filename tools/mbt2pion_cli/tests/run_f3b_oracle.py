@@ -234,6 +234,21 @@ pub fn copy_alias() -> Int {
 }
 '''
 
+NEG_SHOW_MBT = r'''
+pub fn show_float() -> String {
+  let f : Float = 0.1
+  Show::to_string(f)
+}
+
+pub fn show_bytes() -> String {
+  Show::to_string(b"abc")
+}
+
+pub fn show_byte() -> String {
+  Show::to_string(b'a')
+}
+'''
+
 NEG_CLOSURE_MBT = r'''
 fn use_wide(_w : Int64) -> Unit {
   ()
@@ -301,6 +316,42 @@ pub fn loop_let_case() -> Int {
         k = 1L
       for x in items64(k) { ignore(x) }
     }
+    if neg { 1 } else { 0 }
+  }
+  g(2147483647)
+}
+
+priv struct H {
+  k : Int64
+}
+
+pub fn struct_let_case() -> Int {
+  let h : H = { k: 1L }
+  let g = fn(k) {
+    let neg = (k + 1) < 0
+    let { k } = h
+    use_wide(k)
+    if neg { 1 } else { 0 }
+  }
+  g(2147483647)
+}
+
+pub fn struct_arm_case(o : H?) -> Int {
+  let g = fn(k) {
+    let neg = (k + 1) < 0
+    match o {
+      Some({ k }) => use_wide(k)
+      None => ()
+    }
+    if neg { 1 } else { 0 }
+  }
+  g(2147483647)
+}
+
+pub fn struct_is_case(o : H?) -> Int {
+  let g = fn(k) {
+    let neg = (k + 1) < 0
+    if o is Some({ k }) && k > 0L { use_wide(k) }
     if neg { 1 } else { 0 }
   }
   g(2147483647)
@@ -393,6 +444,24 @@ def main():
         )
         assert not os.listdir(nout), "blocked publish must not write --out"
 
+        # Negative 1b: `Show::to_string` on types whose Pion `to_string` differs from MoonBit's `Show`
+        # (Moon prints `0.1`, `b"abc"`, `b'\x61'`) must block publish instead of silently changing output.
+        sneg = os.path.join(md, "f3sneg")
+        os.makedirs(sneg)
+        with open(os.path.join(sneg, "moon.pkg"), "w") as fh:
+            fh.write("\n")
+        with open(os.path.join(sneg, "neg.mbt"), "w") as fh:
+            fh.write(NEG_SHOW_MBT)
+        sout = os.path.join(work, "p_sneg", "src")
+        os.makedirs(sout)
+        p = subprocess.run([bin_path, "--src", sneg, "--out", sout, "--target", "native", "--mode", "publish",
+                            "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc],
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
+        sl = (p.stdout + p.stderr)
+        for ty in ("Float", "Bytes", "Byte"):
+            assert "on type `" + ty + "` has no MoonBit-exact lowering" in sl, f"Show::to_string({ty}) must fail closed:\n{sl}"
+        assert p.returncode != 0 and not os.listdir(sout), f"Show::to_string negatives must block publish:\n{sl}"
+
         # Negative 2: shadowed / field-receiver / named-argument closure params are never inferred.
         cneg = os.path.join(md, "f3cneg")
         os.makedirs(cneg)
@@ -406,12 +475,12 @@ def main():
                         "--mbt-compat", COMPAT_DIR, "--pionc", args.pionc, "--report", os.path.join(work, "cneg.json")],
                        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
         gen = open(os.path.join(cout, "neg.pion"), encoding="utf-8").read()
-        assert gen.count("let g = fn(k) {") == 4 and "let g = fn(k : Int, r : Child) {" in gen and "k : Int64" not in gen, (
-            "shadow/field/loop-let/named closure params must stay unannotated and the sibling one must use `r : Child`:\n" + gen
+        assert gen.count("let g = fn(k) {") == 7 and "let g = fn(k : Int, r : Child) {" in gen and "fn(k : Int64" not in gen, (
+            "shadow/field/loop-let/struct-let/struct-arm/struct-is/named closure params must stay unannotated and the sibling one must use `r : Child`:\n" + gen
         )
 
         print("[f3b-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
-        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; 4 closure params not inferred; sibling param never reads outer `r`)")
+        print("[f3b-oracle] PASS: negatives fail closed (copy-alias slice blocked; Show::to_string on Float/Bytes/Byte blocked; 7 closure params not inferred; sibling param never reads outer `r`)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
