@@ -179,6 +179,7 @@ pub struct QbeGen {
   const_i64_vals : Map[String, Int64]
   const_bool_vals : Map[String, Bool]
   global_min_len_arrs : Map[String, Int]
+  fixed_literal_lengths : Map[String, Int]
   freeze_fn_seen : Map[String, Bool]
   vmap_seen : Map[String, Bool]
   vmap_get_or_seen : Map[String, Bool]
@@ -283,6 +284,9 @@ pub struct QbeGen {
   mut loop_conts : Array[String]
   mut loop_depths : Array[Int]
   mut hot_loop_depth : Int
+  /// Set while emitting an unflattened nested `+` operand of a string chain:
+  /// its root `+` must not start a new flattened chain (see qbe_string_add_parts).
+  mut nested_add_part : Bool
   mut cur_tparams : Array[String]
   mut live_tparams : Array[String]
   mut cur_type_subst : Map[String, Ty]
@@ -16147,6 +16151,33 @@ fn qbe_callee_inline_cost_for_budget(
 }
 
 ///|
+fn qbe_has_simple_tuple_tail(body : Array[Stmt], ret_ty : Ty) -> Bool {
+  match ret_ty {
+    TTuple(fields) => {
+      if fields.length() < 2 || fields.length() > 5 || body.length() == 0 { return false }
+      let mut i = 0
+      while i < fields.length() {
+        if !qbe_is_prim_scalar_ty(fields[i]) { return false }
+        i = i + 1
+      }
+      i = 0
+      while i + 1 < body.length() {
+        match body[i] {
+          SLet(_, _, _, _, _) => ()
+          _ => return false
+        }
+        i = i + 1
+      }
+      match body[i] {
+        SExpr(ETuple(elems, _), _) => elems.length() == fields.length()
+        _ => false
+      }
+    }
+    _ => false
+  }
+}
+
+///|
 fn qbe_try_inline_fn_call(
   g : QbeGen,
   key : String,
@@ -16154,6 +16185,7 @@ fn qbe_try_inline_fn_call(
   arg_vals : Array[String],
   arg_tys : Array[Ty],
   arg_borrowed : Array[Bool],
+  destructure : Bool = false,
 ) -> Option[QbeVal] {
   if g.mono_pkg != "" ||
     g.inline_depth >= 2 ||
@@ -16274,6 +16306,10 @@ fn qbe_try_inline_fn_call(
         let inl_saved_verify = g.in_verify
         g.in_verify = inl_fd.is_verify
         let inl_scope_base = g.scopes.length()
+        // The inlined body resolves names in the callee's lexical scope only:
+        // caller locals must never capture a callee's reference to a global.
+        let caller_floor = g.lookup_scope_floor
+        g.lookup_scope_floor = inl_scope_base
         qbe_scope_push(g)
         let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
         let mut pi = 0
@@ -16304,7 +16340,12 @@ fn qbe_try_inline_fn_call(
         let has_ret = qbe_stmts_has_cf(inl_body, false, false, true) ||
           qbe_stmts_has_default_ret(g, inl_body)
         let out_reg = if !has_ret {
-          let bres = qbe_emit_stmts(g, inl_body, Some(finfo.ret_ty))
+          let bres = qbe_emit_stmts(
+            g,
+            inl_body,
+            Some(finfo.ret_ty),
+            destructure && qbe_has_simple_tuple_tail(inl_body, finfo.ret_ty),
+          )
           let r = qbe_coerce_val(g, bres, finfo.ret_ty)
           qbe_scope_pop(g)
           r
@@ -16340,6 +16381,7 @@ fn qbe_try_inline_fn_call(
             qbe_load_local_slot(g, ret_slot, finfo.ret_ty)
           }
         }
+        g.lookup_scope_floor = caller_floor
         g.in_verify = inl_saved_verify
         g.hoisted_arr_len = inl_hlen
         g.hoisted_arr_dp = inl_hdp
@@ -19646,6 +19688,8 @@ fn qbe_inline_body_into_opt_res_slots(
   let inl_saved_verify = g.in_verify
   g.in_verify = inl_fd.is_verify
   let inl_scope_base = g.scopes.length()
+  let caller_lookup_floor = g.lookup_scope_floor
+  g.lookup_scope_floor = inl_scope_base
   qbe_scope_push(g)
   let inl_has_dp = qbe_stmts_has_any_data_ptr(inl_body)
   let mut pi = 0
@@ -19713,6 +19757,7 @@ fn qbe_inline_body_into_opt_res_slots(
     qbe_emit_lbl(g, sc_ret)
     g.block_immut_fields = Map([])
   }
+  g.lookup_scope_floor = caller_lookup_floor
   g.in_verify = inl_saved_verify
   g.hoisted_arr_len = inl_hlen
   g.hoisted_arr_dp = inl_hdp
@@ -19785,7 +19830,12 @@ fn qbe_local_fn_can_scalar_inline(g : QbeGen, key : String, finfo : FnInfo) -> O
         Some(fidx) => g.cur_file_idx < 0 || fidx == g.cur_file_idx
         None => true
       }
-      let base_max_cost = if same_file { 42 } else { 22 }
+      // Immediate destructuring also removes the result allocation and its release.
+      let consumes_variant = match finfo.ret_ty {
+        TOption(_) | TResult(_, _) => true
+        _ => false
+      }
+      let base_max_cost = if same_file || consumes_variant { 42 } else { 22 }
       let loop_max_cost = if g.target_wasm { 96 } else { 220 }
       let max_cost = if same_file &&
         !inl_fd.is_pub &&
@@ -21602,6 +21652,7 @@ fn qbe_new_for_target_name(
     const_i64_vals: Map([]),
     const_bool_vals: Map([]),
     global_min_len_arrs: Map([]),
+    fixed_literal_lengths: Map([]),
     freeze_fn_seen: Map([]),
     vmap_seen: Map([]),
     vmap_get_or_seen: Map([]),
@@ -21705,6 +21756,7 @@ fn qbe_new_for_target_name(
     loop_conts: [],
     loop_depths: [],
     hot_loop_depth: 0,
+    nested_add_part: false,
     cur_tparams: [],
     live_tparams: [],
     cur_type_subst: Map([]),
@@ -26569,6 +26621,7 @@ fn qbe_record_scalar_const(g : QbeGen, cd : ConstDecl, cty : Ty) -> Unit {
         EArrayLit(elems, _) =>
           if elems.length() >= 1 {
             g.global_min_len_arrs.set(cd.name, elems.length())
+            g.fixed_literal_lengths.set(cd.name, elems.length())
           }
         ECall(EPath("FixedArray", "make", _), args, _)
         | ECall(EPath("ImmArray", "make", _), args, _) =>
@@ -33255,6 +33308,17 @@ fn qbe_emit_method_call_dispatch(
     }
     TStringBuilder => {
       if method_name == "write_string" {
+        if !g.target_wasm && qbe_is_str_slice(g, args[0]) {
+          qbe_scope_push(g)
+          // Validated bounds: pion_strbuf_push_slice's clamping never applies.
+          let (s, lo, hi, _) = qbe_checked_str_bounds(g, args[0], args_pure)
+          if !g.block_term {
+            qbe_emit(g, "call $pion_strbuf_push_slice(l " + obj_val + ", l " + s + ", l " + lo + ", l " + hi + ")")
+            if !obj_borrowed { qbe_rc_dec(g, obj_val, TStringBuilder) }
+          }
+          qbe_scope_pop(g)
+          return qval("0", TUnit)
+        }
         match args[0] {
           EMethodCall(inner, mname, margs, msp) =>
             if mname == "to_string" && margs.length() == 0 && !qbe_has_expected_trait(g, msp) {
@@ -34917,7 +34981,12 @@ fn qbe_emit_method_call_dispatch(
         let va = qbe_emit_arg_maybe_borrow(g, args[0], Some(elem), args_pure)
         let vv = va.qv
         let vl = qbe_as_l(g, vv)
-        qbe_emit_deep_freeze(g, vl, elem)
+        // Native Channel.send freezes every object before publication. Strings
+        // have no reference fields requiring a generated deep traversal.
+        match elem {
+          TString => if g.target_wasm { qbe_emit_deep_freeze(g, vl, elem) }
+          _ => qbe_emit_deep_freeze(g, vl, elem)
+        }
         let rw = qbe_tmp(g)
         let r = qbe_tmp(g)
         qbe_emit(g, rw + " =w call $pion_chan_send(l " + obj_val + ", l " + vl + ")")
@@ -38434,6 +38503,264 @@ fn qbe_probe_switch_arms_ty(
   acc
 }
 
+///| No call, index, conversion, panic or early return may intervene between
+/// obtaining a slot and storing its new value. Extend this total fragment only
+/// when effects and reallocation have been ruled out.
+struct QbeScalarEntryPlan {
+  map_expr : Expr
+  key_name : String
+  old_name : String
+  value_ty : Ty
+  on_hit : Expr
+  on_miss : Expr
+}
+
+///|
+fn qbe_total_entry_value(g : QbeGen, e : Expr, old : String) -> Bool {
+  match e {
+    EInt(_, _) | EInt64(_, _) => true
+    EIdent(n, _) => n == old || match qbe_lookup_local(g, n) {
+      Some(loc) => match loc.ty { TInt | TInt64 => true
+        _ => false }
+      None => false
+    }
+    EBinary(op, a, b, _) =>
+      (op == "+" || op == "-" || op == "*" || op == "&" || op == "|" || op == "^") &&
+        qbe_total_entry_value(g, a, old) && qbe_total_entry_value(g, b, old)
+    _ => false
+  }
+}
+
+///|
+fn qbe_entry_plan(g : QbeGen, e : Expr, arms : Array[MatchArm]) -> Option[QbeScalarEntryPlan] {
+  if g.target_wasm || arms.length() != 2 { return None }
+  let (map_expr, map_name, key) = match e {
+    EMethodCall(obj, "get", args, sp) => {
+      if args.length() != 1 || qbe_has_expected_trait(g, sp) { return None }
+      match (obj, args[0]) {
+        (EIdent(m, _), EIdent(k, _)) => (obj, m, k)
+        _ => return None
+      }
+    }
+    _ => return None
+  }
+  let value_ty = match qbe_peek_expr_ty(g, map_expr) {
+    Some(TMap(TString, TInt64)) => TInt64
+    Some(TMap(TString, TInt)) => TInt
+    _ => return None
+  }
+  let mut old = ""
+  let mut hit : Option[Expr] = None
+  let mut miss : Option[Expr] = None
+  for arm in arms {
+    match arm.guard_expr { Some(_) => return None
+      None => () }
+    let value = match arm.body {
+      EMethodCall(EIdent(m, _), "set", args, sp) => {
+        if m != map_name || args.length() != 2 || qbe_has_expected_trait(g, sp) { return None }
+        match args[0] { EIdent(k, _) => if k != key { return None }
+          _ => return None }
+        args[1]
+      }
+      _ => return None
+    }
+    match arm.pat {
+      PVariant(q, "Some", ps, _, _) => {
+        if (q != "" && q != "Option") || ps.length() != 1 { return None }
+        old = match ps[0] { PIdent(n, _) => n
+          PWild(_) => ""
+          _ => return None }
+        if old == map_name || old == key || !qbe_total_entry_value(g, value, old) { return None }
+        hit = Some(value)
+      }
+      PVariant(q, "None", ps, _, _) => {
+        if (q != "" && q != "Option") || ps.length() != 0 || !qbe_total_entry_value(g, value, "") { return None }
+        miss = Some(value)
+      }
+      _ => return None
+    }
+  }
+  match (hit, miss) {
+    (Some(h), Some(m)) => Some(QbeScalarEntryPlan::{
+      map_expr: map_expr, key_name: key, old_name: old, value_ty: value_ty, on_hit: h, on_miss: m,
+    })
+    _ => None
+  }
+}
+
+///| Both arms perform a scalar store. Normalize the presence test into the
+/// same entry plan, with no binding for the old value.
+fn qbe_contains_plan(g : QbeGen, cond : Expr, body : Array[Stmt], other : Option[Expr]) -> Option[QbeScalarEntryPlan] {
+  match cond {
+    EMethodCall(obj, "contains", args, sp) => {
+      if body.length() != 1 || qbe_has_expected_trait(g, sp) { return None }
+      let a = match body[0] { SExpr(e, _) => e
+        _ => return None }
+      let b = match other {
+        Some(EBlock(ss, _)) => {
+          if ss.length() != 1 { return None }
+          match ss[0] { SExpr(e, _) => e
+            _ => return None }
+        }
+        _ => return None
+      }
+      let yes = MatchArm::{pat: PVariant("Option", "Some", [PWild(sp)], false, sp), guard_expr: None, body: a, span: sp}
+      let no = MatchArm::{pat: PVariant("Option", "None", [], false, sp), guard_expr: None, body: b, span: sp}
+      qbe_entry_plan(g, EMethodCall(obj, "get", args, sp), [yes, no])
+    }
+    _ => None
+  }
+}
+
+///|
+fn qbe_emit_whole_entry(g : QbeGen, p : QbeScalarEntryPlan, key_expr : Expr) -> QbeVal {
+  let key = qbe_emit_arg_maybe_borrow(g, key_expr, Some(TString), true)
+  let _ = qbe_emit_entry_plan(g, p, "0", "0", key.qv.reg, false)
+  if !key.borrowed { qbe_rc_dec(g, key.qv.reg, TString) }
+  qval("0", TUnit)
+}
+
+///| One probe (`pion_map_scalar_entry`) returns the value slot of a present
+/// key, which the hit value overwrites in place; a miss evaluates the value and
+/// inserts through `pion_map_set`, materializing a span key only then. With
+/// `keep`, returns an owned reference to the stored key (the resident key on a
+/// hit, read from its `PionMapEntry`; the fresh key on a miss) for later
+/// concatenations; identity-sensitive uses are excluded by the caller.
+fn qbe_emit_entry_plan(
+  g : QbeGen, plan : QbeScalarEntryPlan, data : String, len : String, whole : String, keep : Bool,
+) -> String {
+  let map = qbe_emit_arg_maybe_borrow(g, plan.map_expr, None, true)
+  let result = if keep { qbe_alloc_slot(g) } else { "0" }
+  let slot = qbe_tmp(g)
+  qbe_emit(g, slot + " =l call $pion_map_scalar_entry(l " + map.qv.reg + ", l " + data +
+    ", l " + len + ", l " + whole + ")")
+  let hw = qbe_tmp(g)
+  qbe_emit(g, hw + " =w cnel " + slot + ", 0")
+  let hit = qbe_lbl(g, "entry_hit")
+  let miss = qbe_lbl(g, "entry_miss")
+  let done = qbe_lbl(g, "entry_done")
+  qbe_emit_term(g, "jnz " + hw + ", " + hit + ", " + miss)
+  qbe_emit_lbl(g, hit)
+  qbe_scope_push(g)
+  if plan.old_name != "" && plan.old_name != "_" {
+    let raw = qbe_tmp(g)
+    qbe_emit(g, raw + " =l loadl " + slot)
+    let local = qbe_define_local(g, plan.old_name, plan.value_ty, false)
+    qbe_store_local_slot(g, qbe_from_l(g, raw, plan.value_ty), local.slot, plan.value_ty)
+  }
+  let hv = qbe_emit_expr(g, plan.on_hit, Some(plan.value_ty))
+  qbe_emit(g, "storel " + qbe_as_l(g, hv) + ", " + slot)
+  qbe_scope_pop(g)
+  if keep {
+    // PionMapEntry { key, hash, val, .. }: the key sits 16 bytes before val.
+    let kp = qbe_tmp(g)
+    let k = qbe_tmp(g)
+    qbe_emit(g, kp + " =l sub " + slot + ", 16")
+    qbe_emit(g, k + " =l loadl " + kp)
+    qbe_rc_inc(g, k, TString)
+    qbe_emit(g, "storel " + k + ", " + result)
+  }
+  qbe_emit_term(g, "jmp " + done)
+  qbe_emit_lbl(g, miss)
+  let mv = qbe_emit_expr(g, plan.on_miss, Some(plan.value_ty))
+  let mvl = qbe_as_l(g, mv)
+  let key = if whole != "0" { whole } else {
+    let k = qbe_tmp(g)
+    qbe_emit(g, k + " =l call $pion_str_from_cstr(l " + data + ", l " + len + ")")
+    k
+  }
+  qbe_emit(g, "call $pion_map_set(l " + map.qv.reg + ", l " + key + ", l " + mvl + ")")
+  if keep {
+    qbe_emit(g, "storel " + key + ", " + result)
+  } else if whole == "0" {
+    qbe_rc_dec(g, key, TString)
+  }
+  qbe_emit_term(g, "jmp " + done)
+  qbe_emit_lbl(g, done)
+  let retained = if keep {
+    let k = qbe_tmp(g)
+    qbe_emit(g, k + " =l loadl " + result)
+    k
+  } else { "0" }
+  if !map.borrowed { qbe_rc_dec(g, map.qv.reg, map.qv.ty) }
+  retained
+}
+
+///| Permit only whole leaves of a real string concatenation after the update.
+/// Any closure capture, key identity test, raw pointer, alias, or passing the
+/// key itself to another operation retains ordinary slice allocation.
+fn qbe_key_value_use(e : Expr, name : String) -> Bool {
+  if !qbe_expr_mentions_ident(e, name) { return true }
+  match e {
+    EBinary("+", l, r, _) => {
+      for part in qbe_string_add_parts(l, r) {
+        match part { EIdent(_, _) => ()
+          _ => if qbe_expr_mentions_ident(part, name) { return false } }
+      }
+      true
+    }
+    EIf(cond, body, other, _) => {
+      if qbe_expr_mentions_ident(cond, name) { return false }
+      for st in body { if !qbe_key_value_stmt(st, name) { return false } }
+      match other { Some(x) => qbe_key_value_use(x, name)
+        None => true }
+    }
+    _ => false
+  }
+}
+
+///|
+fn qbe_key_value_stmt(st : Stmt, name : String) -> Bool {
+  match st {
+    SLet(_, _, _, e, _) | SExpr(e, _) => qbe_key_value_use(e, name)
+    _ => !qbe_stmt_mentions_ident(st, name)
+  }
+}
+
+///|
+///| 0: not applied; 1: applied; 2: applied and defined the local `ss[i]` names.
+fn qbe_try_slice_entry(g : QbeGen, ss : Array[Stmt], i : Int) -> Int {
+  if g.target_wasm || i + 1 >= ss.length() { return 0 }
+  let (name, slice) = match ss[i] {
+    SLet(n, false, _, e, _) => (n, e)
+    _ => return 0
+  }
+  if !qbe_is_str_slice(g, slice) { return 0 }
+  let plan = match ss[i + 1] {
+    SExpr(EMatch(e, arms, _), _) => match qbe_entry_plan(g, e, arms) {
+      Some(p) => p
+      None => return 0
+    }
+    SExpr(EIf(cond, body, other, _), _) => match qbe_contains_plan(g, cond, body, other) {
+      Some(p) => p
+      None => return 0
+    }
+    _ => return 0
+  }
+  if name != plan.key_name || qbe_expr_mentions_ident(plan.map_expr, name) ||
+    qbe_expr_mentions_ident(plan.on_hit, name) || qbe_expr_mentions_ident(plan.on_miss, name) { return 0 }
+  let mut keep = false
+  let mut j = i + 2
+  while j < ss.length() {
+    if qbe_stmt_mentions_ident(ss[j], name) {
+      if !qbe_key_value_stmt(ss[j], name) { return 0 }
+      keep = true
+    }
+    j = j + 1
+  }
+  qbe_scope_push(g)
+  let (p, n) = qbe_checked_str_span(g, slice, !qbe_expr_has_assign(slice))
+  let key = if g.block_term { "0" } else { qbe_emit_entry_plan(g, plan, p, n, "0", keep) }
+  qbe_scope_pop(g)
+  if keep && !g.block_term {
+    qbe_clear_shadowed_local_meta(g, name)
+    let local = qbe_define_local(g, name, TString, true)
+    qbe_store_local_slot(g, key, local.slot, TString)
+    return 2
+  }
+  1
+}
+
 ///|
 fn qbe_try_emit_map_get_match(
   g : QbeGen,
@@ -38531,6 +38858,10 @@ fn qbe_try_emit_map_get_match(
       }
       if !matched {
         return None
+      }
+      match qbe_entry_plan(g, scrut, arms) {
+        Some(plan) => return Some(qbe_emit_whole_entry(g, plan, margs[0]))
+        None => ()
       }
       qbe_scope_push(g)
       let key_expr = margs[0]
@@ -39416,6 +39747,208 @@ fn qbe_concat_part_heap_to_string(g : QbeGen, iv : QbeVal, sp : Span) -> QbeArgV
   QbeArgVal::{ qv: r, borrowed: false }
 }
 
+///| Return definite built-in String receivers only. Chained slices and
+/// fresh string literals have the same layout as a local String.
+fn qbe_is_str_slice(g : QbeGen, e : Expr) -> Bool {
+  match e {
+    EMethodCall(obj, "slice", args, sp) =>
+      args.length() == 2 && !qbe_has_expected_trait(g, sp) &&
+        match obj {
+          EString(_, _) | EInterp(_, _) => true
+          ECall(EIdent(n, _), _, _) => {
+            if g.mono_pkg != "" || g.tc.in_imported_default_arg || g.inline_closures.contains(n) { return false }
+            match qbe_lookup_local(g, n) {
+              Some(_) => false
+              None => match g.tc.fns.get(n) {
+                Some(f) => match f.ret_ty { TString => !g.tc.consts.contains(n)
+                  _ => false }
+                None => false
+              }
+            }
+          }
+          EMethodCall(_, "slice", _, _) => qbe_is_str_slice(g, obj)
+          _ => match qbe_peek_expr_ty(g, obj) {
+            Some(TString) => true
+            _ => false
+          }
+        }
+    _ => false
+  }
+}
+
+///| The raw data pointer is valid until the owner is released. Register owned
+/// expression temporaries in the caller's scope before evaluating the bounds.
+fn qbe_checked_str_span(g : QbeGen, expr : Expr, borrow : Bool) -> (String, String) {
+  let (_, lo, hi, ptr) = qbe_checked_str_bounds(g, expr, borrow)
+  if g.block_term { return ("0", "0") }
+  let len = qbe_tmp(g)
+  qbe_emit(g, len + " =l sub " + hi + ", " + lo)
+  (ptr, len)
+}
+
+///| Evaluate a slice's receiver and bounds in order and validate them at the
+/// slice site; returns (owner, lo, hi, data pointer) registers.
+fn qbe_checked_str_bounds(g : QbeGen, expr : Expr, borrow : Bool) -> (String, String, String, String) {
+  match expr {
+    EMethodCall(obj, _, args, _) => {
+      let a = qbe_emit_arg_maybe_borrow(g, obj, Some(TString), borrow)
+      if !a.borrowed && !g.block_term {
+        let _ = qbe_hold_local(g, "@span_owner", a.qv)
+      }
+      if g.block_term { return ("0", "0", "0", "0") }
+      let lo = qbe_as_l(g, qbe_emit_expr(g, args[0], Some(TInt)))
+      if g.block_term { return ("0", "0", "0", "0") }
+      let hi = qbe_as_l(g, qbe_emit_expr(g, args[1], Some(TInt)))
+      if g.block_term { return ("0", "0", "0", "0") }
+      let ptr = qbe_tmp(g)
+      qbe_emit(g, ptr + " =l call $pion_str_slice_data(l " + a.qv.reg + ", l " + lo + ", l " + hi + ")")
+      (a.qv.reg, lo, hi, ptr)
+    }
+    _ => ("0", "0", "0", "0")
+  }
+}
+
+///| Operands of a string `+` in the same grouping as the ordinary lowering:
+/// when `lhs` is itself a `+`, every leaf of the tree in evaluation order (the
+/// `pion_str_concat_n` chain); otherwise just `[lhs, rhs]` (one
+/// `pion_str_concat`, a nested `rhs` keeping its own concatenation). A span copy
+/// over these parts evaluates the same operands in the same order and checks
+/// the total length once at the end, exactly like the call it replaces.
+fn qbe_string_add_parts(lhs : Expr, rhs : Expr) -> Array[Expr] {
+  match lhs {
+    EBinary("+", _, _, _) => ()
+    _ => return [lhs, rhs]
+  }
+  let parts : Array[Expr] = []
+  let stack : Array[Expr] = [rhs, lhs]
+  while stack.length() > 0 {
+    match stack.pop() {
+      Some(EBinary("+", l, r, _)) => {
+        stack.push(r)
+        stack.push(l)
+      }
+      Some(part) => parts.push(part)
+      None => break
+    }
+  }
+  parts
+}
+
+///| Caller opened a scope for the source and part owners. parts are in Pion
+/// argument evaluation order, even for a right-nested chain.
+fn qbe_emit_span_concat(
+  g : QbeGen, parts : Array[Expr], aliases : Map[String, (String, String)], borrow : Bool,
+) -> QbeVal {
+  let storage = qbe_tmp(g)
+  g.fn_allocs.write_string("    " + storage + " =l alloc8 " + (parts.length() * 16).to_string() + "\n")
+  let mut i = 0
+  while i < parts.length() {
+    let e = parts[i]
+    let cached = match e {
+      EIdent(n, _) => aliases.get(n)
+      _ => None
+    }
+    let (ptr, len) = match cached {
+      Some(pair) => pair
+      None => if qbe_is_str_slice(g, e) {
+        qbe_checked_str_span(g, e, borrow)
+      } else {
+        let a = qbe_concat_part(g, e, borrow, false, parts.length() <= 8)
+        if g.block_term { return qval("0", TString) }
+        if !a.borrowed { let _ = qbe_hold_local(g, "@span_part", a.qv) }
+        let p = qbe_tmp(g)
+        let n = qbe_tmp(g)
+        if g.immortal_regs.contains(a.qv.reg) {
+          qbe_emit(g, n + " =l loadl " + a.qv.reg)
+        } else {
+          qbe_emit(g, n + " =l call $pion_str_len(l " + a.qv.reg + ")")
+        }
+        qbe_emit(g, p + " =l add " + a.qv.reg + ", 8")
+        (p, n)
+      }
+    }
+    if g.block_term { return qval("0", TString) }
+    let pslot = qbe_tmp(g)
+    let nslot = qbe_tmp(g)
+    qbe_emit(g, pslot + " =l add " + storage + ", " + (i * 16).to_string())
+    qbe_emit(g, nslot + " =l add " + pslot + ", 8")
+    qbe_emit(g, "storel " + ptr + ", " + pslot)
+    qbe_emit(g, "storel " + len + ", " + nslot)
+    i = i + 1
+  }
+  let res = qbe_tmp(g)
+  qbe_emit(g, res + " =l call $pion_str_concat_spans(l " + parts.length().to_string() + ", l " + storage + ")")
+  qval(res, TString)
+}
+
+///| Match a run of immutable slice definitions feeding the next concatenation.
+/// No alias is published to the ordinary expression emitter. Check all uses
+/// before emitting the first instruction, including uses inside later bounds.
+/// Returns the number of fused statements; 0 when nothing was fused; -k when
+/// the k slice lets from `start` are not followed by a concatenation let, so no
+/// start among them can fuse either (keeps the scan linear in the block).
+/// A run holds at most 16 aliases.
+fn qbe_try_span_bindings(g : QbeGen, ss : Array[Stmt], start : Int) -> Int {
+  if g.target_wasm { return 0 }
+  let names : Array[String] = []
+  let slices : Array[Expr] = []
+  let mut i = start
+  while i < ss.length() && names.length() < 16 {
+    match ss[i] {
+      SLet(n, false, _, e, _) => {
+        if !qbe_is_str_slice(g, e) || n == "_" { break }
+        for prev in names {
+          if n == prev || qbe_expr_mentions_ident(e, prev) { return 0 }
+        }
+        names.push(n)
+        slices.push(e)
+      }
+      _ => break
+    }
+    i = i + 1
+  }
+  if names.length() == 0 { return 0 }
+  if i == ss.length() { return -names.length() }
+  let (target, lhs, rhs) = match ss[i] {
+    SLet(n, false, TyMissing(_), EBinary("+", l, r, _), _) => (n, l, r)
+    _ => return -names.length()
+  }
+  let parts = qbe_string_add_parts(lhs, rhs)
+  let borrow = !qbe_args_have_assign(parts) && !qbe_args_have_assign(slices)
+  for n in names {
+    let mut used = false
+    for e in parts {
+      match e {
+        EIdent(id, _) => if id == n { used = true }
+        _ => if qbe_expr_mentions_ident(e, n) { return 0 }
+      }
+    }
+    if !used { return 0 }
+    let mut j = i + 1
+    while j < ss.length() {
+      if qbe_stmt_mentions_ident(ss[j], n) { return 0 }
+      j = j + 1
+    }
+  }
+  qbe_scope_push(g)
+  let aliases : Map[String, (String, String)] = Map([])
+  let mut j = 0
+  while j < names.length() && !g.block_term {
+    aliases.set(names[j], qbe_checked_str_span(g, slices[j], borrow))
+    j = j + 1
+  }
+  let result = if !g.block_term { qbe_emit_span_concat(g, parts, aliases, borrow) } else { qval("0", TString) }
+  qbe_scope_pop(g)
+  if !g.block_term {
+    if target == "_" { qbe_rc_dec(g, result.reg, TString) } else {
+      qbe_clear_shadowed_local_meta(g, target)
+      let loc = qbe_define_local(g, target, TString, true)
+      qbe_store_local_slot(g, result.reg, loc.slot, TString)
+    }
+  }
+  i - start + 1
+}
+
 ///|
 /// One part of a flattened `pion_str_concat_n` chain. `pion_str_concat_n`
 /// reads only `len` and the `len` payload bytes of each part, always returns a
@@ -39479,6 +40012,16 @@ fn qbe_concat_part(
         }
       _ => ()
     }
+  }
+  match part {
+    EBinary("+", _, _, _) => {
+      // A nested `+` operand keeps its ordinary (unflattened) concatenation.
+      g.nested_add_part = true
+      let v = qbe_emit_arg_maybe_borrow_ext(g, part, Some(TString), borrow, borrow_fields)
+      g.nested_add_part = false
+      return v
+    }
+    _ => ()
   }
   qbe_emit_arg_maybe_borrow_ext(g, part, Some(TString), borrow, borrow_fields)
 }
@@ -40171,6 +40714,8 @@ fn qbe_emit_binary_chain(
   // state: 0=bin waiting lhs, 1=bin waiting rhs, 2=&& waiting lhs, 3=&& waiting rhs,
   //        4=|| waiting lhs, 5=|| waiting rhs, 6=2.0*rhs waiting rhs
   let root_has_assign = qbe_expr_has_assign(root_lhs) || qbe_expr_has_assign(root_rhs)
+  let no_flatten_root = g.nested_add_part
+  g.nested_add_part = false
   let root_no_calls = !root_has_assign &&
     qbe_loop_has_no_calls_expr(g, root_lhs) &&
     qbe_loop_has_no_calls_expr(g, root_rhs)
@@ -40325,7 +40870,8 @@ fn qbe_emit_binary_chain(
           // N-way chained `String + String + ...` flattening (>= 3 parts) -> single $pion_str_concat_n
           // Only scan at the outermost `+` (skip when parent is already `+`, eliminating O(N^2) scans on `Int` sums).
           if op == "+" &&
-            (f_state.length() == 0 || f_op[f_state.length() - 1] != "+") {
+            ((f_state.length() == 0 && !no_flatten_root) ||
+            (f_state.length() > 0 && f_op[f_state.length() - 1] != "+")) {
             let mut is_add_chain = false
             match lhs {
               EBinary("+", _, _, _) => is_add_chain = true
@@ -40344,22 +40890,18 @@ fn qbe_emit_binary_chain(
                 }
               }
             }
+            // A plain binary `slice + x` / `x + slice`: one span copy of [lhs, rhs]
+            // in place of `pion_str_concat` (a nested `+` operand keeps its own).
+            if !is_add_chain && !g.target_wasm && (qbe_is_str_slice(g, lhs) || qbe_is_str_slice(g, rhs)) {
+              qbe_scope_push(g)
+              let v = qbe_emit_span_concat(g, [lhs, rhs], Map([]), !root_has_assign)
+              qbe_scope_pop(g)
+              cur_arg = QbeArgVal::{ qv: v, borrowed: false }
+              has_val = true
+              continue
+            }
             if is_add_chain {
-              let parts : Array[Expr] = []
-              let stack : Array[Expr] = [rhs, lhs]
-              while stack.length() > 0 {
-                match stack.pop() {
-                  Some(scur) =>
-                    match scur {
-                      EBinary("+", cl, cr, _) => {
-                        stack.push(cr)
-                        stack.push(cl)
-                      }
-                      _ => parts.push(scur)
-                    }
-                  None => break
-                }
-              }
+              let parts = qbe_string_add_parts(lhs, rhs)
               if parts.length() >= 3 {
                 let mut is_str_chain = match cur_exp {
                   Some(TString) => true
@@ -40399,6 +40941,25 @@ fn qbe_emit_binary_chain(
                   }
                 }
                 if is_str_chain {
+                  // Same parts, same order: a span copy replaces pion_str_concat_n
+                  // when a slice operand is present (its length check stays last).
+                  if !g.target_wasm {
+                    let mut use_spans = false
+                    for part in parts {
+                      if qbe_is_str_slice(g, part) {
+                        use_spans = true
+                        break
+                      }
+                    }
+                    if use_spans {
+                      qbe_scope_push(g)
+                      let v = qbe_emit_span_concat(g, parts, Map([]), !root_has_assign)
+                      qbe_scope_pop(g)
+                      cur_arg = QbeArgVal::{ qv: v, borrowed: false }
+                      has_val = true
+                      continue
+                    }
+                  }
                   let can_borrow = !qbe_args_have_assign(parts)
                   let mut can_borrow_af = can_borrow
                   if can_borrow_af {
@@ -40823,7 +41384,17 @@ fn qbe_emit_expr(
   expr : Expr,
   expected : Option[Ty],
 ) -> QbeVal {
-  let res = qbe_emit_expr_inner(g, expr, expected)
+  qbe_emit_expr_mode(g, expr, expected, false)
+}
+
+///|
+fn qbe_emit_expr_mode(
+  g : QbeGen,
+  expr : Expr,
+  expected : Option[Ty],
+  destructure : Bool,
+) -> QbeVal {
+  let res = qbe_emit_expr_inner(g, expr, expected, destructure)
   if g.known_min_len_arrs.length() > 0 {
     match expr {
       ECall(_, _, _) | EMethodCall(_, _, _, _) =>
@@ -40858,6 +41429,7 @@ fn qbe_emit_expr_inner(
   g : QbeGen,
   expr : Expr,
   expected : Option[Ty],
+  destructure : Bool,
 ) -> QbeVal {
   match expr {
     EInt(raw, _) => {
@@ -42578,6 +43150,7 @@ fn qbe_emit_expr_inner(
                 arg_vals,
                 arg_tys,
                 arg_borrowed,
+                destructure,
               ) {
                 Some(qv) => return qv
                 None => ()
@@ -43917,17 +44490,23 @@ fn qbe_emit_expr_inner(
       } else {
         "$pion_alloc"
       }
-      qbe_emit(
-        g,
-        obj +
-        " =l call " +
-        alloc_fn +
-        "(w " +
-        sz.to_string() +
-        ", w 4, l " +
-        drop_sym +
-        ")",
-      )
+      if destructure && obj_slots.length() == 0 && tp_names.length() == 0 {
+        // The only consumer loads scalar fields immediately. No header is observed.
+        g.fn_allocs.write_string("    " + obj + " =l alloc8 " + sz.to_string() + "\n")
+        g.immortal_regs.set(obj, true)
+      } else {
+        qbe_emit(
+          g,
+          obj +
+          " =l call " +
+          alloc_fn +
+          "(w " +
+          sz.to_string() +
+          ", w 4, l " +
+          drop_sym +
+          ")",
+        )
+      }
       i = 0
       while i < vals.length() {
         let p = qbe_tmp(g)
@@ -43944,6 +44523,10 @@ fn qbe_emit_expr_inner(
       r
     }
     EIf(cond, then_stmts, else_opt, sp) => {
+      match qbe_contains_plan(g, cond, then_stmts, else_opt) {
+        Some(p) => return qbe_emit_whole_entry(g, p, EIdent(p.key_name, sp))
+        None => ()
+      }
       match qbe_try_collect_if_switch(g, cond, then_stmts, else_opt) {
         Some(plan) =>
           match qbe_lookup_local(g, plan.vname) {
@@ -51827,7 +52410,7 @@ fn qbe_record_counted_fill(g : QbeGen, stmts : Array[Stmt], at : Int) -> Unit {
 
 ///|
 /// Length operand for a bounds check on local `name` (array object `obj`): the
-/// immediate recorded by `qbe_record_counted_fill`, else a load of the header.
+/// exact local length recorded for a counted fill or a fixed literal, else a header load.
 fn qbe_array_length_operand(g : QbeGen, name : String, obj : String) -> String {
   match qbe_lookup_local(g, name) {
     Some(v) => if v.counted_len != "" { return v.counted_len }
@@ -51856,10 +52439,72 @@ fn qbe_block_needs_data_ptr_scan(stmts : Array[Stmt]) -> Bool {
   false
 }
 
+///| Bookkeeping `qbe_emit_stmts` does after each statement, for a fused run
+/// stmts[lo ..= hi] whose only defined local (if any) is that of stmts[def]:
+/// pin it or register it for last-use release, then release every registered
+/// local whose last use lies inside the run.
+fn qbe_fused_stmts_done(
+  g : QbeGen,
+  n : Int,
+  lo : Int,
+  hi : Int,
+  def : Int,
+  def_names : Array[String],
+  def_last_use : Array[Int],
+  def_dp_pinned : Array[Bool],
+  ed_names : Array[String],
+  ed_slots : Array[String],
+  ed_last : Array[Int],
+  pinned : Map[String, Bool],
+  pinned_slot_list : Array[String],
+) -> Unit {
+  if g.block_term { return }
+  if def >= 0 {
+    if def_dp_pinned[def] {
+      qbe_pin_local_slot(g, def_names[def], pinned_slot_list)
+    } else if def_last_use[def] >= 0 {
+      match qbe_lookup_local(g, def_names[def]) {
+        Some(loc) =>
+          if loc.owned && !loc.is_cell && loc.ref_slot == "" && qbe_is_early_drop_ty(g, loc.ty) {
+            ed_names.push(def_names[def])
+            ed_slots.push(loc.slot)
+            ed_last.push(def_last_use[def])
+          }
+        None => ()
+      }
+    }
+  }
+  if hi >= n - 1 { return }
+  let mut dropped_any = false
+  let mut k = ed_names.length() - 1
+  while k >= 0 {
+    if ed_last[k] >= lo && ed_last[k] <= hi &&
+      !pinned.contains(ed_names[k]) &&
+      !g.pinned_slots.contains(ed_slots[k]) {
+      let dead = qbe_tmp(g)
+      qbe_emit(g, dead + " =l loadl " + ed_slots[k])
+      qbe_emit(g, "call $pion_rc_dec(l " + dead + ")")
+      qbe_emit(g, "storel 0, " + ed_slots[k])
+      g.zeroed_slots.set(ed_slots[k], true)
+      dropped_any = true
+    }
+    k = k - 1
+  }
+  if dropped_any {
+    g.block_immut_fields = Map([])
+  }
+}
+
+///|
+/// `destructure_tail`: the block is the body of an inlined callee whose tail
+/// tuple is destructured immediately (`qbe_has_simple_tuple_tail`); the tail
+/// expression is emitted in destructure mode (private stack buffer). Every
+/// other statement, and the last-use early drops, are emitted as usual.
 fn qbe_emit_stmts(
   g : QbeGen,
   stmts : Array[Stmt],
   expected : Option[Ty],
+  destructure_tail : Bool = false,
 ) -> QbeVal {
   let n = stmts.length()
   if n == 0 {
@@ -51956,9 +52601,42 @@ fn qbe_emit_stmts(
   let pinned_slot_list : Array[String] = []
   let mut i = 0
   let mut last = qval("0", TUnit)
+  // Statements before this index cannot start a fused slice-alias run.
+  let mut span_skip_until = 0
   while i < n {
     if g.block_term {
       break
+    }
+    let entry = qbe_try_slice_entry(g, stmts, i)
+    if entry > 0 {
+      // stmts[i] (a slice let) and stmts[i + 1] (the map update) were fused.
+      qbe_fused_stmts_done(
+        g, n, i, i + 1, if entry == 2 { i } else { -1 }, def_names, def_last_use, def_dp_pinned,
+        ed_names, ed_slots, ed_last, pinned, pinned_slot_list,
+      )
+      i = i + 2
+      last = qval("0", TUnit)
+      continue
+    }
+    let consumed = if i < span_skip_until { 0 } else { qbe_try_span_bindings(g, stmts, i) }
+    if consumed < 0 {
+      span_skip_until = i - consumed
+    }
+    if consumed > 0 {
+      // Slice aliases stmts[i ..] and the concatenation let at end were fused;
+      // only that let defines a local.
+      let end = i + consumed - 1
+      let def = match stmts[end] {
+        SLet(name, _, _, _, _) => if name != "_" { end } else { -1 }
+        _ => -1
+      }
+      qbe_fused_stmts_done(
+        g, n, i, end, def, def_names, def_last_use, def_dp_pinned, ed_names, ed_slots, ed_last,
+        pinned, pinned_slot_list,
+      )
+      i = i + consumed
+      last = qval("0", TUnit)
+      continue
     }
     let is_last = i == n - 1
     let bf_owner_slot = if !is_last {
@@ -52073,7 +52751,11 @@ fn qbe_emit_stmts(
           }
         None => ()
       }
-      last = qbe_emit_stmt(g, stmts[i], exp, is_last)
+      last = match stmts[i] {
+        SExpr(tail, _) if is_last && destructure_tail =>
+          qbe_emit_expr_mode(g, tail, exp, true)
+        _ => qbe_emit_stmt(g, stmts[i], exp, is_last)
+      }
       match stmts[i] { SWhile(_, _, _) => qbe_record_counted_fill(g, stmts, i)
         _ => () }
       let cur_moved = g.moved_slots
@@ -52588,6 +53270,18 @@ fn qbe_emit_stmt(
         }
         // Precompute metadata against the OLD scope BEFORE `qbe_define_local`
         // shadows any outer variable of the same name (e.g. `let src = src.slice(0, 1)`).
+        let fixed_length = match init {
+          EIdent(global_name, _) if !is_mut && g.mono_pkg == "" =>
+            match g.fixed_literal_lengths.get(global_name) {
+              Some(n) =>
+                match qbe_lookup_local(g, global_name) {
+                  None => n.to_string()
+                  Some(_) => ""
+                }
+              None => ""
+            }
+          _ => ""
+        }
         let mut pre_unfrozen_arr = false
         let mut pre_min_len = -1
         let mut pre_writable_bytes = false
@@ -52760,6 +53454,7 @@ fn qbe_emit_stmt(
           qbe_is_obj_ty(g, final_ty) &&
           (coerced_iv == "0" || g.immortal_regs.contains(coerced_iv))
         let loc = qbe_define_local_ex(g, name, final_ty, !iv_immortal, is_mut)
+        if fixed_length != "" { loc.counted_len = fixed_length }
         qbe_store_local_slot(g, coerced_iv, loc.slot, final_ty)
         if iv_immortal {
           g.immortal_slots.set(loc.slot, true)
@@ -52880,7 +53575,7 @@ fn qbe_emit_stmt(
           }
         _ => ()
       }
-      let iv = qbe_emit_expr(g, init, ann_opt)
+      let iv = qbe_emit_expr_mode(g, init, ann_opt, g.release)
       let tup_ty = match ann_opt {
         Some(a) => a
         None => iv.ty
