@@ -673,6 +673,8 @@ pub struct TypeChecker {
   generic_call_sites : Array[GenericCallSite]
   mut cur_fn_key : String
   mut in_pass3 : Bool
+  mut expansive_ready : Bool
+  expansive_defs : Map[String, Bool]
   eq_uses : Array[EqUse]
   /// `span_key` of a method call on a `TParam` with trait bounds -> canonical bound trait name.
   resolved_trait_methods : Map[String, String]
@@ -2066,6 +2068,8 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
     }
     ci_sym = ci_sym + 1
   }
+  tc.expansive_ready = false
+  tc.expansive_defs.clear()
   let mut ei = 0
   while ei < ipkg.tc.eq_keys.length() {
     let ek = ipkg.tc.eq_keys[ei]
@@ -4232,16 +4236,30 @@ fn tc_ty_mentions_param_map_rec(tc : TypeChecker, t : Ty, seen_defs : Map[String
         }
         i = i + 1
       }
-      let dk = "S:" + name
+      let mask_sb = StringBuilder()
+      let abs_args : Array[Ty] = []
+      let mut mi = 0
+      while mi < args.length() {
+        if ty_has_tparam(args[mi]) {
+          mask_sb.write_string("1")
+          abs_args.push(TParam("__p"))
+        } else {
+          mask_sb.write_string("0")
+          abs_args.push(TInt)
+        }
+        mi = mi + 1
+      }
+      let dk = "S:" + name + "|" + mask_sb.to_string()
       if seen_defs.contains(dk) {
         return false
       }
       seen_defs.set(dk, true)
       match tc_lookup_struct_info(tc, name) {
         Some(sinfo) => {
+          let subst = make_subst(sinfo.decl.type_params, abs_args)
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
-            if tc_ty_mentions_param_map_rec(tc, sinfo.field_tys[fi], seen_defs) {
+            if tc_ty_mentions_param_map_rec(tc, subst_ty(sinfo.field_tys[fi], subst), seen_defs) {
               return true
             }
             fi = fi + 1
@@ -4259,19 +4277,33 @@ fn tc_ty_mentions_param_map_rec(tc : TypeChecker, t : Ty, seen_defs : Map[String
         }
         i = i + 1
       }
-      let dk = "E:" + name
+      let mask_sb = StringBuilder()
+      let abs_args : Array[Ty] = []
+      let mut mi = 0
+      while mi < args.length() {
+        if ty_has_tparam(args[mi]) {
+          mask_sb.write_string("1")
+          abs_args.push(TParam("__p"))
+        } else {
+          mask_sb.write_string("0")
+          abs_args.push(TInt)
+        }
+        mi = mi + 1
+      }
+      let dk = "E:" + name + "|" + mask_sb.to_string()
       if seen_defs.contains(dk) {
         return false
       }
       seen_defs.set(dk, true)
       match tc_lookup_enum_info_qualified(tc, name) {
         Some(einfo) => {
+          let subst = make_subst(einfo.decl.type_params, abs_args)
           let mut vi = 0
           while vi < einfo.variants.length() {
             let v = einfo.variants[vi]
             let mut fi = 0
             while fi < v.field_tys.length() {
-              if tc_ty_mentions_param_map_rec(tc, v.field_tys[fi], seen_defs) {
+              if tc_ty_mentions_param_map_rec(tc, subst_ty(v.field_tys[fi], subst), seen_defs) {
                 return true
               }
               fi = fi + 1
@@ -4284,6 +4316,65 @@ fn tc_ty_mentions_param_map_rec(tc : TypeChecker, t : Ty, seen_defs : Map[String
       }
     }
     _ => false
+  }
+}
+
+///|
+fn tc_expansive_def_mentions_param_map(tc : TypeChecker, is_struct : Bool, name : String) -> Bool {
+  let seen_defs : Map[String, Bool] = Map([])
+  if is_struct {
+    match tc_lookup_struct_info(tc, name) {
+      Some(sinfo) => {
+        let mask_sb = StringBuilder()
+        let abs_args : Array[Ty] = []
+        let mut mi = 0
+        while mi < sinfo.decl.type_params.length() {
+          mask_sb.write_string("1")
+          abs_args.push(TParam("__p"))
+          mi = mi + 1
+        }
+        seen_defs.set("S:" + name + "|" + mask_sb.to_string(), true)
+        let subst = make_subst(sinfo.decl.type_params, abs_args)
+        let mut fi = 0
+        while fi < sinfo.field_tys.length() {
+          if tc_ty_mentions_param_map_rec(tc, subst_ty(sinfo.field_tys[fi], subst), seen_defs) {
+            return true
+          }
+          fi = fi + 1
+        }
+        false
+      }
+      None => false
+    }
+  } else {
+    match tc_lookup_enum_info_qualified(tc, name) {
+      Some(einfo) => {
+        let mask_sb = StringBuilder()
+        let abs_args : Array[Ty] = []
+        let mut mi = 0
+        while mi < einfo.decl.type_params.length() {
+          mask_sb.write_string("1")
+          abs_args.push(TParam("__p"))
+          mi = mi + 1
+        }
+        seen_defs.set("E:" + name + "|" + mask_sb.to_string(), true)
+        let subst = make_subst(einfo.decl.type_params, abs_args)
+        let mut vi = 0
+        while vi < einfo.variants.length() {
+          let v = einfo.variants[vi]
+          let mut fi = 0
+          while fi < v.field_tys.length() {
+            if tc_ty_mentions_param_map_rec(tc, subst_ty(v.field_tys[fi], subst), seen_defs) {
+              return true
+            }
+            fi = fi + 1
+          }
+          vi = vi + 1
+        }
+        false
+      }
+      None => false
+    }
   }
 }
 
@@ -4400,61 +4491,45 @@ fn tc_add_all_param_edges(
 }
 
 ///|
-fn tc_graph_can_reach(
-  total_v : Int,
-  edge_u : Array[Int],
-  edge_v : Array[Int],
-  src : Int,
-  dst : Int,
-) -> Bool {
-  let seen : Array[Bool] = []
-  let mut i = 0
-  while i < total_v {
-    seen.push(false)
-    i = i + 1
-  }
-  let q : Array[Int] = [src]
-  seen[src] = true
-  let mut qi = 0
-  while qi < q.length() {
-    let cur = q[qi]
-    if cur == dst {
-      return true
-    }
-    let mut ei = 0
-    while ei < edge_u.length() {
-      if edge_u[ei] == cur {
-        let nxt = edge_v[ei]
-        if !seen[nxt] {
-          seen[nxt] = true
-          q.push(nxt)
-        }
-      }
-      ei = ei + 1
-    }
-    qi = qi + 1
-  }
-  false
-}
-
-///|
-/// Exact static positive-weight cycle check on the type-parameter flow graph:
-/// returns `true` iff nominal `(root_is_struct, root_name)` lies on a positive-weight
-/// polymorphic recursion cycle (non-regular, infinite reachable instantiations).
-fn tc_def_is_expansive(tc : TypeChecker, root_is_struct : Bool, root_name : String) -> Bool {
+/// Builds `tc.expansive_defs` once in O(V + E) using iterative Tarjan SCC on
+/// the static type-parameter flow graph across all structs/enums in `tc`.
+/// A nominal definition is expansive iff any of its type-parameter vertices
+/// belongs to an SCC containing a 1-weight (compound-wrapped) edge.
+fn tc_build_expansive_cache(tc : TypeChecker) -> Unit {
+  tc.expansive_defs.clear()
   let def_ids : Map[String, Int] = Map([])
   let def_is_struct : Array[Bool] = []
   let def_names : Array[String] = []
+  let def_keys : Array[String] = []
   let def_tparams : Array[Array[String]] = []
   let def_fields : Array[Array[Ty]] = []
-  let rkey = eq_nominal_key(tc, root_is_struct, root_name)
-  def_ids.set(rkey, 0)
-  def_is_struct.push(root_is_struct)
-  def_names.push(eq_canonical_nominal_name(tc, root_is_struct, root_name))
+  let mut si = 0
+  while si < tc.struct_names.length() {
+    let sn = tc.struct_names[si]
+    let sk = eq_nominal_key(tc, true, sn)
+    if !def_ids.contains(sk) {
+      def_ids.set(sk, def_names.length())
+      def_is_struct.push(true)
+      def_names.push(eq_canonical_nominal_name(tc, true, sn))
+    }
+    si = si + 1
+  }
+  let mut ei = 0
+  while ei < tc.enum_names.length() {
+    let en = tc.enum_names[ei]
+    let ek = eq_nominal_key(tc, false, en)
+    if !def_ids.contains(ek) {
+      def_ids.set(ek, def_names.length())
+      def_is_struct.push(false)
+      def_names.push(eq_canonical_nominal_name(tc, false, en))
+    }
+    ei = ei + 1
+  }
   let mut qi = 0
   while qi < def_names.length() {
     let is_st = def_is_struct[qi]
     let dname = def_names[qi]
+    def_keys.push(if is_st { "S:" + dname } else { "E:" + dname })
     if is_st {
       match tc_lookup_struct_info(tc, dname) {
         Some(sinfo) => {
@@ -4497,17 +4572,23 @@ fn tc_def_is_expansive(tc : TypeChecker, root_is_struct : Bool, root_name : Stri
     }
     qi = qi + 1
   }
-  let root_np = def_tparams[0].length()
-  if root_np == 0 {
-    return false
-  }
   let node_base : Array[Int] = []
+  let node_def_key : Array[String] = []
   let mut total_v = 0
   let mut di = 0
   while di < def_names.length() {
     node_base.push(total_v)
-    total_v = total_v + def_tparams[di].length()
+    let mut pi = 0
+    while pi < def_tparams[di].length() {
+      node_def_key.push(def_keys[di])
+      total_v = total_v + 1
+      pi = pi + 1
+    }
     di = di + 1
+  }
+  if total_v == 0 {
+    tc.expansive_ready = true
+    return
   }
   let edge_u : Array[Int] = []
   let edge_v : Array[Int] = []
@@ -4521,25 +4602,123 @@ fn tc_def_is_expansive(tc : TypeChecker, root_is_struct : Bool, root_name : Stri
     }
     di = di + 1
   }
-  // root_def (index 0, vertices 0..root_np-1) lies on a positive-weight cycle iff
-  // some 1-weight edge (u -> v) has a root vertex r with r ->* u and v ->* r.
-  let mut ei = 0
-  while ei < edge_w.length() {
-    if edge_w[ei] == 1 {
-      let u = edge_u[ei]
-      let v = edge_v[ei]
-      let mut r = 0
-      while r < root_np {
-        if tc_graph_can_reach(total_v, edge_u, edge_v, r, u) &&
-          tc_graph_can_reach(total_v, edge_u, edge_v, v, r) {
-          return true
+  let adj : Array[Array[Int]] = []
+  let disc : Array[Int] = []
+  let low : Array[Int] = []
+  let on_stk : Array[Bool] = []
+  let comp : Array[Int] = []
+  let mut vi = 0
+  while vi < total_v {
+    adj.push([])
+    disc.push(-1)
+    low.push(0)
+    on_stk.push(false)
+    comp.push(-1)
+    vi = vi + 1
+  }
+  let mut k = 0
+  while k < edge_u.length() {
+    adj[edge_u[k]].push(edge_v[k])
+    k = k + 1
+  }
+  // Iterative Tarjan SCC: O(V + E), zero recursion-stack limit.
+  let tarjan_stk : Array[Int] = []
+  let dfs_v : Array[Int] = []
+  let dfs_ei : Array[Int] = []
+  let mut next_disc = 0
+  let mut num_comp = 0
+  let mut start = 0
+  while start < total_v {
+    if disc[start] < 0 {
+      disc[start] = next_disc
+      low[start] = next_disc
+      next_disc = next_disc + 1
+      tarjan_stk.push(start)
+      on_stk[start] = true
+      dfs_v.push(start)
+      dfs_ei.push(0)
+      while dfs_v.length() > 0 {
+        let top = dfs_v.length() - 1
+        let u = dfs_v[top]
+        let idx = dfs_ei[top]
+        if idx < adj[u].length() {
+          dfs_ei[top] = idx + 1
+          let w = adj[u][idx]
+          if disc[w] < 0 {
+            disc[w] = next_disc
+            low[w] = next_disc
+            next_disc = next_disc + 1
+            tarjan_stk.push(w)
+            on_stk[w] = true
+            dfs_v.push(w)
+            dfs_ei.push(0)
+          } else if on_stk[w] && disc[w] < low[u] {
+            low[u] = disc[w]
+          }
+        } else {
+          let _ = dfs_v.pop()
+          let _ = dfs_ei.pop()
+          if low[u] == disc[u] {
+            let cid = num_comp
+            num_comp = num_comp + 1
+            while tarjan_stk.length() > 0 {
+              match tarjan_stk.pop() {
+                Some(x) => {
+                  on_stk[x] = false
+                  comp[x] = cid
+                  if x == u {
+                    break
+                  }
+                }
+                None => break
+              }
+            }
+          }
+          if dfs_v.length() > 0 {
+            let p = dfs_v[dfs_v.length() - 1]
+            if low[u] < low[p] {
+              low[p] = low[u]
+            }
+          }
         }
-        r = r + 1
       }
     }
-    ei = ei + 1
+    start = start + 1
   }
-  false
+  let scc_exp : Array[Bool] = []
+  let mut ci = 0
+  while ci < num_comp {
+    scc_exp.push(false)
+    ci = ci + 1
+  }
+  k = 0
+  while k < edge_w.length() {
+    if edge_w[k] == 1 {
+      let cu = comp[edge_u[k]]
+      let cv = comp[edge_v[k]]
+      if cu >= 0 && cu == cv {
+        scc_exp[cu] = true
+      }
+    }
+    k = k + 1
+  }
+  vi = 0
+  while vi < total_v {
+    let c = comp[vi]
+    if c >= 0 && scc_exp[c] {
+      tc.expansive_defs.set(node_def_key[vi], true)
+    }
+    vi = vi + 1
+  }
+  tc.expansive_ready = true
+}
+
+///|
+fn tc_def_is_expansive(tc : TypeChecker, root_is_struct : Bool, root_name : String) -> Bool {
+  if !tc.expansive_ready {
+    tc_build_expansive_cache(tc)
+  }
+  tc.expansive_defs.contains(eq_nominal_key(tc, root_is_struct, root_name))
 }
 
 ///|
@@ -4569,17 +4748,9 @@ fn collect_eq_trait_obligations_rec(
       if visited.contains(key) {
         return
       }
-      let nk = "S:" + name
-      let is_exp = sargs.length() > 0 && tc_def_is_expansive(tc, true, name)
-      if is_exp && active_expansive.contains(nk) {
-        return
-      }
-      visited.set(key, true)
-      if is_exp {
-        active_expansive.set(nk, true)
-      }
       match tc_lookup_builtin_eq_impl(tc, name) {
         Some(iinfo) => {
+          visited.set(key, true)
           let mut i = 0
           while i < sargs.length() && i < iinfo.target_param_bounds.length() {
             let btrs = iinfo.target_param_bounds[i]
@@ -4595,12 +4766,18 @@ fn collect_eq_trait_obligations_rec(
             }
             i = i + 1
           }
-          if is_exp {
-            active_expansive.remove(nk)
-          }
           return
         }
         None => ()
+      }
+      let nk = "S:" + name
+      let is_exp = sargs.length() > 0 && tc_def_is_expansive(tc, true, name)
+      if is_exp && active_expansive.contains(nk) {
+        return
+      }
+      visited.set(key, true)
+      if is_exp {
+        active_expansive.set(nk, true)
       }
       match tc_lookup_struct_info(tc, name) {
         Some(sinfo) => {
@@ -4622,17 +4799,9 @@ fn collect_eq_trait_obligations_rec(
       if visited.contains(key) {
         return
       }
-      let nk = "E:" + name
-      let is_exp = eargs.length() > 0 && tc_def_is_expansive(tc, false, name)
-      if is_exp && active_expansive.contains(nk) {
-        return
-      }
-      visited.set(key, true)
-      if is_exp {
-        active_expansive.set(nk, true)
-      }
       match tc_lookup_builtin_eq_impl(tc, name) {
         Some(iinfo) => {
+          visited.set(key, true)
           let mut i = 0
           while i < eargs.length() && i < iinfo.target_param_bounds.length() {
             let btrs = iinfo.target_param_bounds[i]
@@ -4648,12 +4817,18 @@ fn collect_eq_trait_obligations_rec(
             }
             i = i + 1
           }
-          if is_exp {
-            active_expansive.remove(nk)
-          }
           return
         }
         None => ()
+      }
+      let nk = "E:" + name
+      let is_exp = eargs.length() > 0 && tc_def_is_expansive(tc, false, name)
+      if is_exp && active_expansive.contains(nk) {
+        return
+      }
+      visited.set(key, true)
+      if is_exp {
+        active_expansive.set(nk, true)
       }
       match tc_lookup_enum_info_qualified(tc, name) {
         Some(einfo) => {
@@ -6631,7 +6806,7 @@ fn tc_check_map_keys_in_ty_rec(
           let nk = "S:" + name
           let is_exp = tc_def_is_expansive(tc, true, name)
           if is_exp && active_expansive.contains(nk) {
-            if tc_ty_mentions_param_map_rec(tc, t, Map([])) {
+            if tc_expansive_def_mentions_param_map(tc, true, name) {
               tc_err(
                 tc,
                 sp,
@@ -6677,7 +6852,7 @@ fn tc_check_map_keys_in_ty_rec(
           let nk = "E:" + name
           let is_exp = tc_def_is_expansive(tc, false, name)
           if is_exp && active_expansive.contains(nk) {
-            if tc_ty_mentions_param_map_rec(tc, t, Map([])) {
+            if tc_expansive_def_mentions_param_map(tc, false, name) {
               tc_err(
                 tc,
                 sp,
@@ -22368,6 +22543,8 @@ fn check_package_with_imports_mapped_plan(
     generic_call_sites: [],
     cur_fn_key: "",
     in_pass3: false,
+    expansive_ready: false,
+    expansive_defs: Map([]),
     eq_uses: [],
     resolved_trait_methods: Map([]),
     edit_keys: Map([]),
