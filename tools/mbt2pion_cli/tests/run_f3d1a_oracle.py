@@ -826,7 +826,48 @@ pub fn sort_hof() -> Int {
   sort_hof_with(a, fn() { a.push(8) })
   a[0]
 }
-''', "MBT2PION_ARRAY_ITER_MUTATION", "a call handing `apply(..)` a closure value"),
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `apply(..)`"),
+    "sort_alias": (r'''
+fn apply(f : () -> Unit) -> Unit {
+  f()
+}
+
+fn sort_alias_with(xs : Array[Int], touch : () -> Unit) -> Unit {
+  let g = touch
+  xs.sort_by_key(fn(x) {
+    apply(g)
+    x
+  })
+}
+
+pub fn sort_alias() -> Int {
+  let a = [3, 1, 2]
+  sort_alias_with(a, fn() { a.push(8) })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `apply(..)`"),
+    "sort_field_arg": (r'''
+struct Hook {
+  f : () -> Unit
+}
+
+fn apply(f : () -> Unit) -> Unit {
+  f()
+}
+
+fn sort_field_arg_with(xs : Array[Int], hook : Hook) -> Unit {
+  xs.sort_by_key(fn(x) {
+    apply(hook.f)
+    x
+  })
+}
+
+pub fn sort_field_arg() -> Int {
+  let a = [3, 1, 2]
+  sort_field_arg_with(a, { f: fn() { a.push(8) } })
+  a[0]
+}
+''', "MBT2PION_ARRAY_ITER_MUTATION", "key closure is not supported: the callback makes a call to `apply(..)`"),
     "sort_field": (r'''
 struct Hook {
   f : () -> Unit
