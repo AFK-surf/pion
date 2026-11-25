@@ -344,7 +344,8 @@ fn tc_is_unboxed_unit_enum(tc : TypeChecker, t : Ty) -> Bool {
 
 ///|
 fn tc_is_hashable_scalar_ty(tc : TypeChecker, t : Ty) -> Bool {
-  is_hashable_scalar_ty(t) || tc_is_unboxed_unit_enum(tc, t)
+  is_hashable_scalar_ty(t) ||
+  (tc_is_unboxed_unit_enum(tc, t) && !v_has_custom_eq_in(tc, t, []))
 }
 
 ///|
@@ -3743,9 +3744,17 @@ fn eq_has_expansive_cycle(
     let dname = def_names[qi]
     if is_st {
       match tc_lookup_builtin_eq_impl(tc, dname) {
-        Some(_) => {
-          def_tparams.push([])
-          def_fields.push([])
+        Some(iinfo) => {
+          def_tparams.push(iinfo.target_param_names)
+          let flds : Array[Ty] = []
+          let mut pi = 0
+          while pi < iinfo.target_param_names.length() && pi < iinfo.target_param_bounds.length() {
+            if str_arr_contains(iinfo.target_param_bounds[pi], "@builtin:Eq") {
+              flds.push(TParam(iinfo.target_param_names[pi]))
+            }
+            pi = pi + 1
+          }
+          def_fields.push(flds)
         }
         None =>
           match tc_lookup_struct_info(tc, dname) {
@@ -3770,9 +3779,17 @@ fn eq_has_expansive_cycle(
       }
     } else {
       match tc_lookup_builtin_eq_impl(tc, dname) {
-        Some(_) => {
-          def_tparams.push([])
-          def_fields.push([])
+        Some(iinfo) => {
+          def_tparams.push(iinfo.target_param_names)
+          let flds : Array[Ty] = []
+          let mut pi = 0
+          while pi < iinfo.target_param_names.length() && pi < iinfo.target_param_bounds.length() {
+            if str_arr_contains(iinfo.target_param_bounds[pi], "@builtin:Eq") {
+              flds.push(TParam(iinfo.target_param_names[pi]))
+            }
+            pi = pi + 1
+          }
+          def_fields.push(flds)
         }
         None =>
           match tc_lookup_enum_info_qualified(tc, dname) {
@@ -5603,7 +5620,11 @@ fn is_vmap_key_ty(tc : TypeChecker, t : Ty) -> Bool {
       }
       true
     }
-    TStruct(sname, sargs) =>
+    TStruct(sname, sargs) => {
+      match tc_lookup_builtin_eq_impl(tc, sname) {
+        Some(_) => return false
+        None => ()
+      }
       match tc_lookup_struct_info(tc, sname) {
         Some(si) => {
           let n = si.field_tys.length()
@@ -5626,6 +5647,7 @@ fn is_vmap_key_ty(tc : TypeChecker, t : Ty) -> Bool {
         }
         None => false
       }
+    }
     _ => false
   }
 }
@@ -5635,6 +5657,76 @@ fn is_valid_map_key_ty(tc : TypeChecker, k : Ty) -> Bool {
   match k {
     TString | TParam(_) | TError => true
     _ => tc_is_hashable_scalar_ty(tc, k) || is_vmap_key_ty(tc, k)
+  }
+}
+
+///|
+/// Re-checks `TMap(k, v)` types resolved during Pass 2 (before Pass 2.2
+/// registers local `impl Eq` declarations) so custom-`Eq` keys in struct
+/// fields, enum variants, function signatures, consts, aliases, traits, and
+/// impls are rejected with `E_MAP_KEY_TYPE`.
+fn tc_check_custom_eq_map_keys_in_ty(tc : TypeChecker, t : Ty, sp : Span) -> Unit {
+  match t {
+    TMap(k, v) => {
+      if v_has_custom_eq_in(tc, k, []) && !is_valid_map_key_ty(tc, k) {
+        let mut already = false
+        let mut di = 0
+        while di < tc.diagnostics.length() {
+          let d = tc.diagnostics[di]
+          if d.code == "E_MAP_KEY_TYPE" && d.file == sp.file && d.line == sp.line {
+            already = true
+            break
+          }
+          di = di + 1
+        }
+        if !already {
+          tc_err(
+            tc,
+            sp,
+            "E_MAP_KEY_TYPE",
+            "`Map` keys must be `String`, an integer/char/bool scalar, or an immutable pure-scalar tuple/POD struct (1..6 fields) without custom `impl Eq`, got `" +
+            ty_to_string(k) +
+            "`",
+            "String, scalar integer/char/bool, or immutable pure-scalar tuple/struct",
+            ty_to_string(k),
+            "use a supported scalar, tuple, or immutable POD struct key without custom `impl Eq` for `Map[K, " +
+            ty_to_string(v) +
+            "]`",
+          )
+        }
+      }
+      tc_check_custom_eq_map_keys_in_ty(tc, k, sp)
+      tc_check_custom_eq_map_keys_in_ty(tc, v, sp)
+    }
+    TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      tc_check_custom_eq_map_keys_in_ty(tc, e, sp)
+    TResult(ok, err) => {
+      tc_check_custom_eq_map_keys_in_ty(tc, ok, sp)
+      tc_check_custom_eq_map_keys_in_ty(tc, err, sp)
+    }
+    TTuple(es) => {
+      let mut i = 0
+      while i < es.length() {
+        tc_check_custom_eq_map_keys_in_ty(tc, es[i], sp)
+        i = i + 1
+      }
+    }
+    TFn(ps, ret) => {
+      let mut i = 0
+      while i < ps.length() {
+        tc_check_custom_eq_map_keys_in_ty(tc, ps[i], sp)
+        i = i + 1
+      }
+      tc_check_custom_eq_map_keys_in_ty(tc, ret, sp)
+    }
+    TStruct(_, args) | TEnum(_, args) => {
+      let mut i = 0
+      while i < args.length() {
+        tc_check_custom_eq_map_keys_in_ty(tc, args[i], sp)
+        i = i + 1
+      }
+    }
+    _ => ()
   }
 }
 
@@ -22477,8 +22569,18 @@ fn check_package_with_imports_mapped_plan(
               None => ()
             }
           }
+          match tc.structs.get(sd.name) {
+            Some(sinfo) => {
+              let mut j = 0
+              while j < sinfo.field_tys.length() {
+                tc_check_custom_eq_map_keys_in_ty(tc, sinfo.field_tys[j], sd.fields[j].span)
+                j = j + 1
+              }
+            }
+            None => ()
+          }
         }
-        DEnum(ed) =>
+        DEnum(ed) => {
           if ed.derive_eq {
             match tc.enums.get(ed.name) {
               Some(einfo) => {
@@ -22507,6 +22609,86 @@ fn check_package_with_imports_mapped_plan(
               None => ()
             }
           }
+          match tc.enums.get(ed.name) {
+            Some(einfo) => {
+              let mut vi = 0
+              while vi < einfo.variants.length() {
+                let v = einfo.variants[vi]
+                let mut j = 0
+                while j < v.field_tys.length() {
+                  tc_check_custom_eq_map_keys_in_ty(tc, v.field_tys[j], ed.variants[vi].span)
+                  j = j + 1
+                }
+                vi = vi + 1
+              }
+            }
+            None => ()
+          }
+        }
+        DFn(fd) => {
+          let finfo_opt = if fd.receiver_type != "" {
+            tc.methods.get(fd.receiver_type + "::" + fd.name)
+          } else {
+            tc.fns.get(fd.name)
+          }
+          match finfo_opt {
+            Some(finfo) => {
+              let mut pi = 0
+              while pi < finfo.param_tys.length() {
+                let psp = if pi < fd.params.length() { fd.params[pi].span } else { fd.span }
+                tc_check_custom_eq_map_keys_in_ty(tc, finfo.param_tys[pi], psp)
+                pi = pi + 1
+              }
+              tc_check_custom_eq_map_keys_in_ty(tc, finfo.ret_ty, fd.span)
+            }
+            None => ()
+          }
+        }
+        DConst(cd) =>
+          match tc.consts.get(cd.name) {
+            Some(cty) => tc_check_custom_eq_map_keys_in_ty(tc, cty, cd.span)
+            None => ()
+          }
+        DTrait(td) =>
+          match tc.traits.get(td.name) {
+            Some(tinfo) => {
+              let mut mi = 0
+              while mi < tinfo.methods.length() {
+                let tm = tinfo.methods[mi]
+                let mut pi = 0
+                while pi < tm.param_tys.length() {
+                  tc_check_custom_eq_map_keys_in_ty(tc, tm.param_tys[pi], tm.span)
+                  pi = pi + 1
+                }
+                tc_check_custom_eq_map_keys_in_ty(tc, tm.ret_ty, tm.span)
+                mi = mi + 1
+              }
+            }
+            None => ()
+          }
+        DImpl(id) => {
+          let ikey = canon_trait_name(tc, id.trait_name) + "::" + canon_target_type_name(tc, id.target_type)
+          match tc.impls.get(ikey) {
+            Some(iinfo) => {
+              let mut mi = 0
+              while mi < iinfo.method_names.length() {
+                match iinfo.methods.get(iinfo.method_names[mi]) {
+                  Some(finfo) => {
+                    let mut pi = 0
+                    while pi < finfo.param_tys.length() {
+                      tc_check_custom_eq_map_keys_in_ty(tc, finfo.param_tys[pi], finfo.decl.span)
+                      pi = pi + 1
+                    }
+                    tc_check_custom_eq_map_keys_in_ty(tc, finfo.ret_ty, finfo.decl.span)
+                  }
+                  None => ()
+                }
+                mi = mi + 1
+              }
+            }
+            None => ()
+          }
+        }
         _ => ()
       }
       di = di + 1
