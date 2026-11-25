@@ -231,6 +231,10 @@ fn get_items(h : Holder, n : Ref[Int]) -> Array[Int] {
   h.items
 }
 
+fn shrink_once(h : Holder, n : Ref[Int]) -> Unit {
+  get_items(h, n).shrink_to_fit()
+}
+
 fn later(f : () -> Unit) -> Unit {
   f()
 }
@@ -256,7 +260,7 @@ pub fn run_5() -> String {
   let r3 = "(" + ints([zs.capacity(), u.length(), zs[0]]) + ")"
   let h : Holder = { items: [4, 5, 6] }
   let n = Ref::new(0)
-  get_items(h, n).shrink_to_fit()
+  shrink_once(h, n)
   let faded : Array[Int] = [7, 8]
   later(fn() {
     faded.clear()
@@ -499,6 +503,46 @@ pub fn shrink_block_header(flag : Bool) -> Int {
   s
 }
 
+fn trim2(ys : Array[Int]) -> Unit {
+  ys.shrink_to_fit()
+}
+
+fn helper2(zs : Array[Int]) -> Unit {
+  trim2(zs)
+}
+
+pub fn shrink_two_hops() -> Int {
+  let xs : Array[Int] = Array::new(capacity=8)
+  xs.push(1)
+  xs.push(2)
+  xs.push(3)
+  let mut s = 0
+  for x in xs {
+    s = s + x
+    if x == 1 {
+      helper2(xs)
+      xs[1] = 9
+    }
+  }
+  s
+}
+
+pub fn typed_alias_pop() -> Int {
+  let xs = [1, 2, 3]
+  let ys : Array[Int] = xs
+  let it = xs.iter()
+  let _ = ys.pop()
+  it.to_array().length()
+}
+
+pub fn closure_before_iter() -> Int {
+  let xs = [1, 2, 3]
+  let f = fn() { let _ = xs.pop() }
+  let it = xs.iter()
+  f()
+  it.to_array().length()
+}
+
 pub fn paren_pipe() -> Int {
   let m : Map[Int, Int] = ([(1, 10), (2, 20), (3, 30)]) |> Map::from_array
   m.length()
@@ -640,7 +684,8 @@ def main():
                         "inside the iterator chain's callbacks", "`ys.pop(..)` runs while it is kept",
                         "may change it while it is kept", "is passed to `mutate(..)`",
                         "the iterator `it` leaves its expression", "MBT2PION_ARRAY_SHRINK_ITER",
-                        "piped into `Map::from_array`"])
+                        "piped into `Map::from_array`", "reached from `helper2`",
+                        "in a closure defined before the iterator"])
         expect_blocked(bin_path, args.pionc, md, work, "negmap", NEG_MAP_MBT, "MBT2PION_UNSUPPORTED_SYNTAX",
                        ["`Map(arr, capacity=...)` with a capacity expression that may run code"])
 
