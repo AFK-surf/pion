@@ -64,7 +64,8 @@ pub fn run_case4() -> String {
   let fail = fn(s : String) -> Int { s.length() }
   let r10 = fail("abc")
   let r11 = try { let _ = b1.fail(); bad() } catch { Bad => 7 }
-  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "," + r7.to_string() + "," + r8.to_string() + "," + r9.to_string() + "," + r10.to_string() + "," + r11.to_string()
+  let r12 = try { let fail = fn(s : String) -> Int { s.length() }; let k = fail("abc"); if k == 0 { let _ = bad() }; k } catch { Bad => 9 }
+  r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "," + r4.to_string() + "," + r5.to_string() + "," + r6.to_string() + "," + r7.to_string() + "," + r8.to_string() + "," + r9.to_string() + "," + r10.to_string() + "," + r11.to_string() + "," + r12.to_string()
 }
 pub fn run_case5() -> String {
   let s : Side = @m.Side::Left(h=4, w=3)
@@ -109,7 +110,7 @@ def main():
         open(os.path.join(pl, "pion.toml"), "w").write(f'[package]\nname = "leaf"\nversion = "0.1.0"\n[dependencies]\nmbt_compat = {{ path = "{COMPAT_DIR}" }}\norig = {{ path = "{po}" }}\nother = {{ path = "{p2}" }}\nmid = {{ path = "{pm}" }}\n')
         open(os.path.join(pl, "src", "main.pion"), "w").write('pub fn main(w : World) -> Int { io_println(w, run_all()); 0 }\n')
         pion_native, pion_wasm = run_cmd([args.pionc, "run", pl]), run_cmd([args.pionc, "run", "--target", "wasm32", pl])
-        expected = "E2-1:8\nE2-2:77\nE2-3:33,-1,-1\nE2-4:10,-9,107,5,40,9,9,9,8,3,7\nE2-5:a=12,loc=99,r=25,i=36,m=42,alt=22"
+        expected = "E2-1:8\nE2-2:77\nE2-3:33,-1,-1\nE2-4:10,-9,107,5,40,9,9,9,8,3,7,3\nE2-5:a=12,loc=99,r=25,i=36,m=42,alt=22"
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, f"MISMATCH:\nM:{moon_out}\nN:{pion_native}\nW:{pion_wasm}"
         print("[e2-oracle] PASS: 3-engine (moon wasm-gc == pion-native == pion-wasm32) 100% identical!\n" + moon_out)
     finally:
