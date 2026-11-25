@@ -101,11 +101,11 @@ pub fn f(xs : Array[Int]) -> Int {
 EOF
 check_fail s4 MBT2PION_BORROWED_ARRAY_SLICE
 
-# 5. Slice `.iter()` fails closed
+# 5. Escaping slice `.iter()` fails closed
 mkdir -p "$WORK/s5"
 cat > "$WORK/s5/t.mbt" << 'EOF'
 pub struct H { arr : Array[Int] }
-pub fn f(h : H) -> Int { h.arr[0:2].iter().count() }
+pub fn f(h : H) -> Int { let it = h.arr[0:2].iter(); it.count() }
 EOF
 check_fail s5 MBT2PION_BORROWED_ARRAY_SLICE
 

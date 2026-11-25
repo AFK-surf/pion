@@ -338,7 +338,45 @@ pub fn lower_type_tokens(
       continue
     }
     let mut piece = ""
-    if t.kind == TokenKind::PkgRef {
+    if t.kind == TokenKind::Amp && i + 1 < end {
+      // MoonBit trait object type `&Trait` / `&@pkg.Trait` -> Pion `dyn Trait` / `dyn pkg::Trait`
+      if tokens[i + 1].kind == TokenKind::UpperIdent {
+        let mut tname = tokens[i + 1].raw
+        if !symtab.local_types.contains(tname) && !symtab.active_generics.contains(tname) {
+          match symtab.using_types.get(tname) {
+            Some(ut) => tname = ut
+            None => ()
+          }
+        }
+        i = i + 2
+        if i < end && tokens[i].kind == TokenKind::LBracket {
+          let close_b = find_matching_delim(tokens, i)
+          let inner = lower_type_tokens(tokens, i + 1, close_b, symtab, recipes)
+          tname = tname + "[" + inner + "]"
+          i = close_b + 1
+        }
+        piece = "dyn " + tname
+      } else if tokens[i + 1].kind == TokenKind::PkgRef && i + 3 < end &&
+      tokens[i + 2].kind == TokenKind::Dot && tokens[i + 3].kind == TokenKind::UpperIdent {
+        let raw_pkg = tokens[i + 1].raw.slice(1, tokens[i + 1].raw.length())
+        let mapped = match symtab.pkg_aliases.get(raw_pkg) {
+          Some(p) => p
+          None => raw_pkg
+        }
+        let mut tname = mapped + "::" + tokens[i + 3].raw
+        i = i + 4
+        if i < end && tokens[i].kind == TokenKind::LBracket {
+          let close_b = find_matching_delim(tokens, i)
+          let inner = lower_type_tokens(tokens, i + 1, close_b, symtab, recipes)
+          tname = tname + "[" + inner + "]"
+          i = close_b + 1
+        }
+        piece = "dyn " + tname
+      } else {
+        piece = t.raw
+        i = i + 1
+      }
+    } else if t.kind == TokenKind::PkgRef {
       let raw_pkg = t.raw.slice(1, t.raw.length())
       let mapped = match symtab.pkg_aliases.get(raw_pkg) {
         Some(p) => p
@@ -569,6 +607,10 @@ pub struct StageAContext {
   borrowed_views : Map[String, Bool]
   struct_field_renames : Map[String, Map[String, String]]
   struct_val_fields : Map[String, String]
+  trait_methods : Map[String, Map[String, (Array[String], String)]]
+  local_method_names : Map[String, Bool]
+  ufcs_forwarders : Map[String, String]
+  all_source_texts : Array[String]
   val_probe_sites : Array[ValProbeSite]
   exported_abi_enums : Array[AbiEnumSchema]
   exported_abi_struct_vals : Array[AbiStructValRename]
@@ -602,6 +644,7 @@ pub struct StageAContext {
   mut temp_counter : Int
   mut val_site_seq : Int
   mut init_order_seq : Int
+  mut ufcs_seq : Int
 }
 
 pub fn stage_a_context_new(
@@ -625,6 +668,10 @@ pub fn stage_a_context_new(
     borrowed_views: Map(),
     struct_field_renames: Map(),
     struct_val_fields: Map(),
+    trait_methods: Map(),
+    local_method_names: Map(),
+    ufcs_forwarders: Map(),
+    all_source_texts: [],
     val_probe_sites: [],
     exported_abi_enums: [],
     exported_abi_struct_vals: [],
@@ -658,6 +705,7 @@ pub fn stage_a_context_new(
     temp_counter: 0,
     val_site_seq: 0,
     init_order_seq: 0,
+    ufcs_seq: 0,
   }
 }
 
@@ -2351,7 +2399,30 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       }
     }
   }
-  // Field access `a.b` and `.values().collect()` -> `Array[V]`
+  // Indexing `arr[idx]` -> container element type `T` (e.g. `let pool = pools[d]` -> `Pool`)
+  if t.kind == TokenKind::Ident && start + 2 < end && tokens[start + 1].kind == TokenKind::LBracket &&
+  find_matching_delim(tokens, start + 1) == end - 1 {
+    let base_ty = lookup_ident_static_type(ctx, t.raw)
+    if base_ty.length() > 0 {
+      let ety = extract_container_value_type(base_ty)
+      if ety.length() > 0 {
+        return ety
+      }
+    }
+  }
+  // Method `.last()` / `.get(...)` on local container -> `Option[T]`
+  if t.kind == TokenKind::Ident && start + 3 < end && tokens[start + 1].kind == TokenKind::Dot &&
+  (tokens[start + 2].raw == "last" || tokens[start + 2].raw == "get") &&
+  tokens[start + 3].kind == TokenKind::LParen && find_matching_delim(tokens, start + 3) == end - 1 {
+    let base_ty = lookup_ident_static_type(ctx, t.raw)
+    if base_ty.length() > 0 {
+      let ety = extract_container_value_type(base_ty)
+      if ety.length() > 0 {
+        return "Option[" + ety + "]"
+      }
+    }
+  }
+  // Field access `a.b`, `a.b[idx]`, `a.b.last()`, `a.b.get(...)`, and `.values().collect()` -> `Array[V]`
   if t.kind == TokenKind::Ident && start + 2 < end && tokens[start + 1].kind == TokenKind::Dot && tokens[start + 2].kind == TokenKind::Ident {
     let base_ty = lookup_ident_static_type(ctx, t.raw)
     if base_ty.length() > 0 {
@@ -2363,6 +2434,21 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       if cur_ty.length() > 0 {
         if start + 3 == end {
           return cur_ty
+        }
+        if start + 4 < end && tokens[start + 3].kind == TokenKind::LBracket &&
+        find_matching_delim(tokens, start + 3) == end - 1 {
+          let ety = extract_container_value_type(cur_ty)
+          if ety.length() > 0 {
+            return ety
+          }
+        }
+        if start + 5 < end && tokens[start + 3].kind == TokenKind::Dot &&
+        (tokens[start + 4].raw == "last" || tokens[start + 4].raw == "get") &&
+        tokens[start + 5].kind == TokenKind::LParen && find_matching_delim(tokens, start + 5) == end - 1 {
+          let ety = extract_container_value_type(cur_ty)
+          if ety.length() > 0 {
+            return "Option[" + ety + "]"
+          }
         }
         if start + 5 < end && tokens[start + 3].kind == TokenKind::Dot && tokens[start + 4].raw == "values" {
           let vty = extract_container_value_type(cur_ty)
@@ -3975,7 +4061,14 @@ fn try_lower_or_is_expr(
     }
     return None
   }
+  let lhs_ty = infer_simple_expr_type(ctx, tokens, i, is_idx)
+  if lhs_ty.length() > 0 {
+    push_expected_type(ctx, lhs_ty)
+  }
   let pat_str = expand_or_is_pattern(ctx, tokens, is_idx + 1, pat_end, file)
+  if lhs_ty.length() > 0 {
+    pop_expected_type(ctx)
+  }
   Some((tokens[i].leading_trivia + "(match " + lhs_str + " { " + pat_str + " => true, _ => false })", pat_end))
 }
 
@@ -4343,6 +4436,7 @@ fn try_lower_general_postfix_slice(
       outer_owned_exempt,
       has_chained_slice,
       allow_interp_top,
+      if t.kind == TokenKind::Ident { t.raw } else { "" },
       file,
     )
     let extra_tail = if extra_arg.length() > 0 { ", " + extra_arg } else { "" }
@@ -4855,6 +4949,24 @@ fn lower_one_token_or_form(
       pop_expected_type(ctx)
       let then_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
       restore_scope_vars(ctx, saved_if_sc)
+      // Unify `if cond { float_expr } else { 1.0 }` -> `Float::from_double(1.0)` when no outer expected type is set
+      if current_expected_type(ctx).trim().length() == 0 && close_b + 2 < end &&
+      tokens[close_b + 1].kind == TokenKind::Keyword && tokens[close_b + 1].raw == "else" &&
+      tokens[close_b + 2].kind == TokenKind::LBrace {
+        let else_lb = close_b + 2
+        let else_rb = find_matching_delim(tokens, else_lb)
+        if else_rb == else_lb + 2 && tokens[else_lb + 1].kind == TokenKind::FloatLit && !tokens[else_lb + 1].raw.ends_with("F") {
+          let then_ty = infer_simple_expr_type(ctx, tokens, lb + 1, close_b)
+          if then_ty == "Float" {
+            return (
+              trivia + "if" + cond_s + tokens[lb].leading_trivia + then_s +
+              tokens[close_b + 1].leading_trivia + "else" + tokens[else_lb].leading_trivia +
+              "{ Float::from_double(" + tokens[else_lb + 1].raw + ") }",
+              else_rb + 1,
+            )
+          }
+        }
+      }
       return (trivia + "if" + cond_s + tokens[lb].leading_trivia + then_s, close_b + 1)
     }
   }
@@ -5067,8 +5179,66 @@ fn lower_one_token_or_form(
       }
       pat_end = pat_end + 1
     }
+    let mut lhs_s = i
+    let mut ld = 0
+    while lhs_s > 0 {
+      let pk = tokens[lhs_s - 1].kind
+      if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace {
+        ld = ld + 1
+        lhs_s = lhs_s - 1
+        continue
+      }
+      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace {
+        if ld == 0 { break }
+        ld = ld - 1
+        lhs_s = lhs_s - 1
+        continue
+      }
+      if ld == 0 {
+        if pk == TokenKind::Bang || pk == TokenKind::AmpAmp || pk == TokenKind::PipePipe ||
+        pk == TokenKind::Comma || pk == TokenKind::Semi || pk == TokenKind::Eq ||
+        pk == TokenKind::FatArrow || pk == TokenKind::Keyword {
+          break
+        }
+        if lhs_s < i && tokens[lhs_s].newline_before {
+          break
+        }
+      }
+      lhs_s = lhs_s - 1
+    }
+    let lhs_ty = if lhs_s < i { infer_simple_expr_type(ctx, tokens, lhs_s, i) } else { "" }
+    if lhs_ty.length() > 0 {
+      push_expected_type(ctx, lhs_ty)
+    }
     let pat_str = lower_expr_range(ctx, tokens, i + 1, pat_end, file, true)
+    if lhs_ty.length() > 0 {
+      pop_expected_type(ctx)
+    }
     return (trivia + "is" + pat_str, pat_end)
+  }
+
+  // 1e. `as &Trait` / `as &@pkg.Trait` -> `as dyn Trait` / `as dyn pkg::Trait`
+  if !in_pattern && t.kind == TokenKind::Keyword && t.raw == "as" &&
+  i + 2 < end && tokens[i + 1].kind == TokenKind::Amp {
+    if tokens[i + 2].kind == TokenKind::UpperIdent {
+      let mut tname = tokens[i + 2].raw
+      if !ctx.symtab.local_types.contains(tname) && !ctx.active_generics.contains(tname) {
+        match ctx.symtab.using_types.get(tname) {
+          Some(ut) => tname = ut
+          None => ()
+        }
+      }
+      return (trivia + "as dyn " + tname, i + 3)
+    }
+    if tokens[i + 2].kind == TokenKind::PkgRef && i + 4 < end &&
+    tokens[i + 3].kind == TokenKind::Dot && tokens[i + 4].kind == TokenKind::UpperIdent {
+      let raw_pkg = tokens[i + 2].raw.slice(1, tokens[i + 2].raw.length())
+      let mapped = match ctx.symtab.pkg_aliases.get(raw_pkg) {
+        Some(p) => p
+        None => raw_pkg
+      }
+      return (trivia + "as dyn " + mapped + "::" + tokens[i + 4].raw, i + 5)
+    }
   }
 
   // 2. Arrow functions: `(a, b) => expr` AND single-param `x => expr` / `_ => expr`
@@ -5448,6 +5618,43 @@ fn lower_one_token_or_form(
         sb.write_string(arr_tmp + " })")
         return (sb.to_string(), close_br + 1)
       }
+      // Propagate `Array[T]` / `FixedArray[T]` expected element type into array literal elements
+      let exp_arr = current_expected_type(ctx).trim()
+      let arr_elem_ty = if exp_arr.starts_with("Array[") && exp_arr.ends_with("]") {
+        exp_arr.slice(6, exp_arr.length() - 1).trim()
+      } else if exp_arr.starts_with("FixedArray[") && exp_arr.ends_with("]") {
+        exp_arr.slice(11, exp_arr.length() - 1).trim()
+      } else {
+        ""
+      }
+      if arr_elem_ty.length() > 0 {
+        let sb = StringBuilder()
+        sb.write_string("[")
+        let mut ai = i + 1
+        let mut first = true
+        while ai < close_br {
+          if tokens[ai].kind == TokenKind::Comma { ai = ai + 1; continue }
+          let mut ae = ai
+          let mut ad = 0
+          while ae < close_br {
+            let ak = tokens[ae].kind
+            if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+            else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+            else if ad == 0 && ak == TokenKind::Comma { break }
+            ae = ae + 1
+          }
+          if ae > ai {
+            if !first { sb.write_string(", ") }
+            first = false
+            push_expected_type(ctx, arr_elem_ty)
+            sb.write_string(lower_expr_range(ctx, tokens, ai, ae, file, false).trim())
+            pop_expected_type(ctx)
+          }
+          ai = ae + 1
+        }
+        sb.write_string("]")
+        return (trivia + sb.to_string(), close_br + 1)
+      }
     }
   }
 
@@ -5464,7 +5671,28 @@ fn lower_one_token_or_form(
       } else if bk == TokenKind::LBrace && depth == 0 {
         let cb_try = find_matching_delim(tokens, brace_i)
         if cb_try + 1 < end && tokens[cb_try + 1].kind == TokenKind::LBrace {
-          brace_i = cb_try + 1
+          // Only treat `[brace_i, cb_try]` as a scrutinee block (e.g. `match { expr } { arms }`)
+          // when it contains NO top-level `=>` arm separator; otherwise `[brace_i, cb_try]` is
+          // already the match arms block and the following `{ ... }` is a separate statement/struct literal.
+          let mut has_top_arrow = false
+          let mut ak = brace_i + 1
+          let mut ad = 0
+          while ak < cb_try {
+            let akk = tokens[ak].kind
+            if akk == TokenKind::LParen || akk == TokenKind::LBracket || akk == TokenKind::LBrace {
+              ad = ad + 1
+            } else if akk == TokenKind::RParen || akk == TokenKind::RBracket || akk == TokenKind::RBrace {
+              if ad > 0 { ad = ad - 1 }
+            } else if ad == 0 && akk == TokenKind::FatArrow {
+              has_top_arrow = true
+              break
+            }
+            ak = ak + 1
+          }
+          if !has_top_arrow {
+            brace_i = cb_try + 1
+            continue
+          }
         }
         break
       }
@@ -6085,6 +6313,122 @@ fn lower_one_token_or_form(
         }
       }
     }
+    // `Float::to_double(x)` -> `(x).to_double()`; `Float::reinterpret_from_int(x)` -> `Float::from_bits(x)`
+    if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Float" &&
+    !ctx.symtab.local_types.contains("Float") && !ctx.active_generics.contains("Float") &&
+    !(lookup_scope_var(ctx, "Float") is Some(_)) &&
+    i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 3].kind == TokenKind::LParen {
+      let mname = tokens[i + 2].raw
+      let qual_float_fn = "Float::" + mname
+      let shadowed_float_fn = ctx.symtab.local_fn_names.contains(qual_float_fn) ||
+      ctx.symtab.fn_param_types.contains(qual_float_fn) ||
+      ctx.symtab.fn_ret_types.contains(qual_float_fn) ||
+      (ctx.cur_is_blackbox && (ctx.symtab.blackbox_fn_param_types.contains(qual_float_fn) || ctx.symtab.blackbox_fn_ret_types.contains(qual_float_fn)))
+      if !shadowed_float_fn && mname == "to_double" {
+        let close_p = find_matching_delim(tokens, i + 3)
+        push_expected_type(ctx, "Float")
+        let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+        pop_expected_type(ctx)
+        return (trivia + "(" + inner + ").to_double()", close_p + 1)
+      }
+      if !shadowed_float_fn && mname == "reinterpret_from_int" {
+        let close_p = find_matching_delim(tokens, i + 3)
+        push_expected_type(ctx, "Int")
+        let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
+        pop_expected_type(ctx)
+        return (trivia + "Float::from_bits(" + inner + ")", close_p + 1)
+      }
+    }
+    // UFCS trait method call `Trait::method(recv, args...)`:
+    // - Object-safe traits: `((recv) as dyn Trait).method(args...)` (handles concrete, `dyn Trait`, and complex `&Trait` exprs with zero helpers).
+    // - Non-object-safe traits (e.g. `-> Self` / `(Self, Self) -> Self` / associated fns): receiver is guaranteed concrete;
+    //   emit deduplicated (keyed by `"Trait::method"`) hygienic generic-bounded forwarder `fn __mbt_ufcs_<N>[__MbtT : Trait](...)`.
+    if !in_pattern && !prev_colon2 && !prev_dot && ctx.trait_methods.contains(t.raw) &&
+    i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
+    tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen {
+      let mname = rename_keyword_ident(tokens[i + 2].raw)
+      let close_p = find_matching_delim(tokens, i + 3)
+      let raw_uargs : Array[(Int, Int)] = []
+      let mut ui = i + 4
+      while ui < close_p {
+        if tokens[ui].kind == TokenKind::Comma { ui = ui + 1; continue }
+        let mut ue = ui
+        let mut ud = 0
+        while ue < close_p {
+          let uk = tokens[ue].kind
+          if uk == TokenKind::LParen || uk == TokenKind::LBracket || uk == TokenKind::LBrace { ud = ud + 1 }
+          else if uk == TokenKind::RParen || uk == TokenKind::RBracket || uk == TokenKind::RBrace { ud = ud - 1 }
+          else if ud == 0 && uk == TokenKind::Comma { break }
+          ue = ue + 1
+        }
+        if ue > ui { raw_uargs.push((ui, ue)) }
+        ui = ue + 1
+      }
+      if raw_uargs.length() >= 1 {
+        let (t_ptys, t_rty) : (Array[String], String) = match ctx.trait_methods.get(t.raw) {
+          Some(mm) => match mm.get(mname) { Some(sig) => sig, None => ([], "") }
+          None => ([], "")
+        }
+        if t_ptys.length() >= 1 && t_ptys[0] == "Self" {
+          let recv_s = lower_expr_range(ctx, tokens, raw_uargs[0].0, raw_uargs[0].1, file, false).trim()
+          let arg_sb = StringBuilder()
+          let mut ai = 1
+          while ai < raw_uargs.length() {
+            if ai > 1 { arg_sb.write_string(", ") }
+            let exp_pt = if ai < t_ptys.length() { t_ptys[ai] } else { "" }
+            if exp_pt.length() > 0 && exp_pt != "Self" { push_expected_type(ctx, exp_pt) }
+            arg_sb.write_string(lower_expr_range(ctx, tokens, raw_uargs[ai].0, raw_uargs[ai].1, file, false).trim())
+            if exp_pt.length() > 0 && exp_pt != "Self" { pop_expected_type(ctx) }
+            ai = ai + 1
+          }
+          let rest_args = arg_sb.to_string()
+          let obj_safe = is_trait_object_safe(ctx, t.raw)
+          if obj_safe && ctx.active_generics.length() == 0 {
+            return (trivia + "((" + recv_s + ") as dyn " + t.raw + ")." + mname + "(" + rest_args + ")", close_p + 1)
+          }
+          let fwd_key = t.raw + "::" + mname
+          let fwd_name = match ctx.ufcs_forwarders.get(fwd_key) {
+            Some(existing) => existing
+            None => {
+              let mut cand = "__mbt_ufcs_" + ctx.ufcs_seq.to_string()
+              ctx.ufcs_seq = ctx.ufcs_seq + 1
+              while ufcs_name_collides(ctx, cand) {
+                cand = "__mbt_ufcs_" + ctx.ufcs_seq.to_string()
+                ctx.ufcs_seq = ctx.ufcs_seq + 1
+              }
+              ctx.used_idents[cand] = true
+              ctx.ufcs_forwarders[fwd_key] = cand
+              let fp_sb = StringBuilder()
+              let fa_sb = StringBuilder()
+              fp_sb.write_string("__mbt_r : __MbtT")
+              let mut pi = 1
+              while pi < t_ptys.length() {
+                let pty_sub = replace_self_type_in_pion(t_ptys[pi], "__MbtT")
+                fp_sb.write_string(", _a" + pi.to_string() + " : " + pty_sub)
+                if pi > 1 { fa_sb.write_string(", ") }
+                fa_sb.write_string("_a" + pi.to_string())
+                pi = pi + 1
+              }
+              let ret_part = if t_rty.length() > 0 {
+                " -> " + replace_self_type_in_pion(t_rty, "__MbtT")
+              } else {
+                ""
+              }
+              ctx.lifted_fns.push(
+                "fn " + cand + "[__MbtT : " + t.raw + "](" + fp_sb.to_string() + ")" + ret_part + " {\n  __mbt_r." + mname + "(" + fa_sb.to_string() + ")\n}\n"
+              )
+              cand
+            }
+          }
+          if obj_safe {
+            let tail = if rest_args.length() > 0 { ", " + rest_args } else { "" }
+            return (trivia + "mbt_compat::__mbt_ufcs_dispatch(" + recv_s + ", \"" + mname + "\", \"" + fwd_name + "\"" + tail + ")", close_p + 1)
+          }
+          let all_args = if rest_args.length() > 0 { recv_s + ", " + rest_args } else { recv_s }
+          return (trivia + fwd_name + "(" + all_args + ")", close_p + 1)
+        }
+      }
+    }
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Map" &&
     i + 1 < end && tokens[i + 1].kind == TokenKind::LBracket {
       let close_b = find_matching_delim(tokens, i + 1)
@@ -6189,6 +6533,22 @@ fn lower_one_token_or_form(
         }
       } else {
         let _ = check_and_lower_enum_site_d2(ctx, "", "", t.raw, tokens, -1, -1, file, t.line, t.col, in_pattern)
+      }
+    }
+
+    // In pattern context: propagate `Option[T]` inner type into `Some(<pat>)`
+    if in_pattern && !prev_colon2 && !prev_dot && t.raw == "Some" &&
+    i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
+      let exp_opt = current_expected_type(ctx).trim()
+      if exp_opt.starts_with("Option[") && exp_opt.ends_with("]") {
+        let inner_ty = exp_opt.slice(7, exp_opt.length() - 1).trim()
+        let close_p = find_matching_delim(tokens, i + 1)
+        if inner_ty.length() > 0 && close_p > i + 1 {
+          push_expected_type(ctx, inner_ty)
+          let inner_pat = lower_expr_range(ctx, tokens, i + 2, close_p, file, true).trim()
+          pop_expected_type(ctx)
+          return (trivia + "Some(" + inner_pat + ")", close_p + 1)
+        }
       }
     }
 
@@ -6700,7 +7060,7 @@ fn lower_one_token_or_form(
         } else {
           name + ".length()"
         }
-        let (sl_helper, next_after, extra_arg) = classify_slice_consumer(ctx, tokens, close_br, end, own_exempt, false, ctx.in_interp_top, file)
+        let (sl_helper, next_after, extra_arg) = classify_slice_consumer(ctx, tokens, close_br, end, own_exempt, false, ctx.in_interp_top, t.raw, file)
         if sl_helper == "mbt_compat::__mbt_slice_borrow" && (ctx.borrowed_bufs.contains(name) || ctx.borrowed_views.contains(name)) {
           ctx.drift_ledger.push(DriftEntry::{
             category: "array_view_slice",
@@ -6726,6 +7086,56 @@ fn lower_one_token_or_form(
           return (trivia + name + ".set(" + idx_s + ", " + rhs_s + ")", rhs_end)
         }
         return (trivia + name + ".get(" + idx_s + ")", close_br + 1)
+      }
+    }
+
+    // Check local container expected type for `arr.unsafe_set(i, v)` / `arr.set(i, v)` / `arr.push(v)`
+    if !in_pattern && !prev_dot && !prev_cc &&
+    next_i + 2 < end && tokens[next_i].kind == TokenKind::Dot &&
+    tokens[next_i + 1].kind == TokenKind::Ident && tokens[next_i + 2].kind == TokenKind::LParen &&
+    (tokens[next_i + 1].raw == "unsafe_set" || tokens[next_i + 1].raw == "set" || tokens[next_i + 1].raw == "push") {
+      let mut arr_ty = ""
+      match lookup_scope_var(ctx, name) {
+        Some(sv) => arr_ty = sv.ty
+        None =>
+        match ctx.symtab.val_types.get(t.raw) {
+          Some(vt) => arr_ty = vt
+          None => ()
+        }
+      }
+      let elem_ty = if arr_ty.starts_with("Array[") && arr_ty.ends_with("]") {
+        arr_ty.slice(6, arr_ty.length() - 1).trim()
+      } else if arr_ty.starts_with("FixedArray[") && arr_ty.ends_with("]") {
+        arr_ty.slice(11, arr_ty.length() - 1).trim()
+      } else {
+        ""
+      }
+      if elem_ty.length() > 0 {
+        let mname = tokens[next_i + 1].raw
+        let close_p = find_matching_delim(tokens, next_i + 2)
+        if mname == "push" {
+          push_expected_type(ctx, elem_ty)
+          let a0 = lower_expr_range(ctx, tokens, next_i + 3, close_p, file, false).trim()
+          pop_expected_type(ctx)
+          return (trivia + name + ".push(" + a0 + ")", close_p + 1)
+        }
+        let mut comma_p = -1
+        let mut k = next_i + 3
+        let mut d = 0
+        while k < close_p {
+          let kk = tokens[k].kind
+          if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { d = d + 1 }
+          else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { d = d - 1 }
+          else if d == 0 && kk == TokenKind::Comma { comma_p = k; break }
+          k = k + 1
+        }
+        if comma_p > next_i + 3 && comma_p + 1 < close_p {
+          let a0 = lower_expr_range(ctx, tokens, next_i + 3, comma_p, file, false).trim()
+          push_expected_type(ctx, elem_ty)
+          let a1 = lower_expr_range(ctx, tokens, comma_p + 1, close_p, file, false).trim()
+          pop_expected_type(ctx)
+          return (trivia + name + "." + mname + "(" + a0 + ", " + a1 + ")", close_p + 1)
+        }
       }
     }
 
@@ -6892,7 +7302,7 @@ fn lower_one_token_or_form(
           } else {
             chain_str + ".length()"
           }
-          let (sl_helper, next_after, extra_arg) = classify_slice_consumer(ctx, tokens, close_br, end, false, false, ctx.in_interp_top, file)
+          let (sl_helper, next_after, extra_arg) = classify_slice_consumer(ctx, tokens, close_br, end, false, false, ctx.in_interp_top, t.raw, file)
           let extra_tail = if extra_arg.length() > 0 { ", " + extra_arg } else { "" }
           return (trivia + sl_helper + "(" + chain_str + ", " + lo + ", " + hi + extra_tail + ")", next_after)
         }
@@ -7211,6 +7621,338 @@ fn lower_cascade_chain(
   (sb.to_string(), cur)
 }
 
+///| Return true if `cand` collides with any known identifier or appears as a substring anywhere in any package source file
+///| (including nested `InterpString` `\{...}` blocks).
+fn ufcs_name_collides(ctx : StageAContext, cand : String) -> Bool {
+  if ctx.used_idents.contains(cand) {
+    return true
+  }
+  for src in ctx.all_source_texts {
+    if str_has(src, cand) {
+      return true
+    }
+  }
+  false
+}
+
+///| Return true iff every method in `tname` takes `Self` as first param and never mentions standalone `Self`
+///| in any subsequent param type or return type (i.e. safe for `as dyn Trait` dynamic dispatch).
+fn is_trait_object_safe(ctx : StageAContext, tname : String) -> Bool {
+  match ctx.trait_methods.get(tname) {
+    Some(mm) => {
+      for mk in mm.keys() {
+        match mm.get(mk) {
+          Some((pts, rty)) => {
+            if pts.length() < 1 || pts[0] != "Self" {
+              return false
+            }
+            let mut pi = 1
+            while pi < pts.length() {
+              if replace_self_type_in_pion(pts[pi], "__MbtT") != pts[pi] {
+                return false
+              }
+              pi = pi + 1
+            }
+            if rty.length() > 0 && replace_self_type_in_pion(rty, "__MbtT") != rty {
+              return false
+            }
+          }
+          None => ()
+        }
+      }
+      true
+    }
+    None => false
+  }
+}
+
+///| Replace standalone `Self` type identifier inside a Pion type string with `subst` (e.g. `__MbtT`).
+fn replace_self_type_in_pion(ty : String, subst : String) -> String {
+  if !str_has(ty, "Self") {
+    return ty
+  }
+  let toks = lex_moonbit(ty)
+  let n = toks.length() - 1
+  let sb = StringBuilder()
+  let mut last_b = 0
+  let mut k = 0
+  while k < n {
+    let tk = toks[k]
+    if tk.kind == TokenKind::UpperIdent && tk.raw == "Self" &&
+    !(k > 0 && (toks[k - 1].kind == TokenKind::Dot || toks[k - 1].kind == TokenKind::ColonColon)) {
+      sb.write_string(ty.slice(last_b, tk.start_byte))
+      sb.write_string(subst)
+      last_b = tk.end_byte
+    }
+    k = k + 1
+  }
+  sb.write_string(ty.slice(last_b, ty.length()))
+  sb.to_string()
+}
+
+///| Strict read-only pure method whitelist for E1-4 immediate slice `.iter()` consumers.
+fn slice_iter_is_pure_method(m : String) -> Bool {
+  m == "to_string" || m == "length" || m == "is_empty" || m == "abs" ||
+  m == "contains" || m == "has_prefix" || m == "has_suffix" ||
+  m == "to_int" || m == "to_double" || m == "to_float" ||
+  m == "to_int64" || m == "to_uint" || m == "trim"
+}
+
+///| Return the body start token index of an explicit inline lambda (`fn(...) { ... }`, `x => ...`, `(...) => ...`),
+///| or -1 if `[start, end)` is not a recognized explicit inline lambda.
+fn slice_iter_lambda_body_start(tokens : Array[Token], start : Int, end : Int) -> Int {
+  if start >= end {
+    return -1
+  }
+  let t0 = tokens[start]
+  if t0.kind == TokenKind::Keyword && t0.raw == "fn" &&
+  start + 1 < end && tokens[start + 1].kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, start + 1)
+    if cp > start + 1 && cp + 1 < end && tokens[cp + 1].kind == TokenKind::LBrace {
+      return cp + 1
+    }
+    return -1
+  }
+  if t0.kind == TokenKind::Ident && start + 2 < end && tokens[start + 1].kind == TokenKind::FatArrow {
+    return start + 2
+  }
+  if t0.kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, start)
+    if cp > start && cp + 2 < end && tokens[cp + 1].kind == TokenKind::FatArrow {
+      return cp + 2
+    }
+  }
+  -1
+}
+
+///| Check whether `[start, end)` is a single non-interpolated literal or simple identifier (for `take`/`drop`/`join`).
+fn slice_iter_is_simple_arg(tokens : Array[Token], start : Int, end : Int, recv_root : String) -> Bool {
+  if end != start + 1 {
+    return false
+  }
+  let tk = tokens[start]
+  if tk.kind == TokenKind::Ident {
+    return !(recv_root.length() > 0 && tk.raw == recv_root)
+  }
+  tk.kind == TokenKind::IntLit || tk.kind == TokenKind::FloatLit ||
+  tk.kind == TokenKind::StringLit || tk.kind == TokenKind::RawMultiline ||
+  tk.kind == TokenKind::CharLit || tk.kind == TokenKind::ByteCharLit ||
+  (tk.kind == TokenKind::Keyword && (tk.raw == "true" || tk.raw == "false"))
+}
+
+///| Extract parameter names of an inline lambda (`fn(x, y : T) { ... }`, `x => ...`, `(x, y) => ...`).
+fn extract_slice_lambda_params(tokens : Array[Token], start : Int, end : Int) -> Map[String, Bool] {
+  let params : Map[String, Bool] = Map()
+  if start >= end {
+    return params
+  }
+  let t0 = tokens[start]
+  if t0.kind == TokenKind::Ident && start + 1 < end && tokens[start + 1].kind == TokenKind::FatArrow {
+    params[t0.raw] = true
+    return params
+  }
+  let lp = if t0.kind == TokenKind::Keyword && t0.raw == "fn" &&
+  start + 1 < end && tokens[start + 1].kind == TokenKind::LParen {
+    start + 1
+  } else if t0.kind == TokenKind::LParen {
+    start
+  } else {
+    -1
+  }
+  if lp < 0 {
+    return params
+  }
+  let cp = find_matching_delim(tokens, lp)
+  if cp <= lp || cp >= end {
+    return params
+  }
+  let mut k = lp + 1
+  let mut depth = 0
+  let mut at_param_start = true
+  while k < cp {
+    let tk = tokens[k]
+    if tk.kind == TokenKind::LParen || tk.kind == TokenKind::LBracket || tk.kind == TokenKind::LBrace {
+      depth = depth + 1
+      at_param_start = false
+    } else if tk.kind == TokenKind::RParen || tk.kind == TokenKind::RBracket || tk.kind == TokenKind::RBrace {
+      if depth > 0 { depth = depth - 1 }
+      at_param_start = false
+    } else if depth == 0 && tk.kind == TokenKind::Comma {
+      at_param_start = true
+    } else if depth == 0 && at_param_start && tk.kind == TokenKind::Ident {
+      params[tk.raw] = true
+      at_param_start = false
+    } else if depth == 0 {
+      at_param_start = false
+    }
+    k = k + 1
+  }
+  params
+}
+
+///| E1-4 / Wave M2-F1: Strict POSITIVE allowlist for inline `.iter()` lambda bodies and pure constant exprs.
+///| Rejects every token outside the allowlist (including `InterpString`, `InterpMultiline`, `|>`, `=`, `[...]`,
+///| `::`, `@pkg`, `UpperIdent`, external identifiers, free/indirect calls, and non-whitelisted or shadowed methods).
+fn slice_iter_args_are_pure(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  lambda_params : Map[String, Bool],
+) -> Bool {
+  let mut k = start
+  while k < end {
+    let tk = tokens[k]
+    let kind = tk.kind
+    // 1. Non-interpolated literals only (InterpString / InterpMultiline strictly rejected)
+    if kind == TokenKind::IntLit || kind == TokenKind::FloatLit ||
+    kind == TokenKind::StringLit || kind == TokenKind::RawMultiline ||
+    kind == TokenKind::CharLit || kind == TokenKind::ByteCharLit {
+      k = k + 1
+      continue
+    }
+    // 2. Keywords: strictly true / false / if / else
+    if kind == TokenKind::Keyword {
+      if tk.raw == "true" || tk.raw == "false" || tk.raw == "if" || tk.raw == "else" {
+        k = k + 1
+        continue
+      }
+      return false
+    }
+    // 3. Allowed operators and punctuation (no |>, =, +=, [, ], ::, .., ?, =>, ->)
+    if kind == TokenKind::Plus || kind == TokenKind::Minus || kind == TokenKind::Star ||
+    kind == TokenKind::Slash || kind == TokenKind::Percent ||
+    kind == TokenKind::EqEq || kind == TokenKind::BangEq ||
+    kind == TokenKind::Lt || kind == TokenKind::LtEq ||
+    kind == TokenKind::Gt || kind == TokenKind::GtEq ||
+    kind == TokenKind::AmpAmp || kind == TokenKind::PipePipe || kind == TokenKind::Bang ||
+    kind == TokenKind::RParen || kind == TokenKind::LBrace || kind == TokenKind::RBrace ||
+    kind == TokenKind::Comma || kind == TokenKind::Dot || kind == TokenKind::Semi {
+      k = k + 1
+      continue
+    }
+    // LParen allowed for grouping or pure method call arg list, never indirect call `)(` or `}(`
+    if kind == TokenKind::LParen {
+      if k > start && (tokens[k - 1].kind == TokenKind::RParen || tokens[k - 1].kind == TokenKind::RBrace) {
+        return false
+      }
+      k = k + 1
+      continue
+    }
+    // 4. Ident: strictly (a) own lambda param (not called), or (b) `.pure_method(...)` on lambda param / allowlisted `(...)`
+    if kind == TokenKind::Ident {
+      let preceded_by_dot = k > start && tokens[k - 1].kind == TokenKind::Dot
+      if !preceded_by_dot {
+        if lambda_params.contains(tk.raw) && !(k + 1 < end && tokens[k + 1].kind == TokenKind::LParen) {
+          k = k + 1
+          continue
+        }
+        return false
+      }
+      // Dot method call: must be whitelisted, not shadowed locally, followed by `(`, and receiver must be lambda param or `)`
+      if slice_iter_is_pure_method(tk.raw) && !ctx.local_method_names.contains(tk.raw) &&
+      k + 1 < end && tokens[k + 1].kind == TokenKind::LParen && k >= start + 2 {
+        let rk = tokens[k - 2].kind
+        if (rk == TokenKind::Ident && lambda_params.contains(tokens[k - 2].raw) &&
+          !(k >= start + 3 && tokens[k - 3].kind == TokenKind::Dot)) ||
+        rk == TokenKind::RParen {
+          k = k + 1
+          continue
+        }
+      }
+      return false
+    }
+    // 5. Everything else (`UpperIdent`, `PkgRef`, `InterpString`, `PipeGt`, `Eq`, `[`, `]`, etc.) strictly rejected
+    return false
+  }
+  true
+}
+
+///| E1-4 / Wave M2-F1: Return true iff `.iter()` at `close_br + 1 .. close_br + 5` is immediately
+///| consumed by a pure read-only iterator chain ending in a terminal consumer (no escaping `Iter`,
+///| no mutation of backing array, positive-allowlisted inline lambda bodies only).
+fn is_pure_immediate_iter_consumer(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  after_iter : Int,
+  end : Int,
+  recv_root : String,
+) -> Bool {
+  let empty_params : Map[String, Bool] = Map()
+  let mut cur = after_iter
+  while cur + 2 < end && tokens[cur].kind == TokenKind::Dot &&
+  tokens[cur + 1].kind == TokenKind::Ident && tokens[cur + 2].kind == TokenKind::LParen {
+    let mname = tokens[cur + 1].raw
+    let close_p = find_matching_delim(tokens, cur + 2)
+    if close_p < cur + 2 || close_p >= end {
+      return false
+    }
+    // Split top-level arguments inside `(cur + 3 .. close_p)`
+    let args : Array[(Int, Int)] = []
+    let mut ai = cur + 3
+    while ai < close_p {
+      if tokens[ai].kind == TokenKind::Comma { ai = ai + 1; continue }
+      let mut ae = ai
+      let mut ad = 0
+      while ae < close_p {
+        let ak = tokens[ae].kind
+        if ak == TokenKind::LParen || ak == TokenKind::LBracket || ak == TokenKind::LBrace { ad = ad + 1 }
+        else if ak == TokenKind::RParen || ak == TokenKind::RBracket || ak == TokenKind::RBrace { ad = ad - 1 }
+        else if ad == 0 && ak == TokenKind::Comma { break }
+        ae = ae + 1
+      }
+      if ae > ai { args.push((ai, ae)) }
+      ai = ae + 1
+    }
+    if mname == "collect" || mname == "count" || mname == "to_array" {
+      return args.length() == 0
+    }
+    if mname == "rev" || mname == "enumerate" {
+      if args.length() != 0 { return false }
+      cur = close_p + 1
+      continue
+    }
+    if mname == "join" {
+      return args.length() == 1 && slice_iter_is_simple_arg(tokens, args[0].0, args[0].1, recv_root)
+    }
+    if mname == "take" || mname == "drop" {
+      if args.length() != 1 || !slice_iter_is_simple_arg(tokens, args[0].0, args[0].1, recv_root) {
+        return false
+      }
+      cur = close_p + 1
+      continue
+    }
+    if mname == "any" || mname == "all" || mname == "find_first" {
+      if args.length() != 1 { return false }
+      let bstart = slice_iter_lambda_body_start(tokens, args[0].0, args[0].1)
+      if bstart < 0 { return false }
+      let lparams = extract_slice_lambda_params(tokens, args[0].0, args[0].1)
+      return slice_iter_args_are_pure(ctx, tokens, bstart, args[0].1, lparams)
+    }
+    if mname == "map" || mname == "filter" {
+      if args.length() != 1 { return false }
+      let bstart = slice_iter_lambda_body_start(tokens, args[0].0, args[0].1)
+      if bstart < 0 { return false }
+      let lparams = extract_slice_lambda_params(tokens, args[0].0, args[0].1)
+      if !slice_iter_args_are_pure(ctx, tokens, bstart, args[0].1, lparams) {
+        return false
+      }
+      cur = close_p + 1
+      continue
+    }
+    if mname == "fold" {
+      if args.length() != 2 { return false }
+      let bstart = slice_iter_lambda_body_start(tokens, args[1].0, args[1].1)
+      if bstart < 0 { return false }
+      let lparams = extract_slice_lambda_params(tokens, args[1].0, args[1].1)
+      return slice_iter_args_are_pure(ctx, tokens, args[0].0, args[0].1, empty_params) &&
+      slice_iter_args_are_pure(ctx, tokens, bstart, args[1].1, lparams)
+    }
+    return false
+  }
+  false
+}
+
 ///| Lower match arms inside `match expr { pat => body, ... }`.
 ///| E1-4: Strictly classify immediate read-only slice consumers.
 ///| Returns `(helper_name, next_token_idx, extra_arg)`. Anything outside the exact whitelist stays `__mbt_slice_borrow` (fail-closed).
@@ -7222,6 +7964,7 @@ fn classify_slice_consumer(
   own_exempt : Bool,
   has_chained_slice : Bool,
   allow_interp_top : Bool,
+  recv_root : String,
   file : String,
 ) -> (String, Int, String) {
   let followed_by_owned = close_br + 2 < end && tokens[close_br + 1].kind == TokenKind::Dot &&
@@ -7244,6 +7987,12 @@ fn classify_slice_consumer(
   tokens[close_br + 2].raw == "is_empty" &&
   tokens[close_br + 3].kind == TokenKind::LParen && tokens[close_br + 4].kind == TokenKind::RParen {
     return ("mbt_compat::__mbt_slice_owned", close_br + 5, "\"__IS_EMPTY__\"")
+  }
+  if !has_chained_slice && close_br + 4 < end && tokens[close_br + 1].kind == TokenKind::Dot &&
+  tokens[close_br + 2].raw == "iter" &&
+  tokens[close_br + 3].kind == TokenKind::LParen && tokens[close_br + 4].kind == TokenKind::RParen &&
+  is_pure_immediate_iter_consumer(ctx, tokens, close_br + 5, end, recv_root) {
+    return ("mbt_compat::__mbt_slice_owned", close_br + 5, "\"__ITER__\"")
   }
   if !has_chained_slice && close_br + 4 < end && tokens[close_br + 1].kind == TokenKind::Dot &&
   tokens[close_br + 2].raw == "join" && tokens[close_br + 3].kind == TokenKind::LParen {
@@ -10363,6 +11112,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
   let bb_all_idents : Map[String, Bool] = Map()
   let method_seen_count : Map[String, Int] = Map()
   for sf in files {
+    ctx.all_source_texts.push(sf.content)
     let is_blackbox = sf.rel_path.ends_with("_test.mbt") && !sf.rel_path.ends_with("_wbtest.mbt")
     let bb_decls : Map[String, Bool] = if is_blackbox { ctx.symtab.blackbox_decls } else { Map() }
     let tokens = lex_moonbit(sf.content)
@@ -11005,6 +11755,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
           tokens[name_i + 3].kind == TokenKind::LParen {
             let mname = tokens[name_i + 2].raw
             let qual_fn = fn_tok.raw + "::" + mname
+            ctx.local_method_names[mname] = true
             let cp = find_matching_delim(tokens, name_i + 3)
             let (pnames, ptys, _) = extract_param_info(ctx, tokens, name_i + 3, cp, sf.rel_path)
             let pts : Array[(String, String)] = []
@@ -11015,7 +11766,10 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
               pts.push((pnames[pk], clean_pt))
               pk = pk + 1
             }
-            if !is_blackbox {
+            if is_blackbox {
+              ctx.symtab.blackbox_fn_param_types[qual_fn] = pts
+            } else {
+              ctx.symtab.local_fn_names[qual_fn] = true
               ctx.symtab.fn_param_types[qual_fn] = pts
               let p_renames = compute_param_renames(extract_raw_param_names(tokens, name_i + 3, cp))
               if p_renames.length() > 0 {
@@ -11140,6 +11894,85 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
         pop_active_generics(ctx, fn_added_g)
         next_autofill = false
       }
+      if t.kind == TokenKind::Keyword && t.raw == "impl" && i + 1 < n && tokens[i + 1].raw == "Show" {
+        ctx.local_method_names["to_string"] = true
+      }
+      if t.kind == TokenKind::Keyword && t.raw == "trait" && i + 1 < n && tokens[i + 1].kind == TokenKind::UpperIdent {
+        next_autofill = false
+        let tname = tokens[i + 1].raw
+        ctx.symtab.local_types[tname] = true
+        let mut lb = i + 2
+        while lb < n && tokens[lb].kind != TokenKind::LBrace &&
+        !(tokens[lb].newline_before && is_top_level_decl_start(tokens, lb)) {
+          lb = lb + 1
+        }
+        if lb < n && tokens[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(tokens, lb)
+          let mmap : Map[String, (Array[String], String)] = match ctx.trait_methods.get(tname) {
+            Some(m) => m
+            None => Map()
+          }
+          let mut mi = lb + 1
+          while mi < rb {
+            if tokens[mi].kind == TokenKind::Ident && mi + 1 < rb && tokens[mi + 1].kind == TokenKind::LParen {
+              let mname = rename_keyword_ident(tokens[mi].raw)
+              let cp = find_matching_delim(tokens, mi + 1)
+              let mut ret_ty = ""
+              let mut next_mi = cp + 1
+              if cp + 1 < rb && tokens[cp + 1].kind == TokenKind::Arrow {
+                let mut re = cp + 2
+                let mut rd = 0
+                while re < rb {
+                  let rk = tokens[re].kind
+                  if rd == 0 && re > cp + 2 && tokens[re].newline_before { break }
+                  if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace { rd = rd + 1 }
+                  else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace { if rd > 0 { rd = rd - 1 } }
+                  re = re + 1
+                }
+                ret_ty = lower_type_tokens(tokens, cp + 2, re, ctx.symtab, ctx.recipes).trim()
+                next_mi = re
+              }
+              let ptys : Array[String] = []
+              let mut pi = mi + 2
+              while pi < cp {
+                if tokens[pi].kind == TokenKind::Comma { pi = pi + 1; continue }
+                let mut pe = pi
+                let mut pd = 0
+                while pe < cp {
+                  let pk = tokens[pe].kind
+                  if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+                  else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+                  else if pd == 0 && pk == TokenKind::Comma { break }
+                  pe = pe + 1
+                }
+                let mut col_i = -1
+                let mut ck = pi
+                let mut cd = 0
+                while ck < pe {
+                  let ckk = tokens[ck].kind
+                  if ckk == TokenKind::LParen || ckk == TokenKind::LBracket || ckk == TokenKind::LBrace { cd = cd + 1 }
+                  else if ckk == TokenKind::RParen || ckk == TokenKind::RBracket || ckk == TokenKind::RBrace { cd = cd - 1 }
+                  else if cd == 0 && ckk == TokenKind::Colon { col_i = ck; break }
+                  ck = ck + 1
+                }
+                if col_i >= 0 && col_i + 1 < pe {
+                  ptys.push(lower_type_tokens(tokens, col_i + 1, pe, ctx.symtab, ctx.recipes).trim())
+                } else if pe > pi {
+                  ptys.push(lower_type_tokens(tokens, pi, pe, ctx.symtab, ctx.recipes).trim())
+                }
+                pi = pe + 1
+              }
+              mmap[mname] = (ptys, ret_ty)
+              mi = next_mi
+              continue
+            }
+            mi = mi + 1
+          }
+          ctx.trait_methods[tname] = mmap
+          i = rb + 1
+          continue
+        }
+      }
       if t.kind == TokenKind::Keyword && (t.raw == "test" || t.raw == "trait" || t.raw == "impl") {
         next_autofill = false
       }
@@ -11246,6 +12079,43 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
   }
   let out_sb = StringBuilder()
   let anchors : Array[DeclAnchor] = []
+  // Pre-count split `impl Trait for Type with method` declarations per `(Trait|Type)` in this file
+  // so multi-method MoonBit trait impls are merged into a single Pion `impl Trait for Type { ... }` block.
+  let impl_counts : Map[String, Int] = Map()
+  let merged_impl_methods : Map[String, Array[String]] = Map()
+  let merged_impl_seen : Map[String, Int] = Map()
+  let mut ci_scan = 0
+  while ci_scan < n {
+    if tokens[ci_scan].kind == TokenKind::Keyword && tokens[ci_scan].raw == "impl" &&
+    !(ci_scan + 1 < n && tokens[ci_scan + 1].kind == TokenKind::LBracket) {
+      let mut w_i = -1
+      let mut f_i = -1
+      let mut lb_s = ci_scan + 1
+      while lb_s < n && tokens[lb_s].kind != TokenKind::LBrace &&
+      !(tokens[lb_s].newline_before && is_top_level_decl_start(tokens, lb_s)) {
+        if tokens[lb_s].kind == TokenKind::Keyword && tokens[lb_s].raw == "for" && f_i < 0 { f_i = lb_s }
+        else if tokens[lb_s].kind == TokenKind::Keyword && tokens[lb_s].raw == "with" && w_i < 0 { w_i = lb_s }
+        lb_s = lb_s + 1
+      }
+      if f_i > ci_scan && w_i > f_i && lb_s < n && tokens[lb_s].kind == TokenKind::LBrace {
+        let tn = lower_type_tokens(tokens, ci_scan + 1, f_i, ctx.symtab, ctx.recipes).trim()
+        let st = lower_type_tokens(tokens, f_i + 1, w_i, ctx.symtab, ctx.recipes).trim()
+        let mn = if w_i + 1 < lb_s { rename_keyword_ident(tokens[w_i + 1].raw) } else { "" }
+        if !(tn == "Show" && mn == "output") && tn.length() > 0 && st.length() > 0 {
+          let ikey = tn + "|" + st
+          let prev_c = match impl_counts.get(ikey) { Some(v) => v, None => 0 }
+          impl_counts[ikey] = prev_c + 1
+        }
+        ci_scan = find_matching_delim(tokens, lb_s) + 1
+        continue
+      }
+    }
+    if tokens[ci_scan].kind == TokenKind::LBrace {
+      ci_scan = find_matching_delim(tokens, ci_scan) + 1
+      continue
+    }
+    ci_scan = ci_scan + 1
+  }
   let mut i = 0
   let mut init_seq_in_file = 0
   let file_id = sanitize_file_id(sf.rel_path)
@@ -12258,31 +13128,146 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
           open_p = open_p + 1
         }
         let close_p = if open_p < lb { find_matching_delim(tokens, open_p) } else { open_p }
+        // Look up trait method signature for filling omitted MoonBit `impl ... with` param/return types
+        let trait_sig_opt : Option[(Array[String], String)] = match ctx.trait_methods.get(trait_name) {
+          Some(mm) => mm.get(mname)
+          None => None
+        }
         let (p_str, p_pre, _) = if open_p < lb {
           lower_param_list(ctx, tokens, open_p, close_p, sf.rel_path, autofill_loc)
         } else {
           ("", "", false)
         }
-        // Ensure `self` has explicit `: SelfTy`
-        let typed_params = if p_str == "self" {
-          "self : " + self_ty
-        } else if p_str.starts_with("self,") {
-          "self : " + self_ty + p_str.slice(4, p_str.length())
+        let impl_param_scope : Array[(String, String)] = []
+        let typed_params = if open_p < lb {
+          let tp_sb = StringBuilder()
+          let mut pi = open_p + 1
+          let mut pidx = 0
+          while pi < close_p {
+            if tokens[pi].kind == TokenKind::Comma { pi = pi + 1; continue }
+            let mut pe = pi
+            let mut pd = 0
+            while pe < close_p {
+              let pk = tokens[pe].kind
+              if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+              else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+              else if pd == 0 && pk == TokenKind::Comma { break }
+              pe = pe + 1
+            }
+            if pe > pi {
+              if pidx > 0 { tp_sb.write_string(", ") }
+              let mut col_i = -1
+              let mut ck = pi
+              let mut cd = 0
+              while ck < pe {
+                let ckk = tokens[ck].kind
+                if ckk == TokenKind::LParen || ckk == TokenKind::LBracket || ckk == TokenKind::LBrace { cd = cd + 1 }
+                else if ckk == TokenKind::RParen || ckk == TokenKind::RBracket || ckk == TokenKind::RBrace { cd = cd - 1 }
+                else if cd == 0 && ckk == TokenKind::Colon { col_i = ck; break }
+                ck = ck + 1
+              }
+              let raw_pn = rename_keyword_ident(tokens[pi].raw)
+              if col_i >= 0 && col_i + 1 < pe {
+                let pty = lower_type_tokens_checked(ctx, tokens, col_i + 1, pe, sf.rel_path).trim()
+                tp_sb.write_string(raw_pn + " : " + pty)
+                impl_param_scope.push((raw_pn, pty))
+              } else if pidx == 0 && (raw_pn == "self" || raw_pn == "_self") {
+                tp_sb.write_string(raw_pn + " : " + self_ty)
+                impl_param_scope.push((raw_pn, self_ty))
+              } else {
+                let mut filled_ty = ""
+                match trait_sig_opt {
+                  Some((tptys, _)) =>
+                  if pidx < tptys.length() {
+                    filled_ty = if tptys[pidx] == "Self" { self_ty } else { tptys[pidx] }
+                  }
+                  None => ()
+                }
+                if filled_ty.length() > 0 {
+                  tp_sb.write_string(raw_pn + " : " + filled_ty)
+                  impl_param_scope.push((raw_pn, filled_ty))
+                } else {
+                  tp_sb.write_string(raw_pn)
+                  impl_param_scope.push((raw_pn, ""))
+                }
+              }
+              pidx = pidx + 1
+            }
+            pi = pe + 1
+          }
+          tp_sb.to_string()
         } else {
           p_str
         }
         let mut ret_str = ""
         if close_p + 1 < lb && tokens[close_p + 1].kind == TokenKind::Arrow {
           ret_str = " -> " + lower_type_tokens_checked(ctx, tokens, close_p + 2, lb, sf.rel_path)
-        } else if close_p + 1 < lb {
-          check_unsupported_error_tokens(ctx, tokens, close_p + 1, lb, sf.rel_path)
+        } else {
+          if close_p + 1 < lb {
+            check_unsupported_error_tokens(ctx, tokens, close_p + 1, lb, sf.rel_path)
+          }
+          match trait_sig_opt {
+            Some((_, tret)) =>
+            if tret.length() > 0 {
+              ret_str = " -> " + (if tret == "Self" { self_ty } else { tret })
+            }
+            None => ()
+          }
         }
         let saved_impl_sc = ctx.scope_vars.length()
-        if self_ty.length() > 0 && (p_str == "self" || p_str.starts_with("self,") || p_str.starts_with("self ") || p_str.starts_with("self:")) {
-          ctx.scope_vars.push(ScopeVar::{ name: "self", ty: self_ty, is_mut: false, is_boxed: false })
+        for ip in impl_param_scope {
+          if ip.0.length() > 0 && ip.0 != "_" {
+            ctx.scope_vars.push(ScopeVar::{ name: ip.0, ty: ip.1, is_mut: false, is_boxed: false })
+          }
         }
         let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, p_pre)
         restore_scope_vars(ctx, saved_impl_sc)
+        let ikey = trait_name + "|" + self_ty
+        let total_for_key = match impl_counts.get(ikey) { Some(v) => v, None => 1 }
+        if !(trait_name == "Show" && mname == "output") && total_for_key > 1 {
+          let m_entry = "  fn " + mname + "(" + typed_params + ")" + ret_str + " " + body
+          let mlist = match merged_impl_methods.get(ikey) { Some(xs) => xs, None => [] }
+          mlist.push(m_entry)
+          merged_impl_methods[ikey] = mlist
+          let seen_now = (match merged_impl_seen.get(ikey) { Some(v) => v, None => 0 }) + 1
+          merged_impl_seen[ikey] = seen_now
+          if seen_now == total_for_key {
+            let msb = StringBuilder()
+            msb.write_string("impl " + trait_name + " for " + self_ty + " {\n")
+            for me in mlist {
+              msb.write_string(me)
+              msb.write_string("\n")
+            }
+            msb.write_string("}")
+            let decl_code = msb.to_string()
+            let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[rb].end_byte)
+            out_sb.write_string(attrs_trivia.to_string() + kept_attrs.to_string() + vis_trivia)
+            let anchor_start = out_sb.to_string().length()
+            out_sb.write_string(decl_code)
+            let anchor_end = out_sb.to_string().length()
+            anchors.push(DeclAnchor::{
+              source_file: sf.rel_path,
+              decl_identity: "impl:" + trait_name + ":" + self_ty,
+              normalized_source_cst_hash: content_sha256(normalize_for_hash(src_slice)),
+              pre_overlay_generated_hash: content_sha256(decl_code),
+              start_byte: anchor_start,
+              end_byte: anchor_end,
+              line: decl_line,
+              col: decl_col,
+            })
+          }
+          let had_err = count_error_diags(ctx.diags) > decl_err_before
+          ctx.dispositions.push(DispositionEntry::{
+            file: sf.rel_path,
+            decl: "impl:" + trait_name + ":" + self_ty + "::" + mname,
+            line: decl_line,
+            col: decl_col,
+            disposition: if had_err { "unsupported" } else { "transpiled" },
+            detail: if had_err { "impl method contains unsupported syntax" } else { "impl method merged cleanly" },
+          })
+          i = rb + 1
+          continue
+        }
         let decl_code = if trait_name == "Show" && mname == "output" {
           // MoonBit `impl Show for T with output(self, logger) { ... }` -> Pion `pub fn T::to_string(self : T) -> String`
           // Wrap body in a hygienic zero-arg closure so early `return` returns `Unit` from the closure, not from `to_string`!
@@ -12660,7 +13645,86 @@ pub fn lower_file_stage_a(ctx : StageAContext, sf : SourceFile) -> GeneratedFile
         } else {
           ""
         }
-        let body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
+        let raw_body = lower_block_range(ctx, tokens, lb, rb, sf.rel_path, "")
+        // Rewrite top-level trait method signatures:
+        // - First param `Self` -> `self : Self`
+        // - Any unnamed positional param (no top-level `:`) -> `_p<idx> : <Type>`
+        // Never touches return tuples `-> (Self, Self)` or named fn-type params `f : (Self) -> Int`.
+        let btoks = lex_moonbit(raw_body)
+        let bn = btoks.length() - 1
+        let body_sb = StringBuilder()
+        let mut last_b = 0
+        let mut bdepth = 0
+        let mut pdepth = 0
+        let mut bk = 0
+        while bk < bn {
+          let btk = btoks[bk]
+          if btk.kind == TokenKind::LBrace {
+            bdepth = bdepth + 1
+          } else if btk.kind == TokenKind::RBrace {
+            bdepth = bdepth - 1
+          } else if btk.kind == TokenKind::LParen {
+            pdepth = pdepth + 1
+          } else if btk.kind == TokenKind::RParen {
+            pdepth = pdepth - 1
+          } else if bdepth == 1 && pdepth == 0 && btk.kind == TokenKind::Ident &&
+          !(bk > 0 && (btoks[bk - 1].kind == TokenKind::Colon || btoks[bk - 1].kind == TokenKind::Arrow ||
+            btoks[bk - 1].kind == TokenKind::Dot || btoks[bk - 1].kind == TokenKind::ColonColon)) &&
+          bk + 1 < bn && btoks[bk + 1].kind == TokenKind::LParen {
+            let lp_i = bk + 1
+            let cp_i = find_matching_delim(btoks, lp_i)
+            if cp_i > lp_i && cp_i < bn {
+              let segs : Array[(Int, Int)] = []
+              let mut si = lp_i + 1
+              while si < cp_i {
+                if btoks[si].kind == TokenKind::Comma { si = si + 1; continue }
+                let mut se = si
+                let mut sd = 0
+                while se < cp_i {
+                  let sk = btoks[se].kind
+                  if sk == TokenKind::LParen || sk == TokenKind::LBracket || sk == TokenKind::LBrace { sd = sd + 1 }
+                  else if sk == TokenKind::RParen || sk == TokenKind::RBracket || sk == TokenKind::RBrace { sd = sd - 1 }
+                  else if sd == 0 && sk == TokenKind::Comma { break }
+                  se = se + 1
+                }
+                if se > si { segs.push((si, se)) }
+                si = se + 1
+              }
+              let mut pi = 0
+              while pi < segs.length() {
+                let (ps, pe) = segs[pi]
+                let mut has_top_colon = false
+                let mut pk = ps
+                let mut pd2 = 0
+                while pk < pe {
+                  let pkk = btoks[pk].kind
+                  if pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace { pd2 = pd2 + 1 }
+                  else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace { pd2 = pd2 - 1 }
+                  else if pd2 == 0 && pkk == TokenKind::Colon { has_top_colon = true; break }
+                  pk = pk + 1
+                }
+                if !has_top_colon {
+                  let seg_start_b = btoks[ps].start_byte
+                  let seg_end_b = btoks[pe - 1].end_byte
+                  if pi == 0 && pe == ps + 1 && btoks[ps].kind == TokenKind::UpperIdent && btoks[ps].raw == "Self" {
+                    body_sb.write_string(raw_body.slice(last_b, seg_start_b))
+                    body_sb.write_string("self : Self")
+                    last_b = seg_end_b
+                  } else if !(btoks[ps].kind == TokenKind::Ident && btoks[ps].raw == "self") {
+                    body_sb.write_string(raw_body.slice(last_b, seg_start_b))
+                    body_sb.write_string("_p" + pi.to_string() + " : " + raw_body.slice(seg_start_b, seg_end_b))
+                    last_b = seg_end_b
+                  }
+                }
+                pi = pi + 1
+              }
+              bk = cp_i
+            }
+          }
+          bk = bk + 1
+        }
+        body_sb.write_string(raw_body.slice(last_b, raw_body.length()))
+        let body = body_sb.to_string()
         pop_active_generics(ctx, trait_added_g)
         let decl_code = vis + "trait " + tname + header_extra + " " + body
         let src_slice = sf.content.slice(tokens[decl_start].start_byte, tokens[rb].end_byte)
