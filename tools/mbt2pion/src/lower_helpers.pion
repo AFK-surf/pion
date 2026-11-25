@@ -2,6 +2,8 @@
 ///| labeled enum constructors/patterns, raising-callback fail-closed checks,
 ///| nested tuple-struct destructuring, and `[K : Hash + Eq]` generic bounds.
 
+import "json" as json
+
 // ---------------------------------------------------------------------------
 // 1. Recursive MoonBit JSON literals under expected type `mbt_compat::MbtJson`
 // ---------------------------------------------------------------------------
@@ -2574,4 +2576,578 @@ pub fn run_neg_probe_pass(
     ))
   }
   (cur_files, total_changed)
+}
+
+// 7. Wave M2-E2 (§E2-1): `pub using` ABI Canonical Re-Exports
+fn resolve_dep_pkg_alias(raw_pkg : String, pkg_aliases : Map[String, String], moon_import_paths : Map[String, String], known_pkgs : Map[String, Bool]) -> String {
+  match pkg_aliases.get(raw_pkg) { Some(p) => return p, None => () }
+  match moon_import_paths.get(raw_pkg) { Some(fp) => { let d = moon_import_default_alias(fp); if !known_pkgs.contains(raw_pkg) && d.length() > 0 { return d } }, None => () }
+  raw_pkg
+}
+fn build_dep_pub_index(dep_doc_jsons : Array[String], dep_abis : Array[(String, PackageAbi)]) -> (Map[String, Map[String, Bool]], Map[String, Map[String, Bool]], Map[String, Bool], Map[String, Map[String, AbiReexport]]) {
+  let pub_types : Map[String, Map[String, Bool]] = Map(); let pub_values : Map[String, Map[String, Bool]] = Map()
+  let known_pkgs : Map[String, Bool] = Map(); let dep_re : Map[String, Map[String, AbiReexport]] = Map()
+  for dj in dep_doc_jsons {
+    if dj.trim().length() == 0 { continue }
+    let root = match json::parse(dj) { Ok(v) => v, Err(_) => continue }
+    let pkgs = match json::obj_get(root, "packages") { Some(v) => match json::as_arr(v) { Some(a) => a, None => continue }, None => continue }
+    let last_i = pkgs.length() - 1; let mut pi = 0
+    for pkg in pkgs {
+      let pname = j_str(pkg, "name", ""); let is_root = pi == last_i; pi = pi + 1; if pname.length() == 0 { continue }
+      if is_root { known_pkgs[pname] = true }
+      let tmap = match pub_types.get(pname) { Some(m) => m, None => { let m : Map[String, Bool] = Map(); pub_types[pname] = m; m } }
+      let vmap = match pub_values.get(pname) { Some(m) => m, None => { let m : Map[String, Bool] = Map(); pub_values[pname] = m; m } }
+      let items = match json::obj_get(pkg, "items") { Some(v) => match json::as_arr(v) { Some(a) => a, None => continue }, None => continue }
+      for it in items {
+        let k = j_str(it, "kind", ""); let nm = j_str(it, "name", ""); if nm.length() == 0 { continue }
+        if k == "struct" || k == "enum" || k == "type" || k == "typealias" || k == "trait" { tmap[nm] = true }
+        else if k == "fn" || k == "let" || k == "const" || k == "var" || k == "val" || k == "global" { vmap[nm] = true }
+      }
+    }
+  }
+  for pair in dep_abis {
+    known_pkgs[pair.0] = true
+    if pair.1.reexports.length() > 0 { let rmap : Map[String, AbiReexport] = Map(); for r in pair.1.reexports { rmap[r.name] = r }; dep_re[pair.0] = rmap }
+  }
+  (pub_types, pub_values, known_pkgs, dep_re)
+}
+fn parse_using_block_items(tokens : Array[Token], lb : Int, rb : Int) -> Option[Array[(String, String)]] {
+  let out : Array[(String, String)] = []; let mut k = lb + 1
+  while k < rb {
+    let t = tokens[k]
+    if t.kind == TokenKind::Comma || t.kind == TokenKind::Semi { k = k + 1; continue }
+    if is_kw_or_id(t, "type") && k + 1 < rb && (tokens[k + 1].kind == TokenKind::UpperIdent || tokens[k + 1].kind == TokenKind::Ident) {
+      let nm = tokens[k + 1].raw; k = k + 2; if k < rb && is_kw_or_id(tokens[k], "as") { return None }; out.push(("type", nm)); continue
+    }
+    if (t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent) && t.raw != "trait" && t.raw != "as" {
+      let nm = t.raw; k = k + 1; if k < rb && is_kw_or_id(tokens[k], "as") { return None }; out.push(("value", nm)); continue
+    }
+    return None
+  }
+  Some(out)
+}
+fn resolve_reexport_chain(start_pkg : String, start_name : String, want_kind : String, dep_re : Map[String, Map[String, AbiReexport]], file : String, line : Int, col : Int, diags : Array[Diag]) -> Option[(String, String)] {
+  let mut cur_pkg = start_pkg; let mut cur_name = start_name; let visited : Map[String, Bool] = Map()
+  while true {
+    let vk = cur_pkg + "::" + cur_name
+    if visited.contains(vk) { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", file, line, col, "cyclic `pub using` involving `" + vk + "`")); return None }
+    visited[vk] = true
+    match dep_re.get(cur_pkg) {
+      Some(rmap) => match rmap.get(cur_name) {
+        Some(re) => { if want_kind.length() > 0 && re.kind != want_kind { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", file, line, col, "`pub using` kind mismatch for `" + start_name + "`")); return None }; cur_pkg = re.target_pkg; cur_name = re.target_name }
+        None => break
+      }
+      None => break
+    }
+  }
+  Some((cur_pkg, cur_name))
+}
+
+pub fn preprocess_pub_using(sources : Array[SourceFile], pkg_aliases : Map[String, String], moon_import_paths : Map[String, String], dep_doc_jsons : Array[String], dep_abis : Array[(String, PackageAbi)], diags : Array[Diag]) -> (Array[SourceFile], Array[AbiReexport]) {
+  let (pub_types, pub_values, known_pkgs, dep_re) = build_dep_pub_index(dep_doc_jsons, dep_abis)
+  let out_sources : Array[SourceFile] = []; let reexports : Array[AbiReexport] = []; let seen_exports : Map[String, String] = Map()
+  for sf in sources {
+    let toks = lex_moonbit(sf.content); let n = toks.length() - 1; let edits : Array[(Int, Int, String)] = []; let mut i = 0; let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "pub" && i + 3 < n && is_kw_or_id(toks[i + 1], "using") && toks[i + 2].kind == TokenKind::PkgRef && toks[i + 3].kind == TokenKind::LBrace {
+        let rb = find_matching_delim(toks, i + 3)
+        match parse_using_block_items(toks, i + 3, rb) {
+          Some(items) => {
+            let dep_pkg = resolve_dep_pkg_alias(toks[i + 2].raw.slice(1, toks[i + 2].raw.length()), pkg_aliases, moon_import_paths, known_pkgs)
+            for it in items {
+              match resolve_reexport_chain(dep_pkg, it.1, it.0, dep_re, sf.rel_path, t.line, t.col, diags) {
+                Some((tpkg, tname)) => {
+                  let ok = known_pkgs.contains(tpkg) && (if it.0 == "type" { match pub_types.get(tpkg) { Some(m) => m.contains(tname), None => false } } else { match pub_values.get(tpkg) { Some(m) => m.contains(tname), None => false } })
+                  if !ok { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", sf.rel_path, t.line, t.col, "`pub using` target `" + tpkg + "::" + tname + "` (" + it.0 + ") missing, private, or wrong kind")) }
+                  else {
+                    let sig = it.0 + ":" + tpkg + "::" + tname
+                    match seen_exports.get(it.1) { Some(prev) => if prev != sig { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", sf.rel_path, t.line, t.col, "conflicting `pub using` for `" + it.1 + "`")) }, None => { seen_exports[it.1] = sig; reexports.push(AbiReexport::{ name: it.1, kind: it.0, target_pkg: tpkg, target_name: tname }) } }
+                  }
+                }
+                None => ()
+              }
+            }
+            edits.push((toks[i].start_byte, toks[i + 1].start_byte, ""))
+          }
+          None => ()
+        }
+        i = rb + 1; continue
+      }
+      i = i + 1
+    }
+    out_sources.push(if edits.length() > 0 { SourceFile::{ rel_path: sf.rel_path, content: apply_byte_edits(sf.content, edits), is_test: sf.is_test } } else { sf })
+  }
+  (out_sources, reexports)
+}
+fn rewrite_reexport_snippet(src : String, file : String, pkg_aliases : Map[String, String], moon_import_paths : Map[String, String], known_pkgs : Map[String, Bool], dep_re : Map[String, Map[String, AbiReexport]], allow_using : Bool, diags : Array[Diag]) -> (String, Bool) {
+  let toks = lex_moonbit(src); let n = toks.length() - 1; let edits : Array[(Int, Int, String)] = []; let mut i = 0; let mut depth = 0
+  while i < n {
+    let t = toks[i]
+    if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+    if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+    if allow_using && depth == 0 && is_kw_or_id(t, "using") && i + 2 < n && toks[i + 1].kind == TokenKind::PkgRef && toks[i + 2].kind == TokenKind::LBrace {
+      let rb = find_matching_delim(toks, i + 2)
+      match parse_using_block_items(toks, i + 2, rb) {
+        Some(items) => {
+          let raw_pkg = toks[i + 1].raw.slice(1, toks[i + 1].raw.length())
+          let dep_pkg = resolve_dep_pkg_alias(raw_pkg, pkg_aliases, moon_import_paths, known_pkgs)
+          let mut changed = dep_pkg != raw_pkg && known_pkgs.contains(dep_pkg); let by_pkg : Map[String, Array[String]] = Map()
+          for it in items {
+            let (tpkg, tname) = match resolve_reexport_chain(dep_pkg, it.1, it.0, dep_re, file, t.line, t.col, diags) { Some(p) => p, None => (dep_pkg, it.1) }
+            if tpkg != raw_pkg || tname != it.1 { changed = true; if !known_pkgs.contains(tpkg) { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", file, t.line, t.col, "missing transitive `--dep " + tpkg + "=...` for `" + it.1 + "`")) } }
+            let arr = match by_pkg.get(tpkg) { Some(xs) => xs, None => { let xs : Array[String] = []; by_pkg[tpkg] = xs; xs } }
+            arr.push(if it.0 == "type" { "type " + tname } else { tname })
+          }
+          if changed {
+            let sb = StringBuilder(); let mut first = true
+            for pk in sorted_map_keys(by_pkg) { if !first { sb.write_string("\n") }; first = false; let xs = match by_pkg.get(pk) { Some(v) => v, None => [] }; sb.write_string("using @" + pk + " { " + join_comma(xs) + " }") }
+            edits.push((toks[i].start_byte, toks[rb].end_byte, sb.to_string()))
+          }
+        }
+        None => ()
+      }
+      i = rb + 1; continue
+    }
+    if t.kind == TokenKind::PkgRef && i + 2 < n && toks[i + 1].kind == TokenKind::Dot && (toks[i + 2].kind == TokenKind::UpperIdent || toks[i + 2].kind == TokenKind::Ident) {
+      let raw_pkg = t.raw.slice(1, t.raw.length()); let dep_pkg = resolve_dep_pkg_alias(raw_pkg, pkg_aliases, moon_import_paths, known_pkgs)
+      match dep_re.get(dep_pkg) { Some(rmap) => match rmap.get(toks[i + 2].raw) { Some(re) => if !known_pkgs.contains(re.target_pkg) { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", file, t.line, t.col, "missing transitive `--dep " + re.target_pkg + "=...`")) } else { edits.push((toks[i].start_byte, toks[i + 2].end_byte, "@" + re.target_pkg + "." + re.target_name)) }, None => () }, None => () }
+      i = i + 3; continue
+    }
+    if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let is_ml = t.kind == TokenKind::InterpMultiline; let mut any_ch = false; let sb = StringBuilder()
+      sb.write_string(if is_ml { "$|" } else { "\"" })
+      for p in split_interp_string(t.raw, is_ml) { if p.is_expr { let (ns, ch) = rewrite_reexport_snippet(p.text, file, pkg_aliases, moon_import_paths, known_pkgs, dep_re, false, diags); if ch { any_ch = true }; sb.write_string("\\{" + ns + "}") } else { sb.write_string(p.text) } }
+      if !is_ml { sb.write_string("\"") }
+      if any_ch { edits.push((t.start_byte, t.end_byte, sb.to_string())) }
+    }
+    i = i + 1
+  }
+  if edits.length() > 0 { (apply_byte_edits(src, edits), true) } else { (src, false) }
+}
+pub fn rewrite_dep_reexports(sources : Array[SourceFile], pkg_aliases : Map[String, String], moon_import_paths : Map[String, String], dep_doc_jsons : Array[String], dep_abis : Array[(String, PackageAbi)], diags : Array[Diag]) -> Array[SourceFile] {
+  let (_, _, known_pkgs, dep_re) = build_dep_pub_index(dep_doc_jsons, dep_abis)
+  if dep_re.length() == 0 && moon_import_paths.length() == 0 { return sources }
+  let out : Array[SourceFile] = []
+  for sf in sources { let (ns, ch) = rewrite_reexport_snippet(sf.content, sf.rel_path, pkg_aliases, moon_import_paths, known_pkgs, dep_re, true, diags); out.push(if ch { SourceFile::{ rel_path: sf.rel_path, content: ns, is_test: sf.is_test } } else { sf }) }
+  out
+}
+
+// 8. Wave M2-E2 (§E2-2): Controlled `suberror` / `raise` / `try ... catch`
+enum ErrFrame {
+  SourceFn(String, Option[String])
+  TryBlk(String, Bool)
+}
+
+struct ErrLowerState {
+  file : String; is_test : Bool
+  suberror_names : Map[String, Bool]; suberror_ctors : Map[String, String]
+  pkg_raise_fns : Map[String, String]; pkg_raise_methods : Map[String, String]
+  cat_a_approved : Map[String, Bool]; cat_a_rejected : Map[String, Bool]
+  failure_enum : String; outcome_enum : String
+  frames : Array[ErrFrame]; lex_raise_closures : Array[Map[String, String]]; lex_var_types : Array[Map[String, String]]
+  diags : Array[Diag]; mut need_failure : Bool; mut need_outcome : Bool; mut tmp_seq : Int
+}
+
+fn is_kw_or_id(t : Token, s : String) -> Bool { (t.kind == TokenKind::Keyword || t.kind == TokenKind::Ident) && t.raw == s }
+fn err_step_d(k : TokenKind, d : Int) -> Int { if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { d + 1 } else if (k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace) && d > 0 { d - 1 } else { d } }
+fn err_unsup(st : ErrLowerState, ln : Int, col : Int, msg : String) -> Unit { st.diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", st.file, ln, col, msg)) }
+fn err_alloc_unique(used : Map[String, Bool], base : String) -> String { let mut nm = base; let mut k = 1; while used.contains(nm) { nm = base + "_" + k.to_string(); k = k + 1 }; used[nm] = true; nm }
+fn err_lookup_raise_fn(st : ErrLowerState, name : String) -> Option[String] {
+  let mut i = st.lex_raise_closures.length() - 1
+  while i >= 0 { match st.lex_raise_closures[i].get(name) { Some(v) => return if v.length() > 0 { Some(v) } else { None }, None => () }; i = i - 1 }
+  st.pkg_raise_fns.get(name)
+}
+fn err_lookup_var_type(st : ErrLowerState, name : String) -> String {
+  let mut i = st.lex_var_types.length() - 1
+  while i >= 0 { match st.lex_var_types[i].get(name) { Some(v) => return v, None => () }; i = i - 1 }
+  ""
+}
+fn err_canon_ty(st : ErrLowerState, raw_err : String) -> String { if raw_err == "Failure" { st.need_failure = true; st.failure_enum } else { raw_err } }
+fn err_enclosing_ret_stmt(frames : Array[ErrFrame], val_expr : String) -> String {
+  if frames.length() == 0 { return "return " + val_expr }
+  match frames[frames.length() - 1] { ErrFrame::SourceFn(_, None) => "return " + val_expr, ErrFrame::SourceFn(_, Some(_)) => "return Ok(" + val_expr + ")", ErrFrame::TryBlk(_, _) => "return MbtTryRet(" + val_expr + ")" }
+}
+fn err_active_raise_stmt(st : ErrLowerState, err_expr : String, line : Int, col : Int) -> String {
+  if st.frames.length() > 0 { match st.frames[st.frames.length() - 1] { ErrFrame::TryBlk(_, true) => return "return MbtTryErr(" + err_expr + ")", ErrFrame::TryBlk(_, false) => return "return Some(" + err_expr + ")", ErrFrame::SourceFn(_, Some(_)) => return "return Err(" + err_expr + ")", ErrFrame::SourceFn(_, None) => () } }
+  err_unsup(st, line, col, "uncaught `raise` or raising call outside error handler"); "return Err(" + err_expr + ")"
+}
+fn err_enclosing_source_ret_ty(frames : Array[ErrFrame]) -> String { let mut i = frames.length() - 1; while i >= 0 { match frames[i] { ErrFrame::SourceFn(rty, _) => return rty, ErrFrame::TryBlk(_, _) => () }; i = i - 1 }; "Unit" }
+fn err_wrap_call(st : ErrLowerState, call_expr : String, line : Int, col : Int) -> String {
+  let seq = st.tmp_seq; st.tmp_seq = seq + 1; let vv = "__mbt_cv_" + seq.to_string(); let ev = "__mbt_ce_" + seq.to_string()
+  "(match " + call_expr + " { Ok(" + vv + ") => " + vv + "; Err(" + ev + ") => " + err_active_raise_stmt(st, ev, line, col) + " })"
+}
+fn err_is_builtin_stdlib_try(tokens : Array[Token], start : Int, catch_i : Int) -> Bool {
+  let mut s = start; let mut e = catch_i
+  if s < e && tokens[s].kind == TokenKind::LBrace && find_matching_delim(tokens, s) + 1 == e { s = s + 1; e = e - 1 }
+  while s < e && tokens[s].kind == TokenKind::Semi { s = s + 1 }
+  while e > s && tokens[e - 1].kind == TokenKind::Semi { e = e - 1 }
+  if s + 3 < e && tokens[s].kind == TokenKind::PkgRef && tokens[s + 1].kind == TokenKind::Dot && tokens[s + 3].kind == TokenKind::LParen && find_matching_delim(tokens, s + 3) + 1 == e { return true }
+  if s + 5 < e && tokens[s].kind == TokenKind::UpperIdent && tokens[s + 1].kind == TokenKind::LParen && tokens[s + 2].kind == TokenKind::PkgRef && tokens[s + 3].kind == TokenKind::Dot && tokens[s + 5].kind == TokenKind::LParen { let op = find_matching_delim(tokens, s + 1); if op + 1 == e && find_matching_delim(tokens, s + 5) + 1 == op { return true } }
+  false
+}
+fn err_scan_try_body(tokens : Array[Token], s : Int, e : Int) -> (Bool, Bool) {
+  let mut has_ret = false; let mut has_bc = false; let mut ld = 0; let lbds : Array[Int] = []; let mut bd = 0; let mut i = s
+  while i < e {
+    let t = tokens[i]
+    if t.kind == TokenKind::Keyword && t.raw == "fn" { let mut j = i + 1; while j < e && tokens[j].kind != TokenKind::LBrace { j = if tokens[j].kind == TokenKind::LParen || tokens[j].kind == TokenKind::LBracket { find_matching_delim(tokens, j) + 1 } else { j + 1 } }; if j < e && tokens[j].kind == TokenKind::LBrace { i = find_matching_delim(tokens, j) + 1; continue } }
+    if t.kind == TokenKind::Keyword && (t.raw == "while" || t.raw == "for" || t.raw == "loop") { ld = ld + 1; lbds.push(bd) }
+    else if t.kind == TokenKind::LBrace { bd = bd + 1 }
+    else if t.kind == TokenKind::RBrace { if bd > 0 { bd = bd - 1 }; while lbds.length() > 0 && lbds[lbds.length() - 1] == bd { let _ = lbds.pop(); if ld > 0 { ld = ld - 1 } } }
+    else if t.kind == TokenKind::Keyword && t.raw == "return" { has_ret = true }
+    else if t.kind == TokenKind::Keyword && (t.raw == "break" || t.raw == "continue") && ld == 0 { has_bc = true }
+    i = i + 1
+  }
+  (has_ret, has_bc)
+}
+fn err_find_stmt_expr_end(tokens : Array[Token], start : Int, limit : Int) -> Int {
+  let mut i = start; let mut d = 0
+  while i < limit { let t = tokens[i]; if d == 0 && (t.kind == TokenKind::Semi || t.kind == TokenKind::RBrace || t.kind == TokenKind::Comma || t.kind == TokenKind::RParen || t.kind == TokenKind::RBracket || (i > start && t.newline_before && !(t.kind == TokenKind::Keyword && t.raw == "else"))) { break }; d = err_step_d(t.kind, d); i = i + 1 }
+  i
+}
+fn err_parse_fn_header(src : String, tokens : Array[Token], fn_i : Int, limit : Int) -> Option[(String, Int, Int, String, Bool, String, Bool, Int)] {
+  let mut k = fn_i + 1
+  if k < limit && tokens[k].kind == TokenKind::LBracket { k = find_matching_delim(tokens, k) + 1 }
+  let name_sb = StringBuilder(); while k < limit && tokens[k].kind != TokenKind::LParen && tokens[k].kind != TokenKind::LBrace { name_sb.write_string(tokens[k].raw); k = k + 1 }
+  if k >= limit || tokens[k].kind != TokenKind::LParen { return None }
+  let open_p = k; let close_p = find_matching_delim(tokens, open_p); let mut has_rp = false; let mut pi = open_p + 1
+  while pi < close_p { if is_kw_or_id(tokens[pi], "raise") { has_rp = true; break }; pi = pi + 1 }
+  let mut cur = close_p + 1; let mut ret_ty = "Unit"; let mut has_r = false; let mut err_ty = ""
+  if cur < limit && tokens[cur].kind == TokenKind::Arrow {
+    let rt_s = cur + 1; let mut rt_e = rt_s; let mut rd = 0
+    while rt_e < limit { if rd == 0 && (tokens[rt_e].kind == TokenKind::LBrace || tokens[rt_e].kind == TokenKind::Eq) { break }; if rd == 0 && is_kw_or_id(tokens[rt_e], "raise") { has_r = true; break }; rd = err_step_d(tokens[rt_e].kind, rd); rt_e = rt_e + 1 }
+    if rt_e > rt_s { ret_ty = src.slice(tokens[rt_s].start_byte, tokens[rt_e - 1].end_byte).trim() }
+    cur = rt_e
+  } else if cur < limit && is_kw_or_id(tokens[cur], "raise") { has_r = true }
+  if has_r { cur = cur + 1; let et_s = cur; while cur < limit && tokens[cur].kind != TokenKind::LBrace && tokens[cur].kind != TokenKind::Eq { cur = cur + 1 }; if cur > et_s { err_ty = src.slice(tokens[et_s].start_byte, tokens[cur - 1].end_byte).trim() } }
+  while cur < limit && tokens[cur].kind != TokenKind::LBrace { if tokens[cur].kind == TokenKind::Eq { return None }; cur = cur + 1 }
+  if cur >= limit || tokens[cur].kind != TokenKind::LBrace { return None }
+  Some((name_sb.to_string(), open_p, close_p, ret_ty, has_r, err_ty, has_rp, cur))
+}
+fn err_seed_param_types(tokens : Array[Token], open_p : Int, close_p : Int, fn_name : String, vmap : Map[String, String], cmap : Map[String, String]) -> Unit {
+  let cc = fn_name.index_of("::"); if cc > 0 { vmap["self"] = fn_name.slice(0, cc) }
+  let mut k = open_p + 1; let mut d = 0
+  while k < close_p {
+    if d == 0 && (tokens[k].kind == TokenKind::Ident || tokens[k].kind == TokenKind::Keyword) {
+      let pn = tokens[k].raw
+      if pn != "mut" { cmap[pn] = ""; let mut ti = k + 1; if ti < close_p && (tokens[ti].kind == TokenKind::Tilde || tokens[ti].kind == TokenKind::Question) { ti = ti + 1 }; if ti + 1 < close_p && tokens[ti].kind == TokenKind::Colon && tokens[ti + 1].kind == TokenKind::UpperIdent { vmap[pn] = tokens[ti + 1].raw } else if pn != "self" { vmap[pn] = "" } }
+      while k < close_p && !(d == 0 && tokens[k].kind == TokenKind::Comma) { d = err_step_d(tokens[k].kind, d); k = k + 1 }
+    }
+    k = k + 1
+  }
+}
+fn err_validate_catch_arms(st : ErrLowerState, tokens : Array[Token], lb : Int, rb : Int, is_failure : Bool) -> String {
+  let mut inf = ""; let mut k = lb + 1; let mut d = 0; let cv : Map[String, Bool] = Map(); let mut arm_s = k
+  while k <= rb {
+    if k == rb || (d == 0 && (tokens[k].kind == TokenKind::Semi || (k > arm_s && tokens[k].newline_before))) {
+      let mut fa = arm_s; let mut ad = 0; while fa < k && !(ad == 0 && tokens[fa].kind == TokenKind::FatArrow) { ad = err_step_d(tokens[fa].kind, ad); fa = fa + 1 }
+      if fa < k && tokens[fa].kind == TokenKind::FatArrow {
+        let mut p = arm_s
+        while p < fa {
+          let pt = tokens[p]
+          if pt.kind == TokenKind::UpperIdent {
+            if pt.raw == "Failure" {
+              inf = "Failure"
+              if p + 1 < fa && tokens[p + 1].kind == TokenKind::LParen { let cp = find_matching_delim(tokens, p + 1); let mut pi = p + 2; while pi < cp { if tokens[pi].kind != TokenKind::Underscore && tokens[pi].kind != TokenKind::Comma { err_unsup(st, pt.line, pt.col, "binding `Failure(...)` payload is unsupported"); break }; pi = pi + 1 }; p = cp + 1; continue }
+            } else { match st.suberror_ctors.get(pt.raw) { Some(en) => if inf.length() == 0 { inf = en }, None => () } }
+          } else if pt.kind == TokenKind::Ident && p == arm_s && fa == arm_s + 1 { cv[pt.raw] = true; if is_failure { err_unsup(st, pt.line, pt.col, "binding `Failure` to `" + pt.raw + "` is unsupported") } }
+          p = p + 1
+        }
+        let mut b = fa + 1; while b + 2 < k { if tokens[b].kind == TokenKind::Ident && cv.contains(tokens[b].raw) && tokens[b + 1].kind == TokenKind::Dot && tokens[b + 2].raw == "to_string" { err_unsup(st, tokens[b].line, tokens[b].col, "calling `.to_string()` on caught error is unsupported") }; b = b + 1 }
+        arm_s = k + (if k < rb && tokens[k].kind == TokenKind::Semi { 1 } else { 0 })
+      }
+    }
+    if k < rb { d = err_step_d(tokens[k].kind, d) }; k = k + 1
+  }
+  inf
+}
+fn err_infer_body_err_ty(st : ErrLowerState, tokens : Array[Token], s : Int, e : Int) -> (String, Bool) {
+  let mut found = ""; let mut mixed = false; let mut i = s
+  while i < e {
+    let t = tokens[i]; let mut cand = ""
+    if is_kw_or_id(t, "raise") && i + 1 < e && tokens[i + 1].kind == TokenKind::UpperIdent { cand = if tokens[i + 1].raw == "Failure" { "Failure" } else { match st.suberror_ctors.get(tokens[i + 1].raw) { Some(en) => en, None => "" } } }
+    else if t.kind == TokenKind::Ident && t.raw == "fail" && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen { cand = "Failure" }
+    else if t.kind == TokenKind::Ident && i + 1 < e && tokens[i + 1].kind == TokenKind::LParen && !(i > s && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) { match err_lookup_raise_fn(st, t.raw) { Some(et) => cand = et, None => () } }
+    else if t.kind == TokenKind::UpperIdent && i + 3 < e && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen { match st.pkg_raise_methods.get(t.raw + "::" + tokens[i + 2].raw) { Some(et) => cand = et, None => () } }
+    else if t.kind == TokenKind::Ident && i + 3 < e && tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen { let rty = err_lookup_var_type(st, t.raw); if rty.length() > 0 { match st.pkg_raise_methods.get(rty + "::" + tokens[i + 2].raw) { Some(et) => cand = et, None => () } } }
+    if cand.length() > 0 { let cn = if cand == st.failure_enum { "Failure" } else { cand }; if found.length() == 0 { found = cn } else if found != cn { mixed = true } }
+    i = i + 1
+  }
+  (found, mixed)
+}
+fn err_body_ends_with_return_or_raise(tokens : Array[Token], lb : Int, rb : Int) -> Bool {
+  let mut s = lb + 1; while s < rb && tokens[s].kind == TokenKind::Semi { s = s + 1 }
+  if s >= rb || !(is_kw_or_id(tokens[s], "raise") || (tokens[s].kind == TokenKind::Keyword && tokens[s].raw == "return")) { return false }
+  let mut k = err_find_stmt_expr_end(tokens, s + 1, rb); while k < rb && tokens[k].kind == TokenKind::Semi { k = k + 1 }; k >= rb
+}
+
+fn lower_err_range(st : ErrLowerState, src : String, tokens : Array[Token], start : Int, end : Int) -> String {
+  let sb = StringBuilder(); let mut i = start
+  while i < end {
+    let t = tokens[i]
+    if t.kind == TokenKind::LBrace {
+      let rb = find_matching_delim(tokens, i); st.lex_raise_closures.push(Map()); st.lex_var_types.push(Map())
+      sb.write_string(t.leading_trivia + "{" + lower_err_range(st, src, tokens, i + 1, rb) + tokens[rb].leading_trivia + "}")
+      let _ = st.lex_raise_closures.pop(); let _ = st.lex_var_types.pop(); i = rb + 1; continue
+    }
+    if t.kind == TokenKind::Keyword && t.raw == "let" && i + 1 < end {
+      let ni = if tokens[i + 1].kind == TokenKind::Keyword && tokens[i + 1].raw == "mut" { i + 2 } else { i + 1 }
+      if ni < end && tokens[ni].kind == TokenKind::Ident {
+        let vname = tokens[ni].raw; let mut eq_i = ni + 1; let mut ann_ty = ""
+        if eq_i + 1 < end && tokens[eq_i].kind == TokenKind::Colon {
+          if tokens[eq_i + 1].kind == TokenKind::UpperIdent { ann_ty = tokens[eq_i + 1].raw }
+          let mut td = 0; while eq_i < end && !(td == 0 && tokens[eq_i].kind == TokenKind::Eq) { td = err_step_d(tokens[eq_i].kind, td); eq_i = eq_i + 1 }
+        }
+        if eq_i + 1 < end && tokens[eq_i].kind == TokenKind::Eq {
+          if tokens[eq_i + 1].kind == TokenKind::Keyword && tokens[eq_i + 1].raw == "fn" {
+            match err_parse_fn_header(src, tokens, eq_i + 1, end) {
+              Some((_, op, cp, rty, has_r, ety, has_rp, clb)) => if has_r || has_rp {
+                let crb = find_matching_delim(tokens, clb)
+                if has_rp || ety == "Error" || (ety.length() == 0 && !st.is_test) || (ety.length() > 0 && ety != "Failure" && !st.suberror_names.contains(ety)) { err_unsup(st, tokens[eq_i + 1].line, tokens[eq_i + 1].col, "unsupported `raise` in local closure `" + vname + "`") }
+                else if ety.length() > 0 {
+                  let ce = err_canon_ty(st, ety); st.lex_raise_closures[st.lex_raise_closures.length() - 1][vname] = ce; st.lex_var_types[st.lex_var_types.length() - 1][vname] = ""
+                  let pm : Map[String, String] = Map(); let cm : Map[String, String] = Map(); err_seed_param_types(tokens, op, cp, "", pm, cm)
+                  st.lex_var_types.push(pm); st.lex_raise_closures.push(cm); st.frames.push(ErrFrame::SourceFn(rty, Some(ce)))
+                  let bt = lower_err_range(st, src, tokens, clb + 1, crb); let _ = st.frames.pop(); let _ = st.lex_raise_closures.pop(); let _ = st.lex_var_types.pop()
+                  let w = if err_body_ends_with_return_or_raise(tokens, clb, crb) { bt } else if rty == "Unit" { bt + "; Ok(())" } else { " Ok({" + bt + " })" }
+                  sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[eq_i].end_byte) + " fn" + src.slice(tokens[op].start_byte, tokens[cp].end_byte) + " -> Result[" + rty + ", " + ce + "] {" + w + " }"); i = crb + 1; continue
+                }
+              }
+              None => ()
+            }
+          }
+          let rhs_end = err_find_stmt_expr_end(tokens, eq_i + 1, end)
+          sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[eq_i].end_byte) + lower_err_range(st, src, tokens, eq_i + 1, rhs_end))
+          if ann_ty.length() == 0 && eq_i + 2 < rhs_end && tokens[eq_i + 1].kind == TokenKind::UpperIdent && tokens[eq_i + 2].kind == TokenKind::ColonColon { ann_ty = tokens[eq_i + 1].raw }
+          st.lex_raise_closures[st.lex_raise_closures.length() - 1][vname] = ""; st.lex_var_types[st.lex_var_types.length() - 1][vname] = ann_ty; i = rhs_end; continue
+        }
+      }
+    }
+    if t.kind == TokenKind::Keyword && t.raw == "fn" {
+      match err_parse_fn_header(src, tokens, i, end) {
+        Some((_, op, cp, rty, has_r, _, has_rp, clb)) => {
+          let crb = find_matching_delim(tokens, clb); if has_r || has_rp { err_unsup(st, t.line, t.col, "unsupported inline raising closure") }
+          let pm : Map[String, String] = Map(); let cm : Map[String, String] = Map(); err_seed_param_types(tokens, op, cp, "", pm, cm)
+          st.lex_var_types.push(pm); st.lex_raise_closures.push(cm); st.frames.push(ErrFrame::SourceFn(rty, None))
+          sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[clb].end_byte) + lower_err_range(st, src, tokens, clb + 1, crb) + tokens[crb].leading_trivia + "}")
+          let _ = st.frames.pop(); let _ = st.lex_raise_closures.pop(); let _ = st.lex_var_types.pop(); i = crb + 1; continue
+        }
+        None => ()
+      }
+    }
+    if is_kw_or_id(t, "try") {
+      if i + 1 < end && (tokens[i + 1].kind == TokenKind::Bang || tokens[i + 1].kind == TokenKind::Question) { err_unsup(st, t.line, t.col, "`try!` / `try?` is unsupported"); sb.write_string(t.leading_trivia + t.raw); i = i + 1; continue }
+      let mut body_s = i + 1; let mut body_e = i + 1; let mut catch_i = -1
+      if i + 1 < end && tokens[i + 1].kind == TokenKind::LBrace { let tb = find_matching_delim(tokens, i + 1); body_s = i + 2; body_e = tb; if tb + 1 < end && is_kw_or_id(tokens[tb + 1], "catch") { catch_i = tb + 1 } }
+      else { let mut sc = i + 1; let mut sd = 0; while sc < end { if sd == 0 && is_kw_or_id(tokens[sc], "catch") { catch_i = sc; break }; sd = err_step_d(tokens[sc].kind, sd); sc = sc + 1 }; body_e = catch_i }
+      if catch_i < 0 || catch_i + 1 >= end || tokens[catch_i + 1].kind != TokenKind::LBrace { err_unsup(st, t.line, t.col, "unsupported `try` without `catch`"); sb.write_string(t.leading_trivia + t.raw); i = i + 1; continue }
+      let catch_lb = catch_i + 1; let catch_rb = find_matching_delim(tokens, catch_lb)
+      if catch_rb + 1 < end && is_kw_or_id(tokens[catch_rb + 1], "noraise") { err_unsup(st, tokens[catch_rb + 1].line, tokens[catch_rb + 1].col, "`try ... catch ... noraise` is unsupported"); sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte)); i = catch_rb + 1; continue }
+      if err_is_builtin_stdlib_try(tokens, i + 1, catch_i) { sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte)); i = catch_rb + 1; continue }
+      let diag_before = st.diags.length()
+      let (has_ret, has_bc) = err_scan_try_body(tokens, body_s, body_e); if has_bc { err_unsup(st, t.line, t.col, "`break`/`continue` across `try` boundary is unsupported") }
+      let (body_et, mixed_et) = err_infer_body_err_ty(st, tokens, body_s, body_e); if mixed_et { err_unsup(st, t.line, t.col, "polymorphic or mixed error types in `try` are unsupported") }
+      let catch_et = err_validate_catch_arms(st, tokens, catch_lb, catch_rb, body_et == "Failure"); if catch_et == "Failure" && body_et != "Failure" { let _ = err_validate_catch_arms(st, tokens, catch_lb, catch_rb, true) }
+      let raw_et = if body_et.length() > 0 { body_et } else { catch_et }; if raw_et.length() == 0 { err_unsup(st, t.line, t.col, "cannot infer concrete closed error type for `try`") }
+      if st.diags.length() > diag_before { sb.write_string(t.leading_trivia + src.slice(t.start_byte, tokens[catch_rb].end_byte)); i = catch_rb + 1; continue }
+      let canon_et = err_canon_ty(st, raw_et); if has_ret { st.need_outcome = true }
+      let seq = st.tmp_seq; st.tmp_seq = seq + 1; let fn_v = "__mbt_try_" + seq.to_string(); let val_v = "__mbt_tval_" + seq.to_string(); let vv = "__mbt_tv_" + seq.to_string(); let ev = "__mbt_te_" + seq.to_string(); let rv = "__mbt_tr_" + seq.to_string(); let src_ret = err_enclosing_source_ret_ty(st.frames)
+      st.frames.push(ErrFrame::TryBlk(canon_et, has_ret)); st.lex_raise_closures.push(Map()); st.lex_var_types.push(Map())
+      let lb_txt = lower_err_range(st, src, tokens, body_s, body_e); let _ = st.lex_var_types.pop(); let _ = st.lex_raise_closures.pop(); let _ = st.frames.pop()
+      let lc_txt = lower_err_range(st, src, tokens, catch_lb + 1, catch_rb); let unwrap_v = "match " + val_v + " { Some(" + vv + ") => " + vv + "; None => abort(\"unreachable\") }"
+      sb.write_string(t.leading_trivia + (if has_ret { "{ let mut " + val_v + " = None; let " + fn_v + " = fn() -> " + st.outcome_enum + "[" + src_ret + ", " + canon_et + "] { " + val_v + " = Some({" + lb_txt + " }); MbtTryOk }; match " + fn_v + "() { MbtTryOk => " + unwrap_v + "; MbtTryRet(" + rv + ") => " + err_enclosing_ret_stmt(st.frames, rv) + "; MbtTryErr(" + ev + ") => match " + ev + " {" + lc_txt + " } } }" } else { "{ let mut " + val_v + " = None; let " + fn_v + " = fn() -> Option[" + canon_et + "] { " + val_v + " = Some({" + lb_txt + " }); None }; match " + fn_v + "() { None => " + unwrap_v + "; Some(" + ev + ") => match " + ev + " {" + lc_txt + " } } }" }))
+      i = catch_rb + 1; continue
+    }
+    if is_kw_or_id(t, "raise") { let ee = err_find_stmt_expr_end(tokens, i + 1, end); sb.write_string(t.leading_trivia + err_active_raise_stmt(st, lower_err_range(st, src, tokens, i + 1, ee).trim(), t.line, t.col)); i = ee; continue }
+    if t.kind == TokenKind::Keyword && t.raw == "return" && st.frames.length() > 0 {
+      let need_rw = match st.frames[st.frames.length() - 1] { ErrFrame::SourceFn(_, None) => false, _ => true }
+      if need_rw {
+        let bare = i + 1 >= end || tokens[i + 1].kind == TokenKind::Semi || tokens[i + 1].kind == TokenKind::RBrace || tokens[i + 1].kind == TokenKind::Comma || tokens[i + 1].kind == TokenKind::RParen || tokens[i + 1].kind == TokenKind::RBracket || tokens[i + 1].newline_before
+        let ee = if bare { i + 1 } else { err_find_stmt_expr_end(tokens, i + 1, end) }
+        sb.write_string(t.leading_trivia + err_enclosing_ret_stmt(st.frames, if bare { "()" } else { lower_err_range(st, src, tokens, i + 1, ee).trim() }))
+        i = ee; continue
+      }
+    }
+    if t.kind == TokenKind::Ident && t.raw == "fail" && i + 1 < end && tokens[i + 1].kind == TokenKind::LParen && !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) && st.frames.length() > 0 && st.failure_enum.length() > 0 {
+      let active_et = match st.frames[st.frames.length() - 1] { ErrFrame::TryBlk(et, _) => et, ErrFrame::SourceFn(_, Some(et)) => et, _ => "" }
+      if active_et == st.failure_enum { let cp = find_matching_delim(tokens, i + 1); sb.write_string(t.leading_trivia + err_active_raise_stmt(st, "Failure(" + lower_err_range(st, src, tokens, i + 2, cp) + ")", t.line, t.col)); i = cp + 1; continue }
+    }
+    if t.kind == TokenKind::UpperIdent && i + 2 < end && tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::Ident {
+      let qk = t.raw + "::" + tokens[i + 2].raw
+      if st.pkg_raise_methods.contains(qk) {
+        if i + 3 < end && tokens[i + 3].kind == TokenKind::LParen { let cp = find_matching_delim(tokens, i + 3); sb.write_string(t.leading_trivia + err_wrap_call(st, qk + "(" + lower_err_range(st, src, tokens, i + 4, cp) + ")", t.line, t.col)); i = cp + 1; continue }
+        err_unsup(st, t.line, t.col, "raising method `" + qk + "` cannot be used as a function value")
+      }
+    }
+    if t.kind == TokenKind::Ident && i + 3 < end && tokens[i + 1].kind == TokenKind::Dot && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 3].kind == TokenKind::LParen && !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) {
+      let rty = err_lookup_var_type(st, t.raw)
+      if rty.length() > 0 && st.pkg_raise_methods.contains(rty + "::" + tokens[i + 2].raw) { let cp = find_matching_delim(tokens, i + 3); sb.write_string(t.leading_trivia + err_wrap_call(st, t.raw + "." + tokens[i + 2].raw + "(" + lower_err_range(st, src, tokens, i + 4, cp) + ")", t.line, t.col)); i = cp + 1; continue }
+    }
+    if t.kind == TokenKind::Ident && !(i > start && (tokens[i - 1].kind == TokenKind::Dot || tokens[i - 1].kind == TokenKind::ColonColon)) && !(i + 1 < end && (tokens[i + 1].kind == TokenKind::Colon || tokens[i + 1].kind == TokenKind::Eq || tokens[i + 1].kind == TokenKind::Tilde)) {
+      match err_lookup_raise_fn(st, t.raw) {
+        Some(_) =>
+        if i + 1 < end && tokens[i + 1].kind == TokenKind::LParen { let cp = find_matching_delim(tokens, i + 1); sb.write_string(t.leading_trivia + err_wrap_call(st, t.raw + "(" + lower_err_range(st, src, tokens, i + 2, cp) + ")", t.line, t.col)); i = cp + 1; continue }
+        else { err_unsup(st, t.line, t.col, "raising function `" + t.raw + "` cannot be used as a function value") }
+        None => ()
+      }
+    }
+    sb.write_string(t.leading_trivia + t.raw); i = i + 1
+  }
+  sb.to_string()
+}
+
+pub fn preprocess_controlled_errors(sources : Array[SourceFile], diags : Array[Diag]) -> Array[SourceFile] {
+  let all_toks : Array[Array[Token]] = []; let mut any_err_kw = false; let used_idents : Map[String, Bool] = Map()
+  for sf in sources {
+    let toks = lex_moonbit(sf.content); let mut i = 0
+    while i < toks.length() - 1 {
+      let t = toks[i]
+      if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent { used_idents[t.raw] = true }
+      if is_kw_or_id(t, "suberror") || is_kw_or_id(t, "raise") || is_kw_or_id(t, "try") { any_err_kw = true }
+      i = i + 1
+    }
+    all_toks.push(toks)
+  }
+  if !any_err_kw { return sources }
+  let failure_enum = err_alloc_unique(used_idents, "MbtFailure"); let outcome_enum = err_alloc_unique(used_idents, "MbtTryOutcome")
+  let suberror_names : Map[String, Bool] = Map(); let suberror_ctors : Map[String, String] = Map()
+  let pkg_raise_fns : Map[String, String] = Map(); let pkg_raise_methods : Map[String, String] = Map()
+  let cat_a_cands : Map[String, (String, Int, Int)] = Map(); let cat_a_rejected : Map[String, Bool] = Map()
+  let fn_callees : Map[String, Array[String]] = Map(); let called_in_try : Map[String, Bool] = Map()
+
+  let mut fi = 0
+  while fi < sources.length() {
+    let toks = all_toks[fi]; let n = toks.length() - 1; let mut i = 0; let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && is_kw_or_id(t, "suberror") && i + 1 < n && toks[i + 1].kind == TokenKind::UpperIdent {
+        let en = toks[i + 1].raw; suberror_names[en] = true; suberror_ctors[en] = en
+        if i + 2 < n && toks[i + 2].kind == TokenKind::LBrace { let rb = find_matching_delim(toks, i + 2); let mut k = i + 3; let mut bd = 0; while k < rb { if bd == 0 && toks[k].kind == TokenKind::UpperIdent && (k == i + 3 || toks[k].newline_before || toks[k - 1].kind == TokenKind::Semi) { suberror_ctors[toks[k].raw] = en }; bd = err_step_d(toks[k].kind, bd); k = k + 1 }; i = rb + 1; continue }
+      }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  fi = 0
+  while fi < sources.length() {
+    let sf = sources[fi]; let toks = all_toks[fi]; let n = toks.length() - 1; let mut i = 0; let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "fn" {
+        let is_pub = (i > 0 && toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "pub") || (i >= 4 && toks[i - 1].kind == TokenKind::RParen && toks[i - 3].kind == TokenKind::LParen && toks[i - 4].kind == TokenKind::Keyword && toks[i - 4].raw == "pub")
+        match err_parse_fn_header(sf.content, toks, i, n) {
+          Some((fname, _, _, _, has_r, ety, has_rp, lb)) => {
+            let rb = find_matching_delim(toks, lb); let callees : Array[String] = []; let mut k = lb + 1; let mut td = 0; let t_ends : Array[Int] = []; let mut body_err = false
+            while k < rb {
+              while t_ends.length() > 0 && k >= t_ends[t_ends.length() - 1] { let _ = t_ends.pop(); if td > 0 { td = td - 1 } }
+              let kt = toks[k]
+              if is_kw_or_id(kt, "raise") || is_kw_or_id(kt, "try") || is_kw_or_id(kt, "catch") { body_err = true }
+              if is_kw_or_id(kt, "try") && k + 1 < rb && toks[k + 1].kind == TokenKind::LBrace { td = td + 1; t_ends.push(find_matching_delim(toks, k + 1)) }
+              if kt.kind == TokenKind::Ident && k + 1 < rb && toks[k + 1].kind == TokenKind::LParen && !(k > lb + 1 && (toks[k - 1].kind == TokenKind::Dot || toks[k - 1].kind == TokenKind::ColonColon)) { callees.push(kt.raw); if td > 0 { called_in_try[kt.raw] = true } }
+              k = k + 1
+            }
+            if fname.length() > 0 { fn_callees[fname] = callees }
+            if has_r || has_rp {
+              if is_pub { diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", sf.rel_path, t.line, t.col, "public `raise` function `" + fname + "` is unsupported")); cat_a_rejected[fname] = true }
+              else if has_rp || ety == "Error" || (ety.length() == 0 && (!sf.is_test || body_err)) || (ety.length() > 0 && ety != "Failure" && !suberror_names.contains(ety)) { diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", sf.rel_path, t.line, t.col, "unsupported `raise` signature on `" + fname + "`")); cat_a_rejected[fname] = true }
+              else if ety.length() == 0 { cat_a_cands[fname] = (sf.rel_path, t.line, t.col) }
+              else { let ce = if ety == "Failure" { failure_enum } else { ety }; if str_has(fname, "::") { pkg_raise_methods[fname] = ce } else { pkg_raise_fns[fname] = ce } }
+            }
+            i = rb + 1; continue
+          }
+          None => ()
+        }
+      }
+      if is_kw_or_id(t, "try") && i + 1 < n && toks[i + 1].kind == TokenKind::LBrace { let tb = find_matching_delim(toks, i + 1); let mut k = i + 2; while k < tb { if toks[k].kind == TokenKind::Ident && k + 1 < tb && toks[k + 1].kind == TokenKind::LParen && !(k > i + 2 && (toks[k - 1].kind == TokenKind::Dot || toks[k - 1].kind == TokenKind::ColonColon)) { called_in_try[toks[k].raw] = true }; k = k + 1 } }
+      i = i + 1
+    }
+    fi = fi + 1
+  }
+  let mut ch_try = true
+  while ch_try { ch_try = false; for caller in called_in_try.keys() { match fn_callees.get(caller) { Some(cs) => { for c in cs { if !called_in_try.contains(c) { called_in_try[c] = true; ch_try = true } } }, None => () } } }
+  let cat_a_val : Map[String, Bool] = Map()
+  if cat_a_cands.length() > 0 {
+    fi = 0
+    while fi < sources.length() {
+      let toks = all_toks[fi]; let mut i = 0
+      while i < toks.length() - 1 {
+        let t = toks[i]
+        if t.kind == TokenKind::Ident && cat_a_cands.contains(t.raw) && !(i > 0 && ((toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "fn") || toks[i - 1].kind == TokenKind::Dot || toks[i - 1].kind == TokenKind::ColonColon)) && !(i + 1 < toks.length() - 1 && (toks[i + 1].kind == TokenKind::LParen || toks[i + 1].kind == TokenKind::Colon || toks[i + 1].kind == TokenKind::Eq)) { cat_a_val[t.raw] = true }
+        i = i + 1
+      }
+      fi = fi + 1
+    }
+  }
+  let cat_a_approved : Map[String, Bool] = Map()
+  for cname in cat_a_cands.keys() {
+    let mut ok = !called_in_try.contains(cname) && !cat_a_val.contains(cname)
+    if ok { match fn_callees.get(cname) { Some(cs) => { for c in cs { if pkg_raise_fns.contains(c) || cat_a_rejected.contains(c) { ok = false; break } } }, None => () } }
+    if ok { cat_a_approved[cname] = true } else { cat_a_rejected[cname] = true; match cat_a_cands.get(cname) { Some((cf, cl, cc)) => diags.push(diag_error("MBT2PION_UNSUPPORTED_SYNTAX", cf, cl, cc, "test helper `" + cname + "` violates Category A `raise` conditions")), None => () } }
+  }
+
+  let out_sources : Array[SourceFile] = []; let mut any_fail = false; let mut any_out = false; fi = 0
+  while fi < sources.length() {
+    let sf = sources[fi]; let src = sf.content; let toks = all_toks[fi]; let n = toks.length() - 1
+    let st = ErrLowerState::{ file: sf.rel_path, is_test: sf.is_test, suberror_names: suberror_names, suberror_ctors: suberror_ctors, pkg_raise_fns: pkg_raise_fns, pkg_raise_methods: pkg_raise_methods, cat_a_approved: cat_a_approved, cat_a_rejected: cat_a_rejected, failure_enum: failure_enum, outcome_enum: outcome_enum, frames: [], lex_raise_closures: [Map()], lex_var_types: [Map()], diags: diags, need_failure: false, need_outcome: false, tmp_seq: 0 }
+    let edits : Array[(Int, Int, String)] = []; let mut i = 0; let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 && is_kw_or_id(t, "suberror") && i + 1 < n && toks[i + 1].kind == TokenKind::UpperIdent {
+        let ename = toks[i + 1].raw; let sb_b = if i > 0 && toks[i - 1].kind == TokenKind::Keyword && toks[i - 1].raw == "priv" { toks[i - 1].start_byte } else { t.start_byte }
+        if i + 2 < n && toks[i + 2].kind == TokenKind::LBrace { edits.push((sb_b, t.end_byte, "enum")) }
+        else if i + 2 < n && toks[i + 2].kind == TokenKind::LParen { let cp = find_matching_delim(toks, i + 2); edits.push((sb_b, toks[cp].end_byte, "enum " + ename + " { " + ename + src.slice(toks[i + 2].start_byte, toks[cp].end_byte) + " }")); i = cp + 1; continue }
+        else { edits.push((sb_b, toks[i + 1].end_byte, "enum " + ename + " { " + ename + " }")); i = i + 2; continue }
+      }
+      if depth == 0 && t.kind == TokenKind::Keyword && t.raw == "fn" {
+        match err_parse_fn_header(src, toks, i, n) {
+          Some((fname, op, cp, rty, has_r, ety, _, lb)) => {
+            let rb = find_matching_delim(toks, lb)
+            if cat_a_rejected.contains(fname) { i = rb + 1; continue }
+            if has_r && ety.length() == 0 && cat_a_approved.contains(fname) { edits.push((t.start_byte, toks[lb].start_byte, src.slice(t.start_byte, toks[cp].end_byte) + " -> " + rty + " ")); i = rb + 1; continue }
+            let pm : Map[String, String] = Map(); let cm : Map[String, String] = Map()
+            err_seed_param_types(toks, op, cp, fname, pm, cm); st.lex_var_types.push(pm); st.lex_raise_closures.push(cm)
+            if has_r && ety.length() > 0 {
+              let ce = err_canon_ty(st, ety); st.frames.push(ErrFrame::SourceFn(rty, Some(ce)))
+              let bt = lower_err_range(st, src, toks, lb + 1, rb); let _ = st.frames.pop()
+              let w = if err_body_ends_with_return_or_raise(toks, lb, rb) { "{" + bt + " }" } else if rty == "Unit" { "{" + bt + "; Ok(()) }" } else { "{ Ok({" + bt + " }) }" }
+              edits.push((t.start_byte, toks[rb].end_byte, src.slice(t.start_byte, toks[cp].end_byte) + " -> Result[" + rty + ", " + ce + "] " + w))
+            } else {
+              st.frames.push(ErrFrame::SourceFn(rty, None)); let nb = lower_err_range(st, src, toks, lb + 1, rb); let _ = st.frames.pop()
+              if nb != src.slice(toks[lb].end_byte, toks[rb].start_byte) { edits.push((toks[lb].end_byte, toks[rb].start_byte, nb)) }
+            }
+            let _ = st.lex_raise_closures.pop(); let _ = st.lex_var_types.pop(); i = rb + 1; continue
+          }
+          None => ()
+        }
+      }
+      if depth == 0 && is_kw_or_id(t, "test") {
+        let mut lb = i + 1; while lb < n && toks[lb].kind != TokenKind::LBrace { lb = lb + 1 }
+        if lb < n && toks[lb].kind == TokenKind::LBrace {
+          let rb = find_matching_delim(toks, lb); st.lex_var_types.push(Map()); st.lex_raise_closures.push(Map()); st.frames.push(ErrFrame::SourceFn("Unit", None))
+          let nb = lower_err_range(st, src, toks, lb + 1, rb); let _ = st.frames.pop(); let _ = st.lex_raise_closures.pop(); let _ = st.lex_var_types.pop()
+          if nb != src.slice(toks[lb].end_byte, toks[rb].start_byte) { edits.push((toks[lb].end_byte, toks[rb].start_byte, nb)) }
+          i = rb + 1; continue
+        }
+      }
+      i = i + 1
+    }
+    if st.need_failure { any_fail = true }
+    if st.need_outcome { any_out = true }
+    out_sources.push(if edits.length() > 0 { SourceFile::{ rel_path: sf.rel_path, content: apply_byte_edits(src, edits), is_test: sf.is_test } } else { sf })
+    fi = fi + 1
+  }
+  if (any_fail || any_out) && out_sources.length() > 0 {
+    let h = (if any_fail { "enum " + failure_enum + " {\n  Failure(String)\n}\n\n" } else { "" }) + (if any_out { "enum " + outcome_enum + "[R, E] {\n  MbtTryOk\n  MbtTryRet(R)\n  MbtTryErr(E)\n}\n\n" } else { "" })
+    let mut ti = 0; let mut k = 0; while k < out_sources.length() { if !out_sources[k].is_test { ti = k; break }; k = k + 1 }
+    out_sources[ti] = SourceFile::{ rel_path: out_sources[ti].rel_path, content: h + out_sources[ti].content, is_test: out_sources[ti].is_test }
+  }
+  out_sources
 }

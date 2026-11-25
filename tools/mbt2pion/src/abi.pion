@@ -242,6 +242,18 @@ fn sort_abi_op_impls(xs : Array[OpImplEntry]) -> Array[OpImplEntry] {
   out
 }
 
+fn sort_abi_reexports(xs : Array[AbiReexport]) -> Array[AbiReexport] {
+  let out : Array[AbiReexport] = []
+  for x in xs { out.push(x) }
+  let mut i = 1
+  while i < out.length() {
+    let key = out[i]; let mut j = i - 1
+    while j >= 0 && str_cmp(out[j].name, key.name) > 0 { out[j + 1] = out[j]; j = j - 1 }
+    out[j + 1] = key; i = i + 1
+  }
+  out
+}
+
 ///| Exact compiler-aligned library source check (`compiler/src/cli/main.pion:188`):
 ///| ONLY literal suffix `_test.pion` is excluded from library compilation; `*_wbtest.pion` IS included!
 pub fn is_abi_library_pion(rel_path : String) -> Bool {
@@ -496,7 +508,12 @@ pub fn collect_generated_type_names(files : Array[GeneratedFile]) -> Map[String,
   out
 }
 
-fn abi_payload_to_json_opts(abi : PackageAbi, schema_ver : Int, include_publishable : Bool) -> json::JsonValue {
+fn abi_payload_to_json_opts(
+  abi : PackageAbi,
+  schema_ver : Int,
+  include_publishable : Bool,
+  include_reexports : Bool,
+) -> json::JsonValue {
   let sorted_enums = sort_abi_enums(abi.enums)
   let enum_arr : Array[json::JsonValue] = []
   for en in sorted_enums {
@@ -558,6 +575,13 @@ fn abi_payload_to_json_opts(abi : PackageAbi, schema_ver : Int, include_publisha
     }
     fields.push(json_field("op_impls", json_arr(op_arr)))
   }
+  if schema_ver >= 2 && (include_reexports || abi.reexports.length() > 0) {
+    let re_arr : Array[json::JsonValue] = []
+    for r in sort_abi_reexports(abi.reexports) {
+      re_arr.push(json_obj([json_field("name", json_str(r.name)), json_field("kind", json_str(r.kind)), json_field("target_pkg", json_str(r.target_pkg)), json_field("target_name", json_str(r.target_name))]))
+    }
+    fields.push(json_field("reexports", json_arr(re_arr)))
+  }
   if schema_ver >= 2 && include_publishable {
     fields.push(json_field("publishable", json_bool(abi.publishable)))
   }
@@ -565,7 +589,7 @@ fn abi_payload_to_json_opts(abi : PackageAbi, schema_ver : Int, include_publisha
 }
 
 fn abi_payload_to_json_versioned(abi : PackageAbi, schema_ver : Int) -> json::JsonValue {
-  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2)
+  abi_payload_to_json_opts(abi, schema_ver, schema_ver >= 2, abi.reexports.length() > 0)
 }
 
 fn abi_payload_to_json(abi : PackageAbi) -> json::JsonValue {
@@ -979,6 +1003,28 @@ pub fn verify_and_parse_dep_abi(
     }
   }
 
+  let reexports : Array[AbiReexport] = []
+  let seen_reexports : Map[String, Bool] = Map()
+  let mut has_reexports_field = false
+  if sv >= 2 {
+    match json::obj_get(payload_v, "reexports") {
+      Some(rev) => {
+        has_reexports_field = true
+        let ritems = match json::as_arr(rev) { Some(a) => a, None => { diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid `reexports` field in dep `" + dep_name + "`")); return None } }
+        for rit in ritems {
+          let rn = j_str(rit, "name", ""); let rk = j_str(rit, "kind", ""); let rp = j_str(rit, "target_pkg", ""); let rt = j_str(rit, "target_name", "")
+          if rn.length() == 0 || (rk != "type" && rk != "value") || rp.length() == 0 || rt.length() == 0 || seen_reexports.contains(rn) {
+            diags.push(diag_error("MBT2PION_DEP_ABI_ERROR", dep_path + "/mbt2pion_abi.json", 1, 1, "invalid or duplicate `reexports` entry `" + rn + "` in dep `" + dep_name + "`"))
+            return None
+          }
+          seen_reexports[rn] = true
+          reexports.push(AbiReexport::{ name: rn, kind: rk, target_pkg: rp, target_name: rt })
+        }
+      }
+      None => ()
+    }
+  }
+
   let has_pub_field = match json::obj_get(payload_v, "publishable") {
     Some(_) => true
     None => false
@@ -991,10 +1037,11 @@ pub fn verify_and_parse_dep_abi(
     struct_val_fields: struct_vals,
     companion_files: companion_files,
     op_impls: op_impls,
+    reexports: reexports,
     publishable: is_publishable,
   }
   // Direction 1: canonical payload SHA-256 MUST equal `abi_sha256`!
-  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field)))
+  let actual_abi_sha = content_sha256(json::stringify(abi_payload_to_json_opts(parsed, sv, has_pub_field, has_reexports_field)))
   if actual_abi_sha != decl_abi_sha {
     diags.push(diag_error(
       "MBT2PION_DEP_ABI_ERROR",
@@ -1158,4 +1205,52 @@ pub fn verify_and_parse_dep_abi(
     return None
   }
   Some(parsed)
+}
+
+pub fn render_reexport_verify_anchor(reexports : Array[AbiReexport], dep_doc_jsons : Array[String]) -> String {
+  if reexports.length() == 0 { return "" }
+  let type_arity : Map[String, Int] = Map(); let generic_vals : Map[String, Bool] = Map()
+  for dj in dep_doc_jsons {
+    if dj.trim().length() == 0 { continue }
+    let root = match json::parse(dj) { Ok(v) => v, Err(_) => continue }
+    let pkgs = match json::obj_get(root, "packages") { Some(v) => match json::as_arr(v) { Some(a) => a, None => continue }, None => continue }
+    for pkg in pkgs {
+      let pname = j_str(pkg, "name", "")
+      let items = match json::obj_get(pkg, "items") { Some(v) => match json::as_arr(v) { Some(a) => a, None => continue }, None => continue }
+      for it in items {
+        let k = j_str(it, "kind", ""); let nm = j_str(it, "name", ""); let sig = j_str(it, "sig", "")
+        if pname.length() == 0 || nm.length() == 0 { continue }
+        let key = pname + "::" + nm
+        if k == "struct" || k == "enum" || k == "type" || k == "typealias" {
+          let lb = sig.index_of("["); let rb = sig.index_of("]")
+          type_arity[key] = if lb >= 0 && rb > lb && sig.slice(lb + 1, rb).trim().length() > 0 { sig.slice(lb + 1, rb).split(",").length() } else { 0 }
+        } else if k == "fn" { let lb = sig.index_of("["); let lp = sig.index_of("("); if lb >= 0 && (lp < 0 || lb < lp) { generic_vals[key] = true } }
+      }
+    }
+  }
+  let pkgs : Map[String, Bool] = Map()
+  for r in reexports { pkgs[r.target_pkg] = true }
+  let sb = StringBuilder()
+  for p in sorted_map_keys(pkgs) { sb.write_string("import \"" + p + "\"\n") }
+  sb.write_string("\nfn __mbt_verify_reexports_anchor(\n")
+  let mut ti = 0
+  for r in reexports {
+    if r.kind == "type" {
+      let key = r.target_pkg + "::" + r.target_name
+      let ar = match type_arity.get(key) { Some(n) => n, None => 0 }
+      let ts : Array[String] = []; let mut k = 0; while k < ar { ts.push("Int"); k = k + 1 }
+      sb.write_string("  _t" + ti.to_string() + " : Option[" + key + (if ar > 0 { "[" + join_comma(ts) + "]" } else { "" }) + "],\n")
+      ti = ti + 1
+    }
+  }
+  sb.write_string(") -> Unit {\n")
+  let mut vi = 0
+  for r in reexports {
+    if r.kind == "value" && !generic_vals.contains(r.target_pkg + "::" + r.target_name) {
+      sb.write_string("  let _v" + vi.to_string() + " = " + r.target_pkg + "::" + r.target_name + "\n")
+      vi = vi + 1
+    }
+  }
+  sb.write_string("  ()\n}\n")
+  sb.to_string()
 }
