@@ -301,10 +301,41 @@ pub fn ctor_expect_demo() -> String {
     hs + "|" + eq_ok.to_string() + "|" + side_code(p.side) + picked.val
 }
 
+let pkg_shadow_x : Int = 3
+
+pub fn astra_callsite_shadow_demo() -> Int {
+  let x = 30 + 12
+  fn pick(n : Int) -> Int {
+    if n == 0 {
+      x
+    } else {
+      pick(n - 1)
+    }
+  }
+  {
+    let x = 5
+    pick(x - 5)
+  }
+}
+
+pub fn astra_interp_capture_demo() -> String {
+  let pkg_shadow_x : Int = 42
+  fn pick(n : Int) -> String {
+    let _ = fn(pkg_shadow_x : Int) { pkg_shadow_x }
+    if n == 0 {
+      "\{pkg_shadow_x}"
+    } else {
+      pick(n - 1)
+    }
+  }
+  pick(1)
+}
+
 pub fn run_all() -> String {
   "F3d2-1:" + shown_across_demo() +
     "\nF3d2-2:" + capture_semantics_demo() +
-    "\nF3d2-3:" + ctor_expect_demo()
+    "\nF3d2-3:" + ctor_expect_demo() +
+    "\nF3d2-4:" + astra_callsite_shadow_demo().to_string() + "," + astra_interp_capture_demo()
 }
 '''
 
@@ -433,7 +464,8 @@ def main():
         expected = (
             "F3d2-1:1:13:87\n"
             "F3d2-2:100,20,true,16,26\n"
-            "F3d2-3:S:sp:Ri|B::C|bR|1L3A|C|true|LE"
+            "F3d2-3:S:sp:Ri|B::C|bR|1L3A|C|true|LE\n"
+            "F3d2-4:42,42"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
