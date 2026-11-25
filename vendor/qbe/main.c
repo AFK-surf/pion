@@ -459,6 +459,7 @@ usage(FILE *hf, char *prog)
 	fprintf(hf, "\t%-18s output to file\n", "-o file");
 	fprintf(hf, "\t%-18s emit .o directly (arm64_apple Mach-O / amd64_sysv ELF64)\n", "--obj");
 	fprintf(hf, "\t%-18s batch emit .o pairs <in.ssa> <out.o>...\n", "--obj-batch");
+	fprintf(hf, "\t%-18s amd64_win: Microsoft x64 unwind info (.seh_*)\n", "--seh");
 	fprintf(hf, "\t%-18s macOS platform version (e.g. 15.0)\n", "--macos-ver <ver>");
 	fprintf(hf, "\t%-18s generate for a target among:\n", "-t <target>");
 	fprintf(hf, "\t%-18s ", "");
@@ -525,6 +526,8 @@ main(int ac, char *av[])
 			objbatch = 1;
 		} else if (strcmp(arg, "--strict-jnz") == 0 || strcmp(arg, "-strict-jnz") == 0) {
 			strict_jnz = 1;
+		} else if (strcmp(arg, "--seh") == 0) {
+			win_seh = 1;
 		} else if (strcmp(arg, "--macos-ver") == 0) {
 			if (i + 1 >= ac) {
 				usage(stderr, av[0]);

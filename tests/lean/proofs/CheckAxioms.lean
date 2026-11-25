@@ -29,6 +29,7 @@ import PionProofs.QbeColdBootstrapSpeedOpts
 import PionProofs.QbeCountedLoopUnroll
 import PionProofs.QbeJtblIdxAndWideCmp
 import PionProofs.QbeAmd64FpRhsLoadFold
+import PionProofs.QbeWin64XmmCalleeSaved
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -731,3 +732,18 @@ import PionProofs.QbeAmd64FpRhsLoadFold
 #print axioms PionQbeAmd64FpRhsLoadFold.storeBetweenCounterexample
 #print axioms PionQbeAmd64FpRhsLoadFold.emitOneMem
 #print axioms PionQbeAmd64FpRhsLoadFold.spilledLhsEquiv
+#print axioms PionQbeWin64XmmCalleeSaved.locsz16
+#print axioms PionQbeWin64XmmCalleeSaved.frameDisjoint
+#print axioms PionQbeWin64XmmCalleeSaved.rspAligned
+#print axioms PionQbeWin64XmmCalleeSaved.slot16
+#print axioms PionQbeWin64XmmCalleeSaved.vastartSlot
+#print axioms PionQbeWin64XmmCalleeSaved.allocAligned
+#print axioms PionQbeWin64XmmCalleeSaved.oldOrderMisaligned
+#print axioms PionQbeWin64XmmCalleeSaved.allocAlignedBothEnds
+#print axioms PionQbeWin64XmmCalleeSaved.stores_spec
+#print axioms PionQbeWin64XmmCalleeSaved.loads_spec
+#print axioms PionQbeWin64XmmCalleeSaved.loads_other
+#print axioms PionQbeWin64XmmCalleeSaved.saveRestore
+#print axioms PionQbeWin64XmmCalleeSaved.scannerCovers
+#print axioms PionQbeWin64XmmCalleeSaved.writtenSaved
+#print axioms PionQbeWin64XmmCalleeSaved.callerView

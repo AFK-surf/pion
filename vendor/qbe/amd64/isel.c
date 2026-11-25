@@ -492,6 +492,12 @@ sel(Ins i, AddrNums *tn, Fn *fn)
 		break;
 	case Onop:
 		break;
+	case Oaddr:
+		/* amd64_win vastart: address of a caller (home) slot */
+		if (rtype(i.arg[0]) != RSlot)
+			die("unknown instruction addr");
+		emiti(i);
+		break;
 	case Ostored:
 	case Ostores:
 	case Ostorel:
@@ -1251,14 +1257,17 @@ amd64_isel(Fn *fn)
 	Ins *i;
 	Phi *p;
 	uint a;
-	int n, al;
+	int n, al, maxa = 1;
 	int64_t sz;
 	AddrNums num;
 
 	/* assign slots to fast allocs */
 	b = fn->start;
-	/* specific to NAlign == 3 */ /* or change n=4 and sz /= 4 below */
-	for (al=Oalloc, n=4; al<=Oalloc1; al++, n*=2)
+	/* specific to NAlign == 3 */ /* or change n=16 and sz /= 4 below */
+	/* Largest alignment first: every size is rounded to its own
+	 * alignment, so each slot offset stays a multiple of it (an
+	 * alloc16 after an alloc4 used to land 4 bytes off). */
+	for (al=Oalloc1, n=16; al>=Oalloc; al--, n/=2)
 		for (i=b->ins; i<&b->ins[b->nins]; i++)
 			if (i->op == al) {
 				if (rtype(i->arg[0]) != RCon)
@@ -1271,10 +1280,25 @@ amd64_isel(Fn *fn)
 				if (sz > INT_MAX - fn->slot)
 					die("alloc too large");
 				fn->tmp[i->to.val].slot = fn->slot;
+				if (n / 4 > maxa)
+					maxa = n / 4;
 				fn->slot += sz;
-				fn->salign = 2 + al - Oalloc;
+				if (fn->salign < 2 + al - Oalloc)
+					fn->salign = 2 + al - Oalloc;
 				*i = (Ins){.op = Onop};
 			}
+	/* Frame bases are 16-byte aligned: keep the slot area a multiple
+	 * of the largest alloc alignment so offsets from either end stay
+	 * aligned (both 0 + 4*s and -4*(fn->slot - s)). */
+	if (maxa > 1) {
+		int rem = fn->slot & (maxa - 1);
+		if (rem) {
+			int pad = maxa - rem;
+			if (pad > INT_MAX - fn->slot)
+				die("alloc too large");
+			fn->slot += pad;
+		}
+	}
 
 	/* process basic blocks */
 	isel_total_nins = 0;

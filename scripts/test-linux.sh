@@ -653,6 +653,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p115_cross_pkg_struct_lit_probe/run_e2
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.sh" "$PIONC"
 # P118: Opt-Track R (amd64 jump-table selector in the dispatch scratch register, proven zero-extension indexes the table directly, widened-word interval comparison folding; text == --obj dispatch forms, -d G folds, host C differential with dirty high halves, bytecode_vm / fannkuchredux, ASan+UBSan QBE on 4 targets).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC"
+# P120: Win64 nonvolatile xmm6..xmm15 in QBE amd64_win (xmm0..xmm5-only rsave, 128-bit movups save/restore of the used xmm6..xmm14 and the xmm15 scratch; check_frames.py + mutants, x86-64 execution of the Win64 code with all 160 bytes of xmm6..xmm15 checked, ASan+UBSan QBE replay).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_ror_bitops/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p85_compact_4b_arr/run_e2e.sh" "$PIONC"
