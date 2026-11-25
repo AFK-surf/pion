@@ -61,4 +61,16 @@ pionc query defs --json <path>   # inspect symbols/signatures across a package o
 pionc query callers --json <path># inspect call graph before refactoring
 pionc fmt --check <path>         # verify canonical formatting
 pionc test --json <path>         # run all tests in isolated parallel processes
+pionc extract-lean --out <dir> --json <path> # extract `#verify` closure to Lean 4
 ```
+
+## 5. Formal Verification with Lean 4 (`#verify` + `pionc extract-lean`)
+
+Pion includes a built-in Aeneas-style Lean 4 extractor (`SPEC.md` §3.4–§3.5 & §5.5), so critical state machines, schedulers, codecs, and protocol parsers can be proven directly on production Pion code without maintaining a separate handwritten model:
+
+- **Annotate pure kernels with `#verify`** (and mark any trusted leaf boundary `#verify_opaque`). The type checker enforces ownership/aliasing rules (`E_VERIFY_MOVE`, `E_VERIFY_BORROW_ESCAPE`, `E_VERIFY_ALIASING`), checked division/shift bounds, and verified-callee closure (`E_VERIFY_UNVERIFIED_CALLEE`).
+- **Keep `#verify` APIs data-driven (no closures)**: closures and callback parameters are rejected by extraction (`E_EXTRACT_UNSUPPORTED`). Instead of taking `inspect: (K) -> Item` callbacks, pass plain data arrays (`Array[Input]`) and return explicit effect lists `(State, Array[Effect])` that the outer shell executes.
+- **Use `Int64` for logical clocks and counters**: `#verify` forbids `Float` and `Double` arithmetic/comparisons (only `Double` bit-pattern primitives are allowed). Integer millisecond timestamps (`Int64` → `Std.I64`) make ordering, monotonicity, and liveness proofs straightforward in Lean 4.
+- **Supported containers & control flow**: `mut` parameters (threaded functionally), `for`/`while` loops (`Aeneas.Std.loop`), recursion (`partial_fixpoint`), `struct`/`enum`/`trait`/`impl`, `Array`, `FixedArray`, `Bytes`, `StringBuilder`, and `Map[K, V]`. Avoid unmodeled builtins (`Array::sort`, string interpolation, `physical_equal`, most `String` methods beyond `.length()`).
+- **Close the proof loop**: extract with `pionc extract-lean --out <dir> --json <path>`, prove theorems with zero `sorry`/`admit` and standard axioms only (`#print axioms`), and run `sh scripts/test-lean.sh <pionc>` (which also checks native-vs-Lean differential equivalence).
+
