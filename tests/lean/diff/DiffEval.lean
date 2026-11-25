@@ -164,6 +164,9 @@ def main : IO Unit := do
   report "match_wild_tail" diff_cases.c_match_wild_tail
   report "match_is_single_ctor" diff_cases.c_match_is_single_ctor
   report "match_peeled_dead_arm" diff_cases.c_match_peeled_dead_arm
+  report "match_exhaustive_wild" diff_cases.c_match_exhaustive_wild
+  report "match_dup_arm" diff_cases.c_match_dup_arm
+  report "match_nested_dup" diff_cases.c_match_nested_dup
 
 end PionDiff
 
