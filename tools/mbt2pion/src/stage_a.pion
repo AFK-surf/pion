@@ -443,6 +443,11 @@ pub fn lower_type_tokens(
         name = t.raw
       } else if name == "SourceLoc" {
         name = "String"
+      } else if name == "Int32" && !symtab.local_types.contains("Int32") && !symtab.using_types.contains("Int32") &&
+      !symtab.type_aliases.contains("Int32") {
+        // MoonBit's built-in `Int32` is `#alias(Int32)` of `Int` (same 32-bit wrapping type). A local or `using`
+        // type of that name and `@pkg.Int32` (lowered as a qualified type above) are left alone.
+        name = "Int"
       } else if name == "StringView" {
         name = "String"
       } else if name == "BytesView" {
@@ -1508,7 +1513,10 @@ fn lower_map_literal(
   file : String,
 ) -> String {
   let sb = StringBuilder()
-  sb.write_string("mbt_compat::ordered_map_from_array([")
+  // Untyped: bind the pairs to a `let` first (see `hoist_untyped_pairs_literal`).
+  let hoist = current_expected_type(ctx).trim().length() == 0
+  let pairs_nm = "__mbt_pairs_" + tokens[open_b].line.to_string() + "_" + tokens[open_b].col.to_string()
+  sb.write_string(if hoist { "{ let " + pairs_nm + " = [" } else { "mbt_compat::ordered_map_from_array([" })
   let mut i = open_b + 1
   let mut first = true
   while i < close_b {
@@ -1546,7 +1554,7 @@ fn lower_map_literal(
     }
     i = end_i + 1
   }
-  sb.write_string("])")
+  sb.write_string(if hoist { "]; mbt_compat::ordered_map_from_array(" + pairs_nm + ") }" } else { "])" })
   sb.to_string()
 }
 
@@ -4057,6 +4065,13 @@ fn prescan_borrowed_slices(
         if eq_i + 1 < end && tokens[eq_i].kind == TokenKind::Eq && tokens[eq_i + 1].kind == TokenKind::LBracket {
           local_arrs[vname] = true
         }
+        // `let xs [: Array[T]] = Array(capacity=n)` / `Array::new(..)`: an `ArrayBuf` with reserved capacity.
+        if eq_i + 1 < end && tokens[eq_i].kind == TokenKind::Eq {
+          let (ctor_close, _, _) = array_ctor_capacity_range(tokens, eq_i + 1, end)
+          if ctor_close >= 0 {
+            local_arrs[vname] = true
+          }
+        }
       }
     }
     i = i + 1
@@ -5436,6 +5451,18 @@ fn lower_one_token_or_form(
             }
             return (trivia + "let " + mut_kw + lname + " = mbt_compat::ArrayBuf::from_array(" + arr_lit + ")", close_arr + 1)
           }
+          if ctx.borrowed_bufs.contains(lname) && !has_local_ctor(ctx.symtab, "Array") && lty.starts_with("Array[") {
+            match lower_array_ctor_as_buf(ctx, tokens, eq_i + 1, end, file) {
+              Some((buf_s, after)) => {
+                if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
+                if lname != "_" {
+                  ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
+                }
+                return (trivia + "let " + mut_kw + lname + " : mbt_compat::ArrayBuf[" + lty.slice(6, lty.length() - 1) + "] = " + buf_s, after)
+              }
+              None => ()
+            }
+          }
           let rhs_end = find_expr_end(tokens, eq_i + 1, end)
           push_expected_type(ctx, lty)
           let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false)
@@ -6083,7 +6110,7 @@ fn lower_one_token_or_form(
           return (trivia + "mbt_compat::MbtJson::Object(mbt_compat::ordered_map_new())", close_b + 1)
         }
         if str_has(raw_exp, "OrderedMap") || raw_exp.starts_with("Map[") {
-          return (trivia + "mbt_compat::ordered_map_new()", close_b + 1)
+          return (trivia + "mbt_compat::ordered_map_new" + tuple_key_ctor_suffix(ctx) + "()", close_b + 1)
         }
       }
       match try_lower_ref_literal(ctx, tokens, i, close_b, file) {
@@ -6816,12 +6843,19 @@ fn lower_one_token_or_form(
         return (trivia + "{ let _ = " + clean_cap + "; StringBuilder::new() }", close_p + 1)
       }
     }
+    // `Map(arr, capacity=cap)` / `Map::from_array(arr)` / bare `Map::from_array` (`lower_map_ctor.pion`)
+    if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Map" {
+      match try_lower_map_from_array_ctor(ctx, tokens, i, end, file, trivia) {
+        Some(r) => return r
+        None => ()
+      }
+    }
     // `Map([])` -> `mbt_compat::ordered_map_new()`
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Map" &&
     i + 4 < end && tokens[i + 1].kind == TokenKind::LParen &&
     tokens[i + 2].kind == TokenKind::LBracket && tokens[i + 3].kind == TokenKind::RBracket &&
     tokens[i + 4].kind == TokenKind::RParen {
-      return (trivia + "mbt_compat::ordered_map_new()", i + 5)
+      return (trivia + "mbt_compat::ordered_map_new" + tuple_key_ctor_suffix(ctx) + "()", i + 5)
     }
     // `Map::new()` -> `mbt_compat::ordered_map_new()`
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Map" &&
@@ -6829,7 +6863,7 @@ fn lower_one_token_or_form(
     tokens[i + 2].raw == "new" && tokens[i + 3].kind == TokenKind::LParen {
       let close_p = find_matching_delim(tokens, i + 3)
       if close_p == i + 4 {
-        return (trivia + "mbt_compat::ordered_map_new()", close_p + 1)
+        return (trivia + "mbt_compat::ordered_map_new" + tuple_key_ctor_suffix(ctx) + "()", close_p + 1)
       }
     }
     // `FixedArray::makei(...)` -> `mbt_compat::fixed_array_makei(...)`
@@ -6840,7 +6874,8 @@ fn lower_one_token_or_form(
       let inner = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
       return (trivia + "mbt_compat::fixed_array_makei(" + inner + ")", close_p + 1)
     }
-    // `Array()` / `Array(capacity=<expr>)` -> `[]` / `{ let _ = <expr>; [] }` (only when `Array` is not a local enum ctor!)
+    // `Array()` / `Array(capacity=<expr>)` -> `[]` / `{ mbt_compat::arr_capacity_check(<expr>); [] }` (MoonBit aborts on a
+    // negative capacity; only when `Array` is not a local enum ctor!)
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Array" &&
     !has_local_ctor(ctx.symtab, "Array") &&
     i + 1 < end && tokens[i + 1].kind == TokenKind::LParen {
@@ -6851,7 +6886,7 @@ fn lower_one_token_or_form(
       if i + 4 < close_p && tokens[i + 2].kind == TokenKind::Ident && tokens[i + 2].raw == "capacity" && tokens[i + 3].kind == TokenKind::Eq {
         let cap_e = lower_expr_range(ctx, tokens, i + 4, close_p, file, false).trim()
         let clean_cap = if cap_e.ends_with(",") { cap_e.slice(0, cap_e.length() - 1).trim() } else { cap_e }
-        return (trivia + "{ let _ = " + clean_cap + "; [] }", close_p + 1)
+        return (trivia + "{ mbt_compat::arr_capacity_check(" + clean_cap + "); [] }", close_p + 1)
       }
     }
     // `Array::make(n, val)` / `FixedArray::make(n, val)`: propagate element type from expected `Array[T]` / `FixedArray[T]`
@@ -6887,7 +6922,7 @@ fn lower_one_token_or_form(
         }
       }
     }
-    // `Array::new()` / `Array::new(capacity=<expr>)` -> `[]` / `{ let _ = <expr>; [] }`
+    // `Array::new()` / `Array::new(capacity=<expr>)` -> `[]` / `{ mbt_compat::arr_capacity_check(<expr>); [] }`
     if !in_pattern && !prev_colon2 && !prev_dot && t.raw == "Array" &&
     i + 3 < end && tokens[i + 1].kind == TokenKind::ColonColon &&
     tokens[i + 2].raw == "new" && tokens[i + 3].kind == TokenKind::LParen {
@@ -6898,7 +6933,7 @@ fn lower_one_token_or_form(
       if i + 6 < close_p && tokens[i + 4].kind == TokenKind::Ident && tokens[i + 4].raw == "capacity" && tokens[i + 5].kind == TokenKind::Eq {
         let cap_e = lower_expr_range(ctx, tokens, i + 6, close_p, file, false).trim()
         let clean_cap = if cap_e.ends_with(",") { cap_e.slice(0, cap_e.length() - 1).trim() } else { cap_e }
-        return (trivia + "{ let _ = " + clean_cap + "; [] }", close_p + 1)
+        return (trivia + "{ mbt_compat::arr_capacity_check(" + clean_cap + "); [] }", close_p + 1)
       }
     }
     // `Array::makei(...)` -> `mbt_compat::arr_makei(...)`

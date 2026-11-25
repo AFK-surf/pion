@@ -1,0 +1,203 @@
+///| Wave M2-F3d-1a unit tests:
+///| 1. Built-in `Int32` lowers to `Int` in every type position; a local / `using` type of that name is kept
+///| 2. `Map::from_array` (call and bare `|>` target) and `Map(arr, capacity=cap)` lowering, fail-closed on a
+///|    non-fresh `arr` with a capacity that may run code
+///| 3. Tuple `MapKey` constructors: `_pair` / `_triple` rewrite from the pionc diagnostic
+///| 4. `shrink_to_fit`: `Array(capacity=n)` locals with borrowed views become `ArrayBuf::with_capacity(n)`; a plain
+///|    array's shrink is refused under a `for .. in` body, an iteration callback or a kept iterator
+///| 5. `Array(capacity=n)` keeps MoonBit's negative-capacity abort
+///| (2 also covers binding an untyped pairs literal before a generic call: pionc 0.1.0 misreads it inline)
+
+fn f3d1a_transpile(rel : String, src : String) -> (Int, String, Array[Diag]) {
+  let res = transpile_package([SourceFile::{ rel_path: rel, content: src, is_test: false }], empty_api_map(), default_recipes(), [], [], default_options(), [], false, noop_check)
+  let sb = StringBuilder()
+  for f in res.files {
+    sb.write_string(f.content)
+    sb.write_string("\n")
+  }
+  (res.blockers, sb.to_string(), res.diagnostics)
+}
+
+fn f3d1a_has_diag(ds : Array[Diag], code : String, needle : String) -> Bool {
+  for d in ds {
+    if d.code == code && str_has(d.message, needle) {
+      return true
+    }
+  }
+  false
+}
+
+test "F3d1a-1: built-in Int32 lowers to Int in fields, params, returns, Option/Array/tuple and ascriptions" {
+  let src = "struct P {\n  at : Int32\n  gens : Array[(Int32?, Int32)]\n}\n" +
+  "fn f(a : Int32, b : Int32?) -> Int32 {\n" +
+  "  let c : Int32 = a + b.unwrap_or(0)\n" +
+  "  let g : (Int32) -> Int32 = fn(x : Int32) -> Int32 { x }\n" +
+  "  g(c) + (1 : Int32)\n" +
+  "}\n"
+  let (blockers, out, _) = f3d1a_transpile("i32.mbt", src)
+  assert_true(blockers == 0, "Int32 transpiles with 0 blockers")
+  assert_true(!str_has(out, "Int32"), "no Int32 left:\n" + out)
+  assert_true(str_has(out, "at : Int"), "field")
+  assert_true(str_has(out, "gens : Array[(Option[Int], Int)]"), "nested Option/Array/tuple")
+  assert_true(str_has(out, "fn f(a : Int, b : Option[Int]) -> Int"), "params and return")
+  assert_true(str_has(out, "let c : Int ="), "let annotation")
+  assert_true(str_has(out, "(Int) -> Int"), "function type")
+  let src2 = "struct Int32 {\n  v : Int\n}\nfn h(x : Int32) -> Int {\n  x.v\n}\n"
+  let (_, out2, _) = f3d1a_transpile("own.mbt", src2)
+  assert_true(str_has(out2, "fn h(x : Int32) -> Int"), "a local type named Int32 is kept:\n" + out2)
+}
+
+test "F3d1a-2: Map::from_array / Map(arr, capacity=cap) keep [arr, cap] order and fail closed on aliasing" {
+  let src = "fn note(v : Int) -> Int {\n  v\n}\n" +
+  "fn mk(ks : Array[Int], ps : Array[(Int, Int)], c : Int) -> Int {\n" +
+  "  let m1 = Map::from_array([(1, 2), (1, 3)])\n" +
+  "  let m2 : Map[Int, Int] = [(9, 1)] |> Map::from_array\n" +
+  "  let m3 : Map[Int, Unit] = Map([], capacity=ks.length())\n" +
+  "  let m4 : Map[Int, Int] = Map([(note(1), 2)], capacity=note(3))\n" +
+  "  let m5 : Map[Int, Int] = Map(ps, capacity=c + 1)\n" +
+  "  m1.length() + m2.length() + m3.length() + m4.length() + m5.length()\n" +
+  "}\n"
+  let (blockers, out, _) = f3d1a_transpile("maps.mbt", src)
+  assert_true(blockers == 0, "map constructors transpile with 0 blockers:\n" + out)
+  assert_true(str_has(out, "let m1 = { let __mbt_pairs_") && str_has(out, " = [(1, 2), (1, 3)]; mbt_compat::ordered_map_from_array(__mbt_pairs_"), "untyped from_array binds its literal first:\n" + out)
+  assert_true(str_has(out, "let m2 : mbt_compat::OrderedMap[Int, Int] = [(9, 1)] |> mbt_compat::ordered_map_from_array"), "bare from_array as a typed pipe target")
+  assert_true(str_has(out, "mbt_compat::ordered_map_new_cap(ks.length())"), "empty literal + capacity")
+  assert_true(str_has(out, "mbt_compat::ordered_map_from_array_cap([(note(1), 2)], note(3))"), "fresh literal + call capacity")
+  assert_true(str_has(out, "mbt_compat::ordered_map_from_array_cap(ps, c + 1)"), "non-fresh array + call-free capacity")
+  let neg = "fn cap() -> Int {\n  4\n}\nfn bad(ps : Array[(Int, Int)]) -> Int {\n" +
+  "  let m : Map[Int, Int] = Map(ps, capacity=cap())\n  m.length()\n}\n"
+  let lit = "fn lit() -> Int {\n  let m = { 1: 10, 2: 20 }\n  let t : Map[Int, Int] = { 3: 30 }\n  m.length() + t.length()\n}\n"
+  let (_, lout, _) = f3d1a_transpile("lit.mbt", lit)
+  assert_true(str_has(lout, " = [(1, 10), (2, 20)]; mbt_compat::ordered_map_from_array(__mbt_pairs_"), "untyped map literal binds its pairs first:\n" + lout)
+  assert_true(str_has(lout, "= mbt_compat::ordered_map_from_array([(3, 30)])"), "typed map literal stays inline:\n" + lout)
+  let pipe = "fn p() -> Int {\n  let m = [(1, 2)] |> Map::from_array\n  m.length()\n}\n"
+  let (pb, _, pds) = f3d1a_transpile("pipe.mbt", pipe)
+  assert_true(pb > 0 && f3d1a_has_diag(pds, "MBT2PION_UNSUPPORTED_SYNTAX", "piped into `Map::from_array`"), "untyped literal pipe fails closed")
+  let (nb, _, nds) = f3d1a_transpile("neg.mbt", neg)
+  assert_true(nb > 0, "non-fresh array + capacity call blocks")
+  assert_true(f3d1a_has_diag(nds, "MBT2PION_UNSUPPORTED_SYNTAX", "`Map(arr, capacity=...)`"), "with its diagnostic")
+  assert_true(is_call_free_capacity_expr(lex_moonbit("a.b * 2 + -c"), 0, 8), "field reads and arithmetic are call-free")
+  assert_true(!is_call_free_capacity_expr(lex_moonbit("xs.length()"), 0, 5), "a method call is not")
+  assert_true(!is_call_free_capacity_expr(lex_moonbit("{ x = 1; 2 }"), 0, 7), "a block is not")
+}
+
+test "F3d1a-3: tuple map keys switch MapKey constructors to their pair / triple forms" {
+  let ln = "  let s = S::{ sids: mbt_compat::ordered_map_new() }"
+  let msg = "type `(Int, Int)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_new`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln, 22, msg) == Some("  let s = S::{ sids: mbt_compat::ordered_map_new_pair() }"), "pair")
+  let ln2 = "  let m = mbt_compat::ordered_map_from_array([((1, \"a\", true), 2)])"
+  let msg2 = "type `(Int, String, Bool)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_from_array`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln2, 11, msg2) == Some("  let m = mbt_compat::ordered_map_from_array_triple([((1, \"a\", true), 2)])"), "triple")
+  let ln3 = "  let m = mbt_compat::ordered_map_from_array_cap(ps, 4)"
+  let msg3 = "type `(Int, Int)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_from_array_cap`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln3, 11, msg3) == Some("  let m = mbt_compat::ordered_map_from_array_cap_pair(ps, 4)"), "cap form")
+  let msg4 = "type `Foo` does not implement trait `mbt_compat::MapKey` required by `ordered_map_new`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln, 22, msg4) is None, "a non-tuple key is left to fail")
+  let msg5 = "type `(Int, Int, Int, Int)` does not implement trait `mbt_compat::MapKey` required by `ordered_map_new`"
+  assert_true(rewrite_tuple_mapkey_call_at(ln, 22, msg5) is None, "4-tuples have no form")
+  assert_true(tuple_type_arity("(Int, (Int, Int))") == 2, "nested tuple counts once")
+  assert_true(tuple_type_arity("(Int, Int) -> Int") == 0, "a function type is not a tuple")
+  assert_true(tuple_type_arity("(Array[(Int, Int)], Bool)") == 2, "brackets nest")
+}
+
+test "F3d1a-4: shrink_to_fit keeps MoonBit's buffer semantics or fails closed" {
+  let src = "fn astra() -> (Int, Int, Int, Int) {\n" +
+  "  let xs : Array[Int] = Array(capacity=8)\n" +
+  "  xs.push(1)\n  xs.push(2)\n  let v = xs[:]\n  let c0 = xs.capacity()\n" +
+  "  xs.shrink_to_fit()\n  xs[0] = 9\n  (c0, xs.capacity(), v[0], xs[0])\n}\n"
+  let (blockers, out, _) = f3d1a_transpile("buf.mbt", src)
+  assert_true(blockers == 0, "ArrayBuf shrink transpiles:\n" + out)
+  assert_true(str_has(out, "let xs : mbt_compat::ArrayBuf[Int] = mbt_compat::ArrayBuf::with_capacity(8)"), "reserved capacity kept:\n" + out)
+  assert_true(str_has(out, "xs.shrink_to_fit()"), "ArrayBuf::shrink_to_fit")
+  // Plain arrays: the guard over the lowered text.
+  let ok = "fn f(n : N, faded : Array[Int]) -> Unit {\n" +
+  "  later(fn() { faded.clear(); faded.shrink_to_fit() })\n" +
+  "  if !n.props.is_empty() {\n    let props = n.props.copy()\n    n.props.clear()\n    n.props.shrink_to_fit()\n" +
+  "    for p in props {\n      p()\n    }\n  }\n" +
+  "  let any = n.props.iter().any(fn(x) { x > 0 })\n}\n"
+  let okt = lex_moonbit(ok)
+  let mut seen = 0
+  for i, t in okt {
+    if t.raw == "shrink_to_fit" {
+      seen = seen + 1
+      assert_true(shrink_snapshot_hazard(okt, i, Map()) == "", "no snapshot around call " + seen.to_string())
+    }
+  }
+  assert_true(seen == 2, "both calls checked")
+  let fields = collect_array_fields(["struct T {\n  g : Array[Int]\n  bag : Bag\n  mut h : Array[Int]\n}\nstruct U {\n  g : Array[String]\n}\n"])
+  assert_true(fields.get("g") == Some(true) && fields.get("bag") == Some(false), "array-typed fields")
+  let loops = [
+    ("fn f(t : T) -> Unit {\n  let g = mbt_compat::arr_copy(t.g)\n  t.g.clear()\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", ""),
+    ("fn f(t : T) -> Unit {\n  let g = t.g.copy()\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", ""),
+    ("fn f(t : T) -> Unit {\n  let g = t.bag.copy()\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", "for .. in"),
+    ("fn f(t : T) -> Unit {\n  let g = mbt_compat::arr_copy(t.g)\n  t.h = g\n  for e in g {\n    t.n.props.shrink_to_fit()\n  }\n}\n", "for .. in"),
+    ("fn f(t : T) -> Unit {\n  let g = t.g\n  for e in g {\n    t.g.shrink_to_fit()\n  }\n}\n", "for .. in"),
+  ]
+  for c in loops {
+    let ts = lex_moonbit(c.0)
+    let mut hit = "?"
+    for i, t in ts {
+      if t.raw == "shrink_to_fit" {
+        hit = shrink_snapshot_hazard(ts, i, fields)
+      }
+    }
+    assert_true(if c.1 == "" { hit == c.1 } else { str_has(hit, c.1) }, "loop over a private copy:\n" + c.0 + "got: " + hit)
+  }
+  let cases = [
+    ("fn f(xs : Array[Int]) -> Unit {\n  for x in xs {\n    if x == 1 {\n      xs.shrink_to_fit()\n    }\n  }\n}\n", "for .. in"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  mbt_compat::arr_each(xs, fn(x) { xs.shrink_to_fit() })\n}\n", "callback passed to `arr_each"),
+    ("fn f(xs : Array[Int]) -> Unit {\n  xs.each(fn(x) {\n    if x > 0 { xs.shrink_to_fit() }\n  })\n}\n", "callback passed to `each"),
+    ("fn f(xs : Array[Int]) -> Array[Int] {\n  let it = mbt_compat::arr_iter(xs)\n  xs.shrink_to_fit()\n  it.collect()\n}\n", "keeps an `Array::iter()`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let it = xs.iter().map(fn(x) { x })\n  xs.shrink_to_fit()\n  it.count()\n}\n", "keeps an `Array::iter()`"),
+  ]
+  for c in cases {
+    let ts = lex_moonbit(c.0)
+    let mut hit = ""
+    for i, t in ts {
+      if t.raw == "shrink_to_fit" {
+        hit = shrink_snapshot_hazard(ts, i, Map())
+      }
+    }
+    assert_true(str_has(hit, c.1), "hazard `" + c.1 + "` for:\n" + c.0 + "got: " + hit)
+  }
+  // Kept iterators: appends alone or in-place writes alone are exact; removals, or appends + writes, are not.
+  let iters = [
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs.push(2)\n  it.count()\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs[0] = 2\n  it.count()\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let n = xs.iter().count()\n  xs.pop()\n  n\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs.pop()\n  it.count()\n}\n", "`xs.pop(..)`"),
+    ("fn f(d : Array[Int]) -> Bool {\n  let xs = [1]\n  d.push_iter(xs.iter())\n  f(xs)\n  d.iter().zip(xs.iter()).all(fn(p) { p.0 == p.1 })\n}\n", ""),
+    ("fn f(d : Array[Int]) -> Int {\n  let xs = [1]\n  let z = xs.iter()\n  xs.pop()\n  z.count()\n}\n", "`xs.pop(..)`"),
+    ("fn f(d : Array[Int]) -> Int {\n  d.push_iter([7].iter())\n  let z = [1, 2].iter().zip([3].iter().map(fn(x) { x }))\n  d.pop()\n  z.count()\n}\n", ""),
+    ("fn f(d : Array[Array[Int]]) -> Int {\n  let z = d[0].iter()\n  d[0].pop()\n  z.count()\n}\n", "computed array"),
+    ("fn f(xs : Array[Int]) -> MbtIter[Int] {\n  let it = xs.iter()\n  it\n}\n", "leaves its expression"),
+    ("fn f(xs : Array[Int], b : B) -> Unit {\n  b.it = xs.iter()\n}\n", "not bound by `let`"),
+    ("fn f(xs : Array[Int]) -> Int {\n  let mut n = 0\n  for x in xs.iter() {\n    n = n + x\n  }\n  n\n}\n", ""),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  xs.push(2)\n  xs[0] = 3\n  it.count()\n}\n", "appended to and written"),
+    ("fn f() -> Int {\n  let xs = [1]\n  let it = xs.iter()\n  mbt_compat::arr_truncate(xs, 0)\n  it.count()\n}\n", "passed to `arr_truncate"),
+  ]
+  for c in iters {
+    let ts = lex_moonbit(c.0)
+    let mut hit = "?"
+    for i, t in ts {
+      if t.kind == TokenKind::Dot && i + 1 < ts.length() && ts[i + 1].raw == "iter" {
+        hit = kept_iter_hazard(ts, i)
+      }
+    }
+    assert_true(if c.1 == "" { hit == "" } else { str_has(hit, c.1) }, "kept iterator:\n" + c.0 + "got: " + hit)
+  }
+  let (r1, a1, b1) = array_ctor_capacity_range(lex_moonbit("Array::new(capacity=n + 1,)"), 0, 11)
+  assert_true(r1 == 10 && a1 == 6 && b1 == 9, "Array::new(capacity=..) with a trailing comma")
+  let (r0, a0, _) = array_ctor_capacity_range(lex_moonbit("Array()"), 0, 3)
+  assert_true(r0 == 2 && a0 < 0, "Array() has no capacity")
+  let (r2, _, _) = array_ctor_capacity_range(lex_moonbit("Array(1, 2)"), 0, 6)
+  assert_true(r2 < 0, "positional arguments are not a capacity constructor")
+}
+
+test "F3d1a-5: Array(capacity=n) keeps the negative-capacity abort" {
+  let src = "fn mk(n : Int) -> Array[Int] {\n  let a : Array[Int] = Array(capacity=n)\n  let b : Array[Int] = Array::new(capacity=n)\n  a\n}\n"
+  let (blockers, out, _) = f3d1a_transpile("cap.mbt", src)
+  assert_true(blockers == 0, "capacity constructors transpile")
+  assert_true(str_has(out, "{ mbt_compat::arr_capacity_check(n); [] }"), "both forms check:\n" + out)
+  assert_true(!str_has(out, "let _ = n"), "the old discard is gone")
+}
