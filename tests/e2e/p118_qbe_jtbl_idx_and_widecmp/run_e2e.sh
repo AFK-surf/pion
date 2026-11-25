@@ -11,7 +11,7 @@
 #             optional 32-bit offset) against a constant, when both ends of the
 #             interval agree.
 # Verifies:
-#   1. gen_il.py jtbl.ssa (29 selector definitions x {dead, live on the
+#   1. gen_il.py jtbl.ssa (30 selector definitions x {dead, live on the
 #      successors}, plus two with 16 other live values; duplicate entries,
 #      default, dirty high halves such as 0xdeadbeef00000002): the dispatch
 #      form and entry count of every table in amd64_sysv text and ELF `--obj`
@@ -52,7 +52,7 @@ fail() {
 
 F="$TMP_DIR/fix"
 python3 -E "$DIR/gen_il.py" "$F"
-[ "$(wc -l < "$F/jtbl_expect.txt" | tr -d ' ')" -eq 60 ] || fail "jtbl_expect.txt length"
+[ "$(wc -l < "$F/jtbl_expect.txt" | tr -d ' ')" -eq 62 ] || fail "jtbl_expect.txt length"
 [ "$(wc -l < "$F/bounds_expect.txt" | tr -d ' ')" -eq 432 ] || fail "bounds_expect.txt length"
 
 HOST_S="$(uname -s)"
@@ -63,6 +63,11 @@ case "$HOST_S/$HOST_M" in
   Linux/aarch64|Linux/arm64) HT=arm64 ;;
   Darwin/arm64|Darwin/aarch64) HT=arm64_apple; OBJ=1 ;;
   *) HT="" ;;
+esac
+
+# The usual toolchains of these hosts have an x86-64 objdump (cross-check).
+case "$HOST_S/$HOST_M" in
+  Linux/x86_64|Linux/amd64|Darwin/*) export P118_OBJDUMP=1 ;;
 esac
 
 # 1a. Dispatch forms: amd64_sysv text == --obj, amd64_win text.
@@ -118,7 +123,20 @@ done
 rejects entries "d_arg_0 compares against 9, want 8 entries" "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/mutn.s"
 rejects self-copy "d_add_0: text " "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" both "$TMP_DIR/mutc.s" "$TMP_DIR/jt.o"
 rejects self-copy-asm "d_add_0 is bad" "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/mutc.s"
-echo "p118 dispatch checker rejects 8 mutations"
+# Instruction boundaries: an immediate ending like `movl %r10d, %r10d` is no
+# self-copy (d_addmagic_0 above; its bytes must be there), and a self-copy after
+# an immediate that looks like a REX prefix is one.
+python3 -E - "$TMP_DIR/jt.o" <<'PYEOF'
+import sys
+if open(sys.argv[1], 'rb').read().count(bytes.fromhex('004589d24183fa08')) != 1:
+    raise SystemExit('FAIL: p118 d_addmagic_0: immediate bytes not found before the compare')
+PYEOF
+python3 -E "$DIR/mk_selfcopy.py" "$TMP_DIR"
+grep -qx 'd_addmagic_0 direct 8' "$F/jtbl_expect.txt" || fail "d_addmagic_0 expectation"
+python3 -E "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/selfcopy_ok.o"
+rejects elf-self-copy-both "selfcopy: text " "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" both "$TMP_DIR/selfcopy.s" "$TMP_DIR/selfcopy_bad.o"
+rejects elf-self-copy-obj "selfcopy is bad" "$DIR/check_dispatch.py" "$TMP_DIR/selfcopy_expect.txt" obj "$TMP_DIR/selfcopy_bad.o"
+echo "p118 dispatch checker rejects 10 mutations"
 
 # 1b. GVN folds exactly the constant comparisons.
 for T in amd64_sysv amd64_win arm64 arm64_apple; do
@@ -151,10 +169,10 @@ elif [ "${PION_REQUIRE_SANITIZERS:-0}" = 1 ]; then
   fail "needs UBSan for the C driver (PION_REQUIRE_SANITIZERS=1) but $CC_BIN cannot build one"
 fi
 echo "p118 C driver sanitizers: ${DRV_SAN:-<none>}"
-# (2048 + 5 * 12 * 4 * 2) inputs x 60 tables; 18 * 5 inputs x 432 comparisons.
-EXPECT_RUN="jtbl 151680
+# (2048 + 5 * 12 * 4 * 2) inputs x 62 tables; 18 * 5 inputs x 432 comparisons.
+EXPECT_RUN="jtbl 156736
 bounds 38880
-total 190560 bad 0"
+total 195616 bad 0"
 host_run() { # $1 label, then objects / assembly files
   label=$1
   shift
@@ -168,7 +186,7 @@ host_run() { # $1 label, then objects / assembly files
     diff -u "$TMP_DIR/check.want" "$TMP_DIR/check_$label.out" >&2 || true
     fail "host $label: unexpected driver output"
   fi
-  echo "p118 host $label: 190560 checks, bad 0"
+  echo "p118 host $label: 195616 checks, bad 0"
 }
 # 2. p114 loop tables next to sinktablehomes.
 mkdir -p "$TMP_DIR/cfg"

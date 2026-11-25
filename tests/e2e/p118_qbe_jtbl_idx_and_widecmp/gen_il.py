@@ -45,6 +45,8 @@ KINDS = [
     ('or', ['%x =w copy %w', '%i =w or %x, %arg'], 'x | y', 1, 'w'),
     ('xor', ['%x =w copy %w', '%i =w xor %x, %arg'], 'x ^ y', 1, 'w'),
     ('addimm', ['%x =w copy %w', '%i =w add %x, 4294967293'], 'x - 3u', 1, 'w'),
+    # The immediate's bytes (00 45 89 d2) end like `movl %r10d, %r10d`.
+    ('addmagic', ['%x =w copy %w', '%i =w add %x, 3532211456'], 'x + 3532211456u', 1, 'w'),
     ('subimm', ['%x =w copy %w', '%i =w sub %x, 2'], 'x - 2u', 1, 'w'),
     ('addmem', ['%m =w loadw %p', '%i =w add %m, %arg'], 'x + y', 1, 'w'),
     # No proof of a clear high half: parameters, calls, unlisted or 64-bit ops.
