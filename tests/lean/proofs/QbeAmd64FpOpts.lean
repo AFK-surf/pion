@@ -5,9 +5,12 @@ optimizations and the text-assembly conversion width fix in
 
 Register copies (`Ocopy`, also reached from `Oneg` / `Odiv` through
 `emitcopy`). A QBE `s` / `d` value lives only in the low 32 / 64 bits of an
-XMM register. Both emitters now copy XMM to XMM with `movaps` (`0f 28 /r`),
-which writes the whole register instead of merging the low lane into the old
-destination value; memory and stack-slot moves keep `movss` / `movsd`.
+XMM register. The amd64_sysv emitters (text and direct ELF) now copy XMM to
+XMM with `movaps` (`0f 28 /r`), which writes the whole register instead of
+merging the low lane into the old destination value; memory and stack-slot
+moves keep `movss` / `movsd`. amd64_win keeps the scalar moves and adds no
+`xorps` below: xmm6..xmm15 are callee-saved in all 128 bits there and QBE
+does not save them.
 
   1. `copyEquiv`: a full-register copy and a scalar low-lane merge agree on
      the low lane of every register.

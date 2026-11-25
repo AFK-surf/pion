@@ -465,7 +465,8 @@ emitins(Ins i, E *e)
 		break;
 	case Oswtof:
 	case Osltof:
-		/* Scalar SSE conversion merges the unused upper lanes. */
+		/* Scalar SSE conversion merges the unused upper lanes
+		 * (grouped_cvt is never set by amd64_winabi_emitfn). */
 		if (e->grouped_cvt)
 			emitf("xorps %=, %=", &i, e);
 		goto Table;
@@ -527,8 +528,10 @@ emitins(Ins i, E *e)
 			break;
 		if (req(i.to, i.arg[0]))
 			break;
-		/* A register copy only has a live scalar low lane. */
-		if (KBASE(i.cls) && isreg(i.to) && isreg(i.arg[0])) {
+		/* A register copy only has a live scalar low lane. Not on
+		 * Windows: xmm6..xmm15 are callee-saved there (all 128 bits)
+		 * and amd64_win does not save them, so keep the low-lane move. */
+		if (!T.windows && KBASE(i.cls) && isreg(i.to) && isreg(i.arg[0])) {
 			emitf("movaps %0, %=", &i, e);
 			break;
 		}
@@ -928,7 +931,8 @@ amd64_winabi_emitfn(Fn *fn, FILE *f)
 	for (lbl=0, b=fn->start; b; b=b->link) {
 		if (lbl || b->npred > 1)
 			fprintf(f, "%sbb%d:\n", T.asloc, id0+b->id);
-		e->grouped_cvt = amd64_grouped_cvt(b);
+		/* e->grouped_cvt stays 0: no xorps on Windows, where the
+		 * upper lanes of xmm6..xmm15 are callee-saved. */
 		for (i=b->ins; i!=&b->ins[b->nins]; i++)
 			emitins(*i, e);
 		lbl = 1;

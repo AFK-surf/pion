@@ -58,7 +58,9 @@ struct Amd64Op {
 };
 
 /* Isolated conversions do not justify an extra instruction on all CPUs.
- * A group of conversions can repeatedly merge unused destination lanes. */
+ * A group of conversions can repeatedly merge unused destination lanes.
+ * Used by amd64_sysv (text and ELF) only: amd64_win does not save the
+ * callee-saved xmm6..xmm15, so it adds no xorps there. */
 static inline int
 amd64_grouped_cvt(const Blk *b)
 {

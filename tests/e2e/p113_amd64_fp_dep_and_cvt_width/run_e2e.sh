@@ -3,10 +3,11 @@
 # width fix (vendor/qbe/amd64/{all.h,elf.c,emit.c};
 # Lean: tests/lean/proofs/QbeAmd64FpOpts.lean).
 #   copy      XMM -> XMM `Ocopy` (also from `Oneg` / `Odiv` via emitcopy) is
-#             `movaps` in both emitters; memory moves stay movss / movsd.
+#             `movaps` in the amd64_sysv text and ELF emitters; memory moves
+#             stay movss / movsd; amd64_win is unchanged.
 #   grouped   `amd64_grouped_cvt`: a block with >= 2 `swtof` / `sltof`
-#             zeroes each destination with `xorps` first; isolated
-#             conversions are unchanged.
+#             zeroes each destination with `xorps` first (amd64_sysv text
+#             and ELF); isolated conversions are unchanged.
 #   width     text templates `cvtsi2%kl` / `cvtsi2%kq`: GNU `as` used to
 #             encode `cvtsi2sd off(%rsp), %xmm0` from an i64 slot as a dword
 #             load (2^32 + 1 -> 1.0).
@@ -21,7 +22,9 @@
 #      register copy, no register-register movss / movsd, explicit
 #      cvtsi2{ss,sd}{l,q}, one xorps before each conversion of the grouped
 #      blocks (register pressure included) and none in the isolated ones;
-#      `qbe -t amd64_win` text likewise. QBE always reloads a spilled
+#      `qbe -t amd64_win` text keeps movss / movsd and adds no xorps
+#      (xmm6..xmm15 are callee-saved on Windows and not saved by QBE) but
+#      has the same explicit conversion widths. QBE always reloads a spilled
 #      conversion source into a register, so slots.ssa reaches the
 #      memory-operand forms through a test-only QBE (qbe_*_hook.c, built
 #      with ASan + UBSan when available) that rewrites the slot_* bodies
@@ -203,21 +206,29 @@ def functions(path):
 CVT = re.compile(r'^cvtsi2(ss|sd)([lq]) (\S+), %(xmm\d+)$')
 for path, target in ((sys.argv[1], 'amd64_sysv'), (sys.argv[2], 'amd64_win')):
     fs = functions(path)
+    win = target == 'amd64_win'
+    # amd64_win keeps scalar register moves and adds no xorps: xmm6..xmm15
+    # are callee-saved (all 128 bits) there and QBE does not save them.
+    REGMOVE = r'^movs[sd] %xmm\d+, %xmm\d+$' if win else r'^movaps %xmm\d+, %xmm\d+$'
+    ZERO = re.compile(r'^xorps (%xmm\d+), \1$')
     def body(name):
         need(name in fs, f"{target}: no function {name} (got {sorted(fs)})")
         return fs[name]
     for name, ins in fs.items():
         for ln in ins:
-            need(not re.match(r'^movs[sd] %xmm\d+, %xmm\d+$', ln),
-                 f"{target} {name}: register-register scalar move `{ln}`")
+            if win:
+                need(not ln.startswith('movaps') and not ZERO.match(ln), f"{target} {name}: `{ln}` on Windows")
+            else:
+                need(not re.match(r'^movs[sd] %xmm\d+, %xmm\d+$', ln),
+                     f"{target} {name}: register-register scalar move `{ln}`")
             need(not re.match(r'^cvtsi2s[sd] ', ln), f"{target} {name}: conversion without width suffix `{ln}`")
     for name, want in (('second_d', 1), ('second_s', 1), ('neg_d', 1), ('neg_s', 1),
                        ('div_ba', 2), ('div_ba_s', 2), ('div_xx', 1), ('div_xx_s', 1)):
-        got = sum(1 for ln in body(name) if re.match(r'^movaps %xmm\d+, %xmm\d+$', ln))
-        need(got == want, f"{target} {name}: {got} movaps, want {want}: {body(name)}")
-    need(any(ln.startswith('movaps ') for ln in body('swap_sel')), f"{target} swap_sel: no movaps")
+        got = sum(1 for ln in body(name) if re.match(REGMOVE, ln))
+        need(got == want, f"{target} {name}: {got} register copies, want {want}: {body(name)}")
+    need(any(re.match(REGMOVE, ln) for ln in body('swap_sel')), f"{target} swap_sel: no register copy")
     for name in ('div_ab', 'div_ab_s'):
-        need(not any('movaps' in ln for ln in body(name)), f"{target} {name}: needs no copy: {body(name)}")
+        need(not any(re.match(REGMOVE, ln) for ln in body(name)), f"{target} {name}: needs no copy: {body(name)}")
     mc = body('mem_copy')
     need(sum(1 for ln in mc if re.match(r'^movs[sd] ', ln) and '(' in ln) == 4 and
          not any('movaps' in ln for ln in mc), f"{target} mem_copy: memory moves must stay scalar: {mc}")
@@ -234,14 +245,17 @@ for path, target in ((sys.argv[1], 'amd64_sysv'), (sys.argv[2], 'amd64_win')):
         cs = convs(name)
         need(len(cs) == 1 and cs[0][1:3] == (prec, width), f"{target} {name}: want one cvtsi2{prec}{width}: {body(name)}")
     for name in ('iso_wd', 'iso_ld', 'iso_ws', 'iso_ls', 'pressure_iso', 'pressure_iso_s'):
-        need(not any(ln.startswith('xorps') for ln in body(name)), f"{target} {name}: isolated conversion got xorps")
+        need(not any(ZERO.match(ln) for ln in body(name)), f"{target} {name}: isolated conversion got xorps")
     def grouped(name, want):
         cs = convs(name)
         got = sorted(c[1] + c[2] for c in cs)
         need(got == sorted(want), f"{target} {name}: conversions {got}, want {sorted(want)}")
+        n = sum(1 for ln in body(name) if ZERO.match(ln))
+        if win:
+            need(n == 0, f"{target} {name}: {n} xorps on Windows")
+            return cs
         for k, _, _, _, dst, ins in cs:
             need(k > 0 and ins[k - 1] == f'xorps %{dst}, %{dst}', f"{target} {name}: `{ins[k]}` not preceded by xorps %{dst}")
-        n = sum(1 for ln in body(name) if ln.startswith('xorps'))
         need(n == len(cs), f"{target} {name}: {n} xorps for {len(cs)} conversions")
         return cs
     grouped('grouped', ['sdl', 'sdl', 'sdq', 'sdq', 'ssl', 'ssl', 'ssq', 'ssq'])
@@ -262,7 +276,7 @@ for path, target in ((sys.argv[1], 'amd64_sysv'), (sys.argv[2], 'amd64_win')):
                      all(re.match(r'^-?\d*\(%r[sb]p\)$', c_[3]) for c_ in cs),
                      f"{target} {name}: want memory-operand cvtsi2{want[0]} from the slot: {body(name)}")
                 if g == 'i':
-                    need(not any(ln.startswith('xorps') for ln in body(name)), f"{target} {name}: isolated conversion got xorps")
+                    need(not any(ZERO.match(ln) for ln in body(name)), f"{target} {name}: isolated conversion got xorps")
     print(f"p113 {target} text asm ok ({len(fs)} functions)")
 PYEOF
 

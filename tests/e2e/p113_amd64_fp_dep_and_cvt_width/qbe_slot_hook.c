@@ -2,7 +2,8 @@
  * source in its stack slot (`amd64_op[].nmem` is 0 for both, so spill.c
  * reloads it), so the memory-operand forms are reached here directly: after
  * register allocation, the body of each `slot_*` function of slots.ssa is
- * replaced by a store of its integer argument to SLOT(0) followed by one or
+ * replaced by a store of its first integer argument (%rdi, or %rcx on
+ * Windows) to SLOT(0) followed by one or
  * two conversions reading that slot. Both emitters (`--obj` and text) then
  * encode `cvtsi2{ss,sd}{l,q} off(%rsp), %xmmN` from the same instructions. */
 #include <string.h>
@@ -25,7 +26,7 @@ inject(Fn *fn)
 	k = fn->name[7] == 'd' ? Kd : Ks;
 	n = 0;
 	fn->slot = 8;
-	ops[n++] = (Ins){op == Osltof ? Ostorel : Ostorew, Kw, R, {TMP(RDI), SLOT(0)}};
+	ops[n++] = (Ins){op == Osltof ? Ostorel : Ostorew, Kw, R, {T.windows ? TMP(RCX) : TMP(RDI), SLOT(0)}};
 	if (fn->name[5] == 'g')
 		ops[n++] = (Ins){op, k, TMP(XMM1), {SLOT(0), R}};
 	ops[n++] = (Ins){op, k, TMP(XMM0), {SLOT(0), R}};
