@@ -1,6 +1,24 @@
 #!/bin/sh
 set -eu
 
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --no-bench)
+      PION_SKIP_BENCH=1
+      export PION_SKIP_BENCH
+      shift
+      ;;
+    -h|--help)
+      echo "usage: sh scripts/bootstrap.sh [--no-bench]"
+      exit 0
+      ;;
+    *)
+      echo "error: unknown option: $1" >&2
+      exit 1
+      ;;
+  esac
+done
+
 export PATH="/opt/homebrew/bin:/usr/bin:/bin:$PATH"
 
 # Bypass macOS /usr/bin/{cc,clang,ar,strip,ld,git} xcrun shims (~17ms/call).
@@ -141,6 +159,7 @@ S1_BYTES=$(wc -c < "$OUT_DIR/pionc1" | tr -d ' ')
 echo "Stage 1 (pionc1): build=${S1_MS} ms, stage1.ssa=${S1_SSA_LINES} lines (${S1_SSA_BYTES} bytes), binary=${S1_BYTES} bytes"
 
 echo "=== [4/9] Stage 2: pionc1 -> out/pionc2 (fresh CAS, pure pion native + multicore) ==="
+rm -f "$OUT_DIR/.built-rev"
 CAS_S2="$TMP_DIR/cas_stage2"
 mkdir -p "$CAS_S2"
 T_S2_0=$(now_ms)
@@ -325,35 +344,39 @@ if [ "$ADT_OUT" != "$ADT_EXP" ]; then
   exit 1
 fi
 
-"$PIONC2" build -o "$TMP_DIR/multicore_bench" "$ROOT_DIR/tests/e2e/multicore_bench.pion"
-BENCH_NCPUS=""
-case "${PION_BENCH_NCPUS:-}" in
-  ""|*[!0-9]*) ;;
-  *)
-    _ov=$(awk -v s="${PION_BENCH_NCPUS}" 'BEGIN { v=0; for(i=1;i<=length(s);i++){ d=substr(s,i,1)+0; if(v<1000000){ v=v*10+d; if(v>1000000) v=1000000 } } if(v>0) print v }')
-    if [ -n "$_ov" ]; then BENCH_NCPUS="$_ov"; fi
-    ;;
-esac
-if [ -z "$BENCH_NCPUS" ]; then
-  BENCH_NCPUS="$(sysctl -n hw.activecpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
-  _cg_root="${PION_TEST_CGROUP_ROOT:-/sys/fs/cgroup}"
-  _cg_proc="${PION_TEST_PROC_CGROUP:-/proc/self/cgroup}"
-  if [ -r "$_cg_proc" ] && [ -d "$_cg_root" ]; then
-    _cg_rel=$(awk -F: '$1 == "0" && $2 == "" { sub(/^0::/, ""); print; exit }' "$_cg_proc" 2>/dev/null || true)
-    _cg_cur="${_cg_root}${_cg_rel}"
-    while :; do
-      if [ -r "$_cg_cur/cpu.max" ]; then
-        _cg=$(awk 'NR==1 && $1 != "max" && $2 > 0 { q=int($1/$2); if (q<1) q=1; print q }' "$_cg_cur/cpu.max" 2>/dev/null || true)
-        if [ -n "$_cg" ] && [ "$_cg" -lt "$BENCH_NCPUS" ] 2>/dev/null; then BENCH_NCPUS="$_cg"; fi
-      fi
-      [ "$_cg_cur" = "$_cg_root" ] && break
-      _cg_parent="${_cg_cur%/*}"
-      [ -z "$_cg_parent" ] || [ "$_cg_parent" = "$_cg_cur" ] && break
-      _cg_cur="$_cg_parent"
-    done
+if [ "${PION_SKIP_BENCH:-0}" = "1" ]; then
+  echo "multicore_bench: skipped (PION_SKIP_BENCH=1)"
+else
+  "$PIONC2" build -o "$TMP_DIR/multicore_bench" "$ROOT_DIR/tests/e2e/multicore_bench.pion"
+  BENCH_NCPUS=""
+  case "${PION_BENCH_NCPUS:-}" in
+    ""|*[!0-9]*) ;;
+    *)
+      _ov=$(awk -v s="${PION_BENCH_NCPUS}" 'BEGIN { v=0; for(i=1;i<=length(s);i++){ d=substr(s,i,1)+0; if(v<1000000){ v=v*10+d; if(v>1000000) v=1000000 } } if(v>0) print v }')
+      if [ -n "$_ov" ]; then BENCH_NCPUS="$_ov"; fi
+      ;;
+  esac
+  if [ -z "$BENCH_NCPUS" ]; then
+    BENCH_NCPUS="$(sysctl -n hw.activecpu 2>/dev/null || nproc 2>/dev/null || echo 4)"
+    _cg_root="${PION_TEST_CGROUP_ROOT:-/sys/fs/cgroup}"
+    _cg_proc="${PION_TEST_PROC_CGROUP:-/proc/self/cgroup}"
+    if [ -r "$_cg_proc" ] && [ -d "$_cg_root" ]; then
+      _cg_rel=$(awk -F: '$1 == "0" && $2 == "" { sub(/^0::/, ""); print; exit }' "$_cg_proc" 2>/dev/null || true)
+      _cg_cur="${_cg_root}${_cg_rel}"
+      while :; do
+        if [ -r "$_cg_cur/cpu.max" ]; then
+          _cg=$(awk 'NR==1 && $1 != "max" && $2 > 0 { q=int($1/$2); if (q<1) q=1; print q }' "$_cg_cur/cpu.max" 2>/dev/null || true)
+          if [ -n "$_cg" ] && [ "$_cg" -lt "$BENCH_NCPUS" ] 2>/dev/null; then BENCH_NCPUS="$_cg"; fi
+        fi
+        [ "$_cg_cur" = "$_cg_root" ] && break
+        _cg_parent="${_cg_cur%/*}"
+        [ -z "$_cg_parent" ] || [ "$_cg_parent" = "$_cg_cur" ] && break
+        _cg_cur="$_cg_parent"
+      done
+    fi
   fi
+  PION_BENCH_NCPUS="$BENCH_NCPUS" "$TMP_DIR/multicore_bench"
 fi
-PION_BENCH_NCPUS="$BENCH_NCPUS" "$TMP_DIR/multicore_bench"
 
 "$PIONC2" build --emit-ssa "$TMP_DIR/contracts_dev.ssa" -o "$TMP_DIR/contracts_dev" "$ROOT_DIR/tests/e2e/contracts.pion"
 if ! grep -q "pion_debug_assert" "$TMP_DIR/contracts_dev.ssa"; then
@@ -454,6 +477,10 @@ echo "LRU eviction test (5 builds, 4KB cap): index entries=${INDEX_LINES}, obj f
 if [ "$INDEX_LINES" -ge 5 ] || [ "$OBJ_FILES" -ge 5 ]; then
   echo "FAIL: LRU eviction did not evict old CAS entries!" >&2
   exit 1
+fi
+
+if _head_rev="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null)"; then
+  printf '%s\n' "$_head_rev" > "$OUT_DIR/.built-rev"
 fi
 
 echo "=== SUMMARY ==="

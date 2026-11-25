@@ -54,12 +54,32 @@ find_pionc() {
   return 1
 }
 
+NEED_BOOTSTRAP=0
 PIONC_BIN=""
 if ! PIONC_BIN=$(find_pionc); then
   if [ "$NO_BOOTSTRAP" -eq 1 ]; then
     echo "FAIL: no built pionc found in $OUT_DIR and --no-bootstrap was set" >&2
     exit 1
   fi
+  NEED_BOOTSTRAP=1
+elif [ "$NO_BOOTSTRAP" -eq 0 ]; then
+  if _cur_rev="$(git -C "$ROOT_DIR" rev-parse HEAD 2>/dev/null)"; then
+    _built_rev=""
+    if [ -f "$OUT_DIR/.built-rev" ]; then
+      _built_rev="$(tr -d ' \t\r\n' < "$OUT_DIR/.built-rev" 2>/dev/null || true)"
+    fi
+    _dirty="$(git -C "$ROOT_DIR" status --porcelain -- compiler runtime scripts 2>/dev/null || true)"
+    if [ "$_built_rev" != "$_cur_rev" ]; then
+      echo "Cached $PIONC_BIN is stale (built='${_built_rev:-unknown}', HEAD='$_cur_rev'); re-bootstrapping..."
+      NEED_BOOTSTRAP=1
+    elif [ -n "$_dirty" ]; then
+      echo "Working tree has uncommitted changes in compiler/runtime/scripts; re-bootstrapping..."
+      NEED_BOOTSTRAP=1
+    fi
+  fi
+fi
+
+if [ "$NEED_BOOTSTRAP" -eq 1 ]; then
   echo "Bootstrapping pionc..."
   if [ "$UNAME_S" = "Linux" ]; then
     mkdir -p "$OUT_DIR"
@@ -75,9 +95,9 @@ if ! PIONC_BIN=$(find_pionc); then
       -Wall -Wextra -Werror -c "$ROOT_DIR/runtime/pion_cli.c" -o "$OUT_DIR/pion_cli.o"
     rm -f "$OUT_DIR/libpionrt_cli.a"
     ar rcs "$OUT_DIR/libpionrt_cli.a" "$OUT_DIR/pion_rt.o" "$OUT_DIR/pion_cli.o"
-    PION_SKIP_RT_TEST=1 CC="$CC_BIN" sh "$ROOT_DIR/scripts/bootstrap.sh"
+    PION_SKIP_RT_TEST=1 CC="$CC_BIN" sh "$ROOT_DIR/scripts/bootstrap.sh" --no-bench
   else
-    sh "$ROOT_DIR/scripts/bootstrap.sh"
+    sh "$ROOT_DIR/scripts/bootstrap.sh" --no-bench
   fi
   PIONC_BIN=$(find_pionc)
 fi

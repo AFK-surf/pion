@@ -675,6 +675,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_l1a_soundness/run_e2e.sh" "$PIONC"
 # Unit pattern Ok(()), self-referencing generic closure callback 2-pass infer, unannotated closure early return merge & QBE ABI.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/closure_early_ret_and_infer/run_e2e.sh" "$PIONC"
+# Generic arithmetic operator instantiation checks & QBE monomorphization (dev, --release, wasm32, ASan).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/generic_arith_mono/run_e2e.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
 # Real `as`: its [5/5] builds the tests/tv/qbe_bugs reproducers through QBE text
 # assembly (and cc compiles their C driver) besides `--obj`.
