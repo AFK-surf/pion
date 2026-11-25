@@ -6783,6 +6783,18 @@ fn bind_pattern(
             i = i + 1
           }
         }
+        TUnit =>
+          if sub.length() != 0 {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "tuple pattern cannot match `" + ty_to_string(scrut_ty) + "`",
+              "tuple",
+              ty_to_string(scrut_ty),
+              "use a pattern matching `" + ty_to_string(scrut_ty) + "`",
+            )
+          }
         TError => ()
         _ =>
           tc_err(
@@ -8670,6 +8682,18 @@ fn check_stmt(
               ni = ni + 1
             }
           }
+        TUnit =>
+          if names.length() != 0 {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "cannot destructure non-tuple type `" + ty_to_string(final_ty) + "`",
+              "tuple of " + names.length().to_string() + " element(s)",
+              ty_to_string(final_ty),
+              "destructure a tuple value or use a plain `let x = ...` binding",
+            )
+          }
         TError => {
           let mut ni = 0
           while ni < names.length() {
@@ -9173,10 +9197,25 @@ fn check_stmt(
             _ => env.inferred_ret = Some(rty)
           }
         Some(prev) =>
-          if ty_has_unresolved(prev) && !ty_has_unresolved(rty) {
-            match rty {
-              TNever => ()
-              _ => env.inferred_ret = Some(rty)
+          match rty {
+            TNever => ()
+            _ => {
+              match env.ret_ty {
+                TError =>
+                  if !ty_compat(prev, rty) {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_TYPE_MISMATCH",
+                      "return type mismatch",
+                      ty_to_string(prev),
+                      ty_to_string(rty),
+                      "return a value of type `" + ty_to_string(prev) + "`",
+                    )
+                  }
+                _ => ()
+              }
+              env.inferred_ret = Some(ty_prefer_concrete(prev, rty))
             }
           }
       }
@@ -12448,6 +12487,95 @@ fn ty_has_tparam(t : Ty) -> Bool {
 }
 
 ///|
+///|
+fn collect_unbound_tparams_in_ty(
+  t : Ty,
+  type_params : Array[String],
+  subst : Map[String, Ty],
+  out : Array[String],
+) -> Unit {
+  match t {
+    TParam(tp) =>
+      if str_arr_contains(type_params, tp) && !str_arr_contains(out, tp) {
+        let is_unbound = match subst.get(tp) {
+          Some(st) => ty_has_unresolved(st)
+          None => true
+        }
+        if is_unbound {
+          out.push(tp)
+        }
+      }
+    TArray(e) | TFixedArray(e) | TImmArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      collect_unbound_tparams_in_ty(e, type_params, subst, out)
+    TResult(o, e) | TMap(o, e) => {
+      collect_unbound_tparams_in_ty(o, type_params, subst, out)
+      collect_unbound_tparams_in_ty(e, type_params, subst, out)
+    }
+    TStruct(_, args) | TEnum(_, args) | TTuple(args) => {
+      let mut i = 0
+      while i < args.length() {
+        collect_unbound_tparams_in_ty(args[i], type_params, subst, out)
+        i = i + 1
+      }
+    }
+    TFn(ps, r) => {
+      let mut i = 0
+      while i < ps.length() {
+        collect_unbound_tparams_in_ty(ps[i], type_params, subst, out)
+        i = i + 1
+      }
+      collect_unbound_tparams_in_ty(r, type_params, subst, out)
+    }
+    _ => ()
+  }
+}
+
+///|
+fn collect_unbound_fn_param_tparams(
+  raw_param_ty : Ty,
+  is_opt_wrap : Bool,
+  type_params : Array[String],
+  subst : Map[String, Ty],
+) -> Array[String] {
+  let out : Array[String] = []
+  let fn_ty = if is_opt_wrap {
+    match raw_param_ty {
+      TOption(inner) => inner
+      _ => raw_param_ty
+    }
+  } else {
+    raw_param_ty
+  }
+  match fn_ty {
+    TFn(ps, _) => {
+      let mut i = 0
+      while i < ps.length() {
+        collect_unbound_tparams_in_ty(ps[i], type_params, subst, out)
+        i = i + 1
+      }
+    }
+    _ => ()
+  }
+  out
+}
+
+///|
+fn any_tparam_now_concrete(tps : Array[String], subst : Map[String, Ty]) -> Bool {
+  let mut i = 0
+  while i < tps.length() {
+    match subst.get(tps[i]) {
+      Some(t) =>
+        if !ty_has_unresolved(t) {
+          return true
+        }
+      None => ()
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
 fn moved_clone(m : Map[String, Span]) -> Map[String, Span] {
   let out : Map[String, Span] = Map([])
   let ks = m.keys()
@@ -13760,6 +13888,21 @@ fn check_fn_call(
       }
     }
     if !handled_opt_into {
+      let unbound_param_tps : Array[String] = if pass == 1 &&
+        defer_cl &&
+        !is_def &&
+        i < finfo.param_tys.length() {
+        collect_unbound_fn_param_tparams(
+          finfo.param_tys[i],
+          is_opt_wrap,
+          finfo.decl.type_params,
+          subst,
+        )
+      } else {
+        []
+      }
+      let diag_mark = tc.diagnostics.length()
+      let eq_uses_mark = tc.eq_uses.length()
       let arg_exp = if is_def && i < finfo.param_tys.length() {
         Some(finfo.param_tys[i])
       } else {
@@ -13773,7 +13916,7 @@ fn check_fn_call(
           tc.in_imported_default_arg = true
         }
       }
-      let aty = check_call_arg(
+      let mut aty = check_call_arg(
         tc,
         arg_env,
         param_at(finfo.decl.params, i),
@@ -13805,6 +13948,45 @@ fn check_fn_call(
           }
         }
         unify_tparams(finfo.param_tys[i], eff_aty, subst)
+        if unbound_param_tps.length() > 0 && any_tparam_now_concrete(unbound_param_tps, subst) {
+          while tc.diagnostics.length() > diag_mark {
+            let _ = tc.diagnostics.pop()
+          }
+          while tc.eq_uses.length() > eq_uses_mark {
+            let _ = tc.eq_uses.pop()
+          }
+          let exp_p2 : Option[Ty] = Some(
+            subst_ty_mask_unbound(finfo.param_tys[i], finfo.decl.type_params, subst),
+          )
+          let arg_exp2 = into_adjust_arg_expected(tc, resolved_args[i], exp_p2, p_is_into)
+          aty = check_call_arg(
+            tc,
+            arg_env,
+            param_at(finfo.decl.params, i),
+            resolved_args[i],
+            arg_exp2,
+            finfo.decl.name,
+          )
+          fnval_exp[i] = tc_fnval_exp_key(arg_exp2)
+          eff_aty = aty
+          into_errored = false
+          into_hint = ""
+          let pre_pty2 = subst_ty(finfo.param_tys[i], subst)
+          if p_is_into && raw_i >= 0 && !ty_compat(pre_pty2, aty) && !ty_has_unresolved(pre_pty2) {
+            let ir = resolve_into_conversion(tc, env, aty, pre_pty2, expr_span(resolved_args[i]))
+            match ir.conv {
+              Some(conv) => {
+                tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
+                eff_aty = pre_pty2
+              }
+              None => {
+                into_errored = ir.errored
+                into_hint = ir.available_hint
+              }
+            }
+          }
+          unify_tparams(finfo.param_tys[i], eff_aty, subst)
+        }
         let pty = subst_ty(finfo.param_tys[i], subst)
         if !into_errored &&
           (!ty_compat(pty, eff_aty) ||
@@ -15725,6 +15907,21 @@ fn check_method_call(
               }
             }
             if !handled_opt_into {
+              let unbound_param_tps : Array[String] = if pass == 1 &&
+                defer_cl &&
+                !is_def &&
+                p_idx < minfo.param_tys.length() {
+                collect_unbound_fn_param_tparams(
+                  minfo.param_tys[p_idx],
+                  is_opt_wrap,
+                  minfo.decl.type_params,
+                  subst,
+                )
+              } else {
+                []
+              }
+              let diag_mark = tc.diagnostics.length()
+              let eq_uses_mark = tc.eq_uses.length()
               let arg_exp = if is_def && p_idx < minfo.param_tys.length() {
                 Some(minfo.param_tys[p_idx])
               } else {
@@ -15738,7 +15935,7 @@ fn check_method_call(
                   tc.in_imported_default_arg = true
                 }
               }
-              let aty = check_call_arg(
+              let mut aty = check_call_arg(
                 tc,
                 arg_env,
                 param_at(minfo.decl.params, p_idx),
@@ -15770,6 +15967,45 @@ fn check_method_call(
                   }
                 }
                 unify_tparams(minfo.param_tys[p_idx], eff_aty, subst)
+                if unbound_param_tps.length() > 0 && any_tparam_now_concrete(unbound_param_tps, subst) {
+                  while tc.diagnostics.length() > diag_mark {
+                    let _ = tc.diagnostics.pop()
+                  }
+                  while tc.eq_uses.length() > eq_uses_mark {
+                    let _ = tc.eq_uses.pop()
+                  }
+                  let exp_p2 : Option[Ty] = Some(
+                    subst_ty_mask_unbound(minfo.param_tys[p_idx], minfo.decl.type_params, subst),
+                  )
+                  let arg_exp2 = into_adjust_arg_expected(tc, resolved_args[i], exp_p2, p_is_into)
+                  aty = check_call_arg(
+                    tc,
+                    arg_env,
+                    param_at(minfo.decl.params, p_idx),
+                    resolved_args[i],
+                    arg_exp2,
+                    key,
+                  )
+                  fnval_exp[i] = tc_fnval_exp_key(arg_exp2)
+                  eff_aty = aty
+                  into_errored = false
+                  into_hint = ""
+                  let pre_pty2 = subst_ty(minfo.param_tys[p_idx], subst)
+                  if p_is_into && raw_i >= 0 && !ty_compat(pre_pty2, aty) && !ty_has_unresolved(pre_pty2) {
+                    let ir = resolve_into_conversion(tc, env, aty, pre_pty2, expr_span(resolved_args[i]))
+                    match ir.conv {
+                      Some(conv) => {
+                        tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
+                        eff_aty = pre_pty2
+                      }
+                      None => {
+                        into_errored = ir.errored
+                        into_hint = ir.available_hint
+                      }
+                    }
+                  }
+                  unify_tparams(minfo.param_tys[p_idx], eff_aty, subst)
+                }
                 let pty = subst_ty(minfo.param_tys[p_idx], subst)
                 if !into_errored &&
                   (!ty_compat(pty, eff_aty) ||
@@ -19880,14 +20116,35 @@ fn check_expr_inner(
             Some(ir) => ir
             None => body_ty
           }
-        _ => body_ty
+        _ =>
+          match clo_inferred_ret {
+            Some(ir) => {
+              let has_ret_opt = match ret_opt {
+                Some(_) => true
+                None => false
+              }
+              if !has_explicit_ret && !has_ret_opt && !ty_compat(ir, body_ty) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "closure return type mismatch",
+                  ty_to_string(ir),
+                  ty_to_string(body_ty),
+                  "ensure early `return` and tail expression have compatible types",
+                )
+              }
+              ty_prefer_concrete(body_ty, ir)
+            }
+            None => body_ty
+          }
       }
       let final_ret = match ret_opt {
         Some(r) =>
-          if !has_explicit_ret && ty_has_unresolved(r) && !ty_has_unresolved(eff_body_ty) {
+          if !has_explicit_ret {
             match eff_body_ty {
               TNever => r
-              _ => eff_body_ty
+              _ => ty_prefer_concrete(r, eff_body_ty)
             }
           } else {
             r
