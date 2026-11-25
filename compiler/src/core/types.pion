@@ -593,6 +593,21 @@ pub struct IntoConv {
 }
 
 ///|
+pub struct GenericCallSite {
+  caller_key : String
+  callee_key : String
+  callee_name : String
+  subst : Map[String, Ty]
+  span : Span
+}
+
+///|
+pub struct TraitObligation {
+  target_ty : Ty
+  trait_name : String
+}
+
+///|
 pub struct ImportedPkg {
   name : String
   tc : TypeChecker
@@ -645,10 +660,19 @@ pub struct TypeChecker {
   /// Generic fn decl key -> type params compared with `==` / `!=` inside transparent `#verify` bodies (stops at `#verify_opaque`).
   verify_eq_tparams : Map[String, Array[String]]
   verify_eq_keys : Array[String]
-  /// Generic fn decl key -> operator-constrained type params (`"num:" + tp`, `"add:" + tp`, `"int:" + tp`, `"ord:" + tp`, `"mapkey:" + tp`, `"mapkey_scalar:" + tp`, `"trait:" + tp + "=" + tr`).
+  /// Generic fn decl key -> operator-constrained type params (`"num:" + tp`, `"add:" + tp`, `"int:" + tp`, `"ord:" + tp`).
   op_tparams : Map[String, Array[String]]
   op_keys : Array[String]
+  /// Generic fn decl key -> full `Ty` Map keys containing `TParam`s to validate on instantiation.
+  map_key_obligations : Map[String, Array[Ty]]
+  map_key_ob_keys : Array[String]
+  /// Generic fn decl key -> full `(target_ty, trait_name)` obligations from generic `impl Eq` bounds.
+  eq_trait_obligations : Map[String, Array[TraitObligation]]
+  eq_trait_ob_keys : Array[String]
+  /// Generic call sites with full `Map[String, Ty]` substitution for obligation propagation.
+  generic_call_sites : Array[GenericCallSite]
   mut cur_fn_key : String
+  mut in_pass3 : Bool
   eq_uses : Array[EqUse]
   /// `span_key` of a method call on a `TParam` with trait bounds -> canonical bound trait name.
   resolved_trait_methods : Map[String, String]
@@ -2068,6 +2092,45 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
       None => ()
     }
     oi = oi + 1
+  }
+  let mut mki = 0
+  while mki < ipkg.tc.map_key_ob_keys.length() {
+    let mk = ipkg.tc.map_key_ob_keys[mki]
+    match ipkg.tc.map_key_obligations.get(mk) {
+      Some(ktys) => {
+        let mut kj = 0
+        while kj < ktys.length() {
+          let _ = map_key_ob_add(tc, mk, qualify_imported_ty(ipkg.name, ktys[kj]))
+          kj = kj + 1
+        }
+      }
+      None => ()
+    }
+    mki = mki + 1
+  }
+  let mut eti = 0
+  while eti < ipkg.tc.eq_trait_ob_keys.length() {
+    let ek = ipkg.tc.eq_trait_ob_keys[eti]
+    match ipkg.tc.eq_trait_obligations.get(ek) {
+      Some(obs) => {
+        let mut oj = 0
+        while oj < obs.length() {
+          let ob = obs[oj]
+          let qtr = if has_qual_sep(ob.trait_name) || starts_with_str(ob.trait_name, "@builtin:") {
+            ob.trait_name
+          } else {
+            ipkg.name + "::" + ob.trait_name
+          }
+          let _ = eq_trait_ob_add(tc, ek, TraitObligation::{
+            target_ty: qualify_imported_ty(ipkg.name, ob.target_ty),
+            trait_name: qtr,
+          })
+          oj = oj + 1
+        }
+      }
+      None => ()
+    }
+    eti = eti + 1
   }
   let skeys = ipkg.tc.struct_names
   let mut i = 0
@@ -4074,23 +4137,93 @@ fn collect_eq_tparams_in_ty(
 }
 
 ///|
+fn ty_top_is_concrete(t : Ty) -> Bool {
+  match t {
+    TParam(_) | TError | TNever => false
+    _ => true
+  }
+}
+
+///|
+fn map_key_ob_add(tc : TypeChecker, fn_key : String, k : Ty) -> Bool {
+  if fn_key == "" || !ty_has_tparam(k) {
+    return false
+  }
+  let ks = ty_to_string(k)
+  match tc.map_key_obligations.get(fn_key) {
+    Some(arr) => {
+      if arr.length() >= 64 {
+        return false
+      }
+      let mut i = 0
+      while i < arr.length() {
+        if ty_to_string(arr[i]) == ks {
+          return false
+        }
+        i = i + 1
+      }
+      arr.push(k)
+      true
+    }
+    None => {
+      tc.map_key_obligations.set(fn_key, [k])
+      tc.map_key_ob_keys.push(fn_key)
+      true
+    }
+  }
+}
+
+///|
+fn eq_trait_ob_add(tc : TypeChecker, fn_key : String, ob : TraitObligation) -> Bool {
+  if fn_key == "" {
+    return false
+  }
+  let ks = ob.trait_name + "|" + ty_to_string(ob.target_ty)
+  match tc.eq_trait_obligations.get(fn_key) {
+    Some(arr) => {
+      if arr.length() >= 64 {
+        return false
+      }
+      let mut i = 0
+      while i < arr.length() {
+        if arr[i].trait_name + "|" + ty_to_string(arr[i].target_ty) == ks {
+          return false
+        }
+        i = i + 1
+      }
+      arr.push(ob)
+      true
+    }
+    None => {
+      tc.eq_trait_obligations.set(fn_key, [ob])
+      tc.eq_trait_ob_keys.push(fn_key)
+      true
+    }
+  }
+}
+
+///|
 fn collect_eq_trait_obligations_rec(
   tc : TypeChecker,
   t : Ty,
-  out_tags : Array[String],
+  out_obs : Array[TraitObligation],
   visited : Map[String, Bool],
+  depth : Int,
 ) -> Unit {
+  if depth > 24 {
+    return
+  }
   match t {
     TImmArray(e) | TArray(e) | TFixedArray(e) | TOption(e) =>
-      collect_eq_trait_obligations_rec(tc, e, out_tags, visited)
+      collect_eq_trait_obligations_rec(tc, e, out_obs, visited, depth + 1)
     TResult(a, b) => {
-      collect_eq_trait_obligations_rec(tc, a, out_tags, visited)
-      collect_eq_trait_obligations_rec(tc, b, out_tags, visited)
+      collect_eq_trait_obligations_rec(tc, a, out_obs, visited, depth + 1)
+      collect_eq_trait_obligations_rec(tc, b, out_obs, visited, depth + 1)
     }
     TTuple(es) => {
       let mut i = 0
       while i < es.length() {
-        collect_eq_trait_obligations_rec(tc, es[i], out_tags, visited)
+        collect_eq_trait_obligations_rec(tc, es[i], out_obs, visited, depth + 1)
         i = i + 1
       }
     }
@@ -4109,17 +4242,9 @@ fn collect_eq_trait_obligations_rec(
             while bi < btrs.length() {
               let tr = btrs[bi]
               if tr == "@builtin:Eq" {
-                collect_eq_trait_obligations_rec(tc, sargs[i], out_tags, visited)
+                collect_eq_trait_obligations_rec(tc, sargs[i], out_obs, visited, depth + 1)
               } else {
-                match sargs[i] {
-                  TParam(tp) => {
-                    let tag = "trait:" + tp + "=" + tr
-                    if !str_arr_contains(out_tags, tag) {
-                      out_tags.push(tag)
-                    }
-                  }
-                  _ => ()
-                }
+                out_obs.push(TraitObligation::{ target_ty: sargs[i], trait_name: tr })
               }
               bi = bi + 1
             }
@@ -4134,7 +4259,7 @@ fn collect_eq_trait_obligations_rec(
           let subst = make_subst(sinfo.decl.type_params, sargs)
           let mut fi = 0
           while fi < sinfo.field_tys.length() {
-            collect_eq_trait_obligations_rec(tc, subst_ty(sinfo.field_tys[fi], subst), out_tags, visited)
+            collect_eq_trait_obligations_rec(tc, subst_ty(sinfo.field_tys[fi], subst), out_obs, visited, depth + 1)
             fi = fi + 1
           }
         }
@@ -4156,17 +4281,9 @@ fn collect_eq_trait_obligations_rec(
             while bi < btrs.length() {
               let tr = btrs[bi]
               if tr == "@builtin:Eq" {
-                collect_eq_trait_obligations_rec(tc, eargs[i], out_tags, visited)
+                collect_eq_trait_obligations_rec(tc, eargs[i], out_obs, visited, depth + 1)
               } else {
-                match eargs[i] {
-                  TParam(tp) => {
-                    let tag = "trait:" + tp + "=" + tr
-                    if !str_arr_contains(out_tags, tag) {
-                      out_tags.push(tag)
-                    }
-                  }
-                  _ => ()
-                }
+                out_obs.push(TraitObligation::{ target_ty: eargs[i], trait_name: tr })
               }
               bi = bi + 1
             }
@@ -4184,7 +4301,7 @@ fn collect_eq_trait_obligations_rec(
             let v = einfo.variants[vi]
             let mut fi = 0
             while fi < v.field_tys.length() {
-              collect_eq_trait_obligations_rec(tc, subst_ty(v.field_tys[fi], subst), out_tags, visited)
+              collect_eq_trait_obligations_rec(tc, subst_ty(v.field_tys[fi], subst), out_obs, visited, depth + 1)
               fi = fi + 1
             }
             vi = vi + 1
@@ -4202,13 +4319,15 @@ fn record_eq_trait_obligations(tc : TypeChecker, fn_key : String, t : Ty) -> Boo
   if fn_key == "" {
     return false
   }
-  let tags : Array[String] = []
-  collect_eq_trait_obligations_rec(tc, t, tags, Map([]))
+  let obs : Array[TraitObligation] = []
+  collect_eq_trait_obligations_rec(tc, t, obs, Map([]), 0)
   let mut added = false
   let mut i = 0
-  while i < tags.length() {
-    if op_tparams_add(tc, fn_key, tags[i]) {
-      added = true
+  while i < obs.length() {
+    if ty_has_tparam(obs[i].target_ty) {
+      if eq_trait_ob_add(tc, fn_key, obs[i]) {
+        added = true
+      }
     }
     i = i + 1
   }
@@ -4220,17 +4339,100 @@ fn record_map_key_tparams(tc : TypeChecker, fn_key : String, k : Ty) -> Unit {
   if fn_key == "" {
     return
   }
-  match k {
-    TParam(tp) => {
-      let _ = op_tparams_add(tc, fn_key, "mapkey:" + tp)
+  if ty_has_tparam(k) {
+    let _ = map_key_ob_add(tc, fn_key, k)
+  }
+}
+
+///|
+fn record_map_key_tparams_in_ty_rec(
+  tc : TypeChecker,
+  fn_key : String,
+  t : Ty,
+  visited : Map[String, Bool],
+  depth : Int,
+) -> Unit {
+  if fn_key == "" || depth > 24 {
+    return
+  }
+  match t {
+    TMap(k, v) => {
+      record_map_key_tparams(tc, fn_key, k)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, k, visited, depth + 1)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, v, visited, depth + 1)
     }
-    TTuple(_) | TStruct(_, _) => {
-      let tps : Array[String] = []
-      ty_collect_tparams(k, tps)
+    TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      record_map_key_tparams_in_ty_rec(tc, fn_key, e, visited, depth + 1)
+    TResult(a, b) => {
+      record_map_key_tparams_in_ty_rec(tc, fn_key, a, visited, depth + 1)
+      record_map_key_tparams_in_ty_rec(tc, fn_key, b, visited, depth + 1)
+    }
+    TTuple(es) => {
       let mut i = 0
-      while i < tps.length() {
-        let _ = op_tparams_add(tc, fn_key, "mapkey_scalar:" + tps[i])
+      while i < es.length() {
+        record_map_key_tparams_in_ty_rec(tc, fn_key, es[i], visited, depth + 1)
         i = i + 1
+      }
+    }
+    TFn(ps, ret) => {
+      let mut i = 0
+      while i < ps.length() {
+        record_map_key_tparams_in_ty_rec(tc, fn_key, ps[i], visited, depth + 1)
+        i = i + 1
+      }
+      record_map_key_tparams_in_ty_rec(tc, fn_key, ret, visited, depth + 1)
+    }
+    TStruct(name, args) => {
+      let mut i = 0
+      while i < args.length() {
+        record_map_key_tparams_in_ty_rec(tc, fn_key, args[i], visited, depth + 1)
+        i = i + 1
+      }
+      if args.length() > 0 {
+        let vk = "S:" + ty_to_string(t)
+        if !visited.contains(vk) {
+          visited.set(vk, true)
+          match tc_lookup_struct_info(tc, name) {
+            Some(sinfo) => {
+              let subst = make_subst(sinfo.decl.type_params, args)
+              let mut fi = 0
+              while fi < sinfo.field_tys.length() {
+                record_map_key_tparams_in_ty_rec(tc, fn_key, subst_ty(sinfo.field_tys[fi], subst), visited, depth + 1)
+                fi = fi + 1
+              }
+            }
+            None => ()
+          }
+        }
+      }
+    }
+    TEnum(name, args) => {
+      let mut i = 0
+      while i < args.length() {
+        record_map_key_tparams_in_ty_rec(tc, fn_key, args[i], visited, depth + 1)
+        i = i + 1
+      }
+      if args.length() > 0 {
+        let vk = "E:" + ty_to_string(t)
+        if !visited.contains(vk) {
+          visited.set(vk, true)
+          match tc_lookup_enum_info_qualified(tc, name) {
+            Some(einfo) => {
+              let subst = make_subst(einfo.decl.type_params, args)
+              let mut vi = 0
+              while vi < einfo.variants.length() {
+                let v = einfo.variants[vi]
+                let mut fi = 0
+                while fi < v.field_tys.length() {
+                  record_map_key_tparams_in_ty_rec(tc, fn_key, subst_ty(v.field_tys[fi], subst), visited, depth + 1)
+                  fi = fi + 1
+                }
+                vi = vi + 1
+              }
+            }
+            None => ()
+          }
+        }
       }
     }
     _ => ()
@@ -4239,45 +4441,7 @@ fn record_map_key_tparams(tc : TypeChecker, fn_key : String, k : Ty) -> Unit {
 
 ///|
 fn record_map_key_tparams_in_ty(tc : TypeChecker, fn_key : String, t : Ty) -> Unit {
-  if fn_key == "" {
-    return
-  }
-  match t {
-    TMap(k, v) => {
-      record_map_key_tparams(tc, fn_key, k)
-      record_map_key_tparams_in_ty(tc, fn_key, k)
-      record_map_key_tparams_in_ty(tc, fn_key, v)
-    }
-    TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
-      record_map_key_tparams_in_ty(tc, fn_key, e)
-    TResult(a, b) => {
-      record_map_key_tparams_in_ty(tc, fn_key, a)
-      record_map_key_tparams_in_ty(tc, fn_key, b)
-    }
-    TTuple(es) => {
-      let mut i = 0
-      while i < es.length() {
-        record_map_key_tparams_in_ty(tc, fn_key, es[i])
-        i = i + 1
-      }
-    }
-    TFn(ps, ret) => {
-      let mut i = 0
-      while i < ps.length() {
-        record_map_key_tparams_in_ty(tc, fn_key, ps[i])
-        i = i + 1
-      }
-      record_map_key_tparams_in_ty(tc, fn_key, ret)
-    }
-    TStruct(_, args) | TEnum(_, args) => {
-      let mut i = 0
-      while i < args.length() {
-        record_map_key_tparams_in_ty(tc, fn_key, args[i])
-        i = i + 1
-      }
-    }
-    _ => ()
-  }
+  record_map_key_tparams_in_ty_rec(tc, fn_key, t, Map([]), 0)
 }
 
 ///|
@@ -4361,44 +4525,7 @@ fn resolve_eq_uses(tc : TypeChecker) -> Unit {
               op_tparams_add(tc, u.caller_key, "ord:" + caller_tp) {
               o_changed = true
             }
-            if op_tparams_has(tc, u.callee_key, "mapkey:" + u.tparam) &&
-              op_tparams_add(tc, u.caller_key, "mapkey:" + caller_tp) {
-              o_changed = true
-            }
-            if op_tparams_has(tc, u.callee_key, "mapkey_scalar:" + u.tparam) &&
-              op_tparams_add(tc, u.caller_key, "mapkey_scalar:" + caller_tp) {
-              o_changed = true
-            }
-            match tc.op_tparams.get(u.callee_key) {
-              Some(tags) => {
-                let pfx = "trait:" + u.tparam + "="
-                let mut ti = 0
-                while ti < tags.length() {
-                  let tg = tags[ti]
-                  if tg.starts_with(pfx) {
-                    let tr = tg.slice(pfx.length(), tg.length())
-                    if op_tparams_add(tc, u.caller_key, "trait:" + caller_tp + "=" + tr) {
-                      o_changed = true
-                    }
-                  }
-                  ti = ti + 1
-                }
-              }
-              None => ()
-            }
           }
-          TTuple(_) | TStruct(_, _) =>
-            if op_tparams_has(tc, u.callee_key, "mapkey:" + u.tparam) {
-              let tps : Array[String] = []
-              ty_collect_tparams(u.concrete, tps)
-              let mut ti = 0
-              while ti < tps.length() {
-                if op_tparams_add(tc, u.caller_key, "mapkey_scalar:" + tps[ti]) {
-                  o_changed = true
-                }
-                ti = ti + 1
-              }
-            }
           _ => ()
         }
       }
@@ -4552,86 +4679,115 @@ fn resolve_eq_uses(tc : TypeChecker) -> Unit {
         "` with a numeric type, `Bool`, `Char`, `String`, `StrView`, or a payload-less `enum`",
       )
     }
-    if op_tparams_has(tc, u.callee_key, "mapkey:" + u.tparam) &&
-      !ty_has_tparam(u.concrete) &&
-      !is_valid_map_key_ty(tc, u.concrete) {
-      let cname = ty_to_string(u.concrete)
-      tc_err(
-        tc,
-        u.span,
-        "E_MAP_KEY_TYPE",
-        "generic `" +
-        u.callee_name +
-        "` uses `" +
-        u.tparam +
-        "` as a `Map` key, but `" +
-        u.tparam +
-        "` = `" +
-        cname +
-        "` is not a valid `Map` key type",
-        "String, scalar integer/char/bool, or immutable pure-scalar tuple/struct without custom `impl Eq`",
-        cname,
-        "instantiate `" + u.callee_name + "` with a supported `Map` key type without custom `impl Eq`",
-      )
-    } else if op_tparams_has(tc, u.callee_key, "mapkey_scalar:" + u.tparam) &&
-      !ty_has_tparam(u.concrete) &&
-      !tc_is_hashable_scalar_ty(tc, u.concrete) {
-      let cname = ty_to_string(u.concrete)
-      tc_err(
-        tc,
-        u.span,
-        "E_MAP_KEY_TYPE",
-        "generic `" +
-        u.callee_name +
-        "` uses `" +
-        u.tparam +
-        "` inside a composite `Map` key, but `" +
-        u.tparam +
-        "` = `" +
-        cname +
-        "` is not a hashable scalar `Map` key component",
-        "hashable scalar type without custom `impl Eq`",
-        cname,
-        "instantiate `" + u.callee_name + "` with a supported scalar type without custom `impl Eq`",
-      )
-    }
-    if !ty_has_tparam(u.concrete) {
-      match tc.op_tparams.get(u.callee_key) {
-        Some(tags) => {
-          let pfx = "trait:" + u.tparam + "="
-          let cname = ty_to_string(u.concrete)
-          let bname = ty_base_name(u.concrete)
-          let mut ti = 0
-          while ti < tags.length() {
-            let tg = tags[ti]
-            if tg.starts_with(pfx) {
-              let req_tr = tg.slice(pfx.length(), tg.length())
-              if !tc.impls.contains(req_tr + "::" + bname) {
-                let disp_tr = display_trait_name(req_tr)
-                tc_err(
-                  tc,
-                  u.span,
-                  "E_TRAIT_NOT_IMPLEMENTED",
-                  "type `" +
-                  cname +
-                  "` does not implement trait `" +
-                  disp_tr +
-                  "` required by `Eq` comparison in `" +
-                  u.callee_name +
-                  "`",
-                  "impl " + disp_tr + " for " + cname,
-                  cname,
-                  "add `impl " + disp_tr + " for " + cname + " { ... }`",
-                )
-              }
-            }
-            ti = ti + 1
-          }
-        }
-        None => ()
-      }
-    }
     i = i + 1
+  }
+  // Propagate full-Ty Map key obligations and generic `impl Eq` user-trait
+  // obligations across generic call sites via `subst_ty` (preserving outer
+  // nominal/compound types and ignoring phantom type parameters).
+  let max_ob_rounds = tc.generic_call_sites.length() + 16
+  let mut ob_changed = true
+  let mut ob_rounds = 0
+  while ob_changed && ob_rounds < max_ob_rounds {
+    ob_changed = false
+    let mut ci = 0
+    while ci < tc.generic_call_sites.length() {
+      let cs = tc.generic_call_sites[ci]
+      if cs.caller_key != "" {
+        match tc.map_key_obligations.get(cs.callee_key) {
+          Some(ktys) => {
+            let mut ki = 0
+            while ki < ktys.length() {
+              let nk = subst_ty(ktys[ki], cs.subst)
+              if ty_has_tparam(nk) && map_key_ob_add(tc, cs.caller_key, nk) {
+                ob_changed = true
+              }
+              ki = ki + 1
+            }
+          }
+          None => ()
+        }
+        match tc.eq_trait_obligations.get(cs.callee_key) {
+          Some(obs) => {
+            let mut oi = 0
+            while oi < obs.length() {
+              let nty = subst_ty(obs[oi].target_ty, cs.subst)
+              if ty_has_tparam(nty) &&
+                eq_trait_ob_add(tc, cs.caller_key, TraitObligation::{
+                  target_ty: nty,
+                  trait_name: obs[oi].trait_name,
+                }) {
+                ob_changed = true
+              }
+              oi = oi + 1
+            }
+          }
+          None => ()
+        }
+      }
+      ci = ci + 1
+    }
+    ob_rounds = ob_rounds + 1
+  }
+  let mut ci = 0
+  while ci < tc.generic_call_sites.length() {
+    let cs = tc.generic_call_sites[ci]
+    match tc.map_key_obligations.get(cs.callee_key) {
+      Some(ktys) => {
+        let mut ki = 0
+        while ki < ktys.length() {
+          let nk = subst_ty(ktys[ki], cs.subst)
+          if !ty_has_tparam(nk) && !is_valid_map_key_ty(tc, nk) {
+            let cname = ty_to_string(nk)
+            tc_err(
+              tc,
+              cs.span,
+              "E_MAP_KEY_TYPE",
+              "generic `" +
+              cs.callee_name +
+              "` uses `" +
+              cname +
+              "` as a `Map` key, which is not a valid `Map` key type",
+              "String, scalar integer/char/bool, or immutable pure-scalar tuple/struct without custom `impl Eq`",
+              cname,
+              "instantiate `" + cs.callee_name + "` with a supported `Map` key type without custom `impl Eq`",
+            )
+          }
+          ki = ki + 1
+        }
+      }
+      None => ()
+    }
+    match tc.eq_trait_obligations.get(cs.callee_key) {
+      Some(obs) => {
+        let mut oi = 0
+        while oi < obs.length() {
+          let ob = obs[oi]
+          let nty = subst_ty(ob.target_ty, cs.subst)
+          if ty_top_is_concrete(nty) && !tc.impls.contains(ob.trait_name + "::" + ty_base_name(nty)) {
+            let cname = ty_to_string(nty)
+            let disp_tr = display_trait_name(ob.trait_name)
+            tc_err(
+              tc,
+              cs.span,
+              "E_TRAIT_NOT_IMPLEMENTED",
+              "type `" +
+              cname +
+              "` does not implement trait `" +
+              disp_tr +
+              "` required by `Eq` comparison in `" +
+              cs.callee_name +
+              "`",
+              "impl " + disp_tr + " for " + cname,
+              cname,
+              "add `impl " + disp_tr + " for " + cname + " { ... }`",
+            )
+          }
+          oi = oi + 1
+        }
+      }
+      None => ()
+    }
+    ci = ci + 1
   }
 }
 
@@ -5026,7 +5182,11 @@ fn resolve_type_expr(
           let qp_p = split_qual_name(name)
           emit_private_err(tc, sp, "struct", qp_p.prefix, qp_p.name)
         }
-        return TStruct(name, rargs)
+        let res_ty = TStruct(name, rargs)
+        if tc.in_pass3 && rargs.length() > 0 {
+          tc_check_map_keys_in_ty_rec(tc, tc.cur_fn_key, res_ty, sp, true, Map([]), 0)
+        }
+        return res_ty
       }
       if !via_alias && tc.enums.contains(name) {
         if !tc.in_default_arg_expansion && tc.priv_imported_types.contains(name) {
@@ -5049,7 +5209,11 @@ fn resolve_type_expr(
             }
           None => ()
         }
-        return TEnum(name, rargs)
+        let res_ty = TEnum(name, rargs)
+        if tc.in_pass3 && rargs.length() > 0 {
+          tc_check_map_keys_in_ty_rec(tc, tc.cur_fn_key, res_ty, sp, true, Map([]), 0)
+        }
+        return res_ty
       }
       let qp = split_qual_name(name)
       let q_alias = qp.prefix
@@ -5993,10 +6157,23 @@ fn is_valid_map_key_ty(tc : TypeChecker, k : Ty) -> Bool {
 /// registers local `impl Eq` declarations) so custom-`Eq` keys in struct
 /// fields, enum variants, function signatures, consts, aliases, traits, and
 /// impls are rejected with `E_MAP_KEY_TYPE`.
-fn tc_check_custom_eq_map_keys_in_ty(tc : TypeChecker, t : Ty, sp : Span) -> Unit {
+fn tc_check_map_keys_in_ty_rec(
+  tc : TypeChecker,
+  fn_key : String,
+  t : Ty,
+  sp : Span,
+  check_all_invalid : Bool,
+  visited : Map[String, Bool],
+  depth : Int,
+) -> Unit {
+  if depth > 24 {
+    return
+  }
   match t {
     TMap(k, v) => {
-      if v_has_custom_eq_in(tc, k, []) && !is_valid_map_key_ty(tc, k) {
+      if ty_has_tparam(k) {
+        let _ = map_key_ob_add(tc, fn_key, k)
+      } else if !is_valid_map_key_ty(tc, k) && (check_all_invalid || v_has_custom_eq_in(tc, k, [])) {
         let mut already = false
         let mut di = 0
         while di < tc.diagnostics.length() {
@@ -6023,39 +6200,90 @@ fn tc_check_custom_eq_map_keys_in_ty(tc : TypeChecker, t : Ty, sp : Span) -> Uni
           )
         }
       }
-      tc_check_custom_eq_map_keys_in_ty(tc, k, sp)
-      tc_check_custom_eq_map_keys_in_ty(tc, v, sp)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, k, sp, check_all_invalid, visited, depth + 1)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, v, sp, check_all_invalid, visited, depth + 1)
     }
     TArray(e) | TImmArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
-      tc_check_custom_eq_map_keys_in_ty(tc, e, sp)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, e, sp, check_all_invalid, visited, depth + 1)
     TResult(ok, err) => {
-      tc_check_custom_eq_map_keys_in_ty(tc, ok, sp)
-      tc_check_custom_eq_map_keys_in_ty(tc, err, sp)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, ok, sp, check_all_invalid, visited, depth + 1)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, err, sp, check_all_invalid, visited, depth + 1)
     }
     TTuple(es) => {
       let mut i = 0
       while i < es.length() {
-        tc_check_custom_eq_map_keys_in_ty(tc, es[i], sp)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, es[i], sp, check_all_invalid, visited, depth + 1)
         i = i + 1
       }
     }
     TFn(ps, ret) => {
       let mut i = 0
       while i < ps.length() {
-        tc_check_custom_eq_map_keys_in_ty(tc, ps[i], sp)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, ps[i], sp, check_all_invalid, visited, depth + 1)
         i = i + 1
       }
-      tc_check_custom_eq_map_keys_in_ty(tc, ret, sp)
+      tc_check_map_keys_in_ty_rec(tc, fn_key, ret, sp, check_all_invalid, visited, depth + 1)
     }
-    TStruct(_, args) | TEnum(_, args) => {
+    TStruct(name, args) => {
       let mut i = 0
       while i < args.length() {
-        tc_check_custom_eq_map_keys_in_ty(tc, args[i], sp)
+        tc_check_map_keys_in_ty_rec(tc, fn_key, args[i], sp, check_all_invalid, visited, depth + 1)
         i = i + 1
+      }
+      if args.length() > 0 {
+        let vk = "S:" + ty_to_string(t)
+        if !visited.contains(vk) {
+          visited.set(vk, true)
+          match tc_lookup_struct_info(tc, name) {
+            Some(sinfo) => {
+              let subst = make_subst(sinfo.decl.type_params, args)
+              let mut fi = 0
+              while fi < sinfo.field_tys.length() {
+                tc_check_map_keys_in_ty_rec(tc, fn_key, subst_ty(sinfo.field_tys[fi], subst), sp, true, visited, depth + 1)
+                fi = fi + 1
+              }
+            }
+            None => ()
+          }
+        }
+      }
+    }
+    TEnum(name, args) => {
+      let mut i = 0
+      while i < args.length() {
+        tc_check_map_keys_in_ty_rec(tc, fn_key, args[i], sp, check_all_invalid, visited, depth + 1)
+        i = i + 1
+      }
+      if args.length() > 0 {
+        let vk = "E:" + ty_to_string(t)
+        if !visited.contains(vk) {
+          visited.set(vk, true)
+          match tc_lookup_enum_info_qualified(tc, name) {
+            Some(einfo) => {
+              let subst = make_subst(einfo.decl.type_params, args)
+              let mut vi = 0
+              while vi < einfo.variants.length() {
+                let v = einfo.variants[vi]
+                let mut fi = 0
+                while fi < v.field_tys.length() {
+                  tc_check_map_keys_in_ty_rec(tc, fn_key, subst_ty(v.field_tys[fi], subst), sp, true, visited, depth + 1)
+                  fi = fi + 1
+                }
+                vi = vi + 1
+              }
+            }
+            None => ()
+          }
+        }
       }
     }
     _ => ()
   }
+}
+
+///|
+fn tc_check_custom_eq_map_keys_in_ty(tc : TypeChecker, t : Ty, sp : Span) -> Unit {
+  tc_check_map_keys_in_ty_rec(tc, tc.cur_fn_key, t, sp, false, Map([]), 0)
 }
 
 ///|
@@ -10426,7 +10654,11 @@ fn check_variant_ctor(
         }
         ti = ti + 1
       }
-      TEnum(resolved_enum, targs)
+      let res_ty = TEnum(resolved_enum, targs)
+      if targs.length() > 0 {
+        tc_check_map_keys_in_ty_rec(tc, env.fn_key, res_ty, sp, true, Map([]), 0)
+      }
+      res_ty
     }
   }
 }
@@ -12108,6 +12340,25 @@ fn tc_push_eq_uses(
   subst : Map[String, Ty],
   sp : Span,
 ) -> Unit {
+  if fd.type_params.length() > 0 {
+    let subst_copy : Map[String, Ty] = Map([])
+    let mut si = 0
+    while si < fd.type_params.length() {
+      let tp = fd.type_params[si]
+      match subst.get(tp) {
+        Some(concrete) => subst_copy.set(tp, concrete)
+        None => ()
+      }
+      si = si + 1
+    }
+    tc.generic_call_sites.push(GenericCallSite::{
+      caller_key: env.fn_key,
+      callee_key: span_key(fd.span),
+      callee_name: callee_name,
+      subst: subst_copy,
+      span: sp,
+    })
+  }
   let mut ti = 0
   while ti < fd.type_params.length() {
     let tp = fd.type_params[ti]
@@ -12868,31 +13119,22 @@ fn into_check_type_bounds(
                   }
                   eti = eti + 1
                 }
-                let eq_tr_tags : Array[String] = []
-                collect_eq_trait_obligations_rec(tc, concrete_ty, eq_tr_tags, Map([]))
+                let eq_tr_obs : Array[TraitObligation] = []
+                collect_eq_trait_obligations_rec(tc, concrete_ty, eq_tr_obs, Map([]), 0)
                 let mut tri = 0
-                while tri < eq_tr_tags.length() {
-                  let tg = eq_tr_tags[tri]
-                  let rest = tg.slice(6, tg.length())
-                  let mut eq_pos = -1
-                  let mut ci = 0
-                  while ci < rest.length() {
-                    if str_code_at(rest, ci) == 61 {
-                      eq_pos = ci
-                      break
-                    }
-                    ci = ci + 1
+                while tri < eq_tr_obs.length() {
+                  let ob = eq_tr_obs[tri]
+                  let ok_tr = match ob.target_ty {
+                    TParam(etp) =>
+                      match env.type_bounds.get(etp) {
+                        Some(btrs) => str_arr_contains(btrs, ob.trait_name)
+                        None => false
+                      }
+                    TError | TNever => true
+                    _ => tc.impls.contains(ob.trait_name + "::" + ty_base_name(ob.target_ty))
                   }
-                  if eq_pos > 0 {
-                    let etp = rest.slice(0, eq_pos)
-                    let etr = rest.slice(eq_pos + 1, rest.length())
-                    let has_b = match env.type_bounds.get(etp) {
-                      Some(btrs) => str_arr_contains(btrs, etr)
-                      None => false
-                    }
-                    if !has_b {
-                      return false
-                    }
+                  if !ok_tr {
+                    return false
                   }
                   tri = tri + 1
                 }
@@ -18333,7 +18575,11 @@ fn check_expr_inner(
                 }
                 ti = ti + 1
               }
-              TEnum(ename, targs)
+              let res_ty = TEnum(ename, targs)
+              if targs.length() > 0 {
+                tc_check_map_keys_in_ty_rec(tc, env.fn_key, res_ty, sp, true, Map([]), 0)
+              }
+              res_ty
             }
           }
         }
@@ -20868,7 +21114,11 @@ fn check_expr_inner(
             }
             ti = ti + 1
           }
-          TStruct(resolved_name, targs)
+          let res_ty = TStruct(resolved_name, targs)
+          if targs.length() > 0 {
+            tc_check_map_keys_in_ty_rec(tc, env.fn_key, res_ty, sp, true, Map([]), 0)
+          }
+          res_ty
         }
       }
     }
@@ -21672,7 +21922,13 @@ fn check_package_with_imports_mapped_plan(
     verify_eq_keys: [],
     op_tparams: Map([]),
     op_keys: [],
+    map_key_obligations: Map([]),
+    map_key_ob_keys: [],
+    eq_trait_obligations: Map([]),
+    eq_trait_ob_keys: [],
+    generic_call_sites: [],
     cur_fn_key: "",
+    in_pass3: false,
     eq_uses: [],
     resolved_trait_methods: Map([]),
     edit_keys: Map([]),
@@ -23097,6 +23353,7 @@ fn check_package_with_imports_mapped_plan(
   }
 
   // Pass 3: type-check function bodies and constant initializers
+  tc.in_pass3 = true
   fi = 0
   while fi < pkg.files.length() {
     if fi < check_file.length() && !check_file[fi] {
@@ -23320,6 +23577,8 @@ fn check_package_with_imports_mapped_plan(
                     }
                     let env = env_new(finfo.ret_ty, impl_tps)
                     env.fn_key = span_key(md.span)
+                    let saved_fn_key = tc.cur_fn_key
+                    tc.cur_fn_key = env.fn_key
                     let mut bi = 0
                     while bi < id.type_bounds.length() {
                       let tb = id.type_bounds[bi]
@@ -23444,6 +23703,7 @@ fn check_package_with_imports_mapped_plan(
                         "return a value of type `" + ty_to_string(finfo.ret_ty) + "`",
                       )
                     }
+                    tc.cur_fn_key = saved_fn_key
                   }
                   None => ()
                 }
