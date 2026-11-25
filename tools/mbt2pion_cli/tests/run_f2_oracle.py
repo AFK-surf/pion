@@ -53,14 +53,16 @@ pub fn run_f2_2() -> String {
   let f : Float = hue_calc((0.25 : Float), (0.75 : Float), (3.5 : Float))
   let d0 : Double = (0 : Double) + (0x10 : Double)
   let big_hex : Double = (0x80000000 : Double)
-  let u64_hi : Bool = (0x8000000000000000 : Double) > 0.0
+  let u64_hi : Bool = (0x8000000000000000 : Double) == 9223372036854775808.0
+  let u64_max_d : Bool = (0xFFFFFFFFFFFFFFFF : Double) == 18446744073709551616.0
+  let u64_max_f : Bool = (0xFFFFFFFFFFFFFFFF : Float).to_double() == 18446744073709551616.0
   let neg_z : Bool = 1.0 / (-0x0 : Double) < 0.0
   let i64 : Int64 = (42 : Int64)
   let x : Double = 3.5
   let xd : Double = (x : Double) * 2.0
   let opt : Int? = (None : Int?)
   let o = match opt { Some(v) => v; None => 9 }
-  (f.to_double() * 100.0).to_int().to_string() + "," + d0.to_int().to_string() + "," + big_hex.to_int64().to_string() + "," + u64_hi.to_string() + "," + neg_z.to_string() + "," + i64.to_string() + "," + xd.to_int().to_string() + "," + o.to_string()
+  (f.to_double() * 100.0).to_int().to_string() + "," + d0.to_int().to_string() + "," + big_hex.to_int64().to_string() + "," + u64_hi.to_string() + "," + u64_max_d.to_string() + "," + u64_max_f.to_string() + "," + neg_z.to_string() + "," + i64.to_string() + "," + xd.to_int().to_string() + "," + o.to_string()
 }
 
 fn lookup_kind(k : Int) -> Int? {
@@ -195,7 +197,7 @@ def main():
 
         expected = (
             "F2-1:has_loc|has_loc|has_loc,has_loc,pos_opt|def_loc\n"
-            "F2-2:50,16,2147483648,true,true,42,7,9\n"
+            "F2-2:50,16,2147483648,true,true,true,true,42,7,9\n"
             "F2-3:43,30,5,7,106,-99|1-1-2-2-2\n"
             "F2-4:3,2,-4|5,9,-1|+1,+1,+0,-0,+2|+1,+1,+0,-0,+5|11,22\n"
             "F2-5:5"
