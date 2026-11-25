@@ -4036,7 +4036,7 @@ static inline uint32_t rotr32(uint32_t x, uint32_t n) {
     return (x >> n) | (x << (32u - n));
 }
 
-static PION_NOINLINE PION_IO_FN void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
+static PION_NOINLINE PION_MINSIZE void sha256_transform(uint32_t st[8], const uint8_t blk[64]) {
     uint32_t w[16], v[8];
     memcpy(v, st, sizeof(v));
     for (int i = 0; i < 64; i++) {
@@ -4062,7 +4062,7 @@ static PION_NOINLINE PION_IO_FN void sha256_transform(uint32_t st[8], const uint
     for (int i = 0; i < 8; i++) st[i] += v[i];
 }
 
-PION_IO_FN void *pion_sha256_hex(void *s_ptr) {
+PION_MINSIZE void *pion_sha256_hex(void *s_ptr) {
     static const uint32_t iv[8] = {
         0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
         0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
@@ -4105,61 +4105,61 @@ PION_IO_FN void *pion_sha256_hex(void *s_ptr) {
  * 8. FFI Raw Pointers & CStr Helpers
  * ============================================================================ */
 
-PION_IO_FN void *pion_ptr_alloc(int64_t bytes) {
+PION_MINSIZE void *pion_ptr_alloc(int64_t bytes) {
     size_t sz = bytes > 0 ? (size_t)bytes : 1u;
     void *p = calloc(1u, sz);
     if (!p) pion_oom();
     return p;
 }
 
-PION_IO_FN void pion_ptr_free(void *p) {
+PION_MINSIZE void pion_ptr_free(void *p) {
     free(p);
 }
 
-PION_IO_FN void *pion_ptr_offset(void *p, int64_t byte_off) {
+PION_MINSIZE void *pion_ptr_offset(void *p, int64_t byte_off) {
     if (!p) return NULL;
     return (void *)((char *)p + byte_off);
 }
 
-PION_IO_FN void *pion_ptr_read_ptr(void *p, int64_t byte_off) {
+PION_MINSIZE void *pion_ptr_read_ptr(void *p, int64_t byte_off) {
     void *v = NULL;
     memcpy(&v, (const char *)p + byte_off, sizeof(v));
     return v;
 }
 
-PION_IO_FN void pion_ptr_write_ptr(void *p, int64_t byte_off, void *v) {
+PION_MINSIZE void pion_ptr_write_ptr(void *p, int64_t byte_off, void *v) {
     memcpy((char *)p + byte_off, &v, sizeof(v));
 }
 
-PION_IO_FN int32_t pion_ptr_read_u8(void *p, int64_t byte_off) {
+PION_MINSIZE int32_t pion_ptr_read_u8(void *p, int64_t byte_off) {
     return (int32_t)((const uint8_t *)p)[byte_off];
 }
 
-PION_IO_FN void pion_ptr_write_u8(void *p, int64_t byte_off, int32_t v) {
+PION_MINSIZE void pion_ptr_write_u8(void *p, int64_t byte_off, int32_t v) {
     ((uint8_t *)p)[byte_off] = (uint8_t)v;
 }
 
-PION_IO_FN int32_t pion_ptr_read_i32(void *p, int64_t byte_off) {
+PION_MINSIZE int32_t pion_ptr_read_i32(void *p, int64_t byte_off) {
     int32_t v = 0;
     memcpy(&v, (const char *)p + byte_off, sizeof(v));
     return v;
 }
 
-PION_IO_FN void pion_ptr_write_i32(void *p, int64_t byte_off, int32_t v) {
+PION_MINSIZE void pion_ptr_write_i32(void *p, int64_t byte_off, int32_t v) {
     memcpy((char *)p + byte_off, &v, sizeof(v));
 }
 
-PION_IO_FN int64_t pion_ptr_read_i64(void *p, int64_t byte_off) {
+PION_MINSIZE int64_t pion_ptr_read_i64(void *p, int64_t byte_off) {
     int64_t v = 0;
     memcpy(&v, (const char *)p + byte_off, sizeof(v));
     return v;
 }
 
-PION_IO_FN void pion_ptr_write_i64(void *p, int64_t byte_off, int64_t v) {
+PION_MINSIZE void pion_ptr_write_i64(void *p, int64_t byte_off, int64_t v) {
     memcpy((char *)p + byte_off, &v, sizeof(v));
 }
 
-PION_IO_FN void *pion_cstr_to_str(void *cstr) {
+PION_MINSIZE void *pion_cstr_to_str(void *cstr) {
     if (!cstr) return pion_empty_str();
     const char *s = (const char *)cstr;
     return pion_str_from_cstr(s, (int64_t)strlen(s));

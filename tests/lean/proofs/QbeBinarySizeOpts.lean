@@ -19,10 +19,14 @@ Soundness models for the Opt-Track Z2 output-size changes (regression test
      the separately stored strings, and the table is the same byte sequence.
   3. `ElfLiteralSym` — a non-exported compiler literal (`pion_str_<n>_hdr`,
      `pion_cstr_<n>`) that owns its whole dedicated `.data` input section at
-     offset 0 is emitted as an `STT_SECTION` symbol of that section.
-     `literal_relocation`: `S + A`, `S + A - P` and GOT-relative forms give the
-     same value for the section base as for the named symbol at offset 0, for
-     every (also negative, modulo 2^64) addend.
+     offset 0 and is referenced only by `S + A` relocations (`R_X86_64_64`,
+     `PC32`, `32`, `32S`) is emitted as an `STT_SECTION` symbol of that
+     section. `rebased_value` / `rebased_relocation`: also after a partial
+     link moves the input section to any offset `delta` of a merged section
+     (and its addends by `delta`), these relocations compute the same field
+     as through the named symbol, for every 64-bit addend. `got_not_rebased`:
+     a GOT-relative relocation is not invariant under that rewrite, so a
+     literal it references keeps its name.
   4. `RuntimePool` — `runtime/pion_rt.c` stores its cold panic texts as the
      members of one `struct PionErrors`; call sites pass `offsetof` constants.
      `pooled_diagnostic`: reading from the pool base plus a member's offset
@@ -122,15 +126,36 @@ end ElfNames
 
 namespace ElfLiteralSym
 
-/-- The literal is at offset 0 of its own section: the named symbol's value is
-    `base + 0`, the section symbol's is `base`. Absolute, PC-relative and
-    GOT-relative relocations agree for every addend. -/
-theorem literal_relocation (base addend place : BitVec 64)
-    (got : BitVec 64 → BitVec 64) :
-    (base + 0) + addend = base + addend ∧
-    (base + 0) + addend - place = base + addend - place ∧
-    got (base + 0) + addend - place = got base + addend - place := by
-  simp
+/-- A partial link (`ld -r`) may put the literal's input section at offset
+    `delta` of a merged output section based at `mbase`. A named symbol at
+    offset 0 then has the value `mbase + (delta + 0)`; a relocation against the
+    section symbol is rewritten to the merged section with addend
+    `addend + delta`. Both denote the same `S + A`. -/
+theorem rebased_value (mbase delta addend : BitVec 64) :
+    (mbase + (delta + 0)) + addend = mbase + (addend + delta) := by
+  bv_omega
+
+/-- Hence every relocation that is a function of `S + A` (`R_X86_64_64`,
+    `_32`, `_32S`) or of `S + A - P` (`R_X86_64_PC32`) computes the same field
+    through the section symbol, before and after any partial link. -/
+theorem rebased_relocation {α : Type} (f : BitVec 64 → α)
+    (mbase delta addend place : BitVec 64) :
+    f ((mbase + (delta + 0)) + addend) = f (mbase + (addend + delta)) ∧
+    f ((mbase + (delta + 0)) + addend - place) = f (mbase + (addend + delta) - place) := by
+  rw [rebased_value]
+  exact ⟨rfl, rfl⟩
+
+/-- A GOT-relative relocation resolves the symbol itself (`GOT(S) + A - P`),
+    so rebasing its addend is not sound once `delta ≠ 0`: a symbol loaded via
+    the GOT (`R_X86_64_GOTPCREL`) keeps its name (`keep_name` in `elf.c`). -/
+theorem got_not_rebased (base addend delta place : BitVec 64) (h : delta ≠ 0) :
+    ∃ got : BitVec 64 → BitVec 64,
+      got base + (addend + delta) - place ≠ got (base + delta) + addend - place := by
+  refine ⟨fun _ => 0, ?_⟩
+  intro heq
+  apply h
+  dsimp only at heq
+  bv_omega
 
 end ElfLiteralSym
 

@@ -5,14 +5,19 @@
 #   1. Pooled runtime diagnostics: panics.pion traps (dev and --release) on a
 #      string slice, a missing Map key and a negative Bytes length with exactly
 #      `pion panic at pion_rt.c:<line>: <message>`, SIGABRT and the output
-#      before the trap; pool.c calls every user-reachable pooled panic of the
-#      runtime ABI (string index, slice, Bytes length / null destination, array
-#      get / set / pop, null map, missing key on an empty and a non-empty map,
-#      scope_spawn, argv index) the same way; in-bounds calls return normally.
-#   2. Host I/O section: hello.pion (no file I/O) and fileio.pion (fs_write /
-#      fs_read) build and print the reference output. On Linux x86_64 their
+#      before the trap; pool.c reaches 14 of the 16 pooled texts through the
+#      runtime ABI in 15 cases (string index, slice, Bytes length / null
+#      destination / write to a read-only mmap, array get / set / pop, null
+#      map, missing key on an empty and a non-empty map, scope_spawn, argv
+#      index, container length, SIMD stride) the same way; in-bounds calls
+#      return normally. Not reached: the non-owning-thread freeze and a
+#      failing thread creation.
+#   2. Host I/O section: hello.pion (no file I/O), fileio.pion (fs_write /
+#      fs_read) and ptr.pion (Ptr, cstr_to_str, sha256_hex) build and print
+#      the reference output. On Linux x86_64 libpionrt.a is < 65,536 B and
+#      defines every entry point runtime/pion_rt.h declares, and the
 #      `--emit-obj` objects are linked with `--print-gc-sections`: the linker
-#      removes `.text.pion_io` for hello and keeps it for fileio.
+#      removes `.text.pion_io` for hello and ptr and keeps it for fileio.
 #   3. ELF64 writer (Linux x86_64): the `--emit-obj` object of literals.pion
 #      (dev and --release) shares every section name with the tail of its
 #      `.rela` name in `.shstrtab` and refers to the `pion_str_<n>_hdr` /
@@ -21,11 +26,17 @@
 #      empty PION_CACHE_DIR: two direct-object builds are byte-identical; the
 #      direct object and the `--emit-asm` build (assembled by `cc -c`) have
 #      byte-identical allocated sections other than `.text` (the literals
-#      included) with the same relocation targets, every `.text` reference to
-#      a literal resolves to the same section and offset, and both link to
+#      included) with the same relocation targets, every `.text` section
+#      refers to the same literals in the same order with the same relocation
+#      types, and both link to
 #      executables printing the reference output. `.text` bytes are not
 #      compared: the direct encoder picks shorter forms than GAS (`test` for
 #      `cmp $0`).
+#      lit_*.il (QBE IL) are partially linked with `ld -r` so their
+#      `.data.pion_cstr_0` literals move to non-zero offsets: literals reached
+#      only by S + A relocations use the section symbol, one also loaded via
+#      `extern` (GOTPCREL) keeps its name, and lit_main.c reads every literal
+#      exactly after the final link.
 #   4. Wasm32: wasm_map.pion (Map[String, Int]) prints the reference output
 #      under Node (dev and --release); its module (`--wasm-names`, no
 #      wasm-opt) has no `__pion_map_hash` and every function body is reachable
@@ -97,7 +108,7 @@ for MODE in dev release; do
   echo "p128 panics $MODE: in-bounds native and Wasm32 output 'bc 42 2'"
 done
 
-# 1b. Every user-reachable pooled panic through the runtime ABI.
+# 1b. Pooled panics through the runtime ABI (15 cases, 14 of the 16 texts).
 "$CC_BIN" -std=c11 -O2 -I"$ROOT_DIR/runtime" "$DIR/pool.c" "$RT_LIB" -lm -lpthread -o "$TMP_DIR/pool"
 [ "$("$TMP_DIR/pool" ok)" = "ok 99 42 9 9" ] || fail "pool ok printed '$("$TMP_DIR/pool" ok)'"
 N=0
@@ -113,7 +124,10 @@ for CASE in \
   "map_empty:map key not found" \
   "map_miss:map key not found" \
   "spawn:invalid scope_spawn" \
-  "argv_index:argv index out of bounds"; do
+  "argv_index:argv index out of bounds" \
+  "length:container length exceeds maximum" \
+  "stride:simd stride mismatch" \
+  "mmap_write:cannot mutate read-only mmap Bytes"; do
   ARG=${CASE%%:*}
   MSG=${CASE#*:}
   set +e
@@ -123,9 +137,10 @@ for CASE in \
   expect_trap "pool $ARG" "$MSG" "$TMP_DIR/c.out" "$TMP_DIR/c.err" "$RC" ""
   N=$((N + 1))
 done
-[ "$N" -eq 12 ]
+[ "$N" -eq 15 ]
 
-# 2. Programs with and without host file I/O.
+# 2. Programs with and without host file I/O (ptr: Ptr / C string / SHA-256
+#    helpers, which are not host I/O).
 "$PIONC" build --release -o "$TMP_DIR/hello" "$DIR/hello.pion"
 [ "$("$TMP_DIR/hello")" = "hello, p128" ] || fail "hello output"
 "$PIONC" build --release -o "$TMP_DIR/fileio" "$DIR/fileio.pion"
@@ -135,9 +150,40 @@ cmp -s "$DIR/fileio.expected" "$TMP_DIR/fileio.out" || {
   fail "fileio output differs from the reference"
 }
 [ "$(cat "$TMP_DIR/io.txt")" = "$(printf 'p128 line one\np128 line two')" ] || fail "fileio wrote the wrong file"
-echo "p128 hello / fileio: reference output"
+"$PIONC" build --release -o "$TMP_DIR/ptr" "$DIR/ptr.pion"
+"$TMP_DIR/ptr" > "$TMP_DIR/ptr.out"
+cmp -s "$DIR/ptr.expected" "$TMP_DIR/ptr.out" || {
+  diff -u "$DIR/ptr.expected" "$TMP_DIR/ptr.out" >&2 || true
+  fail "ptr output differs from the reference"
+}
+echo "p128 hello / fileio / ptr: reference output"
 if [ "$LINUX_X64" -eq 1 ]; then
-  for PROG in hello fileio; do
+  # The archive stays in budget and defines every runtime entry point that
+  # runtime/pion_rt.h declares (the runtime/pion_cli.c helpers excluded).
+  RT_SIZE=$(wc -c < "$RT_LIB" | tr -d ' ')
+  [ "$RT_SIZE" -lt 65536 ] || fail "libpionrt.a is $RT_SIZE bytes"
+  nm -g --defined-only "$RT_LIB" > "$TMP_DIR/rt.syms"
+  python3 -E - "$ROOT_DIR/runtime" "$TMP_DIR/rt.syms" <<'PY' || fail "runtime ABI incomplete"
+import re, sys
+rt = sys.argv[1]
+h = open(rt + '/pion_rt.h').read()
+cli = open(rt + '/pion_cli.c').read()
+decl = set(re.findall(r'^[A-Za-z_][\w \*]*?\b(pion_[a-z0-9_]+)\s*\(', h, re.M))
+decl = {n for n in decl if not re.search(r'^[^\n;]*\b%s\s*\([^;]*\{' % n, cli, re.M)}
+syms = set()
+for line in open(sys.argv[2]):
+    f = line.split()
+    if len(f) == 3 and f[1] in 'TDRB':
+        syms.add(f[2])
+missing = sorted(decl - syms)
+if len(decl) < 150 or missing:
+    print('declared %d, missing %r' % (len(decl), missing), file=sys.stderr)
+    sys.exit(1)
+print('p128 libpionrt.a: %d exported symbols, all %d declared runtime entry points defined'
+      % (len(syms), len(decl)))
+PY
+  echo "p128 libpionrt.a: $RT_SIZE bytes (< 65536)"
+  for PROG in hello fileio ptr; do
     "$PIONC" build --release --emit-obj "$TMP_DIR/$PROG.o" "$DIR/$PROG.pion"
     "$CC_BIN" "$TMP_DIR/$PROG.o" "$RT_LIB" -lm -lpthread -Wl,--gc-sections -Wl,--print-gc-sections \
       -o "$TMP_DIR/$PROG.gc" 2> "$TMP_DIR/$PROG.gc.log"
@@ -150,13 +196,15 @@ if [ "$LINUX_X64" -eq 1 ]; then
     # The log is never empty: the runtime always has other unused sections.
     [ -s "$TMP_DIR/$PROG.gc.log" ] || fail "$PROG: empty --print-gc-sections log"
     case "$PROG:$GC" in
-      hello:removed|fileio:kept) echo "p128 $PROG: .text.pion_io $GC by --gc-sections" ;;
+      hello:removed|fileio:kept|ptr:removed) echo "p128 $PROG: .text.pion_io $GC by --gc-sections" ;;
       *) cat "$TMP_DIR/$PROG.gc.log" >&2; fail "$PROG: .text.pion_io $GC" ;;
     esac
   done
   [ "$("$TMP_DIR/hello.gc")" = "hello, p128" ] || fail "hello.gc output"
   "$TMP_DIR/fileio.gc" "$TMP_DIR/io2.txt" > "$TMP_DIR/fileio.gc.out"
   cmp -s "$DIR/fileio.expected" "$TMP_DIR/fileio.gc.out" || fail "fileio.gc output"
+  "$TMP_DIR/ptr.gc" > "$TMP_DIR/ptr.gc.out"
+  cmp -s "$DIR/ptr.expected" "$TMP_DIR/ptr.gc.out" || fail "ptr.gc output"
 fi
 
 # 3. ELF64 objects (QBE amd64 direct-object writer).
@@ -190,6 +238,31 @@ else
   "$TMP_DIR/literals" > "$TMP_DIR/literals.out"
   cmp -s "$DIR/literals.expected" "$TMP_DIR/literals.out" || fail "literals output differs from the reference"
   echo "p128 literals: reference output (ELF64 object checks run on Linux x86_64)"
+fi
+
+# 3b. Partial links (Linux x86_64): `ld -r` merges the three objects'
+#     `.data.pion_cstr_0` input sections, so the literals of lit_direct.o and
+#     lit_got.o move to non-zero offsets. S + A references through the
+#     section symbol are rebased by the addend; the GOT-loaded literal keeps
+#     its named symbol. The final program must read every literal exactly.
+if [ "$LINUX_X64" -eq 1 ]; then
+  QBE_BIN="${PION_QBE:-$ROOT_DIR/out/qbe}"
+  [ -x "$QBE_BIN" ] || fail "QBE binary $QBE_BIN not found (set PION_QBE)"
+  for F in lit_pad lit_direct lit_got; do
+    "$QBE_BIN" -t amd64_sysv --obj -o "$TMP_DIR/$F.o" "$DIR/$F.il"
+  done
+  python3 -E "$DIR/check.py" litsym "$TMP_DIR/lit_direct.o" section
+  python3 -E "$DIR/check.py" litsym "$TMP_DIR/lit_pad.o" section
+  python3 -E "$DIR/check.py" litsym "$TMP_DIR/lit_got.o" named
+  LD_BIN="${LD:-ld}"
+  "$LD_BIN" -r -o "$TMP_DIR/lit_merged.o" "$TMP_DIR/lit_pad.o" "$TMP_DIR/lit_direct.o" "$TMP_DIR/lit_got.o"
+  "$CC_BIN" -std=c11 -O2 "$DIR/lit_main.c" "$TMP_DIR/lit_merged.o" -o "$TMP_DIR/lit_main"
+  "$TMP_DIR/lit_main" > "$TMP_DIR/lit_main.out"
+  cmp -s "$DIR/lit_main.expected" "$TMP_DIR/lit_main.out" || {
+    diff -u "$DIR/lit_main.expected" "$TMP_DIR/lit_main.out" >&2 || true
+    fail "ld -r merged literals resolve to the wrong bytes"
+  }
+  echo "p128 ld -r: merged section-symbol and GOT literal references read the exact literals"
 fi
 
 # 4. Wasm32 Map program without the dead hash helper.

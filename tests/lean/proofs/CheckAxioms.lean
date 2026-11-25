@@ -834,6 +834,8 @@ import PionProofs.QbeBinarySizeOpts
 #print axioms PionQbeBinarySizeOpts.WasmDeadFn.avoids_deleted
 #print axioms PionQbeBinarySizeOpts.WasmDeadFn.delete_unreachable
 #print axioms PionQbeBinarySizeOpts.ElfNames.shared_names
-#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.literal_relocation
+#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.rebased_value
+#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.rebased_relocation
+#print axioms PionQbeBinarySizeOpts.ElfLiteralSym.got_not_rebased
 #print axioms PionQbeBinarySizeOpts.RuntimePool.pooled_diagnostic
 #print axioms PionQbeBinarySizeOpts.RuntimePool.grouped_link

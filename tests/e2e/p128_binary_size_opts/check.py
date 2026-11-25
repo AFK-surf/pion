@@ -4,8 +4,12 @@
                                  for private literals (QBE amd64 ELF writer)
   check.py objcmp <a.o> <b.o> -- a direct and a GAS object agree: allocated
                                  sections other than `.text` byte for byte with
-                                 the same relocation targets, and `.text`
-                                 refers to the same literal bytes
+                                 the same relocation targets, and every `.text`
+                                 section refers to the same literals in the
+                                 same order with the same relocation types
+  check.py litsym <o> section|named
+                              -- `pion_cstr_0` via its section symbol (S + A
+                                 only) or by name (also loaded via the GOT)
   check.py wasm <mod.wasm>    -- no `__pion_map_hash`, no unreferenced function
 """
 import re
@@ -158,24 +162,72 @@ def check_objcmp(a, b):
     names_b = sorted(n for n, v in rb.items() if v[2] or v[4])
     if names_a != names_b:
         fail('allocated sections differ: %r vs %r' % (names_a, names_b))
-    text_refs = {}
+    nrefs = 0
     for n in names_a:
         va, vb = ra[n], rb[n]
         if not n.startswith(b'.text'):
             if va[:4] != vb[:4] or sorted(va[4]) != sorted(vb[4]):
                 fail('section %r differs between %s and %s' % (n, a, b))
             continue
-        # The two encoders differ inside `.text`; the literal bytes each
-        # reference resolves to (section, offset + addend) must not.
-        for side, v in (('a', va), ('b', vb)):
-            text_refs.setdefault(side, []).extend(
-                sorted((sec, val) for _, _, sec, val in v[4] if lit.fullmatch(sec)))
-    if not text_refs.get('a'):
+        # The two encoders place instructions differently inside a function,
+        # so offsets are not compared; the function's literal references, in
+        # order, must agree in relocation type and resolved target.
+        seq_a = [(t, sec, val) for _, t, sec, val in sorted(va[4]) if lit.fullmatch(sec)]
+        seq_b = [(t, sec, val) for _, t, sec, val in sorted(vb[4]) if lit.fullmatch(sec)]
+        if seq_a != seq_b:
+            fail('%r: literal references differ: %r vs %r' % (n, seq_a[:6], seq_b[:6]))
+        nrefs += len(seq_a)
+    if nrefs == 0:
         fail('%s: .text never refers to a literal' % a)
-    if sorted(text_refs['a']) != sorted(text_refs.get('b', [])):
-        fail('.text literal references differ: %r vs %r' % (text_refs['a'][:6], text_refs.get('b', [])[:6]))
     print('p128 objcmp: %d sections, %d literal sections identical with their relocations; '
-          '%d .text literal references agree' % (len(names_a), len(lits), len(text_refs['a'])))
+          '%d .text literal references agree per function, in order and type' % (
+              len(names_a), len(lits), nrefs))
+
+
+R_X86_64_GOTPCREL = 9
+
+
+def check_litsym(path, want):
+    """How `pion_cstr_0` is referenced: `section` (local STT_SECTION symbol,
+    no name) or `named` (a local STT_OBJECT `pion_cstr_0` at offset 0, used by
+    a GOTPCREL relocation)."""
+    data = open(path, 'rb').read()
+    secs, _ = elf(data, path)
+    st = [s for s in secs if s['type'] == SHT_SYMTAB][0]
+    strtab = secs[st['link']]['data']
+    syms = []
+    for i in range(st['size'] // 24):
+        name, info, other, shndx, value, size = struct.unpack_from('<IBBHQQ', st['data'], i * 24)
+        syms.append((cstr(strtab, name), info >> 4, info & 15, shndx, value))
+    lit = [i for i, s in enumerate(secs) if s['name'] == b'.data.pion_cstr_0']
+    if len(lit) != 1:
+        fail('%s: no .data.pion_cstr_0 section' % path)
+    named = [i for i, s in enumerate(syms) if s[0] == b'pion_cstr_0']
+    sect = [i for i, s in enumerate(syms) if s[2] == STT_SECTION and s[3] == lit[0]]
+    used = {}
+    for r in secs:
+        if r['type'] == SHT_RELA:
+            for j in range(r['size'] // 24):
+                _, info, _ = struct.unpack_from('<QQq', r['data'], j * 24)
+                used.setdefault(info >> 32, set()).add(info & 0xFFFFFFFF)
+    if want == 'section':
+        if named or not sect or sect[0] not in used:
+            fail('%s: pion_cstr_0 is not referenced through its section symbol' % path)
+        if R_X86_64_GOTPCREL in used[sect[0]]:
+            fail('%s: GOTPCREL against a section symbol' % path)
+    else:
+        if len(named) != 1:
+            fail('%s: pion_cstr_0 lost its name' % path)
+        s = syms[named[0]]
+        if s[1] != 0 or s[2] != STT_OBJECT or s[3] != lit[0] or s[4] != 0:
+            fail('%s: pion_cstr_0 is not a local object at offset 0: %r' % (path, s))
+        if R_X86_64_GOTPCREL not in used.get(named[0], set()):
+            fail('%s: no GOTPCREL against pion_cstr_0' % path)
+        for i in sect:
+            if R_X86_64_GOTPCREL in used.get(i, set()):
+                fail('%s: GOTPCREL against the section symbol' % path)
+    print('p128 litsym %s: pion_cstr_0 referenced via its %s symbol' % (
+        path.rsplit('/', 1)[-1], 'section' if want == 'section' else 'named'))
 
 
 # ---------------------------------------------------------------- Wasm32 ---
@@ -454,7 +506,9 @@ if __name__ == '__main__':
         check_elf(sys.argv[2])
     elif cmd == 'objcmp' and len(sys.argv) == 4:
         check_objcmp(sys.argv[2], sys.argv[3])
+    elif cmd == 'litsym' and len(sys.argv) == 4 and sys.argv[3] in ('section', 'named'):
+        check_litsym(sys.argv[2], sys.argv[3])
     elif cmd == 'wasm' and len(sys.argv) == 3:
         check_wasm(sys.argv[2])
     else:
-        fail('usage: check.py elf <o> | objcmp <a.o> <b.o> | wasm <wasm>')
+        fail('usage: check.py elf <o> | objcmp <a.o> <b.o> | litsym <o> section|named | wasm <wasm>')

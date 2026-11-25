@@ -151,6 +151,7 @@ typedef struct {
 	int sec_idx;
 	uint64_t offset;       /* offset in section, or alignment if common */
 	uint64_t size;         /* st_size */
+	int keep_name;         /* referenced by a non-linear relocation */
 } SymEnt;
 
 typedef struct {
@@ -406,6 +407,12 @@ sec_add_reloc(int sec_idx, uint64_t offset, uint32_t sym_idx, uint32_t type, int
 			die("elf: out of memory");
 	}
 	Reloc *r = &s->relocs[s->nrelocs++];
+	/* Only S + A relocations stay exact when `ld -r` moves a literal away
+	 * from offset 0 of a merged section; GOT, PLT and TLS forms resolve the
+	 * symbol itself and keep its name. */
+	if (type != R_X86_64_64 && type != R_X86_64_PC32 &&
+	    type != R_X86_64_32 && type != R_X86_64_32S)
+		E0.syms[sym_idx].keep_name = 1;
 	r->offset = offset;
 	r->sym_idx = sym_idx;
 	r->type = type;
@@ -2794,8 +2801,9 @@ amd64_elf_finish(FILE *outf)
 		Elf64_Sym *es = &esyms[1u + ni];
 		/* The address of a private literal occupying its own entire input
 		 * section is exactly the section base. Keep the relocation index,
-		 * addend and section identity, and let the linker omit its label. */
-		if (e->defined && !e->is_export && e->st_type == STT_OBJECT &&
+		 * addend and section identity, and let the linker omit its label.
+		 * Only S + A relocations refer to it (see sec_add_reloc). */
+		if (e->defined && !e->is_export && !e->keep_name && e->st_type == STT_OBJECT &&
 		    E0.secs[e->sec_idx].private_literal && e->offset == 0 &&
 		    e->size == E0.secs[e->sec_idx].buf.len) {
 			es->st_info = ELF64_ST_INFO(STB_LOCAL, STT_SECTION);

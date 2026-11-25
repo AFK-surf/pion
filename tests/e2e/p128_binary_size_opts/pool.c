@@ -1,12 +1,15 @@
-/* P128: every user-reachable pooled runtime diagnostic, called through the
- * public runtime ABI of libpionrt.a. argv[1] selects the trap; each case must
- * abort with exactly `pion panic at pion_rt.c:<line>: <message>`. */
+/* P128: pooled runtime diagnostics, called through the public runtime ABI of
+ * libpionrt.a. argv[1] selects the trap; each case must abort with exactly
+ * `pion panic at pion_rt.c:<line>: <message>`. 15 cases reach 14 of the 16
+ * pooled texts; not reachable from a single-threaded harness: the
+ * non-owning-thread freeze and a failing thread creation. */
 #include "pion_rt.h"
 #include <stdio.h>
 #include <string.h>
 
 int main(int argc, char **argv) {
     if (argc != 2) return 2;
+    int32_t ok = 0;
     const char *c = argv[1];
     void *s = pion_str_from_cstr("abc", 3);
     void *key = pion_str_from_cstr("key", 3);
@@ -26,6 +29,14 @@ int main(int argc, char **argv) {
         pion_map_get(m, key);
     } else if (!strcmp(c, "spawn")) pion_scope_spawn(NULL, NULL, NULL);
     else if (!strcmp(c, "argv_index")) pion_world_argv(NULL, 0);
+    else if (!strcmp(c, "length")) pion_arr_new((int64_t)1 << 40, 0);
+    else if (!strcmp(c, "stride")) pion_simd_i8_dot(arr, 0, 0, arr, 0, 0);
+    else if (!strcmp(c, "mmap_write")) {
+        /* The harness executable itself is a non-empty readable file. */
+        void *b = pion_fs_mmap_ro(pion_str_from_cstr(argv[0], (int64_t)strlen(argv[0])), &ok);
+        if (!ok || pion_bytes_len(b) <= 0) return 4;
+        pion_bytes_set(b, 0, 1);
+    }
     else if (!strcmp(c, "ok")) {
         /* The same calls in bounds return normally. */
         void *m = pion_map_new(0);
