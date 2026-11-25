@@ -268,6 +268,24 @@ usage(FILE *hf, char *prog)
 	fprintf(hf, "\t%-18s dump debug information\n", "-d <flags>");
 }
 
+/* A short write (full disk, RLIMIT_FSIZE) may only surface when the
+ * buffer is flushed: fail instead of leaving a truncated output behind
+ * an exit status of 0. */
+static void
+closeout(FILE *f, char *path)
+{
+	int err;
+
+	err = fflush(f) != 0;
+	err |= ferror(f) != 0;
+	if (f != stdout)
+		err |= fclose(f) != 0;
+	if (err) {
+		fprintf(stderr, "error writing '%s'\n", path);
+		exit(1);
+	}
+}
+
 int
 main(int ac, char *av[])
 {
@@ -406,7 +424,7 @@ main(int ac, char *av[])
 				else
 					amd64_elf_finish(outf);
 			}
-			fclose(outf);
+			closeout(outf, out_p);
 			outf = stdout;
 		}
 		free(files);
@@ -458,8 +476,7 @@ main(int ac, char *av[])
 			T.emitfin(outf);
 	}
 
-	if (outf != stdout)
-		fclose(outf);
+	closeout(outf, outf == stdout ? "<stdout>" : outpath);
 	free(files);
 	exit(0);
 }

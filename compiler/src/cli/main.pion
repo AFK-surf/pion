@@ -1648,6 +1648,32 @@ fn drv_publish_tmp(world : World, tmp : String, dst : String, shared : Bool) -> 
 }
 
 ///|
+/// Removes `paths[start..]`, ignoring files that are already gone.
+fn drv_remove_files(world : World, paths : Array[String], start : Int) -> Unit {
+  let mut j = start
+  while j < paths.length() {
+    let _ = fs_remove(world, paths[j])
+    j = j + 1
+  }
+}
+
+///|
+/// Publishes the finished unit objects `tmps[j]` as the CAS entries `objs[j]`
+/// (`drv_publish_tmp`, shared). On the first failure the remaining
+/// temporaries are removed and the error is returned; "" when all published.
+fn drv_publish_unit_objs(world : World, tmps : Array[String], objs : Array[String]) -> String {
+  let mut j = 0
+  while j < tmps.length() {
+    if !drv_publish_tmp(world, tmps[j], objs[j], true) {
+      drv_remove_files(world, tmps, j + 1)
+      return "failed to publish CAS object: " + objs[j]
+    }
+    j = j + 1
+  }
+  ""
+}
+
+///|
 /// A CAS entry counts as present (a hit, or a lost publish race's winner)
 /// only as a non-empty regular file: a directory, symlink or 0-byte file
 /// left at its path is never mistaken for a finished output.
@@ -6733,6 +6759,27 @@ fn drv_run_wasm_opt(
   }
 }
 
+///| Emit one unit on the producer thread; the prepared type checker stays local.
+fn drv_emit_unit_file(
+  world : World,
+  prep : PreparedPackage,
+  idx : Int,
+  output : String,
+  release : Bool,
+  target : String,
+  entry_symbol : String,
+  no_main : Bool,
+) -> Bool {
+  let mask = drv_j2_disable_mask(world)
+  let raw = emit_qbe_unit_entry_target_opts(prep, idx, release, target, entry_symbol, no_main, mask)
+  let text = if release {
+    inline_native_rc_ssa_opts(raw, mask)
+  } else {
+    cleanup_native_rc_ssa_opts(raw, mask)
+  }
+  drv_write_cas_text_atomic(world, output, text)
+}
+
 ///|
 fn drv_build_targets(
   world : World,
@@ -7038,7 +7085,7 @@ fn drv_build_targets(
       pkg_key_sb.write_string(ukey)
       let uobj = cache_dir + "/obj/" + ukey + ".o"
       obj_paths.push(uobj)
-      if !fs_exists(world, uobj) {
+      if !drv_is_nonempty_regular_file(world, uobj) {
         miss_indices.push(ui)
         is_miss.push(true)
       } else {
@@ -7151,31 +7198,18 @@ fn drv_build_targets(
         }
       }
 
-      // Emit QBE SSA only for cache-missed units
-      let mut mi = 0
-      while mi < miss_indices.length() {
-        let idx = miss_indices[mi]
-        let ukey = unit_keys[idx]
-        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
-        let j2_mask = drv_j2_disable_mask(world)
-        let raw_ssa = emit_qbe_unit_entry_target_opts(
-          prep,
-          idx,
-          release,
-          qbe_target,
-          entry_symbol,
-          no_main,
-          j2_mask,
-        )
-        let ssa_text = if release {
-          inline_native_rc_ssa_opts(raw_ssa, j2_mask)
-        } else {
-          cleanup_native_rc_ssa_opts(raw_ssa, j2_mask)
+      if direct_obj && jobs > 1 && miss_indices.length() > 1 {
+        prep_opt = Some(prep)
+      } else {
+        let mut mi = 0
+        while mi < miss_indices.length() {
+          let idx = miss_indices[mi]
+          let path = cache_dir + "/ssa/" + unit_keys[idx] + ".ssa"
+          if !drv_emit_unit_file(world, prep, idx, path, release, qbe_target, entry_symbol, no_main) {
+            return Err("failed to write CAS unit ssa: " + path)
+          }
+          mi = mi + 1
         }
-        if !drv_write_cas_text_atomic(world, u_ssa, ssa_text) {
-          return Err("failed to write CAS unit ssa: " + u_ssa)
-        }
-        mi = mi + 1
       }
     }
 
@@ -7200,7 +7234,9 @@ fn drv_build_targets(
             let _ = fs_remove(world, u_tmp)
             return Err("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
           }
-          let _ = fs_rename(world, u_tmp, u_obj)
+          if !drv_publish_tmp(world, u_tmp, u_obj, true) {
+            return Err("failed to publish CAS object: " + u_obj)
+          }
         } else {
           let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp + "_" + idx.to_string()
           let rc_qbe = proc_exec(world, [qbe_bin, "-t", qbe_arch, "-o", u_asm, u_ssa])
@@ -7222,7 +7258,9 @@ fn drv_build_targets(
             let _ = fs_remove(world, u_tmp)
             return Err("as failed with exit code " + rc_as.to_string())
           }
-          let _ = fs_rename(world, u_tmp, u_obj)
+          if !drv_publish_tmp(world, u_tmp, u_obj, true) {
+            return Err("failed to publish CAS object: " + u_obj)
+          }
         }
         mi = mi + 1
       }
@@ -7254,20 +7292,23 @@ fn drv_build_targets(
         }
         let rc_qbe = proc_exec(world, argv)
         if rc_qbe != 0 {
-          let mut j = 0
-          while j < tmps.length() {
-            let _ = fs_remove(world, tmps[j])
-            j = j + 1
-          }
+          drv_remove_files(world, tmps, 0)
           return Err("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
         }
-        let mut j = 0
-        while j < tmps.length() {
-          let _ = fs_rename(world, tmps[j], objs[j])
-          j = j + 1
+        let pub_err = drv_publish_unit_objs(world, tmps, objs)
+        if pub_err != "" {
+          return Err(pub_err)
         }
       } else {
         let err_ch : Channel[String] = Channel::new(nw + 1)
+        let prep = match prep_opt {
+          Some(p) => p
+          None => return Err("missing prepared package for unit emission")
+        }
+        let emit_errors : Array[String] = []
+        // Temporaries of the batches handed to a worker, published below.
+        let all_tmps : Array[String] = []
+        let all_objs : Array[String] = []
         let qmv = qbe_macos_ver
         let qb = qbe_bin
         let qt = qbe_target
@@ -7277,58 +7318,71 @@ fn drv_build_targets(
             let start = wi * n_miss / nw
             let end = (wi + 1) * n_miss / nw
             let spec_sb = StringBuilder()
+            let batch_tmps : Array[String] = []
+            let batch_objs : Array[String] = []
             let mut k = start
             while k < end {
               let idx = miss_indices[k]
               let ukey = unit_keys[idx]
               let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+              if !drv_emit_unit_file(world, prep, idx, u_ssa, release, qt, entry_symbol, no_main) {
+                emit_errors.push("failed to write CAS unit ssa: " + u_ssa)
+                break
+              }
               let u_obj = obj_paths[idx]
               let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
               spec_sb.write_string(u_ssa)
               spec_sb.write_char('\n')
               spec_sb.write_string(u_tmp)
               spec_sb.write_char('\n')
-              spec_sb.write_string(u_obj)
-              spec_sb.write_char('\n')
+              batch_tmps.push(u_tmp)
+              batch_objs.push(u_obj)
               k = k + 1
+            }
+            if emit_errors.length() > 0 {
+              break
+            }
+            let mut j = 0
+            while j < batch_tmps.length() {
+              all_tmps.push(batch_tmps[j])
+              all_objs.push(batch_objs[j])
+              j = j + 1
             }
             let spec = spec_sb.to_string()
             spawn(s, fn() -> Unit {
               let lines = drv_split_lines(spec)
               let argv = drv_qbe_obj_argv(qb, qt, qmv, true)
-              let tmps : Array[String] = []
-              let objs : Array[String] = []
               let mut li = 0
-              while li + 2 < lines.length() {
+              while li + 1 < lines.length() {
                 argv.push(lines[li])
                 argv.push(lines[li + 1])
-                tmps.push(lines[li + 1])
-                objs.push(lines[li + 2])
-                li = li + 3
+                li = li + 2
               }
               let rc_qbe = proc_exec(argv)
               if rc_qbe != 0 {
-                let mut j = 0
-                while j < tmps.length() {
-                  let _ = fs_remove(tmps[j])
-                  j = j + 1
-                }
                 let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
-              } else {
-                let mut j = 0
-                while j < tmps.length() {
-                  let _ = fs_rename(tmps[j], objs[j])
-                  j = j + 1
-                }
               }
             })
             wi = wi + 1
           }
         })
+        // Every worker has exited: publish only when the whole frontend and
+        // every backend batch succeeded, as in the sequential producer.
+        if emit_errors.length() > 0 {
+          drv_remove_files(world, all_tmps, 0)
+          return Err(emit_errors[0])
+        }
         err_ch.close()
         match err_ch.recv() {
-          Some(err_msg) => return Err(err_msg)
+          Some(err_msg) => {
+            drv_remove_files(world, all_tmps, 0)
+            return Err(err_msg)
+          }
           None => ()
+        }
+        let pub_err = drv_publish_unit_objs(world, all_tmps, all_objs)
+        if pub_err != "" {
+          return Err(pub_err)
         }
       }
     } else if n_miss > 1 {
@@ -7347,6 +7401,8 @@ fn drv_build_targets(
         let stamp_base = drv_tmp_tag(world, "unit_qbe_par_" + base.to_string())
         let use_direct = direct_obj
         let qmv = qbe_macos_ver
+        let batch_tmps : Array[String] = []
+        let batch_objs : Array[String] = []
         scope(world, fn(s : Scope) -> Unit {
           let mut off = 0
           while off < batch {
@@ -7356,6 +7412,8 @@ fn drv_build_targets(
             let u_obj = obj_paths[idx]
             let u_asm = cache_dir + "/obj/" + ukey + ".s." + stamp_base + "_" + idx.to_string()
             let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
+            batch_tmps.push(u_tmp)
+            batch_objs.push(u_obj)
             let qb = qbe_bin
             let qt = qbe_target
             let qa = qbe_arch
@@ -7369,8 +7427,6 @@ fn drv_build_targets(
                 if rc_qbe != 0 {
                   let _ = fs_remove(u_tmp)
                   let _ = err_ch.send("qbe failed with exit code " + rc_qbe.to_string() + " on " + u_ssa)
-                } else {
-                  let _ = fs_rename(u_tmp, u_obj)
                 }
               } else {
                 let rc_qbe = proc_exec([qb, "-t", qa, "-o", u_asm, u_ssa])
@@ -7402,8 +7458,6 @@ fn drv_build_targets(
                   if rc_as != 0 {
                     let _ = fs_remove(u_tmp)
                     let _ = err_ch.send("as failed with exit code " + rc_as.to_string() + " on " + u_asm)
-                  } else {
-                    let _ = fs_rename(u_tmp, u_obj)
                   }
                 }
               }
@@ -7413,8 +7467,15 @@ fn drv_build_targets(
         })
         err_ch.close()
         match err_ch.recv() {
-          Some(err_msg) => return Err(err_msg)
+          Some(err_msg) => {
+            drv_remove_files(world, batch_tmps, 0)
+            return Err(err_msg)
+          }
           None => ()
+        }
+        let pub_err = drv_publish_unit_objs(world, batch_tmps, batch_objs)
+        if pub_err != "" {
+          return Err(pub_err)
         }
         base = base + batch
       }
