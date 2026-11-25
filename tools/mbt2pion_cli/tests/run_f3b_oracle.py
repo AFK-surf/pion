@@ -253,6 +253,27 @@ fn get_float() -> Float {
   0.1
 }
 
+fn read_float(_s : String) -> Float {
+  0.1
+}
+
+pub fn run_f3b_11() -> String {
+  let r : Reading2 = { f: 0.1 }
+  let f = r.f
+  let piped = "\{f.to_string() |> read_float}"
+  let two =
+    $|a=\{r.f}
+    $|b=\{r.f}
+  let mixed =
+    #|hdr
+    $|a=\{r.f}
+    #|ftr
+  let quoted =
+    $|q="\{r.f}"
+    #|x\y"z
+  piped + "|" + two + "|" + mixed + "|" + quoted
+}
+
 pub fn run_f3b_10() -> String {
   let r : Reading2 = { f: 0.1 }
   let half : Float = 2.5
@@ -265,7 +286,7 @@ pub fn run_f3b_10() -> String {
 pub fn run_all() -> String {
   "F3b-1:" + run_f3b_1() + "\nF3b-2:" + run_f3b_2() + "\nF3b-3:" + run_f3b_3() + "\nF3b-4:" + run_f3b_4() +
   "\nF3b-5:" + run_f3b_5() + "\nF3b-6:" + run_f3b_6() + "\nF3b-7:" + run_f3b_7() +
-  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9() + "\nF3b-10:" + run_f3b_10()
+  "\nF3b-8:" + run_f3b_8() + "\nF3b-9:" + run_f3b_9() + "\nF3b-10:" + run_f3b_10() + "\nF3b-11:" + run_f3b_11()
 }
 '''
 
@@ -524,7 +545,8 @@ def main():
             "F3b-7:[ab][abc][][héllo][xé][A]1\n"
             "F3b-8:7\n"
             "F3b-9:0.1|b\"abc\"|0.1|b\"abc\"|97|1e-7,1e+21,3.4028235e+38,0.33333334|2.5|0|b\"a\\x22b\\x5cc\\x0a\"|97|97\n"
-            "F3b-10:0.2|0.1|-2.5|0.30000000000000004|2.5|v=2.5,-2.5"
+            "F3b-10:0.2|0.1|-2.5|0.30000000000000004|2.5|v=2.5,-2.5\n"
+            "F3b-11:0.1|a=0.1\nb=0.1|hdr\na=0.1\nftr|q=\"0.1\"\nx\\y\"z"
         )
         assert moon_out == expected and pion_native == moon_out and pion_wasm == moon_out, (
             f"MISMATCH:\nEXPECTED:\n{expected}\nMOON:\n{moon_out}\nNATIVE:\n{pion_native}\nWASM32:\n{pion_wasm}"
