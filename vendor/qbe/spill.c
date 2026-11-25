@@ -638,9 +638,12 @@ spill(Fn *fn)
 
 	/* align the locals to a 16 byte boundary */
 	/* specific to NAlign == 3 */
-	if (hasvectorhome)
+	if (hasvectorhome) {
 		fn->slot = (locs + slot8 + 3) & -4;
-	else {
+		/* A vector home is a 16-byte aligned quartet of the frame. */
+		if (fn->salign < 4)
+			fn->salign = 4;
+	} else {
 		slot8 += slot8 & 3;
 		fn->slot += slot8;
 	}

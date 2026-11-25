@@ -14,6 +14,11 @@
       with the whole packet before the foreign call and reloaded after it;
       shear, whose packing would move a read of one base across a write of
       another that may alias it, has no entry test and no packed code.
+  check.py frame P30.s [DIRECT.dis TEXT.dis]
+      pressure30.ssa's leaf `pressure` has no frame pointer, one
+      `subq $N, %rsp` with (N + 8) % 16 == 0 and only 16-byte aligned movupd
+      homes off(%rsp); the objdump listings of its direct object and of its
+      assembled text have the same FP / vector and frame instructions.
   check.py objcmp DIRECT.dis TEXT.dis
       objdump listings of the direct-object and assembled-text executables
       have the same multiset of packed / MXCSR / single-precision arithmetic
@@ -187,12 +192,67 @@ def check_objcmp(direct, text):
           ", ".join(f"{f} {sum(a[f].values())}" for f in FUNCS))
 
 
+def frame_dis(path):
+    """Instructions of `pressure` in an objdump listing, operands normalized."""
+    out, cur = [], False
+    for l in open(path):
+        m = re.match(r"^[0-9a-f]+ <(\w+)>:$", l)
+        if m:
+            cur = m.group(1) == "pressure"
+            continue
+        m = re.match(r"^\s*[0-9a-f]+:\s+(.*)$", l)
+        if cur and m:
+            ins = re.sub(r"\s+", " ", m.group(1).split("#")[0]).strip()
+            # FP / vector data movement and arithmetic and the frame setup;
+            # branch spelling and NOP padding may differ between the routes.
+            if re.match(r"(movupd|movsd|movaps|[a-z]+pd|[a-z]+sd|pshufd|stmxcsr|andl|cmpl|"
+                        r"(?:sub|add)q? \$\S+,%rsp)", ins):
+                out.append(ins)
+    return out
+
+
+def check_frame(text, direct=None, assembled=None):
+    body = []
+    on = False
+    for l in open(text).read().split("\n"):
+        if l == "pressure:":
+            on = True
+            continue
+        if on and l.startswith("/* end function"):
+            break
+        if on:
+            body.append(l.strip())
+    if not body:
+        fail(f"{text}: no function pressure")
+    if any(re.match(r"push[q]? %rbp", l) for l in body):
+        fail(f"{text}: pressure has a frame pointer; the leaf case is not exercised")
+    subs = [int(m.group(1)) for l in body for m in [re.match(r"subq \$(\d+), %rsp", l)] if m]
+    if len(subs) != 1 or (subs[0] + 8) % 16:
+        fail(f"{text}: pressure frame {subs}: rsp is not 16-byte aligned after the prologue")
+    homes = [int(m.group(1) or 0) for l in body
+             for m in [re.search(r"movupd (?:%xmm\d+, )?(-?\d*)\(%rsp\)", l)] if m]
+    if not homes:
+        fail(f"{text}: pressure keeps no packet in a frame slot")
+    bad = [o for o in homes if o % 16]
+    if bad:
+        fail(f"{text}: pressure vector homes at rsp offsets {bad}")
+    if direct:
+        a, b = frame_dis(direct), frame_dis(assembled)
+        if not a or a != b:
+            diff = next((x for x in zip(a, b) if x[0] != x[1]), (len(a), len(b)))
+            fail(f"pressure: direct object and assembled text differ: {diff}")
+    print(f"p127 pressure30: subq ${subs[0]}, %rsp, {len(homes)} movupd homes 16-byte aligned"
+          + (f", direct object == assembled text ({len(frame_dis(direct))} FP / frame instructions)" if direct else ""))
+
+
 if __name__ == "__main__":
     cmd = sys.argv[1]
     if cmd == "out":
         check_out(sys.argv[2], sys.argv[3], sys.argv[4])
     elif cmd == "asm":
         check_asm(sys.argv[2], sys.argv[3])
+    elif cmd == "frame":
+        check_frame(*sys.argv[2:5])
     elif cmd == "objcmp":
         check_objcmp(sys.argv[2], sys.argv[3])
     else:

@@ -26,7 +26,8 @@
 #      scalar arm: both runs are identical, NaN payloads included, and equal
 #      to the strict C reference ref.c (a NaN there only requires a NaN).
 #   2. The direct-object executable and the assembled-text executable
-#      (PION_NO_DIRECT_OBJ=1) print the same bytes.
+#      (PION_NO_DIRECT_OBJ=1), each built with its own empty cache, print the
+#      same bytes.
 #   3. On Linux x86-64 (amd64_sysv) and macOS arm64 (arm64_apple), the
 #      --emit-asm text of drift / orbit / kick / mix has the entry test
 #      (stmxcsr + andl/cmpl $8064, or mrs fpcr + tst #0x9f00), the packed
@@ -43,6 +44,10 @@
 #      once reversed is packed, and mixdrv.c gets the same result bits and
 #      stores from both arms over 512 Float inputs, through the assembled
 #      text and through the direct object.
+#   5. pressure30.ssa (Linux x86-64): a SysV leaf without a frame pointer
+#      that keeps packets in frame slots pads its frame so that rsp is
+#      16-byte aligned and every movupd home is at a multiple of 16, in the
+#      text and in the direct object (same instructions in both).
 #      Other hosts (no SLP) run steps 1 and 2 only.
 set -eu
 
@@ -85,8 +90,12 @@ for MODE in release dev; do
   FLAG=""
   [ "$MODE" = "release" ] && FLAG="--release"
   BASE="$TMP_DIR/p127_$MODE"
-  "$PIONC" build $FLAG -o "$BASE" "$APP"
-  PION_NO_DIRECT_OBJ=1 "$PIONC" build $FLAG -o "${BASE}_text" "$APP"
+  # Separate empty caches, so that the text route really runs QBE's text
+  # emitter and the assembler instead of reusing the direct object.
+  mkdir -p "$TMP_DIR/cas_${MODE}_direct" "$TMP_DIR/cas_${MODE}_text"
+  PION_CACHE_DIR="$TMP_DIR/cas_${MODE}_direct" "$PIONC" build $FLAG -o "$BASE" "$APP"
+  PION_CACHE_DIR="$TMP_DIR/cas_${MODE}_text" PION_NO_DIRECT_OBJ=1 \
+    "$PIONC" build $FLAG -o "${BASE}_text" "$APP"
   "$BASE" > "$BASE.out"
   "${BASE}_text" > "${BASE}_text.out"
   if ! cmp -s "$BASE.out" "${BASE}_text.out"; then
@@ -140,6 +149,23 @@ if [ -n "$TARGET" ]; then
     MIX_OUT=$("$TMP_DIR/mix_$ROUTE")
     echo "p127 mix.ssa $ROUTE: $MIX_OUT"
   done
+fi
+
+# pressure30.ssa (Linux x86-64): a frame-pointer-less SysV leaf whose
+# packets live in frame slots. Text and direct object: the frame keeps rsp
+# 16-byte aligned (subq $N with (N + 8) % 16 == 0) and every movupd home at
+# off(%rsp) has off % 16 == 0; both objects carry the same instructions.
+if [ "$TARGET" = "amd64_sysv" ]; then
+  "$QBE" -t amd64_sysv -o "$TMP_DIR/p30.s" "$DIR/pressure30.ssa"
+  "$CC_BIN" -c "$TMP_DIR/p30.s" -o "$TMP_DIR/p30_text.o"
+  "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/p30_obj.o" "$DIR/pressure30.ssa"
+  if command -v objdump >/dev/null 2>&1; then
+    objdump -d --no-show-raw-insn "$TMP_DIR/p30_text.o" > "$TMP_DIR/p30_text.dis"
+    objdump -d --no-show-raw-insn "$TMP_DIR/p30_obj.o" > "$TMP_DIR/p30_obj.dis"
+    check frame "$TMP_DIR/p30.s" "$TMP_DIR/p30_obj.dis" "$TMP_DIR/p30_text.dis"
+  else
+    check frame "$TMP_DIR/p30.s"
+  fi
 fi
 
 echo "PASS: p127_qbe_double_simd_slp"

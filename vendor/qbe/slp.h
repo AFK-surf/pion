@@ -546,6 +546,8 @@ slpversion(Fn *scalar, Fn *packet)
 			b->jmp.arg.val += first;
 	}
 	packet->reg |= scalar->reg;
+	if (scalar->salign > packet->salign)
+		packet->salign = scalar->salign;
 	int slots = scalar->slot > packet->slot ? scalar->slot : packet->slot;
 	packet->slot = !T.apple ? (slots + 1 + 3) & -4 : (slots + 3) & -4;
 	Ins test = {Otrapmask, Kw, R, {T.apple ? R : SLOT(slots), R}};

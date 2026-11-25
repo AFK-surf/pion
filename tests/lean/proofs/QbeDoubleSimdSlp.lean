@@ -19,11 +19,13 @@ are joined behind an entry test of MXCSR / FPCR (`Otrapmask`).
   2. Schedule (`preserves`, `disjoint`): the scheduler only swaps adjacent
      independent operations, which preserves the final state of any
      sequence, and writes to two distinct addresses commute.
-  3. Frame (`allocate`, `separate`, `lowOnly`, `callReload`): a vector home
-     is a fresh aligned quartet of four-byte words past every scalar slot,
-     so it overlaps no scalar home; AAPCS64 may change the high half of a
-     callee-saved D register across a call, which is why a packet live
-     across a call is kept in its private slot, and both lanes reload intact.
+  3. Frame (`allocate`, `separate`, `lowOnly`, `callReload`,
+     `leafFrameAligned`): a vector home is a fresh aligned quartet of
+     four-byte words past every scalar slot, so it overlaps no scalar home;
+     AAPCS64 may change the high half of a callee-saved D register across a
+     call, which is why a packet live across a call is kept in its private
+     slot, and both lanes reload intact; a SysV leaf without a frame pointer
+     pads its frame so that every vector home is 16-byte aligned.
   4. Dispatch (`maskedVector`, `trapScalar`): when every floating-point
      exception is masked (MXCSR bits 7..12 all set / FPCR trap enables
      0x9F00 all clear) the entry test runs the packet graph, whose results
@@ -145,6 +147,21 @@ theorem callReload (stack : Nat → Lane) (slot : Nat) (v : Vector)
     (afterCall slot, afterCall (slot + 1)) = v := by
   rw [privateSlot slot (by omega) (by omega), privateSlot (slot + 1) (by omega) (by omega)]
   simp [save]
+
+/-- The SysV frame without a frame pointer when `salign = 4` (`sysv_framesz`
+in amd64/emit.c and amd64/elf.c): the slot count in four-byte words rounded up
+to a quartet, plus two words of padding. `spill.c` raises `salign` to 4 for
+every function with a vector home. -/
+def leafFrame (slot : Nat) := 4 * ((slot + 3) / 4 * 4 + 2)
+
+/-- `rsp` is 8 mod 16 on entry (the return address), so after
+`subq $leafFrame, %rsp` it is 16-byte aligned, and so is every vector home
+`4 * s(%rsp)` at a quartet index `s`. -/
+theorem leafFrameAligned (rsp slot s : Nat) (entry : rsp % 16 = 8)
+    (room : leafFrame slot ≤ rsp) (quartet : s % 4 = 0) :
+    (rsp - leafFrame slot) % 16 = 0 ∧ (rsp - leafFrame slot + 4 * s) % 16 = 0 := by
+  unfold leafFrame at *
+  omega
 
 /-! ## 4. Dispatch on the trap enables (`Otrapmask`, `slpversion`) -/
 

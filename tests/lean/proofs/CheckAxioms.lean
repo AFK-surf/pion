@@ -838,5 +838,6 @@ import PionProofs.QbeDoubleSimdSlp
 #print axioms PionQbeDoubleSimdSlp.separate
 #print axioms PionQbeDoubleSimdSlp.lowOnly
 #print axioms PionQbeDoubleSimdSlp.callReload
+#print axioms PionQbeDoubleSimdSlp.leafFrameAligned
 #print axioms PionQbeDoubleSimdSlp.maskedVector
 #print axioms PionQbeDoubleSimdSlp.trapScalar
