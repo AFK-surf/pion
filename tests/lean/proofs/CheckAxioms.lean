@@ -17,6 +17,7 @@ import PionProofs.QbeX86ZeroLea
 import PionProofs.QbeCompileSpeedOpts
 import PionProofs.QbeConcatScratch
 import PionProofs.QbeCompileSpeedOpts2
+import PionProofs.QbeFrontendSpeedOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -563,3 +564,8 @@ import PionProofs.QbeCompileSpeedOpts2
 #print axioms PionQbeCompileSpeedOpts2.pair_witness
 #print axioms PionQbeCompileSpeedOpts2.unsigned_mask
 #print axioms PionQbeCompileSpeedOpts2.read_trace
+#print axioms PionQbeFrontendSpeedOpts.batch_order_and_failure
+#print axioms PionQbeFrontendSpeedOpts.disjoint_writes
+#print axioms PionQbeFrontendSpeedOpts.accepted_prefix
+#print axioms PionQbeFrontendSpeedOpts.ascii_range
+#print axioms PionQbeFrontendSpeedOpts.length_partition

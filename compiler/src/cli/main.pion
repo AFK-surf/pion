@@ -6733,6 +6733,27 @@ fn drv_run_wasm_opt(
   }
 }
 
+///| Emit one unit on the producer thread; the prepared type checker stays local.
+fn drv_emit_unit_file(
+  world : World,
+  prep : PreparedPackage,
+  idx : Int,
+  output : String,
+  release : Bool,
+  target : String,
+  entry_symbol : String,
+  no_main : Bool,
+) -> Bool {
+  let mask = drv_j2_disable_mask(world)
+  let raw = emit_qbe_unit_entry_target_opts(prep, idx, release, target, entry_symbol, no_main, mask)
+  let text = if release {
+    inline_native_rc_ssa_opts(raw, mask)
+  } else {
+    cleanup_native_rc_ssa_opts(raw, mask)
+  }
+  drv_write_cas_text_atomic(world, output, text)
+}
+
 ///|
 fn drv_build_targets(
   world : World,
@@ -7151,31 +7172,18 @@ fn drv_build_targets(
         }
       }
 
-      // Emit QBE SSA only for cache-missed units
-      let mut mi = 0
-      while mi < miss_indices.length() {
-        let idx = miss_indices[mi]
-        let ukey = unit_keys[idx]
-        let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
-        let j2_mask = drv_j2_disable_mask(world)
-        let raw_ssa = emit_qbe_unit_entry_target_opts(
-          prep,
-          idx,
-          release,
-          qbe_target,
-          entry_symbol,
-          no_main,
-          j2_mask,
-        )
-        let ssa_text = if release {
-          inline_native_rc_ssa_opts(raw_ssa, j2_mask)
-        } else {
-          cleanup_native_rc_ssa_opts(raw_ssa, j2_mask)
+      if direct_obj && jobs > 1 && miss_indices.length() > 1 {
+        prep_opt = Some(prep)
+      } else {
+        let mut mi = 0
+        while mi < miss_indices.length() {
+          let idx = miss_indices[mi]
+          let path = cache_dir + "/ssa/" + unit_keys[idx] + ".ssa"
+          if !drv_emit_unit_file(world, prep, idx, path, release, qbe_target, entry_symbol, no_main) {
+            return Err("failed to write CAS unit ssa: " + path)
+          }
+          mi = mi + 1
         }
-        if !drv_write_cas_text_atomic(world, u_ssa, ssa_text) {
-          return Err("failed to write CAS unit ssa: " + u_ssa)
-        }
-        mi = mi + 1
       }
     }
 
@@ -7268,6 +7276,12 @@ fn drv_build_targets(
         }
       } else {
         let err_ch : Channel[String] = Channel::new(nw + 1)
+        let prep = match prep_opt {
+          Some(p) => p
+          None => return Err("missing prepared package for unit emission")
+        }
+        let emit_errors : Array[String] = []
+        let publish : Channel[Bool] = Channel::new(nw)
         let qmv = qbe_macos_ver
         let qb = qbe_bin
         let qt = qbe_target
@@ -7282,6 +7296,10 @@ fn drv_build_targets(
               let idx = miss_indices[k]
               let ukey = unit_keys[idx]
               let u_ssa = cache_dir + "/ssa/" + ukey + ".ssa"
+              if !drv_emit_unit_file(world, prep, idx, u_ssa, release, qt, entry_symbol, no_main) {
+                emit_errors.push("failed to write CAS unit ssa: " + u_ssa)
+                break
+              }
               let u_obj = obj_paths[idx]
               let u_tmp = u_obj + ".tmp." + stamp_base + "_" + idx.to_string()
               spec_sb.write_string(u_ssa)
@@ -7291,6 +7309,9 @@ fn drv_build_targets(
               spec_sb.write_string(u_obj)
               spec_sb.write_char('\n')
               k = k + 1
+            }
+            if emit_errors.length() > 0 {
+              break
             }
             let spec = spec_sb.to_string()
             spawn(s, fn() -> Unit {
@@ -7307,13 +7328,19 @@ fn drv_build_targets(
                 li = li + 3
               }
               let rc_qbe = proc_exec(argv)
-              if rc_qbe != 0 {
+              let can_publish = match publish.recv() {
+                Some(ok) => ok
+                None => false
+              }
+              if rc_qbe != 0 || !can_publish {
                 let mut j = 0
                 while j < tmps.length() {
                   let _ = fs_remove(tmps[j])
                   j = j + 1
                 }
-                let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+                if rc_qbe != 0 {
+                  let _ = err_ch.send("qbe --obj-batch failed with exit code " + rc_qbe.to_string())
+                }
               } else {
                 let mut j = 0
                 while j < tmps.length() {
@@ -7324,7 +7351,16 @@ fn drv_build_targets(
             })
             wi = wi + 1
           }
+          // Publish only when every SSA was written, as in the sequential producer.
+          let ok = emit_errors.length() == 0
+          while wi > 0 {
+            let _ = publish.send(ok)
+            wi = wi - 1
+          }
         })
+        if emit_errors.length() > 0 {
+          return Err(emit_errors[0])
+        }
         err_ch.close()
         match err_ch.recv() {
           Some(err_msg) => return Err(err_msg)
