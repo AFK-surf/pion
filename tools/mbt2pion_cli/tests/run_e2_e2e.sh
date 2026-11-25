@@ -60,6 +60,7 @@ neg_cases = [
     ("shadow_holder_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nstruct H { x : Int }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\nfn holder() -> H { H::{ x: 0 } }\npub fn f() -> Int { let holder = fn() -> P { P::{ x: 0 } }; let p = holder(); try { let _ = p.bad(); 10 } catch { Bad => 9 } }\n', []),
     ("type_alias_recv", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\ntype Alias = P\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\npub fn f() -> Int { let p : Alias = P::{ x: 0 }; try { let _ = p.bad(); 10 } catch { Bad => 9 } }\n', []),
     ("local_named_fn_shadow", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nstruct H { x : Int }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\nfn holder() -> H { H::{ x: 0 } }\npub fn f() -> Int { fn holder() -> P { P::{ x: 0 } }; let p = holder(); try { let _ = p.bad(); 10 } catch { Bad => 9 } }\n', []),
+    ("match_pat_shadow", "a.mbt", 'priv suberror Bad\nstruct P { x : Int }\nstruct H { p : P }\nfn P::bad(self : P) -> Int raise Bad { raise Bad }\nfn H::bad(self : H) -> Int { 8 }\nfn holder() -> H { H::{ p: P::{ x: 0 } } }\npub fn f() -> Int { let p : H = holder(); let a = p.bad(); match Some(p.p) { Some(p) => try { let _ = p.bad(); a + 2 } catch { Bad => 9 }; None => 0 } }\n', []),
 ]
 for tag, fn, code, extra in neg_cases:
     sd = os.path.join(work, "n_" + tag); os.makedirs(sd)

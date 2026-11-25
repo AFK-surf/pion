@@ -57,20 +57,20 @@ fi
 grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r2.json"
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
-# 3. `pub using @dep { type Box }` records gap in audit and fails closed in publish
+# 3. `pub using @dep { type Box }` without `--dep dep=...` records MBT2PION_DEP_ABI_ERROR in audit and fails closed in publish
 S3="$WORK/s3"; OUT3="$WORK/out3"; mkdir -p "$S3" "$OUT3"
 cat > "$S3/t.mbt" << 'EOF'
 pub using @dep { type Box }
 pub fn id_box(b : Box) -> Box { b }
 EOF
 "$BIN" --src "$S3" --out "$OUT3" --target native --mode audit --no-probes --report "$WORK/r3_audit.json" --pionc "$PIONC" || true
-grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r3_audit.json"
+grep -q "MBT2PION_DEP_ABI_ERROR" "$WORK/r3_audit.json"
 grep -q "dep::Box" "$OUT3/t.pion"
 if "$BIN" --src "$S3" --out "$NEG_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --report "$WORK/r3_pub.json" --pionc "$PIONC" 2>/dev/null; then
   echo "[d2-e2e] FAIL: pub using should have failed closed in --mode publish"
   exit 1
 fi
-grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r3_pub.json"
+grep -q "MBT2PION_DEP_ABI_ERROR" "$WORK/r3_pub.json"
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
 # 4. Ambiguous bare labeled enum fails closed with MBT2PION_ENUM_LABEL_ERROR
