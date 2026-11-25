@@ -12,6 +12,11 @@
 #      imports another package under the alias `paint`, so `lg`'s generic body
 #      instantiated there must not resolve through the caller's aliases;
 #      `thin` instantiates `lg` generics without importing `lg` or `paint`.
+#   3. `shadow`: the workspace root package `paint` (canonical id `paint`, results
+#      + 1000) and `paint2` (also named `paint`, id `paint__<8hex>`) have the same
+#      structs. `app` imports the former as `paint` and instantiates `lg`, whose
+#      `paint` is the latter; `app2` imports the former as `rootp` and the latter
+#      as `paint`. An alias always means the package its own source imports.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"
@@ -44,9 +49,11 @@ PYEOF
   echo "p115 $2 ok"
 }
 
+# check <label> <output> [expected]
 check() {
-  if ! cmp -s "$DIR/expected.txt" "$2"; then
-    diff -u "$DIR/expected.txt" "$2" >&2 || :
+  WANT="${3:-$DIR/expected.txt}"
+  if ! cmp -s "$WANT" "$2"; then
+    diff -u "$WANT" "$2" >&2 || :
     echo "FAIL: p115 $1 output mismatch" >&2
     exit 1
   fi
@@ -75,5 +82,16 @@ for MODE in dev release; do
   else
     echo "NOTE: p115 wasm32 $MODE skipped (node not found)"
   fi
+  for APP in app app2; do
+    OUT="$TMP_DIR/shadow_${APP}_$MODE"
+    "$PIONC" build $FLAG -o "$OUT" "$PKGS/shadow/$APP"
+    "$OUT" > "$OUT.txt"
+    check "shadow $APP native $MODE" "$OUT.txt" "$DIR/shadow/$APP/expected.txt"
+    if command -v node >/dev/null 2>&1; then
+      "$PIONC" build $FLAG --target wasm32 -o "$OUT.wasm" "$PKGS/shadow/$APP"
+      node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$OUT.wasm" > "$OUT.wasm.txt"
+      check "shadow $APP wasm32 $MODE" "$OUT.wasm.txt" "$DIR/shadow/$APP/expected.txt"
+    fi
+  done
 done
 echo "[SUMMARY] p115_cross_pkg_struct_lit_probe: OK"
