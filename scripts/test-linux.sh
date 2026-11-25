@@ -633,6 +633,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p108_read_pair_and_byte_scan/run_e2e.sh" "$PIONC"
 # P109: native 3..8 part concat_n Int / Int64 `.to_string()` stack scratch parts (SSA + Native + Wasm32 + ASan).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p109_concat_scratch/run_e2e.sh" "$PIONC"
+# P110: generic fns / static methods as first-class values (mono / `%tp_*` wrappers) + `is` binding shadowing in the codegen probe (SSA + Native + Wasm32 + ASan, cross-package).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p110_fnval_flat_and_is_shadow/run_e2e.sh" "$PIONC"
 # P111: AArch64 seladdr local-slot [x29, #off] folding and single-use ldur/stur [base, #-1..-256] (text asm, matrix, native / qemu, Mach-O --obj == .s byte parity).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"

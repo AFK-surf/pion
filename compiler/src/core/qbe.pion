@@ -112,6 +112,13 @@ pub struct QbeSwitchPlan {
 }
 
 ///|
+/// A queued monomorphized instance: its symbol and qualified substitution.
+pub struct QbeMonoTarget {
+  sym : String
+  subst : Map[String, Ty]
+}
+
+///|
 pub struct QbeMonoReq {
   sym : String
   finfo : FnInfo
@@ -134,6 +141,10 @@ pub struct QbeFnWrapper {
   target_sym : String
   param_tys : Array[Ty]
   ret_ty : Ty
+  /// Trailing `%tp_*` object flags of a polymorphic generic target, one per
+  /// type param: `"0"` / `"1"`, or `"env"` for a flag loaded from the next
+  /// closure env word (still live in the generic that took the value).
+  tp_flags : Array[String]
 }
 
 ///|
@@ -21655,6 +21666,7 @@ fn qbe_register_fn_wrapper(
   target_sym : String,
   param_tys : Array[Ty],
   ret_ty : Ty,
+  tp_flags : Array[String],
 ) -> String {
   if !g.fn_wrapper_seen.contains(wrap_sym) {
     g.fn_wrapper_seen.set(wrap_sym, true)
@@ -21663,9 +21675,152 @@ fn qbe_register_fn_wrapper(
       target_sym: target_sym,
       param_tys: param_tys,
       ret_ty: ret_ty,
+      tp_flags: tp_flags,
     })
   }
   wrap_sym
+}
+
+///|
+/// A top-level function or static method used as a first-class value: a
+/// closure whose code pointer is a `wrap_sym` thunk taking every argument as
+/// `l`. A generic target is instantiated from the expected `TFn` (and the
+/// enclosing `cur_type_subst`), exactly like a direct call: when that instance
+/// needs monomorphization (flat struct arrays, `Option`, `==`, bounds, private
+/// cross-package fns) the thunk calls the `__mono_*` symbol with its concrete
+/// ABI; otherwise it calls the polymorphic symbol and passes its trailing
+/// `%tp_*` object flags, capturing in the env those still live in the
+/// enclosing generic.
+fn qbe_emit_fn_value(
+  g : QbeGen,
+  finfo : FnInfo,
+  base_sym : String,
+  wrap_kind : String,
+  wrap_name : String,
+  decl_pkg : String,
+  expected : Option[Ty],
+  sp : Span,
+) -> QbeVal {
+  // Thunk symbols: `wrap_<kind>_<name>` for a plain target, `wrap_m_<kind>_..`
+  // (+ the instance's `__mono_*` suffix) for a monomorphized one and
+  // `wrap_tp<flags>_<kind>_..` for a polymorphic one: the three prefixes never
+  // overlap, so no user fn name can make two thunks share a symbol.
+  let wrap_pre = "$pion_" + g.pkg_prefix + "wrap_"
+  let wrap_tail = wrap_kind + "_" + wrap_name
+  let tps = finfo.decl.type_params
+  let subst : Map[String, Ty] = Map([])
+  if tps.length() > 0 {
+    // The type checker's final instantiation (`<span>#fnval`, re-checked
+    // once the enclosing call fixed every type param) wins over the
+    // expected type, which a call may not know yet when it evaluates the
+    // value (`use(second, identity(v=xs))`).
+    let inst = match qbe_call_infer(g, sp, "#fnval") {
+      Some(t) => if ty_has_unresolved(t) { expected } else { Some(t) }
+      None => expected
+    }
+    match inst {
+      Some(et) =>
+        match subst_ty(et, g.cur_type_subst) {
+          TFn(eps, er) => {
+            let mut i = 0
+            while i < finfo.param_tys.length() && i < eps.length() {
+              qbe_unify_tparams(g, finfo.param_tys[i], eps[i], subst)
+              i = i + 1
+            }
+            qbe_unify_tparams(g, finfo.ret_ty, er, subst)
+          }
+          _ => ()
+        }
+      None => ()
+    }
+  }
+  let env_regs : Array[String] = []
+  if qbe_call_needs_mono(g, finfo, subst, decl_pkg) ||
+    (decl_pkg != "" && !finfo.decl.is_pub && tps.length() > 0) {
+    let mono = qbe_request_mono(g, base_sym, finfo, subst, decl_pkg)
+    let mptys : Array[Ty] = []
+    let mut i = 0
+    while i < finfo.param_tys.length() {
+      mptys.push(subst_ty(finfo.param_tys[i], mono.subst))
+      i = i + 1
+    }
+    let mret = subst_ty(finfo.ret_ty, mono.subst)
+    let wrap = qbe_register_fn_wrapper(
+      g,
+      qbe_mono_fn_sym(wrap_pre + "m_" + wrap_tail, tps, mono.subst),
+      mono.sym,
+      mptys,
+      mret,
+      [],
+    )
+    return qbe_alloc_fn_value(g, wrap, env_regs, TFn(mptys, mret))
+  }
+  let flags : Array[String] = []
+  let key = StringBuilder()
+  key.write_string(wrap_pre)
+  if tps.length() > 0 {
+    key.write_string("tp")
+  }
+  let mut tpi = 0
+  while tpi < tps.length() {
+    let tp_ty = match subst.get(tps[tpi]) {
+      Some(t) => t
+      None => TError
+    }
+    let f = qbe_is_obj_flag(g, tp_ty)
+    if f == "0" || f == "1" {
+      flags.push(f)
+      key.write_string(f)
+    } else {
+      flags.push("env")
+      env_regs.push(f)
+      key.write_string("e")
+    }
+    tpi = tpi + 1
+  }
+  if tps.length() > 0 {
+    key.write_string("_")
+  }
+  key.write_string(wrap_tail)
+  let wrap = qbe_register_fn_wrapper(
+    g,
+    key.to_string(),
+    base_sym,
+    finfo.param_tys,
+    finfo.ret_ty,
+    flags,
+  )
+  let vptys : Array[Ty] = []
+  let mut i = 0
+  while i < finfo.param_tys.length() {
+    vptys.push(subst_ty(finfo.param_tys[i], subst))
+    i = i + 1
+  }
+  qbe_alloc_fn_value(g, wrap, env_regs, TFn(vptys, subst_ty(finfo.ret_ty, subst)))
+}
+
+///|
+/// Boxes `wrap` (plus the captured `%tp_*` flags in `env_regs`) as a closure.
+fn qbe_alloc_fn_value(
+  g : QbeGen,
+  wrap : String,
+  env_regs : Array[String],
+  ty : Ty,
+) -> QbeVal {
+  let clo = qbe_tmp(g)
+  qbe_emit(
+    g,
+    clo + " =l call $pion_alloc(w " + ((1 + env_regs.length()) * 8).to_string() + ", w 6, l 0)",
+  )
+  qbe_emit(g, "storel " + wrap + ", " + clo)
+  let mut i = 0
+  while i < env_regs.length() {
+    let p = qbe_tmp(g)
+    qbe_emit(g, p + " =l add " + clo + ", " + ((i + 1) * 8).to_string())
+    qbe_emit(g, "storel " + env_regs[i] + ", " + p)
+    i = i + 1
+  }
+  qval(clo, ty)
 }
 
 ///|
@@ -36217,15 +36372,7 @@ fn qbe_probe_stmts_ty_with(
           ni = ni + 1
         }
       }
-      SGuard(cond, _, _) => {
-        let gbinds : Array[String] = []
-        qbe_collect_cond_is_binds_arr(cond, gbinds)
-        let mut bi = 0
-        while bi < gbinds.length() {
-          qbe_hints_set(local_hints, gbinds[bi], TError)
-          bi = bi + 1
-        }
-      }
+      SGuard(cond, _, _) => qbe_probe_bind_cond_hints(g, cond, local_hints)
       _ => ()
     }
     i = i + 1
@@ -36233,6 +36380,70 @@ fn qbe_probe_stmts_ty_with(
   match stmts[stmts.length() - 1] {
     SExpr(e, _) => qbe_probe_expr_ty_with(g, e, local_hints)
     _ => None
+  }
+}
+
+///|
+/// Binds the names an `if` / `guard` condition's `is` patterns introduce
+/// (through `&&` chains, left to right) into `hints`, typed from the probed
+/// scrutinee like `match` arms. A name whose type is unknown is bound to
+/// `TError`, so it still shadows an outer local of the same name instead of
+/// leaking that local's type into the branch.
+fn qbe_probe_bind_cond_hints(
+  g : QbeGen,
+  cond : Expr,
+  hints : QbeProbeHints,
+) -> Unit {
+  match cond {
+    EIs(scrut, pat, _) =>
+      qbe_bind_pat_probe_hints(g, pat, qbe_probe_expr_ty_with(g, scrut, hints), hints)
+    EBinary("&&", l, r, _) => {
+      qbe_probe_bind_cond_hints(g, l, hints)
+      qbe_probe_bind_cond_hints(g, r, hints)
+    }
+    _ => ()
+  }
+}
+
+///|
+/// Probed result type of a call to a top-level fn. A generic one is
+/// instantiated from its positional arguments' probed types (`identity(xs)`
+/// is `Array[Int]`); the probe only descends into the arguments, so it ends.
+fn qbe_probe_call_ret_ty(
+  g : QbeGen,
+  finfo : FnInfo,
+  args : Array[Expr],
+  hints : QbeProbeHints,
+) -> Option[Ty] {
+  let mut rt = finfo.ret_ty
+  if finfo.decl.type_params.length() > 0 {
+    let psubst : Map[String, Ty] = Map([])
+    let mut i = 0
+    while i < args.length() && i < finfo.param_tys.length() {
+      match args[i] {
+        ENamedArg(_, _, _, _) => return None
+        _ => ()
+      }
+      match qbe_probe_expr_ty_with(g, args[i], hints) {
+        Some(t0) => {
+          let t = subst_ty(t0, g.cur_type_subst)
+          if !ty_has_unresolved(t) && !qbe_ty_has_param(t) {
+            qbe_unify_tparams(g, finfo.param_tys[i], t, psubst)
+          }
+        }
+        None => ()
+      }
+      i = i + 1
+    }
+    rt = subst_ty(finfo.ret_ty, psubst)
+    if qbe_ty_has_param(rt) {
+      return None
+    }
+  }
+  if ty_has_unresolved(rt) {
+    None
+  } else {
+    Some(rt)
   }
 }
 
@@ -36484,8 +36695,10 @@ fn qbe_probe_expr_ty_with(
         None
       }
     EBlock(stmts, _) => qbe_probe_stmts_ty_with(g, stmts, hints)
-    EIf(_, then_stmts, Some(el), _) =>
-      match qbe_probe_stmts_ty_with(g, then_stmts, hints) {
+    EIf(cond, then_stmts, Some(el), _) => {
+      let then_hints = qbe_hints_copy(hints)
+      qbe_probe_bind_cond_hints(g, cond, then_hints)
+      match qbe_probe_stmts_ty_with(g, then_stmts, then_hints) {
         Some(t) =>
           if !ty_has_unresolved(t) {
             Some(t)
@@ -36497,6 +36710,7 @@ fn qbe_probe_expr_ty_with(
           }
         None => qbe_probe_expr_ty_with(g, el, hints)
       }
+    }
     EIs(_, _, _) => Some(TBool)
     EMatch(scrut, arms, _) => {
       let scrut_ty_opt = qbe_probe_expr_ty_with(g, scrut, hints)
@@ -36520,12 +36734,13 @@ fn qbe_probe_expr_ty_with(
           } else if name == "Map" && args.length() == 1 {
             qbe_call_infer(g, probe_sp, "#map")
           } else {
+            // A probe-scope binding (`is` / `match` / `let`) shadows outer
+            // locals and fns of the same name, even when its type is unknown.
             match qbe_hints_get(hints, name) {
               Some(TFn(_, rt)) =>
-                if !ty_has_unresolved(rt) {
-                  return Some(rt)
-                }
-              _ => ()
+                return if !ty_has_unresolved(rt) { Some(rt) } else { None }
+              Some(_) => return None
+              None => ()
             }
             match g.inline_closures.get(name) {
               Some(iclo) => return Some(iclo.ret_ty)
@@ -36547,28 +36762,14 @@ fn qbe_probe_expr_ty_with(
                 Some(ipkg) =>
                   match ipkg.tc.fns.get(name) {
                     Some(finfo) =>
-                      if finfo.decl.type_params.length() == 0 {
-                        let rt = qualify_imported_ty(ipkg.name, finfo.ret_ty)
-                        if !ty_has_unresolved(rt) {
-                          Some(rt)
-                        } else {
-                          None
-                        }
-                      } else {
-                        None
-                      }
+                      qbe_probe_call_ret_ty(g, qualify_fn_info(ipkg, finfo), args, hints)
                     None => None
                   }
                 None => None
               }
             } else {
               match g.tc.fns.get(name) {
-                Some(finfo) =>
-                  if finfo.decl.type_params.length() == 0 && !ty_has_unresolved(finfo.ret_ty) {
-                    Some(finfo.ret_ty)
-                  } else {
-                    None
-                  }
+                Some(finfo) => qbe_probe_call_ret_ty(g, finfo, args, hints)
                 None => None
               }
             }
@@ -36581,16 +36782,7 @@ fn qbe_probe_expr_ty_with(
             Some(ipkg) =>
               match ipkg.tc.fns.get(mem) {
                 Some(finfo) =>
-                  if finfo.decl.type_params.length() == 0 {
-                    let rt = qualify_imported_ty(ipkg.name, finfo.ret_ty)
-                    if !ty_has_unresolved(rt) {
-                      Some(rt)
-                    } else {
-                      None
-                    }
-                  } else {
-                    None
-                  }
+                  qbe_probe_call_ret_ty(g, qualify_fn_info(ipkg, finfo), args, hints)
                 None => None
               }
             None => None
@@ -37700,16 +37892,15 @@ fn qbe_emit_resolved_finfo_call(
 }
 
 ///|
-fn qbe_emit_mono_call(
+/// Queues (once) the instance of `base_sym` for `subst`, its nominal types
+/// qualified, and returns its symbol with that qualified substitution.
+fn qbe_request_mono(
   g : QbeGen,
   base_sym : String,
   finfo : FnInfo,
   subst : Map[String, Ty],
-  arg_vals : Array[String],
-  arg_tys : Array[Ty],
-  arg_borrowed : Array[Bool],
   decl_pkg : String,
-) -> QbeVal {
+) -> QbeMonoTarget {
   let qsubst : Map[String, Ty] = Map([])
   let mut tpi = 0
   while tpi < finfo.decl.type_params.length() {
@@ -37730,6 +37921,23 @@ fn qbe_emit_mono_call(
       pkg: decl_pkg,
     })
   }
+  QbeMonoTarget::{ sym: mono_sym, subst: qsubst }
+}
+
+///|
+fn qbe_emit_mono_call(
+  g : QbeGen,
+  base_sym : String,
+  finfo : FnInfo,
+  subst : Map[String, Ty],
+  arg_vals : Array[String],
+  arg_tys : Array[Ty],
+  arg_borrowed : Array[Bool],
+  decl_pkg : String,
+) -> QbeVal {
+  let mono = qbe_request_mono(g, base_sym, finfo, subst, decl_pkg)
+  let mono_sym = mono.sym
+  let qsubst = mono.subst
   let call_args : Array[String] = []
   let call_abis : Array[String] = []
   let mut j = 0
@@ -38017,7 +38225,7 @@ fn qbe_emit_expr_inner(
     EUnit(_) => qval("0", TUnit)
     ENamedArg(_, _, inner, _) => qbe_emit_expr(g, inner, expected)
     EMutArg(inner, _) => qbe_emit_expr(g, inner, expected)
-    EIdent(name, _) => {
+    EIdent(name, id_sp) => {
       match qbe_lookup_local(g, name) {
         Some(loc) => {
           if loc.is_cell {
@@ -38079,22 +38287,16 @@ fn qbe_emit_expr_inner(
             match ipkg.tc.fns.get(name) {
               Some(finfo) => {
                 let qfi = qualify_fn_info(ipkg, finfo)
-                let wrap_sym = "$pion_" +
-                  g.pkg_prefix +
-                  "wrap_ef_" +
-                  qbe_mangle_qual_sym(ipkg.name + "::" + name)
-                let target_sym = qbe_ext_fn_sym(ipkg.name, name)
-                let wrap = qbe_register_fn_wrapper(
+                return qbe_emit_fn_value(
                   g,
-                  wrap_sym,
-                  target_sym,
-                  qfi.param_tys,
-                  qfi.ret_ty,
+                  qfi,
+                  qbe_ext_fn_sym(ipkg.name, name),
+                  "ef",
+                  qbe_mangle_qual_sym(ipkg.name + "::" + name),
+                  ipkg.name,
+                  expected,
+                  id_sp,
                 )
-                let clo = qbe_tmp(g)
-                qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-                qbe_emit(g, "storel " + wrap + ", " + clo)
-                return qval(clo, TFn(qfi.param_tys, qfi.ret_ty))
               }
               None => ()
             }
@@ -38143,19 +38345,16 @@ fn qbe_emit_expr_inner(
       }
       match g.tc.fns.get(name) {
         Some(finfo) => {
-          let wrap_sym = "$pion_" + g.pkg_prefix + "wrap_lf_" + qbe_mangle_pkg_sym(name)
-          let target_sym = qbe_local_fn_sym(g, name)
-          let wrap = qbe_register_fn_wrapper(
+          return qbe_emit_fn_value(
             g,
-            wrap_sym,
-            target_sym,
-            finfo.param_tys,
-            finfo.ret_ty,
+            finfo,
+            qbe_local_fn_sym(g, name),
+            "lf",
+            qbe_mangle_pkg_sym(name),
+            "",
+            expected,
+            id_sp,
           )
-          let clo = qbe_tmp(g)
-          qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-          qbe_emit(g, "storel " + wrap + ", " + clo)
-          return qval(clo, TFn(finfo.param_tys, finfo.ret_ty))
         }
         None => ()
       }
@@ -38167,7 +38366,7 @@ fn qbe_emit_expr_inner(
       }
       qval("0", TError)
     }
-    EPath(qual, mem, _) => {
+    EPath(qual, mem, id_sp) => {
       if qual == "Option" && mem == "None" {
         return qbe_emit_variant_ctor(g, "Option", "None", [], expected)
       }
@@ -38200,23 +38399,16 @@ fn qbe_emit_expr_inner(
                   match sub_pkg.tc.methods.get(qp_m.name + "::" + mem) {
                     Some(mi) => {
                       let qmi = qualify_fn_info(sub_pkg, mi)
-                      let wrap_sym = "$pion_" +
-                        g.pkg_prefix +
-                        "wrap_em_" +
-                        qbe_mangle_qual_sym(sub_pkg.name + "::" + qp_m.name) +
-                        qbe_mangle_member_suffix(mem)
-                      let target_sym = qbe_ext_method_sym(sub_pkg.name, qp_m.name, mem)
-                      let wrap = qbe_register_fn_wrapper(
+                      return qbe_emit_fn_value(
                         g,
-                        wrap_sym,
-                        target_sym,
-                        qmi.param_tys,
-                        qmi.ret_ty,
+                        qmi,
+                        qbe_ext_method_sym(sub_pkg.name, qp_m.name, mem),
+                        "em",
+                        qbe_mangle_qual_sym(sub_pkg.name + "::" + qp_m.name) + qbe_mangle_member_suffix(mem),
+                        sub_pkg.name,
+                        expected,
+                        id_sp,
                       )
-                      let clo = qbe_tmp(g)
-                      qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-                      qbe_emit(g, "storel " + wrap + ", " + clo)
-                      return qval(clo, TFn(qmi.param_tys, qmi.ret_ty))
                     }
                     None => ()
                   }
@@ -38238,22 +38430,16 @@ fn qbe_emit_expr_inner(
                 match sub_pkg.tc.fns.get(mem) {
                   Some(finfo) => {
                     let qfi = qualify_fn_info(sub_pkg, finfo)
-                    let wrap_sym = "$pion_" +
-                      g.pkg_prefix +
-                      "wrap_ef_" +
-                      qbe_mangle_qual_sym(sub_pkg.name + "::" + mem)
-                    let target_sym = qbe_ext_fn_sym(sub_pkg.name, mem)
-                    let wrap = qbe_register_fn_wrapper(
+                    return qbe_emit_fn_value(
                       g,
-                      wrap_sym,
-                      target_sym,
-                      qfi.param_tys,
-                      qfi.ret_ty,
+                      qfi,
+                      qbe_ext_fn_sym(sub_pkg.name, mem),
+                      "ef",
+                      qbe_mangle_qual_sym(sub_pkg.name + "::" + mem),
+                      sub_pkg.name,
+                      expected,
+                      id_sp,
                     )
-                    let clo = qbe_tmp(g)
-                    qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-                    qbe_emit(g, "storel " + wrap + ", " + clo)
-                    return qval(clo, TFn(qfi.param_tys, qfi.ret_ty))
                   }
                   None => ()
                 }
@@ -38274,23 +38460,16 @@ fn qbe_emit_expr_inner(
             match ipkg.tc.methods.get(qual + "::" + mem) {
               Some(mi) => {
                 let qmi = qualify_fn_info(ipkg, mi)
-                let wrap_sym = "$pion_" +
-                  g.pkg_prefix +
-                  "wrap_em_" +
-                  qbe_mangle_qual_sym(ipkg.name + "::" + qual) +
-                  qbe_mangle_member_suffix(mem)
-                let target_sym = qbe_ext_method_sym(ipkg.name, qual, mem)
-                let wrap = qbe_register_fn_wrapper(
+                return qbe_emit_fn_value(
                   g,
-                  wrap_sym,
-                  target_sym,
-                  qmi.param_tys,
-                  qmi.ret_ty,
+                  qmi,
+                  qbe_ext_method_sym(ipkg.name, qual, mem),
+                  "em",
+                  qbe_mangle_qual_sym(ipkg.name + "::" + qual) + qbe_mangle_member_suffix(mem),
+                  ipkg.name,
+                  expected,
+                  id_sp,
                 )
-                let clo = qbe_tmp(g)
-                qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-                qbe_emit(g, "storel " + wrap + ", " + clo)
-                return qval(clo, TFn(qmi.param_tys, qmi.ret_ty))
               }
               None => ()
             }
@@ -38325,23 +38504,16 @@ fn qbe_emit_expr_inner(
             match ipkg.tc.methods.get(q_sub + "::" + mem) {
               Some(mi) => {
                 let qmi = qualify_fn_info(ipkg, mi)
-                let wrap_sym = "$pion_" +
-                  g.pkg_prefix +
-                  "wrap_em_" +
-                  qbe_mangle_qual_sym(ipkg.name + "::" + q_sub) +
-                  qbe_mangle_member_suffix(mem)
-                let target_sym = qbe_ext_method_sym(ipkg.name, q_sub, mem)
-                let wrap = qbe_register_fn_wrapper(
+                return qbe_emit_fn_value(
                   g,
-                  wrap_sym,
-                  target_sym,
-                  qmi.param_tys,
-                  qmi.ret_ty,
+                  qmi,
+                  qbe_ext_method_sym(ipkg.name, q_sub, mem),
+                  "em",
+                  qbe_mangle_qual_sym(ipkg.name + "::" + q_sub) + qbe_mangle_member_suffix(mem),
+                  ipkg.name,
+                  expected,
+                  id_sp,
                 )
-                let clo = qbe_tmp(g)
-                qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-                qbe_emit(g, "storel " + wrap + ", " + clo)
-                return qval(clo, TFn(qmi.param_tys, qmi.ret_ty))
               }
               None => ()
             }
@@ -38363,22 +38535,16 @@ fn qbe_emit_expr_inner(
           match ipkg.tc.fns.get(mem) {
             Some(finfo) => {
               let qfi = qualify_fn_info(ipkg, finfo)
-              let wrap_sym = "$pion_" +
-                g.pkg_prefix +
-                "wrap_ef_" +
-                qbe_mangle_qual_sym(ipkg.name + "::" + mem)
-              let target_sym = qbe_ext_fn_sym(ipkg.name, mem)
-              let wrap = qbe_register_fn_wrapper(
+              return qbe_emit_fn_value(
                 g,
-                wrap_sym,
-                target_sym,
-                qfi.param_tys,
-                qfi.ret_ty,
+                qfi,
+                qbe_ext_fn_sym(ipkg.name, mem),
+                "ef",
+                qbe_mangle_qual_sym(ipkg.name + "::" + mem),
+                ipkg.name,
+                expected,
+                id_sp,
               )
-              let clo = qbe_tmp(g)
-              qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-              qbe_emit(g, "storel " + wrap + ", " + clo)
-              return qval(clo, TFn(qfi.param_tys, qfi.ret_ty))
             }
             None => ()
           }
@@ -38399,23 +38565,16 @@ fn qbe_emit_expr_inner(
       if g.mono_pkg == "" {
         match g.tc.methods.get(qual + "::" + mem) {
           Some(mi) => {
-            let wrap_sym = "$pion_" +
-              g.pkg_prefix +
-              "wrap_lm_" +
-              qbe_mangle_qual_sym(qual) +
-              qbe_mangle_member_suffix(mem)
-            let target_sym = qbe_method_call_sym(g, qual, mem)
-            let wrap = qbe_register_fn_wrapper(
+            return qbe_emit_fn_value(
               g,
-              wrap_sym,
-              target_sym,
-              mi.param_tys,
-              mi.ret_ty,
+              mi,
+              qbe_method_call_sym(g, qual, mem),
+              "lm",
+              qbe_mangle_qual_sym(qual) + qbe_mangle_member_suffix(mem),
+              "",
+              expected,
+              id_sp,
             )
-            let clo = qbe_tmp(g)
-            qbe_emit(g, clo + " =l call $pion_alloc(w 8, w 6, l 0)")
-            qbe_emit(g, "storel " + wrap + ", " + clo)
-            return qval(clo, TFn(mi.param_tys, mi.ret_ty))
           }
           None => ()
         }
@@ -41841,7 +42000,9 @@ fn qbe_emit_expr_inner(
             None => true
           }
           if need_probe {
-            match qbe_probe_stmts_ty(g, then_stmts) {
+            let then_hints = qbe_hints_new()
+            qbe_probe_bind_cond_hints(g, cond, then_hints)
+            match qbe_probe_stmts_ty_with(g, then_stmts, then_hints) {
               Some(pt) =>
                 branch_exp = match branch_exp {
                   Some(cur) => Some(ty_prefer_concrete(cur, pt))
@@ -55485,6 +55646,8 @@ fn qbe_emit_helper_drops(g : QbeGen, out : StringBuilder) -> Unit {
 
 ///|
 fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
+  // Closures pass and return every value as `l` (`qbe_as_l` / `qbe_from_l`):
+  // each thunk converts to and from the target's own ABI (`qbe_abi_ty`).
   let mut i = 0
   while i < g.fn_wrappers.length() {
     let w = g.fn_wrappers[i]
@@ -55500,29 +55663,34 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
     out.write_string(") {\n@start\n")
     pi = 0
     while pi < w.param_tys.length() {
-      if qbe_is_double_ty(w.param_tys[pi]) {
-        out.write_string("    %dp")
-        out.write_string(pi.to_string())
-        out.write_string(" =d cast %p")
-        out.write_string(pi.to_string())
-        out.write_string("\n")
-      } else if qbe_is_int32_ty(w.param_tys[pi]) {
-        out.write_string("    %wp")
-        out.write_string(pi.to_string())
-        out.write_string(" =w copy %p")
-        out.write_string(pi.to_string())
-        out.write_string("\n")
+      let ps = pi.to_string()
+      match qbe_abi_ty(w.param_tys[pi]) {
+        "d" => out.write_string("    %ap" + ps + " =d cast %p" + ps + "\n")
+        "s" => {
+          out.write_string("    %wp" + ps + " =w copy %p" + ps + "\n")
+          out.write_string("    %ap" + ps + " =s cast %wp" + ps + "\n")
+        }
+        "w" => out.write_string("    %ap" + ps + " =w copy %p" + ps + "\n")
+        _ => ()
       }
       pi = pi + 1
     }
-    let ret_d = qbe_is_double_ty(w.ret_ty)
-    let ret_w = qbe_is_int32_ty(w.ret_ty)
-    if ret_d {
-      out.write_string("    %rd =d call ")
-    } else if ret_w {
-      out.write_string("    %rw =w call ")
-    } else {
+    let mut fi = 0
+    let mut env_i = 0
+    while fi < w.tp_flags.length() {
+      if w.tp_flags[fi] == "env" {
+        env_i = env_i + 1
+        let fs = fi.to_string()
+        out.write_string("    %tfp" + fs + " =l add %env, " + (env_i * 8).to_string() + "\n")
+        out.write_string("    %tf" + fs + " =l loadl %tfp" + fs + "\n")
+      }
+      fi = fi + 1
+    }
+    let ret_abi = qbe_abi_ty(w.ret_ty)
+    if ret_abi == "l" {
       out.write_string("    %r =l call ")
+    } else {
+      out.write_string("    %rv =" + ret_abi + " call ")
     }
     out.write_string(w.target_sym)
     out.write_string("(")
@@ -55531,21 +55699,44 @@ fn qbe_emit_fn_wrappers(g : QbeGen, out : StringBuilder) -> Unit {
       if pi > 0 {
         out.write_string(", ")
       }
-      if qbe_is_double_ty(w.param_tys[pi]) {
-        out.write_string("d %dp")
-      } else if qbe_is_int32_ty(w.param_tys[pi]) {
-        out.write_string("w %wp")
+      let pabi = qbe_abi_ty(w.param_tys[pi])
+      out.write_string(pabi)
+      if pabi == "l" {
+        out.write_string(" %p")
       } else {
-        out.write_string("l %p")
+        out.write_string(" %ap")
       }
       out.write_string(pi.to_string())
       pi = pi + 1
     }
+    fi = 0
+    while fi < w.tp_flags.length() {
+      if pi + fi > 0 {
+        out.write_string(", ")
+      }
+      out.write_string("l ")
+      if w.tp_flags[fi] == "env" {
+        out.write_string("%tf")
+        out.write_string(fi.to_string())
+      } else {
+        out.write_string(w.tp_flags[fi])
+      }
+      fi = fi + 1
+    }
     out.write_string(")\n")
-    if ret_d {
-      out.write_string("    %r =l cast %rd\n")
-    } else if ret_w {
-      out.write_string("    %r =l extsw %rw\n")
+    match ret_abi {
+      "d" => out.write_string("    %r =l cast %rv\n")
+      "s" => {
+        out.write_string("    %rw =w cast %rv\n")
+        out.write_string("    %r =l extuw %rw\n")
+      }
+      "w" =>
+        if qbe_is_uint32_ty(w.ret_ty) {
+          out.write_string("    %r =l extuw %rv\n")
+        } else {
+          out.write_string("    %r =l extsw %rv\n")
+        }
+      _ => ()
     }
     out.write_string("    ret %r\n}\n\n")
     i = i + 1
