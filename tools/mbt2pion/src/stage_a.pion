@@ -61,6 +61,85 @@ fn compute_param_renames(raw_names : Array[String]) -> Map[String, String] {
   out
 }
 
+///| Compute collision-free renames for lexical binders introduced in a `let`, `for`, or `match` arm,
+///| avoiding BOTH outer `ctx.scope_vars` (e.g. parameter `val_`) AND sibling binders in the same pattern.
+fn compute_scoped_binder_renames(ctx : StageAContext, raw_names : Array[String]) -> Map[String, String] {
+  let out : Map[String, String] = Map()
+  let occupied : Map[String, Bool] = Map()
+  for sv in ctx.scope_vars {
+    occupied[sv.name] = true
+  }
+  for rn in raw_names {
+    if rn != "_" && !is_pion_reserved_ident(rn) {
+      occupied[rn] = true
+    }
+  }
+  for rn in raw_names {
+    if is_pion_reserved_ident(rn) {
+      let mut cand = rn + "_"
+      let mut k = 1
+      while occupied.contains(cand) {
+        cand = rn + "_" + k.to_string()
+        k = k + 1
+      }
+      occupied[cand] = true
+      if cand != rn + "_" || (lookup_ident_rename(ctx, rn) is Some(_)) {
+        out[rn] = cand
+      }
+    }
+  }
+  out
+}
+
+fn restore_ident_renames(ctx : StageAContext, saved_len : Int) -> Unit {
+  while ctx.ident_renames.length() > saved_len {
+    let _ = ctx.ident_renames.pop()
+  }
+}
+
+///| Return true iff `pat_s` is an irrefutable simple binder pattern (a single lowercase identifier or `_`).
+fn is_irrefutable_simple_pat(pat_s : String) -> Bool {
+  let p = pat_s.trim()
+  if p.length() == 0 {
+    return false
+  }
+  if p == "_" {
+    return true
+  }
+  if p == "true" || p == "false" {
+    return false
+  }
+  let c0 = p.code_unit_at(0)
+  if !((c0 >= 97 && c0 <= 122) || c0 == 95) {
+    return false
+  }
+  let mut k = 1
+  while k < p.length() {
+    let c = p.code_unit_at(k)
+    if !((c >= 97 && c <= 122) || (c >= 65 && c <= 90) || (c >= 48 && c <= 57) || c == 95) {
+      return false
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Collect raw (un-renamed) lowercase binder names in pattern slice `[start, end)`.
+fn collect_raw_pattern_binders(tokens : Array[Token], start : Int, end : Int) -> Array[String] {
+  let out : Array[String] = []
+  let mut rbi = start
+  while rbi < end {
+    let rbt = tokens[rbi]
+    if rbt.kind == TokenKind::Ident && rbt.raw != "_" &&
+    !(rbi > start && (tokens[rbi - 1].kind == TokenKind::Dot || tokens[rbi - 1].kind == TokenKind::ColonColon)) &&
+    !(rbi + 1 < end && (tokens[rbi + 1].kind == TokenKind::Colon || tokens[rbi + 1].kind == TokenKind::Eq)) {
+      out.push(rbt.raw)
+    }
+    rbi = rbi + 1
+  }
+  out
+}
+
 fn lookup_ident_rename(ctx : StageAContext, raw : String) -> Option[String] {
   let mut idx = ctx.ident_renames.length() - 1
   while idx >= 0 {
@@ -775,7 +854,7 @@ fn lower_struct_brace(
       }
       // Shorthand `field` (followed by `,` or `}`)
       if i + 1 == close_b || tokens[i + 1].kind == TokenKind::Comma {
-        let local_var = rename_keyword_ident(raw_f)
+        let local_var = resolve_ident_in_scope(ctx, raw_f)
         if renamed_f != local_var {
           sb.write_string(t.leading_trivia + renamed_f + ": " + local_var)
         } else {
@@ -1376,12 +1455,12 @@ fn try_resolve_static_val_field_from_ty(ctx : StageAContext, recv_ty : String) -
 fn lookup_ident_static_type(ctx : StageAContext, raw_ident : String) -> String {
   let eff = resolve_ident_in_scope(ctx, raw_ident)
   match lookup_scope_var(ctx, eff) {
-    Some(sv) => if sv.ty.length() > 0 { return sv.ty }
+    Some(sv) => return sv.ty
     None => ()
   }
   if eff != raw_ident {
     match lookup_scope_var(ctx, raw_ident) {
-      Some(sv) => if sv.ty.length() > 0 { return sv.ty }
+      Some(sv) => return sv.ty
       None => ()
     }
   }
@@ -1545,6 +1624,87 @@ fn try_resolve_static_val_field(ctx : StageAContext, tokens : Array[Token], dot_
   None
 }
 
+///| Check whether a `.val` assignment (`=` or `+=` etc.) must defer to Stage A.5's single-evaluation
+///| receiver snapshot `{ let __mbt_r = <recv>; __mbt_r.v = ... }` instead of lowering directly to `.v`,
+///| because Pion's LLBC keeps `root: r` by place reference when `r` is `mut` or RHS contains `{ ... }`.
+fn should_defer_val_assign_to_a5(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  dot_i : Int,
+  op_i : Int,
+  end : Int,
+) -> Bool {
+  if op_i >= end || (tokens[op_i].kind != TokenKind::Eq && tokens[op_i].kind != TokenKind::AssignOp) {
+    return false
+  }
+  let is_simple_ident_recv = dot_i >= 1 && tokens[dot_i - 1].kind == TokenKind::Ident &&
+  !(dot_i >= 2 && (tokens[dot_i - 2].kind == TokenKind::Dot || tokens[dot_i - 2].kind == TokenKind::ColonColon))
+  let mut root_raw = ""
+  if dot_i >= 5 && tokens[dot_i - 1].kind == TokenKind::RParen &&
+  tokens[dot_i - 2].kind == TokenKind::IntLit && tokens[dot_i - 3].kind == TokenKind::Dot &&
+  tokens[dot_i - 4].kind == TokenKind::Ident && tokens[dot_i - 5].kind == TokenKind::LParen {
+    root_raw = tokens[dot_i - 4].raw
+  } else if dot_i >= 3 && tokens[dot_i - 1].kind == TokenKind::RBracket {
+    let mut ob = dot_i - 2
+    let mut d = 1
+    while ob >= 0 && d > 0 {
+      if tokens[ob].kind == TokenKind::RBracket { d = d + 1 }
+      else if tokens[ob].kind == TokenKind::LBracket { d = d - 1 }
+      if d == 0 { break }
+      ob = ob - 1
+    }
+    if ob >= 3 && tokens[ob - 3].kind == TokenKind::Ident && tokens[ob - 2].kind == TokenKind::Dot && tokens[ob - 1].kind == TokenKind::Ident {
+      root_raw = tokens[ob - 3].raw
+    } else if ob >= 1 && tokens[ob - 1].kind == TokenKind::Ident {
+      root_raw = tokens[ob - 1].raw
+    }
+  } else if dot_i >= 3 && tokens[dot_i - 3].kind == TokenKind::Ident &&
+  tokens[dot_i - 2].kind == TokenKind::Dot && tokens[dot_i - 1].kind == TokenKind::Ident {
+    root_raw = tokens[dot_i - 3].raw
+  } else if is_simple_ident_recv {
+    root_raw = tokens[dot_i - 1].raw
+  }
+  let mut root_is_known_immut = false
+  if root_raw.length() > 0 {
+    let eff = resolve_ident_in_scope(ctx, root_raw)
+    match lookup_scope_var(ctx, eff) {
+      Some(sv) => if sv.is_mut { return true } else { root_is_known_immut = true }
+      None =>
+      if eff != root_raw {
+        match lookup_scope_var(ctx, root_raw) {
+          Some(sv) => if sv.is_mut { return true } else { root_is_known_immut = true }
+          None => ()
+        }
+      }
+    }
+  }
+  if tokens[op_i].kind == TokenKind::Eq && is_simple_ident_recv && root_is_known_immut {
+    return false
+  }
+  let rhs_end = find_expr_end(tokens, op_i + 1, end)
+  let mut k = op_i + 1
+  while k < rhs_end {
+    // Skip closure literal bodies `fn(...) [-> T] { ... }` (not executed during RHS evaluation)
+    if tokens[k].kind == TokenKind::Keyword && tokens[k].raw == "fn" &&
+    k + 1 < rhs_end && tokens[k + 1].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, k + 1)
+      let mut lb = cp + 1
+      while lb < rhs_end && tokens[lb].kind != TokenKind::LBrace {
+        lb = lb + 1
+      }
+      if lb < rhs_end && tokens[lb].kind == TokenKind::LBrace {
+        k = find_matching_delim(tokens, lb) + 1
+        continue
+      }
+    }
+    if tokens[k].kind == TokenKind::LBrace {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
 ///| Check if `{ val: expr }` is a Ref literal (defaults to `mbt_compat::ref_new`, overridable by `--recipes`).
 ///| NEVER misclassify `{ val: expr }` as `Ref` when expected type is a local struct with `val`
 ///| or when a local single-field `struct { val : ... }` exists and expected type is not `Ref[...]`.
@@ -1555,7 +1715,7 @@ fn try_lower_ref_literal(
   close_b : Int,
   file : String,
 ) -> Option[String] {
-  if ctx.symtab.local_types.contains("Ref") {
+  if ctx.symtab.local_types.contains("Ref") || ctx.active_generics.contains("Ref") {
     return None
   }
   let ref_ty = effective_ref_type(ctx.recipes)
@@ -2571,6 +2731,7 @@ pub fn lower_block_range(
   prelude : String,
 ) -> String {
   let saved_scope = ctx.scope_vars.length()
+  let saved_renames = ctx.ident_renames.length()
   let saved_lifted : Array[(String, LiftedLocalFn)] = []
   for k in ctx.lifted_local_fns.keys() {
     match ctx.lifted_local_fns.get(k) {
@@ -2589,6 +2750,7 @@ pub fn lower_block_range(
   sb.write_string(tokens[close_b].leading_trivia)
   sb.write_string("}")
   restore_scope_vars(ctx, saved_scope)
+  restore_ident_renames(ctx, saved_renames)
   ctx.lifted_local_fns.clear()
   for kv in saved_lifted {
     ctx.lifted_local_fns[kv.0] = kv.1
@@ -2659,9 +2821,11 @@ fn lower_stmts_range(
           }
           sb.write_string(t.leading_trivia)
           let saved_g_sc = ctx.scope_vars.length()
+          let saved_g_rn = ctx.ident_renames.length()
           let cond_str = lower_cond_with_is_binders(ctx, tokens, i + 1, else_idx, file).trim()
           let rest_body = lower_stmts_range(ctx, tokens, after_else, end, file)
           restore_scope_vars(ctx, saved_g_sc)
+          restore_ident_renames(ctx, saved_g_rn)
           if is_idx > i + 1 && !has_ampamp {
             let scrut_str = lower_expr_range(ctx, tokens, i + 1, is_idx, file, false).trim()
             let pat_str = lower_expr_range(ctx, tokens, is_idx + 1, else_idx, file, true).trim()
@@ -4223,6 +4387,11 @@ fn lower_one_token_or_form(
       if has_nested {
         let rhs_end = find_expr_end(tokens, tup_eq_i + 1, end)
         let rhs_s = lower_expr_range(ctx, tokens, tup_eq_i + 1, rhs_end, file, false).trim()
+        let raw_b = collect_raw_pattern_binders(tokens, i + 1, cp + 1)
+        let tup_rn = compute_scoped_binder_renames(ctx, raw_b)
+        if tup_rn.length() > 0 {
+          ctx.ident_renames.push(tup_rn)
+        }
         let outer_vars : Array[String] = []
         let inner_lets : Array[String] = []
         let mut ai = i + 2
@@ -4253,13 +4422,20 @@ fn lower_one_token_or_form(
         for il in inner_lets {
           sb.write_string("; " + il)
         }
-        push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, cp + 1))
+        for rb in raw_b {
+          ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+        }
         return (sb.to_string(), rhs_end)
       } else {
         // Single-level tuple destructuring `let (a, b) [: (T0, T1)] = rhs`: lower RHS first, then register binders with inferred element types!
         let rhs_end = find_expr_end(tokens, tup_eq_i + 1, end)
         let rhs_ty = if tup_ann_ty.length() > 0 { tup_ann_ty } else { infer_simple_expr_type(ctx, tokens, tup_eq_i + 1, rhs_end).trim() }
         let rhs_s = lower_expr_range(ctx, tokens, tup_eq_i + 1, rhs_end, file, false)
+        let raw_b = collect_raw_pattern_binders(tokens, i + 1, cp + 1)
+        let tup_rn = compute_scoped_binder_renames(ctx, raw_b)
+        if tup_rn.length() > 0 {
+          ctx.ident_renames.push(tup_rn)
+        }
         let pat_s = lower_expr_range(ctx, tokens, i + 1, cp + 1, file, true)
         let ty_part = if tup_ann_ty.length() > 0 { " : " + tup_ann_ty } else { "" }
         let elem_tys : Array[String] = []
@@ -4297,19 +4473,23 @@ fn lower_one_token_or_form(
             let ety = if tidx < elem_tys.length() { elem_tys[tidx] } else { "" }
             if te == ti + 1 && tokens[ti].kind == TokenKind::Ident && tokens[ti].raw != "_" {
               ctx.scope_vars.push(ScopeVar::{
-                name: rename_keyword_ident(tokens[ti].raw),
+                name: resolve_ident_in_scope(ctx, tokens[ti].raw),
                 ty: ety,
                 is_mut: false,
                 is_boxed: false,
               })
             } else {
-              push_scope_binders(ctx, collect_pattern_binders(tokens, ti, te))
+              for rb in collect_raw_pattern_binders(tokens, ti, te) {
+                ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+              }
             }
             tidx = tidx + 1
             ti = te + 1
           }
         } else {
-          push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, cp + 1))
+          for rb in raw_b {
+            ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+          }
         }
         return (trivia + "let" + pat_s + ty_part + tokens[tup_eq_i].leading_trivia + "=" + rhs_s, rhs_end)
       }
@@ -4409,7 +4589,16 @@ fn lower_one_token_or_form(
       name_i = name_i + 1
     }
     if name_i + 1 < end && (tokens[name_i].kind == TokenKind::Ident || tokens[name_i].raw == "_") {
-      let lname = if tokens[name_i].raw == "_" { "_" } else { rename_keyword_ident(tokens[name_i].raw) }
+      let raw_lname = tokens[name_i].raw
+      let let_rn = if raw_lname == "_" { Map() } else { compute_scoped_binder_renames(ctx, [raw_lname]) }
+      let lname = if raw_lname == "_" {
+        "_"
+      } else {
+        match let_rn.get(raw_lname) {
+          Some(v) => v
+          None => rename_keyword_ident(raw_lname)
+        }
+      }
       let mut_kw = if is_mut { "mut " } else { "" }
       let is_boxed = is_mut && lname != "_" && ctx.boxed_mut_vars.contains(lname)
       if name_i + 2 < end && tokens[name_i + 1].kind == TokenKind::Colon {
@@ -4431,6 +4620,7 @@ fn lower_one_token_or_form(
           if is_boxed {
             let rhs_end = find_expr_end(tokens, eq_i + 1, end)
             let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false).trim()
+            if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
             if lname != "_" {
               ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
             }
@@ -4439,6 +4629,7 @@ fn lower_one_token_or_form(
           if ctx.borrowed_bufs.contains(lname) && eq_i + 1 < end && tokens[eq_i + 1].kind == TokenKind::LBracket {
             let close_arr = find_matching_delim(tokens, eq_i + 1)
             let arr_lit = lower_expr_range(ctx, tokens, eq_i + 1, close_arr + 1, file, false).trim()
+            if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
             if lname != "_" {
               ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
             }
@@ -4448,6 +4639,7 @@ fn lower_one_token_or_form(
           push_expected_type(ctx, lty)
           let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false)
           pop_expected_type(ctx)
+          if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
           if lname != "_" {
             ctx.scope_vars.push(ScopeVar::{ name: lname, ty: lty, is_mut: is_mut, is_boxed: is_boxed })
           }
@@ -4460,6 +4652,7 @@ fn lower_one_token_or_form(
         if is_boxed {
           let rhs_s = lower_expr_range(ctx, tokens, eq_i + 1, rhs_end, file, false).trim()
           let ty_ann = if inf_ty.length() > 0 { " : mbt_compat::MbtCell[" + inf_ty + "]" } else { "" }
+          if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
           if lname != "_" {
             ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
           }
@@ -4468,6 +4661,7 @@ fn lower_one_token_or_form(
         if ctx.borrowed_bufs.contains(lname) && eq_i + 1 < end && tokens[eq_i + 1].kind == TokenKind::LBracket {
           let close_arr = find_matching_delim(tokens, eq_i + 1)
           let arr_lit = lower_expr_range(ctx, tokens, eq_i + 1, close_arr + 1, file, false).trim()
+          if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
           if lname != "_" {
             ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
           }
@@ -4479,6 +4673,7 @@ fn lower_one_token_or_form(
           pop_expected_type(ctx)
           r
         }
+        if let_rn.length() > 0 { ctx.ident_renames.push(let_rn) }
         if lname != "_" {
           ctx.scope_vars.push(ScopeVar::{ name: lname, ty: inf_ty, is_mut: is_mut, is_boxed: is_boxed })
         }
@@ -4565,14 +4760,22 @@ fn lower_one_token_or_form(
         k = k + 1
       }
       if in_idx > i + 1 {
-        let vars_s = lower_expr_range(ctx, tokens, i + 1, in_idx, file, true)
         let saved_fh = ctx.in_for_header
         ctx.in_for_header = true
         let iter_ty = infer_simple_expr_type(ctx, tokens, in_idx + 1, lb)
         let iter_s = lower_expr_range(ctx, tokens, in_idx + 1, lb, file, false)
         ctx.in_for_header = saved_fh
         let saved_for_sc = ctx.scope_vars.length()
-        push_scope_binders(ctx, collect_pattern_binders(tokens, i + 1, in_idx))
+        let saved_for_rn = ctx.ident_renames.length()
+        let raw_for_b = collect_raw_pattern_binders(tokens, i + 1, in_idx)
+        let for_rn = compute_scoped_binder_renames(ctx, raw_for_b)
+        if for_rn.length() > 0 {
+          ctx.ident_renames.push(for_rn)
+        }
+        let vars_s = lower_expr_range(ctx, tokens, i + 1, in_idx, file, true)
+        for rb in raw_for_b {
+          ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+        }
         let elem_ty = extract_container_value_type(iter_ty)
         if elem_ty.length() > 0 {
           if in_idx == i + 2 && tokens[i + 1].kind == TokenKind::Ident && tokens[i + 1].raw != "_" {
@@ -4613,6 +4816,7 @@ fn lower_one_token_or_form(
         }
         let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
         restore_scope_vars(ctx, saved_for_sc)
+        restore_ident_renames(ctx, saved_for_rn)
         return (trivia + "for" + vars_s + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + body_s, close_b + 1)
       } else if semi1 > i + 1 {
         // C-style `for v1 = init1, v2 = init2; cond; step { body }`
@@ -5792,11 +5996,15 @@ fn lower_one_token_or_form(
     let is_val_method_call = prev_dot && t.raw == "val" && i + 1 < end &&
     tokens[i + 1].kind == TokenKind::LParen && !tokens[i + 1].newline_before
     let base_name = if prev_dot && t.raw == "val" && !is_val_method_call {
-      match try_resolve_static_val_field(ctx, tokens, i - 1) {
-        Some(resolved_f) => resolved_f
-        None => alloc_fresh_val_placeholder(ctx, t.line, t.col)
+      if should_defer_val_assign_to_a5(ctx, tokens, i - 1, i + 1, end) {
+        alloc_fresh_val_placeholder(ctx, t.line, t.col)
+      } else {
+        match try_resolve_static_val_field(ctx, tokens, i - 1) {
+          Some(resolved_f) => resolved_f
+          None => alloc_fresh_val_placeholder(ctx, t.line, t.col)
+        }
       }
-    } else if !prev_dot && !prev_cc_id && !in_pattern {
+    } else if !prev_dot && !prev_cc_id && (!in_pattern || !(i + 1 < end && tokens[i + 1].kind == TokenKind::Colon)) {
       resolve_ident_in_scope(ctx, t.raw)
     } else {
       rename_keyword_ident(t.raw)
@@ -6238,9 +6446,13 @@ fn lower_one_token_or_form(
           }
           if rhs_end > rhs_start {
             let f_out = if field_raw == "val" {
-              match try_resolve_static_val_field(ctx, tokens, next_i) {
-                Some(rf) => rf
-                None => alloc_fresh_val_placeholder(ctx, tokens[next_i + 1].line, tokens[next_i + 1].col)
+              if should_defer_val_assign_to_a5(ctx, tokens, next_i, after_f, end) {
+                alloc_fresh_val_placeholder(ctx, tokens[next_i + 1].line, tokens[next_i + 1].col)
+              } else {
+                match try_resolve_static_val_field(ctx, tokens, next_i) {
+                  Some(rf) => rf
+                  None => alloc_fresh_val_placeholder(ctx, tokens[next_i + 1].line, tokens[next_i + 1].col)
+                }
               }
             } else {
               rename_keyword_ident(field_raw)
@@ -6813,6 +7025,8 @@ fn lower_match_arms_with_ty(
   scrut_ty : String,
 ) -> String {
   let sb = StringBuilder()
+  let mut had_guarded_struct_arm = false
+  let mut has_unguarded_catchall = false
   let mut i = start
   while i < end {
     // Find `=>` at depth 0
@@ -6856,12 +7070,16 @@ fn lower_match_arms_with_ty(
       }
       rbi = rbi + 1
     }
-    let arm_pat_renames = compute_param_renames(arm_raw_binders)
+    let arm_pat_renames = compute_scoped_binder_renames(ctx, arm_raw_binders)
     let pushed_arm_renames = arm_pat_renames.length() > 0
     if pushed_arm_renames {
       ctx.ident_renames.push(arm_pat_renames)
     }
-    push_scope_binders(ctx, collect_pattern_binders(tokens, i, pat_end))
+    for rb in arm_raw_binders {
+      if rb != "_" {
+        ctx.scope_vars.push(ScopeVar::{ name: resolve_ident_in_scope(ctx, rb), ty: "", is_mut: false, is_boxed: false })
+      }
+    }
     // Sound static binder typing for `Some(v)` / `Ctor(v0, ...)` / `.Ctor(v0, ...)` in match arms (P1-1)
     let mut ct_scan = i
     while ct_scan + 2 < pat_end {
@@ -7099,6 +7317,13 @@ fn lower_match_arms_with_ty(
       }
       let fguards = nbg_sb.to_string()
       if bind_fields.length() > 0 {
+        let mut all_irrefutable = true
+        for bf in bind_fields {
+          if !is_irrefutable_simple_pat(bf.1) {
+            all_irrefutable = false
+            break
+          }
+        }
         let scrut_e = if bind_fields.length() == 1 {
           bind_fields[0].0
         } else {
@@ -7113,9 +7338,11 @@ fn lower_match_arms_with_ty(
           for bf in bind_fields { ps.push(bf.1) }
           "(" + join_comma(ps) + ")"
         }
-        if fguards.length() == 0 && guard_str.length() == 0 {
+        if all_irrefutable && fguards.length() == 0 && guard_str.length() == 0 {
+          has_unguarded_catchall = true
           sb.write_string(lead_triv + bind_var + tokens[fa].leading_trivia + "=> match " + scrut_e + " { " + pat_e + " => " + body_raw.trim() + ", _ => panic(\"unreachable\") }" + trail_sep)
         } else {
+          had_guarded_struct_arm = true
           let guard_rhs = if guard_str.length() > 0 { "(" + guard_str + ")" } else { "true" }
           let match_g = "(match " + scrut_e + " { " + pat_e + " => " + guard_rhs + ", _ => false })"
           let full_g = if fguards.length() > 0 { "(" + fguards + ") && " + match_g } else { match_g }
@@ -7129,7 +7356,13 @@ fn lower_match_arms_with_ty(
         } else {
           guard_str
         }
-        let g_part = if full_g.length() > 0 { " if " + full_g } else { "" }
+        let g_part = if full_g.length() > 0 {
+          had_guarded_struct_arm = true
+          " if " + full_g
+        } else {
+          has_unguarded_catchall = true
+          ""
+        }
         sb.write_string(lead_triv + bind_var + g_part + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
       }
       handled_special = true
@@ -7137,7 +7370,7 @@ fn lower_match_arms_with_ty(
 
     // Special case A: top-level `<Pat> as <name>` -> `<name> if (<name> is <Pat>) [&& (guard)] => body`
     if top_as_idx > i && top_as_idx + 1 < pat_end {
-      let as_name = rename_keyword_ident(tokens[top_as_idx + 1].raw)
+      let as_name = resolve_ident_in_scope(ctx, tokens[top_as_idx + 1].raw)
       let inner_pat = lower_expr_range(ctx, tokens, i, top_as_idx, file, true).trim()
       let full_guard = if guard_str.length() > 0 {
         "(" + as_name + " is " + inner_pat + ") && (" + guard_str + ")"
@@ -7644,7 +7877,7 @@ fn lower_match_arms_with_ty(
               seen_rest = true
               has_trailing_rest = true
               if tokens[ei + 2].kind == TokenKind::Ident && tokens[ei + 2].raw != "_" {
-                rest_as_var = rename_keyword_ident(tokens[ei + 2].raw)
+                rest_as_var = resolve_ident_in_scope(ctx, tokens[ei + 2].raw)
               }
             }
           } else if ee > ei {
@@ -7954,6 +8187,9 @@ fn lower_match_arms_with_ty(
 
     if !handled_special {
       let expanded = expand_nested_or_pat(ctx, tokens, i, pat_end, file)
+      if guard_str.length() == 0 && expanded.length() == 1 && is_irrefutable_simple_pat(expanded[0]) {
+        has_unguarded_catchall = true
+      }
       let pat_sb = StringBuilder()
       let mut ei = 0
       while ei < expanded.length() {
@@ -7969,6 +8205,9 @@ fn lower_match_arms_with_ty(
     }
     pop_expected_type(ctx)
     i = next_i
+  }
+  if had_guarded_struct_arm && !has_unguarded_catchall {
+    sb.write_string("\n    _ => panic(\"unreachable\")")
   }
   sb.to_string()
 }

@@ -104,7 +104,7 @@ CASES = {
     "transpile_core": ("ok", 7),
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
-    "transpile_upper_tier": ("ok", 18),
+    "transpile_upper_tier": ("ok", 26),
 }
 
 MOON_TRAPS = {
@@ -1679,6 +1679,101 @@ pub fn ut_tup_arr_and_set_ctor() -> (Int, Int, Int) {
   let s = Set([1, 2, 2])
   (r1, r2, s.length())
 }
+
+// Round 3 final boundary regressions (P0-A, P0-B, P2, Red-team P1-1, P1-2)
+pub let ut_g_ref : Ref[Int] = Ref(99)
+
+pub(all) struct UtShadowVal {
+  val : Int
+  v : Int
+}
+
+fn make_shadow_s() -> UtShadowVal {
+  UtShadowVal::{ val: 42, v: 0 }
+}
+
+pub fn ut_r3_val_mut_and_shadow() -> (Int, Int, Int, Int, Int) {
+  let a : Ref[Int] = Ref(1)
+  let b : Ref[Int] = Ref(7)
+  let mut r = a
+  r.val += {
+    r = b
+    10
+  }
+  let a2 : Ref[Int] = Ref(1)
+  let b2 : Ref[Int] = Ref(7)
+  let mut r2 = a2
+  r2.val = {
+    r2 = b2
+    10
+  }
+  let ut_g_ref = make_shadow_s()
+  (a.val, b.val, a2.val, b2.val, ut_g_ref.val)
+}
+
+pub(all) struct UtOptBox {
+  opt : Int?
+  tag : Int
+}
+
+pub(all) struct UtPairBox {
+  p : (Int, Int)
+}
+
+pub fn ut_r3_refutable_struct_pat() -> (Int, Int, Int, Int) {
+  let b1 = UtOptBox::{ opt: Option::Some(5), tag: 1 }
+  let b2 = UtOptBox::{ opt: Option::None, tag: 2 }
+  let r1 = match b1 {
+    { opt: Option::Some(x), .. } => x
+    { opt: Option::None, .. } => -1
+  }
+  let r2 = match b2 {
+    { opt: Option::Some(x), .. } => x
+    { opt: Option::None, .. } => -1
+  }
+  let p1 = UtPairBox::{ p: (1, 7) }
+  let p2 = UtPairBox::{ p: (2, 9) }
+  let r3 = match p1 {
+    { p: (1, x) } => x
+    _ => -1
+  }
+  let r4 = match p2 {
+    { p: (1, x) } => x
+    _ => -1
+  }
+  (r1, r2, r3, r4)
+}
+
+pub fn ut_r3_f_let_shadow(val~ : Int, val_~ : Int) -> Int {
+  let val = 99
+  val + val_
+}
+
+pub fn ut_r3_f_match_shadow(val~ : Int, val_~ : Int) -> Int {
+  match 77 {
+    val => val + val_
+  }
+}
+
+pub fn ut_r3_g_shadow(val_ : Int) -> Int {
+  let val = 99
+  val + val_
+}
+
+pub fn ut_r3_kw_patterns() -> (Int, Int, Int) {
+  let r_tup = match (1, 9) {
+    (val, val_) => val * 10 + val_
+  }
+  let r_arr = match [1, 9] {
+    [val, val_] => val * 10 + val_
+    _ => -1
+  }
+  let k = UtKwCollision::{ val: 1, val_: 9 }
+  let r_st = match k {
+    { val: val, val_: val_ } => val * 10 + val_
+  }
+  (r_tup, r_arr, r_st)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -2245,6 +2340,21 @@ fn main {
     check("ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
     check("ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
     check("ut.p1_4_set_ctor", sc1 == 2)
+    let (va, vb, va2, vb2, vs) = @m12.ut_r3_val_mut_and_shadow()
+    let (so1, so2, sp1, sp2) = @m12.ut_r3_refutable_struct_pat()
+    let fls = @m12.ut_r3_f_let_shadow(val=1, val_=2)
+    let fms = @m12.ut_r3_f_match_shadow(val=1, val_=2)
+    let gs = @m12.ut_r3_g_shadow(2)
+    let (kpt, kpa, kps) = @m12.ut_r3_kw_patterns()
+    trace("utr3", "\{va}:\{vb}:\{va2}:\{vb2}:\{vs},\{so1}:\{so2}:\{sp1}:\{sp2},\{fls}:\{fms}:\{gs},\{kpt}:\{kpa}:\{kps}")
+    check("ut.r3_val_mut_compound", va == 11 && vb == 7)
+    check("ut.r3_val_mut_assign", va2 == 10 && vb2 == 7)
+    check("ut.r3_global_ref_shadow", vs == 42)
+    check("ut.r3_struct_pat_opt", so1 == 5 && so2 == -1)
+    check("ut.r3_struct_pat_pair", sp1 == 7 && sp2 == -1)
+    check("ut.r3_kw_shadow", fls == 101 && fms == 79 && gs == 101)
+    check("ut.r3_kw_pat_tup", kpt == 19)
+    check("ut.r3_kw_pat_arr_struct", kpa == 19 && kps == 19)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2828,6 +2938,21 @@ pub fn main(w : World) -> Int {
     check(w, "ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
     check(w, "ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
     check(w, "ut.p1_4_set_ctor", sc1 == 2)
+    let (va, vb, va2, vb2, vs) = m12::ut_r3_val_mut_and_shadow()
+    let (so1, so2, sp1, sp2) = m12::ut_r3_refutable_struct_pat()
+    let fls = m12::ut_r3_f_let_shadow(val_1=1, val_=2)
+    let fms = m12::ut_r3_f_match_shadow(val_1=1, val_=2)
+    let gs = m12::ut_r3_g_shadow(2)
+    let (kpt, kpa, kps) = m12::ut_r3_kw_patterns()
+    trace(w, "utr3", va.to_string() + ":" + vb.to_string() + ":" + va2.to_string() + ":" + vb2.to_string() + ":" + vs.to_string() + "," + so1.to_string() + ":" + so2.to_string() + ":" + sp1.to_string() + ":" + sp2.to_string() + "," + fls.to_string() + ":" + fms.to_string() + ":" + gs.to_string() + "," + kpt.to_string() + ":" + kpa.to_string() + ":" + kps.to_string())
+    check(w, "ut.r3_val_mut_compound", va == 11 && vb == 7)
+    check(w, "ut.r3_val_mut_assign", va2 == 10 && vb2 == 7)
+    check(w, "ut.r3_global_ref_shadow", vs == 42)
+    check(w, "ut.r3_struct_pat_opt", so1 == 5 && so2 == -1)
+    check(w, "ut.r3_struct_pat_pair", sp1 == 7 && sp2 == -1)
+    check(w, "ut.r3_kw_shadow", fls == 101 && fms == 79 && gs == 101)
+    check(w, "ut.r3_kw_pat_tup", kpt == 19)
+    check(w, "ut.r3_kw_pat_arr_struct", kpa == 19 && kps == 19)
   } else {
     panic("abort: unknown case " + kase)
   }
