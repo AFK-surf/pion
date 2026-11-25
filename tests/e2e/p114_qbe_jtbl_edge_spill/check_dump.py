@@ -15,7 +15,7 @@ the candidates. In the register allocation dump:
     from the dump) selects the table targets: each selected target starts
     with exactly one store of the home, from the register that holds the
     temporary at the end of T ("Register mappings"), and has T as its only
-    predecessor; no other target stores it; the selected entries
+    predecessor; no other block of the function stores it anywhere; the selected entries
     (duplicates counted per entry) are between 1 and half of all entries,
     so at least half of the entries (hot arms) run without it.
 
@@ -180,14 +180,19 @@ for name, kind in expect.items():
         reg = endmap.get(temp[slot])
         need(reg is not None, f'{name}: {slot} (%{temp[slot]}) not in a register at the end of {rt}')
         closure = may_read(slot, src)
-        for e in set(entries):
-            got = [r for r, s in lead(e) if s == slot]
-            if e in closure:
-                need(len(got) == 1, f'{name}: {slot} stored {len(got)} times at the entry of {e}, want 1')
-                need(got[0] == reg, f'{name}: {slot} stored from {got[0]} at {e}, %{temp[slot]} is in {reg}')
-                need(rpred[e] == {rt}, f'{name}: {slot} prepended to {e} with predecessors {sorted(rpred[e])}')
+        # Whole function: the home is stored exactly once at the entry of each
+        # selected target and nowhere else.
+        selected = {e for e in entries if e in closure}
+        for blk, (body, _, _) in rb.items():
+            every = [i for i in body if store_slot(i) == slot]
+            if blk in selected:
+                got = [r for r, s in lead(blk) if s == slot]
+                need(len(every) == 1 and len(got) == 1,
+                     f'{name}: {slot} stored {len(every)} times in {blk} ({len(got)} at its entry), want 1 at the entry')
+                need(got[0] == reg, f'{name}: {slot} stored from {got[0]} at {blk}, %{temp[slot]} is in {reg}')
+                need(rpred[blk] == {rt}, f'{name}: {slot} prepended to {blk} with predecessors {sorted(rpred[blk])}')
             else:
-                need(not got, f'{name}: {slot} stored at {e}, which cannot read it')
+                need(not every, f'{name}: {slot} stored in {blk}, which is not a target that can read it')
         hits = [e for e in entries if e in closure]
         need(1 <= len(hits) <= edges // 2, f'{name}: {slot} stored on {len(hits)} of {edges} entries')
         if len(hits) > len(set(hits)):

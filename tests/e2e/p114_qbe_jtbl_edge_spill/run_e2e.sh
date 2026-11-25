@@ -158,8 +158,11 @@ import re, sys
 def need(ok, msg):
     if not ok:
         raise SystemExit(f"FAIL: p114 fixture {sys.argv[3]}: {msg}")
+# Anchored here as well, so a shrunken expect.txt cannot pass unnoticed.
+NAMES = ['sink7', 'sink11', 'sink14', 'sink18', 'sink23', 'pred14', 'dup14', 'dup23',
+         'major23', 'head23', 'multi14', 'multi23', 'flat14']
 names = [ln.split()[0] for ln in open(sys.argv[1]).read().split('\n') if ln.strip()]
-need(len(names) > 0 and len(set(names)) == len(names), f"bad function list {names}")
+need(names == NAMES, f"expect.txt lists {names}, want {NAMES}")
 lines = open(sys.argv[2]).read().split('\n')
 need(lines[-1] == '', "output does not end with a newline")
 lines = lines[:-1]
@@ -171,9 +174,9 @@ for ln in lines[:-1]:
     need(int(m.group(2)) == 10244, f"{m.group(1)} ran {m.group(2)} inputs, want 10244")
     seen.append(m.group(1))
 need(seen == names, f"functions {seen} != {names}")
-want = 10244 * len(names)
-need(lines[-1] == f"total {want} bad 0", f"last line {lines[-1]!r}, want 'total {want} bad 0'")
-print(f"p114 fixture {sys.argv[3]}: {len(names)} functions x 10244 = {want} inputs equal the C reference")
+want = 10244 * len(NAMES)
+need(want == 133172 and lines[-1] == "total 133172 bad 0", f"last line {lines[-1]!r}, want 'total 133172 bad 0'")
+print(f"p114 fixture {sys.argv[3]}: {len(NAMES)} functions x 10244 = {want} inputs equal the C reference")
 PYEOF
 }
 HOST_S="$(uname -s)"

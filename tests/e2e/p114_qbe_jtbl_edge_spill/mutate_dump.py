@@ -3,13 +3,14 @@
 usage: python3 -E mutate_dump.py DUMP EXPECT CHECK_DUMP OUT_DIR
 
 In the register allocation dump of `sink7`, the first table target that
-starts with a moved store is tampered with in four ways, each of which
+starts with a moved store is tampered with in five ways, each of which
 check_dump.py must reject (non-zero exit, a `FAIL:` line):
 
   dup    the prepended store is duplicated;
   reg    it stores from another register;
   move   it moves to a table target that cannot read the home;
-  extra  a copy of it is added to such a target (the original stays).
+  extra  a copy of it is added to such a target (the original stays);
+  late   a copy of it is added after the first instruction of that target.
 """
 import re
 import subprocess
@@ -60,12 +61,17 @@ def variant(kind):
     elif kind == 'move':
         moved = ls.pop(k)
         ls.insert(ls.index('@' + other[0]) + 1, moved)
-    else:
+    elif kind == 'extra':
         ls.insert(ls.index('@' + other[0]) + 1, ls[k])
+    else:
+        at = ls.index('@' + other[0]) + 1
+        if ls[at].startswith('@') or ls[at].startswith('\tj') or ls[at].startswith('\tret'):
+            raise SystemExit(f'FAIL: p114 mutate: {other[0]} has no first instruction')
+        ls.insert(at + 1, ls[k])
     return head + '\n'.join(ls) + tail
 
 
-for kind in ('dup', 'reg', 'move', 'extra'):
+for kind in ('dup', 'reg', 'move', 'extra', 'late'):
     path = Path(OUT) / f'mutant_{kind}.txt'
     path.write_text(variant(kind))
     r = subprocess.run([sys.executable, '-E', CHECK, str(path), EXPECT, f'mutant-{kind}'],
@@ -73,6 +79,6 @@ for kind in ('dup', 'reg', 'move', 'extra'):
     msg = (r.stderr.strip().split('\n') or [''])[-1]
     if r.returncode == 0 or not msg.startswith('FAIL: p114 mutant-'):
         raise SystemExit(f'FAIL: p114 check_dump accepted the {kind} mutant of {t} {m.group(0).strip()}')
-    if kind == 'extra' and 'cannot read it' not in msg:
+    if kind in ('extra', 'late') and 'not a target that can read it' not in msg:
         raise SystemExit(f'FAIL: p114 the extra store at {other[0]} was not reported: {msg}')
     print(f'p114 check_dump rejects {kind} ({t}: {m.group(0).strip()}): {msg}')
