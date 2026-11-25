@@ -630,6 +630,7 @@ void gvn(Fn *);
 
 /* gcm.c */
 int pinned(Ins *);
+int pinned_fn(Fn *, Ins *);
 void gcm(Fn *);
 
 /* ifopt.c */
