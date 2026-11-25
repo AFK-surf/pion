@@ -53,7 +53,21 @@ same_output() {
   fi
 }
 
+no_stderr() {
+  # $1 label, $2 stderr file
+  if [ -s "$2" ]; then
+    cat "$2" >&2
+    echo "FAIL: p130 $1 wrote to stderr" >&2
+    exit 1
+  fi
+}
+
 CC_BIN="${CC:-cc}"
+# Apple's AddressSanitizer has no leak checker and rejects detect_leaks=1.
+case "$(uname -s)" in
+  Darwin) ASAN_OPTS="detect_leaks=0:halt_on_error=1" ;;
+  *) ASAN_OPTS="detect_leaks=1:halt_on_error=1" ;;
+esac
 ASAN=0
 if "$CC_BIN" -fsanitize=address -x c - -o "$TMP_DIR/asan_probe" <<'PROBE' >/dev/null 2>&1
 int main(void) { return 0; }
@@ -76,17 +90,14 @@ for PROG in strings ints records sparse; do
     python3 -E "$DIR/check.py" ssa "$PROG" "$BASE.ssa" "$GEN"
     "$BASE" > "$BASE.out" 2> "$BASE.err"
     same_output "$PROG $MODE native" "$EXP" "$BASE.out"
-    if [ -s "$BASE.err" ]; then
-      cat "$BASE.err" >&2
-      echo "FAIL: p130 $PROG $MODE wrote to stderr" >&2
-      exit 1
-    fi
+    no_stderr "$PROG $MODE native" "$BASE.err"
     PION_NO_WASM_OPT=1 build $FLAG --target wasm32 -o "$BASE.wasm" "$SRC"
     if [ "$PROG" = "sparse" ]; then
       python3 -E "$DIR/check.py" wasm "$BASE.wasm" "$GEN"
     fi
-    node "$WASM_RT" "$BASE.wasm" > "$BASE.wout"
+    node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr"
     same_output "$PROG $MODE Wasm32" "$EXP" "$BASE.wout"
+    no_stderr "$PROG $MODE Wasm32" "$BASE.werr"
     echo "p130 $PROG $MODE: SSA checks, native and Wasm32 output equal the reference"
   done
   case "$PROG" in
@@ -95,9 +106,10 @@ for PROG in strings ints records sparse; do
         BASE="$TMP_DIR/${PROG}_asan"
         build --release --emit-asm "$BASE.s" "$SRC"
         "$CC_BIN" -fsanitize=address -g -O1 "$BASE.s" "$TMP_DIR/libpionrt_asan.a" -lm -lpthread -o "$BASE"
-        ASAN_OPTIONS=detect_leaks=1 "$BASE" > "$BASE.out"
+        ASAN_OPTIONS="$ASAN_OPTS" "$BASE" > "$BASE.out" 2> "$BASE.err"
         same_output "$PROG ASan/LSan" "$EXP" "$BASE.out"
-        echo "p130 $PROG: ASan/LSan clean, output equals the reference"
+        no_stderr "$PROG ASan/LSan" "$BASE.err"
+        echo "p130 $PROG: ASan ($ASAN_OPTS) clean, output equals the reference"
       else
         echo "p130 $PROG: ASan/LSan SKIP (cc lacks -fsanitize=address)"
       fi
