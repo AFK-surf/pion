@@ -732,6 +732,118 @@ fn case_wave_m2_round2() -> Unit {
 }
 
 ///|
+fn case_wave_m2b_parse() -> Unit {
+  let i_ws = try { Some(@string.parse_int(" 42 ")) } catch { _ => None }
+  let i_hex0 = try { Some(@string.parse_int("0xff")) } catch { _ => None }
+  let i_hex16 = try { Some(@string.parse_int("0xFF", base=16)) } catch { _ => None }
+  let d_ws = try { Some(@string.parse_double(" 1.5 ")) } catch { _ => None }
+  let d_ovf = try { Some(@string.parse_double("1e309")) } catch { _ => None }
+  let d_und = try { Some(@string.parse_double("1e-400")) } catch { _ => None }
+  trace("parse", "\{i_ws is None},\{i_hex0.unwrap_or(-1)},\{i_hex16.unwrap_or(-1)},\{d_ws is None},\{d_ovf is None},\{d_und.unwrap_or(-1.0)}")
+  check("m2b.int_ws_err", i_ws is None)
+  check("m2b.int_hex0", i_hex0 == Some(255))
+  check("m2b.int_hex16", i_hex16 == Some(255))
+  check("m2b.dbl_ws_err", d_ws is None)
+  check("m2b.dbl_ovf_err", d_ovf is None)
+  check("m2b.dbl_und_zero", d_und == Some(0.0))
+
+  // P1-1: 0-ULP exact parse_double bit-level comparison across all 3 engines
+  let big_cancel = "1" + String::make(800, '0') + "e-800"
+  let dbl_inputs = [
+    "1.7976931348623157e308",
+    "1.7976931348623159e308",
+    "2.2250738585072014e-308",
+    "123456789012345678901234567890",
+    "2.4703282292062328e-324",
+    "2.4703282292062327e-324",
+    "1_000.5",
+    "1_234.5_6e1_2",
+    "1e309",
+    "1e-400",
+    "-1e-400",
+    "-0.0",
+    " 1.5 ",
+    "_1.0",
+    "1_.0",
+    "1._0",
+    "1.0_",
+    "1__0.0",
+    "1e_2",
+    "1e+_2",
+    "1e2_",
+    big_cancel,
+  ]
+  for i = 0; i < dbl_inputs.length(); i = i + 1 {
+    let s = dbl_inputs[i]
+    let res = try {
+      let v = @string.parse_double(s)
+      "ok:" + v.reinterpret_as_int64().to_string()
+    } catch {
+      _ => "err"
+    }
+    trace("dbl_bits_\{i}", res)
+  }
+  check("m2b.dbl_exact_bits", true)
+
+  // P1-2: MbtJson lossless repr + non-finite stringify
+  let j1 = (@json.parse("9007199254740993") catch { _ => Json::null() }).stringify()
+  let j2 = (@json.parse("-9007199254740993") catch { _ => Json::null() }).stringify()
+  let j3 = (@json.parse("1e500") catch { _ => Json::null() }).stringify()
+  let j4 = (@json.parse("-1e500") catch { _ => Json::null() }).stringify()
+  let j5 = (@json.parse("1.7976931348623157e308") catch { _ => Json::null() }).stringify()
+  let j6 = Json::number(0.0 / 0.0).stringify()
+  let j7 = Json::number(1.0 / 0.0).stringify()
+  let j8 = Json::number(-1.0 / 0.0).stringify()
+  let j9 = Json::number(-0.0).stringify()
+  trace("json_repr", "\{j1}|\{j2}|\{j3}|\{j4}|\{j5}|\{j6}|\{j7}|\{j8}|\{j9}")
+  check("m2b.json_repr_and_nonfinite", j1 == "9007199254740993" && j2 == "-9007199254740993" && j3 == "1e500" && j4 == "-1e500" && j6 == "\"NaN\"" && j7 == "\"Infinity\"" && j8 == "\"-Infinity\"")
+
+  // P1-1: parse_int underscore rules across radixes
+  let iu1 = try { Some(@string.parse_int("0x_FF")) } catch { _ => None }
+  let iu2 = try { Some(@string.parse_int("1_0", base=10)) } catch { _ => None }
+  let iu3 = try { Some(@string.parse_int("0xF_F", base=16)) } catch { _ => None }
+  let iub1 = try { Some(@string.parse_int("_10")) } catch { _ => None }
+  let iub2 = try { Some(@string.parse_int("10_")) } catch { _ => None }
+  let iub3 = try { Some(@string.parse_int("1__0")) } catch { _ => None }
+  let iub4 = try { Some(@string.parse_int("0x__FF")) } catch { _ => None }
+  let iub5 = try { Some(@string.parse_int("0x_FF", base=10)) } catch { _ => None }
+  trace("int_under", "\{iu1.unwrap_or(-1)},\{iu2.unwrap_or(-1)},\{iu3.unwrap_or(-1)},\{iub1 is None},\{iub2 is None},\{iub3 is None},\{iub4 is None},\{iub5 is None}")
+  check("m2b.int_underscores", iu1 == Some(255) && iu2 == Some(10) && iu3 == Some(255) && iub1 is None && iub2 is None && iub3 is None && iub4 is None && iub5 is None)
+
+  // P1-3: JSON nesting depth 513 (Ok), 1024 (Ok), 1025 (Err)
+  let mk_nest = fn(d : Int) -> String {
+    let sb = StringBuilder::new()
+    for _i = 0; _i < d; _i = _i + 1 { sb.write_char('[') }
+    sb.write_char('0')
+    for _i = 0; _i < d; _i = _i + 1 { sb.write_char(']') }
+    sb.to_string()
+  }
+  let jd513 = try { let _ = @json.parse(mk_nest(513)); true } catch { _ => false }
+  let jd1024 = try { let _ = @json.parse(mk_nest(1024)); true } catch { _ => false }
+  let jd1025 = try { let _ = @json.parse(mk_nest(1025)); true } catch { _ => false }
+  trace("json_depth", "\{jd513},\{jd1024},\{jd1025}")
+  check("m2b.json_depth_1024", jd513 && jd1024 && !jd1025)
+
+  // P1-4: String::view vs String::clamped_view
+  let sv1 = "abc".view(start_offset=1).to_string()
+  let sv2 = "abc".view(start_offset=1, end_offset=2).to_string()
+  let cv1 = "abc".clamped_view(start=1).to_string()
+  let cv2 = "abc".clamped_view(start=-5, end=99).to_string()
+  let cv3 = "abc".clamped_view(start=2, end=1).to_string()
+  trace("str_views", "\{sv1}|\{sv2}|\{cv1}|\{cv2}|\{cv3}")
+  check("m2b.str_views", sv1 == "bc" && sv2 == "b" && cv1 == "bc" && cv2 == "abc" && cv3 == "")
+
+  // P1-6: xxHash32 Hasher exact bit-for-bit match
+  let h7 = Hash::hash(7)
+  let h42 = Hash::hash(42)
+  let hstr = Hash::hash("hello")
+  let hpi = Hash::hash(3.14)
+  let hz_eq = Hash::hash(-0.0) == Hash::hash(0.0)
+  trace("xxhash32", "\{h7},\{h42},\{hstr},\{hpi},\{hz_eq}")
+  check("m2b.xxhash32", h7 == -427046664 && h42 == 1161967057 && hstr == -655549713 && hpi == -428265677 && hz_eq)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -758,6 +870,7 @@ fn main {
     "arr.remove_oob" => case_arr_remove_oob()
     "wave_m2.compat" => case_wave_m2_compat()
     "wave_m2.round2" => case_wave_m2_round2()
+    "wave_m2b.parse" => case_wave_m2b_parse()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)

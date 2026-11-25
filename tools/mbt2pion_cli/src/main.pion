@@ -211,46 +211,42 @@ fn vol_same_dir_entry(world : World, p1 : String, p2 : String) -> Int {
   }
 }
 
-///| Resolve a path to its canonical realpath (normalizing `/tmp` -> `/private/tmp`, etc.);
-///| if the leaf does not yet exist, resolves its nearest existing ancestor and appends remaining segments.
+///| Resolve a path to its canonical realpath WITHOUT lexically collapsing `..` before symlink dereference!
+///| - First calls `fs_realpath(raw_abs)` directly so POSIX `realpath(3)` resolves symlinks before `..`.
+///| - If the leaf does not yet exist, walks segments left-to-right, resolving symlinks before every `..`.
 fn resolve_canonical_path(cwd : String, path : String) -> String {
-  let norm = normalize_path(cwd, path)
-  match fs_realpath(norm) {
+  let raw_abs = if path.starts_with("/") || cwd.length() == 0 {
+    path
+  } else {
+    join_path(cwd, path)
+  }
+  match fs_realpath(raw_abs) {
     Some(rp) => return rp
     None => ()
   }
-  let tail : Array[String] = []
-  let mut cur = norm
-  while cur.length() > 1 {
-    let d = dirname(cur)
-    let base = if d.length() == 0 {
-      cur
-    } else if d == "/" {
-      cur.slice(1, cur.length())
-    } else {
-      cur.slice(d.length() + 1, cur.length())
+  let parts = raw_abs.split("/")
+  let mut cur = if raw_abs.starts_with("/") { "/" } else { "" }
+  for seg in parts {
+    if seg.length() == 0 || seg == "." {
+      continue
     }
-    tail.push(base)
-    let next_cur = if d.length() == 0 { "." } else { d }
-    match fs_realpath(next_cur) {
-      Some(rp) => {
-        let mut res = rp
-        let mut k = tail.length() - 1
-        while k >= 0 {
-          res = join_path(res, tail[k])
-          k = k - 1
-        }
-        return res
+    if seg == ".." {
+      // Dereference any symlink at `cur` BEFORE moving to its parent!
+      let base_cur = match fs_realpath(cur) {
+        Some(rp) => rp
+        None => cur
       }
-      None => {
-        if next_cur == cur || next_cur == "." {
-          break
-        }
-        cur = next_cur
+      let parent = dirname(base_cur)
+      cur = if parent.length() > 0 { parent } else if base_cur.starts_with("/") { "/" } else { "" }
+    } else {
+      let next = if cur.length() == 0 { seg } else { join_path(cur, seg) }
+      cur = match fs_realpath(next) {
+        Some(rp) => rp
+        None => next
       }
     }
   }
-  norm
+  cur
 }
 
 ///| Fixed-length short sibling temp filename (always <= 35 bytes, NEVER triggers ENAMETOOLONG!).
@@ -358,8 +354,9 @@ fn str_to_lower(s : String) -> String {
 }
 
 ///| Parse `[dependencies]` `name = { path = "..." }` entries from a target `pion.toml` (P0-3).
-fn parse_manifest_deps(manifest_path : String, content : String, out_deps : Array[(String, String)]) -> Unit {
-  let base_dir = dirname(manifest_path)
+fn parse_manifest_deps(cwd : String, manifest_path : String, content : String, out_deps : Array[(String, String)]) -> Unit {
+  let abs_manifest = resolve_canonical_path(cwd, manifest_path)
+  let base_dir = dirname(abs_manifest)
   let lines = content.split("\n")
   let mut in_deps = false
   for raw in lines {
@@ -389,11 +386,12 @@ fn parse_manifest_deps(manifest_path : String, content : String, out_deps : Arra
         let q2 = rest.index_of("\"")
         if q2 > 0 {
           let dep_path = rest.slice(0, q2)
-          let resolved = if dep_path.starts_with("/") || base_dir.length() == 0 {
+          let joined = if dep_path.starts_with("/") || base_dir.length() == 0 {
             dep_path
           } else {
             join_path(base_dir, dep_path)
           }
+          let resolved = resolve_canonical_path(cwd, joined)
           out_deps.push((name, resolved))
         }
       }
@@ -1183,14 +1181,23 @@ pub fn main(world : World) -> Int {
 
   let pre_diags : Array[m2p::Diag] = []
 
-  // Assemble real target package dependency graph (P0-3)
+  let cwd = match fs_realpath(".") {
+    Some(d) => d
+    None =>
+    match env_get(world, "PWD") {
+      Some(d) => d
+      None => ""
+    }
+  }
+
+  // Assemble real target package dependency graph (P0-3), canonicalizing all paths against `cwd`
   let check_deps : Array[(String, String)] = []
   if mbt_compat_dir.length() > 0 {
-    check_deps.push(("mbt_compat", mbt_compat_dir))
+    check_deps.push(("mbt_compat", resolve_canonical_path(cwd, mbt_compat_dir)))
   }
   if pkg_manifest_path.length() > 0 {
     match fs_read(world, pkg_manifest_path) {
-      Ok(txt) => parse_manifest_deps(pkg_manifest_path, txt, check_deps)
+      Ok(txt) => parse_manifest_deps(cwd, pkg_manifest_path, txt, check_deps)
       Err(e) => {
         io_eprintln(world, "mbt2pion: cannot read --package-manifest " + pkg_manifest_path + ": " + e)
         return 3
@@ -1198,7 +1205,7 @@ pub fn main(world : World) -> Int {
     }
   }
   for dep in cli_deps {
-    check_deps.push(dep)
+    check_deps.push((dep.0, resolve_canonical_path(cwd, dep.1)))
   }
 
   // Load optional `--api-map`
@@ -1416,14 +1423,6 @@ pub fn main(world : World) -> Int {
 
   // Astra Round 3 P0-1: inspect `--out` with `fs_lstat` (never follow symlinks!) for collisions,
   // unmanaged dirs/symlinks/files (with exact modes), unreadable dirs/files, and in-`--out` reports.
-  let cwd = match fs_realpath(".") {
-    Some(d) => d
-    None =>
-    match env_get(world, "PWD") {
-      Some(d) => d
-      None => ""
-    }
-  }
   let clean_out_dir = strip_trailing_slash(out_dir)
   let out_kind = if clean_out_dir.length() > 0 { lstat_kind(world, clean_out_dir) } else { None }
   let out_existed_as_dir = match out_kind { Some("dir") => true, _ => false }

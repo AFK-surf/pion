@@ -481,10 +481,17 @@ test "BUG-7: recipes [derives] ignore and Ctor(..)/Ctor(.., ..) rest patterns wi
   assert_true(str_has(out, "Tri(_, _, _)"), "Ctor(..) and Ctor(.., ..) expanded to 3 wildcards")
   assert_true(str_has(out, ".Quad(a, _, _, _)"), "cross-pkg Quad(a, ..) expanded using api_map arity=4")
 
-  // Without recipe ignore, #derive(Debug) must still hard-fail!
+  // Wave M2-B: #derive(Debug) is safely ignored by default, while truly unknown derives still hard-fail!
   let no_rec = transpile_package([src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
-  assert_true(no_rec.blockers > 0, "Debug without ignore recipe must still hard-fail")
-  assert_true(no_rec.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "emits MBT2PION_UNKNOWN_DERIVE")
+  assert_eq(no_rec.blockers, 0)
+  let unk_src = SourceFile::{
+    rel_path: "unk_derive.mbt",
+    content: "#derive(ArbitraryCustomDerive)\npub struct U { x : Int }\n",
+    is_test: false,
+  }
+  let unk_res = transpile_package([unk_src], am, default_recipes(), [], [], default_options(), [], false, noop_check)
+  assert_true(unk_res.blockers > 0, "unknown derive without recipe must still hard-fail")
+  assert_true(unk_res.diagnostics[0].code == "MBT2PION_UNKNOWN_DERIVE", "emits MBT2PION_UNKNOWN_DERIVE")
 }
 
 test "P0-1 & P0-2: mul/div/mod precedence, unary neg divisor, Int16 / 2 block, and interp probing" {
@@ -1127,8 +1134,9 @@ test "Final Opus+Astra regressions: #cfg brace-less decl skip, wasm32->wasm-gc e
   assert_true(target_matches_moon_rules("wasm32", ["wasm-gc"]), "moon.pkg [\"wasm-gc\"] included for wasm32")
   assert_true(!target_matches_moon_rules("wasm32", ["not", "wasm-gc"]), "moon.pkg [\"not\", \"wasm-gc\"] excluded for wasm32")
 
-  // 3. Astra P1-3: nested raise/noraise in struct field, enum payload, local let, top-level let
-  //    MUST all emit MBT2PION_UNSUPPORTED_SYNTAX and mark disposition == "unsupported"!
+  // 3. Astra P1-3 + Wave M2-B: nested `raise` in struct field, enum payload, local let, top-level let
+  //    MUST all emit MBT2PION_UNSUPPORTED_SYNTAX and mark disposition == "unsupported",
+  //    while `noraise` is stripped cleanly as equivalent to a plain Pion function type!
   let nested_err_src =
   "pub struct BoxR { cb : () -> Int raise }\n" +
   "pub struct BoxN { cb : () -> Int noraise }\n" +
@@ -1146,15 +1154,19 @@ test "Final Opus+Astra regressions: #cfg brace-less decl skip, wasm32->wasm-gc e
     false,
     empty_check,
   )
-  assert_true(res_ne.blockers >= 5, "all 5 nested raise/noraise type sites MUST block")
+  assert_eq(res_ne.blockers, 4)
   let mut ne_syn = 0
   for d in res_ne.diagnostics {
     if d.code == "MBT2PION_UNSUPPORTED_SYNTAX" { ne_syn = ne_syn + 1 }
   }
-  assert_true(ne_syn >= 5, "all 5 nested raise/noraise sites MUST emit MBT2PION_UNSUPPORTED_SYNTAX")
+  assert_eq(ne_syn, 4)
   assert_eq(res_ne.dispositions.length(), 5)
   for dp in res_ne.dispositions {
-    assert_true(dp.disposition == "unsupported", "struct/enum/let/fn with nested raise/noraise MUST have disposition unsupported: " + dp.decl)
+    if dp.decl == "struct:BoxN" {
+      assert_true(dp.disposition == "transpiled", "struct with noraise MUST transpile cleanly: " + dp.decl)
+    } else {
+      assert_true(dp.disposition == "unsupported", "struct/enum/let/fn with nested raise MUST have disposition unsupported: " + dp.decl)
+    }
   }
 }
 
@@ -2492,4 +2504,357 @@ test "Wave M2-A Round 2: P0/P1/P2 regressions (numeric coercion, enum vis, tuple
   let fa_own_drift : Array[DriftEntry] = []
   let fa_own_rw = rewrite_for_probe(fa_own_sites[0], "FixedArray[Int]", default_recipes(), fa_own_diags, fa_own_drift).unwrap_or("")
   assert_true(fa_own_diags.length() == 0 && str_has(fa_own_rw, "fixed_array_slice_clamp"), "owned FixedArray slice succeeds")
+}
+
+test "Wave M2-B: slices, rest array pats, StringView/Bytes loop, MbtJson+catch, expected-type Auto, Stage B/A.5, blackbox priv, derive Debug/Hash & noraise" {
+  let empty_check = fn(batch : Array[(String, String)]) -> String {
+    let _ = batch
+    "{\"ok\":true,\"diagnostics\":[]}"
+  }
+
+  // #2: Complex receiver postfix slices (single-eval binding when hi omitted)
+  let sl_src =
+  "pub fn sl_demo(parts : Array[String], s : String) -> Unit {\n" +
+  "  let a = parts.get(0).unwrap_or(\"-1\")[:]\n" +
+  "  let b = [1, 2, 3][:].to_owned()\n" +
+  "  let c = (s + \"!\")[1:3]\n" +
+  "  let _ = (a, b, c)\n" +
+  "}\n"
+  let sl_res = transpile_package(
+    [SourceFile::{ rel_path: "sl.mbt", content: sl_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let sl_out = sl_res.files[0].content
+  assert_true(str_has(sl_out, "let __mbt_sl_") && str_has(sl_out, "__mbt_slice_borrow(__mbt_sl_"), "complex slice binds receiver once")
+  assert_true(str_has(sl_out, "__mbt_slice_owned(__mbt_sl_"), "array literal [:].to_owned() lowers to __mbt_slice_owned")
+  assert_true(str_has(sl_out, "__mbt_slice_borrow((s + \"!\"), 1, 3)"), "paren slice lowers cleanly")
+
+  // #3: Trailing `..` in Some([a, b, ..]) and [a, b, ..]; fail-closed on non-trailing `..`
+  let ar_src =
+  "pub fn ar_ok(opt : Array[Int]?, xs : Array[Int], flag : Bool) -> Int {\n" +
+  "  let x = match opt { Some([a, b, ..]) if flag => a + b; _ => 0 }\n" +
+  "  let y = match xs { [h, ..] => h; _ => 0 }\n" +
+  "  x + y\n" +
+  "}\n"
+  let ar_res = transpile_package(
+    [SourceFile::{ rel_path: "ar.mbt", content: ar_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(ar_res.blockers, 0)
+  assert_true(str_has(ar_res.files[0].content, ".length() >= 2") && str_has(ar_res.files[0].content, ".length() >= 1"), "trailing .. uses >=")
+  assert_true(str_has(ar_res.files[0].content, "_ => 0"), "outer fallback arm preserved after guarded Some([..])")
+
+  let ar_bad = "pub fn bad(xs : Array[Int]) -> Int { match xs { [.., last] => last; _ => 0 } }\n"
+  let ar_bad_res = transpile_package(
+    [SourceFile::{ rel_path: "ar_bad.mbt", content: ar_bad, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(ar_bad_res.blockers > 0 && ar_bad_res.diagnostics[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "middle/leading .. in array pattern fails closed")
+
+  // #4 & #5: StringView -> String, Json -> MbtJson, Json::Number(v, ..) + repr= supported, controlled catch + arbitrary catch fail-closed
+  let jc_src =
+  "pub fn jc_ok(s : StringView, b : Bytes) -> (Json, Int) {\n" +
+  "  let j = @json.parse(s) catch { _ => Json::null() }\n" +
+  "  let d = Some(@utf8.decode(b)) catch { _ => None }\n" +
+  "  let n = @string.parse_int(s) catch { _ => -1 }\n" +
+  "  let n2 = try { @strconv.parse_int(s) } catch { _ => 0 }\n" +
+  "  let k = match j { Json::Number(v, ..) => v.to_int(); _ => 0 }\n" +
+  "  let k2 = match j { Json::Number(v, repr=r) => { let _ = r; v.to_int() }; _ => 0 }\n" +
+  "  let _ = d\n" +
+  "  (j, n + n2 + k + k2)\n" +
+  "}\n"
+  let jc_res = transpile_package(
+    [SourceFile::{ rel_path: "jc.mbt", content: jc_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(jc_res.blockers, 0)
+  let jc_out = jc_res.files[0].content
+  assert_true(str_has(jc_out, "s : String") && str_has(jc_out, "mbt_compat::MbtJson"), "StringView->String and Json->MbtJson")
+  assert_true(str_has(jc_out, "mbt_compat::mbt_json_parse") && str_has(jc_out, "mbt_compat::utf8_decode_strict") && str_has(jc_out, "mbt_compat::str_try_parse_int"), "controlled catch lowers to Result match")
+  assert_true(str_has(jc_out, "mbt_compat::MbtJson::Number(v, _)"), "Json::Number(v, ..) lowered with wildcard repr")
+  assert_true(str_has(jc_out, "mbt_compat::MbtJson::Number(v, r)"), "Json::Number(v, repr=r) lowered with repr binder")
+
+  let jc_bad =
+  "pub fn bad_catch() -> Int { unknown_raise() catch { _ => 0 } }\n" +
+  "pub fn bad_err_bind(s : String) -> Int { @string.parse_int(s) catch { e => { let _ = e; -1 } } }\n"
+  let jc_bad_res = transpile_package(
+    [SourceFile::{ rel_path: "jc_bad.mbt", content: jc_bad, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(jc_bad_res.blockers >= 2, "arbitrary catch and error-binding controlled catch both fail closed")
+
+  // P0-4: Local `enum Json` and user `@string` import in `moon.pkg` are NEVER hijacked by stdlib rewrites
+  let local_j_src =
+  "pub(all) enum Json { Null }\n" +
+  "pub fn Json::stringify(self : Json) -> String { match self { Json::Null => \"domain\" } }\n" +
+  "pub fn use_local() -> String { Json::Null.stringify() }\n" +
+  "pub fn use_user_str() -> Int { @string.parse_int(\"7\") }\n"
+  let local_j_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: false,
+    src_prefix: "",
+    moon_pkg_content: "import {\n  \"acme/custom_str\" @string,\n}\n",
+    header: default_header_meta("native"),
+  }
+  let local_j_res = transpile_package(
+    [SourceFile::{ rel_path: "lj.mbt", content: local_j_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    local_j_opts,
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(local_j_res.blockers, 0)
+  let lj_out = local_j_res.files[0].content
+  assert_true(!str_has(lj_out, "mbt_compat::MbtJson") && !str_has(lj_out, "mbt_compat::str_parse_int"), "local Json and user @string import never hijacked")
+
+  // P1 (P0-4): Generic type param `Json` preserved in `fn`, `struct`, `enum` while outer `Json` still maps to `MbtJson`
+  let gj_src =
+  "pub fn[Json] identity(x : Json) -> Json { x }\n" +
+  "pub struct Boxed[Json] { val0 : Json }\n" +
+  "pub(all) enum BoxE[Json] { Val(Json) }\n" +
+  "pub fn real_json(j : Json) -> Json { j }\n" +
+  "pub fn use_gj() -> Int { let b : Boxed[Int] = { val0: identity(17) }; b.val0 }\n"
+  let gj_res = transpile_package(
+    [SourceFile::{ rel_path: "gj.mbt", content: gj_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(gj_res.blockers, 0)
+  let gj_out = gj_res.files[0].content
+  assert_true(
+    str_has(gj_out, "fn identity[Json](x : Json) -> Json") &&
+    str_has(gj_out, "struct Boxed[Json]") &&
+    str_has(gj_out, "val0 : Json") &&
+    str_has(gj_out, "enum BoxE[Json]") &&
+    str_has(gj_out, "Val(Json)") &&
+    str_has(gj_out, "fn real_json(j : mbt_compat::MbtJson) -> mbt_compat::MbtJson"),
+    "generic param named Json preserved in fn/struct/enum without polluting outer Json",
+  )
+
+  // #6: Expected-type disambiguation of ambiguous `Auto` across 2 local enums
+  let eq_auto =
+  "pub(all) enum Dim { Auto; Px(Double) }\n" +
+  "pub(all) enum Align { Auto; Center }\n" +
+  "pub struct Style { mut w : Dim; mut align : Align }\n" +
+  "pub fn take_dim(d : Dim) -> Dim { if true { Auto } else { d } }\n" +
+  "pub fn use_all(s : Style) -> Align {\n" +
+  "  let xs : Array[Align] = Array::make(2, Auto)\n" +
+  "  let _ = take_dim(Auto)\n" +
+  "  s.align = Auto\n" +
+  "  if s.align == Auto { return Auto }\n" +
+  "  xs[0]\n" +
+  "}\n"
+  let auto_res = transpile_package(
+    [SourceFile::{ rel_path: "auto.mbt", content: eq_auto, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(auto_res.blockers, 0)
+  let auto_out = auto_res.files[0].content
+  assert_true(str_has(auto_out, "Dim::Auto") && str_has(auto_out, "Align::Auto"), "Auto disambiguated to Dim::Auto and Align::Auto")
+
+  // #8: Nested `.val = None` inside outer `.val = Some(...)` never corrupts inner assignment into `.mbt_val_probe() = None`
+  let val_src =
+  "pub fn nested_val(u : mbt_compat::Ref[Option[() -> Unit]]) -> Unit {\n" +
+  "  u.val = Some(fn() { u.val = None })\n" +
+  "}\n"
+  let (val_inst, _val_sites) = instrument_probes_for_file("nv.pion", val_src)
+  assert_true(!str_has(val_inst, ".mbt_val_probe() ="), "nested .val = None must not be rewritten to .mbt_val_probe() =")
+
+  // #9: Black-box `*_test.mbt` colliding private fn isolated to `__mbt_bbtest_<name>`
+  let bb_prod = SourceFile::{ rel_path: "shape.mbt", content: "fn dmax(a : Double, b : Double) -> Double { if a > b { a } else { b } }\npub fn pub_ok() -> Double { dmax(1.0, 2.0) }\n", is_test: false }
+  let bb_test = SourceFile::{ rel_path: "line_test.mbt", content: "fn dmax(a : Double, b : Double) -> Double { if a >= b { a } else { b } }\ntest \"bb\" { let _ = dmax(3.0, 4.0) }\n", is_test: true }
+  let bb_opts = TranspileOptions::{
+    target: "native",
+    mode: "audit",
+    with_tests: true,
+    src_prefix: "",
+    moon_pkg_content: "",
+    header: default_header_meta("native"),
+  }
+  let bb_res = transpile_package([bb_prod, bb_test], empty_api_map(), default_recipes(), [], [], bb_opts, [], false, empty_check)
+  assert_eq(bb_res.blockers, 0)
+  let mut saw_bb_rename = false
+  for f in bb_res.files {
+    if f.rel_path == "line_test.pion" {
+      saw_bb_rename = str_has(f.content, "fn __mbt_bbtest_dmax(") && str_has(f.content, "__mbt_bbtest_dmax(3.0, 4.0)")
+    }
+  }
+  assert_true(saw_bb_rename, "blackbox colliding priv fn renamed deterministically")
+
+  // P1-3: Black-box private top-level renaming strictly respects lexical shadowing across all 5 binding sites
+  let bb_sh_prod = SourceFile::{
+    rel_path: "lib.mbt",
+    content: "let limit = 100\npub fn prod_limit() -> Int { limit }\n",
+    is_test: false,
+  }
+  let bb_sh_test = SourceFile::{
+    rel_path: "shadow_test.mbt",
+    content:
+    "let limit = 5\n" +
+    "fn check_match(o : Int?) -> Int { match o { Some(limit) => limit * 2; None => limit } }\n" +
+    "fn check_let() -> Int { let limit = limit + 1; limit }\n" +
+    "fn check_tup() -> Int { let (limit, _) = (10, 20); limit }\n" +
+    "fn check_fn() -> Int { let f = fn(limit : Int) -> Int { limit }; let g = (limit) => limit; let h = limit => limit; f(1) + g(2) + h(3) }\n" +
+    "fn check_for() -> Int { let mut s = 0; for limit in [1, 2] { s = s + limit }; s + limit }\n" +
+    "fn check_if_is(o : Int?) -> Int { if o is Some(limit) && limit > 0 { limit } else { limit } }\n" +
+    "test \"shadow\" { let _ = (check_match(Some(3)), check_let(), check_tup(), check_fn(), check_for(), check_if_is(Some(7))) }\n",
+    is_test: true,
+  }
+  let bb_sh_res = transpile_package([bb_sh_prod, bb_sh_test], empty_api_map(), default_recipes(), [], [], bb_opts, [], false, empty_check)
+  assert_eq(bb_sh_res.blockers, 0)
+  let mut sh_out = ""
+  let mut sh_all = ""
+  for f in bb_sh_res.files {
+    if f.rel_path == "shadow_test.pion" { sh_out = f.content }
+    sh_all = sh_all + "\n" + f.content
+  }
+  assert_true(str_has(sh_all, "let __mbt_bbtest_limit"), "colliding top-level let renamed")
+  assert_true(str_has(sh_out, "Some(limit) => limit * 2") && str_has(sh_out, "None => __mbt_bbtest_limit"), "match arm shadows limit while sibling arm uses renamed top-level")
+  assert_true(str_has(sh_out, "let limit = __mbt_bbtest_limit + 1; limit"), "let limit = limit + 1 renames RHS only")
+  assert_true(str_has(sh_out, "let (limit, _) = (10, 20); limit"), "tuple destructuring let shadows limit")
+  assert_true(str_has(sh_out, "fn(limit : Int) -> Int { limit }") && str_has(sh_out, "fn(limit) { limit }"), "closure & arrow params shadow limit")
+  assert_true(str_has(sh_out, "for limit in [1, 2] { s = s + limit }; s + __mbt_bbtest_limit"), "for loop var shadows inside loop only")
+  assert_true(str_has(sh_out, "if o is Some(limit) && limit > 0 { limit } else { __mbt_bbtest_limit }"), "if is binder shadows && and then-block only, not else")
+
+  // #10: #derive(Debug) ignored, #derive(Hash) synthesized + fail-closed on non-hashable field, noraise stripped
+  let dh_src =
+  "#derive(Debug, Eq, Hash)\npub struct Key { a : Int; b : Double; c : String }\n" +
+  "pub fn nr(f : () -> Int noraise) -> Int noraise { f() }\n"
+  let dh_res = transpile_package(
+    [SourceFile::{ rel_path: "dh.mbt", content: dh_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(dh_res.blockers, 0)
+  let dh_out = dh_res.files[0].content
+  assert_true(str_has(dh_out, "pub fn Key::hash(self : Key) -> Int") && !str_has(dh_out, "noraise"), "Hash synthesized, Debug ignored, noraise stripped")
+
+  let dh_bad = "#derive(Hash)\npub struct NonHash { cb : () -> Int }\n"
+  let dh_bad_res = transpile_package(
+    [SourceFile::{ rel_path: "dh_bad.mbt", content: dh_bad, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(dh_bad_res.blockers > 0 && dh_bad_res.diagnostics[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "#derive(Hash) on non-hashable field fails closed")
+
+  // #11: MoonBit Float32 literals (decimal `1.5F`, `-0.0F`, `0.0F`, `1.0e3F` + hex `0x1.8p0F`, `0x1.0p-149F`) vs hex int `0xFF` & pattern fail-closed
+  let flt_src =
+  "pub fn flt_vals() -> (Float, Float, Float, Float, Float, Float, Int) {\n" +
+  "  (1.5F, -0.0F, 0.0F, 1.0e3F, 0x1.8p0F, 0x1.0p-149F, 0xFF)\n" +
+  "}\n"
+  let flt_res = transpile_package(
+    [SourceFile::{ rel_path: "flt.mbt", content: flt_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(flt_res.blockers, 0)
+  let flt_out = flt_res.files[0].content
+  assert_true(
+    str_has(flt_out, "Float::from_double(1.5)") &&
+    str_has(flt_out, "-Float::from_double(0.0)") &&
+    str_has(flt_out, "Float::from_double(1.0e3)") &&
+    str_has(flt_out, "Float::from_double(Double::from_bits(4609434218613702656L))") &&
+    str_has(flt_out, "Float::from_double(Double::from_bits(3936146074321813504L))") &&
+    str_has(flt_out, "0xFF"),
+    "Decimal and hex Float32 literals lower via binary64->Float::from_double without corrupting hex int 0xFF",
+  )
+
+  let flt_pat_src = "pub fn flt_pat(x : Float) -> Int { match x { 1.5F => 1; 0x1.8p0F => 2; _ => 0 } }\n"
+  let flt_pat_res = transpile_package(
+    [SourceFile::{ rel_path: "flt_pat.mbt", content: flt_pat_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(flt_pat_res.blockers >= 2 && flt_pat_res.diagnostics[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "Decimal and hex Float32 literals in pattern fail closed")
+
+  let flt_low_src = "pub fn bad_low() -> (Float, Float) { (1.5f, 0x1.8p0f) }\n"
+  let flt_low_res = transpile_package(
+    [SourceFile::{ rel_path: "flt_low.mbt", content: flt_low_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(flt_low_res.blockers >= 2 && flt_low_res.diagnostics[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "Lowercase f suffix on decimal and hex float literals fails closed")
 }
