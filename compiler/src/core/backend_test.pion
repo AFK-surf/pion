@@ -15144,3 +15144,253 @@ test "counted fill: a loop body that shadows the array keeps its own header" {
   }
   assert_true(dynamic >= 1, body)
 }
+
+///|
+fn t_w1_ssa(src : String, release : Bool, target : String) -> String {
+  let cr = check_source_files_full("w1", ["w1.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  emit_qbe_package_with_tc_target(cr.pkg, cr.tc, release, target).ssa
+}
+
+///|
+fn t_w1_fn(ssa : String, name : String) -> String {
+  let s = p18_find_from(ssa, " $pion_fn_" + name + "(", 0)
+  assert_true(s >= 0, "missing function " + name + ":\n" + ssa)
+  let e = p18_find_from(ssa, "\n}", s)
+  assert_true(e > s, "unterminated function " + name)
+  slice_str(ssa, s, e)
+}
+
+///|
+test "qbe_w1_string_spans_scalar_map_entry_and_string_send" {
+  let src =
+    #|fn bump(m : Map[String, Int], k : String) -> Int {
+    #|  m.remove(k)
+    #|  1
+    #|}
+    #|pub fn cat(s : String, a : Int, b : Int) -> String {
+    #|  s.slice(a, b) + "-" + s.slice(b, s.length())
+    #|}
+    #|pub fn alias(s : String) -> String {
+    #|  let x = s.slice(0, 1)
+    #|  let y = s.slice(1, 2)
+    #|  let r = x + ":" + y
+    #|  r
+    #|}
+    #|pub fn plain(a : String, b : String) -> String {
+    #|  a + "-" + b
+    #|}
+    #|pub fn sbw(s : String, a : Int, b : Int) -> String {
+    #|  let sb = StringBuilder()
+    #|  sb.write_string(s.slice(a, b))
+    #|  sb.to_string()
+    #|}
+    #|pub fn count(m : Map[String, Int], k : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(k, v + 1)
+    #|    None => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn count64(m : Map[String, Int64], s : String) -> Unit {
+    #|  let k = s.slice(1, 3)
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(k, v * 2L)
+    #|    None => m.set(k, 7L)
+    #|  }
+    #|}
+    #|pub fn has(m : Map[String, Int], k : String, d : Int) -> Unit {
+    #|  if m.contains(k) { m.set(k, d) } else { m.set(k, d + 1) }
+    #|}
+    #|pub fn effect(m : Map[String, Int], k : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(k, v + bump(m, k))
+    #|    None => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn effect_if(m : Map[String, Int], k : String) -> Unit {
+    #|  if m.contains(k) { m.set(k, bump(m, k)) } else { m.set(k, 2) }
+    #|}
+    #|pub fn guarded(m : Map[String, Int], k : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) if v > 3 => m.set(k, v + 1)
+    #|    _ => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn other_key(m : Map[String, Int], k : String, j : String) -> Unit {
+    #|  match m.get(k) {
+    #|    Some(v) => m.set(j, v + 1)
+    #|    None => m.set(k, 1)
+    #|  }
+    #|}
+    #|pub fn push(ch : Channel[String], s : String) -> Bool {
+    #|  ch.send(s)
+    #|}
+    #|pub fn main() -> Int {
+    #|  0
+    #|}
+  for release in [false, true] {
+    let ssa = t_w1_ssa(src, release, "amd64_sysv")
+    // Slices inside a `+` chain and immutable slice aliases feeding the next
+    // concatenation become validated spans plus one exact-size copy.
+    for name in ["cat", "alias"] {
+      let f = t_w1_fn(ssa, name)
+      assert_true(f.contains("call $pion_str_slice_data("), name + ":\n" + f)
+      assert_true(f.contains("call $pion_str_concat_spans(l 3,"), name + ":\n" + f)
+      assert_true(!f.contains("call $pion_str_slice("), name + ":\n" + f)
+    }
+    assert_true(!t_w1_fn(ssa, "plain").contains("$pion_str_concat_spans"), "plain concat keeps its lowering")
+    let sbw = t_w1_fn(ssa, "sbw")
+    // Bounds are validated at the slice site, then the builder appends the
+    // validated range of the receiver (no intermediate String).
+    let sd = t_w1_pos(sbw, "call $pion_str_slice_data(")
+    assert_true(sd >= 0 && t_w1_pos(sbw, "call $pion_strbuf_push_slice(") > sd, sbw)
+    assert_true(!sbw.contains("call $pion_str_slice("), sbw)
+    // Scalar map read-modify-write: one probe; a hit stores into the slot,
+    // only a miss inserts through pion_map_set.
+    for name in ["count", "count64", "has"] {
+      let f = t_w1_fn(ssa, name)
+      let probe = t_w1_pos(f, "call $pion_map_scalar_entry(")
+      assert_true(probe >= 0, name + ":\n" + f)
+      assert_true(t_w1_pos(f, "call $pion_map_set(") > probe, name + ":\n" + f)
+      assert_true(!f.contains("call $pion_map_try_get("), name + ":\n" + f)
+    }
+    // A sliced key is probed as a span (no whole key) and materialized only on
+    // the miss path, after the probe.
+    let c64 = t_w1_fn(ssa, "count64")
+    assert_true(!c64.contains("call $pion_str_slice("), c64)
+    assert_true(c64.contains(", l 0)"), c64)
+    assert_true(t_w1_pos(c64, "call $pion_str_from_cstr(") > t_w1_pos(c64, "call $pion_map_scalar_entry("), c64)
+    // Calls, guards and mismatched keys fall back to ordinary lookups.
+    for name in ["effect", "effect_if", "guarded", "other_key"] {
+      let f = t_w1_fn(ssa, name)
+      assert_true(!f.contains("$pion_map_scalar_entry"), name + ":\n" + f)
+      assert_true(f.contains("call $pion_map_set("), name + ":\n" + f)
+    }
+    // Native Channel[String].send relies on pion_chan_send's publication freeze.
+    let push = t_w1_fn(ssa, "push")
+    assert_true(push.contains("call $pion_chan_send("), push)
+    assert_true(!push.contains("$pion_rc_freeze"), push)
+  }
+  // Wasm32 keeps the ordinary lowering, including the String deep freeze.
+  let wasm = t_w1_ssa(src, false, "wasm32")
+  assert_true(!wasm.contains("$pion_str_concat_spans"), "wasm32 must not use spans")
+  assert_true(!wasm.contains("$pion_str_slice_data"), "wasm32 must not use slice spans")
+  assert_true(!wasm.contains("$pion_map_scalar_entry"), "wasm32 must not use scalar entries")
+  let wpush = t_w1_fn(wasm, "push")
+  assert_true(wpush.contains("call $pion_rc_freeze("), wpush)
+  assert_true(wpush.contains("$pion_chan_send("), wpush)
+}
+
+///|
+fn t_w1_pos(s : String, needle : String) -> Int {
+  p18_find_from(s, needle, 0)
+}
+
+///|
+test "qbe_w1_nested_concat_order_last_use_and_alias_scan" {
+  let src =
+    #|fn mark(n : Int) -> String {
+    #|  if n > 1000 { return mark(n - 1) }
+    #|  "!"
+    #|}
+    #|fn sink(s : String) -> Int {
+    #|  if s.length() > 1000 { return sink(s.slice(1, s.length())) }
+    #|  s.length()
+    #|}
+    #|pub fn early(a : String, x : String, y : String) -> String {
+    #|  a.slice(0, 1) + ((x + y) + mark(1))
+    #|}
+    #|pub fn deep(a : String, x : String, y : String) -> String {
+    #|  a.slice(0, 1) + (((x + y) + mark(1)) + mark(2))
+    #|}
+    #|pub fn quiet(a : String, x : String, y : String) -> String {
+    #|  a.slice(0, 1) + (x + (y + "!"))
+    #|}
+    #|pub fn group(a : String, x : String, y : String, done : Bool) -> String {
+    #|  (a + (x + y)) + (if done { return "early" } else { "!" })
+    #|}
+    #|pub fn sgroup(a : String, x : String, y : String, done : Bool) -> String {
+    #|  (a.slice(0, 1) + (x + y)) + (if done { return "early" } else { "!" })
+    #|}
+    #|pub fn bgroup(a : String, x : String, y : String, done : Bool) -> String {
+    #|  let s = a.slice(0, 1)
+    #|  let r = (s + (x + y)) + (if done { return "early" } else { "!" })
+    #|  r
+    #|}
+    #|pub fn bearly(a : String, x : String, y : String) -> String {
+    #|  let s = a.slice(0, 1)
+    #|  let r = s + ((x + y) + mark(1))
+    #|  r
+    #|}
+    #|pub fn tail(arg : String) -> Int {
+    #|  let source = "x" + arg
+    #|  let a = source.slice(0, 1)
+    #|  let r = a + "!"
+    #|  let n = sink(r)
+    #|  n + sink("tail")
+    #|}
+    #|pub fn main() -> Int {
+    #|  0
+    #|}
+  for release in [false, true] {
+    let ssa = t_w1_ssa(src, release, "amd64_sysv")
+    // A nested `+` followed by a call keeps its own concatenation (and its
+    // length check) before the call.
+    for name in ["early", "deep", "bearly"] {
+      let f = t_w1_fn(ssa, name)
+      let c = t_w1_pos(f, "call $pion_str_concat(")
+      let m = t_w1_pos(f, "call $pion_fn_mark(")
+      assert_true(c >= 0 && m > c, name + ":\n" + f)
+      assert_true(f.contains("call $pion_str_concat_spans("), name + ":\n" + f)
+      assert_true(!f.contains("$pion_str_concat_n("), name + ":\n" + f)
+    }
+    // Chains without slices keep the ordinary full flattening: one
+    // pion_str_concat_n after the early-return branch, no pion_str_concat(x, y).
+    let gr = t_w1_fn(ssa, "group")
+    let cn = t_w1_pos(gr, "call $pion_str_concat_n(l 4,")
+    assert_true(cn >= 0 && t_w1_pos(gr, "jnz ") >= 0 && t_w1_pos(gr, "jnz ") < cn, gr)
+    assert_true(!gr.contains("call $pion_str_concat("), gr)
+    assert_true(!gr.contains("$pion_str_concat_spans"), gr)
+    // A slice chain uses exactly the ordinary grouping: a full flattening when
+    // the left operand is a `+` (all operands, then one length check, after the
+    // early-return branch), else [lhs, rhs] with a nested rhs concatenated first.
+    for name in ["sgroup", "bgroup"] {
+      let f = t_w1_fn(ssa, name)
+      let sp = t_w1_pos(f, "call $pion_str_concat_spans(l 4,")
+      assert_true(sp >= 0 && t_w1_pos(f, "jnz ") >= 0 && t_w1_pos(f, "jnz ") < sp, name + ":\n" + f)
+      assert_true(!f.contains("call $pion_str_concat("), name + ":\n" + f)
+    }
+    let q = t_w1_fn(ssa, "quiet")
+    let qc = t_w1_pos(q, "call $pion_str_concat(")
+    assert_true(qc >= 0 && t_w1_pos(q, "call $pion_str_concat_spans(l 2,") > qc, q)
+    // Fused alias runs keep last-use release: `source` after the span copy and
+    // before sink(r), `r` between the two sink calls.
+    let t = t_w1_fn(ssa, "tail")
+    let spans = t_w1_pos(t, "call $pion_str_concat_spans(")
+    let s1 = t_w1_pos(t, "call $pion_fn_sink(")
+    let s2 = p18_find_from(t, "call $pion_fn_sink(", s1 + 1)
+    assert_true(spans >= 0 && s1 > spans && s2 > s1, t)
+    assert_true(slice_str(t, spans, s1).contains("call $pion_rc_dec("), t)
+    assert_true(slice_str(t, s1, s2).contains("call $pion_rc_dec("), t)
+  }
+  // A long run of slice lets without a concatenation target compiles once per
+  // statement (linear scan) and still emits ordinary slices.
+  let sb = StringBuilder()
+  sb.write_string("pub fn f(s : String) -> Int {\n")
+  let mut i = 0
+  while i < 40 {
+    sb.write_string("  let p" + i.to_string() + " = s.slice(0, 1)\n")
+    i = i + 1
+  }
+  sb.write_string("  let r = p38 + p39\n  r.length() + s.length()\n}\npub fn main() -> Int {\n  0\n}\n")
+  let long = t_w1_fn(t_w1_ssa(sb.to_string(), false, "amd64_sysv"), "f")
+  // p38, p39 fuse into the concatenation; the earlier 38 slices allocate.
+  assert_true(long.contains("call $pion_str_concat_spans(l 2,"), long)
+  let mut count = 0
+  let mut at = p18_find_from(long, "call $pion_str_slice(", 0)
+  while at >= 0 {
+    count = count + 1
+    at = p18_find_from(long, "call $pion_str_slice(", at + 1)
+  }
+  assert_eq(count, 38)
+}

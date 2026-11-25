@@ -203,6 +203,20 @@ void     pion_arr_sort_str(void *a);
 void*    pion_map_new(int32_t val_is_obj);
 void*    pion_map_new_int(int32_t val_is_obj);
 int64_t  pion_map_len(void *m);
+/* Keep one copy of shared fast-path primitives in size-optimized builds.
+ * Speed builds retain the optimizer's original inlining policy. */
+#if defined(__OPTIMIZE_SIZE__) && !defined(__clang__)
+#define PION_SIZE_SHARED PION_NOINLINE
+#define PION_SIZE_EQ PION_NOINLINE
+#else
+#define PION_SIZE_SHARED inline
+#define PION_SIZE_EQ inline __attribute__((always_inline))
+#endif
+
+typedef struct PionStrSpan { const char *data; int64_t len; } PionStrSpan;
+const char *pion_str_slice_data(const PionString *s, int64_t lo, int64_t hi);
+void *pion_str_concat_spans(int64_t count, const PionStrSpan *parts);
+int64_t *pion_map_scalar_entry(PionMap *m, const char *data, int64_t len, PionString *whole);
 void     pion_map_set(void *m, void *key_str, int64_t val);
 int32_t  pion_map_has(void *m, void *key_str);
 int64_t  pion_map_get(void *m, void *key_str);

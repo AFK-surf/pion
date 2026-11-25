@@ -405,6 +405,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `int64_t pion_str_len(void *s);`
 - `int32_t pion_str_byte_at(void *s, int64_t idx);`
 - `void*   pion_str_concat(void *a, void *b);`
+- Native lowering may validate a borrowed byte span with `pion_str_slice_data(s, lo, hi)` at the original slice site. The slice panic and source evaluation order are preserved. `pion_str_concat_spans(count, parts)` consumes an array of native `{data, int64_t len}` pairs, checks aggregate length and copies to a fresh NUL-terminated String. `sb.write_string(s.slice(lo, hi))` validates the same way and then appends with `pion_strbuf_push_slice(sb, s, lo, hi)`, whose clamping cannot apply to validated bounds. All source owners live through the copy.
 - `void*   pion_str_concat_n(int64_t n, void **parts);` (single-allocation N-way string concatenation; reads only `len` and the first `len` payload bytes of each part, never changes a part's reference count and always returns a fresh string, so native codegen may pass caller-stack pseudo strings: 3..8 part chains format built-in `Int`/`Int64` `.to_string()` parts with `pion_strbuf_push_int` into such stack slots)
 - `int32_t pion_str_eq(void *a, void *b);`
 - `int32_t pion_str_cmp(void *a, void *b);`
@@ -482,6 +483,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `int64_t pion_map_get(void *m, void *key_str);` (panics if missing; compiler pairs with `has` or returns Option)
 - `void    pion_map_remove(void *m, void *key_str);`
 - `void*   pion_map_copy(void *m);`
+- Native `int64_t *pion_map_scalar_entry(map, data, len, whole)` probes a String-keyed scalar map (`Map[String, Int|Int64]`) without inserting. The key is the String `whole` (non-null; also matched by identity) or, with `whole == NULL`, the validated non-null byte span `(data, len)`. It returns a borrowed pointer to the value slot of a present key, which native code overwrites in place, or `NULL`; on `NULL` native code evaluates the value and inserts with `pion_map_set`, materializing a span key with `pion_str_from_cstr` only then. The stored key of a hit is the `key` field of the slot's `PionMapEntry` (16 bytes before the slot). The slot must not outlive the map or span any other operation on it.
 - `void*   pion_map_keys(void *m);` (returns `PionArray` of `PionString*`)
 
 **Concurrency (`pthread` backed, race-free):**
