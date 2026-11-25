@@ -21,6 +21,7 @@ import PionProofs.QbeFrontendSpeedOpts
 import PionProofs.QbeArm64AddrOpts
 import PionProofs.QbeInlineRcSpeedOpts
 import PionProofs.QbeParallelRcSpeedOpts
+import PionProofs.QbeRuntimeOpts3
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -615,3 +616,12 @@ import PionProofs.QbeParallelRcSpeedOpts
 #print axioms PionQbeParallelRcSpeedOpts.Chunks.acceptedCut
 #print axioms PionQbeParallelRcSpeedOpts.Chunks.lexicalRestart
 #print axioms PionQbeParallelRcSpeedOpts.Chunks.orderedConcat
+#print axioms PionQbeRuntimeOpts3.BoundedFormat.signedWidth
+#print axioms PionQbeRuntimeOpts3.BoundedFormat.widen
+#print axioms PionQbeRuntimeOpts3.BoundedFormat.appends
+#print axioms PionQbeRuntimeOpts3.BoundedFormat.capacity
+#print axioms PionQbeRuntimeOpts3.BoundedFormat.copyExact
+#print axioms PionQbeRuntimeOpts3.ExactSchedule.independent
+#print axioms PionQbeRuntimeOpts3.ExactSchedule.slide
+#print axioms PionQbeRuntimeOpts3.ExactSchedule.schedule
+#print axioms PionQbeRuntimeOpts3.ExactSchedule.fitsSignificand

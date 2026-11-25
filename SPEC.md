@@ -367,7 +367,7 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
 - `double  pion_math_pow(double x, double y);` (compiler builtin `math_pow`)
 
 **String (`PionString`: `{ int64_t len; char data[]; }` UTF-8, NUL-terminated):**
-- `void*   pion_str_from_cstr(const char *s, int64_t len);`
+- `void*   pion_str_from_cstr(const char *s, int64_t len);` (with `len >= 0`, copies exactly `len` bytes, embedded NUL bytes included, into a fresh string; in a native hot loop, a 2..8 part `+` chain of ASCII literals of at most 8 bytes and built-in `Int`/`Int64` local `.to_string()` parts is written into one stack `PionStrBuf` reserved at function entry with `cap` = literal bytes + 20 per integer + 1, so `pion_strbuf_push_int` never grows it, and copied once with this call)
 - `int64_t pion_str_len(void *s);`
 - `int32_t pion_str_byte_at(void *s, int64_t idx);`
 - `void*   pion_str_concat(void *a, void *b);`

@@ -376,6 +376,64 @@ cheap(Ins *i)
 	}
 }
 
+/* In an unrolled loop, group independent exact i32-to-f64 conversions
+ * before consuming their results. Keep memory and floating arithmetic in
+ * source order. The small window bounds both register pressure and cost. */
+static void
+groupconverts(Blk *b)
+{
+	enum { Max = 192 };
+	Ins sorted[Max];
+	unsigned char early[Max] = {0};
+	uint n, j, a, count, dst;
+	int dk, dc;
+	Ref r;
+
+	if (b->loop <= 1 || b->nins > Max)
+		return;
+	count = 0;
+	for (n=0; n<b->nins; n++) {
+		Ins *i = &b->ins[n];
+		if (i->op == Oswtof && i->cls == Kd) {
+			early[n] = 1;
+			count++;
+		}
+		if (isstore(i->op) || i->op == Ocall)
+			return;
+		/* Only reorder virtual temporaries: a physical register may be
+		 * defined more than once, so the def search below would be unsound. */
+		if (isreg(i->to) || isreg(i->arg[0]) || isreg(i->arg[1]))
+			return;
+	}
+	if (count < 2 || count > 4)
+		return;
+	/* schedblk has placed all local definitions before their uses. */
+	for (n=b->nins; n-- > 0;) {
+		if (!early[n])
+			continue;
+		for (a=0; a<2; a++) {
+			r = b->ins[n].arg[a];
+			if (rtype(r) != RTmp)
+				continue;
+			for (j=n; j-- > 0;)
+				if (req(b->ins[j].to, r)) {
+					if (!cheap(&b->ins[j]) || iscmp(b->ins[j].op, &dk, &dc))
+						return;
+					early[j] = 1;
+					break;
+				}
+		}
+	}
+	dst = 0;
+	for (n=0; n<b->nins; n++)
+		if (early[n])
+			sorted[dst++] = b->ins[n];
+	for (n=0; n<b->nins; n++)
+		if (!early[n])
+			sorted[dst++] = b->ins[n];
+	memcpy(b->ins, sorted, dst * sizeof *sorted);
+}
+
 static void
 sinkref(Fn *fn, Blk *b, Ref *pr)
 {
@@ -453,6 +511,8 @@ gcm(Fn *fn)
 	sink(fn);
 	filluse(fn);
 	schedblk(fn);
+	for (Blk *b = fn->start; b; b = b->link)
+		groupconverts(b);
 	
 	if (debug['G']) {
 		fprintf(stderr, "\n> After GCM:\n");

@@ -392,6 +392,8 @@ sh "$ROOT_DIR/tests/e2e/p109_concat_scratch/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p110_fnval_flat_and_is_shadow/run_e2e.sh" "$PIONC2"
 # P111: AArch64 seladdr local-slot [x29, #off] folding and single-use ldur/stur [base, #-1..-256] (text asm, matrix, native / qemu, Mach-O --obj == .s byte parity).
 sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIONC2"
+# P112: native bounded integer string format in hot loops + QBE gcm groupconverts (SSA + Native + Wasm32 + ASan, -d G order, 8 x 625 C reference).
+sh "$ROOT_DIR/tests/e2e/p112_bounded_format_and_swtof_sched/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.
