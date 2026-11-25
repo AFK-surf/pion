@@ -2176,7 +2176,7 @@ with open(os.path.join(m2b_pkg, "mbt_src", "lib_test.mbt"), "w") as f:
         'fn sh_match(o : Int?) -> Int { match o { Some(limit) => limit * 2; None => limit } }\n'
         'fn sh_let() -> Int { let limit = limit + 1; limit }\n'
         'fn sh_tup() -> Int { let (limit, _) = (10, 20); limit }\n'
-        'fn sh_fn() -> Int { let f = fn(limit : Int) -> Int { limit }; let g = (limit) => limit; let h = limit => limit; f(1) + g(2) + h(3) }\n'
+        'fn sh_fn() -> Int { let f = fn(limit : Int) -> Int { limit }; let g : (Int) -> Int = (limit) => limit; let h : (Int) -> Int = limit => limit; f(1) + g(2) + h(3) }\n'
         'fn sh_for() -> Int { let mut s = 0; for limit in [1, 2] { s = s + limit }; s + limit }\n'
         'fn sh_if(o : Int?) -> Int { if o is Some(limit) && limit > 0 { limit } else { limit } }\n'
         'test "bb_priv_iso" {\n'

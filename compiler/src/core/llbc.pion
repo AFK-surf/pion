@@ -1370,6 +1370,18 @@ fn lb_const_item(b : LB, q : String, n : String) -> Option[LExpr] {
       None => q
     }
   }
+  lb_const_item_canon(b, pkg, n)
+}
+
+///|
+/// A reference to a top-level constant whose package name is already canonical
+/// (e.g. from `pat_const:` or `@canon:`), bypassing `resolve_alias_pkg`.
+fn lb_const_item_canon(b : LB, canon_pkg : String, n : String) -> Option[LExpr] {
+  let pkg = if canon_pkg.length() == 0 {
+    b.pkg
+  } else {
+    canon_pkg
+  }
   match lg_tc(b.g, pkg) {
     Some(tc) =>
       match tc.consts.get(n) {
@@ -1502,6 +1514,9 @@ fn lb_apply_binop(b : LB, op : String, lv : LExpr, rv : LExpr, rty : Ty, sp : Sp
 
 ///|
 fn lb_binary(b : LB, op : String, l : Expr, r : Expr, e : Expr, sp : Span) -> LExpr {
+  if op == "&&" && l_cond_has_is(l) {
+    return lb_cond_branch(b, l, LCExpr(r), LCValue(l_bool(false)), TBool)
+  }
   if op == "&&" || op == "||" {
     let lv = lb_expr(b, l)
     lb_open(b)
@@ -3194,6 +3209,9 @@ enum LCode {
   LCDiverge(Array[Stmt])
   /// A loop body: its statements, then the loop's `continue` prelude.
   LCLoopBody(Array[Stmt])
+  /// Wraps a match arm body's value in `Some(v)` (or `true` for `Unit`) for
+  /// guard-with-`is` dispatch without duplicating the fallback `rest`.
+  LCWrapSome(LCode, Ty)
 }
 
 ///|
@@ -3244,6 +3262,26 @@ fn lb_code_block(b : LB, code : LCode, ty : Ty) -> LBlock {
       let _ = lb_stmts(b, ss, 0, false)
       lb_emit_prelude(b)
       None
+    }
+    LCWrapSome(inner, inner_ty) => {
+      let inner_want = l_wants_value(inner_ty)
+      let inner_blk = lb_code_block(b, inner, inner_ty)
+      let mut si = 0
+      while si < inner_blk.stmts.length() {
+        lb_emit(b, inner_blk.stmts[si])
+        si = si + 1
+      }
+      if inner_want {
+        match inner_blk.tail {
+          Some(v) => Some(LCtor("Option", "Some", [v], ty))
+          None => None
+        }
+      } else if inner_blk.stmts.length() > 0 &&
+        l_stmt_diverges(inner_blk.stmts[inner_blk.stmts.length() - 1]) {
+        None
+      } else {
+        Some(l_bool(true))
+      }
     }
   }
   lb_pop_scope(b)
@@ -3416,7 +3454,37 @@ fn lb_pat_into(b : LB, p : Pattern, st : Ty, checks : Array[LExpr]) -> LPat {
       checks.push(LBin("==", LVar(v, st), lit, st))
       LPVar(v, st)
     }
-    PVariant(_, vname, subs, sp) =>
+    PVariant(pat_enum, vname, subs, explicit_ctor, sp) => {
+      match b.tc.resolved_method_calls.get("pat_const:" + span_key(sp)) {
+        Some(ckey) => {
+          let (cq, cn) = if has_qual_sep(ckey) {
+            let qp = split_qual_name(ckey)
+            (qp.prefix, qp.name)
+          } else {
+            ("", ckey)
+          }
+          match lb_const_item_canon(b, cq, cn) {
+            Some(ce) => {
+              let v = lb_temp(b, st)
+              checks.push(LBin("==", LVar(v, st), ce, st))
+              return LPVar(v, st)
+            }
+            None => ()
+          }
+        }
+        None => ()
+      }
+      if !explicit_ctor && subs.length() == 0 && starts_with_str(pat_enum, "@canon:") {
+        let cq = slice_str(pat_enum, 7, pat_enum.length())
+        match lb_const_item_canon(b, cq, vname) {
+          Some(ce) => {
+            let v = lb_temp(b, st)
+            checks.push(LBin("==", LVar(v, st), ce, st))
+            return LPVar(v, st)
+          }
+          None => ()
+        }
+      }
       match lb_variant_tys(b, st, vname) {
         Some((ek, tys)) => {
           let out : Array[LPat] = []
@@ -3438,6 +3506,7 @@ fn lb_pat_into(b : LB, p : Pattern, st : Ty, checks : Array[LExpr]) -> LPat {
           LPWild
         }
       }
+    }
     PTuple(subs, _) => {
       let tys = match st {
         TTuple(es) => es
@@ -3459,7 +3528,20 @@ fn lb_pat_into(b : LB, p : Pattern, st : Ty, checks : Array[LExpr]) -> LPat {
 fn l_pat_simple(p : Pattern) -> Bool {
   match p {
     PInt(_, _) | PString(_, _) | PChar(_, _) => false
-    PVariant(_, _, subs, _) | PTuple(subs, _) => {
+    PVariant(_, _, subs, explicit_ctor, _) => {
+      if !explicit_ctor && subs.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < subs.length() {
+        if !l_pat_simple(subs[i]) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    PTuple(subs, _) => {
       let mut i = 0
       while i < subs.length() {
         if !l_pat_simple(subs[i]) {
@@ -3566,30 +3648,43 @@ fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, d
       _ => ()
     }
   }
-  let body = lb_code_block(b, arm.code, ty)
-  let has_cond = checks.length() > 0 || (match arm.guard_e { Some(_) => true; None => false })
+  let has_guard = match arm.guard_e { Some(_) => true; None => false }
+  let has_cond = checks.length() > 0 || has_guard
   if irref {
     match arm.guard_e {
-      Some(gx) =>
-        if checks.length() > 0 {
-          // Compute `gcond = if checks { gx } else { false }` so `rest` is emitted
-          // once (no exponential blowup) and `gx` never runs when `checks` fail.
-          let gcond = lb_temp(b, TBool)
+      Some(gx) => {
+        // Lower the guard via `lb_cond_branch` with `LCWrapSome(arm.code, ty)` so
+        // `arm.code` sees any `is`-pattern bindings introduced by `gx`, while
+        // `rest` is still emitted exactly once outside `lb_cond_branch`.
+        let res_ty = if want { TOption(ty) } else { TBool }
+        let miss_val = if want { LCtor("Option", "None", [], res_ty) } else { l_bool(false) }
+        let mres = if checks.length() > 0 {
+          let mtmp = lb_temp(b, res_ty)
           lb_open(b)
-          let gv = lb_expr(b, gx)
+          let gv = lb_cond_branch(b, gx, LCWrapSome(arm.code, ty), LCValue(miss_val), res_ty)
           let gblk = lb_close(b, Some(gv))
-          lb_emit(b, LSIf(l_and_all(checks), gblk, LBlock::{ stmts: [], tail: Some(l_bool(false)) }, gcond, TBool))
-          lb_emit(b, LSIf(LVar(gcond, TBool), body, rest, dest, ty))
+          lb_emit(b, LSIf(l_and_all(checks), gblk, LBlock::{ stmts: [], tail: Some(miss_val) }, mtmp, res_ty))
+          LVar(mtmp, res_ty)
         } else {
-          let gv = lb_expr(b, gx)
-          lb_emit(b, LSIf(gv, body, rest, dest, ty))
+          lb_cond_branch(b, gx, LCWrapSome(arm.code, ty), LCValue(miss_val), res_ty)
         }
-      None =>
+        if want {
+          let mv = lb_temp(b, ty)
+          let some_arm = LArm::{ pat: LPCtor("Option", "Some", [LPVar(mv, ty)]), body: LBlock::{ stmts: [], tail: Some(LVar(mv, ty)) } }
+          let none_arm = LArm::{ pat: LPCtor("Option", "None", []), body: rest }
+          lb_emit(b, LSMatch(mres, res_ty, [some_arm, none_arm], dest, ty))
+        } else {
+          lb_emit(b, LSIf(mres, LBlock::{ stmts: [], tail: None }, rest, "", TUnit))
+        }
+      }
+      None => {
+        let body = lb_code_block(b, arm.code, ty)
         if checks.length() > 0 {
           lb_emit(b, LSIf(l_and_all(checks), body, rest, dest, ty))
         } else {
           l_inline_block(b, body, dest, ty)
         }
+      }
     }
     let pre = lb_close(b, None)
     lb_pop_scope(b)
@@ -3597,6 +3692,7 @@ fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, d
     return
   }
   if !has_cond {
+    let body = lb_code_block(b, arm.code, ty)
     let arm_block0 = lb_close(b, None)
     lb_pop_scope(b)
     let arm_block = l_concat_block(arm_block0.stmts, body)
@@ -3606,38 +3702,41 @@ fn lb_match_arms(b : LB, sv : LExpr, st : Ty, arms : Array[LMArm], from : Int, d
   // Refutable pattern + checks/guard: evaluate arm to `Option[ty]` (or `Bool`
   // when `Unit`), then dispatch to `rest` exactly once (no exponential blowup).
   let res_ty = if want { TOption(ty) } else { TBool }
-  let inner_dest = lb_temp(b, res_ty)
-  let matched_tail : Option[LExpr] = if want {
-    match body.tail {
-      Some(v) => Some(LCtor("Option", "Some", [v], res_ty))
-      None => None
-    }
-  } else if body.stmts.length() > 0 && l_stmt_diverges(body.stmts[body.stmts.length() - 1]) {
-    None
-  } else {
-    Some(l_bool(true))
-  }
-  let matched_blk = LBlock::{ stmts: body.stmts, tail: matched_tail }
   let miss_val = if want { LCtor("Option", "None", [], res_ty) } else { l_bool(false) }
   let miss_blk = LBlock::{ stmts: [], tail: Some(miss_val) }
-  match arm.guard_e {
+  let inner_val : LExpr = match arm.guard_e {
     Some(gx) =>
       if checks.length() > 0 {
-        let gcond = lb_temp(b, TBool)
+        let inner_dest = lb_temp(b, res_ty)
         lb_open(b)
-        let gv = lb_expr(b, gx)
+        let gv = lb_cond_branch(b, gx, LCWrapSome(arm.code, ty), LCValue(miss_val), res_ty)
         let gblk = lb_close(b, Some(gv))
-        lb_emit(b, LSIf(l_and_all(checks), gblk, LBlock::{ stmts: [], tail: Some(l_bool(false)) }, gcond, TBool))
-        lb_emit(b, LSIf(LVar(gcond, TBool), matched_blk, miss_blk, inner_dest, res_ty))
+        lb_emit(b, LSIf(l_and_all(checks), gblk, miss_blk, inner_dest, res_ty))
+        LVar(inner_dest, res_ty)
       } else {
-        let gv = lb_expr(b, gx)
-        lb_emit(b, LSIf(gv, matched_blk, miss_blk, inner_dest, res_ty))
+        lb_cond_branch(b, gx, LCWrapSome(arm.code, ty), LCValue(miss_val), res_ty)
       }
-    None => lb_emit(b, LSIf(l_and_all(checks), matched_blk, miss_blk, inner_dest, res_ty))
+    None => {
+      let body = lb_code_block(b, arm.code, ty)
+      let inner_dest = lb_temp(b, res_ty)
+      let matched_tail : Option[LExpr] = if want {
+        match body.tail {
+          Some(v) => Some(LCtor("Option", "Some", [v], res_ty))
+          None => None
+        }
+      } else if body.stmts.length() > 0 && l_stmt_diverges(body.stmts[body.stmts.length() - 1]) {
+        None
+      } else {
+        Some(l_bool(true))
+      }
+      let matched_blk = LBlock::{ stmts: body.stmts, tail: matched_tail }
+      lb_emit(b, LSIf(l_and_all(checks), matched_blk, miss_blk, inner_dest, res_ty))
+      LVar(inner_dest, res_ty)
+    }
   }
   let arm_block0 = lb_close(b, None)
   lb_pop_scope(b)
-  let arm_block = LBlock::{ stmts: arm_block0.stmts, tail: Some(LVar(inner_dest, res_ty)) }
+  let arm_block = LBlock::{ stmts: arm_block0.stmts, tail: Some(inner_val) }
   let mres = lb_temp(b, res_ty)
   lb_emit(b, LSMatch(sv, st, [LArm::{ pat: lp, body: arm_block }, LArm::{ pat: LPWild, body: miss_blk }], mres, res_ty))
   if want {
