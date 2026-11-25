@@ -75,9 +75,22 @@ pub fn render_auto_imports(content : String) -> String {
 fn prepend_headers_and_imports(
   gen_files : Array[GeneratedFile],
   opts : TranspileOptions,
+  val_probe_sites : Array[ValProbeSite],
   diags : Array[Diag],
 ) -> Array[GeneratedFile] {
   let final_files : Array[GeneratedFile] = []
+  let reg_placeholders_by_file : Map[String, Array[ValProbeSite]] = Map()
+  for vps in val_probe_sites {
+    let list = match reg_placeholders_by_file.get(vps.file) {
+      Some(xs) => xs
+      None => {
+        let xs : Array[ValProbeSite] = []
+        reg_placeholders_by_file[vps.file] = xs
+        xs
+      }
+    }
+    list.push(vps)
+  }
   for gf in gen_files {
     let hdr = render_platform_neutral_header(opts.header, gf.source_file)
     let imports = render_auto_imports(gf.content)
@@ -102,6 +115,24 @@ fn prepend_headers_and_imports(
         "probe residual found in final output of " + gf.rel_path,
       ))
     }
+    // Hard gate (Astra v2 P1-3): 100% of tool-registered `.val` placeholder sites MUST be disposed!
+    match reg_placeholders_by_file.get(gf.rel_path) {
+      Some(sites) => {
+        let live_idents = collect_ident_tokens_set(full)
+        for vps in sites {
+          if live_idents.contains(vps.placeholder_ident) {
+            diags.push(diag_error(
+              "MBT2PION_UNDISPOSED_PROBE_SITE",
+              gf.rel_path,
+              vps.line,
+              vps.col,
+              "undisposed registered `.val` placeholder `" + vps.placeholder_ident + "` (site_id=" + vps.site_id.to_string() + ") remained in final output",
+            ))
+          }
+        }
+      }
+      None => ()
+    }
     final_files.push(GeneratedFile::{
       rel_path: gf.rel_path,
       content: full,
@@ -110,6 +141,33 @@ fn prepend_headers_and_imports(
     })
   }
   final_files
+}
+
+///| Collect all `Ident` token raw names in `content` (ignoring string literals and comments,
+///| but recursing into `InterpString` `\{...}` holes) for exact registered-placeholder checking.
+fn collect_ident_tokens_set(content : String) -> Map[String, Bool] {
+  let out : Map[String, Bool] = Map()
+  let toks = lex_moonbit(content)
+  let tn = toks.length() - 1
+  let mut i = 0
+  while i < tn {
+    let t = toks[i]
+    if t.kind == TokenKind::Ident {
+      out[t.raw] = true
+    } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
+      let parts = split_interp_string(t.raw, t.kind == TokenKind::InterpMultiline)
+      for p in parts {
+        if p.is_expr {
+          let inner = collect_ident_tokens_set(p.text)
+          for k in inner.keys() {
+            out[k] = true
+          }
+        }
+      }
+    }
+    i = i + 1
+  }
+  out
 }
 
 ///| Split a comma-separated bracket list interior respecting nested `[...]` and `"..."` strings.
@@ -772,6 +830,36 @@ pub fn transpile_package_ex(
   run_probes : Bool,
   check_fn : (Array[(String, String)]) -> String,
 ) -> TranspileResult {
+  transpile_package_with_abis(
+    sources,
+    api_map,
+    recipes,
+    overlays,
+    mbti_files,
+    dep_doc_jsons,
+    [],
+    asset_bypass_rules,
+    opts,
+    pre_diags,
+    run_probes,
+    check_fn,
+  )
+}
+
+pub fn transpile_package_with_abis(
+  sources : Array[SourceFile],
+  api_map : ApiMap,
+  recipes : Recipes,
+  overlays : Array[OverlaySpec],
+  mbti_files : Array[(String, String)],
+  dep_doc_jsons : Array[String],
+  dep_abis : Array[(String, PackageAbi)],
+  asset_bypass_rules : Array[AssetBypassRule],
+  opts : TranspileOptions,
+  pre_diags : Array[Diag],
+  run_probes : Bool,
+  check_fn : (Array[(String, String)]) -> String,
+) -> TranspileResult {
   let sorted_sources = sort_source_files(sources)
   let symtab = empty_symbol_table()
   symtab_load_api_map(symtab, api_map)
@@ -780,6 +868,9 @@ pub fn transpile_package_ex(
   }
   for doc_json in dep_doc_jsons {
     symtab_load_pionc_doc_json(symtab, doc_json)
+  }
+  for dabi in dep_abis {
+    symtab_load_dep_abi(symtab, dabi.0, dabi.1)
   }
   if opts.moon_pkg_content.length() > 0 {
     parse_moon_pkg_imports(opts.moon_pkg_content, symtab.moon_import_paths)
@@ -1041,10 +1132,12 @@ pub fn transpile_package_ex(
   // Test files' top-level `let`/`fn init` are strictly isolated into `00_init_order_test.pion`
   // so `--with-tests` NEVER pollutes production `00_init_order.pion`.
   let init_files : Array[GeneratedFile] = []
+  let init_origins_by_file : Map[String, Array[InitOriginRecord]] = Map()
   if ctx.init_items.length() > 0 {
     let sorted_inits = topo_sort_init_items(ctx.init_items, ctx.fn_bodies, ctx.diags)
     if sorted_inits.length() > 0 {
-      let init_body = render_init_order_file(sorted_inits)
+      let (init_body, init_recs) = render_init_order_file_with_origins(sorted_inits)
+      init_origins_by_file["00_init_order.pion"] = init_recs
       init_files.push(GeneratedFile::{
         rel_path: "00_init_order.pion",
         content: init_body,
@@ -1056,7 +1149,8 @@ pub fn transpile_package_ex(
   if ctx.test_init_items.length() > 0 {
     let sorted_test_inits = topo_sort_init_items(ctx.test_init_items, ctx.fn_bodies, ctx.diags)
     if sorted_test_inits.length() > 0 {
-      let test_init_body = render_init_order_file(sorted_test_inits)
+      let (test_init_body, test_init_recs) = render_init_order_file_with_origins(sorted_test_inits)
+      init_origins_by_file["00_init_order_test.pion"] = test_init_recs
       init_files.push(GeneratedFile::{
         rel_path: "00_init_order_test.pion",
         content: test_init_body,
@@ -1107,11 +1201,26 @@ pub fn transpile_package_ex(
     let (pre_files, pre_it, _) = run_stage_b(gen_files, api_map, check_fn, ctx.diags, ctx.drift_ledger)
     gen_files = pre_files
     pre_b_iters = pre_it
-    let (a5_files, pr, pi, pres) = run_stage_a5_ex(
+    let combined_val_fields : Map[String, String] = Map()
+    for k in ctx.struct_val_fields.keys() {
+      match ctx.struct_val_fields.get(k) {
+        Some(v) => combined_val_fields[k] = v
+        None => ()
+      }
+    }
+    for k in symtab.dep_struct_val_fields.keys() {
+      match symtab.dep_struct_val_fields.get(k) {
+        Some(v) => combined_val_fields[k] = v
+        None => ()
+      }
+    }
+    let (a5_files, pr, pi, pres) = run_stage_a5_with_val_sites_and_origins(
       gen_files,
       recipes,
       api_map,
-      ctx.struct_val_fields,
+      combined_val_fields,
+      ctx.val_probe_sites,
+      init_origins_by_file,
       check_fn,
       ctx.diags,
       ctx.drift_ledger,
@@ -1133,8 +1242,32 @@ pub fn transpile_package_ex(
   let stage_b_iters = pre_b_iters + post_b_iters
   gen_files = b_files
 
+  // Build deterministic PackageAbi and embed `// abi-sha256: <hex>` in every emitted `.pion` header!
+  let pkg_abi = PackageAbi::{
+    package_name: ctx.self_pkg_name,
+    enums: ctx.exported_abi_enums,
+    struct_val_fields: ctx.exported_abi_struct_vals,
+  }
+  let abi_sha = compute_abi_payload_sha256(pkg_abi)
+  let opts_with_abi = TranspileOptions::{
+    target: opts.target,
+    mode: opts.mode,
+    with_tests: opts.with_tests,
+    src_prefix: opts.src_prefix,
+    moon_pkg_content: opts.moon_pkg_content,
+    header: HeaderMeta::{
+      mbt2pion_commit: opts.header.mbt2pion_commit,
+      toolchain_lock: opts.header.toolchain_lock,
+      source_commit: opts.header.source_commit,
+      api_map_sha256: opts.header.api_map_sha256,
+      recipes_sha256: opts.header.recipes_sha256,
+      abi_sha256: abi_sha,
+      target: opts.header.target,
+    },
+  }
+
   // Prepend platform-neutral headers + auto-emitted `import "<pkg>"` block to every generated file
-  let final_files = prepend_headers_and_imports(gen_files, opts, ctx.diags)
+  let final_files = prepend_headers_and_imports(gen_files, opts_with_abi, ctx.val_probe_sites, ctx.diags)
 
   // Count blockers: any error diagnostic or unresolved drift entry
   let mut blockers = 0
@@ -1181,5 +1314,7 @@ pub fn transpile_package_ex(
     probes_resolved: probes_resolved,
     stage_b_iterations: stage_b_iters,
     blockers: blockers,
+    abi: pkg_abi,
+    abi_sha256: abi_sha,
   }
 }

@@ -73,9 +73,9 @@ CASES = {
     "collections": ("ok", 3),
     "opt.unwrap_none": ("panic:abort", 0),
     "arr.remove_oob": ("panic:abort", 0),
-    "wave_m2.compat": ("ok", 8),
-    "wave_m2.round2": ("ok", 5),
-    "wave_m2b.parse": ("ok", 12),
+    "compat.basics": ("ok", 8),
+    "compat.round2": ("ok", 5),
+    "compat.parse_numbers": ("ok", 12),
 }
 for _t in DIV_TYPES:
     for _src in ("rt", "const"):

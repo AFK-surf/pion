@@ -101,9 +101,10 @@ CASES = {
     "m12_pipe_loops_compat": ("ok", 10),
     "q2_semantics_p0": ("ok", 13),
     "q2_mechanical_compat": ("ok", 10),
-    "wave_m2_core": ("ok", 7),
-    "wave_m2_round2": ("ok", 8),
-    "wave_m2b_mid_tier": ("ok", 14),
+    "transpile_core": ("ok", 7),
+    "transpile_round2": ("ok", 8),
+    "transpile_mid_tier": ("ok", 14),
+    "transpile_upper_tier": ("ok", 34),
 }
 
 MOON_TRAPS = {
@@ -1404,6 +1405,459 @@ pub fn m2b_p1_views_map_and_hash() -> (String, Int, Int, Int, Int, Int, Bool) {
   let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2) && hf1 == -1445830834 && hf_pos0 == 148298089 && hf_neg0 == 148298089 && fneg_bits == 0x80000000U && fhex_pos == 0x3fc00000U && fhex_sub == 1U && fhex_neg == 0xbfc00000U && fhex_m1 == 0x3f800000U && fhex_m2 == 0x3f800002U && fhex_m3 == 0x00000000U && fhex_m4 == 0x3f800000U && fhex_m5 == 0x3f800002U && hex_int == 255
   (vs, m.get(0).unwrap_or(-1), m.get(1).unwrap_or(-1), gj, hs, he, h_ok)
 }
+
+// Upper-tier transpile differential suite (§1-§7 + codec helpers)
+pub(all) struct UtValBox {
+  mut val : Int
+}
+
+pub fn UtValBox::val(self : UtValBox, d : Int) -> Int {
+  self.val + d
+}
+
+pub fn ut_val_and_compound() -> (Int, Int, Int, Int) {
+  let r : Ref[Int] = Ref::new(10)
+  r.val += 5
+  let mut calls = 0
+  let b = UtValBox::{ val: 20 }
+  let get_box = fn() -> UtValBox {
+    calls = calls + 1
+    b
+  }
+  get_box().val += 7
+  let m = b.val(3)
+  (r.val, b.val, calls, m)
+}
+
+pub fn ut_slices_and_sb() -> (Int, String, String) {
+  let bs : Array[Byte] = [b'a', b'b', b'c', b'd']
+  let sub_b = Bytes::from_array(bs[1:3])
+  let cs : Array[Char] = ['x', 'y', 'z', 'w']
+  let sub_s = String::from_array(cs[1:3])
+  let sb = StringBuilder::new(size_hint=16)
+  sb.write_string("ok:")
+  sb.write_string(sub_s)
+  (sub_b.length(), sub_s, sb.to_string())
+}
+
+pub fn ut_array_add_chain() -> Array[Int] {
+  let a = [1, 2]
+  let b = [3]
+  let c = [4, 5]
+  a +
+    b +
+    c
+}
+
+pub fn ut_json_literals() -> (String, Bool, Bool, Bool) {
+  let j : Json = {
+    "neg0": -0,
+    "big": 9007199254740993,
+    "hex_a": 0xA,
+    "hex_aa": 0xAA,
+    "hex_10": 0x10,
+    "neg_hex": -0x10,
+    "u64_max": 0xFFFFFFFFFFFFFFFF,
+    "nested": { "arr": [0xA, 0x10, -0x10, 0xFFFFFFFFFFFFFFFF] },
+    "flt": 0.12345678901234567,
+    "arr": [true, false, null, "hi"],
+    "empty": {},
+  }
+  let j_neg0 : Json = -0
+  let j_pos0 : Json = 0
+  let j2 : Json = {
+    "neg0": -0,
+    "big": 9007199254740993,
+    "hex_a": 0xA,
+    "hex_aa": 0xAA,
+    "hex_10": 0x10,
+    "neg_hex": -0x10,
+    "u64_max": 0xFFFFFFFFFFFFFFFF,
+    "nested": { "arr": [0xA, 0x10, -0x10, 0xFFFFFFFFFFFFFFFF] },
+    "flt": 0.12345678901234567,
+    "arr": [true, false, null, "hi"],
+    "empty": {},
+  }
+  let eq_same = j == j2
+  let neg0_sign = match j_neg0 {
+    Number(d, ..) => d.reinterpret_as_uint64() == 0x8000000000000000UL
+    _ => false
+  }
+  let j_hex_aa : Json = 0xAA
+  let j_hex_10 : Json = 0x10
+  let j_neg_hex : Json = -0x10
+  let j_u64_max : Json = 0xFFFFFFFFFFFFFFFF
+  let j_flt : Json = 0.12345678901234567
+  let j_match : Json = match 1 {
+    1 => "a"
+    _ => "b"
+  }
+  let hex_ok = match (j_hex_aa, j_hex_10, j_neg_hex, j_u64_max, j_flt, j_match) {
+    (Number(a, ..), Number(b, ..), Number(nh, ..), Number(um, ..), Number(c, ..), String(ms)) =>
+      a == 170.0 && b == 16.0 && nh == -16.0 &&
+      um.reinterpret_as_uint64() == 0x43F0000000000000UL &&
+      c.reinterpret_as_uint64() == (0.12345678901234567).reinterpret_as_uint64() &&
+      ms == "a"
+    _ => false
+  }
+  let _ = j_pos0
+  (j.stringify(), eq_same, neg0_sign, hex_ok)
+}
+
+#derive(Eq, Hash)
+pub(all) struct UtTag {
+  id : Int
+  name : String
+}
+
+pub fn[K : Hash + Eq] ut_set_has(s : Set[K], k1 : K, k2 : K, k3 : K) -> (Bool, Int) {
+  let ok = s.contains(k1) && k1 == k2 && k1 != k3
+  (ok, Hash::hash(k1))
+}
+
+pub fn ut_fixed_arr_guard_mut() -> (Int, Int) {
+  let a = [1]
+  let r = match a {
+    [x] if { a[0] = 9; false } => 0
+    [x] => x
+    _ => -1
+  }
+  (r, a[0])
+}
+
+pub fn ut_set_and_arr_helpers() -> (Int, Int, Bool, Int, Int) {
+  let s : Set[Int] = Set::from_array([1, 2, 3])
+  let mut iter_sum = 0
+  for x in s {
+    if x == 1 {
+      s.remove(3)
+      s.add(4)
+    }
+    iter_sum = iter_sum * 10 + x
+  }
+  let ts : Set[UtTag] = Set::new()
+  let t1 = UtTag::{ id: 1, name: "a" }
+  let t2 = UtTag::{ id: 1, name: "a" }
+  let t3 = UtTag::{ id: 1, name: "b" }
+  ts.add(t1)
+  ts.add(t2)
+  let (has_tag, th) = ut_set_has(ts, t1, t2, t3)
+  let _ = th
+  let xs = [1, 2, 3, 4, 5]
+  xs.retain(fn(v) { v % 2 == 1 })
+  let ys = xs.filter_map(fn(v) { if v > 1 { Option::Some(v * 10) } else { Option::None } })
+  (iter_sum, ts.length(), has_tag, xs.length(), ys[0] + ys[1])
+}
+
+pub(all) enum UtLabeled {
+  Rect(top~ : Int, bottom~ : Int, left~ : Int)
+}
+
+pub fn ut_labeled_enum(a : Int, b : Int) -> (Int, Int) {
+  let left = a + 1
+  let r = UtLabeled::Rect(left~, bottom=b * 2, top=a)
+  let v1 = match r {
+    UtLabeled::Rect(bottom=bt, top=tp, ..) => tp * 100 + bt
+  }
+  let v2 = match r {
+    UtLabeled::Rect(left~, top=_, bottom=_) => left
+  }
+  (v1, v2)
+}
+
+pub(all) struct UtInner(Int, String)
+pub(all) struct UtOuter(UtInner, Int)
+
+#derive(Eq)
+pub(all) struct UtNestedTup {
+  pair : ((Int, String), (Int, String))
+}
+
+pub fn ut_misc_syntax() -> (Int, String, Bool, Int, Bool) {
+  let mut sum = 0
+  for i in 0..<=4 {
+    sum = sum + i
+  }
+  let emoji = "\uD83D\uDE00"
+  let esc = "\\uD800"
+  let interp = "e:\uD83D\uDE00:\{sum}"
+  let w = UtOuter(UtInner(7, "ok"), 9)
+  let UtOuter(UtInner(p, _), n) = w
+  let t1 = UtNestedTup::{ pair: ((1, "a"), (2, "b")) }
+  let t2 = UtNestedTup::{ pair: ((1, "a"), (2, "b")) }
+  let t3 = UtNestedTup::{ pair: ((1, "a"), (2, "c")) }
+  let arr = [10, 20, 30]
+  let as_sum = match arr {
+    [head, .. as tail] => {
+      arr[1] = 29
+      head + tail.length() + (tail[0] - 29)
+    }
+    _ => -1
+  }
+  (sum + p + n + as_sum, emoji + "|" + esc + "|" + interp, t1 == t2 && !(t1 == t3), emoji.length(), true)
+}
+
+// Final review 10-item oracle regressions (P0-2, P0-3, P0-4, P1-2, P1-3, P1-4)
+pub fn ut_json_hex_and_extremes() -> (Bool, Bool, Bool, Bool) {
+  let j1 : Json = 0x1.8p0
+  let j2 : Json = -0x1.8p0
+  let j3 : Json = 0x1.0p1024
+  let j4 : Json = 1.0e309
+  let j5 : Json = -1.0e309
+  let j6 : Json = 1.0e-400
+  let j7 : Json = -1.0e-400
+  let j8 : Json = 0.1
+  let j9 : Json = 1.0e25
+  let ok1 = match (j1, j2) {
+    (Number(a, ..), Number(b, ..)) => a == 1.5 && b == -1.5
+    _ => false
+  }
+  let ok2 = match (j3, j4, j5) {
+    (Number(a, ..), Number(b, ..), Number(c, ..)) =>
+      a.reinterpret_as_uint64() == 0x7FF0000000000000UL &&
+      b.reinterpret_as_uint64() == 0x7FF0000000000000UL &&
+      c.reinterpret_as_uint64() == 0xFFF0000000000000UL
+    _ => false
+  }
+  let ok3 = match (j6, j7) {
+    (Number(a, ..), Number(b, ..)) =>
+      a.reinterpret_as_uint64() == 0UL &&
+      b.reinterpret_as_uint64() == 0x8000000000000000UL
+    _ => false
+  }
+  let ok4 = match (j8, j9) {
+    (Number(a, ..), Number(b, ..)) =>
+      a.reinterpret_as_uint64() == (0.1).reinterpret_as_uint64() &&
+      b.reinterpret_as_uint64() == (1.0e25).reinterpret_as_uint64()
+    _ => false
+  }
+  (ok1, ok2, ok3, ok4)
+}
+
+pub(all) struct UtKwCollision {
+  val : Int
+  val_ : Int
+}
+
+pub fn ut_kw_collision_score(val~ : Int, val_~ : Int) -> Int {
+  val * 10 + val_
+}
+
+pub fn ut_kw_collision_demo() -> (Int, Int) {
+  let k = UtKwCollision::{ val: 1, val_: 9 }
+  let r1 = match k {
+    { val, val_, .. } => val * 10 + val_
+  }
+  let r2 = ut_kw_collision_score(val=1, val_=9)
+  (r1, r2)
+}
+
+pub fn ut_tup_arr_and_set_ctor() -> (Int, Int, Int) {
+  let r1 = match ([10, 2], true) {
+    ([_, _] as fs, _) => fs[1]
+    _ => -1
+  }
+  let r2 = match ([10, 2], false) {
+    ([_, _] as fs, flag) if flag => fs[0]
+    ([a, b], _) => a + b
+    _ => -1
+  }
+  let s = Set([1, 2, 2])
+  (r1, r2, s.length())
+}
+
+// Round 3 final boundary regressions (P0-A, P0-B, P2, Red-team P1-1, P1-2)
+pub let ut_g_ref : Ref[Int] = Ref(99)
+
+pub(all) struct UtShadowVal {
+  val : Int
+  v : Int
+}
+
+fn make_shadow_s() -> UtShadowVal {
+  UtShadowVal::{ val: 42, v: 0 }
+}
+
+pub fn ut_r3_val_mut_and_shadow() -> (Int, Int, Int, Int, Int) {
+  let a : Ref[Int] = Ref(1)
+  let b : Ref[Int] = Ref(7)
+  let mut r = a
+  r.val += {
+    r = b
+    10
+  }
+  let a2 : Ref[Int] = Ref(1)
+  let b2 : Ref[Int] = Ref(7)
+  let mut r2 = a2
+  r2.val = {
+    r2 = b2
+    10
+  }
+  let ut_g_ref = make_shadow_s()
+  (a.val, b.val, a2.val, b2.val, ut_g_ref.val)
+}
+
+pub(all) struct UtOptBox {
+  opt : Int?
+  tag : Int
+}
+
+pub(all) struct UtPairBox {
+  p : (Int, Int)
+}
+
+pub fn ut_r3_refutable_struct_pat() -> (Int, Int, Int, Int) {
+  let b1 = UtOptBox::{ opt: Option::Some(5), tag: 1 }
+  let b2 = UtOptBox::{ opt: Option::None, tag: 2 }
+  let r1 = match b1 {
+    { opt: Option::Some(x), .. } => x
+    { opt: Option::None, .. } => -1
+  }
+  let r2 = match b2 {
+    { opt: Option::Some(x), .. } => x
+    { opt: Option::None, .. } => -1
+  }
+  let p1 = UtPairBox::{ p: (1, 7) }
+  let p2 = UtPairBox::{ p: (2, 9) }
+  let r3 = match p1 {
+    { p: (1, x) } => x
+    _ => -1
+  }
+  let r4 = match p2 {
+    { p: (1, x) } => x
+    _ => -1
+  }
+  (r1, r2, r3, r4)
+}
+
+pub fn ut_r3_f_let_shadow(val~ : Int, val_~ : Int) -> Int {
+  let val = 99
+  val + val_
+}
+
+pub fn ut_r3_f_match_shadow(val~ : Int, val_~ : Int) -> Int {
+  match 77 {
+    val => val + val_
+  }
+}
+
+pub fn ut_r3_g_shadow(val_ : Int) -> Int {
+  let val = 99
+  val + val_
+}
+
+pub fn ut_r3_kw_patterns() -> (Int, Int, Int) {
+  let r_tup = match (1, 9) {
+    (val, val_) => val * 10 + val_
+  }
+  let r_arr = match [1, 9] {
+    [val, val_] => val * 10 + val_
+    _ => -1
+  }
+  let k = UtKwCollision::{ val: 1, val_: 9 }
+  let r_st = match k {
+    { val: val, val_: val_ } => val * 10 + val_
+  }
+  (r_tup, r_arr, r_st)
+}
+
+// Astra P0-2 & P0-3 final regressions
+pub(all) struct UtInnerItems {
+  items : Array[UtShadowVal]
+}
+
+pub(all) struct UtOuterHolder {
+  inner : UtInnerItems
+}
+
+pub(all) struct UtOtherItems {
+  items : Array[Ref[Int]]
+}
+
+fn get_ut_outer() -> UtOuterHolder {
+  UtOuterHolder::{ inner: UtInnerItems::{ items: [UtShadowVal::{ val: 1, v: 9 }] } }
+}
+
+pub fn ut_r4_nested_index_val() -> (Int, Int) {
+  let inner : UtOtherItems = UtOtherItems::{ items: [Ref(7)] }
+  let _ = inner
+  let h = get_ut_outer()
+  (h.inner.items[0].val, get_ut_outer().inner.items[0].val)
+}
+
+pub fn ut_r4_nested_kw_params(val~ : Int, val_~ : Int) -> (Int, Int, Int, Int) {
+  let f = fn(val : Int) -> Int { val * 10 + val_ }
+  let g = (val : Int) => val * 10 + val_
+  fn inner(val : Int) -> Int {
+    val * 10 + val_
+  }
+  (f(1), g(1), inner(1), val * 10 + val_)
+}
+
+// Astra Round 5 P0-2, P1-1 positive (6 cases), P1-2 custom Holder::retain
+pub(all) struct UtCallA {
+  val : Int
+}
+
+pub(all) struct UtCallB {
+  val_ : Int
+  val : Int
+}
+
+fn ut_mk_b(_v : UtCallA) -> UtCallB {
+  UtCallB::{ val_: 9, val: 1 }
+}
+
+pub fn ut_r5_call_tuple_val() -> Int {
+  let r : (UtCallA, Int) = (UtCallA::{ val: 0 }, 0)
+  ut_mk_b(r.0).val
+}
+
+pub fn ut_r5_p1_1_retain_positive() -> (Int, Int, Int) {
+  let a1 = [1, 2, 3]
+  let b1 = a1.copy()
+  a1.retain(fn(x) { b1.push(x); x > 0 })
+  let a2 = [1, 2, 3]
+  a2.retain(fn(x) {
+    let a2 = [10, 20]
+    a2.push(30)
+    x > 0 && a2.length() == 3
+  })
+  let a3 = [1, 2, 3]
+  fn size3() -> Int { a3.length() }
+  a3.retain(fn(x) { size3() == 3 && x > 0 })
+  (a1[0] * 100 + a1[1] * 10 + a1[2], a2[0] * 100 + a2[1] * 10 + a2[2], a3[0] * 100 + a3[1] * 10 + a3[2])
+}
+
+pub fn ut_r5_p1_1_fm_positive() -> (Int, Int, Int) {
+  let a1 = [1, 2, 3]
+  let b1 = a1.copy()
+  let r1 = a1.filter_map(fn(x) { b1.push(x); Option::Some(x) })
+  let a2 = [1, 2, 3]
+  let r2 = a2.filter_map(fn(x) {
+    let a2 = [10, 20]
+    a2.push(30)
+    if a2.length() == 3 { Option::Some(x) } else { Option::None }
+  })
+  let a3 = [1, 2, 3]
+  fn size3() -> Int { a3.length() }
+  let r3 = a3.filter_map(fn(x) { if size3() == 3 { Option::Some(x) } else { Option::None } })
+  (r1[0] * 100 + r1[1] * 10 + r1[2], r2[0] * 100 + r2[1] * 10 + r2[2], r3[0] * 100 + r3[1] * 10 + r3[2])
+}
+
+pub(all) struct UtCustomHolder {
+  mut count : Int
+}
+
+fn UtCustomHolder::retain(self : UtCustomHolder, f : () -> Unit) -> Unit {
+  f()
+}
+
+pub fn ut_r5_p1_2_custom_holder_retain() -> Int {
+  let h = UtCustomHolder::{ count: 1 }
+  h.retain(fn() { h.count = 9 })
+  h.count
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1879,7 +2333,7 @@ fn main {
     check("q2.int_lnot", ln == -1)
     check("q2.unsafe_get_set", g == 25)
     check("q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
-  } else if kase == "wave_m2_core" {
+  } else if kase == "transpile_core" {
     let (ts1, ts2, ts3) = @m12.m2_tuple_struct_roundtrip(7, "hi")
     let (ma, mb) = @m12.m2_map_index_set()
     let (b1, b2, b3, inf_ok) = @m12.m2_hex_floats()
@@ -1892,7 +2346,7 @@ fn main {
     check("m2.hex_1p_54", b3 == 4363988038922010624L)
     check("m2.double_is_inf", inf_ok)
     check("m2.ref_default", rv == 42)
-  } else if kase == "wave_m2_round2" {
+  } else if kase == "transpile_round2" {
     let (tm1, tm2, tm3) = @m12.m2_r2_tuple_match()
     let (d_big, i64_big, d_if) = @m12.m2_r2_large_int_coerce(false)
     let eq_h = @m12.m2_r2_eq_hygiene()
@@ -1911,7 +2365,7 @@ fn main {
     check("r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
     check("r2.show_return", sh == "early:normal")
     check("r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
-  } else if kase == "wave_m2b_mid_tier" {
+  } else if kase == "transpile_mid_tier" {
     let (sc, ss, ssum) = @m12.m2b_postfix_slice_single_eval()
     let (ar1, ar2, ar3) = @m12.m2b_array_rest_pat(true)
     let (bs1, bs2) = @m12.m2b_bytes_for_loop()
@@ -1937,6 +2391,68 @@ fn main {
     check("m2b.p1_4_str_views", p1vs == "box.view():bc|b|bc|abc|")
     check("m2b.p1_5_multiline_map_rhs", p1mv0 == 7 && p1mv1 == 7 && p1gj == 17)
     check("m2b.p1_6_hash_call", p1hk)
+  } else if kase == "transpile_upper_tier" {
+    let (rv, bv, vc, vm) = @m12.ut_val_and_compound()
+    let (bl, ss, sb) = @m12.ut_slices_and_sb()
+    let ac = @m12.ut_array_add_chain()
+    let (js, jeq, jneg0, jhex) = @m12.ut_json_literals()
+    let (fg_r, fg_a0) = @m12.ut_fixed_arr_guard_mut()
+    let (sis, tsl, thas, xsl, ysum) = @m12.ut_set_and_arr_helpers()
+    let (lv1, lv2) = @m12.ut_labeled_enum(3, 4)
+    let (ms, mstr, meq, elen, mok) = @m12.ut_misc_syntax()
+    trace("ut", "\{rv}:\{bv}:\{vc}:\{vm},\{bl}:\{ss}:\{sb},\{ac.length()}:\{ac[0]}:\{ac[4]},\{js}:\{jeq}:\{jneg0}:\{jhex},\{fg_r}:\{fg_a0},\{sis}:\{tsl}:\{thas}:\{xsl}:\{ysum},\{lv1}:\{lv2},\{ms}:\{mstr}:\{meq}:\{elen}:\{mok}")
+    check("ut.val_compound", rv == 15 && bv == 27 && vc == 1 && vm == 30)
+    check("ut.slices_sb", bl == 2 && ss == "yz" && sb == "ok:yz")
+    check("ut.arr_add_chain", ac.length() == 5 && ac[0] == 1 && ac[4] == 5)
+    check("ut.json_eq", jeq)
+    check("ut.json_neg0_sign", jneg0)
+    check("ut.json_hex_float", jhex)
+    check("ut.fixed_arr_guard_mut", fg_r == 1 && fg_a0 == 9)
+    check("ut.set_iter_mut", sis == 124 && tsl == 1 && thas)
+    check("ut.arr_retain_filter_map", xsl == 3 && ysum == 80)
+    check("ut.labeled_enum", lv1 == 308 && lv2 == 4)
+    check("ut.surrogate_len", elen == 2)
+    check("ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
+    let (jh1, jh2, jh3, jh4) = @m12.ut_json_hex_and_extremes()
+    let (kc1, kc2) = @m12.ut_kw_collision_demo()
+    let (ta1, ta2, sc1) = @m12.ut_tup_arr_and_set_ctor()
+    trace("ut10", "\{jh1}:\{jh2}:\{jh3}:\{jh4},\{kc1}:\{kc2},\{ta1}:\{ta2}:\{sc1}")
+    check("ut.p0_2_json_hex_extremes", jh1 && jh2 && jh3 && jh4)
+    check("ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
+    check("ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
+    check("ut.p1_4_set_ctor", sc1 == 2)
+    let (va, vb, va2, vb2, vs) = @m12.ut_r3_val_mut_and_shadow()
+    let (so1, so2, sp1, sp2) = @m12.ut_r3_refutable_struct_pat()
+    let fls = @m12.ut_r3_f_let_shadow(val=1, val_=2)
+    let fms = @m12.ut_r3_f_match_shadow(val=1, val_=2)
+    let gs = @m12.ut_r3_g_shadow(2)
+    let (kpt, kpa, kps) = @m12.ut_r3_kw_patterns()
+    let (ni1, ni2) = @m12.ut_r4_nested_index_val()
+    let (nk1, nk2, nk3, nk4) = @m12.ut_r4_nested_kw_params(val=8, val_=9)
+    trace("utr3", "\{va}:\{vb}:\{va2}:\{vb2}:\{vs},\{so1}:\{so2}:\{sp1}:\{sp2},\{fls}:\{fms}:\{gs},\{kpt}:\{kpa}:\{kps},\{ni1}:\{ni2},\{nk1}:\{nk2}:\{nk3}:\{nk4}")
+    check("ut.r3_val_mut_compound", va == 11 && vb == 7)
+    check("ut.r3_val_mut_assign", va2 == 10 && vb2 == 7)
+    check("ut.r3_global_ref_shadow", vs == 42)
+    check("ut.r3_struct_pat_opt", so1 == 5 && so2 == -1)
+    check("ut.r3_struct_pat_pair", sp1 == 7 && sp2 == -1)
+    check("ut.r3_kw_shadow", fls == 101 && fms == 79 && gs == 101)
+    check("ut.r3_kw_pat_tup", kpt == 19)
+    check("ut.r3_kw_pat_arr_struct", kpa == 19 && kps == 19)
+    check("ut.r4_nested_index_val_shadow", ni1 == 1)
+    check("ut.r4_call_chain_index_val", ni2 == 1)
+    check("ut.r4_closure_kw_param", nk1 == 19)
+    check("ut.r4_arrow_kw_param", nk2 == 19)
+    check("ut.r4_local_fn_kw_param", nk3 == 19)
+    check("ut.r4_outer_kw_preserved", nk4 == 89)
+    let r5v = @m12.ut_r5_call_tuple_val()
+    let (rp1, rp2, rp3) = @m12.ut_r5_p1_1_retain_positive()
+    let (fp1, fp2, fp3) = @m12.ut_r5_p1_1_fm_positive()
+    let r5h = @m12.ut_r5_p1_2_custom_holder_retain()
+    trace("utr5", "\{r5v},\{rp1}:\{rp2}:\{rp3},\{fp1}:\{fp2}:\{fp3},\{r5h}")
+    check("ut.r5_call_tuple_val", r5v == 1)
+    check("ut.r5_p1_1_retain_positive", rp1 == 123 && rp2 == 123 && rp3 == 123)
+    check("ut.r5_p1_1_fm_positive", fp1 == 123 && fp2 == 123 && fp3 == 123)
+    check("ut.r5_p1_2_custom_holder_retain", r5h == 9)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2429,7 +2945,7 @@ pub fn main(w : World) -> Int {
     check(w, "q2.int_lnot", ln == -1)
     check(w, "q2.unsafe_get_set", g == 25)
     check(w, "q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
-  } else if kase == "wave_m2_core" {
+  } else if kase == "transpile_core" {
     let (ts1, ts2, ts3) = m12::m2_tuple_struct_roundtrip(7, "hi")
     let (ma, mb) = m12::m2_map_index_set()
     let (b1, b2, b3, inf_ok) = m12::m2_hex_floats()
@@ -2442,7 +2958,7 @@ pub fn main(w : World) -> Int {
     check(w, "m2.hex_1p_54", b3 == 4363988038922010624L)
     check(w, "m2.double_is_inf", inf_ok)
     check(w, "m2.ref_default", rv == 42)
-  } else if kase == "wave_m2_round2" {
+  } else if kase == "transpile_round2" {
     let (tm1, tm2, tm3) = m12::m2_r2_tuple_match()
     let (d_big, i64_big, d_if) = m12::m2_r2_large_int_coerce(false)
     let eq_h = m12::m2_r2_eq_hygiene()
@@ -2461,7 +2977,7 @@ pub fn main(w : World) -> Int {
     check(w, "r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
     check(w, "r2.show_return", sh == "early:normal")
     check(w, "r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
-  } else if kase == "wave_m2b_mid_tier" {
+  } else if kase == "transpile_mid_tier" {
     let (sc, ss, ssum) = m12::m2b_postfix_slice_single_eval()
     let (ar1, ar2, ar3) = m12::m2b_array_rest_pat(true)
     let (bs1, bs2) = m12::m2b_bytes_for_loop()
@@ -2487,6 +3003,68 @@ pub fn main(w : World) -> Int {
     check(w, "m2b.p1_4_str_views", p1vs == "box.view():bc|b|bc|abc|")
     check(w, "m2b.p1_5_multiline_map_rhs", p1mv0 == 7 && p1mv1 == 7 && p1gj == 17)
     check(w, "m2b.p1_6_hash_call", p1hk)
+  } else if kase == "transpile_upper_tier" {
+    let (rv, bv, vc, vm) = m12::ut_val_and_compound()
+    let (bl, ss, sb) = m12::ut_slices_and_sb()
+    let ac = m12::ut_array_add_chain()
+    let (js, jeq, jneg0, jhex) = m12::ut_json_literals()
+    let (fg_r, fg_a0) = m12::ut_fixed_arr_guard_mut()
+    let (sis, tsl, thas, xsl, ysum) = m12::ut_set_and_arr_helpers()
+    let (lv1, lv2) = m12::ut_labeled_enum(3, 4)
+    let (ms, mstr, meq, elen, mok) = m12::ut_misc_syntax()
+    trace(w, "ut", rv.to_string() + ":" + bv.to_string() + ":" + vc.to_string() + ":" + vm.to_string() + "," + bl.to_string() + ":" + ss + ":" + sb + "," + ac.length().to_string() + ":" + ac[0].to_string() + ":" + ac[4].to_string() + "," + js + ":" + jeq.to_string() + ":" + jneg0.to_string() + ":" + jhex.to_string() + "," + fg_r.to_string() + ":" + fg_a0.to_string() + "," + sis.to_string() + ":" + tsl.to_string() + ":" + thas.to_string() + ":" + xsl.to_string() + ":" + ysum.to_string() + "," + lv1.to_string() + ":" + lv2.to_string() + "," + ms.to_string() + ":" + mstr + ":" + meq.to_string() + ":" + elen.to_string() + ":" + mok.to_string())
+    check(w, "ut.val_compound", rv == 15 && bv == 27 && vc == 1 && vm == 30)
+    check(w, "ut.slices_sb", bl == 2 && ss == "yz" && sb == "ok:yz")
+    check(w, "ut.arr_add_chain", ac.length() == 5 && ac[0] == 1 && ac[4] == 5)
+    check(w, "ut.json_eq", jeq)
+    check(w, "ut.json_neg0_sign", jneg0)
+    check(w, "ut.json_hex_float", jhex)
+    check(w, "ut.fixed_arr_guard_mut", fg_r == 1 && fg_a0 == 9)
+    check(w, "ut.set_iter_mut", sis == 124 && tsl == 1 && thas)
+    check(w, "ut.arr_retain_filter_map", xsl == 3 && ysum == 80)
+    check(w, "ut.labeled_enum", lv1 == 308 && lv2 == 4)
+    check(w, "ut.surrogate_len", elen == 2)
+    check(w, "ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
+    let (jh1, jh2, jh3, jh4) = m12::ut_json_hex_and_extremes()
+    let (kc1, kc2) = m12::ut_kw_collision_demo()
+    let (ta1, ta2, sc1) = m12::ut_tup_arr_and_set_ctor()
+    trace(w, "ut10", jh1.to_string() + ":" + jh2.to_string() + ":" + jh3.to_string() + ":" + jh4.to_string() + "," + kc1.to_string() + ":" + kc2.to_string() + "," + ta1.to_string() + ":" + ta2.to_string() + ":" + sc1.to_string())
+    check(w, "ut.p0_2_json_hex_extremes", jh1 && jh2 && jh3 && jh4)
+    check(w, "ut.p1_2_kw_collision", kc1 == 19 && kc2 == 19)
+    check(w, "ut.p1_3_tup_arr_pat", ta1 == 2 && ta2 == 12)
+    check(w, "ut.p1_4_set_ctor", sc1 == 2)
+    let (va, vb, va2, vb2, vs) = m12::ut_r3_val_mut_and_shadow()
+    let (so1, so2, sp1, sp2) = m12::ut_r3_refutable_struct_pat()
+    let fls = m12::ut_r3_f_let_shadow(val_1=1, val_=2)
+    let fms = m12::ut_r3_f_match_shadow(val_1=1, val_=2)
+    let gs = m12::ut_r3_g_shadow(2)
+    let (kpt, kpa, kps) = m12::ut_r3_kw_patterns()
+    let (ni1, ni2) = m12::ut_r4_nested_index_val()
+    let (nk1, nk2, nk3, nk4) = m12::ut_r4_nested_kw_params(val_1=8, val_=9)
+    trace(w, "utr3", va.to_string() + ":" + vb.to_string() + ":" + va2.to_string() + ":" + vb2.to_string() + ":" + vs.to_string() + "," + so1.to_string() + ":" + so2.to_string() + ":" + sp1.to_string() + ":" + sp2.to_string() + "," + fls.to_string() + ":" + fms.to_string() + ":" + gs.to_string() + "," + kpt.to_string() + ":" + kpa.to_string() + ":" + kps.to_string() + "," + ni1.to_string() + ":" + ni2.to_string() + "," + nk1.to_string() + ":" + nk2.to_string() + ":" + nk3.to_string() + ":" + nk4.to_string())
+    check(w, "ut.r3_val_mut_compound", va == 11 && vb == 7)
+    check(w, "ut.r3_val_mut_assign", va2 == 10 && vb2 == 7)
+    check(w, "ut.r3_global_ref_shadow", vs == 42)
+    check(w, "ut.r3_struct_pat_opt", so1 == 5 && so2 == -1)
+    check(w, "ut.r3_struct_pat_pair", sp1 == 7 && sp2 == -1)
+    check(w, "ut.r3_kw_shadow", fls == 101 && fms == 79 && gs == 101)
+    check(w, "ut.r3_kw_pat_tup", kpt == 19)
+    check(w, "ut.r3_kw_pat_arr_struct", kpa == 19 && kps == 19)
+    check(w, "ut.r4_nested_index_val_shadow", ni1 == 1)
+    check(w, "ut.r4_call_chain_index_val", ni2 == 1)
+    check(w, "ut.r4_closure_kw_param", nk1 == 19)
+    check(w, "ut.r4_arrow_kw_param", nk2 == 19)
+    check(w, "ut.r4_local_fn_kw_param", nk3 == 19)
+    check(w, "ut.r4_outer_kw_preserved", nk4 == 89)
+    let r5v = m12::ut_r5_call_tuple_val()
+    let (rp1, rp2, rp3) = m12::ut_r5_p1_1_retain_positive()
+    let (fp1, fp2, fp3) = m12::ut_r5_p1_1_fm_positive()
+    let r5h = m12::ut_r5_p1_2_custom_holder_retain()
+    trace(w, "utr5", r5v.to_string() + "," + rp1.to_string() + ":" + rp2.to_string() + ":" + rp3.to_string() + "," + fp1.to_string() + ":" + fp2.to_string() + ":" + fp3.to_string() + "," + r5h.to_string())
+    check(w, "ut.r5_call_tuple_val", r5v == 1)
+    check(w, "ut.r5_p1_1_retain_positive", rp1 == 123 && rp2 == 123 && rp3 == 123)
+    check(w, "ut.r5_p1_1_fm_positive", fp1 == 123 && fp2 == 123 && fp3 == 123)
+    check(w, "ut.r5_p1_2_custom_holder_retain", r5h == 9)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -3058,7 +3636,7 @@ def emit_ci_golden(pionc, out_dir):
             print("CI GOLDEN FAILED: mbt2pion publish (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
             return 1
         got_files = sorted(os.listdir(out_dir))
-        expected_files = ["00_init_order.pion", "oracle_lib.pion"]
+        expected_files = ["00_init_order.pion", "mbt2pion_abi.json", "oracle_lib.pion"]
         if got_files != expected_files:
             print("CI GOLDEN FAILED: expected files %s, got %s" % (expected_files, got_files))
             return 1

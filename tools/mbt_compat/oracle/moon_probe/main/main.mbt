@@ -627,7 +627,7 @@ fn case_double_compare_nan() -> Unit {
 }
 
 ///|
-fn case_wave_m2_compat() -> Unit {
+fn case_compat_basics() -> Unit {
   let inf = 1.0 / 0.0
   let ninf = -1.0 / 0.0
   let nan = 0.0 / 0.0
@@ -654,7 +654,7 @@ fn case_wave_m2_compat() -> Unit {
 }
 
 ///|
-fn case_wave_m2_round2() -> Unit {
+fn case_compat_round2() -> Unit {
   // P1-6: UTF-8 lossy maximal subpart (Unicode Table 3-7 / WHATWG)
   let samples : Array[(String, Array[Byte])] = [
     ("e0a0", [b'\xE0', b'\xA0']),
@@ -732,7 +732,7 @@ fn case_wave_m2_round2() -> Unit {
 }
 
 ///|
-fn case_wave_m2b_parse() -> Unit {
+fn case_compat_parse_numbers() -> Unit {
   let i_ws = try { Some(@string.parse_int(" 42 ")) } catch { _ => None }
   let i_hex0 = try { Some(@string.parse_int("0xff")) } catch { _ => None }
   let i_hex16 = try { Some(@string.parse_int("0xFF", base=16)) } catch { _ => None }
@@ -868,9 +868,9 @@ fn main {
     "collections" => case_collections()
     "opt.unwrap_none" => case_opt_unwrap_none()
     "arr.remove_oob" => case_arr_remove_oob()
-    "wave_m2.compat" => case_wave_m2_compat()
-    "wave_m2.round2" => case_wave_m2_round2()
-    "wave_m2b.parse" => case_wave_m2b_parse()
+    "compat.basics" => case_compat_basics()
+    "compat.round2" => case_compat_round2()
+    "compat.parse_numbers" => case_compat_parse_numbers()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)

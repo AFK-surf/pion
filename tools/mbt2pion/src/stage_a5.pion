@@ -780,7 +780,7 @@ pub fn instrument_probes_for_file_with_api_map(
     GeneratedFile::{ rel_path: file, content: content, source_file: file, anchors: [] },
   ])
   let (qvals, qtypes) = collect_qualified_api_names(api_map)
-  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes)
+  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes, Map())
 }
 
 fn instrument_probes_for_file_with_safe(
@@ -792,6 +792,7 @@ fn instrument_probes_for_file_with_safe(
   declared_types : Map[String, Bool],
   qual_values : Map[String, Bool],
   qual_types : Map[String, Bool],
+  val_placeholders : Map[String, Bool],
 ) -> (String, Array[ProbeSite]) {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
@@ -957,6 +958,7 @@ fn instrument_probes_for_file_with_safe(
             declared_types,
             qual_values,
             qual_types,
+            val_placeholders,
           )
           if inner_sites.length() > 0 {
             any_interp_probe = true
@@ -1100,8 +1102,9 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    // 3. `<recv>.val` (read), `<recv>.val = <rhs>` (write), `<recv>.val <op>= <rhs>` (compound write)
-    if t.kind == TokenKind::Dot && i + 1 < n && tokens[i + 1].raw == "val" {
+    // 3. `<recv>.<val_placeholder>` (or legacy `<recv>.val`) read/write/compound-write
+    if t.kind == TokenKind::Dot && i + 1 < n &&
+    (val_placeholders.contains(tokens[i + 1].raw) || tokens[i + 1].raw == "val") {
       let op_b = base_offset + tokens[i + 1].start_byte
       let recv_start = find_receiver_start(tokens, i - 1)
       if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
@@ -1137,50 +1140,8 @@ fn instrument_probes_for_file_with_safe(
               rhs_u64: 0UL,
               rhs_overflow: false,
             })
-            let probed_rhs = if str_has(rhs_expr, ".val") {
-              let rtoks = lex_moonbit(rhs_expr)
-              let rn = rtoks.length() - 1
-              let redits : Array[(Int, Int, String)] = []
-              let mut ri = 0
-              while ri + 1 < rn {
-                if rtoks[ri].kind == TokenKind::Dot && rtoks[ri + 1].raw == "val" {
-                  // NEVER rewrite a nested `.val = ...` assignment LHS into `.mbt_val_probe() = ...` (syntax error!);
-                  // leave nested assignments for the next Stage A.5 round once the outer assignment is rewritten.
-                  let is_nested_assign = ri + 2 < rn &&
-                  (rtoks[ri + 2].kind == TokenKind::Eq || rtoks[ri + 2].kind == TokenKind::AssignOp)
-                  if !is_nested_assign {
-                    redits.push((rtoks[ri].start_byte, rtoks[ri + 1].end_byte, ".mbt_val_probe()"))
-                  }
-                  ri = ri + 2
-                } else {
-                  ri = ri + 1
-                }
-              }
-              apply_byte_edits(rhs_expr, redits)
-            } else {
-              rhs_expr
-            }
-            let probed_lhs = if str_has(recv_expr, ".val") {
-              let ltoks = lex_moonbit(recv_expr)
-              let ln = ltoks.length() - 1
-              let ledits : Array[(Int, Int, String)] = []
-              let mut li = 0
-              while li + 1 < ln {
-                if ltoks[li].kind == TokenKind::Dot && ltoks[li + 1].raw == "val" {
-                  let is_nested_assign = li + 2 < ln &&
-                  (ltoks[li + 2].kind == TokenKind::Eq || ltoks[li + 2].kind == TokenKind::AssignOp)
-                  if !is_nested_assign {
-                    ledits.push((ltoks[li].start_byte, ltoks[li + 1].end_byte, ".mbt_val_probe()"))
-                  }
-                  li = li + 2
-                } else {
-                  li = li + 1
-                }
-              }
-              apply_byte_edits(recv_expr, ledits)
-            } else {
-              recv_expr
-            }
+            let probed_rhs = probe_nested_val_reads(rhs_expr, val_placeholders)
+            let probed_lhs = probe_nested_val_reads(recv_expr, val_placeholders)
             edits.push((start_b, end_b, probed_lhs + ".mbt_val_set_probe(" + probed_rhs + ")"))
             covered_end = end_b
             i = rhs_end
@@ -1445,11 +1406,53 @@ pub fn rewrite_for_probe(
   rewrite_for_probe_with_fields(site, resolved_type, recipes, Map(), diags, drift_ledger)
 }
 
+///| Replace nested non-assignment `.val` / registered placeholder reads inside an expression
+///| with `.mbt_val_probe()` so outer `.mbt_val_set_probe(...)` checks cleanly.
+fn probe_nested_val_reads(expr : String, val_placeholders : Map[String, Bool]) -> String {
+  if !str_has(expr, ".") {
+    return expr
+  }
+  let toks = lex_moonbit(expr)
+  let tn = toks.length() - 1
+  let edits : Array[(Int, Int, String)] = []
+  let mut i = 0
+  while i + 1 < tn {
+    if toks[i].kind == TokenKind::Dot &&
+    (val_placeholders.contains(toks[i + 1].raw) || toks[i + 1].raw == "val") {
+      let is_nested_assign = i + 2 < tn &&
+      (toks[i + 2].kind == TokenKind::Eq || toks[i + 2].kind == TokenKind::AssignOp)
+      if !is_nested_assign {
+        edits.push((toks[i].start_byte, toks[i + 1].end_byte, ".mbt_val_probe()"))
+      }
+      i = i + 2
+    } else {
+      i = i + 1
+    }
+  }
+  if edits.length() == 0 {
+    expr
+  } else {
+    apply_byte_edits(expr, edits)
+  }
+}
+
 pub fn rewrite_for_probe_with_fields(
   site : ProbeSite,
   resolved_type : String,
   recipes : Recipes,
   struct_val_fields : Map[String, String],
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Option[String] {
+  rewrite_for_probe_hygienic(site, resolved_type, recipes, struct_val_fields, Map(), diags, drift_ledger)
+}
+
+fn rewrite_for_probe_hygienic(
+  site : ProbeSite,
+  resolved_type : String,
+  recipes : Recipes,
+  struct_val_fields : Map[String, String],
+  used_idents : Map[String, Bool],
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> Option[String] {
@@ -1487,7 +1490,8 @@ pub fn rewrite_for_probe_with_fields(
     if resolved_type.starts_with("OrderedMap[") || resolved_type.starts_with("mbt_compat::OrderedMap[") {
       return Some("mbt_compat::opt_unwrap(" + site.lhs_expr + ".get(" + site.rhs_expr + "))")
     }
-    if resolved_type.starts_with("ArrayView[") || resolved_type.starts_with("mbt_compat::ArrayView[") {
+    if resolved_type.starts_with("ArrayView[") || resolved_type.starts_with("mbt_compat::ArrayView[") ||
+    resolved_type.starts_with("ArrayBuf[") || resolved_type.starts_with("mbt_compat::ArrayBuf[") {
       return Some(site.lhs_expr + ".get(" + site.rhs_expr + ")")
     }
     return None
@@ -1621,23 +1625,52 @@ pub fn rewrite_for_probe_with_fields(
       let base_ty = strip_type_args(resolved_type)
       match struct_val_fields.get(base_ty) {
         Some(renamed) => renamed
-        None => "val_"
+        None => {
+          // Strict fail-closed: NEVER fall back to hardcoded `val_`!
+          let err_code = if str_has(base_ty, "::") {
+            "MBT2PION_DEP_ABI_ERROR"
+          } else {
+            "MBT2PION_UNDISPOSED_PROBE_SITE"
+          }
+          diags.push(diag_error(
+            err_code,
+            site.file,
+            site.line,
+            site.col,
+            "cannot resolve `.val` field mapping for `" + resolved_type + "` (missing local or verified --dep ABI mapping)",
+          ))
+          drift_ledger.push(DriftEntry::{
+            category: "mbt_val_probe",
+            file: site.file,
+            line: site.line,
+            col: site.col,
+            expr: site.lhs_expr + ".val",
+            resolution: "blocked",
+            status: "unresolved",
+            detail: "missing .val field mapping for " + resolved_type,
+          })
+          return None
+        }
       }
     }
     if site.assign_op.length() == 0 {
       return Some(site.lhs_expr + "." + target_field)
     }
     if site.assign_op == "=" {
-      return Some(site.lhs_expr + "." + target_field + " = " + site.rhs_expr)
-    }
-    // Compound assignment (`+=`, `-=`, `*=`, `/=`, etc.): evaluate complex receiver strictly ONCE!
-    if is_simple_ident_expr(site.lhs_expr) {
+      if is_simple_ident_expr(site.lhs_expr) && !str_has(site.rhs_expr, "{") && !str_has(site.rhs_expr, ";") {
+        return Some(site.lhs_expr + "." + target_field + " = " + site.rhs_expr)
+      }
+      let r_tmp = fresh_stage_b_ident(used_idents, "__mbt_r")
       return Some(
-        site.lhs_expr + "." + target_field + " = " + site.lhs_expr + "." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ")",
+        "{ let " + r_tmp + " = " + site.lhs_expr + "; " + r_tmp + "." + target_field + " = (" + site.rhs_expr + ") }",
       )
     }
+    // Compound assignment (`+=`, `-=`, `*=`, `/=`, etc.): ALWAYS evaluate `<recv>` ONCE into a
+    // hygienic temp BEFORE evaluating `<rhs>` (even for simple ident `r`, so `r.val += { r = b; 10 }`
+    // mutates the original receiver `a` rather than reassigned `b`!).
+    let r_tmp = fresh_stage_b_ident(used_idents, "__mbt_r")
     return Some(
-      "{ let __mbt_r = " + site.lhs_expr + "; __mbt_r." + target_field + " = __mbt_r." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ") }",
+      "{ let " + r_tmp + " = " + site.lhs_expr + "; " + r_tmp + "." + target_field + " = " + r_tmp + "." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ") }",
     )
   }
 
@@ -2394,6 +2427,217 @@ pub fn run_stage_a5_ex(
   probe_dispositions : Array[ProbeDisposition],
   max_rounds : Int,
 ) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_with_val_sites(
+    files,
+    recipes,
+    api_map,
+    struct_val_fields,
+    [],
+    check_fn,
+    diags,
+    drift_ledger,
+    probe_dispositions,
+    max_rounds,
+  )
+}
+
+///| Resolve original MoonBit `(file, line, col)` from structured `InitOriginRecord`s when available,
+///| falling back to `// origin:` comment scanning only when no structured records exist (e.g. unit test mocks).
+fn lookup_init_origin_record(
+  init_origins_by_file : Map[String, Array[InitOriginRecord]],
+  file : String,
+  line_1based : Int,
+) -> Option[InitOriginRecord] {
+  match init_origins_by_file.get(file) {
+    Some(recs) => {
+      let mut best : Option[InitOriginRecord] = None
+      for r in recs {
+        if line_1based >= r.start_line && line_1based <= r.end_line {
+          return Some(r)
+        }
+        if r.start_line <= line_1based {
+          best = Some(r)
+        }
+      }
+      best
+    }
+    None => None
+  }
+}
+
+fn count_newlines_str(s : String) -> Int {
+  let mut c = 0
+  let mut i = 0
+  while i < s.length() {
+    if s.code_unit_at(i) == 10 {
+      c = c + 1
+    }
+    i = i + 1
+  }
+  c
+}
+
+fn byte_off_to_line_1based(s : String, off : Int) -> Int {
+  let lim = if off < s.length() { off } else { s.length() }
+  let mut ln = 1
+  let mut i = 0
+  while i < lim {
+    if s.code_unit_at(i) == 10 {
+      ln = ln + 1
+    }
+    i = i + 1
+  }
+  ln
+}
+
+fn remap_init_origin_records(
+  recs : Array[InitOriginRecord],
+  old_content : String,
+  edits : Array[(Int, Int, String)],
+) -> Array[InitOriginRecord] {
+  if recs.length() == 0 || edits.length() == 0 {
+    return recs
+  }
+  let mut cur : Array[InitOriginRecord] = recs
+  // Collect (edit_line, delta_lines) for every edit that changes newline count
+  let line_deltas : Array[(Int, Int)] = []
+  for ed in edits {
+    let old_nl = count_newlines_str(old_content.slice(ed.0, ed.1))
+    let new_nl = count_newlines_str(ed.2)
+    let d = new_nl - old_nl
+    if d != 0 {
+      line_deltas.push((byte_off_to_line_1based(old_content, ed.0), d))
+    }
+  }
+  if line_deltas.length() == 0 {
+    return cur
+  }
+  let next : Array[InitOriginRecord] = []
+  for r in cur {
+    let mut sl = r.start_line
+    let mut el = r.end_line
+    let mut dl = r.decl_start_line
+    for ld in line_deltas {
+      let edit_line = ld.0
+      let d = ld.1
+      if r.start_line > edit_line {
+        sl = sl + d
+        el = el + d
+        dl = dl + d
+      } else if r.end_line >= edit_line {
+        el = el + d
+        if r.decl_start_line > edit_line {
+          dl = dl + d
+        }
+      }
+    }
+    next.push(InitOriginRecord::{
+      start_line: sl,
+      end_line: el,
+      decl_start_line: dl,
+      source_file: r.source_file,
+      line: r.line,
+      col: r.col,
+      rhs_orig_col: r.rhs_orig_col,
+      rhs_gen_col: r.rhs_gen_col,
+      probe_origins: r.probe_origins,
+    })
+  }
+  cur = next
+  cur
+}
+
+fn resolve_init_order_origin_structured(
+  init_origins_by_file : Map[String, Array[InitOriginRecord]],
+  content : String,
+  file : String,
+  line_1based : Int,
+  col_1based : Int,
+  probe_kind : String,
+  probe_slot : Int,
+) -> (String, Int, Int) {
+  match lookup_init_origin_record(init_origins_by_file, file, line_1based) {
+    Some(rec) => {
+      if probe_kind.length() > 0 && probe_slot >= 0 && rec.probe_origins.length() > 0 {
+        let coords = parse_origin_probes_for_kind(rec.probe_origins, probe_kind)
+        if probe_slot < coords.length() {
+          return (rec.source_file, coords[probe_slot].0, coords[probe_slot].1)
+        }
+      }
+      let line_delta = if line_1based > rec.decl_start_line { line_1based - rec.decl_start_line } else { 0 }
+      let orig_col = if line_delta == 0 {
+        let adj = col_1based - (rec.rhs_gen_col - rec.rhs_orig_col)
+        if adj < 1 { 1 } else { adj }
+      } else {
+        col_1based
+      }
+      return (rec.source_file, rec.line + line_delta, orig_col)
+    }
+    None => ()
+  }
+  resolve_init_order_origin_slot(content, file, line_1based, col_1based, probe_kind, probe_slot)
+}
+
+pub fn run_stage_a5_with_val_sites(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  val_probe_sites : Array[ValProbeSite],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_with_val_sites_and_origins(
+    files,
+    recipes,
+    api_map,
+    struct_val_fields,
+    val_probe_sites,
+    Map(),
+    check_fn,
+    diags,
+    drift_ledger,
+    probe_dispositions,
+    max_rounds,
+  )
+}
+
+pub fn run_stage_a5_with_val_sites_and_origins(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  val_probe_sites : Array[ValProbeSite],
+  init_origins_in : Map[String, Array[InitOriginRecord]],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  // P0-1(b): bucket registered `.val` placeholders by owning file `vps.file` so a placeholder
+  // allocated in file A can NEVER match a legitimate user field of the same name in file B.
+  let val_placeholders_by_file : Map[String, Map[String, Bool]] = Map()
+  for vps in val_probe_sites {
+    match val_placeholders_by_file.get(vps.file) {
+      Some(m) => m[vps.placeholder_ident] = true
+      None => {
+        let m : Map[String, Bool] = Map()
+        m[vps.placeholder_ident] = true
+        val_placeholders_by_file[vps.file] = m
+      }
+    }
+  }
+  let init_origins_by_file : Map[String, Array[InitOriginRecord]] = Map()
+  for k in init_origins_in.keys() {
+    match init_origins_in.get(k) {
+      Some(v) => init_origins_by_file[k] = v
+      None => ()
+    }
+  }
   let mut cur_files : Array[GeneratedFile] = []
   let safe_list_by_file : Map[String, Array[Int]] = Map()
   let safe_map_by_file : Map[String, Map[Int, Bool]] = Map()
@@ -2432,6 +2676,10 @@ pub fn run_stage_a5_ex(
       let skip_map : Map[Int, Bool] = Map()
       for k in smap.keys() { skip_map[k] = true }
       for k in fmap.keys() { skip_map[k] = true }
+      let file_val_placeholders = match val_placeholders_by_file.get(f.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
       let (inst_src, raw_sites) = instrument_probes_for_file_with_safe(
         f.rel_path,
         f.content,
@@ -2441,6 +2689,7 @@ pub fn run_stage_a5_ex(
         declared_types,
         qual_values,
         qual_types,
+        file_val_placeholders,
       )
       let numbered_sites : Array[ProbeSite] = []
       for rs in raw_sites {
@@ -2544,12 +2793,30 @@ pub fn run_stage_a5_ex(
       let round_seen_per_item_kind : Map[String, Int] = Map()
       let round_newly_used : Array[(String, Int)] = []
       for site in sites {
-        // Compute exact slot index in this `InitItem`'s `// origin-probes:` list (immune to multi-round edits!)
+        // Compute exact slot index in this `InitItem`'s `probe_origins` list (using structured
+        // `InitOriginRecord`s when available so user/redacted `// origin:` comments can never hijack it!)
         let mut site_slot = -1
         let mut slot_key = ""
         if f.rel_path == "00_init_order.pion" || f.rel_path == "00_init_order_test.pion" {
-          let (hdr_li, hdr_origin, hdr_probes) = find_init_origin_header(f.content, f.rel_path, site.line)
-          if hdr_li >= 0 && hdr_probes.length() > 0 {
+          let mut hdr_origin = ""
+          let mut hdr_probes = ""
+          let mut has_hdr = false
+          match lookup_init_origin_record(init_origins_by_file, f.rel_path, site.line) {
+            Some(rec) => {
+              has_hdr = true
+              hdr_origin = rec.source_file + ":" + rec.line.to_string() + ":" + rec.col.to_string() + ":" + rec.start_line.to_string()
+              hdr_probes = rec.probe_origins
+            }
+            None => {
+              let (hdr_li, ho, hp) = find_init_origin_header(f.content, f.rel_path, site.line)
+              if hdr_li >= 0 {
+                has_hdr = true
+                hdr_origin = ho
+                hdr_probes = hp
+              }
+            }
+          }
+          if has_hdr && hdr_probes.length() > 0 {
             slot_key = f.rel_path + "|" + hdr_origin + "|" + site.probe_kind
             let rem_idx = match round_seen_per_item_kind.get(slot_key) {
               Some(k) => k
@@ -2611,8 +2878,9 @@ pub fn run_stage_a5_ex(
           if slot_key.length() > 0 && site_slot >= 0 {
             round_newly_used.push((slot_key, site_slot))
           }
-          let (disp_file, disp_line, disp_col) = resolve_init_order_origin_slot(f.content, f.rel_path, site.line, site.col, site.probe_kind, site_slot)
-          match rewrite_for_probe_with_fields(site, matched_ty, recipes, struct_val_fields, diags, drift_ledger) {
+          let (disp_file, disp_line, disp_col) = resolve_init_order_origin_structured(init_origins_by_file, f.content, f.rel_path, site.line, site.col, site.probe_kind, site_slot)
+          let file_used_idents = collect_used_idents(f.content)
+          match rewrite_for_probe_hygienic(site, matched_ty, recipes, struct_val_fields, file_used_idents, diags, drift_ledger) {
             Some(repl) => {
               edits.push((site.start_byte, site.end_byte, repl))
               remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))
@@ -2661,6 +2929,10 @@ pub fn run_stage_a5_ex(
       if edits.length() > 0 {
         any_changed = true
         let updated = apply_byte_edits(f.content, edits)
+        match init_origins_by_file.get(f.rel_path) {
+          Some(recs) => init_origins_by_file[f.rel_path] = remap_init_origin_records(recs, f.content, edits)
+          None => ()
+        }
         let (nl, nm) = remap_safe_offsets(f.content, slist, remap_edits)
         let (nfl, nfm) = remap_safe_offsets(f.content, flist, remap_edits)
         safe_list_by_file[f.rel_path] = nl
@@ -2687,7 +2959,7 @@ pub fn run_stage_a5_ex(
       // Fixpoint reached: report every remaining unresolved probe fail-closed (zero silent fallback).
       for entry in round_unresolved {
         let (rel_p, fcontent, site, site_slot) = entry
-        let (rep_file, rep_line, rep_col) = resolve_init_order_origin_slot(fcontent, rel_p, site.line, site.col, site.probe_kind, site_slot)
+        let (rep_file, rep_line, rep_col) = resolve_init_order_origin_structured(init_origins_by_file, fcontent, rel_p, site.line, site.col, site.probe_kind, site_slot)
         diags.push(diag_error(
           "MBT2PION_UNDISPOSED_PROBE_SITE",
           rep_file,
