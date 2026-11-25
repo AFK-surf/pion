@@ -1345,6 +1345,11 @@ pub struct M2bNestedTupleKey {
 }
 
 #derive(Hash)
+pub struct M2bFloatKey {
+  f : Float
+}
+
+#derive(Hash)
 pub(all) enum M2bHashEnum {
   Empty
   Pair(Int, String)
@@ -1378,11 +1383,14 @@ pub fn m2b_p1_views_map_and_hash() -> (String, Int, Int, Int, Int, Int, Bool) {
   let hnt = Hash::hash(M2bNestedTupleKey::{ a: (7, (8, ())) })
   let k1 = M2bKey::{ a: 7, b: -0.0, c: "abc" }
   let k2 = M2bKey::{ a: 7, b: 0.0, c: "abc" }
-  let he = Hash::hash(M2bHashEnum::Pair(1, "x")) ^ hnt
+  let hf1 = Hash::hash(M2bFloatKey::{ f: (1.5 : Float) })
+  let hf_pos0 = Hash::hash(M2bFloatKey::{ f: (0.0 : Float) })
+  let hf_neg0 = Hash::hash(M2bFloatKey::{ f: (-0.0 : Float) })
+  let he = Hash::hash(M2bHashEnum::Pair(1, "x")) ^ hnt ^ hf1
   let bx : M2bBoxed[Int] = M2bBoxed::{ val0: m2b_generic_json_id(17) }
   let be : M2bBoxE[Int] = M2bBoxE::Val(bx.val0)
   let gj = match be { M2bBoxE::Val(v) => v }
-  let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2)
+  let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2) && hf_neg0 == hf_pos0
   (vs, m.get(0).unwrap_or(-1), m.get(1).unwrap_or(-1), gj, hs, he, h_ok)
 }
 '''
