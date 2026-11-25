@@ -1652,6 +1652,51 @@ fn try_resolve_static_val_field_from_ty(ctx : StageAContext, recv_ty : String) -
   None
 }
 
+///| Lower a single-parameter untyped closure `fn(x) { ... }` passed to `.map`/`.filter`/`.each`:
+///| propagates `param_ty`, isolates `expected_type_stack` (`Bool` / `Unit` / `""`), and applies
+///| scoped binder renames (`compute_scoped_binder_renames` + `ctx.ident_renames` push/pop).
+fn lower_single_param_method_closure(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  fn_i : Int,
+  close_p : Int,
+  file : String,
+  method_name : String,
+  param_ty : String,
+) -> Option[String] {
+  if param_ty.length() == 0 || fn_i + 5 >= close_p {
+    return None
+  }
+  if !(tokens[fn_i].kind == TokenKind::Keyword && tokens[fn_i].raw == "fn" &&
+    tokens[fn_i + 1].kind == TokenKind::LParen && tokens[fn_i + 2].kind == TokenKind::Ident &&
+    tokens[fn_i + 3].kind == TokenKind::RParen && tokens[fn_i + 4].kind == TokenKind::LBrace &&
+    find_matching_delim(tokens, fn_i + 4) == close_p - 1) {
+    return None
+  }
+  let raw_pname = tokens[fn_i + 2].raw
+  let rn = if raw_pname == "_" { Map() } else { compute_scoped_binder_renames(ctx, [raw_pname]) }
+  ctx.ident_renames.push(rn)
+  let pname = match rn.get(raw_pname) {
+    Some(r) => r
+    None => raw_pname
+  }
+  let saved_sc = ctx.scope_vars.length()
+  ctx.scope_vars.push(ScopeVar::{ name: pname, ty: param_ty, is_mut: false, is_boxed: false })
+  let body_exp = if method_name == "filter" {
+    "Bool"
+  } else if method_name == "each" {
+    "Unit"
+  } else {
+    ""
+  }
+  push_expected_type(ctx, body_exp)
+  let body_s = lower_block_range(ctx, tokens, fn_i + 4, close_p - 1, file, "")
+  pop_expected_type(ctx)
+  restore_scope_vars(ctx, saved_sc)
+  let _ = ctx.ident_renames.pop()
+  Some("fn(" + pname + ") " + body_s)
+}
+
 fn lookup_ident_static_type(ctx : StageAContext, raw_ident : String) -> String {
   let eff = resolve_ident_in_scope(ctx, raw_ident)
   match lookup_scope_var(ctx, eff) {
@@ -2674,7 +2719,8 @@ fn infer_simple_expr_type(ctx : StageAContext, tokens : Array[Token], start : In
       tokens[start + 5].kind == TokenKind::LParen && tokens[start + 6].kind == TokenKind::Ident &&
       tokens[start + 7].kind == TokenKind::RParen && tokens[start + 8].kind == TokenKind::LBrace &&
       tokens[start + 9].kind == TokenKind::LBrace && tokens[start + 10].kind == TokenKind::DotDot &&
-      tokens[start + 11].kind == TokenKind::Ident && tokens[start + 11].raw == tokens[start + 6].raw {
+      tokens[start + 11].kind == TokenKind::Ident && tokens[start + 11].raw == tokens[start + 6].raw &&
+      find_matching_delim(tokens, start + 9) + 1 == find_matching_delim(tokens, start + 8) {
         return rbase
       }
       match ctx.symtab.fn_ret_types.get(strip_type_args_sym(rbase) + "::" + tokens[start + 2].raw) {
@@ -7874,29 +7920,18 @@ fn lower_one_token_or_form(
       tokens[close_p + 2].kind == TokenKind::Ident && tokens[close_p + 2].raw == "map" &&
       tokens[close_p + 3].kind == TokenKind::LParen {
         let map_cp = find_matching_delim(tokens, close_p + 3)
-        let fn_i = close_p + 4
-        if fn_i + 5 < map_cp &&
-        tokens[fn_i].kind == TokenKind::Keyword && tokens[fn_i].raw == "fn" &&
-        tokens[fn_i + 1].kind == TokenKind::LParen && tokens[fn_i + 2].kind == TokenKind::Ident &&
-        tokens[fn_i + 3].kind == TokenKind::RParen && tokens[fn_i + 4].kind == TokenKind::LBrace &&
-        find_matching_delim(tokens, fn_i + 4) == map_cp - 1 {
-          let ret_ty = match ctx.symtab.fn_ret_types.get(qual_lookup) {
-            Some(r) => r.trim()
-            None => ""
-          }
-          let inner_ty = if ret_ty.starts_with("Option[") && ret_ty.ends_with("]") {
-            ret_ty.slice(7, ret_ty.length() - 1).trim()
-          } else {
-            extract_container_value_type(ret_ty)
-          }
-          if inner_ty.length() > 0 {
-            let saved_sc = ctx.scope_vars.length()
-            let pname = resolve_ident_in_scope(ctx, tokens[fn_i + 2].raw)
-            ctx.scope_vars.push(ScopeVar::{ name: pname, ty: inner_ty, is_mut: false, is_boxed: false })
-            let body_s = lower_block_range(ctx, tokens, fn_i + 4, map_cp - 1, file, "")
-            restore_scope_vars(ctx, saved_sc)
-            return (trivia + call_str + ".map(fn(" + pname + ") " + body_s + ")", map_cp + 1)
-          }
+        let ret_ty = match ctx.symtab.fn_ret_types.get(qual_lookup) {
+          Some(r) => r.trim()
+          None => ""
+        }
+        let inner_ty = if ret_ty.starts_with("Option[") && ret_ty.ends_with("]") {
+          ret_ty.slice(7, ret_ty.length() - 1).trim()
+        } else {
+          extract_container_value_type(ret_ty)
+        }
+        match lower_single_param_method_closure(ctx, tokens, close_p + 4, map_cp, file, "map", inner_ty) {
+          Some(cl_s) => return (trivia + call_str + ".map(" + cl_s + ")", map_cp + 1)
+          None => ()
         }
       }
       // Check if followed by cascade `..m()`!
@@ -8002,19 +8037,12 @@ fn lower_one_token_or_form(
         extract_container_value_type(fty)
       }
       let close_p = find_matching_delim(tokens, next_i + 4)
-      let fn_i = next_i + 5
-      if inner_ty.length() > 0 && fn_i + 5 < close_p &&
-      tokens[fn_i].kind == TokenKind::Keyword && tokens[fn_i].raw == "fn" &&
-      tokens[fn_i + 1].kind == TokenKind::LParen && tokens[fn_i + 2].kind == TokenKind::Ident &&
-      tokens[fn_i + 3].kind == TokenKind::RParen && tokens[fn_i + 4].kind == TokenKind::LBrace &&
-      find_matching_delim(tokens, fn_i + 4) == close_p - 1 {
-        let saved_sc = ctx.scope_vars.length()
-        let pname = resolve_ident_in_scope(ctx, tokens[fn_i + 2].raw)
-        ctx.scope_vars.push(ScopeVar::{ name: pname, ty: inner_ty, is_mut: false, is_boxed: false })
-        let body_s = lower_block_range(ctx, tokens, fn_i + 4, close_p - 1, file, "")
-        restore_scope_vars(ctx, saved_sc)
-        let rf = rename_struct_field(ctx, strip_type_args_sym(base_ty), tokens[next_i + 1].raw)
-        return (trivia + name + "." + rf + ".map(fn(" + pname + ") " + body_s + ")", close_p + 1)
+      match lower_single_param_method_closure(ctx, tokens, next_i + 5, close_p, file, "map", inner_ty) {
+        Some(cl_s) => {
+          let rf = rename_struct_field(ctx, strip_type_args_sym(base_ty), tokens[next_i + 1].raw)
+          return (trivia + name + "." + rf + ".map(" + cl_s + ")", close_p + 1)
+        }
+        None => ()
       }
     }
 
@@ -8033,24 +8061,10 @@ fn lower_one_token_or_form(
         ""
       }
       let close_p = find_matching_delim(tokens, next_i + 2)
-      let fn_i = next_i + 3
-      if ety.length() > 0 && fn_i + 5 < close_p &&
-      tokens[fn_i].kind == TokenKind::Keyword && tokens[fn_i].raw == "fn" &&
-      tokens[fn_i + 1].kind == TokenKind::LParen && tokens[fn_i + 2].kind == TokenKind::Ident &&
-      tokens[fn_i + 3].kind == TokenKind::RParen && tokens[fn_i + 4].kind == TokenKind::LBrace &&
-      find_matching_delim(tokens, fn_i + 4) == close_p - 1 {
-        let pname_raw = tokens[fn_i + 2].raw
-        let lb = fn_i + 4
-        let rb = close_p - 1
-        let saved_sc = ctx.scope_vars.length()
-        let pname = resolve_ident_in_scope(ctx, pname_raw)
-        ctx.scope_vars.push(ScopeVar::{ name: pname, ty: ety, is_mut: false, is_boxed: false })
-        let body_s = lower_block_range(ctx, tokens, lb, rb, file, "")
-        restore_scope_vars(ctx, saved_sc)
-        return (
-          trivia + name + "." + tokens[next_i + 1].raw + "(fn(" + pname + ") " + body_s + ")",
-          close_p + 1,
-        )
+      let mname = tokens[next_i + 1].raw
+      match lower_single_param_method_closure(ctx, tokens, next_i + 3, close_p, file, mname, ety) {
+        Some(cl_s) => return (trivia + name + "." + mname + "(" + cl_s + ")", close_p + 1)
+        None => ()
       }
     }
 
@@ -12120,14 +12134,17 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
       if t.kind == TokenKind::Attr {
         if t.raw.starts_with("#callsite") && str_has(t.raw, "autofill(loc)") {
           next_autofill = true
-        } else {
-          next_autofill = false
-          if t.raw.starts_with("#cfg") {
-            match eval_cfg_attr(t.raw, ctx.opts.target) {
-              Some(false) => next_cfg_excluded = true
-              None => next_cfg_excluded = true
-              Some(true) => ()
+        } else if t.raw.starts_with("#cfg") {
+          match eval_cfg_attr(t.raw, ctx.opts.target) {
+            Some(false) => {
+              next_cfg_excluded = true
+              next_autofill = false
             }
+            None => {
+              next_cfg_excluded = true
+              next_autofill = false
+            }
+            Some(true) => ()
           }
         }
         i = i + 1

@@ -98,10 +98,40 @@ fn cond_needs_is_chain_lowering(tokens : Array[Token], start : Int, end : Int) -
     let (ss, se) = seg
     let is_i = find_top_level_is_kw(tokens, ss, se)
     if is_i > ss && is_i + 1 < se {
-      if pattern_contains_as_kw(tokens, is_i + 1, se) {
-        return true
+      if !pattern_has_top_pipe(tokens, is_i + 1, se) {
+        if pattern_contains_as_kw(tokens, is_i + 1, se) {
+          return true
+        }
+        if pattern_contains_struct_pat(tokens, is_i + 1, se) {
+          return true
+        }
       }
-      if pattern_contains_struct_pat(tokens, is_i + 1, se) && !pattern_has_top_pipe(tokens, is_i + 1, se) {
+    }
+  }
+  false
+}
+
+///| Fail-closed check: reject top-level `|` or-patterns combined with `as` in `if`/`guard` `is` conditions.
+fn check_unsupported_pipe_as_in_cond(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> Bool {
+  let segs = split_cond_ampamp_segs(tokens, start, end)
+  for seg in segs {
+    let (ss, se) = seg
+    let is_i = find_top_level_is_kw(tokens, ss, se)
+    if is_i > ss && is_i + 1 < se {
+      if pattern_has_top_pipe(tokens, is_i + 1, se) && pattern_contains_as_kw(tokens, is_i + 1, se) {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          tokens[is_i].line,
+          tokens[is_i].col,
+          "top-level or-pattern `|` combined with `as` binding in `is` condition is not supported (fail-closed)",
+        ))
         return true
       }
     }
@@ -372,13 +402,33 @@ fn lower_is_chain_segs(
     pat_s = pat_s + 1
     pat_e = pat_e - 1
   }
+  if pattern_has_top_pipe(tokens, pat_s, pat_e) &&
+  (pattern_contains_as_kw(tokens, pat_s, pat_e) || pattern_contains_struct_pat(tokens, pat_s, pat_e)) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[pat_s].line,
+      tokens[pat_s].col,
+      "top-level or-pattern `|` with `as` or struct pattern in `is`-chain is not supported (fail-closed)",
+    ))
+  }
   let top_as = find_top_level_as_kw(tokens, pat_s, pat_e)
   let mut alias_var = ""
   let mut inner_pat_e = pat_e
-  if top_as > pat_s && top_as + 1 < pat_e && tokens[top_as + 1].kind == TokenKind::Ident {
-    alias_var = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
-    inner_pat_e = top_as
-    record_is_chain_binder(ctx, alias_var, lhs_ty, bound_out, bound_seen)
+  if top_as > pat_s {
+    if top_as + 2 == pat_e && tokens[top_as + 1].kind == TokenKind::Ident {
+      alias_var = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
+      inner_pat_e = top_as
+      record_is_chain_binder(ctx, alias_var, lhs_ty, bound_out, bound_seen)
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[top_as].line,
+        tokens[top_as].col,
+        "unsupported `as` alias form inside `is`-chain pattern (fail-closed)",
+      ))
+    }
   }
   let scrut_expr = if alias_var.length() > 0 { alias_var } else { lhs_s }
   let body_expr = if pattern_contains_struct_pat(tokens, pat_s, inner_pat_e) {
@@ -400,6 +450,15 @@ fn lower_is_chain_segs(
     let ob_set : Map[String, Bool] = Map()
     for ob in obls { ob_set[ob.0] = true }
     let outer_toks = lex_moonbit(outer_pat)
+    if pattern_contains_as_kw(outer_toks, 0, outer_toks.length() - 1) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[pat_s].line,
+        tokens[pat_s].col,
+        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
+      ))
+    }
     let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
     for rb in outer_raw_bs {
       if !ob_set.contains(rb) && !rb.starts_with("__mbt_sp_") {
@@ -429,6 +488,15 @@ fn lower_is_chain_segs(
       "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
+    if pattern_contains_as_kw(tokens, pat_s, inner_pat_e) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[pat_s].line,
+        tokens[pat_s].col,
+        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
+      ))
+    }
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
@@ -457,6 +525,92 @@ fn lower_is_chain_segs(
   }
 }
 
+///| Recursively consume a complete `if ... { ... } [else if ... { ... }]* [else { ... }]` chain
+///| starting at `if_start` (`tokens[if_start].raw == "if"`), returning `(pion_code, next_token_idx)`.
+fn lower_full_if_else_chain(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  if_start : Int,
+  end : Int,
+  file : String,
+) -> (String, Int) {
+  let sb = StringBuilder()
+  let (head_s, cur0) = lower_one_token_or_form(ctx, tokens, if_start, end, file, false)
+  let mut cur = cur0
+  sb.write_string(head_s)
+  while cur + 1 < end && tokens[cur].kind == TokenKind::Keyword && tokens[cur].raw == "else" {
+    if tokens[cur + 1].kind == TokenKind::LBrace {
+      let erb = find_matching_delim(tokens, cur + 1)
+      let eb = lower_block_range(ctx, tokens, cur + 1, erb, file, "")
+      sb.write_string(tokens[cur].leading_trivia + "else" + tokens[cur + 1].leading_trivia + eb)
+      cur = erb + 1
+      break
+    } else if tokens[cur + 1].kind == TokenKind::Keyword && tokens[cur + 1].raw == "if" {
+      let (sub_s, sub_next) = lower_full_if_else_chain(ctx, tokens, cur + 1, end, file)
+      sb.write_string(tokens[cur].leading_trivia + "else" + sub_s)
+      cur = sub_next
+      break
+    } else {
+      break
+    }
+  }
+  (sb.to_string(), cur)
+}
+
+///| Check whether a block `[lb, rb]` definitely diverges on its last top-level statement
+///| (`return`, `break`, `continue`, or `panic(...)`).
+fn block_definitely_diverges(tokens : Array[Token], lb : Int, rb : Int) -> Bool {
+  if rb <= lb + 1 {
+    return false
+  }
+  let mut last_stmt_start = -1
+  let mut i = lb + 1
+  let mut d = 0
+  let mut stmt_start = lb + 1
+  while i < rb {
+    let tk = tokens[i].kind
+    if d == 0 && tk == TokenKind::Semi {
+      if i > stmt_start {
+        last_stmt_start = stmt_start
+      }
+      stmt_start = i + 1
+      i = i + 1
+      continue
+    }
+    if d == 0 && i > stmt_start && str_has(tokens[i].leading_trivia, "\n") {
+      // Only treat newline as statement boundary when not continuing a binary op or `else`
+      let raw_i = tokens[i].raw
+      if tk == TokenKind::Keyword && (raw_i == "return" || raw_i == "break" || raw_i == "continue" || raw_i == "let" || raw_i == "if" || raw_i == "match" || raw_i == "for" || raw_i == "while" || raw_i == "guard") {
+        last_stmt_start = stmt_start
+        stmt_start = i
+      } else if tk == TokenKind::Ident && raw_i == "panic" && i + 1 < rb && tokens[i + 1].kind == TokenKind::LParen {
+        last_stmt_start = stmt_start
+        stmt_start = i
+      }
+    }
+    if tk == TokenKind::LParen || tk == TokenKind::LBracket || tk == TokenKind::LBrace {
+      d = d + 1
+    } else if tk == TokenKind::RParen || tk == TokenKind::RBracket || tk == TokenKind::RBrace {
+      if d > 0 { d = d - 1 }
+    }
+    i = i + 1
+  }
+  if stmt_start < rb {
+    last_stmt_start = stmt_start
+  }
+  if last_stmt_start < 0 || last_stmt_start >= rb {
+    return false
+  }
+  let ft = tokens[last_stmt_start]
+  if ft.kind == TokenKind::Keyword && (ft.raw == "return" || ft.raw == "break" || ft.raw == "continue") {
+    return true
+  }
+  if ft.kind == TokenKind::Ident && ft.raw == "panic" && last_stmt_start + 1 < rb && tokens[last_stmt_start + 1].kind == TokenKind::LParen {
+    return true
+  }
+  false
+}
+
 ///| Lower `if <cond> { <then> } [else <else>]` when `<cond>` requires `is`-chain lowering.
 ///| Returns `Some((pion_code, next_token_idx))` or `None` if not applicable.
 fn try_lower_if_is_chain(
@@ -469,6 +623,9 @@ fn try_lower_if_is_chain(
   file : String,
   trivia : String,
 ) -> Option[(String, Int)] {
+  if check_unsupported_pipe_as_in_cond(ctx, tokens, if_i + 1, lb, file) {
+    return None
+  }
   if !cond_needs_is_chain_lowering(tokens, if_i + 1, lb) {
     return None
   }
@@ -485,10 +642,6 @@ fn try_lower_if_is_chain(
     let saved_sc = ctx.scope_vars.length()
     let bound_out : Array[String] = []
     let bound_seen : Map[String, Bool] = Map()
-    // Pre-collect binders? No: lower_is_chain_segs pushes binders in order, then lowers then_expr!
-    // We pass a placeholder? Better: lower_then inside a small two-step? No, Pion closures can't
-    // capture mut ctx cleanly without care, so lower_is_chain_segs needs then_s AFTER binders are pushed.
-    // Wait: we can push binders in lower_is_chain_segs and pass `(lb, close_b)` to lower at the leaf!
     let code = lower_is_chain_segs_with_block(
       ctx,
       tokens,
@@ -506,13 +659,15 @@ fn try_lower_if_is_chain(
     return Some((trivia + code, close_b + 1))
   }
   // Has `else`: lower `else` FIRST in the outer scope (so `else` NEVER sees `is` binders!)
+  // Consume the complete `else if ... else ...` chain recursively so trailing `else` is never orphaned.
   let (else_s, next_after_else) = if tokens[close_b + 2].kind == TokenKind::LBrace {
     let else_lb = close_b + 2
     let else_rb = find_matching_delim(tokens, else_lb)
     (lower_block_range(ctx, tokens, else_lb, else_rb, file, ""), else_rb + 1)
   } else {
-    lower_one_token_or_form(ctx, tokens, close_b + 2, end, file, false)
+    lower_full_if_else_chain(ctx, tokens, close_b + 2, end, file)
   }
+  let then_div = block_definitely_diverges(tokens, lb, close_b)
   let saved_sc = ctx.scope_vars.length()
   let bound_out : Array[String] = []
   let bound_seen : Map[String, Bool] = Map()
@@ -524,12 +679,16 @@ fn try_lower_if_is_chain(
     file,
     lb,
     close_b,
-    true,
-    "Option::None",
+    !then_div,
+    if then_div { "()" } else { "Option::None" },
     bound_out,
     bound_seen,
   )
   restore_scope_vars(ctx, saved_sc)
+  if then_div {
+    let out = trivia + "{ " + chain_s + "; " + else_s.trim() + " }"
+    return Some((out, next_after_else))
+  }
   let res_v = fresh_temp(ctx, "ic")
   let out = trivia + "match (" + chain_s + ") { Option::Some(" + res_v + ") => " + res_v + ", Option::None => " + else_s.trim() + " }"
   Some((out, next_after_else))
@@ -581,13 +740,33 @@ fn lower_is_chain_segs_with_block(
     pat_s = pat_s + 1
     pat_e = pat_e - 1
   }
+  if pattern_has_top_pipe(tokens, pat_s, pat_e) &&
+  (pattern_contains_as_kw(tokens, pat_s, pat_e) || pattern_contains_struct_pat(tokens, pat_s, pat_e)) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[pat_s].line,
+      tokens[pat_s].col,
+      "top-level or-pattern `|` with `as` or struct pattern in `is`-chain is not supported (fail-closed)",
+    ))
+  }
   let top_as = find_top_level_as_kw(tokens, pat_s, pat_e)
   let mut alias_var = ""
   let mut inner_pat_e = pat_e
-  if top_as > pat_s && top_as + 1 < pat_e && tokens[top_as + 1].kind == TokenKind::Ident {
-    alias_var = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
-    inner_pat_e = top_as
-    record_is_chain_binder(ctx, alias_var, lhs_ty, bound_out, bound_seen)
+  if top_as > pat_s {
+    if top_as + 2 == pat_e && tokens[top_as + 1].kind == TokenKind::Ident {
+      alias_var = resolve_ident_in_scope(ctx, tokens[top_as + 1].raw)
+      inner_pat_e = top_as
+      record_is_chain_binder(ctx, alias_var, lhs_ty, bound_out, bound_seen)
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[top_as].line,
+        tokens[top_as].col,
+        "unsupported `as` alias form inside `is`-chain pattern (fail-closed)",
+      ))
+    }
   }
   let scrut_expr = if alias_var.length() > 0 { alias_var } else { lhs_s }
   let body_expr = if pattern_contains_struct_pat(tokens, pat_s, inner_pat_e) {
@@ -607,6 +786,15 @@ fn lower_is_chain_segs_with_block(
     let ob_set : Map[String, Bool] = Map()
     for ob in obls { ob_set[ob.0] = true }
     let outer_toks = lex_moonbit(outer_pat)
+    if pattern_contains_as_kw(outer_toks, 0, outer_toks.length() - 1) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[pat_s].line,
+        tokens[pat_s].col,
+        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
+      ))
+    }
     let outer_raw_bs = collect_pattern_binders(outer_toks, 0, outer_toks.length() - 1)
     for rb in outer_raw_bs {
       if !ob_set.contains(rb) && !rb.starts_with("__mbt_sp_") {
@@ -638,6 +826,15 @@ fn lower_is_chain_segs_with_block(
       "match " + scrut_expr + " { " + outer_pat + " => " + expanded + ", _ => " + fail_expr + " }"
     }
   } else {
+    if pattern_contains_as_kw(tokens, pat_s, inner_pat_e) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[pat_s].line,
+        tokens[pat_s].col,
+        "nested `as` binding on non-struct sub-pattern inside `is`-chain is not supported (fail-closed)",
+      ))
+    }
     if lhs_ty.length() > 0 {
       push_expected_type(ctx, lhs_ty)
     }
@@ -870,6 +1067,9 @@ fn try_lower_diverging_guard_is_chain(
   else_body : String,
   file : String,
 ) -> Option[String] {
+  if check_unsupported_pipe_as_in_cond(ctx, tokens, guard_i + 1, else_idx, file) {
+    return None
+  }
   if !cond_needs_is_chain_lowering(tokens, guard_i + 1, else_idx) {
     return None
   }
@@ -919,6 +1119,9 @@ fn try_lower_value_guard_is_chain(
   end : Int,
   file : String,
 ) -> Option[String] {
+  if check_unsupported_pipe_as_in_cond(ctx, tokens, guard_i + 1, else_idx, file) {
+    return None
+  }
   if !cond_needs_is_chain_lowering(tokens, guard_i + 1, else_idx) {
     return None
   }

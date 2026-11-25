@@ -128,10 +128,36 @@ pub fn run_f3d3_1() -> String {
     acc = acc + (w.px / w.h).to_int()
   }
 
+  // `if <is-chain> ... else if ... else` + double-diverging `if <is-chain> { return } else { return }`
+  let eie_fn = fn(opt : Fling?, flag : Bool) -> Int {
+    if opt is Some({ v0, .. }) && v0 > 10.0 {
+      1
+    } else if flag {
+      2
+    } else {
+      3
+    }
+  }
+  let dd_fn = fn(opt : Fling?) -> Int {
+    if opt is Some({ v0, .. }) && v0 > 0.0 {
+      return 11
+    } else {
+      return 22
+    }
+  }
+  let eie_res = eie_fn(Some(f_ok), true).to_string() + "," + eie_fn(Some(f_ok), false).to_string()
+  let dd_res = dd_fn(Some(f_ok)).to_string() + "," + dd_fn(None).to_string()
+
+  // `.filter` / `.each` closure expected-type isolation
+  let flings : Array[Fling] = [f_ok, f_no_way]
+  let kept = flings.filter(fn(x) { x.way is Some(_) })
+  let mut ksum = 0
+  kept.each(fn(x) { ksum = ksum + x.tag })
+
   // `f_ok.tag` should be 11 (proving `as f` preserved identity!)
   r1.to_string() + "," + r2.to_string() + "," + r3.to_string() + "|" +
   gr1.to_string() + "," + gr2.to_string() + "," + f_ok.tag.to_string() + "|" +
-  acc.to_string() + "|" + log.join(",")
+  acc.to_string() + "|" + eie_res + "|" + dd_res + "," + ksum.to_string() + "|" + log.join(",")
 }
 
 // 2. `match` guard `Some(x) if <guard>` + `Int::to_char()`
@@ -213,6 +239,7 @@ pub fn local_plain(x : Int) -> Int {
 }
 
 #callsite(autofill(loc))
+#deprecated("stacked attr test")
 fn capture_loc(loc~ : SourceLoc) -> SourceLoc {
   loc
 }
@@ -343,6 +370,32 @@ pub fn f(xs : Array[Int], e : Evil) -> Unit {
 }
 '''
 
+NEG_PIPE_AS_MBT = r'''
+priv enum E {
+  A(Int)
+  B(Int)
+}
+
+pub fn f(e : E) -> Int {
+  if e is (A(v) as x | B(v) as x) {
+    let _ = x
+    v
+  } else {
+    0
+  }
+}
+'''
+
+NEG_NESTED_AS_MBT = r'''
+pub fn f(opt : Int?) -> Int {
+  if opt is Some(x as y) && y > 0 {
+    x
+  } else {
+    0
+  }
+}
+'''
+
 
 def run_cmd(cmd, cwd=None):
     p = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300)
@@ -418,7 +471,7 @@ def main():
         pion_wasm = run_cmd([args.pionc, "run", "--target", "wasm32", pl])
 
         expected = (
-            "F3d3-1:5,999,999|14,77,11|3|scrut:1,rhs:1a,rhs:1b,scrut:2,scrut:3,rhs:3a,scrut:g,rhs:ga,scrut:g\n"
+            "F3d3-1:5,999,999|14,77,11|3|2,3|11,22,11|scrut:1,rhs:1a,rhs:1b,scrut:2,scrut:3,rhs:3a,scrut:g,rhs:ga,scrut:g\n"
             "F3d3-2:A,A,#1127,#999,#56296,#1115112|hit:105:2,miss:20|105,101\n"
             "F3d3-3:1,0,5|base,b,c:10,200,300:77\n"
             "F3d3-4:1,2,3|15,12|true,true,true\n"
@@ -436,8 +489,10 @@ def main():
         assert_publish_blocked(bin_path, args.pionc, work, "arr_gap", NEG_ARR_GAP_MBT, "E_NON_EXHAUSTIVE")
         assert_publish_blocked(bin_path, args.pionc, work, "pi_map", NEG_PUSH_ITER_MAP_MBT, "MBT2PION_ARRAY_ITER_MUTATION")
         assert_publish_blocked(bin_path, args.pionc, work, "pi_custom", NEG_PUSH_ITER_CUSTOM_MBT, "MBT2PION_ARRAY_ITER_MUTATION")
+        assert_publish_blocked(bin_path, args.pionc, work, "pipe_as", NEG_PIPE_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
+        assert_publish_blocked(bin_path, args.pionc, work, "nested_as", NEG_NESTED_AS_MBT, "MBT2PION_UNSUPPORTED_SYNTAX")
 
-        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 6 positive + 6 negative cases)")
+        print("PASS: Wave M2-F3d-3 3-Engine Differential Oracle (Moon wasm-gc == Pion native == Pion wasm32, 6 positive + 8 negative cases)")
     finally:
         shutil.rmtree(work, ignore_errors=True)
 
