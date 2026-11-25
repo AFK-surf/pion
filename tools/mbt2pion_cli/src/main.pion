@@ -919,6 +919,7 @@ fn scan_unmanaged_tree(
   rel_dir : String,
   gen_set : Map[String, Bool],
   companion_set : Map[String, Bool],
+  prev_companion_hashes : Map[String, String],
   unmanaged_dirs : Array[(String, Int)],
   unmanaged_symlinks : Array[(String, String)],
   unmanaged_files : Array[(String, Int)],
@@ -951,6 +952,7 @@ fn scan_unmanaged_tree(
           rel,
           gen_set,
           companion_set,
+          prev_companion_hashes,
           unmanaged_dirs,
           unmanaged_symlinks,
           unmanaged_files,
@@ -965,22 +967,31 @@ fn scan_unmanaged_tree(
         Ok(tgt) => unmanaged_symlinks.push((rel, tgt))
         Err(e) => return Err("cannot readlink in --out (" + full + "): " + e)
       }
-      Some("file") =>
-      if (rel.ends_with(".pion") && is_managed_pion_file(world, full)) || rel == "mbt2pion_abi.json" || companion_set.contains(rel) {
-        // Managed `.pion` file, declared companion, or `mbt2pion_abi.json`: replaced atomically from source/generation
-        let _ = 0
-      } else {
-        let mode = fs_lstat_mode(full)
-        if mode < 0 {
-          return Err("cannot stat file mode in --out: " + full)
-        }
-        if rel.ends_with(".pion") && !gen_set.contains(rel) {
+      Some("file") => {
+        let is_retired_companion = match prev_companion_hashes.get(rel) {
+          Some(prev_sha) =>
           match fs_read(world, full) {
-            Ok(txt) => preserved_unmanaged_pions.push((rel, txt))
-            Err(e) => return Err("unreadable unmanaged .pion file in --out (" + full + "): " + e)
+            Ok(cur_txt) => m2p::content_sha256(cur_txt) == prev_sha
+            Err(_) => false
           }
+          None => false
         }
-        unmanaged_files.push((rel, mode))
+        if (rel.ends_with(".pion") && is_managed_pion_file(world, full)) || rel == "mbt2pion_abi.json" || companion_set.contains(rel) || is_retired_companion {
+          // Managed `.pion` file, declared companion, unmodified retired companion, or `mbt2pion_abi.json`
+          let _ = 0
+        } else {
+          let mode = fs_lstat_mode(full)
+          if mode < 0 {
+            return Err("cannot stat file mode in --out: " + full)
+          }
+          if rel.ends_with(".pion") && !gen_set.contains(rel) {
+            match fs_read(world, full) {
+              Ok(txt) => preserved_unmanaged_pions.push((rel, txt))
+              Err(e) => return Err("unreadable unmanaged .pion file in --out (" + full + "): " + e)
+            }
+          }
+          unmanaged_files.push((rel, mode))
+        }
       }
       Some(other_k) =>
       return Err("unsupported special file (" + other_k + ") in --out: " + full)
@@ -1464,7 +1475,16 @@ pub fn main(world : World) -> Int {
         }
         let mut dep_abi_ok = false
         match m2p::verify_and_parse_dep_abi(dep.0, scan_root, dep_pion_files, abi_json_opt, pre_diags) {
-          Some(parsed_abi) => {
+          Some(parsed_abi) =>
+          if mode == "publish" && !parsed_abi.publishable {
+            pre_diags.push(m2p::diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              scan_root + "/mbt2pion_abi.json",
+              1,
+              1,
+              "dep `" + dep.0 + "` was emitted in `--mode audit` with blockers (`publishable: false`) and cannot be consumed by `--mode publish`",
+            ))
+          } else {
             dep_abis.push((dep.0, parsed_abi))
             dep_abi_ok = true
           }
@@ -1802,12 +1822,17 @@ pub fn main(world : World) -> Int {
             _ => ()
           }
         }
+        let prev_companion_hashes : Map[String, String] = match fs_read(world, join_path(clean_out_dir, "mbt2pion_abi.json")) {
+          Ok(prev_abi_txt) => m2p::extract_abi_companion_hashes(prev_abi_txt)
+          Err(_) => Map()
+        }
         match scan_unmanaged_tree(
           world,
           clean_out_dir,
           "",
           gen_set,
           companion_name_set,
+          prev_companion_hashes,
           unmanaged_dirs,
           unmanaged_symlinks,
           unmanaged_files,
@@ -2366,8 +2391,31 @@ pub fn main(world : World) -> Int {
       }
     }
   } else {
-    // `--mode audit`: write generated files + verified companions + `mbt2pion_abi.json` for chained `--mode audit --dep ...`
+    // `--mode audit`: remove stale managed `.pion` and unmodified retired companions from previous run,
+    // then write generated files + verified companions + `mbt2pion_abi.json` for chained `--mode audit --dep ...`
     let _ = fs_mkdir_p(world, out_dir)
+    let audit_prev_comps : Map[String, String] = match fs_read(world, join_path(out_dir, "mbt2pion_abi.json")) {
+      Ok(prev_abi_txt) => m2p::extract_abi_companion_hashes(prev_abi_txt)
+      Err(_) => Map()
+    }
+    let existing_audit_pions : Array[String] = []
+    collect_files_sorted(world, out_dir, "", ".pion", existing_audit_pions)
+    for rel in existing_audit_pions {
+      if !gen_set.contains(rel) && !companion_name_set.contains(rel) {
+        let full_old = join_path(out_dir, rel)
+        let is_retired_comp = match audit_prev_comps.get(rel) {
+          Some(prev_sha) =>
+          match fs_read(world, full_old) {
+            Ok(cur_txt) => m2p::content_sha256(cur_txt) == prev_sha
+            Err(_) => false
+          }
+          None => false
+        }
+        if is_managed_pion_file(world, full_old) || is_retired_comp {
+          let _ = fs_remove(world, full_old)
+        }
+      }
+    }
     let audit_abi_pairs : Array[(String, String)] = []
     for gf in final_res.files {
       audit_abi_pairs.push((gf.rel_path, gf.content))

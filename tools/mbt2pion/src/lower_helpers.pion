@@ -2124,7 +2124,8 @@ pub fn preprocess_op_trait_impls(
 ) -> (Array[SourceFile], Array[OpImplEntry]) {
   let used_syms : Map[String, Bool] = Map()
   let pub_types : Map[String, Bool] = Map()
-  // Pass 1: collect all existing top-level identifiers & pub types across all source files
+  // Pass 1: collect ALL identifiers (at ANY lexical depth, so local closures/bindings can never shadow
+  // generated `mbt_op_<op>_<Type>` helpers — Astra P0-1) & top-level `pub` types across all source files
   for sf in sources {
     let toks = lex_moonbit(sf.content)
     let n = toks.length() - 1
@@ -2134,10 +2135,10 @@ pub fn preprocess_op_trait_impls(
       let t = toks[i]
       if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
       if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent {
+        used_syms[t.raw] = true
+      }
       if depth == 0 {
-        if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent {
-          used_syms[t.raw] = true
-        }
         if t.kind == TokenKind::Keyword && t.raw == "pub" {
           let mut k = i + 1
           if k < n && toks[k].kind == TokenKind::LParen {
@@ -2293,13 +2294,14 @@ struct NegProbeCandidate {
   operand_expr : String
 }
 
-///| Active type-directed unary `Neg` (`-p`, `-p.x`, `-get_p().y`, `-(a + b)`) probing pass.
+///| Active type-directed unary `Neg` (`-p`, `-p.x`, `-get_p().y`, `-(a + b)`, `-as_int(-p)`, `------p`) probing pass.
+///| Uses innermost-first probing and iterates up to 64 rounds (fail-closed if exceeded).
 ///| Only runs when `has_any_neg_impl(op_lookup)` is true (zero overhead otherwise).
 pub fn run_neg_probe_pass(
   files : Array[GeneratedFile],
   op_lookup : Map[String, String],
   check_fn : (Array[(String, String)]) -> String,
-  _diags : Array[Diag],
+  diags : Array[Diag],
 ) -> (Array[GeneratedFile], Bool) {
   if !has_any_neg_impl(op_lookup) {
     return (files, false)
@@ -2309,7 +2311,8 @@ pub fn run_neg_probe_pass(
   let safe_by_file : Map[String, Map[Int, Bool]] = Map()
   let mut seq = 0
   let mut round = 0
-  while round < 4 {
+  let mut last_round_progressed = false
+  while round < 64 {
     let cands_by_file : Map[String, Array[NegProbeCandidate]] = Map()
     let scratch_batch : Array[(String, String)] = []
     let mut total_cands = 0
@@ -2371,10 +2374,24 @@ pub fn run_neg_probe_pass(
                   break
                 }
               }
-              if j > i + 1 {
+              // Innermost-first (Astra P0-2 / `-as_int(-p)`): if `[i + 1 .. j)` contains any unprobed
+              // inner unary `-` (excluding bare numeric literals), defer this outer `-` to a later round!
+              let mut has_inner_unprobed = false
+              let mut k = i + 1
+              while k < j {
+                if toks[k].kind == TokenKind::Minus && !smap.contains(toks[k].start_byte) {
+                  let k_unary = k == 0 || toks[k].newline_before || !is_value_ending_tok(toks[k - 1])
+                  if k_unary && k + 1 < tn &&
+                  toks[k + 1].kind != TokenKind::IntLit && toks[k + 1].kind != TokenKind::FloatLit {
+                    has_inner_unprobed = true
+                    break
+                  }
+                }
+                k = k + 1
+              }
+              if !has_inner_unprobed && j > i + 1 {
                 let end_b = toks[j - 1].end_byte
                 let expr_s = gf.content.slice(toks[i + 1].start_byte, end_b).trim()
-                // Skip if operand itself starts with unary `-` (nested `-(-p)` resolves inner first)
                 if expr_s.length() > 0 {
                   let pid = "p" + seq.to_string()
                   seq = seq + 1
@@ -2406,6 +2423,7 @@ pub fn run_neg_probe_pass(
       scratch_batch.push((gf.rel_path, scratch_src))
     }
     if total_cands == 0 {
+      last_round_progressed = false
       break
     }
     let raw_json = check_fn(scratch_batch)
@@ -2421,6 +2439,7 @@ pub fn run_neg_probe_pass(
       }
     }
     let mut round_changed = false
+    let mut new_safe_added = false
     let next_files : Array[GeneratedFile] = []
     for gf in cur_files {
       let fcands = match cands_by_file.get(gf.rel_path) {
@@ -2440,11 +2459,17 @@ pub fn run_neg_probe_pass(
               real_edits.push((c.minus_byte, c.end_byte, fn_name + "(" + c.operand_expr + ")"))
             }
             None => {
-              smap[c.minus_byte] = true
+              if !smap.contains(c.minus_byte) {
+                smap[c.minus_byte] = true
+                new_safe_added = true
+              }
             }
           }
           None => {
-            smap[c.minus_byte] = true
+            if !smap.contains(c.minus_byte) {
+              smap[c.minus_byte] = true
+              new_safe_added = true
+            }
           }
         }
       }
@@ -2464,10 +2489,20 @@ pub fn run_neg_probe_pass(
       }
     }
     cur_files = next_files
-    if !round_changed {
+    last_round_progressed = round_changed || new_safe_added
+    if !last_round_progressed {
       break
     }
     round = round + 1
+  }
+  if round == 64 && last_round_progressed {
+    diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      "<neg-probe>",
+      1,
+      1,
+      "unary `-` operator trait lowering did not converge within 64 rounds (fail-closed)",
+    ))
   }
   (cur_files, total_changed)
 }

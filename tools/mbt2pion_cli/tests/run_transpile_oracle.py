@@ -105,7 +105,7 @@ CASES = {
     "transpile_round2": ("ok", 8),
     "transpile_mid_tier": ("ok", 14),
     "transpile_upper_tier": ("ok", 34),
-    "wave_m2_d1": ("ok", 7),
+    "wave_m2_d1": ("ok", 11),
 }
 
 MOON_TRAPS = {
@@ -1911,6 +1911,35 @@ pub fn d1_op_coexist_and_neg() -> (Int, Int, Int, Int, Int, Int) {
   (r_plus, r_method, n1, n2, n3, n4)
 }
 
+pub(all) struct D1Step {
+  v : Int
+}
+
+pub impl Neg for D1Step with neg(self) {
+  D1Step::{ v: self.v + 10 }
+}
+
+fn d1_as_int(s : D1Step) -> Int {
+  s.v
+}
+
+pub fn d1_op_astra_and_redteam_regressions() -> (Int, Int, Int, Int, Int, Int) {
+  let a = D1P::{ n: 7 }
+  let b = D1P::{ n: 3 }
+  let mbt_op_add_D1P = fn(_x : D1P, _y : D1P) -> D1P { D1P::{ n: 99 } }
+  let mbt_op_neg_D1P = fn(_x : D1P) -> D1P { D1P::{ n: 99 } }
+  let _ = mbt_op_add_D1P(a, b)
+  let _ = mbt_op_neg_D1P(a)
+  let sh_add = (a + b).n
+  let sh_neg = (-a).n
+  let st = D1Step::{ v: 7 }
+  let deep6 = (------st).v
+  let mixed = -d1_as_int(-st)
+  let dbl_neg_add = (-(-(a + b))).n
+  let rhs_lit = (a + D1P::{ n: 2 }).n
+  (sh_add, sh_neg, deep6, mixed, dbl_neg_add, rhs_lit)
+}
+
 pub fn d1_op_prec_and_order() -> (Int, Int, Int, Int, Int, Int) {
   let a = D1P::{ n: 10 }
   let b = D1P::{ n: 3 }
@@ -2553,7 +2582,8 @@ fn main {
     let (rp, rm, n1, n2, n3, n4) = @m12.d1_op_coexist_and_neg()
     let (p1, p2, p3, p4, p5, ord) = @m12.d1_op_prec_and_order()
     let (nan_ok, b_ok, fu_s, ru_s, bn, bz, bf, bf0, bf3) = @m12.d1_float_and_bytes_compat()
-    trace("d1_ops", "\{rp}:\{rm}:\{n1}:\{n2}:\{n3}:\{n4},\{p1}:\{p2}:\{p3}:\{p4}:\{p5}:\{ord}")
+    let (sa, sn, d6, mx, dna, rl) = @m12.d1_op_astra_and_redteam_regressions()
+    trace("d1_ops", "\{rp}:\{rm}:\{n1}:\{n2}:\{n3}:\{n4},\{p1}:\{p2}:\{p3}:\{p4}:\{p5}:\{ord},\{sa}:\{sn}:\{d6}:\{mx}:\{dna}:\{rl}")
     trace("d1_compat", "\{nan_ok}:\{b_ok},\{fu_s},\{ru_s},\{bn}:\{bz}:\{bf}:\{bf0}:\{bf3}")
     check("d1.op_coexist", rp == 10 && rm == 4)
     check("d1.op_neg", n1 == -7 && n2 == -4 && n3 == -9 && n4 == -10)
@@ -2562,6 +2592,10 @@ fn main {
     check("d1.float_is_nan", nan_ok)
     check("d1.float_uint_bits", fu_s.length() > 0 && ru_s.length() > 0)
     check("d1.bytes_make", bn == 0 && bz == 0 && bf == 4 && b_ok && bf0 == 171 && bf3 == 171)
+    check("d1.op_local_shadow", sa == 10 && sn == -7)
+    check("d1.op_neg_deep_and_mixed", d6 == 67 && mx == -17)
+    check("d1.op_neg_nested_binop", dna == 10)
+    check("d1.op_rhs_struct_lit", rl == 9)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -3178,7 +3212,8 @@ pub fn main(w : World) -> Int {
     let (rp, rm, n1, n2, n3, n4) = m12::d1_op_coexist_and_neg()
     let (p1, p2, p3, p4, p5, ord) = m12::d1_op_prec_and_order()
     let (nan_ok, b_ok, fu_s, ru_s, bn, bz, bf, bf0, bf3) = m12::d1_float_and_bytes_compat()
-    trace(w, "d1_ops", rp.to_string() + ":" + rm.to_string() + ":" + n1.to_string() + ":" + n2.to_string() + ":" + n3.to_string() + ":" + n4.to_string() + "," + p1.to_string() + ":" + p2.to_string() + ":" + p3.to_string() + ":" + p4.to_string() + ":" + p5.to_string() + ":" + ord.to_string())
+    let (sa, sn, d6, mx, dna, rl) = m12::d1_op_astra_and_redteam_regressions()
+    trace(w, "d1_ops", rp.to_string() + ":" + rm.to_string() + ":" + n1.to_string() + ":" + n2.to_string() + ":" + n3.to_string() + ":" + n4.to_string() + "," + p1.to_string() + ":" + p2.to_string() + ":" + p3.to_string() + ":" + p4.to_string() + ":" + p5.to_string() + ":" + ord.to_string() + "," + sa.to_string() + ":" + sn.to_string() + ":" + d6.to_string() + ":" + mx.to_string() + ":" + dna.to_string() + ":" + rl.to_string())
     trace(w, "d1_compat", nan_ok.to_string() + ":" + b_ok.to_string() + "," + fu_s + "," + ru_s + "," + bn.to_string() + ":" + bz.to_string() + ":" + bf.to_string() + ":" + bf0.to_string() + ":" + bf3.to_string())
     check(w, "d1.op_coexist", rp == 10 && rm == 4)
     check(w, "d1.op_neg", n1 == -7 && n2 == -4 && n3 == -9 && n4 == -10)
@@ -3187,6 +3222,10 @@ pub fn main(w : World) -> Int {
     check(w, "d1.float_is_nan", nan_ok)
     check(w, "d1.float_uint_bits", fu_s.length() > 0 && ru_s.length() > 0)
     check(w, "d1.bytes_make", bn == 0 && bz == 0 && bf == 4 && b_ok && bf0 == 171 && bf3 == 171)
+    check(w, "d1.op_local_shadow", sa == 10 && sn == -7)
+    check(w, "d1.op_neg_deep_and_mixed", d6 == 67 && mx == -17)
+    check(w, "d1.op_neg_nested_binop", dna == 10)
+    check(w, "d1.op_rhs_struct_lit", rl == 9)
   } else {
     panic("abort: unknown case " + kase)
   }

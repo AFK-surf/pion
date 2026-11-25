@@ -2787,7 +2787,98 @@ for tag, code in [
         f"D1 negative {tag} MUST fail-closed with MBT2PION_UNSUPPORTED_SYNTAX, got rc={r_neg.returncode}\n{r_neg.stdout}\n{r_neg.stderr}"
     )
 
-print("[e2e] PASS: Wave M2-D1 E2E suite (ABI v1 compat, ABI v2 test/wbtest isolation, 4 companion atomic cases, chained audit ABI, compound assign fail-closed, get().push fail-closed)")
+# 6. Astra P1 / Red-team P2-2: removing companion from recipe and republishing to same `--out` cleans up old companion
+#    so downstream `--dep` publish exits 0!
+comp_pkg = os.path.join(d1_root, "comp_pkg")
+os.makedirs(os.path.join(comp_pkg, "src"), exist_ok=True)
+with open(os.path.join(comp_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "comp_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r_cp1 = subprocess.run(
+    [bin_path, "--src", comp_mbt_src, "--out", os.path.join(comp_pkg, "src"), "--recipes", comp_rec,
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_cp1.returncode == 0 and os.path.isfile(os.path.join(comp_pkg, "src", "zz_compat.pion"))
+empty_rec = os.path.join(d1_root, "empty_recipes.toml")
+open(empty_rec, "w").write("# companion removed\n")
+r_cp2 = subprocess.run(
+    [bin_path, "--src", comp_mbt_src, "--out", os.path.join(comp_pkg, "src"), "--recipes", empty_rec,
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_cp2.returncode == 0, f"Republish without companion failed:\n{r_cp2.stdout}\n{r_cp2.stderr}"
+assert not os.path.exists(os.path.join(comp_pkg, "src", "zz_compat.pion")), "Old retired companion MUST be removed!"
+cp_cons_src = os.path.join(d1_root, "cp_cons_src")
+cp_cons_out = os.path.join(d1_root, "cp_cons_out")
+os.makedirs(cp_cons_src, exist_ok=True)
+open(os.path.join(cp_cons_src, "u.mbt"), "w").write("pub fn use_cp() -> Int { @comp_pkg.fa() }\n")
+r_cp_cons = subprocess.run(
+    [bin_path, "--src", cp_cons_src, "--out", cp_cons_out, "--dep", f"comp_pkg={comp_pkg}",
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_cp_cons.returncode == 0, f"Downstream publish after companion removal failed:\n{r_cp_cons.stdout}\n{r_cp_cons.stderr}"
+
+# 7. Astra Supplement B: repeated `--mode audit` after renaming `first.mbt` -> `second.mbt` removes stale `first.pion`
+ren_src = os.path.join(d1_root, "ren_src")
+ren_pkg = os.path.join(d1_root, "ren_pkg")
+os.makedirs(ren_src, exist_ok=True)
+os.makedirs(os.path.join(ren_pkg, "src"), exist_ok=True)
+with open(os.path.join(ren_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "ren_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+open(os.path.join(ren_src, "first.mbt"), "w").write("pub fn r1() -> Int { 1 }\n")
+r_ren1 = subprocess.run(
+    [bin_path, "--src", ren_src, "--out", os.path.join(ren_pkg, "src"),
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "audit", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_ren1.returncode == 0 and os.path.isfile(os.path.join(ren_pkg, "src", "first.pion"))
+os.rename(os.path.join(ren_src, "first.mbt"), os.path.join(ren_src, "second.mbt"))
+r_ren2 = subprocess.run(
+    [bin_path, "--src", ren_src, "--out", os.path.join(ren_pkg, "src"),
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "audit", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_ren2.returncode == 0 and os.path.isfile(os.path.join(ren_pkg, "src", "second.pion"))
+assert not os.path.exists(os.path.join(ren_pkg, "src", "first.pion")), "Repeated audit MUST remove stale first.pion!"
+ren_rep = os.path.join(d1_root, "ren_cons_rep.json")
+r_ren_cons = subprocess.run(
+    [bin_path, "--src", comp_mbt_src, "--out", os.path.join(d1_root, "ren_cons_out"),
+     "--dep", f"ren_pkg={ren_pkg}", "--mbt-compat", compat_dir,
+     "--report", ren_rep, "--target", "native", "--mode", "audit", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_ren_cons.returncode == 0
+ren_diags = json.load(open(ren_rep)).get("diagnostics", [])
+assert not any(d.get("code") == "MBT2PION_DEP_ABI_ERROR" for d in ren_diags), f"Renamed audit dep had DEP_ABI_ERROR: {ren_diags}"
+
+# 8. Opus P2: `--mode audit` with blocker marks `publishable: false`; downstream `--mode publish` rejects with MBT2PION_DEP_ABI_ERROR!
+blk_src = os.path.join(d1_root, "blk_src")
+blk_pkg = os.path.join(d1_root, "blk_pkg")
+os.makedirs(blk_src, exist_ok=True)
+os.makedirs(os.path.join(blk_pkg, "src"), exist_ok=True)
+with open(os.path.join(blk_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "blk_pkg"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+open(os.path.join(blk_src, "bad.mbt"), "w").write('pub struct V { x : Int }\npub impl Add for V with add(self, other) { V::{ x: self.x + other.x } }\npub fn f(a : V, b : V) -> V { let mut p = a; p += b; p }\n')
+r_blk_aud = subprocess.run(
+    [bin_path, "--src", blk_src, "--out", os.path.join(blk_pkg, "src"),
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "audit", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_blk_aud.returncode == 0
+blk_abi = json.load(open(os.path.join(blk_pkg, "src", "mbt2pion_abi.json")))
+assert blk_abi["payload"].get("publishable") is False, f"Audit with blocker MUST mark publishable=false: {blk_abi}"
+r_blk_pub = subprocess.run(
+    [bin_path, "--src", comp_mbt_src, "--out", os.path.join(d1_root, "blk_cons_out"),
+     "--dep", f"blk_pkg={blk_pkg}", "--mbt-compat", compat_dir,
+     "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_blk_pub.returncode != 0 and "MBT2PION_DEP_ABI_ERROR" in (r_blk_pub.stdout + r_blk_pub.stderr), (
+    f"Downstream publish MUST reject publishable=false dep with MBT2PION_DEP_ABI_ERROR, got rc={r_blk_pub.returncode}\n{r_blk_pub.stdout}\n{r_blk_pub.stderr}"
+)
+
+print("[e2e] PASS: Wave M2-D1 E2E suite (ABI v1 compat, ABI v2 test/wbtest isolation, 4 companion atomic cases + removal cleanup, chained & renamed audit ABI, publishable=false gate, compound assign fail-closed, get().push fail-closed)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"
