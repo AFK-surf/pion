@@ -845,7 +845,7 @@ fn instrument_probes_for_file_with_safe(
   let mut slice_only_pass = false
   if str_has(content, "__mbt_slice_owned") || str_has(content, "__mbt_slice_borrow") ||
   str_has(content, "__mbt_slice_ro_join") || str_has(content, "__mbt_slice_ro_show") ||
-  str_has(content, "__mbt_match_scrut") || str_has(content, "__mbt_ufcs_dispatch") {
+  str_has(content, "__mbt_match_scrut") || str_has(content, "__mbt_ufcs_dispatch") || str_has(content, "__mbt_show_trait") {
     let mut si = 0
     while si < n {
       if (tokens[si].kind == TokenKind::InterpString || tokens[si].kind == TokenKind::InterpMultiline) &&
@@ -857,7 +857,8 @@ fn instrument_probes_for_file_with_safe(
       tokens[si + 1].kind == TokenKind::ColonColon &&
       (tokens[si + 2].raw == "__mbt_slice_owned" || tokens[si + 2].raw == "__mbt_slice_borrow" ||
         tokens[si + 2].raw == "__mbt_slice_ro_join" || tokens[si + 2].raw == "__mbt_slice_ro_show" ||
-        tokens[si + 2].raw == "__mbt_match_scrut" || tokens[si + 2].raw == "__mbt_ufcs_dispatch") &&
+        tokens[si + 2].raw == "__mbt_match_scrut" || tokens[si + 2].raw == "__mbt_ufcs_dispatch" ||
+        tokens[si + 2].raw == "__mbt_show_trait") &&
       tokens[si + 3].kind == TokenKind::LParen &&
       !safe_offsets.contains(base_offset + tokens[si + 2].start_byte) {
         slice_only_pass = true
@@ -887,6 +888,8 @@ fn instrument_probes_for_file_with_safe(
       if close_p > i + 3 {
         // Split depth-0 comma-separated arguments `(recv, lo, hi)`
         let s_args : Array[String] = []
+        let mut recv_s = -1
+        let mut recv_e = -1
         let mut ai = i + 4
         while ai < close_p {
           if tokens[ai].kind == TokenKind::Comma {
@@ -907,6 +910,10 @@ fn instrument_probes_for_file_with_safe(
             ae = ae + 1
           }
           if ae > ai {
+            if s_args.length() == 0 {
+              recv_s = ai
+              recv_e = ae
+            }
             s_args.push(content.slice(tokens[ai].start_byte, tokens[ae - 1].end_byte).trim())
           }
           ai = ae + 1
@@ -923,7 +930,12 @@ fn instrument_probes_for_file_with_safe(
           } else {
             "mbt_slice_borrow_probe"
           }
-          let sep_arg = if s_args.length() == 4 { s_args[3] } else { "" }
+          // A borrowed slice whose receiver is a proven-fresh allocation (inline, or the hygienic
+          // `let __mbt_sl_N = <fresh>;` temp Stage A binds right before it) has no other owner, so a view
+          // over a buffer of its own is exact: tag it for `rewrite_for_probe_hygienic`.
+          let fresh_recv = pkind == "mbt_slice_borrow_probe" && recv_s >= 0 &&
+          (is_proven_fresh_array_alloc(tokens, recv_s, recv_e) || slice_temp_bound_fresh(tokens, i, s_args[0]))
+          let sep_arg = if s_args.length() == 4 { s_args[3] } else if fresh_recv { fresh_slice_recv_tag() } else { "" }
           let start_b = t.start_byte
           let end_b = tokens[close_p].end_byte
           sites.push(ProbeSite::{
@@ -1005,6 +1017,57 @@ fn instrument_probes_for_file_with_safe(
           i = close_p + 1
           continue
         }
+      }
+    }
+
+    // 0a2b. Wave M2-F3b: `Show::to_string(x)` placeholder `mbt_compat::__mbt_show_trait(x)`, resolved by the
+    //       exact type of `x` (`rewrite_for_probe_hygienic`, allowlist; everything else fails closed).
+    if t.kind == TokenKind::Ident && t.raw == "mbt_compat" && i + 3 < n &&
+    tokens[i + 1].kind == TokenKind::ColonColon &&
+    tokens[i + 2].raw == "__mbt_show_trait" &&
+    tokens[i + 3].kind == TokenKind::LParen {
+      let close_p = find_matching_delim(tokens, i + 3)
+      // `(x, "T1|pkg::T2|..")`: the last top-level argument is the allowlist string literal Stage A computed.
+      let mut last_comma = -1
+      let mut cd = 0
+      let mut ck = i + 4
+      while ck < close_p {
+        let kk = tokens[ck].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { cd = cd + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { cd = cd - 1 }
+        else if cd == 0 && kk == TokenKind::Comma { last_comma = ck }
+        ck = ck + 1
+      }
+      if last_comma > i + 4 && last_comma + 2 == close_p && tokens[last_comma + 1].kind == TokenKind::StringLit &&
+      !safe_offsets.contains(base_offset + tokens[i + 2].start_byte) {
+        let arg = content.slice(tokens[i + 4].start_byte, tokens[last_comma - 1].end_byte).trim()
+        let lit = tokens[last_comma + 1].raw
+        let allow_list = if lit.length() >= 2 { lit.slice(1, lit.length() - 1) } else { "" }
+        let start_b = t.start_byte
+        let end_b = tokens[close_p].end_byte
+        sites.push(ProbeSite::{
+          probe_id: "",
+          file: file,
+          probe_kind: "mbt_show_trait_probe",
+          start_byte: start_b,
+          end_byte: end_b,
+          op_byte: base_offset + tokens[i + 2].start_byte,
+          line: t.line,
+          col: t.col,
+          lhs_expr: arg,
+          rhs_expr: allow_list,
+          assign_op: "",
+          slice_hi: "",
+          divisor_is_zero: false,
+          rhs_has_lit: false,
+          rhs_is_neg: false,
+          rhs_u64: 0UL,
+          rhs_overflow: false,
+        })
+        edits.push((start_b, end_b, "(" + arg + ").mbt_show_trait_probe()"))
+        covered_end = end_b
+        i = close_p + 1
+        continue
       }
     }
 
@@ -1214,12 +1277,14 @@ fn instrument_probes_for_file_with_safe(
 
     // 0b. Interpolated string `"...\{expr}..."` — recursively instrument ANY inner expression
     //     (e.g. `"r=\{a / b} len=\{s.length()}"`) AND probe simple idents for `Double` formatting!
-    if t.kind == TokenKind::InterpString {
-      let parts = split_interp_string(t.raw, false)
+    //     `$|` multiline interpolation lines are rebuilt the same way (prefix `$|`, no closing quote).
+    if t.kind == TokenKind::InterpString || (t.kind == TokenKind::InterpMultiline && t.raw.starts_with("$|")) {
+      let is_ml = t.kind == TokenKind::InterpMultiline
+      let parts = split_interp_string(t.raw, is_ml)
       let mut any_interp_probe = false
       let rebuilt = StringBuilder()
-      rebuilt.write_string("\"")
-      let mut part_off = t.start_byte + 1
+      rebuilt.write_string(if is_ml { "$|" } else { "\"" })
+      let mut part_off = t.start_byte + (if is_ml { 2 } else { 1 })
       for p in parts {
         if !p.is_expr {
           rebuilt.write_string(p.text)
@@ -1265,8 +1330,13 @@ fn instrument_probes_for_file_with_safe(
           } else {
             let et = p.text.trim()
             let show_op_byte = base_offset + expr_start_byte
-            if !slice_only_pass && !safe_offsets.contains(show_op_byte) &&
-            et.length() > 0 && is_alpha(et.code_unit_at(0)) && !str_has(et, "(") && !str_has(et, " ") && !str_has(et, "::") {
+            // A plain `a.b.c` path is probed as is; any other expression (`self.f + self.f`, `get_f()`,
+            // `-x`, `if c { a } else { b }`) is parenthesized so pionc reports the type of the whole hole.
+            // A hole that is exactly one call of a MoonBit formatter (`mbt_compat::float_to_string(x)`) is skipped;
+            // `mbt_compat::float_to_string(x) |> read` or `f(x).to_string()` are still probed as a whole.
+            let simple = is_simple_ident_path(et)
+            let already = is_whole_formatter_call(et)
+            if !slice_only_pass && !safe_offsets.contains(show_op_byte) && et.length() > 0 && !already {
               any_interp_probe = true
               sites.push(ProbeSite::{
                 probe_id: "",
@@ -1287,7 +1357,7 @@ fn instrument_probes_for_file_with_safe(
                 rhs_u64: 0UL,
                 rhs_overflow: false,
               })
-              rebuilt.write_string("\\{" + et + ".mbt_show_probe()}")
+              rebuilt.write_string(if simple { "\\{" + et + ".mbt_show_probe()}" } else { "\\{(" + et + ").mbt_show_probe()}" })
             } else {
               rebuilt.write_string("\\{" + p.text + "}")
             }
@@ -1295,7 +1365,9 @@ fn instrument_probes_for_file_with_safe(
           part_off = part_off + 2 + p.text.length() + 1
         }
       }
-      rebuilt.write_string("\"")
+      if !is_ml {
+        rebuilt.write_string("\"")
+      }
       if any_interp_probe {
         edits.push((t.start_byte, t.end_byte, rebuilt.to_string()))
         covered_end = t.end_byte
@@ -1729,6 +1801,133 @@ pub fn rewrite_for_probe_with_fields(
   rewrite_for_probe_hygienic(site, resolved_type, recipes, struct_val_fields, Map(), diags, drift_ledger)
 }
 
+///| Strict freshness for borrowed-slice views: `[s, e)` is exactly an array literal `[...]` or a call of an
+///| `mbt_compat` helper that always returns a newly allocated `Array` (Stage B rewrites the builtin
+///| `Array::copy`/`map`/`filter`/... to these). Unlike `is_fresh_container_alloc`, a method call such as
+///| `x.copy()` is never trusted: a user-defined `copy` may return an alias.
+fn is_proven_fresh_array_alloc(tokens : Array[Token], s : Int, e : Int) -> Bool {
+  if s >= e {
+    return false
+  }
+  if tokens[s].kind == TokenKind::LBracket && find_matching_delim(tokens, s) == e - 1 {
+    return true
+  }
+  if e >= s + 5 && tokens[s].kind == TokenKind::Ident && tokens[s].raw == "mbt_compat" &&
+  tokens[s + 1].kind == TokenKind::ColonColon && tokens[s + 3].kind == TokenKind::LParen &&
+  find_matching_delim(tokens, s + 3) == e - 1 {
+    let nm = tokens[s + 2].raw
+    // Not `arr_to_array`: it is the identity (`.to_array()` of an already lowered slice) and returns its argument.
+    return nm == "arr_copy" || nm == "array_slice_clamp" || nm == "arr_concat" || nm == "arr_filter" ||
+    nm == "arr_filter_map" || nm == "arr_map"
+  }
+  false
+}
+
+///| True iff `et` is a plain `a.b.c` path: a letter first, then only `[A-Za-z0-9_.]`, no empty segment and no
+///| trailing `.` (so `x|>f`, `f==f`, `a+b`, `arr[0]` are not paths and get parenthesized as a whole).
+fn is_simple_ident_path(et : String) -> Bool {
+  if et.length() == 0 || !is_alpha(et.code_unit_at(0)) || et.ends_with(".") || str_has(et, "..") {
+    return false
+  }
+  for k in 0..<et.length() {
+    let c = et.code_unit_at(k)
+    if !(is_alnum(c) || c == 46) {
+      return false
+    }
+  }
+  true
+}
+
+///| True iff `et` is exactly one call `mbt_compat::{double,float,bytes,byte}_to_string(...)`: the `(` after the
+///| name is matched (skipping string / char literals) by the final character of `et`.
+fn is_whole_formatter_call(et : String) -> Bool {
+  let mut open = -1
+  for pre in ["mbt_compat::double_to_string(", "mbt_compat::float_to_string(", "mbt_compat::bytes_to_string(",
+    "mbt_compat::byte_to_string("] {
+    if et.starts_with(pre) {
+      open = pre.length() - 1
+    }
+  }
+  if open < 0 {
+    return false
+  }
+  let mut d = 0
+  let mut k = open
+  while k < et.length() {
+    let c = et.code_unit_at(k)
+    if c == 34 || c == 39 {
+      // skip a string / char literal (with `\` escapes)
+      k = k + 1
+      while k < et.length() && et.code_unit_at(k) != c {
+        if et.code_unit_at(k) == 92 { k = k + 1 }
+        k = k + 1
+      }
+    } else if c == 40 {
+      d = d + 1
+    } else if c == 41 {
+      d = d - 1
+      if d == 0 {
+        return k == et.length() - 1
+      }
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| `mbt_compat` formatter reproducing MoonBit's `to_string` / `Show` for builtin types whose Pion
+///| `to_string()` prints differently (`Double` is handled by its own branch).
+fn moonbit_show_helper(ty : String) -> Option[String] {
+  if ty == "Float" {
+    Some("mbt_compat::float_to_string")
+  } else if ty == "Bytes" {
+    Some("mbt_compat::bytes_to_string")
+  } else if ty == "Byte" {
+    Some("mbt_compat::byte_to_string")
+  } else {
+    None
+  }
+}
+
+///| Builtin types whose Pion `to_string()` prints exactly what MoonBit's `Show::to_string` prints. User types are
+///| accepted only through the Stage A allowlist (a transpiled `impl Show ... with output` without an inherent
+///| `fn T::to_string`); everything else (`Float`, `Byte`, `Bytes`, views, containers, tuples, generics) fails closed.
+fn is_show_trait_exact_type(ty : String) -> Bool {
+  ty == "Int" || ty == "Int64" || ty == "UInt" || ty == "UInt64" || ty == "Bool" || ty == "Char" || ty == "String"
+}
+
+///| `assign_op` tag of a `mbt_slice_borrow_probe` site whose receiver is a proven-fresh allocation.
+fn fresh_slice_recv_tag() -> String {
+  "\"__FRESH_RECV__\""
+}
+
+///| True iff `name` is a Stage A hygienic slice temp (`__mbt_sl_N`) bound immediately before token `i` as
+///| `let name = <init>;` with `<init>` a proven-fresh array allocation (`is_proven_fresh_array_alloc`).
+fn slice_temp_bound_fresh(tokens : Array[Token], i : Int, name : String) -> Bool {
+  if !name.starts_with("__mbt_sl_") || i < 5 || tokens[i - 1].kind != TokenKind::Semi {
+    return false
+  }
+  // Walk back over the initializer to the matching `let name =` at the same nesting depth.
+  let mut k = i - 2
+  let mut d = 0
+  while k >= 2 {
+    let kk = tokens[k].kind
+    if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace {
+      d = d + 1
+    } else if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace {
+      if d == 0 { return false }
+      d = d - 1
+    } else if d == 0 && kk == TokenKind::Semi {
+      return false
+    } else if d == 0 && kk == TokenKind::Eq && tokens[k - 1].kind == TokenKind::Ident && tokens[k - 1].raw == name &&
+    tokens[k - 2].kind == TokenKind::Keyword && tokens[k - 2].raw == "let" {
+      return is_proven_fresh_array_alloc(tokens, k + 1, i - 1)
+    }
+    k = k - 1
+  }
+  false
+}
+
 fn rewrite_for_probe_hygienic(
   site : ProbeSite,
   resolved_type : String,
@@ -1854,7 +2053,97 @@ fn rewrite_for_probe_hygienic(
       })
       return Some("mbt_compat::double_to_string(" + site.lhs_expr + ")")
     }
+    match moonbit_show_helper(resolved_type) {
+      Some(helper) => {
+        drift_ledger.push(DriftEntry::{
+          category: "show_to_string",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: if site.rhs_expr == "__INTERP_SHOW__" { "\\{" + site.lhs_expr + "}" } else { site.lhs_expr + ".to_string()" },
+          resolution: helper,
+          status: "resolved",
+          detail: resolved_type + " formatting routed to MoonBit-compatible formatter",
+        })
+        return Some(helper + "(" + site.lhs_expr + ")")
+      }
+      None => ()
+    }
     return None
+  }
+
+  if site.probe_kind == "mbt_show_trait_probe" {
+    let expr_desc = "Show::to_string(" + site.lhs_expr + ")"
+    if resolved_type == "Double" {
+      drift_ledger.push(DriftEntry::{
+        category: "show_trait_to_string",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: expr_desc,
+        resolution: "mbt_compat::double_to_string",
+        status: "resolved",
+        detail: "Show::to_string on Double routed to MoonBit-compatible formatter",
+      })
+      return Some("mbt_compat::double_to_string(" + site.lhs_expr + ")")
+    }
+    match moonbit_show_helper(resolved_type) {
+      Some(helper) => {
+        drift_ledger.push(DriftEntry::{
+          category: "show_trait_to_string",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: expr_desc,
+          resolution: helper,
+          status: "resolved",
+          detail: "Show::to_string on " + resolved_type + " routed to MoonBit-compatible formatter",
+        })
+        return Some(helper + "(" + site.lhs_expr + ")")
+      }
+      None => ()
+    }
+    let mut user_show = false
+    for an in site.rhs_expr.split("|") {
+      if an.length() > 0 && an == resolved_type {
+        user_show = true
+      }
+    }
+    if is_show_trait_exact_type(resolved_type) || user_show {
+      drift_ledger.push(DriftEntry::{
+        category: "show_trait_to_string",
+        file: site.file,
+        line: site.line,
+        col: site.col,
+        expr: expr_desc,
+        resolution: "to_string",
+        status: "resolved",
+        detail: if user_show {
+          "Show::to_string on " + resolved_type + " calls its transpiled `impl Show` (no inherent to_string)"
+        } else {
+          "Show::to_string on " + resolved_type + " has identical Pion to_string output"
+        },
+      })
+      return Some("(" + site.lhs_expr + ").to_string()")
+    }
+    diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      site.file,
+      site.line,
+      site.col,
+      "`" + expr_desc + "` on type `" + resolved_type + "` has no MoonBit-exact lowering (fail-closed)",
+    ))
+    drift_ledger.push(DriftEntry::{
+      category: "show_trait_to_string",
+      file: site.file,
+      line: site.line,
+      col: site.col,
+      expr: expr_desc,
+      resolution: "blocked",
+      status: "unresolved",
+      detail: "Show::to_string on unsupported type " + resolved_type,
+    })
+    return Some("\"\"")
   }
 
   if site.probe_kind == "mbt_debug_probe" {
@@ -2188,6 +2477,23 @@ fn rewrite_for_probe_hygienic(
       let ro_ok = (is_owned && (!is_iter_op || is_builtin_scalar_type_a5(elem_ty))) ||
       (is_ro_join && elem_ty == "String") ||
       (is_ro_show && is_builtin_scalar_type_a5(elem_ty))
+      if !ro_ok && site.probe_kind == "mbt_slice_borrow_probe" && site.assign_op == fresh_slice_recv_tag() {
+        // The receiver is a proven-fresh allocation nobody else holds: a view over its own backing buffer
+        // observes exactly what MoonBit's `ArrayView` over it would (same clamped bounds as `array_slice_clamp`).
+        drift_ledger.push(DriftEntry::{
+          category: "array_view_slice",
+          file: site.file,
+          line: site.line,
+          col: site.col,
+          expr: expr_desc,
+          resolution: "mbt_compat::ArrayBuf::view",
+          status: "resolved",
+          detail: "borrowed slice of a fresh Array lowered to a view over its own ArrayBuf",
+        })
+        return Some(
+          "mbt_compat::ArrayBuf::from_array(" + site.lhs_expr + ").view(" + site.rhs_expr + ", " + site.slice_hi + ")",
+        )
+      }
       if ro_ok {
         drift_ledger.push(DriftEntry::{
           category: "array_view_slice",
@@ -2441,6 +2747,7 @@ pub fn has_probe_residual(content : String) -> Bool {
       r.starts_with("mbt_div_probe") ||
       r.starts_with("mbt_mod_probe") ||
       r.starts_with("mbt_show_probe") ||
+      r.starts_with("mbt_show_trait_probe") ||
       r.starts_with("mbt_val_probe") ||
       r.starts_with("mbt_val_set_probe") ||
       r.starts_with("mbt_slice_owned_probe") ||
@@ -2456,9 +2763,10 @@ pub fn has_probe_residual(content : String) -> Bool {
           r == "mbt_match_scrut_probe" || r.starts_with("mbt_match_scrut_probe__") ||
           r == "mbt_slice_ro_join_probe" || r.starts_with("mbt_slice_ro_join_probe__") ||
           r == "mbt_slice_ro_show_probe" || r.starts_with("mbt_slice_ro_show_probe__"))) ||
-      ((r == "__mbt_arrpat_len" || r == "__mbt_match_scrut" || r == "__mbt_slice_ro_join" || r == "__mbt_slice_ro_show") &&
-        i >= 2 && toks[i - 2].kind == TokenKind::Ident && toks[i - 2].raw == "mbt_compat" &&
-        toks[i - 1].kind == TokenKind::ColonColon && i + 1 < tn && toks[i + 1].kind == TokenKind::LParen) {
+      ((r == "__mbt_arrpat_len" || r == "__mbt_match_scrut" || r == "__mbt_slice_ro_join" || r == "__mbt_slice_ro_show" ||
+        r == "__mbt_show_trait") &&
+      i >= 2 && toks[i - 2].kind == TokenKind::Ident && toks[i - 2].raw == "mbt_compat" &&
+      toks[i - 1].kind == TokenKind::ColonColon && i + 1 < tn && toks[i + 1].kind == TokenKind::LParen) {
         return true
       }
     } else if t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline {
