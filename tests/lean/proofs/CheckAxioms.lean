@@ -31,6 +31,7 @@ import PionProofs.QbeJtblIdxAndWideCmp
 import PionProofs.QbeAmd64FpRhsLoadFold
 import PionProofs.QbeWin64XmmCalleeSaved
 import PionProofs.QbeAmd64GuardedExchange
+import PionProofs.QbeArm64GuardedDispatch
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -755,3 +756,19 @@ import PionProofs.QbeAmd64GuardedExchange
 #print axioms PionQbeAmd64GuardedExchange.emptyNoSwap
 #print axioms PionQbeAmd64GuardedExchange.singleSelfSwap
 #print axioms PionQbeAmd64GuardedExchange.stepCount
+#print axioms PionQbeArm64GuardedDispatch.body_append
+#print axioms PionQbeArm64GuardedDispatch.select_in
+#print axioms PionQbeArm64GuardedDispatch.select_oob
+#print axioms PionQbeArm64GuardedDispatch.select_negative
+#print axioms PionQbeArm64GuardedDispatch.select_mem
+#print axioms PionQbeArm64GuardedDispatch.proj_next
+#print axioms PionQbeArm64GuardedDispatch.sim
+#print axioms PionQbeArm64GuardedDispatch.clone_edge
+#print axioms PionQbeArm64GuardedDispatch.clone_table
+#print axioms PionQbeArm64GuardedDispatch.other_blocks
+#print axioms PionQbeArm64GuardedDispatch.arbitrary_path
+#print axioms PionQbeArm64GuardedDispatch.walk_map
+#print axioms PionQbeArm64GuardedDispatch.walk_add
+#print axioms PionQbeArm64GuardedDispatch.fused_steps
+#print axioms PionQbeArm64GuardedDispatch.walk_fused
+#print axioms PionQbeArm64GuardedDispatch.replicate_correct

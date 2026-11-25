@@ -657,6 +657,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p116_qbe_compile_speed_parity/run_e2e.
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p118_qbe_jtbl_idx_and_widecmp/run_e2e.sh" "$PIONC"
 # P120: Win64 nonvolatile xmm6..xmm15 in QBE amd64_win (xmm0..xmm5-only rsave, 128-bit movups save/restore of the used xmm6..xmm14 and the xmm15 scratch; check_frames.py + mutants, x86-64 execution of the Win64 code with all 160 bytes of xmm6..xmm15 checked, ASan+UBSan QBE replay).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p120_win64_xmm_callee_saved/run_e2e.sh" "$PIONC"
+# P122: arm64_apple guarded jump-table dispatch copies (main.c replicatedispatch; br sites on 6 targets, text == Mach-O --obj, checker mutations, both-sides-table symmetry, no copy of a table shared by a rewritten edge, 24-copy limit, 8 QBE mutants of the match conditions and limit, 243712-input C reference via arm64_apple text and --obj on macOS ARM64, bytecode_vm == C with 24 run_vm sites, ASan+UBSan QBE replay).
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p122_arm64_guarded_dispatch/run_e2e.sh" "$PIONC"
 # P123: amd64_sysv release guarded Array[Int] exchange (qbe_emit_guarded_exchange; @exchange_ structure on 6 targets + dev, 614 edge cases vs reference in --release and dev, 4 checked-loop SIGABRT traps with exact index, fannkuchredux = C with one 8-instruction exchange loop).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p123_amd64_guarded_exchange/run_e2e.sh" "$PIONC"
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC"
