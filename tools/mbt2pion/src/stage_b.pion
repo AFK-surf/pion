@@ -61,6 +61,9 @@ pub fn lookup_missing_method_helper(receiver_ty : String, method_name : String) 
     if method_name == "compare" { return Some("mbt_compat::double_compare") }
     if method_name == "reinterpret_as_int64" { return Some("mbt_compat::double_reinterpret_as_int64") }
   }
+  if receiver_ty == "Float" {
+    if method_name == "is_nan" { return Some("mbt_compat::float_is_nan") }
+  }
   if receiver_ty.starts_with("Option[") {
     if method_name == "map" { return Some("mbt_compat::opt_map") }
     if method_name == "unwrap" { return Some("mbt_compat::opt_unwrap") }
@@ -1059,11 +1062,269 @@ fn gen_eq_expr_hygienic(a : String, b : String, ty : String, used : Map[String, 
   a + " == " + b
 }
 
+///| Token-precise rewrite of unsupported static compat calls (`Float::is_nan`, `Float::from_uint`,
+///| `Float::reinterpret_from_uint`, `Bytes::make`) at 1-based column `col` on a single line.
+fn rewrite_static_compat_call_at(ln : String, col : Int) -> Option[String] {
+  let toks = lex_moonbit(ln)
+  let tn = toks.length() - 1
+  let mut best_i = -1
+  let mut best_dist = 1000000
+  let mut best_repl = ""
+  let mut i = 0
+  while i + 3 < tn {
+    if toks[i].kind == TokenKind::UpperIdent && toks[i + 1].kind == TokenKind::ColonColon &&
+    toks[i + 2].kind == TokenKind::Ident && toks[i + 3].kind == TokenKind::LParen {
+      let qual = toks[i].raw
+      let mem = toks[i + 2].raw
+      let repl = if qual == "Float" && mem == "is_nan" {
+        "mbt_compat::float_is_nan"
+      } else if qual == "Float" && mem == "from_uint" {
+        "mbt_compat::float_from_uint"
+      } else if qual == "Float" && mem == "reinterpret_from_uint" {
+        "mbt_compat::float_reinterpret_from_uint"
+      } else if qual == "Bytes" && mem == "make" {
+        "mbt_compat::bytes_make"
+      } else {
+        ""
+      }
+      if repl.length() > 0 {
+        let dist = if toks[i].col >= col { toks[i].col - col } else { col - toks[i].col }
+        if dist < best_dist {
+          best_dist = dist
+          best_i = i
+          best_repl = repl
+        }
+      }
+    }
+    i = i + 1
+  }
+  if best_i >= 0 {
+    return Some(ln.slice(0, toks[best_i].start_byte) + best_repl + ln.slice(toks[best_i + 2].end_byte, ln.length()))
+  }
+  None
+}
+
+fn op_token_prec(k : TokenKind) -> Int {
+  if k == TokenKind::Star || k == TokenKind::Slash || k == TokenKind::Percent {
+    return 2
+  }
+  if k == TokenKind::Plus || k == TokenKind::Minus {
+    return 1
+  }
+  0
+}
+
+fn op_symbol_to_name(sym : String) -> String {
+  if sym == "+" { return "add" }
+  if sym == "-" { return "sub" }
+  if sym == "*" { return "mul" }
+  if sym == "/" { return "div" }
+  ""
+}
+
+///| Rewrite ONE custom binary operator (`+`, `-`, `*`, `/`) at `(lidx, d.col)` into `helper(lhs, rhs)`,
+///| strictly respecting MoonBit precedence (`*`/`/` > `+`/`-`, unary `-` > `*`/`/`), left-associativity,
+///| and left-to-right operand evaluation. Returns `true` if rewritten.
+fn rewrite_custom_binop_at(
+  lines : Array[String],
+  lidx : Int,
+  col : Int,
+  op_str : String,
+  helper_fn : String,
+  mutated_lines : Map[Int, Bool],
+) -> Bool {
+  let target_kind = if op_str == "+" {
+    TokenKind::Plus
+  } else if op_str == "-" {
+    TokenKind::Minus
+  } else if op_str == "*" {
+    TokenKind::Star
+  } else if op_str == "/" {
+    TokenKind::Slash
+  } else {
+    return false
+  }
+  let op_prec = op_token_prec(target_kind)
+  // Gather bounded multiline continuation chunk (only on trailing binary op or unclosed `(`/ `[`, max 8 lines)
+  let mut end_l = lidx
+  let chunk_sb = StringBuilder()
+  chunk_sb.write_string(lines[lidx])
+  let mut cont_lines = 0
+  while end_l + 1 < lines.length() && cont_lines < 8 {
+    let cur_t = lines[end_l].trim()
+    let ends_with_op = cur_t.ends_with("+") || cur_t.ends_with("-") || cur_t.ends_with("*") || cur_t.ends_with("/")
+    if ends_with_op {
+      end_l = end_l + 1
+      cont_lines = cont_lines + 1
+      chunk_sb.write_string("\n")
+      chunk_sb.write_string(lines[end_l])
+    } else {
+      break
+    }
+  }
+  let chunk = chunk_sb.to_string()
+  let toks = lex_moonbit(chunk)
+  let tn = toks.length() - 1
+  let mut op_i = -1
+  let mut best_dist = 1000000
+  let mut ti = 0
+  while ti < tn {
+    if toks[ti].line == 1 && toks[ti].kind == target_kind {
+      // For `-`, ensure it is binary (preceded by a value-ending token!)
+      let is_bin = if target_kind == TokenKind::Minus {
+        ti > 0 && !toks[ti].newline_before && is_value_ending_tok(toks[ti - 1])
+      } else {
+        ti > 0
+      }
+      if is_bin {
+        let dist = if toks[ti].col >= col { toks[ti].col - col } else { col - toks[ti].col }
+        if dist < best_dist {
+          best_dist = dist
+          op_i = ti
+        }
+      }
+    }
+    ti = ti + 1
+  }
+  if op_i <= 0 || op_i + 1 >= tn {
+    return false
+  }
+  // Scan backward for LHS operand (left-associative: stop only at strictly lower precedence or delimiters)
+  let mut ls = op_i - 1
+  let mut ld = 0
+  while ls >= 0 {
+    let lk = toks[ls].kind
+    if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace {
+      ld = ld + 1
+    } else if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace {
+      if ld == 0 {
+        ls = ls + 1
+        break
+      }
+      ld = ld - 1
+    } else if ld == 0 {
+      let is_low_op = op_prec == 2 && (lk == TokenKind::Plus ||
+        (lk == TokenKind::Minus && ls > 0 && !toks[ls].newline_before && is_value_ending_tok(toks[ls - 1])))
+      let is_stop = is_low_op || lk == TokenKind::Eq || lk == TokenKind::AssignOp ||
+      lk == TokenKind::Comma || lk == TokenKind::Semi || lk == TokenKind::Colon ||
+      lk == TokenKind::AmpAmp || lk == TokenKind::PipePipe || lk == TokenKind::FatArrow ||
+      lk == TokenKind::EqEq || lk == TokenKind::BangEq || lk == TokenKind::Lt ||
+      lk == TokenKind::LtEq || lk == TokenKind::Gt || lk == TokenKind::GtEq ||
+      lk == TokenKind::Pipe || lk == TokenKind::Amp || lk == TokenKind::Caret ||
+      lk == TokenKind::Shl || lk == TokenKind::Shr ||
+      (lk == TokenKind::Keyword && (toks[ls].raw == "if" || toks[ls].raw == "else" ||
+        toks[ls].raw == "return" || toks[ls].raw == "while" || toks[ls].raw == "in" ||
+        toks[ls].raw == "match" || toks[ls].raw == "let" || toks[ls].raw == "for"))
+      if is_stop {
+        ls = ls + 1
+        break
+      }
+      if ls < op_i - 1 && toks[ls + 1].newline_before && !is_value_ending_tok(toks[ls]) {
+        // Don't cross onto previous statement line
+        let prev_is_op = lk == TokenKind::Plus || lk == TokenKind::Minus || lk == TokenKind::Star || lk == TokenKind::Slash
+        if !prev_is_op {
+          ls = ls + 1
+          break
+        }
+      }
+    }
+    ls = ls - 1
+  }
+  if ls < 0 { ls = 0 }
+
+  // Scan forward for RHS operand (left-associative: stop at EQUAL OR LOWER precedence binary op!)
+  let mut re = op_i + 1
+  let mut rd = 0
+  let mut expect_operand = true
+  while re < tn {
+    let rk = toks[re].kind
+    if rd == 0 && re > op_i + 1 && toks[re].newline_before && !expect_operand {
+      let cont_op = op_prec == 1 && (rk == TokenKind::Star || rk == TokenKind::Slash || rk == TokenKind::Percent)
+      if !cont_op {
+        break
+      }
+    }
+    if rd == 0 {
+      if rk == TokenKind::Comma || rk == TokenKind::Semi || rk == TokenKind::Eq || rk == TokenKind::AssignOp ||
+      rk == TokenKind::AmpAmp || rk == TokenKind::PipePipe || rk == TokenKind::FatArrow ||
+      rk == TokenKind::EqEq || rk == TokenKind::BangEq || rk == TokenKind::Lt ||
+      rk == TokenKind::LtEq || rk == TokenKind::Gt || rk == TokenKind::GtEq ||
+      rk == TokenKind::Pipe || rk == TokenKind::Amp || rk == TokenKind::Caret ||
+      rk == TokenKind::Shl || rk == TokenKind::Shr ||
+      (rk == TokenKind::Keyword && toks[re].raw == "else") {
+        break
+      }
+      if rk == TokenKind::LBrace && !expect_operand && !(re > op_i + 1 && toks[re - 1].kind == TokenKind::ColonColon) {
+        break
+      }
+      let rp = op_token_prec(rk)
+      if rp > 0 {
+        if expect_operand && rk == TokenKind::Minus {
+          // Unary `-` on RHS (e.g. `a + -b`) — keep going!
+          re = re + 1
+          continue
+        }
+        if rp <= op_prec {
+          // Equal or lower precedence binary op stops RHS (preserves left-associativity & `*` > `+`!)
+          break
+        }
+        // Higher precedence op (`*`/`/` inside `+`/`-` RHS): include it and expect its RHS operand!
+        expect_operand = true
+        re = re + 1
+        continue
+      }
+    }
+    if rk == TokenKind::LParen || rk == TokenKind::LBracket || rk == TokenKind::LBrace {
+      rd = rd + 1
+      expect_operand = false
+    } else if rk == TokenKind::RParen || rk == TokenKind::RBracket || rk == TokenKind::RBrace {
+      if rd == 0 { break }
+      rd = rd - 1
+      expect_operand = false
+    } else if rk == TokenKind::Bang && expect_operand {
+      // Unary `!`
+      expect_operand = true
+    } else {
+      expect_operand = false
+    }
+    re = re + 1
+  }
+  if ls >= op_i || re <= op_i + 1 {
+    return false
+  }
+  let lhs_s = chunk.slice(toks[ls].start_byte, toks[op_i - 1].end_byte).trim()
+  let rhs_s = chunk.slice(toks[op_i + 1].start_byte, toks[re - 1].end_byte).trim()
+  if lhs_s.length() == 0 || rhs_s.length() == 0 {
+    return false
+  }
+  let repl = helper_fn + "(" + lhs_s + ", " + rhs_s + ")"
+  let new_chunk = chunk.slice(0, toks[ls].start_byte) + repl + chunk.slice(toks[re - 1].end_byte, chunk.length())
+  lines[lidx] = new_chunk
+  let mut cl = lidx + 1
+  while cl <= end_l {
+    lines[cl] = ""
+    mutated_lines[cl] = true
+    cl = cl + 1
+  }
+  true
+}
+
 ///| Run Stage B type-directed fixpoint loop using `pionc check --json` callback.
 ///| Returns `(updated_files, iterations, final_diagnostic_histogram)`.
 pub fn run_stage_b(
   files : Array[GeneratedFile],
   api_map : ApiMap,
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> (Array[GeneratedFile], Int, Array[(String, Int)]) {
+  run_stage_b_with_ops(files, api_map, Map(), check_fn, diags, drift_ledger)
+}
+
+pub fn run_stage_b_with_ops(
+  files : Array[GeneratedFile],
+  api_map : ApiMap,
+  op_lookup : Map[String, String],
   check_fn : (Array[(String, String)]) -> String,
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
@@ -1082,7 +1343,7 @@ pub fn run_stage_b(
   let mut iter = 0
   let mut final_hist : Array[(String, Int)] = []
 
-  while iter < 8 {
+  while iter < 16 {
     let batch : Array[(String, String)] = []
     for f in cur_files {
       batch.push((f.rel_path, f.content))
@@ -1113,11 +1374,25 @@ pub fn run_stage_b(
       break
     }
 
+    // Hoisted per-round lazy caches for `arr_retain`/`arr_filter_map` mutation checks (§D1-2)
+    let mut round_pkg_fns : Option[Map[String, StageBPkgFn]] = None
+    let round_file_tokens : Map[String, Array[Token]] = Map()
+
     let mut changed = false
     let next_files : Array[GeneratedFile] = []
     for f in cur_files {
       let lines = f.content.split("\n")
-      let used_idents = collect_used_idents(f.content)
+      let mut used_idents_opt : Option[Map[String, Bool]] = None
+      let get_used_idents = fn() -> Map[String, Bool] {
+        match used_idents_opt {
+          Some(m) => m
+          None => {
+            let m = collect_used_idents(f.content)
+            used_idents_opt = Some(m)
+            m
+          }
+        }
+      }
       let mutated_lines : Map[Int, Bool] = Map()
       let mut file_changed = false
       for d in pdiags {
@@ -1131,14 +1406,36 @@ pub fn run_stage_b(
         let ln = lines[lidx]
         let mut line_mutated = false
 
-        if d.code == "E_TYPE_MISMATCH" {
+        // 0. Static compat calls (`Float::is_nan`, `Float::from_uint`, `Float::reinterpret_from_uint`, `Bytes::make`)
+        if d.code == "E_TYPE_MISMATCH" && str_has(d.message, "unknown static function") &&
+        (str_has(d.message, "Float::is_nan") || str_has(d.message, "Float::from_uint") ||
+          str_has(d.message, "Float::reinterpret_from_uint") || str_has(d.message, "Bytes::make")) {
+          match rewrite_static_compat_call_at(ln, d.col) {
+            Some(new_ln) => {
+              lines[lidx] = new_ln
+              file_changed = true
+              line_mutated = true
+            }
+            None => ()
+          }
+        }
+
+        if !line_mutated && d.code == "E_TYPE_MISMATCH" {
           // 1. Missing builtin method -> canonical `mbt_compat::*`
           match parse_unknown_method_msg(d.message) {
             Some((mname, rty)) =>
             match lookup_missing_method_helper(rty, mname) {
               Some(helper) => {
                 if helper == "mbt_compat::arr_retain" || helper == "mbt_compat::arr_filter_map" {
-                  stage_b_check_array_retain_mutation(cur_files, f.rel_path, f.content, d.line, d.col, mname, diags)
+                  let pkg_fns = match round_pkg_fns {
+                    Some(m) => m
+                    None => {
+                      let m = collect_stage_b_pkg_fns_cached(cur_files, round_file_tokens)
+                      round_pkg_fns = Some(m)
+                      m
+                    }
+                  }
+                  stage_b_check_array_retain_mutation_cached(round_file_tokens, pkg_fns, f.rel_path, f.content, d.line, d.col, mname, diags)
                 }
                 if rewrite_method_call_at(lines, lidx, d.col, mname, helper) {
                   file_changed = true
@@ -1541,6 +1838,7 @@ pub fn run_stage_b(
                 }
                 let tag = lidx.to_string()
                 if close_l >= 0 && (d.found.starts_with("Map[") || d.found.starts_with("OrderedMap[") || d.found.starts_with("mbt_compat::OrderedMap[")) {
+                  let used_idents = get_used_idents()
                   let m_var = fresh_stage_b_ident(used_idents, "__mbt_m_" + tag)
                   let i_var = fresh_stage_b_ident(used_idents, "__mbt_i_" + tag)
                   let s_var = fresh_stage_b_ident(used_idents, "__mbt_slot_" + tag)
@@ -1566,6 +1864,7 @@ pub fn run_stage_b(
                   file_changed = true
                   line_mutated = true
                 } else if close_l >= 0 && d.found == "String" {
+                  let used_idents = get_used_idents()
                   let s_var = fresh_stage_b_ident(used_idents, "__mbt_s_" + tag)
                   let sn_var = fresh_stage_b_ident(used_idents, "__mbt_sn_" + tag)
                   let sp_var = fresh_stage_b_ident(used_idents, "__mbt_sp_" + tag)
@@ -1593,6 +1892,7 @@ pub fn run_stage_b(
                   file_changed = true
                   line_mutated = true
                 } else if close_l >= 0 && (d.found.starts_with("ArrayView[") || d.found.starts_with("mbt_compat::ArrayView[")) {
+                  let used_idents = get_used_idents()
                   let v_var = fresh_stage_b_ident(used_idents, "__mbt_av_" + tag)
                   let i_var = fresh_stage_b_ident(used_idents, "__mbt_ai_" + tag)
                   let bind_stmts = if comma_idx >= 0 {
@@ -1616,6 +1916,7 @@ pub fn run_stage_b(
                   file_changed = true
                   line_mutated = true
                 } else if close_l >= 0 && d.found == "Bytes" {
+                  let used_idents = get_used_idents()
                   let b_var = fresh_stage_b_ident(used_idents, "__mbt_b_" + tag)
                   let i_var = fresh_stage_b_ident(used_idents, "__mbt_bi_" + tag)
                   let c_var = fresh_stage_b_ident(used_idents, "__mbt_bk_" + tag)
@@ -1641,6 +1942,7 @@ pub fn run_stage_b(
                   file_changed = true
                   line_mutated = true
                 } else if close_l >= 0 && (d.found.starts_with("OrderedSet[") || d.found.starts_with("mbt_compat::OrderedSet[")) {
+                  let used_idents = get_used_idents()
                   let sit_var = fresh_stage_b_ident(used_idents, "__mbt_sit_" + tag)
                   let si_var = fresh_stage_b_ident(used_idents, "__mbt_si_" + tag)
                   let open_hdr = if comma_idx >= 0 {
@@ -1711,28 +2013,43 @@ pub fn run_stage_b(
             (eq_ty.starts_with("Option[") && eq_ty.ends_with("]")) ||
             ((eq_ty.starts_with("Array[") || eq_ty.starts_with("FixedArray[")) && eq_ty.ends_with("]"))
             if is_arr_add {
-              // Gather multi-line continuation chunk when trailing `+` or open delimiters span lines
+              // Gather multi-line continuation chunk incrementally (lexing only the newly-added line, bounded)
               let mut end_l = lidx
               let chunk_sb = StringBuilder()
               chunk_sb.write_string(lines[lidx])
-              while end_l + 1 < lines.length() {
-                let c_toks = lex_moonbit(chunk_sb.to_string())
-                let cn = c_toks.length() - 1
-                let mut depth = 0
-                let mut ci = 0
-                while ci < cn {
-                  let ck = c_toks[ci].kind
-                  if ck == TokenKind::LParen || ck == TokenKind::LBracket || ck == TokenKind::LBrace { depth = depth + 1 }
-                  else if ck == TokenKind::RParen || ck == TokenKind::RBracket || ck == TokenKind::RBrace { if depth > 0 { depth = depth - 1 } }
-                  ci = ci + 1
-                }
-                let ends_with_plus = cn > 0 && c_toks[cn - 1].kind == TokenKind::Plus
+              let mut pb_depth = 0
+              let mut last_tok_plus = false
+              let first_toks = lex_moonbit(lines[lidx])
+              let fn0 = first_toks.length() - 1
+              let mut fi0 = 0
+              while fi0 < fn0 {
+                let fk = first_toks[fi0].kind
+                if fk == TokenKind::LParen || fk == TokenKind::LBracket { pb_depth = pb_depth + 1 }
+                else if fk == TokenKind::RParen || fk == TokenKind::RBracket { if pb_depth > 0 { pb_depth = pb_depth - 1 } }
+                fi0 = fi0 + 1
+              }
+              if fn0 > 0 {
+                last_tok_plus = first_toks[fn0 - 1].kind == TokenKind::Plus
+              }
+              while end_l + 1 < lines.length() && end_l - lidx < 32 {
                 let next_trimmed = lines[end_l + 1].trim()
                 let next_starts_plus = next_trimmed.starts_with("+") && !next_trimmed.starts_with("+=")
-                if depth > 0 || ends_with_plus || next_starts_plus {
+                if pb_depth > 0 || last_tok_plus || next_starts_plus {
                   end_l = end_l + 1
                   chunk_sb.write_string("\n")
                   chunk_sb.write_string(lines[end_l])
+                  let nt = lex_moonbit(lines[end_l])
+                  let nn = nt.length() - 1
+                  let mut ni = 0
+                  while ni < nn {
+                    let nk = nt[ni].kind
+                    if nk == TokenKind::LParen || nk == TokenKind::LBracket { pb_depth = pb_depth + 1 }
+                    else if nk == TokenKind::RParen || nk == TokenKind::RBracket { if pb_depth > 0 { pb_depth = pb_depth - 1 } }
+                    ni = ni + 1
+                  }
+                  if nn > 0 {
+                    last_tok_plus = nt[nn - 1].kind == TokenKind::Plus
+                  }
                 } else {
                   break
                 }
@@ -1786,7 +2103,7 @@ pub fn run_stage_b(
                     (rk == TokenKind::Keyword && toks[re].raw == "else")) {
                     break
                   }
-                  if rd == 0 && rk == TokenKind::LBrace && !expect_operand {
+                  if rd == 0 && rk == TokenKind::LBrace && !expect_operand && !(re > ls && toks[re - 1].kind == TokenKind::ColonColon) {
                     // Loop/match body `{ ... }` after `for x in a + b`
                     break
                   }
@@ -1900,6 +2217,7 @@ pub fn run_stage_b(
                   } else if eq_ty.starts_with("OrderedSet[") || eq_ty.starts_with("mbt_compat::OrderedSet[") {
                     (if is_neq { "!mbt_compat::ordered_set_eq(" } else { "mbt_compat::ordered_set_eq(" }) + lhs_s + ", " + rhs_s + ")"
                   } else {
+                    let used_idents = get_used_idents()
                     let la = fresh_stage_b_ident(used_idents, "__eq_l_" + lidx.to_string())
                     let rb = fresh_stage_b_ident(used_idents, "__eq_r_" + lidx.to_string())
                     let body = gen_eq_expr_hygienic(la, rb, eq_ty, used_idents)
@@ -1909,6 +2227,88 @@ pub fn run_stage_b(
                   lines[lidx] = cur_ln.slice(0, toks[ls].start_byte) + repl + cur_ln.slice(toks[re - 1].end_byte, cur_ln.length())
                   file_changed = true
                   line_mutated = true
+                }
+              }
+            }
+          }
+          // 4b. Custom operator trait lowering (`+`, `-`, `*`, `/`) + fail-closed compound assignment (`+=`, `-=`, `*=`, `/=`) (§D1-3)
+          if !line_mutated && str_has(d.message, "operator `") &&
+          (str_has(d.message, " is not supported on `") || str_has(d.message, " is not supported for type `")) {
+            let op_start = d.message.index_of("operator `") + 10
+            let op_rest = d.message.slice(op_start, d.message.length())
+            let op_end = op_rest.index_of("`")
+            let on_idx1 = d.message.index_of("not supported on `")
+            let on_idx2 = d.message.index_of("not supported for type `")
+            let ty_start = if on_idx1 >= 0 {
+              on_idx1 + 18
+            } else if on_idx2 >= 0 {
+              on_idx2 + 24
+            } else {
+              -1
+            }
+            if op_end > 0 && ty_start >= 0 {
+              let raw_op = op_rest.slice(0, op_end)
+              let ty_rest = d.message.slice(ty_start, d.message.length())
+              let ty_end = ty_rest.index_of("`")
+              if ty_end > 0 {
+                let op_ty = ty_rest.slice(0, ty_end)
+                let cur_ln = lines[lidx]
+                // Check for compound assignment (`+=`, `-=`, `*=`, `/=`) on this line near `d.col` FIRST (Opus P2-2 fail-closed!)
+                let mut is_compound = raw_op == "+=" || raw_op == "-=" || raw_op == "*=" || raw_op == "/="
+                let mut compound_sym = raw_op
+                if !is_compound && (raw_op == "+" || raw_op == "-" || raw_op == "*" || raw_op == "/") {
+                  let ctoks = lex_moonbit(cur_ln)
+                  let target_assign = raw_op + "="
+                  let mut has_assign = false
+                  let mut has_exact_bin = false
+                  let mut ci = 0
+                  while ci < ctoks.length() - 1 {
+                    if ctoks[ci].kind == TokenKind::AssignOp && ctoks[ci].raw == target_assign {
+                      has_assign = true
+                    } else if ctoks[ci].raw == raw_op {
+                      let dist = if ctoks[ci].col >= d.col { ctoks[ci].col - d.col } else { d.col - ctoks[ci].col }
+                      if dist <= 2 {
+                        has_exact_bin = true
+                      }
+                    }
+                    ci = ci + 1
+                  }
+                  if has_assign && !has_exact_bin {
+                    is_compound = true
+                    compound_sym = target_assign
+                  }
+                }
+                let op_name = if is_compound && compound_sym.length() >= 2 {
+                  op_symbol_to_name(compound_sym.slice(0, 1))
+                } else {
+                  op_symbol_to_name(raw_op)
+                }
+                if is_compound && op_name.length() > 0 && op_lookup.contains(op_ty + "|" + op_name) {
+                  let mut dup = false
+                  for existing in diags {
+                    if existing.code == "MBT2PION_UNSUPPORTED_SYNTAX" && existing.file == f.rel_path && existing.line == d.line {
+                      dup = true
+                      break
+                    }
+                  }
+                  if !dup {
+                    diags.push(diag_error(
+                      "MBT2PION_UNSUPPORTED_SYNTAX",
+                      f.rel_path,
+                      d.line,
+                      d.col,
+                      "compound assignment `" + compound_sym + "` on custom operator-overloaded type `" + op_ty + "` is not supported (fail-closed)",
+                    ))
+                  }
+                } else if !is_compound && op_name.length() > 0 {
+                  match op_lookup.get(op_ty + "|" + op_name) {
+                    Some(helper_fn) =>
+                    if rewrite_custom_binop_at(lines, lidx, d.col, raw_op, helper_fn, mutated_lines) {
+                      file_changed = true
+                      line_mutated = true
+                    }
+                    None => ()
+                  }
                 }
               }
             }

@@ -844,6 +844,52 @@ fn case_compat_parse_numbers() -> Unit {
 }
 
 ///|
+fn case_set_retain_nan() -> Unit {
+  let nan = 0.0 / 0.0
+  let s1 : Set[Double] = Set::new()
+  s1.add(nan)
+  s1.add(1.0)
+  s1.retain(fn(_) { false })
+  trace("s1_len", s1.length().to_string())
+  check("set.retain_nan_all_false", s1.length() == 0)
+
+  let s2 : Set[Double] = Set::new()
+  s2.add(nan)
+  s2.add(1.0)
+  s2.retain(fn(x) { x == x })
+  let rem = s2.to_array()
+  trace("s2_rem", "\{s2.length()}:\{rem[0]}")
+  check("set.retain_nan_keep_finite", s2.length() == 1 && rem.length() == 1 && rem[0] == 1.0)
+
+  // 100 elements (NaN + 0.0..98.0): triggers compaction threshold (>= 64)
+  let s3 : Set[Double] = Set::new()
+  s3.add(nan)
+  for i = 0; i < 99; i = i + 1 {
+    s3.add(i.to_double())
+  }
+  s3.retain(fn(_) { false })
+  trace("s3_len", s3.length().to_string())
+  check("set.retain_100_all_false", s3.length() == 0 && s3.to_array().length() == 0)
+
+  let s4 : Set[Double] = Set::new()
+  s4.add(nan)
+  for i = 0; i < 99; i = i + 1 {
+    s4.add(i.to_double())
+  }
+  s4.retain(fn(x) { x == x && x >= 90.0 })
+  let rem4 = s4.to_array()
+  let mut rem4_str = ""
+  for j = 0; j < rem4.length(); j = j + 1 {
+    if j > 0 {
+      rem4_str = rem4_str + ","
+    }
+    rem4_str = rem4_str + rem4[j].to_string()
+  }
+  trace("s4_rem", "\{s4.length()}:\{rem4_str}")
+  check("set.retain_100_ge90", s4.length() == 9 && rem4.length() == 9 && rem4[0] == 90.0 && rem4[8] == 98.0)
+}
+
+///|
 fn main {
   let args = @env.args()
   let name = if args.length() > 1 { args[1] } else { "" }
@@ -871,6 +917,7 @@ fn main {
     "compat.basics" => case_compat_basics()
     "compat.round2" => case_compat_round2()
     "compat.parse_numbers" => case_compat_parse_numbers()
+    "set.retain_nan" => case_set_retain_nan()
     _ =>
       if name.has_prefix("div.") {
         case_div_trap(name)

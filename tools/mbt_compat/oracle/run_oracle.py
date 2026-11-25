@@ -76,6 +76,7 @@ CASES = {
     "compat.basics": ("ok", 8),
     "compat.round2": ("ok", 5),
     "compat.parse_numbers": ("ok", 12),
+    "set.retain_nan": ("ok", 4),
 }
 for _t in DIV_TYPES:
     for _src in ("rt", "const"):

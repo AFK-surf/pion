@@ -1180,10 +1180,20 @@ struct StageBPkgFn {
   params : Array[String]
 }
 
-fn collect_stage_b_pkg_fns(cur_files : Array[GeneratedFile]) -> Map[String, StageBPkgFn] {
+fn collect_stage_b_pkg_fns_cached(
+  cur_files : Array[GeneratedFile],
+  file_tokens : Map[String, Array[Token]],
+) -> Map[String, StageBPkgFn] {
   let out : Map[String, StageBPkgFn] = Map()
   for f in cur_files {
-    let toks = lex_moonbit(f.content)
+    let toks = match file_tokens.get(f.rel_path) {
+      Some(ts) => ts
+      None => {
+        let ts = lex_moonbit(f.content)
+        file_tokens[f.rel_path] = ts
+        ts
+      }
+    }
     let n = toks.length() - 1
     let mut i = 0
     let mut depth = 0
@@ -1229,6 +1239,11 @@ fn collect_stage_b_pkg_fns(cur_files : Array[GeneratedFile]) -> Map[String, Stag
     }
   }
   out
+}
+
+fn collect_stage_b_pkg_fns(cur_files : Array[GeneratedFile]) -> Map[String, StageBPkgFn] {
+  let cache : Map[String, Array[Token]] = Map()
+  collect_stage_b_pkg_fns_cached(cur_files, cache)
 }
 
 ///| Check whether a scope `[s, e)` mutates any non-disjoint array or calls a helper that does.
@@ -1480,9 +1495,58 @@ fn stage_b_scope_may_mutate(
             }
           }
         }
+        // Opus #39 P2 #1: fail-closed if a mutating method or `[i] =` is applied to call result `f(...).push(...)` / `f(...)[0] = ...`
+        let mut post = cp + 1
+        while post < e && !tokens[post].newline_before {
+          if post + 2 < e && tokens[post].kind == TokenKind::Dot &&
+          tokens[post + 1].kind == TokenKind::Ident && tokens[post + 2].kind == TokenKind::LParen {
+            if is_array_mutating_method(tokens[post + 1].raw) {
+              return true
+            }
+            post = find_matching_delim(tokens, post + 2) + 1
+          } else if post + 1 < e && tokens[post].kind == TokenKind::Dot &&
+          (tokens[post + 1].kind == TokenKind::Ident || tokens[post + 1].kind == TokenKind::IntLit) {
+            post = post + 2
+          } else if tokens[post].kind == TokenKind::LParen {
+            post = find_matching_delim(tokens, post) + 1
+          } else if tokens[post].kind == TokenKind::LBracket {
+            let cb = find_matching_delim(tokens, post)
+            if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+              return true
+            }
+            post = cb + 1
+          } else {
+            break
+          }
+        }
         k = cp + 1
         continue
       }
+      // 3b. Direct mutation on any parenthesized/call expression `(...).push(...)` or `(...)[0] = ...`
+    } else if tk.kind == TokenKind::RParen && !prev_qual {
+      let mut post = k + 1
+      while post < e && !tokens[post].newline_before {
+        if post + 2 < e && tokens[post].kind == TokenKind::Dot &&
+        tokens[post + 1].kind == TokenKind::Ident && tokens[post + 2].kind == TokenKind::LParen {
+          if is_array_mutating_method(tokens[post + 1].raw) {
+            return true
+          }
+          post = find_matching_delim(tokens, post + 2) + 1
+        } else if post + 1 < e && tokens[post].kind == TokenKind::Dot &&
+        (tokens[post + 1].kind == TokenKind::Ident || tokens[post + 1].kind == TokenKind::IntLit) {
+          post = post + 2
+        } else if tokens[post].kind == TokenKind::LBracket {
+          let cb = find_matching_delim(tokens, post)
+          if cb + 1 < e && (tokens[cb + 1].kind == TokenKind::Eq || tokens[cb + 1].kind == TokenKind::AssignOp) {
+            return true
+          }
+          post = cb + 1
+        } else {
+          break
+        }
+      }
+    }
+    if tk.kind == TokenKind::Ident && !prev_qual {
       // 4. Direct/nested array mutation: walk full access chain (`.field`, `.0`, `[idx]`) first;
       //    any `path_depth > 0` fails closed even if root container is fresh (e.g. `wrap[0].push`, `t.0.push`).
       let mut p = k + 1
@@ -1540,7 +1604,29 @@ fn stage_b_check_array_retain_mutation(
   mname : String,
   diags : Array[Diag],
 ) -> Unit {
-  let tokens = lex_moonbit(content)
+  let file_tokens : Map[String, Array[Token]] = Map()
+  let pkg_fns = collect_stage_b_pkg_fns_cached(cur_files, file_tokens)
+  stage_b_check_array_retain_mutation_cached(file_tokens, pkg_fns, f_rel, content, line, col, mname, diags)
+}
+
+fn stage_b_check_array_retain_mutation_cached(
+  file_tokens : Map[String, Array[Token]],
+  pkg_fns : Map[String, StageBPkgFn],
+  f_rel : String,
+  content : String,
+  line : Int,
+  col : Int,
+  mname : String,
+  diags : Array[Diag],
+) -> Unit {
+  let tokens = match file_tokens.get(f_rel) {
+    Some(ts) => ts
+    None => {
+      let ts = lex_moonbit(content)
+      file_tokens[f_rel] = ts
+      ts
+    }
+  }
   let n = tokens.length() - 1
   // Find `.retain(` or `.filter_map(` on `line` closest to `col`
   let mut dot_i = -1
@@ -1716,7 +1802,6 @@ fn stage_b_check_array_retain_mutation(
     fresh_disjoint.remove(recv_root)
   }
 
-  let pkg_fns = collect_stage_b_pkg_fns(cur_files)
   let visited_fns : Map[String, Bool] = Map()
   let mut may_mutate = false
   if tokens[arg_s].kind == TokenKind::Keyword && tokens[arg_s].raw == "fn" &&
@@ -1930,4 +2015,563 @@ fn lower_generic_bounds_brackets(
     cur = pe + 1
   }
   "[" + join_comma(params) + "]"
+}
+
+// ---------------------------------------------------------------------------
+// 7. Collision-Free Operator Trait Lowering (`Add`/`Sub`/`Mul`/`Neg`/`Div`)
+//    + Active Type-Directed `Neg` (`-p`) Probing Pass
+// ---------------------------------------------------------------------------
+
+fn canonical_op_for_trait_method(trait_name : String, method_name : String) -> Option[String] {
+  if trait_name == "Add" && (method_name == "add" || method_name == "op_add") {
+    return Some("add")
+  }
+  if trait_name == "Sub" && (method_name == "sub" || method_name == "op_sub") {
+    return Some("sub")
+  }
+  if trait_name == "Mul" && (method_name == "mul" || method_name == "op_mul") {
+    return Some("mul")
+  }
+  if trait_name == "Neg" && (method_name == "neg" || method_name == "op_neg") {
+    return Some("neg")
+  }
+  if trait_name == "Div" && (method_name == "div" || method_name == "op_div") {
+    return Some("div")
+  }
+  None
+}
+
+fn sanitize_op_type_ident(ty : String) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < ty.length() {
+    let c = ty.code_unit_at(i)
+    if (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || (c >= 48 && c <= 57) || c == 95 {
+      sb.write_byte(c.to_byte())
+    } else {
+      sb.write_string("_")
+    }
+    i = i + 1
+  }
+  let out = sb.to_string()
+  if out.length() == 0 { "T" } else { out }
+}
+
+fn alloc_collision_free_op_fn(used_syms : Map[String, Bool], op : String, type_name : String) -> String {
+  let base = "mbt_op_" + op + "_" + sanitize_op_type_ident(type_name)
+  if !used_syms.contains(base) {
+    used_syms[base] = true
+    return base
+  }
+  let mut n = 1
+  while true {
+    let cand = base + "_" + n.to_string()
+    if !used_syms.contains(cand) {
+      used_syms[cand] = true
+      return cand
+    }
+    n = n + 1
+  }
+  base
+}
+
+///| Fill omitted parameter types from `self_ty` in `impl (Add|Sub|Mul|Neg|Div)` param list.
+fn fill_op_impl_params(src : String, toks : Array[Token], open_p : Int, close_p : Int, self_ty : String) -> String {
+  let parts : Array[String] = []
+  let mut cur = open_p + 1
+  while cur < close_p {
+    if toks[cur].kind == TokenKind::Comma {
+      cur = cur + 1
+      continue
+    }
+    let mut pe = cur
+    let mut pd = 0
+    while pe < close_p {
+      let pk = toks[pe].kind
+      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+      else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+      else if pd == 0 && pk == TokenKind::Comma { break }
+      pe = pe + 1
+    }
+    if pe > cur {
+      let mut has_colon = false
+      let mut k = cur
+      let mut bd = 0
+      while k < pe {
+        let kk = toks[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { bd = bd + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { bd = bd - 1 }
+        else if bd == 0 && kk == TokenKind::Colon { has_colon = true; break }
+        k = k + 1
+      }
+      let raw_p = src.slice(toks[cur].start_byte, toks[pe - 1].end_byte).trim()
+      if has_colon {
+        parts.push(raw_p)
+      } else {
+        parts.push(raw_p + " : " + self_ty)
+      }
+    }
+    cur = pe + 1
+  }
+  join_comma(parts)
+}
+
+///| Pre-pass before Stage A: lower `[pub] impl (Add|Sub|Mul|Neg|Div) for <Type> with <op>(...) [-> Ret] { ... }`
+///| into collision-free top-level functions `mbt_op_<op>_<Type>` (NEVER colliding with inherent `Type::add`!).
+pub fn preprocess_op_trait_impls(
+  sources : Array[SourceFile],
+  self_pkg : String,
+) -> (Array[SourceFile], Array[OpImplEntry]) {
+  let used_syms : Map[String, Bool] = Map()
+  let pub_types : Map[String, Bool] = Map()
+  // Pass 1: collect ALL identifiers (at ANY lexical depth, so local closures/bindings can never shadow
+  // generated `mbt_op_<op>_<Type>` helpers — Astra P0-1) & top-level `pub` types across all source files
+  for sf in sources {
+    let toks = lex_moonbit(sf.content)
+    let n = toks.length() - 1
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent {
+        used_syms[t.raw] = true
+      }
+      if depth == 0 {
+        if t.kind == TokenKind::Keyword && t.raw == "pub" {
+          let mut k = i + 1
+          if k < n && toks[k].kind == TokenKind::LParen {
+            k = find_matching_delim(toks, k) + 1
+          }
+          if k + 1 < n && toks[k].kind == TokenKind::Keyword &&
+          (toks[k].raw == "struct" || toks[k].raw == "enum" || toks[k].raw == "type") &&
+          toks[k + 1].kind == TokenKind::UpperIdent {
+            pub_types[toks[k + 1].raw] = true
+          }
+        }
+      }
+      i = i + 1
+    }
+  }
+
+  let out_sources : Array[SourceFile] = []
+  let op_entries : Array[OpImplEntry] = []
+  for sf in sources {
+    let src = sf.content
+    let toks = lex_moonbit(src)
+    let n = toks.length() - 1
+    let edits : Array[(Int, Int, String)] = []
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+      let t = toks[i]
+      if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+      if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+      if depth == 0 {
+        let mut is_pub = false
+        let mut impl_i = i
+        if t.kind == TokenKind::Keyword && t.raw == "pub" {
+          is_pub = true
+          impl_i = i + 1
+          if impl_i < n && toks[impl_i].kind == TokenKind::LParen {
+            impl_i = find_matching_delim(toks, impl_i) + 1
+          }
+        }
+        if impl_i < n && toks[impl_i].kind == TokenKind::Keyword && toks[impl_i].raw == "impl" &&
+        !(impl_i + 1 < n && toks[impl_i + 1].kind == TokenKind::LBracket) {
+          let mut for_i = -1
+          let mut with_i = -1
+          let mut lb = impl_i + 1
+          while lb < n && toks[lb].kind != TokenKind::LBrace {
+            if toks[lb].kind == TokenKind::Keyword && toks[lb].raw == "for" && for_i < 0 {
+              for_i = lb
+            } else if toks[lb].kind == TokenKind::Keyword && toks[lb].raw == "with" && with_i < 0 {
+              with_i = lb
+            }
+            lb = lb + 1
+          }
+          if for_i > impl_i && with_i > for_i + 1 && lb < n && toks[lb].kind == TokenKind::LBrace && with_i + 1 < lb {
+            let trait_name = src.slice(toks[impl_i + 1].start_byte, toks[for_i - 1].end_byte).trim()
+            let self_ty = src.slice(toks[for_i + 1].start_byte, toks[with_i - 1].end_byte).trim()
+            let mname = toks[with_i + 1].raw
+            // Only non-generic concrete type names (no `[`)
+            if !str_has(self_ty, "[") {
+              match canonical_op_for_trait_method(trait_name, mname) {
+                Some(canon_op) => {
+                  let mut open_p = with_i + 2
+                  while open_p < lb && toks[open_p].kind != TokenKind::LParen {
+                    open_p = open_p + 1
+                  }
+                  if open_p < lb {
+                    let close_p = find_matching_delim(toks, open_p)
+                    let typed_params = fill_op_impl_params(src, toks, open_p, close_p, self_ty)
+                    let ret_str = if close_p + 1 < lb && toks[close_p + 1].kind == TokenKind::Arrow {
+                      " -> " + src.slice(toks[close_p + 2].start_byte, toks[lb - 1].end_byte).trim()
+                    } else {
+                      " -> " + self_ty
+                    }
+                    let fn_name = alloc_collision_free_op_fn(used_syms, canon_op, self_ty)
+                    let emit_pub = is_pub || pub_types.contains(self_ty)
+                    let vis = if emit_pub { "pub " } else { "" }
+                    let repl_hdr = vis + "fn " + fn_name + "(" + typed_params + ")" + ret_str + " "
+                    edits.push((toks[i].start_byte, toks[lb].start_byte, repl_hdr))
+                    op_entries.push(OpImplEntry::{
+                      pkg: self_pkg,
+                      type_name: self_ty,
+                      op: canon_op,
+                      fn_name: fn_name,
+                    })
+                    let rb = find_matching_delim(toks, lb)
+                    i = rb + 1
+                    continue
+                  }
+                }
+                None => ()
+              }
+            }
+          }
+        }
+      }
+      i = i + 1
+    }
+    if edits.length() > 0 {
+      out_sources.push(SourceFile::{
+        rel_path: sf.rel_path,
+        content: apply_byte_edits(src, edits),
+        is_test: sf.is_test,
+      })
+    } else {
+      out_sources.push(sf)
+    }
+  }
+  (out_sources, op_entries)
+}
+
+///| Build lookup map `type_name|op -> helper_fn_name` from local + verified `--dep` ABIs.
+pub fn build_op_impl_lookup(
+  local_ops : Array[OpImplEntry],
+  dep_abis : Array[(String, PackageAbi)],
+) -> Map[String, String] {
+  let out : Map[String, String] = Map()
+  for op in local_ops {
+    out[op.type_name + "|" + op.op] = op.fn_name
+  }
+  for pair in dep_abis {
+    let dname = pair.0
+    for op in pair.1.op_impls {
+      let qual_ty = dname + "::" + op.type_name
+      let qual_fn = dname + "::" + op.fn_name
+      out[qual_ty + "|" + op.op] = qual_fn
+    }
+  }
+  out
+}
+
+pub fn has_any_neg_impl(op_lookup : Map[String, String]) -> Bool {
+  for k in op_lookup.keys() {
+    if k.ends_with("|neg") {
+      return true
+    }
+  }
+  false
+}
+
+fn is_value_ending_tok(t : Token) -> Bool {
+  t.kind == TokenKind::Ident || t.kind == TokenKind::UpperIdent ||
+  t.kind == TokenKind::IntLit || t.kind == TokenKind::FloatLit ||
+  t.kind == TokenKind::StringLit || t.kind == TokenKind::CharLit ||
+  t.kind == TokenKind::InterpString || t.kind == TokenKind::InterpMultiline ||
+  t.kind == TokenKind::RParen || t.kind == TokenKind::RBracket || t.kind == TokenKind::RBrace ||
+  (t.kind == TokenKind::Keyword && (t.raw == "true" || t.raw == "false" || t.raw == "self"))
+}
+
+struct NegProbeCandidate {
+  probe_id : String
+  file : String
+  minus_byte : Int
+  end_byte : Int
+  operand_expr : String
+}
+
+///| Active type-directed unary `Neg` (`-p`, `-p.x`, `-get_p().y`, `-(a + b)`, `-as_int(-p)`, `------p`) probing pass.
+///| Uses innermost-first probing and iterates up to 64 rounds (fail-closed if exceeded).
+///| Only runs when `has_any_neg_impl(op_lookup)` is true (zero overhead otherwise).
+pub fn run_neg_probe_pass(
+  files : Array[GeneratedFile],
+  op_lookup : Map[String, String],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+) -> (Array[GeneratedFile], Bool) {
+  if !has_any_neg_impl(op_lookup) {
+    return (files, false)
+  }
+  let mut cur_files = files
+  let mut total_changed = false
+  let safe_by_file : Map[String, Map[Int, Bool]] = Map()
+  let mut seq = 0
+  let mut round = 0
+  let mut last_round_progressed = false
+  while round < 64 {
+    let cands_by_file : Map[String, Array[NegProbeCandidate]] = Map()
+    let scratch_batch : Array[(String, String)] = []
+    let mut total_cands = 0
+    for gf in cur_files {
+      let smap = match safe_by_file.get(gf.rel_path) {
+        Some(m) => m
+        None => {
+          let m : Map[Int, Bool] = Map()
+          safe_by_file[gf.rel_path] = m
+          m
+        }
+      }
+      let toks = lex_moonbit(gf.content)
+      let tn = toks.length() - 1
+      let fcands : Array[NegProbeCandidate] = []
+      let scratch_edits : Array[(Int, Int, String)] = []
+      let mut last_end = 0
+      let mut i = 0
+      let mut depth = 0
+      while i < tn {
+        let t = toks[i]
+        if t.kind == TokenKind::LBrace { depth = depth + 1; i = i + 1; continue }
+        if t.kind == TokenKind::RBrace { if depth > 0 { depth = depth - 1 }; i = i + 1; continue }
+        if t.kind == TokenKind::Minus && t.start_byte >= last_end && !smap.contains(t.start_byte) {
+          let is_unary = i == 0 || t.newline_before || !is_value_ending_tok(toks[i - 1])
+          if is_unary && i + 1 < tn {
+            let nxt = toks[i + 1]
+            // Parse full postfix expression starting at `i + 1`
+            let mut j = i + 1
+            let mut valid_base = false
+            if nxt.kind == TokenKind::LParen || nxt.kind == TokenKind::LBracket || nxt.kind == TokenKind::LBrace {
+              j = find_matching_delim(toks, j) + 1
+              valid_base = true
+            } else if nxt.kind == TokenKind::Keyword && nxt.raw == "match" {
+              let mut mk = j + 1
+              while mk < tn {
+                if toks[mk].kind == TokenKind::LParen || toks[mk].kind == TokenKind::LBracket {
+                  mk = find_matching_delim(toks, mk) + 1
+                } else if toks[mk].kind == TokenKind::LBrace {
+                  if mk > j + 1 && toks[mk - 1].kind == TokenKind::ColonColon {
+                    mk = find_matching_delim(toks, mk) + 1
+                  } else {
+                    j = find_matching_delim(toks, mk) + 1
+                    valid_base = true
+                    break
+                  }
+                } else {
+                  mk = mk + 1
+                }
+              }
+            } else if nxt.kind == TokenKind::Keyword && nxt.raw == "if" {
+              let mut ik = j + 1
+              let mut found_then = false
+              while ik < tn {
+                if toks[ik].kind == TokenKind::LParen || toks[ik].kind == TokenKind::LBracket {
+                  ik = find_matching_delim(toks, ik) + 1
+                } else if toks[ik].kind == TokenKind::LBrace {
+                  if ik > j + 1 && toks[ik - 1].kind == TokenKind::ColonColon {
+                    ik = find_matching_delim(toks, ik) + 1
+                  } else {
+                    ik = find_matching_delim(toks, ik) + 1
+                    found_then = true
+                    break
+                  }
+                } else {
+                  ik = ik + 1
+                }
+              }
+              if found_then {
+                while ik < tn && toks[ik].kind == TokenKind::Keyword && toks[ik].raw == "else" {
+                  ik = ik + 1
+                  if ik < tn && toks[ik].kind == TokenKind::Keyword && toks[ik].raw == "if" {
+                    ik = ik + 1
+                    let mut found_elif = false
+                    while ik < tn {
+                      if toks[ik].kind == TokenKind::LParen || toks[ik].kind == TokenKind::LBracket {
+                        ik = find_matching_delim(toks, ik) + 1
+                      } else if toks[ik].kind == TokenKind::LBrace {
+                        if ik > 0 && toks[ik - 1].kind == TokenKind::ColonColon {
+                          ik = find_matching_delim(toks, ik) + 1
+                        } else {
+                          ik = find_matching_delim(toks, ik) + 1
+                          found_elif = true
+                          break
+                        }
+                      } else {
+                        ik = ik + 1
+                      }
+                    }
+                    if !found_elif {
+                      break
+                    }
+                  } else if ik < tn && toks[ik].kind == TokenKind::LBrace {
+                    ik = find_matching_delim(toks, ik) + 1
+                    j = ik
+                    valid_base = true
+                    break
+                  } else {
+                    break
+                  }
+                }
+              }
+            } else if nxt.kind == TokenKind::Ident || nxt.kind == TokenKind::UpperIdent ||
+            (nxt.kind == TokenKind::Keyword && nxt.raw == "self") {
+              j = j + 1
+              while j + 1 < tn && toks[j].kind == TokenKind::ColonColon &&
+              (toks[j + 1].kind == TokenKind::Ident || toks[j + 1].kind == TokenKind::UpperIdent) {
+                j = j + 2
+              }
+              if j + 1 < tn && toks[j].kind == TokenKind::ColonColon && toks[j + 1].kind == TokenKind::LBrace {
+                j = find_matching_delim(toks, j + 1) + 1
+              }
+              valid_base = true
+            } else if nxt.kind == TokenKind::IntLit || nxt.kind == TokenKind::FloatLit {
+              // Skip bare numeric literals `-1`, `-3.14` (always primitive numeric!)
+              valid_base = false
+            }
+            if valid_base {
+              while j < tn && !toks[j].newline_before {
+                if toks[j].kind == TokenKind::Dot && j + 1 < tn &&
+                (toks[j + 1].kind == TokenKind::Ident || toks[j + 1].kind == TokenKind::IntLit) {
+                  j = j + 2
+                } else if toks[j].kind == TokenKind::LParen {
+                  j = find_matching_delim(toks, j) + 1
+                } else if toks[j].kind == TokenKind::LBracket {
+                  j = find_matching_delim(toks, j) + 1
+                } else {
+                  break
+                }
+              }
+              // Innermost-first (Astra P0-2 / `-as_int(-p)`): if `[i + 1 .. j)` contains any unprobed
+              // inner unary `-` (excluding bare numeric literals), defer this outer `-` to a later round!
+              let mut has_inner_unprobed = false
+              let mut k = i + 1
+              while k < j {
+                if toks[k].kind == TokenKind::Minus && !smap.contains(toks[k].start_byte) {
+                  let k_unary = k == 0 || toks[k].newline_before || !is_value_ending_tok(toks[k - 1])
+                  if k_unary && k + 1 < tn &&
+                  toks[k + 1].kind != TokenKind::IntLit && toks[k + 1].kind != TokenKind::FloatLit {
+                    has_inner_unprobed = true
+                    break
+                  }
+                }
+                k = k + 1
+              }
+              if !has_inner_unprobed && j > i + 1 {
+                let end_b = toks[j - 1].end_byte
+                let expr_s = gf.content.slice(toks[i + 1].start_byte, end_b).trim()
+                if expr_s.length() > 0 {
+                  let pid = "p" + seq.to_string()
+                  seq = seq + 1
+                  fcands.push(NegProbeCandidate::{
+                    probe_id: pid,
+                    file: gf.rel_path,
+                    minus_byte: t.start_byte,
+                    end_byte: end_b,
+                    operand_expr: expr_s,
+                  })
+                  scratch_edits.push((t.start_byte, end_b, "(" + expr_s + ").mbt_neg_probe__" + pid + "()"))
+                  last_end = end_b
+                  total_cands = total_cands + 1
+                  i = j
+                  continue
+                }
+              }
+            }
+          }
+        }
+        i = i + 1
+      }
+      cands_by_file[gf.rel_path] = fcands
+      let scratch_src = if scratch_edits.length() > 0 {
+        apply_byte_edits(gf.content, scratch_edits)
+      } else {
+        gf.content
+      }
+      scratch_batch.push((gf.rel_path, scratch_src))
+    }
+    if total_cands == 0 {
+      last_round_progressed = false
+      break
+    }
+    let raw_json = check_fn(scratch_batch)
+    let pdiags = parse_pionc_diagnostics(raw_json)
+    let resolved_by_id : Map[String, String] = Map()
+    for d in pdiags {
+      match extract_probe_with_id_from_diag(d) {
+        Some((pkind, pid, rty)) =>
+        if pkind == "mbt_neg_probe" && pid.length() > 0 {
+          resolved_by_id[pid] = rty
+        }
+        None => ()
+      }
+    }
+    let mut round_changed = false
+    let mut new_safe_added = false
+    let next_files : Array[GeneratedFile] = []
+    for gf in cur_files {
+      let fcands = match cands_by_file.get(gf.rel_path) {
+        Some(xs) => xs
+        None => []
+      }
+      let smap = match safe_by_file.get(gf.rel_path) {
+        Some(m) => m
+        None => Map()
+      }
+      let real_edits : Array[(Int, Int, String)] = []
+      for c in fcands {
+        match resolved_by_id.get(c.probe_id) {
+          Some(rty) =>
+          match op_lookup.get(rty + "|neg") {
+            Some(fn_name) => {
+              real_edits.push((c.minus_byte, c.end_byte, fn_name + "(" + c.operand_expr + ")"))
+            }
+            None => {
+              if !smap.contains(c.minus_byte) {
+                smap[c.minus_byte] = true
+                new_safe_added = true
+              }
+            }
+          }
+          None => {
+            if !smap.contains(c.minus_byte) {
+              smap[c.minus_byte] = true
+              new_safe_added = true
+            }
+          }
+        }
+      }
+      if real_edits.length() > 0 {
+        round_changed = true
+        total_changed = true
+        // Reset safe offsets for this file since byte offsets shifted
+        safe_by_file[gf.rel_path] = Map()
+        next_files.push(GeneratedFile::{
+          rel_path: gf.rel_path,
+          content: apply_byte_edits(gf.content, real_edits),
+          source_file: gf.source_file,
+          anchors: gf.anchors,
+        })
+      } else {
+        next_files.push(gf)
+      }
+    }
+    cur_files = next_files
+    last_round_progressed = round_changed || new_safe_added
+    if !last_round_progressed {
+      break
+    }
+    round = round + 1
+  }
+  if round == 64 && last_round_progressed {
+    diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      "<neg-probe>",
+      1,
+      1,
+      "unary `-` operator trait lowering did not converge within 64 rounds (fail-closed)",
+    ))
+  }
+  (cur_files, total_changed)
 }

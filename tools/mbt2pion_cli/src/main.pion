@@ -413,6 +413,7 @@ fn run_pionc_check_candidate_view(
   clean_out_dir : String,
   stage_dir : String,
   final_files : Array[m2p::GeneratedFile],
+  verified_companions : Array[(String, String, String)],
   unmanaged_dirs : Array[(String, Int)],
   unmanaged_files : Array[(String, Int)],
   unmanaged_symlinks : Array[(String, String)],
@@ -447,6 +448,12 @@ fn run_pionc_check_candidate_view(
     let parent = dirname(dst)
     if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
     let _ = fs_symlink(world, join_path(real_stage, gf.rel_path), dst)
+  }
+  for vc in verified_companions {
+    let dst = join_path(src_view, vc.0)
+    let parent = dirname(dst)
+    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+    let _ = fs_symlink(world, join_path(real_stage, vc.0), dst)
   }
   for fm in unmanaged_files {
     let real_src = join_path(real_stage, fm.0)
@@ -557,6 +564,15 @@ fn run_pionc_check_candidate_view(
     if !fs_symlink(world, join_path(real_stage, gf.rel_path), dst) {
       let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
       return (false, "", "failed creating test-check symlink for " + gf.rel_path)
+    }
+  }
+  for vc in verified_companions {
+    let dst = join_path(test_src_view, alias_test_rel(vc.0))
+    let parent = dirname(dst)
+    if parent.length() > 0 { let _ = fs_mkdir_p(world, parent) }
+    if !fs_symlink(world, join_path(real_stage, vc.0), dst) {
+      let _ = proc_exec(world, [rm_bin, "-rf", test_scratch])
+      return (false, "", "failed creating test-check symlink for " + vc.0)
     }
   }
   for fm in unmanaged_files {
@@ -902,6 +918,8 @@ fn scan_unmanaged_tree(
   root : String,
   rel_dir : String,
   gen_set : Map[String, Bool],
+  companion_set : Map[String, Bool],
+  prev_companion_hashes : Map[String, String],
   unmanaged_dirs : Array[(String, Int)],
   unmanaged_symlinks : Array[(String, String)],
   unmanaged_files : Array[(String, Int)],
@@ -933,6 +951,8 @@ fn scan_unmanaged_tree(
           root,
           rel,
           gen_set,
+          companion_set,
+          prev_companion_hashes,
           unmanaged_dirs,
           unmanaged_symlinks,
           unmanaged_files,
@@ -947,22 +967,31 @@ fn scan_unmanaged_tree(
         Ok(tgt) => unmanaged_symlinks.push((rel, tgt))
         Err(e) => return Err("cannot readlink in --out (" + full + "): " + e)
       }
-      Some("file") =>
-      if (rel.ends_with(".pion") && is_managed_pion_file(world, full)) || rel == "mbt2pion_abi.json" {
-        // Managed `.pion` file or `mbt2pion_abi.json`: replaced by new generation or pruned if stale
-        let _ = 0
-      } else {
-        let mode = fs_lstat_mode(full)
-        if mode < 0 {
-          return Err("cannot stat file mode in --out: " + full)
-        }
-        if rel.ends_with(".pion") && !gen_set.contains(rel) {
+      Some("file") => {
+        let is_retired_companion = match prev_companion_hashes.get(rel) {
+          Some(prev_sha) =>
           match fs_read(world, full) {
-            Ok(txt) => preserved_unmanaged_pions.push((rel, txt))
-            Err(e) => return Err("unreadable unmanaged .pion file in --out (" + full + "): " + e)
+            Ok(cur_txt) => m2p::content_sha256(cur_txt) == prev_sha
+            Err(_) => false
           }
+          None => false
         }
-        unmanaged_files.push((rel, mode))
+        if (rel.ends_with(".pion") && is_managed_pion_file(world, full)) || rel == "mbt2pion_abi.json" || companion_set.contains(rel) || is_retired_companion {
+          // Managed `.pion` file, declared companion, unmodified retired companion, or `mbt2pion_abi.json`
+          let _ = 0
+        } else {
+          let mode = fs_lstat_mode(full)
+          if mode < 0 {
+            return Err("cannot stat file mode in --out: " + full)
+          }
+          if rel.ends_with(".pion") && !gen_set.contains(rel) {
+            match fs_read(world, full) {
+              Ok(txt) => preserved_unmanaged_pions.push((rel, txt))
+              Err(e) => return Err("unreadable unmanaged .pion file in --out (" + full + "): " + e)
+            }
+          }
+          unmanaged_files.push((rel, mode))
+        }
       }
       Some(other_k) =>
       return Err("unsupported special file (" + other_k + ") in --out: " + full)
@@ -1224,14 +1253,62 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  // Load optional `--recipes`
+  // Load optional `--recipes` + versioned `[[abi.companions]]` (NEVER read from `--out`!)
   let mut recipes_sha = "none"
   let mut recipes = m2p::default_recipes()
+  let verified_companions : Array[(String, String, String)] = []
+  let companion_name_set : Map[String, Bool] = Map()
   if recipes_path.length() > 0 {
     match fs_read(world, recipes_path) {
       Ok(txt) => {
         recipes_sha = m2p::content_sha256(txt)
         recipes = m2p::parse_recipes_toml(txt, recipes_path, pre_diags)
+        let comp_specs = m2p::parse_abi_companions_toml(txt, recipes_path, pre_diags)
+        let rec_dir = dirname(resolve_canonical_path(cwd, recipes_path))
+        for cs in comp_specs {
+          let src_path = if cs.source.starts_with("/") || rec_dir.length() == 0 {
+            cs.source
+          } else {
+            join_path(rec_dir, cs.source)
+          }
+          match fs_read(world, src_path) {
+            Ok(ctxt) => {
+              let actual_sha = m2p::content_sha256(ctxt)
+              if cs.sha256.length() > 0 && actual_sha != cs.sha256 {
+                pre_diags.push(m2p::diag_error(
+                  "MBT2PION_ABI_COMPANION_ERROR",
+                  cs.name,
+                  1,
+                  1,
+                  "companion `" + cs.name + "` sha256 mismatch (pinned=" + cs.sha256 + " actual=" + actual_sha + ")",
+                ))
+              } else {
+                match m2p::extract_header_abi_sha256(ctxt) {
+                  Some(_) =>
+                  pre_diags.push(m2p::diag_error(
+                    "MBT2PION_ABI_COMPANION_ERROR",
+                    cs.name,
+                    1,
+                    1,
+                    "companion source `" + cs.name + "` must not carry a `// abi-sha256:` header",
+                  ))
+                  None => {
+                    verified_companions.push((cs.name, ctxt, actual_sha))
+                    companion_name_set[cs.name] = true
+                  }
+                }
+              }
+            }
+            Err(e) =>
+            pre_diags.push(m2p::diag_error(
+              "MBT2PION_ABI_COMPANION_ERROR",
+              cs.name,
+              1,
+              1,
+              "missing or unreadable companion source `" + cs.source + "` (resolved=" + src_path + "): " + e,
+            ))
+          }
+        }
       }
       Err(e) => {
         io_eprintln(world, "mbt2pion: cannot read --recipes " + recipes_path + ": " + e)
@@ -1339,13 +1416,21 @@ pub fn main(world : World) -> Int {
   let scratch_root = join_path(tmp_base, "mbt2pion-scratch-" + start_ms.to_string() + "-" + uniq_tag)
 
   let check_cb = fn(batch : Array[(String, String)]) -> String {
+    let eff_batch = if verified_companions.length() > 0 {
+      let b : Array[(String, String)] = []
+      for item in batch { b.push(item) }
+      for vc in verified_companions { b.push((vc.0, vc.1)) }
+      b
+    } else {
+      batch
+    }
     let (_, raw_out) = run_pionc_check_batch_status(
       world,
       pionc_bin,
       join_path(scratch_root, "check"),
       check_deps,
       true,
-      batch,
+      eff_batch,
     )
     raw_out
   }
@@ -1390,7 +1475,16 @@ pub fn main(world : World) -> Int {
         }
         let mut dep_abi_ok = false
         match m2p::verify_and_parse_dep_abi(dep.0, scan_root, dep_pion_files, abi_json_opt, pre_diags) {
-          Some(parsed_abi) => {
+          Some(parsed_abi) =>
+          if mode == "publish" && !parsed_abi.publishable {
+            pre_diags.push(m2p::diag_error(
+              "MBT2PION_DEP_ABI_ERROR",
+              scan_root + "/mbt2pion_abi.json",
+              1,
+              1,
+              "dep `" + dep.0 + "` was emitted in `--mode audit` with blockers (`publishable: false`) and cannot be consumed by `--mode publish`",
+            ))
+          } else {
             dep_abis.push((dep.0, parsed_abi))
             dep_abi_ok = true
           }
@@ -1449,7 +1543,7 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  let res = m2p::transpile_package_with_abis(
+  let res = m2p::transpile_package_with_abis_and_companions(
     sources,
     api_map,
     recipes,
@@ -1457,6 +1551,7 @@ pub fn main(world : World) -> Int {
     mbti_files,
     dep_doc_jsons,
     dep_abis,
+    verified_companions,
     asset_bypass_rules,
     opts,
     pre_diags,
@@ -1727,11 +1822,17 @@ pub fn main(world : World) -> Int {
             _ => ()
           }
         }
+        let prev_companion_hashes : Map[String, String] = match fs_read(world, join_path(clean_out_dir, "mbt2pion_abi.json")) {
+          Ok(prev_abi_txt) => m2p::extract_abi_companion_hashes(prev_abi_txt)
+          Err(_) => Map()
+        }
         match scan_unmanaged_tree(
           world,
           clean_out_dir,
           "",
           gen_set,
+          companion_name_set,
+          prev_companion_hashes,
           unmanaged_dirs,
           unmanaged_symlinks,
           unmanaged_files,
@@ -1790,7 +1891,7 @@ pub fn main(world : World) -> Int {
       }
     }
 
-    // 2. Write all newly generated `.pion` files + `mbt2pion_abi.json`
+    // 2. Write all newly generated `.pion` files + verified companion files + `mbt2pion_abi.json`
     let abi_pion_pairs : Array[(String, String)] = []
     for gf in final_files {
       abi_pion_pairs.push((gf.rel_path, gf.content))
@@ -1808,6 +1909,18 @@ pub fn main(world : World) -> Int {
           Err(e) => {
             io_eprintln(world, "mbt2pion: failed staging " + dst + ": " + e)
             stage_ok = false
+          }
+        }
+      }
+      if stage_ok {
+        for vc in verified_companions {
+          let cdst = join_path(stage_dir, vc.0)
+          match fs_write(world, cdst, vc.1) {
+            Ok(_) => ()
+            Err(e) => {
+              io_eprintln(world, "mbt2pion: failed staging companion " + cdst + ": " + e)
+              stage_ok = false
+            }
           }
         }
       }
@@ -1927,6 +2040,7 @@ pub fn main(world : World) -> Int {
         clean_out_dir,
         stage_dir,
         final_files,
+        verified_companions,
         unmanaged_dirs,
         unmanaged_files,
         unmanaged_symlinks,
@@ -2018,6 +2132,22 @@ pub fn main(world : World) -> Int {
         }
         Err(_) => {
           io_eprintln(world, "mbt2pion --check: missing output file " + gf.rel_path)
+          diffs = diffs + 1
+        }
+      }
+    }
+    // Check verified companion files byte-for-byte
+    for vc in verified_companions {
+      expected_set[vc.0] = true
+      let cdst = join_path(out_dir, vc.0)
+      match fs_read(world, cdst) {
+        Ok(existing) =>
+        if existing != vc.1 {
+          io_eprintln(world, "mbt2pion --check: mismatch in companion " + vc.0)
+          diffs = diffs + 1
+        }
+        Err(_) => {
+          io_eprintln(world, "mbt2pion --check: missing companion file " + vc.0)
           diffs = diffs + 1
         }
       }
@@ -2261,9 +2391,34 @@ pub fn main(world : World) -> Int {
       }
     }
   } else {
-    // `--mode audit`: write generated files for inspection, exit 0 even with blockers unless IO fails
+    // `--mode audit`: remove stale managed `.pion` and unmodified retired companions from previous run,
+    // then write generated files + verified companions + `mbt2pion_abi.json` for chained `--mode audit --dep ...`
     let _ = fs_mkdir_p(world, out_dir)
+    let audit_prev_comps : Map[String, String] = match fs_read(world, join_path(out_dir, "mbt2pion_abi.json")) {
+      Ok(prev_abi_txt) => m2p::extract_abi_companion_hashes(prev_abi_txt)
+      Err(_) => Map()
+    }
+    let existing_audit_pions : Array[String] = []
+    collect_files_sorted(world, out_dir, "", ".pion", existing_audit_pions)
+    for rel in existing_audit_pions {
+      if !gen_set.contains(rel) && !companion_name_set.contains(rel) {
+        let full_old = join_path(out_dir, rel)
+        let is_retired_comp = match audit_prev_comps.get(rel) {
+          Some(prev_sha) =>
+          match fs_read(world, full_old) {
+            Ok(cur_txt) => m2p::content_sha256(cur_txt) == prev_sha
+            Err(_) => false
+          }
+          None => false
+        }
+        if is_managed_pion_file(world, full_old) || is_retired_comp {
+          let _ = fs_remove(world, full_old)
+        }
+      }
+    }
+    let audit_abi_pairs : Array[(String, String)] = []
     for gf in final_res.files {
+      audit_abi_pairs.push((gf.rel_path, gf.content))
       let dst = join_path(out_dir, gf.rel_path)
       let parent = dirname(dst)
       if parent.length() > 0 {
@@ -2275,6 +2430,24 @@ pub fn main(world : World) -> Int {
           io_eprintln(world, "mbt2pion: failed writing " + dst + ": " + e)
           exit_code = 3
         }
+      }
+    }
+    for vc in verified_companions {
+      let cdst = join_path(out_dir, vc.0)
+      match fs_write(world, cdst, vc.1) {
+        Ok(_) => ()
+        Err(e) => {
+          io_eprintln(world, "mbt2pion: failed writing companion " + cdst + ": " + e)
+          exit_code = 3
+        }
+      }
+    }
+    let audit_abi_json = m2p::render_abi_json(final_res.abi, audit_abi_pairs)
+    match fs_write(world, join_path(out_dir, "mbt2pion_abi.json"), audit_abi_json) {
+      Ok(_) => ()
+      Err(e) => {
+        io_eprintln(world, "mbt2pion: failed writing mbt2pion_abi.json: " + e)
+        exit_code = 3
       }
     }
   }
