@@ -15,10 +15,18 @@
 #      single-row tables keep row boxes;
 #   4. sparse: the Wasm32 data section of a mostly-zero 2,048 word table is
 #      split into active segments that skip edge and 16+ byte zero runs and
-#      rebuild the dense memory image.
+#      rebuild the dense memory image; sparsecap: a leading zero, 4,095
+#      `1, 0 x 16` blocks and a final 1 reach exactly the 4,096 segment cap
+#      and still rebuild the image;
+#   5. collide: `extern "C"` exports named `pion_i32_literal_0` and
+#      `pion_i32_literal_1_words` next to two word-table literals (the tables
+#      take other names); edges: out-of-range decimal / hex / underscore /
+#      negative literals give the same words through 1,023 element stores and
+#      a 1,024 element word table.
 # Each program: check.py on the dev and --release SSA, exact stdout natively
 # (dev, --release) and on Wasm32 (Node, dev and --release); ints and records
-# also under ASan/LSan; sparse also through check.py on the .wasm module
+# (and collide, edges) also under ASan/LSan; sparse and sparsecap also
+# through check.py on the .wasm module
 # (PION_NO_WASM_OPT=1). Every build uses its own empty cache directory.
 set -eu
 unset PION_TARGET || true
@@ -78,7 +86,7 @@ then
 fi
 
 N=0
-for PROG in strings ints records sparse; do
+for PROG in strings ints records sparse sparsecap collide edges; do
   SRC="$GEN/$PROG.pion"
   EXP="$GEN/$PROG.expected"
   [ -s "$EXP" ] || { echo "FAIL: p130 $PROG has no reference output" >&2; exit 1; }
@@ -92,16 +100,16 @@ for PROG in strings ints records sparse; do
     same_output "$PROG $MODE native" "$EXP" "$BASE.out"
     no_stderr "$PROG $MODE native" "$BASE.err"
     PION_NO_WASM_OPT=1 build $FLAG --target wasm32 -o "$BASE.wasm" "$SRC"
-    if [ "$PROG" = "sparse" ]; then
-      python3 -E "$DIR/check.py" wasm "$BASE.wasm" "$GEN"
-    fi
+    case "$PROG" in
+      sparse | sparsecap) python3 -E "$DIR/check.py" wasm "$PROG" "$BASE.wasm" "$GEN" ;;
+    esac
     node "$WASM_RT" "$BASE.wasm" > "$BASE.wout" 2> "$BASE.werr"
     same_output "$PROG $MODE Wasm32" "$EXP" "$BASE.wout"
     no_stderr "$PROG $MODE Wasm32" "$BASE.werr"
     echo "p130 $PROG $MODE: SSA checks, native and Wasm32 output equal the reference"
   done
   case "$PROG" in
-    ints | records)
+    ints | records | collide | edges)
       if [ "$ASAN" -eq 1 ]; then
         BASE="$TMP_DIR/${PROG}_asan"
         build --release --emit-asm "$BASE.s" "$SRC"
@@ -117,6 +125,6 @@ for PROG in strings ints records sparse; do
   esac
   N=$((N + 1))
 done
-[ "$N" -eq 4 ]
+[ "$N" -eq 7 ]
 
 echo "PASS: p130_real_workload_data_opts"

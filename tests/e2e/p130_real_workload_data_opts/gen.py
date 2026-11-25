@@ -13,11 +13,19 @@ here, independently of the compiler) into OUT_DIR:
                 element literal with side-effecting elements;
   records.pion  128+ row tables of 2- and 3-field all-String records with
                 cross-row shared strings, plus dynamic-field, reordered-field
-                and single-row tables;
-  sparse.pion   a 2,048 word table that is mostly zero (sparse Wasm32 data).
+                and single-row tables, and whole-row replacement with a heap
+                string before and after an array copy;
+  sparse.pion   a 2,048 word table that is mostly zero (sparse Wasm32 data);
+  sparsecap.pion  a word table whose bytes are a zero, 4,095 blocks
+                `1, 0 x 16` and a final 1: more cut points than the 4,096
+                segment budget, so the image ends in one dense tail segment;
+  collide.pion  `extern "C"` exports named like the first private word tables
+                next to two 1,024+ element literals;
+  edges.pion    the same edge literals through a 1,023 element (stores) and a
+                1,024 element (word table) literal;
 
-Also writes sparse.table (the little-endian image of the sparse table) and
-strings.base64 (the Base64 literal) for check.py.
+Also writes sparse.table / sparsecap.table (the little-endian images of
+those tables) and strings.base64 (the Base64 literal) for check.py.
 """
 import base64
 import os
@@ -312,6 +320,15 @@ fn main(world : World) -> Int {
   io_println(world, "reordered " + rr[0].name + " " + rr[0].chars + " " + rr[1].name + " " + rr[1].chars)
   let sr = single_row()
   io_println(world, "single " + sr.length().to_string() + " " + sr[0].name + " " + sr[0].chars)
+  // Whole-row replacement with one heap string, a copy, then writes to the
+  // original: the copy keeps its rows.
+  let tbl = entities()
+  let shared = "sh" + "ared"
+  tbl[2] = Entity::{ name: shared, chars: shared }
+  let cp = tbl.copy()
+  tbl[2] = Entity::{ name: "over", chars: tbl[3].chars }
+  tbl[3] = cp[2]
+  io_println(world, "copy " + cp[2].name + "+" + cp[2].chars + " " + cp[3].name + " " + tbl[2].name + "=" + tbl[2].chars + " " + tbl[3].name + "=" + tbl[3].chars)
   0
 }
 ''' % (rows('Entity', ['name', 'chars'], ENT), rows('Triple', ['a', 'b', 'c'], TRI))
@@ -321,6 +338,7 @@ exp.append('pick %s=%s %s=%s 140' % (ENT[7] + ENT[15]))
 exp.append('dyn xy dyn fixed xy')
 exp.append('reordered n1 c1 n2 c2')
 exp.append('single 1 only one')
+exp.append('copy shared+shared %s over=%s shared=shared' % (ENT[3][0], ENT[3][1]))
 write('records.expected', '\n'.join(exp) + '\n')
 
 # ---------------------------------------------------------------- sparse
@@ -356,3 +374,147 @@ write('sparse.expected', 'sparse-marker 2048 %d %d %d %d\n' % (
     sum(1 for w in words if w), sum(words), words[100], words[2047]))
 with open(os.path.join(OUT, 'sparse.table'), 'wb') as f:
     f.write(b''.join((w & 0xFFFFFFFF).to_bytes(4, 'little') for w in words))
+
+# ---------------------------------------------------------------- sparsecap
+cap_bytes = bytes([0]) + (bytes([1]) + bytes(16)) * 4095 + bytes([1])
+cap_bytes += bytes((-len(cap_bytes)) % 4)
+cap_words = [int.from_bytes(cap_bytes[k:k + 4], 'little', signed=True) for k in range(0, len(cap_bytes), 4)]
+src = '''// 4,095 cut points after a leading zero: the segment budget runs out.
+fn table() -> Array[Int] {
+  let a : Array[Int] = [
+%s
+  ]
+  a
+}
+
+fn main(world : World) -> Int {
+  let t = table()
+  let mut s = 0L
+  let mut i = 0
+  while i < t.length() {
+    s = (s * 31L + t[i].to_int64()) %% 1000000007L
+    i = i + 1
+  }
+  io_println(world, "sparsecap-marker " + t.length().to_string() + " " + s.to_string())
+  0
+}
+''' % '\n'.join('    ' + ', '.join(str(w) for w in cap_words[k:k + 32]) + ',' for k in range(0, len(cap_words), 32))
+write('sparsecap.pion', src)
+write('sparsecap.expected', 'sparsecap-marker %d %d\n' % (len(cap_words), checksum(cap_words)))
+with open(os.path.join(OUT, 'sparsecap.table'), 'wb') as f:
+    f.write(cap_bytes)
+
+# ---------------------------------------------------------------- collide
+CA = int_values(1024, 4)
+CB = int_values(1100, 5)
+src = '''// User C exports take the names the first word tables would get.
+pub extern "C" fn answer() -> Int = "pion_i32_literal_0" {
+  17
+}
+
+pub extern "C" fn answer_words() -> Int = "pion_i32_literal_1_words" {
+  25
+}
+
+fn table_a() -> Array[Int] {
+  let a : Array[Int] = [
+%s
+  ]
+  a
+}
+
+fn table_b() -> Array[Int] {
+  let a : Array[Int] = [
+%s
+  ]
+  a
+}
+
+fn sum_array(xs : Array[Int]) -> Int64 {
+  let mut h = 0L
+  let mut i = 0
+  while i < xs.length() {
+    h = (h * 31L + xs[i].to_int64()) %% 1000000007L
+    i = i + 1
+  }
+  h
+}
+
+fn main(world : World) -> Int {
+  let a = table_a()
+  let b = table_b()
+  io_println(world, "collide " + answer().to_string() + " " + answer_words().to_string() + " " + a.length().to_string() + " " + b.length().to_string() + " " + sum_array(a).to_string() + " " + sum_array(b).to_string())
+  0
+}
+''' % (lit(CA), lit(CB))
+write('collide.pion', src)
+write('collide.expected', 'collide 17 25 1024 1100 %d %d\n' % (
+    checksum([v for v, _ in CA]), checksum([v for v, _ in CB])))
+
+# ---------------------------------------------------------------- edges
+# Literals outside the Int range are accepted by the checker and keep their
+# low 32 bits; both lowerings must agree on every one.
+EDGE = ['2147483648', '-2147483649', '0xFFFF_FFFF', '0x8000_0000', '-0x8000_0000',
+        '4294967296', '9_999_999_999', '0x1_0000_0000', '-0xFFFF_FFFF', '1_0', '0x_FF',
+        '-2147483648', '2147483647', '0', '-1']
+
+
+def wrap32(text):
+    neg = text.startswith('-')
+    body = text.lstrip('-').replace('_', '')
+    v = int(body, 16) if body.lower().startswith('0x') else int(body)
+    v = (-v if neg else v) & 0xFFFFFFFF
+    return v - (1 << 32) if v >= 1 << 31 else v
+
+
+def edge_lit(n):
+    items = EDGE + [str(i) for i in range(n - len(EDGE))]
+    return '\n'.join('    ' + ', '.join(items[k:k + 16]) + ',' for k in range(0, len(items), 16))
+
+
+src = '''// The same edge literals through element stores (1,023) and a word table (1,024).
+fn edge_small() -> Array[Int] {
+  let a : Array[Int] = [
+%s
+  ]
+  a
+}
+
+fn edge_big() -> Array[Int] {
+  let a : Array[Int] = [
+%s
+  ]
+  a
+}
+
+fn show(xs : Array[Int], n : Int) -> String {
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < n {
+    sb.write_string(xs[i].to_string())
+    sb.write_string(" ")
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+fn main(world : World) -> Int {
+  let s = edge_small()
+  let b = edge_big()
+  let mut same = 0
+  let mut i = 0
+  while i < s.length() {
+    if s[i] == b[i] {
+      same = same + 1
+    }
+    i = i + 1
+  }
+  io_println(world, "small " + show(s, %d))
+  io_println(world, "big " + show(b, %d))
+  io_println(world, "same " + same.to_string() + " of " + s.length().to_string() + " " + b.length().to_string())
+  0
+}
+''' % (edge_lit(1023), edge_lit(1024), len(EDGE), len(EDGE))
+write('edges.pion', src)
+vals = ' '.join(str(wrap32(t)) for t in EDGE) + ' '
+write('edges.expected', 'small %s\nbig %s\nsame 1023 of 1023 1024\n' % (vals, vals))

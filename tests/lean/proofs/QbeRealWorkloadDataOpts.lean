@@ -32,15 +32,26 @@ tests in `compiler/src/core/backend_test.pion` ("p130 ...") and
      different rows share one pointer.
   4. `SparseData` — `wasm_data_spans` emits the Wasm32 data image as active
      segments that skip the leading zero run, the trailing zero run and every
-     interior zero run of at least 16 bytes, at most 4,096 segments.
-     `encode_ok` / `region_equivalence`: on a freshly instantiated,
-     module-defined (hence zero-filled) memory the segments recreate exactly
-     the dense image, for any segment budget. `coalesce`: adjacent retained
-     bytes may be merged into one segment.
+     interior zero run of at least 16 bytes, at most 4,096 segments. `loop` /
+     `wasmDataSpans` model the function one to one (committed spans only
+     count against the budget, the dense tail `[start, len)` comes last).
+     `rebuild`: writing the returned spans into zero-filled memory gives back
+     the image byte for byte; `span_count`: at most `maxSpans` spans;
+     `span_bounds`: every span is a non-empty range of the image, ascending
+     and non-overlapping; `all_zero`: an all-zero image needs no span
+     (section 11 omitted); `leading_zero_budget` / `leading_zero_budget_4096`:
+     a leading zero takes none of the budget, so a leading zero, 4,095 cut
+     blocks and a final byte give exactly 4,096 spans.
 -/
 import Std
 
 namespace QbeRealWorkloadDataOpts
+
+theorem ite_pos' {c : Prop} [Decidable c] {α : Sort _} {a b : α} (h : c) :
+    (if c then a else b) = a := by simp [h]
+
+theorem ite_neg' {c : Prop} [Decidable c] {α : Sort _} {a b : α} (h : ¬c) :
+    (if c then a else b) = b := by simp [h]
 
 namespace QuotedBytes
 
@@ -201,6 +212,25 @@ theorem other_objects (h : Heap) (ws : List Word) (id : Nat) (ne : id ≠ h.next
     (tableCopy h ws).2.objects id = h.objects id := by
   simp [tableCopy, allocate, ne]
 
+/-- Heap well-formedness: no object lives at or above the allocation cursor. -/
+def Heap.wf (h : Heap) : Prop := ∀ k, h.next ≤ k → h.objects k = none
+
+theorem alloc_wf (h : Heap) (ws : List Word) (hw : h.wf) : (tableCopy h ws).2.wf := by
+  intro k hk
+  simp [tableCopy, allocate] at hk ⊢
+  rw [ite_neg' (by omega)]
+  exact hw k (by omega)
+
+/-- On a well-formed heap the new array takes a free slot, so no existing object
+    (the private word table included) is overwritten. -/
+theorem alloc_fresh (h : Heap) (ws : List Word) (hw : h.wf) :
+    h.objects (tableCopy h ws).1 = none ∧
+    ∀ id, h.objects id ≠ none → (tableCopy h ws).2.objects id = h.objects id := by
+  refine ⟨hw _ (by simp [tableCopy, allocate]), ?_⟩
+  intro id hid
+  have : id ≠ h.next := fun he => hid (by rw [he]; exact hw _ (Nat.le_refl _))
+  exact other_objects h ws id this
+
 end LiteralWords
 
 namespace FlatRows
@@ -272,77 +302,310 @@ end FlatRows
 namespace SparseData
 
 abbrev Byte := UInt8
-inductive Run where
-  | zero (len : Nat)
-  | byte (b : Byte)
 
-def dense : List Run → List Byte
-  | [] => []
-  | .zero n :: tail => List.replicate n 0 ++ dense tail
-  | .byte b :: tail => b :: dense tail
+/-- Length of the leading zero run (the inner `while bytes[i] == 0` loop). -/
+def zrun : List Byte → Nat
+  | [] => 0
+  | b :: t => if b = 0 then zrun t + 1 else 0
 
-def prepend (b : Byte) (rs : List Run) : List Run :=
-  if b = 0 then
-    match rs with
-    | .zero n :: tail => .zero (n+1) :: tail
-    | _ => .zero 1 :: rs
-  else .byte b :: rs
+theorem zrun_le (l : List Byte) : zrun l ≤ l.length := by
+  induction l with
+  | nil => simp [zrun]
+  | cons b t ih => simp only [zrun]; split <;> simp <;> omega
 
-theorem prepend_ok (b : Byte) (rs : List Run) :
-    dense (prepend b rs) = b :: dense rs := by
-  by_cases h : b = 0
-  · subst b
-    cases rs with
-    | nil => rfl
-    | cons r tail => cases r <;> simp [prepend, dense, List.replicate_succ]
-  · simp [prepend, h, dense]
+theorem zrun_zero (l : List Byte) : ∀ t < zrun l, l.getD t 0 = 0 := by
+  induction l with
+  | nil => simp [zrun]
+  | cons b tl ih =>
+    intro t ht
+    simp only [zrun] at ht
+    split at ht
+    · cases t with
+      | zero => simp_all
+      | succ t => simpa using ih t (by omega)
+    · omega
 
-theorem scan_ok (xs : List Byte) : dense (xs.foldr prepend []) = xs := by
-  induction xs with
-  | nil => rfl
-  | cons b bs ih => simp [prepend_ok, ih]
+theorem zrun_pos (b : Byte) (tl : List Byte) (h : b = 0) : 1 ≤ zrun (b :: tl) := by
+  simp [zrun, h]
 
-/-- Chunks advance the same cursor. A gap leaves the corresponding range of
-    a freshly instantiated module-defined memory at its initial zero value. -/
-inductive Chunk where
-  | put (bytes : List Byte)
-  | gap (count : Nat)
+theorem zrun_replicate_append (k : Nat) (l : List Byte) :
+    zrun (List.replicate k 0 ++ l) = k + zrun l := by
+  induction k with
+  | zero => simp
+  | succ k ih => simp [List.replicate_succ, zrun, ih]; omega
 
-def initialized : List Chunk → List Byte
-  | [] => []
-  | .put bs :: cs => bs ++ initialized cs
-  | .gap n :: cs => List.replicate n 0 ++ initialized cs
+theorem getD_drop (l : List Byte) (n t : Nat) : (l.drop n).getD t 0 = l.getD (n + t) 0 := by
+  induction l generalizing n with
+  | nil => simp
+  | cons b tl ih =>
+    cases n with
+    | zero => simp
+    | succ n => simp only [List.drop_succ_cons]; rw [ih]; simp [Nat.succ_add]
 
-/-- `wasm_data_spans`: `lead` holds until the first byte is placed, so a
-    leading zero run of any length is skipped (it only moves the first
-    segment's offset), as are the trailing run and interior runs of at least
-    16 bytes while the segment budget lasts. -/
-def encode (budget : Nat) (lead : Bool) : List Run → List Chunk
-  | [] => []
-  | .byte b :: rs => .put [b] :: encode budget false rs
-  | .zero n :: rs =>
-    if budget > 0 && (lead || n ≥ 16 || rs.isEmpty) then
-      .gap n :: encode (budget-1) false rs
-    else .put (List.replicate n 0) :: encode budget false rs
+/-- One-to-one model of the scan loop of `wasm_data_spans`
+    (`compiler/src/core/wasm.pion`): `rest` is `bytes[pos..]`, `start` the
+    first byte not yet placed in a span, `acc` the committed spans and `cap`
+    the bound of the loop (4,095). A leading zero run (`zero == start`) and
+    every cut only move `start`; a span is committed only when it is
+    non-empty, so only committed spans count against `cap`. -/
+def loop (cap : Nat) (rest : List Byte) (pos start : Nat) (acc : List (Nat × Nat)) :
+    List (Nat × Nat) × Nat :=
+  if cap ≤ acc.length then (acc, start) else
+  match rest with
+  | [] => (acc, start)
+  | b :: tl =>
+    if b ≠ 0 then loop cap tl (pos + 1) start acc
+    else
+      if pos = start ∨ 16 ≤ zrun (b :: tl) ∨ (b :: tl).drop (zrun (b :: tl)) = [] then
+        loop cap ((b :: tl).drop (zrun (b :: tl))) (pos + zrun (b :: tl)) (pos + zrun (b :: tl))
+          (if start < pos then acc ++ [(start, pos)] else acc)
+      else loop cap ((b :: tl).drop (zrun (b :: tl))) (pos + zrun (b :: tl)) start acc
+termination_by rest.length
+decreasing_by
+  all_goals simp_wf
+  all_goals
+    have := zrun_pos b tl (by simpa using ‹¬b ≠ 0›)
+    have := zrun_le (b :: tl)
+    simp at *
+    omega
 
-theorem encode_ok (rs : List Run) (budget : Nat) (lead : Bool) :
-    initialized (encode budget lead rs) = dense rs := by
-  induction rs generalizing budget lead with
-  | nil => rfl
-  | cons r rs ih =>
-    cases r with
-    | byte b => simp [encode, initialized, dense, ih]
-    | zero n => simp only [encode, dense]; split <;> simp [initialized, ih]
+/-- `wasm_data_spans bytes` with at most `maxSpans` (4,096) spans: the scan,
+    then the dense tail `[start, len)` when it is not empty. -/
+def wasmDataSpans (bytes : List Byte) (maxSpans : Nat) : List (Nat × Nat) :=
+  let r := loop (maxSpans - 1) bytes 0 0 []
+  if r.2 < bytes.length then r.1 ++ [(r.2, bytes.length)] else r.1
 
-/-- Coalescing adjacent writes into a single active segment preserves both
-    cursor advancement and bytes, including any deliberately retained zeros. -/
-theorem coalesce (a b : List Byte) (cs : List Chunk) :
-    initialized (.put a :: .put b :: cs) = initialized (.put (a ++ b) :: cs) := by
-  simp [initialized, List.append_assoc]
+/-- Writing every span `[s, e)` of `bytes` at its offset into a freshly
+    instantiated, module-defined (zero-filled) memory of the image's size. -/
+def applySpans (bytes : List Byte) (spans : List (Nat × Nat)) : List Byte :=
+  (List.range bytes.length).map fun j =>
+    if spans.any (fun p => decide (p.1 ≤ j ∧ j < p.2)) then bytes.getD j 0 else 0
 
-theorem region_equivalence (before bytes after : List Byte) (budget : Nat) :
-    before ++ initialized (encode budget true (bytes.foldr prepend [])) ++ after =
-    before ++ bytes ++ after := by rw [encode_ok, scan_ok]
+def Covers (spans : List (Nat × Nat)) (j : Nat) : Prop := ∃ p ∈ spans, p.1 ≤ j ∧ j < p.2
+
+def Ordered (spans : List (Nat × Nat)) : Prop := spans.Pairwise (fun a b => a.2 ≤ b.1)
+
+theorem loop_inv (bytes : List Byte) (cap : Nat) (rest : List Byte) (pos start : Nat)
+    (acc : List (Nat × Nat))
+    (hrest : rest = bytes.drop pos) (hpos : pos ≤ bytes.length) (hstart : start ≤ pos)
+    (hlen : acc.length ≤ cap) (hspan : ∀ p ∈ acc, p.1 < p.2 ∧ p.2 ≤ start)
+    (hord : Ordered acc) (hcov : ∀ j < start, bytes.getD j 0 ≠ 0 → Covers acc j) :
+    (loop cap rest pos start acc).1.length ≤ cap ∧
+    (loop cap rest pos start acc).2 ≤ bytes.length ∧
+    (∀ p ∈ (loop cap rest pos start acc).1, p.1 < p.2 ∧ p.2 ≤ (loop cap rest pos start acc).2) ∧
+    Ordered (loop cap rest pos start acc).1 ∧
+    (∀ j < (loop cap rest pos start acc).2, bytes.getD j 0 ≠ 0 →
+      Covers (loop cap rest pos start acc).1 j) := by
+  fun_induction loop cap rest pos start acc with
+  | case1 rest pos start acc h =>
+    exact ⟨hlen, show start ≤ bytes.length by omega, hspan, hord, hcov⟩
+  | case2 pos start acc h =>
+    exact ⟨hlen, show start ≤ bytes.length by omega, hspan, hord, hcov⟩
+  | case3 pos start acc h b tl hb ih =>
+    have hd : tl = bytes.drop (pos + 1) := by
+      rw [← List.drop_drop, ← hrest]; simp
+    have : pos < bytes.length := by
+      have := congrArg List.length hrest; simp at this; omega
+    exact ih hd (by omega) (by omega) hlen hspan hord hcov
+  | case4 pos start acc h b tl hb hc ih =>
+    have hk := zrun_le (b :: tl)
+    have hz := zrun_zero (b :: tl)
+    have hlenr : (b :: tl).length = bytes.length - pos := by rw [hrest]; simp
+    have hd : (b :: tl).drop (zrun (b :: tl)) = bytes.drop (pos + zrun (b :: tl)) := by
+      rw [hrest, List.drop_drop, Nat.add_comm]
+    apply ih hd (by omega) (by omega)
+    · split <;> (try simp) <;> omega
+    · intro p hp
+      split at hp
+      · simp at hp
+        rcases hp with hp | hp
+        · have := hspan p hp; omega
+        · subst hp; simp; omega
+      · have := hspan p hp; omega
+    · split
+      · unfold Ordered
+        rw [List.pairwise_append]
+        refine ⟨hord, by simp, ?_⟩
+        intro a ha c hc'
+        simp at hc'; subst hc'
+        exact (hspan a ha).2
+      · exact hord
+    · intro j hj hnz
+      by_cases h1 : j < start
+      · obtain ⟨p, hp, hp'⟩ := hcov j h1 hnz
+        refine ⟨p, ?_, hp'⟩
+        split <;> simp [hp]
+      · by_cases h2 : j < pos
+        · have : start < pos := by omega
+          refine ⟨(start, pos), ?_, by simp; omega⟩
+          simp [this]
+        · exfalso
+          apply hnz
+          have := hz (j - pos) (by omega)
+          rw [hrest, getD_drop] at this
+          rwa [show pos + (j - pos) = j by omega] at this
+  | case5 pos start acc h b tl hb hc ih =>
+    have hk := zrun_le (b :: tl)
+    have hlenr : (b :: tl).length = bytes.length - pos := by rw [hrest]; simp
+    have hd : (b :: tl).drop (zrun (b :: tl)) = bytes.drop (pos + zrun (b :: tl)) := by
+      rw [hrest, List.drop_drop, Nat.add_comm]
+    exact ih hd (by omega) (by omega) hlen hspan hord hcov
+
+theorem spans_inv (bytes : List Byte) (maxSpans : Nat) (hm : 1 ≤ maxSpans) :
+    (wasmDataSpans bytes maxSpans).length ≤ maxSpans ∧
+    (∀ p ∈ wasmDataSpans bytes maxSpans, p.1 < p.2 ∧ p.2 ≤ bytes.length) ∧
+    Ordered (wasmDataSpans bytes maxSpans) ∧
+    (∀ j < bytes.length, bytes.getD j 0 ≠ 0 → Covers (wasmDataSpans bytes maxSpans) j) := by
+  have I := loop_inv bytes (maxSpans - 1) bytes 0 0 [] (by simp) (by omega) (by omega)
+    (by simp) (by simp) (by simp [Ordered]) (by intro j hj; omega)
+  obtain ⟨h1, h2, h3, h4, h5⟩ := I
+  unfold wasmDataSpans
+  simp only
+  split
+  · rename_i ht
+    refine ⟨by simp; omega, ?_, ?_, ?_⟩
+    · intro p hp
+      simp at hp
+      rcases hp with hp | hp
+      · have := h3 p hp; omega
+      · subst hp; simp; omega
+    · unfold Ordered
+      rw [List.pairwise_append]
+      refine ⟨h4, by simp, ?_⟩
+      intro a ha c hc
+      simp at hc; subst hc
+      exact (h3 a ha).2
+    · intro j hj hnz
+      by_cases hjs : j < (loop (maxSpans - 1) bytes 0 0 []).2
+      · obtain ⟨p, hp, hp'⟩ := h5 j hjs hnz
+        exact ⟨p, by simp [hp], hp'⟩
+      · exact ⟨((loop (maxSpans - 1) bytes 0 0 []).2, bytes.length), by simp,
+          Nat.le_of_not_lt hjs, hj⟩
+  · refine ⟨by omega, ?_, h4, ?_⟩
+    · intro p hp; have := h3 p hp; omega
+    · intro j hj hnz; exact h5 j (by omega) hnz
+
+/-- At most `maxSpans` segments. -/
+theorem span_count (bytes : List Byte) (maxSpans : Nat) (hm : 1 ≤ maxSpans) :
+    (wasmDataSpans bytes maxSpans).length ≤ maxSpans :=
+  (spans_inv bytes maxSpans hm).1
+
+/-- Every segment is a non-empty range of the image, in ascending order without
+    overlap. -/
+theorem span_bounds (bytes : List Byte) (maxSpans : Nat) (hm : 1 ≤ maxSpans) :
+    (∀ p ∈ wasmDataSpans bytes maxSpans, p.1 < p.2 ∧ p.2 ≤ bytes.length) ∧
+    Ordered (wasmDataSpans bytes maxSpans) :=
+  ⟨(spans_inv bytes maxSpans hm).2.1, (spans_inv bytes maxSpans hm).2.2.1⟩
+
+/-- Writing the segments into zero-filled memory rebuilds the image byte for
+    byte. -/
+theorem rebuild (bytes : List Byte) (maxSpans : Nat) (hm : 1 ≤ maxSpans) :
+    applySpans bytes (wasmDataSpans bytes maxSpans) = bytes := by
+  have hc := (spans_inv bytes maxSpans hm).2.2.2
+  apply List.ext_getElem
+  · simp [applySpans]
+  · intro j h1 h2
+    simp only [applySpans, List.getElem_map, List.getElem_range]
+    have hg : bytes.getD j 0 = bytes[j] := by simp [List.getD, h2]
+    split
+    · exact hg
+    · rename_i hn
+      rw [← hg]
+      by_cases hz : bytes.getD j 0 = 0
+      · exact hz.symm
+      · exfalso
+        apply hn
+        obtain ⟨p, hp, hp'⟩ := hc j h2 hz
+        rw [List.any_eq_true]
+        exact ⟨p, hp, by simp [hp']⟩
+
+/-- An all-zero image needs no segment, so section 11 is omitted. -/
+theorem all_zero (n maxSpans : Nat) (hm : 2 ≤ maxSpans) :
+    wasmDataSpans (List.replicate n 0) maxSpans = [] := by
+  cases n with
+  | zero => simp [wasmDataSpans, loop.eq_def]
+  | succ n =>
+    have hz := zrun_replicate_append (n + 1) []
+    simp only [List.append_nil, zrun, Nat.add_zero, List.replicate_succ] at hz
+    have hl : loop (maxSpans - 1) ((0 : Byte) :: List.replicate n 0) 0 0 [] = ([], n + 1) := by
+      rw [loop.eq_def, ite_neg' (by simp; omega)]
+      have hd : List.drop (zrun ((0 : Byte) :: List.replicate n 0)) ((0 : Byte) :: List.replicate n 0) = [] := by
+        rw [show zrun ((0 : Byte) :: List.replicate n 0) = n + 1 by simpa [zrun] using hz]
+        simp
+      simp only [ne_eq, not_true_eq_false, ite_false, true_or, ite_true, Nat.lt_irrefl, hd]
+      rw [show zrun ((0 : Byte) :: List.replicate n 0) = n + 1 by simpa [zrun] using hz,
+        loop.eq_def]
+      simp <;> omega
+    unfold wasmDataSpans
+    rw [List.replicate_succ, hl]
+    simp
+
+/-- Blocks `1, 0 × 16` (one non-zero byte, then a cut). -/
+def blocks (m : Nat) : List Byte := (List.replicate m ((1 : Byte) :: List.replicate 16 0)).flatten
+
+theorem blocks_succ (m : Nat) :
+    blocks (m + 1) = (1 : Byte) :: List.replicate 16 0 ++ blocks m := by
+  simp [blocks, List.replicate_succ]
+
+theorem zrun_blocks_one (m : Nat) : zrun (blocks m ++ [1]) = 0 := by
+  cases m with
+  | zero => simp [blocks, zrun]
+  | succ m => rw [blocks_succ]; simp [zrun]
+
+theorem loop_blocks (cap r p : Nat) (acc : List (Nat × Nat)) (h : acc.length + r = cap) :
+    loop cap (blocks r ++ [1]) p p acc =
+      (acc ++ (List.range r).map (fun i => (p + 17 * i, p + 17 * i + 1)), p + 17 * r) := by
+  induction r generalizing p acc with
+  | zero =>
+    rw [loop.eq_def, ite_pos' (by omega)]; simp
+  | succ r ih =>
+    rw [blocks_succ, loop.eq_def, ite_neg' (by omega)]
+    simp only [List.cons_append, ne_eq, show ¬((1 : Byte) = 0) by decide, not_false_eq_true,
+      ite_true]
+    have hrep : List.replicate 16 (0 : Byte) ++ blocks r ++ [1] =
+        (0 : Byte) :: (List.replicate 15 0 ++ (blocks r ++ [1])) := by
+      simp [List.replicate_succ]
+    rw [hrep, loop.eq_def, ite_neg' (by omega)]
+    have hz : zrun ((0 : Byte) :: (List.replicate 15 0 ++ (blocks r ++ [1]))) = 16 := by
+      have := zrun_replicate_append 16 (blocks r ++ [1])
+      rw [zrun_blocks_one] at this
+      simpa [List.replicate_succ] using this
+    have hd : ((0 : Byte) :: (List.replicate 15 0 ++ (blocks r ++ [1]))).drop 16 = blocks r ++ [1] := by
+      simp [List.replicate_succ]
+    simp only [ne_eq, not_true_eq_false, ite_false, hz, hd]
+    rw [ite_pos' (by omega), ite_pos' (by omega)]
+    rw [show p + 1 + 16 = p + 17 by omega, ih (p + 17) (acc ++ [(p, p + 1)]) (by simp; omega)]
+    simp only [List.range_succ_eq_map, List.map_cons, List.map_map, List.append_assoc,
+      List.singleton_append]
+    refine Prod.ext ?_ (by simp; omega)
+    simp [Function.comp_def]
+    intro a _
+    omega
+
+/-- The 4,096-segment boundary: a leading zero, `maxSpans - 1` cut blocks and a
+    final non-zero byte give exactly `maxSpans` segments; the leading zero
+    takes no segment of the budget (same result as `wasm_data_spans`). -/
+theorem leading_zero_budget (m : Nat) (hm : 1 ≤ m) :
+    wasmDataSpans ((0 : Byte) :: (blocks m ++ [1])) (m + 1) =
+      (List.range m).map (fun i => (1 + 17 * i, 1 + 17 * i + 1)) ++ [(1 + 17 * m, 2 + 17 * m)] := by
+  have hlen : ((0 : Byte) :: (blocks m ++ [1])).length = 2 + 17 * m := by
+    simp [blocks]; omega
+  have hz : zrun ((0 : Byte) :: (blocks m ++ [1])) = 1 := by
+    simp [zrun, zrun_blocks_one]
+  have hl : loop m ((0 : Byte) :: (blocks m ++ [1])) 0 0 [] =
+      ((List.range m).map (fun i => (1 + 17 * i, 1 + 17 * i + 1)), 1 + 17 * m) := by
+    rw [loop.eq_def, ite_neg' (by simp; omega)]
+    simp only [ne_eq, not_true_eq_false, ite_false, hz, true_or, ite_true, List.drop_succ_cons,
+      List.drop_zero, Nat.lt_irrefl, Nat.zero_add]
+    rw [loop_blocks m m 1 [] (by simp)]
+    simp
+  unfold wasmDataSpans
+  simp only [Nat.add_sub_cancel, hl, hlen]
+  rw [ite_pos' (by omega)]
+
+theorem leading_zero_budget_4096 :
+    (wasmDataSpans ((0 : Byte) :: (blocks 4095 ++ [1])) 4096).length = 4096 := by
+  rw [leading_zero_budget 4095 (by decide)]; simp
 
 end SparseData
 
