@@ -2298,6 +2298,177 @@ for tag, body in [("dec_low_f", "pub fn f() -> Float { 1.5f }\n"), ("hex_low_f",
         f"Lowercase float suffix {tag} MUST fail-closed with MBT2PION_UNSUPPORTED_SYNTAX, got rc={lf_r.returncode}\n{lf_r.stdout}\n{lf_r.stderr}"
     )
 print("[e2e] PASS: Wave M2-B regressions (relative --package-manifest, black-box private isolation + P0-1/P0-3/P0-4 + lowercase f fail-closed)")
+
+# -----------------------------------------------------------------------------
+# Upper-tier E2E suite: verified ABI sidecar, tamper detection, multi-dep
+# same-named enums, readonly pub enum, raising callbacks, [comments] redaction
+# -----------------------------------------------------------------------------
+ut_root = os.path.join(root, "upper_tier_e2e")
+os.makedirs(ut_root, exist_ok=True)
+
+# 1. Verified ABI cross-pkg: labeled enum + renamed `val` struct field + readonly `pub enum`
+dep_a_src = os.path.join(ut_root, "dep_a_mbt")
+dep_a_pkg = os.path.join(ut_root, "dep_a")
+os.makedirs(dep_a_src, exist_ok=True)
+os.makedirs(os.path.join(dep_a_pkg, "src"), exist_ok=True)
+with open(os.path.join(dep_a_src, "lib.mbt"), "w") as f:
+    f.write(
+        'pub(all) enum Bars {\n'
+        '  Range(top~ : Int, bottom~ : Int)\n'
+        '}\n'
+        'pub enum Sealed {\n'
+        '  Tag(Int)\n'
+        '}\n'
+        'pub fn make_sealed(n : Int) -> Sealed { Sealed::Tag(n) }\n'
+        'pub(all) struct Cell {\n'
+        '  mut val : Int\n'
+        '}\n'
+        'pub fn higher(f : () -> Unit) -> Unit { f() }\n'
+    )
+with open(os.path.join(dep_a_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "dep_a"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r_dep_a = subprocess.run(
+    [bin_path, "--src", dep_a_src, "--out", os.path.join(dep_a_pkg, "src"),
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_dep_a.returncode == 0, f"dep_a publish failed:\n{r_dep_a.stdout}\n{r_dep_a.stderr}"
+abi_a_path = os.path.join(dep_a_pkg, "src", "mbt2pion_abi.json")
+assert os.path.exists(abi_a_path), "dep_a must emit mbt2pion_abi.json"
+
+# Second dep exporting same-named `Bars` with opposite field order!
+dep_b_src = os.path.join(ut_root, "dep_b_mbt")
+dep_b_pkg = os.path.join(ut_root, "dep_b")
+os.makedirs(dep_b_src, exist_ok=True)
+os.makedirs(os.path.join(dep_b_pkg, "src"), exist_ok=True)
+with open(os.path.join(dep_b_src, "lib.mbt"), "w") as f:
+    f.write('pub(all) enum Bars {\n  Range(bottom~ : Int, top~ : Int)\n}\n')
+with open(os.path.join(dep_b_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "dep_b"\nversion = "0.1.0"\n\n[dependencies]\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r_dep_b = subprocess.run(
+    [bin_path, "--src", dep_b_src, "--out", os.path.join(dep_b_pkg, "src"),
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_dep_b.returncode == 0, f"dep_b publish failed:\n{r_dep_b.stdout}\n{r_dep_b.stderr}"
+
+# Consumer using both dep_a & dep_b same-named `Bars`, dep_a::Cell.val, and matching readonly dep_a::Sealed
+cons_src = os.path.join(ut_root, "cons_mbt")
+cons_pkg = os.path.join(ut_root, "cons")
+os.makedirs(cons_src, exist_ok=True)
+os.makedirs(os.path.join(cons_pkg, "src"), exist_ok=True)
+with open(os.path.join(cons_src, "app.mbt"), "w") as f:
+    f.write(
+        'pub fn run_cross() -> (Int, Int, Int, Int) {\n'
+        '  let a = @dep_a.Bars::Range(bottom=2, top=1)\n'
+        '  let b = @dep_b.Bars::Range(top=1, bottom=2)\n'
+        '  let va = match a { @dep_a.Bars::Range(top=t, bottom=bt) => t * 10 + bt }\n'
+        '  let vb = match b { @dep_b.Bars::Range(bottom=bt, top=t) => t * 10 + bt }\n'
+        '  let c = @dep_a.Cell::{ val: 5 }\n'
+        '  c.val += 3\n'
+        '  let s = match @dep_a.make_sealed(9) { @dep_a.Sealed::Tag(n) => n }\n'
+        '  (va, vb, c.val, s)\n'
+        '}\n'
+    )
+with open(os.path.join(cons_src, "app_test.mbt"), "w") as f:
+    f.write('test "cross_abi" { let (va, vb, cv, s) = run_cross(); assert_eq(va, 12); assert_eq(vb, 12); assert_eq(cv, 8); assert_eq(s, 9) }\n')
+with open(os.path.join(cons_pkg, "pion.toml"), "w") as f:
+    f.write(f'[package]\nname = "cons"\nversion = "0.1.0"\n\n[dependencies]\ndep_a = {{ path = "../dep_a" }}\ndep_b = {{ path = "../dep_b" }}\nmbt_compat = {{ path = "{compat_dir}" }}\n')
+r_cons = subprocess.run(
+    [bin_path, "--src", cons_src, "--out", os.path.join(cons_pkg, "src"),
+     "--package-manifest", os.path.join(cons_pkg, "pion.toml"),
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--with-tests", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_cons.returncode == 0, f"cons publish failed:\n{r_cons.stdout}\n{r_cons.stderr}"
+r_cons_t = subprocess.run([pionc, "test", cons_pkg], capture_output=True, text=True)
+assert r_cons_t.returncode == 0 and "1 passed; 0 failed" in r_cons_t.stdout, f"cons pionc test failed:\n{r_cons_t.stdout}\n{r_cons_t.stderr}"
+
+# 2. Sidecar-only tamper (`top` <-> `bottom` swap with byte-identical `.pion`) MUST fail with MBT2PION_DEP_ABI_ERROR and preserve --out!
+tamper_out = os.path.join(ut_root, "tamper_out")
+os.makedirs(tamper_out, exist_ok=True)
+with open(os.path.join(tamper_out, "sentinel.pion"), "w") as f:
+    f.write("KEEP_ME\n")
+orig_abi = open(abi_a_path).read()
+swapped_abi = orig_abi.replace('"label":"top"', '"label":"__TMP__"').replace('"label":"bottom"', '"label":"top"').replace('"label":"__TMP__"', '"label":"bottom"')
+assert swapped_abi != orig_abi
+open(abi_a_path, "w").write(swapped_abi)
+r_tamper = subprocess.run(
+    [bin_path, "--src", cons_src, "--out", tamper_out,
+     "--dep", f"dep_a={dep_a_pkg}", "--dep", f"dep_b={dep_b_pkg}",
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+open(abi_a_path, "w").write(orig_abi)
+assert r_tamper.returncode != 0 and "MBT2PION_DEP_ABI_ERROR" in (r_tamper.stdout + r_tamper.stderr), (
+    f"Sidecar tamper MUST fail with MBT2PION_DEP_ABI_ERROR, got rc={r_tamper.returncode}\n{r_tamper.stdout}\n{r_tamper.stderr}"
+)
+assert open(os.path.join(tamper_out, "sentinel.pion")).read() == "KEEP_ME\n", "tamper failure must not touch --out"
+
+# 3. Constructing readonly `pub enum` across pkg boundary MUST fail-closed with MBT2PION_DEP_ABI_ERROR
+ro_src = os.path.join(ut_root, "ro_src")
+ro_out = os.path.join(ut_root, "ro_out")
+os.makedirs(ro_src, exist_ok=True)
+with open(os.path.join(ro_src, "bad.mbt"), "w") as f:
+    f.write('pub fn bad() -> @dep_a.Sealed { @dep_a.Sealed::Tag(1) }\n')
+r_ro = subprocess.run(
+    [bin_path, "--src", ro_src, "--out", ro_out, "--dep", f"dep_a={dep_a_pkg}",
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_ro.returncode != 0 and "MBT2PION_DEP_ABI_ERROR" in (r_ro.stdout + r_ro.stderr), (
+    f"Readonly pub enum construct MUST fail with MBT2PION_DEP_ABI_ERROR, got rc={r_ro.returncode}\n{r_ro.stdout}\n{r_ro.stderr}"
+)
+
+# 4. Cross-pkg higher-order closure calling `fail(...)` & raising callback to `filter_map` MUST fail-closed!
+for tag, code in [
+    ("ho_fail", 'pub fn f() -> Unit { @dep_a.higher(fn() { fail("caught") }) }\n'),
+    ("fm_raise", 'fn may_raise(x : Int) -> Int? raise { Some(x) }\npub fn g(xs : Array[Int]) -> Array[Int] { xs.filter_map(may_raise) }\n'),
+]:
+    cb_src = os.path.join(ut_root, f"cb_{tag}_src")
+    cb_out = os.path.join(ut_root, f"cb_{tag}_out")
+    os.makedirs(cb_src, exist_ok=True)
+    with open(os.path.join(cb_src, "a.mbt"), "w") as f:
+        f.write(code)
+    r_cb = subprocess.run(
+        [bin_path, "--src", cb_src, "--out", cb_out, "--dep", f"dep_a={dep_a_pkg}",
+         "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+        capture_output=True, text=True
+    )
+    assert r_cb.returncode != 0 and "MBT2PION_UNSUPPORTED_SYNTAX" in (r_cb.stdout + r_cb.stderr), (
+        f"Raising callback {tag} MUST fail-closed with MBT2PION_UNSUPPORTED_SYNTAX, got rc={r_cb.returncode}\n{r_cb.stdout}\n{r_cb.stderr}"
+    )
+
+# 5. `[comments]` redaction E2E (redacts comments only, preserves strings/code) + invalid recipe error
+red_src = os.path.join(ut_root, "red_src")
+red_out = os.path.join(ut_root, "red_out")
+os.makedirs(red_src, exist_ok=True)
+with open(os.path.join(red_src, "a.mbt"), "w") as f:
+    f.write('// SecretBrand widget\npub fn label() -> String { "SecretBrand" }\n')
+red_rec = os.path.join(ut_root, "red_recipes.toml")
+with open(red_rec, "w") as f:
+    f.write('[comments]\nreplace = [\n  { from = "SecretBrand", to = "PublicName" },\n]\n')
+r_red = subprocess.run(
+    [bin_path, "--src", red_src, "--out", red_out, "--recipes", red_rec,
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_red.returncode == 0, f"[comments] redaction publish failed:\n{r_red.stdout}\n{r_red.stderr}"
+red_gen = open(os.path.join(red_out, "a.pion")).read()
+assert "// PublicName widget" in red_gen and '"SecretBrand"' in red_gen, f"Redaction mismatch:\n{red_gen}"
+
+bad_rec = os.path.join(ut_root, "bad_recipes.toml")
+with open(bad_rec, "w") as f:
+    f.write('[comments]\nreplace = [{ from = "", to = "x" }]\n')
+r_bad_rec = subprocess.run(
+    [bin_path, "--src", red_src, "--out", os.path.join(ut_root, "bad_rec_out"), "--recipes", bad_rec,
+     "--mbt-compat", compat_dir, "--target", "native", "--mode", "publish", "--pionc", pionc],
+    capture_output=True, text=True
+)
+assert r_bad_rec.returncode != 0 and "MBT2PION_RECIPE_ERROR" in (r_bad_rec.stdout + r_bad_rec.stderr), (
+    f"Invalid [comments] recipe MUST fail with MBT2PION_RECIPE_ERROR, got rc={r_bad_rec.returncode}\n{r_bad_rec.stdout}\n{r_bad_rec.stderr}"
+)
+print("[e2e] PASS: Upper-tier E2E suite (verified ABI, tamper fail-closed, multi-dep Bars, readonly pub enum, raising callbacks, [comments] redaction)")
 PY
 
 PIONC="$PIONC" python3 "$(dirname "$0")/test_zero_rc_leak.py"

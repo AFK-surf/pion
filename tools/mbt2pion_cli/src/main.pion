@@ -948,8 +948,8 @@ fn scan_unmanaged_tree(
         Err(e) => return Err("cannot readlink in --out (" + full + "): " + e)
       }
       Some("file") =>
-      if rel.ends_with(".pion") && is_managed_pion_file(world, full) {
-        // Managed `.pion` file: replaced by new generation or pruned if stale
+      if (rel.ends_with(".pion") && is_managed_pion_file(world, full)) || rel == "mbt2pion_abi.json" {
+        // Managed `.pion` file or `mbt2pion_abi.json`: replaced by new generation or pruned if stale
         let _ = 0
       } else {
         let mode = fs_lstat_mode(full)
@@ -1325,6 +1325,7 @@ pub fn main(world : World) -> Int {
       source_commit: source_commit,
       api_map_sha256: api_map_sha,
       recipes_sha256: recipes_sha,
+      abi_sha256: "",
       target: target,
     },
   }
@@ -1350,7 +1351,9 @@ pub fn main(world : World) -> Int {
   }
 
   // Wave M1.2 A.5: load ALL target enums & fn signatures from `--dep` packages via `pionc doc --json`
+  // Wave M2-C §6: bidirectionally verify `mbt2pion_abi.json` <-> `// abi-sha256:` for transpiled `--dep`s
   let dep_doc_jsons : Array[String] = []
+  let dep_abis : Array[(String, m2p::PackageAbi)] = []
   let seen_doc_dep : Map[String, Bool] = Map()
   for dep in check_deps {
     if !seen_doc_dep.contains(dep.0) && fs_is_dir(world, dep.1) {
@@ -1358,6 +1361,37 @@ pub fn main(world : World) -> Int {
       match proc_exec_capture(world, [pionc_bin, "doc", "--json", dep.1]) {
         Ok(doc_out) => dep_doc_jsons.push(doc_out)
         Err(_) => ()
+      }
+      if dep.0 != "mbt_compat" {
+        let dep_src = join_path(dep.1, "src")
+        let scan_root = if fs_is_dir(world, dep_src) { dep_src } else { dep.1 }
+        let dep_pion_rels : Array[String] = []
+        collect_files_sorted(world, scan_root, "", ".pion", dep_pion_rels)
+        let dep_pion_files : Array[(String, String)] = []
+        for drel in dep_pion_rels {
+          match fs_read(world, join_path(scan_root, drel)) {
+            Ok(txt) => dep_pion_files.push((drel, txt))
+            Err(_) => ()
+          }
+        }
+        let abi_p1 = join_path(scan_root, "mbt2pion_abi.json")
+        let abi_p2 = join_path(dep.1, "mbt2pion_abi.json")
+        let abi_json_opt = match fs_read(world, abi_p1) {
+          Ok(txt) => Some(txt)
+          Err(_) =>
+          if abi_p2 != abi_p1 {
+            match fs_read(world, abi_p2) {
+              Ok(txt2) => Some(txt2)
+              Err(_) => None
+            }
+          } else {
+            None
+          }
+        }
+        match m2p::verify_and_parse_dep_abi(dep.0, scan_root, dep_pion_files, abi_json_opt, pre_diags) {
+          Some(parsed_abi) => dep_abis.push((dep.0, parsed_abi))
+          None => ()
+        }
       }
     }
   }
@@ -1374,13 +1408,14 @@ pub fn main(world : World) -> Int {
     }
   }
 
-  let res = m2p::transpile_package_ex(
+  let res = m2p::transpile_package_with_abis(
     sources,
     api_map,
     recipes,
     overlays,
     mbti_files,
     dep_doc_jsons,
+    dep_abis,
     asset_bypass_rules,
     opts,
     pre_diags,
@@ -1714,7 +1749,12 @@ pub fn main(world : World) -> Int {
       }
     }
 
-    // 2. Write all newly generated `.pion` files
+    // 2. Write all newly generated `.pion` files + `mbt2pion_abi.json`
+    let abi_pion_pairs : Array[(String, String)] = []
+    for gf in final_files {
+      abi_pion_pairs.push((gf.rel_path, gf.content))
+    }
+    let abi_json_content = m2p::render_abi_json(res.abi, abi_pion_pairs)
     if stage_ok {
       for gf in final_files {
         let dst = join_path(stage_dir, gf.rel_path)
@@ -1726,6 +1766,16 @@ pub fn main(world : World) -> Int {
           Ok(_) => ()
           Err(e) => {
             io_eprintln(world, "mbt2pion: failed staging " + dst + ": " + e)
+            stage_ok = false
+          }
+        }
+      }
+      if stage_ok {
+        let abi_dst = join_path(stage_dir, "mbt2pion_abi.json")
+        match fs_write(world, abi_dst, abi_json_content) {
+          Ok(_) => ()
+          Err(e) => {
+            io_eprintln(world, "mbt2pion: failed staging " + abi_dst + ": " + e)
             stage_ok = false
           }
         }
@@ -1876,6 +1926,8 @@ pub fn main(world : World) -> Int {
     probes_resolved: res.probes_resolved,
     stage_b_iterations: res.stage_b_iterations,
     blockers: final_blockers,
+    abi: res.abi,
+    abi_sha256: res.abi_sha256,
   }
 
   let report_json = if report_path.length() > 0 { m2p::render_migration_report_json(final_res, opts) } else { "" }
@@ -1927,6 +1979,23 @@ pub fn main(world : World) -> Int {
           io_eprintln(world, "mbt2pion --check: missing output file " + gf.rel_path)
           diffs = diffs + 1
         }
+      }
+    }
+    // Check `mbt2pion_abi.json` byte-for-byte
+    let chk_abi_pairs : Array[(String, String)] = []
+    for gf in final_res.files {
+      chk_abi_pairs.push((gf.rel_path, gf.content))
+    }
+    let expected_abi_json = m2p::render_abi_json(final_res.abi, chk_abi_pairs)
+    match fs_read(world, join_path(out_dir, "mbt2pion_abi.json")) {
+      Ok(existing_abi) =>
+      if existing_abi != expected_abi_json {
+        io_eprintln(world, "mbt2pion --check: mismatch in mbt2pion_abi.json")
+        diffs = diffs + 1
+      }
+      Err(_) => {
+        io_eprintln(world, "mbt2pion --check: missing output file mbt2pion_abi.json")
+        diffs = diffs + 1
       }
     }
     let existing_pions : Array[String] = []

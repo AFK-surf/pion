@@ -55,6 +55,28 @@ pub fn main(world : World) -> Int {
     total = total + f(3)
     i = i + 1
   }
+  // OrderedSet 0-RC-cycle & compaction stress (add/remove/clear + abandoned iterator)
+  let s : mbt_compat::OrderedSet[Int] = mbt_compat::ordered_set_new()
+  let mut j = 0
+  while j < n {
+    s.add(j)
+    if (j & 1023) == 1023 {
+      let it = s.iter()
+      let _ = it.next()
+      // abandon iterator mid-stream and remove prior elements to trigger compaction
+      let mut k = j - 1023
+      while k <= j {
+        s.remove(k)
+        k = k + 1
+      }
+      if s.slot_table_len() > 64 {
+        panic("OrderedSet slot_table_len did not compact")
+      }
+    }
+    j = j + 1
+  }
+  s.clear()
+  total = total + s.length()
   io_println(world, "ok n=" + n.to_string() + " total=" + total.to_string())
   0
 }

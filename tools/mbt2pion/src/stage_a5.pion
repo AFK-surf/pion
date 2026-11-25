@@ -780,7 +780,7 @@ pub fn instrument_probes_for_file_with_api_map(
     GeneratedFile::{ rel_path: file, content: content, source_file: file, anchors: [] },
   ])
   let (qvals, qtypes) = collect_qualified_api_names(api_map)
-  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes)
+  instrument_probes_for_file_with_safe(file, content, empty_safe, 0, dvals, dtypes, qvals, qtypes, Map())
 }
 
 fn instrument_probes_for_file_with_safe(
@@ -792,6 +792,7 @@ fn instrument_probes_for_file_with_safe(
   declared_types : Map[String, Bool],
   qual_values : Map[String, Bool],
   qual_types : Map[String, Bool],
+  val_placeholders : Map[String, Bool],
 ) -> (String, Array[ProbeSite]) {
   let tokens = lex_moonbit(content)
   let n = tokens.length() - 1
@@ -957,6 +958,7 @@ fn instrument_probes_for_file_with_safe(
             declared_types,
             qual_values,
             qual_types,
+            val_placeholders,
           )
           if inner_sites.length() > 0 {
             any_interp_probe = true
@@ -1100,8 +1102,9 @@ fn instrument_probes_for_file_with_safe(
       }
     }
 
-    // 3. `<recv>.val` (read), `<recv>.val = <rhs>` (write), `<recv>.val <op>= <rhs>` (compound write)
-    if t.kind == TokenKind::Dot && i + 1 < n && tokens[i + 1].raw == "val" {
+    // 3. `<recv>.<val_placeholder>` (or legacy `<recv>.val`) read/write/compound-write
+    if t.kind == TokenKind::Dot && i + 1 < n &&
+    (val_placeholders.contains(tokens[i + 1].raw) || tokens[i + 1].raw == "val") {
       let op_b = base_offset + tokens[i + 1].start_byte
       let recv_start = find_receiver_start(tokens, i - 1)
       if !safe_offsets.contains(op_b) && recv_start >= 0 && tokens[recv_start].start_byte >= covered_end && !is_non_expr_receiver(tokens, recv_start) {
@@ -1137,50 +1140,8 @@ fn instrument_probes_for_file_with_safe(
               rhs_u64: 0UL,
               rhs_overflow: false,
             })
-            let probed_rhs = if str_has(rhs_expr, ".val") {
-              let rtoks = lex_moonbit(rhs_expr)
-              let rn = rtoks.length() - 1
-              let redits : Array[(Int, Int, String)] = []
-              let mut ri = 0
-              while ri + 1 < rn {
-                if rtoks[ri].kind == TokenKind::Dot && rtoks[ri + 1].raw == "val" {
-                  // NEVER rewrite a nested `.val = ...` assignment LHS into `.mbt_val_probe() = ...` (syntax error!);
-                  // leave nested assignments for the next Stage A.5 round once the outer assignment is rewritten.
-                  let is_nested_assign = ri + 2 < rn &&
-                  (rtoks[ri + 2].kind == TokenKind::Eq || rtoks[ri + 2].kind == TokenKind::AssignOp)
-                  if !is_nested_assign {
-                    redits.push((rtoks[ri].start_byte, rtoks[ri + 1].end_byte, ".mbt_val_probe()"))
-                  }
-                  ri = ri + 2
-                } else {
-                  ri = ri + 1
-                }
-              }
-              apply_byte_edits(rhs_expr, redits)
-            } else {
-              rhs_expr
-            }
-            let probed_lhs = if str_has(recv_expr, ".val") {
-              let ltoks = lex_moonbit(recv_expr)
-              let ln = ltoks.length() - 1
-              let ledits : Array[(Int, Int, String)] = []
-              let mut li = 0
-              while li + 1 < ln {
-                if ltoks[li].kind == TokenKind::Dot && ltoks[li + 1].raw == "val" {
-                  let is_nested_assign = li + 2 < ln &&
-                  (ltoks[li + 2].kind == TokenKind::Eq || ltoks[li + 2].kind == TokenKind::AssignOp)
-                  if !is_nested_assign {
-                    ledits.push((ltoks[li].start_byte, ltoks[li + 1].end_byte, ".mbt_val_probe()"))
-                  }
-                  li = li + 2
-                } else {
-                  li = li + 1
-                }
-              }
-              apply_byte_edits(recv_expr, ledits)
-            } else {
-              recv_expr
-            }
+            let probed_rhs = probe_nested_val_reads(rhs_expr, val_placeholders)
+            let probed_lhs = probe_nested_val_reads(recv_expr, val_placeholders)
             edits.push((start_b, end_b, probed_lhs + ".mbt_val_set_probe(" + probed_rhs + ")"))
             covered_end = end_b
             i = rhs_end
@@ -1445,11 +1406,53 @@ pub fn rewrite_for_probe(
   rewrite_for_probe_with_fields(site, resolved_type, recipes, Map(), diags, drift_ledger)
 }
 
+///| Replace nested non-assignment `.val` / registered placeholder reads inside an expression
+///| with `.mbt_val_probe()` so outer `.mbt_val_set_probe(...)` checks cleanly.
+fn probe_nested_val_reads(expr : String, val_placeholders : Map[String, Bool]) -> String {
+  if !str_has(expr, ".") {
+    return expr
+  }
+  let toks = lex_moonbit(expr)
+  let tn = toks.length() - 1
+  let edits : Array[(Int, Int, String)] = []
+  let mut i = 0
+  while i + 1 < tn {
+    if toks[i].kind == TokenKind::Dot &&
+    (val_placeholders.contains(toks[i + 1].raw) || toks[i + 1].raw == "val") {
+      let is_nested_assign = i + 2 < tn &&
+      (toks[i + 2].kind == TokenKind::Eq || toks[i + 2].kind == TokenKind::AssignOp)
+      if !is_nested_assign {
+        edits.push((toks[i].start_byte, toks[i + 1].end_byte, ".mbt_val_probe()"))
+      }
+      i = i + 2
+    } else {
+      i = i + 1
+    }
+  }
+  if edits.length() == 0 {
+    expr
+  } else {
+    apply_byte_edits(expr, edits)
+  }
+}
+
 pub fn rewrite_for_probe_with_fields(
   site : ProbeSite,
   resolved_type : String,
   recipes : Recipes,
   struct_val_fields : Map[String, String],
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+) -> Option[String] {
+  rewrite_for_probe_hygienic(site, resolved_type, recipes, struct_val_fields, Map(), diags, drift_ledger)
+}
+
+fn rewrite_for_probe_hygienic(
+  site : ProbeSite,
+  resolved_type : String,
+  recipes : Recipes,
+  struct_val_fields : Map[String, String],
+  used_idents : Map[String, Bool],
   diags : Array[Diag],
   drift_ledger : Array[DriftEntry],
 ) -> Option[String] {
@@ -1621,23 +1624,52 @@ pub fn rewrite_for_probe_with_fields(
       let base_ty = strip_type_args(resolved_type)
       match struct_val_fields.get(base_ty) {
         Some(renamed) => renamed
-        None => "val_"
+        None => {
+          // Strict fail-closed: NEVER fall back to hardcoded `val_`!
+          let err_code = if str_has(base_ty, "::") {
+            "MBT2PION_DEP_ABI_ERROR"
+          } else {
+            "MBT2PION_UNDISPOSED_PROBE_SITE"
+          }
+          diags.push(diag_error(
+            err_code,
+            site.file,
+            site.line,
+            site.col,
+            "cannot resolve `.val` field mapping for `" + resolved_type + "` (missing local or verified --dep ABI mapping)",
+          ))
+          drift_ledger.push(DriftEntry::{
+            category: "mbt_val_probe",
+            file: site.file,
+            line: site.line,
+            col: site.col,
+            expr: site.lhs_expr + ".val",
+            resolution: "blocked",
+            status: "unresolved",
+            detail: "missing .val field mapping for " + resolved_type,
+          })
+          return None
+        }
       }
     }
     if site.assign_op.length() == 0 {
       return Some(site.lhs_expr + "." + target_field)
     }
     if site.assign_op == "=" {
-      return Some(site.lhs_expr + "." + target_field + " = " + site.rhs_expr)
-    }
-    // Compound assignment (`+=`, `-=`, `*=`, `/=`, etc.): evaluate complex receiver strictly ONCE!
-    if is_simple_ident_expr(site.lhs_expr) {
+      if is_simple_ident_expr(site.lhs_expr) && !str_has(site.rhs_expr, "{") && !str_has(site.rhs_expr, ";") {
+        return Some(site.lhs_expr + "." + target_field + " = " + site.rhs_expr)
+      }
+      let r_tmp = fresh_stage_b_ident(used_idents, "__mbt_r")
       return Some(
-        site.lhs_expr + "." + target_field + " = " + site.lhs_expr + "." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ")",
+        "{ let " + r_tmp + " = " + site.lhs_expr + "; " + r_tmp + "." + target_field + " = (" + site.rhs_expr + ") }",
       )
     }
+    // Compound assignment (`+=`, `-=`, `*=`, `/=`, etc.): ALWAYS evaluate `<recv>` ONCE into a
+    // hygienic temp BEFORE evaluating `<rhs>` (even for simple ident `r`, so `r.val += { r = b; 10 }`
+    // mutates the original receiver `a` rather than reassigned `b`!).
+    let r_tmp = fresh_stage_b_ident(used_idents, "__mbt_r")
     return Some(
-      "{ let __mbt_r = " + site.lhs_expr + "; __mbt_r." + target_field + " = __mbt_r." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ") }",
+      "{ let " + r_tmp + " = " + site.lhs_expr + "; " + r_tmp + "." + target_field + " = " + r_tmp + "." + target_field + " " + site.assign_op + " (" + site.rhs_expr + ") }",
     )
   }
 
@@ -2394,6 +2426,36 @@ pub fn run_stage_a5_ex(
   probe_dispositions : Array[ProbeDisposition],
   max_rounds : Int,
 ) -> (Array[GeneratedFile], Int, Int, Int) {
+  run_stage_a5_with_val_sites(
+    files,
+    recipes,
+    api_map,
+    struct_val_fields,
+    [],
+    check_fn,
+    diags,
+    drift_ledger,
+    probe_dispositions,
+    max_rounds,
+  )
+}
+
+pub fn run_stage_a5_with_val_sites(
+  files : Array[GeneratedFile],
+  recipes : Recipes,
+  api_map : ApiMap,
+  struct_val_fields : Map[String, String],
+  val_probe_sites : Array[ValProbeSite],
+  check_fn : (Array[(String, String)]) -> String,
+  diags : Array[Diag],
+  drift_ledger : Array[DriftEntry],
+  probe_dispositions : Array[ProbeDisposition],
+  max_rounds : Int,
+) -> (Array[GeneratedFile], Int, Int, Int) {
+  let val_placeholders : Map[String, Bool] = Map()
+  for vps in val_probe_sites {
+    val_placeholders[vps.placeholder_ident] = true
+  }
   let mut cur_files : Array[GeneratedFile] = []
   let safe_list_by_file : Map[String, Array[Int]] = Map()
   let safe_map_by_file : Map[String, Map[Int, Bool]] = Map()
@@ -2441,6 +2503,7 @@ pub fn run_stage_a5_ex(
         declared_types,
         qual_values,
         qual_types,
+        val_placeholders,
       )
       let numbered_sites : Array[ProbeSite] = []
       for rs in raw_sites {
@@ -2612,7 +2675,8 @@ pub fn run_stage_a5_ex(
             round_newly_used.push((slot_key, site_slot))
           }
           let (disp_file, disp_line, disp_col) = resolve_init_order_origin_slot(f.content, f.rel_path, site.line, site.col, site.probe_kind, site_slot)
-          match rewrite_for_probe_with_fields(site, matched_ty, recipes, struct_val_fields, diags, drift_ledger) {
+          let file_used_idents = collect_used_idents(f.content)
+          match rewrite_for_probe_hygienic(site, matched_ty, recipes, struct_val_fields, file_used_idents, diags, drift_ledger) {
             Some(repl) => {
               edits.push((site.start_byte, site.end_byte, repl))
               remap_edits.push((site.start_byte, site.end_byte, repl, site.lhs_expr, site.rhs_expr))

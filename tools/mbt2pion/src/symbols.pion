@@ -206,7 +206,135 @@ fn unquote_toml(s : String) -> String {
   t
 }
 
-///| Parse declarative `recipes.toml` (supports `[ref]`, `[eq]`, `[derives]`, `[[trait_impl]]`).
+///| Decode a TOML double-quoted string literal (including `\n`, `\r`, `\t`, `\"`, `\\`, `\uHHHH`).
+fn decode_toml_string_lit(raw : String) -> Result[String, String] {
+  decode_mbt_string_lit(raw)
+}
+
+///| Parse `[comments]` `replace = [{ from = "...", to = "..." }, ...]` array via `lex_moonbit`.
+fn parse_comments_replace_array(
+  raw_arr : String,
+  path : String,
+  line_no : Int,
+  out : Array[CommentReplaceRule],
+  seen_from : Map[String, Bool],
+  diags : Array[Diag],
+) -> Unit {
+  let toks = lex_moonbit(raw_arr)
+  let n = toks.length() - 1
+  if n < 2 || toks[0].kind != TokenKind::LBracket {
+    diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "[comments] `replace` must be an array of `{ from = \"...\", to = \"...\" }` tables"))
+    return
+  }
+  let rb = find_matching_delim(toks, 0)
+  if rb >= n || toks[rb].kind != TokenKind::RBracket {
+    diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "unclosed `[` in [comments] `replace`"))
+    return
+  }
+  let mut k = 1
+  while k < rb {
+    if toks[k].kind == TokenKind::Comma {
+      k = k + 1
+      continue
+    }
+    if toks[k].kind != TokenKind::LBrace {
+      diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "expected `{ from = \"...\", to = \"...\" }` in [comments] `replace` near `" + toks[k].raw + "`"))
+      return
+    }
+    let cb = find_matching_delim(toks, k)
+    if cb >= rb || toks[cb].kind != TokenKind::RBrace {
+      diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "unclosed `{` in [comments] `replace`"))
+      return
+    }
+    let mut has_from = false
+    let mut has_to = false
+    let mut from_val = ""
+    let mut to_val = ""
+    let mut j = k + 1
+    while j < cb {
+      if toks[j].kind == TokenKind::Comma {
+        j = j + 1
+        continue
+      }
+      if (toks[j].kind == TokenKind::Ident || toks[j].kind == TokenKind::Keyword) &&
+      j + 2 < cb && toks[j + 1].kind == TokenKind::Eq && toks[j + 2].kind == TokenKind::StringLit {
+        let kname = toks[j].raw
+        match decode_toml_string_lit(toks[j + 2].raw) {
+          Ok(decoded) =>
+          if kname == "from" {
+            has_from = true
+            from_val = decoded
+          } else if kname == "to" {
+            has_to = true
+            to_val = decoded
+          } else {
+            diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "unknown key `" + kname + "` in [comments] `replace` entry"))
+          }
+          Err(e) =>
+          diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "invalid string in [comments] `replace`: " + e))
+        }
+        j = j + 3
+        continue
+      }
+      diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "malformed key/value in [comments] `replace` near `" + toks[j].raw + "`"))
+      j = j + 1
+    }
+    if !has_from || !has_to {
+      diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "[comments] `replace` entry requires both `from` and `to`"))
+    } else if from_val.length() == 0 {
+      diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "[comments] `replace` entry has empty `from`"))
+    } else if seen_from.contains(from_val) {
+      diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "duplicate `from` key `" + from_val + "` in [comments] `replace`"))
+    } else {
+      let mut has_nl = false
+      let mut ti = 0
+      while ti < to_val.length() {
+        let tc = to_val.code_unit_at(ti)
+        if tc == 10 || tc == 13 {
+          has_nl = true
+          break
+        }
+        ti = ti + 1
+      }
+      if has_nl {
+        diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "[comments] `replace` `to` value for `" + from_val + "` must not contain newline (`\\n` or `\\r`)"))
+      } else {
+        seen_from[from_val] = true
+        out.push(CommentReplaceRule::{ from: from_val, to: to_val })
+      }
+    }
+    k = cb + 1
+  }
+}
+
+///| Count net `[` minus `]` outside string literals on a line.
+fn net_bracket_delta(s : String) -> Int {
+  let mut delta = 0
+  let mut in_str = false
+  let mut esc = false
+  let mut i = 0
+  while i < s.length() {
+    let c = s.code_unit_at(i)
+    if in_str {
+      if esc { esc = false }
+      else if c == 92 { esc = true }
+      else if c == 34 { in_str = false }
+    } else if c == 34 {
+      in_str = true
+    } else if c == 35 {
+      // TOML `#` comment to EOL
+      break
+    } else if c == 91 {
+      delta = delta + 1
+    } else if c == 93 {
+      delta = delta - 1
+    }
+    i = i + 1
+  }
+  delta
+}
+
+///| Parse declarative `recipes.toml` (supports `[ref]`, `[eq]`, `[derives]`, `[comments]`, `[[trait_impl]]`).
 pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) -> Recipes {
   let mut ref_enabled = false
   let mut ref_ctor = ""
@@ -218,6 +346,12 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
   let ignored_derives : Array[String] = []
   let trait_recipes : Array[TraitRecipe] = []
   let asset_bypass : Array[AssetBypassRule] = []
+  let comment_replaces : Array[CommentReplaceRule] = []
+  let seen_comment_from : Map[String, Bool] = Map()
+  let mut collecting_comments_arr = false
+  let mut comments_arr_buf = StringBuilder()
+  let mut comments_arr_depth = 0
+  let mut comments_arr_line = 0
 
   let mut section = ""
   let mut cur_derive = ""
@@ -236,6 +370,19 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
   for raw_line in lines {
     line_no = line_no + 1
     let line = raw_line.trim()
+    if collecting_comments_arr {
+      if line.length() == 0 || line.starts_with("#") {
+        continue
+      }
+      comments_arr_buf.write_string("\n")
+      comments_arr_buf.write_string(line)
+      comments_arr_depth = comments_arr_depth + net_bracket_delta(line)
+      if comments_arr_depth <= 0 {
+        collecting_comments_arr = false
+        parse_comments_replace_array(comments_arr_buf.to_string(), path, comments_arr_line, comment_replaces, seen_comment_from, diags)
+      }
+      continue
+    }
     if line.length() == 0 || line.starts_with("#") {
       continue
     }
@@ -337,6 +484,21 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
           }
         }
       }
+    } else if section == "comments" {
+      if key == "replace" {
+        let d0 = net_bracket_delta(val_s)
+        if d0 <= 0 {
+          parse_comments_replace_array(val_s, path, line_no, comment_replaces, seen_comment_from, diags)
+        } else {
+          collecting_comments_arr = true
+          comments_arr_buf = StringBuilder()
+          comments_arr_buf.write_string(val_s)
+          comments_arr_depth = d0
+          comments_arr_line = line_no
+        }
+      } else {
+        diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, line_no, 1, "unknown key `" + key + "` in [comments] section"))
+      }
     } else if section == "assets.bypass" && !in_asset_item {
       if key == "files" && val_s.starts_with("[") && val_s.ends_with("]") {
         let inner = val_s.slice(1, val_s.length() - 1)
@@ -397,6 +559,9 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
       allowed_decls: cur_asset_decls,
     })
   }
+  if collecting_comments_arr {
+    diags.push(diag_error("MBT2PION_RECIPE_ERROR", path, comments_arr_line, 1, "unterminated [comments] `replace` array"))
+  }
   Recipes::{
     ref_recipe: RefRecipe::{ enabled: ref_enabled, ctor_call: ref_ctor, field_name: ref_field, type_name: ref_type },
     trait_recipes: trait_recipes,
@@ -404,6 +569,7 @@ pub fn parse_recipes_toml(content : String, path : String, diags : Array[Diag]) 
     allowed_derives: allowed_derives,
     ignored_derives: ignored_derives,
     asset_bypass: asset_bypass,
+    comment_replaces: comment_replaces,
   }
 }
 
@@ -539,6 +705,14 @@ pub struct SymbolTable {
   active_generics : Map[String, Bool]
   moon_import_paths : Map[String, String]
   dep_pkg_names : Map[String, Bool]
+  enum_schemas : Map[String, AbiEnumSchema]
+  enum_schemas_by_ctor : Map[String, Array[(AbiEnumSchema, AbiEnumVariant)]]
+  verified_abi_deps : Map[String, Bool]
+  dep_struct_val_fields : Map[String, String]
+  local_raising_fns : Map[String, Bool]
+  dep_raising_fns : Map[String, Bool]
+  local_fn_names : Map[String, Bool]
+  struct_generic_params : Map[String, Array[String]]
 }
 
 pub fn empty_symbol_table() -> SymbolTable {
@@ -568,6 +742,73 @@ pub fn empty_symbol_table() -> SymbolTable {
     active_generics: Map(),
     moon_import_paths: Map(),
     dep_pkg_names: Map(),
+    enum_schemas: Map(),
+    enum_schemas_by_ctor: Map(),
+    verified_abi_deps: Map(),
+    dep_struct_val_fields: Map(),
+    local_raising_fns: Map(),
+    dep_raising_fns: Map(),
+    local_fn_names: Map(),
+    struct_generic_params: Map(),
+  }
+}
+
+///| Register an enum schema (local or verified external dep) into `SymbolTable`.
+pub fn symtab_register_enum_schema(st : SymbolTable, schema : AbiEnumSchema) -> Unit {
+  let key = if schema.pkg.length() > 0 { schema.pkg + "::" + schema.name } else { schema.name }
+  st.enum_schemas[key] = schema
+  let is_local = schema.pkg.length() == 0
+  for v in schema.variants {
+    let list = match st.enum_schemas_by_ctor.get(v.name) {
+      Some(xs) => xs
+      None => {
+        let xs : Array[(AbiEnumSchema, AbiEnumVariant)] = []
+        st.enum_schemas_by_ctor[v.name] = xs
+        xs
+      }
+    }
+    let mut dup = false
+    for existing in list {
+      if existing.0.pkg == schema.pkg && existing.0.name == schema.name && existing.1.name == v.name {
+        dup = true
+        break
+      }
+    }
+    if !dup {
+      list.push((schema, v))
+    }
+    symtab_add_ctor(st, v.name, CtorTarget::{
+      pkg: schema.pkg,
+      enum_name: schema.name,
+      ctor_name: v.name,
+      is_local: is_local,
+      arity: v.fields.length(),
+    })
+  }
+}
+
+///| Load a bidirectionally verified `--dep` `PackageAbi` into `SymbolTable`.
+pub fn symtab_load_dep_abi(st : SymbolTable, dep_name : String, abi : PackageAbi) -> Unit {
+  st.verified_abi_deps[dep_name] = true
+  if abi.package_name.length() > 0 {
+    st.verified_abi_deps[abi.package_name] = true
+  }
+  st.dep_pkg_names[dep_name] = true
+  for en in abi.enums {
+    let norm_en = AbiEnumSchema::{
+      pkg: dep_name,
+      name: en.name,
+      can_match: en.can_match,
+      can_construct: en.can_construct,
+      variants: en.variants,
+    }
+    symtab_register_enum_schema(st, norm_en)
+  }
+  for sv in abi.struct_val_fields {
+    st.dep_struct_val_fields[dep_name + "::" + sv.struct_name] = sv.renamed_field
+    if abi.package_name.length() > 0 && abi.package_name != dep_name {
+      st.dep_struct_val_fields[abi.package_name + "::" + sv.struct_name] = sv.renamed_field
+    }
   }
 }
 

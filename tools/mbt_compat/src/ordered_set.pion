@@ -1,0 +1,520 @@
+///| mbt_compat/ordered_set: MoonBit `Set[K]` (`@set.Set[K]`) semantics.
+///|
+///| Insertion-ordered hash set backed by a forward-only `SetLink[K]` chain
+///| (zero backward references -> strictly DAG -> zero RC cycles), a flat slot
+///| table `nodes` with free-list recycling + O(live) compaction on shrink, and
+///| an open-addressing hash bucket table.
+///|
+///| Iterators hold ONLY `(curr : Option[SetLink[K]], remaining : Int)` and
+///| follow `node.next` without indexing `nodes`, so `remove`, `add`, `clear`,
+///| compaction, and abandoned iterators all work with O(live) memory and zero
+///| `active_iters` counter.
+
+let SET_BUCKET_EMPTY : Int = -1
+let SET_BUCKET_DELETED : Int = -2
+
+struct SetLink[K] {
+  key : K
+  hash : Int
+  mut slot : Int
+  mut prev_slot : Int
+  mut next : Option[SetLink[K]]
+}
+
+struct SetIterState[K] {
+  mut curr : Option[SetLink[K]]
+  mut remaining : Int
+}
+
+pub struct OrderedSet[K] {
+  hash_fn : (K) -> Int
+  eq_fn : (K, K) -> Bool
+  mut head : Option[SetLink[K]]
+  mut tail : Option[SetLink[K]]
+  mut nodes : Array[Option[SetLink[K]]]
+  mut free_slots : Array[Int]
+  mut buckets : Array[Int]
+  mut size : Int
+  mut used : Int
+}
+
+fn set_empty_buckets(cap : Int) -> Array[Int] {
+  Array::make(cap, SET_BUCKET_EMPTY)
+}
+
+fn set_cap_for(count : Int) -> Int {
+  let mut cap = 8
+  while cap * 3 <= (count + 1) * 4 {
+    cap = cap * 2
+  }
+  cap
+}
+
+/// Empty set whose keys hash and compare with `hash` / `eq` (any key type).
+pub fn OrderedSet::new_by[K](
+  hash : (K) -> Int,
+  eq : (K, K) -> Bool,
+) -> OrderedSet[K] {
+  OrderedSet::{
+    hash_fn: hash,
+    eq_fn: eq,
+    head: None,
+    tail: None,
+    nodes: [],
+    free_slots: [],
+    buckets: set_empty_buckets(8),
+    size: 0,
+    used: 0,
+  }
+}
+
+/// Empty set for a `MapKey` key type (MoonBit `Set::new()`).
+pub fn OrderedSet::new[K : MapKey]() -> OrderedSet[K] {
+  ordered_set_new()
+}
+
+/// MoonBit `Set::from_array(xs)`.
+pub fn OrderedSet::from_array[K : MapKey](xs : Array[K]) -> OrderedSet[K] {
+  ordered_set_from_array(xs)
+}
+
+/// MoonBit `Set::from_iter(it)`.
+pub fn OrderedSet::from_iter[K : MapKey](it : MbtIter[K]) -> OrderedSet[K] {
+  ordered_set_from_iter(it)
+}
+
+/// Free-function form of `OrderedSet::new()` for cross-package trait resolution.
+pub fn ordered_set_new[K : MapKey]() -> OrderedSet[K] {
+  OrderedSet::new_by(fn(k : K) -> Int { k.key_hash() }, fn(a : K, b : K) -> Bool {
+    a.key_eq(b)
+  })
+}
+
+/// Free-function form of `OrderedSet::from_array()`.
+pub fn ordered_set_from_array[K : MapKey](xs : Array[K]) -> OrderedSet[K] {
+  let s : OrderedSet[K] = ordered_set_new()
+  for x in xs {
+    s.add(x)
+  }
+  s
+}
+
+/// Free-function form of `OrderedSet::from_iter()`.
+pub fn ordered_set_from_iter[K : MapKey](it : MbtIter[K]) -> OrderedSet[K] {
+  let s : OrderedSet[K] = ordered_set_new()
+  it.each(fn(x : K) -> Unit { s.add(x) })
+  s
+}
+
+/// Bucket index holding `k` (with hash `h`), or -1.
+fn OrderedSet::find_bucket[K](self : OrderedSet[K], k : K, h : Int) -> Int {
+  let mask = self.buckets.length() - 1
+  let mut i = h & mask
+  while true {
+    let slot = self.buckets[i]
+    if slot == SET_BUCKET_EMPTY {
+      return -1
+    }
+    if slot >= 0 {
+      match self.nodes[slot] {
+        Some(nd) =>
+        if nd.hash == h && self.eq_fn(nd.key, k) {
+          return i
+        }
+        None => ()
+      }
+    }
+    i = (i + 1) & mask
+  }
+  -1
+}
+
+/// Rebuild only the open-addressing hash bucket array for current live nodes.
+fn OrderedSet::rehash[K](self : OrderedSet[K], cap : Int) -> Unit {
+  let buckets = set_empty_buckets(cap)
+  let mask = cap - 1
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        let mut j = nd.hash & mask
+        while buckets[j] != SET_BUCKET_EMPTY {
+          j = (j + 1) & mask
+        }
+        buckets[j] = nd.slot
+        cur = nd.next
+      }
+      None => break
+    }
+  }
+  self.buckets = buckets
+  self.used = self.size
+}
+
+/// O(live) compaction of `nodes` and proportional bucket shrink.
+/// Active or abandoned iterators follow `node.next` directly and never index `nodes`,
+/// so compaction is always safe without any `active_iters` counter.
+fn OrderedSet::compact_nodes[K](self : OrderedSet[K]) -> Unit {
+  let new_nodes : Array[Option[SetLink[K]]] = []
+  let mut cur = self.head
+  let mut prev_idx = -1
+  while true {
+    match cur {
+      Some(nd) => {
+        let idx = new_nodes.length()
+        nd.slot = idx
+        nd.prev_slot = prev_idx
+        new_nodes.push(Some(nd))
+        prev_idx = idx
+        cur = nd.next
+      }
+      None => break
+    }
+  }
+  self.nodes = new_nodes
+  self.free_slots = []
+  self.rehash(set_cap_for(self.size))
+}
+
+/// MoonBit `s.add_and_check(k)`: inserts `k` if absent, returning `true` iff newly inserted.
+pub fn OrderedSet::add_and_check[K](self : OrderedSet[K], k : K) -> Bool {
+  let h = self.hash_fn(k)
+  if self.find_bucket(k, h) >= 0 {
+    return false
+  }
+  if (self.used + 1) * 4 >= self.buckets.length() * 3 {
+    self.rehash(set_cap_for(self.size + 1))
+  }
+  let slot = match self.free_slots.pop() {
+    Some(s) => s
+    None => {
+      let s = self.nodes.length()
+      self.nodes.push(None)
+      s
+    }
+  }
+  let prev_slot = match self.tail {
+    Some(t) => t.slot
+    None => -1
+  }
+  let node = SetLink::{ key: k, hash: h, slot: slot, prev_slot: prev_slot, next: None }
+  match self.tail {
+    Some(t) => {
+      t.next = Some(node)
+      self.tail = Some(node)
+    }
+    None => {
+      self.head = Some(node)
+      self.tail = Some(node)
+    }
+  }
+  self.nodes[slot] = Some(node)
+  let mask = self.buckets.length() - 1
+  let mut j = h & mask
+  while self.buckets[j] >= 0 {
+    j = (j + 1) & mask
+  }
+  if self.buckets[j] == SET_BUCKET_EMPTY {
+    self.used = self.used + 1
+  }
+  self.buckets[j] = slot
+  self.size = self.size + 1
+  true
+}
+
+/// MoonBit `s.add(k)`.
+pub fn OrderedSet::add[K](self : OrderedSet[K], k : K) -> Unit {
+  let _ = self.add_and_check(k)
+}
+
+/// MoonBit `s.insert(k)` (alias of `add`).
+pub fn OrderedSet::insert[K](self : OrderedSet[K], k : K) -> Unit {
+  let _ = self.add_and_check(k)
+}
+
+/// MoonBit `s.contains(k)`.
+pub fn OrderedSet::contains[K](self : OrderedSet[K], k : K) -> Bool {
+  self.find_bucket(k, self.hash_fn(k)) >= 0
+}
+
+/// MoonBit `s.remove_and_check(k)`: removes `k` if present, returning `true` iff removed.
+pub fn OrderedSet::remove_and_check[K](self : OrderedSet[K], k : K) -> Bool {
+  let h = self.hash_fn(k)
+  let b = self.find_bucket(k, h)
+  if b < 0 {
+    return false
+  }
+  let slot = self.buckets[b]
+  self.buckets[b] = SET_BUCKET_DELETED
+  match self.nodes[slot] {
+    Some(node) => {
+      // Unlink predecessor in O(1) via `nodes[prev_slot]`, leaving `node.next` INTACT
+      // so any live iterator currently positioned on `node` continues cleanly.
+      if node.prev_slot >= 0 {
+        match self.nodes[node.prev_slot] {
+          Some(prev) => prev.next = node.next
+          None => ()
+        }
+      } else {
+        self.head = node.next
+      }
+      match node.next {
+        Some(nxt) => nxt.prev_slot = node.prev_slot
+        None =>
+        if node.prev_slot >= 0 {
+          self.tail = self.nodes[node.prev_slot]
+        } else {
+          self.tail = None
+        }
+      }
+    }
+    None => ()
+  }
+  self.nodes[slot] = None
+  self.free_slots.push(slot)
+  self.size = self.size - 1
+  if self.nodes.length() >= 64 && self.size * 4 <= self.nodes.length() {
+    self.compact_nodes()
+  }
+  true
+}
+
+/// MoonBit `s.remove(k)`: no-op when absent.
+pub fn OrderedSet::remove[K](self : OrderedSet[K], k : K) -> Unit {
+  let _ = self.remove_and_check(k)
+}
+
+/// MoonBit `s.retain(f)`: keeps only elements for which `f(k)` returns `true`.
+pub fn OrderedSet::retain[K](self : OrderedSet[K], f : (K) -> Bool) -> Unit {
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        cur = nd.next
+        if !f(nd.key) {
+          let _ = self.remove_and_check(nd.key)
+        }
+      }
+      None => break
+    }
+  }
+}
+
+/// MoonBit `s.clear()`: resets table state cleanly; any live iterator keeps
+/// walking its detached forward chain and RC reclaims it once dropped.
+pub fn OrderedSet::clear[K](self : OrderedSet[K]) -> Unit {
+  self.head = None
+  self.tail = None
+  self.nodes = []
+  self.free_slots = []
+  self.buckets = set_empty_buckets(8)
+  self.size = 0
+  self.used = 0
+}
+
+/// MoonBit `s.copy()`.
+pub fn OrderedSet::copy[K](self : OrderedSet[K]) -> OrderedSet[K] {
+  let out = OrderedSet::new_by(self.hash_fn, self.eq_fn)
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        out.add(nd.key)
+        cur = nd.next
+      }
+      None => break
+    }
+  }
+  out
+}
+
+/// MoonBit `s.length()`.
+pub fn OrderedSet::length[K](self : OrderedSet[K]) -> Int {
+  self.size
+}
+
+/// MoonBit `s.size()`.
+pub fn OrderedSet::size[K](self : OrderedSet[K]) -> Int {
+  self.size
+}
+
+/// MoonBit `s.is_empty()`.
+pub fn OrderedSet::is_empty[K](self : OrderedSet[K]) -> Bool {
+  self.size == 0
+}
+
+/// Diagnostic accessor for slot table length (verifying O(live) compaction).
+pub fn OrderedSet::slot_table_len[K](self : OrderedSet[K]) -> Int {
+  self.nodes.length()
+}
+
+/// MoonBit `s.to_array()`: keys in insertion order.
+pub fn OrderedSet::to_array[K](self : OrderedSet[K]) -> Array[K] {
+  let out : Array[K] = []
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        out.push(nd.key)
+        cur = nd.next
+      }
+      None => break
+    }
+  }
+  out
+}
+
+/// MoonBit `s.iter()`: captures `(curr = head, remaining = size)`, advances
+/// `curr = node.next` and decrements `remaining` BEFORE yielding `Some(node.key)`.
+pub fn OrderedSet::iter[K](self : OrderedSet[K]) -> MbtIter[K] {
+  let st = SetIterState::{ curr: self.head, remaining: self.size }
+  MbtIter::{
+    next: fn() -> Option[K] {
+      if st.remaining <= 0 {
+        st.curr = None
+        return None
+      }
+      match st.curr {
+        Some(nd) => {
+          st.curr = nd.next
+          st.remaining = st.remaining - 1
+          Some(nd.key)
+        }
+        None => {
+          st.remaining = 0
+          None
+        }
+      }
+    },
+  }
+}
+
+/// MoonBit `s.each(f)` (walks live `head -> next` links directly).
+pub fn OrderedSet::each[K](self : OrderedSet[K], f : (K) -> Unit) -> Unit {
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        cur = nd.next
+        f(nd.key)
+      }
+      None => break
+    }
+  }
+}
+
+/// MoonBit `s.eachi(f)` (walks live `head -> next` links directly).
+pub fn OrderedSet::eachi[K](self : OrderedSet[K], f : (Int, K) -> Unit) -> Unit {
+  let mut cur = self.head
+  let mut i = 0
+  while true {
+    match cur {
+      Some(nd) => {
+        cur = nd.next
+        f(i, nd.key)
+        i = i + 1
+      }
+      None => break
+    }
+  }
+}
+
+/// MoonBit `a.union(b)`.
+pub fn OrderedSet::union[K](self : OrderedSet[K], other : OrderedSet[K]) -> OrderedSet[K] {
+  let out = self.copy()
+  other.each(fn(k : K) -> Unit { out.add(k) })
+  out
+}
+
+/// MoonBit `a.intersection(b)`.
+pub fn OrderedSet::intersection[K](self : OrderedSet[K], other : OrderedSet[K]) -> OrderedSet[K] {
+  let out = OrderedSet::new_by(self.hash_fn, self.eq_fn)
+  self.each(fn(k : K) -> Unit {
+    if other.contains(k) {
+      out.add(k)
+    }
+  })
+  out
+}
+
+/// MoonBit `a.difference(b)`.
+pub fn OrderedSet::difference[K](self : OrderedSet[K], other : OrderedSet[K]) -> OrderedSet[K] {
+  let out = OrderedSet::new_by(self.hash_fn, self.eq_fn)
+  self.each(fn(k : K) -> Unit {
+    if !other.contains(k) {
+      out.add(k)
+    }
+  })
+  out
+}
+
+/// MoonBit `a.symmetric_difference(b)`.
+pub fn OrderedSet::symmetric_difference[K](self : OrderedSet[K], other : OrderedSet[K]) -> OrderedSet[K] {
+  let out = OrderedSet::new_by(self.hash_fn, self.eq_fn)
+  self.each(fn(k : K) -> Unit {
+    if !other.contains(k) {
+      out.add(k)
+    }
+  })
+  other.each(fn(k : K) -> Unit {
+    if !self.contains(k) {
+      out.add(k)
+    }
+  })
+  out
+}
+
+/// MoonBit `a.is_subset(b)`.
+pub fn OrderedSet::is_subset[K](self : OrderedSet[K], other : OrderedSet[K]) -> Bool {
+  if self.size > other.size {
+    return false
+  }
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        if !other.contains(nd.key) {
+          return false
+        }
+        cur = nd.next
+      }
+      None => break
+    }
+  }
+  true
+}
+
+/// MoonBit `a.is_disjoint(b)`.
+pub fn OrderedSet::is_disjoint[K](self : OrderedSet[K], other : OrderedSet[K]) -> Bool {
+  let mut cur = self.head
+  while true {
+    match cur {
+      Some(nd) => {
+        if other.contains(nd.key) {
+          return false
+        }
+        cur = nd.next
+      }
+      None => break
+    }
+  }
+  true
+}
+
+/// MoonBit `a == b` / `a.equal(b)` (order-independent set equality).
+pub fn OrderedSet::equal[K](self : OrderedSet[K], other : OrderedSet[K]) -> Bool {
+  if self.size != other.size {
+    return false
+  }
+  self.is_subset(other)
+}
+
+/// Free-function helper for `OrderedSet` equality (used by Stage B & `#derive(Eq)`).
+pub fn ordered_set_eq[K](a : OrderedSet[K], b : OrderedSet[K]) -> Bool {
+  a.equal(b)
+}
+
+/// Free-function helper for `OrderedSet` lazy iteration.
+pub fn ordered_set_iter[K](s : OrderedSet[K]) -> MbtIter[K] {
+  s.iter()
+}

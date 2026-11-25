@@ -101,9 +101,10 @@ CASES = {
     "m12_pipe_loops_compat": ("ok", 10),
     "q2_semantics_p0": ("ok", 13),
     "q2_mechanical_compat": ("ok", 10),
-    "wave_m2_core": ("ok", 7),
-    "wave_m2_round2": ("ok", 8),
-    "wave_m2b_mid_tier": ("ok", 14),
+    "transpile_core": ("ok", 7),
+    "transpile_round2": ("ok", 8),
+    "transpile_mid_tier": ("ok", 14),
+    "transpile_upper_tier": ("ok", 10),
 }
 
 MOON_TRAPS = {
@@ -1404,6 +1405,148 @@ pub fn m2b_p1_views_map_and_hash() -> (String, Int, Int, Int, Int, Int, Bool) {
   let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2) && hf1 == -1445830834 && hf_pos0 == 148298089 && hf_neg0 == 148298089 && fneg_bits == 0x80000000U && fhex_pos == 0x3fc00000U && fhex_sub == 1U && fhex_neg == 0xbfc00000U && fhex_m1 == 0x3f800000U && fhex_m2 == 0x3f800002U && fhex_m3 == 0x00000000U && fhex_m4 == 0x3f800000U && fhex_m5 == 0x3f800002U && hex_int == 255
   (vs, m.get(0).unwrap_or(-1), m.get(1).unwrap_or(-1), gj, hs, he, h_ok)
 }
+
+// Upper-tier transpile differential suite (§1-§7 + codec helpers)
+pub(all) struct UtValBox {
+  mut val : Int
+}
+
+pub fn UtValBox::val(self : UtValBox, d : Int) -> Int {
+  self.val + d
+}
+
+pub fn ut_val_and_compound() -> (Int, Int, Int, Int) {
+  let r : Ref[Int] = Ref::new(10)
+  r.val += 5
+  let mut calls = 0
+  let b = UtValBox::{ val: 20 }
+  let get_box = fn() -> UtValBox {
+    calls = calls + 1
+    b
+  }
+  get_box().val += 7
+  let m = b.val(3)
+  (r.val, b.val, calls, m)
+}
+
+pub fn ut_slices_and_sb() -> (Int, String, String) {
+  let bs : Array[Byte] = [b'a', b'b', b'c', b'd']
+  let sub_b = Bytes::from_array(bs[1:3])
+  let cs : Array[Char] = ['x', 'y', 'z', 'w']
+  let sub_s = String::from_array(cs[1:3])
+  let sb = StringBuilder::new(size_hint=16)
+  sb.write_string("ok:")
+  sb.write_string(sub_s)
+  (sub_b.length(), sub_s, sb.to_string())
+}
+
+pub fn ut_array_add_chain() -> Array[Int] {
+  let a = [1, 2]
+  let b = [3]
+  let c = [4, 5]
+  a +
+    b +
+    c
+}
+
+pub fn ut_json_literals() -> (String, Bool, Bool) {
+  let j : Json = {
+    "neg0": -0,
+    "big": 9007199254740993,
+    "arr": [true, false, null, "hi"],
+    "empty": {},
+  }
+  let j_neg0 : Json = -0
+  let j_pos0 : Json = 0
+  let j2 : Json = {
+    "neg0": -0,
+    "big": 9007199254740993,
+    "arr": [true, false, null, "hi"],
+    "empty": {},
+  }
+  let eq_same = j == j2
+  let neg0_sign = match j_neg0 {
+    Number(d, ..) => d.reinterpret_as_uint64() == 0x8000000000000000UL
+    _ => false
+  }
+  let _ = j_pos0
+  (j.stringify(), eq_same, neg0_sign)
+}
+
+#derive(Eq, Hash)
+pub(all) struct UtTag {
+  id : Int
+  name : String
+}
+
+pub fn[K : Hash + Eq] ut_set_has(s : Set[K], k : K) -> Bool {
+  s.contains(k)
+}
+
+pub fn ut_set_and_arr_helpers() -> (Int, Int, Bool, Int, Int) {
+  let s : Set[Int] = Set::from_array([1, 2, 3])
+  let mut iter_sum = 0
+  for x in s {
+    if x == 1 {
+      s.remove(3)
+      s.add(4)
+    }
+    iter_sum = iter_sum * 10 + x
+  }
+  let ts : Set[UtTag] = Set::new()
+  ts.add(UtTag::{ id: 1, name: "a" })
+  ts.add(UtTag::{ id: 1, name: "a" })
+  let has_tag = ut_set_has(ts, UtTag::{ id: 1, name: "a" })
+  let xs = [1, 2, 3, 4, 5]
+  xs.retain(fn(v) { v % 2 == 1 })
+  let ys = xs.filter_map(fn(v) { if v > 1 { Option::Some(v * 10) } else { Option::None } })
+  (iter_sum, ts.length(), has_tag, xs.length(), ys[0] + ys[1])
+}
+
+pub(all) enum UtLabeled {
+  Rect(top~ : Int, bottom~ : Int, left~ : Int)
+}
+
+pub fn ut_labeled_enum(a : Int, b : Int) -> (Int, Int) {
+  let left = a + 1
+  let r = UtLabeled::Rect(left~, bottom=b * 2, top=a)
+  let v1 = match r {
+    UtLabeled::Rect(bottom=bt, top=tp, ..) => tp * 100 + bt
+  }
+  let v2 = match r {
+    UtLabeled::Rect(left~, top=_, bottom=_) => left
+  }
+  (v1, v2)
+}
+
+pub(all) struct UtInner(Int, String)
+pub(all) struct UtOuter(UtInner, Int)
+
+#derive(Eq)
+pub(all) struct UtNestedTup {
+  pair : ((Int, String), (Int, String))
+}
+
+pub fn ut_misc_syntax() -> (Int, String, Bool, Int, Bool) {
+  let mut sum = 0
+  for i in 0..<=4 {
+    sum = sum + i
+  }
+  let emoji = "\uD83D\uDE00"
+  let esc = "\\uD800"
+  let interp = "e:\uD83D\uDE00:\{sum}"
+  let w = UtOuter(UtInner(7, "ok"), 9)
+  let UtOuter(UtInner(p, _), n) = w
+  let t1 = UtNestedTup::{ pair: ((1, "a"), (2, "b")) }
+  let t2 = UtNestedTup::{ pair: ((1, "a"), (2, "b")) }
+  let t3 = UtNestedTup::{ pair: ((1, "a"), (2, "c")) }
+  let arr = [10, 20, 30]
+  let as_sum = match arr {
+    [head, .. as tail] => head + tail.length()
+    _ => -1
+  }
+  (sum + p + n + as_sum, emoji + "|" + esc + "|" + interp, t1 == t2 && !(t1 == t3), emoji.length(), true)
+}
 '''
 
 MOON_DRIVER_MBT = r'''
@@ -1879,7 +2022,7 @@ fn main {
     check("q2.int_lnot", ln == -1)
     check("q2.unsafe_get_set", g == 25)
     check("q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
-  } else if kase == "wave_m2_core" {
+  } else if kase == "transpile_core" {
     let (ts1, ts2, ts3) = @m12.m2_tuple_struct_roundtrip(7, "hi")
     let (ma, mb) = @m12.m2_map_index_set()
     let (b1, b2, b3, inf_ok) = @m12.m2_hex_floats()
@@ -1892,7 +2035,7 @@ fn main {
     check("m2.hex_1p_54", b3 == 4363988038922010624L)
     check("m2.double_is_inf", inf_ok)
     check("m2.ref_default", rv == 42)
-  } else if kase == "wave_m2_round2" {
+  } else if kase == "transpile_round2" {
     let (tm1, tm2, tm3) = @m12.m2_r2_tuple_match()
     let (d_big, i64_big, d_if) = @m12.m2_r2_large_int_coerce(false)
     let eq_h = @m12.m2_r2_eq_hygiene()
@@ -1911,7 +2054,7 @@ fn main {
     check("r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
     check("r2.show_return", sh == "early:normal")
     check("r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
-  } else if kase == "wave_m2b_mid_tier" {
+  } else if kase == "transpile_mid_tier" {
     let (sc, ss, ssum) = @m12.m2b_postfix_slice_single_eval()
     let (ar1, ar2, ar3) = @m12.m2b_array_rest_pat(true)
     let (bs1, bs2) = @m12.m2b_bytes_for_loop()
@@ -1937,6 +2080,25 @@ fn main {
     check("m2b.p1_4_str_views", p1vs == "box.view():bc|b|bc|abc|")
     check("m2b.p1_5_multiline_map_rhs", p1mv0 == 7 && p1mv1 == 7 && p1gj == 17)
     check("m2b.p1_6_hash_call", p1hk)
+  } else if kase == "transpile_upper_tier" {
+    let (rv, bv, vc, vm) = @m12.ut_val_and_compound()
+    let (bl, ss, sb) = @m12.ut_slices_and_sb()
+    let ac = @m12.ut_array_add_chain()
+    let (js, jeq, jneg0) = @m12.ut_json_literals()
+    let (sis, tsl, thas, xsl, ysum) = @m12.ut_set_and_arr_helpers()
+    let (lv1, lv2) = @m12.ut_labeled_enum(3, 4)
+    let (ms, mstr, meq, elen, mok) = @m12.ut_misc_syntax()
+    trace("ut", "\{rv}:\{bv}:\{vc}:\{vm},\{bl}:\{ss}:\{sb},\{ac.length()}:\{ac[0]}:\{ac[4]},\{js}:\{jeq}:\{jneg0},\{sis}:\{tsl}:\{thas}:\{xsl}:\{ysum},\{lv1}:\{lv2},\{ms}:\{mstr}:\{meq}:\{elen}:\{mok}")
+    check("ut.val_compound", rv == 15 && bv == 27 && vc == 1 && vm == 30)
+    check("ut.slices_sb", bl == 2 && ss == "yz" && sb == "ok:yz")
+    check("ut.arr_add_chain", ac.length() == 5 && ac[0] == 1 && ac[4] == 5)
+    check("ut.json_eq", jeq)
+    check("ut.json_neg0_sign", jneg0)
+    check("ut.set_iter_mut", sis == 124 && tsl == 1 && thas)
+    check("ut.arr_retain_filter_map", xsl == 3 && ysum == 80)
+    check("ut.labeled_enum", lv1 == 308 && lv2 == 4)
+    check("ut.surrogate_len", elen == 2)
+    check("ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
   } else {
     abort("unknown case: \{kase}")
   }
@@ -2429,7 +2591,7 @@ pub fn main(w : World) -> Int {
     check(w, "q2.int_lnot", ln == -1)
     check(w, "q2.unsafe_get_set", g == 25)
     check(w, "q2.self_arr_slice_trunc", mid_s == 55 && emp == 2)
-  } else if kase == "wave_m2_core" {
+  } else if kase == "transpile_core" {
     let (ts1, ts2, ts3) = m12::m2_tuple_struct_roundtrip(7, "hi")
     let (ma, mb) = m12::m2_map_index_set()
     let (b1, b2, b3, inf_ok) = m12::m2_hex_floats()
@@ -2442,7 +2604,7 @@ pub fn main(w : World) -> Int {
     check(w, "m2.hex_1p_54", b3 == 4363988038922010624L)
     check(w, "m2.double_is_inf", inf_ok)
     check(w, "m2.ref_default", rv == 42)
-  } else if kase == "wave_m2_round2" {
+  } else if kase == "transpile_round2" {
     let (tm1, tm2, tm3) = m12::m2_r2_tuple_match()
     let (d_big, i64_big, d_if) = m12::m2_r2_large_int_coerce(false)
     let eq_h = m12::m2_r2_eq_hygiene()
@@ -2461,7 +2623,7 @@ pub fn main(w : World) -> Int {
     check(w, "r2.lazy_iter", la1 && lc1 == 2 && !la2 && lc2 == 3 && lz && lzf == 2 && lzg == 2 && ifld == 12 && isnp == 2)
     check(w, "r2.show_return", sh == "early:normal")
     check(w, "r2.arr_add_eq_tuple", aeq && tup == 20 && lit == ".0")
-  } else if kase == "wave_m2b_mid_tier" {
+  } else if kase == "transpile_mid_tier" {
     let (sc, ss, ssum) = m12::m2b_postfix_slice_single_eval()
     let (ar1, ar2, ar3) = m12::m2b_array_rest_pat(true)
     let (bs1, bs2) = m12::m2b_bytes_for_loop()
@@ -2487,6 +2649,25 @@ pub fn main(w : World) -> Int {
     check(w, "m2b.p1_4_str_views", p1vs == "box.view():bc|b|bc|abc|")
     check(w, "m2b.p1_5_multiline_map_rhs", p1mv0 == 7 && p1mv1 == 7 && p1gj == 17)
     check(w, "m2b.p1_6_hash_call", p1hk)
+  } else if kase == "transpile_upper_tier" {
+    let (rv, bv, vc, vm) = m12::ut_val_and_compound()
+    let (bl, ss, sb) = m12::ut_slices_and_sb()
+    let ac = m12::ut_array_add_chain()
+    let (js, jeq, jneg0) = m12::ut_json_literals()
+    let (sis, tsl, thas, xsl, ysum) = m12::ut_set_and_arr_helpers()
+    let (lv1, lv2) = m12::ut_labeled_enum(3, 4)
+    let (ms, mstr, meq, elen, mok) = m12::ut_misc_syntax()
+    trace(w, "ut", rv.to_string() + ":" + bv.to_string() + ":" + vc.to_string() + ":" + vm.to_string() + "," + bl.to_string() + ":" + ss + ":" + sb + "," + ac.length().to_string() + ":" + ac[0].to_string() + ":" + ac[4].to_string() + "," + js + ":" + jeq.to_string() + ":" + jneg0.to_string() + "," + sis.to_string() + ":" + tsl.to_string() + ":" + thas.to_string() + ":" + xsl.to_string() + ":" + ysum.to_string() + "," + lv1.to_string() + ":" + lv2.to_string() + "," + ms.to_string() + ":" + mstr + ":" + meq.to_string() + ":" + elen.to_string() + ":" + mok.to_string())
+    check(w, "ut.val_compound", rv == 15 && bv == 27 && vc == 1 && vm == 30)
+    check(w, "ut.slices_sb", bl == 2 && ss == "yz" && sb == "ok:yz")
+    check(w, "ut.arr_add_chain", ac.length() == 5 && ac[0] == 1 && ac[4] == 5)
+    check(w, "ut.json_eq", jeq)
+    check(w, "ut.json_neg0_sign", jneg0)
+    check(w, "ut.set_iter_mut", sis == 124 && tsl == 1 && thas)
+    check(w, "ut.arr_retain_filter_map", xsl == 3 && ysum == 80)
+    check(w, "ut.labeled_enum", lv1 == 308 && lv2 == 4)
+    check(w, "ut.surrogate_len", elen == 2)
+    check(w, "ut.misc_syntax", ms == 10 + 7 + 9 + 12 && meq && mok)
   } else {
     panic("abort: unknown case " + kase)
   }
@@ -3058,7 +3239,7 @@ def emit_ci_golden(pionc, out_dir):
             print("CI GOLDEN FAILED: mbt2pion publish (rc=%s)\n%s\n%s" % (rc, out[-2000:], err[-2000:]))
             return 1
         got_files = sorted(os.listdir(out_dir))
-        expected_files = ["00_init_order.pion", "oracle_lib.pion"]
+        expected_files = ["00_init_order.pion", "mbt2pion_abi.json", "oracle_lib.pion"]
         if got_files != expected_files:
             print("CI GOLDEN FAILED: expected files %s, got %s" % (expected_files, got_files))
             return 1

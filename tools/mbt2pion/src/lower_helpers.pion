@@ -1,0 +1,805 @@
+///| Self-contained lowering helpers for JSON literals, UTF-16 surrogate pairs,
+///| labeled enum constructors/patterns, raising-callback fail-closed checks,
+///| nested tuple-struct destructuring, and `[K : Hash + Eq]` generic bounds.
+
+// ---------------------------------------------------------------------------
+// 1. Recursive MoonBit JSON literals under expected type `mbt_compat::MbtJson`
+// ---------------------------------------------------------------------------
+
+fn is_expected_mbt_json(ctx : StageAContext) -> Bool {
+  current_expected_type(ctx).trim() == "mbt_compat::MbtJson" &&
+  !ctx.symtab.local_types.contains("Json") &&
+  !ctx.active_generics.contains("Json")
+}
+
+///| True if the token immediately following a literal continues a compound expression
+///| (so `1 + 2` or `"a" + "b"` is NOT prematurely wrapped as `MbtJson::Number(1) + 2`).
+fn next_tok_breaks_json_lit(tokens : Array[Token], next_i : Int, end : Int) -> Bool {
+  if next_i >= end || tokens[next_i].newline_before {
+    return false
+  }
+  let nk = tokens[next_i].kind
+  nk == TokenKind::Plus || nk == TokenKind::Minus || nk == TokenKind::Star ||
+  nk == TokenKind::Slash || nk == TokenKind::Percent || nk == TokenKind::EqEq ||
+  nk == TokenKind::BangEq || nk == TokenKind::Lt || nk == TokenKind::LtEq ||
+  nk == TokenKind::Gt || nk == TokenKind::GtEq || nk == TokenKind::AmpAmp ||
+  nk == TokenKind::PipePipe || nk == TokenKind::Dot || nk == TokenKind::LBracket ||
+  nk == TokenKind::LParen || nk == TokenKind::PipeGt || nk == TokenKind::DotDot ||
+  nk == TokenKind::DotDotLt || nk == TokenKind::DotDotEq || nk == TokenKind::DotDotLtEq
+}
+
+fn int_to_u64(x : Int) -> UInt64 {
+  x.to_int64().reinterpret_as_uint64()
+}
+
+///| Exact 0-ULP round-to-nearest-even conversion of a `UInt64` integer to IEEE-754 binary64 bits.
+fn u64_to_ieee754_bits(v : UInt64) -> UInt64 {
+  if v == 0UL {
+    return 0UL
+  }
+  // Find MSB index `msb` in [0, 63]
+  let mut msb = 63
+  while msb > 0 {
+    if ((v >> int_to_u64(msb)) & 1UL) != 0UL {
+      break
+    }
+    msb = msb - 1
+  }
+  let mut exp : UInt64 = int_to_u64(1023 + msb)
+  let mut mant : UInt64 = 0UL
+  if msb <= 52 {
+    mant = (v << int_to_u64(52 - msb)) & 0x000FFFFFFFFFFFFFUL
+  } else {
+    let shift = msb - 52
+    let shifted = v >> int_to_u64(shift)
+    let rem_mask = (1UL << int_to_u64(shift)) - 1UL
+    let rem = v & rem_mask
+    let half = 1UL << int_to_u64(shift - 1)
+    let mut rounded = shifted
+    if rem > half || (rem == half && (shifted & 1UL) != 0UL) {
+      rounded = rounded + 1UL
+      if rounded == (1UL << 53UL) {
+        rounded = rounded >> 1UL
+        exp = exp + 1UL
+      }
+    }
+    mant = rounded & 0x000FFFFFFFFFFFFFUL
+  }
+  (exp << 52UL) | mant
+}
+
+fn u64_to_hex16(v : UInt64) -> String {
+  let digits = "0123456789ABCDEF"
+  let sb = StringBuilder()
+  let mut shift = 60
+  while shift >= 0 {
+    let nib = ((v >> int_to_u64(shift)) & 15UL).to_int()
+    sb.write_string(digits.slice(nib, nib + 1))
+    shift = shift - 4
+  }
+  sb.to_string()
+}
+
+fn parse_decimal_u64_exact(raw : String) -> Option[UInt64] {
+  let mut acc : UInt64 = 0UL
+  let mut any = false
+  let mut i = 0
+  while i < raw.length() {
+    let c = raw.code_unit_at(i)
+    if c == 95 {
+      i = i + 1
+      continue
+    }
+    if c < 48 || c > 57 {
+      return None
+    }
+    any = true
+    let d = int_to_u64(c - 48)
+    if acc > 1844674407370955161UL || (acc == 1844674407370955161UL && d > 5UL) {
+      return None
+    }
+    acc = acc * 10UL + d
+    i = i + 1
+  }
+  if any { Some(acc) } else { None }
+}
+
+fn is_zero_num_str(raw : String) -> Bool {
+  let mut any_digit = false
+  let mut i = 0
+  while i < raw.length() {
+    let c = raw.code_unit_at(i)
+    if c == 101 || c == 69 {
+      break
+    }
+    if c >= 49 && c <= 57 {
+      return false
+    }
+    if c == 48 {
+      any_digit = true
+    }
+    i = i + 1
+  }
+  any_digit
+}
+
+///| Lower a numeric literal under expected `mbt_compat::MbtJson`, using `Double::from_bits`
+///| to preserve `-0` (`0x8000000000000000`) and 0-ULP 20-digit integer literals (`repr=None`).
+fn lower_json_number_lit(neg : Bool, raw : String, is_float : Bool) -> String {
+  if is_zero_num_str(raw) {
+    let bits_hex = if neg { "8000000000000000" } else { "0000000000000000" }
+    return "mbt_compat::MbtJson::Number(Double::from_bits(0x" + bits_hex + "UL.reinterpret_as_int64()), Option::None)"
+  }
+  if !is_float {
+    match parse_decimal_u64_exact(raw) {
+      Some(u) => {
+        let mut bits = u64_to_ieee754_bits(u)
+        if neg {
+          bits = bits | 0x8000000000000000UL
+        }
+        return "mbt_compat::MbtJson::Number(Double::from_bits(0x" + u64_to_hex16(bits) + "UL.reinterpret_as_int64()), Option::None)"
+      }
+      None => ()
+    }
+  }
+  // Fallback for floats or >20-digit ints: strip underscores, use `str_try_parse_double`
+  let sb = StringBuilder()
+  if neg { sb.write_string("-") }
+  let mut i = 0
+  while i < raw.length() {
+    let c = raw.code_unit_at(i)
+    if c != 95 { sb.write_byte(c.to_byte()) }
+    i = i + 1
+  }
+  let clean = sb.to_string()
+  if is_float {
+    "mbt_compat::MbtJson::Number(" + clean + ", Option::None)"
+  } else {
+    "mbt_compat::MbtJson::Number(mbt_compat::str_try_parse_double(\"" + clean + "\").unwrap_or(0.0), Option::None)"
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 2. UTF-16 Surrogate Pair Lowering (`\uD83D\uDE00` -> `\u{1F600}`)
+// ---------------------------------------------------------------------------
+
+fn hex_upper_cp(cp : Int) -> String {
+  let digits = "0123456789ABCDEF"
+  let rev : Array[String] = []
+  let mut v = cp
+  if v == 0 {
+    return "0"
+  }
+  while v > 0 {
+    let nib = v & 15
+    rev.push(digits.slice(nib, nib + 1))
+    v = v >> 4
+  }
+  let sb = StringBuilder()
+  let mut i = rev.length() - 1
+  while i >= 0 {
+    sb.write_string(rev[i])
+    i = i - 1
+  }
+  sb.to_string()
+}
+
+///| Rewrite MoonBit `\uHHHH` UTF-16 surrogate pairs in string literal content to Pion `\u{...}`
+///| scalar escapes; fail closed (`MBT2PION_UNSUPPORTED_SYNTAX`) on lone surrogates;
+///| strictly respect escaped `\\uD800` (never misread an escaped backslash!).
+fn lower_mbt_string_surrogates(
+  s : String,
+  file : String,
+  line : Int,
+  col : Int,
+  diags : Array[Diag],
+) -> String {
+  if !str_has(s, "\\u") {
+    return s
+  }
+  let n = s.length()
+  let sb = StringBuilder()
+  let mut i = 0
+  while i < n {
+    let c = s.code_unit_at(i)
+    if c == 92 && i + 1 < n {
+      let nxt = s.code_unit_at(i + 1)
+      if nxt == 92 {
+        // Escaped backslash `\\`: emit both bytes verbatim so `\\uD800` is untouched!
+        sb.write_string("\\\\")
+        i = i + 2
+        continue
+      }
+      if nxt == 117 && i + 5 < n && s.code_unit_at(i + 2) != 123 {
+        let d1 = hex_digit_val(s.code_unit_at(i + 2))
+        let d2 = hex_digit_val(s.code_unit_at(i + 3))
+        let d3 = hex_digit_val(s.code_unit_at(i + 4))
+        let d4 = hex_digit_val(s.code_unit_at(i + 5))
+        if d1 >= 0 && d2 >= 0 && d3 >= 0 && d4 >= 0 {
+          let cp = (d1 << 12) | (d2 << 8) | (d3 << 4) | d4
+          if cp >= 0xD800 && cp <= 0xDBFF {
+            // High surrogate: must be immediately followed by low surrogate `\uDC00..\uDFFF`
+            if i + 11 < n && s.code_unit_at(i + 6) == 92 && s.code_unit_at(i + 7) == 117 && s.code_unit_at(i + 8) != 123 {
+              let l1 = hex_digit_val(s.code_unit_at(i + 8))
+              let l2 = hex_digit_val(s.code_unit_at(i + 9))
+              let l3 = hex_digit_val(s.code_unit_at(i + 10))
+              let l4 = hex_digit_val(s.code_unit_at(i + 11))
+              if l1 >= 0 && l2 >= 0 && l3 >= 0 && l4 >= 0 {
+                let lo = (l1 << 12) | (l2 << 8) | (l3 << 4) | l4
+                if lo >= 0xDC00 && lo <= 0xDFFF {
+                  let full_cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00)
+                  sb.write_string("\\u{" + hex_upper_cp(full_cp) + "}")
+                  i = i + 12
+                  continue
+                }
+              }
+            }
+            diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              line,
+              col,
+              "unpaired UTF-16 high surrogate escape `\\u" + s.slice(i + 2, i + 6) + "` in string literal",
+            ))
+            sb.write_string(s.slice(i, i + 6))
+            i = i + 6
+            continue
+          }
+          if cp >= 0xDC00 && cp <= 0xDFFF {
+            diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              line,
+              col,
+              "unpaired UTF-16 low surrogate escape `\\u" + s.slice(i + 2, i + 6) + "` in string literal",
+            ))
+            sb.write_string(s.slice(i, i + 6))
+            i = i + 6
+            continue
+          }
+          // Non-surrogate `\uHHHH`: emit Pion `\u{HHHH}`
+          sb.write_string("\\u{" + s.slice(i + 2, i + 6) + "}")
+          i = i + 6
+          continue
+        }
+      }
+      sb.write_byte(c.to_byte())
+      sb.write_byte(nxt.to_byte())
+      i = i + 2
+      continue
+    }
+    sb.write_byte(c.to_byte())
+    i = i + 1
+  }
+  sb.to_string()
+}
+
+// ---------------------------------------------------------------------------
+// 3. Labeled Enum Constructors & Patterns + Readonly Visibility Gate (§6)
+// ---------------------------------------------------------------------------
+
+///| Check whether a parenthesized argument/pattern list contains any labeled arg (`lbl=...` or `lbl~`).
+fn paren_has_labeled_arg(tokens : Array[Token], open_p : Int, close_p : Int) -> Bool {
+  let mut cur = open_p + 1
+  while cur < close_p {
+    if tokens[cur].kind == TokenKind::Comma {
+      cur = cur + 1
+      continue
+    }
+    let mut a_end = cur
+    let mut depth = 0
+    while a_end < close_p {
+      let k = tokens[a_end].kind
+      if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { depth = depth + 1 }
+      else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { depth = depth - 1 }
+      else if depth == 0 && k == TokenKind::Comma { break }
+      a_end = a_end + 1
+    }
+    if (tokens[cur].kind == TokenKind::Ident || tokens[cur].kind == TokenKind::Keyword) && cur + 1 < a_end {
+      if tokens[cur + 1].kind == TokenKind::Eq || tokens[cur + 1].kind == TokenKind::Tilde {
+        return true
+      }
+    }
+    cur = a_end + 1
+  }
+  false
+}
+
+///| Resolve `(AbiEnumSchema, AbiEnumVariant)` for a constructor/pattern site.
+fn resolve_enum_schema_for_site(
+  ctx : StageAContext,
+  pkg_hint : String,
+  enum_hint : String,
+  ctor_name : String,
+) -> Option[(AbiEnumSchema, AbiEnumVariant)] {
+  if enum_hint.length() > 0 {
+    let key = if pkg_hint.length() > 0 { pkg_hint + "::" + enum_hint } else { enum_hint }
+    match ctx.symtab.enum_schemas.get(key) {
+      Some(sch) => {
+        for v in sch.variants {
+          if v.name == ctor_name {
+            return Some((sch, v))
+          }
+        }
+      }
+      None => ()
+    }
+  }
+  match ctx.symtab.enum_schemas_by_ctor.get(ctor_name) {
+    Some(cands) => {
+      let exp_base = strip_type_args_sym(current_expected_type(ctx))
+      let matched : Array[(AbiEnumSchema, AbiEnumVariant)] = []
+      let local_matched : Array[(AbiEnumSchema, AbiEnumVariant)] = []
+      for c in cands {
+        let sch = c.0
+        if pkg_hint.length() > 0 && sch.pkg != pkg_hint {
+          continue
+        }
+        if enum_hint.length() > 0 && sch.name != enum_hint {
+          continue
+        }
+        let full_e = if sch.pkg.length() > 0 { sch.pkg + "::" + sch.name } else { sch.name }
+        if exp_base.length() > 0 && pkg_hint.length() == 0 && enum_hint.length() == 0 {
+          if str_has(exp_base, "::") {
+            if full_e == exp_base { matched.push(c) }
+          } else if sch.name == exp_base {
+            matched.push(c)
+            if sch.pkg.length() == 0 { local_matched.push(c) }
+          }
+        } else {
+          matched.push(c)
+          if sch.pkg.length() == 0 { local_matched.push(c) }
+        }
+      }
+      if matched.length() == 1 {
+        return Some(matched[0])
+      }
+      if pkg_hint.length() == 0 && local_matched.length() == 1 {
+        return Some(local_matched[0])
+      }
+      None
+    }
+    None => None
+  }
+}
+
+///| Reorder labeled enum constructor/pattern arguments directly into declaration positional order
+///| (ZERO call-site temporary variables; strict fail-closed on unknown/duplicate/missing labels).
+fn lower_labeled_enum_args(
+  ctx : StageAContext,
+  schema : AbiEnumSchema,
+  variant : AbiEnumVariant,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  file : String,
+  line : Int,
+  col : Int,
+  in_pattern : Bool,
+) -> String {
+  let nfields = variant.fields.length()
+  let slots : Array[String] = []
+  let filled : Array[Bool] = []
+  let mut fi = 0
+  while fi < nfields {
+    slots.push("")
+    filled.push(false)
+    fi = fi + 1
+  }
+  let mut has_rest = false
+  let mut next_pos = 0
+  let mut cur = open_p + 1
+  while cur < close_p {
+    if tokens[cur].kind == TokenKind::Comma {
+      cur = cur + 1
+      continue
+    }
+    let mut a_end = cur
+    let mut depth = 0
+    while a_end < close_p {
+      let k = tokens[a_end].kind
+      if k == TokenKind::LParen || k == TokenKind::LBracket || k == TokenKind::LBrace { depth = depth + 1 }
+      else if k == TokenKind::RParen || k == TokenKind::RBracket || k == TokenKind::RBrace { depth = depth - 1 }
+      else if depth == 0 && k == TokenKind::Comma { break }
+      a_end = a_end + 1
+    }
+    if in_pattern && a_end == cur + 1 && tokens[cur].kind == TokenKind::DotDot {
+      has_rest = true
+      cur = a_end + 1
+      continue
+    }
+    let is_punning = (tokens[cur].kind == TokenKind::Ident || tokens[cur].kind == TokenKind::Keyword) &&
+    a_end == cur + 2 && tokens[cur + 1].kind == TokenKind::Tilde
+    let is_named = (tokens[cur].kind == TokenKind::Ident || tokens[cur].kind == TokenKind::Keyword) &&
+    cur + 2 < a_end && tokens[cur + 1].kind == TokenKind::Eq
+    if is_punning || is_named {
+      let lbl = tokens[cur].raw
+      let mut target_idx = -1
+      let mut k = 0
+      while k < nfields {
+        if variant.fields[k].label == lbl {
+          target_idx = k
+          break
+        }
+        k = k + 1
+      }
+      if target_idx < 0 {
+        ctx.diags.push(diag_error(
+          "MBT2PION_ENUM_LABEL_ERROR",
+          file,
+          tokens[cur].line,
+          tokens[cur].col,
+          "unknown label `" + lbl + "` for enum variant `" + schema.name + "::" + variant.name + "`",
+        ))
+      } else if filled[target_idx] {
+        ctx.diags.push(diag_error(
+          "MBT2PION_ENUM_LABEL_ERROR",
+          file,
+          tokens[cur].line,
+          tokens[cur].col,
+          "duplicate label `" + lbl + "` for enum variant `" + schema.name + "::" + variant.name + "`",
+        ))
+      } else {
+        let val_s = if is_punning {
+          rename_keyword_ident(lbl)
+        } else {
+          push_expected_type(ctx, variant.fields[target_idx].ty)
+          let lowered = lower_expr_range(ctx, tokens, cur + 2, a_end, file, in_pattern).trim()
+          pop_expected_type(ctx)
+          lowered
+        }
+        slots[target_idx] = val_s
+        filled[target_idx] = true
+      }
+    } else if a_end > cur {
+      // Positional argument: bind to next unfilled positional (unlabeled) slot
+      while next_pos < nfields && (filled[next_pos] || variant.fields[next_pos].label.length() > 0) {
+        next_pos = next_pos + 1
+      }
+      if next_pos >= nfields {
+        ctx.diags.push(diag_error(
+          "MBT2PION_ENUM_LABEL_ERROR",
+          file,
+          tokens[cur].line,
+          tokens[cur].col,
+          "too many positional arguments for enum variant `" + schema.name + "::" + variant.name + "`",
+        ))
+      } else {
+        push_expected_type(ctx, variant.fields[next_pos].ty)
+        let lowered = lower_expr_range(ctx, tokens, cur, a_end, file, in_pattern).trim()
+        pop_expected_type(ctx)
+        slots[next_pos] = lowered
+        filled[next_pos] = true
+        next_pos = next_pos + 1
+      }
+    }
+    cur = a_end + 1
+  }
+  let ordered : Array[String] = []
+  let mut k = 0
+  while k < nfields {
+    if filled[k] {
+      ordered.push(slots[k])
+    } else if in_pattern && (has_rest || variant.fields[k].label.length() > 0) {
+      ordered.push("_")
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_ENUM_LABEL_ERROR",
+        file,
+        line,
+        col,
+        "missing required field `" + (if variant.fields[k].label.length() > 0 { variant.fields[k].label } else { "#" + k.to_string() }) + "` for enum variant `" + schema.name + "::" + variant.name + "`",
+      ))
+      ordered.push("_")
+    }
+    k = k + 1
+  }
+  "(" + join_comma(ordered) + ")"
+}
+
+///| Check external enum visibility (`can_construct` / `can_match`) and optionally lower labeled args.
+///| Returns `Some(args_str)` if labeled/reordered args were produced, or `None` for normal lowering.
+fn check_and_lower_enum_site(
+  ctx : StageAContext,
+  pkg_hint : String,
+  enum_hint : String,
+  ctor_name : String,
+  tokens : Array[Token],
+  open_p : Int,
+  close_p : Int,
+  file : String,
+  line : Int,
+  col : Int,
+  in_pattern : Bool,
+) -> Option[String] {
+  let has_lbl = open_p >= 0 && paren_has_labeled_arg(tokens, open_p, close_p)
+  match resolve_enum_schema_for_site(ctx, pkg_hint, enum_hint, ctor_name) {
+    Some((sch, variant)) => {
+      if sch.pkg.length() > 0 {
+        if !in_pattern && !sch.can_construct {
+          ctx.diags.push(diag_error(
+            "MBT2PION_DEP_ABI_ERROR",
+            file,
+            line,
+            col,
+            "cannot construct readonly `pub enum` variant `" + sch.pkg + "::" + sch.name + "::" + variant.name + "` from outside its package",
+          ))
+        } else if in_pattern && !sch.can_match {
+          ctx.diags.push(diag_error(
+            "MBT2PION_DEP_ABI_ERROR",
+            file,
+            line,
+            col,
+            "cannot pattern-match private enum variant `" + sch.pkg + "::" + sch.name + "::" + variant.name + "`",
+          ))
+        }
+      }
+      if open_p < 0 {
+        return None
+      }
+      let mut schema_has_labels = false
+      for f in variant.fields {
+        if f.label.length() > 0 {
+          schema_has_labels = true
+          break
+        }
+      }
+      if has_lbl || schema_has_labels {
+        return Some(lower_labeled_enum_args(ctx, sch, variant, tokens, open_p, close_p, file, line, col, in_pattern))
+      }
+      None
+    }
+    None => {
+      if has_lbl {
+        let err_code = if pkg_hint.length() > 0 && !ctx.symtab.verified_abi_deps.contains(pkg_hint) {
+          "MBT2PION_DEP_ABI_ERROR"
+        } else {
+          "MBT2PION_ENUM_LABEL_ERROR"
+        }
+        ctx.diags.push(diag_error(
+          err_code,
+          file,
+          line,
+          col,
+          "labeled enum variant `" + ctor_name + "` requires local declaration or verified `--dep` `mbt2pion_abi.json` metadata",
+        ))
+      }
+      None
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 4. Raising-Callback Fail-Closed Gate for `retain` / `filter_map` (§5)
+// ---------------------------------------------------------------------------
+
+fn check_non_raising_callback(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  arg_s : Int,
+  arg_e : Int,
+  method_name : String,
+  file : String,
+  line : Int,
+  col : Int,
+) -> Unit {
+  if arg_s >= arg_e {
+    return
+  }
+  // 1. Named function reference `f` or `@pkg.f`
+  if arg_e == arg_s + 1 && tokens[arg_s].kind == TokenKind::Ident {
+    let fname = tokens[arg_s].raw
+    if ctx.symtab.local_raising_fns.contains(fname) || ctx.symtab.dep_raising_fns.contains(fname) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        line,
+        col,
+        "passing raising function `" + fname + "` as callback to `." + method_name + "(...)` is not supported (fail-closed)",
+      ))
+      return
+    }
+  }
+  if arg_e == arg_s + 3 && tokens[arg_s].kind == TokenKind::PkgRef && tokens[arg_s + 1].kind == TokenKind::Dot {
+    let raw_pkg = tokens[arg_s].raw.slice(1, tokens[arg_s].raw.length())
+    let qname = raw_pkg + "::" + tokens[arg_s + 2].raw
+    if ctx.symtab.dep_raising_fns.contains(qname) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        line,
+        col,
+        "passing raising function `@" + raw_pkg + "." + tokens[arg_s + 2].raw + "` as callback to `." + method_name + "(...)` is not supported (fail-closed)",
+      ))
+      return
+    }
+  }
+  // 2. Inline closure/arrow fn: scan body for `raise`, unshadowed `fail(...)`, or calls to known raising fns
+  let mut k = arg_s
+  while k < arg_e {
+    let tk = tokens[k]
+    if (tk.kind == TokenKind::Keyword || tk.kind == TokenKind::Ident) && tk.raw == "raise" {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tk.line,
+        tk.col,
+        "raising callback passed to `." + method_name + "(...)` is not supported (fail-closed)",
+      ))
+      return
+    }
+    if tk.kind == TokenKind::Ident && tk.raw == "fail" && k + 1 < arg_e && tokens[k + 1].kind == TokenKind::LParen &&
+    !ctx.symtab.local_fn_names.contains("fail") && !(lookup_scope_var(ctx, "fail") is Some(_)) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tk.line,
+        tk.col,
+        "callback calling `fail(...)` passed to `." + method_name + "(...)` is not supported (fail-closed)",
+      ))
+      return
+    }
+    if tk.kind == TokenKind::Ident && k + 1 < arg_e && tokens[k + 1].kind == TokenKind::LParen &&
+    (ctx.symtab.local_raising_fns.contains(tk.raw) || ctx.symtab.dep_raising_fns.contains(tk.raw)) {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tk.line,
+        tk.col,
+        "callback calling raising function `" + tk.raw + "` passed to `." + method_name + "(...)` is not supported (fail-closed)",
+      ))
+      return
+    }
+    k = k + 1
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 5. Recursive Nested Tuple-Struct Destructuring (`let W(V(p, q), name) = w`)
+// ---------------------------------------------------------------------------
+
+fn emit_tuple_struct_destructure(
+  ctx : StageAContext,
+  sb : StringBuilder,
+  val_expr : String,
+  tokens : Array[Token],
+  pi : Int,
+  pe : Int,
+  file : String,
+) -> Unit {
+  if pi >= pe {
+    return
+  }
+  if pi + 1 < pe && tokens[pi].kind == TokenKind::UpperIdent &&
+  ctx.symtab.tuple_structs.contains(tokens[pi].raw) && tokens[pi + 1].kind == TokenKind::LParen {
+    let cp = find_matching_delim(tokens, pi + 1)
+    if cp == pe - 1 {
+      let inner_tmp = fresh_temp(ctx, "ts")
+      sb.write_string("; let " + inner_tmp + " = " + val_expr)
+      let mut si = pi + 2
+      let mut fidx = 0
+      while si < cp {
+        if tokens[si].kind == TokenKind::Comma {
+          si = si + 1
+          continue
+        }
+        if tokens[si].kind == TokenKind::DotDot {
+          break
+        }
+        let mut se = si
+        let mut sd = 0
+        while se < cp {
+          let sk = tokens[se].kind
+          if sk == TokenKind::LParen || sk == TokenKind::LBracket || sk == TokenKind::LBrace { sd = sd + 1 }
+          else if sk == TokenKind::RParen || sk == TokenKind::RBracket || sk == TokenKind::RBrace { sd = sd - 1 }
+          else if sd == 0 && sk == TokenKind::Comma { break }
+          se = se + 1
+        }
+        emit_tuple_struct_destructure(ctx, sb, inner_tmp + "._" + fidx.to_string(), tokens, si, se, file)
+        fidx = fidx + 1
+        si = se + 1
+      }
+      return
+    }
+  }
+  let pat_s = lower_expr_range(ctx, tokens, pi, pe, file, true).trim()
+  if pat_s.length() > 0 && pat_s != "_" {
+    sb.write_string("; let " + pat_s + " = " + val_expr)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 6. Generic Bounds Lowering (`[K : Hash + Eq]` -> `[K : mbt_compat::MbtHash + Eq + mbt_compat::MapKey]`)
+// ---------------------------------------------------------------------------
+
+fn lower_generic_bounds_brackets(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  open_b : Int,
+  close_b : Int,
+  file : String,
+) -> String {
+  let params : Array[String] = []
+  let mut cur = open_b + 1
+  while cur < close_b {
+    if tokens[cur].kind == TokenKind::Comma {
+      cur = cur + 1
+      continue
+    }
+    let mut pe = cur
+    let mut pd = 0
+    while pe < close_b {
+      let pk = tokens[pe].kind
+      if pk == TokenKind::LParen || pk == TokenKind::LBracket || pk == TokenKind::LBrace { pd = pd + 1 }
+      else if pk == TokenKind::RParen || pk == TokenKind::RBracket || pk == TokenKind::RBrace { pd = pd - 1 }
+      else if pd == 0 && pk == TokenKind::Comma { break }
+      pe = pe + 1
+    }
+    if pe > cur {
+      // Find depth-0 `:` separating type param name from bounds
+      let mut col_i = -1
+      let mut k = cur
+      let mut bd = 0
+      while k < pe {
+        let kk = tokens[k].kind
+        if kk == TokenKind::LParen || kk == TokenKind::LBracket || kk == TokenKind::LBrace { bd = bd + 1 }
+        else if kk == TokenKind::RParen || kk == TokenKind::RBracket || kk == TokenKind::RBrace { bd = bd - 1 }
+        else if bd == 0 && kk == TokenKind::Colon { col_i = k; break }
+        k = k + 1
+      }
+      if col_i > cur && col_i + 1 < pe {
+        let tp_name = tokens[cur].raw
+        let mut has_hash = false
+        let mut has_eq = false
+        let bounds : Array[String] = []
+        let mut bs = col_i + 1
+        while bs < pe {
+          if tokens[bs].kind == TokenKind::Plus {
+            bs = bs + 1
+            continue
+          }
+          let mut be = bs
+          let mut bdepth = 0
+          while be < pe {
+            let bk = tokens[be].kind
+            if bk == TokenKind::LParen || bk == TokenKind::LBracket || bk == TokenKind::LBrace { bdepth = bdepth + 1 }
+            else if bk == TokenKind::RParen || bk == TokenKind::RBracket || bk == TokenKind::RBrace { bdepth = bdepth - 1 }
+            else if bdepth == 0 && bk == TokenKind::Plus { break }
+            be = be + 1
+          }
+          if be > bs {
+            let raw_b = lower_type_tokens_checked(ctx, tokens, bs, be, file).trim()
+            if raw_b == "Hash" && !ctx.symtab.local_types.contains("Hash") {
+              has_hash = true
+              bounds.push("mbt_compat::MbtHash")
+            } else if raw_b == "Eq" && !ctx.symtab.local_types.contains("Eq") {
+              has_eq = true
+            } else {
+              bounds.push(raw_b)
+            }
+          }
+          bs = be + 1
+        }
+        if has_hash && has_eq {
+          bounds.push("mbt_compat::MapKey")
+        }
+        if bounds.length() == 0 {
+          params.push(tp_name)
+        } else {
+          let bsb = StringBuilder()
+          let mut bi = 0
+          while bi < bounds.length() {
+            if bi > 0 { bsb.write_string(" + ") }
+            bsb.write_string(bounds[bi])
+            bi = bi + 1
+          }
+          params.push(tp_name + " : " + bsb.to_string())
+        }
+      } else {
+        params.push(lower_type_tokens_checked(ctx, tokens, cur, pe, file).trim())
+      }
+    }
+    cur = pe + 1
+  }
+  "[" + join_comma(params) + "]"
+}

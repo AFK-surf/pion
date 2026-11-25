@@ -1619,12 +1619,15 @@ test "Wave M1.2 A.1: .val probes, collision-free struct val/val_, exact Ref type
   )
   let v_out = res_v.files[0].content
   assert_true(str_has(v_out, "let __mbt_r = get_ref(); __mbt_r.v = __mbt_r.v + (1)"), "complex receiver compound += evaluates once: " + v_out)
-  assert_true(str_has(v_out, "other_ref.val_ = 2") && !str_has(v_out, "other_ref.v "), "foreign otherpkg::Ref is NOT rewritten as myref::Ref: " + v_out)
+  assert_true(!str_has(v_out, "other_ref.v ") && !str_has(v_out, "other_ref.val_ "), "foreign otherpkg::Ref is NOT rewritten as myref::Ref and never falls back to val_: " + v_out)
   let mut saw_undisposed = false
+  let mut saw_dep_abi = false
   for d in res_v.diagnostics {
     if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" { saw_undisposed = true }
+    if d.code == "MBT2PION_DEP_ABI_ERROR" { saw_dep_abi = true }
   }
   assert_true(saw_undisposed, "unresolved probe still emits MBT2PION_UNDISPOSED_PROBE_SITE")
+  assert_true(saw_dep_abi, "unmapped foreign otherpkg::Ref emits MBT2PION_DEP_ABI_ERROR")
   assert_true(res_v.probe_dispositions.length() >= 3, "every probe ID has a recorded disposition")
 }
 
@@ -2857,4 +2860,250 @@ test "Wave M2-B: slices, rest array pats, StringView/Bytes loop, MbtJson+catch, 
     empty_check,
   )
   assert_true(flt_low_res.blockers >= 2 && flt_low_res.diagnostics[0].code == "MBT2PION_UNSUPPORTED_SYNTAX", "Lowercase f suffix on decimal and hex float literals fails closed")
+}
+
+test "Upper-tier transpiler regressions: .val site-binding, slices, JSON literals, Set/MapKey, ABI, labeled enums, try/fail/surrogates, [comments]" {
+  let empty_check = fn(_b : Array[(String, String)]) -> String { "{\"ok\":true,\"diagnostics\":[]}" }
+
+  // 1. §1: Struct with `val`/`val_`/`__mbt_val`/`__mbt_val_p1` + string `"__mbt_val_p1"` + negative undisposed placeholder gate
+  let val_src =
+  "pub(all) struct Weird {\n" +
+  "  mut val : Int\n" +
+  "  val_ : Int\n" +
+  "  __mbt_val : Int\n" +
+  "  __mbt_val_p1 : Int\n" +
+  "}\n" +
+  "pub fn read_w(w : Weird) -> (Int, String) {\n" +
+  "  (w.val + w.val_ + w.__mbt_val + w.__mbt_val_p1, \"__mbt_val_p1\")\n" +
+  "}\n"
+  let val_res_neg = transpile_package(
+    [SourceFile::{ rel_path: "w.mbt", content: val_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  // Without Stage A.5 running, the registered placeholder MUST trigger MBT2PION_UNDISPOSED_PROBE_SITE
+  // while NEVER colliding with user's `__mbt_val_p1` field or string literal!
+  let val_out_neg = val_res_neg.files[0].content
+  assert_true(!str_has(val_out_neg, "w.val "), "Stage A never emits bare .val")
+  assert_true(str_has(val_out_neg, "w.__mbt_val_p1") && str_has(val_out_neg, "\"__mbt_val_p1\""), "user field & string literal untouched")
+  assert_true(val_res_neg.blockers > 0, "undisposed registered placeholder fails closed")
+  let mut saw_undisp = false
+  for d in val_res_neg.diagnostics {
+    if d.code == "MBT2PION_UNDISPOSED_PROBE_SITE" { saw_undisp = true }
+  }
+  assert_true(saw_undisp, "pipeline disposal gate emits MBT2PION_UNDISPOSED_PROBE_SITE")
+
+  // 2. §2: Bytes::from_array & String::from_array direct slice vs wrapped f(a[1:3]) + StringBuilder(capacity=...)
+  let sl_src =
+  "pub fn f_ok(a : Array[Byte], cs : Array[Char], n : Int) -> (Bytes, String, StringBuilder) {\n" +
+  "  (Bytes::from_array(a[1:3]), String::from_array(cs[1:]), StringBuilder(capacity=n))\n" +
+  "}\n" +
+  "pub fn f_bad(a : Array[Byte], id : (ArrayView[Byte]) -> Array[Byte]) -> Bytes {\n" +
+  "  Bytes::from_array(id(a[1:3]))\n" +
+  "}\n"
+  let sl_res = transpile_package(
+    [SourceFile::{ rel_path: "sl.mbt", content: sl_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  let sl_out = sl_res.files[0].content
+  assert_true(str_has(sl_out, "mbt_compat::bytes_from_array(mbt_compat::__mbt_slice_owned(a, 1, 3))"), "Bytes::from_array direct slice marked owned")
+  assert_true(str_has(sl_out, "mbt_compat::str_from_char_array(mbt_compat::__mbt_slice_owned(cs, 1, cs.length()))"), "String::from_array direct slice marked owned")
+  assert_true(str_has(sl_out, "{ let _ = n; StringBuilder() }"), "StringBuilder(capacity=n) preserves side effects")
+  assert_true(str_has(sl_out, "id(mbt_compat::__mbt_slice_borrow(a, 1, 3))"), "wrapped f(a[1:3]) stays borrowed")
+
+  // 3. §4: Recursive MoonBit JSON literals under expected MbtJson (-0, 20-digit int, {}, [])
+  let j_src =
+  "pub fn mk_json(flag : Bool) -> Json {\n" +
+  "  { \"neg0\": -0, \"big\": 12345678901234567000, \"arr\": [1, []], \"obj\": {}, \"b\": if flag { true } else { false }, \"n\": null }\n" +
+  "}\n"
+  let j_res = transpile_package(
+    [SourceFile::{ rel_path: "j.mbt", content: j_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(j_res.blockers, 0)
+  let j_out = j_res.files[0].content
+  assert_true(str_has(j_out, "0x8000000000000000UL"), "-0 bit pattern preserved")
+  assert_true(str_has(j_out, "MbtJson::Object(mbt_compat::ordered_map_new())"), "empty {} lowered to MbtJson::Object")
+  assert_true(str_has(j_out, "MbtJson::Array([])"), "empty [] lowered to MbtJson::Array")
+  assert_true(str_has(j_out, "MbtJson::Null") && str_has(j_out, "MbtJson::True") && str_has(j_out, "MbtJson::False"), "null/true/false lowered")
+
+  // 4. §5: Set[T] -> OrderedSet[T], [K : Hash + Eq] -> MbtHash + Eq + MapKey, #derive(Eq, Hash) -> impl MapKey, raising cb fail-closed
+  let set_src =
+  "#derive(Eq, Hash)\n" +
+  "pub(all) struct Key { x : Int }\n" +
+  "pub fn[K : Hash + Eq] use_k(k : K) -> (Int, Set[K]) {\n" +
+  "  let s : Set[K] = Set::new()\n" +
+  "  s.add(k)\n" +
+  "  (Hash::hash(k), s)\n" +
+  "}\n"
+  let set_res = transpile_package(
+    [SourceFile::{ rel_path: "st.mbt", content: set_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(set_res.blockers, 0)
+  let set_out = set_res.files[0].content
+  assert_true(str_has(set_out, "impl mbt_compat::MapKey for Key"), "#derive(Eq, Hash) emits impl MapKey")
+  assert_true(str_has(set_out, "K : mbt_compat::MbtHash + mbt_compat::MapKey"), "[K : Hash + Eq] lowers to MbtHash + MapKey")
+  assert_true(str_has(set_out, "mbt_compat::OrderedSet[K]") && str_has(set_out, "mbt_compat::ordered_set_new()"), "Set lowers to OrderedSet")
+
+  let rcb_src =
+  "fn bad_pred(x : Int) -> Bool raise { x > 0 }\n" +
+  "pub fn test_rcb(xs : Array[Int]) -> Unit { xs.retain(bad_pred) }\n"
+  let rcb_res = transpile_package(
+    [SourceFile::{ rel_path: "rcb.mbt", content: rcb_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(rcb_res.blockers > 0, "raising callback to retain fails closed")
+
+  // 5. §6: Labeled enum declaration-order reorder, readonly pub enum ABI, bidirectional SHA-256 tamper detection
+  let enum_src =
+  "pub(all) enum Ev {\n" +
+  "  Pair(a~ : Int, b~ : String)\n" +
+  "  Mix(Int, tag~ : String)\n" +
+  "}\n" +
+  "pub enum Readonly {\n" +
+  "  Secret(Int)\n" +
+  "}\n" +
+  "pub fn mk() -> (Ev, Ev, Int) {\n" +
+  "  let e1 = Pair(b=\"hi\", a=1)\n" +
+  "  let e2 = Mix(tag=\"t\", 2)\n" +
+  "  let n = match e1 { Pair(a=x, ..) => x, _ => 0 }\n" +
+  "  (e1, e2, n)\n" +
+  "}\n"
+  let enum_res = transpile_package(
+    [SourceFile::{ rel_path: "ev.mbt", content: enum_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(enum_res.blockers, 0)
+  let enum_out = enum_res.files[0].content
+  assert_true(str_has(enum_out, "Pair(1, \"hi\")"), "labeled enum args reordered directly into declaration order")
+  assert_true(str_has(enum_out, "Mix(2, \"t\")"), "mixed positional + labeled enum args reordered directly")
+  assert_true(str_has(enum_out, "Pair(x, _)"), "omitted labeled enum pattern field filled with _")
+  assert_true(str_has(enum_out, "// abi-sha256: " + enum_res.abi_sha256), "abi-sha256 embedded in header")
+  // Verify bidirectional ABI check passes on clean output and fails on sidecar-only tamper
+  let abi_json = render_abi_json(enum_res.abi, [(enum_res.files[0].rel_path, enum_out)])
+  let v_diags1 : Array[Diag] = []
+  let parsed_ok = verify_and_parse_dep_abi("evpkg", "evpkg", [(enum_res.files[0].rel_path, enum_out)], Some(abi_json), v_diags1)
+  assert_true(parsed_ok is Some(_) && v_diags1.length() == 0, "clean ABI passes bidirectional verification")
+  let tampered_abi = str_replace_all(abi_json, "\"can_construct\":false", "\"can_construct\":true")
+  let v_diags2 : Array[Diag] = []
+  let parsed_bad = verify_and_parse_dep_abi("evpkg", "evpkg", [(enum_res.files[0].rel_path, enum_out)], Some(tampered_abi), v_diags2)
+  assert_true(parsed_bad is None && v_diags2.length() > 0 && v_diags2[0].code == "MBT2PION_DEP_ABI_ERROR", "tampered sidecar fails closed")
+
+  // 6. §7: ..<=, brace-less try, effect-safe fail, UTF-16 surrogates, nested tuple struct let
+  let p7_src =
+  "struct V(Int, Int)\n" +
+  "struct W(V, String)\n" +
+  "pub fn demo7(w : W, s : String) -> (Int, Option[Json], String) {\n" +
+  "  let W(V(p, q), _) = w\n" +
+  "  let mut acc = p + q\n" +
+  "  for i in 0..<=3 { acc = acc + i }\n" +
+  "  let j = try Some(@json.parse(s)) catch { _ => None }\n" +
+  "  (acc, j, \"\\uD83D\\uDE00\\\\uD800\")\n" +
+  "}\n"
+  let p7_res = transpile_package(
+    [SourceFile::{ rel_path: "p7.mbt", content: p7_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(p7_res.blockers, 0)
+  let p7_out = p7_res.files[0].content
+  assert_true(str_has(p7_out, "0..=3"), "..<= in for lowered to ..=")
+  assert_true(str_has(p7_out, "mbt_compat::mbt_json_parse(s)"), "brace-less try Some(@json.parse(s)) catch lowered")
+  assert_true(str_has(p7_out, "\\u{1F600}\\\\uD800"), "surrogate pair merged and escaped \\\\uD800 preserved")
+
+  // Lone surrogate & closure fail() fail closed
+  let bad7_src = "pub fn bad_surr() -> String { \"\\uD800\" }\npub fn bad_cl() -> () -> Unit { () => fail(\"x\") }\n"
+  let bad7_res = transpile_package(
+    [SourceFile::{ rel_path: "bad7.mbt", content: bad7_src, is_test: false }],
+    empty_api_map(),
+    default_recipes(),
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_true(bad7_res.blockers >= 2, "lone surrogate and closure fail() fail closed")
+
+  // 7. §8: [comments] redaction (longest-match single-pass, code/header invariant, invalid recipe errors)
+  let c_diags : Array[Diag] = []
+  let c_rec = parse_recipes_toml(
+    "[comments]\nreplace = [{ from = \"foo_bar\", to = \"baz\" }, { from = \"foo\", to = \"qux\" }]\n",
+    "recipes.toml",
+    c_diags,
+  )
+  assert_eq(c_diags.length(), 0)
+  let c_src = "// comment foo_bar and foo\npub fn foo_bar() -> String { \"foo_bar\" }\n"
+  let c_res = transpile_package(
+    [SourceFile::{ rel_path: "c.mbt", content: c_src, is_test: false }],
+    empty_api_map(),
+    c_rec,
+    [],
+    [],
+    default_options(),
+    [],
+    false,
+    empty_check,
+  )
+  assert_eq(c_res.blockers, 0)
+  let c_out = c_res.files[0].content
+  assert_true(str_has(c_out, "// comment baz and qux"), "comment body redacted longest-first")
+  assert_true(str_has(c_out, "pub fn foo_bar() -> String { \"foo_bar\" }"), "code and string literal untouched by [comments]")
+
+  let bad_c_diags : Array[Diag] = []
+  let _ = parse_recipes_toml(
+    "[comments]\nreplace = [{ from = \"\", to = \"x\" }, { from = \"a\", to = \"b\\nc\" }, { from = \"d\", to = \"e\" }, { from = \"d\", to = \"f\" }]\n",
+    "recipes.toml",
+    bad_c_diags,
+  )
+  assert_true(bad_c_diags.length() >= 3 && bad_c_diags[0].code == "MBT2PION_RECIPE_ERROR", "invalid [comments] rules emit MBT2PION_RECIPE_ERROR")
 }
