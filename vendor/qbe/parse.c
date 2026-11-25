@@ -1012,7 +1012,8 @@ parsefn(Lnk *lnk)
 		b->dlink = 0; /* was trashed by findblk() */
 	for (i=0; i<BMask+1; ++i)
 		blkh[i] = 0;
-	memset(tmph, 0, tmphcap * sizeof tmph[0]);
+	if (tmphcap) /* memset(NULL, 0, 0) is UB: a function may use no temps */
+		memset(tmph, 0, tmphcap * sizeof tmph[0]);
 	typecheck(curf);
 	return curf;
 }

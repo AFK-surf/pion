@@ -388,6 +388,8 @@ sh "$ROOT_DIR/tests/e2e/query_analyze/run_e2e.sh" "$PIONC2"
 sh "$ROOT_DIR/tests/e2e/p108_read_pair_and_byte_scan/run_e2e.sh" "$PIONC2"
 # P109: native 3..8 part concat_n Int / Int64 `.to_string()` stack scratch parts (SSA + Native + Wasm32 + ASan).
 sh "$ROOT_DIR/tests/e2e/p109_concat_scratch/run_e2e.sh" "$PIONC2"
+# P111: AArch64 seladdr local-slot [x29, #off] folding and single-use ldur/stur [base, #-1..-256] (text asm, matrix, native / qemu, Mach-O --obj == .s byte parity).
+sh "$ROOT_DIR/tests/e2e/p111_arm64_addr_opts/run_e2e.sh" "$PIONC2"
 # Track P3: opt-in single-hop `#into` converters and `into` parameter modifier (Native + Wasm32).
 sh "$ROOT_DIR/tests/e2e/p_into_callsite/run_e2e.sh" "$PIONC2"
 # P85: Hardware ROR + primitive bit-counting methods + struct/enum method call arity check.

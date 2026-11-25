@@ -221,6 +221,7 @@ enum {
 
 typedef struct {
 	uint32_t macos_ver;
+	int layout_only;
 	Sec *secs;
 	size_t nsecs;
 	size_t cap_secs;
@@ -831,6 +832,12 @@ me_loadaddr(Con *c, int rd_r)
 {
 	uint32_t rd = greg(rd_r);
 	const char *l = str(c->sym.id);
+	if (M.layout_only) {
+		/* All Apple symbol addresses use adrp followed by add or ldr. */
+		emit_u32(0);
+		emit_u32(0);
+		return;
+	}
 	uint32_t sym = sym_ref_qbe(l, "");
 	int64_t off = c->bits.i;
 	uint32_t pc;
@@ -948,7 +955,7 @@ me_fixarg(Ref *pr, int sz, int t, ME *e)
 	Ref r = *pr;
 	if (rtype(r) == RSlot) {
 		uint64_t s = me_slot(r, e);
-		if (s > (uint64_t)sz * 4095u) {
+		if (s > (uint64_t)sz * 4095u || s % sz != 0) {
 			if (t < 0)
 				return 1;
 			Ins i = { .op = Oaddr, .cls = Kl, .to = TMP(t), .arg = { r, R } };
@@ -982,7 +989,13 @@ me_emit_mem(uint32_t imm_base_op, uint32_t reg_base_op, uint32_t rt, int sz, Ref
 		uint32_t rn = greg(m->base.val);
 		if (req(m->index, R)) {
 			int64_t off = m->offset.bits.i;
-			assert(off >= 0 && (off % sz) == 0 && (off / sz) <= 4095);
+			if (off < 0) {
+				assert(off >= -256);
+				uint32_t imm9 = (uint32_t)off & 0x1ffu;
+				emit_u32((imm_base_op & ~(1u << 24)) | (imm9 << 12) | (rn << 5) | rt);
+				break;
+			}
+			assert((off % sz) == 0 && (off / sz) <= 4095);
 			uint32_t imm12 = (uint32_t)(off / sz);
 			emit_u32(imm_base_op | (imm12 << 10) | (rn << 5) | rt);
 		} else {
@@ -1446,6 +1459,10 @@ me_emitins(Ins *i, ME *e)
 			Con *c = &e->fn->con[i->arg[0].val];
 			if (c->type != CAddr || (c->sym.type & SThr) || c->bits.i)
 				die("macho: invalid call argument");
+			if (M.layout_only) {
+				emit_u32(0);
+				break;
+			}
 			uint32_t sym = sym_ref_qbe(str(c->sym.id), "");
 			uint32_t pc = text_pos();
 			emit_u32(0x94000000u); /* bl sym */
@@ -1515,7 +1532,7 @@ me_mem_base_off(Ref r, Fn *fn, int *base_out, int64_t *off_out)
 	}
 	if (rtype(r) == RMem) {
 		Mem *m = &fn->mem[r.val];
-		if (isreg(m->base) && req(m->index, R) && m->offset.type == CBits) {
+		if (isreg(m->base) && req(m->index, R) && m->offset.type == CBits && m->offset.bits.i >= 0) {
 			*base_out = m->base.val;
 			*off_out = m->offset.bits.i;
 			return 1;
@@ -2197,6 +2214,23 @@ arm64_macho_fn1(Fn *fn, int far, uint64_t *gpr_out)
 	free(e.fixups);
 	free(e.jtfixups);
 	return 0;
+}
+
+/* Large text functions need the same branch-distance decision as --obj.
+ * The coarse bound keeps ordinary functions on the single-pass path.
+ * A private text section is enough: symbol references need only their size. */
+int
+arm64_macho_needs_far(Fn *fn, uint64_t *gpr_out)
+{
+	Sec scratch = {0};
+	assert(!M.secs);
+	M.layout_only = 1;
+	M.secs = &scratch;
+	int far = arm64_macho_fn1(fn, 0, gpr_out);
+	M.secs = 0;
+	M.layout_only = 0;
+	free(scratch.buf.data);
+	return far;
 }
 
 void

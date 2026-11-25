@@ -18,6 +18,7 @@ import PionProofs.QbeCompileSpeedOpts
 import PionProofs.QbeConcatScratch
 import PionProofs.QbeCompileSpeedOpts2
 import PionProofs.QbeFrontendSpeedOpts
+import PionProofs.QbeArm64AddrOpts
 
 #print axioms PionProofs.CodecP.pack_unpack_roundtrip
 #print axioms PionProofs.CodecP.pack_rejects_invalid
@@ -569,3 +570,16 @@ import PionProofs.QbeFrontendSpeedOpts
 #print axioms PionQbeFrontendSpeedOpts.accepted_prefix
 #print axioms PionQbeFrontendSpeedOpts.ascii_range
 #print axioms PionQbeFrontendSpeedOpts.length_partition
+#print axioms PionQbeArm64AddrOpts.slot_fold
+#print axioms PionQbeArm64AddrOpts.slot_private_boundary
+#print axioms PionQbeArm64AddrOpts.slot_same_access
+#print axioms PionQbeArm64AddrOpts.slot_scaled_field
+#print axioms PionQbeArm64AddrOpts.imm9_roundtrip
+#print axioms PionQbeArm64AddrOpts.imm9_sub_address
+#print axioms PionQbeArm64AddrOpts.imm9_add_address
+#print axioms PionQbeArm64AddrOpts.imm9_sub_access
+#print axioms PionQbeArm64AddrOpts.imm9_field_unsigned32
+#print axioms PionQbeArm64AddrOpts.imm19_signed_field
+#print axioms PionQbeArm64AddrOpts.branch_same_edge
+#print axioms PionQbeArm64AddrOpts.branch_targets
+#print axioms PionQbeArm64AddrOpts.logical_move

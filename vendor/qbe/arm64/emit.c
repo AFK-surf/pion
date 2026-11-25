@@ -426,8 +426,15 @@ loadcon(Con *c, int r, int k, E *e)
 	}
 	if (!w)
 		n = (int32_t)n;
-	if ((n | 0xffff) == -1 || arm64_logimm(n, k)) {
+	if (n >= 0 && n <= 0xffff) {
 		fprintf(e->f, "\tmov\t%s, #%"PRIi64"\n", rn, n);
+	} else if ((n | 0xffff) == -1) {
+		/* Spell movn like macho.c: `mov w, #-65536` may assemble as movz. */
+		fprintf(e->f, "\tmovn\t%s, #%u\n", rn, (uint)(~n & 0xffff));
+	} else if (arm64_logimm(n, k)) {
+		/* A mov alias may assemble as a different move-wide instruction. */
+		fprintf(e->f, "\torr\t%s, %s, #0x%"PRIx64"\n", rn,
+			w ? "xzr" : "wzr", w ? (uint64_t)n : (uint32_t)n);
 	} else {
 		fprintf(e->f, "\tmov\t%s, #%d\n",
 			rn, (int)(n & 0xffff));
@@ -452,7 +459,7 @@ fixarg(Ref *pr, int sz, int t, E *e)
 	r = *pr;
 	if (rtype(r) == RSlot) {
 		s = slot(r, e);
-		if (s > sz * 4095u) {
+		if (s > sz * 4095u || s % sz != 0) {
 			if (t < 0)
 				return 1;
 			i = &(Ins){Oaddr, Kl, TMP(t), {r}};
@@ -686,7 +693,7 @@ arm64_mem_base_off(Ref r, Fn *fn, int *base_out, int64_t *off_out)
 	}
 	if (rtype(r) == RMem) {
 		Mem *m = &fn->mem[r.val];
-		if (isreg(m->base) && req(m->index, R) && m->offset.type == CBits) {
+		if (isreg(m->base) && req(m->index, R) && m->offset.type == CBits && m->offset.bits.i >= 0) {
 			*base_out = m->base.val;
 			*off_out = m->offset.bits.i;
 			return 1;
@@ -909,7 +916,10 @@ arm64_emitfn(Fn *fn, FILE *out)
 	E *e;
 
 	e = &(E){.f = out, .fn = fn};
+	uint64_t *gpr_out = arm64_compute_gpr_out(fn);
 	far = (arm64_est_fn_bytes(fn) >= 983040u);
+	if (far && T.apple)
+		far = arm64_macho_needs_far(fn, gpr_out);
 	if (T.apple)
 		e->fn->lnk.align = 4;
 	emitfnlnk(e->fn->name, &e->fn->lnk, e->f);
@@ -981,7 +991,6 @@ arm64_emitfn(Fn *fn, FILE *out)
 		}
 	}
 
-	uint64_t *gpr_out = arm64_compute_gpr_out(e->fn);
 	for (lbl=0, b=e->fn->start; b; b=b->link) {
 		uint64_t live_out = gpr_out[b->id];
 		Ins *cbz_ins = can_fuse_cbz(b, e->fn);
