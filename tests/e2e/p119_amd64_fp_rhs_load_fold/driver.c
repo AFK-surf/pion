@@ -1,6 +1,6 @@
 /* P119 IEEE-754 bit and exception-flag differential for fold.ssa.
  *
- * Every function of fold.ssa except n_const_subd (see below) runs over
+ * Every function of fold.ssa runs over
  *   4 rounding modes x 16 x 16 boundary values (left operand x memory operand)
  *   x 2 misaligned memory offsets (+1, +3)
  * and is compared with an independent C reference: the exact result bits
@@ -12,9 +12,13 @@
  * compared byte for byte; mismatches (the first 40) and the summary go to
  * stderr, and any mismatch makes the exit status 1.
  *
- * n_const_subd (`1.5 - [p]`) is only checked structurally: QBE lowers it,
- * unchanged by the fold, as `neg; add`, which equals the subtraction in
- * IEEE-754 except for the sign of a NaN result (unspecified by IEEE-754).
+ * Every comparison is exact except one: n_const_subd (`1.5 - [p]`), which
+ * QBE lowers, unchanged by the fold, as `neg; add`. That equals the
+ * subtraction in IEEE-754 except for the sign of a NaN result, which
+ * IEEE-754 leaves unspecified, so there a NaN result only has to be a NaN
+ * (flags and memory are still exact). The folded functions, including
+ * p_sub<k>_dst whose unfolded allocation took that `neg; add` path, are
+ * compared bit for bit with direct subs<k> / divs<k> C code.
  *
  * Build with -ffp-contract=off -frounding-math (and -fsignaling-nans with
  * GCC); the reference operations read volatile operands and store a volatile
@@ -43,7 +47,10 @@ extern D p_subd_slot(D, const void *, long, long), p_divd_slot(D, const void *, 
 extern F p_subs_hp(const void *, const void *, void *), p_divs_hp(const void *, const void *, void *);
 extern D p_subd_hp(const void *, const void *, void *), p_divd_hp(const void *, const void *, void *);
 extern D n_side0_subd(D, D, const void *);
-extern F n_side0_divs(F, const void *);
+extern F n_side0_divs(F, F, const void *);
+extern D p_subd_dst(D, D, const void *);
+extern F p_subs_dst(F, F, const void *);
+extern D n_const_subd(const void *);
 extern D n_self_subd(D, const void *);
 extern F n_multi_divs(F, const void *, void *);
 extern D n_store_subd(D, void *, D);
@@ -135,7 +142,16 @@ static void run_d(int m, unsigned i, unsigned j, unsigned off, uint64_t xb, uint
   CASE("p_divd_idx", p_divd_idx(x, p, 3), rdiv_d(x, mv), 3 * 8 + 8);
   CASE("p_subd_slot", p_subd_slot(x, p, 2, 2), rsub_d(x, mv), 0);
   CASE("p_divd_slot", p_divd_slot(x, p, 2, 2), rdiv_d(x, mv), 0);
-  CASE("n_side0_subd", n_side0_subd(mv, x, p), rsub_d(mv, x), 0);
+  /* y (unused) differs from [p], so a dropped load changes the result. */
+  CASE("n_side0_subd", n_side0_subd(fd(DV[(j + 7) % 16]), x, p), rsub_d(mv, x), 0);
+  CASE("p_subd_dst", p_subd_dst(fd(DV[(j + 7) % 16]), x, p), rsub_d(x, mv), 0);
+  {
+    /* n_const_subd: 1.5 - [p]; a NaN result only has to be a NaN. */
+    PUT(0); CLR(); D r = n_const_subd(p); q.flags = FLAGS(); q.bits = bd(r); q.mem = digest(buf, sizeof buf);
+    PUT(0); CLR(); D cr = rsub_d(1.5, mv); c.flags = FLAGS(); c.bits = bd(cr); c.mem = digest(buf, sizeof buf);
+    if (r != r && cr != cr) c.bits = q.bits;
+    report("n_const_subd", m, i, j, off, q, c);
+  }
   CASE("n_self_subd", n_self_subd(x, p), rsub_d(mv, mv), 0);
   {
     /* n_width_sd: x - (double)[p as float], over the f32 grid. */
@@ -203,7 +219,8 @@ static void run_s(int m, unsigned i, unsigned j, unsigned off, uint32_t xb, uint
   CASE("p_divs_idx", p_divs_idx(x, p, 5), rdiv_s(x, mv), 5 * 4 + 8);
   CASE("p_subs_slot", p_subs_slot(x, p, 3, 3), rsub_s(x, mv), 0);
   CASE("p_divs_slot", p_divs_slot(x, p, 3, 3), rdiv_s(x, mv), 0);
-  CASE("n_side0_divs", n_side0_divs(x, p), rdiv_s(mv, x), 0);
+  CASE("n_side0_divs", n_side0_divs(fs(SV[(j + 7) % 16]), x, p), rdiv_s(mv, x), 0);
+  CASE("p_subs_dst", p_subs_dst(fs(SV[(j + 7) % 16]), x, p), rsub_s(x, mv), 0);
   CASE("n_const_divs", n_const_divs(p), rdiv_s(3.0f, mv), 0);
   {
     /* n_width_ds: x / (float)[p as double]; the double is built from the f32

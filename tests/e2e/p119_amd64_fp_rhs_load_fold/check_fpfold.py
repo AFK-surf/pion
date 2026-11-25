@@ -9,6 +9,8 @@
                                        equal relocations (targets resolved to
                                        section + offset or a global symbol) and
                                        equal bytes in every section they reach
+                                       (local targets, and globals defined in
+                                       the object)
   check_fpfold.py pion LABEL FILE.s SPEC...
                                        SPEC = FUNCTION:MNEMONIC[,...]:MIN (FUNCTION
                                        `*` = the whole file): at least MIN of each
@@ -27,11 +29,16 @@ Expectations per function (the name encodes them):
                      memory operand (no leftover load of the folded value).
                      ptr: (%base); off: 24(%base); idx: 8(%base,%index,W);
                      slot: 16(%rsp|%rbp,%index,W).
+                     dst: (%base) (lhs - [p] where the unfolded load temp
+                     shares the result register).
   p_<op><k>_hp       additionally: the destination register is written last
-                     (through register copies) by a movss/movsd from a stack
-                     slot, i.e. the left operand comes back from its spill slot.
+                     (through full-width register copies: movaps/movapd, or
+                     movs<k> of the same width) by a movs<k> of the operation's
+                     width from a stack slot, i.e. the left operand comes back
+                     from its spill slot.
   n_*                no scalar FP arithmetic (add/sub/mul/div) has a non-%rip
-                     memory operand.
+                     memory operand, and the function keeps the arithmetic it
+                     computes (NEG_KEEP: every mnemonic of one alternative).
 Everywhere: no instruction has two memory operands.
 """
 import re
@@ -41,11 +48,21 @@ import sys
 OPS = ('sub', 'div')
 KS = ('s', 'd')
 SHAPES = ('ptr', 'off', 'idx', 'slot', 'hp')
-POSITIVE = [f'p_{op}{k}_{sh}' for op in OPS for k in KS for sh in SHAPES]
+POSITIVE = [f'p_{op}{k}_{sh}' for op in OPS for k in KS for sh in SHAPES] + ['p_subd_dst', 'p_subs_dst']
 NEGATIVE = ['n_side0_subd', 'n_side0_divs', 'n_self_subd', 'n_multi_divs',
             'n_store_subd', 'n_store_divs', 'n_call_divd', 'n_call_subs',
             'n_width_sd', 'n_width_ds', 'n_const_subd', 'n_const_divs']
 FUNCS = POSITIVE + NEGATIVE
+# The register-form arithmetic each control must keep (any one alternative).
+# n_const_subd may use QBE's pre-existing `neg; add` lowering of `c - x`.
+NEG_KEEP = {
+    'n_side0_subd': [['subsd']], 'n_side0_divs': [['divss']],
+    'n_self_subd': [['subsd']], 'n_multi_divs': [['divss']],
+    'n_store_subd': [['subsd']], 'n_store_divs': [['divss']],
+    'n_call_divd': [['divsd']], 'n_call_subs': [['subss']],
+    'n_width_sd': [['cvtss2sd', 'subsd']], 'n_width_ds': [['cvtsd2ss', 'divss']],
+    'n_const_subd': [['subsd'], ['xorpd', 'addsd']], 'n_const_divs': [['divss']],
+}
 FPARITH = re.compile(r'^(add|sub|mul|div)s[sd]$')
 FPMOVE = re.compile(r'^(movs[sd]|movap[sd]|movup[sd])$')
 STACK = re.compile(r'\(%(rsp|rbp)[,)]')
@@ -151,15 +168,19 @@ def addr_shape(o):
     return disp, m.group(2), m.group(3), int(m.group(4) or 1)
 
 
-def last_writer(ins, idx, reg):
+def last_writer(ins, idx, reg, k):
     """The instruction that last wrote `reg` before ins[idx], following
-    register-to-register FP moves to their source."""
+    register-to-register FP moves to their source. A copy that keeps fewer
+    bits than the k-width value (movss for a double) ends the walk with an
+    error string instead."""
     seen = 0
     j = idx - 1
     while j >= 0 and seen < 64:
         mn, ops = ins[j]
         if ops and ops[-1] == reg:
             if FPMOVE.match(mn) and len(ops) == 2 and not is_mem(ops[0]):
+                if mn in ('movss', 'movsd') and mn != 'movs' + k:
+                    return f'{mn} {",".join(ops)} is not a {k}-width copy'
                 reg = ops[0]
                 seen += 1
                 j -= 1
@@ -183,6 +204,9 @@ def check_funcs(label, funcs):
             for mn, ops in ins:
                 if FPARITH.match(mn) and any(is_mem(o) and not is_rip(o) for o in ops):
                     errors.append(f'{fn}: folded although it must not: {mn} {",".join(ops)}')
+            mns = {mn for mn, _ in ins}
+            if not any(all(m in mns for m in alt) for alt in NEG_KEEP[fn]):
+                errors.append(f'{fn}: lost its arithmetic (want one of {NEG_KEEP[fn]})')
             continue
         _, opk, shape = fn.split('_')
         want = opk[:-1] + 's' + opk[-1]
@@ -206,19 +230,25 @@ def check_funcs(label, funcs):
             'idx': disp == 8 and base and index and scale == w,
             'slot': disp == 16 and base in ('%rsp', '%rbp') and index and scale == w,
             'hp': disp == 0 and base and not index and base not in ('%rsp', '%rbp'),
+            'dst': disp == 0 and base and not index,
         }[shape]
         if not ok:
             errors.append(f'{fn}: memory source {src} is not the {shape} addressing shape')
         if shape == 'hp':
-            wr = last_writer(ins, i, dst)
-            if not wr or wr[0] not in ('movss', 'movsd') or not wr[1] or not STACK.search(wr[1][0]):
-                errors.append(f'{fn}: {dst} of {want} does not come from a stack slot (last writer {wr})')
+            k = opk[-1]
+            wr = last_writer(ins, i, dst, k)
+            if isinstance(wr, str):
+                errors.append(f'{fn}: {dst} of {want}: {wr}')
+            elif not wr or wr[0] != 'movs' + k or not wr[1] or not STACK.search(wr[1][0]):
+                errors.append(f'{fn}: {dst} of {want} does not come from a movs{k} stack-slot reload '
+                              f'(last writer {wr})')
     if errors:
         raise Fail(f'{label}:\n  ' + '\n  '.join(errors))
     npos = len(POSITIVE)
     print(f'p119 {label}: {npos} functions folded (4 shapes + high XMM pressure x '
-          f'subss/subsd/divss/divsd), {len(NEGATIVE)} negative controls not folded, '
-          f'no instruction with two memory operands')
+          f'subss/subsd/divss/divsd, 2 result-register cases), {len(NEGATIVE)} negative '
+          f'controls not folded and keeping their arithmetic, no instruction with two '
+          f'memory operands')
 
 
 # ---- ELF64 x86-64 relocatable objects ----
@@ -261,8 +291,13 @@ def relocs(secs, syms, target):
             for k in range(s['size'] // 24):
                 off, info, add = struct.unpack_from('<QQq', s['data'], 24 * k)
                 sym = syms[info >> 32]
-                if sym['bind'] == 0 and 0 < sym['shndx'] < len(secs):
+                defined = 0 < sym['shndx'] < len(secs)
+                if sym['bind'] == 0 and defined:
                     tgt = ('section', secs[sym['shndx']]['name'], sym['value'] + add)
+                elif defined:
+                    # A global defined here: keep its name, and also where it
+                    # is defined, so that its bytes are compared too.
+                    tgt = ('symbol', sym['name'], add, secs[sym['shndx']]['name'], sym['value'])
                 else:
                     tgt = ('symbol', sym['name'], add)
                 out.append((off, info & 0xffffffff, tgt))
@@ -295,6 +330,8 @@ def elfeq(a, b):
         for _, _, t in ra:
             if t[0] == 'section':
                 reached.add(t[1])
+            elif len(t) == 5:
+                reached.add(t[3])
     for name in sorted(reached):
         da = [s['data'] for s in sa if s['name'] == name]
         db = [s['data'] for s in sb if s['name'] == name]

@@ -51,10 +51,23 @@ original conditions.
      so every emitted instruction has at most one memory operand and the pair
      computes `lhs op [m]`.
 
-These are local models: the floating-point operation and the memory read
-are arbitrary functions, so the theorems hold for every rounding mode,
-NaN payload and exception flag. The encoder correspondence is covered by
+Scope. These are local models of one rewrite of the selected IR
+(`foldEquiv`: two instructions against one, over an abstract register file,
+memory and floating-point environment) and of one invariant of the
+two-address emitters (`emitOneMem` / `spilledLhsEquiv`: copy the left
+operand into the register destination, then operate with at most one memory
+operand). The floating-point operation and the memory read are arbitrary
+functions, so the theorems hold for every rounding mode, NaN payload and
+exception flag; they do not model QBE's register allocator, spiller or the
+instruction encoders, whose correspondence is checked by
 `tests/e2e/p119_amd64_fp_rhs_load_fold`.
+
+Semantics. The folded instruction is a direct `subs{s,d}` / `divs{s,d}`
+with the written operand order, so its result equals the IEEE-754 scalar
+operation and C bit for bit. Where the unfolded code put the load temporary
+in the result register (`req(to, arg[1])`), the emitters lowered the
+subtraction as `neg; add`, which can flip the sign of a NaN result; the folded
+form keeps it. IEEE-754 does not specify the sign of a NaN result.
 
 No imports and no proof holes; plain kernel checks (compatible with both
 standalone `lean -DwarningAsError=true` and `scripts/test-lean.sh`).

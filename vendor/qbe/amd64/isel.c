@@ -1190,6 +1190,12 @@ countselected(Ref r, Fn *fn, uint *uses)
  *    slot (amd64_op[Osub].nmem == 2); the two-address emitters copy it into
  *    the register destination first, so no instruction gets two memory
  *    operands. Odiv (nmem == 0) always reloads it.
+ *    The folded instruction computes IEEE-754 `a - [m]` / `a / [m]` exactly
+ *    as a direct subs[sd] / divs[sd] (and C) does, bit for bit. When the
+ *    unfolded allocation put the load temporary in the result register
+ *    (req(to, arg[1])), emit lowered the sub as `neg; add`, which can flip the
+ *    sign of a NaN result; the folded memory form has no arg[1] register and
+ *    keeps it. IEEE-754 does not specify the sign of a NaN result.
  * Lean: tests/lean/proofs/QbeAmd64FpRhsLoadFold.lean. */
 static void
 foldoperandloads(Fn *fn)

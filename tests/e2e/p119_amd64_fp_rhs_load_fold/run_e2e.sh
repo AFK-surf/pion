@@ -7,26 +7,33 @@
 # memory source of subss / subsd / divss / divsd; the integer Oxcmp fold keeps
 # its conditions.
 # Verifies:
-#   1. Structure (check_fpfold.py, real instruction boundaries): the 20 p_*
+#   1. Structure (check_fpfold.py, real instruction boundaries): the 22 p_*
 #      functions of fold.ssa (subss/subsd/divss/divsd x RTmp pointer, base +
 #      offset, base + index*scale + offset, stack slot + index + offset, and
-#      20 live XMM values with the left operand reloaded from its spill slot)
-#      fold with the expected addressing mode and no leftover load; the 12
-#      n_* controls (left-operand load, two uses, store or call in between,
-#      loads+exts / loadd+truncd, FP constant left operand) do not; no
+#      20 live XMM values with the left operand reloaded from its spill slot
+#      by a movs<k> of the operation's width; plus subss/subsd where the
+#      unfolded load temp shares the result register) fold with the expected
+#      addressing mode and no leftover load; the 12 n_* controls (left-operand
+#      load, two uses, store or call in between, loads+exts / loadd+truncd, FP
+#      constant left operand) do not, and keep their arithmetic; no
 #      instruction has two memory operands. Checked on the amd64_sysv text,
 #      the amd64_win text, and (Linux x86-64 / macOS, objdump required) the
 #      objdump listing of `--obj` and of the assembled text; the executable
 #      sections, relocations and referenced data of `--obj` and of the
 #      assembled text are identical.
 #   2. Checker self-test: a missed fold, a folded control, a spill-free
-#      high-pressure function and a one-function --obj/text difference (all
-#      produced by QBE from mutated copies of fold.ssa) are rejected.
+#      high-pressure function, a one-function --obj/text difference (all
+#      produced by QBE from mutated copies of fold.ssa), a control whose
+#      arithmetic is gone, a 32-bit movss reload in front of a subsd, and two
+#      objects that differ only in a global data symbol they define and use
+#      are rejected.
 #   3. IEEE-754 differential (driver.c, UBSan + alignment when available):
-#      31 functions x 4 rounding modes x 16 x 16 boundary values (+-0,
+#      34 functions x 4 rounding modes x 16 x 16 boundary values (+-0,
 #      subnormals, min / max normals, +-Inf, qNaN / sNaN payloads, ordinary
 #      numbers) x 2 misaligned addresses: result bits, written memory and
-#      fetestexcept flags equal the C reference, identically on the host's
+#      fetestexcept flags equal the C reference (exact everywhere, except
+#      that a NaN result of n_const_subd's pre-existing `neg; add` lowering
+#      only has to be a NaN), identically on the host's
 #      text-assembly and direct-object routes (amd64_sysv or arm64[_apple]).
 #   4. Pion source: p119.pion (f32 / f64 sub / div from array elements and
 #      struct fields over the same boundary values) prints pion_ref.c's lines
@@ -44,7 +51,9 @@ ROOT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")/../../.." && pwd)
 DIR="$ROOT_DIR/tests/e2e/p119_amd64_fp_rhs_load_fold"
 QBE="${PION_QBE:-$ROOT_DIR/out/qbe}"
 CC_BIN="${CC:-cc}"
-CHECK="python3 -E $DIR/check_fpfold.py"
+# check ARGS...: the structure / encoder checker (a function, so that a
+# worktree path with spaces is passed as one argument).
+check() { python3 -E "$DIR/check_fpfold.py" "$@"; }
 TMP_DIR=$(mktemp -d)
 trap 'rm -rf "$TMP_DIR"' EXIT
 export PION_CACHE_DIR="$TMP_DIR/cas"
@@ -74,18 +83,18 @@ esac
 
 # 1. Structure.
 "$QBE" -t amd64_sysv -o "$TMP_DIR/sysv.s" "$FOLD"
-$CHECK asm "amd64_sysv text" "$TMP_DIR/sysv.s"
+check asm "amd64_sysv text" "$TMP_DIR/sysv.s"
 "$QBE" -t amd64_win -o "$TMP_DIR/win.s" "$FOLD"
-$CHECK asm "amd64_win text" "$TMP_DIR/win.s"
+check asm "amd64_win text" "$TMP_DIR/win.s"
 "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/sysv.o" "$FOLD"
 ELF=0
 if [ -n "$OBJDUMP" ] && [ -n "$XAS" ] && $XAS -o "$TMP_DIR/sysv_text.o" "$TMP_DIR/sysv.s" 2> "$TMP_DIR/as.log" \
   && [ ! -s "$TMP_DIR/as.log" ] && "$OBJDUMP" -d --no-show-raw-insn "$TMP_DIR/sysv.o" > "$TMP_DIR/sysv_obj.dis" 2>/dev/null; then
   ELF=1
   "$OBJDUMP" -d --no-show-raw-insn "$TMP_DIR/sysv_text.o" > "$TMP_DIR/sysv_text.dis"
-  $CHECK dis "amd64_sysv --obj ($OBJDUMP)" "$TMP_DIR/sysv_obj.dis"
-  $CHECK dis "amd64_sysv text, assembled ($OBJDUMP)" "$TMP_DIR/sysv_text.dis"
-  $CHECK elfeq "$TMP_DIR/sysv.o" "$TMP_DIR/sysv_text.o"
+  check dis "amd64_sysv --obj ($OBJDUMP)" "$TMP_DIR/sysv_obj.dis"
+  check dis "amd64_sysv text, assembled ($OBJDUMP)" "$TMP_DIR/sysv_text.dis"
+  check elfeq "$TMP_DIR/sysv.o" "$TMP_DIR/sysv_text.o"
 elif [ "$NEED_ELF" = 1 ]; then
   cat "$TMP_DIR/as.log" >&2 2>/dev/null || true
   echo "FAIL: p119 needs objdump / llvm-objdump and an x86-64 ELF assembler on $HOST" >&2
@@ -143,17 +152,52 @@ for m in missed wrong nospill; do
   "$QBE" -t amd64_sysv -o "$TMP_DIR/$m.s" "$TMP_DIR/$m.ssa"
   "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/$m.o" "$TMP_DIR/$m.ssa"
 done
-reject "missed fold (text)" p_subd_ptr $CHECK asm missed "$TMP_DIR/missed.s"
-reject "folded control (text)" n_store_subd $CHECK asm wrong "$TMP_DIR/wrong.s"
-reject "high pressure without a spill (text)" p_divd_hp $CHECK asm nospill "$TMP_DIR/nospill.s"
-reject "--obj differing from text in one function" .text.p_subd_ptr $CHECK elfeq "$TMP_DIR/sysv.o" "$TMP_DIR/missed.o"
+reject "missed fold (text)" p_subd_ptr check asm missed "$TMP_DIR/missed.s"
+reject "folded control (text)" n_store_subd check asm wrong "$TMP_DIR/wrong.s"
+reject "high pressure without a spill (text)" p_divd_hp check asm nospill "$TMP_DIR/nospill.s"
+reject "--obj differing from text in one function" .text.p_subd_ptr check elfeq "$TMP_DIR/sysv.o" "$TMP_DIR/missed.o"
+# Listing-level mutations of the real amd64_sysv text.
+python3 -E - "$TMP_DIR/sysv.s" "$TMP_DIR" <<'PYEOF'
+import re, sys
+src, tmp = sys.argv[1:]
+text = open(src).read()
+def body(fn):
+    start = text.index(f'\n{fn}:\n')
+    return start, text.index('/* end function', start)
+# n_call_divd without its division (the function now returns its argument).
+s, e = body('n_call_divd')
+lost = text[s:e]
+assert re.search(r'\tdivsd %xmm\d+, %xmm\d+\n', lost)
+open(f'{tmp}/lost.s', 'w').write(text[:s] + re.sub(r'\tdivsd %xmm\d+, %xmm\d+\n', '', lost) + text[e:])
+# p_subd_hp: the stack reload that last writes subsd's destination becomes
+# a 32-bit movss.
+s, e = body('p_subd_hp')
+lines = text[s:e].split('\n')
+k = next(i for i, l in enumerate(lines) if re.match(r'\tsubsd \(', l))
+dst = lines[k].rsplit(' ', 1)[1]
+j = next(i for i in range(k - 1, -1, -1) if lines[i].endswith(', ' + dst))
+m = re.fullmatch(r'\tmovsd (-?\d*\(%r[sb]p\)), (%xmm\d+)', lines[j])
+assert m, f'p_subd_hp: {dst} of subsd is last written by {lines[j]!r}'
+lines[j] = f'\tmovss {m.group(1)}, {m.group(2)}'
+hp = '\n'.join(lines)
+open(f'{tmp}/narrow.s', 'w').write(text[:s] + hp + text[e:])
+PYEOF
+reject "control without its arithmetic (text)" n_call_divd check asm lost "$TMP_DIR/lost.s"
+reject "32-bit movss reload before subsd (text)" p_subd_hp check asm narrow "$TMP_DIR/narrow.s"
+# Two objects whose code is identical but whose global datum differs.
+for v in 42 99; do
+  printf 'export data $datum = { b %s }\nexport function w $getd() {\n@start\n\t%%v =w loadub $datum\n\tret %%v\n}\n' "$v" > "$TMP_DIR/datum$v.ssa"
+  "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/datum$v.o" "$TMP_DIR/datum$v.ssa"
+done
+check elfeq "$TMP_DIR/datum42.o" "$TMP_DIR/datum42.o" > /dev/null
+reject "objects differing in a global data symbol" "referenced data differs" check elfeq "$TMP_DIR/datum42.o" "$TMP_DIR/datum99.o"
 if [ "$ELF" = 1 ]; then
   for m in missed wrong nospill; do
     "$OBJDUMP" -d --no-show-raw-insn "$TMP_DIR/$m.o" > "$TMP_DIR/$m.dis"
   done
-  reject "missed fold (--obj listing)" p_subd_ptr $CHECK dis missed "$TMP_DIR/missed.dis"
-  reject "folded control (--obj listing)" n_store_subd $CHECK dis wrong "$TMP_DIR/wrong.dis"
-  reject "high pressure without a spill (--obj listing)" p_divd_hp $CHECK dis nospill "$TMP_DIR/nospill.dis"
+  reject "missed fold (--obj listing)" p_subd_ptr check dis missed "$TMP_DIR/missed.dis"
+  reject "folded control (--obj listing)" n_store_subd check dis wrong "$TMP_DIR/wrong.dis"
+  reject "high pressure without a spill (--obj listing)" p_divd_hp check dis nospill "$TMP_DIR/nospill.dis"
 fi
 
 # 3. IEEE-754 differential on the host target.
@@ -234,9 +278,9 @@ if ! diff -u "$TMP_DIR/nbody_c.out" "$TMP_DIR/nbody.out" >&2; then
 fi
 echo "p119 nbody --release: $(tr '\n' ' ' < "$TMP_DIR/nbody.out")(= C)"
 "$QBE" -t amd64_sysv -o "$TMP_DIR/p119_release.s" "$TMP_DIR/p119_release.ssa"
-$CHECK pion "p119.pion --release amd64_sysv" "$TMP_DIR/p119_release.s" '*:subsd,divsd,subss,divss:1'
+check pion "p119.pion --release amd64_sysv" "$TMP_DIR/p119_release.s" '*:subsd,divsd,subss,divss:1'
 "$QBE" -t amd64_sysv -o "$TMP_DIR/nbody.s" "$TMP_DIR/nbody.ssa"
-$CHECK pion "nbody --release amd64_sysv" "$TMP_DIR/nbody.s" 'pion_fn_advance:subsd:3'
+check pion "nbody --release amd64_sysv" "$TMP_DIR/nbody.s" 'pion_fn_advance:subsd:3'
 
 # 5. ASan + UBSan QBE.
 if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,undefined -o "$TMP_DIR/san_probe" 2>/dev/null \
@@ -285,7 +329,7 @@ if printf 'int main(void){return 0;}\n' | "$CC_BIN" -x c - -fsanitize=address,un
     san -t arm64_apple --obj "$IN"
   done
   env $SAN_ENV "$TMP_DIR/sanq/qbe" -t amd64_sysv -o "$TMP_DIR/san_sysv.s" "$FOLD"
-  $CHECK asm "ASan+UBSan QBE amd64_sysv text" "$TMP_DIR/san_sysv.s"
+  check asm "ASan+UBSan QBE amd64_sysv text" "$TMP_DIR/san_sysv.s"
   asm_obj "$TMP_DIR/sanq/qbe" "$FOLD" "$TMP_DIR/san_text.o"
   route asan-ubsan-qbe-text "$TMP_DIR/san_text.o"
   cmp "$TMP_DIR/rows_text" "$TMP_DIR/rows_asan-ubsan-qbe-text"
