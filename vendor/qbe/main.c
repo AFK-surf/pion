@@ -300,6 +300,11 @@ main(int ac, char *av[])
 	outf = stdout;
 	outpath = 0;
 	macos_ver = (15u << 16);
+	{
+		const char *sj = getenv("PION_QBE_STRICT_JNZ");
+		if (sj && strcmp(sj, "1") == 0)
+			strict_jnz = 1;
+	}
 	files = emalloc((size_t)(ac + 1) * sizeof *files);
 	nfiles = 0;
 
@@ -315,6 +320,8 @@ main(int ac, char *av[])
 		} else if (strcmp(arg, "--obj-batch") == 0) {
 			objmode = 1;
 			objbatch = 1;
+		} else if (strcmp(arg, "--strict-jnz") == 0 || strcmp(arg, "-strict-jnz") == 0) {
+			strict_jnz = 1;
 		} else if (strcmp(arg, "--macos-ver") == 0) {
 			if (i + 1 >= ac) {
 				usage(stderr, av[0]);

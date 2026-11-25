@@ -481,6 +481,7 @@ struct Dat {
 /* main.c */
 extern Target T;
 extern char debug['Z'+1];
+extern int strict_jnz;
 
 /* util.c */
 typedef enum {

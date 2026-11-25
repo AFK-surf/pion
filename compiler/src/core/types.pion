@@ -206,14 +206,6 @@ fn tc_lookup_enum_info(tc : TypeChecker, ename : String) -> Option[EnumInfo] {
     None => {
       let qp = split_qual_name(ename)
       if qp.prefix.length() > 0 {
-        match resolve_alias_pkg(tc, qp.prefix) {
-          Some(ipkg) =>
-            match ipkg.tc.enums.get(qp.name) {
-              Some(ei) => return Some(ei)
-              None => ()
-            }
-          None => ()
-        }
         match lookup_imported_pkg_transitive(tc, qp.prefix) {
           Some(ipkg) => ipkg.tc.enums.get(qp.name)
           None => None
@@ -297,6 +289,7 @@ fn check_field_assign_target(
           let mut fi = 0
           while fi < sinfo.field_names.length() {
             if sinfo.field_names[fi] == fname {
+              tc.resolved_method_calls.set("fw:" + span_key(lsp), sname)
               if has_qual_sep(sname) &&
                 !env.in_default_arg &&
                 fi < sinfo.field_privs.length() &&
@@ -377,6 +370,7 @@ pub struct FnInfo {
   decl : FnDecl
   param_tys : Array[Ty]
   ret_ty : Ty
+  is_imported : Bool
 }
 
 ///|
@@ -448,10 +442,14 @@ pub struct Env {
   mut fn_has_params : Bool
   /// Scope index floor of the innermost enclosing closure (0 at function level).
   mut closure_scope_floor : Int
+  /// Active enclosing loop depth inside the current function/closure (0 outside loops).
+  mut in_loop_depth : Int
   /// Return type inferred from `return expr` statements inside an unannotated closure.
   mut inferred_ret : Option[Ty]
   /// True while checking a callee's default parameter expression (allows transitive/package-private symbols).
   mut in_default_arg : Bool
+  /// True while checking any default parameter expression (declaration or call-site); forbids `return`.
+  mut in_default_expr : Bool
   /// True while checking a `#no_io` / `#render_thread` function (or any closure inside it).
   mut in_no_io : Bool
   mut no_io_fn_name : String
@@ -526,6 +524,7 @@ pub struct TypeChecker {
   consts : Map[String, Ty]
   const_pub : Map[String, Bool]
   scalar_const_exprs : Map[String, Expr]
+  const_init_order : Array[String]
   import_aliases : Map[String, String]
   dep_map : Map[String, String]
   canon_display_keys : Array[String]
@@ -586,6 +585,17 @@ pub struct TypeChecker {
   call_into_convs : Map[String, IntoConv]
   /// `span_key(ETry span)` -> `#into` error conversion for `?`.
   try_into_convs : Map[String, IntoConv]
+  /// `span_key(EMethodCall span)` -> exact `"RecvType::method"` when receiver is concrete.
+  resolved_method_calls : Map[String, String]
+  /// `span_key(ECall/EMethodCall span)` -> true when the call statically diverges (`-> Never` or uninhabited unconstrained `TParam`).
+  never_calls : Map[String, Bool]
+  /// True while checking a callee's expanded default argument at a call site.
+  mut in_default_arg_expansion : Bool
+  /// True while checking an imported callee's expanded default argument (canonical pkg names must not be hijacked by caller aliases).
+  mut in_imported_default_arg : Bool
+  /// Qualified names (`pkg::Type`) of private imported types lazily registered for expanded default args;
+  /// direct references outside default-arg expansion must still emit `E_PRIVATE_SYMBOL`.
+  priv_imported_types : Map[String, Bool]
 }
 
 ///|
@@ -620,14 +630,75 @@ fn env_new(ret_ty : Ty, type_params : Array[String]) -> Env {
     fn_lparen_span: span_empty(),
     fn_has_params: false,
     closure_scope_floor: 0,
+    in_loop_depth: 0,
     inferred_ret: None,
     in_default_arg: false,
+    in_default_expr: false,
     in_no_io: false,
     no_io_fn_name: "",
     in_verify: false,
     verify_fn_name: "",
     mut_params: Map([]),
   }
+}
+
+///|
+fn env_for_default_arg(env : Env, is_expanded : Bool) -> Env {
+  let def_env = env_new(TError, env.type_params)
+  let tb_keys = env.type_bounds.keys()
+  let mut i = 0
+  while i < tb_keys.length() {
+    let k = tb_keys[i]
+    match env.type_bounds.get(k) {
+      Some(v) => def_env.type_bounds.set(k, v)
+      None => ()
+    }
+    i = i + 1
+  }
+  def_env.in_default_arg = is_expanded
+  def_env.in_default_expr = true
+  def_env.in_no_io = env.in_no_io
+  def_env.no_io_fn_name = env.no_io_fn_name
+  def_env.in_verify = env.in_verify
+  def_env.verify_fn_name = env.verify_fn_name
+  def_env
+}
+
+///|
+fn env_for_default_arg_callee(
+  tc : TypeChecker,
+  env : Env,
+  type_params : Array[String],
+  type_bounds : Array[TypeBound],
+  is_expanded : Bool,
+  is_imported : Bool,
+) -> Env {
+  let def_env = env_new(TError, type_params)
+  let mut bi = 0
+  while bi < type_bounds.length() {
+    let tb = type_bounds[bi]
+    let ctrs : Array[String] = []
+    let mut ti = 0
+    while ti < tb.traits.length() {
+      let raw_tr = tb.traits[ti]
+      let tr_n = if starts_with_str(raw_tr, "@canon:") || !is_imported {
+        canon_trait_name(tc, raw_tr)
+      } else {
+        raw_tr
+      }
+      ctrs.push(tr_n)
+      ti = ti + 1
+    }
+    def_env.type_bounds.set(tb.param, ctrs)
+    bi = bi + 1
+  }
+  def_env.in_default_arg = is_expanded
+  def_env.in_default_expr = true
+  def_env.in_no_io = env.in_no_io
+  def_env.no_io_fn_name = env.no_io_fn_name
+  def_env.in_verify = env.in_verify
+  def_env.verify_fn_name = env.verify_fn_name
+  def_env
 }
 
 ///|
@@ -1137,12 +1208,93 @@ fn qualify_imported_type_expr(
           Some(dep) => TyName("@canon:" + dep.name + "::" + qp.name, qargs, sp)
           None => TyName(name, qargs, sp)
         }
-      } else if ipkg.tc.structs.contains(name) || ipkg.tc.enums.contains(name) {
+      } else if ipkg.tc.structs.contains(name) ||
+        ipkg.tc.enums.contains(name) ||
+        ipkg.tc.traits.contains(name) {
         TyName("@canon:" + ipkg.name + "::" + name, qargs, sp)
       } else {
         TyName(name, qargs, sp)
       }
     }
+  }
+}
+
+///|
+fn qualify_imported_type_expr_opt(
+  ipkg : ImportedPkg,
+  te_opt : Option[TypeExpr],
+  tparams : Array[String],
+) -> Option[TypeExpr] {
+  match te_opt {
+    Some(te) => Some(qualify_imported_type_expr(ipkg, te, tparams))
+    None => None
+  }
+}
+
+///|
+fn qualify_imported_pat(ipkg : ImportedPkg, pat : Pattern) -> Pattern {
+  match pat {
+    PVariant(enum_name, vname, subs, sp) => {
+      let qsubs : Array[Pattern] = []
+      let mut i = 0
+      while i < subs.length() {
+        qsubs.push(qualify_imported_pat(ipkg, subs[i]))
+        i = i + 1
+      }
+      let qenum = if enum_name != "" {
+        if starts_with_str(enum_name, "@canon:") {
+          enum_name
+        } else if has_qual_sep(enum_name) {
+          let qp = split_qual_name(enum_name)
+          match resolve_alias_pkg(ipkg.tc, qp.prefix) {
+            Some(dep) => dep.name + "::" + qp.name
+            None => enum_name
+          }
+        } else if ipkg.tc.enums.contains(enum_name) {
+          ipkg.name + "::" + enum_name
+        } else {
+          enum_name
+        }
+      } else {
+        ""
+      }
+      PVariant(qenum, vname, qsubs, sp)
+    }
+    PTuple(subs, sp) => {
+      let qsubs : Array[Pattern] = []
+      let mut i = 0
+      while i < subs.length() {
+        qsubs.push(qualify_imported_pat(ipkg, subs[i]))
+        i = i + 1
+      }
+      PTuple(qsubs, sp)
+    }
+    _ => pat
+  }
+}
+
+///|
+/// Single-pass O(n) qualification for condition contexts (`if` / `while` / `guard`),
+/// where `EIs` pattern bindings propagate left-to-right across `&&` and into the guarded body.
+fn qualify_imported_cond(
+  ipkg : ImportedPkg,
+  e : Expr,
+  bound : Array[String],
+  tparams : Array[String],
+) -> Expr {
+  match e {
+    EBinary("&&", l, r, sp) => {
+      let ql = qualify_imported_cond(ipkg, l, bound, tparams)
+      let qr = qualify_imported_cond(ipkg, r, bound, tparams)
+      EBinary("&&", ql, qr, sp)
+    }
+    EIs(scrut, pat, sp) => {
+      let qs = qualify_imported_expr(ipkg, scrut, bound, tparams)
+      let qp = qualify_imported_pat(ipkg, pat)
+      qualify_pat_bindings(pat, bound)
+      EIs(qs, qp, sp)
+    }
+    _ => qualify_imported_expr(ipkg, e, bound, tparams)
   }
 }
 
@@ -1201,6 +1353,28 @@ fn qualify_imported_expr(
     ECall(callee, args, sp) => {
       let qc = match callee {
         EPath(qual, mem, psp) => qualify_imported_path(ipkg, qual, mem, psp, true)
+        EIdent(cname, csp) => {
+          let is_pkg_const_fn = match ipkg.tc.consts.get(cname) {
+            Some(TFn(_, _)) => true
+            _ => false
+          }
+          let has_pkg_callable = ipkg.tc.fns.contains(cname) ||
+            ipkg.tc.extern_fns.contains(cname) ||
+            is_pkg_const_fn
+          if has_pkg_callable &&
+            (ipkg.tc.resolved_method_calls.contains("call_pkg:" + span_key(sp)) ||
+              !str_arr_contains(bound, cname)) {
+            EPath("@canon:" + ipkg.name, cname, csp)
+          } else if ipkg.tc.resolved_method_calls.contains("ctor:" + span_key(sp)) &&
+            cname != "Some" &&
+            cname != "Ok" &&
+            cname != "Err" &&
+            ipkg.tc.variant_to_enum.contains(cname) {
+            EPath("@canon:" + ipkg.name, cname, csp)
+          } else {
+            qualify_imported_expr(ipkg, callee, bound, tparams)
+          }
+        }
         _ => qualify_imported_expr(ipkg, callee, bound, tparams)
       }
       let qargs : Array[Expr] = []
@@ -1267,7 +1441,7 @@ fn qualify_imported_expr(
     EBlock(stmts, sp) => EBlock(qualify_imported_stmts(ipkg, stmts, bound, tparams), sp)
     EIf(cond, then_s, else_opt, sp) => {
       let tb = str_arr_clone(bound)
-      let qc = qualify_cond_with_bindings(ipkg, cond, tb, tparams)
+      let qc = qualify_imported_cond(ipkg, cond, tb, tparams)
       let qt = qualify_imported_stmts(ipkg, then_s, tb, tparams)
       let qe = match else_opt {
         Some(ee) => Some(qualify_imported_expr(ipkg, ee, bound, tparams))
@@ -1288,7 +1462,7 @@ fn qualify_imported_expr(
           None => None
         }
         qarms.push(MatchArm::{
-          pat: a.pat,
+          pat: qualify_imported_pat(ipkg, a.pat),
           guard_expr: qg,
           body: qualify_imported_expr(ipkg, a.body, ab, tparams),
           span: a.span,
@@ -1297,7 +1471,8 @@ fn qualify_imported_expr(
       }
       EMatch(qs, qarms, sp)
     }
-    EIs(scrut, pat, sp) => EIs(qualify_imported_expr(ipkg, scrut, bound, tparams), pat, sp)
+    EIs(scrut, pat, sp) =>
+      EIs(qualify_imported_expr(ipkg, scrut, bound, tparams), qualify_imported_pat(ipkg, pat), sp)
     EClosure(ps, rty, body, sp) => {
       let cb = str_arr_clone(bound)
       let qps : Array[Param] = []
@@ -1415,13 +1590,19 @@ fn qualify_imported_stmts(
           ),
         )
       SGuard(c, body, sp) => {
+        let gb = str_arr_clone(lb)
+        let qc = qualify_imported_cond(ipkg, c, gb, tparams)
         let qbody = qualify_imported_stmts(ipkg, body, lb, tparams)
-        let qc = qualify_cond_with_bindings(ipkg, c, lb, tparams)
+        let mut gi = lb.length()
+        while gi < gb.length() {
+          lb.push(gb[gi])
+          gi = gi + 1
+        }
         out.push(SGuard(qc, qbody, sp))
       }
       SWhile(c, body, sp) => {
         let wb = str_arr_clone(lb)
-        let qc = qualify_cond_with_bindings(ipkg, c, wb, tparams)
+        let qc = qualify_imported_cond(ipkg, c, wb, tparams)
         let qbody = qualify_imported_stmts(ipkg, body, wb, tparams)
         out.push(SWhile(qc, qbody, sp))
       }
@@ -1516,13 +1697,43 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
   let has_bounds = d.type_bounds.length() > 0
   let qdecl = if has_def || has_bounds {
     let qparams : Array[Param] = if has_def {
+      let q_tparams : Array[String] = []
+      if d.receiver_type != "" {
+        match ipkg.tc.structs.get(d.receiver_type) {
+          Some(si) => {
+            let mut ti = 0
+            while ti < si.decl.type_params.length() {
+              q_tparams.push(si.decl.type_params[ti])
+              ti = ti + 1
+            }
+          }
+          None =>
+            match ipkg.tc.enums.get(d.receiver_type) {
+              Some(ei) => {
+                let mut ti = 0
+                while ti < ei.decl.type_params.length() {
+                  q_tparams.push(ei.decl.type_params[ti])
+                  ti = ti + 1
+                }
+              }
+              None => ()
+            }
+        }
+      }
+      let mut ti = 0
+      while ti < d.type_params.length() {
+        if !str_arr_contains(q_tparams, d.type_params[ti]) {
+          q_tparams.push(d.type_params[ti])
+        }
+        ti = ti + 1
+      }
       let qp : Array[Param] = []
       let prior_names : Array[String] = []
       i = 0
       while i < d.params.length() {
         let p = d.params[i]
         let qdef = match p.default_expr {
-          Some(def) => Some(qualify_imported_expr(ipkg, def, prior_names, d.type_params))
+          Some(def) => Some(qualify_imported_expr(ipkg, def, prior_names, q_tparams))
           None => None
         }
         prior_names.push(p.name)
@@ -1594,6 +1805,7 @@ fn qualify_fn_info(ipkg : ImportedPkg, fi : FnInfo) -> FnInfo {
     decl: qdecl,
     param_tys: ptys,
     ret_ty: qualify_imported_ty(pkg_name, fi.ret_ty),
+    is_imported: true,
   }
 }
 
@@ -1679,7 +1891,7 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
     match ipkg.tc.structs.get(k) {
       Some(si) =>
         if has_qual_sep(k) {
-          if !tc.structs.contains(k) {
+          if !ipkg.tc.priv_imported_types.contains(k) && !tc.structs.contains(k) {
             tc.structs.set(k, si)
             tc.struct_names.push(k)
           }
@@ -1701,7 +1913,7 @@ fn import_pkg_into_tc(tc : TypeChecker, ipkg : ImportedPkg) -> Unit {
     match ipkg.tc.enums.get(k) {
       Some(ei) =>
         if has_qual_sep(k) {
-          if !tc.enums.contains(k) {
+          if !ipkg.tc.priv_imported_types.contains(k) && !tc.enums.contains(k) {
             tc.enums.set(k, ei)
             tc.enum_names.push(k)
           }
@@ -1863,6 +2075,76 @@ pub fn lookup_imported_pkg_transitive(
 }
 
 ///|
+pub fn is_caller_alias_redirected(tc : TypeChecker, qual_name : String) -> Bool {
+  if tc.in_imported_default_arg || !has_qual_sep(qual_name) {
+    return false
+  }
+  let qp = split_qual_name(qual_name)
+  match resolve_alias_pkg(tc, qp.prefix) {
+    Some(ip) => ip.name != qp.prefix
+    None => false
+  }
+}
+
+///|
+fn tc_ensure_priv_struct_registered(
+  tc : TypeChecker,
+  ipkg : ImportedPkg,
+  q_st : String,
+  si : StructInfo,
+) -> Unit {
+  let qk = ipkg.name + "::" + q_st
+  if !tc.structs.contains(qk) {
+    let qftys : Array[Ty] = []
+    let mut j = 0
+    while j < si.field_tys.length() {
+      qftys.push(qualify_imported_ty(ipkg.name, si.field_tys[j]))
+      j = j + 1
+    }
+    tc.struct_names.push(qk)
+    tc.structs.set(
+      qk,
+      StructInfo::{
+        decl: si.decl,
+        field_names: si.field_names,
+        field_muts: si.field_muts,
+        field_privs: si.field_privs,
+        field_tys: qftys,
+      },
+    )
+    tc.priv_imported_types.set(qk, true)
+  }
+}
+
+///|
+fn tc_ensure_priv_enum_registered(
+  tc : TypeChecker,
+  ipkg : ImportedPkg,
+  q_en : String,
+  ei : EnumInfo,
+) -> Unit {
+  let qk = ipkg.name + "::" + q_en
+  if !tc.enums.contains(qk) {
+    let qvars : Array[VariantInfo] = []
+    let mut vi = 0
+    while vi < ei.variants.length() {
+      let v = ei.variants[vi]
+      let qvftys : Array[Ty] = []
+      let mut j = 0
+      while j < v.field_tys.length() {
+        qvftys.push(qualify_imported_ty(ipkg.name, v.field_tys[j]))
+        j = j + 1
+      }
+      qvars.push(VariantInfo::{ name: v.name, field_tys: qvftys })
+      vi = vi + 1
+    }
+    tc.enum_names.push(qk)
+    tc.enums.set(qk, EnumInfo::{ decl: ei.decl, variants: qvars })
+    tc.priv_imported_types.set(qk, true)
+  }
+}
+
+///|
 fn resolve_pkg_for_lookup(
   tc : TypeChecker,
   qual : String,
@@ -1870,6 +2152,12 @@ fn resolve_pkg_for_lookup(
 ) -> Option[ImportedPkg] {
   if starts_with_str(qual, "@canon:") {
     return lookup_imported_pkg_transitive(tc, slice_str(qual, 7, qual.length()))
+  }
+  if tc.in_imported_default_arg {
+    match lookup_imported_pkg_transitive(tc, qual) {
+      Some(p) => return Some(p)
+      None => ()
+    }
   }
   match resolve_alias_pkg(tc, qual) {
     Some(p) => Some(p)
@@ -2945,50 +3233,30 @@ fn resolve_type_expr(
       TFn(ptys, resolve_type_expr(tc, ret, tparams))
     }
     TyDynTrait(tname, sp) => {
-      let qp = split_qual_name(tname)
-      let is_canon = starts_with_str(qp.prefix, "@canon:")
-      if qp.prefix.length() > 0 && !is_canon {
-        match resolve_alias_pkg(tc, qp.prefix) {
-          Some(ipkg) =>
-            match ipkg.tc.traits.get(qp.name) {
-              Some(ti) =>
-                if !ti.decl.is_pub {
-                  emit_private_err_at(
-                    tc,
-                    sp,
-                    "trait",
-                    ipkg.name,
-                    qp.name,
-                    ti.decl.span,
-                  )
-                }
-              None => ()
-            }
-          None => ()
-        }
-      }
-      let cname = canon_trait_name(tc, tname)
-      let tinfo_opt = if is_canon {
-        lookup_trait_allow_private(tc, cname)
-      } else {
-        tc.traits.get(cname)
-      }
-      match tinfo_opt {
+      let stl = lookup_source_trait_ex(
+        tc,
+        tname,
+        sp,
+        tc.in_default_arg_expansion || tc.in_imported_default_arg || starts_with_str(tname, "@canon:"),
+      )
+      match stl.info {
         None => {
-          tc_err(
-            tc,
-            sp,
-            "E_UNKNOWN_TRAIT",
-            "unknown trait `" + tname + "` in `dyn` type",
-            "defined trait",
-            tname,
-            "declare `trait " + tname + " { ... }` or check its spelling",
-          )
+          if !stl.errored {
+            tc_err(
+              tc,
+              sp,
+              "E_UNKNOWN_TRAIT",
+              "unknown trait `" + tname + "` in `dyn` type",
+              "defined trait",
+              tname,
+              "declare `trait " + tname + " { ... }` or check its spelling",
+            )
+          }
           TError
         }
         Some(tinfo) =>
           if check_trait_object_safe(tc, tname, tinfo, sp) {
-            TDynTrait(cname)
+            TDynTrait(stl.canon_name)
           } else {
             TError
           }
@@ -3033,6 +3301,9 @@ fn resolve_type_expr(
       }
       if name == "Unit" {
         return TUnit
+      }
+      if name == "Never" {
+        return TNever
       }
       if name == "Ptr" {
         return TPtr
@@ -3126,9 +3397,17 @@ fn resolve_type_expr(
       }
       let via_alias = tc_is_imported_pkg_alias(tc, name)
       if !via_alias && tc.structs.contains(name) {
+        if !tc.in_default_arg_expansion && tc.priv_imported_types.contains(name) {
+          let qp_p = split_qual_name(name)
+          emit_private_err(tc, sp, "struct", qp_p.prefix, qp_p.name)
+        }
         return TStruct(name, rargs)
       }
       if !via_alias && tc.enums.contains(name) {
+        if !tc.in_default_arg_expansion && tc.priv_imported_types.contains(name) {
+          let qp_p = split_qual_name(name)
+          emit_private_err(tc, sp, "enum", qp_p.prefix, qp_p.name)
+        }
         match tc.enums.get(name) {
           Some(ei) =>
             if rargs.length() > 0 && ei.decl.type_params.length() == 0 {
@@ -3160,21 +3439,31 @@ fn resolve_type_expr(
             return TEnum(q_type, rargs)
           }
         }
-        match resolve_alias_pkg(tc, q_alias) {
+        match resolve_pkg_for_lookup(tc, q_alias, tc.in_default_arg_expansion) {
           Some(ipkg) => {
             match ipkg.tc.structs.get(q_type) {
               Some(si) => {
-                if !si.decl.is_pub && !is_canon {
-                  emit_private_err_at(tc, sp, "struct", ipkg.name, q_type, si.decl.span)
+                let qk = ipkg.name + "::" + q_type
+                if !si.decl.is_pub {
+                  if !tc.in_default_arg_expansion && !is_canon {
+                    emit_private_err_at(tc, sp, "struct", ipkg.name, q_type, si.decl.span)
+                  } else {
+                    tc_ensure_priv_struct_registered(tc, ipkg, q_type, si)
+                  }
                 }
-                return TStruct(ipkg.name + "::" + q_type, rargs)
+                return TStruct(qk, rargs)
               }
               None => ()
             }
             match ipkg.tc.enums.get(q_type) {
               Some(ei) => {
-                if !ei.decl.is_pub && !is_canon {
-                  emit_private_err_at(tc, sp, "enum", ipkg.name, q_type, ei.decl.span)
+                let qk = ipkg.name + "::" + q_type
+                if !ei.decl.is_pub {
+                  if !tc.in_default_arg_expansion && !is_canon {
+                    emit_private_err_at(tc, sp, "enum", ipkg.name, q_type, ei.decl.span)
+                  } else {
+                    tc_ensure_priv_enum_registered(tc, ipkg, q_type, ei)
+                  }
                 }
                 if rargs.length() > 0 && ei.decl.type_params.length() == 0 {
                   tc_err(
@@ -3188,7 +3477,7 @@ fn resolve_type_expr(
                   )
                   return TError
                 }
-                return TEnum(ipkg.name + "::" + q_type, rargs)
+                return TEnum(qk, rargs)
               }
               None => ()
             }
@@ -3606,7 +3895,7 @@ fn ty_prefer_concrete(a : Ty, b : Ty) -> Ty {
 ///|
 fn ty_compat(expected : Ty, found : Ty) -> Bool {
   match expected {
-    TError | TNever => return true
+    TError => return true
     _ => ()
   }
   match found {
@@ -3721,12 +4010,12 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
       }
     TArray(e1) =>
       match found {
-        TArray(e2) => ty_compat(e1, e2)
+        TArray(e2) => ty_compat_eq(e1, e2)
         _ => false
       }
     TFixedArray(e1) =>
       match found {
-        TFixedArray(e2) => ty_compat(e1, e2)
+        TFixedArray(e2) => ty_compat_eq(e1, e2)
         _ => false
       }
     TImmArray(e1) =>
@@ -3736,27 +4025,27 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
       }
     TOption(e1) =>
       match found {
-        TOption(e2) => ty_compat(e1, e2)
+        TOption(e2) => ty_compat_eq(e1, e2)
         _ => false
       }
     TResult(o1, e1) =>
       match found {
-        TResult(o2, e2) => ty_compat(o1, o2) && ty_compat(e1, e2)
+        TResult(o2, e2) => ty_compat_eq(o1, o2) && ty_compat_eq(e1, e2)
         _ => false
       }
     TMap(k1, v1) =>
       match found {
-        TMap(k2, v2) => ty_compat(k1, k2) && ty_compat(v1, v2)
+        TMap(k2, v2) => ty_compat_eq(k1, k2) && ty_compat_eq(v1, v2)
         _ => false
       }
     TChannel(e1) =>
       match found {
-        TChannel(e2) => ty_compat(e1, e2)
+        TChannel(e2) => ty_compat_eq(e1, e2)
         _ => false
       }
     TMutex(e1) =>
       match found {
-        TMutex(e2) => ty_compat(e1, e2)
+        TMutex(e2) => ty_compat_eq(e1, e2)
         _ => false
       }
     TStruct(n1, a1) =>
@@ -3767,7 +4056,7 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
           }
           let mut i = 0
           while i < a1.length() {
-            if !ty_compat(a1[i], a2[i]) {
+            if !ty_compat_eq(a1[i], a2[i]) {
               return false
             }
             i = i + 1
@@ -3784,7 +4073,7 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
           }
           let mut i = 0
           while i < a1.length() {
-            if !ty_compat(a1[i], a2[i]) {
+            if !ty_compat_eq(a1[i], a2[i]) {
               return false
             }
             i = i + 1
@@ -3801,7 +4090,7 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
           }
           let mut i = 0
           while i < p1.length() {
-            if !ty_compat(p1[i], p2[i]) {
+            if !ty_compat(p2[i], p1[i]) {
               return false
             }
             i = i + 1
@@ -3818,7 +4107,7 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
           }
           let mut i = 0
           while i < e1.length() {
-            if !ty_compat(e1[i], e2[i]) {
+            if !ty_compat_eq(e1[i], e2[i]) {
               return false
             }
             i = i + 1
@@ -3832,8 +4121,175 @@ fn ty_compat(expected : Ty, found : Ty) -> Bool {
         TDynTrait(t2) => t1 == t2
         _ => false
       }
-    TNever | TError => true
+    TError => true
+    TNever =>
+      match found {
+        TNever | TError => true
+        _ => false
+      }
   }
+}
+
+///|
+/// Single-pass O(N) invariant type equality (with `TError` wildcard on either side).
+fn ty_compat_eq(a : Ty, b : Ty) -> Bool {
+  match a {
+    TError => return true
+    _ => ()
+  }
+  match b {
+    TError => return true
+    _ => ()
+  }
+  match a {
+    TInt => match b { TInt => true; _ => false }
+    TInt64 => match b { TInt64 => true; _ => false }
+    TUInt => match b { TUInt => true; _ => false }
+    TUInt64 => match b { TUInt64 => true; _ => false }
+    TDouble => match b { TDouble => true; _ => false }
+    TFloat => match b { TFloat => true; _ => false }
+    TBool => match b { TBool => true; _ => false }
+    TByte => match b { TByte => true; _ => false }
+    TInt8 => match b { TInt8 => true; _ => false }
+    TChar => match b { TChar => true; _ => false }
+    TString => match b { TString => true; _ => false }
+    TUnit => match b { TUnit => true; _ => false }
+    TPtr => match b { TPtr => true; _ => false }
+    TStringBuilder => match b { TStringBuilder => true; _ => false }
+    TBytes => match b { TBytes => true; _ => false }
+    TStrView => match b { TStrView => true; _ => false }
+    TBytesView => match b { TBytesView => true; _ => false }
+    TWorld => match b { TWorld => true; _ => false }
+    TScope => match b { TScope => true; _ => false }
+    TAtomicInt => match b { TAtomicInt => true; _ => false }
+    TNever => match b { TNever => true; _ => false }
+    TParam(p1) => match b { TParam(p2) => p1 == p2; _ => false }
+    TDynTrait(t1) => match b { TDynTrait(t2) => t1 == t2; _ => false }
+    TArray(e1) => match b { TArray(e2) => ty_compat_eq(e1, e2); _ => false }
+    TFixedArray(e1) => match b { TFixedArray(e2) => ty_compat_eq(e1, e2); _ => false }
+    TImmArray(e1) => match b { TImmArray(e2) => ty_compat_eq(e1, e2); _ => false }
+    TOption(e1) => match b { TOption(e2) => ty_compat_eq(e1, e2); _ => false }
+    TResult(o1, e1) =>
+      match b {
+        TResult(o2, e2) => ty_compat_eq(o1, o2) && ty_compat_eq(e1, e2)
+        _ => false
+      }
+    TMap(k1, v1) =>
+      match b {
+        TMap(k2, v2) => ty_compat_eq(k1, k2) && ty_compat_eq(v1, v2)
+        _ => false
+      }
+    TChannel(e1) => match b { TChannel(e2) => ty_compat_eq(e1, e2); _ => false }
+    TMutex(e1) => match b { TMutex(e2) => ty_compat_eq(e1, e2); _ => false }
+    TStruct(n1, a1) =>
+      match b {
+        TStruct(n2, a2) => {
+          if n1 != n2 || a1.length() != a2.length() {
+            return false
+          }
+          let mut i = 0
+          while i < a1.length() {
+            if !ty_compat_eq(a1[i], a2[i]) {
+              return false
+            }
+            i = i + 1
+          }
+          true
+        }
+        _ => false
+      }
+    TEnum(n1, a1) =>
+      match b {
+        TEnum(n2, a2) => {
+          if n1 != n2 || a1.length() != a2.length() {
+            return false
+          }
+          let mut i = 0
+          while i < a1.length() {
+            if !ty_compat_eq(a1[i], a2[i]) {
+              return false
+            }
+            i = i + 1
+          }
+          true
+        }
+        _ => false
+      }
+    TTuple(e1) =>
+      match b {
+        TTuple(e2) => {
+          if e1.length() != e2.length() {
+            return false
+          }
+          let mut i = 0
+          while i < e1.length() {
+            if !ty_compat_eq(e1[i], e2[i]) {
+              return false
+            }
+            i = i + 1
+          }
+          true
+        }
+        _ => false
+      }
+    TFn(p1, r1) =>
+      match b {
+        TFn(p2, r2) => {
+          if p1.length() != p2.length() {
+            return false
+          }
+          let mut i = 0
+          while i < p1.length() {
+            if !ty_compat_eq(p1[i], p2[i]) {
+              return false
+            }
+            i = i + 1
+          }
+          ty_compat_eq(r1, r2)
+        }
+        _ => false
+      }
+    TError => true
+  }
+}
+
+///|
+fn ty_is_cast_scalar(t : Ty) -> Bool {
+  match t {
+    TInt
+    | TInt64
+    | TUInt
+    | TUInt64
+    | TDouble
+    | TFloat
+    | TByte
+    | TInt8
+    | TChar
+    | TBool => true
+    _ => false
+  }
+}
+
+///|
+fn ty_is_ptr_cast_int(t : Ty) -> Bool {
+  match t {
+    TInt | TInt64 | TUInt | TUInt64 => true
+    _ => false
+  }
+}
+
+///|
+fn ty_is_valid_ptr_cast(from : Ty, to : Ty) -> Bool {
+  let from_ptr = match from {
+    TPtr => true
+    _ => false
+  }
+  let to_ptr = match to {
+    TPtr => true
+    _ => false
+  }
+  (from_ptr && (to_ptr || ty_is_ptr_cast_int(to))) ||
+  (to_ptr && ty_is_ptr_cast_int(from))
 }
 
 ///|
@@ -4784,11 +5240,13 @@ fn pat_wilds(n : Int) -> Array[Pattern] {
 /// - `kind == 2`: `PVariant` named `ctor_name` with `arity` payload patterns
 /// - `kind == 3`: default (infinite type): keep only rows irrefutable at `c`
 fn pat_matrix_specialize(
+  tc : TypeChecker,
   rows : Array[Array[Pattern]],
   c : Int,
   kind : Int,
   ctor_name : String,
   arity : Int,
+  want_enum : String,
 ) -> Array[Array[Pattern]] {
   let out : Array[Array[Pattern]] = []
   let mut r = 0
@@ -4820,10 +5278,16 @@ fn pat_matrix_specialize(
       }
     } else if kind == 2 {
       match cell {
-        PVariant(_, vn, sub, _) =>
-          if vn == ctor_name && sub.length() == arity {
+        PVariant(pat_enum, vn, sub, _) => {
+          let pat_ok = if pat_enum == "" || want_enum == "" {
+            true
+          } else {
+            canon_pat_enum_name(tc, pat_enum, tc.in_default_arg_expansion) == want_enum
+          }
+          if pat_ok && vn == ctor_name && sub.length() == arity {
             out.push(pat_matrix_splice_row(row, c, sub))
           }
+        }
         _ =>
           if pat_is_irrefutable(cell) {
             out.push(pat_matrix_splice_row(row, c, pat_wilds(arity)))
@@ -4894,29 +5358,29 @@ fn check_pat_matrix_covers(
     TError | TNever => true
     TTuple(sub_tys) => {
       let n_tys = pat_matrix_splice_tys(col_tys, c, sub_tys)
-      let n_rows = pat_matrix_specialize(rows, c, 0, "", sub_tys.length())
+      let n_rows = pat_matrix_specialize(tc, rows, c, 0, "", sub_tys.length(), "")
       check_pat_matrix_covers(tc, n_tys, n_rows)
     }
     TBool => {
       let n_tys = pat_matrix_splice_tys(col_tys, c, [])
-      let t_rows = pat_matrix_specialize(rows, c, 1, "true", 0)
-      let f_rows = pat_matrix_specialize(rows, c, 1, "false", 0)
+      let t_rows = pat_matrix_specialize(tc, rows, c, 1, "true", 0, "")
+      let f_rows = pat_matrix_specialize(tc, rows, c, 1, "false", 0, "")
       check_pat_matrix_covers(tc, n_tys, t_rows) &&
       check_pat_matrix_covers(tc, n_tys, f_rows)
     }
     TOption(inner) => {
       let none_tys = pat_matrix_splice_tys(col_tys, c, [])
       let some_tys = pat_matrix_splice_tys(col_tys, c, [inner])
-      let none_rows = pat_matrix_specialize(rows, c, 2, "None", 0)
-      let some_rows = pat_matrix_specialize(rows, c, 2, "Some", 1)
+      let none_rows = pat_matrix_specialize(tc, rows, c, 2, "None", 0, "Option")
+      let some_rows = pat_matrix_specialize(tc, rows, c, 2, "Some", 1, "Option")
       check_pat_matrix_covers(tc, none_tys, none_rows) &&
       check_pat_matrix_covers(tc, some_tys, some_rows)
     }
     TResult(ok, err) => {
       let ok_tys = pat_matrix_splice_tys(col_tys, c, [ok])
       let err_tys = pat_matrix_splice_tys(col_tys, c, [err])
-      let ok_rows = pat_matrix_specialize(rows, c, 2, "Ok", 1)
-      let err_rows = pat_matrix_specialize(rows, c, 2, "Err", 1)
+      let ok_rows = pat_matrix_specialize(tc, rows, c, 2, "Ok", 1, "Result")
+      let err_rows = pat_matrix_specialize(tc, rows, c, 2, "Err", 1, "Result")
       check_pat_matrix_covers(tc, ok_tys, ok_rows) &&
       check_pat_matrix_covers(tc, err_tys, err_rows)
     }
@@ -4935,7 +5399,7 @@ fn check_pat_matrix_covers(
               fi = fi + 1
             }
             let v_tys = pat_matrix_splice_tys(col_tys, c, ftys)
-            let v_rows = pat_matrix_specialize(rows, c, 2, v.name, ftys.length())
+            let v_rows = pat_matrix_specialize(tc, rows, c, 2, v.name, ftys.length(), ename)
             if !check_pat_matrix_covers(tc, v_tys, v_rows) {
               return false
             }
@@ -4946,9 +5410,25 @@ fn check_pat_matrix_covers(
       }
     _ => {
       let n_tys = pat_matrix_splice_tys(col_tys, c, [])
-      let d_rows = pat_matrix_specialize(rows, c, 3, "", 0)
+      let d_rows = pat_matrix_specialize(tc, rows, c, 3, "", 0, "")
       check_pat_matrix_covers(tc, n_tys, d_rows)
     }
+  }
+}
+
+///|
+fn canon_pat_enum_name(
+  tc : TypeChecker,
+  pat_enum : String,
+  allow_transitive : Bool,
+) -> String {
+  if !has_qual_sep(pat_enum) {
+    return pat_enum
+  }
+  let qp = split_qual_name(pat_enum)
+  match resolve_pkg_for_lookup(tc, qp.prefix, allow_transitive) {
+    Some(ipkg) => ipkg.name + "::" + qp.name
+    None => pat_enum
   }
 }
 
@@ -5357,9 +5837,49 @@ fn bind_pattern(
             "use a pattern matching `" + ty_to_string(scrut_ty) + "`",
           )
       }
-    PVariant(_, vname, sub, sp) =>
+    PVariant(pat_enum, vname, sub, sp) => {
+      if pat_enum != "" && !env.in_default_arg {
+        if has_qual_sep(pat_enum) {
+          let qp_p = split_qual_name(pat_enum)
+          match resolve_pkg_for_lookup(tc, qp_p.prefix, false) {
+            Some(ipkg) =>
+              match ipkg.tc.enums.get(qp_p.name) {
+                Some(ei) =>
+                  if !ei.decl.is_pub {
+                    emit_private_err(tc, sp, "enum", ipkg.name, qp_p.name)
+                  }
+                None => ()
+              }
+            None =>
+              if !is_caller_alias_redirected(tc, pat_enum) &&
+                tc.priv_imported_types.contains(pat_enum) {
+                emit_private_err(tc, sp, "enum", qp_p.prefix, qp_p.name)
+              }
+          }
+        } else if tc.priv_imported_types.contains(pat_enum) {
+          let qp_p = split_qual_name(pat_enum)
+          emit_private_err(tc, sp, "enum", qp_p.prefix, qp_p.name)
+        }
+      }
+      let canon_pat_enum = if pat_enum != "" {
+        canon_pat_enum_name(tc, pat_enum, env.in_default_arg)
+      } else {
+        ""
+      }
       match scrut_ty {
-        TOption(inner) =>
+        TOption(inner) => {
+          if canon_pat_enum != "" && canon_pat_enum != "Option" {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "pattern enum `" + canon_pat_enum + "` does not match scrutinee type `Option`",
+              "Option",
+              canon_pat_enum,
+              "use `Option::" + vname + "` or `" + vname + "`",
+            )
+            return
+          }
           if vname == "Some" {
             if sub.length() != 1 {
               tc_err(
@@ -5398,7 +5918,20 @@ fn bind_pattern(
               "use `Some(...)` or `None`",
             )
           }
-        TResult(ok, err) =>
+        }
+        TResult(ok, err) => {
+          if canon_pat_enum != "" && canon_pat_enum != "Result" {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "pattern enum `" + canon_pat_enum + "` does not match scrutinee type `Result`",
+              "Result",
+              canon_pat_enum,
+              "use `Result::" + vname + "` or `" + vname + "`",
+            )
+            return
+          }
           if vname == "Ok" {
             if sub.length() != 1 {
               tc_err(
@@ -5440,7 +5973,20 @@ fn bind_pattern(
               "use `Ok(...)` or `Err(...)`",
             )
           }
+        }
         TEnum(ename, args) => {
+          if canon_pat_enum != "" && canon_pat_enum != ename {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "pattern enum `" + canon_pat_enum + "` does not match scrutinee enum `" + ename + "`",
+              ename,
+              canon_pat_enum,
+              "match against a variant of `" + ename + "`",
+            )
+            return
+          }
           let einfo_opt = lookup_enum_info_for_match(tc, ename)
           match einfo_opt {
             None => ()
@@ -5494,6 +6040,7 @@ fn bind_pattern(
         }
         _ => ()
       }
+    }
   }
 }
 
@@ -6196,15 +6743,55 @@ fn check_cond_with_bindings(
   env : Env,
   cond : Expr,
 ) -> Ty {
-  match cond {
-    EIs(scrut, pat, _) => {
-      let sty = check_expr(tc, env, scrut, None)
-      bind_pattern(tc, env, pat, sty)
-      TBool
+  // Iterative post-order traversal over `&&` trees to preserve exact left-to-right
+  // `EIs` binding order and diagnostics without overflowing the native stack.
+  let f_state : Array[Int] = []
+  let f_rhs : Array[Expr] = []
+  let f_sp : Array[Span] = []
+  let f_lty : Array[Ty] = []
+  let mut cur = cond
+  let mut has_val = false
+  let mut cur_ty = TBool
+  while true {
+    if !has_val {
+      match cur {
+        EBinary("&&", lhs, rhs, sp) => {
+          f_state.push(0)
+          f_rhs.push(rhs)
+          f_sp.push(sp)
+          f_lty.push(TError)
+          cur = lhs
+          continue
+        }
+        EIs(scrut, pat, _) => {
+          let sty = check_expr(tc, env, scrut, None)
+          bind_pattern(tc, env, pat, sty)
+          cur_ty = TBool
+          has_val = true
+        }
+        _ => {
+          cur_ty = check_expr(tc, env, cur, Some(TBool))
+          has_val = true
+        }
+      }
     }
-    EBinary("&&", lhs, rhs, sp) => {
-      let lty = check_cond_with_bindings(tc, env, lhs)
-      let rty = check_cond_with_bindings(tc, env, rhs)
+    if f_state.length() == 0 {
+      return cur_ty
+    }
+    let idx = f_state.length() - 1
+    if f_state[idx] == 0 {
+      f_state[idx] = 1
+      f_lty[idx] = cur_ty
+      cur = f_rhs[idx]
+      has_val = false
+    } else {
+      let lty = f_lty[idx]
+      let rty = cur_ty
+      let sp = f_sp[idx]
+      let _ = f_state.pop()
+      let _ = f_rhs.pop()
+      let _ = f_sp.pop()
+      let _ = f_lty.pop()
       if !ty_compat(TBool, lty) || !ty_compat(TBool, rty) {
         tc_err(
           tc,
@@ -6216,10 +6803,11 @@ fn check_cond_with_bindings(
           "use boolean operands with `&&`",
         )
       }
-      TBool
+      cur_ty = TBool
+      has_val = true
     }
-    _ => check_expr(tc, env, cond, Some(TBool))
   }
+  cur_ty
 }
 
 ///|
@@ -6309,6 +6897,467 @@ fn check_let(
     )
   }
   TUnit
+}
+
+///|
+fn ty_mentions_tparam(ty : Ty, tp : String) -> Bool {
+  match ty {
+    TParam(n) => n == tp
+    TArray(e) | TFixedArray(e) | TOption(e) | TChannel(e) | TMutex(e) =>
+      ty_mentions_tparam(e, tp)
+    TResult(ok_t, err_t) | TMap(ok_t, err_t) =>
+      ty_mentions_tparam(ok_t, tp) || ty_mentions_tparam(err_t, tp)
+    TTuple(xs) | TStruct(_, xs) | TEnum(_, xs) => {
+      let mut i = 0
+      while i < xs.length() {
+        if ty_mentions_tparam(xs[i], tp) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    TFn(ps, rt) => {
+      let mut i = 0
+      while i < ps.length() {
+        if ty_mentions_tparam(ps[i], tp) {
+          return true
+        }
+        i = i + 1
+      }
+      ty_mentions_tparam(rt, tp)
+    }
+    TInt
+    | TInt64
+    | TUInt
+    | TUInt64
+    | TDouble
+    | TFloat
+    | TBool
+    | TByte
+    | TInt8
+    | TChar
+    | TString
+    | TUnit
+    | TPtr
+    | TStringBuilder
+    | TBytes
+    | TStrView
+    | TBytesView
+    | TWorld
+    | TScope
+    | TAtomicInt
+    | TDynTrait(_)
+    | TNever
+    | TError => false
+    _ => true
+  }
+}
+
+///|
+/// A pure-Pion generic function/method whose declared return type is an
+/// unconstrained type parameter `T` that never appears in any parameter type
+/// cannot construct a `T` and therefore statically diverges (e.g. `halt::saying[T](...) -> T`).
+fn fn_ret_is_uninhabited_tparam(finfo : FnInfo) -> Bool {
+  if finfo.decl.type_params.length() == 0 {
+    return false
+  }
+  match finfo.ret_ty {
+    TParam(tp) => {
+      if !str_arr_contains(finfo.decl.type_params, tp) {
+        return false
+      }
+      let mut bi = 0
+      while bi < finfo.decl.type_bounds.length() {
+        let tb = finfo.decl.type_bounds[bi]
+        if tb.param == tp && tb.traits.length() > 0 {
+          return false
+        }
+        bi = bi + 1
+      }
+      let mut pi = 0
+      while pi < finfo.param_tys.length() {
+        if ty_mentions_tparam(finfo.param_tys[pi], tp) {
+          return false
+        }
+        pi = pi + 1
+      }
+      true
+    }
+    _ => false
+  }
+}
+
+///|
+fn fn_statically_diverges(finfo : FnInfo) -> Bool {
+  match finfo.ret_ty {
+    TNever => true
+    _ => fn_ret_is_uninhabited_tparam(finfo)
+  }
+}
+
+///|
+fn exprs_diverge(
+  tc : TypeChecker,
+  env : Env,
+  exprs : Array[Expr],
+  loop_depth : Int,
+  allow_return : Bool,
+) -> Bool {
+  let mut i = 0
+  while i < exprs.length() {
+    if expr_diverge(tc, env, exprs[i], loop_depth, allow_return) {
+      return true
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn expr_diverge(
+  tc : TypeChecker,
+  env : Env,
+  e : Expr,
+  loop_depth : Int,
+  allow_return : Bool,
+) -> Bool {
+  match e {
+    EBlock(stmts, _) => stmts_diverge(tc, env, stmts, loop_depth, allow_return)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if expr_diverge(tc, env, cond, loop_depth, allow_return) {
+        return true
+      }
+      match else_opt {
+        None => false
+        Some(else_e) =>
+          stmts_diverge(tc, env, then_stmts, loop_depth, allow_return) &&
+          expr_diverge(tc, env, else_e, loop_depth, allow_return)
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      if expr_diverge(tc, env, scrut, loop_depth, allow_return) {
+        return true
+      }
+      if arms.length() == 0 {
+        return false
+      }
+      let mut i = 0
+      while i < arms.length() {
+        if !expr_diverge(tc, env, arms[i].body, loop_depth, allow_return) {
+          return false
+        }
+        i = i + 1
+      }
+      true
+    }
+    ECall(callee, args, sp) => {
+      if expr_diverge(tc, env, callee, loop_depth, allow_return) {
+        return true
+      }
+      if exprs_diverge(tc, env, args, loop_depth, allow_return) {
+        return true
+      }
+      tc.never_calls.contains(span_key(sp))
+    }
+    EMethodCall(recv, _, args, sp) =>
+      expr_diverge(tc, env, recv, loop_depth, allow_return) ||
+      exprs_diverge(tc, env, args, loop_depth, allow_return) ||
+      tc.never_calls.contains(span_key(sp))
+    EClosure(_, _, _, _) => false
+    EUnary(_, inner, _)
+    | EField(inner, _, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | ETry(inner, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _)
+    | EIs(inner, _, _) => expr_diverge(tc, env, inner, loop_depth, allow_return)
+    EBinary(op, lhs, rhs, _) =>
+      if op == "&&" || op == "||" {
+        expr_diverge(tc, env, lhs, loop_depth, allow_return)
+      } else {
+        expr_diverge(tc, env, lhs, loop_depth, allow_return) ||
+        expr_diverge(tc, env, rhs, loop_depth, allow_return)
+      }
+    EIndex(a, b, _) | EScope(a, b, _) | ESpawn(a, b, _) =>
+      expr_diverge(tc, env, a, loop_depth, allow_return) ||
+      expr_diverge(tc, env, b, loop_depth, allow_return)
+    EArrayLit(xs, _) | ETuple(xs, _) | EInterp(xs, _) | EDotVariant(_, xs, _) =>
+      exprs_diverge(tc, env, xs, loop_depth, allow_return)
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(se) =>
+          if expr_diverge(tc, env, se, loop_depth, allow_return) {
+            return true
+          }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if expr_diverge(tc, env, fields[i].value, loop_depth, allow_return) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn exprs_has_reachable_break(
+  tc : TypeChecker,
+  env : Env,
+  exprs : Array[Expr],
+  target_depth : Int,
+) -> Bool {
+  let mut i = 0
+  while i < exprs.length() {
+    if expr_has_reachable_break(tc, env, exprs[i], target_depth) {
+      return true
+    }
+    if expr_diverge(tc, env, exprs[i], 0, true) {
+      return false
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn expr_has_reachable_break(
+  tc : TypeChecker,
+  env : Env,
+  e : Expr,
+  target_depth : Int,
+) -> Bool {
+  match e {
+    EBlock(stmts, _) => stmts_has_reachable_break(tc, env, stmts, target_depth)
+    EIf(cond, then_stmts, else_opt, _) => {
+      if expr_has_reachable_break(tc, env, cond, target_depth) {
+        return true
+      }
+      if expr_diverge(tc, env, cond, 0, true) {
+        return false
+      }
+      if stmts_has_reachable_break(tc, env, then_stmts, target_depth) {
+        return true
+      }
+      match else_opt {
+        Some(else_e) => expr_has_reachable_break(tc, env, else_e, target_depth)
+        None => false
+      }
+    }
+    EMatch(scrut, arms, _) => {
+      if expr_has_reachable_break(tc, env, scrut, target_depth) {
+        return true
+      }
+      if expr_diverge(tc, env, scrut, 0, true) {
+        return false
+      }
+      let mut i = 0
+      while i < arms.length() {
+        match arms[i].guard_expr {
+          Some(ge) =>
+            if expr_has_reachable_break(tc, env, ge, target_depth) {
+              return true
+            }
+          None => ()
+        }
+        if expr_has_reachable_break(tc, env, arms[i].body, target_depth) {
+          return true
+        }
+        i = i + 1
+      }
+      false
+    }
+    EClosure(_, _, _, _) => false
+    ECall(callee, args, _) =>
+      expr_has_reachable_break(tc, env, callee, target_depth) ||
+      (!expr_diverge(tc, env, callee, 0, true) &&
+        exprs_has_reachable_break(tc, env, args, target_depth))
+    EMethodCall(recv, _, args, _) =>
+      expr_has_reachable_break(tc, env, recv, target_depth) ||
+      (!expr_diverge(tc, env, recv, 0, true) &&
+        exprs_has_reachable_break(tc, env, args, target_depth))
+    EUnary(_, inner, _)
+    | EField(inner, _, _)
+    | EMove(inner, _)
+    | EAs(inner, _, _)
+    | ETry(inner, _)
+    | ENamedArg(_, _, inner, _)
+    | EMutArg(inner, _)
+    | EIs(inner, _, _) => expr_has_reachable_break(tc, env, inner, target_depth)
+    EBinary(_, lhs, rhs, _) | EIndex(lhs, rhs, _) | EScope(lhs, rhs, _) | ESpawn(lhs, rhs, _) =>
+      expr_has_reachable_break(tc, env, lhs, target_depth) ||
+      (!expr_diverge(tc, env, lhs, 0, true) &&
+        expr_has_reachable_break(tc, env, rhs, target_depth))
+    EArrayLit(xs, _) | ETuple(xs, _) | EInterp(xs, _) | EDotVariant(_, xs, _) =>
+      exprs_has_reachable_break(tc, env, xs, target_depth)
+    EStructLit(_, spread_opt, fields, _) => {
+      match spread_opt {
+        Some(se) => {
+          if expr_has_reachable_break(tc, env, se, target_depth) {
+            return true
+          }
+          if expr_diverge(tc, env, se, 0, true) {
+            return false
+          }
+        }
+        None => ()
+      }
+      let mut i = 0
+      while i < fields.length() {
+        if expr_has_reachable_break(tc, env, fields[i].value, target_depth) {
+          return true
+        }
+        if expr_diverge(tc, env, fields[i].value, 0, true) {
+          return false
+        }
+        i = i + 1
+      }
+      false
+    }
+    _ => false
+  }
+}
+
+///|
+fn stmt_has_reachable_break(
+  tc : TypeChecker,
+  env : Env,
+  s : Stmt,
+  target_depth : Int,
+) -> Bool {
+  match s {
+    SBreak(_) => target_depth == 0
+    SContinue(_) => false
+    SReturn(opt, _) =>
+      match opt {
+        Some(e) => expr_has_reachable_break(tc, env, e, target_depth)
+        None => false
+      }
+    SLet(_, _, _, e, _) | SLetTuple(_, _, e, _) | SExpr(e, _) =>
+      expr_has_reachable_break(tc, env, e, target_depth)
+    SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+      expr_has_reachable_break(tc, env, lhs, target_depth) ||
+      (!expr_diverge(tc, env, lhs, 0, true) &&
+        expr_has_reachable_break(tc, env, rhs, target_depth))
+    SDebugAssert(cond, msg, _) =>
+      expr_has_reachable_break(tc, env, cond, target_depth) ||
+      (!expr_diverge(tc, env, cond, 0, true) &&
+        expr_has_reachable_break(tc, env, msg, target_depth))
+    SGuard(cond, eb, _) =>
+      expr_has_reachable_break(tc, env, cond, target_depth) ||
+      (!expr_diverge(tc, env, cond, 0, true) &&
+        stmts_has_reachable_break(tc, env, eb, target_depth))
+    SWhile(cond, body, _) =>
+      expr_has_reachable_break(tc, env, cond, target_depth) ||
+      (!expr_diverge(tc, env, cond, 0, true) &&
+        stmts_has_reachable_break(tc, env, body, target_depth + 1))
+    SFor(init_s, cond, step_s, body, _) =>
+      stmt_has_reachable_break(tc, env, init_s, target_depth) ||
+      (!stmt_diverge(tc, env, init_s, 0, true) &&
+        (expr_has_reachable_break(tc, env, cond, target_depth) ||
+          (!expr_diverge(tc, env, cond, 0, true) &&
+            (stmts_has_reachable_break(tc, env, body, target_depth + 1) ||
+              stmt_has_reachable_break(tc, env, step_s, target_depth + 1)))))
+    SForRange(_, s_e, e_e, _, body, _) =>
+      expr_has_reachable_break(tc, env, s_e, target_depth) ||
+      (!expr_diverge(tc, env, s_e, 0, true) &&
+        (expr_has_reachable_break(tc, env, e_e, target_depth) ||
+          (!expr_diverge(tc, env, e_e, 0, true) &&
+            stmts_has_reachable_break(tc, env, body, target_depth + 1))))
+    SForIn(_, _, iter_e, body, _) =>
+      expr_has_reachable_break(tc, env, iter_e, target_depth) ||
+      (!expr_diverge(tc, env, iter_e, 0, true) &&
+        stmts_has_reachable_break(tc, env, body, target_depth + 1))
+  }
+}
+
+///|
+fn stmts_has_reachable_break(
+  tc : TypeChecker,
+  env : Env,
+  stmts : Array[Stmt],
+  target_depth : Int,
+) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if stmt_has_reachable_break(tc, env, stmts[i], target_depth) {
+      return true
+    }
+    if stmt_diverge(tc, env, stmts[i], 0, true) {
+      return false
+    }
+    i = i + 1
+  }
+  false
+}
+
+///|
+fn stmt_diverge(
+  tc : TypeChecker,
+  env : Env,
+  s : Stmt,
+  loop_depth : Int,
+  allow_return : Bool,
+) -> Bool {
+  match s {
+    SReturn(opt, _) =>
+      if allow_return {
+        true
+      } else {
+        match opt {
+          Some(e) => expr_diverge(tc, env, e, loop_depth, false)
+          None => false
+        }
+      }
+    SBreak(_) | SContinue(_) => loop_depth == 0
+    SLet(_, _, _, e, _) | SLetTuple(_, _, e, _) | SExpr(e, _) =>
+      expr_diverge(tc, env, e, loop_depth, allow_return)
+    SAssign(lhs, rhs, _) | SCompoundAssign(_, lhs, rhs, _) =>
+      expr_diverge(tc, env, lhs, loop_depth, allow_return) ||
+      expr_diverge(tc, env, rhs, loop_depth, allow_return)
+    SDebugAssert(_, _, _) => false
+    SGuard(cond, _, _) => expr_diverge(tc, env, cond, loop_depth, allow_return)
+    SWhile(cond, body, _) => {
+      if expr_diverge(tc, env, cond, loop_depth, allow_return) {
+        return true
+      }
+      match cond {
+        EBool(true, _) => !stmts_has_reachable_break(tc, env, body, 0)
+        _ => false
+      }
+    }
+    SFor(init_s, cond, _, _, _) =>
+      stmt_diverge(tc, env, init_s, loop_depth, allow_return) ||
+      expr_diverge(tc, env, cond, loop_depth, allow_return)
+    SForRange(_, s_e, e_e, _, _, _) =>
+      expr_diverge(tc, env, s_e, loop_depth, allow_return) ||
+      expr_diverge(tc, env, e_e, loop_depth, allow_return)
+    SForIn(_, _, iter_e, _, _) => expr_diverge(tc, env, iter_e, loop_depth, allow_return)
+  }
+}
+
+///|
+fn stmts_diverge(
+  tc : TypeChecker,
+  env : Env,
+  stmts : Array[Stmt],
+  loop_depth : Int,
+  allow_return : Bool,
+) -> Bool {
+  let mut i = 0
+  while i < stmts.length() {
+    if stmt_diverge(tc, env, stmts[i], loop_depth, allow_return) {
+      return true
+    }
+    i = i + 1
+  }
+  false
 }
 
 ///|
@@ -6690,8 +7739,26 @@ fn check_stmt(
     }
     SGuard(cond, else_body, sp) => {
       env_push(env)
-      let _ = check_stmts_ex(tc, env, else_body, None, false)
+      let diag_before = tc.diagnostics.length()
+      let else_ty = check_stmts_ex(tc, env, else_body, None, false)
       env_pop(env)
+      let else_has_err = tc.diagnostics.length() > diag_before ||
+        match else_ty {
+          TError => true
+          _ => false
+        }
+      let init_loop_depth = if env.in_loop_depth > 0 { 0 } else { 1 }
+      if !else_has_err && !stmts_diverge(tc, env, else_body, init_loop_depth, true) {
+        tc_err(
+          tc,
+          sp,
+          "E_GUARD_ELSE_NOT_DIVERGE",
+          "`guard ... else` body must diverge (`return`, `break`, `continue`, or `panic`)",
+          "diverging control flow",
+          "block that may fall through",
+          "end the `else` block with `return`, `break`, `continue`, or `panic(...)`",
+        )
+      }
       let cty = check_cond_with_bindings(tc, env, cond)
       if !ty_compat(TBool, cty) {
         tc_err(
@@ -6720,7 +7787,9 @@ fn check_stmt(
           "use a boolean condition",
         )
       }
+      env.in_loop_depth = env.in_loop_depth + 1
       let _ = check_stmts_ex(tc, env, body, None, false)
+      env.in_loop_depth = env.in_loop_depth - 1
       env_pop(env)
       TUnit
     }
@@ -6740,7 +7809,9 @@ fn check_stmt(
         )
       }
       let _ = check_stmt(tc, env, step_s, None)
+      env.in_loop_depth = env.in_loop_depth + 1
       let _ = check_stmts_ex(tc, env, body, None, false)
+      env.in_loop_depth = env.in_loop_depth - 1
       env_pop(env)
       TUnit
     }
@@ -6780,7 +7851,9 @@ fn check_stmt(
       let loop_var_ty = if valid_start { sty } else { TInt }
       env_push(env)
       env_define_line(env, vname, loop_var_ty, false, sp.line)
+      env.in_loop_depth = env.in_loop_depth + 1
       let _ = check_stmts_ex(tc, env, body, None, false)
+      env.in_loop_depth = env.in_loop_depth - 1
       env_pop(env)
       TUnit
     }
@@ -6807,11 +7880,25 @@ fn check_stmt(
         env_define_line(env, idx_name, TInt, false, sp.line)
       }
       env_define_line(env, vname, elem_ty, false, sp.line)
+      env.in_loop_depth = env.in_loop_depth + 1
       let _ = check_stmts_ex(tc, env, body, None, false)
+      env.in_loop_depth = env.in_loop_depth - 1
       env_pop(env)
       TUnit
     }
     SReturn(opt, sp) => {
+      if env.in_default_expr {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "cannot return from a default parameter expression",
+          "expression",
+          "return",
+          "remove `return` from the default parameter expression",
+        )
+        return TNever
+      }
       let exp_r : Option[Ty] = match env.ret_ty {
         TError => None
         _ => Some(env.ret_ty)
@@ -6847,7 +7934,34 @@ fn check_stmt(
       }
       TNever
     }
-    SBreak(_) | SContinue(_) => TNever
+    SBreak(sp) => {
+      if env.in_default_expr && env.in_loop_depth == 0 {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "cannot use `break` outside a loop in a default parameter expression",
+          "expression",
+          "`break`",
+          "remove `break` from the default parameter expression",
+        )
+      }
+      TNever
+    }
+    SContinue(sp) => {
+      if env.in_default_expr && env.in_loop_depth == 0 {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "cannot use `continue` outside a loop in a default parameter expression",
+          "expression",
+          "`continue`",
+          "remove `continue` from the default parameter expression",
+        )
+      }
+      TNever
+    }
     SDebugAssert(cond, msg, sp) => {
       let cty = check_expr(tc, env, cond, Some(TBool))
       if !ty_compat(TBool, cty) {
@@ -6889,6 +8003,9 @@ fn check_variant_ctor(
   expected : Option[Ty],
   sp : Span,
 ) -> Ty {
+  if sp.line > 0 {
+    tc.resolved_method_calls.set("ctor:" + span_key(sp), "1")
+  }
   if enum_name == "Option" || (enum_name == "" && (vname == "Some" || vname == "None")) {
     if vname != "Some" && vname != "None" {
       let mut ai = 0
@@ -7163,7 +8280,7 @@ fn is_c_abi_ret_ty(t : Ty) -> Bool {
 
 ///|
 fn canon_trait_name(tc : TypeChecker, name : String) -> String {
-  if tc.traits.contains(name) {
+  if !is_caller_alias_redirected(tc, name) && tc.traits.contains(name) {
     return name
   }
   let qp = split_qual_name(name)
@@ -7175,7 +8292,7 @@ fn canon_trait_name(tc : TypeChecker, name : String) -> String {
       }
       return raw_pkg + "::" + qp.name
     }
-    match resolve_alias_pkg(tc, qp.prefix) {
+    match resolve_pkg_for_lookup(tc, qp.prefix, tc.in_imported_default_arg) {
       Some(ipkg) => return ipkg.name + "::" + qp.name
       None => ()
     }
@@ -7184,32 +8301,146 @@ fn canon_trait_name(tc : TypeChecker, name : String) -> String {
 }
 
 ///|
+pub fn resolve_canonical_trait_name(tc : TypeChecker, name : String) -> String {
+  if tc.traits.contains(name) {
+    return name
+  }
+  let qp = split_qual_name(name)
+  if qp.prefix.length() > 0 {
+    if tc.pkg_name != "" && qp.prefix == tc.pkg_name && tc.traits.contains(qp.name) {
+      return qp.name
+    }
+    match lookup_imported_pkg_transitive(tc, qp.prefix) {
+      Some(ipkg) =>
+        if ipkg.tc.traits.contains(qp.name) {
+          return ipkg.name + "::" + qp.name
+        }
+      None => ()
+    }
+  }
+  name
+}
+
+///|
+struct SourceTraitLookup {
+  info : Option[TraitInfo]
+  canon_name : String
+  errored : Bool
+}
+
+///|
+/// Resolve a trait name written in source code (e.g. `dyn T`, `impl T for X`, `fn f[A : T]`).
+/// Enforces package aliasing (never falls back to another package's cache) and visibility.
+fn lookup_source_trait_ex(
+  tc : TypeChecker,
+  name : String,
+  sp : Span,
+  allow_priv : Bool,
+) -> SourceTraitLookup {
+  if has_qual_sep(name) {
+    let qp = split_qual_name(name)
+    if starts_with_str(qp.prefix, "@canon:") &&
+      slice_str(qp.prefix, 7, qp.prefix.length()) == tc.pkg_name {
+      return SourceTraitLookup::{ info: tc.traits.get(qp.name), canon_name: qp.name, errored: false }
+    }
+    let allow_priv = allow_priv || starts_with_str(qp.prefix, "@canon:")
+    match resolve_pkg_for_lookup(tc, qp.prefix, allow_priv) {
+      Some(ipkg) =>
+        match ipkg.tc.traits.get(qp.name) {
+          Some(ti) => {
+            let cname = ipkg.name + "::" + qp.name
+            if !ti.decl.is_pub && !allow_priv {
+              emit_private_err_at(tc, sp, "trait", ipkg.name, qp.name, ti.decl.span)
+              SourceTraitLookup::{ info: None, canon_name: cname, errored: true }
+            } else {
+              let rti = match tc.traits.get(cname) {
+                Some(qti) => qti
+                None => qualify_imported_trait_info(ipkg.name, ti)
+              }
+              SourceTraitLookup::{ info: Some(rti), canon_name: cname, errored: false }
+            }
+          }
+          None =>
+            SourceTraitLookup::{
+              info: None,
+              canon_name: ipkg.name + "::" + qp.name,
+              errored: false,
+            }
+        }
+      None => SourceTraitLookup::{ info: None, canon_name: name, errored: false }
+    }
+  } else {
+    SourceTraitLookup::{ info: tc.traits.get(name), canon_name: name, errored: false }
+  }
+}
+
+///|
 fn lookup_trait(tc : TypeChecker, name : String) -> Option[TraitInfo] {
+  match tc.traits.get(name) {
+    Some(ti) => return Some(ti)
+    None => ()
+  }
+  let qp = split_qual_name(name)
+  if qp.prefix.length() > 0 {
+    if tc.pkg_name != "" && qp.prefix == tc.pkg_name {
+      match tc.traits.get(qp.name) {
+        Some(ti) => return Some(ti)
+        None => ()
+      }
+    }
+    match lookup_imported_pkg_transitive(tc, qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.traits.get(qp.name) {
+          Some(ti) =>
+            if ti.decl.is_pub || tc.in_default_arg_expansion || tc.in_imported_default_arg {
+              return Some(qualify_imported_trait_info(ipkg.name, ti))
+            }
+          None => ()
+        }
+      None => ()
+    }
+  }
   let cname = canon_trait_name(tc, name)
   tc.traits.get(cname)
 }
 
 ///|
-pub fn lookup_trait_allow_private(tc : TypeChecker, name : String) -> Option[TraitInfo] {
-  let cname = canon_trait_name(tc, name)
-  match tc.traits.get(cname) {
-    Some(ti) => Some(ti)
-    None => {
-      let qp = split_qual_name(cname)
-      if qp.prefix.length() > 0 {
-        match lookup_imported_pkg_transitive(tc, qp.prefix) {
-          Some(ipkg) =>
-            match ipkg.tc.traits.get(qp.name) {
-              Some(ti) => Some(qualify_imported_trait_info(ipkg.name, ti))
-              None => None
-            }
-          None => None
-        }
-      } else {
-        None
+pub fn lookup_trait_canonical(
+  tc : TypeChecker,
+  name : String,
+) -> Option[TraitInfo] {
+  match tc.traits.get(name) {
+    Some(ti) => return Some(ti)
+    None => ()
+  }
+  let qp = split_qual_name(name)
+  if qp.prefix.length() > 0 {
+    if tc.pkg_name != "" && qp.prefix == tc.pkg_name {
+      match tc.traits.get(qp.name) {
+        Some(ti) => return Some(ti)
+        None => ()
       }
     }
+    match lookup_imported_pkg_transitive(tc, qp.prefix) {
+      Some(ipkg) =>
+        match ipkg.tc.traits.get(qp.name) {
+          Some(ti) => return Some(qualify_imported_trait_info(ipkg.name, ti))
+          None => ()
+        }
+      None => ()
+    }
   }
+  None
+}
+
+///|
+pub fn lookup_trait_allow_private(tc : TypeChecker, name : String) -> Option[TraitInfo] {
+  let clean = if starts_with_str(name, "@canon:") {
+    slice_str(name, 7, name.length())
+  } else {
+    name
+  }
+  lookup_trait_canonical(tc, clean)
 }
 
 ///|
@@ -7217,6 +8448,9 @@ pub fn lookup_trait_allow_private(tc : TypeChecker, name : String) -> Option[Tra
 /// means that package only, even when a root-anchor package has the canonical id
 /// `alias` and declares a `T`.
 fn tc_is_imported_pkg_alias(tc : TypeChecker, name : String) -> Bool {
+  if tc.in_imported_default_arg {
+    return false
+  }
   let qp = split_qual_name(name)
   qp.prefix != "" &&
   !starts_with_str(qp.prefix, "@canon:") &&
@@ -7228,7 +8462,7 @@ fn tc_is_imported_pkg_alias(tc : TypeChecker, name : String) -> Bool {
 fn canon_target_type_name(tc : TypeChecker, name : String) -> String {
   let qp = split_qual_name(name)
   if qp.prefix.length() > 0 {
-    match resolve_alias_pkg(tc, qp.prefix) {
+    match resolve_pkg_for_lookup(tc, qp.prefix, tc.in_imported_default_arg) {
       Some(ipkg) => return ipkg.name + "::" + qp.name
       None => ()
     }
@@ -8081,7 +9315,7 @@ fn tc_inst_fn_value(
     }
     i = i + 1
   }
-  tc_check_type_bounds(tc, env, fd, fresh, sp)
+  tc_check_type_bounds(tc, env, fd, fresh, sp, has_qual_sep(callee_name))
   tc_push_eq_uses(tc, env, fd, callee_name, fresh, sp)
   let inst : Array[Ty] = []
   i = 0
@@ -8547,7 +9781,7 @@ fn tc_refine_relay(
     }
     k = k + 1
   }
-  tc_check_type_bounds(tc, env, cf.decl, fresh, call_sp)
+  tc_check_type_bounds(tc, env, cf.decl, fresh, call_sp, cf.is_imported)
   tc_push_eq_uses(tc, env, cf.decl, cf.decl.name, fresh, call_sp)
   tc.let_infer.set(key, TTuple(targs))
   // Bind arguments to parameters exactly like the call did (named, optional
@@ -8650,88 +9884,6 @@ fn tc_refine_variant_args(
   }
 }
 
-///|
-/// Checks the trait bounds of `fd`'s type params against an instantiation.
-fn tc_check_type_bounds(
-  tc : TypeChecker,
-  env : Env,
-  fd : FnDecl,
-  subst : Map[String, Ty],
-  sp : Span,
-) -> Unit {
-  let mut bi = 0
-  while bi < fd.type_bounds.length() {
-    let tb = fd.type_bounds[bi]
-    match subst.get(tb.param) {
-      Some(concrete_ty) =>
-        match concrete_ty {
-          TError | TNever => ()
-          TParam(other_tp) => {
-            let mut ti = 0
-            while ti < tb.traits.length() {
-              let req_tr = canon_trait_name(tc, tb.traits[ti])
-              let has_bound = match env.type_bounds.get(other_tp) {
-                Some(btrs) => str_arr_contains(btrs, req_tr)
-                None => false
-              }
-              if !has_bound {
-                tc_err(
-                  tc,
-                  sp,
-                  "E_TRAIT_NOT_IMPLEMENTED",
-                  "type parameter `" +
-                  other_tp +
-                  "` does not satisfy trait bound `" +
-                  req_tr +
-                  "` required by `" +
-                  fd.name +
-                  "`",
-                  other_tp + " : " + req_tr,
-                  other_tp,
-                  "add `: " + req_tr + "` bound to type parameter `" + other_tp + "`",
-                )
-              }
-              ti = ti + 1
-            }
-          }
-          _ => {
-            let tname = ty_base_name(concrete_ty)
-            let mut ti = 0
-            while ti < tb.traits.length() {
-              let req_tr = canon_trait_name(tc, tb.traits[ti])
-              let impl_key = req_tr + "::" + tname
-              if !tc.impls.contains(impl_key) {
-                tc_err(
-                  tc,
-                  sp,
-                  "E_TRAIT_NOT_IMPLEMENTED",
-                  "type `" +
-                  ty_to_string(concrete_ty) +
-                  "` does not implement trait `" +
-                  req_tr +
-                  "` required by `" +
-                  fd.name +
-                  "`",
-                  "impl " + req_tr + " for " + ty_to_string(concrete_ty),
-                  ty_to_string(concrete_ty),
-                  "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
-                )
-                add_missing_impl_edit(tc, req_tr, concrete_ty)
-              } else if env.in_verify {
-                match tc.impls.get(impl_key) {
-                  Some(ii) => tc_check_verify_impl(tc, env, ii, req_tr, tname, fd.name, sp)
-                  None => ()
-                }
-              }
-              ti = ti + 1
-            }
-          }
-        }
-      None => ()
-    }
-    bi = bi + 1
-  }
-}
 
 ///|
 /// Records `fd`'s instantiation for `resolve_eq_uses`, which rejects
@@ -8950,7 +10102,8 @@ fn resolve_call_args_impl(
                 slots[found] = Some(expr)
                 slot_raw_idx[found] = ai
               } else if pf.label_kind == 2 {
-                slots[found] = Some(ECall(EIdent("Some", asp), [expr], asp))
+                let syn_sp = Span::{ file: asp.file, line: 0, col: 0 }
+                slots[found] = Some(ECall(EPath("Option", "Some", syn_sp), [expr], asp))
                 slot_raw_idx[found] = ai
                 slot_opt_wrapped[found] = true
               } else {
@@ -9034,7 +10187,7 @@ fn resolve_call_args_impl(
           }
           None =>
             if pk.label_kind == 2 {
-              out.push(EIdent("None", sp))
+              out.push(EPath("Option", "None", Span::{ file: sp.file, line: 0, col: 0 }))
               missing.push(false)
               from_default.push(false)
               raw_idx.push(-1)
@@ -9131,6 +10284,8 @@ fn make_default_arg_env(
   param_tys : Array[Ty],
   subst : Map[String, Ty],
   up_to : Int,
+  extra_type_params : Array[String],
+  is_imported : Bool,
 ) -> Env {
   let params = decl.params
   let def_scope : Map[String, VarBinding] = Map([])
@@ -9159,6 +10314,13 @@ fn make_default_arg_env(
     ti = ti + 1
   }
   ti = 0
+  while ti < extra_type_params.length() {
+    if !str_arr_contains(merged_tparams, extra_type_params[ti]) {
+      merged_tparams.push(extra_type_params[ti])
+    }
+    ti = ti + 1
+  }
+  ti = 0
   while ti < decl.type_params.length() {
     if !str_arr_contains(merged_tparams, decl.type_params[ti]) {
       merged_tparams.push(decl.type_params[ti])
@@ -9172,7 +10334,13 @@ fn make_default_arg_env(
     let ctrs : Array[String] = []
     let mut ci = 0
     while ci < tb.traits.length() {
-      ctrs.push(canon_trait_name(tc, tb.traits[ci]))
+      let raw_tr = tb.traits[ci]
+      let tr_n = if starts_with_str(raw_tr, "@canon:") || !is_imported {
+        canon_trait_name(tc, raw_tr)
+      } else {
+        raw_tr
+      }
+      ctrs.push(tr_n)
       ci = ci + 1
     }
     merged_bounds.set(tb.param, ctrs)
@@ -9189,8 +10357,10 @@ fn make_default_arg_env(
     fn_lparen_span: env.fn_lparen_span,
     fn_has_params: env.fn_has_params,
     closure_scope_floor: 0,
+    in_loop_depth: 0,
     inferred_ret: None,
     in_default_arg: true,
+    in_default_expr: true,
     in_no_io: env.in_no_io,
     no_io_fn_name: env.no_io_fn_name,
     in_verify: env.in_verify,
@@ -9423,6 +10593,7 @@ fn into_check_type_bounds(
   env : Env,
   bounds : Array[TypeBound],
   subst : Map[String, Ty],
+  is_imported : Bool,
 ) -> Bool {
   let mut bi = 0
   while bi < bounds.length() {
@@ -9434,7 +10605,12 @@ fn into_check_type_bounds(
           TParam(other_tp) => {
             let mut ti = 0
             while ti < tb.traits.length() {
-              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let raw_tr = tb.traits[ti]
+              let req_tr = if starts_with_str(raw_tr, "@canon:") || !is_imported {
+                canon_trait_name(tc, raw_tr)
+              } else {
+                raw_tr
+              }
               let has_bound = match env.type_bounds.get(other_tp) {
                 Some(btrs) => str_arr_contains(btrs, req_tr)
                 None => false
@@ -9449,7 +10625,12 @@ fn into_check_type_bounds(
             let tname = ty_base_name(concrete_ty)
             let mut ti = 0
             while ti < tb.traits.length() {
-              let req_tr = canon_trait_name(tc, tb.traits[ti])
+              let raw_tr = tb.traits[ti]
+              let req_tr = if starts_with_str(raw_tr, "@canon:") || !is_imported {
+                canon_trait_name(tc, raw_tr)
+              } else {
+                raw_tr
+              }
               if !tc.impls.contains(req_tr + "::" + tname) {
                 return false
               }
@@ -9583,7 +10764,7 @@ fn resolve_into_conversion(
                   if all_bound &&
                     ty_compat(target_ty, subst_ty(fi.ret_ty, subst)) &&
                     ty_compat(subst_ty(fi.param_tys[0], subst), src_ty) &&
-                    into_check_type_bounds(tc, env, fi.decl.type_bounds, subst) {
+                    into_check_type_bounds(tc, env, fi.decl.type_bounds, subst, fi.is_imported) {
                     if !seen.contains(mk) {
                       seen.set(mk, true)
                       let is_bare_tparam = match fi.param_tys[0] {
@@ -9652,7 +10833,7 @@ fn resolve_into_conversion(
                   if all_bound &&
                     ty_compat(subst_ty(fi.param_tys[0], subst), src_ty) &&
                     ty_compat(target_ty, subst_ty(fi.ret_ty, subst)) &&
-                    into_check_type_bounds(tc, env, fi.decl.type_bounds, subst) {
+                    into_check_type_bounds(tc, env, fi.decl.type_bounds, subst, fi.is_imported) {
                     if !seen.contains(mk) {
                       seen.set(mk, true)
                       tier1.push(IntoCandidate::{
@@ -9798,6 +10979,99 @@ fn into_adjust_arg_expected(
 }
 
 ///|
+fn tc_check_type_bounds(
+  tc : TypeChecker,
+  env : Env,
+  decl : FnDecl,
+  subst : Map[String, Ty],
+  sp : Span,
+  is_imported : Bool,
+) -> Unit {
+  let mut bi = 0
+  while bi < decl.type_bounds.length() {
+    let tb = decl.type_bounds[bi]
+    match subst.get(tb.param) {
+      Some(concrete_ty) =>
+        match concrete_ty {
+          TError | TNever => ()
+          TParam(other_tp) => {
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let raw_tr = tb.traits[ti]
+              let req_tr = if starts_with_str(raw_tr, "@canon:") || !is_imported {
+                canon_trait_name(tc, raw_tr)
+              } else {
+                raw_tr
+              }
+              let has_bound = match env.type_bounds.get(other_tp) {
+                Some(btrs) => str_arr_contains(btrs, req_tr)
+                None => false
+              }
+              if !has_bound {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TRAIT_NOT_IMPLEMENTED",
+                  "type parameter `" +
+                  other_tp +
+                  "` does not satisfy trait bound `" +
+                  req_tr +
+                  "` required by `" +
+                  decl.name +
+                  "`",
+                  other_tp + " : " + req_tr,
+                  other_tp,
+                  "add `: " + req_tr + "` bound to type parameter `" + other_tp + "`",
+                )
+              }
+              ti = ti + 1
+            }
+          }
+          _ => {
+            let tname = ty_base_name(concrete_ty)
+            let mut ti = 0
+            while ti < tb.traits.length() {
+              let raw_tr = tb.traits[ti]
+              let req_tr = if starts_with_str(raw_tr, "@canon:") || !is_imported {
+                canon_trait_name(tc, raw_tr)
+              } else {
+                raw_tr
+              }
+              let impl_key = req_tr + "::" + tname
+              if !tc.impls.contains(impl_key) {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TRAIT_NOT_IMPLEMENTED",
+                  "type `" +
+                  ty_to_string(concrete_ty) +
+                  "` does not implement trait `" +
+                  req_tr +
+                  "` required by `" +
+                  decl.name +
+                  "`",
+                  "impl " + req_tr + " for " + ty_to_string(concrete_ty),
+                  ty_to_string(concrete_ty),
+                  "add `impl " + req_tr + " for " + ty_to_string(concrete_ty) + " { ... }`",
+                )
+                add_missing_impl_edit(tc, req_tr, concrete_ty)
+              } else if env.in_verify {
+                match tc.impls.get(impl_key) {
+                  Some(ii) => tc_check_verify_impl(tc, env, ii, req_tr, tname, decl.name, sp)
+                  None => ()
+                }
+              }
+              ti = ti + 1
+            }
+          }
+        }
+      None => ()
+    }
+    bi = bi + 1
+  }
+}
+
+///|
 fn check_fn_call(
   tc : TypeChecker,
   env : Env,
@@ -9870,9 +11144,10 @@ fn check_fn_call(
     } else {
       None
     }
-    let saved_in_def = env.in_default_arg
-    if is_def {
-      env.in_default_arg = true
+    let arg_env = if is_def {
+      make_default_arg_env(tc, env, finfo.decl, finfo.param_tys, subst, i, [], finfo.is_imported)
+    } else {
+      env
     }
     let mut handled_opt_into = false
     if p_is_into && is_opt_wrap && raw_i >= 0 {
@@ -9884,10 +11159,9 @@ fn check_fn_call(
                 handled_opt_into = true
                 let inner_arg = some_args[0]
                 let inner_exp = into_adjust_arg_expected(tc, inner_arg, Some(inner_target), true)
-                let inner_aty = check_expr(tc, env, inner_arg, inner_exp)
-                env.in_default_arg = saved_in_def
+                let inner_aty = check_expr(tc, arg_env, inner_arg, inner_exp)
                 if !ty_compat(inner_target, inner_aty) {
-                  let ir = resolve_into_conversion(tc, env, inner_aty, inner_target, expr_span(inner_arg))
+                  let ir = resolve_into_conversion(tc, arg_env, inner_aty, inner_target, expr_span(inner_arg))
                   match ir.conv {
                     Some(conv) =>
                       tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
@@ -9921,10 +11195,13 @@ fn check_fn_call(
       } else {
         into_adjust_arg_expected(tc, resolved_args[i], exp_p, p_is_into)
       }
-      let arg_env = if is_def {
-        make_default_arg_env(tc, env, finfo.decl, finfo.param_tys, subst, i)
-      } else {
-        env
+      let saved_tc_def = tc.in_default_arg_expansion
+      let saved_tc_imp_def = tc.in_imported_default_arg
+      if is_def {
+        tc.in_default_arg_expansion = true
+        if finfo.is_imported {
+          tc.in_imported_default_arg = true
+        }
       }
       let aty = check_call_arg(
         tc,
@@ -9934,7 +11211,8 @@ fn check_fn_call(
         arg_exp,
         finfo.decl.name,
       )
-      env.in_default_arg = saved_in_def
+      tc.in_default_arg_expansion = saved_tc_def
+      tc.in_imported_default_arg = saved_tc_imp_def
       if !is_def {
         fnval_exp[i] = tc_fnval_exp_key(arg_exp)
       }
@@ -9988,7 +11266,7 @@ fn check_fn_call(
     true,
   )
   // Validate trait bounds on generic type parameters
-  tc_check_type_bounds(tc, env, finfo.decl, subst, sp)
+  tc_check_type_bounds(tc, env, finfo.decl, subst, sp, finfo.is_imported)
   if params_have_mut(finfo.decl.params) {
     let muts : Array[Bool] = []
     let mut mi = 0
@@ -10010,6 +11288,9 @@ fn check_fn_call(
   // A generic call that may relay fn values (`tc_refine_relay`), with the
   // instantiation its arguments fixed.
   tc_record_gcall(tc, finfo.decl, subst, sp)
+  if fn_statically_diverges(finfo) {
+    tc.never_calls.set(span_key(sp), true)
+  }
   // A type param no argument fixed is unresolved, never the callee's own
   // `TParam` leaking into the caller (`pass(second)` before `T` is known).
   subst_ty_mask_unbound(finfo.ret_ty, finfo.decl.type_params, subst)
@@ -11707,9 +12988,38 @@ fn check_method_call(
             } else {
               None
             }
-            let saved_in_def = env.in_default_arg
-            if is_def {
-              env.in_default_arg = true
+            let arg_env = if is_def {
+              let mtp : Array[String] = []
+              match tc.structs.get(sname) {
+                Some(si) => {
+                  let mut ti = 0
+                  while ti < si.decl.type_params.length() {
+                    mtp.push(si.decl.type_params[ti])
+                    ti = ti + 1
+                  }
+                }
+                None =>
+                  match tc.enums.get(sname) {
+                    Some(ei) => {
+                      let mut ti = 0
+                      while ti < ei.decl.type_params.length() {
+                        mtp.push(ei.decl.type_params[ti])
+                        ti = ti + 1
+                      }
+                    }
+                    None => ()
+                  }
+              }
+              let mut ti = 0
+              while ti < minfo.decl.type_params.length() {
+                if !str_arr_contains(mtp, minfo.decl.type_params[ti]) {
+                  mtp.push(minfo.decl.type_params[ti])
+                }
+                ti = ti + 1
+              }
+              make_default_arg_env(tc, env, minfo.decl, minfo.param_tys, subst, p_idx, mtp, minfo.is_imported)
+            } else {
+              env
             }
             let mut handled_opt_into = false
             if p_is_into && is_opt_wrap && raw_i >= 0 {
@@ -11721,10 +13031,9 @@ fn check_method_call(
                         handled_opt_into = true
                         let inner_arg = some_args[0]
                         let inner_exp = into_adjust_arg_expected(tc, inner_arg, Some(inner_target), true)
-                        let inner_aty = check_expr(tc, env, inner_arg, inner_exp)
-                        env.in_default_arg = saved_in_def
+                        let inner_aty = check_expr(tc, arg_env, inner_arg, inner_exp)
                         if !ty_compat(inner_target, inner_aty) {
-                          let ir = resolve_into_conversion(tc, env, inner_aty, inner_target, expr_span(inner_arg))
+                          let ir = resolve_into_conversion(tc, arg_env, inner_aty, inner_target, expr_span(inner_arg))
                           match ir.conv {
                             Some(conv) =>
                               tc.call_into_convs.set(span_key(sp) + "#" + raw_i.to_string(), conv)
@@ -11758,10 +13067,13 @@ fn check_method_call(
               } else {
                 into_adjust_arg_expected(tc, resolved_args[i], exp_p, p_is_into)
               }
-              let arg_env = if is_def {
-                make_default_arg_env(tc, env, minfo.decl, minfo.param_tys, subst, p_idx)
-              } else {
-                env
+              let saved_tc_def = tc.in_default_arg_expansion
+              let saved_tc_imp_def = tc.in_imported_default_arg
+              if is_def {
+                tc.in_default_arg_expansion = true
+                if minfo.is_imported {
+                  tc.in_imported_default_arg = true
+                }
               }
               let aty = check_call_arg(
                 tc,
@@ -11771,7 +13083,8 @@ fn check_method_call(
                 arg_exp,
                 key,
               )
-              env.in_default_arg = saved_in_def
+              tc.in_default_arg_expansion = saved_tc_def
+              tc.in_imported_default_arg = saved_tc_imp_def
               if !is_def {
                 fnval_exp[i] = tc_fnval_exp_key(arg_exp)
               }
@@ -11824,6 +13137,11 @@ fn check_method_call(
             "in method `" + key + "`",
             false,
           )
+          tc_check_type_bounds(tc, env, minfo.decl, subst, sp, minfo.is_imported)
+          tc.resolved_method_calls.set(span_key(sp), sname + "::" + method_name)
+          if fn_statically_diverges(minfo) {
+            tc.never_calls.set(span_key(sp), true)
+          }
           let mtarget = tc_qualify_local_name(tc, sname) + "::" + method_name
           tc_check_verify_callee(tc, env, minfo.decl, mtarget, sp)
           tc_record_call(tc, env, sp, mtarget, minfo.decl.type_params, subst)
@@ -11831,7 +13149,6 @@ fn check_method_call(
           if use_named {
             tc_record_named_targs(tc, minfo.decl, subst, sp)
           }
-          tc_check_type_bounds(tc, env, minfo.decl, subst, sp)
           tc_push_eq_uses(tc, env, minfo.decl, key, subst, sp)
           if minfo.decl.type_params.length() > 0 {
             tc_record_gcall(tc, minfo.decl, subst, sp)
@@ -11929,6 +13246,11 @@ fn check_method_call(
                         }
                         ai = ai + 1
                       }
+                      match rty {
+                        TNever => tc.never_calls.set(span_key(sp), true)
+                        _ => ()
+                      }
+                      tc.resolved_method_calls.set(span_key(sp), "@field::" + sname + "::" + method_name)
                       return rty
                     }
                     _ => ()
@@ -11998,6 +13320,10 @@ fn check_method_call(
                   )
                 }
                 ai = ai + 1
+              }
+              match tm.ret_ty {
+                TNever => tc.never_calls.set(span_key(sp), true)
+                _ => ()
               }
               return tm.ret_ty
             }
@@ -12070,7 +13396,12 @@ fn check_method_call(
                         bound_traits[bi] + "::" + tp_name + "::" + method_name,
                       )
                     }
-                    return subst_ty(tm.ret_ty, self_subst)
+                    let subst_rt = subst_ty(tm.ret_ty, self_subst)
+                    match subst_rt {
+                      TNever => tc.never_calls.set(span_key(sp), true)
+                      _ => ()
+                    }
+                    return subst_rt
                   }
                   mi = mi + 1
                 }
@@ -12125,6 +13456,10 @@ fn check_method_call(
         }
         i = i + 1
       }
+      tc.resolved_method_calls.set(span_key(sp), ty_base_name(recv_ty) + "::" + method_name)
+      if fn_statically_diverges(minfo) {
+        tc.never_calls.set(span_key(sp), true)
+      }
       tc_check_verify_callee(tc, env, minfo.decl, itarget, sp)
       if env.in_verify || tc.record_analyze {
         tc.call_targets.set(span_key(sp), itarget)
@@ -12143,6 +13478,306 @@ fn check_method_call(
     "define `fn " + ty_to_string(recv_ty) + "::" + method_name + "` or check method name",
   )
   TError
+}
+
+///|
+fn check_binary_combine(
+  tc : TypeChecker,
+  env : Env,
+  op : String,
+  lty : Ty,
+  rty : Ty,
+  sp : Span,
+) -> Ty {
+  if op == "&&" || op == "||" {
+    if !ty_compat(TBool, lty) || !ty_compat(TBool, rty) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "operator `" + op + "` requires `Bool` operands",
+        "Bool",
+        ty_to_string(lty) + " and " + ty_to_string(rty),
+        "use `Bool` operands with `" + op + "`",
+      )
+    }
+    TBool
+  } else if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
+    if op == "==" || op == "!=" {
+      let tps : Array[String] = []
+      collect_eq_tparams_in_ty(tc, lty, tps, [])
+      let mut ti = 0
+      while ti < tps.length() {
+        if env.fn_key != "" && str_arr_contains(env.type_params, tps[ti]) {
+          let _ = eq_tparams_add(tc, env.fn_key, tps[ti])
+          if env.in_verify {
+            let _ = verify_eq_tparams_add(tc, env.fn_key, tps[ti])
+          }
+        }
+        ti = ti + 1
+      }
+    }
+    if (op == "==" || op == "!=") && !eq_comparable(tc, lty) {
+      let lname = ty_to_string(lty)
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "operator `" +
+        op +
+        "` is not supported on `" +
+        lname +
+        "` (no implicit pointer-identity comparison)",
+        "value-comparable type",
+        lname,
+        "use `match` to inspect `" + lname + "` values",
+      )
+    } else if !ty_compat(lty, rty) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "comparison `" + op + "` operand type mismatch",
+        ty_to_string(lty),
+        ty_to_string(rty),
+        "compare values of the same type",
+      )
+    }
+    TBool
+  } else if op == "<<" || op == ">>" {
+    if !ty_compat(TInt, rty) && !ty_compat(lty, rty) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "shift operator `" + op + "` count must be `Int`",
+        "Int",
+        ty_to_string(rty),
+        "use an `Int` shift count for `" + op + "`",
+      )
+    }
+    lty
+  } else {
+    let op_ok = if op == "+" {
+      match lty {
+        TInt
+        | TInt64
+        | TUInt
+        | TUInt64
+        | TDouble
+        | TFloat
+        | TByte
+        | TInt8
+        | TString
+        | TParam(_)
+        | TError
+        | TNever => true
+        _ => false
+      }
+    } else if op == "-" || op == "*" || op == "/" || op == "%" {
+      match lty {
+        TInt
+        | TInt64
+        | TUInt
+        | TUInt64
+        | TDouble
+        | TFloat
+        | TByte
+        | TInt8
+        | TParam(_)
+        | TError
+        | TNever => true
+        _ => false
+      }
+    } else if op == "&" || op == "|" || op == "^" {
+      match lty {
+        TInt
+        | TInt64
+        | TUInt
+        | TUInt64
+        | TByte
+        | TInt8
+        | TParam(_)
+        | TError
+        | TNever => true
+        _ => false
+      }
+    } else {
+      true
+    }
+    if !op_ok {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "operator `" + op + "` is not supported on `" + ty_to_string(lty) + "`",
+        if op == "+" {
+          "numeric type or String"
+        } else if op == "&" || op == "|" || op == "^" {
+          "integer type"
+        } else {
+          "numeric type"
+        },
+        ty_to_string(lty),
+        "use a supported operand type for `" + op + "`",
+      )
+    } else if !ty_compat(lty, rty) {
+      tc_err(
+        tc,
+        sp,
+        "E_TYPE_MISMATCH",
+        "binary operator `" + op + "` operand type mismatch",
+        ty_to_string(lty),
+        ty_to_string(rty),
+        "use matching operand types for `" + op + "`",
+      )
+    }
+    lty
+  }
+}
+
+///|
+/// Iterative `EBinary` type-checker using an explicit heap stack so 4,000+ deep
+/// binary expression chains/trees never overflow the stack in `check_expr_inner`.
+fn check_binary_chain(
+  tc : TypeChecker,
+  env : Env,
+  root_op : String,
+  root_lhs : Expr,
+  root_rhs : Expr,
+  root_sp : Span,
+  root_expected : Option[Ty],
+) -> Ty {
+  // state 0: waiting for lhs; state 1: waiting for rhs;
+  // state 2: dot-variant `==`/`!=` waiting for rhs first; state 3: waiting for lhs
+  let f_state : Array[Int] = []
+  let f_op : Array[String] = []
+  let f_lhs : Array[Expr] = []
+  let f_rhs : Array[Expr] = []
+  let f_sp : Array[Span] = []
+  let f_ty : Array[Ty] = []
+  let mut cur : Expr = EBinary(root_op, root_lhs, root_rhs, root_sp)
+  let mut cur_exp : Option[Ty] = root_expected
+  let mut has_val = false
+  let mut cur_ty : Ty = TError
+  while true {
+    if !has_val {
+      match cur {
+        EBinary(op, lhs, rhs, sp) => {
+          let is_arith_or_bit = op != "&&" &&
+            op != "||" &&
+            op != "==" &&
+            op != "!=" &&
+            op != "<" &&
+            op != "<=" &&
+            op != ">" &&
+            op != ">="
+          let lhs_exp : Option[Ty] = if is_arith_or_bit { cur_exp } else { None }
+          let lhs_is_dot_variant = match lhs {
+            EDotVariant(_, _, _) => true
+            _ => false
+          }
+          if (op == "==" || op == "!=") && lhs_is_dot_variant {
+            f_state.push(2)
+            f_op.push(op)
+            f_lhs.push(lhs)
+            f_rhs.push(rhs)
+            f_sp.push(sp)
+            f_ty.push(TError)
+            cur = rhs
+            cur_exp = None
+          } else {
+            f_state.push(0)
+            f_op.push(op)
+            f_lhs.push(lhs)
+            f_rhs.push(rhs)
+            f_sp.push(sp)
+            f_ty.push(TError)
+            cur = lhs
+            cur_exp = lhs_exp
+          }
+          continue
+        }
+        _ => {
+          cur_ty = check_expr(tc, env, cur, cur_exp)
+          has_val = true
+        }
+      }
+    }
+    if f_state.length() == 0 {
+      return cur_ty
+    }
+    let idx = f_state.length() - 1
+    let st = f_state[idx]
+    let op = f_op[idx]
+    let lhs = f_lhs[idx]
+    let rhs = f_rhs[idx]
+    let sp = f_sp[idx]
+    if st == 0 {
+      f_state[idx] = 1
+      f_ty[idx] = cur_ty
+      let rhs_exp : Option[Ty] = if op == "<<" || op == ">>" {
+        match cur_ty {
+          TUInt | TUInt64 | TInt64 =>
+            match shift_rhs_ty_hint(tc, env, rhs) {
+              Some(ht) =>
+                match ht {
+                  TInt | TUInt | TUInt64 | TInt64 => Some(ht)
+                  _ => Some(cur_ty)
+                }
+              None => Some(cur_ty)
+            }
+          _ => Some(cur_ty)
+        }
+      } else {
+        Some(cur_ty)
+      }
+      cur = rhs
+      cur_exp = rhs_exp
+      has_val = false
+    } else if st == 1 {
+      let lty = f_ty[idx]
+      let rty = cur_ty
+      let _ = f_state.pop()
+      let _ = f_op.pop()
+      let _ = f_lhs.pop()
+      let _ = f_rhs.pop()
+      let _ = f_sp.pop()
+      let _ = f_ty.pop()
+      if op == "<<" || op == ">>" {
+        match rty {
+          TError => ()
+          _ => tc.shift_rhs_infer.set(span_key(sp), rty)
+        }
+      }
+      cur_ty = check_binary_combine(tc, env, op, lty, rty, sp)
+      if env.in_verify || tc.record_analyze {
+        tc.expr_tys.set(span_key(sp), cur_ty)
+      }
+      has_val = true
+    } else if st == 2 {
+      f_state[idx] = 3
+      f_ty[idx] = cur_ty
+      cur = lhs
+      cur_exp = Some(cur_ty)
+      has_val = false
+    } else {
+      let rty = f_ty[idx]
+      let lty = cur_ty
+      let _ = f_state.pop()
+      let _ = f_op.pop()
+      let _ = f_lhs.pop()
+      let _ = f_rhs.pop()
+      let _ = f_sp.pop()
+      let _ = f_ty.pop()
+      cur_ty = check_binary_combine(tc, env, op, lty, rty, sp)
+      if env.in_verify || tc.record_analyze {
+        tc.expr_tys.set(span_key(sp), cur_ty)
+      }
+      has_val = true
+    }
+  }
+  cur_ty
 }
 
 ///|
@@ -12386,6 +14021,10 @@ fn check_expr_inner(
       if !tc_is_imported_pkg_alias(tc, qual) &&
         tc.enums.contains(qual) &&
         (tc_enum_has_variant(tc, qual, mem) || !tc.methods.contains(qual + "::" + mem)) {
+        if !env.in_default_arg && tc.priv_imported_types.contains(qual) {
+          let qp_p = split_qual_name(qual)
+          emit_private_err(tc, sp, "enum", qp_p.prefix, qp_p.name)
+        }
         return check_variant_ctor(tc, env, qual, mem, [], expected, sp)
       }
       let qp = split_qual_name(qual)
@@ -12397,8 +14036,12 @@ fn check_expr_inner(
             match ipkg.tc.enums.get(q_sub) {
               Some(ei) =>
                 if enum_info_has_variant(ei, mem) || !ipkg.tc.methods.contains(q_sub + "::" + mem) {
-                  if !ei.decl.is_pub && !env.in_default_arg {
-                    emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                  if !ei.decl.is_pub {
+                    if !env.in_default_arg {
+                      emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                    } else {
+                      tc_ensure_priv_enum_registered(tc, ipkg, q_sub, ei)
+                    }
                   }
                   return check_variant_ctor(
                     tc,
@@ -12813,194 +14456,8 @@ fn check_expr_inner(
         ity
       }
     }
-    EBinary(op, lhs, rhs, sp) => {
-      let is_arith_or_bit = op != "&&" &&
-        op != "||" &&
-        op != "==" &&
-        op != "!=" &&
-        op != "<" &&
-        op != "<=" &&
-        op != ">" &&
-        op != ">="
-      let lhs_exp : Option[Ty] = if is_arith_or_bit { expected } else { None }
-      let lhs_is_dot_variant = match lhs {
-        EDotVariant(_, _, _) => true
-        _ => false
-      }
-      let mut lty = TError
-      let mut rty = TError
-      if (op == "==" || op == "!=") && lhs_is_dot_variant {
-        rty = check_expr(tc, env, rhs, None)
-        lty = check_expr(tc, env, lhs, Some(rty))
-      } else if op == "<<" || op == ">>" {
-        lty = check_expr(tc, env, lhs, lhs_exp)
-        let rhs_exp : Option[Ty] = match lty {
-          TUInt | TUInt64 | TInt64 =>
-            match shift_rhs_ty_hint(tc, env, rhs) {
-              Some(ht) =>
-                match ht {
-                  TInt | TUInt | TUInt64 | TInt64 => Some(ht)
-                  _ => Some(lty)
-                }
-              None => Some(lty)
-            }
-          _ => Some(lty)
-        }
-        rty = check_expr(tc, env, rhs, rhs_exp)
-        match rty {
-          TError => ()
-          _ => tc.shift_rhs_infer.set(span_key(sp), rty)
-        }
-      } else {
-        lty = check_expr(tc, env, lhs, lhs_exp)
-        rty = check_expr(tc, env, rhs, Some(lty))
-      }
-      if op == "&&" || op == "||" {
-        if !ty_compat(TBool, lty) || !ty_compat(TBool, rty) {
-          tc_err(
-            tc,
-            sp,
-            "E_TYPE_MISMATCH",
-            "operator `" + op + "` requires `Bool` operands",
-            "Bool",
-            ty_to_string(lty) + " and " + ty_to_string(rty),
-            "use `Bool` operands with `" + op + "`",
-          )
-        }
-        TBool
-      } else if op == "==" || op == "!=" || op == "<" || op == "<=" || op == ">" || op == ">=" {
-        if op == "==" || op == "!=" {
-          let tps : Array[String] = []
-          collect_eq_tparams_in_ty(tc, lty, tps, [])
-          let mut ti = 0
-          while ti < tps.length() {
-            if env.fn_key != "" && str_arr_contains(env.type_params, tps[ti]) {
-              let _ = eq_tparams_add(tc, env.fn_key, tps[ti])
-              if env.in_verify {
-                let _ = verify_eq_tparams_add(tc, env.fn_key, tps[ti])
-              }
-            }
-            ti = ti + 1
-          }
-        }
-        if (op == "==" || op == "!=") && !eq_comparable(tc, lty) {
-          let lname = ty_to_string(lty)
-          tc_err(
-            tc,
-            sp,
-            "E_TYPE_MISMATCH",
-            "operator `" +
-            op +
-            "` is not supported on `" +
-            lname +
-            "` (no implicit pointer-identity comparison)",
-            "value-comparable type",
-            lname,
-            "use `match` to inspect `" + lname + "` values",
-          )
-        } else if !ty_compat(lty, rty) {
-          tc_err(
-            tc,
-            sp,
-            "E_TYPE_MISMATCH",
-            "comparison `" + op + "` operand type mismatch",
-            ty_to_string(lty),
-            ty_to_string(rty),
-            "compare values of the same type",
-          )
-        }
-        TBool
-      } else if op == "<<" || op == ">>" {
-        if !ty_compat(TInt, rty) && !ty_compat(lty, rty) {
-          tc_err(
-            tc,
-            sp,
-            "E_TYPE_MISMATCH",
-            "shift operator `" + op + "` count must be `Int`",
-            "Int",
-            ty_to_string(rty),
-            "use an `Int` shift count for `" + op + "`",
-          )
-        }
-        lty
-      } else {
-        let op_ok = if op == "+" {
-          match lty {
-            TInt
-            | TInt64
-            | TUInt
-            | TUInt64
-            | TDouble
-            | TFloat
-            | TByte
-            | TInt8
-            | TString
-            | TParam(_)
-            | TError
-            | TNever => true
-            _ => false
-          }
-        } else if op == "-" || op == "*" || op == "/" || op == "%" {
-          match lty {
-            TInt
-            | TInt64
-            | TUInt
-            | TUInt64
-            | TDouble
-            | TFloat
-            | TByte
-            | TInt8
-            | TParam(_)
-            | TError
-            | TNever => true
-            _ => false
-          }
-        } else if op == "&" || op == "|" || op == "^" {
-          match lty {
-            TInt
-            | TInt64
-            | TUInt
-            | TUInt64
-            | TByte
-            | TInt8
-            | TParam(_)
-            | TError
-            | TNever => true
-            _ => false
-          }
-        } else {
-          true
-        }
-        if !op_ok {
-          tc_err(
-            tc,
-            sp,
-            "E_TYPE_MISMATCH",
-            "operator `" + op + "` is not supported on `" + ty_to_string(lty) + "`",
-            if op == "+" {
-              "numeric type or String"
-            } else if op == "&" || op == "|" || op == "^" {
-              "integer type"
-            } else {
-              "numeric type"
-            },
-            ty_to_string(lty),
-            "use a supported operand type for `" + op + "`",
-          )
-        } else if !ty_compat(lty, rty) {
-          tc_err(
-            tc,
-            sp,
-            "E_TYPE_MISMATCH",
-            "binary operator `" + op + "` operand type mismatch",
-            ty_to_string(lty),
-            ty_to_string(rty),
-            "use matching operand types for `" + op + "`",
-          )
-        }
-        lty
-      }
-    }
+    EBinary(op, lhs, rhs, sp) =>
+      check_binary_chain(tc, env, op, lhs, rhs, sp, expected)
     ECall(callee, args, sp) =>
       match callee {
         EIdent(name, _) => {
@@ -13018,9 +14475,24 @@ fn check_expr_inner(
               }
             None => false
           }
-          let has_user_callee = has_local_fn ||
-            tc.fns.contains(name) ||
-            tc.extern_fns.contains(name)
+          if !has_local_fn {
+            // Invariant: generic bodies and default_exprs are checked under unsubstituted
+            // `TParam`s before monomorphization, so a call-site span has identical
+            // local-vs-nonlocal resolution across all contexts.
+            tc.resolved_method_calls.set("call_nonlocal:" + span_key(sp), name)
+          }
+          let has_const_fn = match tc.consts.get(name) {
+            Some(TFn(_, _)) => true
+            _ => false
+          }
+          let has_user_callee = if tc.in_imported_default_arg {
+            has_local_fn
+          } else {
+            has_local_fn ||
+              has_const_fn ||
+              tc.fns.contains(name) ||
+              tc.extern_fns.contains(name)
+          }
           if !has_user_callee {
           if is_world_builtin(name) {
             return check_world_builtin_call(tc, env, name, args, sp)
@@ -13158,11 +14630,11 @@ fn check_expr_inner(
                   )
                 }
               EPath(alias_name, mem, psp) =>
-                match resolve_alias_pkg(tc, alias_name) {
+                match resolve_pkg_for_lookup(tc, alias_name, env.in_default_arg) {
                   Some(ipkg) =>
                     match ipkg.tc.extern_fns.get(mem) {
                       Some(ei) =>
-                        if !ei.decl.is_pub {
+                        if !ei.decl.is_pub && !env.in_default_arg {
                           tc_err(
                             tc,
                             psp,
@@ -13555,6 +15027,7 @@ fn check_expr_inner(
               let _ = check_expr(tc, env, args[i], None)
               i = i + 1
             }
+            tc.never_calls.set(span_key(sp), true)
             return TNever
           }
           }
@@ -13571,6 +15044,22 @@ fn check_expr_inner(
                       "live binding",
                       "moved variable `" + name + "`",
                       "do not call `" + name + "` after `move`",
+                    )
+                  }
+                  if args.length() != ptys.length() {
+                    tc_err(
+                      tc,
+                      sp,
+                      "E_ARITY_MISMATCH",
+                      "closure `" +
+                      name +
+                      "` expects " +
+                      ptys.length().to_string() +
+                      " argument(s), found " +
+                      args.length().to_string(),
+                      ptys.length().to_string() + " args",
+                      args.length().to_string() + " args",
+                      "pass " + ptys.length().to_string() + " argument(s)",
                     )
                   }
                   let mut i = 0
@@ -13594,39 +15083,98 @@ fn check_expr_inner(
                     }
                     i = i + 1
                   }
+                  match rty {
+                    TNever => tc.never_calls.set(span_key(sp), true)
+                    _ => ()
+                  }
                   return rty
                 }
                 _ => ()
               }
             None => ()
           }
+          if !tc.in_imported_default_arg {
+            match tc.consts.get(name) {
+              Some(TFn(ptys, rty)) => {
+                tc.resolved_method_calls.set("call_pkg:" + span_key(sp), name)
+                if args.length() != ptys.length() {
+                  tc_err(
+                    tc,
+                    sp,
+                    "E_ARITY_MISMATCH",
+                    "closure `" +
+                    name +
+                    "` expects " +
+                    ptys.length().to_string() +
+                    " argument(s), found " +
+                    args.length().to_string(),
+                    ptys.length().to_string() + " args",
+                    args.length().to_string() + " args",
+                    "pass " + ptys.length().to_string() + " argument(s)",
+                  )
+                }
+                let mut i = 0
+                while i < args.length() {
+                  let ep : Option[Ty] = if i < ptys.length() {
+                    Some(ptys[i])
+                  } else {
+                    None
+                  }
+                  let aty = check_expr(tc, env, args[i], ep)
+                  if i < ptys.length() && !ty_compat(ptys[i], aty) {
+                    tc_err(
+                      tc,
+                      expr_span(args[i]),
+                      "E_TYPE_MISMATCH",
+                      "closure argument type mismatch",
+                      ty_to_string(ptys[i]),
+                      ty_to_string(aty),
+                      "pass `" + ty_to_string(ptys[i]) + "`",
+                    )
+                  }
+                  i = i + 1
+                }
+                match rty {
+                  TNever => tc.never_calls.set(span_key(sp), true)
+                  _ => ()
+                }
+                return rty
+              }
+              _ => ()
+            }
+          }
           if name == "Some" ||
             name == "Ok" ||
             name == "Err" ||
-            (tc.variant_to_enum.contains(name) && !tc.fns.contains(name) && !tc.extern_fns.contains(name)) {
+            (!tc.in_imported_default_arg && tc.variant_to_enum.contains(name) && !tc.fns.contains(name) && !tc.extern_fns.contains(name)) {
             return check_variant_ctor(tc, env, "", name, args, expected, sp)
           }
-          match tc.fns.get(name) {
-            Some(finfo) =>
-              return check_fn_call(
-                tc,
-                env,
-                finfo,
-                args,
-                expected,
-                sp,
-                tc_qualify_local_name(tc, name),
-              )
-            None => ()
-          }
-          match tc.extern_fns.get(name) {
-            Some(einfo) => {
-              if tc.record_analyze {
-                tc.call_targets.set(span_key(sp), tc_qualify_local_name(tc, name))
+          if !tc.in_imported_default_arg {
+            match tc.fns.get(name) {
+              Some(finfo) => {
+                tc.resolved_method_calls.set("call_pkg:" + span_key(sp), name)
+                return check_fn_call(
+                  tc,
+                  env,
+                  finfo,
+                  args,
+                  expected,
+                  sp,
+                  tc_qualify_local_name(tc, name),
+                )
               }
-              return check_extern_fn_call(tc, env, einfo, args, sp)
+              None => ()
             }
-            None => ()
+            match tc.extern_fns.get(name) {
+              Some(einfo) => {
+                tc.resolved_method_calls.set("call_pkg:" + span_key(sp), name)
+                if tc.record_analyze {
+                  tc.call_targets.set(span_key(sp), tc_qualify_local_name(tc, name))
+                }
+                return check_extern_fn_call(tc, env, einfo, args, sp)
+              }
+              None => ()
+            }
           }
           tc_err(
             tc,
@@ -14102,6 +15650,10 @@ fn check_expr_inner(
               tc.enums.contains(qual) &&
               (tc_enum_has_variant(tc, qual, mem) ||
                 !tc.methods.contains(qual + "::" + mem))) {
+            if !env.in_default_arg && tc.priv_imported_types.contains(qual) {
+              let qp_p = split_qual_name(qual)
+              emit_private_err(tc, sp, "enum", qp_p.prefix, qp_p.name)
+            }
             return check_variant_ctor(tc, env, qual, mem, args, expected, sp)
           }
           let qp = split_qual_name(qual)
@@ -14114,8 +15666,12 @@ fn check_expr_inner(
                   Some(ei) =>
                     if enum_info_has_variant(ei, mem) ||
                       !ipkg.tc.methods.contains(q_sub + "::" + mem) {
-                      if !ei.decl.is_pub && !env.in_default_arg {
-                        emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                      if !ei.decl.is_pub {
+                        if !env.in_default_arg {
+                          emit_private_err(tc, sp, "enum", ipkg.name, q_sub)
+                        } else {
+                          tc_ensure_priv_enum_registered(tc, ipkg, q_sub, ei)
+                        }
                       }
                       return check_variant_ctor(
                         tc,
@@ -14193,6 +15749,66 @@ fn check_expr_inner(
                 }
                 None => ()
               }
+              match ipkg.tc.consts.get(mem) {
+                Some(cty) =>
+                  match qualify_imported_ty(ipkg.name, cty) {
+                    TFn(ptys, rty) => {
+                      let is_p = match ipkg.tc.const_pub.get(mem) {
+                        Some(v) => v
+                        None => false
+                      }
+                      if !is_p && !env.in_default_arg {
+                        emit_private_err(tc, sp, "let", ipkg.name, mem)
+                      }
+                      if args.length() != ptys.length() {
+                        tc_err(
+                          tc,
+                          sp,
+                          "E_ARITY_MISMATCH",
+                          "closure `" +
+                          qual +
+                          "::" +
+                          mem +
+                          "` expects " +
+                          ptys.length().to_string() +
+                          " argument(s), found " +
+                          args.length().to_string(),
+                          ptys.length().to_string() + " args",
+                          args.length().to_string() + " args",
+                          "pass " + ptys.length().to_string() + " argument(s)",
+                        )
+                      }
+                      let mut i = 0
+                      while i < args.length() {
+                        let ep : Option[Ty] = if i < ptys.length() {
+                          Some(ptys[i])
+                        } else {
+                          None
+                        }
+                        let aty = check_expr(tc, env, args[i], ep)
+                        if i < ptys.length() && !ty_compat(ptys[i], aty) {
+                          tc_err(
+                            tc,
+                            expr_span(args[i]),
+                            "E_TYPE_MISMATCH",
+                            "closure argument type mismatch",
+                            ty_to_string(ptys[i]),
+                            ty_to_string(aty),
+                            "pass `" + ty_to_string(ptys[i]) + "`",
+                          )
+                        }
+                        i = i + 1
+                      }
+                      match rty {
+                        TNever => tc.never_calls.set(span_key(sp), true)
+                        _ => ()
+                      }
+                      return rty
+                    }
+                    _ => ()
+                  }
+                None => ()
+              }
               match ipkg.tc.variant_to_enum.get(mem) {
                 Some(en) => {
                   match ipkg.tc.enums.get(en) {
@@ -14247,6 +15863,20 @@ fn check_expr_inner(
           let cty = check_expr(tc, env, callee, None)
           match cty {
             TFn(ptys, rty) => {
+              if args.length() != ptys.length() {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_ARITY_MISMATCH",
+                  "closure expects " +
+                  ptys.length().to_string() +
+                  " argument(s), found " +
+                  args.length().to_string(),
+                  ptys.length().to_string() + " args",
+                  args.length().to_string() + " args",
+                  "pass " + ptys.length().to_string() + " argument(s)",
+                )
+              }
               let mut i = 0
               while i < args.length() {
                 let ep : Option[Ty] = if i < ptys.length() {
@@ -14254,12 +15884,44 @@ fn check_expr_inner(
                 } else {
                   None
                 }
-                let _ = check_expr(tc, env, args[i], ep)
+                let aty = check_expr(tc, env, args[i], ep)
+                if i < ptys.length() && !ty_compat(ptys[i], aty) {
+                  tc_err(
+                    tc,
+                    expr_span(args[i]),
+                    "E_TYPE_MISMATCH",
+                    "closure argument type mismatch",
+                    ty_to_string(ptys[i]),
+                    ty_to_string(aty),
+                    "pass `" + ty_to_string(ptys[i]) + "`",
+                  )
+                }
                 i = i + 1
+              }
+              match rty {
+                TNever => tc.never_calls.set(span_key(sp), true)
+                _ => ()
               }
               rty
             }
-            _ => TError
+            TError => TError
+            _ => {
+              let mut i = 0
+              while i < args.length() {
+                let _ = check_expr(tc, env, args[i], None)
+                i = i + 1
+              }
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "cannot call value of non-function type `" + ty_to_string(cty) + "`",
+                "function type",
+                ty_to_string(cty),
+                "call a function or closure value",
+              )
+              TError
+            }
           }
         }
       }
@@ -14361,6 +16023,12 @@ fn check_expr_inner(
       let oty = check_expr(tc, env, obj, None)
       tc.infer_hit.clear()
       let rty = check_method_call(tc, env, oty, method_name, args, expected, sp)
+      if !tc.resolved_method_calls.contains(span_key(sp)) {
+        match oty {
+          TStruct(_, _) | TEnum(_, _) | TDynTrait(_) | TParam(_) | TError => ()
+          _ => tc.resolved_method_calls.set(span_key(sp), "__builtin__::" + method_name)
+        }
+      }
       infer_refine_call(tc, env, obj, oty, method_name)
       let mut recv_mut = false
       match oty {
@@ -14555,15 +16223,23 @@ fn check_expr_inner(
               Some(ipkg) =>
                 match ipkg.tc.structs.get(q_st) {
                   Some(si) => {
-                    if !si.decl.is_pub && !env.in_default_arg && !is_canon_struct {
-                      emit_private_err(tc, sp, "struct", ipkg.name, q_st)
+                    let qk = ipkg.name + "::" + q_st
+                    if !si.decl.is_pub {
+                      if !env.in_default_arg && !is_canon_struct {
+                        emit_private_err(tc, sp, "struct", ipkg.name, q_st)
+                      } else {
+                        tc_ensure_priv_struct_registered(tc, ipkg, q_st, si)
+                      }
                     }
-                    resolved_name = ipkg.name + "::" + q_st
+                    resolved_name = qk
                     if is_canon_struct || env.in_default_arg {
                       resolved_sinfo_opt = Some(qualify_imported_struct_info(ipkg.name, si))
                     }
                   }
-                  None => alias_missing = via_alias
+                  None => {
+                    alias_missing = via_alias
+                    resolved_name = ipkg.name + "::" + q_st
+                  }
                 }
               None => ()
             }
@@ -14642,6 +16318,11 @@ fn check_expr_inner(
           TError
         }
         Some(sinfo) => {
+          if !env.in_default_arg && !is_canon_struct && tc.priv_imported_types.contains(resolved_name) {
+            let qp_p = split_qual_name(resolved_name)
+            emit_private_err(tc, sp, "struct", qp_p.prefix, qp_p.name)
+          }
+          tc.resolved_method_calls.set("st:" + span_key(sp), resolved_name)
           if has_qual_sep(resolved_name) && !env.in_default_arg && !is_canon_struct {
             let mut has_priv = false
             let mut pi = 0
@@ -14840,7 +16521,11 @@ fn check_expr_inner(
         None => TUnit
         Some(el) => {
           let else_ty = check_expr(tc, env, el, expected)
-          if !ty_compat(then_ty, else_ty) {
+          let branch_ok = match then_ty {
+            TNever => true
+            _ => ty_compat(then_ty, else_ty)
+          }
+          if !branch_ok {
             tc_err(
               tc,
               sp,
@@ -14976,12 +16661,16 @@ fn check_expr_inner(
       let saved_ret_ty = env.ret_ty
       let saved_inferred_ret = env.inferred_ret
       let saved_closure_floor = env.closure_scope_floor
+      let saved_loop_depth = env.in_loop_depth
+      let saved_in_def_expr = env.in_default_expr
       env.ret_ty = match ret_opt {
         Some(r) => r
         None => TError
       }
       env.inferred_ret = None
       env.closure_scope_floor = env.scopes.length()
+      env.in_loop_depth = 0
+      env.in_default_expr = false
       env_push(env)
       let mut j = 0
       while j < params.length() {
@@ -15007,6 +16696,21 @@ fn check_expr_inner(
         j = j + 1
       }
       let body_ty = check_stmts(tc, env, body, ret_opt)
+      match ret_opt {
+        Some(TNever) =>
+          if !stmts_diverge(tc, env, body, 1, false) {
+            tc_err(
+              tc,
+              sp,
+              "E_TYPE_MISMATCH",
+              "closure declared to return `Never` may return normally",
+              "Never",
+              ty_to_string(body_ty),
+              "ensure all paths diverge (e.g. `panic(...)`)",
+            )
+          }
+        _ => ()
+      }
       let clo_inferred_ret = env.inferred_ret
       env_pop(env)
       if env.mut_params.length() > 0 || (tc.record_analyze && !env.in_default_arg) {
@@ -15060,6 +16764,8 @@ fn check_expr_inner(
         }
       }
       env.closure_scope_floor = saved_closure_floor
+      env.in_loop_depth = saved_loop_depth
+      env.in_default_expr = saved_in_def_expr
       env.ret_ty = saved_ret_ty
       env.inferred_ret = saved_inferred_ret
       let eff_body_ty = match body_ty {
@@ -15238,17 +16944,79 @@ fn check_expr_inner(
       let _ = check_expr(tc, env, f_expr, Some(TFn([], TUnit)))
       TUnit
     }
-    EAs(inner, target, _) => {
+    EAs(inner, target, sp) => {
       let rty = resolve_type_expr(tc, target, env.type_params)
       match rty {
         TDynTrait(_) => check_expr(tc, env, inner, Some(rty))
         _ => {
-          let _ = check_expr(tc, env, inner, None)
-          rty
+          let ity = check_expr(tc, env, inner, None)
+          let rty_err = match rty {
+            TError => true
+            _ => false
+          }
+          let ity_err = match ity {
+            TError => true
+            _ => false
+          }
+          if rty_err || ity_err {
+            rty
+          } else {
+            let rty_never = match rty {
+              TNever => true
+              _ => false
+            }
+            let ity_never = match ity {
+              TNever => true
+              _ => false
+            }
+            if rty_never {
+              if ity_never {
+                TNever
+              } else {
+                tc_err(
+                  tc,
+                  sp,
+                  "E_TYPE_MISMATCH",
+                  "cannot cast `" + ty_to_string(ity) + "` to `Never`",
+                  "Never",
+                  ty_to_string(ity),
+                  "only a diverging expression of type `Never` can be cast to `Never`",
+                )
+                TError
+              }
+            } else if (ty_is_cast_scalar(ity) && ty_is_cast_scalar(rty)) ||
+              ty_is_valid_ptr_cast(ity, rty) ||
+              ty_compat(rty, ity) {
+              rty
+            } else {
+              tc_err(
+                tc,
+                sp,
+                "E_TYPE_MISMATCH",
+                "cannot cast `" + ty_to_string(ity) + "` to `" + ty_to_string(rty) + "`",
+                "compatible cast target",
+                ty_to_string(rty),
+                "remove invalid `as " + ty_to_string(rty) + "` cast",
+              )
+              TError
+            }
+          }
         }
       }
     }
     ETry(inner, sp) => {
+      if env.in_default_expr {
+        tc_err(
+          tc,
+          sp,
+          "E_TYPE_MISMATCH",
+          "cannot use `?` in a default parameter expression",
+          "expression",
+          "`?`",
+          "remove `?` from the default parameter expression",
+        )
+        return TError
+      }
       let ity = check_expr(tc, env, inner, None)
       match ity {
         TError => TError
@@ -15430,6 +17198,7 @@ pub fn check_package_with_imports_mapped(
     consts: Map([]),
     const_pub: Map([]),
     scalar_const_exprs: Map([]),
+    const_init_order: [],
     import_aliases: Map([]),
     dep_map: dep_map,
     canon_display_keys: [],
@@ -15463,6 +17232,11 @@ pub fn check_package_with_imports_mapped(
     analyze_closure_captures: Map([]),
     call_into_convs: Map([]),
     try_into_convs: Map([]),
+    resolved_method_calls: Map([]),
+    never_calls: Map([]),
+    in_default_arg_expansion: false,
+    in_imported_default_arg: false,
+    priv_imported_types: Map([]),
   }
 
   let mut ipi = 0
@@ -15677,7 +17451,7 @@ pub fn check_package_with_imports_mapped(
             }
             _ => resolve_type_expr(tc, fd.ret_ty, fd.type_params)
           }
-          let finfo = FnInfo::{ decl: fd, param_tys: ptys, ret_ty: rty }
+          let finfo = FnInfo::{ decl: fd, param_tys: ptys, ret_ty: rty, is_imported: false }
           validate_into_fn_decl(tc, fd, finfo)
           let mut bi = 0
           while bi < fd.type_bounds.length() {
@@ -15685,18 +17459,21 @@ pub fn check_package_with_imports_mapped(
             let mut ti = 0
             while ti < tb.traits.length() {
               let tr_name = tb.traits[ti]
-              match lookup_trait(tc, tr_name) {
+              let stl = lookup_source_trait_ex(tc, tr_name, fd.span, false)
+              match stl.info {
                 Some(_) => ()
                 None =>
-                  tc_err(
-                    tc,
-                    fd.span,
-                    "E_UNKNOWN_TRAIT",
-                    "unknown trait `" + tr_name + "` in generic bound of `" + fd.name + "`",
-                    "defined trait",
-                    tr_name,
-                    "declare `trait " + tr_name + " { ... }` before using it as a bound",
-                  )
+                  if !stl.errored {
+                    tc_err(
+                      tc,
+                      fd.span,
+                      "E_UNKNOWN_TRAIT",
+                      "unknown trait `" + tr_name + "` in generic bound of `" + fd.name + "`",
+                      "defined trait",
+                      tr_name,
+                      "declare `trait " + tr_name + " { ... }` before using it as a bound",
+                    )
+                  }
               }
               ti = ti + 1
             }
@@ -16023,7 +17800,7 @@ pub fn check_package_with_imports_mapped(
             }
             let raw_r = resolve_type_expr(tc, md.ret_ty, self_tp)
             let rty = subst_ty(raw_r, self_subst)
-            let finfo = FnInfo::{ decl: md, param_tys: ptys, ret_ty: rty }
+            let finfo = FnInfo::{ decl: md, param_tys: ptys, ret_ty: rty, is_imported: false }
             if !impl_methods.contains(md.name) {
               impl_mnames.push(md.name)
             }
@@ -16045,17 +17822,20 @@ pub fn check_package_with_imports_mapped(
               method_names: impl_mnames,
             },
           )
-          match lookup_trait(tc, id.trait_name) {
+          let stl_impl = lookup_source_trait_ex(tc, id.trait_name, id.span, false)
+          match stl_impl.info {
             None =>
-              tc_err(
-                tc,
-                id.span,
-                "E_UNKNOWN_TRAIT",
-                "unknown trait `" + id.trait_name + "` in `impl`",
-                "defined trait",
-                id.trait_name,
-                "declare `trait " + id.trait_name + " { ... }` or check its spelling",
-              )
+              if !stl_impl.errored {
+                tc_err(
+                  tc,
+                  id.span,
+                  "E_UNKNOWN_TRAIT",
+                  "unknown trait `" + id.trait_name + "` in `impl`",
+                  "defined trait",
+                  id.trait_name,
+                  "declare `trait " + id.trait_name + " { ... }` or check its spelling",
+                )
+              }
             Some(tinfo) => {
               let mut tmi = 0
               while tmi < tinfo.methods.length() {
@@ -16332,7 +18112,10 @@ pub fn check_package_with_imports_mapped(
               while pi < fd.params.length() && pi < finfo.param_tys.length() {
                 match fd.params[pi].default_expr {
                   Some(def) => {
+                    let saved_in_def_expr = env.in_default_expr
+                    env.in_default_expr = true
                     let dty = check_expr(tc, env, def, Some(finfo.param_tys[pi]))
+                    env.in_default_expr = saved_in_def_expr
                     if !ty_compat(finfo.param_tys[pi], dty) {
                       tc_err(
                         tc,
@@ -16399,7 +18182,23 @@ pub fn check_package_with_imports_mapped(
                   }
                 _ => ()
               }
-              if !ty_compat(finfo.ret_ty, body_ty) {
+              let is_never_ret = match finfo.ret_ty {
+                TNever => true
+                _ => false
+              }
+              if is_never_ret {
+                if !stmts_diverge(tc, env, fd.body, 1, false) {
+                  tc_err(
+                    tc,
+                    fd.span,
+                    "E_TYPE_MISMATCH",
+                    "function `" + fd.name + "` declared to return `Never` may return normally",
+                    "Never",
+                    ty_to_string(body_ty),
+                    "ensure all paths diverge (e.g. `panic(...)`)",
+                  )
+                }
+              } else if !ty_compat(finfo.ret_ty, body_ty) {
                 tc_err(
                   tc,
                   fd.span,
@@ -16476,7 +18275,19 @@ pub fn check_package_with_imports_mapped(
                 let md = id.methods[mi]
                 match iinfo.methods.get(md.name) {
                   Some(finfo) => {
-                    let env = env_new(finfo.ret_ty, [])
+                    let env = env_new(finfo.ret_ty, md.type_params)
+                    let mut bi = 0
+                    while bi < md.type_bounds.length() {
+                      let tb = md.type_bounds[bi]
+                      let ctrs : Array[String] = []
+                      let mut ti = 0
+                      while ti < tb.traits.length() {
+                        ctrs.push(canon_trait_name(tc, tb.traits[ti]))
+                        ti = ti + 1
+                      }
+                      env.type_bounds.set(tb.param, ctrs)
+                      bi = bi + 1
+                    }
                     env.in_no_io = md.no_io
                     env.no_io_fn_name = if md.receiver_type != "" {
                       md.receiver_type + "::" + md.name
@@ -16487,6 +18298,32 @@ pub fn check_package_with_imports_mapped(
                     env.verify_fn_name = id.trait_name + "::" + id.target_type + "::" + md.name
                     let mut pi = 0
                     while pi < md.params.length() && pi < finfo.param_tys.length() {
+                      match md.params[pi].default_expr {
+                        Some(def) => {
+                          let saved_in_def_expr = env.in_default_expr
+                          env.in_default_expr = true
+                          let dty = check_expr(tc, env, def, Some(finfo.param_tys[pi]))
+                          env.in_default_expr = saved_in_def_expr
+                          if !ty_compat(finfo.param_tys[pi], dty) {
+                            tc_err(
+                              tc,
+                              expr_span(def),
+                              "E_TYPE_MISMATCH",
+                              "default value type mismatch for parameter `" +
+                              md.params[pi].name +
+                              "` of `" +
+                              md.name +
+                              "`",
+                              ty_to_string(finfo.param_tys[pi]),
+                              ty_to_string(dty),
+                              "provide a default value of type `" +
+                              ty_to_string(finfo.param_tys[pi]) +
+                              "`",
+                            )
+                          }
+                        }
+                        None => ()
+                      }
                       let mut pty_def = finfo.param_tys[pi]
                       if md.no_io {
                         match finfo.param_tys[pi] {
@@ -16515,7 +18352,27 @@ pub fn check_package_with_imports_mapped(
                     if md.is_verify {
                       verify_check_fn(tc, md, finfo, env.verify_fn_name, env.fn_key)
                     }
-                    if !ty_compat(finfo.ret_ty, body_ty) {
+                    let is_never_ret = match finfo.ret_ty {
+                      TNever => true
+                      _ => false
+                    }
+                    if is_never_ret {
+                      if !stmts_diverge(tc, env, md.body, 1, false) {
+                        tc_err(
+                          tc,
+                          md.span,
+                          "E_TYPE_MISMATCH",
+                          "impl method `" +
+                          id.trait_name +
+                          "::" +
+                          md.name +
+                          "` declared to return `Never` may return normally",
+                          "Never",
+                          ty_to_string(body_ty),
+                          "ensure all paths diverge (e.g. `panic(...)`)",
+                        )
+                      }
+                    } else if !ty_compat(finfo.ret_ty, body_ty) {
                       tc_err(
                         tc,
                         md.span,
@@ -16567,6 +18424,31 @@ pub fn check_package_with_imports_mapped(
       di = di + 1
     }
     fi = fi + 1
+  }
+
+  if check_file.length() == 0 {
+    let plan = compute_const_init_plan_from_pkg_tc(pkg, tc)
+    let mut pi = 0
+    while pi < plan.order.length() {
+      tc.const_init_order.push(plan.order[pi])
+      pi = pi + 1
+    }
+    if plan.has_cycle && plan.cycle_path.length() >= 2 {
+      let cyc_str = join_strs(plan.cycle_path, " -> ")
+      let cyc_sp = match const_spans.get(plan.cycle_path[0]) {
+        Some(sp) => sp
+        None => Span::{ file: "", line: 1, col: 1 }
+      }
+      tc_err(
+        tc,
+        cyc_sp,
+        "E_CONST_CYCLE",
+        "cyclic top-level constant initialization: " + cyc_str,
+        "acyclic top-level constant initialization order",
+        cyc_str,
+        "break the dependency cycle between top-level constants (e.g. move computation into a function called at runtime)",
+      )
+    }
   }
 
   resolve_eq_uses(tc)

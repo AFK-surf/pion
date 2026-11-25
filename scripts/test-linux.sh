@@ -659,6 +659,8 @@ PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p92_math_wasm_paths/run_e2e.sh" "$PION
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p93_cli_link_symlink/run_e2e.sh" "$PIONC"
 # P95: Wasm32 nested-loop outlining writes back inner-loop-only read+write slots (Native == Wasm32, Debug + --release).
 PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/p95_wasm_nested_loop_liveout/run_e2e.sh" "$PIONC"
+# Wave J1: 2,500-term &&+is short-circuit (Native+Wasm32), cold/hot CAS topo const-init, xpkg mono closure const.
+PATH="$ORIG_PATH" sh "$ROOT_DIR/tests/e2e/wave_j1_soundness/run_e2e.sh" "$PIONC"
 # Translation validation of QBE's SSA optimisations (tools/qbe_tv) on this target.
 # Real `as`: its [5/5] builds the tests/tv/qbe_bugs reproducers through QBE text
 # assembly (and cc compiles their C driver) besides `--obj`.

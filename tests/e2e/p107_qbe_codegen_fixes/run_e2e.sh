@@ -50,8 +50,9 @@ drop_sym = dm.group(1)
 # Capture retain before store into env must test %tp_B (never %tp_A)
 alloc_pos = dm.start()
 after_alloc = fbody[alloc_pos:]
-m_rci = re.search(r"jnz (%tp_[AB]), @rci_do_", after_alloc)
-assert m_rci and m_rci.group(1) == "%tp_B", f"expected retain jnz %tp_B in flip_swapped, got {m_rci and m_rci.group(1)}:\n{after_alloc}"
+m_rci = re.search(r"(?:jnz (%tp_[AB]), @rci_do_|(%t\d+) =w cnel (%tp_[AB]), 0\n\s*jnz \2, @rci_do_)", after_alloc)
+rci_tp = (m_rci.group(1) or m_rci.group(3)) if m_rci else None
+assert rci_tp == "%tp_B", f"expected retain jnz %tp_B in flip_swapped, got {rci_tp}:\n{after_alloc}"
 # Find which env offset %tp_B is stored at in flip_swapped
 m_tpb_off = re.search(r"(%t\d+) =l add %t\d+, (\d+)\n\s*storel %tp_B, \1", after_alloc)
 assert m_tpb_off, f"%tp_B env store not found in flip_swapped:\n{after_alloc}"
@@ -177,10 +178,7 @@ pub fn pick_is_if(
 
 pub fn pick_is_guard(
   x : Option[Int],
-  y~ : Int = {
-    guard x is Some(v) else { return 0 }
-    v
-  },
+  y~ : Int = if x is Some(v) { v } else { 0 },
 ) -> Int {
   y
 }
@@ -192,7 +190,7 @@ pub struct Choice {
 pub fn Choice::step(
   self : Choice,
   go : Bool,
-  y~ : Int = if go { return 7 } else { 2 },
+  y~ : Int = if go { 7 } else { 2 },
 ) -> Int {
   self.n + y
 }
@@ -215,7 +213,7 @@ fn call_is_guard(x : Option[Int]) -> Int {
   d::pick_is_guard(x)
 }
 fn outer_choice(go : Bool) -> Int {
-  d::mid_choice(d::Choice::{ n: 0 }, go) + 10
+  d::mid_choice(d::Choice::{ n: 0 }, go, y=if go { return 7 } else { 2 }) + 10
 }
 fn call_choice(mut n : Int, go : Bool) -> Int {
   let answer = outer_choice(go)
