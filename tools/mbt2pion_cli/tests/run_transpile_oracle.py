@@ -1316,9 +1316,32 @@ pub fn[Json] m2b_generic_json_id(x : Json) -> Json {
   x
 }
 
+pub struct M2bBoxed[Json] {
+  val0 : Json
+}
+
+pub(all) enum M2bBoxE[Json] {
+  Val(Json)
+}
+
 #derive(Hash)
 pub struct M2bSingleKey {
   a : Int
+}
+
+#derive(Hash)
+pub struct M2bTupleKey {
+  a : (Int, Int)
+}
+
+#derive(Hash)
+pub struct M2bUnitKey {
+  a : Unit
+}
+
+#derive(Hash)
+pub struct M2bNestedTupleKey {
+  a : (Int, (Int, Unit))
 }
 
 #derive(Hash)
@@ -1346,15 +1369,20 @@ pub fn m2b_p1_views_map_and_hash() -> (String, Int, Int, Int, Int, Int, Bool) {
     x
   }) + // next term
     2
-  // P1-6: #derive(Hash) exact xxHash32 parity (single-field struct == scalar, multi-field, -0.0 == 0.0, enum)
+  // P1-6: #derive(Hash) exact xxHash32 parity (single-field struct == scalar, tuple, Unit, nested tuple, -0.0 == 0.0, enum)
   let sk = M2bSingleKey::{ a: 7 }
   let hs = Hash::hash(sk)
   let h7 = Hash::hash(7)
+  let ht = Hash::hash(M2bTupleKey::{ a: (7, 8) })
+  let hu = Hash::hash(M2bUnitKey::{ a: () })
+  let hnt = Hash::hash(M2bNestedTupleKey::{ a: (7, (8, ())) })
   let k1 = M2bKey::{ a: 7, b: -0.0, c: "abc" }
   let k2 = M2bKey::{ a: 7, b: 0.0, c: "abc" }
-  let he = Hash::hash(M2bHashEnum::Pair(1, "x"))
-  let gj = m2b_generic_json_id(17)
-  let h_ok = hs == -427046664 && hs == h7 && Hash::hash(k1) == Hash::hash(k2)
+  let he = Hash::hash(M2bHashEnum::Pair(1, "x")) ^ hnt
+  let bx : M2bBoxed[Int] = M2bBoxed::{ val0: m2b_generic_json_id(17) }
+  let be : M2bBoxE[Int] = M2bBoxE::Val(bx.val0)
+  let gj = match be { M2bBoxE::Val(v) => v }
+  let h_ok = hs == -427046664 && hs == h7 && ht == -537206642 && hu == 148298089 && Hash::hash(k1) == Hash::hash(k2)
   (vs, m.get(0).unwrap_or(-1), m.get(1).unwrap_or(-1), gj, hs, he, h_ok)
 }
 '''
