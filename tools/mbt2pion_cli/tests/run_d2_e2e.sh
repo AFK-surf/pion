@@ -89,4 +89,21 @@ fi
 grep -q "MBT2PION_ENUM_LABEL_ERROR" "$WORK/r4.json"
 test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
 
+# 5. Option[String] matching `Some([c, _])` fails closed with MBT2PION_UNSUPPORTED_SYNTAX
+S5="$WORK/s5"; mkdir -p "$S5"
+cat > "$S5/t.mbt" << 'EOF'
+pub fn f(opt : Option[String]) -> Int {
+  match opt {
+    Some([c, _]) => c.to_int()
+    _ => 0
+  }
+}
+EOF
+if "$BIN" --src "$S5" --out "$NEG_OUT" --target native --mode publish --mbt-compat "$COMPAT_DIR" --report "$WORK/r5.json" --pionc "$PIONC" 2>/dev/null; then
+  echo "[d2-e2e] FAIL: Option[String] nested array pattern should have exited non-zero"
+  exit 1
+fi
+grep -q "MBT2PION_UNSUPPORTED_SYNTAX" "$WORK/r5.json"
+test "$(cat "$NEG_OUT/sentinel.pion")" = "SENTINEL"
+
 echo "[d2-e2e] PASS: all Wave M2-D2 negative/fail-closed gates verified"
