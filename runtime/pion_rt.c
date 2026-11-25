@@ -560,23 +560,15 @@ static PION_NOINLINE PION_HOT void pion_slab_raw_free(void *ptr, size_t bytes, i
     pion_slab_raw_free_slow(ptr, bytes, is_frozen);
 }
 
-/* Finish either a pool allocation or a fallible plain malloc allocation. */
-static inline void *pion_finish_alloc(PionHeader *hdr, uint16_t type_tag, uint16_t flags,
-                                      PionDropFn drop_fn, int mt) {
-    hdr->owner_tid = mt ? pion_cur_tid_mt() : 1u;
-    hdr->local_rc = 1;
-    atomic_init(&hdr->shared_rc, 0);
-    hdr->type_tag = type_tag;
-    hdr->flags = flags;
-    hdr->drop_fn = drop_fn;
-    return (void *)(hdr + 1);
-}
-
+/* pre, when non-NULL, is a caller's plain malloc block (freed like any malloc'd
+ * object, flags 0) that only needs its header initialized. */
 static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
-    uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
-    PionHeader *hdr;
+    uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn, PionHeader *pre) {
+    PionHeader *hdr = pre;
     uint16_t flags = 0;
     int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
+    if (pre) {
+    } else
 #if PION_USE_SLAB
     if (__builtin_expect(payload_size <= PION_SLAB_MAX_PAYLOAD, 1)) {
         uint32_t cls = pion_slab_cls_for((uint32_t)sizeof(PionHeader) + payload_size);
@@ -603,7 +595,13 @@ static PION_NOINLINE PION_MINSIZE void *pion_alloc_uninit_slow(
             pion_oom();
         }
     }
-    return pion_finish_alloc(hdr, type_tag, flags, drop_fn, mt);
+    hdr->owner_tid = mt ? pion_cur_tid_mt() : 1u;
+    hdr->local_rc = 1;
+    atomic_init(&hdr->shared_rc, 0);
+    hdr->type_tag = type_tag;
+    hdr->flags = flags;
+    hdr->drop_fn = drop_fn;
+    return (void *)(hdr + 1);
 }
 
 static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
@@ -619,7 +617,7 @@ static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag
             uint32_t slot_sz = pion_slab_sizes[cls];
             char *cur = g_main_slab.chunk_cur;
             if (__builtin_expect((uintptr_t)g_main_slab.chunk_end - (uintptr_t)cur < slot_sz, 0)) {
-                return pion_alloc_uninit_slow(payload_size, type_tag, drop_fn);
+                return pion_alloc_uninit_slow(payload_size, type_tag, drop_fn, NULL);
             }
             g_main_slab.chunk_cur = cur + slot_sz;
             hdr = (PionHeader *)cur;
@@ -633,7 +631,7 @@ static inline void *pion_alloc_raw_fast(uint32_t payload_size, uint16_t type_tag
         return (void *)(hdr + 1);
     }
 #endif
-    return pion_alloc_uninit_slow(payload_size, type_tag, drop_fn);
+    return pion_alloc_uninit_slow(payload_size, type_tag, drop_fn, NULL);
 }
 
 PION_NOINLINE PION_HOT void *pion_alloc_uninit(uint32_t payload_size, uint16_t type_tag, PionDropFn drop_fn) {
@@ -1053,38 +1051,52 @@ PION_HOT void *pion_str_concat(void *a, void *b) {
     return out;
 }
 
-PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
+/* One-allocation concatenation of n parts: PionString pointers (NULL = empty) or, with
+ * spans, PionStrSpan pairs. Reads only each part's len bytes and never changes a part's
+ * reference count; the aggregate length is checked before allocating. */
+static PION_NOINLINE PION_MINSIZE void *pion_concat_parts(int64_t n, const void *parts, int spans) {
     int64_t total = 0;
-    for (int64_t i = 0; i < n; i++) {
-        PionString *s = (PionString *)parts[i];
-        if (s) {
-            if ((uint64_t)s->len > (uint64_t)(PION_MAX_CONTAINER_LEN - total)) {
-                pion_die_len();
+    char *dst = NULL;
+    PionString *out = NULL;
+    for (int pass = 0; pass < 2; pass++) {
+        for (int64_t i = 0; i < n; i++) {
+            const char *data;
+            int64_t len;
+            if (spans) {
+                data = ((const PionStrSpan *)parts)[i].data;
+                len = ((const PionStrSpan *)parts)[i].len;
+            } else {
+                const PionString *s = ((PionString *const *)parts)[i];
+                data = s ? s->data : NULL;
+                len = s ? s->len : 0;
             }
-            total += s->len;
+            if (pass == 0) {
+                if ((uint64_t)len > (uint64_t)(PION_MAX_CONTAINER_LEN - total)) pion_die_len();
+                total += len;
+            } else if (len > 0) {
+                memcpy(dst, data, (size_t)len);
+                dst += len;
+            }
         }
-    }
-    PionString *out = pion_str_alloc_checked(total);
-    char *dst = out->data;
-    for (int64_t i = 0; i < n; i++) {
-        PionString *s = (PionString *)parts[i];
-        if (s && s->len > 0) {
-            memcpy(dst, s->data, (size_t)s->len);
-            dst += s->len;
+        if (pass == 0) {
+            out = pion_str_alloc_checked(total);
+            dst = out->data;
         }
     }
     return out;
 }
 
-static PION_SIZE_EQ int32_t pion_str_eq_fast(const PionString *sa, const PionString *sb) {
-    if (sa == sb) return 1;
-    if (!sa || !sb) return 0;
-    int64_t len = sa->len;
-    if (len != sb->len) return 0;
-    if (len == 0) return 1;
-    size_t n = (size_t)len;
-    const char *a = sa->data;
-    const char *b = sb->data;
+PION_MINSIZE void *pion_str_concat_n(int64_t n, void **parts) {
+    return pion_concat_parts(n, parts, 0);
+}
+
+PION_MINSIZE void *pion_str_concat_spans(int64_t count, const PionStrSpan *parts) {
+    return pion_concat_parts(count, parts, 1);
+}
+
+/* Equality of n bytes; n may be 0 and neither buffer is read past n. */
+static PION_SIZE_EQ int32_t pion_mem_eq_fast(const char *a, const char *b, size_t n) {
+    if (n == 0) return 1;
     if (__builtin_expect(n <= 16, 1)) {
         if (n >= 8) {
             uint64_t a0, b0, a1, b1;
@@ -1119,6 +1131,13 @@ static PION_SIZE_EQ int32_t pion_str_eq_fast(const PionString *sa, const PionStr
     return memcmp(a + 8, b + 8, n - 8) == 0 ? 1 : 0;
 }
 
+static inline int32_t pion_str_eq_fast(const PionString *sa, const PionString *sb) {
+    if (sa == sb) return 1;
+    if (!sa || !sb) return 0;
+    if (sa->len != sb->len) return 0;
+    return pion_mem_eq_fast(sa->data, sb->data, (size_t)sa->len);
+}
+
 PION_NOINLINE PION_HOT int32_t pion_str_eq(void *a, void *b) {
     return pion_str_eq_fast((const PionString *)a, (const PionString *)b);
 }
@@ -1147,28 +1166,10 @@ PION_MINSIZE const char *pion_str_slice_data(const PionString *s, int64_t lo, in
     return s->data + lo;
 }
 
-PION_MINSIZE void *pion_str_concat_spans(int64_t count, const PionStrSpan *parts) {
-    int64_t total = 0;
-    for (int64_t i = 0; i < count; ++i) {
-        if ((uint64_t)parts[i].len > (uint64_t)(PION_MAX_CONTAINER_LEN - total)) pion_die_len();
-        total += parts[i].len;
-    }
-    PionString *out = pion_str_alloc_checked(total);
-    char *dst = out->data;
-    for (int64_t i = 0; i < count; ++i) {
-        size_t n = (size_t)parts[i].len;
-        if (n) memcpy(dst, parts[i].data, n);
-        dst += n;
-    }
-    return out;
-}
 
 PION_HOT void *pion_str_slice(void *s, int64_t start, int64_t end) {
     PionString *str = (PionString *)s;
-    if (__builtin_expect(!str || start < 0 || end < start || end > str->len, 0)) {
-        pion_die("string slice out of bounds");
-    }
-    return pion_str_from_cstr(str->data + start, end - start);
+    return pion_str_from_cstr(pion_str_slice_data(str, start, end), end - start);
 }
 
 PION_HOT void *pion_int_to_str(int64_t v) {
@@ -1653,10 +1654,6 @@ static PION_NOINLINE PION_MINSIZE void pion_strbuf_append_raw(PionStrBuf *sb, co
     sb->data[sb->len] = '\0';
 }
 
-PION_MINSIZE void pion_strbuf_push_span(void *sb, const char *ptr, int64_t len) {
-    if (sb && len) pion_strbuf_append_raw((PionStrBuf *)sb, ptr, len);
-}
-
 PION_MINSIZE void pion_strbuf_push_slice(void *sb_ptr, void *s_ptr, int64_t start, int64_t end) {
     PionStrBuf *sb = (PionStrBuf *)sb_ptr;
     PionString *s = (PionString *)s_ptr;
@@ -2107,7 +2104,8 @@ static PION_MINSIZE __attribute__((constructor)) void pion_rt_init_hash_seed(voi
 }
 #endif
 
-static PION_SIZE_SHARED uint64_t pion_hash_bytes(const unsigned char *p, size_t len) {
+/* Single caller (pion_map_find_key): always inlined there. */
+static inline uint64_t pion_hash_bytes(const unsigned char *p, size_t len) {
     size_t orig_len = len;
     uint64_t s1 = g_pion_hash_seed ^ 0x517cc1b727220a95ULL;
     uint64_t s2 = g_pion_hash_seed2 ^ 0x9e3779b97f4a7c15ULL;
@@ -2139,9 +2137,11 @@ static PION_SIZE_SHARED uint64_t pion_hash_bytes(const unsigned char *p, size_t 
 }
 
 /* Merged key-hash + linear-probe hot path: returns matching occupied slot or first empty slot.
- * Caller must ensure m->cap > 0, m->entries != NULL, and (m->key_is_int || k != NULL). */
-static PION_NOINLINE PION_HOT PionMapEntry *pion_map_find(
-    const PionMap *m, const void *k, uint64_t *out_h) {
+ * Caller must ensure m->cap > 0, m->entries != NULL, and (m->key_is_int || k || data).
+ * A String key is k (data == NULL) or the bytes (data, len); a non-NULL k also matches
+ * a stored key by identity before its bytes are compared. Integer keys use k only. */
+static PION_NOINLINE PION_HOT PionMapEntry *pion_map_find_key(
+    const PionMap *m, const void *k, const char *data, int64_t len, uint64_t *out_h) {
     uint64_t h;
     if (m->key_is_int) {
         uint64_t x = (uint64_t)(uintptr_t)k;
@@ -2150,8 +2150,11 @@ static PION_NOINLINE PION_HOT PionMapEntry *pion_map_find(
         h = pion_wymix(x ^ s1, s2);
         if (!h) h = 1;
     } else {
-        const PionString *s = (const PionString *)k;
-        h = pion_hash_bytes((const unsigned char *)s->data, (size_t)s->len);
+        if (!data) {
+            data = ((const PionString *)k)->data;
+            len = ((const PionString *)k)->len;
+        }
+        h = pion_hash_bytes((const unsigned char *)data, (size_t)len);
     }
     if (out_h) *out_h = h;
     uint64_t mask = (uint64_t)(m->cap - 1);
@@ -2166,12 +2169,15 @@ static PION_NOINLINE PION_HOT PionMapEntry *pion_map_find(
             if (e->key == (const PionString *)k) {
                 return e;
             }
-        } else if (e->hash == h && pion_str_eq_fast(e->key, (const PionString *)k)) {
+        } else if (e->hash == h && (e->key == (const PionString *)k ||
+                   (e->key->len == len && pion_mem_eq_fast(e->key->data, data, (size_t)len)))) {
             return e;
         }
         idx = (idx + 1) & mask;
     }
 }
+
+#define pion_map_find(m, k, out_h) pion_map_find_key((m), (k), NULL, 0, (out_h))
 
 static PION_NOINLINE PION_MINSIZE void pion_map_hint_invalidate(const PionMap *m) {
     if (!atomic_load_explicit(&g_pion_mt, memory_order_relaxed) && g_map_hint.map == m) {
@@ -2285,60 +2291,14 @@ insert_new:
     m->len++;
 }
 
-/* The caller can hold the returned scalar slot only across total, call-free
- * value computation. whole, when present, preserves the inserted key identity.
- * A virtual fresh String is materialized only on insertion. */
-PION_HOT int64_t *pion_map_scalar_entry(PionMap *m, const char *data, int64_t len,
-                                        PionString *whole, int32_t *present, PionString **resident) {
-    if (!m || (len == -1 && !whole)) pion_die("null map or key");
-    if (len == -1) {
-        data = whole->data;
-        len = whole->len;
-    }
-    if (m->key_is_int || m->val_is_obj) pion_die("invalid scalar string map");
-    uint64_t h = pion_hash_bytes((const unsigned char *)data, (size_t)len);
-    int mt = atomic_load_explicit(&g_pion_mt, memory_order_relaxed);
-    int grow = (m->len + 1) * 10 >= m->cap * 7;
-    if (!m->cap || (mt && grow)) {
-        pion_map_grow(m, m->cap ? m->cap * 2 : 16);
-        grow = 0;
-    }
-    for (;;) {
-        uint64_t mask = (uint64_t)m->cap - 1, idx = h & mask;
-        PionMapEntry *e;
-        while ((e = &m->entries[idx])->state) {
-            if (e->hash == h && e->key->len == len &&
-                (!len || memcmp(e->key->data, data, (size_t)len) == 0)) {
-                if (resident) *resident = e->key;
-                *present = 1;
-                /* Match the single-thread get/set hint for a live whole key. */
-                if (!mt) {
-                    g_map_hint.map = whole ? m : NULL;
-                    g_map_hint.key = whole;
-                    g_map_hint.entry = e;
-                    g_map_hint.hash = h;
-                }
-                return &e->val;
-            }
-            idx = (idx + 1) & mask;
-        }
-        if (grow) {
-            pion_map_grow(m, m->cap * 2);
-            grow = 0;
-            continue;
-        }
-        pion_map_hint_invalidate(m);
-        PionString *key = whole ? whole : (PionString *)pion_str_from_cstr(data, len);
-        pion_adopt(m, (int64_t)(uintptr_t)key);
-        if (whole) pion_rc_inc(whole);
-        e->key = key;
-        e->hash = h;
-        e->state = 1;
-        ++m->len;
-        if (resident) *resident = key;
-        *present = 0;
-        return &e->val;
-    }
+/* Probe a String-keyed scalar map for a key given as a whole String (whole != NULL;
+ * matched by identity first) or as validated bytes (data, len). Returns the value
+ * slot of a present key, which the caller may overwrite while the map is not
+ * otherwise touched, or NULL (the caller then inserts with pion_map_set). */
+int64_t *pion_map_scalar_entry(PionMap *m, const char *data, int64_t len, PionString *whole) {
+    if (!m || !m->cap) return NULL;
+    PionMapEntry *e = pion_map_find_key(m, whole, whole ? NULL : data, len, NULL);
+    return e->state ? &e->val : NULL;
 }
 
 PION_HOT int32_t pion_map_try_get(void *m_ptr, void *key_str, int64_t *out_val) {
@@ -3011,25 +2971,23 @@ static PION_NOINLINE PION_MINSIZE void *pion_read_file_obj(void *path_str, int a
             /* Reserve room for the managed header only for a representable String.
              * malloc failure and incomplete reads still take the ordinary IO error path.
              * Bytes retain their allocator's capacity/free-class contract. */
-            size_t prefix = !as_bytes && (uint64_t)sz <= PION_MAX_CONTAINER_LEN
-                ? sizeof(PionHeader) + sizeof(PionString) : 0;
+            size_t prefix = as_bytes ? 0 : sizeof(PionHeader) + sizeof(PionString);
             char *allocation = (char *)malloc(prefix + (size_t)sz + 1);
-            if (allocation) {
-                char *data = allocation + prefix;
-                if (sz == 0 || fread(data, 1, (size_t)sz, f) == (size_t)sz) {
-                    if (prefix) {
-                        PionString *str = (PionString *)pion_finish_alloc((PionHeader *)allocation,
-                            PION_TAG_STRING, 0, NULL, atomic_load_explicit(&g_pion_mt, memory_order_relaxed));
-                        str->len = sz;
-                        str->data[sz] = 0;
-                        out = str;
-                        allocation = NULL;
-                    } else {
-                        out = as_bytes ? pion_bytes_from_ptr(data, sz) : pion_str_from_cstr(data, sz);
-                    }
+            if (allocation && (sz == 0 || fread(allocation + prefix, 1, (size_t)sz, f) == (size_t)sz)) {
+                if (as_bytes) {
+                    out = pion_bytes_from_ptr(allocation, sz);
+                } else {
+                    /* Same length limit as pion_str_from_cstr on the staged copy. */
+                    if ((uint64_t)sz > (uint64_t)PION_MAX_CONTAINER_LEN) pion_die_len();
+                    PionString *str = (PionString *)pion_alloc_uninit_slow(
+                        0, PION_TAG_STRING, NULL, (PionHeader *)allocation);
+                    str->len = sz;
+                    str->data[sz] = 0;
+                    out = str;
+                    allocation = NULL;
                 }
-                free(allocation);
             }
+            free(allocation);
         }
         fclose(f);
     }

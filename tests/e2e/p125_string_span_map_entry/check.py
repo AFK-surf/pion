@@ -65,7 +65,7 @@ if (r.returncode, r.stdout, r.stderr) != (0, want, b''):
 # 4. SSA shape: the native primitives fire where expected and not on fallbacks.
 for name, primitive in (('semantics', 'str_concat_spans'), ('semantics', 'map_scalar_entry'),
                         ('semantics', 'str_slice_data'), ('scanner', 'map_scalar_entry'),
-                        ('scanner', 'strbuf_push_span'), ('owners', 'str_concat_spans'),
+                        ('scanner', 'strbuf_push_slice'), ('owners', 'str_concat_spans'),
                         ('order', 'str_concat_spans'), ('fileread', 'str_concat_spans'),
                         ('fileread', 'map_scalar_entry')):
     if 'call $pion_' + primitive + '(' not in ssa(name):

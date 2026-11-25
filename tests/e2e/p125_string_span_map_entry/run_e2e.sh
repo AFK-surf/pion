@@ -3,7 +3,7 @@
 # and Channel[String].send without a duplicate deep freeze
 # (compiler/src/core/qbe.pion `qbe_emit_span_concat` / `qbe_try_span_bindings` /
 # `qbe_entry_plan` / `qbe_try_slice_entry`; runtime `pion_str_slice_data`,
-# `pion_str_concat_spans`, `pion_strbuf_push_span`, `pion_map_scalar_entry`,
+# `pion_str_concat_spans`, `pion_strbuf_push_slice`, `pion_map_scalar_entry`,
 # `pion_read_file_obj`; Lean: tests/lean/proofs/QbeStringSpanMapEntry.lean).
 # Verifies, in both --release and dev builds:
 #   1. semantics / fallback / scanner / owners exit 0 with exactly "ok\n":
@@ -17,7 +17,7 @@
 #      as String equal fs_read_bytes byte-for-byte; a missing file is Err for
 #      both; file text feeds slice spans and scalar map entries.
 #   4. SSA: pion_str_concat_spans / pion_str_slice_data / pion_map_scalar_entry /
-#      pion_strbuf_push_span calls are present, fallback keeps pion_map_set.
+#      pion_strbuf_push_slice calls are present, fallback keeps pion_map_set.
 set -eu
 
 PIONC="${1:?usage: run_e2e.sh <pionc>}"

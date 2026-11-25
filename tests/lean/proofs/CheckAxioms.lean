@@ -804,6 +804,9 @@ import PionProofs.QbeStringSpanMapEntry
 #print axioms QbeStringSpanMapEntry.checkedLength
 #print axioms QbeStringSpanMapEntry.copySpans_append
 #print axioms QbeStringSpanMapEntry.fusion
+#print axioms QbeStringSpanMapEntry.runSteps_quiet
+#print axioms QbeStringSpanMapEntry.defer_cap_quiet
+#print axioms QbeStringSpanMapEntry.defer_cap_effect_counterexample
 #print axioms QbeStringSpanMapEntry.entry_update
 #print axioms QbeStringSpanMapEntry.entry_hit_keeps_keys
 #print axioms QbeStringSpanMapEntry.ringIndex

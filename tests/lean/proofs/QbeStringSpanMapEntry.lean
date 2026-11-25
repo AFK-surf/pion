@@ -16,6 +16,10 @@ and Channel[String].send changes (`compiler/src/core/qbe.pion`
      may trap (returning the state at the first failure), validating every span
      in source order and copying once at the end produces the same final state,
      the same first error and the same bytes as concatenating eagerly.
+     `runSteps_quiet` / `defer_cap_quiet`: moving a nested concatenation's
+     length check past later steps is equivalent when those steps are quiet
+     (state unchanged, no failure), the condition `qbe_concat_quiet` enforces;
+     `defer_cap_effect_counterexample`: otherwise it is not.
   4. `entry_update`: one probe that updates the found slot or inserts a fresh
      key equals `set k (f (lookup k m)) m`; `entry_hit_keeps_keys`: a hit
      keeps every stored key and its identity.
@@ -102,6 +106,67 @@ theorem fusion (steps : List (Step σ ε)) (st : σ) (ss : List Span) :
     rcases h : f st with ⟨st', err | p⟩
     · simp [deferred, eager, h]
     · simp [deferred, eager, h, ih, copySpans_append, copySpans]
+
+/-! Length checks of nested concatenations. Each `+` checks its own aggregate
+length (`capOk`) and fails with the same error `capErr`. Flattening a nested `+`
+into the enclosing span copy moves its check after the operands evaluated later.
+That is unobservable exactly when those later steps are quiet: they leave the
+state unchanged and cannot fail (`qbe_concat_quiet`: literals, locals and `+` of
+those). Otherwise the compiler keeps the nested concatenation. -/
+
+/-- Run steps left to right, stopping at the first failure. -/
+def runSteps : List (Step σ ε) → σ → σ × Except ε (List Span)
+  | [], st => (st, .ok [])
+  | f :: fs, st =>
+    match f st with
+    | (st', .error e) => (st', .error e)
+    | (st', .ok p) =>
+      match runSteps fs st' with
+      | (s, .ok ps) => (s, .ok (p :: ps))
+      | (s, .error e) => (s, .error e)
+
+/-- Base order: the nested concatenation of `pre` checks its length, then the
+later steps run. -/
+def checkThen (capOk : List Span → Bool) (capErr : ε) (pre : List Span)
+    (fs : List (Step σ ε)) (st : σ) : σ × Except ε (List Span) :=
+  if capOk pre then
+    match runSteps fs st with
+    | (s, .ok ps) => (s, .ok (pre ++ ps))
+    | (s, .error e) => (s, .error e)
+  else (st, .error capErr)
+
+/-- Flattened order: the later steps run first, the check of `pre` happens at the
+final copy. -/
+def thenCheck (capOk : List Span → Bool) (capErr : ε) (pre : List Span)
+    (fs : List (Step σ ε)) (st : σ) : σ × Except ε (List Span) :=
+  match runSteps fs st with
+  | (s, .error e) => (s, .error e)
+  | (s, .ok ps) => if capOk pre then (s, .ok (pre ++ ps)) else (s, .error capErr)
+
+theorem runSteps_quiet (fs : List (Step σ ε))
+    (hq : ∀ f ∈ fs, ∀ s, ∃ p, f s = (s, .ok p)) (st : σ) :
+    ∃ ps, runSteps fs st = (st, .ok ps) := by
+  induction fs generalizing st with
+  | nil => exact ⟨[], rfl⟩
+  | cons f fs ih =>
+    obtain ⟨p, hp⟩ := hq f (by simp) st
+    obtain ⟨ps, hps⟩ := ih (fun g hg s => hq g (by simp [hg]) s) st
+    exact ⟨p :: ps, by simp [runSteps, hp, hps]⟩
+
+theorem defer_cap_quiet (capOk : List Span → Bool) (capErr : ε) (pre : List Span)
+    (fs : List (Step σ ε)) (hq : ∀ f ∈ fs, ∀ s, ∃ p, f s = (s, .ok p)) (st : σ) :
+    checkThen capOk capErr pre fs st = thenCheck capOk capErr pre fs st := by
+  obtain ⟨ps, h⟩ := runSteps_quiet fs hq st
+  by_cases hc : capOk pre = true <;> simp [checkThen, thenCheck, h, hc]
+
+/-- A later step with an observable effect (here: it changes the state) makes the
+flattened order differ: the base order fails before the step runs. -/
+theorem defer_cap_effect_counterexample :
+    checkThen (σ := Nat) (fun _ => false) (7 : Nat) []
+        [fun s => (s + 1, .ok ⟨[], 0, 0⟩)] 0 ≠
+      thenCheck (σ := Nat) (fun _ => false) (7 : Nat) []
+        [fun s => (s + 1, .ok ⟨[], 0, 0⟩)] 0 := by
+  simp [checkThen, thenCheck, runSteps]
 
 structure Entry where
   key : List UInt8

@@ -215,9 +215,8 @@ int64_t  pion_map_len(void *m);
 
 typedef struct PionStrSpan { const char *data; int64_t len; } PionStrSpan;
 const char *pion_str_slice_data(const PionString *s, int64_t lo, int64_t hi);
-void pion_strbuf_push_span(void *sb, const char *ptr, int64_t len);
 void *pion_str_concat_spans(int64_t count, const PionStrSpan *parts);
-int64_t *pion_map_scalar_entry(PionMap *m, const char *data, int64_t len, PionString *whole, int32_t *present, PionString **resident);
+int64_t *pion_map_scalar_entry(PionMap *m, const char *data, int64_t len, PionString *whole);
 void     pion_map_set(void *m, void *key_str, int64_t val);
 int32_t  pion_map_has(void *m, void *key_str);
 int64_t  pion_map_get(void *m, void *key_str);
