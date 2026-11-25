@@ -15525,3 +15525,354 @@ test "x1 destructured inline body keeps last-use early drops" {
   let drop = body.index_of("call $pion_rc_dec(")
   assert_true(drop > first && drop < second, body)
 }
+
+///|
+test "StringBuilder LICM hoists array headers safely and blocks aliasing/custom types" {
+  let src =
+    #|fn revcomp_like(seq : Array[Int], comp : Array[Byte]) -> String {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = seq.length() - 1
+    #|  while i >= 0 {
+    #|    let b = seq[i]
+    #|    sb.write_byte(comp[b])
+    #|    i = i - 1
+    #|  }
+    #|  sb.to_string()
+    #|}
+    #|fn neg_arg_side_effect(arr : Array[Int]) -> String {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    sb.write_byte({ arr.push(99); b'a' })
+    #|    i = i + 1
+    #|  }
+    #|  sb.write_string(sum.to_string())
+    #|  sb.to_string()
+    #|}
+    #|struct MyBuf {
+    #|  arr : Array[Int]
+    #|}
+    #|fn MyBuf::write_byte(self : MyBuf, b : Byte) -> Unit {
+    #|  self.arr.push(b.to_int())
+    #|}
+    #|fn neg_custom_write_byte(arr : Array[Int]) -> Int {
+    #|  let mb = MyBuf::{ arr: arr }
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    mb.write_byte(b'x')
+    #|    i = i + 1
+    #|  }
+    #|  sum
+    #|}
+    #|fn neg_shadowed_sb_in_loop(arr : Array[Int]) -> Int {
+    #|  let sb = StringBuilder::new()
+    #|  let mb = MyBuf::{ arr: arr }
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    let sb = mb
+    #|    sum = sum + arr[i]
+    #|    sb.write_byte(b'!')
+    #|    i = i + 1
+    #|  }
+    #|  let _ = sb.length()
+    #|  sum
+    #|}
+    #|fn neg_local_closure_panic(arr : Array[Int], panic : () -> Byte) -> String {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    sb.write_byte(panic())
+    #|    i = i + 1
+    #|  }
+    #|  sb.write_string(sum.to_string())
+    #|  sb.to_string()
+    #|}
+    #|fn neg_and_rhs_is_shadow_sb(arr : Array[Int], opt : Option[MyBuf]) -> Int {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    if opt is Some(sb) && { sb.write_byte(b'!'); true } {
+    #|      sum = sum + 1
+    #|    }
+    #|    i = i + 1
+    #|  }
+    #|  let _ = sb.length()
+    #|  sum
+    #|}
+    #|fn neg_match_guard_is_shadow_sb(arr : Array[Int], opt : Option[MyBuf]) -> Int {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    match i {
+    #|      _ if opt is Some(sb) => sb.write_byte(b'!')
+    #|      _ => ()
+    #|    }
+    #|    i = i + 1
+    #|  }
+    #|  let _ = sb.length()
+    #|  sum
+    #|}
+    #|fn MyBuf::length(self : MyBuf) -> Int {
+    #|  self.arr.push(33)
+    #|  33
+    #|}
+    #|fn neg_match_guard_shadow_str_len(arr : Array[Int], opt : Option[MyBuf], x : String) -> String {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    sb.write_byte(match i {
+    #|      _ if opt is Some(x) => x.length().to_byte()
+    #|      _ => b'?'
+    #|    })
+    #|    i = i + 1
+    #|  }
+    #|  sb.write_string((sum + x.length()).to_string())
+    #|  sb.to_string()
+    #|}
+    #|fn neg_shadow_unfrozen_scratch(arr : Array[Int], alias : Array[Int]) -> Int {
+    #|  let sb = StringBuilder::new()
+    #|  let scratch : Array[Int] = [0]
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    let scratch = alias
+    #|    scratch.push(33)
+    #|    sb.write_byte(b'!')
+    #|    i = i + 1
+    #|  }
+    #|  let _ = sb.length()
+    #|  sum + scratch.length()
+    #|}
+    #|fn test_write_bytes_fastpath(bs : Bytes) -> String {
+    #|  let sb = StringBuilder::with_capacity(64)
+    #|  sb.write_bytes(bs)
+    #|  sb.to_string()
+    #|}
+    #|pub fn main() -> Int { 0 }
+  let cr = check_source_files_full("t_sb_licm_wbs", ["t.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_multi(cr.pkg, cr.tc, false, true, []).ssa
+  // Positive: revcomp_like hoists both `seq` and `comp` headers before the loop
+  let rc_s = p18_find_from(ssa, "function l $pion_fn_revcomp_like(", 0)
+  let rc_e = p18_find_from(ssa, "\n}", rc_s)
+  assert_true(rc_s >= 0 && rc_e > rc_s, "missing revcomp_like:\n" + ssa)
+  let rc_fn = slice_str(ssa, rc_s, rc_e)
+  let rc_wb = p18_find_from(rc_fn, "@wh_b_", 0)
+  let rc_wc = p18_find_from(rc_fn, "@wh_c_", 0)
+  let rc_loop = if rc_wb > 0 && (rc_wc < 0 || rc_wb < rc_wc) { rc_wb } else { rc_wc }
+  assert_true(rc_loop > 0, rc_fn)
+  let rc_pre = slice_str(rc_fn, 0, rc_loop)
+  let rc_in = slice_str(rc_fn, rc_loop, rc_fn.length())
+  // Preheader loads both array data pointers (+24)
+  let pre_add24_1 = p18_find_from(rc_pre, ", 24\n", 0)
+  let pre_add24_2 = p18_find_from(rc_pre, ", 24\n", pre_add24_1 + 5)
+  assert_true(pre_add24_1 >= 0 && pre_add24_2 > pre_add24_1, "expected 2 hoisted array data ptrs in preheader:\n" + rc_pre)
+  // Inside loop body, neither array header (+24) is reloaded
+  assert_eq(rc_in.contains(", 24\n"), false)
+  // Negative 1: argument side effect prevents hoisting `arr`
+  let n1_s = p18_find_from(ssa, "function l $pion_fn_neg_arg_side_effect(", 0)
+  let n1_e = p18_find_from(ssa, "\n}", n1_s)
+  assert_true(n1_s >= 0 && n1_e > n1_s, "missing neg_arg_side_effect")
+  let n1_fn = slice_str(ssa, n1_s, n1_e)
+  let n1_wb = p18_find_from(n1_fn, "@wh_b_", 0)
+  let n1_wc = p18_find_from(n1_fn, "@wh_c_", 0)
+  let n1_loop = if n1_wb > 0 && (n1_wc < 0 || n1_wb < n1_wc) { n1_wb } else { n1_wc }
+  assert_true(n1_loop > 0, n1_fn)
+  let n1_pre = slice_str(n1_fn, 0, n1_loop)
+  assert_eq(n1_pre.contains(", 24\n"), false)
+  // Negative 2: custom MyBuf::write_byte prevents hoisting `arr`
+  let n2_s = p18_find_from(ssa, "function w $pion_fn_neg_custom_write_byte(", 0)
+  let n2_e = p18_find_from(ssa, "\n}", n2_s)
+  assert_true(n2_s >= 0 && n2_e > n2_s, "missing neg_custom_write_byte")
+  let n2_fn = slice_str(ssa, n2_s, n2_e)
+  let n2_wb = p18_find_from(n2_fn, "@wh_b_", 0)
+  let n2_wc = p18_find_from(n2_fn, "@wh_c_", 0)
+  let n2_loop = if n2_wb > 0 && (n2_wc < 0 || n2_wb < n2_wc) { n2_wb } else { n2_wc }
+  assert_true(n2_loop > 0, n2_fn)
+  let n2_pre = slice_str(n2_fn, 0, n2_loop)
+  assert_eq(n2_pre.contains(", 24\n"), false)
+  // Negative 3: inner `let sb = mb` shadowing outer StringBuilder prevents hoisting `arr`
+  let n3_s = p18_find_from(ssa, "function w $pion_fn_neg_shadowed_sb_in_loop(", 0)
+  let n3_e = p18_find_from(ssa, "\n}", n3_s)
+  assert_true(n3_s >= 0 && n3_e > n3_s, "missing neg_shadowed_sb_in_loop")
+  let n3_fn = slice_str(ssa, n3_s, n3_e)
+  let n3_wb = p18_find_from(n3_fn, "@wh_b_", 0)
+  let n3_wc = p18_find_from(n3_fn, "@wh_c_", 0)
+  let n3_loop = if n3_wb > 0 && (n3_wc < 0 || n3_wb < n3_wc) { n3_wb } else { n3_wc }
+  assert_true(n3_loop > 0, n3_fn)
+  let n3_pre = slice_str(n3_fn, 0, n3_loop)
+  assert_eq(n3_pre.contains(", 24\n"), false)
+  // Negative 4: local closure named `panic` inside sb.write_byte(panic()) prevents hoisting `arr`
+  let n4_s = p18_find_from(ssa, "function l $pion_fn_neg_local_closure_panic(", 0)
+  let n4_e = p18_find_from(ssa, "\n}", n4_s)
+  assert_true(n4_s >= 0 && n4_e > n4_s, "missing neg_local_closure_panic")
+  let n4_fn = slice_str(ssa, n4_s, n4_e)
+  let n4_wb = p18_find_from(n4_fn, "@wh_b_", 0)
+  let n4_wc = p18_find_from(n4_fn, "@wh_c_", 0)
+  let n4_loop = if n4_wb > 0 && (n4_wc < 0 || n4_wb < n4_wc) { n4_wb } else { n4_wc }
+  assert_true(n4_loop > 0, n4_fn)
+  let n4_pre = slice_str(n4_fn, 0, n4_loop)
+  assert_eq(n4_pre.contains(", 24\n"), false)
+  // Negative 5: `opt is Some(sb) && { sb.write_byte(...); true }` shadows outer StringBuilder
+  let n5_s = p18_find_from(ssa, "function w $pion_fn_neg_and_rhs_is_shadow_sb(", 0)
+  let n5_e = p18_find_from(ssa, "\n}", n5_s)
+  assert_true(n5_s >= 0 && n5_e > n5_s, "missing neg_and_rhs_is_shadow_sb")
+  let n5_fn = slice_str(ssa, n5_s, n5_e)
+  let n5_wb = p18_find_from(n5_fn, "@wh_b_", 0)
+  let n5_wc = p18_find_from(n5_fn, "@wh_c_", 0)
+  let n5_loop = if n5_wb > 0 && (n5_wc < 0 || n5_wb < n5_wc) { n5_wb } else { n5_wc }
+  assert_true(n5_loop > 0, n5_fn)
+  let n5_pre = slice_str(n5_fn, 0, n5_loop)
+  assert_eq(n5_pre.contains(", 24\n"), false)
+  // Negative 6: `match i { _ if opt is Some(sb) => sb.write_byte(...) }` shadows outer StringBuilder
+  let n6_s = p18_find_from(ssa, "function w $pion_fn_neg_match_guard_is_shadow_sb(", 0)
+  let n6_e = p18_find_from(ssa, "\n}", n6_s)
+  assert_true(n6_s >= 0 && n6_e > n6_s, "missing neg_match_guard_is_shadow_sb")
+  let n6_fn = slice_str(ssa, n6_s, n6_e)
+  let n6_wb = p18_find_from(n6_fn, "@wh_b_", 0)
+  let n6_wc = p18_find_from(n6_fn, "@wh_c_", 0)
+  let n6_loop = if n6_wb > 0 && (n6_wc < 0 || n6_wb < n6_wc) { n6_wb } else { n6_wc }
+  assert_true(n6_loop > 0, n6_fn)
+  let n6_pre = slice_str(n6_fn, 0, n6_loop)
+  assert_eq(n6_pre.contains(", 24\n"), false)
+  // Negative 7: package-level `fn panic(a : Array[Int]) -> Byte` shadowing builtin `panic`
+  let pkg_panic_src =
+    #|fn panic(a : Array[Int]) -> Byte {
+    #|  a.push(25)
+    #|  b'p'
+    #|}
+    #|fn neg_pkg_fn_panic(arr : Array[Int], alias : Array[Int]) -> String {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    sb.write_byte(panic(alias))
+    #|    i = i + 1
+    #|  }
+    #|  sb.write_string(sum.to_string())
+    #|  sb.to_string()
+    #|}
+    #|pub fn main() -> Int { 0 }
+  let cr_pp = check_source_files_full("t_sb_licm_pkg_panic", ["t.pion"], [pkg_panic_src])
+  assert_true(cr_pp.diagnostics.length() == 0, check_result_to_json(cr_pp.diagnostics))
+  let ssa_pp = emit_qbe_package_multi(cr_pp.pkg, cr_pp.tc, false, true, []).ssa
+  let n7_s = p18_find_from(ssa_pp, "function l $pion_fn_neg_pkg_fn_panic(", 0)
+  let n7_e = p18_find_from(ssa_pp, "\n}", n7_s)
+  assert_true(n7_s >= 0 && n7_e > n7_s, "missing neg_pkg_fn_panic")
+  let n7_fn = slice_str(ssa_pp, n7_s, n7_e)
+  let n7_wb = p18_find_from(n7_fn, "@wh_b_", 0)
+  let n7_wc = p18_find_from(n7_fn, "@wh_c_", 0)
+  let n7_loop = if n7_wb > 0 && (n7_wc < 0 || n7_wb < n7_wc) { n7_wb } else { n7_wc }
+  assert_true(n7_loop > 0, n7_fn)
+  let n7_pre = slice_str(n7_fn, 0, n7_loop)
+  assert_eq(n7_pre.contains(", 24\n"), false)
+  // Negative 8: match guard `opt is Some(x)` shadowing outer `x : String` inside `sb.write_byte(match ...)`
+  let n8_s = p18_find_from(ssa, "function l $pion_fn_neg_match_guard_shadow_str_len(", 0)
+  let n8_e = p18_find_from(ssa, "\n}", n8_s)
+  assert_true(n8_s >= 0 && n8_e > n8_s, "missing neg_match_guard_shadow_str_len")
+  let n8_fn = slice_str(ssa, n8_s, n8_e)
+  let n8_wb = p18_find_from(n8_fn, "@wh_b_", 0)
+  let n8_wc = p18_find_from(n8_fn, "@wh_c_", 0)
+  let n8_loop = if n8_wb > 0 && (n8_wc < 0 || n8_wb < n8_wc) { n8_wb } else { n8_wc }
+  assert_true(n8_loop > 0, n8_fn)
+  let n8_pre = slice_str(n8_fn, 0, n8_loop)
+  assert_true(!n8_pre.contains(", 24\n"), "n8 must not hoist arr:\n" + n8_fn)
+  // Negative 9: inner `let scratch = alias` shadowing outer unfrozen local array `scratch`
+  // (`scratch = [0]` itself writes element 0 via `+ 24` before the loop, so verify `arr` reloads `+ 24` inside the loop)
+  let n9_s = p18_find_from(ssa, "function w $pion_fn_neg_shadow_unfrozen_scratch(", 0)
+  let n9_e = p18_find_from(ssa, "\n}", n9_s)
+  assert_true(n9_s >= 0 && n9_e > n9_s, "missing neg_shadow_unfrozen_scratch")
+  let n9_fn = slice_str(ssa, n9_s, n9_e)
+  let n9_wb = p18_find_from(n9_fn, "@wh_b_", 0)
+  let n9_wc = p18_find_from(n9_fn, "@wh_c_", 0)
+  let n9_loop = if n9_wb > 0 && (n9_wc < 0 || n9_wb < n9_wc) { n9_wb } else { n9_wc }
+  assert_true(n9_loop > 0, n9_fn)
+  let n9_in = slice_str(n9_fn, n9_loop, n9_fn.length())
+  assert_true(n9_in.contains(", 24\n"), "n9 must reload arr inside loop:\n" + n9_fn)
+  // Negative 10: cross-package monomorphization where app defines `enum E { Hit(Int) }`
+  // and dep defines `struct E` + `fn E::Hit(a : Array[Int]) -> Byte`
+  let dep_epath_src =
+    #|pub struct E {
+    #|  v : Int
+    #|}
+    #|pub fn E::Hit(a : Array[Int]) -> Byte {
+    #|  a.push(33)
+    #|  b'!'
+    #|}
+    #|pub fn[T] run_dep_epath(arr : Array[Int], alias : Array[Int], _tag : T) -> Int {
+    #|  let sb = StringBuilder::new()
+    #|  let mut i = 0
+    #|  let mut sum = 0
+    #|  while i < 8 {
+    #|    sum = sum + arr[i]
+    #|    sb.write_byte(E::Hit(alias))
+    #|    i = i + 1
+    #|  }
+    #|  let _ = sb.length()
+    #|  sum
+    #|}
+  let dep_cr = check_source_files_with_imports("dep_epath", ["dep.pion"], [dep_epath_src], [], true)
+  assert_true(dep_cr.diagnostics.length() == 0, check_result_to_json(dep_cr.diagnostics))
+  let app_epath_src =
+    #|import "dep_epath"
+    #|enum E {
+    #|  Hit(Int)
+    #|}
+    #|pub fn main() -> Int {
+    #|  let a : Array[Int] = [5, 6, 7, 8]
+    #|  let _e = E::Hit(1)
+    #|  dep_epath::run_dep_epath(a, a, 0)
+    #|}
+  let app_cr = check_source_files_with_imports(
+    "app_epath",
+    ["app.pion"],
+    [app_epath_src],
+    [imported_pkg_new("dep_epath", dep_cr.tc)],
+    true,
+  )
+  assert_true(app_cr.diagnostics.length() == 0, check_result_to_json(app_cr.diagnostics))
+  let ssa_xpkg = emit_qbe_package_multi(app_cr.pkg, app_cr.tc, true, true, ["dep_epath"]).ssa
+  let n10_s = p18_find_from(ssa_xpkg, "run_dep_epath", 0)
+  assert_true(n10_s >= 0, "missing mono run_dep_epath in ssa")
+  let n10_fn_s = p18_find_from(ssa_xpkg, "function w $", 0)
+  let mut mono_body = ""
+  let xfuncs = ssa_xpkg.split("function ")
+  let mut xfi = 0
+  while xfi < xfuncs.length() {
+    if xfuncs[xfi].contains("run_dep_epath") && xfuncs[xfi].contains("@wh_") {
+      mono_body = xfuncs[xfi]
+      break
+    }
+    xfi = xfi + 1
+  }
+  assert_true(mono_body != "" && n10_fn_s >= 0, "missing mono run_dep_epath body:\n" + ssa_xpkg)
+  let n10_wb = p18_find_from(mono_body, "@wh_b_", 0)
+  let n10_wc = p18_find_from(mono_body, "@wh_c_", 0)
+  let n10_loop = if n10_wb > 0 && (n10_wc < 0 || n10_wb < n10_wc) { n10_wb } else { n10_wc }
+  assert_true(n10_loop > 0, mono_body)
+  let n10_pre = slice_str(mono_body, 0, n10_loop)
+  assert_true(!n10_pre.contains(", 24\n"), "n10 must not hoist arr:\n" + mono_body)
+  // write_bytes fast path emitted in SSA
+  let wb_s = p18_find_from(ssa, "function l $pion_fn_test_write_bytes_fastpath(", 0)
+  let wb_e = p18_find_from(ssa, "\n}", wb_s)
+  assert_true(wb_s >= 0 && wb_e > wb_s, "missing test_write_bytes_fastpath")
+  let wb_fn = slice_str(ssa, wb_s, wb_e)
+  assert_true(wb_fn.contains("@sb_wbs_fast_"), wb_fn)
+  assert_true(wb_fn.contains("@sb_wbs_slow_"), wb_fn)
+  assert_true(wb_fn.contains("@sb_wbs_fdone_"), wb_fn)
+}

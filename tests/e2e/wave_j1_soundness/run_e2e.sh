@@ -8386,4 +8386,113 @@ PION_CACHE_DIR="$TMP_DIR/cas_r63_rel" "$PIONC" build --release -o "$TMP_DIR/r63_
 test "$("$TMP_DIR/r63_rel")" = "7"
 echo "  R63 cross-pkg mono payload enum ctor (dev==7, --release==7) (OK)"
 
+echo "=== Wave J1 E2E [60/60]: P2 R5 cross-pkg 3-segment aliased EPath (paint::E::Hit) blocks LICM hoist ==="
+mkdir -p "$TMP_DIR/p2_r5_alias/src" "$TMP_DIR/p2_r5_alias/paint2/src" "$TMP_DIR/p2_r5_alias/lg/src" "$TMP_DIR/p2_r5_alias/app/src"
+cat > "$TMP_DIR/p2_r5_alias/pion.toml" <<'EOF'
+[package]
+name = "paint"
+version = "0.1.0"
+
+[workspace]
+members = ["paint2", "lg", "app"]
+EOF
+cat > "$TMP_DIR/p2_r5_alias/src/lib.pion" <<'EOF'
+pub enum E {
+  Hit(Int)
+}
+pub fn root_tag(e : E) -> Int {
+  match e {
+    E::Hit(v) => v
+  }
+}
+EOF
+cat > "$TMP_DIR/p2_r5_alias/paint2/pion.toml" <<'EOF'
+[package]
+name = "paint2"
+version = "0.1.0"
+EOF
+cat > "$TMP_DIR/p2_r5_alias/paint2/src/lib.pion" <<'EOF'
+pub struct E {
+  v : Int
+}
+pub fn E::Hit(a : Array[Int]) -> Byte {
+  a.push(33)
+  b'!'
+}
+EOF
+cat > "$TMP_DIR/p2_r5_alias/lg/pion.toml" <<'EOF'
+[package]
+name = "lg"
+version = "0.1.0"
+
+[dependencies]
+paint = { package = "paint2", path = "../paint2" }
+EOF
+cat > "$TMP_DIR/p2_r5_alias/lg/src/lib.pion" <<'EOF'
+import "paint"
+pub trait Tag {
+  fn tag(self : Self) -> Int
+}
+pub fn run_hit[T : Tag](arr : Array[Int], alias : Array[Int], x : T) -> Int {
+  let sb = StringBuilder::new()
+  let mut i = 0
+  let mut sum = 0
+  while i < 40 {
+    sum = sum + arr[i]
+    sb.write_byte(paint::E::Hit(alias))
+    i = i + 1
+  }
+  if sb.length() != 40 {
+    return -1
+  }
+  sum + x.tag() * 0
+}
+EOF
+cat > "$TMP_DIR/p2_r5_alias/app/pion.toml" <<'EOF'
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+rootp = { package = "paint", path = ".." }
+paint2 = { path = "../paint2" }
+lg = { path = "../lg" }
+EOF
+cat > "$TMP_DIR/p2_r5_alias/app/src/main.pion" <<'EOF'
+import "rootp"
+import "paint2"
+import "lg"
+
+struct K { v : Int }
+impl lg::Tag for K {
+  fn tag(self : K) -> Int { self.v }
+}
+
+pub fn main(world : World) -> Unit {
+  let _r = rootp::root_tag(rootp::E::Hit(1))
+  let a : Array[Int] = [5, 6, 7, 8]
+  let sum = lg::run_hit(a, a, K::{ v: 1 })
+  io_println(world, sum.to_string() + ":" + a.length().to_string())
+}
+EOF
+PION_CACHE_DIR="$TMP_DIR/cas_p2_r5_dev" "$PIONC" build -o "$TMP_DIR/p2_r5_dev" "$TMP_DIR/p2_r5_alias/app"
+test "$("$TMP_DIR/p2_r5_dev")" = "1214:44"
+PION_CACHE_DIR="$TMP_DIR/cas_p2_r5_rel" "$PIONC" build --release -o "$TMP_DIR/p2_r5_rel" "$TMP_DIR/p2_r5_alias/app"
+test "$("$TMP_DIR/p2_r5_rel")" = "1214:44"
+# SSA assertion: monomorphized lg::run_hit MUST reload arr data ptr (+ 24) inside the loop body, never hoisted to preheader
+P2_R5_SSA=$(find "$TMP_DIR/cas_p2_r5_rel" -name '*.ssa' -exec grep -l 'run_hit' {} + | head -n 1)
+test -n "$P2_R5_SSA"
+awk '/function w \$[^ ]*run_hit/,/^}/' "$P2_R5_SSA" > "$TMP_DIR/p2_r5_mono.ssa"
+test -s "$TMP_DIR/p2_r5_mono.ssa"
+awk '
+  /^@wh_b_|^@wh_c_/ { in_loop = 1 }
+  !in_loop && /, 24$/ { pre_hoist = 1 }
+  in_loop && /, 24$/ { body_reload = 1 }
+  END {
+    if (pre_hoist) { print "FAIL: arr +24 hoisted to preheader"; exit 1 }
+    if (!body_reload) { print "FAIL: arr +24 not reloaded in loop"; exit 1 }
+  }
+' "$TMP_DIR/p2_r5_mono.ssa"
+echo "  P2 R5 3-segment aliased EPath paint::E::Hit (dev==1214:44, --release==1214:44, SSA no-hoist) (OK)"
+
 echo "PASS: wave_j1_soundness"

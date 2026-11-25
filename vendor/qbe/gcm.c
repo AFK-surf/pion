@@ -22,6 +22,23 @@ pinned(Ins *i)
 	return optab[i->op].pinned || isdivwl(i);
 }
 
+int
+pinned_fn(Fn *fn, Ins *i)
+{
+	if (optab[i->op].pinned)
+		return 1;
+	if (!isdivwl(i))
+		return 0;
+	if (rtype(i->arg[1]) == RCon && fn->con[i->arg[1].val].type == CBits) {
+		int64_t d = KWIDE(i->cls) ? fn->con[i->arg[1].val].bits.i
+			: (int64_t)(int32_t)fn->con[i->arg[1].val].bits.i;
+		if (i->op == Oudiv || i->op == Ourem)
+			return d == 0;
+		return d == 0 || d == -1;
+	}
+	return 1;
+}
+
 /* pinned ins that can be eliminated if unused */
 static int
 canelim(Ins *i)
@@ -70,7 +87,7 @@ earlyins(Fn *fn, Blk *b, Ins *i)
 		assert(dom(fn->rpo[b0], fn->rpo[b1]));
 		b0 = b1;
 	}
-	return pinned(i) ? b->id : b0;
+	return pinned_fn(fn, i) ? b->id : b0;
 }
 
 static void
@@ -86,7 +103,7 @@ earlyblk(Fn *fn, uint bid)
 		for (n=0; n<p->narg; n++)
 			schedearly(fn, p->arg[n]);
 	for (i=b->ins; i<&b->ins[b->nins]; i++)
-		if (pinned(i)) {
+		if (pinned_fn(fn, i)) {
 			schedearly(fn, i->arg[0]);
 			schedearly(fn, i->arg[1]);
 		}
@@ -184,7 +201,7 @@ schedlate(Fn *fn, Ref r)
 	 * in fixed instructions that may be eliminated
 	 * and are themselves unused transitively */
 
-	if (t->def && !pinned(t->def))
+	if (t->def && !pinned_fn(fn, t->def))
 		t->gcmbid = bestbid(fn, earlybid, latebid);
 	/* else, keep the early one */
 
@@ -203,7 +220,7 @@ lateins(Fn *fn, Blk *b, Ins *i, Ref r)
 	assert(req(i->arg[0], r) || req(i->arg[1], r));
 
 	latebid = schedlate(fn, i->to);
-	if (pinned(i)) {
+	if (pinned_fn(fn, i)) {
 		if (latebid == NOBID)
 		if (canelim(i))
 			return NOBID;
@@ -258,7 +275,7 @@ lateblk(Fn *fn, uint bid)
 			pp = &(*pp)->link;
 
 	for (i=b->ins; i<&b->ins[b->nins]; i++)
-		if (pinned(i))
+		if (pinned_fn(fn, i))
 			schedlate(fn, i->to);
 }
 
@@ -297,7 +314,7 @@ gcmmove(Fn *fn)
 		if (t->bid == t->gcmbid)
 			continue;
 		i = t->def;
-		if (pinned(i) && !canelim(i))
+		if (pinned_fn(fn, i) && !canelim(i))
 			continue;
 		assert(rtype(i->to) == RTmp);
 		assert(t == &fn->tmp[i->to.val]);
@@ -446,7 +463,7 @@ sinkref(Fn *fn, Blk *b, Ref *pr)
 	t = &fn->tmp[pr->val];
 	if (!t->def
 	|| t->bid == b->id
-	|| pinned(t->def)
+	|| pinned_fn(fn, t->def)
 	|| !cheap(t->def))
 		return;
 

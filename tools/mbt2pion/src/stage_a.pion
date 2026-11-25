@@ -2004,7 +2004,8 @@ fn find_expr_end(tokens : Array[Token], start : Int, end : Int) -> Int {
       pk == TokenKind::Slash || pk == TokenKind::Percent || pk == TokenKind::Eq ||
       pk == TokenKind::AmpAmp || pk == TokenKind::PipePipe || pk == TokenKind::PipeGt ||
       pk == TokenKind::Colon || pk == TokenKind::Arrow || pk == TokenKind::FatArrow ||
-      pk == TokenKind::Dot || pk == TokenKind::Comma
+      pk == TokenKind::Dot || pk == TokenKind::Comma ||
+      (pk == TokenKind::Keyword && (tokens[i - 1].raw == "match" || tokens[i - 1].raw == "if"))
       if !is_leading_cont && !is_trailing_cont {
         return i
       }
@@ -4540,24 +4541,75 @@ fn try_lower_or_is_expr(
     return None
   }
   if has_struct_pat {
-    // Lower `<lhs> is Ctor({ f1: p1, .. })` -> `(match <lhs> { Ctor(__mbt_s) => (__mbt_s.f1 is p1 && ...), _ => false })`
-    let p_start = is_idx + 1
-    if p_start + 1 < pat_end && (tokens[p_start].kind == TokenKind::UpperIdent || tokens[p_start].kind == TokenKind::Dot) {
-      let mut open_p = p_start + 1
-      if tokens[p_start].kind == TokenKind::Dot && open_p + 1 < pat_end {
-        open_p = p_start + 2
+    // Lower pure-predicate `<lhs> is Ctor({ f1: p1, .. })` and `<lhs> is (None | Some({ f1: p1, .. }))`
+    // via recursive struct-pattern peeling into `(match <lhs> { ..., _ => false })`.
+    // Fail closed if the pattern introduces any variable binder (which a `(match ...)` wrapper would swallow).
+    let mut ps = is_idx + 1
+    let mut pe = pat_end
+    while ps + 1 < pe && tokens[ps].kind == TokenKind::LParen && find_matching_delim(tokens, ps) == pe - 1 {
+      ps = ps + 1
+      pe = pe - 1
+    }
+    let mut has_var_binder = false
+    let mut vk = ps
+    while vk < pe {
+      if tokens[vk].kind == TokenKind::Ident && tokens[vk].raw != "_" &&
+      !(vk > ps && (tokens[vk - 1].kind == TokenKind::Dot || tokens[vk - 1].kind == TokenKind::ColonColon)) &&
+      !(vk + 1 < pe && tokens[vk + 1].kind == TokenKind::Colon) {
+        has_var_binder = true
+        break
       }
-      if open_p < pat_end && tokens[open_p].kind == TokenKind::LParen {
-        let close_p = find_matching_delim(tokens, open_p)
-        if open_p + 1 < close_p && tokens[open_p + 1].kind == TokenKind::LBrace {
-          let close_b = find_matching_delim(tokens, open_p + 1)
-          let ctor_head = lower_expr_range(ctx, tokens, p_start, open_p, file, true).trim()
-          let tmp_s = fresh_temp(ctx, "is")
-          let conds = lower_struct_pat_guards(ctx, tmp_s, tokens, open_p + 1, close_b, file)
-          let cond_expr = if conds.length() > 0 { conds } else { "true" }
-          return Some((tokens[i].leading_trivia + "(match " + lhs_str + " { " + ctor_head + "(" + tmp_s + ") => (" + cond_expr + "), _ => false })", pat_end))
+      vk = vk + 1
+    }
+    if has_var_binder {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[vk].line,
+        tokens[vk].col,
+        "struct pattern with variable bindings in `is` expression is not supported",
+      ))
+      return None
+    }
+    let lhs_ty_sp = infer_simple_expr_type(ctx, tokens, i, is_idx)
+    if lhs_ty_sp.length() > 0 {
+      push_expected_type(ctx, lhs_ty_sp)
+    }
+    let arms : Array[String] = []
+    let mut bi = ps
+    let mut ok_all = true
+    while bi < pe {
+      let mut be = bi
+      let mut bd = 0
+      while be < pe {
+        let bk = tokens[be].kind
+        if bk == TokenKind::LParen || bk == TokenKind::LBracket || bk == TokenKind::LBrace { bd = bd + 1 }
+        else if bk == TokenKind::RParen || bk == TokenKind::RBracket || bk == TokenKind::RBrace { if bd > 0 { bd = bd - 1 } }
+        else if bd == 0 && bk == TokenKind::Pipe { break }
+        be = be + 1
+      }
+      if be > bi {
+        if pattern_contains_struct_pat(tokens, bi, be) {
+          let (outer_p, obls) = peel_struct_patterns_in_pat(ctx, tokens, bi, be, file)
+          if obls.length() > 0 {
+            let (full_g, _) = expand_struct_pat_obligations(ctx, tokens, obls, 0, file, "", "true")
+            arms.push(outer_p.trim() + " if (" + full_g + ") => true")
+          } else {
+            ok_all = false
+            break
+          }
+        } else {
+          let ps_s = lower_expr_range(ctx, tokens, bi, be, file, true).trim()
+          arms.push(ps_s + " => true")
         }
       }
+      bi = be + 1
+    }
+    if lhs_ty_sp.length() > 0 {
+      pop_expected_type(ctx)
+    }
+    if ok_all && arms.length() > 0 {
+      return Some((tokens[i].leading_trivia + "(match " + lhs_str + " { " + join_comma(arms) + ", _ => false })", pat_end))
     }
     return None
   }
@@ -5575,9 +5627,57 @@ fn lower_one_token_or_form(
           }
         }
         let body_s = lower_block_range(ctx, tokens, lb, close_b, file, "")
+        // Lower tuple-destructuring `for (a, b) in xs { ... }` and `for i, (a, b) in xs { ... }`
+        // BEFORE restoring `ctx.ident_renames` / `ctx.scope_vars` so bindings match the renamed body!
+        let mut tuple_out : Option[String] = None
+        if tokens[i + 1].kind == TokenKind::LParen && find_matching_delim(tokens, i + 1) == in_idx - 1 {
+          if is_irrefutable_tuple_pattern(tokens, i + 1, in_idx) {
+            let tmp_v = fresh_temp(ctx, "for")
+            let let_stmts = emit_flat_tuple_let_bindings(ctx, tokens, i + 1, in_idx, tmp_v)
+            let patched_body = if body_s.starts_with("{") {
+              "{ " + let_stmts + body_s.slice(1, body_s.length())
+            } else {
+              body_s
+            }
+            tuple_out = Some(trivia + "for " + tmp_v + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + patched_body)
+          } else {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              tokens[i + 1].line,
+              tokens[i + 1].col,
+              "invalid or refutable tuple pattern in `for ... in` loop header",
+            ))
+          }
+        } else if i + 3 < in_idx && (tokens[i + 1].kind == TokenKind::Ident || tokens[i + 1].kind == TokenKind::Underscore) &&
+        tokens[i + 2].kind == TokenKind::Comma && tokens[i + 3].kind == TokenKind::LParen &&
+        find_matching_delim(tokens, i + 3) == in_idx - 1 {
+          if is_irrefutable_tuple_pattern(tokens, i + 3, in_idx) {
+            let tmp_v = fresh_temp(ctx, "for")
+            let idx_s = lower_expr_range(ctx, tokens, i + 1, i + 2, file, true)
+            let let_stmts = emit_flat_tuple_let_bindings(ctx, tokens, i + 3, in_idx, tmp_v)
+            let patched_body = if body_s.starts_with("{") {
+              "{ " + let_stmts + body_s.slice(1, body_s.length())
+            } else {
+              body_s
+            }
+            tuple_out = Some(trivia + "for" + idx_s + ", " + tmp_v + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + patched_body)
+          } else {
+            ctx.diags.push(diag_error(
+              "MBT2PION_UNSUPPORTED_SYNTAX",
+              file,
+              tokens[i + 3].line,
+              tokens[i + 3].col,
+              "invalid or refutable tuple pattern in `for ... in` loop header",
+            ))
+          }
+        }
         restore_scope_vars(ctx, saved_for_sc)
         restore_ident_renames(ctx, saved_for_rn)
-        return (trivia + "for" + vars_s + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + body_s, close_b + 1)
+        match tuple_out {
+          Some(s) => return (s, close_b + 1)
+          None => return (trivia + "for" + vars_s + tokens[in_idx].leading_trivia + "in" + iter_s + tokens[lb].leading_trivia + body_s, close_b + 1)
+        }
       } else if semi1 > i + 1 {
         // C-style `for v1 = init1, v2 = init2; cond; step { body }`
         let loop_vars : Array[String] = []
@@ -8747,7 +8847,7 @@ fn lower_ambig_match_probe(
       next_i = ni
     } else if body_start < close_b && tokens[body_start].kind == TokenKind::Keyword &&
     (tokens[body_start].raw == "for" || tokens[body_start].raw == "while") {
-      let body_end = find_expr_end(tokens, body_start, close_b)
+      let body_end = find_loop_stmt_end(tokens, body_start, close_b)
       let inner_b = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
       body_raw = "{ " + inner_b + " }"
       next_i = body_end
@@ -9716,7 +9816,7 @@ fn lower_match_arms_with_ty(
           next_i = ni
         } else if body_start < end && tokens[body_start].kind == TokenKind::Keyword &&
         (tokens[body_start].raw == "for" || tokens[body_start].raw == "while") {
-          let body_end = find_expr_end(tokens, body_start, end)
+          let body_end = find_loop_stmt_end(tokens, body_start, end)
           let inner_b = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
           body_raw = tokens[body_start].leading_trivia + "{ " + inner_b + " }"
           next_i = body_end
@@ -9989,7 +10089,7 @@ fn lower_match_arms_with_ty(
       next_i = ni
     } else if body_start < end && tokens[body_start].kind == TokenKind::Keyword &&
     (tokens[body_start].raw == "for" || tokens[body_start].raw == "while") {
-      let body_end = find_expr_end(tokens, body_start, end)
+      let body_end = find_loop_stmt_end(tokens, body_start, end)
       let inner_b = lower_expr_range(ctx, tokens, body_start, body_end, file, false).trim()
       body_raw = tokens[body_start].leading_trivia + "{ " + inner_b + " }"
       next_i = body_end
@@ -10402,127 +10502,56 @@ fn lower_match_arms_with_ty(
       }
     }
 
-    // Special case B: `Ctor({ ... } [as x])` struct pattern inside constructor pattern
-    // Preserves ALL non-binding field guards AND ALL binding fields (0/1/2/N, order-independent),
-    // and evaluates structure match + arm `guard_str` together inside the outer `if` guard so
-    // guard failure falls through cleanly to the next arm!
-    let mut bc_lp = -1
-    if !handled_special && i + 1 < pat_end && tokens[i].kind == TokenKind::UpperIdent && tokens[i + 1].kind == TokenKind::LParen {
-      bc_lp = i + 1
-    } else if !handled_special && i + 3 < pat_end && tokens[i].kind == TokenKind::UpperIdent &&
-    tokens[i + 1].kind == TokenKind::ColonColon && tokens[i + 2].kind == TokenKind::UpperIdent &&
-    tokens[i + 3].kind == TokenKind::LParen {
-      bc_lp = i + 3
-    }
-    if bc_lp > i {
-      let cp = find_matching_delim(tokens, bc_lp)
-      if cp == pat_end - 1 && bc_lp + 1 < cp && tokens[bc_lp + 1].kind == TokenKind::LBrace {
-        let cb = find_matching_delim(tokens, bc_lp + 1)
-        let ctor_head = lower_expr_range(ctx, tokens, i, bc_lp, file, true).trim()
-        let has_as = cb + 2 < cp && tokens[cb + 1].kind == TokenKind::Keyword && tokens[cb + 1].raw == "as"
-        let bind_var = if has_as { rename_keyword_ident(tokens[cb + 2].raw) } else { fresh_temp(ctx, "sp") }
-        let non_bind_guards : Array[String] = []
-        let bind_fields : Array[(String, String)] = []
-        let mut fi = bc_lp + 2
-        while fi < cb {
-          if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot { fi = fi + 1; continue }
-          let mut fe = fi
-          let mut fd = 0
-          while fe < cb {
-            let fk = tokens[fe].kind
-            if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
-            else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
-            else if fd == 0 && fk == TokenKind::Comma { break }
-            fe = fe + 1
-          }
-          if (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
-          fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Colon {
-            let fname = rename_keyword_ident(tokens[fi].raw)
-            let fexpr = bind_var + "." + fname
-            let vs = fi + 2
-            let mut has_binder = false
-            let mut bi = vs
-            while bi < fe {
-              if tokens[bi].kind == TokenKind::Ident &&
-              !(bi > vs && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon)) &&
-              !(bi + 1 < fe && tokens[bi + 1].kind == TokenKind::Colon) {
-                has_binder = true
-              }
-              bi = bi + 1
-            }
-            if has_binder {
-              let pat_s = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
-              bind_fields.push((fexpr, pat_s))
-            } else if vs < fe && tokens[vs].kind == TokenKind::LBrace {
-              let ncb = find_matching_delim(tokens, vs)
-              let nested = lower_struct_pat_guards(ctx, fexpr, tokens, vs, ncb, file)
-              if nested.length() > 0 { non_bind_guards.push(nested) }
-            } else if vs < fe {
-              let vt = tokens[vs]
-              if vs + 1 == fe && (vt.kind == TokenKind::Keyword && (vt.raw == "true" || vt.raw == "false") ||
-                vt.kind == TokenKind::IntLit || vt.kind == TokenKind::FloatLit || vt.kind == TokenKind::StringLit || vt.kind == TokenKind::CharLit) {
-                non_bind_guards.push(fexpr + " == " + vt.raw)
-              } else {
-                let ps = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
-                if ps != "_" {
-                  non_bind_guards.push("(" + fexpr + " is " + ps + ")")
-                }
-              }
-            }
-          } else if tokens[fi].kind == TokenKind::Ident && fe == fi + 1 {
-            // Shorthand field binder `{ x, .. }` -> binds `x` to `bind_var.x`
-            let fname = rename_keyword_ident(tokens[fi].raw)
-            bind_fields.push((bind_var + "." + fname, fname))
-          } else {
+    // Special case B: Arbitrary nested/tuple/constructor struct patterns (`Ctor({ ... })`,
+    // `Some({ hit: Some({ back: Some(p), .. }), .. })`, `(Some({ way: Some(w), .. }), _)`, etc.).
+    // Recursively peels every `{ ... }` / `S::{ ... }` inside the pattern into hygienic bindings
+    // and nests `match` checks + arm `guard_str` inside the outer `if` guard for clean fallthrough.
+    if !handled_special && pattern_contains_struct_pat(tokens, i, pat_end) {
+      let mut has_top_pipe = false
+      let mut pk = i
+      let mut pdp = 0
+      while pk < pat_end {
+        let pkk = tokens[pk].kind
+        if pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace { pdp = pdp + 1 }
+        else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace { if pdp > 0 { pdp = pdp - 1 } }
+        else if pdp == 0 && pkk == TokenKind::Pipe { has_top_pipe = true; break }
+        pk = pk + 1
+      }
+      if !has_top_pipe {
+        let (outer_pat, obls) = peel_struct_patterns_in_pat(ctx, tokens, i, pat_end, file)
+        if obls.length() > 0 {
+          if if_idx >= 0 && !guard_tokens_are_pure(tokens, if_idx + 1, fa) &&
+          struct_pat_obls_have_binders(tokens, obls) {
             ctx.diags.push(diag_error(
               "MBT2PION_UNSUPPORTED_SYNTAX",
               file,
-              tokens[fi].line,
-              tokens[fi].col,
-              "unsupported field pattern inside constructor struct pattern",
+              tokens[if_idx].line,
+              tokens[if_idx].col,
+              "struct pattern with bindings and non-pure `if` guard is not supported (guard may mutate bound fields)",
             ))
-          }
-          fi = fe + 1
-        }
-        let nbg_sb = StringBuilder()
-        let mut ni = 0
-        while ni < non_bind_guards.length() {
-          if ni > 0 { nbg_sb.write_string(" && ") }
-          nbg_sb.write_string(non_bind_guards[ni])
-          ni = ni + 1
-        }
-        let fguards = nbg_sb.to_string()
-        if bind_fields.length() > 0 {
-          let scrut_e = if bind_fields.length() == 1 {
-            bind_fields[0].0
           } else {
-            let es : Array[String] = []
-            for bf in bind_fields { es.push(bf.0) }
-            "(" + join_comma(es) + ")"
+            let (full_g, full_b) = expand_struct_pat_obligations(
+              ctx,
+              tokens,
+              obls,
+              0,
+              file,
+              guard_str,
+              body_raw.trim(),
+            )
+            let g_suffix = if full_g == "true" { "" } else { " if " + full_g }
+            sb.write_string(lead_triv + outer_pat.trim() + g_suffix + tokens[fa].leading_trivia + "=> " + full_b + trail_sep)
+            handled_special = true
           }
-          let pat_e = if bind_fields.length() == 1 {
-            bind_fields[0].1
-          } else {
-            let ps : Array[String] = []
-            for bf in bind_fields { ps.push(bf.1) }
-            "(" + join_comma(ps) + ")"
-          }
-          let guard_rhs = if guard_str.length() > 0 { "(" + guard_str + ")" } else { "true" }
-          let match_g = "(match " + scrut_e + " { " + pat_e + " => " + guard_rhs + ", _ => false })"
-          let full_g = if fguards.length() > 0 { "(" + fguards + ") && " + match_g } else { match_g }
-          sb.write_string(lead_triv + ctor_head + "(" + bind_var + ") if " + full_g + tokens[fa].leading_trivia + "=> match " + scrut_e + " { " + pat_e + " => " + body_raw.trim() + ", _ => panic(\"unreachable\") }" + trail_sep)
-        } else {
-          let full_g = if fguards.length() > 0 && guard_str.length() > 0 {
-            "(" + fguards + ") && (" + guard_str + ")"
-          } else if fguards.length() > 0 {
-            fguards
-          } else {
-            guard_str
-          }
-          let g_suffix = if full_g.length() > 0 { " if " + full_g } else { "" }
-          sb.write_string(lead_triv + ctor_head + "(" + bind_var + ")" + g_suffix + tokens[fa].leading_trivia + "=>" + body_raw + trail_sep)
         }
-        handled_special = true
+      } else {
+        ctx.diags.push(diag_error(
+          "MBT2PION_UNSUPPORTED_SYNTAX",
+          file,
+          tokens[i].line,
+          tokens[i].col,
+          "struct pattern inside or-pattern `|` in `match` arm is not supported",
+        ))
       }
     }
 
@@ -14797,4 +14826,443 @@ fn join_comma(xs : Array[String]) -> String {
     i = i + 1
   }
   sb.to_string()
+}
+
+///| Find the exclusive end token index of a `for` / `while` loop statement starting at `start`
+///| (spanning past any depth-0 `,` in `for k, v in ...` or `;` in `for i = 0; ...; ...`,
+///| up to and including the loop body's closing `}` and optional `else { ... }`).
+fn find_loop_stmt_end(tokens : Array[Token], start : Int, end : Int) -> Int {
+  let mut lb = start + 1
+  let mut pd = 0
+  while lb < end {
+    let lk = tokens[lb].kind
+    if pd == 0 && lk == TokenKind::LBrace {
+      if !(lb > start + 1 && tokens[lb - 1].kind == TokenKind::ColonColon) {
+        let cb = find_matching_delim(tokens, lb)
+        let next_is_multiline_cont = cb + 1 < end && tokens[cb + 1].newline_before && (
+          (tokens[cb + 1].kind == TokenKind::Dot && cb + 2 < end && tokens[cb + 2].kind == TokenKind::Ident) ||
+          tokens[cb + 1].kind == TokenKind::AmpAmp ||
+          tokens[cb + 1].kind == TokenKind::PipePipe ||
+          tokens[cb + 1].kind == TokenKind::PipeGt
+        )
+        let is_cond_block = cb + 1 < end && (next_is_multiline_cont || (!tokens[cb + 1].newline_before && (
+          tokens[cb + 1].kind == TokenKind::LBrace ||
+          tokens[cb + 1].kind == TokenKind::AmpAmp ||
+          tokens[cb + 1].kind == TokenKind::PipePipe ||
+          tokens[cb + 1].kind == TokenKind::EqEq ||
+          tokens[cb + 1].kind == TokenKind::BangEq ||
+          tokens[cb + 1].kind == TokenKind::Lt ||
+          tokens[cb + 1].kind == TokenKind::LtEq ||
+          tokens[cb + 1].kind == TokenKind::Gt ||
+          tokens[cb + 1].kind == TokenKind::GtEq ||
+          tokens[cb + 1].kind == TokenKind::Plus ||
+          tokens[cb + 1].kind == TokenKind::Minus ||
+          tokens[cb + 1].kind == TokenKind::Star ||
+          tokens[cb + 1].kind == TokenKind::Slash ||
+          tokens[cb + 1].kind == TokenKind::Percent ||
+          tokens[cb + 1].kind == TokenKind::Dot ||
+          tokens[cb + 1].kind == TokenKind::LBracket ||
+          tokens[cb + 1].kind == TokenKind::LParen ||
+          tokens[cb + 1].kind == TokenKind::PipeGt ||
+          (tokens[cb + 1].kind == TokenKind::Keyword && (tokens[cb + 1].raw == "is" || tokens[cb + 1].raw == "as"))
+        )))
+        if is_cond_block {
+          lb = cb + 1
+          continue
+        }
+        break
+      }
+    }
+    if lk == TokenKind::LParen || lk == TokenKind::LBracket || lk == TokenKind::LBrace {
+      pd = pd + 1
+    } else if lk == TokenKind::RParen || lk == TokenKind::RBracket || lk == TokenKind::RBrace {
+      if pd > 0 { pd = pd - 1 }
+    }
+    lb = lb + 1
+  }
+  if lb < end && tokens[lb].kind == TokenKind::LBrace {
+    let mut after = find_matching_delim(tokens, lb) + 1
+    if after < end && tokens[after].kind == TokenKind::Keyword && tokens[after].raw == "else" {
+      if after + 1 < end && tokens[after + 1].kind == TokenKind::LBrace {
+        after = find_matching_delim(tokens, after + 1) + 1
+      }
+    }
+    return after
+  }
+  find_expr_end(tokens, start, end)
+}
+
+///| Conservative purity check for `match` arm `if` guard tokens `[start, end)`:
+///| returns `false` if the guard contains any call, assignment, or block expression that could mutate fields.
+fn guard_tokens_are_pure(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::LBrace || tk == TokenKind::Eq || tk == TokenKind::AssignOp ||
+    tk == TokenKind::PipeGt || tk == TokenKind::LBracket ||
+    tk == TokenKind::InterpString || tk == TokenKind::InterpMultiline {
+      return false
+    }
+    if tk == TokenKind::LParen && k > start {
+      let pk = tokens[k - 1].kind
+      if pk == TokenKind::Ident || pk == TokenKind::UpperIdent ||
+      pk == TokenKind::RParen || pk == TokenKind::RBracket {
+        return false
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Return true if any struct-pattern obligation in `obls` introduces at least one variable binder.
+fn struct_pat_obls_have_binders(
+  tokens : Array[Token],
+  obls : Array[(String, Int, Int, String)],
+) -> Bool {
+  for ob in obls {
+    let open_b = ob.1
+    let close_b = ob.2
+    let mut k = open_b + 1
+    while k < close_b {
+      if tokens[k].kind == TokenKind::Ident && tokens[k].raw != "_" &&
+      !(k > open_b + 1 && (tokens[k - 1].kind == TokenKind::Dot || tokens[k - 1].kind == TokenKind::ColonColon)) &&
+      !(k + 1 < close_b && tokens[k + 1].kind == TokenKind::Colon) {
+        return true
+      }
+      k = k + 1
+    }
+  }
+  false
+}
+
+///| Check that `[start, end)` is a syntactically valid irrefutable tuple pattern `(p1, p2, ...)`
+///| with >= 2 comma-separated elements whose leaves are only identifiers, `_`, or nested >= 2-tuples
+///| (fail-closed on 0/1-tuples, missing commas, constructors, literals, or structs).
+fn is_irrefutable_tuple_pattern(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  if start >= end || tokens[start].kind != TokenKind::LParen {
+    return false
+  }
+  if find_matching_delim(tokens, start) != end - 1 {
+    return false
+  }
+  let mut k = start + 1
+  let mut elem_count = 0
+  let mut expect_elem = true
+  while k < end - 1 {
+    let tk = tokens[k].kind
+    if expect_elem {
+      if tk == TokenKind::Ident || tk == TokenKind::Underscore {
+        elem_count = elem_count + 1
+        expect_elem = false
+        k = k + 1
+      } else if tk == TokenKind::LParen {
+        let cp = find_matching_delim(tokens, k)
+        if cp >= end - 1 || !is_irrefutable_tuple_pattern(tokens, k, cp + 1) {
+          return false
+        }
+        elem_count = elem_count + 1
+        expect_elem = false
+        k = cp + 1
+      } else {
+        return false
+      }
+    } else {
+      if tk != TokenKind::Comma {
+        return false
+      }
+      expect_elem = true
+      k = k + 1
+    }
+  }
+  elem_count >= 2
+}
+
+///| Flatten a potentially nested irrefutable tuple pattern `(p1, (p2, p3))` against `rhs_var`
+///| into a sequence of flat Pion `let (a, b) = v; ` statements.
+fn emit_flat_tuple_let_bindings(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  rhs_var : String,
+) -> String {
+  let names : Array[String] = []
+  let nested : Array[(String, Int, Int)] = []
+  let mut k = start + 1
+  while k < end - 1 {
+    if tokens[k].kind == TokenKind::Comma {
+      k = k + 1
+      continue
+    }
+    if tokens[k].kind == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, k)
+      let sub_v = fresh_temp(ctx, "ft")
+      names.push(sub_v)
+      nested.push((sub_v, k, cp + 1))
+      k = cp + 1
+    } else if tokens[k].kind == TokenKind::Underscore {
+      names.push("_")
+      k = k + 1
+    } else {
+      names.push(resolve_ident_in_scope(ctx, tokens[k].raw))
+      k = k + 1
+    }
+  }
+  let sb = StringBuilder()
+  sb.write_string("let (" + join_comma(names) + ") = " + rhs_var + ";")
+  for sub in nested {
+    sb.write_string(" " + emit_flat_tuple_let_bindings(ctx, tokens, sub.1, sub.2, sub.0))
+  }
+  sb.to_string()
+}
+
+///| Return true if pattern token slice `[start, end)` contains any `{` struct pattern.
+fn pattern_contains_struct_pat(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    if tokens[k].kind == TokenKind::LBrace {
+      return true
+    }
+    k = k + 1
+  }
+  false
+}
+
+///| Recursively replace every outermost `{ ... }` / `S::{ ... }` struct pattern inside `[start, end)`
+///| with a hygienic binding variable, returning `(pion_pattern, [(bind_var, open_b, close_b, explicit_sname)])`.
+fn peel_struct_patterns_in_pat(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  start : Int,
+  end : Int,
+  file : String,
+) -> (String, Array[(String, Int, Int, String)]) {
+  // Reject any depth-0 or-pattern `|` at this level if any branch contains `{ ... }`:
+  // peeling `{ ... }` into a fresh binding on one side of `|` produces invalid asymmetric or-patterns.
+  let mut pk = start
+  let mut pd = 0
+  let mut has_pipe = false
+  while pk < end {
+    let pkk = tokens[pk].kind
+    if pkk == TokenKind::LParen || pkk == TokenKind::LBracket || pkk == TokenKind::LBrace { pd = pd + 1 }
+    else if pkk == TokenKind::RParen || pkk == TokenKind::RBracket || pkk == TokenKind::RBrace { if pd > 0 { pd = pd - 1 } }
+    else if pd == 0 && pkk == TokenKind::Pipe { has_pipe = true; break }
+    pk = pk + 1
+  }
+  if has_pipe && pattern_contains_struct_pat(tokens, start, end) {
+    ctx.diags.push(diag_error(
+      "MBT2PION_UNSUPPORTED_SYNTAX",
+      file,
+      tokens[pk].line,
+      tokens[pk].col,
+      "struct pattern inside nested or-pattern `|` is not supported",
+    ))
+    return ("", [])
+  }
+  let sb = StringBuilder()
+  let obls : Array[(String, Int, Int, String)] = []
+  let mut k = start
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::LBrace {
+      let cb = find_matching_delim(tokens, k)
+      let has_as = cb + 2 < end && tokens[cb + 1].kind == TokenKind::Keyword &&
+      tokens[cb + 1].raw == "as" && tokens[cb + 2].kind == TokenKind::Ident
+      let bind_var = if has_as {
+        resolve_ident_in_scope(ctx, tokens[cb + 2].raw)
+      } else {
+        fresh_temp(ctx, "sp")
+      }
+      sb.write_string(tokens[k].leading_trivia + bind_var)
+      obls.push((bind_var, k, cb, ""))
+      k = if has_as { cb + 3 } else { cb + 1 }
+    } else if k + 2 < end && tk == TokenKind::UpperIdent &&
+    tokens[k + 1].kind == TokenKind::ColonColon && tokens[k + 2].kind == TokenKind::LBrace {
+      let cb = find_matching_delim(tokens, k + 2)
+      let has_as = cb + 2 < end && tokens[cb + 1].kind == TokenKind::Keyword &&
+      tokens[cb + 1].raw == "as" && tokens[cb + 2].kind == TokenKind::Ident
+      let bind_var = if has_as {
+        resolve_ident_in_scope(ctx, tokens[cb + 2].raw)
+      } else {
+        fresh_temp(ctx, "sp")
+      }
+      sb.write_string(tokens[k].leading_trivia + bind_var)
+      obls.push((bind_var, k + 2, cb, tokens[k].raw))
+      k = if has_as { cb + 3 } else { cb + 1 }
+    } else if tk == TokenKind::LParen {
+      let cp = find_matching_delim(tokens, k)
+      if pattern_contains_struct_pat(tokens, k + 1, cp) {
+        let (inner_s, inner_obls) = peel_struct_patterns_in_pat(ctx, tokens, k + 1, cp, file)
+        if inner_obls.length() == 0 {
+          return ("", [])
+        }
+        sb.write_string(tokens[k].leading_trivia + "(" + inner_s + tokens[cp].leading_trivia + ")")
+        for ob in inner_obls { obls.push(ob) }
+        k = cp + 1
+      } else {
+        sb.write_string(lower_expr_range(ctx, tokens, k, cp + 1, file, true))
+        k = cp + 1
+      }
+    } else if (tk == TokenKind::UpperIdent || tk == TokenKind::Ident) &&
+    k + 1 < end && tokens[k + 1].kind == TokenKind::LParen &&
+    pattern_contains_struct_pat(tokens, k + 2, find_matching_delim(tokens, k + 1)) {
+      sb.write_string(lower_expr_range(ctx, tokens, k, k + 1, file, true))
+      k = k + 1
+    } else if (tk == TokenKind::UpperIdent || tk == TokenKind::Ident) &&
+    k + 3 < end && tokens[k + 1].kind == TokenKind::ColonColon &&
+    tokens[k + 2].kind == TokenKind::UpperIdent && tokens[k + 3].kind == TokenKind::LParen &&
+    pattern_contains_struct_pat(tokens, k + 4, find_matching_delim(tokens, k + 3)) {
+      sb.write_string(lower_expr_range(ctx, tokens, k, k + 3, file, true))
+      k = k + 3
+    } else {
+      let (piece, nk) = lower_one_token_or_form(ctx, tokens, k, end, file, true)
+      sb.write_string(piece)
+      k = nk
+    }
+  }
+  (sb.to_string(), obls)
+}
+
+///| Expand peeled struct-pattern obligations recursively into `(guard_bool_expr, body_expr)`.
+fn expand_struct_pat_obligations(
+  ctx : StageAContext,
+  tokens : Array[Token],
+  obls : Array[(String, Int, Int, String)],
+  idx : Int,
+  file : String,
+  guard_str : String,
+  body_str : String,
+) -> (String, String) {
+  if idx >= obls.length() {
+    let g = if guard_str.length() > 0 { "(" + guard_str + ")" } else { "true" }
+    return (g, body_str)
+  }
+  let (bind_var, open_b, close_b, explicit_sname) = obls[idx]
+  let non_bind_guards : Array[String] = []
+  let bind_fields : Array[(String, String)] = []
+  let next_obls : Array[(String, Int, Int, String)] = []
+  let mut oi = idx + 1
+  while oi < obls.length() {
+    next_obls.push(obls[oi])
+    oi = oi + 1
+  }
+  let mut fi = open_b + 1
+  while fi < close_b {
+    if tokens[fi].kind == TokenKind::Comma || tokens[fi].kind == TokenKind::DotDot {
+      fi = fi + 1
+      continue
+    }
+    let mut fe = fi
+    let mut fd = 0
+    while fe < close_b {
+      let fk = tokens[fe].kind
+      if fk == TokenKind::LParen || fk == TokenKind::LBracket || fk == TokenKind::LBrace { fd = fd + 1 }
+      else if fk == TokenKind::RParen || fk == TokenKind::RBracket || fk == TokenKind::RBrace { fd = fd - 1 }
+      else if fd == 0 && fk == TokenKind::Comma { break }
+      fe = fe + 1
+    }
+    let raw_f = tokens[fi].raw
+    let access_f = if explicit_sname.length() > 0 {
+      rename_struct_field(ctx, explicit_sname, raw_f)
+    } else {
+      rename_keyword_ident(raw_f)
+    }
+    if (tokens[fi].kind == TokenKind::Ident || tokens[fi].kind == TokenKind::Keyword) &&
+    fi + 2 < fe && tokens[fi + 1].kind == TokenKind::Colon {
+      let fexpr = bind_var + "." + access_f
+      let vs = fi + 2
+      if pattern_contains_struct_pat(tokens, vs, fe) {
+        let (peeled_pat, child_obls) = peel_struct_patterns_in_pat(ctx, tokens, vs, fe, file)
+        bind_fields.push((fexpr, peeled_pat.trim()))
+        for cob in child_obls {
+          next_obls.push(cob)
+        }
+      } else {
+        let mut has_binder = false
+        let mut bi = vs
+        while bi < fe {
+          if tokens[bi].kind == TokenKind::Ident &&
+          !(bi > vs && (tokens[bi - 1].kind == TokenKind::Dot || tokens[bi - 1].kind == TokenKind::ColonColon)) &&
+          !(bi + 1 < fe && tokens[bi + 1].kind == TokenKind::Colon) {
+            has_binder = true
+          }
+          bi = bi + 1
+        }
+        if has_binder {
+          let pat_s = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
+          bind_fields.push((fexpr, pat_s))
+        } else if vs < fe {
+          let vt = tokens[vs]
+          if vs + 1 == fe && (vt.kind == TokenKind::Keyword && (vt.raw == "true" || vt.raw == "false") ||
+            vt.kind == TokenKind::IntLit || vt.kind == TokenKind::FloatLit || vt.kind == TokenKind::StringLit || vt.kind == TokenKind::CharLit) {
+            non_bind_guards.push(fexpr + " == " + vt.raw)
+          } else {
+            let ps = lower_expr_range(ctx, tokens, vs, fe, file, true).trim()
+            if ps != "_" {
+              non_bind_guards.push("(match " + fexpr + " { " + ps + " => true, _ => false })")
+            }
+          }
+        }
+      }
+    } else if tokens[fi].kind == TokenKind::Ident && fe == fi + 1 {
+      let bind_name = resolve_ident_in_scope(ctx, raw_f)
+      bind_fields.push((bind_var + "." + access_f, bind_name))
+    } else {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[fi].line,
+        tokens[fi].col,
+        "unsupported field pattern inside struct pattern",
+      ))
+    }
+    fi = fe + 1
+  }
+  let (inner_g, inner_b) = expand_struct_pat_obligations(
+    ctx,
+    tokens,
+    next_obls,
+    0,
+    file,
+    guard_str,
+    body_str,
+  )
+  let nbg_sb = StringBuilder()
+  let mut ni = 0
+  while ni < non_bind_guards.length() {
+    if ni > 0 { nbg_sb.write_string(" && ") }
+    nbg_sb.write_string(non_bind_guards[ni])
+    ni = ni + 1
+  }
+  let fguards = nbg_sb.to_string()
+  if bind_fields.length() > 0 {
+    let scrut_e = if bind_fields.length() == 1 {
+      bind_fields[0].0
+    } else {
+      let es : Array[String] = []
+      for bf in bind_fields { es.push(bf.0) }
+      "(" + join_comma(es) + ")"
+    }
+    let pat_e = if bind_fields.length() == 1 {
+      bind_fields[0].1
+    } else {
+      let ps : Array[String] = []
+      for bf in bind_fields { ps.push(bf.1) }
+      "(" + join_comma(ps) + ")"
+    }
+    let match_g = "(match " + scrut_e + " { " + pat_e + " => " + inner_g + ", _ => false })"
+    let full_g = if fguards.length() > 0 { "(" + fguards + ") && " + match_g } else { match_g }
+    let full_b = "match " + scrut_e + " { " + pat_e + " => " + inner_b + ", _ => panic(\"unreachable\") }"
+    (full_g, full_b)
+  } else {
+    let full_g = if fguards.length() > 0 && inner_g != "true" {
+      "(" + fguards + ") && " + inner_g
+    } else if fguards.length() > 0 {
+      fguards
+    } else {
+      inner_g
+    }
+    (full_g, inner_b)
+  }
 }

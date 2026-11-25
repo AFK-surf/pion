@@ -183,7 +183,19 @@ if [ "${1:-}" = "--group" ]; then
           exit 1
         }
       fi
-      echo "[SUMMARY] standalone_e2e (text_stats, net_ffi, utf8, p22a/p25a/p27a/p17a, link_z, cross_elf, dyn_trait, wave_j2): OK"
+      P2_DEV_OUT=$("$PIONC2" run "$ROOT_DIR/tests/e2e/p_clbg_p2_divrem_licm_strbuf.pion")
+      "$PIONC2" build --release -o "$G_TMP/p_clbg_p2_rel" "$ROOT_DIR/tests/e2e/p_clbg_p2_divrem_licm_strbuf.pion"
+      P2_REL_OUT=$("$G_TMP/p_clbg_p2_rel")
+      echo "p_clbg_p2_divrem_licm_strbuf -> dev=$P2_DEV_OUT release=$P2_REL_OUT"
+      [ "$P2_DEV_OUT" = "p_clbg_p2_divrem_licm_strbuf ok" ] || { echo "FAIL: p_clbg_p2 dev output ($P2_DEV_OUT)" >&2; exit 1; }
+      [ "$P2_REL_OUT" = "p_clbg_p2_divrem_licm_strbuf ok" ] || { echo "FAIL: p_clbg_p2 rel output ($P2_REL_OUT)" >&2; exit 1; }
+      if command -v node >/dev/null 2>&1; then
+        "$PIONC2" build --release --target wasm32 -o "$G_TMP/p_clbg_p2.wasm" "$ROOT_DIR/tests/e2e/p_clbg_p2_divrem_licm_strbuf.pion"
+        P2_WASM_OUT=$(node "$ROOT_DIR/runtime/pion_wasm_rt.mjs" "$G_TMP/p_clbg_p2.wasm")
+        echo "p_clbg_p2_divrem_licm_strbuf -> wasm32=$P2_WASM_OUT"
+        [ "$P2_WASM_OUT" = "p_clbg_p2_divrem_licm_strbuf ok" ] || { echo "FAIL: p_clbg_p2 wasm32 output ($P2_WASM_OUT)" >&2; exit 1; }
+      fi
+      echo "[SUMMARY] standalone_e2e (text_stats, net_ffi, utf8, p22a/p25a/p27a/p17a, link_z, cross_elf, dyn_trait, wave_j2, p_clbg_p2): OK"
       ;;
     flagship_https_station)
       HTTPS_OUT=$("$PIONC2" test --json "$ROOT_DIR/examples/https_server")

@@ -1373,6 +1373,46 @@ theorem rc_rem1 {cls : Cls} {x y : BitVec 64} (hy : maskC cls y = 1) :
   · simp only [asS, extS32_one', srem_one']; decide
   · simp only [asS, srem_one', maskC]
 
+theorem umod_eq_sub_udiv_mul (a b : BitVec 64) :
+    a % b = a - a / b * b := by
+  have h : a / b * b + a % b = a := by
+    apply BitVec.eq_of_toNat_eq
+    simp only [BitVec.toNat_add, BitVec.toNat_mul, BitVec.toNat_udiv, BitVec.toNat_umod]
+    have hm : b.toNat * (a.toNat / b.toNat) + a.toNat % b.toNat = a.toNat := Nat.div_add_mod a.toNat b.toNat
+    have hlt : a.toNat < 2 ^ 64 := a.isLt
+    rw [Nat.mod_add_mod, Nat.mul_comm (a.toNat / b.toNat), hm, Nat.mod_eq_of_lt hlt]
+  calc a % b = (a / b * b + a % b) - a / b * b := by abel
+    _ = a - a / b * b := by rw [h]
+
+theorem srem_eq_sub_sdiv_mul (x y : BitVec 64) :
+    x.srem y = x - x.sdiv y * y := by
+  simp only [BitVec.srem, BitVec.sdiv]
+  cases x.msb <;> cases y.msb <;> dsimp only
+  · exact umod_eq_sub_udiv_mul x y
+  · change x % (-y) = x - (-(x / (-y))) * y
+    rw [umod_eq_sub_udiv_mul x (-y)]; ring
+  · change -((-x) % y) = x - (-((-x) / y)) * y
+    rw [umod_eq_sub_udiv_mul (-x) y]; ring
+  · change -((-x) % (-y)) = x - ((-x) / (-y)) * y
+    rw [umod_eq_sub_udiv_mul (-x) (-y)]; ring
+
+theorem rc_rem_div_mul_sub {cls : Cls} {x y : BitVec 64}
+    (hs : safeDiv cls .Rem (maskC cls x) (maskC cls y)) :
+    evalBin cls .Rem x y =
+      some (maskC cls (maskC cls x -
+        maskC cls (maskC cls ((asS cls (maskC cls x)).sdiv (asS cls (maskC cls y))) * maskC cls y))) := by
+  simp only [evalBin, ite_t hs]
+  congr 1
+  rw [srem_eq_sub_sdiv_mul]
+  cases cls
+  · have hlo : ∀ z : BitVec 64, lo32 (extS 32 z) = lo32 z := fun z => by
+      have := congrArg lo32 (maskW_extS32 z)
+      simpa [maskC, lo32_zx32] using this
+    simp only [asS, maskC]
+    congr 1
+    simp only [lo32_sub, lo32_mul, lo32_zx32, hlo]
+  · simp only [asS, maskC]
+
 theorem rc_udiv1 {cls : Cls} {x y : BitVec 64} (hy : maskC cls y = 1) (hx : maskC cls x = x) :
     evalBin cls .UDiv x y = some x := by
   have hs : safeDiv cls .UDiv (maskC cls x) (maskC cls y) :=
@@ -1998,6 +2038,7 @@ theorem vg_canon_bin_motive (cls : Cls) : BinMotive1 cls (fun vg => vg_canon_bin
         · simp only [hy1, ↓reduceIte] at hs; exact Or.inl (ok_inj' hs).symm
       case Rem =>
         simp only [argCls1] at hs
+        have hc := hcl2 rfl rfl
         by_cases hy1 : (⟨maskC cls y0.bv⟩ : Std.U64) = 1#u64
         · simp only [hy1, ↓reduceIte] at hs
           have hy1' : maskC cls y0.bv = 1 := by simpa using congrArg (·.bv) hy1
@@ -2007,7 +2048,63 @@ theorem vg_canon_bin_motive (cls : Cls) : BinMotive1 cls (fun vg => vg_canon_bin
           rw [hevb, rc_rem1 hy1'] at hv
           rw [← Option.some.inj hv]
           cases cls <;> decide
-        · simp only [hy1, ↓reduceIte] at hs; exact Or.inl (ok_inj' hs).symm
+        · simp only [hy1, ↓reduceIte] at hs
+          obtain ⟨sf, hsf, hs⟩ := bind_eq_ok hs
+          cases sf with
+          | false => simp only [Bool.false_eq_true, ↓reduceIte] at hs; exact Or.inl (ok_inj' hs).symm
+          | true =>
+            simp only [↓reduceIte] at hs
+            have hsafe_all : ∀ xv : BitVec 64, safeDiv cls .Rem (maskC cls xv) (maskC cls y0.bv) := by
+              intro xv
+              unfold is_safe_div_const at hsf
+              simp only [mask_cls_spec, is_signed_div_spec, all_ones_spec, bind_ok] at hsf
+              split at hsf
+              · simp at hsf
+              · rename_i h0
+                have h0' : maskC cls (maskC cls y0.bv) ≠ 0 := fun e => h0 (u64_ext (by simpa using e))
+                refine ⟨h0', fun hs hall => ?_⟩
+                simp only [hs, ↓reduceIte, bind_ok] at hsf
+                have hbeq : ((⟨maskC cls (U64.bv (⟨maskC cls y0.bv⟩ : Std.U64))⟩ : Std.U64) == ⟨allOnesC cls⟩) = true := by
+                  simpa [u64_mk_bv] using congrArg (fun z : BitVec 64 => ((⟨z⟩ : Std.U64) == ⟨allOnesC cls⟩)) hall
+                simp only [hbeq, ↓reduceIte] at hsf
+                exact absurd (ok_inj' hsf) (by decide)
+            obtain ⟨q1, hq1, hs⟩ := bind_eq_ok hs
+            obtain ⟨qv, vg1⟩ := q1
+            obtain ⟨q2, hq2, hs⟩ := bind_eq_ok hs
+            obtain ⟨pv, vg2⟩ := q2
+            obtain ⟨q3, hq3, hs⟩ := bind_eq_ok hs
+            obtain ⟨rv, vg3⟩ := q3
+            have hok1 : BinArgOK vg cls .Div a b := by
+              simp only [BinArgOK, isCmp, isShift, Bool.false_eq_true, ↓reduceIte]
+              exact ⟨hc.1, hc.2⟩
+            have hr1 := ih1 vg .Div a b _ hq1 hd hva hvb hok1
+            have hok2 : BinArgOK vg1 cls .Mul qv b := by
+              simp only [BinArgOK, isCmp, isShift, Bool.false_eq_true, ↓reduceIte]
+              exact ⟨hr1.2.2.2.1, extends_clsOf hr1.1 hvb ▸ hc.2⟩
+            have hr2 := ih1 vg1 .Mul qv b _ hq2 hr1.2.1 hr1.2.2.1 (extends_valid hr1.1 hvb) hok2
+            have hok3 : BinArgOK vg2 cls .Sub a pv := by
+              simp only [BinArgOK, isCmp, isShift, Bool.false_eq_true, ↓reduceIte]
+              exact ⟨extends_clsOf (vg_extends_trans hr1.1 hr2.1) hva ▸ hc.1, hr2.2.2.2.1⟩
+            have hr3 := ih1 vg2 .Sub a pv _ hq3 hr2.2.1 (extends_valid (vg_extends_trans hr1.1 hr2.1) hva) hr2.2.2.1 hok3
+            have hext := vg_extends_trans hr1.1 (vg_extends_trans hr2.1 hr3.1)
+            refine Or.inr ⟨_, (ok_inj' hs).symm, ⟨hext, hr3.2.1, fun _ => ⟨hr3.2.2.1, hr3.2.2.2.1, fun env v hv => ?_⟩⟩⟩
+            have hsafe_rem : safeDiv cls .Rem (maskC cls (evI vg env a)) (maskC cls y0.bv) := hsafe_all _
+            have hsafe_div : safeDiv cls .Div (maskC cls (evI vg env a)) (maskC cls y0.bv) := by
+              simpa [safeDiv, signedDivOp] using hsafe_rem
+            have hev_b1 : evI vg1 env b = y0.bv := by rw [extends_evI hr1.1 env hvb, hevb]
+            have hev_a2 : evI vg2 env a = evI vg env a := extends_evI (vg_extends_trans hr1.1 hr2.1) env hva
+            have hdiv_ev : evI vg1 env qv = maskC cls ((asS cls (maskC cls (evI vg env a))).sdiv (asS cls (maskC cls y0.bv))) := by
+              apply hr1.2.2.2.2 env _
+              simp only [evalBin, hevb]
+              rw [ite_t hsafe_div]
+            have hmul_ev : evI vg2 env pv = maskC cls (maskC cls ((asS cls (maskC cls (evI vg env a))).sdiv (asS cls (maskC cls y0.bv))) * maskC cls y0.bv) := by
+              apply hr2.2.2.2.2 env _
+              simp only [evalBin, hev_b1, hdiv_ev, maskC_idem]
+            apply hr3.2.2.2.2 env v
+            rw [hev_a2, hmul_ev]
+            simp only [evalBin, maskC_idem]
+            rw [hevb, rc_rem_div_mul_sub hsafe_rem] at hv
+            exact hv
       case UDiv =>
         simp only [argCls1] at hs
         have hc := hcl2 rfl rfl

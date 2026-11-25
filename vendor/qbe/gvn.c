@@ -249,7 +249,7 @@ dedupins(Fn *fn, Blk *b, Ins *i)
 	Ins *i1;
 
 	normins(fn, i);
-	if (i->op == Onop || pinned(i))
+	if (i->op == Onop || pinned_fn(fn, i))
 		return;
 
 	/* when sel instructions are inserted
