@@ -374,7 +374,8 @@ SSAEOF
   MSYS2_ARG_CONV_EXCL="*" "$LLD_LINK" /NOLOGO /entry:entry /nodefaultlib /subsystem:console /opt:ref \
     "/map:${TMP_NAT}${NAT_SEP}pe_two.map" "/out:${TMP_NAT}${NAT_SEP}pe_two.exe" \
     "${TMP_NAT}${NAT_SEP}pe_obj1.obj" "${TMP_NAT}${NAT_SEP}pe_obj2.obj"
-  python3 -E "$DIR/check_unwind.py" --pe-link "$TMP_DIR/pe_two.exe" "$TMP_DIR/pe_two.map" "$TMP_DIR/pe_obj1.s,$TMP_DIR/pe_obj2.s" \
+  python3 -E "$DIR/check_unwind.py" --pe-link "$TMP_DIR/pe_two.exe" "$TMP_DIR/pe_two.map" \
+    --asm "$TMP_DIR/pe_obj1.s" --asm "$TMP_DIR/pe_obj2.s" \
     --live entry,call_obj2,local_same:2 --dead unused,local_dead,local_dead2 --expect-entries 4 || fail "PE two-obj /OPT:REF --seh"
   echo "p120 PE /OPT:REF: single-obj exc_dir=0x0c (1 entry, dead GC'd) + two-obj static isolation exc_dir=0x30 (4 entries, 0 collisions)"
 elif [ "${PION_REQUIRE_PE_LINK:-0}" = 1 ]; then

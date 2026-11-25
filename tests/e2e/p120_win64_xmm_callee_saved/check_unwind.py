@@ -428,13 +428,19 @@ def main():
             fail('usage: check_unwind.py --no-unwind OBJ.obj')
         check_no_unwind(args[1])
     elif mode == '--pe-link':
-        if len(args) < 5:
-            fail('usage: check_unwind.py --pe-link PE.exe MAP.txt WIN.s[,WIN2.s] --live ... --dead ... --expect-entries N')
-        pe_path, map_path, win_s_arg = args[1], args[2], args[3]
-        live, dead, expect_n = [], [], None
-        i = 4
+        if len(args) < 4:
+            fail('usage: check_unwind.py --pe-link PE.exe MAP.txt [--asm WIN.s ...] --live ... --dead ... --expect-entries N')
+        pe_path, map_path = args[1], args[2]
+        win_s_paths, live, dead, expect_n = [], [], [], None
+        i = 3
+        if i < len(args) and not args[i].startswith('--'):
+            win_s_paths.append(args[i])
+            i += 1
         while i < len(args):
-            if args[i] == '--live':
+            if args[i] == '--asm':
+                win_s_paths.append(args[i + 1])
+                i += 2
+            elif args[i] == '--live':
                 live = [x for x in args[i + 1].split(',') if x]
                 i += 2
             elif args[i] == '--dead':
@@ -447,7 +453,7 @@ def main():
                 fail(f'unknown arg {args[i]}')
         if expect_n is None:
             expect_n = sum(int(s.split(':', 1)[1]) if ':' in s else 1 for s in live)
-        check_pe_link(pe_path, map_path, win_s_arg.split(','), live, dead, expect_n)
+        check_pe_link(pe_path, map_path, win_s_paths, live, dead, expect_n)
     else:
         fail(f'unknown mode {mode!r}')
 
