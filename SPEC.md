@@ -36,6 +36,7 @@ This spec is the **single source of truth** shared by `runtime/`, `vendor/qbe/`,
    - Package-level separate compilation via `.pionsig` compact interface files: editing a function body without changing its `pub` signature yields 100% cache hit on downstream packages.
    - **Global Content-Addressed Cache** (`$PION_CACHE_DIR`, default `~/.cache/pion/cas`), LRU-evicted (`$PION_CACHE_MAX_MB`, default 2048). **NEVER writes a `target/` or `_build/` directory inside the source tree.**
    - **Dev backend**: emits per-package **QBE IL** → vendored `qbe --obj` writes the object file directly for `arm64_apple` (Mach-O arm64) and `amd64_sysv` (ELF64 x86-64) with no `as`; all other targets (`amd64_apple`, `amd64_win`, `arm64`, `rv64`, `ios_arm64`, `ios_sim_arm64`, `android_arm64`, `android_x64`) lower via `qbe -t <arch>` → target `cc -c` → `ld`/`cc` + prebuilt `<64 KB` `libpionrt.a`. `--emit-asm` or `PION_NO_DIRECT_OBJ=1` falls back to `qbe` text + assembler.
+     - **Strict `jnz`/`jtbl` `w`-class codegen invariant**: because QBE `jnz`/`jtbl` inspects only the low 32 bits of its argument, Pion codegen (`qbe.pion`) MUST pass only `Kw` (`w`-class) temporaries (or constants) to every `jnz` and `jtbl` (testing 64-bit pointers, lengths, booleans, and `%tp_*` generic flags via explicit `=w cnel %x, 0` first). Vendored `qbe` preserves upstream default semantics for Stage 0 seed compatibility and adds an explicit strict gate (`--strict-jnz` / `-strict-jnz` / `PION_QBE_STRICT_JNZ=1`) that rejects any non-`w` temporary operand to `jnz`/`jtbl`; `pionc` passes `--strict-jnz` on every QBE invocation and `wasm.pion` enforces the equivalent `WASM_TY_I32` check on every `jnz`/`jtbl` at module entry.
    - **Multi-target & library outputs**:
      - Host auto-detection (`$PION_TARGET`, else `$OS == Windows_NT`, else `uname -sm`): macOS ARM64 (`arm64_apple`), macOS x86_64 (`amd64_apple`), Linux x86_64 (`amd64_sysv`), Linux ARM64 (`arm64`), Linux RISC-V 64 (`rv64`), Windows x86_64 (`amd64_win`).
      - Cross targets: `--target arm64_apple|amd64_apple|amd64_sysv|amd64_win|arm64|rv64|ios_arm64|ios_sim_arm64|android_arm64|android_x64|wasm32`, with optional `--sysroot <dir>` (`-isysroot` on Apple, `--sysroot=` on ELF; iOS defaults to deployment target `16.0` overridable via `$PION_IOS_DEPLOYMENT_TARGET`/`$IPHONEOS_DEPLOYMENT_TARGET` and auto-probes `xcrun --sdk iphoneos|iphonesimulator --show-sdk-path`; Android auto-probes `$PION_ANDROID_CC`, `$ANDROID_NDK_HOME`, `$ANDROID_NDK_ROOT`, `$ANDROID_HOME/ndk`, `$ANDROID_SDK_ROOT/ndk`, `$HOME/Library/Android/sdk/ndk`, `$HOME/Android/Sdk/ndk`, and fails cleanly if no NDK/CC is configured; cross targets with unset `PION_RT_LIB` auto-compile and cache `runtime/pion_rt.c` as a target-specific `.a` in CAS; Windows auto-links `-lws2_32`, links executables with a 16 MB main-thread stack (`-Wl,--stack,16777216`; MinGW defaults to 1 MB), spawns `scope` threads with 8 MB stacks, and omits `-fPIC`/`-rpath`; when `CC` targets Windows MSVC (`PION_WIN_ABI=msvc`, `clang-cl`, or `cc -dumpmachine` containing `msvc`), `pionc` auto-derives `clang++`, translates `-mwindows`/`-mconsole`/`-Wl,--stack,N` to `/SUBSYSTEM:*`/`/STACK:*`, adds `-fuse-ld=lld`, omits `-lm`/`-lpthread`, and auto-compiles `runtime/pion_rt.c` into CAS when `PION_RT_LIB` is unset).
@@ -143,6 +144,7 @@ import "pkg_name" [as alias]
 // - `p : T = def` (positional parameter with default, also passable by name)
 // - `into p : T` / `into w~ : T = def` / `into opt? : T` (contextual keyword: opt-in single-hop `#into` conversion at call sites; cannot combine with `mut`, forbidden on `extern "C" fn` and closures)
 // - Call sites: `f(w=10.0)` / `f(w~)` (punned) / `f(opt=val)` (auto-wrapped in `Some`, converting `val` first when `into opt?`) / `f(opt?=opt_val)` (Option forwarding) / `x |> f(w=10.0)`
+// - Default expression lexical hygiene: each `default_expr` is type-checked and evaluated in its defining package's scope with only earlier parameters `0 .. p - 1` of the same function in scope (never captures call-site locals or later parameters; types and visibility resolve against the defining package, while the callee's own generic type parameters remain in scope and are substituted per call site). Top-level `return`, `?`, `break`, and `continue` are forbidden inside `default_expr` (closures nested inside `default_expr` may still use `return`/`?` for themselves). Bare calls `f(...)` invoke a local/parameter only when its static type is a function type (`TFn`); non-function locals and unconstrained generic type-parameter values (`T`) always fall back to the package-level function `fn f(...)` consistently in both function bodies and `default_expr`.
 
 #into [pub] fn Target::from_xxx[T...](v : Src) -> Target { ... }
 #into [pub] fn Src::to_xxx[T...](self : Src) -> Target { ... }
@@ -169,6 +171,28 @@ impl Name for TypeName {
 }
 
 [pub] let CONST_NAME : Type = expr
+// Top-level `let` bindings in a package are initialized once in deterministic
+// package-level topological order (dependencies before dependents, ties broken
+// stably by file order then declaration order) across all compilation modes
+// (single-package, multi-package, per-unit incremental CAS, test, and wasm32).
+// Dependencies are computed by a sound conservative static dependency analysis
+// over same-package top-level `let` references, direct function/method call
+// graphs, and tracked local/struct-field/container-wrapped callbacks and
+// higher-order parameters (recursive functions are not initialization cycles;
+// closure creation and non-escaping local wrapper bindings such as
+// `let x = Some(f)` do not execute the callback body, whereas callbacks that
+// escape via return values/arguments/fields or are grouped inside the same
+// enum/container constant are conservatively over-approximated as reachable
+// whenever the escaping call runs or any unpacked payload of that constant is
+// invoked; `dyn`/FFI/cross-package callbacks follow source order). Cycles in
+// this static dependency graph are rejected at type-check time with
+// `E_CONST_CYCLE` naming the full cycle chain, and cold/hot incremental CAS
+// builds always agree on initialization order and cycle diagnostics (the
+// untyped incremental pre-check falls back to the full type-checked analysis
+// whenever any `call?:`/`mth?:`/`ctor?:` ambiguity could affect the plan). The
+// computed initialization plan and per-function constant read summaries are
+// hashed into the package unit CAS key (`sigs_hash`) so editing a helper's
+// constant reads invalidates cached `init_all` units.
 
 test "test name" {
   ...
@@ -197,7 +221,7 @@ test "test name" {
   - Anonymous struct literals `{ x: 1, y: 2 }` / `{ ..base, x: 1 }` take their struct from the expected type (annotations, typed container elements and `push`/`set` values, `Option`/`Result` payloads, parameters including default and labeled ones, return values, `if`/`match` branches, tuple elements, struct fields, top-level constants) or from a struct-typed `..base`. Without such a context `pionc check` reports `E_TYPE_MISMATCH` "cannot infer struct type for anonymous struct literal `{ ... }`" (`expected` is the non-struct expected type, else `explicit struct type`); a non-struct `..base` reports "struct update base must be a struct type, found `<Ty>`" (not repeated when the base already reported an error). Fix-it: write `StructName::{ ... }` or add a struct type annotation.
 - Control flow:
   - `if cond { ... } else if cond2 { ... } else { ... }` (expression when all branches yield same type; `expr is Pattern` and `if let Pattern = expr` bind pattern variables — including nested tuple/variant patterns such as `Some((a, b))` and `Ok((a, (b, c)))` — into the matching branch, `&&` right-hand side, or enclosing block)
-  - `guard cond else { diverge_block }` and `guard expr is Pattern else { diverge_block }` (early exit on mismatch; binds pattern variables into the enclosing block for subsequent statements)
+  - `guard cond else { diverge_block }` and `guard expr is Pattern else { diverge_block }` (early exit on mismatch; binds pattern variables into the enclosing block for subsequent statements; the `else` block is statically verified to diverge on every reachable path via `return`, enclosing-loop `break`/`continue`, `panic`/`abort`, a `-> Never` function/method/closure call, a pure-Pion generic call whose return type is an unconstrained type parameter `T` not appearing in any parameter type (recommended to migrate to `-> Never`), all-branch-diverging `if`/`else` or exhaustive `match`, or `while true` with no reachable outer `break` — otherwise `E_GUARD_ELSE_NOT_DIVERGE`; `return` inside a nested closure, `break`/`continue` outside a loop or inside a nested loop/closure, and `debug_assert(...)` (erased in release builds) do not diverge the `guard`). `Never` is a first-class bottom type (`ty_compat(T, Never)` holds for any `T`, while `ty_compat(Never, T)` holds only for `Never`; `Option`/`Result`/tuple, mutable containers `Array`/`FixedArray`/`Map`/`Channel`/`Mutex`, and nominal generic `struct`/`enum` types are all invariant in their type arguments, and function types are contravariant in parameter types and covariant in return type; a `-> Never` function, method, or closure body must statically diverge).
   - `while cond { ... }` (including `while expr is Pattern { ... }` and `while let Pattern = expr { ... }`)
   - `for i = 0; i < n; i = i + 1 { ... }`, `for i in start..end { ... }` / `for i in start..<end { ... }` (half-open `[start, end)`), `for i in start..=end { ... }` (closed `[start, end]`, overflow-safe), `for x in arr { ... }` and `for i, x in arr { ... }` (`Array[T]`, `FixedArray[T]`, and `ImmArray[T]`)
   - Error propagation: postfix `expr?` on `Result[T, E]` (enclosing function returns `Result[_, E2]`, applying a single-hop `#into` conversion when `E != E2`) and `Option[T]` (enclosing function returns `Option[_]`)
@@ -312,7 +336,7 @@ test "test name" {
 - `Int` (`i32`): sign-extended in 64-bit register (or `w` locally, `l` across generic boundaries).
 - `Int64`: `int64_t` (`l`).
 - `Double`: IEEE-754 bit-cast (`double` / `d`, boxed to `int64_t` bits in generic slots).
-- `Bool` / `Byte` / `Char`: zero-extended in 64-bit slot (`0`/`1`, `0..255`, Unicode scalar); `Int8`: sign-extended in 64-bit slot (`-128..127`).
+- `Bool` / `Byte` / `Char`: zero-extended in 64-bit slot (`0`/`1`, `0..255`, Unicode scalar `0x0000..=0xD7FF` or `0xE000..=0x10FFFF`); numeric casts `as Char` validate the truncated integer code point and deterministically map any out-of-range, negative, surrogate (`0xD800..=0xDFFF`), or floating-point `NaN`/`±Inf` value to `U+FFFD` (`65533`) on both Native and Wasm32, preserving the zero-extended Unicode scalar ABI invariant across 64-bit slots and compact 4-byte `Char` array/struct storage; `Int8`: sign-extended in 64-bit slot (`-128..127`).
 - `Unit`: `0`.
 - Non-generic payload-less `enum`s (`UnitEnum`, `pionc-v0.19`): 1-based 64-bit integer (`l` / `int64_t`) in `1..=N` (non-object, no ownership/RC); `Option[UnitEnum]` uses `0` for `None` and `1..=N` for `Some(Vk)` (non-object, no ownership/RC).
 - All heap objects (`String`, `Bytes`, `Array`, `Map`, `struct`, generic or payload-carrying `enum`, `Closure`, `Channel`, `Mutex`, `AtomicInt`): `PionObj*` (64-bit pointer, `l` in QBE).
@@ -591,6 +615,8 @@ All symbols use `pion_` prefix and C calling convention (`arm64_apple` / `amd64_
   - `E_UNHANDLED_RESULT` (`"machine"`) — prefixes the discarded statement with `let _ = `.
   - `E_CAPABILITY_MISSING` (`"maybe"`) — inserts `world : World` as the first parameter of the enclosing function; its call sites then report the arity and need a second step passing `world`.
   - `E_NO_IO_VIOLATION` — emitted (with no `edits`) when a `#no_io` / `#render_thread` function, `impl` method, or nested closure accepts/references `World` or calls any `World`-gated IO builtin, runtime primitive, or `scope`.
+  - `E_GUARD_ELSE_NOT_DIVERGE` — emitted (with advisory `fixit`, no semantic-changing `edits`) when a `guard ... else { ... }` block can fall through without diverging.
+  - `E_CONST_CYCLE` — emitted when top-level `let` initializers in a package form a dependency cycle (directly or through same-package direct function calls), reporting the full cycle path.
   - `E_MISSING_TYPE` (`"machine"`) — inserts the inferred return type (`-> T`) (no edit for an uninferable empty `let` collection: the fix-it names the annotation to add).
   - `E_TYPE_MISMATCH` "cannot assign to immutable variable" (`"machine"`) — `let x` → `let mut x` at the declaration (also for an immutable root passed as `mut <place>`); a plain identifier passed to a `mut` parameter gets a `mut ` insertion (`"machine"`).
   - `E_VERIFY_UNSUPPORTED`, `E_VERIFY_MOVE`, `E_VERIFY_BORROW_ESCAPE`, `E_VERIFY_MUT_ESCAPE`, `E_VERIFY_ALIASING`, `E_VERIFY_CLOSURE_CAPTURE`, `E_VERIFY_UNVERIFIED_CALLEE` — `mut` / `#verify` rules of §3.4 (fix-its, no `edits`).

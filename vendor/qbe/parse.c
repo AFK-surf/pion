@@ -5,6 +5,8 @@
 #include <ctype.h>
 #include <stdarg.h>
 
+int strict_jnz;
+
 enum {
 	Ksb = 4, /* matches Oarg/Opar/Jret */
 	Kub,
@@ -957,6 +959,11 @@ typecheck(Fn *fn)
 		if ((b->jmp.type == Jjnz || b->jmp.type == Jjtbl) && !usecheck(r, Kw, fn))
 		JErr:
 			err("invalid type for jump argument %%%s in block @%s",
+				fn->tmp[r.val].name, b->name);
+		if (strict_jnz && (b->jmp.type == Jjnz || b->jmp.type == Jjtbl)
+			&& rtype(r) == RTmp && fn->tmp[r.val].cls != Kw)
+			err("strict-jnz: %s argument %%%s in block @%s has non-w class",
+				b->jmp.type == Jjnz ? "jnz" : "jtbl",
 				fn->tmp[r.val].name, b->name);
 		if (b->s1 && b->s1->jmp.type == Jxxx)
 			err("block @%s is used undefined", b->s1->name);

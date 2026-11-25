@@ -2000,63 +2000,145 @@ fn p_parse_expr(p : Parser) -> Expr {
 }
 
 ///|
-fn p_parse_bin_expr(p : Parser, min_prec : Int) -> Expr {
-  let mut lhs = p_parse_unary_expr(p)
+fn p_parse_bin_expr(p : Parser, init_min_prec : Int) -> Expr {
+  // Explicit stack for iterative binary-op & parenthesized sub-expression parsing
+  // so 4,000+ deep left-chained or right-nested `1 + (1 + (...))` never overflows the stack.
+  let f_is_paren : Array[Bool] = []
+  let f_lhs : Array[Expr] = []
+  let f_op : Array[Token] = []
+  let f_min_prec : Array[Int] = []
+  let mut cur_min_prec = init_min_prec
+  let mut lhs = EUnit(p_peek(p).span)
+  let mut need_operand = true
   while true {
+    if need_operand {
+      // Intercept plain `(` (not `()` and not `(...) => ...`) iteratively.
+      let mut pushed_paren = false
+      match p_peek(p).kind {
+        LParen => {
+          let next_rparen = match p_peek_at(p, 1).kind {
+            RParen => true
+            _ => false
+          }
+          if !next_rparen && !p_looks_like_arrow_fn(p) {
+            let ltok = p_advance(p)
+            f_is_paren.push(true)
+            f_lhs.push(EUnit(ltok.span))
+            f_op.push(ltok)
+            f_min_prec.push(cur_min_prec)
+            cur_min_prec = 1
+            pushed_paren = true
+          }
+        }
+        _ => ()
+      }
+      if pushed_paren {
+        continue
+      }
+      lhs = p_parse_unary_expr(p)
+      need_operand = false
+    }
     let tok = p_peek(p)
     // Handle `expr as Type` at high precedence and `expr is Pattern` at comparison precedence
+    let mut handled_kw = false
     match tok.kind {
-      KwAs => {
-        if min_prec <= 12 {
+      KwAs =>
+        if cur_min_prec <= 12 {
           let _ = p_advance(p)
           let target = p_parse_type_expr(p)
           lhs = EAs(lhs, target, tok.span)
-          continue
+          handled_kw = true
         }
-      }
-      KwIs => {
-        if min_prec <= 7 {
+      KwIs =>
+        if cur_min_prec <= 7 {
           let _ = p_advance(p)
           let pat = p_parse_pattern(p)
           lhs = EIs(lhs, pat, tok.span)
-          continue
+          handled_kw = true
         }
-      }
       _ => ()
     }
-    let prec = bin_prec(tok.kind)
-    if prec == 0 || prec < min_prec {
-      break
+    if handled_kw {
+      continue
     }
+    let prec = bin_prec(tok.kind)
+    let mut take_bin = prec > 0 && prec >= cur_min_prec
     // Avoid treating a leading unary `-` or JSX `<Tag` / `<>` / `</` on a new line as binary op
-    if tok.newline_before {
+    if take_bin && tok.newline_before {
       match tok.kind {
-        Minus => break
+        Minus => take_bin = false
         Lt =>
           match p_peek_at(p, 1).kind {
-            Ident(_) | Gt | Slash => break
+            Ident(_) | Gt | Slash => take_bin = false
             _ => ()
           }
         _ => ()
       }
     }
-    let op_tok = p_advance(p)
-    let rhs = p_parse_bin_expr(p, prec + 1)
-    match op_tok.kind {
-      PipeGt =>
-        match rhs {
-          ECall(callee, args, sp) => {
-            let new_args : Array[Expr] = [lhs]
-            let mut ai = 0
-            while ai < args.length() {
-              new_args.push(args[ai])
-              ai = ai + 1
+    if take_bin {
+      let op_tok = p_advance(p)
+      f_is_paren.push(false)
+      f_lhs.push(lhs)
+      f_op.push(op_tok)
+      f_min_prec.push(cur_min_prec)
+      cur_min_prec = prec + 1
+      need_operand = true
+      continue
+    }
+    // Current precedence level finished; pop enclosing frame if any.
+    if f_is_paren.length() == 0 {
+      return lhs
+    }
+    let idx = f_is_paren.length() - 1
+    let is_paren = f_is_paren[idx]
+    let saved_lhs = f_lhs[idx]
+    let op_tok = f_op[idx]
+    let saved_min_prec = f_min_prec[idx]
+    let _ = f_is_paren.pop()
+    let _ = f_lhs.pop()
+    let _ = f_op.pop()
+    let _ = f_min_prec.pop()
+    cur_min_prec = saved_min_prec
+    if is_paren {
+      if p_match_kind_comma(p) {
+        let elems : Array[Expr] = [lhs]
+        while !p_is_eof(p) {
+          match p_peek(p).kind {
+            RParen => {
+              let _ = p_advance(p)
+              break
             }
-            lhs = ECall(callee, new_args, sp)
+            _ => {
+              elems.push(p_parse_expr(p))
+              if !p_match_kind_comma(p) {
+                p_expect_rparen(p)
+                break
+              }
+            }
           }
-          _ => lhs = ECall(rhs, [lhs], op_tok.span)
         }
-      _ => lhs = EBinary(op_tok.raw, lhs, rhs, op_tok.span)
+        lhs = ETuple(elems, op_tok.span)
+      } else {
+        p_expect_rparen(p)
+      }
+      lhs = p_parse_postfix_tail(p, lhs)
+    } else {
+      match op_tok.kind {
+        PipeGt =>
+          match lhs {
+            ECall(callee, args, sp) => {
+              let new_args : Array[Expr] = [saved_lhs]
+              let mut ai = 0
+              while ai < args.length() {
+                new_args.push(args[ai])
+                ai = ai + 1
+              }
+              lhs = ECall(callee, new_args, sp)
+            }
+            _ => lhs = ECall(lhs, [saved_lhs], op_tok.span)
+          }
+        _ => lhs = EBinary(op_tok.raw, saved_lhs, lhs, op_tok.span)
+      }
     }
   }
   lhs
@@ -2216,7 +2298,12 @@ fn p_parse_arg_list(p : Parser) -> Array[Expr] {
 
 ///|
 fn p_parse_postfix_expr(p : Parser) -> Expr {
-  let mut expr = p_parse_primary_expr(p)
+  p_parse_postfix_tail(p, p_parse_primary_expr(p))
+}
+
+///|
+fn p_parse_postfix_tail(p : Parser, init_expr : Expr) -> Expr {
+  let mut expr = init_expr
   while !p_is_eof(p) {
     let tok = p_peek(p)
     match tok.kind {

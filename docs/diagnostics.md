@@ -584,3 +584,55 @@ pub fn main() -> Int {
   dep::add(1, 2)
 }
 ```
+
+### E_GUARD_ELSE_NOT_DIVERGE
+
+The `else` block of `guard cond else { ... }` must diverge on every reachable path (`return`, enclosing-loop `break`/`continue`, `panic`/`abort`, or an infinite `while true` without a reachable `break`).
+
+```pion before
+pub fn unwrap_pos(x : Int) -> Int {
+  guard x > 0 else {
+    let _ = 0
+  }
+  x
+}
+```
+
+```pion after
+pub fn unwrap_pos(x : Int) -> Int {
+  guard x > 0 else {
+    return 0
+  }
+  x
+}
+```
+
+### E_CONST_CYCLE
+
+Top-level `let` bindings in a package cannot form a cyclic initialization dependency (directly or through same-package direct function calls).
+
+```pion before
+let A : Int = get_b()
+let B : Int = A + 1
+
+fn get_b() -> Int {
+  B
+}
+
+pub fn main() -> Int {
+  A
+}
+```
+
+```pion after
+let B : Int = 41
+let A : Int = get_b()
+
+fn get_b() -> Int {
+  B + 1
+}
+
+pub fn main() -> Int {
+  A
+}
+```

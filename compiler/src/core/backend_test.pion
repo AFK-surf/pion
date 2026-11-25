@@ -2044,7 +2044,7 @@ test "p24a_bug6_generic_drop_fn" {
   let wok_s = p18_find_from(ssa, "$pion_fn_wrap_ok(", 0)
   let wok_e = p18_find_from(ssa, "\n}", wok_s)
   assert_true(wok_s >= 0 && wok_e > wok_s, ssa)
-  let wok_jnz = p18_find_from(ssa, "jnz %tp_T,", wok_s)
+  let wok_jnz = p18_find_from(ssa, "cnel %tp_T, 0", wok_s)
   assert_true(wok_jnz > wok_s && wok_jnz < wok_e, ssa)
   let wok_dp = p18_find_from(ssa, "$pion_drop_res_ok", wok_s)
   assert_true(wok_dp > wok_s && wok_dp < wok_e, ssa)
@@ -3581,6 +3581,7 @@ test "p34b_emit_qbe_unit_no_cross_file_inline_or_const_fold" {
     sig: "",
     sigs_hash: "",
     const_units: [0, 1],
+    const_init_order: cr.tc.const_init_order,
     has_main: false,
   }
   let unit_ssa = emit_qbe_unit(prep, 1, true)
@@ -11938,19 +11939,19 @@ test "p87_unit_mode_pkg_once_init_ssa" {
   }
   let ssa_a = emit_qbe_unit_entry_target(prep, 0, true, "amd64_sysv", "main", true)
   let ssa_b = emit_qbe_unit_entry_target(prep, 1, true, "amd64_sysv", "main", true)
-  // Unit 0 defines the single package-level once wrapper & guard calling both units in order
+  // Unit 0 defines the single package-level once wrapper & guard calling per-const inits in topological order
   assert_true(
     ssa_a.contains("data $pion_unit_init_all_p87_reent_guard = align 4 { w 0 }") &&
       ssa_a.contains("export function $pion_unit_init_all_p87_reent()") &&
-      ssa_a.contains("call $pion_init_consts_0()") &&
-      ssa_a.contains("call $pion_init_consts_1()"),
+      ssa_a.contains("call $pion_init_const_X()") &&
+      ssa_a.contains("call $pion_init_const_Y()"),
     ssa_a,
   )
   // Unit 1 must NOT redefine wrapper/guard, and its exports must call the single wrapper
   assert_true(
     !ssa_b.contains("data $pion_unit_init_all_p87_reent_guard") &&
       !ssa_b.contains("export function $pion_unit_init_all_p87_reent()") &&
-      !ssa_b.contains("call $pion_init_consts_0()") &&
+      !ssa_b.contains("call $pion_init_const_X()") &&
       ssa_b.contains("call $pion_unit_init_all_p87_reent()"),
     ssa_b,
   )
@@ -14403,4 +14404,285 @@ test "qbe_block_needs_data_ptr_scan_rows" {
   assert_eq(qbe_block_needs_data_ptr_scan([bind, bind]), true)
   assert_eq(qbe_block_needs_data_ptr_scan([guard_stmt]), true)
   assert_eq(qbe_block_needs_data_ptr_scan([unit, guard_stmt]), true)
+}
+
+///|
+test "j1.1: strict w-class jnz/jtbl invariant across generic %tp_*, TBool, Int64 and wasm" {
+  let src =
+    #|pub fn wrap_id[T](x : T) -> T { x }
+    #|pub fn test_64(v : Int64) -> Int {
+    #|  let nz = v != 0L
+    #|  let low = v.to_int() != 0
+    #|  if nz && !low { 2 } else if nz || low { 1 } else { 0 }
+    #|}
+    #|pub fn test_jtbl(k : Int) -> Int {
+    #|  match k {
+    #|    0 => 10
+    #|    1 => 20
+    #|    2 => 30
+    #|    3 => 40
+    #|    4 => 50
+    #|    5 => 60
+    #|    _ => -1
+    #|  }
+    #|}
+    #|pub fn main() -> Int {
+    #|  let s = wrap_id("hi")
+    #|  let b = true
+    #|  let _ = b.to_string() + "\{b}"
+    #|  test_64(0L) + test_64(1L) + test_64(1L << 32) + test_jtbl(-1) + test_jtbl(0) + test_jtbl(6) + s.length()
+    #|}
+  let cr = check_source_files_full("j11_strict", ["j11.pion"], [src])
+  assert_true(cr.diagnostics.length() == 0, check_result_to_json(cr.diagnostics))
+  let ssa = emit_qbe_package_with_tc(cr.pkg, cr.tc, false).ssa
+  // Scan EVERY function in emitted SSA: no `jnz` or `jtbl` may branch on an `l` temp/param!
+  let lines = ssa.split("\n")
+  let mut l_tmps : Map[String, Bool] = Map([])
+  let mut fn_hdr = ""
+  let mut i = 0
+  while i < lines.length() {
+    let ln = lines[i]
+    if ln.starts_with("function ") || ln.starts_with("export function ") {
+      fn_hdr = ln
+      l_tmps = Map([])
+      let mut p = p18_find_from(ln, "l %", 0)
+      while p >= 0 {
+        l_tmps.set(p84_tmp_at(ln, p + 2), true)
+        p = p18_find_from(ln, "l %", p + 3)
+      }
+    } else if ln.starts_with("    %") && ln.contains(" =l ") {
+      l_tmps.set(p84_tmp_at(ln, 4), true)
+    } else if ln.starts_with("    jnz %") {
+      let arg = p84_tmp_at(ln, 8)
+      assert_true(!l_tmps.contains(arg), "non-w jnz in " + fn_hdr + " :: " + ln)
+    } else if ln.starts_with("    jtbl %") {
+      let arg = p84_tmp_at(ln, 9)
+      assert_true(!l_tmps.contains(arg), "non-w jtbl in " + fn_hdr + " :: " + ln)
+    }
+    i = i + 1
+  }
+  // Wasm32 strict-jnz entry guard accepts the emitted SSA
+  let wasm_ssa = emit_qbe_package_with_tc_target(cr.pkg, cr.tc, false, "wasm32").ssa
+  let wasm_bytes = emit_wasm_from_ssa(wasm_ssa)
+  assert_true(wasm_bytes.length() > 8, "wasm bytes generated")
+}
+
+///|
+test "j1.4: deep 2500-term left/right/short-circuit chains compile on Native and Wasm32" {
+  // Left-chained `+`, right-nested `1 + (1 + ...)`, and short-circuit `||`
+  let sb_left = StringBuilder()
+  sb_left.write_string("pub fn main() -> Int {\n  let x = 1")
+  let mut i = 0
+  while i < 2500 {
+    sb_left.write_string(" + 1")
+    i = i + 1
+  }
+  sb_left.write_string("\n  x\n}\n")
+  let cr_l = check_source_files_full("j14_l", ["l.pion"], [sb_left.to_string()])
+  assert_true(cr_l.diagnostics.length() == 0, check_result_to_json(cr_l.diagnostics))
+  let w_l = emit_wasm_from_ssa(emit_qbe_package_with_tc_target(cr_l.pkg, cr_l.tc, false, "wasm32").ssa)
+  assert_true(w_l.length() > 8, "left wasm ok")
+
+  let sb_right = StringBuilder()
+  sb_right.write_string("pub fn main() -> Int {\n  let x = ")
+  i = 0
+  while i < 2500 {
+    sb_right.write_string("1 + (")
+    i = i + 1
+  }
+  sb_right.write_string("1")
+  i = 0
+  while i < 2500 {
+    sb_right.write_string(")")
+    i = i + 1
+  }
+  sb_right.write_string("\n  x\n}\n")
+  let cr_r = check_source_files_full("j14_r", ["r.pion"], [sb_right.to_string()])
+  assert_true(cr_r.diagnostics.length() == 0, check_result_to_json(cr_r.diagnostics))
+  let w_r = emit_wasm_from_ssa(emit_qbe_package_with_tc_target(cr_r.pkg, cr_r.tc, false, "wasm32").ssa)
+  assert_true(w_r.length() > 8, "right wasm ok")
+
+  // Deep right-nested `2.0 * (2.0 * (...))` must stay iterative (no recursion in 2.0*x shortcut)
+  let sb_mul2 = StringBuilder()
+  sb_mul2.write_string("pub fn main() -> Double {\n  let x = ")
+  i = 0
+  while i < 2000 {
+    sb_mul2.write_string("2.0 * (")
+    i = i + 1
+  }
+  sb_mul2.write_string("1.0")
+  i = 0
+  while i < 2000 {
+    sb_mul2.write_string(")")
+    i = i + 1
+  }
+  sb_mul2.write_string("\n  x\n}\n")
+  let cr_m2 = check_source_files_full("j14_m2", ["m2.pion"], [sb_mul2.to_string()])
+  assert_true(cr_m2.diagnostics.length() == 0, check_result_to_json(cr_m2.diagnostics))
+  let w_m2 = emit_wasm_from_ssa(emit_qbe_package_with_tc_target(cr_m2.pkg, cr_m2.tc, false, "wasm32").ssa)
+  assert_true(w_m2.length() > 8, "mul2 right-chain wasm ok")
+}
+
+///|
+test "j1.5: per-unit init_all calls per-const init functions in topological order" {
+  let u0 =
+    #|let A : Int = get_b() + 1
+    #|let C : Int = 10
+    #|pub fn main() -> Int { A }
+  let u1 =
+    #|let B : Int = C + 5
+    #|fn get_b() -> Int { B }
+  let prep = match cli_prepare_qbe_units("j15u", ["u0.pion", "u1.pion"], [u0, u1]) {
+    Ok(p) => p
+    Err(e) => {
+      assert_true(false, e)
+      return
+    }
+  }
+  let ssa0 = emit_qbe_unit(prep, 0, false)
+  let ssa1 = emit_qbe_unit(prep, 1, false)
+  assert_true(ssa0.contains("export function $pion_init_const_A()"), ssa0)
+  assert_true(ssa0.contains("export function $pion_init_const_C()"), ssa0)
+  assert_true(ssa1.contains("export function $pion_init_const_B()"), ssa1)
+  let pos_c = p18_find_from(ssa0, "call $pion_init_const_C()", 0)
+  let pos_b = p18_find_from(ssa0, "call $pion_init_const_B()", 0)
+  let pos_a = p18_find_from(ssa0, "call $pion_init_const_A()", 0)
+  assert_true(pos_c > 0 && pos_b > pos_c && pos_a > pos_b, ssa0)
+}
+
+///|
+test "j1.r3: wasm_check_strict_jnz rejects undefined and l-class for jnz & jtbl, accepts w-class" {
+  // 1. jnz: undefined %u (reject), l-class %x (reject), w-class %c (accept)
+  let jnz_undef = "export function w $f() {\n@start\n    jnz %u, @a, @b\n@a\n    ret 1\n@b\n    ret 0\n}\n"
+  let jnz_l = "export function w $f(l %x) {\n@start\n    jnz %x, @a, @b\n@a\n    ret 1\n@b\n    ret 0\n}\n"
+  let jnz_w = "export function w $f(w %c) {\n@start\n    jnz %c, @a, @b\n@a\n    ret 1\n@b\n    ret 0\n}\n"
+  let r_ju = wasm_check_strict_jnz(wasm_parse_ssa_live_units([jnz_undef], fn(_s) { () }).funcs)
+  match r_ju {
+    Err(m) => assert_true(m.contains("is undefined"), m)
+    Ok(_) => assert_true(false, "jnz %u must be rejected")
+  }
+  let r_jl = wasm_check_strict_jnz(wasm_parse_ssa_live_units([jnz_l], fn(_s) { () }).funcs)
+  match r_jl {
+    Err(m) => assert_true(m.contains("has non-w class"), m)
+    Ok(_) => assert_true(false, "jnz l %x must be rejected")
+  }
+  let r_jw = wasm_check_strict_jnz(wasm_parse_ssa_live_units([jnz_w], fn(_s) { () }).funcs)
+  match r_jw {
+    Ok(_) => ()
+    Err(m) => assert_true(false, "jnz w %c must be accepted: " + m)
+  }
+
+  // 2. jtbl: undefined %u (reject), l-class %x (reject), w-class %c (accept)
+  let jtbl_undef = "export function w $f() {\n@start\n    jtbl %u, @a, @b\n@a\n    ret 1\n@b\n    ret 0\n}\n"
+  let jtbl_l = "export function w $f(l %x) {\n@start\n    jtbl %x, @a, @b\n@a\n    ret 1\n@b\n    ret 0\n}\n"
+  let jtbl_w = "export function w $f(w %c) {\n@start\n    jtbl %c, @a, @b\n@a\n    ret 1\n@b\n    ret 0\n}\n"
+  let r_tu = wasm_check_strict_jnz(wasm_parse_ssa_live_units([jtbl_undef], fn(_s) { () }).funcs)
+  match r_tu {
+    Err(m) => assert_true(m.contains("is undefined"), m)
+    Ok(_) => assert_true(false, "jtbl %u must be rejected")
+  }
+  let r_tl = wasm_check_strict_jnz(wasm_parse_ssa_live_units([jtbl_l], fn(_s) { () }).funcs)
+  match r_tl {
+    Err(m) => assert_true(m.contains("has non-w class"), m)
+    Ok(_) => assert_true(false, "jtbl l %x must be rejected")
+  }
+  let r_tw = wasm_check_strict_jnz(wasm_parse_ssa_live_units([jtbl_w], fn(_s) { () }).funcs)
+  match r_tw {
+    Ok(_) => ()
+    Err(m) => assert_true(false, "jtbl w %c must be accepted: " + m)
+  }
+}
+
+///|
+test "j1.r3: deep 2500-term && with is-bindings, 2.0*x add strength reduction & xpkg mono_pkg guard" {
+  // 1. 2500-term `&&` condition with `is` bindings compiles on Native & Wasm32
+  let sb_and = StringBuilder()
+  sb_and.write_string("pub fn check_deep(x : Option[Int]) -> Int {\n  if x is Some(v0)")
+  let mut i = 1
+  while i < 2500 {
+    sb_and.write_string(" && (v0 >= 0)")
+    i = i + 1
+  }
+  sb_and.write_string(" {\n    v0\n  } else {\n    0\n  }\n}\n")
+  let cr_and = check_source_files_full("deep_and_is", ["deep_and_is.pion"], [sb_and.to_string()])
+  assert_true(cr_and.diagnostics.length() == 0, check_result_to_json(cr_and.diagnostics))
+  let w_and = emit_wasm_from_ssa(emit_qbe_package_with_tc_target(cr_and.pkg, cr_and.tc, false, "wasm32").ssa)
+  assert_true(w_and.length() > 8, "deep && with is-binding wasm ok")
+
+  // 2. Right-nested `2.0 * (2.0 * (2.0 * x))` uses `=d add` (no `=d mul`)
+  let m2_src = "pub fn oct(x : Double) -> Double { 2.0 * (2.0 * (2.0 * x)) }\n"
+  let cr_m2 = check_source_files_full("m2_add", ["m2_add.pion"], [m2_src])
+  assert_true(cr_m2.diagnostics.length() == 0, check_result_to_json(cr_m2.diagnostics))
+  let ssa_m2 = emit_qbe_package_with_tc(cr_m2.pkg, cr_m2.tc, false).ssa
+  assert_true(ssa_m2.contains(" =d add "), ssa_m2)
+  assert_eq(ssa_m2.contains(" =d mul "), false)
+
+  // 3. Cross-package monomorphized generic must NOT call importer's top-level closure const of same name
+  let lib_src =
+    #|pub trait Tag {
+    #|  tag(self : Self) -> Int
+    #|}
+    #|pub fn helper(n : Int) -> Int {
+    #|  let mut acc = 7
+    #|  let mut k = 0
+    #|  while k < n {
+    #|    acc = acc + k
+    #|    k = k + 1
+    #|  }
+    #|  acc
+    #|}
+    #|pub fn run_gen[T : Tag](x : T) -> Int { helper(x.tag()) }
+  let lib_cr = check_source_files_with_imports("mlib", ["mlib.pion"], [lib_src], [], true)
+  assert_true(lib_cr.diagnostics.length() == 0, check_result_to_json(lib_cr.diagnostics))
+  let app_src =
+    #|import "mlib"
+    #|struct Item { v : Int }
+    #|impl mlib::Tag for Item {
+    #|  fn tag(self : Item) -> Int { self.v }
+    #|}
+    #|let helper : (Int) -> Int = fn(n : Int) -> Int { n + 99 }
+    #|pub fn main() -> Int { mlib::run_gen(Item::{ v: 3 }) + helper(1) }
+  let app_cr = check_source_files_with_imports(
+    "mapp", ["mapp.pion"], [app_src], [imported_pkg_new("mlib", lib_cr.tc)], true,
+  )
+  assert_true(app_cr.diagnostics.length() == 0, check_result_to_json(app_cr.diagnostics))
+  let app_ssa = emit_qbe_package_multi(app_cr.pkg, app_cr.tc, false, false, ["mlib"]).ssa
+  let mono_s = p18_find_from(app_ssa, "function w $pion_pkg_mlib_fn_run_gen__mono_", 0)
+  let mono_e = p18_find_from(app_ssa, "\n}", mono_s)
+  assert_true(mono_s >= 0 && mono_e > mono_s, app_ssa)
+  let mono_fn = slice_str(app_ssa, mono_s, mono_e)
+  assert_true(mono_fn.contains("$pion_pkg_mlib_fn_helper"), mono_fn)
+  assert_eq(mono_fn.contains("const_helper"), false)
+
+  // 4. Swapped fixture: library defines top-level closure const `helper`,
+  //    app defines normal `fn helper`; monomorphized generic MUST load `$pion_pkg_clib_const_helper`
+  //    (and emit_pion_stub disables stubbing for pub generic fn so driver always loads from source).
+  let clib_src =
+    #|pub trait Tag2 {
+    #|  tag2(self : Self) -> Int
+    #|}
+    #|let helper : (Int) -> Int = fn(n : Int) -> Int { n + 20 }
+    #|pub fn run_gen2[T : Tag2](x : T) -> Int { helper(x.tag2()) }
+  let clib_cr = check_source_files_with_imports("clib", ["clib.pion"], [clib_src], [], true)
+  assert_true(clib_cr.diagnostics.length() == 0, check_result_to_json(clib_cr.diagnostics))
+  assert_eq(emit_pion_stub(clib_cr.pkg), "")
+  let capp_src =
+    #|import "clib"
+    #|struct Item2 { v : Int }
+    #|impl clib::Tag2 for Item2 {
+    #|  fn tag2(self : Item2) -> Int { self.v }
+    #|}
+    #|fn helper(n : Int) -> Int { n + 100 }
+    #|pub fn main() -> Int { clib::run_gen2(Item2::{ v: 5 }) + helper(1) }
+  let capp_cold = check_source_files_with_imports(
+    "capp", ["capp.pion"], [capp_src], [imported_pkg_new("clib", clib_cr.tc)], true,
+  )
+  assert_true(capp_cold.diagnostics.length() == 0, check_result_to_json(capp_cold.diagnostics))
+  let capp_ssa_cold = emit_qbe_package_multi(capp_cold.pkg, capp_cold.tc, false, false, ["clib"]).ssa
+  let cm_s = p18_find_from(capp_ssa_cold, "function w $pion_pkg_clib_fn_run_gen2__mono_", 0)
+  let cm_e = p18_find_from(capp_ssa_cold, "\n}", cm_s)
+  assert_true(cm_s >= 0 && cm_e > cm_s, capp_ssa_cold)
+  let cm_fn = slice_str(capp_ssa_cold, cm_s, cm_e)
+  assert_true(cm_fn.contains("$pion_pkg_clib_const_helper"), cm_fn)
+  assert_eq(cm_fn.contains("$pion_pkg_capp_fn_helper"), false)
 }
