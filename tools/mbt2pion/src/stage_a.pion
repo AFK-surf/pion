@@ -606,6 +606,7 @@ pub struct StageAContext {
   borrowed_bufs : Map[String, Bool]
   borrowed_views : Map[String, Bool]
   struct_field_renames : Map[String, Map[String, String]]
+  struct_field_order : Map[String, Array[String]]
   struct_val_fields : Map[String, String]
   trait_methods : Map[String, Map[String, (Array[String], String)]]
   local_method_names : Map[String, Bool]
@@ -667,6 +668,7 @@ pub fn stage_a_context_new(
     borrowed_bufs: Map(),
     borrowed_views: Map(),
     struct_field_renames: Map(),
+    struct_field_order: Map(),
     struct_val_fields: Map(),
     trait_methods: Map(),
     local_method_names: Map(),
@@ -941,6 +943,198 @@ fn lower_struct_brace(
   }
   sb.write_string(tokens[close_b].leading_trivia + "}")
   sb.to_string()
+}
+
+///| Return true iff expression `[start, end)` inside a struct update `{ ..base, f: val }`
+///| is provably pure (no blocks, no general calls, no assignments, no control flow),
+///| so field evaluation order cannot observe or mutate `base`.
+fn is_pure_struct_update_val(tokens : Array[Token], start : Int, end : Int) -> Bool {
+  let mut k = start
+  while k < end {
+    let tk = tokens[k].kind
+    if tk == TokenKind::LBrace || tk == TokenKind::RBrace {
+      return false
+    }
+    if tk == TokenKind::Eq ||
+    (tokens[k].raw == "+=" || tokens[k].raw == "-=" || tokens[k].raw == "*=" || tokens[k].raw == "/=" || tokens[k].raw == "%=") {
+      return false
+    }
+    if tk == TokenKind::Keyword {
+      let r = tokens[k].raw
+      if r == "if" || r == "match" || r == "for" || r == "while" || r == "loop" ||
+      r == "return" || r == "break" || r == "continue" || r == "guard" ||
+      r == "try" || r == "raise" || r == "fn" || r == "let" || r == "mut" {
+        return false
+      }
+    }
+    if tk == TokenKind::LParen && k > start {
+      let pk = tokens[k - 1].kind
+      if pk == TokenKind::Ident || pk == TokenKind::RParen || pk == TokenKind::RBracket {
+        return false
+      }
+      if pk == TokenKind::UpperIdent {
+        let pr = tokens[k - 1].raw
+        if pr != "Some" && pr != "Ok" && pr != "Err" {
+          return false
+        }
+      }
+    }
+    k = k + 1
+  }
+  true
+}
+
+///| Lower a struct update `{ ..base, f1: e1, ... }` preserving Moon's exact evaluation order:
+///| - Pure overrides: emit `sname::{ ..base, ... }` directly.
+///| - Local struct (known declaration order) with effectful overrides:
+///|   - Strictly increasing declaration order -> bind `base` once, emit all fields in declaration order.
+///|   - Out-of-order overrides -> bind `base` once, evaluate overrides in source order into temps,
+///|     then construct `sname::{ ..base_tmp, f1: tmp1, ... }` so unoverridden fields read post-effect state.
+///| - Foreign struct (unknown field order/mutability) with effectful overrides -> fail-closed
+///|   with `MBT2PION_UNSUPPORTED_SYNTAX` (never silently produce wrong values).
+fn lower_struct_update_expr(
+  ctx : StageAContext,
+  sname : String,
+  tokens : Array[Token],
+  open_b : Int,
+  close_b : Int,
+  file : String,
+) -> String {
+  let mut base_s = -1
+  let mut base_e = -1
+  let overrides : Array[(String, Bool, Int, Int)] = []
+  let mut i = open_b + 1
+  while i < close_b {
+    if tokens[i].kind == TokenKind::Comma {
+      i = i + 1
+      continue
+    }
+    let mut e = i
+    let mut d = 0
+    while e < close_b {
+      let ek = tokens[e].kind
+      if ek == TokenKind::LParen || ek == TokenKind::LBracket || ek == TokenKind::LBrace { d = d + 1 }
+      else if ek == TokenKind::RParen || ek == TokenKind::RBracket || ek == TokenKind::RBrace { d = d - 1 }
+      else if d == 0 && ek == TokenKind::Comma { break }
+      e = e + 1
+    }
+    if tokens[i].kind == TokenKind::DotDot {
+      base_s = i + 1
+      base_e = e
+    } else if (tokens[i].kind == TokenKind::Ident || tokens[i].kind == TokenKind::Keyword) &&
+    i + 1 < e && tokens[i + 1].kind == TokenKind::Colon {
+      overrides.push((tokens[i].raw, false, i + 2, e))
+    } else if (tokens[i].kind == TokenKind::Ident || tokens[i].kind == TokenKind::Keyword) && e == i + 1 {
+      overrides.push((tokens[i].raw, true, i, e))
+    }
+    i = e + 1
+  }
+  let mut all_pure = true
+  for ov in overrides {
+    if !ov.1 && !is_pure_struct_update_val(tokens, ov.2, ov.3) {
+      all_pure = false
+      break
+    }
+  }
+  if all_pure || base_s < 0 || base_e <= base_s {
+    return sname + "::" + lower_struct_brace(ctx, sname, tokens, open_b, close_b, file, false)
+  }
+  match ctx.struct_field_order.get(sname) {
+    None => {
+      ctx.diags.push(diag_error(
+        "MBT2PION_UNSUPPORTED_SYNTAX",
+        file,
+        tokens[open_b].line,
+        tokens[open_b].col,
+        "struct update with potentially effectful field expression on foreign struct `" + sname + "` (unknown field order/mutability) is not supported (fail-closed)",
+      ))
+      sname + "::" + lower_struct_brace(ctx, sname, tokens, open_b, close_b, file, false)
+    }
+    Some(decl_fields) => {
+      let decl_idx : Map[String, Int] = Map()
+      let mut di = 0
+      while di < decl_fields.length() {
+        decl_idx[decl_fields[di]] = di
+        di = di + 1
+      }
+      let mut in_order = true
+      let mut prev_idx = -1
+      for ov in overrides {
+        match decl_idx.get(ov.0) {
+          Some(ci) => {
+            if ci <= prev_idx {
+              in_order = false
+            }
+            prev_idx = ci
+          }
+          None => in_order = false
+        }
+      }
+      let base_var = fresh_temp(ctx, "su_b")
+      let base_expr = lower_expr_range(ctx, tokens, base_s, base_e, file, false).trim()
+      if in_order {
+        let ov_map : Map[String, (Bool, Int, Int)] = Map()
+        for ov in overrides {
+          ov_map[ov.0] = (ov.1, ov.2, ov.3)
+        }
+        let sb = StringBuilder()
+        sb.write_string("{ let " + base_var + " = " + base_expr + "; " + sname + "::{ ")
+        let mut first = true
+        for df in decl_fields {
+          if !first { sb.write_string(", ") }
+          first = false
+          let rf = rename_struct_field(ctx, sname, df)
+          match ov_map.get(df) {
+            Some(ov) => {
+              if ov.0 {
+                sb.write_string(rf + ": " + resolve_ident_in_scope(ctx, df))
+              } else {
+                let field_exp_ty = match ctx.symtab.struct_field_types.get(sname) {
+                  Some(fmap) => match fmap.get(df) { Some(ft) => ft, None => "" }
+                  None => ""
+                }
+                push_expected_type(ctx, field_exp_ty)
+                let vs = lower_expr_range(ctx, tokens, ov.1, ov.2, file, false).trim()
+                pop_expected_type(ctx)
+                sb.write_string(rf + ": " + vs)
+              }
+            }
+            None => sb.write_string(rf + ": " + base_var + "." + rf)
+          }
+        }
+        sb.write_string(" } }")
+        sb.to_string()
+      } else {
+        let sb = StringBuilder()
+        sb.write_string("{ let " + base_var + " = " + base_expr + "; ")
+        let field_tmps : Array[(String, String)] = []
+        for ov in overrides {
+          let rf = rename_struct_field(ctx, sname, ov.0)
+          let tv = fresh_temp(ctx, "su_f")
+          let vs = if ov.1 {
+            resolve_ident_in_scope(ctx, ov.0)
+          } else {
+            let field_exp_ty = match ctx.symtab.struct_field_types.get(sname) {
+              Some(fmap) => match fmap.get(ov.0) { Some(ft) => ft, None => "" }
+              None => ""
+            }
+            push_expected_type(ctx, field_exp_ty)
+            let s = lower_expr_range(ctx, tokens, ov.2, ov.3, file, false).trim()
+            pop_expected_type(ctx)
+            s
+          }
+          sb.write_string("let " + tv + " = " + vs + "; ")
+          field_tmps.push((rf, tv))
+        }
+        sb.write_string(sname + "::{ .." + base_var)
+        for ft in field_tmps {
+          sb.write_string(", " + ft.0 + ": " + ft.1)
+        }
+        sb.write_string(" } }")
+        sb.to_string()
+      }
+    }
+  }
 }
 
 ///| Check whether an anonymous `{ ... }` is a MoonBit struct literal containing shorthand fields
@@ -6348,6 +6542,9 @@ fn lower_one_token_or_form(
       }
       match resolve_anon_struct_literal_name(ctx, tokens, i, close_b) {
         Some(sname) => {
+          if close_b > i + 2 && tokens[i + 1].kind == TokenKind::DotDot {
+            return (trivia + lower_struct_update_expr(ctx, sname, tokens, i, close_b, file), close_b + 1)
+          }
           let body_s = if is_anon_shorthand_struct_lit(tokens, i, close_b) {
             lower_anon_shorthand_struct_lit(ctx, sname, tokens, i, close_b, file)
           } else {
@@ -12260,6 +12457,7 @@ pub fn prescan_package_symbols(ctx : StageAContext, files : Array[SourceFile]) -
             }
           }
           ctx.struct_field_renames[sname] = renames
+          ctx.struct_field_order[sname] = raw_fields
           // Prescan non-primitive `#derive(Eq)` / trailing `derive(Eq)` and `#derive(Hash)` structs!
           let mut has_eq_derive = false
           let mut has_hash_derive = false
