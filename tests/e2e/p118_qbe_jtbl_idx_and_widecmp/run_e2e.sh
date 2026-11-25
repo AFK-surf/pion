@@ -14,13 +14,16 @@
 #   1. gen_il.py jtbl.ssa (29 selector definitions x {dead, live on the
 #      successors}, plus two with 16 other live values; duplicate entries,
 #      default, dirty high halves such as 0xdeadbeef00000002): the dispatch
-#      form of every table in amd64_sysv text and ELF `--obj` (identical
-#      registers and normalization) and in amd64_win text (check_dispatch.py;
-#      the checker rejects dropped / added normalizations and a live selector
-#      in %r10). bounds.ssa: 432 comparisons, `-d G` folds exactly the
-#      constant ones (four targets). A C driver with independent oracles runs
-#      both files on the host through text assembly and `--obj`, exact check
-#      counts, `bad 0` (the driver under UBSan with alignment checks).
+#      form and entry count of every table in amd64_sysv text and ELF `--obj`
+#      (identical registers, normalization and self-copies) and in amd64_win
+#      text (check_dispatch.py; the checker rejects dropped / added / misplaced
+#      normalizations, a wrong entry count and a live selector in %r10).
+#      bounds.ssa: 432 comparisons, `-d G` folds exactly the constant ones and
+#      returns or branches on every kept one (relation, operand and limit
+#      checked by check_gvn.py; tampered dumps are rejected; four targets). A C
+#      driver with independent oracles runs both files on the host through text
+#      assembly and `--obj`, exact check counts, `bad 0` (the driver under UBSan
+#      with alignment checks).
 #   2. The p114 loop jump tables: sunk spill homes coexist with `%r10`
 #      selectors, C reference differential (133172 inputs, text and `--obj`).
 #   3. bytecode_vm and fannkuchredux dev / --release print the C program's
@@ -69,14 +72,14 @@ esac
 python3 -E "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" both "$TMP_DIR/jt.s" "$TMP_DIR/jt.o"
 python3 -E "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/jt_win.s"
 # The checker must reject tampered output.
-python3 -E - "$TMP_DIR/jt.s" "$TMP_DIR" <<'PYEOF'
+python3 -E - "$TMP_DIR/jt.s" "$TMP_DIR/jt_win.s" "$TMP_DIR" <<'PYEOF'
 import re, sys
-text, out = open(sys.argv[1]).read(), sys.argv[2]
-def fn(name):
+text, win, out = open(sys.argv[1]).read(), open(sys.argv[2]).read(), sys.argv[3]
+def fn(name, text=text):
     m = re.search(r'^' + name + r':\n.*?/\* end function ' + name + r' \*/', text, re.M | re.S)
     return m.start(), m.end()
-def sub(name, a, b):
-    s, e = fn(name)
+def sub(name, a, b, text=text):
+    s, e = fn(name, text)
     body = text[s:e]
     if body.count(a) != 1:
         raise SystemExit(f'FAIL: p118 mutation {name}: {a!r} found {body.count(a)} times')
@@ -91,20 +94,53 @@ body = text[s:e].replace(f'cmpl $8, %{m[1]}', 'cmpl $8, %r10d').replace(f'(%r11,
 muts.append(text[:s] + body + text[e:])
 for n, t in enumerate(muts):
     open(f'{out}/mut{n}.s', 'w').write(t)
+# Wrong entry count (amd64_win) and a misplaced self-copy (text only).
+open(f'{out}/mutn.s', 'w').write(sub('d_arg_0', 'cmpl $8, %r10d', 'cmpl $9, %r10d', win))
+open(f'{out}/mutc.s', 'w').write(sub('d_add_0', '\tcmpl $8, %r10d\n', norm + '\tcmpl $8, %r10d\n'))
 PYEOF
-for n in 0 1 2 3 4; do
-  if python3 -E "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/mut$n.s" > "$TMP_DIR/mut.out" 2>&1; then
-    fail "dispatch checker accepts mutation $n"
+rejects() { # $1 label, $2 text the report must contain, then the checker command
+  label=$1
+  want=$2
+  shift 2
+  if python3 -E "$@" > "$TMP_DIR/mut.out" 2>&1; then
+    fail "checker accepts mutation $label"
   fi
-  grep -q '^FAIL: p118 dispatch: ' "$TMP_DIR/mut.out" || { cat "$TMP_DIR/mut.out" >&2; fail "mutation $n: checker crashed"; }
+  grep -q '^FAIL: p118 ' "$TMP_DIR/mut.out" && grep -qF "$want" "$TMP_DIR/mut.out" || {
+    cat "$TMP_DIR/mut.out" >&2
+    fail "mutation $label: rejected for another reason"
+  }
+}
+n=0
+for NAME in d_arg_0 d_opaque_0 d_add_0 d_loaduw_0 d_add_1; do
+  rejects "$n" "$NAME is " "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/mut$n.s"
+  n=$((n + 1))
 done
-echo "p118 dispatch checker rejects 5 mutations"
+rejects entries "d_arg_0 compares against 9, want 8 entries" "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/mutn.s"
+rejects self-copy "d_add_0: text " "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" both "$TMP_DIR/mutc.s" "$TMP_DIR/jt.o"
+rejects self-copy-asm "d_add_0 is bad" "$DIR/check_dispatch.py" "$F/jtbl_expect.txt" asm "$TMP_DIR/mutc.s"
+echo "p118 dispatch checker rejects 8 mutations"
 
 # 1b. GVN folds exactly the constant comparisons.
 for T in amd64_sysv amd64_win arm64 arm64_apple; do
   "$QBE" -t "$T" -d G -o /dev/null "$F/bounds.ssa" 2> "$TMP_DIR/g_$T.txt"
   python3 -E "$DIR/check_gvn.py" "$F/bounds_expect.txt" "$TMP_DIR/g_$T.txt"
 done
+# The checker must reject another relation and an unused result.
+python3 -E - "$TMP_DIR/g_amd64_sysv.txt" "$TMP_DIR" <<'PYEOF'
+import re, sys
+text, out = open(sys.argv[1]).read(), sys.argv[2]
+s = text.index('> After GVN:', text.index('**** Function r2_extsw_csgel_2 ****'))
+e = text.index('\n> ', s)
+for n, (pat, rep) in enumerate([(r'\bcsgel\b', 'csltl'), (r'\bretw %\S+', 'retw 0')]):
+    body, k = re.subn(pat, rep, text[s:e])
+    if k != 1:
+        raise SystemExit(f'FAIL: p118 gvn mutation {n}: {k} matches')
+    open(f'{out}/gmut{n}.txt', 'w').write(text[:s] + body + text[e:])
+PYEOF
+for n in 0 1; do
+  rejects "gvn$n" "p118 gvn: r2_extsw_csgel_2: want keep" "$DIR/check_gvn.py" "$F/bounds_expect.txt" "$TMP_DIR/gmut$n.txt"
+done
+echo "p118 gvn checker rejects 2 mutations"
 
 # 1c. Host execution against the C oracles.
 DRV_SAN=""
@@ -170,7 +206,7 @@ else
 fi
 LOOPS="sink7 sink11 sink14 sink18 sink23 pred14 dup14 dup23"
 for x in $LOOPS; do
-  echo "$x direct"
+  echo "$x direct 9"
 done > "$TMP_DIR/cfg/loops.txt"
 "$QBE" -t amd64_sysv -o "$TMP_DIR/cfg/sysv.s" "$TMP_DIR/cfg/cfg.ssa"
 "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/cfg/sysv.o" "$TMP_DIR/cfg/cfg.ssa"
@@ -209,7 +245,9 @@ for MODE in dev release; do
   IN="$F/bytecode_vm_$MODE.ssa"
   VM=$(sed -n 's/^.*function .*\$\([A-Za-z0-9_.]*run_vm[A-Za-z0-9_.]*\)(.*/\1/p' "$IN")
   [ "$(printf '%s\n' "$VM" | wc -l | tr -d ' ')" -eq 1 ] && [ -n "$VM" ] || fail "bytecode_vm $MODE: run_vm is '$VM'"
-  echo "$VM direct" > "$TMP_DIR/vm_expect.txt"
+  # Entries = the targets after the default in its only jtbl.
+  NT=$(awk -v f="\$$VM(" '/^(export )?function /{on = index($0, f) > 0} on && $1 == "jtbl" {print NF - 3}' "$IN")
+  echo "$VM direct $NT" > "$TMP_DIR/vm_expect.txt"
   "$QBE" -t amd64_sysv -o "$TMP_DIR/vm.s" "$IN"
   "$QBE" -t amd64_sysv --obj -o "$TMP_DIR/vm.o" "$IN"
   python3 -E "$DIR/check_dispatch.py" "$TMP_DIR/vm_expect.txt" both "$TMP_DIR/vm.s" "$TMP_DIR/vm.o"

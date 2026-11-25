@@ -1,9 +1,9 @@
 """Generate the p118 QBE fixtures.
 
 usage: python3 -E gen_il.py OUT_DIR
-writes OUT_DIR/jtbl.ssa, OUT_DIR/jtbl_expect.txt (`name form` per function,
+writes OUT_DIR/jtbl.ssa, OUT_DIR/jtbl_expect.txt (`name form entries` per function,
 checked by check_dispatch.py), OUT_DIR/bounds.ssa, OUT_DIR/bounds_expect.txt
-(`name 0|1|keep` per function, checked by check_gvn.py) and OUT_DIR/check.c
+(`name 0|1` or `name keep op arg limit` per function, checked by check_gvn.py) and OUT_DIR/check.c
 (independent C oracles for both files).
 
 jtbl.ssa: every `d_KIND_LIVE(l %w, l %p, w %arg)` selects with
@@ -28,6 +28,7 @@ from pathlib import Path
 
 MASK32 = 0xffffffff
 TABLE = '@d, @a, @a, @c, @b, @c, @b, @b, @a'
+NTBL = 8  # entries of TABLE without the default
 ARMS = (('d', 41), ('a', 3), ('b', 9), ('c', 27))
 
 # (kind, setup, C expression of the selector's low word, proven, selector class)
@@ -271,6 +272,16 @@ def check_c(rows):
     return c
 
 
+def expect_row(r):
+    name, il, _, want = r
+    if want != 'keep':
+        return f'{name} {want}\n'
+    # `%t =w OP ARG, LIMIT`: the one comparison of the function.
+    (cmp,) = [ln for ln in il if ln.startswith('%t =w cs')]
+    _, _, op, arg, lim = cmp.split()
+    return f'{name} keep {op} {arg.rstrip(",")} {lim}\n'
+
+
 def main():
     out = Path(sys.argv[1])
     out.mkdir(parents=True, exist_ok=True)
@@ -278,14 +289,14 @@ def main():
     for kind, setup, _, proven, cls in KINDS:
         for live in (0, 1):
             ssa += jtbl_fun(kind, setup, live, cls)
-            expect.append(f'd_{kind}_{live} ' + (('live' if proven else 'livenorm') if live else ('direct' if proven else 'norm')))
+            expect.append(f'd_{kind}_{live} ' + (('live' if proven else 'livenorm') if live else ('direct' if proven else 'norm')) + f' {NTBL}')
     ssa += press_fun(0) + press_fun(1)
-    expect += ['press_0 direct', 'press_1 slot']
+    expect += [f'press_0 direct {NTBL}', f'press_1 slot {NTBL}']
     rows = bounds()
     (out / 'jtbl.ssa').write_text('\n'.join(ssa) + '\n')
     (out / 'jtbl_expect.txt').write_text('\n'.join(expect) + '\n')
     (out / 'bounds.ssa').write_text('\n'.join(ln for r in rows for ln in r[1]) + '\n')
-    (out / 'bounds_expect.txt').write_text(''.join(f'{r[0]} {r[3]}\n' for r in rows))
+    (out / 'bounds_expect.txt').write_text(''.join(expect_row(r) for r in rows))
     (out / 'check.c').write_text('\n'.join(check_c(rows)) + '\n')
 
 

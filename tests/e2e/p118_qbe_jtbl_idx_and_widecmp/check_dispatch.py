@@ -3,9 +3,12 @@
 usage: python3 -E check_dispatch.py EXPECT asm FILE.s
        python3 -E check_dispatch.py EXPECT obj FILE.o   (ELF64 x86-64)
        python3 -E check_dispatch.py EXPECT both FILE.s FILE.o
-EXPECT holds `name form[,form]` lines (forms: gen_il.py); every listed
-function has exactly one table. `both` additionally requires the two encoders
-to agree on (compare register, normalization, index register).
+EXPECT holds `name form entries` lines (forms: gen_il.py); every listed
+function has exactly one table, compared against exactly `entries`. A selector
+copied onto itself before the compare (a misplaced normalization) is rejected
+for `direct` / `live` and must agree between the encoders. `both` additionally requires the two encoders
+to agree on (entries, compare register, normalization, index register, home
+load, self-copy).
 """
 import re
 import struct
@@ -41,7 +44,11 @@ def parse_asm(path, names):
             die(f'{path}: {name}: unexpected registers {h.groupdict()}')
         if h['src'] is not None and h['src'] != h['cmp']:
             die(f'{path}: {name}: normalizes {h["src"]}, compares {h["cmp"]}')
-        res[name] = (int(h['n']), R32.index(h['cmp']), h['src'] is not None, R64.index(h['idx']), h['slot'] is not None)
+        # Everything of the dispatch block before the compare.
+        block = re.split(r'^\S+:\n', m.group(1)[:h.start()], flags=re.M)[-1]
+        selfcopy = re.search(rf'^\tmovl %{h["cmp"]}, %{h["cmp"]}$', block, re.M) is not None
+        res[name] = (int(h['n']), R32.index(h['cmp']), h['src'] is not None, R64.index(h['idx']), h['slot'] is not None,
+                     selfcopy)
     return res
 
 
@@ -98,12 +105,19 @@ def parse_obj(path, names):
             src = (mod >> 3 & 7) | (8 if h['nrex'] == b'\x45' else 0)
             if mod & 0xc7 != 0xc2 or src != reg:
                 die(f'{path}: {name}: unexpected normalization {h["norm"].hex()}')
-        res[name] = (n, reg, h['norm'] is not None, idx, h['slot'] is not None)
+        # movl %reg, %reg directly before the compare (89 /r or 8b /r, mod 11).
+        pre = code[:h.start() + len(h['slot'] or b'')]
+        modrm = 0xc0 | (reg & 7) * 9
+        tails = [bytes([0x45, op, modrm]) if reg & 8 else bytes([op, modrm]) for op in (0x89, 0x8b)]
+        selfcopy = any(pre.endswith(t) and (reg & 8 or len(pre) == 2 or not 0x40 <= pre[-3] <= 0x4f) for t in tails)
+        res[name] = (n, reg, h['norm'] is not None, idx, h['slot'] is not None, bool(selfcopy))
     return res
 
 
 def form(r):
-    n, reg, norm, idx, slot = r
+    n, reg, norm, idx, slot, selfcopy = r
+    if selfcopy and not norm:
+        return 'bad'
     if slot:
         return 'slot' if reg == 10 and not norm and idx == 10 else 'bad'
     if norm:
@@ -115,6 +129,8 @@ def form(r):
 
 def main():
     expect = [ln.split() for ln in open(sys.argv[1]).read().split('\n') if ln.strip()]
+    if any(len(e) != 3 for e in expect):
+        die('malformed expectation line')
     names = [e[0] for e in expect]
     if not names or len(set(names)) != len(names):
         die('bad expectation file')
@@ -125,10 +141,12 @@ def main():
     if mode in ('obj', 'both'):
         got.append(parse_obj(files[-1], names))
     tally, wrong = {}, []
-    for name, want in expect:
+    for name, want, entries in expect:
         for g in got:
             f = form(g[name])
-            if f not in want.split(','):
+            if g[name][0] != int(entries):
+                wrong.append(f'{name} compares against {g[name][0]}, want {entries} entries')
+            if f != want:
                 wrong.append(f'{name} is {f} {g[name]}, want {want}')
         if len(got) == 2 and got[0][name] != got[1][name]:
             wrong.append(f'{name}: text {got[0][name]} != --obj {got[1][name]}')

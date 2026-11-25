@@ -1,7 +1,8 @@
 """usage: python3 -E check_gvn.py bounds_expect.txt DUMP (qbe -d G)
 
 Every function: `0` / `1` -> no comparison left and that constant returned;
-`keep` -> the 64-bit signed comparison (or its branch) is still there.
+`keep op arg limit` -> `%res =w op arg, limit` is the only such comparison and
+its result is what the function returns or branches on.
 """
 import re
 import sys
@@ -12,7 +13,7 @@ body = dict(zip(parts[1::2], parts[2::2]))
 if [e[0] for e in expect] != parts[1::2] or not expect:
     raise SystemExit('FAIL: p118 gvn: dump does not list the expected functions')
 tally = {'0': 0, '1': 0, 'keep': 0}
-for name, want in expect:
+for name, want, *cmp in expect:
     text = body[name].split('> After GVN:', 1)
     if len(text) != 2:
         raise SystemExit(f'FAIL: p118 gvn: no GVN dump of {name}')
@@ -21,11 +22,18 @@ for name, want in expect:
     rets = re.findall(r'^\s*ret\w* (\S+)$', dump, re.M)
     branch = re.search(r'\bjnz\b', dump) is not None
     if want == 'keep':
-        ok = len(cmps) == 1
+        op, arg, lim = cmp
+        res = re.findall(rf'^\t(%\S+) =w {op} {re.escape(arg)}, {re.escape(lim)}$', dump, re.M)
+        ok = len(cmps) == 1 and len(res) == 1
+        if ok and name.endswith('_jnz'):
+            jumps = re.findall(r'^\tjnz (\S+), @\S+, @\S+$', dump, re.M)
+            ok = jumps == [res[0]] and sorted(rets) == ['0', '1']
+        elif ok:
+            ok = not branch and rets == [res[0]]
     else:
         ok = not cmps and not branch and rets == [want]
     if not ok:
-        raise SystemExit(f'FAIL: p118 gvn: {name}: want {want}, compares {cmps}, returns {rets}:\n{dump}')
+        raise SystemExit(f'FAIL: p118 gvn: {name}: want {want} {cmp}, compares {cmps}, returns {rets}:\n{dump}')
     tally[want] += 1
 if min(tally.values()) == 0:
     raise SystemExit(f'FAIL: p118 gvn: {tally}')
